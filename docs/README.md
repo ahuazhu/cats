@@ -8,7 +8,7 @@ HTML 面向人类阅读和视觉演示；同名 Markdown 面向 Agent/实现者�
 |---|---|---|
 | [blockd 协议规格](specs/blockd-protocol.md) | Frozen v1 | `blockd/`（常量出处 `api/src/chunk.rs`）；改动需新增 ADR |
 
-实现状态一览见根 [README](../README.md#实现状态)。**Linux 里程碑**（真实 Cloud Hypervisor + vhost-user-blk + tap/overlay + KVM 验收、Warm 用 cats-blockd 复验快照）尚未开始；FakeVmm 缝在 `node-agent/src/runtime.rs` 文件头有说明。
+实现状态一览见根 [README](../README.md#实现状态)。真实 microVM（Cloud Hypervisor + KVM）已实现为 node-agent 的 `--vmm ch` 模式（`node-agent/src/ch.rs`），块路径 Phase A 经内核 NBD 复用已验前端，裸金属部署与验收见 [deploy/metal/](../deploy/metal/README.md)。仍属后续里程碑：原生 vhost-user-blk（性能）、tap/overlay Guest 网络、多节点共享 PostgreSQL 元数据、特权拆分。
 
 如果同一设计的两种格式暂时不同，以 ADR 和实验数据为最高依据，随后以 Markdown 的实现约束为准，并尽快同步 HTML。
 

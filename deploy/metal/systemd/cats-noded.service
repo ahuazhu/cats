@@ -1,0 +1,31 @@
+[Unit]
+Description=Cats node agent (Cloud Hypervisor microVMs)
+After=cats-controld.service
+Wants=cats-controld.service
+
+[Service]
+EnvironmentFile=/etc/cats/cats.env
+# Root is required for /dev/kvm, kernel NBD attach and tap devices (Phase A;
+# privilege separation is a hardening milestone).
+ExecStartPre=/usr/sbin/modprobe nbd nbds_max=64
+ExecStart=/opt/cats/bin/cats-noded \
+  --node-id metal-1 \
+  --listen 127.0.0.1:7301 \
+  --control-plane-url http://127.0.0.1:7300 \
+  --gateway-url http://127.0.0.1:7400 \
+  --state-dir /var/lib/cats/node \
+  --meta-sqlite /var/lib/cats/storage-meta.db \
+  --blockd-bin /opt/cats/bin/cats-blockd \
+  --guest-agent-bin /opt/cats/bin/cats-guest-agent \
+  --vmm ch \
+  --ch-bin /usr/local/bin/cloud-hypervisor \
+  --ch-kernel /opt/cats/guest/vmlinuz \
+  --ch-initramfs /opt/cats/guest/initramfs.img \
+  --ch-cmdline "console=ttyS0 root=/dev/vda rw" \
+  --ch-seed-image /opt/cats/guest/rootfs.ext4 \
+  $CATS_BLOB_ARGS
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

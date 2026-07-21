@@ -1,0 +1,15 @@
+[Unit]
+Description=Cats endpoint gateway
+After=cats-controld.service
+Wants=cats-controld.service
+
+[Service]
+EnvironmentFile=/etc/cats/cats.env
+ExecStart=/opt/cats/bin/cats-gatewayd \
+  --listen 0.0.0.0:7400 \
+  --control-plane-url http://127.0.0.1:7300
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

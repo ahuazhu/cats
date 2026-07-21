@@ -72,8 +72,8 @@ docs/                     架构、决策、协议规格和实验报告
 | 控制面 / CLI / 网关 / node-agent / guest-agent | ✅ 实现并测试 | 单元 + 集成 + E2E 共 46 个测试 |
 | S3 BlobStore | ✅ 代码 + 签名向量测试 | SigV4 通过 AWS 官方测试向量；对真实 S3/MinIO 的联测按需运行 |
 | 元数据存储 | SQLite（开发） | 与规格同 SQL 形状；生产 PostgreSQL 为后续替换项 |
-| 虚拟化 | FakeVmm（进程模拟） | SIGSTOP/SIGCONT=pause/resume、状态文件=Warm 快照；**Cloud Hypervisor + vhost-user-blk 为 Linux 里程碑**（trait 缝在 `node-agent/src/runtime.rs`） |
-| Guest 网络 / tap / overlay | 未实现 | 属 Linux 里程碑；当前网关经 node-agent 代理到 guest unix socket |
+| 虚拟化 | FakeVmm + **Cloud Hypervisor 模式**（`--vmm ch`，Linux+KVM） | CH 直接内核启动、vsock Guest Agent、vm.pause/resume、Warm=vm.snapshot/--restore；块路径 Phase A 走内核 NBD（正确性等价，vhost-user 为性能里程碑）；部署见 `deploy/metal/` |
+| Guest 网络 / tap / overlay | 未实现 | 下一里程碑；exec/健康走 vsock；Endpoint 演示仅 FakeVmm 形态 |
 
 ## 构建与测试
 
