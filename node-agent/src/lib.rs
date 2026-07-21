@@ -24,6 +24,18 @@ pub mod testutil {
         dir
     }
 
+    fn package_for(bin: &str) -> &'static str {
+        match bin {
+            "cats-blockd" => "cats-blockd",
+            "cats-guest-agent" => "cats-guest-agent",
+            "cats-noded" => "cats-node-agent",
+            "cats-controld" => "cats-control-plane",
+            "cats-gatewayd" => "cats-network",
+            "cats" => "cats-cli",
+            other => panic!("unknown workspace binary {other}"),
+        }
+    }
+
     /// Path to a workspace binary, building it on first use if missing.
     pub fn workspace_bin(name: &str) -> PathBuf {
         static BUILD: Once = Once::new();
@@ -31,11 +43,19 @@ pub mod testutil {
         if !path.exists() {
             BUILD.call_once(|| {
                 let status = std::process::Command::new(env!("CARGO"))
-                    .args(["build", "-p", "cats-blockd", "-p", "cats-guest-agent"])
+                    .args(["build", "-p", package_for(name)])
                     .status()
                     .expect("run cargo build for test binaries");
                 assert!(status.success(), "building test binaries failed");
             });
+            // A second missing binary after the Once fired: build directly.
+            if !path.exists() {
+                let status = std::process::Command::new(env!("CARGO"))
+                    .args(["build", "-p", package_for(name)])
+                    .status()
+                    .expect("run cargo build for test binaries");
+                assert!(status.success(), "building test binaries failed");
+            }
         }
         assert!(
             path.exists(),
