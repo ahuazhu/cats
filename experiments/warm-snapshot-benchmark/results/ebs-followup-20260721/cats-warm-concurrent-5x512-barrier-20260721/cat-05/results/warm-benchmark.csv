@@ -1,0 +1,2 @@
+iteration,memory_mib,workset_mib,before_rss_kib,pause_ms,snapshot_ms,shutdown_ms,warm_runtime_rss_kib,snapshot_apparent_bytes,snapshot_allocated_bytes,wake_started_ns,network_backend_ms,restore_to_api_ms,resume_api_ms,wake_to_health_ms,touch_wall_ms,touch_guest_ms,full_memory_ready_ms,after_rss_kib,full_ready_rss_kib,boot_id_preserved
+1,512,64,737312,3.834,418.901,261.859,0,536939933,528146432,1784610263215692511,18.680,25.848,3.814,7847.642,13787.638,13402.031,22659.809,455896,533408,true

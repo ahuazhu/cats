@@ -1,0 +1,257 @@
+cloud-hypervisor:   0.000016s: <main> INFO:cloud-hypervisor/src/main.rs:631 -- v53.0 starting
+cloud-hypervisor:   0.000064s: <main> INFO:event_monitor/src/lib.rs:113 -- Event: source = vmm event = starting 
+cloud-hypervisor:   0.000313s: <vmm> INFO:vmm/src/api/mod.rs:1278 -- API request event: VmCreate VmConfig { cpus: CpusConfig { boot_vcpus: 2, max_vcpus: 2, topology: None, kvm_hyperv: false, max_phys_bits: 46, affinity: None, features: CpuFeatures { amx: false }, nested: true, core_scheduling: Vm, profile: Host }, memory: MemoryConfig { size: 0, mergeable: false, hotplug_method: Acpi, hotplug_size: None, hotplugged_size: None, shared: false, hugepages: false, hugepage_size: None, prefault: false, reserve: false, zones: Some([MemoryZoneConfig { id: "cats-ram", size: 536870912, file: Some("/mnt/local-nvme/cats-pageout-512m/pageout/guest-ram.bin"), shared: true, hugepages: false, hugepage_size: None, host_numa_node: None, hotplug_size: None, hotplugged_size: None, prefault: true, reserve: false, mergeable: false }]), thp: true }, payload: Some(PayloadConfig { firmware: None, kernel: Some("/mnt/local-nvme/cats-warm-bench/images/hypervisor-fw"), cmdline: None, initramfs: None }), rate_limit_groups: None, disks: Some([DiskConfig { pci_common: PciDeviceCommonConfig { id: None, iommu: false, pci_segment: 0, pci_device_id: None }, path: None, readonly: false, direct: false, num_queues: 1, queue_size: 128, vhost_user: true, vhost_socket: Some("/mnt/local-nvme/cats-pageout-512m/run/vhost-user-blk.sock"), rate_limit_group: None, rate_limiter_config: None, disable_io_uring: false, disable_aio: false, serial: None, queue_affinity: None, backing_files: false, sparse: true, image_type: Unknown, lock_granularity: ByteRange }, DiskConfig { pci_common: PciDeviceCommonConfig { id: None, iommu: false, pci_segment: 0, pci_device_id: None }, path: Some("/mnt/local-nvme/cats-pageout-512m/run/seed.img"), readonly: false, direct: false, num_queues: 1, queue_size: 128, vhost_user: false, vhost_socket: None, rate_limit_group: None, rate_limiter_config: None, disable_io_uring: false, disable_aio: false, serial: None, queue_affinity: None, backing_files: false, sparse: true, image_type: Unknown, lock_granularity: ByteRange }]), net: Some([NetConfig { pci_common: PciDeviceCommonConfig { id: None, iommu: false, pci_segment: 0, pci_device_id: None }, tap: Some("cwbtap0"), ip: None, mask: None, mac: MacAddr { bytes: [2, 202, 117, 0, 0, 2] }, host_mac: None, mtu: None, num_queues: 2, queue_size: 256, vhost_user: false, vhost_socket: None, vhost_mode: Client, fds: None, rate_limiter_config: None, offload_tso: true, offload_ufo: true, offload_csum: true }]), rng: RngConfig { pci_common: PciDeviceCommonConfig { id: None, iommu: false, pci_segment: 0, pci_device_id: None }, src: "/dev/urandom" }, balloon: None, generic_vhost_user: None, fs: None, pmem: None, serial: SerialConfig { common: CommonConsoleConfig { file: Some("/mnt/local-nvme/cats-pageout-512m/run/serial.log"), mode: File, socket: None } }, console: ConsoleConfig { common: CommonConsoleConfig { file: None, mode: Off, socket: None }, pci_common: PciDeviceCommonConfig { id: None, iommu: false, pci_segment: 0, pci_device_id: None } }, debug_console: DebugConsoleConfig { file: None, mode: Off, iobase: Some(233) }, devices: None, user_devices: None, vdpa: None, vsock: None, pvpanic: false, iommu: false, numa: None, watchdog: false, rtc: None, pci_segments: None, platform: None, tpm: None, preserved_fds: None, landlock_enable: false, landlock_rules: None }
+cloud-hypervisor:   0.000703s: <vmm> INFO:vmm/src/api/mod.rs:1169 -- API request event: VmBoot
+cloud-hypervisor:   0.000712s: <vmm> INFO:vmm/src/lib.rs:2230 -- Booting VM
+cloud-hypervisor:   0.000720s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = booting 
+cloud-hypervisor:   0.001166s: <vmm> INFO:vmm/src/memory_manager.rs:681 -- create ram region for zone cats-ram, region_start: 0x0, region_size: 0x20000000
+cloud-hypervisor:   0.258908s: <vmm> INFO:vmm/src/memory_manager.rs:2154 -- RAM region mapping at 0x78477fc00000 (size = 0x20000000)
+cloud-hypervisor:   0.258957s: <vmm> INFO:vmm/src/vm.rs:606 -- Booting VM from config: Mutex { data: VmConfig { cpus: CpusConfig { boot_vcpus: 2, max_vcpus: 2, topology: None, kvm_hyperv: false, max_phys_bits: 46, affinity: None, features: CpuFeatures { amx: false }, nested: true, core_scheduling: Vm, profile: Host }, memory: MemoryConfig { size: 0, mergeable: false, hotplug_method: Acpi, hotplug_size: None, hotplugged_size: None, shared: false, hugepages: false, hugepage_size: None, prefault: false, reserve: false, zones: Some([MemoryZoneConfig { id: "cats-ram", size: 536870912, file: Some("/mnt/local-nvme/cats-pageout-512m/pageout/guest-ram.bin"), shared: true, hugepages: false, hugepage_size: None, host_numa_node: None, hotplug_size: None, hotplugged_size: None, prefault: true, reserve: false, mergeable: false }]), thp: true }, payload: Some(PayloadConfig { firmware: None, kernel: Some("/mnt/local-nvme/cats-warm-bench/images/hypervisor-fw"), cmdline: None, initramfs: None }), rate_limit_groups: None, disks: Some([DiskConfig { pci_common: PciDeviceCommonConfig { id: None, iommu: false, pci_segment: 0, pci_device_id: None }, path: None, readonly: false, direct: false, num_queues: 1, queue_size: 128, vhost_user: true, vhost_socket: Some("/mnt/local-nvme/cats-pageout-512m/run/vhost-user-blk.sock"), rate_limit_group: None, rate_limiter_config: None, disable_io_uring: false, disable_aio: false, serial: None, queue_affinity: None, backing_files: false, sparse: true, image_type: Unknown, lock_granularity: ByteRange }, DiskConfig { pci_common: PciDeviceCommonConfig { id: None, iommu: false, pci_segment: 0, pci_device_id: None }, path: Some("/mnt/local-nvme/cats-pageout-512m/run/seed.img"), readonly: false, direct: false, num_queues: 1, queue_size: 128, vhost_user: false, vhost_socket: None, rate_limit_group: None, rate_limiter_config: None, disable_io_uring: false, disable_aio: false, serial: None, queue_affinity: None, backing_files: false, sparse: true, image_type: Unknown, lock_granularity: ByteRange }]), net: Some([NetConfig { pci_common: PciDeviceCommonConfig { id: None, iommu: false, pci_segment: 0, pci_device_id: None }, tap: Some("cwbtap0"), ip: None, mask: None, mac: MacAddr { bytes: [2, 202, 117, 0, 0, 2] }, host_mac: None, mtu: None, num_queues: 2, queue_size: 256, vhost_user: false, vhost_socket: None, vhost_mode: Client, fds: None, rate_limiter_config: None, offload_tso: true, offload_ufo: true, offload_csum: true }]), rng: RngConfig { pci_common: PciDeviceCommonConfig { id: None, iommu: false, pci_segment: 0, pci_device_id: None }, src: "/dev/urandom" }, balloon: None, generic_vhost_user: None, fs: None, pmem: None, serial: SerialConfig { common: CommonConsoleConfig { file: Some("/mnt/local-nvme/cats-pageout-512m/run/serial.log"), mode: File, socket: None } }, console: ConsoleConfig { common: CommonConsoleConfig { file: None, mode: Off, socket: None }, pci_common: PciDeviceCommonConfig { id: None, iommu: false, pci_segment: 0, pci_device_id: None } }, debug_console: DebugConsoleConfig { file: None, mode: Off, iobase: Some(233) }, devices: None, user_devices: None, vdpa: None, vsock: None, pvpanic: false, iommu: false, numa: None, watchdog: false, rtc: None, pci_segments: None, platform: None, tpm: None, preserved_fds: None, landlock_enable: false, landlock_rules: None }, poisoned: false, .. }
+cloud-hypervisor:   0.259284s: <vmm> INFO:arch/src/x86_64/mod.rs:629 -- Generating guest CPUID with physical address size: 46
+cloud-hypervisor:   0.259381s: <vmm> INFO:vmm/src/pci_segment.rs:107 -- Adding PCI segment: id=0, PCI MMIO config address: 0xe8000000, mem32 area [0xc0000000-0xe7ffffff], mem64 area [0x100000000-0x3fffffeeffff]
+cloud-hypervisor:   0.259402s: <vmm> INFO:vmm/src/memory_manager.rs:2433 -- Creating userspace mapping: 0 -> 78477fc00000 20000000, slot 0
+cloud-hypervisor:   0.259493s: <vmm> INFO:vmm/src/memory_manager.rs:2491 -- Created userspace mapping: 0 -> 78477fc00000 20000000
+cloud-hypervisor:   0.259559s: <vmm> INFO:vmm/src/cpu.rs:1100 -- Request to create new vCPUs: desired = 2, max = 2, allocated = 0, present = 0
+cloud-hypervisor:   0.259650s: <payload_loader> INFO:vmm/src/vm.rs:1636 -- Loading kernel
+cloud-hypervisor:   0.259732s: <payload_loader> INFO:vmm/src/vm.rs:1659 -- PVH kernel loaded: entry_addr = 0x116e05
+cloud-hypervisor:   0.260055s: <vmm> INFO:vmm/src/device_manager.rs:2700 -- Creating virtio-block device: DiskConfig { pci_common: PciDeviceCommonConfig { id: Some("_disk0"), iommu: false, pci_segment: 0, pci_device_id: None }, path: None, readonly: false, direct: false, num_queues: 1, queue_size: 128, vhost_user: true, vhost_socket: Some("/mnt/local-nvme/cats-pageout-512m/run/vhost-user-blk.sock"), rate_limit_group: None, rate_limiter_config: None, disable_io_uring: false, disable_aio: false, serial: None, queue_affinity: None, backing_files: false, sparse: true, image_type: Unknown, lock_granularity: ByteRange }
+cloud-hypervisor:   0.260312s: <vmm> INFO:vmm/src/device_manager.rs:2700 -- Creating virtio-block device: DiskConfig { pci_common: PciDeviceCommonConfig { id: Some("_disk1"), iommu: false, pci_segment: 0, pci_device_id: None }, path: Some("/mnt/local-nvme/cats-pageout-512m/run/seed.img"), readonly: false, direct: false, num_queues: 1, queue_size: 128, vhost_user: false, vhost_socket: None, rate_limit_group: None, rate_limiter_config: None, disable_io_uring: false, disable_aio: false, serial: None, queue_affinity: None, backing_files: false, sparse: true, image_type: Unknown, lock_granularity: ByteRange }
+cloud-hypervisor:   0.260433s: <vmm> INFO:block/src/factory.rs:153 -- Opening RAW disk file with io_uring backend
+cloud-hypervisor:   0.260442s: <vmm> WARN:vmm/src/device_manager.rs:2756 -- DEPRECATION: auto-detection of disk image type is deprecated and will be removed in a future release. Please specify image type explicitly.
+cloud-hypervisor:   0.260457s: <vmm> WARN:vmm/src/device_manager.rs:2761 -- No image_type specified - detected as raw. Configuration updated to persist type across reboots and migrations.
+cloud-hypervisor:   0.260466s: <vmm> WARN:vmm/src/device_manager.rs:2769 -- Autodetected raw image type. Disabling sector 0 writes.
+cloud-hypervisor:   0.260505s: <vmm> INFO:block/src/lib.rs:428 -- Probed file sparse support: punch_hole=true, zero_range=true => true
+cloud-hypervisor:   0.260516s: <vmm> INFO:virtio-devices/src/block.rs:871 -- Disk topology: DiskTopology { logical_block_size: 512, physical_block_size: 512, minimum_io_size: 512, optimal_io_size: 0 }
+cloud-hypervisor:   0.260538s: <vmm> INFO:vmm/src/device_manager.rs:2929 -- Creating virtio-net device: NetConfig { pci_common: PciDeviceCommonConfig { id: Some("_net2"), iommu: false, pci_segment: 0, pci_device_id: None }, tap: Some("cwbtap0"), ip: None, mask: None, mac: MacAddr { bytes: [2, 202, 117, 0, 0, 2] }, host_mac: None, mtu: None, num_queues: 2, queue_size: 256, vhost_user: false, vhost_socket: None, vhost_mode: Client, fds: None, rate_limiter_config: None, offload_tso: true, offload_ufo: true, offload_csum: true }
+cloud-hypervisor:   0.260697s: <vmm> WARN:net_util/src/open_tap.rs:84 -- Tap cwbtap0 already exists. IP configuration will not be overwritten.
+cloud-hypervisor:   0.260822s: <vmm> INFO:vmm/src/device_manager.rs:3091 -- Creating virtio-rng device: RngConfig { pci_common: PciDeviceCommonConfig { id: None, iommu: false, pci_segment: 0, pci_device_id: None }, src: "/dev/urandom" }
+cloud-hypervisor:   0.261004s: <vmm> INFO:virtio-devices/src/block.rs:1042 -- Acquired Write lock for disk image id=_disk1,path=/mnt/local-nvme/cats-pageout-512m/run/seed.img
+cloud-hypervisor:   0.261315s: <vmm> INFO:vmm/src/acpi.rs:1166 -- Generated ACPI tables: took 299µs size = 5285
+cloud-hypervisor:   0.261331s: <vmm> INFO:vmm/src/vm.rs:2739 -- Created ACPI tables: rsdp_addr = 0xa0000
+cloud-hypervisor:   0.261345s: <vmm> INFO:vmm/src/cpu.rs:556 -- Configuring vCPU: cpu_id = 0
+cloud-hypervisor:   0.261403s: <vmm> INFO:vmm/src/cpu.rs:556 -- Configuring vCPU: cpu_id = 1
+cloud-hypervisor:   0.261449s: <vmm> INFO:vmm/src/vm.rs:1826 -- Configuring system
+cloud-hypervisor:   0.261469s: <vmm> INFO:arch/src/x86_64/mod.rs:1174 -- first usable physical memory range, start: 0x00100000, end: 0x20000000
+cloud-hypervisor:   0.261483s: <vmm> INFO:arch/src/x86_64/mod.rs:1246 -- create_memmap_entry, start: 0x00100000, end: 0x20000000
+cloud-hypervisor:   0.261493s: <vmm> INFO:vmm/src/cpu.rs:1513 -- Starting vCPUs: desired = 2, allocated = 2, present = 0, paused = false
+cloud-hypervisor:   0.284466s: <vcpu0> INFO:vmm/src/cpu.rs:1314 -- vCPU 0: core scheduling cookie = 0xff3d7b2
+cloud-hypervisor:   0.284470s: <vcpu1> INFO:vmm/src/cpu.rs:1314 -- vCPU 1: core scheduling cookie = 0xff3d7b2
+cloud-hypervisor:   0.284645s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = booted 
+cloud-hypervisor:   0.284688s: <vmm> INFO:vmm/src/api/mod.rs:1346 -- API request event: VmInfo
+cloud-hypervisor:   0.291190s: <vcpu0> INFO:virtio-devices/src/transport/pci_device.rs:1288 -- _virtio-pci-_disk0: Needs activation; writing to activate event fd
+cloud-hypervisor:   0.291203s: <vcpu0> INFO:virtio-devices/src/transport/pci_device.rs:1293 -- _virtio-pci-_disk0: Needs activation; returning barrier
+cloud-hypervisor:   0.291211s: <vcpu0> INFO:vmm/src/vm.rs:488 -- Waiting for barrier
+cloud-hypervisor:   0.291207s: <vmm> INFO:vmm/src/lib.rs:2108 -- Trying to activate pending virtio devices: count = 1
+cloud-hypervisor:   0.291480s: <vmm> INFO:virtio-devices/src/transport/pci_device.rs:347 -- _virtio-pci-_disk0: Waiting for barrier
+cloud-hypervisor:   0.291492s: <vmm> INFO:virtio-devices/src/transport/pci_device.rs:349 -- _virtio-pci-_disk0: Barrier released
+cloud-hypervisor:   0.291497s: <vcpu0> INFO:vmm/src/vm.rs:490 -- Barrier released
+cloud-hypervisor:   0.772185s: <vcpu0> INFO:vmm/src/vm.rs:510 -- Guest PIO write to unregistered address 0x43
+cloud-hypervisor:   0.772198s: <vcpu0> INFO:vmm/src/vm.rs:510 -- Guest PIO write to unregistered address 0x42
+cloud-hypervisor:   0.772209s: <vcpu0> INFO:vmm/src/vm.rs:510 -- Guest PIO write to unregistered address 0x42
+cloud-hypervisor:   2.917123s: <vcpu1> INFO:vmm/src/vm.rs:500 -- Guest PIO read from unregistered address 0x87
+cloud-hypervisor:   2.932000s: <vcpu1> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:   2.932353s: <vcpu1> INFO:event_monitor/src/lib.rs:113 -- Event: source = virtio-device event = reset id = _disk0
+cloud-hypervisor:   2.956409s: <vcpu1> INFO:vmm/src/vm.rs:500 -- Guest PIO read from unregistered address 0x2f9
+cloud-hypervisor:   2.956424s: <vcpu1> INFO:vmm/src/vm.rs:510 -- Guest PIO write to unregistered address 0x2f9
+cloud-hypervisor:   2.956434s: <vcpu1> INFO:vmm/src/vm.rs:500 -- Guest PIO read from unregistered address 0x2f9
+cloud-hypervisor:   2.956447s: <vcpu1> INFO:vmm/src/vm.rs:510 -- Guest PIO write to unregistered address 0x2f9
+cloud-hypervisor:   2.956458s: <vcpu1> INFO:vmm/src/vm.rs:500 -- Guest PIO read from unregistered address 0x2f9
+cloud-hypervisor:   2.956469s: <vcpu1> INFO:vmm/src/vm.rs:510 -- Guest PIO write to unregistered address 0x2f9
+cloud-hypervisor:   2.956513s: <vcpu1> INFO:vmm/src/vm.rs:500 -- Guest PIO read from unregistered address 0x3e9
+cloud-hypervisor:   2.956524s: <vcpu1> INFO:vmm/src/vm.rs:510 -- Guest PIO write to unregistered address 0x3e9
+cloud-hypervisor:   2.956534s: <vcpu1> INFO:vmm/src/vm.rs:500 -- Guest PIO read from unregistered address 0x3e9
+cloud-hypervisor:   2.956545s: <vcpu1> INFO:vmm/src/vm.rs:510 -- Guest PIO write to unregistered address 0x3e9
+cloud-hypervisor:   2.956555s: <vcpu1> INFO:vmm/src/vm.rs:500 -- Guest PIO read from unregistered address 0x3e9
+cloud-hypervisor:   2.956565s: <vcpu1> INFO:vmm/src/vm.rs:510 -- Guest PIO write to unregistered address 0x3e9
+cloud-hypervisor:   2.956612s: <vcpu1> INFO:vmm/src/vm.rs:500 -- Guest PIO read from unregistered address 0x2e9
+cloud-hypervisor:   2.956623s: <vcpu1> INFO:vmm/src/vm.rs:510 -- Guest PIO write to unregistered address 0x2e9
+cloud-hypervisor:   2.956634s: <vcpu1> INFO:vmm/src/vm.rs:500 -- Guest PIO read from unregistered address 0x2e9
+cloud-hypervisor:   2.956644s: <vcpu1> INFO:vmm/src/vm.rs:510 -- Guest PIO write to unregistered address 0x2e9
+cloud-hypervisor:   2.956661s: <vcpu1> INFO:vmm/src/vm.rs:500 -- Guest PIO read from unregistered address 0x2e9
+cloud-hypervisor:   2.956672s: <vcpu1> INFO:vmm/src/vm.rs:510 -- Guest PIO write to unregistered address 0x2e9
+cloud-hypervisor:   3.212090s: <vcpu0> INFO:virtio-devices/src/transport/pci_device.rs:1288 -- _virtio-pci-__rng: Needs activation; writing to activate event fd
+cloud-hypervisor:   3.212115s: <vcpu0> INFO:virtio-devices/src/transport/pci_device.rs:1293 -- _virtio-pci-__rng: Needs activation; returning barrier
+cloud-hypervisor:   3.212123s: <vcpu0> INFO:vmm/src/vm.rs:488 -- Waiting for barrier
+cloud-hypervisor:   3.212231s: <vmm> INFO:vmm/src/lib.rs:2108 -- Trying to activate pending virtio devices: count = 1
+cloud-hypervisor:   3.212310s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = virtio-device event = activated id = __rng
+cloud-hypervisor:   3.212325s: <vmm> INFO:virtio-devices/src/transport/pci_device.rs:347 -- _virtio-pci-__rng: Waiting for barrier
+cloud-hypervisor:   3.212336s: <vmm> INFO:virtio-devices/src/transport/pci_device.rs:349 -- _virtio-pci-__rng: Barrier released
+cloud-hypervisor:   3.212427s: <vcpu0> INFO:vmm/src/vm.rs:490 -- Barrier released
+cloud-hypervisor:   3.213502s: <vcpu0> INFO:virtio-devices/src/transport/pci_device.rs:1288 -- _virtio-pci-_disk0: Needs activation; writing to activate event fd
+cloud-hypervisor:   3.213515s: <vcpu0> INFO:virtio-devices/src/transport/pci_device.rs:1293 -- _virtio-pci-_disk0: Needs activation; returning barrier
+cloud-hypervisor:   3.213525s: <vcpu0> INFO:vmm/src/vm.rs:488 -- Waiting for barrier
+cloud-hypervisor:   3.213519s: <vmm> INFO:vmm/src/lib.rs:2108 -- Trying to activate pending virtio devices: count = 1
+cloud-hypervisor:   3.213888s: <vmm> INFO:virtio-devices/src/transport/pci_device.rs:347 -- _virtio-pci-_disk0: Waiting for barrier
+cloud-hypervisor:   3.213897s: <vmm> INFO:virtio-devices/src/transport/pci_device.rs:349 -- _virtio-pci-_disk0: Barrier released
+cloud-hypervisor:   3.213902s: <vcpu0> INFO:vmm/src/vm.rs:490 -- Barrier released
+cloud-hypervisor:   3.214935s: <vcpu1> INFO:virtio-devices/src/transport/pci_device.rs:1288 -- _virtio-pci-_net2: Needs activation; writing to activate event fd
+cloud-hypervisor:   3.214953s: <vcpu1> INFO:virtio-devices/src/transport/pci_device.rs:1293 -- _virtio-pci-_net2: Needs activation; returning barrier
+cloud-hypervisor:   3.214962s: <vcpu1> INFO:vmm/src/vm.rs:488 -- Waiting for barrier
+cloud-hypervisor:   3.214956s: <vmm> INFO:vmm/src/lib.rs:2108 -- Trying to activate pending virtio devices: count = 1
+cloud-hypervisor:   3.215148s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = virtio-device event = activated id = _net2
+cloud-hypervisor:   3.215162s: <vmm> INFO:virtio-devices/src/transport/pci_device.rs:347 -- _virtio-pci-_net2: Waiting for barrier
+cloud-hypervisor:   3.215171s: <vmm> INFO:virtio-devices/src/transport/pci_device.rs:349 -- _virtio-pci-_net2: Barrier released
+cloud-hypervisor:   3.215303s: <vcpu1> INFO:vmm/src/vm.rs:490 -- Barrier released
+cloud-hypervisor:   3.215347s: <_net2_ctrl> INFO:net_util/src/ctrl_queue.rs:138 -- Number of MQ pairs requested: 1
+cloud-hypervisor:   3.220706s: <vcpu1> INFO:virtio-devices/src/transport/pci_device.rs:1288 -- _virtio-pci-_disk1: Needs activation; writing to activate event fd
+cloud-hypervisor:   3.220719s: <vcpu1> INFO:virtio-devices/src/transport/pci_device.rs:1293 -- _virtio-pci-_disk1: Needs activation; returning barrier
+cloud-hypervisor:   3.220729s: <vcpu1> INFO:vmm/src/vm.rs:488 -- Waiting for barrier
+cloud-hypervisor:   3.220723s: <vmm> INFO:vmm/src/lib.rs:2108 -- Trying to activate pending virtio devices: count = 1
+cloud-hypervisor:   3.220757s: <vmm> INFO:virtio-devices/src/block.rs:1089 -- Changing cache mode to writeback
+cloud-hypervisor:   3.220843s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = virtio-device event = activated id = _disk1
+cloud-hypervisor:   3.220855s: <vmm> INFO:virtio-devices/src/transport/pci_device.rs:347 -- _virtio-pci-_disk1: Waiting for barrier
+cloud-hypervisor:   3.220869s: <vmm> INFO:virtio-devices/src/transport/pci_device.rs:349 -- _virtio-pci-_disk1: Barrier released
+cloud-hypervisor:   3.220875s: <vcpu1> INFO:vmm/src/vm.rs:490 -- Barrier released
+cloud-hypervisor:  62.613251s: <vmm> INFO:vmm/src/api/mod.rs:1384 -- API request event: VmPause
+cloud-hypervisor:  62.613285s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = pausing 
+cloud-hypervisor:  62.614433s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-rng
+cloud-hypervisor:  62.614704s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-block
+cloud-hypervisor:  62.614834s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-net
+cloud-hypervisor:  62.615051s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-block
+cloud-hypervisor:  62.615223s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = paused 
+cloud-hypervisor:  63.324341s: <vmm> INFO:vmm/src/api/mod.rs:1703 -- API request event: VmResume
+cloud-hypervisor:  63.324516s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = resuming 
+cloud-hypervisor:  63.324547s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-rng
+cloud-hypervisor:  63.324570s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  63.324768s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-net
+cloud-hypervisor:  63.324795s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  63.325874s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = resumed 
+cloud-hypervisor:  63.703239s: <vmm> INFO:vmm/src/api/mod.rs:1384 -- API request event: VmPause
+cloud-hypervisor:  63.703331s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = pausing 
+cloud-hypervisor:  63.704506s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-rng
+cloud-hypervisor:  63.704823s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-block
+cloud-hypervisor:  63.704945s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-net
+cloud-hypervisor:  63.704987s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-block
+cloud-hypervisor:  63.705090s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = paused 
+cloud-hypervisor:  64.399803s: <vmm> INFO:vmm/src/api/mod.rs:1703 -- API request event: VmResume
+cloud-hypervisor:  64.399971s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = resuming 
+cloud-hypervisor:  64.399994s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-rng
+cloud-hypervisor:  64.400017s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  64.400154s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-net
+cloud-hypervisor:  64.400177s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  64.401253s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = resumed 
+cloud-hypervisor:  64.826782s: <vmm> INFO:vmm/src/api/mod.rs:1384 -- API request event: VmPause
+cloud-hypervisor:  64.826813s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = pausing 
+cloud-hypervisor:  64.827942s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-rng
+cloud-hypervisor:  64.828308s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-block
+cloud-hypervisor:  64.828491s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-net
+cloud-hypervisor:  64.828682s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-block
+cloud-hypervisor:  64.828857s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = paused 
+cloud-hypervisor:  65.500381s: <vmm> INFO:vmm/src/api/mod.rs:1703 -- API request event: VmResume
+cloud-hypervisor:  65.500664s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = resuming 
+cloud-hypervisor:  65.500755s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-rng
+cloud-hypervisor:  65.500824s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  65.501060s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-net
+cloud-hypervisor:  65.501106s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  65.502205s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = resumed 
+cloud-hypervisor:  65.927406s: <vmm> INFO:vmm/src/api/mod.rs:1384 -- API request event: VmPause
+cloud-hypervisor:  65.927475s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = pausing 
+cloud-hypervisor:  65.928635s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-rng
+cloud-hypervisor:  65.928833s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-block
+cloud-hypervisor:  65.928947s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-net
+cloud-hypervisor:  65.928978s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-block
+cloud-hypervisor:  65.929062s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = paused 
+cloud-hypervisor:  66.602242s: <vmm> INFO:vmm/src/api/mod.rs:1703 -- API request event: VmResume
+cloud-hypervisor:  66.602554s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = resuming 
+cloud-hypervisor:  66.602646s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-rng
+cloud-hypervisor:  66.602722s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  66.602989s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-net
+cloud-hypervisor:  66.603020s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  66.604095s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = resumed 
+cloud-hypervisor:  67.029243s: <vmm> INFO:vmm/src/api/mod.rs:1384 -- API request event: VmPause
+cloud-hypervisor:  67.029327s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = pausing 
+cloud-hypervisor:  67.030502s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-rng
+cloud-hypervisor:  67.030869s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-block
+cloud-hypervisor:  67.031052s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-net
+cloud-hypervisor:  67.031242s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-block
+cloud-hypervisor:  67.031380s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = paused 
+cloud-hypervisor:  67.707497s: <vmm> INFO:vmm/src/api/mod.rs:1703 -- API request event: VmResume
+cloud-hypervisor:  67.707726s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = resuming 
+cloud-hypervisor:  67.707748s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-rng
+cloud-hypervisor:  67.707764s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  67.707909s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-net
+cloud-hypervisor:  67.707932s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  67.709000s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = resumed 
+cloud-hypervisor:  68.132172s: <vmm> INFO:vmm/src/api/mod.rs:1384 -- API request event: VmPause
+cloud-hypervisor:  68.132256s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = pausing 
+cloud-hypervisor:  68.133469s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-rng
+cloud-hypervisor:  68.133842s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-block
+cloud-hypervisor:  68.134018s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-net
+cloud-hypervisor:  68.134201s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-block
+cloud-hypervisor:  68.134354s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = paused 
+cloud-hypervisor:  68.809395s: <vmm> INFO:vmm/src/api/mod.rs:1703 -- API request event: VmResume
+cloud-hypervisor:  68.809692s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = resuming 
+cloud-hypervisor:  68.809746s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-rng
+cloud-hypervisor:  68.809792s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  68.810036s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-net
+cloud-hypervisor:  68.810081s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  68.811188s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = resumed 
+cloud-hypervisor:  69.231735s: <vmm> INFO:vmm/src/api/mod.rs:1384 -- API request event: VmPause
+cloud-hypervisor:  69.231789s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = pausing 
+cloud-hypervisor:  69.232948s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-rng
+cloud-hypervisor:  69.233284s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-block
+cloud-hypervisor:  69.233429s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-net
+cloud-hypervisor:  69.233643s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-block
+cloud-hypervisor:  69.233765s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = paused 
+cloud-hypervisor:  69.902802s: <vmm> INFO:vmm/src/api/mod.rs:1703 -- API request event: VmResume
+cloud-hypervisor:  69.903030s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = resuming 
+cloud-hypervisor:  69.903053s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-rng
+cloud-hypervisor:  69.903076s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  69.903206s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-net
+cloud-hypervisor:  69.903229s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  69.904305s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = resumed 
+cloud-hypervisor:  70.324020s: <vmm> INFO:vmm/src/api/mod.rs:1384 -- API request event: VmPause
+cloud-hypervisor:  70.324104s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = pausing 
+cloud-hypervisor:  70.325310s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-rng
+cloud-hypervisor:  70.325676s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-block
+cloud-hypervisor:  70.325859s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-net
+cloud-hypervisor:  70.325905s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-block
+cloud-hypervisor:  70.326012s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = paused 
+cloud-hypervisor:  71.001366s: <vmm> INFO:vmm/src/api/mod.rs:1703 -- API request event: VmResume
+cloud-hypervisor:  71.001610s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = resuming 
+cloud-hypervisor:  71.001701s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-rng
+cloud-hypervisor:  71.001785s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  71.002052s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-net
+cloud-hypervisor:  71.002136s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  71.003273s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = resumed 
+cloud-hypervisor:  71.423744s: <vmm> INFO:vmm/src/api/mod.rs:1384 -- API request event: VmPause
+cloud-hypervisor:  71.423767s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = pausing 
+cloud-hypervisor:  71.424904s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-rng
+cloud-hypervisor:  71.425201s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-block
+cloud-hypervisor:  71.425316s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-net
+cloud-hypervisor:  71.425438s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-block
+cloud-hypervisor:  71.425552s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = paused 
+cloud-hypervisor:  72.100670s: <vmm> INFO:vmm/src/api/mod.rs:1703 -- API request event: VmResume
+cloud-hypervisor:  72.100807s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = resuming 
+cloud-hypervisor:  72.100830s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-rng
+cloud-hypervisor:  72.100845s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  72.100967s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-net
+cloud-hypervisor:  72.100990s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  72.102066s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = resumed 
+cloud-hypervisor:  72.521576s: <vmm> INFO:vmm/src/api/mod.rs:1384 -- API request event: VmPause
+cloud-hypervisor:  72.521660s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = pausing 
+cloud-hypervisor:  72.522865s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-rng
+cloud-hypervisor:  72.523239s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-block
+cloud-hypervisor:  72.523422s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-net
+cloud-hypervisor:  72.523636s: <vmm> INFO:virtio-devices/src/device.rs:457 -- Pausing virtio-block
+cloud-hypervisor:  72.523758s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = paused 
+cloud-hypervisor:  73.200325s: <vmm> INFO:vmm/src/api/mod.rs:1703 -- API request event: VmResume
+cloud-hypervisor:  73.200607s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = resuming 
+cloud-hypervisor:  73.200699s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-rng
+cloud-hypervisor:  73.200775s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  73.201042s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-net
+cloud-hypervisor:  73.201126s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  73.202209s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = resumed 
+cloud-hypervisor:  73.617432s: <vmm> INFO:vmm/src/lib.rs:2080 -- VM exit event
+cloud-hypervisor:  73.617470s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-rng
+cloud-hypervisor:  73.617493s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  73.617676s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-net
+cloud-hypervisor:  73.617737s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  73.618942s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = shutdown 
+cloud-hypervisor:  73.619026s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-rng
+cloud-hypervisor:  73.619102s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  73.619232s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-net
+cloud-hypervisor:  73.619308s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:  73.638916s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = deleted 
+cloud-hypervisor:  73.639015s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vmm event = shutdown 
+cloud-hypervisor:  73.639389s: <main> INFO:cloud-hypervisor/src/main.rs:962 -- Cloud Hypervisor exited successfully

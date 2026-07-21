@@ -1,0 +1,8 @@
+
+==> Build cloud-init seed with an in-memory working-set service
+
+==> Run 1 Direct-S3 cold-cache boot cycles
+iteration=1
+
+==> PASS: every boot used an empty NVMe chunk cache and fetched blocks directly from S3
+results=/mnt/local-nvme/cats-direct-s3/results/direct-s3-cold-benchmark.csv

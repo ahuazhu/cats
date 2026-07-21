@@ -1,0 +1,15 @@
+
+==> Build cloud-init seed with an in-memory working-set service
+
+==> Boot with 512MiB file-backed Guest RAM on local NVMe
+
+==> Run 1 pause + MADV_PAGEOUT + resume cycles
+iteration=1
+Traceback (most recent call last):
+  File "/home/ubuntu/cats-warm-benchmark-src/warm-snapshot-benchmark/process_madvise_file.py", line 122, in <module>
+    raise SystemExit(main())
+  File "/home/ubuntu/cats-warm-benchmark-src/warm-snapshot-benchmark/process_madvise_file.py", line 96, in main
+    total += advise(descriptor, start, end - start, advice)
+  File "/home/ubuntu/cats-warm-benchmark-src/warm-snapshot-benchmark/process_madvise_file.py", line 71, in advise
+    raise OSError(value, os.strerror(value))
+OSError: [Errno 22] Invalid argument

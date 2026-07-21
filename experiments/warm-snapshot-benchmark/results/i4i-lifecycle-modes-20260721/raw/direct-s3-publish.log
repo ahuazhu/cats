@@ -1,0 +1,3 @@
+
+==> Publish sparse raw disk as immutable 4194304-byte S3 chunks
+{"bucket": "<redacted-test-bucket>", "chunk_size_bytes": 4194304, "elapsed_seconds": 10.549, "mapped_chunks": 450, "prefix": "<redacted-test-prefix>", "unique_objects": 450, "uploaded_bytes": 1887436800, "virtual_size_bytes": 4294967296}

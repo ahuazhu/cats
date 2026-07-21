@@ -1,0 +1,61 @@
+cloud-hypervisor:   0.000015s: <main> INFO:cloud-hypervisor/src/main.rs:631 -- v53.0 starting
+cloud-hypervisor:   0.000039s: <main> INFO:event_monitor/src/lib.rs:113 -- Event: source = vmm event = starting 
+cloud-hypervisor:   0.001025s: <vmm> INFO:vmm/src/api/mod.rs:1670 -- API request event: VmRestore RestoreConfig { source_url: "file:///mnt/local-nvme/cats-warm-concurrent-2x512-barrier/cat-01/snapshot", prefault: false, memory_restore_mode: OnDemand, net_fds: None, resume: false }
+cloud-hypervisor:   0.001946s: <vmm> INFO:arch/src/x86_64/mod.rs:629 -- Generating guest CPUID with physical address size: 46
+cloud-hypervisor:   0.002005s: <vmm> INFO:arch/src/x86_64/mod.rs:591 -- No CPU incompatibility detected.
+cloud-hypervisor:   0.002298s: <vmm> INFO:vmm/src/memory_manager.rs:2154 -- RAM region mapping at 0x73498d5f7000 (size = 0x20000000)
+cloud-hypervisor:   0.002319s: <vmm> INFO:vmm/src/memory_manager.rs:994 -- UFFD: registering 1 region(s) for demand paging
+cloud-hypervisor:   0.002341s: <vmm> INFO:vmm/src/memory_manager.rs:1063 -- UFFD: spawning handler for 1 region(s)
+cloud-hypervisor:   0.002433s: <vmm> INFO:vmm/src/memory_manager.rs:947 -- UFFD restore: demand-paged restore enabled
+cloud-hypervisor:   0.002453s: <vmm> INFO:vmm/src/vm.rs:606 -- Booting VM from config: Mutex { data: VmConfig { cpus: CpusConfig { boot_vcpus: 2, max_vcpus: 2, topology: None, kvm_hyperv: false, max_phys_bits: 46, affinity: None, features: CpuFeatures { amx: false }, nested: true, core_scheduling: Vm, profile: Host }, memory: MemoryConfig { size: 536870912, mergeable: false, hotplug_method: Acpi, hotplug_size: None, hotplugged_size: None, shared: true, hugepages: false, hugepage_size: None, prefault: false, reserve: false, zones: None, thp: true }, payload: Some(PayloadConfig { firmware: None, kernel: Some("/mnt/local-nvme/cats-warm-bench/images/hypervisor-fw"), cmdline: None, initramfs: None }), rate_limit_groups: None, disks: Some([DiskConfig { pci_common: PciDeviceCommonConfig { id: Some("_disk0"), iommu: false, pci_segment: 0, pci_device_id: None }, path: None, readonly: false, direct: false, num_queues: 1, queue_size: 128, vhost_user: true, vhost_socket: Some("/mnt/local-nvme/cats-warm-concurrent-2x512-barrier/cat-01/run/vhost-user-blk.sock"), rate_limit_group: None, rate_limiter_config: None, disable_io_uring: false, disable_aio: false, serial: None, queue_affinity: None, backing_files: false, sparse: true, image_type: Unknown, lock_granularity: ByteRange }, DiskConfig { pci_common: PciDeviceCommonConfig { id: Some("_disk1"), iommu: false, pci_segment: 0, pci_device_id: None }, path: Some("/mnt/local-nvme/cats-warm-concurrent-2x512-barrier/cat-01/run/seed.img"), readonly: false, direct: false, num_queues: 1, queue_size: 128, vhost_user: false, vhost_socket: None, rate_limit_group: None, rate_limiter_config: None, disable_io_uring: false, disable_aio: false, serial: None, queue_affinity: None, backing_files: false, sparse: true, image_type: Raw, lock_granularity: ByteRange }]), net: Some([NetConfig { pci_common: PciDeviceCommonConfig { id: Some("_net2"), iommu: false, pci_segment: 0, pci_device_id: None }, tap: Some("cwt01"), ip: None, mask: None, mac: MacAddr { bytes: [2, 202, 117, 16, 0, 1] }, host_mac: Some(MacAddr { bytes: [254, 237, 156, 225, 238, 185] }), mtu: None, num_queues: 2, queue_size: 256, vhost_user: false, vhost_socket: None, vhost_mode: Client, fds: None, rate_limiter_config: None, offload_tso: true, offload_ufo: true, offload_csum: true }]), rng: RngConfig { pci_common: PciDeviceCommonConfig { id: None, iommu: false, pci_segment: 0, pci_device_id: None }, src: "/dev/urandom" }, balloon: None, generic_vhost_user: None, fs: None, pmem: None, serial: SerialConfig { common: CommonConsoleConfig { file: Some("/mnt/local-nvme/cats-warm-concurrent-2x512-barrier/cat-01/run/serial.log"), mode: File, socket: None } }, console: ConsoleConfig { common: CommonConsoleConfig { file: None, mode: Off, socket: None }, pci_common: PciDeviceCommonConfig { id: None, iommu: false, pci_segment: 0, pci_device_id: None } }, debug_console: DebugConsoleConfig { file: None, mode: Off, iobase: Some(233) }, devices: None, user_devices: None, vdpa: None, vsock: None, pvpanic: false, iommu: false, numa: None, watchdog: false, rtc: None, pci_segments: None, platform: None, tpm: None, preserved_fds: None, landlock_enable: false, landlock_rules: None }, poisoned: false, .. }
+cloud-hypervisor:   0.002770s: <vmm> INFO:arch/src/x86_64/mod.rs:629 -- Generating guest CPUID with physical address size: 46
+cloud-hypervisor:   0.002878s: <vmm> INFO:vmm/src/pci_segment.rs:107 -- Adding PCI segment: id=0, PCI MMIO config address: 0xe8000000, mem32 area [0xc0000000-0xe7ffffff], mem64 area [0x100000000-0x3fffffeeffff]
+cloud-hypervisor:   0.002895s: <vmm> INFO:vmm/src/memory_manager.rs:2433 -- Creating userspace mapping: 0 -> 73498d5f7000 20000000, slot 1
+cloud-hypervisor:   0.002963s: <vmm> INFO:vmm/src/memory_manager.rs:2491 -- Created userspace mapping: 0 -> 73498d5f7000 20000000
+cloud-hypervisor:   0.002986s: <vmm> INFO:vmm/src/cpu.rs:1100 -- Request to create new vCPUs: desired = 2, max = 2, allocated = 0, present = 0
+cloud-hypervisor:   0.004008s: <vmm> INFO:vmm/src/device_manager.rs:2700 -- Creating virtio-block device: DiskConfig { pci_common: PciDeviceCommonConfig { id: Some("_disk0"), iommu: false, pci_segment: 0, pci_device_id: None }, path: None, readonly: false, direct: false, num_queues: 1, queue_size: 128, vhost_user: true, vhost_socket: Some("/mnt/local-nvme/cats-warm-concurrent-2x512-barrier/cat-01/run/vhost-user-blk.sock"), rate_limit_group: None, rate_limiter_config: None, disable_io_uring: false, disable_aio: false, serial: None, queue_affinity: None, backing_files: false, sparse: true, image_type: Unknown, lock_granularity: ByteRange }
+cloud-hypervisor:   0.004098s: <vmm> INFO:virtio-devices/src/vhost_user/blk.rs:78 -- Restoring vhost-user-block _disk0
+cloud-hypervisor:   0.004212s: <vmm> INFO:vmm/src/device_manager.rs:2700 -- Creating virtio-block device: DiskConfig { pci_common: PciDeviceCommonConfig { id: Some("_disk1"), iommu: false, pci_segment: 0, pci_device_id: None }, path: Some("/mnt/local-nvme/cats-warm-concurrent-2x512-barrier/cat-01/run/seed.img"), readonly: false, direct: false, num_queues: 1, queue_size: 128, vhost_user: false, vhost_socket: None, rate_limit_group: None, rate_limiter_config: None, disable_io_uring: false, disable_aio: false, serial: None, queue_affinity: None, backing_files: false, sparse: true, image_type: Raw, lock_granularity: ByteRange }
+cloud-hypervisor:   0.004352s: <vmm> INFO:block/src/factory.rs:153 -- Opening RAW disk file with io_uring backend
+cloud-hypervisor:   0.004365s: <vmm> INFO:virtio-devices/src/block.rs:818 -- Restoring virtio-block _disk1
+cloud-hypervisor:   0.004385s: <vmm> INFO:vmm/src/device_manager.rs:2929 -- Creating virtio-net device: NetConfig { pci_common: PciDeviceCommonConfig { id: Some("_net2"), iommu: false, pci_segment: 0, pci_device_id: None }, tap: Some("cwt01"), ip: None, mask: None, mac: MacAddr { bytes: [2, 202, 117, 16, 0, 1] }, host_mac: Some(MacAddr { bytes: [254, 237, 156, 225, 238, 185] }), mtu: None, num_queues: 2, queue_size: 256, vhost_user: false, vhost_socket: None, vhost_mode: Client, fds: None, rate_limiter_config: None, offload_tso: true, offload_ufo: true, offload_csum: true }
+cloud-hypervisor:   0.004528s: <vmm> WARN:net_util/src/open_tap.rs:84 -- Tap cwt01 already exists. IP configuration will not be overwritten.
+cloud-hypervisor:   0.004613s: <vmm> INFO:virtio-devices/src/net.rs:557 -- Restoring virtio-net _net2
+cloud-hypervisor:   0.004625s: <vmm> INFO:vmm/src/device_manager.rs:3091 -- Creating virtio-rng device: RngConfig { pci_common: PciDeviceCommonConfig { id: None, iommu: false, pci_segment: 0, pci_device_id: None }, src: "/dev/urandom" }
+cloud-hypervisor:   0.004653s: <vmm> INFO:virtio-devices/src/rng.rs:190 -- Restoring virtio-rng __rng
+cloud-hypervisor:   0.004666s: <vmm> INFO:vmm/src/device_manager.rs:4756 -- Restoring virtio-pci _virtio-pci-_disk0 resources
+cloud-hypervisor:   0.005223s: <vmm> INFO:vmm/src/device_manager.rs:4756 -- Restoring virtio-pci _virtio-pci-_disk1 resources
+cloud-hypervisor:   0.005506s: <vmm> INFO:virtio-devices/src/block.rs:1089 -- Changing cache mode to writeback
+cloud-hypervisor:   0.005660s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = virtio-device event = activated id = _disk1
+cloud-hypervisor:   0.005697s: <vmm> INFO:vmm/src/device_manager.rs:4756 -- Restoring virtio-pci _virtio-pci-_net2 resources
+cloud-hypervisor:   0.006490s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = virtio-device event = activated id = _net2
+cloud-hypervisor:   0.006562s: <vmm> INFO:vmm/src/device_manager.rs:4756 -- Restoring virtio-pci _virtio-pci-__rng resources
+cloud-hypervisor:   0.006866s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = virtio-device event = activated id = __rng
+cloud-hypervisor:   0.006929s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = restoring 
+cloud-hypervisor:   0.006944s: <vmm> INFO:virtio-devices/src/block.rs:1042 -- Acquired Write lock for disk image id=_disk1,path=/mnt/local-nvme/cats-warm-concurrent-2x512-barrier/cat-01/run/seed.img
+cloud-hypervisor:   0.006955s: <vmm> INFO:vmm/src/cpu.rs:1513 -- Starting vCPUs: desired = 2, allocated = 2, present = 0, paused = true
+cloud-hypervisor:   0.019255s: <vcpu0> INFO:vmm/src/cpu.rs:1314 -- vCPU 0: core scheduling cookie = 0xb3946fad
+cloud-hypervisor:   0.019258s: <vcpu1> INFO:vmm/src/cpu.rs:1314 -- vCPU 1: core scheduling cookie = 0xb3946fad
+cloud-hypervisor:   0.019750s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = restored 
+cloud-hypervisor:   0.021252s: <vmm> INFO:vmm/src/api/mod.rs:1346 -- API request event: VmInfo
+cloud-hypervisor:   0.024166s: <vmm> INFO:vmm/src/api/mod.rs:1703 -- API request event: VmResume
+cloud-hypervisor:   0.024176s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = resuming 
+cloud-hypervisor:   0.024190s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:   0.024235s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-net
+cloud-hypervisor:   0.024253s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-rng
+cloud-hypervisor:   0.024265s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:   0.025335s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = resumed 
+cloud-hypervisor:   1.946431s: <uffd-handler> INFO:vmm/src/memory_manager.rs:1340 -- UFFD handler: prefault done in 1.944s — prefaulted=111086 served=19986 total=131072
+cloud-hypervisor:   1.994642s: <vmm> INFO:vmm/src/lib.rs:2080 -- VM exit event
+cloud-hypervisor:   1.994677s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:   1.994884s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-net
+cloud-hypervisor:   1.994912s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-rng
+cloud-hypervisor:   1.994933s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:   1.996095s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = shutdown 
+cloud-hypervisor:   1.996119s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:   1.996155s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-net
+cloud-hypervisor:   1.996177s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-rng
+cloud-hypervisor:   1.996195s: <vmm> INFO:virtio-devices/src/device.rs:485 -- Resuming virtio-block
+cloud-hypervisor:   2.100386s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vm event = deleted 
+cloud-hypervisor:   2.100421s: <vmm> INFO:event_monitor/src/lib.rs:113 -- Event: source = vmm event = shutdown 
+cloud-hypervisor:   2.100997s: <main> INFO:cloud-hypervisor/src/main.rs:962 -- Cloud Hypervisor exited successfully

@@ -1,0 +1,31 @@
+# Cats 文档索引
+
+HTML 面向人类阅读和视觉演示；同名 Markdown 面向 Agent/实现者，包含可检索正文、Mermaid 图、明确状态和本地证据链接。实验总报告原生为 Markdown。
+
+如果同一设计的两种格式暂时不同，以 ADR 和实验数据为最高依据，随后以 Markdown 的实现约束为准，并尽快同步 HTML。
+
+## 当前基线
+
+| 文档 | 人类版 | Agent 版 | 状态 | 用途 |
+|---|---|---|---|---|
+| 完整产品与技术架构 | [HTML](cats-complete-product-technical-architecture.html) | [Markdown](cats-complete-product-technical-architecture.md) | 产品/系统基线 | 资源模型、CLI/API、控制面、Node、VM、网络、存储、安全、可靠性和交付阶段 |
+| Direct-S3 ChunkStore（Direct-OS 实现）详细设计 | [HTML](direct-s3-chunkstore-architecture.html) | [Markdown](direct-s3-chunkstore-architecture.md) | 已选定存储基线（ADR-0003） | cats-blockd 的对象块存储：Chunk/Map、Pending Commit、FLUSH、lease/fencing、Snapshot、GC 与恢复 |
+| 睡眠、唤醒与资源回收 | [HTML](cats-sleep-wake-vmm-resource-reclamation.html) | [Markdown](cats-sleep-wake-vmm-resource-reclamation.md) | 生命周期基线（ADR-0002 四态） | Running、Suspended（pause/page-out）、Warm（snapshot/VMM exit）、Cold 的资源与失败处理 |
+| 实验总报告 | — | [Markdown](experiments-2026-07-21-storage-lifecycle.md) | 实验证据 | 方法、代码、正式数字、失败尝试、结论和未验证事项 |
+
+## 历史方案与外部参考
+
+| 文档 | 人类版 | Agent 版 | 状态 | 用途 |
+|---|---|---|---|---|
+| 存储架构设计（JuiceFS raw 方案） | [HTML](cats-storage-product-blueprint.html) | [Markdown](cats-storage-product-blueprint.md) | 历史参考，未采用（ADR-0003） | RootDisk/PersistentDisk 产品语义的最初出处；JuiceFS-backed disk.raw 备选设计 |
+| Sprite 小文件存储路径 | [HTML](sprite-storage-flow.html) | [Markdown](sprite-storage-flow.md) | 历史/竞品参考 | 解释小文件、ext4 逻辑块、Chunk 和对象存储之间的关系 |
+
+`Sprite` 文档用于理解和比较，不代表 Cats 必须复刻其未公开实现。Direct-S3（Direct-OS 实现）已按 ADR-0003 选定为存储基线；当前 Python 原型只证明语义，不能代表生产性能。JuiceFS 蓝图不再实现，其中与后端无关的产品语义已并入完整架构文档。
+
+## Architecture Decision Records
+
+- [ADR-0001：Greenfield implementation baseline](decisions/0001-greenfield-implementation-baseline.md)
+- [ADR-0002：生命周期四态 Running / Suspended / Warm / Cold](decisions/0002-lifecycle-states-running-suspended-warm-cold.md)
+- [ADR-0003：存储后端选定 Direct-OS ChunkStore（Direct-S3 实现）](decisions/0003-direct-s3-chunkstore-backend.md)
+
+后续发生会改变数据格式、公开 API、故障语义或组件边界的决定时，应新增 ADR，而不是直接覆盖实验结论。

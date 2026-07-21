@@ -1,0 +1,916 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="交互解释 Sprite 中 10 万小文件如何从 ext4/NVMe 进入 chunk object storage，并由 SQLite + Litestream 保存 block map。">
+  <title>Sprite 存储路径：10 万小文件去了哪里？</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #071019;
+      --panel: #0d1a25;
+      --panel-2: #111f2c;
+      --ink: #edf4ec;
+      --muted: #98a9ac;
+      --line: #263b45;
+      --lime: #c7f36b;
+      --cyan: #6be4ef;
+      --orange: #ffad66;
+      --violet: #bda5ff;
+      --danger: #ff758f;
+      --shadow: 0 24px 70px rgb(0 0 0 / 34%);
+      --radius: 22px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      background:
+        radial-gradient(circle at 15% 0%, rgb(107 228 239 / 10%), transparent 33rem),
+        radial-gradient(circle at 95% 20%, rgb(199 243 107 / 9%), transparent 34rem),
+        var(--bg);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.55;
+    }
+
+    a { color: var(--cyan); }
+
+    button { font: inherit; }
+
+    .shell {
+      width: min(1240px, calc(100% - 32px));
+      margin: 0 auto;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1.25fr) minmax(260px, .75fr);
+      gap: 38px;
+      align-items: end;
+      padding: 72px 0 44px;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 20px;
+      color: var(--lime);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .16em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow::before {
+      width: 28px;
+      height: 2px;
+      background: currentColor;
+      content: "";
+    }
+
+    h1 {
+      max-width: 880px;
+      margin: 0;
+      font-size: clamp(40px, 6vw, 78px);
+      font-weight: 780;
+      letter-spacing: -.055em;
+      line-height: .98;
+    }
+
+    .hero-copy {
+      max-width: 780px;
+      margin: 25px 0 0;
+      color: #b8c6c7;
+      font-size: clamp(17px, 2vw, 21px);
+    }
+
+    .hero-answer {
+      padding: 24px;
+      border: 1px solid rgb(199 243 107 / 34%);
+      border-radius: var(--radius);
+      background: linear-gradient(145deg, rgb(199 243 107 / 12%), rgb(107 228 239 / 5%));
+      box-shadow: var(--shadow);
+    }
+
+    .hero-answer small {
+      display: block;
+      margin-bottom: 10px;
+      color: var(--lime);
+      font-size: 11px;
+      font-weight: 850;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+
+    .hero-answer strong {
+      display: block;
+      font-size: 22px;
+      line-height: 1.3;
+    }
+
+    .hero-answer p {
+      margin: 12px 0 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .stage-panel {
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      background: rgb(10 22 32 / 86%);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(14px);
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 9px;
+      align-items: center;
+      padding: 15px;
+      overflow-x: auto;
+      border-bottom: 1px solid var(--line);
+      background: rgb(255 255 255 / 2%);
+    }
+
+    .stage-button,
+    .play-button {
+      min-height: 42px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      white-space: nowrap;
+      transition: border-color .2s ease, color .2s ease, background .2s ease, transform .2s ease;
+    }
+
+    .stage-button {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      padding: 0 16px;
+    }
+
+    .stage-button:hover,
+    .play-button:hover {
+      border-color: #52707c;
+      color: var(--ink);
+      transform: translateY(-1px);
+    }
+
+    .stage-button[aria-selected="true"] {
+      border-color: rgb(199 243 107 / 50%);
+      background: var(--lime);
+      color: #142006;
+      font-weight: 780;
+    }
+
+    .stage-number {
+      display: grid;
+      width: 22px;
+      height: 22px;
+      place-items: center;
+      border: 1px solid currentColor;
+      border-radius: 50%;
+      font-size: 11px;
+    }
+
+    .play-button {
+      display: grid;
+      width: 42px;
+      min-width: 42px;
+      margin-left: auto;
+      padding: 0;
+      place-items: center;
+      color: var(--cyan);
+      font-size: 15px;
+    }
+
+    .stage-copy {
+      display: grid;
+      grid-template-columns: 180px minmax(0, 1fr) auto;
+      gap: 20px;
+      align-items: center;
+      min-height: 92px;
+      padding: 17px 22px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .stage-copy-label {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+
+    #stage-title {
+      display: block;
+      margin-top: 2px;
+      color: var(--ink);
+      font-size: 20px;
+      letter-spacing: -.02em;
+      text-transform: none;
+    }
+
+    #stage-description {
+      margin: 0;
+      color: #c0cccc;
+      font-size: 14px;
+    }
+
+    .truth-pill {
+      padding: 8px 12px;
+      border: 1px solid rgb(107 228 239 / 27%);
+      border-radius: 999px;
+      background: rgb(107 228 239 / 7%);
+      color: var(--cyan);
+      font-size: 11px;
+      font-weight: 750;
+      white-space: nowrap;
+    }
+
+    .diagram-wrap {
+      position: relative;
+      padding: 18px;
+      background:
+        linear-gradient(rgb(255 255 255 / 2%) 1px, transparent 1px),
+        linear-gradient(90deg, rgb(255 255 255 / 2%) 1px, transparent 1px);
+      background-size: 34px 34px;
+    }
+
+    .diagram {
+      display: block;
+      width: 100%;
+      height: auto;
+      min-height: 520px;
+    }
+
+    .svg-card {
+      fill: #0d1b26;
+      stroke: #2b404a;
+      stroke-width: 1.5;
+      transition: opacity .35s ease, stroke .35s ease, filter .35s ease;
+    }
+
+    .svg-card-inner {
+      fill: #101f2b;
+      stroke: #2a3c46;
+      stroke-width: 1;
+    }
+
+    .svg-label {
+      fill: #edf4ec;
+      font-size: 19px;
+      font-weight: 750;
+      letter-spacing: -.02em;
+    }
+
+    .svg-kicker {
+      fill: #93a6aa;
+      font-size: 10px;
+      font-weight: 750;
+      letter-spacing: .12em;
+    }
+
+    .svg-body { fill: #aab9ba; font-size: 12px; }
+    .svg-mini { fill: #819499; font-size: 10px; }
+    .svg-code { fill: #d6e3dc; font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .svg-accent { fill: var(--lime); }
+    .svg-cyan { fill: var(--cyan); }
+    .svg-orange { fill: var(--orange); }
+    .svg-violet { fill: var(--violet); }
+
+    .flow {
+      fill: none;
+      stroke: #49606b;
+      stroke-width: 2.3;
+      stroke-linecap: round;
+      stroke-dasharray: 8 9;
+      opacity: .14;
+      transition: opacity .35s ease, stroke .35s ease;
+    }
+
+    .flow-dot {
+      opacity: 0;
+      transition: opacity .3s ease;
+    }
+
+    .node-group { transition: opacity .35s ease, filter .35s ease; }
+
+    body[data-stage="write"] .flow-write,
+    body[data-stage="persist"] .flow-persist,
+    body[data-stage="sleep"] .flow-sleep,
+    body[data-stage="wake"] .flow-wake {
+      opacity: 1;
+      stroke: var(--lime);
+      animation: dash 1.1s linear infinite;
+    }
+
+    body[data-stage="write"] .dot-write,
+    body[data-stage="persist"] .dot-persist,
+    body[data-stage="wake"] .dot-wake { opacity: 1; }
+
+    body[data-stage="write"] .node-write,
+    body[data-stage="persist"] .node-persist,
+    body[data-stage="sleep"] .node-sleep,
+    body[data-stage="wake"] .node-wake {
+      filter: url(#glow);
+    }
+
+    body[data-stage="sleep"] .nvme-active {
+      opacity: .24;
+      filter: grayscale(.7);
+    }
+
+    .sleep-stamp {
+      opacity: 0;
+      transition: opacity .35s ease;
+    }
+
+    body[data-stage="sleep"] .sleep-stamp { opacity: 1; }
+
+    .wake-only { opacity: .12; transition: opacity .35s ease; }
+    body[data-stage="wake"] .wake-only { opacity: 1; }
+
+    .block {
+      stroke: rgb(255 255 255 / 8%);
+      stroke-width: 1;
+      transition: opacity .3s ease, fill .3s ease;
+    }
+
+    body[data-stage="write"] .dirty-block {
+      animation: block-pulse 1.5s ease-in-out infinite alternate;
+    }
+
+    @keyframes dash { to { stroke-dashoffset: -34; } }
+    @keyframes block-pulse { to { filter: brightness(1.35); } }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 20px;
+      padding: 0 22px 19px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .legend-item { display: flex; gap: 7px; align-items: center; }
+
+    .legend-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--lime);
+    }
+
+    .legend-dot.cyan { background: var(--cyan); }
+    .legend-dot.orange { background: var(--orange); }
+    .legend-dot.violet { background: var(--violet); }
+
+    .takeaways {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 16px;
+      margin: 28px 0 72px;
+    }
+
+    .takeaway {
+      min-height: 220px;
+      padding: 25px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: linear-gradient(150deg, rgb(255 255 255 / 4%), rgb(255 255 255 / 1.5%));
+    }
+
+    .takeaway-index {
+      display: grid;
+      width: 34px;
+      height: 34px;
+      margin-bottom: 35px;
+      place-items: center;
+      border: 1px solid var(--line);
+      border-radius: 50%;
+      color: var(--lime);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .takeaway h2 {
+      margin: 0 0 10px;
+      font-size: 21px;
+      letter-spacing: -.03em;
+    }
+
+    .takeaway p { margin: 0; color: var(--muted); font-size: 14px; }
+
+    .deep-dive {
+      display: grid;
+      grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr);
+      gap: 26px;
+      margin-bottom: 80px;
+    }
+
+    .deep-dive-intro {
+      position: sticky;
+      top: 24px;
+      align-self: start;
+      padding: 28px;
+      border-left: 2px solid var(--lime);
+    }
+
+    .deep-dive-intro h2 {
+      margin: 0 0 14px;
+      font-size: clamp(28px, 4vw, 45px);
+      letter-spacing: -.045em;
+      line-height: 1.05;
+    }
+
+    .deep-dive-intro p { margin: 0; color: var(--muted); }
+
+    .stack-list {
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+    }
+
+    .stack-row {
+      display: grid;
+      grid-template-columns: 150px minmax(0, 1fr);
+      gap: 18px;
+      padding: 23px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .stack-row:last-child { border-bottom: 0; }
+    .stack-row strong { color: var(--ink); font-size: 14px; }
+    .stack-row p { margin: 0; color: var(--muted); font-size: 14px; }
+
+    .fact-strip {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      margin-bottom: 80px;
+    }
+
+    .fact {
+      padding: 26px;
+      border-radius: var(--radius);
+      background: #dce8dd;
+      color: #112018;
+    }
+
+    .fact:last-child { background: #f4d6b8; color: #29180b; }
+
+    .fact small {
+      display: block;
+      margin-bottom: 12px;
+      font-weight: 850;
+      letter-spacing: .11em;
+      text-transform: uppercase;
+      opacity: .62;
+    }
+
+    .fact strong {
+      display: block;
+      max-width: 520px;
+      font-size: clamp(21px, 3vw, 31px);
+      letter-spacing: -.035em;
+      line-height: 1.18;
+    }
+
+    .sources {
+      display: flex;
+      gap: 30px;
+      justify-content: space-between;
+      padding: 28px 0 48px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .sources p { max-width: 590px; margin: 0; }
+    .sources-links { display: flex; gap: 18px; flex-wrap: wrap; justify-content: flex-end; }
+
+    @media (max-width: 900px) {
+      .hero,
+      .deep-dive { grid-template-columns: 1fr; }
+      .hero { padding-top: 48px; }
+      .takeaways { grid-template-columns: 1fr; }
+      .takeaway { min-height: 0; }
+      .takeaway-index { margin-bottom: 20px; }
+      .deep-dive-intro { position: static; }
+      .stage-copy { grid-template-columns: 1fr; gap: 8px; }
+      .truth-pill { width: fit-content; }
+    }
+
+    @media (max-width: 680px) {
+      .shell { width: min(100% - 20px, 1240px); }
+      .hero { gap: 24px; }
+      .diagram-wrap { padding: 4px; overflow-x: auto; }
+      .diagram { width: 920px; max-width: none; min-height: 500px; }
+      .toolbar { align-items: stretch; }
+      .stage-button { padding: 0 13px; }
+      .stage-button span:last-child { display: none; }
+      .play-button { margin-left: 0; }
+      .fact-strip { grid-template-columns: 1fr; }
+      .stack-row { grid-template-columns: 1fr; gap: 7px; }
+      .sources { flex-direction: column; }
+      .sources-links { justify-content: flex-start; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        scroll-behavior: auto !important;
+        animation-duration: .01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: .01ms !important;
+      }
+    }
+
+    @media print {
+      :root { color-scheme: light; }
+      body { background: white; color: #111; }
+      .toolbar { display: none; }
+      .stage-panel, .takeaway, .stack-list { box-shadow: none; break-inside: avoid; }
+      .hero-answer { color: white; background: #14251f; }
+      .diagram-wrap { background: #071019; }
+    }
+  </style>
+</head>
+<body data-stage="write">
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <div class="eyebrow">Sprite storage, visually explained</div>
+        <h1>10 万个小文件，<br>不会变成一块<br>100GB 镜像。</h1>
+        <p class="hero-copy">Git 操作的是本地 ext4。变化先被 page cache 与 NVMe 吸收，再由高度改造的 JuiceFS 存储层，把实际变化的磁盘块持久化为对象 chunk。</p>
+      </div>
+      <aside class="hero-answer">
+        <small>一句话答案</small>
+        <strong>上传的是脏 chunk，不是整块 NVMe。</strong>
+        <p>SQLite + Litestream 保存“逻辑块 → chunk”的地图；对象存储保存可恢复的数据本体。</p>
+      </aside>
+    </header>
+
+    <section class="stage-panel" aria-labelledby="diagram-heading">
+      <div class="toolbar" role="tablist" aria-label="存储流程阶段">
+        <button class="stage-button" type="button" role="tab" data-stage-target="write" aria-selected="true">
+          <span class="stage-number">1</span><span>Git 写入</span>
+        </button>
+        <button class="stage-button" type="button" role="tab" data-stage-target="persist" aria-selected="false">
+          <span class="stage-number">2</span><span>异步持久化</span>
+        </button>
+        <button class="stage-button" type="button" role="tab" data-stage-target="sleep" aria-selected="false">
+          <span class="stage-number">3</span><span>释放宿主机</span>
+        </button>
+        <button class="stage-button" type="button" role="tab" data-stage-target="wake" aria-selected="false">
+          <span class="stage-number">4</span><span>冷启动恢复</span>
+        </button>
+        <button class="play-button" type="button" id="play-button" aria-label="自动播放流程" title="自动播放">▶</button>
+      </div>
+
+      <div class="stage-copy">
+        <div class="stage-copy-label">
+          当前阶段
+          <strong id="stage-title">Git 写入本地 ext4</strong>
+        </div>
+        <p id="stage-description">packfile 以顺序写为主；checkout 产生大量小文件，但都先走本地 page cache、ext4 和 NVMe。</p>
+        <div class="truth-pill">公开架构 + 明示推断</div>
+      </div>
+
+      <div class="diagram-wrap">
+        <h2 id="diagram-heading" hidden>Sprite 文件写入与恢复流程图</h2>
+        <svg class="diagram" viewBox="0 0 1200 620" role="img" aria-labelledby="svg-title svg-desc">
+          <title id="svg-title">Sprite 从 Git clone 到对象存储的完整数据路径</title>
+          <desc id="svg-desc">Git clone 先写入 Sprite 的 ext4 文件系统和本地 NVMe。改造的 JuiceFS 层把变化磁盘块切成 chunk 上传到对象存储，并把 block map SQLite 通过 Litestream 持久化。宿主释放后可从对象存储恢复到新的 NVMe。</desc>
+          <defs>
+            <linearGradient id="cardGradient" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#11232f"/>
+              <stop offset="1" stop-color="#0a1721"/>
+            </linearGradient>
+            <linearGradient id="nvmeGradient" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#17313b"/>
+              <stop offset="1" stop-color="#0d2027"/>
+            </linearGradient>
+            <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+              <feGaussianBlur stdDeviation="4" result="blur"/>
+              <feFlood flood-color="#c7f36b" flood-opacity=".3"/>
+              <feComposite in2="blur" operator="in"/>
+              <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+            </filter>
+            <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke"/>
+            </marker>
+            <pattern id="tinyFiles" width="13" height="13" patternUnits="userSpaceOnUse">
+              <rect width="7" height="7" rx="1.5" fill="#6be4ef" opacity=".62"/>
+            </pattern>
+          </defs>
+
+          <!-- Flow paths -->
+          <path id="path-write" class="flow flow-write" d="M276 188 C315 188 315 174 350 174" marker-end="url(#arrow)"/>
+          <path id="path-local" class="flow flow-write" d="M702 190 C742 190 748 142 790 142" marker-end="url(#arrow)"/>
+          <path id="path-chunk" class="flow flow-persist" d="M702 350 C760 350 742 410 790 410" marker-end="url(#arrow)"/>
+          <path id="path-meta" class="flow flow-persist" d="M702 468 C752 468 746 515 790 515" marker-end="url(#arrow)"/>
+          <path id="path-sleep" class="flow flow-sleep" d="M972 262 C972 290 972 306 972 328" marker-end="url(#arrow)"/>
+          <path id="path-wake" class="flow flow-wake" d="M1095 365 C1164 300 1162 196 1118 162" marker-end="url(#arrow)"/>
+
+          <!-- Git clone -->
+          <g class="node-group node-write">
+            <rect class="svg-card" x="30" y="84" width="246" height="410" rx="22" fill="url(#cardGradient)"/>
+            <text class="svg-kicker svg-cyan" x="54" y="116">01 · USER WORKLOAD</text>
+            <text class="svg-label" x="54" y="147">git clone</text>
+            <rect class="svg-card-inner" x="52" y="168" width="202" height="67" rx="12"/>
+            <circle cx="70" cy="190" r="4" fill="#ff758f"/>
+            <circle cx="83" cy="190" r="4" fill="#ffad66"/>
+            <circle cx="96" cy="190" r="4" fill="#c7f36b"/>
+            <text class="svg-code" x="68" y="216">$ git clone …</text>
+            <text class="svg-kicker" x="54" y="269">PHASE A · NETWORK</text>
+            <rect x="54" y="282" width="198" height="42" rx="8" fill="#162937"/>
+            <rect x="62" y="291" width="150" height="8" rx="4" fill="#bda5ff" opacity=".78"/>
+            <rect x="62" y="305" width="104" height="7" rx="3.5" fill="#bda5ff" opacity=".35"/>
+            <text class="svg-mini" x="54" y="343">少量大型 packfile · 顺序写</text>
+            <text class="svg-kicker" x="54" y="378">PHASE B · CHECKOUT</text>
+            <rect x="54" y="391" width="198" height="68" rx="9" fill="url(#tinyFiles)" opacity=".78"/>
+            <rect x="160" y="420" width="91" height="38" rx="8" fill="#0b1720" opacity=".95"/>
+            <text class="svg-accent" x="172" y="440" font-size="17" font-weight="800">100,000</text>
+            <text class="svg-mini" x="174" y="452">small files</text>
+            <text class="svg-mini" x="54" y="479">open · write · stat · rename</text>
+          </g>
+
+          <!-- Sprite VM -->
+          <g class="node-group node-write node-persist">
+            <rect class="svg-card" x="350" y="52" width="352" height="516" rx="24" fill="url(#cardGradient)"/>
+            <text class="svg-kicker svg-accent" x="376" y="84">02 · SPRITE VM</text>
+            <text class="svg-label" x="376" y="115">标准 ext4 可写磁盘</text>
+            <text class="svg-body" x="376" y="138">Git 不知道后面有 JuiceFS 或对象存储</text>
+
+            <rect class="svg-card-inner" x="374" y="158" width="304" height="131" rx="14"/>
+            <text class="svg-kicker" x="394" y="184">LOGICAL BLOCKS · SPARSE</text>
+            <g transform="translate(394 200)">
+              <rect class="block dirty-block" x="0" y="0" width="31" height="27" rx="4" fill="#c7f36b"/>
+              <rect class="block dirty-block" x="37" y="0" width="31" height="27" rx="4" fill="#c7f36b" opacity=".68"/>
+              <rect class="block" x="74" y="0" width="31" height="27" rx="4" fill="#203541"/>
+              <rect class="block dirty-block" x="111" y="0" width="31" height="27" rx="4" fill="#6be4ef"/>
+              <rect class="block" x="148" y="0" width="31" height="27" rx="4" fill="#203541"/>
+              <rect class="block dirty-block" x="185" y="0" width="31" height="27" rx="4" fill="#ffad66"/>
+              <rect class="block" x="222" y="0" width="31" height="27" rx="4" fill="#203541"/>
+              <rect class="block dirty-block" x="259" y="0" width="23" height="27" rx="4" fill="#6be4ef" opacity=".72"/>
+              <rect class="block" x="0" y="34" width="31" height="27" rx="4" fill="#203541"/>
+              <rect class="block dirty-block" x="37" y="34" width="31" height="27" rx="4" fill="#bda5ff"/>
+              <rect class="block dirty-block" x="74" y="34" width="31" height="27" rx="4" fill="#c7f36b" opacity=".75"/>
+              <rect class="block" x="111" y="34" width="31" height="27" rx="4" fill="#203541"/>
+              <rect class="block" x="148" y="34" width="31" height="27" rx="4" fill="#203541"/>
+              <rect class="block dirty-block" x="185" y="34" width="31" height="27" rx="4" fill="#ffad66" opacity=".72"/>
+              <rect class="block dirty-block" x="222" y="34" width="31" height="27" rx="4" fill="#6be4ef"/>
+              <rect class="block" x="259" y="34" width="23" height="27" rx="4" fill="#203541"/>
+            </g>
+            <text class="svg-mini" x="394" y="277">彩色 = 新增/修改块 · 深色 = 未变/空洞</text>
+
+            <rect class="svg-card-inner" x="374" y="309" width="304" height="93" rx="14"/>
+            <text class="svg-kicker svg-orange" x="394" y="334">HIGHLY MODIFIED JUICEFS LAYER</text>
+            <text class="svg-label" x="394" y="362" font-size="16">脏块 → immutable chunks</text>
+            <text class="svg-mini" x="394" y="384">不是“一文件一对象”，也不是“整盘镜像”</text>
+
+            <rect class="svg-card-inner" x="374" y="422" width="304" height="115" rx="14"/>
+            <g transform="translate(394 446)">
+              <ellipse cx="34" cy="7" rx="34" ry="7" fill="#bda5ff" opacity=".9"/>
+              <rect x="0" y="7" width="68" height="39" fill="#302b4d"/>
+              <ellipse cx="34" cy="46" rx="34" ry="7" fill="#201e36" stroke="#bda5ff"/>
+              <ellipse cx="34" cy="7" rx="34" ry="7" fill="#bda5ff"/>
+            </g>
+            <text class="svg-kicker svg-violet" x="482" y="447">SQLITE BLOCK MAP</text>
+            <text class="svg-code" x="482" y="470">block 42 → chunk A</text>
+            <text class="svg-code" x="482" y="490">block 43 → chunk A</text>
+            <text class="svg-code" x="482" y="510">block 80 → chunk B</text>
+            <text class="svg-mini" x="394" y="528">Litestream 复制这张“地图”</text>
+          </g>
+
+          <!-- NVMe -->
+          <g class="node-group node-write node-wake nvme-active">
+            <rect class="svg-card" x="790" y="68" width="378" height="194" rx="22" fill="url(#nvmeGradient)"/>
+            <text class="svg-kicker svg-cyan" x="816" y="100">03 · CURRENT HOST</text>
+            <text class="svg-label" x="816" y="131">稀疏 NVMe 热层</text>
+            <text class="svg-body" x="816" y="154">page cache · ext4 blocks · cached chunks</text>
+            <g transform="translate(816 177)">
+              <rect x="0" y="0" width="322" height="50" rx="10" fill="#09151d" stroke="#2d4650"/>
+              <rect x="8" y="8" width="49" height="34" rx="6" fill="#c7f36b" opacity=".88"/>
+              <rect x="62" y="8" width="72" height="34" rx="6" fill="#6be4ef" opacity=".72"/>
+              <rect x="139" y="8" width="29" height="34" rx="6" fill="#ffad66" opacity=".82"/>
+              <rect x="173" y="8" width="141" height="34" rx="6" fill="#152833"/>
+              <text x="220" y="30" fill="#688087" font-size="10">unallocated / empty</text>
+            </g>
+            <text class="svg-mini" x="816" y="246">最大 100GB ≠ 预先占满 100GB</text>
+          </g>
+
+          <g class="sleep-stamp">
+            <rect x="882" y="132" width="192" height="54" rx="12" fill="#ff758f" transform="rotate(-7 978 159)"/>
+            <text x="912" y="165" fill="#25070e" font-size="17" font-weight="900" transform="rotate(-7 978 159)">HOST RELEASED</text>
+          </g>
+
+          <!-- Object storage -->
+          <g class="node-group node-persist node-sleep node-wake">
+            <rect class="svg-card" x="790" y="328" width="378" height="240" rx="22" fill="url(#cardGradient)"/>
+            <text class="svg-kicker svg-accent" x="816" y="360">04 · DURABLE LAYER</text>
+            <text class="svg-label" x="816" y="390">S3-compatible object storage</text>
+
+            <rect class="svg-card-inner" x="816" y="411" width="326" height="59" rx="12"/>
+            <g transform="translate(832 427)">
+              <path d="M0 10 C0 4 7 0 15 0 C23 0 27 3 30 8 C33 6 37 5 42 5 C50 5 56 10 56 17 C56 24 50 28 42 28 H13 C5 28 0 22 0 16 Z" fill="#c7f36b" opacity=".22" stroke="#c7f36b"/>
+            </g>
+            <text class="svg-kicker svg-accent" x="902" y="433">DATA CHUNKS</text>
+            <text class="svg-mini" x="902" y="452">A · B · C · immutable payloads</text>
+
+            <rect class="svg-card-inner" x="816" y="485" width="326" height="59" rx="12"/>
+            <g transform="translate(834 500)">
+              <rect x="0" y="0" width="48" height="30" rx="5" fill="#bda5ff" opacity=".24" stroke="#bda5ff"/>
+              <path d="M9 9 H39 M9 15 H34 M9 21 H27" stroke="#bda5ff" stroke-width="2"/>
+            </g>
+            <text class="svg-kicker svg-violet" x="902" y="507">METADATA · LTX</text>
+            <text class="svg-mini" x="902" y="526">SQLite pages · block-map history</text>
+            <text class="svg-mini" x="816" y="558">权威状态在这里，本地 NVMe 可以重建</text>
+          </g>
+
+          <!-- Wake label -->
+          <g class="wake-only">
+            <rect x="1019" y="272" width="132" height="38" rx="19" fill="#102b2e" stroke="#6be4ef"/>
+            <text class="svg-cyan" x="1041" y="296" font-size="11" font-weight="800">ON-DEMAND FETCH</text>
+          </g>
+
+          <!-- Animated particles -->
+          <circle class="flow-dot dot-write" r="5" fill="#c7f36b">
+            <animateMotion dur="1.6s" repeatCount="indefinite"><mpath href="#path-write"/></animateMotion>
+          </circle>
+          <circle class="flow-dot dot-write" r="5" fill="#6be4ef">
+            <animateMotion dur="1.8s" repeatCount="indefinite"><mpath href="#path-local"/></animateMotion>
+          </circle>
+          <circle class="flow-dot dot-persist" r="5" fill="#c7f36b">
+            <animateMotion dur="1.8s" repeatCount="indefinite"><mpath href="#path-chunk"/></animateMotion>
+          </circle>
+          <circle class="flow-dot dot-persist" r="5" fill="#bda5ff">
+            <animateMotion dur="2.1s" repeatCount="indefinite"><mpath href="#path-meta"/></animateMotion>
+          </circle>
+          <circle class="flow-dot dot-wake" r="5" fill="#6be4ef">
+            <animateMotion dur="2.2s" repeatCount="indefinite"><mpath href="#path-wake"/></animateMotion>
+          </circle>
+        </svg>
+      </div>
+
+      <div class="legend" aria-label="图例">
+        <span class="legend-item"><span class="legend-dot"></span>文件数据 / 脏块</span>
+        <span class="legend-item"><span class="legend-dot cyan"></span>本地热路径</span>
+        <span class="legend-item"><span class="legend-dot orange"></span>ext4 元数据块</span>
+        <span class="legend-item"><span class="legend-dot violet"></span>block map / Litestream</span>
+      </div>
+    </section>
+
+    <section class="takeaways" aria-label="三个关键结论">
+      <article class="takeaway">
+        <div class="takeaway-index">01</div>
+        <h2>不是一文件一对象</h2>
+        <p>Git 创建的文件先变成 ext4 数据块、inode 与目录项。对象存储层看到的是 chunk，不是 README.md 这样的文件名。</p>
+      </article>
+      <article class="takeaway">
+        <div class="takeaway-index">02</div>
+        <h2>不是上传整盘</h2>
+        <p>100GB 是稀疏上限。系统只持久化实际变化的块；未分配空间、未变化的 base 与已有缓存无需重新上传。</p>
+      </article>
+      <article class="takeaway">
+        <div class="takeaway-index">03</div>
+        <h2>两条异步路径</h2>
+        <p>文件块成为 data chunks；块映射成为 SQLite/LTX。两者最终都进入对象存储，但 Fly 未公开它们的原子提交细节。</p>
+      </article>
+    </section>
+
+    <section class="deep-dive">
+      <div class="deep-dive-intro">
+        <div class="eyebrow">One file, four representations</div>
+        <h2>一个文件，在四层里长得完全不同。</h2>
+        <p>这也是为什么“10 万小文件”不能直接等价为“10 万次 S3 PUT”。</p>
+      </div>
+      <div class="stack-list">
+        <div class="stack-row">
+          <strong>Git 视角</strong>
+          <p><code>src/main.c</code>，通过 open/write/rename 等 POSIX 操作创建。Git 的 HTTPS、SSH 或 file:// 传输协议与底层持久化无关。</p>
+        </div>
+        <div class="stack-row">
+          <strong>ext4 视角</strong>
+          <p>数据 block + inode + directory entry + allocation bitmap。小文件也可能消耗一个或多个块，因此有空间放大。</p>
+        </div>
+        <div class="stack-row">
+          <strong>JuiceFS 层视角</strong>
+          <p>哪些逻辑块变脏，以及它们对应哪些 immutable chunk。公开资料没有披露 chunk 大小与聚合算法。</p>
+        </div>
+        <div class="stack-row">
+          <strong>对象存储视角</strong>
+          <p>没有“文件目录”；只有 data chunk 对象和 block-map 的 LTX 对象。恢复时依靠映射重新拼出同一块 ext4 磁盘。</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="fact-strip" aria-label="边界说明">
+      <article class="fact">
+        <small>已经公开</small>
+        <strong>稀疏 100GB NVMe、immutable chunks、SQLite block map、Litestream 与对象存储。</strong>
+      </article>
+      <article class="fact">
+        <small>尚未公开</small>
+        <strong>chunk 粒度、压缩/聚合策略、数据与 metadata 的提交顺序和最坏写放大。</strong>
+      </article>
+    </section>
+
+    <footer class="sources">
+      <p>本图基于 Fly.io 公开资料。为了把 ext4 与 block map 串起来，图中包含结构性推断；它不是 Fly.io 内部实现文档，也不代表标准 JuiceFS 的默认架构。</p>
+      <div class="sources-links">
+        <a href="https://fly.io/blog/design-and-implementation/" target="_blank" rel="noreferrer">Sprites architecture ↗</a>
+        <a href="https://fly.io/blog/litestream-writable-vfs/" target="_blank" rel="noreferrer">Litestream VFS ↗</a>
+        <a href="https://fly.io/sprites" target="_blank" rel="noreferrer">Persistence & checkpoints ↗</a>
+      </div>
+    </footer>
+  </main>
+
+  <script>
+    (function () {
+      var stages = ['write', 'persist', 'sleep', 'wake'];
+      var content = {
+        write: {
+          title: 'Git 写入本地 ext4',
+          description: 'packfile 以顺序写为主；checkout 产生大量小文件，但都先走本地 page cache、ext4 和 NVMe。'
+        },
+        persist: {
+          title: '只持久化变化的块',
+          description: '脏块成为 immutable data chunks；block map 的 SQLite pages 由 Litestream 变成 LTX。不是整盘上传。'
+        },
+        sleep: {
+          title: '宿主与 NVMe 可以释放',
+          description: '同步完成后，权威状态在对象存储。当前宿主机和 NVMe 缓存都不再是恢复所必需的。'
+        },
+        wake: {
+          title: '在新宿主按需重建',
+          description: '先通过 Litestream VFS 查询 block map；访问文件时拉取对应 chunk，并逐步填热新的 NVMe 缓存。'
+        }
+      };
+      var buttons = Array.prototype.slice.call(document.querySelectorAll('[data-stage-target]'));
+      var playButton = document.getElementById('play-button');
+      var title = document.getElementById('stage-title');
+      var description = document.getElementById('stage-description');
+      var timer = null;
+
+      function selectStage(stage) {
+        document.body.dataset.stage = stage;
+        buttons.forEach(function (button) {
+          button.setAttribute('aria-selected', String(button.dataset.stageTarget === stage));
+        });
+        title.textContent = content[stage].title;
+        description.textContent = content[stage].description;
+      }
+
+      function stopPlaying() {
+        if (timer) {
+          window.clearInterval(timer);
+          timer = null;
+        }
+        playButton.textContent = '▶';
+        playButton.setAttribute('aria-label', '自动播放流程');
+        playButton.title = '自动播放';
+      }
+
+      function startPlaying() {
+        var current = stages.indexOf(document.body.dataset.stage);
+        playButton.textContent = 'Ⅱ';
+        playButton.setAttribute('aria-label', '暂停自动播放');
+        playButton.title = '暂停';
+        timer = window.setInterval(function () {
+          current = (current + 1) % stages.length;
+          selectStage(stages[current]);
+        }, 2600);
+      }
+
+      buttons.forEach(function (button) {
+        button.addEventListener('click', function () {
+          stopPlaying();
+          selectStage(button.dataset.stageTarget);
+        });
+      });
+
+      playButton.addEventListener('click', function () {
+        if (timer) stopPlaying();
+        else startPlaying();
+      });
+
+      document.addEventListener('visibilitychange', function () {
+        if (document.hidden) stopPlaying();
+      });
+    }());
+  </script>
+</body>
+</html>

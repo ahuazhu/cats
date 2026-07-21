@@ -1,0 +1,11 @@
+
+==> Concurrent summary
+workers                  5
+wake_start_spread_ms     3.695
+snapshot_ms              p50=  284.875 ms  max=  292.252 ms
+wake_to_health_ms        p50=  504.794 ms  max=  555.324 ms
+touch_wall_ms            p50= 1440.767 ms  max= 1769.513 ms
+full_memory_ready_ms     p50= 2256.232 ms  max= 2514.896 ms
+warm_runtime_rss_kib     max=0 KiB
+boot_id_preserved        5/5
+results                  /mnt/local-nvme/cats-warm-concurrent-5x512-barrier/concurrent-summary.csv

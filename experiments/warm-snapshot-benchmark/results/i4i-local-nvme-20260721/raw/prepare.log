@@ -1,0 +1,638 @@
+
+==> Install build and image tooling
+Hit:1 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy InRelease
+Get:2 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates InRelease [128 kB]
+Get:3 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-backports InRelease [127 kB]
+Get:4 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/universe amd64 Packages [14.1 MB]
+Get:5 http://security.ubuntu.com/ubuntu jammy-security InRelease [129 kB]
+Get:6 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/universe Translation-en [5652 kB]
+Get:7 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/universe amd64 c-n-f Metadata [286 kB]
+Get:8 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/multiverse amd64 Packages [217 kB]
+Get:9 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/multiverse Translation-en [112 kB]
+Get:10 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/multiverse amd64 c-n-f Metadata [8372 B]
+Get:11 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 Packages [3656 kB]
+Get:12 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main Translation-en [547 kB]
+Get:13 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 c-n-f Metadata [20.1 kB]
+Get:14 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/restricted amd64 Packages [6264 kB]
+Get:15 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/restricted Translation-en [1201 kB]
+Get:16 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/universe amd64 Packages [1279 kB]
+Get:17 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/universe Translation-en [322 kB]
+Get:18 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/universe amd64 c-n-f Metadata [30.8 kB]
+Get:19 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/multiverse amd64 Packages [71.6 kB]
+Get:20 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/multiverse Translation-en [15.5 kB]
+Get:21 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/multiverse amd64 c-n-f Metadata [756 B]
+Get:22 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-backports/main amd64 Packages [70.2 kB]
+Get:23 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-backports/main Translation-en [11.4 kB]
+Get:24 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-backports/main amd64 c-n-f Metadata [412 B]
+Get:25 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-backports/restricted amd64 c-n-f Metadata [116 B]
+Get:26 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-backports/universe amd64 Packages [30.8 kB]
+Get:27 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-backports/universe Translation-en [16.9 kB]
+Get:28 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-backports/universe amd64 c-n-f Metadata [676 B]
+Get:29 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-backports/multiverse amd64 c-n-f Metadata [116 B]
+Get:30 http://security.ubuntu.com/ubuntu jammy-security/main amd64 Packages [3374 kB]
+Get:31 http://security.ubuntu.com/ubuntu jammy-security/main Translation-en [477 kB]
+Get:32 http://security.ubuntu.com/ubuntu jammy-security/main amd64 c-n-f Metadata [14.7 kB]
+Get:33 http://security.ubuntu.com/ubuntu jammy-security/restricted amd64 Packages [6012 kB]
+Get:34 http://security.ubuntu.com/ubuntu jammy-security/restricted Translation-en [1151 kB]
+Get:35 http://security.ubuntu.com/ubuntu jammy-security/universe amd64 Packages [1045 kB]
+Get:36 http://security.ubuntu.com/ubuntu jammy-security/universe Translation-en [234 kB]
+Get:37 http://security.ubuntu.com/ubuntu jammy-security/universe amd64 c-n-f Metadata [23.2 kB]
+Get:38 http://security.ubuntu.com/ubuntu jammy-security/multiverse amd64 Packages [64.3 kB]
+Get:39 http://security.ubuntu.com/ubuntu jammy-security/multiverse Translation-en [12.6 kB]
+Get:40 http://security.ubuntu.com/ubuntu jammy-security/multiverse amd64 c-n-f Metadata [544 B]
+Fetched 46.7 MB in 4s (10.8 MB/s)
+Reading package lists...
+Reading package lists...
+Building dependency tree...
+Reading state information...
+git is already the newest version (1:2.34.1-1ubuntu1.17).
+git set to manually installed.
+python3 is already the newest version (3.10.6-1~22.04.1).
+python3 set to manually installed.
+The following additional packages will be installed:
+  bzip2 clang-14 cpp cpp-11 dpkg-dev g++ g++-11 gcc gcc-11 gcc-11-base
+  genisoimage lib32gcc-s1 lib32stdc++6 libasan6 libatomic1 libc-dev-bin
+  libc6-dev libc6-i386 libcc1-0 libclang-common-14-dev libclang-cpp14
+  libclang1-14 libcrypt-dev libcurl4 libdpkg-perl libgc1 libgcc-11-dev
+  libgomp1 libisl23 libitm1 libjq1 libllvm14 liblsan0 libmpc3 libnsl-dev
+  libobjc-11-dev libobjc4 libonig5 libquadmath0 libstdc++-11-dev libtirpc-dev
+  libtsan0 libubsan1 liburing2 linux-libc-dev llvm-14-linker-tools
+  lto-disabled-list make rpcsvc-proto
+Suggested packages:
+  bzip2-doc clang-14-doc mtools cpp-doc gcc-11-locales debian-keyring
+  g++-multilib g++-11-multilib gcc-11-doc gcc-multilib manpages-dev autoconf
+  automake libtool flex bison gdb gcc-doc gcc-11-multilib wodim cdrkit-doc
+  glibc-doc bzr seccomp libstdc++-11-doc make-doc debootstrap
+Recommended packages:
+  llvm-14-dev fakeroot libalgorithm-merge-perl manpages-dev libc-devtools
+  libfile-fcntllock-perl qemu-block-extra
+The following NEW packages will be installed:
+  build-essential bzip2 clang clang-14 cloud-image-utils cpp cpp-11 dpkg-dev
+  g++ g++-11 gcc gcc-11 gcc-11-base genisoimage jq lib32gcc-s1 lib32stdc++6
+  libasan6 libatomic1 libc-dev-bin libc6-dev libc6-i386 libcap-ng-dev libcc1-0
+  libclang-common-14-dev libclang-cpp14 libclang1-14 libcrypt-dev libdpkg-perl
+  libgc1 libgcc-11-dev libgomp1 libisl23 libitm1 libjq1 libllvm14 liblsan0
+  libmpc3 libnsl-dev libobjc-11-dev libobjc4 libonig5 libquadmath0
+  libseccomp-dev libstdc++-11-dev libtirpc-dev libtsan0 libubsan1 liburing2
+  linux-libc-dev llvm-14-linker-tools lto-disabled-list make pkg-config
+  qemu-utils rpcsvc-proto
+The following packages will be upgraded:
+  ca-certificates curl libcurl4
+3 upgraded, 56 newly installed, 0 to remove and 46 not upgraded.
+Need to get 117 MB of archives.
+After this operation, 505 MB of additional disk space will be used.
+Get:1 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 ca-certificates all 20260601~22.04.1 [141 kB]
+Get:2 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 libc-dev-bin amd64 2.35-0ubuntu3.13 [20.3 kB]
+Get:3 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 linux-libc-dev amd64 5.15.0-186.196 [1361 kB]
+Get:4 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/main amd64 libcrypt-dev amd64 1:4.4.27-1 [112 kB]
+Get:5 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/main amd64 rpcsvc-proto amd64 1.4.2-0ubuntu6 [68.5 kB]
+Get:6 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 libtirpc-dev amd64 1.3.2-2ubuntu0.1 [192 kB]
+Get:7 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/main amd64 libnsl-dev amd64 1.3.0-2build2 [71.3 kB]
+Get:8 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 libc6-dev amd64 2.35-0ubuntu3.13 [2101 kB]
+Get:9 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 gcc-11-base amd64 11.4.0-1ubuntu1~22.04.3 [216 kB]
+Get:10 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/main amd64 libisl23 amd64 0.24-2build1 [727 kB]
+Get:11 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/main amd64 libmpc3 amd64 1.2.1-2build1 [46.9 kB]
+Get:12 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 cpp-11 amd64 11.4.0-1ubuntu1~22.04.3 [10.0 MB]
+Get:13 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/main amd64 cpp amd64 4:11.2.0-1ubuntu1 [27.7 kB]
+Get:14 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 libcc1-0 amd64 12.3.0-1ubuntu1~22.04.3 [48.3 kB]
+Get:15 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 libgomp1 amd64 12.3.0-1ubuntu1~22.04.3 [127 kB]
+Get:16 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 libitm1 amd64 12.3.0-1ubuntu1~22.04.3 [30.2 kB]
+Get:17 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 libatomic1 amd64 12.3.0-1ubuntu1~22.04.3 [10.5 kB]
+Get:18 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 libasan6 amd64 11.4.0-1ubuntu1~22.04.3 [2283 kB]
+Get:19 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 liblsan0 amd64 12.3.0-1ubuntu1~22.04.3 [1069 kB]
+Get:20 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 libtsan0 amd64 11.4.0-1ubuntu1~22.04.3 [2260 kB]
+Get:21 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 libubsan1 amd64 12.3.0-1ubuntu1~22.04.3 [976 kB]
+Get:22 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 libquadmath0 amd64 12.3.0-1ubuntu1~22.04.3 [154 kB]
+Get:23 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 libgcc-11-dev amd64 11.4.0-1ubuntu1~22.04.3 [2517 kB]
+Get:24 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 gcc-11 amd64 11.4.0-1ubuntu1~22.04.3 [20.1 MB]
+Get:25 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/main amd64 gcc amd64 4:11.2.0-1ubuntu1 [5112 B]
+Get:26 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 libstdc++-11-dev amd64 11.4.0-1ubuntu1~22.04.3 [2101 kB]
+Get:27 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 g++-11 amd64 11.4.0-1ubuntu1~22.04.3 [11.4 MB]
+Get:28 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/main amd64 g++ amd64 4:11.2.0-1ubuntu1 [1412 B]
+Get:29 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/main amd64 make amd64 4.3-4.1build1 [180 kB]
+Get:30 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 libdpkg-perl all 1.21.1ubuntu2.6 [237 kB]
+Get:31 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/main amd64 bzip2 amd64 1.0.8-5build1 [34.8 kB]
+Get:32 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/main amd64 lto-disabled-list all 24 [12.5 kB]
+Get:33 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 dpkg-dev all 1.21.1ubuntu2.6 [922 kB]
+Get:34 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/main amd64 build-essential amd64 12.9ubuntu3 [4744 B]
+Get:35 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 libllvm14 amd64 1:14.0.0-1ubuntu1.1 [24.0 MB]
+Get:36 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/universe amd64 libclang-cpp14 amd64 1:14.0.0-1ubuntu1.1 [12.1 MB]
+Get:37 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/main amd64 libgc1 amd64 1:8.0.6-1.1build1 [96.8 kB]
+Get:38 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/universe amd64 libobjc4 amd64 12.3.0-1ubuntu1~22.04.3 [48.7 kB]
+Get:39 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/universe amd64 libobjc-11-dev amd64 11.4.0-1ubuntu1~22.04.3 [196 kB]
+Get:40 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 libc6-i386 amd64 2.35-0ubuntu3.13 [2837 kB]
+Get:41 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 lib32gcc-s1 amd64 12.3.0-1ubuntu1~22.04.3 [63.9 kB]
+Get:42 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 lib32stdc++6 amd64 12.3.0-1ubuntu1~22.04.3 [739 kB]
+Get:43 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/universe amd64 libclang-common-14-dev amd64 1:14.0.0-1ubuntu1.1 [5975 kB]
+Get:44 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/universe amd64 llvm-14-linker-tools amd64 1:14.0.0-1ubuntu1.1 [1355 kB]
+Get:45 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/universe amd64 libclang1-14 amd64 1:14.0.0-1ubuntu1.1 [6792 kB]
+Get:46 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/universe amd64 clang-14 amd64 1:14.0.0-1ubuntu1.1 [81.2 kB]
+Get:47 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/universe amd64 clang amd64 1:14.0-55~exp2 [3558 B]
+Get:48 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 curl amd64 7.81.0-1ubuntu1.25 [194 kB]
+Get:49 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 libcurl4 amd64 7.81.0-1ubuntu1.25 [291 kB]
+Get:50 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/main amd64 genisoimage amd64 9:1.1.11-3.2ubuntu1 [370 kB]
+Get:51 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/main amd64 libonig5 amd64 6.9.7.1-2build1 [172 kB]
+Get:52 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 libjq1 amd64 1.6-2.1ubuntu3.2 [135 kB]
+Get:53 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 jq amd64 1.6-2.1ubuntu3.2 [52.5 kB]
+Get:54 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/main amd64 libcap-ng-dev amd64 0.7.9-2.2build3 [22.9 kB]
+Get:55 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 libseccomp-dev amd64 2.5.3-2ubuntu3~22.04.1 [94.1 kB]
+Get:56 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/main amd64 liburing2 amd64 2.1-2build1 [10.3 kB]
+Get:57 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/main amd64 pkg-config amd64 0.29.2-1ubuntu3 [48.2 kB]
+Get:58 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy-updates/main amd64 qemu-utils amd64 1:6.2+dfsg-2ubuntu6.31 [1503 kB]
+Get:59 http://us-east-1.ec2.archive.ubuntu.com/ubuntu jammy/main amd64 cloud-image-utils all 0.32-22-g45fe84a5-0ubuntu1 [19.3 kB]
+Preconfiguring packages ...
+Fetched 117 MB in 1s (108 MB/s)
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 66037 files and directories currently installed.)
+Preparing to unpack .../00-ca-certificates_20260601~22.04.1_all.deb ...
+Unpacking ca-certificates (20260601~22.04.1) over (20240203~22.04.1) ...
+Selecting previously unselected package libc-dev-bin.
+Preparing to unpack .../01-libc-dev-bin_2.35-0ubuntu3.13_amd64.deb ...
+Unpacking libc-dev-bin (2.35-0ubuntu3.13) ...
+Selecting previously unselected package linux-libc-dev:amd64.
+Preparing to unpack .../02-linux-libc-dev_5.15.0-186.196_amd64.deb ...
+Unpacking linux-libc-dev:amd64 (5.15.0-186.196) ...
+Selecting previously unselected package libcrypt-dev:amd64.
+Preparing to unpack .../03-libcrypt-dev_1%3a4.4.27-1_amd64.deb ...
+Unpacking libcrypt-dev:amd64 (1:4.4.27-1) ...
+Selecting previously unselected package rpcsvc-proto.
+Preparing to unpack .../04-rpcsvc-proto_1.4.2-0ubuntu6_amd64.deb ...
+Unpacking rpcsvc-proto (1.4.2-0ubuntu6) ...
+Selecting previously unselected package libtirpc-dev:amd64.
+Preparing to unpack .../05-libtirpc-dev_1.3.2-2ubuntu0.1_amd64.deb ...
+Unpacking libtirpc-dev:amd64 (1.3.2-2ubuntu0.1) ...
+Selecting previously unselected package libnsl-dev:amd64.
+Preparing to unpack .../06-libnsl-dev_1.3.0-2build2_amd64.deb ...
+Unpacking libnsl-dev:amd64 (1.3.0-2build2) ...
+Selecting previously unselected package libc6-dev:amd64.
+Preparing to unpack .../07-libc6-dev_2.35-0ubuntu3.13_amd64.deb ...
+Unpacking libc6-dev:amd64 (2.35-0ubuntu3.13) ...
+Selecting previously unselected package gcc-11-base:amd64.
+Preparing to unpack .../08-gcc-11-base_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking gcc-11-base:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package libisl23:amd64.
+Preparing to unpack .../09-libisl23_0.24-2build1_amd64.deb ...
+Unpacking libisl23:amd64 (0.24-2build1) ...
+Selecting previously unselected package libmpc3:amd64.
+Preparing to unpack .../10-libmpc3_1.2.1-2build1_amd64.deb ...
+Unpacking libmpc3:amd64 (1.2.1-2build1) ...
+Selecting previously unselected package cpp-11.
+Preparing to unpack .../11-cpp-11_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking cpp-11 (11.4.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package cpp.
+Preparing to unpack .../12-cpp_4%3a11.2.0-1ubuntu1_amd64.deb ...
+Unpacking cpp (4:11.2.0-1ubuntu1) ...
+Selecting previously unselected package libcc1-0:amd64.
+Preparing to unpack .../13-libcc1-0_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libcc1-0:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package libgomp1:amd64.
+Preparing to unpack .../14-libgomp1_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libgomp1:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package libitm1:amd64.
+Preparing to unpack .../15-libitm1_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libitm1:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package libatomic1:amd64.
+Preparing to unpack .../16-libatomic1_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libatomic1:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package libasan6:amd64.
+Preparing to unpack .../17-libasan6_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libasan6:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package liblsan0:amd64.
+Preparing to unpack .../18-liblsan0_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking liblsan0:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package libtsan0:amd64.
+Preparing to unpack .../19-libtsan0_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libtsan0:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package libubsan1:amd64.
+Preparing to unpack .../20-libubsan1_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libubsan1:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package libquadmath0:amd64.
+Preparing to unpack .../21-libquadmath0_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libquadmath0:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package libgcc-11-dev:amd64.
+Preparing to unpack .../22-libgcc-11-dev_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libgcc-11-dev:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package gcc-11.
+Preparing to unpack .../23-gcc-11_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking gcc-11 (11.4.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package gcc.
+Preparing to unpack .../24-gcc_4%3a11.2.0-1ubuntu1_amd64.deb ...
+Unpacking gcc (4:11.2.0-1ubuntu1) ...
+Selecting previously unselected package libstdc++-11-dev:amd64.
+Preparing to unpack .../25-libstdc++-11-dev_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libstdc++-11-dev:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package g++-11.
+Preparing to unpack .../26-g++-11_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking g++-11 (11.4.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package g++.
+Preparing to unpack .../27-g++_4%3a11.2.0-1ubuntu1_amd64.deb ...
+Unpacking g++ (4:11.2.0-1ubuntu1) ...
+Selecting previously unselected package make.
+Preparing to unpack .../28-make_4.3-4.1build1_amd64.deb ...
+Unpacking make (4.3-4.1build1) ...
+Selecting previously unselected package libdpkg-perl.
+Preparing to unpack .../29-libdpkg-perl_1.21.1ubuntu2.6_all.deb ...
+Unpacking libdpkg-perl (1.21.1ubuntu2.6) ...
+Selecting previously unselected package bzip2.
+Preparing to unpack .../30-bzip2_1.0.8-5build1_amd64.deb ...
+Unpacking bzip2 (1.0.8-5build1) ...
+Selecting previously unselected package lto-disabled-list.
+Preparing to unpack .../31-lto-disabled-list_24_all.deb ...
+Unpacking lto-disabled-list (24) ...
+Selecting previously unselected package dpkg-dev.
+Preparing to unpack .../32-dpkg-dev_1.21.1ubuntu2.6_all.deb ...
+Unpacking dpkg-dev (1.21.1ubuntu2.6) ...
+Selecting previously unselected package build-essential.
+Preparing to unpack .../33-build-essential_12.9ubuntu3_amd64.deb ...
+Unpacking build-essential (12.9ubuntu3) ...
+Selecting previously unselected package libllvm14:amd64.
+Preparing to unpack .../34-libllvm14_1%3a14.0.0-1ubuntu1.1_amd64.deb ...
+Unpacking libllvm14:amd64 (1:14.0.0-1ubuntu1.1) ...
+Selecting previously unselected package libclang-cpp14.
+Preparing to unpack .../35-libclang-cpp14_1%3a14.0.0-1ubuntu1.1_amd64.deb ...
+Unpacking libclang-cpp14 (1:14.0.0-1ubuntu1.1) ...
+Selecting previously unselected package libgc1:amd64.
+Preparing to unpack .../36-libgc1_1%3a8.0.6-1.1build1_amd64.deb ...
+Unpacking libgc1:amd64 (1:8.0.6-1.1build1) ...
+Selecting previously unselected package libobjc4:amd64.
+Preparing to unpack .../37-libobjc4_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libobjc4:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package libobjc-11-dev:amd64.
+Preparing to unpack .../38-libobjc-11-dev_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libobjc-11-dev:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package libc6-i386.
+Preparing to unpack .../39-libc6-i386_2.35-0ubuntu3.13_amd64.deb ...
+Unpacking libc6-i386 (2.35-0ubuntu3.13) ...
+Selecting previously unselected package lib32gcc-s1.
+Preparing to unpack .../40-lib32gcc-s1_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking lib32gcc-s1 (12.3.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package lib32stdc++6.
+Preparing to unpack .../41-lib32stdc++6_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking lib32stdc++6 (12.3.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package libclang-common-14-dev.
+Preparing to unpack .../42-libclang-common-14-dev_1%3a14.0.0-1ubuntu1.1_amd64.deb ...
+Unpacking libclang-common-14-dev (1:14.0.0-1ubuntu1.1) ...
+Selecting previously unselected package llvm-14-linker-tools.
+Preparing to unpack .../43-llvm-14-linker-tools_1%3a14.0.0-1ubuntu1.1_amd64.deb ...
+Unpacking llvm-14-linker-tools (1:14.0.0-1ubuntu1.1) ...
+Selecting previously unselected package libclang1-14.
+Preparing to unpack .../44-libclang1-14_1%3a14.0.0-1ubuntu1.1_amd64.deb ...
+Unpacking libclang1-14 (1:14.0.0-1ubuntu1.1) ...
+Selecting previously unselected package clang-14.
+Preparing to unpack .../45-clang-14_1%3a14.0.0-1ubuntu1.1_amd64.deb ...
+Unpacking clang-14 (1:14.0.0-1ubuntu1.1) ...
+Selecting previously unselected package clang.
+Preparing to unpack .../46-clang_1%3a14.0-55~exp2_amd64.deb ...
+Unpacking clang (1:14.0-55~exp2) ...
+Preparing to unpack .../47-curl_7.81.0-1ubuntu1.25_amd64.deb ...
+Unpacking curl (7.81.0-1ubuntu1.25) over (7.81.0-1ubuntu1.24) ...
+Preparing to unpack .../48-libcurl4_7.81.0-1ubuntu1.25_amd64.deb ...
+Unpacking libcurl4:amd64 (7.81.0-1ubuntu1.25) over (7.81.0-1ubuntu1.24) ...
+Selecting previously unselected package genisoimage.
+Preparing to unpack .../49-genisoimage_9%3a1.1.11-3.2ubuntu1_amd64.deb ...
+Unpacking genisoimage (9:1.1.11-3.2ubuntu1) ...
+Selecting previously unselected package libonig5:amd64.
+Preparing to unpack .../50-libonig5_6.9.7.1-2build1_amd64.deb ...
+Unpacking libonig5:amd64 (6.9.7.1-2build1) ...
+Selecting previously unselected package libjq1:amd64.
+Preparing to unpack .../51-libjq1_1.6-2.1ubuntu3.2_amd64.deb ...
+Unpacking libjq1:amd64 (1.6-2.1ubuntu3.2) ...
+Selecting previously unselected package jq.
+Preparing to unpack .../52-jq_1.6-2.1ubuntu3.2_amd64.deb ...
+Unpacking jq (1.6-2.1ubuntu3.2) ...
+Selecting previously unselected package libcap-ng-dev.
+Preparing to unpack .../53-libcap-ng-dev_0.7.9-2.2build3_amd64.deb ...
+Unpacking libcap-ng-dev (0.7.9-2.2build3) ...
+Selecting previously unselected package libseccomp-dev:amd64.
+Preparing to unpack .../54-libseccomp-dev_2.5.3-2ubuntu3~22.04.1_amd64.deb ...
+Unpacking libseccomp-dev:amd64 (2.5.3-2ubuntu3~22.04.1) ...
+Selecting previously unselected package liburing2:amd64.
+Preparing to unpack .../55-liburing2_2.1-2build1_amd64.deb ...
+Unpacking liburing2:amd64 (2.1-2build1) ...
+Selecting previously unselected package pkg-config.
+Preparing to unpack .../56-pkg-config_0.29.2-1ubuntu3_amd64.deb ...
+Unpacking pkg-config (0.29.2-1ubuntu3) ...
+Selecting previously unselected package qemu-utils.
+Preparing to unpack .../57-qemu-utils_1%3a6.2+dfsg-2ubuntu6.31_amd64.deb ...
+Unpacking qemu-utils (1:6.2+dfsg-2ubuntu6.31) ...
+Selecting previously unselected package cloud-image-utils.
+Preparing to unpack .../58-cloud-image-utils_0.32-22-g45fe84a5-0ubuntu1_all.deb ...
+Unpacking cloud-image-utils (0.32-22-g45fe84a5-0ubuntu1) ...
+Setting up genisoimage (9:1.1.11-3.2ubuntu1) ...
+Setting up gcc-11-base:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up libseccomp-dev:amd64 (2.5.3-2ubuntu3~22.04.1) ...
+Setting up lto-disabled-list (24) ...
+Setting up linux-libc-dev:amd64 (5.15.0-186.196) ...
+Setting up libgomp1:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up bzip2 (1.0.8-5build1) ...
+Setting up libasan6:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up ca-certificates (20260601~22.04.1) ...
+Updating certificates in /etc/ssl/certs...
+rehash: warning: skipping ca-certificates.crt,it does not contain exactly one certificate or CRL
+14 added, 39 removed; done.
+Setting up libtirpc-dev:amd64 (1.3.2-2ubuntu0.1) ...
+Setting up rpcsvc-proto (1.4.2-0ubuntu6) ...
+Setting up make (4.3-4.1build1) ...
+Setting up libquadmath0:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up libmpc3:amd64 (1.2.1-2build1) ...
+Setting up libatomic1:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up libgc1:amd64 (1:8.0.6-1.1build1) ...
+Setting up libdpkg-perl (1.21.1ubuntu2.6) ...
+Setting up libubsan1:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up libllvm14:amd64 (1:14.0.0-1ubuntu1.1) ...
+Setting up libnsl-dev:amd64 (1.3.0-2build2) ...
+Setting up libcrypt-dev:amd64 (1:4.4.27-1) ...
+Setting up libcap-ng-dev (0.7.9-2.2build3) ...
+Setting up libc6-i386 (2.35-0ubuntu3.13) ...
+Setting up libcurl4:amd64 (7.81.0-1ubuntu1.25) ...
+Setting up curl (7.81.0-1ubuntu1.25) ...
+Setting up liburing2:amd64 (2.1-2build1) ...
+Setting up libisl23:amd64 (0.24-2build1) ...
+Setting up libc-dev-bin (2.35-0ubuntu3.13) ...
+Setting up llvm-14-linker-tools (1:14.0.0-1ubuntu1.1) ...
+Setting up libcc1-0:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up libonig5:amd64 (6.9.7.1-2build1) ...
+Setting up liblsan0:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up libitm1:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up libtsan0:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up cpp-11 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up libjq1:amd64 (1.6-2.1ubuntu3.2) ...
+Setting up libclang1-14 (1:14.0.0-1ubuntu1.1) ...
+Setting up libobjc4:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up dpkg-dev (1.21.1ubuntu2.6) ...
+Setting up lib32gcc-s1 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up lib32stdc++6 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up libclang-common-14-dev (1:14.0.0-1ubuntu1.1) ...
+Setting up pkg-config (0.29.2-1ubuntu3) ...
+Setting up libclang-cpp14 (1:14.0.0-1ubuntu1.1) ...
+Setting up libgcc-11-dev:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up gcc-11 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up cpp (4:11.2.0-1ubuntu1) ...
+Setting up jq (1.6-2.1ubuntu3.2) ...
+Setting up libc6-dev:amd64 (2.35-0ubuntu3.13) ...
+Setting up qemu-utils (1:6.2+dfsg-2ubuntu6.31) ...
+Setting up libobjc-11-dev:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up cloud-image-utils (0.32-22-g45fe84a5-0ubuntu1) ...
+Setting up gcc (4:11.2.0-1ubuntu1) ...
+Setting up libstdc++-11-dev:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up clang-14 (1:14.0.0-1ubuntu1.1) ...
+Setting up g++-11 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up clang (1:14.0-55~exp2) ...
+Setting up g++ (4:11.2.0-1ubuntu1) ...
+update-alternatives: using /usr/bin/g++ to provide /usr/bin/c++ (c++) in auto mode
+Setting up build-essential (12.9ubuntu3) ...
+Processing triggers for man-db (2.10.2-1) ...
+Processing triggers for libc-bin (2.35-0ubuntu3.13) ...
+Processing triggers for ca-certificates (20260601~22.04.1) ...
+Updating certificates in /etc/ssl/certs...
+0 added, 0 removed; done.
+Running hooks in /etc/ca-certificates/update.d...
+done.
+
+Running kernel seems to be up-to-date.
+
+The processor microcode seems to be up-to-date.
+
+No services need to be restarted.
+
+No containers need to be restarted.
+
+No user sessions are running outdated binaries.
+
+No VM guests are running outdated hypervisor (qemu) binaries on this host.
+info: downloading installer
+warn: It looks like you have an existing rustup settings file at:
+warn: /root/.rustup/settings.toml
+warn: Rustup will install the default toolchain as specified in the settings file,
+warn: instead of the one inferred from the default host triple.
+info: profile set to minimal
+info: default host triple is x86_64-unknown-linux-gnu
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading 3 components
+info: default toolchain set to stable-x86_64-unknown-linux-gnu
+
+  stable-x86_64-unknown-linux-gnu installed - rustc 1.97.1 (8bab26f4f 2026-07-14)
+
+
+Rust is installed now. Great!
+
+To get started you may need to restart your current shell.
+This would reload your PATH environment variable to include
+Cargo's bin directory ($HOME/.cargo/bin).
+
+To configure your current shell, you need to source
+the corresponding env file under $HOME/.cargo.
+
+This is usually done by running one of the following (note the leading DOT):
+. "$HOME/.cargo/env"            # For sh/bash/zsh/ash/dash/pdksh
+source "$HOME/.cargo/env.fish"  # For fish
+source "~/.cargo/env.nu"  # For nushell
+source "$HOME/.cargo/env.tcsh"  # For tcsh
+. "$HOME/.cargo/env.ps1"        # For pwsh
+source "$HOME/.cargo/env.xsh"   # For xonsh
+
+==> Download Cloud Hypervisor v53.0
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0
+100 6896k  100 6896k    0     0  31.3M      0 --:--:-- --:--:-- --:--:-- 31.3M
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0
+100 1756k  100 1756k    0     0  8684k      0 --:--:-- --:--:-- --:--:-- 8684k
+
+==> Build the in-tree vhost-user-blk reference backend
+Cloning into '/mnt/local-nvme/cats-warm-bench/src/cloud-hypervisor-v53.0'...
+Note: switching to '9ed824d6d08df3e96f7d5f50795d9449ac99f431'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+    Updating crates.io index
+    Updating git repository `https://github.com/firecracker-microvm/micro-http`
+    Updating git submodule `https://github.com/rust-vmm/rust-vmm-ci.git`
+ Downloading crates ...
+  Downloaded anstream v1.0.0
+  Downloaded anstyle-parse v1.0.0
+  Downloaded adler2 v2.0.1
+  Downloaded anstyle v1.0.14
+  Downloaded strsim v0.11.1
+  Downloaded utf8parse v0.2.2
+  Downloaded aho-corasick v1.1.4
+  Downloaded vmm-sys-util v0.15.0
+  Downloaded thiserror v2.0.18
+  Downloaded zstd-safe v7.2.4
+  Downloaded anstyle-query v1.1.5
+  Downloaded zstd v0.13.3
+  Downloaded vm-memory v0.17.1
+  Downloaded clap_lex v1.1.0
+  Downloaded byteorder v1.5.0
+  Downloaded pkg-config v0.3.33
+  Downloaded cpufeatures v0.3.0
+  Downloaded is_terminal_polyfill v1.70.2
+  Downloaded debug-helper v0.3.14
+  Downloaded env_filter v2.0.0
+  Downloaded virtio-bindings v0.2.7
+  Downloaded bitflags v1.3.2
+  Downloaded defmt-parser v1.0.0
+  Downloaded vhost-user-backend v0.22.0
+  Downloaded errno v0.3.14
+  Downloaded cfg-if v1.0.4
+  Downloaded terminal_size v0.4.4
+  Downloaded smallvec v1.15.2
+  Downloaded env_logger v0.11.11
+  Downloaded quote v1.0.46
+  Downloaded rustversion v1.0.22
+  Downloaded colorchoice v1.0.5
+  Downloaded clap v4.6.1
+  Downloaded shlex v2.0.1
+  Downloaded jobserver v0.1.35
+  Downloaded crc32fast v1.5.0
+  Downloaded find-msvc-tools v0.1.9
+  Downloaded rand_core v0.10.1
+  Downloaded simd-adler32 v0.3.9
+  Downloaded remain v0.2.15
+  Downloaded defmt-macros v1.1.1
+  Downloaded defmt v1.1.1
+  Downloaded serde_core v1.0.228
+  Downloaded serde v1.0.228
+  Downloaded thiserror-impl v2.0.18
+  Downloaded log v0.4.33
+  Downloaded arc-swap v1.9.2
+  Downloaded uuid v1.23.4
+  Downloaded serde_derive v1.0.228
+  Downloaded bitflags v2.13.0
+  Downloaded memchr v2.8.2
+  Downloaded proc-macro2 v1.0.106
+  Downloaded unicode-ident v1.0.24
+  Downloaded getrandom v0.4.3
+  Downloaded chacha20 v0.10.1
+  Downloaded zerocopy v0.8.53
+  Downloaded flate2 v1.1.9
+  Downloaded miniz_oxide v0.8.9
+  Downloaded rand v0.10.2
+  Downloaded cc v1.2.66
+  Downloaded zerocopy-derive v0.8.53
+  Downloaded clap_builder v4.6.0
+  Downloaded virtio-queue v0.17.0
+  Downloaded regex v1.12.4
+  Downloaded vhost v0.16.0
+  Downloaded syn v2.0.118
+  Downloaded regex-syntax v0.8.11
+  Downloaded rustix v1.1.4
+  Downloaded regex-automata v0.4.14
+  Downloaded zstd-sys v2.0.16+zstd.1.5.7
+  Downloaded jiff v0.2.31
+  Downloaded libc v0.2.186
+  Downloaded linux-raw-sys v0.12.1
+  Downloaded crc-any v3.0.0
+   Compiling libc v0.2.186
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.46
+   Compiling cfg-if v1.0.4
+   Compiling thiserror v2.0.18
+   Compiling rustversion v1.0.22
+   Compiling find-msvc-tools v0.1.9
+   Compiling shlex v2.0.1
+   Compiling bitflags v2.13.0
+   Compiling getrandom v0.4.3
+   Compiling rand_core v0.10.1
+   Compiling pkg-config v0.3.33
+   Compiling log v0.4.33
+   Compiling bitflags v1.3.2
+   Compiling cpufeatures v0.3.0
+   Compiling memchr v2.8.2
+   Compiling rustix v1.1.4
+   Compiling utf8parse v0.2.2
+   Compiling colorchoice v1.0.5
+   Compiling anstyle v1.0.14
+   Compiling zstd-safe v7.2.4
+   Compiling serde_core v1.0.228
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling anstyle-query v1.1.5
+   Compiling regex-syntax v0.8.11
+   Compiling linux-raw-sys v0.12.1
+   Compiling virtio-bindings v0.2.7
+   Compiling crc32fast v1.5.0
+   Compiling zerocopy v0.8.53
+   Compiling adler2 v2.0.1
+   Compiling simd-adler32 v0.3.9
+   Compiling serde v1.0.228
+   Compiling debug-helper v0.3.14
+   Compiling strsim v0.11.1
+   Compiling clap_lex v1.1.0
+   Compiling jiff v0.2.31
+   Compiling smallvec v1.15.2
+   Compiling byteorder v1.5.0
+   Compiling anstyle-parse v1.0.0
+   Compiling chacha20 v0.10.1
+   Compiling crc-any v3.0.0
+   Compiling miniz_oxide v0.8.9
+   Compiling anstream v1.0.0
+   Compiling aho-corasick v1.1.4
+   Compiling arc-swap v1.9.2
+   Compiling flate2 v1.1.9
+   Compiling syn v2.0.118
+   Compiling terminal_size v0.4.4
+   Compiling jobserver v0.1.35
+   Compiling vmm-sys-util v0.15.0
+   Compiling clap_builder v4.6.0
+   Compiling rand v0.10.2
+   Compiling cc v1.2.66
+   Compiling regex-automata v0.4.14
+   Compiling uuid v1.23.4
+   Compiling zstd-sys v2.0.16+zstd.1.5.7
+   Compiling clap v4.6.1
+   Compiling thiserror-impl v2.0.18
+   Compiling serde_derive v1.0.228
+   Compiling zerocopy-derive v0.8.53
+   Compiling remain v0.2.15
+   Compiling regex v1.12.4
+   Compiling env_filter v2.0.0
+   Compiling env_logger v0.11.11
+   Compiling vm-memory v0.17.1
+   Compiling option_parser v0.1.0 (/mnt/local-nvme/cats-warm-bench/src/cloud-hypervisor-v53.0/option_parser)
+   Compiling virtio-queue v0.17.0
+   Compiling vhost v0.16.0
+   Compiling vm-virtio v0.1.0 (/mnt/local-nvme/cats-warm-bench/src/cloud-hypervisor-v53.0/vm-virtio)
+   Compiling vhost-user-backend v0.22.0
+   Compiling zstd v0.13.3
+   Compiling block v0.1.0 (/mnt/local-nvme/cats-warm-bench/src/cloud-hypervisor-v53.0/block)
+   Compiling vhost_user_block v0.1.0 (/mnt/local-nvme/cats-warm-bench/src/cloud-hypervisor-v53.0/vhost_user_block)
+    Finished `release` profile [optimized] target(s) in 19.46s
+
+==> Download rust-hypervisor-firmware
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0
+100  132k  100  132k    0     0   592k      0 --:--:-- --:--:-- --:--:--  592k
+cloud-hypervisor v53.0
+Migration Protocol Versions: 0
+vhost-user-blk backend 0.1.0
+
+==> Download and convert Ubuntu 22.04 cloud image
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0  0  698M    0 2992k    0     0  2894k      0  0:04:07  0:00:01  0:04:06 2893k  7  698M    7 51.7M    0     0  25.4M      0  0:00:27  0:00:02  0:00:25 25.4M 14  698M   14  102M    0     0  33.6M      0  0:00:20  0:00:03  0:00:17 33.6M 21  698M   21  152M    0     0  37.7M      0  0:00:18  0:00:04  0:00:14 37.7M 28  698M   28  202M    0     0  40.1M      0  0:00:17  0:00:05  0:00:12 40.4M 36  698M   36  252M    0     0  41.8M      0  0:00:16  0:00:06  0:00:10 49.8M 43  698M   43  302M    0     0  42.9M      0  0:00:16  0:00:07  0:00:09 50.1M 50  698M   50  352M    0     0  43.8M      0  0:00:15  0:00:08  0:00:07 50.0M 57  698M   57  402M    0     0  44.5M      0  0:00:15  0:00:09  0:00:06 50.0M 64  698M   64  452M    0     0  45.1M      0  0:00:15  0:00:10  0:00:05 50.1M 72  698M   72  502M    0     0  45.5M      0  0:00:15  0:00:11  0:00:04 50.0M 79  698M   79  553M    0     0  45.9M      0  0:00:15  0:00:12  0:00:03 50.0M 86  698M   86  603M    0     0  46.2M      0  0:00:15  0:00:13  0:00:02 50.0M 92  698M   92  647M    0     0  45.9M      0  0:00:15  0:00:14  0:00:01 48.5M 94  698M   94  660M    0     0  43.9M      0  0:00:15  0:00:15 --:--:-- 41.6M100  698M  100  698M    0     0  43.9M      0  0:00:15  0:00:15 --:--:-- 40.2M
+    (0.00/100%)    (1.00/100%)    (2.00/100%)    (3.01/100%)    (4.01/100%)    (5.01/100%)    (6.01/100%)    (7.02/100%)    (8.09/100%)    (9.09/100%)    (10.10/100%)    (11.10/100%)    (12.10/100%)    (13.10/100%)    (14.11/100%)    (15.11/100%)    (16.11/100%)    (17.11/100%)    (18.12/100%)    (19.12/100%)    (20.12/100%)    (21.12/100%)    (22.12/100%)    (23.13/100%)    (24.13/100%)    (25.13/100%)    (26.13/100%)    (27.14/100%)    (28.14/100%)    (29.14/100%)    (30.14/100%)    (31.15/100%)    (32.15/100%)    (33.15/100%)    (34.15/100%)    (35.16/100%)    (36.16/100%)    (37.16/100%)    (38.16/100%)    (39.16/100%)    (40.17/100%)    (41.17/100%)    (42.17/100%)    (43.17/100%)    (44.18/100%)    (45.18/100%)    (46.18/100%)    (47.18/100%)    (48.19/100%)    (49.19/100%)    (50.19/100%)    (51.19/100%)    (52.19/100%)    (53.20/100%)    (54.20/100%)    (55.20/100%)    (56.20/100%)    (57.21/100%)    (58.21/100%)    (59.21/100%)    (60.21/100%)    (61.22/100%)    (62.22/100%)    (63.22/100%)    (64.22/100%)    (65.23/100%)    (66.34/100%)    (67.38/100%)    (68.44/100%)    (69.52/100%)    (70.64/100%)    (71.64/100%)    (72.65/100%)    (73.69/100%)    (74.70/100%)    (75.74/100%)    (76.79/100%)    (77.79/100%)    (78.79/100%)    (79.80/100%)    (80.80/100%)    (81.80/100%)    (82.80/100%)    (83.81/100%)    (84.81/100%)    (85.81/100%)    (86.81/100%)    (87.81/100%)    (88.82/100%)    (89.82/100%)    (90.82/100%)    (91.82/100%)    (92.83/100%)    (93.83/100%)    (94.83/100%)    (95.83/100%)    (96.84/100%)    (97.84/100%)    (98.84/100%)    (99.84/100%)    (100.00/100%)    (100.00/100%)
+WARNING: Image format was not specified for '/mnt/local-nvme/cats-warm-bench/images/jammy-base.raw' and probing guessed raw.
+         Automatically detecting the format is dangerous for raw images, write operations on block 0 will be restricted.
+         Specify the 'raw' format explicitly to remove the restrictions.
+Image resized.
+
+==> Build cloud-init seed with an in-memory working-set service
+
+==> Prepared /mnt/local-nvme/cats-warm-bench

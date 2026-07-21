@@ -1,0 +1,26 @@
+
+==> Build cloud-init seed with an in-memory working-set service
+
+==> Boot 512MiB guest with 64MiB touched working set
+guest={"ok":true,"boot_id":"1ae0fcfe-e70c-422c-8d66-5b9cdb32ab83","started_ns":1784609321363539613,"requests":1,"workset_mib":64}
+
+==> Run 1 Warm snapshot/exit/ondemand-restore cycles
+iteration=1
+1,512,64,747676,3.724,447.972,260.695,0,536939894,536068096,1784609358568935996,23.476,37.645,3.611,21094.468,47286.795,46613.757,70763.462,447776,536688,true
+
+==> Summary
+snapshot_ms              p50=  447.972 ms  p95=  447.972 ms
+shutdown_ms              p50=  260.695 ms  p95=  260.695 ms
+network_backend_ms       p50=   23.476 ms  p95=   23.476 ms
+restore_to_api_ms        p50=   37.645 ms  p95=   37.645 ms
+resume_api_ms            p50=    3.611 ms  p95=    3.611 ms
+wake_to_health_ms        p50=21094.468 ms  p95=21094.468 ms
+touch_wall_ms            p50=47286.795 ms  p95=47286.795 ms
+full_memory_ready_ms     p50=70763.462 ms  p95=70763.462 ms
+warm_runtime_rss_kib     max=0 KiB
+full_ready_rss_kib       max=536688 KiB
+snapshot_allocated_bytes max=536068096 bytes
+boot_id_preserved        1/1
+
+==> PASS: process memory survived every VMM exit and lazy restore
+results=/mnt/scratch/cats-warm-concurrent-10x512-timeout60-20260721/cat-04/results/warm-benchmark.csv

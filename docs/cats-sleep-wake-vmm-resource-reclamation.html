@@ -1,0 +1,664 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Cats 睡眠与唤醒详细设计：Cloud Hypervisor VMM pause/resume、Guest RAM page-out、本地 NVMe、Suspend、Cold、资源回收、容量记账与故障恢复。">
+  <title>Cats 睡眠、唤醒与 VMM 资源回收</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg:#f4f6f7; --paper:#fff; --ink:#18252c; --muted:#5b6c73;
+      --line:#ced9dd; --blue:#1768ac; --blue-bg:#ebf4fc;
+      --green:#087d59; --green-bg:#e9f8f1; --orange:#ae5518;
+      --orange-bg:#fff3e7; --purple:#7041a5; --purple-bg:#f4effb;
+      --red:#b42318; --red-bg:#fff0ef; --gray-bg:#eef2f4;
+      --radius:10px; --shadow:0 8px 24px rgb(22 43 53 / 7%);
+    }
+    * { box-sizing:border-box; }
+    html { scroll-behavior:smooth; }
+    body { margin:0; min-width:320px; background:var(--bg); color:var(--ink); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; line-height:1.66; }
+    a { color:var(--blue); }
+    code,pre { font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace; }
+    code { color:#102832; }
+    .page { width:min(1380px,calc(100% - 32px)); margin:0 auto; }
+    header { background:var(--paper); border-bottom:1px solid var(--line); }
+    .header-inner { padding:38px 0 31px; }
+    h1 { margin:0; font-size:clamp(31px,4vw,49px); line-height:1.14; letter-spacing:-.035em; }
+    .subtitle { max-width:1080px; margin:14px 0 0; color:var(--muted); font-size:16px; }
+    .meta { display:flex; gap:18px; flex-wrap:wrap; margin-top:17px; color:var(--muted); font-size:12px; }
+    nav { position:sticky; z-index:20; top:0; background:rgb(255 255 255 / 95%); border-bottom:1px solid var(--line); backdrop-filter:blur(10px); }
+    .nav-inner { display:flex; gap:20px; overflow-x:auto; padding:11px 0; white-space:nowrap; font-size:12px; }
+    .nav-inner a { color:var(--muted); text-decoration:none; }
+    .nav-inner a:hover { color:var(--blue); }
+    main { padding-bottom:64px; }
+    section { padding:48px 0; border-bottom:1px solid var(--line); scroll-margin-top:48px; }
+    section:last-child { border-bottom:0; }
+    h2 { margin:0 0 10px; font-size:clamp(24px,3vw,34px); line-height:1.25; letter-spacing:-.025em; }
+    h3 { margin:0 0 8px; font-size:18px; }
+    h4 { margin:0 0 6px; font-size:14px; }
+    .lead { max-width:1060px; margin:0 0 24px; color:var(--muted); font-size:14px; }
+    .decision-grid,.two-col,.three-col,.four-col,.metric-grid { display:grid; gap:14px; }
+    .decision-grid,.two-col { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .three-col { grid-template-columns:repeat(3,minmax(0,1fr)); }
+    .four-col,.metric-grid { grid-template-columns:repeat(4,minmax(0,1fr)); }
+    .decision,.card,.metric { padding:18px; border:1px solid var(--line); border-radius:var(--radius); background:var(--paper); }
+    .decision { border-left:4px solid var(--blue); }
+    .decision:nth-child(2) { border-left-color:var(--green); }
+    .decision:nth-child(3) { border-left-color:var(--orange); }
+    .decision:nth-child(4) { border-left-color:var(--purple); }
+    .decision strong,.metric strong { display:block; font-size:15px; }
+    .decision p,.card p { margin:6px 0 0; color:var(--muted); font-size:13px; }
+    .card ul,.card ol { margin:10px 0 0; padding-left:19px; color:var(--muted); font-size:12px; }
+    .card li + li { margin-top:4px; }
+    .table-wrap { overflow-x:auto; border:1px solid var(--line); border-radius:var(--radius); background:var(--paper); }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th,td { padding:12px 14px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+    tr:last-child td { border-bottom:0; }
+    th { background:var(--gray-bg); color:#43565e; font-size:12px; }
+    td:first-child { font-weight:650; }
+    .diagram-frame { overflow-x:auto; padding:12px; border:1px solid var(--line); border-radius:var(--radius); background:var(--paper); box-shadow:var(--shadow); }
+    .diagram-frame svg { display:block; width:100%; min-width:1180px; height:auto; }
+    .legend { display:flex; gap:18px; flex-wrap:wrap; margin-top:12px; color:var(--muted); font-size:12px; }
+    .legend span { display:inline-flex; gap:7px; align-items:center; }
+    .legend i { width:28px; height:3px; background:var(--green); }
+    .legend .control { background:repeating-linear-gradient(90deg,var(--blue) 0 7px,transparent 7px 11px); }
+    .legend .memory { background:var(--orange); }
+    .legend .meta { background:repeating-linear-gradient(90deg,var(--purple) 0 2px,transparent 2px 6px); }
+    .callout { margin-top:18px; padding:15px 17px; border:1px solid #bad5e8; border-left:4px solid var(--blue); border-radius:8px; background:var(--blue-bg); color:#29434f; font-size:13px; }
+    .callout.green { border-color:#b8dfd0; border-left-color:var(--green); background:var(--green-bg); }
+    .callout.orange { border-color:#eed0b6; border-left-color:var(--orange); background:var(--orange-bg); }
+    .callout.red { border-color:#efc2be; border-left-color:var(--red); background:var(--red-bg); }
+    .code-block { overflow-x:auto; margin:16px 0 0; padding:18px; border-radius:var(--radius); background:#10242f; color:#dce9ed; font-size:12px; line-height:1.68; }
+    .code-block code { color:inherit; }
+    .metric strong { color:var(--blue); font-size:22px; }
+    .metric span { display:block; margin-top:5px; color:var(--muted); font-size:11px; }
+    .status { display:inline-block; padding:2px 7px; border-radius:99px; font-size:10px; font-weight:750; white-space:nowrap; }
+    .status.keep { background:var(--orange-bg); color:var(--orange); }
+    .status.free { background:var(--green-bg); color:var(--green); }
+    .status.partial { background:var(--blue-bg); color:var(--blue); }
+    .status.none { background:var(--gray-bg); color:var(--muted); }
+    .flow { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:8px; align-items:stretch; }
+    .flow .step { min-height:110px; padding:13px; border:1px solid var(--line); border-radius:8px; background:var(--paper); font-size:12px; }
+    .flow .step b { display:block; margin-bottom:5px; color:var(--blue); }
+    .flow .step p { margin:0; color:var(--muted); }
+    .source-list { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+    .source-list a { padding:13px 15px; border:1px solid var(--line); border-radius:8px; background:var(--paper); text-decoration:none; font-size:12px; }
+    .source-list strong { display:block; color:var(--ink); font-size:13px; }
+    .sequence { display:grid; grid-template-columns:110px repeat(4,minmax(150px,1fr)); overflow-x:auto; border:1px solid var(--line); border-radius:var(--radius); background:var(--paper); }
+    .seq { min-height:58px; padding:10px 12px; border-right:1px solid var(--line); border-bottom:1px solid var(--line); font-size:11px; }
+    .seq:nth-child(5n) { border-right:0; }
+    .seq.head { min-height:auto; background:var(--gray-bg); color:#43565e; font-weight:750; }
+    .seq.num { color:var(--muted); font-weight:750; }
+    .seq.blue { background:var(--blue-bg); color:#244a64; }
+    .seq.green { background:var(--green-bg); color:#185c46; }
+    .seq.orange { background:var(--orange-bg); color:#6d401f; }
+    footer { padding:24px 0 38px; border-top:1px solid var(--line); color:var(--muted); font-size:12px; }
+    .mt { margin-top:14px; }
+    @media (max-width:980px) {
+      .page { width:calc(100% - 24px); }
+      h1 { font-size:28px; overflow-wrap:anywhere; }
+      .subtitle,.decision,.card,.callout,th,td { overflow-wrap:anywhere; }
+      .decision-grid,.two-col,.three-col,.four-col,.metric-grid,.source-list { grid-template-columns:1fr; }
+      .decision,.card,.metric { min-width:0; }
+      .flow { grid-template-columns:1fr; }
+    }
+    @media print {
+      @page { size:A4 landscape; margin:11mm; }
+      body { background:white; font-size:9pt; }
+      .page { width:100%; }
+      nav { display:none; }
+      section { padding:24px 0; }
+      .decision,.card,.metric,.table-wrap,.callout,.diagram-frame { break-inside:avoid; page-break-inside:avoid; }
+      .diagram-frame { box-shadow:none; overflow:visible; }
+      .diagram-frame svg { min-width:0; width:100%; }
+      .code-block { white-space:pre-wrap; overflow-wrap:anywhere; }
+      a { color:inherit; text-decoration:none; }
+    }
+  </style>
+</head>
+<body>
+  <div style="margin:16px auto 0;max-width:1080px;padding:12px 18px;border:2px solid #d97706;background:#fffbeb;color:#92400e;font-size:14px;line-height:1.7;border-radius:10px;">
+    <strong>状态更新 2026-07-21（ADR-0002）：</strong>生命周期采用四态 Running / Suspended（pause + page-out）/ Warm（snapshot + VMM exit，同 Host）/ Cold。本页"V1 不把内存 Snapshot 当默认睡眠"等章节已被取代，以同名 Markdown 与 ADR-0002 为准。
+  </div>
+  <header>
+    <div class="page header-inner">
+      <h1>Cats 睡眠、唤醒与 VMM 资源回收</h1>
+      <p class="subtitle">本文说明 Cat 从 Running 进入 Suspend 或 Cold 时，Cloud Hypervisor、cat-agent、cats-blockd 和 Host Linux 分别做什么；Guest RAM 如何从物理内存换出到本地 NVMe；哪些资源能够真正回收；唤醒时如何恢复，以及 Host 故障时如何降级。</p>
+      <div class="meta"><span>VMM：Cloud Hypervisor</span><span>磁盘：virtio-blk + vhost-user-blk</span><span>内存：file-backed Guest RAM + MADV_PAGEOUT</span><span>版本：2026-07-21</span></div>
+    </div>
+  </header>
+
+  <nav><div class="page nav-inner">
+    <a href="#conclusion">结论</a><a href="#states">状态</a><a href="#running">Running 资源</a>
+    <a href="#suspend">Suspend</a><a href="#vmm-pause">VMM Pause</a><a href="#pageout">内存回收</a>
+    <a href="#accounting">资源账本</a><a href="#resume">唤醒</a><a href="#cold">Cold</a>
+    <a href="#snapshot">Snapshot</a><a href="#capacity">容量</a><a href="#failure">故障与竞态</a>
+    <a href="#implementation">实现</a><a href="#observability">指标</a><a href="#validation">验收</a><a href="#sources">资料</a>
+  </div></nav>
+
+  <main class="page">
+    <section id="conclusion">
+      <h2>1. 最终结论</h2>
+      <p class="lead">Cats 不应只有一种“睡眠”。一个机制无法同时满足保留进程、快速唤醒、跨 Host 和彻底释放资源。正确做法是把 Suspend 与 Cold 作为两个不同产品状态。</p>
+      <div class="decision-grid">
+        <div class="decision"><strong>Suspend：保留 VMM，回收 CPU 和大部分物理 RAM</strong><p>VMM、KVM fd、设备后端、tap、Attachment lease 和本地 NVMe backing 继续存在。Guest 进程状态保留，必须在原 Host 上 resume。</p></div>
+        <div class="decision"><strong>Cold：退出 VMM，释放全部运行时资源</strong><p>CPU、RAM、VMM、tap、设备进程和强制本地缓存全部释放。只保留远端 RootDisk/PersistentDisk 与控制面 metadata，之后在任意 Host fresh boot。</p></div>
+        <div class="decision"><strong>VMM 只负责协调暂停，不负责完整资源回收</strong><p>Cloud Hypervisor 停 vCPU、保存时钟、暂停设备并维护 VM 状态。Guest sync、磁盘 FLUSH、RAM page-out、NVMe 清理和路由变更由平台组件完成。</p></div>
+        <div class="decision"><strong>自动策略：Running → Suspend → Cold</strong><p>短期闲置先 Suspend；继续闲置或 Host 内存/NVMe 压力升高时转 Cold。Shell/流量触发单次 Wake，不能让同一个 Cat 并发启动两次。</p></div>
+      </div>
+      <div class="callout green"><strong>一句话：</strong>Suspend 是“机器还在，只是 CPU 停了，RAM 被放到本地 NVMe”；Cold 是“机器没了，只剩远端磁盘，下次重新开机”。</div>
+      <div class="callout orange"><strong>重要限制：</strong>Suspend 不是跨 Host 持久状态。原 Host 永久损坏后，内存 backing file 一起丢失；平台必须丢弃进程状态，改用远端 RootDisk 做 Cold Recovery。</div>
+    </section>
+
+    <section id="states">
+      <h2>2. 三个主要状态</h2>
+      <div class="diagram-frame">
+        <svg viewBox="0 0 1320 600" role="img" aria-labelledby="state-title state-desc">
+          <title id="state-title">Running、Suspended 与 Cold 的状态转换</title>
+          <desc id="state-desc">Running 经 sync、flush、pause 和 pageout 进入 Suspended；Suspended 经 resume 和按需缺页回到 Running；Suspended 经过 durable flush、VMM shutdown 和清理进入 Cold；Cold 通过调度、新 attachment、fresh VMM boot 回到 Running。</desc>
+          <defs>
+            <marker id="st-blue" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#1768ac"/></marker>
+            <marker id="st-green" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#087d59"/></marker>
+            <style>
+              .z{fill:#fff;stroke:#9baab1;stroke-width:1.4;rx:13}.run{fill:#e9f8f1;stroke:#087d59}.sus{fill:#fff3e7;stroke:#ae5518}.cold{fill:#ebf4fc;stroke:#1768ac}.t{font:700 22px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#1d3038}.s{font:12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#5e7078}.l{font:700 12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#3d535c}.a{stroke:#1768ac;stroke-width:2.2;fill:none;marker-end:url(#st-blue)}.b{stroke:#087d59;stroke-width:2.2;fill:none;marker-end:url(#st-green)}.dash{stroke-dasharray:7 5}.mini{fill:#fff;stroke:#b4c1c6;stroke-width:1;rx:6}
+            </style>
+          </defs>
+          <rect x="70" y="95" width="300" height="230" class="z run"/><text x="166" y="136" class="t">Running</text>
+          <text x="106" y="172" class="s">vCPU 执行 · Guest RAM 驻留</text><text x="106" y="197" class="s">VMM / blockd / tap / lease 存在</text><text x="106" y="222" class="s">Endpoint active</text>
+          <rect x="107" y="250" width="225" height="47" class="mini"/><text x="135" y="279" class="l">运行成本：CPU + RAM + NVMe</text>
+
+          <rect x="510" y="95" width="300" height="230" class="z sus"/><text x="571" y="136" class="t">Suspended</text>
+          <text x="548" y="172" class="s">vCPU 停止 · Guest RAM page-out</text><text x="548" y="197" class="s">VMM / blockd / tap / lease 保留</text><text x="548" y="222" class="s">必须回到同一 Host</text>
+          <rect x="547" y="250" width="225" height="47" class="mini"/><text x="573" y="279" class="l">运行成本：低 RAM + NVMe</text>
+
+          <rect x="950" y="95" width="300" height="230" class="z cold"/><text x="1038" y="136" class="t">Cold</text>
+          <text x="988" y="172" class="s">无 VMM · 无 vCPU · 无 Guest RAM</text><text x="988" y="197" class="s">无 runtime attachment / tap</text><text x="988" y="222" class="s">远端磁盘与稳定名称保留</text>
+          <rect x="987" y="250" width="225" height="47" class="mini"/><text x="1012" y="279" class="l">运行成本：远端存储 + metadata</text>
+
+          <path d="M370 155 C425 115 455 115 510 155" class="a"/><text x="394" y="99" class="l">sync → FLUSH → pause</text><text x="414" y="119" class="s">→ RAM page-out</text>
+          <path d="M510 265 C455 305 425 305 370 265" class="b"/><text x="410" y="347" class="l">resume → 按需 page fault</text>
+          <path d="M810 155 C865 115 895 115 950 155" class="a"/><text x="839" y="99" class="l">final FLUSH → shutdown</text><text x="860" y="119" class="s">→ cleanup</text>
+          <path d="M950 265 C895 305 865 305 810 265" class="b"/><text x="844" y="347" class="l">schedule → fresh boot</text>
+
+          <rect x="70" y="420" width="1180" height="105" class="z"/>
+          <text x="95" y="452" class="l">Host Lost 降级路径</text><text x="95" y="478" class="s">Running 或 Suspended 的原 Host 永久失联 → Fence 旧 Attachment epoch → 丢弃 Guest RAM/进程状态 → 在新 Host 按 Cold 路径启动。</text>
+          <path d="M656 325 V420" class="a dash"/><text x="674" y="385" class="s">原 Host 丢失</text>
+        </svg>
+      </div>
+      <div class="table-wrap mt"><table>
+        <thead><tr><th>状态</th><th>进程内存</th><th>Host 绑定</th><th>恢复方式</th><th>适用时长</th></tr></thead>
+        <tbody>
+          <tr><td>Running</td><td>保留且驻留</td><td>是</td><td>无需恢复</td><td>正在使用</td></tr>
+          <tr><td>Suspended</td><td>保留在本地内存 backing；多数页不驻留</td><td>是</td><td><code>resume</code>，工作集按需 fault</td><td>分钟到较短小时级</td></tr>
+          <tr><td>Cold</td><td>不保留</td><td>否</td><td>新 VMM 从远端 RootDisk 启动</td><td>长期闲置</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <section id="running">
+      <h2>3. Running 时 Host 上有哪些资源</h2>
+      <p class="lead">理解“回收了什么”，必须先明确运行时实际存在的对象。VMM 只是其中一个进程，磁盘 backend、网络和本地文件同样会占用资源。</p>
+      <div class="diagram-frame">
+        <svg viewBox="0 0 1320 650" role="img" aria-labelledby="run-title run-desc">
+          <title id="run-title">Running Cat 在 Host 上的资源分布</title>
+          <desc id="run-desc">显示 cat-agent、Cloud Hypervisor、KVM、Guest RAM、cats-blockd、本地 NVMe、tap 网络与远端 RootDisk 的关系。</desc>
+          <defs>
+            <marker id="rn-g" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#087d59"/></marker>
+            <marker id="rn-b" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#1768ac"/></marker>
+            <style>
+              .z{fill:#f8fafb;stroke:#9aaab1;stroke-width:1.3;rx:11}.b{fill:#fff;stroke:#9aaab1;stroke-width:1.1;rx:7}.blue{fill:#ebf4fc;stroke:#1768ac}.green{fill:#e9f8f1;stroke:#087d59}.orange{fill:#fff3e7;stroke:#ae5518}.purple{fill:#f4effb;stroke:#7041a5}.t{font:700 15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#233841}.s{font:11px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#60737b}.l{stroke:#087d59;stroke-width:2;fill:none;marker-end:url(#rn-g)}.ctl{stroke:#1768ac;stroke-width:1.6;stroke-dasharray:7 5;fill:none;marker-end:url(#rn-b)}
+            </style>
+          </defs>
+          <rect x="35" y="28" width="1250" height="560" class="z"/><text x="59" y="58" class="t">Bare-metal Host / Node</text>
+          <rect x="70" y="92" width="190" height="82" class="b blue"/><text x="129" y="119" class="t">cat-agent</text><text x="92" y="141" class="s">lifecycle · pidfd · cgroup</text><text x="103" y="158" class="s">jobs · heartbeat · cleanup</text>
+          <rect x="310" y="92" width="360" height="330" class="z blue"/><text x="417" y="122" class="t">Cloud Hypervisor VMM</text>
+          <rect x="340" y="150" width="140" height="74" class="b"/><text x="375" y="177" class="t">vCPU threads</text><text x="362" y="199" class="s">KVM_RUN · registers</text>
+          <rect x="510" y="150" width="130" height="74" class="b"/><text x="544" y="177" class="t">KVM VM</text><text x="526" y="199" class="s">VM/vCPU fd · IRQ</text>
+          <rect x="340" y="255" width="300" height="132" class="b orange"/><text x="427" y="284" class="t">Guest RAM Mapping</text><text x="377" y="309" class="s">Guest Physical Address → VMM mmap</text><text x="374" y="332" class="s">KVM memory slots → Host physical pages</text><text x="391" y="355" class="s">示例：8GiB logical / 5GiB resident</text>
+          <rect x="720" y="92" width="240" height="155" class="b green"/><text x="784" y="121" class="t">cats-blockd</text><text x="755" y="147" class="s">vhost-user-blk socket</text><text x="757" y="169" class="s">cache / dirty / FLUSH</text><text x="752" y="191" class="s">attachment lease / epoch</text><text x="764" y="213" class="s">Root + PersistentDisk</text>
+          <rect x="1010" y="92" width="230" height="155" class="b green"/><text x="1080" y="121" class="t">Node Network</text><text x="1051" y="147" class="s">tap / bridge / overlay</text><text x="1053" y="169" class="s">firewall / route epoch</text><text x="1055" y="191" class="s">Endpoint → Guest port</text><text x="1053" y="213" class="s">connection + byte meter</text>
+          <rect x="720" y="294" width="520" height="128" class="b orange"/><text x="912" y="323" class="t">Local NVMe</text><text x="752" y="350" class="s">memory/&lt;cat&gt;.mem　·　disk clean/dirty cache　·　Pending Commit Pack</text><text x="781" y="376" class="s">Suspend 需要保留 memory backing；Cold 可以清除全部非持久状态</text>
+          <rect x="310" y="466" width="650" height="82" class="b purple"/><text x="535" y="495" class="t">Guest Linux</text><text x="359" y="520" class="s">Kernel · process · page cache · ext4 · TCP state · Guest Agent · /dev/vda /dev/vdb</text>
+          <rect x="1010" y="466" width="230" height="82" class="b purple"/><text x="1062" y="495" class="t">Durable Backend</text><text x="1039" y="520" class="s">Object Store + Metadata Root</text>
+          <path d="M260 132 H310" class="ctl"/><path d="M670 170 H720" class="l"/><path d="M960 170 H1010" class="l"/><path d="M840 247 V294" class="l"/><path d="M490 422 V466" class="l"/><path d="M1125 422 V466" class="l"/><path d="M960 507 H1010" class="l"/>
+        </svg>
+      </div>
+      <div class="callout"><strong>VMM 不是全部：</strong>即使 VMM 已经暂停，cats-blockd、NVMe memory file、tap、lease 和 Node 路由仍可能存在。资源回收必须由一个跨组件 lifecycle transaction 完成，不能只观察 Cloud Hypervisor 状态。</div>
+    </section>
+
+    <section id="suspend">
+      <h2>4. Running → Suspended 的完整流程</h2>
+      <p class="lead">Suspend 的正确顺序是“停止新活动 → Guest 落盘 → 远端持久点 → VMM pause → RAM page-out”。不能先停 Guest 再希望 Guest 自己执行 sync。</p>
+      <div class="flow">
+        <div class="step"><b>1. 状态门禁</b><p>Cat generation 进入 Suspending；阻止新的 exec、挂盘和部署；并发 wake/suspend singleflight。</p></div>
+        <div class="step"><b>2. Guest Quiesce</b><p>Guest Agent 对 RootDisk/PersistentDisk 执行 syncfs；应用 hook 有严格 deadline。</p></div>
+        <div class="step"><b>3. Durable FLUSH</b><p>cats-blockd 完成屏障前 Dirty Set，记录 durable generation；失败则不进入 Suspended。</p></div>
+        <div class="step"><b>4. VMM Pause</b><p>Cloud Hypervisor 暂停 vCPU、保存时钟、暂停设备并进入 Paused。</p></div>
+        <div class="step"><b>5. Memory Page-out</b><p>cat-agent 对 Guest RAM mmap 执行 MADV_PAGEOUT，把大部分物理页写回/丢弃。</p></div>
+        <div class="step"><b>6. 资源记账</b><p>释放 vCPU run budget；更新 resident_bytes、NVMe backing bytes 和 resume commitment。</p></div>
+        <div class="step"><b>7. 发布状态</b><p>Cat=Suspended；Endpoint 按 wake_policy 返回唤醒响应或触发 Wake。</p></div>
+      </div>
+
+      <h3 style="margin-top:28px">4.1 为什么先 sync/FLUSH</h3>
+      <div class="two-col">
+        <article class="card"><h3>Guest Page Cache</h3><p>应用的 write 可能只修改 Guest Linux Page Cache。VMM pause 不会替 Guest 调用 sync，也不会让 ext4 自动产生 FLUSH。</p><ul><li>先通过 Guest Agent 调用 syncfs</li><li>等待 virtio-blk 请求完成</li><li>普通未 fsync 写仍遵循 volatile cache 语义</li></ul></article>
+        <article class="card"><h3>Host Block Cache</h3><p>Guest 已发 FLUSH 不代表只写到本地 NVMe 就够了。平台的 FLUSH 语义要求对象和权威 Root 已提交。</p><ul><li>Pending Commit Pack 固定提交输入</li><li>对象先写，Root 后发布</li><li>只有 durable generation 完成才允许标记安全</li></ul></article>
+      </div>
+      <div class="callout orange"><strong>fsfreeze 不是普通 Suspend 的必需步骤：</strong>syncfs + 完成 FLUSH 后再 pause 已能形成一致运行状态。fsfreeze 更适合需要把文件系统与磁盘 Snapshot 精确对齐的场景；冻结后必须有 watchdog 保证 unfreeze。</div>
+    </section>
+
+    <section id="vmm-pause">
+      <h2>5. Cloud Hypervisor Pause/Resume 内部顺序</h2>
+      <p class="lead">Cloud Hypervisor 的 pause 不是简单对 VMM 进程发送 SIGSTOP。它按顺序协调 vCPU、Guest clock、Device Manager 和底层 Hypervisor 状态。</p>
+
+      <h3>5.1 Pause 时序</h3>
+      <div class="sequence" aria-label="Cloud Hypervisor pause 时序">
+        <div class="seq head">步骤</div><div class="seq head">cat-agent</div><div class="seq head">Cloud Hypervisor</div><div class="seq head">KVM / vCPU</div><div class="seq head">Device / blockd</div>
+        <div class="seq num">1</div><div class="seq blue">调用 VM pause API</div><div class="seq blue">验证 Running → Paused 转换</div><div class="seq">仍在运行</div><div class="seq">仍在处理队列</div>
+        <div class="seq num">2</div><div class="seq">等待</div><div class="seq orange">激活 pending virtio devices</div><div class="seq">仍在运行</div><div class="seq orange">避免半初始化设备进入 pause</div>
+        <div class="seq num">3</div><div class="seq">等待</div><div class="seq orange">CPU Manager pause</div><div class="seq orange">退出 KVM_RUN；停在 barrier</div><div class="seq">完成已有事件</div>
+        <div class="seq num">4</div><div class="seq">等待</div><div class="seq blue">捕获 Guest clock</div><div class="seq blue">寄存器/时钟不再变化</div><div class="seq">—</div>
+        <div class="seq num">5</div><div class="seq">等待</div><div class="seq orange">Device Manager pause</div><div class="seq">已停止</div><div class="seq orange">virtio frontend / event processing 暂停</div>
+        <div class="seq num">6</div><div class="seq">等待</div><div class="seq blue">Hypervisor VM pause；state=Paused</div><div class="seq blue">KVM VM 保留但不执行</div><div class="seq">blockd 可完成已开始后台提交</div>
+        <div class="seq num">7</div><div class="seq green">收到成功</div><div class="seq green">API 返回</div><div class="seq">0 Guest CPU</div><div class="seq">socket/lease 保留</div>
+      </div>
+
+      <h3 style="margin-top:28px">5.2 Pause 后 VMM 保留的状态</h3>
+      <div class="three-col">
+        <article class="card"><h3>CPU / KVM</h3><ul><li>KVM VM fd</li><li>每个 vCPU fd</li><li>通用与系统寄存器</li><li>中断控制器状态</li><li>vCPU thread 和同步 barrier</li></ul></article>
+        <article class="card"><h3>内存</h3><ul><li>Guest Physical → VMM virtual mapping</li><li>KVM memory slots</li><li>内存 backing file fd</li><li>VMM 页表</li><li>已驻留物理页，直到 page-out</li></ul></article>
+        <article class="card"><h3>设备</h3><ul><li>virtio feature negotiation</li><li>queue index 与 eventfd</li><li>PCI/MMIO 配置</li><li>vhost-user socket</li><li>tap、vsock 与 console 状态</li></ul></article>
+      </div>
+      <div class="callout red"><strong>Pause 不等于资源释放：</strong>它首先保证状态停止变化。暂停成功时，CPU 几乎不再消耗，但 Guest RAM RSS 通常仍和暂停前接近。物理内存回收是下一阶段。</div>
+    </section>
+
+    <section id="pageout">
+      <h2>6. Guest RAM 如何从物理内存回收到 NVMe</h2>
+      <p class="lead">推荐每个 Cat 使用受控的 file-backed memory zone。Guest 看见的内存大小不变；Host 可以在暂停后回收其物理页，并在恢复访问时从本地 NVMe 按需读回。</p>
+
+      <div class="diagram-frame">
+        <svg viewBox="0 0 1320 720" role="img" aria-labelledby="mem-title mem-desc">
+          <title id="mem-title">Guest RAM page-out 与 resume page fault</title>
+          <desc id="mem-desc">显示 Guest 物理地址映射到 VMM mmap、Host 物理页和 NVMe backing file；暂停后 process_madvise MADV_PAGEOUT 回收物理页；恢复后访问冷页触发 page fault 从 NVMe 读回。</desc>
+          <defs>
+            <marker id="m-o" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#ae5518"/></marker>
+            <marker id="m-g" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#087d59"/></marker>
+            <style>
+              .z{fill:#f8fafb;stroke:#9aaab1;stroke-width:1.3;rx:11}.b{fill:#fff;stroke:#9aaab1;stroke-width:1.1;rx:7}.o{fill:#fff3e7;stroke:#ae5518}.g{fill:#e9f8f1;stroke:#087d59}.p{fill:#f4effb;stroke:#7041a5}.t{font:700 16px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#233841}.s{font:11px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#60737b}.l{font:700 12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#3d535c}.out{stroke:#ae5518;stroke-width:2.2;fill:none;marker-end:url(#m-o)}.in{stroke:#087d59;stroke-width:2.2;fill:none;marker-end:url(#m-g)}.map{stroke:#7041a5;stroke-width:1.7;stroke-dasharray:3 5;fill:none}.page{fill:#fff;stroke:#9aaab1;rx:3}.resident{fill:#e9f8f1;stroke:#087d59}.cold{fill:#eef2f4;stroke:#9aaab1}
+            </style>
+          </defs>
+          <rect x="35" y="30" width="1250" height="620" class="z"/>
+          <text x="62" y="64" class="t">逻辑映射始终保留</text>
+          <rect x="75" y="95" width="245" height="145" class="b p"/><text x="129" y="128" class="t">Guest Physical RAM</text><text x="114" y="155" class="s">0x0000 ... 8GiB logical address</text><text x="111" y="182" class="s">Guest 认为一直拥有完整 8GiB</text><text x="118" y="209" class="s">Linux process/page cache 在这里</text>
+          <rect x="390" y="95" width="245" height="145" class="b p"/><text x="449" y="128" class="t">VMM mmap</text><text x="424" y="155" class="s">userspace virtual address range</text><text x="424" y="182" class="s">KVM memory slot 指向该范围</text><text x="420" y="209" class="s">映射存在不代表页面已驻留</text>
+          <rect x="705" y="95" width="245" height="145" class="b g"/><text x="753" y="128" class="t">Host Physical RAM</text><text x="742" y="155" class="s">Running：工作集页面 resident</text><text x="749" y="182" class="s">Pause 后：初始仍然占 RAM</text><text x="739" y="209" class="s">Page-out 后：多数页面可回收</text>
+          <rect x="1020" y="95" width="225" height="145" class="b o"/><text x="1065" y="128" class="t">NVMe Backing</text><text x="1044" y="155" class="s">memory/&lt;cat-id&gt;.mem</text><text x="1041" y="182" class="s">logical size=Guest RAM size</text><text x="1040" y="209" class="s">实际空间≈触碰/写回的页面</text>
+          <path d="M320 168 H390" class="map"/><path d="M635 168 H705" class="map"/><path d="M950 168 H1020" class="map"/>
+
+          <rect x="75" y="295" width="370" height="265" class="z o"/><text x="101" y="328" class="t">Suspend Page-out</text>
+          <text x="101" y="357" class="l">cat-agent:</text><text x="101" y="382" class="s">pidfd_open(VMM PID)</text><text x="101" y="405" class="s">定位 Guest RAM mmap ranges</text><text x="101" y="428" class="s">process_madvise(..., MADV_PAGEOUT)</text>
+          <rect x="105" y="464" width="62" height="44" class="page resident"/><rect x="177" y="464" width="62" height="44" class="page resident"/><rect x="249" y="464" width="62" height="44" class="page resident"/><rect x="321" y="464" width="62" height="44" class="page resident"/>
+          <text x="114" y="492" class="s">dirty</text><text x="186" y="492" class="s">clean</text><text x="258" y="492" class="s">pinned</text><text x="330" y="492" class="s">unused</text>
+          <text x="105" y="536" class="s">dirty 写回；clean 丢弃；pinned 可能保留；unused 无成本</text>
+
+          <rect x="500" y="295" width="310" height="265" class="z g"/><text x="526" y="328" class="t">回收后的状态</text>
+          <text x="526" y="360" class="s">Guest logical RAM：8GiB</text><text x="526" y="385" class="s">VMM mmap：8GiB virtual mapping</text><text x="526" y="410" class="s">Host RSS：仅热页/固定页/VMM 开销</text><text x="526" y="435" class="s">NVMe backing：保存已触碰页面</text>
+          <rect x="529" y="472" width="48" height="38" class="page cold"/><rect x="586" y="472" width="48" height="38" class="page cold"/><rect x="643" y="472" width="48" height="38" class="page resident"/><rect x="700" y="472" width="48" height="38" class="page cold"/>
+          <text x="532" y="534" class="s">大多数冷页不再占 Host physical RAM</text>
+
+          <rect x="865" y="295" width="380" height="265" class="z g"/><text x="891" y="328" class="t">Resume Page Fault</text>
+          <text x="891" y="360" class="s">Guest vCPU 访问冷地址</text><text x="891" y="385" class="s">→ Host page fault</text><text x="891" y="410" class="s">→ NVMe backing 读取对应页</text><text x="891" y="435" class="s">→ 建立 Host physical page</text><text x="891" y="460" class="s">→ Guest 指令继续执行</text>
+          <text x="891" y="505" class="l">无需一次性读回整个 8GiB</text><text x="891" y="530" class="s">当前 Kernel、进程和工作集自然优先恢复</text>
+          <path d="M445 430 H500" class="out"/><path d="M810 430 H865" class="in"/>
+          <path d="M1130 295 V240" class="in"/><text x="1143" y="277" class="s">按需读回</text>
+        </svg>
+      </div>
+
+      <h3 style="margin-top:28px">6.1 Linux 实际行为</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>页面类型</th><th>MADV_PAGEOUT 行为</th><th>结果</th></tr></thead>
+        <tbody>
+          <tr><td>file-backed dirty page</td><td>写回 backing file</td><td>写入本地 NVMe 后可从物理 RAM 回收</td></tr>
+          <tr><td>file-backed clean page</td><td>直接从 page cache 回收</td><td>下次访问从 backing file fault 回来</td></tr>
+          <tr><td>anonymous page</td><td>如果 Host 配置 swap，可换出</td><td>没有 swap 或不适用时可能不回收</td></tr>
+          <tr><td>pinned / mlocked / 不适用页面</td><td>内核可以忽略 advice</td><td>继续驻留，所以 page-out 是 best-effort</td></tr>
+          <tr><td>从未触碰的 sparse page</td><td>本来就没有物理页</td><td>既不占 RAM，也不占实际 NVMe block</td></tr>
+        </tbody>
+      </table></div>
+
+      <div class="callout orange"><strong>配置要求：</strong>如果使用匿名 Guest RAM 且 Host 没有 swap，pause 后内存可能基本不下降。Cats 应明确使用每 Cat 独立的 file-backed memory zone，并对 backing file 做权限、容量、生命周期和加密管理。</div>
+      <div class="callout"><strong>不要使用不易回收的内存配置：</strong>如果 Suspend 是核心能力，需要验证 hugetlbfs、显式 HugeTLB、mlock、vhost-user shared mapping 和 THP 对 page-out 的影响。不能只看配置项存在，必须测 pause 前后 RSS/PSS 与 refault。</div>
+    </section>
+
+    <section id="accounting">
+      <h2>7. Suspend 到底回收了哪些资源</h2>
+      <div class="table-wrap"><table>
+        <thead><tr><th>资源</th><th>Running</th><th>Suspended</th><th>Cold</th><th>谁执行回收</th></tr></thead>
+        <tbody>
+          <tr><td>vCPU 执行时间</td><td>持续消耗</td><td><span class="status free">基本完全回收</span></td><td><span class="status free">完全回收</span></td><td>Cloud Hypervisor CPU Manager / scheduler accounting</td></tr>
+          <tr><td>vCPU thread</td><td>运行/KVM_RUN</td><td><span class="status keep">保留但阻塞</span></td><td><span class="status free">线程消失</span></td><td>VMM pause / VMM exit</td></tr>
+          <tr><td>Guest physical RAM</td><td>工作集驻留</td><td><span class="status partial">大部分 page-out</span></td><td><span class="status free">全部释放</span></td><td>cat-agent + Host memory manager</td></tr>
+          <tr><td>Guest 逻辑 RAM</td><td>例如 8GiB</td><td><span class="status keep">仍是 8GiB</span></td><td><span class="status none">不存在</span></td><td>Cold 时关闭 VMM</td></tr>
+          <tr><td>VMM / KVM fd</td><td>存在</td><td><span class="status keep">全部保留</span></td><td><span class="status free">全部释放</span></td><td>Cloud Hypervisor shutdown/exit</td></tr>
+          <tr><td>cats-blockd</td><td>读写</td><td><span class="status keep">保留并续租</span></td><td><span class="status free">停止</span></td><td>cat-agent</td></tr>
+          <tr><td>Dirty/Pending Commit</td><td>可能存在</td><td><span class="status keep">提交前必须保留</span></td><td><span class="status free">必须清零后才可清理</span></td><td>cats-blockd Commit Engine</td></tr>
+          <tr><td>Disk clean cache</td><td>保留热集</td><td><span class="status partial">可按压力淘汰</span></td><td><span class="status free">可全部删除</span></td><td>NVMe Manager</td></tr>
+          <tr><td>Memory backing file</td><td>存在</td><td><span class="status keep">必须保留</span></td><td><span class="status free">删除/密钥销毁</span></td><td>cat-agent / NVMe Manager</td></tr>
+          <tr><td>tap / bridge / overlay</td><td>存在</td><td><span class="status keep">通常保留</span></td><td><span class="status free">运行绑定清除</span></td><td>Network Manager</td></tr>
+          <tr><td>Endpoint 名称</td><td>active</td><td><span class="status keep">sleeping/wakeable</span></td><td><span class="status keep">unbound/wakeable</span></td><td>Route Controller</td></tr>
+          <tr><td>Host 亲和性</td><td>有</td><td><span class="status keep">必须保留</span></td><td><span class="status free">解除</span></td><td>Scheduler / Cat Controller</td></tr>
+          <tr><td>远端 Root/PersistentDisk</td><td>存在</td><td><span class="status keep">存在</span></td><td><span class="status keep">存在</span></td><td>Disk Controller</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3 style="margin-top:28px">7.1 一个 8GiB Cat 的示例</h3>
+      <div class="four-col">
+        <div class="metric"><strong>8 GiB</strong><span>Guest 可见逻辑 RAM，Suspend 前后不变</span></div>
+        <div class="metric"><strong>≈5 GiB</strong><span>假设运行时实际触碰并驻留的工作集</span></div>
+        <div class="metric"><strong>几十～数百 MiB</strong><span>page-out 后可能保留的 RSS；取决于 workload 和 pinned page</span></div>
+        <div class="metric"><strong>≈5 GiB NVMe</strong><span>示例 backing 实际 block；是 RAM 回收换来的本地盘成本</span></div>
+      </div>
+      <div class="callout red"><strong>不能把 Suspended 记成“0 内存资源”：</strong>它只是在物理上低驻留，逻辑上随时可能恢复到完整 8GiB。调度器必须同时记录 resident bytes 和 resume commitment，否则大量 Cat 同时唤醒会让 Host OOM 或持续换页。</div>
+    </section>
+
+    <section id="resume">
+      <h2>8. Suspended → Running 的唤醒过程</h2>
+      <p class="lead">唤醒分为控制面激活、容量准入、VMM resume 和内存 refault。VMM resume 本身很短，但应用第一次访问冷内存会继续产生按需缺页。</p>
+
+      <div class="flow">
+        <div class="step"><b>1. Wake 触发</b><p><code>cats shell/start/resume</code> 或允许 wake 的 Endpoint 请求到达；同一 Cat singleflight。</p></div>
+        <div class="step"><b>2. 健康检查</b><p>确认原 Node、VMM PID、API socket、blockd、lease epoch 和 memory backing 都存在。</p></div>
+        <div class="step"><b>3. 容量准入</b><p>检查 CPU run slot、Host memory headroom 和并发 refault 预算；必要时先 Cold 其他 Cat。</p></div>
+        <div class="step"><b>4. VMM Resume</b><p>恢复时钟、Hypervisor VM、Device Manager、vCPU，顺序不能反。</p></div>
+        <div class="step"><b>5. RAM Refault</b><p>Guest Kernel/进程访问冷页时从本地 NVMe 按需读回，不全量加载 Guest RAM。</p></div>
+        <div class="step"><b>6. Ready</b><p>Guest Agent 心跳、磁盘和基础健康检查通过；清理睡眠中的旧 session。</p></div>
+        <div class="step"><b>7. Route Active</b><p>发布新 activation epoch；等待中的 shell/HTTP 请求连接 Guest。</p></div>
+      </div>
+
+      <h3 style="margin-top:28px">8.1 Cloud Hypervisor Resume 的实际顺序</h3>
+      <div class="sequence" aria-label="Cloud Hypervisor resume 时序">
+        <div class="seq head">步骤</div><div class="seq head">Control / Agent</div><div class="seq head">Cloud Hypervisor</div><div class="seq head">Device</div><div class="seq head">vCPU / Memory</div>
+        <div class="seq num">1</div><div class="seq blue">调用 resume</div><div class="seq blue">验证 Paused → Running</div><div class="seq">暂停</div><div class="seq">暂停</div>
+        <div class="seq num">2</div><div class="seq">等待</div><div class="seq orange">恢复 Guest clock</div><div class="seq">暂停</div><div class="seq orange">避免时间倒退/错误基线</div>
+        <div class="seq num">3</div><div class="seq">等待</div><div class="seq blue">Hypervisor VM resume</div><div class="seq">准备恢复</div><div class="seq">KVM VM 可运行</div>
+        <div class="seq num">4</div><div class="seq">等待</div><div class="seq green">Device Manager resume</div><div class="seq green">virtio queue / eventfd 恢复</div><div class="seq">仍未放行 Guest</div>
+        <div class="seq num">5</div><div class="seq">等待</div><div class="seq green">CPU Manager resume</div><div class="seq">已就绪</div><div class="seq green">vCPU 重新进入 KVM_RUN</div>
+        <div class="seq num">6</div><div class="seq">探测 Ready</div><div class="seq">state=Running</div><div class="seq">处理 Guest I/O</div><div class="seq orange">冷页按需 page fault</div>
+      </div>
+
+      <div class="callout"><strong>唤醒延迟由两部分组成：</strong>一是 VMM 控制动作延迟，通常很短；二是 workload refault 延迟，取决于 Guest 有多少冷页、NVMe 随机读和应用工作集。不能只用 <code>ch-remote resume</code> 命令耗时代表用户可用时间。</div>
+      <div class="callout orange"><strong>网络连接：</strong>Guest TCP 状态虽然还在 RAM 中，但远端客户端、NAT、LB 和防火墙可能已经超时。产品只能保证 Endpoint 名称恢复，不能保证休眠前的 TCP/WebSocket 连接继续可用。</div>
+    </section>
+
+    <section id="cold">
+      <h2>9. Suspended/Running → Cold：彻底资源回收</h2>
+      <p class="lead">Cold 的目标是让 Cat 不再依赖原 Host。进入 Cold 前必须确保远端磁盘 durable；之后退出 VMM、停止设备 backend、清理本地资源并撤销运行时 Attachment。</p>
+
+      <div class="two-col">
+        <article class="card"><h3>进入 Cold</h3><ol><li>阻止新 exec、deploy、mount 和流量激活。</li><li>如果还在 Running，Guest syncfs；如果已 Suspended，使用暂停前的 durable generation。</li><li>确保所有 Pending Commit 已完成或明确失败。</li><li>Route 变为 unbound/cold。</li><li>Cloud Hypervisor shutdown/exit。</li><li>停止 cats-blockd，释放 runtime lease。</li><li>删除 tap、socket、cgroup、memory backing 和本地 Secret。</li><li>clean cache 进入立即可淘汰队列。</li></ol></article>
+        <article class="card"><h3>Cold 唤醒</h3><ol><li>Scheduler 选择任意健康 Node。</li><li>创建更高 Attachment fencing epoch。</li><li>启动空或复用 clean cache 的 cats-blockd。</li><li>建立 tap、vsock、cgroup 和 VMM 配置。</li><li>启动全新的 Cloud Hypervisor。</li><li>Guest 从 RootDisk boot；ext4 journal recovery。</li><li>Guest Agent Ready 后发布 route epoch。</li><li>用户进程按 image/service policy 重新启动。</li></ol></article>
+      </div>
+
+      <h3 style="margin-top:28px">9.1 VMM 退出后真正释放的内容</h3>
+      <div class="three-col">
+        <article class="card"><h3>KVM / CPU</h3><ul><li>VM fd 和 vCPU fd 关闭</li><li>vCPU thread 消失</li><li>寄存器/中断/时钟状态释放</li><li>CPU cgroup allocation 释放</li><li>不保留 Guest process state</li></ul></article>
+        <article class="card"><h3>Memory / Device</h3><ul><li>Guest mmap 和 memory slots 删除</li><li>VMM heap/stack 释放</li><li>memory backing file 删除</li><li>virtio frontend/eventfd/socket 关闭</li><li>blockd 在 final FLUSH 后退出</li></ul></article>
+        <article class="card"><h3>Network / Local State</h3><ul><li>tap 与 per-Cat firewall 删除</li><li>运行 route binding 清除</li><li>本地 Secret 清除</li><li>dirty/pending 必须为零</li><li>clean disk cache 可全部淘汰</li></ul></article>
+      </div>
+      <div class="callout green"><strong>Cold 的 Ground Truth：</strong>只剩 PostgreSQL 中的 Cat/Disk/Endpoint 记录和对象存储中的 RootDisk/PersistentDisk。新 Host 不需要旧 Host 上的任何文件才能启动。</div>
+    </section>
+
+    <section id="snapshot">
+      <h2>10. 为什么 V1 不把内存 Snapshot 当默认睡眠</h2>
+      <p class="lead">“把内存写成 Snapshot、退出 VMM、以后 restore”理论上能同时释放 Host RAM 和保留进程，但会引入完整的 CPU/设备/网络/版本一致性问题。它应是未来第三层 Hibernate，而不是 V1 的 Suspend 或 Cold。</p>
+
+      <div class="table-wrap"><table>
+        <thead><tr><th>方案</th><th>保留进程</th><th>释放 VMM/RAM</th><th>跨 Host</th><th>复杂度与风险</th></tr></thead>
+        <tbody>
+          <tr><td>Pause + Page-out</td><td>是</td><td>保留 VMM；大部分 RAM 可回收</td><td>否</td><td>最低；依赖本地 NVMe 和原 Host</td></tr>
+          <tr><td>Cold fresh boot</td><td>否</td><td>全部释放</td><td>是</td><td>低；只依赖成熟磁盘恢复</td></tr>
+          <tr><td>Hibernate Snapshot/Restore</td><td>理论上是</td><td>退出后可全部释放</td><td>理论上是</td><td>高；必须迁移 CPU、RAM、时钟、设备 backend 和网络状态</td></tr>
+        </tbody>
+      </table></div>
+
+      <div class="three-col mt">
+        <article class="card"><h3>数据量</h3><p>8GiB Guest 可能产生数 GiB 内存 Snapshot。即使按 dirty page/压缩优化，写入 NVMe/对象存储仍有显著延迟和成本。</p></article>
+        <article class="card"><h3>设备一致性</h3><p>vhost-user-blk 的 queue、in-flight request、interrupt、socket 和 cats-blockd transaction 必须与 VMM snapshot 对齐。</p></article>
+        <article class="card"><h3>版本兼容</h3><p>Cloud Hypervisor 不保证 Snapshot/restore 跨版本兼容。Node 滚动升级会与长期 Hibernate Snapshot 冲突。</p></article>
+        <article class="card"><h3>网络语义</h3><p>Guest TCP 状态恢复不代表 NAT、LB 和对端连接还存在。旧 vsock session 也必须丢弃重建。</p></article>
+        <article class="card"><h3>磁盘原子点</h3><p>内存 Snapshot 必须引用明确的 disk durable generation；否则 RAM 中的文件系统状态与远端盘版本不匹配。</p></article>
+        <article class="card"><h3>安全</h3><p>Snapshot 包含应用密钥和进程内存，必须独立加密、授权、保留和安全删除，不能当普通 cache。</p></article>
+      </div>
+      <div class="callout red"><strong>决策：</strong>V1 只支持“同 Host Pause + Page-out”和“跨 Host Cold fresh boot”。Hibernate 只有在精确 Cloud Hypervisor + cats-blockd 版本完成 crash、migration、device 和安全验证后再加入。</div>
+    </section>
+
+    <section id="capacity">
+      <h2>11. 容量记账与自动分层</h2>
+      <p class="lead">Suspend 的物理 RSS 很低，但它仍是一笔可恢复内存承诺和本地 NVMe 消耗。调度器不能只用当前 RSS 做 placement。</p>
+
+      <h3>11.1 每个 Suspended Cat 的四个数字</h3>
+      <pre class="code-block"><code>SuspendedResource {
+  logical_guest_memory_bytes   # Guest 配置内存，例如 8GiB
+  resident_memory_bytes        # page-out 后当前 Host RSS/PSS
+  memory_backing_bytes         # 本地 NVMe 实际占用
+  resume_commit_bytes          # 同时唤醒时可能恢复的内存承诺
+}
+
+NodePressure {
+  running_resident_bytes
+  suspended_resident_bytes
+  suspended_resume_commit_bytes
+  memory_backing_nvme_bytes
+  disk_dirty_and_pending_bytes
+  clean_cache_bytes
+  resume_concurrency
+}</code></pre>
+
+      <h3 style="margin-top:28px">11.2 为什么会出现“逻辑 1.6TiB，物理 512GiB”</h3>
+      <div class="callout orange">如果一个 Node 上有 200 个 8GiB Suspended Cat，它们的逻辑可恢复内存是 1.6TiB。即使当前 RSS 总和只有几十 GiB，也绝不能让 200 个 Cat 同时 resume。需要 overcommit 上限、并发唤醒限流和 Cold 降级。</div>
+
+      <div class="table-wrap mt"><table>
+        <thead><tr><th>水位</th><th>动作</th><th>目的</th></tr></thead>
+        <tbody>
+          <tr><td>RAM 低压</td><td>允许 Running → Suspend；正常 page-out</td><td>降低闲置计算成本</td></tr>
+          <tr><td>RAM 高水位</td><td>加速 oldest Suspended page-out；限制同时 Resume</td><td>避免 Host reclaim 风暴和 OOM</td></tr>
+          <tr><td>NVMe memory backing 高水位</td><td>把最老、低优先级 Suspended Cat 转 Cold</td><td>释放真正的本地盘空间</td></tr>
+          <tr><td>Dirty/Pending 高水位</td><td>停止新的 Suspend/Cold；先回压 Guest 写并完成提交</td><td>不能删除唯一未提交数据</td></tr>
+          <tr><td>用户请求 Wake 无 headroom</td><td>短队列；优先 Cold 其他低优先级 Cat；超时返回明确错误</td><td>不能直接 resume 导致整机抖动</td></tr>
+          <tr><td>Node drain</td><td>Suspended Cat 不能 live 搬迁，先转 Cold，再在其他 Node fresh boot</td><td>解除 Host 亲和</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3 style="margin-top:28px">11.3 自动策略</h3>
+      <pre class="code-block"><code>if cat.running and idle_for > suspend_after:
+    suspend(cat)
+
+if cat.suspended and (
+       idle_for > cold_after
+    or node.memory_pressure > high
+    or node.nvme_memory_pressure > high
+    or node.draining):
+    cold_stop(cat)
+
+if wake_requested(cat):
+    if cat.state == Suspended and original_node_healthy:
+        admit_resume_or_queue(cat)
+    else:
+        cold_start_on_new_node(cat)</code></pre>
+    </section>
+
+    <section id="failure">
+      <h2>12. 故障、取消与竞态</h2>
+      <p class="lead">睡醒涉及 Guest、VMM、blockd、Node 与控制面，必须把每个中间点定义成可恢复阶段。不能只保存一个布尔值 <code>sleeping=true</code>。</p>
+
+      <div class="table-wrap"><table>
+        <thead><tr><th>故障点</th><th>正确状态</th><th>恢复动作</th></tr></thead>
+        <tbody>
+          <tr><td>Guest sync 超时</td><td>保持 Running 或标记 SuspendFailed</td><td>不强行宣称 durable；按策略重试或执行受控 Cold shutdown</td></tr>
+          <tr><td>磁盘 FLUSH 失败</td><td>不进入 Suspended/Cold durable 状态</td><td>blockd 回压；保留 dirty/pending；对象/DB 恢复后重试</td></tr>
+          <tr><td>vCPU 已 pause，Device pause 失败</td><td>VM 处于 Pausing/Error</td><td>优先尝试 resume 回 Running；不执行 page-out 或 cleanup</td></tr>
+          <tr><td>Pause 成功，Page-out 部分失败</td><td>可以保持 Suspended，但记录低回收率</td><td>page-out 是 best-effort；稍后重试；持续高 RSS 则转 Cold</td></tr>
+          <tr><td>Page-out 过程中收到 Wake</td><td>相同 Cat lifecycle generation 仲裁</td><td>取消后续 page-out，等待当前 syscall 返回，再 resume</td></tr>
+          <tr><td>VMM 在 Suspended 时崩溃</td><td>进程状态丢失；不可只靠 memory file restore</td><td>Fence 旧 runtime，按 Cold Recovery fresh boot</td></tr>
+          <tr><td>整台 Host 丢失</td><td>Suspended memory 视为丢失</td><td>云 fencing/Node lease 确认；新 Host 获取更高 disk epoch；Cold start</td></tr>
+          <tr><td>Resume 后 Guest Agent 未 Ready</td><td>Resuming 超时</td><td>收集 console/VMM/device 指标；一次 resume 修复失败后 Cold reboot</td></tr>
+          <tr><td>Cold cleanup 中控制面重试</td><td>Job 幂等</td><td>按明确路径和 PID identity 重做；不存在视为已清理</td></tr>
+          <tr><td>旧 Route cache</td><td>Node 再检查 activation epoch</td><td>旧 epoch 返回 409/503，不代理到错误 Guest</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3 style="margin-top:28px">12.1 状态机建议</h3>
+      <pre class="code-block"><code>Running
+  → SuspendRequested
+  → QuiescingGuest
+  → FlushingDisks
+  → PausingVmm
+  → PagingOutMemory
+  → Suspended
+
+Suspended
+  → ResumeRequested
+  → AdmittingResources
+  → ResumingVmm
+  → WaitingGuestReady
+  → Running
+
+Running | Suspended
+  → ColdStopRequested
+  → FlushingDisks
+  → StoppingVmm
+  → ReleasingAttachment
+  → CleaningLocalState
+  → Cold
+
+# 每个 transition 带 cat_generation、operation_id 和 deadline。
+# Node Job key = cat_id / generation / action，重复请求返回原结果。</code></pre>
+
+      <div class="callout red"><strong>禁止操作：</strong>不能在未确认磁盘 FLUSH 时删除 dirty cache；不能在旧 VMM 可能继续运行时给新 Host 发相同 Attachment epoch；不能把 page-out 失败误认为 Cold；不能仅凭控制面状态删除 Host 上未知 PID。</div>
+    </section>
+
+    <section id="implementation">
+      <h2>13. Cats 中的模块职责</h2>
+      <div class="table-wrap"><table>
+        <thead><tr><th>模块</th><th>Suspend 职责</th><th>Resume/Cold 职责</th></tr></thead>
+        <tbody>
+          <tr><td>Cat Controller</td><td>决定 desired state、创建 Operation、阶段超时和重试</td><td>singleflight Wake、故障降级、Cold Recovery</td></tr>
+          <tr><td>Scheduler</td><td>释放/调整 CPU run budget，记录 resume commitment</td><td>Resume 容量准入；Cold 时重新选 Node</td></tr>
+          <tr><td>cat-agent</td><td>Guest sync、调用 CH pause、pidfd/process_madvise、状态检查</td><td>调用 resume 或 shutdown；进程、tap、socket、cgroup cleanup</td></tr>
+          <tr><td>Cloud Hypervisor</td><td>暂停 vCPU/clock/device/hypervisor VM</td><td>按序恢复；Cold 时退出并释放 KVM 状态</td></tr>
+          <tr><td>Guest Agent</td><td>syncfs、应用 hook、磁盘/服务状态报告</td><td>Ready、session 重建、Cold boot 后 mount/resize 检查</td></tr>
+          <tr><td>cats-blockd</td><td>完成 FLUSH，保留 lease/backend，停止新 Guest I/O 后继续必要后台提交</td><td>Resume 继续；Cold final drain、释放 lease；新 Host 使用新 epoch</td></tr>
+          <tr><td>NVMe Manager</td><td>memory backing quota、page-out 统计、clean cache 淘汰</td><td>Cold 删除 backing 和 staging；密钥清理；Wake 可选预热</td></tr>
+          <tr><td>Route Controller</td><td>active → sleeping，应用 wake_policy</td><td>Wake singleflight；Ready 后发布新 activation epoch</td></tr>
+          <tr><td>Node Controller</td><td>观察内存/NVMe 水位，触发自动分层</td><td>Node Lost、cordon/drain 与批量恢复限流</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3 style="margin-top:28px">13.1 Node 侧伪代码</h3>
+      <pre class="code-block"><code>async fn suspend_cat(job: SuspendJob) -> Result&lt;SuspendResult&gt; {
+    verify_generation_and_pid_identity(job)?;
+    session_gate.block_new_sessions(job.cat_id).await?;
+
+    guest.sync_filesystems(job.deadline).await?;
+    let durable = blockd.flush_all(job.attachment_epochs).await?;
+
+    ch.pause(job.api_socket).await?;
+    verify_vmm_state(job.api_socket, "Paused").await?;
+
+    let ranges = discover_guest_memory_mappings(job.vmm_pidfd)?;
+    let before = read_memory_accounting(job.vmm_pid)?;
+    let advised = process_madvise_pageout(job.vmm_pidfd, ranges)?;
+    let after = wait_for_reclaim_or_deadline(job.vmm_pid, job.reclaim_target).await;
+
+    persist_observation(Suspended {
+        durable_generation: durable,
+        advised_bytes: advised,
+        resident_bytes: after.rss,
+        backing_bytes: stat_blocks(job.memory_backing),
+    }).await?;
+}
+
+async fn resume_cat(job: ResumeJob) -> Result&lt;()&gt; {
+    verify_same_node_runtime(job)?;
+    scheduler.admit_resume(job.cat_id).await?;
+    verify_blockd_and_lease(job.attachment_epochs).await?;
+    ch.resume(job.api_socket).await?;
+    guest.wait_ready(job.deadline).await?;
+    route.publish_new_activation_epoch(job.cat_id).await?;
+}</code></pre>
+
+      <div class="callout"><strong>权限：</strong><code>process_madvise</code> 操作另一个进程需要 pidfd、ptrace 访问检查和 <code>CAP_SYS_NICE</code>。不要给整个 cat-agent 无限制 root；可以把 memory-reclaimer 拆成只允许操作已登记 VMM PID/range 的小型特权 helper。</div>
+    </section>
+
+    <section id="observability">
+      <h2>14. 必须采集的指标</h2>
+      <p class="lead">睡眠是否有效，不能只看状态变成 Suspended。必须同时证明 CPU 降低、RAM 回收、NVMe 成本可控、磁盘达到 durable generation、唤醒按时成功。</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>类别</th><th>指标</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td>Lifecycle</td><td><code>suspend_duration</code>、<code>resume_duration</code>、<code>cold_start_duration</code>、阶段耗时、失败原因</td><td>区分 Guest sync、FLUSH、VMM、page-out、Ready 的瓶颈</td></tr>
+          <tr><td>CPU</td><td>VMM CPU seconds、vCPU thread state、KVM exits、paused duration</td><td>证明暂停后接近 0 CPU</td></tr>
+          <tr><td>Memory</td><td>logical、RSS、PSS、anonymous/file、advised bytes、reclaimed bytes、major/minor faults</td><td>证明 page-out 效果和 Resume refault 成本</td></tr>
+          <tr><td>NVMe</td><td>memory backing logical/allocated bytes、写入/读取带宽、latency、quota、水位</td><td>量化“RAM 换 NVMe”的真实成本</td></tr>
+          <tr><td>Storage</td><td>dirty bytes、pending packs、FLUSH latency、durable generation、lease epoch</td><td>确保睡眠前远端持久性成立</td></tr>
+          <tr><td>VMM/Device</td><td>pause/resume result、device pause latency、socket state、eventfd errors</td><td>发现 vhost-user/virtio 恢复问题</td></tr>
+          <tr><td>Wake</td><td>queue time、admission reject、first shell、first HTTP、working-set refault bytes</td><td>用户实际体验而不只是 VMM API 时间</td></tr>
+          <tr><td>Capacity</td><td>suspended count、resume commitment、overcommit ratio、concurrent wake、Cold demotion</td><td>防止批量唤醒引发 OOM/抖动</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3 style="margin-top:28px">14.1 推荐事件时间线</h3>
+      <pre class="code-block"><code>CatSuspendRequested
+GuestQuiesceStarted / Completed
+DiskFlushStarted / Durable { generation, epoch }
+VmmPauseStarted / Completed
+MemoryPageoutCompleted { before_rss, after_rss, advised_bytes, backing_bytes }
+CatSuspended
+
+CatWakeRequested { source: shell | endpoint | user | scheduler }
+ResumeAdmitted
+VmmResumeCompleted
+GuestReady
+RouteActivated { activation_epoch }
+CatRunning</code></pre>
+    </section>
+
+    <section id="validation">
+      <h2>15. 验收测试</h2>
+      <p class="lead">需要在真实裸金属、真实 KVM、真实 cats-blockd 和真实 NVMe 上验证。只 mock Cloud Hypervisor API 无法发现 pinned page、virtqueue、时钟和 refault 问题。</p>
+
+      <div class="three-col">
+        <article class="card"><h3>正确性</h3><ul><li>Guest 内计数器/进程在 Suspend 后继续</li><li>Root/PersistentDisk digest 一致</li><li>fsync 文件 Host crash 后恢复</li><li>未 fsync 数据允许按语义丢失</li><li>Guest clock 不倒退</li><li>旧 session/route epoch 被拒绝</li></ul></article>
+        <article class="card"><h3>资源回收</h3><ul><li>pause 后 vCPU CPU≈0</li><li>8GiB 多种工作集 RSS 回收率</li><li>memory backing 实际 block</li><li>pinned/hugepage 对照组</li><li>clean cache 淘汰与 dirty 保留</li><li>Cold 后 PID/fd/tap/cgroup=0</li></ul></article>
+        <article class="card"><h3>唤醒性能</h3><ul><li>VMM resume P50/P99</li><li>Guest Ready / shell ready</li><li>HTTP first byte</li><li>NVMe refault bytes/latency</li><li>1/10/100 Cat 并发 Wake</li><li>内存压力下 admission 行为</li></ul></article>
+        <article class="card"><h3>故障注入</h3><ul><li>FLUSH 各阶段 kill -9</li><li>vCPU pause 后 device pause 失败</li><li>page-out 中 wake</li><li>Suspended VMM crash</li><li>整台 Host power off</li><li>旧 Host 恢复网络尝试写</li></ul></article>
+        <article class="card"><h3>长时间稳定性</h3><ul><li>72h Suspend/Resume 循环</li><li>memory backing 泄漏</li><li>fd/tap/cgroup 泄漏</li><li>RSS 回收退化</li><li>网络连接与 DNS 恢复</li><li>Node drain 全流程</li></ul></article>
+        <article class="card"><h3>上线门槛</h3><ul><li>无成功 FLUSH 数据丢失</li><li>无双 Attachment writer</li><li>无 Host OOM</li><li>无 VMM/device resume hang</li><li>Cold 不依赖旧 Host 文件</li><li>每个失败阶段可自动收敛</li></ul></article>
+      </div>
+
+      <h3 style="margin-top:28px">15.1 已有实验结论</h3>
+      <div class="callout green">2026-07-21 的 AWS i4i.metal 正式实验中，Suspend + page-out 的唤醒控制路径为 0.212–0.231 秒；暂停后的 VMM 物理 cgroup 内存为 6.941 / 11.635 / 17.336MiB（分别对应 512MiB / 1GiB / 2GiB Guest），回收率为 97.706%–98.508%，30/30 次恢复保持 Guest boot UUID 不变。本地 snapshot + VMM exit 的恢复控制路径为 0.380–0.399 秒。</div>
+      <div class="callout orange">这些数据验证了 Cloud Hypervisor 生命周期控制和 Guest RAM 回收机制；它们不是包含跨 Host 传输、远端 snapshot 下载、用户服务 readiness 和并发负载的端到端生产指标。正式结论以同目录的实验总报告和原始 CSV 为准。</div>
+    </section>
+
+    <section id="sources">
+      <h2>16. 参考资料与相关设计</h2>
+      <div class="source-list">
+        <a href="https://github.com/cloud-hypervisor/cloud-hypervisor/blob/main/vmm/src/vm.rs"><strong>Cloud Hypervisor Vm pause/resume source</strong>当前 pause 的 CPU、clock、device、hypervisor 顺序和 resume 的反向恢复顺序。</a>
+        <a href="https://www.cloudhypervisor.org/docs/prologue/commands/"><strong>Cloud Hypervisor Commands</strong>pause/resume、API socket、memory zone backing file 和 VM 控制入口。</a>
+        <a href="https://www.man7.org/linux/man-pages/man2/process_madvise.2.html"><strong>process_madvise(2)</strong>通过 pidfd 对另一个进程的地址范围执行 MADV_PAGEOUT，以及权限和部分成功语义。</a>
+        <a href="https://man7.org/linux/man-pages/man2/madvise.2.html"><strong>madvise(2) / MADV_PAGEOUT</strong>匿名页、file-backed dirty/clean page 的回收行为与 best-effort 语义。</a>
+        <a href="https://docs.kernel.org/5.15/virt/kvm/api.html"><strong>KVM userspace memory API</strong>Guest memory slot 使用 userspace address，支持匿名或普通文件作为 backing。</a>
+        <a href="https://github.com/cloud-hypervisor/cloud-hypervisor"><strong>Cloud Hypervisor status</strong>Snapshot/restore 与 live migration 的版本兼容限制。</a>
+        <a href="cats-complete-product-technical-architecture.html"><strong>Cats 完整产品与技术架构</strong>控制面、计算、网络、存储、安全、计费、可靠性与完整产品状态。</a>
+        <a href="cats-storage-product-blueprint.html"><strong>Cats 存储产品蓝图</strong>RootDisk、PersistentDisk、vhost-user-blk、FLUSH、Attachment 与远端恢复。</a>
+        <a href="direct-s3-chunkstore-architecture.html"><strong>Direct-S3 ChunkStore</strong>NVMe Cache、Pending Commit、Root CAS、Lease/Fencing 和冷恢复。</a>
+        <a href="experiments-2026-07-21-storage-lifecycle.md"><strong>实验总报告</strong>Cloud Hypervisor pause/page-out、snapshot + VMM exit 和 AWS 真机原始结果索引。</a>
+      </div>
+    </section>
+  </main>
+
+  <footer><div class="page">Cats 睡眠与唤醒 · Suspend 保留 VMM 并把 Guest RAM 换到本地 NVMe；Cold 退出 VMM，只保留远端磁盘。</div></footer>
+</body>
+</html>

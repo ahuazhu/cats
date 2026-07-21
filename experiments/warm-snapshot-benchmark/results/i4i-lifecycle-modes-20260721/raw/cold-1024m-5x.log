@@ -1,0 +1,26 @@
+
+==> Build cloud-init seed with an in-memory working-set service
+
+==> Prime the persistent root disk and cloud-init before measured cold boots
+
+==> Run 5 cold guest boot cycles
+iteration=1
+1,1024,128,179.644,0,1784616478214015744,17.299,24.746,20189.124,11.202,863136,true,2134021f-f68a-47ce-b423-56deaea5bb38
+iteration=2
+2,1024,128,147.207,0,1784616498655912056,16.823,23.922,21127.363,11.945,843380,true,a0d01989-5dd4-4c59-bb3b-1b8f20c0ec2b
+iteration=3
+3,1024,128,132.177,0,1784616520024180448,17.433,31.475,20344.652,11.292,845076,true,5137ab7b-108d-4064-8468-887cd5ce7db1
+iteration=4
+4,1024,128,149.908,0,1784616540631153626,16.674,24.412,21064.079,12.902,845856,true,9c67273d-990a-4441-b589-f928fbc86f0e
+iteration=5
+5,1024,128,144.524,0,1784616561962794622,16.252,24.191,21196.074,13.960,845276,true,37cb99c2-7858-406f-8340-3e7d9a441965
+
+==> Summary
+shutdown_ms              p50=  147.207 ms  p95=  179.644 ms
+network_backend_ms       p50=   16.823 ms  p95=   17.433 ms
+vmm_to_api_ms            p50=   24.412 ms  p95=   31.475 ms
+cold_to_health_ms        p50=21064.079 ms  p95=21196.074 ms
+boot_id_changed          5/5
+
+==> PASS: every cycle started a new guest kernel/userspace and process boot ID
+results=/mnt/local-nvme/cats-cold-1024m/results/cold-benchmark.csv

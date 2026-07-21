@@ -1,0 +1,910 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Cats 的 RootDisk、PersistentDisk、Cloud Hypervisor、vhost-user-blk、JuiceFS、NVMe 缓存与对象存储完整架构设计。">
+  <title>Cats 存储架构设计</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f7f8;
+      --paper: #ffffff;
+      --ink: #18242b;
+      --muted: #586970;
+      --line: #cdd8dc;
+      --line-dark: #8ca0a8;
+      --blue: #185fa7;
+      --blue-bg: #edf5fc;
+      --green: #087f5b;
+      --green-bg: #eaf8f2;
+      --orange: #b65314;
+      --orange-bg: #fff4e8;
+      --purple: #6f42a8;
+      --purple-bg: #f5effc;
+      --red: #b42318;
+      --red-bg: #fff0ef;
+      --code: #102a38;
+      --radius: 10px;
+      --shadow: 0 8px 24px rgb(23 43 53 / 7%);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      line-height: 1.65;
+    }
+
+    a { color: var(--blue); }
+    code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+    code { color: var(--code); }
+
+    .page {
+      width: min(1320px, calc(100% - 32px));
+      margin: 0 auto;
+    }
+
+    header {
+      border-bottom: 1px solid var(--line);
+      background: var(--paper);
+    }
+
+    .header-inner { padding: 34px 0 28px; }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(30px, 4vw, 48px);
+      line-height: 1.15;
+      letter-spacing: -.035em;
+    }
+
+    .subtitle {
+      max-width: 980px;
+      margin: 13px 0 0;
+      color: var(--muted);
+      font-size: 16px;
+    }
+
+    .meta {
+      display: flex;
+      gap: 18px;
+      margin-top: 16px;
+      color: var(--muted);
+      font-size: 12px;
+      flex-wrap: wrap;
+    }
+
+    nav {
+      position: sticky;
+      z-index: 10;
+      top: 0;
+      border-bottom: 1px solid var(--line);
+      background: rgb(255 255 255 / 94%);
+      backdrop-filter: blur(10px);
+    }
+
+    .nav-inner {
+      display: flex;
+      gap: 20px;
+      padding: 11px 0;
+      overflow-x: auto;
+      white-space: nowrap;
+      font-size: 12px;
+    }
+
+    .nav-inner a { color: var(--muted); text-decoration: none; }
+    .nav-inner a:hover { color: var(--blue); }
+
+    main { padding-bottom: 60px; }
+
+    section {
+      padding: 48px 0;
+      border-bottom: 1px solid var(--line);
+      scroll-margin-top: 48px;
+    }
+
+    section:last-child { border-bottom: 0; }
+
+    h2 {
+      margin: 0 0 10px;
+      font-size: clamp(24px, 3vw, 34px);
+      line-height: 1.25;
+      letter-spacing: -.025em;
+    }
+
+    h3 { margin: 0 0 8px; font-size: 18px; }
+    h4 { margin: 0 0 6px; font-size: 14px; }
+
+    .lead {
+      max-width: 1000px;
+      margin: 0 0 24px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .decision-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .decision {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--blue);
+      border-radius: var(--radius);
+      background: var(--paper);
+    }
+
+    .decision:nth-child(2) { border-left-color: var(--green); }
+    .decision:nth-child(3) { border-left-color: var(--orange); }
+    .decision:nth-child(4) { border-left-color: var(--purple); }
+
+    .decision strong { display: block; font-size: 15px; }
+    .decision p { margin: 6px 0 0; color: var(--muted); font-size: 13px; }
+
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--paper);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    th, td {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+    th { background: #eef2f4; color: #43555d; font-size: 12px; }
+    td:first-child { font-weight: 650; }
+
+    .diagram-frame {
+      overflow-x: auto;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--paper);
+      box-shadow: var(--shadow);
+    }
+
+    .diagram-frame svg {
+      display: block;
+      width: 100%;
+      min-width: 1120px;
+      height: auto;
+    }
+
+    .legend {
+      display: flex;
+      gap: 18px;
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 12px;
+      flex-wrap: wrap;
+    }
+
+    .legend span { display: inline-flex; gap: 7px; align-items: center; }
+    .legend i { width: 28px; height: 3px; background: var(--green); }
+    .legend .control { background: repeating-linear-gradient(90deg, var(--blue) 0 7px, transparent 7px 11px); }
+    .legend .metadata { background: repeating-linear-gradient(90deg, var(--purple) 0 2px, transparent 2px 6px); }
+
+    .module-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .module {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--paper);
+    }
+
+    .module .where {
+      display: inline-block;
+      margin-bottom: 9px;
+      padding: 3px 7px;
+      border-radius: 4px;
+      background: var(--blue-bg);
+      color: var(--blue);
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .module p { margin: 0; color: var(--muted); font-size: 12px; }
+    .module ul { margin: 10px 0 0; padding-left: 18px; color: var(--muted); font-size: 12px; }
+    .module li + li { margin-top: 4px; }
+
+    .path {
+      display: grid;
+      grid-template-columns: repeat(7, minmax(0, 1fr));
+      gap: 8px;
+      align-items: stretch;
+      margin-top: 18px;
+    }
+
+    .path-box, .path-arrow {
+      display: grid;
+      min-height: 84px;
+      place-items: center;
+      text-align: center;
+    }
+
+    .path-box {
+      padding: 11px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--paper);
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    .path-box small { display: block; margin-top: 4px; color: var(--muted); font-weight: 400; }
+    .path-arrow { color: var(--line-dark); font-size: 20px; }
+
+    .sequence {
+      display: grid;
+      grid-template-columns: 170px minmax(0, 1fr);
+      gap: 0;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--paper);
+    }
+
+    .sequence + .sequence { margin-top: 14px; }
+
+    .sequence-name {
+      padding: 18px;
+      border-right: 1px solid var(--line);
+      background: #eef2f4;
+    }
+
+    .sequence-name strong { display: block; font-size: 14px; }
+    .sequence-name span { display: block; margin-top: 5px; color: var(--muted); font-size: 11px; }
+
+    .sequence-steps {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+    }
+
+    .step {
+      position: relative;
+      min-height: 116px;
+      padding: 16px 14px;
+      border-right: 1px solid var(--line);
+      font-size: 12px;
+    }
+
+    .step:last-child { border-right: 0; }
+    .step b { display: block; margin-bottom: 6px; color: var(--blue); }
+    .step p { margin: 0; color: var(--muted); }
+
+    .callout {
+      margin-top: 16px;
+      padding: 15px 17px;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--orange);
+      border-radius: var(--radius);
+      background: var(--orange-bg);
+      color: #6e3a17;
+      font-size: 13px;
+    }
+
+    .callout.red { border-left-color: var(--red); background: var(--red-bg); color: #77211b; }
+    .callout.green { border-left-color: var(--green); background: var(--green-bg); color: #155f49; }
+
+    .code-block {
+      margin-top: 14px;
+      padding: 18px;
+      overflow-x: auto;
+      border-radius: var(--radius);
+      background: #10232d;
+      color: #e3eef2;
+      font-size: 12px;
+      line-height: 1.8;
+    }
+
+    .code-block code { color: inherit; }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .plain-card {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--paper);
+    }
+
+    .plain-card p { margin: 6px 0 0; color: var(--muted); font-size: 12px; }
+    .plain-card ul { margin: 10px 0 0; padding-left: 18px; color: var(--muted); font-size: 12px; }
+
+    .state-flow {
+      display: flex;
+      gap: 7px;
+      align-items: center;
+      margin-top: 14px;
+      overflow-x: auto;
+      white-space: nowrap;
+    }
+
+    .state {
+      padding: 8px 11px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--paper);
+      font-size: 11px;
+      font-weight: 650;
+    }
+
+    .state-arrow { color: var(--line-dark); }
+
+    .source-list {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .source-list a {
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--paper);
+      font-size: 12px;
+      text-decoration: none;
+    }
+
+    .source-list a:hover { border-color: var(--blue); }
+    .source-list strong { display: block; margin-bottom: 4px; color: var(--ink); }
+
+    footer {
+      padding: 24px 0 40px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    @media (max-width: 960px) {
+      .module-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .path { grid-template-columns: 1fr; }
+      .path-arrow { min-height: 24px; transform: rotate(90deg); }
+      .sequence { grid-template-columns: 1fr; }
+      .sequence-name { border-right: 0; border-bottom: 1px solid var(--line); }
+      .sequence-steps { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .step { border-bottom: 1px solid var(--line); }
+    }
+
+    @media (max-width: 640px) {
+      .page { width: min(100% - 22px, 1320px); }
+      .header-inner { padding: 25px 0 21px; }
+      section { padding: 36px 0; }
+      .decision-grid, .module-grid, .two-col, .source-list { grid-template-columns: 1fr; }
+      .sequence-steps { grid-template-columns: 1fr; }
+      .step { min-height: 0; border-right: 0; }
+    }
+
+    @media print {
+      nav { display: none; }
+      body { background: white; }
+      section { padding: 28px 0; }
+      .diagram-frame, .module, .decision, .plain-card, .table-wrap, .sequence { box-shadow: none; break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <div style="margin:16px auto 0;max-width:1080px;padding:12px 18px;border:2px solid #dc2626;background:#fef2f2;color:#991b1b;font-size:14px;line-height:1.7;border-radius:10px;">
+    <strong>历史参考（2026-07-21）：</strong>本页描述的 JuiceFS-backed disk.raw 方案已按 ADR-0003 决定<strong>不实现</strong>。当前存储基线见 <a href="direct-s3-chunkstore-architecture.html" style="text-decoration:underline;">Direct-S3 ChunkStore（Direct-OS 实现）详细设计</a>；RootDisk/PersistentDisk、RWO 与 FLUSH 的产品语义已并入完整架构文档。
+  </div>
+  <header>
+    <div class="page header-inner">
+      <h1>Cats 存储架构设计</h1>
+      <p class="subtitle">本文定义 Cat 系统盘和可选持久盘的完整架构。Guest 只看到标准 ext4 块设备；JuiceFS、NVMe 缓存、元数据引擎和对象存储只存在于 Host 与平台内部。</p>
+      <div class="meta"><span>状态：推荐架构</span><span>范围：RootDisk + 一块可选 RWO PersistentDisk</span><span>CLI：<code>cats</code></span><span>更新：2026-07-18</span></div>
+    </div>
+  </header>
+
+  <nav>
+    <div class="page nav-inner">
+      <a href="#decisions">架构决策</a>
+      <a href="#architecture">完整架构图</a>
+      <a href="#modules">模块说明</a>
+      <a href="#datapath">I/O 路径</a>
+      <a href="#lifecycle">生命周期</a>
+      <a href="#consistency">一致性</a>
+      <a href="#resize-delete">扩容与删除</a>
+      <a href="#model">数据模型与 CLI</a>
+      <a href="#validation">验证计划</a>
+    </div>
+  </nav>
+
+  <main class="page">
+    <section id="decisions">
+      <h2>1. 架构决策</h2>
+      <p class="lead">下面四项是本文后续设计的前提，不再同时保留多套主方案。</p>
+      <div class="decision-grid">
+        <div class="decision"><strong>Guest 磁盘接口：virtio-blk + ext4</strong><p>RootDisk 在 Guest 中是 <code>/dev/vda</code>，PersistentDisk 是额外的 virtio-blk 设备。Guest 不安装 JuiceFS，也不持有对象存储凭证。</p></div>
+        <div class="decision"><strong>Host 磁盘后端：cats-blockd + vhost-user-blk</strong><p>Cloud Hypervisor 通过 Unix socket 把 virtio-blk 队列交给 <code>cats-blockd</code>。所有块 I/O 都经过该服务，因此可以执行 RWO fencing、FLUSH、容量控制和故障隔离。</p></div>
+        <div class="decision"><strong>远端存储格式：JuiceFS 内部的 sparse raw file</strong><p>每块托管盘对应 JuiceFS 内部文件 <code>/volumes/&lt;disk-id&gt;/disk.raw</code>。该文件包含完整 ext4 逻辑扇区；JuiceFS负责 slice/block、元数据和对象存储。</p></div>
+        <div class="decision"><strong>本地层：Host NVMe 只做可回收缓存</strong><p>每个 active attachment 有独立 cache namespace 和容量上限。Cold/detach 后释放 reservation；缓存可以立即删除，也可以作为无保证的可淘汰副本保留。</p></div>
+      </div>
+
+      <div style="height:16px"></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>属性</th><th>RootDisk</th><th>PersistentDisk</th></tr></thead>
+          <tbody>
+            <tr><td>是否必需</td><td>每个 Cat 必须有一块</td><td>可选，第一版最多一块</td></tr>
+            <tr><td>所有者</td><td>Cat</td><td>Tenant / User</td></tr>
+            <tr><td>Guest 挂载</td><td><code>/dev/vda → ext4 → /</code></td><td><code>/dev/vdb → ext4 → /data</code>（路径可配置）</td></tr>
+            <tr><td>访问模式</td><td>RWO，只能由所属 Cat 使用</td><td>RWO，同一时刻只能挂一个 Cat；可先 detach 再挂到另一个 Cat</td></tr>
+            <tr><td>Cat cold / migrate</td><td>磁盘保留，释放本地缓存后可在新 Host lazy restore</td><td>MountBinding 保留，运行时 Attachment 与 lease 释放；启动时重建</td></tr>
+            <tr><td>Cat destroy</td><td>自动删除</td><td>自动安全 detach，磁盘继续存在</td></tr>
+            <tr><td>扩容</td><td>支持 grow</td><td>支持 grow；第一版要求 detach 后扩容</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="architecture">
+      <h2>2. 完整架构图</h2>
+      <p class="lead">绿色实线是 Guest 文件 I/O；蓝色虚线是控制命令；紫色点线是元数据或 lease 访问。Host B 表示 cold start 或跨 Host 迁移后的目标节点。</p>
+
+      <div class="diagram-frame">
+        <svg viewBox="0 0 1440 930" role="img" aria-labelledby="arch-title arch-desc">
+          <title id="arch-title">Cats 存储完整架构</title>
+          <desc id="arch-desc">从 cats CLI、控制面、Host A 中的 Cloud Hypervisor 和 cats-blockd，到 JuiceFS 元数据和对象存储，并展示迁移到 Host B。</desc>
+          <defs>
+            <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#087f5b"/></marker>
+            <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#185fa7"/></marker>
+            <marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#6f42a8"/></marker>
+            <style>
+              .box{fill:#fff;stroke:#9fb0b7;stroke-width:1.5}.group{fill:#f8fafb;stroke:#718990;stroke-width:1.7}.guest{fill:#edf5fc;stroke:#5b91c5}.host{fill:#eaf8f2;stroke:#48a485}.remote{fill:#f5effc;stroke:#9472bd}.controlBox{fill:#edf5fc;stroke:#5b91c5}.t{font:600 14px -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif;fill:#18242b}.s{font:12px -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif;fill:#586970}.label{font:700 13px -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif;fill:#43555d}.io{stroke:#087f5b;stroke-width:3;fill:none;marker-end:url(#arrow-green)}.io2{stroke:#087f5b;stroke-width:3;fill:none;marker-start:url(#arrow-green);marker-end:url(#arrow-green)}.ctl{stroke:#185fa7;stroke-width:2.2;stroke-dasharray:8 6;fill:none;marker-end:url(#arrow-blue)}.metaLine{stroke:#6f42a8;stroke-width:2.2;stroke-dasharray:2 6;fill:none;marker-end:url(#arrow-purple)}.metaBoth{stroke:#6f42a8;stroke-width:2.2;stroke-dasharray:2 6;fill:none;marker-start:url(#arrow-purple);marker-end:url(#arrow-purple)}
+            </style>
+          </defs>
+
+          <text x="24" y="23" class="label">用户与控制面</text>
+          <rect x="24" y="38" width="190" height="82" rx="8" class="box"/>
+          <text x="48" y="70" class="t">cats CLI / API client</text>
+          <text x="48" y="94" class="s">create · mount · resize</text>
+
+          <rect x="258" y="38" width="190" height="82" rx="8" class="controlBox"/>
+          <text x="291" y="70" class="t">Cats API</text>
+          <text x="278" y="94" class="s">鉴权 · 参数校验 · 状态查询</text>
+
+          <rect x="495" y="24" width="455" height="112" rx="9" class="group"/>
+          <text x="514" y="49" class="label">Controllers</text>
+          <rect x="514" y="63" width="125" height="54" rx="6" class="controlBox"/>
+          <text x="532" y="86" class="t">Cat Controller</text><text x="532" y="105" class="s">启动 / cold / destroy</text>
+          <rect x="654" y="63" width="132" height="54" rx="6" class="controlBox"/>
+          <text x="669" y="86" class="t">Disk Controller</text><text x="669" y="105" class="s">create / clone / resize</text>
+          <rect x="801" y="63" width="130" height="54" rx="6" class="controlBox"/>
+          <text x="814" y="86" class="t">Attach Controller</text><text x="814" y="105" class="s">RWO lease / fencing</text>
+
+          <rect x="1000" y="38" width="180" height="82" rx="8" class="remote"/>
+          <text x="1031" y="64" class="t">Registry DB</text>
+          <text x="1020" y="84" class="s">PostgreSQL</text>
+          <text x="1020" y="104" class="s">Cat · Disk · Mount · Attach</text>
+
+          <rect x="1226" y="38" width="190" height="82" rx="8" class="remote"/>
+          <text x="1260" y="70" class="t">Lease Store (etcd)</text>
+          <text x="1245" y="94" class="s">owner · epoch · expiry</text>
+
+          <path d="M214 79 H258" class="ctl"/>
+          <path d="M448 79 H495" class="ctl"/>
+          <path d="M950 72 H1000" class="metaBoth"/>
+          <path d="M950 98 C1050 145 1160 145 1226 96" class="metaBoth"/>
+
+          <text x="24" y="168" class="label">计算节点 Host A（当前 attachment 所在节点）</text>
+          <rect x="24" y="182" width="1000" height="510" rx="12" class="group"/>
+
+          <rect x="48" y="210" width="210" height="74" rx="8" class="controlBox"/>
+          <text x="82" y="241" class="t">cat-agent</text>
+          <text x="66" y="263" class="s">本节点执行器与状态上报</text>
+
+          <rect x="292" y="210" width="210" height="74" rx="8" class="controlBox"/>
+          <text x="320" y="241" class="t">JFS Mount Manager</text>
+          <text x="313" y="263" class="s">subdir mount · cache namespace</text>
+
+          <rect x="536" y="210" width="210" height="74" rx="8" class="controlBox"/>
+          <text x="570" y="241" class="t">Disk Backend Manager</text>
+          <text x="560" y="263" class="s">blockd process · socket · health</text>
+
+          <rect x="780" y="210" width="220" height="74" rx="8" class="host"/>
+          <text x="821" y="241" class="t">Shared NVMe Cache</text>
+          <text x="800" y="263" class="s">/nvme/cats-cache/&lt;disk-id&gt;</text>
+
+          <rect x="48" y="318" width="280" height="330" rx="10" class="guest"/>
+          <text x="66" y="345" class="label">Cat VM</text>
+          <rect x="68" y="365" width="240" height="54" rx="6" class="box"/>
+          <text x="92" y="388" class="t">应用 / Git / package manager</text>
+          <text x="92" y="407" class="s">普通 POSIX 文件操作</text>
+          <rect x="68" y="443" width="240" height="72" rx="6" class="box"/>
+          <text x="88" y="469" class="t">ext4</text>
+          <text x="88" y="492" class="s">RootDisk: /　PersistentDisk: /data</text>
+          <rect x="68" y="539" width="112" height="78" rx="6" class="box"/>
+          <text x="87" y="566" class="t">/dev/vda</text>
+          <text x="84" y="590" class="s">RootDisk</text>
+          <rect x="196" y="539" width="112" height="78" rx="6" class="box"/>
+          <text x="215" y="566" class="t">/dev/vdb</text>
+          <text x="209" y="590" class="s">PersistentDisk</text>
+          <path d="M188 419 V443" class="io"/><path d="M124 515 V539" class="io"/><path d="M252 515 V539" class="io"/>
+
+          <rect x="364" y="318" width="205" height="330" rx="10" class="host"/>
+          <text x="383" y="345" class="label">Cloud Hypervisor</text>
+          <rect x="384" y="375" width="165" height="72" rx="6" class="box"/>
+          <text x="410" y="402" class="t">virtio-blk frontend</text>
+          <text x="408" y="425" class="s">Guest queue / interrupt</text>
+          <rect x="384" y="475" width="165" height="72" rx="6" class="box"/>
+          <text x="405" y="502" class="t">vhost-user client</text>
+          <text x="410" y="525" class="s">shared memory + socket</text>
+          <rect x="384" y="575" width="165" height="50" rx="6" class="box"/>
+          <text x="416" y="606" class="t">add / remove / resize</text>
+          <path d="M466 447 V475" class="io"/>
+
+          <rect x="605" y="318" width="200" height="330" rx="10" class="host"/>
+          <text x="625" y="345" class="label">cats-blockd</text>
+          <rect x="625" y="369" width="160" height="58" rx="6" class="box"/>
+          <text x="647" y="393" class="t">vhost-user-blk server</text><text x="650" y="413" class="s">READ / WRITE / FLUSH</text>
+          <rect x="625" y="449" width="160" height="58" rx="6" class="box"/>
+          <text x="660" y="473" class="t">Lease Gate</text><text x="644" y="493" class="s">epoch 检查 · fail closed</text>
+          <rect x="625" y="529" width="160" height="58" rx="6" class="box"/>
+          <text x="658" y="553" class="t">Raw File I/O</text><text x="642" y="573" class="s">pread · pwrite · fsync</text>
+          <rect x="625" y="603" width="160" height="28" rx="6" class="box"/>
+          <text x="654" y="622" class="s">geometry / metrics</text>
+          <path d="M705 427 V449" class="io"/><path d="M705 507 V529" class="io"/>
+
+          <rect x="841" y="318" width="159" height="330" rx="10" class="host"/>
+          <text x="858" y="345" class="label">JuiceFS Client</text>
+          <rect x="859" y="370" width="123" height="70" rx="6" class="box"/>
+          <text x="875" y="396" class="t">disk.raw</text><text x="871" y="420" class="s">sparse / cloned file</text>
+          <rect x="859" y="467" width="123" height="70" rx="6" class="box"/>
+          <text x="877" y="493" class="t">slice / block</text><text x="875" y="517" class="s">ROW + compaction</text>
+          <rect x="859" y="565" width="123" height="62" rx="6" class="box"/>
+          <text x="877" y="590" class="t">cache client</text><text x="873" y="612" class="s">clean read cache only</text>
+          <path d="M920 440 V467" class="io"/><path d="M920 537 V565" class="io"/>
+
+          <path d="M308 578 H384" class="io2"/>
+          <path d="M549 511 H625" class="io2"/>
+          <path d="M785 558 H859" class="io2"/>
+          <path d="M920 565 C920 300 890 300 890 284" class="io2"/>
+
+          <path d="M720 136 C620 160 180 165 153 210" class="ctl"/>
+          <path d="M258 247 H292" class="ctl"/>
+          <path d="M258 258 C360 300 500 300 605 340" class="ctl"/>
+          <path d="M258 270 C300 330 350 330 364 350" class="ctl"/>
+          <path d="M705 449 C900 300 1190 190 1320 120" class="metaBoth"/>
+
+          <text x="1054" y="168" class="label">Host B（迁移或 cold start 目标）</text>
+          <rect x="1054" y="182" width="362" height="510" rx="12" class="group"/>
+          <rect x="1080" y="212" width="310" height="62" rx="7" class="controlBox"/>
+          <text x="1110" y="239" class="t">cat-agent 获取新 attachment epoch</text>
+          <text x="1110" y="260" class="s">旧 Host lease 失效后才启动写路径</text>
+          <rect x="1080" y="305" width="310" height="72" rx="7" class="guest"/>
+          <text x="1120" y="334" class="t">Cloud Hypervisor + Cat VM</text>
+          <text x="1120" y="357" class="s">重新 boot；同一 ext4 UUID 与挂载路径</text>
+          <rect x="1080" y="405" width="310" height="72" rx="7" class="host"/>
+          <text x="1120" y="434" class="t">新的 cats-blockd</text>
+          <text x="1120" y="457" class="s">空 cache；同一个 disk.raw；更高 epoch</text>
+          <rect x="1080" y="505" width="310" height="72" rx="7" class="host"/>
+          <text x="1120" y="534" class="t">新的 JuiceFS Client</text>
+          <text x="1120" y="557" class="s">按 Guest 实际读请求从对象存储 hydrate</text>
+          <rect x="1080" y="605" width="310" height="54" rx="7" class="box"/>
+          <text x="1120" y="638" class="t">空或可淘汰的 Host B NVMe cache</text>
+          <path d="M1235 377 V405" class="io"/><path d="M1235 477 V505" class="io"/><path d="M1235 577 V605" class="io"/>
+          <path d="M866 117 C1050 145 1190 150 1235 212" class="ctl"/>
+
+          <text x="24" y="733" class="label">共享持久服务（不在 Guest 内）</text>
+          <rect x="24" y="748" width="1392" height="152" rx="12" class="group"/>
+          <rect x="54" y="777" width="288" height="90" rx="8" class="remote"/>
+          <text x="80" y="808" class="t">JuiceFS Metadata Engine</text>
+          <text x="80" y="831" class="s">inode · file size · slice/block map</text>
+          <text x="80" y="852" class="s">TiKV，至少 3 节点</text>
+          <rect x="389" y="777" width="280" height="90" rx="8" class="remote"/>
+          <text x="416" y="808" class="t">S3 / GCS Object Storage</text>
+          <text x="416" y="831" class="s">不可变 JuiceFS data blocks</text>
+          <text x="416" y="852" class="s">实际数据量，而非逻辑盘容量</text>
+          <rect x="716" y="777" width="300" height="90" rx="8" class="remote"/>
+          <text x="744" y="808" class="t">Root Image Catalog（同一 JuiceFS）</text>
+          <text x="744" y="831" class="s">版本化 golden-root.raw</text>
+          <text x="744" y="852" class="s">juicefs clone：只复制元数据引用</text>
+          <rect x="1063" y="777" width="323" height="90" rx="8" class="remote"/>
+          <text x="1090" y="808" class="t">Metrics / Audit / GC</text>
+          <text x="1090" y="831" class="s">cache hit · pending writes · fsync latency</text>
+          <text x="1090" y="852" class="s">attachment audit · stale slice cleanup</text>
+
+          <path d="M920 648 C850 720 350 720 198 777" class="metaBoth"/>
+          <path d="M920 648 C880 725 650 730 529 777" class="io2"/>
+          <path d="M1080 541 C930 700 430 710 198 777" class="metaBoth"/>
+          <path d="M1235 577 C1230 710 700 710 529 777" class="io2"/>
+          <path d="M866 777 C866 720 920 700 920 648" class="metaLine"/>
+        </svg>
+      </div>
+      <div class="legend"><span><i></i>块数据 I/O</span><span><i class="control"></i>控制命令</span><span><i class="metadata"></i>元数据 / lease</span></div>
+    </section>
+
+    <section id="modules">
+      <h2>3. 关键模块</h2>
+      <p class="lead">下表描述每个模块的职责边界。任何对象存储凭证和 JuiceFS 元数据地址都只存在于 Host 侧模块。</p>
+      <div class="module-grid">
+        <article class="module"><span class="where">Control plane</span><h3>Cats API</h3><p>对外提供 Cat 与 Disk 资源 API；不返回 bucket、metadata URL、cache path 或 JuiceFS 参数。</p><ul><li>认证与租户隔离</li><li>命令幂等键</li><li>资源状态查询</li></ul></article>
+        <article class="module"><span class="where">Control plane</span><h3>Disk Controller</h3><p>创建和管理 JuiceFS 内部的 <code>disk.raw</code>；实际存储操作以下发给 cat-agent 的幂等 StorageJob 执行。</p><ul><li>RootDisk：从 <code>golden-root.raw</code> 执行 <code>juicefs clone</code></li><li>PersistentDisk：<code>ftruncate</code> 创建 sparse file，<code>mkfs.ext4 -F</code> 格式化并记录 UUID</li><li>扩容、逻辑删除和后台 GC</li></ul></article>
+        <article class="module"><span class="where">Control plane</span><h3>Attachment Controller</h3><p>实现 RWO，不允许同一磁盘同时挂到两个 Cat。</p><ul><li>MountBinding 保存 Disk、Cat 和 Guest 路径，跨 Cold 保留</li><li>Attachment 只表示节点上的运行时挂载</li><li>发放单调递增 fencing epoch</li><li>lease 到期、转移与审计</li></ul></article>
+        <article class="module"><span class="where">Node</span><h3>cat-agent</h3><p>节点上的唯一执行入口；把控制面的期望状态转换成 Host 进程和 Cloud Hypervisor 设备。</p><ul><li>启动/停止 JFS mount 与 blockd</li><li>调用 Cloud Hypervisor add/remove/resize disk</li><li>调用 Guest Agent mount/unmount/sync</li></ul></article>
+        <article class="module"><span class="where">Node</span><h3>cats-blockd</h3><p>每个 active attachment 一个进程或隔离实例，向 Cloud Hypervisor 提供 vhost-user-blk。</p><ul><li>把 LBA 请求转换为 disk.raw 的 pread/pwrite</li><li>FLUSH → fsync；DISCARD → fallocate(PUNCH_HOLE)</li><li>不允许请求跨过 FLUSH 重排</li><li>持续续租；无法确认 lease 时停止写入</li><li>导出 IOPS、延迟、错误和 epoch</li></ul></article>
+        <article class="module"><span class="where">Node</span><h3>JFS Mount Manager</h3><p>挂载平台内部 JuiceFS namespace，给 blockd 提供 raw file。</p><ul><li>为 active disk 使用隔离 cache namespace</li><li>管理 metadata/object 凭证</li><li>观察 upload/compaction/GC 状态</li></ul></article>
+        <article class="module"><span class="where">Node</span><h3>NVMe Cache Manager</h3><p>管理节点共享 NVMe 的干净读缓存，而不是给每个 Cat 预留一块固定 100GB 盘。</p><ul><li>active disk cache quota</li><li>按热度 LRU 淘汰</li><li>Cold/detach 后释放 reservation</li><li>水位、回压和租户配额</li></ul></article>
+        <article class="module"><span class="where">Guest</span><h3>Guest Agent</h3><p>只处理标准 Linux 磁盘，不知道 JuiceFS。</p><ul><li>按 filesystem UUID 识别设备</li><li>mount/unmount、syncfs、fsfreeze</li><li>扩容后的 rescan 与 resize2fs</li><li>向 cat-agent 返回挂载状态</li></ul></article>
+        <article class="module"><span class="where">Durable services</span><h3>JuiceFS + Object Store</h3><p>JuiceFS 元数据引擎保存 disk.raw 的 file/slice/block 映射，对象存储保存不可变数据块。</p><ul><li>生产配置使用至少 3 节点 TiKV；Cats Registry 使用 PostgreSQL</li><li>对象先上传，再提交可见元数据</li><li>随机写产生的 stale slices 由 compaction/GC 处理</li></ul></article>
+      </div>
+    </section>
+
+    <section id="datapath">
+      <h2>4. 数据路径</h2>
+
+      <h3>4.1 读路径</h3>
+      <div class="path">
+        <div class="path-box">应用 read()<small>Guest</small></div><div class="path-arrow">→</div>
+        <div class="path-box">ext4 读取 LBA<small>/dev/vda 或 vdb</small></div><div class="path-arrow">→</div>
+        <div class="path-box">virtio-blk request<small>Cloud Hypervisor</small></div><div class="path-arrow">→</div>
+        <div class="path-box">cats-blockd pread<small>disk.raw offset</small></div>
+      </div>
+      <div class="path">
+        <div class="path-box">JuiceFS page/cache hit<small>直接返回</small></div><div class="path-arrow">或</div>
+        <div class="path-box">JFS metadata lookup<small>offset → slice/block</small></div><div class="path-arrow">→</div>
+        <div class="path-box">对象存储 GET<small>只获取被读到的 block</small></div><div class="path-arrow">→</div>
+        <div class="path-box">写入 NVMe cache<small>返回 Guest，并供后续命中</small></div>
+      </div>
+
+      <h3 style="margin-top:28px">4.2 写路径与 FLUSH</h3>
+      <div class="path">
+        <div class="path-box">应用 write()<small>Guest page cache</small></div><div class="path-arrow">→</div>
+        <div class="path-box">ext4 journal/data<small>块写请求</small></div><div class="path-arrow">→</div>
+        <div class="path-box">cats-blockd pwrite<small>disk.raw offset</small></div><div class="path-arrow">→</div>
+        <div class="path-box">JuiceFS slice/block<small>对象 + 元数据</small></div>
+      </div>
+
+      <div class="callout green"><strong>默认持久性：</strong>磁盘镜像挂载默认不启用不受保护的 JuiceFS client writeback。Guest 发出 FLUSH/fsync 后，<code>cats-blockd</code> 对 <code>disk.raw</code> 执行 fsync，只有 JuiceFS 完成数据对象上传并提交相应元数据后才向 Guest 返回成功。普通未 fsync 的数据仍可按 POSIX 语义在 Host 故障时丢失。</div>
+
+      <div class="callout"><strong>写放大风险：</strong>ext4 的 4KiB 随机写会落到一个大型 JuiceFS 文件中，形成多个 slice。JuiceFS 会后台 compact，但系统盘工作负载可能产生明显对象 PUT、compaction 和 stale-slice 成本。必须用 git clone、apt/npm install、Docker layer、SQLite fsync 和随机写压测决定是否需要自研更细粒度 block map。</div>
+
+      <h3 style="margin-top:28px">4.3 100GB 逻辑盘里有 10 万个小文件时，实际上传什么</h3>
+      <div class="two-col">
+        <article class="plain-card"><h3>进入 JuiceFS 的数据</h3><ul><li>文件内容对应的 ext4 数据块</li><li>inode、目录、位图、extent tree 等 ext4 元数据块</li><li>ext4 journal 写过的块</li><li>这些块在 <code>disk.raw</code> 中对应的非空 byte ranges</li><li>JuiceFS 保存上述 ranges 的 slice/block 映射</li></ul></article>
+        <article class="plain-card"><h3>不会上传的数据</h3><ul><li>不会 dump Host 上整块 NVMe</li><li>不会上传 <code>disk.raw</code> 中从未写过的 100GB 空洞</li><li>不会把每个 Guest 小文件变成一个对象存储对象</li><li>不会依赖小文件在物理 NVMe 上是否连续</li></ul></article>
+      </div>
+      <div class="callout green"><strong>结论：</strong>cats-blockd 只按 Guest 实际写到的 LBA 更新 <code>disk.raw</code>。100GB 是逻辑地址空间；如果 10 万个文件总内容为 100MB，远端存量大致是“实际改写的 ext4 数据和元数据 + JuiceFS 块取整 + journal/覆写/compaction 放大”，而不是 100GB。具体放大量必须用真实工作负载测量。</div>
+    </section>
+
+    <section id="lifecycle">
+      <h2>5. 生命周期</h2>
+      <p class="lead">所有流程都以控制面状态机驱动。CLI 成功返回之前，相应步骤必须达到明确的远端持久点或 Guest 挂载点。</p>
+
+      <div class="sequence">
+        <div class="sequence-name"><strong>创建 Cat</strong><span><code>cats create dev</code></span></div>
+        <div class="sequence-steps">
+          <div class="step"><b>1. 创建资源</b><p>建立 Cat 和 RootDisk；如果命令带可选盘参数，同时创建 PersistentDisk 和 MountBinding。</p></div>
+          <div class="step"><b>2. 克隆模板</b><p><code>juicefs clone golden-root.raw root.raw</code>，只复制元数据引用。</p></div>
+          <div class="step"><b>3. 获取 lease</b><p>创建 RootDisk attachment 与 epoch。</p></div>
+          <div class="step"><b>4. 启动数据面</b><p>JFS mount → blockd → Cloud Hypervisor。</p></div>
+          <div class="step"><b>5. Guest Ready</b><p>ext4 根盘挂载，Guest Agent 和应用就绪。</p></div>
+        </div>
+      </div>
+
+      <div class="sequence">
+        <div class="sequence-name"><strong>动态挂载</strong><span><code>cats mount disk --cat dev</code></span></div>
+        <div class="sequence-steps">
+          <div class="step"><b>1. 检查 RWO</b><p>磁盘不能绑定或挂载在其他 Cat；否则拒绝。</p></div>
+          <div class="step"><b>2. 创建绑定与 attachment</b><p>保存 MountBinding；运行时状态 Attaching，发放新 epoch。</p></div>
+          <div class="step"><b>3. 启动 blockd</b><p>打开该 disk.raw 并续租。</p></div>
+          <div class="step"><b>4. Hotplug</b><p>Cloud Hypervisor add-disk；Guest 出现新设备。</p></div>
+          <div class="step"><b>5. Guest mount</b><p>按 filesystem UUID 挂载到用户指定路径。</p></div>
+        </div>
+      </div>
+
+      <div class="sequence">
+        <div class="sequence-name"><strong>安全卸载</strong><span><code>cats unmount disk --cat dev</code></span></div>
+        <div class="sequence-steps">
+          <div class="step"><b>1. Guest unmount</b><p>Guest Agent 执行 syncfs/umount；路径 busy 时拒绝继续。</p></div>
+          <div class="step"><b>2. Flush</b><p>blockd 把最后的 FLUSH 传播到 JuiceFS 持久点。</p></div>
+          <div class="step"><b>3. Hot-unplug</b><p>Cloud Hypervisor remove-disk，Guest 设备消失。</p></div>
+          <div class="step"><b>4. 停止数据面</b><p>停止 blockd，释放 lease 和 NVMe cache reservation。</p></div>
+          <div class="step"><b>5. 解除绑定</b><p>删除 MountBinding，PersistentDisk 回到 Available。</p></div>
+        </div>
+      </div>
+
+      <div class="sequence">
+        <div class="sequence-name"><strong>Cold / 迁移</strong><span>释放 Host A，在 Host B 启动</span></div>
+        <div class="sequence-steps">
+          <div class="step"><b>1. Quiesce</b><p>停止新任务，Guest syncfs/fsfreeze。</p></div>
+          <div class="step"><b>2. Flush</b><p>blockd FLUSH；确认 JFS 对象与元数据持久。</p></div>
+          <div class="step"><b>3. Stop &amp; fence</b><p>停止 VMM/blockd，释放 Host A lease 和 cache reservation；MountBinding 继续保留。</p></div>
+          <div class="step"><b>4. Host B attach</b><p>获取更高 epoch，建立空 cache 和新 blockd。</p></div>
+          <div class="step"><b>5. Lazy boot</b><p>重新 boot；JuiceFS只下载启动和工作集读到的数据。</p></div>
+        </div>
+      </div>
+
+      <div class="sequence">
+        <div class="sequence-name"><strong>销毁 Cat</strong><span><code>cats destroy dev</code></span></div>
+        <div class="sequence-steps">
+          <div class="step"><b>1. 停止应用</b><p>阻止新写，开始终止流程。</p></div>
+          <div class="step"><b>2. 外挂盘 detach</b><p>umount → FLUSH → remove-disk；PersistentDisk 回到 Available。</p></div>
+          <div class="step"><b>3. RootDisk flush</b><p>完成最后一次远端提交并停止数据面。</p></div>
+          <div class="step"><b>4. RootDisk 删除</b><p>删除访问入口与元数据记录，进入 Deleting。</p></div>
+          <div class="step"><b>5. 异步 GC</b><p>JuiceFS回收不再引用的数据块；PersistentDisk 不受影响。</p></div>
+        </div>
+      </div>
+
+      <div class="callout"><strong>Cold 的定义：</strong>Cold 不保留 Guest 内存状态。VMM、CPU、RAM、运行时 Attachment lease 和专属 NVMe reservation 都释放；RootDisk 与 PersistentDisk 的 MountBinding 保留。下次重新 boot 时，控制面建立新的 Attachment，并从远端磁盘 lazy load。如果以后需要保留进程内存，应单独定义 Suspend 层，并为内存快照承担额外存储与恢复成本。</div>
+    </section>
+
+    <section id="consistency">
+      <h2>6. RWO、lease 与故障处理</h2>
+
+      <div class="two-col">
+        <article class="plain-card"><h3>为什么数据库里的 attached=true 不够</h3><p>旧 Host 可能与控制面失联但仍能访问对象存储。如果新 Host 只修改数据库后直接挂载，就会出现两个 ext4 writer，导致文件系统损坏。</p><ul><li>每次 attach 分配单调递增 epoch</li><li>cats-blockd 必须持续续租</li><li>续租失败或无法联系 Lease Store 时停止接受新写</li><li>新 Host 等旧 lease 到期后才启动写路径</li></ul></article>
+        <article class="plain-card"><h3>Host 突然宕机</h3><p>新 Host 从 JuiceFS 中同一个 disk.raw 恢复。已成功完成 Guest fsync 的数据应存在于对象存储和 JFS 元数据中；未 fsync 数据可能丢失。</p><ul><li>等待或主动 fence 旧 epoch</li><li>新 Host 获取 attachment</li><li>启动空 cache 的 JFS client 与 blockd</li><li>ext4 journal recovery / 必要时只读 fsck</li><li>校验成功后再对外 Ready</li></ul></article>
+      </div>
+
+      <div class="state-flow" aria-label="Disk 绑定状态机">
+        <span class="state">Disk: Available</span><span class="state-arrow">→ cats mount</span>
+        <span class="state">Disk: Bound@Cat</span><span class="state-arrow">→ cats unmount / destroy</span>
+        <span class="state">Disk: Available</span>
+      </div>
+      <div class="state-flow" aria-label="运行时 Attachment 状态机">
+        <span class="state">Attachment: Detached</span><span class="state-arrow">→</span>
+        <span class="state">Attaching</span><span class="state-arrow">→</span>
+        <span class="state">Mounted</span><span class="state-arrow">→</span>
+        <span class="state">Detaching</span><span class="state-arrow">→</span>
+        <span class="state">Detached</span>
+      </div>
+      <div class="state-flow" aria-label="故障恢复状态机">
+        <span class="state">Mounted@HostA / epoch=7</span><span class="state-arrow">→</span>
+        <span class="state">LeaseExpired</span><span class="state-arrow">→</span>
+        <span class="state">Recovering</span><span class="state-arrow">→</span>
+        <span class="state">Mounted@HostB / epoch=8</span>
+      </div>
+
+      <div class="callout red"><strong>硬约束：</strong>不能把同一个 disk.raw 同时交给两个 Cloud Hypervisor 实例。JuiceFS支持多客户端文件共享，不代表其内部的 ext4 磁盘镜像可以多写挂载；这里的 RWO 必须由平台强制保证。</div>
+    </section>
+
+    <section id="resize-delete">
+      <h2>7. 扩容、缓存释放和删除</h2>
+
+      <div class="two-col">
+        <article class="plain-card">
+          <h3>PersistentDisk 扩容</h3>
+          <p>第一版只允许扩容，不允许缩容；第一版要求磁盘处于 Available。</p>
+          <ol>
+            <li>控制面校验新容量大于旧容量。</li>
+            <li>对 JuiceFS 中的 <code>disk.raw</code> 执行 <code>ftruncate(new_size)</code> 扩大逻辑大小；新增稀疏区不立即占用对象存储。</li>
+            <li>更新 Disk 资源的 <code>size_bytes</code> 与 generation。</li>
+            <li>下次 attach 时 cats-blockd 报告新 geometry。</li>
+            <li>Guest Agent 执行设备 rescan 和 <code>resize2fs</code>。</li>
+          </ol>
+        </article>
+        <article class="plain-card">
+          <h3>Cold 后不占用专属 NVMe</h3>
+          <p>Cold 成功后释放 cache reservation，而不是为每个 100GB 逻辑盘保留 100GB NVMe。</p>
+          <ul>
+            <li>先停止新 I/O 并完成 FLUSH；NVMe cache 中只允许存在可丢弃的干净副本。</li>
+            <li>关闭该 attachment 的 blockd。</li>
+            <li>释放 <code>/nvme/cats-cache/&lt;disk-id&gt;</code> 配额。</li>
+            <li>安全要求物理清理时直接删除 cache namespace。</li>
+            <li>允许复用时，旧 cache 只能作为随时可淘汰、不可依赖的副本。</li>
+          </ul>
+        </article>
+      </div>
+
+      <div style="height:14px"></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>删除操作</th><th>同步完成</th><th>异步完成</th></tr></thead>
+          <tbody>
+            <tr><td><code>cats destroy &lt;cat&gt;</code></td><td>外接盘安全 detach；RootDisk 访问入口撤销；Cat 不可再启动</td><td>RootDisk 的 JFS file、stale slices 和对象由 GC 回收</td></tr>
+            <tr><td><code>cats disk delete &lt;disk&gt;</code></td><td>磁盘必须 Available；删除资源入口并禁止新 attach</td><td>删除 disk.raw，JuiceFS按照内部 trash/GC 策略回收对象</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="model">
+      <h2>8. 控制面数据模型与 CLI</h2>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>资源</th><th>关键字段</th><th>约束</th></tr></thead>
+          <tbody>
+            <tr><td>Cat</td><td><code>cat_id, root_disk_id, node_id, desired_state, observed_state</code></td><td>RootDisk 必须存在；Destroy 级联删除 RootDisk</td></tr>
+            <tr><td>Disk</td><td><code>disk_id, tenant_id, kind, size_bytes, fs_uuid, jfs_path, state, reclaim_policy</code></td><td><code>state=available|bound|deleting</code>；公共 API 不返回 <code>jfs_path</code></td></tr>
+            <tr><td>MountBinding</td><td><code>mount_id, disk_id, cat_id, mount_path, desired_state</code></td><td>跨 Cold 保留；显式 unmount 或 Cat destroy 后删除</td></tr>
+            <tr><td>Attachment</td><td><code>attachment_id, mount_id, node_id, epoch, lease_expiry, state</code></td><td>仅在运行节点存在；每个 disk 最多一个 active attachment</td></tr>
+            <tr><td>NodeCache</td><td><code>node_id, disk_id, reserved_bytes, cache_bytes, last_access</code></td><td>只保存干净读缓存；Cold/detach 后 reserved_bytes 必须释放</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <pre class="code-block"><code># 创建 Cat：RootDisk 自动创建
+cats create dev
+
+# 创建 Cat，并同时创建、挂载一块可选 PersistentDisk
+cats create dev --disk project-data --disk-size 100GiB --mount-at /data
+
+# 也可以先单独创建 PersistentDisk
+cats disk create project-data --size 100GiB
+
+# 运行中动态挂载
+cats mount project-data --cat dev --at /data
+
+# 安全卸载
+cats unmount project-data --cat dev
+
+# 扩容；v1 要求磁盘未挂载
+cats disk resize project-data --size 500GiB
+
+# 删除 Cat：RootDisk 删除，PersistentDisk 保留
+cats destroy dev
+
+# 显式删除持久盘
+cats disk delete project-data</code></pre>
+
+      <div class="callout green"><strong>公共 API 边界：</strong>用户只能看到 disk ID、名称、逻辑容量、文件系统、状态、当前 Cat 和挂载路径。<code>jfs_path</code>、metadata shard、object prefix、cache path、租户凭证和 blockd socket 全部是内部字段。</div>
+    </section>
+
+    <section id="validation">
+      <h2>9. 实现顺序和验收条件</h2>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>阶段</th><th>实现内容</th><th>必须通过的验收</th></tr></thead>
+          <tbody>
+            <tr><td>P0：已有证明</td><td>NBD + chunk backend + 未修改 ext4</td><td>删除完整 cache 后重新挂载，tree digest 相同；对象读取按需发生；未上传整块逻辑盘</td></tr>
+            <tr><td>P1：JFS raw image</td><td><code>disk.raw on JuiceFS</code> + cats-blockd + Cloud Hypervisor vhost-user-blk</td><td>Guest ext4 完成格式化、重启、冷挂载；FLUSH 传播正确；TRIM/WRITE_ZEROES 行为正确</td></tr>
+            <tr><td>P2：RootDisk</td><td>golden-root.raw clone、Guest root boot、系统盘冷恢复</td><td>create 延迟、apt/npm/git 工作负载、100GB sparse clone、跨 Host boot</td></tr>
+            <tr><td>P3：PersistentDisk</td><td>create-time attach、dynamic mount、detach、grow</td><td>RWO 冲突拒绝；按 UUID 重挂；Cat destroy 后磁盘数据完整</td></tr>
+            <tr><td>P4：故障注入</td><td>lease/fencing、Host kill、JFS/metadata/object 故障</td><td>旧 writer 不能提交；已 fsync 数据不丢；ext4 journal 可恢复；失败操作可重试且幂等</td></tr>
+            <tr><td>P5：性能与成本</td><td>共享 NVMe cache、compaction、GC、配额</td><td>git clone/checkout、package install、SQLite、Docker layer 的 P50/P99、PUT/GET、写放大和冷启动数据量达到目标</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout red"><strong>上线阻断项：</strong>如果“ext4 随机写 → JuiceFS 大 raw file”导致无法接受的 slice 数量、compaction 流量或 fsync 延迟，就不能只调参数上线。此时保留 Guest 的 virtio-blk 接口，替换 cats-blockd 下方实现为专用 block map；公共 API、Guest ext4 和 attachment 模型不变。完整替换方案见 <a href="direct-s3-chunkstore-architecture.html">Direct-S3 ChunkStore 详细设计</a>。</div>
+    </section>
+
+    <section id="sources">
+      <h2>10. 参考资料</h2>
+      <div class="source-list">
+        <a href="https://juicefs.com/docs/community/guide/clone/"><strong>JuiceFS Clone</strong>metadata-only clone、Redirect-on-Write 和随机写 fragmentation。</a>
+        <a href="https://juicefs.com/docs/community/guide/cache/"><strong>JuiceFS Cache</strong>本地读缓存、writeback 与对象上传语义。</a>
+        <a href="https://juicefs.com/docs/community/posix_compatibility/"><strong>JuiceFS POSIX</strong>fsync、rename、locks、fallocate 等文件语义。</a>
+        <a href="https://www.cloudhypervisor.org/docs/prologue/commands/"><strong>Cloud Hypervisor Commands</strong>disk、add-disk、vhost-user block、resize。</a>
+        <a href="../experiments/lazy-ext4-demo/README.md"><strong>本仓库 lazy-ext4 Demo</strong>NBD、ext4、空 cache 冷恢复和对象按需读取。</a>
+        <a href="sprite-storage-flow.html"><strong>本仓库 Sprite 存储说明</strong>块映射、对象存储和 lazy load 背景。</a>
+        <a href="direct-s3-chunkstore-architecture.html"><strong>Direct-S3 ChunkStore 详细设计</strong>专用 Block Map、NVMe WAL、S3 对象、FLUSH CAS、Lease/Fencing、Delta 和 GC。</a>
+      </div>
+    </section>
+  </main>
+
+  <footer><div class="page">Cats 存储架构设计 · 用户接口为标准磁盘；JuiceFS与对象存储仅为内部实现。</div></footer>
+</body>
+</html>

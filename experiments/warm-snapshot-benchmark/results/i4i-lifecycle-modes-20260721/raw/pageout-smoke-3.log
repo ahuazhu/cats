@@ -1,0 +1,23 @@
+
+==> Build cloud-init seed with an in-memory working-set service
+
+==> Boot with 512MiB file-backed Guest RAM on local NVMe
+
+==> Run 1 pause + MADV_PAGEOUT + resume cycles
+iteration=1
+pageout={"action":"pageout","pid":38174,"mapping_count":1,"advised_bytes":536870912,"elapsed_ms":94.304}
+{"action":"pageout","pid":38167,"mapping_count":1,"advised_bytes":536870912,"elapsed_ms":2.185} before_mapping_rss_kib=1048576 suspended_mapping_rss_kib=1048576
+1,512,64,1057432,1048576,4.484,177.754,1057432,1048576,0.000,1784614163069281489,3.706,29.873,36.772,29.474,1057432,1048576,true
+
+==> Summary
+pause_ms                 p50=    4.484 ms  p95=    4.484 ms
+pageout_ms               p50=  177.754 ms  p95=  177.754 ms
+resume_api_ms            p50=    3.706 ms  p95=    3.706 ms
+wake_to_health_ms        p50=   29.873 ms  p95=   29.873 ms
+touch_wall_ms            p50=   36.772 ms  p95=   36.772 ms
+suspended_rss_kib        p50=1057432
+reclaimed_pct            p50=0.000%
+boot_id_preserved        1/1
+
+==> PASS: the same process state survived every pause and NVMe page-out
+results=/mnt/local-nvme/cats-pageout-smoke/results/pageout-benchmark.csv

@@ -1,0 +1,59 @@
+
+==> Build cloud-init seed with an in-memory working-set service
+
+==> Boot with 512MiB file-backed Guest RAM on local NVMe
+
+==> Run 10 pause + MADV_PAGEOUT + resume cycles
+iteration=1
+pageout={"action":"pageout","pid":76859,"mapping_count":1,"advised_bytes":536870912,"elapsed_ms":88.083}
+{"action":"pageout","pid":76848,"mapping_count":1,"advised_bytes":536870912,"elapsed_ms":1.759} before_mapping_rss_kib=1048576 suspended_mapping_rss_kib=0 before_cgroup_bytes=640774144 suspended_cgroup_bytes=7716864
+1,512,64,1057424,1048576,640774144,3.793,359.623,8848,0,7716864,98.796,1784615975039855946,3.848,199.513,77.786,71.057,233208,224360,490725376,true
+iteration=2
+pageout={"action":"pageout","pid":76859,"mapping_count":1,"advised_bytes":536870912,"elapsed_ms":12.392}
+{"action":"pageout","pid":76848,"mapping_count":1,"advised_bytes":536870912,"elapsed_ms":1.914} before_mapping_rss_kib=1048576 suspended_mapping_rss_kib=106496 before_cgroup_bytes=490987520 suspended_cgroup_bytes=8404992
+2,512,64,1057424,1048576,490987520,3.661,243.488,115344,106496,8404992,98.288,1784615976115140005,3.406,234.847,90.716,83.299,318532,309684,486817792,true
+iteration=3
+pageout={"action":"pageout","pid":76859,"mapping_count":1,"advised_bytes":536870912,"elapsed_ms":8.667}
+{"action":"pageout","pid":76848,"mapping_count":1,"advised_bytes":536870912,"elapsed_ms":1.985} before_mapping_rss_kib=1048576 suspended_mapping_rss_kib=114688 before_cgroup_bytes=486817792 suspended_cgroup_bytes=8523776
+3,512,64,1057424,1048576,486817792,4.930,253.751,123536,114688,8523776,98.249,1784615977215686041,3.764,236.427,90.548,83.897,327568,318720,486490112,true
+iteration=4
+pageout={"action":"pageout","pid":76859,"mapping_count":1,"advised_bytes":536870912,"elapsed_ms":8.425}
+{"action":"pageout","pid":76848,"mapping_count":1,"advised_bytes":536870912,"elapsed_ms":1.943} before_mapping_rss_kib=1048576 suspended_mapping_rss_kib=114688 before_cgroup_bytes=486236160 suspended_cgroup_bytes=7946240
+4,512,64,1057424,1048576,486236160,3.334,254.630,123536,114688,7946240,98.366,1784615978317534102,3.828,235.099,91.135,84.031,326580,317732,486551552,true
+iteration=5
+pageout={"action":"pageout","pid":76859,"mapping_count":1,"advised_bytes":536870912,"elapsed_ms":8.482}
+{"action":"pageout","pid":76848,"mapping_count":1,"advised_bytes":536870912,"elapsed_ms":1.95} before_mapping_rss_kib=1048576 suspended_mapping_rss_kib=114688 before_cgroup_bytes=486809600 suspended_cgroup_bytes=7045120
+5,512,64,1057424,1048576,486809600,3.852,257.061,123536,114688,7045120,98.553,1784615979422767634,3.495,231.184,92.388,85.144,327804,318956,486580224,true
+iteration=6
+pageout={"action":"pageout","pid":76859,"mapping_count":1,"advised_bytes":536870912,"elapsed_ms":8.477}
+{"action":"pageout","pid":76848,"mapping_count":1,"advised_bytes":536870912,"elapsed_ms":1.938} before_mapping_rss_kib=1048576 suspended_mapping_rss_kib=114688 before_cgroup_bytes=486838272 suspended_cgroup_bytes=7290880
+6,512,64,1057424,1048576,486838272,3.990,255.428,123536,114688,7290880,98.502,1784615980524793261,3.666,230.564,90.574,84.196,325760,316912,486547456,true
+iteration=7
+pageout={"action":"pageout","pid":76859,"mapping_count":1,"advised_bytes":536870912,"elapsed_ms":8.026}
+{"action":"pageout","pid":76848,"mapping_count":1,"advised_bytes":536870912,"elapsed_ms":2.038} before_mapping_rss_kib=1048576 suspended_mapping_rss_kib=114688 before_cgroup_bytes=486547456 suspended_cgroup_bytes=7254016
+7,512,64,1057424,1048576,486547456,3.985,255.113,123536,114688,7254016,98.509,1784615981618176014,3.371,231.316,89.714,83.329,326896,318048,486285312,true
+iteration=8
+pageout={"action":"pageout","pid":76859,"mapping_count":1,"advised_bytes":536870912,"elapsed_ms":8.274}
+{"action":"pageout","pid":76848,"mapping_count":1,"advised_bytes":536870912,"elapsed_ms":1.865} before_mapping_rss_kib=1048576 suspended_mapping_rss_kib=114688 before_cgroup_bytes=486281216 suspended_cgroup_bytes=6963200
+8,512,64,1057424,1048576,486281216,3.716,255.228,123536,114688,6963200,98.568,1784615982716571741,3.972,232.606,89.392,82.761,326652,317804,486387712,true
+iteration=9
+pageout={"action":"pageout","pid":76859,"mapping_count":1,"advised_bytes":536870912,"elapsed_ms":8.3}
+{"action":"pageout","pid":76848,"mapping_count":1,"advised_bytes":536870912,"elapsed_ms":1.99} before_mapping_rss_kib=1048576 suspended_mapping_rss_kib=114688 before_cgroup_bytes=486645760 suspended_cgroup_bytes=7032832
+9,512,64,1057424,1048576,486645760,3.971,255.728,123536,114688,7032832,98.555,1784615983816022680,3.338,228.233,91.185,84.072,326960,318112,486584320,true
+iteration=10
+pageout={"action":"pageout","pid":76859,"mapping_count":1,"advised_bytes":536870912,"elapsed_ms":8.197}
+{"action":"pageout","pid":76848,"mapping_count":1,"advised_bytes":536870912,"elapsed_ms":2.002} before_mapping_rss_kib=1048576 suspended_mapping_rss_kib=114688 before_cgroup_bytes=486850560 suspended_cgroup_bytes=7266304
+10,512,64,1057424,1048576,486850560,4.326,255.578,123536,114688,7266304,98.507,1784615984915627783,3.846,231.284,90.835,83.611,326044,317196,486473728,true
+
+==> Summary
+pause_ms                 p50=    3.912 ms  p95=    4.930 ms
+pageout_ms               p50=  255.328 ms  p95=  359.623 ms
+resume_api_ms            p50=    3.715 ms  p95=    3.972 ms
+wake_to_health_ms        p50=  231.300 ms  p95=  236.427 ms
+touch_wall_ms            p50=   90.645 ms  p95=   92.388 ms
+suspended_rss_kib        p50=123536
+reclaimed_pct            p50=98.508%
+boot_id_preserved        10/10
+
+==> PASS: the same process state survived every pause and NVMe page-out
+results=/mnt/local-nvme/cats-pageout-512m/results/pageout-benchmark.csv

@@ -1,0 +1,978 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Cats Direct-S3 ChunkStore（Direct-OS：Direct-ObjectStorage 接口的一种实现）详细设计：Guest ext4、vhost-user-blk、NVMe Cache、Pending Commit Pack、Merkle Block Map、S3 不可变对象、FLUSH、Lease、Fencing、Snapshot、GC 与冷恢复。">
+  <title>Cats Direct-S3 ChunkStore（Direct-OS 实现）详细设计</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f7;
+      --paper: #ffffff;
+      --ink: #17242b;
+      --muted: #586a72;
+      --line: #ced8dc;
+      --line-dark: #82959d;
+      --blue: #1768ac;
+      --blue-bg: #ebf4fc;
+      --green: #087d59;
+      --green-bg: #e9f8f1;
+      --orange: #b65314;
+      --orange-bg: #fff3e7;
+      --purple: #7041a5;
+      --purple-bg: #f4effb;
+      --red: #b42318;
+      --red-bg: #fff0ef;
+      --code: #102b39;
+      --radius: 10px;
+      --shadow: 0 8px 24px rgb(22 43 53 / 7%);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      line-height: 1.65;
+    }
+
+    a { color: var(--blue); }
+    code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+    code { color: var(--code); }
+
+    .page {
+      width: min(1360px, calc(100% - 32px));
+      margin: 0 auto;
+    }
+
+    header {
+      border-bottom: 1px solid var(--line);
+      background: var(--paper);
+    }
+
+    .header-inner { padding: 36px 0 30px; }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(30px, 4vw, 48px);
+      line-height: 1.15;
+      letter-spacing: -.035em;
+    }
+
+    .subtitle {
+      max-width: 1020px;
+      margin: 13px 0 0;
+      color: var(--muted);
+      font-size: 16px;
+    }
+
+    .meta {
+      display: flex;
+      gap: 18px;
+      margin-top: 16px;
+      color: var(--muted);
+      font-size: 12px;
+      flex-wrap: wrap;
+    }
+
+    nav {
+      position: sticky;
+      z-index: 10;
+      top: 0;
+      border-bottom: 1px solid var(--line);
+      background: rgb(255 255 255 / 94%);
+      backdrop-filter: blur(10px);
+    }
+
+    .nav-inner {
+      display: flex;
+      gap: 20px;
+      padding: 11px 0;
+      overflow-x: auto;
+      white-space: nowrap;
+      font-size: 12px;
+    }
+
+    .nav-inner a { color: var(--muted); text-decoration: none; }
+    .nav-inner a:hover { color: var(--blue); }
+
+    main { padding-bottom: 60px; }
+
+    section {
+      padding: 48px 0;
+      border-bottom: 1px solid var(--line);
+      scroll-margin-top: 48px;
+    }
+
+    section:last-child { border-bottom: 0; }
+
+    h2 {
+      margin: 0 0 10px;
+      font-size: clamp(24px, 3vw, 34px);
+      line-height: 1.25;
+      letter-spacing: -.025em;
+    }
+
+    h3 { margin: 0 0 8px; font-size: 18px; }
+    h4 { margin: 0 0 6px; font-size: 14px; }
+
+    .lead {
+      max-width: 1040px;
+      margin: 0 0 24px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .decision-grid,
+    .module-grid,
+    .two-col,
+    .three-col {
+      display: grid;
+      gap: 14px;
+    }
+
+    .decision-grid, .two-col { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .module-grid, .three-col { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
+    .decision,
+    .module,
+    .card {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--paper);
+    }
+
+    .decision { border-left: 4px solid var(--blue); }
+    .decision:nth-child(2) { border-left-color: var(--green); }
+    .decision:nth-child(3) { border-left-color: var(--orange); }
+    .decision:nth-child(4) { border-left-color: var(--purple); }
+    .decision strong { display: block; font-size: 15px; }
+    .decision p, .card p, .module p { margin: 6px 0 0; color: var(--muted); font-size: 13px; }
+
+    .module .where {
+      display: inline-block;
+      margin-bottom: 9px;
+      padding: 3px 7px;
+      border-radius: 4px;
+      background: var(--blue-bg);
+      color: var(--blue);
+      font-size: 10px;
+      font-weight: 750;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+
+    .module ul, .card ul, .card ol {
+      margin: 10px 0 0;
+      padding-left: 19px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .module li + li, .card li + li { margin-top: 4px; }
+
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--paper);
+    }
+
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+    tr:last-child td { border-bottom: 0; }
+    th { background: #edf2f4; color: #43565e; font-size: 12px; }
+    td:first-child { font-weight: 650; }
+
+    .diagram-frame {
+      overflow-x: auto;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--paper);
+      box-shadow: var(--shadow);
+    }
+
+    .diagram-frame svg {
+      display: block;
+      width: 100%;
+      min-width: 1180px;
+      height: auto;
+    }
+
+    .legend {
+      display: flex;
+      gap: 18px;
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 12px;
+      flex-wrap: wrap;
+    }
+
+    .legend span { display: inline-flex; gap: 7px; align-items: center; }
+    .legend i { width: 28px; height: 3px; background: var(--green); }
+    .legend .control { background: repeating-linear-gradient(90deg, var(--blue) 0 7px, transparent 7px 11px); }
+    .legend .metadata { background: repeating-linear-gradient(90deg, var(--purple) 0 2px, transparent 2px 6px); }
+
+    .callout {
+      margin-top: 18px;
+      padding: 15px 17px;
+      border: 1px solid #b9d5e8;
+      border-left: 4px solid var(--blue);
+      border-radius: 8px;
+      background: var(--blue-bg);
+      color: #29434f;
+      font-size: 13px;
+    }
+
+    .callout.green { border-color: #b8dfd0; border-left-color: var(--green); background: var(--green-bg); }
+    .callout.orange { border-color: #eed0b6; border-left-color: var(--orange); background: var(--orange-bg); }
+    .callout.red { border-color: #efc2be; border-left-color: var(--red); background: var(--red-bg); }
+
+    .code-block {
+      overflow-x: auto;
+      margin: 16px 0 0;
+      padding: 18px;
+      border-radius: var(--radius);
+      background: #10242f;
+      color: #dce9ed;
+      font-size: 12px;
+      line-height: 1.65;
+    }
+
+    .code-block code { color: inherit; }
+
+    .path {
+      display: grid;
+      grid-template-columns: repeat(7, minmax(0, 1fr));
+      gap: 8px;
+      align-items: stretch;
+      margin-top: 18px;
+    }
+
+    .path-box, .path-arrow {
+      display: grid;
+      min-height: 84px;
+      place-items: center;
+      text-align: center;
+    }
+
+    .path-box {
+      padding: 11px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--paper);
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    .path-box small { display: block; margin-top: 4px; color: var(--muted); font-weight: 400; }
+    .path-arrow { color: var(--line-dark); font-size: 20px; }
+
+    .tree {
+      display: grid;
+      gap: 18px;
+      margin-top: 18px;
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--paper);
+    }
+
+    .tree-row {
+      display: flex;
+      gap: 12px;
+      justify-content: center;
+      min-width: 850px;
+    }
+
+    .tree-node {
+      min-width: 180px;
+      padding: 12px 15px;
+      border: 1px solid #b9cbd3;
+      border-radius: 8px;
+      background: var(--blue-bg);
+      text-align: center;
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    .tree-node.leaf { background: var(--purple-bg); }
+    .tree-node.data { min-width: 140px; background: var(--green-bg); }
+    .tree-node.hole { min-width: 120px; border-style: dashed; background: #f7f9fa; color: var(--muted); }
+    .tree-node small { display: block; margin-top: 4px; color: var(--muted); font-weight: 400; }
+    .tree-arrow { text-align: center; color: var(--line-dark); font-size: 20px; line-height: 1; }
+
+    .sequence {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--paper);
+    }
+
+    .sequence-grid {
+      display: grid;
+      grid-template-columns: 64px repeat(5, minmax(170px, 1fr));
+      min-width: 1030px;
+    }
+
+    .seq-cell {
+      min-height: 58px;
+      padding: 10px 12px;
+      border-right: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      font-size: 12px;
+    }
+
+    .seq-cell:nth-child(6n) { border-right: 0; }
+    .seq-head { min-height: auto; background: #edf2f4; color: #43565e; font-weight: 750; text-align: center; }
+    .seq-num { display: grid; place-items: center; color: var(--muted); font-weight: 750; }
+    .seq-active { background: var(--green-bg); color: #245b49; font-weight: 650; }
+    .seq-meta { background: var(--purple-bg); color: #52377a; font-weight: 650; }
+    .seq-warn { background: var(--orange-bg); color: #77421d; }
+    .seq-empty { color: #9aa8ae; text-align: center; }
+
+    .state-flow {
+      display: grid;
+      grid-template-columns: repeat(9, minmax(0, 1fr));
+      gap: 8px;
+      align-items: center;
+      margin-top: 16px;
+    }
+
+    .state {
+      min-height: 82px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--paper);
+      text-align: center;
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    .state small { display: block; margin-top: 4px; color: var(--muted); font-weight: 400; }
+    .state-arrow { color: var(--line-dark); text-align: center; font-size: 20px; }
+
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .metric {
+      padding: 15px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--paper);
+    }
+
+    .metric strong { display: block; color: var(--blue); font-size: 18px; }
+    .metric span { color: var(--muted); font-size: 11px; }
+
+    .source-list { display: grid; gap: 9px; }
+    .source-list a {
+      display: block;
+      padding: 13px 15px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--paper);
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 12px;
+    }
+    .source-list a:hover { border-color: var(--blue); }
+    .source-list strong { display: block; color: var(--blue); font-size: 13px; }
+
+    footer {
+      padding: 24px 0;
+      border-top: 1px solid var(--line);
+      background: var(--paper);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    @media (max-width: 900px) {
+      .decision-grid, .module-grid, .two-col, .three-col, .metric-grid { grid-template-columns: 1fr; }
+      .path { grid-template-columns: 1fr; }
+      .path-arrow { min-height: 24px; transform: rotate(90deg); }
+      .state-flow { grid-template-columns: 1fr; }
+      .state-arrow { transform: rotate(90deg); }
+    }
+
+    @media print {
+      body { background: #fff; }
+      nav { position: static; }
+      .page { width: 100%; padding: 0 14mm; }
+      section { break-inside: avoid; }
+      .diagram-frame { overflow: visible; padding: 4px; }
+      .diagram-frame svg { min-width: 0; }
+      .sequence { overflow: visible; }
+      .sequence-grid { min-width: 0; grid-template-columns: 38px repeat(5, minmax(0, 1fr)); }
+      .seq-cell { padding: 6px; font-size: 8px; }
+      .diagram-frame, .card, .module, .decision { box-shadow: none; }
+      a { color: inherit; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+  <div style="margin:16px auto 0;max-width:1080px;padding:12px 18px;border:2px solid #16a34a;background:#f0fdf4;color:#166534;font-size:14px;line-height:1.7;border-radius:10px;">
+    <strong>状态更新 2026-07-21：</strong>本设计已按 ADR-0003 选定为 Cats 存储基线（原"候选后端"状态作废），JuiceFS 方案不再实现；生命周期状态命名见 ADR-0002。细节以同名 Markdown 与 ADR 为准。
+  </div>
+  <header>
+    <div class="page header-inner">
+      <h1>Cats Direct-S3 ChunkStore（Direct-OS 实现）详细设计</h1>
+      <p class="subtitle">在不改变 Guest ext4、virtio-blk、Cats CLI 和 RWO 产品模型的前提下，用专用块映射、Host NVMe 缓存和 S3 不可变对象替代 JuiceFS raw image 后端。</p>
+      <div class="meta">
+        <span>状态：架构设计草案</span>
+        <span>日期：2026-07-20</span>
+        <span>逻辑盘：默认 100GiB，可扩容</span>
+        <span>挂载模式：单写者 RWO</span>
+      </div>
+    </div>
+  </header>
+
+  <nav aria-label="文档目录">
+    <div class="page nav-inner">
+      <a href="#summary">结论</a>
+      <a href="#decisions">架构决策</a>
+      <a href="#architecture">完整架构图</a>
+      <a href="#modules">模块</a>
+      <a href="#format">远端格式</a>
+      <a href="#io">I/O 路径</a>
+      <a href="#flush">FLUSH</a>
+      <a href="#fencing">Lease/Fencing</a>
+      <a href="#lifecycle">生命周期</a>
+      <a href="#snapshot">Snapshot/GC</a>
+      <a href="#small-files">小文件</a>
+      <a href="#security">安全</a>
+      <a href="#failure">故障处理</a>
+      <a href="#delivery">实施计划</a>
+      <a href="#validation">验证</a>
+    </div>
+  </nav>
+
+  <main class="page">
+    <section id="summary">
+      <h2>1. 结论与边界</h2>
+      <p class="lead">Direct-S3（Direct-OS：Direct-ObjectStorage 接口的一种实现）ChunkStore 不是把一个 100GB raw image 上传到 S3，也不是让 Guest mount S3。它在 Host 上实现一个稀疏虚拟块设备：只把实际写过的逻辑区间保存为不可变对象，并通过一个很小的 Block Map 找到这些对象。</p>
+      <p><strong>Direct-OS 是接口名；本文只覆盖其中的 Direct-S3 实现。</strong></p>
+
+      <div class="decision-grid">
+        <article class="decision"><strong>Guest 接口保持不变</strong><p>Guest 只看到 <code>/dev/vda</code>、<code>/dev/vdb</code> 和标准 ext4。Guest 不安装存储客户端，不持有 S3 或 Metadata 凭证。</p></article>
+        <article class="decision"><strong>数据 Ground Truth 在 S3</strong><p>Data Object、Delta Segment、Map Node 和 Commit Record 都是不可变对象。本地 NVMe 在提交完成后只是可删除 Cache。</p></article>
+        <article class="decision"><strong>Root 与 Lease 由强一致数据库管理</strong><p>PostgreSQL 保存当前 <code>root_hash</code>、Generation、Lease Owner 和 Fencing Epoch；它不保存用户数据块。</p></article>
+        <article class="decision"><strong>FLUSH 是远端持久化边界</strong><p>只有 S3 对象上传完成且 Root CAS 成功后，才向 Guest 返回 FLUSH/FUA 成功。</p></article>
+      </div>
+
+      <div class="callout green"><strong>与现有架构的关系：</strong>Cloud Hypervisor、vhost-user-blk、Guest ext4、RootDisk、PersistentDisk、MountBinding、Attachment 和 <code>cats</code> CLI 都不改变。只替换 <code>cats-blockd</code> 下方的 JuiceFS raw-file 数据路径。</div>
+      <div class="callout red"><strong>不是上线承诺：</strong>本文定义正确性协议和模块边界。是否替换 JuiceFS，必须由真实 S3、真实 Cloud Hypervisor、git/package install、SQLite/fsync、故障注入和长期稳定性测试决定。</div>
+    </section>
+
+    <section id="decisions">
+      <h2>2. 核心架构决策</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>问题</th><th>决定</th><th>原因</th></tr></thead>
+          <tbody>
+            <tr><td>块设备前端</td><td>生产使用 <code>vhost-user-blk</code>；开发/恢复增加 <code>ublk</code> 前端</td><td>Cloud Hypervisor 直接消费 vhost-user 队列；ublk 便于在 Host 上执行 mkfs、fsck、fio 和恢复工具。</td></tr>
+            <tr><td>远端数据对象</td><td>4MiB Base Chunk；后续增加 64KiB 粒度的 Delta Record</td><td>完整 Chunk 实现简单、便于先验证一致性；Delta 用于降低 ext4 Journal 和小文件随机写放大。</td></tr>
+            <tr><td>块映射</td><td>两级不可变 Merkle Radix Tree</td><td>100GiB/4MiB 只有 25,600 个逻辑 Chunk；修改少量 Chunk 时只重写受影响 Leaf 和 Root。</td></tr>
+            <tr><td>权威指针</td><td>PostgreSQL 中对 <code>generation + lease_epoch</code> 做 CAS</td><td>避免依赖不同 S3-compatible 实现的条件写差异，并把 RWO fencing 放入同一原子检查。</td></tr>
+            <tr><td>本地持久状态</td><td>NVMe Cache + Dirty Bitmap + Pending Commit Pack</td><td>普通写低延迟；FLUSH 冻结屏障前的 Dirty Set 并生成不可变提交包，进程崩溃后可以幂等重试。</td></tr>
+            <tr><td>对象可变性</td><td>Data、Delta、Map、Commit 全部不可变；只更新数据库 Root</td><td>简化崩溃恢复、Snapshot、Clone 和并发读；失败提交最多制造不可见 Orphan。</td></tr>
+            <tr><td>多写者</td><td>只支持 RWO；每次 Attach 增加 Fencing Epoch</td><td>同一个 ext4 镜像不能被两个 Writer 同时挂载；数据库中的 <code>attached=true</code> 不足以阻止旧 Host。</td></tr>
+            <tr><td>跨租户去重</td><td>第一版不做</td><td>降低加密、引用计数、信息泄露和删除语义复杂度；不可变 Map 仍会复用卷内未修改对象。</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="architecture">
+      <h2>3. 完整架构图</h2>
+      <p class="lead">图中绿色实线是数据路径，蓝色虚线是控制路径，紫色点线是 Root/Map/Lease 元数据路径。用户看不到右侧所有内部组件。</p>
+
+      <div class="diagram-frame">
+        <svg viewBox="0 0 1600 1030" role="img" aria-labelledby="arch-title arch-desc">
+          <title id="arch-title">Cats Direct-S3 ChunkStore 完整架构</title>
+          <desc id="arch-desc">控制面管理 Volume 和 Attachment；Host A 中 Guest ext4 经 Cloud Hypervisor 和 vhost-user-blk 访问 cats-blockd；cats-blockd 使用本地 NVMe Cache、Dirty Bitmap 和每次 FLUSH 的 Pending Commit Pack，同时把不可变数据、映射和提交记录写入 S3，并通过 PostgreSQL Root CAS 与 Lease Fencing 发布新版本；Host B 可从空缓存恢复。</desc>
+          <defs>
+            <marker id="arrow-data" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L10,3 L0,6 Z" fill="#087d59"/></marker>
+            <marker id="arrow-control" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L10,3 L0,6 Z" fill="#1768ac"/></marker>
+            <marker id="arrow-meta" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L10,3 L0,6 Z" fill="#7041a5"/></marker>
+            <style>
+              .zone{fill:#f8fafb;stroke:#aabac1;stroke-width:1.5}.zone-blue{fill:#f1f7fc;stroke:#8eb8d8;stroke-width:1.5}.zone-green{fill:#f0faf5;stroke:#8fcab4;stroke-width:1.5}.zone-purple{fill:#f7f3fb;stroke:#b9a0d5;stroke-width:1.5}.box{fill:#fff;stroke:#aebdc4;stroke-width:1.4}.box-blue{fill:#ebf4fc;stroke:#72a7ce;stroke-width:1.5}.box-green{fill:#e9f8f1;stroke:#6bb89d;stroke-width:1.5}.box-orange{fill:#fff3e7;stroke:#d6a272;stroke-width:1.5}.box-purple{fill:#f4effb;stroke:#a98bc9;stroke-width:1.5}.title{font:700 16px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#17242b}.label{font:700 13px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#17242b}.t{font:600 12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#263a43}.s{font:400 10px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#65777e}.data{fill:none;stroke:#087d59;stroke-width:3;marker-end:url(#arrow-data)}.control{fill:none;stroke:#1768ac;stroke-width:2.3;stroke-dasharray:8 6;marker-end:url(#arrow-control)}.meta{fill:none;stroke:#7041a5;stroke-width:2.2;stroke-dasharray:2 6;marker-end:url(#arrow-meta)}
+            </style>
+          </defs>
+
+          <rect x="35" y="30" width="1530" height="190" rx="14" class="zone-blue"/>
+          <text x="60" y="61" class="title">Cats Control Plane</text>
+          <rect x="70" y="83" width="210" height="100" rx="9" class="box"/>
+          <text x="92" y="113" class="label">Cats API / cats CLI</text><text x="92" y="137" class="s">Cat、Disk、Mount API</text><text x="92" y="157" class="s">幂等请求与租户认证</text>
+          <rect x="330" y="83" width="225" height="100" rx="9" class="box-blue"/>
+          <text x="352" y="113" class="label">Disk Controller</text><text x="352" y="137" class="s">Create / Resize / Delete</text><text x="352" y="157" class="s">RootDisk / PersistentDisk</text>
+          <rect x="605" y="83" width="245" height="100" rx="9" class="box-blue"/>
+          <text x="627" y="113" class="label">Attachment Controller</text><text x="627" y="137" class="s">RWO Lease / Fencing Epoch</text><text x="627" y="157" class="s">MountBinding / Attachment</text>
+          <rect x="900" y="70" width="625" height="125" rx="9" class="box-purple"/>
+          <text x="925" y="101" class="label">Metadata PostgreSQL（强一致）</text>
+          <text x="925" y="128" class="s">volumes: size, root_hash, generation, state</text>
+          <text x="925" y="149" class="s">attachments: owner, lease_epoch, lease_expiry</text>
+          <text x="925" y="170" class="s">snapshots: volume_id, root_hash, generation</text>
+          <path d="M280 132 H330" class="control"/><path d="M555 132 H605" class="control"/><path d="M850 132 H900" class="meta"/>
+
+          <rect x="35" y="255" width="980" height="735" rx="14" class="zone"/>
+          <text x="60" y="287" class="title">Host A · 当前 Active Attachment</text>
+
+          <rect x="75" y="320" width="260" height="235" rx="10" class="box-green"/>
+          <text x="98" y="351" class="label">Guest VM</text>
+          <rect x="103" y="374" width="204" height="62" rx="7" class="box"/>
+          <text x="126" y="400" class="t">用户文件 / Git / SQLite</text><text x="126" y="420" class="s">普通 Linux 文件语义</text>
+          <rect x="103" y="457" width="204" height="68" rx="7" class="box"/>
+          <text x="126" y="483" class="t">未修改的 ext4</text><text x="126" y="503" class="s">/dev/vda · /dev/vdb</text>
+
+          <rect x="385" y="340" width="220" height="180" rx="10" class="box-blue"/>
+          <text x="407" y="373" class="label">Cloud Hypervisor</text>
+          <text x="407" y="402" class="t">virtio-blk frontend</text><text x="407" y="423" class="s">Guest Virtqueue</text>
+          <text x="407" y="457" class="t">vhost-user client</text><text x="407" y="478" class="s">Unix socket + shared memory</text>
+          <path d="M307 491 H385" class="data"/>
+
+          <rect x="655" y="310" width="320" height="380" rx="11" class="box-blue"/>
+          <text x="681" y="343" class="label">cats-blockd</text><text x="681" y="364" class="s">每个 Active Attachment 一个隔离实例</text>
+          <rect x="681" y="389" width="268" height="54" rx="7" class="box"/>
+          <text x="701" y="412" class="t">vhost-user-blk Frontend</text><text x="701" y="430" class="s">READ / WRITE / FLUSH / DISCARD</text>
+          <rect x="681" y="459" width="128" height="70" rx="7" class="box-green"/>
+          <text x="697" y="485" class="t">I/O Scheduler</text><text x="697" y="504" class="s">Barrier / Seq</text>
+          <rect x="821" y="459" width="128" height="70" rx="7" class="box-purple"/>
+          <text x="837" y="485" class="t">Volume Map</text><text x="837" y="504" class="s">Root / Leaf Cache</text>
+          <rect x="681" y="545" width="128" height="70" rx="7" class="box-orange"/>
+          <text x="697" y="571" class="t">Commit Engine</text><text x="697" y="590" class="s">Upload + CAS</text>
+          <rect x="821" y="545" width="128" height="70" rx="7" class="box-blue"/>
+          <text x="837" y="571" class="t">Lease Guard</text><text x="837" y="590" class="s">Epoch / Expiry</text>
+          <rect x="681" y="631" width="268" height="36" rx="7" class="box"/>
+          <text x="701" y="654" class="s">Checksum · Encryption · Metrics · Backpressure</text>
+          <path d="M605 430 H681" class="data"/>
+
+          <rect x="75" y="610" width="530" height="315" rx="11" class="zone-green"/>
+          <text x="99" y="642" class="label">Local NVMe · 可丢弃的 Clean Cache + 未提交 Pending Pack</text>
+          <rect x="103" y="670" width="220" height="96" rx="8" class="box-green"/>
+          <text x="125" y="699" class="t">Clean Chunk Cache</text><text x="125" y="722" class="s">LRU / quota / read-ahead</text><text x="125" y="743" class="s">Cold 后可以全部删除</text>
+          <rect x="350" y="670" width="220" height="96" rx="8" class="box-orange"/>
+          <text x="372" y="699" class="t">Dirty Cache</text><text x="372" y="722" class="s">64KiB Dirty Bitmap</text><text x="372" y="743" class="s">远端提交前不可删除</text>
+          <rect x="103" y="790" width="220" height="96" rx="8" class="box-orange"/>
+          <text x="125" y="819" class="t">Write-Ahead Log</text><text x="125" y="842" class="s">write_seq / txn_id / checksum</text><text x="125" y="863" class="s">用于崩溃重试</text>
+          <rect x="350" y="790" width="220" height="96" rx="8" class="box"/>
+          <text x="372" y="819" class="t">Cache Index</text><text x="372" y="842" class="s">chunk → local extent</text><text x="372" y="863" class="s">启动时可重建</text>
+          <path d="M715 615 C700 742,610 745,570 718" class="data"/>
+          <path d="M745 615 C710 818,380 835,323 835" class="data"/>
+
+          <rect x="1055" y="255" width="510" height="470" rx="14" class="zone-purple"/>
+          <text x="1080" y="287" class="title">Durable Storage</text>
+          <rect x="1090" y="318" width="440" height="370" rx="10" class="box-purple"/>
+          <text x="1115" y="350" class="label">S3-compatible Object Storage</text>
+          <rect x="1118" y="377" width="180" height="82" rx="8" class="box-green"/>
+          <text x="1138" y="404" class="t">Data Objects</text><text x="1138" y="426" class="s">4MiB Base Chunk</text><text x="1138" y="445" class="s">不可变 + checksum</text>
+          <rect x="1320" y="377" width="180" height="82" rx="8" class="box-orange"/>
+          <text x="1340" y="404" class="t">Delta Segments</text><text x="1340" y="426" class="s">多条 64KiB Record</text><text x="1340" y="445" class="s">按 FLUSH 打包</text>
+          <rect x="1118" y="485" width="180" height="82" rx="8" class="box-purple"/>
+          <text x="1138" y="512" class="t">Map Nodes</text><text x="1138" y="534" class="s">Root + Leaf</text><text x="1138" y="553" class="s">内容寻址、结构共享</text>
+          <rect x="1320" y="485" width="180" height="82" rx="8" class="box-blue"/>
+          <text x="1340" y="512" class="t">Commit Records</text><text x="1340" y="534" class="s">generation / parent</text><text x="1340" y="553" class="s">txn / root / epoch</text>
+          <rect x="1118" y="594" width="382" height="62" rx="8" class="box"/>
+          <text x="1138" y="620" class="t">Object Lifecycle / Inventory</text><text x="1138" y="641" class="s">Mark-and-Sweep GC · orphan grace period · audit</text>
+          <path d="M809 580 C980 580,1000 418,1118 418" class="data"/>
+          <path d="M809 580 C980 580,1000 526,1118 526" class="meta"/>
+          <path d="M885 580 C1030 580,1110 526,1320 526" class="meta"/>
+          <path d="M885 545 C955 250,1120 195,1120 195" class="meta"/>
+
+          <rect x="1055" y="755" width="510" height="235" rx="14" class="zone-green"/>
+          <text x="1080" y="787" class="title">Host B · Cold Start / Migration Target</text>
+          <rect x="1090" y="818" width="195" height="125" rx="9" class="box-blue"/>
+          <text x="1112" y="848" class="label">新的 cats-blockd</text><text x="1112" y="873" class="s">获取新 fencing epoch</text><text x="1112" y="894" class="s">只加载 Root / Leaf</text><text x="1112" y="915" class="s">本地 Cache 初始为空</text>
+          <rect x="1318" y="818" width="205" height="125" rx="9" class="box-green"/>
+          <text x="1340" y="848" class="label">新的 Guest VM</text><text x="1340" y="873" class="s">同一个 ext4 UUID</text><text x="1340" y="894" class="s">按读请求 Lazy Load</text><text x="1340" y="915" class="s">无需搬迁 100GiB</text>
+          <path d="M1285 880 H1318" class="data"/>
+          <path d="M1300 688 C1300 748,1190 752,1190 818" class="data"/>
+          <path d="M1210 195 C1210 660,1160 740,1160 818" class="meta"/>
+
+          <path d="M727 183 C727 225,812 250,812 310" class="control"/>
+          <path d="M442 183 C442 245,535 260,535 340" class="control"/>
+        </svg>
+      </div>
+      <div class="legend">
+        <span><i></i>块数据、Cache Hydration、对象上传</span>
+        <span><i class="control"></i>控制面、Attach、进程管理</span>
+        <span><i class="metadata"></i>Map、Root、Lease、Generation</span>
+      </div>
+
+      <div class="callout"><strong>明确边界：</strong>S3 保存数据和不可变历史，PostgreSQL 保存当前可见 Root 和写入所有权。只恢复 S3 但不恢复 Metadata DB，无法可靠判断哪个失败提交曾经通过 CAS；因此 Metadata DB 也必须高可用并持续备份。</div>
+    </section>
+
+    <section id="modules">
+      <h2>4. 模块职责</h2>
+      <div class="module-grid">
+        <article class="module"><span class="where">Guest</span><h3>ext4</h3><p>向上提供完整 Linux 文件语义，向下只产生标准块请求。</p><ul><li>4KiB 数据和元数据块</li><li>Journal、barrier、fsync</li><li>DISCARD/TRIM</li><li>无需任何 Cats 存储代码</li></ul></article>
+        <article class="module"><span class="where">Hypervisor</span><h3>Cloud Hypervisor</h3><p>向 Guest 暴露 virtio-blk，把 Virtqueue 交给 Host 侧 vhost-user backend。</p><ul><li>RootDisk → /dev/vda</li><li>PersistentDisk → /dev/vdb...</li><li>支持多队列和热插拔</li><li>不理解 S3、Map 或 Lease</li></ul></article>
+        <article class="module"><span class="where">Node</span><h3>cats-blockd Frontend</h3><p>实现 vhost-user-blk 协议并验证请求边界。</p><ul><li>READ / WRITE</li><li>FLUSH / FUA</li><li>DISCARD / WRITE_ZEROES</li><li>容量与只读模式</li></ul></article>
+        <article class="module"><span class="where">Node</span><h3>Block Engine</h3><p>统一处理 I/O 顺序、Barrier、Map 查询、Cache Miss 合并和错误传播。</p><ul><li>每个请求分配 write_seq</li><li>FLUSH 捕获稳定序列</li><li>同 Chunk 写入串行化</li><li>读写并发与回压</li></ul></article>
+        <article class="module"><span class="where">Node</span><h3>Local Cache / Pending Store</h3><p>NVMe 提供运行时性能；每次 FLUSH 用不可变 Pending Commit Pack 固定屏障前的提交输入。</p><ul><li>Clean Cache 可随时淘汰</li><li>Dirty Cache 提交前不可删除</li><li>Pending Pack 保存 txn、dirty extents 和 checksum</li><li>Dirty Bitmap 使用 64KiB 页</li></ul></article>
+        <article class="module"><span class="where">Node</span><h3>Commit Engine</h3><p>唯一可以发布新 Generation 的模块。</p><ul><li>构造 Base/Delta 对象</li><li>上传并验证 checksum</li><li>创建新 Map Root</li><li>执行 Root CAS</li></ul></article>
+        <article class="module"><span class="where">Control plane</span><h3>Lease Store</h3><p>确保一个 Volume 同时只有一个有效 Writer。</p><ul><li>Owner + TTL</li><li>单调递增 Epoch</li><li>续租与撤销</li><li>CAS 时再次校验 Epoch</li></ul></article>
+        <article class="module"><span class="where">Durable</span><h3>S3 BlobStore</h3><p>只接受不可变对象，提供 PUT、GET、Range GET、HEAD 和异步 DELETE。</p><ul><li>服务端 checksum</li><li>对象加密</li><li>失败重试与幂等键</li><li>Bucket/Prefix 租户隔离</li></ul></article>
+        <article class="module"><span class="where">Background</span><h3>Compactor / GC</h3><p>Compactor 合并 Base + Delta；GC 只删除没有任何 Root 引用的旧对象。</p><ul><li>Snapshot-aware Mark</li><li>Orphan grace period</li><li>对象库存扫描</li><li>限速和暂停机制</li></ul></article>
+      </div>
+    </section>
+
+    <section id="format">
+      <h2>5. 远端数据格式</h2>
+      <p class="lead">100GiB 是逻辑地址空间，不是一个必须上传的文件。按 4MiB Base Chunk 计算，共有 25,600 个逻辑 Chunk；Hole 不对应任何对象。</p>
+
+      <div class="tree" aria-label="Merkle Block Map 结构图">
+        <div class="tree-row"><div class="tree-node">Volume Root<small>generation=42 · root_hash=R42</small></div></div>
+        <div class="tree-arrow">↓ 只引用不可变 Leaf Node</div>
+        <div class="tree-row">
+          <div class="tree-node leaf">Leaf 0<small>chunk 0–255</small></div>
+          <div class="tree-node leaf">Leaf 1<small>chunk 256–511</small></div>
+          <div class="tree-node leaf">Leaf 2<small>chunk 512–767</small></div>
+          <div class="tree-node leaf">…<small>未修改 Leaf 直接复用</small></div>
+        </div>
+        <div class="tree-arrow">↓ ChunkRef = Hole | Base | Base + Deltas</div>
+        <div class="tree-row">
+          <div class="tree-node data">Base Object A<small>4MiB · checksum</small></div>
+          <div class="tree-node hole">Hole<small>读取返回全零</small></div>
+          <div class="tree-node data">Base Object B<small>4MiB · checksum</small></div>
+          <div class="tree-node data">Delta 40 → 42<small>64KiB records</small></div>
+        </div>
+      </div>
+
+      <pre class="code-block"><code>tenants/&lt;tenant-id&gt;/volumes/&lt;volume-id&gt;/
+  data/&lt;object-id&gt;                      # 4MiB Base Chunk，不可变
+  deltas/&lt;transaction-id&gt;               # 一个 FLUSH 的 Delta Pack，不可变
+  maps/&lt;sha256&gt;.node                    # Root / Leaf Node，不可变
+  commits/&lt;generation&gt;-&lt;transaction&gt;    # 审计和恢复记录，不可变
+
+PostgreSQL volumes:
+  volume_id
+  tenant_id
+  kind                 # root | persistent
+  size_bytes
+  root_hash
+  generation
+  lease_owner
+  lease_epoch
+  lease_expires_at
+  state                # available | attaching | attached | deleting</code></pre>
+
+      <div class="two-col" style="margin-top:14px">
+        <article class="card"><h3>Base Data Object</h3><ul><li>Header：format、volume、logical chunk、plaintext length</li><li>Compression：v1 可关闭，后续按 Chunk 决定</li><li>Encryption：每 Volume DEK，KMS 包装</li><li>Integrity：明文 SHA-256 + 远端对象 checksum</li><li>Object ID：v1 使用随机 ID，不做跨租户内容寻址</li></ul></article>
+        <article class="card"><h3>Map Node</h3><ul><li>使用确定性二进制编码，不使用字段顺序不稳定的 JSON</li><li>Node Hash 覆盖完整编码内容</li><li>Leaf 保存 ChunkRef 和 Delta offset/length</li><li>Root 保存 Leaf Hash</li><li>读取任何对象后都必须验证 Hash/Checksum</li></ul></article>
+      </div>
+    </section>
+
+    <section id="io">
+      <h2>6. I/O 数据路径</h2>
+
+      <h3>6.1 读路径</h3>
+      <div class="path">
+        <div class="path-box">Guest READ<small>LBA + length</small></div><div class="path-arrow">→</div>
+        <div class="path-box">Volume Map<small>Hole / Base / Delta</small></div><div class="path-arrow">→</div>
+        <div class="path-box">NVMe Cache<small>Hit 直接返回</small></div><div class="path-arrow">或</div>
+        <div class="path-box">S3 GET<small>校验、hydrate、返回</small></div>
+      </div>
+      <div class="callout green"><strong>Cold Start：</strong>Attach 时只加载 Volume Row、Root Node 和启动过程中读到的 Leaf。第一次读取某个 Chunk 才访问 S3；多个相同 Cache Miss 必须合并成一次下载。Hole 直接返回零，不产生 S3 请求。</div>
+
+      <h3 style="margin-top:28px">6.2 普通写路径</h3>
+      <div class="path">
+        <div class="path-box">Guest WRITE<small>4KiB～大块 I/O</small></div><div class="path-arrow">→</div>
+        <div class="path-box">Mark Dirty<small>先保守标记 64KiB page</small></div><div class="path-arrow">→</div>
+        <div class="path-box">NVMe Cache<small>覆盖对应 bytes</small></div><div class="path-arrow">→</div>
+        <div class="path-box">WRITE ACK<small>尚未承诺远端持久</small></div>
+      </div>
+      <div class="callout"><strong>Write Cache 语义：</strong>普通 WRITE 可以在写入本地内存/NVMe 后返回，但必须向 Guest 正确声明 volatile write cache。Host 在 FLUSH 前永久损坏时，未 fsync 数据允许丢失；已经成功完成 FLUSH/FUA 的数据不允许丢失。</div>
+      <div class="callout orange"><strong>V1 不实现逐写 WAL：</strong>普通写不为每个 4KiB 请求追加数据库式日志。只有 FLUSH 到来时，才把屏障前的 Dirty Set 固定成不可变 Pending Commit Pack。若未来要让已 ACK 但尚未 FLUSH 的普通写也能承受整台 Host 永久丢失，需要跨 Host 复制的日志或同步远端提交；单机 NVMe WAL 仍然不够。</div>
+
+      <h3 style="margin-top:28px">6.3 DISCARD / TRIM</h3>
+      <p class="lead">完整 Chunk 的 DISCARD 把对应 ChunkRef 改为 Hole；部分 Chunk 的 DISCARD 记录 Zero Delta 或在 Compaction 时归零。不会同步删除 S3 对象，因为旧 Snapshot 可能仍然引用它。</p>
+    </section>
+
+    <section id="flush">
+      <h2>7. FLUSH/FUA 提交协议</h2>
+      <p class="lead">FLUSH 是整个设计的持久性边界。顺序必须是“对象先持久、Root 后发布、Dirty 最后清理”，不能交换。</p>
+
+      <div class="sequence" aria-label="FLUSH 提交时序">
+        <div class="sequence-grid">
+          <div class="seq-cell seq-head">步骤</div><div class="seq-cell seq-head">Guest/ext4</div><div class="seq-cell seq-head">cats-blockd</div><div class="seq-cell seq-head">Local NVMe</div><div class="seq-cell seq-head">S3</div><div class="seq-cell seq-head">PostgreSQL</div>
+          <div class="seq-cell seq-num">1</div><div class="seq-cell seq-active">发送 FLUSH/FUA</div><div class="seq-cell seq-active">捕获 dirty_seq ≤ N，建立 txn</div><div class="seq-cell seq-empty">—</div><div class="seq-cell seq-empty">—</div><div class="seq-cell seq-empty">—</div>
+          <div class="seq-cell seq-num">2</div><div class="seq-cell seq-warn">等待，不返回</div><div class="seq-cell">冻结 N 的 Dirty Set；后续写进入新集合</div><div class="seq-cell seq-active">创建 Pending Pack 并 fdatasync</div><div class="seq-cell seq-empty">—</div><div class="seq-cell seq-empty">—</div>
+          <div class="seq-cell seq-num">3</div><div class="seq-cell seq-warn">等待</div><div class="seq-cell">构造 Base Chunk 或 Delta Pack</div><div class="seq-cell">读取 dirty extents</div><div class="seq-cell seq-active">PUT Data/Delta + checksum</div><div class="seq-cell seq-empty">—</div>
+          <div class="seq-cell seq-num">4</div><div class="seq-cell seq-warn">等待</div><div class="seq-cell">创建新 Leaf 和 Root</div><div class="seq-cell seq-empty">—</div><div class="seq-cell seq-meta">PUT Map Nodes + Commit Record</div><div class="seq-cell seq-empty">—</div>
+          <div class="seq-cell seq-num">5</div><div class="seq-cell seq-warn">等待</div><div class="seq-cell">提交 root=R(N+1)</div><div class="seq-cell seq-empty">—</div><div class="seq-cell">对象已经可读</div><div class="seq-cell seq-meta">CAS generation + epoch + owner</div>
+          <div class="seq-cell seq-num">6</div><div class="seq-cell seq-warn">等待</div><div class="seq-cell">确认远端 Generation 已发布</div><div class="seq-cell seq-active">清该集合 Dirty；Pending Pack 可删</div><div class="seq-cell seq-empty">—</div><div class="seq-cell">新 Root 可见</div>
+          <div class="seq-cell seq-num">7</div><div class="seq-cell seq-active">收到成功</div><div class="seq-cell seq-active">返回 FLUSH/FUA 成功</div><div class="seq-cell">清理已提交 Pending Pack</div><div class="seq-cell seq-empty">—</div><div class="seq-cell seq-empty">—</div>
+        </div>
+      </div>
+
+      <pre class="code-block"><code>UPDATE volumes
+SET root_hash       = :new_root,
+    generation      = generation + 1,
+    updated_at      = now()
+WHERE volume_id     = :volume_id
+  AND generation    = :expected_generation
+  AND lease_epoch   = :expected_epoch
+  AND lease_owner   = :this_attachment
+  AND lease_expires_at &gt; now();
+
+-- affected_rows 必须恰好为 1，否则不能向 Guest 返回 FLUSH 成功。</code></pre>
+
+      <div class="three-col" style="margin-top:14px">
+        <article class="card"><h3>CAS 前崩溃</h3><p>旧 Root 继续可见。已经上传的对象没有 Root 引用，经过安全等待期后由 GC 删除。</p></article>
+        <article class="card"><h3>CAS 后、ACK 前崩溃</h3><p>新 Root 已经是 Ground Truth。重启后根据 txn/generation 识别已提交状态，只清理 Pending Pack，不重复增加 Generation。</p></article>
+        <article class="card"><h3>CAS 失败</h3><p>说明 Generation 冲突、Lease 过期或 Writer 已被 Fence。立即停止写路径，不能覆盖新 Owner 的 Root。</p></article>
+      </div>
+
+      <div class="callout red"><strong>延迟下限：</strong>严格 FLUSH 至少包含一次 S3 PUT 完成和一次 Metadata CAS。不能同时承诺“纯 NVMe fsync 延迟”和“Host 永久损坏零丢失”。如果 fsync 密集型数据库无法接受，需要增加独立的区域级 Replicated Write Log，而不是提前返回成功。</div>
+    </section>
+
+    <section id="fencing">
+      <h2>8. RWO Lease 与 Fencing</h2>
+      <p class="lead">Lease 负责判断谁应该写；Fencing Epoch 负责阻止已经失联但仍在运行的旧 Host 发布新 Root。两者缺一不可。</p>
+
+      <div class="state-flow">
+        <div class="state">Available<small>无 Writer</small></div><div class="state-arrow">→</div>
+        <div class="state">Attach Txn<small>epoch 41 → 42</small></div><div class="state-arrow">→</div>
+        <div class="state">Attached<small>Host B / epoch 42</small></div><div class="state-arrow">→</div>
+        <div class="state">Flush CAS<small>必须携带 epoch 42</small></div><div class="state-arrow">→</div>
+        <div class="state">Detach<small>flush + release</small></div>
+      </div>
+
+      <div class="two-col" style="margin-top:18px">
+        <article class="card"><h3>正常迁移</h3><ol><li>停止 Guest 新写入。</li><li>完成最终 FLUSH，记录 final root。</li><li>Host A 关闭 vhost-user backend。</li><li>释放 Lease。</li><li>Host B 获取 epoch+1。</li><li>空 Cache 加载 Root，启动 Guest。</li></ol></article>
+        <article class="card"><h3>Host A 突然失联</h3><ol><li>控制面等待 Lease 到期或执行受控撤销。</li><li>Host B 获取更大的 Epoch。</li><li>Host A 即使恢复，也无法通过 Root CAS。</li><li>Host A 上传的对象没有新 Root 引用，只会成为 Orphan。</li><li>Host B 从最后一次成功 FLUSH 的 Root 恢复。</li></ol></article>
+      </div>
+
+      <div class="callout red"><strong>禁止行为：</strong>不能因为 S3 支持多客户端读取，就允许两个 cats-blockd 同时写同一个 ext4 Volume。两个 Writer 分别修改不同 LBA 也不安全，因为 ext4 Journal 和分配器仍然是同一个文件系统。</div>
+    </section>
+
+    <section id="lifecycle">
+      <h2>9. RootDisk 与 PersistentDisk 生命周期</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>阶段</th><th>RootDisk</th><th>PersistentDisk</th><th>存储动作</th></tr></thead>
+          <tbody>
+            <tr><td>Create</td><td>随 Cat 自动创建，可从 Golden Root 克隆 Root</td><td>由用户显式创建或在 <code>cats create --disk</code> 时创建</td><td>创建 Volume Row；Root 指向空 Map 或 Golden Snapshot；无需复制所有 Chunk。</td></tr>
+            <tr><td>Attach</td><td>固定作为 Guest 系统盘</td><td>一次只能挂到一个 Cat，可动态挂载</td><td>分配 Fencing Epoch，启动 cats-blockd，Cloud Hypervisor 添加设备。</td></tr>
+            <tr><td>Active</td><td>普通系统盘读写</td><td>Guest 中挂载到 /data 等路径</td><td>NVMe Cache 加速；FLUSH 提交到 S3 + Metadata。</td></tr>
+            <tr><td>Cold</td><td>Cat 停止但 Volume 保留</td><td>如果仍 Bound，MountBinding 保留；也可先 Detach</td><td>最终 FLUSH；关闭 backend；删除本地 Cache；远端 Root 不变。</td></tr>
+            <tr><td>Wake/Migrate</td><td>新 Host 从最后 Root 启动</td><td>在新的 Cat/Host 上重新 Attach</td><td>只加载 Root/Leaf；数据按需 GET，不搬迁整个逻辑盘。</td></tr>
+            <tr><td>Cat Destroy</td><td>进入 deleting，最终删除</td><td>保留；先安全 Detach</td><td>RootDisk Tombstone 后异步 GC；PersistentDisk 不受影响。</td></tr>
+            <tr><td>Disk Delete</td><td>随 Cat Destroy</td><td>用户显式执行，必须无有效 Attachment</td><td>撤销访问、保留安全期、删除 Volume Prefix 和 Metadata Row。</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <pre class="code-block"><code># 用户接口不暴露 S3、Map、Cache、Lease 或 Socket
+cats create dev
+cats create dev --disk project-data --disk-size 100GiB --mount-at /data
+
+cats disk create project-data --size 100GiB
+cats mount project-data --cat dev --at /data
+cats unmount project-data --cat dev
+cats disk resize project-data --size 500GiB
+
+cats destroy dev              # RootDisk 删除，PersistentDisk 保留
+cats disk delete project-data # 只有 Available 状态允许删除</code></pre>
+    </section>
+
+    <section id="snapshot">
+      <h2>10. Snapshot、Clone、Restore 与 GC</h2>
+      <div class="two-col">
+        <article class="card"><h3>Checkpoint / Snapshot</h3><ol><li>对 Active Volume 建立 Barrier。</li><li>完成一次远端 FLUSH。</li><li>把当前 <code>root_hash + generation</code> 写入 Snapshot Row。</li><li>解除 Barrier。</li></ol><p>不复制 Base Chunk、Delta 或 Map Node。</p></article>
+        <article class="card"><h3>Clone</h3><ol><li>新 Volume 创建新的 ID 和 Lease 状态。</li><li>初始 Root 指向同一个不可变 Map Root。</li><li>后续写入创建新的 Leaf、Root 和 Data Object。</li><li>旧对象由两个 Root 共同引用。</li></ol></article>
+        <article class="card"><h3>Restore</h3><ol><li>拒绝或冻结新写入。</li><li>完成当前写入的处理策略：提交或明确丢弃。</li><li>数据库将 Volume Root CAS 到 Snapshot Root。</li><li>Generation 增加，失效本地 Clean Cache。</li><li>重新开放设备。</li></ol></article>
+        <article class="card"><h3>Mark-and-Sweep GC</h3><ol><li>以所有 Active Volume Root 和 Snapshot Root 为起点。</li><li>遍历 Root、Leaf、Base、Delta 引用。</li><li>形成 Live Object 集合。</li><li>只删除未引用且早于 Grace Period 的对象。</li><li>GC 进度和删除清单必须可审计。</li></ol></article>
+      </div>
+      <div class="callout orange"><strong>不能仅靠引用计数：</strong>上传对象后、Root CAS 前随时可能崩溃；Snapshot 删除、Clone 和并发 GC 也会造成引用计数时序问题。不可变对象 + 周期性 Mark-and-Sweep 更容易证明正确。</div>
+    </section>
+
+    <section id="small-files">
+      <h2>11. 小文件与写放大</h2>
+      <p class="lead">10 万个 Guest 文件不会变成 10 万个 S3 对象。cats-blockd 看不到文件名，只看到 ext4 写入的 LBA。但 ext4 Journal、inode table、目录块和重复 FLUSH 会反复改写少量热区，因此完整 4MiB Chunk 上传会造成写放大。</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>阶段</th><th>远端表示</th><th>优点</th><th>问题/触发条件</th></tr></thead>
+          <tbody>
+            <tr><td>V1：Full Chunk</td><td>每个 Dirty 逻辑 Chunk 生成新的 4MiB Base Object</td><td>代码简单；读路径简单；容易验证崩溃一致性</td><td>4KiB 写也可能上传 4MiB；只适合功能验证和初期小规模。</td></tr>
+            <tr><td>V2：Delta Pack</td><td>一次 FLUSH 将多个 64KiB Dirty Page 打包成一个 Segment</td><td>减少 PUT 数和传输字节；适合 ext4 Journal 和 Git 小文件</td><td>读时需要 Base + Delta 合并；Map 保存 segment offset/length。</td></tr>
+            <tr><td>Compaction</td><td>后台把 Base + 多个 Delta 合并为新 Base</td><td>限制读放大和 Delta Chain 长度</td><td>建议在 delta_count &gt; 4、delta_bytes &gt; 50% base 或 Chunk 变热时触发。</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <pre class="code-block"><code>DeltaSegment {
+  format_version
+  volume_id
+  transaction_id
+  lease_epoch
+  records[] {
+    logical_chunk_index
+    offset_in_chunk        # 64KiB 对齐
+    length
+    plaintext_checksum
+    payload_offset
+  }
+  encrypted_payload
+  segment_checksum
+}
+
+ChunkRef {
+  base_object
+  deltas[] { segment_id, record_offset, record_length }
+}</code></pre>
+
+      <div class="callout"><strong>基准必须看四个量：</strong><code>guest_bytes_written</code>、<code>remote_bytes_uploaded</code>、S3 PUT 数和 Compaction Bytes。只看最终对象容量会掩盖重复上传与后台整理成本。</div>
+    </section>
+
+    <section id="security">
+      <h2>12. 租户隔离、凭证与加密</h2>
+      <div class="three-col">
+        <article class="card"><h3>权限边界</h3><ul><li>Guest 永远拿不到 S3/DB 凭证。</li><li>cat-agent 只给 blockd 发送短期 Volume Token。</li><li>Token 限定 tenant、volume、attachment、epoch 和操作。</li><li>blockd 使用节点身份换取短期远端凭证。</li></ul></article>
+        <article class="card"><h3>对象加密</h3><ul><li>每个 Volume 独立 DEK。</li><li>DEK 由平台 KMS KEK 包装。</li><li>对象 Header 作为 AEAD Associated Data。</li><li>Map 中保存 key_version。</li><li>后台重写完成密钥轮换。</li></ul></article>
+        <article class="card"><h3>完整性</h3><ul><li>上传提供服务端 checksum。</li><li>Map 保存明文或规范编码 Hash。</li><li>下载后再次验证。</li><li>校验失败不写入 Clean Cache。</li><li>错误进入只读/故障状态并告警。</li></ul></article>
+      </div>
+      <div class="callout orange"><strong>第一版不做跨租户去重：</strong>跨租户内容寻址可能泄露“另一个租户是否拥有某段数据”，并让密钥轮换、引用追踪和删除证明复杂化。Volume 内通过不可变 Root 复用未修改对象已经能获得主要 CoW 收益。</div>
+    </section>
+
+    <section id="failure">
+      <h2>13. 故障处理矩阵</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>故障</th><th>正确行为</th><th>不能发生</th><th>恢复动作</th></tr></thead>
+          <tbody>
+            <tr><td>blockd 进程崩溃</td><td>设备暂停或 I/O 失败；旧 Root 保持完整</td><td>自动跳过未完成 FLUSH 并返回成功</td><td>读取 Pending Pack；检查远端 generation/txn；幂等重试或回滚该 Dirty Set。</td></tr>
+            <tr><td>Host 永久损坏</td><td>从最后成功 FLUSH 的 Root 恢复</td><td>依赖旧 NVMe 才能启动</td><td>等待/撤销 Lease；新 Host 获取更高 Epoch；空 Cache Cold Start。</td></tr>
+            <tr><td>S3 PUT 超时</td><td>重试同一不可变 Object ID；FLUSH 保持等待或失败</td><td>不知道对象是否完成时发布 Root</td><td>HEAD/GET 验证对象和 checksum；确认后继续提交。</td></tr>
+            <tr><td>S3 返回损坏数据</td><td>Checksum 失败，拒绝将数据交给 Guest</td><td>把损坏内容写入 Cache 后继续运行</td><td>重试、读取其他副本/区域；无法恢复时 Volume 进入 Faulted。</td></tr>
+            <tr><td>PostgreSQL 不可用</td><td>已有 Clean Cache 的读可继续；新 FLUSH 不能成功</td><td>绕过 CAS 直接修改 S3 HEAD</td><td>回压写请求；超时后冻结或只读；数据库恢复后重试。</td></tr>
+            <tr><td>Lease 续租失败</td><td>在安全窗口内停止新写和 Root 发布</td><td>旧 Host 无限期继续写</td><td>设备进入 fenced 状态；由控制面重新 Attach。</td></tr>
+            <tr><td>GC 进程崩溃</td><td>最多延迟空间回收</td><td>删除任何仍被 Root/Snapshot 引用的对象</td><td>GC Job 使用 epoch、checkpoint 和幂等 delete，重新扫描。</td></tr>
+            <tr><td>Compaction 崩溃</td><td>旧 Base + Delta 仍可读</td><td>先删除旧对象再发布新 Map</td><td>新 Base 成为 Orphan 或在重试时复用；Root CAS 后才允许旧对象进入 GC。</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="observability">
+      <h2>14. 可观测性与目标</h2>
+      <p class="lead">下列数字是设计目标，不是已经验证的承诺。必须分别统计 Cache Hit、Cold Miss、普通写和 FLUSH，不能用平均延迟掩盖远端提交。</p>
+      <div class="metric-grid">
+        <div class="metric"><strong>&lt; 1ms</strong><span>目标：NVMe Cache Hit READ P99</span></div>
+        <div class="metric"><strong>&lt; 1ms</strong><span>目标：非 FUA 本地 WRITE P99</span></div>
+        <div class="metric"><strong>实测决定</strong><span>FLUSH P50/P99：S3 PUT + DB CAS</span></div>
+        <div class="metric"><strong>&gt; 95%</strong><span>目标：稳态工作集 Cache Hit Rate</span></div>
+      </div>
+
+      <div class="table-wrap" style="margin-top:14px">
+        <table>
+          <thead><tr><th>类别</th><th>必须导出的指标</th></tr></thead>
+          <tbody>
+            <tr><td>I/O</td><td>read/write/flush/trim IOPS、bytes、P50/P95/P99、queue depth、barrier wait</td></tr>
+            <tr><td>Cache</td><td>hit/miss、hydrated bytes、eviction、clean/dirty bytes、quota、NVMe fsync latency</td></tr>
+            <tr><td>Remote</td><td>GET/PUT 数、bytes、latency、retry、checksum failure、throttle、error code</td></tr>
+            <tr><td>Commit</td><td>generation、dirty pages/txn、delta bytes、CAS conflict、flush durable seq、Pending Pack backlog</td></tr>
+            <tr><td>Lifecycle</td><td>attach latency、cold start first-read、migration time、lease renewal、fencing event</td></tr>
+            <tr><td>Space</td><td>live bytes、orphan bytes、snapshot retained bytes、GC reclaimed bytes、compaction amplification</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="delivery">
+      <h2>15. 实施计划</h2>
+      <p class="lead">不建议一次性删除 JuiceFS。先让同一套 Block Engine 支持多个 Backend，保持可对照、可回退。</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>阶段</th><th>实现内容</th><th>退出条件</th></tr></thead>
+          <tbody>
+            <tr><td>P0：已有 Demo</td><td>Python/NBD、固定 Chunk、Generation Manifest、原子 HEAD、真实 JuiceFS 对照、崩溃注入</td><td>已完成：冷恢复、HEAD 前后崩溃和兼容 ext4 验证通过。</td></tr>
+            <tr><td>P1：接口拆分</td><td><code>BlockEngine</code>、<code>LocalCache</code>、<code>BlobStore</code>、<code>MetadataStore</code> 四个边界；File/JuiceFS/S3 三种 BlobStore</td><td>相同测试套件在 File 和 JuiceFS Backend 上通过。</td></tr>
+            <tr><td>P2：Rust 正确性版本</td><td>4MiB Full Chunk、两级 Map、PostgreSQL CAS、Lease/Fencing、S3 checksum</td><td>NBD/ublk 下 ext4、fsck、fio、kill -9 和 stale-writer 测试通过。</td></tr>
+            <tr><td>P3：虚拟化接入</td><td>vhost-user-blk、多队列、Cloud Hypervisor 动态磁盘、RootDisk boot</td><td>真实 Guest 中系统盘和 PersistentDisk 生命周期通过。</td></tr>
+            <tr><td>P4：空间与小写优化</td><td>Delta Pack、Compaction、TRIM、Snapshot/Clone、Mark-and-Sweep GC</td><td>git clone、apt/npm、SQLite fsync 的远端写放大和延迟达到阈值。</td></tr>
+            <tr><td>P5：生产强化</td><td>KMS、Credential Broker、限流、配额、审计、在线升级、跨 AZ 恢复、容量计划</td><td>故障演练、72h soak、升级回滚、数据恢复 Runbook 通过评审。</td></tr>
+            <tr><td>P6：灰度决策</td><td>同一产品 API 下按 Volume 选择 JuiceFS 或 Direct-S3 Backend（Direct-OS 实现）</td><td>小比例 RootDisk → PersistentDisk；出现错误可 Detach 并切回兼容 Backend。</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <pre class="code-block"><code>trait BlobStore {
+    async fn put_immutable(object_id, bytes, checksum) -&gt; PutResult;
+    async fn get(object_id, range) -&gt; Bytes;
+    async fn head(object_id) -&gt; ObjectMetadata;
+    async fn delete_batch(object_ids) -&gt; DeleteResult;
+}
+
+trait MetadataStore {
+    async fn acquire_lease(volume, attachment, ttl) -&gt; LeaseEpoch;
+    async fn renew_lease(volume, attachment, epoch, ttl);
+    async fn load_head(volume) -&gt; VolumeHead;
+    async fn compare_and_swap_head(expected, next, attachment, epoch);
+    async fn create_snapshot(volume, root, generation) -&gt; SnapshotId;
+}</code></pre>
+    </section>
+
+    <section id="validation">
+      <h2>16. 验收与故障注入</h2>
+      <div class="two-col">
+        <article class="card"><h3>正确性</h3><ul><li>ext4 mkfs、mount、unmount、journal replay</li><li>tree digest 冷恢复一致</li><li>fsck.ext4 强制检查</li><li>fio verify、fsx、随机断电点</li><li>TRIM 后读取全零</li><li>Snapshot/Restore/Clone 内容一致</li></ul></article>
+        <article class="card"><h3>故障注入</h3><ul><li>Data PUT 前、中、后 kill -9</li><li>Map PUT 后、CAS 前崩溃</li><li>CAS 后、ACK 前崩溃</li><li>Lease 过期和旧 Host 恢复</li><li>S3 延迟、5xx、超时、损坏响应</li><li>PostgreSQL failover 和重复事务</li></ul></article>
+        <article class="card"><h3>工作负载</h3><ul><li>100GiB / 100,000 小文件</li><li>git clone、checkout、gc</li><li>apt、npm、pip install</li><li>SQLite WAL + 每事务 fsync</li><li>PostgreSQL/MySQL 开发实例</li><li>Docker/OCI layer 解包</li></ul></article>
+        <article class="card"><h3>必须记录</h3><ul><li>远端上传/下载字节</li><li>S3 GET/PUT 数和费用模型</li><li>Full Chunk 与 Delta 写放大</li><li>FLUSH P50/P99</li><li>Cold Start 首次响应和 Hotset</li><li>GC/Compaction 对前台 I/O 的影响</li></ul></article>
+      </div>
+
+      <div class="callout red"><strong>上线阻断条件：</strong>任何一次成功返回的 FLUSH 在删除整台 Host 后无法恢复；旧 Fencing Epoch 能发布 Root；GC 能删除可达对象；Checksum 错误未被发现；或无法给出明确的 Dirty/Pending Commit 上限。</div>
+
+      <h3 style="margin-top:30px">Direct-S3 替换 JuiceFS 的决策门</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>比较项</th><th>Direct-S3（Direct-OS 实现）必须证明</th></tr></thead>
+          <tbody>
+            <tr><td>正确性</td><td>FLUSH、FUA、TRIM、Snapshot、Fencing 和恢复语义至少与 JuiceFS 方案相同。</td></tr>
+            <tr><td>延迟</td><td>Cache Hit 不因自研 Map 明显回退；FLUSH 延迟达到产品可接受范围。</td></tr>
+            <tr><td>成本</td><td>S3 请求费、写放大、Compaction 和 GC 后的总成本低于 JuiceFS 双层映射方案。</td></tr>
+            <tr><td>运维</td><td>能够定位某个 LBA 对应的 Root、Map、Data、Delta、Checksum 和提交事务。</td></tr>
+            <tr><td>恢复</td><td>有可执行的 Volume Verify、Read-only Attach、Export Raw、Rebuild Cache 和灾难恢复工具。</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="sources">
+      <h2>17. 参考资料</h2>
+      <div class="source-list">
+        <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/"><strong>Amazon S3 一致性模型</strong>PUT、DELETE 和读取的一致性基础。</a>
+        <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-requests.html"><strong>Amazon S3 Conditional Requests</strong>If-Match / If-None-Match 条件操作；可作为特定 Backend 的 HEAD CAS 能力。</a>
+        <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html"><strong>Amazon S3 Object Integrity</strong>上传与下载 checksum 验证。</a>
+        <a href="https://docs.kernel.org/block/ublk.html"><strong>Linux ublk</strong>io_uring userspace block device、进程恢复和调试接口。</a>
+        <a href="https://github.com/cloud-hypervisor/cloud-hypervisor/blob/main/docs/vhost-user-blk-testing.md"><strong>Cloud Hypervisor vhost-user-blk</strong>Cloud Hypervisor 与外部块后端的连接方式。</a>
+        <a href="https://www.qemu.org/docs/master/tools/qemu-storage-daemon.html"><strong>QEMU Storage Daemon</strong>vhost-user-blk/NBD 导出和生产实现参考。</a>
+        <a href="../experiments/lazy-ext4-demo/README.md"><strong>本仓库 lazy-ext4 Demo</strong>固定 Chunk、未修改 ext4、真实 JuiceFS 对照、冷恢复和崩溃注入。</a>
+        <a href="cats-storage-product-blueprint.html"><strong>Cats 存储产品蓝图</strong>RootDisk、PersistentDisk、CLI、Attachment 和当前 JuiceFS raw-image 方案。</a>
+        <a href="sprite-storage-flow.html"><strong>Sprite 存储路径说明</strong>ext4、块映射、NVMe Cache、对象存储与 Lazy Load 背景。</a>
+      </div>
+    </section>
+  </main>
+
+  <footer><div class="page">Cats Direct-S3 ChunkStore · Guest 使用标准 ext4；NVMe、S3、Map、Lease 和加密全部由平台内部管理。</div></footer>
+</body>
+</html>
