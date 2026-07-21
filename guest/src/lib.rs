@@ -1,3 +1,346 @@
-//! Cats guest agent: in-guest control endpoint (vsock in production, unix socket in tests).
+//! Cats guest agent.
+//!
+//! In production this process is PID-1-adjacent inside the guest and speaks
+//! the length-prefixed JSON protocol over AF_VSOCK. Under the FakeVmm it is
+//! an ordinary host process speaking the same protocol over a unix socket,
+//! and its "virtio disks" are NBD connections to per-attachment
+//! `cats-blockd` sockets — so every block byte still flows through the real
+//! storage engine.
+//!
+//! Identity: `boot_id` is created fresh at cold boot and restored from the
+//! state file on Warm restore. This is the same correctness oracle the
+//! 2026-07-21 experiments used (`boot_id_preserved` / `boot_id_changed`).
 
-pub mod placeholder {}
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::Instant;
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+use cats_api::guest::{
+    GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody, MAX_FRAME_BYTES,
+};
+use cats_blockd::nbd::NbdClient;
+
+// ---------------------------------------------------------------------------
+// Framing: u32 big-endian length + JSON body.
+// ---------------------------------------------------------------------------
+
+pub fn write_frame<W: Write, T: Serialize>(w: &mut W, value: &T) -> std::io::Result<()> {
+    let body = serde_json::to_vec(value).expect("frame serializes");
+    w.write_all(&(body.len() as u32).to_be_bytes())?;
+    w.write_all(&body)?;
+    w.flush()
+}
+
+pub fn read_frame<R: Read, T: for<'a> Deserialize<'a>>(r: &mut R) -> std::io::Result<T> {
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf);
+    if len > MAX_FRAME_BYTES {
+        return Err(std::io::Error::other("oversized frame"));
+    }
+    let mut body = vec![0u8; len as usize];
+    r.read_exact(&mut body)?;
+    serde_json::from_slice(&body).map_err(std::io::Error::other)
+}
+
+// ---------------------------------------------------------------------------
+// Disk map: written by the node agent, re-read on every block operation so
+// hot attach/detach need no push channel.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiskMapEntry {
+    pub socket: PathBuf,
+    pub mount_path: String,
+}
+
+pub type DiskMap = HashMap<String, DiskMapEntry>;
+
+fn load_disk_map(path: &Path) -> DiskMap {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Saved state (Warm snapshot carrier)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedState {
+    boot_id: String,
+    counter: u64,
+}
+
+pub struct GuestAgent {
+    boot_id: String,
+    started: Instant,
+    disk_map_path: PathBuf,
+    /// Monotonic counter surviving Warm (proves process-state continuity).
+    counter: AtomicU64,
+    volumes: Mutex<HashMap<String, NbdClient>>,
+}
+
+impl GuestAgent {
+    pub fn new(disk_map_path: PathBuf, state_file: Option<&Path>) -> Self {
+        let restored: Option<SavedState> = state_file
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        let (boot_id, counter) = match restored {
+            Some(s) => (s.boot_id, s.counter),
+            None => (uuid::Uuid::new_v4().simple().to_string(), 0),
+        };
+        Self {
+            boot_id,
+            started: Instant::now(),
+            disk_map_path,
+            counter: AtomicU64::new(counter),
+            volumes: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn boot_id(&self) -> &str {
+        &self.boot_id
+    }
+
+    fn with_volume<T>(
+        &self,
+        disk_id: &str,
+        f: impl FnOnce(&mut NbdClient) -> Result<T>,
+    ) -> Result<T> {
+        let map = load_disk_map(&self.disk_map_path);
+        let entry = map
+            .get(disk_id)
+            .with_context(|| format!("disk {disk_id} is not attached"))?
+            .clone();
+        let mut volumes = self.volumes.lock().unwrap();
+        if !volumes.contains_key(disk_id) {
+            let client = NbdClient::connect_unix(&entry.socket)
+                .with_context(|| format!("connect volume {disk_id}"))?;
+            volumes.insert(disk_id.to_string(), client);
+        }
+        let client = volumes.get_mut(disk_id).expect("just inserted");
+        let out = f(client);
+        if out.is_err() {
+            // Drop a broken connection so the next call reconnects.
+            volumes.remove(disk_id);
+        }
+        out
+    }
+
+    fn drop_missing_volumes(&self) {
+        let map = load_disk_map(&self.disk_map_path);
+        self.volumes
+            .lock()
+            .unwrap()
+            .retain(|k, _| map.contains_key(k));
+    }
+
+    pub fn handle(&self, req: GuestRequestBody) -> GuestResponseBody {
+        match self.try_handle(req) {
+            Ok(resp) => resp,
+            Err(e) => GuestResponseBody::Error {
+                message: format!("{e:#}"),
+            },
+        }
+    }
+
+    fn try_handle(&self, req: GuestRequestBody) -> Result<GuestResponseBody> {
+        match req {
+            GuestRequestBody::Health => {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+                let disks = load_disk_map(&self.disk_map_path).keys().cloned().collect();
+                Ok(GuestResponseBody::Health {
+                    boot_id: self.boot_id.clone(),
+                    uptime_ms: self.started.elapsed().as_millis() as u64,
+                    disks,
+                })
+            }
+            GuestRequestBody::Exec {
+                command,
+                timeout_ms: _,
+            } => {
+                let (argv0, rest) = command
+                    .split_first()
+                    .context("command must be a non-empty argv array")?;
+                let out = std::process::Command::new(argv0)
+                    .args(rest)
+                    .output()
+                    .with_context(|| format!("spawn {argv0}"))?;
+                Ok(GuestResponseBody::Exec {
+                    exit_code: out.status.code().unwrap_or(-1),
+                    stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                })
+            }
+            GuestRequestBody::Syncfs => {
+                self.drop_missing_volumes();
+                let ids: Vec<String> = load_disk_map(&self.disk_map_path).keys().cloned().collect();
+                for id in ids {
+                    self.with_volume(&id, |c| Ok(c.flush()?))?;
+                }
+                Ok(GuestResponseBody::Ok)
+            }
+            GuestRequestBody::ReadBlock {
+                disk_id,
+                offset,
+                len,
+            } => {
+                let data = self.with_volume(&disk_id, |c| Ok(c.read(offset, len)?))?;
+                Ok(GuestResponseBody::Data {
+                    data_hex: hex::encode(data),
+                })
+            }
+            GuestRequestBody::WriteBlock {
+                disk_id,
+                offset,
+                data_hex,
+            } => {
+                let data = hex::decode(&data_hex).context("data_hex is not valid hex")?;
+                self.with_volume(&disk_id, |c| Ok(c.write(offset, &data)?))?;
+                self.counter.fetch_add(1, Ordering::SeqCst);
+                Ok(GuestResponseBody::Ok)
+            }
+            GuestRequestBody::FlushDisk { disk_id } => {
+                self.with_volume(&disk_id, |c| Ok(c.flush()?))?;
+                Ok(GuestResponseBody::Ok)
+            }
+            GuestRequestBody::SaveState { path } => {
+                let state = SavedState {
+                    boot_id: self.boot_id.clone(),
+                    counter: self.counter.load(Ordering::SeqCst),
+                };
+                let tmp = PathBuf::from(format!("{path}.tmp"));
+                std::fs::write(&tmp, serde_json::to_vec(&state)?)?;
+                std::fs::rename(&tmp, &path)?;
+                Ok(GuestResponseBody::Ok)
+            }
+            GuestRequestBody::Shutdown => {
+                tracing::info!("guest agent shutting down");
+                std::process::exit(0);
+            }
+        }
+    }
+
+    /// Serve the control socket until the process is killed. One thread per
+    /// connection so health checks are never blocked behind a long exec.
+    pub fn serve_control(self: &std::sync::Arc<Self>, listener: UnixListener) {
+        for conn in listener.incoming() {
+            let Ok(mut stream) = conn else { return };
+            let agent = self.clone();
+            std::thread::spawn(move || loop {
+                let req: GuestRequest = match read_frame(&mut stream) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = GuestResponse {
+                    id: req.id,
+                    body: agent.handle(req.body),
+                };
+                if write_frame(&mut stream, &resp).is_err() {
+                    break;
+                }
+            });
+        }
+    }
+
+    /// Minimal HTTP/1.1 web service over a unix socket: the "user workload"
+    /// behind endpoints in dev/tests.
+    pub fn serve_web(&self, listener: UnixListener) {
+        let hits = AtomicU64::new(0);
+        for conn in listener.incoming() {
+            let Ok(mut stream) = conn else { return };
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let mut buf = [0u8; 4096];
+            let n = match stream.read(&mut buf) {
+                Ok(n) if n > 0 => n,
+                _ => continue,
+            };
+            let head = String::from_utf8_lossy(&buf[..n]);
+            let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+            let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+            let body = format!("cat boot_id={} path={} hits={}\n", self.boot_id, path, hit);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: text/plain\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_roundtrip() {
+        let req = GuestRequest {
+            id: 7,
+            body: GuestRequestBody::Health,
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &req).unwrap();
+        let back: GuestRequest = read_frame(&mut &buf[..]).unwrap();
+        assert_eq!(back.id, 7);
+        assert!(matches!(back.body, GuestRequestBody::Health));
+    }
+
+    #[test]
+    fn health_exec_and_state_save_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let map_path = dir.path().join("disks.json");
+        std::fs::write(&map_path, b"{}").unwrap();
+        let agent = GuestAgent::new(map_path.clone(), None);
+        let boot_id = agent.boot_id().to_string();
+
+        match agent.handle(GuestRequestBody::Health) {
+            GuestResponseBody::Health {
+                boot_id: b, disks, ..
+            } => {
+                assert_eq!(b, boot_id);
+                assert!(disks.is_empty());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match agent.handle(GuestRequestBody::Exec {
+            command: vec!["echo".into(), "hello".into()],
+            timeout_ms: None,
+        }) {
+            GuestResponseBody::Exec {
+                exit_code, stdout, ..
+            } => {
+                assert_eq!(exit_code, 0);
+                assert_eq!(stdout.trim(), "hello");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Save state, then "restore" into a new agent: boot_id survives.
+        let state = dir.path().join("state.json");
+        agent.handle(GuestRequestBody::SaveState {
+            path: state.display().to_string(),
+        });
+        let restored = GuestAgent::new(map_path, Some(&state));
+        assert_eq!(restored.boot_id(), boot_id);
+
+        // Unknown disk errors cleanly.
+        match agent.handle(GuestRequestBody::ReadBlock {
+            disk_id: "missing".into(),
+            offset: 0,
+            len: 16,
+        }) {
+            GuestResponseBody::Error { message } => assert!(message.contains("not attached")),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}

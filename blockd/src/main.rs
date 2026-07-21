@@ -57,13 +57,17 @@ struct Args {
 
     #[arg(long, default_value_t = 5_000)]
     lease_ttl_ms: i64,
+
+    /// How long to wait for a held lease to expire before giving up
+    /// (design: a new attachment waits out the old holder's TTL).
+    #[arg(long, default_value_t = 15_000)]
+    acquire_wait_ms: u64,
 }
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_writer(std::io::stderr)
         .init();
@@ -103,17 +107,26 @@ fn main() -> Result<()> {
         _ => bail!("exactly one of --blob-file-root or --blob-s3-endpoint must be given"),
     };
 
-    let engine = ChunkEngine::attach(
-        EngineConfig {
-            volume_id: args.volume_id.clone(),
-            data_dir: args.data_dir.clone(),
-            attachment_id: args.attachment_id.clone(),
-            lease_ttl_ms: args.lease_ttl_ms,
-        },
-        blob,
-        meta,
-    )
-    .context("attach chunk engine")?;
+    let cfg = EngineConfig {
+        volume_id: args.volume_id.clone(),
+        data_dir: args.data_dir.clone(),
+        attachment_id: args.attachment_id.clone(),
+        lease_ttl_ms: args.lease_ttl_ms,
+    };
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(args.acquire_wait_ms);
+    let engine = loop {
+        match ChunkEngine::attach(cfg.clone(), blob.clone(), meta.clone()) {
+            Ok(engine) => break engine,
+            Err(cats_blockd::engine::EngineError::Meta(MetaError::LeaseHeld))
+                if std::time::Instant::now() < deadline =>
+            {
+                tracing::info!("lease held by another attachment; waiting for expiry");
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => return Err(e).context("attach chunk engine"),
+        }
+    };
 
     tracing::info!(
         volume = %args.volume_id,

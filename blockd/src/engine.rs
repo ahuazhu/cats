@@ -14,13 +14,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
-use cats_api::chunk::{self, CHUNK_SIZE, CHUNKS_PER_LEAF};
+use cats_api::chunk::{self, CHUNKS_PER_LEAF, CHUNK_SIZE};
 
 use crate::blobstore::{BlobError, BlobStore};
 use crate::crashpoint;
-use crate::format::{
-    self, ChunkRef, LeafRef, PackEntry, PackHeader, BITMAP_HEADER_LEN,
-};
+use crate::format::{self, ChunkRef, LeafRef, PackEntry, PackHeader, BITMAP_HEADER_LEN};
 use crate::meta::{MetaError, MetadataStore};
 
 #[derive(Debug, thiserror::Error)]
@@ -114,7 +112,9 @@ impl ChunkEngine {
             )));
         }
         if size > chunk::MAX_VOLUME_BYTES {
-            return Err(EngineError::Corrupt("volume exceeds the V1 size limit".into()));
+            return Err(EngineError::Corrupt(
+                "volume exceeds the V1 size limit".into(),
+            ));
         }
         let chunk_count = chunk::chunk_count(size);
 
@@ -143,10 +143,7 @@ impl ChunkEngine {
             state: Mutex::new(EngineState {
                 dirty,
                 map: vec![ChunkRef::Hole; chunk_count as usize],
-                leaf_refs: vec![
-                    LeafRef::Empty;
-                    chunk::leaf_count(size) as usize
-                ],
+                leaf_refs: vec![LeafRef::Empty; chunk::leaf_count(size) as usize],
                 generation: 0,
                 hydrated: vec![false; chunk_count as usize],
                 hydrating: HashSet::new(),
@@ -184,7 +181,9 @@ impl ChunkEngine {
             let stored = format::decode_bitmap_header(&header)
                 .map_err(|e| EngineError::Corrupt(e.to_string()))?;
             if stored != chunk_count {
-                return Err(EngineError::Corrupt("dirty bitmap chunk count mismatch".into()));
+                return Err(EngineError::Corrupt(
+                    "dirty bitmap chunk count mismatch".into(),
+                ));
             }
             let mut words = vec![0u8; (chunk_count * 8) as usize];
             file.read_exact_at(&mut words, BITMAP_HEADER_LEN)?;
@@ -206,13 +205,15 @@ impl ChunkEngine {
         let mut leaf_refs = vec![LeafRef::Empty; chunk::leaf_count(self.size) as usize];
 
         if let (Some(root_hash), Some(root_object)) = (head.root_hash, &head.root_object_id) {
-            let root_bytes =
-                self.blob.get(&chunk::keys::map_node(&self.cfg.volume_id, root_object_hex(root_object)))?;
+            let root_bytes = self.blob.get(&chunk::keys::map_node(
+                &self.cfg.volume_id,
+                root_object_hex(root_object),
+            ))?;
             if format::sha256(&root_bytes) != root_hash {
                 return Err(EngineError::Corrupt("root node hash mismatch".into()));
             }
-            let (vol_size, leaves) =
-                format::decode_root(&root_bytes).map_err(|e| EngineError::Corrupt(e.to_string()))?;
+            let (vol_size, leaves) = format::decode_root(&root_bytes)
+                .map_err(|e| EngineError::Corrupt(e.to_string()))?;
             if vol_size != self.size {
                 return Err(EngineError::Corrupt("root volume size mismatch".into()));
             }
@@ -221,9 +222,10 @@ impl ChunkEngine {
             }
             for (leaf_idx, leaf) in leaves.iter().enumerate() {
                 if let LeafRef::Present { hash, object_id } = leaf {
-                    let bytes = self
-                        .blob
-                        .get(&chunk::keys::map_node(&self.cfg.volume_id, object_id_hex(object_id)))?;
+                    let bytes = self.blob.get(&chunk::keys::map_node(
+                        &self.cfg.volume_id,
+                        object_id_hex(object_id),
+                    ))?;
                     if &format::sha256(&bytes) != hash {
                         return Err(EngineError::Corrupt(format!(
                             "leaf {leaf_idx} hash mismatch"
@@ -357,7 +359,8 @@ impl ChunkEngine {
             let mut entries = Vec::with_capacity(frozen.len());
             for &c in &frozen {
                 let mut chunk_bytes = vec![0u8; CHUNK_SIZE as usize];
-                self.cache.read_exact_at(&mut chunk_bytes, c * CHUNK_SIZE as u64)?;
+                self.cache
+                    .read_exact_at(&mut chunk_bytes, c * CHUNK_SIZE as u64)?;
                 let sha = format::sha256(&chunk_bytes);
                 entries.push(PackEntry {
                     chunk_idx: c,
@@ -367,7 +370,14 @@ impl ChunkEngine {
                 });
                 payload.extend_from_slice(&chunk_bytes);
             }
-            (frozen, base_generation, base_map, base_leaves, payload, entries)
+            (
+                frozen,
+                base_generation,
+                base_map,
+                base_leaves,
+                payload,
+                entries,
+            )
         };
         let _ = frozen;
 
@@ -424,7 +434,8 @@ impl ChunkEngine {
             let bytes =
                 &payload[e.payload_offset as usize..e.payload_offset as usize + e.len as usize];
             let object_id = Self::data_object_id(&header.txn, e.chunk_idx);
-            self.blob.put_immutable(&chunk::keys::data(vol, &object_id), bytes)?;
+            self.blob
+                .put_immutable(&chunk::keys::data(vol, &object_id), bytes)?;
         }
         crashpoint::maybe_crash(crashpoint::AFTER_DATA_UPLOAD);
 
@@ -472,7 +483,8 @@ impl ChunkEngine {
         let root_hash = format::sha256(&root_encoded);
         let root_hex = hex::encode(root_hash);
         let root_object_id = format!("{root_hex}.node");
-        self.blob.put_immutable(&chunk::keys::map_node(vol, &root_hex), &root_encoded)?;
+        self.blob
+            .put_immutable(&chunk::keys::map_node(vol, &root_hex), &root_encoded)?;
         let record = serde_json::json!({
             "txn": header.txn,
             "generation": header.base_generation + 1,
@@ -519,10 +531,7 @@ impl ChunkEngine {
             let bitmap = self.bitmap.lock().unwrap();
             for e in &header.entries {
                 let word = st.dirty[e.chunk_idx as usize];
-                bitmap.write_all_at(
-                    &word.to_le_bytes(),
-                    BITMAP_HEADER_LEN + e.chunk_idx * 8,
-                )?;
+                bitmap.write_all_at(&word.to_le_bytes(), BITMAP_HEADER_LEN + e.chunk_idx * 8)?;
             }
             bitmap.sync_data()?;
         }
@@ -534,7 +543,10 @@ impl ChunkEngine {
     }
 
     fn pack_path(&self, txn: &str) -> PathBuf {
-        self.cfg.data_dir.join("pending").join(format!("{txn}.pack"))
+        self.cfg
+            .data_dir
+            .join("pending")
+            .join(format!("{txn}.pack"))
     }
 
     fn write_pack_file(&self, header: &PackHeader, payload: &[u8]) -> Result<()> {
@@ -560,7 +572,11 @@ impl ChunkEngine {
         let mut packs = Vec::new();
         for entry in fs::read_dir(&dir)? {
             let path = entry?.path();
-            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             if name.ends_with(".pack") {
                 packs.push(path);
             } else if name.starts_with(".tmp-") {
@@ -647,7 +663,11 @@ impl ChunkEngine {
                         st.hydrated[chunk_idx as usize] = true;
                         return Ok(());
                     }
-                    ChunkRef::Base { object_id, len, sha256 } => {
+                    ChunkRef::Base {
+                        object_id,
+                        len,
+                        sha256,
+                    } => {
                         if st.hydrating.contains(&chunk_idx) {
                             let _unused = self
                                 .hydration_cv
@@ -672,16 +692,27 @@ impl ChunkEngine {
         }
     }
 
-    fn hydrate_chunk(&self, chunk_idx: u64, object_id: &str, len: u32, sha: [u8; 32]) -> Result<()> {
+    fn hydrate_chunk(
+        &self,
+        chunk_idx: u64,
+        object_id: &str,
+        len: u32,
+        sha: [u8; 32],
+    ) -> Result<()> {
         let key = chunk::keys::data(&self.cfg.volume_id, object_id);
         let bytes = self.blob.get(&key)?;
         if bytes.len() != len as usize {
-            return Err(EngineError::Corrupt(format!("object {object_id} length mismatch")));
+            return Err(EngineError::Corrupt(format!(
+                "object {object_id} length mismatch"
+            )));
         }
         if format::sha256(&bytes) != sha {
-            return Err(EngineError::Corrupt(format!("object {object_id} checksum mismatch")));
+            return Err(EngineError::Corrupt(format!(
+                "object {object_id} checksum mismatch"
+            )));
         }
-        self.cache.write_all_at(&bytes, chunk_idx * CHUNK_SIZE as u64)?;
+        self.cache
+            .write_all_at(&bytes, chunk_idx * CHUNK_SIZE as u64)?;
         Ok(())
     }
 
@@ -716,7 +747,11 @@ impl ChunkEngine {
 
     fn check_bounds(&self, offset: u64, len: u64) -> Result<()> {
         if offset.checked_add(len).is_none_or(|end| end > self.size) {
-            return Err(EngineError::OutOfBounds { offset, len, size: self.size });
+            return Err(EngineError::OutOfBounds {
+                offset,
+                len,
+                size: self.size,
+            });
         }
         Ok(())
     }
@@ -736,7 +771,9 @@ impl ChunkEngine {
                 if stop.load(Ordering::SeqCst) {
                     return;
                 }
-                let Some(engine) = engine.upgrade() else { return };
+                let Some(engine) = engine.upgrade() else {
+                    return;
+                };
                 if engine.is_fenced() {
                     return;
                 }
@@ -763,11 +800,9 @@ impl ChunkEngine {
             let _ = h.join();
         }
         if !self.is_fenced() {
-            let _ = self.meta.release_lease(
-                &self.cfg.volume_id,
-                &self.cfg.attachment_id,
-                self.epoch,
-            );
+            let _ =
+                self.meta
+                    .release_lease(&self.cfg.volume_id, &self.cfg.attachment_id, self.epoch);
         }
     }
 }
@@ -811,7 +846,12 @@ mod tests {
         let meta = Arc::new(SqliteMeta::open(&dir.path().join("meta.db")).unwrap());
         meta.create_volume(VOL, SIZE).unwrap();
         let data_dir = dir.path().join("data");
-        Env { _dir: dir, blob, meta, data_dir }
+        Env {
+            _dir: dir,
+            blob,
+            meta,
+            data_dir,
+        }
     }
 
     fn attach(env: &Env, attachment: &str) -> Arc<ChunkEngine> {
@@ -834,7 +874,9 @@ mod tests {
     }
 
     fn pattern(len: usize, seed: u8) -> Vec<u8> {
-        (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
     }
 
     #[test]
@@ -945,8 +987,10 @@ mod tests {
             e.detach();
         }
         fs::remove_dir_all(&env.data_dir).unwrap();
-        let counting =
-            Arc::new(CountingBlob { inner: env.blob.clone(), gets: AtomicU64::new(0) });
+        let counting = Arc::new(CountingBlob {
+            inner: env.blob.clone(),
+            gets: AtomicU64::new(0),
+        });
         let e = ChunkEngine::attach(
             EngineConfig::new(VOL, &env.data_dir, "attB"),
             counting.clone(),
@@ -957,7 +1001,11 @@ mod tests {
         let mut z = vec![1u8; 4096];
         e.read(6 * CHUNK_SIZE as u64, &mut z).unwrap();
         assert!(z.iter().all(|&b| b == 0));
-        assert_eq!(counting.gets.load(Ordering::SeqCst), after_attach, "hole read must not GET");
+        assert_eq!(
+            counting.gets.load(Ordering::SeqCst),
+            after_attach,
+            "hole read must not GET"
+        );
         // Reading committed data hydrates exactly once.
         let mut b = vec![0u8; 4096];
         e.read(0, &mut b).unwrap();
@@ -974,7 +1022,10 @@ mod tests {
         // Control plane fences the volume (host presumed lost).
         env.meta.revoke_lease(VOL).unwrap();
         let err = e1.flush().unwrap_err();
-        assert!(matches!(err, EngineError::Meta(_)), "flush must fail after revoke: {err}");
+        assert!(
+            matches!(err, EngineError::Meta(_)),
+            "flush must fail after revoke: {err}"
+        );
         assert!(e1.is_fenced());
         assert!(matches!(e1.write(0, b"x"), Err(EngineError::Fenced)));
         // The new attachment lands on a fresh host and takes over from the
@@ -1014,7 +1065,10 @@ mod tests {
         // Reattach with a healthy store: recovery replays the pack.
         let e = attach(&env, "attB");
         assert_eq!(e.generation(), 1, "recovery must replay the pending pack");
-        assert!(fs::read_dir(env.data_dir.join("pending")).unwrap().next().is_none());
+        assert!(fs::read_dir(env.data_dir.join("pending"))
+            .unwrap()
+            .next()
+            .is_none());
         let mut b = vec![0u8; 2048];
         e.read(0, &mut b).unwrap();
         assert_eq!(b, data);

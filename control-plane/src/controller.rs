@@ -122,16 +122,19 @@ impl Controller {
         match (cat.desired_state, cat.observed_state) {
             (D::Deleted, _) => self.delete_flow(cat).await,
             // Anything that needs compute first goes through the start flow.
-            (D::Running | D::Suspended | D::Warm, O::Creating | O::Cold | O::Failed | O::Starting) => {
-                self.start_flow(cat).await
-            }
+            (
+                D::Running | D::Suspended | D::Warm,
+                O::Creating | O::Cold | O::Failed | O::Starting,
+            ) => self.start_flow(cat).await,
             (D::Running, O::Suspended) => self.simple_transition(cat, "resume").await,
             (D::Running, O::Warm) => self.simple_transition(cat, "restore").await,
             (D::Suspended, O::Running) => self.simple_transition(cat, "suspend").await,
             (D::Warm, O::Running) => self.simple_transition(cat, "suspend").await,
             (D::Warm, O::Suspended) => self.simple_transition(cat, "warm").await,
             (D::Suspended, O::Warm) => self.simple_transition(cat, "restore").await,
-            (D::Cold, O::Running | O::Suspended | O::Warm | O::Starting) => self.stop_flow(cat).await,
+            (D::Cold, O::Running | O::Suspended | O::Warm | O::Starting) => {
+                self.stop_flow(cat).await
+            }
             // Unknown clears via fence_lost_nodes; transitional states are
             // re-driven by their owning flow on the next tick.
             _ => Ok(()),
@@ -206,7 +209,8 @@ impl Controller {
         match self.dispatch(&node.agent_url, &job).await {
             Ok(res) if res.phase == JobPhase::Succeeded => {
                 self.store.set_observed(&cat.id, ObservedState::Running)?;
-                self.store.publish_routes(&cat.id, &node.id, &node.gateway_url)?;
+                self.store
+                    .publish_routes(&cat.id, &node.id, &node.gateway_url)?;
                 self.attempts.lock().unwrap().remove(&attempt_key(cat));
                 self.complete_ops_if_converged(&cat.id).await?;
                 Ok(())
@@ -260,22 +264,30 @@ impl Controller {
         let (job_action, transitional, target): (NodeJobAction, ObservedState, ObservedState) =
             match action {
                 "suspend" => (
-                    NodeJobAction::SuspendCat { cat_id: cat.id.clone() },
+                    NodeJobAction::SuspendCat {
+                        cat_id: cat.id.clone(),
+                    },
                     ObservedState::Suspending,
                     ObservedState::Suspended,
                 ),
                 "resume" => (
-                    NodeJobAction::ResumeCat { cat_id: cat.id.clone() },
+                    NodeJobAction::ResumeCat {
+                        cat_id: cat.id.clone(),
+                    },
                     ObservedState::Starting,
                     ObservedState::Running,
                 ),
                 "warm" => (
-                    NodeJobAction::WarmCat { cat_id: cat.id.clone() },
+                    NodeJobAction::WarmCat {
+                        cat_id: cat.id.clone(),
+                    },
                     ObservedState::Warming,
                     ObservedState::Warm,
                 ),
                 "restore" => (
-                    NodeJobAction::RestoreCat { cat_id: cat.id.clone() },
+                    NodeJobAction::RestoreCat {
+                        cat_id: cat.id.clone(),
+                    },
                     ObservedState::Starting,
                     ObservedState::Running,
                 ),
@@ -291,7 +303,8 @@ impl Controller {
             Ok(res) if res.phase == JobPhase::Succeeded => {
                 self.store.set_observed(&cat.id, target)?;
                 if target == ObservedState::Running {
-                    self.store.publish_routes(&cat.id, &node.id, &node.gateway_url)?;
+                    self.store
+                        .publish_routes(&cat.id, &node.id, &node.gateway_url)?;
                 }
                 self.complete_ops_if_converged(&cat.id).await?;
                 Ok(())
@@ -306,7 +319,9 @@ impl Controller {
                 let cleanup = NodeJob {
                     job_id: nodejob::job_id(&cat.id, cat.generation, "cleanup_cat"),
                     cat_generation: cat.generation,
-                    action: NodeJobAction::CleanupCat { cat_id: cat.id.clone() },
+                    action: NodeJobAction::CleanupCat {
+                        cat_id: cat.id.clone(),
+                    },
                 };
                 let _ = self.dispatch(&node.agent_url, &cleanup).await;
                 self.fence_cat_volumes(cat).await?;
@@ -325,13 +340,19 @@ impl Controller {
             self.complete_ops_if_converged(&cat.id).await?;
             return Ok(());
         };
-        let node = self.store.list_nodes()?.into_iter().find(|n| &n.id == node_id);
+        let node = self
+            .store
+            .list_nodes()?
+            .into_iter()
+            .find(|n| &n.id == node_id);
         self.store.set_observed(&cat.id, ObservedState::Stopping)?;
         if let Some(node) = node {
             let job = NodeJob {
                 job_id: nodejob::job_id(&cat.id, cat.generation, "stop_cat"),
                 cat_generation: cat.generation,
-                action: NodeJobAction::StopCat { cat_id: cat.id.clone() },
+                action: NodeJobAction::StopCat {
+                    cat_id: cat.id.clone(),
+                },
             };
             match self.dispatch(&node.agent_url, &job).await {
                 Ok(res) if res.phase == JobPhase::Succeeded => {}

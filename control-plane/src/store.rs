@@ -19,7 +19,10 @@ use cats_api::resources::*;
 pub type Result<T> = std::result::Result<T, ApiError>;
 
 pub fn now_unix() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
 }
 
 pub fn new_id(prefix: &str) -> String {
@@ -45,12 +48,18 @@ fn is_constraint(e: &rusqlite::Error) -> bool {
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).map_err(internal)?;
-        conn.busy_timeout(std::time::Duration::from_secs(10)).map_err(internal)?;
-        conn.pragma_update(None, "journal_mode", "WAL").map_err(internal)?;
-        conn.pragma_update(None, "synchronous", "FULL").map_err(internal)?;
-        conn.pragma_update(None, "foreign_keys", "ON").map_err(internal)?;
+        conn.busy_timeout(std::time::Duration::from_secs(10))
+            .map_err(internal)?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(internal)?;
+        conn.pragma_update(None, "synchronous", "FULL")
+            .map_err(internal)?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(internal)?;
         conn.execute_batch(SCHEMA).map_err(internal)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T> {
@@ -107,9 +116,26 @@ impl Store {
                 "INSERT INTO cats (id, project, name, image, cpus, memory_mib, root_disk_id,
                                    desired_state, observed_state, generation, created_at)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,'running','creating',1,?8)",
-                params![cat_id, project, name, image, cpus, memory_mib as i64, root_disk_id, now],
+                params![
+                    cat_id,
+                    project,
+                    name,
+                    image,
+                    cpus,
+                    memory_mib as i64,
+                    root_disk_id,
+                    now
+                ],
             )?;
-            insert_disk(&tx, &root_disk_id, &format!("{name}-root"), "root", root_disk_size, &root_volume, "bound")?;
+            insert_disk(
+                &tx,
+                &root_disk_id,
+                &format!("{name}-root"),
+                "root",
+                root_disk_size,
+                &root_volume,
+                "bound",
+            )?;
             tx.execute(
                 "INSERT INTO mount_bindings (id, disk_id, cat_id, mount_path)
                  VALUES (?1,?2,?3,'/')",
@@ -117,7 +143,15 @@ impl Store {
             )?;
             if let Some((dname, dsize, dpath)) = extra_disk {
                 let disk_id = new_id(ids::DISK_PREFIX);
-                insert_disk(&tx, &disk_id, dname, "persistent", dsize, &new_id(ids::VOLUME_PREFIX), "bound")?;
+                insert_disk(
+                    &tx,
+                    &disk_id,
+                    dname,
+                    "persistent",
+                    dsize,
+                    &new_id(ids::VOLUME_PREFIX),
+                    "bound",
+                )?;
                 tx.execute(
                     "INSERT INTO mount_bindings (id, disk_id, cat_id, mount_path)
                      VALUES (?1,?2,?3,?4)",
@@ -128,7 +162,10 @@ impl Store {
         })();
         result.map_err(|e| {
             if is_constraint(&e) {
-                ApiError::new(ErrorCode::AlreadyExists, format!("cat or disk name in use: {e}"))
+                ApiError::new(
+                    ErrorCode::AlreadyExists,
+                    format!("cat or disk name in use: {e}"),
+                )
             } else {
                 internal(e)
             }
@@ -183,7 +220,8 @@ impl Store {
 
     pub fn must_get_cat_by_id(&self, id: &str) -> Result<Cat> {
         self.with(|c| {
-            c.query_row("SELECT * FROM cats WHERE id=?1", params![id], row_to_cat).optional()
+            c.query_row("SELECT * FROM cats WHERE id=?1", params![id], row_to_cat)
+                .optional()
         })?
         .ok_or_else(|| ApiError::not_found(format!("cat {id}")))
     }
@@ -207,7 +245,11 @@ impl Store {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(internal)?;
         let current: Option<i64> = tx
-            .query_row("SELECT generation FROM cats WHERE id=?1", params![cat_id], |r| r.get(0))
+            .query_row(
+                "SELECT generation FROM cats WHERE id=?1",
+                params![cat_id],
+                |r| r.get(0),
+            )
             .optional()
             .map_err(internal)?;
         let current = current.ok_or_else(|| ApiError::not_found(format!("cat {cat_id}")))?;
@@ -241,17 +283,24 @@ impl Store {
 
     pub fn set_placement(&self, cat_id: &str, node_id: Option<&str>) -> Result<()> {
         self.with(|c| {
-            c.execute("UPDATE cats SET node_id=?2 WHERE id=?1", params![cat_id, node_id])
-                .map(|_| ())
+            c.execute(
+                "UPDATE cats SET node_id=?2 WHERE id=?1",
+                params![cat_id, node_id],
+            )
+            .map(|_| ())
         })
     }
 
     pub fn delete_cat_row(&self, cat_id: &str) -> Result<()> {
         self.with(|c| {
-            c.execute("DELETE FROM mount_bindings WHERE cat_id=?1", params![cat_id])?;
+            c.execute(
+                "DELETE FROM mount_bindings WHERE cat_id=?1",
+                params![cat_id],
+            )?;
             c.execute("DELETE FROM endpoints WHERE cat_id=?1", params![cat_id])?;
             c.execute("DELETE FROM routes WHERE cat_id=?1", params![cat_id])?;
-            c.execute("DELETE FROM cats WHERE id=?1", params![cat_id]).map(|_| ())
+            c.execute("DELETE FROM cats WHERE id=?1", params![cat_id])
+                .map(|_| ())
         })
     }
 
@@ -349,7 +398,8 @@ impl Store {
         let mut out = Vec::new();
         for id in ids {
             let d = self.with(|c| {
-                c.query_row("SELECT * FROM disks WHERE id=?1", params![id], row_to_disk).optional()
+                c.query_row("SELECT * FROM disks WHERE id=?1", params![id], row_to_disk)
+                    .optional()
             })?;
             if let Some(mut d) = d {
                 d.bound_cat_id = Some(cat_id.to_string());
@@ -402,7 +452,10 @@ impl Store {
                 "INSERT INTO mount_bindings (id, disk_id, cat_id, mount_path) VALUES (?1,?2,?3,?4)",
                 params![id, disk_id, cat_id, mount_path],
             )?;
-            c.execute("UPDATE disks SET state='bound' WHERE id=?1", params![disk_id])?;
+            c.execute(
+                "UPDATE disks SET state='bound' WHERE id=?1",
+                params![disk_id],
+            )?;
             Ok(())
         })
         .map_err(|e| {
@@ -422,7 +475,10 @@ impl Store {
 
     pub fn unbind_disk(&self, disk_id: &str) -> Result<()> {
         self.with(|c| {
-            c.execute("DELETE FROM mount_bindings WHERE disk_id=?1", params![disk_id])?;
+            c.execute(
+                "DELETE FROM mount_bindings WHERE disk_id=?1",
+                params![disk_id],
+            )?;
             c.execute(
                 "UPDATE disks SET state='available' WHERE id=?1 AND kind='persistent'",
                 params![disk_id],
@@ -443,13 +499,19 @@ impl Store {
 
     pub fn set_disk_size(&self, disk_id: &str, size: u64) -> Result<()> {
         self.with(|c| {
-            c.execute("UPDATE disks SET size_bytes=?2 WHERE id=?1", params![disk_id, size as i64])
-                .map(|_| ())
+            c.execute(
+                "UPDATE disks SET size_bytes=?2 WHERE id=?1",
+                params![disk_id, size as i64],
+            )
+            .map(|_| ())
         })
     }
 
     pub fn delete_disk_row(&self, disk_id: &str) -> Result<()> {
-        self.with(|c| c.execute("DELETE FROM disks WHERE id=?1", params![disk_id]).map(|_| ()))
+        self.with(|c| {
+            c.execute("DELETE FROM disks WHERE id=?1", params![disk_id])
+                .map(|_| ())
+        })
     }
 
     // ------------------------------------------------------------------
@@ -526,8 +588,12 @@ impl Store {
 
     pub fn get_operation(&self, id: &str) -> Result<Operation> {
         self.with(|c| {
-            c.query_row("SELECT * FROM operations WHERE id=?1", params![id], row_to_operation)
-                .optional()
+            c.query_row(
+                "SELECT * FROM operations WHERE id=?1",
+                params![id],
+                row_to_operation,
+            )
+            .optional()
         })?
         .ok_or_else(|| ApiError::not_found(format!("operation {id}")))
     }
@@ -543,7 +609,11 @@ impl Store {
     }
 
     pub fn finish_operation(&self, op_id: &str, error: Option<&ErrorBody>) -> Result<()> {
-        let phase = if error.is_some() { "failed" } else { "succeeded" };
+        let phase = if error.is_some() {
+            "failed"
+        } else {
+            "succeeded"
+        };
         let err_json = error.map(|e| serde_json::to_string(e).expect("error serializes"));
         self.with(|c| {
             c.execute(
@@ -696,7 +766,10 @@ impl Store {
 }
 
 pub fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_millis() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as i64
 }
 
 // ---------------------------------------------------------------------------
@@ -796,7 +869,10 @@ fn row_to_cat(r: &rusqlite::Row<'_>) -> rusqlite::Result<Cat> {
         project: r.get("project")?,
         name: r.get("name")?,
         image: r.get("image")?,
-        spec: CatSpec { cpus: r.get("cpus")?, memory_mib: r.get::<_, i64>("memory_mib")? as u64 },
+        spec: CatSpec {
+            cpus: r.get("cpus")?,
+            memory_mib: r.get::<_, i64>("memory_mib")? as u64,
+        },
         root_disk_id: r.get("root_disk_id")?,
         desired_state: parse_desired(&r.get::<_, String>("desired_state")?),
         observed_state: parse_observed(&r.get::<_, String>("observed_state")?),
@@ -813,7 +889,11 @@ fn row_to_disk(r: &rusqlite::Row<'_>) -> rusqlite::Result<Disk> {
         id: r.get("id")?,
         project: r.get("project")?,
         name: r.get("name")?,
-        kind: if kind == "root" { DiskKind::Root } else { DiskKind::Persistent },
+        kind: if kind == "root" {
+            DiskKind::Root
+        } else {
+            DiskKind::Persistent
+        },
         size_bytes: r.get::<_, i64>("size_bytes")? as u64,
         state: match state.as_str() {
             "creating" => DiskState::Creating,

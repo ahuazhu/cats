@@ -138,5 +138,11 @@ impl NodeJobResult {
 
 /// Derive the idempotent job id.
 pub fn job_id(cat_id: &str, generation: i64, action_kind: &str) -> String {
-    format!("{}{}_{}_{}", crate::ids::JOB_PREFIX, cat_id, generation, action_kind)
+    format!(
+        "{}{}_{}_{}",
+        crate::ids::JOB_PREFIX,
+        cat_id,
+        generation,
+        action_kind
+    )
 }

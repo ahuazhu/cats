@@ -54,7 +54,11 @@ pub struct ErrorBody {
 
 impl ErrorBody {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        Self { code, message: message.into(), request_id: None }
+        Self {
+            code,
+            message: message.into(),
+            request_id: None,
+        }
     }
 }
 
@@ -67,7 +71,10 @@ pub struct ApiError {
 
 impl ApiError {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self {
+            code,
+            message: message.into(),
+        }
     }
     pub fn not_found(what: impl std::fmt::Display) -> Self {
         Self::new(ErrorCode::NotFound, format!("{what} not found"))

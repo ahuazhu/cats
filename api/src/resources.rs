@@ -39,7 +39,10 @@ pub enum ObservedState {
 impl ObservedState {
     /// Whether a wake request must go through a full cold start.
     pub fn requires_cold_start(self) -> bool {
-        matches!(self, ObservedState::Cold | ObservedState::Failed | ObservedState::Unknown)
+        matches!(
+            self,
+            ObservedState::Cold | ObservedState::Failed | ObservedState::Unknown
+        )
     }
 }
 

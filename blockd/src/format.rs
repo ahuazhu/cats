@@ -23,7 +23,11 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChunkRef {
     Hole,
-    Base { object_id: String, len: u32, sha256: [u8; 32] },
+    Base {
+        object_id: String,
+        len: u32,
+        sha256: [u8; 32],
+    },
 }
 
 impl ChunkRef {
@@ -77,7 +81,11 @@ pub fn encode_leaf(first_chunk: u64, entries: &[ChunkRef]) -> Vec<u8> {
     for e in entries {
         match e {
             ChunkRef::Hole => out.push(0),
-            ChunkRef::Base { object_id, len, sha256 } => {
+            ChunkRef::Base {
+                object_id,
+                len,
+                sha256,
+            } => {
                 out.push(1);
                 let id = object_id.as_bytes();
                 out.extend_from_slice(&(id.len() as u16).to_le_bytes());
@@ -112,7 +120,11 @@ pub fn decode_leaf(mut buf: &[u8]) -> Result<(u64, Vec<ChunkRef>), FormatError> 
                     .to_string();
                 let len = take_u32(b, "leaf")?;
                 let sha: [u8; 32] = take(b, 32, "leaf")?.try_into().unwrap();
-                entries.push(ChunkRef::Base { object_id: id, len, sha256: sha });
+                entries.push(ChunkRef::Base {
+                    object_id: id,
+                    len,
+                    sha256: sha,
+                });
             }
             _ => return Err(FormatError::Malformed("leaf")),
         }
@@ -176,7 +188,10 @@ pub fn decode_root(mut buf: &[u8]) -> Result<(u64, Vec<LeafRef>), FormatError> {
                 let id = std::str::from_utf8(take(b, id_len, "root")?)
                     .map_err(|_| FormatError::Malformed("root"))?
                     .to_string();
-                leaves.push(LeafRef::Present { hash, object_id: id });
+                leaves.push(LeafRef::Present {
+                    hash,
+                    object_id: id,
+                });
             }
             _ => return Err(FormatError::Malformed("root")),
         }
@@ -286,7 +301,11 @@ mod tests {
     fn leaf_roundtrip_and_hash_stability() {
         let entries = vec![
             ChunkRef::Hole,
-            ChunkRef::Base { object_id: "txn1-c1".into(), len: CHUNK_SIZE, sha256: [7u8; 32] },
+            ChunkRef::Base {
+                object_id: "txn1-c1".into(),
+                len: CHUNK_SIZE,
+                sha256: [7u8; 32],
+            },
             ChunkRef::Hole,
         ];
         let enc = encode_leaf(0, &entries);
@@ -301,7 +320,10 @@ mod tests {
     fn root_roundtrip() {
         let leaves = vec![
             LeafRef::Empty,
-            LeafRef::Present { hash: [9u8; 32], object_id: "abc.node".into() },
+            LeafRef::Present {
+                hash: [9u8; 32],
+                object_id: "abc.node".into(),
+            },
         ];
         let enc = encode_root(1 << 30, &leaves);
         let (size, dec) = decode_root(&enc).unwrap();

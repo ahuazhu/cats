@@ -48,7 +48,10 @@ impl FileBlobStore {
             key: root.display().to_string(),
             source: e,
         })?;
-        Ok(Self { root, tmp_seq: AtomicU64::new(0) })
+        Ok(Self {
+            root,
+            tmp_seq: AtomicU64::new(0),
+        })
     }
 
     fn path_for(&self, key: &str) -> PathBuf {
@@ -62,7 +65,10 @@ impl FileBlobStore {
     }
 
     fn io_err(key: &str, source: std::io::Error) -> BlobError {
-        BlobError::Io { key: key.to_string(), source }
+        BlobError::Io {
+            key: key.to_string(),
+            source,
+        }
     }
 }
 
@@ -164,7 +170,10 @@ pub struct FaultyBlobStore {
 
 impl FaultyBlobStore {
     pub fn new(inner: Arc<dyn BlobStore>) -> Self {
-        Self { inner, fail_puts: AtomicU64::new(0) }
+        Self {
+            inner,
+            fail_puts: AtomicU64::new(0),
+        }
     }
 }
 
@@ -217,11 +226,17 @@ mod tests {
         store.put_immutable("volumes/v1/data/a", b"hello").unwrap();
         // Different content is rejected.
         assert!(store.put_immutable("volumes/v1/data/a", b"other").is_err());
-        assert!(matches!(store.get("volumes/v1/data/missing"), Err(BlobError::NotFound(_))));
+        assert!(matches!(
+            store.get("volumes/v1/data/missing"),
+            Err(BlobError::NotFound(_))
+        ));
         store.put_immutable("volumes/v1/maps/x.node", b"n").unwrap();
         assert_eq!(
             store.list("volumes/v1/").unwrap(),
-            vec!["volumes/v1/data/a".to_string(), "volumes/v1/maps/x.node".to_string()]
+            vec![
+                "volumes/v1/data/a".to_string(),
+                "volumes/v1/maps/x.node".to_string()
+            ]
         );
         store.delete("volumes/v1/data/a").unwrap();
         assert!(!store.exists("volumes/v1/data/a").unwrap());

@@ -23,15 +23,30 @@ pub enum GuestRequestBody {
     /// from cold boot (new id) — the correctness oracle from the experiments.
     Health,
     /// Run a command inside the guest.
-    Exec { command: Vec<String>, #[serde(default)] timeout_ms: Option<u64> },
+    Exec {
+        command: Vec<String>,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
     /// Flush guest filesystems (fake guest: flush volume writers).
     Syncfs,
     /// Read from an attached volume (fake guest block I/O path).
-    ReadBlock { disk_id: String, offset: u64, len: u32 },
+    ReadBlock {
+        disk_id: String,
+        offset: u64,
+        len: u32,
+    },
     /// Write to an attached volume. Data is hex-encoded to stay in JSON.
-    WriteBlock { disk_id: String, offset: u64, data_hex: String },
+    WriteBlock {
+        disk_id: String,
+        offset: u64,
+        data_hex: String,
+    },
     /// Issue a durable FLUSH on an attached volume.
     FlushDisk { disk_id: String },
+    /// Persist process identity/state to a file (Warm snapshot carrier in the
+    /// fake VMM; the real VMM snapshots memory instead).
+    SaveState { path: String },
     /// Graceful shutdown of the guest agent.
     Shutdown,
 }
@@ -46,9 +61,21 @@ pub struct GuestResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum GuestResponseBody {
-    Health { boot_id: String, uptime_ms: u64, disks: Vec<String> },
-    Exec { exit_code: i32, stdout: String, stderr: String },
+    Health {
+        boot_id: String,
+        uptime_ms: u64,
+        disks: Vec<String>,
+    },
+    Exec {
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+    },
     Ok,
-    Data { data_hex: String },
-    Error { message: String },
+    Data {
+        data_hex: String,
+    },
+    Error {
+        message: String,
+    },
 }

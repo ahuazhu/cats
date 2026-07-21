@@ -107,5 +107,10 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
     let reconciler_task = tokio::spawn(controller.run(interval));
 
     tracing::info!(%addr, "control plane ready");
-    Ok(Handle { addr, state, server_task, reconciler_task })
+    Ok(Handle {
+        addr,
+        state,
+        server_task,
+        reconciler_task,
+    })
 }

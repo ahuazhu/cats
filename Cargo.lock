@@ -251,12 +251,13 @@ dependencies = [
  "cats-api",
  "cats-blockd",
  "clap",
+ "hex",
  "serde",
  "serde_json",
  "tempfile",
- "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -285,7 +286,9 @@ dependencies = [
  "axum",
  "cats-api",
  "cats-blockd",
+ "cats-guest-agent",
  "clap",
+ "hex",
  "libc",
  "reqwest",
  "serde",

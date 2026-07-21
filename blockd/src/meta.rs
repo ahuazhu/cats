@@ -48,7 +48,10 @@ pub enum MetaError {
 pub type Result<T> = std::result::Result<T, MetaError>;
 
 pub fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_millis() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as i64
 }
 
 /// Authoritative metadata operations. All implementations must be safe for
@@ -105,9 +108,12 @@ pub struct SqliteMeta {
 impl SqliteMeta {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).map_err(sql_err)?;
-        conn.busy_timeout(std::time::Duration::from_secs(10)).map_err(sql_err)?;
-        conn.pragma_update(None, "journal_mode", "WAL").map_err(sql_err)?;
-        conn.pragma_update(None, "synchronous", "FULL").map_err(sql_err)?;
+        conn.busy_timeout(std::time::Duration::from_secs(10))
+            .map_err(sql_err)?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(sql_err)?;
+        conn.pragma_update(None, "synchronous", "FULL")
+            .map_err(sql_err)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS volumes (
                 volume_id TEXT PRIMARY KEY,
@@ -129,7 +135,9 @@ impl SqliteMeta {
             );",
         )
         .map_err(sql_err)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 }
 
@@ -178,10 +186,16 @@ impl MetadataStore for SqliteMeta {
 
     fn delete_volume(&self, volume_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM volumes WHERE volume_id = ?1", params![volume_id])
-            .map_err(sql_err)?;
-        conn.execute("DELETE FROM snapshots WHERE volume_id = ?1", params![volume_id])
-            .map_err(sql_err)?;
+        conn.execute(
+            "DELETE FROM volumes WHERE volume_id = ?1",
+            params![volume_id],
+        )
+        .map_err(sql_err)?;
+        conn.execute(
+            "DELETE FROM snapshots WHERE volume_id = ?1",
+            params![volume_id],
+        )
+        .map_err(sql_err)?;
         Ok(())
     }
 
@@ -330,7 +344,9 @@ impl MetadataStore for SqliteMeta {
             )
             .map_err(sql_err)?;
         if n != 1 {
-            return Err(MetaError::CasConflict { expected: expected_generation });
+            return Err(MetaError::CasConflict {
+                expected: expected_generation,
+            });
         }
         Ok(expected_generation + 1)
     }
@@ -407,7 +423,10 @@ mod tests {
     fn volume_lifecycle_and_head() {
         let (_d, m) = store();
         m.create_volume("v1", 1 << 22).unwrap();
-        assert!(matches!(m.create_volume("v1", 1), Err(MetaError::AlreadyExists(_))));
+        assert!(matches!(
+            m.create_volume("v1", 1),
+            Err(MetaError::AlreadyExists(_))
+        ));
         let head = m.load_head("v1").unwrap();
         assert_eq!(head.generation, 0);
         assert!(head.root_hash.is_none());
@@ -421,15 +440,24 @@ mod tests {
         let e1 = m.acquire_lease("v1", "attA", 60_000).unwrap();
         assert_eq!(e1, 1);
         // Another attachment cannot steal an unexpired lease.
-        assert!(matches!(m.acquire_lease("v1", "attB", 60_000), Err(MetaError::LeaseHeld)));
+        assert!(matches!(
+            m.acquire_lease("v1", "attB", 60_000),
+            Err(MetaError::LeaseHeld)
+        ));
         m.renew_lease("v1", "attA", e1, 60_000).unwrap();
         // Revoke fences the current holder.
         m.revoke_lease("v1").unwrap();
-        assert!(matches!(m.renew_lease("v1", "attA", e1, 60_000), Err(MetaError::Fenced)));
+        assert!(matches!(
+            m.renew_lease("v1", "attA", e1, 60_000),
+            Err(MetaError::Fenced)
+        ));
         let e2 = m.acquire_lease("v1", "attB", 60_000).unwrap();
         assert_eq!(e2, 2);
         // Old epoch renew still fails even though owner column changed.
-        assert!(matches!(m.renew_lease("v1", "attA", e1, 60_000), Err(MetaError::Fenced)));
+        assert!(matches!(
+            m.renew_lease("v1", "attA", e1, 60_000),
+            Err(MetaError::Fenced)
+        ));
     }
 
     #[test]
@@ -442,7 +470,9 @@ mod tests {
         // Wrong expected generation.
         assert!(m.cas_head("v1", 0, [2; 32], "obj2", "attA", epoch).is_err());
         // Wrong epoch.
-        assert!(m.cas_head("v1", 1, [2; 32], "obj2", "attA", epoch + 1).is_err());
+        assert!(m
+            .cas_head("v1", 1, [2; 32], "obj2", "attA", epoch + 1)
+            .is_err());
         // Fenced holder cannot CAS.
         m.revoke_lease("v1").unwrap();
         assert!(m.cas_head("v1", 1, [2; 32], "obj2", "attA", epoch).is_err());

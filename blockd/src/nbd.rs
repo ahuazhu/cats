@@ -373,7 +373,11 @@ impl NbdClient {
             }
         }
         let size = size.ok_or_else(|| NbdError::Protocol("no export info".into()))?;
-        Ok(Self { stream, size, next_handle: 1 })
+        Ok(Self {
+            stream,
+            size,
+            next_handle: 1,
+        })
     }
 
     pub fn size(&self) -> u64 {
@@ -433,7 +437,14 @@ impl NbdClient {
     }
 
     pub fn write_fua(&mut self, offset: u64, data: &[u8]) -> NbdResult<()> {
-        self.roundtrip(CMD_WRITE, CMD_FLAG_FUA, offset, data.len() as u32, Some(data), false)?;
+        self.roundtrip(
+            CMD_WRITE,
+            CMD_FLAG_FUA,
+            offset,
+            data.len() as u32,
+            Some(data),
+            false,
+        )?;
         Ok(())
     }
 
@@ -470,9 +481,14 @@ mod tests {
     fn engine(dir: &Path) -> Arc<ChunkEngine> {
         let blob = Arc::new(FileBlobStore::open(dir.join("blob")).unwrap());
         let meta = Arc::new(SqliteMeta::open(&dir.join("meta.db")).unwrap());
-        meta.create_volume("vol_nbd", 4 * cats_api::chunk::CHUNK_SIZE as u64).unwrap();
-        ChunkEngine::attach(EngineConfig::new("vol_nbd", dir.join("data"), "att1"), blob, meta)
-            .unwrap()
+        meta.create_volume("vol_nbd", 4 * cats_api::chunk::CHUNK_SIZE as u64)
+            .unwrap();
+        ChunkEngine::attach(
+            EngineConfig::new("vol_nbd", dir.join("data"), "att1"),
+            blob,
+            meta,
+        )
+        .unwrap()
     }
 
     #[test]

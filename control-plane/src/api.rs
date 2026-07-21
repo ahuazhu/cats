@@ -20,9 +20,13 @@ pub struct Failure(pub ApiError);
 
 impl IntoResponse for Failure {
     fn into_response(self) -> Response {
-        let status =
-            StatusCode::from_u16(self.0.code.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let body = ErrorBody { code: self.0.code, message: self.0.message, request_id: None };
+        let status = StatusCode::from_u16(self.0.code.http_status())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let body = ErrorBody {
+            code: self.0.code,
+            message: self.0.message,
+            request_id: None,
+        };
         (status, Json(body)).into_response()
     }
 }
@@ -44,12 +48,19 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
     if ok {
         Ok(())
     } else {
-        Err(ApiError::new(ErrorCode::Unauthenticated, "missing or invalid bearer token").into())
+        Err(ApiError::new(
+            ErrorCode::Unauthenticated,
+            "missing or invalid bearer token",
+        )
+        .into())
     }
 }
 
 fn idem_key(headers: &HeaderMap) -> Option<String> {
-    headers.get("idempotency-key").and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+    headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
 }
 
 fn if_match(headers: &HeaderMap) -> Option<i64> {
@@ -63,15 +74,39 @@ fn if_match(headers: &HeaderMap) -> Option<i64> {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .route("/v1/projects/{project}/cats", post(create_cat).get(list_cats))
-        .route("/v1/projects/{project}/cats/{cat}", get(get_cat).delete(delete_cat))
-        .route("/v1/projects/{project}/cats/{cat}/actions/{verb}", post(cat_action))
+        .route(
+            "/v1/projects/{project}/cats",
+            post(create_cat).get(list_cats),
+        )
+        .route(
+            "/v1/projects/{project}/cats/{cat}",
+            get(get_cat).delete(delete_cat),
+        )
+        .route(
+            "/v1/projects/{project}/cats/{cat}/actions/{verb}",
+            post(cat_action),
+        )
         .route("/v1/projects/{project}/cats/{cat}/exec", post(exec_cat))
-        .route("/v1/projects/{project}/cats/{cat}/endpoints", post(create_endpoint).get(list_endpoints))
-        .route("/v1/projects/{project}/disks", post(create_disk).get(list_disks))
-        .route("/v1/projects/{project}/disks/{disk}", get(get_disk).delete(delete_disk))
-        .route("/v1/projects/{project}/disks/{disk}/actions/{verb}", post(disk_action))
-        .route("/v1/projects/{project}/disks/{disk}/snapshots", post(create_snapshot).get(list_snapshots))
+        .route(
+            "/v1/projects/{project}/cats/{cat}/endpoints",
+            post(create_endpoint).get(list_endpoints),
+        )
+        .route(
+            "/v1/projects/{project}/disks",
+            post(create_disk).get(list_disks),
+        )
+        .route(
+            "/v1/projects/{project}/disks/{disk}",
+            get(get_disk).delete(delete_disk),
+        )
+        .route(
+            "/v1/projects/{project}/disks/{disk}/actions/{verb}",
+            post(disk_action),
+        )
+        .route(
+            "/v1/projects/{project}/disks/{disk}/snapshots",
+            post(create_snapshot).get(list_snapshots),
+        )
         .route("/v1/operations/{id}", get(get_operation))
         .route("/v1/nodes/register", post(register_node))
         .route("/v1/nodes/heartbeat", post(heartbeat))
@@ -93,7 +128,12 @@ async fn create_cat(
     Json(req): Json<CreateCatRequest>,
 ) -> ApiResult<Response> {
     check_auth(&state, &headers)?;
-    if req.name.is_empty() || !req.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+    if req.name.is_empty()
+        || !req
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
         return Err(ApiError::invalid("cat name must be non-empty [a-z0-9-]").into());
     }
     let route = format!("POST /cats {project}/{}", req.name);
@@ -101,11 +141,17 @@ async fn create_cat(
         if let Some(op_id) = state.store.idempotency_lookup(&key, &route)? {
             let op = state.store.get_operation(&op_id)?;
             let cat = state.store.must_get_cat_by_id(&op.resource_id)?;
-            return Ok((StatusCode::ACCEPTED, Json(CatOperationResponse { operation: op, cat }))
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(CatOperationResponse { operation: op, cat }),
+            )
                 .into_response());
         }
     }
-    let extra = req.disk.as_ref().map(|d| (d.name.as_str(), d.size_bytes, d.mount_at.as_str()));
+    let extra = req
+        .disk
+        .as_ref()
+        .map(|d| (d.name.as_str(), d.size_bytes, d.mount_at.as_str()));
     let (cat, _disks, op) = state.store.create_cat(
         &project,
         &req.name,
@@ -119,7 +165,11 @@ async fn create_cat(
         state.store.idempotency_store(&key, &route, &op.id)?;
     }
     state.notify.notify_one();
-    Ok((StatusCode::ACCEPTED, Json(CatOperationResponse { operation: op, cat })).into_response())
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(CatOperationResponse { operation: op, cat }),
+    )
+        .into_response())
 }
 
 async fn list_cats(
@@ -128,7 +178,9 @@ async fn list_cats(
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<Cat>>> {
     check_auth(&state, &headers)?;
-    Ok(Json(ListResponse { items: state.store.list_cats(&project)? }))
+    Ok(Json(ListResponse {
+        items: state.store.list_cats(&project)?,
+    }))
 }
 
 async fn get_cat(
@@ -159,17 +211,27 @@ async fn cat_action(
         if let Some(op_id) = state.store.idempotency_lookup(&key, &route)? {
             let op = state.store.get_operation(&op_id)?;
             let cat = state.store.must_get_cat_by_id(&cat.id)?;
-            return Ok((StatusCode::ACCEPTED, Json(CatOperationResponse { operation: op, cat }))
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(CatOperationResponse { operation: op, cat }),
+            )
                 .into_response());
         }
     }
-    let op = state.store.set_desired(&cat.id, desired, if_match(&headers), &format!("cat.{verb}"))?;
+    let op =
+        state
+            .store
+            .set_desired(&cat.id, desired, if_match(&headers), &format!("cat.{verb}"))?;
     if let Some(key) = idem_key(&headers) {
         state.store.idempotency_store(&key, &route, &op.id)?;
     }
     state.notify.notify_one();
     let cat = state.store.must_get_cat_by_id(&cat.id)?;
-    Ok((StatusCode::ACCEPTED, Json(CatOperationResponse { operation: op, cat })).into_response())
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(CatOperationResponse { operation: op, cat }),
+    )
+        .into_response())
 }
 
 async fn delete_cat(
@@ -179,10 +241,21 @@ async fn delete_cat(
 ) -> ApiResult<Response> {
     check_auth(&state, &headers)?;
     let cat = state.store.get_cat(&project, &cat)?;
-    let op = state.store.set_desired(&cat.id, DesiredState::Deleted, if_match(&headers), "cat.delete")?;
+    let op = state.store.set_desired(
+        &cat.id,
+        DesiredState::Deleted,
+        if_match(&headers),
+        "cat.delete",
+    )?;
     state.notify.notify_one();
     let cat_snapshot = state.store.must_get_cat_by_id(&cat.id)?;
-    Ok((StatusCode::ACCEPTED, Json(CatOperationResponse { operation: op, cat: cat_snapshot }))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(CatOperationResponse {
+            operation: op,
+            cat: cat_snapshot,
+        }),
+    )
         .into_response())
 }
 
@@ -205,7 +278,11 @@ async fn exec_cat(
         .into_iter()
         .find(|n| Some(&n.id) == cat.node_id.as_ref())
         .ok_or_else(|| ApiError::unavailable("cat has no live node"))?;
-    let url = format!("{}/v1/cats/{}/exec", node.agent_url.trim_end_matches('/'), cat.id);
+    let url = format!(
+        "{}/v1/cats/{}/exec",
+        node.agent_url.trim_end_matches('/'),
+        cat.id
+    );
     let resp = state
         .controller
         .http
@@ -218,8 +295,10 @@ async fn exec_cat(
     if !resp.status().is_success() {
         return Err(ApiError::unavailable(format!("exec failed: {}", resp.status())).into());
     }
-    let out: ExecResponse =
-        resp.json().await.map_err(|e| ApiError::internal(format!("bad exec response: {e}")))?;
+    let out: ExecResponse = resp
+        .json()
+        .await
+        .map_err(|e| ApiError::internal(format!("bad exec response: {e}")))?;
     Ok(Json(out))
 }
 
@@ -229,7 +308,9 @@ pub async fn ensure_running(state: &AppState, cat: Cat) -> ApiResult<Cat> {
         return Ok(cat);
     }
     if cat.desired_state != DesiredState::Running {
-        state.store.set_desired(&cat.id, DesiredState::Running, None, "cat.wake")?;
+        state
+            .store
+            .set_desired(&cat.id, DesiredState::Running, None, "cat.wake")?;
     }
     state.notify.notify_one();
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -263,7 +344,9 @@ async fn create_disk(
     if req.size_bytes == 0 || req.size_bytes > cats_api::chunk::MAX_VOLUME_BYTES {
         return Err(ApiError::invalid("disk size out of range").into());
     }
-    let disk = state.store.create_disk(&project, &req.name, req.size_bytes)?;
+    let disk = state
+        .store
+        .create_disk(&project, &req.name, req.size_bytes)?;
     // Create the storage volume eagerly so snapshots/resize work pre-attach.
     let size = cats_api::chunk::round_up_to_chunk(req.size_bytes);
     match state.storage_meta.create_volume(&disk.volume_id, size) {
@@ -279,7 +362,9 @@ async fn list_disks(
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<Disk>>> {
     check_auth(&state, &headers)?;
-    Ok(Json(ListResponse { items: state.store.list_disks(&project)? }))
+    Ok(Json(ListResponse {
+        items: state.store.list_disks(&project)?,
+    }))
 }
 
 async fn get_disk(
@@ -332,8 +417,12 @@ async fn disk_action(
     let disk = state.store.get_disk(&project, &disk)?;
     match verb.as_str() {
         "mount" => {
-            let cat_ref = body.cat_id.ok_or_else(|| ApiError::invalid("cat_id required"))?;
-            let mount_at = body.mount_at.ok_or_else(|| ApiError::invalid("mount_at required"))?;
+            let cat_ref = body
+                .cat_id
+                .ok_or_else(|| ApiError::invalid("cat_id required"))?;
+            let mount_at = body
+                .mount_at
+                .ok_or_else(|| ApiError::invalid("mount_at required"))?;
             let cat = state.store.get_cat(&project, &cat_ref)?;
             if disk.kind == DiskKind::Root {
                 return Err(ApiError::failed_precondition("cannot mount a root disk").into());
@@ -364,11 +453,14 @@ async fn disk_action(
             Ok(StatusCode::NO_CONTENT.into_response())
         }
         "resize" => {
-            let new_size = body.size_bytes.ok_or_else(|| ApiError::invalid("size_bytes required"))?;
+            let new_size = body
+                .size_bytes
+                .ok_or_else(|| ApiError::invalid("size_bytes required"))?;
             if disk.bound_cat_id.is_some() {
-                return Err(
-                    ApiError::failed_precondition("v1 resize requires the disk to be Available").into()
-                );
+                return Err(ApiError::failed_precondition(
+                    "v1 resize requires the disk to be Available",
+                )
+                .into());
             }
             if new_size < disk.size_bytes {
                 return Err(ApiError::invalid("shrink is not supported").into());
@@ -450,10 +542,14 @@ async fn dispatch_or_unavailable(
     if !resp.status().is_success() {
         return Err(ApiError::unavailable(format!("node agent returned {}", resp.status())).into());
     }
-    let result: cats_api::nodejob::NodeJobResult =
-        resp.json().await.map_err(|e| ApiError::internal(e.to_string()))?;
+    let result: cats_api::nodejob::NodeJobResult = resp
+        .json()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     if result.phase != cats_api::nodejob::JobPhase::Succeeded {
-        return Err(ApiError::unavailable(result.error.unwrap_or_else(|| "job failed".into())).into());
+        return Err(
+            ApiError::unavailable(result.error.unwrap_or_else(|| "job failed".into())).into(),
+        );
     }
     Ok(())
 }
@@ -524,11 +620,24 @@ async fn create_endpoint(
 ) -> ApiResult<Json<EndpointResponse>> {
     check_auth(&state, &headers)?;
     let cat = state.store.get_cat(&project, &cat)?;
-    let ep = state.store.create_endpoint(&cat, &req.name, req.target_port, &req.protocol, req.wake_policy)?;
+    let ep = state.store.create_endpoint(
+        &cat,
+        &req.name,
+        req.target_port,
+        &req.protocol,
+        req.wake_policy,
+    )?;
     // If the cat is already running, bind the route immediately.
     if let (ObservedState::Running, Some(node_id)) = (cat.observed_state, &cat.node_id) {
-        if let Some(node) = state.store.list_nodes()?.into_iter().find(|n| &n.id == node_id) {
-            state.store.publish_routes(&cat.id, &node.id, &node.gateway_url)?;
+        if let Some(node) = state
+            .store
+            .list_nodes()?
+            .into_iter()
+            .find(|n| &n.id == node_id)
+        {
+            state
+                .store
+                .publish_routes(&cat.id, &node.id, &node.gateway_url)?;
         }
     }
     Ok(Json(EndpointResponse { endpoint: ep }))
@@ -541,11 +650,13 @@ async fn list_endpoints(
 ) -> ApiResult<Json<ListResponse<Endpoint>>> {
     check_auth(&state, &headers)?;
     let cat = state.store.get_cat(&project, &cat)?;
-    Ok(Json(ListResponse { items: state.store.endpoints_for_cat(&cat.id)? }))
+    Ok(Json(ListResponse {
+        items: state.store.endpoints_for_cat(&cat.id)?,
+    }))
 }
 
 #[derive(serde::Deserialize)]
-struct ResolveQuery {
+pub(crate) struct ResolveQuery {
     hostname: String,
 }
 
@@ -601,7 +712,13 @@ async fn register_node(
     Json(req): Json<RegisterNodeRequest>,
 ) -> ApiResult<StatusCode> {
     check_auth(&state, &headers)?;
-    state.store.register_node(&req.node_id, &req.agent_url, &req.gateway_url, req.cpus, req.memory_mib)?;
+    state.store.register_node(
+        &req.node_id,
+        &req.agent_url,
+        &req.gateway_url,
+        req.cpus,
+        req.memory_mib,
+    )?;
     state.notify.notify_one();
     Ok(StatusCode::NO_CONTENT)
 }
@@ -648,7 +765,9 @@ async fn list_nodes(
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<Node>>> {
     check_auth(&state, &headers)?;
-    Ok(Json(ListResponse { items: state.store.list_nodes()? }))
+    Ok(Json(ListResponse {
+        items: state.store.list_nodes()?,
+    }))
 }
 
 /// Public wake handler used by the gateway (`POST /v1/routes/wake?hostname=`).
@@ -670,4 +789,3 @@ async fn get_operation(
     check_auth(&state, &headers)?;
     Ok(Json(state.store.get_operation(&id)?))
 }
-

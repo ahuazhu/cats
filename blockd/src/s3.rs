@@ -40,7 +40,10 @@ impl S3BlobStore {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(60))
             .build()
-            .map_err(|e| BlobError::Backend { key: "<client>".into(), message: e.to_string() })?;
+            .map_err(|e| BlobError::Backend {
+                key: "<client>".into(),
+                message: e.to_string(),
+            })?;
         Ok(Self { cfg, client })
     }
 
@@ -54,7 +57,9 @@ impl S3BlobStore {
 
     fn host(&self) -> String {
         let e = self.cfg.endpoint.trim_end_matches('/');
-        e.trim_start_matches("https://").trim_start_matches("http://").to_string()
+        e.trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .to_string()
     }
 
     fn url(&self, path: &str, query: &[(String, String)]) -> String {
@@ -75,7 +80,10 @@ impl S3BlobStore {
         body: &[u8],
         key_for_errors: &str,
     ) -> Result<(u16, Vec<u8>)> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
         let (amz_date, date_stamp) = amz_timestamp(now as i64);
         let payload_hash = hex::encode(Sha256::digest(body));
         let host = self.host();
@@ -108,13 +116,17 @@ impl S3BlobStore {
             }
         }
         req = req.header("authorization", auth);
-        let resp = req
-            .send()
-            .map_err(|e| BlobError::Backend { key: key_for_errors.into(), message: e.to_string() })?;
+        let resp = req.send().map_err(|e| BlobError::Backend {
+            key: key_for_errors.into(),
+            message: e.to_string(),
+        })?;
         let status = resp.status().as_u16();
         let bytes = resp
             .bytes()
-            .map_err(|e| BlobError::Backend { key: key_for_errors.into(), message: e.to_string() })?
+            .map_err(|e| BlobError::Backend {
+                key: key_for_errors.into(),
+                message: e.to_string(),
+            })?
             .to_vec();
         Ok((status, bytes))
     }
@@ -213,7 +225,9 @@ impl BlobStore for S3BlobStore {
                 .first()
                 .is_some_and(|v| v == "true");
             if truncated {
-                token = extract_tags(&xml, "NextContinuationToken").into_iter().next();
+                token = extract_tags(&xml, "NextContinuationToken")
+                    .into_iter()
+                    .next();
                 if token.is_none() {
                     break;
                 }
@@ -262,7 +276,11 @@ fn canonical_query(query: &[(String, String)]) -> String {
         .map(|(k, v)| (uri_encode(k, true), uri_encode(v, true)))
         .collect();
     pairs.sort();
-    pairs.into_iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")
+    pairs
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -281,10 +299,12 @@ pub fn sign_v4(
 ) -> String {
     let mut sorted = headers.to_vec();
     sorted.sort();
-    let canonical_headers: String =
-        sorted.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
-    let signed_headers =
-        sorted.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
+    let canonical_headers: String = sorted.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
+    let signed_headers = sorted
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .collect::<Vec<_>>()
+        .join(";");
     let canonical_request = format!(
         "{method}\n{canonical_path}\n{}\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
         canonical_query(query)
@@ -294,7 +314,10 @@ pub fn sign_v4(
         "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
         hex::encode(Sha256::digest(canonical_request.as_bytes()))
     );
-    let k_date = hmac(format!("AWS4{secret_key}").as_bytes(), date_stamp.as_bytes());
+    let k_date = hmac(
+        format!("AWS4{secret_key}").as_bytes(),
+        date_stamp.as_bytes(),
+    );
     let k_region = hmac(&k_date, region.as_bytes());
     let k_service = hmac(&k_region, service.as_bytes());
     let k_signing = hmac(&k_service, b"aws4_request");
@@ -401,7 +424,10 @@ mod tests {
 
     #[test]
     fn uri_encoding_rules() {
-        assert_eq!(uri_encode("volumes/v1/data/a b", false), "volumes/v1/data/a%20b");
+        assert_eq!(
+            uri_encode("volumes/v1/data/a b", false),
+            "volumes/v1/data/a%20b"
+        );
         assert_eq!(uri_encode("a/b", true), "a%2Fb");
         assert_eq!(uri_encode("A-Z_a.z~0", true), "A-Z_a.z~0");
     }

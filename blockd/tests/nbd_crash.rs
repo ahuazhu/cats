@@ -19,7 +19,9 @@ struct TestEnv {
 
 impl TestEnv {
     fn new() -> Self {
-        Self { dir: tempfile::tempdir().unwrap() }
+        Self {
+            dir: tempfile::tempdir().unwrap(),
+        }
     }
     fn meta_path(&self) -> PathBuf {
         self.dir.path().join("meta.db")
@@ -116,7 +118,9 @@ impl Drop for Server {
 }
 
 fn pattern(len: usize, seed: u8) -> Vec<u8> {
-    (0..len).map(|i| (i as u8).wrapping_mul(29).wrapping_add(seed)).collect()
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(29).wrapping_add(seed))
+        .collect()
 }
 
 fn read_all(client: &mut NbdClient) -> Vec<u8> {
@@ -159,15 +163,26 @@ fn crash_matrix_every_window_recovers_exactly_once() {
             client.write(2 * CHUNK + 999, &data1).unwrap();
             // The server aborts mid-flush: the client sees an I/O failure.
             let err = client.flush().unwrap_err();
-            assert!(matches!(err, NbdError::Io(_)), "{point}: expected io error, got {err:?}");
+            assert!(
+                matches!(err, NbdError::Io(_)),
+                "{point}: expected io error, got {err:?}"
+            );
             server.wait_exit(Duration::from_secs(10));
         }
         // Same-host restart with the same attachment id (allowed lease
         // re-acquire) and no crash point: recovery must converge.
         let mut server = Server::spawn(&env, "a", "att_a", None);
         let mut client = server.connect();
-        assert_eq!(client.read(0, 64_000).unwrap(), data0, "{point}: data0 lost");
-        assert_eq!(client.read(2 * CHUNK + 999, 120_000).unwrap(), data1, "{point}: data1 lost");
+        assert_eq!(
+            client.read(0, 64_000).unwrap(),
+            data0,
+            "{point}: data0 lost"
+        );
+        assert_eq!(
+            client.read(2 * CHUNK + 999, 120_000).unwrap(),
+            data1,
+            "{point}: data1 lost"
+        );
         client.disconnect().unwrap();
         drop(server);
 
@@ -242,6 +257,9 @@ fn empty_cache_cold_restore_preserves_digest() {
     let mut client = server.connect();
     let digest_after = read_all(&mut client);
     assert_eq!(digest_before.len(), digest_after.len());
-    assert!(digest_before == digest_after, "cold restore digest mismatch");
+    assert!(
+        digest_before == digest_after,
+        "cold restore digest mismatch"
+    );
     client.disconnect().unwrap();
 }

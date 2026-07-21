@@ -50,7 +50,11 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Jso
 }
 
 async fn stub_exec(Json(req): Json<ExecRequest>) -> Json<ExecResponse> {
-    Json(ExecResponse { exit_code: 0, stdout: req.command.join(" "), stderr: String::new() })
+    Json(ExecResponse {
+        exit_code: 0,
+        stdout: req.command.join(" "),
+        stderr: String::new(),
+    })
 }
 
 async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
@@ -62,7 +66,10 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
     };
     let app = Router::new()
         .route("/v1/jobs", post(stub_job))
-        .route("/v1/cats/{id}/exec", post(|_: axum::extract::Path<String>, req: Json<ExecRequest>| stub_exec(req)))
+        .route(
+            "/v1/cats/{id}/exec",
+            post(|_: axum::extract::Path<String>, req: Json<ExecRequest>| stub_exec(req)),
+        )
         .with_state(node.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -101,12 +108,19 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
                 .lock()
                 .unwrap()
                 .iter()
-                .map(|(id, st)| HeartbeatCat { cat_id: id.clone(), generation: 0, state: *st })
+                .map(|(id, st)| HeartbeatCat {
+                    cat_id: id.clone(),
+                    generation: 0,
+                    state: *st,
+                })
                 .collect();
             let _ = client
                 .post(format!("{base}/v1/nodes/heartbeat"))
                 .bearer_auth("dev-token")
-                .json(&HeartbeatRequest { node_id: hb.id.clone(), cats })
+                .json(&HeartbeatRequest {
+                    node_id: hb.id.clone(),
+                    cats,
+                })
                 .send()
                 .await;
         }
@@ -128,7 +142,11 @@ impl Ctx {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let cp = spawn(Config::dev(dir.path())).await.unwrap();
-        Self { _dir: dir, cp, http: reqwest::Client::new() }
+        Self {
+            _dir: dir,
+            cp,
+            http: reqwest::Client::new(),
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -151,7 +169,10 @@ impl Ctx {
             if cat.observed_state == want {
                 return cat;
             }
-            assert!(std::time::Instant::now() < deadline, "timed out waiting {want:?} for {name}");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting {want:?} for {name}"
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
@@ -172,7 +193,10 @@ impl Ctx {
             if op.phase.is_terminal() {
                 return op;
             }
-            assert!(std::time::Instant::now() < deadline, "operation {op_id} never finished");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "operation {op_id} never finished"
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
@@ -244,8 +268,12 @@ async fn create_converges_and_idempotency_replays() {
     assert_eq!(resp.status(), 409);
 
     // Unauthenticated requests are rejected.
-    let resp =
-        ctx.http.get(ctx.url("/v1/projects/default/cats")).send().await.unwrap();
+    let resp = ctx
+        .http
+        .get(ctx.url("/v1/projects/default/cats"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 401);
 }
 
@@ -285,7 +313,10 @@ async fn rwo_second_bind_is_rejected() {
         .http
         .post(ctx.url("/v1/projects/default/disks"))
         .bearer_auth("dev-token")
-        .json(&CreateDiskRequest { name: "shared".into(), size_bytes: 8 << 20 })
+        .json(&CreateDiskRequest {
+            name: "shared".into(),
+            size_bytes: 8 << 20,
+        })
         .send()
         .await
         .unwrap()
@@ -294,9 +325,7 @@ async fn rwo_second_bind_is_rejected() {
         .unwrap();
     assert_eq!(disk.state, DiskState::Available);
 
-    let mount = |cat: &str| {
-        serde_json::json!({ "cat_id": cat, "mount_at": "/data" })
-    };
+    let mount = |cat: &str| serde_json::json!({ "cat_id": cat, "mount_at": "/data" });
     let r1 = ctx
         .http
         .post(ctx.url("/v1/projects/default/disks/shared/actions/mount"))
@@ -305,7 +334,11 @@ async fn rwo_second_bind_is_rejected() {
         .send()
         .await
         .unwrap();
-    assert!(r1.status().is_success(), "first mount failed: {}", r1.status());
+    assert!(
+        r1.status().is_success(),
+        "first mount failed: {}",
+        r1.status()
+    );
 
     let r2 = ctx
         .http
@@ -374,7 +407,10 @@ async fn node_loss_fences_and_reschedules() {
         {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "never rescheduled to node_b");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never rescheduled to node_b"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
@@ -392,7 +428,10 @@ async fn exec_wakes_a_cold_cat() {
         .http
         .post(ctx.url("/v1/projects/default/cats/dev/exec"))
         .bearer_auth("dev-token")
-        .json(&ExecRequest { command: vec!["echo".into(), "hi".into()], timeout_ms: None })
+        .json(&ExecRequest {
+            command: vec!["echo".into(), "hi".into()],
+            timeout_ms: None,
+        })
         .send()
         .await
         .unwrap();
@@ -412,7 +451,10 @@ async fn destroy_deletes_root_disk_and_keeps_persistent() {
     ctx.http
         .post(ctx.url("/v1/projects/default/disks"))
         .bearer_auth("dev-token")
-        .json(&CreateDiskRequest { name: "keep".into(), size_bytes: 8 << 20 })
+        .json(&CreateDiskRequest {
+            name: "keep".into(),
+            size_bytes: 8 << 20,
+        })
         .send()
         .await
         .unwrap();
