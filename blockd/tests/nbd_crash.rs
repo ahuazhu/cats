@@ -222,7 +222,7 @@ fn fenced_writer_gets_eperm_and_new_host_takes_over() {
 #[test]
 fn empty_cache_cold_restore_preserves_digest() {
     let env = TestEnv::new();
-    let mut digest_before = Vec::new();
+    let digest_before;
     {
         let mut server = Server::spawn(&env, "a", "att_a", None);
         let mut client = server.connect();

@@ -209,6 +209,7 @@ dependencies = [
  "anyhow",
  "axum",
  "cats-api",
+ "cats-blockd",
  "clap",
  "rand",
  "reqwest",

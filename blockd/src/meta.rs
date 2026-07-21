@@ -58,6 +58,9 @@ pub trait MetadataStore: Send + Sync {
     fn create_volume(&self, volume_id: &str, size_bytes: u64) -> Result<()>;
     fn load_head(&self, volume_id: &str) -> Result<VolumeHead>;
     fn delete_volume(&self, volume_id: &str) -> Result<()>;
+    /// Grow-only resize; rejected while a live lease exists (V1 requires the
+    /// disk to be detached).
+    fn resize_volume(&self, volume_id: &str, new_size_bytes: u64) -> Result<()>;
 
     /// Acquire the single-writer lease. Succeeds only when no unexpired lease
     /// is held by a different attachment; always bumps the fencing epoch.
@@ -179,6 +182,36 @@ impl MetadataStore for SqliteMeta {
             .map_err(sql_err)?;
         conn.execute("DELETE FROM snapshots WHERE volume_id = ?1", params![volume_id])
             .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn resize_volume(&self, volume_id: &str, new_size_bytes: u64) -> Result<()> {
+        let now = now_ms();
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute(
+                "UPDATE volumes SET size_bytes = ?2
+                  WHERE volume_id = ?1 AND size_bytes <= ?2
+                    AND (lease_owner IS NULL OR lease_expires_at_ms <= ?3)",
+                params![volume_id, new_size_bytes as i64, now],
+            )
+            .map_err(sql_err)?;
+        if n == 0 {
+            let exists: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM volumes WHERE volume_id = ?1",
+                    params![volume_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(sql_err)?;
+            return match exists {
+                None => Err(MetaError::NotFound(volume_id.to_string())),
+                Some(_) => Err(MetaError::Backend(
+                    "resize rejected: shrink not allowed or lease active".into(),
+                )),
+            };
+        }
         Ok(())
     }
 

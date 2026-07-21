@@ -1,3 +1,6 @@
 //! Cats control plane: Resource API, operations, scheduler and controllers.
 
-pub mod placeholder {}
+pub mod api;
+pub mod controller;
+pub mod server;
+pub mod store;

@@ -302,7 +302,7 @@ pub enum NbdError {
 
 pub type NbdResult<T> = std::result::Result<T, NbdError>;
 
-trait ReadWriteSend: Read + Write + Send {}
+pub trait ReadWriteSend: Read + Write + Send {}
 impl<T: Read + Write + Send> ReadWriteSend for T {}
 
 /// Synchronous userspace NBD client.
