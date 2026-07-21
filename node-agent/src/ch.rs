@@ -42,7 +42,7 @@ pub struct ChConfig {
 }
 
 /// Per-cat runtime state that only exists in CH mode.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ChRuntime {
     pub api_sock: PathBuf,
     pub vsock_sock: PathBuf,
@@ -236,7 +236,13 @@ pub fn spawn_vmm(s: &ChSpawn<'_>) -> Result<Child> {
                 .arg(format!("size={}M", s.memory_mib.max(128)));
             cmd.arg("--vsock")
                 .arg(format!("cid=3,socket={}", s.vsock_sock.display()));
-            let mut disk_args: Vec<String> = s.disks.iter().map(|d| format!("path={d}")).collect();
+            // image_type=raw is required: CH v53 otherwise auto-detects raw
+            // and enables a sector-0 write protection that fails ext4 writes.
+            let mut disk_args: Vec<String> = s
+                .disks
+                .iter()
+                .map(|d| format!("path={d},image_type=raw"))
+                .collect();
             cmd.arg("--disk").args(disk_args.drain(..));
             cmd.arg("--serial")
                 .arg(format!("file={}", s.serial_log.display()));
@@ -252,8 +258,11 @@ pub fn spawn_vmm(s: &ChSpawn<'_>) -> Result<Child> {
 pub fn wait_api_ready(api_sock: &Path, child: &mut Child) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if ch_api(api_sock, "GET", "/api/v1/vm.ping", None).is_ok() {
-            return Ok(());
+        // vmm.ping (not vm.ping): confirms the VMM HTTP thread is serving.
+        if let Ok((status, _)) = ch_api(api_sock, "GET", "/api/v1/vmm.ping", None) {
+            if (200..300).contains(&status) {
+                return Ok(());
+            }
         }
         if let Some(status) = child.try_wait()? {
             bail!("cloud-hypervisor exited during startup: {status}");

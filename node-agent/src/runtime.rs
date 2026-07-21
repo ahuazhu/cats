@@ -425,9 +425,11 @@ impl NodeRuntime {
                 chrt.nbd.insert(grant.disk_id.clone(), dev.clone());
                 disks.push(dev);
             }
-            // 4. VMM.
+            // 4. VMM. Store the child in `rt` immediately so a failure in
+            //    readiness/health still lets `teardown` kill it (no orphan
+            //    holding the api socket).
             let serial_log = dir.join("serial.log");
-            let mut vmm = ch::spawn_vmm(&ch::ChSpawn {
+            let vmm = ch::spawn_vmm(&ch::ChSpawn {
                 cfg: chc,
                 api_sock: &chrt.api_sock,
                 vsock_sock: &chrt.vsock_sock,
@@ -437,11 +439,12 @@ impl NodeRuntime {
                 disks: &disks,
                 restore_from: snapshot_dir.as_deref(),
             })?;
-            ch::wait_api_ready(&chrt.api_sock, &mut vmm)?;
+            rt.guest = Some(vmm);
+            rt.ch = Some(chrt.clone());
+            ch::wait_api_ready(&chrt.api_sock, rt.guest.as_mut().unwrap())?;
             if warm_restore {
                 ch::resume(&chrt.api_sock)?;
             }
-            rt.guest = Some(vmm);
             // 5. Guest agent over vsock.
             let conn = GuestConn::Vsock(chrt.vsock_sock.clone(), GUEST_VSOCK_PORT);
             let deadline = Instant::now() + Duration::from_secs(60);
