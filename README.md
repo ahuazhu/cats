@@ -2,7 +2,7 @@
 
 Cats 是一个从零实现的独立项目：为用户提供可休眠、可迁移、带持久块设备和稳定网络入口的 Linux microVM。
 
-仓库包含**完整的 Rust workspace 实现（V1 开发形态）**与全部设计文档、实验证据：存储引擎（Direct-OS ChunkStore）、控制面、node-agent、guest-agent、CLI、Endpoint 网关，以及覆盖崩溃注入、fencing、跨节点冷恢复的 46 个自动化测试（单元 + 集成 + 端到端）。KVM/Cloud Hypervisor/vhost-user 的真实虚拟化接入是 Linux 里程碑（见下文"实现状态"）。
+仓库包含**完整的 Rust workspace 实现**与全部设计文档、实验证据：存储引擎（Direct-OS ChunkStore，S3 后端经 MinIO 实测）、控制面、node-agent（FakeVmm + **Cloud Hypervisor 真 microVM 模式**）、guest-agent（vsock）、CLI、Endpoint 网关，以及覆盖崩溃注入、fencing、跨节点冷恢复的 48 个自动化测试（macOS 与 Linux 双平台全绿）。裸金属部署与验收见 [deploy/metal/](deploy/metal/README.md)。
 
 ## Greenfield 边界
 
