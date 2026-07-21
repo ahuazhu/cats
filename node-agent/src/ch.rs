@@ -14,7 +14,7 @@
 //! 2026-07-21 experiments) with the snapshot on local disk.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -65,16 +65,49 @@ pub fn ch_api(sock: &Path, method: &str, path: &str, body: Option<&str>) -> Resu
         body.len()
     );
     stream.write_all(req.as_bytes())?;
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw)?;
-    let text = String::from_utf8_lossy(&raw);
-    let status: u16 = text
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
+
+    // Cloud Hypervisor keeps its API connections alive even when the client
+    // asks for `Connection: close`. Read the HTTP message according to its
+    // Content-Length instead of waiting for EOF (which otherwise turns every
+    // successful API call into a read timeout).
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line)?;
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
         .and_then(|c| c.parse().ok())
         .context("malformed CH api response")?;
-    let payload = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+
+    let mut content_length = None;
+    let mut header_bytes = status_line.len();
+    loop {
+        let mut line = String::new();
+        let read = reader.read_line(&mut line)?;
+        anyhow::ensure!(read > 0, "truncated CH api response headers");
+        header_bytes += read;
+        anyhow::ensure!(
+            header_bytes <= 64 * 1024,
+            "oversized CH api response headers"
+        );
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = Some(
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .context("invalid CH api Content-Length")?,
+                );
+            }
+        }
+    }
+
+    let mut payload = vec![0; content_length.unwrap_or(0)];
+    reader.read_exact(&mut payload)?;
+    let payload = String::from_utf8(payload).context("CH api response body is not UTF-8")?;
     Ok((status, payload))
 }
 
@@ -302,4 +335,39 @@ pub fn shutdown_vmm(api_sock: &Path, child: &mut Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+    use std::sync::mpsc;
+
+    #[test]
+    fn ch_api_uses_content_length_without_waiting_for_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("ch-api.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let count = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..count]).contains("/api/v1/vmm.ping"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 \r\nConnection: keep-alive\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}",
+                )
+                .unwrap();
+            // Reproduce CH v53: keep the connection open after the complete
+            // response. The client must still return immediately.
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+
+        let (status, body) = ch_api(&sock, "GET", "/api/v1/vmm.ping", None).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, r#"{"ok":true}"#);
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
 }

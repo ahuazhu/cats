@@ -61,6 +61,10 @@ sudo deploy/metal/e2e.sh
 动的内核、写文件+sync、suspend/resume 同 boot、warm 后无常驻 VMM、restore 同
 boot 且文件在、stop/start 换 boot 且数据从 durable 层恢复、destroy。
 
+2026-07-21 的 AWS i4i.metal + 真实 S3 验收结果与失败诊断记录保存在
+[`experiments/metal-e2e-20260721/`](../../experiments/metal-e2e-20260721/README.md)：
+最终 `17 passed, 0 failed`。这是单次正确性验收，不是性能样本或生产 SLA。
+
 手动玩法与本地 CLI 相同（`cats create/exec/suspend/warm/...`）。
 
 ## 5. 已知边界（Phase A）

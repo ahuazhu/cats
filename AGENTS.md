@@ -2,7 +2,7 @@
 
 ## Repository state
 
-The repository contains the full Rust workspace implementation (V1 dev shape) plus architecture documents and validated experiments. Implemented and tested: ChunkStore engine (`blockd/`, spec in `docs/specs/blockd-protocol.md`), control plane, node agent (FakeVmm), guest agent, CLI, endpoint gateway — 46 automated tests including crash injection, fencing and cross-node cold restore. NOT yet implemented: real KVM/Cloud Hypervisor/vhost-user integration, tap/overlay networking, PostgreSQL metadata store (SQLite dev stand-in keeps the spec's SQL shape) — these are the Linux milestone. Do not infer other modules exist because a design document names them; check the workspace.
+The repository contains the full Rust workspace implementation (V1 dev shape) plus architecture documents and validated experiments. Implemented and tested: ChunkStore engine (`blockd/`, spec in `docs/specs/blockd-protocol.md`), control plane, node agent (FakeVmm plus a Cloud Hypervisor Phase-A path), guest agent (Unix socket plus real-Guest vsock), CLI, endpoint gateway — 49 automated workspace tests including crash injection, fencing and cross-node cold restore. The Cloud Hypervisor path has also passed the 17-check AWS bare-metal acceptance run recorded under `experiments/metal-e2e-20260721/`. NOT yet implemented: native vhost-user-blk (Phase A uses kernel NBD), tap/overlay Guest networking, PostgreSQL metadata store (SQLite dev stand-in keeps the spec's SQL shape), and privilege separation. Do not infer other modules exist because a design document names them; check the workspace.
 
 Quality gates for any change: `cargo test --workspace` green and `cargo clippy --workspace --all-targets` warning-free.
 

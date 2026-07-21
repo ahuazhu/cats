@@ -1,0 +1,8 @@
+== cleanup from previous runs ==
+== 1. cold create -> real VM boots ==
+  FAIL  create converges to running (wanted 'observed=running', got 'error: operation op_390481c6e0b7 failed: start failed after retries: guest never became healthy over vsock')
+  FAIL  guest runs the direct-boot kernel (wanted '6.17.0-1019-aws', got '')
+  FAIL  no boot_id
+== 2. durable write through the real ext4 root ==
+  FAIL  guest write failed
+== 3. suspend/resume (vm.pause/resume): same boot ==

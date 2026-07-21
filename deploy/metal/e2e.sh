@@ -42,7 +42,10 @@ check "boot_id preserved across suspend/resume" "$boot1" "$(boot_id)"
 
 echo "== 4. warm (vm.snapshot + full exit) / restore: same boot =="
 out=$($CATS warm $CAT 2>&1);     check "warm"    "observed=warm"      "$out"
-if pgrep -f "cloud-hypervisor.*$CAT" >/dev/null 2>&1; then bad "VMM still resident while Warm"; else ok "no resident VMM while Warm"; fi
+# Match the VMM executable itself. cats-noded's arguments contain both the
+# cloud-hypervisor path and (in this test deployment) an S3 bucket containing
+# "metal-e2e", so a loose `pgrep -f` produces a false positive.
+if pgrep -f '^/usr/local/bin/cloud-hypervisor( |$)' >/dev/null 2>&1; then bad "VMM still resident while Warm"; else ok "no resident VMM while Warm"; fi
 out=$($CATS resume $CAT 2>&1);   check "restore" "observed=running"   "$out"
 check "boot_id preserved across warm/restore" "$boot1" "$(boot_id)"
 check "file survives warm" "metal-persistent-data" "$($CATS exec $CAT -- cat /data.txt 2>/dev/null)"

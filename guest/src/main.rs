@@ -61,15 +61,19 @@ fn main() -> Result<()> {
         std::thread::spawn(move || agent.serve_web(listener));
     }
 
-    let listener = match (&args.control_socket, args.vsock_port) {
+    match (&args.control_socket, args.vsock_port) {
         (Some(path), None) => {
             let _ = std::fs::remove_file(path);
-            UnixListener::bind(path).context("bind control socket")?
+            let listener = UnixListener::bind(path).context("bind control socket")?;
+            println!("READY");
+            agent.serve_control(listener);
         }
-        (None, Some(port)) => bind_vsock(port).context("bind vsock control port")?,
+        (None, Some(port)) => {
+            let listener = bind_vsock(port).context("bind vsock control port")?;
+            println!("READY");
+            agent.serve_vsock_control(listener)?;
+        }
         _ => anyhow::bail!("exactly one of --control-socket or --vsock-port must be given"),
-    };
-    println!("READY");
-    agent.serve_control(listener);
+    }
     Ok(())
 }

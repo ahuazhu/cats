@@ -1,0 +1,14 @@
+date_utc=2026-07-21
+cloud=AWS
+region=us-east-1
+instance_type=i4i.metal
+os=Ubuntu 24.04 x86_64
+kernel=6.17.0-1019-aws
+kvm=present
+cloud_hypervisor=v53.0
+rustc=1.97.1
+CONFIG_VSOCKETS=m
+CONFIG_VIRTIO_VSOCKETS=m
+durable_blobstore=temporary real AWS S3 bucket in us-east-1
+post_run_cloud_hypervisor_processes=0
+post_run_attached_nbd_devices=0

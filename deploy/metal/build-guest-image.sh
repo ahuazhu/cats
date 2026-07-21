@@ -40,6 +40,25 @@ resolve_modules() {
   done | awk '!seen[$0]++'
 }
 
+# Ubuntu kernels ship modules compressed, while busybox `insmod` expects an
+# uncompressed ELF module. Copy each dependency in load order and normalize
+# it to a plain .ko inside the guest image.
+copy_module() {
+  src=$1
+  dest=$2
+  name=$(basename "$src")
+  name=${name%.zst}
+  name=${name%.xz}
+  name=${name%.gz}
+  case "$src" in
+    *.zst) zstd -q -d -c "$src" > "$dest/$name" ;;
+    *.xz)  xz -d -c "$src" > "$dest/$name" ;;
+    *.gz)  gzip -d -c "$src" > "$dest/$name" ;;
+    *)     cp "$src" "$dest/$name" ;;
+  esac
+  printf '%s\n' "$dest/$name"
+}
+
 # --------------------------------------------------------------------------
 # 2. Initramfs: load virtio/ext4, mount /dev/vda, switch_root.
 # --------------------------------------------------------------------------
@@ -51,9 +70,11 @@ INITRD_MODULES=$(resolve_modules virtio_pci virtio_blk ext4)
 n=0
 : > "$IR/modules.order"
 for m in $INITRD_MODULES; do
-  base=$(printf '%03d' "$n")-$(basename "$m")
-  cp "$m" "$IR/lib/modules/$base"
-  echo "/lib/modules/$base" >> "$IR/modules.order"
+  base=$(printf '%03d' "$n")
+  copied=$(copy_module "$m" "$IR/lib/modules")
+  named="$IR/lib/modules/$base-$(basename "$copied")"
+  mv "$copied" "$named"
+  echo "/lib/modules/$(basename "$named")" >> "$IR/modules.order"
   n=$((n+1))
 done
 
@@ -62,7 +83,9 @@ cat > "$IR/init" <<'EOF'
 /bin/busybox mount -t proc proc /proc
 /bin/busybox mount -t sysfs sys /sys
 /bin/busybox mount -t devtmpfs dev /dev
-while read -r m; do /bin/busybox insmod "$m" 2>/dev/null; done < /modules.order
+while read -r m; do
+  /bin/busybox insmod "$m" || echo "failed to load initramfs module: $m"
+done < /modules.order
 i=0
 while [ ! -b /dev/vda ] && [ $i -lt 100 ]; do /bin/busybox sleep 0.1; i=$((i+1)); done
 /bin/busybox mount -o rw /dev/vda /newroot || exec /bin/busybox sh
@@ -88,9 +111,11 @@ VSOCK_MODULES=$(resolve_modules vmw_vsock_virtio_transport)
 n=0
 : > "$RF/etc/cats-modules.order"
 for m in $VSOCK_MODULES; do
-  base=$(printf '%03d' "$n")-$(basename "$m")
-  cp "$m" "$RF/lib/cats-modules/$base"
-  echo "/lib/cats-modules/$base" >> "$RF/etc/cats-modules.order"
+  base=$(printf '%03d' "$n")
+  copied=$(copy_module "$m" "$RF/lib/cats-modules")
+  named="$RF/lib/cats-modules/$base-$(basename "$copied")"
+  mv "$copied" "$named"
+  echo "/lib/cats-modules/$(basename "$named")" >> "$RF/etc/cats-modules.order"
   n=$((n+1))
 done
 
@@ -99,7 +124,9 @@ cat > "$RF/sbin/init" <<'EOF'
 /bin/busybox mount -t proc proc /proc 2>/dev/null
 /bin/busybox mount -t sysfs sys /sys 2>/dev/null
 /bin/busybox mount -t devtmpfs dev /dev 2>/dev/null
-while read -r m; do /bin/busybox insmod "$m" 2>/dev/null; done < /etc/cats-modules.order
+while read -r m; do
+  /bin/busybox insmod "$m" || echo "failed to load guest module: $m"
+done < /etc/cats-modules.order
 /bin/busybox hostname cat
 echo "cats guest up (kernel $(/bin/busybox uname -r))"
 while true; do

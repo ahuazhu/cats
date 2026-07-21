@@ -2,7 +2,7 @@
 
 Cats 是一个从零实现的独立项目：为用户提供可休眠、可迁移、带持久块设备和稳定网络入口的 Linux microVM。
 
-仓库包含**完整的 Rust workspace 实现**与全部设计文档、实验证据：存储引擎（Direct-OS ChunkStore，S3 后端经 MinIO 实测）、控制面、node-agent（FakeVmm + **Cloud Hypervisor 真 microVM 模式**）、guest-agent（vsock）、CLI、Endpoint 网关，以及覆盖崩溃注入、fencing、跨节点冷恢复的 48 个自动化测试（macOS 与 Linux 双平台全绿）。裸金属部署与验收见 [deploy/metal/](deploy/metal/README.md)。
+仓库包含**完整的 Rust workspace 实现**与全部设计文档、实验证据：存储引擎（Direct-OS ChunkStore，S3 后端经 MinIO 实测）、控制面、node-agent（FakeVmm + **Cloud Hypervisor 真 microVM 模式**）、guest-agent（vsock）、CLI、Endpoint 网关，以及覆盖崩溃注入、fencing、跨节点冷恢复的 49 个自动化测试（macOS 与 Linux 双平台全绿）。裸金属部署与验收见 [deploy/metal/](deploy/metal/README.md)。
 
 ## Greenfield 边界
 
@@ -69,7 +69,7 @@ docs/                     架构、决策、协议规格和实验报告
 | 层 | 状态 | 说明 |
 |---|---|---|
 | 存储引擎（blockd） | ✅ 实现并测试 | 协议见 [docs/specs/blockd-protocol.md](docs/specs/blockd-protocol.md)；4 个提交窗口 kill -9 恢复、空缓存冷恢复、stale epoch 拒绝均有测试 |
-| 控制面 / CLI / 网关 / node-agent / guest-agent | ✅ 实现并测试 | 单元 + 集成 + E2E 共 46 个测试 |
+| 控制面 / CLI / 网关 / node-agent / guest-agent | ✅ 实现并测试 | workspace 单元 + 集成 + E2E 共 49 个测试 |
 | S3 BlobStore | ✅ 代码 + 签名向量测试 | SigV4 通过 AWS 官方测试向量；对真实 S3/MinIO 的联测按需运行 |
 | 元数据存储 | SQLite（开发） | 与规格同 SQL 形状；生产 PostgreSQL 为后续替换项 |
 | 虚拟化 | FakeVmm + **Cloud Hypervisor 模式**（`--vmm ch`，Linux+KVM） | CH 直接内核启动、vsock Guest Agent、vm.pause/resume、Warm=vm.snapshot/--restore；块路径 Phase A 走内核 NBD（正确性等价，vhost-user 为性能里程碑）；部署见 `deploy/metal/` |
@@ -79,7 +79,7 @@ docs/                     架构、决策、协议规格和实验报告
 
 ```bash
 cargo build --workspace          # 全部组件
-cargo test --workspace           # 46 个测试：单元 + 崩溃注入 + 控制面契约 + E2E
+cargo test --workspace           # 49 个测试：单元 + 崩溃注入 + 控制面契约 + E2E
 cargo clippy --workspace --all-targets   # 零警告
 ```
 

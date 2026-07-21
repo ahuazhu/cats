@@ -1,0 +1,26 @@
+== cleanup from previous runs ==
+== 1. cold create -> real VM boots ==
+  FAIL  create converges to running (wanted 'observed=running', got 'error: operation op_4fa6a956b489 failed: start failed after retries: timed out waiting for CH api socket')
+  FAIL  guest runs the direct-boot kernel (wanted '6.17.0-1019-aws', got '')
+  FAIL  no boot_id
+== 2. durable write through the real ext4 root ==
+  FAIL  guest write failed
+== 3. suspend/resume (vm.pause/resume): same boot ==
+  FAIL  suspend (wanted 'observed=suspended', got 'error: operation op_ff5392d51777 failed: start failed after retries: timed out waiting for CH api socket')
+  FAIL  resume (wanted 'observed=running', got 'error: operation op_664398fee881 did not finish in time')
+  PASS  boot_id preserved across suspend/resume
+== 4. warm (vm.snapshot + full exit) / restore: same boot ==
+  FAIL  warm (wanted 'observed=warm', got 'error: operation op_c80d7ee59e7b failed: start failed after retries: timed out waiting for CH api socket')
+  FAIL  VMM still resident while Warm
+  FAIL  restore (wanted 'observed=running', got 'error: operation op_1fb8e05193cd failed: start failed after retries: timed out waiting for CH api socket')
+  PASS  boot_id preserved across warm/restore
+  FAIL  file survives warm (wanted 'metal-persistent-data', got '')
+== 5. stop/start: fresh boot, durable data intact ==
+  FAIL  stop (wanted 'observed=cold', got 'error: operation op_9328af82be64 did not finish in time')
+  FAIL  start (wanted 'observed=running', got 'error: operation op_ed74b9683e82 failed: start failed after retries: timed out waiting for CH api socket')
+  FAIL  boot_id did not change on cold start ()
+  FAIL  flushed data survives cold restart (wanted 'metal-persistent-data', got '')
+== 6. destroy ==
+  PASS  destroy
+
+metal e2e: 3 passed, 14 failed

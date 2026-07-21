@@ -288,20 +288,47 @@ impl GuestAgent {
     /// connection so health checks are never blocked behind a long exec.
     pub fn serve_control(self: &std::sync::Arc<Self>, listener: UnixListener) {
         for conn in listener.incoming() {
-            let Ok(mut stream) = conn else { return };
-            let agent = self.clone();
-            std::thread::spawn(move || {
-                while let Ok(req) = read_frame::<_, GuestRequest>(&mut stream) {
-                    let resp = GuestResponse {
-                        id: req.id,
-                        body: agent.handle(req.body),
-                    };
-                    if write_frame(&mut stream, &resp).is_err() {
-                        break;
-                    }
-                }
-            });
+            let Ok(stream) = conn else { return };
+            self.serve_control_stream(stream);
         }
+    }
+
+    fn serve_control_stream(
+        self: &std::sync::Arc<Self>,
+        mut stream: std::os::unix::net::UnixStream,
+    ) {
+        let agent = self.clone();
+        std::thread::spawn(move || {
+            while let Ok(req) = read_frame::<_, GuestRequest>(&mut stream) {
+                let resp = GuestResponse {
+                    id: req.id,
+                    body: agent.handle(req.body),
+                };
+                if write_frame(&mut stream, &resp).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Serve AF_VSOCK without asking `UnixListener` to decode the peer
+    /// address. Its `accept` path expects `sockaddr_un` and rejects an
+    /// otherwise valid `sockaddr_vm`; accepting with a null address keeps the
+    /// resulting stream fully usable for read/write framing.
+    #[cfg(target_os = "linux")]
+    pub fn serve_vsock_control(self: &std::sync::Arc<Self>, listener: VsockListener) -> Result<()> {
+        loop {
+            let stream = listener.accept()?;
+            self.serve_control_stream(stream);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn serve_vsock_control(
+        self: &std::sync::Arc<Self>,
+        _listener: VsockListener,
+    ) -> Result<()> {
+        anyhow::bail!("vsock is only available on linux")
     }
 
     /// Minimal HTTP/1.1 web service over a unix socket: the "user workload"
@@ -358,31 +385,62 @@ fn real_syncfs() -> Result<()> {
 /// AF_VSOCK listener (real guests only). Accepted connections are handed to
 /// the same frame loop as unix sockets.
 #[cfg(target_os = "linux")]
-pub fn bind_vsock(port: u32) -> Result<std::os::unix::net::UnixListener> {
-    use std::os::unix::io::FromRawFd;
+pub struct VsockListener(std::os::fd::OwnedFd);
+
+#[cfg(target_os = "linux")]
+impl VsockListener {
+    fn accept(&self) -> Result<std::os::unix::net::UnixStream> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        loop {
+            let fd = unsafe {
+                libc::accept4(
+                    self.0.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    libc::SOCK_CLOEXEC,
+                )
+            };
+            if fd >= 0 {
+                return Ok(unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) });
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                anyhow::bail!("vsock accept: {error}");
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn bind_vsock(port: u32) -> Result<VsockListener> {
+    use std::os::fd::{AsRawFd, FromRawFd};
     unsafe {
         let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
         anyhow::ensure!(fd >= 0, "vsock socket: {}", std::io::Error::last_os_error());
+        // Own the descriptor before any fallible operation so bind/listen
+        // errors cannot leak it in a Guest Agent restart loop.
+        let fd = std::os::fd::OwnedFd::from_raw_fd(fd);
         let mut addr: libc::sockaddr_vm = std::mem::zeroed();
         addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
         addr.svm_port = port;
         addr.svm_cid = libc::VMADDR_CID_ANY;
         let rc = libc::bind(
-            fd,
+            fd.as_raw_fd(),
             &addr as *const _ as *const libc::sockaddr,
             std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
         );
         anyhow::ensure!(rc == 0, "vsock bind: {}", std::io::Error::last_os_error());
-        let rc = libc::listen(fd, 16);
+        let rc = libc::listen(fd.as_raw_fd(), 16);
         anyhow::ensure!(rc == 0, "vsock listen: {}", std::io::Error::last_os_error());
-        // A vsock stream fd behaves like any stream socket; UnixListener is
-        // just an fd wrapper, so accept()/read()/write() all work.
-        Ok(std::os::unix::net::UnixListener::from_raw_fd(fd))
+        Ok(VsockListener(fd))
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn bind_vsock(_port: u32) -> Result<std::os::unix::net::UnixListener> {
+pub struct VsockListener;
+
+#[cfg(not(target_os = "linux"))]
+pub fn bind_vsock(_port: u32) -> Result<VsockListener> {
     anyhow::bail!("vsock is only available on linux")
 }
 

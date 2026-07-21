@@ -1,0 +1,26 @@
+== cleanup from previous runs ==
+== 1. cold create -> real VM boots ==
+  PASS  create converges to running
+  PASS  guest runs the direct-boot kernel
+  PASS  guest reports a kernel boot_id (fb8e6f48-4415-4649-b7b7-8974597c957e)
+== 2. durable write through the real ext4 root ==
+  PASS  wrote /data.txt + sync
+== 3. suspend/resume (vm.pause/resume): same boot ==
+  PASS  suspend
+  PASS  resume
+  PASS  boot_id preserved across suspend/resume
+== 4. warm (vm.snapshot + full exit) / restore: same boot ==
+  PASS  warm
+  FAIL  VMM still resident while Warm
+  PASS  restore
+  PASS  boot_id preserved across warm/restore
+  PASS  file survives warm
+== 5. stop/start: fresh boot, durable data intact ==
+  PASS  stop
+  PASS  start
+  PASS  cold start is a fresh boot
+  PASS  flushed data survives cold restart
+== 6. destroy ==
+  PASS  destroy
+
+metal e2e: 16 passed, 1 failed
