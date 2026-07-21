@@ -514,6 +514,8 @@ impl NodeRuntime {
             .arg(grant.size_bytes.to_string())
             .arg("--lease-ttl-ms")
             .arg(self.cfg.blockd_lease_ttl_ms.to_string());
+        let log = std::fs::File::create(cat_dir.join(format!("blockd-{}.log", grant.disk_id)))
+            .context("create blockd log")?;
         match &self.cfg.blob {
             BlobBackend::File { root } => {
                 cmd.arg("--blob-file-root").arg(root);
@@ -536,7 +538,7 @@ impl NodeRuntime {
         }
         let child = cmd
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(log)
             .env_remove("CATS_CRASH_POINT")
             .spawn()
             .context("spawn cats-blockd")?;
@@ -596,7 +598,7 @@ impl NodeRuntime {
             .arg("--web-socket")
             .arg(rt.web_socket())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(std::fs::File::create(rt.dir.join("guest.log")).context("create guest log")?);
         if let Some(sf) = state_file {
             cmd.arg("--state-file").arg(sf);
         }

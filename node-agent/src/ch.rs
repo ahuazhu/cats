@@ -243,7 +243,9 @@ pub fn spawn_vmm(s: &ChSpawn<'_>) -> Result<Child> {
             cmd.arg("--console").arg("off");
         }
     }
-    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    let log =
+        std::fs::File::create(s.serial_log.with_file_name("vmm.log")).context("create vmm log")?;
+    cmd.stdout(Stdio::null()).stderr(log);
     cmd.spawn().context("spawn cloud-hypervisor")
 }
 
