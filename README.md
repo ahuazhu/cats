@@ -63,7 +63,7 @@ experiments/              可复现实验与原始证据
 docs/                     架构、决策和实验报告
 ```
 
-这只是目标结构；实现时应先完成最小 `cats-blockd` 和单机生命周期闭环，再扩展控制面。
+这只是目标结构；实现语言统一为 Rust 单 cargo workspace（[ADR-0004](docs/decisions/0004-implementation-stack-and-dev-environment.md)），先完成最小 `cats-blockd` 和单机生命周期闭环，再扩展控制面。
 
 ## 本地验证
 

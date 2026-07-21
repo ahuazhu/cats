@@ -5,3 +5,6 @@ __pycache__/
 .env
 build/
 dist/
+
+# Rust
+/target/

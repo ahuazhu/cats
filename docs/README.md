@@ -27,5 +27,6 @@ HTML 面向人类阅读和视觉演示；同名 Markdown 面向 Agent/实现者�
 - [ADR-0001：Greenfield implementation baseline](decisions/0001-greenfield-implementation-baseline.md)
 - [ADR-0002：生命周期四态 Running / Suspended / Warm / Cold](decisions/0002-lifecycle-states-running-suspended-warm-cold.md)
 - [ADR-0003：存储后端选定 Direct-OS ChunkStore（Direct-S3 实现）](decisions/0003-direct-s3-chunkstore-backend.md)
+- [ADR-0004：实现技术栈（全 Rust）与开发测试环境](decisions/0004-implementation-stack-and-dev-environment.md)
 
 后续发生会改变数据格式、公开 API、故障语义或组件边界的决定时，应新增 ADR，而不是直接覆盖实验结论。

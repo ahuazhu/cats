@@ -1204,7 +1204,7 @@ NodeJobResult {
 
 ### 控制面
 
-- Go 或 Rust 服务；已有 Python 作为规格与测试 oracle
+- Rust 服务（axum/sqlx/tokio，与数据面同一 cargo workspace，ADR-0004）；已有 Python 作为规格与测试 oracle
 - PostgreSQL HA
 - 托管队列 + Transactional Outbox
 - Kubernetes/EKS
