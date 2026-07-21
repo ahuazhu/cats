@@ -55,14 +55,17 @@ struct CatRuntime {
     /// Grants remembered for Warm restore.
     volumes: Vec<VolumeGrant>,
     dir: PathBuf,
+    /// Short bind paths (see `short_socket_path`).
+    ctl_sock: PathBuf,
+    web_sock: PathBuf,
 }
 
 impl CatRuntime {
     fn ctl_socket(&self) -> PathBuf {
-        self.dir.join("ctl.sock")
+        self.ctl_sock.clone()
     }
     fn web_socket(&self) -> PathBuf {
-        self.dir.join("web.sock")
+        self.web_sock.clone()
     }
     fn disk_map_path(&self) -> PathBuf {
         self.dir.join("disk-map.json")
@@ -70,6 +73,28 @@ impl CatRuntime {
     fn state_file(&self) -> PathBuf {
         self.dir.join("warm-state.json")
     }
+}
+
+/// AF_UNIX `sun_path` is limited to ~104 bytes on macOS (108 on Linux), and
+/// tempdir + resource-id paths blow past it. All sockets are therefore bound
+/// under a short base directory with hashed names; human-readable symlinks
+/// are left in the cat directory (`ctl.sock`, `web.sock`) for tooling.
+fn short_socket_path(state_dir: &Path, cat_id: &str, kind: &str) -> PathBuf {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let base = std::env::var_os("CATS_SOCK_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp/cats-sock"));
+    let _ = std::fs::create_dir_all(&base);
+    let mut h = DefaultHasher::new();
+    // state_dir is unique per node instance (tests use fresh tempdirs), so
+    // parallel nodes/tests can never collide on a socket path.
+    (state_dir, cat_id, kind).hash(&mut h);
+    base.join(format!("{:016x}.sock", h.finish()))
+}
+
+fn symlink_socket(link: &Path, target: &Path) {
+    let _ = std::fs::remove_file(link);
+    let _ = std::os::unix::fs::symlink(target, link);
 }
 
 pub struct NodeRuntime {
@@ -173,6 +198,10 @@ impl NodeRuntime {
         }
         std::fs::create_dir_all(&dir)?;
 
+        let ctl_sock = short_socket_path(&self.cfg.state_dir, cat_id, "ctl");
+        let web_sock = short_socket_path(&self.cfg.state_dir, cat_id, "web");
+        symlink_socket(&dir.join("ctl.sock"), &ctl_sock);
+        symlink_socket(&dir.join("web.sock"), &web_sock);
         let mut rt = CatRuntime {
             generation,
             state: ObservedState::Starting,
@@ -181,11 +210,13 @@ impl NodeRuntime {
             blockds: HashMap::new(),
             volumes: volumes.clone(),
             dir: dir.clone(),
+            ctl_sock,
+            web_sock,
         };
 
         let launch = (|| -> Result<String> {
             for grant in &volumes {
-                let proc = self.spawn_blockd(&dir, grant)?;
+                let proc = self.spawn_blockd(cat_id, &dir, grant)?;
                 rt.blockds.insert(grant.disk_id.clone(), proc);
             }
             self.write_disk_map(&rt)?;
@@ -216,8 +247,21 @@ impl NodeRuntime {
         }
     }
 
-    fn spawn_blockd(&self, cat_dir: &Path, grant: &VolumeGrant) -> Result<BlockdProc> {
-        let socket = cat_dir.join(format!("nbd-{}.sock", grant.disk_id));
+    fn spawn_blockd(
+        &self,
+        cat_id: &str,
+        cat_dir: &Path,
+        grant: &VolumeGrant,
+    ) -> Result<BlockdProc> {
+        let socket = short_socket_path(
+            &self.cfg.state_dir,
+            cat_id,
+            &format!("nbd-{}", grant.disk_id),
+        );
+        symlink_socket(
+            &cat_dir.join(format!("nbd-{}.sock", grant.disk_id)),
+            &socket,
+        );
         let data_dir = cat_dir.join(format!("vol-{}", grant.disk_id));
         let child = Command::new(&self.cfg.blockd_bin)
             .arg("--volume-id")
@@ -356,7 +400,10 @@ impl NodeRuntime {
         for (_, mut p) in rt.blockds.drain() {
             let _ = p.child.kill();
             let _ = p.child.wait();
+            let _ = std::fs::remove_file(&p.socket);
         }
+        let _ = std::fs::remove_file(rt.ctl_socket());
+        let _ = std::fs::remove_file(rt.web_socket());
         rt.state = ObservedState::Cold;
     }
 
@@ -491,7 +538,7 @@ impl NodeRuntime {
             return Ok(ObservedState::Running); // idempotent
         }
         let dir = rt.dir.clone();
-        let proc = self.spawn_blockd(&dir, &grant)?;
+        let proc = self.spawn_blockd(cat_id, &dir, &grant)?;
         rt.blockds.insert(grant.disk_id.clone(), proc);
         rt.volumes.push(grant);
         self.write_disk_map(rt)?;
