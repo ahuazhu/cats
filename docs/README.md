@@ -2,6 +2,14 @@
 
 HTML 面向人类阅读和视觉演示；同名 Markdown 面向 Agent/实现者，包含可检索正文、Mermaid 图、明确状态和本地证据链接。实验总报告原生为 Markdown。
 
+## 规格（实现的直接依据）
+
+| 文档 | 状态 | 对应实现 |
+|---|---|---|
+| [blockd 协议规格](specs/blockd-protocol.md) | Frozen v1 | `blockd/`（常量出处 `api/src/chunk.rs`）；改动需新增 ADR |
+
+实现状态一览见根 [README](../README.md#实现状态)。**Linux 里程碑**（真实 Cloud Hypervisor + vhost-user-blk + tap/overlay + KVM 验收、Warm 用 cats-blockd 复验快照）尚未开始；FakeVmm 缝在 `node-agent/src/runtime.rs` 文件头有说明。
+
 如果同一设计的两种格式暂时不同，以 ADR 和实验数据为最高依据，随后以 Markdown 的实现约束为准，并尽快同步 HTML。
 
 ## 当前基线

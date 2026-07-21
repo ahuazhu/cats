@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -236,17 +236,15 @@ impl GuestAgent {
         for conn in listener.incoming() {
             let Ok(mut stream) = conn else { return };
             let agent = self.clone();
-            std::thread::spawn(move || loop {
-                let req: GuestRequest = match read_frame(&mut stream) {
-                    Ok(r) => r,
-                    Err(_) => break,
-                };
-                let resp = GuestResponse {
-                    id: req.id,
-                    body: agent.handle(req.body),
-                };
-                if write_frame(&mut stream, &resp).is_err() {
-                    break;
+            std::thread::spawn(move || {
+                while let Ok(req) = read_frame::<_, GuestRequest>(&mut stream) {
+                    let resp = GuestResponse {
+                        id: req.id,
+                        body: agent.handle(req.body),
+                    };
+                    if write_frame(&mut stream, &resp).is_err() {
+                        break;
+                    }
                 }
             });
         }

@@ -2,7 +2,7 @@
 
 Cats 是一个从零实现的独立项目：为用户提供可休眠、可迁移、带持久块设备和稳定网络入口的 Linux microVM。
 
-当前仓库处于**设计与技术验证阶段**。这里保存最近两天形成的产品架构、存储和生命周期设计、实验代码、正式结果与失败现场；尚未包含生产实现。
+仓库包含**完整的 Rust workspace 实现（V1 开发形态）**与全部设计文档、实验证据：存储引擎（Direct-OS ChunkStore）、控制面、node-agent、guest-agent、CLI、Endpoint 网关，以及覆盖崩溃注入、fencing、跨节点冷恢复的 46 个自动化测试（单元 + 集成 + 端到端）。KVM/Cloud Hypervisor/vhost-user 的真实虚拟化接入是 Linux 里程碑（见下文"实现状态"）。
 
 ## Greenfield 边界
 
@@ -46,32 +46,55 @@ Cats 是一个从零实现的独立项目：为用户提供可休眠、可迁移
 - Cold：直接内核、精简 initramfs、提前网络和 Agent，本轮完整新内核/新进程 P50 为 1.755 秒。
 - Direct-S3：语义原型成立，当前串行 Python 实现约 39.87 秒，只用于验证和定位瓶颈。
 
-这些数字不是生产 SLA。跨 Host 空 Cache 恢复、生产 `cats-blockd`、租约 fencing、故障注入和大规模并发仍未完成。
+这些数字不是生产 SLA（AWS metal 实验口径）。本仓库的自动化测试已经覆盖：跨节点空 Cache 恢复、租约 fencing/僵尸写拒绝、FLUSH 各窗口 kill -9 崩溃恢复——但均在 FakeVmm/本地 BlobStore 形态下；真实 KVM 与大规模并发见"实现状态"。
 
-## 计划中的代码结构
+## 代码结构（Rust workspace，ADR-0004）
 
 ```text
-cmd/cats/                 CLI
-control-plane/            Resource API、Operation、Scheduler、Controller
-node-agent/               Node 生命周期与本机资源管理
-blockd/                   vhost-user-blk、NVMe Cache、Chunk/Manifest、FLUSH
-guest/                    Kernel config、initramfs、PID 1 / Guest Agent
-network/                  tap、路由、Endpoint 和策略
-api/                      版本化 API schema 和生成代码
-tests/                    单元、故障注入和跨组件 E2E
+cmd/cats/                 cats CLI（clap；等待 Operation、幂等键）
+control-plane/            Resource API、Operation、Scheduler、reconcile Controller（axum + SQLite）
+node-agent/               NodeJob 执行器、FakeVmm、blockd 子进程监督、心跳（cats-noded）
+blockd/                   ChunkStore 引擎：Cache/Bitmap/Pack/Map、FLUSH 提交协议、
+                          lease/fencing、NBD 前端、File/S3 BlobStore（cats-blockd）
+guest/                    Guest Agent：控制协议、经 NBD 的块 I/O、demo web（cats-guest-agent）
+network/                  Endpoint 网关：路由解析、唤醒、旧路由 fail-closed（cats-gatewayd）
+api/                      共享类型：资源模型、四态、NodeJob、Guest 协议、Chunk 常量
+tests/                    端到端测试（真实 CLI + 双节点 + 网关 + 真实存储子进程）
 experiments/              可复现实验与原始证据
-docs/                     架构、决策和实验报告
+docs/                     架构、决策、协议规格和实验报告
 ```
 
-这只是目标结构；实现语言统一为 Rust 单 cargo workspace（[ADR-0004](docs/decisions/0004-implementation-stack-and-dev-environment.md)），先完成最小 `cats-blockd` 和单机生命周期闭环，再扩展控制面。
+## 实现状态
 
-## 本地验证
+| 层 | 状态 | 说明 |
+|---|---|---|
+| 存储引擎（blockd） | ✅ 实现并测试 | 协议见 [docs/specs/blockd-protocol.md](docs/specs/blockd-protocol.md)；4 个提交窗口 kill -9 恢复、空缓存冷恢复、stale epoch 拒绝均有测试 |
+| 控制面 / CLI / 网关 / node-agent / guest-agent | ✅ 实现并测试 | 单元 + 集成 + E2E 共 46 个测试 |
+| S3 BlobStore | ✅ 代码 + 签名向量测试 | SigV4 通过 AWS 官方测试向量；对真实 S3/MinIO 的联测按需运行 |
+| 元数据存储 | SQLite（开发） | 与规格同 SQL 形状；生产 PostgreSQL 为后续替换项 |
+| 虚拟化 | FakeVmm（进程模拟） | SIGSTOP/SIGCONT=pause/resume、状态文件=Warm 快照；**Cloud Hypervisor + vhost-user-blk 为 Linux 里程碑**（trait 缝在 `node-agent/src/runtime.rs`） |
+| Guest 网络 / tap / overlay | 未实现 | 属 Linux 里程碑；当前网关经 node-agent 代理到 guest unix socket |
 
-无需 KVM 的 ChunkStore 单测：
+## 构建与测试
 
 ```bash
-cd experiments/lazy-ext4-demo
-python3 -m unittest -v test_chunkstore.py
+cargo build --workspace          # 全部组件
+cargo test --workspace           # 46 个测试：单元 + 崩溃注入 + 控制面契约 + E2E
+cargo clippy --workspace --all-targets   # 零警告
 ```
 
-完整 Lazy ext4 需要 Docker privileged/NBD；VM 生命周期实验需要 Linux x86_64、root 和 `/dev/kvm`。具体命令在各实验 README 中。
+单机手动体验（四个终端或后台）：
+
+```bash
+cargo run -p cats-control-plane --bin cats-controld -- --listen 127.0.0.1:7300
+cargo run -p cats-node-agent --bin cats-noded -- \
+  --node-id n1 --control-plane-url http://127.0.0.1:7300 \
+  --state-dir /tmp/cats-n1 --meta-sqlite cats-storage-meta.db \
+  --blob-file-root /tmp/cats-blob \
+  --blockd-bin target/debug/cats-blockd --guest-agent-bin target/debug/cats-guest-agent
+cargo run -p cats-network --bin cats-gatewayd -- --listen 127.0.0.1:7400
+cargo run -p cats-cli --bin cats -- create dev --root-size 64MiB && \
+  cargo run -p cats-cli --bin cats -- exec dev -- echo hello
+```
+
+实验侧验证（原型证据，无需 Rust）：`cd experiments/lazy-ext4-demo && python3 -m unittest -v test_chunkstore.py`；完整 Lazy ext4 需要 Docker privileged/NBD；VM 生命周期实验需要 Linux x86_64、root 和 `/dev/kvm`。

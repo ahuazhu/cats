@@ -229,11 +229,12 @@ impl NodeRuntime {
 
         match launch {
             Ok(boot_id) => {
-                if warm_restore {
-                    if rt.boot_id.is_some() && rt.boot_id.as_deref() != Some(boot_id.as_str()) {
-                        self.teardown(&mut rt, false);
-                        bail!("warm restore produced a different boot id");
-                    }
+                if warm_restore
+                    && rt.boot_id.is_some()
+                    && rt.boot_id.as_deref() != Some(boot_id.as_str())
+                {
+                    self.teardown(&mut rt, false);
+                    bail!("warm restore produced a different boot id");
                 }
                 rt.boot_id = Some(boot_id);
                 rt.state = ObservedState::Running;

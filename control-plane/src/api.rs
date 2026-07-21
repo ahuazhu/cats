@@ -770,8 +770,8 @@ async fn list_nodes(
     }))
 }
 
-/// Public wake handler used by the gateway (`POST /v1/routes/wake?hostname=`).
-pub async fn wake_route_handler(
+/// Wake handler used by the gateway (`POST /v1/routes/wake?hostname=`).
+async fn wake_route_handler(
     State(state): State<AppState>,
     Query(q): Query<ResolveQuery>,
     headers: HeaderMap,
