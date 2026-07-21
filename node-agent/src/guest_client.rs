@@ -24,6 +24,30 @@ impl GuestClient {
         Ok(Self { stream, next_id: 1 })
     }
 
+    /// Connect through Cloud Hypervisor's hybrid vsock socket: the VMM
+    /// exposes a unix socket on the host; the client sends
+    /// `CONNECT <port>\n` and the VMM answers `OK <assigned>\n` before the
+    /// raw guest byte stream begins (Firecracker-compatible handshake).
+    pub fn connect_hybrid_vsock(path: &Path, port: u32) -> Result<Self> {
+        use std::io::{BufRead, BufReader, Write};
+        let mut stream = UnixStream::connect(path)
+            .with_context(|| format!("connect vsock mux at {}", path.display()))?;
+        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+        stream.write_all(format!("CONNECT {port}\n").as_bytes())?;
+        // Read the single handshake line without buffering past it.
+        let mut reader = BufReader::with_capacity(64, stream.try_clone()?);
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .context("vsock handshake read")?;
+        if !line.starts_with("OK") {
+            bail!("vsock handshake rejected: {}", line.trim());
+        }
+        drop(reader); // BufReader consumed exactly the handshake line
+        Ok(Self { stream, next_id: 1 })
+    }
+
     pub fn request(&mut self, body: GuestRequestBody) -> Result<GuestResponseBody> {
         let id = self.next_id;
         self.next_id += 1;

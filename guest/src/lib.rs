@@ -80,7 +80,22 @@ struct SavedState {
     counter: u64,
 }
 
+/// How this agent is running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuestMode {
+    /// FakeVmm: a host process; "virtio disks" are NBD connections listed in
+    /// the node-maintained disk map; boot identity is synthesized (and
+    /// restored from the Warm state file).
+    Fake,
+    /// A real VM: boot identity is the kernel's per-boot UUID (preserved by
+    /// VMM snapshot/restore, changed by cold boot — the experiments'
+    /// oracle); syncfs is the real syscall; the kernel owns the disks, so
+    /// block-level ops are not served here.
+    Vm,
+}
+
 pub struct GuestAgent {
+    mode: GuestMode,
     boot_id: String,
     started: Instant,
     disk_map_path: PathBuf,
@@ -89,16 +104,31 @@ pub struct GuestAgent {
     volumes: Mutex<HashMap<String, NbdClient>>,
 }
 
+fn kernel_boot_id() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|s| s.trim().replace('-', ""))
+}
+
 impl GuestAgent {
     pub fn new(disk_map_path: PathBuf, state_file: Option<&Path>) -> Self {
+        Self::with_mode(GuestMode::Fake, disk_map_path, state_file)
+    }
+
+    pub fn with_mode(mode: GuestMode, disk_map_path: PathBuf, state_file: Option<&Path>) -> Self {
         let restored: Option<SavedState> = state_file
             .and_then(|p| std::fs::read(p).ok())
             .and_then(|b| serde_json::from_slice(&b).ok());
-        let (boot_id, counter) = match restored {
-            Some(s) => (s.boot_id, s.counter),
-            None => (uuid::Uuid::new_v4().simple().to_string(), 0),
+        let (boot_id, counter) = match (&mode, restored) {
+            (GuestMode::Vm, _) => (
+                kernel_boot_id().unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string()),
+                0,
+            ),
+            (GuestMode::Fake, Some(s)) => (s.boot_id, s.counter),
+            (GuestMode::Fake, None) => (uuid::Uuid::new_v4().simple().to_string(), 0),
         };
         Self {
+            mode,
             boot_id,
             started: Instant::now(),
             disk_map_path,
@@ -153,11 +183,23 @@ impl GuestAgent {
         }
     }
 
+    fn require_fake(&self, op: &str) -> Result<()> {
+        if self.mode != GuestMode::Fake {
+            anyhow::bail!(
+                "{op} is only served by the fake guest (real disks belong to the kernel)"
+            );
+        }
+        Ok(())
+    }
+
     fn try_handle(&self, req: GuestRequestBody) -> Result<GuestResponseBody> {
         match req {
             GuestRequestBody::Health => {
                 self.counter.fetch_add(1, Ordering::SeqCst);
-                let disks = load_disk_map(&self.disk_map_path).keys().cloned().collect();
+                let disks = match self.mode {
+                    GuestMode::Fake => load_disk_map(&self.disk_map_path).keys().cloned().collect(),
+                    GuestMode::Vm => list_block_devices(),
+                };
                 Ok(GuestResponseBody::Health {
                     boot_id: self.boot_id.clone(),
                     uptime_ms: self.started.elapsed().as_millis() as u64,
@@ -182,6 +224,10 @@ impl GuestAgent {
                 })
             }
             GuestRequestBody::Syncfs => {
+                if self.mode == GuestMode::Vm {
+                    real_syncfs()?;
+                    return Ok(GuestResponseBody::Ok);
+                }
                 self.drop_missing_volumes();
                 let ids: Vec<String> = load_disk_map(&self.disk_map_path).keys().cloned().collect();
                 for id in ids {
@@ -194,6 +240,7 @@ impl GuestAgent {
                 offset,
                 len,
             } => {
+                self.require_fake("read_block")?;
                 let data = self.with_volume(&disk_id, |c| Ok(c.read(offset, len)?))?;
                 Ok(GuestResponseBody::Data {
                     data_hex: hex::encode(data),
@@ -204,16 +251,23 @@ impl GuestAgent {
                 offset,
                 data_hex,
             } => {
+                self.require_fake("write_block")?;
                 let data = hex::decode(&data_hex).context("data_hex is not valid hex")?;
                 self.with_volume(&disk_id, |c| Ok(c.write(offset, &data)?))?;
                 self.counter.fetch_add(1, Ordering::SeqCst);
                 Ok(GuestResponseBody::Ok)
             }
             GuestRequestBody::FlushDisk { disk_id } => {
+                if self.mode == GuestMode::Vm {
+                    // The kernel owns the disks; syncfs is the durable point.
+                    real_syncfs()?;
+                    return Ok(GuestResponseBody::Ok);
+                }
                 self.with_volume(&disk_id, |c| Ok(c.flush()?))?;
                 Ok(GuestResponseBody::Ok)
             }
             GuestRequestBody::SaveState { path } => {
+                self.require_fake("save_state")?;
                 let state = SavedState {
                     boot_id: self.boot_id.clone(),
                     counter: self.counter.load(Ordering::SeqCst),
@@ -274,6 +328,62 @@ impl GuestAgent {
             let _ = stream.write_all(resp.as_bytes());
         }
     }
+}
+
+fn list_block_devices() -> Vec<String> {
+    std::fs::read_dir("/sys/block")
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("vd"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Flush every mounted filesystem (real VM mode durable point).
+#[cfg(target_os = "linux")]
+fn real_syncfs() -> Result<()> {
+    // sync(2) flushes all filesystems; simple and sufficient for V1.
+    unsafe { libc::sync() };
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn real_syncfs() -> Result<()> {
+    anyhow::bail!("vm mode requires linux")
+}
+
+/// AF_VSOCK listener (real guests only). Accepted connections are handed to
+/// the same frame loop as unix sockets.
+#[cfg(target_os = "linux")]
+pub fn bind_vsock(port: u32) -> Result<std::os::unix::net::UnixListener> {
+    use std::os::unix::io::FromRawFd;
+    unsafe {
+        let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        anyhow::ensure!(fd >= 0, "vsock socket: {}", std::io::Error::last_os_error());
+        let mut addr: libc::sockaddr_vm = std::mem::zeroed();
+        addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
+        addr.svm_port = port;
+        addr.svm_cid = libc::VMADDR_CID_ANY;
+        let rc = libc::bind(
+            fd,
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+        );
+        anyhow::ensure!(rc == 0, "vsock bind: {}", std::io::Error::last_os_error());
+        let rc = libc::listen(fd, 16);
+        anyhow::ensure!(rc == 0, "vsock listen: {}", std::io::Error::last_os_error());
+        // A vsock stream fd behaves like any stream socket; UnixListener is
+        // just an fd wrapper, so accept()/read()/write() all work.
+        Ok(std::os::unix::net::UnixListener::from_raw_fd(fd))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn bind_vsock(_port: u32) -> Result<std::os::unix::net::UnixListener> {
+    anyhow::bail!("vsock is only available on linux")
 }
 
 #[cfg(test)]

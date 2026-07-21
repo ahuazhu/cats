@@ -81,8 +81,11 @@ impl Cluster {
                 blockd_bin: workspace_bin("cats-blockd"),
                 guest_agent_bin: workspace_bin("cats-guest-agent"),
                 meta_sqlite: dir.path().join("storage-meta.db"),
-                blob_file_root: dir.path().join("blob"),
+                blob: cats_node_agent::runtime::BlobBackend::File {
+                    root: dir.path().join("blob"),
+                },
                 blockd_lease_ttl_ms: 1_200,
+                vmm: cats_node_agent::runtime::VmmMode::Fake,
             },
         })
         .await

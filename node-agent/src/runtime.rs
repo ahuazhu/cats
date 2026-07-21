@@ -6,9 +6,9 @@
 //! and the guest state file stands in for the memory snapshot. Every block
 //! byte still flows through the real cats-blockd engine, so storage
 //! semantics (leases, FLUSH durability, cold restore) are exercised for
-//! real. The Cloud Hypervisor implementation replaces `spawn_guest` /
-//! `pause` / `resume` / `snapshot` with ch-remote API calls on Linux and is
-//! tracked as the Linux milestone (docs/README).
+//! real. The Cloud Hypervisor mode (`VmmMode::CloudHypervisor`, Linux+KVM)
+//! is implemented in `ch.rs`: direct-kernel boot, kernel-NBD block path,
+//! vsock guest control, vm.pause/resume and vm.snapshot/--restore.
 //!
 //! Job idempotency: results are journaled by job_id and replayed for
 //! duplicate submissions (arch doc §17.4). The journal is in-memory; a node
@@ -27,7 +27,36 @@ use cats_api::nodejob::{NodeJob, NodeJobAction, NodeJobResult, VolumeGrant};
 use cats_api::resources::ObservedState;
 use cats_guest_agent::DiskMapEntry;
 
+use crate::ch::{self, ChConfig, ChRuntime, GUEST_VSOCK_PORT};
 use crate::guest_client::GuestClient;
+
+/// Which VMM this node runs.
+#[derive(Debug, Clone)]
+pub enum VmmMode {
+    /// Host-process guest (dev/tests on any OS).
+    Fake,
+    /// Real microVMs via Cloud Hypervisor (Linux + KVM).
+    CloudHypervisor(ChConfig),
+}
+
+/// Durable object store the node hands to its blockd children.
+///
+/// S3 credentials are NOT part of this config: `cats-blockd` reads
+/// `CATS_S3_ACCESS_KEY` / `CATS_S3_SECRET_KEY` from its environment, which
+/// the node agent's own environment provides (systemd `EnvironmentFile=` in
+/// the AWS deployment).
+#[derive(Debug, Clone)]
+pub enum BlobBackend {
+    File {
+        root: PathBuf,
+    },
+    S3 {
+        endpoint: String,
+        bucket: String,
+        region: String,
+        prefix: String,
+    },
+}
 
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -36,8 +65,9 @@ pub struct NodeConfig {
     pub blockd_bin: PathBuf,
     pub guest_agent_bin: PathBuf,
     pub meta_sqlite: PathBuf,
-    pub blob_file_root: PathBuf,
+    pub blob: BlobBackend,
     pub blockd_lease_ttl_ms: i64,
+    pub vmm: VmmMode,
 }
 
 struct BlockdProc {
@@ -48,6 +78,8 @@ struct BlockdProc {
 
 struct CatRuntime {
     generation: i64,
+    cpus: u32,
+    memory_mib: u64,
     state: ObservedState,
     guest: Option<Child>,
     boot_id: Option<String>,
@@ -58,9 +90,35 @@ struct CatRuntime {
     /// Short bind paths (see `short_socket_path`).
     ctl_sock: PathBuf,
     web_sock: PathBuf,
+    /// Present only in Cloud Hypervisor mode.
+    ch: Option<ChRuntime>,
+}
+
+/// How to reach a cat's guest agent (cloneable so locks can be dropped
+/// before the potentially slow connect/health exchange).
+#[derive(Debug, Clone)]
+pub enum GuestConn {
+    Unix(PathBuf),
+    Vsock(PathBuf, u32),
+}
+
+impl GuestConn {
+    pub fn connect(&self) -> Result<GuestClient> {
+        match self {
+            GuestConn::Unix(path) => GuestClient::connect(path),
+            GuestConn::Vsock(path, port) => GuestClient::connect_hybrid_vsock(path, *port),
+        }
+    }
 }
 
 impl CatRuntime {
+    /// Guest control connection: hybrid vsock in CH mode, unix otherwise.
+    fn conn(&self) -> GuestConn {
+        match &self.ch {
+            Some(chrt) => GuestConn::Vsock(chrt.vsock_sock.clone(), GUEST_VSOCK_PORT),
+            None => GuestConn::Unix(self.ctl_sock.clone()),
+        }
+    }
     fn ctl_socket(&self) -> PathBuf {
         self.ctl_sock.clone()
     }
@@ -160,8 +218,19 @@ impl NodeRuntime {
     fn run_action(&self, job: &NodeJob) -> Result<ObservedState> {
         match &job.action {
             NodeJobAction::StartCat {
-                cat_id, volumes, ..
-            } => self.start_cat(cat_id, job.cat_generation, volumes.clone(), false),
+                cat_id,
+                volumes,
+                cpus,
+                memory_mib,
+                ..
+            } => self.start_cat(
+                cat_id,
+                job.cat_generation,
+                volumes.clone(),
+                *cpus,
+                *memory_mib,
+                false,
+            ),
             NodeJobAction::StopCat { cat_id } => self.stop_cat(cat_id, true),
             NodeJobAction::SuspendCat { cat_id } => self.suspend_cat(cat_id),
             NodeJobAction::ResumeCat { cat_id } => self.resume_cat(cat_id),
@@ -179,17 +248,31 @@ impl NodeRuntime {
     // Start / restore
     // ------------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     fn start_cat(
         &self,
         cat_id: &str,
         generation: i64,
         volumes: Vec<VolumeGrant>,
+        cpus: u32,
+        memory_mib: u64,
         warm_restore: bool,
     ) -> Result<ObservedState> {
         if let Some(rt) = self.cats.lock().unwrap().get(cat_id) {
             if rt.state == ObservedState::Running {
                 return Ok(ObservedState::Running);
             }
+        }
+        if let VmmMode::CloudHypervisor(chc) = &self.cfg.vmm {
+            return self.start_cat_ch(
+                &chc.clone(),
+                cat_id,
+                generation,
+                volumes,
+                cpus,
+                memory_mib,
+                warm_restore,
+            );
         }
         let dir = self.cfg.state_dir.join("cats").join(cat_id);
         if !warm_restore {
@@ -204,6 +287,8 @@ impl NodeRuntime {
         symlink_socket(&dir.join("web.sock"), &web_sock);
         let mut rt = CatRuntime {
             generation,
+            cpus,
+            memory_mib,
             state: ObservedState::Starting,
             guest: None,
             boot_id: None,
@@ -212,6 +297,7 @@ impl NodeRuntime {
             dir: dir.clone(),
             ctl_sock,
             web_sock,
+            ch: None,
         };
 
         let launch = (|| -> Result<String> {
@@ -248,6 +334,155 @@ impl NodeRuntime {
         }
     }
 
+    /// Cloud Hypervisor start/restore: blockd -> (seed) -> kernel NBD ->
+    /// CH direct-kernel boot (or snapshot restore) -> vsock health.
+    #[allow(clippy::too_many_arguments)]
+    fn start_cat_ch(
+        &self,
+        chc: &ChConfig,
+        cat_id: &str,
+        generation: i64,
+        volumes: Vec<VolumeGrant>,
+        cpus: u32,
+        memory_mib: u64,
+        warm_restore: bool,
+    ) -> Result<ObservedState> {
+        let dir = self.cfg.state_dir.join("cats").join(cat_id);
+        // Warm restore reuses local state (snapshot + nbd mapping).
+        let previous = if warm_restore {
+            let cats = self.cats.lock().unwrap();
+            let rt = cats
+                .get(cat_id)
+                .context("no warm state for cat on this node")?;
+            anyhow::ensure!(
+                rt.state == ObservedState::Warm,
+                "cannot restore from {:?}",
+                rt.state
+            );
+            rt.ch
+                .as_ref()
+                .map(|c| (c.nbd.clone(), c.snapshot_dir.clone(), rt.boot_id.clone()))
+                .context("warm state missing CH runtime")?
+        } else {
+            let _ = std::fs::remove_dir_all(&dir);
+            (HashMap::new(), None, None)
+        };
+        let (prev_nbd, snapshot_dir, expected_boot) = previous;
+        if warm_restore {
+            self.cats.lock().unwrap().remove(cat_id);
+        }
+        std::fs::create_dir_all(&dir)?;
+
+        let mut chrt = ChRuntime {
+            api_sock: short_socket_path(&self.cfg.state_dir, cat_id, "chapi"),
+            vsock_sock: short_socket_path(&self.cfg.state_dir, cat_id, "vsock"),
+            nbd: HashMap::new(),
+            snapshot_dir: None,
+        };
+        let mut rt = CatRuntime {
+            generation,
+            cpus,
+            memory_mib,
+            state: ObservedState::Starting,
+            guest: None,
+            boot_id: None,
+            blockds: HashMap::new(),
+            volumes: volumes.clone(),
+            dir: dir.clone(),
+            ctl_sock: short_socket_path(&self.cfg.state_dir, cat_id, "ctl"),
+            web_sock: short_socket_path(&self.cfg.state_dir, cat_id, "web"),
+            ch: None,
+        };
+
+        let launch = (|| -> Result<String> {
+            // 1. Block backends.
+            for grant in &volumes {
+                let proc = self.spawn_blockd(cat_id, &dir, grant)?;
+                rt.blockds.insert(grant.disk_id.clone(), proc);
+            }
+            // 2. Seed a brand-new root volume with the golden image.
+            if !warm_restore {
+                if let Some(image) = &chc.seed_image {
+                    for grant in volumes.iter().filter(|g| g.mount_path == "/") {
+                        use cats_blockd::meta::MetadataStore;
+                        let meta = cats_blockd::meta::SqliteMeta::open(&self.cfg.meta_sqlite)?;
+                        let head = meta.load_head(&grant.volume_id)?;
+                        if head.generation == 0 {
+                            tracing::info!(volume = %grant.volume_id, "seeding golden root");
+                            ch::seed_volume(&rt.blockds[&grant.disk_id].socket, image)?;
+                        }
+                    }
+                }
+            }
+            // 3. Kernel NBD attach (root first => /dev/vda). On restore the
+            //    device indices must match the snapshot exactly.
+            let mut ordered: Vec<&VolumeGrant> = volumes.iter().collect();
+            ordered.sort_by_key(|g| g.mount_path != "/");
+            let mut disks = Vec::new();
+            for grant in ordered {
+                let want = prev_nbd.get(&grant.disk_id).map(|s| s.as_str());
+                let dev = ch::nbd_attach(chc, &rt.blockds[&grant.disk_id].socket, want)?;
+                chrt.nbd.insert(grant.disk_id.clone(), dev.clone());
+                disks.push(dev);
+            }
+            // 4. VMM.
+            let serial_log = dir.join("serial.log");
+            let mut vmm = ch::spawn_vmm(&ch::ChSpawn {
+                cfg: chc,
+                api_sock: &chrt.api_sock,
+                vsock_sock: &chrt.vsock_sock,
+                serial_log: &serial_log,
+                cpus,
+                memory_mib,
+                disks: &disks,
+                restore_from: snapshot_dir.as_deref(),
+            })?;
+            ch::wait_api_ready(&chrt.api_sock, &mut vmm)?;
+            if warm_restore {
+                ch::resume(&chrt.api_sock)?;
+            }
+            rt.guest = Some(vmm);
+            // 5. Guest agent over vsock.
+            let conn = GuestConn::Vsock(chrt.vsock_sock.clone(), GUEST_VSOCK_PORT);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                if let Ok(mut client) = conn.connect() {
+                    if let Ok((boot_id, _)) = client.health() {
+                        return Ok(boot_id);
+                    }
+                }
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "guest never became healthy over vsock"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        })();
+
+        match launch {
+            Ok(boot_id) => {
+                if warm_restore
+                    && expected_boot.is_some()
+                    && expected_boot.as_deref() != Some(&boot_id)
+                {
+                    rt.ch = Some(chrt);
+                    self.teardown(&mut rt, false);
+                    bail!("warm restore produced a different kernel boot id");
+                }
+                rt.boot_id = Some(boot_id);
+                rt.state = ObservedState::Running;
+                rt.ch = Some(chrt);
+                self.cats.lock().unwrap().insert(cat_id.to_string(), rt);
+                Ok(ObservedState::Running)
+            }
+            Err(e) => {
+                rt.ch = Some(chrt);
+                self.teardown(&mut rt, false);
+                Err(e)
+            }
+        }
+    }
+
     fn spawn_blockd(
         &self,
         cat_id: &str,
@@ -264,8 +499,8 @@ impl NodeRuntime {
             &socket,
         );
         let data_dir = cat_dir.join(format!("vol-{}", grant.disk_id));
-        let child = Command::new(&self.cfg.blockd_bin)
-            .arg("--volume-id")
+        let mut cmd = Command::new(&self.cfg.blockd_bin);
+        cmd.arg("--volume-id")
             .arg(&grant.volume_id)
             .arg("--data-dir")
             .arg(&data_dir)
@@ -273,14 +508,33 @@ impl NodeRuntime {
             .arg(&grant.attachment_id)
             .arg("--meta-sqlite")
             .arg(&self.cfg.meta_sqlite)
-            .arg("--blob-file-root")
-            .arg(&self.cfg.blob_file_root)
             .arg("--listen-unix")
             .arg(&socket)
             .arg("--create-volume-size")
             .arg(grant.size_bytes.to_string())
             .arg("--lease-ttl-ms")
-            .arg(self.cfg.blockd_lease_ttl_ms.to_string())
+            .arg(self.cfg.blockd_lease_ttl_ms.to_string());
+        match &self.cfg.blob {
+            BlobBackend::File { root } => {
+                cmd.arg("--blob-file-root").arg(root);
+            }
+            BlobBackend::S3 {
+                endpoint,
+                bucket,
+                region,
+                prefix,
+            } => {
+                cmd.arg("--blob-s3-endpoint")
+                    .arg(endpoint)
+                    .arg("--blob-s3-bucket")
+                    .arg(bucket)
+                    .arg("--blob-s3-region")
+                    .arg(region)
+                    .arg("--blob-s3-prefix")
+                    .arg(prefix);
+            }
+        }
+        let child = cmd
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .env_remove("CATS_CRASH_POINT")
@@ -352,7 +606,7 @@ impl NodeRuntime {
     fn wait_guest_ready(&self, rt: &CatRuntime) -> Result<String> {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            if let Ok(mut client) = GuestClient::connect(&rt.ctl_socket()) {
+            if let Ok(mut client) = rt.conn().connect() {
                 if let Ok((boot_id, _)) = client.health() {
                     return Ok(boot_id);
                 }
@@ -384,24 +638,46 @@ impl NodeRuntime {
     fn teardown(&self, rt: &mut CatRuntime, graceful: bool) {
         if graceful && rt.guest.is_some() {
             if rt.state == ObservedState::Suspended {
-                // A stopped process cannot flush; wake it first.
-                if let Some(g) = &rt.guest {
-                    signal(g, libc::SIGCONT);
+                // A paused guest cannot flush; wake it first.
+                match &rt.ch {
+                    Some(chrt) => {
+                        let _ = ch::resume(&chrt.api_sock);
+                    }
+                    None => {
+                        if let Some(g) = &rt.guest {
+                            signal(g, libc::SIGCONT);
+                        }
+                    }
                 }
             }
-            if let Ok(mut client) = GuestClient::connect(&rt.ctl_socket()) {
+            if let Ok(mut client) = rt.conn().connect() {
                 let _ = client.syncfs();
-                let _ = client.shutdown();
+                if rt.ch.is_none() {
+                    let _ = client.shutdown();
+                }
             }
         }
-        if let Some(mut g) = rt.guest.take() {
-            let _ = g.kill();
-            let _ = g.wait();
+        if let Some(mut vmm) = rt.guest.take() {
+            match &rt.ch {
+                Some(chrt) => ch::shutdown_vmm(&chrt.api_sock, &mut vmm),
+                None => {
+                    let _ = vmm.kill();
+                    let _ = vmm.wait();
+                }
+            }
+        }
+        if let (Some(chrt), VmmMode::CloudHypervisor(chc)) = (&rt.ch, &self.cfg.vmm) {
+            for dev in chrt.nbd.values() {
+                ch::nbd_detach(chc, dev);
+            }
         }
         for (_, mut p) in rt.blockds.drain() {
             let _ = p.child.kill();
             let _ = p.child.wait();
             let _ = std::fs::remove_file(&p.socket);
+        }
+        if let Some(chrt) = &mut rt.ch {
+            chrt.nbd.clear();
         }
         let _ = std::fs::remove_file(rt.ctl_socket());
         let _ = std::fs::remove_file(rt.web_socket());
@@ -424,10 +700,15 @@ impl NodeRuntime {
             bail!("cannot suspend from {:?}", rt.state);
         }
         // ADR-0002 order: quiesce + durable flush BEFORE pausing.
-        let mut client = GuestClient::connect(&rt.ctl_socket())?;
+        let mut client = rt.conn().connect()?;
         client.syncfs()?;
-        let guest = rt.guest.as_ref().context("guest process missing")?;
-        signal(guest, libc::SIGSTOP);
+        match &rt.ch {
+            Some(chrt) => ch::pause(&chrt.api_sock)?,
+            None => {
+                let guest = rt.guest.as_ref().context("guest process missing")?;
+                signal(guest, libc::SIGSTOP);
+            }
+        }
         rt.state = ObservedState::Suspended;
         Ok(ObservedState::Suspended)
     }
@@ -441,13 +722,18 @@ impl NodeRuntime {
         if rt.state != ObservedState::Suspended {
             bail!("cannot resume from {:?}", rt.state);
         }
-        let guest = rt.guest.as_ref().context("guest process missing")?;
-        signal(guest, libc::SIGCONT);
+        match &rt.ch {
+            Some(chrt) => ch::resume(&chrt.api_sock)?,
+            None => {
+                let guest = rt.guest.as_ref().context("guest process missing")?;
+                signal(guest, libc::SIGCONT);
+            }
+        }
         let expected = rt.boot_id.clone();
-        let ctl = rt.ctl_socket();
+        let conn = rt.conn();
         drop(cats);
-        // The resumed process must be the same one (boot_id preserved).
-        let mut client = GuestClient::connect(&ctl)?;
+        // The resumed guest must be the same one (boot_id preserved).
+        let mut client = conn.connect()?;
         let (boot_id, _) = client.health()?;
         if expected.as_deref() != Some(boot_id.as_str()) {
             bail!("resume produced a different boot id");
@@ -470,10 +756,48 @@ impl NodeRuntime {
             ObservedState::Suspended | ObservedState::Running => {}
             other => bail!("cannot warm from {other:?}"),
         }
+        // CH mode: real memory snapshot, then everything exits (ADR-0002).
+        if rt.ch.is_some() {
+            let api = rt.ch.as_ref().expect("checked").api_sock.clone();
+            if rt.state != ObservedState::Suspended {
+                // Not paused yet: durable flush first, then pause.
+                let mut client = rt.conn().connect()?;
+                client.syncfs()?;
+                ch::pause(&api)?;
+            }
+            let snap_dir = rt.dir.join("snapshot");
+            let _ = std::fs::remove_dir_all(&snap_dir);
+            ch::snapshot(&api, &snap_dir)?;
+            if let Some(mut vmm) = rt.guest.take() {
+                ch::shutdown_vmm(&api, &mut vmm);
+            }
+            let nbd_devices: Vec<String> = rt
+                .ch
+                .as_ref()
+                .expect("checked")
+                .nbd
+                .values()
+                .cloned()
+                .collect();
+            if let VmmMode::CloudHypervisor(chc) = &self.cfg.vmm {
+                for dev in &nbd_devices {
+                    ch::nbd_detach(chc, dev);
+                }
+            }
+            for (_, mut p) in rt.blockds.drain() {
+                let _ = p.child.kill();
+                let _ = p.child.wait();
+            }
+            if let Some(chrt) = &mut rt.ch {
+                chrt.snapshot_dir = Some(snap_dir);
+            }
+            rt.state = ObservedState::Warm;
+            return Ok(ObservedState::Warm);
+        }
         if let Some(g) = &rt.guest {
             signal(g, libc::SIGCONT); // wake a suspended guest to snapshot it
         }
-        let mut client = GuestClient::connect(&rt.ctl_socket())?;
+        let mut client = rt.conn().connect()?;
         // Durable point, then persist the process identity ("snapshot"),
         // then exit the VMM and the block backends (ADR-0002 Warm).
         client.syncfs()?;
@@ -492,7 +816,7 @@ impl NodeRuntime {
     }
 
     fn restore_cat(&self, cat_id: &str, generation: i64) -> Result<ObservedState> {
-        let (volumes, expected_boot_id) = {
+        let (volumes, expected_boot_id, cpus, memory_mib) = {
             let cats = self.cats.lock().unwrap();
             let rt = cats
                 .get(cat_id)
@@ -500,16 +824,30 @@ impl NodeRuntime {
             if rt.state != ObservedState::Warm {
                 bail!("cannot restore from {:?}", rt.state);
             }
-            if !rt.state_file().exists() {
-                bail!("warm snapshot is missing");
+            match &rt.ch {
+                Some(chrt) => {
+                    anyhow::ensure!(
+                        chrt.snapshot_dir.as_ref().is_some_and(|d| d.exists()),
+                        "warm snapshot is missing"
+                    );
+                }
+                None => anyhow::ensure!(rt.state_file().exists(), "warm snapshot is missing"),
             }
-            (rt.volumes.clone(), rt.boot_id.clone())
+            (
+                rt.volumes.clone(),
+                rt.boot_id.clone(),
+                rt.cpus,
+                rt.memory_mib,
+            )
         };
-        self.cats.lock().unwrap().remove(cat_id);
+        // CH mode keeps the runtime entry (start_cat_ch consumes it).
+        if matches!(self.cfg.vmm, VmmMode::Fake) {
+            self.cats.lock().unwrap().remove(cat_id);
+        }
         // Re-launch on the preserved local state (cache + snapshot). The
         // fake VMM re-acquires the volume leases; the production vhost
         // implementation keeps the lease alive across Warm instead.
-        let observed = self.start_cat(cat_id, generation, volumes, true)?;
+        let observed = self.start_cat(cat_id, generation, volumes, cpus, memory_mib, true)?;
         let now_boot = self
             .cats
             .lock()
@@ -535,6 +873,11 @@ impl NodeRuntime {
         if rt.state != ObservedState::Running {
             bail!("hot attach requires a running cat");
         }
+        if rt.ch.is_some() {
+            // vm.add-disk hotplug lands with the vhost-user milestone; cold
+            // cats pick bindings up at the next start.
+            bail!("hot attach is not supported in Cloud Hypervisor mode yet");
+        }
         if rt.blockds.contains_key(&grant.disk_id) {
             return Ok(ObservedState::Running); // idempotent
         }
@@ -556,7 +899,7 @@ impl NodeRuntime {
         };
         rt.volumes.retain(|v| v.disk_id != disk_id);
         // Final durable flush through the guest before the backend exits.
-        if let Ok(mut client) = GuestClient::connect(&rt.ctl_socket()) {
+        if let Ok(mut client) = rt.conn().connect() {
             let _ = client.flush_disk(disk_id);
         }
         self.write_disk_map(rt)?;
@@ -570,7 +913,7 @@ impl NodeRuntime {
     // ------------------------------------------------------------------
 
     pub fn exec(&self, cat_id: &str, command: Vec<String>) -> Result<(i32, String, String)> {
-        let ctl = {
+        let conn = {
             let cats = self.cats.lock().unwrap();
             let rt = cats
                 .get(cat_id)
@@ -578,9 +921,9 @@ impl NodeRuntime {
             if rt.state != ObservedState::Running {
                 bail!("cat is not running (state {:?})", rt.state);
             }
-            rt.ctl_socket()
+            rt.conn()
         };
-        let mut client = GuestClient::connect(&ctl)?;
+        let mut client = conn.connect()?;
         client.exec(command)
     }
 

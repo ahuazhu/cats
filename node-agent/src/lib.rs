@@ -2,6 +2,7 @@
 //! (guest-agent process) and one cats-blockd per attachment. See
 //! `runtime.rs` for the FakeVmm / Cloud Hypervisor seam.
 
+pub mod ch;
 pub mod guest_client;
 pub mod runtime;
 pub mod server;
