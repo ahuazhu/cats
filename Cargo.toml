@@ -3,11 +3,18 @@ resolver = "2"
 members = [
     "api",
     "blockd",
+    "storage",
+    "adapters/object-store-file",
+    "adapters/object-store-aws-s3",
+    "adapters/metadata-store-sqlite",
     "control-plane",
     "node-agent",
     "guest",
     "network",
     "cmd/cats",
+    "cmd/blockd",
+    "cmd/controld",
+    "cmd/noded",
     "tests",
 ]
 
@@ -19,6 +26,10 @@ rust-version = "1.85"
 [workspace.dependencies]
 cats-api = { path = "api" }
 cats-blockd = { path = "blockd" }
+cats-storage = { path = "storage" }
+cats-object-store-file = { path = "adapters/object-store-file" }
+cats-object-store-aws-s3 = { path = "adapters/object-store-aws-s3" }
+cats-metadata-store-sqlite = { path = "adapters/metadata-store-sqlite" }
 cats-control-plane = { path = "control-plane" }
 cats-node-agent = { path = "node-agent" }
 cats-guest-agent = { path = "guest" }
@@ -52,6 +63,14 @@ bytes = "1"
 rand = "0.9"
 libc = "0.2"
 tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+undocumented_unsafe_blocks = "deny"
 
 [profile.release]
 debug = true

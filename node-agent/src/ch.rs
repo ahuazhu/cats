@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! guest virtio-blk -> CH built-in block backend -> /dev/nbdN (kernel NBD
-//! client) -> cats-blockd NBD server -> ChunkEngine -> S3/File blobstore
+//! client) -> cats-blockd NBD server -> ChunkEngine -> storage adapters
 //! ```
 //!
 //! The kernel NBD hop reuses the fully crash-tested NBD frontend; a native
@@ -130,6 +130,8 @@ fn nbd_lock() -> Result<std::fs::File> {
         .truncate(false)
         .write(true)
         .open(&lock_path)?;
+    // SAFETY: `file` owns a valid open descriptor for the duration of this
+    // call, and `flock` does not retain the descriptor pointer.
     let rc = unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) };
     anyhow::ensure!(rc == 0, "flock nbd allocation lock failed");
     Ok(file)

@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
-use clap::Parser;
-
+use cats_metadata_store_sqlite::SqliteMetadataStoreFactory;
 use cats_node_agent::runtime::NodeConfig;
 use cats_node_agent::server::{spawn, ServerConfig};
+use cats_storage::{open_metadata_store, AdapterConfig, AdapterSelection, MetadataStoreFactory};
+use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[command(name = "cats-noded", about = "Cats node agent")]
@@ -25,18 +26,13 @@ struct Args {
     #[arg(long)]
     guest_agent_bin: PathBuf,
     #[arg(long)]
-    meta_sqlite: PathBuf,
-    /// File blobstore root. Exactly one of --blob-file-root / --blob-s3-* .
+    metadata_store_adapter: String,
+    #[arg(long = "metadata-store-option", value_name = "KEY=VALUE")]
+    metadata_store_options: Vec<String>,
     #[arg(long)]
-    blob_file_root: Option<PathBuf>,
-    #[arg(long)]
-    blob_s3_endpoint: Option<String>,
-    #[arg(long)]
-    blob_s3_bucket: Option<String>,
-    #[arg(long, default_value = "us-east-1")]
-    blob_s3_region: String,
-    #[arg(long, default_value = "")]
-    blob_s3_prefix: String,
+    object_store_adapter: String,
+    #[arg(long = "object-store-option", value_name = "KEY=VALUE")]
+    object_store_options: Vec<String>,
     #[arg(long, default_value_t = 16)]
     cpus: u32,
     #[arg(long, default_value_t = 32768)]
@@ -74,18 +70,20 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
-    let blob = match (&args.blob_file_root, &args.blob_s3_endpoint) {
-        (Some(root), None) => cats_node_agent::runtime::BlobBackend::File { root: root.clone() },
-        (None, Some(endpoint)) => cats_node_agent::runtime::BlobBackend::S3 {
-            endpoint: endpoint.clone(),
-            bucket: args.blob_s3_bucket.clone().ok_or_else(|| {
-                anyhow::anyhow!("--blob-s3-bucket is required with --blob-s3-endpoint")
-            })?,
-            region: args.blob_s3_region.clone(),
-            prefix: args.blob_s3_prefix.clone(),
-        },
-        _ => anyhow::bail!("exactly one of --blob-file-root or --blob-s3-endpoint must be given"),
-    };
+    let metadata_store = AdapterSelection::new(
+        args.metadata_store_adapter,
+        AdapterConfig::from_cli(args.metadata_store_options)?,
+    );
+    let object_store = AdapterSelection::new(
+        args.object_store_adapter,
+        AdapterConfig::from_cli(args.object_store_options)?,
+    );
+    let metadata_factories: [&dyn MetadataStoreFactory; 1] = [&SqliteMetadataStoreFactory];
+    let storage_meta = open_metadata_store(
+        &metadata_store.name,
+        &metadata_store.config,
+        &metadata_factories,
+    )?;
     let vmm = match args.vmm.as_str() {
         "fake" => cats_node_agent::runtime::VmmMode::Fake,
         "ch" => cats_node_agent::runtime::VmmMode::CloudHypervisor(cats_node_agent::ch::ChConfig {
@@ -112,11 +110,12 @@ async fn main() -> anyhow::Result<()> {
             state_dir: args.state_dir,
             blockd_bin: args.blockd_bin,
             guest_agent_bin: args.guest_agent_bin,
-            meta_sqlite: args.meta_sqlite,
-            blob,
+            metadata_store,
+            object_store,
             blockd_lease_ttl_ms: args.blockd_lease_ttl_ms,
             vmm,
         },
+        storage_meta,
     })
     .await?;
     println!("READY {}", handle.addr);

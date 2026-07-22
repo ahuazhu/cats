@@ -2,7 +2,7 @@
 
 ## Repository state
 
-The repository contains the full Rust workspace implementation (V1 dev shape) plus architecture documents and validated experiments. Implemented and tested: ChunkStore engine (`blockd/`, spec in `docs/specs/blockd-protocol.md`), control plane, node agent (FakeVmm plus a Cloud Hypervisor Phase-A path), guest agent (Unix socket plus real-Guest vsock), CLI, endpoint gateway — 49 automated workspace tests including crash injection, fencing and cross-node cold restore. The Cloud Hypervisor path has also passed the 17-check AWS bare-metal acceptance run recorded under `experiments/metal-e2e-20260721/`. NOT yet implemented: native vhost-user-blk (Phase A uses kernel NBD), tap/overlay Guest networking, PostgreSQL metadata store (SQLite dev stand-in keeps the spec's SQL shape), and privilege separation. Do not infer other modules exist because a design document names them; check the workspace.
+The repository contains the full Rust workspace implementation (V1 dev shape) plus architecture documents and validated experiments. Implemented and tested: ChunkStore engine (`blockd/`, spec in `docs/specs/blockd-protocol.md`), provider-neutral storage ports and adapters, control plane, node agent (FakeVmm plus a Cloud Hypervisor Phase-A path), guest agent (Unix socket plus real-Guest vsock), CLI, endpoint gateway — automated workspace tests include adapter contracts, crash injection, fencing and cross-node cold restore. The Cloud Hypervisor path has also passed the 17-check AWS bare-metal acceptance run recorded under `experiments/metal-e2e-20260721/`. NOT yet implemented: native vhost-user-blk (Phase A uses kernel NBD), tap/overlay Guest networking, PostgreSQL metadata store (SQLite dev stand-in keeps the spec's SQL shape), and privilege separation. Do not infer other modules exist because a design document names them; check the workspace.
 
 Quality gates for any change: `cargo test --workspace` green and `cargo clippy --workspace --all-targets` warning-free.
 
@@ -10,7 +10,7 @@ Quality gates for any change: `cargo test --workspace` green and `cargo clippy -
 
 Read in this order:
 
-1. All ADRs in [`docs/decisions/`](docs/decisions/): [`0001` greenfield baseline](docs/decisions/0001-greenfield-implementation-baseline.md), [`0002` lifecycle states](docs/decisions/0002-lifecycle-states-running-suspended-warm-cold.md), [`0003` storage backend](docs/decisions/0003-direct-s3-chunkstore-backend.md), [`0004` stack and dev environment](docs/decisions/0004-implementation-stack-and-dev-environment.md)
+1. All ADRs in [`docs/decisions/`](docs/decisions/): [`0001` greenfield baseline](docs/decisions/0001-greenfield-implementation-baseline.md), [`0002` lifecycle states](docs/decisions/0002-lifecycle-states-running-suspended-warm-cold.md), [`0003` storage backend](docs/decisions/0003-direct-s3-chunkstore-backend.md), [`0004` stack and dev environment](docs/decisions/0004-implementation-stack-and-dev-environment.md), [`0005` provider-neutral storage ports and adapters](docs/decisions/0005-provider-neutral-storage-ports-and-adapters.md)
 2. [`docs/cats-complete-product-technical-architecture.md`](docs/cats-complete-product-technical-architecture.md)
 3. The task-specific design:
    - storage (selected backend, ADR-0003; Direct-OS 形态的 Direct-S3 实现): [`docs/direct-s3-chunkstore-architecture.md`](docs/direct-s3-chunkstore-architecture.md)
@@ -45,6 +45,8 @@ Never turn a prototype measurement into a production SLA. Preserve sample count,
 ## Backend status
 
 Direct-OS ChunkStore (Direct-S3 implementation: S3 immutable objects + PostgreSQL root/lease CAS) is the selected storage backend per ADR-0003. Do not implement the JuiceFS-backed sparse `disk.raw` design; `docs/cats-storage-product-blueprint.md` is historical reference only. The current Python/NBD prototype proves semantics and serves as a correctness oracle; the production target is the Rust `cats-blockd` described in the Direct-S3 document.
+
+Storage code follows Ports and Adapters per ADR-0005. Provider-neutral contracts live in `cats-storage`; concrete provider/product code lives in `adapters/`. AWS S3 is the first durable object-store adapter, not a dependency of core storage semantics.
 
 ## Documentation maintenance
 

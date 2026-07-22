@@ -14,7 +14,6 @@ ExecStart=/opt/cats/bin/cats-noded \
   --control-plane-url http://127.0.0.1:7300 \
   --gateway-url http://127.0.0.1:7400 \
   --state-dir /var/lib/cats/node \
-  --meta-sqlite /var/lib/cats/storage-meta.db \
   --blockd-bin /opt/cats/bin/cats-blockd \
   --guest-agent-bin /opt/cats/bin/cats-guest-agent \
   --vmm ch \
@@ -23,7 +22,8 @@ ExecStart=/opt/cats/bin/cats-noded \
   --ch-initramfs /opt/cats/guest/initramfs.img \
   --ch-cmdline "console=ttyS0 root=/dev/vda rw" \
   --ch-seed-image /opt/cats/guest/rootfs.ext4 \
-  $CATS_BLOB_ARGS
+  $CATS_METADATA_STORE_ARGS \
+  $CATS_OBJECT_STORE_ARGS
 Restart=always
 RestartSec=1
 

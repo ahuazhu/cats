@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -26,6 +26,7 @@ use anyhow::{bail, Context, Result};
 use cats_api::nodejob::{NodeJob, NodeJobAction, NodeJobResult, VolumeGrant};
 use cats_api::resources::ObservedState;
 use cats_guest_agent::DiskMapEntry;
+use cats_storage::{AdapterSelection, MetadataStore};
 
 use crate::ch::{self, ChConfig, ChRuntime, GUEST_VSOCK_PORT};
 use crate::guest_client::GuestClient;
@@ -39,33 +40,15 @@ pub enum VmmMode {
     CloudHypervisor(ChConfig),
 }
 
-/// Durable object store the node hands to its blockd children.
-///
-/// S3 credentials are NOT part of this config: `cats-blockd` reads
-/// `CATS_S3_ACCESS_KEY` / `CATS_S3_SECRET_KEY` from its environment, which
-/// the node agent's own environment provides (systemd `EnvironmentFile=` in
-/// the AWS deployment).
-#[derive(Debug, Clone)]
-pub enum BlobBackend {
-    File {
-        root: PathBuf,
-    },
-    S3 {
-        endpoint: String,
-        bucket: String,
-        region: String,
-        prefix: String,
-    },
-}
-
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
     pub node_id: String,
     pub state_dir: PathBuf,
     pub blockd_bin: PathBuf,
     pub guest_agent_bin: PathBuf,
-    pub meta_sqlite: PathBuf,
-    pub blob: BlobBackend,
+    /// Opaque selections passed to blockd without interpreting provider data.
+    pub metadata_store: AdapterSelection,
+    pub object_store: AdapterSelection,
     pub blockd_lease_ttl_ms: i64,
     pub vmm: VmmMode,
 }
@@ -157,6 +140,7 @@ fn symlink_socket(link: &Path, target: &Path) {
 
 pub struct NodeRuntime {
     pub cfg: NodeConfig,
+    storage_meta: Arc<dyn MetadataStore>,
     /// Serializes job execution; jobs are rare and idempotent.
     ops: Mutex<()>,
     cats: Mutex<HashMap<String, CatRuntime>>,
@@ -164,9 +148,10 @@ pub struct NodeRuntime {
 }
 
 impl NodeRuntime {
-    pub fn new(cfg: NodeConfig) -> Self {
+    pub fn new(cfg: NodeConfig, storage_meta: Arc<dyn MetadataStore>) -> Self {
         Self {
             cfg,
+            storage_meta,
             ops: Mutex::new(()),
             cats: Mutex::new(HashMap::new()),
             journal: Mutex::new(HashMap::new()),
@@ -404,9 +389,7 @@ impl NodeRuntime {
             if !warm_restore {
                 if let Some(image) = &chc.seed_image {
                     for grant in volumes.iter().filter(|g| g.mount_path == "/") {
-                        use cats_blockd::meta::MetadataStore;
-                        let meta = cats_blockd::meta::SqliteMeta::open(&self.cfg.meta_sqlite)?;
-                        let head = meta.load_head(&grant.volume_id)?;
+                        let head = self.storage_meta.load_head(&grant.volume_id)?;
                         if head.generation == 0 {
                             tracing::info!(volume = %grant.volume_id, "seeding golden root");
                             ch::seed_volume(&rt.blockds[&grant.disk_id].socket, image)?;
@@ -509,8 +492,10 @@ impl NodeRuntime {
             .arg(&data_dir)
             .arg("--attachment-id")
             .arg(&grant.attachment_id)
-            .arg("--meta-sqlite")
-            .arg(&self.cfg.meta_sqlite)
+            .arg("--metadata-store-adapter")
+            .arg(&self.cfg.metadata_store.name)
+            .arg("--object-store-adapter")
+            .arg(&self.cfg.object_store.name)
             .arg("--listen-unix")
             .arg(&socket)
             .arg("--create-volume-size")
@@ -519,25 +504,11 @@ impl NodeRuntime {
             .arg(self.cfg.blockd_lease_ttl_ms.to_string());
         let log = std::fs::File::create(cat_dir.join(format!("blockd-{}.log", grant.disk_id)))
             .context("create blockd log")?;
-        match &self.cfg.blob {
-            BlobBackend::File { root } => {
-                cmd.arg("--blob-file-root").arg(root);
-            }
-            BlobBackend::S3 {
-                endpoint,
-                bucket,
-                region,
-                prefix,
-            } => {
-                cmd.arg("--blob-s3-endpoint")
-                    .arg(endpoint)
-                    .arg("--blob-s3-bucket")
-                    .arg(bucket)
-                    .arg("--blob-s3-region")
-                    .arg(region)
-                    .arg("--blob-s3-prefix")
-                    .arg(prefix);
-            }
+        for option in self.cfg.metadata_store.config.to_cli() {
+            cmd.arg("--metadata-store-option").arg(option);
+        }
+        for option in self.cfg.object_store.config.to_cli() {
+            cmd.arg("--object-store-option").arg(option);
         }
         let child = cmd
             .stdout(Stdio::null())
@@ -958,7 +929,11 @@ impl NodeRuntime {
 }
 
 fn signal(child: &Child, sig: i32) {
-    unsafe {
-        libc::kill(child.id() as i32, sig);
+    if let Ok(pid) = i32::try_from(child.id()) {
+        // SAFETY: `pid` comes from the live `Child`; `kill` copies both scalar
+        // arguments and does not retain any borrowed memory.
+        unsafe {
+            libc::kill(pid, sig);
+        }
     }
 }

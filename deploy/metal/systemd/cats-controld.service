@@ -8,7 +8,7 @@ EnvironmentFile=/etc/cats/cats.env
 ExecStart=/opt/cats/bin/cats-controld \
   --listen 127.0.0.1:7300 \
   --db-path /var/lib/cats/control.db \
-  --storage-meta-path /var/lib/cats/storage-meta.db
+  $CATS_METADATA_STORE_ARGS
 Restart=always
 RestartSec=1
 

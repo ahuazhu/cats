@@ -350,7 +350,7 @@ async fn create_disk(
     // Create the storage volume eagerly so snapshots/resize work pre-attach.
     let size = cats_api::chunk::round_up_to_chunk(req.size_bytes);
     match state.storage_meta.create_volume(&disk.volume_id, size) {
-        Ok(()) | Err(cats_blockd::meta::MetaError::AlreadyExists(_)) => {}
+        Ok(()) | Err(cats_storage::MetaError::AlreadyExists(_)) => {}
         Err(e) => return Err(ApiError::internal(e.to_string()).into()),
     }
     Ok(Json(disk))
@@ -390,7 +390,7 @@ async fn delete_disk(
         return Err(ApiError::failed_precondition("disk must be Available (unmount first)").into());
     }
     match state.storage_meta.delete_volume(&disk.volume_id) {
-        Ok(()) | Err(cats_blockd::meta::MetaError::NotFound(_)) => {}
+        Ok(()) | Err(cats_storage::MetaError::NotFound(_)) => {}
         Err(e) => return Err(ApiError::internal(e.to_string()).into()),
     }
     state.store.delete_disk_row(&disk.id)?;
@@ -446,7 +446,7 @@ async fn disk_action(
                 hot_detach(&state, &cat, &disk).await?;
             }
             match state.storage_meta.revoke_lease(&disk.volume_id) {
-                Ok(()) | Err(cats_blockd::meta::MetaError::NotFound(_)) => {}
+                Ok(()) | Err(cats_storage::MetaError::NotFound(_)) => {}
                 Err(e) => return Err(ApiError::internal(e.to_string()).into()),
             }
             state.store.unbind_disk(&disk.id)?;
@@ -486,7 +486,7 @@ async fn hot_attach(state: &AppState, cat: &Cat, disk: &Disk, mount_path: &str) 
         .ok_or_else(|| ApiError::unavailable("cat node missing"))?;
     let size = cats_api::chunk::round_up_to_chunk(disk.size_bytes);
     match state.storage_meta.create_volume(&disk.volume_id, size) {
-        Ok(()) | Err(cats_blockd::meta::MetaError::AlreadyExists(_)) => {}
+        Ok(()) | Err(cats_storage::MetaError::AlreadyExists(_)) => {}
         Err(e) => return Err(ApiError::internal(e.to_string()).into()),
     }
     let job = cats_api::nodejob::NodeJob {

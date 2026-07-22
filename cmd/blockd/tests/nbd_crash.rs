@@ -7,8 +7,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cats_blockd::meta::{MetadataStore, SqliteMeta};
 use cats_blockd::nbd::{NbdClient, NbdError, EPERM};
+use cats_metadata_store_sqlite::SqliteMetadataStore;
+use cats_storage::MetadataStore;
 
 const CHUNK: u64 = cats_api::chunk::CHUNK_SIZE as u64;
 const VOL_SIZE: u64 = 4 * CHUNK;
@@ -35,8 +36,8 @@ impl TestEnv {
     fn socket(&self, host: &str) -> PathBuf {
         self.dir.path().join(format!("nbd-{host}.sock"))
     }
-    fn meta(&self) -> SqliteMeta {
-        SqliteMeta::open(&self.meta_path()).unwrap()
+    fn meta(&self) -> SqliteMetadataStore {
+        SqliteMetadataStore::open(&self.meta_path()).unwrap()
     }
 }
 
@@ -60,10 +61,14 @@ impl Server {
         ])
         .arg("--data-dir")
         .arg(env.data_dir(host))
-        .arg("--meta-sqlite")
-        .arg(env.meta_path())
-        .arg("--blob-file-root")
-        .arg(env.blob_root())
+        .arg("--metadata-store-adapter")
+        .arg("sqlite")
+        .arg("--metadata-store-option")
+        .arg(format!("path={}", env.meta_path().display()))
+        .arg("--object-store-adapter")
+        .arg("file")
+        .arg("--object-store-option")
+        .arg(format!("root={}", env.blob_root().display()))
         .arg("--listen-unix")
         .arg(&socket)
         .arg("--create-volume-size")

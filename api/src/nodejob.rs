@@ -8,10 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::resources::ObservedState;
 
-/// Authorization envelope for storage access carried by a job.
+/// Storage attachment grant carried by a job.
 ///
-/// The fencing epoch is the only credential the node needs in the local
-/// dev/test blobstore; the S3 backend adds scoped remote credentials here.
+/// Provider credentials never cross this API boundary. The node obtains
+/// adapter credentials from its own workload identity or secret source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeGrant {
     pub disk_id: String,

@@ -2,6 +2,8 @@
 name = "cats-guest-agent"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish = false
 
 [[bin]]
 name = "cats-guest-agent"
@@ -22,3 +24,6 @@ clap = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -4,7 +4,7 @@
 #
 #   sudo deploy/metal/install.sh
 #
-# Then edit /etc/cats/cats.env (S3 backend) and run deploy/metal/e2e.sh.
+# Then select the storage adapters in /etc/cats/cats.env and run deploy/metal/e2e.sh.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"

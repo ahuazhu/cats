@@ -5,13 +5,16 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
 use cats_api::guest::{GuestRequestBody, GuestResponseBody};
+use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_node_agent::guest_client::GuestClient;
 use cats_node_agent::runtime::NodeConfig;
 use cats_node_agent::server::{spawn as spawn_node, Handle as NodeHandle, ServerConfig};
 use cats_node_agent::testutil::workspace_bin;
+use cats_storage::{AdapterConfig, AdapterSelection, MetadataStore};
 
 const TOKEN: &str = "dev-token";
 
@@ -27,10 +30,13 @@ struct Cluster {
 impl Cluster {
     async fn start(node_ids: &[&str]) -> Cluster {
         let dir = tempfile::tempdir().unwrap();
+        let storage_meta_path = dir.path().join("storage-meta.db");
+        let storage_meta: Arc<dyn MetadataStore> =
+            Arc::new(SqliteMetadataStore::open(&storage_meta_path).unwrap());
         let cp = cats_control_plane::server::spawn(cats_control_plane::server::Config {
             listen: "127.0.0.1:0".into(),
             db_path: dir.path().join("control.db"),
-            storage_meta_path: dir.path().join("storage-meta.db"),
+            storage_meta,
             auth_token: TOKEN.into(),
             node_lease_timeout_ms: 3_000,
             reconcile_interval_ms: 150,
@@ -67,6 +73,21 @@ impl Cluster {
         gateway: &cats_network::Handle,
         id: &str,
     ) -> NodeHandle {
+        let meta_path = dir.path().join("storage-meta.db");
+        let metadata_store = AdapterSelection {
+            name: "sqlite".into(),
+            config: AdapterConfig::from_pairs([("path", meta_path.display().to_string())]).unwrap(),
+        };
+        let object_store = AdapterSelection {
+            name: "file".into(),
+            config: AdapterConfig::from_pairs([(
+                "root",
+                dir.path().join("blob").display().to_string(),
+            )])
+            .unwrap(),
+        };
+        let storage_meta: Arc<dyn MetadataStore> =
+            Arc::new(SqliteMetadataStore::open(&meta_path).unwrap());
         spawn_node(ServerConfig {
             listen: "127.0.0.1:0".into(),
             control_plane_url: cp.base_url(),
@@ -75,15 +96,14 @@ impl Cluster {
             cpus: 16,
             memory_mib: 32_768,
             heartbeat_ms: 300,
+            storage_meta,
             node: NodeConfig {
                 node_id: id.to_string(),
                 state_dir: dir.path().join(format!("node-{id}")),
                 blockd_bin: workspace_bin("cats-blockd"),
                 guest_agent_bin: workspace_bin("cats-guest-agent"),
-                meta_sqlite: dir.path().join("storage-meta.db"),
-                blob: cats_node_agent::runtime::BlobBackend::File {
-                    root: dir.path().join("blob"),
-                },
+                metadata_store,
+                object_store,
                 blockd_lease_ttl_ms: 1_200,
                 vmm: cats_node_agent::runtime::VmmMode::Fake,
             },

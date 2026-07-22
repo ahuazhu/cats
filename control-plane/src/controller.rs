@@ -16,7 +16,7 @@ use std::time::Duration;
 use cats_api::error::ErrorBody;
 use cats_api::nodejob::{self, JobPhase, NodeJob, NodeJobAction, NodeJobResult, VolumeGrant};
 use cats_api::resources::*;
-use cats_blockd::meta::{MetaError, MetadataStore};
+use cats_storage::{MetaError, MetadataStore};
 
 use crate::store::{now_ms, Store};
 

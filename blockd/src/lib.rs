@@ -1,4 +1,4 @@
-//! cats-blockd: Direct-OS ChunkStore block engine (Direct-S3 implementation).
+//! Provider-neutral Direct-OS ChunkStore block engine.
 //!
 //! Layering (spec: docs/specs/blockd-protocol.md):
 //!
@@ -6,8 +6,8 @@
 //! frontend (NBD today, vhost-user-blk on Linux later)
 //!        └── engine::ChunkEngine        read/write/flush/trim, dirty tracking,
 //!                                       pending commit packs, crash recovery
-//!             ├── blobstore::BlobStore  immutable objects (File / S3)
-//!             └── meta::MetadataStore   volume root CAS + lease/fencing
+//!             ├── cats_storage::BlobStore      immutable object port
+//!             └── cats_storage::MetadataStore  root CAS + fencing port
 //! ```
 //!
 //! The engine is deliberately synchronous: every entry point is `&self` and
@@ -15,10 +15,7 @@
 //! is the V1 correctness baseline the spec freezes; multi-queue performance
 //! work must not change the commit protocol.
 
-pub mod blobstore;
 pub mod crashpoint;
 pub mod engine;
 pub mod format;
-pub mod meta;
 pub mod nbd;
-pub mod s3;

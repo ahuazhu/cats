@@ -2,7 +2,7 @@
 
 Phase A 形态（正确性优先）：Cloud Hypervisor 直接内核启动真 Guest；磁盘链路
 `guest virtio-blk → CH raw disk → /dev/nbdN（内核 NBD client）→ cats-blockd →
-S3/File BlobStore`；Guest Agent 走 vsock；Suspended=vm.pause，Warm=vm.snapshot
+BlobStore port → AWS S3/File adapter`；Guest Agent 走 vsock；Suspended=vm.pause，Warm=vm.snapshot
 + 全进程退出，Restore=--restore。原生 vhost-user-blk 与 tap Guest 网络是下一
 个性能/网络里程碑，不改变提交协议。
 

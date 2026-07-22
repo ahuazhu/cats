@@ -4,13 +4,16 @@
 //! idempotency. Storage flows through real cats-blockd instances.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use cats_api::guest::{GuestRequestBody, GuestResponseBody};
 use cats_api::nodejob::{job_id, NodeJob, NodeJobAction, VolumeGrant};
 use cats_api::resources::ObservedState;
+use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_node_agent::guest_client::GuestClient;
 use cats_node_agent::runtime::{NodeConfig, NodeRuntime};
 use cats_node_agent::testutil::workspace_bin;
+use cats_storage::{AdapterConfig, AdapterSelection, MetadataStore};
 
 const CAT: &str = "cat_rt";
 const SIZE: u64 = 2 * cats_api::chunk::CHUNK_SIZE as u64;
@@ -24,18 +27,34 @@ struct Env {
 fn env() -> Env {
     let dir = tempfile::tempdir().unwrap();
     let state_dir = dir.path().join("node-state");
-    let runtime = NodeRuntime::new(NodeConfig {
-        node_id: "node_test".into(),
-        state_dir: state_dir.clone(),
-        blockd_bin: workspace_bin("cats-blockd"),
-        guest_agent_bin: workspace_bin("cats-guest-agent"),
-        meta_sqlite: dir.path().join("meta.db"),
-        blob: cats_node_agent::runtime::BlobBackend::File {
-            root: dir.path().join("blob"),
+    let meta_path = dir.path().join("meta.db");
+    let metadata_store = AdapterSelection {
+        name: "sqlite".into(),
+        config: AdapterConfig::from_pairs([("path", meta_path.display().to_string())]).unwrap(),
+    };
+    let object_store = AdapterSelection {
+        name: "file".into(),
+        config: AdapterConfig::from_pairs([(
+            "root",
+            dir.path().join("blob").display().to_string(),
+        )])
+        .unwrap(),
+    };
+    let storage_meta: Arc<dyn MetadataStore> =
+        Arc::new(SqliteMetadataStore::open(&meta_path).unwrap());
+    let runtime = NodeRuntime::new(
+        NodeConfig {
+            node_id: "node_test".into(),
+            state_dir: state_dir.clone(),
+            blockd_bin: workspace_bin("cats-blockd"),
+            guest_agent_bin: workspace_bin("cats-guest-agent"),
+            metadata_store,
+            object_store,
+            blockd_lease_ttl_ms: 1200,
+            vmm: cats_node_agent::runtime::VmmMode::Fake,
         },
-        blockd_lease_ttl_ms: 1200,
-        vmm: cats_node_agent::runtime::VmmMode::Fake,
-    });
+        storage_meta,
+    );
     Env {
         _dir: dir,
         runtime,

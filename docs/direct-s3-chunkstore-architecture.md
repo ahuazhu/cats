@@ -641,12 +641,16 @@ ChunkRef {
 
 ## 15. 实施计划
 
-本设计是唯一实现路径（ADR-0003），直接面向生产 Rust 实现；`BlobStore`/`MetadataStore` 抽象只用于测试替身与故障注入，不为第二套生产后端服务。
+本设计是唯一数据路径（ADR-0003），直接面向生产 Rust 实现。按
+[ADR-0005](decisions/0005-provider-neutral-storage-ports-and-adapters.md)，
+`BlobStore`/`MetadataStore` 是长期 provider-neutral ports；File/SQLite 是开发
+adapter，AWS S3 是第一版 durable object-store adapter。具体厂商协议、SDK、凭据
+和参数只允许存在于 `adapters/` 与进程 composition root，不进入 `ChunkEngine`。
 
 | 阶段 | 实现内容 | 退出条件 |
 |----|----|----|
 | P0：已有 Demo | Python/NBD、固定 Chunk、Generation Manifest、原子 HEAD、真实 JuiceFS 对照、崩溃注入 | 已完成：冷恢复、HEAD 前后崩溃和兼容 ext4 验证通过。 |
-| P1：接口拆分 | `BlockEngine`、`LocalCache`、`BlobStore`、`MetadataStore` 四个边界；File/S3 两种 BlobStore（File 用于单测与故障注入） | 相同测试套件在 File Backend 与 S3 兼容测试端点上通过。 |
+| P1：接口拆分 | `BlockEngine`、`LocalCache`、`BlobStore`、`MetadataStore` 四个边界；契约位于 `cats-storage`，实现位于独立 adapter crate | 相同契约测试在 File adapter 与 AWS S3 兼容测试端点上通过；核心 crate 不依赖厂商实现。 |
 | P2：Rust 正确性版本 | 4MiB Full Chunk、两级 Map、PostgreSQL CAS、Lease/Fencing、S3 checksum | NBD/ublk 下 ext4、fsck、fio、kill -9 和 stale-writer 测试通过。 |
 | P3：虚拟化接入 | vhost-user-blk、多队列、Cloud Hypervisor 动态磁盘、RootDisk boot | 真实 Guest 中系统盘和 PersistentDisk 生命周期通过。 |
 | P4：空间与小写优化 | Delta Pack、Compaction、TRIM、Snapshot/Clone、Mark-and-Sweep GC | git clone、apt/npm、SQLite fsync 的远端写放大和延迟达到阈值。 |

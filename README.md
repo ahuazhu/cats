@@ -2,7 +2,7 @@
 
 Cats 是一个从零实现的独立项目：为用户提供可休眠、可迁移、带持久块设备和稳定网络入口的 Linux microVM。
 
-仓库包含**完整的 Rust workspace 实现**与全部设计文档、实验证据：存储引擎（Direct-OS ChunkStore，S3 后端经 MinIO 实测）、控制面、node-agent（FakeVmm + **Cloud Hypervisor 真 microVM 模式**）、guest-agent（vsock）、CLI、Endpoint 网关，以及覆盖崩溃注入、fencing、跨节点冷恢复的 49 个自动化测试（macOS 与 Linux 双平台全绿）。裸金属部署与验收见 [deploy/metal/](deploy/metal/README.md)。
+仓库包含**完整的 Rust workspace 实现**与全部设计文档、实验证据：存储引擎（Direct-OS ChunkStore，AWS S3 adapter 可经 MinIO 联测）、控制面、node-agent（FakeVmm + **Cloud Hypervisor 真 microVM 模式**）、guest-agent（vsock）、CLI、Endpoint 网关，以及覆盖 adapter 契约、崩溃注入、fencing、跨节点冷恢复的自动化测试。Cloud Hypervisor Phase-A 路径另有 17 项 AWS 裸金属验收记录；部署与证据见 [deploy/metal/](deploy/metal/README.md)。
 
 ## Greenfield 边界
 
@@ -11,6 +11,7 @@ Cats 是一个从零实现的独立项目：为用户提供可休眠、可迁移
 - 用户和公开 API 统一使用 `cats` 命名。
 - Guest 看到普通 virtio block device 和 ext4；S3、NVMe Cache、Chunk/Manifest 与租约均为平台内部实现。
 - 存储后端已选定为 Direct-OS ChunkStore（Direct-S3 实现，[ADR-0003](docs/decisions/0003-direct-s3-chunkstore-backend.md)）；JuiceFS 方案不再实现，仅作历史参考。
+- 存储依赖边界采用 Ports and Adapters（[ADR-0005](docs/decisions/0005-provider-neutral-storage-ports-and-adapters.md)）：核心只依赖云无关契约，AWS S3 是第一版 durable adapter。
 - 生命周期状态统一为 Running / Suspended / Warm / Cold（[ADR-0002](docs/decisions/0002-lifecycle-states-running-suspended-warm-cold.md)）。
 
 具体边界记录在 [`ADR-0001: Greenfield implementation baseline`](docs/decisions/0001-greenfield-implementation-baseline.md) 及后续 ADR。
@@ -51,11 +52,13 @@ Cats 是一个从零实现的独立项目：为用户提供可休眠、可迁移
 ## 代码结构（Rust workspace，ADR-0004）
 
 ```text
-cmd/cats/                 cats CLI（clap；等待 Operation、幂等键）
+cmd/                      daemon composition roots 与 cats CLI；只在这里注册具体 adapter
+storage/                  云无关 BlobStore/MetadataStore ports、错误契约与 adapter factory
+adapters/                 具体实现：File、SQLite（开发）与 AWS S3（首个 durable adapter）
 control-plane/            Resource API、Operation、Scheduler、reconcile Controller（axum + SQLite）
 node-agent/               NodeJob 执行器、FakeVmm、blockd 子进程监督、心跳（cats-noded）
 blockd/                   ChunkStore 引擎：Cache/Bitmap/Pack/Map、FLUSH 提交协议、
-                          lease/fencing、NBD 前端、File/S3 BlobStore（cats-blockd）
+                          lease/fencing、NBD 前端（cats-blockd；只依赖 storage ports）
 guest/                    Guest Agent：控制协议、经 NBD 的块 I/O、demo web（cats-guest-agent）
 network/                  Endpoint 网关：路由解析、唤醒、旧路由 fail-closed（cats-gatewayd）
 api/                      共享类型：资源模型、四态、NodeJob、Guest 协议、Chunk 常量
@@ -69,8 +72,9 @@ docs/                     架构、决策、协议规格和实验报告
 | 层 | 状态 | 说明 |
 |---|---|---|
 | 存储引擎（blockd） | ✅ 实现并测试 | 协议见 [docs/specs/blockd-protocol.md](docs/specs/blockd-protocol.md)；4 个提交窗口 kill -9 恢复、空缓存冷恢复、stale epoch 拒绝均有测试 |
-| 控制面 / CLI / 网关 / node-agent / guest-agent | ✅ 实现并测试 | workspace 单元 + 集成 + E2E 共 49 个测试 |
-| S3 BlobStore | ✅ 代码 + 签名向量测试 | SigV4 通过 AWS 官方测试向量；对真实 S3/MinIO 的联测按需运行 |
+| 控制面 / CLI / 网关 / node-agent / guest-agent | ✅ 实现并测试 | 单元 + 集成 + E2E 覆盖完整开发闭环 |
+| 存储 ports / adapters | ✅ 接口拆分 | `cats-storage` 不含厂商依赖；File/SQLite 为开发 adapter，AWS S3 为首个 durable object-store adapter |
+| AWS S3 adapter | ✅ 代码 + 签名向量测试 | SigV4 通过 AWS 官方测试向量；对真实 AWS S3/MinIO 的联测按需运行 |
 | 元数据存储 | SQLite（开发） | 与规格同 SQL 形状；生产 PostgreSQL 为后续替换项 |
 | 虚拟化 | FakeVmm + **Cloud Hypervisor 模式**（`--vmm ch`，Linux+KVM） | CH 直接内核启动、vsock Guest Agent、vm.pause/resume、Warm=vm.snapshot/--restore；块路径 Phase A 走内核 NBD（正确性等价，vhost-user 为性能里程碑）；部署见 `deploy/metal/` |
 | Guest 网络 / tap / overlay | 未实现 | 下一里程碑；exec/健康走 vsock；Endpoint 演示仅 FakeVmm 形态 |
@@ -79,18 +83,19 @@ docs/                     架构、决策、协议规格和实验报告
 
 ```bash
 cargo build --workspace          # 全部组件
-cargo test --workspace           # 49 个测试：单元 + 崩溃注入 + 控制面契约 + E2E
+cargo test --workspace           # 单元 + adapter 契约 + 崩溃注入 + 控制面契约 + E2E
 cargo clippy --workspace --all-targets   # 零警告
 ```
 
 单机手动体验（四个终端或后台）：
 
 ```bash
-cargo run -p cats-control-plane --bin cats-controld -- --listen 127.0.0.1:7300
-cargo run -p cats-node-agent --bin cats-noded -- \
+cargo run -p cats-control-plane-daemon --bin cats-controld -- --listen 127.0.0.1:7300
+cargo run -p cats-node-agent-daemon --bin cats-noded -- \
   --node-id n1 --control-plane-url http://127.0.0.1:7300 \
-  --state-dir /tmp/cats-n1 --meta-sqlite cats-storage-meta.db \
-  --blob-file-root /tmp/cats-blob \
+  --state-dir /tmp/cats-n1 \
+  --metadata-store-adapter sqlite --metadata-store-option path=cats-storage-meta.db \
+  --object-store-adapter file --object-store-option root=/tmp/cats-blob \
   --blockd-bin target/debug/cats-blockd --guest-agent-bin target/debug/cats-guest-agent
 cargo run -p cats-network --bin cats-gatewayd -- --listen 127.0.0.1:7400
 cargo run -p cats-cli --bin cats -- create dev --root-size 64MiB && \

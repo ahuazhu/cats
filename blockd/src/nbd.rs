@@ -474,13 +474,14 @@ impl NbdClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blobstore::FileBlobStore;
     use crate::engine::EngineConfig;
-    use crate::meta::{MetadataStore, SqliteMeta};
+    use cats_metadata_store_sqlite::SqliteMetadataStore;
+    use cats_object_store_file::FileBlobStore;
+    use cats_storage::MetadataStore;
 
     fn engine(dir: &Path) -> Arc<ChunkEngine> {
         let blob = Arc::new(FileBlobStore::open(dir.join("blob")).unwrap());
-        let meta = Arc::new(SqliteMeta::open(&dir.join("meta.db")).unwrap());
+        let meta = Arc::new(SqliteMetadataStore::open(&dir.join("meta.db")).unwrap());
         meta.create_volume("vol_nbd", 4 * cats_api::chunk::CHUNK_SIZE as u64)
             .unwrap();
         ChunkEngine::attach(

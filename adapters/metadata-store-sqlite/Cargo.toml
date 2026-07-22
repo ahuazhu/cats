@@ -1,0 +1,16 @@
+[package]
+name = "cats-metadata-store-sqlite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+cats-storage = { workspace = true }
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

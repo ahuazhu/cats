@@ -1,24 +1,26 @@
-//! S3-compatible BlobStore over HTTP with AWS Signature V4 (path-style).
+//! AWS S3 adapter for the provider-neutral Cats blob-store port.
 //!
-//! Works against AWS S3, MinIO and other S3-compatible endpoints. This is
-//! the production durable store (ADR-0003); `FileBlobStore` mirrors its
-//! semantics for dev/tests. Live integration tests run only when
-//! `CATS_S3_TEST_ENDPOINT` is set (see `blockd/tests/`).
+//! The adapter uses AWS Signature V4 and path-style requests. A configurable
+//! endpoint keeps MinIO usable as the contract-test target without exposing
+//! S3 concepts to storage consumers.
 //!
-//! Immutability note: our object keys are content-stable (txn-derived), so a
-//! repeated PUT always carries identical bytes; we deliberately do not spend
-//! an extra HEAD per PUT to re-check.
+//! Immutability uses `If-None-Match: *`; a retry that finds an existing object
+//! verifies its bytes before treating the operation as idempotently complete.
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::blobstore::{BlobError, BlobStore, Result};
+use cats_storage::blob::{validate_key, BlobError, BlobStore, Result};
+use cats_storage::{AdapterConfig, AdapterError, BlobStoreFactory};
+
+pub const ADAPTER_NAME: &str = "aws-s3";
 
 type HmacSha256 = Hmac<Sha256>;
 
-#[derive(Debug, Clone)]
-pub struct S3Config {
+#[derive(Clone)]
+pub struct AwsS3Config {
     /// Endpoint origin, e.g. `https://s3.us-east-1.amazonaws.com` or
     /// `http://127.0.0.1:9000` (MinIO).
     pub endpoint: String,
@@ -26,17 +28,43 @@ pub struct S3Config {
     pub region: String,
     pub access_key: String,
     pub secret_key: String,
+    /// Session token for short-lived AWS credentials.
+    pub session_token: Option<String>,
     /// Key prefix inside the bucket (tenant/env isolation).
     pub prefix: String,
 }
 
-pub struct S3BlobStore {
-    cfg: S3Config,
+pub struct AwsS3BlobStore {
+    cfg: AwsS3Config,
     client: reqwest::blocking::Client,
 }
 
-impl S3BlobStore {
-    pub fn new(cfg: S3Config) -> Result<Self> {
+impl AwsS3BlobStore {
+    pub fn new(mut cfg: AwsS3Config) -> Result<Self> {
+        let endpoint = reqwest::Url::parse(&cfg.endpoint).map_err(|error| BlobError::Backend {
+            key: "<config>".into(),
+            message: format!("invalid AWS S3 endpoint: {error}"),
+        })?;
+        if !matches!(endpoint.scheme(), "http" | "https")
+            || !endpoint.has_host()
+            || endpoint.path() != "/"
+            || endpoint.query().is_some()
+            || endpoint.fragment().is_some()
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+        {
+            return Err(BlobError::Backend {
+                key: "<config>".into(),
+                message: "AWS S3 endpoint must be an HTTP(S) origin without credentials, path, query, or fragment".into(),
+            });
+        }
+        if cfg.bucket.is_empty() {
+            return Err(BlobError::Backend {
+                key: "<config>".into(),
+                message: "AWS S3 bucket must not be empty".into(),
+            });
+        }
+        cfg.endpoint = endpoint.origin().ascii_serialization();
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(60))
             .build()
@@ -78,21 +106,37 @@ impl S3BlobStore {
         path: &str,
         query: &[(String, String)],
         body: &[u8],
+        extra_headers: &[(&str, &str)],
         key_for_errors: &str,
     ) -> Result<(u16, Vec<u8>)> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("clock")
+            .map_err(|error| BlobError::Backend {
+                key: key_for_errors.into(),
+                message: format!("system clock is before the Unix epoch: {error}"),
+            })?
             .as_secs();
-        let (amz_date, date_stamp) = amz_timestamp(now as i64);
+        let now = i64::try_from(now).map_err(|error| BlobError::Backend {
+            key: key_for_errors.into(),
+            message: format!("system clock is outside the supported range: {error}"),
+        })?;
+        let (amz_date, date_stamp) = amz_timestamp(now);
         let payload_hash = hex::encode(Sha256::digest(body));
         let host = self.host();
 
-        let headers = vec![
+        let mut headers = vec![
             ("host".to_string(), host.clone()),
             ("x-amz-content-sha256".to_string(), payload_hash.clone()),
             ("x-amz-date".to_string(), amz_date.clone()),
         ];
+        if let Some(token) = &self.cfg.session_token {
+            headers.push(("x-amz-security-token".to_string(), token.clone()));
+        }
+        headers.extend(
+            extra_headers
+                .iter()
+                .map(|(name, value)| (name.to_ascii_lowercase(), (*value).to_string())),
+        );
         let auth = sign_v4(
             method,
             path,
@@ -108,8 +152,12 @@ impl S3BlobStore {
         );
 
         let url = self.url(path, query);
-        let m = reqwest::Method::from_bytes(method.as_bytes()).expect("valid method");
-        let mut req = self.client.request(m, &url).body(body.to_vec());
+        let method =
+            reqwest::Method::from_bytes(method.as_bytes()).map_err(|error| BlobError::Backend {
+                key: key_for_errors.into(),
+                message: format!("invalid HTTP method: {error}"),
+            })?;
+        let mut req = self.client.request(method, &url).body(body.to_vec());
         for (k, v) in &headers {
             if k != "host" {
                 req = req.header(k.as_str(), v.as_str());
@@ -131,19 +179,81 @@ impl S3BlobStore {
         Ok((status, bytes))
     }
 
-    fn object_path(&self, key: &str) -> String {
-        format!(
+    fn object_path(&self, key: &str) -> Result<String> {
+        validate_key(key)?;
+        Ok(format!(
             "/{}/{}",
             uri_encode(&self.cfg.bucket, false),
             uri_encode(&self.full_key(key), false)
-        )
+        ))
     }
 }
 
-impl BlobStore for S3BlobStore {
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AwsS3BlobStoreFactory;
+
+impl BlobStoreFactory for AwsS3BlobStoreFactory {
+    fn name(&self) -> &'static str {
+        ADAPTER_NAME
+    }
+
+    fn open(
+        &self,
+        config: &AdapterConfig,
+    ) -> std::result::Result<Arc<dyn BlobStore>, AdapterError> {
+        config.ensure_only(ADAPTER_NAME, &["endpoint", "bucket", "region", "prefix"])?;
+        let bucket = config.required(ADAPTER_NAME, "bucket")?.to_string();
+        let region = config.optional("region").unwrap_or("us-east-1").to_string();
+        let endpoint = config
+            .optional("endpoint")
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com"));
+        let access_key =
+            std::env::var("AWS_ACCESS_KEY_ID").map_err(|_| AdapterError::InvalidConfig {
+                adapter: ADAPTER_NAME,
+                message: "AWS_ACCESS_KEY_ID is not set".into(),
+            })?;
+        let secret_key =
+            std::env::var("AWS_SECRET_ACCESS_KEY").map_err(|_| AdapterError::InvalidConfig {
+                adapter: ADAPTER_NAME,
+                message: "AWS_SECRET_ACCESS_KEY is not set".into(),
+            })?;
+        let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
+        AwsS3BlobStore::new(AwsS3Config {
+            endpoint,
+            bucket,
+            region,
+            access_key,
+            secret_key,
+            session_token,
+            prefix: config.optional("prefix").unwrap_or_default().to_string(),
+        })
+        .map(|store| Arc::new(store) as Arc<dyn BlobStore>)
+        .map_err(|error| AdapterError::Open {
+            adapter: ADAPTER_NAME,
+            message: error.to_string(),
+        })
+    }
+}
+
+impl BlobStore for AwsS3BlobStore {
     fn put_immutable(&self, key: &str, data: &[u8]) -> Result<()> {
-        let path = self.object_path(key);
-        let (status, body) = self.request("PUT", &path, &[], data, key)?;
+        let path = self.object_path(key)?;
+        let (status, body) =
+            self.request("PUT", &path, &[], data, &[("if-none-match", "*")], key)?;
+        if matches!(status, 409 | 412) {
+            return match self.get(key) {
+                Ok(existing) if existing == data => Ok(()),
+                Ok(_) => Err(BlobError::Backend {
+                    key: key.to_string(),
+                    message: "immutable object overwrite with different content".into(),
+                }),
+                Err(error) => Err(BlobError::Backend {
+                    key: key.to_string(),
+                    message: format!("conditional PUT conflicted and existing object could not be verified: {error}"),
+                }),
+            };
+        }
         if !(200..300).contains(&status) {
             return Err(BlobError::Backend {
                 key: key.to_string(),
@@ -154,8 +264,8 @@ impl BlobStore for S3BlobStore {
     }
 
     fn get(&self, key: &str) -> Result<Vec<u8>> {
-        let path = self.object_path(key);
-        let (status, body) = self.request("GET", &path, &[], b"", key)?;
+        let path = self.object_path(key)?;
+        let (status, body) = self.request("GET", &path, &[], b"", &[], key)?;
         match status {
             200..=299 => Ok(body),
             404 => Err(BlobError::NotFound(key.to_string())),
@@ -167,8 +277,8 @@ impl BlobStore for S3BlobStore {
     }
 
     fn exists(&self, key: &str) -> Result<bool> {
-        let path = self.object_path(key);
-        let (status, body) = self.request("HEAD", &path, &[], b"", key)?;
+        let path = self.object_path(key)?;
+        let (status, body) = self.request("HEAD", &path, &[], b"", &[], key)?;
         match status {
             200..=299 => Ok(true),
             404 => Ok(false),
@@ -180,8 +290,8 @@ impl BlobStore for S3BlobStore {
     }
 
     fn delete(&self, key: &str) -> Result<()> {
-        let path = self.object_path(key);
-        let (status, body) = self.request("DELETE", &path, &[], b"", key)?;
+        let path = self.object_path(key)?;
+        let (status, body) = self.request("DELETE", &path, &[], b"", &[], key)?;
         if !(200..300).contains(&status) && status != 404 {
             return Err(BlobError::Backend {
                 key: key.to_string(),
@@ -209,7 +319,7 @@ impl BlobStore for S3BlobStore {
                 query.push(("continuation-token".to_string(), t.clone()));
             }
             let path = format!("/{}", uri_encode(&self.cfg.bucket, false));
-            let (status, body) = self.request("GET", &path, &query, b"", prefix)?;
+            let (status, body) = self.request("GET", &path, &query, b"", &[], prefix)?;
             if !(200..300).contains(&status) {
                 return Err(BlobError::Backend {
                     key: prefix.to_string(),
@@ -383,6 +493,24 @@ fn xml_unescape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_object_key_fails_before_network_io() {
+        let store = AwsS3BlobStore::new(AwsS3Config {
+            endpoint: "http://127.0.0.1:1".into(),
+            bucket: "test".into(),
+            region: "us-east-1".into(),
+            access_key: "unused".into(),
+            secret_key: "unused".into(),
+            session_token: None,
+            prefix: String::new(),
+        })
+        .unwrap();
+        assert!(matches!(
+            store.exists("../escape"),
+            Err(BlobError::InvalidKey { .. })
+        ));
+    }
 
     /// AWS SigV4 test-suite vector `get-vanilla`.
     #[test]

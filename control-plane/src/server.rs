@@ -6,36 +6,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-
-use cats_blockd::meta::{MetadataStore, SqliteMeta};
+use cats_storage::MetadataStore;
 
 use crate::controller::Controller;
 use crate::store::Store;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// `host:port`; use port 0 to pick a free port (tests).
     pub listen: String,
     /// Control-plane resource database.
     pub db_path: PathBuf,
-    /// Storage metadata database (volume roots + leases), shared with blockd.
-    pub storage_meta_path: PathBuf,
+    /// Open authoritative volume-root/lease port, shared with blockd.
+    pub storage_meta: Arc<dyn MetadataStore>,
     pub auth_token: String,
     pub node_lease_timeout_ms: i64,
     pub reconcile_interval_ms: u64,
-}
-
-impl Config {
-    pub fn dev(dir: &std::path::Path) -> Self {
-        Self {
-            listen: "127.0.0.1:0".to_string(),
-            db_path: dir.join("control.db"),
-            storage_meta_path: dir.join("storage-meta.db"),
-            auth_token: "dev-token".to_string(),
-            node_lease_timeout_ms: 3_000,
-            reconcile_interval_ms: 200,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -75,8 +61,7 @@ impl Drop for Handle {
 pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
     let cfg = Arc::new(cfg);
     let store = Arc::new(Store::open(&cfg.db_path)?);
-    let storage_meta: Arc<dyn MetadataStore> =
-        Arc::new(SqliteMeta::open(&cfg.storage_meta_path).context("open storage meta")?);
+    let storage_meta = cfg.storage_meta.clone();
     let notify = Arc::new(tokio::sync::Notify::new());
     let controller = Controller::new(
         store.clone(),

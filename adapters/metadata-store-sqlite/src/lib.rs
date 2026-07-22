@@ -1,111 +1,54 @@
-//! Authoritative volume metadata: root pointer CAS + lease/fencing (spec §4).
+//! SQLite development adapter for the authoritative metadata port.
 //!
-//! The SQLite implementation is the dev/test stand-in for the production
-//! PostgreSQL store; both must keep the exact SQL shape of the spec: the
-//! CAS is a single conditional UPDATE whose affected-row count decides
+//! This implementation preserves the production contract's SQL shape: root
+//! publication is one conditional UPDATE whose affected-row count determines
 //! whether a FLUSH may be acknowledged.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use cats_storage::metadata::{MetaError, MetadataStore, Result, SnapshotRow, VolumeHead};
+use cats_storage::{AdapterConfig, AdapterError, MetadataStoreFactory};
 use rusqlite::{params, Connection, OptionalExtension};
 
-#[derive(Debug, Clone)]
-pub struct VolumeHead {
-    pub volume_id: String,
-    pub size_bytes: u64,
-    pub generation: i64,
-    pub root_hash: Option<[u8; 32]>,
-    pub root_object_id: Option<String>,
-}
+pub const ADAPTER_NAME: &str = "sqlite";
 
-#[derive(Debug, Clone)]
-pub struct SnapshotRow {
-    pub snapshot_id: String,
-    pub volume_id: String,
-    pub generation: i64,
-    pub root_hash: Option<[u8; 32]>,
-    pub root_object_id: Option<String>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum MetaError {
-    #[error("volume not found: {0}")]
-    NotFound(String),
-    #[error("volume already exists: {0}")]
-    AlreadyExists(String),
-    #[error("lease is held by another attachment")]
-    LeaseHeld,
-    #[error("lease epoch is stale or expired (fenced)")]
-    Fenced,
-    #[error("root CAS conflict: expected generation {expected}")]
-    CasConflict { expected: i64 },
-    #[error("metadata backend error: {0}")]
-    Backend(String),
-}
-
-pub type Result<T> = std::result::Result<T, MetaError>;
-
-pub fn now_ms() -> i64 {
+fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_millis() as i64
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
-/// Authoritative metadata operations. All implementations must be safe for
-/// concurrent use from multiple processes (the SQLite impl relies on the
-/// database file's own locking).
-pub trait MetadataStore: Send + Sync {
-    fn create_volume(&self, volume_id: &str, size_bytes: u64) -> Result<()>;
-    fn load_head(&self, volume_id: &str) -> Result<VolumeHead>;
-    fn delete_volume(&self, volume_id: &str) -> Result<()>;
-    /// Grow-only resize; rejected while a live lease exists (V1 requires the
-    /// disk to be detached).
-    fn resize_volume(&self, volume_id: &str, new_size_bytes: u64) -> Result<()>;
+fn sqlite_integer(value: u64, field: &str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| {
+        MetaError::InvalidArgument(format!("{field} exceeds SQLite's signed 64-bit range"))
+    })
+}
 
-    /// Acquire the single-writer lease. Succeeds only when no unexpired lease
-    /// is held by a different attachment; always bumps the fencing epoch.
-    /// Re-acquiring with the same attachment id is allowed (crash restart)
-    /// and also bumps the epoch.
-    fn acquire_lease(&self, volume_id: &str, attachment_id: &str, ttl_ms: i64) -> Result<i64>;
-    fn renew_lease(
-        &self,
-        volume_id: &str,
-        attachment_id: &str,
-        epoch: i64,
-        ttl_ms: i64,
-    ) -> Result<()>;
-    fn release_lease(&self, volume_id: &str, attachment_id: &str, epoch: i64) -> Result<()>;
-    /// Control-plane fencing: expire the current lease immediately so the old
-    /// holder's next renew fails and a new attachment can acquire.
-    fn revoke_lease(&self, volume_id: &str) -> Result<()>;
-
-    /// Spec §4 root CAS. Returns the new generation.
-    fn cas_head(
-        &self,
-        volume_id: &str,
-        expected_generation: i64,
-        new_root_hash: [u8; 32],
-        new_root_object_id: &str,
-        attachment_id: &str,
-        epoch: i64,
-    ) -> Result<i64>;
-
-    fn create_snapshot(&self, snapshot_id: &str, volume_id: &str) -> Result<SnapshotRow>;
-    fn list_snapshots(&self, volume_id: &str) -> Result<Vec<SnapshotRow>>;
+fn lease_window(ttl_ms: i64) -> Result<(i64, i64)> {
+    if ttl_ms <= 0 {
+        return Err(MetaError::InvalidArgument(
+            "lease TTL must be positive".into(),
+        ));
+    }
+    let now = now_ms();
+    let expires_at = now
+        .checked_add(ttl_ms)
+        .ok_or_else(|| MetaError::InvalidArgument("lease expiry overflows i64".into()))?;
+    Ok((now, expires_at))
 }
 
 // ---------------------------------------------------------------------------
 // SQLite implementation
 // ---------------------------------------------------------------------------
 
-pub struct SqliteMeta {
+pub struct SqliteMetadataStore {
     conn: Mutex<Connection>,
 }
 
-impl SqliteMeta {
+impl SqliteMetadataStore {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).map_err(sql_err)?;
         conn.busy_timeout(std::time::Duration::from_secs(10))
@@ -139,6 +82,12 @@ impl SqliteMeta {
             conn: Mutex::new(conn),
         })
     }
+
+    fn connection(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.conn
+            .lock()
+            .map_err(|_| MetaError::Backend("SQLite connection mutex was poisoned".into()))
+    }
 }
 
 fn sql_err(e: rusqlite::Error) -> MetaError {
@@ -147,22 +96,47 @@ fn sql_err(e: rusqlite::Error) -> MetaError {
 
 fn row_to_head(row: &rusqlite::Row<'_>) -> rusqlite::Result<VolumeHead> {
     let hash: Option<Vec<u8>> = row.get(3)?;
+    let size = row.get::<_, i64>(1)?;
     Ok(VolumeHead {
         volume_id: row.get(0)?,
-        size_bytes: row.get::<_, i64>(1)? as u64,
+        size_bytes: u64::try_from(size).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })?,
         generation: row.get(2)?,
-        root_hash: hash.map(|h| h.try_into().expect("stored hash is 32 bytes")),
+        root_hash: decode_hash(hash, 3)?,
         root_object_id: row.get(4)?,
     })
 }
 
-impl MetadataStore for SqliteMeta {
+fn decode_hash(hash: Option<Vec<u8>>, column: usize) -> rusqlite::Result<Option<[u8; 32]>> {
+    hash.map(|bytes| {
+        bytes.try_into().map_err(|bytes: Vec<u8>| {
+            rusqlite::Error::FromSqlConversionFailure(
+                column,
+                rusqlite::types::Type::Blob,
+                std::io::Error::other(format!(
+                    "expected a 32-byte hash, got {} bytes",
+                    bytes.len()
+                ))
+                .into(),
+            )
+        })
+    })
+    .transpose()
+}
+
+impl MetadataStore for SqliteMetadataStore {
     fn create_volume(&self, volume_id: &str, size_bytes: u64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let size_bytes = sqlite_integer(size_bytes, "size_bytes")?;
+        let conn = self.connection()?;
         let n = conn
             .execute(
                 "INSERT OR IGNORE INTO volumes (volume_id, size_bytes) VALUES (?1, ?2)",
-                params![volume_id, size_bytes as i64],
+                params![volume_id, size_bytes],
             )
             .map_err(sql_err)?;
         if n == 0 {
@@ -172,7 +146,7 @@ impl MetadataStore for SqliteMeta {
     }
 
     fn load_head(&self, volume_id: &str) -> Result<VolumeHead> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection()?;
         conn.query_row(
             "SELECT volume_id, size_bytes, generation, root_hash, root_object_id
                FROM volumes WHERE volume_id = ?1",
@@ -185,7 +159,7 @@ impl MetadataStore for SqliteMeta {
     }
 
     fn delete_volume(&self, volume_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection()?;
         conn.execute(
             "DELETE FROM volumes WHERE volume_id = ?1",
             params![volume_id],
@@ -200,14 +174,15 @@ impl MetadataStore for SqliteMeta {
     }
 
     fn resize_volume(&self, volume_id: &str, new_size_bytes: u64) -> Result<()> {
+        let new_size_bytes = sqlite_integer(new_size_bytes, "new_size_bytes")?;
         let now = now_ms();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection()?;
         let n = conn
             .execute(
                 "UPDATE volumes SET size_bytes = ?2
                   WHERE volume_id = ?1 AND size_bytes <= ?2
                     AND (lease_owner IS NULL OR lease_expires_at_ms <= ?3)",
-                params![volume_id, new_size_bytes as i64, now],
+                params![volume_id, new_size_bytes, now],
             )
             .map_err(sql_err)?;
         if n == 0 {
@@ -230,8 +205,8 @@ impl MetadataStore for SqliteMeta {
     }
 
     fn acquire_lease(&self, volume_id: &str, attachment_id: &str, ttl_ms: i64) -> Result<i64> {
-        let now = now_ms();
-        let conn = self.conn.lock().unwrap();
+        let (now, expires_at) = lease_window(ttl_ms)?;
+        let conn = self.connection()?;
         let n = conn
             .execute(
                 "UPDATE volumes
@@ -242,7 +217,7 @@ impl MetadataStore for SqliteMeta {
                     AND (lease_owner IS NULL
                          OR lease_expires_at_ms <= ?4
                          OR lease_owner = ?2)",
-                params![volume_id, attachment_id, now + ttl_ms, now],
+                params![volume_id, attachment_id, expires_at, now],
             )
             .map_err(sql_err)?;
         if n == 0 {
@@ -275,14 +250,14 @@ impl MetadataStore for SqliteMeta {
         epoch: i64,
         ttl_ms: i64,
     ) -> Result<()> {
-        let now = now_ms();
-        let conn = self.conn.lock().unwrap();
+        let (now, expires_at) = lease_window(ttl_ms)?;
+        let conn = self.connection()?;
         let n = conn
             .execute(
                 "UPDATE volumes SET lease_expires_at_ms = ?4
                   WHERE volume_id = ?1 AND lease_owner = ?2 AND lease_epoch = ?3
                     AND lease_expires_at_ms > ?5",
-                params![volume_id, attachment_id, epoch, now + ttl_ms, now],
+                params![volume_id, attachment_id, epoch, expires_at, now],
             )
             .map_err(sql_err)?;
         if n == 0 {
@@ -292,7 +267,7 @@ impl MetadataStore for SqliteMeta {
     }
 
     fn release_lease(&self, volume_id: &str, attachment_id: &str, epoch: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection()?;
         conn.execute(
             "UPDATE volumes SET lease_owner = NULL, lease_expires_at_ms = 0
               WHERE volume_id = ?1 AND lease_owner = ?2 AND lease_epoch = ?3",
@@ -303,7 +278,7 @@ impl MetadataStore for SqliteMeta {
     }
 
     fn revoke_lease(&self, volume_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection()?;
         conn.execute(
             "UPDATE volumes SET lease_expires_at_ms = 0 WHERE volume_id = ?1",
             params![volume_id],
@@ -322,7 +297,7 @@ impl MetadataStore for SqliteMeta {
         epoch: i64,
     ) -> Result<i64> {
         let now = now_ms();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection()?;
         let n = conn
             .execute(
                 "UPDATE volumes
@@ -352,7 +327,7 @@ impl MetadataStore for SqliteMeta {
     }
 
     fn create_snapshot(&self, snapshot_id: &str, volume_id: &str) -> Result<SnapshotRow> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection()?;
         let head = conn
             .query_row(
                 "SELECT volume_id, size_bytes, generation, root_hash, root_object_id
@@ -386,7 +361,7 @@ impl MetadataStore for SqliteMeta {
     }
 
     fn list_snapshots(&self, volume_id: &str) -> Result<Vec<SnapshotRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection()?;
         let mut stmt = conn
             .prepare(
                 "SELECT snapshot_id, volume_id, generation, root_hash, root_object_id
@@ -400,7 +375,7 @@ impl MetadataStore for SqliteMeta {
                     snapshot_id: row.get(0)?,
                     volume_id: row.get(1)?,
                     generation: row.get(2)?,
-                    root_hash: hash.map(|h| h.try_into().expect("32 bytes")),
+                    root_hash: decode_hash(hash, 3)?,
                     root_object_id: row.get(4)?,
                 })
             })
@@ -409,13 +384,36 @@ impl MetadataStore for SqliteMeta {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SqliteMetadataStoreFactory;
+
+impl MetadataStoreFactory for SqliteMetadataStoreFactory {
+    fn name(&self) -> &'static str {
+        ADAPTER_NAME
+    }
+
+    fn open(
+        &self,
+        config: &AdapterConfig,
+    ) -> std::result::Result<std::sync::Arc<dyn MetadataStore>, AdapterError> {
+        config.ensure_only(ADAPTER_NAME, &["path"])?;
+        let path = config.required(ADAPTER_NAME, "path")?;
+        SqliteMetadataStore::open(Path::new(path))
+            .map(|store| std::sync::Arc::new(store) as std::sync::Arc<dyn MetadataStore>)
+            .map_err(|error| AdapterError::Open {
+                adapter: ADAPTER_NAME,
+                message: error.to_string(),
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn store() -> (tempfile::TempDir, SqliteMeta) {
+    fn store() -> (tempfile::TempDir, SqliteMetadataStore) {
         let dir = tempfile::tempdir().unwrap();
-        let meta = SqliteMeta::open(&dir.path().join("meta.db")).unwrap();
+        let meta = SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap();
         (dir, meta)
     }
 
@@ -431,6 +429,24 @@ mod tests {
         assert_eq!(head.generation, 0);
         assert!(head.root_hash.is_none());
         assert!(matches!(m.load_head("nope"), Err(MetaError::NotFound(_))));
+    }
+
+    #[test]
+    fn invalid_numeric_inputs_are_rejected_without_wrapping() {
+        let (_d, m) = store();
+        assert!(matches!(
+            m.create_volume("too-large", u64::MAX),
+            Err(MetaError::InvalidArgument(_))
+        ));
+        m.create_volume("v1", 1 << 22).unwrap();
+        assert!(matches!(
+            m.acquire_lease("v1", "attA", 0),
+            Err(MetaError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            m.acquire_lease("v1", "attA", i64::MAX),
+            Err(MetaError::InvalidArgument(_))
+        ));
     }
 
     #[test]

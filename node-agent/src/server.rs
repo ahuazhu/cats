@@ -14,10 +14,11 @@ use cats_api::nodejob::NodeJob;
 use cats_api::requests::{
     ExecRequest, ExecResponse, HeartbeatCat, HeartbeatRequest, RegisterNodeRequest,
 };
+use cats_storage::MetadataStore;
 
 use crate::runtime::{NodeConfig, NodeRuntime};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ServerConfig {
     pub listen: String,
     pub control_plane_url: String,
@@ -27,6 +28,7 @@ pub struct ServerConfig {
     pub memory_mib: u64,
     pub heartbeat_ms: u64,
     pub node: NodeConfig,
+    pub storage_meta: Arc<dyn MetadataStore>,
 }
 
 #[derive(Clone)]
@@ -149,7 +151,7 @@ pub fn router(state: NodeState) -> Router {
 pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
     std::fs::create_dir_all(&cfg.node.state_dir)?;
     let cfg = Arc::new(cfg);
-    let runtime = Arc::new(NodeRuntime::new(cfg.node.clone()));
+    let runtime = Arc::new(NodeRuntime::new(cfg.node.clone(), cfg.storage_meta.clone()));
     let state = NodeState {
         runtime: runtime.clone(),
         cfg: cfg.clone(),

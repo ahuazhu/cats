@@ -27,10 +27,10 @@ pub mod testutil {
 
     fn package_for(bin: &str) -> &'static str {
         match bin {
-            "cats-blockd" => "cats-blockd",
+            "cats-blockd" => "cats-blockd-daemon",
             "cats-guest-agent" => "cats-guest-agent",
-            "cats-noded" => "cats-node-agent",
-            "cats-controld" => "cats-control-plane",
+            "cats-noded" => "cats-node-agent-daemon",
+            "cats-controld" => "cats-control-plane-daemon",
             "cats-gatewayd" => "cats-network",
             "cats" => "cats-cli",
             other => panic!("unknown workspace binary {other}"),

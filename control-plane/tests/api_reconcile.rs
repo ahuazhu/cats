@@ -14,6 +14,8 @@ use cats_api::nodejob::{NodeJob, NodeJobAction, NodeJobResult};
 use cats_api::requests::*;
 use cats_api::resources::*;
 use cats_control_plane::server::{spawn, Config, Handle};
+use cats_metadata_store_sqlite::SqliteMetadataStore;
+use cats_storage::MetadataStore;
 
 // ---------------------------------------------------------------------------
 // Stub node agent: accepts every job, tracks "running" cats, heartbeats.
@@ -141,7 +143,18 @@ struct Ctx {
 impl Ctx {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let cp = spawn(Config::dev(dir.path())).await.unwrap();
+        let storage_meta: Arc<dyn MetadataStore> =
+            Arc::new(SqliteMetadataStore::open(&dir.path().join("storage-meta.db")).unwrap());
+        let cp = spawn(Config {
+            listen: "127.0.0.1:0".into(),
+            db_path: dir.path().join("control.db"),
+            storage_meta,
+            auth_token: "dev-token".into(),
+            node_lease_timeout_ms: 3_000,
+            reconcile_interval_ms: 200,
+        })
+        .await
+        .unwrap();
         Self {
             _dir: dir,
             cp,

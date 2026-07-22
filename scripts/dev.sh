@@ -28,7 +28,8 @@ up() {
   "$BIN/cats-controld" \
     --listen "$API" \
     --db-path "$STATE/control.db" \
-    --storage-meta-path "$STATE/storage-meta.db" \
+    --metadata-store-adapter sqlite \
+    --metadata-store-option "path=$STATE/storage-meta.db" \
     >"$LOGS/controld.log" 2>&1 &
   echo $! > "$STATE/controld.pid"
 
@@ -46,8 +47,10 @@ up() {
     --control-plane-url "http://$API" \
     --gateway-url "http://$GW" \
     --state-dir "$STATE/node-n1" \
-    --meta-sqlite "$STATE/storage-meta.db" \
-    --blob-file-root "$STATE/blob" \
+    --metadata-store-adapter sqlite \
+    --metadata-store-option "path=$STATE/storage-meta.db" \
+    --object-store-adapter file \
+    --object-store-option "root=$STATE/blob" \
     --blockd-bin "$BIN/cats-blockd" \
     --guest-agent-bin "$BIN/cats-guest-agent" \
     >"$LOGS/noded.log" 2>&1 &

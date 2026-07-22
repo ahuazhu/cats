@@ -16,10 +16,9 @@ use std::time::Duration;
 
 use cats_api::chunk::{self, CHUNKS_PER_LEAF, CHUNK_SIZE};
 
-use crate::blobstore::{BlobError, BlobStore};
 use crate::crashpoint;
 use crate::format::{self, ChunkRef, LeafRef, PackEntry, PackHeader, BITMAP_HEADER_LEN};
-use crate::meta::{MetaError, MetadataStore};
+use cats_storage::{BlobError, BlobStore, MetaError, MetadataStore};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -29,6 +28,8 @@ pub enum EngineError {
     Fenced,
     #[error("volume corrupt: {0}")]
     Corrupt(String),
+    #[error("invalid engine configuration: {0}")]
+    InvalidConfig(String),
     #[error(transparent)]
     Blob(#[from] BlobError),
     #[error(transparent)]
@@ -104,6 +105,16 @@ impl ChunkEngine {
         blob: Arc<dyn BlobStore>,
         meta: Arc<dyn MetadataStore>,
     ) -> Result<Arc<Self>> {
+        if cfg.volume_id.is_empty() || cfg.attachment_id.is_empty() {
+            return Err(EngineError::InvalidConfig(
+                "volume_id and attachment_id must not be empty".into(),
+            ));
+        }
+        if cfg.lease_ttl_ms <= 0 {
+            return Err(EngineError::InvalidConfig(
+                "lease_ttl_ms must be positive".into(),
+            ));
+        }
         let head = meta.load_head(&cfg.volume_id)?;
         let size = head.size_bytes;
         if size == 0 || size % CHUNK_SIZE as u64 != 0 {
@@ -826,8 +837,8 @@ fn root_object_hex(object_id: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blobstore::FileBlobStore;
-    use crate::meta::SqliteMeta;
+    use cats_metadata_store_sqlite::SqliteMetadataStore;
+    use cats_object_store_file::FileBlobStore;
     use std::sync::atomic::AtomicU64;
 
     struct Env {
@@ -843,7 +854,7 @@ mod tests {
     fn env() -> Env {
         let dir = tempfile::tempdir().unwrap();
         let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
-        let meta = Arc::new(SqliteMeta::open(&dir.path().join("meta.db")).unwrap());
+        let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
         meta.create_volume(VOL, SIZE).unwrap();
         let data_dir = dir.path().join("data");
         Env {
@@ -959,20 +970,20 @@ mod tests {
         gets: AtomicU64,
     }
     impl BlobStore for CountingBlob {
-        fn put_immutable(&self, k: &str, d: &[u8]) -> crate::blobstore::Result<()> {
+        fn put_immutable(&self, k: &str, d: &[u8]) -> cats_storage::blob::Result<()> {
             self.inner.put_immutable(k, d)
         }
-        fn get(&self, k: &str) -> crate::blobstore::Result<Vec<u8>> {
+        fn get(&self, k: &str) -> cats_storage::blob::Result<Vec<u8>> {
             self.gets.fetch_add(1, Ordering::SeqCst);
             self.inner.get(k)
         }
-        fn exists(&self, k: &str) -> crate::blobstore::Result<bool> {
+        fn exists(&self, k: &str) -> cats_storage::blob::Result<bool> {
             self.inner.exists(k)
         }
-        fn delete(&self, k: &str) -> crate::blobstore::Result<()> {
+        fn delete(&self, k: &str) -> cats_storage::blob::Result<()> {
             self.inner.delete(k)
         }
-        fn list(&self, p: &str) -> crate::blobstore::Result<Vec<String>> {
+        fn list(&self, p: &str) -> cats_storage::blob::Result<Vec<String>> {
             self.inner.list(p)
         }
     }
@@ -1040,7 +1051,7 @@ mod tests {
 
     #[test]
     fn failed_upload_leaves_pack_and_recovery_replays_it() {
-        use crate::blobstore::FaultyBlobStore;
+        use cats_storage::blob::FaultyBlobStore;
         let env = env();
         let faulty = Arc::new(FaultyBlobStore::new(env.blob.clone()));
         let data = pattern(2048, 7);

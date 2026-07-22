@@ -32,8 +32,12 @@ use cats_blockd::nbd::NbdClient;
 // ---------------------------------------------------------------------------
 
 pub fn write_frame<W: Write, T: Serialize>(w: &mut W, value: &T) -> std::io::Result<()> {
-    let body = serde_json::to_vec(value).expect("frame serializes");
-    w.write_all(&(body.len() as u32).to_be_bytes())?;
+    let body = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+    let len = u32::try_from(body.len()).map_err(|_| std::io::Error::other("oversized frame"))?;
+    if len > MAX_FRAME_BYTES {
+        return Err(std::io::Error::other("oversized frame"));
+    }
+    w.write_all(&len.to_be_bytes())?;
     w.write_all(&body)?;
     w.flush()
 }
@@ -373,6 +377,8 @@ fn list_block_devices() -> Vec<String> {
 #[cfg(target_os = "linux")]
 fn real_syncfs() -> Result<()> {
     // sync(2) flushes all filesystems; simple and sufficient for V1.
+    // SAFETY: `sync` takes no pointers or arguments and has no Rust-side
+    // memory-safety preconditions.
     unsafe { libc::sync() };
     Ok(())
 }
@@ -392,6 +398,9 @@ impl VsockListener {
     fn accept(&self) -> Result<std::os::unix::net::UnixStream> {
         use std::os::fd::{AsRawFd, FromRawFd};
         loop {
+            // SAFETY: the listener owns a valid AF_VSOCK descriptor; null
+            // address pointers are explicitly allowed, and no pointer is
+            // retained after `accept4` returns.
             let fd = unsafe {
                 libc::accept4(
                     self.0.as_raw_fd(),
@@ -401,6 +410,9 @@ impl VsockListener {
                 )
             };
             if fd >= 0 {
+                // SAFETY: a successful `accept4` returns a fresh owned stream
+                // descriptor, transferred exactly once to `UnixStream` as a
+                // generic owning stream-fd wrapper.
                 return Ok(unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) });
             }
             let error = std::io::Error::last_os_error();
@@ -413,27 +425,40 @@ impl VsockListener {
 
 #[cfg(target_os = "linux")]
 pub fn bind_vsock(port: u32) -> Result<VsockListener> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    unsafe {
-        let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
-        anyhow::ensure!(fd >= 0, "vsock socket: {}", std::io::Error::last_os_error());
-        // Own the descriptor before any fallible operation so bind/listen
-        // errors cannot leak it in a Guest Agent restart loop.
-        let fd = std::os::fd::OwnedFd::from_raw_fd(fd);
-        let mut addr: libc::sockaddr_vm = std::mem::zeroed();
-        addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
-        addr.svm_port = port;
-        addr.svm_cid = libc::VMADDR_CID_ANY;
-        let rc = libc::bind(
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    // SAFETY: `socket` receives constant address/protocol values and returns
+    // either a new owned descriptor or a negative error sentinel.
+    let raw_fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    anyhow::ensure!(
+        raw_fd >= 0,
+        "vsock socket: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: `raw_fd` was just returned by `socket`, is non-negative, and is
+    // transferred exactly once into `OwnedFd`; every later error closes it.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    // SAFETY: zero is a valid initial representation for `sockaddr_vm`; all
+    // fields required by AF_VSOCK are populated immediately below.
+    let mut addr: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
+    addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
+    addr.svm_port = port;
+    addr.svm_cid = libc::VMADDR_CID_ANY;
+    // SAFETY: the pointer and length describe the live `addr` value, and the
+    // owned socket descriptor stays valid for the call.
+    let rc = unsafe {
+        libc::bind(
             fd.as_raw_fd(),
             &addr as *const _ as *const libc::sockaddr,
             std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
-        );
-        anyhow::ensure!(rc == 0, "vsock bind: {}", std::io::Error::last_os_error());
-        let rc = libc::listen(fd.as_raw_fd(), 16);
-        anyhow::ensure!(rc == 0, "vsock listen: {}", std::io::Error::last_os_error());
-        Ok(VsockListener(fd))
-    }
+        )
+    };
+    anyhow::ensure!(rc == 0, "vsock bind: {}", std::io::Error::last_os_error());
+    // SAFETY: `fd` remains a valid socket descriptor and `listen` retains no
+    // Rust references.
+    let rc = unsafe { libc::listen(fd.as_raw_fd(), 16) };
+    anyhow::ensure!(rc == 0, "vsock listen: {}", std::io::Error::last_os_error());
+    Ok(VsockListener(fd))
 }
 
 #[cfg(not(target_os = "linux"))]

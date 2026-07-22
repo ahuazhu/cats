@@ -665,6 +665,14 @@ Cat 创建时自动从 Golden Root 克隆；作为 `/dev/vda`；包含系统、�
 
 cats-blockd 原生实现 Direct-OS ChunkStore（Direct-S3 实现）：NVMe Cache + Dirty Bitmap/Pending Commit Pack + 两级不可变 Map + S3 不可变对象 + PostgreSQL root/lease CAS。对象存储、元数据和内部格式对用户与 Guest 完全不可见。JuiceFS raw image 方案不再实现，仅作历史参考。
 
+**实现依赖边界（[ADR-0005](decisions/0005-provider-neutral-storage-ports-and-adapters.md)）**
+
+存储采用 Ports and Adapters：`cats-storage` 只定义 `BlobStore`、`MetadataStore`
+契约、错误与 adapter factory；`adapters/` 中的独立 crate 承载 File、SQLite、
+AWS S3 等具体实现。控制器和 `ChunkEngine` 只依赖 ports，厂商参数只在 composition
+root 解析。V1 静态链接 adapter，不承诺动态 plugin ABI；AWS S3 是第一个 durable
+object-store adapter，而不是核心代码的云依赖。
+
 ### 10.1 I/O 与持久性
 
 | Guest 操作 | Host 行为 | 返回成功条件 | Host 丢失后的保证 |
