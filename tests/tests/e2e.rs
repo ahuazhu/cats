@@ -3,7 +3,6 @@
 //! binary. Covers the minimal production acceptance scenarios from the
 //! architecture doc §20.1 that are meaningful without KVM.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -17,7 +16,6 @@ use cats_node_agent::server::{spawn as spawn_node, Handle as NodeHandle, ServerC
 use cats_node_agent::testutil::workspace_bin;
 use cats_storage::{AdapterConfig, AdapterSelection, MetadataStore};
 
-const USER_TOKEN: &str = "dev-token";
 const SERVICE_TOKEN: &str = "dev-service-token";
 const ADMIN_TOKEN: &str = "dev-admin-token";
 
@@ -36,14 +34,12 @@ impl Cluster {
         let storage_meta_path = dir.path().join("storage-meta.db");
         let storage_meta: Arc<dyn MetadataStore> =
             Arc::new(SqliteMetadataStore::open(&storage_meta_path).unwrap());
-        let project_tokens = BTreeMap::from([("default".to_string(), USER_TOKEN.to_string())]);
         let cp = cats_control_plane::server::spawn(cats_control_plane::server::Config {
             listen: "127.0.0.1:0".into(),
             db_path: dir.path().join("control.db"),
             storage_meta,
             auth_token: SERVICE_TOKEN.into(),
             admin_token: ADMIN_TOKEN.into(),
-            project_tokens,
             workos: None,
             node_lease_timeout_ms: 3_000,
             reconcile_interval_ms: 150,
@@ -122,7 +118,7 @@ impl Cluster {
 
     /// Run the real `cats` binary; returns (exit_ok, stdout, stderr).
     async fn cli(&self, args: &[&str]) -> (bool, String, String) {
-        self.cli_with_token(args, USER_TOKEN).await
+        self.cli_with_token(args, ADMIN_TOKEN).await
     }
 
     async fn cli_with_token(&self, args: &[&str], token: &str) -> (bool, String, String) {
@@ -169,7 +165,7 @@ impl Cluster {
     async fn api_get(&self, path: &str) -> serde_json::Value {
         self.http
             .get(format!("{}{}", self.cp.base_url(), path))
-            .bearer_auth(USER_TOKEN)
+            .bearer_auth(ADMIN_TOKEN)
             .send()
             .await
             .unwrap()
@@ -315,7 +311,6 @@ async fn work_driven_fast_suspend_and_gateway_wake_loop() {
             "256MiB",
             "--cpus",
             "1",
-            "--auto-suspend",
         ])
         .await;
     cluster.wait_cat_state("nap", "suspended").await;
@@ -360,6 +355,7 @@ async fn product_loop_end_to_end() {
             "256MiB",
             "--cpus",
             "1",
+            "--no-auto-suspend",
         ])
         .await;
     assert!(out.contains("observed=running"), "create output: {out}");
@@ -478,7 +474,15 @@ async fn product_loop_end_to_end() {
 
     // RWO: mounting the bound disk somewhere else is rejected.
     cluster
-        .cli_ok(&["create", "second", "--root-size", "8MiB", "--cpus", "1"])
+        .cli_ok(&[
+            "create",
+            "second",
+            "--root-size",
+            "8MiB",
+            "--cpus",
+            "1",
+            "--no-auto-suspend",
+        ])
         .await;
     let (ok, _, stderr) = cluster
         .cli(&["mount", "shared", "--cat", "second", "--at", "/data"])
@@ -544,7 +548,15 @@ async fn host_loss_fences_and_recovers_elsewhere() {
     // Force placement onto node-a.
     cluster.cordon("node-b").await;
     cluster
-        .cli_ok(&["create", "victim", "--root-size", "8MiB", "--cpus", "1"])
+        .cli_ok(&[
+            "create",
+            "victim",
+            "--root-size",
+            "8MiB",
+            "--cpus",
+            "1",
+            "--no-auto-suspend",
+        ])
         .await;
     let cat = cluster.cat_json("victim").await;
     let cat_id = cat["id"].as_str().unwrap().to_string();
@@ -629,7 +641,15 @@ async fn api_semantics_through_cli() {
     let cluster = Cluster::start(&["node-a"]).await;
 
     cluster
-        .cli_ok(&["create", "api", "--root-size", "8MiB", "--cpus", "1"])
+        .cli_ok(&[
+            "create",
+            "api",
+            "--root-size",
+            "8MiB",
+            "--cpus",
+            "1",
+            "--no-auto-suspend",
+        ])
         .await;
 
     // A no-wake endpoint answers 503 while the cat sleeps.

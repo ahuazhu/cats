@@ -1,13 +1,14 @@
 //! Control-plane contract tests with a stub node agent: reconcile loop,
 //! operations, idempotency, RWO enforcement, node-loss fencing/rescheduling.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 
@@ -30,6 +31,8 @@ struct StubNode {
     cats: Arc<Mutex<HashMap<String, ObservedState>>>,
     jobs: Arc<Mutex<Vec<String>>>,
     alive: Arc<AtomicBool>,
+    exec_attempts: Arc<AtomicUsize>,
+    exec_conflicts_remaining: Arc<AtomicUsize>,
 }
 
 async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Json<NodeJobResult> {
@@ -54,12 +57,27 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Jso
     Json(NodeJobResult::ok(job.job_id, observed))
 }
 
-async fn stub_exec(Json(req): Json<ExecRequest>) -> Json<ExecResponse> {
+async fn stub_exec(State(node): State<StubNode>, Json(req): Json<ExecRequest>) -> Response {
+    node.exec_attempts.fetch_add(1, Ordering::SeqCst);
+    if node
+        .exec_conflicts_remaining
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
+    {
+        return (
+            StatusCode::CONFLICT,
+            "activity changed while preparing to suspend",
+        )
+            .into_response();
+    }
     Json(ExecResponse {
         exit_code: 0,
         stdout: req.command.join(" "),
         stderr: String::new(),
     })
+    .into_response()
 }
 
 async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
@@ -68,13 +86,12 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
         cats: Arc::new(Mutex::new(HashMap::new())),
         jobs: Arc::new(Mutex::new(Vec::new())),
         alive: Arc::new(AtomicBool::new(true)),
+        exec_attempts: Arc::new(AtomicUsize::new(0)),
+        exec_conflicts_remaining: Arc::new(AtomicUsize::new(0)),
     };
     let app = Router::new()
         .route("/v1/jobs", post(stub_job))
-        .route(
-            "/v1/cats/{id}/exec",
-            post(|_: axum::extract::Path<String>, req: Json<ExecRequest>| stub_exec(req)),
-        )
+        .route("/v1/cats/{id}/exec", post(stub_exec))
         .with_state(node.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -163,7 +180,6 @@ impl Ctx {
             storage_meta,
             auth_token: SERVICE_TOKEN.into(),
             admin_token: "dev-admin-token".into(),
-            project_tokens: BTreeMap::from([("*".into(), "dev-token".into())]),
             workos: None,
             node_lease_timeout_ms: 3_000,
             reconcile_interval_ms: 200,
@@ -187,7 +203,7 @@ impl Ctx {
             let cat: Cat = self
                 .http
                 .get(self.url(&format!("/v1/projects/default/cats/{name}")))
-                .bearer_auth("dev-token")
+                .bearer_auth("dev-admin-token")
                 .send()
                 .await
                 .unwrap()
@@ -211,7 +227,7 @@ impl Ctx {
             let op: Operation = self
                 .http
                 .get(self.url(&format!("/v1/operations/{op_id}")))
-                .bearer_auth("dev-token")
+                .bearer_auth("dev-admin-token")
                 .send()
                 .await
                 .unwrap()
@@ -233,15 +249,15 @@ impl Ctx {
         let mut req = self
             .http
             .post(self.url("/v1/projects/default/cats"))
-            .bearer_auth("dev-token")
-            .json(&CreateCatRequest {
-                name: name.to_string(),
-                image: "ubuntu-24.04".to_string(),
-                cpus: 2,
-                memory_mib: 1024,
-                root_size_bytes: 8 << 20,
-                disk: None,
-            });
+            .bearer_auth("dev-admin-token")
+            .json(&serde_json::json!({
+                "name": name,
+                "image": "ubuntu-24.04",
+                "cpus": 2,
+                "memory_mib": 1024,
+                "root_size_bytes": 8 << 20,
+                "disk": null
+            }));
         if let Some(k) = idem {
             req = req.header("Idempotency-Key", k);
         }
@@ -254,7 +270,7 @@ impl Ctx {
         let resp = self
             .http
             .post(self.url(&format!("/v1/projects/default/cats/{name}/actions/{verb}")))
-            .bearer_auth("dev-token")
+            .bearer_auth("dev-admin-token")
             .send()
             .await
             .unwrap();
@@ -351,6 +367,7 @@ async fn create_converges_and_idempotency_replays() {
     let _node = start_stub_node(&ctx.cp, "node_a").await;
 
     let created = ctx.create_cat("dev", Some("key-1")).await;
+    assert!(created.cat.auto_suspend);
     let op = ctx.wait_operation(&created.operation.id).await;
     assert_eq!(op.phase, OperationPhase::Succeeded);
     let cat = ctx.wait_observed("dev", ObservedState::Running).await;
@@ -363,13 +380,14 @@ async fn create_converges_and_idempotency_replays() {
     let resp = ctx
         .http
         .post(ctx.url("/v1/projects/default/cats"))
-        .bearer_auth("dev-token")
+        .bearer_auth("dev-admin-token")
         .json(&CreateCatRequest {
             name: "dev".into(),
             image: "x".into(),
             cpus: 1,
             memory_mib: 256,
             root_size_bytes: 4 << 20,
+            auto_suspend: true,
             disk: None,
         })
         .send()
@@ -411,11 +429,12 @@ async fn lifecycle_stop_start_suspend_resume() {
 }
 
 #[tokio::test]
-async fn auto_suspend_fires_on_the_last_guest_work_release() {
+async fn default_auto_suspend_fires_on_the_last_guest_work_release() {
     let ctx = Ctx::new().await;
     let _node = start_stub_node(&ctx.cp, "node_a").await;
     ctx.create_cat("worker", None).await;
     let cat = ctx.wait_observed("worker", ObservedState::Running).await;
+    assert!(cat.auto_suspend);
 
     let report = |sequence, leases| NodeWorkStatusRequest {
         node_id: "node_a".into(),
@@ -444,9 +463,8 @@ async fn auto_suspend_fires_on_the_last_guest_work_release() {
 
     let enabled: AutoSuspendResponse = ctx
         .http
-        .put(ctx.url("/v1/projects/default/cats/worker/auto-suspend"))
-        .bearer_auth("dev-token")
-        .json(&UpdateAutoSuspendRequest { enabled: true })
+        .get(ctx.url("/v1/projects/default/cats/worker/auto-suspend"))
+        .bearer_auth("dev-admin-token")
         .send()
         .await
         .unwrap()
@@ -484,7 +502,7 @@ async fn auto_suspend_fires_on_the_last_guest_work_release() {
     let operations: ListResponse<Operation> = ctx
         .http
         .get(ctx.url("/v1/projects/default/operations"))
-        .bearer_auth("dev-token")
+        .bearer_auth("dev-admin-token")
         .send()
         .await
         .unwrap()
@@ -510,7 +528,7 @@ async fn rwo_second_bind_is_rejected() {
     let disk: Disk = ctx
         .http
         .post(ctx.url("/v1/projects/default/disks"))
-        .bearer_auth("dev-token")
+        .bearer_auth("dev-admin-token")
         .json(&CreateDiskRequest {
             name: "shared".into(),
             size_bytes: 8 << 20,
@@ -527,7 +545,7 @@ async fn rwo_second_bind_is_rejected() {
     let r1 = ctx
         .http
         .post(ctx.url("/v1/projects/default/disks/shared/actions/mount"))
-        .bearer_auth("dev-token")
+        .bearer_auth("dev-admin-token")
         .json(&mount("cat-a"))
         .send()
         .await
@@ -541,7 +559,7 @@ async fn rwo_second_bind_is_rejected() {
     let r2 = ctx
         .http
         .post(ctx.url("/v1/projects/default/disks/shared/actions/mount"))
-        .bearer_auth("dev-token")
+        .bearer_auth("dev-admin-token")
         .json(&mount("cat-b"))
         .send()
         .await
@@ -552,7 +570,7 @@ async fn rwo_second_bind_is_rejected() {
     let del = ctx
         .http
         .delete(ctx.url("/v1/projects/default/disks/shared"))
-        .bearer_auth("dev-token")
+        .bearer_auth("dev-admin-token")
         .send()
         .await
         .unwrap();
@@ -560,7 +578,7 @@ async fn rwo_second_bind_is_rejected() {
     let um = ctx
         .http
         .post(ctx.url("/v1/projects/default/disks/shared/actions/unmount"))
-        .bearer_auth("dev-token")
+        .bearer_auth("dev-admin-token")
         .json(&serde_json::json!({}))
         .send()
         .await
@@ -569,7 +587,7 @@ async fn rwo_second_bind_is_rejected() {
     let del = ctx
         .http
         .delete(ctx.url("/v1/projects/default/disks/shared"))
-        .bearer_auth("dev-token")
+        .bearer_auth("dev-admin-token")
         .send()
         .await
         .unwrap();
@@ -594,7 +612,7 @@ async fn node_loss_fences_and_reschedules() {
         let cat: Cat = ctx
             .http
             .get(ctx.url("/v1/projects/default/cats/dev"))
-            .bearer_auth("dev-token")
+            .bearer_auth("dev-admin-token")
             .send()
             .await
             .unwrap()
@@ -625,7 +643,7 @@ async fn exec_wakes_a_cold_cat() {
     let resp = ctx
         .http
         .post(ctx.url("/v1/projects/default/cats/dev/exec"))
-        .bearer_auth("dev-token")
+        .bearer_auth("dev-admin-token")
         .json(&ExecRequest {
             command: vec!["echo".into(), "hi".into()],
             timeout_ms: None,
@@ -640,6 +658,31 @@ async fn exec_wakes_a_cold_cat() {
 }
 
 #[tokio::test]
+async fn exec_retries_a_transient_suspend_conflict() {
+    let ctx = Ctx::new().await;
+    let node = start_stub_node(&ctx.cp, "node_a").await;
+    ctx.create_cat("dev", None).await;
+    ctx.wait_observed("dev", ObservedState::Running).await;
+    node.exec_conflicts_remaining.store(1, Ordering::SeqCst);
+
+    let resp = ctx
+        .http
+        .post(ctx.url("/v1/projects/default/cats/dev/exec"))
+        .bearer_auth("dev-admin-token")
+        .json(&ExecRequest {
+            command: vec!["pwd".into()],
+            timeout_ms: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "exec failed: {}", resp.status());
+    let out: ExecResponse = resp.json().await.unwrap();
+    assert_eq!(out.stdout, "pwd");
+    assert_eq!(node.exec_attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn destroy_deletes_root_disk_and_keeps_persistent() {
     let ctx = Ctx::new().await;
     let _node = start_stub_node(&ctx.cp, "node_a").await;
@@ -648,7 +691,7 @@ async fn destroy_deletes_root_disk_and_keeps_persistent() {
     // Attach a persistent disk.
     ctx.http
         .post(ctx.url("/v1/projects/default/disks"))
-        .bearer_auth("dev-token")
+        .bearer_auth("dev-admin-token")
         .json(&CreateDiskRequest {
             name: "keep".into(),
             size_bytes: 8 << 20,
@@ -658,7 +701,7 @@ async fn destroy_deletes_root_disk_and_keeps_persistent() {
         .unwrap();
     ctx.http
         .post(ctx.url("/v1/projects/default/disks/keep/actions/mount"))
-        .bearer_auth("dev-token")
+        .bearer_auth("dev-admin-token")
         .json(&serde_json::json!({"cat_id": "dev", "mount_at": "/data"}))
         .send()
         .await
@@ -667,7 +710,7 @@ async fn destroy_deletes_root_disk_and_keeps_persistent() {
     let resp = ctx
         .http
         .delete(ctx.url("/v1/projects/default/cats/dev"))
-        .bearer_auth("dev-token")
+        .bearer_auth("dev-admin-token")
         .send()
         .await
         .unwrap();
@@ -679,7 +722,7 @@ async fn destroy_deletes_root_disk_and_keeps_persistent() {
         let resp = ctx
             .http
             .get(ctx.url("/v1/projects/default/cats/dev"))
-            .bearer_auth("dev-token")
+            .bearer_auth("dev-admin-token")
             .send()
             .await
             .unwrap();
@@ -692,7 +735,7 @@ async fn destroy_deletes_root_disk_and_keeps_persistent() {
     let disks: ListResponse<Disk> = ctx
         .http
         .get(ctx.url("/v1/projects/default/disks"))
-        .bearer_auth("dev-token")
+        .bearer_auth("dev-admin-token")
         .send()
         .await
         .unwrap()
@@ -705,7 +748,7 @@ async fn destroy_deletes_root_disk_and_keeps_persistent() {
 }
 
 #[tokio::test]
-async fn project_tokens_scope_user_resources_and_operations() {
+async fn static_user_tokens_are_not_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let storage_meta: Arc<dyn MetadataStore> =
         Arc::new(SqliteMetadataStore::open(&dir.path().join("storage-meta.db")).unwrap());
@@ -715,10 +758,6 @@ async fn project_tokens_scope_user_resources_and_operations() {
         storage_meta,
         auth_token: SERVICE_TOKEN.into(),
         admin_token: "token-admin".into(),
-        project_tokens: BTreeMap::from([
-            ("alpha".to_string(), "token-alpha".to_string()),
-            ("beta".to_string(), "token-beta".to_string()),
-        ]),
         workos: None,
         node_lease_timeout_ms: 3_000,
         reconcile_interval_ms: 200,
@@ -726,38 +765,13 @@ async fn project_tokens_scope_user_resources_and_operations() {
     let cp = spawn(cfg).await.unwrap();
     let http = reqwest::Client::new();
 
-    let create = http
-        .post(format!("{}/v1/projects/alpha/cats", cp.base_url()))
-        .bearer_auth("token-alpha")
-        .json(&CreateCatRequest {
-            name: "mine".into(),
-            image: "ubuntu-24.04".into(),
-            cpus: 1,
-            memory_mib: 512,
-            root_size_bytes: 8 << 20,
-            disk: None,
-        })
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(create.status(), StatusCode::ACCEPTED);
-    let created: CatOperationResponse = create.json().await.unwrap();
-
-    let own = http
+    let old_project_token = http
         .get(format!("{}/v1/projects/alpha/cats", cp.base_url()))
         .bearer_auth("token-alpha")
         .send()
         .await
         .unwrap();
-    assert_eq!(own.status(), StatusCode::OK);
-
-    let other_project = http
-        .get(format!("{}/v1/projects/beta/cats", cp.base_url()))
-        .bearer_auth("token-alpha")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(other_project.status(), StatusCode::FORBIDDEN);
+    assert_eq!(old_project_token.status(), StatusCode::UNAUTHORIZED);
 
     let service_as_user = http
         .get(format!("{}/v1/projects/alpha/cats", cp.base_url()))
@@ -766,40 +780,6 @@ async fn project_tokens_scope_user_resources_and_operations() {
         .await
         .unwrap();
     assert_eq!(service_as_user.status(), StatusCode::FORBIDDEN);
-
-    let other_operation = http
-        .get(format!(
-            "{}/v1/operations/{}",
-            cp.base_url(),
-            created.operation.id
-        ))
-        .bearer_auth("token-beta")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(other_operation.status(), StatusCode::FORBIDDEN);
-
-    let operations: ListResponse<Operation> = http
-        .get(format!("{}/v1/projects/alpha/operations", cp.base_url()))
-        .bearer_auth("token-alpha")
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(operations.items.len(), 1);
-    assert_eq!(operations.items[0].project, "alpha");
-
-    let user_admin = http
-        .get(format!("{}/v1/admin/monitoring", cp.base_url()))
-        .bearer_auth("token-alpha")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(user_admin.status(), StatusCode::FORBIDDEN);
 
     let admin_cross_project = http
         .get(format!("{}/v1/projects/alpha/cats", cp.base_url()))
@@ -892,7 +872,7 @@ async fn admin_can_monitor_and_drain_nodes() {
         let cat: Cat = ctx
             .http
             .get(ctx.url("/v1/projects/default/cats/drain-me"))
-            .bearer_auth("dev-token")
+            .bearer_auth("dev-admin-token")
             .send()
             .await
             .unwrap()

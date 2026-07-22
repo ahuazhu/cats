@@ -100,19 +100,21 @@ cargo run -p cats-node-agent-daemon --bin cats-noded -- \
   --object-store-adapter file --object-store-option root=/tmp/cats-blob \
   --blockd-bin target/debug/cats-blockd --guest-agent-bin target/debug/cats-guest-agent
 cargo run -p cats-network --bin cats-gatewayd -- --listen 127.0.0.1:7400
-cargo run -p cats-cli --bin cats -- create dev --root-size 64MiB && \
+CATS_API_URL=http://127.0.0.1:7300 CATS_TOKEN=dev-admin-token \
+  cargo run -p cats-cli --bin cats -- create dev --root-size 64MiB && \
+CATS_API_URL=http://127.0.0.1:7300 CATS_TOKEN=dev-admin-token \
   cargo run -p cats-cli --bin cats -- exec dev -- echo hello
 ```
 
 ### 用户与管理员控制面
 
-控制面使用三类独立 Bearer 凭证：`CATS_AUTH_TOKEN` 仅供 node-agent/gateway 等内部
-服务；`CATS_PROJECT_TOKENS` 把 CLI token 绑定到一个 project；`CATS_ADMIN_TOKEN`
-用于 fleet CLI。生产/共享环境必须显式设置三者，例如：
+控制面把用户身份与机器身份分开：`CATS_AUTH_TOKEN` 仅供 node-agent/gateway 等内部
+服务，`CATS_ADMIN_TOKEN` 是 fleet 自动化的 break-glass 机器凭据；普通用户的 Web 和
+CLI 都使用 WorkOS 短期 session。服务端不再接受静态 project token。生产/共享环境
+必须显式设置两个机器凭据，例如：
 
 ```bash
 export CATS_AUTH_TOKEN='service-secret'
-export CATS_PROJECT_TOKENS='acme-dev=user-secret,acme-prod=prod-user-secret'
 export CATS_ADMIN_TOKEN='admin-secret'
 cargo run -p cats-control-plane-daemon --bin cats-controld
 ```
@@ -130,9 +132,11 @@ cargo run -p cats-control-plane-daemon --bin cats-controld
 
 ### WorkOS AuthKit 登录
 
-配置 WorkOS 后，两个 Web 站点使用独立的加密 HttpOnly session cookie；CLI Bearer
-Token 不受影响。一个 WorkOS Organization 必须显式映射到
-一个 Cats Project；没有 Organization membership 的新用户会获得基于 WorkOS
+配置 WorkOS 后，两个 Web 站点使用独立的加密 HttpOnly session cookie；`cats login`
+使用 WorkOS Device Authorization，并把 refresh/access token 存入操作系统 Keychain。
+服务端从 WorkOS JWKS 验证每个 CLI access JWT，不接收或保存用户 refresh token。
+一个 WorkOS Organization 必须显式映射到一个 Cats Workspace（底层仍使用 Project
+资源命名空间）；没有 Organization membership 的新用户会获得基于 WorkOS
 `user_id` 的独立个人 Project，不会进入共享的 `default` Project。管理员还必须在
 管理员 Organization 中拥有 `cats:fleet:admin` permission：
 
@@ -141,6 +145,7 @@ export WORKOS_CLIENT_ID='client_...'
 export WORKOS_API_KEY='sk_...'
 export WORKOS_COOKIE_PASSWORD="$(openssl rand -hex 32)"
 export WORKOS_REDIRECT_URI='http://127.0.0.1:7300/auth/callback'
+export WORKOS_ISSUER='https://api.workos.com/user_management/client_...'
 export CATS_WORKOS_PROJECT_ORGANIZATIONS='acme-dev=org_...'
 export CATS_WORKOS_ADMIN_ORGANIZATION_ID='org_admin_...'
 export CATS_WORKOS_ADMIN_PERMISSION='cats:fleet:admin'
@@ -149,14 +154,22 @@ cargo run -p cats-control-plane-daemon --bin cats-controld
 
 在 WorkOS Dashboard 的 Redirects 中登记同一个 callback URI，并给管理员角色添加
 `cats:fleet:admin` permission。生产 redirect URI 使用 HTTPS 后，控制面会默认给
-session cookie 添加 `Secure`。
+session cookie 添加 `Secure`。`WORKOS_ISSUER` 必须与当前 WorkOS Application 签发的
+access token 中 `iss` claim 完全一致；它不是 AuthKit 登录页面域名。服务端仍同时
+校验 RS256 签名、`exp`、`sub` 和 `client_id`。
 
-用户 token 只能查看和管理所属 project 的 Cat、Disk、Endpoint、Snapshot 和
-Operation；跨 project 请求返回 `403`：
+一个用户可以同时属于多个已映射的 WorkOS Organization。登录与 workspace 选择分离，
+行为与 Sprites CLI 的组织选择一致：保存一个默认 workspace，同时允许命令级覆盖。
+切换时 CLI 使用 refresh token 向 WorkOS 申请目标 Organization 范围的新 access
+token；跨 workspace 请求返回 `403`：
 
 ```bash
-CATS_TOKEN=user-secret CATS_PROJECT=acme-dev cats ls
-CATS_TOKEN=user-secret CATS_PROJECT=acme-dev cats operation ls
+cats login
+cats whoami
+cats workspace list
+cats workspace use acme-dev
+cats ls
+cats --workspace acme-prod ls
 ```
 
 管理员可以查看节点分配/心跳/遥测，执行 cordon、uncordon、drain 和删除空节点。

@@ -3,6 +3,9 @@
 //! that the CLI waits on by default (`--no-wait` to skip). No storage/node
 //! internals ever appear here.
 
+mod auth;
+mod config;
+
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -20,19 +23,14 @@ use cats_api::resources::*;
 )]
 pub struct Cli {
     /// Control plane URL.
-    #[arg(
-        long,
-        env = "CATS_API_URL",
-        default_value = "http://127.0.0.1:7300",
-        global = true
-    )]
-    pub api_url: String,
-    /// API token.
-    #[arg(long, env = "CATS_TOKEN", default_value = "dev-token", global = true)]
-    pub token: String,
-    /// Project name.
-    #[arg(long, env = "CATS_PROJECT", default_value = "default", global = true)]
-    pub project: String,
+    #[arg(long, env = "CATS_API_URL", global = true)]
+    pub api_url: Option<String>,
+    /// Machine/admin bearer token. Users should run `cats login`.
+    #[arg(long, env = "CATS_TOKEN", global = true)]
+    pub token: Option<String>,
+    /// Use one workspace for this command without changing the saved default.
+    #[arg(long, visible_alias = "project", env = "CATS_WORKSPACE", global = true)]
+    pub workspace: Option<String>,
     /// Do not wait for operations to finish.
     #[arg(long, global = true)]
     pub no_wait: bool,
@@ -46,6 +44,17 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Sign in through WorkOS in your browser.
+    Login,
+    /// Revoke the current CLI session and remove it from the system keychain.
+    Logout,
+    /// Show the signed-in user and active workspace.
+    Whoami,
+    /// List or select one of your workspaces.
+    Workspace {
+        #[command(subcommand)]
+        cmd: WorkspaceCommand,
+    },
     /// Create a cat (its root disk is created automatically).
     Create {
         name: String,
@@ -64,9 +73,9 @@ pub enum Command {
         disk_size: String,
         #[arg(long, default_value = "/data")]
         mount_at: String,
-        /// Suspend immediately whenever the distributed work count reaches 0.
+        /// Keep this Cat running when the distributed work count reaches 0.
         #[arg(long)]
-        auto_suspend: bool,
+        no_auto_suspend: bool,
     },
     /// List cats.
     Ls,
@@ -133,11 +142,19 @@ pub enum Command {
         #[command(subcommand)]
         cmd: OperationCommand,
     },
-    /// Fleet administration (requires an administrator token).
+    /// Fleet administration (requires an administrator identity).
     Admin {
         #[command(subcommand)]
         cmd: AdminCommand,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum WorkspaceCommand {
+    /// List workspaces available to the signed-in user.
+    List,
+    /// Save the default workspace for subsequent commands.
+    Use { name: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -252,13 +269,29 @@ struct Client {
 
 impl Client {
     fn new(cli: &Cli) -> Result<Self> {
+        if let Some(token) = &cli.token {
+            return Ok(Self {
+                http: reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(120))
+                    .build()?,
+                base: auth::configured_api_url(cli.api_url.as_deref())?,
+                token: token.clone(),
+                project: workspace_override(cli).unwrap_or_else(|| "default".to_string()),
+            });
+        }
+        let session =
+            auth::user_session(cli.api_url.as_deref(), workspace_override(cli).as_deref())?;
+        Self::from_user_session(session)
+    }
+
+    fn from_user_session(session: auth::UserSession) -> Result<Self> {
         Ok(Self {
             http: reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(120))
                 .build()?,
-            base: cli.api_url.trim_end_matches('/').to_string(),
-            token: cli.token.clone(),
-            project: cli.project.clone(),
+            base: session.api_url,
+            token: session.access_token,
+            project: session.workspace,
         })
     }
 
@@ -330,6 +363,12 @@ impl Client {
     }
 }
 
+fn workspace_override(cli: &Cli) -> Option<String> {
+    cli.workspace
+        .clone()
+        .or_else(|| std::env::var("CATS_PROJECT").ok())
+}
+
 fn print_cat(cat: &Cat, json_mode: bool) {
     if json_mode {
         println!("{}", serde_json::to_string_pretty(cat).unwrap());
@@ -349,6 +388,71 @@ fn print_cat(cat: &Cat, json_mode: bool) {
 
 /// Run the CLI; returns the process exit code.
 pub fn run(cli: Cli) -> Result<()> {
+    match &cli.command {
+        Command::Login => {
+            let config = auth::login(cli.api_url.as_deref())?;
+            let user = config.user.as_ref().context("WorkOS returned no user")?;
+            println!("Logged in as {}", user.email);
+            if let Some(workspace) = &config.current_workspace {
+                println!("Current workspace: {workspace}");
+            }
+            return Ok(());
+        }
+        Command::Logout => {
+            auth::logout(cli.api_url.as_deref())?;
+            println!("Logged out");
+            return Ok(());
+        }
+        Command::Whoami => {
+            let session =
+                auth::user_session(cli.api_url.as_deref(), workspace_override(&cli).as_deref())?;
+            let client = Client::from_user_session(session)?;
+            let value = client.send(client.http.get(format!("{}/v1/me", client.base)))?;
+            let me: cats_api::auth::MeResponse = serde_json::from_value(value)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&me)?);
+            } else {
+                println!("{}", me.user.email);
+                println!("User: {}", me.user.id);
+                println!("Workspace: {}", client.project);
+            }
+            return Ok(());
+        }
+        Command::Workspace { cmd } => {
+            match cmd {
+                WorkspaceCommand::List => {
+                    let mut session = auth::user_session(
+                        cli.api_url.as_deref(),
+                        workspace_override(&cli).as_deref(),
+                    )?;
+                    let workspaces = auth::sync_workspaces(&mut session)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&workspaces)?);
+                    } else {
+                        for workspace in workspaces {
+                            let selected = if session.config.current_workspace.as_deref()
+                                == Some(workspace.slug.as_str())
+                            {
+                                "*"
+                            } else {
+                                " "
+                            };
+                            println!(
+                                "{selected} {:<24} {}",
+                                workspace.slug, workspace.display_name
+                            );
+                        }
+                    }
+                }
+                WorkspaceCommand::Use { name } => {
+                    let workspace = auth::switch_workspace(cli.api_url.as_deref(), name)?;
+                    println!("Current workspace: {}", workspace.slug);
+                }
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
     let client = Client::new(&cli)?;
     let idem = uuid_like();
 
@@ -373,6 +477,9 @@ pub fn run(cli: Cli) -> Result<()> {
     };
 
     match &cli.command {
+        Command::Login | Command::Logout | Command::Whoami | Command::Workspace { .. } => {
+            unreachable!("handled before API client construction")
+        }
         Command::Create {
             name,
             image,
@@ -382,7 +489,7 @@ pub fn run(cli: Cli) -> Result<()> {
             disk,
             disk_size,
             mount_at,
-            auto_suspend,
+            no_auto_suspend,
         } => {
             let body = CreateCatRequest {
                 name: name.clone(),
@@ -390,6 +497,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 cpus: *cpus,
                 memory_mib: parse_size(memory)? >> 20,
                 root_size_bytes: parse_size(root_size)?,
+                auto_suspend: !no_auto_suspend,
                 disk: disk.as_ref().map(|d| CreateCatDisk {
                     name: d.clone(),
                     size_bytes: parse_size(disk_size).unwrap_or(1 << 30),
@@ -404,12 +512,6 @@ pub fn run(cli: Cli) -> Result<()> {
                     .json(&body),
             )?;
             mutate(resp)?;
-            if *auto_suspend {
-                let _: AutoSuspendResponse = serde_json::from_value(client.put(
-                    &format!("/cats/{name}/auto-suspend"),
-                    json!({ "enabled": true }),
-                )?)?;
-            }
             Ok(())
         }
         Command::Ls => {
@@ -795,14 +897,41 @@ mod tests {
     #[test]
     fn cli_parses_typical_commands() {
         use clap::Parser;
+        assert!(matches!(
+            Cli::parse_from(["cats", "login"]).command,
+            Command::Login
+        ));
+        let workspace = Cli::parse_from(["cats", "workspace", "use", "acme-dev"]);
+        assert!(matches!(
+            workspace.command,
+            Command::Workspace {
+                cmd: WorkspaceCommand::Use { .. }
+            }
+        ));
+        let override_workspace = Cli::parse_from(["cats", "--workspace", "other", "ls"]);
+        assert_eq!(override_workspace.workspace.as_deref(), Some("other"));
         let cli = Cli::parse_from(["cats", "create", "dev", "--cpus", "4", "--memory", "8GiB"]);
         match cli.command {
-            Command::Create { name, cpus, .. } => {
+            Command::Create {
+                name,
+                cpus,
+                no_auto_suspend,
+                ..
+            } => {
                 assert_eq!(name, "dev");
                 assert_eq!(cpus, 4);
+                assert!(!no_auto_suspend);
             }
             _ => panic!("wrong parse"),
         }
+        let cli = Cli::parse_from(["cats", "create", "always-on", "--no-auto-suspend"]);
+        assert!(matches!(
+            cli.command,
+            Command::Create {
+                no_auto_suspend: true,
+                ..
+            }
+        ));
         let cli = Cli::parse_from(["cats", "exec", "dev", "--", "git", "status"]);
         match cli.command {
             Command::Exec { command, .. } => assert_eq!(command, vec!["git", "status"]),

@@ -1,7 +1,6 @@
 //! Control-plane assembly: config, shared state, reconciler task and HTTP
 //! server. `spawn` is used by the binary and by every integration/E2E test.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,11 +23,8 @@ pub struct Config {
     pub auth_token: String,
     /// Administrator credential for fleet management and monitoring APIs.
     pub admin_token: String,
-    /// User credentials keyed by the one project each credential may access.
-    /// A `*` entry is reserved for the in-process development/test config.
-    pub project_tokens: BTreeMap<String, String>,
-    /// Optional AuthKit configuration for browser sessions. Bearer-token
-    /// authentication remains available for CLI and service callers.
+    /// Optional AuthKit configuration for browser sessions and user CLI
+    /// access tokens. Service/admin machine credentials remain separate.
     pub workos: Option<Arc<crate::auth::WorkOsConfig>>,
     pub node_lease_timeout_ms: i64,
     pub reconcile_interval_ms: u64,
@@ -78,23 +74,6 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         cfg.auth_token != cfg.admin_token,
         "service and admin tokens must be different"
     );
-    anyhow::ensure!(
-        !cfg.project_tokens.is_empty(),
-        "at least one project token is required"
-    );
-    let mut unique_project_tokens = BTreeSet::new();
-    for (project, token) in &cfg.project_tokens {
-        anyhow::ensure!(!project.is_empty(), "project name must not be empty");
-        anyhow::ensure!(!token.is_empty(), "project token must not be empty");
-        anyhow::ensure!(
-            token != &cfg.auth_token && token != &cfg.admin_token,
-            "service, admin and project tokens must be different"
-        );
-        anyhow::ensure!(
-            unique_project_tokens.insert(token.clone()),
-            "a project token may be bound to only one project"
-        );
-    }
     let cfg = Arc::new(cfg);
     let store = Arc::new(Store::open(&cfg.db_path)?);
     let storage_meta = cfg.storage_meta.clone();

@@ -23,6 +23,9 @@ pub struct CreateCatRequest {
     pub memory_mib: u64,
     #[serde(default = "default_root_size")]
     pub root_size_bytes: u64,
+    /// Work-driven auto-suspend is enabled for new Cats unless explicitly disabled.
+    #[serde(default = "default_auto_suspend")]
+    pub auto_suspend: bool,
     /// Optional persistent disk created and mounted at create time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk: Option<CreateCatDisk>,
@@ -36,6 +39,9 @@ fn default_memory_mib() -> u64 {
 }
 fn default_root_size() -> u64 {
     crate::chunk::DEFAULT_ROOT_DISK_BYTES
+}
+fn default_auto_suspend() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +107,21 @@ pub struct ExecResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateAutoSuspendRequest {
     pub enabled: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CreateCatRequest;
+
+    #[test]
+    fn create_cat_defaults_to_auto_suspend() {
+        let request: CreateCatRequest = serde_json::from_value(serde_json::json!({
+            "name": "worker",
+            "image": "ubuntu-24.04"
+        }))
+        .unwrap();
+        assert!(request.auto_suspend);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

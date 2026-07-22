@@ -25,14 +25,6 @@ struct Args {
     auth_token: String,
     #[arg(long, env = "CATS_ADMIN_TOKEN", default_value = "dev-admin-token")]
     admin_token: String,
-    /// Bind a user token to exactly one project (repeatable: PROJECT=TOKEN).
-    #[arg(
-        long = "project-token",
-        env = "CATS_PROJECT_TOKENS",
-        value_delimiter = ',',
-        value_name = "PROJECT=TOKEN"
-    )]
-    project_tokens: Vec<String>,
     /// WorkOS AuthKit application client ID. Setting any WorkOS option
     /// enables AuthKit and requires the complete configuration.
     #[arg(long, env = "WORKOS_CLIENT_ID")]
@@ -44,6 +36,9 @@ struct Args {
     workos_cookie_password: Option<String>,
     #[arg(long, env = "WORKOS_REDIRECT_URI")]
     workos_redirect_uri: Option<String>,
+    /// Exact `iss` claim published in this WorkOS application's access tokens.
+    #[arg(long, env = "WORKOS_ISSUER")]
+    workos_issuer: Option<String>,
     /// Bind a Cats project to exactly one WorkOS Organization.
     #[arg(
         long = "workos-project-organization",
@@ -100,34 +95,11 @@ async fn main() -> anyhow::Result<()> {
         &metadata_config,
         &metadata_factories,
     )?;
-    let mut project_tokens = BTreeMap::new();
-    if args.project_tokens.is_empty() {
-        project_tokens.insert("default".to_string(), "dev-token".to_string());
-    } else {
-        for value in &args.project_tokens {
-            let (project, token) = value
-                .split_once('=')
-                .ok_or_else(|| anyhow::anyhow!("--project-token must be PROJECT=TOKEN"))?;
-            anyhow::ensure!(
-                !project.is_empty() && project != "*" && !token.is_empty(),
-                "--project-token must be PROJECT=TOKEN"
-            );
-            anyhow::ensure!(
-                !project_tokens.values().any(|existing| existing == token),
-                "a project token may be bound to only one project"
-            );
-            anyhow::ensure!(
-                project_tokens
-                    .insert(project.to_string(), token.to_string())
-                    .is_none(),
-                "duplicate --project-token for project {project}"
-            );
-        }
-    }
     let any_workos_option = args.workos_client_id.is_some()
         || args.workos_api_key.is_some()
         || args.workos_cookie_password.is_some()
         || args.workos_redirect_uri.is_some()
+        || args.workos_issuer.is_some()
         || !args.workos_project_organizations.is_empty()
         || args.workos_admin_organization_id.is_some()
         || args.workos_cookie_domain.is_some()
@@ -146,6 +118,9 @@ async fn main() -> anyhow::Result<()> {
         let redirect_uri = args
             .workos_redirect_uri
             .ok_or_else(|| anyhow::anyhow!("WORKOS_REDIRECT_URI is required"))?;
+        let issuer_url = args
+            .workos_issuer
+            .ok_or_else(|| anyhow::anyhow!("WORKOS_ISSUER is required"))?;
         let admin_organization_id = args
             .workos_admin_organization_id
             .ok_or_else(|| anyhow::anyhow!("CATS_WORKOS_ADMIN_ORGANIZATION_ID is required"))?;
@@ -173,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
                 client_id,
                 api_key,
                 api_base_url: args.workos_api_base_url,
+                issuer_url,
                 redirect_uri,
                 cookie_password,
                 project_organizations: mappings,
@@ -193,7 +169,6 @@ async fn main() -> anyhow::Result<()> {
         storage_meta,
         auth_token: args.auth_token,
         admin_token: args.admin_token,
-        project_tokens,
         workos,
         node_lease_timeout_ms: args.node_lease_timeout_ms,
         reconcile_interval_ms: args.reconcile_interval_ms,

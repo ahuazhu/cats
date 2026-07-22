@@ -11,6 +11,7 @@
 //! It must stay dependency-light; encoding/hashing implementations live in
 //! `cats-blockd`.
 
+pub mod auth;
 pub mod chunk;
 pub mod error;
 pub mod guest;

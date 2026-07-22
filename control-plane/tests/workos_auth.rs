@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use axum::extract::State;
-use axum::routing::post;
+use axum::extract::{Path, State};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -14,12 +14,14 @@ use cats_control_plane::auth::{WorkOsConfig, WorkOsConfigParams};
 use cats_control_plane::server::{spawn, Config, Handle};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_storage::MetadataStore;
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use reqwest::header::{LOCATION, SET_COOKIE};
 use reqwest::{StatusCode, Url};
 use serde_json::{json, Value};
 use workos::helpers::{seal_session, SessionData};
 
 const COOKIE_PASSWORD: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const TEST_RSA_MODULUS: &str = "yRE6rHuNR0QbHO3H3Kt2pOKGVhQqGZXInOduQNxXzuKlvQTLUTv4l4sggh5_CYYi_cvI-SXVT9kPWSKXxJXBXd_4LkvcPuUakBoAkfh-eiFVMh2VrUyWyj3MFl0HTVF9KwRXLAcwkREiS3npThHRyIxuy0ZMeZfxVL5arMhw1SRELB8HoGfG_AtH89BIE9jDBHZ9dLelK9a184zAf8LwoPLxvJb3Il5nncqPcSfKDDodMFBIMc4lQzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi-yUod-j8MtvIj812dkS4QMiRVN_by2h3ZY8LYVGrqZXZTcgn2ujn8uKjXLZVD5TdQ";
 
 #[derive(Clone)]
 struct WorkOsStub {
@@ -99,6 +101,63 @@ async fn revoke_session(State(stub): State<WorkOsStub>, Json(body): Json<Value>)
     StatusCode::NO_CONTENT
 }
 
+async fn jwks() -> Json<Value> {
+    Json(json!({
+        "keys": [{
+            "kid": "test-rsa-key",
+            "kty": "RSA",
+            "alg": "RS256",
+            "use": "sig",
+            "n": TEST_RSA_MODULUS,
+            "e": "AQAB"
+        }]
+    }))
+}
+
+fn test_user(id: &str) -> Value {
+    json!({
+        "object": "user",
+        "id": id,
+        "name": "Cats Tester",
+        "email": "user@example.com",
+        "email_verified": true,
+        "created_at": "2026-07-22T00:00:00.000Z",
+        "updated_at": "2026-07-22T00:00:00.000Z"
+    })
+}
+
+async fn list_memberships() -> Json<Value> {
+    let membership = |id: &str, organization_id: &str, organization_name: &str, role: &str| {
+        json!({
+            "object": "organization_membership",
+            "id": id,
+            "user_id": "user_cli",
+            "organization_id": organization_id,
+            "status": "active",
+            "directory_managed": false,
+            "organization_name": organization_name,
+            "created_at": "2026-07-22T00:00:00.000Z",
+            "updated_at": "2026-07-22T00:00:00.000Z",
+            "role": { "slug": role },
+            "roles": [{ "slug": role }],
+            "user": test_user("user_cli")
+        })
+    };
+    Json(json!({
+        "object": "list",
+        "data": [
+            membership("om_1", "org_project", "Default Workspace", "member"),
+            membership("om_2", "org_second", "Second Workspace", "admin"),
+            membership("om_3", "org_unmapped", "Unmapped", "member")
+        ],
+        "list_metadata": { "before": null, "after": null }
+    }))
+}
+
+async fn get_user(Path(id): Path<String>) -> Json<Value> {
+    Json(test_user(&id))
+}
+
 struct Ctx {
     _dir: tempfile::TempDir,
     _cp: Handle,
@@ -106,6 +165,7 @@ struct Ctx {
     http: reqwest::Client,
     exchanges: Arc<AtomicUsize>,
     revoked_sessions: Arc<Mutex<Vec<String>>>,
+    issuer: String,
 }
 
 impl Ctx {
@@ -119,6 +179,12 @@ impl Ctx {
         let app = Router::new()
             .route("/user_management/authenticate", post(authenticate))
             .route("/user_management/sessions/revoke", post(revoke_session))
+            .route("/sso/jwks/client_test", get(jwks))
+            .route(
+                "/user_management/organization_memberships",
+                get(list_memberships),
+            )
+            .route("/user_management/users/{id}", get(get_user))
             .with_state(stub);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let workos_base = format!("http://{}", listener.local_addr().unwrap());
@@ -126,13 +192,18 @@ impl Ctx {
             axum::serve(listener, app).await.unwrap();
         });
 
+        let issuer = format!("{workos_base}/user_management/client_test");
         let workos = WorkOsConfig::new(WorkOsConfigParams {
             client_id: "client_test".into(),
             api_key: "sk_test_secret".into(),
-            api_base_url: workos_base,
+            api_base_url: workos_base.clone(),
+            issuer_url: issuer.clone(),
             redirect_uri: "http://127.0.0.1:7300/auth/callback".into(),
             cookie_password: COOKIE_PASSWORD.into(),
-            project_organizations: BTreeMap::from([("default".into(), "org_project".into())]),
+            project_organizations: BTreeMap::from([
+                ("default".into(), "org_project".into()),
+                ("second".into(), "org_second".into()),
+            ]),
             admin_organization_id: "org_admin".into(),
             admin_permission: "cats:fleet:admin".into(),
             cookie_secure: false,
@@ -150,7 +221,6 @@ impl Ctx {
             storage_meta,
             auth_token: "service-token".into(),
             admin_token: "admin-token".into(),
-            project_tokens: BTreeMap::from([("default".into(), "project-token".into())]),
             workos: Some(Arc::new(workos)),
             node_lease_timeout_ms: 3_000,
             reconcile_interval_ms: 200,
@@ -168,6 +238,7 @@ impl Ctx {
                 .unwrap(),
             exchanges,
             revoked_sessions,
+            issuer,
         }
     }
 
@@ -224,6 +295,30 @@ impl Ctx {
         );
         cookie_pair(&callback, &format!("cats_{site}_session"))
     }
+
+    fn cli_token(&self, organization_id: &str) -> String {
+        self.cli_token_with_issuer(organization_id, &self.issuer)
+    }
+
+    fn cli_token_with_issuer(&self, organization_id: &str, issuer: &str) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("test-rsa-key".into());
+        encode(
+            &header,
+            &json!({
+                "iss": issuer,
+                "sub": "user_cli",
+                "sid": format!("session_{organization_id}"),
+                "client_id": "client_test",
+                "org_id": organization_id,
+                "role": "member",
+                "permissions": [],
+                "exp": cats_control_plane::store::now_unix() + 3600
+            }),
+            &EncodingKey::from_rsa_pem(include_bytes!("fixtures/workos_test_private.pem")).unwrap(),
+        )
+        .unwrap()
+    }
 }
 
 fn cookie_pair(response: &reqwest::Response, name: &str) -> String {
@@ -254,6 +349,11 @@ async fn workos_user_and_admin_sessions_enforce_their_scopes() {
         .await
         .unwrap();
     assert_eq!(public_config["workos_enabled"], true);
+    assert_eq!(public_config["workos_client_id"], "client_test");
+    assert!(public_config["workos_api_base_url"]
+        .as_str()
+        .unwrap()
+        .starts_with("http://127.0.0.1:"));
     assert!(public_config.get("token_login_enabled").is_none());
     assert!(public_config.get("projects").is_none());
     assert!(!public_config.to_string().contains("sk_test_secret"));
@@ -316,6 +416,81 @@ async fn workos_user_and_admin_sessions_enforce_their_scopes() {
         .unwrap();
     assert_eq!(admin_can_read_project.status(), StatusCode::OK);
     assert_eq!(ctx.exchanges.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn cli_jwt_lists_and_enforces_multiple_workspaces() {
+    let ctx = Ctx::new().await;
+    let default_token = ctx.cli_token("org_project");
+
+    let me = ctx
+        .http
+        .get(ctx.url("/v1/me"))
+        .bearer_auth(&default_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(me.status(), StatusCode::OK);
+    let me: Value = me.json().await.unwrap();
+    assert_eq!(me["user"]["id"], "user_cli");
+    assert_eq!(me["workspaces"].as_array().unwrap().len(), 2);
+    assert_eq!(me["workspaces"][0]["slug"], "default");
+    assert_eq!(me["workspaces"][1]["slug"], "second");
+    assert!(!me.to_string().contains("org_unmapped"));
+
+    let own = ctx
+        .http
+        .get(ctx.url("/v1/projects/default/cats"))
+        .bearer_auth(&default_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(own.status(), StatusCode::OK);
+    let other = ctx
+        .http
+        .get(ctx.url("/v1/projects/second/cats"))
+        .bearer_auth(&default_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other.status(), StatusCode::FORBIDDEN);
+
+    let second_token = ctx.cli_token("org_second");
+    let selected = ctx
+        .http
+        .get(ctx.url("/v1/projects/second/cats"))
+        .bearer_auth(&second_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(selected.status(), StatusCode::OK);
+    let wrong = ctx
+        .http
+        .get(ctx.url("/v1/projects/default/cats"))
+        .bearer_auth(&second_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+
+    let tampered = ctx
+        .http
+        .get(ctx.url("/v1/projects/default/cats"))
+        .bearer_auth(format!("{default_token}x"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tampered.status(), StatusCode::UNAUTHORIZED);
+
+    let wrong_issuer = ctx.cli_token_with_issuer("org_project", "https://api.workos.com");
+    let rejected = ctx
+        .http
+        .get(ctx.url("/v1/projects/default/cats"))
+        .bearer_auth(wrong_issuer)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

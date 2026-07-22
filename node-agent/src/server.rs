@@ -158,7 +158,10 @@ async fn handle_exec(
             stderr,
         })
         .into_response(),
-        Ok(Err(e)) => (StatusCode::CONFLICT, format!("{e:#}")).into_response(),
+        Ok(Err(e)) if crate::runtime::is_activity_changed(&e) => {
+            (StatusCode::CONFLICT, format!("{e:#}")).into_response()
+        }
+        Ok(Err(e)) => (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

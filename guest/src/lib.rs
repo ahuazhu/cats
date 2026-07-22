@@ -691,10 +691,17 @@ impl GuestAgent {
                 let (argv0, rest) = command
                     .split_first()
                     .context("command must be a non-empty argv array")?;
-                let out = std::process::Command::new(argv0)
-                    .args(rest)
-                    .output()
-                    .with_context(|| format!("spawn {argv0}"))?;
+                let out = match std::process::Command::new(argv0).args(rest).output() {
+                    Ok(out) => out,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(GuestResponseBody::Exec {
+                            exit_code: 127,
+                            stdout: String::new(),
+                            stderr: format!("{argv0}: command not found\n"),
+                        });
+                    }
+                    Err(error) => return Err(error).with_context(|| format!("spawn {argv0}")),
+                };
                 Ok(GuestResponseBody::Exec {
                     exit_code: out.status.code().unwrap_or(-1),
                     stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -1108,6 +1115,24 @@ mod tests {
             } => {
                 assert_eq!(exit_code, 0);
                 assert_eq!(stdout.trim(), "hello");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match agent.handle(GuestRequestBody::Exec {
+            command: vec!["/definitely/not/a/cats-command".into()],
+            timeout_ms: None,
+        }) {
+            GuestResponseBody::Exec {
+                exit_code,
+                stdout,
+                stderr,
+            } => {
+                assert_eq!(exit_code, 127);
+                assert!(stdout.is_empty());
+                assert_eq!(
+                    stderr,
+                    "/definitely/not/a/cats-command: command not found\n"
+                );
             }
             other => panic!("unexpected {other:?}"),
         }

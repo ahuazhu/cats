@@ -82,6 +82,12 @@ impl ApiError {
     pub fn invalid(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::InvalidArgument, message)
     }
+    pub fn unauthenticated(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Unauthenticated, message)
+    }
+    pub fn permission_denied(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::PermissionDenied, message)
+    }
     pub fn conflict(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Conflict, message)
     }

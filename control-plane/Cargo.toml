@@ -18,6 +18,7 @@ rusqlite = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 workos = { workspace = true }
+jsonwebtoken = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

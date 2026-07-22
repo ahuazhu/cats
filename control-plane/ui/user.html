@@ -155,8 +155,7 @@
     <form method="dialog" id="exec-form">
       <header><div><small data-i18n="user.execDialog.eyebrow">GUEST EXEC</small><h2><span data-i18n="user.execDialog.title">Run in</span> <span id="exec-cat-name"></span></h2></div><button class="icon-button" value="cancel" data-i18n-aria-label="common.close" aria-label="Close">×</button></header>
       <label><span data-i18n="user.execDialog.command">Command</span><input name="command" value="uname -a" required><small data-i18n="user.execDialog.hint">Split into argv on spaces; this development console does not perform shell expansion.</small></label>
-      <pre class="terminal-output" id="exec-output" data-i18n="user.execDialog.waiting">Waiting to run…</pre>
-      <p class="form-error" data-form-error></p>
+      <pre class="terminal-output" id="exec-output" data-i18n="user.execDialog.waiting" aria-live="polite">Waiting to run…</pre>
       <footer><button class="button button-quiet" value="cancel" data-i18n="common.close">Close</button><button class="button button-primary" value="default" data-i18n="user.execDialog.run">Run</button></footer>
     </form>
   </dialog>

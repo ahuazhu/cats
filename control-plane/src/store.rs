@@ -84,7 +84,7 @@ impl Store {
             "scheduling_disabled",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
-        ensure_column(&conn, "cats", "auto_suspend", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "cats", "auto_suspend", "INTEGER NOT NULL DEFAULT 1")?;
         ensure_column(&conn, "cats", "work_version", "INTEGER NOT NULL DEFAULT 0")?;
         // Backfill ownership for databases created before operations carried
         // their project explicitly. Deleted resources cannot be recovered and
@@ -130,6 +130,7 @@ impl Store {
         cpus: u32,
         memory_mib: u64,
         root_disk_size: u64,
+        auto_suspend: bool,
         extra_disk: Option<(&str, u64, &str)>, // (name, size, mount_path)
     ) -> Result<(Cat, Vec<Disk>, Operation)> {
         let mut conn = self.conn.lock().unwrap();
@@ -158,8 +159,8 @@ impl Store {
         let result: rusqlite::Result<()> = (|| {
             tx.execute(
                 "INSERT INTO cats (id, project, name, image, cpus, memory_mib, root_disk_id,
-                                   desired_state, observed_state, generation, created_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,'running','creating',1,?8)",
+                                   desired_state, observed_state, generation, auto_suspend, created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,'running','creating',1,?8,?9)",
                 params![
                     cat_id,
                     project,
@@ -168,6 +169,7 @@ impl Store {
                     cpus,
                     memory_mib as i64,
                     root_disk_id,
+                    i64::from(auto_suspend),
                     now
                 ],
             )?;
@@ -1785,7 +1787,7 @@ CREATE TABLE IF NOT EXISTS cats (
     desired_state TEXT NOT NULL,
     observed_state TEXT NOT NULL,
     generation INTEGER NOT NULL,
-    auto_suspend INTEGER NOT NULL DEFAULT 0,
+    auto_suspend INTEGER NOT NULL DEFAULT 1,
     work_version INTEGER NOT NULL DEFAULT 0,
     node_id TEXT,
     created_at INTEGER NOT NULL,
@@ -1919,6 +1921,7 @@ mod tests {
 
         let store = Store::open(&path).unwrap();
         assert_eq!(store.get_operation("op_old").unwrap().project, "alpha");
+        assert!(store.must_get_cat_by_id("cat_old").unwrap().auto_suspend);
         let node = store.get_node("node_old").unwrap();
         assert_eq!(node.state, NodeState::Cordoned);
         assert!(node.telemetry.is_none());
@@ -1952,15 +1955,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("control.db")).unwrap();
         let (cat, _, _) = store
-            .create_cat("alpha", "worker", "test", 1, 256, 1024 * 1024, None)
+            .create_cat("alpha", "worker", "test", 1, 256, 1024 * 1024, true, None)
             .unwrap();
+        assert!(cat.auto_suspend);
         store
             .register_node("node-1", "http://node", "http://gateway", 4, 8192)
             .unwrap();
         store.set_placement(&cat.id, Some("node-1")).unwrap();
         store.set_observed(&cat.id, ObservedState::Running).unwrap();
-        store.set_auto_suspend(&cat.id, true).unwrap();
-
         let status = |sequence, leases| NodeWorkStatusRequest {
             node_id: "node-1".into(),
             cat_id: cat.id.clone(),
@@ -2001,7 +2003,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("control.db")).unwrap();
         let (cat, _, _) = store
-            .create_cat("alpha", "web", "test", 1, 256, 1024 * 1024, None)
+            .create_cat("alpha", "web", "test", 1, 256, 1024 * 1024, true, None)
             .unwrap();
         store
             .register_node("node-1", "http://node", "http://gateway", 4, 8192)
@@ -2038,7 +2040,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("control.db")).unwrap();
         let (cat, _, _) = store
-            .create_cat("alpha", "racer", "test", 1, 256, 1024 * 1024, None)
+            .create_cat("alpha", "racer", "test", 1, 256, 1024 * 1024, true, None)
             .unwrap();
         store
             .register_node("node-1", "http://node", "http://gateway", 4, 8192)

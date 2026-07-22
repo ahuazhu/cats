@@ -70,6 +70,10 @@ rand = "0.9"
 libc = "0.2"
 tempfile = "3"
 workos = "2.5"
+jsonwebtoken = { version = "10.4", default-features = false, features = ["rust_crypto", "use_pem"] }
+directories = "6"
+keyring = "4.1"
+open = "5.4"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

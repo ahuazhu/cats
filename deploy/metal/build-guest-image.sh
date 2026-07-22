@@ -102,8 +102,15 @@ chmod +x "$IR/init"
 RF="$WORK/rootfs"
 mkdir -p "$RF"/{bin,sbin,usr/bin,dev,proc,sys,tmp,etc,root,lib/cats-modules}
 cp "$BUSYBOX" "$RF/bin/busybox"
-for tool in sh mount umount insmod sleep sync cat echo uname hostname ls ps vi mkdir grep head; do
+"$BUSYBOX" --list | while IFS= read -r tool; do
+  [ -n "$tool" ] || continue
   ln -sf /bin/busybox "$RF/bin/$tool"
+done
+for required_applet in sh mount umount insmod sleep sync uname pwd; do
+  [ -L "$RF/bin/$required_applet" ] || {
+    echo "busybox is missing required applet: $required_applet" >&2
+    exit 1
+  }
 done
 cp "$AGENT" "$RF/usr/bin/cats-guest-agent"
 

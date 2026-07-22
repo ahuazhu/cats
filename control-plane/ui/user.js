@@ -25,6 +25,7 @@ const state = {
   operations: [],
   activeView: "overview",
   execCat: "",
+  loading: false,
 };
 
 const loginScreen = document.querySelector("#login-screen");
@@ -81,6 +82,8 @@ function showLogin(message = "") {
 }
 
 async function loadAll({ quiet = false } = {}) {
+  if (state.loading) return;
+  state.loading = true;
   const button = document.querySelector("#refresh-button");
   if (!quiet) setBusy(button, true, t("common.refreshing"));
   try {
@@ -96,11 +99,12 @@ async function loadAll({ quiet = false } = {}) {
   } catch (error) {
     if (error.status === 401 || error.status === 403) {
       showLogin(error.message);
-    } else {
+    } else if (!quiet) {
       toast(t("user.refreshFailed"), error.message, "error");
     }
     throw error;
   } finally {
+    state.loading = false;
     if (!quiet) setBusy(button, false);
   }
 }
@@ -229,7 +233,9 @@ async function mutateCat(name, action, button) {
   if (action === "exec") {
     state.execCat = name;
     document.querySelector("#exec-cat-name").textContent = name;
-    document.querySelector("#exec-output").textContent = t("user.execDialog.waiting");
+    const output = document.querySelector("#exec-output");
+    output.classList.remove("is-error");
+    output.textContent = t("user.execDialog.waiting");
     execDialog.showModal();
     return;
   }
@@ -345,6 +351,7 @@ document.querySelector("#create-cat-form").addEventListener("submit", async (eve
         cpus: Number(values.get("cpus")),
         memory_mib: Number(values.get("memory_mib")),
         root_size_bytes: Math.round(Number(values.get("root_gib")) * (1024 ** 3)),
+        auto_suspend: true,
         disk: null,
       }),
     });
@@ -398,8 +405,7 @@ document.querySelector("#exec-form").addEventListener("submit", async (event) =>
   const form = event.currentTarget;
   const button = form.querySelector('button[value="default"]');
   const output = document.querySelector("#exec-output");
-  const error = form.querySelector("[data-form-error]");
-  error.textContent = "";
+  output.classList.remove("is-error");
   setBusy(button, true, t("user.execDialog.running"));
   try {
     const command = splitCommand(new FormData(form).get("command"));
@@ -407,9 +413,11 @@ document.querySelector("#exec-form").addEventListener("submit", async (event) =>
       method: "POST",
       body: JSON.stringify({ command }),
     });
+    output.classList.toggle("is-error", result.exit_code !== 0);
     output.textContent = `${result.stdout || ""}${result.stderr ? `\n[stderr]\n${result.stderr}` : ""}\n\n[exit ${result.exit_code}]`;
   } catch (caught) {
-    error.textContent = caught.message;
+    output.classList.add("is-error");
+    output.textContent = t("user.execDialog.failed", { message: caught.message });
   } finally {
     setBusy(button, false);
   }
@@ -467,3 +475,9 @@ async function initializeAuth() {
 }
 
 initializeAuth();
+
+window.setInterval(() => {
+  if (!document.hidden && state.project && !appShell.classList.contains("is-hidden")) {
+    loadAll({ quiet: true }).catch(() => {});
+  }
+}, 3_000);

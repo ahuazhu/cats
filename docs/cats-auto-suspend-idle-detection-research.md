@@ -79,7 +79,7 @@ Sprites 是 Fly.io 面向 AI agent 负载的新产品。它与 Cats 都采用 mi
 
 ## 6. 对 Cats 的落地推荐
 
-实现状态（2026-07-22）：工作租约、Guest 长轮询摘要、控制面事务判定、Gateway/exec 自动租约、Node/Guest 两阶段 quiesce、generation/sequence 栅栏和 `ActivityChanged` 类型化拒绝均已落地并有自动化测试。自动策略为 Cat 级 opt-in，工作并集归零后不等待 idle timer。尚未完成的是 Suspended 承诺的 page-out（`MADV_PAGEOUT`）；当前 Cloud Hypervisor 路径只 pause，主要节省 vCPU 而非内存。完整方案见[《Cats 工作驱动的快速休眠：产品与实现设计》](cats-auto-tier-product-and-implementation-design.md)。
+实现状态（2026-07-22）：工作租约、Guest 长轮询摘要、控制面事务判定、Gateway/exec 自动租约、Node/Guest 两阶段 quiesce、generation/sequence 栅栏和 `ActivityChanged` 类型化拒绝均已落地并有自动化测试。自动策略在新建 Cat 上默认开启、允许按 Cat 显式关闭，工作并集归零后不等待 idle timer。尚未完成的是 Suspended 承诺的 page-out（`MADV_PAGEOUT`）；当前 Cloud Hypervisor 路径只 pause，主要节省 vCPU 而非内存。完整方案见[《Cats 工作驱动的快速休眠：产品与实现设计》](cats-auto-tier-product-and-implementation-design.md)。
 
 ### 已选架构：控制面工作汇总 + Guest/Node 最终栅栏
 

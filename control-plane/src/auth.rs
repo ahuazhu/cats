@@ -1,24 +1,29 @@
-//! Optional WorkOS AuthKit integration for the embedded web consoles.
+//! WorkOS AuthKit integration for browser sessions and CLI device login.
 //!
-//! CLI and service callers continue to use bearer tokens. Browser sessions
-//! use separate encrypted, HttpOnly cookies for the user and administrator
-//! sites. A WorkOS Organization is mapped explicitly to one Cats project;
-//! an organization-less AuthKit user receives an isolated personal project.
-//! Fleet access additionally requires a configured WorkOS permission.
+//! Browser sessions use separate encrypted, HttpOnly cookies for the user and
+//! administrator sites. The CLI sends short-lived WorkOS access JWTs, which
+//! are verified against WorkOS JWKS on every API request. A WorkOS
+//! Organization is mapped explicitly to one Cats workspace/project; an
+//! organization-less AuthKit user receives an isolated personal workspace.
 
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use workos::enums::UserOrganizationMembershipStatus;
 use workos::helpers::{
     seal, seal_session, unseal, AuthKitAuthorizationUrlParams, AuthKitPkceCodeExchangeParams,
     SessionData, SessionManager, SessionRefreshOptions, SessionState,
 };
 use workos::models::RevokeSession;
+use workos::resources::organization_membership::ListOrganizationMembershipsParams;
 use workos::resources::user_management::RevokeSessionParams;
 
+use cats_api::auth::{CliAuthConfigResponse, MeResponse, UserProfile, Workspace, WorkspaceKind};
 use cats_api::error::ApiError;
 
 use crate::api::Failure;
@@ -35,6 +40,10 @@ const FLOW_MAX_AGE_UNIX_SECONDS: i64 = 10 * 60;
 #[derive(Clone)]
 pub struct WorkOsConfig {
     client: workos::Client,
+    client_id: String,
+    api_base_url: String,
+    issuer_url: String,
+    jwks: Arc<workos::helpers::JwksHelper>,
     redirect_uri: String,
     cookie_password: String,
     project_organizations: BTreeMap<String, String>,
@@ -50,6 +59,8 @@ pub struct WorkOsConfigParams {
     pub client_id: String,
     pub api_key: String,
     pub api_base_url: String,
+    /// Exact `iss` claim published in this WorkOS application's access tokens.
+    pub issuer_url: String,
     pub redirect_uri: String,
     pub cookie_password: String,
     /// Cats project -> WorkOS Organization ID.
@@ -109,6 +120,15 @@ impl WorkOsConfig {
             matches!(redirect.scheme(), "http" | "https"),
             "WorkOS redirect URI must use http or https"
         );
+        let issuer = reqwest::Url::parse(&params.issuer_url)
+            .map_err(|error| anyhow::anyhow!("invalid WorkOS issuer URL: {error}"))?;
+        anyhow::ensure!(
+            matches!(issuer.scheme(), "http" | "https")
+                && issuer.host_str().is_some()
+                && issuer.query().is_none()
+                && issuer.fragment().is_none(),
+            "WorkOS issuer must be an absolute http(s) URL without a query or fragment"
+        );
         if let Some(domain) = &params.cookie_domain {
             anyhow::ensure!(
                 !domain.is_empty()
@@ -124,14 +144,22 @@ impl WorkOsConfig {
         validate_site_url(&user_site_url, "user")?;
         validate_site_url(&admin_site_url, "admin")?;
 
+        let client_id = params.client_id.clone();
+        let api_base_url = params.api_base_url.trim_end_matches('/').to_string();
+        let issuer_url = params.issuer_url;
         let client = workos::Client::builder()
-            .client_id(params.client_id)
+            .client_id(&client_id)
             .api_key(params.api_key)
-            .base_url(params.api_base_url)
+            .base_url(&api_base_url)
             .try_build()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let jwks = Arc::new(client.jwks());
         Ok(Self {
             client,
+            client_id,
+            api_base_url,
+            issuer_url,
+            jwks,
             redirect_uri: params.redirect_uri,
             cookie_password: params.cookie_password,
             project_organizations: params.project_organizations,
@@ -152,12 +180,235 @@ impl WorkOsConfig {
             })
     }
 
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    pub fn api_base_url(&self) -> &str {
+        &self.api_base_url
+    }
+
+    /// Verify a CLI bearer token cryptographically and turn its organization
+    /// scope into the existing Cats project namespace. A valid token for an
+    /// unmapped organization remains authenticated but has no project access.
+    pub async fn verify_access_token(&self, token: &str) -> Result<AccessIdentity, ApiError> {
+        let header = decode_header(token)
+            .map_err(|_| ApiError::unauthenticated("invalid WorkOS access token"))?;
+        if header.alg != Algorithm::RS256 {
+            return Err(ApiError::unauthenticated(
+                "unsupported WorkOS access token algorithm",
+            ));
+        }
+        let kid = header
+            .kid
+            .as_deref()
+            .ok_or_else(|| ApiError::unauthenticated("WorkOS access token has no key ID"))?;
+        let keys = self.jwks.fetch().await.map_err(|error| {
+            tracing::warn!(error = %error, "WorkOS JWKS fetch failed");
+            ApiError::unavailable("WorkOS signing keys are temporarily unavailable")
+        })?;
+        let jwk = keys
+            .keys
+            .iter()
+            .find(|key| key.kid.as_deref() == Some(kid))
+            .ok_or_else(|| ApiError::unauthenticated("unknown WorkOS signing key"))?;
+        if jwk.kty.as_deref() != Some("RSA") || jwk.alg.as_deref() != Some("RS256") {
+            return Err(ApiError::unauthenticated("invalid WorkOS signing key"));
+        }
+        let modulus = jwk
+            .other
+            .get("n")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ApiError::unauthenticated("invalid WorkOS RSA key"))?;
+        let exponent = jwk
+            .other
+            .get("e")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ApiError::unauthenticated("invalid WorkOS RSA key"))?;
+        let key = DecodingKey::from_rsa_components(modulus, exponent)
+            .map_err(|_| ApiError::unauthenticated("invalid WorkOS RSA key"))?;
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.validate_aud = false;
+        validation.set_required_spec_claims(&["exp", "iss", "sub"]);
+        validation.set_issuer(&[self.issuer_url.as_str()]);
+        let claims = decode::<AccessTokenClaims>(token, &key, &validation)
+            .map_err(|error| {
+                tracing::warn!(
+                    error = %error,
+                    kid,
+                    "WorkOS access token validation failed"
+                );
+                ApiError::unauthenticated("invalid or expired WorkOS access token")
+            })?
+            .claims;
+        if claims.client_id != self.client_id || claims.sub.is_empty() || claims.sid.is_empty() {
+            return Err(ApiError::unauthenticated(
+                "WorkOS access token belongs to another application",
+            ));
+        }
+        let organization_id = claims.org_id.filter(|value| !value.is_empty());
+        let project = organization_id
+            .as_deref()
+            .and_then(|org| self.project_for_organization(org).map(str::to_string))
+            .or_else(|| {
+                organization_id
+                    .is_none()
+                    .then(|| format!("personal-{}", claims.sub))
+            });
+        Ok(AccessIdentity {
+            user_id: claims.sub,
+            session_id: claims.sid,
+            organization_id,
+            project,
+            role: claims.role,
+            permissions: claims.permissions,
+        })
+    }
+
+    pub async fn me(&self, identity: &AccessIdentity) -> Result<MeResponse, ApiError> {
+        let user = self
+            .client
+            .user_management()
+            .get_user(&identity.user_id)
+            .await
+            .map_err(|error| {
+                tracing::warn!(error = %error, "WorkOS user lookup failed");
+                ApiError::unavailable("WorkOS user profile is temporarily unavailable")
+            })?;
+        Ok(MeResponse {
+            user: UserProfile {
+                id: user.id,
+                email: user.email,
+                name: user.name.or_else(|| {
+                    let joined = [user.first_name, user.last_name]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    (!joined.is_empty()).then_some(joined)
+                }),
+            },
+            workspaces: self.workspaces_for(identity).await?,
+        })
+    }
+
+    pub async fn workspaces_for(
+        &self,
+        identity: &AccessIdentity,
+    ) -> Result<Vec<Workspace>, ApiError> {
+        let mut result = Vec::new();
+        if identity.organization_id.is_none() {
+            let slug = format!("personal-{}", identity.user_id);
+            result.push(Workspace {
+                display_name: "Personal".to_string(),
+                slug,
+                kind: WorkspaceKind::Personal,
+                organization_id: None,
+                role: Some("owner".to_string()),
+            });
+        }
+        let mut after = None;
+        loop {
+            let page = self
+                .client
+                .organization_membership()
+                .list_organization_memberships(ListOrganizationMembershipsParams {
+                    after: after.clone(),
+                    limit: Some(100),
+                    user_id: Some(identity.user_id.clone()),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|error| {
+                    tracing::warn!(error = %error, "WorkOS organization membership lookup failed");
+                    ApiError::unavailable(
+                        "WorkOS workspace memberships are temporarily unavailable",
+                    )
+                })?;
+            for membership in page.data {
+                if membership.status != UserOrganizationMembershipStatus::Active {
+                    continue;
+                }
+                let Some(slug) = self
+                    .project_for_organization(&membership.organization_id)
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                result.push(Workspace {
+                    display_name: membership.organization_name.unwrap_or_else(|| slug.clone()),
+                    slug,
+                    kind: WorkspaceKind::Organization,
+                    organization_id: Some(membership.organization_id),
+                    role: Some(membership.role.slug),
+                });
+            }
+            after = page.list_metadata.after;
+            if after.is_none() {
+                break;
+            }
+        }
+        result.sort_by(|left, right| left.slug.cmp(&right.slug));
+        result.dedup_by(|left, right| left.slug == right.slug);
+        Ok(result)
+    }
+
+    pub async fn revoke_cli_session(&self, identity: &AccessIdentity) -> Result<(), ApiError> {
+        let params = RevokeSessionParams::new(RevokeSession {
+            session_id: identity.session_id.clone(),
+        });
+        self.client
+            .user_management()
+            .revoke_session(params)
+            .await
+            .map_err(|error| {
+                tracing::warn!(error = %error, "WorkOS CLI session revocation failed");
+                ApiError::unavailable("WorkOS session could not be revoked")
+            })?;
+        Ok(())
+    }
+
+    pub fn is_fleet_administrator(&self, identity: &AccessIdentity) -> bool {
+        identity.organization_id.as_deref() == Some(self.admin_organization_id.as_str())
+            && identity
+                .permissions
+                .iter()
+                .any(|permission| permission == &self.admin_permission)
+    }
+
     fn site_url(&self, site: Site) -> &str {
         match site {
             Site::User => &self.user_site_url,
             Site::Admin => &self.admin_site_url,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct AccessIdentity {
+    pub user_id: String,
+    pub session_id: String,
+    pub organization_id: Option<String>,
+    pub project: Option<String>,
+    pub role: Option<String>,
+    pub permissions: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccessTokenClaims {
+    sub: String,
+    sid: String,
+    client_id: String,
+    #[serde(default)]
+    org_id: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    permissions: Vec<String>,
+    #[allow(dead_code)]
+    exp: u64,
+    #[allow(dead_code)]
+    iss: String,
 }
 
 fn validate_site_url(value: &str, site: &str) -> anyhow::Result<()> {
@@ -256,11 +507,6 @@ pub struct SiteQuery {
 }
 
 #[derive(Debug, Serialize)]
-struct AuthConfigResponse {
-    workos_enabled: bool,
-}
-
-#[derive(Debug, Serialize)]
 struct SessionUser {
     id: String,
     email: String,
@@ -278,8 +524,18 @@ struct SessionResponse {
 }
 
 pub async fn config(State(state): State<AppState>) -> Response {
-    let mut response = Json(AuthConfigResponse {
+    let mut response = Json(CliAuthConfigResponse {
         workos_enabled: state.cfg.workos.is_some(),
+        workos_client_id: state
+            .cfg
+            .workos
+            .as_ref()
+            .map(|config| config.client_id().to_string()),
+        workos_api_base_url: state
+            .cfg
+            .workos
+            .as_ref()
+            .map(|config| config.api_base_url().to_string()),
     })
     .into_response();
     set_no_store(&mut response);

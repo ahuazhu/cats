@@ -152,6 +152,21 @@ mod tests {
     }
 
     #[test]
+    fn user_console_polls_for_background_lifecycle_changes() {
+        for contract in [
+            "window.setInterval(",
+            "!document.hidden",
+            "loadAll({ quiet: true })",
+            "state.loading",
+        ] {
+            assert!(
+                USER_JS.contains(contract),
+                "missing polling contract: {contract}"
+            );
+        }
+    }
+
+    #[test]
     fn english_and_chinese_catalogs_have_the_same_keys() {
         let mut counts = std::collections::BTreeMap::<&str, usize>::new();
         for line in I18N_JS.lines() {

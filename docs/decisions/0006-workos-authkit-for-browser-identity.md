@@ -3,6 +3,9 @@
 - 状态：Accepted
 - 日期：2026-07-22
 
+> CLI project token 部分已由 ADR-0008 取代；本 ADR 的浏览器 session、组织映射和
+> user/admin 隔离决定继续有效。
+
 ## 背景
 
 V1 开发控制面最初只接受静态 Bearer Token。它适合 node-agent、gateway、CLI 和
@@ -30,11 +33,10 @@ CLI 调用契约。
 4. user/admin 使用不同的 AES-GCM sealed、`HttpOnly`、`SameSite=Lax` Cookie。生产
    HTTPS 下 Cookie 必须带 `Secure`。短期 access token 过期后，控制面使用 sealed
    refresh token 向 WorkOS 换取并轮换 session；认证响应不得缓存。
-5. `cats` CLI 和内部服务继续使用 Bearer Token：
-   - project token 用于 CLI/自动化；
-   - admin token 用于 fleet CLI；
-   - service token 只用于 node-agent、gateway 与控制器。
-   WorkOS session 不得获得 service 权限，Guest 不接收任何上述凭据。
+5. 内部服务继续使用独立 Bearer Token：service token 只用于 node-agent、gateway 与
+   控制器，admin token 用于 fleet 自动化。普通用户 CLI 鉴权已由 ADR-0008 改为
+   WorkOS Device Login，不再使用 project token。WorkOS session 不得获得 service
+   权限，Guest 不接收任何上述凭据。
 6. user/admin Web 站点只使用 WorkOS 登录，不提供静态 Token 表单或开发回退。
    WorkOS 未配置时浏览器站点 fail closed。Bearer API 本身仍保留给 CLI 和内部服务。
 7. 使用 WorkOS 官方 Rust SDK 提供的 AuthKit、PKCE 与 sealed-session helper，不自行
@@ -55,8 +57,9 @@ CLI 调用契约。
 
 ## 影响
 
-- WorkOS 不可用时，未过期且已 sealed 的 access token 仍可完成本地校验；新登录和
-  到期 refresh 会失败。CLI/service 路径不依赖 WorkOS。
+- WorkOS 不可用时，未过期且已 sealed 的浏览器 access token 仍可完成本地校验；新
+  登录和到期 refresh 会失败。CLI 的详细失败语义见 ADR-0008；service 路径不依赖
+  WorkOS。
 - 每个生产环境需要配置 WorkOS redirect URI、团队 Project/Organization 映射、
   管理员 Organization 和权限；无组织用户的个人 Project 无需预配置。生产 Web
   必须使用 HTTPS。

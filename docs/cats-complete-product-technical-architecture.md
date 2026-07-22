@@ -155,9 +155,10 @@ flowchart TD
 `cats` 是唯一主 CLI。命令只描述用户意图，不暴露 node_id、S3 prefix、内部 metadata、tap、socket 或 vhost-user 参数。Dashboard 和 SDK 使用同一 API。
 
 ``` code-block
-# 登录和选择项目
-cats auth login
-cats project use acme/dev
+# 登录和选择 workspace（登录与选择分离；命令可用 --workspace 临时覆盖）
+cats login
+cats workspace list
+cats workspace use acme-dev
 
 # 创建 Cat；RootDisk 自动创建
 cats create dev --image ubuntu-24.04 --cpus 4 --memory 8GiB --root-size 100GiB
@@ -593,7 +594,7 @@ MountBinding 可以保留，但 runtime Attachment 必须结束。
 
 ### 8.2 自动空闲策略
 
-**工作驱动的快速 Suspend：**V1 按 Cat opt-in。平台 Gateway/exec/control 租约与 Guest 用户程序显式工作租约都为零、Guest 摘要新鲜且最终 quiesce fence 通过时，Running 立即尝试进入 Suspended，不等待 idle timeout，也不根据 CPU、load、网络或进程扫描猜测。信号链不确定时 fail-awake。Suspended → Warm → Cold 仍可按更长闲置时间、本机内存/backing/快照压力或 Node drain 自动降级；具体阈值属于套餐/项目策略，不写死在 VMM 实现中。详见 [工作驱动快速休眠设计](cats-auto-tier-product-and-implementation-design.md)。
+**工作驱动的快速 Suspend：**V1 新建 Cat 默认开启，并允许按 Cat 显式关闭。平台 Gateway/exec/control 租约与 Guest 用户程序显式工作租约都为零、Guest 摘要新鲜且最终 quiesce fence 通过时，Running 立即尝试进入 Suspended，不等待 idle timeout，也不根据 CPU、load、网络或进程扫描猜测。需要持续后台运行的 Guest workload 必须接入工作租约或关闭该策略；信号链不确定时 fail-awake。Suspended → Warm → Cold 仍可按更长闲置时间、本机内存/backing/快照压力或 Node drain 自动降级；具体阈值属于套餐/项目策略，不写死在 VMM 实现中。详见 [工作驱动快速休眠设计](cats-auto-tier-product-and-implementation-design.md)。
 
 **自动唤醒：**Shell/Exec 一定触发唤醒；HTTP Endpoint 是否因请求唤醒由 `wake_policy` 控制。Edge 对同一 Cat 的并发冷请求只触发一个 Activation Operation；等待超时返回 `503 + Retry-After`，不能无限占用连接。
 

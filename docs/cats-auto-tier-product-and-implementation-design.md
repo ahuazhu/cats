@@ -20,13 +20,14 @@ AND 平台工作租约数 + Guest 用户工作租约数 = 0
 
 “没有租约”的准确含义是“平台和 Guest 用户程序都没有请求继续运行”，不是 Cats 证明 Guest 中所有进程已经完成。Guest 内信号由 Guest 内用户程序设置；Guest Agent 不扫描 `/proc`，不根据 CPU、load、TCP、块 IO 或进程名代替用户判断。
 
-V1 默认 `auto_suspend=off`。用户确认自己的 workload 已接入工作协议后，按 Cat 开启：
+V1 新建 Cat 默认 `auto_suspend=on`。平台入口工作由 Gateway/exec 租约自动保护；需要持续后台运行的 Guest workload 必须接入工作租约，或按 Cat 显式关闭：
 
 ```text
-cats create worker --auto-suspend
-cats sleep on worker
+cats create worker
+cats create always-on --no-auto-suspend
 cats sleep status worker
 cats sleep off worker
+cats sleep on worker
 ```
 
 显式 `suspend`、`resume`、`warm`、`stop` 不受此开关影响。
@@ -37,7 +38,7 @@ cats sleep off worker
 
 | 条件 | 原因 |
 |---|---|
-| 自动休眠已开启 | V1 是 opt-in，避免未接入的后台程序被误睡 |
+| 自动休眠已开启 | 新建 Cat 默认开启；未接入工作租约且需要持续运行的后台程序应显式关闭 |
 | desired / observed 都是 Running | 不和 start、resume、drain、fencing 或其他生命周期转换并行决策 |
 | Guest 工作摘要新鲜 | 信号链故障时 fail-awake，不把“收不到信号”解释为“没有工作” |
 | 所有未过期租约的并集为空 | Gateway、exec、Guest 用户任务中的任一工作都阻止自动睡眠 |
@@ -286,7 +287,7 @@ Host control 继续使用现有的 u32 big-endian length + JSON framing over AF_
 
 V1 已实现：
 
-- Cat 级 opt-in `auto_suspend`；
+- Cat 级 `auto_suspend`，新建 Cat 默认开启且可显式关闭；
 - Guest 本机 `/run/cats/runtime.sock` HTTP 工作租约 API，以及可选的 `cats-guest-work` HTTP 包装器；
 - Node 长轮询上报和 freshness fail-awake；
 - Gateway、exec 工作租约；

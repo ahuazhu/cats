@@ -83,6 +83,11 @@ struct CatRuntime {
 #[error("activity changed while preparing to suspend")]
 struct ActivityChanged;
 
+pub(crate) fn is_activity_changed(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ActivityChanged>().is_some()
+        || format!("{error:#}").contains("activity_changed")
+}
+
 #[derive(Default)]
 struct RuntimeActivityInner {
     sequence: u64,
@@ -290,9 +295,7 @@ impl NodeRuntime {
             Err(e) => {
                 tracing::warn!(job = %job_id, "job failed: {e:#}");
                 let observed = self.observed_of(&cat_id);
-                if e.downcast_ref::<ActivityChanged>().is_some()
-                    || format!("{e:#}").contains("activity_changed")
-                {
+                if is_activity_changed(&e) {
                     // A rejected suspend still consumed this lifecycle job:
                     // keep the work-status watcher on the control-plane
                     // generation used for cancellation/retry.
