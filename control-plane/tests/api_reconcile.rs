@@ -37,7 +37,7 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Jso
     let (cat_id, observed) = match &job.action {
         NodeJobAction::StartCat { cat_id, .. } => (cat_id.clone(), ObservedState::Running),
         NodeJobAction::StopCat { cat_id } => (cat_id.clone(), ObservedState::Cold),
-        NodeJobAction::SuspendCat { cat_id } => (cat_id.clone(), ObservedState::Suspended),
+        NodeJobAction::SuspendCat { cat_id, .. } => (cat_id.clone(), ObservedState::Suspended),
         NodeJobAction::ResumeCat { cat_id } => (cat_id.clone(), ObservedState::Running),
         NodeJobAction::WarmCat { cat_id } => (cat_id.clone(), ObservedState::Warm),
         NodeJobAction::RestoreCat { cat_id } => (cat_id.clone(), ObservedState::Running),
@@ -391,6 +391,94 @@ async fn lifecycle_stop_start_suspend_resume() {
     ctx.wait_observed("dev", ObservedState::Warm).await;
     ctx.action("dev", "resume").await;
     ctx.wait_observed("dev", ObservedState::Running).await;
+}
+
+#[tokio::test]
+async fn auto_suspend_fires_on_the_last_guest_work_release() {
+    let ctx = Ctx::new().await;
+    let _node = start_stub_node(&ctx.cp, "node_a").await;
+    ctx.create_cat("worker", None).await;
+    let cat = ctx.wait_observed("worker", ObservedState::Running).await;
+
+    let report = |sequence, leases| NodeWorkStatusRequest {
+        node_id: "node_a".into(),
+        cat_id: cat.id.clone(),
+        generation: cat.generation,
+        guest_source_epoch: "guest-boot-1".into(),
+        guest_lease_sequence: sequence,
+        leases,
+    };
+    ctx.http
+        .post(ctx.url("/v1/nodes/work-status"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&report(
+            1,
+            vec![cats_api::guest::GuestWorkLease {
+                id: "job-1".into(),
+                label: "user-training".into(),
+                remaining_ttl_ms: 30_000,
+            }],
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let enabled: AutoSuspendResponse = ctx
+        .http
+        .put(ctx.url("/v1/projects/default/cats/worker/auto-suspend"))
+        .bearer_auth("dev-token")
+        .json(&UpdateAutoSuspendRequest { enabled: true })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(enabled.cat.auto_suspend);
+    assert_eq!(enabled.work.reason, "active_work");
+    assert_eq!(enabled.work.active_work_count, 1);
+
+    // No CPU/network heuristic is involved: the explicit Guest work lease
+    // alone keeps the Cat Running.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        ctx.wait_observed("worker", ObservedState::Running)
+            .await
+            .observed_state,
+        ObservedState::Running
+    );
+
+    ctx.http
+        .post(ctx.url("/v1/nodes/work-status"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&report(2, vec![]))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let suspended = ctx.wait_observed("worker", ObservedState::Suspended).await;
+    assert_eq!(suspended.desired_state, DesiredState::Suspended);
+
+    let operations: ListResponse<Operation> = ctx
+        .http
+        .get(ctx.url("/v1/projects/default/operations"))
+        .bearer_auth("dev-token")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(operations.items.iter().any(|operation| {
+        operation.kind == "cat.auto_suspend" && operation.phase == OperationPhase::Succeeded
+    }));
 }
 
 #[tokio::test]

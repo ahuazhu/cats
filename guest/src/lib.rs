@@ -16,14 +16,16 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
-use std::time::Instant;
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use cats_api::guest::{
-    GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody, MAX_FRAME_BYTES,
+    GuestLocalWorkRequest, GuestLocalWorkRequestBody, GuestLocalWorkResponse,
+    GuestLocalWorkResponseBody, GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody,
+    GuestWorkLease, GuestWorkStatus, MAX_FRAME_BYTES, MAX_WORK_LEASES, MAX_WORK_LEASE_TTL_MS,
 };
 use cats_blockd::nbd::NbdClient;
 
@@ -106,6 +108,193 @@ pub struct GuestAgent {
     /// Monotonic counter surviving Warm (proves process-state continuity).
     counter: AtomicU64,
     volumes: Mutex<HashMap<String, NbdClient>>,
+    work: WorkRegistry,
+}
+
+struct WorkLeaseEntry {
+    id: String,
+    label: String,
+    expires_at: Instant,
+}
+
+struct WorkInner {
+    source_epoch: String,
+    lease_sequence: u64,
+    quiescing: bool,
+    leases: HashMap<String, WorkLeaseEntry>,
+}
+
+struct WorkRegistry {
+    inner: Mutex<WorkInner>,
+    changed: Condvar,
+}
+
+impl WorkRegistry {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(WorkInner {
+                source_epoch: uuid::Uuid::new_v4().simple().to_string(),
+                lease_sequence: 0,
+                quiescing: false,
+                leases: HashMap::new(),
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn prune(inner: &mut WorkInner) -> bool {
+        let before = inner.leases.len();
+        let now = Instant::now();
+        inner.leases.retain(|_, lease| lease.expires_at > now);
+        if inner.leases.len() != before {
+            inner.lease_sequence = inner.lease_sequence.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn status_of(inner: &WorkInner) -> GuestWorkStatus {
+        let now = Instant::now();
+        let mut leases: Vec<GuestWorkLease> = inner
+            .leases
+            .values()
+            .map(|lease| GuestWorkLease {
+                id: lease.id.clone(),
+                label: lease.label.clone(),
+                remaining_ttl_ms: lease
+                    .expires_at
+                    .saturating_duration_since(now)
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            })
+            .collect();
+        leases.sort_by(|a, b| a.id.cmp(&b.id));
+        GuestWorkStatus {
+            source_epoch: inner.source_epoch.clone(),
+            lease_sequence: inner.lease_sequence,
+            quiescing: inner.quiescing,
+            leases,
+        }
+    }
+
+    fn status(&self, after_sequence: Option<u64>, wait_timeout_ms: u64) -> GuestWorkStatus {
+        let max_wait = Duration::from_millis(wait_timeout_ms.min(30_000));
+        let deadline = Instant::now() + max_wait;
+        let mut inner = self.inner.lock().unwrap();
+        if Self::prune(&mut inner) {
+            self.changed.notify_all();
+        }
+        while after_sequence == Some(inner.lease_sequence) && Instant::now() < deadline {
+            let until_expiry = inner
+                .leases
+                .values()
+                .map(|lease| lease.expires_at.saturating_duration_since(Instant::now()))
+                .min()
+                .unwrap_or_else(|| deadline.saturating_duration_since(Instant::now()));
+            let wait = until_expiry
+                .min(deadline.saturating_duration_since(Instant::now()))
+                .max(Duration::from_millis(1));
+            let (next, _) = self.changed.wait_timeout(inner, wait).unwrap();
+            inner = next;
+            if Self::prune(&mut inner) {
+                self.changed.notify_all();
+            }
+        }
+        Self::status_of(&inner)
+    }
+
+    fn acquire(&self, label: String, ttl_ms: u64) -> Result<GuestWorkLease> {
+        anyhow::ensure!(!label.is_empty(), "work label must not be empty");
+        anyhow::ensure!(label.len() <= 64, "work label exceeds 64 bytes");
+        anyhow::ensure!(ttl_ms > 0, "work TTL must be positive");
+        anyhow::ensure!(
+            ttl_ms <= MAX_WORK_LEASE_TTL_MS,
+            "work TTL exceeds the maximum"
+        );
+        let mut inner = self.inner.lock().unwrap();
+        Self::prune(&mut inner);
+        if inner.quiescing {
+            inner.lease_sequence = inner.lease_sequence.saturating_add(1);
+            self.changed.notify_all();
+            anyhow::bail!("activity_changed: Cat is preparing to suspend; retry");
+        }
+        anyhow::ensure!(inner.leases.len() < MAX_WORK_LEASES, "too many work leases");
+        let id = format!("work_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+        inner.leases.insert(
+            id.clone(),
+            WorkLeaseEntry {
+                id: id.clone(),
+                label,
+                expires_at: Instant::now() + Duration::from_millis(ttl_ms),
+            },
+        );
+        inner.lease_sequence = inner.lease_sequence.saturating_add(1);
+        let lease = Self::status_of(&inner)
+            .leases
+            .into_iter()
+            .find(|lease| lease.id == id)
+            .expect("inserted work lease");
+        self.changed.notify_all();
+        Ok(lease)
+    }
+
+    fn renew(&self, lease_id: &str, ttl_ms: u64) -> Result<GuestWorkLease> {
+        anyhow::ensure!(ttl_ms > 0, "work TTL must be positive");
+        anyhow::ensure!(
+            ttl_ms <= MAX_WORK_LEASE_TTL_MS,
+            "work TTL exceeds the maximum"
+        );
+        let mut inner = self.inner.lock().unwrap();
+        Self::prune(&mut inner);
+        if inner.quiescing {
+            inner.lease_sequence = inner.lease_sequence.saturating_add(1);
+            self.changed.notify_all();
+            anyhow::bail!("activity_changed: Cat is preparing to suspend; retry");
+        }
+        let lease = inner
+            .leases
+            .get_mut(lease_id)
+            .with_context(|| format!("work lease {lease_id} not found"))?;
+        lease.expires_at = Instant::now() + Duration::from_millis(ttl_ms);
+        inner.lease_sequence = inner.lease_sequence.saturating_add(1);
+        let renewed = Self::status_of(&inner)
+            .leases
+            .into_iter()
+            .find(|lease| lease.id == lease_id)
+            .expect("renewed work lease");
+        self.changed.notify_all();
+        Ok(renewed)
+    }
+
+    fn release(&self, lease_id: &str) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        Self::prune(&mut inner);
+        anyhow::ensure!(
+            inner.leases.remove(lease_id).is_some(),
+            "work lease {lease_id} not found"
+        );
+        inner.lease_sequence = inner.lease_sequence.saturating_add(1);
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    fn prepare_suspend(&self, expected_sequence: u64) -> Result<(String, u64)> {
+        let mut inner = self.inner.lock().unwrap();
+        Self::prune(&mut inner);
+        anyhow::ensure!(
+            inner.lease_sequence == expected_sequence && inner.leases.is_empty(),
+            "activity_changed: guest work changed before suspend"
+        );
+        inner.quiescing = true;
+        Ok((inner.source_epoch.clone(), inner.lease_sequence))
+    }
+
+    fn abort_suspend(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.quiescing = false;
+        self.changed.notify_all();
+    }
 }
 
 fn kernel_boot_id() -> Option<String> {
@@ -138,6 +327,7 @@ impl GuestAgent {
             disk_map_path,
             counter: AtomicU64::new(counter),
             volumes: Mutex::new(HashMap::new()),
+            work: WorkRegistry::new(),
         }
     }
 
@@ -209,6 +399,26 @@ impl GuestAgent {
                     uptime_ms: self.started.elapsed().as_millis() as u64,
                     disks,
                 })
+            }
+            GuestRequestBody::WorkStatus {
+                after_sequence,
+                wait_timeout_ms,
+            } => Ok(GuestResponseBody::WorkStatus {
+                status: self.work.status(after_sequence, wait_timeout_ms),
+            }),
+            GuestRequestBody::PrepareSuspend {
+                expected_lease_sequence,
+            } => {
+                let (source_epoch, lease_sequence) =
+                    self.work.prepare_suspend(expected_lease_sequence)?;
+                Ok(GuestResponseBody::SuspendPrepared {
+                    source_epoch,
+                    lease_sequence,
+                })
+            }
+            GuestRequestBody::AbortSuspend => {
+                self.work.abort_suspend();
+                Ok(GuestResponseBody::Ok)
             }
             GuestRequestBody::Exec {
                 command,
@@ -285,6 +495,49 @@ impl GuestAgent {
                 tracing::info!("guest agent shutting down");
                 std::process::exit(0);
             }
+        }
+    }
+
+    fn handle_local_work(&self, req: GuestLocalWorkRequestBody) -> GuestLocalWorkResponseBody {
+        let result = match req {
+            GuestLocalWorkRequestBody::Acquire { label, ttl_ms } => self
+                .work
+                .acquire(label, ttl_ms)
+                .map(|lease| GuestLocalWorkResponseBody::Lease { lease }),
+            GuestLocalWorkRequestBody::Renew { lease_id, ttl_ms } => self
+                .work
+                .renew(&lease_id, ttl_ms)
+                .map(|lease| GuestLocalWorkResponseBody::Lease { lease }),
+            GuestLocalWorkRequestBody::Release { lease_id } => self
+                .work
+                .release(&lease_id)
+                .map(|()| GuestLocalWorkResponseBody::Ok),
+            GuestLocalWorkRequestBody::List => Ok(GuestLocalWorkResponseBody::Status {
+                status: self.work.status(None, 0),
+            }),
+        };
+        result.unwrap_or_else(|error| GuestLocalWorkResponseBody::Error {
+            message: format!("{error:#}"),
+        })
+    }
+
+    /// Serve the user-program work API. One connection may issue multiple
+    /// framed requests; no platform credential or Cat id crosses this socket.
+    pub fn serve_work(self: &std::sync::Arc<Self>, listener: UnixListener) {
+        for conn in listener.incoming() {
+            let Ok(mut stream) = conn else { return };
+            let agent = self.clone();
+            std::thread::spawn(move || {
+                while let Ok(req) = read_frame::<_, GuestLocalWorkRequest>(&mut stream) {
+                    let resp = GuestLocalWorkResponse {
+                        id: req.id,
+                        body: agent.handle_local_work(req.body),
+                    };
+                    if write_frame(&mut stream, &resp).is_err() {
+                        break;
+                    }
+                }
+            });
         }
     }
 
@@ -533,5 +786,83 @@ mod tests {
             GuestResponseBody::Error { message } => assert!(message.contains("not attached")),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn user_work_lease_is_the_guest_suspend_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let map_path = dir.path().join("disks.json");
+        std::fs::write(&map_path, b"{}").unwrap();
+        let agent = GuestAgent::new(map_path, None);
+
+        let lease = match agent.handle_local_work(GuestLocalWorkRequestBody::Acquire {
+            label: "training-step".into(),
+            ttl_ms: 5_000,
+        }) {
+            GuestLocalWorkResponseBody::Lease { lease } => lease,
+            other => panic!("unexpected {other:?}"),
+        };
+        let active = agent.work.status(None, 0);
+        assert_eq!(active.leases.len(), 1);
+        assert!(matches!(
+            agent.handle(GuestRequestBody::PrepareSuspend {
+                expected_lease_sequence: active.lease_sequence,
+            }),
+            GuestResponseBody::Error { .. }
+        ));
+
+        assert!(matches!(
+            agent.handle_local_work(GuestLocalWorkRequestBody::Release { lease_id: lease.id }),
+            GuestLocalWorkResponseBody::Ok
+        ));
+        let idle = agent.work.status(None, 0);
+        assert!(idle.leases.is_empty());
+        assert!(matches!(
+            agent.handle(GuestRequestBody::PrepareSuspend {
+                expected_lease_sequence: idle.lease_sequence,
+            }),
+            GuestResponseBody::SuspendPrepared { .. }
+        ));
+
+        // New work cannot slip through the quiesce window. Its failed
+        // admission still changes the sequence, forcing the Node to abort.
+        assert!(matches!(
+            agent.handle_local_work(GuestLocalWorkRequestBody::Acquire {
+                label: "racing-step".into(),
+                ttl_ms: 5_000,
+            }),
+            GuestLocalWorkResponseBody::Error { .. }
+        ));
+        let raced = agent.work.status(None, 0);
+        assert!(raced.lease_sequence > idle.lease_sequence);
+        assert!(raced.quiescing);
+
+        assert!(matches!(
+            agent.handle(GuestRequestBody::AbortSuspend),
+            GuestResponseBody::Ok
+        ));
+        assert!(matches!(
+            agent.handle_local_work(GuestLocalWorkRequestBody::Acquire {
+                label: "retry-step".into(),
+                ttl_ms: 5_000,
+            }),
+            GuestLocalWorkResponseBody::Lease { .. }
+        ));
+    }
+
+    #[test]
+    fn expired_user_work_lease_disappears_without_polling_delay() {
+        let dir = tempfile::tempdir().unwrap();
+        let map_path = dir.path().join("disks.json");
+        std::fs::write(&map_path, b"{}").unwrap();
+        let agent = GuestAgent::new(map_path, None);
+        agent.handle_local_work(GuestLocalWorkRequestBody::Acquire {
+            label: "short".into(),
+            ttl_ms: 10,
+        });
+        let active = agent.work.status(None, 0);
+        let idle = agent.work.status(Some(active.lease_sequence), 1_000);
+        assert!(idle.leases.is_empty());
+        assert!(idle.lease_sequence > active.lease_sequence);
     }
 }

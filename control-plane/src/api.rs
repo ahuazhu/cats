@@ -176,6 +176,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/projects/{project}/cats/{cat}/exec", post(exec_cat))
         .route(
+            "/v1/projects/{project}/cats/{cat}/auto-suspend",
+            get(get_auto_suspend).put(update_auto_suspend),
+        )
+        .route("/v1/projects/{project}/cats/{cat}/work", get(get_cat_work))
+        .route(
             "/v1/projects/{project}/cats/{cat}/endpoints",
             post(create_endpoint).get(list_endpoints),
         )
@@ -199,6 +204,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/projects/{project}/operations", get(list_operations))
         .route("/v1/nodes/register", post(register_node))
         .route("/v1/nodes/heartbeat", post(heartbeat))
+        .route("/v1/nodes/work-status", post(node_work_status))
+        .route("/v1/internal/work/acquire", post(acquire_work))
+        .route("/v1/internal/work/release", post(release_work))
         .route("/v1/nodes/{id}/actions/cordon", post(cordon_node))
         .route("/v1/nodes", get(list_nodes))
         .route("/v1/admin/nodes", get(admin_list_nodes))
@@ -370,48 +378,101 @@ async fn exec_cat(
     if req.command.is_empty() {
         return Err(ApiError::invalid("command must be a non-empty argv array").into());
     }
-    // Shell/exec always wakes (arch doc §8.2).
-    let cat = ensure_running(&state, cat).await?;
-    let node = state
+    let owner = format!("exec_{}", uuid::Uuid::new_v4().simple());
+    let cat_id = cat.id.clone();
+    let ttl_ms = req.timeout_ms.unwrap_or(120_000).clamp(1_000, 3_600_000);
+    let lease = state
         .store
-        .list_nodes()?
-        .into_iter()
-        .find(|n| Some(&n.id) == cat.node_id.as_ref())
-        .ok_or_else(|| ApiError::unavailable("cat has no live node"))?;
-    let url = format!(
-        "{}/v1/cats/{}/exec",
-        node.agent_url.trim_end_matches('/'),
-        cat.id
-    );
-    let resp = state
-        .controller
-        .http
-        .post(url)
-        .bearer_auth(&state.cfg.auth_token)
-        .json(&req)
-        .send()
-        .await
-        .map_err(|e| ApiError::unavailable(format!("node agent unreachable: {e}")))?;
-    if !resp.status().is_success() {
-        return Err(ApiError::unavailable(format!("exec failed: {}", resp.status())).into());
+        .acquire_work(&cat.id, WorkKind::Exec, &owner, "exec", ttl_ms)?;
+    let result: ApiResult<ExecResponse> = async {
+        // Shell/exec always wakes (arch doc §8.2).
+        let cat = ensure_running(&state, cat).await?;
+        let node = state
+            .store
+            .list_nodes()?
+            .into_iter()
+            .find(|n| Some(&n.id) == cat.node_id.as_ref())
+            .ok_or_else(|| ApiError::unavailable("cat has no live node"))?;
+        let url = format!(
+            "{}/v1/cats/{}/exec",
+            node.agent_url.trim_end_matches('/'),
+            cat.id
+        );
+        let resp = state
+            .controller
+            .http
+            .post(url)
+            .bearer_auth(&state.cfg.auth_token)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| ApiError::unavailable(format!("node agent unreachable: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(ApiError::unavailable(format!("exec failed: {}", resp.status())).into());
+        }
+        resp.json::<ExecResponse>()
+            .await
+            .map_err(|e| ApiError::internal(format!("bad exec response: {e}")).into())
     }
-    let out: ExecResponse = resp
-        .json()
-        .await
-        .map_err(|e| ApiError::internal(format!("bad exec response: {e}")))?;
-    Ok(Json(out))
+    .await;
+    let _ = state.store.release_work(&lease.id);
+    let _ = state.controller.maybe_auto_suspend(&cat_id);
+    result.map(Json)
+}
+
+async fn get_auto_suspend(
+    State(state): State<AppState>,
+    Path((project, cat)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<AutoSuspendResponse>> {
+    check_project_auth(&state, &headers, &project)?;
+    let cat = state.store.get_cat(&project, &cat)?;
+    let work = state
+        .store
+        .work_status(&cat.id, state.cfg.node_lease_timeout_ms)?;
+    Ok(Json(AutoSuspendResponse { cat, work }))
+}
+
+async fn update_auto_suspend(
+    State(state): State<AppState>,
+    Path((project, cat)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateAutoSuspendRequest>,
+) -> ApiResult<Json<AutoSuspendResponse>> {
+    check_project_auth(&state, &headers, &project)?;
+    let cat = state.store.get_cat(&project, &cat)?;
+    let cat = state.store.set_auto_suspend(&cat.id, request.enabled)?;
+    if request.enabled {
+        state.controller.maybe_auto_suspend(&cat.id)?;
+    }
+    let cat = state.store.must_get_cat_by_id(&cat.id)?;
+    let work = state
+        .store
+        .work_status(&cat.id, state.cfg.node_lease_timeout_ms)?;
+    Ok(Json(AutoSuspendResponse { cat, work }))
+}
+
+async fn get_cat_work(
+    State(state): State<AppState>,
+    Path((project, cat)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<CatWorkStatus>> {
+    check_project_auth(&state, &headers, &project)?;
+    let cat = state.store.get_cat(&project, &cat)?;
+    Ok(Json(
+        state
+            .store
+            .work_status(&cat.id, state.cfg.node_lease_timeout_ms)?,
+    ))
 }
 
 /// Wake a cat for exec/gateway traffic and wait until it reports Running.
 pub async fn ensure_running(state: &AppState, cat: Cat) -> ApiResult<Cat> {
-    if cat.observed_state == ObservedState::Running {
+    let cat = state.store.must_get_cat_by_id(&cat.id)?;
+    if cat.desired_state == DesiredState::Running && cat.observed_state == ObservedState::Running {
         return Ok(cat);
     }
-    if cat.desired_state != DesiredState::Running {
-        state
-            .store
-            .set_desired(&cat.id, DesiredState::Running, None, "cat.wake")?;
-    }
+    state.store.ensure_desired_running(&cat.id)?;
     state.notify.notify_one();
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -578,51 +639,85 @@ async fn disk_action(
 }
 
 async fn hot_attach(state: &AppState, cat: &Cat, disk: &Disk, mount_path: &str) -> ApiResult<()> {
-    let node = state
-        .store
-        .list_nodes()?
-        .into_iter()
-        .find(|n| Some(&n.id) == cat.node_id.as_ref())
-        .ok_or_else(|| ApiError::unavailable("cat node missing"))?;
-    let size = cats_api::chunk::round_up_to_chunk(disk.size_bytes);
-    match state.storage_meta.create_volume(&disk.volume_id, size) {
-        Ok(()) | Err(cats_storage::MetaError::AlreadyExists(_)) => {}
-        Err(e) => return Err(ApiError::internal(e.to_string()).into()),
-    }
-    let job = cats_api::nodejob::NodeJob {
-        job_id: cats_api::nodejob::job_id(&cat.id, cat.generation, &format!("attach_{}", disk.id)),
-        cat_generation: cat.generation,
-        action: cats_api::nodejob::NodeJobAction::AttachDisk {
-            cat_id: cat.id.clone(),
-            volume: cats_api::nodejob::VolumeGrant {
-                disk_id: disk.id.clone(),
-                volume_id: disk.volume_id.clone(),
-                attachment_id: format!("att_{}_{}_{}", cat.id, disk.id, cat.generation),
-                epoch: 0,
-                size_bytes: size,
-                mount_path: mount_path.to_string(),
+    let owner = format!("control_{}", uuid::Uuid::new_v4().simple());
+    let lease =
+        state
+            .store
+            .acquire_work(&cat.id, WorkKind::Control, &owner, "disk_attach", 120_000)?;
+    let cat_id = cat.id.clone();
+    let result = async {
+        let cat = ensure_running(state, cat.clone()).await?;
+        let node = state
+            .store
+            .list_nodes()?
+            .into_iter()
+            .find(|n| Some(&n.id) == cat.node_id.as_ref())
+            .ok_or_else(|| ApiError::unavailable("cat node missing"))?;
+        let size = cats_api::chunk::round_up_to_chunk(disk.size_bytes);
+        match state.storage_meta.create_volume(&disk.volume_id, size) {
+            Ok(()) | Err(cats_storage::MetaError::AlreadyExists(_)) => {}
+            Err(e) => return Err(ApiError::internal(e.to_string()).into()),
+        }
+        let job = cats_api::nodejob::NodeJob {
+            job_id: cats_api::nodejob::job_id(
+                &cat.id,
+                cat.generation,
+                &format!("attach_{}", disk.id),
+            ),
+            cat_generation: cat.generation,
+            action: cats_api::nodejob::NodeJobAction::AttachDisk {
+                cat_id: cat.id.clone(),
+                volume: cats_api::nodejob::VolumeGrant {
+                    disk_id: disk.id.clone(),
+                    volume_id: disk.volume_id.clone(),
+                    attachment_id: format!("att_{}_{}_{}", cat.id, disk.id, cat.generation),
+                    epoch: 0,
+                    size_bytes: size,
+                    mount_path: mount_path.to_string(),
+                },
             },
-        },
-    };
-    dispatch_or_unavailable(state, &node.agent_url, &job).await
+        };
+        dispatch_or_unavailable(state, &node.agent_url, &job).await
+    }
+    .await;
+    let _ = state.store.release_work(&lease.id);
+    let _ = state.controller.maybe_auto_suspend(&cat_id);
+    result
 }
 
 async fn hot_detach(state: &AppState, cat: &Cat, disk: &Disk) -> ApiResult<()> {
-    let node = state
-        .store
-        .list_nodes()?
-        .into_iter()
-        .find(|n| Some(&n.id) == cat.node_id.as_ref())
-        .ok_or_else(|| ApiError::unavailable("cat node missing"))?;
-    let job = cats_api::nodejob::NodeJob {
-        job_id: cats_api::nodejob::job_id(&cat.id, cat.generation, &format!("detach_{}", disk.id)),
-        cat_generation: cat.generation,
-        action: cats_api::nodejob::NodeJobAction::DetachDisk {
-            cat_id: cat.id.clone(),
-            disk_id: disk.id.clone(),
-        },
-    };
-    dispatch_or_unavailable(state, &node.agent_url, &job).await
+    let owner = format!("control_{}", uuid::Uuid::new_v4().simple());
+    let lease =
+        state
+            .store
+            .acquire_work(&cat.id, WorkKind::Control, &owner, "disk_detach", 120_000)?;
+    let cat_id = cat.id.clone();
+    let result = async {
+        let cat = ensure_running(state, cat.clone()).await?;
+        let node = state
+            .store
+            .list_nodes()?
+            .into_iter()
+            .find(|n| Some(&n.id) == cat.node_id.as_ref())
+            .ok_or_else(|| ApiError::unavailable("cat node missing"))?;
+        let job = cats_api::nodejob::NodeJob {
+            job_id: cats_api::nodejob::job_id(
+                &cat.id,
+                cat.generation,
+                &format!("detach_{}", disk.id),
+            ),
+            cat_generation: cat.generation,
+            action: cats_api::nodejob::NodeJobAction::DetachDisk {
+                cat_id: cat.id.clone(),
+                disk_id: disk.id.clone(),
+            },
+        };
+        dispatch_or_unavailable(state, &node.agent_url, &job).await
+    }
+    .await;
+    let _ = state.store.release_work(&lease.id);
+    let _ = state.controller.maybe_auto_suspend(&cat_id);
+    result
 }
 
 async fn dispatch_or_unavailable(
@@ -848,6 +943,52 @@ async fn heartbeat(
                 state.notify.notify_one();
             }
         }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn node_work_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<NodeWorkStatusRequest>,
+) -> ApiResult<StatusCode> {
+    check_service_auth(&state, &headers)?;
+    let should_wake = state.store.ingest_guest_work(&request)?;
+    if should_wake {
+        state.notify.notify_one();
+    } else {
+        state.controller.maybe_auto_suspend(&request.cat_id)?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn acquire_work(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AcquireWorkRequest>,
+) -> ApiResult<Json<AcquireWorkResponse>> {
+    check_service_auth(&state, &headers)?;
+    if request.kind == WorkKind::Guest {
+        return Err(ApiError::invalid("guest work must come through the owning node").into());
+    }
+    let lease = state.store.acquire_work(
+        &request.cat_id,
+        request.kind,
+        &request.owner_id,
+        &request.label,
+        request.ttl_ms,
+    )?;
+    Ok(Json(AcquireWorkResponse { lease }))
+}
+
+async fn release_work(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ReleaseWorkRequest>,
+) -> ApiResult<StatusCode> {
+    check_service_auth(&state, &headers)?;
+    if let Some(cat_id) = state.store.release_work(&request.lease_id)? {
+        state.controller.maybe_auto_suspend(&cat_id)?;
     }
     Ok(StatusCode::NO_CONTENT)
 }

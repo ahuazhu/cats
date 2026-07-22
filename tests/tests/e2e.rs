@@ -196,6 +196,21 @@ impl Cluster {
             .await
     }
 
+    async fn wait_cat_state(&self, name: &str, state: &str) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let cat = self.cat_json(name).await;
+            if cat["observed_state"] == state {
+                return cat;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {name} to become {state}: {cat}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// Guest control socket path on a given node (the harness owns the
     /// node state dirs, so reaching into them is fair game for oracles).
     fn guest_ctl(&self, node: &str, cat_id: &str) -> PathBuf {
@@ -282,6 +297,48 @@ fn extract(body: &str, key: &str) -> String {
         .find_map(|tok| tok.strip_prefix(&format!("{key}=")))
         .unwrap_or_default()
         .to_string()
+}
+
+/// Work count 0 drives immediate Suspend; a Gateway request holds work while
+/// waking/proxying and its final release lets the Cat go straight back down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn work_driven_fast_suspend_and_gateway_wake_loop() {
+    let cluster = Cluster::start(&["node-a"]).await;
+    cluster
+        .cli_ok(&[
+            "create",
+            "nap",
+            "--root-size",
+            "8MiB",
+            "--memory",
+            "256MiB",
+            "--cpus",
+            "1",
+            "--auto-suspend",
+        ])
+        .await;
+    cluster.wait_cat_state("nap", "suspended").await;
+
+    let status = cluster.cli_ok(&["sleep", "status", "nap"]).await;
+    assert!(status.contains("auto-suspend=on"), "status: {status}");
+    let hostname = cluster
+        .cli_ok(&["expose", "nap", "8080", "--name", "web"])
+        .await
+        .trim()
+        .to_string();
+
+    let (status, first) = cluster.gateway_get(&hostname, "/first").await;
+    assert_eq!(status, 200, "first wake failed: {first}");
+    let boot_id = extract(&first, "boot_id");
+    cluster.wait_cat_state("nap", "suspended").await;
+
+    let (status, second) = cluster.gateway_get(&hostname, "/second").await;
+    assert_eq!(status, 200, "second wake failed: {second}");
+    assert_eq!(extract(&second, "boot_id"), boot_id);
+    cluster.wait_cat_state("nap", "suspended").await;
+
+    cluster.cli_ok(&["sleep", "off", "nap"]).await;
+    cluster.cli_ok(&["destroy", "nap"]).await;
 }
 
 /// §20.1 正常路径 (KVM-free rendition): create -> exec -> endpoint ->

@@ -9,6 +9,26 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 
+pub const DEFAULT_WORK_LEASE_TTL_MS: u64 = 5 * 60 * 1000;
+pub const MAX_WORK_LEASE_TTL_MS: u64 = 60 * 60 * 1000;
+pub const MAX_WORK_LEASES: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestWorkLease {
+    pub id: String,
+    pub label: String,
+    /// Remaining duration measured by the Guest Agent's monotonic clock.
+    pub remaining_ttl_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuestWorkStatus {
+    pub source_epoch: String,
+    pub lease_sequence: u64,
+    pub quiescing: bool,
+    pub leases: Vec<GuestWorkLease>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuestRequest {
     pub id: u64,
@@ -22,6 +42,19 @@ pub enum GuestRequestBody {
     /// Liveness + boot identity. `boot_id` distinguishes resume (same id)
     /// from cold boot (new id) — the correctness oracle from the experiments.
     Health,
+    /// Current user-program work leases. When `after_sequence` is supplied,
+    /// wait until the sequence changes or the bounded timeout elapses.
+    WorkStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_sequence: Option<u64>,
+        #[serde(default)]
+        wait_timeout_ms: u64,
+    },
+    /// Close the Guest task gate before sync/pause. The expected sequence is
+    /// the control plane's activity fence.
+    PrepareSuspend { expected_lease_sequence: u64 },
+    /// Re-open the Guest task gate after a rejected suspend or resume.
+    AbortSuspend,
     /// Run a command inside the guest.
     Exec {
         command: Vec<String>,
@@ -66,6 +99,13 @@ pub enum GuestResponseBody {
         uptime_ms: u64,
         disks: Vec<String>,
     },
+    WorkStatus {
+        status: GuestWorkStatus,
+    },
+    SuspendPrepared {
+        source_epoch: String,
+        lease_sequence: u64,
+    },
     Exec {
         exit_code: i32,
         stdout: String,
@@ -78,4 +118,38 @@ pub enum GuestResponseBody {
     Error {
         message: String,
     },
+}
+
+/// Guest-local user program protocol over `/run/cats/work.sock` (or the
+/// FakeVmm-provided path). It intentionally carries no Cat/control-plane id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuestLocalWorkRequest {
+    pub id: u64,
+    #[serde(flatten)]
+    pub body: GuestLocalWorkRequestBody,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum GuestLocalWorkRequestBody {
+    Acquire { label: String, ttl_ms: u64 },
+    Renew { lease_id: String, ttl_ms: u64 },
+    Release { lease_id: String },
+    List,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuestLocalWorkResponse {
+    pub id: u64,
+    #[serde(flatten)]
+    pub body: GuestLocalWorkResponseBody,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum GuestLocalWorkResponseBody {
+    Lease { lease: GuestWorkLease },
+    Status { status: GuestWorkStatus },
+    Ok,
+    Error { message: String },
 }

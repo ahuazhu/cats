@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
-use cats_api::guest::{GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody};
+use cats_api::guest::{
+    GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody, GuestWorkStatus,
+};
 use cats_guest_agent::{read_frame, write_frame};
 
 pub struct GuestClient {
@@ -71,6 +73,36 @@ impl GuestClient {
 
     pub fn syncfs(&mut self) -> Result<()> {
         self.request(GuestRequestBody::Syncfs).map(|_| ())
+    }
+
+    pub fn work_status(
+        &mut self,
+        after_sequence: Option<u64>,
+        wait_timeout_ms: u64,
+    ) -> Result<GuestWorkStatus> {
+        match self.request(GuestRequestBody::WorkStatus {
+            after_sequence,
+            wait_timeout_ms,
+        })? {
+            GuestResponseBody::WorkStatus { status } => Ok(status),
+            other => bail!("unexpected work status response: {other:?}"),
+        }
+    }
+
+    pub fn prepare_suspend(&mut self, expected_lease_sequence: u64) -> Result<(String, u64)> {
+        match self.request(GuestRequestBody::PrepareSuspend {
+            expected_lease_sequence,
+        })? {
+            GuestResponseBody::SuspendPrepared {
+                source_epoch,
+                lease_sequence,
+            } => Ok((source_epoch, lease_sequence)),
+            other => bail!("unexpected prepare suspend response: {other:?}"),
+        }
+    }
+
+    pub fn abort_suspend(&mut self) -> Result<()> {
+        self.request(GuestRequestBody::AbortSuspend).map(|_| ())
     }
 
     pub fn flush_disk(&mut self, disk_id: &str) -> Result<()> {

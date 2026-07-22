@@ -1,5 +1,6 @@
 //! Node agent HTTP surface + registration/heartbeat loops.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,12 +13,58 @@ use axum::{Json, Router};
 
 use cats_api::nodejob::NodeJob;
 use cats_api::requests::{
-    ExecRequest, ExecResponse, HeartbeatCat, HeartbeatRequest, RegisterNodeRequest,
+    ExecRequest, ExecResponse, HeartbeatCat, HeartbeatRequest, NodeWorkStatusRequest,
+    RegisterNodeRequest,
 };
 use cats_api::resources::NodeTelemetry;
 use cats_storage::MetadataStore;
 
-use crate::runtime::{NodeConfig, NodeRuntime};
+use crate::runtime::{GuestConn, NodeConfig, NodeRuntime};
+
+async fn watch_guest_work(
+    client: reqwest::Client,
+    cp: String,
+    token: String,
+    node_id: String,
+    cat_id: String,
+    generation: i64,
+    conn: GuestConn,
+) {
+    let mut after_sequence = None;
+    loop {
+        let watch_conn = conn.clone();
+        let status = tokio::task::spawn_blocking(move || {
+            let mut guest = watch_conn.connect()?;
+            guest.work_status(after_sequence, 1_000)
+        })
+        .await;
+        let status = match status {
+            Ok(Ok(status)) => status,
+            _ => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+        };
+        after_sequence = Some(status.lease_sequence);
+        let request = NodeWorkStatusRequest {
+            node_id: node_id.clone(),
+            cat_id: cat_id.clone(),
+            generation,
+            guest_source_epoch: status.source_epoch,
+            guest_lease_sequence: status.lease_sequence,
+            leases: status.leases,
+        };
+        let response = client
+            .post(format!("{cp}/v1/nodes/work-status"))
+            .bearer_auth(&token)
+            .json(&request)
+            .send()
+            .await;
+        if response.is_err() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -261,9 +308,51 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
         }
     });
 
+    // One long-poll watcher per Running Cat. Lease changes are pushed to the
+    // control plane immediately; the 1s timeout refreshes source freshness
+    // and repairs a lost event without high-rate polling.
+    let watch_state = state.clone();
+    let watch_client = client.clone();
+    let watch_cp = cp.clone();
+    let watch_token = token.clone();
+    let watch_node_id = cfg.node.node_id.clone();
+    let activity_watchers = tokio::spawn(async move {
+        let mut watchers: HashMap<(String, i64), tokio::task::JoinHandle<()>> = HashMap::new();
+        loop {
+            let targets = watch_state.runtime.activity_targets();
+            let wanted: HashSet<(String, i64)> = targets
+                .iter()
+                .map(|(cat_id, generation, _)| (cat_id.clone(), *generation))
+                .collect();
+            watchers.retain(|key, task| {
+                if wanted.contains(key) {
+                    true
+                } else {
+                    task.abort();
+                    false
+                }
+            });
+            for (cat_id, generation, conn) in targets {
+                let key = (cat_id.clone(), generation);
+                watchers.entry(key).or_insert_with(|| {
+                    tokio::spawn(watch_guest_work(
+                        watch_client.clone(),
+                        watch_cp.clone(),
+                        watch_token.clone(),
+                        watch_node_id.clone(),
+                        cat_id,
+                        generation,
+                        conn,
+                    ))
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+
     Ok(Handle {
         addr,
         state,
-        tasks: vec![server, heartbeat],
+        tasks: vec![server, heartbeat, activity_watchers],
     })
 }

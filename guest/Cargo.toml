@@ -9,6 +9,10 @@ publish = false
 name = "cats-guest-agent"
 path = "src/main.rs"
 
+[[bin]]
+name = "cats-guest-work"
+path = "src/work_main.rs"
+
 [dependencies]
 cats-api = { workspace = true }
 cats-blockd = { workspace = true }

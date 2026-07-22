@@ -20,6 +20,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
 
+use cats_api::requests::{AcquireWorkRequest, AcquireWorkResponse, ReleaseWorkRequest};
+use cats_api::resources::WorkKind;
 use cats_api::resources::{ObservedState, RouteBinding, WakePolicy};
 
 #[derive(Debug, Clone)]
@@ -139,6 +141,55 @@ impl Gateway {
         Ok(())
     }
 
+    async fn acquire_request_work(&self, cat_id: &str) -> Result<String, Response> {
+        let owner_id = format!("gateway_{}", uuid::Uuid::new_v4().simple());
+        let response = self
+            .http
+            .post(format!("{}/v1/internal/work/acquire", self.cp()))
+            .bearer_auth(&self.cfg.auth_token)
+            .json(&AcquireWorkRequest {
+                cat_id: cat_id.to_string(),
+                kind: WorkKind::Gateway,
+                owner_id,
+                label: "endpoint_request".to_string(),
+                ttl_ms: 120_000,
+            })
+            .send()
+            .await
+            .map_err(|error| {
+                gw_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("work acquire failed: {error}"),
+                )
+            })?;
+        if !response.status().is_success() {
+            return Err(gw_error(
+                StatusCode::BAD_GATEWAY,
+                format!("work acquire status {}", response.status()),
+            ));
+        }
+        let acquired: AcquireWorkResponse = response.json().await.map_err(|error| {
+            gw_error(
+                StatusCode::BAD_GATEWAY,
+                format!("bad work acquire body: {error}"),
+            )
+        })?;
+        Ok(acquired.lease.id)
+    }
+
+    async fn release_request_work(&self, lease_id: String) {
+        let response = self
+            .http
+            .post(format!("{}/v1/internal/work/release", self.cp()))
+            .bearer_auth(&self.cfg.auth_token)
+            .json(&ReleaseWorkRequest { lease_id })
+            .send()
+            .await;
+        if let Err(error) = response {
+            tracing::warn!(%error, "failed to release gateway work lease; TTL will recover it");
+        }
+    }
+
     /// One proxy attempt through the owning node. Ok(None) = stale route.
     async fn try_proxy(
         &self,
@@ -192,31 +243,52 @@ impl Gateway {
             Err(resp) => return resp,
         };
 
+        if (resolved.observed_state != ObservedState::Running || resolved.state != "active")
+            && resolved.binding.wake_policy == WakePolicy::NoWake
+        {
+            return gw_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "endpoint does not wake on request".to_string(),
+            );
+        }
+
+        // Acquire before wake/proxy. The final release is the event that can
+        // immediately drive work_count 1 -> 0 -> Suspended.
+        let work_lease = match self.acquire_request_work(&resolved.binding.cat_id).await {
+            Ok(lease) => lease,
+            Err(response) => return response,
+        };
+
+        let response = self.handle_with_work(&hostname, &path, &mut resolved).await;
+        self.release_request_work(work_lease).await;
+        response
+    }
+
+    async fn handle_with_work(
+        &self,
+        hostname: &str,
+        path: &str,
+        resolved: &mut ResolveResponse,
+    ) -> Response {
         // Wake if the cat is not running (policy permitting).
         if resolved.observed_state != ObservedState::Running || resolved.state != "active" {
-            if resolved.binding.wake_policy == WakePolicy::NoWake {
-                return gw_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "endpoint does not wake on request".to_string(),
-                );
-            }
-            if let Err(resp) = self.wake(&hostname).await {
+            if let Err(resp) = self.wake(hostname).await {
                 return resp;
             }
-            self.invalidate(&hostname);
-            resolved = match self.resolve(&hostname, false).await {
+            self.invalidate(hostname);
+            *resolved = match self.resolve(hostname, false).await {
                 Ok(r) => r,
                 Err(resp) => return resp,
             };
         }
 
         // Proxy; on a stale route re-resolve once and retry.
-        match self.try_proxy(&resolved, &path).await {
+        match self.try_proxy(resolved, path).await {
             Ok(Some(resp)) => resp,
             Err(resp) => resp,
             Ok(None) => {
-                self.invalidate(&hostname);
-                let fresh = match self.resolve(&hostname, false).await {
+                self.invalidate(hostname);
+                let fresh = match self.resolve(hostname, false).await {
                     Ok(r) => r,
                     Err(resp) => return resp,
                 };
@@ -224,15 +296,15 @@ impl Gateway {
                     if fresh.binding.wake_policy == WakePolicy::NoWake {
                         return gw_error(StatusCode::SERVICE_UNAVAILABLE, "endpoint asleep".into());
                     }
-                    if let Err(resp) = self.wake(&hostname).await {
+                    if let Err(resp) = self.wake(hostname).await {
                         return resp;
                     }
                 }
-                let retry = match self.resolve(&hostname, false).await {
+                let retry = match self.resolve(hostname, false).await {
                     Ok(r) => r,
                     Err(resp) => return resp,
                 };
-                match self.try_proxy(&retry, &path).await {
+                match self.try_proxy(&retry, path).await {
                     Ok(Some(resp)) => resp,
                     Ok(None) => gw_error(
                         StatusCode::CONFLICT,
