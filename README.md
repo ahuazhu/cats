@@ -129,8 +129,9 @@ cargo run -p cats-control-plane-daemon --bin cats-controld
 
 配置 WorkOS 后，两个 Web 站点改用独立的加密 HttpOnly session cookie；静态 token
 表单默认隐藏，CLI Bearer Token 不受影响。一个 WorkOS Organization 必须显式映射到
-一个 Cats Project，管理员还必须在管理员 Organization 中拥有
-`cats:fleet:admin` permission：
+一个 Cats Project；没有 Organization membership 的新用户会获得基于 WorkOS
+`user_id` 的独立个人 Project，不会进入共享的 `default` Project。管理员还必须在
+管理员 Organization 中拥有 `cats:fleet:admin` permission：
 
 ```bash
 export WORKOS_CLIENT_ID='client_...'

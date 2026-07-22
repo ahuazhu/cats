@@ -45,13 +45,18 @@ async fn authenticate(State(stub): State<WorkOsStub>, Json(body): Json<Value>) -
     };
     let (organization_id, permissions, email) = match code {
         "user-code" => (
-            "org_project",
+            Some("org_project"),
             vec!["cats:project:write"],
             "user@example.com",
         ),
-        "admin-code" => ("org_admin", vec!["cats:fleet:admin"], "admin@example.com"),
+        "new-user-code" => (None, vec![], "new-user@example.com"),
+        "admin-code" => (
+            Some("org_admin"),
+            vec!["cats:fleet:admin"],
+            "admin@example.com",
+        ),
         "refreshed" => (
-            "org_project",
+            Some("org_project"),
             vec!["cats:project:write"],
             "user@example.com",
         ),
@@ -59,7 +64,7 @@ async fn authenticate(State(stub): State<WorkOsStub>, Json(body): Json<Value>) -
     };
     let claims = json!({
         "sid": format!("session_{code}"),
-        "org_id": organization_id,
+        "org_id": organization_id.unwrap_or_default(),
         "role": if code == "admin-code" { "admin" } else { "member" },
         "permissions": permissions,
         "exp": cats_control_plane::store::now_unix() + 3600,
@@ -328,6 +333,42 @@ async fn workos_callback_rejects_tampered_state_before_code_exchange() {
         .unwrap();
     assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(ctx.exchanges.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn organizationless_workos_user_receives_an_isolated_personal_project() {
+    let ctx = Ctx::new().await;
+    let user_cookie = ctx.login("user", "new-user-code").await;
+
+    let session: Value = ctx
+        .http
+        .get(ctx.url("/auth/session?site=user"))
+        .header("Cookie", &user_cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(session["authenticated"], true);
+    assert_eq!(session["project"], "personal-user_new-user-code");
+
+    let own_project = ctx
+        .http
+        .get(ctx.url("/v1/projects/personal-user_new-user-code/cats"))
+        .header("Cookie", &user_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(own_project.status(), StatusCode::OK);
+    let shared_project = ctx
+        .http
+        .get(ctx.url("/v1/projects/default/cats"))
+        .header("Cookie", &user_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(shared_project.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

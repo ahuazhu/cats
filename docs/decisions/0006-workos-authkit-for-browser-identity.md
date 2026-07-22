@@ -19,7 +19,10 @@ CLI 调用契约。
    必须使用 PKCE 和随机 `state`；回调在服务端交换 code，WorkOS API Key 不进入
    浏览器。
 2. WorkOS Organization 与 Cats Project 通过显式配置一一映射。用户 session 的
-   `org_id` 只允许访问对应 project；未映射 organization fail closed。
+   `org_id` 只允许访问对应 project；未映射 organization fail closed。没有
+   Organization membership 的 AuthKit 用户只在 user 站获得由 WorkOS `user_id`
+   确定的独立个人 Project（`personal-<user_id>`），不得回落到共享 Project。该例外
+   不适用于 admin 站。
 3. Fleet 管理员使用独立 admin session cookie，并且必须同时满足：
    - session 属于配置的管理员 Organization；
    - session permissions 包含 `cats:fleet:admin`（名称可配置）。
@@ -41,8 +44,9 @@ CLI 调用契约。
 
 - `WORKOS_API_KEY`、Cookie password、refresh/access token 不写数据库日志、不返回
   `/auth/config`、不进入前端 JavaScript 或 Guest。
-- 登录 flow cookie 最长 10 分钟；回调必须同时匹配 sealed flow、site、state、
-  organization 和 return path。
+- 登录 flow cookie 最长 10 分钟；回调必须同时匹配 sealed flow、site、state 和
+  return path。组织 session 必须匹配请求的 organization；仅 user 站允许无组织
+  session 进入其确定性的个人 Project。
 - user/admin session 相互独立；admin session 可以管理所有 Cats projects，但不能
   调用 service-only node/gateway API。
 - Project 名称不通过公开认证配置接口枚举；用户从受控入口或邀请链接获得项目名。
@@ -51,7 +55,8 @@ CLI 调用契约。
 
 - WorkOS 不可用时，未过期且已 sealed 的 access token 仍可完成本地校验；新登录和
   到期 refresh 会失败。CLI/service 路径不依赖 WorkOS。
-- 每个生产环境需要配置 WorkOS redirect URI、Project/Organization 映射、管理员
-  Organization 和权限；生产 Web 必须使用 HTTPS。
+- 每个生产环境需要配置 WorkOS redirect URI、团队 Project/Organization 映射、
+  管理员 Organization 和权限；无组织用户的个人 Project 无需预配置。生产 Web
+  必须使用 HTTPS。
 - AuthKit 基础登录与企业 SSO/Directory Sync 的商业计费独立，启用企业连接前需要
   将连接成本计入产品套餐。

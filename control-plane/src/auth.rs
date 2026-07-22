@@ -3,7 +3,8 @@
 //! CLI and service callers continue to use bearer tokens. Browser sessions
 //! use separate encrypted, HttpOnly cookies for the user and administrator
 //! sites. A WorkOS Organization is mapped explicitly to one Cats project;
-//! fleet access additionally requires a configured WorkOS permission.
+//! an organization-less AuthKit user receives an isolated personal project.
+//! Fleet access additionally requires a configured WorkOS permission.
 
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, HeaderValue};
@@ -419,7 +420,12 @@ pub async fn callback(
                 "WorkOS authentication failed",
             )
         })?;
-    if auth.organization_id.as_deref() != Some(flow.organization_id.as_str()) {
+    let personal_user = flow.site == Site::User
+        && auth
+            .organization_id
+            .as_deref()
+            .is_none_or(|organization_id| organization_id.is_empty());
+    if !personal_user && auth.organization_id.as_deref() != Some(flow.organization_id.as_str()) {
         return Err(ApiError::new(
             cats_api::error::ErrorCode::PermissionDenied,
             "WorkOS session organization does not match the requested workspace",
@@ -570,6 +576,9 @@ fn validate_flow_identity(
     session: &SessionState,
 ) -> Result<WebIdentity, Failure> {
     let identity = validate_session_identity(config, flow.site, session)?;
+    if flow.site == Site::User && session.organization_id.is_empty() {
+        return Ok(identity);
+    }
     if session.organization_id != flow.organization_id || identity.project != flow.project {
         return Err(ApiError::new(
             cats_api::error::ErrorCode::PermissionDenied,
@@ -594,6 +603,23 @@ fn validate_session_identity(
     }
     match site {
         Site::User => {
+            if session.organization_id.is_empty() {
+                let user_id = session
+                    .user
+                    .as_ref()
+                    .map(|user| user.id.as_str())
+                    .filter(|user_id| !user_id.is_empty())
+                    .ok_or_else(|| {
+                        ApiError::new(
+                            cats_api::error::ErrorCode::Unauthenticated,
+                            "WorkOS personal session has no user identity",
+                        )
+                    })?;
+                return Ok(WebIdentity {
+                    project: Some(format!("personal-{user_id}")),
+                    administrator: false,
+                });
+            }
             let project = config
                 .project_for_organization(&session.organization_id)
                 .ok_or_else(|| {

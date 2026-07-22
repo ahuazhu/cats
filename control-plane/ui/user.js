@@ -45,6 +45,10 @@ function projectPath(path) {
   return `/v1/projects/${encodeURIComponent(state.project)}${path}`;
 }
 
+function workspaceLabel(project) {
+  return project.startsWith("personal-user_") ? "个人工作区" : project;
+}
+
 async function authenticatedRequest(path, options) {
   try {
     return await request(path, state.token, options);
@@ -62,8 +66,9 @@ function idempotencyHeaders() {
 function showApp() {
   loginScreen.classList.add("is-hidden");
   appShell.classList.remove("is-hidden");
-  document.querySelector("#sidebar-project").textContent = state.project;
-  document.querySelector("#header-project").textContent = state.project;
+  const label = workspaceLabel(state.project);
+  document.querySelector("#sidebar-project").textContent = label;
+  document.querySelector("#header-project").textContent = label;
 }
 
 function showLogin(message = "") {
@@ -466,6 +471,7 @@ async function initializeAuth() {
     state.authConfig = await request("/auth/config", "");
     document.querySelector("#workos-login-button").classList.toggle("is-hidden", !state.authConfig.workos_enabled);
     document.querySelector("#token-login-section").classList.toggle("is-hidden", !state.authConfig.token_login_enabled);
+    document.querySelector("#login-project-field").classList.toggle("is-hidden", !state.authConfig.token_login_enabled);
     document.querySelector("#login-description").textContent = state.authConfig.workos_enabled
       ? "登录后即可创建、启动和管理你的 Cats。"
       : "使用工作区 Token 登录。凭证仅保存在当前浏览器标签页中。";
