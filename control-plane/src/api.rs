@@ -140,6 +140,15 @@ fn if_match(headers: &HeaderMap) -> Option<i64> {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/", get(crate::ui::portal))
+        .route("/user", get(crate::ui::user_console))
+        .route("/user/", get(crate::ui::user_console))
+        .route("/admin", get(crate::ui::admin_console))
+        .route("/admin/", get(crate::ui::admin_console))
+        .route("/ui/styles.css", get(crate::ui::styles))
+        .route("/ui/common.js", get(crate::ui::common_script))
+        .route("/ui/user.js", get(crate::ui::user_script))
+        .route("/ui/admin.js", get(crate::ui::admin_script))
         .route("/healthz", get(|| async { "ok" }))
         .route(
             "/v1/projects/{project}/cats",

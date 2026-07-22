@@ -4,3 +4,4 @@ pub mod api;
 pub mod controller;
 pub mod server;
 pub mod store;
+pub mod ui;

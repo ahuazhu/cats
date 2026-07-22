@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Cats · 用户控制台</title>
+  <link rel="stylesheet" href="/ui/styles.css">
+</head>
+<body class="console-page" data-site="user">
+  <section class="login-screen" id="login-screen">
+    <div class="login-panel">
+      <a class="brand brand-large" href="/">
+        <span class="brand-mark" aria-hidden="true">C</span>
+        <span><strong>Cats</strong><small>Project Console</small></span>
+      </a>
+      <div class="login-copy">
+        <div class="eyebrow">USER SITE</div>
+        <h1>回到你的 Cat 工作空间</h1>
+        <p>使用 Project Token 登录。凭证仅保存在当前浏览器标签页中。</p>
+      </div>
+      <form class="login-form" id="login-form">
+        <label>
+          <span>Project</span>
+          <input id="login-project" name="project" value="default" autocomplete="organization" required>
+        </label>
+        <label>
+          <span>Project Token</span>
+          <span class="password-field">
+            <input id="login-token" name="token" type="password" autocomplete="current-password" required>
+            <button class="token-toggle" type="button" aria-label="显示或隐藏 token">显示</button>
+          </span>
+        </label>
+        <p class="form-error" id="login-error" role="alert"></p>
+        <button class="button button-primary button-wide" type="submit">
+          <span>进入用户控制台</span><span aria-hidden="true">→</span>
+        </button>
+      </form>
+      <a class="back-link" href="/">← 返回站点选择</a>
+    </div>
+    <aside class="login-art user-art" aria-hidden="true">
+      <div class="orbit orbit-one"></div><div class="orbit orbit-two"></div>
+      <div class="art-card"><small>CAT STATUS</small><strong>Running</strong><span>dev · 2 CPU · 2 GiB</span></div>
+    </aside>
+  </section>
+
+  <div class="app-shell is-hidden" id="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="/">
+        <span class="brand-mark" aria-hidden="true">C</span>
+        <span><strong>Cats</strong><small>User Console</small></span>
+      </a>
+      <div class="context-card"><small>PROJECT</small><strong id="sidebar-project">default</strong><span>项目资源边界</span></div>
+      <nav class="nav-list" aria-label="用户控制台导航">
+        <button class="nav-item is-active" data-view="overview"><span>⌂</span>概览</button>
+        <button class="nav-item" data-view="cats"><span>◇</span>Cats</button>
+        <button class="nav-item" data-view="disks"><span>▱</span>磁盘</button>
+        <button class="nav-item" data-view="operations"><span>↻</span>Operations</button>
+      </nav>
+      <div class="sidebar-footer">
+        <a href="/admin/">切换到管理员站</a>
+        <button id="logout-button">退出登录</button>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <button class="mobile-menu" id="mobile-menu" aria-label="打开导航">☰</button>
+        <div><span class="breadcrumb">Project / <b id="header-project">default</b></span><h1 id="view-title">项目概览</h1></div>
+        <div class="topbar-actions"><span class="live-indicator"><i></i>Connected</span><button class="button button-quiet" id="refresh-button">刷新</button><button class="button button-primary" id="create-cat-button">＋ 创建 Cat</button></div>
+      </header>
+
+      <div class="content">
+        <section class="view is-active" id="view-overview">
+          <div class="metric-grid" id="user-metrics"></div>
+          <div class="dashboard-grid">
+            <section class="panel panel-span-2"><header class="panel-header"><div><small>COMPUTE</small><h2>最近的 Cats</h2></div><button class="text-button" data-go="cats">查看全部 →</button></header><div id="recent-cats"></div></section>
+            <section class="panel"><header class="panel-header"><div><small>ACTIVITY</small><h2>最近操作</h2></div></header><div id="recent-operations"></div></section>
+          </div>
+        </section>
+
+        <section class="view" id="view-cats">
+          <section class="panel"><header class="panel-header"><div><small>COMPUTE</small><h2>我的 Cats</h2><p>管理生命周期、执行命令或销毁计算实例。</p></div><button class="button button-primary" data-create-cat>＋ 创建 Cat</button></header><div class="table-wrap"><table><thead><tr><th>名称</th><th>状态</th><th>规格</th><th>节点</th><th>创建时间</th><th class="align-right">操作</th></tr></thead><tbody id="cats-table"></tbody></table></div><div class="empty-state is-hidden" id="cats-empty"><span>◇</span><h3>还没有 Cat</h3><p>创建第一个可休眠、带持久 RootDisk 的工作空间。</p><button class="button button-primary" data-create-cat>创建 Cat</button></div></section>
+        </section>
+
+        <section class="view" id="view-disks">
+          <section class="panel"><header class="panel-header"><div><small>STORAGE</small><h2>Persistent Disks</h2><p>独立于 Cat 生命周期的 RWO 持久磁盘。</p></div><button class="button button-primary" id="create-disk-button">＋ 创建磁盘</button></header><div class="table-wrap"><table><thead><tr><th>名称</th><th>类型</th><th>容量</th><th>状态</th><th>绑定 Cat</th><th class="align-right">操作</th></tr></thead><tbody id="disks-table"></tbody></table></div><div class="empty-state is-hidden" id="disks-empty"><span>▱</span><h3>没有独立磁盘</h3><p>RootDisk 会随 Cat 自动创建；这里展示额外 PersistentDisk。</p></div></section>
+        </section>
+
+        <section class="view" id="view-operations">
+          <section class="panel"><header class="panel-header"><div><small>CONTROL PLANE</small><h2>Operations</h2><p>所有异步变更的状态、目标资源和最终结果。</p></div></header><div class="table-wrap"><table><thead><tr><th>Operation</th><th>类型</th><th>资源</th><th>阶段</th><th>更新时间</th><th>错误</th></tr></thead><tbody id="operations-table"></tbody></table></div><div class="empty-state is-hidden" id="operations-empty"><span>↻</span><h3>暂无操作记录</h3></div></section>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <dialog id="create-cat-dialog" class="modal">
+    <form method="dialog" id="create-cat-form"><header><div><small>NEW COMPUTE</small><h2>创建 Cat</h2></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></header><div class="form-grid"><label class="span-2"><span>名称</span><input name="name" placeholder="dev" pattern="[A-Za-z0-9-]+" required><small>字母、数字和连字符</small></label><label class="span-2"><span>镜像</span><input name="image" value="ubuntu-24.04" required></label><label><span>CPU</span><input name="cpus" type="number" min="1" max="64" value="2" required></label><label><span>内存 (MiB)</span><input name="memory_mib" type="number" min="128" value="2048" required></label><label class="span-2"><span>RootDisk (GiB)</span><input name="root_gib" type="number" min="0.0625" step="0.0625" value="1" required></label></div><p class="form-error" data-form-error></p><footer><button class="button button-quiet" value="cancel">取消</button><button class="button button-primary" value="default">创建并启动</button></footer></form>
+  </dialog>
+
+  <dialog id="create-disk-dialog" class="modal">
+    <form method="dialog" id="create-disk-form"><header><div><small>NEW STORAGE</small><h2>创建 PersistentDisk</h2></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></header><div class="form-grid"><label class="span-2"><span>名称</span><input name="name" placeholder="workspace-data" required></label><label class="span-2"><span>容量 (GiB)</span><input name="size_gib" type="number" min="0.0625" step="0.0625" value="1" required></label></div><p class="form-error" data-form-error></p><footer><button class="button button-quiet" value="cancel">取消</button><button class="button button-primary" value="default">创建磁盘</button></footer></form>
+  </dialog>
+
+  <dialog id="exec-dialog" class="modal modal-wide">
+    <form method="dialog" id="exec-form"><header><div><small>GUEST EXEC</small><h2>在 <span id="exec-cat-name"></span> 中执行</h2></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></header><label><span>命令</span><input name="command" value="uname -a" required><small>按空格拆分为 argv；当前开发控制台不执行 shell 展开。</small></label><pre class="terminal-output" id="exec-output">等待执行…</pre><p class="form-error" data-form-error></p><footer><button class="button button-quiet" value="cancel">关闭</button><button class="button button-primary" value="default">执行</button></footer></form>
+  </dialog>
+
+  <div class="toast-region" id="toast-region" aria-live="polite"></div>
+  <script type="module" src="/ui/user.js"></script>
+</body>
+</html>

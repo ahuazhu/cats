@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Cats · 管理员控制台</title>
+  <link rel="stylesheet" href="/ui/styles.css">
+</head>
+<body class="console-page" data-site="admin">
+  <section class="login-screen" id="login-screen">
+    <div class="login-panel">
+      <a class="brand brand-large" href="/"><span class="brand-mark admin-mark" aria-hidden="true">C</span><span><strong>Cats</strong><small>Fleet Console</small></span></a>
+      <div class="login-copy"><div class="eyebrow">ADMIN SITE</div><h1>管理计算 Fleet</h1><p>使用 Administrator Token 登录。该站点可排空和删除工作节点。</p></div>
+      <form class="login-form" id="login-form"><label><span>Administrator Token</span><span class="password-field"><input id="login-token" name="token" type="password" autocomplete="current-password" required><button class="token-toggle" type="button">显示</button></span></label><p class="form-error" id="login-error" role="alert"></p><button class="button button-admin button-wide" type="submit"><span>进入管理员控制台</span><span>→</span></button></form>
+      <a class="back-link" href="/">← 返回站点选择</a>
+    </div>
+    <aside class="login-art admin-art" aria-hidden="true"><div class="grid-lines"></div><div class="art-card admin-card"><small>FLEET HEALTH</small><strong>Healthy</strong><span>All systems operational</span></div></aside>
+  </section>
+
+  <div class="app-shell is-hidden" id="app-shell">
+    <aside class="sidebar admin-sidebar">
+      <a class="brand" href="/"><span class="brand-mark admin-mark">C</span><span><strong>Cats</strong><small>Admin Console</small></span></a>
+      <div class="context-card admin-context"><small>PLATFORM</small><strong>Fleet</strong><span>全局管理边界</span></div>
+      <nav class="nav-list"><button class="nav-item is-active" data-view="overview"><span>⌁</span>Fleet 概览</button><button class="nav-item" data-view="nodes"><span>▦</span>工作节点</button><button class="nav-item" data-view="metrics"><span>⌇</span>Metrics</button></nav>
+      <div class="sidebar-footer"><a href="/user/">切换到用户站</a><button id="logout-button">退出登录</button></div>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar"><button class="mobile-menu" id="mobile-menu">☰</button><div><span class="breadcrumb">Platform / <b>Fleet</b></span><h1 id="view-title">Fleet 概览</h1></div><div class="topbar-actions"><span class="live-indicator admin-live"><i></i>Auto refresh</span><button class="button button-quiet" id="refresh-button">刷新</button></div></header>
+      <div class="content">
+        <section class="view is-active" id="view-overview">
+          <div class="metric-grid" id="admin-metrics"></div>
+          <div class="dashboard-grid"><section class="panel panel-span-2"><header class="panel-header"><div><small>CAPACITY</small><h2>Fleet 资源分配</h2></div><span class="timestamp" id="generated-at"></span></header><div class="capacity-grid" id="capacity-grid"></div></section><section class="panel"><header class="panel-header"><div><small>LIFECYCLE</small><h2>Cat 状态</h2></div></header><div id="lifecycle-summary"></div></section><section class="panel panel-span-3"><header class="panel-header"><div><small>WORKERS</small><h2>节点健康</h2></div><button class="text-button" data-go="nodes">管理节点 →</button></header><div id="node-health-strip"></div></section></div>
+        </section>
+
+        <section class="view" id="view-nodes"><section class="panel"><header class="panel-header"><div><small>FLEET MANAGEMENT</small><h2>工作节点</h2><p>Cordon 停止新调度；Drain 安全停止、fence 并迁移现有 Cats。</p></div></header><div class="table-wrap"><table><thead><tr><th>节点</th><th>状态</th><th>分配</th><th>容量</th><th>心跳</th><th>Host telemetry</th><th class="align-right">操作</th></tr></thead><tbody id="nodes-table"></tbody></table></div><div class="empty-state is-hidden" id="nodes-empty"><span>▦</span><h3>没有已注册节点</h3><p>启动 cats-noded 后，节点会自动注册并心跳。</p></div></section></section>
+
+        <section class="view" id="view-metrics"><section class="panel"><header class="panel-header"><div><small>PROMETHEUS</small><h2>实时 Metrics</h2><p>使用管理员凭证从同一控制面读取。</p></div><button class="button button-quiet" id="copy-metrics">复制</button></header><pre class="metrics-output" id="metrics-output">正在加载…</pre></section></section>
+      </div>
+    </main>
+  </div>
+
+  <div class="toast-region" id="toast-region" aria-live="polite"></div>
+  <script type="module" src="/ui/admin.js"></script>
+</body>
+</html>

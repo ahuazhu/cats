@@ -263,6 +263,58 @@ impl Ctx {
 }
 
 #[tokio::test]
+async fn embedded_user_and_admin_sites_are_served_without_credentials() {
+    let ctx = Ctx::new().await;
+    let assets = [
+        ("/", "text/html", "一套控制面，两个清晰入口"),
+        ("/user/", "text/html", "用户控制台"),
+        ("/admin/", "text/html", "管理员控制台"),
+        ("/ui/styles.css", "text/css", ".app-shell"),
+        (
+            "/ui/common.js",
+            "text/javascript",
+            "export async function request",
+        ),
+        ("/ui/user.js", "text/javascript", "cats.user.token"),
+        ("/ui/admin.js", "text/javascript", "cats.admin.token"),
+    ];
+
+    for (path, content_type, marker) in assets {
+        let response = ctx.http.get(ctx.url(path)).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "failed to serve {path}");
+        assert!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with(content_type)),
+            "wrong content type for {path}"
+        );
+        assert!(
+            response.headers().contains_key("content-security-policy"),
+            "missing CSP for {path}"
+        );
+        let body = response.text().await.unwrap();
+        assert!(body.contains(marker), "missing marker in {path}");
+        for secret in ["dev-token", "dev-admin-token", SERVICE_TOKEN] {
+            assert!(!body.contains(secret), "{path} embeds credential {secret}");
+        }
+    }
+
+    let portal = ctx
+        .http
+        .get(ctx.url("/"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(portal.contains("href=\"/user/\""));
+    assert!(portal.contains("href=\"/admin/\""));
+}
+
+#[tokio::test]
 async fn create_converges_and_idempotency_replays() {
     let ctx = Ctx::new().await;
     let _node = start_stub_node(&ctx.cp, "node_a").await;

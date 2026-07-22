@@ -1,6 +1,7 @@
-//! `cats` CLI: the only user-facing surface. Commands express intent against
-//! the versioned API; mutations return operations that the CLI waits on by
-//! default (`--no-wait` to skip). No storage/node internals ever appear here.
+//! `cats` CLI: the command-line user surface. Commands express intent against
+//! the same versioned API as the web consoles; mutations return operations
+//! that the CLI waits on by default (`--no-wait` to skip). No storage/node
+//! internals ever appear here.
 
 use std::time::{Duration, Instant};
 
