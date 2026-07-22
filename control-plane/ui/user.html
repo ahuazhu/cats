@@ -17,24 +17,30 @@
       <div class="login-copy">
         <div class="eyebrow">USER SITE</div>
         <h1>回到你的 Cat 工作空间</h1>
-        <p>使用 Project Token 登录。凭证仅保存在当前浏览器标签页中。</p>
+        <p id="login-description">通过 WorkOS 安全登录并进入所属 Project。</p>
       </div>
       <form class="login-form" id="login-form">
         <label>
           <span>Project</span>
           <input id="login-project" name="project" value="default" autocomplete="organization" required>
         </label>
-        <label>
-          <span>Project Token</span>
-          <span class="password-field">
-            <input id="login-token" name="token" type="password" autocomplete="current-password" required>
-            <button class="token-toggle" type="button" aria-label="显示或隐藏 token">显示</button>
-          </span>
-        </label>
-        <p class="form-error" id="login-error" role="alert"></p>
-        <button class="button button-primary button-wide" type="submit">
-          <span>进入用户控制台</span><span aria-hidden="true">→</span>
+        <button class="button button-primary button-wide is-hidden" id="workos-login-button" type="button">
+          <span>使用 WorkOS 登录</span><span aria-hidden="true">→</span>
         </button>
+        <div class="token-login-section" id="token-login-section">
+          <div class="auth-divider"><span>开发环境 Token</span></div>
+          <label>
+            <span>Project Token</span>
+            <span class="password-field">
+              <input id="login-token" name="token" type="password" autocomplete="current-password">
+              <button class="token-toggle" type="button" aria-label="显示或隐藏 token">显示</button>
+            </span>
+          </label>
+          <p class="form-error" id="login-error" role="alert"></p>
+          <button class="button button-quiet button-wide" id="token-login-button" type="submit">
+            <span>使用 Token 登录</span><span aria-hidden="true">→</span>
+          </button>
+        </div>
       </form>
       <a class="back-link" href="/">← 返回站点选择</a>
     </div>

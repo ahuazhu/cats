@@ -11,8 +11,16 @@
   <section class="login-screen" id="login-screen">
     <div class="login-panel">
       <a class="brand brand-large" href="/"><span class="brand-mark admin-mark" aria-hidden="true">C</span><span><strong>Cats</strong><small>Fleet Console</small></span></a>
-      <div class="login-copy"><div class="eyebrow">ADMIN SITE</div><h1>管理计算 Fleet</h1><p>使用 Administrator Token 登录。该站点可排空和删除工作节点。</p></div>
-      <form class="login-form" id="login-form"><label><span>Administrator Token</span><span class="password-field"><input id="login-token" name="token" type="password" autocomplete="current-password" required><button class="token-toggle" type="button">显示</button></span></label><p class="form-error" id="login-error" role="alert"></p><button class="button button-admin button-wide" type="submit"><span>进入管理员控制台</span><span>→</span></button></form>
+      <div class="login-copy"><div class="eyebrow">ADMIN SITE</div><h1>管理计算 Fleet</h1><p id="login-description">通过 WorkOS 登录，并验证 Fleet 管理员权限。</p></div>
+      <form class="login-form" id="login-form">
+        <button class="button button-admin button-wide is-hidden" id="workos-login-button" type="button"><span>使用 WorkOS 登录</span><span>→</span></button>
+        <div class="token-login-section" id="token-login-section">
+          <div class="auth-divider"><span>开发环境 Token</span></div>
+          <label><span>Administrator Token</span><span class="password-field"><input id="login-token" name="token" type="password" autocomplete="current-password"><button class="token-toggle" type="button">显示</button></span></label>
+          <p class="form-error" id="login-error" role="alert"></p>
+          <button class="button button-quiet button-wide" id="token-login-button" type="submit"><span>使用 Token 登录</span><span>→</span></button>
+        </div>
+      </form>
       <a class="back-link" href="/">← 返回站点选择</a>
     </div>
     <aside class="login-art admin-art" aria-hidden="true"><div class="grid-lines"></div><div class="art-card admin-card"><small>FLEET HEALTH</small><strong>Healthy</strong><span>All systems operational</span></div></aside>

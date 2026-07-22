@@ -15,7 +15,7 @@
 | 领域 | 改进 |
 |---|---|
 | 依赖方向 | 新增 `cats-storage` ports、独立 `adapters/` 和 `cmd/*` composition roots；核心 package 的 normal Cargo 依赖图不再包含具体 adapter 或云厂商参数 |
-| crate 元数据 | 所有 workspace package 继承 `rust-version = 1.85`，标记 `publish = false`，统一 workspace lints |
+| crate 元数据 | 所有 workspace package 继承 `rust-version = 1.88`，标记 `publish = false`，统一 workspace lints |
 | 静态检查 | 禁止 `dbg!`、`todo!` 和无安全说明的 unsafe block；质量门禁继续要求全 workspace test 与 all-targets Clippy 零警告 |
 | 错误处理 | adapter 配置使用结构化错误；SQLite 锁中毒、hash/整数转换和 TTL 溢出不再静默 wrap 或直接 panic |
 | 数据契约 | immutable key 使用统一可移植校验；File adapter 用临时文件、`sync_data`、hard-link no-replace 与目录 fsync 保证并发写不覆盖 |
@@ -51,7 +51,7 @@
    领域错误。现在两种策略并存。
 2. 在 CI 强制 `cargo fmt --all -- --check`、`cargo test --workspace`、
    `cargo clippy --workspace --all-targets -- -D warnings`，并增加依赖漏洞/许可证检查。
-3. 用 Rust 1.85 单独跑 MSRV job。声明 `rust-version` 只限制依赖解析/编译诊断，不能
+3. 用 Rust 1.88 单独跑 MSRV job。声明 `rust-version` 只限制依赖解析/编译诊断，不能
    代替实际构建验证。
 4. 随 I/O 并发需求评估同步 `BlobStore` port：V1 的 blocking 路径简单且可测试，
    但生产多队列需要有界并发、背压、取消和超时预算，不能靠无限制线程扩张。

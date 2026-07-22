@@ -17,10 +17,12 @@ reqwest = { workspace = true }
 rusqlite = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
+workos = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 cats-metadata-store-sqlite = { workspace = true }
+base64 = { workspace = true }
 
 [lints]
 workspace = true

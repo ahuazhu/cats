@@ -15,7 +15,17 @@ import {
 
 const TOKEN_KEY = "cats.user.token";
 const PROJECT_KEY = "cats.user.project";
-const state = { token: "", project: "", cats: [], disks: [], operations: [], activeView: "overview", execCat: "" };
+const state = {
+  token: "",
+  project: "",
+  authMode: "token",
+  authConfig: null,
+  cats: [],
+  disks: [],
+  operations: [],
+  activeView: "overview",
+  execCat: "",
+};
 
 const loginScreen = document.querySelector("#login-screen");
 const appShell = document.querySelector("#app-shell");
@@ -35,8 +45,14 @@ function projectPath(path) {
   return `/v1/projects/${encodeURIComponent(state.project)}${path}`;
 }
 
-function authenticatedRequest(path, options) {
-  return request(path, state.token, options);
+async function authenticatedRequest(path, options) {
+  try {
+    return await request(path, state.token, options);
+  } catch (error) {
+    if (state.authMode !== "workos" || error.status !== 401) throw error;
+    await request("/auth/session?site=user", "");
+    return request(path, "", options);
+  }
 }
 
 function idempotencyHeaders() {
@@ -288,6 +304,10 @@ async function mutateDisk(name, action, button) {
 
 loginForm.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (state.authConfig?.workos_enabled && !state.authConfig.token_login_enabled) {
+    startWorkOsLogin();
+    return;
+  }
   const button = loginForm.querySelector('button[type="submit"]');
   const form = new FormData(loginForm);
   const project = String(form.get("project") || "").trim();
@@ -298,6 +318,7 @@ loginForm.addEventListener("submit", async (event) => {
     await request(`/v1/projects/${encodeURIComponent(project)}/cats`, token);
     state.project = project;
     state.token = token;
+    state.authMode = "token";
     sessionStorage.setItem(PROJECT_KEY, project);
     sessionStorage.setItem(TOKEN_KEY, token);
     showApp();
@@ -309,7 +330,23 @@ loginForm.addEventListener("submit", async (event) => {
   }
 });
 
+function startWorkOsLogin() {
+  const project = document.querySelector("#login-project").value.trim();
+  if (!project) {
+    loginError.textContent = "Project 不能为空";
+    return;
+  }
+  const query = new URLSearchParams({ site: "user", project, return_to: "/user/" });
+  window.location.assign(`/auth/login?${query}`);
+}
+
+document.querySelector("#workos-login-button").addEventListener("click", startWorkOsLogin);
+
 document.querySelector("#logout-button").addEventListener("click", () => {
+  if (state.authMode === "workos") {
+    window.location.assign("/auth/logout?site=user");
+    return;
+  }
   sessionStorage.removeItem(TOKEN_KEY);
   state.token = "";
   showLogin();
@@ -421,12 +458,42 @@ document.querySelector("#disks-table").addEventListener("click", (event) => {
   mutateDisk(button.dataset.disk, button.dataset.diskAction, button).catch((error) => toast("磁盘操作失败", error.message, "error"));
 });
 
-state.project = sessionStorage.getItem(PROJECT_KEY) || "default";
-state.token = sessionStorage.getItem(TOKEN_KEY) || "";
-document.querySelector("#login-project").value = state.project;
-if (state.token) {
-  showApp();
-  loadAll({ quiet: true }).catch(() => {});
-} else {
-  showLogin();
+async function initializeAuth() {
+  state.project = sessionStorage.getItem(PROJECT_KEY) || "default";
+  state.token = sessionStorage.getItem(TOKEN_KEY) || "";
+  document.querySelector("#login-project").value = state.project;
+  try {
+    state.authConfig = await request("/auth/config", "");
+    document.querySelector("#workos-login-button").classList.toggle("is-hidden", !state.authConfig.workos_enabled);
+    document.querySelector("#token-login-section").classList.toggle("is-hidden", !state.authConfig.token_login_enabled);
+    document.querySelector("#login-description").textContent = state.authConfig.workos_enabled
+      ? "通过 WorkOS 安全登录并进入所属 Project。"
+      : "使用 Project Token 登录。凭证仅保存在当前浏览器标签页中。";
+    if (state.authConfig.workos_enabled) {
+      try {
+        const session = await request("/auth/session?site=user", "");
+        state.authMode = "workos";
+        state.token = "";
+        state.project = session.project;
+        sessionStorage.removeItem(TOKEN_KEY);
+        sessionStorage.setItem(PROJECT_KEY, state.project);
+        showApp();
+        await loadAll({ quiet: true });
+        return;
+      } catch (_) {
+        // No WorkOS session yet; remain on the sign-in screen.
+      }
+    }
+    if (state.token && state.authConfig.token_login_enabled) {
+      state.authMode = "token";
+      showApp();
+      await loadAll({ quiet: true });
+      return;
+    }
+  } catch (error) {
+    loginError.textContent = `读取登录配置失败：${error.message}`;
+  }
+  showLogin(loginError.textContent);
 }
+
+initializeAuth();

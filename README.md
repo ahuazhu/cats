@@ -13,6 +13,7 @@ Cats 是一个从零实现的独立项目：为用户提供可休眠、可迁移
 - 存储后端已选定为 Direct-OS ChunkStore（Direct-S3 实现，[ADR-0003](docs/decisions/0003-direct-s3-chunkstore-backend.md)）；JuiceFS 方案不再实现，仅作历史参考。
 - 存储依赖边界采用 Ports and Adapters（[ADR-0005](docs/decisions/0005-provider-neutral-storage-ports-and-adapters.md)）：核心只依赖云无关契约，AWS S3 是第一版 durable adapter。
 - 生命周期状态统一为 Running / Suspended / Warm / Cold（[ADR-0002](docs/decisions/0002-lifecycle-states-running-suspended-warm-cold.md)）。
+- 浏览器身份使用 WorkOS AuthKit，CLI 与内部服务继续使用 Bearer Token（[ADR-0006](docs/decisions/0006-workos-authkit-for-browser-identity.md)）。
 
 具体边界记录在 [`ADR-0001: Greenfield implementation baseline`](docs/decisions/0001-greenfield-implementation-baseline.md) 及后续 ADR。
 
@@ -104,9 +105,9 @@ cargo run -p cats-cli --bin cats -- create dev --root-size 64MiB && \
 
 ### 用户与管理员控制面
 
-控制面使用三类独立凭证：`CATS_AUTH_TOKEN` 仅供 node-agent/gateway 等内部服务；
-`CATS_PROJECT_TOKENS` 把用户 token 绑定到一个 project；`CATS_ADMIN_TOKEN` 用于节点
-管理和 fleet 监控。生产/共享环境必须显式设置三者，例如：
+控制面使用三类独立 Bearer 凭证：`CATS_AUTH_TOKEN` 仅供 node-agent/gateway 等内部
+服务；`CATS_PROJECT_TOKENS` 把 CLI token 绑定到一个 project；`CATS_ADMIN_TOKEN`
+用于 fleet CLI。生产/共享环境必须显式设置三者，例如：
 
 ```bash
 export CATS_AUTH_TOKEN='service-secret'
@@ -115,12 +116,35 @@ export CATS_ADMIN_TOKEN='admin-secret'
 cargo run -p cats-control-plane-daemon --bin cats-controld
 ```
 
-控制面进程同时提供两个独立的、无需前端构建步骤的管理站点。页面凭证只保存在
-当前浏览器标签页的 `sessionStorage` 中，浏览器和 `cats` CLI 调用同一套版本化 API：
+控制面进程同时提供两个独立的、无需前端构建步骤的管理站点。未配置 WorkOS 时，
+本地开发仍可使用当前标签页 `sessionStorage` 中的 token：
 
 - 用户站：<http://127.0.0.1:7300/user/>，使用 project 名和对应的 Project Token。
 - 管理员站：<http://127.0.0.1:7300/admin/>，使用 Administrator Token。
 - 站点入口：<http://127.0.0.1:7300/>。
+
+### WorkOS AuthKit 登录
+
+配置 WorkOS 后，两个 Web 站点改用独立的加密 HttpOnly session cookie；静态 token
+表单默认隐藏，CLI Bearer Token 不受影响。一个 WorkOS Organization 必须显式映射到
+一个 Cats Project，管理员还必须在管理员 Organization 中拥有
+`cats:fleet:admin` permission：
+
+```bash
+export WORKOS_CLIENT_ID='client_...'
+export WORKOS_API_KEY='sk_...'
+export WORKOS_COOKIE_PASSWORD="$(openssl rand -hex 32)"
+export WORKOS_REDIRECT_URI='http://127.0.0.1:7300/auth/callback'
+export CATS_WORKOS_PROJECT_ORGANIZATIONS='acme-dev=org_...'
+export CATS_WORKOS_ADMIN_ORGANIZATION_ID='org_admin_...'
+export CATS_WORKOS_ADMIN_PERMISSION='cats:fleet:admin'
+cargo run -p cats-control-plane-daemon --bin cats-controld
+```
+
+在 WorkOS Dashboard 的 Redirects 中登记同一个 callback URI，并给管理员角色添加
+`cats:fleet:admin` permission。生产 redirect URI 使用 HTTPS 后，控制面会默认给
+session cookie 添加 `Secure`。如需在已配置 WorkOS 的本地环境暂时显示 token 表单，
+显式设置 `CATS_WORKOS_ALLOW_TOKEN_LOGIN=true`。
 
 用户 token 只能查看和管理所属 project 的 Cat、Disk、Endpoint、Snapshot 和
 Operation；跨 project 请求返回 `403`：

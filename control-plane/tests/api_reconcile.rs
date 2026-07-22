@@ -164,6 +164,7 @@ impl Ctx {
             auth_token: SERVICE_TOKEN.into(),
             admin_token: "dev-admin-token".into(),
             project_tokens: BTreeMap::from([("*".into(), "dev-token".into())]),
+            workos: None,
             node_lease_timeout_ms: 3_000,
             reconcile_interval_ms: 200,
         })
@@ -312,6 +313,19 @@ async fn embedded_user_and_admin_sites_are_served_without_credentials() {
         .unwrap();
     assert!(portal.contains("href=\"/user/\""));
     assert!(portal.contains("href=\"/admin/\""));
+
+    let auth_config = ctx.http.get(ctx.url("/auth/config")).send().await.unwrap();
+    assert_eq!(auth_config.status(), StatusCode::OK);
+    assert_eq!(
+        auth_config
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    let auth_config: serde_json::Value = auth_config.json().await.unwrap();
+    assert_eq!(auth_config["workos_enabled"], false);
+    assert_eq!(auth_config["token_login_enabled"], true);
 }
 
 #[tokio::test]
@@ -600,6 +614,7 @@ async fn project_tokens_scope_user_resources_and_operations() {
             ("alpha".to_string(), "token-alpha".to_string()),
             ("beta".to_string(), "token-beta".to_string()),
         ]),
+        workos: None,
         node_lease_timeout_ms: 3_000,
         reconcile_interval_ms: 200,
     };

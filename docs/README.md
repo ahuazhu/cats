@@ -39,5 +39,6 @@ Rust 工程质量现状、已修问题和后续优先项见 [Rust 工程实践�
 - [ADR-0003：存储后端选定 Direct-OS ChunkStore（Direct-S3 实现）](decisions/0003-direct-s3-chunkstore-backend.md)
 - [ADR-0004：实现技术栈（全 Rust）与开发测试环境](decisions/0004-implementation-stack-and-dev-environment.md)
 - [ADR-0005：云无关存储边界采用 Ports and Adapters](decisions/0005-provider-neutral-storage-ports-and-adapters.md)
+- [ADR-0006：浏览器身份使用 WorkOS AuthKit](decisions/0006-workos-authkit-for-browser-identity.md)
 
 后续发生会改变数据格式、公开 API、故障语义或组件边界的决定时，应新增 ADR，而不是直接覆盖实验结论。

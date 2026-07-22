@@ -11,7 +11,16 @@ import {
 } from "/ui/common.js";
 
 const TOKEN_KEY = "cats.admin.token";
-const state = { token: "", overview: null, nodes: [], metrics: "", activeView: "overview", timer: null };
+const state = {
+  token: "",
+  authMode: "token",
+  authConfig: null,
+  overview: null,
+  nodes: [],
+  metrics: "",
+  activeView: "overview",
+  timer: null,
+};
 const loginScreen = document.querySelector("#login-screen");
 const appShell = document.querySelector("#app-shell");
 const loginForm = document.querySelector("#login-form");
@@ -23,8 +32,14 @@ initNavigation({ overview: "Fleet 概览", nodes: "工作节点", metrics: "Metr
   if (view === "metrics") loadMetrics().catch((error) => toast("Metrics 加载失败", error.message, "error"));
 });
 
-function authenticatedRequest(path, options) {
-  return request(path, state.token, options);
+async function authenticatedRequest(path, options) {
+  try {
+    return await request(path, state.token, options);
+  } catch (error) {
+    if (state.authMode !== "workos" || error.status !== 401) throw error;
+    await request("/auth/session?site=admin", "");
+    return request(path, "", options);
+  }
 }
 
 function showApp() {
@@ -180,6 +195,10 @@ async function mutateNode(id, action, button) {
 
 loginForm.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (state.authConfig?.workos_enabled && !state.authConfig.token_login_enabled) {
+    startWorkOsLogin();
+    return;
+  }
   const button = loginForm.querySelector('button[type="submit"]');
   const token = String(new FormData(loginForm).get("token") || "").trim();
   loginError.textContent = "";
@@ -187,6 +206,7 @@ loginForm.addEventListener("submit", async (event) => {
   try {
     await request("/v1/admin/monitoring", token);
     state.token = token;
+    state.authMode = "token";
     sessionStorage.setItem(TOKEN_KEY, token);
     showApp();
     await loadAll({ quiet: true });
@@ -197,7 +217,18 @@ loginForm.addEventListener("submit", async (event) => {
   }
 });
 
+function startWorkOsLogin() {
+  const query = new URLSearchParams({ site: "admin", return_to: "/admin/" });
+  window.location.assign(`/auth/login?${query}`);
+}
+
+document.querySelector("#workos-login-button").addEventListener("click", startWorkOsLogin);
+
 document.querySelector("#logout-button").addEventListener("click", () => {
+  if (state.authMode === "workos") {
+    window.location.assign("/auth/logout?site=admin");
+    return;
+  }
   sessionStorage.removeItem(TOKEN_KEY);
   state.token = "";
   showLogin();
@@ -217,10 +248,38 @@ document.querySelector("#copy-metrics").addEventListener("click", async () => {
   }
 });
 
-state.token = sessionStorage.getItem(TOKEN_KEY) || "";
-if (state.token) {
-  showApp();
-  loadAll({ quiet: true }).catch(() => {});
-} else {
-  showLogin();
+async function initializeAuth() {
+  state.token = sessionStorage.getItem(TOKEN_KEY) || "";
+  try {
+    state.authConfig = await request("/auth/config", "");
+    document.querySelector("#workos-login-button").classList.toggle("is-hidden", !state.authConfig.workos_enabled);
+    document.querySelector("#token-login-section").classList.toggle("is-hidden", !state.authConfig.token_login_enabled);
+    document.querySelector("#login-description").textContent = state.authConfig.workos_enabled
+      ? "通过 WorkOS 登录，并验证 Fleet 管理员权限。"
+      : "使用 Administrator Token 登录。该站点可排空和删除工作节点。";
+    if (state.authConfig.workos_enabled) {
+      try {
+        await request("/auth/session?site=admin", "");
+        state.authMode = "workos";
+        state.token = "";
+        sessionStorage.removeItem(TOKEN_KEY);
+        showApp();
+        await loadAll({ quiet: true });
+        return;
+      } catch (_) {
+        // No WorkOS administrator session yet.
+      }
+    }
+    if (state.token && state.authConfig.token_login_enabled) {
+      state.authMode = "token";
+      showApp();
+      await loadAll({ quiet: true });
+      return;
+    }
+  } catch (error) {
+    loginError.textContent = `读取登录配置失败：${error.message}`;
+  }
+  showLogin(loginError.textContent);
 }
+
+initializeAuth();

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use cats_metadata_store_sqlite::SqliteMetadataStoreFactory;
 use cats_storage::{open_metadata_store, AdapterConfig, MetadataStoreFactory};
@@ -31,6 +32,47 @@ struct Args {
         value_name = "PROJECT=TOKEN"
     )]
     project_tokens: Vec<String>,
+    /// WorkOS AuthKit application client ID. Setting any WorkOS option
+    /// enables AuthKit and requires the complete configuration.
+    #[arg(long, env = "WORKOS_CLIENT_ID")]
+    workos_client_id: Option<String>,
+    #[arg(long, env = "WORKOS_API_KEY")]
+    workos_api_key: Option<String>,
+    /// 64 hexadecimal characters (generate with `openssl rand -hex 32`).
+    #[arg(long, env = "WORKOS_COOKIE_PASSWORD")]
+    workos_cookie_password: Option<String>,
+    #[arg(long, env = "WORKOS_REDIRECT_URI")]
+    workos_redirect_uri: Option<String>,
+    /// Bind a Cats project to exactly one WorkOS Organization.
+    #[arg(
+        long = "workos-project-organization",
+        env = "CATS_WORKOS_PROJECT_ORGANIZATIONS",
+        value_delimiter = ',',
+        value_name = "PROJECT=ORG_ID"
+    )]
+    workos_project_organizations: Vec<String>,
+    #[arg(long, env = "CATS_WORKOS_ADMIN_ORGANIZATION_ID")]
+    workos_admin_organization_id: Option<String>,
+    #[arg(
+        long,
+        env = "CATS_WORKOS_ADMIN_PERMISSION",
+        default_value = "cats:fleet:admin"
+    )]
+    workos_admin_permission: String,
+    /// Show static-token forms in addition to WorkOS login.
+    #[arg(long, env = "CATS_WORKOS_ALLOW_TOKEN_LOGIN", default_value_t = false)]
+    workos_allow_token_login: bool,
+    /// Override Secure on AuthKit cookies. Defaults to true for HTTPS redirects.
+    #[arg(long, env = "CATS_WORKOS_COOKIE_SECURE")]
+    workos_cookie_secure: Option<bool>,
+    /// Override only for integration tests or an explicit WorkOS proxy.
+    #[arg(
+        long,
+        env = "WORKOS_API_BASE_URL",
+        default_value = "https://api.workos.com",
+        hide = true
+    )]
+    workos_api_base_url: String,
     #[arg(long, default_value_t = 10_000)]
     node_lease_timeout_ms: i64,
     #[arg(long, default_value_t = 500)]
@@ -76,6 +118,64 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
+    let any_workos_option = args.workos_client_id.is_some()
+        || args.workos_api_key.is_some()
+        || args.workos_cookie_password.is_some()
+        || args.workos_redirect_uri.is_some()
+        || !args.workos_project_organizations.is_empty()
+        || args.workos_admin_organization_id.is_some();
+    let workos = if any_workos_option {
+        let client_id = args
+            .workos_client_id
+            .ok_or_else(|| anyhow::anyhow!("WORKOS_CLIENT_ID is required"))?;
+        let api_key = args
+            .workos_api_key
+            .ok_or_else(|| anyhow::anyhow!("WORKOS_API_KEY is required"))?;
+        let cookie_password = args
+            .workos_cookie_password
+            .ok_or_else(|| anyhow::anyhow!("WORKOS_COOKIE_PASSWORD is required"))?;
+        let redirect_uri = args
+            .workos_redirect_uri
+            .ok_or_else(|| anyhow::anyhow!("WORKOS_REDIRECT_URI is required"))?;
+        let admin_organization_id = args
+            .workos_admin_organization_id
+            .ok_or_else(|| anyhow::anyhow!("CATS_WORKOS_ADMIN_ORGANIZATION_ID is required"))?;
+        let mut mappings = BTreeMap::new();
+        for value in &args.workos_project_organizations {
+            let (project, organization_id) = value.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("--workos-project-organization must be PROJECT=ORG_ID")
+            })?;
+            anyhow::ensure!(
+                !project.is_empty() && !organization_id.is_empty(),
+                "--workos-project-organization must be PROJECT=ORG_ID"
+            );
+            anyhow::ensure!(
+                mappings
+                    .insert(project.to_string(), organization_id.to_string())
+                    .is_none(),
+                "duplicate WorkOS mapping for project {project}"
+            );
+        }
+        let cookie_secure = args
+            .workos_cookie_secure
+            .unwrap_or_else(|| redirect_uri.starts_with("https://"));
+        Some(Arc::new(cats_control_plane::auth::WorkOsConfig::new(
+            cats_control_plane::auth::WorkOsConfigParams {
+                client_id,
+                api_key,
+                api_base_url: args.workos_api_base_url,
+                redirect_uri,
+                cookie_password,
+                project_organizations: mappings,
+                admin_organization_id,
+                admin_permission: args.workos_admin_permission,
+                cookie_secure,
+                allow_token_login: args.workos_allow_token_login,
+            },
+        )?))
+    } else {
+        None
+    };
     let handle = cats_control_plane::server::spawn(cats_control_plane::server::Config {
         listen: args.listen,
         db_path: args.db_path,
@@ -83,6 +183,7 @@ async fn main() -> anyhow::Result<()> {
         auth_token: args.auth_token,
         admin_token: args.admin_token,
         project_tokens,
+        workos,
         node_lease_timeout_ms: args.node_lease_timeout_ms,
         reconcile_interval_ms: args.reconcile_interval_ms,
     })

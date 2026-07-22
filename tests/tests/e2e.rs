@@ -44,6 +44,7 @@ impl Cluster {
             auth_token: SERVICE_TOKEN.into(),
             admin_token: ADMIN_TOKEN.into(),
             project_tokens,
+            workos: None,
             node_lease_timeout_ms: 3_000,
             reconcile_interval_ms: 150,
         })

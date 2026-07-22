@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -27,7 +27,11 @@ impl IntoResponse for Failure {
             message: self.0.message,
             request_id: None,
         };
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        response
     }
 }
 
@@ -56,17 +60,19 @@ fn token_is_known(state: &AppState, token: &str) -> bool {
             .any(|value| value == token)
 }
 
-fn auth_failure(state: &AppState, token: Option<&str>) -> Failure {
-    if token.is_some_and(|token| token_is_known(state, token)) {
+fn auth_failure(state: &AppState, headers: &HeaderMap, token: Option<&str>) -> Failure {
+    if token.is_some_and(|token| token_is_known(state, token))
+        || crate::auth::has_any_web_session(state, headers)
+    {
         ApiError::new(
             ErrorCode::PermissionDenied,
-            "token is not allowed for this resource",
+            "authentication credential is not allowed for this resource",
         )
         .into()
     } else {
         ApiError::new(
             ErrorCode::Unauthenticated,
-            "missing or invalid bearer token",
+            "missing or invalid authentication credential",
         )
         .into()
     }
@@ -74,10 +80,10 @@ fn auth_failure(state: &AppState, token: Option<&str>) -> Failure {
 
 fn check_authenticated(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
     let token = bearer_token(headers);
-    token
-        .is_some_and(|token| token_is_known(state, token))
-        .then_some(())
-        .ok_or_else(|| auth_failure(state, token))
+    (token.is_some_and(|token| token_is_known(state, token))
+        || crate::auth::has_any_web_session(state, headers))
+    .then_some(())
+    .ok_or_else(|| auth_failure(state, headers, token))
 }
 
 fn check_project_auth(state: &AppState, headers: &HeaderMap, project: &str) -> ApiResult<()> {
@@ -90,17 +96,18 @@ fn check_project_auth(state: &AppState, headers: &HeaderMap, project: &str) -> A
                 .get(project)
                 .or_else(|| state.cfg.project_tokens.get("*"))
                 .is_some_and(|expected| expected == token)
-    });
+    }) || crate::auth::web_session_allows_project(state, headers, project);
     allowed
         .then_some(())
-        .ok_or_else(|| auth_failure(state, token))
+        .ok_or_else(|| auth_failure(state, headers, token))
 }
 
 fn check_admin_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
     let token = bearer_token(headers);
-    (token == Some(state.cfg.admin_token.as_str()))
-        .then_some(())
-        .ok_or_else(|| auth_failure(state, token))
+    (token == Some(state.cfg.admin_token.as_str())
+        || crate::auth::web_session_is_admin(state, headers))
+    .then_some(())
+    .ok_or_else(|| auth_failure(state, headers, token))
 }
 
 fn check_service_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
@@ -108,7 +115,7 @@ fn check_service_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
     token
         .is_some_and(|token| token == state.cfg.auth_token || token == state.cfg.admin_token)
         .then_some(())
-        .ok_or_else(|| auth_failure(state, token))
+        .ok_or_else(|| auth_failure(state, headers, token))
 }
 
 fn cordon_registered_node(state: &AppState, id: &str) -> ApiResult<()> {
@@ -149,6 +156,11 @@ pub fn router(state: AppState) -> Router {
         .route("/ui/common.js", get(crate::ui::common_script))
         .route("/ui/user.js", get(crate::ui::user_script))
         .route("/ui/admin.js", get(crate::ui::admin_script))
+        .route("/auth/config", get(crate::auth::config))
+        .route("/auth/login", get(crate::auth::login))
+        .route("/auth/callback", get(crate::auth::callback))
+        .route("/auth/session", get(crate::auth::session))
+        .route("/auth/logout", get(crate::auth::logout))
         .route("/healthz", get(|| async { "ok" }))
         .route(
             "/v1/projects/{project}/cats",

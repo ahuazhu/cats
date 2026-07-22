@@ -27,6 +27,9 @@ pub struct Config {
     /// User credentials keyed by the one project each credential may access.
     /// A `*` entry is reserved for the in-process development/test config.
     pub project_tokens: BTreeMap<String, String>,
+    /// Optional AuthKit configuration for browser sessions. Bearer-token
+    /// authentication remains available for CLI and service callers.
+    pub workos: Option<Arc<crate::auth::WorkOsConfig>>,
     pub node_lease_timeout_ms: i64,
     pub reconcile_interval_ms: u64,
 }
