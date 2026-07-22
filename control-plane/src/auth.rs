@@ -15,6 +15,8 @@ use workos::helpers::{
     seal, seal_session, unseal, AuthKitAuthorizationUrlParams, AuthKitPkceCodeExchangeParams,
     SessionData, SessionManager, SessionRefreshOptions, SessionState,
 };
+use workos::models::RevokeSession;
+use workos::resources::user_management::RevokeSessionParams;
 
 use cats_api::error::ApiError;
 
@@ -33,7 +35,6 @@ const FLOW_MAX_AGE_UNIX_SECONDS: i64 = 10 * 60;
 pub struct WorkOsConfig {
     client: workos::Client,
     redirect_uri: String,
-    public_base_url: String,
     cookie_password: String,
     project_organizations: BTreeMap<String, String>,
     admin_organization_id: String,
@@ -109,11 +110,6 @@ impl WorkOsConfig {
             matches!(redirect.scheme(), "http" | "https"),
             "WorkOS redirect URI must use http or https"
         );
-        let mut public_base = redirect.clone();
-        public_base.set_path("/");
-        public_base.set_query(None);
-        public_base.set_fragment(None);
-
         if let Some(domain) = &params.cookie_domain {
             anyhow::ensure!(
                 !domain.is_empty()
@@ -138,7 +134,6 @@ impl WorkOsConfig {
         Ok(Self {
             client,
             redirect_uri: params.redirect_uri,
-            public_base_url: public_base.into(),
             cookie_password: params.cookie_password,
             project_organizations: params.project_organizations,
             admin_organization_id: params.admin_organization_id,
@@ -549,10 +544,16 @@ pub async fn logout(
     let site = Site::parse(&query.site).ok_or_else(|| ApiError::invalid("unknown auth site"))?;
     let sealed = cookie_value(&headers, site.session_cookie()).unwrap_or_default();
     let manager = SessionManager::new(Some(&config.client), sealed, &config.cookie_password);
-    let destination = manager
-        .logout_url(Some(&config.public_base_url))
-        .unwrap_or_else(|_| config.public_base_url.clone());
-    let mut response = Redirect::to(&destination).into_response();
+    let session = manager.authenticate();
+    if !session.session_id.is_empty() {
+        let params = RevokeSessionParams::new(RevokeSession {
+            session_id: session.session_id,
+        });
+        if let Err(error) = config.client.user_management().revoke_session(params).await {
+            tracing::warn!(error = %error, "WorkOS session revocation failed");
+        }
+    }
+    let mut response = Redirect::to(config.site_url(site)).into_response();
     append_delete_cookie(
         &mut response,
         site.session_cookie(),

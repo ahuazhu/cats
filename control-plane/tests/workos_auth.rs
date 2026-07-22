@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
 use axum::routing::post;
@@ -24,6 +24,7 @@ const COOKIE_PASSWORD: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0
 #[derive(Clone)]
 struct WorkOsStub {
     exchanges: Arc<AtomicUsize>,
+    revoked_sessions: Arc<Mutex<Vec<String>>>,
 }
 
 async fn authenticate(State(stub): State<WorkOsStub>, Json(body): Json<Value>) -> Json<Value> {
@@ -85,22 +86,34 @@ async fn authenticate(State(stub): State<WorkOsStub>, Json(body): Json<Value>) -
     }))
 }
 
+async fn revoke_session(State(stub): State<WorkOsStub>, Json(body): Json<Value>) -> StatusCode {
+    stub.revoked_sessions
+        .lock()
+        .unwrap()
+        .push(body["session_id"].as_str().unwrap().to_string());
+    StatusCode::NO_CONTENT
+}
+
 struct Ctx {
     _dir: tempfile::TempDir,
     _cp: Handle,
     base: String,
     http: reqwest::Client,
     exchanges: Arc<AtomicUsize>,
+    revoked_sessions: Arc<Mutex<Vec<String>>>,
 }
 
 impl Ctx {
     async fn new() -> Self {
         let exchanges = Arc::new(AtomicUsize::new(0));
+        let revoked_sessions = Arc::new(Mutex::new(Vec::new()));
         let stub = WorkOsStub {
             exchanges: exchanges.clone(),
+            revoked_sessions: revoked_sessions.clone(),
         };
         let app = Router::new()
             .route("/user_management/authenticate", post(authenticate))
+            .route("/user_management/sessions/revoke", post(revoke_session))
             .with_state(stub);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let workos_base = format!("http://{}", listener.local_addr().unwrap());
@@ -119,8 +132,8 @@ impl Ctx {
             admin_permission: "cats:fleet:admin".into(),
             cookie_secure: false,
             cookie_domain: None,
-            user_site_url: None,
-            admin_site_url: None,
+            user_site_url: Some("https://cats.run/".into()),
+            admin_site_url: Some("https://ops.cats.run/".into()),
             allow_token_login: false,
         })
         .unwrap();
@@ -150,6 +163,7 @@ impl Ctx {
                 .build()
                 .unwrap(),
             exchanges,
+            revoked_sessions,
         }
     }
 
@@ -314,6 +328,49 @@ async fn workos_callback_rejects_tampered_state_before_code_exchange() {
         .unwrap();
     assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(ctx.exchanges.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn workos_logout_revokes_the_session_and_returns_to_the_requested_site() {
+    let ctx = Ctx::new().await;
+
+    let user_cookie = ctx.login("user", "user-code").await;
+    let user_logout = ctx
+        .http
+        .get(ctx.url("/auth/logout?site=user"))
+        .header("Cookie", user_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(user_logout.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        user_logout.headers().get(LOCATION).unwrap(),
+        "https://cats.run/"
+    );
+    assert!(user_logout
+        .headers()
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| value.starts_with("cats_user_session=;") && value.contains("Max-Age=0")));
+
+    let admin_cookie = ctx.login("admin", "admin-code").await;
+    let admin_logout = ctx
+        .http
+        .get(ctx.url("/auth/logout?site=admin"))
+        .header("Cookie", admin_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin_logout.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        admin_logout.headers().get(LOCATION).unwrap(),
+        "https://ops.cats.run/"
+    );
+    assert_eq!(
+        *ctx.revoked_sessions.lock().unwrap(),
+        vec!["session_user-code", "session_admin-code"]
+    );
 }
 
 #[tokio::test]
