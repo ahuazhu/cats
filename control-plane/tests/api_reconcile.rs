@@ -314,6 +314,7 @@ async fn embedded_user_and_admin_sites_are_served_without_credentials() {
     assert!(!user_html.contains("Project Token"));
     assert!(!user_html.contains("token-login-section"));
     assert!(!user_html.contains("CAT STATUS"));
+    assert!(user_html.contains("login-screen is-hidden"));
 
     let response = ctx
         .http
@@ -327,6 +328,7 @@ async fn embedded_user_and_admin_sites_are_served_without_credentials() {
     assert!(admin_html.contains("管理员控制台"));
     assert!(!admin_html.contains("Administrator Token"));
     assert!(!admin_html.contains("FLEET HEALTH"));
+    assert!(admin_html.contains("login-screen is-hidden"));
 
     let auth_config = ctx.http.get(ctx.url("/auth/config")).send().await.unwrap();
     assert_eq!(auth_config.status(), StatusCode::OK);
