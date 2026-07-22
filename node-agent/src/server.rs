@@ -14,6 +14,7 @@ use cats_api::nodejob::NodeJob;
 use cats_api::requests::{
     ExecRequest, ExecResponse, HeartbeatCat, HeartbeatRequest, RegisterNodeRequest,
 };
+use cats_api::resources::NodeTelemetry;
 use cats_storage::MetadataStore;
 
 use crate::runtime::{NodeConfig, NodeRuntime};
@@ -147,6 +148,33 @@ pub fn router(state: NodeState) -> Router {
         .with_state(state)
 }
 
+fn linux_host_telemetry(mut telemetry: NodeTelemetry) -> NodeTelemetry {
+    telemetry.load_average_1m = std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|contents| contents.split_whitespace().next()?.parse().ok());
+    if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
+        for line in contents.lines() {
+            let mut fields = line.split_whitespace();
+            match fields.next() {
+                Some("MemTotal:") => {
+                    telemetry.host_memory_total_mib = fields
+                        .next()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .map(|kib| kib / 1024);
+                }
+                Some("MemAvailable:") => {
+                    telemetry.host_memory_available_mib = fields
+                        .next()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .map(|kib| kib / 1024);
+                }
+                _ => {}
+            }
+        }
+    }
+    telemetry
+}
+
 /// Start the node agent: HTTP server + registration + heartbeat loop.
 pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
     std::fs::create_dir_all(&cfg.node.state_dir)?;
@@ -226,6 +254,7 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
                 .json(&HeartbeatRequest {
                     node_id: hb_state.cfg.node.node_id.clone(),
                     cats,
+                    telemetry: Some(linux_host_telemetry(hb_state.runtime.telemetry())),
                 })
                 .send()
                 .await;

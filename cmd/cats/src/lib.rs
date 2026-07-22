@@ -124,6 +124,11 @@ pub enum Command {
         #[command(subcommand)]
         cmd: OperationCommand,
     },
+    /// Fleet administration (requires an administrator token).
+    Admin {
+        #[command(subcommand)]
+        cmd: AdminCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -160,8 +165,43 @@ pub enum EndpointCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum OperationCommand {
+    Ls,
     Get { id: String },
     Wait { id: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AdminCommand {
+    /// Show fleet health, lifecycle and capacity counters.
+    Monitoring,
+    /// List worker nodes with assignments and last telemetry.
+    Nodes,
+    /// Inspect or manage one worker node.
+    Node {
+        #[command(subcommand)]
+        cmd: AdminNodeCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AdminNodeCommand {
+    Get {
+        id: String,
+    },
+    Cordon {
+        id: String,
+    },
+    Uncordon {
+        id: String,
+    },
+    /// Stop and reschedule every Cat, then leave the node cordoned.
+    Drain {
+        id: String,
+    },
+    /// Remove an empty cordoned/lost node from the registry.
+    Delete {
+        id: String,
+    },
 }
 
 /// Parse "8GiB" / "512MiB" / "1024" into bytes.
@@ -208,6 +248,10 @@ impl Client {
 
     fn url(&self, path: &str) -> String {
         format!("{}/v1/projects/{}{}", self.base, self.project, path)
+    }
+
+    fn admin_url(&self, path: &str) -> String {
+        format!("{}/v1/admin{}", self.base, path)
     }
 
     fn send(&self, req: reqwest::blocking::RequestBuilder) -> Result<serde_json::Value> {
@@ -439,6 +483,24 @@ pub fn run(cli: Cli) -> Result<()> {
             }
         },
         Command::Operation { cmd } => match cmd {
+            OperationCommand::Ls => {
+                let v = client.get("/operations")?;
+                let list: ListResponse<Operation> = serde_json::from_value(v)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&list.items).unwrap());
+                } else {
+                    for operation in list.items {
+                        println!(
+                            "{:<18} {:<18} phase={:<10} resource={}",
+                            operation.id,
+                            operation.kind,
+                            format!("{:?}", operation.phase).to_lowercase(),
+                            operation.resource_id
+                        );
+                    }
+                }
+                Ok(())
+            }
             OperationCommand::Get { id } => {
                 let v = client.send(
                     client
@@ -454,7 +516,117 @@ pub fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
         },
+        Command::Admin { cmd } => run_admin(&client, &cli, cmd),
     }
+}
+
+fn run_admin(client: &Client, cli: &Cli, cmd: &AdminCommand) -> Result<()> {
+    match cmd {
+        AdminCommand::Monitoring => {
+            let value = client.send(client.http.get(client.admin_url("/monitoring")))?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&value).unwrap());
+            } else {
+                let overview: MonitoringOverview = serde_json::from_value(value)?;
+                println!(
+                    "cats total={} running={} suspended={} warm={} cold={} failed/unknown={}",
+                    overview.cats.total,
+                    overview.cats.running,
+                    overview.cats.suspended,
+                    overview.cats.warm,
+                    overview.cats.cold,
+                    overview.cats.failed_or_unknown
+                );
+                println!(
+                    "nodes total={} ready={} cordoned={} draining={} lost={}",
+                    overview.nodes.total,
+                    overview.nodes.ready,
+                    overview.nodes.cordoned,
+                    overview.nodes.draining,
+                    overview.nodes.lost
+                );
+                println!(
+                    "capacity cpu={}/{} memory={}MiB/{}MiB",
+                    overview.capacity.assigned_cpus,
+                    overview.capacity.total_cpus,
+                    overview.capacity.assigned_memory_mib,
+                    overview.capacity.total_memory_mib
+                );
+                println!(
+                    "operations pending={} running={} succeeded={} failed={}",
+                    overview.operations.pending,
+                    overview.operations.running,
+                    overview.operations.succeeded,
+                    overview.operations.failed
+                );
+            }
+            Ok(())
+        }
+        AdminCommand::Nodes => {
+            let value = client.send(client.http.get(client.admin_url("/nodes")))?;
+            let list: ListResponse<NodeSummary> = serde_json::from_value(value)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&list.items).unwrap());
+            } else {
+                for node in &list.items {
+                    print_node(node);
+                }
+            }
+            Ok(())
+        }
+        AdminCommand::Node { cmd } => {
+            let (id, action) = match cmd {
+                AdminNodeCommand::Get { id } => (id, None),
+                AdminNodeCommand::Cordon { id } => (id, Some("cordon")),
+                AdminNodeCommand::Uncordon { id } => (id, Some("uncordon")),
+                AdminNodeCommand::Drain { id } => (id, Some("drain")),
+                AdminNodeCommand::Delete { id } => {
+                    client.send(
+                        client
+                            .http
+                            .delete(client.admin_url(&format!("/nodes/{id}"))),
+                    )?;
+                    println!("deleted {id}");
+                    return Ok(());
+                }
+            };
+            let request = if let Some(action) = action {
+                client
+                    .http
+                    .post(client.admin_url(&format!("/nodes/{id}/actions/{action}")))
+                    .header("content-length", "0")
+            } else {
+                client.http.get(client.admin_url(&format!("/nodes/{id}")))
+            };
+            let value = client.send(request)?;
+            let summary: NodeSummary = serde_json::from_value(value)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&summary).unwrap());
+            } else {
+                print_node(&summary);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn print_node(summary: &NodeSummary) {
+    let telemetry = summary.node.telemetry.as_ref();
+    println!(
+        "{:<18} state={:<9} cats={} cpu={}/{} memory={}MiB/{}MiB heartbeat={}s load={}",
+        summary.node.id,
+        format!("{:?}", summary.node.state).to_lowercase(),
+        summary.assigned_cats,
+        summary.assigned_cpus,
+        summary.node.capacity.cpus,
+        summary.assigned_memory_mib,
+        summary.node.capacity.memory_mib,
+        summary.heartbeat_age_seconds,
+        telemetry
+            .and_then(|sample| sample.load_average_1m)
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "-".to_string())
+    );
 }
 
 fn run_disk(client: &Client, cli: &Cli, cmd: &DiskCommand) -> Result<()> {
@@ -559,5 +731,14 @@ mod tests {
         }
         let cli = Cli::parse_from(["cats", "mount", "data", "--cat", "dev", "--at", "/data"]);
         assert!(matches!(cli.command, Command::Mount { .. }));
+        let cli = Cli::parse_from(["cats", "admin", "node", "drain", "node-a"]);
+        assert!(matches!(
+            cli.command,
+            Command::Admin {
+                cmd: AdminCommand::Node {
+                    cmd: AdminNodeCommand::Drain { .. }
+                }
+            }
+        ));
     }
 }

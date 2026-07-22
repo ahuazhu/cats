@@ -1,12 +1,13 @@
 //! Control-plane contract tests with a stub node agent: reconcile loop,
 //! operations, idempotency, RWO enforcement, node-loss fencing/rescheduling.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 
@@ -16,6 +17,8 @@ use cats_api::resources::*;
 use cats_control_plane::server::{spawn, Config, Handle};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_storage::MetadataStore;
+
+const SERVICE_TOKEN: &str = "dev-service-token";
 
 // ---------------------------------------------------------------------------
 // Stub node agent: accepts every job, tracks "running" cats, heartbeats.
@@ -83,7 +86,7 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
     let base = cp.base_url();
     client
         .post(format!("{base}/v1/nodes/register"))
-        .bearer_auth("dev-token")
+        .bearer_auth(SERVICE_TOKEN)
         .json(&RegisterNodeRequest {
             node_id: id.to_string(),
             agent_url: format!("http://{addr}"),
@@ -116,12 +119,21 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
                     state: *st,
                 })
                 .collect();
+            let observed_cats = cats.len() as u64;
             let _ = client
                 .post(format!("{base}/v1/nodes/heartbeat"))
-                .bearer_auth("dev-token")
+                .bearer_auth(SERVICE_TOKEN)
                 .json(&HeartbeatRequest {
                     node_id: hb.id.clone(),
                     cats,
+                    telemetry: Some(NodeTelemetry {
+                        observed_cats,
+                        allocated_cpus: 0,
+                        allocated_memory_mib: 0,
+                        load_average_1m: Some(0.25),
+                        host_memory_total_mib: Some(32_768),
+                        host_memory_available_mib: Some(24_576),
+                    }),
                 })
                 .send()
                 .await;
@@ -149,7 +161,9 @@ impl Ctx {
             listen: "127.0.0.1:0".into(),
             db_path: dir.path().join("control.db"),
             storage_meta,
-            auth_token: "dev-token".into(),
+            auth_token: SERVICE_TOKEN.into(),
+            admin_token: "dev-admin-token".into(),
+            project_tokens: BTreeMap::from([("*".into(), "dev-token".into())]),
             node_lease_timeout_ms: 3_000,
             reconcile_interval_ms: 200,
         })
@@ -517,4 +531,300 @@ async fn destroy_deletes_root_disk_and_keeps_persistent() {
     assert_eq!(disks.items.len(), 1);
     assert_eq!(disks.items[0].name, "keep");
     assert_eq!(disks.items[0].state, DiskState::Available);
+}
+
+#[tokio::test]
+async fn project_tokens_scope_user_resources_and_operations() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage_meta: Arc<dyn MetadataStore> =
+        Arc::new(SqliteMetadataStore::open(&dir.path().join("storage-meta.db")).unwrap());
+    let cfg = Config {
+        listen: "127.0.0.1:0".into(),
+        db_path: dir.path().join("control.db"),
+        storage_meta,
+        auth_token: SERVICE_TOKEN.into(),
+        admin_token: "token-admin".into(),
+        project_tokens: BTreeMap::from([
+            ("alpha".to_string(), "token-alpha".to_string()),
+            ("beta".to_string(), "token-beta".to_string()),
+        ]),
+        node_lease_timeout_ms: 3_000,
+        reconcile_interval_ms: 200,
+    };
+    let cp = spawn(cfg).await.unwrap();
+    let http = reqwest::Client::new();
+
+    let create = http
+        .post(format!("{}/v1/projects/alpha/cats", cp.base_url()))
+        .bearer_auth("token-alpha")
+        .json(&CreateCatRequest {
+            name: "mine".into(),
+            image: "ubuntu-24.04".into(),
+            cpus: 1,
+            memory_mib: 512,
+            root_size_bytes: 8 << 20,
+            disk: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::ACCEPTED);
+    let created: CatOperationResponse = create.json().await.unwrap();
+
+    let own = http
+        .get(format!("{}/v1/projects/alpha/cats", cp.base_url()))
+        .bearer_auth("token-alpha")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(own.status(), StatusCode::OK);
+
+    let other_project = http
+        .get(format!("{}/v1/projects/beta/cats", cp.base_url()))
+        .bearer_auth("token-alpha")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other_project.status(), StatusCode::FORBIDDEN);
+
+    let service_as_user = http
+        .get(format!("{}/v1/projects/alpha/cats", cp.base_url()))
+        .bearer_auth(SERVICE_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(service_as_user.status(), StatusCode::FORBIDDEN);
+
+    let other_operation = http
+        .get(format!(
+            "{}/v1/operations/{}",
+            cp.base_url(),
+            created.operation.id
+        ))
+        .bearer_auth("token-beta")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other_operation.status(), StatusCode::FORBIDDEN);
+
+    let operations: ListResponse<Operation> = http
+        .get(format!("{}/v1/projects/alpha/operations", cp.base_url()))
+        .bearer_auth("token-alpha")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(operations.items.len(), 1);
+    assert_eq!(operations.items[0].project, "alpha");
+
+    let user_admin = http
+        .get(format!("{}/v1/admin/monitoring", cp.base_url()))
+        .bearer_auth("token-alpha")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(user_admin.status(), StatusCode::FORBIDDEN);
+
+    let admin_cross_project = http
+        .get(format!("{}/v1/projects/alpha/cats", cp.base_url()))
+        .bearer_auth("token-admin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin_cross_project.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn admin_can_monitor_and_drain_nodes() {
+    let ctx = Ctx::new().await;
+    let node_a = start_stub_node(&ctx.cp, "node_a").await;
+    let _node_b = start_stub_node(&ctx.cp, "node_b").await;
+    ctx.create_cat("drain-me", None).await;
+    let cat = ctx.wait_observed("drain-me", ObservedState::Running).await;
+    assert_eq!(cat.node_id.as_deref(), Some("node_a"));
+
+    // Wait for at least one telemetry-bearing heartbeat.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let nodes: ListResponse<NodeSummary> = ctx
+            .http
+            .get(ctx.url("/v1/admin/nodes"))
+            .bearer_auth("dev-admin-token")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if nodes
+            .items
+            .iter()
+            .all(|summary| summary.node.telemetry.is_some())
+        {
+            assert_eq!(nodes.items.len(), 2);
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "telemetry missing");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let overview: MonitoringOverview = ctx
+        .http
+        .get(ctx.url("/v1/admin/monitoring"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(overview.nodes.total, 2);
+    assert_eq!(overview.cats.running, 1);
+    assert_eq!(overview.capacity.total_cpus, 32);
+    assert_eq!(overview.capacity.assigned_cpus, 2);
+
+    let prometheus = ctx
+        .http
+        .get(ctx.url("/metrics"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(prometheus.contains("cats_control_plane_cats_running 1"));
+    assert!(prometheus.contains("cats_node_load_average_1m{node_id=\"node_a\"} 0.25"));
+
+    let drain = ctx
+        .http
+        .post(ctx.url("/v1/admin/nodes/node_a/actions/drain"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(drain.status(), StatusCode::ACCEPTED);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let cat: Cat = ctx
+            .http
+            .get(ctx.url("/v1/projects/default/cats/drain-me"))
+            .bearer_auth("dev-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let node: NodeSummary = ctx
+            .http
+            .get(ctx.url("/v1/admin/nodes/node_a"))
+            .bearer_auth("dev-admin-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if cat.observed_state == ObservedState::Running
+            && cat.node_id.as_deref() == Some("node_b")
+            && node.node.state == NodeState::Cordoned
+            && node.assigned_cats == 0
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "drain did not converge"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let uncordon = ctx
+        .http
+        .post(ctx.url("/v1/admin/nodes/node_a/actions/uncordon"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(uncordon.status(), StatusCode::OK);
+    assert_eq!(
+        uncordon.json::<NodeSummary>().await.unwrap().node.state,
+        NodeState::Ready
+    );
+
+    // Cordon records scheduling intent without hiding Lost health; a later
+    // registration recovery must not silently defeat that intent.
+    node_a.alive.store(false, Ordering::SeqCst);
+    ctx.cp
+        .state
+        .store
+        .set_node_state("node_a", NodeState::Lost)
+        .unwrap();
+    let cordon = ctx
+        .http
+        .post(ctx.url("/v1/admin/nodes/node_a/actions/cordon"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cordon.status(), StatusCode::OK);
+    assert_eq!(
+        cordon.json::<NodeSummary>().await.unwrap().node.state,
+        NodeState::Lost
+    );
+    let register = ctx
+        .http
+        .post(ctx.url("/v1/nodes/register"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&RegisterNodeRequest {
+            node_id: "node_a".into(),
+            agent_url: "http://127.0.0.1:1".into(),
+            gateway_url: "http://gateway.invalid".into(),
+            cpus: 8,
+            memory_mib: 16_384,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(register.status(), StatusCode::NO_CONTENT);
+    let node: NodeSummary = ctx
+        .http
+        .get(ctx.url("/v1/admin/nodes/node_a"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(node.node.state, NodeState::Cordoned);
+
+    let deleted = ctx
+        .http
+        .delete(ctx.url("/v1/admin/nodes/node_a"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    let missing = ctx
+        .http
+        .get(ctx.url("/v1/admin/nodes/node_a"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 }

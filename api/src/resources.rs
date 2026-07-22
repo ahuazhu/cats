@@ -141,6 +141,8 @@ pub struct Attachment {
 pub enum NodeState {
     Ready,
     Cordoned,
+    /// Existing Cats are being stopped and rescheduled; no new placements.
+    Draining,
     Lost,
 }
 
@@ -148,6 +150,21 @@ pub enum NodeState {
 pub struct NodeCapacity {
     pub cpus: u32,
     pub memory_mib: u64,
+}
+
+/// Last telemetry sample reported by a node agent. Host-level values are
+/// optional so development nodes on non-Linux systems can still heartbeat.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NodeTelemetry {
+    pub observed_cats: u64,
+    pub allocated_cpus: u32,
+    pub allocated_memory_mib: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_average_1m: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_memory_total_mib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_memory_available_mib: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +177,19 @@ pub struct Node {
     pub state: NodeState,
     pub capacity: NodeCapacity,
     pub last_heartbeat_unix: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<NodeTelemetry>,
+}
+
+/// Administrator-facing node view combining declared capacity, placement
+/// accounting and the most recent agent telemetry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeSummary {
+    pub node: Node,
+    pub assigned_cats: u64,
+    pub assigned_cpus: u32,
+    pub assigned_memory_mib: u64,
+    pub heartbeat_age_seconds: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,6 +210,9 @@ impl OperationPhase {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Operation {
     pub id: String,
+    /// Project ownership is persisted with the operation so authorization
+    /// still works after the target resource has been deleted.
+    pub project: String,
     pub kind: String,
     pub resource_id: String,
     pub resource_generation: i64,
@@ -188,6 +221,52 @@ pub struct Operation {
     pub error: Option<crate::error::ErrorBody>,
     pub created_at_unix: i64,
     pub updated_at_unix: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CatStateCounts {
+    pub total: u64,
+    pub running: u64,
+    pub suspended: u64,
+    pub warm: u64,
+    pub cold: u64,
+    pub transitional: u64,
+    pub failed_or_unknown: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NodeStateCounts {
+    pub total: u64,
+    pub ready: u64,
+    pub cordoned: u64,
+    pub draining: u64,
+    pub lost: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperationCounts {
+    pub pending: u64,
+    pub running: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FleetCapacity {
+    pub total_cpus: u64,
+    pub assigned_cpus: u64,
+    pub total_memory_mib: u64,
+    pub assigned_memory_mib: u64,
+}
+
+/// JSON monitoring snapshot exposed to administrators.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitoringOverview {
+    pub generated_at_unix: i64,
+    pub cats: CatStateCounts,
+    pub nodes: NodeStateCounts,
+    pub operations: OperationCounts,
+    pub capacity: FleetCapacity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

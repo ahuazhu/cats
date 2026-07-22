@@ -3,6 +3,7 @@
 //! binary. Covers the minimal production acceptance scenarios from the
 //! architecture doc §20.1 that are meaningful without KVM.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -16,7 +17,9 @@ use cats_node_agent::server::{spawn as spawn_node, Handle as NodeHandle, ServerC
 use cats_node_agent::testutil::workspace_bin;
 use cats_storage::{AdapterConfig, AdapterSelection, MetadataStore};
 
-const TOKEN: &str = "dev-token";
+const USER_TOKEN: &str = "dev-token";
+const SERVICE_TOKEN: &str = "dev-service-token";
+const ADMIN_TOKEN: &str = "dev-admin-token";
 
 struct Cluster {
     dir: tempfile::TempDir,
@@ -33,11 +36,14 @@ impl Cluster {
         let storage_meta_path = dir.path().join("storage-meta.db");
         let storage_meta: Arc<dyn MetadataStore> =
             Arc::new(SqliteMetadataStore::open(&storage_meta_path).unwrap());
+        let project_tokens = BTreeMap::from([("default".to_string(), USER_TOKEN.to_string())]);
         let cp = cats_control_plane::server::spawn(cats_control_plane::server::Config {
             listen: "127.0.0.1:0".into(),
             db_path: dir.path().join("control.db"),
             storage_meta,
-            auth_token: TOKEN.into(),
+            auth_token: SERVICE_TOKEN.into(),
+            admin_token: ADMIN_TOKEN.into(),
+            project_tokens,
             node_lease_timeout_ms: 3_000,
             reconcile_interval_ms: 150,
         })
@@ -47,7 +53,7 @@ impl Cluster {
         let gateway = cats_network::spawn(cats_network::GatewayConfig {
             listen: "127.0.0.1:0".into(),
             control_plane_url: cp.base_url(),
-            auth_token: TOKEN.into(),
+            auth_token: SERVICE_TOKEN.into(),
             cache_ttl_ms: 500,
         })
         .await
@@ -91,7 +97,7 @@ impl Cluster {
         spawn_node(ServerConfig {
             listen: "127.0.0.1:0".into(),
             control_plane_url: cp.base_url(),
-            auth_token: TOKEN.into(),
+            auth_token: SERVICE_TOKEN.into(),
             gateway_url: gateway.base_url(),
             cpus: 16,
             memory_mib: 32_768,
@@ -114,14 +120,19 @@ impl Cluster {
 
     /// Run the real `cats` binary; returns (exit_ok, stdout, stderr).
     async fn cli(&self, args: &[&str]) -> (bool, String, String) {
+        self.cli_with_token(args, USER_TOKEN).await
+    }
+
+    async fn cli_with_token(&self, args: &[&str], token: &str) -> (bool, String, String) {
         let bin = self.cli_bin.clone();
         let api = self.cp.base_url();
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let token = token.to_string();
         tokio::task::spawn_blocking(move || {
             let out = Command::new(bin)
                 .args(&args)
                 .env("CATS_API_URL", api)
-                .env("CATS_TOKEN", TOKEN)
+                .env("CATS_TOKEN", token)
                 .env("CATS_PROJECT", "default")
                 .output()
                 .expect("run cats CLI");
@@ -144,10 +155,19 @@ impl Cluster {
         stdout
     }
 
+    async fn admin_cli_ok(&self, args: &[&str]) -> String {
+        let (ok, stdout, stderr) = self.cli_with_token(args, ADMIN_TOKEN).await;
+        assert!(
+            ok,
+            "cats {args:?} failed:\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        stdout
+    }
+
     async fn api_get(&self, path: &str) -> serde_json::Value {
         self.http
             .get(format!("{}{}", self.cp.base_url(), path))
-            .bearer_auth(TOKEN)
+            .bearer_auth(USER_TOKEN)
             .send()
             .await
             .unwrap()
@@ -163,7 +183,7 @@ impl Cluster {
                 "{}/v1/nodes/{node}/actions/cordon",
                 self.cp.base_url()
             ))
-            .bearer_auth(TOKEN)
+            .bearer_auth(ADMIN_TOKEN)
             .send()
             .await
             .unwrap();
@@ -367,7 +387,7 @@ async fn product_loop_end_to_end() {
     let stale = cluster
         .http
         .get(format!("{old_agent}/v1/cats/{cat_id}/proxy"))
-        .bearer_auth(TOKEN)
+        .bearer_auth(SERVICE_TOKEN)
         .send()
         .await
         .unwrap();
@@ -489,29 +509,19 @@ async fn host_loss_fences_and_recovers_elsewhere() {
     // "Host loss": the node agent process dies (heartbeats stop) while its
     // children (guest + blockd) keep running — a real partition.
     cluster.nodes[0].shutdown();
-    // Re-open the surviving node for placement.
+    // Re-open the surviving node for placement through the administrator
+    // action; registration/heartbeats intentionally preserve cordons.
     let resp = cluster
         .http
         .post(format!(
-            "{}/v1/nodes/node-b/actions/cordon",
+            "{}/v1/admin/nodes/node-b/actions/uncordon",
             cluster.cp.base_url()
         ))
-        .bearer_auth(TOKEN);
-    drop(resp); // (cordon was set above; lift it by re-registering)
-    cluster
-        .http
-        .post(format!("{}/v1/nodes/register", cluster.cp.base_url()))
-        .bearer_auth(TOKEN)
-        .json(&serde_json::json!({
-            "node_id": "node-b",
-            "agent_url": cluster.nodes[1].base_url(),
-            "gateway_url": cluster.gateway.base_url(),
-            "cpus": 16,
-            "memory_mib": 32768,
-        }))
+        .bearer_auth(ADMIN_TOKEN)
         .send()
         .await
         .unwrap();
+    assert!(resp.status().is_success());
 
     // Wait for fencing + rescheduling onto node-b.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -589,5 +599,13 @@ async fn api_semantics_through_cli() {
     // ls shows it; get is consistent.
     let out = cluster.cli_ok(&["ls"]).await;
     assert!(out.contains("api"));
+
+    // The administrator view is available through the same CLI with an
+    // administrator credential, without exposing it to project users.
+    let monitoring = cluster.admin_cli_ok(&["admin", "monitoring"]).await;
+    assert!(monitoring.contains("cats total="));
+    let nodes = cluster.admin_cli_ok(&["admin", "nodes"]).await;
+    assert!(nodes.contains("node-a"));
+
     cluster.cli_ok(&["destroy", "api"]).await;
 }

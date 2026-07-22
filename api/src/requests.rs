@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::resources::{Cat, Disk, Endpoint, Operation, WakePolicy};
+use crate::resources::{Cat, Disk, Endpoint, NodeTelemetry, Operation, WakePolicy};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateCatRequest {
@@ -134,6 +134,8 @@ pub struct HeartbeatRequest {
     pub node_id: String,
     /// Cats currently running on the node with their observed runtime state.
     pub cats: Vec<HeartbeatCat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<NodeTelemetry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

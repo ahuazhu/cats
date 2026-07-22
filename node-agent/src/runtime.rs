@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use cats_api::nodejob::{NodeJob, NodeJobAction, NodeJobResult, VolumeGrant};
-use cats_api::resources::ObservedState;
+use cats_api::resources::{NodeTelemetry, ObservedState};
 use cats_guest_agent::DiskMapEntry;
 use cats_storage::{AdapterSelection, MetadataStore};
 
@@ -166,6 +166,18 @@ impl NodeRuntime {
             .iter()
             .map(|(id, rt)| (id.clone(), rt.generation, rt.state))
             .collect()
+    }
+
+    /// Allocation telemetry reported with heartbeats. These values come from
+    /// the runtime inventory (actual node ownership), not control-plane intent.
+    pub fn telemetry(&self) -> NodeTelemetry {
+        let cats = self.cats.lock().unwrap();
+        NodeTelemetry {
+            observed_cats: cats.len() as u64,
+            allocated_cpus: cats.values().map(|runtime| runtime.cpus).sum(),
+            allocated_memory_mib: cats.values().map(|runtime| runtime.memory_mib).sum(),
+            ..NodeTelemetry::default()
+        }
     }
 
     pub fn execute(&self, job: NodeJob) -> NodeJobResult {

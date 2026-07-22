@@ -15,7 +15,7 @@ struct Args {
     listen: String,
     #[arg(long)]
     control_plane_url: String,
-    #[arg(long, env = "CATS_AUTH_TOKEN", default_value = "dev-token")]
+    #[arg(long, env = "CATS_AUTH_TOKEN", default_value = "dev-service-token")]
     auth_token: String,
     #[arg(long, default_value = "")]
     gateway_url: String,

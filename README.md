@@ -2,7 +2,7 @@
 
 Cats 是一个从零实现的独立项目：为用户提供可休眠、可迁移、带持久块设备和稳定网络入口的 Linux microVM。
 
-仓库包含**完整的 Rust workspace 实现**与全部设计文档、实验证据：存储引擎（Direct-OS ChunkStore，AWS S3 adapter 可经 MinIO 联测）、控制面、node-agent（FakeVmm + **Cloud Hypervisor 真 microVM 模式**）、guest-agent（vsock）、CLI、Endpoint 网关，以及覆盖 adapter 契约、崩溃注入、fencing、跨节点冷恢复的自动化测试。Cloud Hypervisor Phase-A 路径另有 17 项 AWS 裸金属验收记录；部署与证据见 [deploy/metal/](deploy/metal/README.md)。
+仓库包含**完整的 Rust workspace 实现**与全部设计文档、实验证据：存储引擎（Direct-OS ChunkStore，AWS S3 adapter 可经 MinIO 联测）、带项目隔离和管理员 fleet API 的控制面、node-agent（FakeVmm + **Cloud Hypervisor 真 microVM 模式**）、guest-agent（vsock）、CLI、Endpoint 网关，以及覆盖 adapter 契约、崩溃注入、fencing、跨项目鉴权、节点排空和跨节点冷恢复的自动化测试。Cloud Hypervisor Phase-A 路径另有 17 项 AWS 裸金属验收记录；部署与证据见 [deploy/metal/](deploy/metal/README.md)。
 
 ## Greenfield 边界
 
@@ -55,7 +55,7 @@ Cats 是一个从零实现的独立项目：为用户提供可休眠、可迁移
 cmd/                      daemon composition roots 与 cats CLI；只在这里注册具体 adapter
 storage/                  云无关 BlobStore/MetadataStore ports、错误契约与 adapter factory
 adapters/                 具体实现：File、SQLite（开发）与 AWS S3（首个 durable adapter）
-control-plane/            Resource API、Operation、Scheduler、reconcile Controller（axum + SQLite）
+control-plane/            项目隔离 Resource API、Operation、Scheduler、节点管理/监控、reconcile Controller
 node-agent/               NodeJob 执行器、FakeVmm、blockd 子进程监督、心跳（cats-noded）
 blockd/                   ChunkStore 引擎：Cache/Bitmap/Pack/Map、FLUSH 提交协议、
                           lease/fencing、NBD 前端（cats-blockd；只依赖 storage ports）
@@ -72,7 +72,7 @@ docs/                     架构、决策、协议规格和实验报告
 | 层 | 状态 | 说明 |
 |---|---|---|
 | 存储引擎（blockd） | ✅ 实现并测试 | 协议见 [docs/specs/blockd-protocol.md](docs/specs/blockd-protocol.md)；4 个提交窗口 kill -9 恢复、空缓存冷恢复、stale epoch 拒绝均有测试 |
-| 控制面 / CLI / 网关 / node-agent / guest-agent | ✅ 实现并测试 | 单元 + 集成 + E2E 覆盖完整开发闭环 |
+| 控制面 / CLI / 网关 / node-agent / guest-agent | ✅ 实现并测试 | 项目鉴权、生命周期、fleet 管理、监控、单元 + 集成 + E2E 覆盖完整开发闭环 |
 | 存储 ports / adapters | ✅ 接口拆分 | `cats-storage` 不含厂商依赖；File/SQLite 为开发 adapter，AWS S3 为首个 durable object-store adapter |
 | AWS S3 adapter | ✅ 代码 + 签名向量测试 | SigV4 通过 AWS 官方测试向量；对真实 AWS S3/MinIO 的联测按需运行 |
 | 元数据存储 | SQLite（开发） | 与规格同 SQL 形状；生产 PostgreSQL 为后续替换项 |
@@ -100,6 +100,38 @@ cargo run -p cats-node-agent-daemon --bin cats-noded -- \
 cargo run -p cats-network --bin cats-gatewayd -- --listen 127.0.0.1:7400
 cargo run -p cats-cli --bin cats -- create dev --root-size 64MiB && \
   cargo run -p cats-cli --bin cats -- exec dev -- echo hello
+```
+
+### 用户与管理员控制面
+
+控制面使用三类独立凭证：`CATS_AUTH_TOKEN` 仅供 node-agent/gateway 等内部服务；
+`CATS_PROJECT_TOKENS` 把用户 token 绑定到一个 project；`CATS_ADMIN_TOKEN` 用于节点
+管理和 fleet 监控。生产/共享环境必须显式设置三者，例如：
+
+```bash
+export CATS_AUTH_TOKEN='service-secret'
+export CATS_PROJECT_TOKENS='acme-dev=user-secret,acme-prod=prod-user-secret'
+export CATS_ADMIN_TOKEN='admin-secret'
+cargo run -p cats-control-plane-daemon --bin cats-controld
+```
+
+用户 token 只能查看和管理所属 project 的 Cat、Disk、Endpoint、Snapshot 和
+Operation；跨 project 请求返回 `403`：
+
+```bash
+CATS_TOKEN=user-secret CATS_PROJECT=acme-dev cats ls
+CATS_TOKEN=user-secret CATS_PROJECT=acme-dev cats operation ls
+```
+
+管理员可以查看节点分配/心跳/遥测，执行 cordon、uncordon、drain 和删除空节点。
+`drain` 会先停止并 fence 原节点上的 Cat，再保持用户 desired state 在其他健康节点
+重调度；完成后节点进入 Cordoned：
+
+```bash
+CATS_TOKEN=admin-secret cats admin monitoring
+CATS_TOKEN=admin-secret cats admin nodes
+CATS_TOKEN=admin-secret cats admin node drain node-a
+curl -H 'Authorization: Bearer admin-secret' http://127.0.0.1:7300/metrics
 ```
 
 实验侧验证（原型证据，无需 Rust）：`cd experiments/lazy-ext4-demo && python3 -m unittest -v test_chunkstore.py`；完整 Lazy ext4 需要 Docker privileged/NBD；VM 生命周期实验需要 Linux x86_64、root 和 `/dev/kvm`。

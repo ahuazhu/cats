@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -39,21 +39,88 @@ impl From<ApiError> for Failure {
 
 type ApiResult<T> = std::result::Result<T, Failure>;
 
-fn check_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
-    let ok = headers
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|t| t == state.cfg.auth_token);
-    if ok {
-        Ok(())
+}
+
+fn token_is_known(state: &AppState, token: &str) -> bool {
+    token == state.cfg.auth_token
+        || token == state.cfg.admin_token
+        || state
+            .cfg
+            .project_tokens
+            .values()
+            .any(|value| value == token)
+}
+
+fn auth_failure(state: &AppState, token: Option<&str>) -> Failure {
+    if token.is_some_and(|token| token_is_known(state, token)) {
+        ApiError::new(
+            ErrorCode::PermissionDenied,
+            "token is not allowed for this resource",
+        )
+        .into()
     } else {
-        Err(ApiError::new(
+        ApiError::new(
             ErrorCode::Unauthenticated,
             "missing or invalid bearer token",
         )
-        .into())
+        .into()
     }
+}
+
+fn check_authenticated(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+    let token = bearer_token(headers);
+    token
+        .is_some_and(|token| token_is_known(state, token))
+        .then_some(())
+        .ok_or_else(|| auth_failure(state, token))
+}
+
+fn check_project_auth(state: &AppState, headers: &HeaderMap, project: &str) -> ApiResult<()> {
+    let token = bearer_token(headers);
+    let allowed = token.is_some_and(|token| {
+        token == state.cfg.admin_token
+            || state
+                .cfg
+                .project_tokens
+                .get(project)
+                .or_else(|| state.cfg.project_tokens.get("*"))
+                .is_some_and(|expected| expected == token)
+    });
+    allowed
+        .then_some(())
+        .ok_or_else(|| auth_failure(state, token))
+}
+
+fn check_admin_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+    let token = bearer_token(headers);
+    (token == Some(state.cfg.admin_token.as_str()))
+        .then_some(())
+        .ok_or_else(|| auth_failure(state, token))
+}
+
+fn check_service_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+    let token = bearer_token(headers);
+    token
+        .is_some_and(|token| token == state.cfg.auth_token || token == state.cfg.admin_token)
+        .then_some(())
+        .ok_or_else(|| auth_failure(state, token))
+}
+
+fn cordon_registered_node(state: &AppState, id: &str) -> ApiResult<()> {
+    let node = state.store.get_node(id)?;
+    if node.state == NodeState::Draining && !state.store.cats_on_node(id)?.is_empty() {
+        return Err(ApiError::failed_precondition(
+            "node drain is still in progress; use uncordon to cancel it",
+        )
+        .into());
+    }
+    state.store.set_node_state(id, NodeState::Cordoned)?;
+    Ok(())
 }
 
 fn idem_key(headers: &HeaderMap) -> Option<String> {
@@ -108,10 +175,22 @@ pub fn router(state: AppState) -> Router {
             post(create_snapshot).get(list_snapshots),
         )
         .route("/v1/operations/{id}", get(get_operation))
+        .route("/v1/projects/{project}/operations", get(list_operations))
         .route("/v1/nodes/register", post(register_node))
         .route("/v1/nodes/heartbeat", post(heartbeat))
         .route("/v1/nodes/{id}/actions/cordon", post(cordon_node))
         .route("/v1/nodes", get(list_nodes))
+        .route("/v1/admin/nodes", get(admin_list_nodes))
+        .route(
+            "/v1/admin/nodes/{id}",
+            get(admin_get_node).delete(admin_delete_node),
+        )
+        .route(
+            "/v1/admin/nodes/{id}/actions/{verb}",
+            post(admin_node_action),
+        )
+        .route("/v1/admin/monitoring", get(admin_monitoring))
+        .route("/metrics", get(prometheus_metrics))
         .route("/v1/routes/resolve", get(resolve_route))
         .route("/v1/routes/wake", post(wake_route_handler))
         .with_state(state)
@@ -127,7 +206,7 @@ async fn create_cat(
     headers: HeaderMap,
     Json(req): Json<CreateCatRequest>,
 ) -> ApiResult<Response> {
-    check_auth(&state, &headers)?;
+    check_project_auth(&state, &headers, &project)?;
     if req.name.is_empty()
         || !req
             .name
@@ -177,7 +256,7 @@ async fn list_cats(
     Path(project): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<Cat>>> {
-    check_auth(&state, &headers)?;
+    check_project_auth(&state, &headers, &project)?;
     Ok(Json(ListResponse {
         items: state.store.list_cats(&project)?,
     }))
@@ -188,7 +267,7 @@ async fn get_cat(
     Path((project, cat)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Cat>> {
-    check_auth(&state, &headers)?;
+    check_project_auth(&state, &headers, &project)?;
     Ok(Json(state.store.get_cat(&project, &cat)?))
 }
 
@@ -197,7 +276,7 @@ async fn cat_action(
     Path((project, cat, verb)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    check_auth(&state, &headers)?;
+    check_project_auth(&state, &headers, &project)?;
     let cat = state.store.get_cat(&project, &cat)?;
     let desired = match verb.as_str() {
         "start" | "resume" => DesiredState::Running,
@@ -239,7 +318,7 @@ async fn delete_cat(
     Path((project, cat)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    check_auth(&state, &headers)?;
+    check_project_auth(&state, &headers, &project)?;
     let cat = state.store.get_cat(&project, &cat)?;
     let op = state.store.set_desired(
         &cat.id,
@@ -265,7 +344,7 @@ async fn exec_cat(
     headers: HeaderMap,
     Json(req): Json<ExecRequest>,
 ) -> ApiResult<Json<ExecResponse>> {
-    check_auth(&state, &headers)?;
+    check_project_auth(&state, &headers, &project)?;
     let cat = state.store.get_cat(&project, &cat)?;
     if req.command.is_empty() {
         return Err(ApiError::invalid("command must be a non-empty argv array").into());
@@ -340,7 +419,7 @@ async fn create_disk(
     headers: HeaderMap,
     Json(req): Json<CreateDiskRequest>,
 ) -> ApiResult<Json<Disk>> {
-    check_auth(&state, &headers)?;
+    check_project_auth(&state, &headers, &project)?;
     if req.size_bytes == 0 || req.size_bytes > cats_api::chunk::MAX_VOLUME_BYTES {
         return Err(ApiError::invalid("disk size out of range").into());
     }
@@ -361,7 +440,7 @@ async fn list_disks(
     Path(project): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<Disk>>> {
-    check_auth(&state, &headers)?;
+    check_project_auth(&state, &headers, &project)?;
     Ok(Json(ListResponse {
         items: state.store.list_disks(&project)?,
     }))
@@ -372,7 +451,7 @@ async fn get_disk(
     Path((project, disk)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Disk>> {
-    check_auth(&state, &headers)?;
+    check_project_auth(&state, &headers, &project)?;
     Ok(Json(state.store.get_disk(&project, &disk)?))
 }
 
@@ -381,7 +460,7 @@ async fn delete_disk(
     Path((project, disk)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<StatusCode> {
-    check_auth(&state, &headers)?;
+    check_project_auth(&state, &headers, &project)?;
     let disk = state.store.get_disk(&project, &disk)?;
     if disk.kind == DiskKind::Root {
         return Err(ApiError::failed_precondition("root disks are deleted with their cat").into());
@@ -413,7 +492,7 @@ async fn disk_action(
     headers: HeaderMap,
     Json(body): Json<DiskActionBody>,
 ) -> ApiResult<Response> {
-    check_auth(&state, &headers)?;
+    check_project_auth(&state, &headers, &project)?;
     let disk = state.store.get_disk(&project, &disk)?;
     match verb.as_str() {
         "mount" => {
@@ -563,7 +642,7 @@ async fn create_snapshot(
     Path((project, disk)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Snapshot>> {
-    check_auth(&state, &headers)?;
+    check_project_auth(&state, &headers, &project)?;
     let disk = state.store.get_disk(&project, &disk)?;
     let snap_id = crate::store::new_id(cats_api::ids::SNAPSHOT_PREFIX);
     let row = state
@@ -588,7 +667,7 @@ async fn list_snapshots(
     Path((project, disk)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<Snapshot>>> {
-    check_auth(&state, &headers)?;
+    check_project_auth(&state, &headers, &project)?;
     let disk = state.store.get_disk(&project, &disk)?;
     let rows = state
         .storage_meta
@@ -618,7 +697,7 @@ async fn create_endpoint(
     headers: HeaderMap,
     Json(req): Json<CreateEndpointRequest>,
 ) -> ApiResult<Json<EndpointResponse>> {
-    check_auth(&state, &headers)?;
+    check_project_auth(&state, &headers, &project)?;
     let cat = state.store.get_cat(&project, &cat)?;
     let ep = state.store.create_endpoint(
         &cat,
@@ -648,7 +727,7 @@ async fn list_endpoints(
     Path((project, cat)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<Endpoint>>> {
-    check_auth(&state, &headers)?;
+    check_project_auth(&state, &headers, &project)?;
     let cat = state.store.get_cat(&project, &cat)?;
     Ok(Json(ListResponse {
         items: state.store.endpoints_for_cat(&cat.id)?,
@@ -673,7 +752,7 @@ async fn resolve_route(
     Query(q): Query<ResolveQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ResolveResponse>> {
-    check_auth(&state, &headers)?;
+    check_service_auth(&state, &headers)?;
     let (binding, route_state) = state.store.resolve_route(&q.hostname)?;
     let cat = state.store.must_get_cat_by_id(&binding.cat_id)?;
     let node_agent_url = state
@@ -711,7 +790,7 @@ async fn register_node(
     headers: HeaderMap,
     Json(req): Json<RegisterNodeRequest>,
 ) -> ApiResult<StatusCode> {
-    check_auth(&state, &headers)?;
+    check_service_auth(&state, &headers)?;
     state.store.register_node(
         &req.node_id,
         &req.agent_url,
@@ -728,8 +807,10 @@ async fn heartbeat(
     headers: HeaderMap,
     Json(req): Json<HeartbeatRequest>,
 ) -> ApiResult<StatusCode> {
-    check_auth(&state, &headers)?;
-    state.store.heartbeat_node(&req.node_id)?;
+    check_service_auth(&state, &headers)?;
+    state
+        .store
+        .heartbeat_node(&req.node_id, req.telemetry.as_ref())?;
     // Drift detection: trust node reports for steady states at the same
     // generation; the reconciler drives any resulting divergence.
     for hb in &req.cats {
@@ -755,8 +836,8 @@ async fn cordon_node(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<StatusCode> {
-    check_auth(&state, &headers)?;
-    state.store.set_node_state(&id, NodeState::Cordoned)?;
+    check_admin_auth(&state, &headers)?;
+    cordon_registered_node(&state, &id)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -764,10 +845,242 @@ async fn list_nodes(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<Node>>> {
-    check_auth(&state, &headers)?;
+    check_admin_auth(&state, &headers)?;
     Ok(Json(ListResponse {
         items: state.store.list_nodes()?,
     }))
+}
+
+async fn admin_list_nodes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ListResponse<NodeSummary>>> {
+    check_admin_auth(&state, &headers)?;
+    Ok(Json(ListResponse {
+        items: state.store.list_node_summaries()?,
+    }))
+}
+
+async fn admin_get_node(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<NodeSummary>> {
+    check_admin_auth(&state, &headers)?;
+    Ok(Json(state.store.node_summary(&id)?))
+}
+
+async fn admin_node_action(
+    State(state): State<AppState>,
+    Path((id, verb)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    check_admin_auth(&state, &headers)?;
+    let node = state.store.get_node(&id)?;
+    let status = match verb.as_str() {
+        "cordon" => {
+            cordon_registered_node(&state, &id)?;
+            StatusCode::OK
+        }
+        "uncordon" => {
+            if node.state == NodeState::Lost {
+                return Err(ApiError::failed_precondition(
+                    "lost node must heartbeat or register before uncordon",
+                )
+                .into());
+            }
+            state.store.set_node_state(&id, NodeState::Ready)?;
+            state.notify.notify_one();
+            StatusCode::OK
+        }
+        "drain" => {
+            if node.state == NodeState::Lost {
+                return Err(ApiError::failed_precondition(
+                    "lost nodes are fenced automatically and cannot be drained",
+                )
+                .into());
+            }
+            state.store.set_node_state(&id, NodeState::Draining)?;
+            state.notify.notify_one();
+            StatusCode::ACCEPTED
+        }
+        _ => return Err(ApiError::invalid(format!("unknown node action {verb}")).into()),
+    };
+    Ok((status, Json(state.store.node_summary(&id)?)).into_response())
+}
+
+async fn admin_delete_node(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    check_admin_auth(&state, &headers)?;
+    state.store.delete_node(&id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn monitoring_snapshot(state: &AppState) -> crate::store::Result<MonitoringOverview> {
+    let mut cat_counts = CatStateCounts::default();
+    for cat in state.store.list_all_cats()? {
+        cat_counts.total += 1;
+        match cat.observed_state {
+            ObservedState::Running => cat_counts.running += 1,
+            ObservedState::Suspended => cat_counts.suspended += 1,
+            ObservedState::Warm => cat_counts.warm += 1,
+            ObservedState::Cold => cat_counts.cold += 1,
+            ObservedState::Failed | ObservedState::Unknown => cat_counts.failed_or_unknown += 1,
+            _ => cat_counts.transitional += 1,
+        }
+    }
+
+    let summaries = state.store.list_node_summaries()?;
+    let mut node_counts = NodeStateCounts::default();
+    let mut capacity = FleetCapacity::default();
+    for summary in &summaries {
+        node_counts.total += 1;
+        match summary.node.state {
+            NodeState::Ready => node_counts.ready += 1,
+            NodeState::Cordoned => node_counts.cordoned += 1,
+            NodeState::Draining => node_counts.draining += 1,
+            NodeState::Lost => node_counts.lost += 1,
+        }
+        capacity.total_cpus += u64::from(summary.node.capacity.cpus);
+        capacity.total_memory_mib += summary.node.capacity.memory_mib;
+        capacity.assigned_cpus += u64::from(summary.assigned_cpus);
+        capacity.assigned_memory_mib += summary.assigned_memory_mib;
+    }
+
+    Ok(MonitoringOverview {
+        generated_at_unix: crate::store::now_unix(),
+        cats: cat_counts,
+        nodes: node_counts,
+        operations: state.store.operation_counts()?,
+        capacity,
+    })
+}
+
+async fn admin_monitoring(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<MonitoringOverview>> {
+    check_admin_auth(&state, &headers)?;
+    Ok(Json(monitoring_snapshot(&state)?))
+}
+
+async fn prometheus_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    check_admin_auth(&state, &headers)?;
+    let overview = monitoring_snapshot(&state)?;
+    let mut body = String::new();
+    macro_rules! metric {
+        ($name:expr, $value:expr) => {
+            body.push_str(&format!("{} {}\n", $name, $value));
+        };
+    }
+    metric!("cats_control_plane_cats_total", overview.cats.total);
+    metric!("cats_control_plane_cats_running", overview.cats.running);
+    metric!("cats_control_plane_cats_suspended", overview.cats.suspended);
+    metric!("cats_control_plane_cats_warm", overview.cats.warm);
+    metric!("cats_control_plane_cats_cold", overview.cats.cold);
+    metric!(
+        "cats_control_plane_cats_transitional",
+        overview.cats.transitional
+    );
+    metric!(
+        "cats_control_plane_cats_failed_or_unknown",
+        overview.cats.failed_or_unknown
+    );
+    metric!("cats_control_plane_nodes_ready", overview.nodes.ready);
+    metric!("cats_control_plane_nodes_cordoned", overview.nodes.cordoned);
+    metric!("cats_control_plane_nodes_draining", overview.nodes.draining);
+    metric!("cats_control_plane_nodes_lost", overview.nodes.lost);
+    metric!(
+        "cats_control_plane_operations_pending",
+        overview.operations.pending
+    );
+    metric!(
+        "cats_control_plane_operations_running",
+        overview.operations.running
+    );
+    metric!(
+        "cats_control_plane_operations_succeeded",
+        overview.operations.succeeded
+    );
+    metric!(
+        "cats_control_plane_operations_failed",
+        overview.operations.failed
+    );
+    metric!(
+        "cats_control_plane_capacity_cpus",
+        overview.capacity.total_cpus
+    );
+    metric!(
+        "cats_control_plane_capacity_assigned_cpus",
+        overview.capacity.assigned_cpus
+    );
+    metric!(
+        "cats_control_plane_capacity_memory_mib",
+        overview.capacity.total_memory_mib
+    );
+    metric!(
+        "cats_control_plane_capacity_assigned_memory_mib",
+        overview.capacity.assigned_memory_mib
+    );
+    for summary in state.store.list_node_summaries()? {
+        let node_id = summary
+            .node
+            .id
+            .replace('\\', "\\\\")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('"', "\\\"");
+        metric!(
+            format!("cats_node_heartbeat_age_seconds{{node_id=\"{node_id}\"}}"),
+            summary.heartbeat_age_seconds
+        );
+        if let Some(telemetry) = summary.node.telemetry {
+            metric!(
+                format!("cats_node_observed_cats{{node_id=\"{node_id}\"}}"),
+                telemetry.observed_cats
+            );
+            metric!(
+                format!("cats_node_allocated_cpus{{node_id=\"{node_id}\"}}"),
+                telemetry.allocated_cpus
+            );
+            metric!(
+                format!("cats_node_allocated_memory_mib{{node_id=\"{node_id}\"}}"),
+                telemetry.allocated_memory_mib
+            );
+            if let Some(load) = telemetry.load_average_1m {
+                metric!(
+                    format!("cats_node_load_average_1m{{node_id=\"{node_id}\"}}"),
+                    load
+                );
+            }
+            if let Some(available) = telemetry.host_memory_available_mib {
+                metric!(
+                    format!("cats_node_memory_available_mib{{node_id=\"{node_id}\"}}"),
+                    available
+                );
+            }
+            if let Some(total) = telemetry.host_memory_total_mib {
+                metric!(
+                    format!("cats_node_memory_total_mib{{node_id=\"{node_id}\"}}"),
+                    total
+                );
+            }
+        }
+    }
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response())
 }
 
 /// Wake handler used by the gateway (`POST /v1/routes/wake?hostname=`).
@@ -776,7 +1089,7 @@ async fn wake_route_handler(
     Query(q): Query<ResolveQuery>,
     headers: HeaderMap,
 ) -> ApiResult<StatusCode> {
-    check_auth(&state, &headers)?;
+    check_service_auth(&state, &headers)?;
     wake_route(&state, &q.hostname).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -786,6 +1099,21 @@ async fn get_operation(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Operation>> {
-    check_auth(&state, &headers)?;
-    Ok(Json(state.store.get_operation(&id)?))
+    // Authenticate before looking up an opaque ID so unauthenticated callers
+    // cannot use status differences to enumerate operations.
+    check_authenticated(&state, &headers)?;
+    let operation = state.store.get_operation(&id)?;
+    check_project_auth(&state, &headers, &operation.project)?;
+    Ok(Json(operation))
+}
+
+async fn list_operations(
+    State(state): State<AppState>,
+    Path(project): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ListResponse<Operation>>> {
+    check_project_auth(&state, &headers, &project)?;
+    Ok(Json(ListResponse {
+        items: state.store.list_operations(&project)?,
+    }))
 }

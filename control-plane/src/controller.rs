@@ -67,6 +67,7 @@ impl Controller {
 
     pub async fn tick(&self) -> anyhow::Result<()> {
         self.fence_lost_nodes().await?;
+        self.drain_nodes().await?;
         let cats = self.store.cats_needing_work()?;
         for cat in cats {
             if let Err(e) = self.reconcile_cat(&cat).await {
@@ -107,6 +108,53 @@ impl Controller {
             match self.storage_meta.revoke_lease(&disk.volume_id) {
                 Ok(()) | Err(MetaError::NotFound(_)) => {}
                 Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Evacuate every Cat from nodes explicitly placed in Draining. Desired
+    /// Cat state is preserved: Running Cats cold-start elsewhere, while
+    /// Suspended/Warm Cats re-establish their requested host-bound state on a
+    /// healthy node. A drain only becomes Cordoned after placement is empty.
+    async fn drain_nodes(&self) -> anyhow::Result<()> {
+        for node in self
+            .store
+            .list_nodes()?
+            .into_iter()
+            .filter(|node| node.state == NodeState::Draining)
+        {
+            for cat in self.store.cats_on_node(&node.id)? {
+                let job = NodeJob {
+                    job_id: nodejob::job_id(&cat.id, cat.generation, "drain_stop_cat"),
+                    cat_generation: cat.generation,
+                    action: NodeJobAction::StopCat {
+                        cat_id: cat.id.clone(),
+                    },
+                };
+                match self.dispatch(&node.agent_url, &job).await {
+                    Ok(result) if result.phase == JobPhase::Succeeded => {
+                        self.store.unbind_routes(&cat.id)?;
+                        self.fence_cat_volumes(&cat).await?;
+                        self.store.set_placement(&cat.id, None)?;
+                        self.store.set_observed(&cat.id, ObservedState::Cold)?;
+                    }
+                    Ok(result) => tracing::warn!(
+                        node = %node.id,
+                        cat = %cat.id,
+                        error = ?result.error,
+                        "node drain stop failed; will retry"
+                    ),
+                    Err(error) => tracing::warn!(
+                        node = %node.id,
+                        cat = %cat.id,
+                        %error,
+                        "node drain dispatch failed; will retry"
+                    ),
+                }
+            }
+            if self.store.cats_on_node(&node.id)?.is_empty() {
+                self.store.set_node_state(&node.id, NodeState::Cordoned)?;
             }
         }
         Ok(())

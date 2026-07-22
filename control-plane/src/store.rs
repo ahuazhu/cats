@@ -45,6 +45,25 @@ fn is_constraint(e: &rusqlite::Error) -> bool {
     )
 }
 
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(internal)?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(internal)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(internal)?;
+    if !names.iter().any(|name| name == column) {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )
+        .map_err(internal)?;
+    }
+    Ok(())
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).map_err(internal)?;
@@ -57,6 +76,29 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(internal)?;
         conn.execute_batch(SCHEMA).map_err(internal)?;
+        ensure_column(&conn, "operations", "project", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&conn, "nodes", "telemetry_json", "TEXT")?;
+        ensure_column(
+            &conn,
+            "nodes",
+            "scheduling_disabled",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        // Backfill ownership for databases created before operations carried
+        // their project explicitly. Deleted resources cannot be recovered and
+        // remain admin-only (empty project).
+        conn.execute_batch(
+            "UPDATE operations
+                SET project = COALESCE(
+                    (SELECT project FROM cats WHERE cats.id = operations.resource_id),
+                    (SELECT project FROM disks WHERE disks.id = operations.resource_id),
+                    project)
+              WHERE project = '';
+             UPDATE nodes
+                SET scheduling_disabled = 1
+              WHERE state IN ('cordoned', 'draining');",
+        )
+        .map_err(internal)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -171,7 +213,7 @@ impl Store {
             }
         })?;
 
-        let op = Self::insert_operation(&tx, "cat.create", &cat_id, 1)?;
+        let op = Self::insert_operation(&tx, project, "cat.create", &cat_id, 1)?;
         tx.commit().map_err(internal)?;
         drop(conn);
 
@@ -182,6 +224,7 @@ impl Store {
 
     fn insert_operation(
         tx: &rusqlite::Transaction<'_>,
+        project: &str,
         kind: &str,
         resource_id: &str,
         generation: i64,
@@ -189,13 +232,14 @@ impl Store {
         let now = now_unix();
         let id = new_id(ids::OPERATION_PREFIX);
         tx.execute(
-            "INSERT INTO operations (id, kind, resource_id, resource_generation, phase, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,'pending',?5,?5)",
-            params![id, kind, resource_id, generation, now],
+            "INSERT INTO operations (id, project, kind, resource_id, resource_generation, phase, created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,'pending',?6,?6)",
+            params![id, project, kind, resource_id, generation, now],
         )
         .map_err(internal)?;
         Ok(Operation {
             id,
+            project: project.to_string(),
             kind: kind.to_string(),
             resource_id: resource_id.to_string(),
             resource_generation: generation,
@@ -234,6 +278,14 @@ impl Store {
         })
     }
 
+    pub fn list_all_cats(&self) -> Result<Vec<Cat>> {
+        self.with(|c| {
+            let mut stmt = c.prepare("SELECT * FROM cats ORDER BY created_at")?;
+            let rows = stmt.query_map([], row_to_cat)?;
+            rows.collect()
+        })
+    }
+
     /// Bump generation and set a new desired state; returns the operation.
     pub fn set_desired(
         &self,
@@ -244,15 +296,16 @@ impl Store {
     ) -> Result<Operation> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(internal)?;
-        let current: Option<i64> = tx
+        let current: Option<(i64, String)> = tx
             .query_row(
-                "SELECT generation FROM cats WHERE id=?1",
+                "SELECT generation, project FROM cats WHERE id=?1",
                 params![cat_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
             .map_err(internal)?;
-        let current = current.ok_or_else(|| ApiError::not_found(format!("cat {cat_id}")))?;
+        let (current, project) =
+            current.ok_or_else(|| ApiError::not_found(format!("cat {cat_id}")))?;
         if let Some(expected) = expected_generation {
             if expected != current {
                 return Err(ApiError::conflict(format!(
@@ -266,7 +319,7 @@ impl Store {
             params![cat_id, desired_str(desired), new_gen],
         )
         .map_err(internal)?;
-        let op = Self::insert_operation(&tx, op_kind, cat_id, new_gen)?;
+        let op = Self::insert_operation(&tx, &project, op_kind, cat_id, new_gen)?;
         tx.commit().map_err(internal)?;
         Ok(op)
     }
@@ -529,22 +582,43 @@ impl Store {
         let now = now_ms();
         self.with(|c| {
             c.execute(
-                "INSERT INTO nodes (id, agent_url, gateway_url, state, cpus, memory_mib, last_heartbeat_ms)
-                 VALUES (?1,?2,?3,'ready',?4,?5,?6)
+                "INSERT INTO nodes (id, agent_url, gateway_url, state, cpus, memory_mib,
+                                    last_heartbeat_ms, scheduling_disabled)
+                 VALUES (?1,?2,?3,'ready',?4,?5,?6,0)
                  ON CONFLICT(id) DO UPDATE SET
-                   agent_url=?2, gateway_url=?3, state='ready', cpus=?4, memory_mib=?5, last_heartbeat_ms=?6",
-                params![node_id, agent_url, gateway_url, cpus, memory_mib as i64, now],
+                   agent_url=?2, gateway_url=?3,
+                   state=CASE
+                       WHEN nodes.state='draining' THEN 'draining'
+                       WHEN nodes.scheduling_disabled=1 THEN 'cordoned'
+                       ELSE 'ready'
+                   END,
+                   cpus=?4, memory_mib=?5, last_heartbeat_ms=?6",
+                params![
+                    node_id,
+                    agent_url,
+                    gateway_url,
+                    cpus,
+                    memory_mib as i64,
+                    now
+                ],
             )
             .map(|_| ())
         })
     }
 
-    pub fn heartbeat_node(&self, node_id: &str) -> Result<()> {
+    pub fn heartbeat_node(&self, node_id: &str, telemetry: Option<&NodeTelemetry>) -> Result<()> {
+        let telemetry_json = telemetry
+            .map(|value| serde_json::to_string(value).expect("node telemetry must serialize"));
         let n = self.with(|c| {
             c.execute(
-                "UPDATE nodes SET last_heartbeat_ms=?2, state=CASE WHEN state='lost' THEN 'ready' ELSE state END
+                "UPDATE nodes SET last_heartbeat_ms=?2, telemetry_json=?3,
+                                  state=CASE
+                                      WHEN state='lost' AND scheduling_disabled=1 THEN 'cordoned'
+                                      WHEN state='lost' THEN 'ready'
+                                      ELSE state
+                                  END
                  WHERE id=?1",
-                params![node_id, now_ms()],
+                params![node_id, now_ms(), telemetry_json],
             )
         })?;
         if n == 0 {
@@ -561,11 +635,34 @@ impl Store {
         })
     }
 
+    pub fn get_node(&self, node_id: &str) -> Result<Node> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT * FROM nodes WHERE id=?1",
+                params![node_id],
+                row_to_node,
+            )
+            .optional()
+        })?
+        .ok_or_else(|| ApiError::not_found(format!("node {node_id}")))
+    }
+
     pub fn set_node_state(&self, node_id: &str, state: NodeState) -> Result<()> {
+        let state = node_state_str(state);
         let n = self.with(|c| {
             c.execute(
-                "UPDATE nodes SET state=?2 WHERE id=?1",
-                params![node_id, node_state_str(state)],
+                "UPDATE nodes
+                    SET state=CASE
+                            WHEN ?2='cordoned' AND state='lost' THEN state
+                            ELSE ?2
+                        END,
+                        scheduling_disabled=CASE
+                            WHEN ?2='ready' THEN 0
+                            WHEN ?2 IN ('cordoned','draining') THEN 1
+                            ELSE scheduling_disabled
+                        END
+                  WHERE id=?1",
+                params![node_id, state],
             )
         })?;
         if n == 0 {
@@ -582,6 +679,56 @@ impl Store {
         })
     }
 
+    pub fn node_summary(&self, node_id: &str) -> Result<NodeSummary> {
+        let node = self.get_node(node_id)?;
+        let cats = self.cats_on_node(node_id)?;
+        Ok(summarize_node(node, &cats))
+    }
+
+    pub fn list_node_summaries(&self) -> Result<Vec<NodeSummary>> {
+        self.list_nodes()?
+            .into_iter()
+            .map(|node| {
+                let cats = self.cats_on_node(&node.id)?;
+                Ok(summarize_node(node, &cats))
+            })
+            .collect()
+    }
+
+    pub fn delete_node(&self, node_id: &str) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(internal)?;
+        let assigned: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM cats WHERE node_id=?1",
+                params![node_id],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        if assigned != 0 {
+            return Err(ApiError::failed_precondition(
+                "node still owns Cats; drain it before deletion",
+            ));
+        }
+        let state: Option<String> = tx
+            .query_row(
+                "SELECT state FROM nodes WHERE id=?1",
+                params![node_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(internal)?;
+        let state = state.ok_or_else(|| ApiError::not_found(format!("node {node_id}")))?;
+        if state == "ready" || state == "draining" {
+            return Err(ApiError::failed_precondition(
+                "only cordoned or lost nodes can be deleted",
+            ));
+        }
+        tx.execute("DELETE FROM nodes WHERE id=?1", params![node_id])
+            .map_err(internal)?;
+        tx.commit().map_err(internal)
+    }
+
     // ------------------------------------------------------------------
     // Operations / idempotency
     // ------------------------------------------------------------------
@@ -596,6 +743,38 @@ impl Store {
             .optional()
         })?
         .ok_or_else(|| ApiError::not_found(format!("operation {id}")))
+    }
+
+    pub fn list_operations(&self, project: &str) -> Result<Vec<Operation>> {
+        self.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT * FROM operations WHERE project=?1 ORDER BY created_at DESC, id DESC",
+            )?;
+            let rows = stmt.query_map(params![project], row_to_operation)?;
+            rows.collect()
+        })
+    }
+
+    pub fn operation_counts(&self) -> Result<OperationCounts> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT
+                    SUM(CASE WHEN phase='pending' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN phase='running' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN phase='succeeded' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN phase='failed' THEN 1 ELSE 0 END)
+                 FROM operations",
+                [],
+                |row| {
+                    Ok(OperationCounts {
+                        pending: row.get::<_, Option<i64>>(0)?.unwrap_or(0) as u64,
+                        running: row.get::<_, Option<i64>>(1)?.unwrap_or(0) as u64,
+                        succeeded: row.get::<_, Option<i64>>(2)?.unwrap_or(0) as u64,
+                        failed: row.get::<_, Option<i64>>(3)?.unwrap_or(0) as u64,
+                    })
+                },
+            )
+        })
     }
 
     pub fn pending_operations_for(&self, resource_id: &str) -> Result<Vec<Operation>> {
@@ -844,6 +1023,7 @@ fn node_state_str(s: NodeState) -> &'static str {
     match s {
         NodeState::Ready => "ready",
         NodeState::Cordoned => "cordoned",
+        NodeState::Draining => "draining",
         NodeState::Lost => "lost",
     }
 }
@@ -910,12 +1090,14 @@ fn row_to_disk(r: &rusqlite::Row<'_>) -> rusqlite::Result<Disk> {
 
 fn row_to_node(r: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
     let state: String = r.get("state")?;
+    let telemetry_json: Option<String> = r.get("telemetry_json")?;
     Ok(Node {
         id: r.get("id")?,
         agent_url: r.get("agent_url")?,
         gateway_url: r.get("gateway_url")?,
         state: match state.as_str() {
             "cordoned" => NodeState::Cordoned,
+            "draining" => NodeState::Draining,
             "lost" => NodeState::Lost,
             _ => NodeState::Ready,
         },
@@ -924,7 +1106,23 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
             memory_mib: r.get::<_, i64>("memory_mib")? as u64,
         },
         last_heartbeat_unix: r.get::<_, i64>("last_heartbeat_ms")? / 1000,
+        telemetry: telemetry_json.and_then(|json| serde_json::from_str(&json).ok()),
     })
+}
+
+fn summarize_node(node: Node, cats: &[Cat]) -> NodeSummary {
+    let assigned_cpus = cats.iter().map(|cat| cat.spec.cpus).sum();
+    let assigned_memory_mib = cats.iter().map(|cat| cat.spec.memory_mib).sum();
+    NodeSummary {
+        heartbeat_age_seconds: now_unix()
+            .saturating_sub(node.last_heartbeat_unix)
+            .try_into()
+            .unwrap_or(0),
+        node,
+        assigned_cats: cats.len() as u64,
+        assigned_cpus,
+        assigned_memory_mib,
+    }
 }
 
 fn row_to_operation(r: &rusqlite::Row<'_>) -> rusqlite::Result<Operation> {
@@ -932,6 +1130,7 @@ fn row_to_operation(r: &rusqlite::Row<'_>) -> rusqlite::Result<Operation> {
     let err_json: Option<String> = r.get("error_json")?;
     Ok(Operation {
         id: r.get("id")?,
+        project: r.get("project")?,
         kind: r.get("kind")?,
         resource_id: r.get("resource_id")?,
         resource_generation: r.get("resource_generation")?,
@@ -999,10 +1198,13 @@ CREATE TABLE IF NOT EXISTS nodes (
     state TEXT NOT NULL,
     cpus INTEGER NOT NULL,
     memory_mib INTEGER NOT NULL,
-    last_heartbeat_ms INTEGER NOT NULL
+    last_heartbeat_ms INTEGER NOT NULL,
+    telemetry_json TEXT,
+    scheduling_disabled INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS operations (
     id TEXT PRIMARY KEY,
+    project TEXT NOT NULL,
     kind TEXT NOT NULL,
     resource_id TEXT NOT NULL,
     resource_generation INTEGER NOT NULL,
@@ -1036,3 +1238,73 @@ CREATE TABLE IF NOT EXISTS routes (
     state TEXT NOT NULL
 );
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opens_and_backfills_the_pre_project_operation_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE cats (
+                    id TEXT PRIMARY KEY, project TEXT NOT NULL, name TEXT NOT NULL,
+                    image TEXT NOT NULL, cpus INTEGER NOT NULL, memory_mib INTEGER NOT NULL,
+                    root_disk_id TEXT NOT NULL, desired_state TEXT NOT NULL,
+                    observed_state TEXT NOT NULL, generation INTEGER NOT NULL,
+                    node_id TEXT, created_at INTEGER NOT NULL, UNIQUE (project, name)
+                 );
+                 CREATE TABLE operations (
+                    id TEXT PRIMARY KEY, kind TEXT NOT NULL, resource_id TEXT NOT NULL,
+                    resource_generation INTEGER NOT NULL, phase TEXT NOT NULL,
+                    error_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE nodes (
+                    id TEXT PRIMARY KEY, agent_url TEXT NOT NULL, gateway_url TEXT NOT NULL,
+                    state TEXT NOT NULL, cpus INTEGER NOT NULL, memory_mib INTEGER NOT NULL,
+                    last_heartbeat_ms INTEGER NOT NULL
+                 );
+                 INSERT INTO cats VALUES
+                    ('cat_old', 'alpha', 'legacy', 'ubuntu', 1, 512, 'disk_old',
+                     'running', 'cold', 1, NULL, 1);
+                 INSERT INTO operations VALUES
+                    ('op_old', 'cat.create', 'cat_old', 1, 'pending', NULL, 1, 1);
+                 INSERT INTO nodes VALUES
+                    ('node_old', 'http://node', 'http://gateway', 'cordoned', 4, 8192, 1);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.get_operation("op_old").unwrap().project, "alpha");
+        let node = store.get_node("node_old").unwrap();
+        assert_eq!(node.state, NodeState::Cordoned);
+        assert!(node.telemetry.is_none());
+
+        // An upgraded cordoned node remains unschedulable after a Lost ->
+        // register/heartbeat recovery cycle.
+        store.set_node_state("node_old", NodeState::Lost).unwrap();
+        store
+            .register_node("node_old", "http://node-new", "http://gateway", 4, 8192)
+            .unwrap();
+        assert_eq!(
+            store.get_node("node_old").unwrap().state,
+            NodeState::Cordoned
+        );
+
+        let telemetry = NodeTelemetry {
+            observed_cats: 2,
+            allocated_cpus: 3,
+            allocated_memory_mib: 2048,
+            ..NodeTelemetry::default()
+        };
+        store.heartbeat_node("node_old", Some(&telemetry)).unwrap();
+        let stored = store.get_node("node_old").unwrap().telemetry.unwrap();
+        assert_eq!(stored.observed_cats, 2);
+        assert_eq!(stored.allocated_cpus, 3);
+        assert_eq!(stored.allocated_memory_mib, 2048);
+    }
+}

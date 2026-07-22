@@ -7,7 +7,7 @@ struct Args {
     listen: String,
     #[arg(long, default_value = "http://127.0.0.1:7300")]
     control_plane_url: String,
-    #[arg(long, env = "CATS_AUTH_TOKEN", default_value = "dev-token")]
+    #[arg(long, env = "CATS_AUTH_TOKEN", default_value = "dev-service-token")]
     auth_token: String,
     #[arg(long, default_value_t = 1000)]
     cache_ttl_ms: u64,
