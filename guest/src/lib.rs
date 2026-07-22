@@ -13,20 +13,22 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::os::unix::net::UnixListener;
+use std::net::Shutdown;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{mpsc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
 
 use cats_api::guest::{
     AcquireGuestWorkLeaseRequest, GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody,
-    GuestRuntimeApiError, GuestRuntimeApiErrorResponse, GuestWorkLease, GuestWorkStatus,
-    RenewGuestWorkLeaseRequest, GUEST_WORK_LEASES_PATH, MAX_FRAME_BYTES, MAX_WORK_LEASES,
-    MAX_WORK_LEASE_TTL_MS,
+    GuestRuntimeApiError, GuestRuntimeApiErrorResponse, GuestShellFrame, GuestWorkLease,
+    GuestWorkStatus, RenewGuestWorkLeaseRequest, GUEST_WORK_LEASES_PATH, MAX_FRAME_BYTES,
+    MAX_WORK_LEASES, MAX_WORK_LEASE_TTL_MS,
 };
 use cats_blockd::nbd::NbdClient;
 
@@ -348,6 +350,13 @@ struct WorkInner {
 struct WorkRegistry {
     inner: Mutex<WorkInner>,
     changed: Condvar,
+}
+
+enum ShellEvent {
+    Client(GuestShellFrame),
+    ClientClosed,
+    Output(Vec<u8>),
+    OutputClosed,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -708,6 +717,9 @@ impl GuestAgent {
                     stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
                 })
             }
+            GuestRequestBody::Shell { .. } => Ok(GuestResponseBody::Error {
+                message: "shell requires a dedicated streaming connection".to_string(),
+            }),
             GuestRequestBody::Syncfs => {
                 if self.mode == GuestMode::Vm {
                     real_syncfs()?;
@@ -900,22 +912,176 @@ impl GuestAgent {
         }
     }
 
-    fn serve_control_stream(
-        self: &std::sync::Arc<Self>,
-        mut stream: std::os::unix::net::UnixStream,
-    ) {
+    fn serve_control_stream(self: &std::sync::Arc<Self>, mut stream: UnixStream) {
         let agent = self.clone();
         std::thread::spawn(move || {
             while let Ok(req) = read_frame::<_, GuestRequest>(&mut stream) {
-                let resp = GuestResponse {
-                    id: req.id,
-                    body: agent.handle(req.body),
-                };
-                if write_frame(&mut stream, &resp).is_err() {
-                    break;
+                match req.body {
+                    GuestRequestBody::Shell { rows, cols } => {
+                        if let Err(error) = agent.serve_shell(&mut stream, req.id, rows, cols) {
+                            let _ = write_frame(
+                                &mut stream,
+                                &GuestResponse {
+                                    id: req.id,
+                                    body: GuestResponseBody::Error {
+                                        message: format!("{error:#}"),
+                                    },
+                                },
+                            );
+                        }
+                        break;
+                    }
+                    body => {
+                        let resp = GuestResponse {
+                            id: req.id,
+                            body: agent.handle(body),
+                        };
+                        if write_frame(&mut stream, &resp).is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         });
+    }
+
+    fn serve_shell(&self, stream: &mut UnixStream, id: u64, rows: u16, cols: u16) -> Result<()> {
+        anyhow::ensure!(
+            (1..=1_000).contains(&rows) && (1..=1_000).contains(&cols),
+            "terminal dimensions must be in 1..=1000"
+        );
+        let pair = native_pty_system().openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.arg("-l");
+        command.env("TERM", "xterm-256color");
+        command.env("COLORTERM", "truecolor");
+        command.cwd(if Path::new("/root").is_dir() {
+            "/root"
+        } else {
+            "/"
+        });
+        let mut child = pair.slave.spawn_command(command)?;
+        drop(pair.slave);
+        let mut pty_reader = pair.master.try_clone_reader()?;
+        let mut pty_writer = pair.master.take_writer()?;
+
+        write_frame(
+            stream,
+            &GuestResponse {
+                id,
+                body: GuestResponseBody::ShellReady,
+            },
+        )?;
+
+        // Both producer threads are bounded so a stalled client cannot make
+        // the guest agent buffer unbounded PTY output or input frames.
+        let (events_tx, events_rx) = mpsc::sync_channel::<ShellEvent>(32);
+        let mut input_stream = stream.try_clone()?;
+        let input_tx = events_tx.clone();
+        let input_thread = std::thread::spawn(move || {
+            while let Ok(frame) = read_frame::<_, GuestShellFrame>(&mut input_stream) {
+                if input_tx.send(ShellEvent::Client(frame)).is_err() {
+                    return;
+                }
+            }
+            let _ = input_tx.send(ShellEvent::ClientClosed);
+        });
+        let output_tx = events_tx.clone();
+        let output_thread = std::thread::spawn(move || {
+            let mut buffer = vec![0u8; 16 * 1024];
+            loop {
+                match pty_reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        if output_tx
+                            .send(ShellEvent::Output(buffer[..count].to_vec()))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    // PTY masters commonly report EIO after the slave closes.
+                    Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                    Err(_) => break,
+                }
+            }
+            let _ = output_tx.send(ShellEvent::OutputClosed);
+        });
+        drop(events_tx);
+
+        let mut exit_status = None;
+        let mut transport_open = true;
+        while exit_status.is_none() && transport_open {
+            match events_rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(ShellEvent::Client(GuestShellFrame::Input { data })) => {
+                    pty_writer.write_all(&data)?;
+                    pty_writer.flush()?;
+                }
+                Ok(ShellEvent::Client(GuestShellFrame::Resize { rows, cols })) => {
+                    if (1..=1_000).contains(&rows) && (1..=1_000).contains(&cols) {
+                        pair.master.resize(PtySize {
+                            rows,
+                            cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        })?;
+                    }
+                }
+                Ok(ShellEvent::Client(GuestShellFrame::Close)) | Ok(ShellEvent::ClientClosed) => {
+                    transport_open = false
+                }
+                Ok(ShellEvent::Client(
+                    GuestShellFrame::Output { .. } | GuestShellFrame::Exit { .. },
+                )) => {
+                    transport_open = false;
+                }
+                Ok(ShellEvent::Output(data)) => {
+                    if write_frame(stream, &GuestShellFrame::Output { data }).is_err() {
+                        transport_open = false;
+                    }
+                }
+                Ok(ShellEvent::OutputClosed) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => transport_open = false,
+            }
+            exit_status = child.try_wait()?;
+        }
+        if exit_status.is_none() {
+            let _ = child.kill();
+            exit_status = Some(child.wait()?);
+        }
+
+        // Drain output emitted just before exit, then publish the terminal
+        // status as the final frame.
+        let drain_deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < drain_deadline {
+            match events_rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(ShellEvent::Output(data)) => {
+                    if write_frame(stream, &GuestShellFrame::Output { data }).is_err() {
+                        transport_open = false;
+                        break;
+                    }
+                }
+                Ok(ShellEvent::OutputClosed) => break,
+                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        if transport_open {
+            let exit_code = exit_status
+                .as_ref()
+                .map(|status| status.exit_code().min(i32::MAX as u32) as i32)
+                .unwrap_or(1);
+            let _ = write_frame(stream, &GuestShellFrame::Exit { exit_code });
+        }
+        let _ = stream.shutdown(Shutdown::Both);
+        let _ = input_thread.join();
+        let _ = output_thread.join();
+        Ok(())
     }
 
     /// Serve AF_VSOCK without asking `UnixListener` to decode the peer
@@ -1087,6 +1253,62 @@ mod tests {
         let back: GuestRequest = read_frame(&mut &buf[..]).unwrap();
         assert_eq!(back.id, 7);
         assert!(matches!(back.body, GuestRequestBody::Health));
+    }
+
+    #[test]
+    fn interactive_shell_streams_pty_output_resize_and_exit_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let map_path = dir.path().join("disks.json");
+        std::fs::write(&map_path, b"{}").unwrap();
+        let agent = std::sync::Arc::new(GuestAgent::new(map_path, None));
+        let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        agent.serve_control_stream(server);
+
+        write_frame(
+            &mut client,
+            &GuestRequest {
+                id: 41,
+                body: GuestRequestBody::Shell { rows: 24, cols: 80 },
+            },
+        )
+        .unwrap();
+        let ready: GuestResponse = read_frame(&mut client).unwrap();
+        assert_eq!(ready.id, 41);
+        assert!(matches!(ready.body, GuestResponseBody::ShellReady));
+
+        write_frame(
+            &mut client,
+            &GuestShellFrame::Resize {
+                rows: 40,
+                cols: 120,
+            },
+        )
+        .unwrap();
+        write_frame(
+            &mut client,
+            &GuestShellFrame::Input {
+                data: b"printf 'cats-shell-ready\\n'; exit 7\n".to_vec(),
+            },
+        )
+        .unwrap();
+
+        let mut output = Vec::new();
+        let exit_code = loop {
+            match read_frame::<_, GuestShellFrame>(&mut client).unwrap() {
+                GuestShellFrame::Output { data } => output.extend(data),
+                GuestShellFrame::Exit { exit_code } => break exit_code,
+                other => panic!("unexpected shell frame: {other:?}"),
+            }
+        };
+        assert_eq!(exit_code, 7);
+        assert!(
+            String::from_utf8_lossy(&output).contains("cats-shell-ready"),
+            "PTY output: {}",
+            String::from_utf8_lossy(&output)
+        );
     }
 
     #[test]

@@ -19,6 +19,8 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 workos = { workspace = true }
 jsonwebtoken = { workspace = true }
+futures-util = { workspace = true }
+tokio-tungstenite = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

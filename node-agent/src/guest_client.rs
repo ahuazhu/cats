@@ -8,13 +8,34 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use cats_api::guest::{
-    GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody, GuestWorkStatus,
+    GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody, GuestShellFrame,
+    GuestWorkStatus,
 };
 use cats_guest_agent::{read_frame, write_frame};
 
 pub struct GuestClient {
     stream: UnixStream,
     next_id: u64,
+}
+
+pub struct GuestShell {
+    stream: UnixStream,
+}
+
+impl GuestShell {
+    pub fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            stream: self.stream.try_clone()?,
+        })
+    }
+
+    pub fn send(&mut self, frame: &GuestShellFrame) -> Result<()> {
+        write_frame(&mut self.stream, frame).context("write guest shell frame")
+    }
+
+    pub fn recv(&mut self) -> Result<GuestShellFrame> {
+        read_frame(&mut self.stream).context("read guest shell frame")
+    }
 }
 
 impl GuestClient {
@@ -142,6 +163,29 @@ impl GuestClient {
                 stderr,
             } => Ok((exit_code, stdout, stderr)),
             other => bail!("unexpected exec response: {other:?}"),
+        }
+    }
+
+    pub fn start_shell(mut self, rows: u16, cols: u16) -> Result<GuestShell> {
+        let id = self.next_id;
+        self.next_id += 1;
+        write_frame(
+            &mut self.stream,
+            &GuestRequest {
+                id,
+                body: GuestRequestBody::Shell { rows, cols },
+            },
+        )?;
+        let response: GuestResponse = read_frame(&mut self.stream)?;
+        if response.id != id {
+            bail!("guest response id mismatch");
+        }
+        match response.body {
+            GuestResponseBody::ShellReady => Ok(GuestShell {
+                stream: self.stream,
+            }),
+            GuestResponseBody::Error { message } => bail!("guest error: {message}"),
+            other => bail!("unexpected shell response: {other:?}"),
         }
     }
 }

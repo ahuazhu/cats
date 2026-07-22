@@ -13,8 +13,9 @@ Cats 是一个从零实现的独立项目：为用户提供可休眠、可迁移
 - 存储后端已选定为 Direct-OS ChunkStore（Direct-S3 实现，[ADR-0003](docs/decisions/0003-direct-s3-chunkstore-backend.md)）；JuiceFS 方案不再实现，仅作历史参考。
 - 存储依赖边界采用 Ports and Adapters（[ADR-0005](docs/decisions/0005-provider-neutral-storage-ports-and-adapters.md)）：核心只依赖云无关契约，AWS S3 是第一版 durable adapter。
 - 生命周期状态统一为 Running / Suspended / Warm / Cold（[ADR-0002](docs/decisions/0002-lifecycle-states-running-suspended-warm-cold.md)）。
-- 浏览器身份使用 WorkOS AuthKit，CLI 与内部服务继续使用 Bearer Token（[ADR-0006](docs/decisions/0006-workos-authkit-for-browser-identity.md)）。
+- 浏览器身份使用 WorkOS AuthKit；CLI 使用 WorkOS Device Login，内部服务使用独立机器 Bearer Token（[ADR-0006](docs/decisions/0006-workos-authkit-for-browser-identity.md)、[ADR-0008](docs/decisions/0008-workos-device-login-and-cli-workspaces.md)）。
 - Guest 可选运行时能力使用 Unix socket 上的标准 HTTP，不要求 Cats SDK/CLI 或固定 TCP 端口（[ADR-0007](docs/decisions/0007-guest-runtime-http-over-unix-socket.md)）。
+- `cats shell` 使用受 Workspace 鉴权的 WebSocket PTY，不在 Guest 运行 sshd（[ADR-0009](docs/decisions/0009-interactive-shell-over-authenticated-websocket.md)）。
 
 具体边界记录在 [`ADR-0001: Greenfield implementation baseline`](docs/decisions/0001-greenfield-implementation-baseline.md) 及后续 ADR。
 
@@ -74,7 +75,7 @@ docs/                     架构、决策、协议规格和实验报告
 | 层 | 状态 | 说明 |
 |---|---|---|
 | 存储引擎（blockd） | ✅ 实现并测试 | 协议见 [docs/specs/blockd-protocol.md](docs/specs/blockd-protocol.md)；4 个提交窗口 kill -9 恢复、空缓存冷恢复、stale epoch 拒绝均有测试 |
-| 控制面 / Web 控制台 / CLI / 网关 / node-agent / guest-agent | ✅ 实现并测试 | 项目鉴权、生命周期、独立 user/admin 站点、fleet 管理、监控、单元 + 集成 + E2E 覆盖完整开发闭环 |
+| 控制面 / Web 控制台 / CLI / 网关 / node-agent / guest-agent | ✅ 实现并测试 | Workspace 鉴权、生命周期、交互式 PTY shell、独立 user/admin 站点、fleet 管理、监控、单元 + 集成 + E2E 覆盖完整开发闭环 |
 | 存储 ports / adapters | ✅ 接口拆分 | `cats-storage` 不含厂商依赖；File/SQLite 为开发 adapter，AWS S3 与 PostgreSQL 为 AWS 生产部署 adapter |
 | AWS S3 adapter | ✅ 代码 + 签名向量测试 | SigV4 通过 AWS 官方测试向量；对真实 AWS S3/MinIO 的联测按需运行 |
 | 元数据存储 | ✅ SQLite + PostgreSQL | SQLite 用于本地开发；PostgreSQL adapter 实现 root/lease/fencing 的数据库时钟与原子 CAS，并用于 AWS EKS/metal 共享元数据 |
@@ -104,6 +105,8 @@ CATS_API_URL=http://127.0.0.1:7300 CATS_TOKEN=dev-admin-token \
   cargo run -p cats-cli --bin cats -- create dev --root-size 64MiB && \
 CATS_API_URL=http://127.0.0.1:7300 CATS_TOKEN=dev-admin-token \
   cargo run -p cats-cli --bin cats -- exec dev -- echo hello
+CATS_API_URL=http://127.0.0.1:7300 CATS_TOKEN=dev-admin-token \
+  cargo run -p cats-cli --bin cats -- shell dev
 ```
 
 ### 用户与管理员控制面

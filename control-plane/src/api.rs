@@ -4,11 +4,15 @@
 
 use std::time::Duration;
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use cats_api::error::{ApiError, ErrorBody, ErrorCode};
 use cats_api::requests::*;
@@ -218,6 +222,7 @@ pub fn router(state: AppState) -> Router {
             post(cat_action),
         )
         .route("/v1/projects/{project}/cats/{cat}/exec", post(exec_cat))
+        .route("/v1/projects/{project}/cats/{cat}/shell", get(shell_cat))
         .route(
             "/v1/projects/{project}/cats/{cat}/auto-suspend",
             get(get_auto_suspend).put(update_auto_suspend),
@@ -521,6 +526,188 @@ async fn exec_cat(
     let _ = state.store.release_work(&lease.id);
     let _ = state.controller.maybe_auto_suspend(&cat_id);
     result.map(Json)
+}
+
+#[derive(Debug, Deserialize)]
+struct ShellQuery {
+    #[serde(default = "default_terminal_rows")]
+    rows: u16,
+    #[serde(default = "default_terminal_cols")]
+    cols: u16,
+}
+
+fn default_terminal_rows() -> u16 {
+    24
+}
+
+fn default_terminal_cols() -> u16 {
+    80
+}
+
+async fn shell_cat(
+    State(state): State<AppState>,
+    Path((project, cat)): Path<(String, String)>,
+    Query(query): Query<ShellQuery>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> ApiResult<Response> {
+    check_project_auth(&state, &headers, &project).await?;
+    if !(1..=1_000).contains(&query.rows) || !(1..=1_000).contains(&query.cols) {
+        return Err(ApiError::invalid("terminal dimensions must be in 1..=1000").into());
+    }
+    let cat = state.store.get_cat(&project, &cat)?;
+    let owner = format!("shell_{}", uuid::Uuid::new_v4().simple());
+    let lease = state
+        .store
+        .acquire_work(&cat.id, WorkKind::Exec, &owner, "shell", 120_000)?;
+    state.notify.notify_one();
+    let cat_id = cat.id.clone();
+
+    let prepared = prepare_node_shell(&state, cat, query.rows, query.cols).await;
+    let node_socket = match prepared {
+        Ok(socket) => socket,
+        Err(error) => {
+            let _ = state.store.release_work(&lease.id);
+            let _ = state.controller.maybe_auto_suspend(&cat_id);
+            return Err(error);
+        }
+    };
+    let cleanup_state = state.clone();
+    Ok(ws
+        .max_message_size(MAX_SHELL_MESSAGE_BYTES)
+        .max_frame_size(MAX_SHELL_MESSAGE_BYTES)
+        .on_upgrade(move |socket| async move {
+            proxy_shell(
+                socket,
+                node_socket,
+                cleanup_state.clone(),
+                cat_id.clone(),
+                owner,
+            )
+            .await;
+            let _ = cleanup_state.store.release_work(&lease.id);
+            let _ = cleanup_state.controller.maybe_auto_suspend(&cat_id);
+        }))
+}
+
+async fn prepare_node_shell(
+    state: &AppState,
+    mut cat: Cat,
+    rows: u16,
+    cols: u16,
+) -> ApiResult<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+> {
+    let mut retried_suspend_conflict = false;
+    loop {
+        cat = ensure_running(state, cat).await?;
+        let node = state
+            .store
+            .list_nodes()?
+            .into_iter()
+            .find(|node| Some(&node.id) == cat.node_id.as_ref())
+            .ok_or_else(|| ApiError::unavailable("cat has no live node"))?;
+        let mut url = reqwest::Url::parse(node.agent_url.trim_end_matches('/'))
+            .map_err(|error| ApiError::internal(format!("invalid node agent URL: {error}")))?;
+        url.set_scheme(match url.scheme() {
+            "http" => "ws",
+            "https" => "wss",
+            _ => return Err(ApiError::internal("node agent URL must use http or https").into()),
+        })
+        .map_err(|_| ApiError::internal("invalid node WebSocket URL"))?;
+        url.set_path(&format!("/v1/cats/{}/shell", cat.id));
+        url.set_query(Some(&format!("rows={rows}&cols={cols}")));
+        let mut request = url
+            .as_str()
+            .into_client_request()
+            .map_err(|error| ApiError::internal(format!("build node shell request: {error}")))?;
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", state.cfg.auth_token))
+                .map_err(|_| ApiError::internal("invalid service authorization header"))?,
+        );
+        match tokio_tungstenite::connect_async(request).await {
+            Ok((socket, _)) => return Ok(socket),
+            Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                if response.status() == StatusCode::CONFLICT && !retried_suspend_conflict =>
+            {
+                retried_suspend_conflict = true;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => {
+                return Err(
+                    ApiError::unavailable(format!("node shell connection failed: {error}")).into(),
+                )
+            }
+        }
+    }
+}
+
+async fn proxy_shell(
+    client: WebSocket,
+    node: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    state: AppState,
+    cat_id: String,
+    owner: String,
+) {
+    let (mut client_sender, mut client_receiver) = client.split();
+    let (mut node_sender, mut node_receiver) = node.split();
+    let mut renewal = tokio::time::interval(Duration::from_secs(30));
+    renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    renewal.tick().await;
+
+    loop {
+        tokio::select! {
+            incoming = client_receiver.next() => {
+                let Some(Ok(message)) = incoming else { break };
+                let message = match message {
+                    Message::Text(text) => {
+                        tokio_tungstenite::tungstenite::Message::Text(text.to_string().into())
+                    }
+                    Message::Binary(data) => tokio_tungstenite::tungstenite::Message::Binary(data),
+                    Message::Ping(data) => tokio_tungstenite::tungstenite::Message::Ping(data),
+                    Message::Pong(data) => tokio_tungstenite::tungstenite::Message::Pong(data),
+                    Message::Close(_) => tokio_tungstenite::tungstenite::Message::Close(None),
+                };
+                if node_sender.send(message).await.is_err() {
+                    break;
+                }
+            }
+            outgoing = node_receiver.next() => {
+                let Some(Ok(message)) = outgoing else { break };
+                let message = match message {
+                    tokio_tungstenite::tungstenite::Message::Text(text) => {
+                        Message::Text(text.to_string().into())
+                    }
+                    tokio_tungstenite::tungstenite::Message::Binary(data) => Message::Binary(data),
+                    tokio_tungstenite::tungstenite::Message::Ping(data) => Message::Ping(data),
+                    tokio_tungstenite::tungstenite::Message::Pong(data) => Message::Pong(data),
+                    tokio_tungstenite::tungstenite::Message::Close(_) => Message::Close(None),
+                    tokio_tungstenite::tungstenite::Message::Frame(_) => continue,
+                };
+                if client_sender.send(message).await.is_err() {
+                    break;
+                }
+            }
+            _ = renewal.tick() => {
+                if let Err(error) = state.store.acquire_work(
+                    &cat_id,
+                    WorkKind::Exec,
+                    &owner,
+                    "shell",
+                    120_000,
+                ) {
+                    tracing::warn!(cat_id, error = %error, "shell work lease renewal failed");
+                    break;
+                }
+            }
+        }
+    }
+    let _ = node_sender
+        .send(tokio_tungstenite::tungstenite::Message::Close(None))
+        .await;
 }
 
 async fn get_auto_suspend(

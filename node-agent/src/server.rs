@@ -5,21 +5,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::{SinkExt, StreamExt};
 
+use cats_api::guest::GuestShellFrame;
 use cats_api::nodejob::NodeJob;
 use cats_api::requests::{
     ExecRequest, ExecResponse, HeartbeatCat, HeartbeatRequest, NodeWorkStatusRequest,
-    RegisterNodeRequest,
+    RegisterNodeRequest, ShellClientControl, ShellServerControl, MAX_SHELL_MESSAGE_BYTES,
 };
 use cats_api::resources::NodeTelemetry;
 use cats_storage::MetadataStore;
 
-use crate::runtime::{GuestConn, NodeConfig, NodeRuntime};
+use crate::guest_client::GuestShell;
+use crate::runtime::{GuestConn, NodeConfig, NodeRuntime, RuntimeActivityGuard};
 
 async fn watch_guest_work(
     client: reqwest::Client,
@@ -167,6 +171,152 @@ async fn handle_exec(
 }
 
 #[derive(serde::Deserialize)]
+struct ShellQuery {
+    #[serde(default = "default_terminal_rows")]
+    rows: u16,
+    #[serde(default = "default_terminal_cols")]
+    cols: u16,
+}
+
+fn default_terminal_rows() -> u16 {
+    24
+}
+
+fn default_terminal_cols() -> u16 {
+    80
+}
+
+async fn handle_shell(
+    State(state): State<NodeState>,
+    Path(cat_id): Path<String>,
+    Query(query): Query<ShellQuery>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Err(code) = check_auth(&state.cfg, &headers) {
+        return code.into_response();
+    }
+    if !(1..=1_000).contains(&query.rows) || !(1..=1_000).contains(&query.cols) {
+        return (StatusCode::BAD_REQUEST, "invalid terminal dimensions").into_response();
+    }
+    let runtime = state.runtime.clone();
+    let opened =
+        tokio::task::spawn_blocking(move || runtime.open_shell(&cat_id, query.rows, query.cols))
+            .await;
+    match opened {
+        Ok(Ok((guest, activity_guard))) => ws
+            .max_message_size(MAX_SHELL_MESSAGE_BYTES)
+            .max_frame_size(MAX_SHELL_MESSAGE_BYTES)
+            .on_upgrade(move |socket| bridge_shell(socket, guest, activity_guard)),
+        Ok(Err(error)) if crate::runtime::is_activity_changed(&error) => {
+            (StatusCode::CONFLICT, format!("{error:#}")).into_response()
+        }
+        Ok(Err(error)) => (StatusCode::SERVICE_UNAVAILABLE, format!("{error:#}")).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn bridge_shell(socket: WebSocket, guest: GuestShell, _activity_guard: RuntimeActivityGuard) {
+    let mut guest_reader = match guest.try_clone() {
+        Ok(reader) => reader,
+        Err(error) => {
+            tracing::warn!(error = %error, "clone guest shell stream failed");
+            return;
+        }
+    };
+    let mut guest_writer = guest;
+    let (to_guest_tx, mut to_guest_rx) = tokio::sync::mpsc::channel::<GuestShellFrame>(32);
+    let (from_guest_tx, mut from_guest_rx) = tokio::sync::mpsc::channel::<GuestShellFrame>(32);
+    let writer_task = tokio::task::spawn_blocking(move || {
+        while let Some(frame) = to_guest_rx.blocking_recv() {
+            if guest_writer.send(&frame).is_err() {
+                break;
+            }
+            if frame == GuestShellFrame::Close {
+                break;
+            }
+        }
+    });
+    let reader_task = tokio::task::spawn_blocking(move || {
+        while let Ok(frame) = guest_reader.recv() {
+            let terminal = matches!(frame, GuestShellFrame::Exit { .. });
+            if from_guest_tx.blocking_send(frame).is_err() || terminal {
+                break;
+            }
+        }
+    });
+
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+    let mut terminal = false;
+    while !terminal {
+        tokio::select! {
+            incoming = ws_receiver.next() => {
+                let Some(Ok(message)) = incoming else { break };
+                let frame = match message {
+                    Message::Binary(data) => Some(GuestShellFrame::Input { data: data.to_vec() }),
+                    Message::Text(text) => match serde_json::from_str::<ShellClientControl>(text.as_str()) {
+                        Ok(ShellClientControl::Resize { rows, cols }) => {
+                            Some(GuestShellFrame::Resize { rows, cols })
+                        }
+                        Ok(ShellClientControl::Close) => {
+                            terminal = true;
+                            Some(GuestShellFrame::Close)
+                        }
+                        Err(_) => {
+                            let control = ShellServerControl::Error {
+                                message: "invalid shell control frame".to_string(),
+                            };
+                            let _ = ws_sender.send(Message::Text(serde_json::to_string(&control).unwrap().into())).await;
+                            terminal = true;
+                            Some(GuestShellFrame::Close)
+                        }
+                    },
+                    Message::Ping(data) => {
+                        if ws_sender.send(Message::Pong(data)).await.is_err() {
+                            terminal = true;
+                        }
+                        None
+                    }
+                    Message::Pong(_) => None,
+                    Message::Close(_) => {
+                        terminal = true;
+                        Some(GuestShellFrame::Close)
+                    }
+                };
+                if let Some(frame) = frame {
+                    if to_guest_tx.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            outgoing = from_guest_rx.recv() => {
+                let Some(frame) = outgoing else { break };
+                let message = match frame {
+                    GuestShellFrame::Output { data } => Message::Binary(data.into()),
+                    GuestShellFrame::Exit { exit_code } => {
+                        terminal = true;
+                        Message::Text(serde_json::to_string(&ShellServerControl::Exit { exit_code }).unwrap().into())
+                    }
+                    _ => {
+                        terminal = true;
+                        Message::Text(serde_json::to_string(&ShellServerControl::Error {
+                            message: "invalid frame from guest shell".to_string(),
+                        }).unwrap().into())
+                    }
+                };
+                if ws_sender.send(message).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = to_guest_tx.send(GuestShellFrame::Close).await;
+    drop(to_guest_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(2), writer_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), reader_task).await;
+}
+
+#[derive(serde::Deserialize)]
 struct ProxyQuery {
     path: Option<String>,
 }
@@ -197,6 +347,7 @@ pub fn router(state: NodeState) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/jobs", post(handle_job))
         .route("/v1/cats/{id}/exec", post(handle_exec))
+        .route("/v1/cats/{id}/shell", get(handle_shell))
         .route("/v1/cats/{id}/proxy", get(handle_proxy))
         .with_state(state)
 }

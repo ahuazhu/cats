@@ -104,6 +104,26 @@ pub struct ExecResponse {
     pub stderr: String,
 }
 
+/// JSON control messages carried in WebSocket text frames. PTY input/output
+/// uses binary WebSocket frames.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ShellClientControl {
+    Resize { rows: u16, cols: u16 },
+    Close,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ShellServerControl {
+    Exit { exit_code: i32 },
+    Error { message: String },
+}
+
+/// Terminal messages are intentionally small. This caps public and internal
+/// WebSocket buffering before data reaches the Guest protocol's own bound.
+pub const MAX_SHELL_MESSAGE_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateAutoSuspendRequest {
     pub enabled: bool,

@@ -228,21 +228,26 @@ Route Controller 使用新 epoch 绑定 Endpoint；Operation 变为 Succeeded，
 
 ### 4.2 Shell / Exec 数据路径
 
+> V1 已实现形态由 [ADR-0009](decisions/0009-interactive-shell-over-authenticated-websocket.md)
+> 固定。长期仍可拆出独立 Session Gateway，但不能改变公开 CLI/WebSocket 契约。
+
 ### 控制建立
 
-1.  CLI 向 API 申请短期 Session Token。
-2.  Session Gateway 查 Cat 当前 node 与 activation epoch。
-3.  Cat 为 Cold 时触发一次 Start，其他并发请求复用同一 Operation。
-4.  Gateway 与目标 cat-agent 建立 mTLS stream。
-5.  cat-agent 通过 AF_VSOCK 连接 Guest Agent。
+1.  CLI 使用 `cats login` 获得的短期 WorkOS access token 连接控制面 WebSocket。
+2.  控制面校验 Workspace/Cat 授权，获取并续期 work lease；Cat 非 Running 时通过既有
+    reconcile 路径唤醒。
+3.  控制面查 Cat 当前 Node，用独立 service credential 建立内部 WebSocket。
+4.  Node 在 upgrade 前获取 runtime activity guard，通过 Unix/vsock 连接 Guest Agent。
+5.  Guest Agent 建立 `/bin/sh -l` PTY，成功后会话开始转发。
 
 ### 交互数据
 
 1.  PTY 字节、窗口 resize、exit code 在流式通道传输。
-2.  中央 Resource API 不转发终端数据。
-3.  Token 只允许一个 tenant/project/cat/session。
-4.  断线后进程是否继续由命令参数决定；默认交互 shell 随 session 结束。
-5.  审计记录谁在何时打开 session，不记录终端明文。
+2.  V1 控制面承担受限 Session Gateway 角色并转发流量；长期拆分后 Resource API 不再
+    承载终端字节。
+3.  用户 access token 只允许其已验证的 Workspace；内部 service token 不进入 Guest。
+4.  默认交互 shell 随 session 断开而结束；V1 不支持 detach/reconnect。
+5.  各跳使用有界队列，不记录终端明文。会话审计事件仍是后续工作。
 
 **API 行为：**创建、启动、停止、挂载、快照等长操作返回 `202 + operation_id`。CLI 默认等待并显示阶段；`--no-wait` 立即返回。网络超时后用户查询同一个 Operation，不重复创建资源。
 
@@ -610,7 +615,9 @@ Controller ↔ cat-agent。仅私网/mTLS，传 Job、heartbeat 和结果，不�
 
 ### 会话平面
 
-CLI ↔ Session Gateway ↔ Node ↔ vsock，用于 shell/exec/logs/cp，使用短期单用途 token。
+目标态为 CLI ↔ Session Gateway ↔ Node ↔ vsock，用于 shell/exec/logs/cp，使用短期
+单用途 token。V1 的 `cats shell` 由控制面承担 Session Gateway 角色：外层使用 WorkOS
+短期 access token，控制面到 Node 使用 service credential；拆分计划见 ADR-0009。
 
 ### Guest 私网
 

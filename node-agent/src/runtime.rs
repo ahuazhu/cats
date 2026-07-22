@@ -29,7 +29,7 @@ use cats_guest_agent::DiskMapEntry;
 use cats_storage::{AdapterSelection, MetadataStore};
 
 use crate::ch::{self, ChConfig, ChRuntime, GUEST_VSOCK_PORT};
-use crate::guest_client::GuestClient;
+use crate::guest_client::{GuestClient, GuestShell};
 
 /// Which VMM this node runs.
 #[derive(Debug, Clone)]
@@ -135,7 +135,7 @@ impl RuntimeActivity {
     }
 }
 
-struct RuntimeActivityGuard {
+pub(crate) struct RuntimeActivityGuard {
     activity: Arc<RuntimeActivity>,
 }
 
@@ -1134,6 +1134,27 @@ impl NodeRuntime {
         let _guard = activity.acquire()?;
         let mut client = conn.connect()?;
         client.exec(command)
+    }
+
+    pub(crate) fn open_shell(
+        &self,
+        cat_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<(GuestShell, RuntimeActivityGuard)> {
+        let (conn, activity) = {
+            let cats = self.cats.lock().unwrap();
+            let runtime = cats
+                .get(cat_id)
+                .context("cat is not running on this node")?;
+            if runtime.state != ObservedState::Running {
+                bail!("cat is not running (state {:?})", runtime.state);
+            }
+            (runtime.conn(), runtime.activity.clone())
+        };
+        let guard = activity.acquire()?;
+        let shell = conn.connect()?.start_shell(rows, cols)?;
+        Ok((shell, guard))
     }
 
     /// Forward an HTTP GET to the guest web service. Returns the raw HTTP

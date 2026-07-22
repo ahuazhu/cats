@@ -70,6 +70,10 @@ pub enum GuestRequestBody {
         #[serde(default)]
         timeout_ms: Option<u64>,
     },
+    /// Start an interactive login shell attached to a pseudoterminal. After
+    /// `ShellReady`, this control connection switches to `GuestShellFrame`
+    /// messages until the shell exits or the caller closes it.
+    Shell { rows: u16, cols: u16 },
     /// Flush guest filesystems (fake guest: flush volume writers).
     Syncfs,
     /// Read from an attached volume (fake guest block I/O path).
@@ -120,6 +124,7 @@ pub enum GuestResponseBody {
         stdout: String,
         stderr: String,
     },
+    ShellReady,
     Ok,
     Data {
         data_hex: String,
@@ -127,6 +132,20 @@ pub enum GuestResponseBody {
     Error {
         message: String,
     },
+}
+
+/// Bidirectional frames used after a `Shell`/`ShellReady` handshake. They use
+/// the same bounded length-prefixed JSON codec as the control protocol. Raw
+/// PTY bytes remain bytes so terminal escape sequences and UTF-8 fragments
+/// survive without lossy conversion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GuestShellFrame {
+    Input { data: Vec<u8> },
+    Resize { rows: u16, cols: u16 },
+    Output { data: Vec<u8> },
+    Exit { exit_code: i32 },
+    Close,
 }
 
 /// JSON body for `POST /v1/work-leases` on the Guest runtime socket.

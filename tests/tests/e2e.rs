@@ -3,8 +3,9 @@
 //! binary. Covers the minimal production acceptance scenarios from the
 //! architecture doc §20.1 that are meaningful without KVM.
 
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -151,6 +152,39 @@ impl Cluster {
             "cats {args:?} failed:\nstdout: {stdout}\nstderr: {stderr}"
         );
         stdout
+    }
+
+    async fn cli_with_input(&self, args: &[&str], input: &[u8]) -> (bool, String, String) {
+        let bin = self.cli_bin.clone();
+        let api = self.cp.base_url();
+        let args: Vec<String> = args.iter().map(|value| value.to_string()).collect();
+        let input = input.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let mut child = Command::new(bin)
+                .args(&args)
+                .env("CATS_API_URL", api)
+                .env("CATS_TOKEN", ADMIN_TOKEN)
+                .env("CATS_PROJECT", "default")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("run cats CLI");
+            child
+                .stdin
+                .take()
+                .expect("piped stdin")
+                .write_all(&input)
+                .expect("write cats CLI stdin");
+            let output = child.wait_with_output().expect("wait for cats CLI");
+            (
+                output.status.success(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
+        })
+        .await
+        .unwrap()
     }
 
     async fn admin_cli_ok(&self, args: &[&str]) -> String {
@@ -365,6 +399,17 @@ async fn product_loop_end_to_end() {
         .cli_ok(&["exec", "dev", "--", "echo", "hello-from-guest"])
         .await;
     assert_eq!(out.trim(), "hello-from-guest");
+
+    // Interactive shell crosses CLI -> control plane -> node -> guest PTY,
+    // and remains scriptable when stdin/stdout are pipes.
+    let (ok, stdout, stderr) = cluster
+        .cli_with_input(&["shell", "dev"], b"printf 'hello-from-shell\\n'; exit\n")
+        .await;
+    assert!(ok, "cats shell failed:\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("hello-from-shell"),
+        "shell output: {stdout}"
+    );
 
     let cat = cluster.cat_json("dev").await;
     let cat_id = cat["id"].as_str().unwrap().to_string();

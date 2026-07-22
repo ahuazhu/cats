@@ -5,6 +5,7 @@
 
 mod auth;
 mod config;
+mod shell;
 
 use std::time::{Duration, Instant};
 
@@ -100,6 +101,8 @@ pub enum Command {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
+    /// Open an interactive login shell inside the cat.
+    Shell { name: String },
     /// Configure or explain work-driven auto-suspend.
     Sleep {
         #[command(subcommand)]
@@ -566,6 +569,7 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Command::Shell { name } => shell::run(&client.base, &client.project, &client.token, name),
         Command::Sleep { cmd } => {
             let response = match cmd {
                 SleepCommand::On { name } => client.put(
@@ -937,6 +941,10 @@ mod tests {
             Command::Exec { command, .. } => assert_eq!(command, vec!["git", "status"]),
             _ => panic!("wrong parse"),
         }
+        assert!(matches!(
+            Cli::parse_from(["cats", "shell", "dev"]).command,
+            Command::Shell { name } if name == "dev"
+        ));
         let cli = Cli::parse_from(["cats", "mount", "data", "--cat", "dev", "--at", "/data"]);
         assert!(matches!(cli.command, Command::Mount { .. }));
         let cli = Cli::parse_from(["cats", "admin", "node", "drain", "node-a"]);
