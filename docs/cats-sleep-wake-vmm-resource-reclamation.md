@@ -95,9 +95,9 @@ flowchart LR
 
 Suspend 的正确顺序是“停止新活动 → Guest 落盘 → 远端持久点 → VMM pause → RAM page-out”。不能先停 Guest 再希望 Guest 自己执行 sync。
 
-**1. 状态门禁**
+**1. 工作与状态门禁**
 
-Cat generation 进入 Suspending；阻止新的 exec、挂盘和部署；并发 wake/suspend singleflight。
+Cat generation 进入 Suspending；平台工作租约与 Guest 用户程序租约必须为空。Node 关闭 exec/proxy gate，Guest Agent 以 `PrepareSuspend(expected_lease_sequence)` 原子关闭 `/run/cats/runtime.sock` 的新 acquire/renew；阻止新的 exec、挂盘和部署；并发 wake/suspend singleflight。任一新工作使本次 Suspend 被拒绝并恢复 Running。
 
 **2. Guest Quiesce**
 
@@ -630,7 +630,7 @@ Running | Suspended | Warm
 | Scheduler | 释放/调整 CPU run budget，记录 resume commitment | Resume 容量准入；Cold 时重新选 Node |
 | cat-agent | Guest sync、调用 CH pause、pidfd/process_madvise、状态检查 | 调用 resume 或 shutdown；进程、tap、socket、cgroup cleanup |
 | Cloud Hypervisor | 暂停 vCPU/clock/device/hypervisor VM | 按序恢复；Cold 时退出并释放 KVM 状态 |
-| Guest Agent | syncfs、应用 hook、磁盘/服务状态报告 | Ready、session 重建、Cold boot 后 mount/resize 检查 |
+| Guest Agent | `/run/cats/runtime.sock` HTTP 工作租约、sequence/quiesce fence、syncfs、应用 hook、磁盘/服务状态报告 | Ready、重新开放租约 admission、session 重建、Cold boot 后 mount/resize 检查 |
 | cats-blockd | 完成 FLUSH，保留 lease/backend，停止新 Guest I/O 后继续必要后台提交 | Resume 继续；Cold final drain、释放 lease；新 Host 使用新 epoch |
 | NVMe Manager | memory backing quota、page-out 统计、clean cache 淘汰 | Cold 删除 backing 和 staging；密钥清理；Wake 可选预热 |
 | Route Controller | active → sleeping，应用 wake_policy | Wake singleflight；Ready 后发布新 activation epoch |

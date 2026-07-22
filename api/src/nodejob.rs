@@ -24,6 +24,12 @@ pub struct VolumeGrant {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuspendWorkFence {
+    pub control_work_version: i64,
+    pub guest_lease_sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum NodeJobAction {
     /// Start the block backend + VMM + guest for a cat.
@@ -37,7 +43,11 @@ pub enum NodeJobAction {
     /// Flush disks, stop guest/VMM/backends, release runtime state.
     StopCat { cat_id: String },
     /// Pause + page-out (Suspended, ADR-0002).
-    SuspendCat { cat_id: String },
+    SuspendCat {
+        cat_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        work_fence: Option<SuspendWorkFence>,
+    },
     /// Resume a suspended cat.
     ResumeCat { cat_id: String },
     /// Snapshot + VMM/backend exit (Warm, ADR-0002).
@@ -71,7 +81,7 @@ impl NodeJobAction {
         match self {
             NodeJobAction::StartCat { cat_id, .. }
             | NodeJobAction::StopCat { cat_id }
-            | NodeJobAction::SuspendCat { cat_id }
+            | NodeJobAction::SuspendCat { cat_id, .. }
             | NodeJobAction::ResumeCat { cat_id }
             | NodeJobAction::WarmCat { cat_id }
             | NodeJobAction::RestoreCat { cat_id }
@@ -95,7 +105,15 @@ pub struct NodeJob {
 #[serde(rename_all = "snake_case")]
 pub enum JobPhase {
     Succeeded,
+    Rejected,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeJobErrorCode {
+    ActivityChanged,
+    LifecycleFailed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +121,8 @@ pub struct NodeJobResult {
     pub job_id: String,
     pub phase: JobPhase,
     pub observed_state: ObservedState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<NodeJobErrorCode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default)]
@@ -115,6 +135,7 @@ impl NodeJobResult {
             job_id: job_id.into(),
             phase: JobPhase::Succeeded,
             observed_state: observed,
+            error_code: None,
             error: None,
             retryable: false,
         }
@@ -130,8 +151,24 @@ impl NodeJobResult {
             job_id: job_id.into(),
             phase: JobPhase::Failed,
             observed_state: observed,
+            error_code: Some(NodeJobErrorCode::LifecycleFailed),
             error: Some(error.into()),
             retryable,
+        }
+    }
+
+    pub fn rejected(
+        job_id: impl Into<String>,
+        observed: ObservedState,
+        error: impl Into<String>,
+    ) -> Self {
+        Self {
+            job_id: job_id.into(),
+            phase: JobPhase::Rejected,
+            observed_state: observed,
+            error_code: Some(NodeJobErrorCode::ActivityChanged),
+            error: Some(error.into()),
+            retryable: true,
         }
     }
 }

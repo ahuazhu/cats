@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
-use cats_api::nodejob::{NodeJob, NodeJobAction, NodeJobResult, VolumeGrant};
+use cats_api::nodejob::{NodeJob, NodeJobAction, NodeJobResult, SuspendWorkFence, VolumeGrant};
 use cats_api::resources::{NodeTelemetry, ObservedState};
 use cats_guest_agent::DiskMapEntry;
 use cats_storage::{AdapterSelection, MetadataStore};
@@ -73,8 +73,73 @@ struct CatRuntime {
     /// Short bind paths (see `short_socket_path`).
     ctl_sock: PathBuf,
     web_sock: PathBuf,
+    runtime_sock: PathBuf,
+    activity: Arc<RuntimeActivity>,
     /// Present only in Cloud Hypervisor mode.
     ch: Option<ChRuntime>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("activity changed while preparing to suspend")]
+struct ActivityChanged;
+
+#[derive(Default)]
+struct RuntimeActivityInner {
+    sequence: u64,
+    active: u32,
+    quiescing: bool,
+}
+
+#[derive(Default)]
+struct RuntimeActivity {
+    inner: Mutex<RuntimeActivityInner>,
+}
+
+impl RuntimeActivity {
+    fn acquire(self: &Arc<Self>) -> Result<RuntimeActivityGuard> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.quiescing {
+            inner.sequence = inner.sequence.saturating_add(1);
+            return Err(ActivityChanged.into());
+        }
+        inner.active = inner.active.saturating_add(1);
+        inner.sequence = inner.sequence.saturating_add(1);
+        Ok(RuntimeActivityGuard {
+            activity: self.clone(),
+        })
+    }
+
+    fn prepare(&self) -> Result<u64> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.quiescing || inner.active != 0 {
+            return Err(ActivityChanged.into());
+        }
+        inner.quiescing = true;
+        Ok(inner.sequence)
+    }
+
+    fn unchanged_since(&self, sequence: u64) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.quiescing && inner.active == 0 && inner.sequence == sequence
+    }
+
+    fn open(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.quiescing = false;
+        inner.sequence = inner.sequence.saturating_add(1);
+    }
+}
+
+struct RuntimeActivityGuard {
+    activity: Arc<RuntimeActivity>,
+}
+
+impl Drop for RuntimeActivityGuard {
+    fn drop(&mut self) {
+        let mut inner = self.activity.inner.lock().unwrap();
+        inner.active = inner.active.saturating_sub(1);
+        inner.sequence = inner.sequence.saturating_add(1);
+    }
 }
 
 /// How to reach a cat's guest agent (cloneable so locks can be dropped
@@ -107,6 +172,9 @@ impl CatRuntime {
     }
     fn web_socket(&self) -> PathBuf {
         self.web_sock.clone()
+    }
+    fn runtime_socket(&self) -> PathBuf {
+        self.runtime_sock.clone()
     }
     fn disk_map_path(&self) -> PathBuf {
         self.dir.join("disk-map.json")
@@ -168,6 +236,27 @@ impl NodeRuntime {
             .collect()
     }
 
+    /// Running guests watched by the event-driven work-status loop.
+    pub fn activity_targets(&self) -> Vec<(String, i64, GuestConn)> {
+        self.cats
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, runtime)| runtime.state == ObservedState::Running)
+            .map(|(id, runtime)| (id.clone(), runtime.generation, runtime.conn()))
+            .collect()
+    }
+
+    /// FakeVmm/testing access to the guest-local user work API.
+    pub fn runtime_socket_for(&self, cat_id: &str) -> Option<PathBuf> {
+        self.cats
+            .lock()
+            .unwrap()
+            .get(cat_id)
+            .filter(|runtime| runtime.ch.is_none())
+            .map(CatRuntime::runtime_socket)
+    }
+
     /// Allocation telemetry reported with heartbeats. These values come from
     /// the runtime inventory (actual node ownership), not control-plane intent.
     pub fn telemetry(&self) -> NodeTelemetry {
@@ -192,11 +281,28 @@ impl NodeRuntime {
         let job_id = job.job_id.clone();
         let cat_id = job.action.cat_id().to_string();
         let result = match self.run_action(&job) {
-            Ok(observed) => NodeJobResult::ok(&job_id, observed),
+            Ok(observed) => {
+                if let Some(runtime) = self.cats.lock().unwrap().get_mut(&cat_id) {
+                    runtime.generation = job.cat_generation;
+                }
+                NodeJobResult::ok(&job_id, observed)
+            }
             Err(e) => {
                 tracing::warn!(job = %job_id, "job failed: {e:#}");
                 let observed = self.observed_of(&cat_id);
-                NodeJobResult::fail(&job_id, observed, format!("{e:#}"), true)
+                if e.downcast_ref::<ActivityChanged>().is_some()
+                    || format!("{e:#}").contains("activity_changed")
+                {
+                    // A rejected suspend still consumed this lifecycle job:
+                    // keep the work-status watcher on the control-plane
+                    // generation used for cancellation/retry.
+                    if let Some(runtime) = self.cats.lock().unwrap().get_mut(&cat_id) {
+                        runtime.generation = job.cat_generation;
+                    }
+                    NodeJobResult::rejected(&job_id, observed, format!("{e:#}"))
+                } else {
+                    NodeJobResult::fail(&job_id, observed, format!("{e:#}"), true)
+                }
             }
         };
         self.journal.lock().unwrap().insert(job_id, result.clone());
@@ -229,7 +335,9 @@ impl NodeRuntime {
                 false,
             ),
             NodeJobAction::StopCat { cat_id } => self.stop_cat(cat_id, true),
-            NodeJobAction::SuspendCat { cat_id } => self.suspend_cat(cat_id),
+            NodeJobAction::SuspendCat { cat_id, work_fence } => {
+                self.suspend_cat(cat_id, work_fence.as_ref())
+            }
             NodeJobAction::ResumeCat { cat_id } => self.resume_cat(cat_id),
             NodeJobAction::WarmCat { cat_id } => self.warm_cat(cat_id),
             NodeJobAction::RestoreCat { cat_id } => self.restore_cat(cat_id, job.cat_generation),
@@ -280,6 +388,7 @@ impl NodeRuntime {
 
         let ctl_sock = short_socket_path(&self.cfg.state_dir, cat_id, "ctl");
         let web_sock = short_socket_path(&self.cfg.state_dir, cat_id, "web");
+        let runtime_sock = short_socket_path(&self.cfg.state_dir, cat_id, "runtime");
         symlink_socket(&dir.join("ctl.sock"), &ctl_sock);
         symlink_socket(&dir.join("web.sock"), &web_sock);
         let mut rt = CatRuntime {
@@ -294,6 +403,8 @@ impl NodeRuntime {
             dir: dir.clone(),
             ctl_sock,
             web_sock,
+            runtime_sock,
+            activity: Arc::new(RuntimeActivity::default()),
             ch: None,
         };
 
@@ -388,6 +499,8 @@ impl NodeRuntime {
             dir: dir.clone(),
             ctl_sock: short_socket_path(&self.cfg.state_dir, cat_id, "ctl"),
             web_sock: short_socket_path(&self.cfg.state_dir, cat_id, "web"),
+            runtime_sock: short_socket_path(&self.cfg.state_dir, cat_id, "runtime"),
+            activity: Arc::new(RuntimeActivity::default()),
             ch: None,
         };
 
@@ -583,6 +696,11 @@ impl NodeRuntime {
             .arg(rt.disk_map_path())
             .arg("--web-socket")
             .arg(rt.web_socket())
+            // FakeVmm runs the Guest Agent as a host process, so the Node
+            // supplies an isolated test socket. A real VMM never opens the
+            // Guest's /run/cats/runtime.sock.
+            .arg("--runtime-socket")
+            .arg(rt.runtime_socket())
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(rt.dir.join("guest.log")).context("create guest log")?);
         if let Some(sf) = state_file {
@@ -669,6 +787,7 @@ impl NodeRuntime {
         }
         let _ = std::fs::remove_file(rt.ctl_socket());
         let _ = std::fs::remove_file(rt.web_socket());
+        let _ = std::fs::remove_file(rt.runtime_socket());
         rt.state = ObservedState::Cold;
     }
 
@@ -676,29 +795,94 @@ impl NodeRuntime {
     // Suspend / resume (pause + page-out analog)
     // ------------------------------------------------------------------
 
-    fn suspend_cat(&self, cat_id: &str) -> Result<ObservedState> {
-        let mut cats = self.cats.lock().unwrap();
-        let rt = cats
-            .get_mut(cat_id)
-            .context("cat is not running on this node")?;
-        if rt.state == ObservedState::Suspended {
-            return Ok(ObservedState::Suspended);
-        }
-        if rt.state != ObservedState::Running {
-            bail!("cannot suspend from {:?}", rt.state);
-        }
-        // ADR-0002 order: quiesce + durable flush BEFORE pausing.
-        let mut client = rt.conn().connect()?;
-        client.syncfs()?;
-        match &rt.ch {
-            Some(chrt) => ch::pause(&chrt.api_sock)?,
-            None => {
-                let guest = rt.guest.as_ref().context("guest process missing")?;
-                signal(guest, libc::SIGSTOP);
+    fn suspend_cat(
+        &self,
+        cat_id: &str,
+        work_fence: Option<&SuspendWorkFence>,
+    ) -> Result<ObservedState> {
+        let (conn, activity) = {
+            let cats = self.cats.lock().unwrap();
+            let rt = cats
+                .get(cat_id)
+                .context("cat is not running on this node")?;
+            if rt.state == ObservedState::Suspended {
+                return Ok(ObservedState::Suspended);
+            }
+            if rt.state != ObservedState::Running {
+                bail!("cannot suspend from {:?}", rt.state);
+            }
+            (rt.conn(), rt.activity.clone())
+        };
+
+        // Close the Node proxy/exec gate before asking the Guest Agent to
+        // close its user-work gate. Any rejected arrival increments the local
+        // sequence and cancels this suspend.
+        let node_sequence = activity.prepare()?;
+        let attempt = (|| -> Result<()> {
+            let mut client = conn.connect()?;
+            let expected_guest_sequence = match work_fence {
+                Some(fence) => fence.guest_lease_sequence,
+                None => client.work_status(None, 0)?.lease_sequence,
+            };
+            client.prepare_suspend(expected_guest_sequence)?;
+
+            // ADR-0002 order: quiesce + durable FLUSH before pausing.
+            client.syncfs()?;
+            let guest_status = client.work_status(None, 0)?;
+            if guest_status.lease_sequence != expected_guest_sequence
+                || !activity.unchanged_since(node_sequence)
+            {
+                let _ = client.abort_suspend();
+                return Err(ActivityChanged.into());
+            }
+
+            let mut cats = self.cats.lock().unwrap();
+            let rt = cats
+                .get_mut(cat_id)
+                .context("cat vanished during suspend")?;
+            if rt.state != ObservedState::Running {
+                let _ = client.abort_suspend();
+                return Err(ActivityChanged.into());
+            }
+            match &rt.ch {
+                Some(chrt) => ch::pause(&chrt.api_sock)?,
+                None => {
+                    let guest = rt.guest.as_ref().context("guest process missing")?;
+                    signal(guest, libc::SIGSTOP);
+                }
+            }
+            rt.state = ObservedState::Suspended;
+            drop(cats);
+
+            // A proxy/exec can arrive in the tiny pause window. It never
+            // enters the guest, but it does invalidate the gate. Resume now;
+            // the control plane will retry after the work event is visible.
+            if !activity.unchanged_since(node_sequence) {
+                let mut cats = self.cats.lock().unwrap();
+                let rt = cats.get_mut(cat_id).context("cat vanished after pause")?;
+                match &rt.ch {
+                    Some(chrt) => ch::resume(&chrt.api_sock)?,
+                    None => {
+                        let guest = rt.guest.as_ref().context("guest process missing")?;
+                        signal(guest, libc::SIGCONT);
+                    }
+                }
+                rt.state = ObservedState::Running;
+                drop(cats);
+                let mut resumed = conn.connect()?;
+                let _ = resumed.abort_suspend();
+                return Err(ActivityChanged.into());
+            }
+            Ok(())
+        })();
+
+        if attempt.is_err() {
+            activity.open();
+            if let Ok(mut client) = conn.connect() {
+                let _ = client.abort_suspend();
             }
         }
-        rt.state = ObservedState::Suspended;
-        Ok(ObservedState::Suspended)
+        attempt.map(|()| ObservedState::Suspended)
     }
 
     fn resume_cat(&self, cat_id: &str) -> Result<ObservedState> {
@@ -729,6 +913,12 @@ impl NodeRuntime {
         let mut cats = self.cats.lock().unwrap();
         let rt = cats.get_mut(cat_id).context("cat vanished during resume")?;
         rt.state = ObservedState::Running;
+        rt.activity.open();
+        let conn = rt.conn();
+        drop(cats);
+        if let Ok(mut client) = conn.connect() {
+            let _ = client.abort_suspend();
+        }
         Ok(ObservedState::Running)
     }
 
@@ -836,6 +1026,15 @@ impl NodeRuntime {
         // fake VMM re-acquires the volume leases; the production vhost
         // implementation keeps the lease alive across Warm instead.
         let observed = self.start_cat(cat_id, generation, volumes, cpus, memory_mib, true)?;
+        // A real VMM snapshot preserves the Guest Agent's quiescing bit.
+        // Restoring is a committed wake, so reopen the Guest-side admission
+        // gate before reporting Running. FakeVmm restores a fresh registry;
+        // AbortSuspend is harmless there too.
+        if let Some(conn) = self.cats.lock().unwrap().get(cat_id).map(CatRuntime::conn) {
+            if let Ok(mut client) = conn.connect() {
+                client.abort_suspend()?;
+            }
+        }
         let now_boot = self
             .cats
             .lock()
@@ -854,6 +1053,15 @@ impl NodeRuntime {
     // ------------------------------------------------------------------
 
     fn attach_disk(&self, cat_id: &str, grant: VolumeGrant) -> Result<ObservedState> {
+        let activity = self
+            .cats
+            .lock()
+            .unwrap()
+            .get(cat_id)
+            .context("cat is not running on this node")?
+            .activity
+            .clone();
+        let _activity = activity.acquire()?;
         let mut cats = self.cats.lock().unwrap();
         let rt = cats
             .get_mut(cat_id)
@@ -878,6 +1086,15 @@ impl NodeRuntime {
     }
 
     fn detach_disk(&self, cat_id: &str, disk_id: &str) -> Result<ObservedState> {
+        let activity = self
+            .cats
+            .lock()
+            .unwrap()
+            .get(cat_id)
+            .context("cat is not running on this node")?
+            .activity
+            .clone();
+        let _activity = activity.acquire()?;
         let mut cats = self.cats.lock().unwrap();
         let rt = cats
             .get_mut(cat_id)
@@ -901,7 +1118,7 @@ impl NodeRuntime {
     // ------------------------------------------------------------------
 
     pub fn exec(&self, cat_id: &str, command: Vec<String>) -> Result<(i32, String, String)> {
-        let conn = {
+        let (conn, activity) = {
             let cats = self.cats.lock().unwrap();
             let rt = cats
                 .get(cat_id)
@@ -909,8 +1126,9 @@ impl NodeRuntime {
             if rt.state != ObservedState::Running {
                 bail!("cat is not running (state {:?})", rt.state);
             }
-            rt.conn()
+            (rt.conn(), rt.activity.clone())
         };
+        let _guard = activity.acquire()?;
         let mut client = conn.connect()?;
         client.exec(command)
     }
@@ -920,14 +1138,15 @@ impl NodeRuntime {
     /// here — the gateway treats that as a stale route (409).
     pub fn proxy_get(&self, cat_id: &str, path: &str) -> Result<Vec<u8>> {
         use std::io::{Read, Write};
-        let web = {
+        let (web, activity) = {
             let cats = self.cats.lock().unwrap();
             let rt = cats.get(cat_id).context("cat is not active on this node")?;
             if rt.state != ObservedState::Running {
                 bail!("cat is not active on this node (state {:?})", rt.state);
             }
-            rt.web_socket()
+            (rt.web_socket(), rt.activity.clone())
         };
+        let _guard = activity.acquire()?;
         let mut stream = std::os::unix::net::UnixStream::connect(&web)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         write!(

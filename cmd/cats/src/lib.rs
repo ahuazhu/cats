@@ -64,6 +64,9 @@ pub enum Command {
         disk_size: String,
         #[arg(long, default_value = "/data")]
         mount_at: String,
+        /// Suspend immediately whenever the distributed work count reaches 0.
+        #[arg(long)]
+        auto_suspend: bool,
     },
     /// List cats.
     Ls,
@@ -87,6 +90,11 @@ pub enum Command {
         /// Command argv, after `--`.
         #[arg(last = true, required = true)]
         command: Vec<String>,
+    },
+    /// Configure or explain work-driven auto-suspend.
+    Sleep {
+        #[command(subcommand)]
+        cmd: SleepCommand,
     },
     /// Disk management.
     Disk {
@@ -130,6 +138,13 @@ pub enum Command {
         #[command(subcommand)]
         cmd: AdminCommand,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SleepCommand {
+    On { name: String },
+    Off { name: String },
+    Status { name: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -289,6 +304,10 @@ impl Client {
         self.send(req)
     }
 
+    fn put(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
+        self.send(self.http.put(self.url(path)).json(&body))
+    }
+
     fn wait_operation(&self, op_id: &str) -> Result<Operation> {
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
@@ -316,12 +335,13 @@ fn print_cat(cat: &Cat, json_mode: bool) {
         println!("{}", serde_json::to_string_pretty(cat).unwrap());
     } else {
         println!(
-            "{:<16} {:>4} cpu {:>6} MiB  desired={:<9} observed={:<9} node={}",
+            "{:<16} {:>4} cpu {:>6} MiB  desired={:<9} observed={:<9} auto-suspend={} node={}",
             cat.name,
             cat.spec.cpus,
             cat.spec.memory_mib,
             format!("{:?}", cat.desired_state).to_lowercase(),
             format!("{:?}", cat.observed_state).to_lowercase(),
+            if cat.auto_suspend { "on" } else { "off" },
             cat.node_id.as_deref().unwrap_or("-")
         );
     }
@@ -362,6 +382,7 @@ pub fn run(cli: Cli) -> Result<()> {
             disk,
             disk_size,
             mount_at,
+            auto_suspend,
         } => {
             let body = CreateCatRequest {
                 name: name.clone(),
@@ -382,7 +403,14 @@ pub fn run(cli: Cli) -> Result<()> {
                     .header("Idempotency-Key", &idem)
                     .json(&body),
             )?;
-            mutate(resp)
+            mutate(resp)?;
+            if *auto_suspend {
+                let _: AutoSuspendResponse = serde_json::from_value(client.put(
+                    &format!("/cats/{name}/auto-suspend"),
+                    json!({ "enabled": true }),
+                )?)?;
+            }
+            Ok(())
         }
         Command::Ls => {
             let v = client.get("/cats")?;
@@ -433,6 +461,35 @@ pub fn run(cli: Cli) -> Result<()> {
             eprint!("{}", out.stderr);
             if out.exit_code != 0 {
                 bail!("command exited with {}", out.exit_code);
+            }
+            Ok(())
+        }
+        Command::Sleep { cmd } => {
+            let response = match cmd {
+                SleepCommand::On { name } => client.put(
+                    &format!("/cats/{name}/auto-suspend"),
+                    json!({ "enabled": true }),
+                )?,
+                SleepCommand::Off { name } => client.put(
+                    &format!("/cats/{name}/auto-suspend"),
+                    json!({ "enabled": false }),
+                )?,
+                SleepCommand::Status { name } => {
+                    let work: CatWorkStatus =
+                        serde_json::from_value(client.get(&format!("/cats/{name}/work"))?)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&work)?);
+                    } else {
+                        print_work_status(&work);
+                    }
+                    return Ok(());
+                }
+            };
+            let response: AutoSuspendResponse = serde_json::from_value(response)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                print_work_status(&response.work);
             }
             Ok(())
         }
@@ -518,6 +575,27 @@ pub fn run(cli: Cli) -> Result<()> {
             }
         },
         Command::Admin { cmd } => run_admin(&client, &cli, cmd),
+    }
+}
+
+fn print_work_status(work: &CatWorkStatus) {
+    println!(
+        "auto-suspend={} work={} guest-signal={} eligible={} reason={}",
+        if work.auto_suspend { "on" } else { "off" },
+        work.active_work_count,
+        if work.guest_signal_fresh {
+            "fresh"
+        } else {
+            "stale"
+        },
+        work.can_suspend_now,
+        work.reason
+    );
+    for lease in &work.leases {
+        println!(
+            "  {:?} {} label={} expires_at_ms={}",
+            lease.kind, lease.id, lease.label, lease.expires_at_unix_ms
+        );
     }
 }
 

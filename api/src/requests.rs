@@ -8,7 +8,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::resources::{Cat, Disk, Endpoint, NodeTelemetry, Operation, WakePolicy};
+use crate::guest::GuestWorkLease;
+use crate::resources::{
+    Cat, CatWorkStatus, Disk, Endpoint, NodeTelemetry, Operation, WakePolicy, WorkKind, WorkLease,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateCatRequest {
@@ -93,6 +96,50 @@ pub struct ExecResponse {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateAutoSuspendRequest {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoSuspendResponse {
+    pub cat: Cat,
+    pub work: CatWorkStatus,
+}
+
+/// Internal platform work lease. Gateway and exec acquire before waking or
+/// entering the guest, then release on every completion/error path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcquireWorkRequest {
+    pub cat_id: String,
+    pub kind: WorkKind,
+    pub owner_id: String,
+    pub label: String,
+    pub ttl_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcquireWorkResponse {
+    pub lease: WorkLease,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseWorkRequest {
+    pub lease_id: String,
+}
+
+/// Event-driven Guest lease update from the owning Node Agent. A periodic
+/// identical update refreshes freshness and repairs a lost event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeWorkStatusRequest {
+    pub node_id: String,
+    pub cat_id: String,
+    pub generation: i64,
+    pub guest_source_epoch: String,
+    pub guest_lease_sequence: u64,
+    pub leases: Vec<GuestWorkLease>,
 }
 
 /// Response wrapper for mutations: the operation plus the (possibly still

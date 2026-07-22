@@ -68,6 +68,9 @@ impl Controller {
     pub async fn tick(&self) -> anyhow::Result<()> {
         self.fence_lost_nodes().await?;
         self.drain_nodes().await?;
+        for cat_id in self.store.auto_suspend_candidates()? {
+            self.maybe_auto_suspend(&cat_id)?;
+        }
         let cats = self.store.cats_needing_work()?;
         for cat in cats {
             if let Err(e) = self.reconcile_cat(&cat).await {
@@ -75,6 +78,20 @@ impl Controller {
             }
         }
         Ok(())
+    }
+
+    /// Event/tick entry for the work-driven policy. The Store transaction is
+    /// the linearization point for `work_count == 0 -> desired Suspended`.
+    pub fn maybe_auto_suspend(&self, cat_id: &str) -> crate::store::Result<bool> {
+        let operation = self
+            .store
+            .try_auto_suspend(cat_id, self.node_lease_timeout_ms)?;
+        if operation.is_some() {
+            self.notify.notify_one();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     // ------------------------------------------------------------------
@@ -314,6 +331,7 @@ impl Controller {
                 "suspend" => (
                     NodeJobAction::SuspendCat {
                         cat_id: cat.id.clone(),
+                        work_fence: Some(self.store.suspend_work_fence(&cat.id)?),
                     },
                     ObservedState::Suspending,
                     ObservedState::Suspended,
@@ -349,12 +367,22 @@ impl Controller {
         };
         match self.dispatch(&node.agent_url, &job).await {
             Ok(res) if res.phase == JobPhase::Succeeded => {
-                self.store.set_observed(&cat.id, target)?;
-                if target == ObservedState::Running {
+                let recorded = self
+                    .store
+                    .finish_transition(&cat.id, transitional, target)?;
+                if recorded && target == ObservedState::Running {
                     self.store
                         .publish_routes(&cat.id, &node.id, &node.gateway_url)?;
                 }
                 self.complete_ops_if_converged(&cat.id).await?;
+                self.notify.notify_one();
+                Ok(())
+            }
+            Ok(res) if res.phase == JobPhase::Rejected && action == "suspend" => {
+                tracing::info!(cat = %cat.id, "suspend cancelled because work changed");
+                self.store
+                    .cancel_rejected_suspend(&cat.id, cat.generation)?;
+                self.notify.notify_one();
                 Ok(())
             }
             other => {

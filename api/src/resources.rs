@@ -64,9 +64,52 @@ pub struct Cat {
     pub observed_state: ObservedState,
     /// Monotonic; bumped on every desired-state/spec mutation.
     pub generation: i64,
+    /// Work-driven auto-suspend. When enabled, the last work lease release
+    /// immediately requests Suspended; there is no business idle timeout.
+    #[serde(default)]
+    pub auto_suspend: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
     pub created_at_unix: i64,
+}
+
+/// Sources that can hold a Cat Running. Guest leases are created explicitly
+/// by user programs; the Guest Agent never infers them from resource usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkKind {
+    Gateway,
+    Exec,
+    Guest,
+    Pin,
+    Control,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkLease {
+    pub id: String,
+    pub cat_id: String,
+    pub kind: WorkKind,
+    pub owner_id: String,
+    pub label: String,
+    pub expires_at_unix_ms: i64,
+}
+
+/// Explainable work state exposed to users and used by the auto-suspend
+/// controller. `can_suspend_now` means the control-plane snapshot is eligible;
+/// the Node/Guest quiesce barrier is still the final arbiter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatWorkStatus {
+    pub cat_id: String,
+    pub auto_suspend: bool,
+    pub work_version: i64,
+    pub active_work_count: u32,
+    pub leases: Vec<WorkLease>,
+    pub guest_signal_fresh: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_signal_age_ms: Option<u64>,
+    pub can_suspend_now: bool,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

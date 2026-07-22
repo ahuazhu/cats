@@ -1,11 +1,11 @@
 //! Cats guest agent.
 //!
-//! In production this process is PID-1-adjacent inside the guest and speaks
-//! the length-prefixed JSON protocol over AF_VSOCK. Under the FakeVmm it is
-//! an ordinary host process speaking the same protocol over a unix socket,
-//! and its "virtio disks" are NBD connections to per-attachment
-//! `cats-blockd` sockets — so every block byte still flows through the real
-//! storage engine.
+//! In production this process is PID-1-adjacent inside the guest. Host control
+//! uses the length-prefixed JSON protocol over AF_VSOCK; Guest user programs
+//! use HTTP/1.1 on `/run/cats/runtime.sock`. Under the FakeVmm it is an
+//! ordinary host process with isolated Unix sockets, and its "virtio disks"
+//! are NBD connections to per-attachment `cats-blockd` sockets — so every
+//! block byte still flows through the real storage engine.
 //!
 //! Identity: `boot_id` is created fresh at cold boot and restored from the
 //! state file on Warm restore. This is the same correctness oracle the
@@ -16,14 +16,17 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
-use std::time::Instant;
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use cats_api::guest::{
-    GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody, MAX_FRAME_BYTES,
+    AcquireGuestWorkLeaseRequest, GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody,
+    GuestRuntimeApiError, GuestRuntimeApiErrorResponse, GuestWorkLease, GuestWorkStatus,
+    RenewGuestWorkLeaseRequest, GUEST_WORK_LEASES_PATH, MAX_FRAME_BYTES, MAX_WORK_LEASES,
+    MAX_WORK_LEASE_TTL_MS,
 };
 use cats_blockd::nbd::NbdClient;
 
@@ -52,6 +55,226 @@ pub fn read_frame<R: Read, T: for<'a> Deserialize<'a>>(r: &mut R) -> std::io::Re
     let mut body = vec![0u8; len as usize];
     r.read_exact(&mut body)?;
     serde_json::from_slice(&body).map_err(std::io::Error::other)
+}
+
+// ---------------------------------------------------------------------------
+// Guest runtime HTTP/1.1 over Unix socket.
+// ---------------------------------------------------------------------------
+
+const MAX_WORK_HTTP_HEADER_BYTES: usize = 16 * 1024;
+const MAX_WORK_HTTP_BODY_BYTES: usize = 64 * 1024;
+
+struct WorkHttpRequest {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+}
+
+struct WorkHttpResponse {
+    status: u16,
+    reason: &'static str,
+    content_type: Option<&'static str>,
+    body: Vec<u8>,
+    location: Option<String>,
+}
+
+impl WorkHttpResponse {
+    fn json<T: Serialize>(status: u16, reason: &'static str, value: &T) -> Self {
+        Self {
+            status,
+            reason,
+            content_type: Some("application/json"),
+            body: serde_json::to_vec(value).expect("Guest runtime response is JSON serializable"),
+            location: None,
+        }
+    }
+
+    fn empty(status: u16, reason: &'static str) -> Self {
+        Self {
+            status,
+            reason,
+            content_type: None,
+            body: Vec::new(),
+            location: None,
+        }
+    }
+
+    fn error(status: u16, reason: &'static str, code: &str, message: impl Into<String>) -> Self {
+        Self::json(
+            status,
+            reason,
+            &GuestRuntimeApiErrorResponse {
+                error: GuestRuntimeApiError {
+                    code: code.into(),
+                    message: message.into(),
+                },
+            },
+        )
+    }
+
+    fn with_location(mut self, location: String) -> Self {
+        self.location = Some(location);
+        self
+    }
+
+    fn write_to(&self, stream: &mut impl Write) -> std::io::Result<()> {
+        write!(
+            stream,
+            "HTTP/1.1 {} {}\r\ncontent-length: {}\r\nconnection: close\r\ncache-control: no-store\r\n",
+            self.status,
+            self.reason,
+            self.body.len()
+        )?;
+        if let Some(content_type) = self.content_type {
+            write!(stream, "content-type: {content_type}\r\n")?;
+        }
+        if let Some(location) = &self.location {
+            write!(stream, "location: {location}\r\n")?;
+        }
+        write!(stream, "\r\n")?;
+        stream.write_all(&self.body)?;
+        stream.flush()
+    }
+}
+
+fn header_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn read_work_http_request(
+    stream: &mut impl Read,
+) -> std::result::Result<WorkHttpRequest, WorkHttpResponse> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let end = loop {
+        if let Some(end) = header_end(&bytes) {
+            break end;
+        }
+        if bytes.len() >= MAX_WORK_HTTP_HEADER_BYTES {
+            return Err(WorkHttpResponse::error(
+                431,
+                "Request Header Fields Too Large",
+                "headers_too_large",
+                "HTTP headers exceed 16 KiB",
+            ));
+        }
+        let read = stream.read(&mut chunk).map_err(|error| {
+            WorkHttpResponse::error(400, "Bad Request", "read_failed", error.to_string())
+        })?;
+        if read == 0 {
+            return Err(WorkHttpResponse::error(
+                400,
+                "Bad Request",
+                "incomplete_headers",
+                "connection closed before the HTTP headers completed",
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    };
+    if end > MAX_WORK_HTTP_HEADER_BYTES {
+        return Err(WorkHttpResponse::error(
+            431,
+            "Request Header Fields Too Large",
+            "headers_too_large",
+            "HTTP headers exceed 16 KiB",
+        ));
+    }
+
+    let head = std::str::from_utf8(&bytes[..end]).map_err(|_| {
+        WorkHttpResponse::error(
+            400,
+            "Bad Request",
+            "invalid_headers",
+            "HTTP headers must be UTF-8/ASCII",
+        )
+    })?;
+    let mut lines = head.split("\r\n");
+    let request_line = lines.next().unwrap_or_default();
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts.next().unwrap_or_default().to_string();
+    let path = request_parts.next().unwrap_or_default().to_string();
+    let version = request_parts.next().unwrap_or_default();
+    if method.is_empty()
+        || path.is_empty()
+        || !matches!(version, "HTTP/1.0" | "HTTP/1.1")
+        || request_parts.next().is_some()
+    {
+        return Err(WorkHttpResponse::error(
+            400,
+            "Bad Request",
+            "invalid_request_line",
+            "expected METHOD PATH HTTP/1.1",
+        ));
+    }
+
+    let mut content_length = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(WorkHttpResponse::error(
+                400,
+                "Bad Request",
+                "invalid_header",
+                "HTTP header is missing ':'",
+            ));
+        };
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(WorkHttpResponse::error(
+                400,
+                "Bad Request",
+                "unsupported_transfer_encoding",
+                "chunked request bodies are not supported on the local runtime socket",
+            ));
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                return Err(WorkHttpResponse::error(
+                    400,
+                    "Bad Request",
+                    "duplicate_content_length",
+                    "Content-Length may appear only once",
+                ));
+            }
+            content_length = Some(value.trim().parse::<usize>().map_err(|_| {
+                WorkHttpResponse::error(
+                    400,
+                    "Bad Request",
+                    "invalid_content_length",
+                    "Content-Length must be a non-negative integer",
+                )
+            })?);
+        }
+    }
+
+    let content_length = content_length.unwrap_or(0);
+    if content_length > MAX_WORK_HTTP_BODY_BYTES {
+        return Err(WorkHttpResponse::error(
+            413,
+            "Content Too Large",
+            "body_too_large",
+            "HTTP body exceeds 64 KiB",
+        ));
+    }
+    let body_start = end + 4;
+    while bytes.len().saturating_sub(body_start) < content_length {
+        let read = stream.read(&mut chunk).map_err(|error| {
+            WorkHttpResponse::error(400, "Bad Request", "read_failed", error.to_string())
+        })?;
+        if read == 0 {
+            return Err(WorkHttpResponse::error(
+                400,
+                "Bad Request",
+                "incomplete_body",
+                "connection closed before Content-Length bytes arrived",
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+
+    Ok(WorkHttpRequest {
+        method,
+        path,
+        body: bytes[body_start..body_start + content_length].to_vec(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +329,236 @@ pub struct GuestAgent {
     /// Monotonic counter surviving Warm (proves process-state continuity).
     counter: AtomicU64,
     volumes: Mutex<HashMap<String, NbdClient>>,
+    work: WorkRegistry,
+}
+
+struct WorkLeaseEntry {
+    id: String,
+    label: String,
+    expires_at: Instant,
+}
+
+struct WorkInner {
+    source_epoch: String,
+    lease_sequence: u64,
+    quiescing: bool,
+    leases: HashMap<String, WorkLeaseEntry>,
+}
+
+struct WorkRegistry {
+    inner: Mutex<WorkInner>,
+    changed: Condvar,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum WorkRegistryError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("activity_changed: Cat is preparing to suspend; retry")]
+    ActivityChanged,
+    #[error("work lease {0} not found")]
+    NotFound(String),
+    #[error("too many work leases")]
+    Capacity,
+}
+
+impl WorkRegistry {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(WorkInner {
+                source_epoch: uuid::Uuid::new_v4().simple().to_string(),
+                lease_sequence: 0,
+                quiescing: false,
+                leases: HashMap::new(),
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn prune(inner: &mut WorkInner) -> bool {
+        let before = inner.leases.len();
+        let now = Instant::now();
+        inner.leases.retain(|_, lease| lease.expires_at > now);
+        if inner.leases.len() != before {
+            inner.lease_sequence = inner.lease_sequence.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn status_of(inner: &WorkInner) -> GuestWorkStatus {
+        let now = Instant::now();
+        let mut leases: Vec<GuestWorkLease> = inner
+            .leases
+            .values()
+            .map(|lease| GuestWorkLease {
+                id: lease.id.clone(),
+                label: lease.label.clone(),
+                remaining_ttl_ms: lease
+                    .expires_at
+                    .saturating_duration_since(now)
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            })
+            .collect();
+        leases.sort_by(|a, b| a.id.cmp(&b.id));
+        GuestWorkStatus {
+            source_epoch: inner.source_epoch.clone(),
+            lease_sequence: inner.lease_sequence,
+            quiescing: inner.quiescing,
+            leases,
+        }
+    }
+
+    fn status(&self, after_sequence: Option<u64>, wait_timeout_ms: u64) -> GuestWorkStatus {
+        let max_wait = Duration::from_millis(wait_timeout_ms.min(30_000));
+        let deadline = Instant::now() + max_wait;
+        let mut inner = self.inner.lock().unwrap();
+        if Self::prune(&mut inner) {
+            self.changed.notify_all();
+        }
+        while after_sequence == Some(inner.lease_sequence) && Instant::now() < deadline {
+            let until_expiry = inner
+                .leases
+                .values()
+                .map(|lease| lease.expires_at.saturating_duration_since(Instant::now()))
+                .min()
+                .unwrap_or_else(|| deadline.saturating_duration_since(Instant::now()));
+            let wait = until_expiry
+                .min(deadline.saturating_duration_since(Instant::now()))
+                .max(Duration::from_millis(1));
+            let (next, _) = self.changed.wait_timeout(inner, wait).unwrap();
+            inner = next;
+            if Self::prune(&mut inner) {
+                self.changed.notify_all();
+            }
+        }
+        Self::status_of(&inner)
+    }
+
+    fn acquire(
+        &self,
+        label: String,
+        ttl_ms: u64,
+    ) -> std::result::Result<GuestWorkLease, WorkRegistryError> {
+        validate_label(&label)?;
+        validate_ttl(ttl_ms)?;
+        let mut inner = self.inner.lock().unwrap();
+        Self::prune(&mut inner);
+        if inner.quiescing {
+            inner.lease_sequence = inner.lease_sequence.saturating_add(1);
+            self.changed.notify_all();
+            return Err(WorkRegistryError::ActivityChanged);
+        }
+        if inner.leases.len() >= MAX_WORK_LEASES {
+            return Err(WorkRegistryError::Capacity);
+        }
+        let id = format!("work_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+        inner.leases.insert(
+            id.clone(),
+            WorkLeaseEntry {
+                id: id.clone(),
+                label,
+                expires_at: Instant::now() + Duration::from_millis(ttl_ms),
+            },
+        );
+        inner.lease_sequence = inner.lease_sequence.saturating_add(1);
+        let lease = Self::status_of(&inner)
+            .leases
+            .into_iter()
+            .find(|lease| lease.id == id)
+            .expect("inserted work lease");
+        self.changed.notify_all();
+        Ok(lease)
+    }
+
+    fn renew(
+        &self,
+        lease_id: &str,
+        ttl_ms: u64,
+    ) -> std::result::Result<GuestWorkLease, WorkRegistryError> {
+        validate_ttl(ttl_ms)?;
+        let mut inner = self.inner.lock().unwrap();
+        Self::prune(&mut inner);
+        if inner.quiescing {
+            inner.lease_sequence = inner.lease_sequence.saturating_add(1);
+            self.changed.notify_all();
+            return Err(WorkRegistryError::ActivityChanged);
+        }
+        let lease = inner
+            .leases
+            .get_mut(lease_id)
+            .ok_or_else(|| WorkRegistryError::NotFound(lease_id.to_string()))?;
+        lease.expires_at = Instant::now() + Duration::from_millis(ttl_ms);
+        inner.lease_sequence = inner.lease_sequence.saturating_add(1);
+        let renewed = Self::status_of(&inner)
+            .leases
+            .into_iter()
+            .find(|lease| lease.id == lease_id)
+            .expect("renewed work lease");
+        self.changed.notify_all();
+        Ok(renewed)
+    }
+
+    fn release(&self, lease_id: &str) -> std::result::Result<(), WorkRegistryError> {
+        let mut inner = self.inner.lock().unwrap();
+        Self::prune(&mut inner);
+        if inner.leases.remove(lease_id).is_some() {
+            inner.lease_sequence = inner.lease_sequence.saturating_add(1);
+            self.changed.notify_all();
+        }
+        // DELETE is idempotent: an expired, already released, or pre-restart
+        // lease is already in the caller's desired state.
+        Ok(())
+    }
+
+    fn prepare_suspend(
+        &self,
+        expected_sequence: u64,
+    ) -> std::result::Result<(String, u64), WorkRegistryError> {
+        let mut inner = self.inner.lock().unwrap();
+        Self::prune(&mut inner);
+        if inner.lease_sequence != expected_sequence || !inner.leases.is_empty() {
+            return Err(WorkRegistryError::ActivityChanged);
+        }
+        inner.quiescing = true;
+        Ok((inner.source_epoch.clone(), inner.lease_sequence))
+    }
+
+    fn abort_suspend(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.quiescing = false;
+        self.changed.notify_all();
+    }
+}
+
+fn validate_label(label: &str) -> std::result::Result<(), WorkRegistryError> {
+    if label.is_empty() {
+        return Err(WorkRegistryError::Invalid(
+            "work label must not be empty".into(),
+        ));
+    }
+    if label.len() > 64 {
+        return Err(WorkRegistryError::Invalid(
+            "work label exceeds 64 bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ttl(ttl_ms: u64) -> std::result::Result<(), WorkRegistryError> {
+    if ttl_ms == 0 {
+        return Err(WorkRegistryError::Invalid(
+            "work TTL must be positive".into(),
+        ));
+    }
+    if ttl_ms > MAX_WORK_LEASE_TTL_MS {
+        return Err(WorkRegistryError::Invalid(
+            "work TTL exceeds the maximum".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn kernel_boot_id() -> Option<String> {
@@ -138,6 +591,7 @@ impl GuestAgent {
             disk_map_path,
             counter: AtomicU64::new(counter),
             volumes: Mutex::new(HashMap::new()),
+            work: WorkRegistry::new(),
         }
     }
 
@@ -209,6 +663,26 @@ impl GuestAgent {
                     uptime_ms: self.started.elapsed().as_millis() as u64,
                     disks,
                 })
+            }
+            GuestRequestBody::WorkStatus {
+                after_sequence,
+                wait_timeout_ms,
+            } => Ok(GuestResponseBody::WorkStatus {
+                status: self.work.status(after_sequence, wait_timeout_ms),
+            }),
+            GuestRequestBody::PrepareSuspend {
+                expected_lease_sequence,
+            } => {
+                let (source_epoch, lease_sequence) =
+                    self.work.prepare_suspend(expected_lease_sequence)?;
+                Ok(GuestResponseBody::SuspendPrepared {
+                    source_epoch,
+                    lease_sequence,
+                })
+            }
+            GuestRequestBody::AbortSuspend => {
+                self.work.abort_suspend();
+                Ok(GuestResponseBody::Ok)
             }
             GuestRequestBody::Exec {
                 command,
@@ -285,6 +759,128 @@ impl GuestAgent {
                 tracing::info!("guest agent shutting down");
                 std::process::exit(0);
             }
+        }
+    }
+
+    fn work_registry_error(error: WorkRegistryError) -> WorkHttpResponse {
+        match error {
+            WorkRegistryError::Invalid(message) => {
+                WorkHttpResponse::error(400, "Bad Request", "invalid_request", message)
+            }
+            WorkRegistryError::ActivityChanged => WorkHttpResponse::error(
+                409,
+                "Conflict",
+                "activity_changed",
+                "Cat is preparing to suspend; retry after it remains Running",
+            ),
+            WorkRegistryError::NotFound(lease_id) => WorkHttpResponse::error(
+                404,
+                "Not Found",
+                "lease_not_found",
+                format!("work lease {lease_id} was not found"),
+            ),
+            WorkRegistryError::Capacity => WorkHttpResponse::error(
+                429,
+                "Too Many Requests",
+                "too_many_leases",
+                format!("a Guest may hold at most {MAX_WORK_LEASES} work leases"),
+            ),
+        }
+    }
+
+    fn parse_work_json<T: for<'de> Deserialize<'de>>(
+        body: &[u8],
+    ) -> std::result::Result<T, WorkHttpResponse> {
+        serde_json::from_slice(body).map_err(|error| {
+            WorkHttpResponse::error(
+                400,
+                "Bad Request",
+                "invalid_json",
+                format!("invalid JSON request body: {error}"),
+            )
+        })
+    }
+
+    fn handle_work_http(&self, request: WorkHttpRequest) -> WorkHttpResponse {
+        if request.path == GUEST_WORK_LEASES_PATH {
+            return match request.method.as_str() {
+                "GET" => WorkHttpResponse::json(200, "OK", &self.work.status(None, 0)),
+                "POST" => {
+                    let body: AcquireGuestWorkLeaseRequest =
+                        match Self::parse_work_json(&request.body) {
+                            Ok(body) => body,
+                            Err(response) => return response,
+                        };
+                    match self.work.acquire(body.label, body.ttl_ms) {
+                        Ok(lease) => WorkHttpResponse::json(201, "Created", &lease)
+                            .with_location(format!("{GUEST_WORK_LEASES_PATH}/{}", lease.id)),
+                        Err(error) => Self::work_registry_error(error),
+                    }
+                }
+                _ => WorkHttpResponse::error(
+                    405,
+                    "Method Not Allowed",
+                    "method_not_allowed",
+                    "use GET or POST on /v1/work-leases",
+                ),
+            };
+        }
+
+        let Some(lease_id) = request
+            .path
+            .strip_prefix(&format!("{GUEST_WORK_LEASES_PATH}/"))
+            .filter(|lease_id| !lease_id.is_empty() && !lease_id.contains('/'))
+        else {
+            return WorkHttpResponse::error(
+                404,
+                "Not Found",
+                "not_found",
+                "unknown Guest runtime API route",
+            );
+        };
+        match request.method.as_str() {
+            "PUT" => {
+                let body: RenewGuestWorkLeaseRequest = match Self::parse_work_json(&request.body) {
+                    Ok(body) => body,
+                    Err(response) => return response,
+                };
+                match self.work.renew(lease_id, body.ttl_ms) {
+                    Ok(lease) => WorkHttpResponse::json(200, "OK", &lease),
+                    Err(error) => Self::work_registry_error(error),
+                }
+            }
+            "DELETE" => match self.work.release(lease_id) {
+                Ok(()) => WorkHttpResponse::empty(204, "No Content"),
+                Err(error) => Self::work_registry_error(error),
+            },
+            _ => WorkHttpResponse::error(
+                405,
+                "Method Not Allowed",
+                "method_not_allowed",
+                "use PUT or DELETE on /v1/work-leases/{lease_id}",
+            ),
+        }
+    }
+
+    fn serve_work_stream(&self, mut stream: std::os::unix::net::UnixStream) {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+        let response = match read_work_http_request(&mut stream) {
+            Ok(request) => self.handle_work_http(request),
+            Err(response) => response,
+        };
+        let _ = response.write_to(&mut stream);
+    }
+
+    /// Serve the open Guest-local work API as HTTP/1.1 over a Unix socket.
+    /// Each connection handles one request and closes, which is compatible
+    /// with curl and language HTTP clients that support Unix sockets. No Cat
+    /// id, platform credential, Cats SDK, or TCP port crosses this boundary.
+    pub fn serve_runtime_http(self: &std::sync::Arc<Self>, listener: UnixListener) {
+        for conn in listener.incoming() {
+            let Ok(stream) = conn else { return };
+            let agent = self.clone();
+            std::thread::spawn(move || agent.serve_work_stream(stream));
         }
     }
 
@@ -533,5 +1129,146 @@ mod tests {
             GuestResponseBody::Error { message } => assert!(message.contains("not attached")),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn user_work_lease_is_the_guest_suspend_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let map_path = dir.path().join("disks.json");
+        std::fs::write(&map_path, b"{}").unwrap();
+        let agent = GuestAgent::new(map_path, None);
+
+        let lease = agent.work.acquire("training-step".into(), 5_000).unwrap();
+        let active = agent.work.status(None, 0);
+        assert_eq!(active.leases.len(), 1);
+        assert!(matches!(
+            agent.handle(GuestRequestBody::PrepareSuspend {
+                expected_lease_sequence: active.lease_sequence,
+            }),
+            GuestResponseBody::Error { .. }
+        ));
+
+        agent.work.release(&lease.id).unwrap();
+        let idle = agent.work.status(None, 0);
+        assert!(idle.leases.is_empty());
+        assert!(matches!(
+            agent.handle(GuestRequestBody::PrepareSuspend {
+                expected_lease_sequence: idle.lease_sequence,
+            }),
+            GuestResponseBody::SuspendPrepared { .. }
+        ));
+
+        // New work cannot slip through the quiesce window. Its failed
+        // admission still changes the sequence, forcing the Node to abort.
+        assert!(matches!(
+            agent.work.acquire("racing-step".into(), 5_000),
+            Err(WorkRegistryError::ActivityChanged)
+        ));
+        let raced = agent.work.status(None, 0);
+        assert!(raced.lease_sequence > idle.lease_sequence);
+        assert!(raced.quiescing);
+
+        assert!(matches!(
+            agent.handle(GuestRequestBody::AbortSuspend),
+            GuestResponseBody::Ok
+        ));
+        assert!(agent.work.acquire("retry-step".into(), 5_000).is_ok());
+    }
+
+    #[test]
+    fn expired_user_work_lease_disappears_without_polling_delay() {
+        let dir = tempfile::tempdir().unwrap();
+        let map_path = dir.path().join("disks.json");
+        std::fs::write(&map_path, b"{}").unwrap();
+        let agent = GuestAgent::new(map_path, None);
+        agent.work.acquire("short".into(), 10).unwrap();
+        let active = agent.work.status(None, 0);
+        let idle = agent.work.status(Some(active.lease_sequence), 1_000);
+        assert!(idle.leases.is_empty());
+        assert!(idle.lease_sequence > active.lease_sequence);
+    }
+
+    #[test]
+    fn guest_runtime_work_api_is_http_over_unix_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let map_path = dir.path().join("disks.json");
+        std::fs::write(&map_path, b"{}").unwrap();
+        let agent = std::sync::Arc::new(GuestAgent::new(map_path, None));
+        let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let serving = agent.clone();
+        let worker = std::thread::spawn(move || serving.serve_work_stream(server));
+        let body = br#"{"label":"compile","ttl_ms":5000}"#;
+        write!(
+            client,
+            "POST {GUEST_WORK_LEASES_PATH} HTTP/1.1\r\nhost: cats-runtime\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        client.write_all(body).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        worker.join().unwrap();
+
+        let split = header_end(&response).unwrap();
+        let head = std::str::from_utf8(&response[..split]).unwrap();
+        assert!(head.starts_with("HTTP/1.1 201 Created\r\n"));
+        assert!(head.contains("content-type: application/json\r\n"));
+        let lease: GuestWorkLease = serde_json::from_slice(&response[split + 4..]).unwrap();
+        assert_eq!(lease.label, "compile");
+        assert_eq!(agent.work.status(None, 0).leases.len(), 1);
+    }
+
+    #[test]
+    fn guest_runtime_http_covers_renew_list_idempotent_delete_and_quiesce() {
+        let dir = tempfile::tempdir().unwrap();
+        let map_path = dir.path().join("disks.json");
+        std::fs::write(&map_path, b"{}").unwrap();
+        let agent = GuestAgent::new(map_path, None);
+
+        let created = agent.handle_work_http(WorkHttpRequest {
+            method: "POST".into(),
+            path: GUEST_WORK_LEASES_PATH.into(),
+            body: br#"{"label":"queue-drain"}"#.to_vec(),
+        });
+        assert_eq!(created.status, 201);
+        let lease: GuestWorkLease = serde_json::from_slice(&created.body).unwrap();
+        assert!(lease.remaining_ttl_ms > 0);
+
+        let renewed = agent.handle_work_http(WorkHttpRequest {
+            method: "PUT".into(),
+            path: format!("{GUEST_WORK_LEASES_PATH}/{}", lease.id),
+            body: br#"{"ttl_ms":10000}"#.to_vec(),
+        });
+        assert_eq!(renewed.status, 200);
+        let renewed: GuestWorkLease = serde_json::from_slice(&renewed.body).unwrap();
+        assert!(renewed.remaining_ttl_ms > 5_000);
+
+        let listed = agent.handle_work_http(WorkHttpRequest {
+            method: "GET".into(),
+            path: GUEST_WORK_LEASES_PATH.into(),
+            body: Vec::new(),
+        });
+        let status: GuestWorkStatus = serde_json::from_slice(&listed.body).unwrap();
+        assert_eq!(status.leases.len(), 1);
+
+        for _ in 0..2 {
+            let released = agent.handle_work_http(WorkHttpRequest {
+                method: "DELETE".into(),
+                path: format!("{GUEST_WORK_LEASES_PATH}/{}", lease.id),
+                body: Vec::new(),
+            });
+            assert_eq!(released.status, 204);
+        }
+
+        let idle = agent.work.status(None, 0);
+        agent.work.prepare_suspend(idle.lease_sequence).unwrap();
+        let rejected = agent.handle_work_http(WorkHttpRequest {
+            method: "POST".into(),
+            path: GUEST_WORK_LEASES_PATH.into(),
+            body: br#"{"label":"racing-work"}"#.to_vec(),
+        });
+        assert_eq!(rejected.status, 409);
+        let error: GuestRuntimeApiErrorResponse = serde_json::from_slice(&rejected.body).unwrap();
+        assert_eq!(error.error.code, "activity_changed");
     }
 }

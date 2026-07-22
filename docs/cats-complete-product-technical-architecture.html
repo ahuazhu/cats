@@ -410,7 +410,7 @@ cats disk delete project-data    # 必须先处于 Available</code></pre>
           <rect x="50" y="608" width="805" height="200" class="zone"/><text x="70" y="634" class="title">Cat 运行单元（每个 Cat 一组隔离进程与设备）</text>
           <rect x="75" y="657" width="195" height="118" class="box bb"/><text x="108" y="681" class="t">Cloud Hypervisor</text><text x="93" y="700" class="s">KVM · virtio-blk · virtio-net</text><text x="102" y="718" class="s">vsock · rng · console</text><text x="91" y="743" class="tiny">cgroup + seccomp + Landlock</text><text x="102" y="759" class="tiny">pinned version / API socket</text>
           <rect x="305" y="657" width="195" height="118" class="box bo"/><text x="360" y="681" class="t">cats-blockd</text><text x="331" y="700" class="s">vhost-user-blk backend</text><text x="331" y="718" class="s">cache · FLUSH · fencing</text><text x="332" y="743" class="tiny">RootDisk + PersistentDisk</text><text x="327" y="759" class="tiny">JuiceFS raw / Direct-S3（Direct-OS 实现）</text>
-          <rect x="535" y="657" width="290" height="118" class="box bg"/><text x="638" y="681" class="t">Guest Linux</text><text x="558" y="702" class="s">应用 / shell / git / package manager / service</text><text x="579" y="722" class="s">Guest Agent（vsock，仅最小权限）</text><text x="578" y="742" class="s">/dev/vda RootDisk · /dev/vdb /data</text><text x="601" y="760" class="tiny">标准 ext4；不知道 S3/JuiceFS</text>
+          <rect x="535" y="657" width="290" height="118" class="box bg"/><text x="638" y="681" class="t">Guest Linux</text><text x="558" y="702" class="s">应用 / shell / git / package manager / service</text><text x="552" y="722" class="s">Guest Agent（vsock control + local HTTP）</text><text x="578" y="742" class="s">/dev/vda RootDisk · /dev/vdb /data</text><text x="601" y="760" class="tiny">标准 ext4；不知道 S3/JuiceFS</text>
 
           <rect x="934" y="452" width="422" height="390" class="zone zp"/><text x="956" y="480" class="title">持久服务与区域基础设施</text>
           <rect x="960" y="508" width="176" height="70" class="box bp"/><text x="1005" y="534" class="t">PostgreSQL HA</text><text x="977" y="553" class="s">resources · operation · lease</text><text x="994" y="568" class="s">route · usage · outbox</text>
@@ -502,7 +502,7 @@ COMMIT;
 
     <section id="runtime">
       <h2>7. 计算运行时与 Node 内部</h2>
-      <p class="lead">每个 Cat 是一个 Cloud Hypervisor 进程和一组专属设备后端。cat-agent 是 Node 上唯一拥有 Host 管理权限的组件；Guest Agent 只通过 vsock 接收经过控制面授权的少量操作。</p>
+      <p class="lead">每个 Cat 是一个 Cloud Hypervisor 进程和一组专属设备后端。cat-agent 是 Node 上唯一拥有 Host 管理权限的组件。Guest Agent 通过 vsock 接收经过控制面授权的少量 Host 操作，同时在 Guest 内通过 <code>/run/cats/runtime.sock</code> 提供不含平台凭据的 HTTP Runtime API（ADR-0007）；两条接口不能混用。</p>
 
       <div class="two-col">
         <article class="card"><h3>Node 基线</h3><ul><li>精简不可变 Host OS；仅开放管理平面</li><li>KVM、IOMMU、cgroup v2、nftables/eBPF、io_uring</li><li>本地 NVMe 分区：images、disk cache、memory、staging、logs</li><li>cat-agent、node gateway、cats-blockd、OTel agent 由 systemd 管理</li><li>节点身份来自云实例身份 + 平台 PKI，不放静态管理员密钥</li><li>禁止用户 SSH；break-glass 操作单独审计</li></ul></article>
@@ -525,11 +525,14 @@ COMMIT;
       </div>
 
       <h3 style="margin-top:28px">7.2 Guest Agent 协议</h3>
+      <p><strong>Host → Guest 控制：</strong>继续使用 AF_VSOCK 上的版本化 framed protocol。</p>
       <div class="three-col">
         <article class="card"><h3>允许操作</h3><ul><li>health / boot status</li><li>exec / PTY / signal / resize</li><li>syncfs / fsfreeze / unfreeze</li><li>mount / unmount / resize2fs</li><li>service readiness 与端口列表</li><li>受限文件上传/下载</li></ul></article>
         <article class="card"><h3>协议要求</h3><ul><li>长度前缀或 HTTP/2 framed protocol</li><li>每请求 session token、deadline、request ID</li><li>命令参数数组，不经 shell 拼接</li><li>流量 backpressure 和输出上限</li><li>大文件走分块校验</li><li>支持 agent 版本协商</li></ul></article>
         <article class="card"><h3>明确禁止</h3><ul><li>接收任意 Host path</li><li>返回平台凭证</li><li>从 Guest 调控制面管理 API</li><li>以未经授权的 root session 执行</li><li>把 Secret 写到串口或 operation event</li><li>把 Agent 当公网应用入口</li></ul></article>
       </div>
+
+      <div class="callout"><strong>Guest-local Runtime API（ADR-0007）：</strong><code>/run/cats/runtime.sock</code> 上提供 HTTP/1.1 + JSON；<code>POST/PUT/DELETE/GET /v1/work-leases...</code> 用于创建、续租、释放和查看工作租约。不监听默认 TCP/UDP 端口，不要求 Cats SDK/CLI，也不携带平台凭据。Guest Agent 经 vsock 向 Node 汇总状态；VMM 不打开该 socket、不解析 HTTP/租约，只执行生命周期动作。该入口只能阻止自动 Suspend，唤醒仍来自 Gateway、shell/exec 或控制面。Wire contract 见 <a href="specs/guest-runtime-api.md">Guest Runtime API v1</a>。</div>
 
       <div class="callout orange"><strong>VMM 版本策略：</strong>Cloud Hypervisor、Guest Kernel、virtio 协议和 cats-blockd 形成兼容矩阵。Snapshot/restore 与 live migration 不假设跨 VMM 版本兼容；节点升级先 cordon，再冷迁移 Cat，旧版本节点清空后替换。</div>
     </section>
@@ -560,7 +563,7 @@ COMMIT;
       </div>
 
       <h3 style="margin-top:28px">8.2 自动空闲策略</h3>
-      <div class="callout"><strong>推荐默认：</strong>无活动一段时间后 Running → Suspended；继续无活动后 Suspended → Cold。活动信号包括 shell/exec、公开 Endpoint 请求、Guest CPU/网络阈值和用户 pin。具体分钟数属于套餐/项目策略，不写死在 VMM 实现中。</div>
+      <div class="callout"><strong>工作驱动的快速 Suspend：</strong>V1 按 Cat opt-in。平台与 Guest 用户程序的显式工作租约都为零、Guest 摘要新鲜且最终 quiesce fence 通过时，Running 立即尝试进入 Suspended；不等待 idle timeout，也不根据 CPU、load、网络或进程扫描猜测。信号链不确定时 fail-awake。Suspended → Warm → Cold 才按更长闲置时间、Host 压力或 Node drain 继续降级。</div>
       <div class="callout orange"><strong>自动唤醒：</strong>Shell/Exec 一定触发唤醒；HTTP Endpoint 是否因请求唤醒由 <code>wake_policy</code> 控制。Edge 对同一 Cat 的并发冷请求只触发一个 Activation Operation；等待超时返回 <code>503 + Retry-After</code>，不能无限占用连接。</div>
       <div class="callout green"><strong>详细机制：</strong>Cloud Hypervisor pause/resume 顺序、Guest RAM 如何 page-out 到本地 NVMe、Suspend/Cold 的资源账本、并发唤醒和 Host Lost 降级见 <a href="cats-sleep-wake-vmm-resource-reclamation.html">Cats 睡眠、唤醒与 VMM 资源回收</a>。</div>
     </section>
