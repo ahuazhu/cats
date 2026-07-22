@@ -1,17 +1,26 @@
 //! Guest agent protocol.
 //!
-//! Transport: length-prefixed JSON frames (`u32` big-endian length + body)
-//! over AF_VSOCK in production and a unix socket in dev/tests. Each request
-//! carries an id echoed in the response; commands are argument arrays, never
-//! shell strings (arch doc §7.2).
+//! Host control transport: length-prefixed JSON frames (`u32` big-endian
+//! length + body) over AF_VSOCK in production and a unix socket in dev/tests.
+//! Guest user programs use the separate HTTP/1.1 API on
+//! `/run/cats/runtime.sock` (ADR-0007). Host control requests carry an id
+//! echoed in the response; commands are argument arrays, never shell strings.
 
 use serde::{Deserialize, Serialize};
 
 pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 
+/// Stable Guest ABI endpoint. The Guest Agent serves HTTP/1.1 over this Unix
+/// socket; no TCP/UDP port or Cats SDK is required.
+pub const GUEST_RUNTIME_SOCKET_PATH: &str = "/run/cats/runtime.sock";
+pub const GUEST_WORK_LEASES_PATH: &str = "/v1/work-leases";
 pub const DEFAULT_WORK_LEASE_TTL_MS: u64 = 5 * 60 * 1000;
 pub const MAX_WORK_LEASE_TTL_MS: u64 = 60 * 60 * 1000;
 pub const MAX_WORK_LEASES: usize = 64;
+
+pub fn default_work_lease_ttl_ms() -> u64 {
+    DEFAULT_WORK_LEASE_TTL_MS
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestWorkLease {
@@ -120,36 +129,29 @@ pub enum GuestResponseBody {
     },
 }
 
-/// Guest-local user program protocol over `/run/cats/work.sock` (or the
-/// FakeVmm-provided path). It intentionally carries no Cat/control-plane id.
+/// JSON body for `POST /v1/work-leases` on the Guest runtime socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GuestLocalWorkRequest {
-    pub id: u64,
-    #[serde(flatten)]
-    pub body: GuestLocalWorkRequestBody,
+pub struct AcquireGuestWorkLeaseRequest {
+    pub label: String,
+    #[serde(default = "default_work_lease_ttl_ms")]
+    pub ttl_ms: u64,
+}
+
+/// JSON body for `PUT /v1/work-leases/{lease_id}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenewGuestWorkLeaseRequest {
+    #[serde(default = "default_work_lease_ttl_ms")]
+    pub ttl_ms: u64,
+}
+
+/// Stable JSON error envelope for the Guest-local HTTP API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuestRuntimeApiError {
+    pub code: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-pub enum GuestLocalWorkRequestBody {
-    Acquire { label: String, ttl_ms: u64 },
-    Renew { lease_id: String, ttl_ms: u64 },
-    Release { lease_id: String },
-    List,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GuestLocalWorkResponse {
-    pub id: u64,
-    #[serde(flatten)]
-    pub body: GuestLocalWorkResponseBody,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "result", rename_all = "snake_case")]
-pub enum GuestLocalWorkResponseBody {
-    Lease { lease: GuestWorkLease },
-    Status { status: GuestWorkStatus },
-    Ok,
-    Error { message: String },
+pub struct GuestRuntimeApiErrorResponse {
+    pub error: GuestRuntimeApiError,
 }

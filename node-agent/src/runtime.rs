@@ -73,7 +73,7 @@ struct CatRuntime {
     /// Short bind paths (see `short_socket_path`).
     ctl_sock: PathBuf,
     web_sock: PathBuf,
-    work_sock: PathBuf,
+    runtime_sock: PathBuf,
     activity: Arc<RuntimeActivity>,
     /// Present only in Cloud Hypervisor mode.
     ch: Option<ChRuntime>,
@@ -173,8 +173,8 @@ impl CatRuntime {
     fn web_socket(&self) -> PathBuf {
         self.web_sock.clone()
     }
-    fn work_socket(&self) -> PathBuf {
-        self.work_sock.clone()
+    fn runtime_socket(&self) -> PathBuf {
+        self.runtime_sock.clone()
     }
     fn disk_map_path(&self) -> PathBuf {
         self.dir.join("disk-map.json")
@@ -248,12 +248,13 @@ impl NodeRuntime {
     }
 
     /// FakeVmm/testing access to the guest-local user work API.
-    pub fn work_socket_for(&self, cat_id: &str) -> Option<PathBuf> {
+    pub fn runtime_socket_for(&self, cat_id: &str) -> Option<PathBuf> {
         self.cats
             .lock()
             .unwrap()
             .get(cat_id)
-            .map(CatRuntime::work_socket)
+            .filter(|runtime| runtime.ch.is_none())
+            .map(CatRuntime::runtime_socket)
     }
 
     /// Allocation telemetry reported with heartbeats. These values come from
@@ -387,7 +388,7 @@ impl NodeRuntime {
 
         let ctl_sock = short_socket_path(&self.cfg.state_dir, cat_id, "ctl");
         let web_sock = short_socket_path(&self.cfg.state_dir, cat_id, "web");
-        let work_sock = short_socket_path(&self.cfg.state_dir, cat_id, "work");
+        let runtime_sock = short_socket_path(&self.cfg.state_dir, cat_id, "runtime");
         symlink_socket(&dir.join("ctl.sock"), &ctl_sock);
         symlink_socket(&dir.join("web.sock"), &web_sock);
         let mut rt = CatRuntime {
@@ -402,7 +403,7 @@ impl NodeRuntime {
             dir: dir.clone(),
             ctl_sock,
             web_sock,
-            work_sock,
+            runtime_sock,
             activity: Arc::new(RuntimeActivity::default()),
             ch: None,
         };
@@ -498,7 +499,7 @@ impl NodeRuntime {
             dir: dir.clone(),
             ctl_sock: short_socket_path(&self.cfg.state_dir, cat_id, "ctl"),
             web_sock: short_socket_path(&self.cfg.state_dir, cat_id, "web"),
-            work_sock: short_socket_path(&self.cfg.state_dir, cat_id, "work"),
+            runtime_sock: short_socket_path(&self.cfg.state_dir, cat_id, "runtime"),
             activity: Arc::new(RuntimeActivity::default()),
             ch: None,
         };
@@ -695,8 +696,11 @@ impl NodeRuntime {
             .arg(rt.disk_map_path())
             .arg("--web-socket")
             .arg(rt.web_socket())
-            .arg("--work-socket")
-            .arg(rt.work_socket())
+            // FakeVmm runs the Guest Agent as a host process, so the Node
+            // supplies an isolated test socket. A real VMM never opens the
+            // Guest's /run/cats/runtime.sock.
+            .arg("--runtime-socket")
+            .arg(rt.runtime_socket())
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(rt.dir.join("guest.log")).context("create guest log")?);
         if let Some(sf) = state_file {
@@ -783,7 +787,7 @@ impl NodeRuntime {
         }
         let _ = std::fs::remove_file(rt.ctl_socket());
         let _ = std::fs::remove_file(rt.web_socket());
-        let _ = std::fs::remove_file(rt.work_socket());
+        let _ = std::fs::remove_file(rt.runtime_socket());
         rt.state = ObservedState::Cold;
     }
 

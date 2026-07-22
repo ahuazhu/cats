@@ -14,6 +14,7 @@ Cats 是一个从零实现的独立项目：为用户提供可休眠、可迁移
 - 存储依赖边界采用 Ports and Adapters（[ADR-0005](docs/decisions/0005-provider-neutral-storage-ports-and-adapters.md)）：核心只依赖云无关契约，AWS S3 是第一版 durable adapter。
 - 生命周期状态统一为 Running / Suspended / Warm / Cold（[ADR-0002](docs/decisions/0002-lifecycle-states-running-suspended-warm-cold.md)）。
 - 浏览器身份使用 WorkOS AuthKit，CLI 与内部服务继续使用 Bearer Token（[ADR-0006](docs/decisions/0006-workos-authkit-for-browser-identity.md)）。
+- Guest 可选运行时能力使用 Unix socket 上的标准 HTTP，不要求 Cats SDK/CLI 或固定 TCP 端口（[ADR-0007](docs/decisions/0007-guest-runtime-http-over-unix-socket.md)）。
 
 具体边界记录在 [`ADR-0001: Greenfield implementation baseline`](docs/decisions/0001-greenfield-implementation-baseline.md) 及后续 ADR。
 
@@ -60,7 +61,7 @@ control-plane/            项目隔离 API、用户/管理员 Web 控制台、Op
 node-agent/               NodeJob 执行器、FakeVmm、blockd 子进程监督、心跳（cats-noded）
 blockd/                   ChunkStore 引擎：Cache/Bitmap/Pack/Map、FLUSH 提交协议、
                           lease/fencing、NBD 前端（cats-blockd；只依赖 storage ports）
-guest/                    Guest Agent：控制协议、经 NBD 的块 I/O、demo web（cats-guest-agent）
+guest/                    Guest Agent：vsock 控制协议、Guest-local HTTP Runtime API、demo web
 network/                  Endpoint 网关：路由解析、唤醒、旧路由 fail-closed（cats-gatewayd）
 api/                      共享类型：资源模型、四态、NodeJob、Guest 协议、Chunk 常量
 tests/                    端到端测试（真实 CLI + 双节点 + 网关 + 真实存储子进程）

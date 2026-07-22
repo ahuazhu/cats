@@ -450,7 +450,7 @@ COMMIT;
 
 ## 7. 计算运行时与 Node 内部
 
-每个 Cat 是一个 Cloud Hypervisor 进程和一组专属设备后端。cat-agent 是 Node 上唯一拥有 Host 管理权限的组件；Guest Agent 只通过 vsock 接收经过控制面授权的少量操作。
+每个 Cat 是一个 Cloud Hypervisor 进程和一组专属设备后端。cat-agent 是 Node 上唯一拥有 Host 管理权限的组件。Guest Agent 通过 vsock 接收经过控制面授权的少量 Host 操作，同时在 Guest 内通过 `/run/cats/runtime.sock` 提供不含平台凭据的 HTTP Runtime API（ADR-0007）；两条接口不能混用。
 
 ### Node 基线
 
@@ -483,6 +483,8 @@ COMMIT;
 
 ### 7.2 Guest Agent 协议
 
+### Host → Guest 控制协议（AF_VSOCK）
+
 ### 允许操作
 
 - health / boot status
@@ -501,6 +503,15 @@ COMMIT;
 - 大文件走分块校验
 - 支持 agent 版本协商
 
+### Guest 用户程序 → Guest Agent（Unix socket HTTP）
+
+- 固定入口 `/run/cats/runtime.sock`，HTTP/1.1 + JSON，不监听默认 TCP/UDP 端口
+- `POST/PUT/DELETE/GET /v1/work-leases...` 创建、续租、释放和查看工作租约
+- 不要求 Cats SDK 或 CLI；`curl --unix-socket` 等通用客户端可以直接调用
+- 不携带 Cat id、控制面 token、对象存储/metadata 凭据
+- Guest Agent 在内存中维护租约，通过 Host 控制协议的 `WorkStatus` 向 Node 汇总
+- 该入口只能阻止自动 Suspend；Cat 已睡后，唤醒必须来自 Gateway、shell/exec 或控制面
+
 ### 明确禁止
 
 - 接收任意 Host path
@@ -509,6 +520,8 @@ COMMIT;
 - 以未经授权的 root session 执行
 - 把 Secret 写到串口或 operation event
 - 把 Agent 当公网应用入口
+
+Cloud Hypervisor/VMM 不访问 Guest 内的 runtime socket，也不解析 HTTP 或租约。它只提供 virtio-vsock 设备和执行 pause/resume/snapshot 等生命周期动作。完整决定见 [ADR-0007](decisions/0007-guest-runtime-http-over-unix-socket.md)，wire contract 见 [Guest Runtime API v1](specs/guest-runtime-api.md)。
 
 **VMM 版本策略：**Cloud Hypervisor、Guest Kernel、virtio 协议和 cats-blockd 形成兼容矩阵。Snapshot/restore 与 live migration 不假设跨 VMM 版本兼容；节点升级先 cordon，再冷迁移 Cat，旧版本节点清空后替换。
 
@@ -580,7 +593,7 @@ MountBinding 可以保留，但 runtime Attachment 必须结束。
 
 ### 8.2 自动空闲策略
 
-**推荐默认：**无活动一段时间后 Running → Suspended；继续无活动或本机内存/backing 压力升高时 Suspended → Warm；更久闲置、快照空间紧张或 Node drain 时降级 Cold。活动信号包括 shell/exec、公开 Endpoint 请求、Guest CPU/网络阈值和用户 pin。具体分钟数属于套餐/项目策略，不写死在 VMM 实现中。
+**工作驱动的快速 Suspend：**V1 按 Cat opt-in。平台 Gateway/exec/control 租约与 Guest 用户程序显式工作租约都为零、Guest 摘要新鲜且最终 quiesce fence 通过时，Running 立即尝试进入 Suspended，不等待 idle timeout，也不根据 CPU、load、网络或进程扫描猜测。信号链不确定时 fail-awake。Suspended → Warm → Cold 仍可按更长闲置时间、本机内存/backing/快照压力或 Node drain 自动降级；具体阈值属于套餐/项目策略，不写死在 VMM 实现中。详见 [工作驱动快速休眠设计](cats-auto-tier-product-and-implementation-design.md)。
 
 **自动唤醒：**Shell/Exec 一定触发唤醒；HTTP Endpoint 是否因请求唤醒由 `wake_policy` 控制。Edge 对同一 Cat 的并发冷请求只触发一个 Activation Operation；等待超时返回 `503 + Retry-After`，不能无限占用连接。
 

@@ -3,13 +3,14 @@
 //! (ADR-0002) with boot-id oracles, plus hot attach/detach and journal
 //! idempotency. Storage flows through real cats-blockd instances.
 
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cats_api::guest::{
-    GuestLocalWorkRequest, GuestLocalWorkRequestBody, GuestLocalWorkResponse,
-    GuestLocalWorkResponseBody, GuestRequestBody, GuestResponseBody,
+    AcquireGuestWorkLeaseRequest, GuestRequestBody, GuestResponseBody, GuestWorkLease,
+    GUEST_WORK_LEASES_PATH,
 };
 use cats_api::nodejob::{job_id, JobPhase, NodeJob, NodeJobAction, SuspendWorkFence, VolumeGrant};
 use cats_api::resources::ObservedState;
@@ -111,11 +112,32 @@ fn boot_id(env: &Env) -> String {
     guest(env).health().unwrap().0
 }
 
-fn guest_work(path: &Path, body: GuestLocalWorkRequestBody) -> GuestLocalWorkResponseBody {
-    let mut stream = UnixStream::connect(path).unwrap();
-    cats_guest_agent::write_frame(&mut stream, &GuestLocalWorkRequest { id: 1, body }).unwrap();
-    let response: GuestLocalWorkResponse = cats_guest_agent::read_frame(&mut stream).unwrap();
-    response.body
+fn guest_work(socket: &Path, method: &str, route: &str, body: &[u8]) -> (u16, Vec<u8>) {
+    let mut stream = UnixStream::connect(socket).unwrap();
+    write!(
+        stream,
+        "{method} {route} HTTP/1.1\r\nhost: cats-runtime\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    )
+    .unwrap();
+    stream.write_all(body).unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap();
+    let status = std::str::from_utf8(&response[..split])
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    (status, response[split + 4..].to_vec())
 }
 
 #[test]
@@ -125,17 +147,15 @@ fn suspend_rejects_active_guest_work_then_succeeds_on_last_release() {
         env.runtime.execute(start_job(1)).observed_state,
         ObservedState::Running
     );
-    let work_socket = env.runtime.work_socket_for(CAT).unwrap();
-    let lease_id = match guest_work(
-        &work_socket,
-        GuestLocalWorkRequestBody::Acquire {
-            label: "user-job".into(),
-            ttl_ms: 5_000,
-        },
-    ) {
-        GuestLocalWorkResponseBody::Lease { lease } => lease.id,
-        other => panic!("unexpected {other:?}"),
-    };
+    let runtime_socket = env.runtime.runtime_socket_for(CAT).unwrap();
+    let acquire = serde_json::to_vec(&AcquireGuestWorkLeaseRequest {
+        label: "user-job".into(),
+        ttl_ms: 5_000,
+    })
+    .unwrap();
+    let (status, body) = guest_work(&runtime_socket, "POST", GUEST_WORK_LEASES_PATH, &acquire);
+    assert_eq!(status, 201);
+    let lease_id = serde_json::from_slice::<GuestWorkLease>(&body).unwrap().id;
     let active = guest(&env).work_status(None, 0).unwrap();
     let rejected = env.runtime.execute(simple(
         2,
@@ -151,13 +171,14 @@ fn suspend_rejects_active_guest_work_then_succeeds_on_last_release() {
     assert_eq!(rejected.phase, JobPhase::Rejected);
     assert_eq!(rejected.observed_state, ObservedState::Running);
 
-    assert!(matches!(
-        guest_work(
-            &work_socket,
-            GuestLocalWorkRequestBody::Release { lease_id }
-        ),
-        GuestLocalWorkResponseBody::Ok
-    ));
+    let (status, body) = guest_work(
+        &runtime_socket,
+        "DELETE",
+        &format!("{GUEST_WORK_LEASES_PATH}/{lease_id}"),
+        &[],
+    );
+    assert_eq!(status, 204);
+    assert!(body.is_empty());
     let idle = guest(&env).work_status(None, 0).unwrap();
     assert!(idle.leases.is_empty());
     let suspended = env.runtime.execute(simple(

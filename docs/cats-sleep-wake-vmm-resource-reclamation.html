@@ -231,7 +231,7 @@
       <h2>4. Running → Suspended 的完整流程</h2>
       <p class="lead">Suspend 的正确顺序是“停止新活动 → Guest 落盘 → 远端持久点 → VMM pause → RAM page-out”。不能先停 Guest 再希望 Guest 自己执行 sync。</p>
       <div class="flow">
-        <div class="step"><b>1. 状态门禁</b><p>Cat generation 进入 Suspending；阻止新的 exec、挂盘和部署；并发 wake/suspend singleflight。</p></div>
+        <div class="step"><b>1. 工作与状态门禁</b><p>平台与 Guest 工作租约必须为空。Node 关闭 exec/proxy gate，Guest Agent 以 sequence fence 原子关闭 <code>/run/cats/runtime.sock</code> 的新 acquire/renew；任一新工作拒绝本次 Suspend 并恢复 Running。</p></div>
         <div class="step"><b>2. Guest Quiesce</b><p>Guest Agent 对 RootDisk/PersistentDisk 执行 syncfs；应用 hook 有严格 deadline。</p></div>
         <div class="step"><b>3. Durable FLUSH</b><p>cats-blockd 完成屏障前 Dirty Set，记录 durable generation；失败则不进入 Suspended。</p></div>
         <div class="step"><b>4. VMM Pause</b><p>Cloud Hypervisor 暂停 vCPU、保存时钟、暂停设备并进入 Paused。</p></div>
@@ -547,7 +547,7 @@ Running | Suspended
           <tr><td>Scheduler</td><td>释放/调整 CPU run budget，记录 resume commitment</td><td>Resume 容量准入；Cold 时重新选 Node</td></tr>
           <tr><td>cat-agent</td><td>Guest sync、调用 CH pause、pidfd/process_madvise、状态检查</td><td>调用 resume 或 shutdown；进程、tap、socket、cgroup cleanup</td></tr>
           <tr><td>Cloud Hypervisor</td><td>暂停 vCPU/clock/device/hypervisor VM</td><td>按序恢复；Cold 时退出并释放 KVM 状态</td></tr>
-          <tr><td>Guest Agent</td><td>syncfs、应用 hook、磁盘/服务状态报告</td><td>Ready、session 重建、Cold boot 后 mount/resize 检查</td></tr>
+          <tr><td>Guest Agent</td><td><code>/run/cats/runtime.sock</code> HTTP 工作租约、sequence/quiesce fence、syncfs、应用 hook、磁盘/服务状态报告</td><td>Ready、重新开放租约 admission、session 重建、Cold boot 后 mount/resize 检查</td></tr>
           <tr><td>cats-blockd</td><td>完成 FLUSH，保留 lease/backend，停止新 Guest I/O 后继续必要后台提交</td><td>Resume 继续；Cold final drain、释放 lease；新 Host 使用新 epoch</td></tr>
           <tr><td>NVMe Manager</td><td>memory backing quota、page-out 统计、clean cache 淘汰</td><td>Cold 删除 backing 和 staging；密钥清理；Wake 可选预热</td></tr>
           <tr><td>Route Controller</td><td>active → sleeping，应用 wake_policy</td><td>Wake singleflight；Ready 后发布新 activation epoch</td></tr>

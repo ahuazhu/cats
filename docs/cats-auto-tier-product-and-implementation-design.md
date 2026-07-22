@@ -62,24 +62,34 @@ V1 已接通 Gateway、exec、Guest 用户程序以及磁盘热挂载/卸载。�
 
 ### 2.3 Guest 用户程序契约
 
-真实 Guest 默认暴露 `/run/cats/work.sock`，只允许本机用户程序访问，不需要 Cat id、项目 token、对象存储凭据或元数据凭据。FakeVmm 使用 Node 创建的短 Unix socket，但协议相同。
+真实 Guest 默认在 `/run/cats/runtime.sock` 暴露 **HTTP/1.1 + JSON over Unix socket**，只允许本机用户程序访问，不占用 TCP/UDP 端口，也不需要 Cat id、项目 token、对象存储凭据或元数据凭据。FakeVmm 使用 Node 创建的隔离 Unix socket，但 HTTP 协议相同。该 Guest ABI 由 [ADR-0007](decisions/0007-guest-runtime-http-over-unix-socket.md) 固定。
 
-包装一条命令：
+创建租约只需通用 HTTP 客户端：
 
-```text
-cats-guest-work run --name release-build -- make -j8
+```bash
+curl --unix-socket /run/cats/runtime.sock \
+  -X POST http://cats-runtime/v1/work-leases \
+  -H 'content-type: application/json' \
+  -d '{"label":"release-build","ttl_ms":300000}'
+
+# => {"id":"work_...","label":"release-build","remaining_ttl_ms":...}
 ```
 
-包装器在启动子进程前 acquire，运行中周期续租，子进程退出后立即 release。需要自己管理生命周期的程序可以使用：
+续租、释放和查看：
 
-```text
-lease_id=$(cats-guest-work acquire --name queue-drain)
-cats-guest-work renew "$lease_id"
-cats-guest-work release "$lease_id"
-cats-guest-work list
+```bash
+curl --unix-socket /run/cats/runtime.sock \
+  -X PUT http://cats-runtime/v1/work-leases/$lease_id \
+  -H 'content-type: application/json' -d '{"ttl_ms":300000}'
+curl --unix-socket /run/cats/runtime.sock \
+  -X DELETE http://cats-runtime/v1/work-leases/$lease_id
+curl --unix-socket /run/cats/runtime.sock \
+  http://cats-runtime/v1/work-leases
 ```
 
-默认 TTL 为 5 分钟，单次最大 TTL 为 1 小时，每个 Guest 最多 64 个租约。TTL 使用 Guest Agent 的单调时钟；控制面使用自己的接收时间，不信任 Guest 墙钟。
+`cats-guest-work` 可以作为可选的 shell 包装器，但它只是上述 HTTP API 的普通客户端，不是必需组件，也没有私有能力。Python、Go、Rust 等程序可以使用任意支持 Unix socket transport 的通用 HTTP client；不需要 Cats SDK。
+
+在普通本机开发环境中，程序可以先检查 socket 是否存在，不存在就跳过租约；在启用了 auto-suspend 的 Cat 内，acquire/renew 失败意味着无法保证 Cat 保持 Running，不应被基础库静默吞掉。默认 TTL 为 5 分钟，单次最大 TTL 为 1 小时，每个 Guest 最多 64 个租约。TTL 使用 Guest Agent 的单调时钟；控制面使用自己的接收时间，不信任 Guest 墙钟。
 
 长期常驻且无法接入这个协议的 workload 应保持 `auto_suspend=off`。这不是技术缺陷的掩盖，而是产品契约的边界：只有用户程序知道它是否仍有业务工作。
 
@@ -242,16 +252,18 @@ PrepareSuspend {expected_lease_sequence}
 AbortSuspend
 ```
 
-Guest-local：
+Guest-local 是固定 Unix socket 上的 HTTP/1.1：
 
 ```text
-Acquire {label, ttl_ms}
-Renew {lease_id, ttl_ms}
-Release {lease_id}
-List
+POST   /v1/work-leases             {label, ttl_ms}
+PUT    /v1/work-leases/{lease_id}  {ttl_ms}
+DELETE /v1/work-leases/{lease_id}
+GET    /v1/work-leases
 ```
 
-两者复用现有的 u32 big-endian length + JSON framing，保留 frame 大小限制。
+Host control 继续使用现有的 u32 big-endian length + JSON framing over AF_VSOCK；它只在 Guest Agent 与 Node Agent 之间使用。Guest-local 用户协议不复用私有 framing。VMM 既不打开 `/run/cats/runtime.sock`，也不解析 HTTP/租约；它只提供 vsock 设备并执行 pause/resume。
+
+完整请求、响应、错误码、大小/超时限制和本机降级语义见 [`Guest Runtime API v1`](specs/guest-runtime-api.md)。
 
 ## 6. 故障与安全语义
 
@@ -275,7 +287,7 @@ List
 V1 已实现：
 
 - Cat 级 opt-in `auto_suspend`；
-- Guest 本机工作租约和 `cats-guest-work` 包装器；
+- Guest 本机 `/run/cats/runtime.sock` HTTP 工作租约 API，以及可选的 `cats-guest-work` HTTP 包装器；
 - Node 长轮询上报和 freshness fail-awake；
 - Gateway、exec 工作租约；
 - 控制面事务判定、singleflight wake、operation 与原因码；
@@ -297,12 +309,13 @@ V1 已实现：
 1. 自动策略关闭时，工作集合为空也不自动睡。
 2. Guest signal 缺失或过期时不自动睡。
 3. 任一 Gateway、exec 或 Guest lease 存活时不自动睡。
-4. 最后一个 lease release 后无需 idle timer 即创建 auto-suspend operation。
-5. Guest lease 在 PrepareSuspend 前变化时，Node 返回 ActivityChanged，Cat 保持 Running。
-6. Node proxy/exec 在 quiesce 窗口到达时不能进入 Guest，并撤销 Suspend。
-7. durable FLUSH 失败时不得报告 Suspended。
-8. 并发 wake 只创建一个 Running generation。
-9. resume / restore 失败收敛 Cold。
+4. 通用 HTTP 客户端可通过 Unix socket 完成 create/renew/delete/list；不监听固定 TCP/UDP 端口。
+5. 最后一个 lease release 后无需 idle timer 即创建 auto-suspend operation。
+6. Guest lease 在 PrepareSuspend 前变化时，Node 返回 ActivityChanged，Cat 保持 Running。
+7. Node proxy/exec 在 quiesce 窗口到达时不能进入 Guest，并撤销 Suspend。
+8. durable FLUSH 失败时不得报告 Suspended。
+9. 并发 wake 只创建一个 Running generation。
+10. resume / restore 失败收敛 Cold。
 
 工程门禁：
 

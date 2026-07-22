@@ -7,6 +7,7 @@ HTML 面向人类阅读和视觉演示；同名 Markdown 面向 Agent/实现者�
 | 文档 | 状态 | 对应实现 |
 |---|---|---|
 | [blockd 协议规格](specs/blockd-protocol.md) | Frozen v1 | `blockd/`（常量出处 `api/src/chunk.rs`）；改动需新增 ADR |
+| [Guest Runtime API v1](specs/guest-runtime-api.md) | Frozen v1 | `guest/` 的 `/run/cats/runtime.sock` HTTP 工作租约；依据 ADR-0007 |
 
 实现状态一览见根 [README](../README.md#实现状态)。真实 microVM（Cloud Hypervisor + KVM）已实现为 node-agent 的 `--vmm ch` 模式（`node-agent/src/ch.rs`），块路径 Phase A 经内核 NBD 复用已验前端，裸金属部署与验收见 [deploy/metal/](../deploy/metal/README.md)。仍属后续里程碑：原生 vhost-user-blk（性能）、tap/overlay Guest 网络、多节点共享 PostgreSQL 元数据、特权拆分。
 
@@ -21,6 +22,7 @@ Rust 工程质量现状、已修问题和后续优先项见 [Rust 工程实践�
 | 完整产品与技术架构 | [HTML](cats-complete-product-technical-architecture.html) | [Markdown](cats-complete-product-technical-architecture.md) | 产品/系统基线 | 资源模型、CLI/API、控制面、Node、VM、网络、存储、安全、可靠性和交付阶段 |
 | Direct-S3 ChunkStore（Direct-OS 实现）详细设计 | [HTML](direct-s3-chunkstore-architecture.html) | [Markdown](direct-s3-chunkstore-architecture.md) | 已选定存储基线（ADR-0003） | cats-blockd 的对象块存储：Chunk/Map、Pending Commit、FLUSH、lease/fencing、Snapshot、GC 与恢复 |
 | 睡眠、唤醒与资源回收 | [HTML](cats-sleep-wake-vmm-resource-reclamation.html) | [Markdown](cats-sleep-wake-vmm-resource-reclamation.md) | 生命周期基线（ADR-0002 四态） | Running、Suspended（pause/page-out）、Warm（snapshot/VMM exit）、Cold 的资源与失败处理 |
+| 工作驱动快速休眠 | — | [Markdown](cats-auto-tier-product-and-implementation-design.md) | V1 dev shape（ADR-0007 Guest ABI） | 显式工作租约、立即 Suspend、Guest Runtime HTTP、竞态栅栏与 fail-awake |
 | 实验总报告 | — | [Markdown](experiments-2026-07-21-storage-lifecycle.md) | 实验证据 | 方法、代码、正式数字、失败尝试、结论和未验证事项 |
 
 ## 历史方案与外部参考
@@ -40,5 +42,6 @@ Rust 工程质量现状、已修问题和后续优先项见 [Rust 工程实践�
 - [ADR-0004：实现技术栈（全 Rust）与开发测试环境](decisions/0004-implementation-stack-and-dev-environment.md)
 - [ADR-0005：云无关存储边界采用 Ports and Adapters](decisions/0005-provider-neutral-storage-ports-and-adapters.md)
 - [ADR-0006：浏览器身份使用 WorkOS AuthKit](decisions/0006-workos-authkit-for-browser-identity.md)
+- [ADR-0007：Guest Runtime API 使用 Unix Socket 上的 HTTP](decisions/0007-guest-runtime-http-over-unix-socket.md)
 
 后续发生会改变数据格式、公开 API、故障语义或组件边界的决定时，应新增 ADR，而不是直接覆盖实验结论。

@@ -10,7 +10,7 @@ Quality gates for any change: `cargo test --workspace` green and `cargo clippy -
 
 Read in this order:
 
-1. All ADRs in [`docs/decisions/`](docs/decisions/): [`0001` greenfield baseline](docs/decisions/0001-greenfield-implementation-baseline.md), [`0002` lifecycle states](docs/decisions/0002-lifecycle-states-running-suspended-warm-cold.md), [`0003` storage backend](docs/decisions/0003-direct-s3-chunkstore-backend.md), [`0004` stack and dev environment](docs/decisions/0004-implementation-stack-and-dev-environment.md), [`0005` provider-neutral storage ports and adapters](docs/decisions/0005-provider-neutral-storage-ports-and-adapters.md), [`0006` WorkOS AuthKit browser identity](docs/decisions/0006-workos-authkit-for-browser-identity.md)
+1. All ADRs in [`docs/decisions/`](docs/decisions/): [`0001` greenfield baseline](docs/decisions/0001-greenfield-implementation-baseline.md), [`0002` lifecycle states](docs/decisions/0002-lifecycle-states-running-suspended-warm-cold.md), [`0003` storage backend](docs/decisions/0003-direct-s3-chunkstore-backend.md), [`0004` stack and dev environment](docs/decisions/0004-implementation-stack-and-dev-environment.md), [`0005` provider-neutral storage ports and adapters](docs/decisions/0005-provider-neutral-storage-ports-and-adapters.md), [`0006` WorkOS AuthKit browser identity](docs/decisions/0006-workos-authkit-for-browser-identity.md), [`0007` Guest Runtime HTTP over Unix socket](docs/decisions/0007-guest-runtime-http-over-unix-socket.md)
 2. [`docs/cats-complete-product-technical-architecture.md`](docs/cats-complete-product-technical-architecture.md)
 3. The task-specific design:
    - storage (selected backend, ADR-0003; Direct-OS 形态的 Direct-S3 实现): [`docs/direct-s3-chunkstore-architecture.md`](docs/direct-s3-chunkstore-architecture.md)
@@ -40,6 +40,7 @@ Never turn a prototype measurement into a production SLA. Preserve sample count,
 - Lifecycle states are Running / Suspended (pause + page-out) / Warm (snapshot + VMM exit) / Cold (ADR-0002). Suspended and Warm are host-bound; do not merge them into one "sleep" state.
 - Suspended resume or Warm restore failure must converge to a clean Cold fallback.
 - RootDisk lifecycle follows the Cat; PersistentDisk lifecycle is independent.
+- Guest user programs access optional runtime capabilities through HTTP/1.1 on `/run/cats/runtime.sock`; they must not require a Cats SDK/CLI or a fixed TCP/UDP port. The VMM never accesses this Guest-local socket.
 - Do not hard-code cloud account IDs, buckets, instance IDs, credentials or Host paths.
 
 ## Backend status

@@ -1,10 +1,11 @@
 use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 
+use cats_api::guest::GUEST_RUNTIME_SOCKET_PATH;
 use cats_guest_agent::{bind_vsock, GuestAgent, GuestMode};
 
 #[derive(Parser, Debug)]
@@ -25,13 +26,26 @@ struct Args {
     /// Tiny demo web service socket (endpoint target in dev).
     #[arg(long)]
     web_socket: Option<PathBuf>,
-    /// Guest-local user work lease socket. Real guests default to
-    /// /run/cats/work.sock; FakeVmm passes an isolated host path.
+    /// Guest-local HTTP runtime socket. Real guests default to
+    /// /run/cats/runtime.sock; FakeVmm passes an isolated host path.
     #[arg(long)]
-    work_socket: Option<PathBuf>,
+    runtime_socket: Option<PathBuf>,
     /// Warm-restore state file; created by SaveState, read at boot (fake).
     #[arg(long)]
     state_file: Option<PathBuf>,
+}
+
+fn remove_stale_socket(path: &Path) -> Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            std::fs::remove_file(path).context("remove stale Unix socket")
+        }
+        Ok(_) => anyhow::bail!("refusing to replace non-socket path at {}", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("inspect Unix socket path"),
+    }
 }
 
 fn main() -> Result<()> {
@@ -60,35 +74,40 @@ fn main() -> Result<()> {
     tracing::info!(boot_id = agent.boot_id(), mode = %args.mode, "guest agent booting");
 
     if let Some(web) = &args.web_socket {
-        let _ = std::fs::remove_file(web);
+        remove_stale_socket(web)?;
         let listener = UnixListener::bind(web).context("bind web socket")?;
         let agent = agent.clone();
         std::thread::spawn(move || agent.serve_web(listener));
     }
 
-    let work_socket = args
-        .work_socket
-        .or_else(|| is_vm.then(|| PathBuf::from("/run/cats/work.sock")));
-    if let Some(work) = work_socket {
-        if let Some(parent) = work.parent() {
-            std::fs::create_dir_all(parent).context("create work socket directory")?;
+    let runtime_socket = args
+        .runtime_socket
+        .or_else(|| is_vm.then(|| PathBuf::from(GUEST_RUNTIME_SOCKET_PATH)));
+    if let Some(runtime) = runtime_socket {
+        if let Some(parent) = runtime.parent() {
+            std::fs::create_dir_all(parent).context("create Guest runtime socket directory")?;
+            if runtime == Path::new(GUEST_RUNTIME_SOCKET_PATH) {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755))?;
+            }
         }
-        let _ = std::fs::remove_file(&work);
-        let listener = UnixListener::bind(&work).context("bind work socket")?;
+        remove_stale_socket(&runtime)?;
+        let listener = UnixListener::bind(&runtime).context("bind Guest runtime socket")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             // Every user program in the Cat may declare its own work. The
             // socket is Guest-local and carries no platform credentials.
-            std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o666))?;
+            std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o666))?;
         }
+        tracing::info!(socket = %runtime.display(), "Guest runtime HTTP API listening");
         let agent = agent.clone();
-        std::thread::spawn(move || agent.serve_work(listener));
+        std::thread::spawn(move || agent.serve_runtime_http(listener));
     }
 
     match (&args.control_socket, args.vsock_port) {
         (Some(path), None) => {
-            let _ = std::fs::remove_file(path);
+            remove_stale_socket(path)?;
             let listener = UnixListener::bind(path).context("bind control socket")?;
             println!("READY");
             agent.serve_control(listener);
