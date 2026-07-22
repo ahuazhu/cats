@@ -4,7 +4,11 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#14231b">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <meta name="description" content="Manage Cats Linux cloud workspaces, disks, endpoints, and operations." data-i18n-content="user.meta.description">
   <title data-i18n="user.meta.title">Cats · User Console</title>
+  <link rel="icon" href="/assets/cats-mark.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/ui/styles.css">
 </head>
 <body class="console-page" data-site="user">
@@ -12,7 +16,7 @@
     <div class="login-panel">
       <div class="login-heading">
         <a class="brand brand-large" href="/">
-          <span class="brand-mark" aria-hidden="true">C</span>
+          <img class="brand-mark" src="/assets/cats-mark.svg" alt="">
           <span><strong>Cats</strong><small data-i18n="brand.cloudWorkspaces">Cloud Workspaces</small></span>
         </a>
         <label class="language-picker">
@@ -44,7 +48,7 @@
   <div class="app-shell is-hidden" id="app-shell">
     <aside class="sidebar">
       <a class="brand" href="/">
-        <span class="brand-mark" aria-hidden="true">C</span>
+        <img class="brand-mark" src="/assets/cats-mark.svg" alt="">
         <span><strong>Cats</strong><small data-i18n="brand.myWorkspaces">My Workspaces</small></span>
       </a>
       <div class="context-card">
@@ -67,6 +71,7 @@
             <option value="zh-CN" data-i18n="language.zh-CN">中文</option>
           </select>
         </label>
+        <a href="https://cats.run/docs/" data-i18n="common.docs" data-i18n-href="common.userDocsUrl">Documentation</a>
         <button id="logout-button" data-i18n="common.logout">Sign out</button>
       </div>
     </aside>

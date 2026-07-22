@@ -13,6 +13,23 @@ HTML 面向人类阅读和视觉演示；同名 Markdown 面向 Agent/实现者�
 
 Rust 工程质量现状、已修问题和后续优先项见 [Rust 工程实践审查](rust-engineering-review.md)。
 
+## 公开用户文档
+
+控制面会把无需登录的产品用户文档发布到 `/docs/`（英语）和 `/zh-CN/docs/`（简体中文）。
+可索引 HTML 片段位于 `control-plane/ui/public/docs/<locale>/*.html`；每个页面都有同名
+Markdown companion，便于 Agent 检索并满足 HTML/Markdown 同步维护约定。入口分别为：
+
+- [English usage docs](../control-plane/ui/public/docs/en/index.md)
+- [简体中文使用文档](../control-plane/ui/public/docs/zh-CN/index.md)
+
+这些页面描述当前 Rust workspace 已实现的用户能力，并明确标注 native vhost-user-blk、
+tap/overlay、Suspended page-out、控制面资源库 PostgreSQL 化与权限拆分等尚未完成项。跨组件事实仍以 ADR、
+原始实验数据和本文档索引中的架构 Markdown 为更高优先级来源。
+
+Fleet 管理员指南不属于官网用户文档。其双语源文件位于
+`control-plane/ui/ops/docs/<locale>/index.{html,md}`，生产环境由 `ops.cats.run/docs/`
+与 `ops.cats.run/zh-CN/docs/` 提供，并通过 `noindex` 与官网 sitemap 隔离。
+
 如果同一设计的两种格式暂时不同，以 ADR 和实验数据为最高依据，随后以 Markdown 的实现约束为准，并尽快同步 HTML。
 
 ## 当前基线

@@ -1,0 +1,52 @@
+<h2 id="access">Access the fleet boundary</h2>
+<p>Use the administrator console on the dedicated operations site or sign in through the CLI. WorkOS access requires the configured administrator Organization and <code>cats:fleet:admin</code> permission by default. Fleet automation may instead use the separate break-glass administrator machine credential.</p>
+<pre><code>cats login
+cats admin monitoring
+cats admin nodes
+
+# Break-glass automation only:
+CATS_TOKEN='administrator-credential' cats admin monitoring</code></pre>
+<div class="callout warning"><strong>Not a user credential</strong><p>The administrator machine token is a fleet automation/break-glass identity. Do not hand it to users, embed it in the console, or put it in a Guest.</p></div>
+
+<h2 id="monitoring">Read fleet monitoring</h2>
+<p><code>cats admin monitoring</code> reports Cat lifecycle counts, node states, CPU/memory assignments, and Operation phases. The administrator console adds auto-refresh, host telemetry, and raw Prometheus metrics. Investigate per-node and per-project data rather than relying only on fleet averages.</p>
+
+<h2 id="node-actions">Node actions</h2>
+<pre><code>cats admin node get node-a
+cats admin node cordon node-a
+cats admin node drain node-a
+cats admin node uncordon node-a
+cats admin node delete node-a</code></pre>
+<table><thead><tr><th>Action</th><th>Use</th><th>Safety condition</th></tr></thead><tbody>
+  <tr><td>Cordon</td><td>Stop new placement</td><td>Existing Cats continue.</td></tr>
+  <tr><td>Drain</td><td>Stop/fence and reschedule Cats, then leave node cordoned</td><td>Durable disk gate and recovery capacity must be available.</td></tr>
+  <tr><td>Uncordon</td><td>Return a healthy node to scheduling</td><td>Version, KVM, NVMe, network, and time checks pass.</td></tr>
+  <tr><td>Delete</td><td>Remove registry record</td><td>Node is empty and cordoned or lost.</td></tr>
+</tbody></table>
+
+<h2 id="drain">Drain workflow</h2>
+<ol>
+  <li>Confirm replacement capacity and object/metadata service health.</li>
+  <li>Cordon the node and observe that new allocations stop.</li>
+  <li>Drain; Suspended and Warm Cats must become Cold before moving hosts.</li>
+  <li>Verify allocations, dirty/pending commits, route bindings, and local snapshots reach zero.</li>
+  <li>Delete or replace the node only after identity and local-cache cleanup.</li>
+</ol>
+
+<h2 id="lost-node">Lost node</h2>
+<p>Do not immediately start duplicate Guests. Wait for the node lease or cloud fencing evidence, revoke old disk ownership, issue a higher attachment epoch, and recover Cats in controlled batches. Rate-limit boot, object GET, and database pressure to avoid a recovery storm.</p>
+
+<h2 id="metrics">Metrics and audit</h2>
+<p>The <code>/metrics</code> endpoint requires administrator authorization. Correlate request ID → Operation → Cat → node → attachment → route epoch. Audit node actions and authorization decisions, but never log tokens, cookies, DSNs, Secret content, terminal plaintext, or Guest disk data.</p>
+
+<h2 id="admin-api">Administrator HTTP API</h2>
+<pre><code>GET    /v1/admin/monitoring
+GET    /v1/admin/nodes
+GET    /v1/admin/nodes/{id}
+DELETE /v1/admin/nodes/{id}
+POST   /v1/admin/nodes/{id}/actions/{verb}
+GET    /metrics</code></pre>
+<p>Supported node action verbs are <code>cordon</code>, <code>uncordon</code>, and <code>drain</code>. Use <code>uncordon</code> to cancel a drain. All routes require the fleet administrator identity; node registration, heartbeat, route resolution, and internal work endpoints remain service-only APIs.</p>
+
+<h2 id="production-caveats">Source-version caveats</h2>
+<p>The current repository still lacks native vhost-user-blk, tap/overlay Guest networking, Suspended page-out (the CH path currently pauses only), PostgreSQL for the project resource store, and privilege separation. The Cloud Hypervisor Phase-A path has passed the recorded bare-metal acceptance run, but those remaining items must be closed before calling the entire stack production-ready.</p>

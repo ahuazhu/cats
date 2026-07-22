@@ -1,0 +1,52 @@
+<h2 id="access">访问 Fleet 管理边界</h2>
+<p>通过独立运维站点的管理员控制台，或在 CLI 中登录。WorkOS 访问需要已配置的管理员 Organization 和默认 <code>cats:fleet:admin</code> Permission；Fleet 自动化也可以使用独立的 break-glass 管理员机器凭据。</p>
+<pre><code>cats login
+cats admin monitoring
+cats admin nodes
+
+# 仅供 break-glass 自动化：
+CATS_TOKEN='administrator-credential' cats admin monitoring</code></pre>
+<div class="callout warning"><strong>这不是用户凭据</strong><p>管理员机器 Token 是 Fleet 自动化/break-glass 身份。不要交给用户、嵌入控制台或放进 Guest。</p></div>
+
+<h2 id="monitoring">查看 Fleet 监控</h2>
+<p><code>cats admin monitoring</code> 报告 Cat 生命周期数量、Node 状态、CPU/内存分配与 Operation 阶段。管理员控制台还提供自动刷新、Host Telemetry 与原始 Prometheus Metrics。应调查每个 Node/Project，而不能只依赖 Fleet 平均值。</p>
+
+<h2 id="node-actions">Node 操作</h2>
+<pre><code>cats admin node get node-a
+cats admin node cordon node-a
+cats admin node drain node-a
+cats admin node uncordon node-a
+cats admin node delete node-a</code></pre>
+<table><thead><tr><th>操作</th><th>用途</th><th>安全条件</th></tr></thead><tbody>
+  <tr><td>Cordon</td><td>停止新 Placement</td><td>现有 Cats 继续运行。</td></tr>
+  <tr><td>Drain</td><td>Stop/Fence 并重调度 Cats，最终保持 Cordoned</td><td>Durable Disk Gate 与恢复容量可用。</td></tr>
+  <tr><td>Uncordon</td><td>让健康 Node 重新参与调度</td><td>版本、KVM、NVMe、网络与时钟检查通过。</td></tr>
+  <tr><td>Delete</td><td>移除 Registry 记录</td><td>Node 为空且处于 Cordoned 或 Lost。</td></tr>
+</tbody></table>
+
+<h2 id="drain">Drain 流程</h2>
+<ol>
+  <li>确认替代容量以及 Object/Metadata 服务健康。</li>
+  <li>Cordon Node，观察不再产生新 Allocation。</li>
+  <li>执行 Drain；Suspended 与 Warm Cat 在跨 Host 前必须转为 Cold。</li>
+  <li>确认 Allocation、Dirty/Pending Commit、Route Binding 与本地 Snapshot 归零。</li>
+  <li>完成身份与本地 Cache 清理后，才能删除或替换 Node。</li>
+</ol>
+
+<h2 id="lost-node">Node 丢失</h2>
+<p>不要立即启动重复 Guest。等待 Node Lease 或云 Fencing 证据，撤销旧磁盘 Owner，签发更高 Attachment Epoch，并分批恢复 Cat。限制 Boot、对象 GET 与数据库压力，避免恢复风暴。</p>
+
+<h2 id="metrics">Metrics 与审计</h2>
+<p><code>/metrics</code> 需要管理员权限。关联 Request ID → Operation → Cat → Node → Attachment → Route Epoch。审计 Node 操作和授权决策，但绝不能记录 Token、Cookie、DSN、Secret、终端明文或 Guest 磁盘数据。</p>
+
+<h2 id="admin-api">管理员 HTTP API</h2>
+<pre><code>GET    /v1/admin/monitoring
+GET    /v1/admin/nodes
+GET    /v1/admin/nodes/{id}
+DELETE /v1/admin/nodes/{id}
+POST   /v1/admin/nodes/{id}/actions/{verb}
+GET    /metrics</code></pre>
+<p>支持的 Node Action Verb 是 <code>cordon</code>、<code>uncordon</code> 与 <code>drain</code>；取消 Drain 也使用 <code>uncordon</code>。所有路由都要求 Fleet Administrator 身份；Node Register/Heartbeat、Route Resolve 与 Internal Work Endpoint 仍是仅供 Service 使用的 API。</p>
+
+<h2 id="production-caveats">当前源码的生产限制</h2>
+<p>仓库仍缺少原生 vhost-user-blk、tap/overlay Guest 网络、Suspended page-out（CH 路径当前仅 Pause）、Project Resource Store 的 PostgreSQL 实现与权限隔离。Cloud Hypervisor Phase-A 路径已经通过已记录的裸金属验收，但在这些剩余项完成前，不能称整个技术栈已经 Production Ready。</p>

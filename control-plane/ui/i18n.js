@@ -28,6 +28,9 @@ const messages = {
     "common.copied": "Copied",
     "common.copyFailed": "Copy failed",
     "common.noMetrics": "# no metrics",
+    "common.docs": "Documentation",
+    "common.userDocsUrl": "https://cats.run/docs/",
+    "common.opsDocsUrl": "/docs/",
     "common.generation": "generation {value}",
     "brand.cloudWorkspaces": "Cloud Workspaces",
     "brand.myWorkspaces": "My Workspaces",
@@ -43,6 +46,7 @@ const messages = {
     "section.prometheus": "PROMETHEUS",
 
     "user.meta.title": "Cats · User Console",
+    "user.meta.description": "Manage Cats Linux cloud workspaces, disks, endpoints, and operations.",
     "user.login.eyebrow": "WELCOME BACK",
     "user.login.title": "Continue to your cloud workspace",
     "user.login.description": "Sign in to create, start, and manage your Cats.",
@@ -144,6 +148,7 @@ const messages = {
     "user.authConfigFailed": "Could not load sign-in configuration: {message}",
 
     "admin.meta.title": "Cats · Administrator Console",
+    "admin.meta.description": "Monitor and administer the Cats compute fleet.",
     "admin.login.eyebrow": "ADMIN SITE",
     "admin.login.title": "Manage the compute fleet",
     "admin.login.description": "Sign in with WorkOS and verify fleet administrator access.",
@@ -278,6 +283,9 @@ const messages = {
     "common.copied": "已复制",
     "common.copyFailed": "复制失败",
     "common.noMetrics": "# 暂无指标",
+    "common.docs": "使用文档",
+    "common.userDocsUrl": "https://cats.run/zh-CN/docs/",
+    "common.opsDocsUrl": "/zh-CN/docs/",
     "common.generation": "版本 {value}",
     "brand.cloudWorkspaces": "云端工作空间",
     "brand.myWorkspaces": "我的工作空间",
@@ -293,6 +301,7 @@ const messages = {
     "section.prometheus": "PROMETHEUS",
 
     "user.meta.title": "Cats · 用户控制台",
+    "user.meta.description": "管理 Cats Linux 云端工作空间、磁盘、Endpoint 与 Operation。",
     "user.login.eyebrow": "欢迎回来",
     "user.login.title": "继续使用你的云端工作空间",
     "user.login.description": "登录后即可创建、启动和管理你的 Cats。",
@@ -394,6 +403,7 @@ const messages = {
     "user.authConfigFailed": "读取登录配置失败：{message}",
 
     "admin.meta.title": "Cats · 管理员控制台",
+    "admin.meta.description": "监控和管理 Cats 计算 Fleet。",
     "admin.login.eyebrow": "管理员站点",
     "admin.login.title": "管理计算 Fleet",
     "admin.login.description": "通过 WorkOS 登录，并验证 Fleet 管理员权限。",
@@ -571,6 +581,12 @@ export function translateDocument(root = document) {
   });
   root.querySelectorAll("[data-i18n-title]").forEach((element) => {
     translateAttribute(element, "title", "i18nTitle");
+  });
+  root.querySelectorAll("[data-i18n-content]").forEach((element) => {
+    translateAttribute(element, "content", "i18nContent");
+  });
+  root.querySelectorAll("[data-i18n-href]").forEach((element) => {
+    translateAttribute(element, "href", "i18nHref");
   });
   root.querySelectorAll("[data-language-select]").forEach((select) => {
     select.value = currentPreference;

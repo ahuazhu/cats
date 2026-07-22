@@ -1,0 +1,39 @@
+<h2 id="operations">Understand Operations</h2>
+<p>Create, lifecycle, and delete requests are asynchronous. The control plane records an Operation with an ID, kind, target resource, phase, timestamps, and an optional structured error.</p>
+<pre><code>cats operation ls
+cats operation get OPERATION_ID
+cats operation wait OPERATION_ID</code></pre>
+<p>Phases move from pending/running to succeeded or failed. A network timeout does not prove that the original mutation failed—look up the accepted Operation before retrying.</p>
+
+<h2 id="errors">Common error classes</h2>
+<table><thead><tr><th>Code</th><th>Meaning</th><th>First response</th></tr></thead><tbody>
+  <tr><td><code>unauthenticated</code></td><td>Missing or expired identity</td><td>Run <code>cats login</code> again or refresh the browser session.</td></tr>
+  <tr><td><code>permission_denied</code></td><td>Valid identity, wrong Workspace</td><td>Run <code>cats whoami</code> and check the saved/overridden Workspace.</td></tr>
+  <tr><td><code>not_found</code></td><td>Resource name or ID does not exist in scope</td><td>Run the matching list command in the same Workspace.</td></tr>
+  <tr><td><code>already_exists</code></td><td>Name collision</td><td>Choose another name or inspect the existing resource.</td></tr>
+  <tr><td><code>failed_precondition</code></td><td>Current lifecycle or attachment state blocks the action</td><td>Inspect Cat/Disk state and finish the prerequisite transition.</td></tr>
+  <tr><td><code>conflict</code></td><td>Concurrent generation or RWO conflict</td><td>Refresh state; do not force a second writer.</td></tr>
+  <tr><td><code>stale_epoch</code></td><td>Old disk or route owner attempted work</td><td>Treat as fenced; rebuild from the current assignment.</td></tr>
+  <tr><td><code>unavailable</code></td><td>Temporary dependency failure</td><td>Retry with bounded backoff and inspect the Operation.</td></tr>
+</tbody></table>
+
+<h2 id="cat-not-ready">Cat does not become Ready</h2>
+<ol>
+  <li>Run <code>cats get NAME --json</code> and note desired/observed state and node.</li>
+  <li>Inspect recent Operations and the final error.</li>
+  <li>Operators check node heartbeat, blockd/Guest readiness, console output, and attachment epoch.</li>
+  <li>If Suspended/Warm restore failed, verify the controller converged to Cold fallback instead of remaining in an intermediate state.</li>
+</ol>
+
+<h2 id="disk-busy">Disk cannot mount, resize, or delete</h2>
+<p>Run <code>cats disk get NAME</code>. A PersistentDisk can have only one active read-write Attachment. Unmount it cleanly before moving or deleting it, and follow the current runtime precondition for resize. Never bypass a fencing conflict.</p>
+
+<h2 id="auto-suspend">Auto-suspend does not trigger</h2>
+<pre><code>cats sleep status dev</code></pre>
+<p>Check active platform/Guest leases, Guest signal freshness, and the printed reason. A stale signal intentionally fails awake. Confirm that long-running applications release expired work and that no shell, exec, deploy, or gateway activation lease remains.</p>
+
+<h2 id="control-plane">Control plane is unreachable</h2>
+<p>Existing Running Cats may continue because API processes are not in the Guest I/O hot path. New lifecycle changes and durable root publication may be delayed or fail closed. Do not claim a FLUSH succeeded while the authoritative metadata CAS is unavailable.</p>
+
+<h2 id="support-bundle">Useful evidence</h2>
+<p>When escalating, preserve the request ID, Operation ID, Workspace/project slug, Cat/Disk name, node ID, generation, attachment/route epoch, timestamps, CLI version, and the structured error. Remove tokens, cookies, Secret values, Guest disk contents, and terminal plaintext.</p>

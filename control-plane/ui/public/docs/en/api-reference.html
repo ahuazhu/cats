@@ -1,0 +1,71 @@
+<h2 id="conventions">Conventions</h2>
+<p>The external API is JSON over HTTP. User resources are scoped by the compatible project segment in <code>/v1/projects/{project}/…</code>; its value is the user-visible Workspace slug. A verified WorkOS identity may access only its selected Workspace, and changing the URL cannot change that authorization context.</p>
+<pre><code>Authorization: Bearer &lt;short-lived-workos-access-token&gt;
+Accept: application/json
+Content-Type: application/json
+Idempotency-Key: &lt;unique-request-id&gt;   # mutations
+If-Match: "&lt;generation&gt;"                # guarded state changes</code></pre>
+<p><code>cats login</code> obtains and refreshes the user token through WorkOS Device Authorization without writing it to the normal config file. Other user clients must use an approved WorkOS flow and the same verified JWT contract; static project tokens are not accepted. Browser consoles use their HttpOnly WorkOS session instead of exposing a Bearer token to JavaScript. Service and administrator machine identities have separate scopes.</p>
+
+<h2 id="identity">Identity and Workspaces</h2>
+<pre><code>GET  /auth/config       # public WorkOS client/base-URL configuration
+GET  /v1/me             # user profile and available Workspaces
+GET  /v1/workspaces     # refresh the available Workspace list
+POST /v1/auth/logout    # revoke the CLI WorkOS session</code></pre>
+<p>Workspace enumeration returns active WorkOS Organization memberships that have an explicit deployment mapping, plus an isolated personal Workspace for an organizationless user. User access-token signature, issuer, client ID, expiry, subject, and Organization scope are verified before a resource path is authorized.</p>
+
+<h2 id="cats">Cats</h2>
+<pre><code>POST   /v1/projects/{project}/cats
+GET    /v1/projects/{project}/cats
+GET    /v1/projects/{project}/cats/{cat}
+DELETE /v1/projects/{project}/cats/{cat}
+POST   /v1/projects/{project}/cats/{cat}/actions/{verb}
+POST   /v1/projects/{project}/cats/{cat}/exec
+GET    /v1/projects/{project}/cats/{cat}/work
+GET    /v1/projects/{project}/cats/{cat}/auto-suspend
+PUT    /v1/projects/{project}/cats/{cat}/auto-suspend</code></pre>
+<p>Lifecycle verbs are <code>start</code>, <code>stop</code>, <code>suspend</code>, <code>resume</code>, and <code>warm</code>. <code>auto_suspend</code> defaults to <code>true</code> when omitted from create. Cat create/lifecycle/delete returns an asynchronous Operation response; poll the Operation URL instead of repeating a timed-out mutation with a new intent.</p>
+<pre><code>POST /v1/projects/acme-dev/cats
+Idempotency-Key: request-7f12
+
+{
+  "name": "dev",
+  "image": "ubuntu-24.04",
+  "cpus": 2,
+  "memory_mib": 2048,
+  "root_size_bytes": 8589934592
+}</code></pre>
+
+<h2 id="disks">Disks and snapshots</h2>
+<pre><code>POST   /v1/projects/{project}/disks
+GET    /v1/projects/{project}/disks
+GET    /v1/projects/{project}/disks/{disk}
+DELETE /v1/projects/{project}/disks/{disk}
+POST   /v1/projects/{project}/disks/{disk}/actions/{verb}
+POST   /v1/projects/{project}/disks/{disk}/snapshots
+GET    /v1/projects/{project}/disks/{disk}/snapshots</code></pre>
+<p>Disk action verbs are <code>mount</code>, <code>unmount</code>, and <code>resize</code>. Mount bodies identify the Cat and Guest path. The service enforces RWO and rejects stale or conflicting attachment state.</p>
+
+<h2 id="endpoints">Endpoints</h2>
+<pre><code>POST /v1/projects/{project}/cats/{cat}/endpoints
+GET  /v1/projects/{project}/cats/{cat}/endpoints</code></pre>
+<pre><code>{
+  "name": "web",
+  "target_port": 3000,
+  "protocol": "http",
+  "wake_policy": "wake_on_request"
+}</code></pre>
+
+<h2 id="operations">Operations</h2>
+<pre><code>GET /v1/projects/{project}/operations
+GET /v1/operations/{operation}</code></pre>
+<p>An Operation contains Workspace ownership (stored as project), kind, target resource ID/generation, phase, timestamps, and an optional structured error. Access is still Workspace-scoped even though the single-Operation URL does not contain the project segment.</p>
+
+<h2 id="errors">Errors</h2>
+<pre><code>{
+  "code": "failed_precondition",
+  "message": "disk must be available before deletion"
+}</code></pre>
+<p>Clients should branch on the stable code and show the message for context. Important codes include <code>invalid_argument</code>, <code>unauthenticated</code>, <code>permission_denied</code>, <code>not_found</code>, <code>already_exists</code>, <code>failed_precondition</code>, <code>conflict</code>, <code>stale_epoch</code>, <code>deadline_exceeded</code>, <code>unavailable</code>, and <code>internal</code>.</p>
+
+<div class="callout"><strong>Version authority</strong><p>This page documents the current V1 Rust router. For generated clients, derive a reviewed OpenAPI description from the same request/resource types before release; do not infer undocumented fields from architecture examples.</p></div>

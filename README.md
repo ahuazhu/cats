@@ -119,12 +119,27 @@ export CATS_ADMIN_TOKEN='admin-secret'
 cargo run -p cats-control-plane-daemon --bin cats-controld
 ```
 
-控制面进程同时提供两个独立的、无需前端构建步骤的站点。生产环境以 `cats.run`
-作为用户入口、`ops.cats.run` 作为管理员入口。两个浏览器站点都只支持 WorkOS
-登录，不提供静态 Token 表单；未配置 WorkOS 时页面会提示联系平台管理员。本地根
-路径直接进入用户站：<http://127.0.0.1:7300/>。
+控制面进程同时提供公开产品站、公开用户文档和两个独立的、无需前端构建步骤的控制台。
+生产环境以 `cats.run` 作为产品/用户文档入口、`app.cats.run/user/` 作为用户控制台、
+`ops.cats.run` 作为管理员入口；Fleet 管理员指南独立发布在 `ops.cats.run/docs/`，不会
+出现在官网文档目录或 sitemap。两个浏览器控制台都只支持 WorkOS 登录，不提供静态
+Token 表单；未配置 WorkOS 时页面会提示联系平台管理员。本地入口：
 
-两个站点均提供英语和简体中文。未保存语言偏好时，页面按浏览器的
+- 产品站：<http://127.0.0.1:7300/>
+- 英文使用文档：<http://127.0.0.1:7300/docs/>
+- 中文使用文档：<http://127.0.0.1:7300/zh-CN/docs/>
+- 用户控制台：<http://127.0.0.1:7300/user/>
+- 管理员控制台：<http://127.0.0.1:7300/admin/>
+
+本地测试管理员指南时，请为 `/docs/` 请求设置 `Host: ops.cats.run`；生产地址提供英语
+`https://ops.cats.run/docs/` 与简体中文 `https://ops.cats.run/zh-CN/docs/`。
+
+产品站与使用文档不要求登录，英语/简体中文分别使用可索引的稳定 URL，并提供 canonical、
+hreflang、Open Graph/Twitter 元数据、JSON-LD、`robots.txt`、`sitemap.xml`、Web
+Manifest 与品牌图形。控制台和认证/API 路径声明 `noindex`，资源数据仍必须经过正常
+会话鉴权。
+
+两个控制台均提供英语和简体中文。未保存语言偏好时，页面按浏览器的
 `navigator.languages` / `navigator.language` 自动选择（中文环境使用简体中文，
 其他环境使用英语）；语言选择器可切换为英语、中文或“跟随系统”，显式选择保存在
 当前站点的浏览器本地存储中。语言偏好只影响展示，不参与 WorkOS session、Project

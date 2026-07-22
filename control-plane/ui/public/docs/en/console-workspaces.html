@@ -1,0 +1,38 @@
+<h2 id="public-and-private">Public site versus console</h2>
+<p>The marketing site and documentation are public. The user console at <a href="/user/"><code>/user/</code></a> and administrator console at <code>/admin/</code> load without credentials so they can start sign-in, but resource data remains unavailable until a valid session is established. Search engines are instructed not to index console or authentication routes.</p>
+
+<h2 id="workos">WorkOS browser sign-in</h2>
+<ol>
+  <li>Choose <strong>Sign in with WorkOS</strong>.</li>
+  <li>The server starts an authorization-code flow with PKCE and a short-lived sealed state cookie.</li>
+  <li>After callback, the server stores access/refresh material only in an encrypted, HttpOnly session cookie.</li>
+  <li>The page calls the same Workspace-scoped resource APIs as the CLI; no service credential is embedded in JavaScript.</li>
+</ol>
+<p>If WorkOS is not configured, the browser sites fail closed and show an operator-facing explanation. They do not fall back to a token entry form.</p>
+
+<h2 id="cli-sign-in">CLI Device Login</h2>
+<p><code>cats login</code> starts WorkOS Device Authorization, prints a verification URL/code, and opens the browser when possible. Access and rotating refresh tokens stay in the operating-system credential store; the <code>0600</code> CLI config contains only the API URL, public user/Workspace data, and the current selection. Use <code>cats whoami</code>, <code>cats workspace list</code>, <code>cats workspace use SLUG</code>, and <code>cats logout</code> to manage that session.</p>
+
+<h2 id="workspaces">Workspaces</h2>
+<p>A WorkOS Organization must be explicitly mapped to one Cats Workspace. An unmapped Organization cannot be enumerated or accessed. A user without an Organization membership receives a deterministic personal Workspace based on the verified WorkOS user ID.</p>
+<div class="callout"><strong>User label versus API compatibility</strong><p>The CLI and console call the boundary a <em>Workspace</em>. The V1 HTTP API path and resource-store column keep the compatible name <code>project</code>; changing that path string cannot change the Workspace established by the verified identity.</p></div>
+<p>Login and selection are separate. <code>cats workspace use acme-dev</code> saves a default and obtains an Organization-scoped access token; <code>--workspace acme-prod</code> overrides one command without changing the default.</p>
+
+<h2 id="user-console">User console</h2>
+<p>The console provides:</p>
+<ul>
+  <li>Fleet-independent overview of your Cats, sleeping states, disks, and active Operations.</li>
+  <li>Create, start, suspend, Warm, stop, exec, expose, and destroy actions for Cats.</li>
+  <li>Create, snapshot, mount, unmount, resize, and delete actions for disks.</li>
+  <li>Structured status and error display with automatic session refresh.</li>
+</ul>
+
+<h2 id="language">Language switching</h2>
+<p>Both user and administrator consoles support English and Simplified Chinese. The default follows <code>navigator.languages</code>/<code>navigator.language</code>. A manual selection is stored locally for the current site and updates static text, dynamic states/actions, form labels, errors, dates, number formatting, document title, and <code>html lang</code>.</p>
+<p>Language preference affects presentation only. It never changes the session, Workspace mapping, permissions, resource values, or API behavior.</p>
+
+<h2 id="admin-boundary">Administrator isolation</h2>
+<p>The administrator site uses a separate cookie and requires both the configured administrator Organization and the configured fleet permission (normally <code>cats:fleet:admin</code>). A normal organization member or user-console cookie cannot call fleet APIs.</p>
+
+<h2 id="sign-out">Sign out and session failure</h2>
+<p>Browser sign out asks WorkOS to revoke the remote session and clears the local cookie. If a session expires, the console attempts server-side refresh; a failed or unauthorized refresh returns to the sign-in screen. <code>cats logout</code> tries remote revocation and removes the local keychain credential even if the network is unavailable. Authentication responses use <code>no-store</code>.</p>

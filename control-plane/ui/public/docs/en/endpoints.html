@@ -1,0 +1,33 @@
+<h2 id="publish">Publish a Guest port</h2>
+<pre><code>cats expose dev 3000 --name web --protocol http
+cats endpoint ls dev</code></pre>
+<p>The command creates an Endpoint with a stable hostname, a target Guest port, and <code>wake_on_request</code> by default. The hostname is tied to the Cat resource, not a particular host.</p>
+
+<h2 id="wake-policy">Wake policy</h2>
+<pre><code>cats expose dev 3000 --name internal-preview --no-wake</code></pre>
+<ul>
+  <li><strong>wake on request:</strong> the gateway singleflights concurrent activation attempts for a sleeping Cat, waits for readiness, and then routes to the new activation epoch.</li>
+  <li><strong>no wake:</strong> a request does not start the Cat; use this for workloads that should serve only while explicitly Running.</li>
+</ul>
+<p>A client should tolerate <code>503</code> with retry guidance during activation and reconnect after lifecycle or host changes. Stable hostname does not mean stable long-lived connections.</p>
+
+<h2 id="protocols">Protocols and routing safety</h2>
+<p>The V1 product model covers HTTP, HTTPS, WebSocket, and secure WebSocket through a regional edge. The node gateway revalidates project, Cat, target port, and route epoch; an old cached route must fail closed instead of reaching a different Guest.</p>
+
+<h2 id="current-availability">Current source availability</h2>
+<div class="callout warning"><strong>Cloud Hypervisor networking is not complete</strong><p>The endpoint API, route epoch logic, wake flow, and FakeVmm gateway path are implemented and tested. Tap/overlay Guest networking for the Cloud Hypervisor Phase-A runtime is not implemented in this repository. Treat a real CH public Endpoint as unavailable until that milestone lands.</p></div>
+
+<h2 id="guest-service">Prepare the Guest service</h2>
+<ol>
+  <li>Listen on the target Guest port, not on a platform-reserved port.</li>
+  <li>Return readiness only after dependencies and disk state are usable.</li>
+  <li>Do not expect Cats to preserve application TCP state across sleep.</li>
+  <li>If background work must keep the Cat Running, acquire a <a href="/docs/runtime-api/">work lease</a>.</li>
+</ol>
+
+<h2 id="troubleshoot">Troubleshoot an Endpoint</h2>
+<pre><code>cats get dev
+cats endpoint ls dev
+cats operation ls
+cats exec dev -- sh -lc 'ss -lnt'</code></pre>
+<p>Verify the Cat is healthy, the Endpoint targets the expected port, the latest activation Operation succeeded, and the Guest service is actually listening. Operators should also check route epoch mismatch and gateway/node connectivity metrics.</p>
