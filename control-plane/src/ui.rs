@@ -1,10 +1,9 @@
 //! Embedded, build-free web consoles. The user and administrator sites call
 //! the same versioned API as the CLI and never receive service credentials.
 
-use axum::http::{header, HeaderValue};
+use axum::http::{header, HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
 
-const PORTAL_HTML: &str = include_str!("../ui/index.html");
 const USER_HTML: &str = include_str!("../ui/user.html");
 const ADMIN_HTML: &str = include_str!("../ui/admin.html");
 const STYLES_CSS: &str = include_str!("../ui/styles.css");
@@ -31,8 +30,20 @@ fn asset(content_type: &'static str, body: &'static str) -> Response {
     response
 }
 
-pub async fn portal() -> Response {
-    asset("text/html; charset=utf-8", PORTAL_HTML)
+pub async fn portal(headers: HeaderMap) -> Response {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(':').next())
+        .unwrap_or_default();
+    match host {
+        "app.cats.run" => axum::response::Redirect::permanent("https://cats.run/").into_response(),
+        "admin.cats.run" => {
+            axum::response::Redirect::permanent("https://ops.cats.run/").into_response()
+        }
+        _ if host.starts_with("ops.") => asset("text/html; charset=utf-8", ADMIN_HTML),
+        _ => asset("text/html; charset=utf-8", USER_HTML),
+    }
 }
 
 pub async fn user_console() -> Response {

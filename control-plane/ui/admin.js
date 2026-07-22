@@ -218,7 +218,7 @@ loginForm.addEventListener("submit", async (event) => {
 });
 
 function startWorkOsLogin() {
-  const query = new URLSearchParams({ site: "admin", return_to: "/admin/" });
+  const query = new URLSearchParams({ site: "admin" });
   window.location.assign(`/auth/login?${query}`);
 }
 

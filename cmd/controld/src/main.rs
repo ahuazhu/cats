@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use cats_metadata_store_postgres::PostgresMetadataStoreFactory;
 use cats_metadata_store_sqlite::SqliteMetadataStoreFactory;
 use cats_storage::{open_metadata_store, AdapterConfig, MetadataStoreFactory};
 use clap::Parser;
@@ -65,6 +66,13 @@ struct Args {
     /// Override Secure on AuthKit cookies. Defaults to true for HTTPS redirects.
     #[arg(long, env = "CATS_WORKOS_COOKIE_SECURE")]
     workos_cookie_secure: Option<bool>,
+    /// Parent domain for AuthKit cookies when consoles use subdomains.
+    #[arg(long, env = "CATS_WORKOS_COOKIE_DOMAIN")]
+    workos_cookie_domain: Option<String>,
+    #[arg(long, env = "CATS_USER_SITE_URL")]
+    user_site_url: Option<String>,
+    #[arg(long, env = "CATS_ADMIN_SITE_URL")]
+    admin_site_url: Option<String>,
     /// Override only for integration tests or an explicit WorkOS proxy.
     #[arg(
         long,
@@ -88,7 +96,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     let metadata_config = AdapterConfig::from_cli(args.metadata_store_options)?;
-    let metadata_factories: [&dyn MetadataStoreFactory; 1] = [&SqliteMetadataStoreFactory];
+    let metadata_factories: [&dyn MetadataStoreFactory; 2] =
+        [&SqliteMetadataStoreFactory, &PostgresMetadataStoreFactory];
     let storage_meta = open_metadata_store(
         &args.metadata_store_adapter,
         &metadata_config,
@@ -123,7 +132,10 @@ async fn main() -> anyhow::Result<()> {
         || args.workos_cookie_password.is_some()
         || args.workos_redirect_uri.is_some()
         || !args.workos_project_organizations.is_empty()
-        || args.workos_admin_organization_id.is_some();
+        || args.workos_admin_organization_id.is_some()
+        || args.workos_cookie_domain.is_some()
+        || args.user_site_url.is_some()
+        || args.admin_site_url.is_some();
     let workos = if any_workos_option {
         let client_id = args
             .workos_client_id
@@ -170,6 +182,9 @@ async fn main() -> anyhow::Result<()> {
                 admin_organization_id,
                 admin_permission: args.workos_admin_permission,
                 cookie_secure,
+                cookie_domain: args.workos_cookie_domain,
+                user_site_url: args.user_site_url,
+                admin_site_url: args.admin_site_url,
                 allow_token_login: args.workos_allow_token_login,
             },
         )?))

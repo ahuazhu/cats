@@ -7,6 +7,7 @@ members = [
     "adapters/object-store-file",
     "adapters/object-store-aws-s3",
     "adapters/metadata-store-sqlite",
+    "adapters/metadata-store-postgres",
     "control-plane",
     "node-agent",
     "guest",
@@ -21,7 +22,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.97"
 
 [workspace.dependencies]
 cats-api = { path = "api" }
@@ -30,6 +31,7 @@ cats-storage = { path = "storage" }
 cats-object-store-file = { path = "adapters/object-store-file" }
 cats-object-store-aws-s3 = { path = "adapters/object-store-aws-s3" }
 cats-metadata-store-sqlite = { path = "adapters/metadata-store-sqlite" }
+cats-metadata-store-postgres = { path = "adapters/metadata-store-postgres" }
 cats-control-plane = { path = "control-plane" }
 cats-node-agent = { path = "node-agent" }
 cats-guest-agent = { path = "guest" }
@@ -53,6 +55,9 @@ tokio = { version = "1", features = [
 axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
+postgres = "0.19.14"
+native-tls = "0.2"
+postgres-native-tls = "0.5.3"
 clap = { version = "4", features = ["derive", "env"] }
 sha2 = "0.10"
 hex = "0.4"

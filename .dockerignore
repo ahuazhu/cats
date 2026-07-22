@@ -1,0 +1,6 @@
+target*
+.git
+.DS_Store
+docs
+experiments
+deploy/metal

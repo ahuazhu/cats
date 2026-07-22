@@ -1,0 +1,34 @@
+[Unit]
+Description=Cats bare-metal worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/cats/worker.env
+ExecStartPre=/usr/sbin/modprobe nbd nbds_max=64
+ExecStart=/opt/cats/bin/cats-noded \
+  --node-id $CATS_NODE_ID \
+  --listen 0.0.0.0:7301 \
+  --advertise-url $CATS_NODE_ADVERTISE_URL \
+  --control-plane-url $CATS_CONTROL_PLANE_URL \
+  --gateway-url $CATS_GATEWAY_URL \
+  --state-dir /var/lib/cats/node \
+  --blockd-bin /opt/cats/bin/cats-blockd \
+  --guest-agent-bin /opt/cats/bin/cats-guest-agent \
+  --metadata-store-adapter postgres \
+  --metadata-store-option ca-file=/etc/cats/rds-ca.pem \
+  --object-store-adapter aws-s3 \
+  --object-store-option bucket=${CATS_S3_BUCKET} \
+  --object-store-option region=${CATS_AWS_REGION} \
+  --object-store-option prefix=cats \
+  --vmm ch \
+  --ch-bin /opt/cats/bin/cloud-hypervisor \
+  --ch-kernel /opt/cats/guest/vmlinuz \
+  --ch-initramfs /opt/cats/guest/initramfs.img \
+  --ch-cmdline "console=ttyS0 root=/dev/vda rw" \
+  --ch-seed-image /opt/cats/guest/rootfs.ext4
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

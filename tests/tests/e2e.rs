@@ -96,6 +96,7 @@ impl Cluster {
         let storage_meta: Arc<dyn MetadataStore> =
             Arc::new(SqliteMetadataStore::open(&meta_path).unwrap());
         spawn_node(ServerConfig {
+            advertise_url: None,
             listen: "127.0.0.1:0".into(),
             control_plane_url: cp.base_url(),
             auth_token: SERVICE_TOKEN.into(),

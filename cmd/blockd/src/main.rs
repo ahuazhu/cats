@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use cats_blockd::engine::{ChunkEngine, EngineConfig};
 use cats_blockd::nbd;
+use cats_metadata_store_postgres::PostgresMetadataStoreFactory;
 use cats_metadata_store_sqlite::SqliteMetadataStoreFactory;
 use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
 use cats_object_store_file::FileBlobStoreFactory;
@@ -70,7 +71,8 @@ fn main() -> Result<()> {
 
     let metadata_config =
         AdapterConfig::from_cli(args.metadata_store_options).context("metadata adapter options")?;
-    let metadata_factories: [&dyn MetadataStoreFactory; 1] = [&SqliteMetadataStoreFactory];
+    let metadata_factories: [&dyn MetadataStoreFactory; 2] =
+        [&SqliteMetadataStoreFactory, &PostgresMetadataStoreFactory];
     let meta = open_metadata_store(
         &args.metadata_store_adapter,
         &metadata_config,

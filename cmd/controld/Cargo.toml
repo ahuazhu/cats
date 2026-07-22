@@ -13,6 +13,7 @@ path = "src/main.rs"
 cats-control-plane = { workspace = true }
 cats-storage = { workspace = true }
 cats-metadata-store-sqlite = { workspace = true }
+cats-metadata-store-postgres = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }

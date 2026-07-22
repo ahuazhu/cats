@@ -12,16 +12,16 @@
     <div class="login-panel">
       <a class="brand brand-large" href="/">
         <span class="brand-mark" aria-hidden="true">C</span>
-        <span><strong>Cats</strong><small>Project Console</small></span>
+        <span><strong>Cats</strong><small>Cloud Workspaces</small></span>
       </a>
       <div class="login-copy">
-        <div class="eyebrow">USER SITE</div>
-        <h1>回到你的 Cat 工作空间</h1>
-        <p id="login-description">通过 WorkOS 安全登录并进入所属 Project。</p>
+        <div class="eyebrow">WELCOME BACK</div>
+        <h1>继续使用你的云端工作空间</h1>
+        <p id="login-description">登录后即可创建、启动和管理你的 Cats。</p>
       </div>
       <form class="login-form" id="login-form">
         <label>
-          <span>Project</span>
+          <span>工作区</span>
           <input id="login-project" name="project" value="default" autocomplete="organization" required>
         </label>
         <button class="button button-primary button-wide is-hidden" id="workos-login-button" type="button">
@@ -42,7 +42,6 @@
           </button>
         </div>
       </form>
-      <a class="back-link" href="/">← 返回站点选择</a>
     </div>
     <aside class="login-art user-art" aria-hidden="true">
       <div class="orbit orbit-one"></div><div class="orbit orbit-two"></div>
@@ -54,25 +53,22 @@
     <aside class="sidebar">
       <a class="brand" href="/">
         <span class="brand-mark" aria-hidden="true">C</span>
-        <span><strong>Cats</strong><small>User Console</small></span>
+        <span><strong>Cats</strong><small>My Workspaces</small></span>
       </a>
-      <div class="context-card"><small>PROJECT</small><strong id="sidebar-project">default</strong><span>项目资源边界</span></div>
+      <div class="context-card"><small>WORKSPACE</small><strong id="sidebar-project">default</strong><span>你的资源空间</span></div>
       <nav class="nav-list" aria-label="用户控制台导航">
         <button class="nav-item is-active" data-view="overview"><span>⌂</span>概览</button>
         <button class="nav-item" data-view="cats"><span>◇</span>Cats</button>
         <button class="nav-item" data-view="disks"><span>▱</span>磁盘</button>
         <button class="nav-item" data-view="operations"><span>↻</span>Operations</button>
       </nav>
-      <div class="sidebar-footer">
-        <a href="/admin/">切换到管理员站</a>
-        <button id="logout-button">退出登录</button>
-      </div>
+      <div class="sidebar-footer"><button id="logout-button">退出登录</button></div>
     </aside>
 
     <main class="workspace">
       <header class="topbar">
         <button class="mobile-menu" id="mobile-menu" aria-label="打开导航">☰</button>
-        <div><span class="breadcrumb">Project / <b id="header-project">default</b></span><h1 id="view-title">项目概览</h1></div>
+        <div><span class="breadcrumb">工作区 / <b id="header-project">default</b></span><h1 id="view-title">工作区概览</h1></div>
         <div class="topbar-actions"><span class="live-indicator"><i></i>Connected</span><button class="button button-quiet" id="refresh-button">刷新</button><button class="button button-primary" id="create-cat-button">＋ 创建 Cat</button></div>
       </header>
 
@@ -86,7 +82,7 @@
         </section>
 
         <section class="view" id="view-cats">
-          <section class="panel"><header class="panel-header"><div><small>COMPUTE</small><h2>我的 Cats</h2><p>管理生命周期、执行命令或销毁计算实例。</p></div><button class="button button-primary" data-create-cat>＋ 创建 Cat</button></header><div class="table-wrap"><table><thead><tr><th>名称</th><th>状态</th><th>规格</th><th>节点</th><th>创建时间</th><th class="align-right">操作</th></tr></thead><tbody id="cats-table"></tbody></table></div><div class="empty-state is-hidden" id="cats-empty"><span>◇</span><h3>还没有 Cat</h3><p>创建第一个可休眠、带持久 RootDisk 的工作空间。</p><button class="button button-primary" data-create-cat>创建 Cat</button></div></section>
+          <section class="panel"><header class="panel-header"><div><small>COMPUTE</small><h2>我的 Cats</h2><p>启动、暂停或管理你的云端工作空间。</p></div><button class="button button-primary" data-create-cat>＋ 创建 Cat</button></header><div class="table-wrap"><table><thead><tr><th>名称</th><th>状态</th><th>规格</th><th>节点</th><th>创建时间</th><th class="align-right">操作</th></tr></thead><tbody id="cats-table"></tbody></table></div><div class="empty-state is-hidden" id="cats-empty"><span>◇</span><h3>还没有 Cat</h3><p>创建你的第一个云端工作空间。</p><button class="button button-primary" data-create-cat>创建 Cat</button></div></section>
         </section>
 
         <section class="view" id="view-disks">

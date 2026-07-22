@@ -1,0 +1,23 @@
+FROM rust:1.97-bookworm AS builder
+
+WORKDIR /src
+COPY . .
+RUN cargo build --locked --release \
+    -p cats-control-plane-daemon \
+    -p cats-network
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 cats \
+    && useradd --uid 10001 --gid cats --home-dir /var/lib/cats --create-home cats
+
+COPY --from=builder /src/target/release/cats-controld /usr/local/bin/cats-controld
+COPY --from=builder /src/target/release/cats-gatewayd /usr/local/bin/cats-gatewayd
+
+USER 10001:10001
+WORKDIR /var/lib/cats
+EXPOSE 7300 7400
+ENTRYPOINT ["/usr/local/bin/cats-controld"]

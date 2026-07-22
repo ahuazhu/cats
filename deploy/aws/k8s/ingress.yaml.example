@@ -1,0 +1,102 @@
+# Render the environment-specific certificate ARN and every public EKS subnet
+# before
+# applying. This file intentionally contains no AWS account or VPC identifiers.
+apiVersion: eks.amazonaws.com/v1
+kind: IngressClassParams
+metadata:
+  name: cats-public
+spec:
+  scheme: internet-facing
+  targetType: ip
+  ipAddressType: ipv4
+  certificateARNs:
+    - CATS_ACM_CERTIFICATE_ARN
+  listeners:
+    - protocol: HTTP
+      port: 80
+    - protocol: HTTPS
+      port: 443
+  namespaceSelector:
+    matchLabels:
+      cats.run/ingress: enabled
+  subnets:
+    ids:
+      - CATS_PUBLIC_SUBNET_A
+      - CATS_PUBLIC_SUBNET_B
+      - CATS_PUBLIC_SUBNET_C
+      - CATS_PUBLIC_SUBNET_D
+      - CATS_PUBLIC_SUBNET_E
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: cats-public
+spec:
+  controller: eks.amazonaws.com/alb
+  parameters:
+    apiGroup: eks.amazonaws.com
+    kind: IngressClassParams
+    name: cats-public
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cats-public
+  namespace: cats
+  annotations:
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+spec:
+  ingressClassName: cats-public
+  rules:
+    - host: cats.run
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cats-controld
+                port:
+                  number: 7300
+    - host: app.cats.run
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cats-controld
+                port:
+                  number: 7300
+    - host: ops.cats.run
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cats-controld
+                port:
+                  number: 7300
+    # Legacy host kept only so the application can redirect old bookmarks.
+    - host: admin.cats.run
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cats-controld
+                port:
+                  number: 7300
+    - host: "*.cats.run"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cats-gatewayd
+                port:
+                  number: 7400

@@ -45,8 +45,8 @@ AWS S3 实现都位于 `cats-blockd` crate；控制面为了使用元数据契�
 - 本 ADR 修正 ADR-0003 第 3 条中“抽象只用于测试替身”的范围：ports 是长期架构
   边界，AWS S3 是第一个生产 adapter；未来是否增加其他生产 adapter 另按需求
   决定，但不允许为具体云产品污染核心契约。
-- PostgreSQL metadata adapter 仍是 Linux/生产里程碑；SQLite 不是生产多节点
-  权威元数据实现。
+- PostgreSQL metadata adapter 已按同一 port 实现，并作为 Linux/AWS 多节点
+  root/lease 权威元数据实现；SQLite 只用于本地开发。
 
 ## 影响
 

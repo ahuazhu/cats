@@ -22,6 +22,9 @@ use crate::runtime::{NodeConfig, NodeRuntime};
 #[derive(Clone)]
 pub struct ServerConfig {
     pub listen: String,
+    /// URL other components use to reach this node. Required when `listen`
+    /// uses a wildcard address such as `0.0.0.0:7301`.
+    pub advertise_url: Option<String>,
     pub control_plane_url: String,
     pub auth_token: String,
     pub gateway_url: String,
@@ -200,9 +203,19 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
+    let agent_url = cfg
+        .advertise_url
+        .clone()
+        .unwrap_or_else(|| format!("http://{addr}"));
+    anyhow::ensure!(
+        reqwest::Url::parse(&agent_url).is_ok_and(|url| matches!(url.scheme(), "http" | "https")
+            && url.has_host()
+            && !url.cannot_be_a_base()),
+        "node advertise URL must be an absolute HTTP(S) URL"
+    );
     let register = RegisterNodeRequest {
         node_id: cfg.node.node_id.clone(),
-        agent_url: format!("http://{addr}"),
+        agent_url,
         gateway_url: cfg.gateway_url.clone(),
         cpus: cfg.cpus,
         memory_mib: cfg.memory_mib,

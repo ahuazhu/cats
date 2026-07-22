@@ -9,8 +9,8 @@
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cats_storage::blob::{validate_key, BlobError, BlobStore, Result};
 use cats_storage::{AdapterConfig, AdapterError, BlobStoreFactory};
@@ -37,6 +37,31 @@ pub struct AwsS3Config {
 pub struct AwsS3BlobStore {
     cfg: AwsS3Config,
     client: reqwest::blocking::Client,
+    credentials: Mutex<CredentialState>,
+}
+
+#[derive(Clone)]
+struct SigningCredentials {
+    access_key: String,
+    secret_key: String,
+    session_token: Option<String>,
+}
+
+enum CredentialState {
+    Static(SigningCredentials),
+    Imds {
+        role_name: String,
+        credentials: SigningCredentials,
+        refreshed_at: Instant,
+    },
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ImdsCredentialDocument {
+    access_key_id: String,
+    secret_access_key: String,
+    token: String,
 }
 
 impl AwsS3BlobStore {
@@ -72,7 +97,61 @@ impl AwsS3BlobStore {
                 key: "<client>".into(),
                 message: e.to_string(),
             })?;
-        Ok(Self { cfg, client })
+        let credentials = SigningCredentials {
+            access_key: cfg.access_key.clone(),
+            secret_key: cfg.secret_key.clone(),
+            session_token: cfg.session_token.clone(),
+        };
+        Ok(Self {
+            cfg,
+            client,
+            credentials: Mutex::new(CredentialState::Static(credentials)),
+        })
+    }
+
+    fn from_instance_role(mut cfg: AwsS3Config) -> Result<Self> {
+        let (role_name, credentials) = load_imds_credentials(None)?;
+        cfg.access_key = credentials.access_key.clone();
+        cfg.secret_key = credentials.secret_key.clone();
+        cfg.session_token = credentials.session_token.clone();
+        let mut store = Self::new(cfg)?;
+        store.credentials = Mutex::new(CredentialState::Imds {
+            role_name,
+            credentials,
+            refreshed_at: Instant::now(),
+        });
+        Ok(store)
+    }
+
+    fn signing_credentials(&self, key_for_errors: &str) -> Result<SigningCredentials> {
+        let mut state = self.credentials.lock().map_err(|_| BlobError::Backend {
+            key: key_for_errors.into(),
+            message: "AWS credential mutex was poisoned".into(),
+        })?;
+        match &mut *state {
+            CredentialState::Static(credentials) => Ok(credentials.clone()),
+            CredentialState::Imds {
+                role_name,
+                credentials,
+                refreshed_at,
+            } => {
+                // EC2 role credentials normally last hours. Refreshing every
+                // five minutes avoids depending on timestamp parsing while
+                // keeping a long-running blockd process current.
+                if refreshed_at.elapsed() >= Duration::from_secs(5 * 60) {
+                    let (_, replacement) =
+                        load_imds_credentials(Some(role_name)).map_err(|error| {
+                            BlobError::Backend {
+                                key: key_for_errors.into(),
+                                message: format!("refresh EC2 instance-role credentials: {error}"),
+                            }
+                        })?;
+                    *credentials = replacement;
+                    *refreshed_at = Instant::now();
+                }
+                Ok(credentials.clone())
+            }
+        }
     }
 
     fn full_key(&self, key: &str) -> String {
@@ -123,13 +202,14 @@ impl AwsS3BlobStore {
         let (amz_date, date_stamp) = amz_timestamp(now);
         let payload_hash = hex::encode(Sha256::digest(body));
         let host = self.host();
+        let credentials = self.signing_credentials(key_for_errors)?;
 
         let mut headers = vec![
             ("host".to_string(), host.clone()),
             ("x-amz-content-sha256".to_string(), payload_hash.clone()),
             ("x-amz-date".to_string(), amz_date.clone()),
         ];
-        if let Some(token) = &self.cfg.session_token {
+        if let Some(token) = &credentials.session_token {
             headers.push(("x-amz-security-token".to_string(), token.clone()));
         }
         headers.extend(
@@ -147,8 +227,8 @@ impl AwsS3BlobStore {
             &date_stamp,
             &self.cfg.region,
             "s3",
-            &self.cfg.access_key,
-            &self.cfg.secret_key,
+            &credentials.access_key,
+            &credentials.secret_key,
         );
 
         let url = self.url(path, query);
@@ -189,6 +269,89 @@ impl AwsS3BlobStore {
     }
 }
 
+fn load_imds_credentials(role_name: Option<&str>) -> Result<(String, SigningCredentials)> {
+    if std::env::var("AWS_EC2_METADATA_DISABLED").is_ok_and(|value| value == "true") {
+        return Err(BlobError::Backend {
+            key: "<credentials>".into(),
+            message: "EC2 instance metadata is disabled".into(),
+        });
+    }
+    const IMDS: &str = "http://169.254.169.254/latest";
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(3))
+        .build()
+        .map_err(|error| BlobError::Backend {
+            key: "<credentials>".into(),
+            message: format!("build EC2 metadata client: {error}"),
+        })?;
+    let token = client
+        .put(format!("{IMDS}/api/token"))
+        .header("x-aws-ec2-metadata-token-ttl-seconds", "21600")
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .and_then(reqwest::blocking::Response::text)
+        .map_err(|error| BlobError::Backend {
+            key: "<credentials>".into(),
+            message: format!("obtain EC2 metadata token: {error}"),
+        })?;
+    let role_name = match role_name {
+        Some(role_name) => role_name.to_string(),
+        None => client
+            .get(format!("{IMDS}/meta-data/iam/security-credentials/"))
+            .header("x-aws-ec2-metadata-token", &token)
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .and_then(reqwest::blocking::Response::text)
+            .map(|value| value.trim().to_string())
+            .map_err(|error| BlobError::Backend {
+                key: "<credentials>".into(),
+                message: format!("discover EC2 instance role: {error}"),
+            })?,
+    };
+    if role_name.is_empty() || role_name.contains(['/', '\n', '\r']) {
+        return Err(BlobError::Backend {
+            key: "<credentials>".into(),
+            message: "EC2 metadata returned an invalid role name".into(),
+        });
+    }
+    let document: ImdsCredentialDocument = client
+        .get(format!(
+            "{IMDS}/meta-data/iam/security-credentials/{role_name}"
+        ))
+        .header("x-aws-ec2-metadata-token", token)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .and_then(reqwest::blocking::Response::text)
+        .map_err(|error| BlobError::Backend {
+            key: "<credentials>".into(),
+            message: format!("read EC2 instance-role credentials: {error}"),
+        })
+        .and_then(|body| {
+            serde_json::from_str(&body).map_err(|error| BlobError::Backend {
+                key: "<credentials>".into(),
+                message: format!("decode EC2 instance-role credentials: {error}"),
+            })
+        })?;
+    if document.access_key_id.is_empty()
+        || document.secret_access_key.is_empty()
+        || document.token.is_empty()
+    {
+        return Err(BlobError::Backend {
+            key: "<credentials>".into(),
+            message: "EC2 metadata returned incomplete credentials".into(),
+        });
+    }
+    Ok((
+        role_name,
+        SigningCredentials {
+            access_key: document.access_key_id,
+            secret_key: document.secret_access_key,
+            session_token: Some(document.token),
+        },
+    ))
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AwsS3BlobStoreFactory;
 
@@ -208,26 +371,29 @@ impl BlobStoreFactory for AwsS3BlobStoreFactory {
             .optional("endpoint")
             .map(str::to_string)
             .unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com"));
-        let access_key =
-            std::env::var("AWS_ACCESS_KEY_ID").map_err(|_| AdapterError::InvalidConfig {
+        let access_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
+        let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+        if access_key.is_some() != secret_key.is_some() {
+            return Err(AdapterError::InvalidConfig {
                 adapter: ADAPTER_NAME,
-                message: "AWS_ACCESS_KEY_ID is not set".into(),
-            })?;
-        let secret_key =
-            std::env::var("AWS_SECRET_ACCESS_KEY").map_err(|_| AdapterError::InvalidConfig {
-                adapter: ADAPTER_NAME,
-                message: "AWS_SECRET_ACCESS_KEY is not set".into(),
-            })?;
+                message: "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set together".into(),
+            });
+        }
         let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
-        AwsS3BlobStore::new(AwsS3Config {
+        let config = AwsS3Config {
             endpoint,
             bucket,
             region,
-            access_key,
-            secret_key,
+            access_key: access_key.clone().unwrap_or_default(),
+            secret_key: secret_key.unwrap_or_default(),
             session_token,
             prefix: config.optional("prefix").unwrap_or_default().to_string(),
-        })
+        };
+        if access_key.is_some() {
+            AwsS3BlobStore::new(config)
+        } else {
+            AwsS3BlobStore::from_instance_role(config)
+        }
         .map(|store| Arc::new(store) as Arc<dyn BlobStore>)
         .map_err(|error| AdapterError::Open {
             adapter: ADAPTER_NAME,

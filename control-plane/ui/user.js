@@ -37,7 +37,7 @@ const execDialog = document.querySelector("#exec-dialog");
 
 initTokenToggle();
 initNavigation(
-  { overview: "项目概览", cats: "Cats", disks: "Persistent Disks", operations: "Operations" },
+  { overview: "工作区概览", cats: "Cats", disks: "Persistent Disks", operations: "Operations" },
   (view) => { state.activeView = view; },
 );
 
@@ -333,10 +333,10 @@ loginForm.addEventListener("submit", async (event) => {
 function startWorkOsLogin() {
   const project = document.querySelector("#login-project").value.trim();
   if (!project) {
-    loginError.textContent = "Project 不能为空";
+    loginError.textContent = "工作区不能为空";
     return;
   }
-  const query = new URLSearchParams({ site: "user", project, return_to: "/user/" });
+  const query = new URLSearchParams({ site: "user", project });
   window.location.assign(`/auth/login?${query}`);
 }
 
@@ -467,8 +467,8 @@ async function initializeAuth() {
     document.querySelector("#workos-login-button").classList.toggle("is-hidden", !state.authConfig.workos_enabled);
     document.querySelector("#token-login-section").classList.toggle("is-hidden", !state.authConfig.token_login_enabled);
     document.querySelector("#login-description").textContent = state.authConfig.workos_enabled
-      ? "通过 WorkOS 安全登录并进入所属 Project。"
-      : "使用 Project Token 登录。凭证仅保存在当前浏览器标签页中。";
+      ? "登录后即可创建、启动和管理你的 Cats。"
+      : "使用工作区 Token 登录。凭证仅保存在当前浏览器标签页中。";
     if (state.authConfig.workos_enabled) {
       try {
         const session = await request("/auth/session?site=user", "");

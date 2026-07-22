@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use cats_metadata_store_postgres::PostgresMetadataStoreFactory;
 use cats_metadata_store_sqlite::SqliteMetadataStoreFactory;
 use cats_node_agent::runtime::NodeConfig;
 use cats_node_agent::server::{spawn, ServerConfig};
@@ -13,6 +14,8 @@ struct Args {
     node_id: String,
     #[arg(long, default_value = "127.0.0.1:0")]
     listen: String,
+    #[arg(long, env = "CATS_NODE_ADVERTISE_URL")]
+    advertise_url: Option<String>,
     #[arg(long)]
     control_plane_url: String,
     #[arg(long, env = "CATS_AUTH_TOKEN", default_value = "dev-service-token")]
@@ -78,7 +81,8 @@ async fn main() -> anyhow::Result<()> {
         args.object_store_adapter,
         AdapterConfig::from_cli(args.object_store_options)?,
     );
-    let metadata_factories: [&dyn MetadataStoreFactory; 1] = [&SqliteMetadataStoreFactory];
+    let metadata_factories: [&dyn MetadataStoreFactory; 2] =
+        [&SqliteMetadataStoreFactory, &PostgresMetadataStoreFactory];
     let storage_meta = open_metadata_store(
         &metadata_store.name,
         &metadata_store.config,
@@ -99,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let handle = spawn(ServerConfig {
         listen: args.listen,
+        advertise_url: args.advertise_url,
         control_plane_url: args.control_plane_url,
         auth_token: args.auth_token,
         gateway_url: args.gateway_url,

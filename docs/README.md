@@ -8,7 +8,7 @@ HTML 面向人类阅读和视觉演示；同名 Markdown 面向 Agent/实现者�
 |---|---|---|
 | [blockd 协议规格](specs/blockd-protocol.md) | Frozen v1 | `blockd/`（常量出处 `api/src/chunk.rs`）；改动需新增 ADR |
 
-实现状态一览见根 [README](../README.md#实现状态)。真实 microVM（Cloud Hypervisor + KVM）已实现为 node-agent 的 `--vmm ch` 模式（`node-agent/src/ch.rs`），块路径 Phase A 经内核 NBD 复用已验前端，裸金属部署与验收见 [deploy/metal/](../deploy/metal/README.md)。仍属后续里程碑：原生 vhost-user-blk（性能）、tap/overlay Guest 网络、多节点共享 PostgreSQL 元数据、特权拆分。
+实现状态一览见根 [README](../README.md#实现状态)。真实 microVM（Cloud Hypervisor + KVM）已实现为 node-agent 的 `--vmm ch` 模式（`node-agent/src/ch.rs`），块路径 Phase A 经内核 NBD 复用已验前端，裸金属部署与验收见 [deploy/metal/](../deploy/metal/README.md)。共享 PostgreSQL root/lease 元数据 adapter 已实现；仍属后续里程碑：原生 vhost-user-blk（性能）、tap/overlay Guest 网络、控制面资源库 PostgreSQL/outbox 化、特权拆分。
 
 Rust 工程质量现状、已修问题和后续优先项见 [Rust 工程实践审查](rust-engineering-review.md)。
 

@@ -1,0 +1,15 @@
+[package]
+name = "cats-metadata-store-postgres"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+cats-storage = { workspace = true }
+native-tls = { workspace = true }
+postgres = { workspace = true }
+postgres-native-tls = { workspace = true }
+
+[lints]
+workspace = true

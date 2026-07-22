@@ -18,6 +18,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
+use axum::routing::get;
 use axum::Router;
 
 use cats_api::resources::{ObservedState, RouteBinding, WakePolicy};
@@ -294,7 +295,10 @@ pub async fn spawn(cfg: GatewayConfig) -> anyhow::Result<Handle> {
         .await
         .with_context(|| format!("bind {}", gw.cfg.listen))?;
     let addr = listener.local_addr()?;
-    let app = Router::new().fallback(any(entry)).with_state(gw);
+    let app = Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .fallback(any(entry))
+        .with_state(gw);
     let task = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!("gateway exited: {e}");

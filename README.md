@@ -55,7 +55,7 @@ Cats 是一个从零实现的独立项目：为用户提供可休眠、可迁移
 ```text
 cmd/                      daemon composition roots 与 cats CLI；只在这里注册具体 adapter
 storage/                  云无关 BlobStore/MetadataStore ports、错误契约与 adapter factory
-adapters/                 具体实现：File、SQLite（开发）与 AWS S3（首个 durable adapter）
+adapters/                 具体实现：File/AWS S3 对象存储、SQLite/PostgreSQL 元数据
 control-plane/            项目隔离 API、用户/管理员 Web 控制台、Operation、Scheduler、节点管理/监控
 node-agent/               NodeJob 执行器、FakeVmm、blockd 子进程监督、心跳（cats-noded）
 blockd/                   ChunkStore 引擎：Cache/Bitmap/Pack/Map、FLUSH 提交协议、
@@ -74,9 +74,9 @@ docs/                     架构、决策、协议规格和实验报告
 |---|---|---|
 | 存储引擎（blockd） | ✅ 实现并测试 | 协议见 [docs/specs/blockd-protocol.md](docs/specs/blockd-protocol.md)；4 个提交窗口 kill -9 恢复、空缓存冷恢复、stale epoch 拒绝均有测试 |
 | 控制面 / Web 控制台 / CLI / 网关 / node-agent / guest-agent | ✅ 实现并测试 | 项目鉴权、生命周期、独立 user/admin 站点、fleet 管理、监控、单元 + 集成 + E2E 覆盖完整开发闭环 |
-| 存储 ports / adapters | ✅ 接口拆分 | `cats-storage` 不含厂商依赖；File/SQLite 为开发 adapter，AWS S3 为首个 durable object-store adapter |
+| 存储 ports / adapters | ✅ 接口拆分 | `cats-storage` 不含厂商依赖；File/SQLite 为开发 adapter，AWS S3 与 PostgreSQL 为 AWS 生产部署 adapter |
 | AWS S3 adapter | ✅ 代码 + 签名向量测试 | SigV4 通过 AWS 官方测试向量；对真实 AWS S3/MinIO 的联测按需运行 |
-| 元数据存储 | SQLite（开发） | 与规格同 SQL 形状；生产 PostgreSQL 为后续替换项 |
+| 元数据存储 | ✅ SQLite + PostgreSQL | SQLite 用于本地开发；PostgreSQL adapter 实现 root/lease/fencing 的数据库时钟与原子 CAS，并用于 AWS EKS/metal 共享元数据 |
 | 虚拟化 | FakeVmm + **Cloud Hypervisor 模式**（`--vmm ch`，Linux+KVM） | CH 直接内核启动、vsock Guest Agent、vm.pause/resume、Warm=vm.snapshot/--restore；块路径 Phase A 走内核 NBD（正确性等价，vhost-user 为性能里程碑）；部署见 `deploy/metal/` |
 | Guest 网络 / tap / overlay | 未实现 | 下一里程碑；exec/健康走 vsock；Endpoint 演示仅 FakeVmm 形态 |
 
@@ -116,12 +116,13 @@ export CATS_ADMIN_TOKEN='admin-secret'
 cargo run -p cats-control-plane-daemon --bin cats-controld
 ```
 
-控制面进程同时提供两个独立的、无需前端构建步骤的管理站点。未配置 WorkOS 时，
-本地开发仍可使用当前标签页 `sessionStorage` 中的 token：
+控制面进程同时提供两个独立的、无需前端构建步骤的站点。生产环境以 `cats.run`
+作为用户入口、`ops.cats.run` 作为管理员入口。未配置 WorkOS 时，本地开发仍可使用
+当前标签页 `sessionStorage` 中的 token：
 
 - 用户站：<http://127.0.0.1:7300/user/>，使用 project 名和对应的 Project Token。
 - 管理员站：<http://127.0.0.1:7300/admin/>，使用 Administrator Token。
-- 站点入口：<http://127.0.0.1:7300/>。
+- 本地根路径直接进入用户站：<http://127.0.0.1:7300/>。
 
 ### WorkOS AuthKit 登录
 

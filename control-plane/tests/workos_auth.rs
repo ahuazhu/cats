@@ -118,6 +118,9 @@ impl Ctx {
             admin_organization_id: "org_admin".into(),
             admin_permission: "cats:fleet:admin".into(),
             cookie_secure: false,
+            cookie_domain: None,
+            user_site_url: None,
+            admin_site_url: None,
             allow_token_login: false,
         })
         .unwrap();

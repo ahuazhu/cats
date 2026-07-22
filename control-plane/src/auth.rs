@@ -39,6 +39,9 @@ pub struct WorkOsConfig {
     admin_organization_id: String,
     admin_permission: String,
     cookie_secure: bool,
+    cookie_domain: Option<String>,
+    user_site_url: String,
+    admin_site_url: String,
     allow_token_login: bool,
 }
 
@@ -53,6 +56,11 @@ pub struct WorkOsConfigParams {
     pub admin_organization_id: String,
     pub admin_permission: String,
     pub cookie_secure: bool,
+    /// Optional parent domain used when user/admin sites are on subdomains.
+    pub cookie_domain: Option<String>,
+    /// Login completion destinations. Relative paths preserve local-dev behavior.
+    pub user_site_url: Option<String>,
+    pub admin_site_url: Option<String>,
     pub allow_token_login: bool,
 }
 
@@ -106,6 +114,21 @@ impl WorkOsConfig {
         public_base.set_query(None);
         public_base.set_fragment(None);
 
+        if let Some(domain) = &params.cookie_domain {
+            anyhow::ensure!(
+                !domain.is_empty()
+                    && !domain.starts_with('.')
+                    && !domain
+                        .chars()
+                        .any(|ch| ch.is_whitespace() || ch == ';' || ch == '/'),
+                "WorkOS cookie domain must be a bare DNS name"
+            );
+        }
+        let user_site_url = params.user_site_url.unwrap_or_else(|| "/user/".into());
+        let admin_site_url = params.admin_site_url.unwrap_or_else(|| "/admin/".into());
+        validate_site_url(&user_site_url, "user")?;
+        validate_site_url(&admin_site_url, "admin")?;
+
         let client = workos::Client::builder()
             .client_id(params.client_id)
             .api_key(params.api_key)
@@ -121,6 +144,9 @@ impl WorkOsConfig {
             admin_organization_id: params.admin_organization_id,
             admin_permission: params.admin_permission,
             cookie_secure: params.cookie_secure,
+            cookie_domain: params.cookie_domain,
+            user_site_url,
+            admin_site_url,
             allow_token_login: params.allow_token_login,
         })
     }
@@ -132,6 +158,29 @@ impl WorkOsConfig {
                 (candidate == organization_id).then_some(project.as_str())
             })
     }
+
+    fn site_url(&self, site: Site) -> &str {
+        match site {
+            Site::User => &self.user_site_url,
+            Site::Admin => &self.admin_site_url,
+        }
+    }
+}
+
+fn validate_site_url(value: &str, site: &str) -> anyhow::Result<()> {
+    if value.starts_with('/') && !value.starts_with("//") {
+        return Ok(());
+    }
+    let url = reqwest::Url::parse(value)
+        .map_err(|error| anyhow::anyhow!("invalid {site} site URL: {error}"))?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.has_host()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "{site} site URL must be an absolute HTTP(S) URL without query or fragment"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,9 +325,9 @@ pub async fn login(
     let return_to = query
         .return_to
         .as_deref()
-        .filter(|value| *value == site.root())
-        .unwrap_or(site.root())
-        .to_string();
+        .filter(|value| *value == site.root() || *value == config.site_url(site))
+        .map(str::to_string)
+        .unwrap_or_else(|| config.site_url(site).to_string());
     let authorization = config
         .client
         .authkit()
@@ -307,6 +356,7 @@ pub async fn login(
         &sealed,
         FLOW_MAX_AGE_SECONDS,
         config.cookie_secure,
+        config.cookie_domain.as_deref(),
     )?;
     set_no_store(&mut response);
     Ok(response)
@@ -402,8 +452,14 @@ pub async fn callback(
         &sealed_session,
         SESSION_MAX_AGE_SECONDS,
         config.cookie_secure,
+        config.cookie_domain.as_deref(),
     )?;
-    append_delete_cookie(&mut response, flow.site.flow_cookie(), config.cookie_secure)?;
+    append_delete_cookie(
+        &mut response,
+        flow.site.flow_cookie(),
+        config.cookie_secure,
+        config.cookie_domain.as_deref(),
+    )?;
     set_no_store(&mut response);
     Ok(response)
 }
@@ -473,6 +529,7 @@ pub async fn session(
             &sealed,
             SESSION_MAX_AGE_SECONDS,
             config.cookie_secure,
+            config.cookie_domain.as_deref(),
         )?;
     }
     set_no_store(&mut response);
@@ -496,7 +553,12 @@ pub async fn logout(
         .logout_url(Some(&config.public_base_url))
         .unwrap_or_else(|_| config.public_base_url.clone());
     let mut response = Redirect::to(&destination).into_response();
-    append_delete_cookie(&mut response, site.session_cookie(), config.cookie_secure)?;
+    append_delete_cookie(
+        &mut response,
+        site.session_cookie(),
+        config.cookie_secure,
+        config.cookie_domain.as_deref(),
+    )?;
     set_no_store(&mut response);
     Ok(response)
 }
@@ -604,10 +666,14 @@ fn append_set_cookie(
     value: &str,
     max_age_seconds: u64,
     secure: bool,
+    domain: Option<&str>,
 ) -> Result<(), Failure> {
     let secure_attribute = if secure { "; Secure" } else { "" };
+    let domain_attribute = domain
+        .map(|value| format!("; Domain={value}"))
+        .unwrap_or_default();
     let cookie = format!(
-        "{name}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age_seconds}{secure_attribute}"
+        "{name}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age_seconds}{secure_attribute}{domain_attribute}"
     );
     let value = HeaderValue::from_str(&cookie)
         .map_err(|_| ApiError::internal("failed to encode session cookie"))?;
@@ -615,8 +681,13 @@ fn append_set_cookie(
     Ok(())
 }
 
-fn append_delete_cookie(response: &mut Response, name: &str, secure: bool) -> Result<(), Failure> {
-    append_set_cookie(response, name, "", 0, secure)
+fn append_delete_cookie(
+    response: &mut Response,
+    name: &str,
+    secure: bool,
+    domain: Option<&str>,
+) -> Result<(), Failure> {
+    append_set_cookie(response, name, "", 0, secure, domain)
 }
 
 fn set_no_store(response: &mut Response) {

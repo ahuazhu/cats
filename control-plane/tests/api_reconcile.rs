@@ -267,7 +267,7 @@ impl Ctx {
 async fn embedded_user_and_admin_sites_are_served_without_credentials() {
     let ctx = Ctx::new().await;
     let assets = [
-        ("/", "text/html", "一套控制面，两个清晰入口"),
+        ("/", "text/html", "用户控制台"),
         ("/user/", "text/html", "用户控制台"),
         ("/admin/", "text/html", "管理员控制台"),
         ("/ui/styles.css", "text/css", ".app-shell"),
@@ -302,17 +302,15 @@ async fn embedded_user_and_admin_sites_are_served_without_credentials() {
         }
     }
 
-    let portal = ctx
+    let response = ctx
         .http
         .get(ctx.url("/"))
+        .header("Host", "ops.cats.run")
         .send()
         .await
-        .unwrap()
-        .text()
-        .await
         .unwrap();
-    assert!(portal.contains("href=\"/user/\""));
-    assert!(portal.contains("href=\"/admin/\""));
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.text().await.unwrap().contains("管理员控制台"));
 
     let auth_config = ctx.http.get(ctx.url("/auth/config")).send().await.unwrap();
     assert_eq!(auth_config.status(), StatusCode::OK);
