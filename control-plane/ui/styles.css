@@ -35,7 +35,7 @@ a { color: inherit; }
 .is-hidden { display: none !important; }
 
 .brand { display: inline-flex; align-items: center; gap: 11px; color: inherit; text-decoration: none; }
-.brand-mark { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 12px; background: var(--ink); color: white; font-weight: 800; letter-spacing: -.08em; box-shadow: inset 0 -2px 0 rgb(0 0 0 / 20%); }
+.brand-mark { width: 38px; height: 38px; display: block; flex: 0 0 auto; border-radius: 12px; object-fit: contain; box-shadow: 0 7px 16px rgb(17 26 49 / 14%); }
 .admin-mark { background: var(--admin); }
 .brand strong, .brand small { display: block; }
 .brand strong { font-size: 17px; letter-spacing: -.02em; }

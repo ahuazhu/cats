@@ -1,0 +1,73 @@
+## 准备条件
+
+当前源码发行版需要 Rust 1.88 或更高版本，并且能访问已运行的 Cats 控制面。构建 CLI 不需要 KVM；运行完整 Cloud Hypervisor 数据路径需要 Linux x86_64、root 权限和 `/dev/kvm`。
+
+## 构建 CLI
+
+    git clone <your-cats-repository>
+    cd cats
+    cargo install --path cmd/cats
+    cats --help
+
+在仓库内开发时，也可以把示例中的 `cats` 替换为 `cargo run -p cats-cli --bin cats --`。
+
+## 配置访问
+
+普通用户通过 WorkOS 登录。CLI 使用 Device Authorization，在浏览器中打开验证页面，并且只把短期 Access Token 与轮换 Refresh Credential 存进操作系统凭据存储。Cats 不再接受普通用户的静态 Project Token。
+
+    export CATS_API_URL='http://127.0.0.1:7300'
+    cats login
+    cats whoami
+    cats workspace list
+    cats workspace use acme-dev
+    cats ls
+
+`cats login` 会在权限为 `0600` 的配置文件中保存控制面地址与公开 Workspace 元数据，但绝不会把 Token 写入其中。使用 `--workspace acme-prod` 或 `CATS_WORKSPACE=acme-prod` 可仅覆盖一条命令的已保存 Workspace。
+
+**不要代入机器凭据**
+
+`CATS_TOKEN` 仅保留给 Administrator/break-glass 机器身份。不要把 Service、对象存储、元数据存储、Node 或管理员凭据当作普通用户登录，也绝不能把它们放进 Guest。
+
+## 创建第一只 Cat
+
+    cats create dev \
+      --image ubuntu-24.04 \
+      --cpus 2 \
+      --memory 2GiB \
+      --root-size 8GiB
+
+    cats get dev
+
+创建 Cat 时会同时创建 RootDisk，并默认开启工作驱动自动休眠。对于没有接入 Work Lease 且必须持续运行的后台任务，可添加 `--no-auto-suspend`。CLI 默认等待异步 Operation 完成并打印 Cat；`--no-wait` 在控制面接受请求后立即返回，`--json` 输出机器可读数据。
+
+## 执行命令
+
+    cats exec dev -- uname -a
+    cats exec dev -- sh -lc 'printf "hello\n" > /tmp/hello'
+
+`exec` 会在必要时唤醒 Suspended、Warm 或 Cold Cat。`--` 后的内容会成为 Guest 命令 argv；只有像第二个示例那样显式调用 Shell 时，Shell 语法才会生效。
+
+## 管理工作驱动自动休眠
+
+    cats sleep on dev
+    cats sleep status dev
+    cats sleep off dev
+
+新建 Cat 默认开启自动休眠。它不会根据 CPU 或进程列表猜测；当平台工作与新鲜的 Guest Work Lease 同时为空时，Cat 才具备休眠资格。持续运行的后台应用必须使用 [Guest Runtime API](/zh-CN/docs/runtime-api/)，或执行 `cats sleep off dev`。
+
+## 停止与启动
+
+    cats suspend dev    # 绑定原 Host，保留进程状态
+    cats resume dev
+    cats stop dev       # Cold：释放计算与 Host 亲和
+    cats start dev      # 从持久 RootDisk 启动
+
+## 清理资源
+
+    cats destroy dev
+
+Operation 完成后，Destroy 会删除 Cat 及其 RootDisk。独立 PersistentDisk 会保留，需要单独执行 `cats disk delete`。
+
+**破坏性操作**
+
+Destroy 前请对需要的内容创建快照或复制。V1 CLI 没有撤销删除命令。

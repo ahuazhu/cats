@@ -4,14 +4,18 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#243b67">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <meta name="description" content="Monitor and administer the Cats compute fleet." data-i18n-content="admin.meta.description">
   <title data-i18n="admin.meta.title">Cats · Administrator Console</title>
+  <link rel="icon" href="/assets/cats-mark.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/ui/styles.css">
 </head>
 <body class="console-page" data-site="admin">
   <section class="login-screen is-hidden" id="login-screen">
     <div class="login-panel">
       <div class="login-heading">
-        <a class="brand brand-large" href="/"><span class="brand-mark admin-mark" aria-hidden="true">C</span><span><strong>Cats</strong><small data-i18n="brand.fleetConsole">Fleet Console</small></span></a>
+        <a class="brand brand-large" href="/"><img class="brand-mark" src="/assets/cats-mark.svg" alt=""><span><strong>Cats</strong><small data-i18n="brand.fleetConsole">Fleet Console</small></span></a>
         <label class="language-picker">
           <span data-i18n="language.label">Language</span>
           <select data-language-select data-i18n-aria-label="language.label" aria-label="Language">
@@ -37,7 +41,7 @@
 
   <div class="app-shell is-hidden" id="app-shell">
     <aside class="sidebar admin-sidebar">
-      <a class="brand" href="/"><span class="brand-mark admin-mark" aria-hidden="true">C</span><span><strong>Cats</strong><small data-i18n="brand.adminConsole">Admin Console</small></span></a>
+      <a class="brand" href="/"><img class="brand-mark" src="/assets/cats-mark.svg" alt=""><span><strong>Cats</strong><small data-i18n="brand.adminConsole">Admin Console</small></span></a>
       <div class="context-card admin-context"><small data-i18n="admin.context.label">PLATFORM</small><strong>Fleet</strong><span data-i18n="admin.context.description">Global administration boundary</span></div>
       <nav class="nav-list" data-i18n-aria-label="admin.nav.aria" aria-label="Administrator console navigation">
         <button class="nav-item is-active" data-view="overview"><span>⌁</span><b data-i18n="admin.nav.overview">Fleet overview</b></button>
@@ -53,6 +57,7 @@
             <option value="zh-CN" data-i18n="language.zh-CN">中文</option>
           </select>
         </label>
+        <a href="/docs/" data-i18n="common.docs" data-i18n-href="common.opsDocsUrl">Documentation</a>
         <a href="https://cats.run/" data-i18n="admin.backToUser">← Back to user site</a>
         <button id="logout-button" data-i18n="common.logout">Sign out</button>
       </div>

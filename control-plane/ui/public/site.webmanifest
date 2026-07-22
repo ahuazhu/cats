@@ -1,0 +1,18 @@
+{
+  "name": "Cats Cloud Workspaces",
+  "short_name": "Cats",
+  "description": "Durable Linux microVM workspaces that sleep and wake on demand.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f7f4ed",
+  "theme_color": "#111a31",
+  "icons": [
+    {
+      "src": "/assets/cats-mark.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

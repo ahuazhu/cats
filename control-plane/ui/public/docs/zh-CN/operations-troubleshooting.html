@@ -1,0 +1,39 @@
+<h2 id="operations">理解 Operation</h2>
+<p>Create、Lifecycle 与 Delete 请求是异步的。控制面记录包含 ID、类型、目标资源、阶段、时间戳和可选结构化错误的 Operation。</p>
+<pre><code>cats operation ls
+cats operation get OPERATION_ID
+cats operation wait OPERATION_ID</code></pre>
+<p>阶段从 pending/running 进入 succeeded 或 failed。网络超时不代表原变更失败——重试前先查询已经接受的 Operation。</p>
+
+<h2 id="errors">常见错误类型</h2>
+<table><thead><tr><th>Code</th><th>含义</th><th>第一步处理</th></tr></thead><tbody>
+  <tr><td><code>unauthenticated</code></td><td>身份缺失或过期</td><td>重新执行 <code>cats login</code>，或刷新浏览器 Session。</td></tr>
+  <tr><td><code>permission_denied</code></td><td>身份有效，但 Workspace 错误</td><td>执行 <code>cats whoami</code>，检查已保存/临时覆盖的 Workspace。</td></tr>
+  <tr><td><code>not_found</code></td><td>作用域内没有该资源</td><td>在同一 Workspace 执行对应 List 命令。</td></tr>
+  <tr><td><code>already_exists</code></td><td>名称冲突</td><td>选择新名称或检查现有资源。</td></tr>
+  <tr><td><code>failed_precondition</code></td><td>当前生命周期或 Attachment 状态阻止操作</td><td>查看 Cat/Disk 状态并完成前置转换。</td></tr>
+  <tr><td><code>conflict</code></td><td>并发 Generation 或 RWO 冲突</td><td>刷新状态；不要强行创建第二写者。</td></tr>
+  <tr><td><code>stale_epoch</code></td><td>旧磁盘或 Route Owner 尝试工作</td><td>视为已 fenced；从当前 Assignment 重建。</td></tr>
+  <tr><td><code>unavailable</code></td><td>临时依赖故障</td><td>有界退避重试并查看 Operation。</td></tr>
+</tbody></table>
+
+<h2 id="cat-not-ready">Cat 无法 Ready</h2>
+<ol>
+  <li>执行 <code>cats get NAME --json</code>，记录 desired/observed state 与 Node。</li>
+  <li>查看最近 Operation 及最终错误。</li>
+  <li>管理员检查 Node Heartbeat、blockd/Guest readiness、Console Output 与 Attachment Epoch。</li>
+  <li>如果 Suspended/Warm 恢复失败，确认 Controller 已收敛到 Cold fallback，而不是停在中间态。</li>
+</ol>
+
+<h2 id="disk-busy">磁盘无法 Mount、Resize 或 Delete</h2>
+<p>执行 <code>cats disk get NAME</code>。PersistentDisk 只能有一个活跃读写 Attachment。移动或删除前先安全 Unmount，并遵守当前运行路径的 Resize 前置条件。绝不能绕过 Fencing 冲突。</p>
+
+<h2 id="auto-suspend">自动休眠未触发</h2>
+<pre><code>cats sleep status dev</code></pre>
+<p>检查活跃平台/Guest Lease、Guest 信号新鲜度和打印的原因。过期信号会有意 fail awake。确认长期运行应用会释放工作租约，且没有 Shell、Exec、Deploy 或 Gateway Activation Lease。</p>
+
+<h2 id="control-plane">控制面无法访问</h2>
+<p>已经 Running 的 Cat 可能继续运行，因为 API 进程不在 Guest I/O 热路径。新的生命周期变更与 durable Root 发布可能延迟或 fail closed。权威 Metadata CAS 不可用时，不能宣称 FLUSH 成功。</p>
+
+<h2 id="support-bundle">有用的故障证据</h2>
+<p>升级处理时请保留 Request ID、Operation ID、Workspace/Project Slug、Cat/Disk 名称、Node ID、Generation、Attachment/Route Epoch、时间戳、CLI 版本与结构化错误。移除 Token、Cookie、Secret、Guest 磁盘内容与终端明文。</p>

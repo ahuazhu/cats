@@ -191,6 +191,27 @@ fn if_match(headers: &HeaderMap) -> Option<i64> {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(crate::ui::portal))
+        .route("/zh-CN", get(crate::ui::zh_home_redirect))
+        .route("/zh-CN/", get(crate::ui::zh_home))
+        .route("/docs", get(crate::ui::docs_redirect))
+        .route("/docs/", get(crate::ui::docs_index))
+        .route("/docs/{slug}", get(crate::ui::docs_detail_redirect))
+        .route("/docs/{slug}/", get(crate::ui::docs_detail))
+        .route("/zh-CN/docs", get(crate::ui::zh_docs_redirect))
+        .route("/zh-CN/docs/", get(crate::ui::zh_docs_index))
+        .route(
+            "/zh-CN/docs/{slug}",
+            get(crate::ui::zh_docs_detail_redirect),
+        )
+        .route("/zh-CN/docs/{slug}/", get(crate::ui::zh_docs_detail))
+        .route("/robots.txt", get(crate::ui::robots))
+        .route("/sitemap.xml", get(crate::ui::sitemap))
+        .route("/site.webmanifest", get(crate::ui::web_manifest))
+        .route("/assets/public.css", get(crate::ui::public_styles))
+        .route("/assets/cats-mark.svg", get(crate::ui::cats_mark))
+        .route("/assets/cats-logo.svg", get(crate::ui::cats_logo))
+        .route("/assets/cats-og.svg", get(crate::ui::cats_og))
+        .route("/assets/cats-og.png", get(crate::ui::cats_og_png))
         .route("/user", get(crate::ui::user_console))
         .route("/user/", get(crate::ui::user_console))
         .route("/admin", get(crate::ui::admin_console))
@@ -270,6 +291,7 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics", get(prometheus_metrics))
         .route("/v1/routes/resolve", get(resolve_route))
         .route("/v1/routes/wake", post(wake_route_handler))
+        .fallback(crate::ui::not_found)
         .with_state(state)
 }
 

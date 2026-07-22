@@ -1,0 +1,37 @@
+<div class="callout"><strong>Public by design</strong><p>These product and usage docs require no Cats session. The console and resource APIs still enforce their normal authentication boundaries.</p></div>
+
+<h2 id="choose-a-path">Choose a path</h2>
+<div class="doc-grid">
+  <a class="doc-card" href="/docs/getting-started/"><strong>Get started</strong><span>Build the CLI, configure access, create a Cat, and run your first command.</span></a>
+  <a class="doc-card" href="/docs/cats-lifecycle/"><strong>Cats and lifecycle</strong><span>Understand Running, Suspended, Warm, Cold, wake behavior, and deletion.</span></a>
+  <a class="doc-card" href="/docs/storage-disks/"><strong>Storage and disks</strong><span>Use RootDisk, PersistentDisk, snapshots, resize, mount, and durable FLUSH.</span></a>
+  <a class="doc-card" href="/docs/endpoints/"><strong>Endpoints</strong><span>Publish a Guest port, choose wake behavior, and understand current networking scope.</span></a>
+  <a class="doc-card" href="/docs/cli-reference/"><strong>CLI reference</strong><span>All commands, global options, output modes, and automation behavior.</span></a>
+  <a class="doc-card" href="/docs/api-reference/"><strong>HTTP API reference</strong><span>Routes, authentication scopes, idempotency, request bodies, Operations, and errors.</span></a>
+  <a class="doc-card" href="/docs/runtime-api/"><strong>Guest Runtime API</strong><span>Keep work-driven Cats awake through HTTP over a Guest-local Unix socket.</span></a>
+  <a class="doc-card" href="/docs/console-workspaces/"><strong>Console and identity</strong><span>WorkOS browser/device sign-in, workspaces, sessions, and language settings.</span></a>
+  <a class="doc-card" href="/docs/operations-troubleshooting/"><strong>Operations and troubleshooting</strong><span>Follow asynchronous work, read errors, and recover from common failures.</span></a>
+</div>
+
+<h2 id="product-model">Product model</h2>
+<p>A <strong>Cat</strong> is a long-lived Linux microVM with a required RootDisk. Compute may stop while the Cat name and durable disk remain. A Workspace is the user-visible authorization and resource boundary; the V1 HTTP API keeps the compatible <code>project</code> path segment underneath.</p>
+<ul>
+  <li><strong>RootDisk</strong> follows the Cat and is deleted with it.</li>
+  <li><strong>PersistentDisk</strong> is independent, grow-only in V1, and read-write attached to at most one Cat.</li>
+  <li><strong>Endpoint</strong> maps a stable hostname to one Guest port and may wake a sleeping Cat.</li>
+  <li><strong>Operation</strong> records every asynchronous mutation and its final structured error.</li>
+</ul>
+
+<h2 id="current-scope">Current V1 developer shape</h2>
+<p>The Rust workspace implements the control plane, CLI, embedded user/admin consoles, node and Guest agents, endpoint gateway contracts, ChunkStore engine, provider-neutral storage adapters, and a Cloud Hypervisor Phase-A path. The following limitations matter when evaluating or operating this source version:</p>
+<table><thead><tr><th>Area</th><th>Current status</th><th>What it means</th></tr></thead><tbody>
+  <tr><td>Block frontend</td><td>Kernel NBD in Cloud Hypervisor Phase A</td><td>Native vhost-user-blk remains a later performance milestone.</td></tr>
+  <tr><td>Guest networking</td><td>Tap/overlay not implemented</td><td>Endpoint routing is covered in the FakeVmm development path; do not claim full CH Guest networking yet.</td></tr>
+  <tr><td>Suspended memory reclaim</td><td>CH Phase A currently pauses only</td><td>The designed page-out path is not implemented, so Suspended currently saves vCPU rather than Host memory.</td></tr>
+  <tr><td>Control metadata</td><td>SQLite development store</td><td>The PostgreSQL storage metadata adapter exists, but the project resource store is still SQLite-shaped development state.</td></tr>
+  <tr><td>Privilege separation</td><td>Not implemented</td><td>Run development components only in an appropriately isolated environment.</td></tr>
+</tbody></table>
+<div class="callout warning"><strong>Performance numbers are evidence, not an SLA</strong><p>Repository benchmark results preserve sample count, environment, measurement boundary, and correctness oracle. Never promote those prototype measurements to a production commitment.</p></div>
+
+<h2 id="conventions">Documentation conventions</h2>
+<p>Examples use the Workspace selected by <code>cats login</code> and a Cat named <code>dev</code>. Replace them for your deployment. Sizes accept binary suffixes such as <code>512MiB</code> and <code>8GiB</code>.</p>

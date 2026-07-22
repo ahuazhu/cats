@@ -1,0 +1,86 @@
+<main id="main">
+  <section class="hero">
+    <div class="content-shell hero-grid">
+      <div class="hero-copy">
+        <span class="eyebrow">Durable cloud workspaces</span>
+        <h1>Your Linux workspace, <em>ready when you are.</em></h1>
+        <p>Cats gives every workspace a real Linux microVM with durable disks and a stable identity. Work at full speed, let it sleep when idle, and wake it without rebuilding your environment.</p>
+        <div class="hero-actions">
+          <a class="button-link primary" href="/user/">Open console <span aria-hidden="true">→</span></a>
+          <a class="button-link secondary" href="/docs/getting-started/">Read the quickstart</a>
+        </div>
+        <div class="hero-note" aria-label="Product highlights">
+          <span><i></i>True pay-as-you-go</span>
+          <span><i></i>Durable data by default</span>
+          <span><i></i>Linux ready on demand</span>
+        </div>
+      </div>
+      <div class="workspace-card" aria-label="Cats command-line example">
+        <div class="workspace-top">
+          <div class="workspace-title"><img src="/assets/cats-mark.svg" alt=""><span><strong>dev-workspace</strong><small>ubuntu-24.04 · 2 CPU · 2 GiB</small></span></div>
+          <span class="live-pill">RUNNING</span>
+        </div>
+        <div class="terminal">
+          <div class="terminal-bar" aria-hidden="true"><i></i><i></i><i></i></div>
+          <pre><span class="prompt">$</span> cats login
+<span class="muted">signed in · workspace acme-dev</span>
+
+<span class="prompt">$</span> cats create dev
+<span class="muted">creating durable RootDisk…</span>
+<span class="muted">starting guest… ready</span>
+
+<span class="prompt">$</span> cats exec dev -- git status
+On branch main
+nothing to commit, working tree clean
+
+<span class="warm">idle → suspended · work preserved</span></pre>
+        </div>
+        <div class="state-strip" aria-label="Lifecycle states">
+          <div><small>Active</small><strong>Running</strong></div>
+          <div><small>Fast wake</small><strong>Suspended</strong></div>
+          <div><small>Local snapshot</small><strong>Warm</strong></div>
+          <div><small>Zero compute</small><strong>Cold</strong></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band white" id="product">
+    <div class="content-shell">
+      <div class="section-heading"><span class="eyebrow">One durable environment</span><h2>Keep the machine. Release the compute.</h2><p>A Cat is a long-lived Linux microVM, not a disposable container session. Its name and disk outlive any one host.</p></div>
+      <div class="feature-grid">
+        <article class="feature-card dark"><span class="feature-icon">⌁</span><h3>A real Linux boundary</h3><p>Run an independent kernel in KVM, install normal packages, and use an unmodified ext4 filesystem. The Guest never receives platform storage credentials.</p></article>
+        <article class="feature-card"><span class="feature-icon">↻</span><h3>Sleep without starting over</h3><p>Running, Suspended, Warm, and Cold are distinct states. Fast host-bound resume is available, and every failed fast restore converges to a clean Cold start.</p></article>
+        <article class="feature-card"><span class="feature-icon">▱</span><h3>Disks that survive hosts</h3><p>Successful FLUSH operations publish to durable remote storage. Local NVMe is a cache, while fencing keeps every PersistentDisk single-writer in V1.</p></article>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" id="lifecycle">
+    <div class="content-shell">
+      <div class="section-heading"><span class="eyebrow">Lifecycle, made explicit</span><h2>Four states. No vague “sleep” mode.</h2><p>Choose the right balance between wake speed, preserved process state, and complete host independence.</p></div>
+      <div class="lifecycle">
+        <article class="life-step"><span class="number">1</span><h3>Running</h3><p>vCPU executes, memory is resident, disks keep publishing durable generations, and endpoints can serve traffic.</p><small>Full compute</small></article>
+        <article class="life-step"><span class="number">2</span><h3>Suspended</h3><p>vCPUs pause and process state stays on the original host. The VMM and host affinity remain for the shortest resume path.</p><small>Process state kept</small></article>
+        <article class="life-step"><span class="number">3</span><h3>Warm</h3><p>The VMM exits after a host-local snapshot. Runtime RSS becomes zero, but restore still uses the original healthy host.</p><small>Local snapshot</small></article>
+        <article class="life-step"><span class="number">4</span><h3>Cold</h3><p>All host runtime resources are released. A new host can boot from the last durable disk generation.</p><small>Host independent</small></article>
+      </div>
+    </div>
+  </section>
+
+  <section class="band white" id="durability">
+    <div class="content-shell truth-grid">
+      <div class="section-heading"><span class="eyebrow">Durability contract</span><h2>Your disk is the truth. The host is replaceable.</h2><p>Cats keeps the user-facing promise narrow and testable: a successful durable FLUSH survives permanent host loss.</p></div>
+      <div class="truth-list">
+        <div class="truth-item"><span>✓</span><div><strong>Standard block devices</strong><p>The Guest sees virtio block devices and ordinary ext4—never object-store APIs or metadata credentials.</p></div></div>
+        <div class="truth-item"><span>✓</span><div><strong>Small writes stay small</strong><p>The block engine tracks dirty logical chunks. It does not upload an entire sparse virtual disk to commit a small working set.</p></div></div>
+        <div class="truth-item"><span>✓</span><div><strong>Old writers fail closed</strong><p>Every attachment has a fencing epoch. A host that returns after a partition cannot publish over a newer writer.</p></div></div>
+        <div class="truth-item"><span>✓</span><div><strong>PersistentDisk is independent</strong><p>Destroying a Cat removes its RootDisk; a detached PersistentDisk remains available until you explicitly delete it.</p></div></div>
+      </div>
+    </div>
+  </section>
+
+  <div class="content-shell cta">
+    <div class="cta-grid"><div><h2>Start with one Cat.</h2><p>Follow the quickstart, create a durable workspace, run a command, and understand exactly what happens when it sleeps.</p></div><a class="button-link primary" href="/docs/getting-started/">Get started <span aria-hidden="true">→</span></a></div>
+  </div>
+</main>

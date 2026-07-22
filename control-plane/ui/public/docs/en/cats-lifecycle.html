@@ -1,0 +1,45 @@
+<h2 id="states">The four states</h2>
+<table><thead><tr><th>State</th><th>Process memory</th><th>Host-bound</th><th>Return to Running</th></tr></thead><tbody>
+  <tr><td><strong>Running</strong></td><td>Resident as needed</td><td>Yes</td><td>Already active</td></tr>
+  <tr><td><strong>Suspended</strong></td><td>Preserved; pages may move to local NVMe</td><td>Yes</td><td>Resume and demand-refault</td></tr>
+  <tr><td><strong>Warm</strong></td><td>Preserved in a local VM snapshot; VMM exits</td><td>Yes</td><td>Rebuild runtime and restore</td></tr>
+  <tr><td><strong>Cold</strong></td><td>Not preserved</td><td>No</td><td>Fresh boot from durable disks</td></tr>
+</tbody></table>
+<p>Suspended and Warm are intentionally separate. Both preserve process state and depend on the original host. Cold releases that dependency and starts a new kernel and user processes.</p>
+<div class="callout warning"><strong>Current source limitation</strong><p>Suspended is defined as pause plus page-out, but the current Cloud Hypervisor Phase-A implementation only pauses. It preserves process state and saves vCPU, but does not yet reclaim Host memory.</p></div>
+
+<h2 id="commands">Lifecycle commands</h2>
+<pre><code>cats start dev
+cats suspend dev
+cats warm dev
+cats resume dev
+cats stop dev
+cats get dev</code></pre>
+<ul>
+  <li><code>start</code> starts or wakes a Cat.</li>
+  <li><code>suspend</code> pauses the Guest after the durable disk gate succeeds. The product state includes page-out, but the current Cloud Hypervisor Phase-A path still pauses without reclaiming Host memory.</li>
+  <li><code>warm</code> creates a host-local snapshot and exits the VMM/backend.</li>
+  <li><code>resume</code> resumes either Suspended or Warm.</li>
+  <li><code>stop</code> enters Cold and releases runtime attachment leases.</li>
+</ul>
+
+<h2 id="durable-gate">The durable gate</h2>
+<p>Before entering Suspended, Warm, or Cold, Cats quiesces new work, asks the Guest to sync filesystems, and waits for required block FLUSH operations to publish a durable generation. A failed FLUSH prevents the platform from claiming a safe sleep state.</p>
+<div class="callout"><strong>What survives host loss?</strong><p>Successful durable FLUSH data survives. Suspended/Warm process memory does not: if the original host is permanently lost, Cats fences the old attachment and performs Cold recovery on another host.</p></div>
+
+<h2 id="fallback">Fast-resume fallback</h2>
+<p>A missing backing file, invalid snapshot, version mismatch, VMM error, or Guest readiness timeout must not leave a Cat stuck in a restore state. The platform discards the unsafe local state, obtains a newer disk fencing epoch when required, and converges to Cold boot.</p>
+
+<h2 id="auto-suspend">Work-driven auto-suspend</h2>
+<p>New Cats enable it by default. Inspect it, disable it for an always-on workload, or turn it back on:</p>
+<pre><code>cats create dev
+cats sleep status dev
+cats sleep off dev
+cats sleep on dev</code></pre>
+<p>The status output includes the distributed work count, Guest-signal freshness, current eligibility, and an explanation. If the signal chain is stale or uncertain, the safe behavior is fail-awake. A background workload must hold a Guest work lease or explicitly disable auto-suspend.</p>
+
+<h2 id="connections">Connections and time</h2>
+<p>Preserving Guest memory does not promise that old TCP or WebSocket connections survive. Edge, NAT, and remote peers may time out while the Cat sleeps. Clients should reconnect through the stable Endpoint. Guest time must not move backward across pause/resume.</p>
+
+<h2 id="delete">Deletion</h2>
+<p><code>cats destroy dev</code> stops new work, finishes the lifecycle operation, deletes the Cat, and cascades deletion to its RootDisk. It safely detaches but does not delete an independent PersistentDisk.</p>

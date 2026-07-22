@@ -1,0 +1,47 @@
+<h2 id="purpose">Purpose and discovery</h2>
+<p>Applications inside a Cat use work leases to say “keep this Cat Running while this task is active.” The API is HTTP/1.1 plus JSON on a Guest-local Unix socket:</p>
+<pre><code>/run/cats/runtime.sock
+
+curl --unix-socket /run/cats/runtime.sock \
+  http://cats-runtime/v1/work-leases</code></pre>
+<p>There is no default TCP or UDP listener, no required Cats SDK, and no control-plane or object-store credential in the protocol. Any HTTP client that supports Unix sockets can use it.</p>
+
+<h2 id="create">Create a work lease</h2>
+<pre><code>curl --unix-socket /run/cats/runtime.sock \
+  -H 'Content-Type: application/json' \
+  -d '{"label":"release-build","ttl_ms":300000}' \
+  http://cats-runtime/v1/work-leases</code></pre>
+<p>Success returns <code>201 Created</code>, a generated opaque lease ID, and remaining TTL. The default TTL is five minutes, the maximum is one hour, and a Guest may have at most 64 live leases.</p>
+
+<h2 id="renew">Renew and release</h2>
+<pre><code>curl --unix-socket /run/cats/runtime.sock \
+  -X PUT -H 'Content-Type: application/json' \
+  -d '{"ttl_ms":300000}' \
+  http://cats-runtime/v1/work-leases/LEASE_ID
+
+curl --unix-socket /run/cats/runtime.sock \
+  -X DELETE \
+  http://cats-runtime/v1/work-leases/LEASE_ID</code></pre>
+<p>Renew at roughly one third of the TTL. DELETE is idempotent and returns <code>204</code> even when the lease already expired. Always release in success, failure, and cancellation paths; TTL is the crash-recovery boundary.</p>
+
+<h2 id="status">Inspect status</h2>
+<pre><code>curl --unix-socket /run/cats/runtime.sock \
+  http://cats-runtime/v1/work-leases</code></pre>
+<p>The response contains <code>source_epoch</code>, monotonic <code>lease_sequence</code>, <code>quiescing</code>, and the current leases. IDs and sequences are opaque coordination values, not user identity or a durable cursor.</p>
+
+<h2 id="errors">Stable errors</h2>
+<table><thead><tr><th>HTTP</th><th>Code</th><th>Action</th></tr></thead><tbody>
+  <tr><td>400</td><td><code>invalid_request</code> / <code>invalid_json</code></td><td>Fix fields, TTL, or JSON.</td></tr>
+  <tr><td>404</td><td><code>lease_not_found</code></td><td>Create a new lease if work is still active.</td></tr>
+  <tr><td>409</td><td><code>activity_changed</code></td><td>Suspend quiesce raced with new work; retry after the Cat remains Running.</td></tr>
+  <tr><td>429</td><td><code>too_many_leases</code></td><td>Release or consolidate callers.</td></tr>
+</tbody></table>
+
+<h2 id="semantics">Important semantics</h2>
+<ul>
+  <li>A lease blocks work-driven suspend; it does not prove a Linux process is alive.</li>
+  <li>The socket cannot wake an already sleeping Cat because Guest code cannot run then.</li>
+  <li>If the socket exists but acquire/renew fails, the keep-awake guarantee was not established.</li>
+  <li>On a normal local machine, an application may detect that the socket is absent and continue according to its own policy.</li>
+</ul>
+<div class="callout warning"><strong>Do not silently ignore failures inside Cats</strong><p>If correctness depends on staying Running, surface acquire or renewal failure and decide whether the task should stop.</p></div>

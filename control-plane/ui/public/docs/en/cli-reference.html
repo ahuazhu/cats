@@ -1,0 +1,67 @@
+<h2 id="global-options">Global options</h2>
+<table><thead><tr><th>Option / environment</th><th>Default</th><th>Purpose</th></tr></thead><tbody>
+  <tr><td><code>--api-url</code> / <code>CATS_API_URL</code></td><td>saved login target, otherwise <code>https://cats.run</code></td><td>Control-plane base URL</td></tr>
+  <tr><td><code>--workspace</code> / <code>CATS_WORKSPACE</code></td><td>saved Workspace</td><td>Override one command without changing the default; <code>--project</code> is a compatibility alias</td></tr>
+  <tr><td><code>--token</code> / <code>CATS_TOKEN</code></td><td>none</td><td>Machine/administrator Bearer credential only; normal users run <code>cats login</code></td></tr>
+  <tr><td><code>--no-wait</code></td><td>off</td><td>Return after an Operation is accepted</td></tr>
+  <tr><td><code>--json</code></td><td>off</td><td>Print machine-readable JSON where supported</td></tr>
+</tbody></table>
+<p>Global options may appear before or after the subcommand. Use <code>cats --help</code> and <code>cats &lt;command&gt; --help</code> as the version-authoritative reference.</p>
+
+<h2 id="identity-commands">Identity and Workspace commands</h2>
+<pre><code>cats login
+cats whoami
+cats workspace list
+cats workspace use SLUG
+cats --workspace SLUG ls
+cats logout</code></pre>
+<p><code>login</code> uses WorkOS Device Authorization and stores access/refresh material only in the operating-system credential store. Workspace availability is the intersection of active WorkOS Organization memberships and the deployment's explicit mappings; personal users receive an isolated <code>personal-&lt;user-id&gt;</code> Workspace. <code>logout</code> attempts remote revocation and always removes the local credential.</p>
+
+<h2 id="cat-commands">Cat commands</h2>
+<pre><code>cats create NAME [--image IMAGE] [--cpus N] [--memory SIZE]
+                 [--root-size SIZE] [--disk NAME]
+                 [--disk-size SIZE] [--mount-at PATH] [--no-auto-suspend]
+cats ls
+cats get NAME
+cats start NAME
+cats stop NAME
+cats suspend NAME
+cats resume NAME
+cats warm NAME
+cats destroy NAME
+cats exec NAME -- COMMAND [ARG...]</code></pre>
+<p><code>create</code> defaults to image <code>ubuntu-24.04</code>, 2 CPUs, 2 GiB memory, a 1 GiB RootDisk, and auto-suspend enabled. Sizes accept <code>KiB</code>, <code>MiB</code>, <code>GiB</code>, or raw bytes.</p>
+
+<h2 id="sleep-commands">Auto-suspend commands</h2>
+<pre><code>cats sleep on NAME
+cats sleep off NAME
+cats sleep status NAME</code></pre>
+<p>Status reports platform and Guest work leases, signal freshness, eligibility, and the current reason.</p>
+
+<h2 id="disk-commands">Disk commands</h2>
+<pre><code>cats disk create NAME --size SIZE
+cats disk ls
+cats disk get NAME
+cats disk resize NAME --size SIZE
+cats disk snapshot NAME
+cats disk delete NAME
+cats mount DISK --cat CAT [--at /data]
+cats unmount DISK</code></pre>
+
+<h2 id="endpoint-commands">Endpoint commands</h2>
+<pre><code>cats expose CAT PORT [--name web] [--protocol http] [--no-wake]
+cats endpoint ls CAT</code></pre>
+
+<h2 id="operation-commands">Operation commands</h2>
+<pre><code>cats operation ls
+cats operation get ID
+cats operation wait ID</code></pre>
+<p>Mutations normally wait up to 120 seconds. With <code>--no-wait</code>, save the returned ID and use <code>operation wait</code> or <code>operation get</code>. Safe retries should use the same resource intent; the API attaches idempotency keys to mutations.</p>
+
+<h2 id="automation">Automation guidance</h2>
+<ul>
+  <li>Use <code>--json</code> instead of scraping aligned human output.</li>
+  <li>Treat non-zero exit status as failure. <code>exec</code> also fails when the Guest command exits non-zero.</li>
+  <li>Do not parse resource IDs, work lease IDs, or Operation IDs for meaning.</li>
+  <li>Use WorkOS login for users. Do not log token values or substitute service/administrator credentials for a user session.</li>
+</ul>

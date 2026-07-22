@@ -280,12 +280,17 @@ impl Ctx {
 }
 
 #[tokio::test]
-async fn embedded_user_and_admin_sites_are_served_without_credentials() {
+async fn embedded_public_user_and_admin_sites_are_served_without_credentials() {
     let ctx = Ctx::new().await;
     let assets = [
-        ("/", "text/html", "data-i18n=\"user.meta.title\""),
+        ("/", "text/html", "Cats — Durable Linux Cloud Workspaces"),
+        ("/zh-CN/", "text/html", "Cats — 持久化 Linux 云端工作空间"),
+        ("/docs/", "text/html", "Cats documentation | Cats Docs"),
+        ("/zh-CN/docs/", "text/html", "Cats 使用文档 | Cats Docs"),
         ("/user/", "text/html", "data-i18n=\"user.meta.title\""),
         ("/admin/", "text/html", "data-i18n=\"admin.meta.title\""),
+        ("/assets/public.css", "text/css", ".docs-layout"),
+        ("/assets/cats-mark.svg", "image/svg+xml", "Cats"),
         ("/ui/styles.css", "text/css", ".app-shell"),
         ("/ui/i18n.js", "text/javascript", "navigator.languages"),
         (
@@ -321,7 +326,7 @@ async fn embedded_user_and_admin_sites_are_served_without_credentials() {
 
     let user_html = ctx
         .http
-        .get(ctx.url("/"))
+        .get(ctx.url("/user/"))
         .send()
         .await
         .unwrap()
@@ -332,6 +337,8 @@ async fn embedded_user_and_admin_sites_are_served_without_credentials() {
     assert!(!user_html.contains("token-login-section"));
     assert!(!user_html.contains("CAT STATUS"));
     assert!(user_html.contains("login-screen is-hidden"));
+    assert!(user_html.contains("noindex, nofollow, noarchive"));
+    assert!(user_html.contains("/assets/cats-mark.svg"));
 
     let response = ctx
         .http
@@ -346,6 +353,7 @@ async fn embedded_user_and_admin_sites_are_served_without_credentials() {
     assert!(!admin_html.contains("Administrator Token"));
     assert!(!admin_html.contains("FLEET HEALTH"));
     assert!(admin_html.contains("login-screen is-hidden"));
+    assert!(admin_html.contains("noindex, nofollow, noarchive"));
 
     let auth_config = ctx.http.get(ctx.url("/auth/config")).send().await.unwrap();
     assert_eq!(auth_config.status(), StatusCode::OK);
@@ -359,6 +367,159 @@ async fn embedded_user_and_admin_sites_are_served_without_credentials() {
     let auth_config: serde_json::Value = auth_config.json().await.unwrap();
     assert_eq!(auth_config["workos_enabled"], false);
     assert!(auth_config.get("token_login_enabled").is_none());
+}
+
+#[tokio::test]
+async fn public_docs_are_bilingual_crawlable_and_complete_without_a_session() {
+    let ctx = Ctx::new().await;
+    let slugs = [
+        "getting-started",
+        "cats-lifecycle",
+        "storage-disks",
+        "endpoints",
+        "cli-reference",
+        "api-reference",
+        "runtime-api",
+        "console-workspaces",
+        "operations-troubleshooting",
+    ];
+
+    for slug in slugs {
+        for (prefix, lang) in [("", "en"), ("/zh-CN", "zh-CN")] {
+            let path = format!("{prefix}/docs/{slug}/");
+            let response = ctx.http.get(ctx.url(&path)).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "failed to serve {path}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("content-language")
+                    .and_then(|value| value.to_str().ok()),
+                Some(lang),
+                "wrong locale for {path}"
+            );
+            assert!(
+                response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.starts_with("public")),
+                "public page is not cacheable: {path}"
+            );
+            let html = response.text().await.unwrap();
+            for marker in [
+                "<meta name=\"description\"",
+                "<meta name=\"robots\" content=\"index, follow",
+                "<link rel=\"canonical\" href=\"https://cats.run/",
+                "hreflang=\"en\"",
+                "hreflang=\"zh-CN\"",
+                "hreflang=\"x-default\"",
+                "application/ld+json",
+                "og:image",
+                "<article class=\"doc-content\">",
+            ] {
+                assert!(html.contains(marker), "{path} is missing {marker}");
+            }
+            for secret in ["dev-token", "dev-admin-token", SERVICE_TOKEN] {
+                assert!(!html.contains(secret), "{path} embeds credential {secret}");
+            }
+        }
+    }
+
+    let missing = ctx
+        .http
+        .get(ctx.url("/zh-CN/docs/not-a-real-page/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert!(missing.text().await.unwrap().contains("noindex, nofollow"));
+
+    let robots = ctx.http.get(ctx.url("/robots.txt")).send().await.unwrap();
+    assert_eq!(robots.status(), StatusCode::OK);
+    let robots = robots.text().await.unwrap();
+    assert!(robots.contains("Disallow: /auth"));
+    assert!(robots.contains("Sitemap: https://cats.run/sitemap.xml"));
+    let ops_robots = ctx
+        .http
+        .get(ctx.url("/robots.txt"))
+        .header("Host", "ops.cats.run")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(ops_robots, "User-agent: *\nDisallow: /\n");
+
+    let sitemap = ctx.http.get(ctx.url("/sitemap.xml")).send().await.unwrap();
+    assert_eq!(sitemap.status(), StatusCode::OK);
+    assert!(sitemap
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/xml")));
+    let sitemap = sitemap.text().await.unwrap();
+    assert!(sitemap.contains("https://cats.run/docs/getting-started/"));
+    assert!(sitemap.contains("https://cats.run/zh-CN/docs/getting-started/"));
+    assert!(!sitemap.contains("admin-guide"));
+    assert!(sitemap.contains("xmlns:xhtml="));
+
+    for path in ["/docs/admin-guide/", "/zh-CN/docs/admin-guide/"] {
+        let response = ctx.http.get(ctx.url(path)).send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{path} leaked from the ops site"
+        );
+    }
+
+    for (path, lang, title) in [
+        ("/docs/", "en", "Fleet administrator guide | Cats Ops"),
+        ("/zh-CN/docs/", "zh-CN", "Fleet 管理员指南 | Cats Ops"),
+    ] {
+        let response = ctx
+            .http
+            .get(ctx.url(path))
+            .header("Host", "ops.cats.run")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-language")
+                .and_then(|value| value.to_str().ok()),
+            Some(lang)
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-robots-tag")
+                .and_then(|value| value.to_str().ok()),
+            Some("noindex, nofollow, noarchive")
+        );
+        let html = response.text().await.unwrap();
+        assert!(html.contains(title));
+        assert!(html.contains("/v1/admin/nodes"));
+        assert!(html.contains("ops.cats.run"));
+    }
+
+    let image = ctx
+        .http
+        .get(ctx.url("/assets/cats-og.png"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(image.status(), StatusCode::OK);
+    assert_eq!(
+        image
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
+    assert!(image.bytes().await.unwrap().len() > 10_000);
 }
 
 #[tokio::test]

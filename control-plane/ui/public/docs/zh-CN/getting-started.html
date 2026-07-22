@@ -1,0 +1,52 @@
+<h2 id="prerequisites">准备条件</h2>
+<p>当前源码发行版需要 Rust 1.88 或更高版本，并且能访问已运行的 Cats 控制面。构建 CLI 不需要 KVM；运行完整 Cloud Hypervisor 数据路径需要 Linux x86_64、root 权限和 <code>/dev/kvm</code>。</p>
+
+<h2 id="install-cli">构建 CLI</h2>
+<pre><code>git clone &lt;your-cats-repository&gt;
+cd cats
+cargo install --path cmd/cats
+cats --help</code></pre>
+<p>在仓库内开发时，也可以把示例中的 <code>cats</code> 替换为 <code>cargo run -p cats-cli --bin cats --</code>。</p>
+
+<h2 id="configure-access">配置访问</h2>
+<p>普通用户通过 WorkOS 登录。CLI 使用 Device Authorization，在浏览器中打开验证页面，并且只把短期 Access Token 与轮换 Refresh Credential 存进操作系统凭据存储。Cats 不再接受普通用户的静态 Project Token。</p>
+<pre><code>export CATS_API_URL='http://127.0.0.1:7300'
+cats login
+cats whoami
+cats workspace list
+cats workspace use acme-dev
+cats ls</code></pre>
+<p><code>cats login</code> 会在权限为 <code>0600</code> 的配置文件中保存控制面地址与公开 Workspace 元数据，但绝不会把 Token 写入其中。使用 <code>--workspace acme-prod</code> 或 <code>CATS_WORKSPACE=acme-prod</code> 可仅覆盖一条命令的已保存 Workspace。</p>
+<div class="callout warning"><strong>不要代入机器凭据</strong><p><code>CATS_TOKEN</code> 仅保留给 Administrator/break-glass 机器身份。不要把 Service、对象存储、元数据存储、Node 或管理员凭据当作普通用户登录，也绝不能把它们放进 Guest。</p></div>
+
+<h2 id="create">创建第一只 Cat</h2>
+<pre><code>cats create dev \
+  --image ubuntu-24.04 \
+  --cpus 2 \
+  --memory 2GiB \
+  --root-size 8GiB
+
+cats get dev</code></pre>
+<p>创建 Cat 时会同时创建 RootDisk，并默认开启工作驱动自动休眠。对于没有接入 Work Lease 且必须持续运行的后台任务，可添加 <code>--no-auto-suspend</code>。CLI 默认等待异步 Operation 完成并打印 Cat；<code>--no-wait</code> 在控制面接受请求后立即返回，<code>--json</code> 输出机器可读数据。</p>
+
+<h2 id="run-command">执行命令</h2>
+<pre><code>cats exec dev -- uname -a
+cats exec dev -- sh -lc 'printf "hello\n" &gt; /tmp/hello'</code></pre>
+<p><code>exec</code> 会在必要时唤醒 Suspended、Warm 或 Cold Cat。<code>--</code> 后的内容会成为 Guest 命令 argv；只有像第二个示例那样显式调用 Shell 时，Shell 语法才会生效。</p>
+
+<h2 id="auto-suspend">管理工作驱动自动休眠</h2>
+<pre><code>cats sleep on dev
+cats sleep status dev
+cats sleep off dev</code></pre>
+<p>新建 Cat 默认开启自动休眠。它不会根据 CPU 或进程列表猜测；当平台工作与新鲜的 Guest Work Lease 同时为空时，Cat 才具备休眠资格。持续运行的后台应用必须使用 <a href="/zh-CN/docs/runtime-api/">Guest Runtime API</a>，或执行 <code>cats sleep off dev</code>。</p>
+
+<h2 id="stop-start">停止与启动</h2>
+<pre><code>cats suspend dev    # 绑定原 Host，保留进程状态
+cats resume dev
+cats stop dev       # Cold：释放计算与 Host 亲和
+cats start dev      # 从持久 RootDisk 启动</code></pre>
+
+<h2 id="clean-up">清理资源</h2>
+<pre><code>cats destroy dev</code></pre>
+<p>Operation 完成后，Destroy 会删除 Cat 及其 RootDisk。独立 PersistentDisk 会保留，需要单独执行 <code>cats disk delete</code>。</p>
+<div class="callout warning"><strong>破坏性操作</strong><p>Destroy 前请对需要的内容创建快照或复制。V1 CLI 没有撤销删除命令。</p></div>

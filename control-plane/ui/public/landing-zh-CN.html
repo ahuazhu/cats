@@ -1,0 +1,86 @@
+<main id="main">
+  <section class="hero">
+    <div class="content-shell hero-grid">
+      <div class="hero-copy">
+        <span class="eyebrow">持久化云端工作空间</span>
+        <h1>你的 Linux 工作空间，<em>随时就绪。</em></h1>
+        <p>Cats 为每个工作区提供一台真正的 Linux microVM，拥有持久磁盘和稳定身份。全速工作，闲置时休眠，再次使用时无需重建环境。</p>
+        <div class="hero-actions">
+          <a class="button-link primary" href="/user/">打开控制台 <span aria-hidden="true">→</span></a>
+          <a class="button-link secondary" href="/zh-CN/docs/getting-started/">阅读快速入门</a>
+        </div>
+        <div class="hero-note" aria-label="产品特点">
+          <span><i></i>真正按量付费</span>
+          <span><i></i>数据默认持久化</span>
+          <span><i></i>Linux 环境随唤随用</span>
+        </div>
+      </div>
+      <div class="workspace-card" aria-label="Cats 命令行示例">
+        <div class="workspace-top">
+          <div class="workspace-title"><img src="/assets/cats-mark.svg" alt=""><span><strong>dev-workspace</strong><small>ubuntu-24.04 · 2 CPU · 2 GiB</small></span></div>
+          <span class="live-pill">运行中</span>
+        </div>
+        <div class="terminal">
+          <div class="terminal-bar" aria-hidden="true"><i></i><i></i><i></i></div>
+          <pre><span class="prompt">$</span> cats login
+<span class="muted">已登录 · 工作区 acme-dev</span>
+
+<span class="prompt">$</span> cats create dev
+<span class="muted">正在创建持久 RootDisk…</span>
+<span class="muted">正在启动 Guest… 已就绪</span>
+
+<span class="prompt">$</span> cats exec dev -- git status
+位于分支 main
+无文件要提交，干净的工作区
+
+<span class="warm">闲置 → 已暂停 · 工作状态保留</span></pre>
+        </div>
+        <div class="state-strip" aria-label="生命周期状态">
+          <div><small>活跃</small><strong>Running</strong></div>
+          <div><small>快速唤醒</small><strong>Suspended</strong></div>
+          <div><small>本地快照</small><strong>Warm</strong></div>
+          <div><small>零计算</small><strong>Cold</strong></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band white" id="product">
+    <div class="content-shell">
+      <div class="section-heading"><span class="eyebrow">一套长期存在的环境</span><h2>保留机器，释放计算。</h2><p>Cat 是一台长期存在的 Linux microVM，而不是一次性的容器会话。它的名称和磁盘不依赖某一台 Host。</p></div>
+      <div class="feature-grid">
+        <article class="feature-card dark"><span class="feature-icon">⌁</span><h3>真正的 Linux 隔离边界</h3><p>在 KVM 中运行独立内核，安装普通软件包，使用未修改的 ext4。Guest 永远不会获得平台存储凭据。</p></article>
+        <article class="feature-card"><span class="feature-icon">↻</span><h3>休眠后不用重头开始</h3><p>Running、Suspended、Warm 与 Cold 是不同状态。快速恢复失败时，系统一定收敛到干净的 Cold 启动。</p></article>
+        <article class="feature-card"><span class="feature-icon">▱</span><h3>不怕 Host 丢失的磁盘</h3><p>成功的 FLUSH 会发布到远端持久存储。本地 NVMe 只是缓存，fencing 确保 V1 的 PersistentDisk 始终只有一个写者。</p></article>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" id="lifecycle">
+    <div class="content-shell">
+      <div class="section-heading"><span class="eyebrow">明确的生命周期</span><h2>四种状态，而不是模糊的“睡眠”。</h2><p>在唤醒速度、进程状态保留与彻底摆脱原 Host 之间，选择清晰可解释的平衡。</p></div>
+      <div class="lifecycle">
+        <article class="life-step"><span class="number">1</span><h3>Running</h3><p>vCPU 正在执行、内存驻留，磁盘持续发布持久 generation，Endpoint 可以服务流量。</p><small>完整计算资源</small></article>
+        <article class="life-step"><span class="number">2</span><h3>Suspended</h3><p>vCPU 暂停，进程状态保留在原 Host。VMM 与 Host 亲和继续存在，以获得最短恢复路径。</p><small>保留进程状态</small></article>
+        <article class="life-step"><span class="number">3</span><h3>Warm</h3><p>生成 Host 本地快照后 VMM 退出，运行时 RSS 为零，但仍需在原健康 Host 上恢复。</p><small>本地快照</small></article>
+        <article class="life-step"><span class="number">4</span><h3>Cold</h3><p>释放全部 Host 运行时资源。任何健康 Host 都能从最后的持久磁盘 generation 启动。</p><small>不再绑定 Host</small></article>
+      </div>
+    </div>
+  </section>
+
+  <section class="band white" id="durability">
+    <div class="content-shell truth-grid">
+      <div class="section-heading"><span class="eyebrow">持久性契约</span><h2>磁盘是真相，Host 可以被替换。</h2><p>Cats 给用户的承诺范围明确且可测试：成功返回的 durable FLUSH 必须能经受 Host 永久丢失。</p></div>
+      <div class="truth-list">
+        <div class="truth-item"><span>✓</span><div><strong>标准块设备</strong><p>Guest 只看到 virtio 块设备和普通 ext4，不会接触对象存储 API 或元数据凭据。</p></div></div>
+        <div class="truth-item"><span>✓</span><div><strong>小量写入只提交小工作集</strong><p>块引擎追踪发生变化的逻辑 Chunk，不会为了提交少量修改而上传整个稀疏虚拟盘。</p></div></div>
+        <div class="truth-item"><span>✓</span><div><strong>旧写者 fail closed</strong><p>每个 Attachment 都有 fencing epoch。网络分区后返回的旧 Host 无法覆盖新的写者。</p></div></div>
+        <div class="truth-item"><span>✓</span><div><strong>PersistentDisk 独立存在</strong><p>销毁 Cat 会删除它的 RootDisk；已卸载的 PersistentDisk 会一直保留，直到你显式删除。</p></div></div>
+      </div>
+    </div>
+  </section>
+
+  <div class="content-shell cta">
+    <div class="cta-grid"><div><h2>从一只 Cat 开始。</h2><p>按照快速入门创建持久工作空间、执行命令，并准确理解它休眠时会发生什么。</p></div><a class="button-link primary" href="/zh-CN/docs/getting-started/">开始使用 <span aria-hidden="true">→</span></a></div>
+  </div>
+</main>
