@@ -104,8 +104,16 @@ mkdir -p "$RF"/{bin,sbin,usr/bin,dev,proc,sys,tmp,etc,root,lib/cats-modules}
 cp "$BUSYBOX" "$RF/bin/busybox"
 "$BUSYBOX" --list | while IFS= read -r tool; do
   [ -n "$tool" ] || continue
+  # BusyBox includes "busybox" in its applet list. Replacing the copied
+  # binary with /bin/busybox -> /bin/busybox makes every guest boot fail with
+  # ELOOP when the init script's shebang is resolved.
+  [ "$tool" = busybox ] && continue
   ln -sf /bin/busybox "$RF/bin/$tool"
 done
+[ -x "$RF/bin/busybox" ] && [ ! -L "$RF/bin/busybox" ] || {
+  echo "busybox payload must remain a regular executable" >&2
+  exit 1
+}
 for required_applet in sh mount umount insmod sleep sync uname pwd; do
   [ -L "$RF/bin/$required_applet" ] || {
     echo "busybox is missing required applet: $required_applet" >&2
