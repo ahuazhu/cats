@@ -100,7 +100,7 @@ chmod +x "$IR/init"
 # 3. Golden rootfs: busybox userland + guest agent on vsock 5000.
 # --------------------------------------------------------------------------
 RF="$WORK/rootfs"
-mkdir -p "$RF"/{bin,sbin,usr/bin,dev,proc,sys,tmp,etc,root,lib/cats-modules}
+mkdir -p "$RF"/{bin,sbin,usr/bin,dev/pts,proc,sys,tmp,etc,root,lib/cats-modules}
 cp "$BUSYBOX" "$RF/bin/busybox"
 "$BUSYBOX" --list | while IFS= read -r tool; do
   [ -n "$tool" ] || continue
@@ -139,6 +139,8 @@ cat > "$RF/sbin/init" <<'EOF'
 /bin/busybox mount -t proc proc /proc 2>/dev/null
 /bin/busybox mount -t sysfs sys /sys 2>/dev/null
 /bin/busybox mount -t devtmpfs dev /dev 2>/dev/null
+/bin/busybox mkdir -p /dev/pts
+/bin/busybox mount -t devpts devpts /dev/pts 2>/dev/null
 while read -r m; do
   /bin/busybox insmod "$m" || echo "failed to load guest module: $m"
 done < /etc/cats-modules.order
