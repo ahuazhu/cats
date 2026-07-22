@@ -44,7 +44,6 @@ pub struct WorkOsConfig {
     cookie_domain: Option<String>,
     user_site_url: String,
     admin_site_url: String,
-    allow_token_login: bool,
 }
 
 pub struct WorkOsConfigParams {
@@ -63,7 +62,6 @@ pub struct WorkOsConfigParams {
     /// Login completion destinations. Relative paths preserve local-dev behavior.
     pub user_site_url: Option<String>,
     pub admin_site_url: Option<String>,
-    pub allow_token_login: bool,
 }
 
 impl WorkOsConfig {
@@ -143,7 +141,6 @@ impl WorkOsConfig {
             cookie_domain: params.cookie_domain,
             user_site_url,
             admin_site_url,
-            allow_token_login: params.allow_token_login,
         })
     }
 
@@ -228,7 +225,7 @@ struct LoginFlow {
     state: String,
     code_verifier: String,
     site: Site,
-    organization_id: String,
+    organization_id: Option<String>,
     project: Option<String>,
     return_to: String,
     created_at_unix: i64,
@@ -261,7 +258,6 @@ pub struct SiteQuery {
 #[derive(Debug, Serialize)]
 struct AuthConfigResponse {
     workos_enabled: bool,
-    token_login_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -282,13 +278,8 @@ struct SessionResponse {
 }
 
 pub async fn config(State(state): State<AppState>) -> Response {
-    let (workos_enabled, token_login_enabled) = match &state.cfg.workos {
-        Some(config) => (true, config.allow_token_login),
-        None => (false, true),
-    };
     let mut response = Json(AuthConfigResponse {
-        workos_enabled,
-        token_login_enabled,
+        workos_enabled: state.cfg.workos.is_some(),
     })
     .into_response();
     set_no_store(&mut response);
@@ -307,16 +298,23 @@ pub async fn login(
     let site = Site::parse(&query.site).ok_or_else(|| ApiError::invalid("unknown auth site"))?;
     let (organization_id, project) = match site {
         Site::User => {
-            let project = query
-                .project
-                .as_deref()
-                .ok_or_else(|| ApiError::invalid("project is required for user login"))?;
-            let organization_id = config.project_organizations.get(project).ok_or_else(|| {
-                ApiError::new(cats_api::error::ErrorCode::NotFound, "unknown project")
-            })?;
-            (organization_id.clone(), Some(project.to_string()))
+            if let Some(project) = query.project.as_deref() {
+                if project.starts_with("personal-user_") {
+                    (None, Some(project.to_string()))
+                } else {
+                    let organization_id =
+                        config.project_organizations.get(project).ok_or_else(|| {
+                            ApiError::new(cats_api::error::ErrorCode::NotFound, "unknown project")
+                        })?;
+                    (Some(organization_id.clone()), Some(project.to_string()))
+                }
+            } else {
+                // The public user site does not know a user's project before
+                // authentication. Resolve it from the returned WorkOS identity.
+                (None, None)
+            }
         }
-        Site::Admin => (config.admin_organization_id.clone(), None),
+        Site::Admin => (Some(config.admin_organization_id.clone()), None),
     };
     let return_to = query
         .return_to
@@ -330,7 +328,7 @@ pub async fn login(
         .pkce_authorization_url(AuthKitAuthorizationUrlParams {
             redirect_uri: config.redirect_uri.clone(),
             provider: Some("authkit".to_string()),
-            organization_id: Some(organization_id.clone()),
+            organization_id: organization_id.clone(),
             ..Default::default()
         })
         .map_err(|error| ApiError::internal(format!("build WorkOS authorization URL: {error}")))?;
@@ -420,12 +418,11 @@ pub async fn callback(
                 "WorkOS authentication failed",
             )
         })?;
-    let personal_user = flow.site == Site::User
-        && auth
-            .organization_id
-            .as_deref()
-            .is_none_or(|organization_id| organization_id.is_empty());
-    if !personal_user && auth.organization_id.as_deref() != Some(flow.organization_id.as_str()) {
+    if flow
+        .organization_id
+        .as_deref()
+        .is_some_and(|expected| auth.organization_id.as_deref() != Some(expected))
+    {
         return Err(ApiError::new(
             cats_api::error::ErrorCode::PermissionDenied,
             "WorkOS session organization does not match the requested workspace",
@@ -576,10 +573,23 @@ fn validate_flow_identity(
     session: &SessionState,
 ) -> Result<WebIdentity, Failure> {
     let identity = validate_session_identity(config, flow.site, session)?;
-    if flow.site == Site::User && session.organization_id.is_empty() {
+    if flow.site == Site::User && flow.organization_id.is_none() && flow.project.is_none() {
         return Ok(identity);
     }
-    if session.organization_id != flow.organization_id || identity.project != flow.project {
+    if flow.site == Site::User && session.organization_id.is_empty() {
+        if flow.organization_id.is_none() && flow.project.as_deref() != identity.project.as_deref()
+        {
+            return Err(ApiError::new(
+                cats_api::error::ErrorCode::PermissionDenied,
+                "WorkOS session does not match the requested personal workspace",
+            )
+            .into());
+        }
+        return Ok(identity);
+    }
+    if Some(session.organization_id.as_str()) != flow.organization_id.as_deref()
+        || identity.project != flow.project
+    {
         return Err(ApiError::new(
             cats_api::error::ErrorCode::PermissionDenied,
             "WorkOS session does not match the requested workspace",

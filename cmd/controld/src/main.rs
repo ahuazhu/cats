@@ -60,9 +60,6 @@ struct Args {
         default_value = "cats:fleet:admin"
     )]
     workos_admin_permission: String,
-    /// Show static-token forms in addition to WorkOS login.
-    #[arg(long, env = "CATS_WORKOS_ALLOW_TOKEN_LOGIN", default_value_t = false)]
-    workos_allow_token_login: bool,
     /// Override Secure on AuthKit cookies. Defaults to true for HTTPS redirects.
     #[arg(long, env = "CATS_WORKOS_COOKIE_SECURE")]
     workos_cookie_secure: Option<bool>,
@@ -185,7 +182,6 @@ async fn main() -> anyhow::Result<()> {
                 cookie_domain: args.workos_cookie_domain,
                 user_site_url: args.user_site_url,
                 admin_site_url: args.admin_site_url,
-                allow_token_login: args.workos_allow_token_login,
             },
         )?))
     } else {

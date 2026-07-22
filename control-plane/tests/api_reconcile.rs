@@ -276,8 +276,8 @@ async fn embedded_user_and_admin_sites_are_served_without_credentials() {
             "text/javascript",
             "export async function request",
         ),
-        ("/ui/user.js", "text/javascript", "cats.user.token"),
-        ("/ui/admin.js", "text/javascript", "cats.admin.token"),
+        ("/ui/user.js", "text/javascript", "initializeAuth"),
+        ("/ui/admin.js", "text/javascript", "initializeAuth"),
     ];
 
     for (path, content_type, marker) in assets {
@@ -302,6 +302,19 @@ async fn embedded_user_and_admin_sites_are_served_without_credentials() {
         }
     }
 
+    let user_html = ctx
+        .http
+        .get(ctx.url("/"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!user_html.contains("Project Token"));
+    assert!(!user_html.contains("token-login-section"));
+    assert!(!user_html.contains("CAT STATUS"));
+
     let response = ctx
         .http
         .get(ctx.url("/"))
@@ -310,7 +323,10 @@ async fn embedded_user_and_admin_sites_are_served_without_credentials() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(response.text().await.unwrap().contains("管理员控制台"));
+    let admin_html = response.text().await.unwrap();
+    assert!(admin_html.contains("管理员控制台"));
+    assert!(!admin_html.contains("Administrator Token"));
+    assert!(!admin_html.contains("FLEET HEALTH"));
 
     let auth_config = ctx.http.get(ctx.url("/auth/config")).send().await.unwrap();
     assert_eq!(auth_config.status(), StatusCode::OK);
@@ -323,7 +339,7 @@ async fn embedded_user_and_admin_sites_are_served_without_credentials() {
     );
     let auth_config: serde_json::Value = auth_config.json().await.unwrap();
     assert_eq!(auth_config["workos_enabled"], false);
-    assert_eq!(auth_config["token_login_enabled"], true);
+    assert!(auth_config.get("token_login_enabled").is_none());
 }
 
 #[tokio::test]

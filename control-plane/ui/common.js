@@ -7,10 +7,9 @@ export class ApiError extends Error {
   }
 }
 
-export async function request(path, token, options = {}) {
+export async function request(path, options = {}) {
   const headers = new Headers(options.headers || {});
   headers.set("Accept", "application/json, text/plain;q=0.9");
-  if (token) headers.set("Authorization", `Bearer ${token}`);
   if (options.body !== undefined && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
@@ -142,17 +141,6 @@ export function splitCommand(command) {
   if (current) values.push(current);
   if (!values.length) throw new Error("命令不能为空");
   return values;
-}
-
-export function initTokenToggle(root = document) {
-  root.querySelectorAll(".token-toggle").forEach((button) => {
-    button.addEventListener("click", () => {
-      const input = button.closest(".password-field")?.querySelector("input");
-      if (!input) return;
-      input.type = input.type === "password" ? "text" : "password";
-      button.textContent = input.type === "password" ? "显示" : "隐藏";
-    });
-  });
 }
 
 export function initNavigation(titles, onChange) {

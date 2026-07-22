@@ -19,33 +19,15 @@
         <h1>继续使用你的云端工作空间</h1>
         <p id="login-description">登录后即可创建、启动和管理你的 Cats。</p>
       </div>
-      <form class="login-form" id="login-form">
-        <label id="login-project-field">
-          <span>工作区</span>
-          <input id="login-project" name="project" value="default" autocomplete="organization" required>
-        </label>
+      <div class="login-form">
         <button class="button button-primary button-wide is-hidden" id="workos-login-button" type="button">
           <span>使用 WorkOS 登录</span><span aria-hidden="true">→</span>
         </button>
-        <div class="token-login-section" id="token-login-section">
-          <div class="auth-divider"><span>开发环境 Token</span></div>
-          <label>
-            <span>Project Token</span>
-            <span class="password-field">
-              <input id="login-token" name="token" type="password" autocomplete="current-password">
-              <button class="token-toggle" type="button" aria-label="显示或隐藏 token">显示</button>
-            </span>
-          </label>
-          <p class="form-error" id="login-error" role="alert"></p>
-          <button class="button button-quiet button-wide" id="token-login-button" type="submit">
-            <span>使用 Token 登录</span><span aria-hidden="true">→</span>
-          </button>
-        </div>
-      </form>
+        <p class="form-error" id="login-error" role="alert"></p>
+      </div>
     </div>
     <aside class="login-art user-art" aria-hidden="true">
       <div class="orbit orbit-one"></div><div class="orbit orbit-two"></div>
-      <div class="art-card"><small>CAT STATUS</small><strong>Running</strong><span>dev · 2 CPU · 2 GiB</span></div>
     </aside>
   </section>
 

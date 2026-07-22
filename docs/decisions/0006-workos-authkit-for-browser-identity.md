@@ -35,8 +35,8 @@ CLI 调用契约。
    - admin token 用于 fleet CLI；
    - service token 只用于 node-agent、gateway 与控制器。
    WorkOS session 不得获得 service 权限，Guest 不接收任何上述凭据。
-6. WorkOS 配置是可选的。未配置时保留本地 token 登录；配置后 Web 默认隐藏 token
-   表单，只有显式启用开发回退时才显示。Bearer API 本身仍保留给 CLI。
+6. user/admin Web 站点只使用 WorkOS 登录，不提供静态 Token 表单或开发回退。
+   WorkOS 未配置时浏览器站点 fail closed。Bearer API 本身仍保留给 CLI 和内部服务。
 7. 使用 WorkOS 官方 Rust SDK 提供的 AuthKit、PKCE 与 sealed-session helper，不自行
    实现密码学协议。由此 workspace 最低 Rust 版本从 1.85 提升到 1.88。
 
@@ -49,7 +49,9 @@ CLI 调用契约。
   session 进入其确定性的个人 Project。
 - user/admin session 相互独立；admin session 可以管理所有 Cats projects，但不能
   调用 service-only node/gateway API。
-- Project 名称不通过公开认证配置接口枚举；用户从受控入口或邀请链接获得项目名。
+- Project 名称不通过公开认证配置接口枚举。公共用户入口先完成 WorkOS 认证，再从
+  已验证的 Organization membership 或 WorkOS user ID 确定工作区；受控邀请链接仍可
+  显式指定团队或个人 Project，并在回调时重新校验身份匹配。
 
 ## 影响
 

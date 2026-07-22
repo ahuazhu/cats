@@ -118,17 +118,14 @@ cargo run -p cats-control-plane-daemon --bin cats-controld
 ```
 
 控制面进程同时提供两个独立的、无需前端构建步骤的站点。生产环境以 `cats.run`
-作为用户入口、`ops.cats.run` 作为管理员入口。未配置 WorkOS 时，本地开发仍可使用
-当前标签页 `sessionStorage` 中的 token：
-
-- 用户站：<http://127.0.0.1:7300/user/>，使用 project 名和对应的 Project Token。
-- 管理员站：<http://127.0.0.1:7300/admin/>，使用 Administrator Token。
-- 本地根路径直接进入用户站：<http://127.0.0.1:7300/>。
+作为用户入口、`ops.cats.run` 作为管理员入口。两个浏览器站点都只支持 WorkOS
+登录，不提供静态 Token 表单；未配置 WorkOS 时页面会提示联系平台管理员。本地根
+路径直接进入用户站：<http://127.0.0.1:7300/>。
 
 ### WorkOS AuthKit 登录
 
-配置 WorkOS 后，两个 Web 站点改用独立的加密 HttpOnly session cookie；静态 token
-表单默认隐藏，CLI Bearer Token 不受影响。一个 WorkOS Organization 必须显式映射到
+配置 WorkOS 后，两个 Web 站点使用独立的加密 HttpOnly session cookie；CLI Bearer
+Token 不受影响。一个 WorkOS Organization 必须显式映射到
 一个 Cats Project；没有 Organization membership 的新用户会获得基于 WorkOS
 `user_id` 的独立个人 Project，不会进入共享的 `default` Project。管理员还必须在
 管理员 Organization 中拥有 `cats:fleet:admin` permission：
@@ -146,8 +143,7 @@ cargo run -p cats-control-plane-daemon --bin cats-controld
 
 在 WorkOS Dashboard 的 Redirects 中登记同一个 callback URI，并给管理员角色添加
 `cats:fleet:admin` permission。生产 redirect URI 使用 HTTPS 后，控制面会默认给
-session cookie 添加 `Secure`。如需在已配置 WorkOS 的本地环境暂时显示 token 表单，
-显式设置 `CATS_WORKOS_ALLOW_TOKEN_LOGIN=true`。
+session cookie 添加 `Secure`。
 
 用户 token 只能查看和管理所属 project 的 Cat、Disk、Endpoint、Snapshot 和
 Operation；跨 project 请求返回 `403`：

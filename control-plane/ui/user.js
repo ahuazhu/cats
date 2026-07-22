@@ -3,7 +3,6 @@ import {
   formatBytes,
   formatTime,
   initNavigation,
-  initTokenToggle,
   metricCard,
   request,
   setBusy,
@@ -13,12 +12,8 @@ import {
   toast,
 } from "/ui/common.js";
 
-const TOKEN_KEY = "cats.user.token";
-const PROJECT_KEY = "cats.user.project";
 const state = {
-  token: "",
   project: "",
-  authMode: "token",
   authConfig: null,
   cats: [],
   disks: [],
@@ -29,13 +24,11 @@ const state = {
 
 const loginScreen = document.querySelector("#login-screen");
 const appShell = document.querySelector("#app-shell");
-const loginForm = document.querySelector("#login-form");
 const loginError = document.querySelector("#login-error");
 const createCatDialog = document.querySelector("#create-cat-dialog");
 const createDiskDialog = document.querySelector("#create-disk-dialog");
 const execDialog = document.querySelector("#exec-dialog");
 
-initTokenToggle();
 initNavigation(
   { overview: "工作区概览", cats: "Cats", disks: "Persistent Disks", operations: "Operations" },
   (view) => { state.activeView = view; },
@@ -51,11 +44,11 @@ function workspaceLabel(project) {
 
 async function authenticatedRequest(path, options) {
   try {
-    return await request(path, state.token, options);
+    return await request(path, options);
   } catch (error) {
-    if (state.authMode !== "workos" || error.status !== 401) throw error;
-    await request("/auth/session?site=user", "");
-    return request(path, "", options);
+    if (error.status !== 401) throw error;
+    await request("/auth/session?site=user");
+    return request(path, options);
   }
 }
 
@@ -92,7 +85,6 @@ async function loadAll({ quiet = false } = {}) {
     render();
   } catch (error) {
     if (error.status === 401 || error.status === 403) {
-      sessionStorage.removeItem(TOKEN_KEY);
       showLogin(error.message);
     } else {
       toast("刷新失败", error.message, "error");
@@ -307,54 +299,15 @@ async function mutateDisk(name, action, button) {
   }
 }
 
-loginForm.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  if (state.authConfig?.workos_enabled && !state.authConfig.token_login_enabled) {
-    startWorkOsLogin();
-    return;
-  }
-  const button = loginForm.querySelector('button[type="submit"]');
-  const form = new FormData(loginForm);
-  const project = String(form.get("project") || "").trim();
-  const token = String(form.get("token") || "").trim();
-  loginError.textContent = "";
-  setBusy(button, true, "正在验证…");
-  try {
-    await request(`/v1/projects/${encodeURIComponent(project)}/cats`, token);
-    state.project = project;
-    state.token = token;
-    state.authMode = "token";
-    sessionStorage.setItem(PROJECT_KEY, project);
-    sessionStorage.setItem(TOKEN_KEY, token);
-    showApp();
-    await loadAll({ quiet: true });
-  } catch (error) {
-    loginError.textContent = error.message;
-  } finally {
-    setBusy(button, false);
-  }
-});
-
 function startWorkOsLogin() {
-  const project = document.querySelector("#login-project").value.trim();
-  if (!project) {
-    loginError.textContent = "工作区不能为空";
-    return;
-  }
-  const query = new URLSearchParams({ site: "user", project });
+  const query = new URLSearchParams({ site: "user" });
   window.location.assign(`/auth/login?${query}`);
 }
 
 document.querySelector("#workos-login-button").addEventListener("click", startWorkOsLogin);
 
 document.querySelector("#logout-button").addEventListener("click", () => {
-  if (state.authMode === "workos") {
-    window.location.assign("/auth/logout?site=user");
-    return;
-  }
-  sessionStorage.removeItem(TOKEN_KEY);
-  state.token = "";
-  showLogin();
+  window.location.assign("/auth/logout?site=user");
 });
 document.querySelector("#refresh-button").addEventListener("click", () => loadAll().catch(() => {}));
 document.querySelectorAll("#create-cat-button, [data-create-cat]").forEach((button) => button.addEventListener("click", () => createCatDialog.showModal()));
@@ -464,37 +417,22 @@ document.querySelector("#disks-table").addEventListener("click", (event) => {
 });
 
 async function initializeAuth() {
-  state.project = sessionStorage.getItem(PROJECT_KEY) || "default";
-  state.token = sessionStorage.getItem(TOKEN_KEY) || "";
-  document.querySelector("#login-project").value = state.project;
   try {
-    state.authConfig = await request("/auth/config", "");
+    state.authConfig = await request("/auth/config");
     document.querySelector("#workos-login-button").classList.toggle("is-hidden", !state.authConfig.workos_enabled);
-    document.querySelector("#token-login-section").classList.toggle("is-hidden", !state.authConfig.token_login_enabled);
-    document.querySelector("#login-project-field").classList.toggle("is-hidden", !state.authConfig.token_login_enabled);
     document.querySelector("#login-description").textContent = state.authConfig.workos_enabled
       ? "登录后即可创建、启动和管理你的 Cats。"
-      : "使用工作区 Token 登录。凭证仅保存在当前浏览器标签页中。";
+      : "WorkOS 登录尚未配置，请联系平台管理员。";
     if (state.authConfig.workos_enabled) {
       try {
-        const session = await request("/auth/session?site=user", "");
-        state.authMode = "workos";
-        state.token = "";
+        const session = await request("/auth/session?site=user");
         state.project = session.project;
-        sessionStorage.removeItem(TOKEN_KEY);
-        sessionStorage.setItem(PROJECT_KEY, state.project);
         showApp();
         await loadAll({ quiet: true });
         return;
       } catch (_) {
         // No WorkOS session yet; remain on the sign-in screen.
       }
-    }
-    if (state.token && state.authConfig.token_login_enabled) {
-      state.authMode = "token";
-      showApp();
-      await loadAll({ quiet: true });
-      return;
     }
   } catch (error) {
     loginError.textContent = `读取登录配置失败：${error.message}`;

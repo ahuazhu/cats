@@ -2,7 +2,6 @@ import {
   escapeHtml,
   formatTime,
   initNavigation,
-  initTokenToggle,
   metricCard,
   request,
   setBusy,
@@ -10,10 +9,7 @@ import {
   toast,
 } from "/ui/common.js";
 
-const TOKEN_KEY = "cats.admin.token";
 const state = {
-  token: "",
-  authMode: "token",
   authConfig: null,
   overview: null,
   nodes: [],
@@ -23,10 +19,8 @@ const state = {
 };
 const loginScreen = document.querySelector("#login-screen");
 const appShell = document.querySelector("#app-shell");
-const loginForm = document.querySelector("#login-form");
 const loginError = document.querySelector("#login-error");
 
-initTokenToggle();
 initNavigation({ overview: "Fleet 概览", nodes: "工作节点", metrics: "Metrics" }, (view) => {
   state.activeView = view;
   if (view === "metrics") loadMetrics().catch((error) => toast("Metrics 加载失败", error.message, "error"));
@@ -34,11 +28,11 @@ initNavigation({ overview: "Fleet 概览", nodes: "工作节点", metrics: "Metr
 
 async function authenticatedRequest(path, options) {
   try {
-    return await request(path, state.token, options);
+    return await request(path, options);
   } catch (error) {
-    if (state.authMode !== "workos" || error.status !== 401) throw error;
-    await request("/auth/session?site=admin", "");
-    return request(path, "", options);
+    if (error.status !== 401) throw error;
+    await request("/auth/session?site=admin");
+    return request(path, options);
   }
 }
 
@@ -84,7 +78,6 @@ async function loadAll({ quiet = false } = {}) {
     if (state.activeView === "metrics") await loadMetrics();
   } catch (error) {
     if (error.status === 401 || error.status === 403) {
-      sessionStorage.removeItem(TOKEN_KEY);
       showLogin(error.message);
     } else if (!quiet) {
       toast("刷新失败", error.message, "error");
@@ -193,30 +186,6 @@ async function mutateNode(id, action, button) {
   }
 }
 
-loginForm.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  if (state.authConfig?.workos_enabled && !state.authConfig.token_login_enabled) {
-    startWorkOsLogin();
-    return;
-  }
-  const button = loginForm.querySelector('button[type="submit"]');
-  const token = String(new FormData(loginForm).get("token") || "").trim();
-  loginError.textContent = "";
-  setBusy(button, true, "正在验证…");
-  try {
-    await request("/v1/admin/monitoring", token);
-    state.token = token;
-    state.authMode = "token";
-    sessionStorage.setItem(TOKEN_KEY, token);
-    showApp();
-    await loadAll({ quiet: true });
-  } catch (error) {
-    loginError.textContent = error.message;
-  } finally {
-    setBusy(button, false);
-  }
-});
-
 function startWorkOsLogin() {
   const query = new URLSearchParams({ site: "admin" });
   window.location.assign(`/auth/login?${query}`);
@@ -225,13 +194,7 @@ function startWorkOsLogin() {
 document.querySelector("#workos-login-button").addEventListener("click", startWorkOsLogin);
 
 document.querySelector("#logout-button").addEventListener("click", () => {
-  if (state.authMode === "workos") {
-    window.location.assign("/auth/logout?site=admin");
-    return;
-  }
-  sessionStorage.removeItem(TOKEN_KEY);
-  state.token = "";
-  showLogin();
+  window.location.assign("/auth/logout?site=admin");
 });
 document.querySelector("#refresh-button").addEventListener("click", () => loadAll().catch(() => {}));
 document.querySelector("#nodes-table").addEventListener("click", (event) => {
@@ -249,32 +212,21 @@ document.querySelector("#copy-metrics").addEventListener("click", async () => {
 });
 
 async function initializeAuth() {
-  state.token = sessionStorage.getItem(TOKEN_KEY) || "";
   try {
-    state.authConfig = await request("/auth/config", "");
+    state.authConfig = await request("/auth/config");
     document.querySelector("#workos-login-button").classList.toggle("is-hidden", !state.authConfig.workos_enabled);
-    document.querySelector("#token-login-section").classList.toggle("is-hidden", !state.authConfig.token_login_enabled);
     document.querySelector("#login-description").textContent = state.authConfig.workos_enabled
       ? "通过 WorkOS 登录，并验证 Fleet 管理员权限。"
-      : "使用 Administrator Token 登录。该站点可排空和删除工作节点。";
+      : "WorkOS 登录尚未配置，请联系平台管理员。";
     if (state.authConfig.workos_enabled) {
       try {
-        await request("/auth/session?site=admin", "");
-        state.authMode = "workos";
-        state.token = "";
-        sessionStorage.removeItem(TOKEN_KEY);
+        await request("/auth/session?site=admin");
         showApp();
         await loadAll({ quiet: true });
         return;
       } catch (_) {
         // No WorkOS administrator session yet.
       }
-    }
-    if (state.token && state.authConfig.token_login_enabled) {
-      state.authMode = "token";
-      showApp();
-      await loadAll({ quiet: true });
-      return;
     }
   } catch (error) {
     loginError.textContent = `读取登录配置失败：${error.message}`;

@@ -139,7 +139,6 @@ impl Ctx {
             cookie_domain: None,
             user_site_url: Some("https://cats.run/".into()),
             admin_site_url: Some("https://ops.cats.run/".into()),
-            allow_token_login: false,
         })
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -178,7 +177,7 @@ impl Ctx {
 
     async fn login(&self, site: &str, code: &str) -> String {
         let path = if site == "user" {
-            "/auth/login?site=user&project=default&return_to=/user/"
+            "/auth/login?site=user&return_to=/user/"
         } else {
             "/auth/login?site=admin&return_to=/admin/"
         };
@@ -199,6 +198,11 @@ impl Ctx {
         assert!(location
             .query_pairs()
             .any(|(key, _)| key == "code_challenge"));
+        if site == "user" {
+            assert!(!location
+                .query_pairs()
+                .any(|(key, _)| key == "organization_id"));
+        }
         let state = location
             .query_pairs()
             .find(|(key, _)| key == "state")
@@ -250,7 +254,7 @@ async fn workos_user_and_admin_sessions_enforce_their_scopes() {
         .await
         .unwrap();
     assert_eq!(public_config["workos_enabled"], true);
-    assert_eq!(public_config["token_login_enabled"], false);
+    assert!(public_config.get("token_login_enabled").is_none());
     assert!(public_config.get("projects").is_none());
     assert!(!public_config.to_string().contains("sk_test_secret"));
 
@@ -369,6 +373,45 @@ async fn organizationless_workos_user_receives_an_isolated_personal_project() {
         .await
         .unwrap();
     assert_eq!(shared_project.status(), StatusCode::FORBIDDEN);
+
+    let personal_login = ctx
+        .http
+        .get(ctx.url("/auth/login?site=user&project=personal-user_new-user-code"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(personal_login.status(), StatusCode::SEE_OTHER);
+    let flow_cookie = cookie_pair(&personal_login, "cats_user_auth_flow");
+    let location = Url::parse(
+        personal_login
+            .headers()
+            .get(LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!location
+        .query_pairs()
+        .any(|(key, _)| key == "organization_id"));
+    let state = location
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .unwrap()
+        .1
+        .into_owned();
+    let callback = ctx
+        .http
+        .get(ctx.url(&format!("/auth/callback?code=new-user-code&state={state}")))
+        .header("Cookie", flow_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        callback.headers().get(LOCATION).unwrap(),
+        "https://cats.run/"
+    );
 }
 
 #[tokio::test]
