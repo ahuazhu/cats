@@ -1,0 +1,617 @@
+const STORAGE_KEY = "cats.language";
+const DEFAULT_LOCALE = "en";
+
+const messages = {
+  en: {
+    "language.label": "Language",
+    "language.auto": "System default",
+    "language.en": "English",
+    "language.zh-CN": "中文",
+    "common.cancel": "Cancel",
+    "common.close": "Close",
+    "common.refresh": "Refresh",
+    "common.refreshing": "Refreshing…",
+    "common.logout": "Sign out",
+    "common.connected": "Connected",
+    "common.actions": "Actions",
+    "common.name": "Name",
+    "common.status": "Status",
+    "common.type": "Type",
+    "common.capacity": "Capacity",
+    "common.memory": "Memory",
+    "common.created": "Created",
+    "common.node": "Node",
+    "common.error": "Error",
+    "common.notScheduled": "Not scheduled",
+    "common.loading": "Loading…",
+    "common.copy": "Copy",
+    "common.copied": "Copied",
+    "common.copyFailed": "Copy failed",
+    "common.noMetrics": "# no metrics",
+    "common.generation": "generation {value}",
+    "brand.cloudWorkspaces": "Cloud Workspaces",
+    "brand.myWorkspaces": "My Workspaces",
+    "brand.fleetConsole": "Fleet Console",
+    "brand.adminConsole": "Admin Console",
+    "section.compute": "COMPUTE",
+    "section.activity": "ACTIVITY",
+    "section.storage": "STORAGE",
+    "section.controlPlane": "CONTROL PLANE",
+    "section.capacity": "CAPACITY",
+    "section.lifecycle": "LIFECYCLE",
+    "section.workers": "WORKERS",
+    "section.prometheus": "PROMETHEUS",
+
+    "user.meta.title": "Cats · User Console",
+    "user.login.eyebrow": "WELCOME BACK",
+    "user.login.title": "Continue to your cloud workspace",
+    "user.login.description": "Sign in to create, start, and manage your Cats.",
+    "user.login.unconfigured": "WorkOS sign-in is not configured. Contact your platform administrator.",
+    "user.login.button": "Sign in with WorkOS",
+    "user.context.label": "WORKSPACE",
+    "user.context.description": "Your resource space",
+    "user.nav.aria": "User console navigation",
+    "user.nav.overview": "Overview",
+    "user.nav.cats": "Cats",
+    "user.nav.disks": "Disks",
+    "user.nav.operations": "Operations",
+    "user.breadcrumb": "Workspace /",
+    "user.mobileMenu": "Open navigation",
+    "user.createCat": "Create Cat",
+    "user.overview.recentCats": "Recent Cats",
+    "user.overview.viewAll": "View all →",
+    "user.overview.recentOperations": "Recent operations",
+    "user.cats.title": "My Cats",
+    "user.cats.description": "Start, suspend, or manage your cloud workspaces.",
+    "user.cats.spec": "Size",
+    "user.cats.emptyTitle": "No Cats yet",
+    "user.cats.emptyDescription": "Create your first cloud workspace.",
+    "user.disks.title": "Persistent Disks",
+    "user.disks.description": "RWO persistent disks with a lifecycle independent from Cats.",
+    "user.disks.create": "Create disk",
+    "user.disks.boundCat": "Attached Cat",
+    "user.disks.emptyTitle": "No independent disks",
+    "user.disks.emptyDescription": "RootDisk is created with each Cat; extra PersistentDisks appear here.",
+    "user.operations.description": "Status, target resource, and final result for every asynchronous change.",
+    "user.operations.operation": "Operation",
+    "user.operations.resource": "Resource",
+    "user.operations.phase": "Phase",
+    "user.operations.updated": "Updated",
+    "user.operations.emptyTitle": "No operations yet",
+    "user.catDialog.eyebrow": "NEW COMPUTE",
+    "user.catDialog.title": "Create Cat",
+    "user.catDialog.image": "Image",
+    "user.catDialog.memory": "Memory (MiB)",
+    "user.catDialog.rootDisk": "RootDisk (GiB)",
+    "user.catDialog.nameHint": "Letters, numbers, and hyphens",
+    "user.catDialog.submit": "Create and start",
+    "user.diskDialog.eyebrow": "NEW STORAGE",
+    "user.diskDialog.title": "Create PersistentDisk",
+    "user.diskDialog.size": "Capacity (GiB)",
+    "user.diskDialog.submit": "Create disk",
+    "user.execDialog.eyebrow": "GUEST EXEC",
+    "user.execDialog.title": "Run in",
+    "user.execDialog.command": "Command",
+    "user.execDialog.hint": "Split into argv on spaces; this development console does not perform shell expansion.",
+    "user.execDialog.waiting": "Waiting to run…",
+    "user.execDialog.run": "Run",
+    "user.execDialog.running": "Running…",
+    "user.workspace.personal": "Personal workspace",
+    "user.metric.totalCats": "Total Cats",
+    "user.metric.sleeping": "Suspended / Warm",
+    "user.metric.running": "{count} running",
+    "user.metric.fastResume": "Fast resume available",
+    "user.metric.persistentDisks": "Persistent Disks",
+    "user.metric.activeOperations": "Active Operations",
+    "user.metric.controlTasks": "Control-plane asynchronous tasks",
+    "user.empty.recentCats": "No Cats yet. Use Create Cat to get started.",
+    "user.empty.recentOperations": "No operations yet.",
+    "user.action.exec": "Exec",
+    "user.action.suspend": "Suspend",
+    "user.action.warm": "Warm",
+    "user.action.stop": "Stop",
+    "user.action.resume": "Resume",
+    "user.action.start": "Start",
+    "user.action.expose": "Expose",
+    "user.action.destroy": "Destroy",
+    "user.action.snapshot": "Snapshot",
+    "user.action.unmount": "Unmount",
+    "user.action.mount": "Mount",
+    "user.action.resize": "Resize",
+    "user.action.delete": "Delete",
+    "user.refreshFailed": "Refresh failed",
+    "user.operationFailed": "Operation {id} failed",
+    "user.operationTimeout": "Timed out waiting for operation {id}",
+    "user.expose.portPrompt": "Guest port to expose for {name}",
+    "user.expose.namePrompt": "Endpoint name",
+    "user.expose.created": "Endpoint created",
+    "user.destroy.confirm": "Destroy Cat “{name}”? Its RootDisk will also be deleted.",
+    "user.operation.accepted": "Operation accepted",
+    "user.operation.completed": "Operation completed",
+    "user.mount.noCats": "Create a Cat first",
+    "user.mount.catPrompt": "Which Cat should this disk attach to?",
+    "user.mount.pathPrompt": "Guest mount path",
+    "user.resize.prompt": "New capacity in GiB (grow only)",
+    "user.disk.deleteConfirm": "Delete PersistentDisk “{name}”?",
+    "user.disk.snapshotCreated": "Snapshot created",
+    "user.disk.operationCompleted": "Disk operation completed",
+    "user.cat.creating": "Creating Cat",
+    "user.cat.ready": "Cat is ready",
+    "user.disk.created": "PersistentDisk created",
+    "user.cat.actionFailed": "Cat operation failed",
+    "user.disk.actionFailed": "Disk operation failed",
+    "user.authConfigFailed": "Could not load sign-in configuration: {message}",
+
+    "admin.meta.title": "Cats · Administrator Console",
+    "admin.login.eyebrow": "ADMIN SITE",
+    "admin.login.title": "Manage the compute fleet",
+    "admin.login.description": "Sign in with WorkOS and verify fleet administrator access.",
+    "admin.login.unconfigured": "WorkOS sign-in is not configured. Contact your platform administrator.",
+    "admin.login.button": "Sign in with WorkOS",
+    "admin.backToUser": "← Back to user site",
+    "admin.context.label": "PLATFORM",
+    "admin.context.description": "Global administration boundary",
+    "admin.nav.aria": "Administrator console navigation",
+    "admin.nav.overview": "Fleet overview",
+    "admin.nav.nodes": "Worker nodes",
+    "admin.nav.metrics": "Metrics",
+    "admin.breadcrumb": "Platform /",
+    "admin.autoRefresh": "Auto refresh",
+    "admin.capacity.title": "Fleet resource allocation",
+    "admin.lifecycle.title": "Cat states",
+    "admin.workers.title": "Node health",
+    "admin.workers.manage": "Manage nodes →",
+    "admin.nodes.eyebrow": "FLEET MANAGEMENT",
+    "admin.nodes.title": "Worker nodes",
+    "admin.nodes.description": "Cordon stops new scheduling. Drain safely stops, fences, and reschedules existing Cats.",
+    "admin.nodes.assignments": "Assignments",
+    "admin.nodes.heartbeat": "Heartbeat",
+    "admin.nodes.telemetry": "Host telemetry",
+    "admin.nodes.emptyTitle": "No registered nodes",
+    "admin.nodes.emptyDescription": "Nodes register and begin heartbeating after cats-noded starts.",
+    "admin.metrics.title": "Live metrics",
+    "admin.metrics.description": "Read from the same control plane using administrator credentials.",
+    "admin.metric.fleetNodes": "Fleet Nodes",
+    "admin.metric.nodeDetail": "{ready} ready · {lost} lost",
+    "admin.metric.totalCats": "Total Cats",
+    "admin.metric.running": "{count} running",
+    "admin.metric.cpuAllocation": "CPU Allocation",
+    "admin.metric.activeOperations": "Active Operations",
+    "admin.metric.failed": "{count} failed",
+    "admin.refreshFailed": "Refresh failed",
+    "admin.generatedAt": "Generated {time}",
+    "admin.unit.cores": "cores",
+    "admin.lifecycle.transitional": "Transitional",
+    "admin.lifecycle.failedUnknown": "Failed / Unknown",
+    "admin.empty.nodes": "No registered nodes.",
+    "admin.node.heartbeatAgo": "heartbeat {seconds}s ago",
+    "admin.node.secondsAgo": "{seconds}s ago",
+    "admin.node.load": "{count} Cats · load {load}",
+    "admin.action.cordon": "Cordon",
+    "admin.action.drain": "Drain",
+    "admin.action.uncordon": "Uncordon",
+    "admin.action.cancelDrain": "Cancel drain",
+    "admin.action.delete": "Delete",
+    "admin.node.drainConfirm": "Drain node “{id}”? Existing Cats will be stopped, fenced, and rescheduled.",
+    "admin.node.deleteConfirm": "Remove node “{id}” from the registry? It must be empty and cordoned or lost.",
+    "admin.node.actionConfirm": "{action} node “{id}”?",
+    "admin.node.operationCompleted": "Node operation completed",
+    "admin.node.operationFailed": "Node operation failed",
+    "admin.metrics.loadFailed": "Could not load metrics",
+    "admin.metrics.copied": "Metrics copied",
+    "admin.authConfigFailed": "Could not load sign-in configuration: {message}",
+
+    "status.unknown": "Unknown",
+    "status.creating": "Creating",
+    "status.running": "Running",
+    "status.ready": "Ready",
+    "status.succeeded": "Succeeded",
+    "status.available": "Available",
+    "status.failed": "Failed",
+    "status.lost": "Lost",
+    "status.pending": "Pending",
+    "status.starting": "Starting",
+    "status.stopping": "Stopping",
+    "status.suspending": "Suspending",
+    "status.warming": "Warming",
+    "status.draining": "Draining",
+    "status.suspended": "Suspended",
+    "status.warm": "Warm",
+    "status.cold": "Cold",
+    "status.cordoned": "Cordoned",
+    "status.bound": "Bound",
+    "status.deleting": "Deleting",
+    "status.deleted": "Deleted",
+    "kind.root": "Root",
+    "kind.persistent": "Persistent",
+    "operation.cat_create": "Create Cat",
+    "operation.cat_start": "Start Cat",
+    "operation.cat_stop": "Stop Cat",
+    "operation.cat_suspend": "Suspend Cat",
+    "operation.cat_resume": "Resume Cat",
+    "operation.cat_warm": "Move Cat to Warm",
+    "operation.cat_wake": "Wake Cat",
+    "operation.cat_work_wake": "Wake Cat for active work",
+    "operation.cat_auto_suspend": "Automatically suspend Cat",
+    "operation.cat_delete": "Delete Cat",
+    "error.network": "Could not connect to the control plane: {message}",
+    "error.invalidJson": "The control plane returned invalid JSON",
+    "error.http": "Request failed (HTTP {status})",
+    "error.invalid_argument": "Check the request values and try again.",
+    "error.unauthenticated": "Your session has expired. Sign in again.",
+    "error.permission_denied": "You do not have permission to perform this action.",
+    "error.not_found": "The requested resource was not found.",
+    "error.already_exists": "A resource with this name already exists.",
+    "error.failed_precondition": "The resource is not in a state that allows this action.",
+    "error.conflict": "The resource changed or is already in use. Refresh and try again.",
+    "error.stale_epoch": "This request used a stale attachment or route epoch.",
+    "error.deadline_exceeded": "The operation timed out.",
+    "error.unavailable": "The service is temporarily unavailable.",
+    "error.internal": "The control plane encountered an internal error.",
+    "error.unclosedQuote": "The command contains an unclosed quote",
+    "error.emptyCommand": "The command cannot be empty",
+  },
+  "zh-CN": {
+    "language.label": "语言",
+    "language.auto": "跟随系统",
+    "language.en": "English",
+    "language.zh-CN": "中文",
+    "common.cancel": "取消",
+    "common.close": "关闭",
+    "common.refresh": "刷新",
+    "common.refreshing": "刷新中…",
+    "common.logout": "退出登录",
+    "common.connected": "已连接",
+    "common.actions": "操作",
+    "common.name": "名称",
+    "common.status": "状态",
+    "common.type": "类型",
+    "common.capacity": "容量",
+    "common.memory": "内存",
+    "common.created": "创建时间",
+    "common.node": "节点",
+    "common.error": "错误",
+    "common.notScheduled": "未调度",
+    "common.loading": "正在加载…",
+    "common.copy": "复制",
+    "common.copied": "已复制",
+    "common.copyFailed": "复制失败",
+    "common.noMetrics": "# 暂无指标",
+    "common.generation": "版本 {value}",
+    "brand.cloudWorkspaces": "云端工作空间",
+    "brand.myWorkspaces": "我的工作空间",
+    "brand.fleetConsole": "Fleet 控制台",
+    "brand.adminConsole": "管理员控制台",
+    "section.compute": "计算",
+    "section.activity": "活动",
+    "section.storage": "存储",
+    "section.controlPlane": "控制面",
+    "section.capacity": "容量",
+    "section.lifecycle": "生命周期",
+    "section.workers": "工作节点",
+    "section.prometheus": "PROMETHEUS",
+
+    "user.meta.title": "Cats · 用户控制台",
+    "user.login.eyebrow": "欢迎回来",
+    "user.login.title": "继续使用你的云端工作空间",
+    "user.login.description": "登录后即可创建、启动和管理你的 Cats。",
+    "user.login.unconfigured": "WorkOS 登录尚未配置，请联系平台管理员。",
+    "user.login.button": "使用 WorkOS 登录",
+    "user.context.label": "工作区",
+    "user.context.description": "你的资源空间",
+    "user.nav.aria": "用户控制台导航",
+    "user.nav.overview": "概览",
+    "user.nav.cats": "Cats",
+    "user.nav.disks": "磁盘",
+    "user.nav.operations": "Operations",
+    "user.breadcrumb": "工作区 /",
+    "user.mobileMenu": "打开导航",
+    "user.createCat": "创建 Cat",
+    "user.overview.recentCats": "最近的 Cats",
+    "user.overview.viewAll": "查看全部 →",
+    "user.overview.recentOperations": "最近操作",
+    "user.cats.title": "我的 Cats",
+    "user.cats.description": "启动、暂停或管理你的云端工作空间。",
+    "user.cats.spec": "规格",
+    "user.cats.emptyTitle": "还没有 Cat",
+    "user.cats.emptyDescription": "创建你的第一个云端工作空间。",
+    "user.disks.title": "Persistent Disks",
+    "user.disks.description": "独立于 Cat 生命周期的 RWO 持久磁盘。",
+    "user.disks.create": "创建磁盘",
+    "user.disks.boundCat": "绑定 Cat",
+    "user.disks.emptyTitle": "没有独立磁盘",
+    "user.disks.emptyDescription": "RootDisk 会随 Cat 自动创建；这里展示额外 PersistentDisk。",
+    "user.operations.description": "所有异步变更的状态、目标资源和最终结果。",
+    "user.operations.operation": "Operation",
+    "user.operations.resource": "资源",
+    "user.operations.phase": "阶段",
+    "user.operations.updated": "更新时间",
+    "user.operations.emptyTitle": "暂无操作记录",
+    "user.catDialog.eyebrow": "新建计算资源",
+    "user.catDialog.title": "创建 Cat",
+    "user.catDialog.image": "镜像",
+    "user.catDialog.memory": "内存 (MiB)",
+    "user.catDialog.rootDisk": "RootDisk (GiB)",
+    "user.catDialog.nameHint": "字母、数字和连字符",
+    "user.catDialog.submit": "创建并启动",
+    "user.diskDialog.eyebrow": "新建存储",
+    "user.diskDialog.title": "创建 PersistentDisk",
+    "user.diskDialog.size": "容量 (GiB)",
+    "user.diskDialog.submit": "创建磁盘",
+    "user.execDialog.eyebrow": "GUEST EXEC",
+    "user.execDialog.title": "执行于",
+    "user.execDialog.command": "命令",
+    "user.execDialog.hint": "按空格拆分为 argv；当前开发控制台不执行 shell 展开。",
+    "user.execDialog.waiting": "等待执行…",
+    "user.execDialog.run": "执行",
+    "user.execDialog.running": "执行中…",
+    "user.workspace.personal": "个人工作区",
+    "user.metric.totalCats": "Cats 总数",
+    "user.metric.sleeping": "已暂停 / Warm",
+    "user.metric.running": "{count} 正在运行",
+    "user.metric.fastResume": "可快速恢复",
+    "user.metric.persistentDisks": "Persistent Disks",
+    "user.metric.activeOperations": "活跃 Operations",
+    "user.metric.controlTasks": "控制面异步任务",
+    "user.empty.recentCats": "还没有 Cat，点击“创建 Cat”开始使用。",
+    "user.empty.recentOperations": "暂无操作记录。",
+    "user.action.exec": "执行",
+    "user.action.suspend": "暂停",
+    "user.action.warm": "转为 Warm",
+    "user.action.stop": "停止",
+    "user.action.resume": "恢复",
+    "user.action.start": "启动",
+    "user.action.expose": "暴露端口",
+    "user.action.destroy": "销毁",
+    "user.action.snapshot": "创建快照",
+    "user.action.unmount": "卸载",
+    "user.action.mount": "挂载",
+    "user.action.resize": "扩容",
+    "user.action.delete": "删除",
+    "user.refreshFailed": "刷新失败",
+    "user.operationFailed": "Operation {id} 失败",
+    "user.operationTimeout": "等待 Operation {id} 超时",
+    "user.expose.portPrompt": "暴露 {name} 的 Guest 端口",
+    "user.expose.namePrompt": "Endpoint 名称",
+    "user.expose.created": "Endpoint 已创建",
+    "user.destroy.confirm": "确定销毁 Cat “{name}”？RootDisk 将一并删除。",
+    "user.operation.accepted": "操作已接受",
+    "user.operation.completed": "操作完成",
+    "user.mount.noCats": "请先创建一个 Cat",
+    "user.mount.catPrompt": "挂载到哪个 Cat？",
+    "user.mount.pathPrompt": "Guest 挂载路径",
+    "user.resize.prompt": "新容量（GiB，只能扩容）",
+    "user.disk.deleteConfirm": "确定删除 PersistentDisk “{name}”？",
+    "user.disk.snapshotCreated": "Snapshot 已创建",
+    "user.disk.operationCompleted": "磁盘操作完成",
+    "user.cat.creating": "Cat 创建中",
+    "user.cat.ready": "Cat 已就绪",
+    "user.disk.created": "PersistentDisk 已创建",
+    "user.cat.actionFailed": "Cat 操作失败",
+    "user.disk.actionFailed": "磁盘操作失败",
+    "user.authConfigFailed": "读取登录配置失败：{message}",
+
+    "admin.meta.title": "Cats · 管理员控制台",
+    "admin.login.eyebrow": "管理员站点",
+    "admin.login.title": "管理计算 Fleet",
+    "admin.login.description": "通过 WorkOS 登录，并验证 Fleet 管理员权限。",
+    "admin.login.unconfigured": "WorkOS 登录尚未配置，请联系平台管理员。",
+    "admin.login.button": "使用 WorkOS 登录",
+    "admin.backToUser": "← 返回用户站",
+    "admin.context.label": "平台",
+    "admin.context.description": "全局管理边界",
+    "admin.nav.aria": "管理员控制台导航",
+    "admin.nav.overview": "Fleet 概览",
+    "admin.nav.nodes": "工作节点",
+    "admin.nav.metrics": "Metrics",
+    "admin.breadcrumb": "平台 /",
+    "admin.autoRefresh": "自动刷新",
+    "admin.capacity.title": "Fleet 资源分配",
+    "admin.lifecycle.title": "Cat 状态",
+    "admin.workers.title": "节点健康",
+    "admin.workers.manage": "管理节点 →",
+    "admin.nodes.eyebrow": "FLEET 管理",
+    "admin.nodes.title": "工作节点",
+    "admin.nodes.description": "Cordon 停止新调度；Drain 安全停止、fence 并迁移现有 Cats。",
+    "admin.nodes.assignments": "分配",
+    "admin.nodes.heartbeat": "心跳",
+    "admin.nodes.telemetry": "Host 遥测",
+    "admin.nodes.emptyTitle": "没有已注册节点",
+    "admin.nodes.emptyDescription": "启动 cats-noded 后，节点会自动注册并心跳。",
+    "admin.metrics.title": "实时 Metrics",
+    "admin.metrics.description": "使用管理员凭证从同一控制面读取。",
+    "admin.metric.fleetNodes": "Fleet 节点",
+    "admin.metric.nodeDetail": "{ready} 就绪 · {lost} 丢失",
+    "admin.metric.totalCats": "Cats 总数",
+    "admin.metric.running": "{count} 正在运行",
+    "admin.metric.cpuAllocation": "CPU 分配率",
+    "admin.metric.activeOperations": "活跃 Operations",
+    "admin.metric.failed": "{count} 失败",
+    "admin.refreshFailed": "刷新失败",
+    "admin.generatedAt": "生成于 {time}",
+    "admin.unit.cores": "核",
+    "admin.lifecycle.transitional": "转换中",
+    "admin.lifecycle.failedUnknown": "失败 / 未知",
+    "admin.empty.nodes": "没有已注册节点。",
+    "admin.node.heartbeatAgo": "心跳于 {seconds} 秒前",
+    "admin.node.secondsAgo": "{seconds} 秒前",
+    "admin.node.load": "{count} Cats · 负载 {load}",
+    "admin.action.cordon": "停止调度",
+    "admin.action.drain": "迁空",
+    "admin.action.uncordon": "恢复调度",
+    "admin.action.cancelDrain": "取消迁空",
+    "admin.action.delete": "删除",
+    "admin.node.drainConfirm": "迁空节点 “{id}”？现有 Cats 会被停止、fence 并重新调度。",
+    "admin.node.deleteConfirm": "从注册表删除节点 “{id}”？节点必须为空且处于 cordoned/lost。",
+    "admin.node.actionConfirm": "对节点 “{id}” 执行 {action}？",
+    "admin.node.operationCompleted": "节点操作完成",
+    "admin.node.operationFailed": "节点操作失败",
+    "admin.metrics.loadFailed": "Metrics 加载失败",
+    "admin.metrics.copied": "Metrics 已复制",
+    "admin.authConfigFailed": "读取登录配置失败：{message}",
+
+    "status.unknown": "未知",
+    "status.creating": "创建中",
+    "status.running": "运行中",
+    "status.ready": "就绪",
+    "status.succeeded": "成功",
+    "status.available": "可用",
+    "status.failed": "失败",
+    "status.lost": "失联",
+    "status.pending": "等待中",
+    "status.starting": "启动中",
+    "status.stopping": "停止中",
+    "status.suspending": "暂停中",
+    "status.warming": "转为 Warm",
+    "status.draining": "迁空中",
+    "status.suspended": "已暂停",
+    "status.warm": "Warm",
+    "status.cold": "Cold",
+    "status.cordoned": "已停止调度",
+    "status.bound": "已绑定",
+    "status.deleting": "删除中",
+    "status.deleted": "已删除",
+    "kind.root": "Root",
+    "kind.persistent": "Persistent",
+    "operation.cat_create": "创建 Cat",
+    "operation.cat_start": "启动 Cat",
+    "operation.cat_stop": "停止 Cat",
+    "operation.cat_suspend": "暂停 Cat",
+    "operation.cat_resume": "恢复 Cat",
+    "operation.cat_warm": "将 Cat 转为 Warm",
+    "operation.cat_wake": "唤醒 Cat",
+    "operation.cat_work_wake": "因活跃工作唤醒 Cat",
+    "operation.cat_auto_suspend": "自动暂停 Cat",
+    "operation.cat_delete": "删除 Cat",
+    "error.network": "无法连接控制面：{message}",
+    "error.invalidJson": "控制面返回了无法解析的 JSON",
+    "error.http": "请求失败（HTTP {status}）",
+    "error.invalid_argument": "请检查请求参数后重试。",
+    "error.unauthenticated": "会话已过期，请重新登录。",
+    "error.permission_denied": "你没有执行此操作的权限。",
+    "error.not_found": "找不到请求的资源。",
+    "error.already_exists": "同名资源已存在。",
+    "error.failed_precondition": "资源当前状态不允许执行此操作。",
+    "error.conflict": "资源已发生变化或正在使用中，请刷新后重试。",
+    "error.stale_epoch": "请求使用了过期的 Attachment 或 Route epoch。",
+    "error.deadline_exceeded": "操作等待超时。",
+    "error.unavailable": "服务暂时不可用。",
+    "error.internal": "控制面发生内部错误。",
+    "error.unclosedQuote": "命令中存在未闭合的引号",
+    "error.emptyCommand": "命令不能为空",
+  },
+};
+
+function normalizeLocale(value) {
+  const locale = String(value || "").toLowerCase();
+  if (locale === "zh" || locale.startsWith("zh-")) return "zh-CN";
+  if (locale === "en" || locale.startsWith("en-")) return "en";
+  return null;
+}
+
+function storedPreference() {
+  try {
+    const value = window.localStorage.getItem(STORAGE_KEY);
+    if (!value || value === "auto") return "auto";
+    return normalizeLocale(value) || "auto";
+  } catch (_) {
+    return "auto";
+  }
+}
+
+function environmentLocale() {
+  const candidates = Array.isArray(navigator.languages) && navigator.languages.length
+    ? navigator.languages
+    : [navigator.language];
+  for (const candidate of candidates) {
+    const locale = normalizeLocale(candidate);
+    if (locale) return locale;
+  }
+  return DEFAULT_LOCALE;
+}
+
+function resolveLocale(preference = storedPreference()) {
+  return preference === "auto" ? environmentLocale() : normalizeLocale(preference) || DEFAULT_LOCALE;
+}
+
+let currentPreference = storedPreference();
+let currentLocale = resolveLocale(currentPreference);
+
+export function getLocale() {
+  return currentLocale;
+}
+
+export function getLanguagePreference() {
+  return currentPreference;
+}
+
+export function t(key, variables = {}) {
+  const template = messages[currentLocale]?.[key] ?? messages[DEFAULT_LOCALE]?.[key] ?? key;
+  return template.replace(/\{([A-Za-z0-9_]+)\}/g, (_, name) => String(variables[name] ?? `{${name}}`));
+}
+
+function translateAttribute(element, attribute, keyAttribute) {
+  const key = element.dataset[keyAttribute];
+  if (key) element.setAttribute(attribute, t(key));
+}
+
+export function translateDocument(root = document) {
+  document.documentElement.lang = currentLocale;
+  document.documentElement.dir = "ltr";
+  root.querySelectorAll("[data-i18n]").forEach((element) => {
+    element.textContent = t(element.dataset.i18n);
+  });
+  root.querySelectorAll("[data-i18n-placeholder]").forEach((element) => {
+    translateAttribute(element, "placeholder", "i18nPlaceholder");
+  });
+  root.querySelectorAll("[data-i18n-aria-label]").forEach((element) => {
+    translateAttribute(element, "aria-label", "i18nAriaLabel");
+  });
+  root.querySelectorAll("[data-i18n-title]").forEach((element) => {
+    translateAttribute(element, "title", "i18nTitle");
+  });
+  root.querySelectorAll("[data-language-select]").forEach((select) => {
+    select.value = currentPreference;
+  });
+}
+
+export function setLanguagePreference(preference) {
+  const normalized = preference === "auto" ? "auto" : normalizeLocale(preference);
+  if (!normalized) return;
+  try {
+    if (normalized === "auto") window.localStorage.removeItem(STORAGE_KEY);
+    else window.localStorage.setItem(STORAGE_KEY, normalized);
+  } catch (_) {
+    // Storage may be unavailable in a hardened browser; the current page still updates.
+  }
+  currentPreference = normalized;
+  currentLocale = resolveLocale(normalized);
+  translateDocument();
+  window.dispatchEvent(new CustomEvent("cats:localechange", { detail: { locale: currentLocale } }));
+}
+
+export function onLocaleChange(callback) {
+  window.addEventListener("cats:localechange", callback);
+}
+
+export function initI18n() {
+  translateDocument();
+  document.querySelectorAll("[data-language-select]").forEach((select) => {
+    select.addEventListener("change", () => setLanguagePreference(select.value));
+  });
+  window.addEventListener("languagechange", () => {
+    if (currentPreference !== "auto") return;
+    const next = environmentLocale();
+    if (next === currentLocale) return;
+    currentLocale = next;
+    translateDocument();
+    window.dispatchEvent(new CustomEvent("cats:localechange", { detail: { locale: currentLocale } }));
+  });
+}
+
+export function localizedApiMessage(code, fallback) {
+  if (!code) return fallback;
+  const key = `error.${code}`;
+  const localized = t(key);
+  return localized === key ? fallback : localized;
+}

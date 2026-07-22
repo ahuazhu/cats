@@ -4,13 +4,18 @@ import {
   formatTime,
   initNavigation,
   metricCard,
+  operationKind,
   request,
+  resourceKind,
   setBusy,
   sleep,
   splitCommand,
   statusBadge,
   toast,
 } from "/ui/common.js";
+import { initI18n, localizedApiMessage, onLocaleChange, t } from "/ui/i18n.js";
+
+initI18n();
 
 const state = {
   project: "",
@@ -29,8 +34,13 @@ const createCatDialog = document.querySelector("#create-cat-dialog");
 const createDiskDialog = document.querySelector("#create-disk-dialog");
 const execDialog = document.querySelector("#exec-dialog");
 
-initNavigation(
-  { overview: "工作区概览", cats: "Cats", disks: "Persistent Disks", operations: "Operations" },
+const switchView = initNavigation(
+  {
+    overview: () => t("user.nav.overview"),
+    cats: () => t("user.nav.cats"),
+    disks: () => t("user.disks.title"),
+    operations: () => t("user.nav.operations"),
+  },
   (view) => { state.activeView = view; },
 );
 
@@ -39,7 +49,7 @@ function projectPath(path) {
 }
 
 function workspaceLabel(project) {
-  return project.startsWith("personal-user_") ? "个人工作区" : project;
+  return project.startsWith("personal-user_") ? t("user.workspace.personal") : project;
 }
 
 async function authenticatedRequest(path, options) {
@@ -72,7 +82,7 @@ function showLogin(message = "") {
 
 async function loadAll({ quiet = false } = {}) {
   const button = document.querySelector("#refresh-button");
-  if (!quiet) setBusy(button, true, "刷新中…");
+  if (!quiet) setBusy(button, true, t("common.refreshing"));
   try {
     const [cats, disks, operations] = await Promise.all([
       authenticatedRequest(projectPath("/cats")),
@@ -87,7 +97,7 @@ async function loadAll({ quiet = false } = {}) {
     if (error.status === 401 || error.status === 403) {
       showLogin(error.message);
     } else {
-      toast("刷新失败", error.message, "error");
+      toast(t("user.refreshFailed"), error.message, "error");
     }
     throw error;
   } finally {
@@ -110,38 +120,38 @@ function renderOverview() {
   const persistentDisks = state.disks.filter((disk) => disk.kind === "persistent");
   const activeOperations = state.operations.filter((operation) => ["pending", "running"].includes(operation.phase));
   document.querySelector("#user-metrics").innerHTML = [
-    metricCard("Total Cats", state.cats.length, `${counts.running || 0} 正在运行`),
-    metricCard("Suspended / Warm", (counts.suspended || 0) + (counts.warm || 0), "可快速恢复"),
-    metricCard("Persistent Disks", persistentDisks.length, formatBytes(persistentDisks.reduce((sum, disk) => sum + disk.size_bytes, 0))),
-    metricCard("Active Operations", activeOperations.length, "控制面异步任务"),
+    metricCard(t("user.metric.totalCats"), state.cats.length, t("user.metric.running", { count: counts.running || 0 })),
+    metricCard(t("user.metric.sleeping"), (counts.suspended || 0) + (counts.warm || 0), t("user.metric.fastResume")),
+    metricCard(t("user.metric.persistentDisks"), persistentDisks.length, formatBytes(persistentDisks.reduce((sum, disk) => sum + disk.size_bytes, 0))),
+    metricCard(t("user.metric.activeOperations"), activeOperations.length, t("user.metric.controlTasks")),
   ].join("");
 
   const recentCats = [...state.cats].sort((a, b) => b.created_at_unix - a.created_at_unix).slice(0, 5);
   document.querySelector("#recent-cats").innerHTML = recentCats.length
-    ? `<div class="compact-list">${recentCats.map((cat) => `<div class="compact-row"><div><strong>${escapeHtml(cat.name)}</strong><small>${escapeHtml(cat.spec.cpus)} CPU · ${escapeHtml(cat.spec.memory_mib)} MiB · ${escapeHtml(cat.node_id || "未调度")}</small></div>${statusBadge(cat.observed_state)}</div>`).join("")}</div>`
-    : '<div class="mini-empty">还没有 Cat，点击右上角开始创建。</div>';
+    ? `<div class="compact-list">${recentCats.map((cat) => `<div class="compact-row"><div><strong>${escapeHtml(cat.name)}</strong><small>${escapeHtml(cat.spec.cpus)} CPU · ${escapeHtml(cat.spec.memory_mib)} MiB · ${escapeHtml(cat.node_id || t("common.notScheduled"))}</small></div>${statusBadge(cat.observed_state)}</div>`).join("")}</div>`
+    : `<div class="mini-empty">${escapeHtml(t("user.empty.recentCats"))}</div>`;
 
   const recentOperations = [...state.operations].sort((a, b) => b.updated_at_unix - a.updated_at_unix).slice(0, 5);
   document.querySelector("#recent-operations").innerHTML = recentOperations.length
-    ? `<div class="compact-list">${recentOperations.map((operation) => `<div class="compact-row"><div><strong>${escapeHtml(operation.kind)}</strong><small>${formatTime(operation.updated_at_unix)}</small></div>${statusBadge(operation.phase)}</div>`).join("")}</div>`
-    : '<div class="mini-empty">暂无操作记录。</div>';
+    ? `<div class="compact-list">${recentOperations.map((operation) => `<div class="compact-row"><div><strong>${escapeHtml(operationKind(operation.kind))}</strong><small>${formatTime(operation.updated_at_unix)}</small></div>${statusBadge(operation.phase)}</div>`).join("")}</div>`
+    : `<div class="mini-empty">${escapeHtml(t("user.empty.recentOperations"))}</div>`;
 }
 
 function catActions(cat) {
   const stateActions = {
-    running: [["exec", "Exec"], ["suspend", "Suspend"], ["warm", "Warm"], ["stop", "Stop"]],
-    suspended: [["resume", "Resume"], ["warm", "Warm"], ["stop", "Stop"]],
-    warm: [["resume", "Resume"], ["stop", "Stop"]],
-    cold: [["start", "Start"]],
-    failed: [["start", "Start"]],
-    unknown: [["start", "Start"]],
+    running: ["exec", "suspend", "warm", "stop"],
+    suspended: ["resume", "warm", "stop"],
+    warm: ["resume", "stop"],
+    cold: ["start"],
+    failed: ["start"],
+    unknown: ["start"],
   };
   const actions = stateActions[cat.observed_state] || [];
-  const buttons = actions.map(([action, label]) => `<button class="mini-button" data-cat-action="${action}" data-cat="${escapeHtml(cat.name)}">${label}</button>`);
+  const buttons = actions.map((action) => `<button class="mini-button" data-cat-action="${action}" data-cat="${escapeHtml(cat.name)}">${escapeHtml(t(`user.action.${action}`))}</button>`);
   if (cat.observed_state === "running") {
-    buttons.push(`<button class="mini-button" data-cat-action="expose" data-cat="${escapeHtml(cat.name)}">Expose</button>`);
+    buttons.push(`<button class="mini-button" data-cat-action="expose" data-cat="${escapeHtml(cat.name)}">${escapeHtml(t("user.action.expose"))}</button>`);
   }
-  buttons.push(`<button class="mini-button danger" data-cat-action="destroy" data-cat="${escapeHtml(cat.name)}">Destroy</button>`);
+  buttons.push(`<button class="mini-button danger" data-cat-action="destroy" data-cat="${escapeHtml(cat.name)}">${escapeHtml(t("user.action.destroy"))}</button>`);
   return buttons.join("");
 }
 
@@ -162,14 +172,14 @@ function renderCats() {
 }
 
 function diskActions(disk) {
-  const buttons = [`<button class="mini-button" data-disk-action="snapshot" data-disk="${escapeHtml(disk.name)}">Snapshot</button>`];
+  const buttons = [`<button class="mini-button" data-disk-action="snapshot" data-disk="${escapeHtml(disk.name)}">${escapeHtml(t("user.action.snapshot"))}</button>`];
   if (disk.kind === "persistent") {
     if (disk.state === "bound") {
-      buttons.push(`<button class="mini-button" data-disk-action="unmount" data-disk="${escapeHtml(disk.name)}">Unmount</button>`);
+      buttons.push(`<button class="mini-button" data-disk-action="unmount" data-disk="${escapeHtml(disk.name)}">${escapeHtml(t("user.action.unmount"))}</button>`);
     } else if (disk.state === "available") {
-      buttons.push(`<button class="mini-button" data-disk-action="mount" data-disk="${escapeHtml(disk.name)}">Mount</button>`);
-      buttons.push(`<button class="mini-button" data-disk-action="resize" data-disk="${escapeHtml(disk.name)}">Resize</button>`);
-      buttons.push(`<button class="mini-button danger" data-disk-action="delete" data-disk="${escapeHtml(disk.name)}">Delete</button>`);
+      buttons.push(`<button class="mini-button" data-disk-action="mount" data-disk="${escapeHtml(disk.name)}">${escapeHtml(t("user.action.mount"))}</button>`);
+      buttons.push(`<button class="mini-button" data-disk-action="resize" data-disk="${escapeHtml(disk.name)}">${escapeHtml(t("user.action.resize"))}</button>`);
+      buttons.push(`<button class="mini-button danger" data-disk-action="delete" data-disk="${escapeHtml(disk.name)}">${escapeHtml(t("user.action.delete"))}</button>`);
     }
   }
   return buttons.join("");
@@ -184,7 +194,7 @@ function renderDisks() {
   const catNames = new Map(state.cats.map((cat) => [cat.id, cat.name]));
   body.innerHTML = state.disks.map((disk) => `<tr>
     <td><div class="resource-name"><span class="resource-avatar">D</span><span><strong>${escapeHtml(disk.name)}</strong><small>${escapeHtml(disk.id)}</small></span></div></td>
-    <td>${escapeHtml(disk.kind)}</td><td>${formatBytes(disk.size_bytes)}</td><td>${statusBadge(disk.state)}</td>
+    <td>${escapeHtml(resourceKind(disk.kind))}</td><td>${formatBytes(disk.size_bytes)}</td><td>${statusBadge(disk.state)}</td>
     <td>${escapeHtml(catNames.get(disk.bound_cat_id) || disk.bound_cat_id || "—")}</td>
     <td><div class="row-actions">${diskActions(disk)}</div></td>
   </tr>`).join("");
@@ -197,9 +207,9 @@ function renderOperations() {
   empty.classList.toggle("is-hidden", operations.length !== 0);
   body.closest(".table-wrap").classList.toggle("is-hidden", operations.length === 0);
   body.innerHTML = operations.map((operation) => `<tr>
-    <td><div class="resource-name"><span><strong>${escapeHtml(operation.id)}</strong><small>generation ${escapeHtml(operation.resource_generation)}</small></span></div></td>
-    <td>${escapeHtml(operation.kind)}</td><td>${escapeHtml(operation.resource_id)}</td><td>${statusBadge(operation.phase)}</td>
-    <td>${formatTime(operation.updated_at_unix)}</td><td>${escapeHtml(operation.error?.message || "—")}</td>
+    <td><div class="resource-name"><span><strong>${escapeHtml(operation.id)}</strong><small>${escapeHtml(t("common.generation", { value: operation.resource_generation }))}</small></span></div></td>
+    <td>${escapeHtml(operationKind(operation.kind))}</td><td>${escapeHtml(operation.resource_id)}</td><td>${statusBadge(operation.phase)}</td>
+    <td>${formatTime(operation.updated_at_unix)}</td><td>${escapeHtml(operation.error ? localizedApiMessage(operation.error.code, operation.error.message) : "—")}</td>
   </tr>`).join("");
 }
 
@@ -209,24 +219,24 @@ async function waitForOperation(operation) {
   while (Date.now() < deadline) {
     const current = await authenticatedRequest(`/v1/operations/${encodeURIComponent(operation.id)}`);
     if (current.phase === "succeeded") return current;
-    if (current.phase === "failed") throw new Error(current.error?.message || `Operation ${current.id} 失败`);
+    if (current.phase === "failed") throw new Error(current.error ? localizedApiMessage(current.error.code, current.error.message) : t("user.operationFailed", { id: current.id }));
     await sleep(300);
   }
-  throw new Error(`Operation ${operation.id} 等待超时`);
+  throw new Error(t("user.operationTimeout", { id: operation.id }));
 }
 
 async function mutateCat(name, action, button) {
   if (action === "exec") {
     state.execCat = name;
     document.querySelector("#exec-cat-name").textContent = name;
-    document.querySelector("#exec-output").textContent = "等待执行…";
+    document.querySelector("#exec-output").textContent = t("user.execDialog.waiting");
     execDialog.showModal();
     return;
   }
   if (action === "expose") {
-    const port = window.prompt(`暴露 ${name} 的 guest port`, "8080");
+    const port = window.prompt(t("user.expose.portPrompt", { name }), "8080");
     if (port === null) return;
-    const endpointName = window.prompt("Endpoint 名称", "web");
+    const endpointName = window.prompt(t("user.expose.namePrompt"), "web");
     if (endpointName === null) return;
     setBusy(button, true);
     try {
@@ -234,13 +244,13 @@ async function mutateCat(name, action, button) {
         method: "POST",
         body: JSON.stringify({ name: endpointName, target_port: Number(port), protocol: "http", wake_policy: "wake_on_request" }),
       });
-      toast("Endpoint 已创建", response.endpoint.hostname);
+      toast(t("user.expose.created"), response.endpoint.hostname);
     } finally {
       setBusy(button, false);
     }
     return;
   }
-  if (action === "destroy" && !window.confirm(`确定销毁 Cat “${name}”？RootDisk 将一并删除。`)) return;
+  if (action === "destroy" && !window.confirm(t("user.destroy.confirm", { name }))) return;
   setBusy(button, true);
   try {
     const path = action === "destroy"
@@ -250,10 +260,10 @@ async function mutateCat(name, action, button) {
       method: action === "destroy" ? "DELETE" : "POST",
       headers: idempotencyHeaders(),
     });
-    toast("操作已接受", `${name} · ${action}`);
+    toast(t("user.operation.accepted"), `${name} · ${t(`user.action.${action}`)}`);
     await waitForOperation(response.operation);
     await loadAll({ quiet: true });
-    toast("操作完成", `${name} · ${action}`);
+    toast(t("user.operation.completed"), `${name} · ${t(`user.action.${action}`)}`);
   } finally {
     setBusy(button, false);
   }
@@ -266,15 +276,15 @@ async function mutateDisk(name, action, button) {
   let path = projectPath(`/disks/${encodeURIComponent(name)}/actions/${action}`);
   let body;
   if (action === "mount") {
-    if (!state.cats.length) throw new Error("请先创建一个 Cat");
-    const cat = window.prompt("挂载到哪个 Cat？", state.cats[0].name);
+    if (!state.cats.length) throw new Error(t("user.mount.noCats"));
+    const cat = window.prompt(t("user.mount.catPrompt"), state.cats[0].name);
     if (cat === null) return;
-    const mountAt = window.prompt("Guest 挂载路径", "/data");
+    const mountAt = window.prompt(t("user.mount.pathPrompt"), "/data");
     if (mountAt === null) return;
     body = { cat_id: cat, mount_at: mountAt };
   } else if (action === "resize") {
     const currentGiB = disk.size_bytes / (1024 ** 3);
-    const size = window.prompt("新容量（GiB，只能扩容）", String(currentGiB));
+    const size = window.prompt(t("user.resize.prompt"), String(currentGiB));
     if (size === null) return;
     body = { size_bytes: Math.round(Number(size) * (1024 ** 3)) };
   } else if (action === "unmount") {
@@ -282,7 +292,7 @@ async function mutateDisk(name, action, button) {
   } else if (action === "snapshot") {
     path = projectPath(`/disks/${encodeURIComponent(name)}/snapshots`);
   } else if (action === "delete") {
-    if (!window.confirm(`确定删除 PersistentDisk “${name}”？`)) return;
+    if (!window.confirm(t("user.disk.deleteConfirm", { name }))) return;
     method = "DELETE";
     path = projectPath(`/disks/${encodeURIComponent(name)}`);
   }
@@ -293,7 +303,7 @@ async function mutateDisk(name, action, button) {
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
     });
     await loadAll({ quiet: true });
-    toast(action === "snapshot" ? "Snapshot 已创建" : "磁盘操作完成", response?.id || `${name} · ${action}`);
+    toast(action === "snapshot" ? t("user.disk.snapshotCreated") : t("user.disk.operationCompleted"), response?.id || `${name} · ${t(`user.action.${action}`)}`);
   } finally {
     setBusy(button, false);
   }
@@ -338,12 +348,12 @@ document.querySelector("#create-cat-form").addEventListener("submit", async (eve
         disk: null,
       }),
     });
-    toast("Cat 创建中", response.cat.name);
+    toast(t("user.cat.creating"), response.cat.name);
     createCatDialog.close();
     form.reset();
     await waitForOperation(response.operation);
     await loadAll({ quiet: true });
-    toast("Cat 已就绪", response.cat.name);
+    toast(t("user.cat.ready"), response.cat.name);
   } catch (caught) {
     error.textContent = caught.message;
   } finally {
@@ -371,7 +381,7 @@ document.querySelector("#create-disk-form").addEventListener("submit", async (ev
     createDiskDialog.close();
     form.reset();
     await loadAll({ quiet: true });
-    toast("PersistentDisk 已创建", `${disk.name} · ${formatBytes(disk.size_bytes)}`);
+    toast(t("user.disk.created"), `${disk.name} · ${formatBytes(disk.size_bytes)}`);
   } catch (caught) {
     error.textContent = caught.message;
   } finally {
@@ -390,7 +400,7 @@ document.querySelector("#exec-form").addEventListener("submit", async (event) =>
   const output = document.querySelector("#exec-output");
   const error = form.querySelector("[data-form-error]");
   error.textContent = "";
-  setBusy(button, true, "执行中…");
+  setBusy(button, true, t("user.execDialog.running"));
   try {
     const command = splitCommand(new FormData(form).get("command"));
     const result = await authenticatedRequest(projectPath(`/cats/${encodeURIComponent(state.execCat)}/exec`), {
@@ -408,21 +418,37 @@ document.querySelector("#exec-form").addEventListener("submit", async (event) =>
 document.querySelector("#cats-table").addEventListener("click", (event) => {
   const button = event.target.closest("[data-cat-action]");
   if (!button) return;
-  mutateCat(button.dataset.cat, button.dataset.catAction, button).catch((error) => toast("Cat 操作失败", error.message, "error"));
+  mutateCat(button.dataset.cat, button.dataset.catAction, button).catch((error) => toast(t("user.cat.actionFailed"), error.message, "error"));
 });
 document.querySelector("#disks-table").addEventListener("click", (event) => {
   const button = event.target.closest("[data-disk-action]");
   if (!button) return;
-  mutateDisk(button.dataset.disk, button.dataset.diskAction, button).catch((error) => toast("磁盘操作失败", error.message, "error"));
+  mutateDisk(button.dataset.disk, button.dataset.diskAction, button).catch((error) => toast(t("user.disk.actionFailed"), error.message, "error"));
+});
+
+function updateLoginDescription() {
+  if (!state.authConfig) return;
+  document.querySelector("#login-description").textContent = state.authConfig.workos_enabled
+    ? t("user.login.description")
+    : t("user.login.unconfigured");
+}
+
+onLocaleChange(() => {
+  updateLoginDescription();
+  const label = state.project ? workspaceLabel(state.project) : "";
+  if (label) {
+    document.querySelector("#sidebar-project").textContent = label;
+    document.querySelector("#header-project").textContent = label;
+  }
+  switchView(state.activeView);
+  render();
 });
 
 async function initializeAuth() {
   try {
     state.authConfig = await request("/auth/config");
     document.querySelector("#workos-login-button").classList.toggle("is-hidden", !state.authConfig.workos_enabled);
-    document.querySelector("#login-description").textContent = state.authConfig.workos_enabled
-      ? "登录后即可创建、启动和管理你的 Cats。"
-      : "WorkOS 登录尚未配置，请联系平台管理员。";
+    updateLoginDescription();
     if (state.authConfig.workos_enabled) {
       try {
         const session = await request("/auth/session?site=user");
@@ -435,7 +461,7 @@ async function initializeAuth() {
       }
     }
   } catch (error) {
-    loginError.textContent = `读取登录配置失败：${error.message}`;
+    loginError.textContent = t("user.authConfigFailed", { message: error.message });
   }
   showLogin(loginError.textContent);
 }

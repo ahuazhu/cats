@@ -1,27 +1,37 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>Cats · 用户控制台</title>
+  <title data-i18n="user.meta.title">Cats · User Console</title>
   <link rel="stylesheet" href="/ui/styles.css">
 </head>
 <body class="console-page" data-site="user">
   <section class="login-screen is-hidden" id="login-screen">
     <div class="login-panel">
-      <a class="brand brand-large" href="/">
-        <span class="brand-mark" aria-hidden="true">C</span>
-        <span><strong>Cats</strong><small>Cloud Workspaces</small></span>
-      </a>
+      <div class="login-heading">
+        <a class="brand brand-large" href="/">
+          <span class="brand-mark" aria-hidden="true">C</span>
+          <span><strong>Cats</strong><small data-i18n="brand.cloudWorkspaces">Cloud Workspaces</small></span>
+        </a>
+        <label class="language-picker">
+          <span data-i18n="language.label">Language</span>
+          <select data-language-select data-i18n-aria-label="language.label" aria-label="Language">
+            <option value="auto" data-i18n="language.auto">System default</option>
+            <option value="en" data-i18n="language.en">English</option>
+            <option value="zh-CN" data-i18n="language.zh-CN">中文</option>
+          </select>
+        </label>
+      </div>
       <div class="login-copy">
-        <div class="eyebrow">WELCOME BACK</div>
-        <h1>继续使用你的云端工作空间</h1>
-        <p id="login-description">登录后即可创建、启动和管理你的 Cats。</p>
+        <div class="eyebrow" data-i18n="user.login.eyebrow">WELCOME BACK</div>
+        <h1 data-i18n="user.login.title">Continue to your cloud workspace</h1>
+        <p id="login-description" data-i18n="user.login.description">Sign in to create, start, and manage your Cats.</p>
       </div>
       <div class="login-form">
         <button class="button button-primary button-wide is-hidden" id="workos-login-button" type="button">
-          <span>使用 WorkOS 登录</span><span aria-hidden="true">→</span>
+          <span data-i18n="user.login.button">Sign in with WorkOS</span><span aria-hidden="true">→</span>
         </button>
         <p class="form-error" id="login-error" role="alert"></p>
       </div>
@@ -35,59 +45,120 @@
     <aside class="sidebar">
       <a class="brand" href="/">
         <span class="brand-mark" aria-hidden="true">C</span>
-        <span><strong>Cats</strong><small>My Workspaces</small></span>
+        <span><strong>Cats</strong><small data-i18n="brand.myWorkspaces">My Workspaces</small></span>
       </a>
-      <div class="context-card"><small>WORKSPACE</small><strong id="sidebar-project">default</strong><span>你的资源空间</span></div>
-      <nav class="nav-list" aria-label="用户控制台导航">
-        <button class="nav-item is-active" data-view="overview"><span>⌂</span>概览</button>
-        <button class="nav-item" data-view="cats"><span>◇</span>Cats</button>
-        <button class="nav-item" data-view="disks"><span>▱</span>磁盘</button>
-        <button class="nav-item" data-view="operations"><span>↻</span>Operations</button>
+      <div class="context-card">
+        <small data-i18n="user.context.label">WORKSPACE</small>
+        <strong id="sidebar-project">default</strong>
+        <span data-i18n="user.context.description">Your resource space</span>
+      </div>
+      <nav class="nav-list" data-i18n-aria-label="user.nav.aria" aria-label="User console navigation">
+        <button class="nav-item is-active" data-view="overview"><span>⌂</span><b data-i18n="user.nav.overview">Overview</b></button>
+        <button class="nav-item" data-view="cats"><span>◇</span><b data-i18n="user.nav.cats">Cats</b></button>
+        <button class="nav-item" data-view="disks"><span>▱</span><b data-i18n="user.nav.disks">Disks</b></button>
+        <button class="nav-item" data-view="operations"><span>↻</span><b data-i18n="user.nav.operations">Operations</b></button>
       </nav>
-      <div class="sidebar-footer"><button id="logout-button">退出登录</button></div>
+      <div class="sidebar-footer">
+        <label class="language-picker language-picker-sidebar">
+          <span data-i18n="language.label">Language</span>
+          <select data-language-select data-i18n-aria-label="language.label" aria-label="Language">
+            <option value="auto" data-i18n="language.auto">System default</option>
+            <option value="en" data-i18n="language.en">English</option>
+            <option value="zh-CN" data-i18n="language.zh-CN">中文</option>
+          </select>
+        </label>
+        <button id="logout-button" data-i18n="common.logout">Sign out</button>
+      </div>
     </aside>
 
     <main class="workspace">
       <header class="topbar">
-        <button class="mobile-menu" id="mobile-menu" aria-label="打开导航">☰</button>
-        <div><span class="breadcrumb">工作区 / <b id="header-project">default</b></span><h1 id="view-title">工作区概览</h1></div>
-        <div class="topbar-actions"><span class="live-indicator"><i></i>Connected</span><button class="button button-quiet" id="refresh-button">刷新</button><button class="button button-primary" id="create-cat-button">＋ 创建 Cat</button></div>
+        <button class="mobile-menu" id="mobile-menu" data-i18n-aria-label="user.mobileMenu" aria-label="Open navigation">☰</button>
+        <div>
+          <span class="breadcrumb"><span data-i18n="user.breadcrumb">Workspace /</span> <b id="header-project">default</b></span>
+          <h1 id="view-title" data-i18n="user.nav.overview">Overview</h1>
+        </div>
+        <div class="topbar-actions">
+          <span class="live-indicator"><i></i><span data-i18n="common.connected">Connected</span></span>
+          <button class="button button-quiet" id="refresh-button" data-i18n="common.refresh">Refresh</button>
+          <button class="button button-primary" id="create-cat-button">＋ <span data-i18n="user.createCat">Create Cat</span></button>
+        </div>
       </header>
 
       <div class="content">
         <section class="view is-active" id="view-overview">
           <div class="metric-grid" id="user-metrics"></div>
           <div class="dashboard-grid">
-            <section class="panel panel-span-2"><header class="panel-header"><div><small>COMPUTE</small><h2>最近的 Cats</h2></div><button class="text-button" data-go="cats">查看全部 →</button></header><div id="recent-cats"></div></section>
-            <section class="panel"><header class="panel-header"><div><small>ACTIVITY</small><h2>最近操作</h2></div></header><div id="recent-operations"></div></section>
+            <section class="panel panel-span-2">
+              <header class="panel-header"><div><small data-i18n="section.compute">COMPUTE</small><h2 data-i18n="user.overview.recentCats">Recent Cats</h2></div><button class="text-button" data-go="cats" data-i18n="user.overview.viewAll">View all →</button></header>
+              <div id="recent-cats"></div>
+            </section>
+            <section class="panel">
+              <header class="panel-header"><div><small data-i18n="section.activity">ACTIVITY</small><h2 data-i18n="user.overview.recentOperations">Recent operations</h2></div></header>
+              <div id="recent-operations"></div>
+            </section>
           </div>
         </section>
 
         <section class="view" id="view-cats">
-          <section class="panel"><header class="panel-header"><div><small>COMPUTE</small><h2>我的 Cats</h2><p>启动、暂停或管理你的云端工作空间。</p></div><button class="button button-primary" data-create-cat>＋ 创建 Cat</button></header><div class="table-wrap"><table><thead><tr><th>名称</th><th>状态</th><th>规格</th><th>节点</th><th>创建时间</th><th class="align-right">操作</th></tr></thead><tbody id="cats-table"></tbody></table></div><div class="empty-state is-hidden" id="cats-empty"><span>◇</span><h3>还没有 Cat</h3><p>创建你的第一个云端工作空间。</p><button class="button button-primary" data-create-cat>创建 Cat</button></div></section>
+          <section class="panel">
+            <header class="panel-header"><div><small data-i18n="section.compute">COMPUTE</small><h2 data-i18n="user.cats.title">My Cats</h2><p data-i18n="user.cats.description">Start, suspend, or manage your cloud workspaces.</p></div><button class="button button-primary" data-create-cat>＋ <span data-i18n="user.createCat">Create Cat</span></button></header>
+            <div class="table-wrap"><table><thead><tr><th data-i18n="common.name">Name</th><th data-i18n="common.status">Status</th><th data-i18n="user.cats.spec">Size</th><th data-i18n="common.node">Node</th><th data-i18n="common.created">Created</th><th class="align-right" data-i18n="common.actions">Actions</th></tr></thead><tbody id="cats-table"></tbody></table></div>
+            <div class="empty-state is-hidden" id="cats-empty"><span>◇</span><h3 data-i18n="user.cats.emptyTitle">No Cats yet</h3><p data-i18n="user.cats.emptyDescription">Create your first cloud workspace.</p><button class="button button-primary" data-create-cat data-i18n="user.createCat">Create Cat</button></div>
+          </section>
         </section>
 
         <section class="view" id="view-disks">
-          <section class="panel"><header class="panel-header"><div><small>STORAGE</small><h2>Persistent Disks</h2><p>独立于 Cat 生命周期的 RWO 持久磁盘。</p></div><button class="button button-primary" id="create-disk-button">＋ 创建磁盘</button></header><div class="table-wrap"><table><thead><tr><th>名称</th><th>类型</th><th>容量</th><th>状态</th><th>绑定 Cat</th><th class="align-right">操作</th></tr></thead><tbody id="disks-table"></tbody></table></div><div class="empty-state is-hidden" id="disks-empty"><span>▱</span><h3>没有独立磁盘</h3><p>RootDisk 会随 Cat 自动创建；这里展示额外 PersistentDisk。</p></div></section>
+          <section class="panel">
+            <header class="panel-header"><div><small data-i18n="section.storage">STORAGE</small><h2 data-i18n="user.disks.title">Persistent Disks</h2><p data-i18n="user.disks.description">RWO persistent disks with a lifecycle independent from Cats.</p></div><button class="button button-primary" id="create-disk-button">＋ <span data-i18n="user.disks.create">Create disk</span></button></header>
+            <div class="table-wrap"><table><thead><tr><th data-i18n="common.name">Name</th><th data-i18n="common.type">Type</th><th data-i18n="common.capacity">Capacity</th><th data-i18n="common.status">Status</th><th data-i18n="user.disks.boundCat">Attached Cat</th><th class="align-right" data-i18n="common.actions">Actions</th></tr></thead><tbody id="disks-table"></tbody></table></div>
+            <div class="empty-state is-hidden" id="disks-empty"><span>▱</span><h3 data-i18n="user.disks.emptyTitle">No independent disks</h3><p data-i18n="user.disks.emptyDescription">RootDisk is created with each Cat; extra PersistentDisks appear here.</p></div>
+          </section>
         </section>
 
         <section class="view" id="view-operations">
-          <section class="panel"><header class="panel-header"><div><small>CONTROL PLANE</small><h2>Operations</h2><p>所有异步变更的状态、目标资源和最终结果。</p></div></header><div class="table-wrap"><table><thead><tr><th>Operation</th><th>类型</th><th>资源</th><th>阶段</th><th>更新时间</th><th>错误</th></tr></thead><tbody id="operations-table"></tbody></table></div><div class="empty-state is-hidden" id="operations-empty"><span>↻</span><h3>暂无操作记录</h3></div></section>
+          <section class="panel">
+            <header class="panel-header"><div><small data-i18n="section.controlPlane">CONTROL PLANE</small><h2 data-i18n="user.nav.operations">Operations</h2><p data-i18n="user.operations.description">Status, target resource, and final result for every asynchronous change.</p></div></header>
+            <div class="table-wrap"><table><thead><tr><th data-i18n="user.operations.operation">Operation</th><th data-i18n="common.type">Type</th><th data-i18n="user.operations.resource">Resource</th><th data-i18n="user.operations.phase">Phase</th><th data-i18n="user.operations.updated">Updated</th><th data-i18n="common.error">Error</th></tr></thead><tbody id="operations-table"></tbody></table></div>
+            <div class="empty-state is-hidden" id="operations-empty"><span>↻</span><h3 data-i18n="user.operations.emptyTitle">No operations yet</h3></div>
+          </section>
         </section>
       </div>
     </main>
   </div>
 
   <dialog id="create-cat-dialog" class="modal">
-    <form method="dialog" id="create-cat-form"><header><div><small>NEW COMPUTE</small><h2>创建 Cat</h2></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></header><div class="form-grid"><label class="span-2"><span>名称</span><input name="name" placeholder="dev" pattern="[A-Za-z0-9-]+" required><small>字母、数字和连字符</small></label><label class="span-2"><span>镜像</span><input name="image" value="ubuntu-24.04" required></label><label><span>CPU</span><input name="cpus" type="number" min="1" max="64" value="2" required></label><label><span>内存 (MiB)</span><input name="memory_mib" type="number" min="128" value="2048" required></label><label class="span-2"><span>RootDisk (GiB)</span><input name="root_gib" type="number" min="0.0625" step="0.0625" value="1" required></label></div><p class="form-error" data-form-error></p><footer><button class="button button-quiet" value="cancel">取消</button><button class="button button-primary" value="default">创建并启动</button></footer></form>
+    <form method="dialog" id="create-cat-form">
+      <header><div><small data-i18n="user.catDialog.eyebrow">NEW COMPUTE</small><h2 data-i18n="user.catDialog.title">Create Cat</h2></div><button class="icon-button" value="cancel" data-i18n-aria-label="common.close" aria-label="Close">×</button></header>
+      <div class="form-grid">
+        <label class="span-2"><span data-i18n="common.name">Name</span><input name="name" placeholder="dev" pattern="[A-Za-z0-9-]+" required><small data-i18n="user.catDialog.nameHint">Letters, numbers, and hyphens</small></label>
+        <label class="span-2"><span data-i18n="user.catDialog.image">Image</span><input name="image" value="ubuntu-24.04" required></label>
+        <label><span>CPU</span><input name="cpus" type="number" min="1" max="64" value="2" required></label>
+        <label><span data-i18n="user.catDialog.memory">Memory (MiB)</span><input name="memory_mib" type="number" min="128" value="2048" required></label>
+        <label class="span-2"><span data-i18n="user.catDialog.rootDisk">RootDisk (GiB)</span><input name="root_gib" type="number" min="0.0625" step="0.0625" value="1" required></label>
+      </div>
+      <p class="form-error" data-form-error></p>
+      <footer><button class="button button-quiet" value="cancel" data-i18n="common.cancel">Cancel</button><button class="button button-primary" value="default" data-i18n="user.catDialog.submit">Create and start</button></footer>
+    </form>
   </dialog>
 
   <dialog id="create-disk-dialog" class="modal">
-    <form method="dialog" id="create-disk-form"><header><div><small>NEW STORAGE</small><h2>创建 PersistentDisk</h2></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></header><div class="form-grid"><label class="span-2"><span>名称</span><input name="name" placeholder="workspace-data" required></label><label class="span-2"><span>容量 (GiB)</span><input name="size_gib" type="number" min="0.0625" step="0.0625" value="1" required></label></div><p class="form-error" data-form-error></p><footer><button class="button button-quiet" value="cancel">取消</button><button class="button button-primary" value="default">创建磁盘</button></footer></form>
+    <form method="dialog" id="create-disk-form">
+      <header><div><small data-i18n="user.diskDialog.eyebrow">NEW STORAGE</small><h2 data-i18n="user.diskDialog.title">Create PersistentDisk</h2></div><button class="icon-button" value="cancel" data-i18n-aria-label="common.close" aria-label="Close">×</button></header>
+      <div class="form-grid"><label class="span-2"><span data-i18n="common.name">Name</span><input name="name" placeholder="workspace-data" required></label><label class="span-2"><span data-i18n="user.diskDialog.size">Capacity (GiB)</span><input name="size_gib" type="number" min="0.0625" step="0.0625" value="1" required></label></div>
+      <p class="form-error" data-form-error></p>
+      <footer><button class="button button-quiet" value="cancel" data-i18n="common.cancel">Cancel</button><button class="button button-primary" value="default" data-i18n="user.diskDialog.submit">Create disk</button></footer>
+    </form>
   </dialog>
 
   <dialog id="exec-dialog" class="modal modal-wide">
-    <form method="dialog" id="exec-form"><header><div><small>GUEST EXEC</small><h2>在 <span id="exec-cat-name"></span> 中执行</h2></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></header><label><span>命令</span><input name="command" value="uname -a" required><small>按空格拆分为 argv；当前开发控制台不执行 shell 展开。</small></label><pre class="terminal-output" id="exec-output">等待执行…</pre><p class="form-error" data-form-error></p><footer><button class="button button-quiet" value="cancel">关闭</button><button class="button button-primary" value="default">执行</button></footer></form>
+    <form method="dialog" id="exec-form">
+      <header><div><small data-i18n="user.execDialog.eyebrow">GUEST EXEC</small><h2><span data-i18n="user.execDialog.title">Run in</span> <span id="exec-cat-name"></span></h2></div><button class="icon-button" value="cancel" data-i18n-aria-label="common.close" aria-label="Close">×</button></header>
+      <label><span data-i18n="user.execDialog.command">Command</span><input name="command" value="uname -a" required><small data-i18n="user.execDialog.hint">Split into argv on spaces; this development console does not perform shell expansion.</small></label>
+      <pre class="terminal-output" id="exec-output" data-i18n="user.execDialog.waiting">Waiting to run…</pre>
+      <p class="form-error" data-form-error></p>
+      <footer><button class="button button-quiet" value="cancel" data-i18n="common.close">Close</button><button class="button button-primary" value="default" data-i18n="user.execDialog.run">Run</button></footer>
+    </form>
   </dialog>
 
   <div class="toast-region" id="toast-region" aria-live="polite"></div>

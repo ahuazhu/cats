@@ -153,6 +153,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin", get(crate::ui::admin_console))
         .route("/admin/", get(crate::ui::admin_console))
         .route("/ui/styles.css", get(crate::ui::styles))
+        .route("/ui/i18n.js", get(crate::ui::i18n_script))
         .route("/ui/common.js", get(crate::ui::common_script))
         .route("/ui/user.js", get(crate::ui::user_script))
         .route("/ui/admin.js", get(crate::ui::admin_script))

@@ -267,10 +267,11 @@ impl Ctx {
 async fn embedded_user_and_admin_sites_are_served_without_credentials() {
     let ctx = Ctx::new().await;
     let assets = [
-        ("/", "text/html", "用户控制台"),
-        ("/user/", "text/html", "用户控制台"),
-        ("/admin/", "text/html", "管理员控制台"),
+        ("/", "text/html", "data-i18n=\"user.meta.title\""),
+        ("/user/", "text/html", "data-i18n=\"user.meta.title\""),
+        ("/admin/", "text/html", "data-i18n=\"admin.meta.title\""),
         ("/ui/styles.css", "text/css", ".app-shell"),
+        ("/ui/i18n.js", "text/javascript", "navigator.languages"),
         (
             "/ui/common.js",
             "text/javascript",
@@ -325,7 +326,7 @@ async fn embedded_user_and_admin_sites_are_served_without_credentials() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let admin_html = response.text().await.unwrap();
-    assert!(admin_html.contains("管理员控制台"));
+    assert!(admin_html.contains("data-i18n=\"admin.meta.title\""));
     assert!(!admin_html.contains("Administrator Token"));
     assert!(!admin_html.contains("FLEET HEALTH"));
     assert!(admin_html.contains("login-screen is-hidden"));

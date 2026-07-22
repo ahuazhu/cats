@@ -70,6 +70,7 @@ a { color: inherit; }
 /* Authentication */
 .login-screen { min-height: 100vh; display: grid; grid-template-columns: minmax(420px, 46%) 1fr; background: var(--surface); }
 .login-panel { width: min(480px, calc(100% - 64px)); margin: 0 auto; padding: 54px 0 40px; display: flex; flex-direction: column; }
+.login-heading { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
 .login-copy { margin: auto 0 34px; }
 .login-copy h1 { margin: 12px 0; font-size: 39px; line-height: 1.1; letter-spacing: -.045em; }
 .login-copy p { margin: 0; color: var(--muted); line-height: 1.7; }
@@ -80,6 +81,10 @@ input, select { width: 100%; min-height: 46px; padding: 0 13px; border: 1px soli
 input:focus, select:focus { border-color: #67a785; box-shadow: 0 0 0 4px rgb(56 133 90 / 11%); }
 .form-error { min-height: 18px; margin: -7px 0 0; color: var(--red); font-size: 12px; font-weight: 600; }
 .back-link { margin-top: 28px; color: var(--muted); font-size: 12px; text-decoration: none; }
+.language-picker { display: inline-flex; width: auto; align-items: center; gap: 8px; color: var(--muted); font-size: 10px; font-weight: 700; }
+.language-picker select { width: auto; min-width: 118px; min-height: 34px; padding: 0 28px 0 9px; border-radius: 9px; background-color: white; color: #536058; font-size: 10px; }
+.language-picker-sidebar { width: 100%; justify-content: space-between; margin-bottom: 4px; }
+.language-picker-sidebar select { min-width: 128px; background-color: rgb(255 255 255 / 70%); }
 .login-art { position: relative; overflow: hidden; margin: 18px; border-radius: 26px; background: var(--green-dark); }
 .user-art { background: linear-gradient(145deg, #163f2e, #286c4c); }
 .admin-art { background: linear-gradient(145deg, var(--admin-dark), #355a93); }
@@ -102,6 +107,7 @@ input:focus, select:focus { border-color: #67a785; box-shadow: 0 0 0 4px rgb(56 
 .nav-list { display: grid; gap: 5px; }
 .nav-item { width: 100%; height: 44px; display: flex; align-items: center; gap: 12px; padding: 0 13px; border: 0; border-radius: 10px; background: transparent; color: #68736c; cursor: pointer; font-size: 13px; font-weight: 650; text-align: left; }
 .nav-item span { width: 20px; color: #8f9992; font-size: 17px; text-align: center; }
+.nav-item b { font: inherit; }
 .nav-item:hover { background: rgb(255 255 255 / 65%); color: var(--ink); }
 .nav-item.is-active { background: white; color: var(--green-dark); box-shadow: 0 4px 14px rgb(30 62 42 / 6%); }
 [data-site="admin"] .nav-item.is-active { color: var(--admin); }
@@ -241,6 +247,7 @@ tbody tr:hover { background: #fbfcfb; }
   .site-card { min-height: 185px; padding: 24px; }
   .login-screen { display: block; }
   .login-panel { min-height: 100vh; width: min(100% - 42px, 480px); padding-top: 30px; }
+  .login-heading { align-items: flex-start; }
   .login-copy { margin-top: auto; }
   .login-art { display: none; }
   .app-shell { display: block; }
@@ -256,6 +263,7 @@ tbody tr:hover { background: #fbfcfb; }
 }
 
 @media (max-width: 520px) {
+  .login-heading { flex-wrap: wrap; }
   .portal-hero h1 { font-size: 39px; }
   .portal-hero p { font-size: 15px; }
   .site-card { grid-template-columns: auto 1fr; }

@@ -122,6 +122,12 @@ cargo run -p cats-control-plane-daemon --bin cats-controld
 登录，不提供静态 Token 表单；未配置 WorkOS 时页面会提示联系平台管理员。本地根
 路径直接进入用户站：<http://127.0.0.1:7300/>。
 
+两个站点均提供英语和简体中文。未保存语言偏好时，页面按浏览器的
+`navigator.languages` / `navigator.language` 自动选择（中文环境使用简体中文，
+其他环境使用英语）；语言选择器可切换为英语、中文或“跟随系统”，显式选择保存在
+当前站点的浏览器本地存储中。语言偏好只影响展示，不参与 WorkOS session、Project
+映射或权限判断。
+
 ### WorkOS AuthKit 登录
 
 配置 WorkOS 后，两个 Web 站点使用独立的加密 HttpOnly session cookie；CLI Bearer

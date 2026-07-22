@@ -1,3 +1,5 @@
+import { getLocale, localizedApiMessage, t } from "/ui/i18n.js";
+
 export class ApiError extends Error {
   constructor(message, status = 0, code = "") {
     super(message);
@@ -18,7 +20,7 @@ export async function request(path, options = {}) {
   try {
     response = await fetch(path, { ...options, headers });
   } catch (error) {
-    throw new ApiError(`无法连接控制面：${error.message}`);
+    throw new ApiError(t("error.network", { message: error.message }));
   }
 
   const body = await response.text();
@@ -29,7 +31,7 @@ export async function request(path, options = {}) {
       try {
         value = JSON.parse(body);
       } catch (_) {
-        throw new ApiError("控制面返回了无法解析的 JSON", response.status);
+        throw new ApiError(t("error.invalidJson"), response.status);
       }
     } else {
       value = body;
@@ -37,10 +39,11 @@ export async function request(path, options = {}) {
   }
 
   if (!response.ok) {
-    const message = value && typeof value === "object" && value.message
-      ? value.message
-      : body || `请求失败（HTTP ${response.status}）`;
     const code = value && typeof value === "object" ? value.code || "" : "";
+    const fallback = value && typeof value === "object" && value.message
+      ? value.message
+      : body || t("error.http", { status: response.status });
+    const message = localizedApiMessage(code, fallback);
     throw new ApiError(message, response.status, code);
   }
   return value;
@@ -61,12 +64,13 @@ export function formatBytes(bytes) {
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
   const scaled = value / (1024 ** index);
-  return `${scaled >= 10 || index === 0 ? scaled.toFixed(0) : scaled.toFixed(1)} ${units[index]}`;
+  const digits = scaled >= 10 || index === 0 ? 0 : 1;
+  return `${new Intl.NumberFormat(getLocale(), { maximumFractionDigits: digits }).format(scaled)} ${units[index]}`;
 }
 
 export function formatTime(unixSeconds) {
   if (!unixSeconds) return "—";
-  return new Intl.DateTimeFormat("zh-CN", {
+  return new Intl.DateTimeFormat(getLocale(), {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
@@ -78,7 +82,23 @@ export function formatTime(unixSeconds) {
 export function statusBadge(status) {
   const normalized = String(status || "unknown").toLowerCase().replaceAll("_", "-");
   const safeClass = normalized.replace(/[^a-z0-9-]/g, "");
-  return `<span class="badge badge-${safeClass}">${escapeHtml(normalized.replaceAll("-", " "))}</span>`;
+  const key = `status.${normalized.replaceAll("-", "_")}`;
+  const label = t(key);
+  return `<span class="badge badge-${safeClass}">${escapeHtml(label === key ? normalized.replaceAll("-", " ") : label)}</span>`;
+}
+
+export function resourceKind(kind) {
+  const normalized = String(kind || "unknown").toLowerCase();
+  const key = `kind.${normalized}`;
+  const label = t(key);
+  return label === key ? normalized : label;
+}
+
+export function operationKind(kind) {
+  const normalized = String(kind || "unknown").toLowerCase().replaceAll(".", "_");
+  const key = `operation.${normalized}`;
+  const label = t(key);
+  return label === key ? kind : label;
 }
 
 export function metricCard(label, value, detail) {
@@ -99,7 +119,7 @@ export function toast(title, message = "", kind = "success") {
   window.setTimeout(() => item.remove(), 4500);
 }
 
-export function setBusy(button, busy, busyLabel = "处理中…") {
+export function setBusy(button, busy, busyLabel = t("common.loading")) {
   if (!button) return;
   if (busy) {
     button.dataset.originalLabel = button.textContent;
@@ -137,9 +157,9 @@ export function splitCommand(command) {
     }
   }
   if (escaping) current += "\\";
-  if (quote) throw new Error("命令中存在未闭合的引号");
+  if (quote) throw new Error(t("error.unclosedQuote"));
   if (current) values.push(current);
-  if (!values.length) throw new Error("命令不能为空");
+  if (!values.length) throw new Error(t("error.emptyCommand"));
   return values;
 }
 
@@ -158,7 +178,7 @@ export function initNavigation(titles, onChange) {
     document.querySelectorAll(".view").forEach((view) => view.classList.toggle("is-active", view.id === `view-${name}`));
     document.querySelectorAll(".nav-item").forEach((item) => item.classList.toggle("is-active", item.dataset.view === name));
     const title = document.querySelector("#view-title");
-    if (title) title.textContent = titles[name];
+    if (title) title.textContent = typeof titles[name] === "function" ? titles[name]() : titles[name];
     sidebar?.classList.remove("is-open");
     onChange?.(name);
   }

@@ -1,45 +1,90 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>Cats · 管理员控制台</title>
+  <title data-i18n="admin.meta.title">Cats · Administrator Console</title>
   <link rel="stylesheet" href="/ui/styles.css">
 </head>
 <body class="console-page" data-site="admin">
   <section class="login-screen is-hidden" id="login-screen">
     <div class="login-panel">
-      <a class="brand brand-large" href="/"><span class="brand-mark admin-mark" aria-hidden="true">C</span><span><strong>Cats</strong><small>Fleet Console</small></span></a>
-      <div class="login-copy"><div class="eyebrow">ADMIN SITE</div><h1>管理计算 Fleet</h1><p id="login-description">通过 WorkOS 登录，并验证 Fleet 管理员权限。</p></div>
+      <div class="login-heading">
+        <a class="brand brand-large" href="/"><span class="brand-mark admin-mark" aria-hidden="true">C</span><span><strong>Cats</strong><small data-i18n="brand.fleetConsole">Fleet Console</small></span></a>
+        <label class="language-picker">
+          <span data-i18n="language.label">Language</span>
+          <select data-language-select data-i18n-aria-label="language.label" aria-label="Language">
+            <option value="auto" data-i18n="language.auto">System default</option>
+            <option value="en" data-i18n="language.en">English</option>
+            <option value="zh-CN" data-i18n="language.zh-CN">中文</option>
+          </select>
+        </label>
+      </div>
+      <div class="login-copy">
+        <div class="eyebrow" data-i18n="admin.login.eyebrow">ADMIN SITE</div>
+        <h1 data-i18n="admin.login.title">Manage the compute fleet</h1>
+        <p id="login-description" data-i18n="admin.login.description">Sign in with WorkOS and verify fleet administrator access.</p>
+      </div>
       <div class="login-form">
-        <button class="button button-admin button-wide is-hidden" id="workos-login-button" type="button"><span>使用 WorkOS 登录</span><span>→</span></button>
+        <button class="button button-admin button-wide is-hidden" id="workos-login-button" type="button"><span data-i18n="admin.login.button">Sign in with WorkOS</span><span aria-hidden="true">→</span></button>
         <p class="form-error" id="login-error" role="alert"></p>
       </div>
-      <a class="back-link" href="https://cats.run/">← 返回用户站</a>
+      <a class="back-link" href="https://cats.run/" data-i18n="admin.backToUser">← Back to user site</a>
     </div>
     <aside class="login-art admin-art" aria-hidden="true"><div class="grid-lines"></div></aside>
   </section>
 
   <div class="app-shell is-hidden" id="app-shell">
     <aside class="sidebar admin-sidebar">
-      <a class="brand" href="/"><span class="brand-mark admin-mark">C</span><span><strong>Cats</strong><small>Admin Console</small></span></a>
-      <div class="context-card admin-context"><small>PLATFORM</small><strong>Fleet</strong><span>全局管理边界</span></div>
-      <nav class="nav-list"><button class="nav-item is-active" data-view="overview"><span>⌁</span>Fleet 概览</button><button class="nav-item" data-view="nodes"><span>▦</span>工作节点</button><button class="nav-item" data-view="metrics"><span>⌇</span>Metrics</button></nav>
-      <div class="sidebar-footer"><a href="https://cats.run/">返回用户站</a><button id="logout-button">退出登录</button></div>
+      <a class="brand" href="/"><span class="brand-mark admin-mark" aria-hidden="true">C</span><span><strong>Cats</strong><small data-i18n="brand.adminConsole">Admin Console</small></span></a>
+      <div class="context-card admin-context"><small data-i18n="admin.context.label">PLATFORM</small><strong>Fleet</strong><span data-i18n="admin.context.description">Global administration boundary</span></div>
+      <nav class="nav-list" data-i18n-aria-label="admin.nav.aria" aria-label="Administrator console navigation">
+        <button class="nav-item is-active" data-view="overview"><span>⌁</span><b data-i18n="admin.nav.overview">Fleet overview</b></button>
+        <button class="nav-item" data-view="nodes"><span>▦</span><b data-i18n="admin.nav.nodes">Worker nodes</b></button>
+        <button class="nav-item" data-view="metrics"><span>⌇</span><b data-i18n="admin.nav.metrics">Metrics</b></button>
+      </nav>
+      <div class="sidebar-footer">
+        <label class="language-picker language-picker-sidebar">
+          <span data-i18n="language.label">Language</span>
+          <select data-language-select data-i18n-aria-label="language.label" aria-label="Language">
+            <option value="auto" data-i18n="language.auto">System default</option>
+            <option value="en" data-i18n="language.en">English</option>
+            <option value="zh-CN" data-i18n="language.zh-CN">中文</option>
+          </select>
+        </label>
+        <a href="https://cats.run/" data-i18n="admin.backToUser">← Back to user site</a>
+        <button id="logout-button" data-i18n="common.logout">Sign out</button>
+      </div>
     </aside>
 
     <main class="workspace">
-      <header class="topbar"><button class="mobile-menu" id="mobile-menu">☰</button><div><span class="breadcrumb">Platform / <b>Fleet</b></span><h1 id="view-title">Fleet 概览</h1></div><div class="topbar-actions"><span class="live-indicator admin-live"><i></i>Auto refresh</span><button class="button button-quiet" id="refresh-button">刷新</button></div></header>
+      <header class="topbar">
+        <button class="mobile-menu" id="mobile-menu" data-i18n-aria-label="user.mobileMenu" aria-label="Open navigation">☰</button>
+        <div><span class="breadcrumb"><span data-i18n="admin.breadcrumb">Platform /</span> <b>Fleet</b></span><h1 id="view-title" data-i18n="admin.nav.overview">Fleet overview</h1></div>
+        <div class="topbar-actions"><span class="live-indicator admin-live"><i></i><span data-i18n="admin.autoRefresh">Auto refresh</span></span><button class="button button-quiet" id="refresh-button" data-i18n="common.refresh">Refresh</button></div>
+      </header>
       <div class="content">
         <section class="view is-active" id="view-overview">
           <div class="metric-grid" id="admin-metrics"></div>
-          <div class="dashboard-grid"><section class="panel panel-span-2"><header class="panel-header"><div><small>CAPACITY</small><h2>Fleet 资源分配</h2></div><span class="timestamp" id="generated-at"></span></header><div class="capacity-grid" id="capacity-grid"></div></section><section class="panel"><header class="panel-header"><div><small>LIFECYCLE</small><h2>Cat 状态</h2></div></header><div id="lifecycle-summary"></div></section><section class="panel panel-span-3"><header class="panel-header"><div><small>WORKERS</small><h2>节点健康</h2></div><button class="text-button" data-go="nodes">管理节点 →</button></header><div id="node-health-strip"></div></section></div>
+          <div class="dashboard-grid">
+            <section class="panel panel-span-2"><header class="panel-header"><div><small data-i18n="section.capacity">CAPACITY</small><h2 data-i18n="admin.capacity.title">Fleet resource allocation</h2></div><span class="timestamp" id="generated-at"></span></header><div class="capacity-grid" id="capacity-grid"></div></section>
+            <section class="panel"><header class="panel-header"><div><small data-i18n="section.lifecycle">LIFECYCLE</small><h2 data-i18n="admin.lifecycle.title">Cat states</h2></div></header><div id="lifecycle-summary"></div></section>
+            <section class="panel panel-span-3"><header class="panel-header"><div><small data-i18n="section.workers">WORKERS</small><h2 data-i18n="admin.workers.title">Node health</h2></div><button class="text-button" data-go="nodes" data-i18n="admin.workers.manage">Manage nodes →</button></header><div id="node-health-strip"></div></section>
+          </div>
         </section>
 
-        <section class="view" id="view-nodes"><section class="panel"><header class="panel-header"><div><small>FLEET MANAGEMENT</small><h2>工作节点</h2><p>Cordon 停止新调度；Drain 安全停止、fence 并迁移现有 Cats。</p></div></header><div class="table-wrap"><table><thead><tr><th>节点</th><th>状态</th><th>分配</th><th>容量</th><th>心跳</th><th>Host telemetry</th><th class="align-right">操作</th></tr></thead><tbody id="nodes-table"></tbody></table></div><div class="empty-state is-hidden" id="nodes-empty"><span>▦</span><h3>没有已注册节点</h3><p>启动 cats-noded 后，节点会自动注册并心跳。</p></div></section></section>
+        <section class="view" id="view-nodes">
+          <section class="panel">
+            <header class="panel-header"><div><small data-i18n="admin.nodes.eyebrow">FLEET MANAGEMENT</small><h2 data-i18n="admin.nodes.title">Worker nodes</h2><p data-i18n="admin.nodes.description">Cordon stops new scheduling. Drain safely stops, fences, and reschedules existing Cats.</p></div></header>
+            <div class="table-wrap"><table><thead><tr><th data-i18n="common.node">Node</th><th data-i18n="common.status">Status</th><th data-i18n="admin.nodes.assignments">Assignments</th><th data-i18n="common.capacity">Capacity</th><th data-i18n="admin.nodes.heartbeat">Heartbeat</th><th data-i18n="admin.nodes.telemetry">Host telemetry</th><th class="align-right" data-i18n="common.actions">Actions</th></tr></thead><tbody id="nodes-table"></tbody></table></div>
+            <div class="empty-state is-hidden" id="nodes-empty"><span>▦</span><h3 data-i18n="admin.nodes.emptyTitle">No registered nodes</h3><p data-i18n="admin.nodes.emptyDescription">Nodes register and begin heartbeating after cats-noded starts.</p></div>
+          </section>
+        </section>
 
-        <section class="view" id="view-metrics"><section class="panel"><header class="panel-header"><div><small>PROMETHEUS</small><h2>实时 Metrics</h2><p>使用管理员凭证从同一控制面读取。</p></div><button class="button button-quiet" id="copy-metrics">复制</button></header><pre class="metrics-output" id="metrics-output">正在加载…</pre></section></section>
+        <section class="view" id="view-metrics">
+          <section class="panel"><header class="panel-header"><div><small data-i18n="section.prometheus">PROMETHEUS</small><h2 data-i18n="admin.metrics.title">Live metrics</h2><p data-i18n="admin.metrics.description">Read from the same control plane using administrator credentials.</p></div><button class="button button-quiet" id="copy-metrics" data-i18n="common.copy">Copy</button></header><pre class="metrics-output" id="metrics-output" data-i18n="common.loading">Loading…</pre></section>
+        </section>
       </div>
     </main>
   </div>
