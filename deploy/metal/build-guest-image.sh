@@ -140,7 +140,13 @@ while [ ! -b /dev/vda ] && [ $i -lt 100 ]; do /bin/busybox sleep 0.1; i=$((i+1))
 /bin/busybox mount -o rw /dev/vda /newroot || exec /bin/busybox sh
 /bin/busybox mount --move /dev /newroot/dev
 /bin/busybox umount /proc /sys 2>/dev/null
-exec /bin/busybox switch_root /newroot /usr/bin/cats-init
+if [ -x /newroot/usr/bin/cats-init ]; then
+  exec /bin/busybox switch_root /newroot /usr/bin/cats-init
+fi
+# RootDisks created by the previous BusyBox image only have /sbin/init.
+# Keep them bootable during a rolling worker/image upgrade; newly created
+# Ubuntu roots always take the optimized cats-init path above.
+exec /bin/busybox switch_root /newroot /sbin/init
 EOF
 chmod +x "$IR/init"
 (cd "$IR" && find . | cpio -o -H newc --quiet | gzip -9) > "$OUT/initramfs.img"
