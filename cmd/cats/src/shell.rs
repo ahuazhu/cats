@@ -1,12 +1,12 @@
 //! Interactive PTY client for `cats shell`.
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use futures_util::{SinkExt, StreamExt};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{header, HeaderValue};
 use tokio_tungstenite::tungstenite::Message;
@@ -15,6 +15,35 @@ use cats_api::requests::{ShellClientControl, ShellServerControl};
 
 struct RawModeGuard {
     enabled: bool,
+}
+
+enum StdinEvent {
+    Data(Vec<u8>),
+    Eof,
+    Error(std::io::Error),
+}
+
+fn spawn_stdin_reader<R>(mut reader: R) -> tokio::sync::mpsc::Receiver<StdinEvent>
+where
+    R: Read + Send + 'static,
+{
+    let (sender, receiver) = tokio::sync::mpsc::channel(32);
+    std::thread::spawn(move || {
+        let mut buffer = vec![0u8; 16 * 1024];
+        loop {
+            let event = match reader.read(&mut buffer) {
+                Ok(0) => StdinEvent::Eof,
+                Ok(count) => StdinEvent::Data(buffer[..count].to_vec()),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => StdinEvent::Error(error),
+            };
+            let terminal = matches!(event, StdinEvent::Eof | StdinEvent::Error(_));
+            if sender.blocking_send(event).is_err() || terminal {
+                return;
+            }
+        }
+    });
+    receiver
 }
 
 impl RawModeGuard {
@@ -75,9 +104,13 @@ async fn run_async(base: &str, project: &str, token: &str, cat: &str) -> Result<
         .context("connect interactive shell")?;
     let _raw_mode = RawModeGuard::enable_if_terminal()?;
     let (mut sender, mut receiver) = socket.split();
-    let mut stdin = tokio::io::stdin();
+    // Tokio's stdin uses a blocking-pool read that cannot be cancelled. In an
+    // interactive terminal it keeps Runtime::drop waiting after the remote
+    // shell has already exited. A detached OS thread lets the WebSocket exit
+    // frame end the process immediately; process teardown closes the pending
+    // terminal read.
+    let mut stdin = spawn_stdin_reader(std::io::stdin());
     let mut stdout = tokio::io::stdout();
-    let mut input = vec![0u8; 16 * 1024];
     let mut stdin_open = true;
     let mut known_size = (rows, cols);
     let mut resize_poll = tokio::time::interval(Duration::from_millis(250));
@@ -89,15 +122,20 @@ async fn run_async(base: &str, project: &str, token: &str, cat: &str) -> Result<
 
     loop {
         tokio::select! {
-            read = stdin.read(&mut input), if stdin_open => {
-                let count = read.context("read terminal input")?;
-                if count == 0 {
+            read = stdin.recv(), if stdin_open => {
+                match read.unwrap_or(StdinEvent::Eof) {
+                    StdinEvent::Data(data) => {
+                        sender.send(Message::Binary(data.into())).await?;
+                    }
+                    StdinEvent::Eof => {
                     // Deliver terminal EOF instead of closing the transport so
                     // a piped `printf '...\nexit\n' | cats shell` drains output.
-                    sender.send(Message::Binary(vec![0x04].into())).await?;
-                    stdin_open = false;
-                } else {
-                    sender.send(Message::Binary(input[..count].to_vec().into())).await?;
+                        sender.send(Message::Binary(vec![0x04].into())).await?;
+                        stdin_open = false;
+                    }
+                    StdinEvent::Error(error) => {
+                        return Err(error).context("read terminal input");
+                    }
                 }
             }
             incoming = receiver.next() => {
@@ -143,5 +181,55 @@ async fn run_async(base: &str, project: &str, token: &str, cat: &str) -> Result<
                 sender.send(Message::Ping(Vec::new().into())).await?;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Cursor, Read};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    use super::{spawn_stdin_reader, StdinEvent};
+
+    #[tokio::test]
+    async fn detached_stdin_reader_reports_data_then_eof() {
+        let mut events = spawn_stdin_reader(Cursor::new(b"exit\n".to_vec()));
+        match events.recv().await.unwrap() {
+            StdinEvent::Data(data) => assert_eq!(data, b"exit\n"),
+            _ => panic!("expected stdin data"),
+        }
+        assert!(matches!(events.recv().await.unwrap(), StdinEvent::Eof));
+    }
+
+    struct BlockingReader {
+        started: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl Read for BlockingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            let _ = self.started.send(());
+            let _ = self.release.recv();
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn pending_terminal_read_does_not_block_runtime_drop() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let input = spawn_stdin_reader(BlockingReader {
+            started: started_tx,
+            release: release_rx,
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(input);
+
+        let before = Instant::now();
+        drop(runtime);
+        assert!(before.elapsed() < Duration::from_secs(1));
+        drop(release_tx);
     }
 }
