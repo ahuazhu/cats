@@ -47,6 +47,13 @@ impl GuestClient {
         Ok(Self { stream, next_id: 1 })
     }
 
+    pub fn connect_shell(path: &Path) -> Result<Self> {
+        let stream = UnixStream::connect(path)
+            .with_context(|| format!("connect guest agent at {}", path.display()))?;
+        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+        Ok(Self { stream, next_id: 1 })
+    }
+
     /// Connect through Cloud Hypervisor's hybrid vsock socket: the VMM
     /// exposes a unix socket on the host; the client sends
     /// `CONNECT <port>\n` and the VMM answers `OK <assigned>\n` before the
@@ -69,6 +76,18 @@ impl GuestClient {
         }
         drop(reader); // BufReader consumed exactly the handshake line
         Ok(Self { stream, next_id: 1 })
+    }
+
+    pub fn connect_hybrid_vsock_shell(path: &Path, port: u32) -> Result<Self> {
+        let client = Self::connect_hybrid_vsock(path, port)?;
+        // Cloud Hypervisor runs on Linux, where an active SO_RCVTIMEO can be
+        // cleared after the bounded mux handshake. Keep the handshake bounded
+        // but let the subsequent interactive session remain silent forever.
+        client
+            .stream
+            .set_read_timeout(None)
+            .context("clear interactive shell read timeout")?;
+        Ok(client)
     }
 
     pub fn request(&mut self, body: GuestRequestBody) -> Result<GuestResponseBody> {
@@ -187,5 +206,46 @@ impl GuestClient {
             GuestResponseBody::Error { message } => bail!("guest error: {message}"),
             other => bail!("unexpected shell response: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixListener;
+    use std::thread;
+
+    use cats_api::guest::{GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody};
+    use cats_guest_agent::{read_frame, write_frame};
+
+    use super::GuestClient;
+
+    #[test]
+    fn interactive_shell_uses_an_unbounded_read_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("guest.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let peer = thread::spawn(move || {
+            let (mut server, _) = listener.accept().unwrap();
+            let request: GuestRequest = read_frame(&mut server).unwrap();
+            assert!(matches!(
+                request.body,
+                GuestRequestBody::Shell { rows: 24, cols: 80 }
+            ));
+            write_frame(
+                &mut server,
+                &GuestResponse {
+                    id: request.id,
+                    body: GuestResponseBody::ShellReady,
+                },
+            )
+            .unwrap();
+        });
+
+        let shell = GuestClient::connect_shell(&path)
+            .unwrap()
+            .start_shell(24, 80)
+            .unwrap();
+        assert_eq!(shell.stream.read_timeout().unwrap(), None);
+        peer.join().unwrap();
     }
 }

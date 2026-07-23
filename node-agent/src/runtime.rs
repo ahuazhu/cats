@@ -162,6 +162,13 @@ impl GuestConn {
             GuestConn::Vsock(path, port) => GuestClient::connect_hybrid_vsock(path, *port),
         }
     }
+
+    pub fn connect_shell(&self) -> Result<GuestClient> {
+        match self {
+            GuestConn::Unix(path) => GuestClient::connect_shell(path),
+            GuestConn::Vsock(path, port) => GuestClient::connect_hybrid_vsock_shell(path, *port),
+        }
+    }
 }
 
 impl CatRuntime {
@@ -1176,7 +1183,7 @@ impl NodeRuntime {
             (runtime.conn(), runtime.activity.clone())
         };
         let guard = activity.acquire()?;
-        let shell = conn.connect()?.start_shell(rows, cols)?;
+        let shell = conn.connect_shell()?.start_shell(rows, cols)?;
         Ok((shell, guard))
     }
 
