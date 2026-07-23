@@ -163,7 +163,8 @@ debootstrap \
   "$UBUNTU_SUITE" "$RF" "$UBUNTU_MIRROR"
 
 mkdir -p "$RF"/usr/bin "$RF"/etc/systemd/system/sysinit.target.wants \
-  "$RF"/etc/systemd/system/multi-user.target.wants "$RF"/etc/systemd/network
+  "$RF"/etc/systemd/system/multi-user.target.wants "$RF"/etc/systemd/network \
+  "$RF"/etc/profile.d
 cp "$AGENT" "$RF/usr/bin/cats-guest-agent"
 
 # Fast PID 1. The root is still normal Ubuntu; this only removes the generic
@@ -313,6 +314,17 @@ set colored-stats on
 set visible-stats on
 EOF
 fi
+cat > "$RF/etc/profile.d/cats-login-bash.sh" <<'EOF'
+# Let RootDisks created during the /bin/sh Guest Agent transition pick up the
+# same shell UX without changing Ubuntu's system /bin/sh symlink.
+if [ "$(id -u)" -eq 0 ]; then
+  export HOME=/root USER=root LOGNAME=root
+  if [ -t 0 ] && [ -x /bin/bash ] && [ -z "${BASH_VERSION:-}" ]; then
+    export SHELL=/bin/bash
+    exec /bin/bash -l
+  fi
+fi
+EOF
 
 rm -rf "$RF/var/lib/apt/lists/"* "$RF/var/cache/apt/archives/"*.deb
 

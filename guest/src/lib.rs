@@ -964,6 +964,9 @@ impl GuestAgent {
         let mut command = CommandBuilder::new(shell);
         command.arg("-l");
         command.env("SHELL", shell);
+        command.env("HOME", "/root");
+        command.env("USER", "root");
+        command.env("LOGNAME", "root");
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
         command.cwd(if Path::new("/root").is_dir() {
