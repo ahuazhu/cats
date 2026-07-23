@@ -45,6 +45,20 @@ Project 资源命名空间。
    `CATS_ADMIN_TOKEN` 暂时保留为 fleet 自动化的 break-glass 机器凭据。两者都不是普通
    用户登录方式，Guest 永远不会收到这些凭据。
 
+### macOS 凭据存储实现
+
+macOS 上的 CLI 通过 Apple 自带且路径固定的 `/usr/bin/security` 访问 Keychain，而不由
+每次本地构建产生的新 `cats` 二进制直接调用 Security.framework。这与
+[GitHub CLI 使用的 macOS keyring 实现](https://github.com/zalando/go-keyring/blob/v0.2.8/keyring_darwin.go)
+一致，可避免 ad-hoc 签名或二进制哈希变化让 Keychain 把每次构建识别成新的访问方。
+读取和删除使用独立参数；写入使用 `security -i`，只通过 stdin 传递 Base64 编码后的
+凭据，token 不得进入进程参数、日志或错误信息。调用最长等待 60 秒。
+
+旧版 `cats` 写入的同 service/account 原始 JSON 可继续读取；后续登录或 token 刷新会
+原位改写为带编码前缀的 Base64 表示。Windows 与 Linux 继续分别使用系统 Credential
+Manager 与 Secret Service。正式 macOS 发行包仍应使用稳定 Developer ID 签名并完成
+notarization；本实现同时改善频繁变化的本地开发二进制体验。
+
 ## 安全与失败语义
 
 - email 只用于展示；稳定用户主键是 WorkOS `sub`（user ID）。

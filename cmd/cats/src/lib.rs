@@ -5,6 +5,7 @@
 
 mod auth;
 mod config;
+mod credential_store;
 mod shell;
 
 use std::time::{Duration, Instant};

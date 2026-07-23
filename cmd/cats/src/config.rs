@@ -102,12 +102,9 @@ pub struct Credentials {
 
 impl Credentials {
     pub fn load(api_url: &str) -> Result<Option<Self>> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, api_url)
-            .context("open the operating-system credential store")?;
-        let encoded = match entry.get_password() {
-            Ok(value) => value,
-            Err(keyring::Error::NoEntry) => return Ok(None),
-            Err(error) => return Err(error).context("read Cats login from credential store"),
+        let encoded = match crate::credential_store::get(KEYRING_SERVICE, api_url)? {
+            Some(value) => value,
+            None => return Ok(None),
         };
         Ok(Some(
             serde_json::from_str(&encoded).context("parse Cats login from credential store")?,
@@ -115,20 +112,11 @@ impl Credentials {
     }
 
     pub fn save(&self, api_url: &str) -> Result<()> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, api_url)
-            .context("open the operating-system credential store")?;
-        entry
-            .set_password(&serde_json::to_string(self)?)
-            .context("save Cats login in credential store")
+        crate::credential_store::set(KEYRING_SERVICE, api_url, &serde_json::to_string(self)?)
     }
 
     pub fn delete(api_url: &str) -> Result<()> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, api_url)
-            .context("open the operating-system credential store")?;
-        match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(error).context("delete Cats login from credential store"),
-        }
+        crate::credential_store::delete(KEYRING_SERVICE, api_url)
     }
 }
 
