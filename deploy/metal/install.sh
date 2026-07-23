@@ -18,7 +18,7 @@ echo "==> apt dependencies"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
 apt-get install -qy build-essential curl git nbd-client busybox-static \
-  musl-tools e2fsprogs cpio zstd pkg-config
+  musl-tools e2fsprogs cpio zstd pkg-config debootstrap iptables
 
 echo "==> rust toolchain"
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -51,6 +51,14 @@ modprobe nbd nbds_max=64 || true
 echo nbd > /etc/modules-load.d/cats.conf
 echo "options nbd nbds_max=64" > /etc/modprobe.d/cats-nbd.conf
 
+echo "==> guest outbound network"
+install -m 0755 "$REPO/deploy/metal/setup-guest-network.sh" \
+  "$PREFIX/bin/setup-guest-network"
+printf 'net.ipv4.ip_forward=1\nnet.ipv4.conf.all.rp_filter=1\nnet.ipv4.conf.default.rp_filter=1\n' \
+  > /etc/sysctl.d/90-cats-guest-network.conf
+CATS_GUEST_NETWORK_CIDR=${CATS_GUEST_NETWORK_CIDR:-10.240.0.0/16} \
+  "$PREFIX/bin/setup-guest-network"
+
 echo "==> guest image"
 OUT="$PREFIX/guest" "$REPO/deploy/metal/build-guest-image.sh"
 
@@ -70,5 +78,5 @@ sleep 1
 systemctl --no-pager --lines 0 status cats-controld cats-gatewayd cats-noded | grep -E "●|Active"
 echo
 echo "install complete. Try:"
-echo "  cats create dev --root-size 512MiB && cats exec dev -- uname -a"
+echo "  cats create dev --root-size 1GiB && cats exec dev -- uname -a"
 echo "  deploy/metal/e2e.sh   # full acceptance run"

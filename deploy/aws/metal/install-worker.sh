@@ -14,7 +14,7 @@ CATS_CH_VERSION=${CATS_CH_VERSION:-v53.0}
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
 apt-get install -qy build-essential curl nbd-client busybox-static musl-tools \
-  e2fsprogs cpio zstd pkg-config libssl-dev ca-certificates
+  e2fsprogs cpio zstd pkg-config libssl-dev ca-certificates debootstrap iptables
 
 export PATH="/root/.cargo/bin:$PATH"
 if ! command -v cargo >/dev/null; then
@@ -40,6 +40,13 @@ fi
 modprobe nbd nbds_max=64
 echo nbd > /etc/modules-load.d/cats.conf
 echo "options nbd nbds_max=64" > /etc/modprobe.d/cats-nbd.conf
+
+install -m 0755 "$CATS_REPO/deploy/metal/setup-guest-network.sh" \
+  "$CATS_PREFIX/bin/setup-guest-network"
+printf 'net.ipv4.ip_forward=1\nnet.ipv4.conf.all.rp_filter=1\nnet.ipv4.conf.default.rp_filter=1\n' \
+  > /etc/sysctl.d/90-cats-guest-network.conf
+CATS_GUEST_NETWORK_CIDR=${CATS_GUEST_NETWORK_CIDR:-10.240.0.0/16} \
+  "$CATS_PREFIX/bin/setup-guest-network"
 
 OUT="$CATS_PREFIX/guest" "$CATS_REPO/deploy/metal/build-guest-image.sh"
 curl -fsSL https://truststore.pki.rds.amazonaws.com/us-east-1/us-east-1-bundle.pem \

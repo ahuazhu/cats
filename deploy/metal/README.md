@@ -3,8 +3,8 @@
 Phase A 形态（正确性优先）：Cloud Hypervisor 直接内核启动真 Guest；磁盘链路
 `guest virtio-blk → CH raw disk → /dev/nbdN（内核 NBD client）→ cats-blockd →
 BlobStore port → AWS S3/File adapter`；Guest Agent 走 vsock；Suspended=vm.pause，Warm=vm.snapshot
-+ 全进程退出，Restore=--restore。原生 vhost-user-blk 与 tap Guest 网络是下一
-个性能/网络里程碑，不改变提交协议。
++ 全进程退出，Restore=--restore。每个 Cat 有独立 tap `/30` 和 Host SNAT 出站；
+原生 vhost-user-blk、跨节点 overlay 与公网入站仍是后续里程碑，不改变提交协议。
 
 ## 1. 开机器
 
@@ -49,7 +49,14 @@ sudo systemctl restart cats-noded
 `install.sh` 做的事：apt 依赖、rustup、`cargo build --release`、下载
 cloud-hypervisor 静态二进制（`CH_VERSION` 可覆盖，默认 v53.0，与实验一致）、
 `modprobe nbd nbds_max=64`、构建 Guest 三件套（宿主内核 vmlinuz + 最小
-initramfs + busybox/guest-agent golden rootfs）、装 systemd 单元并启动。
+initramfs + Ubuntu 24.04 minbase/guest-agent golden rootfs）、装 systemd 单元并启动。
+
+Guest 的 BusyBox 只存在于 initramfs，用来加载 virtio/ext4/vsock 并
+`switch_root`。用户进入的是完整 Ubuntu root，默认包含 `apt`、`curl`、`git`、
+`wget`、`iproute2`、`ping`、`procps`、`nano` 和 OpenSSH client。一个负责转发信号和回收
+子进程的轻量 PID 1 会在根盘扩容后直接启动 Guest Agent，Cold 路径无需等待完整
+systemd transaction；systemd 仍保留用于兼容和调试。golden root 默认 512 MiB，
+首次启动会把 ext4 在线扩到用户请求的 RootDisk 大小；因此生产创建建议至少 1 GiB。
 
 ## 4. 验收
 
@@ -58,8 +65,8 @@ sudo deploy/metal/e2e.sh
 ```
 
 断言（全部基于**真实内核 boot_id**）：create→Running、guest 内核版本=直接启
-动的内核、写文件+sync、suspend/resume 同 boot、warm 后无常驻 VMM、restore 同
-boot 且文件在、stop/start 换 boot 且数据从 durable 层恢复、destroy。
+动的内核、DNS/HTTPS 出站、写文件+sync、suspend/resume 同 boot、warm 后无常驻
+VMM、restore 同 boot 且文件在、stop/start 换 boot 且数据从 durable 层恢复、destroy。
 
 2026-07-21 的 AWS i4i.metal + 真实 S3 验收结果与失败诊断记录保存在
 [`experiments/metal-e2e-20260721/`](../../experiments/metal-e2e-20260721/README.md)：
@@ -69,7 +76,8 @@ boot 且文件在、stop/start 换 boot 且数据从 durable 层恢复、destroy
 
 ## 5. 已知边界（Phase A）
 
-- Guest 无 tap 网络（Endpoint/HTTP 演示仅 FakeVmm 形态可用）；exec/健康走 vsock。
+- Guest 已有单节点 tap + SNAT 出站；跨节点私网 overlay 和公网 Endpoint → tap 入站
+  尚未实现。Guest 默认不能访问 Host、VPC 私网或云 metadata；exec/健康仍走 vsock。
 - 磁盘热插拔在 CH 模式暂不支持（停机挂载生效）。
 - 单节点单元（`metal-1`）；多金属节点 = 每台跑 install.sh + 唯一 --node-id，
   指向同一 control plane 与 S3（storage-meta 需共享→生产 PostgreSQL 项）。

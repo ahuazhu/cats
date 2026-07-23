@@ -42,7 +42,7 @@ VM I/O、网络转发和 exec 数据流不经过中央 API 进程。RootDisk/Per
 |----|----|----|----|
 | CLI / API / UI | 只有目标设计；旧控制面代码未迁移 | 统一命名为 `cats`，API 版本化，所有写操作返回 Operation | Greenfield 待实现 |
 | VM | 仓库保存 Cloud Hypervisor bare-metal 生命周期实验和结果 | 固定版本矩阵、节点隔离、cgroup、升级和故障恢复 | 机制已验证，产品代码待实现 |
-| 网络 | 只有目标设计；旧网络原型未迁移 | HA Edge、DNS/TLS 自动化、私网 overlay、策略与限流 | 待实现与重新验证 |
+| 网络 | 单 Node per-Cat tap `/30`、Host SNAT 和敏感目标阻断已实现并在真实 CH Guest 验证 | HA Edge、DNS/TLS 自动化、私网 overlay、策略与限流 | 基础出站已实现；完整网络待实现 |
 | 存储 | 保存 lazy-ext4、JuiceFS-shaped 和 Direct-OS（Direct-S3 实现）实验 | RootDisk + 单写 PersistentDisk、fencing、快照、GC、灾难恢复 | 正确性阻断项 |
 | 控制面数据 | 只有资源模型、事务和 outbox 设计 | PostgreSQL HA、事务 outbox、分区 controller、审计和备份 | 待实现 |
 | SaaS | 只有产品范围和接口设计 | 身份、项目/RBAC、账单、配额、审计和支持流程 | 后续实现 |
@@ -622,6 +622,11 @@ Controller ↔ cat-agent。仅私网/mTLS，传 Job、heartbeat 和结果，不�
 ### Guest 私网
 
 Cat 间和出站网络。Node tap/bridge 接入 routed overlay；网络策略在 Host 执行。
+
+**当前 V1 dev 形态：**Node 为每个 Cat 创建独立 `/30` tap，Guest 地址由 Node
+分配并在启动时配置，Host 使用 SNAT 提供公网出站。Host 本机、RFC1918 私网和云
+metadata 地址在 FORWARD 前显式阻断；跨 Node overlay、项目内服务发现和公网入站
+仍属于后续网络里程碑。
 
 ### 公网服务
 

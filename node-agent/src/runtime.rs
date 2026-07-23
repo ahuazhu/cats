@@ -410,7 +410,6 @@ impl NodeRuntime {
             activity: Arc::new(RuntimeActivity::default()),
             ch: None,
         };
-
         let launch = (|| -> Result<String> {
             for grant in &volumes {
                 let proc = self.spawn_blockd(cat_id, &dir, grant)?;
@@ -472,13 +471,20 @@ impl NodeRuntime {
             );
             rt.ch
                 .as_ref()
-                .map(|c| (c.nbd.clone(), c.snapshot_dir.clone(), rt.boot_id.clone()))
+                .map(|c| {
+                    (
+                        c.nbd.clone(),
+                        c.snapshot_dir.clone(),
+                        rt.boot_id.clone(),
+                        c.network.clone(),
+                    )
+                })
                 .context("warm state missing CH runtime")?
         } else {
             let _ = std::fs::remove_dir_all(&dir);
-            (HashMap::new(), None, None)
+            (HashMap::new(), None, None, None)
         };
-        let (prev_nbd, snapshot_dir, expected_boot) = previous;
+        let (prev_nbd, snapshot_dir, expected_boot, previous_network) = previous;
         if warm_restore {
             self.cats.lock().unwrap().remove(cat_id);
         }
@@ -489,6 +495,7 @@ impl NodeRuntime {
             vsock_sock: short_socket_path(&self.cfg.state_dir, cat_id, "vsock"),
             nbd: HashMap::new(),
             snapshot_dir: None,
+            network: previous_network,
         };
         let mut rt = CatRuntime {
             generation,
@@ -506,6 +513,9 @@ impl NodeRuntime {
             activity: Arc::new(RuntimeActivity::default()),
             ch: None,
         };
+        // Warm may already own a tap from the preserved runtime. Publish the
+        // partial CH state immediately so every failure path can tear it down.
+        rt.ch = Some(chrt.clone());
 
         let launch = (|| -> Result<String> {
             // 1. Block backends.
@@ -534,7 +544,15 @@ impl NodeRuntime {
                 let want = prev_nbd.get(&grant.disk_id).map(|s| s.as_str());
                 let dev = ch::nbd_attach(chc, &rt.blockds[&grant.disk_id].socket, want)?;
                 chrt.nbd.insert(grant.disk_id.clone(), dev.clone());
+                rt.ch = Some(chrt.clone());
                 disks.push(dev);
+            }
+            // Record block devices before any later fallible setup so the
+            // shared failure teardown cannot leak host NBD attachments.
+            rt.ch = Some(chrt.clone());
+            if !warm_restore {
+                chrt.network = ch::prepare_network(chc, cat_id)?;
+                rt.ch = Some(chrt.clone());
             }
             // 4. VMM. Store the child in `rt` immediately so a failure in
             //    readiness/health still lets `teardown` kill it (no orphan
@@ -549,6 +567,7 @@ impl NodeRuntime {
                 memory_mib,
                 disks: &disks,
                 restore_from: snapshot_dir.as_deref(),
+                network: chrt.network.as_ref(),
             })?;
             rt.guest = Some(vmm);
             rt.ch = Some(chrt.clone());
@@ -779,6 +798,9 @@ impl NodeRuntime {
             for dev in chrt.nbd.values() {
                 ch::nbd_detach(chc, dev);
             }
+            if let Some(network) = &chrt.network {
+                ch::remove_network(chc, network);
+            }
         }
         for (_, mut p) in rt.blockds.drain() {
             let _ = p.child.kill();
@@ -787,6 +809,7 @@ impl NodeRuntime {
         }
         if let Some(chrt) = &mut rt.ch {
             chrt.nbd.clear();
+            chrt.network = None;
         }
         let _ = std::fs::remove_file(rt.ctl_socket());
         let _ = std::fs::remove_file(rt.web_socket());

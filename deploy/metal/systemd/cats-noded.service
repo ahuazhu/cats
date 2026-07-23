@@ -4,10 +4,12 @@ After=cats-controld.service
 Wants=cats-controld.service
 
 [Service]
+Environment=CATS_GUEST_NETWORK_CIDR=10.240.0.0/16
 EnvironmentFile=/etc/cats/cats.env
 # Root is required for /dev/kvm, kernel NBD attach and tap devices (Phase A;
 # privilege separation is a hardening milestone).
 ExecStartPre=/usr/sbin/modprobe nbd nbds_max=64
+ExecStartPre=/opt/cats/bin/setup-guest-network
 ExecStart=/opt/cats/bin/cats-noded \
   --node-id metal-1 \
   --listen 127.0.0.1:7301 \
@@ -21,6 +23,7 @@ ExecStart=/opt/cats/bin/cats-noded \
   --ch-kernel /opt/cats/guest/vmlinuz \
   --ch-initramfs /opt/cats/guest/initramfs.img \
   --ch-cmdline "console=ttyS0 root=/dev/vda rw" \
+  --ch-network-cidr $CATS_GUEST_NETWORK_CIDR \
   --ch-seed-image /opt/cats/guest/rootfs.ext4 \
   $CATS_METADATA_STORE_ARGS \
   $CATS_OBJECT_STORE_ARGS

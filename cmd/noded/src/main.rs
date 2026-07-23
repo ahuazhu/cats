@@ -63,6 +63,11 @@ struct Args {
     ch_nbd_client: PathBuf,
     #[arg(long, default_value_t = 64)]
     ch_nbd_devices: u32,
+    /// Optional private /16 split into per-Cat /30 tap networks.
+    #[arg(long)]
+    ch_network_cidr: Option<String>,
+    #[arg(long, default_value = "/usr/sbin/ip")]
+    ch_ip_bin: PathBuf,
 }
 
 #[tokio::main]
@@ -98,6 +103,8 @@ async fn main() -> anyhow::Result<()> {
             seed_image: args.ch_seed_image.clone(),
             nbd_client_bin: args.ch_nbd_client.clone(),
             nbd_devices: args.ch_nbd_devices,
+            network_cidr: args.ch_network_cidr.clone(),
+            ip_bin: args.ch_ip_bin.clone(),
         }),
         other => anyhow::bail!("unknown --vmm {other} (expected fake|ch)"),
     };

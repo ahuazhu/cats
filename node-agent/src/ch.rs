@@ -39,6 +39,18 @@ pub struct ChConfig {
     pub nbd_client_bin: PathBuf,
     /// How many /dev/nbdN devices exist (modprobe nbd nbds_max=...).
     pub nbd_devices: u32,
+    /// Optional private /16 used for per-Cat tap networks (for example
+    /// `10.240.0.0/16`). Host NAT is installed by the deployment scripts.
+    pub network_cidr: Option<String>,
+    pub ip_bin: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChNetwork {
+    pub tap: String,
+    pub mac: String,
+    pub host_ip: String,
+    pub guest_ip: String,
 }
 
 /// Per-cat runtime state that only exists in CH mode.
@@ -49,6 +61,114 @@ pub struct ChRuntime {
     /// disk_id -> /dev/nbdN (order matters for restore).
     pub nbd: HashMap<String, String>,
     pub snapshot_dir: Option<PathBuf>,
+    /// Kept while Warm because the restored VMM reconnects to the same tap.
+    pub network: Option<ChNetwork>,
+}
+
+fn stable_hash(value: &str) -> u64 {
+    // FNV-1a: deterministic across processes and Rust releases, unlike
+    // DefaultHasher. The slot only controls local addressing, never identity.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn network_for(cidr: &str, cat_id: &str) -> Result<ChNetwork> {
+    let (base, prefix) = cidr
+        .split_once('/')
+        .context("--ch-network-cidr must include /16")?;
+    anyhow::ensure!(prefix == "16", "--ch-network-cidr must be a /16");
+    let base: std::net::Ipv4Addr = base.parse().context("invalid --ch-network-cidr")?;
+    let octets = base.octets();
+    anyhow::ensure!(
+        octets[2] == 0 && octets[3] == 0,
+        "--ch-network-cidr must be aligned to a /16"
+    );
+
+    let hash = stable_hash(cat_id);
+    // 16,383 non-overlapping /30s. Slot zero is intentionally unused.
+    let offset = ((hash % 16_383) + 1) as u16 * 4;
+    let third = (offset >> 8) as u8;
+    let fourth = (offset & 0xff) as u8;
+    let host_ip = format!("{}.{}.{}.{}/30", octets[0], octets[1], third, fourth + 1);
+    let guest_ip = format!("{}.{}.{}.{}/30", octets[0], octets[1], third, fourth + 2);
+    Ok(ChNetwork {
+        tap: format!("cat{:011x}", hash & 0x7ff_ffff_ffff),
+        // cats-init derives its address from these final two octets.
+        mac: format!(
+            "02:ca:{:02x}:{:02x}:{third:02x}:{:02x}",
+            octets[0],
+            octets[1],
+            fourth + 2
+        ),
+        host_ip,
+        guest_ip,
+    })
+}
+
+fn ip_status(ip_bin: &Path, args: &[&str]) -> Result<()> {
+    let output = Command::new(ip_bin)
+        .args(args)
+        .output()
+        .with_context(|| format!("run {} {}", ip_bin.display(), args.join(" ")))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "{} {} failed: {}",
+        ip_bin.display(),
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
+}
+
+pub fn prepare_network(cfg: &ChConfig, cat_id: &str) -> Result<Option<ChNetwork>> {
+    let Some(cidr) = cfg.network_cidr.as_deref() else {
+        return Ok(None);
+    };
+    let network = network_for(cidr, cat_id)?;
+    let _ = Command::new(&cfg.ip_bin)
+        .args(["link", "delete", "dev", &network.tap])
+        .output();
+    let addresses = Command::new(&cfg.ip_bin)
+        .args(["-o", "-4", "addr", "show"])
+        .output()
+        .with_context(|| format!("run {} -o -4 addr show", cfg.ip_bin.display()))?;
+    anyhow::ensure!(
+        addresses.status.success(),
+        "{} -o -4 addr show failed: {}",
+        cfg.ip_bin.display(),
+        String::from_utf8_lossy(&addresses.stderr).trim()
+    );
+    let assigned = String::from_utf8_lossy(&addresses.stdout);
+    anyhow::ensure!(
+        !assigned.contains(&format!("inet {}", network.host_ip)),
+        "Cat network address collision for {}",
+        network.host_ip
+    );
+    ip_status(
+        &cfg.ip_bin,
+        &["tuntap", "add", "dev", &network.tap, "mode", "tap"],
+    )?;
+    if let Err(error) = (|| {
+        ip_status(
+            &cfg.ip_bin,
+            &["addr", "add", &network.host_ip, "dev", &network.tap],
+        )?;
+        ip_status(&cfg.ip_bin, &["link", "set", "dev", &network.tap, "up"])
+    })() {
+        remove_network(cfg, &network);
+        return Err(error);
+    }
+    Ok(Some(network))
+}
+
+pub fn remove_network(cfg: &ChConfig, network: &ChNetwork) {
+    let _ = Command::new(&cfg.ip_bin)
+        .args(["link", "delete", "dev", &network.tap])
+        .output();
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +369,7 @@ pub struct ChSpawn<'a> {
     pub disks: &'a [String],
     /// Restore from this snapshot directory instead of a fresh boot.
     pub restore_from: Option<&'a Path>,
+    pub network: Option<&'a ChNetwork>,
 }
 
 pub fn spawn_vmm(s: &ChSpawn<'_>) -> Result<Child> {
@@ -271,6 +392,10 @@ pub fn spawn_vmm(s: &ChSpawn<'_>) -> Result<Child> {
                 .arg(format!("size={}M", s.memory_mib.max(128)));
             cmd.arg("--vsock")
                 .arg(format!("cid=3,socket={}", s.vsock_sock.display()));
+            if let Some(network) = s.network {
+                cmd.arg("--net")
+                    .arg(format!("tap={},mac={}", network.tap, network.mac));
+            }
             // image_type=raw is required: CH v53 otherwise auto-detects raw
             // and enables a sector-0 write protection that fails ext4 writes.
             let mut disk_args: Vec<String> = s
@@ -344,6 +469,26 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
     use std::sync::mpsc;
+
+    #[test]
+    fn cat_network_is_stable_and_encodes_guest_address_in_mac() {
+        let first = network_for("10.240.0.0/16", "cat_60e825c8c6cd").unwrap();
+        let second = network_for("10.240.0.0/16", "cat_60e825c8c6cd").unwrap();
+        assert_eq!(first, second);
+        assert!(first.tap.len() <= 15);
+        let ip = first.guest_ip.trim_end_matches("/30");
+        let octets: Vec<u8> = ip.split('.').map(|part| part.parse().unwrap()).collect();
+        assert!(first.mac.ends_with(&format!(
+            "{:02x}:{:02x}:{:02x}:{:02x}",
+            octets[0], octets[1], octets[2], octets[3]
+        )));
+    }
+
+    #[test]
+    fn cat_network_rejects_non_16_or_unaligned_cidr() {
+        assert!(network_for("10.240.0.0/24", "cat").is_err());
+        assert!(network_for("10.240.1.0/16", "cat").is_err());
+    }
 
     #[test]
     fn ch_api_uses_content_length_without_waiting_for_eof() {

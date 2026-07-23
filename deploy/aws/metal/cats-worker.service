@@ -4,8 +4,10 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+Environment=CATS_GUEST_NETWORK_CIDR=10.240.0.0/16
 EnvironmentFile=/etc/cats/worker.env
 ExecStartPre=/usr/sbin/modprobe nbd nbds_max=64
+ExecStartPre=/opt/cats/bin/setup-guest-network
 ExecStart=/opt/cats/bin/cats-noded \
   --node-id $CATS_NODE_ID \
   --listen 0.0.0.0:7301 \
@@ -26,6 +28,7 @@ ExecStart=/opt/cats/bin/cats-noded \
   --ch-kernel /opt/cats/guest/vmlinuz \
   --ch-initramfs /opt/cats/guest/initramfs.img \
   --ch-cmdline "console=ttyS0 root=/dev/vda rw" \
+  --ch-network-cidr $CATS_GUEST_NETWORK_CIDR \
   --ch-seed-image /opt/cats/guest/rootfs.ext4
 Restart=always
 RestartSec=2

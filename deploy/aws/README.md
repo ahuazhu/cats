@@ -23,6 +23,14 @@ host-wide binary used by another workload. The S3 adapter uses the EC2
 instance role and refreshes its temporary credentials; no long-lived AWS key is
 stored in `worker.env`.
 
+The worker builds an optimized Ubuntu 24.04 Guest: direct kernel, a minimal
+BusyBox initramfs used only for `switch_root`, and an Ubuntu minbase golden root
+with a small reaping PID 1 that starts the Guest Agent without a full systemd
+transaction. The visible Guest includes apt/curl/wget/git; cloud-init, snapd,
+LXD and wait-online are not on the Cold-to-Agent readiness path. Each Cat gets
+an isolated tap `/30` with outbound host NAT; host, VPC-private and cloud
+metadata destinations are blocked before the general egress allow rule.
+
 The control resource database remains SQLite on one encrypted RWO EBS volume,
 so `cats-controld` intentionally has one replica and uses `Recreate`. Shared
 storage metadata is PostgreSQL and is safe across the EKS/metal boundary.

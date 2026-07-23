@@ -21,12 +21,38 @@ echo "== cleanup from previous runs =="
 $CATS destroy $CAT >/dev/null 2>&1
 
 echo "== 1. cold create -> real VM boots =="
-out=$($CATS create $CAT --root-size 512MiB --cpus 1 --memory 512MiB 2>&1)
+cold_create_started_ms=$(date +%s%3N)
+out=$($CATS create $CAT --root-size 1GiB --cpus 1 --memory 512MiB 2>&1)
+cold_create_ms=$(( $(date +%s%3N) - cold_create_started_ms ))
 check "create converges to running" "observed=running" "$out"
+echo "  INFO  create-to-running ${cold_create_ms} ms (single sample; includes scheduling and root seeding)"
 
 guest_kver=$($CATS exec $CAT -- uname -r 2>/dev/null | tr -d ' \n')
 host_kver=$(uname -r)
 check "guest runs the direct-boot kernel" "$host_kver" "$guest_kver"
+
+guest_os=$($CATS exec $CAT -- sh -c '. /etc/os-release && echo "$PRETTY_NAME"' 2>/dev/null)
+check "guest userland is Ubuntu 24.04" "Ubuntu 24.04" "$guest_os"
+
+guest_tools=$($CATS exec $CAT -- sh -c 'command -v apt-get curl git' 2>/dev/null)
+check "guest includes apt, curl and git" "/usr/bin/git" "$guest_tools"
+
+guest_pid1=$($CATS exec $CAT -- cat /proc/1/comm 2>/dev/null | tr -d ' \n')
+check "guest uses the optimized reaping PID 1" "tini" "$guest_pid1"
+guest_agent=$($CATS exec $CAT -- pgrep -f '^/usr/bin/cats-guest-agent( |$)' 2>/dev/null)
+[ -n "$guest_agent" ] && ok "Guest Agent is running" || bad "Guest Agent is not running"
+
+guest_network=$($CATS exec $CAT -- sh -c \
+  'getent ahostsv4 github.com >/dev/null && curl -fsSI --max-time 10 https://github.com | head -n 1' \
+  2>/dev/null)
+check "guest DNS and HTTPS egress work" "200" "$guest_network"
+
+root_bytes=$($CATS exec $CAT -- sh -c "df -B1 --output=size / | tail -1" 2>/dev/null | tr -d ' ')
+if [ "${root_bytes:-0}" -ge 900000000 ]; then
+  ok "guest ext4 root grew to the requested size"
+else
+  bad "guest ext4 root did not grow (reported ${root_bytes:-unknown} bytes)"
+fi
 
 boot1=$(boot_id)
 [ -n "$boot1" ] && ok "guest reports a kernel boot_id ($boot1)" || bad "no boot_id"
@@ -52,7 +78,10 @@ check "file survives warm" "metal-persistent-data" "$($CATS exec $CAT -- cat /da
 
 echo "== 5. stop/start: fresh boot, durable data intact =="
 out=$($CATS stop $CAT 2>&1);     check "stop"    "observed=cold"      "$out"
+cold_start_started_ms=$(date +%s%3N)
 out=$($CATS start $CAT 2>&1);    check "start"   "observed=running"   "$out"
+cold_start_ms=$(( $(date +%s%3N) - cold_start_started_ms ))
+echo "  INFO  cold-to-running ${cold_start_ms} ms (single sample; warm remote/root cache state)"
 boot2=$(boot_id)
 if [ -n "$boot2" ] && [ "$boot2" != "$boot1" ]; then ok "cold start is a fresh boot"; else bad "boot_id did not change on cold start ($boot2)"; fi
 check "flushed data survives cold restart" "metal-persistent-data" "$($CATS exec $CAT -- cat /data.txt 2>/dev/null)"

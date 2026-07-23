@@ -202,7 +202,7 @@
           <tbody>
             <tr><td>CLI / API / UI</td><td>只有目标设计；旧控制面代码未迁移</td><td>统一命名为 <code>cats</code>，API 版本化，所有写操作返回 Operation</td><td><span class="status todo">Greenfield 待实现</span></td></tr>
             <tr><td>VM</td><td>仓库保存 Cloud Hypervisor bare-metal 生命周期实验和结果</td><td>固定版本矩阵、节点隔离、cgroup、升级和故障恢复</td><td><span class="status done">机制已验证，产品代码待实现</span></td></tr>
-            <tr><td>网络</td><td>只有目标设计；旧网络原型未迁移</td><td>HA Edge、DNS/TLS 自动化、私网 overlay、策略与限流</td><td><span class="status target">待实现与重新验证</span></td></tr>
+            <tr><td>网络</td><td>单 Node per-Cat tap <code>/30</code>、Host SNAT 和敏感目标阻断已实现并在真实 CH Guest 验证</td><td>HA Edge、DNS/TLS 自动化、私网 overlay、策略与限流</td><td><span class="status done">基础出站已实现；完整网络待实现</span></td></tr>
             <tr><td>存储</td><td>保存 lazy-ext4、JuiceFS-shaped 和 Direct-OS（Direct-S3 实现）实验</td><td>RootDisk + 单写 PersistentDisk、fencing、快照、GC、灾难恢复</td><td><span class="status target">正确性阻断项</span></td></tr>
             <tr><td>控制面数据</td><td>只有资源模型、事务和 outbox 设计</td><td>PostgreSQL HA、事务 outbox、分区 controller、审计和备份</td><td><span class="status target">待实现</span></td></tr>
             <tr><td>SaaS</td><td>只有产品范围和接口设计</td><td>身份、项目/RBAC、账单、配额、审计和支持流程</td><td><span class="status later">后续实现</span></td></tr>
@@ -578,6 +578,8 @@ COMMIT;
         <article class="card"><h3>Guest 私网</h3><p>Cat 间和出站网络。Node tap/bridge 接入 routed overlay；网络策略在 Host 执行。</p></article>
         <article class="card"><h3>公网服务</h3><p>DNS/TLS/WAF/Edge → owning Node gateway → Guest port，按 Endpoint 独立鉴权和计量。</p></article>
       </div>
+
+      <div class="callout"><strong>当前 V1 dev 形态：</strong>Node 为每个 Cat 创建独立 <code>/30</code> tap，Guest 地址由 Node 分配并在启动时配置，Host 使用 SNAT 提供公网出站。Host 本机、RFC1918 私网和云 metadata 地址在 FORWARD 前显式阻断；跨 Node overlay、项目内服务发现和公网入站仍属于后续网络里程碑。</div>
 
       <h3 style="margin-top:28px">9.1 公网请求路径</h3>
       <div class="flow">
