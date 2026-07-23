@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use anyhow::Context;
 use cats_metadata_store_postgres::PostgresMetadataStoreFactory;
 use cats_metadata_store_sqlite::SqliteMetadataStoreFactory;
 use cats_node_agent::runtime::NodeConfig;
@@ -36,10 +37,12 @@ struct Args {
     object_store_adapter: String,
     #[arg(long = "object-store-option", value_name = "KEY=VALUE")]
     object_store_options: Vec<String>,
-    #[arg(long, default_value_t = 16)]
-    cpus: u32,
-    #[arg(long, default_value_t = 32768)]
-    memory_mib: u64,
+    /// Schedulable logical CPUs. Defaults to the detected host total.
+    #[arg(long, env = "CATS_NODE_CPUS")]
+    cpus: Option<u32>,
+    /// Schedulable memory in MiB. Defaults to the detected host total.
+    #[arg(long, env = "CATS_NODE_MEMORY_MIB")]
+    memory_mib: Option<u64>,
     #[arg(long, default_value_t = 1000)]
     heartbeat_ms: u64,
     #[arg(long, default_value_t = 1500)]
@@ -78,6 +81,21 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    let detected_cpus = std::thread::available_parallelism()
+        .map(|count| u32::try_from(count.get()))
+        .map_err(anyhow::Error::from)??;
+    let detected_memory_mib = detect_host_memory_mib()?;
+    let cpus = args.cpus.unwrap_or(detected_cpus);
+    let memory_mib = args.memory_mib.unwrap_or(detected_memory_mib);
+    anyhow::ensure!(cpus > 0, "--cpus must be greater than zero");
+    anyhow::ensure!(memory_mib > 0, "--memory-mib must be greater than zero");
+    tracing::info!(
+        schedulable_cpus = cpus,
+        schedulable_memory_mib = memory_mib,
+        detected_cpus,
+        detected_memory_mib,
+        "resolved node capacity"
+    );
     let metadata_store = AdapterSelection::new(
         args.metadata_store_adapter,
         AdapterConfig::from_cli(args.metadata_store_options)?,
@@ -114,8 +132,8 @@ async fn main() -> anyhow::Result<()> {
         control_plane_url: args.control_plane_url,
         auth_token: args.auth_token,
         gateway_url: args.gateway_url,
-        cpus: args.cpus,
-        memory_mib: args.memory_mib,
+        cpus,
+        memory_mib,
         heartbeat_ms: args.heartbeat_ms,
         node: NodeConfig {
             node_id: args.node_id,
@@ -133,4 +151,46 @@ async fn main() -> anyhow::Result<()> {
     println!("READY {}", handle.addr);
     std::future::pending::<()>().await;
     Ok(())
+}
+
+fn detect_host_memory_mib() -> anyhow::Result<u64> {
+    if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
+        if let Some(memory_mib) = parse_linux_memory_mib(&contents) {
+            return Ok(memory_mib);
+        }
+    }
+    // SAFETY: sysconf reads process-wide host configuration and does not
+    // dereference pointers. Negative results are checked before conversion.
+    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+    // SAFETY: same as above for the page-size selector.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    anyhow::ensure!(
+        pages > 0 && page_size > 0,
+        "could not detect host memory; pass --memory-mib explicitly"
+    );
+    u64::try_from(pages)
+        .and_then(|pages| u64::try_from(page_size).map(|size| pages.saturating_mul(size)))
+        .map(|bytes| bytes / 1024 / 1024)
+        .context("detected host memory does not fit in u64")
+}
+
+fn parse_linux_memory_mib(contents: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.next()? != "MemTotal:" {
+            return None;
+        }
+        fields.next()?.parse::<u64>().ok().map(|kib| kib / 1024)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn parses_linux_host_memory() {
+        assert_eq!(
+            super::parse_linux_memory_mib("MemTotal:       197659444 kB\nMemFree: 1 kB\n"),
+            Some(193_026)
+        );
+    }
 }

@@ -1,6 +1,10 @@
 //! Node agent HTTP surface + registration/heartbeat loops.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
+use std::mem::MaybeUninit;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -355,31 +359,124 @@ pub fn router(state: NodeState) -> Router {
         .with_state(state)
 }
 
-fn linux_host_telemetry(mut telemetry: NodeTelemetry) -> NodeTelemetry {
-    telemetry.load_average_1m = std::fs::read_to_string("/proc/loadavg")
-        .ok()
-        .and_then(|contents| contents.split_whitespace().next()?.parse().ok());
-    if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
-        for line in contents.lines() {
-            let mut fields = line.split_whitespace();
-            match fields.next() {
-                Some("MemTotal:") => {
-                    telemetry.host_memory_total_mib = fields
-                        .next()
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .map(|kib| kib / 1024);
-                }
-                Some("MemAvailable:") => {
-                    telemetry.host_memory_available_mib = fields
-                        .next()
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .map(|kib| kib / 1024);
-                }
-                _ => {}
-            }
+#[derive(Clone, Copy)]
+struct CpuTimes {
+    total: u64,
+    idle: u64,
+}
+
+fn parse_cpu_times(contents: &str) -> Option<CpuTimes> {
+    let mut fields = contents
+        .lines()
+        .find(|line| line.starts_with("cpu "))?
+        .split_whitespace();
+    if fields.next()? != "cpu" {
+        return None;
+    }
+    let values = fields
+        .take(8)
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if values.len() < 4 {
+        return None;
+    }
+    let total = values.iter().copied().sum();
+    let idle = values[3].saturating_add(values.get(4).copied().unwrap_or(0));
+    Some(CpuTimes { total, idle })
+}
+
+fn cpu_usage_percent(previous: CpuTimes, current: CpuTimes) -> Option<f64> {
+    let total = current.total.checked_sub(previous.total)?;
+    if total == 0 {
+        return None;
+    }
+    let idle = current.idle.saturating_sub(previous.idle).min(total);
+    Some((((total - idle) as f64 / total as f64) * 100.0).clamp(0.0, 100.0))
+}
+
+fn parse_memory_mib(contents: &str) -> (Option<u64>, Option<u64>) {
+    let mut total = None;
+    let mut available = None;
+    for line in contents.lines() {
+        let mut fields = line.split_whitespace();
+        let key = fields.next();
+        let value = fields
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|kib| kib / 1024);
+        match key {
+            Some("MemTotal:") => total = value,
+            Some("MemAvailable:") => available = value,
+            _ => {}
         }
     }
-    telemetry
+    (total, available)
+}
+
+fn filesystem_capacity(path: &FsPath) -> Option<(u64, u64)> {
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stats = MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is a valid NUL-terminated C string and `stats` points to
+    // writable storage for one `statvfs` value. A zero return initializes it.
+    let result = unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: statvfs returned zero, so it initialized the output structure.
+    let stats = unsafe { stats.assume_init() };
+    let block_size = stats.f_frsize;
+    Some((
+        (stats.f_blocks as u64).saturating_mul(block_size),
+        (stats.f_bavail as u64).saturating_mul(block_size),
+    ))
+}
+
+struct HostTelemetrySampler {
+    previous_cpu: Option<CpuTimes>,
+    disk_path: PathBuf,
+}
+
+impl HostTelemetrySampler {
+    fn new(disk_path: PathBuf) -> Self {
+        Self {
+            previous_cpu: std::fs::read_to_string("/proc/stat")
+                .ok()
+                .and_then(|contents| parse_cpu_times(&contents)),
+            disk_path,
+        }
+    }
+
+    fn sample(&mut self, mut telemetry: NodeTelemetry) -> NodeTelemetry {
+        telemetry.host_logical_cpus = std::thread::available_parallelism()
+            .ok()
+            .and_then(|count| u32::try_from(count.get()).ok());
+        telemetry.load_average_1m = std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|contents| contents.split_whitespace().next()?.parse().ok());
+
+        if let Some(current) = std::fs::read_to_string("/proc/stat")
+            .ok()
+            .and_then(|contents| parse_cpu_times(&contents))
+        {
+            telemetry.host_cpu_usage_percent = self
+                .previous_cpu
+                .and_then(|previous| cpu_usage_percent(previous, current));
+            self.previous_cpu = Some(current);
+        }
+
+        if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
+            (
+                telemetry.host_memory_total_mib,
+                telemetry.host_memory_available_mib,
+            ) = parse_memory_mib(&contents);
+        }
+        if let Some((total, available)) = filesystem_capacity(&self.disk_path) {
+            telemetry.host_disk_total_bytes = Some(total);
+            telemetry.host_disk_available_bytes = Some(available);
+        }
+        telemetry
+    }
 }
 
 /// Start the node agent: HTTP server + registration + heartbeat loop.
@@ -452,6 +549,7 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
     let hb_cp = cp.clone();
     let hb_token = token.clone();
     let interval = Duration::from_millis(cfg.heartbeat_ms);
+    let mut telemetry_sampler = HostTelemetrySampler::new(cfg.node.state_dir.clone());
     let heartbeat = tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
@@ -471,7 +569,7 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
                 .json(&HeartbeatRequest {
                     node_id: hb_state.cfg.node.node_id.clone(),
                     cats,
-                    telemetry: Some(linux_host_telemetry(hb_state.runtime.telemetry())),
+                    telemetry: Some(telemetry_sampler.sample(hb_state.runtime.telemetry())),
                 })
                 .send()
                 .await;
@@ -525,4 +623,34 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
         state,
         tasks: vec![server, heartbeat, activity_watchers],
     })
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::{cpu_usage_percent, filesystem_capacity, parse_cpu_times, parse_memory_mib};
+
+    #[test]
+    fn parses_cpu_and_calculates_interval_usage() {
+        let previous = parse_cpu_times("cpu  100 0 50 800 50 0 0 0 0 0\n").unwrap();
+        let current = parse_cpu_times("cpu  130 0 70 850 50 0 0 0 0 0\n").unwrap();
+        let usage = cpu_usage_percent(previous, current).unwrap();
+        assert!((usage - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parses_linux_memory_values_as_mib() {
+        let (total, available) = parse_memory_mib(
+            "MemTotal:       197659444 kB\nMemFree: 100 kB\nMemAvailable: 70158328 kB\n",
+        );
+        assert_eq!(total, Some(193_026));
+        assert_eq!(available, Some(68_513));
+    }
+
+    #[test]
+    fn reads_capacity_for_an_existing_filesystem() {
+        let temp = tempfile::tempdir().unwrap();
+        let (total, available) = filesystem_capacity(temp.path()).unwrap();
+        assert!(total > 0);
+        assert!(available <= total);
+    }
 }

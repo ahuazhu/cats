@@ -203,11 +203,19 @@ pub struct NodeTelemetry {
     pub allocated_cpus: u32,
     pub allocated_memory_mib: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_logical_cpus: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_cpu_usage_percent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_average_1m: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_memory_total_mib: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_memory_available_mib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_disk_total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_disk_available_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,6 +310,24 @@ pub struct FleetCapacity {
     pub assigned_memory_mib: u64,
 }
 
+/// Actual host resource use aggregated from the latest node heartbeats.
+/// Missing samples remain `None` rather than being presented as zero use.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FleetUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_cpus: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_usage_percent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_used_mib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_total_mib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_used_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_total_bytes: Option<u64>,
+}
+
 /// JSON monitoring snapshot exposed to administrators.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonitoringOverview {
@@ -310,6 +336,7 @@ pub struct MonitoringOverview {
     pub nodes: NodeStateCounts,
     pub operations: OperationCounts,
     pub capacity: FleetCapacity,
+    pub usage: FleetUsage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

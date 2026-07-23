@@ -147,9 +147,13 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
                         observed_cats,
                         allocated_cpus: 0,
                         allocated_memory_mib: 0,
+                        host_logical_cpus: Some(16),
+                        host_cpu_usage_percent: Some(12.5),
                         load_average_1m: Some(0.25),
                         host_memory_total_mib: Some(32_768),
                         host_memory_available_mib: Some(24_576),
+                        host_disk_total_bytes: Some(100 * 1024 * 1024 * 1024),
+                        host_disk_available_bytes: Some(75 * 1024 * 1024 * 1024),
                     }),
                 })
                 .send()
@@ -1003,6 +1007,14 @@ async fn admin_can_monitor_and_drain_nodes() {
     assert_eq!(overview.cats.running, 1);
     assert_eq!(overview.capacity.total_cpus, 32);
     assert_eq!(overview.capacity.assigned_cpus, 2);
+    assert_eq!(overview.usage.logical_cpus, Some(32));
+    assert_eq!(overview.usage.cpu_usage_percent, Some(12.5));
+    assert_eq!(overview.usage.memory_total_mib, Some(65_536));
+    assert_eq!(overview.usage.memory_used_mib, Some(16_384));
+    assert_eq!(
+        overview.usage.disk_used_bytes,
+        Some(50 * 1024 * 1024 * 1024)
+    );
 
     let prometheus = ctx
         .http
@@ -1018,6 +1030,8 @@ async fn admin_can_monitor_and_drain_nodes() {
         .unwrap();
     assert!(prometheus.contains("cats_control_plane_cats_running 1"));
     assert!(prometheus.contains("cats_node_load_average_1m{node_id=\"node_a\"} 0.25"));
+    assert!(prometheus.contains("cats_node_cpu_usage_percent{node_id=\"node_a\"} 12.5"));
+    assert!(prometheus.contains("cats_node_disk_used_bytes{node_id=\"node_a\"} 26843545600"));
 
     let drain = ctx
         .http

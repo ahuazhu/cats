@@ -617,7 +617,9 @@ dependencies = [
  "cats-node-agent",
  "cats-storage",
  "clap",
+ "libc",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 

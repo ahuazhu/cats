@@ -34,6 +34,12 @@ Every Cat receives a stable wildcard HTTPS Endpoint for Guest port 8080; the
 ALB sends wildcard hosts to `cats-gatewayd`, which resolves the owning worker
 and the worker connects the service through that Cat's tap address.
 
+`cats-noded` detects the host's logical CPU and memory totals when it starts;
+the administrator console reports those schedulable totals plus sampled host
+CPU, memory and state-filesystem disk utilization. `CATS_NODE_CPUS` and
+`CATS_NODE_MEMORY_MIB` are optional lower scheduling ceilings for hosts that
+reserve resources for other workloads.
+
 The control resource database remains SQLite on one encrypted RWO EBS volume,
 so `cats-controld` intentionally has one replica and uses `Recreate`. Shared
 storage metadata is PostgreSQL and is safe across the EKS/metal boundary.

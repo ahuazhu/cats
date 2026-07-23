@@ -17,6 +17,8 @@ cats-metadata-store-postgres = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
+libc = { workspace = true }
+tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [lints]

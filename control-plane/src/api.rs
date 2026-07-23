@@ -1429,6 +1429,16 @@ fn monitoring_snapshot(state: &AppState) -> crate::store::Result<MonitoringOverv
     let summaries = state.store.list_node_summaries()?;
     let mut node_counts = NodeStateCounts::default();
     let mut capacity = FleetCapacity::default();
+    let mut usage = FleetUsage::default();
+    let mut cpu_weighted_sum = 0.0;
+    let mut cpu_weight = 0_u64;
+    let mut logical_cpus = 0_u64;
+    let mut memory_total = 0_u64;
+    let mut memory_available = 0_u64;
+    let mut memory_samples = 0_u64;
+    let mut disk_total = 0_u64;
+    let mut disk_available = 0_u64;
+    let mut disk_samples = 0_u64;
     for summary in &summaries {
         node_counts.total += 1;
         match summary.node.state {
@@ -1441,6 +1451,57 @@ fn monitoring_snapshot(state: &AppState) -> crate::store::Result<MonitoringOverv
         capacity.total_memory_mib += summary.node.capacity.memory_mib;
         capacity.assigned_cpus += u64::from(summary.assigned_cpus);
         capacity.assigned_memory_mib += summary.assigned_memory_mib;
+
+        if summary.node.state == NodeState::Lost {
+            continue;
+        }
+        let Some(telemetry) = &summary.node.telemetry else {
+            continue;
+        };
+        if let Some(count) = telemetry.host_logical_cpus {
+            logical_cpus += u64::from(count);
+        }
+        if let Some(percent) = telemetry.host_cpu_usage_percent {
+            let weight = u64::from(
+                telemetry
+                    .host_logical_cpus
+                    .unwrap_or(summary.node.capacity.cpus),
+            );
+            if weight > 0 {
+                cpu_weighted_sum += percent.clamp(0.0, 100.0) * weight as f64;
+                cpu_weight += weight;
+            }
+        }
+        if let (Some(total), Some(available)) = (
+            telemetry.host_memory_total_mib,
+            telemetry.host_memory_available_mib,
+        ) {
+            memory_total = memory_total.saturating_add(total);
+            memory_available = memory_available.saturating_add(available.min(total));
+            memory_samples += 1;
+        }
+        if let (Some(total), Some(available)) = (
+            telemetry.host_disk_total_bytes,
+            telemetry.host_disk_available_bytes,
+        ) {
+            disk_total = disk_total.saturating_add(total);
+            disk_available = disk_available.saturating_add(available.min(total));
+            disk_samples += 1;
+        }
+    }
+    if cpu_weight > 0 {
+        usage.cpu_usage_percent = Some(cpu_weighted_sum / cpu_weight as f64);
+    }
+    if logical_cpus > 0 {
+        usage.logical_cpus = Some(logical_cpus);
+    }
+    if memory_samples > 0 {
+        usage.memory_total_mib = Some(memory_total);
+        usage.memory_used_mib = Some(memory_total.saturating_sub(memory_available));
+    }
+    if disk_samples > 0 {
+        usage.disk_total_bytes = Some(disk_total);
+        usage.disk_used_bytes = Some(disk_total.saturating_sub(disk_available));
     }
 
     Ok(MonitoringOverview {
@@ -1449,6 +1510,7 @@ fn monitoring_snapshot(state: &AppState) -> crate::store::Result<MonitoringOverv
         nodes: node_counts,
         operations: state.store.operation_counts()?,
         capacity,
+        usage,
     })
 }
 
@@ -1521,6 +1583,24 @@ async fn prometheus_metrics(
         "cats_control_plane_capacity_assigned_memory_mib",
         overview.capacity.assigned_memory_mib
     );
+    if let Some(percent) = overview.usage.cpu_usage_percent {
+        metric!("cats_control_plane_host_cpu_usage_percent", percent);
+    }
+    if let Some(logical_cpus) = overview.usage.logical_cpus {
+        metric!("cats_control_plane_host_logical_cpus", logical_cpus);
+    }
+    if let Some(total) = overview.usage.memory_total_mib {
+        metric!("cats_control_plane_host_memory_total_mib", total);
+    }
+    if let Some(used) = overview.usage.memory_used_mib {
+        metric!("cats_control_plane_host_memory_used_mib", used);
+    }
+    if let Some(total) = overview.usage.disk_total_bytes {
+        metric!("cats_control_plane_host_disk_total_bytes", total);
+    }
+    if let Some(used) = overview.usage.disk_used_bytes {
+        metric!("cats_control_plane_host_disk_used_bytes", used);
+    }
     for summary in state.store.list_node_summaries()? {
         let node_id = summary
             .node
@@ -1546,6 +1626,18 @@ async fn prometheus_metrics(
                 format!("cats_node_allocated_memory_mib{{node_id=\"{node_id}\"}}"),
                 telemetry.allocated_memory_mib
             );
+            if let Some(logical_cpus) = telemetry.host_logical_cpus {
+                metric!(
+                    format!("cats_node_logical_cpus{{node_id=\"{node_id}\"}}"),
+                    logical_cpus
+                );
+            }
+            if let Some(percent) = telemetry.host_cpu_usage_percent {
+                metric!(
+                    format!("cats_node_cpu_usage_percent{{node_id=\"{node_id}\"}}"),
+                    percent
+                );
+            }
             if let Some(load) = telemetry.load_average_1m {
                 metric!(
                     format!("cats_node_load_average_1m{{node_id=\"{node_id}\"}}"),
@@ -1563,6 +1655,30 @@ async fn prometheus_metrics(
                     format!("cats_node_memory_total_mib{{node_id=\"{node_id}\"}}"),
                     total
                 );
+                if let Some(available) = telemetry.host_memory_available_mib {
+                    metric!(
+                        format!("cats_node_memory_used_mib{{node_id=\"{node_id}\"}}"),
+                        total.saturating_sub(available.min(total))
+                    );
+                }
+            }
+            if let Some(available) = telemetry.host_disk_available_bytes {
+                metric!(
+                    format!("cats_node_disk_available_bytes{{node_id=\"{node_id}\"}}"),
+                    available
+                );
+            }
+            if let Some(total) = telemetry.host_disk_total_bytes {
+                metric!(
+                    format!("cats_node_disk_total_bytes{{node_id=\"{node_id}\"}}"),
+                    total
+                );
+                if let Some(available) = telemetry.host_disk_available_bytes {
+                    metric!(
+                        format!("cats_node_disk_used_bytes{{node_id=\"{node_id}\"}}"),
+                        total.saturating_sub(available.min(total))
+                    );
+                }
             }
         }
     }

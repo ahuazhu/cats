@@ -61,6 +61,10 @@ Guest 的 BusyBox 只存在于 initramfs，用来加载 virtio/ext4/vsock 并
 systemd transaction；systemd 仍保留用于兼容和调试。golden root 默认 512 MiB，
 首次启动会把 ext4 在线扩到用户请求的 RootDisk 大小；因此生产创建建议至少 1 GiB。
 
+`cats-noded` 启动时默认探测 Host 的逻辑 CPU 与内存总量作为可调度容量；管理员页面
+同时展示 Host CPU、内存和节点状态目录所在文件系统的实时使用量。若需要给 Host
+保留资源，可在环境文件中设置 `CATS_NODE_CPUS` / `CATS_NODE_MEMORY_MIB` 降低调度上限。
+
 ## 4. 验收
 
 ```bash

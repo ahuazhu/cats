@@ -1,5 +1,6 @@
 import {
   escapeHtml,
+  formatBytes,
   formatTime,
   initNavigation,
   metricCard,
@@ -109,9 +110,23 @@ function percentage(assigned, total) {
   return total ? Math.min(100, Math.round((assigned / total) * 100)) : 0;
 }
 
-function capacityItem(label, assigned, total, unit) {
+function formatPercent(value) {
+  if (value == null || !Number.isFinite(Number(value))) return "—";
+  return `${Number(value).toFixed(1)}%`;
+}
+
+function formatMib(value) {
+  return formatBytes(Number(value || 0) * 1024 * 1024);
+}
+
+function usageDetail(used, total, formatter) {
+  if (used == null || total == null) return t("admin.metric.telemetryUnavailable");
+  return `${formatter(used)} / ${formatter(total)}`;
+}
+
+function capacityItem(label, assigned, total, formatter) {
   const used = percentage(assigned, total);
-  return `<article class="capacity-item"><header><strong>${escapeHtml(label)}</strong><span>${escapeHtml(assigned)} / ${escapeHtml(total)} ${escapeHtml(unit)} · ${used}%</span></header><progress class="progress" max="100" value="${used}">${used}%</progress></article>`;
+  return `<article class="capacity-item"><header><strong>${escapeHtml(label)}</strong><span>${escapeHtml(formatter(assigned))} / ${escapeHtml(formatter(total))} · ${used}%</span></header><progress class="progress" max="100" value="${used}">${used}%</progress></article>`;
 }
 
 function lifecycleRow(label, value, total) {
@@ -122,16 +137,19 @@ function lifecycleRow(label, value, total) {
 function render() {
   if (!state.overview) return;
   const overview = state.overview;
+  const usage = overview.usage || {};
   document.querySelector("#admin-metrics").innerHTML = [
     metricCard(t("admin.metric.fleetNodes"), overview.nodes.total, t("admin.metric.nodeDetail", { ready: overview.nodes.ready, lost: overview.nodes.lost })),
     metricCard(t("admin.metric.totalCats"), overview.cats.total, t("admin.metric.running", { count: overview.cats.running })),
-    metricCard(t("admin.metric.cpuAllocation"), `${percentage(overview.capacity.assigned_cpus, overview.capacity.total_cpus)}%`, `${overview.capacity.assigned_cpus} / ${overview.capacity.total_cpus} CPU`),
+    metricCard(t("admin.metric.cpuUsage"), formatPercent(usage.cpu_usage_percent), t("admin.metric.cpuDetail", { logical: usage.logical_cpus ?? overview.capacity.total_cpus, assigned: overview.capacity.assigned_cpus })),
+    metricCard(t("admin.metric.memoryUsage"), formatPercent(usage.memory_total_mib == null ? null : (usage.memory_used_mib / usage.memory_total_mib) * 100), usageDetail(usage.memory_used_mib, usage.memory_total_mib, formatMib)),
+    metricCard(t("admin.metric.diskUsage"), formatPercent(usage.disk_total_bytes == null ? null : (usage.disk_used_bytes / usage.disk_total_bytes) * 100), usageDetail(usage.disk_used_bytes, usage.disk_total_bytes, formatBytes)),
     metricCard(t("admin.metric.activeOperations"), overview.operations.pending + overview.operations.running, t("admin.metric.failed", { count: overview.operations.failed })),
   ].join("");
   document.querySelector("#generated-at").textContent = t("admin.generatedAt", { time: formatTime(overview.generated_at_unix) });
   document.querySelector("#capacity-grid").innerHTML = [
-    capacityItem("CPU", overview.capacity.assigned_cpus, overview.capacity.total_cpus, t("admin.unit.cores")),
-    capacityItem(t("common.memory"), overview.capacity.assigned_memory_mib, overview.capacity.total_memory_mib, "MiB"),
+    capacityItem("CPU", overview.capacity.assigned_cpus, overview.capacity.total_cpus, (value) => `${value} ${t("admin.unit.vcpus")}`),
+    capacityItem(t("common.memory"), overview.capacity.assigned_memory_mib, overview.capacity.total_memory_mib, formatMib),
   ].join("");
   document.querySelector("#lifecycle-summary").innerHTML = `<div class="lifecycle-list">${[
     [t("status.running"), overview.cats.running],
@@ -162,9 +180,33 @@ function nodeActions(summary) {
 }
 
 function telemetryText(telemetry) {
-  if (!telemetry) return "—";
+  if (!telemetry) return ["—"];
   const load = telemetry.load_average_1m == null ? "n/a" : Number(telemetry.load_average_1m).toFixed(2);
-  return t("admin.node.load", { count: telemetry.observed_cats, load });
+  const cpu = formatPercent(telemetry.host_cpu_usage_percent);
+  const logicalCpus = telemetry.host_logical_cpus ?? "—";
+  const memoryTotal = telemetry.host_memory_total_mib;
+  const memoryUsed = memoryTotal == null || telemetry.host_memory_available_mib == null
+    ? null
+    : Math.max(0, memoryTotal - telemetry.host_memory_available_mib);
+  const memoryPercent = memoryUsed == null || !memoryTotal
+    ? null
+    : (memoryUsed / memoryTotal) * 100;
+  const diskTotal = telemetry.host_disk_total_bytes;
+  const diskUsed = diskTotal == null || telemetry.host_disk_available_bytes == null
+    ? null
+    : Math.max(0, diskTotal - telemetry.host_disk_available_bytes);
+  const diskPercent = diskUsed == null || !diskTotal ? null : (diskUsed / diskTotal) * 100;
+  const lines = [
+    t("admin.node.cpu", { percent: cpu, logical: logicalCpus, load }),
+    memoryUsed == null
+      ? t("admin.node.memoryUnavailable")
+      : t("admin.node.memoryUsage", { used: formatMib(memoryUsed), total: formatMib(memoryTotal), percent: formatPercent(memoryPercent) }),
+    diskUsed == null
+      ? t("admin.node.diskUnavailable")
+      : t("admin.node.diskUsage", { used: formatBytes(diskUsed), total: formatBytes(diskTotal), percent: formatPercent(diskPercent) }),
+    t("admin.node.observedCats", { count: telemetry.observed_cats }),
+  ];
+  return lines;
 }
 
 function renderNodes() {
@@ -175,10 +217,10 @@ function renderNodes() {
   body.innerHTML = state.nodes.map((summary) => `<tr>
     <td><div class="resource-name"><span class="resource-avatar node-avatar">N</span><span><strong>${escapeHtml(summary.node.id)}</strong><small>${escapeHtml(summary.node.agent_url)}</small></span></div></td>
     <td>${statusBadge(summary.node.state)}</td>
-    <td>${escapeHtml(summary.assigned_cats)} Cats<br><small>${escapeHtml(summary.assigned_cpus)} CPU · ${escapeHtml(summary.assigned_memory_mib)} MiB</small></td>
-    <td>${escapeHtml(summary.node.capacity.cpus)} CPU · ${escapeHtml(summary.node.capacity.memory_mib)} MiB</td>
+    <td>${escapeHtml(summary.assigned_cats)} Cats<br><small>${escapeHtml(summary.assigned_cpus)} vCPU · ${escapeHtml(formatMib(summary.assigned_memory_mib))}</small></td>
+    <td>${escapeHtml(summary.node.capacity.cpus)} vCPU · ${escapeHtml(formatMib(summary.node.capacity.memory_mib))}</td>
     <td>${escapeHtml(t("admin.node.secondsAgo", { seconds: summary.heartbeat_age_seconds }))}<br><small>${formatTime(summary.node.last_heartbeat_unix)}</small></td>
-    <td>${escapeHtml(telemetryText(summary.node.telemetry))}</td>
+    <td>${telemetryText(summary.node.telemetry).map((line) => escapeHtml(line)).join("<br>")}</td>
     <td><div class="row-actions">${nodeActions(summary)}</div></td>
   </tr>`).join("");
 }
