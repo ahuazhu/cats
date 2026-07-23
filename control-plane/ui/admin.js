@@ -179,11 +179,19 @@ function nodeActions(summary) {
   return actions.map(([action, label]) => `<button class="mini-button ${action === "delete" ? "danger" : ""}" data-node-action="${action}" data-node="${escapeHtml(summary.node.id)}">${label}</button>`).join("");
 }
 
-function telemetryText(telemetry) {
-  if (!telemetry) return ["—"];
-  const load = telemetry.load_average_1m == null ? "n/a" : Number(telemetry.load_average_1m).toFixed(2);
-  const cpu = formatPercent(telemetry.host_cpu_usage_percent);
-  const logicalCpus = telemetry.host_logical_cpus ?? "—";
+function telemetryMeter(label, value, detail = "") {
+  const numeric = value == null || !Number.isFinite(Number(value))
+    ? null
+    : Math.max(0, Math.min(100, Number(value)));
+  return `<div class="telemetry-meter ${numeric == null ? "is-unavailable" : ""}">
+    <header><span>${escapeHtml(label)}</span><strong>${escapeHtml(formatPercent(numeric))}</strong></header>
+    <progress max="100" value="${numeric ?? 0}">${escapeHtml(formatPercent(numeric))}</progress>
+    <small>${escapeHtml(detail)}</small>
+  </div>`;
+}
+
+function telemetrySummary(telemetry) {
+  if (!telemetry) return "—";
   const memoryTotal = telemetry.host_memory_total_mib;
   const memoryUsed = memoryTotal == null || telemetry.host_memory_available_mib == null
     ? null
@@ -196,17 +204,11 @@ function telemetryText(telemetry) {
     ? null
     : Math.max(0, diskTotal - telemetry.host_disk_available_bytes);
   const diskPercent = diskUsed == null || !diskTotal ? null : (diskUsed / diskTotal) * 100;
-  const lines = [
-    t("admin.node.cpu", { percent: cpu, logical: logicalCpus, load }),
-    memoryUsed == null
-      ? t("admin.node.memoryUnavailable")
-      : t("admin.node.memoryUsage", { used: formatMib(memoryUsed), total: formatMib(memoryTotal), percent: formatPercent(memoryPercent) }),
-    diskUsed == null
-      ? t("admin.node.diskUnavailable")
-      : t("admin.node.diskUsage", { used: formatBytes(diskUsed), total: formatBytes(diskTotal), percent: formatPercent(diskPercent) }),
-    t("admin.node.observedCats", { count: telemetry.observed_cats }),
-  ];
-  return lines;
+  return `<div class="telemetry-summary">
+    ${telemetryMeter(t("admin.node.cpuLabel"), telemetry.host_cpu_usage_percent)}
+    ${telemetryMeter(t("admin.node.memoryLabel"), memoryPercent, memoryUsed == null ? "" : `${formatMib(memoryUsed)} / ${formatMib(memoryTotal)}`)}
+    ${telemetryMeter(t("admin.node.diskLabel"), diskPercent, diskUsed == null ? "" : `${formatBytes(diskUsed)} / ${formatBytes(diskTotal)}`)}
+  </div>`;
 }
 
 function renderNodes() {
@@ -220,7 +222,7 @@ function renderNodes() {
     <td>${escapeHtml(summary.assigned_cats)} Cats<br><small>${escapeHtml(summary.assigned_cpus)} vCPU · ${escapeHtml(formatMib(summary.assigned_memory_mib))}</small></td>
     <td>${escapeHtml(summary.node.capacity.cpus)} vCPU · ${escapeHtml(formatMib(summary.node.capacity.memory_mib))}</td>
     <td>${escapeHtml(t("admin.node.secondsAgo", { seconds: summary.heartbeat_age_seconds }))}<br><small>${formatTime(summary.node.last_heartbeat_unix)}</small></td>
-    <td>${telemetryText(summary.node.telemetry).map((line) => escapeHtml(line)).join("<br>")}</td>
+    <td class="host-telemetry-cell">${telemetrySummary(summary.node.telemetry)}</td>
     <td><div class="row-actions">${nodeActions(summary)}</div></td>
   </tr>`).join("");
 }

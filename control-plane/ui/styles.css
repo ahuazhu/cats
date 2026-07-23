@@ -181,6 +181,18 @@ tbody tr:hover { background: #fbfcfb; }
 .mini-button { min-height: 29px; padding: 0 9px; border: 1px solid var(--line); border-radius: 8px; background: white; color: #566159; cursor: pointer; font-size: 9px; font-weight: 750; }
 .mini-button:hover { border-color: #aebbb1; color: var(--green); }
 .mini-button.danger:hover { border-color: #e5b7b2; color: var(--red); }
+.host-telemetry-cell { min-width: 360px; }
+.telemetry-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 15px; }
+.telemetry-meter { min-width: 0; }
+.telemetry-meter header { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.telemetry-meter header span { color: var(--muted); font-size: 9px; font-weight: 750; }
+.telemetry-meter header strong { color: var(--ink); font-size: 11px; }
+.telemetry-meter progress { width: 100%; height: 4px; display: block; margin: 6px 0 5px; overflow: hidden; border: 0; border-radius: 999px; appearance: none; background: #e9edf3; }
+.telemetry-meter progress::-webkit-progress-bar { border-radius: 999px; background: #e9edf3; }
+.telemetry-meter progress::-webkit-progress-value { border-radius: 999px; background: var(--admin); }
+.telemetry-meter progress::-moz-progress-bar { border-radius: 999px; background: var(--admin); }
+.telemetry-meter small { min-height: 12px; display: block; overflow: hidden; color: var(--muted); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.telemetry-meter.is-unavailable { opacity: .55; }
 .empty-state { padding: 52px 24px; text-align: center; }
 .empty-state > span { width: 45px; height: 45px; display: grid; margin: auto; place-items: center; border-radius: 14px; background: var(--surface-soft); color: #8e9991; font-size: 22px; }
 .empty-state h3 { margin: 13px 0 7px; font-size: 15px; }
