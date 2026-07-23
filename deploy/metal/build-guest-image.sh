@@ -304,7 +304,7 @@ fi
 EOF
   fi
 done
-if ! grep -q 'CATS_READLINE' "$RF/etc/inputrc"; then
+if [[ ! -f "$RF/etc/inputrc" ]] || ! grep -q 'CATS_READLINE' "$RF/etc/inputrc"; then
   cat >> "$RF/etc/inputrc" <<'EOF'
 
 # CATS_READLINE
