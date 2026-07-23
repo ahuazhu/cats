@@ -246,7 +246,7 @@ impl Ctx {
         format!("{}{path}", self.base)
     }
 
-    async fn login(&self, site: &str, code: &str) -> String {
+    async fn begin_login(&self, site: &str) -> (String, String) {
         let path = if site == "user" {
             "/auth/login?site=user&return_to=/user/"
         } else {
@@ -280,7 +280,11 @@ impl Ctx {
             .unwrap()
             .1
             .into_owned();
+        (flow_cookie, state)
+    }
 
+    async fn login(&self, site: &str, code: &str) -> String {
+        let (flow_cookie, state) = self.begin_login(site).await;
         let callback = self
             .http
             .get(self.url(&format!("/auth/callback?code={code}&state={state}")))
@@ -512,6 +516,50 @@ async fn workos_callback_rejects_tampered_state_before_code_exchange() {
         .unwrap();
     assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(ctx.exchanges.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn workos_callback_returns_auth_failures_to_the_originating_site() {
+    let ctx = Ctx::new().await;
+
+    let (user_flow_cookie, user_state) = ctx.begin_login("user").await;
+    let cancelled = ctx
+        .http
+        .get(ctx.url(&format!(
+            "/auth/callback?error=access_denied&state={user_state}"
+        )))
+        .header("Cookie", user_flow_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        cancelled.headers().get(LOCATION).unwrap(),
+        "/user/?auth_error=authentication_failed"
+    );
+    assert_eq!(ctx.exchanges.load(Ordering::SeqCst), 0);
+
+    let (admin_flow_cookie, admin_state) = ctx.begin_login("admin").await;
+    let unauthorized = ctx
+        .http
+        .get(ctx.url(&format!(
+            "/auth/callback?code=new-user-code&state={admin_state}"
+        )))
+        .header("Cookie", admin_flow_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        unauthorized.headers().get(LOCATION).unwrap(),
+        "/admin/?auth_error=admin_access_required"
+    );
+    assert!(unauthorized
+        .headers()
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| value.starts_with("cats_admin_auth_flow=") && value.contains("Max-Age=0")));
 }
 
 #[tokio::test]

@@ -622,16 +622,6 @@ pub async fn callback(
         .workos
         .as_ref()
         .ok_or_else(|| ApiError::failed_precondition("WorkOS AuthKit is not configured"))?;
-    if let Some(error) = query.error {
-        return Err(ApiError::new(
-            cats_api::error::ErrorCode::Unauthenticated,
-            format!("WorkOS authentication was not completed: {error}"),
-        )
-        .into());
-    }
-    let code = query
-        .code
-        .ok_or_else(|| ApiError::invalid("missing WorkOS authorization code"))?;
     let returned_state = query
         .state
         .ok_or_else(|| ApiError::invalid("missing WorkOS state"))?;
@@ -658,6 +648,13 @@ pub async fn callback(
         )
         .into());
     }
+    if let Some(error) = query.error {
+        tracing::warn!(site = ?flow.site, error, "WorkOS authentication was not completed");
+        return auth_error_redirect(config, &flow, "authentication_failed");
+    }
+    let code = query
+        .code
+        .ok_or_else(|| ApiError::invalid("missing WorkOS authorization code"))?;
 
     let auth = config
         .client
@@ -679,11 +676,11 @@ pub async fn callback(
         .as_deref()
         .is_some_and(|expected| auth.organization_id.as_deref() != Some(expected))
     {
-        return Err(ApiError::new(
-            cats_api::error::ErrorCode::PermissionDenied,
-            "WorkOS session organization does not match the requested workspace",
-        )
-        .into());
+        tracing::warn!(
+            site = ?flow.site,
+            "WorkOS session organization does not match the requested scope"
+        );
+        return auth_error_redirect(config, &flow, identity_error_code(flow.site));
     }
     let sealed_session = seal_session(
         &SessionData {
@@ -697,7 +694,14 @@ pub async fn callback(
     .map_err(|error| ApiError::internal(format!("seal WorkOS session: {error}")))?;
     let session =
         SessionManager::new(None, &sealed_session, &config.cookie_password).authenticate();
-    validate_flow_identity(config, &flow, &session)?;
+    if let Err(error) = validate_flow_identity(config, &flow, &session) {
+        tracing::warn!(
+            site = ?flow.site,
+            error = %error.0,
+            "WorkOS session is not authorized for the requested site"
+        );
+        return auth_error_redirect(config, &flow, identity_error_code(flow.site));
+    }
 
     let mut response = Redirect::to(&flow.return_to).into_response();
     append_set_cookie(
@@ -708,6 +712,35 @@ pub async fn callback(
         config.cookie_secure,
         config.cookie_domain.as_deref(),
     )?;
+    append_delete_cookie(
+        &mut response,
+        flow.site.flow_cookie(),
+        config.cookie_secure,
+        config.cookie_domain.as_deref(),
+    )?;
+    set_no_store(&mut response);
+    Ok(response)
+}
+
+fn identity_error_code(site: Site) -> &'static str {
+    match site {
+        Site::User => "workspace_access_required",
+        Site::Admin => "admin_access_required",
+    }
+}
+
+fn auth_error_redirect(
+    config: &WorkOsConfig,
+    flow: &LoginFlow,
+    error_code: &str,
+) -> Result<Response, Failure> {
+    let separator = if flow.return_to.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
+    let location = format!("{}{separator}auth_error={error_code}", flow.return_to);
+    let mut response = Redirect::to(&location).into_response();
     append_delete_cookie(
         &mut response,
         flow.site.flow_cookie(),

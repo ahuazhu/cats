@@ -81,6 +81,16 @@ function showLogin(message = "") {
   loginError.textContent = message;
 }
 
+function consumeAuthError() {
+  const url = new URL(window.location.href);
+  const code = url.searchParams.get("auth_error");
+  if (!code) return "";
+  url.searchParams.delete("auth_error");
+  window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+  if (code === "workspace_access_required") return t("auth.error.workspaceAccessRequired");
+  return t("auth.error.authenticationFailed");
+}
+
 async function loadAll({ quiet = false } = {}) {
   if (state.loading) return;
   state.loading = true;
@@ -453,6 +463,7 @@ onLocaleChange(() => {
 });
 
 async function initializeAuth() {
+  const callbackError = consumeAuthError();
   try {
     state.authConfig = await request("/auth/config");
     document.querySelector("#workos-login-button").classList.toggle("is-hidden", !state.authConfig.workos_enabled);
@@ -471,7 +482,7 @@ async function initializeAuth() {
   } catch (error) {
     loginError.textContent = t("user.authConfigFailed", { message: error.message });
   }
-  showLogin(loginError.textContent);
+  showLogin(loginError.textContent || callbackError);
 }
 
 initializeAuth();
