@@ -159,7 +159,7 @@ debootstrap \
   --arch=amd64 \
   --variant=minbase \
   --components=main,universe \
-  --include=systemd-sysv,tini,e2fsprogs,ca-certificates,curl,wget,git,iproute2,iputils-ping,netbase,procps,less,nano,openssh-client \
+  --include=systemd-sysv,tini,e2fsprogs,ca-certificates,curl,wget,git,iproute2,iputils-ping,netbase,procps,less,nano,openssh-client,bash-completion,ncurses-term \
   "$UBUNTU_SUITE" "$RF" "$UBUNTU_MIRROR"
 
 mkdir -p "$RF"/usr/bin "$RF"/etc/systemd/system/sysinit.target.wants \
@@ -286,6 +286,34 @@ printf 'cat\n' > "$RF/etc/hostname"
 printf '127.0.0.1 localhost\n127.0.1.1 cat\n' > "$RF/etc/hosts"
 : > "$RF/etc/machine-id"
 rm -f "$RF/var/lib/dbus/machine-id"
+
+# A Cat opens directly into an interactive login Bash. Enable Ubuntu's color
+# prompt, programmable completion (including completions installed later by
+# packages such as gh), and useful Readline completion presentation.
+for bashrc in "$RF/root/.bashrc" "$RF/etc/skel/.bashrc"; do
+  [[ -f $bashrc ]] || continue
+  sed -i 's/^#force_color_prompt=yes$/force_color_prompt=yes/' "$bashrc"
+  if ! grep -q 'CATS_BASH_COMPLETION' "$bashrc"; then
+    cat >> "$bashrc" <<'EOF'
+
+# CATS_BASH_COMPLETION
+if [ -r /usr/share/bash-completion/bash_completion ] && ! shopt -oq posix; then
+  . /usr/share/bash-completion/bash_completion
+fi
+EOF
+  fi
+done
+if ! grep -q 'CATS_READLINE' "$RF/etc/inputrc"; then
+  cat >> "$RF/etc/inputrc" <<'EOF'
+
+# CATS_READLINE
+set completion-ignore-case on
+set show-all-if-ambiguous on
+set colored-stats on
+set visible-stats on
+EOF
+fi
+
 rm -rf "$RF/var/lib/apt/lists/"* "$RF/var/cache/apt/archives/"*.deb
 
 chroot "$RF" dpkg-query -W -f='${binary:Package}\t${Version}\n' \
@@ -293,7 +321,8 @@ chroot "$RF" dpkg-query -W -f='${binary:Package}\t${Version}\n' \
 
 for required in \
   bin/bash usr/bin/apt-get usr/bin/curl usr/bin/wget usr/bin/git usr/bin/cats-init \
-  usr/bin/cats-guest-agent usr/bin/tini lib/systemd/systemd sbin/resize2fs; do
+  usr/bin/cats-guest-agent usr/bin/tini lib/systemd/systemd sbin/resize2fs \
+  usr/share/bash-completion/bash_completion; do
   [[ -e "$RF/$required" ]] || {
     echo "Ubuntu rootfs is missing required path: /$required" >&2
     exit 1

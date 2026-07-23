@@ -53,8 +53,10 @@ initramfs + Ubuntu 24.04 minbase/guest-agent golden rootfs）、装 systemd 单�
 
 Guest 的 BusyBox 只存在于 initramfs，用来加载 virtio/ext4/vsock 并
 `switch_root`。用户进入的是完整 Ubuntu root，默认包含 `apt`、`curl`、`git`、
-`wget`、`iproute2`、`ping`、`procps`、`nano` 和 OpenSSH client。一个负责转发信号和回收
-子进程的轻量 PID 1 会在根盘扩容后直接启动 Guest Agent，Cold 路径无需等待完整
+`wget`、`iproute2`、`ping`、`procps`、`nano` 和 OpenSSH client。`cats shell`
+默认启动 login Bash，启用 256 色 prompt、Readline 路径补全和
+`bash-completion`（后续安装的 `gh` 等软件可直接注册自己的补全）。一个负责转发信号
+和回收子进程的轻量 PID 1 会在根盘扩容后直接启动 Guest Agent，Cold 路径无需等待完整
 systemd transaction；systemd 仍保留用于兼容和调试。golden root 默认 512 MiB，
 首次启动会把 ext4 在线扩到用户请求的 RootDisk 大小；因此生产创建建议至少 1 GiB。
 

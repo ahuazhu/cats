@@ -956,8 +956,14 @@ impl GuestAgent {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        let mut command = CommandBuilder::new("/bin/sh");
+        let shell = if Path::new("/bin/bash").is_file() {
+            "/bin/bash"
+        } else {
+            "/bin/sh"
+        };
+        let mut command = CommandBuilder::new(shell);
         command.arg("-l");
+        command.env("SHELL", shell);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
         command.cwd(if Path::new("/root").is_dir() {
