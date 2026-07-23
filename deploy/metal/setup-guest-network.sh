@@ -20,9 +20,15 @@ iptables -t nat -C POSTROUTING -s "$CIDR" -j MASQUERADE 2>/dev/null || \
   iptables -t nat -A POSTROUTING -s "$CIDR" -j MASQUERADE
 
 # Guests get Internet egress, not access to the worker, VPC/control network or
-# cloud instance metadata. vsock remains the only Host/Guest control channel.
+# cloud instance metadata. The node may initiate an Endpoint connection to a
+# Guest; only replies belonging to that established flow may return to Host
+# userspace. Guest-initiated Host traffic still hits the following DROP.
 iptables -C INPUT -i 'cat+' -j DROP 2>/dev/null || \
-  iptables -I INPUT 1 -i 'cat+' -j DROP
+  iptables -A INPUT -i 'cat+' -j DROP
+iptables -C INPUT -i 'cat+' -s "$CIDR" -m conntrack --ctstate RELATED,ESTABLISHED \
+  -j ACCEPT 2>/dev/null || \
+  iptables -I INPUT 1 -i 'cat+' -s "$CIDR" -m conntrack \
+    --ctstate RELATED,ESTABLISHED -j ACCEPT
 iptables -C FORWARD -i 'cat+' '!' -s "$CIDR" -j DROP 2>/dev/null || \
   iptables -I FORWARD 1 -i 'cat+' '!' -s "$CIDR" -j DROP
 for blocked in 169.254.169.254/32 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
