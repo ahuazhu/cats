@@ -4,7 +4,8 @@ Phase A 形态（正确性优先）：Cloud Hypervisor 直接内核启动真 Gue
 `guest virtio-blk → CH raw disk → /dev/nbdN（内核 NBD client）→ cats-blockd →
 BlobStore port → AWS S3/File adapter`；Guest Agent 走 vsock；Suspended=vm.pause，Warm=vm.snapshot
 + 全进程退出，Restore=--restore。每个 Cat 有独立 tap `/30` 和 Host SNAT 出站；
-原生 vhost-user-blk、跨节点 overlay 与公网入站仍是后续里程碑，不改变提交协议。
+公网 HTTP Endpoint 经 owning Node 进入 Guest tap。原生 vhost-user-blk、跨节点 overlay
+与 WebSocket 入站仍是后续里程碑，不改变提交协议。
 
 ## 1. 开机器
 
@@ -78,8 +79,9 @@ VMM、restore 同 boot 且文件在、stop/start 换 boot 且数据从 durable �
 
 ## 5. 已知边界（Phase A）
 
-- Guest 已有单节点 tap + SNAT 出站；跨节点私网 overlay 和公网 Endpoint → tap 入站
-  尚未实现。Guest 默认不能访问 Host、VPC 私网或云 metadata；exec/健康仍走 vsock。
+- Guest 已有单节点 tap + SNAT 出站和公网 HTTP Endpoint → tap 入站；跨节点私网
+  overlay 和 WebSocket 入站尚未实现。Guest 默认不能访问 Host、VPC 私网或云
+  metadata；exec/健康仍走 vsock。
 - 磁盘热插拔在 CH 模式暂不支持（停机挂载生效）。
 - 单节点单元（`metal-1`）；多金属节点 = 每台跑 install.sh + 唯一 --node-id，
   指向同一 control plane 与 S3（storage-meta 需共享→生产 PostgreSQL 项）。

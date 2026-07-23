@@ -5,6 +5,7 @@
 //! one mount binding per disk (RWO), at most one live attachment per disk,
 //! monotonic generations.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,6 +28,49 @@ pub fn now_unix() -> i64 {
 
 pub fn new_id(prefix: &str) -> String {
     ids::make_id(prefix, &Uuid::new_v4().simple().to_string()[..12])
+}
+
+pub const DEFAULT_ENDPOINT_NAME: &str = "web";
+pub const DEFAULT_ENDPOINT_PORT: u16 = 8080;
+
+fn dns_slug(value: &str, max_len: usize) -> String {
+    let mut slug = String::with_capacity(value.len().min(max_len));
+    for ch in value.chars() {
+        if slug.len() == max_len {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if ch == '-' && !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "cat".to_string()
+    } else {
+        slug
+    }
+}
+
+/// Produce the one-label hostname covered by the `*.cats.run` certificate.
+///
+/// The opaque Cat suffix makes the URL stable across workspace renames and
+/// globally unique without exposing a workspace identifier.
+pub fn public_endpoint_hostname(cat: &Cat, endpoint_name: &str) -> String {
+    let suffix = dns_slug(cat.id.strip_prefix("cat_").unwrap_or(&cat.id), 12);
+    let endpoint = dns_slug(endpoint_name, 24);
+    let prefix = if endpoint_name == DEFAULT_ENDPOINT_NAME {
+        let available = 63usize.saturating_sub(suffix.len() + 1).max(1);
+        dns_slug(&cat.name, available)
+    } else {
+        let fixed = endpoint.len() + suffix.len() + 2;
+        let available = 63usize.saturating_sub(fixed).max(1);
+        format!("{endpoint}-{}", dns_slug(&cat.name, available))
+    };
+    format!("{prefix}-{suffix}.cats.run")
 }
 
 pub struct Store {
@@ -64,9 +108,136 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str)
     Ok(())
 }
 
+fn backfill_public_endpoints(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction().map_err(internal)?;
+    let cats = {
+        let mut stmt = tx.prepare("SELECT * FROM cats").map_err(internal)?;
+        let rows = stmt
+            .query_map([], row_to_cat)
+            .map_err(internal)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(internal)?;
+        rows
+    };
+    let cats_by_id = cats
+        .iter()
+        .map(|cat| (cat.id.as_str(), cat))
+        .collect::<HashMap<_, _>>();
+    let existing = {
+        let mut stmt = tx
+            .prepare("SELECT id, cat_id, name, hostname FROM endpoints")
+            .map_err(internal)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(internal)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(internal)?;
+        rows
+    };
+
+    // Databases created by the local-only prototype used `.cats.local`.
+    // Move every endpoint to the public one-label namespace atomically while
+    // preserving route state and epoch.
+    for (endpoint_id, cat_id, name, old_hostname) in existing {
+        let Some(cat) = cats_by_id.get(cat_id.as_str()) else {
+            continue;
+        };
+        let hostname = public_endpoint_hostname(cat, &name);
+        if hostname == old_hostname {
+            continue;
+        }
+        tx.execute(
+            "UPDATE routes SET hostname=?2 WHERE hostname=?1",
+            params![old_hostname, hostname],
+        )
+        .map_err(internal)?;
+        tx.execute(
+            "UPDATE endpoints SET hostname=?2 WHERE id=?1",
+            params![endpoint_id, hostname],
+        )
+        .map_err(internal)?;
+    }
+
+    // Every Cat owns a default wake-on-request endpoint. Existing Cats get
+    // the same contract during control-plane startup.
+    for cat in cats {
+        let has_default: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM endpoints WHERE cat_id=?1 AND name=?2
+                 )",
+                params![cat.id, DEFAULT_ENDPOINT_NAME],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        if has_default {
+            continue;
+        }
+        let endpoint_id = new_id(ids::ENDPOINT_PREFIX);
+        let hostname = public_endpoint_hostname(&cat, DEFAULT_ENDPOINT_NAME);
+        tx.execute(
+            "INSERT INTO endpoints
+                (id, cat_id, name, hostname, target_port, protocol, wake_policy)
+             VALUES (?1,?2,?3,?4,?5,'http','wake_on_request')",
+            params![
+                endpoint_id,
+                cat.id,
+                DEFAULT_ENDPOINT_NAME,
+                hostname,
+                DEFAULT_ENDPOINT_PORT
+            ],
+        )
+        .map_err(internal)?;
+
+        let gateway_url = match (
+            cat.observed_state == ObservedState::Running,
+            cat.node_id.as_deref(),
+        ) {
+            (true, Some(node_id)) => tx
+                .query_row(
+                    "SELECT gateway_url FROM nodes WHERE id=?1",
+                    params![node_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(internal)?,
+            _ => None,
+        };
+        let (node_id, epoch, state) = match (cat.node_id.as_deref(), gateway_url.as_deref()) {
+            (Some(node_id), Some(_)) if cat.observed_state == ObservedState::Running => {
+                (Some(node_id), 1, "active")
+            }
+            _ => (None, 0, "unbound"),
+        };
+        tx.execute(
+            "INSERT INTO routes
+                (hostname, cat_id, node_id, gateway_url, target_port, epoch, state)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                hostname,
+                cat.id,
+                node_id,
+                gateway_url,
+                DEFAULT_ENDPOINT_PORT,
+                epoch,
+                state
+            ],
+        )
+        .map_err(internal)?;
+    }
+    tx.commit().map_err(internal)
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path).map_err(internal)?;
+        let mut conn = Connection::open(path).map_err(internal)?;
         conn.busy_timeout(std::time::Duration::from_secs(10))
             .map_err(internal)?;
         conn.pragma_update(None, "journal_mode", "WAL")
@@ -101,6 +272,7 @@ impl Store {
               WHERE state IN ('cordoned', 'draining');",
         )
         .map_err(internal)?;
+        backfill_public_endpoints(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -172,6 +344,42 @@ impl Store {
                     i64::from(auto_suspend),
                     now
                 ],
+            )?;
+            let default_endpoint_id = new_id(ids::ENDPOINT_PREFIX);
+            let default_hostname = public_endpoint_hostname(
+                &Cat {
+                    id: cat_id.clone(),
+                    project: project.to_string(),
+                    name: name.to_string(),
+                    image: image.to_string(),
+                    spec: CatSpec { cpus, memory_mib },
+                    root_disk_id: root_disk_id.clone(),
+                    desired_state: DesiredState::Running,
+                    observed_state: ObservedState::Creating,
+                    generation: 1,
+                    auto_suspend,
+                    node_id: None,
+                    created_at_unix: now,
+                },
+                DEFAULT_ENDPOINT_NAME,
+            );
+            tx.execute(
+                "INSERT INTO endpoints
+                    (id, cat_id, name, hostname, target_port, protocol, wake_policy)
+                 VALUES (?1,?2,?3,?4,?5,'http','wake_on_request')",
+                params![
+                    default_endpoint_id,
+                    cat_id,
+                    DEFAULT_ENDPOINT_NAME,
+                    default_hostname,
+                    DEFAULT_ENDPOINT_PORT
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO routes
+                    (hostname, cat_id, node_id, gateway_url, target_port, epoch, state)
+                 VALUES (?1,?2,NULL,NULL,?3,0,'unbound')",
+                params![default_hostname, cat_id, DEFAULT_ENDPOINT_PORT],
             )?;
             insert_disk(
                 &tx,
@@ -1423,8 +1631,39 @@ impl Store {
         protocol: &str,
         wake: WakePolicy,
     ) -> Result<Endpoint> {
+        if let Some(mut endpoint) = self
+            .endpoints_for_cat(&cat.id)?
+            .into_iter()
+            .find(|endpoint| endpoint.name == name)
+        {
+            if name != DEFAULT_ENDPOINT_NAME {
+                return Err(ApiError::new(
+                    ErrorCode::AlreadyExists,
+                    "endpoint name in use",
+                ));
+            }
+            self.with(|connection| {
+                connection.execute(
+                    "UPDATE endpoints
+                        SET target_port=?2, protocol=?3, wake_policy=?4
+                      WHERE id=?1",
+                    params![endpoint.id, target_port, protocol, wake_str(wake)],
+                )?;
+                connection.execute(
+                    "UPDATE routes
+                        SET target_port=?2, epoch=epoch+1
+                      WHERE hostname=?1",
+                    params![endpoint.hostname, target_port],
+                )?;
+                Ok(())
+            })?;
+            endpoint.target_port = target_port;
+            endpoint.protocol = protocol.to_string();
+            endpoint.wake_policy = wake;
+            return Ok(endpoint);
+        }
         let id = new_id(ids::ENDPOINT_PREFIX);
-        let hostname = format!("{}.{}.{}.cats.local", name, cat.name, cat.project);
+        let hostname = public_endpoint_hostname(cat, name);
         self.with(|c| {
             c.execute(
                 "INSERT INTO endpoints (id, cat_id, name, hostname, target_port, protocol, wake_policy)
@@ -1922,6 +2161,11 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert_eq!(store.get_operation("op_old").unwrap().project, "alpha");
         assert!(store.must_get_cat_by_id("cat_old").unwrap().auto_suspend);
+        let endpoints = store.endpoints_for_cat("cat_old").unwrap();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].name, DEFAULT_ENDPOINT_NAME);
+        assert_eq!(endpoints[0].hostname, "legacy-old.cats.run");
+        assert_eq!(endpoints[0].target_port, DEFAULT_ENDPOINT_PORT);
         let node = store.get_node("node_old").unwrap();
         assert_eq!(node.state, NodeState::Cordoned);
         assert!(node.telemetry.is_none());
@@ -1958,6 +2202,29 @@ mod tests {
             .create_cat("alpha", "worker", "test", 1, 256, 1024 * 1024, true, None)
             .unwrap();
         assert!(cat.auto_suspend);
+        let endpoints = store.endpoints_for_cat(&cat.id).unwrap();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].name, DEFAULT_ENDPOINT_NAME);
+        assert_eq!(endpoints[0].target_port, DEFAULT_ENDPOINT_PORT);
+        assert!(endpoints[0].hostname.starts_with("worker-"));
+        assert!(endpoints[0].hostname.ends_with(".cats.run"));
+        let default_id = endpoints[0].id.clone();
+        let updated = store
+            .create_endpoint(
+                &cat,
+                DEFAULT_ENDPOINT_NAME,
+                3000,
+                "http",
+                WakePolicy::NoWake,
+            )
+            .unwrap();
+        assert_eq!(updated.id, default_id);
+        assert_eq!(updated.target_port, 3000);
+        assert_eq!(updated.wake_policy, WakePolicy::NoWake);
+        assert_eq!(store.endpoints_for_cat(&cat.id).unwrap().len(), 1);
+        let (route, _) = store.resolve_route(&updated.hostname).unwrap();
+        assert_eq!(route.target_port, 3000);
+        assert_eq!(route.epoch, 1);
         store
             .register_node("node-1", "http://node", "http://gateway", 4, 8192)
             .unwrap();

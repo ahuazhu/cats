@@ -1,9 +1,23 @@
-## 发布 Guest 端口
+## 默认 URL
 
-    cats expose dev 3000 --name web --protocol http
+    cats create dev
+    cats endpoint ls dev
+    curl https://dev-<cat-suffix>.cats.run/
+
+每个 Cat 都会自动获得名为 `web` 的稳定 HTTPS Endpoint，转发到 Guest 的 `8080` 端口并采用 `wake_on_request`；不需要再执行 `cats expose`。URL 绑定 Cat 资源而不是某一台 Host，`cats create` 和 `cats get` 也会直接显示它。
+
+应用必须监听 `0.0.0.0:8080`（或 `:::8080`）。只绑定 Guest loopback 的服务无法经 tap 网络访问。
+
+## 额外端口
+
+    # 把默认 URL 改为转发 3000 端口
+    cats expose dev 3000
+
+    # 或增加第二个 URL
+    cats expose dev 3000 --name preview --protocol http
     cats endpoint ls dev
 
-命令会创建一个拥有稳定域名、目标 Guest 端口与默认 `wake_on_request` 策略的 Endpoint。域名绑定 Cat 资源，而不是某一台 Host。
+不带 `--name` 时，`cats expose` 会重新配置默认 `web` Endpoint；指定其他名称则增加第二个 URL。V1 Endpoint 可从公网访问；不要在其中暴露未鉴权的管理或凭据接口。
 
 ## 唤醒策略
 
@@ -16,17 +30,17 @@
 
 ## 协议与路由安全
 
-V1 产品模型通过区域 Edge 支持 HTTP、HTTPS、WebSocket 与安全 WebSocket。Node Gateway 会重新校验 Project、Cat、目标端口与 Route Epoch；旧 Route Cache 必须 fail closed，不能到达另一个 Guest。
+当前实现支持 HTTP/1.1，并由区域 Edge 终止 HTTPS；method、path/query、应用 headers、响应状态和请求/响应 body 都会保留。Owning Node 会重新校验 Cat ownership 与 Running 状态；旧 Route Cache 必须 fail closed，不能到达另一个 Guest。WebSocket 属于后续里程碑。
 
 ## 当前源码可用性
 
-**Cloud Hypervisor 网络尚未完整**
+**Cloud Hypervisor HTTP 入站已可用**
 
-Endpoint API、Route Epoch、唤醒流程与 FakeVmm 网关路径已经实现并测试。仓库尚未实现 Cloud Hypervisor Phase-A 的 tap/overlay Guest 网络。在该里程碑完成前，不能把真实 CH 公网 Endpoint 当作可用能力。
+Endpoint API、Route Binding、唤醒流程、每 Cat `/30` tap 与 Owning Node HTTP 代理均已实现。跨 Node Guest overlay 和 WebSocket 代理尚未实现。
 
 ## 准备 Guest 服务
 
-1.  监听目标 Guest 端口，不依赖平台保留端口。
+1.  默认 URL 监听 `0.0.0.0:8080`；额外 Endpoint 则监听所选目标端口。
 2.  只有依赖和磁盘状态可用后才报告 Ready。
 3.  不要期待 Cats 在休眠后保留应用 TCP 状态。
 4.  如后台任务必须保持 Running，请获取 [工作租约](/zh-CN/docs/runtime-api/)。

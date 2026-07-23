@@ -104,6 +104,28 @@ pub struct ExecResponse {
     pub stderr: String,
 }
 
+/// Internal gateway -> owning-node HTTP proxy request.
+///
+/// The gateway resolves the endpoint and supplies the route's target port.
+/// The node still fails closed unless the Cat is currently running there.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyHttpRequest {
+    pub method: String,
+    pub path: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    pub target_port: u16,
+    pub route_epoch: i64,
+}
+
+/// Guest HTTP response returned by the owning node to the gateway.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyHttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
 /// JSON control messages carried in WebSocket text frames. PTY input/output
 /// uses binary WebSocket frames.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

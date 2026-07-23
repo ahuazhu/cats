@@ -51,6 +51,7 @@ cats unmount DISK</code></pre>
 <h2 id="endpoint-commands">Endpoint commands</h2>
 <pre><code>cats expose CAT PORT [--name web] [--protocol http] [--no-wake]
 cats endpoint ls CAT</code></pre>
+<p>Every Cat already has a <code>web</code> Endpoint for port 8080. <code>cats expose CAT PORT</code> reconfigures it; use another <code>--name</code> to add a URL.</p>
 
 <h2 id="operation-commands">Operation commands</h2>
 <pre><code>cats operation ls

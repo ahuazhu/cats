@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use cats_api::nodejob::{NodeJob, NodeJobAction, NodeJobResult, SuspendWorkFence, VolumeGrant};
+use cats_api::requests::{ProxyHttpRequest, ProxyHttpResponse};
 use cats_api::resources::{NodeTelemetry, ObservedState};
 use cats_guest_agent::DiskMapEntry;
 use cats_storage::{AdapterSelection, MetadataStore};
@@ -1187,29 +1188,250 @@ impl NodeRuntime {
         Ok((shell, guard))
     }
 
-    /// Forward an HTTP GET to the guest web service. Returns the raw HTTP
-    /// response bytes. Errors with "not active" when the cat is not running
-    /// here — the gateway treats that as a stale route (409).
-    pub fn proxy_get(&self, cat_id: &str, path: &str) -> Result<Vec<u8>> {
+    /// Forward an HTTP request to the guest service. In Cloud Hypervisor mode
+    /// this is a direct host-tap -> guest-IP connection; FakeVmm uses its
+    /// Unix test workload. Errors with "not active" when the Cat is not
+    /// running here, which the gateway treats as a stale route.
+    pub fn proxy_http(
+        &self,
+        cat_id: &str,
+        request: &ProxyHttpRequest,
+    ) -> Result<ProxyHttpResponse> {
         use std::io::{Read, Write};
-        let (web, activity) = {
+        enum Target {
+            Unix(PathBuf),
+            Tcp(std::net::SocketAddr),
+        }
+
+        anyhow::ensure!(
+            request.target_port > 0,
+            "endpoint target port must be non-zero"
+        );
+        let (target, activity) = {
             let cats = self.cats.lock().unwrap();
             let rt = cats.get(cat_id).context("cat is not active on this node")?;
             if rt.state != ObservedState::Running {
                 bail!("cat is not active on this node (state {:?})", rt.state);
             }
-            (rt.web_socket(), rt.activity.clone())
+            let target = match rt.ch.as_ref() {
+                Some(chrt) => {
+                    let network = chrt.network.as_ref().context("cat has no guest network")?;
+                    let ip = network
+                        .guest_ip
+                        .split('/')
+                        .next()
+                        .context("invalid guest address")?
+                        .parse::<std::net::IpAddr>()
+                        .context("invalid guest IP")?;
+                    Target::Tcp(std::net::SocketAddr::new(ip, request.target_port))
+                }
+                None => Target::Unix(rt.web_socket()),
+            };
+            (target, rt.activity.clone())
         };
         let _guard = activity.acquire()?;
-        let mut stream = std::os::unix::net::UnixStream::connect(&web)?;
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        write!(
-            stream,
-            "GET {path} HTTP/1.1\r\nhost: guest\r\nconnection: close\r\n\r\n"
-        )?;
+        let raw_request = build_guest_http_request(request)?;
         let mut buf = Vec::new();
-        stream.read_to_end(&mut buf)?;
-        Ok(buf)
+        match target {
+            Target::Unix(path) => {
+                let mut stream = std::os::unix::net::UnixStream::connect(&path)?;
+                stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+                stream.write_all(&raw_request)?;
+                stream
+                    .take((MAX_PROXY_RESPONSE_BYTES + 1) as u64)
+                    .read_to_end(&mut buf)?;
+            }
+            Target::Tcp(address) => {
+                let mut stream =
+                    std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5))
+                        .with_context(|| format!("connect guest service {address}"))?;
+                stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+                stream.write_all(&raw_request)?;
+                stream
+                    .take((MAX_PROXY_RESPONSE_BYTES + 1) as u64)
+                    .read_to_end(&mut buf)?;
+            }
+        }
+        anyhow::ensure!(
+            buf.len() <= MAX_PROXY_RESPONSE_BYTES,
+            "guest response exceeds {MAX_PROXY_RESPONSE_BYTES} bytes"
+        );
+        parse_guest_http_response(&buf)
+    }
+}
+
+const MAX_PROXY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+fn is_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn hop_by_hop_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+fn build_guest_http_request(request: &ProxyHttpRequest) -> Result<Vec<u8>> {
+    use std::io::Write as _;
+
+    anyhow::ensure!(is_http_token(&request.method), "invalid HTTP method");
+    anyhow::ensure!(
+        request.path.starts_with('/')
+            && !request.path.contains('\r')
+            && !request.path.contains('\n'),
+        "invalid HTTP request path"
+    );
+    let mut raw = format!(
+        "{} {} HTTP/1.1\r\nhost: guest\r\n",
+        request.method, request.path
+    )
+    .into_bytes();
+    for (name, value) in &request.headers {
+        if name.eq_ignore_ascii_case("host")
+            || name.eq_ignore_ascii_case("content-length")
+            || hop_by_hop_header(name)
+        {
+            continue;
+        }
+        anyhow::ensure!(
+            is_http_token(name) && !value.contains('\r') && !value.contains('\n'),
+            "invalid HTTP header"
+        );
+        write!(&mut raw, "{name}: {value}\r\n")?;
+    }
+    write!(
+        &mut raw,
+        "x-cats-route-epoch: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        request.route_epoch,
+        request.body.len()
+    )?;
+    raw.extend_from_slice(&request.body);
+    Ok(raw)
+}
+
+fn parse_guest_http_response(raw: &[u8]) -> Result<ProxyHttpResponse> {
+    let head_end = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .context("guest returned malformed HTTP response")?;
+    let head = std::str::from_utf8(&raw[..head_end]).context("guest returned non-UTF8 headers")?;
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .context("guest response is missing status")?
+        .parse::<u16>()
+        .context("invalid guest response status")?;
+    anyhow::ensure!((100..=599).contains(&status), "invalid guest HTTP status");
+
+    let mut headers = Vec::new();
+    let mut chunked = false;
+    let mut content_length = None;
+    for line in lines {
+        let (name, value) = line
+            .split_once(':')
+            .context("malformed guest response header")?;
+        let name = name.trim();
+        let value = value.trim();
+        anyhow::ensure!(
+            is_http_token(name) && !value.contains('\r') && !value.contains('\n'),
+            "invalid guest response header"
+        );
+        if name.eq_ignore_ascii_case("transfer-encoding")
+            && value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+        {
+            chunked = true;
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = Some(
+                value
+                    .parse::<usize>()
+                    .context("invalid guest Content-Length")?,
+            );
+        }
+        if !hop_by_hop_header(name) && !name.eq_ignore_ascii_case("content-length") {
+            headers.push((name.to_string(), value.to_string()));
+        }
+    }
+
+    let encoded_body = &raw[head_end + 4..];
+    let body = if chunked {
+        decode_chunked_body(encoded_body)?
+    } else if let Some(length) = content_length {
+        anyhow::ensure!(
+            encoded_body.len() >= length,
+            "truncated guest HTTP response body"
+        );
+        encoded_body[..length].to_vec()
+    } else {
+        encoded_body.to_vec()
+    };
+    Ok(ProxyHttpResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+fn decode_chunked_body(mut encoded: &[u8]) -> Result<Vec<u8>> {
+    let mut decoded = Vec::new();
+    loop {
+        let line_end = encoded
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .context("malformed chunked response")?;
+        let size_line =
+            std::str::from_utf8(&encoded[..line_end]).context("invalid chunk size line")?;
+        let size =
+            usize::from_str_radix(size_line.split(';').next().unwrap_or_default().trim(), 16)
+                .context("invalid chunk size")?;
+        encoded = &encoded[line_end + 2..];
+        if size == 0 {
+            return Ok(decoded);
+        }
+        anyhow::ensure!(
+            encoded.len() >= size + 2 && &encoded[size..size + 2] == b"\r\n",
+            "truncated chunked response"
+        );
+        decoded.extend_from_slice(&encoded[..size]);
+        anyhow::ensure!(
+            decoded.len() <= MAX_PROXY_RESPONSE_BYTES,
+            "guest response exceeds {MAX_PROXY_RESPONSE_BYTES} bytes"
+        );
+        encoded = &encoded[size + 2..];
     }
 }
 
@@ -1220,5 +1442,48 @@ fn signal(child: &Child, sig: i32) {
         unsafe {
             libc::kill(pid, sig);
         }
+    }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+
+    #[test]
+    fn proxy_request_preserves_method_path_headers_and_body() {
+        let request = ProxyHttpRequest {
+            method: "POST".to_string(),
+            path: "/api/items?q=one".to_string(),
+            headers: vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("connection".to_string(), "keep-alive".to_string()),
+            ],
+            body: br#"{"name":"cat"}"#.to_vec(),
+            target_port: 8080,
+            route_epoch: 7,
+        };
+        let raw = build_guest_http_request(&request).unwrap();
+        let text = String::from_utf8(raw).unwrap();
+        assert!(text.starts_with("POST /api/items?q=one HTTP/1.1\r\n"));
+        assert!(text.contains("content-type: application/json\r\n"));
+        assert!(text.contains("x-cats-route-epoch: 7\r\n"));
+        assert!(!text.contains("keep-alive"));
+        assert!(text.ends_with(r#"{"name":"cat"}"#));
+    }
+
+    #[test]
+    fn proxy_response_preserves_status_headers_and_decodes_chunks() {
+        let raw = b"HTTP/1.1 201 Created\r\n\
+                    content-type: text/plain\r\n\
+                    transfer-encoding: chunked\r\n\
+                    connection: close\r\n\r\n\
+                    5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let response = parse_guest_http_response(raw).unwrap();
+        assert_eq!(response.status, 201);
+        assert_eq!(response.body, b"hello world");
+        assert_eq!(
+            response.headers,
+            vec![("content-type".to_string(), "text/plain".to_string())]
+        );
     }
 }

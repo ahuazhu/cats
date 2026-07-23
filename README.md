@@ -16,6 +16,7 @@ Cats 是一个从零实现的独立项目：为用户提供可休眠、可迁移
 - 浏览器身份使用 WorkOS AuthKit；CLI 使用 WorkOS Device Login，内部服务使用独立机器 Bearer Token（[ADR-0006](docs/decisions/0006-workos-authkit-for-browser-identity.md)、[ADR-0008](docs/decisions/0008-workos-device-login-and-cli-workspaces.md)）。
 - Guest 可选运行时能力使用 Unix socket 上的标准 HTTP，不要求 Cats SDK/CLI 或固定 TCP 端口（[ADR-0007](docs/decisions/0007-guest-runtime-http-over-unix-socket.md)）。
 - `cats shell` 使用受 Workspace 鉴权的 WebSocket PTY，不在 Guest 运行 sshd（[ADR-0009](docs/decisions/0009-interactive-shell-over-authenticated-websocket.md)）。
+- 每个 Cat 创建时自动获得稳定的 `*.cats.run` HTTPS URL，默认转发 Guest 8080 并按请求唤醒（[ADR-0010](docs/decisions/0010-default-http-endpoint-per-cat.md)）。
 
 具体边界记录在 [`ADR-0001: Greenfield implementation baseline`](docs/decisions/0001-greenfield-implementation-baseline.md) 及后续 ADR。
 

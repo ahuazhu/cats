@@ -326,7 +326,7 @@ pub struct Endpoint {
     pub id: String,
     pub cat_id: String,
     pub name: String,
-    /// Stable hostname, e.g. `web.dev.default.cats.local`.
+    /// Stable public hostname, e.g. `dev-a1b2c3d4e5f6.cats.run`.
     pub hostname: String,
     pub target_port: u16,
     pub protocol: String,

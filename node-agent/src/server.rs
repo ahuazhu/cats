@@ -17,7 +17,8 @@ use cats_api::guest::GuestShellFrame;
 use cats_api::nodejob::NodeJob;
 use cats_api::requests::{
     ExecRequest, ExecResponse, HeartbeatCat, HeartbeatRequest, NodeWorkStatusRequest,
-    RegisterNodeRequest, ShellClientControl, ShellServerControl, MAX_SHELL_MESSAGE_BYTES,
+    ProxyHttpRequest, RegisterNodeRequest, ShellClientControl, ShellServerControl,
+    MAX_SHELL_MESSAGE_BYTES,
 };
 use cats_api::resources::NodeTelemetry;
 use cats_storage::MetadataStore;
@@ -316,28 +317,30 @@ async fn bridge_shell(socket: WebSocket, guest: GuestShell, _activity_guard: Run
     let _ = tokio::time::timeout(Duration::from_secs(2), reader_task).await;
 }
 
-#[derive(serde::Deserialize)]
-struct ProxyQuery {
-    path: Option<String>,
-}
-
-/// Gateway hop: returns the guest's raw HTTP response bytes. 409 = the cat
-/// is not active on this node (stale route: the gateway must re-resolve).
+/// Gateway hop. 409 means the Cat is not active on this node (stale route:
+/// the gateway must re-resolve); guest network/service failures are 502.
 async fn handle_proxy(
     State(state): State<NodeState>,
     Path(cat_id): Path<String>,
-    Query(q): Query<ProxyQuery>,
     headers: HeaderMap,
+    Json(request): Json<ProxyHttpRequest>,
 ) -> impl IntoResponse {
     if let Err(code) = check_auth(&state.cfg, &headers) {
         return code.into_response();
     }
     let runtime = state.runtime.clone();
-    let path = q.path.unwrap_or_else(|| "/".to_string());
-    let result = tokio::task::spawn_blocking(move || runtime.proxy_get(&cat_id, &path)).await;
+    let result = tokio::task::spawn_blocking(move || runtime.proxy_http(&cat_id, &request)).await;
     match result {
-        Ok(Ok(raw)) => (StatusCode::OK, raw).into_response(),
-        Ok(Err(e)) => (StatusCode::CONFLICT, format!("{e:#}")).into_response(),
+        Ok(Ok(response)) => Json(response).into_response(),
+        Ok(Err(error)) => {
+            let message = format!("{error:#}");
+            let status = if message.contains("cat is not active on this node") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            (status, message).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -348,7 +351,7 @@ pub fn router(state: NodeState) -> Router {
         .route("/v1/jobs", post(handle_job))
         .route("/v1/cats/{id}/exec", post(handle_exec))
         .route("/v1/cats/{id}/shell", get(handle_shell))
-        .route("/v1/cats/{id}/proxy", get(handle_proxy))
+        .route("/v1/cats/{id}/proxy", post(handle_proxy))
         .with_state(state)
 }
 

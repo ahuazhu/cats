@@ -62,6 +62,8 @@ Status reports platform and Guest work leases, signal freshness, eligibility, an
     cats expose CAT PORT [--name web] [--protocol http] [--no-wake]
     cats endpoint ls CAT
 
+Every Cat already has a `web` Endpoint for port 8080. `cats expose CAT PORT` reconfigures it; use another `--name` to add a URL.
+
 ## Operation commands
 
     cats operation ls

@@ -1126,6 +1126,25 @@ async fn create_endpoint(
     Json(req): Json<CreateEndpointRequest>,
 ) -> ApiResult<Json<EndpointResponse>> {
     check_project_auth(&state, &headers, &project).await?;
+    if req.name.is_empty()
+        || req.name.len() > 24
+        || !req
+            .name
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+        || req.name.starts_with('-')
+        || req.name.ends_with('-')
+    {
+        return Err(
+            ApiError::invalid("endpoint name must be 1-24 lowercase [a-z0-9-] characters").into(),
+        );
+    }
+    if req.target_port == 0 {
+        return Err(ApiError::invalid("endpoint target_port must be non-zero").into());
+    }
+    if req.protocol != "http" {
+        return Err(ApiError::invalid("only http endpoints are currently supported").into());
+    }
     let cat = state.store.get_cat(&project, &cat)?;
     let ep = state.store.create_endpoint(
         &cat,

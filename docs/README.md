@@ -10,7 +10,7 @@ HTML 面向人类阅读和视觉演示；同名 Markdown 面向 Agent/实现者�
 | [Guest Runtime API v1](specs/guest-runtime-api.md) | Frozen v1 | `guest/` 的 `/run/cats/runtime.sock` HTTP 工作租约；依据 ADR-0007 |
 | [Interactive Shell Protocol v1](specs/interactive-shell-protocol.md) | Implemented v1 | `cats shell` 的 WorkOS 鉴权 WebSocket、Node/Guest PTY 流；依据 ADR-0009 |
 
-实现状态一览见根 [README](../README.md#实现状态)。真实 microVM（Cloud Hypervisor + KVM）已实现为 node-agent 的 `--vmm ch` 模式（`node-agent/src/ch.rs`），块路径 Phase A 经内核 NBD 复用已验前端，裸金属部署与验收见 [deploy/metal/](../deploy/metal/README.md)。共享 PostgreSQL root/lease 元数据 adapter 已实现；仍属后续里程碑：原生 vhost-user-blk（性能）、tap/overlay Guest 网络、控制面资源库 PostgreSQL/outbox 化、特权拆分。
+实现状态一览见根 [README](../README.md#实现状态)。真实 microVM（Cloud Hypervisor + KVM）已实现为 node-agent 的 `--vmm ch` 模式（`node-agent/src/ch.rs`），块路径 Phase A 经内核 NBD 复用已验前端，裸金属部署与验收见 [deploy/metal/](../deploy/metal/README.md)。共享 PostgreSQL root/lease 元数据 adapter、每 Cat `/30` tap 和 owning-node HTTP 入站已实现；仍属后续里程碑：原生 vhost-user-blk（性能）、跨 Node Guest overlay、WebSocket 入站、控制面资源库 PostgreSQL/outbox 化、特权拆分。
 
 Rust 工程质量现状、已修问题和后续优先项见 [Rust 工程实践审查](rust-engineering-review.md)。
 
@@ -63,5 +63,6 @@ Fleet 管理员指南不属于官网用户文档。其双语源文件位于
 - [ADR-0007：Guest Runtime API 使用 Unix Socket 上的 HTTP](decisions/0007-guest-runtime-http-over-unix-socket.md)
 - [ADR-0008：CLI 使用 WorkOS Device Login 与多 Workspace 会话](decisions/0008-workos-device-login-and-cli-workspaces.md)
 - [ADR-0009：交互式 Shell 使用受鉴权的 WebSocket PTY 流](decisions/0009-interactive-shell-over-authenticated-websocket.md)
+- [ADR-0010：每个 Cat 默认获得稳定 HTTP Endpoint](decisions/0010-default-http-endpoint-per-cat.md)
 
 后续发生会改变数据格式、公开 API、故障语义或组件边界的决定时，应新增 ADR，而不是直接覆盖实验结论。

@@ -13,15 +13,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::extract::State;
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::routing::get;
 use axum::Router;
 
-use cats_api::requests::{AcquireWorkRequest, AcquireWorkResponse, ReleaseWorkRequest};
+use cats_api::requests::{
+    AcquireWorkRequest, AcquireWorkResponse, ProxyHttpRequest, ProxyHttpResponse,
+    ReleaseWorkRequest,
+};
 use cats_api::resources::WorkKind;
 use cats_api::resources::{ObservedState, RouteBinding, WakePolicy};
 
@@ -195,7 +198,7 @@ impl Gateway {
     async fn try_proxy(
         &self,
         resolved: &ResolveResponse,
-        path: &str,
+        request: &ProxyHttpRequest,
     ) -> Result<Option<Response>, Response> {
         if resolved.node_agent_url.is_empty() {
             return Ok(None);
@@ -205,28 +208,47 @@ impl Gateway {
             resolved.node_agent_url.trim_end_matches('/'),
             resolved.binding.cat_id
         );
+        let mut request = request.clone();
+        request.target_port = resolved.binding.target_port;
+        request.route_epoch = resolved.binding.epoch;
         let resp = self
             .http
-            .get(url)
-            .query(&[("path", path)])
+            .post(url)
             .bearer_auth(&self.cfg.auth_token)
+            .json(&request)
             .send()
             .await
             .map_err(|e| gw_error(StatusCode::BAD_GATEWAY, format!("node hop failed: {e}")))?;
         match resp.status() {
             reqwest::StatusCode::OK => {
-                let raw = resp
-                    .bytes()
-                    .await
-                    .map_err(|e| gw_error(StatusCode::BAD_GATEWAY, e.to_string()))?;
-                let (status, body) = parse_guest_http(&raw);
-                Ok(Some(
-                    Response::builder()
-                        .status(status)
-                        .header("x-cats-route-epoch", resolved.binding.epoch)
-                        .body(Body::from(body))
-                        .expect("response builds"),
-                ))
+                let guest: ProxyHttpResponse = resp.json().await.map_err(|e| {
+                    gw_error(StatusCode::BAD_GATEWAY, format!("bad node body: {e}"))
+                })?;
+                let status = StatusCode::from_u16(guest.status).map_err(|e| {
+                    gw_error(
+                        StatusCode::BAD_GATEWAY,
+                        format!("invalid guest status: {e}"),
+                    )
+                })?;
+                let mut response = Response::builder()
+                    .status(status)
+                    .body(Body::from(guest.body))
+                    .expect("response builds");
+                for (name, value) in guest.headers {
+                    let Ok(name) = HeaderName::try_from(name) else {
+                        continue;
+                    };
+                    let Ok(value) = HeaderValue::try_from(value) else {
+                        continue;
+                    };
+                    response.headers_mut().append(name, value);
+                }
+                response.headers_mut().insert(
+                    "x-cats-route-epoch",
+                    HeaderValue::from_str(&resolved.binding.epoch.to_string())
+                        .expect("integer is a header value"),
+                );
+                Ok(Some(response))
             }
             // Stale route: the cat is not active on that node any more.
             reqwest::StatusCode::CONFLICT => Ok(None),
@@ -237,7 +259,7 @@ impl Gateway {
         }
     }
 
-    async fn handle(&self, hostname: String, path: String) -> Response {
+    async fn handle(&self, hostname: String, request: ProxyHttpRequest) -> Response {
         // Fast path: cached/current route.
         let mut resolved = match self.resolve(&hostname, true).await {
             Ok(r) => r,
@@ -260,7 +282,9 @@ impl Gateway {
             Err(response) => return response,
         };
 
-        let response = self.handle_with_work(&hostname, &path, &mut resolved).await;
+        let response = self
+            .handle_with_work(&hostname, &request, &mut resolved)
+            .await;
         self.release_request_work(work_lease).await;
         response
     }
@@ -268,7 +292,7 @@ impl Gateway {
     async fn handle_with_work(
         &self,
         hostname: &str,
-        path: &str,
+        request: &ProxyHttpRequest,
         resolved: &mut ResolveResponse,
     ) -> Response {
         // Wake if the cat is not running (policy permitting).
@@ -284,7 +308,7 @@ impl Gateway {
         }
 
         // Proxy; on a stale route re-resolve once and retry.
-        match self.try_proxy(resolved, path).await {
+        match self.try_proxy(resolved, request).await {
             Ok(Some(resp)) => resp,
             Err(resp) => resp,
             Ok(None) => {
@@ -305,7 +329,7 @@ impl Gateway {
                     Ok(r) => r,
                     Err(resp) => return resp,
                 };
-                match self.try_proxy(&retry, path).await {
+                match self.try_proxy(&retry, request).await {
                     Ok(Some(resp)) => resp,
                     Ok(None) => gw_error(
                         StatusCode::CONFLICT,
@@ -322,23 +346,6 @@ fn gw_error(status: StatusCode, message: String) -> Response {
     (status, message).into_response()
 }
 
-/// Parse the guest's raw HTTP/1.1 response into (status, body).
-pub fn parse_guest_http(raw: &[u8]) -> (StatusCode, Vec<u8>) {
-    let split = raw.windows(4).position(|w| w == b"\r\n\r\n");
-    let Some(pos) = split else {
-        return (StatusCode::OK, raw.to_vec());
-    };
-    let head = String::from_utf8_lossy(&raw[..pos]);
-    let status = head
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|c| c.parse::<u16>().ok())
-        .and_then(|c| StatusCode::from_u16(c).ok())
-        .unwrap_or(StatusCode::OK);
-    (status, raw[pos + 4..].to_vec())
-}
-
 async fn entry(State(gw): State<Gateway>, headers: HeaderMap, req: Request<Body>) -> Response {
     let Some(host) = headers
         .get("host")
@@ -352,8 +359,46 @@ async fn entry(State(gw): State<Gateway>, headers: HeaderMap, req: Request<Body>
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
-    gw.handle(host, path).await
+    let method = req.method().as_str().to_string();
+    let mut forwarded_headers = Vec::new();
+    for (name, value) in &headers {
+        if name == "host" || name == "content-length" {
+            continue;
+        }
+        let Ok(value) = value.to_str() else {
+            return gw_error(
+                StatusCode::BAD_REQUEST,
+                format!("header {name} is not valid text"),
+            );
+        };
+        forwarded_headers.push((name.as_str().to_string(), value.to_string()));
+    }
+    forwarded_headers.push(("x-forwarded-host".to_string(), host.clone()));
+    let body = match to_bytes(req.into_body(), MAX_PROXY_REQUEST_BYTES).await {
+        Ok(body) => body.to_vec(),
+        Err(_) => {
+            return gw_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("request body exceeds {MAX_PROXY_REQUEST_BYTES} bytes"),
+            )
+        }
+    };
+    gw.handle(
+        host,
+        ProxyHttpRequest {
+            method,
+            path,
+            headers: forwarded_headers,
+            body,
+            // Resolved per attempt so stale-route retry uses the fresh values.
+            target_port: 0,
+            route_epoch: 0,
+        },
+    )
+    .await
 }
+
+const MAX_PROXY_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
 pub async fn spawn(cfg: GatewayConfig) -> anyhow::Result<Handle> {
     let gw = Gateway {
@@ -378,27 +423,4 @@ pub async fn spawn(cfg: GatewayConfig) -> anyhow::Result<Handle> {
     });
     tracing::info!(%addr, "gateway ready");
     Ok(Handle { addr, task })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn guest_http_parsing() {
-        let raw = b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello";
-        let (status, body) = parse_guest_http(raw);
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, b"hello");
-
-        let raw = b"HTTP/1.1 404 Not Found\r\n\r\n";
-        let (status, body) = parse_guest_http(raw);
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert!(body.is_empty());
-
-        // Degenerate payload falls back to 200 + raw bytes.
-        let (status, body) = parse_guest_http(b"junk");
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, b"junk");
-    }
 }

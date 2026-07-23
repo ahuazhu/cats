@@ -1,7 +1,18 @@
-<h2 id="publish">Publish a Guest port</h2>
-<pre><code>cats expose dev 3000 --name web --protocol http
+<h2 id="default-url">Default URL</h2>
+<pre><code>cats create dev
+cats endpoint ls dev
+curl https://dev-&lt;cat-suffix&gt;.cats.run/</code></pre>
+<p>Every Cat receives a stable HTTPS Endpoint named <code>web</code>. It forwards to Guest port <code>8080</code> and uses <code>wake_on_request</code>; no <code>cats expose</code> step is required. The URL is tied to the Cat resource, not a host, and is also printed by <code>cats create</code> and <code>cats get</code>.</p>
+<p>The application must listen on <code>0.0.0.0:8080</code> (or <code>:::8080</code>). A service bound only to Guest loopback cannot be reached through the tap network.</p>
+
+<h2 id="additional-ports">Additional ports</h2>
+<pre><code># Repoint the default URL to port 3000
+cats expose dev 3000
+
+# Or add a second URL
+cats expose dev 3000 --name preview --protocol http
 cats endpoint ls dev</code></pre>
-<p>The command creates an Endpoint with a stable hostname, a target Guest port, and <code>wake_on_request</code> by default. The hostname is tied to the Cat resource, not a particular host.</p>
+<p>Without <code>--name</code>, <code>cats expose</code> reconfigures the default <code>web</code> Endpoint. Use a different name to add a second URL. V1 Endpoints are publicly addressable; do not expose an unauthenticated administration or secrets interface.</p>
 
 <h2 id="wake-policy">Wake policy</h2>
 <pre><code>cats expose dev 3000 --name internal-preview --no-wake</code></pre>
@@ -12,14 +23,14 @@ cats endpoint ls dev</code></pre>
 <p>A client should tolerate <code>503</code> with retry guidance during activation and reconnect after lifecycle or host changes. Stable hostname does not mean stable long-lived connections.</p>
 
 <h2 id="protocols">Protocols and routing safety</h2>
-<p>The V1 product model covers HTTP, HTTPS, WebSocket, and secure WebSocket through a regional edge. The node gateway revalidates project, Cat, target port, and route epoch; an old cached route must fail closed instead of reaching a different Guest.</p>
+<p>The implemented path supports HTTP/1.1 with HTTPS termination at the regional edge. It preserves method, path/query, application headers, response status, and request/response bodies. The owning node revalidates Cat ownership and Running state; an old cached route fails closed instead of reaching a different Guest. WebSocket support is a later milestone.</p>
 
 <h2 id="current-availability">Current source availability</h2>
-<div class="callout warning"><strong>Cloud Hypervisor networking is not complete</strong><p>The endpoint API, route epoch logic, wake flow, and FakeVmm gateway path are implemented and tested. Tap/overlay Guest networking for the Cloud Hypervisor Phase-A runtime is not implemented in this repository. Treat a real CH public Endpoint as unavailable until that milestone lands.</p></div>
+<div class="callout"><strong>Cloud Hypervisor HTTP ingress is available</strong><p>The Endpoint API, route binding, wake flow, per-Cat <code>/30</code> tap, and owning-node HTTP proxy are implemented. Cross-node Guest overlay networking and WebSocket proxying are not yet implemented.</p></div>
 
 <h2 id="guest-service">Prepare the Guest service</h2>
 <ol>
-  <li>Listen on the target Guest port, not on a platform-reserved port.</li>
+  <li>Listen on <code>0.0.0.0:8080</code> for the default URL, or on the selected additional Endpoint port.</li>
   <li>Return readiness only after dependencies and disk state are usable.</li>
   <li>Do not expect Cats to preserve application TCP state across sleep.</li>
   <li>If background work must keep the Cat Running, acquire a <a href="/docs/runtime-api/">work lease</a>.</li>

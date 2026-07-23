@@ -18,7 +18,7 @@ Cats 是一套“可休眠、可迁移、带持久磁盘和稳定网络入口的
 
 **产品单位：一个 Cat = 一台长期存在的 Linux microVM**
 
-它有固定名称、RootDisk、私网身份和可选公网 Endpoint。计算可以停止，磁盘和名称继续存在；再次启动时可以落到另一台 Host。
+它有固定名称、RootDisk、私网身份和默认公网 HTTP Endpoint。计算可以停止，磁盘、名称和 URL 继续存在；再次启动时可以落到另一台 Host。
 
 **隔离边界：KVM + Cloud Hypervisor**
 
@@ -173,9 +173,12 @@ cats exec dev -- git status
 cats cp ./config.json dev:/workspace/config.json
 cats logs dev --follow
 
-# 暴露 Guest 的 3000 端口；平台签发 TLS
-cats expose dev 3000 --name web --protocol http
+# 创建时已经获得 https://dev-<cat-suffix>.cats.run → Guest:8080
 cats endpoint ls dev
+
+# 可选：把默认 URL 改到 3000，或用其他 --name 增加 URL
+cats expose dev 3000
+cats expose dev 3000 --name preview --protocol http
 
 # 生命周期：Suspend 保留进程状态但绑定当前 Host（内部含 Suspended/Warm 两层，见 ADR-0002）；
 # Stop 释放整台 VM
@@ -625,8 +628,9 @@ Cat 间和出站网络。Node tap/bridge 接入 routed overlay；网络策略在
 
 **当前 V1 dev 形态：**Node 为每个 Cat 创建独立 `/30` tap，Guest 地址由 Node
 分配并在启动时配置，Host 使用 SNAT 提供公网出站。Host 本机、RFC1918 私网和云
-metadata 地址在 FORWARD 前显式阻断；跨 Node overlay、项目内服务发现和公网入站
-仍属于后续网络里程碑。
+metadata 地址在 FORWARD 前显式阻断。公网 HTTP 入站由 Edge/Gateway 解析稳定
+Endpoint，再由 owning Node 连接 Guest tap 地址；跨 Node overlay、项目内服务发现和
+WebSocket 入站仍属于后续网络里程碑。
 
 ### 公网服务
 
@@ -636,7 +640,7 @@ DNS/TLS/WAF/Edge → owning Node gateway → Guest port，按 Endpoint 独立鉴
 
 **1. DNS**
 
-`web.dev.acme.cats.example` 指向区域 Edge；不指向某台裸金属 Node。
+`dev-<opaque-cat-suffix>.cats.run` 指向区域 Edge；不指向某台裸金属 Node。
 
 **2. TLS / WAF**
 
@@ -671,7 +675,7 @@ Node 再校验 route epoch 和 Guest IP，拒绝旧绑定与跨租户端口。
 | 出站 | Host SNAT，共享区域 egress；DNS 由平台 resolver 提供 | 项目固定 Egress IP、PrivateLink、NAT gateway pool |
 | 入站 | HTTP/HTTPS/WS/WSS，Edge TLS termination；Guest 不需要证书 | 受限 TCP endpoint、UDP、TLS passthrough |
 | 服务发现 | `<cat>.<project>.internal` → 项目内稳定地址 | 按 Endpoint 的服务别名与负载均衡 |
-| 策略 | 默认同项目可达、跨项目拒绝；Endpoint 显式开放；Host 反欺骗 | 用户可配置 ingress/egress policy |
+| 策略 | 默认 HTTP Endpoint 公网可寻址；Host 反欺骗 | 私有 Endpoint、逐 Endpoint 身份策略、用户可配置 ingress/egress policy |
 
 **路由安全不变量：**Route cache 的 key 必须包含规范化 hostname；结果必须包含 tenant/project/cat/node/epoch；Node gateway 必须再次验证 epoch 和目标端口。不能只相信 Edge 传来的 Guest IP，也不能让请求头直接指定后端地址。
 

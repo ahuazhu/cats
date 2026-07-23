@@ -51,6 +51,7 @@ cats unmount DISK</code></pre>
 <h2 id="endpoint-commands">Endpoint 命令</h2>
 <pre><code>cats expose CAT PORT [--name web] [--protocol http] [--no-wake]
 cats endpoint ls CAT</code></pre>
+<p>每个 Cat 已经拥有转发 8080 的 <code>web</code> Endpoint。<code>cats expose CAT PORT</code> 会重新配置它；使用其他 <code>--name</code> 可增加 URL。</p>
 
 <h2 id="operation-commands">Operation 命令</h2>
 <pre><code>cats operation ls

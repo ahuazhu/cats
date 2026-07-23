@@ -287,6 +287,7 @@ impl Cluster {
     }
 
     async fn gateway_get(&self, hostname: &str, path: &str) -> (u16, String) {
+        let hostname = hostname.strip_prefix("https://").unwrap_or(hostname);
         let resp = self
             .http
             .get(format!("{}{}", self.gateway.base_url(), path))
@@ -297,6 +298,16 @@ impl Cluster {
         let status = resp.status().as_u16();
         let body = resp.text().await.unwrap();
         (status, body)
+    }
+
+    async fn endpoint_hostname(&self, cat: &str, name: &str) -> String {
+        let output = self.cli_ok(&["--json", "endpoint", "ls", cat]).await;
+        let endpoints: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
+        endpoints
+            .into_iter()
+            .find(|endpoint| endpoint["name"] == name)
+            .and_then(|endpoint| endpoint["hostname"].as_str().map(str::to_string))
+            .unwrap_or_else(|| panic!("missing endpoint {name} for {cat}"))
     }
 
     /// Kill every child process a node runtime spawned (used at test end;
@@ -351,11 +362,7 @@ async fn work_driven_fast_suspend_and_gateway_wake_loop() {
 
     let status = cluster.cli_ok(&["sleep", "status", "nap"]).await;
     assert!(status.contains("auto-suspend=on"), "status: {status}");
-    let hostname = cluster
-        .cli_ok(&["expose", "nap", "8080", "--name", "web"])
-        .await
-        .trim()
-        .to_string();
+    let hostname = cluster.endpoint_hostname("nap", "web").await;
 
     let (status, first) = cluster.gateway_get(&hostname, "/first").await;
     assert_eq!(status, 200, "first wake failed: {first}");
@@ -420,13 +427,12 @@ async fn product_loop_end_to_end() {
     let payload = b"root-disk-payload".to_vec();
     cluster.guest_write(&node_a, &cat_id, &root_disk_id, 8192, &payload);
 
-    // Expose an endpoint and reach the guest through the gateway.
-    let hostname = cluster
-        .cli_ok(&["expose", "dev", "8080", "--name", "web"])
-        .await
-        .trim()
-        .to_string();
-    assert_eq!(hostname, "web.dev.default.cats.local");
+    // Every Cat has a default endpoint; no explicit expose step is required.
+    let hostname = cluster.endpoint_hostname("dev", "web").await;
+    assert!(
+        hostname.starts_with("dev-") && hostname.ends_with(".cats.run"),
+        "default hostname: {hostname}"
+    );
     let (status, body) = cluster.gateway_get(&hostname, "/hello").await;
     assert_eq!(status, 200, "gateway body: {body}");
     let boot_running = extract(&body, "boot_id");
@@ -486,8 +492,16 @@ async fn product_loop_end_to_end() {
         .base_url();
     let stale = cluster
         .http
-        .get(format!("{old_agent}/v1/cats/{cat_id}/proxy"))
+        .post(format!("{old_agent}/v1/cats/{cat_id}/proxy"))
         .bearer_auth(SERVICE_TOKEN)
+        .json(&cats_api::requests::ProxyHttpRequest {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+            target_port: 8080,
+            route_epoch: 1,
+        })
         .send()
         .await
         .unwrap();

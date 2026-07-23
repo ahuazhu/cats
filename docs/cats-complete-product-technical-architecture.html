@@ -186,7 +186,7 @@
       <p class="lead">Cats 是一套“可休眠、可迁移、带持久磁盘和稳定网络入口的 Linux microVM”产品。用户只操作 Cat、Disk、Snapshot、Endpoint、Secret 和 Image；KVM、JuiceFS、对象存储、NVMe、vhost-user、租约和节点网络全部是平台内部实现。</p>
 
       <div class="decision-grid">
-        <div class="decision"><strong>产品单位：一个 Cat = 一台长期存在的 Linux microVM</strong><p>它有固定名称、RootDisk、私网身份和可选公网 Endpoint。计算可以停止，磁盘和名称继续存在；再次启动时可以落到另一台 Host。</p></div>
+        <div class="decision"><strong>产品单位：一个 Cat = 一台长期存在的 Linux microVM</strong><p>它有固定名称、RootDisk、私网身份和默认公网 HTTP Endpoint。计算可以停止，磁盘、名称和 URL 继续存在；再次启动时可以落到另一台 Host。</p></div>
         <div class="decision"><strong>隔离边界：KVM + Cloud Hypervisor</strong><p>每个 Cat 有独立 Guest Kernel，不与其他租户共享内核。Node 上的 cat-agent 负责 VMM、块后端、tap、cgroup 和生命周期，不允许用户接触 Host。</p></div>
         <div class="decision"><strong>控制面：声明式资源 + 异步 Operation</strong><p><code>cats</code> CLI、Dashboard 和 SDK 调用同一套版本化 API。PostgreSQL 保存权威状态；Controller 通过 reconcile 将 desired state 收敛为 observed state。</p></div>
         <div class="decision"><strong>数据面：Host 本地热路径，远端服务作持久底座</strong><p>VM I/O、网络转发和 exec 数据流不经过中央 API 进程。RootDisk/PersistentDisk 以 ext4 块设备呈现，NVMe 加速，对象存储保存可恢复副本。</p></div>
@@ -318,8 +318,12 @@ cats cp ./config.json dev:/workspace/config.json
 cats logs dev --follow
 
 # 暴露 Guest 的 3000 端口；平台签发 TLS
-cats expose dev 3000 --name web --protocol http
+# 创建时已经获得 https://dev-&lt;cat-suffix&gt;.cats.run → Guest:8080
 cats endpoint ls dev
+
+# 可选：把默认 URL 改到 3000，或用其他 --name 增加 URL
+cats expose dev 3000
+cats expose dev 3000 --name preview --protocol http
 
 # 生命周期：Suspend 保留内存但绑定当前 Host；Stop 释放整台 VM
 cats suspend dev
@@ -579,11 +583,11 @@ COMMIT;
         <article class="card"><h3>公网服务</h3><p>DNS/TLS/WAF/Edge → owning Node gateway → Guest port，按 Endpoint 独立鉴权和计量。</p></article>
       </div>
 
-      <div class="callout"><strong>当前 V1 dev 形态：</strong>Node 为每个 Cat 创建独立 <code>/30</code> tap，Guest 地址由 Node 分配并在启动时配置，Host 使用 SNAT 提供公网出站。Host 本机、RFC1918 私网和云 metadata 地址在 FORWARD 前显式阻断；跨 Node overlay、项目内服务发现和公网入站仍属于后续网络里程碑。</div>
+      <div class="callout"><strong>当前 V1 dev 形态：</strong>Node 为每个 Cat 创建独立 <code>/30</code> tap，Guest 地址由 Node 分配并在启动时配置，Host 使用 SNAT 提供公网出站。Host 本机、RFC1918 私网和云 metadata 地址在 FORWARD 前显式阻断。公网 HTTP 入站由 Edge/Gateway 解析稳定 Endpoint，再由 owning Node 连接 Guest tap 地址；跨 Node overlay、项目内服务发现和 WebSocket 入站仍属于后续网络里程碑。</div>
 
       <h3 style="margin-top:28px">9.1 公网请求路径</h3>
       <div class="flow">
-        <div class="step"><b>1. DNS</b><p><code>web.dev.acme.cats.example</code> 指向区域 Edge；不指向某台裸金属 Node。</p></div>
+        <div class="step"><b>1. DNS</b><p><code>dev-&lt;opaque-cat-suffix&gt;.cats.run</code> 指向区域 Edge；不指向某台裸金属 Node。</p></div>
         <div class="step"><b>2. TLS / WAF</b><p>Edge 选择证书、校验 Host/SNI、执行限流和最大请求策略。</p></div>
         <div class="step"><b>3. Route Lookup</b><p>按 hostname 查只读缓存，得到 project/cat/node/port/epoch。</p></div>
         <div class="step"><b>4. Activation</b><p>Cat 非 Running 时按 wake policy 唤醒；并发请求 singleflight。</p></div>
@@ -602,7 +606,7 @@ COMMIT;
             <tr><td>出站</td><td>Host SNAT，共享区域 egress；DNS 由平台 resolver 提供</td><td>项目固定 Egress IP、PrivateLink、NAT gateway pool</td></tr>
             <tr><td>入站</td><td>HTTP/HTTPS/WS/WSS，Edge TLS termination；Guest 不需要证书</td><td>受限 TCP endpoint、UDP、TLS passthrough</td></tr>
             <tr><td>服务发现</td><td><code>&lt;cat&gt;.&lt;project&gt;.internal</code> → 项目内稳定地址</td><td>按 Endpoint 的服务别名与负载均衡</td></tr>
-            <tr><td>策略</td><td>默认同项目可达、跨项目拒绝；Endpoint 显式开放；Host 反欺骗</td><td>用户可配置 ingress/egress policy</td></tr>
+            <tr><td>策略</td><td>默认 HTTP Endpoint 公网可寻址；Host 反欺骗</td><td>私有 Endpoint、逐 Endpoint 身份策略、用户可配置 ingress/egress policy</td></tr>
           </tbody>
         </table>
       </div>

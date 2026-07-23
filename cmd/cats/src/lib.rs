@@ -516,6 +516,13 @@ pub fn run(cli: Cli) -> Result<()> {
                     .json(&body),
             )?;
             mutate(resp)?;
+            if !cli.json {
+                let endpoints: ListResponse<Endpoint> =
+                    serde_json::from_value(client.get(&format!("/cats/{name}/endpoints"))?)?;
+                if let Some(endpoint) = endpoints.items.iter().find(|ep| ep.name == "web") {
+                    println!("URL: https://{}", endpoint.hostname);
+                }
+            }
             Ok(())
         }
         Command::Ls => {
@@ -533,6 +540,13 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Get { name } => {
             let cat: Cat = serde_json::from_value(client.get(&format!("/cats/{name}"))?)?;
             print_cat(&cat, cli.json);
+            if !cli.json {
+                let endpoints: ListResponse<Endpoint> =
+                    serde_json::from_value(client.get(&format!("/cats/{name}/endpoints"))?)?;
+                if let Some(endpoint) = endpoints.items.iter().find(|ep| ep.name == "web") {
+                    println!("URL: https://{}", endpoint.hostname);
+                }
+            }
             Ok(())
         }
         Command::Start { name } => {
@@ -631,17 +645,24 @@ pub fn run(cli: Cli) -> Result<()> {
                 })),
             )?;
             let resp: EndpointResponse = serde_json::from_value(v)?;
-            println!("{}", resp.endpoint.hostname);
+            println!("https://{}", resp.endpoint.hostname);
             Ok(())
         }
         Command::Endpoint { cmd } => match cmd {
             EndpointCommand::Ls { cat } => {
                 let v = client.get(&format!("/cats/{cat}/endpoints"))?;
                 let list: ListResponse<Endpoint> = serde_json::from_value(v)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&list.items)?);
+                    return Ok(());
+                }
                 for ep in list.items {
                     println!(
                         "{:<12} {:<40} port={} wake={:?}",
-                        ep.name, ep.hostname, ep.target_port, ep.wake_policy
+                        ep.name,
+                        format!("https://{}", ep.hostname),
+                        ep.target_port,
+                        ep.wake_policy
                     );
                 }
                 Ok(())

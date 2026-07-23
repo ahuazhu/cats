@@ -62,6 +62,8 @@
     cats expose CAT PORT [--name web] [--protocol http] [--no-wake]
     cats endpoint ls CAT
 
+每个 Cat 已经拥有转发 8080 的 `web` Endpoint。`cats expose CAT PORT` 会重新配置它；使用其他 `--name` 可增加 URL。
+
 ## Operation 命令
 
     cats operation ls

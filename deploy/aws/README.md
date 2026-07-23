@@ -30,6 +30,9 @@ transaction. The visible Guest includes apt/curl/wget/git; cloud-init, snapd,
 LXD and wait-online are not on the Cold-to-Agent readiness path. Each Cat gets
 an isolated tap `/30` with outbound host NAT; host, VPC-private and cloud
 metadata destinations are blocked before the general egress allow rule.
+Every Cat receives a stable wildcard HTTPS Endpoint for Guest port 8080; the
+ALB sends wildcard hosts to `cats-gatewayd`, which resolves the owning worker
+and the worker connects the service through that Cat's tap address.
 
 The control resource database remains SQLite on one encrypted RWO EBS volume,
 so `cats-controld` intentionally has one replica and uses `Recreate`. Shared
