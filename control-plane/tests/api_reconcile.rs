@@ -137,6 +137,15 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
                 })
                 .collect();
             let observed_cats = cats.len() as u64;
+            let cat_resources = cats
+                .iter()
+                .map(|cat| CatResourceTelemetry {
+                    cat_id: cat.cat_id.clone(),
+                    cpu_usage_cores: Some(0.25),
+                    memory_rss_bytes: Some(128 * 1024 * 1024),
+                    host_disk_used_bytes: Some(32 * 1024 * 1024),
+                })
+                .collect();
             let _ = client
                 .post(format!("{base}/v1/nodes/heartbeat"))
                 .bearer_auth(SERVICE_TOKEN)
@@ -147,6 +156,7 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
                         observed_cats,
                         allocated_cpus: 0,
                         allocated_memory_mib: 0,
+                        cat_resources,
                         host_logical_cpus: Some(16),
                         host_cpu_usage_percent: Some(12.5),
                         load_average_1m: Some(0.25),
@@ -1016,6 +1026,26 @@ async fn admin_can_monitor_and_drain_nodes() {
         Some(50 * 1024 * 1024 * 1024)
     );
 
+    let node_cats: ListResponse<NodeCatSummary> = ctx
+        .http
+        .get(ctx.url("/v1/admin/nodes/node_a/cats"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(node_cats.items.len(), 1);
+    assert_eq!(node_cats.items[0].cat.name, "drain-me");
+    assert_eq!(node_cats.items[0].requested_disk_bytes, 8 << 20);
+    let actual = node_cats.items[0].actual.as_ref().unwrap();
+    assert_eq!(actual.cpu_usage_cores, Some(0.25));
+    assert_eq!(actual.memory_rss_bytes, Some(128 * 1024 * 1024));
+    assert_eq!(actual.host_disk_used_bytes, Some(32 * 1024 * 1024));
+
     let prometheus = ctx
         .http
         .get(ctx.url("/metrics"))
@@ -1032,6 +1062,9 @@ async fn admin_can_monitor_and_drain_nodes() {
     assert!(prometheus.contains("cats_node_load_average_1m{node_id=\"node_a\"} 0.25"));
     assert!(prometheus.contains("cats_node_cpu_usage_percent{node_id=\"node_a\"} 12.5"));
     assert!(prometheus.contains("cats_node_disk_used_bytes{node_id=\"node_a\"} 26843545600"));
+    assert!(prometheus.contains("cats_cat_cpu_usage_cores{node_id=\"node_a\",cat_id=\""));
+    assert!(prometheus.contains("cats_cat_memory_rss_bytes{node_id=\"node_a\",cat_id=\""));
+    assert!(prometheus.contains("cats_cat_host_disk_used_bytes{node_id=\"node_a\",cat_id=\""));
 
     let drain = ctx
         .http

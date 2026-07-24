@@ -195,6 +195,23 @@ pub struct NodeCapacity {
     pub memory_mib: u64,
 }
 
+/// Actual host resources attributed to one Cat by its owning node.
+///
+/// CPU is expressed as logical CPU cores consumed during the latest sample
+/// interval (1.0 means one fully busy logical CPU). Memory is the aggregate
+/// RSS of the Cat's supervised runtime processes. Disk is the allocated host
+/// footprint under the Cat runtime directory, including cache and snapshots.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CatResourceTelemetry {
+    pub cat_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_usage_cores: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_rss_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_disk_used_bytes: Option<u64>,
+}
+
 /// Last telemetry sample reported by a node agent. Host-level values are
 /// optional so development nodes on non-Linux systems can still heartbeat.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -202,6 +219,8 @@ pub struct NodeTelemetry {
     pub observed_cats: u64,
     pub allocated_cpus: u32,
     pub allocated_memory_mib: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cat_resources: Vec<CatResourceTelemetry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_logical_cpus: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -241,6 +260,18 @@ pub struct NodeSummary {
     pub assigned_cpus: u32,
     pub assigned_memory_mib: u64,
     pub heartbeat_age_seconds: u64,
+}
+
+/// Administrator-facing Cat row within one worker node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeCatSummary {
+    pub cat: Cat,
+    /// Provisioned logical capacity across the RootDisk and every bound
+    /// PersistentDisk. This is a request/allocation, not measured usage.
+    pub requested_disk_bytes: u64,
+    /// Missing when the node has not yet published a matching Cat sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual: Option<CatResourceTelemetry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

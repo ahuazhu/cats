@@ -283,6 +283,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/admin/nodes/{id}",
             get(admin_get_node).delete(admin_delete_node),
         )
+        .route("/v1/admin/nodes/{id}/cats", get(admin_node_cats))
         .route(
             "/v1/admin/nodes/{id}/actions/{verb}",
             post(admin_node_action),
@@ -1363,6 +1364,17 @@ async fn admin_get_node(
     Ok(Json(state.store.node_summary(&id)?))
 }
 
+async fn admin_node_cats(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ListResponse<NodeCatSummary>>> {
+    check_admin_auth(&state, &headers).await?;
+    Ok(Json(ListResponse {
+        items: state.store.node_cat_summaries(&id)?,
+    }))
+}
+
 async fn admin_node_action(
     State(state): State<AppState>,
     Path((id, verb)): Path<(String, String)>,
@@ -1678,6 +1690,24 @@ async fn prometheus_metrics(
                         format!("cats_node_disk_used_bytes{{node_id=\"{node_id}\"}}"),
                         total.saturating_sub(available.min(total))
                     );
+                }
+            }
+            for cat in telemetry.cat_resources {
+                let cat_id = cat
+                    .cat_id
+                    .replace('\\', "\\\\")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r")
+                    .replace('"', "\\\"");
+                let labels = format!("node_id=\"{node_id}\",cat_id=\"{cat_id}\"");
+                if let Some(cores) = cat.cpu_usage_cores {
+                    metric!(format!("cats_cat_cpu_usage_cores{{{labels}}}"), cores);
+                }
+                if let Some(bytes) = cat.memory_rss_bytes {
+                    metric!(format!("cats_cat_memory_rss_bytes{{{labels}}}"), bytes);
+                }
+                if let Some(bytes) = cat.host_disk_used_bytes {
+                    metric!(format!("cats_cat_host_disk_used_bytes{{{labels}}}"), bytes);
                 }
             }
         }

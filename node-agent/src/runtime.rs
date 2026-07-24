@@ -140,6 +140,14 @@ pub(crate) struct RuntimeActivityGuard {
     activity: Arc<RuntimeActivity>,
 }
 
+/// Process and filesystem identities used by the heartbeat sampler to
+/// attribute host resource use to one Cat.
+pub(crate) struct CatTelemetryTarget {
+    pub cat_id: String,
+    pub process_ids: Vec<u32>,
+    pub runtime_dir: PathBuf,
+}
+
 impl Drop for RuntimeActivityGuard {
     fn drop(&mut self) {
         let mut inner = self.activity.inner.lock().unwrap();
@@ -280,6 +288,27 @@ impl NodeRuntime {
             allocated_memory_mib: cats.values().map(|runtime| runtime.memory_mib).sum(),
             ..NodeTelemetry::default()
         }
+    }
+
+    /// Runtime identities for actual per-Cat host resource sampling.
+    pub(crate) fn telemetry_targets(&self) -> Vec<CatTelemetryTarget> {
+        self.cats
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(cat_id, runtime)| {
+                let mut process_ids = Vec::with_capacity(runtime.blockds.len() + 1);
+                if let Some(guest) = &runtime.guest {
+                    process_ids.push(guest.id());
+                }
+                process_ids.extend(runtime.blockds.values().map(|blockd| blockd.child.id()));
+                CatTelemetryTarget {
+                    cat_id: cat_id.clone(),
+                    process_ids,
+                    runtime_dir: runtime.dir.clone(),
+                }
+            })
+            .collect()
     }
 
     pub fn execute(&self, job: NodeJob) -> NodeJobResult {

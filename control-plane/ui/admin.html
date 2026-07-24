@@ -94,6 +94,27 @@
     </main>
   </div>
 
+  <dialog class="modal modal-node" id="node-detail-dialog">
+    <form method="dialog">
+      <header>
+        <div><small data-i18n="admin.nodeDetail.eyebrow">WORKER DETAIL</small><h2 id="node-detail-title" data-i18n="admin.nodeDetail.title">Node Cats</h2></div>
+        <button class="icon-button" value="cancel" data-i18n-aria-label="common.close" aria-label="Close">×</button>
+      </header>
+      <div class="node-detail-body">
+        <div id="node-detail-summary"></div>
+        <div class="table-wrap">
+          <table class="node-cats-table">
+            <thead><tr><th data-i18n="admin.nodeDetail.cat">Cat</th><th data-i18n="common.status">Status</th><th data-i18n="admin.nodeDetail.cpu">CPU</th><th data-i18n="admin.nodeDetail.memory">Memory</th><th data-i18n="admin.nodeDetail.disk">Disk</th></tr></thead>
+            <tbody id="node-cats-table"></tbody>
+          </table>
+        </div>
+        <div class="empty-state is-hidden" id="node-cats-empty"><span>◇</span><h3 data-i18n="admin.nodeDetail.emptyTitle">No Cats on this node</h3><p data-i18n="admin.nodeDetail.emptyDescription">This worker currently has no assigned Cats.</p></div>
+        <div class="mini-empty is-hidden" id="node-cats-loading" data-i18n="common.loading">Loading…</div>
+      </div>
+      <footer><button class="button button-quiet" value="cancel" data-i18n="common.close">Close</button></footer>
+    </form>
+  </dialog>
+
   <div class="toast-region" id="toast-region" aria-live="polite"></div>
   <script type="module" src="/ui/admin.js"></script>
 </body>

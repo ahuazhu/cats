@@ -4,9 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -24,11 +25,13 @@ use cats_api::requests::{
     ProxyHttpRequest, RegisterNodeRequest, ShellClientControl, ShellServerControl,
     MAX_SHELL_MESSAGE_BYTES,
 };
-use cats_api::resources::NodeTelemetry;
+use cats_api::resources::{CatResourceTelemetry, NodeTelemetry};
 use cats_storage::MetadataStore;
 
 use crate::guest_client::GuestShell;
-use crate::runtime::{GuestConn, NodeConfig, NodeRuntime, RuntimeActivityGuard};
+use crate::runtime::{
+    CatTelemetryTarget, GuestConn, NodeConfig, NodeRuntime, RuntimeActivityGuard,
+};
 
 async fn watch_guest_work(
     client: reqwest::Client,
@@ -395,6 +398,19 @@ fn cpu_usage_percent(previous: CpuTimes, current: CpuTimes) -> Option<f64> {
     Some((((total - idle) as f64 / total as f64) * 100.0).clamp(0.0, 100.0))
 }
 
+fn process_cpu_usage_cores(
+    previous_ticks: u64,
+    current_ticks: u64,
+    host_interval_ticks: u64,
+    logical_cpus: u32,
+) -> Option<f64> {
+    if host_interval_ticks == 0 || logical_cpus == 0 {
+        return None;
+    }
+    let process_delta = current_ticks.checked_sub(previous_ticks)?;
+    Some(process_delta as f64 / host_interval_ticks as f64 * f64::from(logical_cpus))
+}
+
 fn parse_memory_mib(contents: &str) -> (Option<u64>, Option<u64>) {
     let mut total = None;
     let mut available = None;
@@ -432,8 +448,80 @@ fn filesystem_capacity(path: &FsPath) -> Option<(u64, u64)> {
     ))
 }
 
+fn parse_process_cpu_ticks(contents: &str) -> Option<u64> {
+    // `/proc/<pid>/stat` wraps comm in parentheses and it may contain spaces.
+    // Fields after the final ')' start at process-state (field 3); utime and
+    // stime are fields 14 and 15.
+    let fields: Vec<&str> = contents
+        .get(contents.rfind(')')? + 1..)?
+        .split_whitespace()
+        .collect();
+    let user = fields.get(11)?.parse::<u64>().ok()?;
+    let system = fields.get(12)?.parse::<u64>().ok()?;
+    Some(user.saturating_add(system))
+}
+
+fn parse_process_rss_bytes(contents: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.next()? != "VmRSS:" {
+            return None;
+        }
+        fields
+            .next()?
+            .parse::<u64>()
+            .ok()
+            .map(|kib| kib.saturating_mul(1024))
+    })
+}
+
+fn process_usage(process_ids: &[u32]) -> (Option<u64>, Option<u64>) {
+    if process_ids.is_empty() {
+        return (Some(0), Some(0));
+    }
+    let mut cpu_ticks = 0_u64;
+    let mut rss_bytes = 0_u64;
+    for process_id in process_ids {
+        let stat = std::fs::read_to_string(format!("/proc/{process_id}/stat"))
+            .ok()
+            .and_then(|contents| parse_process_cpu_ticks(&contents));
+        let rss = std::fs::read_to_string(format!("/proc/{process_id}/status"))
+            .ok()
+            .and_then(|contents| parse_process_rss_bytes(&contents));
+        let (Some(stat), Some(rss)) = (stat, rss) else {
+            return (None, None);
+        };
+        cpu_ticks = cpu_ticks.saturating_add(stat);
+        rss_bytes = rss_bytes.saturating_add(rss);
+    }
+    (Some(cpu_ticks), Some(rss_bytes))
+}
+
+fn allocated_tree_bytes(path: &FsPath) -> Option<u64> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    let mut total = metadata.blocks().saturating_mul(512);
+    if metadata.file_type().is_dir() {
+        for entry in std::fs::read_dir(path).ok()? {
+            total = total.saturating_add(allocated_tree_bytes(&entry.ok()?.path())?);
+        }
+    }
+    Some(total)
+}
+
+struct CatCpuSample {
+    process_ids: Vec<u32>,
+    cpu_ticks: u64,
+}
+
+struct CatDiskSample {
+    sampled_at: Instant,
+    used_bytes: u64,
+}
+
 struct HostTelemetrySampler {
     previous_cpu: Option<CpuTimes>,
+    previous_cat_cpu: HashMap<String, CatCpuSample>,
+    cat_disk_samples: HashMap<String, CatDiskSample>,
     disk_path: PathBuf,
 }
 
@@ -443,22 +531,38 @@ impl HostTelemetrySampler {
             previous_cpu: std::fs::read_to_string("/proc/stat")
                 .ok()
                 .and_then(|contents| parse_cpu_times(&contents)),
+            previous_cat_cpu: HashMap::new(),
+            cat_disk_samples: HashMap::new(),
             disk_path,
         }
     }
 
-    fn sample(&mut self, mut telemetry: NodeTelemetry) -> NodeTelemetry {
-        telemetry.host_logical_cpus = std::thread::available_parallelism()
+    fn sample(
+        &mut self,
+        mut telemetry: NodeTelemetry,
+        targets: Vec<CatTelemetryTarget>,
+    ) -> NodeTelemetry {
+        let logical_cpus = std::thread::available_parallelism()
             .ok()
             .and_then(|count| u32::try_from(count.get()).ok());
+        telemetry.host_logical_cpus = logical_cpus;
         telemetry.load_average_1m = std::fs::read_to_string("/proc/loadavg")
             .ok()
             .and_then(|contents| contents.split_whitespace().next()?.parse().ok());
 
-        if let Some(current) = std::fs::read_to_string("/proc/stat")
+        let current_cpu = std::fs::read_to_string("/proc/stat")
             .ok()
-            .and_then(|contents| parse_cpu_times(&contents))
-        {
+            .and_then(|contents| parse_cpu_times(&contents));
+        let host_interval_ticks =
+            self.previous_cpu
+                .zip(current_cpu)
+                .and_then(|(previous, current)| {
+                    current
+                        .total
+                        .checked_sub(previous.total)
+                        .filter(|value| *value > 0)
+                });
+        if let Some(current) = current_cpu {
             telemetry.host_cpu_usage_percent = self
                 .previous_cpu
                 .and_then(|previous| cpu_usage_percent(previous, current));
@@ -475,6 +579,63 @@ impl HostTelemetrySampler {
             telemetry.host_disk_total_bytes = Some(total);
             telemetry.host_disk_available_bytes = Some(available);
         }
+
+        let now = Instant::now();
+        let mut current_cat_cpu = HashMap::new();
+        telemetry.cat_resources = targets
+            .into_iter()
+            .map(|mut target| {
+                target.process_ids.sort_unstable();
+                let (cpu_ticks, memory_rss_bytes) = process_usage(&target.process_ids);
+                let cpu_usage_cores = cpu_ticks.and_then(|ticks| {
+                    let previous = self.previous_cat_cpu.get(&target.cat_id)?;
+                    if previous.process_ids != target.process_ids {
+                        return None;
+                    }
+                    let host_delta = host_interval_ticks?;
+                    process_cpu_usage_cores(previous.cpu_ticks, ticks, host_delta, logical_cpus?)
+                });
+                if let Some(ticks) = cpu_ticks {
+                    current_cat_cpu.insert(
+                        target.cat_id.clone(),
+                        CatCpuSample {
+                            process_ids: target.process_ids,
+                            cpu_ticks: ticks,
+                        },
+                    );
+                }
+
+                let host_disk_used_bytes = match self.cat_disk_samples.get(&target.cat_id) {
+                    Some(sample)
+                        if now.duration_since(sample.sampled_at) < Duration::from_secs(5) =>
+                    {
+                        Some(sample.used_bytes)
+                    }
+                    _ => allocated_tree_bytes(&target.runtime_dir).inspect(|used_bytes| {
+                        self.cat_disk_samples.insert(
+                            target.cat_id.clone(),
+                            CatDiskSample {
+                                sampled_at: now,
+                                used_bytes: *used_bytes,
+                            },
+                        );
+                    }),
+                };
+                CatResourceTelemetry {
+                    cat_id: target.cat_id,
+                    cpu_usage_cores,
+                    memory_rss_bytes,
+                    host_disk_used_bytes,
+                }
+            })
+            .collect();
+        self.previous_cat_cpu = current_cat_cpu;
+        self.cat_disk_samples.retain(|cat_id, _| {
+            telemetry
+                .cat_resources
+                .iter()
+                .any(|item| &item.cat_id == cat_id)
+        });
         telemetry
     }
 }
@@ -569,7 +730,10 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
                 .json(&HeartbeatRequest {
                     node_id: hb_state.cfg.node.node_id.clone(),
                     cats,
-                    telemetry: Some(telemetry_sampler.sample(hb_state.runtime.telemetry())),
+                    telemetry: Some(telemetry_sampler.sample(
+                        hb_state.runtime.telemetry(),
+                        hb_state.runtime.telemetry_targets(),
+                    )),
                 })
                 .send()
                 .await;
@@ -627,7 +791,11 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
 
 #[cfg(test)]
 mod telemetry_tests {
-    use super::{cpu_usage_percent, filesystem_capacity, parse_cpu_times, parse_memory_mib};
+    use super::{
+        allocated_tree_bytes, cpu_usage_percent, filesystem_capacity, parse_cpu_times,
+        parse_memory_mib, parse_process_cpu_ticks, parse_process_rss_bytes,
+        process_cpu_usage_cores,
+    };
 
     #[test]
     fn parses_cpu_and_calculates_interval_usage() {
@@ -647,10 +815,41 @@ mod telemetry_tests {
     }
 
     #[test]
+    fn calculates_process_cpu_as_consumed_logical_cores() {
+        let cores = process_cpu_usage_cores(100, 150, 400, 8).unwrap();
+        assert!((cores - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn reads_capacity_for_an_existing_filesystem() {
         let temp = tempfile::tempdir().unwrap();
         let (total, available) = filesystem_capacity(temp.path()).unwrap();
         assert!(total > 0);
         assert!(available <= total);
+    }
+
+    #[test]
+    fn parses_process_cpu_and_rss() {
+        let stat = "123 (cloud hypervisor) S 1 2 3 4 5 6 7 8 9 10 20 7 0 0 0";
+        assert_eq!(parse_process_cpu_ticks(stat), Some(27));
+        assert_eq!(
+            parse_process_rss_bytes("Name:\tcloud-hypervisor\nVmRSS:\t  1234 kB\n"),
+            Some(1_263_616)
+        );
+    }
+
+    #[test]
+    fn measures_allocated_runtime_tree_without_following_symlinks() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("cache")).unwrap();
+        let mut file = std::fs::File::create(temp.path().join("cache/chunk")).unwrap();
+        file.write_all(&vec![1_u8; 8192]).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("cache"), temp.path().join("cache-link"))
+            .unwrap();
+        let used = allocated_tree_bytes(temp.path()).unwrap();
+        assert!(used >= 8192);
+        assert!(used < 32 * 1024 * 1024);
     }
 }

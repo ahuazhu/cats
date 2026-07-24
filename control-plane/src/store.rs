@@ -1466,7 +1466,8 @@ impl Store {
 
     pub fn cats_on_node(&self, node_id: &str) -> Result<Vec<Cat>> {
         self.with(|c| {
-            let mut stmt = c.prepare("SELECT * FROM cats WHERE node_id=?1")?;
+            let mut stmt =
+                c.prepare("SELECT * FROM cats WHERE node_id=?1 ORDER BY project, name")?;
             let rows = stmt.query_map(params![node_id], row_to_cat)?;
             rows.collect()
         })
@@ -1484,6 +1485,35 @@ impl Store {
             .map(|node| {
                 let cats = self.cats_on_node(&node.id)?;
                 Ok(summarize_node(node, &cats))
+            })
+            .collect()
+    }
+
+    pub fn node_cat_summaries(&self, node_id: &str) -> Result<Vec<NodeCatSummary>> {
+        let node = self.get_node(node_id)?;
+        let mut actual_by_cat: HashMap<String, CatResourceTelemetry> = node
+            .telemetry
+            .map(|telemetry| {
+                telemetry
+                    .cat_resources
+                    .into_iter()
+                    .map(|actual| (actual.cat_id.clone(), actual))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.cats_on_node(node_id)?
+            .into_iter()
+            .map(|cat| {
+                let requested_disk_bytes = self
+                    .list_disks_for_cat(&cat.id)?
+                    .into_iter()
+                    .fold(0_u64, |total, disk| total.saturating_add(disk.size_bytes));
+                let actual = actual_by_cat.remove(&cat.id);
+                Ok(NodeCatSummary {
+                    cat,
+                    requested_disk_bytes,
+                    actual,
+                })
             })
             .collect()
     }

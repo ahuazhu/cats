@@ -19,6 +19,9 @@ const state = {
   nodes: [],
   metrics: "",
   activeView: "overview",
+  selectedNodeId: null,
+  nodeCats: [],
+  nodeDetailsLoading: false,
   timer: null,
 };
 const loginScreen = document.querySelector("#login-screen");
@@ -93,6 +96,9 @@ async function loadAll({ quiet = false } = {}) {
     state.overview = overview;
     state.nodes = nodes.items || [];
     render();
+    if (state.selectedNodeId && document.querySelector("#node-detail-dialog").open) {
+      await loadNodeCats(state.selectedNodeId, { quiet: true });
+    }
     if (state.activeView === "metrics") await loadMetrics();
   } catch (error) {
     if (error.status === 401 || error.status === 403) {
@@ -160,7 +166,7 @@ function render() {
     [t("admin.lifecycle.failedUnknown"), overview.cats.failed_or_unknown],
   ].map(([label, value]) => lifecycleRow(label, value, overview.cats.total)).join("")}</div>`;
   document.querySelector("#node-health-strip").innerHTML = state.nodes.length
-    ? `<div class="health-strip">${state.nodes.map((summary) => `<article class="health-node"><header><strong>${escapeHtml(summary.node.id)}</strong>${statusBadge(summary.node.state)}</header><p>${escapeHtml(summary.assigned_cats)} Cats · ${escapeHtml(t("admin.node.heartbeatAgo", { seconds: summary.heartbeat_age_seconds }))}</p></article>`).join("")}</div>`
+    ? `<div class="health-strip">${state.nodes.map((summary) => `<button class="health-node node-select-card" type="button" data-node-detail="${escapeHtml(summary.node.id)}"><header><strong>${escapeHtml(summary.node.id)}</strong>${statusBadge(summary.node.state)}</header><p>${escapeHtml(summary.assigned_cats)} Cats · ${escapeHtml(t("admin.node.heartbeatAgo", { seconds: summary.heartbeat_age_seconds }))}</p></button>`).join("")}</div>`
     : `<div class="mini-empty">${escapeHtml(t("admin.empty.nodes"))}</div>`;
   renderNodes();
 }
@@ -216,7 +222,7 @@ function renderNodes() {
   const empty = document.querySelector("#nodes-empty");
   empty.classList.toggle("is-hidden", state.nodes.length !== 0);
   body.closest(".table-wrap").classList.toggle("is-hidden", state.nodes.length === 0);
-  body.innerHTML = state.nodes.map((summary) => `<tr>
+  body.innerHTML = state.nodes.map((summary) => `<tr class="node-row" data-node-detail="${escapeHtml(summary.node.id)}" tabindex="0">
     <td><div class="resource-name"><span class="resource-avatar node-avatar">N</span><span><strong>${escapeHtml(summary.node.id)}</strong><small>${escapeHtml(summary.node.agent_url)}</small></span></div></td>
     <td>${statusBadge(summary.node.state)}</td>
     <td>${escapeHtml(summary.assigned_cats)} Cats<br><small>${escapeHtml(summary.assigned_cpus)} vCPU · ${escapeHtml(formatMib(summary.assigned_memory_mib))}</small></td>
@@ -225,6 +231,89 @@ function renderNodes() {
     <td class="host-telemetry-cell">${telemetrySummary(summary.node.telemetry)}</td>
     <td><div class="row-actions">${nodeActions(summary)}</div></td>
   </tr>`).join("");
+}
+
+function requestedActual(requested, actual, actualLabel = t("admin.nodeDetail.actual")) {
+  const actualClass = actual === t("admin.nodeDetail.unavailable") ? "node-detail-unavailable" : "";
+  return `<div class="resource-comparison">
+    <span><small>${escapeHtml(t("admin.nodeDetail.requested"))}</small><strong>${escapeHtml(requested)}</strong></span>
+    <span class="actual"><small>${escapeHtml(actualLabel)}</small><strong class="${actualClass}">${escapeHtml(actual)}</strong></span>
+  </div>`;
+}
+
+function actualValue(value, formatter) {
+  return value == null || !Number.isFinite(Number(value))
+    ? t("admin.nodeDetail.unavailable")
+    : formatter(Number(value));
+}
+
+function renderNodeDetails() {
+  const summary = state.nodes.find((item) => item.node.id === state.selectedNodeId);
+  if (!summary) return;
+  document.querySelector("#node-detail-title").textContent = summary.node.id;
+  document.querySelector("#node-detail-summary").innerHTML = `<section class="node-detail-summary">
+    <div class="node-detail-identity"><span class="resource-avatar node-avatar">N</span><span><strong>${escapeHtml(summary.node.id)}</strong><small>${escapeHtml(summary.node.agent_url)}</small><small>${escapeHtml(t("admin.node.heartbeatAgo", { seconds: summary.heartbeat_age_seconds }))}</small></span>${statusBadge(summary.node.state)}</div>
+    ${telemetrySummary(summary.node.telemetry)}
+  </section>`;
+
+  const body = document.querySelector("#node-cats-table");
+  const table = body.closest(".table-wrap");
+  const empty = document.querySelector("#node-cats-empty");
+  const loading = document.querySelector("#node-cats-loading");
+  loading.classList.toggle("is-hidden", !state.nodeDetailsLoading);
+  table.classList.toggle("is-hidden", state.nodeDetailsLoading || state.nodeCats.length === 0);
+  empty.classList.toggle("is-hidden", state.nodeDetailsLoading || state.nodeCats.length !== 0);
+  body.innerHTML = state.nodeCats.map((item) => {
+    const actual = item.actual || {};
+    return `<tr>
+      <td><div class="resource-name"><span class="resource-avatar">C</span><span><strong>${escapeHtml(item.cat.name)}</strong><small>${escapeHtml(item.cat.project)} · ${escapeHtml(item.cat.id)}</small></span></div></td>
+      <td>${statusBadge(item.cat.observed_state)}<br><small>${escapeHtml(t("common.generation", { value: item.cat.generation }))}</small></td>
+      <td>${requestedActual(
+        `${item.cat.spec.cpus} ${t("admin.unit.vcpus")}`,
+        actualValue(actual.cpu_usage_cores, (value) => `${value.toFixed(2)} ${t("admin.unit.vcpus")}`),
+      )}</td>
+      <td>${requestedActual(
+        formatMib(item.cat.spec.memory_mib),
+        actualValue(actual.memory_rss_bytes, formatBytes),
+        t("admin.nodeDetail.processRss"),
+      )}</td>
+      <td>${requestedActual(
+        formatBytes(item.requested_disk_bytes),
+        actualValue(actual.host_disk_used_bytes, formatBytes),
+        t("admin.nodeDetail.hostFootprint"),
+      )}</td>
+    </tr>`;
+  }).join("");
+}
+
+async function loadNodeCats(id, { quiet = false } = {}) {
+  if (!quiet) {
+    state.nodeDetailsLoading = true;
+    state.nodeCats = [];
+    renderNodeDetails();
+  }
+  try {
+    const response = await authenticatedRequest(`/v1/admin/nodes/${encodeURIComponent(id)}/cats`);
+    if (state.selectedNodeId === id) state.nodeCats = response.items || [];
+  } catch (error) {
+    if (!quiet) toast(t("admin.nodeDetail.loadFailed"), error.message, "error");
+    throw error;
+  } finally {
+    if (state.selectedNodeId === id) {
+      state.nodeDetailsLoading = false;
+      renderNodeDetails();
+    }
+  }
+}
+
+function openNodeDetails(id) {
+  state.selectedNodeId = id;
+  state.nodeCats = [];
+  state.nodeDetailsLoading = true;
+  renderNodeDetails();
+  const dialog = document.querySelector("#node-detail-dialog");
+  if (!dialog.open) dialog.showModal();
+  loadNodeCats(id).catch(() => {});
 }
 
 async function mutateNode(id, action, button) {
@@ -260,8 +349,28 @@ document.querySelector("#logout-button").addEventListener("click", () => {
 document.querySelector("#refresh-button").addEventListener("click", () => loadAll().catch(() => {}));
 document.querySelector("#nodes-table").addEventListener("click", (event) => {
   const button = event.target.closest("[data-node-action]");
-  if (!button) return;
-  mutateNode(button.dataset.node, button.dataset.nodeAction, button).catch((error) => toast(t("admin.node.operationFailed"), error.message, "error"));
+  if (button) {
+    mutateNode(button.dataset.node, button.dataset.nodeAction, button).catch((error) => toast(t("admin.node.operationFailed"), error.message, "error"));
+    return;
+  }
+  const row = event.target.closest("[data-node-detail]");
+  if (row) openNodeDetails(row.dataset.nodeDetail);
+});
+document.querySelector("#nodes-table").addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  const row = event.target.closest("[data-node-detail]");
+  if (!row) return;
+  event.preventDefault();
+  openNodeDetails(row.dataset.nodeDetail);
+});
+document.querySelector("#node-health-strip").addEventListener("click", (event) => {
+  const node = event.target.closest("[data-node-detail]");
+  if (node) openNodeDetails(node.dataset.nodeDetail);
+});
+document.querySelector("#node-detail-dialog").addEventListener("close", () => {
+  state.selectedNodeId = null;
+  state.nodeCats = [];
+  state.nodeDetailsLoading = false;
 });
 document.querySelector("#copy-metrics").addEventListener("click", async () => {
   try {
@@ -283,6 +392,7 @@ onLocaleChange(() => {
   updateLoginDescription();
   switchView(state.activeView);
   render();
+  if (state.selectedNodeId) renderNodeDetails();
   if (state.activeView === "metrics" && !state.metrics) {
     document.querySelector("#metrics-output").textContent = t("common.loading");
   }
