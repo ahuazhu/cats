@@ -17,6 +17,7 @@ use cats_api::requests::*;
 use cats_api::resources::*;
 use cats_control_plane::controller::AutoTierPolicy;
 use cats_control_plane::server::{spawn, Config, Handle};
+use cats_control_plane::store::Store;
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_storage::MetadataStore;
 
@@ -884,6 +885,87 @@ async fn node_loss_fences_and_reschedules() {
 }
 
 #[tokio::test]
+async fn control_plane_startup_grace_preserves_a_reconnecting_host_bound_cat() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("control.db");
+    let cat_id;
+    {
+        let store = Store::open(&db_path).unwrap();
+        store
+            .register_node(
+                "node_a",
+                "http://127.0.0.1:1",
+                "http://gateway.invalid",
+                16,
+                32_768,
+            )
+            .unwrap();
+        let (cat, _, _) = store
+            .create_cat(
+                "default",
+                "restart-safe",
+                "test",
+                1,
+                256,
+                8 << 20,
+                true,
+                None,
+            )
+            .unwrap();
+        cat_id = cat.id.clone();
+        store.set_placement(&cat_id, Some("node_a")).unwrap();
+        store
+            .set_desired(&cat_id, DesiredState::Suspended, None, "cat.suspend")
+            .unwrap();
+        store
+            .set_observed(&cat_id, ObservedState::Suspended)
+            .unwrap();
+    }
+    // Make the persisted heartbeat older than the configured Node lease
+    // before the new control-plane process starts.
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+
+    let storage_meta: Arc<dyn MetadataStore> =
+        Arc::new(SqliteMetadataStore::open(&dir.path().join("storage-meta.db")).unwrap());
+    let cp = spawn(Config {
+        listen: "127.0.0.1:0".into(),
+        db_path,
+        storage_meta,
+        auth_token: SERVICE_TOKEN.into(),
+        admin_token: "dev-admin-token".into(),
+        workos: None,
+        node_lease_timeout_ms: 2_000,
+        reconcile_interval_ms: 10,
+        auto_tier_policy: Default::default(),
+    })
+    .await
+    .unwrap();
+
+    // The first reconcile sees a stale persisted heartbeat, but must wait one
+    // lease interval for the real Node to reconnect.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let cat = cp.state.store.must_get_cat_by_id(&cat_id).unwrap();
+    assert_eq!(cat.observed_state, ObservedState::Suspended);
+    assert_eq!(cat.node_id.as_deref(), Some("node_a"));
+    assert_eq!(
+        cp.state.store.get_node("node_a").unwrap().state,
+        NodeState::Ready
+    );
+
+    for _ in 0..11 {
+        cp.state.store.heartbeat_node("node_a", None).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let cat = cp.state.store.must_get_cat_by_id(&cat_id).unwrap();
+    assert_eq!(cat.observed_state, ObservedState::Suspended);
+    assert_eq!(cat.node_id.as_deref(), Some("node_a"));
+    assert_eq!(
+        cp.state.store.get_node("node_a").unwrap().state,
+        NodeState::Ready
+    );
+}
+
+#[tokio::test]
 async fn exec_wakes_a_cold_cat() {
     let ctx = Ctx::new().await;
     let _node = start_stub_node(&ctx.cp, "node_a").await;
@@ -907,6 +989,47 @@ async fn exec_wakes_a_cold_cat() {
     let out: ExecResponse = resp.json().await.unwrap();
     assert_eq!(out.stdout, "echo hi");
     ctx.wait_observed("dev", ObservedState::Running).await;
+}
+
+#[tokio::test]
+async fn a_failed_cat_waits_for_a_new_generation_before_retrying() {
+    let ctx = Ctx::new().await;
+    let node = start_stub_node(&ctx.cp, "node_a").await;
+    ctx.create_cat("retry-me", None).await;
+    let cat = ctx.wait_observed("retry-me", ObservedState::Running).await;
+    node.jobs.lock().unwrap().clear();
+    node.cats.lock().unwrap().remove(&cat.id);
+    ctx.cp.state.store.set_placement(&cat.id, None).unwrap();
+    ctx.cp
+        .state
+        .store
+        .set_observed(&cat.id, ObservedState::Failed)
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        node.jobs.lock().unwrap().is_empty(),
+        "a terminal failed generation must not hot-loop retries"
+    );
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .must_get_cat_by_id(&cat.id)
+            .unwrap()
+            .observed_state,
+        ObservedState::Failed
+    );
+
+    ctx.action("retry-me", "start").await;
+    let recovered = ctx.wait_observed("retry-me", ObservedState::Running).await;
+    assert!(recovered.generation > cat.generation);
+    assert!(node
+        .jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|job| job.ends_with("_start_cat")));
 }
 
 #[tokio::test]

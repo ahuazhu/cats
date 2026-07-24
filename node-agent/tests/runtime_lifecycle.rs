@@ -197,6 +197,44 @@ fn suspend_rejects_active_guest_work_then_succeeds_on_last_release() {
 }
 
 #[test]
+fn cold_fallback_tears_down_an_existing_suspended_runtime_before_restart() {
+    let env = env();
+    let started = env.runtime.execute(start_job(1));
+    assert_eq!(
+        started.observed_state,
+        ObservedState::Running,
+        "start failed: {:?}",
+        started.error
+    );
+    let original_boot = boot_id(&env);
+    let suspended = env.runtime.execute(simple(
+        1,
+        "suspend_before_cold_fallback",
+        NodeJobAction::SuspendCat {
+            cat_id: CAT.into(),
+            work_fence: None,
+        },
+    ));
+    assert_eq!(suspended.observed_state, ObservedState::Suspended);
+
+    // A control plane that lost placement can legitimately send a fresh Cold
+    // start while the old Node process still remembers the host-bound
+    // runtime. The Node must clean the old runtime first.
+    let restarted = env.runtime.execute(start_job(2));
+    assert_eq!(
+        restarted.observed_state,
+        ObservedState::Running,
+        "cold fallback restart failed: {:?}",
+        restarted.error
+    );
+    assert_ne!(
+        boot_id(&env),
+        original_boot,
+        "Cold fallback must replace the old process identity"
+    );
+}
+
+#[test]
 fn full_lifecycle_ladder_with_boot_id_oracles() {
     let env = env();
 

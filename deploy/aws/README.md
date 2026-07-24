@@ -58,6 +58,13 @@ persisted-state timers configured by `CATS_AUTO_WARM_AFTER_SECONDS` and
 Existing Cats begin these deeper-tier timers when the migration is first
 applied, rather than being aged from their original creation time.
 
+On control-plane startup, automatic Node-loss fencing waits one full Node lease
+interval for persisted workers to heartbeat. This prevents a `Recreate`
+deployment gap from being mistaken for permanent Host loss; a genuinely lost
+Node is fenced after the grace interval. A Cold fallback on a still-live Node
+tears down any stale Suspended/Warm runtime and removes its VMM sockets before
+starting a replacement.
+
 The control resource database remains SQLite on one encrypted RWO EBS volume,
 so `cats-controld` intentionally has one replica and uses `Recreate`. Shared
 storage metadata is PostgreSQL and is safe across the EKS/metal boundary.

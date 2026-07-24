@@ -408,6 +408,18 @@ impl NodeRuntime {
                 return Ok(ObservedState::Running);
             }
         }
+        if !warm_restore {
+            // A Cold fallback can arrive while this Node still owns a stale
+            // Suspended/Warm runtime (for example after a control-plane
+            // reconnect). Tear it down before removing/recreating its runtime
+            // directory; otherwise the old VMM keeps the API socket and
+            // memory backing open and the new VMM cannot start.
+            let existing = self.cats.lock().unwrap().remove(cat_id);
+            if let Some(mut runtime) = existing {
+                self.teardown(&mut runtime, false);
+                let _ = std::fs::remove_dir_all(&runtime.dir);
+            }
+        }
         if let VmmMode::CloudHypervisor(chc) = &self.cfg.vmm {
             return self.start_cat_ch(
                 &chc.clone(),
@@ -884,6 +896,8 @@ impl NodeRuntime {
             let _ = std::fs::remove_file(&p.socket);
         }
         if let Some(chrt) = &mut rt.ch {
+            let _ = std::fs::remove_file(&chrt.api_sock);
+            let _ = std::fs::remove_file(&chrt.vsock_sock);
             chrt.nbd.clear();
             chrt.network = None;
         }

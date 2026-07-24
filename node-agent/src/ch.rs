@@ -387,6 +387,7 @@ pub struct ChSpawn<'a> {
 
 pub fn spawn_vmm(s: &ChSpawn<'_>) -> Result<Child> {
     let _ = std::fs::remove_file(s.api_sock);
+    let _ = std::fs::remove_file(s.vsock_sock);
     let mut cmd = Command::new(&s.cfg.ch_bin);
     cmd.arg("--api-socket").arg(s.api_sock);
     match s.restore_from {
