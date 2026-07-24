@@ -494,6 +494,7 @@ impl NodeRuntime {
         memory_mib: u64,
         warm_restore: bool,
     ) -> Result<ObservedState> {
+        let restore_started = Instant::now();
         let dir = self.cfg.state_dir.join("cats").join(cat_id);
         // Warm restore reuses local state (snapshot + nbd mapping).
         let previous = if warm_restore {
@@ -566,10 +567,12 @@ impl NodeRuntime {
 
         let launch = (|| -> Result<String> {
             // 1. Block backends.
+            let blockd_started = Instant::now();
             for grant in &volumes {
                 let proc = self.spawn_blockd(cat_id, &dir, grant)?;
                 rt.blockds.insert(grant.disk_id.clone(), proc);
             }
+            let blockd_us = blockd_started.elapsed().as_micros();
             // 2. Seed a brand-new root volume with the golden image.
             if !warm_restore {
                 if let Some(image) = &chc.seed_image {
@@ -587,6 +590,7 @@ impl NodeRuntime {
             let mut ordered: Vec<&VolumeGrant> = volumes.iter().collect();
             ordered.sort_by_key(|g| g.mount_path != "/");
             let mut disks = Vec::new();
+            let nbd_started = Instant::now();
             for grant in ordered {
                 let want = prev_nbd.get(&grant.disk_id).map(|s| s.as_str());
                 let dev = ch::nbd_attach(chc, &rt.blockds[&grant.disk_id].socket, want)?;
@@ -594,6 +598,7 @@ impl NodeRuntime {
                 rt.ch = Some(chrt.clone());
                 disks.push(dev);
             }
+            let nbd_us = nbd_started.elapsed().as_micros();
             // Record block devices before any later fallible setup so the
             // shared failure teardown cannot leak host NBD attachments.
             rt.ch = Some(chrt.clone());
@@ -605,6 +610,7 @@ impl NodeRuntime {
             //    readiness/health still lets `teardown` kill it (no orphan
             //    holding the api socket).
             let serial_log = dir.join("serial.log");
+            let vmm_spawn_started = Instant::now();
             let vmm = ch::spawn_vmm(&ch::ChSpawn {
                 cfg: chc,
                 api_sock: &chrt.api_sock,
@@ -617,18 +623,40 @@ impl NodeRuntime {
                 restore_from: snapshot_dir.as_deref(),
                 network: chrt.network.as_ref(),
             })?;
+            let vmm_spawn_us = vmm_spawn_started.elapsed().as_micros();
             rt.guest = Some(vmm);
             rt.ch = Some(chrt.clone());
+            let api_ready_started = Instant::now();
             ch::wait_api_ready(&chrt.api_sock, rt.guest.as_mut().unwrap())?;
+            let api_ready_us = api_ready_started.elapsed().as_micros();
+            let resume_started = Instant::now();
             if warm_restore {
                 ch::resume(&chrt.api_sock)?;
             }
+            let resume_us = resume_started.elapsed().as_micros();
             // 5. Guest agent over vsock.
             let conn = GuestConn::Vsock(chrt.vsock_sock.clone(), GUEST_VSOCK_PORT);
-            let deadline = Instant::now() + Duration::from_secs(60);
+            // Keep this below the control plane's 60-second node-job timeout
+            // so a failed start tears down its partial VMM before the control
+            // plane can retry the Cat on the same node.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let guest_health_started = Instant::now();
             loop {
                 if let Ok(mut client) = conn.connect() {
                     if let Ok((boot_id, _)) = client.health() {
+                        if warm_restore {
+                            tracing::info!(
+                                cat = cat_id,
+                                total_us = restore_started.elapsed().as_micros(),
+                                blockd_us,
+                                nbd_us,
+                                vmm_spawn_us,
+                                api_ready_us,
+                                resume_us,
+                                guest_health_us = guest_health_started.elapsed().as_micros(),
+                                "warm restore phase timings"
+                            );
+                        }
                         return Ok(boot_id);
                     }
                 }
@@ -636,7 +664,7 @@ impl NodeRuntime {
                     Instant::now() < deadline,
                     "guest never became healthy over vsock"
                 );
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(10));
             }
         })();
 
@@ -734,7 +762,7 @@ impl NodeRuntime {
             if Instant::now() > deadline {
                 bail!("timed out waiting for blockd socket");
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 

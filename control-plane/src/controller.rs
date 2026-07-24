@@ -314,6 +314,7 @@ impl Controller {
     /// suspend / resume / warm / restore on the current node, with the
     /// ADR-0002 rule: any resume/restore failure falls back to Cold.
     async fn simple_transition(&self, cat: &Cat, action: &str) -> anyhow::Result<()> {
+        let transition_started = std::time::Instant::now();
         let Some(node_id) = &cat.node_id else {
             // Placement lost (e.g. host fenced) - converge through Cold.
             self.store.set_observed(&cat.id, ObservedState::Cold)?;
@@ -365,7 +366,16 @@ impl Controller {
             cat_generation: cat.generation,
             action: job_action,
         };
-        match self.dispatch(&node.agent_url, &job).await {
+        let dispatch_started = std::time::Instant::now();
+        let dispatched = self.dispatch(&node.agent_url, &job).await;
+        tracing::info!(
+            cat = %cat.id,
+            action,
+            setup_us = dispatch_started.duration_since(transition_started).as_micros(),
+            dispatch_us = dispatch_started.elapsed().as_micros(),
+            "lifecycle transition dispatch timings"
+        );
+        match dispatched {
             Ok(res) if res.phase == JobPhase::Succeeded => {
                 let recorded = self
                     .store

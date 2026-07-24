@@ -781,17 +781,27 @@ async fn get_cat_work(
 
 /// Wake a cat for exec/gateway traffic and wait until it reports Running.
 pub async fn ensure_running(state: &AppState, cat: Cat) -> ApiResult<Cat> {
+    let wake_started = std::time::Instant::now();
     let cat = state.store.must_get_cat_by_id(&cat.id)?;
     if cat.desired_state == DesiredState::Running && cat.observed_state == ObservedState::Running {
         return Ok(cat);
     }
     state.store.ensure_desired_running(&cat.id)?;
+    let desired_update_us = wake_started.elapsed().as_micros();
     state.notify.notify_one();
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let current = state.store.must_get_cat_by_id(&cat.id)?;
         match current.observed_state {
-            ObservedState::Running => return Ok(current),
+            ObservedState::Running => {
+                tracing::info!(
+                    cat = %cat.id,
+                    total_us = wake_started.elapsed().as_micros(),
+                    desired_update_us,
+                    "wake wait timings"
+                );
+                return Ok(current);
+            }
             ObservedState::Failed => {
                 return Err(ApiError::unavailable("cat failed to start").into())
             }
@@ -800,7 +810,7 @@ pub async fn ensure_running(state: &AppState, cat: Cat) -> ApiResult<Cat> {
         if std::time::Instant::now() > deadline {
             return Err(ApiError::new(ErrorCode::DeadlineExceeded, "wake timed out").into());
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 

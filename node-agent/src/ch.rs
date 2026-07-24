@@ -616,7 +616,7 @@ pub fn wait_api_ready(api_sock: &Path, child: &mut Child) -> Result<()> {
         if Instant::now() > deadline {
             bail!("timed out waiting for CH api socket");
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
