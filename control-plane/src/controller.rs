@@ -37,10 +37,9 @@ pub struct Controller {
     pub node_lease_timeout_ms: i64,
     pub auth_token: String,
     pub auto_tier_policy: AutoTierPolicy,
-    /// A freshly started control plane must give persisted Nodes one lease
-    /// interval to reconnect. Otherwise a Recreate deployment whose downtime
-    /// exceeded the lease would fence healthy host-bound Cats on its first
-    /// reconcile tick.
+    /// A freshly started control plane gives persisted Nodes two lease
+    /// intervals to reconnect. The second interval covers the worker's
+    /// in-flight request timeout during a Recreate deployment gap.
     node_fencing_starts_at_ms: i64,
     /// Start attempts per (cat, generation): after 3 failures -> Failed.
     attempts: Mutex<HashMap<String, u32>>,
@@ -66,7 +65,8 @@ impl Controller {
             node_lease_timeout_ms,
             auth_token,
             auto_tier_policy,
-            node_fencing_starts_at_ms: now_ms().saturating_add(node_lease_timeout_ms.max(0)),
+            node_fencing_starts_at_ms: now_ms()
+                .saturating_add(node_lease_timeout_ms.max(0).saturating_mul(2)),
             attempts: Mutex::new(HashMap::new()),
         })
     }

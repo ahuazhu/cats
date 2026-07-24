@@ -99,6 +99,22 @@ fn threshold_ms(seconds: u64, name: &str) -> anyhow::Result<Option<i64>> {
     })?))
 }
 
+#[cfg(unix)]
+async fn shutdown_signal() -> anyhow::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        _ = terminate.recv() => {}
+        result = tokio::signal::ctrl_c() => result?,
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> anyhow::Result<()> {
+    tokio::signal::ctrl_c().await?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -199,6 +215,11 @@ async fn main() -> anyhow::Result<()> {
     })
     .await?;
     println!("READY {}", handle.addr);
-    std::future::pending::<()>().await;
+    shutdown_signal().await?;
+    // cats-controld is PID 1 in the production image. Explicitly handling
+    // SIGTERM stops the reconciler as soon as Kubernetes removes the Pod from
+    // Service endpoints, so the deployment gap cannot look like Node loss.
+    handle.shutdown();
+    println!("SHUTDOWN");
     Ok(())
 }

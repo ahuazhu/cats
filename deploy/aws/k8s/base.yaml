@@ -51,6 +51,9 @@ spec:
         app.kubernetes.io/name: cats-controld
         app.kubernetes.io/part-of: cats
     spec:
+      # Must remain shorter than the Node lease. cats-controld handles SIGTERM
+      # and exits immediately; this bound also fails closed if that regresses.
+      terminationGracePeriodSeconds: 5
       securityContext:
         fsGroup: 10001
         fsGroupChangePolicy: OnRootMismatch
