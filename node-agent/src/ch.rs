@@ -11,10 +11,14 @@
 //! vhost-user-blk backend is the later performance milestone and does not
 //! change any commit semantics. Guest control runs over CH hybrid vsock.
 //! Warm uses `vm.snapshot` / `--restore` (the mechanism validated in the
-//! 2026-07-21 experiments) with the snapshot on local disk.
+//! 2026-07-21 experiments) with the snapshot on local disk. Suspended uses a
+//! per-Cat, file-backed memory zone and process_madvise(MADV_PAGEOUT), so it
+//! reclaims Guest RAM without depending on host swap.
 
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -26,6 +30,9 @@ use cats_blockd::nbd::NbdClient;
 
 /// Guest-agent vsock port (must match the guest image's init script).
 pub const GUEST_VSOCK_PORT: u32 = 5000;
+/// Named, per-Cat RAM backing kept under the Cat's host-local runtime.
+pub const GUEST_MEMORY_FILE: &str = "guest-memory.bin";
+const MIB: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ChConfig {
@@ -58,6 +65,9 @@ pub struct ChNetwork {
 pub struct ChRuntime {
     pub api_sock: PathBuf,
     pub vsock_sock: PathBuf,
+    /// Sparse file-backed Guest RAM. It survives Suspended/Warm and is
+    /// removed with the rest of the Cat runtime when the Cat becomes Cold.
+    pub memory_file: PathBuf,
     /// disk_id -> /dev/nbdN (order matters for restore).
     pub nbd: HashMap<String, String>,
     pub snapshot_dir: Option<PathBuf>,
@@ -365,6 +375,9 @@ pub struct ChSpawn<'a> {
     pub serial_log: &'a Path,
     pub cpus: u32,
     pub memory_mib: u64,
+    /// Required for a fresh boot. Snapshot restore reopens the path recorded
+    /// in the Cloud Hypervisor snapshot.
+    pub memory_file: Option<&'a Path>,
     /// Root first; kernel names them vda, vdb, ... in order.
     pub disks: &'a [String],
     /// Restore from this snapshot directory instead of a fresh boot.
@@ -388,8 +401,21 @@ pub fn spawn_vmm(s: &ChSpawn<'_>) -> Result<Child> {
             }
             cmd.arg("--cmdline").arg(&s.cfg.cmdline);
             cmd.arg("--cpus").arg(format!("boot={}", s.cpus.max(1)));
-            cmd.arg("--memory")
-                .arg(format!("size={}M", s.memory_mib.max(128)));
+            let memory_file = s
+                .memory_file
+                .context("fresh Cloud Hypervisor boot requires a memory backing file")?;
+            anyhow::ensure!(
+                !memory_file.as_os_str().to_string_lossy().contains(','),
+                "memory backing path cannot contain a comma"
+            );
+            // A named MAP_SHARED memory zone is required for MADV_PAGEOUT to
+            // write dirty Guest pages to local NVMe on hosts without swap.
+            cmd.arg("--memory").arg("size=0");
+            cmd.arg("--memory-zone").arg(format!(
+                "id=cat-ram,size={}M,file={},shared=on",
+                s.memory_mib.max(128),
+                memory_file.display()
+            ));
             cmd.arg("--vsock")
                 .arg(format!("cid=3,socket={}", s.vsock_sock.display()));
             if let Some(network) = s.network {
@@ -413,6 +439,166 @@ pub fn spawn_vmm(s: &ChSpawn<'_>) -> Result<Child> {
         std::fs::File::create(s.serial_log.with_file_name("vmm.log")).context("create vmm log")?;
     cmd.stdout(Stdio::null()).stderr(log);
     cmd.spawn().context("spawn cloud-hypervisor")
+}
+
+/// Create a zero-filled sparse RAM backing. Sparse allocation avoids charging
+/// untouched Guest pages to local NVMe; MADV_PAGEOUT allocates only pages that
+/// the Guest actually dirtied.
+pub fn prepare_memory_backing(path: &Path, memory_mib: u64) -> Result<()> {
+    let bytes = memory_mib
+        .max(128)
+        .checked_mul(MIB)
+        .context("Guest memory size overflow")?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("create Guest memory backing {}", path.display()))?;
+    file.set_len(bytes)
+        .with_context(|| format!("size Guest memory backing {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+/// Make file-backed Guest RAM durable before exiting the VMM for Warm.
+pub fn sync_memory_backing(path: &Path) -> Result<()> {
+    File::open(path)
+        .with_context(|| format!("open Guest memory backing {}", path.display()))?
+        .sync_all()
+        .with_context(|| format!("sync Guest memory backing {}", path.display()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageOutStats {
+    pub ranges: usize,
+    pub bytes_advised: u64,
+    pub rss_before_bytes: u64,
+    pub rss_after_bytes: u64,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_backing_ranges(maps: &str, backing: &Path) -> Result<Vec<(usize, usize)>> {
+    let expected = backing
+        .to_str()
+        .context("Guest memory backing path is not UTF-8")?;
+    let mut ranges = Vec::new();
+    for line in maps.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(range) = fields.next() else {
+            continue;
+        };
+        let Some(perms) = fields.next() else {
+            continue;
+        };
+        let _offset = fields.next();
+        let _device = fields.next();
+        let _inode = fields.next();
+        let path = fields.collect::<Vec<_>>().join(" ");
+        if path.is_empty() {
+            continue;
+        }
+        if path != expected || !perms.starts_with("rw") {
+            continue;
+        }
+        let (start, end) = range
+            .split_once('-')
+            .context("malformed process memory range")?;
+        let start = usize::from_str_radix(start, 16).context("invalid memory range start")?;
+        let end = usize::from_str_radix(end, 16).context("invalid memory range end")?;
+        anyhow::ensure!(end > start, "empty process memory range");
+        ranges.push((start, end));
+    }
+    Ok(ranges)
+}
+
+#[cfg(target_os = "linux")]
+fn process_rss_bytes(pid: u32) -> Result<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .with_context(|| format!("read status for VMM pid {pid}"))?;
+    let rss_kib = status
+        .lines()
+        .find_map(|line| {
+            let value = line.strip_prefix("VmRSS:")?.trim();
+            value.split_whitespace().next()?.parse::<u64>().ok()
+        })
+        .context("VMM status did not contain VmRSS")?;
+    rss_kib.checked_mul(1024).context("VMM RSS overflow")
+}
+
+#[cfg(target_os = "linux")]
+pub fn page_out_memory(pid: u32, backing: &Path) -> Result<PageOutStats> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))
+        .with_context(|| format!("read memory maps for VMM pid {pid}"))?;
+    let ranges = parse_backing_ranges(&maps, backing)?;
+    anyhow::ensure!(
+        !ranges.is_empty(),
+        "VMM does not map expected Guest memory backing {}",
+        backing.display()
+    );
+
+    // SAFETY: pidfd_open returns a new owned fd on success.
+    let raw_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if raw_pidfd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("pidfd_open VMM pid {pid}"));
+    }
+    // SAFETY: raw_pidfd was returned as a new descriptor above.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw_pidfd as i32) };
+
+    let rss_before_bytes = process_rss_bytes(pid)?;
+    let mut bytes_advised = 0u64;
+    for (start, end) in &ranges {
+        let mut cursor = *start;
+        while cursor < *end {
+            let mut iov = libc::iovec {
+                iov_base: cursor as *mut libc::c_void,
+                iov_len: end - cursor,
+            };
+            // SAFETY: process_madvise interprets the iovec addresses in the
+            // pidfd target. The VMM is paused and remains our supervised child.
+            let advised = unsafe {
+                libc::syscall(
+                    libc::SYS_process_madvise,
+                    pidfd.as_raw_fd(),
+                    &mut iov as *mut libc::iovec,
+                    1usize,
+                    libc::MADV_PAGEOUT,
+                    0u32,
+                )
+            };
+            if advised < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("MADV_PAGEOUT VMM pid {pid}"));
+            }
+            anyhow::ensure!(advised > 0, "MADV_PAGEOUT made no progress");
+            let advised = advised as usize;
+            anyhow::ensure!(
+                advised <= end - cursor,
+                "MADV_PAGEOUT returned an invalid byte count"
+            );
+            cursor += advised;
+            bytes_advised = bytes_advised
+                .checked_add(advised as u64)
+                .context("page-out byte count overflow")?;
+        }
+    }
+    let rss_after_bytes = process_rss_bytes(pid)?;
+    Ok(PageOutStats {
+        ranges: ranges.len(),
+        bytes_advised,
+        rss_before_bytes,
+        rss_after_bytes,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn page_out_memory(_pid: u32, _backing: &Path) -> Result<PageOutStats> {
+    bail!("Guest memory page-out requires Linux")
 }
 
 pub fn wait_api_ready(api_sock: &Path, child: &mut Child) -> Result<()> {
@@ -467,6 +653,7 @@ pub fn shutdown_vmm(api_sock: &Path, child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use std::sync::mpsc;
 
@@ -488,6 +675,141 @@ mod tests {
     fn cat_network_rejects_non_16_or_unaligned_cidr() {
         assert!(network_for("10.240.0.0/24", "cat").is_err());
         assert!(network_for("10.240.1.0/16", "cat").is_err());
+    }
+
+    #[test]
+    fn memory_backing_is_sparse_sized_and_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(GUEST_MEMORY_FILE);
+        prepare_memory_backing(&path, 256).unwrap();
+        let metadata = path.metadata().unwrap();
+        assert_eq!(metadata.len(), 256 * MIB);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn backing_range_parser_selects_only_writable_exact_file_mappings() {
+        let maps = "\
+1000-2000 rw-s 00000000 08:01 1 /var/lib/cats/cat/guest-memory.bin\n\
+2000-3000 r--s 00001000 08:01 1 /var/lib/cats/cat/guest-memory.bin\n\
+3000-5000 rw-s 00002000 08:01 1 /var/lib/cats/cat/guest-memory.bin\n\
+5000-6000 rw-p 00000000 00:00 0 [heap]\n";
+        assert_eq!(
+            parse_backing_ranges(maps, Path::new("/var/lib/cats/cat/guest-memory.bin")).unwrap(),
+            vec![(0x1000, 0x2000), (0x3000, 0x5000)]
+        );
+    }
+
+    #[test]
+    fn fresh_vmm_uses_shared_file_backed_memory_zone() {
+        let dir = tempfile::tempdir().unwrap();
+        let args_path = dir.path().join("args");
+        let fake_ch = dir.path().join("cloud-hypervisor");
+        std::fs::write(
+            &fake_ch,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                args_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_ch, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let kernel = dir.path().join("vmlinuz");
+        std::fs::write(&kernel, []).unwrap();
+        let memory_file = dir.path().join(GUEST_MEMORY_FILE);
+        prepare_memory_backing(&memory_file, 256).unwrap();
+        let cfg = ChConfig {
+            ch_bin: fake_ch,
+            kernel,
+            initramfs: None,
+            cmdline: "console=ttyS0".into(),
+            seed_image: None,
+            nbd_client_bin: PathBuf::from("nbd-client"),
+            nbd_devices: 8,
+            network_cidr: None,
+            ip_bin: PathBuf::from("ip"),
+        };
+        let serial = dir.path().join("serial.log");
+        let mut child = spawn_vmm(&ChSpawn {
+            cfg: &cfg,
+            api_sock: &dir.path().join("api.sock"),
+            vsock_sock: &dir.path().join("vsock.sock"),
+            serial_log: &serial,
+            cpus: 2,
+            memory_mib: 256,
+            memory_file: Some(&memory_file),
+            disks: &[],
+            restore_from: None,
+            network: None,
+        })
+        .unwrap();
+        assert!(child.wait().unwrap().success());
+        let args = std::fs::read_to_string(args_path).unwrap();
+        assert!(args.contains("--memory\nsize=0\n"));
+        assert!(args.contains(&format!(
+            "--memory-zone\nid=cat-ram,size=256M,file={},shared=on\n",
+            memory_file.display()
+        )));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn page_out_preserves_shared_backing_contents() {
+        use std::os::fd::AsRawFd;
+
+        const LEN: usize = 32 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let memory_file = dir.path().join(GUEST_MEMORY_FILE);
+        prepare_memory_backing(&memory_file, 32).unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&memory_file)
+            .unwrap();
+        // SAFETY: the test owns this file and unmaps the returned mapping.
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED);
+        for offset in (0..LEN).step_by(4096) {
+            // SAFETY: every offset is within the mapping above.
+            unsafe { (mapping.cast::<u8>().add(offset)).write_volatile(0x5a) };
+        }
+
+        let stats = match page_out_memory(std::process::id(), &memory_file) {
+            Ok(stats) => stats,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error)
+                    .is_some_and(|code| code == libc::ENOSYS || code == libc::EPERM) =>
+            {
+                // Some container runtimes block pidfd/process_madvise. The
+                // production worker capability is checked separately.
+                // SAFETY: mapping and length are owned by this test.
+                assert_eq!(unsafe { libc::munmap(mapping, LEN) }, 0);
+                return;
+            }
+            Err(error) => panic!("page-out probe failed: {error:#}"),
+        };
+        assert!(stats.bytes_advised >= LEN as u64);
+        for offset in [0, LEN / 2, LEN - 4096] {
+            // SAFETY: these offsets are within the mapping and may refault the
+            // page from the backing file after MADV_PAGEOUT.
+            assert_eq!(
+                unsafe { (mapping.cast::<u8>().add(offset)).read_volatile() },
+                0x5a
+            );
+        }
+        // SAFETY: mapping and length are the values returned to this test.
+        assert_eq!(unsafe { libc::munmap(mapping, LEN) }, 0);
     }
 
     #[test]

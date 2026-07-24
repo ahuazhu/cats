@@ -40,6 +40,15 @@ CPU, memory and state-filesystem disk utilization. `CATS_NODE_CPUS` and
 `CATS_NODE_MEMORY_MIB` are optional lower scheduling ceilings for hosts that
 reserve resources for other workloads.
 
+Each Cloud Hypervisor Cat uses a private, sparse, file-backed memory zone under
+its host-local runtime directory. Suspended first pauses the VM and then uses
+`process_madvise(MADV_PAGEOUT)` to reclaim Guest pages into that backing file;
+it does not require host swap. The worker service therefore needs
+`CAP_SYS_NICE` (the default root systemd unit has it), and the state filesystem
+must have enough local capacity for the active working sets. A page-out failure
+is not reported as Suspended: the VM is resumed and the control plane applies
+the lifecycle Cold fallback.
+
 The control resource database remains SQLite on one encrypted RWO EBS volume,
 so `cats-controld` intentionally has one replica and uses `Recreate`. Shared
 storage metadata is PostgreSQL and is safe across the EKS/metal boundary.

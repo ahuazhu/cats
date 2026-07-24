@@ -526,10 +526,20 @@ impl NodeRuntime {
             self.cats.lock().unwrap().remove(cat_id);
         }
         std::fs::create_dir_all(&dir)?;
+        let memory_file = dir.join(ch::GUEST_MEMORY_FILE);
+        if warm_restore {
+            anyhow::ensure!(
+                memory_file.is_file(),
+                "warm state is missing Guest memory backing"
+            );
+        } else {
+            ch::prepare_memory_backing(&memory_file, memory_mib)?;
+        }
 
         let mut chrt = ChRuntime {
             api_sock: short_socket_path(&self.cfg.state_dir, cat_id, "chapi"),
             vsock_sock: short_socket_path(&self.cfg.state_dir, cat_id, "vsock"),
+            memory_file,
             nbd: HashMap::new(),
             snapshot_dir: None,
             network: previous_network,
@@ -602,6 +612,7 @@ impl NodeRuntime {
                 serial_log: &serial_log,
                 cpus,
                 memory_mib,
+                memory_file: Some(&chrt.memory_file),
                 disks: &disks,
                 restore_from: snapshot_dir.as_deref(),
                 network: chrt.network.as_ref(),
@@ -855,7 +866,7 @@ impl NodeRuntime {
     }
 
     // ------------------------------------------------------------------
-    // Suspend / resume (pause + page-out analog)
+    // Suspend / resume (pause + page-out)
     // ------------------------------------------------------------------
 
     fn suspend_cat(
@@ -914,6 +925,13 @@ impl NodeRuntime {
                     signal(guest, libc::SIGSTOP);
                 }
             }
+            let page_out_target = match &rt.ch {
+                Some(chrt) => Some((
+                    rt.guest.as_ref().context("VMM process missing")?.id(),
+                    chrt.memory_file.clone(),
+                )),
+                None => None,
+            };
             rt.state = ObservedState::Suspended;
             drop(cats);
 
@@ -935,6 +953,31 @@ impl NodeRuntime {
                 let mut resumed = conn.connect()?;
                 let _ = resumed.abort_suspend();
                 return Err(ActivityChanged.into());
+            }
+            if let Some((vmm_pid, memory_file)) = page_out_target {
+                match ch::page_out_memory(vmm_pid, &memory_file) {
+                    Ok(stats) => tracing::info!(
+                        cat = %cat_id,
+                        vmm_pid,
+                        ranges = stats.ranges,
+                        advised_bytes = stats.bytes_advised,
+                        rss_before_bytes = stats.rss_before_bytes,
+                        rss_after_bytes = stats.rss_after_bytes,
+                        "paged out suspended Guest memory"
+                    ),
+                    Err(error) => {
+                        // Never report a pause-only Cat as Suspended. Return it
+                        // to Running and let the controller retry or demote it.
+                        let mut cats = self.cats.lock().unwrap();
+                        let rt = cats
+                            .get_mut(cat_id)
+                            .context("cat vanished after page-out failure")?;
+                        let chrt = rt.ch.as_ref().context("CH runtime missing")?;
+                        ch::resume(&chrt.api_sock)?;
+                        rt.state = ObservedState::Running;
+                        bail!("Guest memory page-out failed: {error:#}");
+                    }
+                }
             }
             Ok(())
         })();
@@ -1006,6 +1049,8 @@ impl NodeRuntime {
                 client.syncfs()?;
                 ch::pause(&api)?;
             }
+            let memory_file = rt.ch.as_ref().expect("checked").memory_file.clone();
+            ch::sync_memory_backing(&memory_file)?;
             let snap_dir = rt.dir.join("snapshot");
             let _ = std::fs::remove_dir_all(&snap_dir);
             ch::snapshot(&api, &snap_dir)?;
