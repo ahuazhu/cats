@@ -20,6 +20,15 @@ use cats_storage::{MetaError, MetadataStore};
 
 use crate::store::{now_ms, Store};
 
+/// Time-based automatic deeper-sleep policy. `None` disables that boundary.
+/// The timers begin only after the corresponding stable observed state has
+/// been persisted.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AutoTierPolicy {
+    pub warm_after_ms: Option<i64>,
+    pub cold_after_ms: Option<i64>,
+}
+
 pub struct Controller {
     pub store: Arc<Store>,
     pub storage_meta: Arc<dyn MetadataStore>,
@@ -27,6 +36,7 @@ pub struct Controller {
     pub notify: Arc<tokio::sync::Notify>,
     pub node_lease_timeout_ms: i64,
     pub auth_token: String,
+    pub auto_tier_policy: AutoTierPolicy,
     /// Start attempts per (cat, generation): after 3 failures -> Failed.
     attempts: Mutex<HashMap<String, u32>>,
 }
@@ -38,6 +48,7 @@ impl Controller {
         notify: Arc<tokio::sync::Notify>,
         node_lease_timeout_ms: i64,
         auth_token: String,
+        auto_tier_policy: AutoTierPolicy,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
@@ -49,6 +60,7 @@ impl Controller {
             notify,
             node_lease_timeout_ms,
             auth_token,
+            auto_tier_policy,
             attempts: Mutex::new(HashMap::new()),
         })
     }
@@ -71,6 +83,12 @@ impl Controller {
         for cat_id in self.store.auto_suspend_candidates()? {
             self.maybe_auto_suspend(&cat_id)?;
         }
+        for cat_id in self.store.auto_tier_candidates(
+            self.auto_tier_policy.warm_after_ms,
+            self.auto_tier_policy.cold_after_ms,
+        )? {
+            self.maybe_auto_tier(&cat_id)?;
+        }
         let cats = self.store.cats_needing_work()?;
         for cat in cats {
             if let Err(e) = self.reconcile_cat(&cat).await {
@@ -87,6 +105,29 @@ impl Controller {
             .store
             .try_auto_suspend(cat_id, self.node_lease_timeout_ms)?;
         if operation.is_some() {
+            self.notify.notify_one();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Event/tick entry for time-based Suspended -> Warm -> Cold demotion.
+    /// The Store transaction rechecks the persisted state age and live work
+    /// leases before changing desired state.
+    pub fn maybe_auto_tier(&self, cat_id: &str) -> crate::store::Result<bool> {
+        let operation = self.store.try_auto_tier(
+            cat_id,
+            self.auto_tier_policy.warm_after_ms,
+            self.auto_tier_policy.cold_after_ms,
+        )?;
+        if let Some(operation) = operation {
+            tracing::info!(
+                cat = cat_id,
+                operation = %operation.kind,
+                generation = operation.resource_generation,
+                "automatic lifecycle tier requested"
+            );
             self.notify.notify_one();
             Ok(true)
         } else {

@@ -9,10 +9,6 @@
 
 Suspended 与 Warm 有意保持为两种状态。两者都保留进程状态并依赖原 Host；Cold 解除该依赖，启动新的 Kernel 与用户进程。
 
-**当前源码限制**
-
-Suspended 的定义是 Pause + page-out，但当前 Cloud Hypervisor Phase-A 实现只执行 Pause。它会保留进程状态并节省 vCPU，但尚不能回收 Host 内存。
-
 ## 生命周期命令
 
     cats start dev
@@ -23,7 +19,7 @@ Suspended 的定义是 Pause + page-out，但当前 Cloud Hypervisor Phase-A 实
     cats get dev
 
 - `start` 启动或唤醒 Cat。
-- `suspend` 在持久磁盘门禁通过后暂停 Guest。产品状态包含 page-out，但当前 Cloud Hypervisor Phase-A 路径仍只执行 Pause，尚不能回收 Host 内存。
+- `suspend` 在持久磁盘门禁通过后暂停 Guest，并把可回收 Guest 内存页换出到 Host 本地状态文件系统。
 - `warm` 创建 Host 本地快照并退出 VMM/Backend。
 - `resume` 可恢复 Suspended 或 Warm。
 - `stop` 进入 Cold 并释放运行时 Attachment Lease。
@@ -50,6 +46,12 @@ Backing file 缺失、快照损坏、版本不匹配、VMM 错误或 Guest readi
     cats sleep on dev
 
 状态输出包括分布式工作数量、Guest 信号是否新鲜、当前是否符合条件及原因。信号链过期或不确定时，安全行为是 fail-awake。后台任务必须持有 Guest Work Lease，或者显式关闭自动休眠。
+
+同一策略还会让稳定 Suspended 的 Cat 在 10 分钟后进入 Warm，再让稳定
+Warm 的 Cat 在 24 小时后进入 Cold。计时从 observed state 提交时开始，
+控制面重启不会重置；每次转换前都会重新检查活跃工作。运维可通过
+`CATS_AUTO_WARM_AFTER_SECONDS` / `CATS_AUTO_COLD_AFTER_SECONDS` 调整阈值，
+设为 `0` 可关闭对应边界。
 
 ## 连接与时间
 

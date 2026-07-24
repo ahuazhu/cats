@@ -145,7 +145,7 @@
         <div class="decision"><strong>Suspend：保留 VMM，回收 CPU 和大部分物理 RAM</strong><p>VMM、KVM fd、设备后端、tap、Attachment lease 和本地 NVMe backing 继续存在。Guest 进程状态保留，必须在原 Host 上 resume。</p></div>
         <div class="decision"><strong>Cold：退出 VMM，释放全部运行时资源</strong><p>CPU、RAM、VMM、tap、设备进程和强制本地缓存全部释放。只保留远端 RootDisk/PersistentDisk 与控制面 metadata，之后在任意 Host fresh boot。</p></div>
         <div class="decision"><strong>VMM 只负责协调暂停，不负责完整资源回收</strong><p>Cloud Hypervisor 停 vCPU、保存时钟、暂停设备并维护 VM 状态。Guest sync、磁盘 FLUSH、RAM page-out、NVMe 清理和路由变更由平台组件完成。</p></div>
-        <div class="decision"><strong>自动策略：Running → Suspend → Cold</strong><p>短期闲置先 Suspend；继续闲置或 Host 内存/NVMe 压力升高时转 Cold。Shell/流量触发单次 Wake，不能让同一个 Cat 并发启动两次。</p></div>
+        <div class="decision"><strong>自动策略：Running → Suspended → Warm → Cold</strong><p>工作归零后立即 Suspended；稳定 10 分钟后默认转 Warm，Warm 稳定 24 小时后默认转 Cold。计时持久化，Shell/流量触发单次 Wake。</p></div>
       </div>
       <div class="callout green"><strong>一句话：</strong>Suspend 是“机器还在，只是 CPU 停了，RAM 被放到本地 NVMe”；Cold 是“机器没了，只剩远端磁盘，下次重新开机”。</div>
       <div class="callout orange"><strong>重要限制：</strong>Suspend 不是跨 Host 持久状态。原 Host 永久损坏后，内存 backing file 一起丢失；平台必须丢弃进程状态，改用远端 RootDisk 做 Cold Recovery。</div>
@@ -471,19 +471,27 @@ NodePressure {
       </table></div>
 
       <h3 style="margin-top:28px">11.3 自动策略</h3>
-      <pre class="code-block"><code>if cat.running and idle_for > suspend_after:
-    suspend(cat)
+      <div class="callout"><code>CATS_AUTO_WARM_AFTER_SECONDS=600</code>，<code>CATS_AUTO_COLD_AFTER_SECONDS=86400</code>；设为 0 可关闭对应边界。计时来自持久化的稳定 observed state，每次晋级重新检查工作租约。</div>
+      <pre class="code-block"><code>if cat.running and explicit_work_count == 0:
+    suspend(cat)                        # 立即 pause + page-out
 
 if cat.suspended and (
-       idle_for > cold_after
+       state_age > warm_after
     or node.memory_pressure > high
-    or node.nvme_memory_pressure > high
+    or node.memory_backing_pressure > high):
+    warm_stop(cat)
+
+if (cat.suspended or cat.warm) and (
+       state_age > cold_after
+    or node.snapshot_pressure > high
     or node.draining):
     cold_stop(cat)
 
 if wake_requested(cat):
     if cat.state == Suspended and original_node_healthy:
         admit_resume_or_queue(cat)
+    elif cat.state == Warm and original_node_healthy:
+        admit_restore_or_queue(cat)
     else:
         cold_start_on_new_node(cat)</code></pre>
     </section>

@@ -15,6 +15,7 @@ use axum::{Json, Router};
 use cats_api::nodejob::{NodeJob, NodeJobAction, NodeJobResult};
 use cats_api::requests::*;
 use cats_api::resources::*;
+use cats_control_plane::controller::AutoTierPolicy;
 use cats_control_plane::server::{spawn, Config, Handle};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_storage::MetadataStore;
@@ -185,6 +186,13 @@ struct Ctx {
 
 impl Ctx {
     async fn new() -> Self {
+        Self::new_with_auto_tier(Default::default(), 200).await
+    }
+
+    async fn new_with_auto_tier(
+        auto_tier_policy: AutoTierPolicy,
+        reconcile_interval_ms: u64,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let storage_meta: Arc<dyn MetadataStore> =
             Arc::new(SqliteMetadataStore::open(&dir.path().join("storage-meta.db")).unwrap());
@@ -196,7 +204,8 @@ impl Ctx {
             admin_token: "dev-admin-token".into(),
             workos: None,
             node_lease_timeout_ms: 3_000,
-            reconcile_interval_ms: 200,
+            reconcile_interval_ms,
+            auto_tier_policy,
         })
         .await
         .unwrap();
@@ -692,6 +701,74 @@ async fn default_auto_suspend_fires_on_the_last_guest_work_release() {
 }
 
 #[tokio::test]
+async fn automatic_tiers_progress_from_suspended_through_warm_to_cold() {
+    let ctx = Ctx::new_with_auto_tier(
+        AutoTierPolicy {
+            warm_after_ms: Some(100),
+            cold_after_ms: Some(100),
+        },
+        20,
+    )
+    .await;
+    let node = start_stub_node(&ctx.cp, "node_a").await;
+    ctx.create_cat("tiered", None).await;
+    let cat = ctx.wait_observed("tiered", ObservedState::Running).await;
+
+    ctx.http
+        .post(ctx.url("/v1/nodes/work-status"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&NodeWorkStatusRequest {
+            node_id: "node_a".into(),
+            cat_id: cat.id.clone(),
+            generation: cat.generation,
+            guest_source_epoch: "guest-boot-1".into(),
+            guest_lease_sequence: 0,
+            leases: vec![],
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let cold = ctx.wait_observed("tiered", ObservedState::Cold).await;
+    assert_eq!(cold.desired_state, DesiredState::Cold);
+    assert!(cold.node_id.is_none());
+    assert!(cold.observed_state_since_unix_ms > 0);
+
+    let operations: ListResponse<Operation> = ctx
+        .http
+        .get(ctx.url("/v1/projects/default/operations"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for kind in ["cat.auto_suspend", "cat.auto_warm", "cat.auto_cold"] {
+        assert!(
+            operations
+                .items
+                .iter()
+                .any(|operation| operation.kind == kind
+                    && operation.phase == OperationPhase::Succeeded),
+            "missing successful {kind}: {:?}",
+            operations
+                .items
+                .iter()
+                .map(|operation| (&operation.kind, operation.phase))
+                .collect::<Vec<_>>()
+        );
+    }
+    let jobs = node.jobs.lock().unwrap();
+    assert!(jobs.iter().any(|job| job.ends_with("_warm_cat")));
+    assert!(jobs.iter().any(|job| job.ends_with("_stop_cat")));
+}
+
+#[tokio::test]
 async fn rwo_second_bind_is_rejected() {
     let ctx = Ctx::new().await;
     let _node = start_stub_node(&ctx.cp, "node_a").await;
@@ -936,6 +1013,7 @@ async fn static_user_tokens_are_not_accepted() {
         workos: None,
         node_lease_timeout_ms: 3_000,
         reconcile_interval_ms: 200,
+        auto_tier_policy: Default::default(),
     };
     let cp = spawn(cfg).await.unwrap();
     let http = reqwest::Client::new();

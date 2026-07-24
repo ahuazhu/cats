@@ -1,8 +1,8 @@
 # Cats 工作驱动的快速休眠：产品与实现设计
 
-> 状态：Implemented（V1 dev shape），2026-07-22。
+> 状态：Implemented（V1 dev shape），2026-07-24。
 >
-> 本设计服从 ADR-0002：Running / Suspended / Warm / Cold 是四个不同状态。本文只自动驱动 Running → Suspended；Warm / Cold 仍由显式生命周期动作驱动。
+> 本设计服从 ADR-0002：Running / Suspended / Warm / Cold 是四个不同状态。自动策略沿 Running → Suspended → Warm → Cold 单向降级；显式工作始终将 Cat 唤醒到 Running。
 
 ## 1. 产品结论
 
@@ -14,6 +14,12 @@ AND desired_state = observed_state = Running
 AND Guest 工作信号新鲜
 AND 平台工作租约数 + Guest 用户工作租约数 = 0
 => 立即创建 cat.auto_suspend operation
+
+Suspended 稳定保持 10 分钟且仍无工作
+=> 创建 cat.auto_warm operation
+
+Warm 稳定保持 24 小时且仍无工作
+=> 创建 cat.auto_cold operation
 ```
 
 这里没有 `idle_timeout`、CPU 阈值、网络静默阈值或 30 秒宽限期。快速启、快速睡的前提是把“工作”定义为显式、可仲裁的协议，而不是猜测。
@@ -31,6 +37,15 @@ cats sleep on worker
 ```
 
 显式 `suspend`、`resume`、`warm`、`stop` 不受此开关影响。
+
+`auto_suspend=off` 同时关闭自动 Running → Suspended 和后续自动 Warm/Cold；已经提交的显式生命周期动作不受影响。默认深层阈值由控制面配置，不写入 VMM：
+
+```text
+CATS_AUTO_WARM_AFTER_SECONDS=600     # Suspended 稳定 10 分钟后转 Warm
+CATS_AUTO_COLD_AFTER_SECONDS=86400   # Warm 稳定 24 小时后转 Cold
+```
+
+任一值设为 `0` 只关闭对应边界。计时从目标 observed state 真正稳定时开始，不从 desired state 请求时开始。
 
 ## 2. Cat 什么时候可以睡
 
@@ -188,6 +203,7 @@ Node 上的 exec 和 proxy 在真正进入 Guest 前取得 RAII guard。Suspend 
 
 ```sql
 cats(auto_suspend, work_version)
+cats(observed_state_since_ms)
 cat_work_sources(cat_id, node_id, generation, source_epoch,
                  lease_sequence, seen_at_ms)
 cat_work_leases(id, cat_id, kind, owner_id, label,
@@ -203,6 +219,16 @@ cat_work_leases(id, cat_id, kind, owner_id, label,
 3. 重查 live lease count；
 4. 条件更新 desired Suspended、generation + 1；
 5. 创建 `cat.auto_suspend` operation。
+
+`try_auto_tier` 是深层晋级的决策线性化点。它在同类事务中重查：
+
+1. `auto_suspend=on`；
+2. desired 与 observed 都稳定在 Suspended 或 Warm；
+3. `observed_state_since_ms` 已超过对应阈值；
+4. 清理过期租约后仍没有活跃工作；
+5. 条件更新下一 desired state、generation + 1，并创建 `cat.auto_warm` 或 `cat.auto_cold` operation。
+
+`observed_state_since_ms` 保存在数据库中，只在 observed state 真正变化时更新。控制面重启、重复心跳或无变化的 reconcile 不会重置深层休眠计时。节点执行仍复用手动 Warm/Cold 的幂等 Job、durable generation 门禁与 Cold cleanup。
 
 生产 PostgreSQL adapter 应保持相同 SQL/CAS 形状；不能把 lease 计数放到单个控制器进程内存中。
 
@@ -293,12 +319,15 @@ V1 已实现：
 - Gateway、exec 工作租约；
 - 控制面事务判定、singleflight wake、operation 与原因码；
 - Node/Guest 两阶段 quiesce、ActivityChanged 拒绝和竞态恢复；
+- Suspended 的 file-backed Guest RAM `process_madvise(MADV_PAGEOUT)`；
+- 持久化状态计时驱动的 Suspended → Warm → Cold，默认分别为 10 分钟和 24 小时；
+- 自动 Warm/Cold 的原子工作租约复查、异步 Operation 与显式 Wake 抢占；
 - Store、API、Guest、Node 生命周期自动化测试。
 
 仍未实现：
 
-- Suspended 的 `process_madvise(MADV_PAGEOUT)` / 独立特权 helper。当前 Cloud Hypervisor 路径只有 `vm.pause`，因此只可靠回收 vCPU，不能宣称已回收主要内存。
-- 自动 Suspended → Warm → Cold。两态依然存在且可手动使用，但时间阈值、保留预算和自动降级策略应另行设计。
+- 基于 Node 内存、memory backing、snapshot NVMe 水位的压力驱动提前晋级；
+- 按套餐/Workspace/Cat 覆盖全局深层休眠阈值；
 - tap/overlay 数据面。将来流量不再经过 Node proxy 时，必须建立等价的本地 activity gate，不能只依赖控制面 lease。
 - PostgreSQL metadata adapter 和 privilege separation。
 - Web 控制台卡片。V1 API 和 CLI 已具备完整解释数据，UI 仍需接入。
@@ -317,6 +346,9 @@ V1 已实现：
 8. durable FLUSH 失败时不得报告 Suspended。
 9. 并发 wake 只创建一个 Running generation。
 10. resume / restore 失败收敛 Cold。
+11. Suspended/Warm 计时跨控制面重启保持，且重复心跳不重置。
+12. 深层阈值到期但存在活跃工作时不晋级；工作释放后可以晋级。
+13. 自动路径产生可查询的 `cat.auto_warm` / `cat.auto_cold` Operation，并复用手动路径的幂等 Node Job。
 
 工程门禁：
 
@@ -335,6 +367,6 @@ cargo clippy --workspace --all-targets
 2. 将 API 状态和原因码接入用户/管理员控制台。
 3. 为长连接 Gateway lease 增加续租；当前简化 HTTP proxy 有 60 秒超时，120 秒 lease 足够，但 WebSocket/SSE 需要持续 renew。
 4. 加入带 TTL 的用户 pin 和控制面变更 lease。
-5. 在 Suspended 成熟后，单独设计 Warm / Cold 自动降级。时间只服务于“睡得更深”，不回到“等一段空闲时间才允许 Suspend”的模型。
+5. 加入 Node 内存/backing/snapshot 水位驱动的提前 Warm/Cold，以及按套餐与 Workspace 的阈值覆盖。时间只服务于“睡得更深”，不回到“等一段空闲时间才允许 Suspend”的模型。
 
 核心原则保持不变：**工作从 1 变 0 就尝试快速睡；工作从 0 变 1 就快速启；任何不确定性都 fail-awake。**

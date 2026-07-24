@@ -71,6 +71,11 @@ pub struct Cat {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
     pub created_at_unix: i64,
+    /// Persisted time at which `observed_state` last changed. Automatic
+    /// deeper-sleep tiers use this value, so control-plane restarts do not
+    /// reset the Suspended/Warm retention clock.
+    #[serde(default)]
+    pub observed_state_since_unix_ms: i64,
 }
 
 /// Sources that can hold a Cat Running. Guest leases are created explicitly

@@ -567,7 +567,7 @@ COMMIT;
       </div>
 
       <h3 style="margin-top:28px">8.2 自动空闲策略</h3>
-      <div class="callout"><strong>工作驱动的快速 Suspend：</strong>V1 按 Cat opt-in。平台与 Guest 用户程序的显式工作租约都为零、Guest 摘要新鲜且最终 quiesce fence 通过时，Running 立即尝试进入 Suspended；不等待 idle timeout，也不根据 CPU、load、网络或进程扫描猜测。信号链不确定时 fail-awake。Suspended → Warm → Cold 才按更长闲置时间、Host 压力或 Node drain 继续降级。</div>
+      <div class="callout"><strong>工作驱动的自动分层：</strong>平台与 Guest 用户程序的显式工作租约都为零、Guest 摘要新鲜且最终 quiesce fence 通过时，Running 立即尝试进入 Suspended；不等待 idle timeout。稳定 Suspended 默认 10 分钟后转 Warm，稳定 Warm 默认 24 小时后转 Cold；计时持久化并在晋级事务中重新检查工作。阈值由 <code>CATS_AUTO_WARM_AFTER_SECONDS</code> / <code>CATS_AUTO_COLD_AFTER_SECONDS</code> 配置，0 表示关闭对应边界。</div>
       <div class="callout orange"><strong>自动唤醒：</strong>Shell/Exec 一定触发唤醒；HTTP Endpoint 是否因请求唤醒由 <code>wake_policy</code> 控制。Edge 对同一 Cat 的并发冷请求只触发一个 Activation Operation；等待超时返回 <code>503 + Retry-After</code>，不能无限占用连接。</div>
       <div class="callout green"><strong>详细机制：</strong>Cloud Hypervisor pause/resume 顺序、Guest RAM 如何 page-out 到本地 NVMe、Suspend/Cold 的资源账本、并发唤醒和 Host Lost 降级见 <a href="cats-sleep-wake-vmm-resource-reclamation.html">Cats 睡眠、唤醒与 VMM 资源回收</a>。</div>
     </section>

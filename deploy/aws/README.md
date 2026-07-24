@@ -49,6 +49,15 @@ must have enough local capacity for the active working sets. A page-out failure
 is not reported as Suspended: the VM is resumed and the control plane applies
 the lifecycle Cold fallback.
 
+Automatic deeper sleep is enabled for Cats that opt into `auto_suspend`.
+Running moves to Suspended when the explicit work-lease and Guest quiesce
+checks pass; a stable Suspended Cat moves to Warm after 10 minutes, and a
+stable Warm Cat moves to Cold after 24 hours. The latter thresholds are
+persisted-state timers configured by `CATS_AUTO_WARM_AFTER_SECONDS` and
+`CATS_AUTO_COLD_AFTER_SECONDS`; `0` disables the corresponding boundary.
+Existing Cats begin these deeper-tier timers when the migration is first
+applied, rather than being aged from their original creation time.
+
 The control resource database remains SQLite on one encrypted RWO EBS volume,
 so `cats-controld` intentionally has one replica and uses `Recreate`. Shared
 storage metadata is PostgreSQL and is safe across the EKS/metal boundary.

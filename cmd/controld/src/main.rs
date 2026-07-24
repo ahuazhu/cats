@@ -77,6 +77,26 @@ struct Args {
     node_lease_timeout_ms: i64,
     #[arg(long, default_value_t = 500)]
     reconcile_interval_ms: u64,
+    /// Seconds a stable Suspended Cat remains before automatic Warm.
+    /// Zero disables this automatic boundary.
+    #[arg(long, env = "CATS_AUTO_WARM_AFTER_SECONDS", default_value_t = 600)]
+    auto_warm_after_seconds: u64,
+    /// Seconds a stable Warm Cat remains before automatic Cold.
+    /// Zero disables this automatic boundary.
+    #[arg(long, env = "CATS_AUTO_COLD_AFTER_SECONDS", default_value_t = 86_400)]
+    auto_cold_after_seconds: u64,
+}
+
+fn threshold_ms(seconds: u64, name: &str) -> anyhow::Result<Option<i64>> {
+    if seconds == 0 {
+        return Ok(None);
+    }
+    let millis = seconds
+        .checked_mul(1_000)
+        .ok_or_else(|| anyhow::anyhow!("{name} threshold is too large"))?;
+    Ok(Some(i64::try_from(millis).map_err(|_| {
+        anyhow::anyhow!("{name} threshold is too large")
+    })?))
 }
 
 #[tokio::main]
@@ -172,6 +192,10 @@ async fn main() -> anyhow::Result<()> {
         workos,
         node_lease_timeout_ms: args.node_lease_timeout_ms,
         reconcile_interval_ms: args.reconcile_interval_ms,
+        auto_tier_policy: cats_control_plane::controller::AutoTierPolicy {
+            warm_after_ms: threshold_ms(args.auto_warm_after_seconds, "automatic Warm")?,
+            cold_after_ms: threshold_ms(args.auto_cold_after_seconds, "automatic Cold")?,
+        },
     })
     .await?;
     println!("READY {}", handle.addr);

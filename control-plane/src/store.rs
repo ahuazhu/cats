@@ -257,6 +257,12 @@ impl Store {
         )?;
         ensure_column(&conn, "cats", "auto_suspend", "INTEGER NOT NULL DEFAULT 1")?;
         ensure_column(&conn, "cats", "work_version", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(
+            &conn,
+            "cats",
+            "observed_state_since_ms",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         // Backfill ownership for databases created before operations carried
         // their project explicitly. Deleted resources cannot be recovered and
         // remain admin-only (empty project).
@@ -270,6 +276,17 @@ impl Store {
              UPDATE nodes
                 SET scheduling_disabled = 1
               WHERE state IN ('cordoned', 'draining');",
+        )
+        .map_err(internal)?;
+        // Databases upgraded from a release without a persisted state clock
+        // start their automatic tier timers at migration time. Using the Cat
+        // creation time here could immediately demote an old but recently
+        // suspended Cat.
+        conn.execute(
+            "UPDATE cats
+                SET observed_state_since_ms=?1
+              WHERE observed_state_since_ms=0",
+            params![now_ms()],
         )
         .map_err(internal)?;
         backfill_public_endpoints(&mut conn)?;
@@ -331,8 +348,9 @@ impl Store {
         let result: rusqlite::Result<()> = (|| {
             tx.execute(
                 "INSERT INTO cats (id, project, name, image, cpus, memory_mib, root_disk_id,
-                                   desired_state, observed_state, generation, auto_suspend, created_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,'running','creating',1,?8,?9)",
+                                   desired_state, observed_state, generation, auto_suspend, created_at,
+                                   observed_state_since_ms)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,'running','creating',1,?8,?9,?10)",
                 params![
                     cat_id,
                     project,
@@ -342,7 +360,8 @@ impl Store {
                     memory_mib as i64,
                     root_disk_id,
                     i64::from(auto_suspend),
-                    now
+                    now,
+                    now.saturating_mul(1000)
                 ],
             )?;
             let default_endpoint_id = new_id(ids::ENDPOINT_PREFIX);
@@ -360,6 +379,7 @@ impl Store {
                     auto_suspend,
                     node_id: None,
                     created_at_unix: now,
+                    observed_state_since_unix_ms: now.saturating_mul(1000),
                 },
                 DEFAULT_ENDPOINT_NAME,
             );
@@ -462,7 +482,7 @@ impl Store {
         })
     }
 
-    fn fail_pending_auto_suspend(
+    fn fail_pending_auto_tier(
         tx: &rusqlite::Transaction<'_>,
         cat_id: &str,
         message: &str,
@@ -471,7 +491,8 @@ impl Store {
             .map_err(internal)?;
         tx.execute(
             "UPDATE operations SET phase='failed', error_json=?2, updated_at=?3
-             WHERE resource_id=?1 AND kind='cat.auto_suspend'
+             WHERE resource_id=?1
+               AND kind IN ('cat.auto_suspend','cat.auto_warm','cat.auto_cold')
                AND phase IN ('pending','running')",
             params![cat_id, error, now_unix()],
         )
@@ -543,7 +564,7 @@ impl Store {
             }
         }
         if op_kind != "cat.auto_suspend" {
-            Self::fail_pending_auto_suspend(&tx, cat_id, "superseded by a newer Cat action")?;
+            Self::fail_pending_auto_tier(&tx, cat_id, "superseded by a newer Cat action")?;
         }
         let new_gen = current + 1;
         tx.execute(
@@ -575,7 +596,7 @@ impl Store {
         if desired == "running" {
             return Ok(None);
         }
-        Self::fail_pending_auto_suspend(&tx, cat_id, "superseded by active work")?;
+        Self::fail_pending_auto_tier(&tx, cat_id, "superseded by active work")?;
         let next = generation + 1;
         tx.execute(
             "UPDATE cats SET desired_state='running', generation=?2 WHERE id=?1",
@@ -590,8 +611,14 @@ impl Store {
     pub fn set_observed(&self, cat_id: &str, observed: ObservedState) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "UPDATE cats SET observed_state=?2 WHERE id=?1",
-                params![cat_id, observed_str(observed)],
+                "UPDATE cats
+                    SET observed_state_since_ms = CASE
+                            WHEN observed_state=?2 THEN observed_state_since_ms
+                            ELSE ?3
+                        END,
+                        observed_state=?2
+                  WHERE id=?1",
+                params![cat_id, observed_str(observed), now_ms()],
             )
             .map(|_| ())
         })
@@ -608,9 +635,15 @@ impl Store {
     ) -> Result<bool> {
         self.with(|c| {
             c.execute(
-                "UPDATE cats SET observed_state=?3
+                "UPDATE cats
+                    SET observed_state=?3, observed_state_since_ms=?4
                  WHERE id=?1 AND observed_state=?2",
-                params![cat_id, observed_str(transitional), observed_str(target)],
+                params![
+                    cat_id,
+                    observed_str(transitional),
+                    observed_str(target),
+                    now_ms()
+                ],
             )
             .map(|changed| changed == 1)
         })
@@ -904,7 +937,7 @@ impl Store {
         let wake_suspended = has_guest_work && desired != "running" && observed == "suspended";
         let should_wake = cancel_inflight_suspend || wake_suspended;
         if cancel_inflight_suspend {
-            Self::fail_pending_auto_suspend(&tx, &request.cat_id, "superseded by Guest work")?;
+            Self::fail_pending_auto_tier(&tx, &request.cat_id, "superseded by Guest work")?;
             // The physical suspend for this generation has not committed.
             // Cancel it in-place so the Node and its work watcher can both
             // converge on the job generation after ActivityChanged.
@@ -914,7 +947,7 @@ impl Store {
             )
             .map_err(internal)?;
         } else if wake_suspended {
-            Self::fail_pending_auto_suspend(&tx, &request.cat_id, "superseded by Guest work")?;
+            Self::fail_pending_auto_tier(&tx, &request.cat_id, "superseded by Guest work")?;
             let new_generation = generation + 1;
             tx.execute(
                 "UPDATE cats SET desired_state='running', generation=?2 WHERE id=?1",
@@ -1106,6 +1139,158 @@ impl Store {
         Ok(Some(operation))
     }
 
+    /// Stable sleeping Cats whose persisted state age has crossed the next
+    /// automatic tier boundary. This is only a scan optimization; the
+    /// transaction in `try_auto_tier` is the decision linearization point.
+    pub fn auto_tier_candidates(
+        &self,
+        warm_after_ms: Option<i64>,
+        cold_after_ms: Option<i64>,
+    ) -> Result<Vec<String>> {
+        let now = now_ms();
+        self.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, observed_state, observed_state_since_ms
+                   FROM cats
+                  WHERE auto_suspend=1
+                    AND desired_state=observed_state
+                    AND observed_state IN ('suspended','warm')",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            let mut candidates = Vec::new();
+            for row in rows {
+                let (id, state, since_ms) = row?;
+                let threshold = match state.as_str() {
+                    "suspended" => warm_after_ms,
+                    "warm" => cold_after_ms,
+                    _ => None,
+                };
+                if threshold.is_some_and(|threshold| now.saturating_sub(since_ms) >= threshold) {
+                    candidates.push(id);
+                }
+            }
+            Ok(candidates)
+        })
+    }
+
+    /// Atomically deepen a stable, inactive Cat by one tier:
+    /// Suspended -> Warm or Warm -> Cold.
+    ///
+    /// The elapsed clock is persisted with the observed state, so a control
+    /// plane restart neither resets nor accelerates the policy. Any live work
+    /// lease wins the race and blocks the transition.
+    pub fn try_auto_tier(
+        &self,
+        cat_id: &str,
+        warm_after_ms: Option<i64>,
+        cold_after_ms: Option<i64>,
+    ) -> Result<Option<Operation>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(internal)?;
+        let now = now_ms();
+        let expired = tx
+            .execute(
+                "DELETE FROM cat_work_leases WHERE cat_id=?1 AND expires_at_ms<=?2",
+                params![cat_id, now],
+            )
+            .map_err(internal)?;
+        if expired > 0 {
+            tx.execute(
+                "UPDATE cats SET work_version=work_version+1 WHERE id=?1",
+                params![cat_id],
+            )
+            .map_err(internal)?;
+        }
+
+        let cat: Option<(String, i64, i64, String, String, i64)> = tx
+            .query_row(
+                "SELECT project, generation, auto_suspend, desired_state,
+                        observed_state, observed_state_since_ms
+                   FROM cats WHERE id=?1",
+                params![cat_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(internal)?;
+        let Some((project, generation, auto_suspend, desired, observed, since_ms)) = cat else {
+            return Ok(None);
+        };
+        if auto_suspend == 0 || desired != observed {
+            return Ok(None);
+        }
+        let (threshold_ms, next_state, operation_kind) = match observed.as_str() {
+            "suspended" => (warm_after_ms, "warm", "cat.auto_warm"),
+            "warm" => (cold_after_ms, "cold", "cat.auto_cold"),
+            _ => return Ok(None),
+        };
+        let Some(threshold_ms) = threshold_ms else {
+            return Ok(None);
+        };
+        if now.saturating_sub(since_ms) < threshold_ms {
+            return Ok(None);
+        }
+        let active: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM cat_work_leases
+                  WHERE cat_id=?1 AND expires_at_ms>?2",
+                params![cat_id, now],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        if active != 0 {
+            return Ok(None);
+        }
+
+        let next_generation = generation + 1;
+        let changed = tx
+            .execute(
+                "UPDATE cats
+                    SET desired_state=?2, generation=?3
+                  WHERE id=?1
+                    AND generation=?4
+                    AND auto_suspend=1
+                    AND desired_state=?5
+                    AND observed_state=?5
+                    AND observed_state_since_ms=?6
+                    AND NOT EXISTS (
+                        SELECT 1 FROM cat_work_leases
+                         WHERE cat_id=?1 AND expires_at_ms>?7
+                    )",
+                params![
+                    cat_id,
+                    next_state,
+                    next_generation,
+                    generation,
+                    observed,
+                    since_ms,
+                    now
+                ],
+            )
+            .map_err(internal)?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let operation =
+            Self::insert_operation(&tx, &project, operation_kind, cat_id, next_generation)?;
+        tx.commit().map_err(internal)?;
+        Ok(Some(operation))
+    }
+
     pub fn cancel_rejected_suspend(&self, cat_id: &str, job_generation: i64) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(internal)?;
@@ -1134,8 +1319,10 @@ impl Store {
         .map_err(internal)?;
         if observed == "suspending" {
             tx.execute(
-                "UPDATE cats SET observed_state='running' WHERE id=?1",
-                params![cat_id],
+                "UPDATE cats
+                    SET observed_state='running', observed_state_since_ms=?2
+                  WHERE id=?1",
+                params![cat_id, now_ms()],
             )
             .map_err(internal)?;
         }
@@ -1914,6 +2101,7 @@ fn row_to_cat(r: &rusqlite::Row<'_>) -> rusqlite::Result<Cat> {
         auto_suspend: r.get::<_, i64>("auto_suspend")? != 0,
         node_id: r.get("node_id")?,
         created_at_unix: r.get("created_at")?,
+        observed_state_since_unix_ms: r.get("observed_state_since_ms")?,
     })
 }
 
@@ -2058,6 +2246,7 @@ CREATE TABLE IF NOT EXISTS cats (
     generation INTEGER NOT NULL,
     auto_suspend INTEGER NOT NULL DEFAULT 1,
     work_version INTEGER NOT NULL DEFAULT 0,
+    observed_state_since_ms INTEGER NOT NULL,
     node_id TEXT,
     created_at INTEGER NOT NULL,
     UNIQUE (project, name)
@@ -2188,9 +2377,15 @@ mod tests {
             .unwrap();
         }
 
+        let migration_started_ms = now_ms();
         let store = Store::open(&path).unwrap();
         assert_eq!(store.get_operation("op_old").unwrap().project, "alpha");
-        assert!(store.must_get_cat_by_id("cat_old").unwrap().auto_suspend);
+        let upgraded_cat = store.must_get_cat_by_id("cat_old").unwrap();
+        assert!(upgraded_cat.auto_suspend);
+        assert!(
+            upgraded_cat.observed_state_since_unix_ms >= migration_started_ms,
+            "an upgraded Cat must begin its tier clock at migration time"
+        );
         let endpoints = store.endpoints_for_cat("cat_old").unwrap();
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].name, DEFAULT_ENDPOINT_NAME);
@@ -2379,5 +2574,79 @@ mod tests {
             store.get_operation(&auto.id).unwrap().phase,
             OperationPhase::Failed
         );
+    }
+
+    #[test]
+    fn automatic_deeper_tiers_use_persisted_state_age_and_respect_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.db");
+        let cat_id;
+        {
+            let store = Store::open(&path).unwrap();
+            let (cat, _, _) = store
+                .create_cat("alpha", "sleeper", "test", 1, 256, 1024 * 1024, true, None)
+                .unwrap();
+            cat_id = cat.id.clone();
+            let suspend = store
+                .set_desired(&cat.id, DesiredState::Suspended, None, "cat.suspend")
+                .unwrap();
+            store
+                .set_observed(&cat.id, ObservedState::Suspended)
+                .unwrap();
+            store.finish_operation(&suspend.id, None).unwrap();
+            store
+                .with(|conn| {
+                    conn.execute(
+                        "UPDATE cats SET observed_state_since_ms=?2 WHERE id=?1",
+                        params![cat.id, now_ms() - 2_000],
+                    )
+                    .map(|_| ())
+                })
+                .unwrap();
+
+            let candidates = store
+                .auto_tier_candidates(Some(1_000), Some(1_000))
+                .unwrap();
+            assert_eq!(candidates, vec![cat.id.clone()]);
+            let warm = store
+                .try_auto_tier(&cat.id, Some(1_000), Some(1_000))
+                .unwrap()
+                .expect("an old Suspended Cat should move toward Warm");
+            assert_eq!(warm.kind, "cat.auto_warm");
+            assert_eq!(
+                store.must_get_cat_by_id(&cat.id).unwrap().desired_state,
+                DesiredState::Warm
+            );
+            store.set_observed(&cat.id, ObservedState::Warm).unwrap();
+            store.finish_operation(&warm.id, None).unwrap();
+            store
+                .with(|conn| {
+                    conn.execute(
+                        "UPDATE cats SET observed_state_since_ms=?2 WHERE id=?1",
+                        params![cat.id, now_ms() - 2_000],
+                    )
+                    .map(|_| ())
+                })
+                .unwrap();
+        }
+
+        // Reopening the control-plane database must not reset the Warm timer.
+        let store = Store::open(&path).unwrap();
+        let lease = store
+            .acquire_work(&cat_id, WorkKind::Gateway, "request-1", "GET /", 5_000)
+            .unwrap();
+        assert!(store
+            .try_auto_tier(&cat_id, Some(1_000), Some(1_000))
+            .unwrap()
+            .is_none());
+        store.release_work(&lease.id).unwrap();
+        let cold = store
+            .try_auto_tier(&cat_id, Some(1_000), Some(1_000))
+            .unwrap()
+            .expect("an old inactive Warm Cat should move toward Cold");
+        assert_eq!(cold.kind, "cat.auto_cold");
+        let cat = store.must_get_cat_by_id(&cat_id).unwrap();
+        assert_eq!(cat.desired_state, DesiredState::Cold);
+        assert_eq!(cat.observed_state, ObservedState::Warm);
     }
 }

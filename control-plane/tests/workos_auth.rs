@@ -224,6 +224,7 @@ impl Ctx {
             workos: Some(Arc::new(workos)),
             node_lease_timeout_ms: 3_000,
             reconcile_interval_ms: 200,
+            auto_tier_policy: Default::default(),
         })
         .await
         .unwrap();

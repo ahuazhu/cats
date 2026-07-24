@@ -9,10 +9,6 @@
 
 Suspended and Warm are intentionally separate. Both preserve process state and depend on the original host. Cold releases that dependency and starts a new kernel and user processes.
 
-**Current source limitation**
-
-Suspended is defined as pause plus page-out, but the current Cloud Hypervisor Phase-A implementation only pauses. It preserves process state and saves vCPU, but does not yet reclaim Host memory.
-
 ## Lifecycle commands
 
     cats start dev
@@ -23,7 +19,7 @@ Suspended is defined as pause plus page-out, but the current Cloud Hypervisor Ph
     cats get dev
 
 - `start` starts or wakes a Cat.
-- `suspend` pauses the Guest after the durable disk gate succeeds. The product state includes page-out, but the current Cloud Hypervisor Phase-A path still pauses without reclaiming Host memory.
+- `suspend` pauses the Guest after the durable disk gate succeeds and pages reclaimable Guest memory to the Host's local state filesystem.
 - `warm` creates a host-local snapshot and exits the VMM/backend.
 - `resume` resumes either Suspended or Warm.
 - `stop` enters Cold and releases runtime attachment leases.
@@ -50,6 +46,14 @@ New Cats enable it by default. Inspect it, disable it for an always-on workload,
     cats sleep on dev
 
 The status output includes the distributed work count, Guest-signal freshness, current eligibility, and an explanation. If the signal chain is stale or uncertain, the safe behavior is fail-awake. A background workload must hold a Guest work lease or explicitly disable auto-suspend.
+
+The same opt-in policy continues a stable Suspended Cat to Warm after 10
+minutes, then a stable Warm Cat to Cold after 24 hours. These clocks begin when
+the observed state is committed, survive control-plane restarts, and are
+rechecked against live work before each transition. Operators can change or
+disable the two boundaries with
+`CATS_AUTO_WARM_AFTER_SECONDS`/`CATS_AUTO_COLD_AFTER_SECONDS`; `0` disables
+that boundary.
 
 ## Connections and time
 

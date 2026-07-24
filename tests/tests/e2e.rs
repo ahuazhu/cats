@@ -44,6 +44,7 @@ impl Cluster {
             workos: None,
             node_lease_timeout_ms: 3_000,
             reconcile_interval_ms: 150,
+            auto_tier_policy: Default::default(),
         })
         .await
         .unwrap();

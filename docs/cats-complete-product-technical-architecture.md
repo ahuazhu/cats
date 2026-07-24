@@ -602,7 +602,7 @@ MountBinding 可以保留，但 runtime Attachment 必须结束。
 
 ### 8.2 自动空闲策略
 
-**工作驱动的快速 Suspend：**V1 新建 Cat 默认开启，并允许按 Cat 显式关闭。平台 Gateway/exec/control 租约与 Guest 用户程序显式工作租约都为零、Guest 摘要新鲜且最终 quiesce fence 通过时，Running 立即尝试进入 Suspended，不等待 idle timeout，也不根据 CPU、load、网络或进程扫描猜测。需要持续后台运行的 Guest workload 必须接入工作租约或关闭该策略；信号链不确定时 fail-awake。Suspended → Warm → Cold 仍可按更长闲置时间、本机内存/backing/快照压力或 Node drain 自动降级；具体阈值属于套餐/项目策略，不写死在 VMM 实现中。详见 [工作驱动快速休眠设计](cats-auto-tier-product-and-implementation-design.md)。
+**工作驱动的快速 Suspend：**V1 新建 Cat 默认开启，并允许按 Cat 显式关闭。平台 Gateway/exec/control 租约与 Guest 用户程序显式工作租约都为零、Guest 摘要新鲜且最终 quiesce fence 通过时，Running 立即尝试进入 Suspended，不等待 idle timeout，也不根据 CPU、load、网络或进程扫描猜测。需要持续后台运行的 Guest workload 必须接入工作租约或关闭该策略；信号链不确定时 fail-awake。进入稳定 Suspended 后默认 10 分钟转 Warm，进入稳定 Warm 后默认 24 小时转 Cold；计时持久化，控制面重启不重置，并在每次晋级事务中重新检查工作租约。阈值由 `CATS_AUTO_WARM_AFTER_SECONDS` / `CATS_AUTO_COLD_AFTER_SECONDS` 配置，设为 `0` 可关闭对应边界，不写死在 VMM。内存/backing/快照压力或 Node drain 触发的提前降级仍是后续策略。详见 [工作驱动快速休眠设计](cats-auto-tier-product-and-implementation-design.md)。
 
 **自动唤醒：**Shell/Exec 一定触发唤醒；HTTP Endpoint 是否因请求唤醒由 `wake_policy` 控制。Edge 对同一 Cat 的并发冷请求只触发一个 Activation Operation；等待超时返回 `503 + Retry-After`，不能无限占用连接。
 

@@ -69,6 +69,11 @@ spec:
             - postgres
             - --metadata-store-option
             - ca-file=/etc/cats/rds-ca.pem
+          env:
+            - name: CATS_AUTO_WARM_AFTER_SECONDS
+              value: "600"
+            - name: CATS_AUTO_COLD_AFTER_SECONDS
+              value: "86400"
           envFrom:
             - secretRef:
                 name: cats-runtime

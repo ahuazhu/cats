@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::Context;
 use cats_storage::MetadataStore;
 
-use crate::controller::Controller;
+use crate::controller::{AutoTierPolicy, Controller};
 use crate::store::Store;
 
 #[derive(Clone)]
@@ -28,6 +28,7 @@ pub struct Config {
     pub workos: Option<Arc<crate::auth::WorkOsConfig>>,
     pub node_lease_timeout_ms: i64,
     pub reconcile_interval_ms: u64,
+    pub auto_tier_policy: AutoTierPolicy,
 }
 
 #[derive(Clone)]
@@ -74,6 +75,18 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         cfg.auth_token != cfg.admin_token,
         "service and admin tokens must be different"
     );
+    anyhow::ensure!(
+        cfg.auto_tier_policy
+            .warm_after_ms
+            .is_none_or(|value| value > 0),
+        "automatic Warm threshold must be positive"
+    );
+    anyhow::ensure!(
+        cfg.auto_tier_policy
+            .cold_after_ms
+            .is_none_or(|value| value > 0),
+        "automatic Cold threshold must be positive"
+    );
     let cfg = Arc::new(cfg);
     let store = Arc::new(Store::open(&cfg.db_path)?);
     let storage_meta = cfg.storage_meta.clone();
@@ -84,6 +97,7 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         notify.clone(),
         cfg.node_lease_timeout_ms,
         cfg.auth_token.clone(),
+        cfg.auto_tier_policy,
     );
     let state = AppState {
         store,

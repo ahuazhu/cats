@@ -529,6 +529,13 @@ NodePressure {
 
 ### 11.3 自动策略
 
+当前 V1 控制面在工作驱动的立即 Suspended 之后，使用持久化的
+`observed_state_since_ms` 继续降级：稳定 Suspended 默认 10 分钟后转 Warm，稳定 Warm
+默认 24 小时后转 Cold。阈值分别由 `CATS_AUTO_WARM_AFTER_SECONDS` 和
+`CATS_AUTO_COLD_AFTER_SECONDS` 配置，`0` 表示关闭对应边界。每次晋级都在事务中重新
+检查 policy、desired/observed、状态时间和活跃工作租约；控制面重启与重复心跳不会
+重置计时。
+
 ``` code-block
 if cat.running and idle_for > suspend_after:
     suspend(cat)                        # pause + page-out
