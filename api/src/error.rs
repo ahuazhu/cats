@@ -16,6 +16,9 @@ pub enum ErrorCode {
     AlreadyExists,
     /// Resource state does not allow the request (e.g. deleting a bound disk).
     FailedPrecondition,
+    /// The prepaid balance is exhausted; clients should direct the user to
+    /// the billing top-up flow before retrying paid work.
+    PaymentRequired,
     /// Concurrent modification (generation/If-Match mismatch) or RWO conflict.
     Conflict,
     /// A stale fencing epoch or route epoch was presented.
@@ -34,6 +37,7 @@ impl ErrorCode {
             ErrorCode::NotFound => 404,
             ErrorCode::AlreadyExists => 409,
             ErrorCode::FailedPrecondition => 412,
+            ErrorCode::PaymentRequired => 402,
             ErrorCode::Conflict => 409,
             ErrorCode::StaleEpoch => 409,
             ErrorCode::DeadlineExceeded => 504,
@@ -93,6 +97,9 @@ impl ApiError {
     }
     pub fn failed_precondition(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::FailedPrecondition, message)
+    }
+    pub fn payment_required(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::PaymentRequired, message)
     }
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Internal, message)

@@ -9,6 +9,7 @@ publish = false
 
 [dev-dependencies]
 cats-api = { workspace = true }
+cats-metering = { workspace = true }
 cats-control-plane = { workspace = true }
 cats-node-agent = { workspace = true }
 cats-guest-agent = { workspace = true }

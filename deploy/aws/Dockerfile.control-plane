@@ -1,10 +1,18 @@
+# syntax=docker/dockerfile:1.7
 FROM rust:1.97-bookworm AS builder
 
 WORKDIR /src
 COPY . .
-RUN cargo build --locked --release \
+RUN --mount=type=cache,id=cats-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cats-control-target,target=/src/target \
+    cargo build --locked --release \
     -p cats-control-plane-daemon \
-    -p cats-network
+    -p cats-network \
+    && strip \
+      target/release/cats-controld \
+      target/release/cats-gatewayd \
+    && install -D -m 0755 target/release/cats-controld /out/cats-controld \
+    && install -D -m 0755 target/release/cats-gatewayd /out/cats-gatewayd
 
 FROM debian:bookworm-slim AS runtime
 
@@ -14,8 +22,8 @@ RUN apt-get update \
     && groupadd --gid 10001 cats \
     && useradd --uid 10001 --gid cats --home-dir /var/lib/cats --create-home cats
 
-COPY --from=builder /src/target/release/cats-controld /usr/local/bin/cats-controld
-COPY --from=builder /src/target/release/cats-gatewayd /usr/local/bin/cats-gatewayd
+COPY --from=builder /out/cats-controld /usr/local/bin/cats-controld
+COPY --from=builder /out/cats-gatewayd /usr/local/bin/cats-gatewayd
 
 USER 10001:10001
 WORKDIR /var/lib/cats

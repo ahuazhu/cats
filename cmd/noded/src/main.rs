@@ -47,6 +47,9 @@ struct Args {
     heartbeat_ms: u64,
     #[arg(long, default_value_t = 1500)]
     blockd_lease_ttl_ms: i64,
+    /// Delegated cgroup v2 subtree for authoritative billing counters.
+    #[arg(long, env = "CATS_METERING_CGROUP_ROOT")]
+    metering_cgroup_root: Option<PathBuf>,
 
     /// VMM mode: fake (host processes) or ch (Cloud Hypervisor, Linux+KVM).
     #[arg(long, default_value = "fake")]
@@ -143,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
             metadata_store,
             object_store,
             blockd_lease_ttl_ms: args.blockd_lease_ttl_ms,
+            metering_cgroup_root: args.metering_cgroup_root,
             vmm,
         },
         storage_meta,

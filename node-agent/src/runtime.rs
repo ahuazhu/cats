@@ -51,7 +51,17 @@ pub struct NodeConfig {
     pub metadata_store: AdapterSelection,
     pub object_store: AdapterSelection,
     pub blockd_lease_ttl_ms: i64,
+    /// Delegated cgroup v2 subtree used for authoritative per-Cat billing
+    /// counters. When absent, monitoring remains available but billing
+    /// checkpoints are deliberately not produced.
+    pub metering_cgroup_root: Option<PathBuf>,
     pub vmm: VmmMode,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeMetering {
+    cgroup_path: PathBuf,
+    source_epoch: String,
 }
 
 struct BlockdProc {
@@ -76,6 +86,7 @@ struct CatRuntime {
     web_sock: PathBuf,
     runtime_sock: PathBuf,
     activity: Arc<RuntimeActivity>,
+    metering: Option<RuntimeMetering>,
     /// Present only in Cloud Hypervisor mode.
     ch: Option<ChRuntime>,
 }
@@ -142,10 +153,23 @@ pub(crate) struct RuntimeActivityGuard {
 
 /// Process and filesystem identities used by the heartbeat sampler to
 /// attribute host resource use to one Cat.
+#[derive(Clone)]
 pub(crate) struct CatTelemetryTarget {
     pub cat_id: String,
+    pub generation: i64,
     pub process_ids: Vec<u32>,
     pub runtime_dir: PathBuf,
+    pub metering: Option<CatMeteringTarget>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CatMeteringTarget {
+    pub cgroup_path: PathBuf,
+    pub source_epoch: String,
+}
+
+pub(crate) trait UsageFinalizer: Send + Sync {
+    fn finalize(&self, target: CatTelemetryTarget) -> Result<()>;
 }
 
 impl Drop for RuntimeActivityGuard {
@@ -203,6 +227,24 @@ impl CatRuntime {
     fn state_file(&self) -> PathBuf {
         self.dir.join("warm-state.json")
     }
+
+    fn telemetry_target(&self, cat_id: &str) -> CatTelemetryTarget {
+        let mut process_ids = Vec::with_capacity(self.blockds.len() + 1);
+        if let Some(guest) = &self.guest {
+            process_ids.push(guest.id());
+        }
+        process_ids.extend(self.blockds.values().map(|blockd| blockd.child.id()));
+        CatTelemetryTarget {
+            cat_id: cat_id.to_string(),
+            generation: self.generation,
+            process_ids,
+            runtime_dir: self.dir.clone(),
+            metering: self.metering.as_ref().map(|metering| CatMeteringTarget {
+                cgroup_path: metering.cgroup_path.clone(),
+                source_epoch: metering.source_epoch.clone(),
+            }),
+        }
+    }
 }
 
 /// AF_UNIX `sun_path` is limited to ~104 bytes on macOS (108 on Linux), and
@@ -234,6 +276,7 @@ pub struct NodeRuntime {
     ops: Mutex<()>,
     cats: Mutex<HashMap<String, CatRuntime>>,
     journal: Mutex<HashMap<String, NodeJobResult>>,
+    usage_finalizer: Option<Arc<dyn UsageFinalizer>>,
 }
 
 impl NodeRuntime {
@@ -244,7 +287,13 @@ impl NodeRuntime {
             ops: Mutex::new(()),
             cats: Mutex::new(HashMap::new()),
             journal: Mutex::new(HashMap::new()),
+            usage_finalizer: None,
         }
+    }
+
+    pub(crate) fn with_usage_finalizer(mut self, finalizer: Arc<dyn UsageFinalizer>) -> Self {
+        self.usage_finalizer = Some(finalizer);
+        self
     }
 
     /// Snapshot for heartbeats: (cat_id, generation, state).
@@ -296,18 +345,7 @@ impl NodeRuntime {
             .lock()
             .unwrap()
             .iter()
-            .map(|(cat_id, runtime)| {
-                let mut process_ids = Vec::with_capacity(runtime.blockds.len() + 1);
-                if let Some(guest) = &runtime.guest {
-                    process_ids.push(guest.id());
-                }
-                process_ids.extend(runtime.blockds.values().map(|blockd| blockd.child.id()));
-                CatTelemetryTarget {
-                    cat_id: cat_id.clone(),
-                    process_ids,
-                    runtime_dir: runtime.dir.clone(),
-                }
-            })
+            .map(|(cat_id, runtime)| runtime.telemetry_target(cat_id))
             .collect()
     }
 
@@ -323,12 +361,23 @@ impl NodeRuntime {
         let job_id = job.job_id.clone();
         let cat_id = job.action.cat_id().to_string();
         let result = match self.run_action(&job) {
-            Ok(observed) => {
-                if let Some(runtime) = self.cats.lock().unwrap().get_mut(&cat_id) {
-                    runtime.generation = job.cat_generation;
+            Ok(observed) => match self.set_runtime_generation(&cat_id, job.cat_generation) {
+                Ok(()) => NodeJobResult::ok(&job_id, observed),
+                Err(error) => {
+                    tracing::error!(
+                        job = %job_id,
+                        cat = %cat_id,
+                        %error,
+                        "final usage checkpoint failed; lifecycle job failed closed"
+                    );
+                    NodeJobResult::fail(
+                        &job_id,
+                        self.observed_of(&cat_id),
+                        format!("final usage checkpoint failed: {error:#}"),
+                        true,
+                    )
                 }
-                NodeJobResult::ok(&job_id, observed)
-            }
+            },
             Err(e) => {
                 tracing::warn!(job = %job_id, "job failed: {e:#}");
                 let observed = self.observed_of(&cat_id);
@@ -336,10 +385,18 @@ impl NodeRuntime {
                     // A rejected suspend still consumed this lifecycle job:
                     // keep the work-status watcher on the control-plane
                     // generation used for cancellation/retry.
-                    if let Some(runtime) = self.cats.lock().unwrap().get_mut(&cat_id) {
-                        runtime.generation = job.cat_generation;
+                    if let Err(finalize_error) =
+                        self.set_runtime_generation(&cat_id, job.cat_generation)
+                    {
+                        NodeJobResult::fail(
+                            &job_id,
+                            observed,
+                            format!("final usage checkpoint failed: {finalize_error:#}"),
+                            true,
+                        )
+                    } else {
+                        NodeJobResult::rejected(&job_id, observed, format!("{e:#}"))
                     }
-                    NodeJobResult::rejected(&job_id, observed, format!("{e:#}"))
                 } else {
                     NodeJobResult::fail(&job_id, observed, format!("{e:#}"), true)
                 }
@@ -347,6 +404,45 @@ impl NodeRuntime {
         };
         self.journal.lock().unwrap().insert(job_id, result.clone());
         result
+    }
+
+    fn set_runtime_generation(&self, cat_id: &str, generation: i64) -> Result<()> {
+        let target = {
+            let cats = self.cats.lock().unwrap();
+            let Some(runtime) = cats.get(cat_id) else {
+                return Ok(());
+            };
+            if runtime.generation == generation {
+                return Ok(());
+            }
+            runtime.telemetry_target(cat_id)
+        };
+        self.finalize_usage(target)?;
+        let mut cats = self.cats.lock().unwrap();
+        let Some(runtime) = cats.get_mut(cat_id) else {
+            return Ok(());
+        };
+        if runtime.generation == generation {
+            return Ok(());
+        }
+        runtime.generation = generation;
+        if let Some(metering) = &mut runtime.metering {
+            // A generation change is a new attribution epoch even when the
+            // same cgroup counter continues monotonically. The first sample
+            // in the new epoch establishes a fresh baseline.
+            metering.source_epoch = uuid::Uuid::new_v4().simple().to_string();
+        }
+        Ok(())
+    }
+
+    fn finalize_usage(&self, target: CatTelemetryTarget) -> Result<()> {
+        if target.metering.is_none() {
+            return Ok(());
+        }
+        if let Some(finalizer) = &self.usage_finalizer {
+            finalizer.finalize(target)?;
+        }
+        Ok(())
     }
 
     fn observed_of(&self, cat_id: &str) -> ObservedState {
@@ -416,6 +512,18 @@ impl NodeRuntime {
             // memory backing open and the new VMM cannot start.
             let existing = self.cats.lock().unwrap().remove(cat_id);
             if let Some(mut runtime) = existing {
+                if matches!(
+                    runtime.state,
+                    ObservedState::Running | ObservedState::Suspended | ObservedState::Warm
+                ) {
+                    if let Err(error) = self.finalize_usage(runtime.telemetry_target(cat_id)) {
+                        self.cats
+                            .lock()
+                            .unwrap()
+                            .insert(cat_id.to_string(), runtime);
+                        return Err(error);
+                    }
+                }
                 self.teardown(&mut runtime, false);
                 let _ = std::fs::remove_dir_all(&runtime.dir);
             }
@@ -443,6 +551,7 @@ impl NodeRuntime {
         let runtime_sock = short_socket_path(&self.cfg.state_dir, cat_id, "runtime");
         symlink_socket(&dir.join("ctl.sock"), &ctl_sock);
         symlink_socket(&dir.join("web.sock"), &web_sock);
+        let metering = self.prepare_metering(cat_id)?;
         let mut rt = CatRuntime {
             generation,
             cpus,
@@ -457,17 +566,22 @@ impl NodeRuntime {
             web_sock,
             runtime_sock,
             activity: Arc::new(RuntimeActivity::default()),
+            metering,
             ch: None,
         };
         let launch = (|| -> Result<String> {
             for grant in &volumes {
                 let proc = self.spawn_blockd(cat_id, &dir, grant)?;
+                let process_id = proc.child.id();
                 rt.blockds.insert(grant.disk_id.clone(), proc);
+                self.attach_to_metering(&rt, process_id)?;
             }
             self.write_disk_map(&rt)?;
             let state_file = rt.state_file();
             let guest = self.spawn_guest(&rt, warm_restore.then_some(state_file.as_path()))?;
+            let process_id = guest.id();
             rt.guest = Some(guest);
+            self.attach_to_metering(&rt, process_id)?;
             let boot_id = self.wait_guest_ready(&rt)?;
             Ok(boot_id)
         })();
@@ -536,7 +650,9 @@ impl NodeRuntime {
         };
         let (prev_nbd, snapshot_dir, expected_boot, previous_network) = previous;
         if warm_restore {
-            self.cats.lock().unwrap().remove(cat_id);
+            if let Some(previous_runtime) = self.cats.lock().unwrap().remove(cat_id) {
+                Self::remove_metering_cgroup(previous_runtime.metering.as_ref());
+            }
         }
         std::fs::create_dir_all(&dir)?;
         let memory_file = dir.join(ch::GUEST_MEMORY_FILE);
@@ -557,6 +673,7 @@ impl NodeRuntime {
             snapshot_dir: None,
             network: previous_network,
         };
+        let metering = self.prepare_metering(cat_id)?;
         let mut rt = CatRuntime {
             generation,
             cpus,
@@ -571,6 +688,7 @@ impl NodeRuntime {
             web_sock: short_socket_path(&self.cfg.state_dir, cat_id, "web"),
             runtime_sock: short_socket_path(&self.cfg.state_dir, cat_id, "runtime"),
             activity: Arc::new(RuntimeActivity::default()),
+            metering,
             ch: None,
         };
         // Warm may already own a tap from the preserved runtime. Publish the
@@ -582,7 +700,9 @@ impl NodeRuntime {
             let blockd_started = Instant::now();
             for grant in &volumes {
                 let proc = self.spawn_blockd(cat_id, &dir, grant)?;
+                let process_id = proc.child.id();
                 rt.blockds.insert(grant.disk_id.clone(), proc);
+                self.attach_to_metering(&rt, process_id)?;
             }
             let blockd_us = blockd_started.elapsed().as_micros();
             // 2. Seed a brand-new root volume with the golden image.
@@ -635,8 +755,10 @@ impl NodeRuntime {
                 restore_from: snapshot_dir.as_deref(),
                 network: chrt.network.as_ref(),
             })?;
-            let vmm_spawn_us = vmm_spawn_started.elapsed().as_micros();
+            let process_id = vmm.id();
             rt.guest = Some(vmm);
+            self.attach_to_metering(&rt, process_id)?;
+            let vmm_spawn_us = vmm_spawn_started.elapsed().as_micros();
             rt.ch = Some(chrt.clone());
             let api_ready_started = Instant::now();
             ch::wait_api_ready(&chrt.api_sock, rt.guest.as_mut().unwrap())?;
@@ -761,6 +883,55 @@ impl NodeRuntime {
         Ok(proc)
     }
 
+    fn prepare_metering(&self, cat_id: &str) -> Result<Option<RuntimeMetering>> {
+        let Some(root) = &self.cfg.metering_cgroup_root else {
+            return Ok(None);
+        };
+        let source_epoch = uuid::Uuid::new_v4().simple().to_string();
+        let node_dir = root.join(&self.cfg.node_id);
+        std::fs::create_dir_all(&node_dir)
+            .with_context(|| format!("create node metering cgroup {}", node_dir.display()))?;
+        enable_cgroup_controllers(&node_dir)?;
+        let cgroup_path = node_dir.join(format!("{cat_id}-{source_epoch}"));
+        std::fs::create_dir_all(&cgroup_path)
+            .with_context(|| format!("create metering cgroup {}", cgroup_path.display()))?;
+        for required in ["cgroup.procs", "cpu.stat", "memory.current"] {
+            if !cgroup_path.join(required).is_file() {
+                let _ = std::fs::remove_dir(&cgroup_path);
+                bail!(
+                    "metering cgroup {} lacks {required}; configure a delegated cgroup v2 subtree with CPU and memory accounting",
+                    cgroup_path.display()
+                );
+            }
+        }
+        Ok(Some(RuntimeMetering {
+            cgroup_path,
+            source_epoch,
+        }))
+    }
+
+    fn attach_to_metering(&self, runtime: &CatRuntime, process_id: u32) -> Result<()> {
+        let Some(metering) = &runtime.metering else {
+            return Ok(());
+        };
+        std::fs::write(
+            metering.cgroup_path.join("cgroup.procs"),
+            process_id.to_string(),
+        )
+        .with_context(|| {
+            format!(
+                "move process {process_id} into metering cgroup {}",
+                metering.cgroup_path.display()
+            )
+        })
+    }
+
+    fn remove_metering_cgroup(metering: Option<&RuntimeMetering>) {
+        if let Some(metering) = metering {
+            let _ = std::fs::remove_dir(&metering.cgroup_path);
+        }
+    }
+
     fn wait_blockd_ready(&self, proc: &mut BlockdProc) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
@@ -845,6 +1016,15 @@ impl NodeRuntime {
             let _ = std::fs::remove_dir_all(&dir);
             return Ok(ObservedState::Cold);
         };
+        if matches!(
+            rt.state,
+            ObservedState::Running | ObservedState::Suspended | ObservedState::Warm
+        ) {
+            if let Err(error) = self.finalize_usage(rt.telemetry_target(cat_id)) {
+                self.cats.lock().unwrap().insert(cat_id.to_string(), rt);
+                return Err(error);
+            }
+        }
         self.teardown(&mut rt, graceful);
         let _ = std::fs::remove_dir_all(&rt.dir);
         Ok(ObservedState::Cold)
@@ -904,6 +1084,7 @@ impl NodeRuntime {
         let _ = std::fs::remove_file(rt.ctl_socket());
         let _ = std::fs::remove_file(rt.web_socket());
         let _ = std::fs::remove_file(rt.runtime_socket());
+        Self::remove_metering_cgroup(rt.metering.as_ref());
         rt.state = ObservedState::Cold;
     }
 
@@ -1168,6 +1349,14 @@ impl NodeRuntime {
                 rt.memory_mib,
             )
         };
+        let target = self
+            .cats
+            .lock()
+            .unwrap()
+            .get(cat_id)
+            .map(|runtime| runtime.telemetry_target(cat_id))
+            .context("warm runtime vanished before usage finalization")?;
+        self.finalize_usage(target)?;
         // CH mode keeps the runtime entry (start_cat_ch consumes it).
         if matches!(self.cfg.vmm, VmmMode::Fake) {
             self.cats.lock().unwrap().remove(cat_id);
@@ -1229,7 +1418,15 @@ impl NodeRuntime {
         }
         let dir = rt.dir.clone();
         let proc = self.spawn_blockd(cat_id, &dir, &grant)?;
+        let process_id = proc.child.id();
         rt.blockds.insert(grant.disk_id.clone(), proc);
+        if let Err(error) = self.attach_to_metering(rt, process_id) {
+            if let Some(mut proc) = rt.blockds.remove(&grant.disk_id) {
+                let _ = proc.child.kill();
+                let _ = proc.child.wait();
+            }
+            return Err(error);
+        }
         rt.volumes.push(grant);
         self.write_disk_map(rt)?;
         Ok(ObservedState::Running)
@@ -1376,6 +1573,94 @@ impl NodeRuntime {
         );
         parse_guest_http_response(&buf)
     }
+}
+
+/// Prepare the delegated cgroup v2 hierarchy before any Cat runtime starts.
+///
+/// A systemd service initially places its own process in the delegated unit
+/// cgroup. cgroup v2 does not allow CPU or memory controllers to be enabled
+/// for children while that parent contains a process, so the node agent first
+/// moves itself into a sibling leaf and leaves the configured metering root
+/// empty for per-Cat descendants.
+pub(crate) fn initialize_metering_cgroup(cfg: &NodeConfig) -> Result<()> {
+    let Some(root) = &cfg.metering_cgroup_root else {
+        return Ok(());
+    };
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = root;
+        bail!("authoritative cgroup v2 billing is supported only on Linux");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let delegated_root = root.parent().with_context(|| {
+            format!(
+                "metering cgroup root {} must have a delegated parent",
+                root.display()
+            )
+        })?;
+        let delegated_processes = delegated_root.join("cgroup.procs");
+        let process_id = std::process::id().to_string();
+        let current_processes =
+            std::fs::read_to_string(&delegated_processes).with_context(|| {
+                format!(
+                    "read delegated cgroup process list {}",
+                    delegated_processes.display()
+                )
+            })?;
+        anyhow::ensure!(
+            current_processes.lines().any(|line| line == process_id),
+            "node agent is not running in configured delegated cgroup {}",
+            delegated_root.display()
+        );
+
+        let agent_leaf = delegated_root.join("agent");
+        std::fs::create_dir_all(&agent_leaf)
+            .with_context(|| format!("create node-agent cgroup {}", agent_leaf.display()))?;
+        std::fs::write(agent_leaf.join("cgroup.procs"), &process_id)
+            .with_context(|| format!("move node agent into {}", agent_leaf.display()))?;
+        let remaining_processes =
+            std::fs::read_to_string(&delegated_processes).with_context(|| {
+                format!(
+                    "re-read delegated cgroup process list {}",
+                    delegated_processes.display()
+                )
+            })?;
+        anyhow::ensure!(
+            remaining_processes.lines().all(|line| line.is_empty()),
+            "delegated cgroup {} contains processes other than the node agent",
+            delegated_root.display()
+        );
+
+        enable_cgroup_controllers(delegated_root)?;
+        std::fs::create_dir_all(root)
+            .with_context(|| format!("create metering cgroup root {}", root.display()))?;
+        enable_cgroup_controllers(root)?;
+        Ok(())
+    }
+}
+
+fn enable_cgroup_controllers(cgroup: &Path) -> Result<()> {
+    let controllers_path = cgroup.join("cgroup.controllers");
+    let controllers = std::fs::read_to_string(&controllers_path)
+        .with_context(|| format!("read cgroup controllers {}", controllers_path.display()))?;
+    let available = controllers
+        .split_whitespace()
+        .collect::<std::collections::HashSet<_>>();
+    for required in ["cpu", "memory"] {
+        anyhow::ensure!(
+            available.contains(required),
+            "delegated cgroup {} does not expose the {required} controller",
+            cgroup.display()
+        );
+    }
+    let subtree_control = cgroup.join("cgroup.subtree_control");
+    std::fs::write(&subtree_control, "+cpu +memory").with_context(|| {
+        format!(
+            "enable cpu and memory controllers in {}",
+            subtree_control.display()
+        )
+    })
 }
 
 const MAX_PROXY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;

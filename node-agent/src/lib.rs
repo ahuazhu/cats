@@ -6,6 +6,7 @@ pub mod ch;
 pub mod guest_client;
 pub mod runtime;
 pub mod server;
+pub mod usage_spool;
 
 /// Test support: locate (and if needed build) workspace binaries so
 /// integration/E2E tests can spawn the real `cats-blockd` and

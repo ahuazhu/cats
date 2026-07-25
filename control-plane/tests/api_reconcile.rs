@@ -12,6 +12,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 
+use cats_api::billing::BillingBalance;
+use cats_api::metering::{
+    CatUsageCheckpoint, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse, UsageMetric,
+    UsageReport,
+};
 use cats_api::nodejob::{NodeJob, NodeJobAction, NodeJobResult};
 use cats_api::requests::*;
 use cats_api::resources::*;
@@ -19,6 +24,7 @@ use cats_control_plane::controller::AutoTierPolicy;
 use cats_control_plane::server::{spawn, Config, Handle};
 use cats_control_plane::store::Store;
 use cats_metadata_store_sqlite::SqliteMetadataStore;
+use cats_metering::{deterministic_event_id, SqliteUsageStore};
 use cats_storage::MetadataStore;
 
 const SERVICE_TOKEN: &str = "dev-service-token";
@@ -200,10 +206,14 @@ impl Ctx {
         let cp = spawn(Config {
             listen: "127.0.0.1:0".into(),
             db_path: dir.path().join("control.db"),
+            usage_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
+            credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
             storage_meta,
             auth_token: SERVICE_TOKEN.into(),
             admin_token: "dev-admin-token".into(),
             workos: None,
+            stripe: None,
+            billing_enforcement_enabled: true,
             node_lease_timeout_ms: 3_000,
             reconcile_interval_ms,
             auto_tier_policy,
@@ -929,11 +939,15 @@ async fn control_plane_startup_grace_preserves_a_reconnecting_host_bound_cat() {
         Arc::new(SqliteMetadataStore::open(&dir.path().join("storage-meta.db")).unwrap());
     let cp = spawn(Config {
         listen: "127.0.0.1:0".into(),
+        usage_store: Arc::new(SqliteUsageStore::open(&db_path).unwrap()),
+        credit_store: Arc::new(SqliteUsageStore::open(&db_path).unwrap()),
         db_path,
         storage_meta,
         auth_token: SERVICE_TOKEN.into(),
         admin_token: "dev-admin-token".into(),
         workos: None,
+        stripe: None,
+        billing_enforcement_enabled: false,
         node_lease_timeout_ms: 2_000,
         reconcile_interval_ms: 10,
         auto_tier_policy: Default::default(),
@@ -1130,10 +1144,14 @@ async fn static_user_tokens_are_not_accepted() {
     let cfg = Config {
         listen: "127.0.0.1:0".into(),
         db_path: dir.path().join("control.db"),
+        usage_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
+        credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
         storage_meta,
         auth_token: SERVICE_TOKEN.into(),
         admin_token: "token-admin".into(),
         workos: None,
+        stripe: None,
+        billing_enforcement_enabled: false,
         node_lease_timeout_ms: 3_000,
         reconcile_interval_ms: 200,
         auto_tier_policy: Default::default(),
@@ -1164,6 +1182,389 @@ async fn static_user_tokens_are_not_accepted() {
         .await
         .unwrap();
     assert_eq!(admin_cross_project.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn cumulative_usage_is_idempotent_and_queryable_by_project_cat_and_metric() {
+    let ctx = Ctx::new().await;
+    let _node = start_stub_node(&ctx.cp, "node_a").await;
+    ctx.create_cat("metered", None).await;
+    let cat = ctx.wait_observed("metered", ObservedState::Running).await;
+
+    let make_checkpoint =
+        |metric: UsageMetric, sequence: u64, observed_at_unix_ms: i64, quantity: u128| {
+            let mut checkpoint = CatUsageCheckpoint {
+                event_id: String::new(),
+                source_id: format!("node/node_a/cat/{}", cat.id),
+                source_epoch: "runtime-1".to_string(),
+                sequence,
+                observed_at_unix_ms,
+                cat_id: cat.id.clone(),
+                cat_generation: cat.generation,
+                metric,
+                cumulative_quantity: quantity,
+            };
+            checkpoint.event_id = deterministic_event_id(&checkpoint);
+            checkpoint
+        };
+    let hour_end = 3_601_000;
+    let checkpoints = vec![
+        make_checkpoint(UsageMetric::CpuUsec, 0, 1_000, 0),
+        make_checkpoint(UsageMetric::MemoryByteMillis, 0, 1_000, 0),
+        make_checkpoint(UsageMetric::CpuUsec, 1, hour_end, 3_600_000_000),
+        make_checkpoint(
+            UsageMetric::MemoryByteMillis,
+            1,
+            hour_end,
+            1_073_741_824 * 3_600_000,
+        ),
+    ];
+    let request = IngestUsageCheckpointsRequest {
+        node_id: "node_a".to_string(),
+        checkpoints,
+    };
+    let first: IngestUsageCheckpointsResponse = ctx
+        .http
+        .post(ctx.url("/v1/internal/usage/checkpoints"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first.accepted, 4);
+    assert_eq!(first.duplicates, 0);
+
+    let replay: IngestUsageCheckpointsResponse = ctx
+        .http
+        .post(ctx.url("/v1/internal/usage/checkpoints"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replay.accepted, 0);
+    assert_eq!(replay.duplicates, 4);
+
+    let report_response = ctx
+        .http
+        .get(ctx.url(&format!(
+            "/v1/projects/default/billing/usage?from_ms=1000&to_ms={hour_end}&cat=metered&detail=true"
+        )))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        report_response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    let report: UsageReport = report_response.json().await.unwrap();
+    assert_eq!(report.status, "provisional");
+    assert_eq!(report.amount_nanos, "113750000");
+    assert_eq!(report.items.len(), 2);
+    assert_eq!(report.cats.len(), 1);
+    assert_eq!(report.cats[0].cat_id, cat.id);
+    assert_eq!(report.details.len(), 2);
+    assert_eq!(report.latest_interval_end_unix_ms, Some(hour_end));
+
+    let balance: BillingBalance = ctx
+        .http
+        .get(ctx.url("/v1/projects/default/billing/balance"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(balance.credit_nanos, "10000000000");
+    assert_eq!(balance.provisional_usage_nanos, "113750000");
+    assert_eq!(balance.available_credit_nanos, "9886250000");
+    assert_eq!(balance.signup_credit_nanos, "10000000000");
+    assert!(!balance.stripe_enabled);
+
+    let bucketed: UsageReport = ctx
+        .http
+        .get(ctx.url(&format!(
+            "/v1/projects/default/billing/usage?from_ms=1000&to_ms={hour_end}&cat_id={}&bucket_ms=1800000",
+            cat.id
+        )))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(bucketed.time_buckets.len(), 2);
+    assert_eq!(bucketed.time_buckets[0].interval_start_unix_ms, 1_000);
+    assert_eq!(bucketed.time_buckets[1].interval_end_unix_ms, hour_end);
+    assert_eq!(bucketed.time_buckets[0].amount_nanos, "56875000");
+    assert_eq!(bucketed.time_buckets[1].amount_nanos, "56875000");
+    assert_eq!(
+        bucketed
+            .time_buckets
+            .iter()
+            .map(|bucket| bucket.amount_nanos.parse::<u128>().unwrap())
+            .sum::<u128>()
+            .to_string(),
+        bucketed.amount_nanos
+    );
+
+    for query in [
+        format!(
+            "/v1/projects/default/billing/usage?from_ms=1000&to_ms={hour_end}&cat_id={}&bucket_ms=1000",
+            cat.id
+        ),
+        format!(
+            "/v1/projects/default/billing/usage?from_ms=1000&to_ms=40000000&cat_id={}&bucket_ms=60000",
+            cat.id
+        ),
+    ] {
+        let invalid_bucket = ctx
+            .http
+            .get(ctx.url(&query))
+            .bearer_auth("dev-admin-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid_bucket.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // A lifecycle mutation bumps the control-plane generation before the
+    // node can submit the previous runtime epoch's final checkpoint.
+    ctx.action("metered", "suspend").await;
+    let transitioned = ctx.wait_observed("metered", ObservedState::Suspended).await;
+    assert!(transitioned.generation > cat.generation);
+    let historical = IngestUsageCheckpointsRequest {
+        node_id: "node_a".to_string(),
+        checkpoints: vec![make_checkpoint(
+            UsageMetric::CpuUsec,
+            2,
+            hour_end + 1_000,
+            3_600_000_001,
+        )],
+    };
+    let accepted_historical: IngestUsageCheckpointsResponse = ctx
+        .http
+        .post(ctx.url("/v1/internal/usage/checkpoints"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&historical)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(accepted_historical.accepted, 1);
+
+    let mut future_checkpoint = historical.checkpoints[0].clone();
+    future_checkpoint.cat_generation = transitioned.generation + 1;
+    future_checkpoint.event_id = deterministic_event_id(&future_checkpoint);
+    let future = ctx
+        .http
+        .post(ctx.url("/v1/internal/usage/checkpoints"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&IngestUsageCheckpointsRequest {
+            node_id: "node_a".to_string(),
+            checkpoints: vec![future_checkpoint],
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(future.status(), StatusCode::CONFLICT);
+
+    let deleted = ctx
+        .http
+        .delete(ctx.url("/v1/projects/default/cats/metered"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::ACCEPTED);
+    let delete_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let response = ctx
+            .http
+            .get(ctx.url("/v1/projects/default/cats/metered"))
+            .bearer_auth("dev-admin-token")
+            .send()
+            .await
+            .unwrap();
+        if response.status() == StatusCode::NOT_FOUND {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < delete_deadline,
+            "metered Cat never deleted"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let deleted_tail: IngestUsageCheckpointsResponse = ctx
+        .http
+        .post(ctx.url("/v1/internal/usage/checkpoints"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&IngestUsageCheckpointsRequest {
+            node_id: "node_a".to_string(),
+            checkpoints: vec![make_checkpoint(
+                UsageMetric::CpuUsec,
+                3,
+                hour_end + 2_000,
+                3_600_000_002,
+            )],
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(deleted_tail.accepted, 1);
+
+    let historical_report: UsageReport = ctx
+        .http
+        .get(ctx.url(&format!(
+            "/v1/projects/default/billing/usage?from_ms=1000&to_ms={}&cat_id={}&detail=true",
+            hour_end + 3_000,
+            cat.id
+        )))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(historical_report.cats.len(), 1);
+    assert_eq!(historical_report.cats[0].cat_id, cat.id);
+    assert_eq!(historical_report.details.len(), 4);
+    assert_eq!(
+        historical_report
+            .details
+            .iter()
+            .map(|detail| detail.end_sequence)
+            .max(),
+        Some(3)
+    );
+
+    let ambiguous_cat_filter = ctx
+        .http
+        .get(ctx.url(&format!(
+            "/v1/projects/default/billing/usage?from_ms=1000&to_ms={hour_end}&cat=metered&cat_id={}",
+            cat.id
+        )))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ambiguous_cat_filter.status(), StatusCode::BAD_REQUEST);
+
+    let user_query_with_service_credential = ctx
+        .http
+        .get(ctx.url(&format!(
+            "/v1/projects/default/billing/usage?from_ms=1000&to_ms={hour_end}"
+        )))
+        .bearer_auth(SERVICE_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        user_query_with_service_credential.status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn exhausted_prepaid_balance_blocks_new_or_waking_compute() {
+    let ctx = Ctx::new().await;
+    let _node = start_stub_node(&ctx.cp, "node_a").await;
+    ctx.create_cat("spender", None).await;
+    let cat = ctx.wait_observed("spender", ObservedState::Running).await;
+    let checkpoint = |sequence, observed_at_unix_ms, cumulative_quantity| {
+        let mut checkpoint = CatUsageCheckpoint {
+            event_id: String::new(),
+            source_id: format!("node/node_a/cat/{}", cat.id),
+            source_epoch: "expensive-runtime".to_string(),
+            sequence,
+            observed_at_unix_ms,
+            cat_id: cat.id.clone(),
+            cat_generation: cat.generation,
+            metric: UsageMetric::CpuUsec,
+            cumulative_quantity,
+        };
+        checkpoint.event_id = deterministic_event_id(&checkpoint);
+        checkpoint
+    };
+    let response = ctx
+        .http
+        .post(ctx.url("/v1/internal/usage/checkpoints"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&IngestUsageCheckpointsRequest {
+            node_id: "node_a".to_string(),
+            checkpoints: vec![
+                checkpoint(0, 1_000, 0),
+                checkpoint(1, 720_001_000, 720_000_000_000),
+            ],
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    ctx.action("spender", "suspend").await;
+    ctx.wait_observed("spender", ObservedState::Suspended).await;
+    let resume = ctx
+        .http
+        .post(ctx.url("/v1/projects/default/cats/spender/actions/resume"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resume.status(), StatusCode::PAYMENT_REQUIRED);
+    let body: cats_api::error::ErrorBody = resume.json().await.unwrap();
+    assert_eq!(body.code, cats_api::error::ErrorCode::PaymentRequired);
+
+    let create = ctx
+        .http
+        .post(ctx.url("/v1/projects/default/cats"))
+        .bearer_auth("dev-admin-token")
+        .json(&serde_json::json!({
+            "name": "blocked",
+            "image": "ubuntu-24.04",
+            "cpus": 1,
+            "memory_mib": 512,
+            "root_size_bytes": 8 << 20,
+            "disk": null
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::PAYMENT_REQUIRED);
 }
 
 #[tokio::test]

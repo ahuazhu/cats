@@ -32,6 +32,7 @@ The console provides:
 - Fleet-independent overview of your Cats, sleeping states, disks, and active Operations.
 - Create, start, suspend, Warm, stop, exec, expose, and destroy actions for Cats.
 - Create, snapshot, mount, unmount, resize, and delete actions for disks.
+- Near-real-time provisional billing by meter and Cat, with a selected Cat's range total, per-meter totals, over-time spend curves, and bounded period detail.
 - Structured status and error display with automatic session refresh.
 
 ## Language switching

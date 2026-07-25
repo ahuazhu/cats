@@ -41,6 +41,12 @@ CLI 调用契约。
    WorkOS 未配置时浏览器站点 fail closed。Bearer API 本身仍保留给 CLI 和内部服务。
 7. 使用 WorkOS 官方 Rust SDK 提供的 AuthKit、PKCE 与 sealed-session helper，不自行
    实现密码学协议。由此 workspace 最低 Rust 版本从 1.85 提升到 1.88。
+8. 公共 user 入口不预先枚举 Project。若 WorkOS Hosted UI 因现有登录上下文返回一个
+   未映射 Organization，但该用户的 active membership 与部署映射的交集恰好只有一个
+   Workspace，控制面使用 WorkOS refresh-token organization switching 将该 session
+   切换到唯一候选后再授权。候选为零个或多个时 fail closed；无 Organization session
+   的个人 Project 行为不变。该规则避免同时拥有平台管理员 Organization 和一个用户
+   Workspace 的账号被管理员登录上下文挡在 user 站之外。
 
 ## 安全边界
 
@@ -48,7 +54,9 @@ CLI 调用契约。
   `/auth/config`、不进入前端 JavaScript 或 Guest。
 - 登录 flow cookie 最长 10 分钟；回调必须同时匹配 sealed flow、site、state 和
   return path。组织 session 必须匹配请求的 organization；仅 user 站允许无组织
-  session 进入其确定性的个人 Project。
+  session 进入其确定性的个人 Project。自动 organization switching 前必须从 WorkOS
+  重新读取 active memberships；切换后的 user ID、organization ID 和显式 Project
+  映射必须全部匹配，否则拒绝登录。
 - user/admin session 相互独立；admin session 可以管理所有 Cats projects，但不能
   调用 service-only node/gateway API。
 - Project 名称不通过公开认证配置接口枚举。公共用户入口先完成 WorkOS 认证，再从

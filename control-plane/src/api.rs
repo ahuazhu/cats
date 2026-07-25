@@ -2,8 +2,10 @@
 //! `Idempotency-Key` retries replay the original operation; actions live
 //! under `/actions/<verb>` (path-safe rendering of the `:verb` convention).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -12,11 +14,21 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+use cats_api::billing::{BillingBalance, CreateCheckoutRequest, CreateCheckoutResponse};
 use cats_api::error::{ApiError, ErrorBody, ErrorCode};
+use cats_api::metering::{
+    CatUsageSummary, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse,
+    UsageDetailLine, UsageMetric, UsageReport, UsageSummaryLine, UsageTimeBucket,
+};
 use cats_api::requests::*;
 use cats_api::resources::*;
+use cats_metering::{
+    AttributedCheckpoint, CheckoutIntent, CheckoutPayment, CheckoutRefund, CreditApplyOutcome,
+    IngestOutcome, RateCard, UsageAttribution, UsageInterval, UsageQuery as MeterUsageQuery,
+};
 
 use crate::server::AppState;
 
@@ -188,6 +200,21 @@ fn if_match(headers: &HeaderMap) -> Option<i64> {
         .and_then(|s| s.parse().ok())
 }
 
+fn billing_account_id_for_project(project: &str) -> String {
+    // The current V1 repository has a 1:1 workspace/project boundary. Keep
+    // the account namespace explicit so a future org -> many projects mapping
+    // does not require rewriting immutable historical usage.
+    format!("billing_account/project/{project}")
+}
+
+fn metering_failure(error: cats_metering::MeteringError) -> Failure {
+    match error {
+        cats_metering::MeteringError::Invalid(message) => ApiError::invalid(message).into(),
+        cats_metering::MeteringError::Conflict(message) => ApiError::conflict(message).into(),
+        other => ApiError::internal(other.to_string()).into(),
+    }
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(crate::ui::portal))
@@ -276,6 +303,20 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/nodes/work-status", post(node_work_status))
         .route("/v1/internal/work/acquire", post(acquire_work))
         .route("/v1/internal/work/release", post(release_work))
+        .route(
+            "/v1/internal/usage/checkpoints",
+            post(ingest_usage_checkpoints),
+        )
+        .route("/v1/projects/{project}/billing/usage", get(project_usage))
+        .route(
+            "/v1/projects/{project}/billing/balance",
+            get(project_billing_balance),
+        )
+        .route(
+            "/v1/projects/{project}/billing/checkout",
+            post(create_billing_checkout),
+        )
+        .route("/v1/billing/stripe/webhook", post(stripe_webhook))
         .route("/v1/nodes/{id}/actions/cordon", post(cordon_node))
         .route("/v1/nodes", get(list_nodes))
         .route("/v1/admin/nodes", get(admin_list_nodes))
@@ -346,6 +387,7 @@ async fn create_cat(
     Json(req): Json<CreateCatRequest>,
 ) -> ApiResult<Response> {
     check_project_auth(&state, &headers, &project).await?;
+    require_funded(&state, &project).await?;
     if req.name.is_empty()
         || !req
             .name
@@ -425,6 +467,9 @@ async fn cat_action(
         "stop" => DesiredState::Cold,
         _ => return Err(ApiError::invalid(format!("unknown action {verb}")).into()),
     };
+    if desired == DesiredState::Running {
+        require_funded(&state, &project).await?;
+    }
     let route = format!("POST /cats/{}/actions/{verb}", cat.id);
     if let Some(key) = idem_key(&headers) {
         if let Some(op_id) = state.store.idempotency_lookup(&key, &route)? {
@@ -783,6 +828,7 @@ async fn get_cat_work(
 pub async fn ensure_running(state: &AppState, cat: Cat) -> ApiResult<Cat> {
     let wake_started = std::time::Instant::now();
     let cat = state.store.must_get_cat_by_id(&cat.id)?;
+    require_funded(state, &cat.project).await?;
     if cat.desired_state == DesiredState::Running && cat.observed_state == ObservedState::Running {
         return Ok(cat);
     }
@@ -1287,6 +1333,785 @@ async fn heartbeat(
         }
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn ingest_usage_checkpoints(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<IngestUsageCheckpointsRequest>,
+) -> ApiResult<Json<IngestUsageCheckpointsResponse>> {
+    check_service_auth(&state, &headers).await?;
+    if req.checkpoints.len() > 10_000 {
+        return Err(ApiError::invalid("at most 10000 checkpoints per request").into());
+    }
+    // A missing/lost node cannot invent a producer identity. Registration is
+    // also what lets operations fence a replaced node before accepting data.
+    state.store.get_node(&req.node_id)?;
+
+    let mut accepted = 0_u64;
+    let mut duplicates = 0_u64;
+    for checkpoint in req.checkpoints {
+        let expected_source = format!("node/{}/cat/{}", req.node_id, checkpoint.cat_id);
+        if checkpoint.source_id != expected_source {
+            return Err(ApiError::invalid(format!(
+                "checkpoint source_id must be {expected_source}"
+            ))
+            .into());
+        }
+        let attribution = match state.store.must_get_cat_by_id(&checkpoint.cat_id) {
+            Ok(cat) => {
+                if cat.node_id.as_deref() != Some(req.node_id.as_str()) {
+                    return Err(ApiError::conflict(format!(
+                        "node {} does not own Cat {}",
+                        req.node_id, checkpoint.cat_id
+                    ))
+                    .into());
+                }
+                // A lifecycle job finalizes the runtime epoch that existed
+                // before the desired-state mutation bumped the control-plane
+                // generation. Accept an older acknowledged generation while
+                // this node still owns the Cat; never accept a future one.
+                if checkpoint.cat_generation > cat.generation {
+                    return Err(ApiError::conflict(format!(
+                        "Cat {} checkpoint generation {} is newer than current {}",
+                        checkpoint.cat_id, checkpoint.cat_generation, cat.generation
+                    ))
+                    .into());
+                }
+                UsageAttribution {
+                    billing_account_id: billing_account_id_for_project(&cat.project),
+                    project_id: cat.project,
+                    resource_type: "cat".to_string(),
+                    resource_id: checkpoint.cat_id.clone(),
+                    attributed_cat_id: Some(checkpoint.cat_id.clone()),
+                }
+            }
+            Err(error) if error.code == ErrorCode::NotFound => {
+                // Durable outboxes can replay after resource deletion. Reuse
+                // attribution already frozen in this exact source epoch; the
+                // node never supplies or changes billing ownership.
+                let attribution = state
+                    .usage
+                    .source_epoch_attribution(&checkpoint.source_id, &checkpoint.source_epoch)
+                    .await
+                    .map_err(metering_failure)?
+                    .ok_or_else(|| {
+                        ApiError::conflict(format!(
+                            "no frozen attribution exists for deleted Cat {} source epoch",
+                            checkpoint.cat_id
+                        ))
+                    })?;
+                if attribution.resource_type != "cat"
+                    || attribution.resource_id != checkpoint.cat_id
+                    || attribution.attributed_cat_id.as_deref() != Some(checkpoint.cat_id.as_str())
+                {
+                    return Err(ApiError::conflict(
+                        "stored source-epoch attribution does not match checkpoint Cat",
+                    )
+                    .into());
+                }
+                attribution
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let value = AttributedCheckpoint {
+            attribution,
+            checkpoint,
+        };
+        match state.usage.ingest(&value).await.map_err(metering_failure)? {
+            IngestOutcome::Accepted => accepted += 1,
+            IngestOutcome::Duplicate => duplicates += 1,
+        }
+    }
+    Ok(Json(IngestUsageCheckpointsResponse {
+        accepted,
+        duplicates,
+    }))
+}
+
+const SIGNUP_CREDIT_NANOS: i128 = 10_000_000_000;
+
+struct BillingProjection {
+    credit_nanos: i128,
+    usage_nanos: u128,
+    available_nanos: i128,
+    latest_interval_end_unix_ms: Option<i64>,
+    stripe_customer_id: Option<String>,
+}
+
+fn unix_millis() -> Result<i64, Failure> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| ApiError::internal("system time is before Unix epoch"))?
+        .as_millis();
+    i64::try_from(millis).map_err(|_| ApiError::internal("system time is out of range").into())
+}
+
+async fn billing_projection(state: &AppState, project: &str) -> ApiResult<BillingProjection> {
+    let now_ms = unix_millis()?;
+    let billing_account_id = billing_account_id_for_project(project);
+    let credit = state
+        .credits
+        .ensure_account(
+            &billing_account_id,
+            project,
+            "USD",
+            SIGNUP_CREDIT_NANOS,
+            now_ms,
+        )
+        .await
+        .map_err(metering_failure)?;
+    let usage = state
+        .usage
+        .query(&MeterUsageQuery {
+            billing_account_id,
+            project_id: Some(project.to_string()),
+            attributed_cat_id: None,
+            interval_start_unix_ms: 0,
+            interval_end_unix_ms: now_ms.max(1),
+        })
+        .await
+        .map_err(metering_failure)?;
+    let rate_card = RateCard::sprites_compute_v1();
+    let mut usage_nanos = 0_u128;
+    for aggregate in &usage.totals {
+        if let Some(amount) = rate_card
+            .rate_quantity(aggregate.metric, aggregate.quantity)
+            .map_err(metering_failure)?
+        {
+            usage_nanos = usage_nanos
+                .checked_add(amount)
+                .ok_or_else(|| ApiError::internal("rated balance overflow"))?;
+        }
+    }
+    let usage_signed = i128::try_from(usage_nanos)
+        .map_err(|_| ApiError::internal("rated balance exceeds signed money range"))?;
+    let available_nanos = credit
+        .credit_nanos
+        .checked_sub(usage_signed)
+        .ok_or_else(|| ApiError::internal("available balance overflow"))?;
+    Ok(BillingProjection {
+        credit_nanos: credit.credit_nanos,
+        usage_nanos,
+        available_nanos,
+        latest_interval_end_unix_ms: usage.latest_interval_end_unix_ms,
+        stripe_customer_id: credit.stripe_customer_id,
+    })
+}
+
+async fn require_funded(state: &AppState, project: &str) -> ApiResult<()> {
+    if !state.cfg.billing_enforcement_enabled {
+        return Ok(());
+    }
+    let projection = billing_projection(state, project).await?;
+    if projection.available_nanos <= 0 {
+        return Err(ApiError::payment_required(
+            "prepaid balance is exhausted; add funds in Billing before starting paid work",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+pub(crate) async fn enforce_exhausted_billing_accounts(state: &AppState) -> ApiResult<()> {
+    let active_cats = state
+        .store
+        .list_all_cats()?
+        .into_iter()
+        .filter(|cat| cat.desired_state == DesiredState::Running)
+        .collect::<Vec<_>>();
+    let projects = active_cats
+        .iter()
+        .map(|cat| cat.project.clone())
+        .collect::<BTreeSet<_>>();
+    let mut changed = false;
+    for project in projects {
+        let projection = billing_projection(state, &project).await?;
+        if projection.available_nanos > 0 {
+            continue;
+        }
+        for cat in active_cats.iter().filter(|cat| cat.project == project) {
+            match state
+                .store
+                .set_desired(&cat.id, DesiredState::Cold, None, "cat.credit_exhausted")
+            {
+                Ok(_) => {
+                    changed = true;
+                    tracing::warn!(
+                        billing_account = %billing_account_id_for_project(&project),
+                        cat_id = %cat.id,
+                        "prepaid balance exhausted; converging Cat to Cold"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        cat_id = %cat.id,
+                        error = %error,
+                        "could not apply exhausted-credit Cold state"
+                    );
+                }
+            }
+        }
+    }
+    if changed {
+        state.notify.notify_one();
+    }
+    Ok(())
+}
+
+async fn project_billing_balance(
+    State(state): State<AppState>,
+    Path(project): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    check_project_auth(&state, &headers, &project).await?;
+    let projection = billing_projection(&state, &project).await?;
+    let stripe_enabled = state.cfg.stripe.is_some();
+    let topup_options_cents = state
+        .cfg
+        .stripe
+        .as_ref()
+        .map(|stripe| stripe.topup_options_cents())
+        .unwrap_or_default();
+    let balance = BillingBalance {
+        billing_account_id: billing_account_id_for_project(&project),
+        project_id: project,
+        currency: "USD".to_string(),
+        status: if projection.available_nanos > 0 {
+            "active"
+        } else {
+            "payment_required"
+        }
+        .to_string(),
+        credit_nanos: projection.credit_nanos.to_string(),
+        provisional_usage_nanos: projection.usage_nanos.to_string(),
+        available_credit_nanos: projection.available_nanos.to_string(),
+        signup_credit_nanos: SIGNUP_CREDIT_NANOS.to_string(),
+        stripe_enabled,
+        topup_options_cents,
+        usage_visible_through_unix_ms: projection.latest_interval_end_unix_ms,
+    };
+    let mut response = Json(balance).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+async fn create_billing_checkout(
+    State(state): State<AppState>,
+    Path(project): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<CreateCheckoutRequest>,
+) -> ApiResult<Response> {
+    check_project_auth(&state, &headers, &project).await?;
+    let stripe = state
+        .cfg
+        .stripe
+        .as_ref()
+        .ok_or_else(|| ApiError::failed_precondition("Stripe top-ups are not configured"))?;
+    if !stripe.topup_options_cents().contains(&request.amount_cents) {
+        return Err(ApiError::invalid("unsupported top-up amount").into());
+    }
+    let idempotency_key = idem_key(&headers)
+        .filter(|value| !value.trim().is_empty() && value.len() <= 200)
+        .ok_or_else(|| ApiError::invalid("Idempotency-Key is required for Checkout"))?;
+    let billing_account_id = billing_account_id_for_project(&project);
+    let projection = billing_projection(&state, &project).await?;
+    let mut hasher = Sha256::new();
+    for value in [&billing_account_id, &idempotency_key] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    let intent_id = format!("checkout_{}", hex::encode(hasher.finalize()));
+    let intent = state
+        .credits
+        .create_checkout_intent(&CheckoutIntent {
+            intent_id,
+            billing_account_id,
+            project_id: project,
+            amount_cents: request.amount_cents,
+            currency: "USD".to_string(),
+            created_at_unix_ms: unix_millis()?,
+            stripe_session_id: None,
+            checkout_url: None,
+        })
+        .await
+        .map_err(metering_failure)?;
+    let intent = if intent.stripe_session_id.is_some() && intent.checkout_url.is_some() {
+        intent
+    } else {
+        let session = stripe
+            .create_checkout_session(&intent, projection.stripe_customer_id.as_deref())
+            .await?;
+        state
+            .credits
+            .attach_checkout_session(&intent.intent_id, &session.id, &session.url)
+            .await
+            .map_err(metering_failure)?
+    };
+    let response = CreateCheckoutResponse {
+        checkout_intent_id: intent.intent_id,
+        stripe_session_id: intent
+            .stripe_session_id
+            .ok_or_else(|| ApiError::internal("checkout session was not persisted"))?,
+        url: intent
+            .checkout_url
+            .ok_or_else(|| ApiError::internal("checkout URL was not persisted"))?,
+    };
+    let mut response = Json(response).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum StripeObjectId {
+    Id(String),
+    Object { id: String },
+}
+
+impl StripeObjectId {
+    fn into_id(self) -> String {
+        match self {
+            Self::Id(id) | Self::Object { id } => id,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct StripeCheckoutSessionEvent {
+    id: String,
+    amount_total: Option<i64>,
+    currency: Option<String>,
+    payment_status: String,
+    payment_intent: Option<StripeObjectId>,
+    customer: Option<StripeObjectId>,
+    #[serde(default)]
+    metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StripeRefundEvent {
+    id: String,
+    amount: i64,
+    currency: String,
+    status: Option<String>,
+    payment_intent: Option<StripeObjectId>,
+}
+
+async fn stripe_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<StatusCode> {
+    let stripe = state
+        .cfg
+        .stripe
+        .as_ref()
+        .ok_or_else(|| ApiError::failed_precondition("Stripe top-ups are not configured"))?;
+    let signature = headers
+        .get("stripe-signature")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| ApiError::invalid("Stripe-Signature header is required"))?;
+    let verified = stripe.verify_webhook(signature, &body)?;
+    if matches!(
+        verified.event.event_type.as_str(),
+        "refund.created" | "refund.updated"
+    ) {
+        let refund: StripeRefundEvent = serde_json::from_value(verified.event.data.object)
+            .map_err(|error| ApiError::invalid(format!("invalid refund event: {error}")))?;
+        if refund.status.as_deref() != Some("succeeded") {
+            return Ok(StatusCode::NO_CONTENT);
+        }
+        let payment_intent_id = refund
+            .payment_intent
+            .map(StripeObjectId::into_id)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ApiError::invalid("refund payment_intent is missing"))?;
+        let outcome = state
+            .credits
+            .apply_checkout_refund(&CheckoutRefund {
+                event_id: verified.event.id,
+                payload_sha256: verified.payload_sha256,
+                stripe_refund_id: refund.id,
+                stripe_payment_intent_id: payment_intent_id,
+                amount_cents: refund.amount,
+                currency: refund.currency.to_ascii_uppercase(),
+                livemode: stripe.livemode(),
+                processed_at_unix_ms: unix_millis()?,
+            })
+            .await
+            .map_err(metering_failure)?;
+        return match outcome {
+            CreditApplyOutcome::Accepted | CreditApplyOutcome::Duplicate => {
+                Ok(StatusCode::NO_CONTENT)
+            }
+        };
+    }
+    if !matches!(
+        verified.event.event_type.as_str(),
+        "checkout.session.completed" | "checkout.session.async_payment_succeeded"
+    ) {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    let session: StripeCheckoutSessionEvent = serde_json::from_value(verified.event.data.object)
+        .map_err(|error| ApiError::invalid(format!("invalid Checkout session event: {error}")))?;
+    // A completed session can still be awaiting an asynchronous payment.
+    // Only the paid state is allowed to mint credit.
+    if session.payment_status != "paid" {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    let intent_id = session
+        .metadata
+        .get("checkout_intent_id")
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| ApiError::invalid("Checkout metadata is missing checkout_intent_id"))?;
+    let billing_account_id = session
+        .metadata
+        .get("billing_account_id")
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| ApiError::invalid("Checkout metadata is missing billing_account_id"))?;
+    let amount_cents = session
+        .amount_total
+        .filter(|amount| *amount > 0)
+        .ok_or_else(|| ApiError::invalid("Checkout amount_total must be positive"))?;
+    let currency = session
+        .currency
+        .map(|value| value.to_ascii_uppercase())
+        .ok_or_else(|| ApiError::invalid("Checkout currency is missing"))?;
+    let payment_intent_id = session
+        .payment_intent
+        .map(StripeObjectId::into_id)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::invalid("Checkout payment_intent is missing"))?;
+    let outcome = state
+        .credits
+        .apply_checkout_payment(&CheckoutPayment {
+            event_id: verified.event.id,
+            payload_sha256: verified.payload_sha256,
+            intent_id,
+            billing_account_id,
+            stripe_session_id: session.id,
+            stripe_payment_intent_id: payment_intent_id,
+            stripe_customer_id: session.customer.map(StripeObjectId::into_id),
+            amount_cents,
+            currency,
+            livemode: stripe.livemode(),
+            processed_at_unix_ms: unix_millis()?,
+        })
+        .await
+        .map_err(metering_failure)?;
+    match outcome {
+        CreditApplyOutcome::Accepted | CreditApplyOutcome::Duplicate => Ok(StatusCode::NO_CONTENT),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectUsageQuery {
+    from_ms: i64,
+    to_ms: i64,
+    #[serde(default)]
+    cat: Option<String>,
+    /// Immutable Cat resource ID for historical queries after deletion.
+    #[serde(default)]
+    cat_id: Option<String>,
+    #[serde(default)]
+    detail: bool,
+    /// Optional bounded projection for charts and period-level detail tables.
+    #[serde(default)]
+    bucket_ms: Option<i64>,
+}
+
+const MIN_USAGE_BUCKET_MS: i64 = 60_000;
+const MAX_USAGE_BUCKETS: i64 = 512;
+
+fn validate_usage_bucket(
+    from_ms: i64,
+    to_ms: i64,
+    bucket_ms: Option<i64>,
+) -> Result<Option<i64>, Failure> {
+    let Some(bucket_ms) = bucket_ms else {
+        return Ok(None);
+    };
+    if bucket_ms < MIN_USAGE_BUCKET_MS {
+        return Err(
+            ApiError::invalid(format!("bucket_ms must be at least {MIN_USAGE_BUCKET_MS}")).into(),
+        );
+    }
+    let duration = to_ms
+        .checked_sub(from_ms)
+        .ok_or_else(|| ApiError::invalid("usage query interval overflow"))?;
+    if duration <= 0 {
+        return Err(ApiError::invalid("usage query interval must be non-empty").into());
+    }
+    let bucket_count = duration
+        .checked_add(bucket_ms - 1)
+        .ok_or_else(|| ApiError::invalid("usage bucket count overflow"))?
+        / bucket_ms;
+    if bucket_count > MAX_USAGE_BUCKETS {
+        return Err(ApiError::invalid(format!(
+            "bucket_ms produces more than {MAX_USAGE_BUCKETS} buckets"
+        ))
+        .into());
+    }
+    Ok(Some(bucket_ms))
+}
+
+fn usage_time_buckets(
+    intervals: &[UsageInterval],
+    from_ms: i64,
+    to_ms: i64,
+    bucket_ms: i64,
+    rate_card: &RateCard,
+) -> cats_metering::Result<Vec<UsageTimeBucket>> {
+    if to_ms <= from_ms {
+        return Ok(Vec::new());
+    }
+    let duration = to_ms
+        .checked_sub(from_ms)
+        .ok_or(cats_metering::MeteringError::Overflow)?;
+    let bucket_count = usize::try_from(
+        duration
+            .checked_add(bucket_ms - 1)
+            .ok_or(cats_metering::MeteringError::Overflow)?
+            / bucket_ms,
+    )
+    .map_err(|_| cats_metering::MeteringError::Overflow)?;
+    let mut quantities = vec![BTreeMap::<&'static str, (UsageMetric, u128)>::new(); bucket_count];
+
+    for interval in intervals {
+        let interval_start = interval.interval_start_unix_ms.max(from_ms);
+        let interval_end = interval.interval_end_unix_ms.min(to_ms);
+        if interval_end <= interval_start || interval.quantity == 0 {
+            continue;
+        }
+        let duration = u128::try_from(interval_end - interval_start)
+            .map_err(|_| cats_metering::MeteringError::Overflow)?;
+        let mut cursor = interval_start;
+        while cursor < interval_end {
+            let index = usize::try_from((cursor - from_ms) / bucket_ms)
+                .map_err(|_| cats_metering::MeteringError::Overflow)?;
+            let boundary = from_ms
+                .checked_add(
+                    i64::try_from(index + 1)
+                        .map_err(|_| cats_metering::MeteringError::Overflow)?
+                        .checked_mul(bucket_ms)
+                        .ok_or(cats_metering::MeteringError::Overflow)?,
+                )
+                .ok_or(cats_metering::MeteringError::Overflow)?;
+            let part_end = interval_end.min(boundary);
+            let start_offset = u128::try_from(cursor - interval_start)
+                .map_err(|_| cats_metering::MeteringError::Overflow)?;
+            let end_offset = u128::try_from(part_end - interval_start)
+                .map_err(|_| cats_metering::MeteringError::Overflow)?;
+            let quantity_at_start = interval
+                .quantity
+                .checked_mul(start_offset)
+                .ok_or(cats_metering::MeteringError::Overflow)?
+                / duration;
+            let quantity_at_end = interval
+                .quantity
+                .checked_mul(end_offset)
+                .ok_or(cats_metering::MeteringError::Overflow)?
+                / duration;
+            let part_quantity = quantity_at_end
+                .checked_sub(quantity_at_start)
+                .ok_or(cats_metering::MeteringError::Overflow)?;
+            let entry = quantities[index]
+                .entry(interval.metric.slug())
+                .or_insert((interval.metric, 0));
+            entry.1 = entry
+                .1
+                .checked_add(part_quantity)
+                .ok_or(cats_metering::MeteringError::Overflow)?;
+            cursor = part_end;
+        }
+    }
+
+    quantities
+        .into_iter()
+        .enumerate()
+        .map(|(index, values)| {
+            let interval_start_unix_ms = from_ms
+                .checked_add(
+                    i64::try_from(index)
+                        .map_err(|_| cats_metering::MeteringError::Overflow)?
+                        .checked_mul(bucket_ms)
+                        .ok_or(cats_metering::MeteringError::Overflow)?,
+                )
+                .ok_or(cats_metering::MeteringError::Overflow)?;
+            let interval_end_unix_ms = interval_start_unix_ms
+                .checked_add(bucket_ms)
+                .ok_or(cats_metering::MeteringError::Overflow)?
+                .min(to_ms);
+            let mut amount_nanos = 0_u128;
+            let mut items = Vec::with_capacity(values.len());
+            for (_, (metric, quantity)) in values {
+                let amount = rate_card.rate_quantity(metric, quantity)?;
+                if let Some(amount) = amount {
+                    amount_nanos = amount_nanos
+                        .checked_add(amount)
+                        .ok_or(cats_metering::MeteringError::Overflow)?;
+                }
+                items.push(UsageSummaryLine {
+                    metric,
+                    quantity: quantity.to_string(),
+                    unit: metric.canonical_unit().to_string(),
+                    amount_nanos: amount.map(|value| value.to_string()),
+                });
+            }
+            Ok(UsageTimeBucket {
+                interval_start_unix_ms,
+                interval_end_unix_ms,
+                items,
+                amount_nanos: amount_nanos.to_string(),
+            })
+        })
+        .collect()
+}
+
+async fn project_usage(
+    State(state): State<AppState>,
+    Path(project): Path<String>,
+    Query(query): Query<ProjectUsageQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    check_project_auth(&state, &headers, &project).await?;
+    if query.cat.is_some() && query.cat_id.is_some() {
+        return Err(ApiError::invalid("cat and cat_id are mutually exclusive").into());
+    }
+    let bucket_ms = validate_usage_bucket(query.from_ms, query.to_ms, query.bucket_ms)?;
+    let cat_id = if let Some(cat_id) = query.cat_id {
+        if cat_id.trim().is_empty() {
+            return Err(ApiError::invalid("cat_id must not be empty").into());
+        }
+        Some(cat_id)
+    } else {
+        query
+            .cat
+            .as_deref()
+            .map(|cat| state.store.get_cat(&project, cat).map(|cat| cat.id))
+            .transpose()?
+    };
+    let usage_query = MeterUsageQuery {
+        billing_account_id: billing_account_id_for_project(&project),
+        project_id: Some(project.clone()),
+        attributed_cat_id: cat_id,
+        interval_start_unix_ms: query.from_ms,
+        interval_end_unix_ms: query.to_ms,
+    };
+    let view = state
+        .usage
+        .query(&usage_query)
+        .await
+        .map_err(metering_failure)?;
+    let rate_card = RateCard::sprites_compute_v1();
+
+    let mut amount_nanos = 0_u128;
+    let mut items = Vec::with_capacity(view.totals.len());
+    for aggregate in &view.totals {
+        let amount = rate_card
+            .rate_quantity(aggregate.metric, aggregate.quantity)
+            .map_err(metering_failure)?;
+        if let Some(amount) = amount {
+            amount_nanos = amount_nanos
+                .checked_add(amount)
+                .ok_or_else(|| ApiError::internal("rated amount overflow"))?;
+        }
+        items.push(UsageSummaryLine {
+            metric: aggregate.metric,
+            quantity: aggregate.quantity.to_string(),
+            unit: aggregate.metric.canonical_unit().to_string(),
+            amount_nanos: amount.map(|value| value.to_string()),
+        });
+    }
+
+    let mut cats = Vec::with_capacity(view.cats.len());
+    for cat in &view.cats {
+        let mut cat_amount = 0_u128;
+        let mut cat_items = Vec::with_capacity(cat.items.len());
+        for aggregate in &cat.items {
+            let amount = rate_card
+                .rate_quantity(aggregate.metric, aggregate.quantity)
+                .map_err(metering_failure)?;
+            if let Some(amount) = amount {
+                cat_amount = cat_amount
+                    .checked_add(amount)
+                    .ok_or_else(|| ApiError::internal("rated Cat amount overflow"))?;
+            }
+            cat_items.push(UsageSummaryLine {
+                metric: aggregate.metric,
+                quantity: aggregate.quantity.to_string(),
+                unit: aggregate.metric.canonical_unit().to_string(),
+                amount_nanos: amount.map(|value| value.to_string()),
+            });
+        }
+        cats.push(CatUsageSummary {
+            cat_id: cat.cat_id.clone(),
+            items: cat_items,
+            amount_nanos: cat_amount.to_string(),
+        });
+    }
+
+    let time_buckets = if let (Some(bucket_ms), Some(latest_interval_end_unix_ms)) =
+        (bucket_ms, view.latest_interval_end_unix_ms)
+    {
+        usage_time_buckets(
+            &view.details,
+            query.from_ms,
+            query.to_ms.min(latest_interval_end_unix_ms),
+            bucket_ms,
+            &rate_card,
+        )
+        .map_err(metering_failure)?
+    } else {
+        Vec::new()
+    };
+    let details = if query.detail {
+        view.details
+            .iter()
+            .map(|interval| UsageDetailLine {
+                interval_start_unix_ms: interval.interval_start_unix_ms,
+                interval_end_unix_ms: interval.interval_end_unix_ms,
+                resource_type: interval.attribution.resource_type.clone(),
+                resource_id: interval.attribution.resource_id.clone(),
+                attributed_cat_id: interval.attribution.attributed_cat_id.clone(),
+                metric: interval.metric,
+                quantity: interval.quantity.to_string(),
+                unit: interval.metric.canonical_unit().to_string(),
+                source_id: interval.source_id.clone(),
+                source_epoch: interval.source_epoch.clone(),
+                end_sequence: interval.end_sequence,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let report = UsageReport {
+        billing_account_id: usage_query.billing_account_id,
+        project_id: project,
+        interval_start_unix_ms: query.from_ms,
+        interval_end_unix_ms: query.to_ms,
+        status: "provisional".to_string(),
+        currency: rate_card.currency,
+        rate_card_id: rate_card.id,
+        latest_interval_end_unix_ms: view.latest_interval_end_unix_ms,
+        items,
+        cats,
+        time_buckets,
+        details,
+        amount_nanos: amount_nanos.to_string(),
+    };
+    let mut response = Json(report).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 async fn node_work_status(

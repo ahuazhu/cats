@@ -11,9 +11,12 @@ path = "src/main.rs"
 
 [dependencies]
 cats-control-plane = { workspace = true }
+cats-metering = { workspace = true }
 cats-storage = { workspace = true }
 cats-metadata-store-sqlite = { workspace = true }
 cats-metadata-store-postgres = { workspace = true }
+cats-usage-store-postgres = { workspace = true }
+cats-usage-store-aws-stream = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }

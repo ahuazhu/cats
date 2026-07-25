@@ -32,6 +32,7 @@ CLI 与控制台把该边界称为 *Workspace*。V1 HTTP API 路径和资源库�
 - 当前工作区的 Cats、休眠状态、磁盘与活跃 Operation 概览。
 - Cat 的创建、启动、Suspend、Warm、Stop、Exec、Expose 与 Destroy。
 - 磁盘的创建、Snapshot、Mount、Unmount、Resize 与 Delete。
+- 按 Meter 与 Cat 展示准实时预估账单，并可查看指定 Cat 的范围总额、分项汇总、费用随时间变化曲线与有界时段详单。
 - 结构化状态/错误展示与自动 Session Refresh。
 
 ## 语言切换

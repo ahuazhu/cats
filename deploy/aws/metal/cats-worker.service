@@ -4,6 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+Delegate=cpu memory
 Environment=CATS_GUEST_NETWORK_CIDR=10.240.0.0/16
 EnvironmentFile=/etc/cats/worker.env
 ExecStartPre=/usr/sbin/modprobe nbd nbds_max=64

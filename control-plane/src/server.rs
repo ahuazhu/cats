@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use cats_metering::{CreditStore, UsageStore};
 use cats_storage::MetadataStore;
 
 use crate::controller::{AutoTierPolicy, Controller};
@@ -17,6 +18,13 @@ pub struct Config {
     pub listen: String,
     /// Control-plane resource database.
     pub db_path: PathBuf,
+    /// Usage ledger is injected independently from control-plane metadata.
+    /// Local development may point a SQLite adapter at `db_path`; production
+    /// uses the PostgreSQL usage adapter.
+    pub usage_store: Arc<dyn UsageStore>,
+    /// Append-only prepaid credit ledger. It may share the same physical
+    /// database as the usage projection while remaining a separate port.
+    pub credit_store: Arc<dyn CreditStore>,
     /// Open authoritative volume-root/lease port, shared with blockd.
     pub storage_meta: Arc<dyn MetadataStore>,
     /// Service credential used by node agents, gateways and controller jobs.
@@ -26,6 +34,12 @@ pub struct Config {
     /// Optional AuthKit configuration for browser sessions and user CLI
     /// access tokens. Service/admin machine credentials remain separate.
     pub workos: Option<Arc<crate::auth::WorkOsConfig>>,
+    /// Optional Stripe-hosted top-up integration. Balance and signup credit
+    /// remain available when Stripe is not configured.
+    pub stripe: Option<Arc<crate::billing::StripeClient>>,
+    /// Rollout kill switch for 402 admission and automatic Cold convergence.
+    /// Production enables this only with a working top-up path.
+    pub billing_enforcement_enabled: bool,
     pub node_lease_timeout_ms: i64,
     pub reconcile_interval_ms: u64,
     pub auto_tier_policy: AutoTierPolicy,
@@ -34,6 +48,8 @@ pub struct Config {
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
+    pub usage: Arc<dyn UsageStore>,
+    pub credits: Arc<dyn CreditStore>,
     pub storage_meta: Arc<dyn MetadataStore>,
     pub notify: Arc<tokio::sync::Notify>,
     pub controller: Arc<Controller>,
@@ -46,6 +62,7 @@ pub struct Handle {
     pub state: AppState,
     server_task: tokio::task::JoinHandle<()>,
     reconciler_task: tokio::task::JoinHandle<()>,
+    billing_enforcer_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Handle {
@@ -55,6 +72,9 @@ impl Handle {
     pub fn shutdown(&self) {
         self.server_task.abort();
         self.reconciler_task.abort();
+        if let Some(task) = &self.billing_enforcer_task {
+            task.abort();
+        }
     }
 }
 
@@ -89,6 +109,8 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
     );
     let cfg = Arc::new(cfg);
     let store = Arc::new(Store::open(&cfg.db_path)?);
+    let usage = cfg.usage_store.clone();
+    let credits = cfg.credit_store.clone();
     let storage_meta = cfg.storage_meta.clone();
     let notify = Arc::new(tokio::sync::Notify::new());
     let controller = Controller::new(
@@ -101,6 +123,8 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
     );
     let state = AppState {
         store,
+        usage,
+        credits,
         storage_meta,
         notify,
         controller: controller.clone(),
@@ -119,6 +143,21 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
     });
     let interval = Duration::from_millis(cfg.reconcile_interval_ms);
     let reconciler_task = tokio::spawn(controller.run(interval));
+    let billing_enforcer_task = cfg.billing_enforcement_enabled.then(|| {
+        let enforcement_state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if let Err(error) =
+                    crate::api::enforce_exhausted_billing_accounts(&enforcement_state).await
+                {
+                    tracing::error!(error = %error.0, "billing credit enforcement failed");
+                }
+            }
+        })
+    });
 
     tracing::info!(%addr, "control plane ready");
     Ok(Handle {
@@ -126,5 +165,6 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         state,
         server_task,
         reconciler_task,
+        billing_enforcer_task,
     })
 }

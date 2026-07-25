@@ -3,7 +3,10 @@ use std::sync::Arc;
 
 use cats_metadata_store_postgres::PostgresMetadataStoreFactory;
 use cats_metadata_store_sqlite::SqliteMetadataStoreFactory;
+use cats_metering::{CreditStore, SqliteUsageStore, UsageStore};
 use cats_storage::{open_metadata_store, AdapterConfig, MetadataStoreFactory};
+use cats_usage_store_aws_stream::{AwsUsageStreamConfig, AwsUsageStreamStore};
+use cats_usage_store_postgres::{PostgresUsageStore, DEFAULT_SCHEMA, DEFAULT_WORKERS};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -13,6 +16,57 @@ struct Args {
     listen: String,
     #[arg(long, default_value = "cats-control.db")]
     db_path: std::path::PathBuf,
+    /// Usage ledger adapter. SQLite is for local development; production
+    /// should use the independent PostgreSQL usage database/schema.
+    #[arg(
+        long,
+        env = "CATS_USAGE_STORE_ADAPTER",
+        default_value = "sqlite",
+        value_parser = ["sqlite", "postgres"]
+    )]
+    usage_store_adapter: String,
+    /// Durable delivery in front of the query projection. Production uses
+    /// Kinesis; direct mode is retained for local development.
+    #[arg(
+        long,
+        env = "CATS_USAGE_DELIVERY_ADAPTER",
+        default_value = "direct",
+        value_parser = ["direct", "aws-kinesis"]
+    )]
+    usage_delivery_adapter: String,
+    #[arg(long, env = "CATS_USAGE_AWS_REGION", default_value = "us-east-1")]
+    usage_aws_region: String,
+    #[arg(long, env = "CATS_USAGE_KINESIS_STREAM")]
+    usage_kinesis_stream: Option<String>,
+    #[arg(long, env = "CATS_USAGE_ARCHIVE_BUCKET")]
+    usage_archive_bucket: Option<String>,
+    #[arg(long, env = "CATS_USAGE_CHECKPOINT_TABLE")]
+    usage_checkpoint_table: Option<String>,
+    /// SQLite usage path. Defaults to --db-path so the local dev shape stays
+    /// single-file without coupling production usage storage to metadata.
+    #[arg(long, env = "CATS_USAGE_SQLITE_PATH")]
+    usage_sqlite_path: Option<std::path::PathBuf>,
+    /// Environment variable containing the production usage PostgreSQL URL.
+    #[arg(
+        long,
+        env = "CATS_USAGE_POSTGRES_URL_ENV",
+        default_value = "CATS_USAGE_POSTGRES_URL"
+    )]
+    usage_postgres_url_env: String,
+    #[arg(long, env = "CATS_USAGE_POSTGRES_CA_FILE")]
+    usage_postgres_ca_file: Option<String>,
+    #[arg(
+        long,
+        env = "CATS_USAGE_POSTGRES_SCHEMA",
+        default_value = DEFAULT_SCHEMA
+    )]
+    usage_postgres_schema: String,
+    #[arg(
+        long,
+        env = "CATS_USAGE_POSTGRES_WORKERS",
+        default_value_t = DEFAULT_WORKERS
+    )]
+    usage_postgres_workers: usize,
     #[arg(long, default_value = "sqlite")]
     metadata_store_adapter: String,
     #[arg(
@@ -65,6 +119,39 @@ struct Args {
     user_site_url: Option<String>,
     #[arg(long, env = "CATS_ADMIN_SITE_URL")]
     admin_site_url: Option<String>,
+    /// Stripe secret key. Setting any Stripe option enables hosted prepaid
+    /// top-ups and requires a webhook secret plus at least one fixed Price.
+    #[arg(long, env = "STRIPE_SECRET_KEY")]
+    stripe_secret_key: Option<String>,
+    #[arg(long, env = "STRIPE_WEBHOOK_SECRET")]
+    stripe_webhook_secret: Option<String>,
+    #[arg(
+        long = "stripe-topup-price",
+        env = "CATS_STRIPE_TOPUP_PRICES",
+        value_delimiter = ',',
+        value_name = "CENTS=PRICE_ID"
+    )]
+    stripe_topup_prices: Vec<String>,
+    #[arg(long, env = "CATS_STRIPE_CHECKOUT_SUCCESS_URL")]
+    stripe_checkout_success_url: Option<String>,
+    #[arg(long, env = "CATS_STRIPE_CHECKOUT_CANCEL_URL")]
+    stripe_checkout_cancel_url: Option<String>,
+    #[arg(long, env = "CATS_STRIPE_LIVEMODE", default_value_t = true)]
+    stripe_livemode: bool,
+    #[arg(
+        long,
+        env = "CATS_BILLING_ENFORCEMENT_ENABLED",
+        default_value_t = false
+    )]
+    billing_enforcement_enabled: bool,
+    /// Override only for integration tests or an explicit Stripe proxy.
+    #[arg(
+        long,
+        env = "CATS_STRIPE_API_BASE_URL",
+        default_value = "https://api.stripe.com",
+        hide = true
+    )]
+    stripe_api_base_url: String,
     /// Override only for integration tests or an explicit WorkOS proxy.
     #[arg(
         long,
@@ -131,6 +218,60 @@ async fn main() -> anyhow::Result<()> {
         &metadata_config,
         &metadata_factories,
     )?;
+    let (usage_projection, credit_store): (Arc<dyn UsageStore>, Arc<dyn CreditStore>) =
+        match args.usage_store_adapter.as_str() {
+            "sqlite" => {
+                let store = Arc::new(SqliteUsageStore::open(
+                    args.usage_sqlite_path
+                        .as_deref()
+                        .unwrap_or(args.db_path.as_path()),
+                )?);
+                (store.clone(), store)
+            }
+            "postgres" => {
+                let url = std::env::var(&args.usage_postgres_url_env).map_err(|_| {
+                    anyhow::anyhow!(
+                        "usage PostgreSQL URL environment variable {} is not set",
+                        args.usage_postgres_url_env
+                    )
+                })?;
+                let store = Arc::new(PostgresUsageStore::connect(
+                    &url,
+                    args.usage_postgres_ca_file.as_deref(),
+                    &args.usage_postgres_schema,
+                    args.usage_postgres_workers,
+                )?);
+                (store.clone(), store)
+            }
+            _ => unreachable!("clap validates usage_store_adapter"),
+        };
+    let usage_store: Arc<dyn UsageStore> = match args.usage_delivery_adapter.as_str() {
+        "direct" => usage_projection.clone(),
+        "aws-kinesis" => {
+            let required = |value: Option<String>, name: &str| {
+                value.ok_or_else(|| anyhow::anyhow!("{name} is required for aws-kinesis delivery"))
+            };
+            let stream = AwsUsageStreamStore::load(
+                usage_projection,
+                AwsUsageStreamConfig {
+                    region: args.usage_aws_region,
+                    stream_name: required(args.usage_kinesis_stream, "CATS_USAGE_KINESIS_STREAM")?,
+                    archive_bucket: required(
+                        args.usage_archive_bucket,
+                        "CATS_USAGE_ARCHIVE_BUCKET",
+                    )?,
+                    checkpoint_table: required(
+                        args.usage_checkpoint_table,
+                        "CATS_USAGE_CHECKPOINT_TABLE",
+                    )?,
+                },
+            )
+            .await?;
+            stream.spawn_projector();
+            stream
+        }
+        _ => unreachable!("clap validates usage_delivery_adapter"),
+    };
     let any_workos_option = args.workos_client_id.is_some()
         || args.workos_api_key.is_some()
         || args.workos_cookie_password.is_some()
@@ -199,13 +340,64 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    let any_stripe_option = args.stripe_secret_key.is_some()
+        || args.stripe_webhook_secret.is_some()
+        || !args.stripe_topup_prices.is_empty()
+        || args.stripe_checkout_success_url.is_some()
+        || args.stripe_checkout_cancel_url.is_some();
+    let stripe = if any_stripe_option {
+        let secret_key = args
+            .stripe_secret_key
+            .ok_or_else(|| anyhow::anyhow!("STRIPE_SECRET_KEY is required"))?;
+        let webhook_secret = args
+            .stripe_webhook_secret
+            .ok_or_else(|| anyhow::anyhow!("STRIPE_WEBHOOK_SECRET is required"))?;
+        let mut prices = BTreeMap::new();
+        for value in &args.stripe_topup_prices {
+            let (amount, price_id) = value
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("--stripe-topup-price must be CENTS=PRICE_ID"))?;
+            let amount = amount.parse::<i64>().map_err(|_| {
+                anyhow::anyhow!("Stripe top-up amount {amount:?} is not integer cents")
+            })?;
+            anyhow::ensure!(
+                prices.insert(amount, price_id.to_string()).is_none(),
+                "duplicate Stripe top-up amount {amount}"
+            );
+        }
+        Some(Arc::new(cats_control_plane::billing::StripeClient::new(
+            cats_control_plane::billing::StripeConfig {
+                secret_key,
+                webhook_secret,
+                topup_prices: prices,
+                checkout_success_url: args
+                    .stripe_checkout_success_url
+                    .unwrap_or_else(|| "https://cats.run/user/?topup=success".to_string()),
+                checkout_cancel_url: args
+                    .stripe_checkout_cancel_url
+                    .unwrap_or_else(|| "https://cats.run/user/?topup=cancelled".to_string()),
+                livemode: args.stripe_livemode,
+                api_base_url: args.stripe_api_base_url,
+            },
+        )?))
+    } else {
+        None
+    };
+    anyhow::ensure!(
+        !args.billing_enforcement_enabled || stripe.is_some(),
+        "CATS_BILLING_ENFORCEMENT_ENABLED requires a complete Stripe top-up configuration"
+    );
     let handle = cats_control_plane::server::spawn(cats_control_plane::server::Config {
         listen: args.listen,
         db_path: args.db_path,
+        usage_store,
+        credit_store,
         storage_meta,
         auth_token: args.auth_token,
         admin_token: args.admin_token,
         workos,
+        stripe,
+        billing_enforcement_enabled: args.billing_enforcement_enabled,
         node_lease_timeout_ms: args.node_lease_timeout_ms,
         reconcile_interval_ms: args.reconcile_interval_ms,
         auto_tier_policy: cats_control_plane::controller::AutoTierPolicy {

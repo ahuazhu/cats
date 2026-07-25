@@ -1,0 +1,6 @@
+aws_region        = "us-east-1"
+state_bucket_name = "REPLACE_WITH_GLOBALLY_UNIQUE_CATS_TERRAFORM_STATE_BUCKET"
+
+tags = {
+  Owner = "platform"
+}

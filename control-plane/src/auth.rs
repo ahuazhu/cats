@@ -353,6 +353,52 @@ impl WorkOsConfig {
         Ok(result)
     }
 
+    async fn single_mapped_workspace_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<(String, String)>, ApiError> {
+        let mut candidates = BTreeMap::new();
+        let mut after = None;
+        loop {
+            let page = self
+                .client
+                .organization_membership()
+                .list_organization_memberships(ListOrganizationMembershipsParams {
+                    after: after.clone(),
+                    limit: Some(100),
+                    user_id: Some(user_id.to_string()),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|error| {
+                    tracing::warn!(error = %error, "WorkOS organization membership lookup failed");
+                    ApiError::unavailable(
+                        "WorkOS workspace memberships are temporarily unavailable",
+                    )
+                })?;
+            for membership in page.data {
+                if membership.status != UserOrganizationMembershipStatus::Active {
+                    continue;
+                }
+                let Some(project) = self
+                    .project_for_organization(&membership.organization_id)
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                candidates.insert(project, membership.organization_id);
+            }
+            after = page.list_metadata.after;
+            if after.is_none() {
+                break;
+            }
+        }
+        if candidates.len() != 1 {
+            return Ok(None);
+        }
+        Ok(candidates.into_iter().next())
+    }
+
     pub async fn revoke_cli_session(&self, identity: &AccessIdentity) -> Result<(), ApiError> {
         let params = RevokeSessionParams::new(RevokeSession {
             session_id: identity.session_id.clone(),
@@ -694,6 +740,8 @@ pub async fn callback(
     .map_err(|error| ApiError::internal(format!("seal WorkOS session: {error}")))?;
     let session =
         SessionManager::new(None, &sealed_session, &config.cookie_password).authenticate();
+    let (sealed_session, session) =
+        scope_unmapped_user_session(config, &flow, sealed_session, session).await;
     if let Err(error) = validate_flow_identity(config, &flow, &session) {
         tracing::warn!(
             site = ?flow.site,
@@ -720,6 +768,89 @@ pub async fn callback(
     )?;
     set_no_store(&mut response);
     Ok(response)
+}
+
+async fn scope_unmapped_user_session(
+    config: &WorkOsConfig,
+    flow: &LoginFlow,
+    sealed_session: String,
+    session: SessionState,
+) -> (String, SessionState) {
+    let should_rescope = flow.site == Site::User
+        && flow.organization_id.is_none()
+        && flow.project.is_none()
+        && session.authenticated
+        && !session.organization_id.is_empty()
+        && config
+            .project_for_organization(&session.organization_id)
+            .is_none();
+    if !should_rescope {
+        return (sealed_session, session);
+    }
+    let Some(user_id) = session
+        .user
+        .as_ref()
+        .map(|user| user.id.clone())
+        .filter(|user_id| !user_id.is_empty())
+    else {
+        return (sealed_session, session);
+    };
+    let target = match config.single_mapped_workspace_for_user(&user_id).await {
+        Ok(Some(target)) => target,
+        Ok(None) => return (sealed_session, session),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "WorkOS user workspace resolution failed"
+            );
+            return (sealed_session, session);
+        }
+    };
+    let (project, organization_id) = target;
+    let manager = SessionManager::new(
+        Some(&config.client),
+        &sealed_session,
+        &config.cookie_password,
+    );
+    let refreshed = match manager
+        .refresh(SessionRefreshOptions {
+            organization_id: Some(organization_id.clone()),
+        })
+        .await
+    {
+        Ok(refreshed) if refreshed.authenticated => refreshed,
+        Ok(refreshed) => {
+            tracing::warn!(
+                reason = refreshed.reason,
+                project,
+                "WorkOS session could not switch to the user's Cats workspace"
+            );
+            return (sealed_session, session);
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                project,
+                "WorkOS workspace session refresh failed"
+            );
+            return (sealed_session, session);
+        }
+    };
+    let candidate = SessionManager::new(None, &refreshed.sealed_session, &config.cookie_password)
+        .authenticate();
+    let same_user = candidate.user.as_ref().map(|user| user.id.as_str()) == Some(user_id.as_str());
+    if !candidate.authenticated
+        || candidate.organization_id != organization_id
+        || !same_user
+        || config.project_for_organization(&candidate.organization_id) != Some(project.as_str())
+    {
+        tracing::warn!(
+            project,
+            "WorkOS returned an invalid workspace-scoped session"
+        );
+        return (sealed_session, session);
+    }
+    (refreshed.sealed_session, candidate)
 }
 
 fn identity_error_code(site: Site) -> &'static str {

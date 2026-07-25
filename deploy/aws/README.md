@@ -1,5 +1,13 @@
 # AWS deployment
 
+Terraform under [`terraform/`](terraform/) is now the authoritative source for
+new AWS usage resources and the Kubernetes production deployment. The YAML
+files under `k8s/` are retained only as import/migration references; do not
+apply them after Terraform takeover. Existing EKS, RDS, VPC, ACM, ECR,
+ChunkStore and bare-metal resources must be represented from their exact live
+configuration and imported before Terraform changes them. See
+[`terraform/README.md`](terraform/README.md) and ADR-0012.
+
 Production-shaped split:
 
 - EKS Pods: `cats-controld` (portal, user console, admin console and API) and
@@ -8,17 +16,31 @@ Production-shaped split:
   assets. It is not an EKS node.
 - RDS PostgreSQL: authoritative ChunkStore roots, leases and fencing epochs.
 - S3: immutable durable ChunkStore objects.
+- Usage billing: `cats-controld` publishes attributed cumulative checkpoints to
+  Kinesis; its projector writes 50-second/4-MiB/1000-record NDJSON batches to a
+  seven-year Object Lock S3 archive, updates the PostgreSQL `cats_usage`
+  projection and advances a DynamoDB checkpoint last.
+- Prepaid collection: the official Stripe Terraform provider owns one Cats
+  credit Product, fixed $10/$25/$50/$100 one-time Prices, and the signed
+  webhook endpoint. PostgreSQL stores append-only signup grants, top-ups and
+  refund reversals; Stripe is collection infrastructure, not the balance or
+  usage truth.
 - One EKS Auto Mode ALB: the user site at `cats.run`, the operator site at
   `ops.cats.run`, legacy-host redirects and the endpoint wildcard.
 
-`k8s/base.yaml` deliberately references a pre-created `cats-runtime` Secret
-and `cats-rds-ca` ConfigMap. Do not commit their values. Render
-`k8s/ingress.yaml.example` with the target ACM ARN and every public subnet in
-which an ingress target Pod may run; environment-specific AWS identifiers stay
-outside the repository.
+The Terraform application stack creates the `cats-controld` ServiceAccount,
+`cats-runtime` and `cats-rds-ca`;
+secrets are injected by CI and remain protected in remote state. It also
+renders the target ACM ARN and every public subnet into EKS Auto Mode ingress.
+EKS Pod Identity grants the control plane only the Kinesis/S3/DynamoDB usage
+permissions; gateway Pods receive none. Do not create or patch these objects
+manually.
 
-`metal/install-worker.sh` installs only the worker binaries and its systemd
-unit. It keeps Cloud Hypervisor under `/opt/cats/bin` so it does not replace a
+Production worker releases use the Terraform-managed artifact bucket,
+Secrets Manager secret and SSM State Manager association. The bundle digest is
+verified before installing `cats-noded`, `cats-blockd`, `cats-guest-agent` and
+the systemd unit. `metal/install-worker.sh` remains a bootstrap/development
+helper. Cloud Hypervisor stays under `/opt/cats/bin` so it does not replace a
 host-wide binary used by another workload. The S3 adapter uses the EC2
 instance role and refreshes its temporary credentials; no long-lived AWS key is
 stored in `worker.env`.

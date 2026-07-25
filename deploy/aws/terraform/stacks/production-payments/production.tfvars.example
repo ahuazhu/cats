@@ -1,0 +1,8 @@
+webhook_url = "https://cats.run/v1/billing/stripe/webhook"
+
+topup_amounts_cents = [
+  1000,
+  2500,
+  5000,
+  10000,
+]

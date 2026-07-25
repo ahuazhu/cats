@@ -1,6 +1,15 @@
 target*
+dist
 .git
 .DS_Store
+.env
+.env.*
+**/.terraform
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfplan
+**/*.auto.tfvars
+**/backend.hcl
 docs
 experiments
 deploy/metal

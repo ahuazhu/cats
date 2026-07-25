@@ -60,6 +60,7 @@
         <button class="nav-item is-active" data-view="overview"><span>⌂</span><b data-i18n="user.nav.overview">Overview</b></button>
         <button class="nav-item" data-view="cats"><span>◇</span><b data-i18n="user.nav.cats">Cats</b></button>
         <button class="nav-item" data-view="disks"><span>▱</span><b data-i18n="user.nav.disks">Disks</b></button>
+        <button class="nav-item" data-view="billing"><span>$</span><b data-i18n="user.nav.billing">Billing</b></button>
         <button class="nav-item" data-view="operations"><span>↻</span><b data-i18n="user.nav.operations">Operations</b></button>
       </nav>
       <div class="sidebar-footer">
@@ -121,6 +122,50 @@
           </section>
         </section>
 
+        <section class="view" id="view-billing">
+          <section class="billing-toolbar">
+            <div>
+              <div class="eyebrow" data-i18n="user.billing.eyebrow">USAGE &amp; BILLING</div>
+              <p data-i18n="user.billing.description">Near-real-time estimated usage for this workspace. Open-period figures are provisional.</p>
+            </div>
+            <form id="billing-range-form" class="billing-range">
+              <label><span data-i18n="user.billing.from">From</span><input id="billing-from" name="from" type="date" required></label>
+              <label><span data-i18n="user.billing.to">To</span><input id="billing-to" name="to" type="date" required></label>
+              <button class="button button-quiet" type="submit" data-i18n="user.billing.apply">Apply</button>
+            </form>
+          </section>
+          <section class="billing-funds" aria-labelledby="billing-funds-title">
+            <div class="billing-funds-balance">
+              <span class="eyebrow" data-i18n="user.billing.balance.eyebrow">PREPAID BALANCE</span>
+              <h2 id="billing-funds-title"><span data-i18n="user.billing.balance.available">Available credit</span> <strong id="billing-available-credit">—</strong></h2>
+              <p id="billing-balance-status" data-i18n="user.billing.balance.loading">Loading balance…</p>
+            </div>
+            <div class="billing-funds-breakdown">
+              <div><span data-i18n="user.billing.balance.totalCredit">Credits added</span><strong id="billing-total-credit">—</strong></div>
+              <div><span data-i18n="user.billing.balance.usage">All-time provisional usage</span><strong id="billing-total-usage">—</strong></div>
+              <div><span data-i18n="user.billing.balance.signupCredit">Signup credit</span><strong id="billing-signup-credit">—</strong></div>
+            </div>
+            <div class="billing-topup">
+              <span data-i18n="user.billing.topup.title">Add funds with Stripe</span>
+              <div class="billing-topup-options" id="billing-topup-options"></div>
+              <small id="billing-topup-note" data-i18n="user.billing.topup.loading">Loading payment options…</small>
+            </div>
+          </section>
+          <p class="form-error billing-error" id="billing-error" role="alert"></p>
+          <div class="metric-grid billing-metric-grid" id="billing-metrics"></div>
+          <div class="billing-meta" id="billing-meta"></div>
+          <div class="dashboard-grid">
+            <section class="panel panel-span-3">
+              <header class="panel-header"><div><small data-i18n="user.billing.metersEyebrow">BY METER</small><h2 data-i18n="user.billing.metersTitle">Usage by billing item</h2><p data-i18n="user.billing.metersDescription">Aggregated once for the selected period before exact integer rating.</p></div></header>
+              <div class="table-wrap"><table><thead><tr><th data-i18n="user.billing.item">Billing item</th><th data-i18n="user.billing.usage">Usage</th><th data-i18n="user.billing.rate">Rate</th><th class="align-right" data-i18n="user.billing.estimatedAmount">Estimated amount</th></tr></thead><tbody id="billing-meters-table"></tbody></table></div>
+            </section>
+            <section class="panel panel-span-3">
+              <header class="panel-header"><div><small data-i18n="user.billing.catsEyebrow">BY CAT</small><h2 data-i18n="user.billing.catsTitle">Usage by Cat</h2><p data-i18n="user.billing.catsDescription">Includes immutable Cat IDs so historical usage remains identifiable after deletion.</p></div></header>
+              <div class="table-wrap"><table><thead><tr><th data-i18n="user.billing.cat">Cat</th><th data-i18n="user.billing.cpu">CPU</th><th data-i18n="common.memory">Memory</th><th class="align-right" data-i18n="user.billing.estimatedAmount">Estimated amount</th><th class="align-right" data-i18n="common.actions">Actions</th></tr></thead><tbody id="billing-cats-table"></tbody></table></div>
+            </section>
+          </div>
+        </section>
+
         <section class="view" id="view-operations">
           <section class="panel">
             <header class="panel-header"><div><small data-i18n="section.controlPlane">CONTROL PLANE</small><h2 data-i18n="user.nav.operations">Operations</h2><p data-i18n="user.operations.description">Status, target resource, and final result for every asynchronous change.</p></div></header>
@@ -153,6 +198,39 @@
       <div class="form-grid"><label class="span-2"><span data-i18n="common.name">Name</span><input name="name" placeholder="workspace-data" required></label><label class="span-2"><span data-i18n="user.diskDialog.size">Capacity (GiB)</span><input name="size_gib" type="number" min="0.0625" step="0.0625" value="1" required></label></div>
       <p class="form-error" data-form-error></p>
       <footer><button class="button button-quiet" value="cancel" data-i18n="common.cancel">Cancel</button><button class="button button-primary" value="default" data-i18n="user.diskDialog.submit">Create disk</button></footer>
+    </form>
+  </dialog>
+
+  <dialog class="modal modal-billing" id="billing-cat-dialog">
+    <form method="dialog">
+      <header>
+        <div><small data-i18n="user.billing.detail.eyebrow">CAT BILLING DETAIL</small><h2><span id="billing-detail-name">Cat</span></h2><code id="billing-detail-id"></code></div>
+        <button class="icon-button" value="cancel" data-i18n-aria-label="common.close" aria-label="Close">×</button>
+      </header>
+      <div class="billing-detail-body">
+        <div class="mini-empty" id="billing-detail-loading" data-i18n="common.loading">Loading…</div>
+        <p class="form-error billing-detail-error is-hidden" id="billing-detail-error" role="alert"></p>
+        <div class="is-hidden" id="billing-detail-content">
+          <div class="billing-detail-period">
+            <div><span class="billing-provisional" data-i18n="user.billing.provisional">Provisional</span><strong data-i18n="user.billing.detail.period">Selected period</strong> <span id="billing-detail-period"></span></div>
+            <span data-i18n="user.billing.noInvoice">Not a finalized invoice</span>
+          </div>
+          <div class="metric-grid billing-detail-metrics" id="billing-detail-metrics"></div>
+          <section class="billing-detail-section">
+            <header><div><small data-i18n="user.billing.detail.chartEyebrow">OVER TIME</small><h3 data-i18n="user.billing.detail.chartTitle">Estimated spend over time</h3><p data-i18n="user.billing.detail.chartDescription">CPU and memory are converted to USD per time bucket so both series share one scale.</p></div></header>
+            <div id="billing-detail-chart"></div>
+          </section>
+          <section class="billing-detail-section">
+            <header><div><small data-i18n="user.billing.metersEyebrow">BY METER</small><h3 data-i18n="user.billing.detail.itemsTitle">Totals by billing item</h3></div></header>
+            <div class="table-wrap"><table><thead><tr><th data-i18n="user.billing.item">Billing item</th><th data-i18n="user.billing.usage">Usage</th><th data-i18n="user.billing.rate">Rate</th><th class="align-right" data-i18n="user.billing.estimatedAmount">Estimated amount</th></tr></thead><tbody id="billing-detail-items-table"></tbody></table></div>
+          </section>
+          <section class="billing-detail-section">
+            <header><div><small data-i18n="user.billing.detail.periodsEyebrow">PERIOD DETAIL</small><h3 data-i18n="user.billing.detail.periodsTitle">Usage over time</h3><p data-i18n="user.billing.detail.periodsDescription">Bounded time buckets derived from the immutable usage ledger.</p></div></header>
+            <div class="table-wrap billing-period-table"><table><thead><tr><th data-i18n="user.billing.detail.time">Time</th><th data-i18n="user.billing.meter.cpu">CPU</th><th data-i18n="user.billing.meter.memory">Memory</th><th class="align-right" data-i18n="user.billing.estimatedAmount">Estimated amount</th></tr></thead><tbody id="billing-detail-periods-table"></tbody></table></div>
+          </section>
+        </div>
+      </div>
+      <footer><button class="button button-quiet" value="cancel" data-i18n="common.close">Close</button></footer>
     </form>
   </dialog>
 

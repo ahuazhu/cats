@@ -9,3 +9,16 @@ dist/
 # Rust
 /target/
 /target-linux/
+
+# Terraform working data and sensitive local plans/state. Provider lock files
+# remain committed for reproducible deployments.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.auto.tfvars
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json

@@ -1,0 +1,330 @@
+variable "namespace" {
+  description = "Kubernetes namespace that owns all Cats application resources."
+  type        = string
+  default     = "cats"
+
+  validation {
+    condition     = can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", var.namespace))
+    error_message = "namespace must be a valid Kubernetes DNS label."
+  }
+}
+
+variable "control_plane_image" {
+  description = "Immutable cats-controld container image, including its sha256 digest."
+  type        = string
+
+  validation {
+    condition     = can(regex("@sha256:[0-9a-f]{64}$", var.control_plane_image))
+    error_message = "control_plane_image must be pinned by sha256 digest."
+  }
+}
+
+variable "gateway_image" {
+  description = "Immutable cats-gatewayd container image, including its sha256 digest."
+  type        = string
+
+  validation {
+    condition     = can(regex("@sha256:[0-9a-f]{64}$", var.gateway_image))
+    error_message = "gateway_image must be pinned by sha256 digest."
+  }
+}
+
+variable "runtime_secret_data" {
+  description = "Additional cats-runtime environment variables, such as WorkOS credentials and Cats service tokens."
+  type        = map(string)
+  sensitive   = true
+
+  validation {
+    condition = length(setintersection(
+      toset(keys(var.runtime_secret_data)),
+      toset([
+        "CATS_POSTGRES_URL",
+        "CATS_USAGE_STORE_ADAPTER",
+        "CATS_USAGE_POSTGRES_URL",
+        "CATS_USAGE_POSTGRES_SCHEMA",
+        "CATS_USAGE_POSTGRES_WORKERS",
+        "CATS_USAGE_POSTGRES_CA_FILE",
+        "CATS_USAGE_DELIVERY_ADAPTER",
+        "CATS_USAGE_AWS_REGION",
+        "CATS_USAGE_KINESIS_STREAM",
+        "CATS_USAGE_ARCHIVE_BUCKET",
+        "CATS_USAGE_CHECKPOINT_TABLE",
+        "STRIPE_SECRET_KEY",
+        "STRIPE_WEBHOOK_SECRET",
+        "CATS_STRIPE_TOPUP_PRICES",
+        "CATS_STRIPE_CHECKOUT_SUCCESS_URL",
+        "CATS_STRIPE_CHECKOUT_CANCEL_URL",
+        "CATS_STRIPE_LIVEMODE",
+        "CATS_BILLING_ENFORCEMENT_ENABLED",
+      ])
+    )) == 0
+    error_message = "runtime_secret_data cannot override Terraform-managed storage or usage database settings."
+  }
+
+  validation {
+    condition = alltrue([
+      for key in ["CATS_AUTH_TOKEN", "CATS_ADMIN_TOKEN"] :
+      try(length(trimspace(var.runtime_secret_data[key])) >= 32, false)
+    ])
+    error_message = "runtime_secret_data must contain CATS_AUTH_TOKEN and CATS_ADMIN_TOKEN, each at least 32 characters."
+  }
+}
+
+variable "storage_postgres_url" {
+  description = "PostgreSQL URL used for ChunkStore roots, leases, and fencing."
+  type        = string
+  sensitive   = true
+
+  validation {
+    condition = (
+      startswith(var.storage_postgres_url, "postgresql://") ||
+      startswith(var.storage_postgres_url, "postgres://")
+      ) && (
+      strcontains(var.storage_postgres_url, "sslmode=require") ||
+      strcontains(var.storage_postgres_url, "sslmode=verify-ca") ||
+      strcontains(var.storage_postgres_url, "sslmode=verify-full")
+    )
+    error_message = "storage_postgres_url must be a PostgreSQL URL with an explicit TLS sslmode."
+  }
+}
+
+variable "usage_postgres_url" {
+  description = "PostgreSQL URL used for the usage ledger. It may initially point to the shared RDS instance."
+  type        = string
+  sensitive   = true
+
+  validation {
+    condition = (
+      startswith(var.usage_postgres_url, "postgresql://") ||
+      startswith(var.usage_postgres_url, "postgres://")
+      ) && (
+      strcontains(var.usage_postgres_url, "sslmode=require") ||
+      strcontains(var.usage_postgres_url, "sslmode=verify-ca") ||
+      strcontains(var.usage_postgres_url, "sslmode=verify-full")
+    )
+    error_message = "usage_postgres_url must be a PostgreSQL URL with an explicit TLS sslmode."
+  }
+}
+
+variable "usage_postgres_schema" {
+  description = "Schema owned by the usage adapter."
+  type        = string
+  default     = "cats_usage"
+
+  validation {
+    condition     = can(regex("^[A-Za-z_][A-Za-z0-9_]*$", var.usage_postgres_schema))
+    error_message = "usage_postgres_schema must be a valid unquoted PostgreSQL identifier."
+  }
+}
+
+variable "usage_postgres_workers" {
+  description = "Number of blocking PostgreSQL workers used by cats-controld."
+  type        = number
+  default     = 4
+
+  validation {
+    condition     = var.usage_postgres_workers >= 1 && var.usage_postgres_workers <= 32 && floor(var.usage_postgres_workers) == var.usage_postgres_workers
+    error_message = "usage_postgres_workers must be an integer between 1 and 32."
+  }
+}
+
+variable "usage_delivery_adapter" {
+  description = "Durable usage delivery adapter."
+  type        = string
+  default     = "direct"
+
+  validation {
+    condition     = contains(["direct", "aws-kinesis"], var.usage_delivery_adapter)
+    error_message = "usage_delivery_adapter must be direct or aws-kinesis."
+  }
+}
+
+variable "usage_aws_region" {
+  description = "AWS region for the usage stream and archive."
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "usage_kinesis_stream" {
+  description = "Kinesis stream used when usage_delivery_adapter is aws-kinesis."
+  type        = string
+  default     = ""
+}
+
+variable "usage_archive_bucket" {
+  description = "Immutable S3 usage archive bucket."
+  type        = string
+  default     = ""
+}
+
+variable "usage_checkpoint_table" {
+  description = "DynamoDB projector checkpoint table."
+  type        = string
+  default     = ""
+}
+
+variable "stripe_enabled" {
+  description = "Enable Stripe-hosted prepaid top-ups."
+  type        = bool
+  default     = false
+}
+
+variable "stripe_secret_key" {
+  description = "Stripe secret API key used only by cats-controld."
+  type        = string
+  default     = null
+  nullable    = true
+  sensitive   = true
+}
+
+variable "stripe_webhook_secret" {
+  description = "Signing secret exported by the Terraform-managed Stripe webhook endpoint."
+  type        = string
+  default     = null
+  nullable    = true
+  sensitive   = true
+}
+
+variable "stripe_topup_price_ids" {
+  description = "Map of fixed USD-cent amounts to Terraform-managed Stripe Price IDs."
+  type        = map(string)
+  default     = {}
+}
+
+variable "stripe_checkout_success_url" {
+  type    = string
+  default = "https://cats.run/user/?topup=success&session_id={CHECKOUT_SESSION_ID}"
+
+  validation {
+    condition     = startswith(var.stripe_checkout_success_url, "https://")
+    error_message = "stripe_checkout_success_url must use HTTPS."
+  }
+}
+
+variable "stripe_checkout_cancel_url" {
+  type    = string
+  default = "https://cats.run/user/?topup=cancelled"
+
+  validation {
+    condition     = startswith(var.stripe_checkout_cancel_url, "https://")
+    error_message = "stripe_checkout_cancel_url must use HTTPS."
+  }
+}
+
+variable "stripe_livemode" {
+  description = "Reject webhook events whose livemode flag differs from this value."
+  type        = bool
+  default     = true
+}
+
+variable "rds_ca_pem" {
+  description = "PEM bundle used to verify the RDS PostgreSQL TLS certificate."
+  type        = string
+
+  validation {
+    condition     = strcontains(var.rds_ca_pem, "BEGIN CERTIFICATE")
+    error_message = "rds_ca_pem must contain at least one PEM certificate."
+  }
+}
+
+variable "control_data_storage_class" {
+  description = "StorageClass for the control-plane SQLite development-shaped resource database."
+  type        = string
+  default     = "cats-auto-ebs"
+}
+
+variable "control_data_size" {
+  description = "Encrypted EBS PVC size for the single-replica control resource database."
+  type        = string
+  default     = "8Gi"
+}
+
+variable "auto_warm_after_seconds" {
+  description = "Seconds before an eligible Suspended Cat becomes Warm; zero disables the transition."
+  type        = number
+  default     = 600
+
+  validation {
+    condition     = var.auto_warm_after_seconds >= 0 && floor(var.auto_warm_after_seconds) == var.auto_warm_after_seconds
+    error_message = "auto_warm_after_seconds must be a non-negative integer."
+  }
+}
+
+variable "auto_cold_after_seconds" {
+  description = "Seconds before an eligible Warm Cat becomes Cold; zero disables the transition."
+  type        = number
+  default     = 86400
+
+  validation {
+    condition     = var.auto_cold_after_seconds >= 0 && floor(var.auto_cold_after_seconds) == var.auto_cold_after_seconds
+    error_message = "auto_cold_after_seconds must be a non-negative integer."
+  }
+}
+
+variable "gateway_replicas" {
+  description = "Number of stateless endpoint gateway replicas."
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.gateway_replicas >= 2 && floor(var.gateway_replicas) == var.gateway_replicas
+    error_message = "gateway_replicas must be an integer of at least 2."
+  }
+}
+
+variable "enable_public_ingress" {
+  description = "Create the EKS Auto Mode ALB ingress resources."
+  type        = bool
+  default     = true
+}
+
+variable "ingress_class_name" {
+  description = "Name of the EKS Auto Mode IngressClass and IngressClassParams."
+  type        = string
+  default     = "cats-public"
+}
+
+variable "acm_certificate_arn" {
+  description = "ACM certificate ARN used by the public HTTPS listener."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = !var.enable_public_ingress || (var.acm_certificate_arn != null && startswith(var.acm_certificate_arn, "arn:"))
+    error_message = "acm_certificate_arn is required when public ingress is enabled."
+  }
+}
+
+variable "public_subnet_ids" {
+  description = "Every public subnet in which EKS Auto Mode may place the ALB."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = !var.enable_public_ingress || length(var.public_subnet_ids) >= 2
+    error_message = "At least two public subnet IDs are required when public ingress is enabled."
+  }
+}
+
+variable "control_plane_hosts" {
+  description = "Public hostnames routed to cats-controld."
+  type        = list(string)
+  default     = ["cats.run", "app.cats.run", "admin.cats.run", "ops.cats.run"]
+
+  validation {
+    condition     = length(var.control_plane_hosts) == length(toset(var.control_plane_hosts))
+    error_message = "control_plane_hosts must not contain duplicates."
+  }
+}
+
+variable "endpoint_wildcard_host" {
+  description = "Wildcard hostname routed to cats-gatewayd."
+  type        = string
+  default     = "*.cats.run"
+
+  validation {
+    condition     = startswith(var.endpoint_wildcard_host, "*.")
+    error_message = "endpoint_wildcard_host must begin with '*.'."
+  }
+}

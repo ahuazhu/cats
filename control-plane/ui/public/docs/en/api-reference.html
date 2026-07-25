@@ -56,6 +56,22 @@ GET  /v1/projects/{project}/cats/{cat}/endpoints</code></pre>
   "wake_policy": "wake_on_request"
 }</code></pre>
 
+<h2 id="usage-billing">Usage and billing</h2>
+<pre><code>GET /v1/projects/{project}/billing/usage
+    ?from_ms=&lt;inclusive-unix-milliseconds&gt;
+    &amp;to_ms=&lt;exclusive-unix-milliseconds&gt;
+    [&amp;cat=&lt;active-cat-name&gt; | &amp;cat_id=&lt;immutable-cat-id&gt;]
+    [&amp;bucket_ms=&lt;milliseconds&gt;]
+    [&amp;detail=true]</code></pre>
+<p>The response is a <code>provisional</code> estimate for the open period. It includes range totals, totals by meter, totals by Cat, the immutable rate-card ID, and the latest visible interval end. <code>cat_id</code> remains queryable after a Cat is deleted. <code>bucket_ms</code> returns server-side time buckets for charts and bounded period detail; it must be at least 60 seconds and produce no more than 512 buckets. <code>detail=true</code> returns raw ledger intervals and should be reserved for controlled reconciliation queries rather than long browser ranges.</p>
+<p>CPU is rated at <code>$0.07 / CPU-hour</code> and memory at <code>$0.04375 / GiB-hour</code> by the current rate card. Decimal quantities and nanodollar amounts are JSON strings so clients do not lose integer precision. The range total is rated once after aggregation; bucket amounts are display estimates and are not a finalized invoice.</p>
+<pre><code>GET  /v1/projects/{project}/billing/balance
+POST /v1/projects/{project}/billing/checkout
+Idempotency-Key: &lt;unique-key&gt;
+{"amount_cents": 1000}</code></pre>
+<p>Each billing account receives one non-renewing <code>$10</code> signup credit. The balance response subtracts all-time provisional usage from append-only grants and top-ups. Checkout accepts only the published fixed top-up amounts and returns a Stripe-hosted URL. Returning from Checkout does not add credit: Cats credits the account only after a signed Stripe webhook reports the session as paid.</p>
+<p>When available credit is exhausted, paid compute admission returns HTTP <code>402</code> with code <code>payment_required</code>. Stopping, suspending, and deleting resources remain available.</p>
+
 <h2 id="operations">Operations</h2>
 <pre><code>GET /v1/projects/{project}/operations
 GET /v1/operations/{operation}</code></pre>
@@ -66,6 +82,6 @@ GET /v1/operations/{operation}</code></pre>
   "code": "failed_precondition",
   "message": "disk must be available before deletion"
 }</code></pre>
-<p>Clients should branch on the stable code and show the message for context. Important codes include <code>invalid_argument</code>, <code>unauthenticated</code>, <code>permission_denied</code>, <code>not_found</code>, <code>already_exists</code>, <code>failed_precondition</code>, <code>conflict</code>, <code>stale_epoch</code>, <code>deadline_exceeded</code>, <code>unavailable</code>, and <code>internal</code>.</p>
+<p>Clients should branch on the stable code and show the message for context. Important codes include <code>invalid_argument</code>, <code>unauthenticated</code>, <code>permission_denied</code>, <code>not_found</code>, <code>already_exists</code>, <code>failed_precondition</code>, <code>payment_required</code>, <code>conflict</code>, <code>stale_epoch</code>, <code>deadline_exceeded</code>, <code>unavailable</code>, and <code>internal</code>.</p>
 
 <div class="callout"><strong>Version authority</strong><p>This page documents the current V1 Rust router. For generated clients, derive a reviewed OpenAPI description from the same request/resource types before release; do not infer undocumented fields from architecture examples.</p></div>

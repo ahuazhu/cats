@@ -12,10 +12,12 @@
 //! `cats-blockd`.
 
 pub mod auth;
+pub mod billing;
 pub mod chunk;
 pub mod error;
 pub mod guest;
 pub mod ids;
+pub mod metering;
 pub mod nodejob;
 pub mod requests;
 pub mod resources;

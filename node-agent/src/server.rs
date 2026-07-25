@@ -6,10 +6,10 @@ use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -19,19 +19,22 @@ use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 
 use cats_api::guest::GuestShellFrame;
-use cats_api::nodejob::NodeJob;
+use cats_api::metering::{CatUsageCheckpoint, IngestUsageCheckpointsRequest, UsageMetric};
+use cats_api::nodejob::{JobPhase, NodeJob, NodeJobResult};
 use cats_api::requests::{
     ExecRequest, ExecResponse, HeartbeatCat, HeartbeatRequest, NodeWorkStatusRequest,
     ProxyHttpRequest, RegisterNodeRequest, ShellClientControl, ShellServerControl,
     MAX_SHELL_MESSAGE_BYTES,
 };
 use cats_api::resources::{CatResourceTelemetry, NodeTelemetry};
+use cats_metering::RuntimeMeterAccumulator;
 use cats_storage::MetadataStore;
 
 use crate::guest_client::GuestShell;
 use crate::runtime::{
-    CatTelemetryTarget, GuestConn, NodeConfig, NodeRuntime, RuntimeActivityGuard,
+    CatTelemetryTarget, GuestConn, NodeConfig, NodeRuntime, RuntimeActivityGuard, UsageFinalizer,
 };
+use crate::usage_spool::UsageSpool;
 
 async fn watch_guest_work(
     client: reqwest::Client,
@@ -98,6 +101,8 @@ pub struct ServerConfig {
 pub struct NodeState {
     pub runtime: Arc<NodeRuntime>,
     pub cfg: Arc<ServerConfig>,
+    client: reqwest::Client,
+    usage_pipeline: Arc<UsageMeteringPipeline>,
 }
 
 pub struct Handle {
@@ -136,6 +141,42 @@ fn check_auth(cfg: &ServerConfig, headers: &HeaderMap) -> Result<(), StatusCode>
     }
 }
 
+impl NodeState {
+    async fn deliver_pending_usage(&self) -> anyhow::Result<()> {
+        loop {
+            let pending_checkpoints = self.usage_pipeline.spool.peek(10_000)?;
+            if pending_checkpoints.is_empty() {
+                return Ok(());
+            }
+            let request = IngestUsageCheckpointsRequest {
+                node_id: self.cfg.node.node_id.clone(),
+                checkpoints: pending_checkpoints.clone(),
+            };
+            let response = self
+                .client
+                .post(format!(
+                    "{}/v1/internal/usage/checkpoints",
+                    self.cfg.control_plane_url.trim_end_matches('/')
+                ))
+                .bearer_auth(&self.cfg.auth_token)
+                .json(&request)
+                .send()
+                .await
+                .context("send durable usage checkpoints")?;
+            anyhow::ensure!(
+                response.status().is_success(),
+                "usage ingestion returned {}",
+                response.status()
+            );
+            let event_ids = pending_checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.event_id.clone())
+                .collect::<Vec<_>>();
+            self.usage_pipeline.spool.acknowledge(&event_ids)?;
+        }
+    }
+}
+
 async fn handle_job(
     State(state): State<NodeState>,
     headers: HeaderMap,
@@ -147,6 +188,24 @@ async fn handle_job(
     let runtime = state.runtime.clone();
     let result = tokio::task::spawn_blocking(move || runtime.execute(job)).await;
     match result {
+        Ok(res) if res.phase == JobPhase::Succeeded => {
+            if let Err(error) = state.deliver_pending_usage().await {
+                tracing::error!(
+                    job = %res.job_id,
+                    %error,
+                    "lifecycle result withheld until final usage checkpoints are acknowledged"
+                );
+                Json(NodeJobResult::fail(
+                    res.job_id,
+                    res.observed_state,
+                    format!("final usage delivery failed: {error:#}"),
+                    true,
+                ))
+                .into_response()
+            } else {
+                Json(res).into_response()
+            }
+        }
         Ok(res) => Json(res).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -508,6 +567,35 @@ fn allocated_tree_bytes(path: &FsPath) -> Option<u64> {
     Some(total)
 }
 
+fn parse_cgroup_cpu_usage_usec(contents: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.next()? != "usage_usec" {
+            return None;
+        }
+        fields.next()?.parse().ok()
+    })
+}
+
+fn read_cgroup_usage(path: &FsPath) -> Option<(u64, u64)> {
+    let cpu_usage_usec = std::fs::read_to_string(path.join("cpu.stat"))
+        .ok()
+        .and_then(|contents| parse_cgroup_cpu_usage_usec(&contents))?;
+    let memory_current_bytes = std::fs::read_to_string(path.join("memory.current"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some((cpu_usage_usec, memory_current_bytes))
+}
+
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 struct CatCpuSample {
     process_ids: Vec<u32>,
     cpu_ticks: u64,
@@ -518,21 +606,33 @@ struct CatDiskSample {
     used_bytes: u64,
 }
 
+struct CatMeterSample {
+    source_epoch: String,
+    generation: i64,
+    accumulator: RuntimeMeterAccumulator,
+    last_checkpoint_at: Option<Instant>,
+    failed: bool,
+}
+
 struct HostTelemetrySampler {
+    node_id: String,
     previous_cpu: Option<CpuTimes>,
     previous_cat_cpu: HashMap<String, CatCpuSample>,
     cat_disk_samples: HashMap<String, CatDiskSample>,
+    cat_meter_samples: HashMap<String, CatMeterSample>,
     disk_path: PathBuf,
 }
 
 impl HostTelemetrySampler {
-    fn new(disk_path: PathBuf) -> Self {
+    fn new(node_id: String, disk_path: PathBuf) -> Self {
         Self {
+            node_id,
             previous_cpu: std::fs::read_to_string("/proc/stat")
                 .ok()
                 .and_then(|contents| parse_cpu_times(&contents)),
             previous_cat_cpu: HashMap::new(),
             cat_disk_samples: HashMap::new(),
+            cat_meter_samples: HashMap::new(),
             disk_path,
         }
     }
@@ -541,7 +641,7 @@ impl HostTelemetrySampler {
         &mut self,
         mut telemetry: NodeTelemetry,
         targets: Vec<CatTelemetryTarget>,
-    ) -> NodeTelemetry {
+    ) -> (NodeTelemetry, Vec<CatUsageCheckpoint>) {
         let logical_cpus = std::thread::available_parallelism()
             .ok()
             .and_then(|count| u32::try_from(count.get()).ok());
@@ -581,6 +681,20 @@ impl HostTelemetrySampler {
         }
 
         let now = Instant::now();
+        let observed_at_unix_ms = now_unix_ms();
+        let mut usage_checkpoints = Vec::new();
+        for target in &targets {
+            match self.sample_usage_target(target, now, observed_at_unix_ms, false) {
+                Ok(checkpoints) => usage_checkpoints.extend(checkpoints),
+                Err(error) => {
+                    tracing::error!(
+                        cat = %target.cat_id,
+                        %error,
+                        "authoritative billing sample failed closed until a new runtime epoch"
+                    );
+                }
+            }
+        }
         let mut current_cat_cpu = HashMap::new();
         telemetry.cat_resources = targets
             .into_iter()
@@ -636,18 +750,223 @@ impl HostTelemetrySampler {
                 .iter()
                 .any(|item| &item.cat_id == cat_id)
         });
-        telemetry
+        self.cat_meter_samples.retain(|cat_id, _| {
+            telemetry
+                .cat_resources
+                .iter()
+                .any(|item| &item.cat_id == cat_id)
+        });
+        (telemetry, usage_checkpoints)
     }
+
+    fn finalize(&mut self, target: &CatTelemetryTarget) -> anyhow::Result<Vec<CatUsageCheckpoint>> {
+        let checkpoints = self.sample_usage_target(target, Instant::now(), now_unix_ms(), true)?;
+        self.cat_meter_samples.remove(&target.cat_id);
+        Ok(checkpoints)
+    }
+
+    fn sample_usage_target(
+        &mut self,
+        target: &CatTelemetryTarget,
+        now: Instant,
+        observed_at_unix_ms: i64,
+        force_checkpoint: bool,
+    ) -> anyhow::Result<Vec<CatUsageCheckpoint>> {
+        let Some(metering) = &target.metering else {
+            return Ok(Vec::new());
+        };
+        let replace = self
+            .cat_meter_samples
+            .get(&target.cat_id)
+            .is_none_or(|sample| {
+                sample.source_epoch != metering.source_epoch
+                    || sample.generation != target.generation
+            });
+        if replace {
+            let accumulator = RuntimeMeterAccumulator::new(
+                format!("node/{}/cat/{}", self.node_id, target.cat_id),
+                metering.source_epoch.clone(),
+                target.cat_id.clone(),
+                target.generation,
+            )?;
+            self.cat_meter_samples.insert(
+                target.cat_id.clone(),
+                CatMeterSample {
+                    source_epoch: metering.source_epoch.clone(),
+                    generation: target.generation,
+                    accumulator,
+                    last_checkpoint_at: None,
+                    failed: false,
+                },
+            );
+        }
+        let sample = self
+            .cat_meter_samples
+            .get_mut(&target.cat_id)
+            .context("meter sample disappeared during observation")?;
+        if sample.failed {
+            bail!("meter sample previously failed");
+        }
+        let Some((cpu_usage_usec, memory_current_bytes)) = read_cgroup_usage(&metering.cgroup_path)
+        else {
+            sample.failed = true;
+            bail!(
+                "authoritative cgroup sample unavailable at {}",
+                metering.cgroup_path.display()
+            );
+        };
+        if sample
+            .accumulator
+            .last_observed_at_unix_ms()
+            .is_none_or(|last| observed_at_unix_ms > last)
+        {
+            if let Err(error) = sample.accumulator.observe(
+                observed_at_unix_ms,
+                cpu_usage_usec,
+                memory_current_bytes,
+            ) {
+                sample.failed = true;
+                return Err(error.into());
+            }
+        }
+        let due = force_checkpoint
+            || sample
+                .last_checkpoint_at
+                .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(10));
+        if !due {
+            return Ok(Vec::new());
+        }
+        match sample.accumulator.checkpoint() {
+            Ok(checkpoints) => {
+                sample.last_checkpoint_at = Some(now);
+                Ok(checkpoints.into())
+            }
+            Err(error) => {
+                sample.failed = true;
+                Err(error.into())
+            }
+        }
+    }
+}
+
+struct UsageMeteringPipeline {
+    sampler: Mutex<HostTelemetrySampler>,
+    spool: UsageSpool,
+    unspooled: Mutex<Vec<CatUsageCheckpoint>>,
+}
+
+impl UsageMeteringPipeline {
+    fn open(node_id: String, state_dir: PathBuf) -> anyhow::Result<Self> {
+        let spool = UsageSpool::open(&state_dir.join("usage-spool.sqlite3"))?;
+        Ok(Self {
+            sampler: Mutex::new(HostTelemetrySampler::new(node_id, state_dir)),
+            spool,
+            unspooled: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn sample(
+        &self,
+        telemetry: NodeTelemetry,
+        targets: Vec<CatTelemetryTarget>,
+    ) -> (NodeTelemetry, anyhow::Result<()>) {
+        let (telemetry, checkpoints) = self.sampler.lock().unwrap().sample(telemetry, targets);
+        (telemetry, self.persist(checkpoints))
+    }
+
+    fn persist(&self, checkpoints: Vec<CatUsageCheckpoint>) -> anyhow::Result<()> {
+        let mut unspooled = self.unspooled.lock().unwrap();
+        unspooled.extend(checkpoints);
+        if unspooled.len() > 20_000 {
+            *unspooled = compact_pending_checkpoints(std::mem::take(&mut *unspooled));
+        }
+        self.spool.enqueue(&unspooled)?;
+        unspooled.clear();
+        Ok(())
+    }
+}
+
+impl UsageFinalizer for UsageMeteringPipeline {
+    fn finalize(&self, target: CatTelemetryTarget) -> anyhow::Result<()> {
+        let checkpoints = self.sampler.lock().unwrap().finalize(&target)?;
+        self.persist(checkpoints)
+    }
+}
+
+fn compact_pending_checkpoints(checkpoints: Vec<CatUsageCheckpoint>) -> Vec<CatUsageCheckpoint> {
+    let mut streams =
+        HashMap::<(String, String, UsageMetric), (CatUsageCheckpoint, CatUsageCheckpoint)>::new();
+    for checkpoint in checkpoints {
+        let key = (
+            checkpoint.source_id.clone(),
+            checkpoint.source_epoch.clone(),
+            checkpoint.metric,
+        );
+        streams
+            .entry(key)
+            .and_modify(|(first, last)| {
+                if checkpoint.sequence < first.sequence {
+                    *first = checkpoint.clone();
+                }
+                if checkpoint.sequence > last.sequence {
+                    *last = checkpoint.clone();
+                }
+            })
+            .or_insert_with(|| (checkpoint.clone(), checkpoint));
+    }
+    let mut compacted = Vec::with_capacity(streams.len() * 2);
+    for (_, (first, last)) in streams {
+        let one = first.event_id == last.event_id;
+        compacted.push(first);
+        if !one {
+            compacted.push(last);
+        }
+    }
+    compacted.sort_by(|left, right| {
+        (
+            left.observed_at_unix_ms,
+            left.source_id.as_str(),
+            left.source_epoch.as_str(),
+            left.metric.slug(),
+            left.sequence,
+        )
+            .cmp(&(
+                right.observed_at_unix_ms,
+                right.source_id.as_str(),
+                right.source_epoch.as_str(),
+                right.metric.slug(),
+                right.sequence,
+            ))
+    });
+    compacted
 }
 
 /// Start the node agent: HTTP server + registration + heartbeat loop.
 pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
+    anyhow::ensure!(cfg.heartbeat_ms > 0, "heartbeat interval must be positive");
+    anyhow::ensure!(
+        cfg.node.metering_cgroup_root.is_none() || cfg.heartbeat_ms <= 1_000,
+        "authoritative billing requires a heartbeat/sample interval of at most 1000ms"
+    );
+    crate::runtime::initialize_metering_cgroup(&cfg.node)?;
     std::fs::create_dir_all(&cfg.node.state_dir)?;
+    let usage_pipeline = Arc::new(UsageMeteringPipeline::open(
+        cfg.node.node_id.clone(),
+        cfg.node.state_dir.clone(),
+    )?);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
     let cfg = Arc::new(cfg);
-    let runtime = Arc::new(NodeRuntime::new(cfg.node.clone(), cfg.storage_meta.clone()));
+    let runtime = Arc::new(
+        NodeRuntime::new(cfg.node.clone(), cfg.storage_meta.clone())
+            .with_usage_finalizer(usage_pipeline.clone()),
+    );
     let state = NodeState {
         runtime: runtime.clone(),
         cfg: cfg.clone(),
+        client: client.clone(),
+        usage_pipeline: usage_pipeline.clone(),
     };
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen)
@@ -662,9 +981,6 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
     });
 
     // Register with the control plane (retry until it is reachable).
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
     let agent_url = cfg
         .advertise_url
         .clone()
@@ -710,7 +1026,7 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
     let hb_cp = cp.clone();
     let hb_token = token.clone();
     let interval = Duration::from_millis(cfg.heartbeat_ms);
-    let mut telemetry_sampler = HostTelemetrySampler::new(cfg.node.state_dir.clone());
+    let hb_usage_pipeline = usage_pipeline.clone();
     let heartbeat = tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
@@ -724,19 +1040,29 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
                     state,
                 })
                 .collect();
+            let (telemetry, persisted) = hb_usage_pipeline.sample(
+                hb_state.runtime.telemetry(),
+                hb_state.runtime.telemetry_targets(),
+            );
+            if let Err(error) = persisted {
+                tracing::error!(
+                    %error,
+                    "usage checkpoints are not durable; billing remains failed closed"
+                );
+            }
             let _ = hb_client
                 .post(format!("{hb_cp}/v1/nodes/heartbeat"))
                 .bearer_auth(&hb_token)
                 .json(&HeartbeatRequest {
                     node_id: hb_state.cfg.node.node_id.clone(),
                     cats,
-                    telemetry: Some(telemetry_sampler.sample(
-                        hb_state.runtime.telemetry(),
-                        hb_state.runtime.telemetry_targets(),
-                    )),
+                    telemetry: Some(telemetry),
                 })
                 .send()
                 .await;
+            if let Err(error) = hb_state.deliver_pending_usage().await {
+                tracing::warn!(%error, "durable usage checkpoint delivery deferred");
+            }
         }
     });
 
@@ -792,10 +1118,15 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
 #[cfg(test)]
 mod telemetry_tests {
     use super::{
-        allocated_tree_bytes, cpu_usage_percent, filesystem_capacity, parse_cpu_times,
-        parse_memory_mib, parse_process_cpu_ticks, parse_process_rss_bytes,
-        process_cpu_usage_cores,
+        allocated_tree_bytes, compact_pending_checkpoints, cpu_usage_percent, filesystem_capacity,
+        now_unix_ms, parse_cgroup_cpu_usage_usec, parse_cpu_times, parse_memory_mib,
+        parse_process_cpu_ticks, parse_process_rss_bytes, process_cpu_usage_cores,
+        read_cgroup_usage, HostTelemetrySampler,
     };
+    use crate::runtime::{CatMeteringTarget, CatTelemetryTarget};
+    use cats_api::metering::{CatUsageCheckpoint, UsageMetric};
+    use cats_metering::deterministic_event_id;
+    use std::time::Instant;
 
     #[test]
     fn parses_cpu_and_calculates_interval_usage() {
@@ -851,5 +1182,90 @@ mod telemetry_tests {
         let used = allocated_tree_bytes(temp.path()).unwrap();
         assert!(used >= 8192);
         assert!(used < 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn reads_authoritative_cgroup_v2_cpu_and_memory_counters() {
+        assert_eq!(
+            parse_cgroup_cpu_usage_usec("usage_usec 12345\nuser_usec 10000\nsystem_usec 2345\n"),
+            Some(12_345)
+        );
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("cpu.stat"),
+            "usage_usec 12345\nuser_usec 10000\nsystem_usec 2345\n",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("memory.current"), "987654\n").unwrap();
+        assert_eq!(read_cgroup_usage(temp.path()), Some((12_345, 987_654)));
+    }
+
+    #[test]
+    fn pending_checkpoint_compaction_keeps_baseline_and_latest_cumulative_value() {
+        let checkpoints = (0..3)
+            .map(|sequence| {
+                let mut checkpoint = CatUsageCheckpoint {
+                    event_id: String::new(),
+                    source_id: "node/node-a/cat/cat-a".to_string(),
+                    source_epoch: "epoch-a".to_string(),
+                    sequence,
+                    observed_at_unix_ms: 1_000 + i64::try_from(sequence).unwrap() * 10_000,
+                    cat_id: "cat-a".to_string(),
+                    cat_generation: 1,
+                    metric: UsageMetric::CpuUsec,
+                    cumulative_quantity: u128::from(sequence) * 100,
+                };
+                checkpoint.event_id = deterministic_event_id(&checkpoint);
+                checkpoint
+            })
+            .collect();
+        let compacted = compact_pending_checkpoints(checkpoints);
+        assert_eq!(compacted.len(), 2);
+        assert_eq!(compacted[0].sequence, 0);
+        assert_eq!(compacted[1].sequence, 2);
+    }
+
+    #[test]
+    fn lifecycle_finalization_emits_and_retires_the_latest_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let cgroup = temp.path().join("metering");
+        std::fs::create_dir(&cgroup).unwrap();
+        std::fs::write(cgroup.join("cpu.stat"), "usage_usec 100\n").unwrap();
+        std::fs::write(cgroup.join("memory.current"), "1000\n").unwrap();
+        let target = CatTelemetryTarget {
+            cat_id: "cat-a".to_string(),
+            generation: 1,
+            process_ids: Vec::new(),
+            runtime_dir: temp.path().to_path_buf(),
+            metering: Some(CatMeteringTarget {
+                cgroup_path: cgroup.clone(),
+                source_epoch: "epoch-a".to_string(),
+            }),
+        };
+        let mut sampler =
+            HostTelemetrySampler::new("node-a".to_string(), temp.path().to_path_buf());
+        let baseline = sampler
+            .sample_usage_target(&target, Instant::now(), now_unix_ms(), false)
+            .unwrap();
+        assert_eq!(baseline.len(), 2);
+        assert!(baseline.iter().all(|checkpoint| checkpoint.sequence == 0));
+
+        std::fs::write(cgroup.join("cpu.stat"), "usage_usec 200\n").unwrap();
+        std::fs::write(cgroup.join("memory.current"), "2000\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let final_checkpoints = sampler.finalize(&target).unwrap();
+        assert_eq!(final_checkpoints.len(), 2);
+        assert!(final_checkpoints
+            .iter()
+            .all(|checkpoint| checkpoint.sequence == 1));
+        assert_eq!(
+            final_checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.metric == UsageMetric::CpuUsec)
+                .unwrap()
+                .cumulative_quantity,
+            200
+        );
+        assert!(!sampler.cat_meter_samples.contains_key("cat-a"));
     }
 }

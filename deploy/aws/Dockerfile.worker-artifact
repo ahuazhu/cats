@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1.7
+FROM rust:1.97-bookworm AS builder
+
+WORKDIR /src
+COPY . .
+RUN --mount=type=cache,id=cats-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cats-worker-target,target=/src/target \
+    cargo build --locked --release \
+    -p cats-node-agent-daemon \
+    -p cats-blockd-daemon \
+    -p cats-guest-agent \
+    && strip \
+      target/release/cats-noded \
+      target/release/cats-blockd \
+      target/release/cats-guest-agent \
+    && install -D -m 0755 target/release/cats-noded /out/cats-noded \
+    && install -D -m 0755 target/release/cats-blockd /out/cats-blockd \
+    && install -D -m 0755 target/release/cats-guest-agent /out/cats-guest-agent
+
+FROM scratch AS artifact
+
+COPY --from=builder /out/cats-noded /cats-noded
+COPY --from=builder /out/cats-blockd /cats-blockd
+COPY --from=builder /out/cats-guest-agent /cats-guest-agent
+COPY deploy/aws/metal/cats-worker.service /cats-worker.service

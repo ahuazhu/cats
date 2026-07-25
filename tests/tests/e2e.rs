@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use cats_api::guest::{GuestRequestBody, GuestResponseBody};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
+use cats_metering::SqliteUsageStore;
 use cats_node_agent::guest_client::GuestClient;
 use cats_node_agent::runtime::NodeConfig;
 use cats_node_agent::server::{spawn as spawn_node, Handle as NodeHandle, ServerConfig};
@@ -38,10 +39,14 @@ impl Cluster {
         let cp = cats_control_plane::server::spawn(cats_control_plane::server::Config {
             listen: "127.0.0.1:0".into(),
             db_path: dir.path().join("control.db"),
+            usage_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
+            credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
             storage_meta,
             auth_token: SERVICE_TOKEN.into(),
             admin_token: ADMIN_TOKEN.into(),
             workos: None,
+            stripe: None,
+            billing_enforcement_enabled: false,
             node_lease_timeout_ms: 3_000,
             reconcile_interval_ms: 150,
             auto_tier_policy: Default::default(),
@@ -111,6 +116,7 @@ impl Cluster {
                 metadata_store,
                 object_store,
                 blockd_lease_ttl_ms: 1_200,
+                metering_cgroup_root: None,
                 vmm: cats_node_agent::runtime::VmmMode::Fake,
             },
         })

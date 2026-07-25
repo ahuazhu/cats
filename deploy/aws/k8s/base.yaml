@@ -1,3 +1,6 @@
+# LEGACY MIGRATION REFERENCE ONLY.
+# Production ownership moved to deploy/aws/terraform/modules/cats-kubernetes.
+# Import the live objects into Terraform; do not apply this file again.
 apiVersion: v1
 kind: Namespace
 metadata:

@@ -56,6 +56,7 @@ fn env() -> Env {
             metadata_store,
             object_store,
             blockd_lease_ttl_ms: 1200,
+            metering_cgroup_root: None,
             vmm: cats_node_agent::runtime::VmmMode::Fake,
         },
         storage_meta,

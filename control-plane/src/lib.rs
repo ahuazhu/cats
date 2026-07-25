@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod billing;
 pub mod controller;
 pub mod server;
 pub mod store;

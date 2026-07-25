@@ -1,0 +1,30 @@
+kubeconfig_path    = "/absolute/path/to/kubeconfig"
+kubeconfig_context = "REPLACE_WITH_PRODUCTION_EKS_CONTEXT"
+
+control_plane_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats-control-plane@sha256:REPLACE_WITH_64_HEX_CHARACTERS"
+gateway_image       = "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats-control-plane@sha256:REPLACE_WITH_64_HEX_CHARACTERS"
+
+usage_delivery_adapter = "aws-kinesis"
+usage_aws_region        = "us-east-1"
+usage_kinesis_stream    = "REPLACE_WITH_USAGE_STREAM"
+usage_archive_bucket    = "REPLACE_WITH_USAGE_ARCHIVE_BUCKET"
+usage_checkpoint_table  = "REPLACE_WITH_USAGE_CHECKPOINT_TABLE"
+
+stripe_enabled  = true
+stripe_livemode = true
+stripe_topup_price_ids = {
+  "1000"  = "price_REPLACE_10"
+  "2500"  = "price_REPLACE_25"
+  "5000"  = "price_REPLACE_50"
+  "10000" = "price_REPLACE_100"
+}
+
+acm_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/REPLACE"
+public_subnet_ids = [
+  "subnet-REPLACE_A",
+  "subnet-REPLACE_B",
+]
+
+# Do not put runtime_secret_data, storage_postgres_url, usage_postgres_url,
+# stripe_secret_key, stripe_webhook_secret, or rds_ca_pem in this file. Supply
+# them through TF_VAR_* or the CI secret store.

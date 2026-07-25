@@ -2,10 +2,11 @@
 //! stub. No WorkOS credentials or network access are required.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -13,6 +14,7 @@ use base64::Engine;
 use cats_control_plane::auth::{WorkOsConfig, WorkOsConfigParams};
 use cats_control_plane::server::{spawn, Config, Handle};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
+use cats_metering::SqliteUsageStore;
 use cats_storage::MetadataStore;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use reqwest::header::{LOCATION, SET_COOKIE};
@@ -33,11 +35,17 @@ async fn authenticate(State(stub): State<WorkOsStub>, Json(body): Json<Value>) -
     stub.exchanges.fetch_add(1, Ordering::SeqCst);
     assert_eq!(body["client_id"], "client_test");
     assert_eq!(body["client_secret"], "sk_test_secret");
-    let code = if body["grant_type"] == "refresh_token" {
-        assert!(body["refresh_token"]
+    let is_refresh = body["grant_type"] == "refresh_token";
+    let code = if is_refresh {
+        let refresh_token = body["refresh_token"]
             .as_str()
-            .is_some_and(|value| !value.is_empty()));
-        "refreshed"
+            .filter(|value| !value.is_empty())
+            .expect("refresh token");
+        match refresh_token {
+            "refresh_admin-user-code" => "admin-user-refreshed",
+            "refresh_expired" => "refreshed",
+            _ => panic!("unexpected refresh token"),
+        }
     } else {
         assert_eq!(body["grant_type"], "authorization_code");
         assert!(body["code_verifier"]
@@ -45,22 +53,37 @@ async fn authenticate(State(stub): State<WorkOsStub>, Json(body): Json<Value>) -
             .is_some_and(|value| !value.is_empty()));
         body["code"].as_str().unwrap()
     };
-    let (organization_id, permissions, email) = match code {
+    let (organization_id, permissions, email, user_id) = match code {
         "user-code" => (
             Some("org_project"),
             vec!["cats:project:write"],
             "user@example.com",
+            "user_user-code",
         ),
-        "new-user-code" => (None, vec![], "new-user@example.com"),
+        "new-user-code" => (None, vec![], "new-user@example.com", "user_new-user-code"),
         "admin-code" => (
             Some("org_admin"),
             vec!["cats:fleet:admin"],
             "admin@example.com",
+            "user_admin-code",
+        ),
+        "admin-user-code" => (
+            Some("org_admin"),
+            vec!["cats:fleet:admin"],
+            "admin-user@example.com",
+            "user_admin-user-code",
+        ),
+        "admin-user-refreshed" => (
+            body["organization_id"].as_str(),
+            vec!["cats:project:write"],
+            "admin-user@example.com",
+            "user_admin-user-code",
         ),
         "refreshed" => (
-            Some("org_project"),
+            body["organization_id"].as_str().or(Some("org_project")),
             vec!["cats:project:write"],
             "user@example.com",
+            "user_refresh",
         ),
         _ => panic!("unexpected authorization code or grant"),
     };
@@ -78,7 +101,7 @@ async fn authenticate(State(stub): State<WorkOsStub>, Json(body): Json<Value>) -
     Json(json!({
         "user": {
             "object": "user",
-            "id": format!("user_{code}"),
+            "id": user_id,
             "first_name": "Cats",
             "last_name": "Tester",
             "name": "Cats Tester",
@@ -126,30 +149,52 @@ fn test_user(id: &str) -> Value {
     })
 }
 
-async fn list_memberships() -> Json<Value> {
-    let membership = |id: &str, organization_id: &str, organization_name: &str, role: &str| {
-        json!({
-            "object": "organization_membership",
-            "id": id,
-            "user_id": "user_cli",
-            "organization_id": organization_id,
-            "status": "active",
-            "directory_managed": false,
-            "organization_name": organization_name,
-            "created_at": "2026-07-22T00:00:00.000Z",
-            "updated_at": "2026-07-22T00:00:00.000Z",
-            "role": { "slug": role },
-            "roles": [{ "slug": role }],
-            "user": test_user("user_cli")
-        })
+async fn list_memberships(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
+    let membership =
+        |id: &str, user_id: &str, organization_id: &str, organization_name: &str, role: &str| {
+            json!({
+                "object": "organization_membership",
+                "id": id,
+                "user_id": user_id,
+                "organization_id": organization_id,
+                "status": "active",
+                "directory_managed": false,
+                "organization_name": organization_name,
+                "created_at": "2026-07-22T00:00:00.000Z",
+                "updated_at": "2026-07-22T00:00:00.000Z",
+                "role": { "slug": role },
+                "roles": [{ "slug": role }],
+                "user": test_user(user_id)
+            })
+        };
+    let user_id = query
+        .get("user_id")
+        .map(String::as_str)
+        .unwrap_or("user_cli");
+    let data = if user_id == "user_admin-user-code" {
+        vec![membership(
+            "om_admin_user",
+            user_id,
+            "org_project",
+            "Default Workspace",
+            "member",
+        )]
+    } else {
+        vec![
+            membership(
+                "om_1",
+                user_id,
+                "org_project",
+                "Default Workspace",
+                "member",
+            ),
+            membership("om_2", user_id, "org_second", "Second Workspace", "admin"),
+            membership("om_3", user_id, "org_unmapped", "Unmapped", "member"),
+        ]
     };
     Json(json!({
         "object": "list",
-        "data": [
-            membership("om_1", "org_project", "Default Workspace", "member"),
-            membership("om_2", "org_second", "Second Workspace", "admin"),
-            membership("om_3", "org_unmapped", "Unmapped", "member")
-        ],
+        "data": data,
         "list_metadata": { "before": null, "after": null }
     }))
 }
@@ -218,10 +263,14 @@ impl Ctx {
         let cp = spawn(Config {
             listen: "127.0.0.1:0".into(),
             db_path: dir.path().join("control.db"),
+            usage_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
+            credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
             storage_meta,
             auth_token: "service-token".into(),
             admin_token: "admin-token".into(),
             workos: Some(Arc::new(workos)),
+            stripe: None,
+            billing_enforcement_enabled: false,
             node_lease_timeout_ms: 3_000,
             reconcile_interval_ms: 200,
             auto_tier_policy: Default::default(),
@@ -636,6 +685,27 @@ async fn organizationless_workos_user_receives_an_isolated_personal_project() {
         callback.headers().get(LOCATION).unwrap(),
         "https://cats.run/"
     );
+}
+
+#[tokio::test]
+async fn user_login_switches_from_admin_org_to_the_only_mapped_workspace() {
+    let ctx = Ctx::new().await;
+    let user_cookie = ctx.login("user", "admin-user-code").await;
+
+    let session: Value = ctx
+        .http
+        .get(ctx.url("/auth/session?site=user"))
+        .header("Cookie", &user_cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(session["authenticated"], true);
+    assert_eq!(session["project"], "default");
+    assert_eq!(session["user"]["id"], "user_admin-user-code");
+    assert_eq!(ctx.exchanges.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

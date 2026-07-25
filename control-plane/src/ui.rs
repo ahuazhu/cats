@@ -27,7 +27,7 @@ const WEB_MANIFEST: &str = include_str!("../ui/public/site.webmanifest");
 
 const PUBLIC_ORIGIN: &str = "https://cats.run";
 const OPS_ORIGIN: &str = "https://ops.cats.run";
-const LAST_MODIFIED: &str = "2026-07-22";
+const LAST_MODIFIED: &str = "2026-07-25";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Locale {
@@ -304,9 +304,10 @@ fn security_headers(headers: &mut HeaderMap, referrer_policy: &'static str) {
 }
 
 fn site_header(locale: Locale, current: &str, alternate_path: &str) -> String {
-    let (product, docs, lifecycle, scope, console, menu, language) = match locale {
+    let (product, pricing, docs, lifecycle, scope, console, menu, language) = match locale {
         Locale::En => (
             "Product",
+            "Pricing",
             "Docs",
             "Lifecycle",
             "Current scope",
@@ -316,6 +317,7 @@ fn site_header(locale: Locale, current: &str, alternate_path: &str) -> String {
         ),
         Locale::ZhCn => (
             "产品",
+            "价格",
             "文档",
             "生命周期",
             "当前能力",
@@ -326,6 +328,7 @@ fn site_header(locale: Locale, current: &str, alternate_path: &str) -> String {
     };
     let home = format!("{}/", locale.prefix());
     let docs_path = format!("{}/docs/", locale.prefix());
+    let pricing_path = format!("{}/#pricing", locale.prefix());
     let lifecycle_path = format!("{}/docs/cats-lifecycle/", locale.prefix());
     let scope_path = format!("{}/docs/#current-scope", locale.prefix());
     format!(
@@ -334,12 +337,13 @@ fn site_header(locale: Locale, current: &str, alternate_path: &str) -> String {
   <a class="logo-link" href="{home}" aria-label="Cats"><img src="/assets/cats-logo.svg" alt="Cats"></a>
   <nav class="site-nav" aria-label="{menu}">
     <a href="{home}"{product_current}>{product}</a>
+    <a href="{pricing_path}">{pricing}</a>
     <a href="{docs_path}"{docs_current}>{docs}</a>
     <a href="{lifecycle_path}">{lifecycle}</a>
     <a href="{scope_path}">{scope}</a>
   </nav>
   <div class="nav-actions"><a class="language-link" href="{alternate_path}" hreflang="{alternate_lang}">{language}</a><a class="button-link primary" href="/user/">{console}</a></div>
-  <details class="mobile-nav"><summary>{menu}</summary><div class="mobile-nav-panel"><a href="{home}">{product}</a><a href="{docs_path}">{docs}</a><a href="{lifecycle_path}">{lifecycle}</a><a href="{scope_path}">{scope}</a><a href="{alternate_path}" hreflang="{alternate_lang}">{language}</a><a href="/user/">{console}</a></div></details>
+  <details class="mobile-nav"><summary>{menu}</summary><div class="mobile-nav-panel"><a href="{home}">{product}</a><a href="{pricing_path}">{pricing}</a><a href="{docs_path}">{docs}</a><a href="{lifecycle_path}">{lifecycle}</a><a href="{scope_path}">{scope}</a><a href="{alternate_path}" hreflang="{alternate_lang}">{language}</a><a href="/user/">{console}</a></div></details>
 </div></header>"##,
         skip = if locale == Locale::En {
             "Skip to content"
@@ -431,7 +435,7 @@ fn document(
   <meta name="twitter:image" content="{origin}/assets/cats-og.png">
   <link rel="icon" href="/assets/cats-mark.svg" type="image/svg+xml">
   <link rel="manifest" href="/site.webmanifest">
-  <link rel="stylesheet" href="/assets/public.css?v=20260722-3">
+  <link rel="stylesheet" href="/assets/public.css?v=20260725-1">
   <script type="application/ld+json">{json_ld}</script>
 </head><body>{header}{body}{footer}</body></html>"##,
         lang = locale.code(),
@@ -965,7 +969,10 @@ pub async fn sitemap() -> Response {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{ADMIN_GUIDE, ADMIN_HTML, ADMIN_JS, COMMON_JS, DOCS, I18N_JS, USER_HTML, USER_JS};
+    use super::{
+        ADMIN_GUIDE, ADMIN_HTML, ADMIN_JS, COMMON_JS, DOCS, I18N_JS, LANDING_EN, LANDING_ZH,
+        USER_HTML, USER_JS,
+    };
 
     fn quoted_keys(source: &str, prefix: &str) -> BTreeSet<String> {
         let mut keys = BTreeSet::new();
@@ -1055,6 +1062,60 @@ mod tests {
     }
 
     #[test]
+    fn user_console_exposes_exact_provisional_billing_usage() {
+        for contract in [
+            "data-view=\"billing\"",
+            "id=\"view-billing\"",
+            "id=\"billing-range-form\"",
+            "id=\"billing-available-credit\"",
+            "id=\"billing-topup-options\"",
+            "id=\"billing-meters-table\"",
+            "id=\"billing-cats-table\"",
+            "id=\"billing-cat-dialog\"",
+            "id=\"billing-detail-chart\"",
+            "id=\"billing-detail-items-table\"",
+            "id=\"billing-detail-periods-table\"",
+        ] {
+            assert!(
+                USER_HTML.contains(contract),
+                "missing billing console contract: {contract}"
+            );
+        }
+        for contract in [
+            "/billing/usage?",
+            "/billing/balance",
+            "/billing/checkout",
+            "redirectForPayment",
+            "from_ms",
+            "to_ms",
+            "BigInt(",
+            "bucket_ms",
+            "report.time_buckets",
+            "renderBillingDetailChart",
+            "report.latest_interval_end_unix_ms",
+            "report.rate_card_id",
+            "state.activeView === \"billing\"",
+        ] {
+            assert!(
+                USER_JS.contains(contract),
+                "missing billing script contract: {contract}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_landing_pages_publish_pricing_and_signup_credit() {
+        for body in [LANDING_EN, LANDING_ZH] {
+            for contract in ["id=\"pricing\"", "$0.07", "$0.04375", "$10", "Stripe"] {
+                assert!(
+                    body.contains(contract),
+                    "public pricing page is missing {contract:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn english_and_chinese_catalogs_have_the_same_keys_without_duplicates() {
         let mut counts = std::collections::BTreeMap::<&str, usize>::new();
         for line in I18N_JS.lines() {
@@ -1129,6 +1190,7 @@ mod tests {
             "operation.cat_wake",
             "operation.cat_work_wake",
             "operation.cat_auto_suspend",
+            "operation.cat_credit_exhausted",
             "operation.cat_delete",
         ] {
             assert_eq!(

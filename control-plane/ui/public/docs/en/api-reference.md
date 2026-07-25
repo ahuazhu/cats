@@ -68,6 +68,28 @@ Disk action verbs are `mount`, `unmount`, and `resize`. Mount bodies identify th
       "wake_policy": "wake_on_request"
     }
 
+## Usage and billing
+
+    GET /v1/projects/{project}/billing/usage
+        ?from_ms=<inclusive-unix-milliseconds>
+        &to_ms=<exclusive-unix-milliseconds>
+        [&cat=<active-cat-name> | &cat_id=<immutable-cat-id>]
+        [&bucket_ms=<milliseconds>]
+        [&detail=true]
+
+The response is a `provisional` estimate for the open period. It includes range totals, totals by meter, totals by Cat, the immutable rate-card ID, and the latest visible interval end. `cat_id` remains queryable after a Cat is deleted. `bucket_ms` returns server-side time buckets for charts and bounded period detail; it must be at least 60 seconds and produce no more than 512 buckets. `detail=true` returns raw ledger intervals and should be reserved for controlled reconciliation queries rather than long browser ranges.
+
+CPU is rated at `$0.07 / CPU-hour` and memory at `$0.04375 / GiB-hour` by the current rate card. Decimal quantities and nanodollar amounts are JSON strings so clients do not lose integer precision. The range total is rated once after aggregation; bucket amounts are display estimates and are not a finalized invoice.
+
+    GET  /v1/projects/{project}/billing/balance
+    POST /v1/projects/{project}/billing/checkout
+    Idempotency-Key: <unique-key>
+    {"amount_cents": 1000}
+
+Each billing account receives one non-renewing `$10` signup credit. The balance response subtracts all-time provisional usage from append-only grants and top-ups. Checkout accepts only the published fixed top-up amounts and returns a Stripe-hosted URL. Returning from Checkout does not add credit: Cats credits the account only after a signed Stripe webhook reports the session as paid.
+
+When available credit is exhausted, paid compute admission returns HTTP `402` with code `payment_required`. Stopping, suspending, and deleting resources remain available.
+
 ## Operations
 
     GET /v1/projects/{project}/operations
@@ -82,7 +104,7 @@ An Operation contains Workspace ownership (stored as project), kind, target reso
       "message": "disk must be available before deletion"
     }
 
-Clients should branch on the stable code and show the message for context. Important codes include `invalid_argument`, `unauthenticated`, `permission_denied`, `not_found`, `already_exists`, `failed_precondition`, `conflict`, `stale_epoch`, `deadline_exceeded`, `unavailable`, and `internal`.
+Clients should branch on the stable code and show the message for context. Important codes include `invalid_argument`, `unauthenticated`, `permission_denied`, `not_found`, `already_exists`, `failed_precondition`, `payment_required`, `conflict`, `stale_epoch`, `deadline_exceeded`, `unavailable`, and `internal`.
 
 **Version authority**
 

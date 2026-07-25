@@ -68,6 +68,28 @@ Disk Action Verb 为 `mount`、`unmount` 与 `resize`。Mount Body 指定 Cat �
       "wake_policy": "wake_on_request"
     }
 
+## 用量与账单
+
+    GET /v1/projects/{project}/billing/usage
+        ?from_ms=<包含的-unix-毫秒>
+        &to_ms=<不包含的-unix-毫秒>
+        [&cat=<活跃-cat-名称> | &cat_id=<不可变-cat-id>]
+        [&bucket_ms=<毫秒>]
+        [&detail=true]
+
+开放账期的响应是 `provisional` 预估，包含范围总额、按 Meter 汇总、按 Cat 汇总、不可变 Rate Card ID 与当前最新可见 Interval End。Cat 删除后仍可通过 `cat_id` 查询。`bucket_ms` 返回服务端时间桶，用于曲线和有界时段详单；不得小于 60 秒，且最多产生 512 个时间桶。`detail=true` 返回原始 Ledger Interval，应只用于受控对账查询，避免浏览器直接查询很长范围。
+
+当前 Rate Card 的 CPU 单价为 `$0.07 / CPU-hour`，内存为 `$0.04375 / GiB-hour`。十进制 Quantity 与纳美元金额使用 JSON String，防止客户端丢失整数精度。范围总额在聚合后只计价一次；时间桶金额只用于展示预估，不是最终账单。
+
+    GET  /v1/projects/{project}/billing/balance
+    POST /v1/projects/{project}/billing/checkout
+    Idempotency-Key: <唯一键>
+    {"amount_cents": 1000}
+
+每个 Billing Account 获得一次性、不续期的 `$10` 注册赠金。余额响应使用 append-only 赠金与充值总额减去全部准实时暂估用量。Checkout 只接受官网公布的固定充值档位，并返回 Stripe 托管支付地址。仅从 Checkout 返回不会入账；Cats 只在收到签名正确且状态为 paid 的 Stripe Webhook 后增加余额。
+
+可用额度耗尽时，付费计算 Admission 返回 HTTP `402` 和 `payment_required` Code；停止、休眠和删除资源仍然可用。
+
 ## Operation
 
     GET /v1/projects/{project}/operations
@@ -82,7 +104,7 @@ Operation 包含 Workspace Owner（存储字段仍为 Project）、类型、目�
       "message": "disk must be available before deletion"
     }
 
-客户端应基于稳定 Code 分支，并把 Message 用作上下文。重要 Code 包括 `invalid_argument`、`unauthenticated`、`permission_denied`、`not_found`、`already_exists`、`failed_precondition`、`conflict`、`stale_epoch`、`deadline_exceeded`、`unavailable` 与 `internal`。
+客户端应基于稳定 Code 分支，并把 Message 用作上下文。重要 Code 包括 `invalid_argument`、`unauthenticated`、`permission_denied`、`not_found`、`already_exists`、`failed_precondition`、`payment_required`、`conflict`、`stale_epoch`、`deadline_exceeded`、`unavailable` 与 `internal`。
 
 **版本权威**
 

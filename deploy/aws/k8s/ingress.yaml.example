@@ -1,6 +1,6 @@
-# Render the environment-specific certificate ARN and every public EKS subnet
-# before
-# applying. This file intentionally contains no AWS account or VPC identifiers.
+# LEGACY MIGRATION REFERENCE ONLY.
+# Production ownership moved to deploy/aws/terraform/modules/cats-kubernetes.
+# Import the live objects into Terraform; do not render or apply this file.
 apiVersion: eks.amazonaws.com/v1
 kind: IngressClassParams
 metadata:
