@@ -1,24 +1,24 @@
    Compiling cats-blockd v0.1.0 (/work/blockd)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.85s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.63s
      Running unittests src/lib.rs (/target/debug/deps/cats_blockd-b42fc2ffcf862f0a)
 
 running 14 tests
-test format::tests::root_roundtrip ... ok
-test format::tests::truncated_inputs_are_rejected ... ok
-test format::tests::pack_roundtrip ... ok
 test format::tests::leaf_roundtrip_and_hash_stability ... ok
 test format::tests::page_mask_covers_ranges ... ok
+test format::tests::pack_roundtrip ... ok
+test format::tests::truncated_inputs_are_rejected ... ok
+test format::tests::root_roundtrip ... ok
 test engine::tests::write_read_roundtrip_and_holes ... ok
 test engine::tests::snapshot_captures_generation ... ok
 test nbd::tests::client_server_loopback_over_unix_pair ... ok
 test engine::tests::stale_writer_is_fenced_and_cannot_commit ... ok
-test engine::tests::multi_generation_overwrites_read_latest ... ok
 test engine::tests::write_zeroes_marks_dirty_and_commits_zeros ... ok
 test engine::tests::hole_reads_do_not_touch_the_blobstore ... ok
+test engine::tests::multi_generation_overwrites_read_latest ... ok
 test engine::tests::flush_commits_and_survives_full_cache_wipe ... ok
 test engine::tests::failed_upload_leaves_pack_and_recovery_replays_it ... ok
 
-test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.05s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.06s
 
      Running tests/vhost_user_bench.rs (/target/debug/deps/vhost_user_bench-2d9ca42ea5fd2a72)
 
@@ -34,16 +34,16 @@ test result: ok. 0 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; fini
 running 10 tests
 test config_space_reports_the_engine_geometry ... ok
 test fenced_attachment_fails_closed_for_the_guest ... ok
-test pipelined_requests_complete_out_of_order_safely ... ok
-test get_id_reports_the_volume_id ... ok
+test discard_and_write_zeroes_zero_the_range ... ok
+test multi_queue_requests_run_in_parallel ... ok
 test out_of_range_and_unknown_requests_fail_the_request_only ... ok
+test pipelined_requests_complete_out_of_order_safely ... ok
 test works_without_event_idx ... ok
 test payload_split_across_descriptors_is_reassembled ... ok
-test discard_and_write_zeroes_zero_the_range ... ok
 test write_read_flush_matches_the_nbd_oracle ... ok
-test multi_queue_requests_run_in_parallel ... ok
+test get_id_reports_the_volume_id ... ok
 
-test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.71s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.73s
 
    Doc-tests cats_blockd
 
