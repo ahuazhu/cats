@@ -48,6 +48,18 @@ struct Args {
     #[arg(long)]
     listen_tcp: Option<String>,
 
+    /// Serve vhost-user-blk on this unix socket path (Linux only). May be
+    /// combined with an NBD listener: the VMM uses vhost-user while seeding and
+    /// recovery tooling keeps using NBD on the same engine.
+    #[arg(long)]
+    listen_vhost_user: Option<PathBuf>,
+    /// virtio-blk virtqueues to expose (must match the VMM's num_queues).
+    #[arg(long, default_value_t = 1)]
+    vhost_user_queues: usize,
+    /// Depth of each virtqueue (power of two).
+    #[arg(long, default_value_t = 256)]
+    vhost_user_queue_size: u16,
+
     /// Dev helper: create the volume row with this size if it is missing.
     #[arg(long)]
     create_volume_size: Option<u64>,
@@ -68,6 +80,20 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
+    // Copied out before the adapter option vectors are consumed below.
+    let vhost_user_args = VhostUserArgs {
+        socket: args.listen_vhost_user.clone(),
+        queues: args.vhost_user_queues,
+        queue_size: args.vhost_user_queue_size,
+    };
+
+    // Reject an impossible listener set before taking the attachment lease.
+    if args.listen_unix.is_some() && args.listen_tcp.is_some() {
+        bail!("--listen-unix and --listen-tcp are mutually exclusive");
+    }
+    if args.listen_unix.is_none() && args.listen_tcp.is_none() && args.listen_vhost_user.is_none() {
+        bail!("give at least one of --listen-unix, --listen-tcp or --listen-vhost-user");
+    }
 
     let metadata_config =
         AdapterConfig::from_cli(args.metadata_store_options).context("metadata adapter options")?;
@@ -127,30 +153,133 @@ fn main() -> Result<()> {
         "attached"
     );
 
-    match (&args.listen_unix, &args.listen_tcp) {
-        (Some(path), None) => {
+    // Bind every requested socket before printing READY: a VMM told to start on
+    // readiness must never race a socket that does not exist yet.
+    let nbd_unix = match &args.listen_unix {
+        Some(path) => {
             if path.exists() {
                 std::fs::remove_file(path).ok();
             }
-            let listener = UnixListener::bind(path)
-                .with_context(|| format!("bind unix socket {}", path.display()))?;
-            println!("READY {}", path.display());
-            nbd::serve_unix(listener, engine);
+            Some(
+                UnixListener::bind(path)
+                    .with_context(|| format!("bind unix socket {}", path.display()))?,
+            )
         }
-        (None, Some(address)) => {
-            let listener = std::net::TcpListener::bind(address)
-                .with_context(|| format!("bind tcp {address}"))?;
-            println!("READY {address}");
+        None => None,
+    };
+    let nbd_tcp = match &args.listen_tcp {
+        Some(address) => Some(
+            std::net::TcpListener::bind(address).with_context(|| format!("bind tcp {address}"))?,
+        ),
+        None => None,
+    };
+    let vhost_user = bind_vhost_user(&vhost_user_args)?;
+
+    let ready = args
+        .listen_vhost_user
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .or_else(|| args.listen_unix.as_ref().map(|p| p.display().to_string()))
+        .or_else(|| args.listen_tcp.clone())
+        .expect("a listener was validated above");
+    println!("READY {ready}");
+
+    // An NBD frontend serves until its listener stops; the vhost-user daemon
+    // returns when the VMM disconnects, which is the signal to release the lease
+    // and exit. Whichever the Guest uses governs the process lifetime.
+    let mut nbd_threads = Vec::new();
+    if let Some(listener) = nbd_unix {
+        let engine = engine.clone();
+        nbd_threads.push(std::thread::spawn(move || nbd::serve_unix(listener, engine)));
+    }
+    if let Some(listener) = nbd_tcp {
+        let engine = engine.clone();
+        nbd_threads.push(std::thread::spawn(move || {
             for connection in listener.incoming() {
-                let connection = connection?;
+                let Ok(connection) = connection else { return };
                 connection.set_nodelay(true).ok();
                 let engine = engine.clone();
                 std::thread::spawn(move || {
                     let _ = nbd::handle_connection(connection, engine);
                 });
             }
-        }
-        _ => bail!("exactly one of --listen-unix or --listen-tcp must be given"),
+        }));
+    }
+    serve_vhost_user(vhost_user, &vhost_user_args, engine, nbd_threads)
+}
+
+/// NBD-only mode: the listener threads own the work, so the process lives as
+/// long as they do.
+fn serve_nbd_only(nbd_threads: Vec<std::thread::JoinHandle<()>>) -> Result<()> {
+    for thread in nbd_threads {
+        let _ = thread.join();
     }
     Ok(())
+}
+
+/// vhost-user CLI settings, kept separate so the serving code does not depend on
+/// the parts of `Args` consumed during adapter setup.
+struct VhostUserArgs {
+    socket: Option<PathBuf>,
+    // Only the Linux build has a frontend to configure; elsewhere `socket` is
+    // rejected outright.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    queues: usize,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    queue_size: u16,
+}
+
+#[cfg(target_os = "linux")]
+fn vhost_user_options(args: &VhostUserArgs) -> cats_blockd::vhost_user::VhostUserOptions {
+    cats_blockd::vhost_user::VhostUserOptions {
+        num_queues: args.queues,
+        queue_size: args.queue_size,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bind_vhost_user(args: &VhostUserArgs) -> Result<Option<vhost::vhost_user::Listener>> {
+    match &args.socket {
+        Some(path) => Ok(Some(
+            cats_blockd::vhost_user::bind(path, vhost_user_options(args))
+                .with_context(|| format!("bind vhost-user socket {}", path.display()))?,
+        )),
+        None => Ok(None),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_vhost_user(args: &VhostUserArgs) -> Result<Option<()>> {
+    if args.socket.is_some() {
+        bail!("--listen-vhost-user requires Linux (vhost-user needs eventfd and shared Guest memory)");
+    }
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+fn serve_vhost_user(
+    listener: Option<vhost::vhost_user::Listener>,
+    args: &VhostUserArgs,
+    engine: std::sync::Arc<ChunkEngine>,
+    nbd_threads: Vec<std::thread::JoinHandle<()>>,
+) -> Result<()> {
+    match listener {
+        Some(mut listener) => {
+            cats_blockd::vhost_user::serve_listener(&mut listener, engine, vhost_user_options(args))
+                .context("serve vhost-user-blk")?;
+            tracing::info!("vhost-user client disconnected; detaching");
+            Ok(())
+        }
+        None => serve_nbd_only(nbd_threads),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn serve_vhost_user(
+    _listener: Option<()>,
+    _args: &VhostUserArgs,
+    _engine: std::sync::Arc<ChunkEngine>,
+    nbd_threads: Vec<std::thread::JoinHandle<()>>,
+) -> Result<()> {
+    serve_nbd_only(nbd_threads)
 }

@@ -4,8 +4,15 @@ Phase A 形态（正确性优先）：Cloud Hypervisor 直接内核启动真 Gue
 `guest virtio-blk → CH raw disk → /dev/nbdN（内核 NBD client）→ cats-blockd →
 BlobStore port → AWS S3/File adapter`；Guest Agent 走 vsock；Suspended=vm.pause，Warm=vm.snapshot
 + 全进程退出，Restore=--restore。每个 Cat 有独立 tap `/30` 和 Host SNAT 出站；
-公网 HTTP Endpoint 经 owning Node 进入 Guest tap。原生 vhost-user-blk、跨节点 overlay
-与 WebSocket 入站仍是后续里程碑，不改变提交协议。
+公网 HTTP Endpoint 经 owning Node 进入 Guest tap。跨节点 overlay 与 WebSocket 入站仍是
+后续里程碑，不改变提交协议。
+
+原生 vhost-user-blk 路径已实现（ADR-0015）：给 `cats-noded` 加
+`--ch-block-path vhost-user`（可选 `--ch-vhost-user-queues N`），磁盘链路变成
+`guest virtio-blk → CH vhost-user-blk client → cats-blockd`，不再需要 `nbd` 内核模块或
+`/dev/nbdN`。该路径的协议级验收已完成，但**真机（KVM）验收尚未做**，包括 Warm
+snapshot/restore 的设备状态对齐；因此默认仍是内核 NBD，裸金属上要用 vhost-user 必须
+按 `experiments/vhost-user-blk-frontend-20260726/README.md` 的未验证清单先跑一轮验收。
 
 ## 1. 开机器
 

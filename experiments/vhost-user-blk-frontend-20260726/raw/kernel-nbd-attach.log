@@ -1,0 +1,4 @@
+Warning: the oldstyle protocol is no longer supported.
+This method now uses the newstyle protocol with a default export
+Negotiation: ..size = 64MB
+Connected /dev/nbd0

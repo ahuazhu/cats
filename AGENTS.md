@@ -2,15 +2,29 @@
 
 ## Repository state
 
-The repository contains the full Rust workspace implementation (V1 dev shape) plus architecture documents and validated experiments. Implemented and tested: ChunkStore engine (`blockd/`, spec in `docs/specs/blockd-protocol.md`), provider-neutral storage ports and adapters, project-scoped control plane and fleet administration/monitoring, separate embedded user and administrator web consoles with optional WorkOS AuthKit sessions, node agent (FakeVmm plus a Cloud Hypervisor Phase-A path), guest agent (Unix socket plus real-Guest vsock), CLI, endpoint gateway — automated workspace tests include adapter contracts, crash injection, fencing, cross-project authorization, AuthKit PKCE/session scopes and refresh, schema migration, node drain and cross-node cold restore. The Cloud Hypervisor path has also passed the 17-check AWS bare-metal acceptance run recorded under `experiments/metal-e2e-20260721/`. NOT yet implemented: native vhost-user-blk (Phase A uses kernel NBD), tap/overlay Guest networking, PostgreSQL metadata store (SQLite dev stand-in keeps the spec's SQL shape), and privilege separation. Do not infer other modules exist because a design document names them; check the workspace.
+The repository contains the full Rust workspace implementation (V1 dev shape) plus architecture documents and validated experiments. Implemented and tested: ChunkStore engine (`blockd/`, spec in `docs/specs/blockd-protocol.md`) with both frontends — NBD (portable) and native vhost-user-blk (Linux, ADR-0015) — provider-neutral storage ports and adapters, project-scoped control plane and fleet administration/monitoring, separate embedded user and administrator web consoles with optional WorkOS AuthKit sessions, node agent (FakeVmm plus a Cloud Hypervisor Phase-A path, `--ch-block-path kernel-nbd|vhost-user`), guest agent (Unix socket plus real-Guest vsock), CLI, endpoint gateway — automated workspace tests include adapter contracts, crash injection, fencing, cross-project authorization, AuthKit PKCE/session scopes and refresh, schema migration, node drain and cross-node cold restore, plus Linux-only vhost-user-blk acceptance tests driven by a userspace VMM stand-in (`blockd/tests/vhost_user_blk.rs`). The Cloud Hypervisor path has also passed the 17-check AWS bare-metal acceptance run recorded under `experiments/metal-e2e-20260721/`. NOT yet validated/implemented: the vhost-user-blk path under a real VMM (needs KVM bare metal, including Warm snapshot/restore state alignment; kernel NBD stays the default block path until then, see `experiments/vhost-user-blk-frontend-20260726/`), tap/overlay Guest networking, PostgreSQL metadata store (SQLite dev stand-in keeps the spec's SQL shape), and privilege separation. Do not infer other modules exist because a design document names them; check the workspace.
 
 Quality gates for any change: `cargo test --workspace` green and `cargo clippy --workspace --all-targets` warning-free.
+
+The vhost-user-blk frontend and the node agent's Linux-only code compile out on macOS, so a change touching either must also be gated on Linux. Without a Linux box, a container is enough (no KVM needed for the protocol tests):
+
+```bash
+docker run --rm --platform linux/arm64 -v "$PWD":/work -w /work \
+  -v cats-cargo-registry:/usr/local/cargo/registry \
+  -v cats-target-linux:/target rust:1.97-bookworm \
+  sh -c 'rustup component add clippy &&
+         cargo build --workspace --target-dir /target &&
+         cargo clippy --workspace --all-targets --target-dir /target &&
+         cargo test --workspace --target-dir /target'
+```
+
+Keep the target directory in a Docker volume (`/target` above), not in the bind-mounted repository: the shared macOS filesystem is slow and has produced spurious "can't find crate" failures mid-build. `cargo build` must come first because some integration tests shell out to `cargo build` for helper binaries and would otherwise deadlock on the build-directory lock.
 
 ## Read before implementation
 
 Read in this order:
 
-1. All ADRs in [`docs/decisions/`](docs/decisions/): [`0001` greenfield baseline](docs/decisions/0001-greenfield-implementation-baseline.md), [`0002` lifecycle states](docs/decisions/0002-lifecycle-states-running-suspended-warm-cold.md), [`0003` storage backend](docs/decisions/0003-direct-s3-chunkstore-backend.md), [`0004` stack and dev environment](docs/decisions/0004-implementation-stack-and-dev-environment.md), [`0005` provider-neutral storage ports and adapters](docs/decisions/0005-provider-neutral-storage-ports-and-adapters.md), [`0006` WorkOS AuthKit browser identity](docs/decisions/0006-workos-authkit-for-browser-identity.md), [`0007` Guest Runtime HTTP over Unix socket](docs/decisions/0007-guest-runtime-http-over-unix-socket.md)
+1. All ADRs in [`docs/decisions/`](docs/decisions/): [`0001` greenfield baseline](docs/decisions/0001-greenfield-implementation-baseline.md), [`0002` lifecycle states](docs/decisions/0002-lifecycle-states-running-suspended-warm-cold.md), [`0003` storage backend](docs/decisions/0003-direct-s3-chunkstore-backend.md), [`0004` stack and dev environment](docs/decisions/0004-implementation-stack-and-dev-environment.md), [`0005` provider-neutral storage ports and adapters](docs/decisions/0005-provider-neutral-storage-ports-and-adapters.md), [`0006` WorkOS AuthKit browser identity](docs/decisions/0006-workos-authkit-for-browser-identity.md), [`0007` Guest Runtime HTTP over Unix socket](docs/decisions/0007-guest-runtime-http-over-unix-socket.md), [`0015` vhost-user-blk production block frontend](docs/decisions/0015-vhost-user-blk-production-block-frontend.md)
 2. [`docs/cats-complete-product-technical-architecture.md`](docs/cats-complete-product-technical-architecture.md)
 3. The task-specific design:
    - storage (selected backend, ADR-0003; Direct-OS 形态的 Direct-S3 实现): [`docs/direct-s3-chunkstore-architecture.md`](docs/direct-s3-chunkstore-architecture.md)

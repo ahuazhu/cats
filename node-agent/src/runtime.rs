@@ -31,11 +31,14 @@ use cats_api::resources::{NodeTelemetry, ObservedState};
 use cats_guest_agent::DiskMapEntry;
 use cats_storage::{AdapterSelection, MetadataStore};
 
-use crate::ch::{self, ChConfig, ChRuntime, GUEST_VSOCK_PORT};
+use crate::ch::{self, BlockPath, ChConfig, ChRuntime, GUEST_VSOCK_PORT};
 use crate::guest_client::{GuestClient, GuestShell};
 
 /// Which VMM this node runs.
 #[derive(Debug, Clone)]
+// Exactly one VmmMode exists per node agent, stored in `NodeConfig` and always
+// matched by reference, so the size gap between the variants costs nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum VmmMode {
     /// Host-process guest (dev/tests on any OS).
     Fake,
@@ -72,7 +75,11 @@ struct RuntimeMetering {
 
 struct BlockdProc {
     child: Child,
+    /// NBD socket: readiness probe, golden-root seeding and recovery tooling.
+    /// Always present, on both block paths.
     socket: PathBuf,
+    /// vhost-user socket the VMM consumes, when the Cat runs on that path.
+    vhost_user_socket: Option<PathBuf>,
     grant: VolumeGrant,
 }
 
@@ -670,8 +677,9 @@ impl NodeRuntime {
         }
     }
 
-    /// Cloud Hypervisor start/restore: blockd -> (seed) -> kernel NBD ->
-    /// CH direct-kernel boot (or snapshot restore) -> vsock health.
+    /// Cloud Hypervisor start/restore: blockd -> (seed) -> block attach
+    /// (kernel NBD device or vhost-user socket) -> CH direct-kernel boot (or
+    /// snapshot restore) -> vsock health.
     #[allow(clippy::too_many_arguments)]
     fn start_cat_ch(
         &self,
@@ -780,22 +788,40 @@ impl NodeRuntime {
                     }
                 }
             }
-            // 3. Kernel NBD attach (root first => /dev/vda). On restore the
-            //    device indices must match the snapshot exactly.
+            // 3. Block attach (root first => /dev/vda). On a kernel-NBD restore
+            //    the device indices must match the snapshot exactly; vhost-user
+            //    sockets are derived from the Cat and disk id, so they are
+            //    already stable across a Warm restore.
             let mut ordered: Vec<&VolumeGrant> = volumes.iter().collect();
             ordered.sort_by_key(|g| g.mount_path != "/");
             let mut disks = Vec::new();
-            let nbd_started = Instant::now();
+            let block_attach_started = Instant::now();
             for grant in ordered {
-                let want = prev_nbd.get(&grant.disk_id).map(|s| s.as_str());
-                let dev = ch::nbd_attach(chc, &rt.blockds[&grant.disk_id].socket, want)?;
-                chrt.nbd.insert(grant.disk_id.clone(), dev.clone());
-                rt.ch = Some(chrt.clone());
-                disks.push(dev);
+                let proc = &rt.blockds[&grant.disk_id];
+                match chc.block_path {
+                    BlockPath::KernelNbd => {
+                        let want = prev_nbd.get(&grant.disk_id).map(|s| s.as_str());
+                        let dev = ch::nbd_attach(chc, &proc.socket, want)?;
+                        chrt.nbd.insert(grant.disk_id.clone(), dev.clone());
+                        // Record the attachment before any later fallible setup
+                        // so the shared failure teardown cannot leak it.
+                        rt.ch = Some(chrt.clone());
+                        disks.push(ch::file_disk_arg(&dev));
+                    }
+                    BlockPath::VhostUser => {
+                        let socket = proc
+                            .vhost_user_socket
+                            .as_ref()
+                            .context("blockd was started without a vhost-user socket")?;
+                        disks.push(ch::vhost_user_disk_arg(
+                            socket,
+                            chc.vhost_user_queues,
+                            chc.vhost_user_queue_size,
+                        )?);
+                    }
+                }
             }
-            let nbd_us = nbd_started.elapsed().as_micros();
-            // Record block devices before any later fallible setup so the
-            // shared failure teardown cannot leak host NBD attachments.
+            let block_attach_us = block_attach_started.elapsed().as_micros();
             rt.ch = Some(chrt.clone());
             if !warm_restore {
                 chrt.network = ch::prepare_network(chc, cat_id)?;
@@ -844,9 +870,10 @@ impl NodeRuntime {
                         if warm_restore {
                             tracing::info!(
                                 cat = cat_id,
+                                block_path = chc.block_path.as_str(),
                                 total_us = restore_started.elapsed().as_micros(),
                                 blockd_us,
-                                nbd_us,
+                                block_attach_us,
                                 vmm_spawn_us,
                                 api_ready_us,
                                 resume_us,
@@ -904,6 +931,24 @@ impl NodeRuntime {
             &cat_dir.join(format!("nbd-{}.sock", grant.disk_id)),
             &socket,
         );
+        // The Guest's data path. Both frontends serve one engine in one
+        // process, so seeding and recovery keep using NBD while the VMM uses
+        // vhost-user (spec §7.1).
+        let vhost_user_socket = match &self.cfg.vmm {
+            VmmMode::CloudHypervisor(chc) if chc.block_path == BlockPath::VhostUser => {
+                let socket = short_socket_path(
+                    &self.cfg.state_dir,
+                    cat_id,
+                    &format!("vhu-{}", grant.disk_id),
+                );
+                symlink_socket(
+                    &cat_dir.join(format!("vhu-{}.sock", grant.disk_id)),
+                    &socket,
+                );
+                Some(socket)
+            }
+            _ => None,
+        };
         let data_dir = cat_dir.join(format!("vol-{}", grant.disk_id));
         let mut cmd = Command::new(&self.cfg.blockd_bin);
         cmd.arg("--volume-id")
@@ -922,6 +967,14 @@ impl NodeRuntime {
             .arg(grant.size_bytes.to_string())
             .arg("--lease-ttl-ms")
             .arg(self.cfg.blockd_lease_ttl_ms.to_string());
+        if let (Some(socket), VmmMode::CloudHypervisor(chc)) = (&vhost_user_socket, &self.cfg.vmm) {
+            cmd.arg("--listen-vhost-user")
+                .arg(socket)
+                .arg("--vhost-user-queues")
+                .arg(chc.vhost_user_queues.to_string())
+                .arg("--vhost-user-queue-size")
+                .arg(chc.vhost_user_queue_size.to_string());
+        }
         let log = std::fs::File::create(cat_dir.join(format!("blockd-{}.log", grant.disk_id)))
             .context("create blockd log")?;
         for option in self.cfg.metadata_store.config.to_cli() {
@@ -939,6 +992,7 @@ impl NodeRuntime {
         let mut proc = BlockdProc {
             child,
             socket,
+            vhost_user_socket,
             grant: grant.clone(),
         };
         self.wait_blockd_ready(&mut proc)
@@ -1137,6 +1191,9 @@ impl NodeRuntime {
             let _ = p.child.kill();
             let _ = p.child.wait();
             let _ = std::fs::remove_file(&p.socket);
+            if let Some(socket) = &p.vhost_user_socket {
+                let _ = std::fs::remove_file(socket);
+            }
         }
         if let Some(chrt) = &mut rt.ch {
             let _ = std::fs::remove_file(&chrt.api_sock);

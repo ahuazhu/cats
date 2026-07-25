@@ -11,6 +11,7 @@
 | [`lazy-ext4-demo/`](lazy-ext4-demo/) | 未修改 ext4 运行在稀疏 ChunkStore 上；只提交 dirty Chunk；删除本地 Cache 后懒加载；JuiceFS production-shaped crash consistency | [`README`](lazy-ext4-demo/README.md) |
 | [`warm-snapshot-benchmark/`](warm-snapshot-benchmark/) | Cloud Hypervisor Cold、pause + page-out、snapshot + VMM exit、并发唤醒和 Direct-S3 | [`README`](warm-snapshot-benchmark/README.md) |
 | [`metal-e2e-20260721/`](metal-e2e-20260721/) | 生产 Rust 组件在 AWS i4i.metal 上经真实 KVM、Cloud Hypervisor、vsock、ext4、内核 NBD 与真实 S3 完成四态生命周期验收 | [`README`](metal-e2e-20260721/README.md) |
+| [`vhost-user-blk-frontend-20260726/`](vhost-user-blk-frontend-20260726/) | `cats-blockd` 原生 vhost-user-blk 前端的协议级验收（独立实现的 VMM 侧驱动 + NBD oracle 对照）与三条块传输路径的前端成本测量 | [`README`](vhost-user-blk-frontend-20260726/README.md) |
 
 ## 2026-07-21 正式结果
 

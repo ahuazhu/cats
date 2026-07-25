@@ -16,10 +16,26 @@ hex = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 
+# The vhost-user-blk frontend is a Linux data-plane feature (vhost-user needs
+# eventfd/memfd and shared guest memory); the NBD frontend stays portable so the
+# workspace still builds and tests on macOS dev machines.
+[target.'cfg(target_os = "linux")'.dependencies]
+vhost = { workspace = true }
+vhost-user-backend = { workspace = true }
+virtio-bindings = { workspace = true }
+virtio-queue = { workspace = true }
+vm-memory = { workspace = true }
+vmm-sys-util = { workspace = true }
+libc = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 cats-object-store-file = { workspace = true }
 cats-metadata-store-sqlite = { workspace = true }
+
+# Tests drive the backend from a userspace vhost-user frontend (a VMM stand-in).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+vhost = { workspace = true, features = ["vhost-user-frontend"] }
 
 [lints]
 workspace = true

@@ -22,6 +22,10 @@ clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# The vhost-user listener type is only reachable on Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+vhost = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

@@ -1,0 +1,9 @@
+date_utc: 2026-07-25T17:51:19Z
+uname: Linux 6.12.76-linuxkit aarch64
+cpus: 18
+memory_kb: 8124424
+rustc: rustc 1.97.1 (8bab26f4f 2026-07-14)
+kvm: absent
+container: yes
+cpu_model: 0x61
+git_commit: 96994a1

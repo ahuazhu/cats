@@ -43,7 +43,7 @@ Cats 是一个从零实现的独立项目：为用户提供可休眠、可迁移
 ## 当前证据支持的基线
 
 - 虚拟化：KVM + Cloud Hypervisor，Guest 使用未修改的 Linux/ext4。
-- 块数据面：`virtio-blk -> vhost-user-blk -> cats-blockd`。
+- 块数据面：`virtio-blk -> vhost-user-blk -> cats-blockd`（ADR-0015；Phase A 的内核 NBD 路径仍是默认值，两条路径共用同一提交协议与卷格式）。
 - 存储：对象存储保存 durable truth，本地 NVMe 是可删除的稀疏读写 Cache；只提交 dirty logical Chunk，不 dump 整块虚拟盘。后端为 Direct-OS ChunkStore（Direct-S3 实现，ADR-0003）。
 - 磁盘：每个 Cat 有生命周期一致的 RootDisk；可选一块跨 Cat 持久化的 RWO PersistentDisk。
 - Suspended（pause + page-out）：本轮唤醒约 0.21–0.23 秒，VMM 保留。
@@ -84,7 +84,7 @@ docs/                     架构、决策、协议规格和实验报告
 | AWS S3 adapter | ✅ 代码 + 签名向量测试 | SigV4 通过 AWS 官方测试向量；对真实 AWS S3/MinIO 的联测按需运行 |
 | 元数据存储 | ✅ SQLite + PostgreSQL | SQLite 用于本地开发；PostgreSQL adapter 实现 root/lease/fencing 的数据库时钟与原子 CAS，并用于 AWS EKS/metal 共享元数据 |
 | Usage / billing ledger | ✅ provisional 全链路 | 1 秒 cgroup 采样、10 秒累计 checkpoint、Node 持久 outbox、lifecycle final checkpoint、Kinesis、七年 Object Lock S3 archive、PostgreSQL projection、DynamoDB checkpoint，以及 account/Cat/metric 查询和整数计价；正式收费仍待 replay/shadow invoice 验收 |
-| 虚拟化 | FakeVmm + **Cloud Hypervisor 模式**（`--vmm ch`，Linux+KVM） | CH 直接内核启动、vsock Guest Agent、vm.pause/resume、Warm=vm.snapshot/--restore；块路径 Phase A 走内核 NBD（正确性等价，vhost-user 为性能里程碑）；部署见 `deploy/metal/` |
+| 虚拟化 | FakeVmm + **Cloud Hypervisor 模式**（`--vmm ch`，Linux+KVM） | CH 直接内核启动、vsock Guest Agent、vm.pause/resume、Warm=vm.snapshot/--restore；块路径可选内核 NBD（默认，已裸金属验收）或原生 vhost-user-blk（`--ch-block-path vhost-user`，ADR-0015，协议级验收完成、真机验收待做）；部署见 `deploy/metal/` |
 | Guest 网络 / tap / overlay | 未实现 | 下一里程碑；exec/健康走 vsock；Endpoint 演示仅 FakeVmm 形态 |
 
 ## 构建与测试

@@ -1,15 +1,23 @@
 //! Cloud Hypervisor integration (the real-VMM half of the runtime seam).
 //!
-//! Phase A data path (correctness-first, per ADR-0001 ordering):
+//! Two Guest block data paths, selected by [`ChConfig::block_path`]:
 //!
 //! ```text
-//! guest virtio-blk -> CH built-in block backend -> /dev/nbdN (kernel NBD
-//! client) -> cats-blockd NBD server -> ChunkEngine -> storage adapters
+//! kernel-nbd (Phase A, the correctness-first path of ADR-0001):
+//!   guest virtio-blk -> CH built-in block backend -> /dev/nbdN (kernel NBD
+//!   client) -> cats-blockd NBD server -> ChunkEngine -> storage adapters
+//!
+//! vhost-user (ADR-0015):
+//!   guest virtio-blk -> CH vhost-user-blk client -> cats-blockd vhost-user
+//!   backend -> ChunkEngine -> storage adapters
 //! ```
 //!
-//! The kernel NBD hop reuses the fully crash-tested NBD frontend; a native
-//! vhost-user-blk backend is the later performance milestone and does not
-//! change any commit semantics. Guest control runs over CH hybrid vsock.
+//! Both frontends drive the same engine and the same commit protocol, so the
+//! choice is a performance/operational one, not a correctness one: the kernel
+//! NBD hop needs `nbd-client` plus a `/dev/nbdN` device per disk, while
+//! vhost-user needs shared Guest memory (already required here for
+//! `MADV_PAGEOUT`) and no host block device at all. Guest control runs over CH
+//! hybrid vsock.
 //! Warm uses `vm.snapshot` / `--restore` (the mechanism validated in the
 //! 2026-07-21 experiments) with the snapshot on local disk. Suspended uses a
 //! per-Cat, file-backed memory zone and process_madvise(MADV_PAGEOUT), so it
@@ -34,6 +42,34 @@ pub const GUEST_VSOCK_PORT: u32 = 5000;
 pub const GUEST_MEMORY_FILE: &str = "guest-memory.bin";
 const MIB: u64 = 1024 * 1024;
 
+/// Which frontend of `cats-blockd` the Guest's virtio-blk devices are served by.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BlockPath {
+    /// Phase A: `nbd-client` binds the backend to `/dev/nbdN` and Cloud
+    /// Hypervisor's built-in block backend serves the Guest from that device.
+    #[default]
+    KernelNbd,
+    /// Cloud Hypervisor talks vhost-user-blk directly to `cats-blockd`.
+    VhostUser,
+}
+
+impl BlockPath {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "kernel-nbd" => Ok(Self::KernelNbd),
+            "vhost-user" => Ok(Self::VhostUser),
+            other => bail!("unknown block path {other} (expected kernel-nbd|vhost-user)"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::KernelNbd => "kernel-nbd",
+            Self::VhostUser => "vhost-user",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ChConfig {
     pub ch_bin: PathBuf,
@@ -43,6 +79,12 @@ pub struct ChConfig {
     pub cmdline: String,
     /// Raw image written into generation-0 root volumes (golden root).
     pub seed_image: Option<PathBuf>,
+    pub block_path: BlockPath,
+    /// virtio-blk queues per disk on the vhost-user path. One worker thread per
+    /// queue in `cats-blockd`, so this bounds per-disk request concurrency.
+    pub vhost_user_queues: usize,
+    /// Depth of each virtio-blk queue (power of two).
+    pub vhost_user_queue_size: u16,
     pub nbd_client_bin: PathBuf,
     /// How many /dev/nbdN devices exist (modprobe nbd nbds_max=...).
     pub nbd_devices: u32,
@@ -368,6 +410,32 @@ pub fn seed_volume(blockd_socket: &Path, image: &Path) -> Result<()> {
 // VMM process control
 // ---------------------------------------------------------------------------
 
+/// `--disk` argument for a host block device or file.
+///
+/// `image_type=raw` is required: CH v53 otherwise auto-detects raw and enables a
+/// sector-0 write protection that fails ext4 writes.
+pub fn file_disk_arg(path: &str) -> String {
+    format!("path={path},image_type=raw")
+}
+
+/// `--disk` argument for a `cats-blockd` vhost-user-blk backend.
+///
+/// `num_queues` and `queue_size` must match what the backend was started with:
+/// the VMM configures exactly the queues it is told about, and a mismatch shows
+/// up as a Guest device that never completes a request.
+pub fn vhost_user_disk_arg(socket: &Path, num_queues: usize, queue_size: u16) -> Result<String> {
+    let socket = socket
+        .to_str()
+        .context("vhost-user socket path is not UTF-8")?;
+    anyhow::ensure!(
+        !socket.contains(','),
+        "vhost-user socket path cannot contain a comma"
+    );
+    Ok(format!(
+        "vhost_user=on,socket={socket},num_queues={num_queues},queue_size={queue_size}"
+    ))
+}
+
 pub struct ChSpawn<'a> {
     pub cfg: &'a ChConfig,
     pub api_sock: &'a Path,
@@ -378,7 +446,9 @@ pub struct ChSpawn<'a> {
     /// Required for a fresh boot. Snapshot restore reopens the path recorded
     /// in the Cloud Hypervisor snapshot.
     pub memory_file: Option<&'a Path>,
-    /// Root first; kernel names them vda, vdb, ... in order.
+    /// Fully formed `--disk` arguments, root first: the kernel names them vda,
+    /// vdb, ... in order. Build them with [`file_disk_arg`] or
+    /// [`vhost_user_disk_arg`].
     pub disks: &'a [String],
     /// Restore from this snapshot directory instead of a fresh boot.
     pub restore_from: Option<&'a Path>,
@@ -410,7 +480,9 @@ pub fn spawn_vmm(s: &ChSpawn<'_>) -> Result<Child> {
                 "memory backing path cannot contain a comma"
             );
             // A named MAP_SHARED memory zone is required for MADV_PAGEOUT to
-            // write dirty Guest pages to local NVMe on hosts without swap.
+            // write dirty Guest pages to local NVMe on hosts without swap. It
+            // is also what makes vhost-user possible: the backend has to be able
+            // to map the Guest's virtqueues and payload pages.
             cmd.arg("--memory").arg("size=0");
             cmd.arg("--memory-zone").arg(format!(
                 "id=cat-ram,size={}M,file={},shared=on",
@@ -423,14 +495,7 @@ pub fn spawn_vmm(s: &ChSpawn<'_>) -> Result<Child> {
                 cmd.arg("--net")
                     .arg(format!("tap={},mac={}", network.tap, network.mac));
             }
-            // image_type=raw is required: CH v53 otherwise auto-detects raw
-            // and enables a sector-0 write protection that fails ext4 writes.
-            let mut disk_args: Vec<String> = s
-                .disks
-                .iter()
-                .map(|d| format!("path={d},image_type=raw"))
-                .collect();
-            cmd.arg("--disk").args(disk_args.drain(..));
+            cmd.arg("--disk").args(s.disks);
             cmd.arg("--serial")
                 .arg(format!("file={}", s.serial_log.display()));
             cmd.arg("--console").arg("off");
@@ -688,6 +753,32 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
+    fn block_path_round_trips_and_rejects_unknown_values() {
+        for path in [BlockPath::KernelNbd, BlockPath::VhostUser] {
+            assert_eq!(BlockPath::parse(path.as_str()).unwrap(), path);
+        }
+        assert!(BlockPath::parse("vhost_user").is_err());
+        // The Phase A path stays the default until the vhost-user path passes a
+        // real-VMM acceptance run (ADR-0015).
+        assert_eq!(BlockPath::default(), BlockPath::KernelNbd);
+    }
+
+    #[test]
+    fn disk_arguments_describe_both_block_paths() {
+        assert_eq!(
+            file_disk_arg("/dev/nbd3"),
+            "path=/dev/nbd3,image_type=raw",
+            "image_type is required for CH v53 raw disks"
+        );
+        assert_eq!(
+            vhost_user_disk_arg(Path::new("/tmp/cats-sock/abc.sock"), 4, 256).unwrap(),
+            "vhost_user=on,socket=/tmp/cats-sock/abc.sock,num_queues=4,queue_size=256"
+        );
+        // A comma would silently split into another CH disk option.
+        assert!(vhost_user_disk_arg(Path::new("/tmp/a,b.sock"), 1, 256).is_err());
+    }
+
+    #[test]
     fn cat_network_is_stable_and_encodes_guest_address_in_mac() {
         let first = network_for("10.240.0.0/16", "cat_60e825c8c6cd").unwrap();
         let second = network_for("10.240.0.0/16", "cat_60e825c8c6cd").unwrap();
@@ -754,6 +845,9 @@ mod tests {
             initramfs: None,
             cmdline: "console=ttyS0".into(),
             seed_image: None,
+            block_path: BlockPath::KernelNbd,
+            vhost_user_queues: 1,
+            vhost_user_queue_size: 256,
             nbd_client_bin: PathBuf::from("nbd-client"),
             nbd_devices: 8,
             network_cidr: None,
