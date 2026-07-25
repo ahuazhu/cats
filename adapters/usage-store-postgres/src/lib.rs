@@ -226,7 +226,7 @@ fn validate_credit_account(
     if billing_account_id.is_empty()
         || project_id.is_empty()
         || currency != "USD"
-        || signup_credit_nanos <= 0
+        || signup_credit_nanos < 0
         || created_at_unix_ms < 0
     {
         return Err(MeteringError::Invalid(
@@ -293,28 +293,30 @@ fn pg_ensure_credit_account(
             "billing account {billing_account_id} identity changed"
         )));
     }
-    let grant_sql = format!(
-        "INSERT INTO {schema}.credit_ledger_entries (
-            entry_id, billing_account_id, kind, amount_nanos, currency,
-            external_reference, effective_at_ms
-         ) VALUES ($1, $2, 'signup_grant', $3::text::numeric, $4, $5, $6)
-         ON CONFLICT (entry_id) DO NOTHING"
-    );
-    let grant_id = format!("signup-grant/{billing_account_id}");
-    let amount = signup_credit_nanos.to_string();
-    transaction
-        .execute(
-            &grant_sql,
-            &[
-                &grant_id,
-                &billing_account_id,
-                &amount,
-                &currency,
-                &grant_id,
-                &created_at_unix_ms,
-            ],
-        )
-        .map_err(|error| pg_error("ensure signup credit", error))?;
+    if signup_credit_nanos > 0 {
+        let grant_sql = format!(
+            "INSERT INTO {schema}.credit_ledger_entries (
+                entry_id, billing_account_id, kind, amount_nanos, currency,
+                external_reference, effective_at_ms
+             ) VALUES ($1, $2, 'signup_grant', $3::text::numeric, $4, $5, $6)
+             ON CONFLICT (entry_id) DO NOTHING"
+        );
+        let grant_id = format!("signup-grant/{billing_account_id}");
+        let amount = signup_credit_nanos.to_string();
+        transaction
+            .execute(
+                &grant_sql,
+                &[
+                    &grant_id,
+                    &billing_account_id,
+                    &amount,
+                    &currency,
+                    &grant_id,
+                    &created_at_unix_ms,
+                ],
+            )
+            .map_err(|error| pg_error("ensure signup credit", error))?;
+    }
     let summary = pg_credit_summary_transaction(&mut transaction, schema, billing_account_id)?;
     transaction
         .commit()
@@ -1403,6 +1405,15 @@ mod tests {
                 Err(MeteringError::Invalid(_))
             ));
         }
+    }
+
+    #[test]
+    fn credit_accounts_can_start_without_signup_credit() {
+        assert!(validate_credit_account("billing/account-a", "account-a", "USD", 0, 0).is_ok());
+        assert!(matches!(
+            validate_credit_account("billing/account-a", "account-a", "USD", -1, 0),
+            Err(MeteringError::Invalid(_))
+        ));
     }
 
     #[test]
