@@ -903,15 +903,6 @@ impl Store {
     /// rows are immutable V1 bindings retained only to aggregate history.
     pub fn billing_ledgers_for_project(&self, project: &str) -> Result<Vec<BillingLedgerRecord>> {
         let scope = self.workspace_scope_for_project(project)?;
-        let mut ledgers = vec![BillingLedgerRecord {
-            billing_account_id: scope.account.billing_account_id.clone(),
-            owner_id: scope.account.id.clone(),
-            signup_credit_nanos: if scope.account.kind == AccountKind::Personal {
-                10_000_000_000
-            } else {
-                0
-            },
-        }];
         let mut historical = self.with(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT billing_account_id, legacy_project
@@ -928,6 +919,23 @@ impl Store {
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
         })?;
+        // An early account-migration shape reused one V1 project ledger as
+        // the Account's canonical ledger. Preserve that immutable ledger's
+        // original owner and do not aggregate it twice.
+        let canonical = historical
+            .iter()
+            .position(|ledger| ledger.billing_account_id == scope.account.billing_account_id)
+            .map(|index| historical.remove(index))
+            .unwrap_or_else(|| BillingLedgerRecord {
+                billing_account_id: scope.account.billing_account_id.clone(),
+                owner_id: scope.account.id.clone(),
+                signup_credit_nanos: if scope.account.kind == AccountKind::Personal {
+                    10_000_000_000
+                } else {
+                    0
+                },
+            });
+        let mut ledgers = vec![canonical];
         ledgers.append(&mut historical);
         Ok(ledgers)
     }
@@ -3651,6 +3659,47 @@ mod tests {
                 .unwrap()
                 .workos_organization_id,
             "org_grouped"
+        );
+    }
+
+    #[test]
+    fn legacy_canonical_billing_alias_keeps_its_original_owner_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("control.db")).unwrap();
+        let mappings = BTreeMap::from([
+            ("default".to_string(), "org_acme".to_string()),
+            ("sibling".to_string(), "org_acme".to_string()),
+        ]);
+        store.reconcile_legacy_projects(&mappings).unwrap();
+        let account_id = store
+            .workspace_for_project("default")
+            .unwrap()
+            .unwrap()
+            .account_id;
+        store
+            .with(|conn| {
+                conn.execute(
+                    "UPDATE accounts SET billing_account_id=?2 WHERE id=?1",
+                    params![account_id, "billing_account/project/default"],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            store.billing_ledgers_for_project("sibling").unwrap(),
+            vec![
+                BillingLedgerRecord {
+                    billing_account_id: "billing_account/project/default".to_string(),
+                    owner_id: "default".to_string(),
+                    signup_credit_nanos: 10_000_000_000,
+                },
+                BillingLedgerRecord {
+                    billing_account_id: "billing_account/project/sibling".to_string(),
+                    owner_id: "sibling".to_string(),
+                    signup_credit_nanos: 10_000_000_000,
+                },
+            ]
         );
     }
 
