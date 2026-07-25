@@ -221,6 +221,10 @@ pub struct CatResourceTelemetry {
     pub host_disk_used_bytes: Option<u64>,
 }
 
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 /// Last telemetry sample reported by a node agent. Host-level values are
 /// optional so development nodes on non-Linux systems can still heartbeat.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -228,6 +232,17 @@ pub struct NodeTelemetry {
     pub observed_cats: u64,
     pub allocated_cpus: u32,
     pub allocated_memory_mib: u64,
+    /// Wakes currently admitted by the node's concurrent-wake gate, and the
+    /// resume commitment they hold (ADR-0002 §8). Operators need these to see
+    /// wake queueing instead of inferring it from latency.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub wake_in_flight: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub wake_commitment_bytes: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub wake_peak_in_flight: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub wake_commitment_budget_bytes: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cat_resources: Vec<CatResourceTelemetry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

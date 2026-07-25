@@ -27,7 +27,7 @@
 <table><thead><tr><th>Area</th><th>Current status</th><th>What it means</th></tr></thead><tbody>
   <tr><td>Block frontend</td><td>Kernel NBD in Cloud Hypervisor Phase A</td><td>Native vhost-user-blk remains a later performance milestone.</td></tr>
   <tr><td>Guest networking</td><td>Tap/overlay not implemented</td><td>Endpoint routing is covered in the FakeVmm development path; do not claim full CH Guest networking yet.</td></tr>
-  <tr><td>Suspended memory reclaim</td><td>CH Phase A currently pauses only</td><td>The designed page-out path is not implemented, so Suspended currently saves vCPU rather than Host memory.</td></tr>
+  <tr><td>Concurrent wakes</td><td>Bounded per node</td><td>Suspended/Warm wakes are admitted against a node budget accounted in resume-commitment bytes; excess wakes queue rather than fail. Defaults match the 2026-07-21 validated point (10 concurrent) and are not a proven optimum.</td></tr>
   <tr><td>Control metadata</td><td>SQLite development store</td><td>The PostgreSQL storage metadata adapter exists, but the project resource store is still SQLite-shaped development state.</td></tr>
   <tr><td>Privilege separation</td><td>Not implemented</td><td>Run development components only in an appropriately isolated environment.</td></tr>
 </tbody></table>

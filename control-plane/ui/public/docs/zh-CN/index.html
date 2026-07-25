@@ -27,7 +27,7 @@
 <table><thead><tr><th>领域</th><th>当前状态</th><th>实际含义</th></tr></thead><tbody>
   <tr><td>块设备前端</td><td>Cloud Hypervisor Phase A 使用内核 NBD</td><td>原生 vhost-user-blk 仍是后续性能里程碑。</td></tr>
   <tr><td>Guest 网络</td><td>tap/overlay 尚未实现</td><td>Endpoint 路由已覆盖 FakeVmm 开发路径，不能宣称 CH Guest 网络已经完整。</td></tr>
-  <tr><td>Suspended 内存回收</td><td>CH Phase A 当前仅 Pause</td><td>设计中的 page-out 路径尚未实现，因此 Suspended 当前节省 vCPU，但不节省 Host 内存。</td></tr>
+  <tr><td>并发唤醒</td><td>按节点预算限流</td><td>Suspended/Warm 唤醒按 resume commitment 字节数计入节点预算，超出的唤醒排队而非失败。默认值取 2026-07-21 实验验证点（10 并发），不是已证明的最优值。</td></tr>
   <tr><td>控制元数据</td><td>SQLite 开发存储</td><td>存储元数据 PostgreSQL adapter 已存在，但 Project 资源存储仍是 SQLite 开发形态。</td></tr>
   <tr><td>权限隔离</td><td>尚未实现</td><td>只能在适当隔离的环境中运行开发组件。</td></tr>
 </tbody></table>

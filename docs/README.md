@@ -10,7 +10,7 @@ HTML 面向人类阅读和视觉演示；同名 Markdown 面向 Agent/实现者�
 | [Guest Runtime API v1](specs/guest-runtime-api.md) | Frozen v1 | `guest/` 的 `/run/cats/runtime.sock` HTTP 工作租约；依据 ADR-0007 |
 | [Interactive Shell Protocol v1](specs/interactive-shell-protocol.md) | Implemented v1 | `cats shell` 的 WorkOS 鉴权 WebSocket、Node/Guest PTY 流；依据 ADR-0009 |
 
-实现状态一览见根 [README](../README.md#实现状态)。真实 microVM（Cloud Hypervisor + KVM）已实现为 node-agent 的 `--vmm ch` 模式（`node-agent/src/ch.rs`），块路径 Phase A 经内核 NBD 复用已验前端，裸金属部署与验收见 [deploy/metal/](../deploy/metal/README.md)。共享 PostgreSQL root/lease 元数据 adapter、每 Cat `/30` tap 和 owning-node HTTP 入站已实现；仍属后续里程碑：原生 vhost-user-blk（性能）、跨 Node Guest overlay、WebSocket 入站、控制面资源库 PostgreSQL/outbox 化、特权拆分。
+实现状态一览见根 [README](../README.md#实现状态)。真实 microVM（Cloud Hypervisor + KVM）已实现为 node-agent 的 `--vmm ch` 模式（`node-agent/src/ch.rs`），块路径 Phase A 经内核 NBD 复用已验前端，裸金属部署与验收见 [deploy/metal/](../deploy/metal/README.md)。共享 PostgreSQL root/lease 元数据 adapter、每 Cat `/30` tap 和 owning-node HTTP 入站已实现；并发唤醒准入与限流已实现（`node-agent/src/admission.rs`，ADR-0002 §8；按 resume commitment 字节数计量的节点预算 + 有界排队，并放开了 `ResumeCat` 的节点内并发）。仍属后续里程碑：原生 vhost-user-blk（性能）、跨 Node Guest overlay、WebSocket 入站、控制面资源库 PostgreSQL/outbox 化、特权拆分、`RestoreCat` 并发化（需先让 `start_cat` 的 NBD/tap 分配并发安全）。
 
 Rust 工程质量现状、已修问题和后续优先项见 [Rust 工程实践审查](rust-engineering-review.md)。
 
@@ -24,7 +24,7 @@ Markdown companion，便于 Agent 检索并满足 HTML/Markdown 同步维护约�
 - [简体中文使用文档](../control-plane/ui/public/docs/zh-CN/index.md)
 
 这些页面描述当前 Rust workspace 已实现的用户能力，并明确标注 native vhost-user-blk、
-tap/overlay、Suspended page-out、控制面资源库 PostgreSQL 化与权限拆分等尚未完成项。跨组件事实仍以 ADR、
+跨 Node tap/overlay、控制面资源库 PostgreSQL 化与权限拆分等尚未完成项。跨组件事实仍以 ADR、
 原始实验数据和本文档索引中的架构 Markdown 为更高优先级来源。
 
 Fleet 管理员指南不属于官网用户文档。其双语源文件位于

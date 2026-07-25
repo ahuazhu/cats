@@ -24,6 +24,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use cats_api::nodejob::{NodeJob, NodeJobAction, NodeJobResult, SuspendWorkFence, VolumeGrant};
+
+use crate::admission::{resume_commitment_bytes, WakeAdmission, WakeBudget, WakeLoad};
 use cats_api::requests::{ProxyHttpRequest, ProxyHttpResponse};
 use cats_api::resources::{NodeTelemetry, ObservedState};
 use cats_guest_agent::DiskMapEntry;
@@ -56,6 +58,10 @@ pub struct NodeConfig {
     /// checkpoints are deliberately not produced.
     pub metering_cgroup_root: Option<PathBuf>,
     pub vmm: VmmMode,
+    /// Ceiling on concurrent Suspended/Warm wakes (ADR-0002 §8). The
+    /// 2026-07-21 concurrency run showed the limit is Guest memory page
+    /// read-back, not the VMM, so the budget is accounted in bytes.
+    pub wake_budget: WakeBudget,
 }
 
 #[derive(Debug, Clone)]
@@ -272,23 +278,40 @@ fn symlink_socket(link: &Path, target: &Path) {
 pub struct NodeRuntime {
     pub cfg: NodeConfig,
     storage_meta: Arc<dyn MetadataStore>,
-    /// Serializes job execution; jobs are rare and idempotent.
+    /// Serializes job execution; jobs are rare and idempotent. Held by every
+    /// action except `ResumeCat`, which allocates no node-global resource and
+    /// instead serializes per Cat so several Cats can wake in parallel.
     ops: Mutex<()>,
+    /// Per-Cat execution locks for the concurrent wake path. Keeps the
+    /// existing "one job per Cat at a time" idempotency guarantee while
+    /// dropping the node-wide serialization.
+    cat_ops: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     cats: Mutex<HashMap<String, CatRuntime>>,
     journal: Mutex<HashMap<String, NodeJobResult>>,
     usage_finalizer: Option<Arc<dyn UsageFinalizer>>,
+    /// Bounds concurrent wakes so a wake storm degrades linearly instead of
+    /// collapsing the way 10× concurrency on EBS did (19.05 s vs 0.53 s).
+    admission: WakeAdmission,
 }
 
 impl NodeRuntime {
     pub fn new(cfg: NodeConfig, storage_meta: Arc<dyn MetadataStore>) -> Self {
+        let cfg_wake_budget = cfg.wake_budget;
         Self {
             cfg,
             storage_meta,
             ops: Mutex::new(()),
             cats: Mutex::new(HashMap::new()),
+            cat_ops: Mutex::new(HashMap::new()),
             journal: Mutex::new(HashMap::new()),
             usage_finalizer: None,
+            admission: WakeAdmission::new(cfg_wake_budget),
         }
+    }
+
+    /// Current wake saturation, for heartbeats and tests.
+    pub fn wake_load(&self) -> WakeLoad {
+        self.admission.load()
     }
 
     pub(crate) fn with_usage_finalizer(mut self, finalizer: Arc<dyn UsageFinalizer>) -> Self {
@@ -330,11 +353,18 @@ impl NodeRuntime {
     /// Allocation telemetry reported with heartbeats. These values come from
     /// the runtime inventory (actual node ownership), not control-plane intent.
     pub fn telemetry(&self) -> NodeTelemetry {
+        // Sample the wake gate before taking `cats`: the two locks are never
+        // held together anywhere, and this keeps it that way.
+        let wake = self.admission.load();
         let cats = self.cats.lock().unwrap();
         NodeTelemetry {
             observed_cats: cats.len() as u64,
             allocated_cpus: cats.values().map(|runtime| runtime.cpus).sum(),
             allocated_memory_mib: cats.values().map(|runtime| runtime.memory_mib).sum(),
+            wake_in_flight: wake.wakes as u64,
+            wake_commitment_bytes: wake.commitment_bytes,
+            wake_peak_in_flight: wake.peak_wakes as u64,
+            wake_commitment_budget_bytes: self.admission.budget().commitment_bytes,
             ..NodeTelemetry::default()
         }
     }
@@ -349,11 +379,44 @@ impl NodeRuntime {
             .collect()
     }
 
+    fn cat_lock(&self, cat_id: &str) -> Arc<Mutex<()>> {
+        Arc::clone(
+            self.cat_ops
+                .lock()
+                .unwrap()
+                .entry(cat_id.to_string())
+                .or_default(),
+        )
+    }
+
     pub fn execute(&self, job: NodeJob) -> NodeJobResult {
         if let Some(prev) = self.journal.lock().unwrap().get(&job.job_id) {
             return prev.clone();
         }
-        let _guard = self.ops.lock().unwrap();
+        // Suspended resume is the one action that allocates no node-global
+        // resource: it resumes a VMM that is already up (no blockd child, no
+        // NBD device, no tap). It therefore runs under a per-Cat lock so that
+        // several Cats wake in parallel, bounded by the wake admission budget
+        // (ADR-0002 §8). The 2026-07-21 run measured ten concurrent restores
+        // at 0.53 s versus 0.380 s for one, so node-wide serialization costs
+        // roughly 7x on a wake storm for no correctness benefit.
+        //
+        // Everything else keeps the node-wide lock. In particular Warm
+        // `RestoreCat` goes through `start_cat`, which allocates node-global
+        // NBD devices and tap slots; making those concurrency-safe is separate
+        // work. Warm is still charged its resume commitment, so the ceiling is
+        // already in place for when that lands.
+        if matches!(job.action, NodeJobAction::ResumeCat { .. }) {
+            let per_cat = self.cat_lock(job.action.cat_id());
+            let _guard = per_cat.lock().unwrap();
+            self.execute_locked(job)
+        } else {
+            let _guard = self.ops.lock().unwrap();
+            self.execute_locked(job)
+        }
+    }
+
+    fn execute_locked(&self, job: NodeJob) -> NodeJobResult {
         // Re-check after acquiring the execution lock.
         if let Some(prev) = self.journal.lock().unwrap().get(&job.job_id) {
             return prev.clone();
@@ -1215,7 +1278,28 @@ impl NodeRuntime {
     }
 
     fn resume_cat(&self, cat_id: &str) -> Result<ObservedState> {
+        // Read the commitment and drop the lock: `acquire` may block on other
+        // wakes, and holding `cats` across that wait would deadlock every
+        // other job on this node.
+        let memory_mib = {
+            let cats = self.cats.lock().unwrap();
+            let rt = cats.get(cat_id).context("cat is not on this node")?;
+            if rt.state == ObservedState::Running {
+                return Ok(ObservedState::Running);
+            }
+            if rt.state != ObservedState::Suspended {
+                bail!("cannot resume from {:?}", rt.state);
+            }
+            rt.memory_mib
+        };
+        // Held until this wake finishes; released on every exit path.
+        let _permit = self
+            .admission
+            .acquire(resume_commitment_bytes(memory_mib))
+            .with_context(|| format!("admit resume of cat {cat_id}"))?;
+
         let mut cats = self.cats.lock().unwrap();
+        // The Cat may have moved while this wake sat in the queue.
         let rt = cats.get_mut(cat_id).context("cat is not on this node")?;
         if rt.state == ObservedState::Running {
             return Ok(ObservedState::Running);
@@ -1349,6 +1433,23 @@ impl NodeRuntime {
                 rt.memory_mib,
             )
         };
+        // Warm reads Guest RAM back out of the snapshot, so it is charged the
+        // same resume commitment as Suspended (ADR-0002 §8). Acquired before
+        // any state is torn down so a queued restore stays restorable.
+        let _permit = self
+            .admission
+            .acquire(resume_commitment_bytes(memory_mib))
+            .with_context(|| format!("admit warm restore of cat {cat_id}"))?;
+        {
+            // Re-validate: the Cat may have moved while queued.
+            let cats = self.cats.lock().unwrap();
+            let rt = cats
+                .get(cat_id)
+                .context("no warm state for cat on this node")?;
+            if rt.state != ObservedState::Warm {
+                bail!("cannot restore from {:?}", rt.state);
+            }
+        }
         let target = self
             .cats
             .lock()

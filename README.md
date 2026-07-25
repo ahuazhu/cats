@@ -47,6 +47,7 @@ Cats 是一个从零实现的独立项目：为用户提供可休眠、可迁移
 - 存储：对象存储保存 durable truth，本地 NVMe 是可删除的稀疏读写 Cache；只提交 dirty logical Chunk，不 dump 整块虚拟盘。后端为 Direct-OS ChunkStore（Direct-S3 实现，ADR-0003）。
 - 磁盘：每个 Cat 有生命周期一致的 RootDisk；可选一块跨 Cat 持久化的 RWO PersistentDisk。
 - Suspended（pause + page-out）：本轮唤醒约 0.21–0.23 秒，VMM 保留。
+- 并发唤醒按 resume commitment 字节数计入节点预算并有界排队（ADR-0002 §8）；默认取实验验证点 10 并发，`ResumeCat` 已可节点内并发。
 - Warm（snapshot + VMM/backend exit）：本地 NVMe 唤醒约 0.38–0.40 秒，进程状态保留且无常驻 VMM。
 - Cold：直接内核、精简 initramfs、提前网络和 Agent，本轮完整新内核/新进程 P50 为 1.755 秒。
 - Direct-S3：语义原型成立，当前串行 Python 实现约 39.87 秒，只用于验证和定位瓶颈。

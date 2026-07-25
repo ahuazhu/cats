@@ -23,7 +23,7 @@ The Rust workspace implements the control plane, CLI, embedded user/admin consol
 |----|----|----|
 | Block frontend | Kernel NBD in Cloud Hypervisor Phase A | Native vhost-user-blk remains a later performance milestone. |
 | Guest networking | Tap/overlay not implemented | Endpoint routing is covered in the FakeVmm development path; do not claim full CH Guest networking yet. |
-| Suspended memory reclaim | CH Phase A currently pauses only | The designed page-out path is not implemented, so Suspended currently saves vCPU rather than Host memory. |
+| Concurrent wakes | Bounded per node | Suspended/Warm wakes are admitted against a node budget accounted in resume-commitment bytes; excess wakes queue rather than fail. Defaults match the 2026-07-21 validated point (10 concurrent) and are not a proven optimum. |
 | Control metadata | SQLite development store | The PostgreSQL storage metadata adapter exists, but the project resource store is still SQLite-shaped development state. |
 | Privilege separation | Not implemented | Run development components only in an appropriately isolated environment. |
 
