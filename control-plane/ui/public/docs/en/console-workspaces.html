@@ -11,12 +11,16 @@
 <p>If WorkOS is not configured, the browser sites fail closed and show an operator-facing explanation. They do not fall back to a token entry form.</p>
 
 <h2 id="cli-sign-in">CLI Device Login</h2>
-<p><code>cats login</code> starts WorkOS Device Authorization, prints a verification URL/code, and opens the browser when possible. Access and rotating refresh tokens stay in the operating-system credential store; the <code>0600</code> CLI config contains only the API URL, public user/Workspace data, and the current selection. Use <code>cats whoami</code>, <code>cats workspace list</code>, <code>cats workspace use SLUG</code>, and <code>cats logout</code> to manage that session.</p>
+<p><code>cats login</code> starts WorkOS Device Authorization, prints a verification URL/code, and opens the browser when possible. Access and rotating refresh tokens stay in the operating-system credential store; the <code>0600</code> CLI config contains only the API URL, public user/Workspace data, and the current selection. Use <code>cats whoami</code>, <code>cats workspace list</code>, <code>cats workspace use ACCOUNT/WORKSPACE</code>, and <code>cats logout</code> to manage that session.</p>
 
 <h2 id="workspaces">Workspaces</h2>
-<p>A WorkOS Organization must be explicitly mapped to one Cats Workspace. An unmapped Organization cannot be enumerated or accessed. A user without an Organization membership receives a deterministic personal Workspace based on the verified WorkOS user ID.</p>
-<div class="callout"><strong>User label versus API compatibility</strong><p>The CLI and console call the boundary a <em>Workspace</em>. The V1 HTTP API path and resource-store column keep the compatible name <code>project</code>; changing that path string cannot change the Workspace established by the verified identity.</p></div>
-<p>Login and selection are separate. <code>cats workspace use acme-dev</code> saves a default and obtains an Organization-scoped access token; <code>--workspace acme-prod</code> overrides one command without changing the default.</p>
+<p>A user belongs to one or more Personal or Organization Accounts, and each Account owns one or more Workspaces plus one billing boundary. Every Account—including Personal—maps to a WorkOS Organization. A new user receives one Personal Account, a <code>default</code> Workspace, and one non-transferable $10 signup grant on that Personal Billing Account. Creating another Workspace or joining an Organization does not issue another grant.</p>
+<p>Workspace slugs are unique inside an Account and may be renamed; immutable Account and Workspace IDs retain authorization and resource ownership. The console uses copyable <code>/user/ACCOUNT/WORKSPACE/</code> URLs. The CLI accepts the same <code>account/workspace</code> locator and permits a bare slug only when it is unambiguous.</p>
+<div class="callout"><strong>User label versus API compatibility</strong><p>The CLI and console call the boundary a <em>Workspace</em>. The V1 HTTP API path and resource-store column keep the compatible name <code>project</code>; each Workspace has a stable legacy Project route so renaming a slug does not move resources or rewrite usage and credit history.</p></div>
+<p>Login and selection are separate. <code>cats workspace use acme/dev</code> saves a default; <code>--workspace acme/prod</code> overrides one command without changing it. Switching Workspaces inside one Account is local. Crossing Accounts rotates the WorkOS refresh token into the target Organization scope; concurrent CLI processes serialize that rotation.</p>
+
+<h2 id="members">Organization members and invitations</h2>
+<p>An Organization member with <code>cats:members:manage</code> can send an email invitation with an initial <code>member</code> or <code>admin</code> role. WorkOS binds the invitation to that Organization and creates or activates the membership when accepted. Cats rechecks the active membership for resource and member-management requests; changing a client-side slug or cached role never grants access. Personal Accounts do not accept invitations.</p>
 
 <h2 id="user-console">User console</h2>
 <p>The console provides:</p>

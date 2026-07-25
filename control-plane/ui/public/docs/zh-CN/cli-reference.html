@@ -12,10 +12,10 @@
 <pre><code>cats login
 cats whoami
 cats workspace list
-cats workspace use SLUG
-cats --workspace SLUG ls
+cats workspace use ACCOUNT/WORKSPACE
+cats --workspace ACCOUNT/WORKSPACE ls
 cats logout</code></pre>
-<p><code>login</code> 使用 WorkOS Device Authorization，并且只把 Access/Refresh 信息保存到操作系统凭据存储。可用 Workspace 是 Active WorkOS Organization Membership 与部署显式映射的交集；个人用户获得隔离的 <code>personal-&lt;user-id&gt;</code> Workspace。<code>logout</code> 会尝试远端撤销，并始终删除本地凭据。</p>
+<p><code>login</code> 使用 WorkOS Device Authorization，并且只把 Access/Refresh 信息保存到操作系统凭据存储。Active WorkOS Organization Membership 会暴露 Personal/Organization Account 及其 Workspace。<code>workspace use</code> 修改已保存默认值，<code>--workspace</code> 只影响一条命令；同 Account 切换为本地操作，跨 Account 则在跨进程凭据锁内轮换 WorkOS Refresh Token。<code>logout</code> 会尝试远端撤销，并始终删除本地凭据。</p>
 
 <h2 id="cat-commands">Cat 命令</h2>
 <pre><code>cats create NAME [--image IMAGE] [--cpus N] [--memory SIZE]

@@ -15,11 +15,11 @@ Global options may appear before or after the subcommand. Use `cats --help` and 
     cats login
     cats whoami
     cats workspace list
-    cats workspace use SLUG
-    cats --workspace SLUG ls
+    cats workspace use ACCOUNT/WORKSPACE
+    cats --workspace ACCOUNT/WORKSPACE ls
     cats logout
 
-`login` uses WorkOS Device Authorization and stores access/refresh material only in the operating-system credential store. Workspace availability is the intersection of active WorkOS Organization memberships and the deployment's explicit mappings; personal users receive an isolated `personal-<user-id>` Workspace. `logout` attempts remote revocation and always removes the local credential.
+`login` uses WorkOS Device Authorization and stores access/refresh material only in the operating-system credential store. Active WorkOS Organization memberships expose Personal and Organization Accounts and their Workspaces. `workspace use` changes the saved default; `--workspace` affects one command only. A same-Account switch is local, while a cross-Account switch rotates the WorkOS refresh token under a cross-process credential lock. `logout` attempts remote revocation and always removes the local credential.
 
 ## Cat commands
 

@@ -1,5 +1,5 @@
 <h2 id="conventions">Conventions</h2>
-<p>The external API is JSON over HTTP. User resources are scoped by the compatible project segment in <code>/v1/projects/{project}/…</code>; its value is the user-visible Workspace slug. A verified WorkOS identity may access only its selected Workspace, and changing the URL cannot change that authorization context.</p>
+<p>The external API is JSON over HTTP. User resources are scoped by the compatible project segment in <code>/v1/projects/{project}/…</code>; its value is a Workspace's stable legacy route. A verified WorkOS identity may access Workspaces owned by its active Account membership, and changing a URL cannot create that membership.</p>
 <pre><code>Authorization: Bearer &lt;short-lived-workos-access-token&gt;
 Accept: application/json
 Content-Type: application/json
@@ -11,8 +11,14 @@ If-Match: "&lt;generation&gt;"                # guarded state changes</code></pr
 <pre><code>GET  /auth/config       # public WorkOS client/base-URL configuration
 GET  /v1/me             # user profile and available Workspaces
 GET  /v1/workspaces     # refresh the available Workspace list
+POST /v1/accounts/{account}/workspaces
+PATCH /v1/workspaces/{workspace}
+GET|POST /v1/accounts/{account}/invitations
+POST /v1/accounts/{account}/invitations/{invitation}/actions/revoke
+GET /v1/accounts/{account}/members
+PATCH|DELETE /v1/accounts/{account}/members/{membership}
 POST /v1/auth/logout    # revoke the CLI WorkOS session</code></pre>
-<p>Workspace enumeration returns active WorkOS Organization memberships that have an explicit deployment mapping, plus an isolated personal Workspace for an organizationless user. User access-token signature, issuer, client ID, expiry, subject, and Organization scope are verified before a resource path is authorized.</p>
+<p>Workspace enumeration returns Personal and Organization Accounts from active WorkOS Organization memberships. Creating or renaming a Workspace requires account-management permission; a rename does not change its immutable ID or legacy Project route. Invitation/member mutations require <code>cats:members:manage</code>, are rejected for Personal Accounts, and are performed through WorkOS. Creating an invitation also requires <code>Idempotency-Key</code>; Cats forwards it to WorkOS so a network retry returns the same invitation. User access-token signature, issuer, client ID, expiry, subject, Organization scope, active membership, Account ID, and Workspace ownership are checked before authorization.</p>
 
 <h2 id="cats">Cats</h2>
 <pre><code>POST   /v1/projects/{project}/cats
@@ -25,6 +31,7 @@ GET    /v1/projects/{project}/cats/{cat}/work
 GET    /v1/projects/{project}/cats/{cat}/auto-suspend
 PUT    /v1/projects/{project}/cats/{cat}/auto-suspend</code></pre>
 <p>Lifecycle verbs are <code>start</code>, <code>stop</code>, <code>suspend</code>, <code>resume</code>, and <code>warm</code>. <code>auto_suspend</code> defaults to <code>true</code> when omitted from create. Cat create/lifecycle/delete returns an asynchronous Operation response; poll the Operation URL instead of repeating a timed-out mutation with a new intent.</p>
+<p>Cat, Disk, and Operation responses include the immutable <code>workspace_id</code>. The <code>project</code> field is the stable V1 compatibility route and is not the ownership authority.</p>
 <pre><code>POST /v1/projects/acme-dev/cats
 Idempotency-Key: request-7f12
 
@@ -64,18 +71,18 @@ GET  /v1/projects/{project}/cats/{cat}/endpoints</code></pre>
     [&amp;bucket_ms=&lt;milliseconds&gt;]
     [&amp;detail=true]</code></pre>
 <p>The response is a <code>provisional</code> estimate for the open period. It includes range totals, totals by meter, totals by Cat, the immutable rate-card ID, and the latest visible interval end. <code>cat_id</code> remains queryable after a Cat is deleted. <code>bucket_ms</code> returns server-side time buckets for charts and bounded period detail; it must be at least 60 seconds and produce no more than 512 buckets. <code>detail=true</code> returns raw ledger intervals and should be reserved for controlled reconciliation queries rather than long browser ranges.</p>
-<p>CPU is rated at <code>$0.07 / CPU-hour</code> and memory at <code>$0.04375 / GiB-hour</code> by the current rate card. Decimal quantities and nanodollar amounts are JSON strings so clients do not lose integer precision. The range total is rated once after aggregation; bucket amounts are display estimates and are not a finalized invoice.</p>
+<p>CPU is rated at <code>$0.07 / CPU-hour</code> and memory at <code>$0.045 / GiB-hour</code> by the current rate card. Decimal quantities and nanodollar amounts are JSON strings so clients do not lose integer precision. The range total is rated once after aggregation; bucket amounts are display estimates and are not a finalized invoice.</p>
 <pre><code>GET  /v1/projects/{project}/billing/balance
 POST /v1/projects/{project}/billing/checkout
 Idempotency-Key: &lt;unique-key&gt;
 {"amount_cents": 1000}</code></pre>
-<p>Each billing account receives one non-renewing <code>$10</code> signup credit. The balance response subtracts all-time provisional usage from append-only grants and top-ups. Checkout accepts only the published fixed top-up amounts and returns a Stripe-hosted URL. Returning from Checkout does not add credit: Cats credits the account only after a signed Stripe webhook reports the session as paid.</p>
+<p>A new user receives one non-renewing <code>$10</code> signup credit on the user's Personal Billing Account. Organization Accounts, extra Workspaces, and invitations do not mint signup credit. The balance response subtracts all-time provisional usage from append-only grants and top-ups. Checkout accepts only the published fixed top-up amounts and returns a Stripe-hosted URL. Returning from Checkout does not add credit: Cats credits the account only after a signed Stripe webhook reports the session as paid.</p>
 <p>When available credit is exhausted, paid compute admission returns HTTP <code>402</code> with code <code>payment_required</code>. Stopping, suspending, and deleting resources remain available.</p>
 
 <h2 id="operations">Operations</h2>
 <pre><code>GET /v1/projects/{project}/operations
 GET /v1/operations/{operation}</code></pre>
-<p>An Operation contains Workspace ownership (stored as project), kind, target resource ID/generation, phase, timestamps, and an optional structured error. Access is still Workspace-scoped even though the single-Operation URL does not contain the project segment.</p>
+<p>An Operation contains immutable <code>workspace_id</code> ownership, the compatible project route, kind, target resource ID/generation, phase, timestamps, and an optional structured error. Access is still Workspace-scoped even though the single-Operation URL does not contain the project segment.</p>
 
 <h2 id="errors">Errors</h2>
 <pre><code>{

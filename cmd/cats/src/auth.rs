@@ -8,7 +8,7 @@ use cats_api::requests::ListResponse;
 use reqwest::blocking::Client as HttpClient;
 use workos::resources::user_management::AuthenticateWithRefreshTokenParams;
 
-use crate::config::{Credentials, StoredConfig, DEFAULT_API_URL};
+use crate::config::{CliStateLock, Credentials, StoredConfig, DEFAULT_API_URL};
 
 pub struct UserSession {
     pub api_url: String,
@@ -85,17 +85,25 @@ pub fn login(provided_api_url: Option<&str>) -> Result<StoredConfig> {
         .workspaces
         .iter()
         .find(|workspace| {
-            workspace.organization_id.as_deref() == credentials.active_organization_id.as_deref()
+            Some(workspace.organization_id.as_str())
+                == credentials.active_organization_id.as_deref()
         })
         .cloned()
         .unwrap_or_else(|| me.workspaces[0].clone());
-    if selected.organization_id != credentials.active_organization_id {
-        credentials = refresh_for_workspace(&runtime, &workos, &credentials, &selected)?;
+    if Some(selected.organization_id.as_str()) != credentials.active_organization_id.as_deref() {
+        credentials = refresh_for_workspace(
+            &runtime,
+            &workos,
+            &credentials,
+            &selected,
+            Some(&me.user.id),
+        )?;
     }
+    let _state_lock = CliStateLock::acquire()?;
     credentials.save(&api_url)?;
     let mut config = StoredConfig::new(api_url, client_id, workos_api_base_url);
     config.user = Some(me.user);
-    config.current_workspace = Some(selected.slug);
+    config.current_workspace = Some(selected.selector().to_string());
     config.workspaces = me.workspaces;
     config.save()?;
     Ok(config)
@@ -105,40 +113,41 @@ pub fn user_session(
     provided_api_url: Option<&str>,
     workspace_override: Option<&str>,
 ) -> Result<UserSession> {
-    let mut config = StoredConfig::load()?.context("not logged in; run `cats login`")?;
+    let _state_lock = CliStateLock::acquire()?;
+    let config = StoredConfig::load()?.context("not logged in; run `cats login`")?;
     let api_url = configured_api_url(provided_api_url)?;
     anyhow::ensure!(
         api_url == config.api_url,
         "not logged in to {api_url}; run `cats login --api-url {api_url}`"
     );
-    let workspace_slug = workspace_override
+    let workspace_selector = workspace_override
         .map(str::to_string)
         .or_else(|| config.current_workspace.clone())
         .context("no workspace selected; run `cats workspace use <name>`")?;
-    let workspace = config
-        .workspaces
-        .iter()
-        .find(|candidate| candidate.slug == workspace_slug)
-        .cloned()
-        .with_context(|| {
-            format!("unknown workspace {workspace_slug}; run `cats workspace list` to refresh")
+    let workspace =
+        resolve_workspace(&config.workspaces, &workspace_selector).with_context(|| {
+            format!("unknown workspace {workspace_selector}; run `cats workspace list` to refresh")
         })?;
     let mut credentials =
         Credentials::load(&api_url)?.context("login credentials are missing; run `cats login`")?;
-    if credentials.active_organization_id != workspace.organization_id
+    if credentials.active_organization_id.as_deref() != Some(workspace.organization_id.as_str())
         || token_expires_soon(&credentials.access_token)
     {
         let workos = public_client(&config)?;
         let runtime = tokio::runtime::Runtime::new()?;
-        credentials = refresh_for_workspace(&runtime, &workos, &credentials, &workspace)?;
+        credentials = refresh_for_workspace(
+            &runtime,
+            &workos,
+            &credentials,
+            &workspace,
+            config.user.as_ref().map(|user| user.id.as_str()),
+        )?;
         credentials.save(&api_url)?;
     }
-    config.current_workspace = Some(workspace_slug.clone());
-    config.save()?;
     Ok(UserSession {
         api_url,
         access_token: credentials.access_token,
-        workspace: workspace_slug,
+        workspace: workspace.project().to_string(),
         config,
     })
 }
@@ -150,47 +159,98 @@ pub fn sync_workspaces(session: &mut UserSession) -> Result<Vec<Workspace>> {
         &format!("{}/v1/workspaces", session.api_url),
         Some(&session.access_token),
     )?;
-    session.config.workspaces = response.items.clone();
-    if !session
-        .config
-        .workspaces
-        .iter()
-        .any(|workspace| Some(&workspace.slug) == session.config.current_workspace.as_ref())
-    {
-        session.config.current_workspace = session
-            .config
+    let _state_lock = CliStateLock::acquire()?;
+    let mut config =
+        StoredConfig::load()?.context("login configuration disappeared; run `cats login`")?;
+    anyhow::ensure!(
+        config.api_url == session.api_url,
+        "login configuration changed while workspaces were refreshing"
+    );
+    config.workspaces = response.items.clone();
+    let current_is_available = config
+        .current_workspace
+        .as_deref()
+        .and_then(|selector| resolve_workspace(&config.workspaces, selector))
+        .is_some();
+    if !current_is_available {
+        config.current_workspace = config
             .workspaces
             .first()
-            .map(|workspace| workspace.slug.clone());
+            .map(|workspace| workspace.selector().to_string());
     }
-    session.config.save()?;
+    config.save()?;
+    session.config = config;
     Ok(response.items)
 }
 
-pub fn switch_workspace(provided_api_url: Option<&str>, slug: &str) -> Result<Workspace> {
+pub fn switch_workspace(provided_api_url: Option<&str>, selector: &str) -> Result<Workspace> {
     let mut session = user_session(provided_api_url, None)?;
-    let workspaces = sync_workspaces(&mut session)?;
-    let workspace = workspaces
-        .into_iter()
-        .find(|workspace| workspace.slug == slug)
-        .with_context(|| format!("workspace {slug} is not available to this user"))?;
+    sync_workspaces(&mut session)?;
+    let _state_lock = CliStateLock::acquire()?;
+    let mut config =
+        StoredConfig::load()?.context("login configuration disappeared; run `cats login`")?;
+    anyhow::ensure!(
+        config.api_url == session.api_url,
+        "login configuration changed while selecting a workspace"
+    );
+    let workspace = resolve_workspace(&config.workspaces, selector)
+        .with_context(|| format!("workspace {selector} is not available to this user"))?;
     let current_credentials = Credentials::load(&session.api_url)?
         .context("login credentials are missing; run `cats login`")?;
-    let runtime = tokio::runtime::Runtime::new()?;
-    let workos = public_client(&session.config)?;
-    let credentials = refresh_for_workspace(&runtime, &workos, &current_credentials, &workspace)?;
-    credentials.save(&session.api_url)?;
-    session.config.current_workspace = Some(workspace.slug.clone());
-    session.config.save()?;
+    if current_credentials.active_organization_id.as_deref()
+        != Some(workspace.organization_id.as_str())
+        || token_expires_soon(&current_credentials.access_token)
+    {
+        let runtime = tokio::runtime::Runtime::new()?;
+        let workos = public_client(&config)?;
+        let credentials = refresh_for_workspace(
+            &runtime,
+            &workos,
+            &current_credentials,
+            &workspace,
+            config.user.as_ref().map(|user| user.id.as_str()),
+        )?;
+        credentials.save(&session.api_url)?;
+    }
+    config.current_workspace = Some(workspace.selector().to_string());
+    config.save()?;
     Ok(workspace)
 }
 
+fn resolve_workspace(workspaces: &[Workspace], selector: &str) -> Option<Workspace> {
+    if let Some(workspace) = workspaces
+        .iter()
+        .find(|workspace| workspace.selector() == selector)
+    {
+        return Some(workspace.clone());
+    }
+    if let Some(workspace) = workspaces
+        .iter()
+        .find(|workspace| workspace.project() == selector)
+    {
+        return Some(workspace.clone());
+    }
+    let mut matches = workspaces
+        .iter()
+        .filter(|workspace| workspace.slug == selector);
+    let workspace = matches.next()?.clone();
+    matches.next().is_none().then_some(workspace)
+}
+
 pub fn logout(provided_api_url: Option<&str>) -> Result<()> {
-    let Some(mut config) = StoredConfig::load()? else {
+    let Some(config) = StoredConfig::load()? else {
         return Ok(());
     };
     let api_url = configured_api_url(provided_api_url)?;
     if api_url == config.api_url {
+        let _state_lock = CliStateLock::acquire()?;
+        let Some(mut config) = StoredConfig::load()? else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            config.api_url == api_url,
+            "login configuration changed while logout was starting"
+        );
         if let Some(mut credentials) = Credentials::load(&api_url)? {
             if token_expires_soon(&credentials.access_token) {
                 if let (Ok(runtime), Ok(workos)) =
@@ -199,11 +259,15 @@ pub fn logout(provided_api_url: Option<&str>) -> Result<()> {
                     if let Some(workspace) = config
                         .current_workspace
                         .as_deref()
-                        .and_then(|slug| config.workspaces.iter().find(|item| item.slug == slug))
+                        .and_then(|selector| resolve_workspace(&config.workspaces, selector))
                     {
-                        if let Ok(refreshed) =
-                            refresh_for_workspace(&runtime, &workos, &credentials, workspace)
-                        {
+                        if let Ok(refreshed) = refresh_for_workspace(
+                            &runtime,
+                            &workos,
+                            &credentials,
+                            &workspace,
+                            config.user.as_ref().map(|user| user.id.as_str()),
+                        ) {
                             credentials = refreshed;
                         }
                     }
@@ -238,9 +302,10 @@ fn refresh_for_workspace(
     workos: &workos::Client,
     credentials: &Credentials,
     workspace: &Workspace,
+    expected_user_id: Option<&str>,
 ) -> Result<Credentials> {
     let mut params = AuthenticateWithRefreshTokenParams::new(credentials.refresh_token.clone());
-    params.organization_id = workspace.organization_id.clone();
+    params.organization_id = Some(workspace.organization_id.clone());
     let refreshed = runtime
         .block_on(
             workos
@@ -248,8 +313,11 @@ fn refresh_for_workspace(
                 .authenticate_with_refresh_token(params),
         )
         .map_err(|error| anyhow::anyhow!("refresh WorkOS session: {error}"))?;
-    if refreshed.organization_id != workspace.organization_id {
+    if refreshed.organization_id.as_deref() != Some(workspace.organization_id.as_str()) {
         bail!("WorkOS did not authorize workspace {}", workspace.slug);
+    }
+    if expected_user_id.is_some_and(|expected| refreshed.user.id != expected) {
+        bail!("WorkOS refreshed a different user identity");
     }
     Ok(Credentials {
         access_token: refreshed.access_token.into_inner(),
@@ -338,5 +406,62 @@ mod tests {
             .encode(serde_json::to_vec(&serde_json::json!({ "exp": u64::MAX - 1 })).unwrap());
         assert!(!token_expires_soon(&format!("header.{future}.signature")));
         assert!(token_expires_soon("not-a-jwt"));
+    }
+
+    #[test]
+    fn workspace_resolution_prefers_account_qualified_selectors() {
+        let workspaces = vec![
+            serde_json::from_value::<Workspace>(serde_json::json!({
+                "id": "ws_acme_default",
+                "account_id": "acct_acme",
+                "account_slug": "acme",
+                "account_display_name": "Acme",
+                "slug": "default",
+                "locator": "acme",
+                "legacy_project": "acme",
+                "display_name": "Default",
+                "kind": "organization",
+                "organization_id": "org_acme",
+                "is_default": true
+            }))
+            .unwrap(),
+            serde_json::from_value::<Workspace>(serde_json::json!({
+                "id": "ws_acme_dev",
+                "account_id": "acct_acme",
+                "account_slug": "acme",
+                "account_display_name": "Acme",
+                "slug": "dev",
+                "locator": "acme/dev",
+                "legacy_project": "acme-dev",
+                "display_name": "Development",
+                "kind": "organization",
+                "organization_id": "org_acme",
+                "is_default": false
+            }))
+            .unwrap(),
+            serde_json::from_value::<Workspace>(serde_json::json!({
+                "id": "ws_other_dev",
+                "account_id": "acct_other",
+                "account_slug": "other",
+                "account_display_name": "Other",
+                "slug": "dev",
+                "locator": "other/dev",
+                "legacy_project": "other-dev",
+                "display_name": "Development",
+                "kind": "organization",
+                "organization_id": "org_other",
+                "is_default": false
+            }))
+            .unwrap(),
+        ];
+        assert_eq!(
+            resolve_workspace(&workspaces, "acme/dev").unwrap().id,
+            "ws_acme_dev"
+        );
+        assert_eq!(
+            resolve_workspace(&workspaces, "acme-dev").unwrap().id,
+            "ws_acme_dev"
+        );
+        assert!(resolve_workspace(&workspaces, "dev").is_none());
     }
 }

@@ -1,7 +1,7 @@
 //! Control-plane contract tests with a stub node agent: reconcile loop,
 //! operations, idempotency, RWO enforcement, node-loss fencing/rescheduling.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,7 +24,9 @@ use cats_control_plane::controller::AutoTierPolicy;
 use cats_control_plane::server::{spawn, Config, Handle};
 use cats_control_plane::store::Store;
 use cats_metadata_store_sqlite::SqliteMetadataStore;
-use cats_metering::{deterministic_event_id, SqliteUsageStore};
+use cats_metering::{
+    deterministic_event_id, AttributedCheckpoint, IngestOutcome, SqliteUsageStore, UsageAttribution,
+};
 use cats_storage::MetadataStore;
 
 const SERVICE_TOKEN: &str = "dev-service-token";
@@ -902,6 +904,13 @@ async fn control_plane_startup_grace_preserves_a_reconnecting_host_bound_cat() {
     {
         let store = Store::open(&db_path).unwrap();
         store
+            .reconcile_legacy_projects(&BTreeMap::from([(
+                "default".to_string(),
+                "org_default".to_string(),
+            )]))
+            .unwrap();
+        let workspace = store.workspace_for_project("default").unwrap().unwrap();
+        store
             .register_node(
                 "node_a",
                 "http://127.0.0.1:1",
@@ -912,7 +921,7 @@ async fn control_plane_startup_grace_preserves_a_reconnecting_host_bound_cat() {
             .unwrap();
         let (cat, _, _) = store
             .create_cat(
-                "default",
+                &workspace,
                 "restart-safe",
                 "test",
                 1,
@@ -1157,6 +1166,13 @@ async fn static_user_tokens_are_not_accepted() {
         auto_tier_policy: Default::default(),
     };
     let cp = spawn(cfg).await.unwrap();
+    cp.state
+        .store
+        .reconcile_legacy_projects(&BTreeMap::from([(
+            "alpha".to_string(),
+            "local-development".to_string(),
+        )]))
+        .unwrap();
     let http = reqwest::Client::new();
 
     let old_project_token = http
@@ -1223,6 +1239,24 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_project_cat_and_metric(
         node_id: "node_a".to_string(),
         checkpoints,
     };
+    assert_eq!(
+        ctx.cp
+            .state
+            .usage
+            .ingest(&AttributedCheckpoint {
+                attribution: UsageAttribution {
+                    billing_account_id: "billing_account/project/default".to_string(),
+                    project_id: "default".to_string(),
+                    resource_type: "cat".to_string(),
+                    resource_id: cat.id.clone(),
+                    attributed_cat_id: Some(cat.id.clone()),
+                },
+                checkpoint: request.checkpoints[0].clone(),
+            })
+            .await
+            .unwrap(),
+        IngestOutcome::Accepted
+    );
     let first: IngestUsageCheckpointsResponse = ctx
         .http
         .post(ctx.url("/v1/internal/usage/checkpoints"))
@@ -1236,8 +1270,8 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_project_cat_and_metric(
         .json()
         .await
         .unwrap();
-    assert_eq!(first.accepted, 4);
-    assert_eq!(first.duplicates, 0);
+    assert_eq!(first.accepted, 3);
+    assert_eq!(first.duplicates, 1);
 
     let replay: IngestUsageCheckpointsResponse = ctx
         .http
@@ -1275,7 +1309,7 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_project_cat_and_metric(
     );
     let report: UsageReport = report_response.json().await.unwrap();
     assert_eq!(report.status, "provisional");
-    assert_eq!(report.amount_nanos, "113750000");
+    assert_eq!(report.amount_nanos, "115000000");
     assert_eq!(report.items.len(), 2);
     assert_eq!(report.cats.len(), 1);
     assert_eq!(report.cats[0].cat_id, cat.id);
@@ -1295,8 +1329,8 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_project_cat_and_metric(
         .await
         .unwrap();
     assert_eq!(balance.credit_nanos, "10000000000");
-    assert_eq!(balance.provisional_usage_nanos, "113750000");
-    assert_eq!(balance.available_credit_nanos, "9886250000");
+    assert_eq!(balance.provisional_usage_nanos, "115000000");
+    assert_eq!(balance.available_credit_nanos, "9885000000");
     assert_eq!(balance.signup_credit_nanos, "10000000000");
     assert!(!balance.stripe_enabled);
 
@@ -1318,8 +1352,8 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_project_cat_and_metric(
     assert_eq!(bucketed.time_buckets.len(), 2);
     assert_eq!(bucketed.time_buckets[0].interval_start_unix_ms, 1_000);
     assert_eq!(bucketed.time_buckets[1].interval_end_unix_ms, hour_end);
-    assert_eq!(bucketed.time_buckets[0].amount_nanos, "56875000");
-    assert_eq!(bucketed.time_buckets[1].amount_nanos, "56875000");
+    assert_eq!(bucketed.time_buckets[0].amount_nanos, "57500000");
+    assert_eq!(bucketed.time_buckets[1].amount_nanos, "57500000");
     assert_eq!(
         bucketed
             .time_buckets

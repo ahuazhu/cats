@@ -244,13 +244,13 @@ pub struct RateCard {
 }
 
 impl RateCard {
-    /// Accepted compute price: $0.07/CPU-hour and $0.04375/GiB-hour.
+    /// Accepted compute price: $0.07/CPU-hour and $0.045/GiB-hour.
     ///
     /// "GiB" is explicit in the denominator even if product copy abbreviates
     /// it to GB; changing the byte convention requires a new rate-card id.
     pub fn sprites_compute_v1() -> Self {
         Self {
-            id: "cats-sprites-compute-2026-07-24".to_string(),
+            id: "cats-compute-2026-07-25".to_string(),
             currency: "USD".to_string(),
             rates: vec![
                 MeterRate {
@@ -260,7 +260,7 @@ impl RateCard {
                 },
                 MeterRate {
                     metric: UsageMetric::MemoryByteMillis,
-                    numerator_nanos: 43_750_000,
+                    numerator_nanos: 45_000_000,
                     denominator_quantity: GIB * MILLIS_PER_HOUR,
                 },
             ],
@@ -680,20 +680,22 @@ impl CreditStore for SqliteUsageStore {
                     "billing account {billing_account_id} identity changed"
                 )));
             }
-            transaction.execute(
-                "INSERT OR IGNORE INTO credit_ledger_entries (
-                    entry_id, billing_account_id, kind, amount_nanos, currency,
-                    external_reference, effective_at_ms
-                 ) VALUES (?1, ?2, 'signup_grant', ?3, ?4, ?5, ?6)",
-                params![
-                    format!("signup-grant/{billing_account_id}"),
-                    billing_account_id,
-                    signup_credit_nanos.to_string(),
-                    currency,
-                    format!("signup-grant/{billing_account_id}"),
-                    created_at_unix_ms,
-                ],
-            )?;
+            if signup_credit_nanos > 0 {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO credit_ledger_entries (
+                        entry_id, billing_account_id, kind, amount_nanos, currency,
+                        external_reference, effective_at_ms
+                     ) VALUES (?1, ?2, 'signup_grant', ?3, ?4, ?5, ?6)",
+                    params![
+                        format!("signup-grant/{billing_account_id}"),
+                        billing_account_id,
+                        signup_credit_nanos.to_string(),
+                        currency,
+                        format!("signup-grant/{billing_account_id}"),
+                        created_at_unix_ms,
+                    ],
+                )?;
+            }
             let summary = sqlite_credit_summary(&transaction, billing_account_id)?;
             transaction.commit()?;
             Ok(summary)
@@ -970,9 +972,9 @@ fn validate_credit_account(
             "only USD credit accounts are supported".to_string(),
         ));
     }
-    if signup_credit_nanos <= 0 || created_at_unix_ms < 0 {
+    if signup_credit_nanos < 0 || created_at_unix_ms < 0 {
         return Err(MeteringError::Invalid(
-            "signup credit must be positive and timestamp must be non-negative".to_string(),
+            "signup credit and timestamp must be non-negative".to_string(),
         ));
     }
     Ok(())
@@ -1929,6 +1931,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn organization_billing_account_can_start_without_signup_credit() {
+        let ledger = ledger();
+        let summary = CreditStore::ensure_account(
+            &ledger,
+            "billing/account-org",
+            "org-default",
+            "USD",
+            0,
+            1_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.credit_nanos, 0);
+        assert_eq!(
+            CreditStore::summary(&ledger, "billing/account-org")
+                .await
+                .unwrap()
+                .credit_nanos,
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn sqlite_credit_ledger_rejects_update_and_delete() {
         let ledger = ledger();
         CreditStore::ensure_account(
@@ -1961,7 +1986,7 @@ mod tests {
         assert_eq!(
             card.rate_quantity(UsageMetric::MemoryByteMillis, GIB * MILLIS_PER_HOUR)
                 .unwrap(),
-            Some(43_750_000)
+            Some(45_000_000)
         );
         assert_eq!(
             card.rate_quantity(UsageMetric::NetworkEgressBytes, 1)

@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, Query, State};
-use axum::routing::{get, post};
+use axum::http::HeaderMap;
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -29,6 +30,10 @@ const TEST_RSA_MODULUS: &str = "yRE6rHuNR0QbHO3H3Kt2pOKGVhQqGZXInOduQNxXzuKlvQTL
 struct WorkOsStub {
     exchanges: Arc<AtomicUsize>,
     revoked_sessions: Arc<Mutex<Vec<String>>>,
+    personal_organizations: Arc<Mutex<HashMap<String, String>>>,
+    personal_memberships: Arc<Mutex<HashMap<String, String>>>,
+    invitations: Arc<Mutex<Vec<Value>>>,
+    invitation_requests: Arc<Mutex<HashMap<String, Value>>>,
 }
 
 async fn authenticate(State(stub): State<WorkOsStub>, Json(body): Json<Value>) -> Json<Value> {
@@ -36,14 +41,16 @@ async fn authenticate(State(stub): State<WorkOsStub>, Json(body): Json<Value>) -
     assert_eq!(body["client_id"], "client_test");
     assert_eq!(body["client_secret"], "sk_test_secret");
     let is_refresh = body["grant_type"] == "refresh_token";
-    let code = if is_refresh {
+    let (code, session_code) = if is_refresh {
         let refresh_token = body["refresh_token"]
             .as_str()
             .filter(|value| !value.is_empty())
             .expect("refresh token");
         match refresh_token {
-            "refresh_admin-user-code" => "admin-user-refreshed",
-            "refresh_expired" => "refreshed",
+            "refresh_admin-user-code" => ("admin-user-refreshed", "admin-user-code"),
+            "refresh_new-user-code" => ("new-user-refreshed", "new-user-code"),
+            "refresh_expired" => ("refreshed", "expired"),
+            "refresh_user-code" | "refresh_user-refreshed" => ("user-refreshed", "user-code"),
             _ => panic!("unexpected refresh token"),
         }
     } else {
@@ -51,7 +58,8 @@ async fn authenticate(State(stub): State<WorkOsStub>, Json(body): Json<Value>) -
         assert!(body["code_verifier"]
             .as_str()
             .is_some_and(|value| !value.is_empty()));
-        body["code"].as_str().unwrap()
+        let code = body["code"].as_str().unwrap();
+        (code, code)
     };
     let (organization_id, permissions, email, user_id) = match code {
         "user-code" => (
@@ -61,6 +69,12 @@ async fn authenticate(State(stub): State<WorkOsStub>, Json(body): Json<Value>) -
             "user_user-code",
         ),
         "new-user-code" => (None, vec![], "new-user@example.com", "user_new-user-code"),
+        "new-user-scoped-code" => (
+            Some("org_personal_new-user-code"),
+            vec![],
+            "new-user@example.com",
+            "user_new-user-code",
+        ),
         "admin-code" => (
             Some("org_admin"),
             vec!["cats:fleet:admin"],
@@ -79,6 +93,18 @@ async fn authenticate(State(stub): State<WorkOsStub>, Json(body): Json<Value>) -
             "admin-user@example.com",
             "user_admin-user-code",
         ),
+        "new-user-refreshed" => (
+            body["organization_id"].as_str(),
+            vec![],
+            "new-user@example.com",
+            "user_new-user-code",
+        ),
+        "user-refreshed" => (
+            body["organization_id"].as_str(),
+            vec!["cats:project:write"],
+            "user@example.com",
+            "user_user-code",
+        ),
         "refreshed" => (
             body["organization_id"].as_str().or(Some("org_project")),
             vec!["cats:project:write"],
@@ -88,7 +114,7 @@ async fn authenticate(State(stub): State<WorkOsStub>, Json(body): Json<Value>) -
         _ => panic!("unexpected authorization code or grant"),
     };
     let claims = json!({
-        "sid": format!("session_{code}"),
+        "sid": format!("session_{session_code}"),
         "org_id": organization_id.unwrap_or_default(),
         "role": if code == "admin-code" { "admin" } else { "member" },
         "permissions": permissions,
@@ -149,7 +175,10 @@ fn test_user(id: &str) -> Value {
     })
 }
 
-async fn list_memberships(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
+async fn list_memberships(
+    State(stub): State<WorkOsStub>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
     let membership =
         |id: &str, user_id: &str, organization_id: &str, organization_name: &str, role: &str| {
             json!({
@@ -171,7 +200,7 @@ async fn list_memberships(Query(query): Query<HashMap<String, String>>) -> Json<
         .get("user_id")
         .map(String::as_str)
         .unwrap_or("user_cli");
-    let data = if user_id == "user_admin-user-code" {
+    let mut data = if user_id == "user_admin-user-code" {
         vec![membership(
             "om_admin_user",
             user_id,
@@ -192,10 +221,216 @@ async fn list_memberships(Query(query): Query<HashMap<String, String>>) -> Json<
             membership("om_3", user_id, "org_unmapped", "Unmapped", "member"),
         ]
     };
+    if let Some(organization_id) = stub
+        .personal_memberships
+        .lock()
+        .unwrap()
+        .get(user_id)
+        .cloned()
+    {
+        data.push(membership(
+            "om_personal",
+            user_id,
+            &organization_id,
+            "Personal Account",
+            "admin",
+        ));
+    }
+    if let Some(expected_organization_id) = query.get("organization_id") {
+        data.retain(|item| item["organization_id"] == *expected_organization_id);
+    }
+    if !query.contains_key("user_id")
+        && query.get("organization_id").map(String::as_str) == Some("org_project")
+    {
+        data.push(membership(
+            "om_target",
+            "user_target",
+            "org_project",
+            "Default Workspace",
+            "member",
+        ));
+    }
     Json(json!({
         "object": "list",
         "data": data,
         "list_metadata": { "before": null, "after": null }
+    }))
+}
+
+fn test_invitation(id: &str, email: &str, organization_id: &str, state: &str) -> Value {
+    json!({
+        "object": "invitation",
+        "id": id,
+        "email": email,
+        "state": state,
+        "accepted_at": null,
+        "revoked_at": if state == "revoked" { Some("2026-07-25T00:01:00.000Z") } else { None },
+        "expires_at": "2026-08-01T00:00:00.000Z",
+        "organization_id": organization_id,
+        "inviter_user_id": "user_cli",
+        "accepted_user_id": null,
+        "role_slug": "member",
+        "created_at": "2026-07-25T00:00:00.000Z",
+        "updated_at": "2026-07-25T00:00:00.000Z",
+        "token": "invite-token",
+        "accept_invitation_url": "https://example.com/invite"
+    })
+}
+
+async fn send_invitation(
+    State(stub): State<WorkOsStub>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .expect("WorkOS invitation request must carry Idempotency-Key");
+    if let Some(invitation) = stub
+        .invitation_requests
+        .lock()
+        .unwrap()
+        .get(idempotency_key)
+        .cloned()
+    {
+        return Json(invitation);
+    }
+    let invitation = test_invitation(
+        "invite_test",
+        body["email"].as_str().unwrap(),
+        body["organization_id"].as_str().unwrap(),
+        "pending",
+    );
+    let mut invitation = invitation;
+    invitation["inviter_user_id"] = body["inviter_user_id"].clone();
+    invitation["role_slug"] = body["role_slug"].clone();
+    stub.invitations.lock().unwrap().push(invitation.clone());
+    stub.invitation_requests
+        .lock()
+        .unwrap()
+        .insert(idempotency_key.to_string(), invitation.clone());
+    Json(invitation)
+}
+
+async fn list_invitations(
+    State(stub): State<WorkOsStub>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let mut data = stub.invitations.lock().unwrap().clone();
+    if let Some(organization_id) = query.get("organization_id") {
+        data.retain(|item| item["organization_id"] == *organization_id);
+    }
+    Json(json!({
+        "object": "list",
+        "data": data,
+        "list_metadata": {"before": null, "after": null}
+    }))
+}
+
+async fn revoke_invitation(State(stub): State<WorkOsStub>, Path(id): Path<String>) -> Json<Value> {
+    let mut invitations = stub.invitations.lock().unwrap();
+    let invitation = invitations
+        .iter_mut()
+        .find(|invitation| invitation["id"] == id)
+        .unwrap();
+    invitation["state"] = json!("revoked");
+    invitation["revoked_at"] = json!("2026-07-25T00:01:00.000Z");
+    Json(invitation.clone())
+}
+
+async fn get_membership(Path(id): Path<String>) -> Json<Value> {
+    let user_id = if id == "om_target" {
+        "user_target"
+    } else {
+        "user_cli"
+    };
+    Json(json!({
+        "object": "organization_membership",
+        "id": id,
+        "user_id": user_id,
+        "organization_id": "org_project",
+        "status": "active",
+        "directory_managed": false,
+        "organization_name": "Default Workspace",
+        "created_at": "2026-07-25T00:00:00.000Z",
+        "updated_at": "2026-07-25T00:00:00.000Z",
+        "role": {"slug": "member"},
+        "roles": [{"slug": "member"}],
+        "user": test_user(user_id)
+    }))
+}
+
+async fn update_membership(Path(id): Path<String>, Json(body): Json<Value>) -> Json<Value> {
+    let mut membership = get_membership(Path(id)).await.0;
+    membership["role"] = json!({"slug": body["role_slug"]});
+    membership["roles"] = json!([{"slug": body["role_slug"]}]);
+    Json(membership)
+}
+
+async fn deactivate_membership(Path(id): Path<String>) -> Json<Value> {
+    let mut membership = get_membership(Path(id)).await.0;
+    membership["status"] = json!("inactive");
+    Json(membership)
+}
+
+fn test_organization(id: &str, external_id: &str) -> Value {
+    json!({
+        "object": "organization",
+        "id": id,
+        "name": "Personal Account",
+        "domains": [],
+        "metadata": {"cats_account_kind": "personal"},
+        "external_id": external_id,
+        "created_at": "2026-07-25T00:00:00.000Z",
+        "updated_at": "2026-07-25T00:00:00.000Z"
+    })
+}
+
+async fn get_organization_by_external_id(
+    State(stub): State<WorkOsStub>,
+    Path(external_id): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let user_id = external_id
+        .strip_prefix("cats-personal:")
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let organizations = stub.personal_organizations.lock().unwrap();
+    let organization_id = organizations.get(user_id).ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(test_organization(organization_id, &external_id)))
+}
+
+async fn create_organization(
+    State(stub): State<WorkOsStub>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let external_id = body["external_id"].as_str().unwrap();
+    let user_id = external_id.strip_prefix("cats-personal:").unwrap();
+    let organization_id = format!("org_personal_{}", user_id.trim_start_matches("user_"));
+    stub.personal_organizations
+        .lock()
+        .unwrap()
+        .insert(user_id.to_string(), organization_id.clone());
+    Json(test_organization(&organization_id, external_id))
+}
+
+async fn create_membership(State(stub): State<WorkOsStub>, Json(body): Json<Value>) -> Json<Value> {
+    let user_id = body["user_id"].as_str().unwrap();
+    let organization_id = body["organization_id"].as_str().unwrap();
+    stub.personal_memberships
+        .lock()
+        .unwrap()
+        .insert(user_id.to_string(), organization_id.to_string());
+    Json(json!({
+        "object": "organization_membership",
+        "id": "om_personal",
+        "user_id": user_id,
+        "organization_id": organization_id,
+        "status": "active",
+        "directory_managed": false,
+        "created_at": "2026-07-25T00:00:00.000Z",
+        "updated_at": "2026-07-25T00:00:00.000Z",
+        "role": {"slug": "admin"},
+        "roles": [{"slug": "admin"}],
+        "user": test_user(user_id)
     }))
 }
 
@@ -217,9 +452,17 @@ impl Ctx {
     async fn new() -> Self {
         let exchanges = Arc::new(AtomicUsize::new(0));
         let revoked_sessions = Arc::new(Mutex::new(Vec::new()));
+        let personal_organizations = Arc::new(Mutex::new(HashMap::new()));
+        let personal_memberships = Arc::new(Mutex::new(HashMap::new()));
+        let invitations = Arc::new(Mutex::new(Vec::new()));
+        let invitation_requests = Arc::new(Mutex::new(HashMap::new()));
         let stub = WorkOsStub {
             exchanges: exchanges.clone(),
             revoked_sessions: revoked_sessions.clone(),
+            personal_organizations,
+            personal_memberships,
+            invitations,
+            invitation_requests,
         };
         let app = Router::new()
             .route("/user_management/authenticate", post(authenticate))
@@ -227,7 +470,28 @@ impl Ctx {
             .route("/sso/jwks/client_test", get(jwks))
             .route(
                 "/user_management/organization_memberships",
-                get(list_memberships),
+                get(list_memberships).post(create_membership),
+            )
+            .route(
+                "/user_management/organization_memberships/{id}",
+                get(get_membership).put(update_membership),
+            )
+            .route(
+                "/user_management/organization_memberships/{id}/deactivate",
+                put(deactivate_membership),
+            )
+            .route(
+                "/user_management/invitations",
+                get(list_invitations).post(send_invitation),
+            )
+            .route(
+                "/user_management/invitations/{id}/revoke",
+                post(revoke_invitation),
+            )
+            .route("/organizations", post(create_organization))
+            .route(
+                "/organizations/external_id/{external_id}",
+                get(get_organization_by_external_id),
             )
             .route("/user_management/users/{id}", get(get_user))
             .with_state(stub);
@@ -247,6 +511,7 @@ impl Ctx {
             cookie_password: COOKIE_PASSWORD.into(),
             project_organizations: BTreeMap::from([
                 ("default".into(), "org_project".into()),
+                ("sibling".into(), "org_project".into()),
                 ("second".into(), "org_second".into()),
             ]),
             admin_organization_id: "org_admin".into(),
@@ -342,7 +607,11 @@ impl Ctx {
             .send()
             .await
             .unwrap();
-        assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+        if callback.status() != StatusCode::SEE_OTHER {
+            let status = callback.status();
+            let body = callback.text().await.unwrap();
+            panic!("callback returned {status}: {body}");
+        }
         assert_eq!(
             callback.headers().get(LOCATION).unwrap().to_str().unwrap(),
             format!("/{site}/")
@@ -351,10 +620,23 @@ impl Ctx {
     }
 
     fn cli_token(&self, organization_id: &str) -> String {
-        self.cli_token_with_issuer(organization_id, &self.issuer)
+        self.cli_token_with_permissions(organization_id, &[])
+    }
+
+    fn cli_token_with_permissions(&self, organization_id: &str, permissions: &[&str]) -> String {
+        self.cli_token_with_issuer_and_permissions(organization_id, &self.issuer, permissions)
     }
 
     fn cli_token_with_issuer(&self, organization_id: &str, issuer: &str) -> String {
+        self.cli_token_with_issuer_and_permissions(organization_id, issuer, &[])
+    }
+
+    fn cli_token_with_issuer_and_permissions(
+        &self,
+        organization_id: &str,
+        issuer: &str,
+        permissions: &[&str],
+    ) -> String {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some("test-rsa-key".into());
         encode(
@@ -366,7 +648,7 @@ impl Ctx {
                 "client_id": "client_test",
                 "org_id": organization_id,
                 "role": "member",
-                "permissions": [],
+                "permissions": permissions,
                 "exp": cats_control_plane::store::now_unix() + 3600
             }),
             &EncodingKey::from_rsa_pem(include_bytes!("fixtures/workos_test_private.pem")).unwrap(),
@@ -487,9 +769,10 @@ async fn cli_jwt_lists_and_enforces_multiple_workspaces() {
     assert_eq!(me.status(), StatusCode::OK);
     let me: Value = me.json().await.unwrap();
     assert_eq!(me["user"]["id"], "user_cli");
-    assert_eq!(me["workspaces"].as_array().unwrap().len(), 2);
+    assert_eq!(me["workspaces"].as_array().unwrap().len(), 3);
     assert_eq!(me["workspaces"][0]["slug"], "default");
-    assert_eq!(me["workspaces"][1]["slug"], "second");
+    assert_eq!(me["workspaces"][1]["slug"], "sibling");
+    assert_eq!(me["workspaces"][2]["slug"], "second");
     assert!(!me.to_string().contains("org_unmapped"));
 
     let own = ctx
@@ -613,7 +896,7 @@ async fn workos_callback_returns_auth_failures_to_the_originating_site() {
 }
 
 #[tokio::test]
-async fn organizationless_workos_user_receives_an_isolated_personal_project() {
+async fn organizationless_workos_user_receives_an_isolated_personal_account() {
     let ctx = Ctx::new().await;
     let user_cookie = ctx.login("user", "new-user-code").await;
 
@@ -664,9 +947,9 @@ async fn organizationless_workos_user_receives_an_isolated_personal_project() {
             .unwrap(),
     )
     .unwrap();
-    assert!(!location
+    assert!(location
         .query_pairs()
-        .any(|(key, _)| key == "organization_id"));
+        .any(|(key, value)| { key == "organization_id" && value == "org_personal_new-user-code" }));
     let state = location
         .query_pairs()
         .find(|(key, _)| key == "state")
@@ -675,7 +958,9 @@ async fn organizationless_workos_user_receives_an_isolated_personal_project() {
         .into_owned();
     let callback = ctx
         .http
-        .get(ctx.url(&format!("/auth/callback?code=new-user-code&state={state}")))
+        .get(ctx.url(&format!(
+            "/auth/callback?code=new-user-scoped-code&state={state}"
+        )))
         .header("Cookie", flow_cookie)
         .send()
         .await
@@ -803,4 +1088,245 @@ async fn expired_workos_session_is_refreshed_and_cookie_is_rotated() {
     assert_eq!(body["authenticated"], true);
     assert_eq!(body["project"], "default");
     assert_eq!(ctx.exchanges.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn organization_manager_invites_and_manages_members_through_workos() {
+    let ctx = Ctx::new().await;
+    let denied = ctx
+        .http
+        .post(ctx.url("/v1/accounts/unknown/invitations"))
+        .bearer_auth(ctx.cli_token("org_project"))
+        .json(&json!({"email": "new@example.com", "role_slug": "member"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(matches!(
+        denied.status(),
+        StatusCode::NOT_FOUND | StatusCode::FORBIDDEN
+    ));
+
+    let manager_token = ctx.cli_token_with_permissions("org_project", &["cats:members:manage"]);
+    let me: Value = ctx
+        .http
+        .get(ctx.url("/v1/me"))
+        .bearer_auth(&manager_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let account_id = me["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|account| account["organization_id"] == "org_project")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let no_permission = ctx
+        .http
+        .post(ctx.url(&format!("/v1/accounts/{account_id}/invitations")))
+        .bearer_auth(ctx.cli_token("org_project"))
+        .header("Idempotency-Key", "invite-without-permission")
+        .json(&json!({"email": "new@example.com", "role_slug": "member"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_permission.status(), StatusCode::FORBIDDEN);
+
+    let workspace: Value = ctx
+        .http
+        .post(ctx.url(&format!("/v1/accounts/{account_id}/workspaces")))
+        .bearer_auth(&manager_token)
+        .json(&json!({"slug": "dev", "display_name": "Development"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(workspace["locator"], "default/dev");
+    let workspace_id = workspace["id"].as_str().unwrap();
+    let legacy_project = workspace["legacy_project"].as_str().unwrap().to_string();
+    let renamed: Value = ctx
+        .http
+        .patch(ctx.url(&format!("/v1/workspaces/{workspace_id}")))
+        .bearer_auth(&manager_token)
+        .json(&json!({"slug": "engineering"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(renamed["locator"], "default/engineering");
+    assert_eq!(renamed["legacy_project"], legacy_project);
+
+    let created: Value = ctx
+        .http
+        .post(ctx.url(&format!("/v1/accounts/{account_id}/invitations")))
+        .bearer_auth(&manager_token)
+        .header("Idempotency-Key", "invite-new-example")
+        .json(&json!({"email": "NEW@Example.com", "role_slug": "member"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(created["account_id"], account_id);
+    assert_eq!(created["email"], "new@example.com");
+    assert_eq!(created["state"], "pending");
+
+    let replayed: Value = ctx
+        .http
+        .post(ctx.url(&format!("/v1/accounts/{account_id}/invitations")))
+        .bearer_auth(&manager_token)
+        .header("Idempotency-Key", "invite-new-example")
+        .json(&json!({"email": "NEW@Example.com", "role_slug": "member"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replayed["id"], created["id"]);
+
+    let invitations: Value = ctx
+        .http
+        .get(ctx.url(&format!("/v1/accounts/{account_id}/invitations")))
+        .bearer_auth(&manager_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(invitations["items"].as_array().unwrap().len(), 1);
+
+    let members: Value = ctx
+        .http
+        .get(ctx.url(&format!("/v1/accounts/{account_id}/members")))
+        .bearer_auth(&manager_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(members["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|member| member["membership_id"] == "om_target"));
+
+    let updated: Value = ctx
+        .http
+        .patch(ctx.url(&format!("/v1/accounts/{account_id}/members/om_target")))
+        .bearer_auth(&manager_token)
+        .json(&json!({"role_slug": "admin"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(updated["role_slug"], "admin");
+
+    let deactivated = ctx
+        .http
+        .delete(ctx.url(&format!("/v1/accounts/{account_id}/members/om_target")))
+        .bearer_auth(&manager_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deactivated.status(), StatusCode::NO_CONTENT);
+
+    let revoked: Value = ctx
+        .http
+        .post(ctx.url(&format!(
+            "/v1/accounts/{account_id}/invitations/invite_test/actions/revoke"
+        )))
+        .bearer_auth(&manager_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(revoked["state"], "revoked");
+}
+
+#[tokio::test]
+async fn web_switches_workspaces_locally_and_serializes_cross_account_refresh() {
+    let ctx = Ctx::new().await;
+    let user_cookie = ctx.login("user", "user-code").await;
+    assert_eq!(ctx.exchanges.load(Ordering::SeqCst), 1);
+    let session: Value = ctx
+        .http
+        .get(ctx.url("/auth/session?site=user"))
+        .header("Cookie", &user_cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let workspace_id = |project: &str| {
+        session["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|workspace| workspace["legacy_project"] == project)
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let sibling_id = workspace_id("sibling");
+    let second_id = workspace_id("second");
+
+    let same_account = ctx
+        .http
+        .post(ctx.url("/auth/workspace"))
+        .header("Cookie", &user_cookie)
+        .json(&json!({"workspace_id": sibling_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(same_account.status(), StatusCode::OK);
+    assert_eq!(ctx.exchanges.load(Ordering::SeqCst), 1);
+    assert!(!same_account
+        .headers()
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| value.starts_with("cats_user_session=")));
+    let body: Value = same_account.json().await.unwrap();
+    assert_eq!(body["project"], "sibling");
+
+    let first = ctx
+        .http
+        .post(ctx.url("/auth/workspace"))
+        .header("Cookie", &user_cookie)
+        .json(&json!({"workspace_id": second_id}));
+    let second = ctx
+        .http
+        .post(ctx.url("/auth/workspace"))
+        .header("Cookie", &user_cookie)
+        .json(&json!({"workspace_id": workspace_id("second")}));
+    let (first, second) = tokio::join!(first.send(), second.send());
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(
+        ctx.exchanges.load(Ordering::SeqCst),
+        2,
+        "two stale tabs must consume only one rotating refresh token"
+    );
 }

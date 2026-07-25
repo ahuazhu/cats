@@ -10,6 +10,9 @@ dist/
 /target/
 /target-linux/
 
+# Local agent worktrees are full repository checkouts, not source assets.
+/.claude/worktrees/
+
 # Terraform working data and sensitive local plans/state. Provider lock files
 # remain committed for reproducible deployments.
 **/.terraform/

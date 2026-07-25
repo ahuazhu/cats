@@ -2,7 +2,7 @@
 //! `Idempotency-Key` retries replay the original operation; actions live
 //! under `/actions/<verb>` (path-safe rendering of the `:verb` convention).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -17,6 +17,10 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+use cats_api::auth::{
+    AccountInvitation, AccountMember, CreateInvitationRequest, CreateWorkspaceRequest,
+    UpdateAccountMemberRequest, UpdateWorkspaceRequest, Workspace,
+};
 use cats_api::billing::{BillingBalance, CreateCheckoutRequest, CreateCheckoutResponse};
 use cats_api::error::{ApiError, ErrorBody, ErrorCode};
 use cats_api::metering::{
@@ -26,8 +30,9 @@ use cats_api::metering::{
 use cats_api::requests::*;
 use cats_api::resources::*;
 use cats_metering::{
-    AttributedCheckpoint, CheckoutIntent, CheckoutPayment, CheckoutRefund, CreditApplyOutcome,
-    IngestOutcome, RateCard, UsageAttribution, UsageInterval, UsageQuery as MeterUsageQuery,
+    AttributedCheckpoint, CatAggregate, CheckoutIntent, CheckoutPayment, CheckoutRefund,
+    CreditApplyOutcome, IngestOutcome, RateCard, UsageAggregate, UsageAttribution, UsageInterval,
+    UsageQuery as MeterUsageQuery, UsageView,
 };
 
 use crate::server::AppState;
@@ -117,15 +122,39 @@ async fn check_authenticated(state: &AppState, headers: &HeaderMap) -> ApiResult
     Err(auth_failure(false))
 }
 
-async fn check_project_auth(state: &AppState, headers: &HeaderMap, project: &str) -> ApiResult<()> {
+async fn check_project_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+    project: &str,
+) -> ApiResult<crate::store::WorkspaceScope> {
     let principal = bearer_principal(state, headers).await?;
+    let mut resolved_scope = None;
     let bearer_allowed = match &principal {
         Some(Principal::Administrator) => true,
-        Some(Principal::User(identity)) => identity.project.as_deref() == Some(project),
+        Some(Principal::User(identity)) => {
+            let Some(organization_id) = identity.organization_id.as_deref() else {
+                return Err(auth_failure(true));
+            };
+            let scope = state.store.workspace_scope_for_project(project)?;
+            let allowed = scope.account.status == "active"
+                && scope.account.workos_organization_id == organization_id
+                && state
+                    .cfg
+                    .workos
+                    .as_ref()
+                    .expect("a WorkOS user principal requires WorkOS configuration")
+                    .user_has_active_membership(&identity.user_id, organization_id)
+                    .await?;
+            resolved_scope = Some(scope);
+            allowed
+        }
         Some(Principal::Service) | None => false,
     };
-    if bearer_allowed || crate::auth::web_session_allows_project(state, headers, project) {
-        return Ok(());
+    if bearer_allowed || crate::auth::web_session_allows_project(state, headers, project).await? {
+        return resolved_scope
+            .map(Ok)
+            .unwrap_or_else(|| state.store.workspace_scope_for_project(project))
+            .map_err(Into::into);
     }
     Err(auth_failure(
         principal.is_some() || crate::auth::has_any_web_session(state, headers),
@@ -173,6 +202,54 @@ async fn require_cli_identity(
     }
 }
 
+const MEMBERS_MANAGE_PERMISSION: &str = "cats:members:manage";
+
+async fn require_account_manager(
+    state: &AppState,
+    headers: &HeaderMap,
+    account_id: &str,
+) -> ApiResult<(crate::store::AccountRecord, String)> {
+    let principal = bearer_principal(state, headers).await?;
+    let bearer_identity = match principal {
+        Some(Principal::User(identity)) => Some(identity),
+        Some(_) => return Err(auth_failure(true)),
+        None => None,
+    };
+    let (user_id, organization_id, permissions) = if let Some(identity) = bearer_identity {
+        (
+            identity.user_id,
+            identity.organization_id,
+            identity.permissions,
+        )
+    } else if let Some(identity) = crate::auth::web_user_identity(state, headers) {
+        let user_id = identity.user_id.ok_or_else(|| auth_failure(true))?;
+        (user_id, identity.organization_id, identity.permissions)
+    } else {
+        return Err(auth_failure(false));
+    };
+    let account = state.store.account_by_id(account_id)?;
+    if user_id.is_empty()
+        || organization_id.as_deref() != Some(account.workos_organization_id.as_str())
+        || !permissions
+            .iter()
+            .any(|permission| permission == MEMBERS_MANAGE_PERMISSION)
+    {
+        return Err(auth_failure(true));
+    }
+    let workos = state
+        .cfg
+        .workos
+        .as_ref()
+        .ok_or_else(|| ApiError::failed_precondition("WorkOS AuthKit is not configured"))?;
+    if !workos
+        .user_has_active_membership(&user_id, &account.workos_organization_id)
+        .await?
+    {
+        return Err(auth_failure(true));
+    }
+    Ok((account, user_id))
+}
+
 fn cordon_registered_node(state: &AppState, id: &str) -> ApiResult<()> {
     let node = state.store.get_node(id)?;
     if node.state == NodeState::Draining && !state.store.cats_on_node(id)?.is_empty() {
@@ -200,11 +277,8 @@ fn if_match(headers: &HeaderMap) -> Option<i64> {
         .and_then(|s| s.parse().ok())
 }
 
-fn billing_account_id_for_project(project: &str) -> String {
-    // The current V1 repository has a 1:1 workspace/project boundary. Keep
-    // the account namespace explicit so a future org -> many projects mapping
-    // does not require rewriting immutable historical usage.
-    format!("billing_account/project/{project}")
+fn billing_account_id_for_project(state: &AppState, project: &str) -> Result<String, ApiError> {
+    state.store.billing_account_id_for_project(project)
 }
 
 fn metering_failure(error: cats_metering::MeteringError) -> Failure {
@@ -241,6 +315,8 @@ pub fn router(state: AppState) -> Router {
         .route("/assets/cats-og.png", get(crate::ui::cats_og_png))
         .route("/user", get(crate::ui::user_console))
         .route("/user/", get(crate::ui::user_console))
+        .route("/user/{account}/{workspace}", get(crate::ui::user_console))
+        .route("/user/{account}/{workspace}/", get(crate::ui::user_console))
         .route("/admin", get(crate::ui::admin_console))
         .route("/admin/", get(crate::ui::admin_console))
         .route("/ui/styles.css", get(crate::ui::styles))
@@ -252,11 +328,33 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/login", get(crate::auth::login))
         .route("/auth/callback", get(crate::auth::callback))
         .route("/auth/session", get(crate::auth::session))
+        .route("/auth/workspace", post(crate::auth::switch_workspace))
         .route("/auth/logout", get(crate::auth::logout))
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/me", get(cli_me))
         .route("/v1/workspaces", get(list_workspaces))
+        .route(
+            "/v1/accounts/{account}/workspaces",
+            post(create_account_workspace),
+        )
+        .route(
+            "/v1/workspaces/{workspace}",
+            axum::routing::patch(update_workspace),
+        )
         .route("/v1/auth/logout", post(cli_logout))
+        .route(
+            "/v1/accounts/{account}/invitations",
+            post(create_account_invitation).get(list_account_invitations),
+        )
+        .route(
+            "/v1/accounts/{account}/invitations/{invitation}/actions/revoke",
+            post(revoke_account_invitation),
+        )
+        .route("/v1/accounts/{account}/members", get(list_account_members))
+        .route(
+            "/v1/accounts/{account}/members/{membership}",
+            axum::routing::patch(update_account_member).delete(deactivate_account_member),
+        )
         .route(
             "/v1/projects/{project}/cats",
             post(create_cat).get(list_cats),
@@ -342,12 +440,16 @@ async fn cli_me(
     headers: HeaderMap,
 ) -> ApiResult<Json<cats_api::auth::MeResponse>> {
     let identity = require_cli_identity(&state, &headers).await?;
+    if identity.organization_id.is_none() {
+        crate::auth::provision_personal_account(&state, &identity.user_id, &identity.user_id)
+            .await?;
+    }
     let workos = state
         .cfg
         .workos
         .as_ref()
         .ok_or_else(|| ApiError::failed_precondition("WorkOS AuthKit is not configured"))?;
-    Ok(Json(workos.me(&identity).await?))
+    Ok(Json(workos.me(&state.store, &identity).await?))
 }
 
 async fn list_workspaces(
@@ -355,13 +457,17 @@ async fn list_workspaces(
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<cats_api::auth::Workspace>>> {
     let identity = require_cli_identity(&state, &headers).await?;
+    if identity.organization_id.is_none() {
+        crate::auth::provision_personal_account(&state, &identity.user_id, &identity.user_id)
+            .await?;
+    }
     let workos = state
         .cfg
         .workos
         .as_ref()
         .ok_or_else(|| ApiError::failed_precondition("WorkOS AuthKit is not configured"))?;
     Ok(Json(ListResponse {
-        items: workos.workspaces_for(&identity).await?,
+        items: workos.workspaces_for(&state.store, &identity).await?,
     }))
 }
 
@@ -376,6 +482,260 @@ async fn cli_logout(State(state): State<AppState>, headers: HeaderMap) -> ApiRes
     Ok(StatusCode::NO_CONTENT)
 }
 
+fn workspace_response(
+    state: &AppState,
+    account: &crate::store::AccountRecord,
+    workspace_id: &str,
+) -> ApiResult<Workspace> {
+    let (_, workspaces) = state
+        .store
+        .account_and_workspace_views(&account.workos_organization_id, None, &[])?
+        .ok_or_else(|| ApiError::failed_precondition("account is not active"))?;
+    workspaces
+        .into_iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .ok_or_else(|| ApiError::internal("workspace was not visible after mutation").into())
+}
+
+async fn create_account_workspace(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<CreateWorkspaceRequest>,
+) -> ApiResult<Response> {
+    let (account, _) = require_account_manager(&state, &headers, &account_id).await?;
+    let workspace =
+        state
+            .store
+            .create_workspace(&account.id, &request.slug, &request.display_name)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(workspace_response(&state, &account, &workspace.id)?),
+    )
+        .into_response())
+}
+
+async fn update_workspace(
+    State(state): State<AppState>,
+    Path(workspace_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateWorkspaceRequest>,
+) -> ApiResult<Json<Workspace>> {
+    let existing = state.store.workspace_by_id(&workspace_id)?;
+    let (account, _) = require_account_manager(&state, &headers, &existing.account_id).await?;
+    let workspace = state.store.update_workspace(
+        &workspace_id,
+        request.slug.as_deref(),
+        request.display_name.as_deref(),
+    )?;
+    Ok(Json(workspace_response(&state, &account, &workspace.id)?))
+}
+
+async fn create_account_invitation(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<CreateInvitationRequest>,
+) -> ApiResult<Response> {
+    let (account, inviter_user_id) = require_account_manager(&state, &headers, &account_id).await?;
+    if account.kind == cats_api::auth::AccountKind::Personal {
+        return Err(ApiError::failed_precondition(
+            "personal accounts do not accept member invitations",
+        )
+        .into());
+    }
+    let email = request.email.trim().to_ascii_lowercase();
+    if email.len() > 320
+        || !email
+            .split_once('@')
+            .is_some_and(|(local, domain)| !local.is_empty() && domain.contains('.'))
+    {
+        return Err(ApiError::invalid("invitation email is invalid").into());
+    }
+    if !matches!(request.role_slug.as_str(), "member" | "admin") {
+        return Err(ApiError::invalid("role_slug must be member or admin").into());
+    }
+    let idempotency_key = idem_key(&headers)
+        .filter(|key| !key.is_empty() && key.len() <= 255)
+        .ok_or_else(|| {
+            ApiError::invalid("a non-empty Idempotency-Key of at most 255 bytes is required")
+        })?;
+    let workos = state
+        .cfg
+        .workos
+        .as_ref()
+        .ok_or_else(|| ApiError::failed_precondition("WorkOS AuthKit is not configured"))?;
+    let invitation = workos
+        .send_account_invitation(
+            &account,
+            &inviter_user_id,
+            &email,
+            &request.role_slug,
+            &idempotency_key,
+        )
+        .await?;
+    state
+        .store
+        .record_invitation(&invitation, &account.workos_organization_id)?;
+    Ok((StatusCode::CREATED, Json(invitation)).into_response())
+}
+
+async fn list_account_invitations(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ListResponse<AccountInvitation>>> {
+    let (account, _) = require_account_manager(&state, &headers, &account_id).await?;
+    let workos = state
+        .cfg
+        .workos
+        .as_ref()
+        .ok_or_else(|| ApiError::failed_precondition("WorkOS AuthKit is not configured"))?;
+    let items = workos.list_account_invitations(&account).await?;
+    for invitation in &items {
+        state
+            .store
+            .record_invitation(invitation, &account.workos_organization_id)?;
+    }
+    Ok(Json(ListResponse { items }))
+}
+
+async fn revoke_account_invitation(
+    State(state): State<AppState>,
+    Path((account_id, invitation_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<AccountInvitation>> {
+    let (account, _) = require_account_manager(&state, &headers, &account_id).await?;
+    let workos = state
+        .cfg
+        .workos
+        .as_ref()
+        .ok_or_else(|| ApiError::failed_precondition("WorkOS AuthKit is not configured"))?;
+    let invitation = workos
+        .revoke_account_invitation(&account, &invitation_id)
+        .await?;
+    state
+        .store
+        .record_invitation(&invitation, &account.workos_organization_id)?;
+    Ok(Json(invitation))
+}
+
+async fn list_account_members(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ListResponse<AccountMember>>> {
+    let (account, _) = require_account_manager(&state, &headers, &account_id).await?;
+    let workos = state
+        .cfg
+        .workos
+        .as_ref()
+        .ok_or_else(|| ApiError::failed_precondition("WorkOS AuthKit is not configured"))?;
+    let items = workos.list_account_members(&account).await?;
+    for member in &items {
+        state.store.upsert_membership_shadow(
+            &member.membership_id,
+            &account.id,
+            &member.user.id,
+            &member.role_slug,
+            &member.status,
+        )?;
+    }
+    Ok(Json(ListResponse { items }))
+}
+
+async fn update_account_member(
+    State(state): State<AppState>,
+    Path((account_id, membership_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateAccountMemberRequest>,
+) -> ApiResult<Json<AccountMember>> {
+    let (account, _) = require_account_manager(&state, &headers, &account_id).await?;
+    if !matches!(request.role_slug.as_str(), "member" | "admin") {
+        return Err(ApiError::invalid("role_slug must be member or admin").into());
+    }
+    let workos = state
+        .cfg
+        .workos
+        .as_ref()
+        .ok_or_else(|| ApiError::failed_precondition("WorkOS AuthKit is not configured"))?;
+    let members = workos.list_account_members(&account).await?;
+    let target = members
+        .iter()
+        .find(|member| member.membership_id == membership_id)
+        .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "membership not found"))?;
+    let active_admins = members
+        .iter()
+        .filter(|member| member.status == "active" && member.role_slug == "admin")
+        .count();
+    if target.status == "active"
+        && target.role_slug == "admin"
+        && request.role_slug != "admin"
+        && active_admins <= 1
+    {
+        return Err(ApiError::failed_precondition(
+            "an organization account must retain an active administrator",
+        )
+        .into());
+    }
+    let member = workos
+        .update_account_member(&account, &membership_id, &request.role_slug)
+        .await?;
+    state.store.upsert_membership_shadow(
+        &member.membership_id,
+        &account.id,
+        &member.user.id,
+        &member.role_slug,
+        &member.status,
+    )?;
+    Ok(Json(member))
+}
+
+async fn deactivate_account_member(
+    State(state): State<AppState>,
+    Path((account_id, membership_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    let (account, actor_user_id) = require_account_manager(&state, &headers, &account_id).await?;
+    let workos = state
+        .cfg
+        .workos
+        .as_ref()
+        .ok_or_else(|| ApiError::failed_precondition("WorkOS AuthKit is not configured"))?;
+    let members = workos.list_account_members(&account).await?;
+    let target = members
+        .iter()
+        .find(|member| member.membership_id == membership_id)
+        .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "membership not found"))?;
+    if target.user.id == actor_user_id {
+        return Err(ApiError::failed_precondition(
+            "use another account administrator to deactivate your own membership",
+        )
+        .into());
+    }
+    let active_admins = members
+        .iter()
+        .filter(|member| member.status == "active" && member.role_slug == "admin")
+        .count();
+    if target.role_slug == "admin" && active_admins <= 1 {
+        return Err(ApiError::failed_precondition(
+            "an organization account must retain an active administrator",
+        )
+        .into());
+    }
+    workos
+        .deactivate_account_member(&account, &membership_id)
+        .await?;
+    state.store.upsert_membership_shadow(
+        &target.membership_id,
+        &account.id,
+        &target.user.id,
+        &target.role_slug,
+        "inactive",
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ---------------------------------------------------------------------------
 // Cats
 // ---------------------------------------------------------------------------
@@ -386,7 +746,7 @@ async fn create_cat(
     headers: HeaderMap,
     Json(req): Json<CreateCatRequest>,
 ) -> ApiResult<Response> {
-    check_project_auth(&state, &headers, &project).await?;
+    let scope = check_project_auth(&state, &headers, &project).await?;
     require_funded(&state, &project).await?;
     if req.name.is_empty()
         || !req
@@ -413,7 +773,7 @@ async fn create_cat(
         .as_ref()
         .map(|d| (d.name.as_str(), d.size_bytes, d.mount_at.as_str()));
     let (cat, _disks, op) = state.store.create_cat(
-        &project,
+        &scope.workspace,
         &req.name,
         &req.image,
         req.cpus,
@@ -870,13 +1230,13 @@ async fn create_disk(
     headers: HeaderMap,
     Json(req): Json<CreateDiskRequest>,
 ) -> ApiResult<Json<Disk>> {
-    check_project_auth(&state, &headers, &project).await?;
+    let scope = check_project_auth(&state, &headers, &project).await?;
     if req.size_bytes == 0 || req.size_bytes > cats_api::chunk::MAX_VOLUME_BYTES {
         return Err(ApiError::invalid("disk size out of range").into());
     }
     let disk = state
         .store
-        .create_disk(&project, &req.name, req.size_bytes)?;
+        .create_disk(&scope.workspace, &req.name, req.size_bytes)?;
     // Create the storage volume eagerly so snapshots/resize work pre-attach.
     let size = cats_api::chunk::round_up_to_chunk(req.size_bytes);
     match state.storage_meta.create_volume(&disk.volume_id, size) {
@@ -1358,6 +1718,11 @@ async fn ingest_usage_checkpoints(
             ))
             .into());
         }
+        let frozen_attribution = state
+            .usage
+            .source_epoch_attribution(&checkpoint.source_id, &checkpoint.source_epoch)
+            .await
+            .map_err(metering_failure)?;
         let attribution = match state.store.must_get_cat_by_id(&checkpoint.cat_id) {
             Ok(cat) => {
                 if cat.node_id.as_deref() != Some(req.node_id.as_str()) {
@@ -1378,33 +1743,30 @@ async fn ingest_usage_checkpoints(
                     ))
                     .into());
                 }
-                UsageAttribution {
-                    billing_account_id: billing_account_id_for_project(&cat.project),
-                    project_id: cat.project,
-                    resource_type: "cat".to_string(),
-                    resource_id: checkpoint.cat_id.clone(),
-                    attributed_cat_id: Some(checkpoint.cat_id.clone()),
+                if let Some(attribution) = frozen_attribution {
+                    validate_cat_attribution(&attribution, &cat)?;
+                    attribution
+                } else {
+                    UsageAttribution {
+                        billing_account_id: billing_account_id_for_project(&state, &cat.project)?,
+                        project_id: cat.project,
+                        resource_type: "cat".to_string(),
+                        resource_id: checkpoint.cat_id.clone(),
+                        attributed_cat_id: Some(checkpoint.cat_id.clone()),
+                    }
                 }
             }
             Err(error) if error.code == ErrorCode::NotFound => {
                 // Durable outboxes can replay after resource deletion. Reuse
                 // attribution already frozen in this exact source epoch; the
                 // node never supplies or changes billing ownership.
-                let attribution = state
-                    .usage
-                    .source_epoch_attribution(&checkpoint.source_id, &checkpoint.source_epoch)
-                    .await
-                    .map_err(metering_failure)?
-                    .ok_or_else(|| {
-                        ApiError::conflict(format!(
-                            "no frozen attribution exists for deleted Cat {} source epoch",
-                            checkpoint.cat_id
-                        ))
-                    })?;
-                if attribution.resource_type != "cat"
-                    || attribution.resource_id != checkpoint.cat_id
-                    || attribution.attributed_cat_id.as_deref() != Some(checkpoint.cat_id.as_str())
-                {
+                let attribution = frozen_attribution.ok_or_else(|| {
+                    ApiError::conflict(format!(
+                        "no frozen attribution exists for deleted Cat {} source epoch",
+                        checkpoint.cat_id
+                    ))
+                })?;
+                if !cat_attribution_matches(&attribution, &checkpoint.cat_id, None) {
                     return Err(ApiError::conflict(
                         "stored source-epoch attribution does not match checkpoint Cat",
                     )
@@ -1429,9 +1791,30 @@ async fn ingest_usage_checkpoints(
     }))
 }
 
-const SIGNUP_CREDIT_NANOS: i128 = 10_000_000_000;
+fn cat_attribution_matches(
+    attribution: &UsageAttribution,
+    cat_id: &str,
+    project: Option<&str>,
+) -> bool {
+    attribution.resource_type == "cat"
+        && attribution.resource_id == cat_id
+        && attribution.attributed_cat_id.as_deref() == Some(cat_id)
+        && project.is_none_or(|project| attribution.project_id == project)
+}
+
+fn validate_cat_attribution(attribution: &UsageAttribution, cat: &Cat) -> Result<(), Failure> {
+    if cat_attribution_matches(attribution, &cat.id, Some(&cat.project)) {
+        Ok(())
+    } else {
+        Err(ApiError::conflict(
+            "stored source-epoch attribution does not match current Cat ownership",
+        )
+        .into())
+    }
+}
 
 struct BillingProjection {
+    signup_credit_nanos: i128,
     credit_nanos: i128,
     usage_nanos: u128,
     available_nanos: i128,
@@ -1449,53 +1832,70 @@ fn unix_millis() -> Result<i64, Failure> {
 
 async fn billing_projection(state: &AppState, project: &str) -> ApiResult<BillingProjection> {
     let now_ms = unix_millis()?;
-    let billing_account_id = billing_account_id_for_project(project);
-    let credit = state
-        .credits
-        .ensure_account(
-            &billing_account_id,
-            project,
-            "USD",
-            SIGNUP_CREDIT_NANOS,
-            now_ms,
-        )
-        .await
-        .map_err(metering_failure)?;
-    let usage = state
-        .usage
-        .query(&MeterUsageQuery {
-            billing_account_id,
-            project_id: Some(project.to_string()),
-            attributed_cat_id: None,
-            interval_start_unix_ms: 0,
-            interval_end_unix_ms: now_ms.max(1),
-        })
-        .await
-        .map_err(metering_failure)?;
+    let ledgers = state.store.billing_ledgers_for_project(project)?;
     let rate_card = RateCard::sprites_compute_v1();
+    let mut signup_credit_nanos = 0_i128;
+    let mut credit_nanos = 0_i128;
     let mut usage_nanos = 0_u128;
-    for aggregate in &usage.totals {
-        if let Some(amount) = rate_card
-            .rate_quantity(aggregate.metric, aggregate.quantity)
-            .map_err(metering_failure)?
-        {
-            usage_nanos = usage_nanos
-                .checked_add(amount)
-                .ok_or_else(|| ApiError::internal("rated balance overflow"))?;
+    let mut latest_interval_end_unix_ms = None;
+    let mut stripe_customer_id = None;
+    for ledger in ledgers {
+        signup_credit_nanos = signup_credit_nanos
+            .checked_add(ledger.signup_credit_nanos)
+            .ok_or_else(|| ApiError::internal("signup credit overflow"))?;
+        let credit = state
+            .credits
+            .ensure_account(
+                &ledger.billing_account_id,
+                &ledger.owner_id,
+                "USD",
+                ledger.signup_credit_nanos,
+                now_ms,
+            )
+            .await
+            .map_err(metering_failure)?;
+        credit_nanos = credit_nanos
+            .checked_add(credit.credit_nanos)
+            .ok_or_else(|| ApiError::internal("credit balance overflow"))?;
+        if stripe_customer_id.is_none() {
+            stripe_customer_id = credit.stripe_customer_id;
+        }
+        let usage = state
+            .usage
+            .query(&MeterUsageQuery {
+                billing_account_id: ledger.billing_account_id,
+                project_id: None,
+                attributed_cat_id: None,
+                interval_start_unix_ms: 0,
+                interval_end_unix_ms: now_ms.max(1),
+            })
+            .await
+            .map_err(metering_failure)?;
+        latest_interval_end_unix_ms =
+            latest_interval_end_unix_ms.max(usage.latest_interval_end_unix_ms);
+        for aggregate in usage.totals {
+            if let Some(amount) = rate_card
+                .rate_quantity(aggregate.metric, aggregate.quantity)
+                .map_err(metering_failure)?
+            {
+                usage_nanos = usage_nanos
+                    .checked_add(amount)
+                    .ok_or_else(|| ApiError::internal("rated balance overflow"))?;
+            }
         }
     }
     let usage_signed = i128::try_from(usage_nanos)
         .map_err(|_| ApiError::internal("rated balance exceeds signed money range"))?;
-    let available_nanos = credit
-        .credit_nanos
+    let available_nanos = credit_nanos
         .checked_sub(usage_signed)
         .ok_or_else(|| ApiError::internal("available balance overflow"))?;
     Ok(BillingProjection {
-        credit_nanos: credit.credit_nanos,
+        signup_credit_nanos,
+        credit_nanos,
         usage_nanos,
         available_nanos,
-        latest_interval_end_unix_ms: usage.latest_interval_end_unix_ms,
-        stripe_customer_id: credit.stripe_customer_id,
+        latest_interval_end_unix_ms,
+        stripe_customer_id,
     })
 }
 
@@ -1519,18 +1919,25 @@ pub(crate) async fn enforce_exhausted_billing_accounts(state: &AppState) -> ApiR
         .list_all_cats()?
         .into_iter()
         .filter(|cat| cat.desired_state == DesiredState::Running)
-        .collect::<Vec<_>>();
-    let projects = active_cats
+        .map(|cat| {
+            let account_id = state.store.workspace_by_id(&cat.workspace_id)?.account_id;
+            Ok((cat, account_id))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    let accounts = active_cats
         .iter()
-        .map(|cat| cat.project.clone())
-        .collect::<BTreeSet<_>>();
+        .map(|(cat, account_id)| (account_id.clone(), cat.project.clone()))
+        .collect::<BTreeMap<_, _>>();
     let mut changed = false;
-    for project in projects {
+    for (account_id, project) in accounts {
         let projection = billing_projection(state, &project).await?;
         if projection.available_nanos > 0 {
             continue;
         }
-        for cat in active_cats.iter().filter(|cat| cat.project == project) {
+        for (cat, _) in active_cats
+            .iter()
+            .filter(|(_, cat_account_id)| cat_account_id == &account_id)
+        {
             match state
                 .store
                 .set_desired(&cat.id, DesiredState::Cold, None, "cat.credit_exhausted")
@@ -1538,7 +1945,7 @@ pub(crate) async fn enforce_exhausted_billing_accounts(state: &AppState) -> ApiR
                 Ok(_) => {
                     changed = true;
                     tracing::warn!(
-                        billing_account = %billing_account_id_for_project(&project),
+                        billing_account = %billing_account_id_for_project(state, &project)?,
                         cat_id = %cat.id,
                         "prepaid balance exhausted; converging Cat to Cold"
                     );
@@ -1574,8 +1981,8 @@ async fn project_billing_balance(
         .map(|stripe| stripe.topup_options_cents())
         .unwrap_or_default();
     let balance = BillingBalance {
-        billing_account_id: billing_account_id_for_project(&project),
-        project_id: project,
+        billing_account_id: billing_account_id_for_project(&state, &project)?,
+        project_id: project.clone(),
         currency: "USD".to_string(),
         status: if projection.available_nanos > 0 {
             "active"
@@ -1586,7 +1993,7 @@ async fn project_billing_balance(
         credit_nanos: projection.credit_nanos.to_string(),
         provisional_usage_nanos: projection.usage_nanos.to_string(),
         available_credit_nanos: projection.available_nanos.to_string(),
-        signup_credit_nanos: SIGNUP_CREDIT_NANOS.to_string(),
+        signup_credit_nanos: projection.signup_credit_nanos.to_string(),
         stripe_enabled,
         topup_options_cents,
         usage_visible_through_unix_ms: projection.latest_interval_end_unix_ms,
@@ -1616,7 +2023,7 @@ async fn create_billing_checkout(
     let idempotency_key = idem_key(&headers)
         .filter(|value| !value.trim().is_empty() && value.len() <= 200)
         .ok_or_else(|| ApiError::invalid("Idempotency-Key is required for Checkout"))?;
-    let billing_account_id = billing_account_id_for_project(&project);
+    let billing_account_id = billing_account_id_for_project(&state, &project)?;
     let projection = billing_projection(&state, &project).await?;
     let mut hasher = Sha256::new();
     for value in [&billing_account_id, &idempotency_key] {
@@ -1975,6 +2382,95 @@ fn usage_time_buckets(
         .collect()
 }
 
+async fn project_usage_view(
+    state: &AppState,
+    project: &str,
+    attributed_cat_id: Option<String>,
+    interval_start_unix_ms: i64,
+    interval_end_unix_ms: i64,
+) -> ApiResult<(String, UsageView)> {
+    let ledgers = state.store.billing_ledgers_for_project(project)?;
+    let canonical_billing_account_id = ledgers
+        .first()
+        .map(|ledger| ledger.billing_account_id.clone())
+        .ok_or_else(|| ApiError::internal("account has no canonical billing ledger"))?;
+    let mut totals = HashMap::<UsageMetric, u128>::new();
+    let mut cats = HashMap::<String, HashMap<UsageMetric, u128>>::new();
+    let mut details = Vec::new();
+    let mut latest_interval_end_unix_ms = None;
+    for ledger in ledgers {
+        let view = state
+            .usage
+            .query(&MeterUsageQuery {
+                billing_account_id: ledger.billing_account_id,
+                project_id: Some(project.to_string()),
+                attributed_cat_id: attributed_cat_id.clone(),
+                interval_start_unix_ms,
+                interval_end_unix_ms,
+            })
+            .await
+            .map_err(metering_failure)?;
+        latest_interval_end_unix_ms =
+            latest_interval_end_unix_ms.max(view.latest_interval_end_unix_ms);
+        for aggregate in view.totals {
+            let quantity = totals.entry(aggregate.metric).or_default();
+            *quantity = quantity
+                .checked_add(aggregate.quantity)
+                .ok_or_else(|| ApiError::internal("usage total overflow"))?;
+        }
+        for cat in view.cats {
+            let cat_totals = cats.entry(cat.cat_id).or_default();
+            for aggregate in cat.items {
+                let quantity = cat_totals.entry(aggregate.metric).or_default();
+                *quantity = quantity
+                    .checked_add(aggregate.quantity)
+                    .ok_or_else(|| ApiError::internal("Cat usage total overflow"))?;
+            }
+        }
+        details.extend(view.details);
+    }
+    let mut totals = totals
+        .into_iter()
+        .map(|(metric, quantity)| UsageAggregate { metric, quantity })
+        .collect::<Vec<_>>();
+    totals.sort_by_key(|aggregate| aggregate.metric.slug());
+    let mut cats = cats
+        .into_iter()
+        .map(|(cat_id, items)| {
+            let mut items = items
+                .into_iter()
+                .map(|(metric, quantity)| UsageAggregate { metric, quantity })
+                .collect::<Vec<_>>();
+            items.sort_by_key(|aggregate| aggregate.metric.slug());
+            CatAggregate { cat_id, items }
+        })
+        .collect::<Vec<_>>();
+    cats.sort_by(|left, right| left.cat_id.cmp(&right.cat_id));
+    details.sort_by(|left, right| {
+        (
+            left.interval_start_unix_ms,
+            left.interval_end_unix_ms,
+            left.source_id.as_str(),
+            left.end_sequence,
+        )
+            .cmp(&(
+                right.interval_start_unix_ms,
+                right.interval_end_unix_ms,
+                right.source_id.as_str(),
+                right.end_sequence,
+            ))
+    });
+    Ok((
+        canonical_billing_account_id,
+        UsageView {
+            totals,
+            cats,
+            details,
+            latest_interval_end_unix_ms,
+        },
+    ))
+}
+
 async fn project_usage(
     State(state): State<AppState>,
     Path(project): Path<String>,
@@ -1998,18 +2494,8 @@ async fn project_usage(
             .map(|cat| state.store.get_cat(&project, cat).map(|cat| cat.id))
             .transpose()?
     };
-    let usage_query = MeterUsageQuery {
-        billing_account_id: billing_account_id_for_project(&project),
-        project_id: Some(project.clone()),
-        attributed_cat_id: cat_id,
-        interval_start_unix_ms: query.from_ms,
-        interval_end_unix_ms: query.to_ms,
-    };
-    let view = state
-        .usage
-        .query(&usage_query)
-        .await
-        .map_err(metering_failure)?;
+    let (billing_account_id, view) =
+        project_usage_view(&state, &project, cat_id, query.from_ms, query.to_ms).await?;
     let rate_card = RateCard::sprites_compute_v1();
 
     let mut amount_nanos = 0_u128;
@@ -2093,7 +2579,7 @@ async fn project_usage(
         Vec::new()
     };
     let report = UsageReport {
-        billing_account_id: usage_query.billing_account_id,
+        billing_account_id,
         project_id: project,
         interval_start_unix_ms: query.from_ms,
         interval_end_unix_ms: query.to_ms,
@@ -2577,7 +3063,10 @@ async fn get_operation(
     // cannot use status differences to enumerate operations.
     check_authenticated(&state, &headers).await?;
     let operation = state.store.get_operation(&id)?;
-    check_project_auth(&state, &headers, &operation.project).await?;
+    let scope = check_project_auth(&state, &headers, &operation.project).await?;
+    if scope.workspace.id != operation.workspace_id {
+        return Err(ApiError::internal("operation workspace ownership is inconsistent").into());
+    }
     Ok(Json(operation))
 }
 

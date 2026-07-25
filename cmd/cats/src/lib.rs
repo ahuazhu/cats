@@ -435,7 +435,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     } else {
                         for workspace in workspaces {
                             let selected = if session.config.current_workspace.as_deref()
-                                == Some(workspace.slug.as_str())
+                                == Some(workspace.selector())
                             {
                                 "*"
                             } else {
@@ -443,14 +443,15 @@ pub fn run(cli: Cli) -> Result<()> {
                             };
                             println!(
                                 "{selected} {:<24} {}",
-                                workspace.slug, workspace.display_name
+                                workspace.selector(),
+                                workspace.display_name
                             );
                         }
                     }
                 }
                 WorkspaceCommand::Use { name } => {
                     let workspace = auth::switch_workspace(cli.api_url.as_deref(), name)?;
-                    println!("Current workspace: {}", workspace.slug);
+                    println!("Current workspace: {}", workspace.selector());
                 }
             }
             return Ok(());
