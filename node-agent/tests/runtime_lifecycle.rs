@@ -57,6 +57,7 @@ fn env() -> Env {
             object_store,
             blockd_lease_ttl_ms: 1200,
             metering_cgroup_root: None,
+            wake_budget: Default::default(),
             vmm: cats_node_agent::runtime::VmmMode::Fake,
         },
         storage_meta,

@@ -529,6 +529,52 @@ fn process_rss_bytes(pid: u32) -> Result<u64> {
     rss_kib.checked_mul(1024).context("VMM RSS overflow")
 }
 
+/// One `MADV_PAGEOUT` walk of `[start, end)`, returning the bytes advised.
+///
+/// The kernel reports partial progress, so this loops until the range is
+/// covered. Each call is capped at 1 GiB per iovec to match the validated
+/// reference helper rather than handing the kernel an unbounded length.
+#[cfg(target_os = "linux")]
+fn advise_pageout(pidfd: std::os::fd::RawFd, pid: u32, start: usize, end: usize) -> Result<u64> {
+    const MAX_IOV_BYTES: usize = 1 << 30;
+    let mut advised_total = 0u64;
+    let mut cursor = start;
+    while cursor < end {
+        let len = (end - cursor).min(MAX_IOV_BYTES);
+        let mut iov = libc::iovec {
+            iov_base: cursor as *mut libc::c_void,
+            iov_len: len,
+        };
+        // SAFETY: process_madvise interprets the iovec addresses in the pidfd
+        // target. The VMM is paused and remains our supervised child.
+        let advised = unsafe {
+            libc::syscall(
+                libc::SYS_process_madvise,
+                pidfd,
+                &mut iov as *mut libc::iovec,
+                1usize,
+                libc::MADV_PAGEOUT,
+                0u32,
+            )
+        };
+        if advised < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("MADV_PAGEOUT VMM pid {pid}"));
+        }
+        anyhow::ensure!(advised > 0, "MADV_PAGEOUT made no progress");
+        let advised = advised as usize;
+        anyhow::ensure!(
+            advised <= len,
+            "MADV_PAGEOUT returned an invalid byte count"
+        );
+        cursor += advised;
+        advised_total = advised_total
+            .checked_add(advised as u64)
+            .context("page-out byte count overflow")?;
+    }
+    Ok(advised_total)
+}
+
 #[cfg(target_os = "linux")]
 pub fn page_out_memory(pid: u32, backing: &Path) -> Result<PageOutStats> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -554,39 +600,22 @@ pub fn page_out_memory(pid: u32, backing: &Path) -> Result<PageOutStats> {
     let rss_before_bytes = process_rss_bytes(pid)?;
     let mut bytes_advised = 0u64;
     for (start, end) in &ranges {
-        let mut cursor = *start;
-        while cursor < *end {
-            let mut iov = libc::iovec {
-                iov_base: cursor as *mut libc::c_void,
-                iov_len: end - cursor,
-            };
-            // SAFETY: process_madvise interprets the iovec addresses in the
-            // pidfd target. The VMM is paused and remains our supervised child.
-            let advised = unsafe {
-                libc::syscall(
-                    libc::SYS_process_madvise,
-                    pidfd.as_raw_fd(),
-                    &mut iov as *mut libc::iovec,
-                    1usize,
-                    libc::MADV_PAGEOUT,
-                    0u32,
-                )
-            };
-            if advised < 0 {
-                return Err(std::io::Error::last_os_error())
-                    .with_context(|| format!("MADV_PAGEOUT VMM pid {pid}"));
-            }
-            anyhow::ensure!(advised > 0, "MADV_PAGEOUT made no progress");
-            let advised = advised as usize;
-            anyhow::ensure!(
-                advised <= end - cursor,
-                "MADV_PAGEOUT returned an invalid byte count"
-            );
-            cursor += advised;
-            bytes_advised = bytes_advised
-                .checked_add(advised as u64)
-                .context("page-out byte count overflow")?;
-        }
+        bytes_advised = bytes_advised
+            .checked_add(advise_pageout(pidfd.as_raw_fd(), pid, *start, *end)?)
+            .context("page-out byte count overflow")?;
+    }
+    // Flush the file-backed zone so the pages the first pass left dirty become
+    // clean and therefore reclaimable. Without this the second pass has
+    // nothing new to drop.
+    // SAFETY: sync takes no arguments and cannot fail.
+    unsafe { libc::sync() };
+    // Second pass: reclaims the now-clean pages where the mapping topology
+    // permits it. The 2026-07-21 reclaim ratios (97.7-98.5% of Guest RAM)
+    // were measured with both passes, so a single pass does not reproduce
+    // the validated Suspended footprint. Byte counts from this pass are not
+    // added to `bytes_advised`, which reports the range walked once.
+    for (start, end) in &ranges {
+        advise_pageout(pidfd.as_raw_fd(), pid, *start, *end)?;
     }
     let rss_after_bytes = process_rss_bytes(pid)?;
     Ok(PageOutStats {
@@ -804,10 +833,8 @@ mod tests {
         for offset in [0, LEN / 2, LEN - 4096] {
             // SAFETY: these offsets are within the mapping and may refault the
             // page from the backing file after MADV_PAGEOUT.
-            assert_eq!(
-                unsafe { (mapping.cast::<u8>().add(offset)).read_volatile() },
-                0x5a
-            );
+            let byte = unsafe { (mapping.cast::<u8>().add(offset)).read_volatile() };
+            assert_eq!(byte, 0x5a);
         }
         // SAFETY: mapping and length are the values returned to this test.
         assert_eq!(unsafe { libc::munmap(mapping, LEN) }, 0);

@@ -51,6 +51,25 @@ struct Args {
     #[arg(long, env = "CATS_METERING_CGROUP_ROOT")]
     metering_cgroup_root: Option<PathBuf>,
 
+    /// Concurrent-wake commitment budget in bytes (ADR-0002 §8). Accounted in
+    /// bytes because the 2026-07-21 run showed Guest memory page read-back is
+    /// the limit, not the VMM. Default is the validated operating point
+    /// (10 x 512 MiB), not a proven optimum: re-measure before raising it.
+    #[arg(long, env = "CATS_WAKE_COMMITMENT_BUDGET_BYTES",
+          default_value_t = cats_node_agent::admission::DEFAULT_WAKE_COMMITMENT_BUDGET_BYTES)]
+    wake_commitment_budget_bytes: u64,
+    /// Ceiling on concurrently admitted wakes, so many tiny Cats cannot
+    /// bypass the byte budget. Default is the validated concurrency.
+    #[arg(long, env = "CATS_MAX_CONCURRENT_WAKES",
+          default_value_t = cats_node_agent::admission::DEFAULT_MAX_CONCURRENT_WAKES)]
+    max_concurrent_wakes: usize,
+    /// How long a wake may queue for budget before the node reports it cannot
+    /// serve the wake. Above the slowest measured concurrent restore (EBS
+    /// first-health P50 19.05 s) so a slow medium queues instead of falling
+    /// back to Cold.
+    #[arg(long, env = "CATS_WAKE_QUEUE_TIMEOUT_SECS", default_value_t = 60)]
+    wake_queue_timeout_secs: u64,
+
     /// VMM mode: fake (host processes) or ch (Cloud Hypervisor, Linux+KVM).
     #[arg(long, default_value = "fake")]
     vmm: String,
@@ -147,6 +166,11 @@ async fn main() -> anyhow::Result<()> {
             object_store,
             blockd_lease_ttl_ms: args.blockd_lease_ttl_ms,
             metering_cgroup_root: args.metering_cgroup_root,
+            wake_budget: cats_node_agent::admission::WakeBudget {
+                commitment_bytes: args.wake_commitment_budget_bytes,
+                max_wakes: args.max_concurrent_wakes,
+                queue_timeout: std::time::Duration::from_secs(args.wake_queue_timeout_secs),
+            },
             vmm,
         },
         storage_meta,

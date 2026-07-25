@@ -2473,6 +2473,25 @@ async fn prometheus_metrics(
                 format!("cats_node_allocated_memory_mib{{node_id=\"{node_id}\"}}"),
                 telemetry.allocated_memory_mib
             );
+            // Concurrent-wake gate saturation (ADR-0002 §8). Exported
+            // unconditionally so a node sitting at its budget is visible as a
+            // gauge rather than only as wake latency.
+            metric!(
+                format!("cats_node_wake_in_flight{{node_id=\"{node_id}\"}}"),
+                telemetry.wake_in_flight
+            );
+            metric!(
+                format!("cats_node_wake_commitment_bytes{{node_id=\"{node_id}\"}}"),
+                telemetry.wake_commitment_bytes
+            );
+            metric!(
+                format!("cats_node_wake_peak_in_flight{{node_id=\"{node_id}\"}}"),
+                telemetry.wake_peak_in_flight
+            );
+            metric!(
+                format!("cats_node_wake_commitment_budget_bytes{{node_id=\"{node_id}\"}}"),
+                telemetry.wake_commitment_budget_bytes
+            );
             if let Some(logical_cpus) = telemetry.host_logical_cpus {
                 metric!(
                     format!("cats_node_logical_cpus{{node_id=\"{node_id}\"}}"),

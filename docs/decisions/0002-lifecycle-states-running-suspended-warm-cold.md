@@ -39,6 +39,14 @@
 ## 待验证事项（Warm 进入生产前）
 
 - 现有 Warm 数据使用 Cloud Hypervisor 自带参考 vhost-user 后端；必须用带 dirty/lease 状态的 `cats-blockd` 重新验证 snapshot/restore 的设备状态对齐。
-- Warm/Suspended wake storm 的准入与限流（目前仅 10 并发、小规格验证）。
+- ~~Warm/Suspended wake storm 的准入与限流~~ —— **机制已实现**（`node-agent/src/admission.rs`）：
+  按 resume commitment **字节数**计量的节点级唤醒预算 + 并发数上限，超预算的唤醒**有界排队**而非被拒绝。
+  按字节而非按个数计量的依据是本实验的结论——10 并发 restore 时 `vm.restore` API 仅 25–26 ms，
+  瓶颈是 Guest 内存页回读；排队而非拒绝的依据是第 7 条——被拒绝的唤醒会被控制面收敛到 Cold，
+  从而销毁本地 Suspended/Warm 状态，使 wake storm 更严重。
+  默认值钉在本实验验证点（10 并发 / 10 × 512 MiB），**不是已证明的最优值**。
+  同时放开了 `ResumeCat` 的节点内并发（改为 per-Cat 锁），此前所有 node job 全局串行。
+  **仍待真机验证**：在与本实验同构的机型（i4i，本地 NVMe）上重测并发唤醒延迟曲线，
+  确认预算默认值与排队超时；`RestoreCat` 的并发化需先让 `start_cat` 的 NBD/tap 分配并发安全。
 - 快照加密、完整性校验与安全删除的实现。
 - 上述完成前，产品可先启用 Suspended + Cold，Warm 置于特性开关之后；状态模型与 API 命名按本 ADR 一次定型。
