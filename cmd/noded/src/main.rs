@@ -84,6 +84,16 @@ struct Args {
     /// Raw golden-root image written into fresh root volumes.
     #[arg(long)]
     ch_seed_image: Option<PathBuf>,
+    /// Guest block data path: `kernel-nbd` (Phase A) or `vhost-user` (native
+    /// virtio-blk straight into cats-blockd).
+    #[arg(long, default_value = "kernel-nbd")]
+    ch_block_path: String,
+    /// virtio-blk queues per disk on the vhost-user path.
+    #[arg(long, default_value_t = 1)]
+    ch_vhost_user_queues: usize,
+    /// Depth of each virtio-blk queue on the vhost-user path.
+    #[arg(long, default_value_t = 256)]
+    ch_vhost_user_queue_size: u16,
     #[arg(long, default_value = "/usr/sbin/nbd-client")]
     ch_nbd_client: PathBuf,
     #[arg(long, default_value_t = 64)]
@@ -141,6 +151,9 @@ async fn main() -> anyhow::Result<()> {
             initramfs: args.ch_initramfs.clone(),
             cmdline: args.ch_cmdline.clone(),
             seed_image: args.ch_seed_image.clone(),
+            block_path: cats_node_agent::ch::BlockPath::parse(&args.ch_block_path)?,
+            vhost_user_queues: args.ch_vhost_user_queues,
+            vhost_user_queue_size: args.ch_vhost_user_queue_size,
             nbd_client_bin: args.ch_nbd_client.clone(),
             nbd_devices: args.ch_nbd_devices,
             network_cidr: args.ch_network_cidr.clone(),

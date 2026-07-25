@@ -501,6 +501,9 @@ fn filesystem_capacity(path: &FsPath) -> Option<(u64, u64)> {
     // SAFETY: statvfs returned zero, so it initialized the output structure.
     let stats = unsafe { stats.assume_init() };
     let block_size = stats.f_frsize;
+    // The statvfs block counters are 32-bit on some platforms and 64-bit on
+    // others, so the cast is redundant on Linux but required elsewhere.
+    #[allow(clippy::unnecessary_cast)]
     Some((
         (stats.f_blocks as u64).saturating_mul(block_size),
         (stats.f_bavail as u64).saturating_mul(block_size),

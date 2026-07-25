@@ -1,0 +1,18 @@
+   Compiling cats-blockd v0.1.0 (/work/blockd)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.39s
+     Running tests/vhost_user_blk.rs (/target/debug/deps/vhost_user_blk-b062c297e4ec2b7f)
+
+running 10 tests
+test discard_and_write_zeroes_zero_the_range ... ok
+test fenced_attachment_fails_closed_for_the_guest ... ok
+test out_of_range_and_unknown_requests_fail_the_request_only ... ok
+test get_id_reports_the_volume_id ... ok
+test payload_split_across_descriptors_is_reassembled ... ok
+test multi_queue_requests_run_in_parallel ... ok
+test pipelined_requests_complete_out_of_order_safely ... ok
+test config_space_reports_the_engine_geometry ... ok
+test works_without_event_idx ... ok
+test write_read_flush_matches_the_nbd_oracle ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.71s
+

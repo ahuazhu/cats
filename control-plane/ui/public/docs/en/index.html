@@ -25,7 +25,7 @@
 <h2 id="current-scope">Current V1 developer shape</h2>
 <p>The Rust workspace implements the control plane, CLI, embedded user/admin consoles, node and Guest agents, endpoint gateway contracts, ChunkStore engine, provider-neutral storage adapters, and a Cloud Hypervisor Phase-A path. The following limitations matter when evaluating or operating this source version:</p>
 <table><thead><tr><th>Area</th><th>Current status</th><th>What it means</th></tr></thead><tbody>
-  <tr><td>Block frontend</td><td>Kernel NBD in Cloud Hypervisor Phase A</td><td>Native vhost-user-blk remains a later performance milestone.</td></tr>
+  <tr><td>Block frontend</td><td>Kernel NBD by default; native vhost-user-blk available</td><td>Both frontends drive the same engine and commit protocol. vhost-user-blk (<code>--ch-block-path vhost-user</code>) has passed protocol-level acceptance but not yet a real-VMM (KVM) run, so kernel NBD stays the default.</td></tr>
   <tr><td>Guest networking</td><td>Tap/overlay not implemented</td><td>Endpoint routing is covered in the FakeVmm development path; do not claim full CH Guest networking yet.</td></tr>
   <tr><td>Concurrent wakes</td><td>Bounded per node</td><td>Suspended/Warm wakes are admitted against a node budget accounted in resume-commitment bytes; excess wakes queue rather than fail. Defaults match the 2026-07-21 validated point (10 concurrent) and are not a proven optimum.</td></tr>
   <tr><td>Control metadata</td><td>SQLite development store</td><td>The PostgreSQL storage metadata adapter exists, but the project resource store is still SQLite-shaped development state.</td></tr>

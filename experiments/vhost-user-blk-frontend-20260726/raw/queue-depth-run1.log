@@ -1,0 +1,15 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.15s
+     Running tests/vhost_user_bench.rs (/target/release/deps/vhost_user_bench-e7173f80bcb3bb40)
+
+running 1 test
+test vhost_user_queue_depth_scaling ... 
+workload    qd        ops/s      MiB/s
+randread     1        34268      133.9
+randread     4        88864      347.1
+randread     8       127466      497.9
+randread    16       184694      721.5
+randread    32       222461      869.0
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 8.43s
+

@@ -171,7 +171,35 @@ dirty set 为空时 FLUSH 直接成功（generation 不变）。
 - 协议：NBD newstyle fixed（`NBD_OPT_GO`），仅导出单卷；支持 `READ / WRITE / FLUSH / TRIM / WRITE_ZEROES / DISC`。
 - 传输：unix socket（默认）或 TCP。
 - 语义映射：WRITE→§5 写路径；FLUSH→§6；TRIM/WRITE_ZEROES→写零（V1 不改 Map 为 Hole，Compaction 阶段优化）；`FUA` 位按 FLUSH 处理。
-- 生产 Guest 路径为 vhost-user-blk（Linux 里程碑），复用同一 Block Engine；NBD 永久保留用于恢复工具与 oracle 测试。
+- NBD 永久保留用于恢复工具、golden root seeding、readiness 探测与 oracle 测试；生产 Guest 路径见 §7.1。
+
+## 7.1 vhost-user-blk 前端（生产 Guest 路径，Linux）
+
+选定为生产前端（[ADR-0015](../decisions/0015-vhost-user-blk-production-block-frontend.md)）。
+后端 listen、VMM connect；一个进程可同时提供 §7 的 NBD socket 与本节的 vhost-user
+socket，两者服务同一个 engine 与同一个 attachment lease。
+
+- 传输：unix socket + `VHOST_USER_SET_MEM_TABLE` 共享 Guest 内存 + 每队列 kick/call eventfd。
+- 协议特性：`MQ`、`CONFIG`。virtio 特性：`VERSION_1`、`INDIRECT_DESC`、`EVENT_IDX`、
+  `SEG_MAX`、`BLK_SIZE`、`FLUSH`、`DISCARD`、`WRITE_ZEROES`，`num_queues > 1` 时加 `MQ`。
+- Config space：`capacity` = 卷字节数 / 512；`blk_size` = 512（与 §7 路径 Guest 可见
+  几何一致）；`size_max` = 32 MiB；`seg_max` = queue_size − 2；`writeback` = 1；
+  `write_zeroes_may_unmap` = 0。
+- 请求映射（与 §7 完全同构，调用同一批 engine 入口）：
+
+  | virtio-blk 请求 | 语义 |
+  |---|---|
+  | `IN` | §5 读路径，`sector * 512` 偏移，长度为可写描述符总长减状态字节 |
+  | `OUT` | §5 写路径 |
+  | `FLUSH` | §6 提交协议；dirty set 为空则直接成功 |
+  | `DISCARD` / `WRITE_ZEROES` | 写零（V1 不改 Map 为 Hole）；每段 16 字节 `{sector, num_sectors, flags}` |
+  | `GET_ID` | 返回 volume id（截断到 20 字节） |
+
+- 状态码：成功 `OK`；未知请求类型与未定义 flag `UNSUPP`；越界、fenced attachment
+  与其它 engine 错误 `IOERR`。**fenced 必须 fail closed**：旧 epoch 的写和 FLUSH 都返回
+  `IOERR`，不允许 ACK 永远无法提交的数据。
+- 每个队列一个 worker 线程；队列数不改变提交协议，FLUSH 始终是整卷屏障。
+- 畸形描述符链（缺状态字节、header 被截断）只失败该请求并记日志，队列继续服务。
 
 ## 8. 正确性判据（测试必须覆盖）
 

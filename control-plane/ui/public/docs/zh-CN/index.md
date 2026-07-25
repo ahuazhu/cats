@@ -21,7 +21,7 @@ Rust workspace 已实现控制面、CLI、嵌入式用户/管理员控制台、N
 
 | 领域 | 当前状态 | 实际含义 |
 |----|----|----|
-| 块设备前端 | Cloud Hypervisor Phase A 使用内核 NBD | 原生 vhost-user-blk 仍是后续性能里程碑。 |
+| 块设备前端 | 默认内核 NBD，可选原生 vhost-user-blk | 两种前端驱动同一个引擎与同一套提交协议。vhost-user-blk（`--ch-block-path vhost-user`）已通过协议级验收，但尚未做真机（KVM）验收，因此默认仍是内核 NBD。 |
 | Guest 网络 | tap/overlay 尚未实现 | Endpoint 路由已覆盖 FakeVmm 开发路径，不能宣称 CH Guest 网络已经完整。 |
 | 并发唤醒 | 按节点预算限流 | Suspended/Warm 唤醒按 resume commitment 字节数计入节点预算，超出的唤醒排队而非失败。默认值取 2026-07-21 实验验证点（10 并发），不是已证明的最优值。 |
 | 控制元数据 | SQLite 开发存储 | 存储元数据 PostgreSQL adapter 已存在，但 Project 资源存储仍是 SQLite 开发形态。 |

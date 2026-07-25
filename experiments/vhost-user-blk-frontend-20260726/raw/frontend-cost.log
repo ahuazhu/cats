@@ -1,0 +1,93 @@
+   Compiling cats-blockd v0.1.0 (/work/blockd)
+    Finished `release` profile [optimized + debuginfo] target(s) in 2.06s
+     Running tests/vhost_user_bench.rs (/target/release/deps/vhost_user_bench-e7173f80bcb3bb40)
+
+running 1 test
+test frontend_cost_nbd_versus_vhost_user ... 
+workload     block thr  qd  frontend               ops/s      MiB/s    p50 us    p99 us
+randread      4096   1   1  nbd                    43110      168.4        20        94
+randread      4096   1   1  nbd                    42376      165.5        20        94
+randread      4096   1   1  nbd                    44004      171.9        19        89
+randread      4096   1   1  nbd                    43333      169.3        20        93
+randread      4096   1   1  nbd                    41781      163.2        20        98
+randread      4096   1   1  vhost-user-blk         34415      134.4        25        82
+randread      4096   1   1  vhost-user-blk         33762      131.9        25        85
+randread      4096   1   1  vhost-user-blk         34812      136.0        25        89
+randread      4096   1   1  vhost-user-blk         35084      137.0        25        82
+randread      4096   1   1  vhost-user-blk         34007      132.8        25        88
+randwrite     4096   1   1  nbd                    37712      147.3        20       121
+randwrite     4096   1   1  nbd                    33819      132.1        21       132
+randwrite     4096   1   1  nbd                    37199      145.3        20       113
+randwrite     4096   1   1  nbd                    37709      147.3        20       120
+randwrite     4096   1   1  nbd                    36418      142.3        20       124
+randwrite     4096   1   1  vhost-user-blk         34154      133.4        23       112
+randwrite     4096   1   1  vhost-user-blk         31996      125.0        25       117
+randwrite     4096   1   1  vhost-user-blk         42235      165.0        24       106
+randwrite     4096   1   1  vhost-user-blk         32306      126.2        25       108
+randwrite     4096   1   1  vhost-user-blk         33567      131.1        22       127
+randread      4096   4   1  nbd                    70662      276.0        47       174
+randread      4096   4   1  nbd                    68834      268.9        49       185
+randread      4096   4   1  nbd                    73852      288.5        44       180
+randread      4096   4   1  nbd                    71081      277.7        47       170
+randread      4096   4   1  nbd                    70819      276.6        47       178
+randread      4096   4   1  vhost-user-blk         76944      300.6        46       135
+randread      4096   4   1  vhost-user-blk         83410      325.8        41       122
+randread      4096   4   1  vhost-user-blk         81953      320.1        40       142
+randread      4096   4   1  vhost-user-blk         60035      234.5        54       177
+randread      4096   4   1  vhost-user-blk         79270      309.6        44       129
+randwrite     4096   4   1  nbd                    55533      216.9        52       376
+randwrite     4096   4   1  nbd                    53933      210.7        55       337
+randwrite     4096   4   1  nbd                    52564      205.3        56       358
+randwrite     4096   4   1  nbd                    55264      215.9        53       345
+randwrite     4096   4   1  nbd                    52139      203.7        58       336
+randwrite     4096   4   1  vhost-user-blk         68586      267.9        41       321
+randwrite     4096   4   1  vhost-user-blk         68813      268.8        42       298
+randwrite     4096   4   1  vhost-user-blk         70318      274.7        42       302
+randwrite     4096   4   1  vhost-user-blk         72691      283.9        37       327
+randwrite     4096   4   1  vhost-user-blk         67839      265.0        44       301
+seqread    1048576   1   1  nbd                     3869     3869.5       247       423
+seqread    1048576   1   1  nbd                     3495     3494.6       276       501
+seqread    1048576   1   1  nbd                     3397     3396.9       276       510
+seqread    1048576   1   1  nbd                     2550     2550.5       376       753
+seqread    1048576   1   1  nbd                     2860     2860.3       341       519
+seqread    1048576   1   1  vhost-user-blk          5072     5072.2       189       270
+seqread    1048576   1   1  vhost-user-blk          5682     5682.1       173       271
+seqread    1048576   1   1  vhost-user-blk          5486     5485.7       174       260
+seqread    1048576   1   1  vhost-user-blk          5267     5266.6       185       271
+seqread    1048576   1   1  vhost-user-blk          5888     5888.5       166       263
+seqwrite   1048576   1   1  nbd                     3652     3651.9       260       491
+seqwrite   1048576   1   1  nbd                     3120     3119.9       305       694
+seqwrite   1048576   1   1  nbd                     3664     3664.3       258       472
+seqwrite   1048576   1   1  nbd                     3545     3544.6       261       620
+seqwrite   1048576   1   1  nbd                     3524     3523.7       272       497
+seqwrite   1048576   1   1  vhost-user-blk          5017     5016.6       178       513
+seqwrite   1048576   1   1  vhost-user-blk          7560     7559.8       118       294
+seqwrite   1048576   1   1  vhost-user-blk          7144     7143.8       126       279
+seqwrite   1048576   1   1  vhost-user-blk          7411     7410.6       120       295
+seqwrite   1048576   1   1  vhost-user-blk          7418     7417.8       119       294
+flush         4096   1   1  nbd                       48        0.2     20347     31945
+flush         4096   1   1  nbd                       51        0.2     19451     24635
+flush         4096   1   1  nbd                       52        0.2     19223     22676
+flush         4096   1   1  nbd                       48        0.2     20390     24937
+flush         4096   1   1  nbd                       49        0.2     20115     25107
+flush         4096   1   1  vhost-user-blk            48        0.2     20193     30358
+flush         4096   1   1  vhost-user-blk            49        0.2     20380     23400
+flush         4096   1   1  vhost-user-blk            48        0.2     20420     23089
+flush         4096   1   1  vhost-user-blk            50        0.2     19666     23416
+flush         4096   1   1  vhost-user-blk            48        0.2     20218     32300
+
+mean over 5 repeats (ops/s):
+workload                          nbd  vhost-user-blk   speedup
+randread 4KiB t1 qd1            42921           34416     0.80x
+randwrite 4KiB t1 qd1           36571           34852     0.95x
+randread 4KiB t4 qd1            71050           76323     1.07x
+randwrite 4KiB t4 qd1           53887           69650     1.29x
+seqread 1024KiB t1 qd1           3234            5479     1.69x
+seqwrite 1024KiB t1 qd1          3501            6910     1.97x
+flush 4KiB t1 qd1                  49              49     0.98x
+
+wrote /work/experiments/vhost-user-blk-frontend-20260726/raw/frontend-cost.csv
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 134.55s
+

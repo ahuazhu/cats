@@ -1,0 +1,7 @@
+workload,rw,block_bytes,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+randread-4k-qd1,randread,4k,1,20167,78.778,43.8,38,129
+randread-4k-qd32,randread,4k,32,153259,598.679,207.4,198,449
+randwrite-4k-qd1,randwrite,4k,1,20733,80.987,41.7,36,126
+randwrite-4k-qd32,randwrite,4k,32,181425,708.705,174.5,161,379
+seqread-1m-qd1,read,1M,1,2293,2293.071,419.7,403,676
+seqwrite-1m-qd1,write,1M,1,2475,2474.953,190.6,183,330

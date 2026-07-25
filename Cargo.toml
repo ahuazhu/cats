@@ -92,6 +92,14 @@ aws-sdk-dynamodb = "1"
 aws-sdk-kinesis = "1"
 aws-sdk-s3 = "1"
 
+# rust-vmm ecosystem (Linux-only data plane: vhost-user-blk frontend, ADR-0004).
+vhost = "0.17"
+vhost-user-backend = "0.23"
+virtio-bindings = "0.2"
+virtio-queue = "0.18"
+vm-memory = { version = "0.18", features = ["backend-mmap", "backend-atomic"] }
+vmm-sys-util = "0.15"
+
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
