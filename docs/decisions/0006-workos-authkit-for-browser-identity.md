@@ -4,7 +4,8 @@
 - 日期：2026-07-22
 
 > CLI project token 部分已由 ADR-0008 取代；本 ADR 的浏览器 session、组织映射和
-> user/admin 隔离决定继续有效。
+> user/admin 隔离决定继续有效。无 Organization 的 Personal Project 及
+> Organization/Workspace 一一映射已由 ADR-0014 取代。
 
 ## 背景
 

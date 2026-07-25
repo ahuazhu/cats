@@ -117,12 +117,14 @@ API 必须围绕稳定资源建模，而不是围绕某台 Host 上的进程建�
 
 ```mermaid
 flowchart TD
-    Tenant --> Project
-    Project --> Cat
-    Project --> Disk
-    Project --> Endpoint
-    Project --> Image
-    Project --> Secret
+    User -->|membership| Account
+    Account --> BillingAccount
+    Account --> Workspace
+    Workspace --> Cat
+    Workspace --> Disk
+    Workspace --> Endpoint
+    Workspace --> Image
+    Workspace --> Secret
 
     Cat -->|owns; delete cascades| RootDisk["Disk: RootDisk"]
     Cat -->|runtime mount| Attachment
@@ -139,16 +141,16 @@ flowchart TD
 
 | 资源 | 关键字段 | 生命周期与不变量 |
 |----|----|----|
-| Tenant | `tenant_id, plan, status, quotas` | 所有资源必须属于一个 Tenant；跨租户查询在数据库与 API 两层拒绝 |
-| Project | `project_id, region, network_cidr, budget` | Region 固定；成员、资源、账单和私网的管理边界 |
-| Cat | `cat_id, spec, image_id, root_disk_id, desired_state, observed_state, generation` | RootDisk 必须存在；Cat 删除最终级联删除 RootDisk，不删除外接盘 |
-| Disk | `disk_id, kind, size, backend, state, current_root` | Root 或 Persistent；只能扩容；RWO；删除前必须无有效 Attachment |
+| Account | `account_id, kind, workos_organization_id, billing_account_id, status, quotas` | Personal/Organization 都是租户；成员和账单属于 Account；跨 Account 查询在数据库与 API 两层拒绝 |
+| Workspace | `workspace_id, account_id, slug, legacy_project, region, network_cidr` | Account 内的资源隔离边界；slug 可改、ID 不变；V1 Project 路由键只用于兼容 |
+| Cat | `cat_id, workspace_id, spec, image_id, root_disk_id, desired_state, observed_state, generation` | 不可变 Workspace 归属随资源写入；RootDisk 必须存在；Cat 删除最终级联删除 RootDisk，不删除外接盘 |
+| Disk | `disk_id, workspace_id, kind, size, backend, state, current_root` | 不可变 Workspace 归属随资源写入；Root 或 Persistent；只能扩容；RWO；删除前必须无有效 Attachment |
 | Attachment | `attachment_id, disk_id, cat_id, node_id, lease_epoch, expires_at` | 唯一 active writer；epoch 单调增加；旧 epoch 永远不能再次提交 |
 | Endpoint | `endpoint_id, hostname, target_port, protocol, wake_policy` | 名称稳定；绑定随 Cat 位置变化；解绑时不能误路由到旧 Guest |
 | Image | `image_id, version, digest, kernel_abi, status, signature` | 已发布版本不可变；RootDisk 从明确 digest 创建，不直接依赖 mutable tag |
 | Snapshot | `snapshot_id, disk_id, root_ref, generation, state` | 不可变；Clone/Restore 指向同一只读根；删除走 grace period + GC |
 | Secret | `secret_id, ciphertext, key_version, allowed_cats` | 控制面不保存明文；不得进入 Image、日志、命令行或 registry event payload |
-| Operation | `operation_id, kind, resource_id, idempotency_key, phase, error` | 每次变更可查询、可重试、可审计；同一幂等键不得产生两套资源 |
+| Operation | `operation_id, workspace_id, kind, resource_id, idempotency_key, phase, error` | 继承目标资源的不可变 Workspace 归属；每次变更可查询、可重试、可审计；同一幂等键不得产生两套资源 |
 
 ## 4. 用户接口与端到端流程
 
@@ -158,7 +160,8 @@ flowchart TD
 # 登录和选择 workspace（登录与选择分离；命令可用 --workspace 临时覆盖）
 cats login
 cats workspace list
-cats workspace use acme-dev
+cats workspace use acme/dev
+cats --workspace acme/prod ls
 
 # 创建 Cat；RootDisk 自动创建
 cats create dev --image ubuntu-24.04 --cpus 4 --memory 8GiB --root-size 100GiB
@@ -766,7 +769,18 @@ Identity
 
 ### 用户与组织
 
-OIDC/WorkOS 提供登录；平台数据库保存 Tenant、Project、Role 映射。
+OIDC/WorkOS 提供登录；平台数据库保存 Account、Workspace、不可变 ID、legacy Project
+路由、Billing Account binding 与 membership shadow。Personal 和 Organization Account
+都映射到 WorkOS Organization：同 Account 内切换 Workspace 不刷新 WorkOS token，
+跨 Account 使用旋转 refresh token 切换 Organization scope。服务端按 active
+membership、不可变 Account/Workspace ID 和 permission 重新授权，不信任 email、
+display name、URL slug 或客户端缓存 role。
+
+新用户通过幂等 provisioning 状态机获得 Personal Account、`default` Workspace 和
+只属于 Personal Billing Account 的一次性 10 美元 signup grant。唯一 eligibility
+键为 WorkOS user ID + campaign；创建 Workspace/Organization 或接受邀请不重复发放。
+WorkOS、本地 metadata 与 credit ledger 不宣称跨服务 ACID，Account 只在全部步骤完成
+后进入 active。详见 ADR-0014。
 
 - Owner / Admin / Developer / Viewer
 - 短期 session cookie

@@ -1106,13 +1106,17 @@ mod tests {
     #[test]
     fn public_landing_pages_publish_pricing_and_signup_credit() {
         for body in [LANDING_EN, LANDING_ZH] {
-            for contract in ["id=\"pricing\"", "$0.07", "$0.04375", "$10", "Stripe"] {
+            for contract in ["id=\"pricing\"", "$0.07", "$0.045", "$10", "Stripe"] {
                 assert!(
                     body.contains(contract),
                     "public pricing page is missing {contract:?}"
                 );
             }
         }
+        assert!(LANDING_EN.contains("Personal Billing Account"));
+        assert!(LANDING_ZH.contains("Personal Billing Account"));
+        assert!(!LANDING_EN.contains("Every new billing account receives"));
+        assert!(!LANDING_ZH.contains("每个新 Billing Account"));
     }
 
     #[test]

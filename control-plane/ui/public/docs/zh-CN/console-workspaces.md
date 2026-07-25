@@ -13,17 +13,23 @@ WorkOS 未配置时，浏览器站点会 fail closed 并显示面向管理员的
 
 ## CLI Device Login
 
-`cats login` 启动 WorkOS Device Authorization，显示验证 URL/Code，并在可能时打开浏览器。Access Token 与轮换 Refresh Token 只保存在操作系统凭据存储；权限为 `0600` 的 CLI 配置文件只包含 API URL、公开用户/Workspace 数据与当前选择。使用 `cats whoami`、`cats workspace list`、`cats workspace use SLUG` 与 `cats logout` 管理会话。
+`cats login` 启动 WorkOS Device Authorization，显示验证 URL/Code，并在可能时打开浏览器。Access Token 与轮换 Refresh Token 只保存在操作系统凭据存储；权限为 `0600` 的 CLI 配置文件只包含 API URL、公开用户/Workspace 数据与当前选择。使用 `cats whoami`、`cats workspace list`、`cats workspace use ACCOUNT/WORKSPACE` 与 `cats logout` 管理会话。
 
 ## Workspace
 
-WorkOS Organization 必须显式映射到一个 Cats Workspace。未映射 Organization 不能被枚举或访问。没有 Organization Membership 的用户会基于已验证 WorkOS User ID 获得确定性的个人 Workspace。
+用户可以属于一个或多个 Personal/Organization Account；每个 Account 拥有一个或多个 Workspace 和一个计费边界。包括 Personal 在内的所有 Account 都映射到 WorkOS Organization。新用户只会获得一个 Personal Account、一个 slug 为 `default` 的 Workspace，以及只属于该 Personal Billing Account、不可转移的一次性 10 美元赠金。新建 Workspace 或加入 Organization 不会再次发放。
+
+Workspace slug 只需在 Account 内唯一并允许修改；不可变 Account/Workspace ID 保持授权与资源归属不变。控制台使用可复制的 `/user/ACCOUNT/WORKSPACE/` URL。CLI 接受同样的 `account/workspace` locator；只有无歧义时才接受裸 slug。
 
 **用户名称与 API 兼容性**
 
-CLI 与控制台把该边界称为 *Workspace*。V1 HTTP API 路径和资源库列仍保留兼容名称 `project`；修改 URL 字符串不能改变已验证身份建立的 Workspace。
+CLI 与控制台把该边界称为 *Workspace*。V1 HTTP API 路径和资源库列仍保留兼容名称 `project`；每个 Workspace 都有稳定的 legacy Project 路由，因此修改 slug 不会移动资源，也不会改写 usage/credit 历史。
 
-登录与选择相互独立。`cats workspace use acme-dev` 保存默认值并获取 Organization 范围的 Access Token；`--workspace acme-prod` 仅覆盖一条命令，不改变默认选择。
+登录与选择相互独立。`cats workspace use acme/dev` 保存默认值；`--workspace acme/prod` 仅覆盖一条命令。同一 Account 内切换只改本地选择；跨 Account 时才把轮换 Refresh Token 切到目标 WorkOS Organization scope，并通过跨进程锁串行化 CLI 刷新。
+
+## Organization 成员与邀请
+
+拥有 `cats:members:manage` Permission 的 Organization 成员可以按 email 邀请用户，并指定初始 `member` 或 `admin` role。WorkOS 把邀请绑定到该 Organization，接受后创建或激活 membership。Cats 在资源和成员管理请求中重新确认 active membership；修改客户端 slug 或缓存 role 不能获得权限。Personal Account 不开放邀请。
 
 ## 用户控制台
 

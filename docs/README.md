@@ -49,8 +49,11 @@ Fleet 管理员指南不属于官网用户文档。其双语源文件位于
 |---|---|---|---|---|
 | 存储架构设计（JuiceFS raw 方案） | [HTML](cats-storage-product-blueprint.html) | [Markdown](cats-storage-product-blueprint.md) | 历史参考，未采用（ADR-0003） | RootDisk/PersistentDisk 产品语义的最初出处；JuiceFS-backed disk.raw 备选设计 |
 | Sprite 小文件存储路径 | [HTML](sprite-storage-flow.html) | [Markdown](sprite-storage-flow.md) | 历史/竞品参考 | 解释小文件、ext4 逻辑块、Chunk 和对象存储之间的关系 |
+| 竞品与市场格局分析 | — | [Markdown](cats-competitive-landscape.md) | 外部调研快照（2026-07-25） | 按五个关键指标逐项横比（成本/持久性/环境保真度/隔离/并发）、逐产品档案、独立持久卷、计量基准与实际账单、自建 vs 买的成本边界、需求侧证据、Cats 的优势与差距、国内合规约束 |
 
-`Sprite` 文档用于理解和比较，不代表 Cats 必须复刻其未公开实现。Direct-S3（Direct-OS 实现）已按 ADR-0003 选定为存储基线；当前 Python 原型只证明语义，不能代表生产性能。JuiceFS 蓝图不再实现，其中与后端无关的产品语义已并入完整架构文档。
+`Sprite` 文档用于理解和比较，不代表 Cats 必须复刻其未公开实现。
+[竞品与市场格局分析](cats-competitive-landscape.md)是外部调研快照，不是实现契约；
+其中已证实 Sprites 即 Fly.io 于 2026-01 发布的产品，且证实了 `sprite-storage-flow.md` 中标注的结构性推断。Direct-S3（Direct-OS 实现）已按 ADR-0003 选定为存储基线；当前 Python 原型只证明语义，不能代表生产性能。JuiceFS 蓝图不再实现，其中与后端无关的产品语义已并入完整架构文档。
 
 ## Architecture Decision Records
 

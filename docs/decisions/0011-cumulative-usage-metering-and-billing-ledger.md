@@ -8,7 +8,7 @@
 Cats 已决定采用 Sprites 类似的实际用量模型，首个公开 Rate Card 为：
 
 - CPU：`$0.07 / CPU-hour`
-- 内存：`$0.04375 / GiB-hour`
+- 内存：`$0.045 / GiB-hour`
 
 用户还必须能够查询一个 Billing Account（当前 V1 的 Workspace/Project）任意时间范围的
 账单、一个 Cat 任意时间范围的详单，以及按计费项聚合的账单，并在正常情况下看到
@@ -121,7 +121,7 @@ CPU:
   70,000,000 nanodollars / 3,600,000,000 microseconds
 
 Memory:
-  43,750,000 nanodollars /
+  45,000,000 nanodollars /
   (1,073,741,824 bytes * 3,600,000 milliseconds)
 ```
 

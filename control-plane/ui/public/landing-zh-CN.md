@@ -127,21 +127,21 @@ Guest 只看到 virtio 块设备和普通 ext4，不会接触对象存储 API �
 
 简单的预付费价格
 
-## 计算资源按小时计费，新账户先送 $10。
+## 计算资源按小时计费，新用户先送 $10。
 
-每个新 Billing Account 一次性获得 $10 赠金。不收订阅费和席位费；余额不足时可通过 Stripe 安全充值。
+每位新用户的 Personal Account 一次性获得 $10 赠金。不收订阅费和席位费；余额不足时可通过 Stripe 安全充值。
 
 ### CPU — $0.07 / CPU-hour
 
 根据 cgroup 累计 CPU 时间采样，使用精确整数进行计价。
 
-### 内存 — $0.04375 / GiB-hour
+### 内存 — $0.045 / GiB-hour
 
 根据内存用量的时间积分计费；一个 GiB 为 2³⁰ 字节。
 
 ### 新账户赠金 — $10
 
-每个 Billing Account 仅发放一次。控制台提供准实时用量、余额和 Cat 级详单。
+只向新用户的 Personal Billing Account 发放一次；创建 Organization 或 Workspace 不会重复领取。控制台提供准实时用量、余额和 Cat 级详单。
 
 开放账期内金额为暂估，待用量数据稳定后结算。以上为当前已公开的 CPU 与内存计费项。
 

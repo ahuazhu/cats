@@ -129,19 +129,19 @@ Simple prepaid pricing
 
 ## Pay for compute by the hour. Start with $10 on us.
 
-Every new billing account receives a one-time $10 promotional credit. No subscription and no seat fee—add prepaid funds securely with Stripe when you need more.
+Every new user receives a one-time $10 promotional credit on their Personal Account. No subscription and no seat fee—add prepaid funds securely with Stripe when you need more.
 
 ### CPU — $0.07 / CPU-hour
 
 Charged from cumulative cgroup CPU time with exact integer rating.
 
-### Memory — $0.04375 / GiB-hour
+### Memory — $0.045 / GiB-hour
 
 Charged from memory usage integrated over time. One GiB is 2³⁰ bytes.
 
 ### New account credit — $10
 
-Applied once per billing account. The console shows near-real-time usage, remaining credit, and Cat-level detail.
+Applied once to the new user's Personal Billing Account; creating Organizations or Workspaces does not repeat it. The console shows near-real-time usage, remaining credit, and Cat-level detail.
 
 Open-period totals are provisional until usage settles. Prices above cover the currently published CPU and memory meters.
 

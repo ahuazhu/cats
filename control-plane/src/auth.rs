@@ -2,9 +2,10 @@
 //!
 //! Browser sessions use separate encrypted, HttpOnly cookies for the user and
 //! administrator sites. The CLI sends short-lived WorkOS access JWTs, which
-//! are verified against WorkOS JWKS on every API request. A WorkOS
-//! Organization is mapped explicitly to one Cats workspace/project; an
-//! organization-less AuthKit user receives an isolated personal workspace.
+//! are verified against WorkOS JWKS on every API request. Every Personal or
+//! Organization Account maps to one WorkOS Organization and may own multiple
+//! Cats workspaces; organization scope and immutable local IDs are both
+//! checked before resource access.
 
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, HeaderValue};
@@ -12,30 +13,44 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use workos::enums::UserOrganizationMembershipStatus;
 use workos::helpers::{
     seal, seal_session, unseal, AuthKitAuthorizationUrlParams, AuthKitPkceCodeExchangeParams,
     SessionData, SessionManager, SessionRefreshOptions, SessionState,
 };
-use workos::models::RevokeSession;
-use workos::resources::organization_membership::ListOrganizationMembershipsParams;
-use workos::resources::user_management::RevokeSessionParams;
+use workos::models::{CreateUserInviteOptions, OrganizationInput, RevokeSession};
+use workos::resources::organization_membership::{
+    CreateOrganizationMembershipParams, CreateOrganizationMembershipParamsBody,
+    ListOrganizationMembershipsParams, Role, UpdateOrganizationMembershipParams,
+    UpdateOrganizationMembershipParamsBody,
+};
+use workos::resources::organizations::CreateOrganizationParams;
+use workos::resources::user_management::{
+    ListInvitationsParams, RevokeSessionParams, SendInvitationParams,
+};
+use workos::RequestOptions;
 
-use cats_api::auth::{CliAuthConfigResponse, MeResponse, UserProfile, Workspace, WorkspaceKind};
-use cats_api::error::ApiError;
+use cats_api::auth::{
+    Account, AccountInvitation, AccountMember, CliAuthConfigResponse, MeResponse, UserProfile,
+    Workspace,
+};
+use cats_api::error::{ApiError, ErrorCode};
 
 use crate::api::Failure;
 use crate::server::AppState;
 
 const USER_SESSION_COOKIE: &str = "cats_user_session";
+const USER_CONTEXT_COOKIE: &str = "cats_user_context";
 const ADMIN_SESSION_COOKIE: &str = "cats_admin_session";
 const USER_FLOW_COOKIE: &str = "cats_user_auth_flow";
 const ADMIN_FLOW_COOKIE: &str = "cats_admin_auth_flow";
 const SESSION_MAX_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
 const FLOW_MAX_AGE_SECONDS: u64 = 10 * 60;
 const FLOW_MAX_AGE_UNIX_SECONDS: i64 = 10 * 60;
+const SIGNUP_CAMPAIGN: &str = "signup-2026-10usd";
+const SIGNUP_CREDIT_NANOS: i128 = 10_000_000_000;
 
 #[derive(Clone)]
 pub struct WorkOsConfig {
@@ -53,6 +68,7 @@ pub struct WorkOsConfig {
     cookie_domain: Option<String>,
     user_site_url: String,
     admin_site_url: String,
+    browser_session_heads: Arc<tokio::sync::Mutex<BTreeMap<String, String>>>,
 }
 
 pub struct WorkOsConfigParams {
@@ -86,10 +102,6 @@ impl WorkOsConfig {
             "WorkOS API key must not be empty"
         );
         anyhow::ensure!(
-            !params.project_organizations.is_empty(),
-            "at least one WorkOS project/organization mapping is required"
-        );
-        anyhow::ensure!(
             !params.admin_organization_id.is_empty(),
             "WorkOS admin organization ID must not be empty"
         );
@@ -97,16 +109,11 @@ impl WorkOsConfig {
             !params.admin_permission.is_empty(),
             "WorkOS admin permission must not be empty"
         );
-        let mut organization_ids = BTreeSet::new();
         for (project, organization_id) in &params.project_organizations {
             anyhow::ensure!(!project.is_empty(), "Cats project name must not be empty");
             anyhow::ensure!(
                 !organization_id.is_empty(),
                 "WorkOS organization ID must not be empty"
-            );
-            anyhow::ensure!(
-                organization_ids.insert(organization_id),
-                "a WorkOS organization may map to only one Cats project"
             );
         }
         // Exercise the SDK's password validation at startup rather than on
@@ -169,15 +176,8 @@ impl WorkOsConfig {
             cookie_domain: params.cookie_domain,
             user_site_url,
             admin_site_url,
+            browser_session_heads: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
         })
-    }
-
-    fn project_for_organization(&self, organization_id: &str) -> Option<&str> {
-        self.project_organizations
-            .iter()
-            .find_map(|(project, candidate)| {
-                (candidate == organization_id).then_some(project.as_str())
-            })
     }
 
     pub fn client_id(&self) -> &str {
@@ -186,6 +186,339 @@ impl WorkOsConfig {
 
     pub fn api_base_url(&self) -> &str {
         &self.api_base_url
+    }
+
+    pub fn project_organizations(&self) -> &BTreeMap<String, String> {
+        &self.project_organizations
+    }
+
+    async fn ensure_personal_organization(
+        &self,
+        user_id: &str,
+        display_name: &str,
+    ) -> Result<String, ApiError> {
+        let external_id = format!("cats-personal:{user_id}");
+        let organization = match self
+            .client
+            .organizations()
+            .get_organization_by_external_id(&external_id)
+            .await
+        {
+            Ok(organization) => organization,
+            Err(error) if error.is_not_found() => self
+                .client
+                .organizations()
+                .create_organization(CreateOrganizationParams::new(OrganizationInput {
+                    name: format!("{display_name}'s Personal Account"),
+                    allow_profiles_outside_organization: Some(false),
+                    domains: None,
+                    domain_data: None,
+                    metadata: Some(std::collections::HashMap::from([(
+                        "cats_account_kind".to_string(),
+                        "personal".to_string(),
+                    )])),
+                    external_id: Some(external_id),
+                }))
+                .await
+                .map_err(|error| {
+                    tracing::warn!(error = %error, user_id, "WorkOS personal organization create failed");
+                    ApiError::unavailable(
+                        "personal account provisioning is temporarily unavailable",
+                    )
+                })?,
+            Err(error) => {
+                tracing::warn!(error = %error, user_id, "WorkOS personal organization lookup failed");
+                return Err(ApiError::unavailable(
+                    "personal account provisioning is temporarily unavailable",
+                ));
+            }
+        };
+        if !self
+            .user_has_active_membership(user_id, &organization.id)
+            .await?
+        {
+            let mut body =
+                CreateOrganizationMembershipParamsBody::new(user_id, organization.id.clone());
+            body.role = Some(Role::Single {
+                role_slug: "admin".to_string(),
+            });
+            self.client
+                .organization_membership()
+                .create_organization_membership(CreateOrganizationMembershipParams::new(body))
+                .await
+                .map_err(|error| {
+                    tracing::warn!(
+                        error = %error,
+                        user_id,
+                        organization_id = organization.id,
+                        "WorkOS personal owner membership create failed"
+                    );
+                    ApiError::unavailable(
+                        "personal account provisioning is temporarily unavailable",
+                    )
+                })?;
+        }
+        Ok(organization.id)
+    }
+
+    pub async fn user_has_active_membership(
+        &self,
+        user_id: &str,
+        organization_id: &str,
+    ) -> Result<bool, ApiError> {
+        let page = self
+            .client
+            .organization_membership()
+            .list_organization_memberships(ListOrganizationMembershipsParams {
+                organization_id: Some(organization_id.to_string()),
+                user_id: Some(user_id.to_string()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    error = %error,
+                    user_id,
+                    organization_id,
+                    "WorkOS membership authorization lookup failed"
+                );
+                ApiError::unavailable("WorkOS membership is temporarily unavailable")
+            })?;
+        Ok(page.data.into_iter().any(|membership| {
+            membership.organization_id == organization_id
+                && membership.user_id == user_id
+                && membership.status == UserOrganizationMembershipStatus::Active
+        }))
+    }
+
+    pub async fn send_account_invitation(
+        &self,
+        account: &crate::store::AccountRecord,
+        inviter_user_id: &str,
+        email: &str,
+        role_slug: &str,
+        idempotency_key: &str,
+    ) -> Result<AccountInvitation, ApiError> {
+        let options = RequestOptions::new().idempotency_key(idempotency_key);
+        let invitation = self
+            .client
+            .user_management()
+            .send_invitation_with_options(
+                SendInvitationParams::new(CreateUserInviteOptions {
+                    email: email.to_string(),
+                    organization_id: Some(account.workos_organization_id.clone()),
+                    role_slug: Some(role_slug.to_string()),
+                    expires_in_days: Some(7),
+                    inviter_user_id: Some(inviter_user_id.to_string()),
+                    locale: None,
+                }),
+                Some(&options),
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    error = %error,
+                    account_id = account.id,
+                    "WorkOS invitation create failed"
+                );
+                ApiError::unavailable("WorkOS invitation is temporarily unavailable")
+            })?;
+        Ok(AccountInvitation {
+            id: invitation.id,
+            account_id: account.id.clone(),
+            email: invitation.email,
+            role_slug: invitation
+                .role_slug
+                .unwrap_or_else(|| role_slug.to_string()),
+            state: invitation.state.to_string(),
+            expires_at: invitation.expires_at,
+        })
+    }
+
+    pub async fn list_account_invitations(
+        &self,
+        account: &crate::store::AccountRecord,
+    ) -> Result<Vec<AccountInvitation>, ApiError> {
+        let mut result = Vec::new();
+        let mut after = None;
+        loop {
+            let page = self
+                .client
+                .user_management()
+                .list_invitations(ListInvitationsParams {
+                    organization_id: Some(account.workos_organization_id.clone()),
+                    after: after.clone(),
+                    limit: Some(100),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|error| {
+                    tracing::warn!(
+                        error = %error,
+                        account_id = account.id,
+                        "WorkOS invitation list failed"
+                    );
+                    ApiError::unavailable("WorkOS invitations are temporarily unavailable")
+                })?;
+            result.extend(page.data.into_iter().map(|invitation| AccountInvitation {
+                id: invitation.id,
+                account_id: account.id.clone(),
+                email: invitation.email,
+                role_slug: invitation.role_slug.unwrap_or_else(|| "member".to_string()),
+                state: invitation.state.to_string(),
+                expires_at: invitation.expires_at,
+            }));
+            after = page.list_metadata.after;
+            if after.is_none() {
+                break;
+            }
+        }
+        Ok(result)
+    }
+
+    pub async fn revoke_account_invitation(
+        &self,
+        account: &crate::store::AccountRecord,
+        invitation_id: &str,
+    ) -> Result<AccountInvitation, ApiError> {
+        let invitation = self
+            .client
+            .user_management()
+            .revoke_invitation(invitation_id)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    error = %error,
+                    account_id = account.id,
+                    invitation_id,
+                    "WorkOS invitation revoke failed"
+                );
+                if error.is_not_found() {
+                    ApiError::new(ErrorCode::NotFound, "invitation not found")
+                } else {
+                    ApiError::unavailable("WorkOS invitation is temporarily unavailable")
+                }
+            })?;
+        if invitation.organization_id.as_deref() != Some(account.workos_organization_id.as_str()) {
+            return Err(ApiError::new(
+                ErrorCode::PermissionDenied,
+                "invitation belongs to another account",
+            ));
+        }
+        Ok(AccountInvitation {
+            id: invitation.id,
+            account_id: account.id.clone(),
+            email: invitation.email,
+            role_slug: invitation.role_slug.unwrap_or_else(|| "member".to_string()),
+            state: invitation.state.to_string(),
+            expires_at: invitation.expires_at,
+        })
+    }
+
+    pub async fn list_account_members(
+        &self,
+        account: &crate::store::AccountRecord,
+    ) -> Result<Vec<AccountMember>, ApiError> {
+        let mut result = Vec::new();
+        let mut after = None;
+        loop {
+            let page = self
+                .client
+                .organization_membership()
+                .list_organization_memberships(ListOrganizationMembershipsParams {
+                    organization_id: Some(account.workos_organization_id.clone()),
+                    after: after.clone(),
+                    limit: Some(100),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|error| {
+                    tracing::warn!(
+                        error = %error,
+                        account_id = account.id,
+                        "WorkOS member list failed"
+                    );
+                    ApiError::unavailable("WorkOS members are temporarily unavailable")
+                })?;
+            result.extend(page.data.into_iter().map(|membership| AccountMember {
+                membership_id: membership.id,
+                account_id: account.id.clone(),
+                user: workos_user_profile(membership.user),
+                role_slug: membership.role.slug,
+                status: membership.status.to_string(),
+            }));
+            after = page.list_metadata.after;
+            if after.is_none() {
+                break;
+            }
+        }
+        Ok(result)
+    }
+
+    pub async fn update_account_member(
+        &self,
+        account: &crate::store::AccountRecord,
+        membership_id: &str,
+        role_slug: &str,
+    ) -> Result<AccountMember, ApiError> {
+        let current = self
+            .client
+            .organization_membership()
+            .get_organization_membership(membership_id)
+            .await
+            .map_err(workos_membership_error)?;
+        if current.organization_id != account.workos_organization_id {
+            return Err(ApiError::new(
+                ErrorCode::PermissionDenied,
+                "membership belongs to another account",
+            ));
+        }
+        let mut body = UpdateOrganizationMembershipParamsBody::new();
+        body.role = Some(Role::Single {
+            role_slug: role_slug.to_string(),
+        });
+        let membership = self
+            .client
+            .organization_membership()
+            .update_organization_membership(
+                membership_id,
+                UpdateOrganizationMembershipParams::new(body),
+            )
+            .await
+            .map_err(workos_membership_error)?;
+        Ok(AccountMember {
+            membership_id: membership.id,
+            account_id: account.id.clone(),
+            user: workos_user_profile(membership.user),
+            role_slug: membership.role.slug,
+            status: membership.status.to_string(),
+        })
+    }
+
+    pub async fn deactivate_account_member(
+        &self,
+        account: &crate::store::AccountRecord,
+        membership_id: &str,
+    ) -> Result<(), ApiError> {
+        let current = self
+            .client
+            .organization_membership()
+            .get_organization_membership(membership_id)
+            .await
+            .map_err(workos_membership_error)?;
+        if current.organization_id != account.workos_organization_id {
+            return Err(ApiError::new(
+                ErrorCode::PermissionDenied,
+                "membership belongs to another account",
+            ));
+        }
+        self.client
+            .organization_membership()
+            .deactivate_organization_membership(membership_id)
+            .await
+            .map_err(workos_membership_error)?;
+        Ok(())
     }
 
     /// Verify a CLI bearer token cryptographically and turn its organization
@@ -247,25 +580,20 @@ impl WorkOsConfig {
             ));
         }
         let organization_id = claims.org_id.filter(|value| !value.is_empty());
-        let project = organization_id
-            .as_deref()
-            .and_then(|org| self.project_for_organization(org).map(str::to_string))
-            .or_else(|| {
-                organization_id
-                    .is_none()
-                    .then(|| format!("personal-{}", claims.sub))
-            });
         Ok(AccessIdentity {
             user_id: claims.sub,
             session_id: claims.sid,
             organization_id,
-            project,
             role: claims.role,
             permissions: claims.permissions,
         })
     }
 
-    pub async fn me(&self, identity: &AccessIdentity) -> Result<MeResponse, ApiError> {
+    pub async fn me(
+        &self,
+        store: &crate::store::Store,
+        identity: &AccessIdentity,
+    ) -> Result<MeResponse, ApiError> {
         let user = self
             .client
             .user_management()
@@ -275,6 +603,7 @@ impl WorkOsConfig {
                 tracing::warn!(error = %error, "WorkOS user lookup failed");
                 ApiError::unavailable("WorkOS user profile is temporarily unavailable")
             })?;
+        let (accounts, workspaces) = self.accounts_and_workspaces_for(store, identity).await?;
         Ok(MeResponse {
             user: UserProfile {
                 id: user.id,
@@ -288,25 +617,28 @@ impl WorkOsConfig {
                     (!joined.is_empty()).then_some(joined)
                 }),
             },
-            workspaces: self.workspaces_for(identity).await?,
+            accounts,
+            workspaces,
         })
     }
 
     pub async fn workspaces_for(
         &self,
+        store: &crate::store::Store,
         identity: &AccessIdentity,
     ) -> Result<Vec<Workspace>, ApiError> {
-        let mut result = Vec::new();
-        if identity.organization_id.is_none() {
-            let slug = format!("personal-{}", identity.user_id);
-            result.push(Workspace {
-                display_name: "Personal".to_string(),
-                slug,
-                kind: WorkspaceKind::Personal,
-                organization_id: None,
-                role: Some("owner".to_string()),
-            });
-        }
+        self.accounts_and_workspaces_for(store, identity)
+            .await
+            .map(|(_, workspaces)| workspaces)
+    }
+
+    pub async fn accounts_and_workspaces_for(
+        &self,
+        store: &crate::store::Store,
+        identity: &AccessIdentity,
+    ) -> Result<(Vec<Account>, Vec<Workspace>), ApiError> {
+        let mut accounts = Vec::new();
+        let mut workspaces = Vec::new();
         let mut after = None;
         loop {
             let page = self
@@ -329,32 +661,54 @@ impl WorkOsConfig {
                 if membership.status != UserOrganizationMembershipStatus::Active {
                     continue;
                 }
-                let Some(slug) = self
-                    .project_for_organization(&membership.organization_id)
-                    .map(str::to_string)
+                if membership.user_id != identity.user_id {
+                    tracing::warn!(
+                        expected_user_id = identity.user_id,
+                        actual_user_id = membership.user_id,
+                        "WorkOS membership list returned another user"
+                    );
+                    continue;
+                }
+                let permissions = if identity.organization_id.as_deref()
+                    == Some(membership.organization_id.as_str())
+                {
+                    identity.permissions.as_slice()
+                } else {
+                    &[]
+                };
+                let Some((account, mut account_workspaces)) = store.account_and_workspace_views(
+                    &membership.organization_id,
+                    Some(&membership.role.slug),
+                    permissions,
+                )?
                 else {
                     continue;
                 };
-                result.push(Workspace {
-                    display_name: membership.organization_name.unwrap_or_else(|| slug.clone()),
-                    slug,
-                    kind: WorkspaceKind::Organization,
-                    organization_id: Some(membership.organization_id),
-                    role: Some(membership.role.slug),
-                });
+                store.upsert_membership_shadow(
+                    &membership.id,
+                    &account.id,
+                    &membership.user_id,
+                    &membership.role.slug,
+                    "active",
+                )?;
+                accounts.push(account);
+                workspaces.append(&mut account_workspaces);
             }
             after = page.list_metadata.after;
             if after.is_none() {
                 break;
             }
         }
-        result.sort_by(|left, right| left.slug.cmp(&right.slug));
-        result.dedup_by(|left, right| left.slug == right.slug);
-        Ok(result)
+        accounts.sort_by(|left, right| left.slug.cmp(&right.slug));
+        accounts.dedup_by(|left, right| left.id == right.id);
+        workspaces.sort_by(|left, right| left.locator.cmp(&right.locator));
+        workspaces.dedup_by(|left, right| left.id == right.id);
+        Ok((accounts, workspaces))
     }
 
     async fn single_mapped_workspace_for_user(
         &self,
+        store: &crate::store::Store,
         user_id: &str,
     ) -> Result<Option<(String, String)>, ApiError> {
         let mut candidates = BTreeMap::new();
@@ -380,13 +734,24 @@ impl WorkOsConfig {
                 if membership.status != UserOrganizationMembershipStatus::Active {
                     continue;
                 }
-                let Some(project) = self
-                    .project_for_organization(&membership.organization_id)
-                    .map(str::to_string)
+                if membership.user_id != user_id {
+                    continue;
+                }
+                let Some(account) = store.account_for_organization(&membership.organization_id)?
                 else {
                     continue;
                 };
-                candidates.insert(project, membership.organization_id);
+                if account.status != "active" {
+                    continue;
+                }
+                let Some(workspace) = store
+                    .workspaces_for_account(&account.id)?
+                    .into_iter()
+                    .find(|workspace| workspace.is_default)
+                else {
+                    continue;
+                };
+                candidates.insert(workspace.id, membership.organization_id);
             }
             after = page.list_metadata.after;
             if after.is_none() {
@@ -430,14 +795,88 @@ impl WorkOsConfig {
     }
 }
 
+fn workos_membership_error(error: workos::Error) -> ApiError {
+    tracing::warn!(error = %error, "WorkOS membership operation failed");
+    if error.is_not_found() {
+        ApiError::new(ErrorCode::NotFound, "membership not found")
+    } else {
+        ApiError::unavailable("WorkOS membership is temporarily unavailable")
+    }
+}
+
+fn workos_user_profile(user: workos::User) -> UserProfile {
+    UserProfile {
+        id: user.id,
+        email: user.email,
+        name: user.name.or_else(|| {
+            let joined = [user.first_name, user.last_name]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!joined.is_empty()).then_some(joined)
+        }),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AccessIdentity {
     pub user_id: String,
     pub session_id: String,
     pub organization_id: Option<String>,
-    pub project: Option<String>,
     pub role: Option<String>,
     pub permissions: Vec<String>,
+}
+
+pub async fn provision_personal_account(
+    state: &AppState,
+    user_id: &str,
+    display_name: &str,
+) -> Result<crate::store::AccountRecord, ApiError> {
+    let config = state
+        .cfg
+        .workos
+        .as_ref()
+        .ok_or_else(|| ApiError::failed_precondition("WorkOS AuthKit is not configured"))?;
+    let organization_id = config
+        .ensure_personal_organization(user_id, display_name)
+        .await?;
+    let (account, _workspace) =
+        state
+            .store
+            .ensure_personal_account(user_id, &organization_id, display_name)?;
+    let grant_state =
+        state
+            .store
+            .signup_grant_state(user_id, SIGNUP_CAMPAIGN, &account.billing_account_id)?;
+    if grant_state == crate::store::SignupGrantState::Pending {
+        state
+            .credits
+            .ensure_account(
+                &account.billing_account_id,
+                &account.id,
+                "USD",
+                SIGNUP_CREDIT_NANOS,
+                crate::store::now_ms(),
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    error = %error,
+                    user_id,
+                    billing_account_id = account.billing_account_id,
+                    "personal signup grant failed"
+                );
+                ApiError::unavailable("personal account credit is temporarily unavailable")
+            })?;
+        state.store.mark_signup_grant_applied(
+            user_id,
+            SIGNUP_CAMPAIGN,
+            &account.billing_account_id,
+        )?;
+    }
+    state.store.activate_account(&account.id)?;
+    state.store.account_by_id(&account.id)
 }
 
 #[derive(Debug, Deserialize)]
@@ -451,10 +890,10 @@ struct AccessTokenClaims {
     role: Option<String>,
     #[serde(default)]
     permissions: Vec<String>,
-    #[allow(dead_code)]
-    exp: u64,
-    #[allow(dead_code)]
-    iss: String,
+    #[serde(rename = "exp")]
+    _expires_at: u64,
+    #[serde(rename = "iss")]
+    _issuer: String,
 }
 
 fn validate_site_url(value: &str, site: &str) -> anyhow::Result<()> {
@@ -513,8 +952,12 @@ impl Site {
 
 #[derive(Debug, Clone)]
 pub struct WebIdentity {
-    pub project: Option<String>,
+    pub user_id: Option<String>,
+    pub organization_id: Option<String>,
+    pub account_id: Option<String>,
+    pub default_workspace_id: Option<String>,
     pub administrator: bool,
+    pub permissions: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -564,9 +1007,25 @@ struct SessionResponse {
     authenticated: bool,
     site: Site,
     project: Option<String>,
+    active_account_id: Option<String>,
+    active_workspace_id: Option<String>,
+    accounts: Vec<Account>,
+    workspaces: Vec<Workspace>,
     role: String,
     permissions: Vec<String>,
     user: Option<SessionUser>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UserContext {
+    user_id: String,
+    account_id: String,
+    workspace_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SwitchWorkspaceRequest {
+    workspace_id: String,
 }
 
 pub async fn config(State(state): State<AppState>) -> Response {
@@ -601,15 +1060,14 @@ pub async fn login(
     let (organization_id, project) = match site {
         Site::User => {
             if let Some(project) = query.project.as_deref() {
-                if project.starts_with("personal-user_") {
-                    (None, Some(project.to_string()))
-                } else {
-                    let organization_id =
-                        config.project_organizations.get(project).ok_or_else(|| {
-                            ApiError::new(cats_api::error::ErrorCode::NotFound, "unknown project")
-                        })?;
-                    (Some(organization_id.clone()), Some(project.to_string()))
-                }
+                let workspace = state.store.workspace_for_project(project)?.ok_or_else(|| {
+                    ApiError::new(cats_api::error::ErrorCode::NotFound, "unknown workspace")
+                })?;
+                let account = state.store.account_by_id(&workspace.account_id)?;
+                (
+                    Some(account.workos_organization_id),
+                    Some(project.to_string()),
+                )
             } else {
                 // The public user site does not know a user's project before
                 // authentication. Resolve it from the returned WorkOS identity.
@@ -728,6 +1186,21 @@ pub async fn callback(
         );
         return auth_error_redirect(config, &flow, identity_error_code(flow.site));
     }
+    let personal_scope = if flow.site == Site::User && auth.organization_id.is_none() {
+        let display_name = auth
+            .user
+            .name
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&auth.user.email);
+        Some(
+            provision_personal_account(&state, &auth.user.id, display_name)
+                .await?
+                .workos_organization_id,
+        )
+    } else {
+        None
+    };
     let sealed_session = seal_session(
         &SessionData {
             access_token: auth.access_token,
@@ -740,16 +1213,29 @@ pub async fn callback(
     .map_err(|error| ApiError::internal(format!("seal WorkOS session: {error}")))?;
     let session =
         SessionManager::new(None, &sealed_session, &config.cookie_password).authenticate();
-    let (sealed_session, session) =
-        scope_unmapped_user_session(config, &flow, sealed_session, session).await;
-    if let Err(error) = validate_flow_identity(config, &flow, &session) {
-        tracing::warn!(
-            site = ?flow.site,
-            error = %error.0,
-            "WorkOS session is not authorized for the requested site"
-        );
-        return auth_error_redirect(config, &flow, identity_error_code(flow.site));
-    }
+    let (sealed_session, session) = if let Some(organization_id) = personal_scope {
+        scope_session_to_organization(
+            config,
+            sealed_session,
+            session,
+            &organization_id,
+            "personal account",
+        )
+        .await?
+    } else {
+        scope_unmapped_user_session(config, &state.store, &flow, sealed_session, session).await
+    };
+    let identity = match validate_flow_identity(config, &state.store, &flow, &session) {
+        Ok(identity) => identity,
+        Err(error) => {
+            tracing::warn!(
+                site = ?flow.site,
+                error = %error.0,
+                "WorkOS session is not authorized for the requested site"
+            );
+            return auth_error_redirect(config, &flow, identity_error_code(flow.site));
+        }
+    };
 
     let mut response = Redirect::to(&flow.return_to).into_response();
     append_set_cookie(
@@ -760,6 +1246,49 @@ pub async fn callback(
         config.cookie_secure,
         config.cookie_domain.as_deref(),
     )?;
+    if flow.site == Site::User {
+        let workspace = if let Some(project) = flow.project.as_deref() {
+            state
+                .store
+                .workspace_for_project(project)?
+                .ok_or_else(|| ApiError::internal("selected workspace disappeared"))?
+        } else {
+            state.store.workspace_by_id(
+                identity
+                    .default_workspace_id
+                    .as_deref()
+                    .ok_or_else(|| ApiError::internal("user login selected no workspace"))?,
+            )?
+        };
+        let user_id = identity
+            .user_id
+            .as_deref()
+            .ok_or_else(|| ApiError::unauthenticated("WorkOS session has no user identity"))?;
+        let context = seal(
+            &UserContext {
+                user_id: user_id.to_string(),
+                account_id: workspace.account_id,
+                workspace_id: workspace.id,
+            },
+            &config.cookie_password,
+        )
+        .map_err(|error| ApiError::internal(format!("seal workspace context: {error}")))?;
+        append_set_cookie(
+            &mut response,
+            USER_CONTEXT_COOKIE,
+            &context,
+            SESSION_MAX_AGE_SECONDS,
+            config.cookie_secure,
+            config.cookie_domain.as_deref(),
+        )?;
+    }
+    if !session.session_id.is_empty() {
+        config
+            .browser_session_heads
+            .lock()
+            .await
+            .insert(session.session_id.clone(), sealed_session);
+    }
     append_delete_cookie(
         &mut response,
         flow.site.flow_cookie(),
@@ -770,8 +1299,58 @@ pub async fn callback(
     Ok(response)
 }
 
+async fn scope_session_to_organization(
+    config: &WorkOsConfig,
+    sealed_session: String,
+    session: SessionState,
+    organization_id: &str,
+    label: &str,
+) -> Result<(String, SessionState), Failure> {
+    let user_id = session
+        .user
+        .as_ref()
+        .map(|user| user.id.clone())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::unauthenticated("WorkOS session has no user identity"))?;
+    let manager = SessionManager::new(
+        Some(&config.client),
+        &sealed_session,
+        &config.cookie_password,
+    );
+    let refreshed = manager
+        .refresh(SessionRefreshOptions {
+            organization_id: Some(organization_id.to_string()),
+        })
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, organization_id, label, "WorkOS organization switch failed");
+            ApiError::unavailable("WorkOS organization switch is temporarily unavailable")
+        })?;
+    if !refreshed.authenticated {
+        return Err(ApiError::new(
+            cats_api::error::ErrorCode::PermissionDenied,
+            format!("WorkOS did not authorize {label}"),
+        )
+        .into());
+    }
+    let candidate = SessionManager::new(None, &refreshed.sealed_session, &config.cookie_password)
+        .authenticate();
+    if !candidate.authenticated
+        || candidate.organization_id != organization_id
+        || candidate.user.as_ref().map(|user| user.id.as_str()) != Some(user_id.as_str())
+    {
+        return Err(ApiError::new(
+            cats_api::error::ErrorCode::PermissionDenied,
+            format!("WorkOS returned an invalid {label} session"),
+        )
+        .into());
+    }
+    Ok((refreshed.sealed_session, candidate))
+}
+
 async fn scope_unmapped_user_session(
     config: &WorkOsConfig,
+    store: &crate::store::Store,
     flow: &LoginFlow,
     sealed_session: String,
     session: SessionState,
@@ -781,8 +1360,10 @@ async fn scope_unmapped_user_session(
         && flow.project.is_none()
         && session.authenticated
         && !session.organization_id.is_empty()
-        && config
-            .project_for_organization(&session.organization_id)
+        && store
+            .account_for_organization(&session.organization_id)
+            .ok()
+            .flatten()
             .is_none();
     if !should_rescope {
         return (sealed_session, session);
@@ -795,7 +1376,10 @@ async fn scope_unmapped_user_session(
     else {
         return (sealed_session, session);
     };
-    let target = match config.single_mapped_workspace_for_user(&user_id).await {
+    let target = match config
+        .single_mapped_workspace_for_user(store, &user_id)
+        .await
+    {
         Ok(Some(target)) => target,
         Ok(None) => return (sealed_session, session),
         Err(error) => {
@@ -806,7 +1390,7 @@ async fn scope_unmapped_user_session(
             return (sealed_session, session);
         }
     };
-    let (project, organization_id) = target;
+    let (workspace_id, organization_id) = target;
     let manager = SessionManager::new(
         Some(&config.client),
         &sealed_session,
@@ -822,7 +1406,7 @@ async fn scope_unmapped_user_session(
         Ok(refreshed) => {
             tracing::warn!(
                 reason = refreshed.reason,
-                project,
+                workspace_id,
                 "WorkOS session could not switch to the user's Cats workspace"
             );
             return (sealed_session, session);
@@ -830,7 +1414,7 @@ async fn scope_unmapped_user_session(
         Err(error) => {
             tracing::warn!(
                 error = %error,
-                project,
+                workspace_id,
                 "WorkOS workspace session refresh failed"
             );
             return (sealed_session, session);
@@ -842,10 +1426,13 @@ async fn scope_unmapped_user_session(
     if !candidate.authenticated
         || candidate.organization_id != organization_id
         || !same_user
-        || config.project_for_organization(&candidate.organization_id) != Some(project.as_str())
+        || !store
+            .workspace_by_id(&workspace_id)
+            .and_then(|workspace| store.account_by_id(&workspace.account_id))
+            .is_ok_and(|account| account.workos_organization_id == candidate.organization_id)
     {
         tracing::warn!(
-            project,
+            workspace_id,
             "WorkOS returned an invalid workspace-scoped session"
         );
         return (sealed_session, session);
@@ -918,29 +1505,17 @@ pub async fn session(
             .authenticate();
         }
     }
-    let identity = validate_session_identity(config, site, &session)?;
-    let user = session.user.map(|user| SessionUser {
-        id: user.id,
-        email: user.email,
-        name: user.name.or_else(|| {
-            let joined = [user.first_name, user.last_name]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(" ");
-            (!joined.is_empty()).then_some(joined)
-        }),
-    });
-    let mut response = Json(SessionResponse {
-        authenticated: true,
-        site,
-        project: identity.project,
-        role: session.role,
-        permissions: session.permissions,
-        user,
-    })
-    .into_response();
+    let (body, replacement_context) =
+        session_response(&state, config, site, &session, &headers).await?;
+    let mut response = Json(body).into_response();
     if let Some(sealed) = replacement_cookie {
+        if !session.session_id.is_empty() {
+            config
+                .browser_session_heads
+                .lock()
+                .await
+                .insert(session.session_id.clone(), sealed.clone());
+        }
         append_set_cookie(
             &mut response,
             site.session_cookie(),
@@ -950,8 +1525,253 @@ pub async fn session(
             config.cookie_domain.as_deref(),
         )?;
     }
+    if let Some(context) = replacement_context {
+        append_set_cookie(
+            &mut response,
+            USER_CONTEXT_COOKIE,
+            &context,
+            SESSION_MAX_AGE_SECONDS,
+            config.cookie_secure,
+            config.cookie_domain.as_deref(),
+        )?;
+    }
     set_no_store(&mut response);
     Ok(response)
+}
+
+pub async fn switch_workspace(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SwitchWorkspaceRequest>,
+) -> Result<Response, Failure> {
+    let config = state
+        .cfg
+        .workos
+        .as_ref()
+        .ok_or_else(|| ApiError::failed_precondition("WorkOS AuthKit is not configured"))?;
+    let requested_sealed = cookie_value(&headers, USER_SESSION_COOKIE)
+        .ok_or_else(|| ApiError::unauthenticated("missing WorkOS user session"))?;
+    let requested_session =
+        SessionManager::new(None, &requested_sealed, &config.cookie_password).authenticate();
+    if !requested_session.authenticated || requested_session.session_id.is_empty() {
+        return Err(ApiError::unauthenticated("invalid WorkOS user session").into());
+    }
+    let requested_user_id = requested_session
+        .user
+        .as_ref()
+        .map(|user| user.id.clone())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::unauthenticated("WorkOS session has no user identity"))?;
+    let workspace = state.store.workspace_by_id(&request.workspace_id)?;
+    let account = state.store.account_by_id(&workspace.account_id)?;
+    if account.status != "active"
+        || !config
+            .user_has_active_membership(&requested_user_id, &account.workos_organization_id)
+            .await?
+    {
+        return Err(ApiError::new(
+            ErrorCode::PermissionDenied,
+            "workspace is not available to this user",
+        )
+        .into());
+    }
+
+    // WorkOS refresh tokens rotate. Serialize scope changes and always start
+    // from the latest sealed head for this WorkOS session, not the possibly
+    // stale cookie carried by a concurrently submitted browser tab.
+    let mut heads = config.browser_session_heads.lock().await;
+    let current_sealed = heads
+        .get(&requested_session.session_id)
+        .cloned()
+        .unwrap_or(requested_sealed);
+    let current_session =
+        SessionManager::new(None, &current_sealed, &config.cookie_password).authenticate();
+    if !current_session.authenticated
+        || current_session.session_id != requested_session.session_id
+        || current_session.user.as_ref().map(|user| user.id.as_str())
+            != Some(requested_user_id.as_str())
+    {
+        return Err(ApiError::unauthenticated("WorkOS user session expired").into());
+    }
+    let (active_sealed, active_session, switched_account) =
+        if current_session.organization_id == account.workos_organization_id {
+            (current_sealed, current_session, false)
+        } else {
+            let (sealed, session) = scope_session_to_organization(
+                config,
+                current_sealed,
+                current_session,
+                &account.workos_organization_id,
+                "account",
+            )
+            .await?;
+            (sealed, session, true)
+        };
+    heads.insert(active_session.session_id.clone(), active_sealed.clone());
+    drop(heads);
+
+    let context = seal(
+        &UserContext {
+            user_id: requested_user_id,
+            account_id: account.id,
+            workspace_id: workspace.id,
+        },
+        &config.cookie_password,
+    )
+    .map_err(|error| ApiError::internal(format!("seal workspace context: {error}")))?;
+    let mut context_headers = HeaderMap::new();
+    context_headers.insert(
+        header::COOKIE,
+        HeaderValue::from_str(&format!("{USER_CONTEXT_COOKIE}={context}"))
+            .map_err(|_| ApiError::internal("workspace context cookie is invalid"))?,
+    );
+    let (body, _) = session_response(
+        &state,
+        config,
+        Site::User,
+        &active_session,
+        &context_headers,
+    )
+    .await?;
+    let mut response = Json(body).into_response();
+    if switched_account {
+        append_set_cookie(
+            &mut response,
+            USER_SESSION_COOKIE,
+            &active_sealed,
+            SESSION_MAX_AGE_SECONDS,
+            config.cookie_secure,
+            config.cookie_domain.as_deref(),
+        )?;
+    }
+    append_set_cookie(
+        &mut response,
+        USER_CONTEXT_COOKIE,
+        &context,
+        SESSION_MAX_AGE_SECONDS,
+        config.cookie_secure,
+        config.cookie_domain.as_deref(),
+    )?;
+    set_no_store(&mut response);
+    Ok(response)
+}
+
+async fn session_response(
+    state: &AppState,
+    config: &WorkOsConfig,
+    site: Site,
+    session: &SessionState,
+    headers: &HeaderMap,
+) -> Result<(SessionResponse, Option<String>), Failure> {
+    let identity = validate_session_identity(config, &state.store, site, session)?;
+    let user = session
+        .user
+        .clone()
+        .map(workos_user_profile)
+        .map(|user| SessionUser {
+            id: user.id,
+            email: user.email,
+            name: user.name,
+        });
+    if site == Site::Admin {
+        return Ok((
+            SessionResponse {
+                authenticated: true,
+                site,
+                project: None,
+                active_account_id: None,
+                active_workspace_id: None,
+                accounts: Vec::new(),
+                workspaces: Vec::new(),
+                role: session.role.clone(),
+                permissions: session.permissions.clone(),
+                user,
+            },
+            None,
+        ));
+    }
+    let user_id = identity
+        .user_id
+        .as_deref()
+        .ok_or_else(|| ApiError::unauthenticated("WorkOS session has no user identity"))?;
+    let organization_id = identity.organization_id.as_deref().ok_or_else(|| {
+        ApiError::new(ErrorCode::PermissionDenied, "session has no account scope")
+    })?;
+    if !config
+        .user_has_active_membership(user_id, organization_id)
+        .await?
+    {
+        return Err(ApiError::new(
+            ErrorCode::PermissionDenied,
+            "WorkOS account membership is not active",
+        )
+        .into());
+    }
+    let access = AccessIdentity {
+        user_id: user_id.to_string(),
+        session_id: session.session_id.clone(),
+        organization_id: Some(organization_id.to_string()),
+        role: Some(session.role.clone()),
+        permissions: session.permissions.clone(),
+    };
+    let (accounts, workspaces) = config
+        .accounts_and_workspaces_for(&state.store, &access)
+        .await?;
+    let current_account_id = identity
+        .account_id
+        .as_deref()
+        .ok_or_else(|| ApiError::internal("session account resolution failed"))?;
+    let sealed_context = cookie_value(headers, USER_CONTEXT_COOKIE);
+    let context = sealed_context
+        .as_deref()
+        .and_then(|sealed| unseal::<UserContext>(sealed, &config.cookie_password).ok())
+        .filter(|context| {
+            context.user_id == user_id
+                && context.account_id == current_account_id
+                && workspaces.iter().any(|workspace| {
+                    workspace.id == context.workspace_id
+                        && workspace.account_id == context.account_id
+                })
+        });
+    let (selected, replacement_context) = if let Some(context) = context {
+        let selected = workspaces
+            .iter()
+            .find(|workspace| workspace.id == context.workspace_id)
+            .cloned()
+            .ok_or_else(|| ApiError::internal("workspace context validation drifted"))?;
+        (selected, None)
+    } else {
+        let selected = workspaces
+            .iter()
+            .find(|workspace| workspace.account_id == current_account_id && workspace.is_default)
+            .cloned()
+            .ok_or_else(|| ApiError::internal("account has no default workspace"))?;
+        let sealed = seal(
+            &UserContext {
+                user_id: user_id.to_string(),
+                account_id: selected.account_id.clone(),
+                workspace_id: selected.id.clone(),
+            },
+            &config.cookie_password,
+        )
+        .map_err(|error| ApiError::internal(format!("seal workspace context: {error}")))?;
+        (selected, Some(sealed))
+    };
+    Ok((
+        SessionResponse {
+            authenticated: true,
+            site,
+            project: Some(selected.project().to_string()),
+            active_account_id: Some(selected.account_id.clone()),
+            active_workspace_id: Some(selected.id.clone()),
+            accounts,
+            workspaces,
+            role: session.role.clone(),
+            permissions: session.permissions.clone(),
+            user,
+        },
+        replacement_context,
+    ))
 }
 
 pub async fn logout(
@@ -970,11 +1790,16 @@ pub async fn logout(
     let session = manager.authenticate();
     if !session.session_id.is_empty() {
         let params = RevokeSessionParams::new(RevokeSession {
-            session_id: session.session_id,
+            session_id: session.session_id.clone(),
         });
         if let Err(error) = config.client.user_management().revoke_session(params).await {
             tracing::warn!(error = %error, "WorkOS session revocation failed");
         }
+        config
+            .browser_session_heads
+            .lock()
+            .await
+            .remove(&session.session_id);
     }
     let mut response = Redirect::to(config.site_url(site)).into_response();
     append_delete_cookie(
@@ -983,32 +1808,35 @@ pub async fn logout(
         config.cookie_secure,
         config.cookie_domain.as_deref(),
     )?;
+    if site == Site::User {
+        append_delete_cookie(
+            &mut response,
+            USER_CONTEXT_COOKIE,
+            config.cookie_secure,
+            config.cookie_domain.as_deref(),
+        )?;
+    }
     set_no_store(&mut response);
     Ok(response)
 }
 
 fn validate_flow_identity(
     config: &WorkOsConfig,
+    store: &crate::store::Store,
     flow: &LoginFlow,
     session: &SessionState,
 ) -> Result<WebIdentity, Failure> {
-    let identity = validate_session_identity(config, flow.site, session)?;
+    let identity = validate_session_identity(config, store, flow.site, session)?;
     if flow.site == Site::User && flow.organization_id.is_none() && flow.project.is_none() {
         return Ok(identity);
     }
-    if flow.site == Site::User && session.organization_id.is_empty() {
-        if flow.organization_id.is_none() && flow.project.as_deref() != identity.project.as_deref()
-        {
-            return Err(ApiError::new(
-                cats_api::error::ErrorCode::PermissionDenied,
-                "WorkOS session does not match the requested personal workspace",
-            )
-            .into());
+    let project_matches = match flow.project.as_deref() {
+        Some(project) => {
+            store.project_belongs_to_organization(project, &session.organization_id)?
         }
-        return Ok(identity);
-    }
-    if Some(session.organization_id.as_str()) != flow.organization_id.as_deref()
-        || identity.project != flow.project
+        None => true,
+    };
+    if Some(session.organization_id.as_str()) != flow.organization_id.as_deref() || !project_matches
     {
         return Err(ApiError::new(
             cats_api::error::ErrorCode::PermissionDenied,
@@ -1021,6 +1849,7 @@ fn validate_flow_identity(
 
 fn validate_session_identity(
     config: &WorkOsConfig,
+    store: &crate::store::Store,
     site: Site,
     session: &SessionState,
 ) -> Result<WebIdentity, Failure> {
@@ -1034,33 +1863,40 @@ fn validate_session_identity(
     match site {
         Site::User => {
             if session.organization_id.is_empty() {
-                let user_id = session
-                    .user
-                    .as_ref()
-                    .map(|user| user.id.as_str())
-                    .filter(|user_id| !user_id.is_empty())
-                    .ok_or_else(|| {
-                        ApiError::new(
-                            cats_api::error::ErrorCode::Unauthenticated,
-                            "WorkOS personal session has no user identity",
-                        )
-                    })?;
-                return Ok(WebIdentity {
-                    project: Some(format!("personal-{user_id}")),
-                    administrator: false,
-                });
+                return Err(ApiError::new(
+                    cats_api::error::ErrorCode::PermissionDenied,
+                    "WorkOS user session is not scoped to an account",
+                )
+                .into());
             }
-            let project = config
-                .project_for_organization(&session.organization_id)
+            let account = store
+                .account_for_organization(&session.organization_id)?
                 .ok_or_else(|| {
                     ApiError::new(
                         cats_api::error::ErrorCode::PermissionDenied,
-                        "WorkOS organization is not mapped to a Cats project",
+                        "WorkOS organization is not mapped to a Cats account",
                     )
                 })?;
+            if account.status != "active" {
+                return Err(ApiError::new(
+                    cats_api::error::ErrorCode::PermissionDenied,
+                    "Cats account is not active",
+                )
+                .into());
+            }
+            let default_workspace_id = store
+                .workspaces_for_account(&account.id)?
+                .into_iter()
+                .find(|workspace| workspace.is_default)
+                .map(|workspace| workspace.id)
+                .ok_or_else(|| ApiError::internal("Cats account has no default workspace"))?;
             Ok(WebIdentity {
-                project: Some(project.to_string()),
+                user_id: session.user.as_ref().map(|user| user.id.clone()),
+                organization_id: Some(session.organization_id.clone()),
+                account_id: Some(account.id),
+                default_workspace_id: Some(default_workspace_id),
                 administrator: false,
+                permissions: session.permissions.clone(),
             })
         }
         Site::Admin => {
@@ -1077,8 +1913,12 @@ fn validate_session_identity(
                 .into());
             }
             Ok(WebIdentity {
-                project: None,
+                user_id: session.user.as_ref().map(|user| user.id.clone()),
+                organization_id: Some(session.organization_id.clone()),
+                account_id: None,
+                default_workspace_id: None,
                 administrator: true,
+                permissions: session.permissions.clone(),
             })
         }
     }
@@ -1088,14 +1928,44 @@ fn identity_from_cookie(state: &AppState, headers: &HeaderMap, site: Site) -> Op
     let config = state.cfg.workos.as_ref()?;
     let sealed = cookie_value(headers, site.session_cookie())?;
     let session = SessionManager::new(None, sealed, &config.cookie_password).authenticate();
-    validate_session_identity(config, site, &session).ok()
+    validate_session_identity(config, &state.store, site, &session).ok()
 }
 
-pub fn web_session_allows_project(state: &AppState, headers: &HeaderMap, project: &str) -> bool {
-    identity_from_cookie(state, headers, Site::Admin).is_some_and(|identity| identity.administrator)
-        || identity_from_cookie(state, headers, Site::User)
-            .and_then(|identity| identity.project)
-            .is_some_and(|allowed| allowed == project)
+pub fn web_user_identity(state: &AppState, headers: &HeaderMap) -> Option<WebIdentity> {
+    identity_from_cookie(state, headers, Site::User)
+}
+
+pub async fn web_session_allows_project(
+    state: &AppState,
+    headers: &HeaderMap,
+    project: &str,
+) -> Result<bool, ApiError> {
+    if identity_from_cookie(state, headers, Site::Admin)
+        .is_some_and(|identity| identity.administrator)
+    {
+        return Ok(true);
+    }
+    let Some(identity) = identity_from_cookie(state, headers, Site::User) else {
+        return Ok(false);
+    };
+    let (Some(user_id), Some(organization_id)) = (
+        identity.user_id.as_deref(),
+        identity.organization_id.as_deref(),
+    ) else {
+        return Ok(false);
+    };
+    if !state
+        .store
+        .project_belongs_to_organization(project, organization_id)?
+    {
+        return Ok(false);
+    }
+    let Some(workos) = state.cfg.workos.as_ref() else {
+        return Ok(false);
+    };
+    workos
+        .user_has_active_membership(user_id, organization_id)
+        .await
 }
 
 pub fn web_session_is_admin(state: &AppState, headers: &HeaderMap) -> bool {

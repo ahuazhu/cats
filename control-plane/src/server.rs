@@ -109,6 +109,17 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
     );
     let cfg = Arc::new(cfg);
     let store = Arc::new(Store::open(&cfg.db_path)?);
+    if let Some(workos) = &cfg.workos {
+        store.reconcile_legacy_projects(workos.project_organizations())?;
+    } else {
+        // The credential-free development shape has one explicit bootstrap
+        // account. Production WorkOS deployments provision Accounts through
+        // AuthKit or the configured legacy mapping instead.
+        store.reconcile_legacy_projects(&std::collections::BTreeMap::from([(
+            "default".to_string(),
+            "local-development".to_string(),
+        )]))?;
+    }
     let usage = cfg.usage_store.clone();
     let credits = cfg.credit_store.clone();
     let storage_meta = cfg.storage_meta.clone();

@@ -179,10 +179,11 @@ Manifest 与品牌图形。控制台和认证/API 路径声明 `noindex`，资�
 配置 WorkOS 后，两个 Web 站点使用独立的加密 HttpOnly session cookie；`cats login`
 使用 WorkOS Device Authorization，并把 refresh/access token 存入操作系统 Keychain。
 服务端从 WorkOS JWKS 验证每个 CLI access JWT，不接收或保存用户 refresh token。
-一个 WorkOS Organization 必须显式映射到一个 Cats Workspace（底层仍使用 Project
-资源命名空间）；没有 Organization membership 的新用户会获得基于 WorkOS
-`user_id` 的独立个人 Project，不会进入共享的 `default` Project。管理员还必须在
-管理员 Organization 中拥有 `cats:fleet:admin` permission：
+Personal 与 Organization Account 都映射到 WorkOS Organization；一个 Account 可以
+拥有多个 Workspace（底层仍保留稳定的 legacy Project 资源命名空间）。新用户会幂等
+创建 Personal Account、`default` Workspace 和只属于该 Personal Billing Account 的
+一次性 10 美元赠金。管理员还必须在管理员 Organization 中拥有
+`cats:fleet:admin` permission：
 
 ```bash
 export WORKOS_CLIENT_ID='client_...'
@@ -202,18 +203,19 @@ session cookie 添加 `Secure`。`WORKOS_ISSUER` 必须与当前 WorkOS Applicat
 access token 中 `iss` claim 完全一致；它不是 AuthKit 登录页面域名。服务端仍同时
 校验 RS256 签名、`exp`、`sub` 和 `client_id`。
 
-一个用户可以同时属于多个已映射的 WorkOS Organization。登录与 workspace 选择分离，
-行为与 Sprites CLI 的组织选择一致：保存一个默认 workspace，同时允许命令级覆盖。
-切换时 CLI 使用 refresh token 向 WorkOS 申请目标 Organization 范围的新 access
-token；跨 workspace 请求返回 `403`：
+一个用户可以同时属于多个已映射的 WorkOS Organization。登录与 workspace 选择分离：
+保存一个默认 workspace，同时允许命令级覆盖。同 Account 内切换只改本地 Workspace
+ID；跨 Account 时 CLI 才在跨进程凭据锁内使用旋转 refresh token 申请目标
+Organization 范围的新 access token。服务端按 Organization membership 与 Workspace
+归属重新授权：
 
 ```bash
 cats login
 cats whoami
 cats workspace list
-cats workspace use acme-dev
+cats workspace use acme/dev
 cats ls
-cats --workspace acme-prod ls
+cats --workspace acme/prod ls
 ```
 
 管理员可以查看节点分配/心跳/遥测，执行 cordon、uncordon、drain 和删除空节点。

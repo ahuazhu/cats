@@ -1,6 +1,6 @@
 ## 约定
 
-外部 API 使用 HTTP + JSON。用户资源通过兼容路径 `/v1/projects/{project}/…` 确定作用域，其中 Project 值是面向用户的 Workspace Slug。已验证 WorkOS 身份只能访问当前选择的 Workspace；修改 URL 不能改变授权上下文。
+外部 API 使用 HTTP + JSON。用户资源通过兼容路径 `/v1/projects/{project}/…` 确定作用域，其中 Project 值是 Workspace 的稳定 legacy route。已验证 WorkOS 身份只能访问 active Account membership 所拥有的 Workspace；修改 URL 不能凭空产生 membership。
 
     Authorization: Bearer <short-lived-workos-access-token>
     Accept: application/json
@@ -15,9 +15,15 @@
     GET  /auth/config       # 公开 WorkOS Client/Base URL 配置
     GET  /v1/me             # 用户资料与可用 Workspace
     GET  /v1/workspaces     # 刷新可用 Workspace 列表
+    POST /v1/accounts/{account}/workspaces
+    PATCH /v1/workspaces/{workspace}
+    GET|POST /v1/accounts/{account}/invitations
+    POST /v1/accounts/{account}/invitations/{invitation}/actions/revoke
+    GET /v1/accounts/{account}/members
+    PATCH|DELETE /v1/accounts/{account}/members/{membership}
     POST /v1/auth/logout    # 撤销 CLI WorkOS Session
 
-Workspace 枚举返回拥有显式部署映射的 Active WorkOS Organization Membership；无 Organization 用户还会获得隔离的个人 Workspace。授权资源路径前，服务端会验证用户 Access Token 的签名、Issuer、Client ID、过期时间、Subject 与 Organization Scope。
+Workspace 枚举根据 Active WorkOS Organization Membership 返回 Personal/Organization Account。创建或修改 Workspace 需要 Account 管理权限；修改 slug 不会改变不可变 ID 或 legacy Project route。邀请与成员变更要求 `cats:members:manage`、拒绝 Personal Account，并通过 WorkOS 执行。创建邀请还要求 `Idempotency-Key`，Cats 将其透传给 WorkOS，使网络重试返回同一个 invitation。授权前会校验 Access Token 签名、Issuer、Client ID、过期时间、Subject、Organization Scope、active membership、Account ID 与 Workspace 归属。
 
 ## Cats
 
@@ -32,6 +38,8 @@ Workspace 枚举返回拥有显式部署映射的 Active WorkOS Organization Mem
     PUT    /v1/projects/{project}/cats/{cat}/auto-suspend
 
 Lifecycle Verb 包括 `start`、`stop`、`suspend`、`resume` 与 `warm`。Create 省略 `auto_suspend` 时默认为 `true`。Cat 的 Create/Lifecycle/Delete 返回异步 Operation；请求超时后应查询 Operation，而不是用新意图重复变更。
+
+Cat、Disk 和 Operation 响应都包含不可变 `workspace_id`。`project` 字段只是稳定的 V1 兼容路由，不是资源归属真相源。
 
     POST /v1/projects/acme-dev/cats
     Idempotency-Key: request-7f12
@@ -79,14 +87,14 @@ Disk Action Verb 为 `mount`、`unmount` 与 `resize`。Mount Body 指定 Cat �
 
 开放账期的响应是 `provisional` 预估，包含范围总额、按 Meter 汇总、按 Cat 汇总、不可变 Rate Card ID 与当前最新可见 Interval End。Cat 删除后仍可通过 `cat_id` 查询。`bucket_ms` 返回服务端时间桶，用于曲线和有界时段详单；不得小于 60 秒，且最多产生 512 个时间桶。`detail=true` 返回原始 Ledger Interval，应只用于受控对账查询，避免浏览器直接查询很长范围。
 
-当前 Rate Card 的 CPU 单价为 `$0.07 / CPU-hour`，内存为 `$0.04375 / GiB-hour`。十进制 Quantity 与纳美元金额使用 JSON String，防止客户端丢失整数精度。范围总额在聚合后只计价一次；时间桶金额只用于展示预估，不是最终账单。
+当前 Rate Card 的 CPU 单价为 `$0.07 / CPU-hour`，内存为 `$0.045 / GiB-hour`。十进制 Quantity 与纳美元金额使用 JSON String，防止客户端丢失整数精度。范围总额在聚合后只计价一次；时间桶金额只用于展示预估，不是最终账单。
 
     GET  /v1/projects/{project}/billing/balance
     POST /v1/projects/{project}/billing/checkout
     Idempotency-Key: <唯一键>
     {"amount_cents": 1000}
 
-每个 Billing Account 获得一次性、不续期的 `$10` 注册赠金。余额响应使用 append-only 赠金与充值总额减去全部准实时暂估用量。Checkout 只接受官网公布的固定充值档位，并返回 Stripe 托管支付地址。仅从 Checkout 返回不会入账；Cats 只在收到签名正确且状态为 paid 的 Stripe Webhook 后增加余额。
+新用户只在自己的 Personal Billing Account 获得一次性、不续期的 `$10` 注册赠金；Organization Account、额外 Workspace 和邀请不会产生赠金。余额响应使用 append-only 赠金与充值总额减去全部准实时暂估用量。Checkout 只接受官网公布的固定充值档位，并返回 Stripe 托管支付地址。仅从 Checkout 返回不会入账；Cats 只在收到签名正确且状态为 paid 的 Stripe Webhook 后增加余额。
 
 可用额度耗尽时，付费计算 Admission 返回 HTTP `402` 和 `payment_required` Code；停止、休眠和删除资源仍然可用。
 
@@ -95,7 +103,7 @@ Disk Action Verb 为 `mount`、`unmount` 与 `resize`。Mount Body 指定 Cat �
     GET /v1/projects/{project}/operations
     GET /v1/operations/{operation}
 
-Operation 包含 Workspace Owner（存储字段仍为 Project）、类型、目标 Resource ID/Generation、阶段、时间戳与可选结构化错误。即使单个 Operation URL 没有 Project 分段，访问仍按 Workspace 限制。
+Operation 包含不可变 `workspace_id` Owner、兼容 Project 路由、类型、目标 Resource ID/Generation、阶段、时间戳与可选结构化错误。即使单个 Operation URL 没有 Project 分段，访问仍按 Workspace 限制。
 
 ## 错误
 

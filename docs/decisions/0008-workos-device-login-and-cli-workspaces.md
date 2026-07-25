@@ -4,6 +4,9 @@
 - 日期：2026-07-22
 - 取代：ADR-0006 第 5 条中的 CLI project token 决定；其浏览器与机器身份决定继续有效
 
+> Organization/Workspace 一一映射、organization-less Personal 和 workspace selector
+> 细节已由 ADR-0014 取代；Device Login、系统凭据存储和 JWT 校验决定继续有效。
+
 ## 背景
 
 早期 `cats` CLI 默认使用静态 `dev-token`，控制面通过

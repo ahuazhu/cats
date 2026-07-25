@@ -16,6 +16,8 @@ pub const ENDPOINT_PREFIX: &str = "ep_";
 pub const SNAPSHOT_PREFIX: &str = "snap_";
 pub const JOB_PREFIX: &str = "job_";
 pub const SESSION_PREFIX: &str = "sess_";
+pub const ACCOUNT_PREFIX: &str = "acct_";
+pub const WORKSPACE_PREFIX: &str = "ws_";
 
 /// Build a prefixed id from a prefix constant and a random suffix.
 pub fn make_id(prefix: &str, random_suffix: &str) -> String {

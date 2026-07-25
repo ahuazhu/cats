@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use cats_api::auth::{UserProfile, Workspace};
 
 pub const DEFAULT_API_URL: &str = "https://cats.run";
-const CONFIG_VERSION: u32 = 1;
+const CONFIG_VERSION: u32 = 2;
 const KEYRING_SERVICE: &str = "cats.run CLI";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,13 +50,32 @@ impl StoredConfig {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
         };
-        let config: Self =
+        let value: serde_json::Value =
             serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
-        anyhow::ensure!(
-            config.version == CONFIG_VERSION,
-            "unsupported Cats CLI config version {}",
-            config.version
-        );
+        let version = value
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .context("Cats CLI config has no numeric version")?;
+        let config = match version {
+            1 => {
+                let legacy: LegacyStoredConfig = serde_json::from_value(value)
+                    .with_context(|| format!("parse legacy {}", path.display()))?;
+                Self {
+                    version: CONFIG_VERSION,
+                    api_url: legacy.api_url,
+                    workos_client_id: legacy.workos_client_id,
+                    workos_api_base_url: legacy.workos_api_base_url,
+                    user: None,
+                    current_workspace: None,
+                    workspaces: Vec::new(),
+                }
+            }
+            version if version == u64::from(CONFIG_VERSION) => serde_json::from_value(value)
+                .with_context(|| format!("parse {}", path.display()))?,
+            unsupported => anyhow::bail!(
+                "unsupported Cats CLI config version {unsupported}; expected {CONFIG_VERSION}"
+            ),
+        };
         Ok(Some(config))
     }
 
@@ -92,6 +112,17 @@ impl StoredConfig {
     }
 }
 
+/// V1 cached workspaces did not contain immutable Account/Workspace identity.
+/// They cannot be upgraded locally without trusting mutable slugs, so only the
+/// public AuthKit endpoint configuration is retained. The next login fetches
+/// authoritative workspace records from the control plane.
+#[derive(Deserialize)]
+struct LegacyStoredConfig {
+    api_url: String,
+    workos_client_id: String,
+    workos_api_base_url: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Credentials {
     pub access_token: String,
@@ -117,6 +148,39 @@ impl Credentials {
 
     pub fn delete(api_url: &str) -> Result<()> {
         crate::credential_store::delete(KEYRING_SERVICE, api_url)
+    }
+}
+
+pub struct CliStateLock {
+    file: std::fs::File,
+}
+
+impl CliStateLock {
+    pub fn acquire() -> Result<Self> {
+        let path = config_path().with_file_name("credentials.lock");
+        let parent = path
+            .parent()
+            .context("Cats credential lock has no parent")?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create config directory {}", parent.display()))?;
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        FileExt::lock_exclusive(&file).with_context(|| format!("lock {}", path.display()))?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for CliStateLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -160,5 +224,36 @@ mod tests {
                 .id,
             "user_123"
         );
+    }
+
+    #[test]
+    fn legacy_workspace_cache_is_discarded_instead_of_inventing_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(
+            &path,
+            br#"{
+                "version": 1,
+                "api_url": "https://cats.example",
+                "workos_client_id": "client_test",
+                "workos_api_base_url": "https://api.workos.com",
+                "user": {"id": "user_old", "email": "old@example.com"},
+                "current_workspace": "mutable-slug",
+                "workspaces": [{
+                    "slug": "mutable-slug",
+                    "display_name": "Old",
+                    "kind": "organization",
+                    "organization_id": "org_old"
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let config = StoredConfig::load_from(&path).unwrap().unwrap();
+        assert_eq!(config.version, CONFIG_VERSION);
+        assert_eq!(config.api_url, "https://cats.example");
+        assert!(config.user.is_none());
+        assert!(config.current_workspace.is_none());
+        assert!(config.workspaces.is_empty());
     }
 }

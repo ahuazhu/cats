@@ -19,6 +19,10 @@ initI18n();
 
 const state = {
   project: "",
+  accounts: [],
+  workspaces: [],
+  activeAccountId: "",
+  activeWorkspaceId: "",
   authConfig: null,
   cats: [],
   disks: [],
@@ -68,6 +72,58 @@ function workspaceLabel(project) {
   return project.startsWith("personal-user_") ? t("user.workspace.personal") : project;
 }
 
+function activeWorkspace() {
+  return state.workspaces.find((workspace) => workspace.id === state.activeWorkspaceId);
+}
+
+function applySession(session) {
+  state.project = session.project || "";
+  state.accounts = session.accounts || [];
+  state.workspaces = session.workspaces || [];
+  state.activeAccountId = session.active_account_id || "";
+  state.activeWorkspaceId = session.active_workspace_id || "";
+  renderWorkspaceSwitcher();
+}
+
+function workspaceUrl(workspace) {
+  return `/user/${encodeURIComponent(workspace.account_slug)}/${encodeURIComponent(workspace.slug)}/`;
+}
+
+function renderWorkspaceSwitcher() {
+  const select = document.querySelector("#workspace-switcher");
+  if (!select) return;
+  select.innerHTML = state.workspaces.map((workspace) => {
+    const label = `${workspace.account_display_name} / ${workspace.display_name}`;
+    return `<option value="${escapeHtml(workspace.id)}"${workspace.id === state.activeWorkspaceId ? " selected" : ""}>${escapeHtml(label)}</option>`;
+  }).join("");
+  const workspace = activeWorkspace();
+  const label = workspace
+    ? `${workspace.account_display_name} / ${workspace.display_name}`
+    : workspaceLabel(state.project);
+  document.querySelector("#sidebar-project").textContent = label;
+  document.querySelector("#header-project").textContent = label;
+}
+
+async function switchWorkspace(workspaceId, { updateUrl = true } = {}) {
+  if (!workspaceId || workspaceId === state.activeWorkspaceId) return;
+  const session = await request("/auth/workspace", {
+    method: "POST",
+    body: JSON.stringify({ workspace_id: workspaceId }),
+  });
+  applySession(session);
+  state.cats = [];
+  state.disks = [];
+  state.operations = [];
+  state.billing = null;
+  state.billingBalance = null;
+  state.billingDetail = null;
+  if (updateUrl) {
+    const workspace = activeWorkspace();
+    if (workspace) window.history.pushState(null, "", workspaceUrl(workspace));
+  }
+  await loadAll({ quiet: true });
+}
+
 async function authenticatedRequest(path, options) {
   try {
     return await request(path, options);
@@ -98,9 +154,7 @@ function idempotencyHeaders() {
 function showApp() {
   loginScreen.classList.add("is-hidden");
   appShell.classList.remove("is-hidden");
-  const label = workspaceLabel(state.project);
-  document.querySelector("#sidebar-project").textContent = label;
-  document.querySelector("#header-project").textContent = label;
+  renderWorkspaceSwitcher();
 }
 
 function showLogin(message = "") {
@@ -281,7 +335,7 @@ const BILLING_METERS = {
     slug: "cats.compute.memory.v1",
     rate: () => t("user.billing.rate.memory"),
     denominator: 1_073_741_824n * 3_600_000n,
-    rateNumeratorNanos: 43_750_000n,
+    rateNumeratorNanos: 45_000_000n,
     unit: () => t("user.billing.unit.gibHour"),
   },
   storage_hot_byte_millis: {
@@ -881,6 +935,18 @@ document.querySelector("#refresh-button").addEventListener("click", () => {
   if (state.activeView === "billing") requests.push(loadBilling());
   Promise.all(requests).catch(() => {});
 });
+document.querySelector("#workspace-switcher").addEventListener("change", (event) => {
+  const previous = state.activeWorkspaceId;
+  event.currentTarget.disabled = true;
+  switchWorkspace(event.currentTarget.value)
+    .catch((error) => {
+      event.currentTarget.value = previous;
+      toast(t("user.workspace.switchFailed"), error.message, "error");
+    })
+    .finally(() => {
+      event.currentTarget.disabled = false;
+    });
+});
 document.querySelectorAll("#create-cat-button, [data-create-cat]").forEach((button) => button.addEventListener("click", () => createCatDialog.showModal()));
 document.querySelector("#create-disk-button").addEventListener("click", () => createDiskDialog.showModal());
 document.querySelector("#billing-range-form").addEventListener("submit", (event) => {
@@ -1019,11 +1085,7 @@ function updateLoginDescription() {
 
 onLocaleChange(() => {
   updateLoginDescription();
-  const label = state.project ? workspaceLabel(state.project) : "";
-  if (label) {
-    document.querySelector("#sidebar-project").textContent = label;
-    document.querySelector("#header-project").textContent = label;
-  }
+  renderWorkspaceSwitcher();
   switchView(state.activeView);
   render();
   if (billingCatDialog.open && state.billingDetail) {
@@ -1044,7 +1106,21 @@ async function initializeAuth() {
     if (state.authConfig.workos_enabled) {
       try {
         const session = await request("/auth/session?site=user");
-        state.project = session.project;
+        applySession(session);
+        const path = window.location.pathname.split("/").filter(Boolean);
+        if (path[0] === "user" && path.length >= 3) {
+          const accountSlug = decodeURIComponent(path[1]);
+          const workspaceSlug = decodeURIComponent(path[2]);
+          const requested = state.workspaces.find((workspace) =>
+            workspace.account_slug === accountSlug && workspace.slug === workspaceSlug);
+          if (requested && requested.id !== state.activeWorkspaceId) {
+            await switchWorkspace(requested.id, { updateUrl: false });
+          }
+        }
+        const workspace = activeWorkspace();
+        if (workspace && window.location.pathname !== workspaceUrl(workspace)) {
+          window.history.replaceState(null, "", workspaceUrl(workspace));
+        }
         showApp();
         await loadAll({ quiet: true });
         if (topupStatus) {

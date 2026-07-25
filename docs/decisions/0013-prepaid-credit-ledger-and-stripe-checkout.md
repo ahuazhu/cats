@@ -3,12 +3,15 @@
 - 状态：Accepted
 - 日期：2026-07-25
 
+> “每个 Billing Account 首次建立时赠送 10 美元”已由 ADR-0014 的 Personal signup
+> eligibility 规则取代；不可变资金账本、Stripe 和余额控制决定继续有效。
+
 ## 背景
 
 ADR-0011 已选定累计 usage ledger、精确整数 Rate Card 与准实时账单分析，并明确支付
 提供商不是 usage 真相源。产品现在采用预付费模式：每个新账户赠送 10 美元，用完后
 通过 Stripe 充值，CPU 为 `$0.07 / CPU-hour`，内存为
-`$0.04375 / GiB-hour`。
+`$0.045 / GiB-hour`。
 
 注册赠金、充值、退款与 usage 扣减必须在并发、Webhook 重放、乱序和支付跳转伪造下
 保持可审计。仅依赖 Stripe Checkout 成功返回页会允许伪造入账，也无法回答某一时刻
