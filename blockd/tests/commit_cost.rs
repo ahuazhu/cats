@@ -10,6 +10,7 @@
 //! Ignored by default; run with
 //! `cargo test --release -p cats-blockd --test commit_cost -- --ignored --nocapture`.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -17,9 +18,10 @@ use std::time::Instant;
 use cats_blockd::engine::{ChunkEngine, EngineConfig};
 use cats_blockd::format;
 use cats_metadata_store_sqlite::SqliteMetadataStore;
+use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
 use cats_object_store_file::FileBlobStore;
 use cats_storage::blob::{BlobStore, Result as BlobResult};
-use cats_storage::MetadataStore;
+use cats_storage::{open_blob_store, AdapterConfig, BlobStoreFactory, MetadataStore};
 
 const CHUNK: u64 = cats_api::chunk::CHUNK_SIZE as u64;
 const PAGE: u64 = cats_api::chunk::DIRTY_PAGE_SIZE as u64;
@@ -52,17 +54,50 @@ impl BlobStore for SizingBlob {
     }
 }
 
+/// The object store a benchmark run measures against.
+///
+/// Defaults to a local file store so the benchmark runs anywhere. Set
+/// `CATS_BENCH_S3_BUCKET` to measure against real S3 instead, which is the number
+/// that matters: an object there costs a PUT round trip rather than a `create` +
+/// `sync_data` + `hard_link`, and both delta packs and golden roots are about how
+/// many bytes and objects reach the object store.
+///
+/// `prefix` keeps concurrent and repeated runs from colliding in one bucket.
+fn object_store(dir: &Path, prefix: &str) -> Arc<dyn BlobStore> {
+    match std::env::var("CATS_BENCH_S3_BUCKET") {
+        Ok(bucket) if !bucket.is_empty() => {
+            let mut pairs = vec![
+                ("bucket".to_string(), bucket),
+                ("prefix".to_string(), format!("bench/{prefix}")),
+            ];
+            if let Ok(region) = std::env::var("AWS_REGION") {
+                pairs.push(("region".to_string(), region));
+            }
+            let config = AdapterConfig::from_pairs(
+                pairs.iter().map(|(k, v)| (k.as_str(), v.clone())),
+            )
+            .expect("s3 adapter options");
+            open_blob_store(
+                cats_object_store_aws_s3::ADAPTER_NAME,
+                &config,
+                &[&AwsS3BlobStoreFactory as &dyn BlobStoreFactory],
+            )
+            .expect("open s3 object store")
+        }
+        _ => Arc::new(FileBlobStore::open(dir.join("blob")).expect("blob")),
+    }
+}
+
 struct Env {
     _dir: tempfile::TempDir,
     engine: Arc<ChunkEngine>,
     published: Arc<SizingBlob>,
 }
 
-fn env(chunks: u64) -> Env {
+fn env(chunks: u64, run: &str) -> Env {
     let dir = tempfile::tempdir().expect("tempdir");
-    let file = Arc::new(FileBlobStore::open(dir.path().join("blob")).expect("blob"));
     let published = Arc::new(SizingBlob {
-        inner: file,
+        inner: object_store(dir.path(), run),
         data_bytes: AtomicU64::new(0),
     });
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).expect("meta"));
@@ -95,8 +130,8 @@ fn flush_cost_scales_with_the_dirty_set() {
     for dirty_chunks in [1u64, 8, 16, 32, 48] {
         let mut samples = Vec::new();
         let mut published = 0u64;
-        for _ in 0..repeats {
-            let env = env(volume_chunks);
+        for repeat in 0..repeats {
+            let env = env(volume_chunks, &format!("sparse-{dirty_chunks}-{repeat}"));
             let page = vec![0x5au8; PAGE as usize];
             for chunk in 0..dirty_chunks {
                 env.engine
@@ -151,8 +186,8 @@ fn flush_cost_for_dense_writes() {
     for dirty_chunks in [8u64, 32, 48] {
         let mut samples = Vec::new();
         let mut published = 0u64;
-        for _ in 0..repeats {
-            let env = env(volume_chunks);
+        for repeat in 0..repeats {
+            let env = env(volume_chunks, &format!("dense-{dirty_chunks}-{repeat}"));
             let whole = vec![0xa5u8; CHUNK as usize];
             for chunk in 0..dirty_chunks {
                 env.engine

@@ -26,9 +26,12 @@ use std::time::Instant;
 use cats_blockd::engine::{ChunkEngine, EngineConfig};
 use cats_blockd::image;
 use cats_metadata_store_sqlite::SqliteMetadataStore;
+use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
 use cats_object_store_file::FileBlobStore;
 use cats_storage::blob::{BlobStore, Result as BlobResult};
-use cats_storage::{MetadataStore, VolumeHead};
+use cats_storage::{
+    open_blob_store, AdapterConfig, BlobStoreFactory, MetadataStore, VolumeHead,
+};
 
 const CHUNK: u64 = cats_api::chunk::CHUNK_SIZE as u64;
 const MIB: f64 = 1024.0 * 1024.0;
@@ -74,6 +77,40 @@ impl BlobStore for CountingBlob {
     }
 }
 
+/// The object store a benchmark run measures against.
+///
+/// Defaults to a local file store so the benchmark runs anywhere. Set
+/// `CATS_BENCH_S3_BUCKET` to measure against real S3 instead, which is the number
+/// that matters: an object there costs a PUT round trip rather than a `create` +
+/// `sync_data` + `hard_link`, and both delta packs and golden roots are about how
+/// many bytes and objects reach the object store.
+///
+/// `prefix` keeps concurrent and repeated runs from colliding in one bucket.
+fn object_store(dir: &Path, prefix: &str) -> Arc<dyn BlobStore> {
+    match std::env::var("CATS_BENCH_S3_BUCKET") {
+        Ok(bucket) if !bucket.is_empty() => {
+            let mut pairs = vec![
+                ("bucket".to_string(), bucket),
+                ("prefix".to_string(), format!("bench/{prefix}")),
+            ];
+            if let Ok(region) = std::env::var("AWS_REGION") {
+                pairs.push(("region".to_string(), region));
+            }
+            let config = AdapterConfig::from_pairs(
+                pairs.iter().map(|(k, v)| (k.as_str(), v.clone())),
+            )
+            .expect("s3 adapter options");
+            open_blob_store(
+                cats_object_store_aws_s3::ADAPTER_NAME,
+                &config,
+                &[&AwsS3BlobStoreFactory as &dyn BlobStoreFactory],
+            )
+            .expect("open s3 object store")
+        }
+        _ => Arc::new(FileBlobStore::open(dir.join("blob")).expect("blob")),
+    }
+}
+
 struct Env {
     _dir: tempfile::TempDir,
     root: PathBuf,
@@ -82,11 +119,11 @@ struct Env {
     counters: Arc<Counters>,
 }
 
-fn env() -> Env {
+fn env(run: &str) -> Env {
     let dir = tempfile::tempdir().expect("tempdir");
     let counters = Arc::new(Counters::default());
     let blob = Arc::new(CountingBlob {
-        inner: Arc::new(FileBlobStore::open(dir.path().join("blob")).expect("blob")),
+        inner: object_store(dir.path(), run),
         counters: counters.clone(),
     });
     let meta: Arc<dyn MetadataStore> =
@@ -174,7 +211,7 @@ fn provisioning_one_root_disk() {
         let mut copy_samples = Vec::new();
         let mut copy_report = (0u64, 0u64, 0i64);
         for repeat in 0..repeats {
-            let env = env();
+            let env = env(&format!("one-copy-{image_mib}-{repeat}"));
             let image = golden_image(&env.root, image_mib);
             let volume = format!("vol_copy_{image_mib}_{repeat}");
             let started = Instant::now();
@@ -193,7 +230,7 @@ fn provisioning_one_root_disk() {
         let mut ref_report = (0u64, 0u64, 0i64);
         let mut publish_ms = 0.0;
         for repeat in 0..repeats {
-            let env = env();
+            let env = env(&format!("one-ref-{image_mib}-{repeat}"));
             let image = golden_image(&env.root, image_mib);
             // Publishing happens once per image for the whole fleet; it is timed
             // separately rather than charged to a create.
@@ -266,7 +303,7 @@ fn provisioning_many_root_disks_from_one_image() {
         let mut wall = [0.0f64; 2];
         let mut uploaded = [(0u64, 0u64); 2];
         for (index, by_reference) in [false, true].into_iter().enumerate() {
-            let env = env();
+            let env = env(&format!("many-{cats}-{by_reference}"));
             let image = golden_image(&env.root, image_mib);
             let manifest = by_reference
                 .then(|| image::publish(env.blob.as_ref(), &image).expect("publish").manifest);
@@ -319,7 +356,7 @@ fn first_read_of_a_referenced_chunk_versus_a_private_one() {
         "path", "cold read ms", "MiB/s"
     );
     for by_reference in [false, true] {
-        let env = env();
+        let env = env(&format!("read-{by_reference}"));
         let image = golden_image(&env.root, image_mib);
         let volume = format!("vol_read_{by_reference}");
         if by_reference {

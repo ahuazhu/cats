@@ -5,7 +5,6 @@
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::time::{Duration, Instant};
 
 const VOL_SIZE: u64 = 4 * cats_api::chunk::CHUNK_SIZE as u64;
 
@@ -76,17 +75,6 @@ fn wait_ready(child: &mut Child) -> String {
     reader.read_line(&mut line).expect("read READY line");
     assert!(line.starts_with("READY "), "unexpected first line: {line:?}");
     line.trim().to_string()
-}
-
-fn wait_exit(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            return status;
-        }
-        assert!(Instant::now() < deadline, "cats-blockd did not exit in time");
-        std::thread::sleep(Duration::from_millis(20));
-    }
 }
 
 #[test]
@@ -243,12 +231,23 @@ fn a_root_disk_is_provisioned_from_a_shared_image_without_copying_it() {
 /// The Linux-only half: vhost-user needs eventfd, memfd and SCM_RIGHTS.
 #[cfg(target_os = "linux")]
 mod vhost_user {
-    use std::process::Stdio;
-    use std::time::Duration;
+    use std::process::{Child, Stdio};
+    use std::time::{Duration, Instant};
 
     use cats_blockd::nbd::NbdClient;
 
-    use super::{wait_exit, wait_ready, Env, VOL_SIZE};
+    use super::{wait_ready, Env, VOL_SIZE};
+
+    fn wait_exit(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "cats-blockd did not exit in time");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 
     /// The node agent runs `cats-blockd` with both frontends: the VMM consumes
     /// vhost-user while seeding, readiness probing and recovery keep using NBD on the
