@@ -1,0 +1,34 @@
+blockd/tests/commit_cost.rs, release build, aarch64 Linux container, median of 3,
+run serially and in isolation. ADR-0016 delta packs.
+
+Sparse: one 64 KiB page dirtied per chunk -- the shape a 4 KiB random-write Guest
+workload produces. "published MiB" is what actually reached the object store.
+
+dirty chunks  dirty pages  published MiB     flush ms   ms per pub MiB   sha256 MiB/s
+           1            1           0.06          7.6           121.25            532
+           8            8           0.50         30.5            61.01            534
+          16           16           1.00         47.4            47.39            541
+          32           32           2.00         85.9            42.97            548
+          48           48           3.00        109.0            36.34            548
+
+Dense: every page of each chunk dirtied, so the commit publishes full 4 MiB bases.
+This is deliberately unchanged by delta packs, and it is also an in-run proxy for
+what the old code did for ANY dirty chunk, sparse or not.
+
+dirty chunks  published MiB     flush ms   ms per pub MiB
+           8          32.00         83.1             2.60
+          32         128.00        300.7             2.35
+          48         192.00        412.4             2.15
+
+Reading:
+
+* A 48-chunk commit that used to publish 192 MiB now publishes 3 MiB: 64x less
+  data into the object store.
+* Same-run comparison of the two shapes: 412.4 ms -> 109.0 ms, i.e. 3.8x lower
+  FLUSH latency. Against the separately recorded full-chunk baseline before delta
+  packs (749.5 ms for 48 chunks) it is 6.9x.
+* Latency does not follow bytes down 64x because the cost structure flipped: at
+  36 ms per published MiB versus 2.15 for the dense case, the residual is
+  per-object fixed cost -- 48 objects, each a create + sync_data + hard_link in
+  the file store, or a PUT round trip on S3, about 2.3 ms each. The next lever is
+  fewer objects per commit, not fewer bytes.

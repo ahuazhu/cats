@@ -12,11 +12,35 @@ pub const ROOT_MAGIC: &[u8; 8] = b"CATSROOT";
 pub const PACK_MAGIC: &[u8; 8] = b"CATSPACK";
 pub const BITMAP_MAGIC: &[u8; 8] = b"CATSDRTY";
 pub const FORMAT_VERSION: u16 = 1;
+/// Leaf encoding version that can carry layered (base + delta) chunk refs.
+///
+/// A leaf is encoded at version 1 unless it actually contains a layered ref, so
+/// volumes that never take a delta keep byte-identical map nodes (and therefore
+/// the same object ids) as before delta packs existed.
+pub const LEAF_VERSION_LAYERED: u16 = 2;
 
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(data);
     h.finalize().into()
+}
+
+/// A full-chunk image object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseRef {
+    pub object_id: String,
+    pub len: u32,
+    pub sha256: [u8; 32],
+}
+
+/// A delta object: the dirty 64 KiB pages of one chunk, concatenated in page
+/// order. `page_mask` says which pages, so `len` is `popcount(page_mask)` pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaRef {
+    pub object_id: String,
+    pub page_mask: u64,
+    pub len: u32,
+    pub sha256: [u8; 32],
 }
 
 /// Reference of one logical chunk in the committed map.
@@ -28,11 +52,81 @@ pub enum ChunkRef {
         len: u32,
         sha256: [u8; 32],
     },
+    /// A base image — or a hole, when `base` is `None` — with deltas applied in
+    /// order. Later deltas win on any page they both carry.
+    Layered {
+        base: Option<BaseRef>,
+        deltas: Vec<DeltaRef>,
+    },
 }
 
 impl ChunkRef {
     pub fn is_hole(&self) -> bool {
         matches!(self, ChunkRef::Hole)
+    }
+
+    /// Delta objects a cold read of this chunk has to fetch on top of its base.
+    pub fn layer_count(&self) -> usize {
+        match self {
+            Self::Hole | Self::Base { .. } => 0,
+            Self::Layered { deltas, .. } => deltas.len(),
+        }
+    }
+
+    /// The chunk's base image, if it has one.
+    pub fn base(&self) -> Option<BaseRef> {
+        match self {
+            Self::Hole => None,
+            Self::Base {
+                object_id,
+                len,
+                sha256,
+            } => Some(BaseRef {
+                object_id: object_id.clone(),
+                len: *len,
+                sha256: *sha256,
+            }),
+            Self::Layered { base, .. } => base.clone(),
+        }
+    }
+
+    /// Objects a cold read of this chunk fetches, base first.
+    pub fn object_ids(&self) -> Vec<&str> {
+        match self {
+            Self::Hole => Vec::new(),
+            Self::Base { object_id, .. } => vec![object_id.as_str()],
+            Self::Layered { base, deltas } => base
+                .iter()
+                .map(|b| b.object_id.as_str())
+                .chain(deltas.iter().map(|d| d.object_id.as_str()))
+                .collect(),
+        }
+    }
+
+    /// Append a delta, turning a hole or a plain base into a layered ref.
+    pub fn with_delta(self, delta: DeltaRef) -> Self {
+        match self {
+            Self::Hole => Self::Layered {
+                base: None,
+                deltas: vec![delta],
+            },
+            Self::Base {
+                object_id,
+                len,
+                sha256,
+            } => Self::Layered {
+                base: Some(BaseRef {
+                    object_id,
+                    len,
+                    sha256,
+                }),
+                deltas: vec![delta],
+            },
+            Self::Layered { base, mut deltas } => {
+                deltas.push(delta);
+                Self::Layered { base, deltas }
+            }
+        }
     }
 }
 
@@ -67,15 +161,32 @@ fn take_u32(buf: &mut &[u8], what: &'static str) -> Result<u32, FormatError> {
 fn take_u64(buf: &mut &[u8], what: &'static str) -> Result<u64, FormatError> {
     Ok(u64::from_le_bytes(take(buf, 8, what)?.try_into().unwrap()))
 }
+fn take_id(buf: &mut &[u8]) -> Result<String, FormatError> {
+    let len = take_u16(buf, "leaf")? as usize;
+    Ok(std::str::from_utf8(take(buf, len, "leaf")?)
+        .map_err(|_| FormatError::Malformed("leaf"))?
+        .to_string())
+}
 
 // ---------------------------------------------------------------------------
 // Leaf nodes
 // ---------------------------------------------------------------------------
 
+fn push_id(out: &mut Vec<u8>, id: &str) {
+    let bytes = id.as_bytes();
+    out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+    out.extend_from_slice(bytes);
+}
+
 pub fn encode_leaf(first_chunk: u64, entries: &[ChunkRef]) -> Vec<u8> {
+    let version = if entries.iter().any(|e| matches!(e, ChunkRef::Layered { .. })) {
+        LEAF_VERSION_LAYERED
+    } else {
+        FORMAT_VERSION
+    };
     let mut out = Vec::with_capacity(16 + entries.len() * 64);
     out.extend_from_slice(LEAF_MAGIC);
-    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&first_chunk.to_le_bytes());
     out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for e in entries {
@@ -87,11 +198,28 @@ pub fn encode_leaf(first_chunk: u64, entries: &[ChunkRef]) -> Vec<u8> {
                 sha256,
             } => {
                 out.push(1);
-                let id = object_id.as_bytes();
-                out.extend_from_slice(&(id.len() as u16).to_le_bytes());
-                out.extend_from_slice(id);
+                push_id(&mut out, object_id);
                 out.extend_from_slice(&len.to_le_bytes());
                 out.extend_from_slice(sha256);
+            }
+            ChunkRef::Layered { base, deltas } => {
+                out.push(2);
+                match base {
+                    None => out.push(0),
+                    Some(base) => {
+                        out.push(1);
+                        push_id(&mut out, &base.object_id);
+                        out.extend_from_slice(&base.len.to_le_bytes());
+                        out.extend_from_slice(&base.sha256);
+                    }
+                }
+                out.extend_from_slice(&(deltas.len() as u16).to_le_bytes());
+                for delta in deltas {
+                    push_id(&mut out, &delta.object_id);
+                    out.extend_from_slice(&delta.page_mask.to_le_bytes());
+                    out.extend_from_slice(&delta.len.to_le_bytes());
+                    out.extend_from_slice(&delta.sha256);
+                }
             }
         }
     }
@@ -104,7 +232,7 @@ pub fn decode_leaf(mut buf: &[u8]) -> Result<(u64, Vec<ChunkRef>), FormatError> 
         return Err(FormatError::Malformed("leaf"));
     }
     let ver = take_u16(b, "leaf")?;
-    if ver != FORMAT_VERSION {
+    if ver != FORMAT_VERSION && ver != LEAF_VERSION_LAYERED {
         return Err(FormatError::Version("leaf", ver));
     }
     let first_chunk = take_u64(b, "leaf")?;
@@ -125,6 +253,33 @@ pub fn decode_leaf(mut buf: &[u8]) -> Result<(u64, Vec<ChunkRef>), FormatError> 
                     len,
                     sha256: sha,
                 });
+            }
+            2 if ver >= LEAF_VERSION_LAYERED => {
+                let base = match take_u8(b, "leaf")? {
+                    0 => None,
+                    1 => Some(BaseRef {
+                        object_id: take_id(b)?,
+                        len: take_u32(b, "leaf")?,
+                        sha256: take(b, 32, "leaf")?.try_into().unwrap(),
+                    }),
+                    _ => return Err(FormatError::Malformed("leaf")),
+                };
+                let count = take_u16(b, "leaf")? as usize;
+                if count == 0 {
+                    // A layered ref with no deltas would be a plain base or a
+                    // hole; refuse it so there is exactly one encoding per state.
+                    return Err(FormatError::Malformed("leaf"));
+                }
+                let mut deltas = Vec::with_capacity(count);
+                for _ in 0..count {
+                    deltas.push(DeltaRef {
+                        object_id: take_id(b)?,
+                        page_mask: take_u64(b, "leaf")?,
+                        len: take_u32(b, "leaf")?,
+                        sha256: take(b, 32, "leaf")?.try_into().unwrap(),
+                    });
+                }
+                entries.push(ChunkRef::Layered { base, deltas });
             }
             _ => return Err(FormatError::Malformed("leaf")),
         }
@@ -215,12 +370,29 @@ pub struct PackHeader {
     pub entries: Vec<PackEntry>,
 }
 
+/// `page_mask` of a full-chunk base image. Deltas always carry fewer pages, so
+/// this value distinguishes the two without a second field — and it is the serde
+/// default, which keeps packs written before delta packs replayable.
+pub fn full_page_mask() -> u64 {
+    u64::MAX
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PackEntry {
     pub chunk_idx: u64,
     pub payload_offset: u64,
     pub len: u32,
     pub sha256_hex: String,
+    /// Which of the chunk's 64 pages this entry carries.
+    #[serde(default = "full_page_mask")]
+    pub page_mask: u64,
+}
+
+impl PackEntry {
+    /// A full-chunk image rather than a delta.
+    pub fn is_base(&self) -> bool {
+        self.page_mask == full_page_mask()
+    }
 }
 
 pub fn encode_pack(header: &PackHeader, payload: &[u8]) -> Vec<u8> {
@@ -343,12 +515,122 @@ mod tests {
                 payload_offset: 0,
                 len: 4,
                 sha256_hex: hex::encode(sha256(b"data")),
+                page_mask: full_page_mask(),
             }],
         };
         let enc = encode_pack(&header, b"data");
         let (h, payload) = decode_pack(&enc).unwrap();
         assert_eq!(h.txn, "t1");
         assert_eq!(payload, b"data");
+    }
+
+    #[test]
+    fn layered_leaf_roundtrip_and_version_only_bumps_when_needed() {
+        let plain = vec![
+            ChunkRef::Hole,
+            ChunkRef::Base {
+                object_id: "txn1-c1".into(),
+                len: CHUNK_SIZE,
+                sha256: [7u8; 32],
+            },
+        ];
+        // A leaf with no layered ref keeps the version it always had, so volumes
+        // that never take a delta keep byte-identical map nodes.
+        assert_eq!(
+            u16::from_le_bytes(encode_leaf(0, &plain)[8..10].try_into().unwrap()),
+            FORMAT_VERSION
+        );
+
+        let layered = vec![
+            ChunkRef::Layered {
+                base: None,
+                deltas: vec![DeltaRef {
+                    object_id: "txn2-c0-d".into(),
+                    page_mask: 0b101,
+                    len: 2 * cats_api::chunk::DIRTY_PAGE_SIZE,
+                    sha256: [1u8; 32],
+                }],
+            },
+            ChunkRef::Layered {
+                base: Some(BaseRef {
+                    object_id: "txn1-c1".into(),
+                    len: CHUNK_SIZE,
+                    sha256: [7u8; 32],
+                }),
+                deltas: vec![
+                    DeltaRef {
+                        object_id: "txn2-c1-d".into(),
+                        page_mask: 1,
+                        len: cats_api::chunk::DIRTY_PAGE_SIZE,
+                        sha256: [2u8; 32],
+                    },
+                    DeltaRef {
+                        object_id: "txn3-c1-d".into(),
+                        page_mask: 1 << 63,
+                        len: cats_api::chunk::DIRTY_PAGE_SIZE,
+                        sha256: [3u8; 32],
+                    },
+                ],
+            },
+        ];
+        let encoded = encode_leaf(64, &layered);
+        assert_eq!(
+            u16::from_le_bytes(encoded[8..10].try_into().unwrap()),
+            LEAF_VERSION_LAYERED
+        );
+        let (first, decoded) = decode_leaf(&encoded).unwrap();
+        assert_eq!(first, 64);
+        assert_eq!(decoded, layered);
+        assert_eq!(sha256(&encoded), sha256(&encode_leaf(64, &layered)));
+
+        assert_eq!(layered[0].layer_count(), 1);
+        assert_eq!(layered[1].layer_count(), 2);
+        assert_eq!(layered[1].object_ids(), vec!["txn1-c1", "txn2-c1-d", "txn3-c1-d"]);
+        assert_eq!(layered[0].base(), None);
+    }
+
+    #[test]
+    fn a_layered_ref_with_no_deltas_is_not_a_valid_encoding() {
+        // Every state has exactly one encoding: no deltas means Hole or Base.
+        let mut encoded = encode_leaf(
+            0,
+            &[ChunkRef::Layered {
+                base: None,
+                deltas: vec![DeltaRef {
+                    object_id: "d".into(),
+                    page_mask: 1,
+                    len: cats_api::chunk::DIRTY_PAGE_SIZE,
+                    sha256: [0u8; 32],
+                }],
+            }],
+        );
+        // Rewrite the delta count to zero and drop the delta body.
+        let count_at = encoded.len() - (1 + 2 + 8 + 4 + 32);
+        encoded[count_at] = 0;
+        encoded[count_at + 1] = 0;
+        encoded.truncate(count_at + 2);
+        assert!(decode_leaf(&encoded).is_err());
+    }
+
+    #[test]
+    fn a_pack_written_before_delta_packs_still_decodes_as_full_chunks() {
+        // Recovery has to replay a pending pack written by an older binary, which
+        // had no page_mask field at all.
+        let legacy = serde_json::json!({
+            "txn": "t1",
+            "volume_id": "vol_x",
+            "base_generation": 1,
+            "lease_epoch": 2,
+            "entries": [{
+                "chunk_idx": 0,
+                "payload_offset": 0,
+                "len": CHUNK_SIZE,
+                "sha256_hex": hex::encode([0u8; 32]),
+            }]
+        });
+        let header: PackHeader = serde_json::from_value(legacy).unwrap();
+        assert!(header.entries[0].is_base());
+        assert_eq!(header.entries[0].page_mask, full_page_mask());
     }
 
     #[test]

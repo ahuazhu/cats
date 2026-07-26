@@ -348,24 +348,28 @@ impl ChunkEngine {
 
         // ---- freeze the barrier ----
         //
-        // Everything in here blocks every Guest read and write on this volume,
-        // so it does the minimum a point-in-time image requires: pick the dirty
-        // set and copy those chunk images. Hashing them is pure computation over
-        // a private copy, so it happens after the barrier is released. Measured
-        // on a real Guest this is worth about 5% of FLUSH latency: the rest is
-        // the full-chunk copy plus writing the pack and the objects, which only
-        // delta packs can fix (evidence and numbers:
-        // experiments/vhost-user-blk-frontend-20260726).
-        let (frozen, base_generation, base_map, base_leaves, payload) = {
+        // Everything in here blocks every Guest read and write on this volume, so
+        // it does the minimum a point-in-time image requires: pick the dirty set
+        // and copy the bytes this commit will publish. Hashing is pure computation
+        // over a private copy, so it happens after the barrier is released.
+        //
+        // A commit publishes only the dirty 64 KiB pages of each chunk (spec
+        // §6.2). The pages it does not carry are unchanged since the last commit
+        // and are therefore already immutable in the object store, so leaving
+        // them out cannot make the image inconsistent — which is what makes the
+        // barrier proportional to what the Guest actually wrote instead of to the
+        // 4 MiB chunks it touched.
+        let (plans, base_generation, base_map, base_leaves, payload) = {
             let _barrier = self.io_gate.write().unwrap();
             let mut st = self.state.lock().unwrap();
-            let frozen: Vec<u64> = (0..self.chunk_count)
+            let dirty: Vec<(u64, u64)> = (0..self.chunk_count)
                 .filter(|&c| st.dirty[c as usize] != 0)
+                .map(|c| (c, st.dirty[c as usize]))
                 .collect();
-            if frozen.is_empty() {
+            if dirty.is_empty() {
                 return Ok(st.generation);
             }
-            for &c in &frozen {
+            for &(c, _) in &dirty {
                 st.dirty[c as usize] = 0;
             }
             let base_generation = st.generation;
@@ -373,24 +377,28 @@ impl ChunkEngine {
             let base_leaves = st.leaf_refs.clone();
             drop(st);
 
+            let plans = plan_commit(&dirty, &base_map);
+            let bytes: usize = plans.iter().map(|p| p.len()).sum();
             // One allocation for the whole pack: `vec![0u8; n]` for a large `n`
-            // comes from fresh zero pages, while a 4 MiB allocation per chunk
-            // charged an allocation and a page-fault storm to the barrier.
-            let mut payload = vec![0u8; frozen.len() * CHUNK_SIZE as usize];
-            copy_chunks_into(&self.cache, &frozen, &mut payload)?;
-            (frozen, base_generation, base_map, base_leaves, payload)
+            // comes from fresh zero pages, while an allocation per chunk charged
+            // a page-fault storm to the barrier.
+            let mut payload = vec![0u8; bytes];
+            copy_planned_pages(&self.cache, &plans, &mut payload)?;
+            (plans, base_generation, base_map, base_leaves, payload)
         };
 
-        // Barrier released: hash the frozen images and describe the pack.
-        let entries = describe_pack(&frozen, &payload);
+        // Barrier released: hash the frozen bytes and describe the pack.
+        let entries = describe_pack(&plans, &payload);
 
         // Commit size is the single most useful number when a Guest workload
         // stalls on FLUSH: the barrier above is held for as long as it takes to
-        // copy and hash every dirty chunk, and V1 commits whole 4 MiB chunks.
+        // copy the published bytes, and the commit then writes them twice more
+        // (pack file, then objects).
         tracing::info!(
             volume = %self.cfg.volume_id,
             base_generation,
-            dirty_chunks = frozen.len(),
+            dirty_chunks = plans.len(),
+            base_rewrites = plans.iter().filter(|p| p.is_base()).count(),
             pack_bytes = payload.len(),
             "commit barrier frozen"
         );
@@ -429,8 +437,15 @@ impl ChunkEngine {
     // Commit path (shared by flush and recovery)
     // -----------------------------------------------------------------
 
-    fn data_object_id(txn: &str, chunk_idx: u64) -> String {
-        format!("{txn}-c{chunk_idx}")
+    /// Object id for one pack entry. A commit publishes at most one object per
+    /// chunk, so the txn and chunk index identify it; the suffix keeps a delta
+    /// from ever colliding with a base written for the same chunk in a replay.
+    fn object_id(txn: &str, entry: &PackEntry) -> String {
+        if entry.is_base() {
+            format!("{txn}-c{}", entry.chunk_idx)
+        } else {
+            format!("{txn}-c{}-d", entry.chunk_idx)
+        }
     }
 
     fn commit_pack(
@@ -446,23 +461,35 @@ impl ChunkEngine {
         for e in &header.entries {
             let bytes =
                 &payload[e.payload_offset as usize..e.payload_offset as usize + e.len as usize];
-            let object_id = Self::data_object_id(&header.txn, e.chunk_idx);
+            let object_id = Self::object_id(&header.txn, e);
             self.blob
                 .put_immutable(&chunk::keys::data(vol, &object_id), bytes)?;
         }
         crashpoint::maybe_crash(crashpoint::AFTER_DATA_UPLOAD);
 
-        // 2. New map: apply frozen refs onto the base map.
+        // 2. New map: a base entry replaces the chunk's reference outright, a
+        //    delta entry appends a layer to whatever the chunk already had.
         let mut new_map = base_map;
         for e in &header.entries {
             let sha: [u8; 32] = hex::decode(&e.sha256_hex)
                 .ok()
                 .and_then(|v| v.try_into().ok())
                 .ok_or_else(|| EngineError::Corrupt("bad sha in pack".into()))?;
-            new_map[e.chunk_idx as usize] = ChunkRef::Base {
-                object_id: Self::data_object_id(&header.txn, e.chunk_idx),
-                len: e.len,
-                sha256: sha,
+            let object_id = Self::object_id(&header.txn, e);
+            let slot = &mut new_map[e.chunk_idx as usize];
+            *slot = if e.is_base() {
+                ChunkRef::Base {
+                    object_id,
+                    len: e.len,
+                    sha256: sha,
+                }
+            } else {
+                slot.clone().with_delta(format::DeltaRef {
+                    object_id,
+                    page_mask: e.page_mask,
+                    len: e.len,
+                    sha256: sha,
+                })
             };
         }
 
@@ -664,37 +691,28 @@ impl ChunkEngine {
     /// base hydrated, or the chunk is a hole / locally dirty).
     fn ensure_cache_complete(&self, chunk_idx: u64) -> Result<()> {
         loop {
-            let base = {
+            let chunk_ref = {
                 let mut st = self.state.lock().unwrap();
                 if st.hydrated[chunk_idx as usize] {
                     return Ok(());
                 }
                 let chunk_ref = st.map[chunk_idx as usize].clone();
-                match chunk_ref {
-                    ChunkRef::Hole => {
-                        // Sparse cache file already reads as zeros.
-                        st.hydrated[chunk_idx as usize] = true;
-                        return Ok(());
-                    }
-                    ChunkRef::Base {
-                        object_id,
-                        len,
-                        sha256,
-                    } => {
-                        if st.hydrating.contains(&chunk_idx) {
-                            let _unused = self
-                                .hydration_cv
-                                .wait(st)
-                                .map_err(|_| EngineError::Corrupt("poisoned lock".into()))?;
-                            continue;
-                        }
-                        st.hydrating.insert(chunk_idx);
-                        (object_id, len, sha256)
-                    }
+                if chunk_ref.is_hole() {
+                    // Sparse cache file already reads as zeros.
+                    st.hydrated[chunk_idx as usize] = true;
+                    return Ok(());
                 }
+                if st.hydrating.contains(&chunk_idx) {
+                    let _unused = self
+                        .hydration_cv
+                        .wait(st)
+                        .map_err(|_| EngineError::Corrupt("poisoned lock".into()))?;
+                    continue;
+                }
+                st.hydrating.insert(chunk_idx);
+                chunk_ref
             };
-            let (object_id, len, sha) = base;
-            let result = self.hydrate_chunk(chunk_idx, &object_id, len, sha);
+            let result = self.hydrate_chunk(chunk_idx, &chunk_ref);
             let mut st = self.state.lock().unwrap();
             st.hydrating.remove(&chunk_idx);
             if result.is_ok() {
@@ -705,13 +723,8 @@ impl ChunkEngine {
         }
     }
 
-    fn hydrate_chunk(
-        &self,
-        chunk_idx: u64,
-        object_id: &str,
-        len: u32,
-        sha: [u8; 32],
-    ) -> Result<()> {
+    /// Fetch one object and check it against the reference that named it.
+    fn fetch_verified(&self, object_id: &str, len: u32, sha: [u8; 32]) -> Result<Vec<u8>> {
         let key = chunk::keys::data(&self.cfg.volume_id, object_id);
         let bytes = self.blob.get(&key)?;
         if bytes.len() != len as usize {
@@ -724,8 +737,62 @@ impl ChunkEngine {
                 "object {object_id} checksum mismatch"
             )));
         }
+        Ok(bytes)
+    }
+
+    /// Materialize one chunk into the local cache from its committed objects.
+    ///
+    /// A layered chunk is assembled base-first and then delta by delta, so a
+    /// later delta overwrites an earlier one on any page they share. The result
+    /// is written as one full chunk so nothing stale can survive underneath it —
+    /// which matters because the cache file outlives an attachment.
+    fn hydrate_chunk(&self, chunk_idx: u64, chunk_ref: &ChunkRef) -> Result<()> {
+        let page = cats_api::chunk::DIRTY_PAGE_SIZE as usize;
+        let image = match chunk_ref {
+            ChunkRef::Hole => return Ok(()),
+            ChunkRef::Base {
+                object_id,
+                len,
+                sha256,
+            } => self.fetch_verified(object_id, *len, *sha256)?,
+            ChunkRef::Layered { base, deltas } => {
+                let mut image = match base {
+                    Some(base) => {
+                        self.fetch_verified(&base.object_id, base.len, base.sha256)?
+                    }
+                    None => vec![0u8; CHUNK_SIZE as usize],
+                };
+                if image.len() != CHUNK_SIZE as usize {
+                    return Err(EngineError::Corrupt(
+                        "layered chunk base is not a full chunk".into(),
+                    ));
+                }
+                for delta in deltas {
+                    let bytes =
+                        self.fetch_verified(&delta.object_id, delta.len, delta.sha256)?;
+                    let mut consumed = 0usize;
+                    for page_idx in 0..cats_api::chunk::PAGES_PER_CHUNK {
+                        if delta.page_mask & (1u64 << page_idx) == 0 {
+                            continue;
+                        }
+                        let at = page_idx as usize * page;
+                        image[at..at + page].copy_from_slice(&bytes[consumed..consumed + page]);
+                        consumed += page;
+                    }
+                    if consumed != bytes.len() {
+                        return Err(EngineError::Corrupt(format!(
+                            "delta {} carries {} bytes for {} pages",
+                            delta.object_id,
+                            bytes.len(),
+                            delta.page_mask.count_ones()
+                        )));
+                    }
+                }
+                image
+            }
+        };
         self.cache
-            .write_all_at(&bytes, chunk_idx * CHUNK_SIZE as u64)?;
+            .write_all_at(&image, chunk_idx * CHUNK_SIZE as u64)?;
         Ok(())
     }
 
@@ -836,55 +903,166 @@ fn root_object_hex(object_id: &str) -> &str {
     object_id_hex(object_id)
 }
 
+/// Deltas a chunk may accumulate before the next commit rewrites its base.
+///
+/// Every layer is one more object a cold read of that chunk has to fetch, so this
+/// trades cold-read round trips against write amplification: with a cap of four,
+/// a cold chunk read costs at most five GETs, and a chunk that keeps being
+/// written gets a fresh full base at least every fourth commit. A background
+/// compactor would let this be raised; there is none yet.
+pub const MAX_DELTA_LAYERS: usize = 4;
+
+/// What one commit publishes for one chunk.
+#[derive(Debug, Clone)]
+struct ChunkPlan {
+    chunk_idx: u64,
+    /// Pages carried by this entry; `full_page_mask()` means a whole-chunk base.
+    page_mask: u64,
+}
+
+impl ChunkPlan {
+    fn is_base(&self) -> bool {
+        self.page_mask == format::full_page_mask()
+    }
+
+    /// Payload bytes this plan contributes to the pack.
+    fn len(&self) -> usize {
+        self.page_mask.count_ones() as usize * cats_api::chunk::DIRTY_PAGE_SIZE as usize
+    }
+
+    /// Byte runs to copy out of the cache, coalescing adjacent dirty pages so a
+    /// scattered mask still costs few reads.
+    fn runs(&self, payload_offset: usize) -> Vec<CopyRun> {
+        let page = cats_api::chunk::DIRTY_PAGE_SIZE as u64;
+        let chunk_start = self.chunk_idx * CHUNK_SIZE as u64;
+        let mut runs = Vec::new();
+        let mut dst = payload_offset;
+        let mut page_idx = 0u32;
+        while page_idx < cats_api::chunk::PAGES_PER_CHUNK {
+            if self.page_mask & (1u64 << page_idx) == 0 {
+                page_idx += 1;
+                continue;
+            }
+            let first = page_idx;
+            while page_idx < cats_api::chunk::PAGES_PER_CHUNK
+                && self.page_mask & (1u64 << page_idx) != 0
+            {
+                page_idx += 1;
+            }
+            let len = ((page_idx - first) as u64 * page) as usize;
+            runs.push(CopyRun {
+                file_offset: chunk_start + first as u64 * page,
+                dst_offset: dst,
+                len,
+            });
+            dst += len;
+        }
+        runs
+    }
+}
+
+/// One contiguous copy from the cache file into the pack payload.
+#[derive(Debug, Clone, Copy)]
+struct CopyRun {
+    file_offset: u64,
+    dst_offset: usize,
+    len: usize,
+}
+
+/// Decide what each dirty chunk publishes: a delta of its dirty pages, or a
+/// fresh full base.
+///
+/// A base is written when the chunk's delta chain is full, or when the Guest
+/// dirtied more than half the chunk — past that point a delta saves little and
+/// resetting the chain is worth more than the bytes.
+fn plan_commit(dirty: &[(u64, u64)], base_map: &[ChunkRef]) -> Vec<ChunkPlan> {
+    let pages_per_chunk = cats_api::chunk::PAGES_PER_CHUNK;
+    dirty
+        .iter()
+        .map(|&(chunk_idx, mask)| {
+            let dense = mask.count_ones() * 2 > pages_per_chunk;
+            let chain_full = base_map[chunk_idx as usize].layer_count() >= MAX_DELTA_LAYERS;
+            let page_mask = if dense || chain_full {
+                format::full_page_mask()
+            } else {
+                mask
+            };
+            ChunkPlan {
+                chunk_idx,
+                page_mask,
+            }
+        })
+        .collect()
+}
+
 /// How many threads to use for one commit's copy/hash work.
 ///
 /// Both are per-chunk independent, and both are a large share of FLUSH latency:
 /// measured on aarch64, sha256 runs at ~546 MiB/s per core and accounts for
-/// roughly 47% of a commit, while the copy reads the whole dirty set out of the
-/// cache file. The cap keeps a big commit from spawning hundreds of threads.
-fn commit_workers(chunks: usize) -> usize {
+/// roughly 47% of a commit, while the copy reads the dirty set out of the cache
+/// file. The cap keeps a big commit from spawning hundreds of threads.
+fn commit_workers(units: usize) -> usize {
     const MAX: usize = 8;
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
         .min(MAX)
-        .min(chunks)
+        .min(units)
         .max(1)
 }
 
-/// Copy the frozen chunk images out of the cache into the pack payload.
+/// Copy the planned bytes out of the cache into the pack payload.
 ///
 /// Runs inside the exclusive commit barrier, so it is the one thing that must be
-/// as short as possible: the ranges are disjoint and `read_exact_at` takes
-/// `&self`, so the copy parallelizes without any locking.
-fn copy_chunks_into(cache: &File, frozen: &[u64], payload: &mut [u8]) -> Result<()> {
-    let chunk_size = CHUNK_SIZE as usize;
-    let mut jobs: Vec<(u64, &mut [u8])> = frozen
-        .iter()
-        .copied()
-        .zip(payload.chunks_mut(chunk_size))
-        .collect();
-    let workers = commit_workers(jobs.len());
+/// as short as possible: the destination ranges are disjoint and `read_exact_at`
+/// takes `&self`, so the copy parallelizes without any locking.
+fn copy_planned_pages(cache: &File, plans: &[ChunkPlan], payload: &mut [u8]) -> Result<()> {
+    let mut runs = Vec::with_capacity(plans.len());
+    let mut offset = 0usize;
+    for plan in plans {
+        runs.extend(plan.runs(offset));
+        offset += plan.len();
+    }
+    debug_assert_eq!(offset, payload.len());
+
+    let workers = commit_workers(runs.len());
     if workers == 1 {
-        // Small commits are the common case for a quiet volume; spawning a
-        // thread to copy one chunk only adds latency.
-        for (chunk_idx, destination) in jobs.iter_mut() {
-            cache.read_exact_at(destination, *chunk_idx * CHUNK_SIZE as u64)?;
+        for run in &runs {
+            cache.read_exact_at(
+                &mut payload[run.dst_offset..run.dst_offset + run.len],
+                run.file_offset,
+            )?;
         }
         return Ok(());
     }
-    let per_worker = jobs.len().div_ceil(workers);
+
+    // Runs are in increasing destination order, so a contiguous group of runs
+    // owns a contiguous span of the payload and each worker can be handed its
+    // own `&mut` slice.
+    let per_worker = runs.len().div_ceil(workers);
     let mut failure: Option<std::io::Error> = None;
+    let mut rest = payload;
+    let mut spans: Vec<(&[CopyRun], &mut [u8], usize)> = Vec::new();
+    for group in runs.chunks(per_worker) {
+        let span_start = group[0].dst_offset;
+        let span_end = group[group.len() - 1].dst_offset + group[group.len() - 1].len;
+        let (span, tail) = rest.split_at_mut(span_end - span_start);
+        rest = tail;
+        spans.push((group, span, span_start));
+    }
     std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for group in jobs.chunks_mut(per_worker) {
-            handles.push(scope.spawn(move || -> std::io::Result<()> {
-                for (chunk_idx, destination) in group.iter_mut() {
-                    cache.read_exact_at(destination, *chunk_idx * CHUNK_SIZE as u64)?;
-                }
-                Ok(())
-            }));
-        }
+        let handles: Vec<_> = spans
+            .into_iter()
+            .map(|(group, span, span_start)| {
+                scope.spawn(move || -> std::io::Result<()> {
+                    for run in group {
+                        let start = run.dst_offset - span_start;
+                        cache.read_exact_at(&mut span[start..start + run.len], run.file_offset)?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
         for handle in handles {
             match handle.join() {
                 Ok(Err(error)) if failure.is_none() => failure = Some(error),
@@ -903,36 +1081,41 @@ fn copy_chunks_into(cache: &File, frozen: &[u64], payload: &mut [u8]) -> Result<
     }
 }
 
-/// Hash the frozen images and describe the pack entries, in chunk order.
+/// Hash the frozen bytes and describe the pack entries, in chunk order.
 ///
 /// Runs after the barrier is released, over a private copy, so it is pure
 /// computation — but it is still on the Guest's FLUSH latency, so it is worth
 /// spreading across cores.
-fn describe_pack(frozen: &[u64], payload: &[u8]) -> Vec<PackEntry> {
-    let chunk_size = CHUNK_SIZE as usize;
-    let jobs: Vec<(usize, u64, &[u8])> = frozen
-        .iter()
-        .copied()
-        .zip(payload.chunks(chunk_size))
-        .enumerate()
-        .map(|(slot, (chunk_idx, image))| (slot, chunk_idx, image))
-        .collect();
-    let workers = commit_workers(jobs.len());
-    let describe = |(slot, chunk_idx, image): &(usize, u64, &[u8])| PackEntry {
-        chunk_idx: *chunk_idx,
-        payload_offset: (*slot * CHUNK_SIZE as usize) as u64,
-        len: CHUNK_SIZE,
-        sha256_hex: hex::encode(format::sha256(image)),
+fn describe_pack(plans: &[ChunkPlan], payload: &[u8]) -> Vec<PackEntry> {
+    let mut offsets = Vec::with_capacity(plans.len());
+    let mut offset = 0usize;
+    for plan in plans {
+        offsets.push(offset);
+        offset += plan.len();
+    }
+    let describe = |(plan, start): (&ChunkPlan, &usize)| PackEntry {
+        chunk_idx: plan.chunk_idx,
+        payload_offset: *start as u64,
+        len: plan.len() as u32,
+        sha256_hex: hex::encode(format::sha256(&payload[*start..*start + plan.len()])),
+        page_mask: plan.page_mask,
     };
+    let jobs: Vec<(&ChunkPlan, &usize)> = plans.iter().zip(offsets.iter()).collect();
+    let workers = commit_workers(jobs.len());
     if workers == 1 {
-        return jobs.iter().map(describe).collect();
+        return jobs.into_iter().map(describe).collect();
     }
     let per_worker = jobs.len().div_ceil(workers);
     let mut entries: Vec<PackEntry> = std::thread::scope(|scope| {
         let handles: Vec<_> = jobs
             .chunks(per_worker)
             .map(|group| {
-                scope.spawn(move || group.iter().map(describe).collect::<Vec<_>>())
+                scope.spawn(move || {
+                    group
+                        .iter()
+                        .map(|(plan, start)| describe((plan, start)))
+                        .collect::<Vec<_>>()
+                })
             })
             .collect();
         handles
@@ -1098,6 +1281,170 @@ mod tests {
         fn list(&self, p: &str) -> cats_storage::blob::Result<Vec<String>> {
             self.inner.list(p)
         }
+    }
+
+    /// Bytes a commit actually publishes, so a test can assert that a small Guest
+    /// write does not turn into a 4 MiB upload.
+    struct SizingBlob {
+        inner: Arc<dyn BlobStore>,
+        data_bytes: AtomicU64,
+        data_objects: AtomicU64,
+    }
+    impl BlobStore for SizingBlob {
+        fn put_immutable(&self, k: &str, d: &[u8]) -> cats_storage::blob::Result<()> {
+            if k.contains("/data/") {
+                self.data_bytes.fetch_add(d.len() as u64, Ordering::SeqCst);
+                self.data_objects.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.put_immutable(k, d)
+        }
+        fn get(&self, k: &str) -> cats_storage::blob::Result<Vec<u8>> {
+            self.inner.get(k)
+        }
+        fn exists(&self, k: &str) -> cats_storage::blob::Result<bool> {
+            self.inner.exists(k)
+        }
+        fn delete(&self, k: &str) -> cats_storage::blob::Result<()> {
+            self.inner.delete(k)
+        }
+        fn list(&self, p: &str) -> cats_storage::blob::Result<Vec<String>> {
+            self.inner.list(p)
+        }
+    }
+
+    fn sizing_env() -> (Env, Arc<SizingBlob>) {
+        let env = env();
+        let sizing = Arc::new(SizingBlob {
+            inner: env.blob.clone(),
+            data_bytes: AtomicU64::new(0),
+            data_objects: AtomicU64::new(0),
+        });
+        (env, sizing)
+    }
+
+    fn attach_with(env: &Env, blob: Arc<dyn BlobStore>, attachment: &str) -> Arc<ChunkEngine> {
+        ChunkEngine::attach(
+            EngineConfig::new(VOL, &env.data_dir, attachment),
+            blob,
+            env.meta.clone(),
+        )
+        .unwrap()
+    }
+
+    const PAGE: u64 = cats_api::chunk::DIRTY_PAGE_SIZE as u64;
+
+    #[test]
+    fn a_sparse_write_publishes_only_its_dirty_pages() {
+        let (env, sizing) = sizing_env();
+        let e = attach_with(&env, sizing.clone(), "attA");
+        // One 4 KiB write in each of three chunks: three dirty 64 KiB pages, not
+        // three 4 MiB chunks.
+        for chunk in 0..3u64 {
+            e.write(chunk * CHUNK_SIZE as u64, &pattern(4096, chunk as u8 + 1))
+                .unwrap();
+        }
+        assert_eq!(e.flush().unwrap(), 1);
+
+        assert_eq!(
+            sizing.data_bytes.load(Ordering::SeqCst),
+            3 * PAGE,
+            "a commit must publish dirty pages, not whole chunks"
+        );
+        assert_eq!(sizing.data_objects.load(Ordering::SeqCst), 3);
+        let st = e.state.lock().unwrap();
+        for chunk in 0..3usize {
+            match &st.map[chunk] {
+                ChunkRef::Layered { base, deltas } => {
+                    assert!(base.is_none(), "chunk {chunk} had no committed base yet");
+                    assert_eq!(deltas.len(), 1);
+                    assert_eq!(deltas[0].page_mask, 1, "only the first page is dirty");
+                }
+                other => panic!("chunk {chunk} should be layered, got {other:?}"),
+            }
+        }
+        drop(st);
+        e.detach();
+    }
+
+    #[test]
+    fn a_dense_write_publishes_a_full_base() {
+        let (env, sizing) = sizing_env();
+        let e = attach_with(&env, sizing.clone(), "attA");
+        // More than half the chunk: a delta would save little and resetting the
+        // chain is worth more than the bytes.
+        e.write(0, &pattern(CHUNK_SIZE as usize / 2 + 1, 3)).unwrap();
+        e.flush().unwrap();
+        assert_eq!(
+            sizing.data_bytes.load(Ordering::SeqCst),
+            CHUNK_SIZE as u64,
+            "a dense write should publish one full chunk"
+        );
+        let st = e.state.lock().unwrap();
+        assert!(matches!(st.map[0], ChunkRef::Base { .. }));
+        drop(st);
+        e.detach();
+    }
+
+    #[test]
+    fn delta_chains_are_capped_by_a_base_rewrite() {
+        let (env, sizing) = sizing_env();
+        let e = attach_with(&env, sizing.clone(), "attA");
+        // Each commit dirties one page of chunk 0, so each adds a layer until the
+        // cap forces a fresh base.
+        for round in 0..=MAX_DELTA_LAYERS {
+            e.write(round as u64 * PAGE, &pattern(4096, round as u8)).unwrap();
+            e.flush().unwrap();
+            let st = e.state.lock().unwrap();
+            let layers = st.map[0].layer_count();
+            if round < MAX_DELTA_LAYERS {
+                assert_eq!(layers, round + 1, "round {round} should add a layer");
+            } else {
+                assert_eq!(
+                    layers, 0,
+                    "the commit past the cap must publish a fresh base instead"
+                );
+                assert!(matches!(st.map[0], ChunkRef::Base { .. }));
+            }
+        }
+        // Cheap for the first four commits, one full chunk for the rewrite.
+        assert_eq!(
+            sizing.data_bytes.load(Ordering::SeqCst),
+            MAX_DELTA_LAYERS as u64 * PAGE + CHUNK_SIZE as u64
+        );
+        e.detach();
+    }
+
+    #[test]
+    fn layered_chunks_reassemble_after_the_cache_is_wiped() {
+        let env = env();
+        let e = attach(&env, "attA");
+        // Build a chunk out of a base plus several deltas on different pages,
+        // including one page written twice so a later delta has to win.
+        e.write(0, &pattern(CHUNK_SIZE as usize, 9)).unwrap(); // dense -> base
+        e.flush().unwrap();
+        let mut expected = pattern(CHUNK_SIZE as usize, 9);
+        for (round, page) in [1u64, 5, 5, 63].into_iter().enumerate() {
+            let data = pattern(4096, 100 + round as u8);
+            e.write(page * PAGE, &data).unwrap();
+            expected[(page * PAGE) as usize..(page * PAGE) as usize + data.len()]
+                .copy_from_slice(&data);
+            e.flush().unwrap();
+        }
+        {
+            let st = e.state.lock().unwrap();
+            assert!(
+                st.map[0].layer_count() > 1,
+                "the chunk should be layered for this test to mean anything"
+            );
+        }
+        e.detach();
+
+        // Fresh host, empty cache: everything has to come back from the objects.
+        let restored = attach_at(&env, "attB", "data-host-b");
+        let mut got = vec![0u8; CHUNK_SIZE as usize];
+        restored.read(0, &mut got).unwrap();
+        assert_eq!(got, expected, "layered reassembly must be byte-exact");
+        restored.detach();
     }
 
     #[test]

@@ -118,7 +118,7 @@ chunk_count × u64（小端；bit i = 页 i dirty）
 
 ### 5.2 Pending Commit Pack（V1：内嵌冻结数据）
 
-FLUSH 冻结时把每个 dirty chunk 的**完整当前内容**拷入 pack（屏障后的新写继续进 cache，不影响已冻结输入）：
+FLUSH 冻结时把每个 dirty chunk 本次要发布的内容拷入 pack——默认是它的脏 64 KiB 页，整块重写时是完整 chunk（§6.2）。屏障后的新写继续进 cache，不影响已冻结输入：
 
 ```text
 [magic "CATSPACK"] [version u16 = 1]
@@ -165,6 +165,26 @@ dirty set 为空时 FLUSH 直接成功（generation 不变）。
   - 否则 → 从 pack 幂等重放步骤 3–6（对象 PUT 键不变）。
 - 重放前必须验证租约 epoch 仍属于本 attachment；已被 fence 则丢弃 pack 并保持只读。
 - CAS 前崩溃产生的无 Root 引用对象成为 Orphan，由 GC 按 grace period 清理；恢复流程不负责删除。
+
+### 6.2 发布粒度：Delta Pack（[ADR-0016](../decisions/0016-delta-pack-page-granular-commits.md)）
+
+一次提交对每个 dirty chunk 只发布**该 chunk 的脏 64 KiB 页**，按页序拼接成一个对象。
+未携带的页自上次提交以来未被修改，其内容已作为不可变对象存在，因此省略它们不影响点时刻
+一致性——屏障必须拷贝的是**本次要发布的内容**，而不是必须是整块。
+
+- `PackEntry` 的 `page_mask` 说明携带哪些页；`page_mask == u64::MAX`（且 `len == CHUNK_SIZE`）
+  表示整块 base。该字段有 serde 默认值，旧版本写下的 pending pack 仍按整块重放。
+- Map 的 `ChunkRef` 增加 `Layered { base: Option<BaseRef>, deltas: [DeltaRef] }`；`base` 为
+  `None` 表示底座是空洞。后写的 delta 在重叠页上覆盖先写的。
+- 对象键：base 为 `data/<txn>-c<idx>`，delta 为 `data/<txn>-c<idx>-d`。一次提交对一个 chunk
+  最多产生一个对象。
+- **自压缩**：满足任一条件时本次提交对该 chunk 发布新的整块 base 并清空链——链长达到
+  `MAX_DELTA_LAYERS`（当前 4），或本次脏页超过半块（> 32 页）。因此冷读放大有硬上限
+  （≤ 5 个对象/chunk），正确性不依赖后台 Compactor。
+- 读路径在 hydration 处解析层：base（或全零）+ 按序应用 delta，一次性整块写入本地 cache；
+  每个对象按其引用中的 `len` 与 `sha256` 校验。
+- **GC 必须把 base 与全部 delta 都视为存活**（存活判据仍是"被当前 Root 引用"）。
+- Leaf 编码只在实际包含 `Layered` 时写版本 2，未产生 delta 的卷 map node 逐字节不变。
 
 ## 7. NBD 前端（开发/测试/恢复通道）
 
