@@ -19,9 +19,12 @@
 ## 2. 远端对象布局（BlobStore 键空间）
 
 ```text
-volumes/<volume-id>/data/<object-id>            # 不可变数据对象（一个完整 chunk 的密文/明文）
+volumes/<volume-id>/data/<object-id>            # 不可变数据对象（整块 base 或一组脏页，见 §6.2）
 volumes/<volume-id>/maps/<hex-sha256>.node      # 不可变 Map Leaf/Root 节点
 volumes/<volume-id>/commits/<gen>-<txn>.json    # 不可变提交记录（审计/恢复辅助）
+
+images/<image-id>/data/<chunk-sha256>           # 共享基础镜像的 chunk（系统所有，见 §6.3）
+images/<image-id>/manifest.json                 # 镜像清单；最后写入
 ```
 
 - `object-id` = `<txn>-c<chunk_idx>`；同一 txn 内对同一 chunk 幂等重传时键不变，重复 PUT 内容必须字节一致。
@@ -43,12 +46,17 @@ entry_count × ChunkRef
 `ChunkRef`：
 
 ```text
-[tag u8]            # 0 = Hole；1 = Base
+[tag u8]            # 0 = Hole；1 = Base；2 = Layered（版本 ≥ 2，见 §6.2）
 tag==1 时:
   [object_id_len u16] [object_id bytes]
   [data_len u32]     # chunk 有效字节数（恒为 CHUNK_SIZE，卷尾不足时为余量）
   [sha256 32B]       # 明文校验和；READ miss 下载后必须验证
+  版本 ≥ 3 追加:
+  [image_id_len u16] [image_id bytes]   # 空串 = 本卷自己的对象；非空 = images/<image-id>/
 ```
+
+版本按「用到才升」：leaf 只在实际包含 `Layered` 时写版本 2、只在实际包含镜像 base 时写版本 3，
+所以没用到这些特性的卷 map node 逐字节不变（对象 id 也不变）。解码同时接受 1、2、3。
 
 ### 3.2 Root
 
@@ -185,6 +193,25 @@ dirty set 为空时 FLUSH 直接成功（generation 不变）。
   每个对象按其引用中的 `len` 与 `sha256` 校验。
 - **GC 必须把 base 与全部 delta 都视为存活**（存活判据仍是"被当前 Root 引用"）。
 - Leaf 编码只在实际包含 `Layered` 时写版本 2，未产生 delta 的卷 map node 逐字节不变。
+
+### 6.3 共享基础镜像：Golden Root（[ADR-0017](../decisions/0017-golden-root-shared-base-images.md)）
+
+镜像是系统所有的一等不可变工件，放在 `images/` 命名空间下（**不在任何 `volumes/` 前缀里**），
+新卷通过**引用**它的 chunk 来完成 provision，不移动任何数据字节。
+
+- `<image-id>` = 镜像文件的 sha256；chunk 对象按内容寻址（`data/<chunk-sha256>`），因此镜像内
+  重复的 chunk 只存一份，全零 chunk 根本不存。卷尾不足一块的部分补零成整块。
+- **发布幂等**：任何节点对同一镜像算出同一个 id，重复发布是把相同字节写到相同 key（§2 的
+  `put_immutable` 契约里这是 no-op），多节点并发发布安全。
+- **manifest 最后写**：读到 manifest 即意味着它引用的每个对象都已持久。半途中断只留下无引用
+  的对象，不会留下「可引用但不完整」的镜像。
+- **provision** 从 manifest 构造 Map（每个非空洞 chunk 一条 `Base`，`image_id` 指向该镜像），
+  然后走与任何一次提交完全相同的 §6 步骤 3–5（leaf → root → commit record → Root CAS）。
+  只允许在 `generation == 0` 且无未提交脏页的卷上执行。
+- **写入不整块私有化**：Guest 写一页就发布一页 delta（§6.2），镜像对象继续做 base。只有写满
+  半块或链达到 `MAX_DELTA_LAYERS` 才改写成私有整块 base。
+- **GC**：镜像对象属于镜像而不属于卷，存活判据**不是**「某个卷的 Root 引用它」。V1 规则是镜像
+  对象不自动回收，由运营方在确认没有卷引用该 image-id 后显式删除。
 
 ## 7. NBD 前端（开发/测试/恢复通道）
 

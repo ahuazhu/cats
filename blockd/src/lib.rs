@@ -23,6 +23,7 @@
 pub mod crashpoint;
 pub mod engine;
 pub mod format;
+pub mod image;
 pub mod nbd;
 #[cfg(target_os = "linux")]
 pub mod vhost_user;

@@ -2,7 +2,7 @@
 //! volume under one attachment lease.
 
 use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use cats_blockd::engine::{ChunkEngine, EngineConfig};
@@ -64,12 +64,58 @@ struct Args {
     #[arg(long)]
     create_volume_size: Option<u64>,
 
+    /// Provision an empty volume from this raw image, sharing one published copy
+    /// of it across every volume that starts from it (ADR-0017).
+    ///
+    /// Publishing is idempotent and keyed by the image's digest, so passing this
+    /// on every launch is the intended usage: the first launch uploads the image,
+    /// every later one references it. A volume that already has a generation is
+    /// left alone, which is what makes this safe to pass on a resume too.
+    #[arg(long)]
+    seed_image: Option<PathBuf>,
+
     #[arg(long, default_value_t = 5_000)]
     lease_ttl_ms: i64,
 
     /// How long to wait for a held lease to expire before giving up.
     #[arg(long, default_value_t = 15_000)]
     acquire_wait_ms: u64,
+}
+
+/// Provision a fresh volume from a shared base image, or do nothing if it already
+/// has data. Publishing the image happens here rather than in a separate step so
+/// a node needs no image-management state of its own.
+fn seed_from_image(
+    engine: &cats_blockd::engine::ChunkEngine,
+    blob: &dyn cats_storage::BlobStore,
+    path: &Path,
+) -> Result<()> {
+    if engine.generation() != 0 {
+        tracing::info!(
+            generation = engine.generation(),
+            "volume already has data; not seeding from the image"
+        );
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    let published = cats_blockd::image::publish(blob, path).context("publish base image")?;
+    let publish_us = started.elapsed().as_micros();
+    let provision = std::time::Instant::now();
+    let generation = engine
+        .provision_from_image(&published.manifest)
+        .context("provision from base image")?;
+    tracing::info!(
+        image = %published.manifest.image_id,
+        chunks = published.manifest.chunks.len(),
+        image_already_published = published.already_present,
+        uploaded_objects = published.objects_written,
+        uploaded_bytes = published.bytes_written,
+        publish_us,
+        provision_us = provision.elapsed().as_micros(),
+        generation,
+        "seeded volume from a shared base image"
+    );
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -152,6 +198,11 @@ fn main() -> Result<()> {
         generation = engine.generation(),
         "attached"
     );
+
+    if let Some(path) = &args.seed_image {
+        seed_from_image(&engine, blob.as_ref(), path)
+            .with_context(|| format!("seed volume from image {}", path.display()))?;
+    }
 
     // Bind every requested socket before printing READY: a VMM told to start on
     // readiness must never race a socket that does not exist yet.

@@ -93,7 +93,9 @@ pub struct ChunkEngine {
     flush_lock: Mutex<()>,
     fenced: AtomicBool,
     epoch: i64,
-    stop_renew: Arc<AtomicBool>,
+    /// Signals the lease-renewal thread to stop, and wakes it so a detach does not
+    /// have to wait out its sleep interval.
+    stop_renew: Arc<(Mutex<bool>, Condvar)>,
     renew_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -164,7 +166,7 @@ impl ChunkEngine {
             flush_lock: Mutex::new(()),
             fenced: AtomicBool::new(false),
             epoch,
-            stop_renew: Arc::new(AtomicBool::new(false)),
+            stop_renew: Arc::new((Mutex::new(false), Condvar::new())),
             renew_thread: Mutex::new(None),
             cfg,
         });
@@ -288,6 +290,74 @@ impl ChunkEngine {
     }
     pub fn volume_id(&self) -> &str {
         &self.cfg.volume_id
+    }
+
+    /// Provision an empty volume from a shared base image (ADR-0017).
+    ///
+    /// This is the golden-root fast path: instead of streaming the image through
+    /// the block frontend and committing a private copy of every chunk, the volume
+    /// publishes a Map that references the image's already-durable objects. It
+    /// moves **zero data bytes** — the only writes are the map nodes and the
+    /// commit record — and it goes through the same `publish_map` as any commit,
+    /// so fencing, the CAS and the durability point are unchanged.
+    ///
+    /// Refuses anything but a fresh volume. Provisioning replaces the whole map,
+    /// so on a volume that already committed data it would silently discard it,
+    /// and on a volume holding unflushed writes the cache would disagree with the
+    /// map it just published.
+    pub fn provision_from_image(&self, manifest: &format::ImageManifest) -> Result<i64> {
+        if self.is_fenced() {
+            return Err(EngineError::Fenced);
+        }
+        let _flush = self.flush_lock.lock().unwrap();
+        let _gate = self.io_gate.write().unwrap();
+
+        let new_map = {
+            let st = self.state.lock().unwrap();
+            if st.generation != 0 {
+                return Err(EngineError::InvalidConfig(format!(
+                    "volume {} is at generation {}; only an empty volume can be \
+                     provisioned from an image",
+                    self.cfg.volume_id, st.generation
+                )));
+            }
+            if st.dirty.iter().any(|w| *w != 0) {
+                return Err(EngineError::InvalidConfig(format!(
+                    "volume {} has unflushed writes; refusing to provision over them",
+                    self.cfg.volume_id
+                )));
+            }
+            manifest
+                .base_map(self.size)
+                .map_err(|_| EngineError::Corrupt(format!(
+                    "image {} does not fit volume {} of {} bytes",
+                    manifest.image_id, self.cfg.volume_id, self.size
+                )))?
+        };
+
+        let chunks: Vec<u64> = manifest.chunks.iter().map(|c| c.chunk_idx).collect();
+        let txn = format!("img-{}", &manifest.image_id[..16]);
+        let mut new_leaves = vec![LeafRef::Empty; chunk::leaf_count(self.size) as usize];
+        let new_gen = self.publish_map(&txn, 0, self.epoch, &new_map, &mut new_leaves, &chunks)?;
+
+        let mut st = self.state.lock().unwrap();
+        st.map = new_map;
+        st.leaf_refs = new_leaves;
+        st.generation = new_gen;
+        // Unlike a commit, the cache does not hold this content: the chunks are in
+        // the image namespace and get hydrated on first read. A reader that ran
+        // before this point cannot have left stale content behind either — at
+        // generation 0 every ref was a hole, and a hole is "hydrated" under this
+        // same lock without touching the cache file.
+        st.hydrated.iter_mut().for_each(|h| *h = false);
+        tracing::info!(
+            volume = %self.cfg.volume_id,
+            image = %manifest.image_id,
+            chunks = chunks.len(),
+            generation = new_gen,
+            "provisioned volume from a shared base image"
+        );
+        Ok(new_gen)
     }
 
     pub fn read(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
@@ -448,6 +518,73 @@ impl ChunkEngine {
         }
     }
 
+    /// Publish a map as the volume's committed state: re-encode the leaves the
+    /// change touched, write the root and the commit record, then CAS the head
+    /// (spec §6 steps 3-5).
+    ///
+    /// Shared by the commit path and by provisioning from a shared base image,
+    /// which differ only in where the chunk refs came from — everything about
+    /// durability, fencing and the CAS is the same, and must stay that way.
+    fn publish_map(
+        &self,
+        txn: &str,
+        base_generation: i64,
+        lease_epoch: i64,
+        new_map: &[ChunkRef],
+        new_leaves: &mut [LeafRef],
+        chunks: &[u64],
+    ) -> Result<i64> {
+        let vol = &self.cfg.volume_id;
+        let mut touched: Vec<u64> = chunks.iter().map(|c| c / CHUNKS_PER_LEAF as u64).collect();
+        touched.sort_unstable();
+        touched.dedup();
+        for leaf_idx in touched {
+            let first = leaf_idx * CHUNKS_PER_LEAF as u64;
+            let end = (first + CHUNKS_PER_LEAF as u64).min(self.chunk_count);
+            let slice = &new_map[first as usize..end as usize];
+            if slice.iter().all(|r| r.is_hole()) {
+                new_leaves[leaf_idx as usize] = LeafRef::Empty;
+                continue;
+            }
+            let encoded = format::encode_leaf(first, slice);
+            let hash = format::sha256(&encoded);
+            let object_id = format!("{}.node", hex::encode(hash));
+            self.blob
+                .put_immutable(&chunk::keys::map_node(vol, &hex::encode(hash)), &encoded)?;
+            new_leaves[leaf_idx as usize] = LeafRef::Present { hash, object_id };
+        }
+
+        let root_encoded = format::encode_root(self.size, new_leaves);
+        let root_hash = format::sha256(&root_encoded);
+        let root_hex = hex::encode(root_hash);
+        let root_object_id = format!("{root_hex}.node");
+        self.blob
+            .put_immutable(&chunk::keys::map_node(vol, &root_hex), &root_encoded)?;
+        let record = serde_json::json!({
+            "txn": txn,
+            "generation": base_generation + 1,
+            "root_hash": root_hex,
+            "lease_epoch": lease_epoch,
+            "chunks": chunks,
+        });
+        self.blob.put_immutable(
+            &chunk::keys::commit_record(vol, base_generation + 1, txn),
+            record.to_string().as_bytes(),
+        )?;
+        crashpoint::maybe_crash(crashpoint::BEFORE_CAS);
+
+        let new_gen = self.meta.cas_head(
+            vol,
+            base_generation,
+            root_hash,
+            &root_object_id,
+            &self.cfg.attachment_id,
+            self.epoch,
+        )?;
+        crashpoint::maybe_crash(crashpoint::AFTER_CAS);
+        Ok(new_gen)
+    }
+
     fn commit_pack(
         &self,
         header: &PackHeader,
@@ -478,11 +615,7 @@ impl ChunkEngine {
             let object_id = Self::object_id(&header.txn, e);
             let slot = &mut new_map[e.chunk_idx as usize];
             *slot = if e.is_base() {
-                ChunkRef::Base {
-                    object_id,
-                    len: e.len,
-                    sha256: sha,
-                }
+                ChunkRef::Base(format::BaseRef::local(object_id, e.len, sha))
             } else {
                 slot.clone().with_delta(format::DeltaRef {
                     object_id,
@@ -493,61 +626,17 @@ impl ChunkEngine {
             };
         }
 
-        // 3. Re-encode only the touched leaves.
+        // 3-5. Map, root, commit record, CAS.
+        let chunks: Vec<u64> = header.entries.iter().map(|e| e.chunk_idx).collect();
         let mut new_leaves = base_leaves;
-        let mut touched: Vec<u64> = header
-            .entries
-            .iter()
-            .map(|e| e.chunk_idx / CHUNKS_PER_LEAF as u64)
-            .collect();
-        touched.sort_unstable();
-        touched.dedup();
-        for leaf_idx in touched {
-            let first = leaf_idx * CHUNKS_PER_LEAF as u64;
-            let end = (first + CHUNKS_PER_LEAF as u64).min(self.chunk_count);
-            let slice = &new_map[first as usize..end as usize];
-            if slice.iter().all(|r| r.is_hole()) {
-                new_leaves[leaf_idx as usize] = LeafRef::Empty;
-                continue;
-            }
-            let encoded = format::encode_leaf(first, slice);
-            let hash = format::sha256(&encoded);
-            let object_id = format!("{}.node", hex::encode(hash));
-            self.blob
-                .put_immutable(&chunk::keys::map_node(vol, &hex::encode(hash)), &encoded)?;
-            new_leaves[leaf_idx as usize] = LeafRef::Present { hash, object_id };
-        }
-
-        // 4. Root node + commit record.
-        let root_encoded = format::encode_root(self.size, &new_leaves);
-        let root_hash = format::sha256(&root_encoded);
-        let root_hex = hex::encode(root_hash);
-        let root_object_id = format!("{root_hex}.node");
-        self.blob
-            .put_immutable(&chunk::keys::map_node(vol, &root_hex), &root_encoded)?;
-        let record = serde_json::json!({
-            "txn": header.txn,
-            "generation": header.base_generation + 1,
-            "root_hash": root_hex,
-            "lease_epoch": header.lease_epoch,
-            "chunks": header.entries.iter().map(|e| e.chunk_idx).collect::<Vec<_>>(),
-        });
-        self.blob.put_immutable(
-            &chunk::keys::commit_record(vol, header.base_generation + 1, &header.txn),
-            record.to_string().as_bytes(),
-        )?;
-        crashpoint::maybe_crash(crashpoint::BEFORE_CAS);
-
-        // 5. Root CAS — the durability point.
-        let new_gen = self.meta.cas_head(
-            vol,
+        let new_gen = self.publish_map(
+            &header.txn,
             header.base_generation,
-            root_hash,
-            &root_object_id,
-            &self.cfg.attachment_id,
-            self.epoch,
+            header.lease_epoch,
+            &new_map,
+            &mut new_leaves,
+            &chunks,
         )?;
-        crashpoint::maybe_crash(crashpoint::AFTER_CAS);
 
         // 6. Swap in the committed map.
         {
@@ -724,8 +813,20 @@ impl ChunkEngine {
     }
 
     /// Fetch one object and check it against the reference that named it.
-    fn fetch_verified(&self, object_id: &str, len: u32, sha: [u8; 32]) -> Result<Vec<u8>> {
-        let key = chunk::keys::data(&self.cfg.volume_id, object_id);
+    ///
+    /// `image` selects the namespace: a chunk provisioned from a shared base image
+    /// lives outside this volume's prefix and is read, never written, from here.
+    fn fetch_verified(
+        &self,
+        object_id: &str,
+        len: u32,
+        sha: [u8; 32],
+        image: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        let key = match image {
+            Some(image) => chunk::keys::image_data(image, object_id),
+            None => chunk::keys::data(&self.cfg.volume_id, object_id),
+        };
         let bytes = self.blob.get(&key)?;
         if bytes.len() != len as usize {
             return Err(EngineError::Corrupt(format!(
@@ -750,16 +851,17 @@ impl ChunkEngine {
         let page = cats_api::chunk::DIRTY_PAGE_SIZE as usize;
         let image = match chunk_ref {
             ChunkRef::Hole => return Ok(()),
-            ChunkRef::Base {
-                object_id,
-                len,
-                sha256,
-            } => self.fetch_verified(object_id, *len, *sha256)?,
+            ChunkRef::Base(base) => {
+                self.fetch_verified(&base.object_id, base.len, base.sha256, base.image.as_deref())?
+            }
             ChunkRef::Layered { base, deltas } => {
                 let mut image = match base {
-                    Some(base) => {
-                        self.fetch_verified(&base.object_id, base.len, base.sha256)?
-                    }
+                    Some(base) => self.fetch_verified(
+                        &base.object_id,
+                        base.len,
+                        base.sha256,
+                        base.image.as_deref(),
+                    )?,
                     None => vec![0u8; CHUNK_SIZE as usize],
                 };
                 if image.len() != CHUNK_SIZE as usize {
@@ -768,8 +870,9 @@ impl ChunkEngine {
                     ));
                 }
                 for delta in deltas {
+                    // Deltas are always written by this volume, never shared.
                     let bytes =
-                        self.fetch_verified(&delta.object_id, delta.len, delta.sha256)?;
+                        self.fetch_verified(&delta.object_id, delta.len, delta.sha256, None)?;
                     let mut consumed = 0usize;
                     for page_idx in 0..cats_api::chunk::PAGES_PER_CHUNK {
                         if delta.page_mask & (1u64 << page_idx) == 0 {
@@ -847,8 +950,18 @@ impl ChunkEngine {
         let handle = std::thread::Builder::new()
             .name("lease-renew".into())
             .spawn(move || loop {
-                std::thread::sleep(interval);
-                if stop.load(Ordering::SeqCst) {
+                // Waiting on a condvar rather than sleeping: a detach has to be able
+                // to interrupt this. A plain sleep made every stop, suspend and
+                // migration wait out up to a third of the lease TTL per volume.
+                let (lock, cv) = &*stop;
+                let stopped = {
+                    let guard = lock.lock().unwrap();
+                    let (guard, _timeout) = cv
+                        .wait_timeout_while(guard, interval, |stopped| !*stopped)
+                        .unwrap();
+                    *guard
+                };
+                if stopped {
                     return;
                 }
                 let Some(engine) = engine.upgrade() else {
@@ -875,10 +988,7 @@ impl ChunkEngine {
     /// Graceful detach: callers should `flush()` first. Releases the lease
     /// unless this attachment has been fenced.
     pub fn detach(&self) {
-        self.stop_renew.store(true, Ordering::SeqCst);
-        if let Some(h) = self.renew_thread.lock().unwrap().take() {
-            let _ = h.join();
-        }
+        self.stop_renewal();
         if !self.is_fenced() {
             let _ =
                 self.meta
@@ -887,12 +997,20 @@ impl ChunkEngine {
     }
 }
 
+impl ChunkEngine {
+    fn stop_renewal(&self) {
+        let (lock, cv) = &*self.stop_renew;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        if let Some(handle) = self.renew_thread.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 impl Drop for ChunkEngine {
     fn drop(&mut self) {
-        self.stop_renew.store(true, Ordering::SeqCst);
-        if let Some(h) = self.renew_thread.lock().unwrap().take() {
-            let _ = h.join();
-        }
+        self.stop_renewal();
     }
 }
 
@@ -1289,10 +1407,16 @@ mod tests {
         inner: Arc<dyn BlobStore>,
         data_bytes: AtomicU64,
         data_objects: AtomicU64,
+        image_bytes: AtomicU64,
     }
     impl BlobStore for SizingBlob {
         fn put_immutable(&self, k: &str, d: &[u8]) -> cats_storage::blob::Result<()> {
-            if k.contains("/data/") {
+            // Image objects also live under a `/data/` path, but they belong to the
+            // image and are written once for the whole fleet, so a volume's cost has
+            // to be counted separately from them.
+            if k.starts_with("images/") && k.contains("/data/") {
+                self.image_bytes.fetch_add(d.len() as u64, Ordering::SeqCst);
+            } else if k.contains("/data/") {
                 self.data_bytes.fetch_add(d.len() as u64, Ordering::SeqCst);
                 self.data_objects.fetch_add(1, Ordering::SeqCst);
             }
@@ -1318,6 +1442,7 @@ mod tests {
             inner: env.blob.clone(),
             data_bytes: AtomicU64::new(0),
             data_objects: AtomicU64::new(0),
+            image_bytes: AtomicU64::new(0),
         });
         (env, sizing)
     }
@@ -1332,6 +1457,135 @@ mod tests {
     }
 
     const PAGE: u64 = cats_api::chunk::DIRTY_PAGE_SIZE as u64;
+
+    /// A golden rootfs stand-in: distinct content per chunk, one all-zero chunk,
+    /// and a tail shorter than a chunk — the shapes a real image has.
+    fn golden_image(dir: &std::path::Path, chunks: u64) -> PathBuf {
+        let path = dir.join(format!("golden-{chunks}.raw"));
+        let mut f = File::create(&path).unwrap();
+        for chunk in 0..chunks {
+            let body = if chunk == 1 {
+                vec![0u8; CHUNK_SIZE as usize]
+            } else {
+                pattern(CHUNK_SIZE as usize, chunk as u8 + 100)
+            };
+            f.write_all(&body).unwrap();
+        }
+        f.write_all(&pattern(4096, 42)).unwrap();
+        f.sync_all().unwrap();
+        path
+    }
+
+    #[test]
+    fn a_volume_provisioned_from_an_image_publishes_no_data_of_its_own() {
+        let (env, sizing) = sizing_env();
+        let image = golden_image(env.data_dir.parent().unwrap(), 3);
+        let published = crate::image::publish(sizing.as_ref(), &image).unwrap();
+        // Chunk 1 was all zeros, so the image stored 2 chunks plus the padded tail.
+        assert_eq!(published.manifest.chunks.len(), 3);
+        let image_cost = sizing.image_bytes.load(Ordering::SeqCst);
+        assert_eq!(image_cost, 3 * CHUNK_SIZE as u64);
+        sizing.data_bytes.store(0, Ordering::SeqCst);
+        sizing.data_objects.store(0, Ordering::SeqCst);
+        sizing.image_bytes.store(0, Ordering::SeqCst);
+
+        let e = attach_with(&env, sizing.clone(), "attA");
+        let gen = e.provision_from_image(&published.manifest).unwrap();
+        assert_eq!(gen, 1);
+
+        // This is the whole point: a Cat's private cost for its root disk is zero
+        // data objects, only map nodes.
+        assert_eq!(sizing.data_bytes.load(Ordering::SeqCst), 0);
+        assert_eq!(sizing.data_objects.load(Ordering::SeqCst), 0);
+        assert_eq!(sizing.image_bytes.load(Ordering::SeqCst), 0);
+
+        // And a fresh host still reads the image content, chunk 1 as zeros and the
+        // padded tail included.
+        e.detach();
+        fs::remove_dir_all(&env.data_dir).unwrap();
+        let e = attach_with(&env, sizing.clone(), "attB");
+        assert_eq!(e.generation(), 1);
+        let raw = fs::read(&image).unwrap();
+        let mut got = vec![0u8; raw.len()];
+        e.read(0, &mut got).unwrap();
+        assert_eq!(got, raw);
+        let mut tail = vec![0xffu8; CHUNK_SIZE as usize - 4096];
+        e.read(3 * CHUNK_SIZE as u64 + 4096, &mut tail).unwrap();
+        assert!(tail.iter().all(|b| *b == 0), "padding past the image reads as zeros");
+    }
+
+    #[test]
+    fn writing_onto_a_provisioned_chunk_publishes_one_page_and_keeps_sharing_the_base() {
+        let (env, sizing) = sizing_env();
+        let image = golden_image(env.data_dir.parent().unwrap(), 3);
+        let published = crate::image::publish(sizing.as_ref(), &image).unwrap();
+        let e = attach_with(&env, sizing.clone(), "attA");
+        e.provision_from_image(&published.manifest).unwrap();
+        sizing.data_bytes.store(0, Ordering::SeqCst);
+        sizing.image_bytes.store(0, Ordering::SeqCst);
+
+        // One 4 KiB write into a shared chunk.
+        let patch = pattern(4096, 7);
+        e.write(0, &patch).unwrap();
+        assert_eq!(e.flush().unwrap(), 2);
+
+        // Delta packs and image sharing compose: the Cat publishes the 64 KiB page
+        // it dirtied, not a 4 MiB private copy of the shared chunk.
+        assert_eq!(sizing.data_bytes.load(Ordering::SeqCst), PAGE);
+        assert_eq!(sizing.image_bytes.load(Ordering::SeqCst), 0);
+        {
+            let st = e.state.lock().unwrap();
+            // The base is still the image's object — sharing did not erode.
+            assert_eq!(st.map[0].image(), Some(published.manifest.image_id.as_str()));
+            assert_eq!(st.map[0].layer_count(), 1, "one delta over the shared base");
+            // An untouched chunk is still a plain reference into the image.
+            assert_eq!(st.map[2].image(), Some(published.manifest.image_id.as_str()));
+            assert_eq!(st.map[2].layer_count(), 0);
+        }
+
+        // The write wins over the image on the page it touched, and the rest of the
+        // chunk still comes from the image, reassembled on a host with no cache.
+        e.detach();
+        fs::remove_dir_all(&env.data_dir).unwrap();
+        let e = attach_with(&env, sizing.clone(), "attB");
+        let raw = fs::read(&image).unwrap();
+        let mut got = vec![0u8; CHUNK_SIZE as usize];
+        e.read(0, &mut got).unwrap();
+        assert_eq!(&got[..4096], &patch[..]);
+        assert_eq!(&got[4096..], &raw[4096..CHUNK_SIZE as usize]);
+    }
+
+    #[test]
+    fn provisioning_refuses_to_run_over_a_volume_that_is_not_empty() {
+        let env = env();
+        let image = golden_image(env.data_dir.parent().unwrap(), 2);
+        let published = crate::image::publish(env.blob.as_ref(), &image).unwrap();
+
+        // Unflushed writes: the cache would disagree with the map being published.
+        let e = attach(&env, "attA");
+        e.write(0, &pattern(4096, 3)).unwrap();
+        assert!(e.provision_from_image(&published.manifest).is_err());
+
+        // Committed data: provisioning replaces the whole map, so this would be a
+        // silent data loss rather than an error.
+        e.flush().unwrap();
+        assert!(e.provision_from_image(&published.manifest).is_err());
+        let mut got = vec![0u8; 4096];
+        e.read(0, &mut got).unwrap();
+        assert_eq!(got, pattern(4096, 3));
+
+    }
+
+    #[test]
+    fn an_image_larger_than_the_volume_is_refused_rather_than_truncated() {
+        let env = env(); // 8 chunks
+        let big = golden_image(env.data_dir.parent().unwrap(), 16);
+        let published = crate::image::publish(env.blob.as_ref(), &big).unwrap();
+        let e = attach(&env, "attA");
+        // Silently dropping the tail would give the Guest a corrupt rootfs.
+        assert!(e.provision_from_image(&published.manifest).is_err());
+        assert_eq!(e.generation(), 0);
+    }
 
     #[test]
     fn a_sparse_write_publishes_only_its_dirty_pages() {
@@ -1380,7 +1634,7 @@ mod tests {
             "a dense write should publish one full chunk"
         );
         let st = e.state.lock().unwrap();
-        assert!(matches!(st.map[0], ChunkRef::Base { .. }));
+        assert!(matches!(st.map[0], ChunkRef::Base(_)));
         drop(st);
         e.detach();
     }
@@ -1403,7 +1657,7 @@ mod tests {
                     layers, 0,
                     "the commit past the cap must publish a fresh base instead"
                 );
-                assert!(matches!(st.map[0], ChunkRef::Base { .. }));
+                assert!(matches!(st.map[0], ChunkRef::Base(_)));
             }
         }
         // Cheap for the first four commits, one full chunk for the rewrite.
@@ -1569,6 +1823,36 @@ mod tests {
         e.read(0, &mut b).unwrap();
         assert!(b.iter().all(|&x| x == 0));
         e.detach();
+    }
+
+    #[test]
+    fn detaching_does_not_wait_out_the_lease_renewal_interval() {
+        // A stop, a suspend and a cold migration all detach. Joining a thread that
+        // is sleeping out ttl/3 put that whole interval on the critical path of
+        // every one of them, per volume.
+        let env = env();
+        let e = ChunkEngine::attach(
+            EngineConfig {
+                volume_id: VOL.into(),
+                data_dir: env.data_dir.clone(),
+                attachment_id: "attDetach".into(),
+                lease_ttl_ms: 6_000,
+            },
+            env.blob.clone(),
+            env.meta.clone(),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        e.detach();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "detach waited {elapsed:?} on a 6 s lease (renewal interval is 2 s)"
+        );
+        // And the lease really was released: the next attachment gets it at once.
+        let next = attach(&env, "attDetach2");
+        assert!(next.epoch() > e.epoch());
+        next.detach();
     }
 
     #[test]

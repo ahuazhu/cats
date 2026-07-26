@@ -7,8 +7,9 @@
 /// Logical block size advertised to the guest block frontend.
 pub const LOGICAL_BLOCK_SIZE: u32 = 512;
 
-/// Base chunk size: the unit of remote objects and of the volume map (V1
-/// full-chunk commit; 64 KiB delta records are a later optimization).
+/// Base chunk size: the unit of the volume map and of base objects. A commit
+/// publishes only the dirty 64 KiB pages of a chunk (ADR-0016), so a data object
+/// is at most one chunk, not always exactly one.
 pub const CHUNK_SIZE: u32 = 4 * 1024 * 1024;
 
 /// Dirty-tracking page size inside a chunk.
@@ -54,6 +55,20 @@ pub mod keys {
     /// `volumes/<volume-id>/commits/<generation>-<txn>.json`
     pub fn commit_record(volume_id: &str, generation: i64, txn: &str) -> String {
         format!("volumes/{volume_id}/commits/{generation}-{txn}.json")
+    }
+
+    /// `images/<image-id>/data/<object-id>` — a chunk of a shared base image
+    /// (ADR-0017). Deliberately outside every `volumes/` prefix: these objects
+    /// are owned by the image, are referenced by many volumes, and must not be
+    /// deleted by a per-volume GC pass.
+    pub fn image_data(image_id: &str, object_id: &str) -> String {
+        format!("images/{image_id}/data/{object_id}")
+    }
+
+    /// `images/<image-id>/manifest.json` — written last, so its presence is what
+    /// makes an image publishable-once and safe to reference.
+    pub fn image_manifest(image_id: &str) -> String {
+        format!("images/{image_id}/manifest.json")
     }
 }
 

@@ -29,7 +29,7 @@ use crate::admission::{resume_commitment_bytes, WakeAdmission, WakeBudget, WakeL
 use cats_api::requests::{ProxyHttpRequest, ProxyHttpResponse};
 use cats_api::resources::{NodeTelemetry, ObservedState};
 use cats_guest_agent::DiskMapEntry;
-use cats_storage::{AdapterSelection, MetadataStore};
+use cats_storage::AdapterSelection;
 
 use crate::ch::{self, BlockPath, ChConfig, ChRuntime, GUEST_VSOCK_PORT};
 use crate::guest_client::{GuestClient, GuestShell};
@@ -284,7 +284,6 @@ fn symlink_socket(link: &Path, target: &Path) {
 
 pub struct NodeRuntime {
     pub cfg: NodeConfig,
-    storage_meta: Arc<dyn MetadataStore>,
     /// Serializes job execution; jobs are rare and idempotent. Held by every
     /// action except `ResumeCat`, which allocates no node-global resource and
     /// instead serializes per Cat so several Cats can wake in parallel.
@@ -311,11 +310,10 @@ pub struct NodeRuntime {
 }
 
 impl NodeRuntime {
-    pub fn new(cfg: NodeConfig, storage_meta: Arc<dyn MetadataStore>) -> Self {
+    pub fn new(cfg: NodeConfig) -> Self {
         let cfg_wake_budget = cfg.wake_budget;
         Self {
             cfg,
-            storage_meta,
             ops: Mutex::new(()),
             cats: Mutex::new(HashMap::new()),
             cat_ops: Mutex::new(HashMap::new()),
@@ -691,7 +689,7 @@ impl NodeRuntime {
         let launch = (|| -> Result<String> {
             for grant in &volumes {
                 // FakeVmm never consumes vhost-user; NBD is its only frontend.
-                let proc = self.spawn_blockd(cat_id, &dir, grant, 1)?;
+                let proc = self.spawn_blockd(cat_id, &dir, grant, 1, None)?;
                 let process_id = proc.child.id();
                 rt.blockds.insert(grant.disk_id.clone(), proc);
                 self.attach_to_metering(&rt, process_id)?;
@@ -823,25 +821,21 @@ impl NodeRuntime {
             // must expose exactly the queues the VMM will configure.
             let vhost_user_queues = ch::vhost_user_queues_for(chc, cpus);
             for grant in &volumes {
-                let proc = self.spawn_blockd(cat_id, &dir, grant, vhost_user_queues)?;
+                // The root disk is provisioned from the shared golden image inside
+                // blockd, before it announces readiness, so a launch no longer
+                // streams a private copy of the rootfs through the block frontend
+                // (ADR-0017). Data disks have no image.
+                let seed = chc
+                    .seed_image
+                    .as_deref()
+                    .filter(|_| !warm_restore && grant.mount_path == "/");
+                let proc = self.spawn_blockd(cat_id, &dir, grant, vhost_user_queues, seed)?;
                 let process_id = proc.child.id();
                 rt.blockds.insert(grant.disk_id.clone(), proc);
                 self.attach_to_metering(&rt, process_id)?;
             }
             let blockd_us = blockd_started.elapsed().as_micros();
-            // 2. Seed a brand-new root volume with the golden image.
-            if !warm_restore {
-                if let Some(image) = &chc.seed_image {
-                    for grant in volumes.iter().filter(|g| g.mount_path == "/") {
-                        let head = self.storage_meta.load_head(&grant.volume_id)?;
-                        if head.generation == 0 {
-                            tracing::info!(volume = %grant.volume_id, "seeding golden root");
-                            ch::seed_volume(&rt.blockds[&grant.disk_id].socket, image)?;
-                        }
-                    }
-                }
-            }
-            // 3. Block attach (root first => /dev/vda). On a kernel-NBD restore
+            // 2. Block attach (root first => /dev/vda). On a kernel-NBD restore
             //    the device indices must match the snapshot exactly; vhost-user
             //    sockets are derived from the Cat and disk id, so they are
             //    already stable across a Warm restore.
@@ -880,7 +874,7 @@ impl NodeRuntime {
                 chrt.network = ch::prepare_network(chc, cat_id)?;
                 rt.ch = Some(chrt.clone());
             }
-            // 4. VMM. Store the child in `rt` immediately so a failure in
+            // 3. VMM. Store the child in `rt` immediately so a failure in
             //    readiness/health still lets `teardown` kill it (no orphan
             //    holding the api socket).
             let serial_log = dir.join("serial.log");
@@ -910,7 +904,7 @@ impl NodeRuntime {
                 ch::resume(&chrt.api_sock)?;
             }
             let resume_us = resume_started.elapsed().as_micros();
-            // 5. Guest agent over vsock.
+            // 4. Guest agent over vsock.
             let conn = GuestConn::Vsock(chrt.vsock_sock.clone(), GUEST_VSOCK_PORT);
             // Keep this below the control plane's 60-second node-job timeout
             // so a failed start tears down its partial VMM before the control
@@ -975,6 +969,7 @@ impl NodeRuntime {
         cat_dir: &Path,
         grant: &VolumeGrant,
         vhost_user_queues: usize,
+        seed_image: Option<&Path>,
     ) -> Result<BlockdProc> {
         let socket = short_socket_path(
             &self.cfg.state_dir,
@@ -1021,6 +1016,12 @@ impl NodeRuntime {
             .arg(grant.size_bytes.to_string())
             .arg("--lease-ttl-ms")
             .arg(self.cfg.blockd_lease_ttl_ms.to_string());
+        if let Some(image) = seed_image {
+            // blockd publishes the image once for the whole fleet and provisions
+            // this volume by reference (ADR-0017). Passing it unconditionally is
+            // safe: a volume that already has a generation is left alone.
+            cmd.arg("--seed-image").arg(image);
+        }
         if let (Some(socket), VmmMode::CloudHypervisor(chc)) = (&vhost_user_socket, &self.cfg.vmm) {
             cmd.arg("--listen-vhost-user")
                 .arg(socket)
@@ -1630,7 +1631,7 @@ impl NodeRuntime {
         }
         let dir = rt.dir.clone();
         // Unreachable in Cloud Hypervisor mode (hot attach is rejected above).
-        let proc = self.spawn_blockd(cat_id, &dir, &grant, 1)?;
+        let proc = self.spawn_blockd(cat_id, &dir, &grant, 1, None)?;
         let process_id = proc.child.id();
         rt.blockds.insert(grant.disk_id.clone(), proc);
         if let Err(error) = self.attach_to_metering(rt, process_id) {

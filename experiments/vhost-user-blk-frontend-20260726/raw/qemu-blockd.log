@@ -1,47 +1,48 @@
-[2m2026-07-26T13:52:30.838278Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m attached [3mvolume[0m[2m=[0mvol_qemu_guest [3mepoch[0m[2m=[0m1 [3mgeneration[0m[2m=[0m0
-[2m2026-07-26T13:52:35.784217Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m0 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m1048576
-[2m2026-07-26T13:52:35.975239Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m1 [3mdirty_chunks[0m[2m=[0m50 [3mbase_rewrites[0m[2m=[0m50 [3mpack_bytes[0m[2m=[0m209715200
-[2m2026-07-26T13:52:36.412144Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m2 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
-[2m2026-07-26T13:52:36.478778Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m3 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
-[2m2026-07-26T13:52:37.385220Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m4 [3mdirty_chunks[0m[2m=[0m4 [3mbase_rewrites[0m[2m=[0m2 [3mpack_bytes[0m[2m=[0m8585216
-[2m2026-07-26T13:52:37.415134Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m5 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
-[2m2026-07-26T13:52:37.663629Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m6 [3mdirty_chunks[0m[2m=[0m4 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m393216
-[2m2026-07-26T13:52:37.683749Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m7 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
-[2m2026-07-26T13:52:37.775971Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m8 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
-[2m2026-07-26T13:52:37.802742Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m9 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m1 [3mpack_bytes[0m[2m=[0m4194304
-[2m2026-07-26T13:52:37.824215Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m10 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
-[2m2026-07-26T13:52:37.839468Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m11 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
-[2m2026-07-26T13:52:37.865382Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m12 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m1 [3mpack_bytes[0m[2m=[0m4194304
-[2m2026-07-26T13:52:38.037916Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m vhost-user client disconnected; detaching
-[2m2026-07-26T13:52:38.061752Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:38.262501Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:38.463996Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:38.665481Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:38.866017Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:39.067068Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:39.269005Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:39.470016Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:39.671016Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:39.871998Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:40.073020Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:40.274014Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:40.475016Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:40.676001Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:40.877334Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:41.078010Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:41.280030Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:41.481014Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:41.682020Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:41.883510Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:42.084133Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:42.285032Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:42.486230Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
-[2m2026-07-26T13:52:42.702597Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m attached [3mvolume[0m[2m=[0mvol_qemu_guest [3mepoch[0m[2m=[0m2 [3mgeneration[0m[2m=[0m13
-[2m2026-07-26T13:52:47.412558Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m13 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
-[2m2026-07-26T13:52:47.776094Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m14 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
-[2m2026-07-26T13:52:47.787882Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m15 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
-[2m2026-07-26T13:52:47.861410Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m16 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
-[2m2026-07-26T13:52:47.886873Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m17 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m1 [3mpack_bytes[0m[2m=[0m4194304
-[2m2026-07-26T13:52:47.908681Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m18 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
-[2m2026-07-26T13:52:47.927574Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m19 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
-[2m2026-07-26T13:52:48.069009Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m vhost-user client disconnected; detaching
+[2m2026-07-26T14:26:20.240031Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m attached [3mvolume[0m[2m=[0mvol_qemu_guest [3mepoch[0m[2m=[0m1 [3mgeneration[0m[2m=[0m0
+[2m2026-07-26T14:26:25.319445Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m0 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m1048576
+[2m2026-07-26T14:26:25.477742Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m1 [3mdirty_chunks[0m[2m=[0m50 [3mbase_rewrites[0m[2m=[0m50 [3mpack_bytes[0m[2m=[0m209715200
+[2m2026-07-26T14:26:25.823839Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m2 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
+[2m2026-07-26T14:26:25.872709Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m3 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
+[2m2026-07-26T14:26:26.628093Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m4 [3mdirty_chunks[0m[2m=[0m4 [3mbase_rewrites[0m[2m=[0m2 [3mpack_bytes[0m[2m=[0m8585216
+[2m2026-07-26T14:26:26.653255Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m5 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
+[2m2026-07-26T14:26:26.870125Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m6 [3mdirty_chunks[0m[2m=[0m4 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m393216
+[2m2026-07-26T14:26:26.901934Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m7 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
+[2m2026-07-26T14:26:26.984497Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m8 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
+[2m2026-07-26T14:26:27.005428Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m9 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m1 [3mpack_bytes[0m[2m=[0m4194304
+[2m2026-07-26T14:26:27.019817Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m10 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
+[2m2026-07-26T14:26:27.027149Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m11 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
+[2m2026-07-26T14:26:27.047115Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m12 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m1 [3mpack_bytes[0m[2m=[0m4194304
+[2m2026-07-26T14:26:27.198510Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m vhost-user client disconnected; detaching
+[2m2026-07-26T14:26:27.219080Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:27.420146Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:27.621154Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:27.824007Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:28.025154Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:28.229222Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:28.431346Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:28.634222Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:28.836363Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:29.037034Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:29.238502Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:29.439011Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:29.640099Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:29.841471Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:30.042236Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:30.245541Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:30.447316Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:30.650170Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:30.852445Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:31.056470Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:31.259061Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:31.460013Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:31.661025Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:31.862001Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m lease held by another attachment; waiting for expiry
+[2m2026-07-26T14:26:32.068764Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m attached [3mvolume[0m[2m=[0mvol_qemu_guest [3mepoch[0m[2m=[0m2 [3mgeneration[0m[2m=[0m13
+[2m2026-07-26T14:26:36.837792Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m13 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
+[2m2026-07-26T14:26:37.193139Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m14 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
+[2m2026-07-26T14:26:37.200681Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m15 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
+[2m2026-07-26T14:26:37.267281Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m16 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
+[2m2026-07-26T14:26:37.287517Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m17 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m1 [3mpack_bytes[0m[2m=[0m4194304
+[2m2026-07-26T14:26:37.302541Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m18 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
+[2m2026-07-26T14:26:37.310454Z[0m [32m INFO[0m [2mcats_blockd::engine[0m[2m:[0m commit barrier frozen [3mvolume[0m[2m=[0mvol_qemu_guest [3mbase_generation[0m[2m=[0m19 [3mdirty_chunks[0m[2m=[0m1 [3mbase_rewrites[0m[2m=[0m0 [3mpack_bytes[0m[2m=[0m65536
+[2m2026-07-26T14:26:37.442076Z[0m [32m INFO[0m [2mcats_blockd[0m[2m:[0m vhost-user client disconnected; detaching

@@ -53,8 +53,7 @@ impl SqliteMetadataStore {
         let conn = Connection::open(path).map_err(sql_err)?;
         conn.busy_timeout(std::time::Duration::from_secs(10))
             .map_err(sql_err)?;
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(sql_err)?;
+        enable_wal(&conn)?;
         conn.pragma_update(None, "synchronous", "FULL")
             .map_err(sql_err)?;
         conn.execute_batch(
@@ -87,6 +86,36 @@ impl SqliteMetadataStore {
         self.conn
             .lock()
             .map_err(|_| MetaError::Backend("SQLite connection mutex was poisoned".into()))
+    }
+}
+
+/// Put the database in WAL mode, tolerating other processes doing the same.
+///
+/// Switching the journal mode needs the database to itself for a moment, and
+/// `busy_timeout` does not cover that particular lock — a plain
+/// `PRAGMA journal_mode=WAL` fails outright with "database is locked" when
+/// several connections open a fresh database at once. Several `cats-blockd`
+/// processes starting together do exactly that, so this retries and treats an
+/// already-WAL database as success. The mode is stored in the database header, so
+/// after the first winner every later open just reads "wal" and returns.
+fn enable_wal(conn: &Connection) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .map_err(sql_err)?;
+        if mode.eq_ignore_ascii_case("wal") {
+            return Ok(());
+        }
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(sql_err(error));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
     }
 }
 
@@ -415,6 +444,38 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let meta = SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap();
         (dir, meta)
+    }
+
+    #[test]
+    fn several_processes_can_open_a_fresh_database_at_once() {
+        // A node starting N Cats at once starts N `cats-blockd` processes, each of
+        // which opens this store. Before `enable_wal` retried, 2 of 8 concurrent
+        // opens failed with "database is locked" and the launches failed with them.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.db");
+        let failures: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let path = path.clone();
+                    scope.spawn(move || SqliteMetadataStore::open(&path).err())
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap())
+                .map(|e| e.to_string())
+                .collect()
+        });
+        assert!(failures.is_empty(), "concurrent open failed: {failures:?}");
+
+        // And the database really is in WAL mode, not left in the default journal.
+        let store = SqliteMetadataStore::open(&path).unwrap();
+        let mode: String = store
+            .connection()
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
     }
 
     #[test]

@@ -34,7 +34,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
-use cats_blockd::nbd::NbdClient;
 
 /// Guest-agent vsock port (must match the guest image's init script).
 pub const GUEST_VSOCK_PORT: u32 = 5000;
@@ -77,7 +76,9 @@ pub struct ChConfig {
     pub initramfs: Option<PathBuf>,
     /// Kernel command line; `root=/dev/vda` etc.
     pub cmdline: String,
-    /// Raw image written into generation-0 root volumes (golden root).
+    /// Golden root: the raw image a generation-0 root volume is provisioned from.
+    /// Published once per digest and then referenced, not copied (ADR-0017), so
+    /// this is passed to `cats-blockd` rather than streamed through a frontend.
     pub seed_image: Option<PathBuf>,
     pub block_path: BlockPath,
     /// Upper bound on virtio-blk queues per disk on the vhost-user path; the
@@ -376,36 +377,6 @@ pub fn nbd_attach(
 
 pub fn nbd_detach(cfg: &ChConfig, dev: &str) {
     let _ = Command::new(&cfg.nbd_client_bin).args(["-d", dev]).output();
-}
-
-// ---------------------------------------------------------------------------
-// Golden-root seeding: stream a raw image into a fresh volume through the
-// userspace NBD client (skipping all-zero blocks: the volume is sparse).
-// ---------------------------------------------------------------------------
-
-pub fn seed_volume(blockd_socket: &Path, image: &Path) -> Result<()> {
-    const STEP: usize = 1 << 20;
-    let data =
-        std::fs::read(image).with_context(|| format!("read seed image {}", image.display()))?;
-    let mut client = NbdClient::connect_unix(blockd_socket)?;
-    anyhow::ensure!(
-        client.size() >= data.len() as u64,
-        "volume ({}) smaller than seed image ({})",
-        client.size(),
-        data.len()
-    );
-    let mut off = 0usize;
-    while off < data.len() {
-        let end = (off + STEP).min(data.len());
-        let chunk = &data[off..end];
-        if !chunk.iter().all(|&b| b == 0) {
-            client.write(off as u64, chunk)?;
-        }
-        off = end;
-    }
-    client.flush()?;
-    client.disconnect()?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

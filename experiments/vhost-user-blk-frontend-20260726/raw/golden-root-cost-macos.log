@@ -1,0 +1,57 @@
+blockd/tests/golden_root_cost.rs, release, macOS arm64 (18 logical cpus, APFS),
+median of 3, local file object store. Same process, same store, same volume
+geometry -- the only variable is how a volume gets its rootfs.
+
+  copy      = stream the image into the volume and commit it (what a create did)
+  reference = publish the image once, provision by referencing its chunks (ADR-0017)
+
+One create:
+
+ image MiB       path uploaded MiB    objects provision ms    speedup        gen
+        64       copy        64.00         19        483.3       1.0x          1
+        64  reference         0.00          3         29.4      16.5x          1
+        64  (publish)         once          -        502.9          -          -
+       256       copy       256.01         67       1836.9       1.0x          1
+       256  reference         0.01          3         28.2      65.1x          1
+       256  (publish)         once          -       2013.5          -          -
+       512       copy       512.01        131       3612.5       1.0x          1
+       512  reference         0.02          3         29.0     124.6x          1
+       512  (publish)         once          -       2988.5          -          -
+
+N Cats from one image at once (256 MiB image):
+
+    cats       path uploaded MiB    objects        wall ms    speedup
+       1       copy       256.01         67         1777.4       1.0x
+       1  reference         0.01          3           28.3      62.7x
+       4       copy      1024.02        268         6067.7       1.0x
+       4  reference         0.04         12          123.2      49.2x
+      10       copy      2560.05        670         9614.5       1.0x
+      10  reference         0.11         30          250.8      38.3x
+
+Cold read of every chunk on a host with an empty cache (64 MiB):
+
+        path       cold read ms              MiB/s
+        copy              130.3                491
+   reference              131.0                489
+
+Reading:
+
+* Provisioning cost is now independent of image size (~29 ms), because it writes
+  map nodes and a commit record and nothing else. The 0.01-0.02 MiB "uploaded"
+  is those map nodes.
+* Concurrent creates no longer contend on the object store at all: 10 Cats upload
+  0.11 MiB between them instead of 2.5 GiB.
+* Referencing a shared chunk costs nothing to read: a provisioned chunk is one
+  object, exactly like a private one, so cold-read throughput is unchanged
+  (491 vs 489 MiB/s, within noise).
+* The `copy` column here is the engine-level copy, not the old path that streamed
+  the image through an NBD socket, so these speedups are conservative.
+* Publishing an image costs ~3 s for 512 MiB and happens once per image digest.
+  Today it happens on the first launch that uses the image, so that launch pays
+  it; pre-publishing at image-deploy time would remove even that.
+
+Also found by this bench: `ChunkEngine::detach` joined a lease-renewal thread that
+was sleeping out lease_ttl_ms/3, so every detach -- every stop, suspend and cold
+migration, per volume -- waited ~1.67 s at the default TTL. Before the fix every
+row above had a 1674 ms floor, which is what made it visible. Renewal now waits on
+a condvar; regression test: engine::tests::detaching_does_not_wait_out_the_lease_renewal_interval.
