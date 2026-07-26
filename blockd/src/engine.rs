@@ -347,7 +347,16 @@ impl ChunkEngine {
         let _flush = self.flush_lock.lock().unwrap();
 
         // ---- freeze the barrier ----
-        let (frozen, base_generation, base_map, base_leaves, payload, entries) = {
+        //
+        // Everything in here blocks every Guest read and write on this volume,
+        // so it does the minimum a point-in-time image requires: pick the dirty
+        // set and copy those chunk images. Hashing them is pure computation over
+        // a private copy, so it happens after the barrier is released. Measured
+        // on a real Guest this is worth about 5% of FLUSH latency: the rest is
+        // the full-chunk copy plus writing the pack and the objects, which only
+        // delta packs can fix (evidence and numbers:
+        // experiments/vhost-user-blk-frontend-20260726).
+        let (frozen, base_generation, base_map, base_leaves, payload) = {
             let _barrier = self.io_gate.write().unwrap();
             let mut st = self.state.lock().unwrap();
             let frozen: Vec<u64> = (0..self.chunk_count)
@@ -364,34 +373,27 @@ impl ChunkEngine {
             let base_leaves = st.leaf_refs.clone();
             drop(st);
 
-            // Copy the frozen chunk images while writers are blocked so the
-            // pack is a consistent point-in-time barrier image.
-            let mut payload = Vec::with_capacity(frozen.len() * CHUNK_SIZE as usize);
-            let mut entries = Vec::with_capacity(frozen.len());
-            for &c in &frozen {
-                let mut chunk_bytes = vec![0u8; CHUNK_SIZE as usize];
-                self.cache
-                    .read_exact_at(&mut chunk_bytes, c * CHUNK_SIZE as u64)?;
-                let sha = format::sha256(&chunk_bytes);
-                entries.push(PackEntry {
-                    chunk_idx: c,
-                    payload_offset: payload.len() as u64,
-                    len: CHUNK_SIZE,
-                    sha256_hex: hex::encode(sha),
-                });
-                payload.extend_from_slice(&chunk_bytes);
-            }
-            (
-                frozen,
-                base_generation,
-                base_map,
-                base_leaves,
-                payload,
-                entries,
-            )
+            // One allocation for the whole pack: `vec![0u8; n]` for a large `n`
+            // comes from fresh zero pages, while a 4 MiB allocation per chunk
+            // charged an allocation and a page-fault storm to the barrier.
+            let mut payload = vec![0u8; frozen.len() * CHUNK_SIZE as usize];
+            copy_chunks_into(&self.cache, &frozen, &mut payload)?;
+            (frozen, base_generation, base_map, base_leaves, payload)
         };
-        let _ = frozen;
 
+        // Barrier released: hash the frozen images and describe the pack.
+        let entries = describe_pack(&frozen, &payload);
+
+        // Commit size is the single most useful number when a Guest workload
+        // stalls on FLUSH: the barrier above is held for as long as it takes to
+        // copy and hash every dirty chunk, and V1 commits whole 4 MiB chunks.
+        tracing::info!(
+            volume = %self.cfg.volume_id,
+            base_generation,
+            dirty_chunks = frozen.len(),
+            pack_bytes = payload.len(),
+            "commit barrier frozen"
+        );
         let txn = uuid::Uuid::new_v4().simple().to_string();
         let header = PackHeader {
             txn: txn.clone(),
@@ -832,6 +834,116 @@ fn object_id_hex(object_id: &str) -> &str {
 }
 fn root_object_hex(object_id: &str) -> &str {
     object_id_hex(object_id)
+}
+
+/// How many threads to use for one commit's copy/hash work.
+///
+/// Both are per-chunk independent, and both are a large share of FLUSH latency:
+/// measured on aarch64, sha256 runs at ~546 MiB/s per core and accounts for
+/// roughly 47% of a commit, while the copy reads the whole dirty set out of the
+/// cache file. The cap keeps a big commit from spawning hundreds of threads.
+fn commit_workers(chunks: usize) -> usize {
+    const MAX: usize = 8;
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(MAX)
+        .min(chunks)
+        .max(1)
+}
+
+/// Copy the frozen chunk images out of the cache into the pack payload.
+///
+/// Runs inside the exclusive commit barrier, so it is the one thing that must be
+/// as short as possible: the ranges are disjoint and `read_exact_at` takes
+/// `&self`, so the copy parallelizes without any locking.
+fn copy_chunks_into(cache: &File, frozen: &[u64], payload: &mut [u8]) -> Result<()> {
+    let chunk_size = CHUNK_SIZE as usize;
+    let mut jobs: Vec<(u64, &mut [u8])> = frozen
+        .iter()
+        .copied()
+        .zip(payload.chunks_mut(chunk_size))
+        .collect();
+    let workers = commit_workers(jobs.len());
+    if workers == 1 {
+        // Small commits are the common case for a quiet volume; spawning a
+        // thread to copy one chunk only adds latency.
+        for (chunk_idx, destination) in jobs.iter_mut() {
+            cache.read_exact_at(destination, *chunk_idx * CHUNK_SIZE as u64)?;
+        }
+        return Ok(());
+    }
+    let per_worker = jobs.len().div_ceil(workers);
+    let mut failure: Option<std::io::Error> = None;
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for group in jobs.chunks_mut(per_worker) {
+            handles.push(scope.spawn(move || -> std::io::Result<()> {
+                for (chunk_idx, destination) in group.iter_mut() {
+                    cache.read_exact_at(destination, *chunk_idx * CHUNK_SIZE as u64)?;
+                }
+                Ok(())
+            }));
+        }
+        for handle in handles {
+            match handle.join() {
+                Ok(Err(error)) if failure.is_none() => failure = Some(error),
+                Ok(_) => {}
+                Err(_) => {
+                    if failure.is_none() {
+                        failure = Some(std::io::Error::other("commit copy worker panicked"));
+                    }
+                }
+            }
+        }
+    });
+    match failure {
+        Some(error) => Err(error.into()),
+        None => Ok(()),
+    }
+}
+
+/// Hash the frozen images and describe the pack entries, in chunk order.
+///
+/// Runs after the barrier is released, over a private copy, so it is pure
+/// computation — but it is still on the Guest's FLUSH latency, so it is worth
+/// spreading across cores.
+fn describe_pack(frozen: &[u64], payload: &[u8]) -> Vec<PackEntry> {
+    let chunk_size = CHUNK_SIZE as usize;
+    let jobs: Vec<(usize, u64, &[u8])> = frozen
+        .iter()
+        .copied()
+        .zip(payload.chunks(chunk_size))
+        .enumerate()
+        .map(|(slot, (chunk_idx, image))| (slot, chunk_idx, image))
+        .collect();
+    let workers = commit_workers(jobs.len());
+    let describe = |(slot, chunk_idx, image): &(usize, u64, &[u8])| PackEntry {
+        chunk_idx: *chunk_idx,
+        payload_offset: (*slot * CHUNK_SIZE as usize) as u64,
+        len: CHUNK_SIZE,
+        sha256_hex: hex::encode(format::sha256(image)),
+    };
+    if workers == 1 {
+        return jobs.iter().map(describe).collect();
+    }
+    let per_worker = jobs.len().div_ceil(workers);
+    let mut entries: Vec<PackEntry> = std::thread::scope(|scope| {
+        let handles: Vec<_> = jobs
+            .chunks(per_worker)
+            .map(|group| {
+                scope.spawn(move || group.iter().map(describe).collect::<Vec<_>>())
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("commit hash worker panicked"))
+            .collect()
+    });
+    // Groups are handed out in order, but be explicit: recovery and the map
+    // update both assume entries are ordered by chunk index.
+    entries.sort_unstable_by_key(|entry| entry.chunk_idx);
+    entries
 }
 
 #[cfg(test)]

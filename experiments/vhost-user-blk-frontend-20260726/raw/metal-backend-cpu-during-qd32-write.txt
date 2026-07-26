@@ -1,0 +1,22 @@
+Captured on the i4i.metal host while a Guest ran fio randwrite 4k iodepth=32
+(single job) over the vhost-user-blk path, 4 queues configured.
+
+`top -b -n 1 -H -p <cats-blockd pids>`:
+
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+  37456 root      20   0 4699432   2.7g 566728 R  90.9   0.3   0:10.39 vring_w+
+  37451 root      20   0 4699432   2.7g 566728 S   0.0   0.3   0:00.00 cats-bl+
+  37452 root      20   0 4699432   2.7g 566728 S   0.0   0.3   0:00.00 lease-r+
+  37453 root      20   0 4699432   2.7g 566728 S   0.0   0.3   0:00.00 cats-bl+
+  37454 root      20   0 4699432   2.7g 566728 S   0.0   0.3   0:00.75 vring_w+
+  37455 root      20   0 4699432   2.7g 566728 S   0.0   0.3   0:02.68 vring_w+
+  37457 root      20   0 4699432   2.7g 566728 S   0.0   0.3   0:09.32 vring_w+
+  37474 root      20   0 4699432   2.7g 566728 S   0.0   0.3   0:00.00 cats-bl+
+
+`pidstat -p <cats-blockd> 1 3` (whole process): ~50% of one core, 40.7% system.
+
+Reading: one vring worker is saturated (90.9%, state R) while the other three
+queues are idle, because a single-job Guest workload drives a single virtqueue
+and this backend executes that queue's requests serially in its worker thread.
+Deep-queue throughput is therefore bounded by one thread's per-request engine
+cost, which is the measured write regression in metal-guest-fio-*.csv.

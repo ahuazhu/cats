@@ -1,0 +1,26 @@
+Create-only runs with per-phase settling (wait for the fleet to reach the target
+state rather than trusting the CLI's per-operation wait).
+
+### cluster, 10 Cats across 2 nodes, real S3
+label,phase,requested,completed,min_ms,p50_ms,p95_ms,max_ms,failures
+cluster-10,create,10,10,14335,65322,120073,120073,2
+# settled: 10/10 observed=running after 140s
+# placement: metal-1 cats=5, metal-2 cats=5
+
+### single node, 10 Cats, real S3
+label,phase,requested,completed,min_ms,p50_ms,p95_ms,max_ms,failures
+single-10,create,10,10,12689,63528,120089,120089,1
+# settled: 10/10 observed=running after 128s
+
+### single node, 10 Cats, LOCAL file object store (same NVMe as the cache)
+label,phase,requested,completed,min_ms,p50_ms,p95_ms,max_ms,failures
+single-10-file,create,10,10,2572,12220,24277,24277,0
+# settled: 10/10 observed=running after 24s
+
+Reading: with the file adapter, 10 concurrent creates settle in 24.3 s, which is
+10x the 2.4 s single-create time -- exactly what strict per-node serialization
+predicts (NodeRuntime::execute holds a node-wide mutex for everything except
+ResumeCat). Switching the durable layer to S3 adds 5.3x on top, because every
+create seeds and uploads the 512 MiB golden root. The two-node run is NOT clean
+evidence about cluster scaling: teardown of the previous 20-Cat batch may have
+overlapped it.

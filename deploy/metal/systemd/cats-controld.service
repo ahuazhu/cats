@@ -4,9 +4,10 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+Environment=CATS_CONTROLD_LISTEN=127.0.0.1:7300
 EnvironmentFile=/etc/cats/cats.env
 ExecStart=/opt/cats/bin/cats-controld \
-  --listen 127.0.0.1:7300 \
+  --listen ${CATS_CONTROLD_LISTEN} \
   --db-path /var/lib/cats/control.db \
   $CATS_METADATA_STORE_ARGS
 Restart=always

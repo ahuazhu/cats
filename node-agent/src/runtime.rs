@@ -299,6 +299,15 @@ pub struct NodeRuntime {
     /// Bounds concurrent wakes so a wake storm degrades linearly instead of
     /// collapsing the way 10× concurrency on EBS did (19.05 s vs 0.53 s).
     admission: WakeAdmission,
+    /// Bounds concurrent cold launches, which no longer serialize node-wide.
+    ///
+    /// Separate from `admission` on purpose: the wake budget is sized in
+    /// resume-commitment bytes because a wake reads Guest RAM back off the
+    /// medium, and a node whose wake budget is smaller than one Cat legitimately
+    /// refuses to wake it. A cold launch has no snapshot to read, so it must not
+    /// be refused for the same reason — only counted. Same configured
+    /// concurrency, byte ceiling removed.
+    launch_admission: WakeAdmission,
 }
 
 impl NodeRuntime {
@@ -313,6 +322,10 @@ impl NodeRuntime {
             journal: Mutex::new(HashMap::new()),
             usage_finalizer: None,
             admission: WakeAdmission::new(cfg_wake_budget),
+            launch_admission: WakeAdmission::new(WakeBudget {
+                commitment_bytes: u64::MAX,
+                ..cfg_wake_budget
+            }),
         }
     }
 
@@ -413,14 +426,40 @@ impl NodeRuntime {
         // NBD devices and tap slots; making those concurrency-safe is separate
         // work. Warm is still charged its resume commitment, so the ceiling is
         // already in place for when that lands.
-        if matches!(job.action, NodeJobAction::ResumeCat { .. }) {
-            let per_cat = self.cat_lock(job.action.cat_id());
-            let _guard = per_cat.lock().unwrap();
-            self.execute_locked(job)
-        } else {
-            let _guard = self.ops.lock().unwrap();
-            self.execute_locked(job)
-        }
+        // The per-Cat lock is unconditional: it is what keeps "one job per Cat at
+        // a time" true, so a stop can never interleave with a start of the same
+        // Cat. The node-wide lock is then layered on top only for actions that
+        // touch node-global state. The order is always per-Cat then node-wide, so
+        // a thread holding the node-wide lock never waits for a per-Cat lock and
+        // the pair cannot deadlock.
+        let needs_node_lock = match &job.action {
+            NodeJobAction::ResumeCat { .. } => false,
+            // A launch is independent of other Cats unless it has to pick a
+            // node-global resource; see `launch_allocates_node_global_state`.
+            NodeJobAction::StartCat { .. } | NodeJobAction::RestoreCat { .. } => {
+                self.launch_allocates_node_global_state()
+            }
+            _ => true,
+        };
+        let per_cat = self.cat_lock(job.action.cat_id());
+        let _cat_guard = per_cat.lock().unwrap();
+        let _node_guard = needs_node_lock.then(|| self.ops.lock().unwrap());
+        self.execute_locked(job)
+    }
+
+    /// Whether starting a Cat competes with other Cats for node-global state.
+    ///
+    /// Only the kernel-NBD block path does: `nbd_attach` takes a host-wide lock
+    /// and scans for a free `/dev/nbdN`. Everything else a launch allocates is
+    /// derived from the Cat and disk id — the vhost-user socket path, the tap
+    /// name and its /30, the per-Cat state directory and metering cgroup — so
+    /// two launches cannot collide. Keeping the node-wide lock for the NBD path
+    /// is what makes that path's device allocation safe.
+    fn launch_allocates_node_global_state(&self) -> bool {
+        matches!(
+            &self.cfg.vmm,
+            VmmMode::CloudHypervisor(chc) if chc.block_path == BlockPath::KernelNbd
+        )
     }
 
     fn execute_locked(&self, job: NodeJob) -> NodeJobResult {
@@ -532,14 +571,24 @@ impl NodeRuntime {
                 cpus,
                 memory_mib,
                 ..
-            } => self.start_cat(
-                cat_id,
-                job.cat_generation,
-                volumes.clone(),
-                *cpus,
-                *memory_mib,
-                false,
-            ),
+            } => {
+                // Launches are no longer serialized node-wide, so they need
+                // their own ceiling; see `launch_admission`. Warm restore
+                // charges the wake budget inside `restore_cat`, so this stays on
+                // the StartCat action only.
+                let _permit = self
+                    .launch_admission
+                    .acquire(resume_commitment_bytes(*memory_mib))
+                    .with_context(|| format!("admit launch of cat {cat_id}"))?;
+                self.start_cat(
+                    cat_id,
+                    job.cat_generation,
+                    volumes.clone(),
+                    *cpus,
+                    *memory_mib,
+                    false,
+                )
+            }
             NodeJobAction::StopCat { cat_id } => self.stop_cat(cat_id, true),
             NodeJobAction::SuspendCat { cat_id, work_fence } => {
                 self.suspend_cat(cat_id, work_fence.as_ref())
@@ -641,7 +690,8 @@ impl NodeRuntime {
         };
         let launch = (|| -> Result<String> {
             for grant in &volumes {
-                let proc = self.spawn_blockd(cat_id, &dir, grant)?;
+                // FakeVmm never consumes vhost-user; NBD is its only frontend.
+                let proc = self.spawn_blockd(cat_id, &dir, grant, 1)?;
                 let process_id = proc.child.id();
                 rt.blockds.insert(grant.disk_id.clone(), proc);
                 self.attach_to_metering(&rt, process_id)?;
@@ -769,8 +819,11 @@ impl NodeRuntime {
         let launch = (|| -> Result<String> {
             // 1. Block backends.
             let blockd_started = Instant::now();
+            // Cloud Hypervisor refuses num_queues > boot vCPUs, and the backend
+            // must expose exactly the queues the VMM will configure.
+            let vhost_user_queues = ch::vhost_user_queues_for(chc, cpus);
             for grant in &volumes {
-                let proc = self.spawn_blockd(cat_id, &dir, grant)?;
+                let proc = self.spawn_blockd(cat_id, &dir, grant, vhost_user_queues)?;
                 let process_id = proc.child.id();
                 rt.blockds.insert(grant.disk_id.clone(), proc);
                 self.attach_to_metering(&rt, process_id)?;
@@ -815,7 +868,7 @@ impl NodeRuntime {
                             .context("blockd was started without a vhost-user socket")?;
                         disks.push(ch::vhost_user_disk_arg(
                             socket,
-                            chc.vhost_user_queues,
+                            vhost_user_queues,
                             chc.vhost_user_queue_size,
                         )?);
                     }
@@ -921,6 +974,7 @@ impl NodeRuntime {
         cat_id: &str,
         cat_dir: &Path,
         grant: &VolumeGrant,
+        vhost_user_queues: usize,
     ) -> Result<BlockdProc> {
         let socket = short_socket_path(
             &self.cfg.state_dir,
@@ -971,7 +1025,7 @@ impl NodeRuntime {
             cmd.arg("--listen-vhost-user")
                 .arg(socket)
                 .arg("--vhost-user-queues")
-                .arg(chc.vhost_user_queues.to_string())
+                .arg(vhost_user_queues.to_string())
                 .arg("--vhost-user-queue-size")
                 .arg(chc.vhost_user_queue_size.to_string());
         }
@@ -1575,7 +1629,8 @@ impl NodeRuntime {
             return Ok(ObservedState::Running); // idempotent
         }
         let dir = rt.dir.clone();
-        let proc = self.spawn_blockd(cat_id, &dir, &grant)?;
+        // Unreachable in Cloud Hypervisor mode (hot attach is rejected above).
+        let proc = self.spawn_blockd(cat_id, &dir, &grant, 1)?;
         let process_id = proc.child.id();
         rt.blockds.insert(grant.disk_id.clone(), proc);
         if let Err(error) = self.attach_to_metering(rt, process_id) {

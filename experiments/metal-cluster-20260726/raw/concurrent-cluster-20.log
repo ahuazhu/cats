@@ -1,0 +1,12 @@
+Two nodes, 20 Cats, real S3 + RDS PostgreSQL. Saturated: 11/20 creates, 20/20
+warms and 7/20 restores exceeded the CLI's 120 s per-operation wait, yet 20/20
+were running at the end -- a throughput ceiling, not lost work. The warm and
+restore rows are polluted by the previous phase's backlog and must not be quoted.
+
+label,phase,requested,completed,min_ms,p50_ms,p95_ms,max_ms,failures
+cluster-20,create,20,20,12371,120075,120099,120100,11
+# cluster-20: 9/20 running after concurrent create; batch wall 120104 ms
+cluster-20,warm,20,20,120068,120070,120072,120073,20
+cluster-20,restore,20,20,5239,20769,120163,120190,7
+# cluster-20: 20/20 running after concurrent restore
+#   metal-1  cats=10   metal-2  cats=10

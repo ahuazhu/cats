@@ -1,0 +1,8 @@
+# kernel-nbd-r2: guest hw queues=1 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+kernel-nbd-r2,randread-4k-qd1,randread,4k,1,54148,211.5,13.8,14,20
+kernel-nbd-r2,randwrite-4k-qd1,randwrite,4k,1,21446,83.8,41.7,34,51
+kernel-nbd-r2,randread-4k-qd32,randread,4k,32,326805,1276.6,95.4,93,132
+kernel-nbd-r2,randwrite-4k-qd32,randwrite,4k,32,222676,869.8,140.1,131,220
+kernel-nbd-r2,seqread-1m-qd1,read,1M,1,4010,4010.3,217.7,237,255
+kernel-nbd-r2,seqwrite-1m-qd1,write,1M,1,1734,1734.1,525.0,309,358

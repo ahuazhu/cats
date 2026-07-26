@@ -4,10 +4,11 @@ After=cats-controld.service
 Wants=cats-controld.service
 
 [Service]
+Environment=CATS_CONTROL_PLANE_URL=http://127.0.0.1:7300
 EnvironmentFile=/etc/cats/cats.env
 ExecStart=/opt/cats/bin/cats-gatewayd \
   --listen 0.0.0.0:7400 \
-  --control-plane-url http://127.0.0.1:7300
+  --control-plane-url ${CATS_CONTROL_PLANE_URL}
 Restart=always
 RestartSec=1
 

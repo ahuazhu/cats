@@ -80,7 +80,9 @@ pub struct ChConfig {
     /// Raw image written into generation-0 root volumes (golden root).
     pub seed_image: Option<PathBuf>,
     pub block_path: BlockPath,
-    /// virtio-blk queues per disk on the vhost-user path. One worker thread per
+    /// Upper bound on virtio-blk queues per disk on the vhost-user path; the
+    /// effective count is [`vhost_user_queues_for`], because Cloud Hypervisor
+    /// rejects a queue count above the Cat's boot vCPUs. One worker thread per
     /// queue in `cats-blockd`, so this bounds per-disk request concurrency.
     pub vhost_user_queues: usize,
     /// Depth of each virtio-blk queue (power of two).
@@ -416,6 +418,16 @@ pub fn seed_volume(blockd_socket: &Path, image: &Path) -> Result<()> {
 /// sector-0 write protection that fails ext4 writes.
 pub fn file_disk_arg(path: &str) -> String {
     format!("path={path},image_type=raw")
+}
+
+/// Effective virtio-blk queue count for one Cat.
+///
+/// Cloud Hypervisor validates `num_queues <= boot vCPUs` and refuses to start
+/// otherwise (`TooManyQueues`), so the node-level maximum has to be clamped per
+/// Cat. The Guest driver maps queues to vCPUs anyway, so more queues than vCPUs
+/// would buy nothing.
+pub fn vhost_user_queues_for(cfg: &ChConfig, cpus: u32) -> usize {
+    cfg.vhost_user_queues.clamp(1, cpus.max(1) as usize)
 }
 
 /// `--disk` argument for a `cats-blockd` vhost-user-blk backend.
@@ -761,6 +773,33 @@ mod tests {
         // The Phase A path stays the default until the vhost-user path passes a
         // real-VMM acceptance run (ADR-0015).
         assert_eq!(BlockPath::default(), BlockPath::KernelNbd);
+    }
+
+    #[test]
+    fn queue_count_never_exceeds_the_cats_vcpus() {
+        let mut cfg = ChConfig {
+            ch_bin: PathBuf::from("ch"),
+            kernel: PathBuf::from("vmlinuz"),
+            initramfs: None,
+            cmdline: String::new(),
+            seed_image: None,
+            block_path: BlockPath::VhostUser,
+            vhost_user_queues: 4,
+            vhost_user_queue_size: 256,
+            nbd_client_bin: PathBuf::from("nbd-client"),
+            nbd_devices: 8,
+            network_cidr: None,
+            ip_bin: PathBuf::from("ip"),
+        };
+        // Cloud Hypervisor rejects num_queues > boot vCPUs, so a 1-vCPU Cat on a
+        // node configured for 4 queues must still start.
+        assert_eq!(vhost_user_queues_for(&cfg, 1), 1);
+        assert_eq!(vhost_user_queues_for(&cfg, 2), 2);
+        assert_eq!(vhost_user_queues_for(&cfg, 8), 4);
+        // A zero vCPU count cannot happen, but must not produce zero queues.
+        assert_eq!(vhost_user_queues_for(&cfg, 0), 1);
+        cfg.vhost_user_queues = 1;
+        assert_eq!(vhost_user_queues_for(&cfg, 16), 1);
     }
 
     #[test]

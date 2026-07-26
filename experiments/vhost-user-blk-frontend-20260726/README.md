@@ -6,30 +6,53 @@
 
 ## 结论摘要
 
-1. 协议级验收 **10/10 通过**，外加 1 项针对真实 `cats-blockd` 二进制的双前端集成测试通过。
-   正确性判据是「Guest 路径与 oracle 路径看到同一批字节」：每个写入都用 NBD 前端从同一个
-   engine 读回比对（规范 §7 指定 NBD 为 oracle）。
-2. 相对**真实 Phase A 宿主链路**（fio + O_DIRECT + `/dev/nbd0`）：1 MiB 顺序读
-   **2.4–3.8×**、顺序写 **2.8–3.4×**、4 KiB 随机 QD1 **1.7–1.8×**（驱动阻塞等待）
-   或 **4.6–5.0×**（驱动自旋等待）、单队列 QD32 4 KiB 随机读 **1.4–1.6×**。
-3. 相对**进程内 NBD 客户端**（刻意乐观的对照，不含内核 NBD 跳）：1 MiB 顺序
-   **1.7–2.5×**、4 路并发 4 KiB **1.07–1.29×**、单路 QD1 4 KiB **0.80–0.95×**（无提升）。
-4. 单路 QD1 没有提升的原因不在后端：把 harness 驱动侧的 `poll(2)`+线程唤醒换成短自旋后，
-   同一后端同一负载做到 95–100k ops/s（对进程内 NBD 为 2.2–2.3×），p50 从 25 µs 降到 8–9 µs。
-   真实 Guest 的完成通知由 VMM 注入中断，不付 harness 这笔开销。
-5. 单队列排队深度 1→32：34–35k → 222–239k ops/s（约 930 MiB/s）。同步 NBD 客户端无法表达
-   这种并行度。
-6. FLUSH 提交路径两条前端落在同一区间（控制项，0.87–0.98×），证明前端只做协议适配、
-   没有改动提交协议。
-7. 所有数字都跑了**两轮独立测量**（间隔约 15 分钟，同一台机器）。内核 NBD 侧非常稳定
-   （±1–7%），vhost-user 侧的大块读波动明显（5.5 vs 8.8 GiB/s），所以本报告一律给区间，
-   不给单点。这也是虚拟化开发环境不能替代裸金属验收的直接证据。
-8. **未做**：真实 Cloud Hypervisor + KVM 下的 Guest 启动、ext4/fio 负载与 Warm
-   snapshot/restore 状态对齐。开发机没有 `/dev/kvm`，这一步必须在裸金属上按
-   [`metal-e2e-20260721`](../metal-e2e-20260721/README.md) 的形式补做。因此
-   `--ch-block-path` 默认仍是 `kernel-nbd`。
+真机(AWS `i4i.metal`,真 KVM + Cloud Hypervisor v53)与本机容器两处证据,真机结论优先。
+
+1. **正确性:与内核 NBD 路径完全等价。** 同一套 `deploy/metal/e2e.sh` 在两条路径上都是
+   **22 passed / 1 failed**,唯一失败是 golden rootfs 里没有 `git` 的陈旧断言,与块路径无关。
+   通过项包含四态生命周期、**Warm(`vm.snapshot` / `--restore`)后 boot_id 保持且文件存活**
+   ——正是 ADR-0002 要求用带 dirty/lease 状态的 blockd 重验的那一项。
+2. **Warm restore 快 1.8×**:总耗时 51.9 ms vs 92.5–98.7 ms,原因很具体——块挂载步骤从
+   ~40 ms(`nbd-client` 挂 `/dev/nbdN`,还要抢宿主全局分配锁)降到 **5 µs**(只是拼一个 socket 路径)。
+3. **Guest 可见吞吐:公平对照下 6 项里 5 项快 1.7×–5.7×。** 关键前提是把宿主 page cache
+   从对照里去掉(见第 4 条):
+
+   | Guest fio(4 vCPU,ext4 root,O_DIRECT) | kernel-nbd `direct=on` | vhost-user | 倍数 |
+   |---|---|---|---|
+   | 4 KiB 随机读 QD1 | 26 952 IOPS | 68 485–74 006 | **2.5–2.7×** |
+   | 4 KiB 随机读 QD32 | 129 301 | 260 741–270 724 | **2.0–2.1×** |
+   | 4 KiB 随机写 QD32 | 5 841 | 23 379–33 000 | **4.0–5.7×** |
+   | 1 MiB 顺序读 | 1 056 MiB/s | 3 575–3 642 | **3.4×** |
+   | 1 MiB 顺序写 | 723 MiB/s | 1 242–1 702 | **1.7–2.4×** |
+   | 4 KiB 随机写 QD1 | 11 928 | 6 080–8 197 | **0.5–0.7×**(唯一劣势) |
+
+4. **不要拿今天的默认配置直接比。** 生产用的 kernel-nbd 路径里,Cloud Hypervisor 是
+   **带缓冲**打开 `/dev/nbdN` 的(`direct=off` 是 CH 默认),宿主 page cache 会先把 Guest 的写
+   吃掉再 ack,引擎当时还没看到这些写。所以按当前部署形态对比,NBD 在写和顺序读上更快
+   (4 KiB 随机写 QD32 213–223k vs 23–33k)。这不是传输层的差距,而是多了一层易失缓冲——
+   把它关掉,同一条 NBD 路径就比 vhost-user 慢。详见 [根因](#写路径根因flush-bound不是前端)。
+5. **协议级验收 10/10**,外加真实二进制的双前端集成测试;QEMU/TCG 下真实 Linux 6.1 内核的
+   `virtio_blk` + 真实 ext4 也全通过,含删掉本地缓存后重新 attach 仍 fsck clean、四个 sha256 一致。
+6. **默认值仍是 `kernel-nbd`。** 理由不再是"没验过",而是第 4 条那个按当前部署形态的写吞吐
+   权衡:在 delta pack(Direct-S3 设计 P4)落地把提交成本降下来之前,不建议把带缓冲的
+   NBD 路径换成 vhost-user 作为默认。翻转默认值的判据写在 [ADR-0015](../../docs/decisions/0015-vhost-user-blk-production-block-frontend.md)。
 
 ## 环境与测量边界
+
+### 真机(结论依据)
+
+- AWS `i4i.metal`,`us-east-1`,Ubuntu 24.04 x86_64,Linux `6.17.0-1019-aws`,`/dev/kvm` 可用,
+  128 vCPU / 1 007 GiB RAM;Cloud Hypervisor `v53.0`;rustc 1.97.1。
+- ChunkStore 本地 cache 放在**本地 NVMe 实例存储**(`/dev/nvme0n1` 挂到 `/var/lib/cats`),
+  与 2026-07-21 的 i4i 基线同形态;object store 为 file adapter(同一块 NVMe),
+  storage-meta 为 SQLite。跨节点那部分另用 RDS PostgreSQL + 真实 S3(见
+  [`metal-cluster-20260726`](../metal-cluster-20260726/README.md))。
+- 每个 Guest 都是 4 vCPU / 2 GiB / 6 GiB root 的真 microVM,fio 在 Guest 内对 ext4 root 上的
+  文件跑 `--direct=1`,单 job,每点 10 s(2 s ramp)。fio 两轮(`-r2` 后缀)。
+- 环境摘要 [`raw/metal-environment.txt`](raw/metal-environment.txt);实例、RDS、S3 桶、
+  IAM 角色、key pair 与安全组在跑完后全部销毁。
+
+### 本机容器(前端传输成本,次要证据)
 
 - 宿主：Apple Silicon macOS 开发机；测量在 Docker Desktop 的 Linux VM 内进行
   （`Linux 6.12.76-linuxkit aarch64`，容器可见 18 CPU / 7.7 GiB，**无 `/dev/kvm`**）。
@@ -96,7 +119,143 @@
 `cargo test -p cats-blockd` 全量（两条前端共用的 engine/格式/崩溃测试）见
 [`raw/blockd-crate-tests.log`](raw/blockd-crate-tests.log)。
 
-## 性能测量
+## 真实 Guest 验收（QEMU/TCG，无需 KVM）
+
+协议级 harness 是本仓库自己写的驱动端，Cloud Hypervisor 又需要 KVM。QEMU 用 TCG（纯软件
+模拟）可以在没有 KVM 的机器上充当 vhost-user frontend，于是能补上 harness 补不了的两件事：
+**一个与本仓库无关的 frontend 实现**，以及**真实 Linux `virtio_blk` 驱动 + 真实 ext4**。
+
+脚本 [`qemu-guest-smoke.sh`](qemu-guest-smoke.sh)；串行日志
+[`raw/qemu-guest-boot1.log`](raw/qemu-guest-boot1.log)、
+[`raw/qemu-guest-boot2.log`](raw/qemu-guest-boot2.log)；后端日志
+[`raw/qemu-blockd.log`](raw/qemu-blockd.log)。
+
+场景：256 MiB 卷、2 队列。boot 1 先在文件系统区域之外做裸扇区读写回环，然后 `mkfs.ext4`
+（前 200 MiB）、mount、写三个确定内容的文件、`sync`、`umount`（ext4 journal 在这里发 FLUSH）、
+`e2fsck -fn`。随后主机**杀掉后端并删除本地缓存目录**，用新的 data-dir 重新 attach 同一个卷
+（规范 §8 判据 2 的空缓存懒读）。boot 2 再 `e2fsck`、mount、重算全部摘要。
+
+| 断言 | 结果 |
+|---|---|
+| Guest 看到的容量 | 268435456（= 卷字节数，来自 config space） |
+| 逻辑块大小 | 512（与 Phase A `nbd-client -b 512` 一致） |
+| Guest 硬件队列数 | 2（`/sys/block/vda/mq/`，多队列协商生效） |
+| 写缓存语义 | `write back`（持久点在 FLUSH） |
+| 裸扇区读写回环 | ok |
+| boot 1 `e2fsck -fn` | clean |
+| boot 2（空缓存 attach 之后）`e2fsck -fn` | clean |
+| boot 2 `dumpe2fs` 文件系统状态 | clean |
+| small / large / nested 文件摘要跨空缓存 attach | 三个 sha256 全部一致 |
+| 裸扇区区域摘要跨空缓存 attach | 一致 |
+
+内核自己打印的设备行是 `virtio_blk virtio1: 2/0/0 default/read/poll queues` 与
+`[vda] 524288 512-byte logical blocks (268 MB/256 MiB)`。第二次 attach 时本地缓存为空，
+114 个已提交对象留在对象存储里，数据是从那里懒读回来的。
+
+**这一轮不覆盖** Cloud Hypervisor 自身与 Warm 状态对齐——那两项由下面的真机验收覆盖。
+保留这一轮的价值在于:它不需要 KVM,任何开发机都能跑,而且 frontend 是 QEMU 而不是本仓库
+自己写的驱动。
+
+## 真机验收(AWS i4i.metal,真 KVM + Cloud Hypervisor)
+
+### 生命周期验收:两条路径同分
+
+`deploy/metal/e2e.sh` 的 23 项断言,同一台机器、同一个 Guest 镜像,只改
+`CATS_BLOCK_PATH_ARGS`。原始日志 [`raw/metal-e2e-kernel-nbd.log`](raw/metal-e2e-kernel-nbd.log)、
+[`raw/metal-e2e-vhost-user.log`](raw/metal-e2e-vhost-user.log)。
+
+| 路径 | 结果 | 唯一失败项 |
+|---|---|---|
+| kernel-nbd(默认) | **22 passed / 1 failed** | `guest includes apt, curl and git`(golden rootfs 不再装 git,与块路径无关) |
+| vhost-user | **22 passed / 1 failed** | 同上 |
+
+vhost-user 那轮里通过的关键项:`create` 收敛 running 并给出真 kernel boot id;
+Guest 内 `virtio_blk virtio0: 2/0/0 default/read/poll queues`、
+`[vda] 2097152 512-byte logical blocks`;suspend/resume 保持 boot_id;
+**warm(snapshot + VMM 退出)/ restore 保持 boot_id 且 `/data.txt` 存活**;
+stop/start 换新 boot_id 且已 flush 数据完好;destroy 后无残留 VMM。
+运行期间 `ls /sys/block/nbd*/pid | wc -l` 为 **0**——一个内核 NBD 设备都没用到。
+
+`--ch-vhost-user-queues 4` 配合 4 vCPU 的 Cat,Guest 侧 `/sys/block/vda/mq/` 是 4 个队列;
+1 vCPU 的 Cat 自动夹到 1 个队列(见下)。
+
+### 真机暴露的一个 bug(已修)
+
+第一次在 e2e 里跑 vhost-user 全挂:`cloud-hypervisor exited during startup: exit status: 1`,
+VMM 日志是 `ParsingConfig(Validation(TooManyQueues(2, 1)))` —— **Cloud Hypervisor 校验
+`num_queues ≤ boot vCPUs`**。原实现把队列数当成节点级静态配置,于是"配 2 队列的节点永远
+起不了 1 vCPU 的 Cat"。修法是按每个 Cat 的 vCPU 数夹住,并保证 VMM 与后端拿到同一个值
+(`ch::vhost_user_queues_for`,含单元测试)。这类问题协议级 harness 永远发现不了。
+
+### Warm restore:块挂载从 40 ms 变 5 µs
+
+节点代理自己打的阶段计时([`raw/metal-warm-restore-timings.log`](raw/metal-warm-restore-timings.log)):
+
+| block_path | total | blockd 启动 | **块挂载** | VMM spawn | API ready | resume | guest health |
+|---|---|---|---|---|---|---|---|
+| kernel-nbd | 92.5 ms | 10.8 ms | **39.5 ms** | 0.2 ms | 25.6 ms | 1.4 ms | 15.0 ms |
+| kernel-nbd | 98.7 ms | 11.1 ms | **42.2 ms** | 0.5 ms | 27.7 ms | 1.3 ms | 15.9 ms |
+| vhost-user | **51.9 ms** | 10.9 ms | **0.005 ms** | 0.5 ms | 24.0 ms | 1.2 ms | 15.2 ms |
+
+`nbd-client` 挂载 `/dev/nbdN` 要走宿主全局分配锁 + 内核块层建设备,占了 Warm restore 的
+四成;vhost-user 这一步只是把 socket 路径写进 `--disk` 参数。这是本次最干净的一个收益。
+
+### Guest 可见 fio:三种配置
+
+原始 CSV:[`raw/metal-guest-fio-kernel-nbd.csv`](raw/metal-guest-fio-kernel-nbd.csv)、
+[`-r2`](raw/metal-guest-fio-kernel-nbd-r2.csv)、
+[`raw/metal-guest-fio-kernel-nbd-direct.csv`](raw/metal-guest-fio-kernel-nbd-direct.csv)、
+[`raw/metal-guest-fio-vhost-user.csv`](raw/metal-guest-fio-vhost-user.csv)、
+[`-r2`](raw/metal-guest-fio-vhost-user-r2.csv)。脚本
+[`metal-guest-fio.sh`](metal-guest-fio.sh)。
+
+| 负载 | kernel-nbd 缓冲(今天的默认) | kernel-nbd `direct=on` | vhost-user |
+|---|---|---|---|
+| 4 KiB 随机读 QD1 | 49 368 / 54 148 | 26 952 | **74 006 / 68 485** |
+| 4 KiB 随机写 QD1 | **11 517 / 21 446** | 11 928 | 8 197 / 6 080 |
+| 4 KiB 随机读 QD32 | 309 107 / 326 805 | 129 301 | 260 741 / 270 724 |
+| 4 KiB 随机写 QD32 | **212 992 / 222 676** | 5 841 | 23 379 / 33 000 |
+| 1 MiB 顺序读 | 5 280 / 4 010 MiB/s | 1 056 | 3 575 / 3 642 |
+| 1 MiB 顺序写 | 1 776 / 1 734 MiB/s | 723 | 1 242 / 1 702 |
+| p50 延迟(4 KiB 随机读 QD1) | 14 µs | 32 µs | **9–10 µs** |
+
+`direct=on` 那一列是把 CH 打开 `/dev/nbdN` 的宿主 page cache 关掉后的同一条路径;它与
+vhost-user 才是同一层次的对照。注意 Guest 硬件队列数:kernel-nbd 只有 1 个(CH 内置块后端
+默认单队列),vhost-user 是 4 个。
+
+### 写路径根因:flush-bound,不是前端
+
+完整数据 [`raw/metal-flush-root-cause.txt`](raw/metal-flush-root-cause.txt)。方法是**把 Guest 写
+速率对齐**(`--rate_iops=800`,20 s),这样两条路径唯一的差别只能是前端;Guest 侧计数来自
+`/sys/block/vda/stat`,提交大小来自引擎新加的 `commit barrier frozen` 日志。
+
+| | kernel-nbd 缓冲 | kernel-nbd `direct=on` | vhost-user |
+|---|---|---|---|
+| Guest 写次数 | 13 775 | 14 846 | 14 852 |
+| Guest flush 次数 | 65 | 9 | 28 |
+| **每次 flush 停顿** | 324 ms | **772 ms** | 638 ms |
+| 引擎每次提交的 dirty chunk | 23.6 | **53.7** | 47.4 |
+| 每次提交 pack | 94.4 MiB | 214.8 MiB | 195.6 MiB |
+
+1. 这个负载**在任何路径上都是 flush-bound**:20 秒窗口几乎全部花在 FLUSH 停顿里。V1 提交
+   整个 4 MiB chunk,所以一次 4 KiB 随机写就脏掉 4 MiB,一次提交要拷贝、哈希并写下约 200 MiB。
+   实测进对象存储的写放大约 **100×**。
+2. kernel-nbd 之所以"看起来快",只是因为 CH **带缓冲**打开 `/dev/nbdN`(`direct=off` 是 CH
+   默认,也是节点代理今天用的形态):宿主 page cache 先吸收并合并 Guest 的写,于是提交更频繁
+   但每次更便宜。关掉它(`direct=on`)后,同一条路径变成 **772 ms/flush、53.7 chunk/commit**,
+   比 vhost-user 更差。
+3. **所以 vhost-user 前端不是写回归的原因**,差别只在提交协议前面垫了多少易失缓冲。
+4. 本次能做的修复:把 sha256 从**独占提交屏障**里移出去(屏障只保留点时刻镜像必需的拷贝),
+   并把每 chunk 一次 4 MiB 分配换成整包一次分配。实测约 **5%**(638 → 627 ms/flush,
+   3.37 → 3.21 ms/已提交 MiB)。剩下的都是整 chunk 拷贝 + pack 落盘 + 对象写入,只有
+   **delta pack**(Direct-S3 设计 P4:只提交脏的 64 KiB 页而不是整 4 MiB chunk)能真正拿掉,
+   那需要独立的 ADR 与崩溃矩阵工作,不在本次范围。
+
+## 前端传输成本(本机容器,次要证据)
+
+以下是在没有 KVM 的开发机上做的前端层面对照,结论以上面的真机数据为准。保留它是因为它
+把传输成本单独隔离了出来,而真机数据里传输成本被提交协议掩盖。
+
 
 ### 进程内前端对比（每点 5 次重复，两轮测量）
 
@@ -195,20 +354,91 @@ fio JSON 保存在 `raw/fio-*.json`。这是 `--ch-block-path kernel-nbd` 在宿
 那一跳（内核 NBD client + 每请求 socket 往返 + payload 复制）在同一台机器上值
 1.4×–5×，且大块 I/O 与高队列深度的收益最确定。真实数字要靠裸金属验收。
 
-## 未验证事项（必须在裸金属上补做）
+## 四个优化点的验证结果(2026-07-26 追加)
 
-1. 真实 Cloud Hypervisor（KVM）用 `--disk vhost_user=on,...` 启动 Guest，跑通四态生命周期，
-   与 2026-07-21 的 17 项验收等价。
-2. Warm（`vm.snapshot` / `--restore`）在 vhost-user 设备上的状态对齐（ADR-0002 已列为必须重验项）：
-   restore 前先起 blockd，socket 路径由 (state_dir, cat_id, disk_id) 决定，理论上稳定，但需要实测。
-3. Guest 内 ext4 + fio 的可见性能，以及多队列在真实 vCPU 数下的收益曲线。
-4. `nbd` 内核模块与 `nbd-client` 依赖去除后的部署路径（`install.sh` 仍按 kernel-nbd 配置）。
+把"未验证清单"里点名的优化项逐个量了一遍。两个做了并有实测收益,一个**验证为负收益不做**,
+一个**验证为在当前设计下不可行**。原始输出见
+[`raw/commit-cost.log`](raw/commit-cost.log)、[`raw/queue-count-versus-depth.log`](raw/queue-count-versus-depth.log)、
+[`raw/concurrent-launch.log`](raw/concurrent-launch.log)。
+
+### 1. 提交路径的拷贝与哈希并行化 —— 做了,FLUSH 快 1.6×–1.8×
+
+先量成本结构(`blockd/tests/commit_cost.rs`,median of 3):**FLUSH 耗时与 pack 字节数严格线性**,
+而 **sha256 单线程只有 546 MiB/s(≈1.83 ms/MiB),占整个提交的约 47%**。拷贝和哈希都是按 chunk
+独立的,于是把屏障内的拷贝和屏障外的哈希都摊到最多 8 个线程:
+
+| dirty chunks | pack | 串行 FLUSH | 并行 FLUSH | 倍数 |
+|---|---|---|---|---|
+| 8 | 32 MiB | 131.8 ms | **80.3 ms** | 1.64× |
+| 16 | 64 MiB | 266.7 ms | **156.4 ms** | 1.71× |
+| 32 | 128 MiB | 491.7 ms | **269.1 ms** | 1.83× |
+| 48 | 192 MiB | 749.5 ms | **411.3 ms** | 1.82× |
+
+单 chunk 的小提交走内联路径不开线程。崩溃注入矩阵(每个提交窗口)全过。这一项对**两条前端
+都有效**,因为它在共享引擎里。
+
+### 2. 节点内并发拉起 —— 做了,8 个并发从"基本串行"到 4.0–5.3×
+
+`NodeRuntime::execute` 原来除 `ResumeCat` 外一律拿节点级 `ops: Mutex<()>`。实测(FakeVmm,
+`node-agent/tests/concurrent_start.rs`):单个拉起 74 ms,8 个并发 **539 ms**,而完全串行是
+592 ms —— 也就是**并发度约 1.1**。
+
+改动:每-Cat 锁改为**无条件**持有(这同时修掉 `ResumeCat` 与 `StopCat` 之间原本可交错的隐患),
+节点级锁只在真正分配节点全局资源时叠加——只有内核 NBD 路径需要(`nbd_attach` 要抢宿主锁扫
+`/dev/nbdN`);vhost-user 的 socket 路径、tap 名与 /30、状态目录、metering cgroup 全部由
+cat/disk id 决定,天然不冲突。并发上限用一个**独立**的 launch 门限,不复用唤醒预算的字节口径
+(唤醒预算按 resume commitment 计,预算小于单个 Cat 时拒绝唤醒是对的;冷启动没有快照要读回,
+不能因为同样的理由被拒)。
+
+结果:8 个并发 **539 ms → 114–137 ms(4.0×–5.3×)**,六个并发在上限为 2 时全部排队成功、不失败。
+
+### 3. 每队列请求并行 —— 验证为负收益,不做
+
+同样 32 个在飞请求:**1 队列 667k ops/s、2 队列各 16 深 243k、4 队列各 8 深 211k**。单队列深排队
+反而快 2.7–3.2×(一次 kick 排干整批、只发一次通知),拆队列要付每队列 kick/唤醒与跨线程争用。
+真机上那个"一个 vring worker 90.9% CPU、另三个空闲"是写路径卡在提交协议,不是调度缺陷。
+
+### 4. golden root 复用 —— 当前设计下不可行,需要先做决定
+
+收益是确定的(并发 create 在 S3 上 5.3×),但对象 key 是**按卷做命名空间**的
+(`volumes/<volume-id>/data/<object-id>`),所以新卷的 Map 无法引用另一个卷已提交的 chunk 对象;
+而 GC 按"没有 Root 引用"删除,跨卷引用会被误删。要拿到这个收益必须先决定其中一条:把数据对象
+改为内容寻址的全局命名空间,或者引入显式的 clone/snapshot 血缘让 GC 理解跨卷引用。两者都是
+ADR 级别的改动,不是补丁。
+
+### 关于"中间形态 delta pack"的自我修正
+
+我先前提过一个"只拷脏页、不改 Map 和读路径"的中间形态。**它不成立**:屏障必须拷贝它将要上传的
+内容,而对象是整个 chunk;只拷脏页就得在上传时重建整块,而重建时再读缓存会读到屏障之后的新写,
+破坏点时刻一致性。要绕开只有 CoW 或者按 P4 改 Map 表达 base+delta。真正的 delta pack 仍然是
+独立 ADR 的工作。
+
+## 仍未验证 / 后续项
+
+1. **delta pack**(只提交脏的 64 KiB 页,Direct-S3 设计 P4):写放大 ~100× 的唯一根治办法,
+   需要 Map 表达 base+delta、读路径合并、Compactor/GC 与重做崩溃矩阵。
+2. **golden root 复用**:见上面第 4 条,先要一个命名空间/血缘的决定。
+3. **多队列在真实 vCPU 数下的收益曲线**:本次只验了 1 和 4 两个点,而且已知队列多不等于更快。
+4. **长时间 soak 与多 Cat 同机压力**:本次每个场景都是单样本,不构成 SLA。
+5. **`nbd` 内核模块依赖的移除**:`install.sh` 仍无条件 `modprobe nbd`,以便随时切回默认路径。
+6. **本轮四项优化的真机复测**:并行提交与并发拉起都是在本机容器/FakeVmm 上量的,真机数字
+   要等下一轮裸金属。
 
 ## 复现
+
+真机部分:在 `i4i.metal` 上 `sudo deploy/metal/install.sh`,把 `/etc/cats/cats.env` 的
+`CATS_BLOCK_PATH_ARGS` 在空(kernel-nbd)与 `--ch-block-path vhost-user --ch-vhost-user-queues 4`
+之间切换,每次 `systemctl restart cats-noded` 后跑 `deploy/metal/e2e.sh` 与
+`experiments/vhost-user-blk-frontend-20260726/metal-guest-fio.sh <label>`。
+
+本机部分:
 
 ```bash
 # 协议级验收 + 进程内前端成本（不需要 KVM / root；macOS 上自动进容器）
 experiments/vhost-user-blk-frontend-20260726/run.sh
+
+# 真实 Guest：QEMU/TCG 当 frontend，真实内核驱动 + 真实 ext4（不需要 KVM）
+experiments/vhost-user-blk-frontend-20260726/qemu-guest-smoke.sh
 
 # 真实内核 NBD 链路对照（需要 nbd 模块、nbd-client、fio 与 privileged 容器）
 experiments/vhost-user-blk-frontend-20260726/kernel-nbd-baseline.sh

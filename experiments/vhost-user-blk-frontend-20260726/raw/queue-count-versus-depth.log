@@ -1,0 +1,13 @@
+blockd/tests/vhost_user_bench.rs::vhost_user_queue_count_versus_depth, release,
+aarch64 Linux container. 32 requests in flight in every row, split differently.
+
+workload    queues   qd   total ops/s      MiB/s
+randread         1   32        667268     2606.5
+randread         2   16        243202      950.0
+randread         4    8        210591      822.6
+
+Reading: one queue with a deep ring is 2.7x-3.2x faster than the same depth split
+across queues, because a single kick drains the whole batch in one loop and
+signals once. Per-queue worker serialization is therefore NOT a bottleneck, and a
+worker pool per queue would cost throughput rather than add it. Corollary: raising
+--ch-vhost-user-queues is not automatically better.
