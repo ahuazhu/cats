@@ -175,3 +175,60 @@ fn concurrent_launches_queue_under_the_ceiling_instead_of_failing() {
     }
     assert_eq!(runtime.wake_load().wakes, 0, "a launch leaked a wake permit");
 }
+
+/// Where does concurrent launch actually flatten out, and why?
+///
+/// Raises the ceiling out of the way so the remaining limit is the machine and
+/// the shared state, not policy. Effective parallelism is `n * single / wall`.
+#[test]
+#[ignore = "benchmark; run explicitly with --ignored --nocapture"]
+fn concurrent_launch_scaling() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = runtime_with(
+        dir.path(),
+        WakeBudget {
+            commitment_bytes: u64::MAX,
+            max_wakes: 64,
+            ..Default::default()
+        },
+    );
+    for warmup in 0..2 {
+        runtime.execute(start_job(&format!("cat_scale_warm_{warmup}")));
+    }
+    let started = Instant::now();
+    runtime.execute(start_job("cat_scale_single"));
+    let single_ms = started.elapsed().as_millis().max(1);
+    println!(
+        "\nsingle launch {single_ms} ms on {} logical cpus\n{:>12} {:>10} {:>14} {:>22}",
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0),
+        "concurrent",
+        "wall ms",
+        "ms per launch",
+        "effective parallelism"
+    );
+    for n in [1usize, 2, 4, 8, 16, 24] {
+        let started = Instant::now();
+        let mut workers = Vec::new();
+        for index in 0..n {
+            let runtime = runtime.clone();
+            let tag = format!("cat_scale_{n}_{index}");
+            workers.push(std::thread::spawn(move || runtime.execute(start_job(&tag))));
+        }
+        let failures = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("launch thread panicked"))
+            .filter(|result| result.observed_state != ObservedState::Running)
+            .count();
+        let wall_ms = started.elapsed().as_millis().max(1);
+        assert_eq!(failures, 0, "{failures} of {n} launches failed");
+        println!(
+            "{:>12} {:>10} {:>14.1} {:>21.2}x",
+            n,
+            wall_ms,
+            wall_ms as f64 / n as f64,
+            (single_ms * n as u128) as f64 / wall_ms as f64
+        );
+    }
+}

@@ -17,14 +17,27 @@ pub mod testutil {
     use std::path::PathBuf;
     use std::sync::Once;
 
-    fn target_debug_dir() -> PathBuf {
-        // .../target/debug/deps/<test-bin> -> .../target/debug
+    /// Directory the current test binary was built into, e.g. `target/debug` or
+    /// `target/release`.
+    fn target_profile_dir() -> PathBuf {
+        // .../target/<profile>/deps/<test-bin> -> .../target/<profile>
         let exe = std::env::current_exe().expect("current_exe");
         let mut dir = exe.parent().expect("deps dir").to_path_buf();
         if dir.file_name().is_some_and(|n| n == "deps") {
             dir.pop();
         }
         dir
+    }
+
+    /// Extra `cargo build` arguments so a release test run gets release helper
+    /// binaries; building debug ones would put them in a directory this test
+    /// binary never looks at.
+    fn profile_args(dir: &std::path::Path) -> &'static [&'static str] {
+        if dir.file_name().is_some_and(|name| name == "release") {
+            &["--release"]
+        } else {
+            &[]
+        }
     }
 
     fn package_for(bin: &str) -> &'static str {
@@ -42,22 +55,21 @@ pub mod testutil {
     /// Path to a workspace binary, building it on first use if missing.
     pub fn workspace_bin(name: &str) -> PathBuf {
         static BUILD: Once = Once::new();
-        let path = target_debug_dir().join(name);
+        let dir = target_profile_dir();
+        let path = dir.join(name);
+        let build = || {
+            let status = std::process::Command::new(env!("CARGO"))
+                .args(["build", "-p", package_for(name)])
+                .args(profile_args(&dir))
+                .status()
+                .expect("run cargo build for test binaries");
+            assert!(status.success(), "building test binaries failed");
+        };
         if !path.exists() {
-            BUILD.call_once(|| {
-                let status = std::process::Command::new(env!("CARGO"))
-                    .args(["build", "-p", package_for(name)])
-                    .status()
-                    .expect("run cargo build for test binaries");
-                assert!(status.success(), "building test binaries failed");
-            });
+            BUILD.call_once(build);
             // A second missing binary after the Once fired: build directly.
             if !path.exists() {
-                let status = std::process::Command::new(env!("CARGO"))
-                    .args(["build", "-p", package_for(name)])
-                    .status()
-                    .expect("run cargo build for test binaries");
-                assert!(status.success(), "building test binaries failed");
+                build();
             }
         }
         assert!(
