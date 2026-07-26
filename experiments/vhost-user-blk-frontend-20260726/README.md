@@ -440,29 +440,32 @@ delta pack 降低**写**的发布量,golden root 降低**创建**的发布量。
 
 ### Golden Root:创建卷改为引用共享镜像([ADR-0017](../../docs/decisions/0017-golden-root-shared-base-images.md))
 
-原始数据 [`raw/golden-root-cost-macos.log`](raw/golden-root-cost-macos.log)。同一进程、同一对象
-存储,唯一变量是卷如何获得 rootfs;`copy` 是**引擎层**的复制,比旧的「经 NBD socket 流式写入」
-更快,所以下面的倍数是保守的。
+原始数据 [`raw/golden-root-cost.log`](raw/golden-root-cost.log)(与 delta pack 同一平台:
+release,aarch64 Linux 容器,median of 3;macOS 作为第二平台见
+[`raw/golden-root-cost-macos.log`](raw/golden-root-cost-macos.log))。同一进程、同一对象存储,
+唯一变量是卷如何获得 rootfs;`copy` 是**引擎层**的复制,比旧的「经 NBD socket 流式写入」更快,
+所以下面的倍数是保守的。
 
 | 单个 create | 上传字节 | 对象数 | provision 延迟 | |
 |---|---|---|---|---|
-| 512 MiB 镜像,复制 | 512.01 MiB | 131 | 3612 ms | 1.0× |
-| 512 MiB 镜像,引用 | **0.02 MiB** | **3** | **29.0 ms** | **124×** |
-| 256 MiB 镜像,引用 | 0.01 MiB | 3 | 28.2 ms | 65× |
+| 512 MiB 镜像,复制 | 512.01 MiB | 131 | 1239.8 ms | 1.0× |
+| 512 MiB 镜像,引用 | **0.02 MiB** | **3** | **7.0 ms** | **178×** |
+| 256 MiB 镜像,引用 | 0.01 MiB | 3 | 7.5 ms | 108× |
+| 64 MiB 镜像,引用 | 0.00 MiB | 3 | 6.5 ms | 29× |
 
-provision 延迟与镜像大小**无关**(恒定约 29 ms):它只写 map node 与 commit record,那
+provision 延迟与镜像大小**无关**(恒定约 7 ms):它只写 map node 与 commit record,那
 0.01–0.02 MiB 就是这些 map node。
 
 | 10 个 Cat 同时创建(256 MiB 镜像) | 上传字节 | 对象数 | 墙钟 | |
 |---|---|---|---|---|
-| 复制 | 2560 MiB | 670 | 9614 ms | 1.0× |
-| 引用 | **0.11 MiB** | **30** | **251 ms** | **38×** |
+| 复制 | 2560 MiB | 670 | 5725 ms | 1.0× |
+| 引用 | **0.11 MiB** | **30** | **56 ms** | **102×** |
 
-冷读代价:空 cache 逐 chunk 读完 64 MiB,复制 491 MiB/s vs 引用 489 MiB/s——**在噪声内**。
-被引用的 chunk 就是一个对象,和私有 chunk 完全一样,共享在读路径上不要钱。
+冷读代价:空 cache 逐 chunk 读完 64 MiB,复制 446 MiB/s vs 引用 452 MiB/s——**在噪声内**
+(引用侧还略快一点)。被引用的 chunk 就是一个对象,和私有 chunk 完全一样,共享在读路径上不要钱。
 
-代价:第一次发布落在第一个用到该镜像的 launch 上(512 MiB 约 3 s,之后每次都是 `exists` 命中);
-以及 GC 必须把镜像对象视为镜像所有而不是卷所有(ADR-0017 第 8 条)。
+代价:第一次发布落在第一个用到该镜像的 launch 上(512 MiB 约 2.7 s,之后每次都是 `exists`
+命中);以及 GC 必须把镜像对象视为镜像所有而不是卷所有(ADR-0017 第 8 条)。
 
 ### 组合效果
 

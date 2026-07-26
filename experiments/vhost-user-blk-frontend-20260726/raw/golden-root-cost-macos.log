@@ -1,5 +1,7 @@
 blockd/tests/golden_root_cost.rs, release, macOS arm64 (18 logical cpus, APFS),
-median of 3, local file object store. Same process, same store, same volume
+median of 3, local file object store. Second platform; the primary run is
+raw/golden-root-cost.log (aarch64 Linux container, same platform as the
+delta-pack numbers). Same process, same store, same volume
 geometry -- the only variable is how a volume gets its rootfs.
 
   copy      = stream the image into the volume and commit it (what a create did)

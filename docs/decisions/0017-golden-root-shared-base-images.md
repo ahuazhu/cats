@@ -63,37 +63,39 @@
 
 ## 实测结果
 
-`blockd/tests/golden_root_cost.rs`(release,macOS arm64,median of 3,本地文件对象存储;
-同一进程、同一对象存储,唯一变量是卷如何获得 rootfs)。原始数据:
+`blockd/tests/golden_root_cost.rs`(release,aarch64 Linux 容器,median of 3,本地文件对象
+存储;同一进程、同一对象存储,唯一变量是卷如何获得 rootfs)。原始数据:
+[`raw/golden-root-cost.log`](../../experiments/vhost-user-blk-frontend-20260726/raw/golden-root-cost.log);
+macOS arm64 作为第二平台见
 [`raw/golden-root-cost-macos.log`](../../experiments/vhost-user-blk-frontend-20260726/raw/golden-root-cost-macos.log)。
 
 单个 create:
 
 | 镜像 | 上传字节 | 对象数 | provision 延迟 | |
 |---|---|---|---|---|
-| 512 MiB,复制 | 512.01 MiB | 131 | 3612 ms | 1.0× |
-| 512 MiB,引用 | **0.02 MiB** | **3** | **29.0 ms** | **124×** |
-| 256 MiB,引用 | 0.01 MiB | 3 | 28.2 ms | 65× |
-| 64 MiB,引用 | 0.00 MiB | 3 | 29.4 ms | 16.5× |
+| 512 MiB,复制 | 512.01 MiB | 131 | 1239.8 ms | 1.0× |
+| 512 MiB,引用 | **0.02 MiB** | **3** | **7.0 ms** | **178×** |
+| 256 MiB,引用 | 0.01 MiB | 3 | 7.5 ms | 108× |
+| 64 MiB,引用 | 0.00 MiB | 3 | 6.5 ms | 29× |
 
-**provision 延迟与镜像大小无关**(恒定约 29 ms):它只写 map node 与 commit record,
+**provision 延迟与镜像大小无关**(恒定约 7 ms):它只写 map node 与 commit record,
 那 0.01–0.02 MiB 就是这些 map node。
 
 10 个 Cat 同时从同一镜像创建(256 MiB 镜像):
 
 | | 上传字节 | 对象数 | 墙钟 | |
 |---|---|---|---|---|
-| 复制 | 2560 MiB | 670 | 9614 ms | 1.0× |
-| 引用 | **0.11 MiB** | **30** | **251 ms** | **38×** |
+| 复制 | 2560 MiB | 670 | 5725 ms | 1.0× |
+| 引用 | **0.11 MiB** | **30** | **56 ms** | **102×** |
 
-冷读代价(空 cache 逐 chunk 读完 64 MiB):复制 491 MiB/s,引用 489 MiB/s——**在噪声内**。
+冷读代价(空 cache 逐 chunk 读完 64 MiB):复制 446 MiB/s,引用 452 MiB/s——**在噪声内**。
 被引用的 chunk 就是一个对象,和私有 chunk 完全一样,所以共享在读路径上不要钱。
 
 上表的「复制」是**引擎层**的复制,不是旧的「经 NBD socket 流式写入」路径,所以这些倍数是保守的。
 
 ## 代价与风险
 
-- **首次发布的成本落在第一个用到该镜像的 launch 上**:512 MiB 约 3 s(本地存储)。之后每次
+- **首次发布的成本落在第一个用到该镜像的 launch 上**:512 MiB 约 2.7 s(本地存储)。之后每次
   launch 都是 `exists` 命中后直接引用。在镜像部署时预发布可以把这一次也去掉——尚未实现。
 - **卷的删除不再意味着数据可删**:见第 8 条,GC 必须区分镜像对象与卷对象。这是本决定引入的
   最主要的运维约束。
