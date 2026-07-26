@@ -38,8 +38,10 @@ ADR-0001 第 3 条把「接入 Cloud Hypervisor vhost-user-blk」列为 V1 里�
    （V1 写真零，不产生 Hole，符合 §7 的 TRIM 语义）。已 seed 的 golden root 镜像
    在两条路径上按字节等价。
 6. 队列数与队列深度由 Node 配置（`--ch-vhost-user-queues`、
-   `--ch-vhost-user-queue-size`），后端每个队列一个 worker 线程。FLUSH 仍是整卷
-   屏障，与队列数无关。
+   `--ch-vhost-user-queue-size`），后端每个队列一个 worker 线程，数量按每个 Cat 的 vCPU 数
+   夹住（Cloud Hypervisor 拒绝 `num_queues > vCPU`）。FLUSH 仍是整卷屏障，与队列数无关。
+   **队列多不等于更快**：同样 32 个在飞请求，1 队列 667k ops/s 对 4 队列 211k——单队列深排队
+   的批处理效果强于跨队列并行，所以默认保持 1 个队列。
 
 ## 现状:已验证到什么程度
 
@@ -71,6 +73,20 @@ ADR-0001 第 3 条把「接入 Cloud Hypervisor vhost-user-blk」列为 V1 里�
 **翻转默认值的判据**:(a) delta pack(Direct-S3 设计 P4:只提交脏的 64 KiB 页)落地并把提交
 成本降下来,或 (b) 明确接受"用写吞吐换随机读延迟与 Warm 速度"这个权衡并有对应负载证据;
 外加 (c) 一轮多样本 soak。在此之前 vhost-user 是显式选项。
+
+## 后续优化的验证结果(2026-07-26)
+
+- **做了**:提交路径的拷贝与哈希并行化 → FLUSH 快 **1.6×–1.8×**(32–192 MiB 的提交);
+  节点内并发拉起从"基本串行"(并发度 1.1)到 **4.0×–5.3×**,并发有独立上限。两者对两条
+  前端都有效。
+- **验证为负收益**:每队列请求并行。同样 32 个在飞请求,1 队列 667k ops/s 对 4 队列 211k。
+- **验证为当前设计下不可行**:golden root 复用(对象 key 按卷命名空间,GC 会误删跨卷引用),
+  需要先决定内容寻址或显式 clone 血缘。
+- **仍是根治项**:delta pack(只提交脏的 64 KiB 页)。注意"只拷脏页但仍上传整 chunk"的中间
+  形态**不成立**——屏障必须拷贝它将要上传的内容,否则重建时会读到屏障之后的新写。
+
+数据见 [`vhost-user-blk-frontend-20260726`](../../experiments/vhost-user-blk-frontend-20260726/README.md)
+的"四个优化点的验证结果"。
 
 ## 风险与缓解
 

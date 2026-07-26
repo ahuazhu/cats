@@ -1,0 +1,177 @@
+//! How much of a concurrent launch is serialized by the node agent.
+//!
+//! `NodeRuntime::execute` runs every job under a node-wide mutex except the
+//! Suspended resume path (ADR-0002 §8), because `start_cat` used to allocate
+//! node-global resources. This measures what that costs for a concurrent cold
+//! launch and asserts the property the fix relies on: N launches must not take N
+//! times as long as one.
+//!
+//! FakeVmm only: the point is the node agent's own locking, not the VMM.
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use cats_api::nodejob::{job_id, NodeJob, NodeJobAction, VolumeGrant};
+use cats_api::resources::ObservedState;
+use cats_metadata_store_sqlite::SqliteMetadataStore;
+use cats_node_agent::admission::WakeBudget;
+use cats_node_agent::runtime::{NodeConfig, NodeRuntime, VmmMode};
+use cats_node_agent::testutil::workspace_bin;
+use cats_storage::{AdapterConfig, AdapterSelection, MetadataStore};
+
+const SIZE: u64 = 2 * cats_api::chunk::CHUNK_SIZE as u64;
+
+fn runtime(dir: &std::path::Path) -> Arc<NodeRuntime> {
+    runtime_with(dir, WakeBudget::default())
+}
+
+fn runtime_with(dir: &std::path::Path, wake_budget: WakeBudget) -> Arc<NodeRuntime> {
+    let meta_path = dir.join("meta.db");
+    let storage_meta: Arc<dyn MetadataStore> =
+        Arc::new(SqliteMetadataStore::open(&meta_path).unwrap());
+    Arc::new(NodeRuntime::new(
+        NodeConfig {
+            node_id: "node_conc".into(),
+            state_dir: dir.join("node-state"),
+            blockd_bin: workspace_bin("cats-blockd"),
+            guest_agent_bin: workspace_bin("cats-guest-agent"),
+            metadata_store: AdapterSelection {
+                name: "sqlite".into(),
+                config: AdapterConfig::from_pairs([("path", meta_path.display().to_string())])
+                    .unwrap(),
+            },
+            object_store: AdapterSelection {
+                name: "file".into(),
+                config: AdapterConfig::from_pairs([("root", dir.join("blob").display().to_string())])
+                    .unwrap(),
+            },
+            blockd_lease_ttl_ms: 1500,
+            metering_cgroup_root: None,
+            wake_budget,
+            vmm: VmmMode::Fake,
+        },
+        storage_meta,
+    ))
+}
+
+fn start_job(cat: &str) -> NodeJob {
+    NodeJob {
+        job_id: job_id(cat, 1, "start_cat"),
+        cat_generation: 1,
+        action: NodeJobAction::StartCat {
+            cat_id: cat.into(),
+            image: "test".into(),
+            cpus: 1,
+            memory_mib: 256,
+            volumes: vec![VolumeGrant {
+                disk_id: format!("root_{cat}"),
+                volume_id: format!("vol_{cat}"),
+                attachment_id: format!("att_{cat}"),
+                epoch: 0,
+                size_bytes: SIZE,
+                mount_path: "/".into(),
+            }],
+        },
+    }
+}
+
+/// Launch one Cat, then `n` concurrently, and report both. A node that
+/// serializes launches shows `concurrent ≈ n × single`.
+#[test]
+fn concurrent_cold_launch_is_not_serialized() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = runtime(dir.path());
+    let n = 8;
+
+    // Two throwaway launches first: the very first one pays for binary loading,
+    // schema creation and page-cache warming, which would otherwise dwarf the
+    // per-launch cost this test is about.
+    for warmup in 0..2 {
+        let result = runtime.execute(start_job(&format!("cat_warmup_{warmup}")));
+        assert_eq!(
+            result.observed_state,
+            ObservedState::Running,
+            "warmup launch failed: {result:?}"
+        );
+    }
+    let started = Instant::now();
+    let result = runtime.execute(start_job("cat_single"));
+    let single_ms = started.elapsed().as_millis();
+    assert_eq!(
+        result.observed_state,
+        ObservedState::Running,
+        "single launch failed: {result:?}"
+    );
+
+    let started = Instant::now();
+    let mut workers = Vec::new();
+    for index in 0..n {
+        let runtime = runtime.clone();
+        workers.push(std::thread::spawn(move || {
+            runtime.execute(start_job(&format!("cat_conc_{index}")))
+        }));
+    }
+    let results: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("launch thread panicked"))
+        .collect();
+    let concurrent_ms = started.elapsed().as_millis();
+
+    for (index, result) in results.iter().enumerate() {
+        assert_eq!(
+            result.observed_state,
+            ObservedState::Running,
+            "cat_conc_{index} failed: {result:?}"
+        );
+    }
+
+    let serial_ms = single_ms * n as u128;
+    println!(
+        "single launch {single_ms} ms; {n} concurrent {concurrent_ms} ms; \
+         fully serialized would be {serial_ms} ms; speedup {:.2}x",
+        serial_ms as f64 / concurrent_ms.max(1) as f64
+    );
+
+    // The threshold is deliberately loose: this asserts "launches overlap", not
+    // a performance number. Fully serialized execution lands at ~serial_ms.
+    assert!(
+        concurrent_ms < serial_ms * 3 / 4,
+        "concurrent launch looks serialized: {concurrent_ms} ms for {n} launches \
+         versus {single_ms} ms for one"
+    );
+}
+
+/// Concurrency is bounded, not unlimited: with a ceiling of two, six launches
+/// must queue and all still succeed. A launch must never be *refused* for
+/// exceeding a byte budget the way a wake is — a node whose wake budget is
+/// smaller than one Cat can still launch it cold.
+#[test]
+fn concurrent_launches_queue_under_the_ceiling_instead_of_failing() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = runtime_with(
+        dir.path(),
+        WakeBudget {
+            // Deliberately below one Cat's 256 MiB resume commitment.
+            commitment_bytes: 128 * 1024 * 1024,
+            max_wakes: 2,
+            ..Default::default()
+        },
+    );
+
+    let mut workers = Vec::new();
+    for index in 0..6 {
+        let runtime = runtime.clone();
+        workers.push(std::thread::spawn(move || {
+            runtime.execute(start_job(&format!("cat_bound_{index}")))
+        }));
+    }
+    for worker in workers {
+        let result = worker.join().expect("launch thread panicked");
+        assert_eq!(
+            result.observed_state,
+            ObservedState::Running,
+            "a queued launch must still succeed: {result:?}"
+        );
+    }
+    assert_eq!(runtime.wake_load().wakes, 0, "a launch leaked a wake permit");
+}

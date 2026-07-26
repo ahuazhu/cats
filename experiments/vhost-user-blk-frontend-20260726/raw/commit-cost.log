@@ -1,0 +1,25 @@
+blockd/tests/commit_cost.rs, release build, aarch64 Linux container, median of 3
+per point. One 64 KiB page dirtied per chunk, i.e. the shape a 4 KiB random-write
+Guest workload produces, where a tiny write dirties a whole 4 MiB chunk.
+
+Serial commit (copy and hash one chunk at a time):
+
+dirty chunks   pack MiB     flush ms     ms per MiB     sha256 MiB/s
+           8         32        131.8           4.12              548
+          16         64        266.7           4.17              541
+          32        128        491.7           3.84              546
+          48        192        749.5           3.90              545
+
+Parallel commit (copy inside the barrier and hash after it, up to 8 threads;
+single-chunk commits stay inline):
+
+dirty chunks   pack MiB     flush ms     ms per MiB     sha256 MiB/s
+           1          4         22.1           5.53              548
+           8         32         80.3           2.51              548
+          16         64        156.4           2.44              548
+          32        128        269.1           2.10              546
+          48        192        411.3           2.14              545
+
+Reading: FLUSH cost is strictly linear in pack bytes, and sha256 at 546 MiB/s per
+core is ~1.83 of the ~3.9 ms per MiB, i.e. about 47% of a commit. Parallelising
+the copy and the hash gives 1.64x-1.83x on commits of 32-192 MiB.

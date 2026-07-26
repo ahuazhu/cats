@@ -354,19 +354,75 @@ fio JSON 保存在 `raw/fio-*.json`。这是 `--ch-block-path kernel-nbd` 在宿
 那一跳（内核 NBD client + 每请求 socket 往返 + payload 复制）在同一台机器上值
 1.4×–5×，且大块 I/O 与高队列深度的收益最确定。真实数字要靠裸金属验收。
 
+## 四个优化点的验证结果(2026-07-26 追加)
+
+把"未验证清单"里点名的优化项逐个量了一遍。两个做了并有实测收益,一个**验证为负收益不做**,
+一个**验证为在当前设计下不可行**。原始输出见
+[`raw/commit-cost.log`](raw/commit-cost.log)、[`raw/queue-count-versus-depth.log`](raw/queue-count-versus-depth.log)、
+[`raw/concurrent-launch.log`](raw/concurrent-launch.log)。
+
+### 1. 提交路径的拷贝与哈希并行化 —— 做了,FLUSH 快 1.6×–1.8×
+
+先量成本结构(`blockd/tests/commit_cost.rs`,median of 3):**FLUSH 耗时与 pack 字节数严格线性**,
+而 **sha256 单线程只有 546 MiB/s(≈1.83 ms/MiB),占整个提交的约 47%**。拷贝和哈希都是按 chunk
+独立的,于是把屏障内的拷贝和屏障外的哈希都摊到最多 8 个线程:
+
+| dirty chunks | pack | 串行 FLUSH | 并行 FLUSH | 倍数 |
+|---|---|---|---|---|
+| 8 | 32 MiB | 131.8 ms | **80.3 ms** | 1.64× |
+| 16 | 64 MiB | 266.7 ms | **156.4 ms** | 1.71× |
+| 32 | 128 MiB | 491.7 ms | **269.1 ms** | 1.83× |
+| 48 | 192 MiB | 749.5 ms | **411.3 ms** | 1.82× |
+
+单 chunk 的小提交走内联路径不开线程。崩溃注入矩阵(每个提交窗口)全过。这一项对**两条前端
+都有效**,因为它在共享引擎里。
+
+### 2. 节点内并发拉起 —— 做了,8 个并发从"基本串行"到 4.0–5.3×
+
+`NodeRuntime::execute` 原来除 `ResumeCat` 外一律拿节点级 `ops: Mutex<()>`。实测(FakeVmm,
+`node-agent/tests/concurrent_start.rs`):单个拉起 74 ms,8 个并发 **539 ms**,而完全串行是
+592 ms —— 也就是**并发度约 1.1**。
+
+改动:每-Cat 锁改为**无条件**持有(这同时修掉 `ResumeCat` 与 `StopCat` 之间原本可交错的隐患),
+节点级锁只在真正分配节点全局资源时叠加——只有内核 NBD 路径需要(`nbd_attach` 要抢宿主锁扫
+`/dev/nbdN`);vhost-user 的 socket 路径、tap 名与 /30、状态目录、metering cgroup 全部由
+cat/disk id 决定,天然不冲突。并发上限用一个**独立**的 launch 门限,不复用唤醒预算的字节口径
+(唤醒预算按 resume commitment 计,预算小于单个 Cat 时拒绝唤醒是对的;冷启动没有快照要读回,
+不能因为同样的理由被拒)。
+
+结果:8 个并发 **539 ms → 114–137 ms(4.0×–5.3×)**,六个并发在上限为 2 时全部排队成功、不失败。
+
+### 3. 每队列请求并行 —— 验证为负收益,不做
+
+同样 32 个在飞请求:**1 队列 667k ops/s、2 队列各 16 深 243k、4 队列各 8 深 211k**。单队列深排队
+反而快 2.7–3.2×(一次 kick 排干整批、只发一次通知),拆队列要付每队列 kick/唤醒与跨线程争用。
+真机上那个"一个 vring worker 90.9% CPU、另三个空闲"是写路径卡在提交协议,不是调度缺陷。
+
+### 4. golden root 复用 —— 当前设计下不可行,需要先做决定
+
+收益是确定的(并发 create 在 S3 上 5.3×),但对象 key 是**按卷做命名空间**的
+(`volumes/<volume-id>/data/<object-id>`),所以新卷的 Map 无法引用另一个卷已提交的 chunk 对象;
+而 GC 按"没有 Root 引用"删除,跨卷引用会被误删。要拿到这个收益必须先决定其中一条:把数据对象
+改为内容寻址的全局命名空间,或者引入显式的 clone/snapshot 血缘让 GC 理解跨卷引用。两者都是
+ADR 级别的改动,不是补丁。
+
+### 关于"中间形态 delta pack"的自我修正
+
+我先前提过一个"只拷脏页、不改 Map 和读路径"的中间形态。**它不成立**:屏障必须拷贝它将要上传的
+内容,而对象是整个 chunk;只拷脏页就得在上传时重建整块,而重建时再读缓存会读到屏障之后的新写,
+破坏点时刻一致性。要绕开只有 CoW 或者按 P4 改 Map 表达 base+delta。真正的 delta pack 仍然是
+独立 ADR 的工作。
+
 ## 仍未验证 / 后续项
 
-真机验收已覆盖四态生命周期与 Warm 状态对齐,剩下的是:
-
-1. **写吞吐的真正修复**:delta pack(只提交脏的 64 KiB 页而不是整 4 MiB chunk,Direct-S3
-   设计 P4)。这是"按当前部署形态 NBD 写更快"的唯一根治办法,需要独立 ADR + 崩溃矩阵。
-2. **每队列请求并行**:后端目前每个 virtqueue 由单个 worker 线程串行处理。实测单 job Guest
-   负载下一个 vring worker 90.9% CPU 打满、另外三个空闲
-   ([`raw/metal-backend-cpu-during-qd32-write.txt`](raw/metal-backend-cpu-during-qd32-write.txt))。
-   在当前 flush-bound 的负载里它不是瓶颈,但读多的负载会碰到。
-3. **多队列在真实 vCPU 数下的收益曲线**:本次只验了 1 和 4 两个点。
+1. **delta pack**(只提交脏的 64 KiB 页,Direct-S3 设计 P4):写放大 ~100× 的唯一根治办法,
+   需要 Map 表达 base+delta、读路径合并、Compactor/GC 与重做崩溃矩阵。
+2. **golden root 复用**:见上面第 4 条,先要一个命名空间/血缘的决定。
+3. **多队列在真实 vCPU 数下的收益曲线**:本次只验了 1 和 4 两个点,而且已知队列多不等于更快。
 4. **长时间 soak 与多 Cat 同机压力**:本次每个场景都是单样本,不构成 SLA。
 5. **`nbd` 内核模块依赖的移除**:`install.sh` 仍无条件 `modprobe nbd`,以便随时切回默认路径。
+6. **本轮四项优化的真机复测**:并行提交与并发拉起都是在本机容器/FakeVmm 上量的,真机数字
+   要等下一轮裸金属。
 
 ## 复现
 

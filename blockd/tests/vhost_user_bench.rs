@@ -549,6 +549,53 @@ fn vhost_user_queue_depth_scaling() {
     }
 }
 
+/// Is a single queue's worker thread the throughput limit?
+///
+/// The backend drains each virtqueue serially in that queue's worker thread, so
+/// the same number of in-flight requests spread over more queues should go
+/// faster if — and only if — that serialization is the bottleneck. Same total
+/// depth, different queue counts.
+#[test]
+#[ignore = "benchmark; run explicitly with --ignored --nocapture"]
+fn vhost_user_queue_count_versus_depth() {
+    println!(
+        "\n{:<10} {:>7} {:>4} {:>13} {:>10}",
+        "workload", "queues", "qd", "total ops/s", "MiB/s"
+    );
+    // 32 requests in flight, split three ways.
+    for (queues, depth) in [(1usize, 32usize), (2, 16), (4, 8)] {
+        let (bench, server) = Bench::start(
+            VhostUserOptions {
+                num_queues: queues,
+                queue_size: 256,
+            },
+            true,
+        );
+        bench.warm();
+        let workload = Workload {
+            op: Op::RandRead,
+            block: SMALL_BLOCK,
+            ops: SMALL_OPS,
+            threads: queues,
+            depth,
+        };
+        let sample = run_vhost_user(&bench, workload, 0x0bad_c0de_dead_beef);
+        println!(
+            "{:<10} {:>7} {:>4} {:>13.0} {:>10.1}",
+            workload.op.name(),
+            queues,
+            depth,
+            sample.ops_per_sec(),
+            sample.mib_per_sec()
+        );
+        bench.engine.detach();
+        drop(bench);
+        if let Some(server) = server {
+            let _ = server.join();
+        }
+    }
+}
+
 /// How much of the QD1 gap is the harness's own completion wait?
 ///
 /// A Guest driver never pays for `poll(2)` plus a thread wakeup per completion:

@@ -1,0 +1,16 @@
+node-agent/tests/concurrent_start.rs, FakeVmm (the node agent's own locking is
+what is under test, not the VMM), macOS dev machine.
+
+Before -- everything except ResumeCat under the node-wide ops mutex:
+  single launch 74 ms; 8 concurrent 539 ms; fully serialized would be 592 ms;
+  speedup 1.10x
+
+After -- per-Cat lock held unconditionally, node-wide lock only for launches that
+allocate node-global state (kernel-NBD device allocation), concurrency bounded by
+a separate launch ceiling:
+  single launch 65-76 ms; 8 concurrent 113-137 ms; fully serialized would be
+  520-608 ms; speedup 4.03x-5.33x
+
+Also asserted: with a ceiling of 2, six concurrent launches all queue and
+succeed, and a Cat whose memory exceeds the wake budget is still launchable --
+launches are counted, not charged in resume-commitment bytes.
