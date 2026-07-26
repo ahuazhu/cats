@@ -1,16 +1,23 @@
-<h2 id="prerequisites">Prerequisites</h2>
-<p>For this source distribution you need Rust 1.88 or newer and access to a running Cats control plane. Building the CLI does not require KVM; running the full Cloud Hypervisor data path requires Linux x86_64, root privileges, and <code>/dev/kvm</code>.</p>
+<h2 id="first-cat">Start with a Cat — nothing to install</h2>
+<ol>
+  <li>Open the <a href="/user/">console</a> and sign in with WorkOS. A new user's Personal Account receives a one-time $10 credit.</li>
+  <li>Click <strong>Create Cat</strong>, pick a shape, confirm. It comes up with a persistent RootDisk attached.</li>
+  <li>Use <strong>Exec</strong> on the Cat's page to run a command — <code>uname -a</code>, or <code>apt install -y ripgrep</code>.</li>
+</ol>
+<p>That Cat is long-lived from this point on: it suspends itself when idle, wakes when something reaches it, and keeps its disk and its name throughout.</p>
 
-<h2 id="install-cli">Build the CLI</h2>
+<h2 id="install-cli">Install the CLI (optional)</h2>
+<p>The console is good for creating machines and running one-off commands. Day-to-day work, the <code>cats shell</code> interactive terminal and scripting are easier with the CLI.</p>
+<div class="callout"><strong>The CLI is built from source today</strong><p>Prebuilt binaries are coming. Building needs Rust 1.88 or newer, and does not need KVM.</p></div>
 <pre><code>git clone &lt;your-cats-repository&gt;
 cd cats
 cargo install --path cmd/cats
 cats --help</code></pre>
-<p>You can also replace <code>cats</code> in every example with <code>cargo run -p cats-cli --bin cats --</code> while developing in the repository.</p>
+<p>Working inside the repository, you can also replace <code>cats</code> in every example with <code>cargo run -p cats-cli --bin cats --</code>.</p>
 
 <h2 id="configure-access">Configure access</h2>
 <p>Users sign in with WorkOS. The CLI uses Device Authorization, opens the verification page in a browser, and stores its short-lived access token and rotating refresh credential only in the operating-system credential store. Cats no longer accepts static project tokens for normal users.</p>
-<pre><code>export CATS_API_URL='http://127.0.0.1:7300'
+<pre><code>export CATS_API_URL='https://cats.run'
 cats login
 cats whoami
 cats workspace list

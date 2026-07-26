@@ -1,4 +1,5 @@
-<div class="callout"><strong>Public by design</strong><p>These product and usage docs require no Cats session. The console and resource APIs still enforce their normal authentication boundaries.</p></div>
+<p>Cats gives you a long-lived Linux microVM: its own kernel, its own persistent disk, and a stable address. Compute can stop while the disk, the name and the address stay.</p>
+<p><strong>Nothing to install to begin</strong> — create a Cat in the console and it is ready.</p>
 
 <h2 id="choose-a-path">Choose a path</h2>
 <div class="doc-grid">
@@ -22,16 +23,17 @@
   <li><strong>Operation</strong> records every asynchronous mutation and its final structured error.</li>
 </ul>
 
-<h2 id="current-scope">Current V1 developer shape</h2>
-<p>The Rust workspace implements the control plane, CLI, embedded user/admin consoles, node and Guest agents, endpoint gateway contracts, ChunkStore engine, provider-neutral storage adapters, and a Cloud Hypervisor Phase-A path. The following limitations matter when evaluating or operating this source version:</p>
-<table><thead><tr><th>Area</th><th>Current status</th><th>What it means</th></tr></thead><tbody>
-  <tr><td>Block frontend</td><td>Kernel NBD by default; native vhost-user-blk available</td><td>Both frontends drive the same engine and commit protocol. vhost-user-blk (<code>--ch-block-path vhost-user</code>) has passed protocol-level acceptance but not yet a real-VMM (KVM) run, so kernel NBD stays the default.</td></tr>
-  <tr><td>Guest networking</td><td>Tap/overlay not implemented</td><td>Endpoint routing is covered in the FakeVmm development path; do not claim full CH Guest networking yet.</td></tr>
-  <tr><td>Concurrent wakes</td><td>Bounded per node</td><td>Suspended/Warm wakes are admitted against a node budget accounted in resume-commitment bytes; excess wakes queue rather than fail. Defaults match the 2026-07-21 validated point (10 concurrent) and are not a proven optimum.</td></tr>
-  <tr><td>Control metadata</td><td>SQLite development store</td><td>The PostgreSQL storage metadata adapter exists, but the project resource store is still SQLite-shaped development state.</td></tr>
-  <tr><td>Privilege separation</td><td>Not implemented</td><td>Run development components only in an appropriately isolated environment.</td></tr>
+<h2 id="current-scope">What you will hit today</h2>
+<p>Cats is moving quickly. These are the boundaries you will actually run into:</p>
+<table><thead><tr><th>Capability</th><th>Where it stands</th></tr></thead><tbody>
+  <tr><td>Endpoint protocols</td><td>HTTP/1.1, with HTTPS terminated at the regional edge. <strong>Inbound WebSocket is not supported yet.</strong></td></tr>
+  <tr><td>Guest outbound network</td><td>Every Cat gets its own network and outbound access, with sensitive destinations blocked. Private Guest-to-Guest networking across nodes is not offered yet.</td></tr>
+  <tr><td>PersistentDisk</td><td>Read-write on one Cat at a time, and it can grow but not shrink.</td></tr>
+  <tr><td>Snapshots</td><td>You can create one; convenience commands to list and restore are not there yet — use the HTTP API.</td></tr>
+  <tr><td>Wake concurrency</td><td>A node caps how many Cats wake at once. Beyond that, wakes <strong>queue instead of failing</strong>, so a wake can be slower at peak.</td></tr>
+  <tr><td>Interactive terminal</td><td><code>cats shell</code> needs the CLI. The console runs one command at a time, with no persistent terminal.</td></tr>
 </tbody></table>
-<div class="callout warning"><strong>Performance numbers are evidence, not an SLA</strong><p>Repository benchmark results preserve sample count, environment, measurement boundary, and correctness oracle. Never promote those prototype measurements to a production commitment.</p></div>
+<div class="callout warning"><strong>Performance numbers are evidence, not an SLA</strong><p>Every performance number we publish carries its sample count, hardware and measurement boundary. Prototype measurements never become production commitments — judge them against your own workload.</p></div>
 
 <h2 id="conventions">Documentation conventions</h2>
 <p>Examples use the Workspace selected by <code>cats login</code> and a Cat named <code>dev</code>. Replace them for your deployment. Sizes accept binary suffixes such as <code>512MiB</code> and <code>8GiB</code>.</p>

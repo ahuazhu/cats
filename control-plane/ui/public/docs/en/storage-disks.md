@@ -37,7 +37,7 @@ V1 supports growth only. Follow the API error if the disk must be Available befo
 
     cats disk snapshot project-data
 
-The control plane first establishes a durable barrier, then records an immutable root and generation. The current CLI creates and prints the snapshot response; snapshot list/restore convenience commands are not yet exposed by this source CLI.
+The control plane first establishes a durable barrier, then records an immutable root and generation. The CLI creates and prints the snapshot response; convenience commands to list and restore snapshots are not exposed yet — use the HTTP API for those.
 
 ## Durability and cache semantics
 

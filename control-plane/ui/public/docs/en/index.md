@@ -1,6 +1,6 @@
-**Public by design**
+Cats gives you a long-lived Linux microVM: its own kernel, its own persistent disk, and a stable address. Compute can stop while the disk, the name and the address stay.
 
-These product and usage docs require no Cats session. The console and resource APIs still enforce their normal authentication boundaries.
+**Nothing to install to begin** — create a Cat in the console and it is ready.
 
 ## Choose a path
 
@@ -15,21 +15,22 @@ A **Cat** is a long-lived Linux microVM with a required RootDisk. Compute may st
 - **Endpoint** maps a stable hostname to one Guest port and may wake a sleeping Cat.
 - **Operation** records every asynchronous mutation and its final structured error.
 
-## Current V1 developer shape
+## What you will hit today
 
-The Rust workspace implements the control plane, CLI, embedded user/admin consoles, node and Guest agents, endpoint gateway contracts, ChunkStore engine, provider-neutral storage adapters, and a Cloud Hypervisor Phase-A path. The following limitations matter when evaluating or operating this source version:
+Cats is moving quickly. These are the boundaries you will actually run into:
 
-| Area | Current status | What it means |
-|----|----|----|
-| Block frontend | Kernel NBD by default; native vhost-user-blk available | Both frontends drive the same engine and commit protocol. vhost-user-blk (`--ch-block-path vhost-user`) has passed protocol-level acceptance but not yet a real-VMM (KVM) run, so kernel NBD stays the default. |
-| Guest networking | Tap/overlay not implemented | Endpoint routing is covered in the FakeVmm development path; do not claim full CH Guest networking yet. |
-| Concurrent wakes | Bounded per node | Suspended/Warm wakes are admitted against a node budget accounted in resume-commitment bytes; excess wakes queue rather than fail. Defaults match the 2026-07-21 validated point (10 concurrent) and are not a proven optimum. |
-| Control metadata | SQLite development store | The PostgreSQL storage metadata adapter exists, but the project resource store is still SQLite-shaped development state. |
-| Privilege separation | Not implemented | Run development components only in an appropriately isolated environment. |
+| Capability | Where it stands |
+|----|----|
+| Endpoint protocols | HTTP/1.1, with HTTPS terminated at the regional edge. **Inbound WebSocket is not supported yet.** |
+| Guest outbound network | Every Cat gets its own network and outbound access, with sensitive destinations blocked. Private Guest-to-Guest networking across nodes is not offered yet. |
+| PersistentDisk | Read-write on one Cat at a time, and it can grow but not shrink. |
+| Snapshots | You can create one; convenience commands to list and restore are not there yet — use the HTTP API. |
+| Wake concurrency | A node caps how many Cats wake at once. Beyond that, wakes **queue instead of failing**, so a wake can be slower at peak. |
+| Interactive terminal | `cats shell` needs the CLI. The console runs one command at a time, with no persistent terminal. |
 
 **Performance numbers are evidence, not an SLA**
 
-Repository benchmark results preserve sample count, environment, measurement boundary, and correctness oracle. Never promote those prototype measurements to a production commitment.
+Every performance number we publish carries its sample count, hardware and measurement boundary. Prototype measurements never become production commitments — judge them against your own workload.
 
 ## Documentation conventions
 

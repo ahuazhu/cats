@@ -37,7 +37,7 @@ V1 只支持增大容量。如果当前运行路径要求磁盘处于 Available�
 
     cats disk snapshot project-data
 
-控制面先建立 durable barrier，再记录不可变 Root 与 generation。当前 CLI 会创建并打印 Snapshot 响应；此源码 CLI 尚未提供快照列表/Restore 的便利命令。
+控制面先建立 durable barrier，再记录不可变 Root 与 generation。CLI 会创建并打印 Snapshot 响应；列出与恢复快照的便捷命令尚未提供，目前需要走 HTTP API。
 
 ## 持久性与缓存语义
 

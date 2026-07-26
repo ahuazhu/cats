@@ -27,7 +27,7 @@ cats unmount project-data</code></pre>
 
 <h2 id="snapshot">Create a snapshot</h2>
 <pre><code>cats disk snapshot project-data</code></pre>
-<p>The control plane first establishes a durable barrier, then records an immutable root and generation. The current CLI creates and prints the snapshot response; snapshot list/restore convenience commands are not yet exposed by this source CLI.</p>
+<p>The control plane first establishes a durable barrier, then records an immutable root and generation. The CLI creates and prints the snapshot response; convenience commands to list and restore snapshots are not exposed yet — use the HTTP API for those.</p>
 
 <h2 id="durability">Durability and cache semantics</h2>
 <p>The Guest sees standard virtio block devices. Normal writes may complete in managed local cache, but FLUSH/FUA success requires immutable objects to be durable and the authoritative root CAS to succeed. After that point local NVMe is only a deletable cache.</p>

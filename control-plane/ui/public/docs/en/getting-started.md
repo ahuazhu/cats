@@ -1,21 +1,31 @@
-## Prerequisites
+## Start with a Cat — nothing to install
 
-For this source distribution you need Rust 1.88 or newer and access to a running Cats control plane. Building the CLI does not require KVM; running the full Cloud Hypervisor data path requires Linux x86_64, root privileges, and `/dev/kvm`.
+1.  Open the [console](/user/) and sign in with WorkOS. A new user's Personal Account receives a one-time $10 credit.
+2.  Click **Create Cat**, pick a shape, confirm. It comes up with a persistent RootDisk attached.
+3.  Use **Exec** on the Cat's page to run a command — `uname -a`, or `apt install -y ripgrep`.
 
-## Build the CLI
+That Cat is long-lived from this point on: it suspends itself when idle, wakes when something reaches it, and keeps its disk and its name throughout.
+
+## Install the CLI (optional)
+
+The console is good for creating machines and running one-off commands. Day-to-day work, the `cats shell` interactive terminal and scripting are easier with the CLI.
+
+**The CLI is built from source today**
+
+Prebuilt binaries are coming. Building needs Rust 1.88 or newer, and does not need KVM.
 
     git clone <your-cats-repository>
     cd cats
     cargo install --path cmd/cats
     cats --help
 
-You can also replace `cats` in every example with `cargo run -p cats-cli --bin cats --` while developing in the repository.
+Working inside the repository, you can also replace `cats` in every example with `cargo run -p cats-cli --bin cats --`.
 
 ## Configure access
 
 Users sign in with WorkOS. The CLI uses Device Authorization, opens the verification page in a browser, and stores its short-lived access token and rotating refresh credential only in the operating-system credential store. Cats no longer accepts static project tokens for normal users.
 
-    export CATS_API_URL='http://127.0.0.1:7300'
+    export CATS_API_URL='https://cats.run'
     cats login
     cats whoami
     cats workspace list

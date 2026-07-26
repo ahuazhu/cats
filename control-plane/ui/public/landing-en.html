@@ -76,7 +76,7 @@ src/main.rs:42: // TODO: converge the retry policy</pre>
         <article class="life-step"><span class="number">3</span><h3>Warm</h3><p>A local snapshot lands and the VMM exits: dedicated runtime RSS goes to zero while process state survives. Trades a little wake time for resident memory.</p><small>Zero resident, still stateful</small></article>
         <article class="life-step"><span class="number">4</span><h3>Cold</h3><p>Every Host-local dependency is released; only the remote disk and control-plane record remain. Any healthy Host can bring it back.</p><small>No Host affinity</small></article>
       </div>
-      <p class="pricing-note">The ladder only descends, and waking always returns to Running. One hard rule holds it together: <strong>any failed fast recovery must converge to a clean Cold boot</strong> — never a stuck intermediate state. Slower is acceptable; not knowing which state you are in is not.</p>
+      <p class="band-note">The ladder only descends, and waking always returns to Running. One hard rule holds it together: <strong>any failed fast recovery must converge to a clean Cold boot</strong> — never a stuck intermediate state. Slower is acceptable; not knowing which state you are in is not.</p>
     </div>
   </section>
 

@@ -32,11 +32,11 @@ A client should tolerate `503` with retry guidance during activation and reconne
 
 The implemented path supports HTTP/1.1 with HTTPS termination at the regional edge. It preserves method, path/query, application headers, response status, and request/response bodies. The owning node revalidates Cat ownership and Running state; an old cached route fails closed instead of reaching a different Guest. WebSocket support is a later milestone.
 
-## Current source availability
+## Where this stands today
 
-**Cloud Hypervisor HTTP ingress is available**
+HTTP ingress works: Endpoint addresses, route binding and wake-on-request are all in place.
 
-The Endpoint API, route binding, wake flow, per-Cat `/30` tap, and owning-node HTTP proxy are implemented. Cross-node Guest overlay networking and WebSocket proxying are not yet implemented.
+Not yet available: **inbound WebSocket**, and **private Guest-to-Guest networking across nodes**.
 
 ## Prepare the Guest service
 
