@@ -24,7 +24,11 @@
 7. 所有数字都跑了**两轮独立测量**（间隔约 15 分钟，同一台机器）。内核 NBD 侧非常稳定
    （±1–7%），vhost-user 侧的大块读波动明显（5.5 vs 8.8 GiB/s），所以本报告一律给区间，
    不给单点。这也是虚拟化开发环境不能替代裸金属验收的直接证据。
-8. **未做**：真实 Cloud Hypervisor + KVM 下的 Guest 启动、ext4/fio 负载与 Warm
+8. **真实 Guest 已验**（QEMU/TCG，不需要 KVM）：真实 Linux 6.1 内核的 `virtio_blk` 驱动
+   加真实 ext4 跑在后端上，mkfs / 写 / sync / umount / e2fsck 全过；删掉本地缓存目录后重新
+   attach 同一个卷，仍然 fsck clean 且四个 sha256 摘要一致。QEMU 同时充当一个与本仓库无关的
+   frontend 实现。
+9. **仍未做**：真实 Cloud Hypervisor + KVM 下的 Guest 启动、Guest 内 fio 负载与 Warm
    snapshot/restore 状态对齐。开发机没有 `/dev/kvm`，这一步必须在裸金属上按
    [`metal-e2e-20260721`](../metal-e2e-20260721/README.md) 的形式补做。因此
    `--ch-block-path` 默认仍是 `kernel-nbd`。
@@ -95,6 +99,42 @@
 
 `cargo test -p cats-blockd` 全量（两条前端共用的 engine/格式/崩溃测试）见
 [`raw/blockd-crate-tests.log`](raw/blockd-crate-tests.log)。
+
+## 真实 Guest 验收（QEMU/TCG，无需 KVM）
+
+协议级 harness 是本仓库自己写的驱动端，Cloud Hypervisor 又需要 KVM。QEMU 用 TCG（纯软件
+模拟）可以在没有 KVM 的机器上充当 vhost-user frontend，于是能补上 harness 补不了的两件事：
+**一个与本仓库无关的 frontend 实现**，以及**真实 Linux `virtio_blk` 驱动 + 真实 ext4**。
+
+脚本 [`qemu-guest-smoke.sh`](qemu-guest-smoke.sh)；串行日志
+[`raw/qemu-guest-boot1.log`](raw/qemu-guest-boot1.log)、
+[`raw/qemu-guest-boot2.log`](raw/qemu-guest-boot2.log)；后端日志
+[`raw/qemu-blockd.log`](raw/qemu-blockd.log)。
+
+场景：256 MiB 卷、2 队列。boot 1 先在文件系统区域之外做裸扇区读写回环，然后 `mkfs.ext4`
+（前 200 MiB）、mount、写三个确定内容的文件、`sync`、`umount`（ext4 journal 在这里发 FLUSH）、
+`e2fsck -fn`。随后主机**杀掉后端并删除本地缓存目录**，用新的 data-dir 重新 attach 同一个卷
+（规范 §8 判据 2 的空缓存懒读）。boot 2 再 `e2fsck`、mount、重算全部摘要。
+
+| 断言 | 结果 |
+|---|---|
+| Guest 看到的容量 | 268435456（= 卷字节数，来自 config space） |
+| 逻辑块大小 | 512（与 Phase A `nbd-client -b 512` 一致） |
+| Guest 硬件队列数 | 2（`/sys/block/vda/mq/`，多队列协商生效） |
+| 写缓存语义 | `write back`（持久点在 FLUSH） |
+| 裸扇区读写回环 | ok |
+| boot 1 `e2fsck -fn` | clean |
+| boot 2（空缓存 attach 之后）`e2fsck -fn` | clean |
+| boot 2 `dumpe2fs` 文件系统状态 | clean |
+| small / large / nested 文件摘要跨空缓存 attach | 三个 sha256 全部一致 |
+| 裸扇区区域摘要跨空缓存 attach | 一致 |
+
+内核自己打印的设备行是 `virtio_blk virtio1: 2/0/0 default/read/poll queues` 与
+`[vda] 524288 512-byte logical blocks (268 MB/256 MiB)`。第二次 attach 时本地缓存为空，
+114 个已提交对象留在对象存储里，数据是从那里懒读回来的。
+
+**这一轮不覆盖**：Cloud Hypervisor 自身，以及 Warm（`vm.snapshot` / `--restore`）的设备
+状态对齐。
 
 ## 性能测量
 
@@ -209,6 +249,9 @@ fio JSON 保存在 `raw/fio-*.json`。这是 `--ch-block-path kernel-nbd` 在宿
 ```bash
 # 协议级验收 + 进程内前端成本（不需要 KVM / root；macOS 上自动进容器）
 experiments/vhost-user-blk-frontend-20260726/run.sh
+
+# 真实 Guest：QEMU/TCG 当 frontend，真实内核驱动 + 真实 ext4（不需要 KVM）
+experiments/vhost-user-blk-frontend-20260726/qemu-guest-smoke.sh
 
 # 真实内核 NBD 链路对照（需要 nbd 模块、nbd-client、fio 与 privileged 容器）
 experiments/vhost-user-blk-frontend-20260726/kernel-nbd-baseline.sh
