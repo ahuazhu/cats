@@ -1,0 +1,12 @@
+Single node (metal-2 cordoned), 10 Cats, real S3 object store + RDS PostgreSQL.
+Phases: concurrent cold create -> warm (snapshot + VMM exit) -> concurrent warm
+restore. Each Cat: 2 vCPU / 1 GiB / 2 GiB root, --no-auto-suspend.
+
+label,phase,requested,completed,min_ms,p50_ms,p95_ms,max_ms,failures
+single-node-10,create,10,10,12666,63050,120047,120047,1
+# single-node-10: 9/10 running after concurrent create; batch wall 120050 ms
+single-node-10,warm,10,10,16447,16749,17050,17050,0
+single-node-10,restore,10,10,307,1065,2119,2119,0
+# single-node-10: 10/10 running after concurrent restore; batch walls create=120050 warm=17054 restore=2121 ms
+#   metal-1            state=ready     cats=10 cpu=20/128 memory=10240MiB/1031865MiB
+#   metal-2            state=cordoned  cats=0 cpu=0/128 memory=0MiB/1031865MiB

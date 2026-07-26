@@ -1,0 +1,13 @@
+nodes: 2 x AWS i4i.metal, us-east-1, Ubuntu 24.04 x86_64
+kernel: 6.17.0-1019-aws, /dev/kvm present
+cpus_per_node: 128
+memory_per_node_kb: 1056630388
+cloud_hypervisor: v53.0
+rustc: 1.97.1
+chunkstore_cache: local NVMe instance store (/dev/nvme0n1 -> /var/lib/cats)
+object_store: aws-s3 adapter, temporary in-region bucket, EC2 instance profile
+storage_meta: RDS PostgreSQL 18.3, db.m5.large, sslmode=require with the RDS CA
+control_plane: metal-1 only; node agents metal-1 and metal-2
+block_path: --ch-block-path vhost-user --ch-vhost-user-queues 4
+teardown: instances, RDS, bucket, IAM role/profile, key pair and security group
+          all deleted after the run

@@ -7,12 +7,20 @@ BlobStore port → AWS S3/File adapter`；Guest Agent 走 vsock；Suspended=vm.p
 公网 HTTP Endpoint 经 owning Node 进入 Guest tap。跨节点 overlay 与 WebSocket 入站仍是
 后续里程碑，不改变提交协议。
 
-原生 vhost-user-blk 路径已实现（ADR-0015）：给 `cats-noded` 加
-`--ch-block-path vhost-user`（可选 `--ch-vhost-user-queues N`），磁盘链路变成
+原生 vhost-user-blk 路径已实现并在本机型上验收（ADR-0015）：在 `/etc/cats/cats.env` 里设
+`CATS_BLOCK_PATH_ARGS=--ch-block-path vhost-user --ch-vhost-user-queues 4`，磁盘链路变成
 `guest virtio-blk → CH vhost-user-blk client → cats-blockd`，不再需要 `nbd` 内核模块或
-`/dev/nbdN`。该路径的协议级验收已完成，但**真机（KVM）验收尚未做**，包括 Warm
-snapshot/restore 的设备状态对齐；因此默认仍是内核 NBD，裸金属上要用 vhost-user 必须
-按 `experiments/vhost-user-blk-frontend-20260726/README.md` 的未验证清单先跑一轮验收。
+`/dev/nbdN`（队列数会自动夹到每个 Cat 的 vCPU 数，CH 拒绝 `num_queues > vCPU`）。
+两条路径在 i4i.metal 上跑同一套 `e2e.sh` 都是 22/23，含 Warm snapshot/restore；
+vhost-user 的 Warm restore 快 1.8×、随机读 p50 更低，但按当前形态（CH 带缓冲打开
+`/dev/nbdN`）NBD 的写吞吐更高，所以**默认仍是内核 NBD**。数据与根因见
+`experiments/vhost-user-blk-frontend-20260726/README.md`。
+
+多节点：每台跑一次 `install.sh`，然后在 `cats.env` 里给每台唯一的 `CATS_NODE_ID`、
+`CATS_NODE_LISTEN`、`CATS_NODE_ADVERTISE_URL`，并让所有节点指向同一个
+`CATS_CONTROL_PLANE_URL` 以及**同一套共享 storage-meta 与 object store**（PostgreSQL + S3；
+SQLite 和 file adapter 是每台主机私有的，跨节点迁移不可能成立）。双节点验收见
+`experiments/metal-cluster-20260726/README.md`。
 
 ## 1. 开机器
 

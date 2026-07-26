@@ -1,0 +1,24 @@
+Captured on the two-node i4i.metal cluster (metal-1 -> metal-2), vhost-user block
+path, real S3 object store + RDS PostgreSQL storage-meta.
+
+== cleanup
+== 1. place the Cat on metal-1 and make data durable
+  PASS  create converges to running
+  PASS  placed on the source node
+  PASS  source boot id is present
+  PASS  durable write on the source node
+== 2. stop the Cat (Cold) and cordon metal-1 so it cannot be placed back
+  PASS  stop converges to cold
+  PASS  source node is cordoned
+== 3. start again: the scheduler must pick metal-2, with an empty local cache
+  PASS  start converges to running
+  PASS  migrated to the destination node
+  PASS  destination boot id is present
+  PASS  cold migration is a fresh boot (new boot id)
+  PASS  durable data survived the migration
+  INFO  cold migration metal-1 -> metal-2 took 4379 ms (single sample, empty destination cache)
+== 4. the destination can write and flush too
+  PASS  post-migration write
+== cleanup
+
+cold migration: 12 passed, 0 failed

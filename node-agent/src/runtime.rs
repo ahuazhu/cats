@@ -641,7 +641,8 @@ impl NodeRuntime {
         };
         let launch = (|| -> Result<String> {
             for grant in &volumes {
-                let proc = self.spawn_blockd(cat_id, &dir, grant)?;
+                // FakeVmm never consumes vhost-user; NBD is its only frontend.
+                let proc = self.spawn_blockd(cat_id, &dir, grant, 1)?;
                 let process_id = proc.child.id();
                 rt.blockds.insert(grant.disk_id.clone(), proc);
                 self.attach_to_metering(&rt, process_id)?;
@@ -769,8 +770,11 @@ impl NodeRuntime {
         let launch = (|| -> Result<String> {
             // 1. Block backends.
             let blockd_started = Instant::now();
+            // Cloud Hypervisor refuses num_queues > boot vCPUs, and the backend
+            // must expose exactly the queues the VMM will configure.
+            let vhost_user_queues = ch::vhost_user_queues_for(chc, cpus);
             for grant in &volumes {
-                let proc = self.spawn_blockd(cat_id, &dir, grant)?;
+                let proc = self.spawn_blockd(cat_id, &dir, grant, vhost_user_queues)?;
                 let process_id = proc.child.id();
                 rt.blockds.insert(grant.disk_id.clone(), proc);
                 self.attach_to_metering(&rt, process_id)?;
@@ -815,7 +819,7 @@ impl NodeRuntime {
                             .context("blockd was started without a vhost-user socket")?;
                         disks.push(ch::vhost_user_disk_arg(
                             socket,
-                            chc.vhost_user_queues,
+                            vhost_user_queues,
                             chc.vhost_user_queue_size,
                         )?);
                     }
@@ -921,6 +925,7 @@ impl NodeRuntime {
         cat_id: &str,
         cat_dir: &Path,
         grant: &VolumeGrant,
+        vhost_user_queues: usize,
     ) -> Result<BlockdProc> {
         let socket = short_socket_path(
             &self.cfg.state_dir,
@@ -971,7 +976,7 @@ impl NodeRuntime {
             cmd.arg("--listen-vhost-user")
                 .arg(socket)
                 .arg("--vhost-user-queues")
-                .arg(chc.vhost_user_queues.to_string())
+                .arg(vhost_user_queues.to_string())
                 .arg("--vhost-user-queue-size")
                 .arg(chc.vhost_user_queue_size.to_string());
         }
@@ -1575,7 +1580,8 @@ impl NodeRuntime {
             return Ok(ObservedState::Running); // idempotent
         }
         let dir = rt.dir.clone();
-        let proc = self.spawn_blockd(cat_id, &dir, &grant)?;
+        // Unreachable in Cloud Hypervisor mode (hot attach is rejected above).
+        let proc = self.spawn_blockd(cat_id, &dir, &grant, 1)?;
         let process_id = proc.child.id();
         rt.blockds.insert(grant.disk_id.clone(), proc);
         if let Err(error) = self.attach_to_metering(rt, process_id) {

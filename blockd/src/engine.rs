@@ -347,7 +347,16 @@ impl ChunkEngine {
         let _flush = self.flush_lock.lock().unwrap();
 
         // ---- freeze the barrier ----
-        let (frozen, base_generation, base_map, base_leaves, payload, entries) = {
+        //
+        // Everything in here blocks every Guest read and write on this volume,
+        // so it does the minimum a point-in-time image requires: pick the dirty
+        // set and copy those chunk images. Hashing them is pure computation over
+        // a private copy, so it happens after the barrier is released. Measured
+        // on a real Guest this is worth about 5% of FLUSH latency: the rest is
+        // the full-chunk copy plus writing the pack and the objects, which only
+        // delta packs can fix (evidence and numbers:
+        // experiments/vhost-user-blk-frontend-20260726).
+        let (frozen, base_generation, base_map, base_leaves, payload) = {
             let _barrier = self.io_gate.write().unwrap();
             let mut st = self.state.lock().unwrap();
             let frozen: Vec<u64> = (0..self.chunk_count)
@@ -364,34 +373,46 @@ impl ChunkEngine {
             let base_leaves = st.leaf_refs.clone();
             drop(st);
 
-            // Copy the frozen chunk images while writers are blocked so the
-            // pack is a consistent point-in-time barrier image.
-            let mut payload = Vec::with_capacity(frozen.len() * CHUNK_SIZE as usize);
-            let mut entries = Vec::with_capacity(frozen.len());
-            for &c in &frozen {
-                let mut chunk_bytes = vec![0u8; CHUNK_SIZE as usize];
-                self.cache
-                    .read_exact_at(&mut chunk_bytes, c * CHUNK_SIZE as u64)?;
-                let sha = format::sha256(&chunk_bytes);
-                entries.push(PackEntry {
-                    chunk_idx: c,
-                    payload_offset: payload.len() as u64,
-                    len: CHUNK_SIZE,
-                    sha256_hex: hex::encode(sha),
-                });
-                payload.extend_from_slice(&chunk_bytes);
+            // One allocation for the whole pack: `vec![0u8; n]` for a large `n`
+            // comes from fresh zero pages, while a 4 MiB allocation per chunk
+            // charged an allocation and a page-fault storm to the barrier.
+            let mut payload = vec![0u8; frozen.len() * CHUNK_SIZE as usize];
+            for (slot, &c) in frozen.iter().enumerate() {
+                let start = slot * CHUNK_SIZE as usize;
+                self.cache.read_exact_at(
+                    &mut payload[start..start + CHUNK_SIZE as usize],
+                    c * CHUNK_SIZE as u64,
+                )?;
             }
-            (
-                frozen,
-                base_generation,
-                base_map,
-                base_leaves,
-                payload,
-                entries,
-            )
+            (frozen, base_generation, base_map, base_leaves, payload)
         };
-        let _ = frozen;
 
+        // Barrier released: hash the frozen images and describe the pack.
+        let entries: Vec<PackEntry> = frozen
+            .iter()
+            .enumerate()
+            .map(|(slot, &c)| {
+                let start = slot * CHUNK_SIZE as usize;
+                let image = &payload[start..start + CHUNK_SIZE as usize];
+                PackEntry {
+                    chunk_idx: c,
+                    payload_offset: start as u64,
+                    len: CHUNK_SIZE,
+                    sha256_hex: hex::encode(format::sha256(image)),
+                }
+            })
+            .collect();
+
+        // Commit size is the single most useful number when a Guest workload
+        // stalls on FLUSH: the barrier above is held for as long as it takes to
+        // copy and hash every dirty chunk, and V1 commits whole 4 MiB chunks.
+        tracing::info!(
+            volume = %self.cfg.volume_id,
+            base_generation,
+            dirty_chunks = frozen.len(),
+            pack_bytes = payload.len(),
+            "commit barrier frozen"
+        );
         let txn = uuid::Uuid::new_v4().simple().to_string();
         let header = PackHeader {
             txn: txn.clone(),

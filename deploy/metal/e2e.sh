@@ -6,6 +6,13 @@ set -uo pipefail
 
 CATS=${CATS:-/opt/cats/bin/cats}
 export CATS_API_URL=${CATS_API_URL:-http://127.0.0.1:7300}
+# The CLI requires a bearer token (ADR-0008). Reuse the fleet admin token from
+# the deployment config so an acceptance run needs no interactive `cats login`.
+if [[ -z ${CATS_TOKEN:-} ]] && [[ -r /etc/cats/cats.env ]]; then
+  CATS_TOKEN=$(sed -n 's/^CATS_ADMIN_TOKEN=//p' /etc/cats/cats.env | tail -1)
+  export CATS_TOKEN
+fi
+[[ -n ${CATS_TOKEN:-} ]] || { echo "set CATS_TOKEN (or CATS_ADMIN_TOKEN in /etc/cats/cats.env)" >&2; exit 1; }
 CAT=metal-e2e
 
 pass=0; fail=0
@@ -22,7 +29,7 @@ $CATS destroy $CAT >/dev/null 2>&1
 
 echo "== 1. cold create -> real VM boots =="
 cold_create_started_ms=$(date +%s%3N)
-out=$($CATS create $CAT --root-size 1GiB --cpus 1 --memory 512MiB 2>&1)
+out=$($CATS create $CAT --root-size 1GiB --cpus 1 --memory 512MiB ${CATS_CREATE_ARGS:-} 2>&1)
 cold_create_ms=$(( $(date +%s%3N) - cold_create_started_ms ))
 check "create converges to running" "observed=running" "$out"
 echo "  INFO  create-to-running ${cold_create_ms} ms (single sample; includes scheduling and root seeding)"
