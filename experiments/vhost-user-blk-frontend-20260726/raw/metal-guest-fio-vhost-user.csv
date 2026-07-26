@@ -1,0 +1,8 @@
+# vhost-user: guest hw queues=4 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+vhost-user,randread-4k-qd1,randread,4k,1,74006,289.1,9.5,9,12
+vhost-user,randwrite-4k-qd1,randwrite,4k,1,8197,32.0,117.4,23,77
+vhost-user,randread-4k-qd32,randread,4k,32,260741,1018.5,119.8,117,153
+vhost-user,randwrite-4k-qd32,randwrite,4k,32,23379,91.3,1366.8,424,1516
+vhost-user,seqread-1m-qd1,read,1M,1,3575,3574.5,252.3,253,264
+vhost-user,seqwrite-1m-qd1,write,1M,1,1242,1241.9,768.8,289,338

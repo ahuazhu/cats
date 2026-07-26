@@ -41,17 +41,36 @@ ADR-0001 第 3 条把「接入 Cloud Hypervisor vhost-user-blk」列为 V1 里�
    `--ch-vhost-user-queue-size`），后端每个队列一个 worker 线程。FLUSH 仍是整卷
    屏障，与队列数无关。
 
-## 现状与未验证事项
+## 现状:已验证到什么程度
 
-- 已验证（本机 Linux 容器，arm64）：vhost-user 协议协商、config space、六类请求、
-  多描述符 payload、多队列并行、EVENT_IDX 开关、越界与未知请求的按请求失败、
-  fenced attachment 对 Guest fail closed，以及与 NBD oracle 的逐字节一致。
-  证据见 [`experiments/vhost-user-blk-frontend-20260726`](../../experiments/vhost-user-blk-frontend-20260726/README.md)。
-- **未验证**：真实 Cloud Hypervisor + KVM 下的 Guest 启动、ext4/fio 负载，以及
-  Warm（`vm.snapshot` / `--restore`）在 vhost-user 设备上的状态对齐——ADR-0002
-  已经把后者标为必须用带 dirty/lease 状态的 `cats-blockd` 重新验证的项。开发机没有
-  `/dev/kvm`，这一步必须在裸金属上跑，与 2026-07-21 同样的验收形式。
-- 因此默认值保持 `kernel-nbd`：在裸金属验收通过之前，vhost-user 是显式选项。
+- **协议级**(本机,无需 KVM):vhost-user 协商、config space、六类请求、多描述符 payload、
+  多队列并行、EVENT_IDX 开关、越界与未知请求按请求失败、fenced attachment 对 Guest fail closed,
+  以及与 NBD oracle 的逐字节一致。10/10。
+- **真实 Guest**(QEMU/TCG,无需 KVM):真实 Linux 6.1 内核 `virtio_blk` + 真实 ext4,
+  mkfs/写/sync/umount/e2fsck 全过;删除本地缓存目录后重新 attach 仍 fsck clean、摘要一致。
+- **真机**(AWS `i4i.metal`,真 KVM + Cloud Hypervisor v53):`deploy/metal/e2e.sh` 在两条路径上
+  同为 **22 passed / 1 failed**(唯一失败与块路径无关),**包含 Warm `vm.snapshot` / `--restore`
+  后 boot_id 保持与文件存活**——ADR-0002 要求的重验项已完成。Warm restore 总耗时 51.9 ms vs
+  92.5–98.7 ms(块挂载 40 ms → 5 µs)。
+- **集群形态**:两节点 + 真实 S3 + RDS PostgreSQL 下跨节点 Cold 迁移 12/12 通过(4.4 s)。
+- 证据:[`vhost-user-blk-frontend-20260726`](../../experiments/vhost-user-blk-frontend-20260726/README.md)、
+  [`metal-cluster-20260726`](../../experiments/metal-cluster-20260726/README.md)。
+
+## 为什么默认值仍是 `kernel-nbd`
+
+不是因为没验过,而是一个**按当前部署形态**的写吞吐权衡:
+
+- 节点代理今天让 Cloud Hypervisor **带缓冲**打开 `/dev/nbdN`(`direct=off` 是 CH 默认),宿主
+  page cache 会在引擎看到之前就 ack Guest 的写。按这个形态对比,kernel-nbd 在写与顺序读上更快
+  (Guest fio 4 KiB 随机写 QD32:213–223k vs 23–33k IOPS)。
+- 把这层缓冲关掉(`direct=on`)做同层次对照,**vhost-user 在 6 项负载里的 5 项快 1.7×–5.7×**,
+  随机读 p50 从 32 µs 降到 9–10 µs。
+- 两条路径在这个负载上**都是 flush-bound**:V1 提交整个 4 MiB chunk,4 KiB 随机写的写放大约
+  100×,一次提交要写下约 200 MiB。差别只在提交协议前面垫了多少易失缓冲。
+
+**翻转默认值的判据**:(a) delta pack(Direct-S3 设计 P4:只提交脏的 64 KiB 页)落地并把提交
+成本降下来,或 (b) 明确接受"用写吞吐换随机读延迟与 Warm 速度"这个权衡并有对应负载证据;
+外加 (c) 一轮多样本 soak。在此之前 vhost-user 是显式选项。
 
 ## 风险与缓解
 

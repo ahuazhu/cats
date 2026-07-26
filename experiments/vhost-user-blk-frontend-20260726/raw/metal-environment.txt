@@ -1,0 +1,11 @@
+instance_type: i4i.metal
+region: us-east-1
+uname: Linux 6.17.0-1019-aws x86_64
+kvm: present
+cpus: 128
+memory_kb: 1056630388
+cloud_hypervisor: cloud-hypervisor v53.0
+guest_kernel: 6.17.0-1019-aws
+cache_device: /dev/nvme0n1 (local NVMe instance store)
+blob_store: file adapter on /var/lib/cats/blob
+rustc: rustc 1.97.1 (8bab26f4f 2026-07-14)

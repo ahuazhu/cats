@@ -1,0 +1,41 @@
+Root cause of the write-path difference between the two block frontends.
+Captured on i4i.metal, real Cloud Hypervisor + KVM, 4 vCPU / 2 GiB Cat, ext4
+root on the local NVMe ChunkStore cache, file object store.
+
+Method: rate-matched Guest workload so the frontends cannot differ by write rate
+(fio randwrite 4k, iodepth 1, --rate_iops=800, 20 s, on a pre-laid-out 512 MiB
+file). Guest counters from /sys/block/vda/stat (fields 5, 16, 17); commit sizes
+from the engine's "commit barrier frozen" log.
+
+                                    kernel-nbd   kernel-nbd    vhost-user
+                                    (buffered)   (direct=on)
+  Guest writes                          13775        14846         14852
+  Guest flushes                            65            9            28
+  Guest flush stall total (ms)          21048         6946         17864
+  ms per flush                            324          772           638
+  engine commits                           69           10            29
+  avg dirty chunks per commit            23.6         53.7          47.4
+  avg pack per commit (MiB)              94.4        214.8         195.6
+
+Findings:
+
+1. The workload is FLUSH-bound on every path: the Guest spends essentially the
+   whole window stalled in FLUSH. V1 commits whole 4 MiB chunks, so a 4 KiB
+   random write dirties 4 MiB and one commit copies, hashes and writes ~200 MiB.
+   Measured write amplification into the object store: ~100x.
+
+2. The kernel-NBD path only looked faster because Cloud Hypervisor opens
+   /dev/nbdN buffered (`direct=off` is CH's default and what the node agent uses
+   today). The host page cache absorbs and coalesces Guest writes before the
+   engine sees them, which yields more frequent but individually cheaper
+   commits. Disable it (`direct=on`) and the same path becomes slower than
+   vhost-user: 772 ms per flush and 53.7 dirty chunks per commit.
+
+3. The vhost-user frontend is therefore NOT the cause of the write regression
+   reported earlier. The cost is the commit protocol's granularity, and the two
+   paths differ only in how much volatile host buffering sits in front of it.
+
+4. Moving sha256 out of the exclusive commit barrier (this change) is worth
+   about 5%: 638 -> 627 ms per flush, 3.37 -> 3.21 ms per committed MiB. The
+   remainder is the full-chunk copy plus writing the pack and the objects, which
+   only delta packs (Direct-S3 design P4) can remove.

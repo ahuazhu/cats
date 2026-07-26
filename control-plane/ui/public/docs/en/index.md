@@ -21,7 +21,7 @@ The Rust workspace implements the control plane, CLI, embedded user/admin consol
 
 | Area | Current status | What it means |
 |----|----|----|
-| Block frontend | Kernel NBD by default; native vhost-user-blk available | Both frontends drive the same engine and commit protocol. vhost-user-blk (`--ch-block-path vhost-user`) has passed protocol-level acceptance but not yet a real-VMM (KVM) run, so kernel NBD stays the default. |
+| Block frontend | Kernel NBD by default; native vhost-user-blk available | Both frontends drive the same engine and commit protocol, and both passed the same bare-metal acceptance run with real KVM including Warm snapshot/restore. Kernel NBD stays the default for a measured write-throughput trade-off, not for lack of validation. |
 | Guest networking | Tap/overlay not implemented | Endpoint routing is covered in the FakeVmm development path; do not claim full CH Guest networking yet. |
 | Concurrent wakes | Bounded per node | Suspended/Warm wakes are admitted against a node budget accounted in resume-commitment bytes; excess wakes queue rather than fail. Defaults match the 2026-07-21 validated point (10 concurrent) and are not a proven optimum. |
 | Control metadata | SQLite development store | The PostgreSQL storage metadata adapter exists, but the project resource store is still SQLite-shaped development state. |

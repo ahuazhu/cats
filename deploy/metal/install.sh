@@ -17,8 +17,9 @@ PREFIX=/opt/cats
 echo "==> apt dependencies"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
+# libssl-dev is required by the PostgreSQL metadata adapter's native-tls stack.
 apt-get install -qy build-essential curl git nbd-client busybox-static \
-  musl-tools e2fsprogs cpio zstd pkg-config debootstrap iptables
+  musl-tools e2fsprogs cpio zstd pkg-config libssl-dev debootstrap iptables
 
 echo "==> rust toolchain"
 export PATH="$HOME/.cargo/bin:$PATH"
