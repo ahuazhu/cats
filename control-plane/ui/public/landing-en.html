@@ -2,97 +2,132 @@
   <section class="hero">
     <div class="content-shell hero-grid">
       <div class="hero-copy">
-        <span class="eyebrow">Durable cloud workspaces</span>
-        <h1>Your Linux workspace, <em>ready when you are.</em></h1>
-        <p>Cats gives every workspace a real Linux microVM with durable disks and a stable identity. Work at full speed, let it sleep when idle, and wake it without rebuilding your environment.</p>
+        <span class="eyebrow">One design choice</span>
+        <h1>Most sandboxes are a task. <em>A Cat is a machine.</em></h1>
+        <p>That is not a turn of phrase. Treat the environment as a task and state becomes a by-product, stopping means discarding, and the bill follows what you requested. Treat it as a machine and all three invert. Everything below is a consequence of that one choice, not a feature list.</p>
         <div class="hero-actions">
-          <a class="button-link primary" href="/user/">Open console <span aria-hidden="true">→</span></a>
+          <a class="button-link primary" href="/user/">Open the console <span aria-hidden="true">→</span></a>
           <a class="button-link secondary" href="/docs/getting-started/">Read the quickstart</a>
         </div>
-        <div class="hero-note" aria-label="Product highlights">
-          <span><i></i>True pay-as-you-go</span>
-          <span><i></i>Durable data by default</span>
-          <span><i></i>Linux ready on demand</span>
+        <div class="hero-note" aria-label="Three consequences">
+          <span><i></i>State outlives the process</span>
+          <span><i></i>The Guest is a real machine</span>
+          <span><i></i>You pay for what you used</span>
         </div>
       </div>
-      <div class="workspace-card" aria-label="Cats command-line example">
+      <div class="workspace-card" aria-label="Cats command line example">
         <div class="workspace-top">
           <div class="workspace-title"><img src="/assets/cats-mark.svg" alt=""><span><strong>dev-workspace</strong><small>ubuntu-24.04 · 2 CPU · 2 GiB</small></span></div>
-          <span class="live-pill">RUNNING</span>
+          <span class="live-pill">Running</span>
         </div>
         <div class="terminal">
           <div class="terminal-bar" aria-hidden="true"><i></i><i></i><i></i></div>
-          <pre><span class="prompt">$</span> cats login
-<span class="muted">signed in · workspace acme-dev</span>
+          <pre><span class="prompt">$</span> cats create dev
+<span class="muted">Creating persistent RootDisk… ready</span>
 
-<span class="prompt">$</span> cats create dev
-<span class="muted">creating durable RootDisk…</span>
-<span class="muted">starting guest… ready</span>
+<span class="prompt">$</span> cats exec dev -- apt install -y ripgrep
+<span class="muted">as root, on unmodified ext4</span>
 
-<span class="prompt">$</span> cats exec dev -- git status
-On branch main
-nothing to commit, working tree clean
+<span class="warm">work leases reached zero → suspended · process state kept</span>
 
-<span class="warm">idle → suspended · work preserved</span></pre>
+<span class="prompt">$</span> cats exec dev -- rg TODO src/
+<span class="muted">woken · same process, same disk</span>
+src/main.rs:42: // TODO: converge the retry policy</pre>
         </div>
         <div class="state-strip" aria-label="Lifecycle states">
           <div><small>Active</small><strong>Running</strong></div>
-          <div><small>Fast wake</small><strong>Suspended</strong></div>
-          <div><small>Local snapshot</small><strong>Warm</strong></div>
-          <div><small>Zero compute</small><strong>Cold</strong></div>
+          <div><small>Process kept</small><strong>Suspended</strong></div>
+          <div><small>Zero resident</small><strong>Warm</strong></div>
+          <div><small>Host-free</small><strong>Cold</strong></div>
         </div>
-      </div>
-    </div>
-  </section>
-
-  <section class="band white" id="product">
-    <div class="content-shell">
-      <div class="section-heading"><span class="eyebrow">One durable environment</span><h2>Keep the machine. Release the compute.</h2><p>A Cat is a long-lived Linux microVM, not a disposable container session. Its name and disk outlive any one host.</p></div>
-      <div class="feature-grid">
-        <article class="feature-card dark"><span class="feature-icon">⌁</span><h3>A real Linux boundary</h3><p>Run an independent kernel in KVM, install normal packages, and use an unmodified ext4 filesystem. The Guest never receives platform storage credentials.</p></article>
-        <article class="feature-card"><span class="feature-icon">↻</span><h3>Sleep without starting over</h3><p>Running, Suspended, Warm, and Cold are distinct states. Fast host-bound resume is available, and every failed fast restore converges to a clean Cold start.</p></article>
-        <article class="feature-card"><span class="feature-icon">▱</span><h3>Disks that survive hosts</h3><p>Successful FLUSH operations publish to durable remote storage. Local NVMe is a cache, while fencing keeps every PersistentDisk single-writer in V1.</p></article>
-      </div>
-    </div>
-  </section>
-
-  <section class="band" id="lifecycle">
-    <div class="content-shell">
-      <div class="section-heading"><span class="eyebrow">Lifecycle, made explicit</span><h2>Four states. No vague “sleep” mode.</h2><p>Choose the right balance between wake speed, preserved process state, and complete host independence.</p></div>
-      <div class="lifecycle">
-        <article class="life-step"><span class="number">1</span><h3>Running</h3><p>vCPU executes, memory is resident, disks keep publishing durable generations, and endpoints can serve traffic.</p><small>Full compute</small></article>
-        <article class="life-step"><span class="number">2</span><h3>Suspended</h3><p>vCPUs pause and process state stays on the original host. The VMM and host affinity remain for the shortest resume path.</p><small>Process state kept</small></article>
-        <article class="life-step"><span class="number">3</span><h3>Warm</h3><p>The VMM exits after a host-local snapshot. Runtime RSS becomes zero, but restore still uses the original healthy host.</p><small>Local snapshot</small></article>
-        <article class="life-step"><span class="number">4</span><h3>Cold</h3><p>All host runtime resources are released. A new host can boot from the last durable disk generation.</p><small>Host independent</small></article>
       </div>
     </div>
   </section>
 
   <section class="band white" id="durability">
     <div class="content-shell truth-grid">
-      <div class="section-heading"><span class="eyebrow">Durability contract</span><h2>Your disk is the truth. The host is replaceable.</h2><p>Cats keeps the user-facing promise narrow and testable: a successful durable FLUSH survives permanent host loss.</p></div>
+      <div class="section-heading"><span class="eyebrow">Consequence one</span><h2>State has to outlive the process.</h2><p>If it is a machine, turning it off cannot mean losing it. That single requirement shapes the whole storage layer: object storage holds the truth, the local disk is only a cache, and the promise has to be testable.</p></div>
       <div class="truth-list">
-        <div class="truth-item"><span>✓</span><div><strong>Standard block devices</strong><p>The Guest sees virtio block devices and ordinary ext4—never object-store APIs or metadata credentials.</p></div></div>
-        <div class="truth-item"><span>✓</span><div><strong>Small writes stay small</strong><p>The block engine tracks dirty logical chunks. It does not upload an entire sparse virtual disk to commit a small working set.</p></div></div>
-        <div class="truth-item"><span>✓</span><div><strong>Old writers fail closed</strong><p>Every attachment has a fencing epoch. A host that returns after a partition cannot publish over a newer writer.</p></div></div>
-        <div class="truth-item"><span>✓</span><div><strong>PersistentDisk is independent</strong><p>Destroying a Cat removes its RootDisk; a detached PersistentDisk remains available until you explicitly delete it.</p></div></div>
+        <div class="truth-item"><span>✓</span><div><strong>A successful FLUSH survives permanent Host loss</strong><p>A testable promise, not an adjective. It is the oracle for every crash-recovery test we run.</p></div></div>
+        <div class="truth-item"><span>✓</span><div><strong>Local NVMe is a cache you can delete</strong><p>Wipe it entirely and the disk still refills chunk by chunk on read, with a byte-identical file tree.</p></div></div>
+        <div class="truth-item"><span>✓</span><div><strong>Only what changed gets committed</strong><p>Writing a few files does not upload a whole virtual disk. The engine commits the logical chunks that actually changed.</p></div></div>
+        <div class="truth-item"><span>✓</span><div><strong>A PersistentDisk outlives its Cat</strong><p>Change the image, change the shape, delete the Cat — the data stays put and mounts onto the next one. No destroy-and-recreate, no copying files out by hand.</p></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" id="product">
+    <div class="content-shell">
+      <div class="section-heading"><span class="eyebrow">Consequence two</span><h2>So it has to be a real machine.</h2><p>“A container that feels like a VM” holds up in a demo and leaks under real work. We draw the boundary at hardware virtualisation rather than at word choice.</p></div>
+      <div class="feature-grid">
+        <article class="feature-card dark"><span class="feature-icon">⌁</span><h3>Its own kernel, real root</h3><p>KVM and Cloud Hypervisor, one Linux kernel per Cat. <code>apt install</code> just works — no rootless workaround.</p></article>
+        <article class="feature-card"><span class="feature-icon">▱</span><h3>Unmodified ext4</h3><p>The Guest sees a standard virtio block device, not object storage behind FUSE. So git, SQLite and node_modules behave exactly as they do on your laptop — atomic rename included.</p></article>
+        <article class="feature-card"><span class="feature-icon">⊘</span><h3>The Guest never holds platform credentials</h3><p>Object storage, the metadata store and leases are all platform internals. Nothing running inside the Guest can reach them.</p></article>
+      </div>
+    </div>
+  </section>
+
+  <section class="band white" id="lifecycle">
+    <div class="content-shell">
+      <div class="section-heading"><span class="eyebrow">Consequence three</span><h2>Stopping is not one thing. It is four.</h2><p>A single vague “sleep” hides three very different trade-offs. We put them on the table: each state says what it keeps, what it releases, and whether it is still tied to the Host it started on.</p></div>
+      <div class="lifecycle">
+        <article class="life-step"><span class="number">1</span><h3>Running</h3><p>vCPUs execute, memory is resident, the disk keeps publishing durable generations, and the Endpoint serves traffic.</p><small>Full compute</small></article>
+        <article class="life-step"><span class="number">2</span><h3>Suspended</h3><p>vCPUs pause and Guest memory is reclaimed into local backing, with process state kept exactly as it was. Buys the shortest path back.</p><small>Process state kept</small></article>
+        <article class="life-step"><span class="number">3</span><h3>Warm</h3><p>A local snapshot lands and the VMM exits: dedicated runtime RSS goes to zero while process state survives. Trades a little wake time for resident memory.</p><small>Zero resident, still stateful</small></article>
+        <article class="life-step"><span class="number">4</span><h3>Cold</h3><p>Every Host-local dependency is released; only the remote disk and control-plane record remain. Any healthy Host can bring it back.</p><small>No Host affinity</small></article>
+      </div>
+      <p class="pricing-note">The ladder only descends, and waking always returns to Running. One hard rule holds it together: <strong>any failed fast recovery must converge to a clean Cold boot</strong> — never a stuck intermediate state. Slower is acceptable; not knowing which state you are in is not.</p>
+    </div>
+  </section>
+
+  <section class="band" id="autosleep">
+    <div class="content-shell truth-grid">
+      <div class="section-heading"><span class="eyebrow">Consequence four</span><h2>The platform should not guess whether you are busy.</h2><p>The industry habit is to infer it from an idle timer, a CPU threshold or network silence. Guess wrong and you either suspend live work or keep paying for an environment nobody is using. We hand that judgement back to your programs.</p></div>
+      <div class="truth-list">
+        <div class="truth-item"><span>✓</span><div><strong>No idle timeout, no CPU threshold</strong><p>A Cat does not sleep after a quiet interval. It tries to suspend <strong>immediately once no work is known to remain</strong>.</p></div></div>
+        <div class="truth-item"><span>✓</span><div><strong>Work is an explicit, arbitrable signal</strong><p>Platform entry points (HTTP, exec, shell) hold a work lease automatically; your own programs can hold one too. Only at zero leases does it sleep.</p></div></div>
+        <div class="truth-item"><span>✓</span><div><strong>The Guest Agent does not decide for you</strong><p>It does not scan <code>/proc</code>, watch load, or guess at process names. A long-running background job either takes a lease or turns auto-suspend off.</p></div></div>
+        <div class="truth-item"><span>✓</span><div><strong>A request wakes it</strong><p>Every Cat gets a stable <code>*.cats.run</code> address bound to its name, not to a Host. Traffic arriving there wakes it — you do not have to call an API first.</p></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band white" id="metering">
+    <div class="content-shell">
+      <div class="section-heading"><span class="eyebrow">Consequence five</span><h2>Pay for what you used, not what you asked for.</h2><p>If the bill follows the shape you requested, then “it can sleep” is only marketing — an idle machine still burns money. So the metering basis has to be measured.</p></div>
+      <div class="feature-grid">
+        <article class="feature-card dark"><span class="feature-icon">◷</span><h3>CPU and memory are both measured</h3><p>CPU from the cgroup's accumulated time, memory from the time integral of <code>memory.current</code>. Configure 4 GiB but keep a 1 GiB resident set and you are billed for 1 GiB.</p></article>
+        <article class="feature-card"><span class="feature-icon">∅</span><h3>No per-request charge</h3><p>There is no invocation line item. A long-lived machine that is accessed occasionally should not get more expensive per visit the rarer those visits are.</p></article>
+        <article class="feature-card"><span class="feature-icon">◔</span><h3>Sleeping costs almost no compute</h3><p>Warm leaves dedicated runtime RSS at zero. That is what makes “it can sleep” save money instead of just naming a state.</p></article>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" id="correctness">
+    <div class="content-shell truth-grid">
+      <div class="section-heading"><span class="eyebrow">Consequence six</span><h2>Prove it is correct before making it fast.</h2><p>Storage and lifecycle bugs are usually silent — you do not notice them, you discover months later that the data is wrong. So we pin the semantics and leave reproducible evidence first, and optimise the path second.</p></div>
+      <div class="truth-list">
+        <div class="truth-item"><span>✓</span><div><strong>Stale writers fail closed</strong><p>Every attachment carries a fencing epoch, so a Host that returns after a partition cannot overwrite the current writer. That one has crash-injection tests behind it, not just design intent.</p></div></div>
+        <div class="truth-item"><span>✓</span><div><strong>A different data path, not different semantics</strong><p>The block frontend only adapts a protocol. Whichever path a Cat runs on, the commit protocol, dirty tracking, leases and crash recovery are identical, and both share one correctness suite.</p></div></div>
+        <div class="truth-item"><span>✓</span><div><strong>Wake storms queue instead of collapsing</strong><p>Concurrent wakes are admitted against a node budget accounted in the memory bytes they must read back. Excess wakes wait rather than being rejected into a full cold boot.</p></div></div>
+        <div class="truth-item"><span>✓</span><div><strong>We publish measurement boundaries</strong><p>Every performance number in our docs carries its sample count, hardware and measurement boundary. A prototype measurement never becomes a production promise — you get to judge whether it applies to your workload.</p></div></div>
       </div>
     </div>
   </section>
 
   <section class="band pricing-band" id="pricing">
     <div class="content-shell">
-      <div class="section-heading pricing-heading"><span class="eyebrow">Simple prepaid pricing</span><h2>Pay for compute by the hour. Start with $10 on us.</h2><p>Every new user receives a one-time $10 promotional credit on their Personal Account. No subscription and no seat fee—add prepaid funds securely with Stripe when you need more.</p></div>
+      <div class="section-heading pricing-heading"><span class="eyebrow">Pricing is the same consequence</span><h2>Hourly compute, with $10 to start.</h2><p>No subscription, no seats, no per-request fee. Every new user's Personal Account receives a one-time $10 credit; top up securely through Stripe when the balance runs low.</p></div>
       <div class="pricing-grid">
-        <article class="price-card featured"><span class="price-kicker">CPU</span><div class="price-value"><strong>$0.07</strong><span>/ CPU-hour</span></div><p>Charged from cumulative cgroup CPU time with exact integer rating.</p></article>
-        <article class="price-card"><span class="price-kicker">Memory</span><div class="price-value"><strong>$0.045</strong><span>/ GiB-hour</span></div><p>Charged from memory usage integrated over time. One GiB is 2³⁰ bytes.</p></article>
-        <article class="price-card credit-card"><span class="price-kicker">NEW ACCOUNT CREDIT</span><div class="price-value"><strong>$10</strong><span>free credit</span></div><p>Applied once to the new user's Personal Billing Account; creating Organizations or Workspaces does not repeat it. Your console shows near-real-time usage, remaining credit, and Cat-level detail.</p><a class="button-link primary" href="/user/">Start with $10 <span aria-hidden="true">→</span></a></article>
+        <article class="price-card featured"><span class="price-kicker">CPU</span><div class="price-value"><strong>$0.07</strong><span>/ CPU-hour</span></div><p>Sampled from accumulated cgroup CPU time and priced in exact integers — not from the core count you requested.</p></article>
+        <article class="price-card"><span class="price-kicker">Memory</span><div class="price-value"><strong>$0.045</strong><span>/ GiB-hour</span></div><p>Billed on the time integral of actual memory use — not the size you configured. One GiB is 2³⁰ bytes.</p></article>
+        <article class="price-card credit-card"><span class="price-kicker">New account credit</span><div class="price-value"><strong>$10</strong><span>free to start</span></div><p>Granted once to a new user's Personal Billing Account; creating an Organization or Workspace does not grant it again. The console shows near-real-time usage, balance and per-Cat detail.</p><a class="button-link primary" href="/user/">Claim $10 and start <span aria-hidden="true">→</span></a></article>
       </div>
-      <p class="pricing-note">Open-period totals are provisional until usage settles. Suspended and Warm remain distinct lifecycle states; prices above cover the currently published CPU and memory meters.</p>
+      <p class="pricing-note">Amounts are provisional during an open period and settle once usage data is stable. Suspended and Warm remain distinct lifecycle states; the above covers the CPU and memory line items published today.</p>
     </div>
   </section>
 
   <div class="content-shell cta">
-    <div class="cta-grid"><div><h2>Start with one Cat.</h2><p>Follow the quickstart, create a durable workspace, run a command, and understand exactly what happens when it sleeps.</p></div><a class="button-link primary" href="/docs/getting-started/">Get started <span aria-hidden="true">→</span></a></div>
+    <div class="cta-grid"><div><h2>Start with one Cat.</h2><p>Create a persistent workspace, install something, let it sleep for a while, then come back and see whether it is still where you left it.</p></div><a class="button-link primary" href="/docs/getting-started/">Get started <span aria-hidden="true">→</span></a></div>
   </div>
 </main>
