@@ -7,7 +7,9 @@ Wants=cats-controld.service
 Environment=CATS_GUEST_NETWORK_CIDR=10.240.0.0/16
 EnvironmentFile=/etc/cats/cats.env
 # Root is required for /dev/kvm, kernel NBD attach and tap devices (Phase A;
-# privilege separation is a hardening milestone).
+# privilege separation is a hardening milestone). The nbd module is loaded
+# unconditionally so switching CATS_BLOCK_PATH_ARGS back to kernel-nbd needs no
+# reprovisioning; the vhost-user path simply never uses it.
 ExecStartPre=/usr/sbin/modprobe nbd nbds_max=64
 ExecStartPre=/opt/cats/bin/setup-guest-network
 ExecStart=/opt/cats/bin/cats-noded \
@@ -25,6 +27,7 @@ ExecStart=/opt/cats/bin/cats-noded \
   --ch-cmdline "console=ttyS0 root=/dev/vda rw" \
   --ch-network-cidr $CATS_GUEST_NETWORK_CIDR \
   --ch-seed-image /opt/cats/guest/rootfs.ext4 \
+  $CATS_BLOCK_PATH_ARGS \
   $CATS_METADATA_STORE_ARGS \
   $CATS_OBJECT_STORE_ARGS
 Restart=always
