@@ -76,7 +76,7 @@ src/main.rs:42: // TODO: 收敛重试策略</pre>
         <article class="life-step"><span class="number">3</span><h3>Warm</h3><p>本地快照落盘后 VMM 退出，专属运行时 RSS 归零，进程状态仍在。用一点唤醒时间换掉常驻内存。</p><small>零驻留，仍保进程</small></article>
         <article class="life-step"><span class="number">4</span><h3>Cold</h3><p>释放全部 Host 本地依赖，只剩远端磁盘与控制面记录。任何一台健康 Host 都能把它拉起来。</p><small>不再绑定 Host</small></article>
       </div>
-      <p class="pricing-note">四态单向降级，唤醒总是回到 Running。还有一条硬规则：<strong>任何快速恢复失败都必须收敛到一次干净的 Cold 启动</strong>——不允许卡在中间态。慢一点可以接受，说不清自己在哪个状态不行。</p>
+      <p class="band-note">四态单向降级，唤醒总是回到 Running。还有一条硬规则：<strong>任何快速恢复失败都必须收敛到一次干净的 Cold 启动</strong>——不允许卡在中间态。慢一点可以接受，说不清自己在哪个状态不行。</p>
     </div>
   </section>
 

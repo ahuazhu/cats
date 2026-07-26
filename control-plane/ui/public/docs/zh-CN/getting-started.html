@@ -1,7 +1,14 @@
-<h2 id="prerequisites">准备条件</h2>
-<p>当前源码发行版需要 Rust 1.88 或更高版本，并且能访问已运行的 Cats 控制面。构建 CLI 不需要 KVM；运行完整 Cloud Hypervisor 数据路径需要 Linux x86_64、root 权限和 <code>/dev/kvm</code>。</p>
+<h2 id="first-cat">先开一只 Cat（不用装任何东西）</h2>
+<ol>
+  <li>打开 <a href="/user/">控制台</a> 并用 WorkOS 登录。新用户的 Personal Account 会自动获得一次性 $10 赠金。</li>
+  <li>点 <strong>Create Cat</strong>，选规格并确认。Cat 会带一块持久 RootDisk 建出来。</li>
+  <li>在 Cat 详情页用 <strong>Exec</strong> 跑命令，例如 <code>uname -a</code> 或 <code>apt install -y ripgrep</code>。</li>
+</ol>
+<p>这只 Cat 从这一刻起就长期存在了：闲下来自动休眠，被访问时唤醒，磁盘和名字一直都在。</p>
 
-<h2 id="install-cli">构建 CLI</h2>
+<h2 id="install-cli">装 CLI（可选）</h2>
+<p>控制台适合开机器和跑单条命令；日常开发、<code>cats shell</code> 交互式终端和脚本化更适合用 CLI。</p>
+<div class="callout"><strong>目前 CLI 需要自己从源码构建</strong><p>预编译版本会在后续发布。构建需要 Rust 1.88 或更高版本，不需要 KVM。</p></div>
 <pre><code>git clone &lt;your-cats-repository&gt;
 cd cats
 cargo install --path cmd/cats
@@ -10,7 +17,7 @@ cats --help</code></pre>
 
 <h2 id="configure-access">配置访问</h2>
 <p>普通用户通过 WorkOS 登录。CLI 使用 Device Authorization，在浏览器中打开验证页面，并且只把短期 Access Token 与轮换 Refresh Credential 存进操作系统凭据存储。Cats 不再接受普通用户的静态 Project Token。</p>
-<pre><code>export CATS_API_URL='http://127.0.0.1:7300'
+<pre><code>export CATS_API_URL='https://cats.run'
 cats login
 cats whoami
 cats workspace list

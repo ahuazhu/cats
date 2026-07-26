@@ -1,10 +1,10 @@
-**文档默认公开**
+Cats 给你一台长期存在的 Linux microVM：有自己的内核、自己的持久磁盘和固定域名。计算可以停，磁盘、名字和地址继续存在。
 
-查阅产品与使用文档不需要 Cats 会话。控制台与资源 API 仍然执行各自的身份认证和权限边界。
+**不需要装任何东西就能开始**——在控制台建一只 Cat 就能用。
 
 ## 选择阅读路径
 
-<a href="/zh-CN/docs/getting-started/" class="doc-card"><strong>快速入门</strong>构建 CLI、配置访问、创建 Cat 并执行第一条命令。</a> <a href="/zh-CN/docs/cats-lifecycle/" class="doc-card"><strong>Cat 与生命周期</strong>理解 Running、Suspended、Warm、Cold、唤醒与删除。</a> <a href="/zh-CN/docs/storage-disks/" class="doc-card"><strong>存储与磁盘</strong>使用 RootDisk、PersistentDisk、快照、扩容、挂载和 durable FLUSH。</a> <a href="/zh-CN/docs/endpoints/" class="doc-card"><strong>Endpoint</strong>发布 Guest 端口、选择唤醒策略并了解当前网络能力边界。</a> <a href="/zh-CN/docs/cli-reference/" class="doc-card"><strong>CLI 参考</strong>全部命令、全局选项、输出模式与自动化行为。</a> <a href="/zh-CN/docs/api-reference/" class="doc-card"><strong>HTTP API 参考</strong>路由、身份权限、幂等、请求 Body、Operation 与错误。</a> <a href="/zh-CN/docs/runtime-api/" class="doc-card"><strong>Guest Runtime API</strong>通过 Guest 本地 Unix socket 上的 HTTP 阻止工作驱动休眠。</a> <a href="/zh-CN/docs/console-workspaces/" class="doc-card"><strong>控制台与身份</strong>WorkOS 浏览器/Device 登录、工作区、会话与语言设置。</a> <a href="/zh-CN/docs/operations-troubleshooting/" class="doc-card"><strong>Operation 与故障排查</strong>跟踪异步任务、理解错误并处理常见故障。</a>
+<a href="/zh-CN/docs/getting-started/" class="doc-card"><strong>快速入门</strong>在控制台开出第一只 Cat，再按需装 CLI。</a> <a href="/zh-CN/docs/cats-lifecycle/" class="doc-card"><strong>Cat 与生命周期</strong>理解 Running、Suspended、Warm、Cold、唤醒与删除。</a> <a href="/zh-CN/docs/storage-disks/" class="doc-card"><strong>存储与磁盘</strong>使用 RootDisk、PersistentDisk、快照、扩容、挂载和 durable FLUSH。</a> <a href="/zh-CN/docs/endpoints/" class="doc-card"><strong>Endpoint</strong>发布 Guest 端口、选择唤醒策略并了解当前网络能力边界。</a> <a href="/zh-CN/docs/cli-reference/" class="doc-card"><strong>CLI 参考</strong>全部命令、全局选项、输出模式与自动化行为。</a> <a href="/zh-CN/docs/api-reference/" class="doc-card"><strong>HTTP API 参考</strong>路由、身份权限、幂等、请求 Body、Operation 与错误。</a> <a href="/zh-CN/docs/runtime-api/" class="doc-card"><strong>Guest Runtime API</strong>通过 Guest 本地 Unix socket 上的 HTTP 阻止工作驱动休眠。</a> <a href="/zh-CN/docs/console-workspaces/" class="doc-card"><strong>控制台与身份</strong>WorkOS 浏览器/Device 登录、工作区、会话与语言设置。</a> <a href="/zh-CN/docs/operations-troubleshooting/" class="doc-card"><strong>Operation 与故障排查</strong>跟踪异步任务、理解错误并处理常见故障。</a>
 
 ## 产品模型
 
@@ -15,21 +15,22 @@
 - **Endpoint** 将稳定域名映射到一个 Guest 端口，并可唤醒休眠中的 Cat。
 - **Operation** 记录每一次异步变更及其最终结构化错误。
 
-## 当前 V1 开发形态
+## 当前能力边界
 
-Rust workspace 已实现控制面、CLI、嵌入式用户/管理员控制台、Node 与 Guest Agent、Endpoint 网关契约、ChunkStore 引擎、云厂商无关存储 Adapter，以及 Cloud Hypervisor Phase-A 路径。评估或运行当前源码版本时必须了解以下限制：
+Cats 正在快速演进。下面是今天你会真实碰到的边界：
 
-| 领域 | 当前状态 | 实际含义 |
-|----|----|----|
-| 块设备前端 | 默认内核 NBD，可选原生 vhost-user-blk | 两种前端驱动同一个引擎与同一套提交协议。vhost-user-blk（`--ch-block-path vhost-user`）已通过协议级验收，但尚未做真机（KVM）验收，因此默认仍是内核 NBD。 |
-| Guest 网络 | tap/overlay 尚未实现 | Endpoint 路由已覆盖 FakeVmm 开发路径，不能宣称 CH Guest 网络已经完整。 |
-| 并发唤醒 | 按节点预算限流 | Suspended/Warm 唤醒按 resume commitment 字节数计入节点预算，超出的唤醒排队而非失败。默认值取 2026-07-21 实验验证点（10 并发），不是已证明的最优值。 |
-| 控制元数据 | SQLite 开发存储 | 存储元数据 PostgreSQL adapter 已存在，但 Project 资源存储仍是 SQLite 开发形态。 |
-| 权限隔离 | 尚未实现 | 只能在适当隔离的环境中运行开发组件。 |
+| 能力 | 现状 |
+|----|----|
+| Endpoint 协议 | 支持 HTTP/1.1，由区域 Edge 终止 HTTPS。**WebSocket 入站尚未支持。** |
+| Guest 出站网络 | 每只 Cat 有独立网络与出站访问，敏感目标被阻断。跨 Node 的 Guest 私网互通尚未提供。 |
+| PersistentDisk | 同一时刻只能挂给一只 Cat 读写，且只支持扩容、不支持缩容。 |
+| 快照 | 可以创建快照；列出与恢复的便捷命令尚未提供，目前需要走 HTTP API。 |
+| 唤醒并发 | 同一节点上同时唤醒的 Cat 数量有上限。超出时唤醒会**排队而不是失败**——高峰期唤醒可能变慢。 |
+| 交互式终端 | `cats shell` 需要 CLI；控制台目前提供单条命令执行，没有常驻终端。 |
 
 **性能数字是实验依据，不是 SLA**
 
-仓库内的基准保留了样本数、环境、测量边界和正确性判据。绝不能把原型测量直接升级为生产承诺。
+我们公布的每个性能数字都带样本数、硬件和测量口径。原型上测到的数不会被写成生产承诺——请按你自己的负载判断适用性。
 
 ## 文档约定
 

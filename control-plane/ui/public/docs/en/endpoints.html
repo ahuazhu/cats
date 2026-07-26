@@ -25,8 +25,9 @@ cats endpoint ls dev</code></pre>
 <h2 id="protocols">Protocols and routing safety</h2>
 <p>The implemented path supports HTTP/1.1 with HTTPS termination at the regional edge. It preserves method, path/query, application headers, response status, and request/response bodies. The owning node revalidates Cat ownership and Running state; an old cached route fails closed instead of reaching a different Guest. WebSocket support is a later milestone.</p>
 
-<h2 id="current-availability">Current source availability</h2>
-<div class="callout"><strong>Cloud Hypervisor HTTP ingress is available</strong><p>The Endpoint API, route binding, wake flow, per-Cat <code>/30</code> tap, and owning-node HTTP proxy are implemented. Cross-node Guest overlay networking and WebSocket proxying are not yet implemented.</p></div>
+<h2 id="availability">Where this stands today</h2>
+<p>HTTP ingress works: Endpoint addresses, route binding and wake-on-request are all in place.</p>
+<p>Not yet available: <strong>inbound WebSocket</strong>, and <strong>private Guest-to-Guest networking across nodes</strong>.</p></div>
 
 <h2 id="guest-service">Prepare the Guest service</h2>
 <ol>

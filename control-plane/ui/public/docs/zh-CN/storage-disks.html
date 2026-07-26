@@ -27,7 +27,7 @@ cats unmount project-data</code></pre>
 
 <h2 id="snapshot">创建快照</h2>
 <pre><code>cats disk snapshot project-data</code></pre>
-<p>控制面先建立 durable barrier，再记录不可变 Root 与 generation。当前 CLI 会创建并打印 Snapshot 响应；此源码 CLI 尚未提供快照列表/Restore 的便利命令。</p>
+<p>控制面先建立 durable barrier，再记录不可变 Root 与 generation。CLI 会创建并打印 Snapshot 响应；列出与恢复快照的便捷命令尚未提供，目前需要走 HTTP API。</p>
 
 <h2 id="durability">持久性与缓存语义</h2>
 <p>Guest 只看到标准 virtio 块设备。普通写入可以完成于受控本地缓存，但 FLUSH/FUA 成功必须等待不可变对象持久化并完成权威 Root CAS。此后本地 NVMe 只是可删除缓存。</p>

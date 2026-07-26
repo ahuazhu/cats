@@ -1,8 +1,9 @@
-<div class="callout"><strong>文档默认公开</strong><p>查阅产品与使用文档不需要 Cats 会话。控制台与资源 API 仍然执行各自的身份认证和权限边界。</p></div>
+<p>Cats 给你一台长期存在的 Linux microVM：有自己的内核、自己的持久磁盘和固定域名。计算可以停，磁盘、名字和地址继续存在。</p>
+<p><strong>不需要装任何东西就能开始</strong>——在控制台建一只 Cat 就能用。</p>
 
 <h2 id="choose-a-path">选择阅读路径</h2>
 <div class="doc-grid">
-  <a class="doc-card" href="/zh-CN/docs/getting-started/"><strong>快速入门</strong><span>构建 CLI、配置访问、创建 Cat 并执行第一条命令。</span></a>
+  <a class="doc-card" href="/zh-CN/docs/getting-started/"><strong>快速入门</strong><span>在控制台开出第一只 Cat，再按需装 CLI。</span></a>
   <a class="doc-card" href="/zh-CN/docs/cats-lifecycle/"><strong>Cat 与生命周期</strong><span>理解 Running、Suspended、Warm、Cold、唤醒与删除。</span></a>
   <a class="doc-card" href="/zh-CN/docs/storage-disks/"><strong>存储与磁盘</strong><span>使用 RootDisk、PersistentDisk、快照、扩容、挂载和 durable FLUSH。</span></a>
   <a class="doc-card" href="/zh-CN/docs/endpoints/"><strong>Endpoint</strong><span>发布 Guest 端口、选择唤醒策略并了解当前网络能力边界。</span></a>
@@ -22,16 +23,17 @@
   <li><strong>Operation</strong> 记录每一次异步变更及其最终结构化错误。</li>
 </ul>
 
-<h2 id="current-scope">当前 V1 开发形态</h2>
-<p>Rust workspace 已实现控制面、CLI、嵌入式用户/管理员控制台、Node 与 Guest Agent、Endpoint 网关契约、ChunkStore 引擎、云厂商无关存储 Adapter，以及 Cloud Hypervisor Phase-A 路径。评估或运行当前源码版本时必须了解以下限制：</p>
-<table><thead><tr><th>领域</th><th>当前状态</th><th>实际含义</th></tr></thead><tbody>
-  <tr><td>块设备前端</td><td>默认内核 NBD，可选原生 vhost-user-blk</td><td>两种前端驱动同一个引擎与同一套提交协议。vhost-user-blk（<code>--ch-block-path vhost-user</code>）已通过协议级验收，但尚未做真机（KVM）验收，因此默认仍是内核 NBD。</td></tr>
-  <tr><td>Guest 网络</td><td>tap/overlay 尚未实现</td><td>Endpoint 路由已覆盖 FakeVmm 开发路径，不能宣称 CH Guest 网络已经完整。</td></tr>
-  <tr><td>并发唤醒</td><td>按节点预算限流</td><td>Suspended/Warm 唤醒按 resume commitment 字节数计入节点预算，超出的唤醒排队而非失败。默认值取 2026-07-21 实验验证点（10 并发），不是已证明的最优值。</td></tr>
-  <tr><td>控制元数据</td><td>SQLite 开发存储</td><td>存储元数据 PostgreSQL adapter 已存在，但 Project 资源存储仍是 SQLite 开发形态。</td></tr>
-  <tr><td>权限隔离</td><td>尚未实现</td><td>只能在适当隔离的环境中运行开发组件。</td></tr>
+<h2 id="current-scope">当前能力边界</h2>
+<p>Cats 正在快速演进。下面是今天你会真实碰到的边界：</p>
+<table><thead><tr><th>能力</th><th>现状</th></tr></thead><tbody>
+  <tr><td>Endpoint 协议</td><td>支持 HTTP/1.1，由区域 Edge 终止 HTTPS。<strong>WebSocket 入站尚未支持。</strong></td></tr>
+  <tr><td>Guest 出站网络</td><td>每只 Cat 有独立网络与出站访问，敏感目标被阻断。跨 Node 的 Guest 私网互通尚未提供。</td></tr>
+  <tr><td>PersistentDisk</td><td>同一时刻只能挂给一只 Cat 读写，且只支持扩容、不支持缩容。</td></tr>
+  <tr><td>快照</td><td>可以创建快照；列出与恢复的便捷命令尚未提供，目前需要走 HTTP API。</td></tr>
+  <tr><td>唤醒并发</td><td>同一节点上同时唤醒的 Cat 数量有上限。超出时唤醒会<strong>排队而不是失败</strong>——高峰期唤醒可能变慢。</td></tr>
+  <tr><td>交互式终端</td><td><code>cats shell</code> 需要 CLI；控制台目前提供单条命令执行，没有常驻终端。</td></tr>
 </tbody></table>
-<div class="callout warning"><strong>性能数字是实验依据，不是 SLA</strong><p>仓库内的基准保留了样本数、环境、测量边界和正确性判据。绝不能把原型测量直接升级为生产承诺。</p></div>
+<div class="callout warning"><strong>性能数字是实验依据，不是 SLA</strong><p>我们公布的每个性能数字都带样本数、硬件和测量口径。原型上测到的数不会被写成生产承诺——请按你自己的负载判断适用性。</p></div>
 
 <h2 id="conventions">文档约定</h2>
 <p>示例使用 <code>cats login</code> 选中的 Workspace 与名为 <code>dev</code> 的 Cat。请按部署替换。容量支持 <code>512MiB</code>、<code>8GiB</code> 等二进制后缀。</p>

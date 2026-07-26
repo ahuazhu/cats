@@ -32,11 +32,11 @@
 
 当前实现支持 HTTP/1.1，并由区域 Edge 终止 HTTPS；method、path/query、应用 headers、响应状态和请求/响应 body 都会保留。Owning Node 会重新校验 Cat ownership 与 Running 状态；旧 Route Cache 必须 fail closed，不能到达另一个 Guest。WebSocket 属于后续里程碑。
 
-## 当前源码可用性
+## 现在支持到哪
 
-**Cloud Hypervisor HTTP 入站已可用**
+HTTP 入站已经可用：Endpoint 地址、路由绑定和按请求唤醒都能正常工作。
 
-Endpoint API、Route Binding、唤醒流程、每 Cat `/30` tap 与 Owning Node HTTP 代理均已实现。跨 Node Guest overlay 和 WebSocket 代理尚未实现。
+尚未提供：**WebSocket 入站**，以及**跨 Node 的 Guest 私网互通**。
 
 ## 准备 Guest 服务
 
