@@ -1,73 +1,102 @@
-Durable cloud workspaces
+One design choice
 
-# Your Linux workspace, *ready when you are.*
+# Most sandboxes are a task. *A Cat is a machine.*
 
-Cats gives every workspace a real Linux microVM with durable disks and a stable identity. Work at full speed, let it sleep when idle, and wake it without rebuilding your environment.
+That is not a turn of phrase. Treat the environment as a task and state becomes a by-product, stopping means discarding, and the bill follows what you requested. Treat it as a machine and all three invert. Everything below is a consequence of that one choice, not a feature list.
 
-<a href="/user/" class="button-link primary">Open console →</a> <a href="/docs/getting-started/" class="button-link secondary">Read the quickstart</a>
+<a href="/user/" class="button-link primary">Open the console →</a> <a href="/docs/getting-started/" class="button-link secondary">Read the quickstart</a>
 
-True pay-as-you-go Durable data by default Linux ready on demand
+State outlives the process The Guest is a real machine You pay for what you used
 
 ![](/assets/cats-mark.svg)**dev-workspace**ubuntu-24.04 · 2 CPU · 2 GiB
 
-RUNNING
-
-    $ cats login
-    signed in · workspace acme-dev
+Running
 
     $ cats create dev
-    creating durable RootDisk…
-    starting guest… ready
+    Creating persistent RootDisk… ready
 
-    $ cats exec dev -- git status
-    On branch main
-    nothing to commit, working tree clean
+    $ cats exec dev -- apt install -y ripgrep
+    as root, on unmodified ext4
 
-    idle → suspended · work preserved
+    work leases reached zero → suspended · process state kept
+
+    $ cats exec dev -- rg TODO src/
+    woken · same process, same disk
+    src/main.rs:42: // TODO: converge the retry policy
 
 Active**Running**
 
-Fast wake**Suspended**
+Process kept**Suspended**
 
-Local snapshot**Warm**
+Zero resident**Warm**
 
-Zero compute**Cold**
+Host-free**Cold**
 
-One durable environment
+Consequence one
 
-## Keep the machine. Release the compute.
+## State has to outlive the process.
 
-A Cat is a long-lived Linux microVM, not a disposable container session. Its name and disk outlive any one host.
+If it is a machine, turning it off cannot mean losing it. That single requirement shapes the whole storage layer: object storage holds the truth, the local disk is only a cache, and the promise has to be testable.
+
+✓
+
+**A successful FLUSH survives permanent Host loss**
+
+A testable promise, not an adjective. It is the oracle for every crash-recovery test we run.
+
+✓
+
+**Local NVMe is a cache you can delete**
+
+Wipe it entirely and the disk still refills chunk by chunk on read, with a byte-identical file tree.
+
+✓
+
+**Only what changed gets committed**
+
+Writing a few files does not upload a whole virtual disk. The engine commits the logical chunks that actually changed.
+
+✓
+
+**A PersistentDisk outlives its Cat**
+
+Change the image, change the shape, delete the Cat — the data stays put and mounts onto the next one. No destroy-and-recreate, no copying files out by hand.
+
+Consequence two
+
+## So it has to be a real machine.
+
+“A container that feels like a VM” holds up in a demo and leaks under real work. We draw the boundary at hardware virtualisation rather than at word choice.
 
 ⌁
 
-### A real Linux boundary
+### Its own kernel, real root
 
-Run an independent kernel in KVM, install normal packages, and use an unmodified ext4 filesystem. The Guest never receives platform storage credentials.
-
-↻
-
-### Sleep without starting over
-
-Running, Suspended, Warm, and Cold are distinct states. Fast host-bound resume is available, and every failed fast restore converges to a clean Cold start.
+KVM and Cloud Hypervisor, one Linux kernel per Cat. `apt install` just works — no rootless workaround.
 
 ▱
 
-### Disks that survive hosts
+### Unmodified ext4
 
-Successful FLUSH operations publish to durable remote storage. Local NVMe is a cache, while fencing keeps every PersistentDisk single-writer in V1.
+The Guest sees a standard virtio block device, not object storage behind FUSE. So git, SQLite and node\_modules behave exactly as they do on your laptop — atomic rename included.
 
-Lifecycle, made explicit
+⊘
 
-## Four states. No vague “sleep” mode.
+### The Guest never holds platform credentials
 
-Choose the right balance between wake speed, preserved process state, and complete host independence.
+Object storage, the metadata store and leases are all platform internals. Nothing running inside the Guest can reach them.
+
+Consequence three
+
+## Stopping is not one thing. It is four.
+
+A single vague “sleep” hides three very different trade-offs. We put them on the table: each state says what it keeps, what it releases, and whether it is still tied to the Host it started on.
 
 1
 
 ### Running
 
-vCPU executes, memory is resident, disks keep publishing durable generations, and endpoints can serve traffic.
+vCPUs execute, memory is resident, the disk keeps publishing durable generations, and the Endpoint serves traffic.
 
 Full compute
 
@@ -75,7 +104,7 @@ Full compute
 
 ### Suspended
 
-vCPUs pause and process state stays on the original host. The VMM and host affinity remain for the shortest resume path.
+vCPUs pause and Guest memory is reclaimed into local backing, with process state kept exactly as it was. Buys the shortest path back.
 
 Process state kept
 
@@ -83,70 +112,134 @@ Process state kept
 
 ### Warm
 
-The VMM exits after a host-local snapshot. Runtime RSS becomes zero, but restore still uses the original healthy host.
+A local snapshot lands and the VMM exits: dedicated runtime RSS goes to zero while process state survives. Trades a little wake time for resident memory.
 
-Local snapshot
+Zero resident, still stateful
 
 4
 
 ### Cold
 
-All host runtime resources are released. A new host can boot from the last durable disk generation.
+Every Host-local dependency is released; only the remote disk and control-plane record remain. Any healthy Host can bring it back.
 
-Host independent
+No Host affinity
 
-Durability contract
+The ladder only descends, and waking always returns to Running. One hard rule holds it together: **any failed fast recovery must converge to a clean Cold boot** — never a stuck intermediate state. Slower is acceptable; not knowing which state you are in is not.
 
-## Your disk is the truth. The host is replaceable.
+Consequence four
 
-Cats keeps the user-facing promise narrow and testable: a successful durable FLUSH survives permanent host loss.
+## The platform should not guess whether you are busy.
 
-✓
-
-**Standard block devices**
-
-The Guest sees virtio block devices and ordinary ext4—never object-store APIs or metadata credentials.
+The industry habit is to infer it from an idle timer, a CPU threshold or network silence. Guess wrong and you either suspend live work or keep paying for an environment nobody is using. We hand that judgement back to your programs.
 
 ✓
 
-**Small writes stay small**
+**No idle timeout, no CPU threshold**
 
-The block engine tracks dirty logical chunks. It does not upload an entire sparse virtual disk to commit a small working set.
-
-✓
-
-**Old writers fail closed**
-
-Every attachment has a fencing epoch. A host that returns after a partition cannot publish over a newer writer.
+A Cat does not sleep after a quiet interval. It tries to suspend **immediately once no work is known to remain**.
 
 ✓
 
-**PersistentDisk is independent**
+**Work is an explicit, arbitrable signal**
 
-Destroying a Cat removes its RootDisk; a detached PersistentDisk remains available until you explicitly delete it.
+Platform entry points (HTTP, exec, shell) hold a work lease automatically; your own programs can hold one too. Only at zero leases does it sleep.
 
-Simple prepaid pricing
+✓
 
-## Pay for compute by the hour. Start with $10 on us.
+**The Guest Agent does not decide for you**
 
-Every new user receives a one-time $10 promotional credit on their Personal Account. No subscription and no seat fee—add prepaid funds securely with Stripe when you need more.
+It does not scan `/proc`, watch load, or guess at process names. A long-running background job either takes a lease or turns auto-suspend off.
 
-### CPU — $0.07 / CPU-hour
+✓
 
-Charged from cumulative cgroup CPU time with exact integer rating.
+**A request wakes it**
 
-### Memory — $0.045 / GiB-hour
+Every Cat gets a stable `*.cats.run` address bound to its name, not to a Host. Traffic arriving there wakes it — you do not have to call an API first.
 
-Charged from memory usage integrated over time. One GiB is 2³⁰ bytes.
+Consequence five
 
-### New account credit — $10
+## Pay for what you used, not what you asked for.
 
-Applied once to the new user's Personal Billing Account; creating Organizations or Workspaces does not repeat it. The console shows near-real-time usage, remaining credit, and Cat-level detail.
+If the bill follows the shape you requested, then “it can sleep” is only marketing — an idle machine still burns money. So the metering basis has to be measured.
 
-Open-period totals are provisional until usage settles. Prices above cover the currently published CPU and memory meters.
+◷
+
+### CPU and memory are both measured
+
+CPU from the cgroup's accumulated time, memory from the time integral of `memory.current`. Configure 4 GiB but keep a 1 GiB resident set and you are billed for 1 GiB.
+
+∅
+
+### No per-request charge
+
+There is no invocation line item. A long-lived machine that is accessed occasionally should not get more expensive per visit the rarer those visits are.
+
+◔
+
+### Sleeping costs almost no compute
+
+Warm leaves dedicated runtime RSS at zero. That is what makes “it can sleep” save money instead of just naming a state.
+
+Consequence six
+
+## Prove it is correct before making it fast.
+
+Storage and lifecycle bugs are usually silent — you do not notice them, you discover months later that the data is wrong. So we pin the semantics and leave reproducible evidence first, and optimise the path second.
+
+✓
+
+**Stale writers fail closed**
+
+Every attachment carries a fencing epoch, so a Host that returns after a partition cannot overwrite the current writer. That one has crash-injection tests behind it, not just design intent.
+
+✓
+
+**A different data path, not different semantics**
+
+The block frontend only adapts a protocol. Whichever path a Cat runs on, the commit protocol, dirty tracking, leases and crash recovery are identical, and both share one correctness suite.
+
+✓
+
+**Wake storms queue instead of collapsing**
+
+Concurrent wakes are admitted against a node budget accounted in the memory bytes they must read back. Excess wakes wait rather than being rejected into a full cold boot.
+
+✓
+
+**We publish measurement boundaries**
+
+Every performance number in our docs carries its sample count, hardware and measurement boundary. A prototype measurement never becomes a production promise — you get to judge whether it applies to your workload.
+
+Pricing is the same consequence
+
+## Hourly compute, with $10 to start.
+
+No subscription, no seats, no per-request fee. Every new user's Personal Account receives a one-time $10 credit; top up securely through Stripe when the balance runs low.
+
+CPU
+
+**$0.07**/ CPU-hour
+
+Sampled from accumulated cgroup CPU time and priced in exact integers — not from the core count you requested.
+
+Memory
+
+**$0.045**/ GiB-hour
+
+Billed on the time integral of actual memory use — not the size you configured. One GiB is 2³⁰ bytes.
+
+New account credit
+
+**$10**free to start
+
+Granted once to a new user's Personal Billing Account; creating an Organization or Workspace does not grant it again. The console shows near-real-time usage, balance and per-Cat detail.
+
+<a href="/user/" class="button-link primary">Claim $10 and start →</a>
+
+Amounts are provisional during an open period and settle once usage data is stable. Suspended and Warm remain distinct lifecycle states; the above covers the CPU and memory line items published today.
 
 ## Start with one Cat.
 
-Follow the quickstart, create a durable workspace, run a command, and understand exactly what happens when it sleeps.
+Create a persistent workspace, install something, let it sleep for a while, then come back and see whether it is still where you left it.
 
 <a href="/docs/getting-started/" class="button-link primary">Get started →</a>
