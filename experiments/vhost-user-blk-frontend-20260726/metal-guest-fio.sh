@@ -13,7 +13,10 @@ set -uo pipefail
 label=${1:?usage: metal-guest-fio.sh <label>}
 cat_name=${CATS_FIO_CAT:-fio-$label}
 export CATS_API_URL=${CATS_API_URL:-http://127.0.0.1:7300}
-if [ -z "${CATS_TOKEN:-}" ] && [ -r /etc/cats/cats.env ]; then
+if [ -z "${CATS_TOKEN:-}" ]; then
+  # No [ -r ] test: cats.env is root-only 0600, so the test fails for a normal
+  # user even though the read below is sudo. That silently left CATS_TOKEN empty
+  # and every measurement in the run failed with "not logged in".
   CATS_TOKEN=$(sudo sed -n 's/^CATS_ADMIN_TOKEN=//p' /etc/cats/cats.env | tail -1)
   export CATS_TOKEN
 fi

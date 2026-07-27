@@ -8,8 +8,11 @@ CATS=${CATS:-/opt/cats/bin/cats}
 export CATS_API_URL=${CATS_API_URL:-http://127.0.0.1:7300}
 # The CLI requires a bearer token (ADR-0008). Reuse the fleet admin token from
 # the deployment config so an acceptance run needs no interactive `cats login`.
-if [[ -z ${CATS_TOKEN:-} ]] && [[ -r /etc/cats/cats.env ]]; then
-  CATS_TOKEN=$(sed -n 's/^CATS_ADMIN_TOKEN=//p' /etc/cats/cats.env | tail -1)
+if [[ -z ${CATS_TOKEN:-} ]]; then
+  # cats.env is root-only 0600. Reading it needs sudo, and testing [[ -r ]] first
+  # makes the whole thing a no-op for a normal user, which leaves CATS_TOKEN empty
+  # and fails every step with "not logged in".
+  CATS_TOKEN=$(sudo sed -n 's/^CATS_ADMIN_TOKEN=//p' /etc/cats/cats.env 2>/dev/null | tail -1)
   export CATS_TOKEN
 fi
 [[ -n ${CATS_TOKEN:-} ]] || { echo "set CATS_TOKEN (or CATS_ADMIN_TOKEN in /etc/cats/cats.env)" >&2; exit 1; }

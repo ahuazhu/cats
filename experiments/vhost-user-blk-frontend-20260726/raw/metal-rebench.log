@@ -1,0 +1,138 @@
+date_utc: 2026-07-27T08:29:40Z
+instance_type: i4i.metal
+uname: Linux 6.17.0-1019-aws x86_64
+cpus: 128
+memory_kb: 1056630384
+cache_mount: /var/lib/cats on /dev/nvme8n1 (rotational=)
+cache_fs: ext4
+blob_store: object-store-adapter aws-s3
+cloud_hypervisor: cloud-hypervisor v53.0
+rustc: rustc 1.97.1 (8bab26f4f 2026-07-14)
+git: not a git checkout
+
+
+##### commit_cost -- local file object store on /dev/nvme8n1
+
+running 3 tests
+test cold_read_cost_by_delta_chain_length ... 
+ layers          objects chunk-at-a-time ms        MiB/s one big read ms        MiB/s
+      0               16           81.4          786           55.4         1156
+      1               32           80.6          794           50.7         1263
+      2               48           82.0          781           50.7         1263
+      4               80           81.4          787           51.4         1246
+ok
+test flush_cost_for_dense_writes ... 
+dirty chunks  published MiB     flush ms   ms per pub MiB
+           8          32.00        476.7            14.90
+          32         128.00       1956.4            15.28
+          48         192.00       2945.5            15.34
+ok
+test flush_cost_scales_with_the_dirty_set ... 
+dirty chunks  dirty pages  published MiB     flush ms   ms per pub MiB   sha256 MiB/s
+           1            1           0.06         21.6           345.54           1277
+           8            8           0.50         28.9            57.73           1271
+          16           16           1.00         30.0            30.03           1284
+          32           32           2.00         41.6            20.78           1281
+          48           48           3.00         48.0            16.00           1278
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.56s
+
+
+##### golden_root_cost -- local file object store on /dev/nvme8n1
+
+running 3 tests
+test first_read_of_a_referenced_chunk_versus_a_private_one ... 
+        path       cold read ms              MiB/s
+        copy               81.8                783
+   reference               80.5                795
+ok
+test provisioning_many_root_disks_from_one_image ... 
+image 256 MiB, 128 logical cpus
+    cats       path uploaded MiB    objects        wall ms    speedup
+       1       copy       256.01         67         4771.4       1.0x
+       1  reference         0.01          3           36.7     129.9x
+       4       copy      1024.02        268        16616.3       1.0x
+       4  reference         0.04         12           93.8     177.2x
+      10       copy      2560.05        670        45309.1       1.0x
+      10  reference         0.11         30          106.8     424.3x
+ok
+test provisioning_one_root_disk ... 
+ image MiB       path uploaded MiB    objects provision ms    speedup        gen
+        64       copy        64.00         19       1161.9       1.0x          1
+        64  reference         0.00          3         36.0      32.2x          1
+        64  (publish)         once          -        491.8          -          -
+       256       copy       256.01         67       4176.2       1.0x          1
+       256  reference         0.01          3         23.4     178.7x          1
+       256  (publish)         once          -       1888.1          -          -
+       512       copy       512.01        131       8583.3       1.0x          1
+       512  reference         0.02          3         22.5     382.0x          1
+       512  (publish)         once          -       2476.8          -          -
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 187.23s
+
+
+##### commit_cost -- real S3 (s3://cats-bench-20260727f-19334)
+
+running 3 tests
+test cold_read_cost_by_delta_chain_length ... 
+ layers          objects chunk-at-a-time ms        MiB/s one big read ms        MiB/s
+      0               16         1067.7           60          165.9          386
+      1               32          870.8           73          154.2          415
+      2               48          848.9           75          156.2          410
+      4               80          970.2           66          183.6          349
+ok
+test flush_cost_for_dense_writes ... 
+dirty chunks  published MiB     flush ms   ms per pub MiB
+           8          32.00        270.9             8.47
+          32         128.00        763.3             5.96
+          48         192.00       1460.5             7.61
+ok
+test flush_cost_scales_with_the_dirty_set ... 
+dirty chunks  dirty pages  published MiB     flush ms   ms per pub MiB   sha256 MiB/s
+           1            1           0.06        128.0          2048.36           1269
+           8            8           0.50        144.2           288.36            647
+          16           16           1.00        182.1           182.08           1260
+          32           32           2.00        201.3           100.65           1271
+          48           48           3.00        223.4            74.48           1282
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.44s
+
+
+##### golden_root_cost -- real S3 (s3://cats-bench-20260727f-19334)
+
+running 3 tests
+test first_read_of_a_referenced_chunk_versus_a_private_one ... 
+        path       cold read ms              MiB/s
+        copy              899.8                 71
+   reference              872.4                 73
+ok
+test provisioning_many_root_disks_from_one_image ... 
+image 256 MiB, 128 logical cpus
+    cats       path uploaded MiB    objects        wall ms    speedup
+       1       copy       256.01         67         2566.7       1.0x
+       1  reference         0.01          3           98.7      26.0x
+       4       copy      1024.02        268         8925.7       1.0x
+       4  reference         0.04         12          107.7      82.9x
+      10       copy      2560.05        670        21344.0       1.0x
+      10  reference         0.11         30          162.9     131.0x
+ok
+test provisioning_one_root_disk ... 
+ image MiB       path uploaded MiB    objects provision ms    speedup        gen
+        64       copy        64.00         19        584.4       1.0x          1
+        64  reference         0.00          3         86.1       6.8x          1
+        64  (publish)         once          -        302.7          -          -
+       256       copy       256.01         67       2584.4       1.0x          1
+       256  reference         0.01          3         96.6      26.7x          1
+       256  (publish)         once          -        971.7          -          -
+       512       copy       512.01        131       5352.1       1.0x          1
+       512  reference         0.02          3         90.4      59.2x          1
+       512  (publish)         once          -       1364.8          -          -
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 110.88s
+
+
+##### fio kernel-nbd round 1
