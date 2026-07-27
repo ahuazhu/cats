@@ -687,25 +687,51 @@ ADR-0016 把「冷读放大」列为 delta pack 的主要代价(满链一个 chu
 
 同一轮的验收:`metal e2e: 22 passed, 1 failed`,仍是那条 golden rootfs 里没有 `git` 的陈旧断言。
 
+## 默认块路径的 fio 复测:不翻,而且卡点变了(2026-07-27 追加)
+
+[ADR-0015](../../docs/decisions/0015-vhost-user-blk-production-block-frontend.md) 把翻转默认值的
+判据 (a) 定为「delta pack 落地并把提交成本降下来」。**这条已经满足**(真实 S3 上 48 个 dirty chunk
+的 FLUSH 从 1437 ms 降到 211 ms)。当初那组「带缓冲的 NBD 在写上更快」的对比是在 flush-bound 的
+引擎上量的,前提没了,所以重量了一遍。原始数据
+[`raw/metal-blockpath-fio-rerun.log`](raw/metal-blockpath-fio-rerun.log)(i4i.metal + 真 KVM +
+真实 S3,fio 已经打进 golden image,单样本)。
+
+**结论:默认值不翻。**理由不是 delta pack 没效果,而是这组数字**测的是宿主 page cache 不是前端**
+——同一条路径同一轮里自相矛盾:
+
+| kernel-nbd | 结果 | p99 |
+|---|---|---|
+| 4k 随机写 QD32 | 64419 IOPS(251 MiB/s) | 237 µs |
+| 1M 顺序写 | **8.7 MiB/s** | **851 ms** |
+
+同一个设备。前者装得进宿主 page cache,后者持续到必须回写,于是塌了 29 倍、p99 逼近一秒。
+vhost-user 没有这层缓存,数字自洽(4k 随机写 2.4 MiB/s、1M 顺序写 273 MiB/s——顺序 1 MiB 写产生
+密集 chunk,提交起来划算;4 KiB 随机写不是)。
+
+读这边混淆小一些,vhost-user 占优:4k 随机读 QD1 **60735 vs 54729**、QD32 **215097 vs 194971**
+(都约 1.10×),各分位延迟都更低;1M 顺序读 kernel-nbd 2977 vs 2533 MiB/s——还是 page cache。
+
+**真正的卡点**:要做 like-for-like 对比,kernel-nbd 必须以 `direct=on` 打开,而节点代理今天**没有
+这个选项**(PR #8 那次是手工改的)。加上 ADR-0015 还要求一轮多样本 soak,而这里单样本的 p99 跨了
+三个数量级(237 µs 到 2.4 s),单样本定不了。
+
+所以默认值继续是 `kernel-nbd`,但理由换了第三个:不是「没验过」,也不是「已知权衡」,而是
+**「能定这件事的那个测量,需要一个还不存在的 `direct=on` 开关」**。
+
 ## 仍未验证 / 后续项
 
 1. ~~读路径也要并发~~:**已做**,一次读完整卷从 840 ms 降到 155 ms(412 MiB/s),见上一节。
 2. ~~减少每次提交的对象数~~:**评估后不做**,理由与数字见
    [ADR-0016](../../docs/decisions/0016-delta-pack-page-granular-commits.md)「关于打包成一个对象」。
 3. ~~delta 链的冷读放大~~:**已量**,满链只贵 11%,见上一节。
-4. **重新评估默认块路径**(这一轮新解锁的最大一项)。[ADR-0015](../../docs/decisions/0015-vhost-user-blk-production-block-frontend.md)
-   翻转默认值的判据 (a) 是「delta pack 落地并把提交成本降下来」——已经满足(真实 S3 上 48 chunk
-   的 FLUSH 1437 → 211 ms)。但判据 (c)「一轮多样本 soak」没做,而且**当初那组 Guest fio 对比是
-   在 flush-bound 的引擎上量的**:"带缓冲的 NBD 在写上更快"这个结论建立在提交要写 200 MiB 的
-   前提上,那个前提没了。要重跑一遍六种 fio 负载再决定,默认值目前仍是 `kernel-nbd`。
+4. **给 kernel-nbd 路径加一个 `direct=on` 选项**——不加,默认值就没法判。fio 已经重跑了
+   (见下一节),结论是**默认值不翻**,而且卡点很具体:节点代理今天没有办法让 CH 以 `direct=on`
+   打开 `/dev/nbdN`,所以每一行写的数据量的都是宿主 page cache,不是前端。
 5. **单个 create 的 4.5–6.9 秒**:并发拉起解决之后,这就是下一个天花板,成分是 VM 启动
    与 guest agent 就绪,不再是存储或排队。
-6. **没有任何东西调度 GC**:`cats-blockd --collect-garbage` 只能手动跑,节点代理与控制面都不会
-   触发它。同样地,**没有工具能找出「没有卷再引用」的镜像**,而镜像回收本来就是运营方手动操作。
-7. **TRIM / WRITE_ZEROES 只写零,不把 Map 项变成 Hole**(协议 §7),所以 Guest 释放空间不会回收
-   对象。GC 已经能删「Root 够不到的」对象,但够不到的前提是 Map 不再引用它。
-5. ~~GC~~:**已实现**,见[协议 §9](../../docs/specs/blockd-protocol.md)与
-   `cats-blockd --collect-garbage`。镜像本身的回收仍然是运营方显式操作。
+6. ~~没有任何东西调度 GC~~:**已做**,服务期间按 `--gc-interval-ms` 定时跑(默认 10 分钟)。
+   仍然**没有工具能找出「没有卷再引用」的镜像**,镜像回收还是运营方手动操作。
+7. ~~TRIM 不回收对象~~:**已做**,整块覆盖的 chunk 变成 Hole,旧对象随即被 GC 收走(协议 §7.2)。
 8. **多队列在真实 vCPU 数下的收益曲线**:本次只验了 1 和 4 两个点,而且已知队列多不等于更快。
 9. **长时间 soak 与多 Cat 同机压力**:本次每个场景都是单样本,不构成 SLA。这一条同时卡着第 4 项。
 10. **`nbd` 内核模块依赖的移除**:`install.sh` 仍无条件 `modprobe nbd`,以便随时切回默认路径。

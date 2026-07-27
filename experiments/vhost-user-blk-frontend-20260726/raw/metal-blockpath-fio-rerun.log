@@ -1,0 +1,67 @@
+Guest fio, both block paths, re-run after delta packs and concurrent uploads.
+
+host:     AWS i4i.metal, real KVM, Cloud Hypervisor, real in-region S3
+build:    this branch; fio in the golden image, 4 vCPU / 2 GiB Cat, ext4 root,
+          --direct=1, 1 GiB file, 10 s runtime, 2 s ramp, single sample per point
+date_utc: 2026-07-27
+
+Why re-run: ADR-0015 keeps `kernel-nbd` as the default and names its flip
+criterion (a) "delta pack lands and brings commit cost down". It did. But the
+comparison behind "buffered NBD wins on writes" was taken on a flush-bound engine
+that wrote ~200 MiB per commit, and that premise is gone, so the comparison had to
+be taken again.
+
+Configuration is as deployed: the node agent opens /dev/nbdN with direct=off, so
+the kernel-nbd rows have the host page cache in front of them and the vhost-user
+rows do not.
+
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+# kernel-nbd: guest hw queues=1 logical_block_size=512
+kernel-nbd,randread-4k-qd1,randread,4k,1,54729,213.8,13.7,14,20
+kernel-nbd,randwrite-4k-qd1,randwrite,4k,1,158,0.6,6308.1,36,113
+kernel-nbd,randread-4k-qd32,randread,4k,32,194971,761.6,160.8,98,136
+kernel-nbd,randwrite-4k-qd32,randwrite,4k,32,64419,251.7,610.3,111,237
+kernel-nbd,seqread-1m-qd1,read,1M,1,2977,2976.9,282.7,159,234
+kernel-nbd,seqwrite-1m-qd1,write,1M,1,9,8.7,115521.9,502,851444
+# vhost-user: guest hw queues=2 logical_block_size=512
+vhost-user,randread-4k-qd1,randread,4k,1,60735,237.2,12.0,11,18
+vhost-user,randwrite-4k-qd1,randwrite,4k,1,10,0.0,99186.5,63177,295698
+vhost-user,randread-4k-qd32,randread,4k,32,215097,840.2,144.1,97,131
+vhost-user,randwrite-4k-qd32,randwrite,4k,32,602,2.4,64147.5,15532,2365587
+vhost-user,seqread-1m-qd1,read,1M,1,2533,2533.0,343.8,241,289
+vhost-user,seqwrite-1m-qd1,write,1M,1,273,273.4,3497.9,285,1335
+
+--- verdict: the default does NOT flip, and this run says why ---------------
+
+The write rows contradict each other within a single path, which is the tell that
+this is measuring the host page cache and not the frontend:
+
+  kernel-nbd  4k randwrite QD32   64419 IOPS (251 MiB/s)   p99 237 us
+  kernel-nbd  1M seqwrite          8.7 MiB/s               p99 851 ms
+
+Both are the same device on the same run. The first fits in the host page cache,
+the second is sustained enough to have to writeback, and then it collapses by a
+factor of 29 with a near-second p99. vhost-user has no such cache, so its numbers
+are internally consistent (randwrite 2.4 MiB/s, seqwrite 273 MiB/s -- sequential
+1 MiB writes make dense chunks, which commit efficiently; 4 KiB random writes do
+not) and honest.
+
+Reads, where the confound is smaller, favour vhost-user: 4k randread QD1
+60735 vs 54729 IOPS and QD32 215097 vs 194971, both about 1.10x, with lower
+latency at every percentile. Sequential read favours kernel-nbd 2977 vs
+2533 MiB/s, which is the page cache again.
+
+So: criterion (a) is met -- delta packs did bring commit cost down (FLUSH for 48
+dirty chunks is 1437 -> 211 ms on S3 in the same day's run). Criterion (b) and (c)
+are not:
+
+* A like-for-like comparison needs the kernel-nbd path opened with direct=on, and
+  the node agent has no way to configure that today; PR #8 did it by hand. Without
+  it, every write row here is a page-cache measurement.
+* ADR-0015 also requires a multi-sample soak. These are single samples and the
+  p99 spread (237 us to 2.4 s within one table) says the variance is large enough
+  that single samples cannot settle it.
+
+The default therefore stays `kernel-nbd`, now for a third reason distinct from the
+first two: not "unvalidated", not "a measured trade-off", but "the measurement
+that would decide it needs a direct=on option that does not exist yet".

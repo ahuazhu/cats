@@ -74,6 +74,14 @@ ADR-0001 第 3 条把「接入 Cloud Hypervisor vhost-user-blk」列为 V1 里�
 成本降下来,或 (b) 明确接受"用写吞吐换随机读延迟与 Warm 速度"这个权衡并有对应负载证据;
 外加 (c) 一轮多样本 soak。在此之前 vhost-user 是显式选项。
 
+**2026-07-27 复测:判据 (a) 已满足,默认值仍然不翻。**delta pack 确实把提交成本降下来了
+(真实 S3 上 48 个 dirty chunk 的 FLUSH 1437 → 211 ms),于是按上面这条把六种 fio 负载重跑了一遍
+([原始数据](../../experiments/vhost-user-blk-frontend-20260726/raw/metal-blockpath-fio-rerun.log))。
+结果测出来的是**宿主 page cache 而不是前端**:同一条 kernel-nbd 路径同一轮里,4k 随机写 QD32
+是 64419 IOPS / p99 237 µs,1M 顺序写却只有 8.7 MiB/s / p99 851 ms。要做 like-for-like 对比,
+kernel-nbd 必须以 `direct=on` 打开,而节点代理**今天没有这个选项**——这是现在真正的卡点,
+比 (b) 和 (c) 都更靠前。读这边 vhost-user 稳定占优约 1.10×(4k 随机读 QD1 60735 vs 54729)。
+
 ## 后续优化的验证结果(2026-07-26)
 
 - **做了**:提交路径的拷贝与哈希并行化 → FLUSH 快 **1.6×–1.8×**(32–192 MiB 的提交);
