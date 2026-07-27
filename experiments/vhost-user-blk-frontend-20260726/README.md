@@ -480,6 +480,70 @@ provision 延迟与镜像大小**无关**(恒定约 7 ms):它只写 map node 与
    `PRAGMA journal_mode=WAL` 的切换不受 `busy_timeout` 保护。之前一直被"总有人先打开过"掩盖着,
    删掉节点代理里那个不再需要的元数据 handle 之后就露出来了。改为重试并把"已经是 WAL"视为成功。
 
+## 真机复测:AWS i4i.metal + 真 KVM + 真实 S3(2026-07-27)
+
+原始数据:[`raw/metal-golden-root-s3.log`](raw/metal-golden-root-s3.log)、
+[`raw/metal-concurrent-create-ab.log`](raw/metal-concurrent-create-ab.log)、
+[`raw/metal-e2e-golden-root.log`](raw/metal-e2e-golden-root.log)。
+
+### Golden Root 在真实 S3 上的存储成本
+
+每个对象都是一次真实 PUT 往返,而不是本地的 create + `sync_data` + hard_link:
+
+| | 复制 | 引用 |
+|---|---|---|
+| 单个 create,512 MiB 镜像 | 15472.6 ms / 512 MiB | **89.7 ms / 0.02 MiB(172×)** |
+| 10 个并发 | 27230 ms / 2560 MiB | **167.4 ms / 0.11 MiB(162×)** |
+
+引用侧对镜像大小和并发数都**不敏感**(90–210 ms)。S3 上的倍数比本地更大,因为复制侧每 4 MiB
+对象要付一次 PUT 往返。
+
+### 端到端:同一台机器、同一个 S3、同一个 VMM,10 个并发冷创建
+
+唯一的变量是二进制:`复制` 是本分支的父提交(有 delta pack、无 golden root)。
+
+| | 墙钟 | 失败的操作 |
+|---|---|---|
+| 复制 rootfs(父提交) | 121.4 s | **4** |
+| 引用共享镜像(本分支) | **61.6 s** | **0** |
+
+复制那一行复现了 2026-07-26 记录的 128 s(不同机器、不同日期),两个数字互相印证。复制路径
+**10 个里失败了 4 个**:每个 Cat 各传 512 MiB、传十遍,会把 launch 顶过它自己的超时——真机日志里
+看到的就是提交 286 MiB 的过程中租约续不上(`lease renewal failed; fencing writes`)。
+
+单个 create:节点上第一个 Cat 6.9 s(顺带发布镜像),第二个 **4.5 s**,Guest 从引用的 chunk
+正常起来(`/dev/vda 2.0G 279M used`、`/usr/bin` 411 个可执行文件、真实 ext4)。
+
+**剩下的 61.6 s 不是存储**:十个 create 的存储部分合计 167 ms。墙钟是一条约 6 s/个的斜坡
+(min 8.2 s、p50 28 s、max 61.6 s),看起来是完全串行的;换成 kernel-nbd 路径是 60.4 s,几乎一样,
+所以也不是块路径(`launch_allocates_node_global_state` 只在 kernel-nbd 下加节点全局锁)。
+**golden root 拿掉了并发创建的存储成本,剩下的是节点代理之上的某个队列**,那是下一个要量的东西。
+
+### 验收未回退
+
+`deploy/metal/e2e.sh` 走 vhost-user + 真实 S3:**22 passed / 1 failed**,唯一失败仍是 PR #8 就
+记录过的陈旧断言(golden rootfs 里没有 `git`),与块路径和本次改动无关。
+
+桶里最后的样子:`images/` 74 个对象 / 306 MB —— 512 MiB rootfs 去掉全零 chunk 后的**唯一一份**,
+被这一轮创建的 43 个卷共同引用。
+
+### 真机顺带查出的一个设计错误(已修)
+
+第一版接线让 `cats-blockd --seed-image` 在 **attach 之后**发布镜像,也就是握着卷租约做一次 8 秒的
+512 MiB 上传。节点代理配的租约 TTL 是 1.5 s,于是租约丢了、launch 失败:
+
+```
+INFO  attached volume=vol_f11ad38fc6d3 epoch=1 generation=0
+ERROR lease renewal failed; fencing writes: lease epoch is stale or expired
+Error: seed volume from image /opt/cats/guest/rootfs.ext4
+       provision from base image: attachment is fenced; refusing writes
+```
+
+发布根本不需要租约(它只写 `images/` 命名空间,不属于任何卷),所以现在发布在 attach 之前;
+更进一步,发布是**全队列一次性**的工作,不该落在某次 launch 上,于是拆成
+`cats-blockd --publish-image`(发布并打印 image id)与 `--seed-image-id`(按 id provision,
+成本是一次 manifest GET 加一次 map 写),节点代理每个节点发布一次。
+
 ## 仍未验证 / 后续项
 
 1. **减少每次提交的对象数**:delta pack 之后 FLUSH 的残余是每对象约 2.3 ms 的固定开销,
@@ -493,9 +557,10 @@ provision 延迟与镜像大小**无关**(恒定约 7 ms):它只写 map node 与
 5. **多队列在真实 vCPU 数下的收益曲线**:本次只验了 1 和 4 两个点,而且已知队列多不等于更快。
 6. **长时间 soak 与多 Cat 同机压力**:本次每个场景都是单样本,不构成 SLA。
 7. **`nbd` 内核模块依赖的移除**:`install.sh` 仍无条件 `modprobe nbd`,以便随时切回默认路径。
-8. **本机测量项的真机复测**:并行提交、并发拉起、delta pack、golden root 都是在本机容器或
-   macOS 上量的;真机 + 真实 S3 的数字要等下一轮裸金属(那里 golden root 的收益会更大,
-   因为每个对象都变成一次 PUT 往返)。
+8. **delta pack 没有在真实 S3 上量过**(golden root 已经量了,见上一节)。这一条对一个具体
+   说法有影响:delta pack 把发布**字节**降 64×,但每次提交的**对象数不变**,而 S3 上一个对象
+   就是一次 PUT 往返——所以那里的延迟收益应该**小于**本地测到的 3.8×,而不是更大。字节数的
+   下降是算术,在哪里都成立。
 9. **并发拉起的天花板应该由实测饱和点决定**,而不是沿用 wake 的那个常量。
 
 ## 复现

@@ -70,3 +70,64 @@ Two things this run found, both fixed on this branch:
    full-chunk commits a 512 MiB seed commit takes 15 s on S3 against a 1.5 s
    lease, and survives only because renewal runs concurrently. Delta packs
    shorten commits by the same factor they shrink them.
+
+--------------------------------------------------------------------------------
+End to end: 10 concurrent cold creates, same box, same S3, same VMM
+
+experiments/metal-cluster-20260726/concurrent-start.sh with CATS_PHASES=create,
+10 Cats, 2 GiB root disks from the same 512 MiB golden rootfs, vhost-user block
+path. The only difference between the two rows is the build: `copy` is this
+branch's parent (delta packs, no golden root), which streams the rootfs into each
+volume; `reference` is this branch.
+
+  build                       wall ms   min ms   p50 ms   max ms  failed ops
+  copy the rootfs (parent)     121448    11775    88477   121448           4
+  reference a shared image      61637     8203    28134    61634           0
+
+* The copy row reproduces the 128 s recorded on 2026-07-26 for the same shape, on
+  a different box on a different day, which is a useful check on both numbers.
+* Four of ten create operations failed on the copy path and none on the reference
+  path: uploading 512 MiB per Cat ten times over is not only slow, it pushes the
+  launch past its own timeouts.
+* Single create on this branch: 6.9 s for the first Cat on the node (which
+  publishes the image) and 4.5 s for the second. The Guest boots off referenced
+  chunks -- `/dev/vda 2.0G 279M used`, 411 binaries in /usr/bin, real ext4.
+
+The remaining 61.6 s is not storage. Storage for all ten creates is 167 ms
+(measured above); the wall clock is a ~6 s-per-create ramp (min 8.2 s, p50 28 s,
+max 61.6 s) that looks fully serialized end to end. The kernel-nbd path gives
+essentially the same number (60.4 s), so it is not the block path either --
+`launch_allocates_node_global_state` only takes the node-wide lock for kernel-nbd,
+and switching it off changed nothing. Whatever serializes cold create now lives
+above the node agent's launch path, and it is the next thing to measure: golden
+roots removed the storage cost of a concurrent create, and what is left is
+somebody else's queue.
+
+One Guest in an earlier 10-way vhost-user run failed with "guest never became
+healthy over vsock" (9/10 running). It did not recur in the run recorded above
+(10/10, 0 failures), so it is logged here as seen-once rather than diagnosed.
+
+--------------------------------------------------------------------------------
+Acceptance and object-store accounting
+
+deploy/metal/e2e.sh on the vhost-user block path with real S3, this branch:
+
+  metal e2e: 22 passed, 1 failed
+
+The one failure is the same stale assertion PR #8 already recorded -- the golden
+rootfs has apt and curl but no git -- and is unrelated to the block path or to
+these changes. So delta packs and golden roots leave the acceptance score exactly
+where it was.
+
+In the bucket at the end of the session, under the node's `e2e/` prefix:
+
+  e2e/images/    74 objects   306 MB   <- the rootfs, published once
+  e2e/volumes/   43 volumes            <- every Cat created during the session
+
+74 objects is the whole 512 MiB rootfs after dropping its all-zero chunks, stored
+once and referenced by every Cat that started from it. Before this change each of
+those 43 volumes would have carried its own copy.
+
+(The volumes/ byte total is not a clean number for this comparison: the session
+ran both builds against the same bucket, so most of those bytes are the copy-path
+baseline runs.)
