@@ -78,10 +78,26 @@ OUT="$PREFIX/guest" "$REPO/deploy/metal/build-guest-image.sh"
 # --------------------------------------------------------------------------
 DATA_DEVICE=${CATS_DATA_DEVICE:-auto}
 if [[ $DATA_DEVICE == auto ]]; then
-  # An unmounted, unpartitioned NVMe that is not the root disk.
+  # AWS labels instance storage in the device model, which is the only signal
+  # here that cannot be confused with something else. In particular the `nbd`
+  # module this script loads a few lines up creates /dev/nbd0..63, and lsblk
+  # reports those as TYPE=disk with no mountpoint -- picking one of those is how
+  # the first version of this got it wrong.
   root_src=$(findmnt -no SOURCE / | sed 's/p\?[0-9]*$//')
-  DATA_DEVICE=$(lsblk -dnp -o NAME,TYPE,MOUNTPOINT |
-    awk -v root="$root_src" '$2 == "disk" && $1 != root && $3 == "" {print $1; exit}')
+  DATA_DEVICE=$(lsblk -dnp -o NAME,TYPE,SIZE,MOUNTPOINT,MODEL |
+    awk -v root="$root_src" '
+      $2 == "disk" && $1 != root && $4 == "" && $3 != "0B" &&
+      $1 !~ /\/dev\/(nbd|loop|ram|zram|md|dm-)/ &&
+      $0 ~ /Instance Storage/ {print $1; exit}')
+  if [[ -z ${DATA_DEVICE:-} ]]; then
+    # No vendor label: fall back to the largest unmounted real disk, still
+    # excluding the virtual device classes.
+    DATA_DEVICE=$(lsblk -dnpb -o NAME,TYPE,SIZE,MOUNTPOINT |
+      awk -v root="$root_src" '
+        $2 == "disk" && $1 != root && $4 == "" && $3 > 0 &&
+        $1 !~ /\/dev\/(nbd|loop|ram|zram|md|dm-)/ {print $3, $1}' |
+      sort -rn | head -1 | awk '{print $2}')
+  fi
   DATA_DEVICE=${DATA_DEVICE:-none}
 fi
 if [[ $DATA_DEVICE != none ]]; then

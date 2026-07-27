@@ -42,7 +42,9 @@ gate() { # description condition-output expected
 }
 echo "== environment gate"
 cache_src=$(findmnt -no SOURCE /var/lib/cats 2>/dev/null || findmnt -no SOURCE /)
-cache_rota=$(lsblk -ndo ROTA "$(echo "$cache_src" | sed 's/p\?[0-9]*$//')" 2>/dev/null | tr -d ' ')
+# lsblk resolves a partition to its parent itself; stripping digits by hand turns
+# /dev/nvme8n1 into /dev/nvme8n, which is not a device.
+cache_model=$(lsblk -no MODEL "$cache_src" 2>/dev/null | head -1 | sed 's/ *$//')
 case "$cache_src" in
   /dev/nvme*) gate "ChunkStore cache is on local NVMe" "nvme" "nvme" ;;
   *) gate "ChunkStore cache is on local NVMe" "$cache_src" "nvme" ;;
@@ -62,9 +64,12 @@ gate "cloud-hypervisor installed" \
   echo "uname: $(uname -srm)"
   echo "cpus: $(nproc)"
   echo "memory_kb: $(awk '/MemTotal/ {print $2}' /proc/meminfo)"
-  echo "cache_mount: /var/lib/cats on $cache_src (rotational=$cache_rota)"
+  echo "cache_mount: /var/lib/cats on $cache_src (${cache_model:-unknown model})"
   echo "cache_fs: $(findmnt -no FSTYPE /var/lib/cats 2>/dev/null)"
-  echo "blob_store: $(sudo grep -o 'object-store-adapter [a-z0-9-]*' /etc/cats/cats.env | tail -1)"
+  # Uncommented lines only: cats.env.example ships a commented-out aws-s3 line
+  # right under the active one, and grepping without this reports the wrong store.
+  echo "blob_store: $(sudo grep -v '^[[:space:]]*#' /etc/cats/cats.env |
+    grep -o 'object-store-adapter [a-z0-9-]*' | tail -1)"
   echo "cloud_hypervisor: $(cloud-hypervisor --version 2>&1 | head -1)"
   echo "rustc: $(rustc --version)"
   echo "git: $(git rev-parse --short HEAD 2>/dev/null || echo 'not a git checkout')"
