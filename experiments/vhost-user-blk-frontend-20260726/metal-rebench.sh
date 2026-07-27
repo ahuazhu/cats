@@ -55,9 +55,18 @@ esac
 gate "/dev/kvm present" "$([ -e /dev/kvm ] && echo yes || echo no)" "yes"
 gate "cloud-hypervisor installed" \
   "$(command -v cloud-hypervisor >/dev/null && echo yes || echo no)" "yes"
+if [ "$fail" -ne 0 ] && [ -n "${CATS_REBENCH_ALLOW_ANY_CACHE:-}" ]; then
+  # Deliberate exception: comparing a machine that HAS local NVMe against one that
+  # does not (c5.metal is EBS-only) is a measurement in its own right. The override
+  # has to be explicit, and the recorded environment below still says what it ran
+  # on, so such a run can never be mistaken for the documented one.
+  echo "  NOTE  environment gate overridden on purpose (CATS_REBENCH_ALLOW_ANY_CACHE)"
+  fail=0
+fi
 [ "$fail" -eq 0 ] || {
   echo "environment does not match the documented one; refusing to benchmark" >&2
   echo "(mount the instance NVMe at /var/lib/cats -- CATS_DATA_DEVICE in install.sh)" >&2
+  echo "(or set CATS_REBENCH_ALLOW_ANY_CACHE=1 if the difference IS the measurement)" >&2
   exit 1
 }
 
