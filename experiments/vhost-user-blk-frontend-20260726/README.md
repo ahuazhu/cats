@@ -475,7 +475,9 @@ provision 延迟与镜像大小**无关**(恒定约 7 ms):它只写 map node 与
 
 1. **`ChunkEngine::detach` 要等掉三分之一个租约 TTL。** golden root 的 benchmark 一开始每行都有
    一个 1674 ms 的地板,查出来是 detach 去 join 一个正在 `sleep(lease_ttl_ms / 3)` 的续期线程——
-   也就是**每次 stop、suspend、冷迁移,按卷计,都白等 1.67 s**(默认 TTL)。续期改为等 condvar。
+   也就是**每次 stop、suspend、冷迁移,按卷计,都白等三分之一个租约 TTL**——节点代理给 blockd 配的是
+   1500 ms(约 **0.5 s/卷**),blockd 自己的默认值 5000 ms 下是 1.67 s,后者就是这个 benchmark 撞到的。
+   续期改为等 condvar。
 2. **8 个进程同时打开同一个新建 sqlite 元数据库,有 2 个失败**(`database is locked`):
    `PRAGMA journal_mode=WAL` 的切换不受 `busy_timeout` 保护。之前一直被"总有人先打开过"掩盖着,
    删掉节点代理里那个不再需要的元数据 handle 之后就露出来了。改为重试并把"已经是 WAL"视为成功。

@@ -54,6 +54,8 @@ Reading:
 
 Also found by this bench: `ChunkEngine::detach` joined a lease-renewal thread that
 was sleeping out lease_ttl_ms/3, so every detach -- every stop, suspend and cold
-migration, per volume -- waited ~1.67 s at the default TTL. Before the fix every
+migration, per volume -- waited out a third of the lease TTL. That is ~0.5 s per
+volume as the node agent configures blockd (--blockd-lease-ttl-ms 1500) and 1.67 s
+at blockd's own 5 s default, which is what this benchmark used. Before the fix every
 row above had a 1674 ms floor, which is what made it visible. Renewal now waits on
 a condvar; regression test: engine::tests::detaching_does_not_wait_out_the_lease_renewal_interval.
