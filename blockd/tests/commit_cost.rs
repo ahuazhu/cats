@@ -25,6 +25,7 @@ use cats_storage::{open_blob_store, AdapterConfig, BlobStoreFactory, MetadataSto
 
 const CHUNK: u64 = cats_api::chunk::CHUNK_SIZE as u64;
 const PAGE: u64 = cats_api::chunk::DIRTY_PAGE_SIZE as u64;
+const MIB: f64 = 1024.0 * 1024.0;
 
 /// Counts the bytes a commit actually publishes, which is the number the flush
 /// cost should track.
@@ -90,8 +91,27 @@ fn object_store(dir: &Path, prefix: &str) -> Arc<dyn BlobStore> {
 
 struct Env {
     _dir: tempfile::TempDir,
+    root: std::path::PathBuf,
+    blob: Arc<SizingBlob>,
+    meta: Arc<SqliteMetadataStore>,
     engine: Arc<ChunkEngine>,
     published: Arc<SizingBlob>,
+}
+
+impl Env {
+    fn data_dir(&self) -> std::path::PathBuf {
+        self.root.join("data")
+    }
+
+    /// Attach again after the local cache has been deleted: a fresh host.
+    fn reattach(&self, attachment: &str) -> Arc<ChunkEngine> {
+        ChunkEngine::attach(
+            EngineConfig::new("vol_commit", self.data_dir(), attachment),
+            self.blob.clone(),
+            self.meta.clone(),
+        )
+        .expect("reattach")
+    }
 }
 
 fn env(chunks: u64, run: &str) -> Env {
@@ -103,6 +123,7 @@ fn env(chunks: u64, run: &str) -> Env {
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).expect("meta"));
     meta.create_volume("vol_commit", chunks * CHUNK)
         .expect("volume");
+    let meta_for_reattach = meta.clone();
     let engine = ChunkEngine::attach(
         EngineConfig::new("vol_commit", dir.path().join("data"), "att-commit"),
         published.clone(),
@@ -110,7 +131,10 @@ fn env(chunks: u64, run: &str) -> Env {
     )
     .expect("attach");
     Env {
+        root: dir.path().to_path_buf(),
         _dir: dir,
+        blob: published.clone(),
+        meta: meta_for_reattach,
         engine,
         published,
     }
@@ -209,6 +233,61 @@ fn flush_cost_for_dense_writes() {
             published_mib,
             flush_ms,
             flush_ms / published_mib
+        );
+    }
+}
+
+/// What a delta chain costs to read back cold — the price ADR-0016 pays for
+/// publishing pages instead of chunks.
+///
+/// Each chunk is written once densely (a base) and then `layers` more times, each
+/// touching a different page, so the chain really is that deep. Then the local
+/// cache is deleted and every chunk is read back, which is what a cross-node
+/// migration or a fresh host does.
+#[test]
+#[ignore = "benchmark; run explicitly with --ignored --nocapture"]
+fn cold_read_cost_by_delta_chain_length() {
+    let chunks = 16u64;
+    println!(
+        "\n{:>7} {:>16} {:>14} {:>12} {:>14}",
+        "layers", "objects to fetch", "cold read ms", "MiB/s", "ms per chunk"
+    );
+    for layers in [0u64, 1, 2, 4] {
+        let env = env(chunks, &format!("chain-{layers}"));
+        let whole = vec![0xc3u8; CHUNK as usize];
+        for chunk in 0..chunks {
+            env.engine.write(chunk * CHUNK, &whole).expect("base write");
+        }
+        env.engine.flush().expect("base flush");
+        for layer in 0..layers {
+            for chunk in 0..chunks {
+                env.engine
+                    .write(chunk * CHUNK + layer * PAGE, &[0x5au8; 4096])
+                    .expect("delta write");
+            }
+            env.engine.flush().expect("delta flush");
+        }
+        env.engine.detach();
+
+        // A host with nothing cached.
+        std::fs::remove_dir_all(env.data_dir()).ok();
+        let engine = env.reattach("cold");
+        let mut buf = vec![0u8; CHUNK as usize];
+        let started = Instant::now();
+        for chunk in 0..chunks {
+            engine.read(chunk * CHUNK, &mut buf).expect("cold read");
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        engine.detach();
+
+        let mib = (chunks * CHUNK) as f64 / MIB;
+        println!(
+            "{:>7} {:>16} {:>14.1} {:>12.0} {:>14.1}",
+            layers,
+            chunks * (layers + 1),
+            elapsed * 1000.0,
+            mib / elapsed,
+            elapsed * 1000.0 / chunks as f64
         );
     }
 }
