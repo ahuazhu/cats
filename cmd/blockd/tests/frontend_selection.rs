@@ -318,6 +318,69 @@ fn an_image_is_published_once_and_then_referenced_by_id() {
     );
 }
 
+/// GC through the real binary: it attaches, sweeps, and exits without a listener.
+#[test]
+fn collecting_garbage_needs_no_listener_and_leaves_live_objects_alone() {
+    use cats_blockd::nbd::NbdClient;
+    use std::process::Stdio;
+
+    let env = Env::new();
+    let nbd = env.path("gc-nbd.sock");
+    let mut child = env
+        .command("att-gc")
+        .arg("--listen-unix")
+        .arg(&nbd)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn cats-blockd");
+    wait_ready(&mut child);
+    let mut client = NbdClient::connect_unix(&nbd).expect("nbd connect");
+    // Two full-chunk generations: the first chunk object becomes garbage. (Two
+    // small writes to the same page would not: the second delta replaces the
+    // first in the chain, so the first is never referenced in the first place.)
+    const CHUNK: usize = cats_api::chunk::CHUNK_SIZE as usize;
+    let first = vec![0x11u8; CHUNK];
+    let second = vec![0x22u8; CHUNK];
+    client.write(0, &first).unwrap();
+    client.flush().unwrap();
+    client.write(0, &second).unwrap();
+    client.flush().unwrap();
+    client.disconnect().ok();
+    child.kill().ok();
+    child.wait().ok();
+    assert_eq!(env.objects("volumes/vol_frontends/data").len(), 2);
+
+    // No listener argument at all.
+    let gc = env
+        .command("att-gc-run")
+        .arg("--collect-garbage")
+        .output()
+        .expect("run cats-blockd --collect-garbage");
+    assert!(
+        gc.status.success(),
+        "gc failed: {}",
+        String::from_utf8_lossy(&gc.stderr)
+    );
+    let report = String::from_utf8_lossy(&gc.stdout);
+    assert!(report.contains("data_deleted=1"), "unexpected report: {report}");
+    assert_eq!(env.objects("volumes/vol_frontends/data").len(), 1);
+
+    // And the volume still serves the live generation.
+    let mut child = env
+        .command("att-gc-after")
+        .arg("--listen-unix")
+        .arg(env.path("gc-nbd2.sock"))
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn cats-blockd again");
+    wait_ready(&mut child);
+    let mut client = NbdClient::connect_unix(&env.path("gc-nbd2.sock")).unwrap();
+    assert_eq!(client.read(0, CHUNK as u32).unwrap(), second);
+    client.disconnect().ok();
+    child.kill().ok();
+    child.wait().ok();
+}
+
 /// The Linux-only half: vhost-user needs eventfd, memfd and SCM_RIGHTS.
 #[cfg(target_os = "linux")]
 mod vhost_user {

@@ -66,6 +66,14 @@ struct Args {
     #[arg(long)]
     create_volume_size: Option<u64>,
 
+    /// Delete objects this volume no longer references, then exit (spec §9).
+    ///
+    /// Takes the volume's lease like any attachment, which is what makes it safe:
+    /// no other writer can be publishing objects the Root does not name yet.
+    /// Never touches `images/` — those belong to the image, not to any volume.
+    #[arg(long)]
+    collect_garbage: bool,
+
     /// Publish this raw image as a shared base image and exit, printing
     /// `IMAGE <image-id>` (ADR-0017).
     ///
@@ -186,7 +194,12 @@ fn main() -> Result<()> {
     if args.listen_unix.is_some() && args.listen_tcp.is_some() {
         bail!("--listen-unix and --listen-tcp are mutually exclusive");
     }
-    if args.listen_unix.is_none() && args.listen_tcp.is_none() && args.listen_vhost_user.is_none() {
+    // A GC pass attaches to the volume but serves no Guest, so it needs no socket.
+    if !args.collect_garbage
+        && args.listen_unix.is_none()
+        && args.listen_tcp.is_none()
+        && args.listen_vhost_user.is_none()
+    {
         bail!("give at least one of --listen-unix, --listen-tcp or --listen-vhost-user");
     }
     let volume_id = args
@@ -271,6 +284,19 @@ fn main() -> Result<()> {
     if let Some(manifest) = &seed {
         seed_from_image(&engine, manifest)
             .with_context(|| format!("seed volume {volume_id} from image {}", manifest.image_id))?;
+    }
+
+    if args.collect_garbage {
+        let stats = engine.collect_garbage().context("collect garbage")?;
+        engine.detach();
+        println!(
+            "GC data_live={} data_deleted={} nodes_live={} nodes_deleted={}",
+            stats.data_objects_live,
+            stats.data_objects_deleted,
+            stats.map_nodes_live,
+            stats.map_nodes_deleted
+        );
+        return Ok(());
     }
 
     // Bind every requested socket before printing READY: a VMM told to start on

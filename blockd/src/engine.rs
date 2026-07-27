@@ -40,6 +40,15 @@ pub enum EngineError {
 
 pub type Result<T> = std::result::Result<T, EngineError>;
 
+/// What one garbage-collection pass found and removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GcStats {
+    pub data_objects_live: usize,
+    pub data_objects_deleted: usize,
+    pub map_nodes_live: usize,
+    pub map_nodes_deleted: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub volume_id: String,
@@ -358,6 +367,95 @@ impl ChunkEngine {
             "provisioned volume from a shared base image"
         );
         Ok(new_gen)
+    }
+
+    /// Delete objects this volume no longer references (spec §9).
+    ///
+    /// Liveness is "reachable from the volume's current Root": the root node, the
+    /// leaf nodes it names, and every object every `ChunkRef` names — which after
+    /// delta packs means a base **and all of its deltas**, not just the newest
+    /// object for a chunk (ADR-0016).
+    ///
+    /// Two things it must not do, both introduced by this branch:
+    ///
+    /// * Never touch `images/`. Those objects belong to the image and are shared
+    ///   by every volume provisioned from it, so deleting a volume must not delete
+    ///   the fleet's rootfs (ADR-0017). This function only ever lists and deletes
+    ///   under this volume's own prefix, and a base whose ref names an image is
+    ///   simply not one of this volume's objects.
+    /// * Never race a commit. It runs on the engine, which holds the volume's
+    ///   lease, so no other writer can be publishing objects that the Root does
+    ///   not name yet. A pending pack of this writer's own is safe either way:
+    ///   recovery replays it from the pack file and re-uploads whatever was
+    ///   deleted.
+    ///
+    /// Commit records are left alone: they are the audit trail, they are tiny, and
+    /// pruning them is a retention policy rather than garbage collection.
+    pub fn collect_garbage(&self) -> Result<GcStats> {
+        if self.is_fenced() {
+            return Err(EngineError::Fenced);
+        }
+        // Block commits for the scan so the live set and the Root agree.
+        let _flush = self.flush_lock.lock().unwrap();
+        let vol = &self.cfg.volume_id;
+
+        let (live_data, live_nodes) = {
+            let st = self.state.lock().unwrap();
+            let mut data: HashSet<String> = HashSet::new();
+            for chunk_ref in &st.map {
+                // A base that came from an image is not this volume's object; it
+                // lives under `images/` and is not a candidate for deletion here.
+                if chunk_ref.image().is_some() {
+                    for delta in chunk_ref.delta_object_ids() {
+                        data.insert(delta.to_string());
+                    }
+                } else {
+                    for object_id in chunk_ref.object_ids() {
+                        data.insert(object_id.to_string());
+                    }
+                }
+            }
+            let mut nodes: HashSet<String> = HashSet::new();
+            for leaf in &st.leaf_refs {
+                if let LeafRef::Present { object_id, .. } = leaf {
+                    nodes.insert(object_id_hex(object_id).to_string());
+                }
+            }
+            let head = self.meta.load_head(vol)?;
+            if let Some(root) = &head.root_object_id {
+                nodes.insert(root_object_hex(root).to_string());
+            }
+            (data, nodes)
+        };
+
+        let mut stats = GcStats::default();
+        for key in self.blob.list(&format!("volumes/{vol}/data/"))? {
+            let object_id = key.rsplit('/').next().unwrap_or_default();
+            if live_data.contains(object_id) {
+                continue;
+            }
+            self.blob.delete(&key)?;
+            stats.data_objects_deleted += 1;
+        }
+        for key in self.blob.list(&format!("volumes/{vol}/maps/"))? {
+            let node = key.rsplit('/').next().unwrap_or_default();
+            if live_nodes.contains(object_id_hex(node)) {
+                continue;
+            }
+            self.blob.delete(&key)?;
+            stats.map_nodes_deleted += 1;
+        }
+        stats.data_objects_live = live_data.len();
+        stats.map_nodes_live = live_nodes.len();
+        tracing::info!(
+            volume = %vol,
+            data_objects_live = stats.data_objects_live,
+            data_objects_deleted = stats.data_objects_deleted,
+            map_nodes_live = stats.map_nodes_live,
+            map_nodes_deleted = stats.map_nodes_deleted,
+            "garbage collected"
+        );
+        Ok(stats)
     }
 
     pub fn read(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
@@ -1876,10 +1974,15 @@ mod tests {
             e.write(chunk * CHUNK_SIZE as u64, &whole).unwrap();
         }
         e.flush().unwrap();
-        for round in 0..2u8 {
+        // Distinct pages per round, so the chain is genuinely two deltas deep: a
+        // delta that fully rewrote the previous one would replace it instead.
+        for round in 0..2u64 {
             for chunk in 0..4u64 {
-                e.write(chunk * CHUNK_SIZE as u64, &pattern(4096, round + 20))
-                    .unwrap();
+                e.write(
+                    chunk * CHUNK_SIZE as u64 + round * PAGE,
+                    &pattern(4096, round as u8 + 20),
+                )
+                .unwrap();
             }
             e.flush().unwrap();
         }
@@ -1902,13 +2005,120 @@ mod tests {
             probe.peak.load(Ordering::SeqCst)
         );
         assert_eq!(probe.in_flight.load(Ordering::SeqCst), 0, "a fetch leaked");
-        // Concurrency must not change what comes back: the last write wins on the
-        // page it touched, the base shows through everywhere else.
+        // Concurrency must not change what comes back: each round's write wins on
+        // the page it touched, the base shows through everywhere else.
         for chunk in 0..4usize {
             let at = chunk * CHUNK_SIZE as usize;
-            assert_eq!(&back[at..at + 4096], &pattern(4096, 21)[..], "chunk {chunk}");
-            assert_eq!(&back[at + 4096..at + CHUNK_SIZE as usize], &whole[4096..]);
+            assert_eq!(&back[at..at + 4096], &pattern(4096, 20)[..], "chunk {chunk}");
+            let second = at + PAGE as usize;
+            assert_eq!(&back[second..second + 4096], &pattern(4096, 21)[..]);
+            assert_eq!(&back[at + 4096..second], &whole[4096..PAGE as usize]);
         }
+        e.detach();
+    }
+
+    #[test]
+    fn gc_keeps_every_layer_of_a_live_chain_and_drops_superseded_objects() {
+        let (env, sizing) = sizing_env();
+        let e = attach_with(&env, sizing.clone(), "attA");
+
+        // Chunk 0: a base, then two deltas on different pages -- all three live.
+        let whole = pattern(CHUNK_SIZE as usize, 4);
+        e.write(0, &whole).unwrap();
+        e.flush().unwrap();
+        for round in 0..2u64 {
+            e.write(round * PAGE, &pattern(4096, round as u8 + 30)).unwrap();
+            e.flush().unwrap();
+        }
+        // Chunk 1: written twice densely, so the first base is superseded.
+        e.write(CHUNK_SIZE as u64, &pattern(CHUNK_SIZE as usize, 6))
+            .unwrap();
+        e.flush().unwrap();
+        e.write(CHUNK_SIZE as u64, &pattern(CHUNK_SIZE as usize, 7))
+            .unwrap();
+        e.flush().unwrap();
+
+        let before = env.blob.list("volumes/vol_test/data/").unwrap().len();
+        let stats = e.collect_garbage().unwrap();
+        let after = env.blob.list("volumes/vol_test/data/").unwrap().len();
+
+        // Live: chunk 0's base + 2 deltas, chunk 1's second base. Dead: chunk 1's
+        // first base. A GC that only kept the newest object per chunk would have
+        // deleted chunk 0's base and its first delta and corrupted the volume.
+        assert_eq!(stats.data_objects_live, 4);
+        assert_eq!(stats.data_objects_deleted, 1);
+        assert_eq!(after, before - 1);
+        assert!(stats.map_nodes_deleted > 0, "superseded map nodes survived");
+
+        // The volume still reads correctly from a host with nothing cached.
+        e.detach();
+        fs::remove_dir_all(&env.data_dir).unwrap();
+        let e = attach_with(&env, sizing.clone(), "attB");
+        let mut back = vec![0u8; CHUNK_SIZE as usize];
+        e.read(0, &mut back).unwrap();
+        assert_eq!(&back[..4096], &pattern(4096, 30)[..]);
+        assert_eq!(&back[PAGE as usize..PAGE as usize + 4096], &pattern(4096, 31)[..]);
+        assert_eq!(&back[4096..PAGE as usize], &whole[4096..PAGE as usize]);
+        e.read(CHUNK_SIZE as u64, &mut back).unwrap();
+        assert_eq!(back, pattern(CHUNK_SIZE as usize, 7));
+        e.detach();
+    }
+
+    #[test]
+    fn gc_never_deletes_a_shared_image_even_though_the_volume_references_it() {
+        let (env, sizing) = sizing_env();
+        let image = golden_image(env.data_dir.parent().unwrap(), 3);
+        let published = crate::image::publish(sizing.as_ref(), &image).unwrap();
+        let image_keys = env
+            .blob
+            .list(&format!("images/{}/", published.manifest.image_id))
+            .unwrap();
+        assert!(!image_keys.is_empty());
+
+        let e = attach_with(&env, sizing.clone(), "attA");
+        e.provision_from_image(&published.manifest).unwrap();
+        // One page written onto a shared chunk: that delta is this volume's and
+        // must survive; the image base underneath it is not ours to delete.
+        e.write(0, &pattern(4096, 9)).unwrap();
+        e.flush().unwrap();
+
+        let stats = e.collect_garbage().unwrap();
+        assert_eq!(
+            stats.data_objects_live, 1,
+            "only the volume's own delta is a volume object"
+        );
+        assert_eq!(stats.data_objects_deleted, 0);
+        assert_eq!(
+            env.blob
+                .list(&format!("images/{}/", published.manifest.image_id))
+                .unwrap(),
+            image_keys,
+            "GC touched the shared image"
+        );
+
+        // And the volume still reassembles from image base + local delta.
+        e.detach();
+        fs::remove_dir_all(&env.data_dir).unwrap();
+        let e = attach_with(&env, sizing.clone(), "attB");
+        let raw = fs::read(&image).unwrap();
+        let mut back = vec![0u8; CHUNK_SIZE as usize];
+        e.read(0, &mut back).unwrap();
+        assert_eq!(&back[..4096], &pattern(4096, 9)[..]);
+        assert_eq!(&back[4096..], &raw[4096..CHUNK_SIZE as usize]);
+        e.detach();
+    }
+
+    #[test]
+    fn gc_on_an_untouched_volume_deletes_nothing() {
+        let env = env();
+        let e = attach(&env, "attA");
+        e.write(0, &pattern(4096, 1)).unwrap();
+        e.flush().unwrap();
+        let first = e.collect_garbage().unwrap();
+        assert_eq!(first.data_objects_deleted, 0);
+        // Idempotent: a second pass finds nothing new.
+        let second = e.collect_garbage().unwrap();
+        assert_eq!(second, first);
         e.detach();
     }
 

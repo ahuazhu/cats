@@ -128,9 +128,25 @@ impl ChunkRef {
                 deltas: vec![delta],
             },
             Self::Layered { base, mut deltas } => {
+                // An older delta whose pages this one fully rewrites contributes
+                // nothing: hydration would fetch it and then overwrite every byte
+                // of it. Dropping it shortens the chain (so a cold read fetches
+                // fewer objects and the base rewrite triggers later) and stops GC
+                // from having to keep a fully shadowed object alive. Rewriting the
+                // same hot page over and over is the common case for this.
+                deltas.retain(|existing| existing.page_mask & !delta.page_mask != 0);
                 deltas.push(delta);
                 Self::Layered { base, deltas }
             }
+        }
+    }
+
+    /// Just the delta objects, which are always written by the volume itself even
+    /// when the base underneath them belongs to a shared image.
+    pub fn delta_object_ids(&self) -> Vec<&str> {
+        match self {
+            Self::Hole | Self::Base(_) => Vec::new(),
+            Self::Layered { deltas, .. } => deltas.iter().map(|d| d.object_id.as_str()).collect(),
         }
     }
 
@@ -675,6 +691,41 @@ mod tests {
         assert_eq!(layered[1].layer_count(), 2);
         assert_eq!(layered[1].object_ids(), vec!["txn1-c1", "txn2-c1-d", "txn3-c1-d"]);
         assert_eq!(layered[0].base(), None);
+    }
+
+    #[test]
+    fn a_delta_that_fully_rewrites_an_older_one_replaces_it() {
+        let page = |mask: u64, tag: u8| DeltaRef {
+            object_id: format!("d{tag}"),
+            page_mask: mask,
+            len: cats_api::chunk::DIRTY_PAGE_SIZE * mask.count_ones(),
+            sha256: [tag; 32],
+        };
+        let base = BaseRef::local("b".into(), CHUNK_SIZE, [1u8; 32]);
+        let chunk = ChunkRef::Base(base.clone());
+
+        // Writing the same page again: the older delta would be fetched and then
+        // completely overwritten, so it is dropped rather than kept in the chain.
+        let once = chunk.clone().with_delta(page(0b001, 1));
+        let twice = once.clone().with_delta(page(0b001, 2));
+        assert_eq!(twice.layer_count(), 1);
+        assert_eq!(twice.object_ids(), vec!["b", "d2"]);
+
+        // A delta covering a superset of two older ones replaces both.
+        let spread = chunk
+            .clone()
+            .with_delta(page(0b001, 1))
+            .with_delta(page(0b010, 2))
+            .with_delta(page(0b011, 3));
+        assert_eq!(spread.layer_count(), 1);
+        assert_eq!(spread.object_ids(), vec!["b", "d3"]);
+
+        // A partial overlap keeps the older delta: it still owns a page.
+        let overlap = chunk
+            .with_delta(page(0b011, 1))
+            .with_delta(page(0b001, 2));
+        assert_eq!(overlap.layer_count(), 2);
+        assert_eq!(overlap.object_ids(), vec!["b", "d1", "d2"]);
     }
 
     #[test]

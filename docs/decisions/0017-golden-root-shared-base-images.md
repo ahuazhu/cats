@@ -57,9 +57,11 @@
    情况下检查卷 generation 的组件;节点代理只是把镜像路径传给根盘的 blockd,不再流式写入。
    已有 generation 的卷会被跳过,因此这个参数在 resume/warm 路径上也能无条件传。
 
-8. **GC(尚未实现)必须把镜像对象视为镜像所有,而不是卷所有**:存活判据不能是「某个卷的 Root
-   引用它」,因为删掉一个卷不应该删掉全队列共享的 rootfs。V1 的规则是**镜像对象不自动回收**,
-   由运营方在确认没有卷引用该 image-id 后显式删除。
+8. **GC 必须把镜像对象视为镜像所有,而不是卷所有**:存活判据不能是「某个卷的 Root 引用它」,
+   因为删掉一个卷不应该删掉全队列共享的 rootfs。已实现(见[协议 §9](../specs/blockd-protocol.md)):
+   GC 只列举本卷前缀下的对象,带 image origin 的 base 根本不算本卷的对象;回归测试
+   `gc_never_deletes_a_shared_image_even_though_the_volume_references_it`。**镜像本身的回收是
+   另一件事**:V1 不自动回收,由运营方在确认没有卷引用该 image-id 后显式删除。
 
 ## 实测结果
 

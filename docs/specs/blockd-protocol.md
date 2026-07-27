@@ -255,3 +255,22 @@ socket，两者服务同一个 engine 与同一个 attachment lease。
 3. 旧 epoch 的 blockd 无法完成任何 Root CAS，也无法在续租失败后继续 ACK 写。
 4. 同一 txn 重放不产生第二个 generation。
 5. Hole 读取恒为零且不产生远端 GET。
+
+## 9. GC（对象回收）
+
+存活判据是**从卷当前 Root 可达**:root 节点、它命名的 leaf 节点,以及每个 `ChunkRef` 命名的每个
+对象——delta pack 之后这意味着 **base 加上它的全部 delta**,而不是"每个 chunk 最新的那个对象"。
+删掉一个 chunk 的 base 只留最新 delta,会直接损坏该 chunk。
+
+- **绝不碰 `images/`。**镜像对象属于镜像、被所有从它 provision 的卷共享,删一个卷不能删掉全队列
+  的 rootfs(§6.3)。GC 只列举和删除本卷前缀下的对象;`ChunkRef` 里带 image origin 的 base 根本
+  不算本卷的对象。这也意味着**镜像的回收是另一件事**:V1 不自动回收,由运营方在确认无卷引用
+  该 image-id 后显式删除。
+- **必须持有卷租约运行**,这样没有别的写者会在发布 Root 尚未命名的对象。本写者自己的 pending
+  pack 无所谓:恢复会从 pack 文件重放并重新上传被删掉的对象。
+- **commit record 不删**:它是审计线索、体积极小,清理它属于保留策略而不是垃圾回收。
+- 完全被后来的 delta 覆盖的旧 delta**根本不会进入 Map**:`with_delta` 在追加时就把
+  `page_mask` 被新 delta 完全覆盖的旧 delta 丢掉了(它在 hydration 里会被逐字节覆盖,留着只是
+  让链更长、冷读更贵、GC 还得当它活着)。
+
+入口:`cats-blockd --collect-garbage`(不需要监听套接字,扫完即退出)。

@@ -97,8 +97,13 @@ sparse 行的 556 ms/发布 MiB 对 dense 的 25.6 ms/发布 MiB,说明 sparse �
 - **冷读放大**:一个满链 chunk 的冷读要取 5 个对象而不是 1 个。这是本决定最主要的代价,
   `MAX_DELTA_LAYERS = 4` 就是为此选的(而不是 8 或更多)。跨节点冷迁移与空缓存恢复会更慢,
   幅度取决于链长分布;真机上尚未单独测量这一项。
-- **GC(尚未实现)必须把 base 与全部 delta 都视为存活**:存活判据仍然是"被当前 Root 引用",
-  只是一个 chunk 现在可能引用多个对象。实现 GC 时必须遍历 `ChunkRef::object_ids()`。
+- **GC 必须把 base 与全部 delta 都视为存活**:存活判据仍然是"被当前 Root 引用",只是一个
+  chunk 现在可能引用多个对象。已实现(见[协议 §9](../specs/blockd-protocol.md)),遍历的正是
+  `ChunkRef::object_ids()`;回归测试 `gc_keeps_every_layer_of_a_live_chain_and_drops_superseded_objects`
+  就是在防"只留每个 chunk 最新那个对象"这种写法。
+- 被后来的 delta **完全覆盖**的旧 delta 不会进入 Map:`with_delta` 追加时就丢掉它。它在
+  hydration 里本来就会被逐字节覆盖,留着只会让链更长、冷读更贵、GC 还得当它活着。反复写同一个
+  热页是最常见的形态,这条让那种形态的链长保持在 1。
 - **对象数量增加**:同样的写入量会产生更多、更小的对象。S3 的 PUT 次数按 ADR-0003 的要求
   仍然要记入基准四元组(`guest_bytes_written`、`remote_bytes_uploaded`、PUT 数、Compaction bytes)。
 - **前向兼容**:写过 delta 的卷,其 map node 是版本 2,旧版二进制读到会明确报错(不会静默误读)。
