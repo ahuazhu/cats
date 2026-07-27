@@ -44,10 +44,11 @@ check "guest runs the direct-boot kernel" "$host_kver" "$guest_kver"
 guest_os=$($CATS exec $CAT -- sh -c '. /etc/os-release && echo "$PRETTY_NAME"' 2>/dev/null)
 check "guest userland is Ubuntu 24.04" "Ubuntu 24.04" "$guest_os"
 
-# `command -v a b c` prints one line per tool, so compare the set, not the first
-# line. This asserted equality against a single path and had been failing since
-# it was written -- the image has all three.
-guest_tools=$($CATS exec $CAT -- sh -c 'command -v apt-get curl git' 2>/dev/null |
+# The Guest's /bin/sh is dash, whose `command -v` resolves only its FIRST operand
+# -- `command -v apt-get curl git` prints just /usr/bin/apt-get. That is why this
+# check had failed since it was written, against an image that has all three all
+# along. Ask about one tool per call.
+guest_tools=$($CATS exec $CAT -- sh -c 'for t in apt-get curl git; do command -v $t; done' 2>/dev/null |
   tr -d '\r' | sort | tr '\n' ' ' | sed 's/ $//')
 check "guest includes apt, curl and git" "/usr/bin/apt-get /usr/bin/curl /usr/bin/git" "$guest_tools"
 

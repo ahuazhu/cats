@@ -1,0 +1,36 @@
+date_utc: 2026-07-27T08:38:41Z
+cache_mount: /dev/nvme8n1 ext4
+
+##### warm restore timings -- kernel-nbd
+
+##### warm restore timings -- vhost-user
+Jul 27 08:38:55 ip-172-31-84-83 cats-noded[55594]: 2026-07-27T08:38:55.891709Z  INFO cats_node_agent::runtime: warm restore phase timings cat="cat_42c68f6b8f9b" block_path="vhost-user" total_us=37718 blockd_us=11270 block_attach_us=6 vmm_spawn_us=358 api_ready_us=24493 resume_us=1311 guest_health_us=187
+Jul 27 08:38:56 ip-172-31-84-83 cats-noded[55594]: 2026-07-27T08:38:56.215999Z  INFO cats_node_agent::runtime: warm restore phase timings cat="cat_42c68f6b8f9b" block_path="vhost-user" total_us=54380 blockd_us=10895 block_attach_us=5 vmm_spawn_us=384 api_ready_us=25816 resume_us=1776 guest_health_us=15468
+Jul 27 08:38:56 ip-172-31-84-83 cats-noded[55594]: 2026-07-27T08:38:56.519934Z  INFO cats_node_agent::runtime: warm restore phase timings cat="cat_42c68f6b8f9b" block_path="vhost-user" total_us=51430 blockd_us=10952 block_attach_us=1 vmm_spawn_us=220 api_ready_us=27407 resume_us=1158 guest_health_us=11590
+
+##### GC and TRIM on a real Guest (vhost-user, file object store on local NVMe)
+volume under test: vol_f9e0f43a8d5e
+after create:            objects=23 bytes=4131196
+after write round 1:   objects=158 bytes=541717493
+after write round 2:   objects=295 bytes=1083723931
+after write round 3:   objects=427 bytes=1620916819
+after write round 4:   objects=558 bytes=2158044169
+     512B
+/: 3.5 GiB (3793793024 bytes) trimmed
+after rm + fstrim:       objects=561 bytes=2158365715
+# the GC thread runs every 10 min; force one now
+2026-07-27T08:39:15.382146Z  INFO cats_blockd::engine: garbage collected volume=vol_f9e0f43a8d5e data_objects_live=44 data_objects_deleted=553 map_nodes_live=5 map_nodes_deleted=45
+GC data_live=44 data_deleted=553 nodes_live=5 nodes_deleted=45
+after explicit GC:       objects=44 bytes=136346286
+
+##### 10 concurrent cold creates -- vhost-user, real S3 (comparable with the record)
+== cleanup
+label,phase,requested,completed,min_ms,p50_ms,p95_ms,max_ms,failures
+vhost-user-s3,create,10,10,4836,7850,8000,8000,0
+# settled: 10/10 observed=running after 8s
+# vhost-user-s3: 10/10 running; create batch wall 8003 ms, settled at 8031 ms
+# vhost-user-s3: batch walls create=8003 warm=n/a restore=n/a ms (settled)
+# vhost-user-s3: wake gate telemetry:
+#   metal-1            state=ready     cats=10 cpu=20/128 memory=10240MiB/1031865MiB heartbeat=0s load=3.58
+== cleanup
+== phase 4 done

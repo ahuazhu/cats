@@ -1,11 +1,11 @@
-date_utc: 2026-07-27T08:29:40Z
+date_utc: 2026-07-27T08:39:03Z
 instance_type: i4i.metal
 uname: Linux 6.17.0-1019-aws x86_64
 cpus: 128
 memory_kb: 1056630384
-cache_mount: /var/lib/cats on /dev/nvme8n1 (rotational=)
+cache_mount: /var/lib/cats on /dev/nvme8n1 (Amazon EC2 NVMe Instance Storage)
 cache_fs: ext4
-blob_store: object-store-adapter aws-s3
+blob_store: object-store-adapter file
 cloud_hypervisor: cloud-hypervisor v53.0
 rustc: rustc 1.97.1 (8bab26f4f 2026-07-14)
 git: not a git checkout
@@ -16,61 +16,79 @@ git: not a git checkout
 running 3 tests
 test cold_read_cost_by_delta_chain_length ... 
  layers          objects chunk-at-a-time ms        MiB/s one big read ms        MiB/s
-      0               16           81.4          786           55.4         1156
-      1               32           80.6          794           50.7         1263
-      2               48           82.0          781           50.7         1263
-      4               80           81.4          787           51.4         1246
+      0               16           83.4          768           54.9         1165
+      1               32           82.7          773           52.1         1227
+      2               48           82.1          779           52.0         1231
+      4               80           85.5          749           54.5         1174
 ok
 test flush_cost_for_dense_writes ... 
 dirty chunks  published MiB     flush ms   ms per pub MiB
-           8          32.00        476.7            14.90
-          32         128.00       1956.4            15.28
-          48         192.00       2945.5            15.34
+           8          32.00        472.6            14.77
+          32         128.00       1965.5            15.36
+          48         192.00       2947.4            15.35
 ok
 test flush_cost_scales_with_the_dirty_set ... 
 dirty chunks  dirty pages  published MiB     flush ms   ms per pub MiB   sha256 MiB/s
-           1            1           0.06         21.6           345.54           1277
-           8            8           0.50         28.9            57.73           1271
-          16           16           1.00         30.0            30.03           1284
-          32           32           2.00         41.6            20.78           1281
-          48           48           3.00         48.0            16.00           1278
+           1            1           0.06         21.4           343.00            266
+           8            8           0.50         28.1            56.23           1283
+          16           16           1.00         29.3            29.26           1273
+          32           32           2.00         39.0            19.52           1270
+          48           48           3.00         48.1            16.03           1277
 ok
 
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.56s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.58s
 
 
 ##### golden_root_cost -- local file object store on /dev/nvme8n1
+== cleanup
+label,phase,requested,completed,min_ms,p50_ms,p95_ms,max_ms,failures
+# FAILURE create-rbker-5 rc=1: error: not logged in; run `cats login` 
+# FAILURE create-rbker-2 rc=1: error: not logged in; run `cats login` 
+# FAILURE create-rbker-1 rc=1: error: not logged in; run `cats login` 
+# FAILURE create-rbker-7 rc=1: error: not logged in; run `cats login` 
+# FAILURE create-rbker-6 rc=1: error: not logged in; run `cats login` 
+# FAILURE create-rbker-4 rc=1: error: not logged in; run `cats login` 
+# FAILURE create-rbker-3 rc=1: error: not logged in; run `cats login` 
+# FAILURE create-rbker-10 rc=1: error: not logged in; run `cats login` 
+# FAILURE create-rbker-9 rc=1: error: not logged in; run `cats login` 
+# FAILURE create-rbker-8 rc=1: error: not logged in; run `cats login` 
+kernel-nbd,create,10,10,2,3,3,3,10
+# NOT SETTLED: 0/10 observed=running after 300s
+# kernel-nbd: 0/10 running; create batch wall 8 ms, settled at 300516 ms
+# kernel-nbd: batch walls create=8 warm=n/a restore=n/a ms (settled)
+# kernel-nbd: wake gate telemetry:
+== cleanup
 
 running 3 tests
 test first_read_of_a_referenced_chunk_versus_a_private_one ... 
         path       cold read ms              MiB/s
-        copy               81.8                783
-   reference               80.5                795
+        copy               82.0                780
+   reference               81.3                787
 ok
 test provisioning_many_root_disks_from_one_image ... 
 image 256 MiB, 128 logical cpus
     cats       path uploaded MiB    objects        wall ms    speedup
-       1       copy       256.01         67         4771.4       1.0x
-       1  reference         0.01          3           36.7     129.9x
-       4       copy      1024.02        268        16616.3       1.0x
-       4  reference         0.04         12           93.8     177.2x
-      10       copy      2560.05        670        45309.1       1.0x
-      10  reference         0.11         30          106.8     424.3x
+       1       copy       256.01         67         4178.2       1.0x
+       1  reference         0.01          3           22.7     183.8x
+       4       copy      1024.02        268        16599.8       1.0x
+       4  reference         0.04         12           53.4     310.8x
+      10       copy      2560.05        670        46089.1       1.0x
+      10  reference         0.11         30          108.2     425.9x
 ok
 test provisioning_one_root_disk ... 
  image MiB       path uploaded MiB    objects provision ms    speedup        gen
-        64       copy        64.00         19       1161.9       1.0x          1
-        64  reference         0.00          3         36.0      32.2x          1
-        64  (publish)         once          -        491.8          -          -
-       256       copy       256.01         67       4176.2       1.0x          1
-       256  reference         0.01          3         23.4     178.7x          1
-       256  (publish)         once          -       1888.1          -          -
-       512       copy       512.01        131       8583.3       1.0x          1
-       512  reference         0.02          3         22.5     382.0x          1
-       512  (publish)         once          -       2476.8          -          -
+        64       copy        64.00         19       1062.1       1.0x          1
+        64  reference         0.00          3         24.4      43.6x          1
+        64  (publish)         once          -        521.0          -          -
+       256       copy       256.01         67       4180.6       1.0x          1
+       256  reference         0.01          3         23.3     179.5x          1
+       256  (publish)         once          -       2102.0          -          -
+       512       copy       512.01        131       8648.1       1.0x          1
+       512  reference         0.02          3         22.3     387.3x          1
+       512  (publish)         once          -       2060.7          -          -
 ok
 
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 187.23s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 185.09s
 
 
 ##### commit_cost -- real S3 (s3://cats-bench-20260727f-19334)
@@ -78,27 +96,27 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 running 3 tests
 test cold_read_cost_by_delta_chain_length ... 
  layers          objects chunk-at-a-time ms        MiB/s one big read ms        MiB/s
-      0               16         1067.7           60          165.9          386
-      1               32          870.8           73          154.2          415
-      2               48          848.9           75          156.2          410
-      4               80          970.2           66          183.6          349
+      0               16          805.0           79          167.6          382
+      1               32          869.0           74          166.1          385
+      2               48          904.2           71          168.2          381
+      4               80          863.2           74          189.0          339
 ok
 test flush_cost_for_dense_writes ... 
 dirty chunks  published MiB     flush ms   ms per pub MiB
-           8          32.00        270.9             8.47
-          32         128.00        763.3             5.96
-          48         192.00       1460.5             7.61
+           8          32.00        289.3             9.04
+          32         128.00        718.2             5.61
+          48         192.00       1436.6             7.48
 ok
 test flush_cost_scales_with_the_dirty_set ... 
 dirty chunks  dirty pages  published MiB     flush ms   ms per pub MiB   sha256 MiB/s
-           1            1           0.06        128.0          2048.36           1269
-           8            8           0.50        144.2           288.36            647
-          16           16           1.00        182.1           182.08           1260
-          32           32           2.00        201.3           100.65           1271
-          48           48           3.00        223.4            74.48           1282
+           1            1           0.06        107.3          1716.14           1273
+           8            8           0.50        162.8           325.65           1283
+          16           16           1.00        162.7           162.73           1107
+          32           32           2.00        204.1           102.07           1271
+          48           48           3.00        221.3            73.77           1272
 ok
 
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.44s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.39s
 
 
 ##### golden_root_cost -- real S3 (s3://cats-bench-20260727f-19334)
@@ -106,33 +124,211 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 running 3 tests
 test first_read_of_a_referenced_chunk_versus_a_private_one ... 
         path       cold read ms              MiB/s
-        copy              899.8                 71
-   reference              872.4                 73
+        copy              886.1                 72
+   reference              939.5                 68
 ok
 test provisioning_many_root_disks_from_one_image ... 
 image 256 MiB, 128 logical cpus
     cats       path uploaded MiB    objects        wall ms    speedup
-       1       copy       256.01         67         2566.7       1.0x
-       1  reference         0.01          3           98.7      26.0x
-       4       copy      1024.02        268         8925.7       1.0x
-       4  reference         0.04         12          107.7      82.9x
-      10       copy      2560.05        670        21344.0       1.0x
-      10  reference         0.11         30          162.9     131.0x
+       1       copy       256.01         67         2614.0       1.0x
+       1  reference         0.01          3          144.3      18.1x
+       4       copy      1024.02        268         8933.5       1.0x
+       4  reference         0.04         12          240.9      37.1x
+      10       copy      2560.05        670        22115.6       1.0x
+      10  reference         0.11         30          288.0      76.8x
 ok
 test provisioning_one_root_disk ... 
  image MiB       path uploaded MiB    objects provision ms    speedup        gen
-        64       copy        64.00         19        584.4       1.0x          1
-        64  reference         0.00          3         86.1       6.8x          1
-        64  (publish)         once          -        302.7          -          -
-       256       copy       256.01         67       2584.4       1.0x          1
-       256  reference         0.01          3         96.6      26.7x          1
-       256  (publish)         once          -        971.7          -          -
-       512       copy       512.01        131       5352.1       1.0x          1
-       512  reference         0.02          3         90.4      59.2x          1
-       512  (publish)         once          -       1364.8          -          -
+        64       copy        64.00         19        824.2       1.0x          1
+        64  reference         0.00          3        187.1       4.4x          1
+        64  (publish)         once          -        190.2          -          -
+       256       copy       256.01         67       2629.2       1.0x          1
+       256  reference         0.01          3        167.5      15.7x          1
+       256  (publish)         once          -        506.9          -          -
+       512       copy       512.01        131       5341.8       1.0x          1
+       512  reference         0.02          3        163.6      32.7x          1
+       512  (publish)         once          -        916.1          -          -
 ok
 
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 110.88s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 110.38s
 
 
 ##### fio kernel-nbd round 1
+# kernel-nbd: guest hw queues=1 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+kernel-nbd,randread-4k-qd1,randread,4k,1,53788,210.1,13.9,13,19
+kernel-nbd,randwrite-4k-qd1,randwrite,4k,1,8548,33.4,111.9,38,49
+kernel-nbd,randread-4k-qd32,randread,4k,32,288394,1126.6,108.1,97,171
+Traceback (most recent call last):
+  File "<string>", line 3, in <module>
+  File "/usr/lib/python3.12/json/__init__.py", line 293, in load
+    return loads(fp.read(),
+           ^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/__init__.py", line 346, in loads
+    return _default_decoder.decode(s)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/decoder.py", line 337, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/decoder.py", line 355, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+kernel-nbd,randwrite-4k-qd32,randwrite,4k,32,,,,,
+kernel-nbd,seqread-1m-qd1,read,1M,1,4363,4362.8,195.8,194,226
+Traceback (most recent call last):
+  File "<string>", line 3, in <module>
+  File "/usr/lib/python3.12/json/__init__.py", line 293, in load
+    return loads(fp.read(),
+           ^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/__init__.py", line 346, in loads
+    return _default_decoder.decode(s)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/decoder.py", line 337, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/decoder.py", line 355, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+kernel-nbd,seqwrite-1m-qd1,write,1M,1,,,,,
+
+##### fio kernel-nbd-direct round 1
+# kernel-nbd-direct: guest hw queues=1 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+kernel-nbd-direct,randread-4k-qd1,randread,4k,1,23513,91.8,37.7,35,47
+kernel-nbd-direct,randwrite-4k-qd1,randwrite,4k,1,11023,43.1,85.3,47,84
+kernel-nbd-direct,randread-4k-qd32,randread,4k,32,122438,478.3,339.9,243,371
+kernel-nbd-direct,randwrite-4k-qd32,randwrite,4k,32,18600,72.7,1716.8,569,1253
+kernel-nbd-direct,seqread-1m-qd1,read,1M,1,1441,1441.4,668.4,635,668
+kernel-nbd-direct,seqwrite-1m-qd1,write,1M,1,722,722.2,1337.3,498,700
+
+##### fio vhost-user round 1
+# vhost-user: guest hw queues=4 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+vhost-user,randread-4k-qd1,randread,4k,1,63590,248.4,11.0,10,15
+vhost-user,randwrite-4k-qd1,randwrite,4k,1,8446,33.0,113.1,24,91
+vhost-user,randread-4k-qd32,randread,4k,32,258283,1008.9,120.8,119,169
+vhost-user,randwrite-4k-qd32,randwrite,4k,32,5047,19.7,6335.4,1139,21365
+vhost-user,seqread-1m-qd1,read,1M,1,3764,3763.5,242.9,255,272
+vhost-user,seqwrite-1m-qd1,write,1M,1,1682,1681.8,556.1,301,379
+
+##### fio kernel-nbd round 2
+# kernel-nbd: guest hw queues=1 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+kernel-nbd,randread-4k-qd1,randread,4k,1,55237,215.8,13.5,13,22
+kernel-nbd,randwrite-4k-qd1,randwrite,4k,1,8656,33.8,110.4,33,46
+kernel-nbd,randread-4k-qd32,randread,4k,32,243074,949.5,128.1,136,159
+kernel-nbd,randwrite-4k-qd32,randwrite,4k,32,142919,558.3,220.6,130,232
+kernel-nbd,seqread-1m-qd1,read,1M,1,5813,5812.7,151.9,134,208
+kernel-nbd,seqwrite-1m-qd1,write,1M,1,1368,1367.6,685.2,259,276
+
+##### fio kernel-nbd-direct round 2
+# kernel-nbd-direct: guest hw queues=1 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+kernel-nbd-direct,randread-4k-qd1,randread,4k,1,23180,90.5,38.3,35,45
+kernel-nbd-direct,randwrite-4k-qd1,randwrite,4k,1,7770,30.4,123.7,46,84
+kernel-nbd-direct,randread-4k-qd32,randread,4k,32,120817,472.0,262.6,241,367
+kernel-nbd-direct,randwrite-4k-qd32,randwrite,4k,32,19540,76.3,1634.3,586,1352
+kernel-nbd-direct,seqread-1m-qd1,read,1M,1,1828,1827.7,523.1,522,537
+kernel-nbd-direct,seqwrite-1m-qd1,write,1M,1,743,742.5,1304.9,481,659
+
+##### fio vhost-user round 2
+# vhost-user: guest hw queues=4 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+vhost-user,randread-4k-qd1,randread,4k,1,59942,234.1,11.7,12,16
+vhost-user,randwrite-4k-qd1,randwrite,4k,1,6100,23.8,158.1,31,114
+vhost-user,randread-4k-qd32,randread,4k,32,260420,1017.3,119.7,119,138
+vhost-user,randwrite-4k-qd32,randwrite,4k,32,38491,150.4,829.4,403,1597
+vhost-user,seqread-1m-qd1,read,1M,1,3787,3787.1,238.1,228,285
+vhost-user,seqwrite-1m-qd1,write,1M,1,3110,3110.4,287.4,272,358
+
+##### 10 concurrent cold creates -- kernel-nbd
+== cleanup
+label,phase,requested,completed,min_ms,p50_ms,p95_ms,max_ms,failures
+kernel-nbd,create,10,10,5133,15990,30465,30465,0
+# settled: 10/10 observed=running after 31s
+# kernel-nbd: 10/10 running; create batch wall 30468 ms, settled at 30496 ms
+# kernel-nbd: batch walls create=30468 warm=n/a restore=n/a ms (settled)
+# kernel-nbd: wake gate telemetry:
+#   metal-1            state=ready     cats=10 cpu=20/128 memory=10240MiB/1031865MiB heartbeat=1s load=1.43
+== cleanup
+
+##### acceptance -- kernel-nbd
+== cleanup from previous runs ==
+== 1. cold create -> real VM boots ==
+  PASS  create converges to running
+  PASS  guest runs the direct-boot kernel
+  PASS  guest userland is Ubuntu 24.04
+  FAIL  guest includes apt, curl and git (wanted '/usr/bin/apt-get /usr/bin/curl /usr/bin/git', got '/usr/bin/apt-get')
+  PASS  guest uses the optimized reaping PID 1
+  PASS  Guest Agent is running
+  PASS  guest DNS and HTTPS egress work
+  PASS  guest ext4 root grew to the requested size
+  PASS  guest reports a kernel boot_id (e0faf581-1d3a-435a-977b-0af02177954b)
+== 2. durable write through the real ext4 root ==
+  PASS  wrote /data.txt + sync
+== 3. suspend/resume (vm.pause/resume): same boot ==
+  PASS  suspend
+  PASS  resume
+  PASS  boot_id preserved across suspend/resume
+== 4. warm (vm.snapshot + full exit) / restore: same boot ==
+  PASS  warm
+  PASS  no resident VMM while Warm
+  PASS  restore
+  PASS  boot_id preserved across warm/restore
+  PASS  file survives warm
+== 5. stop/start: fresh boot, durable data intact ==
+  PASS  stop
+  PASS  start
+  PASS  cold start is a fresh boot
+  PASS  flushed data survives cold restart
+== 6. destroy ==
+  PASS  destroy
+
+metal e2e: 22 passed, 1 failed
+
+##### 10 concurrent cold creates -- vhost-user
+== cleanup
+label,phase,requested,completed,min_ms,p50_ms,p95_ms,max_ms,failures
+vhost-user,create,10,10,4071,6937,7388,7388,0
+# settled: 10/10 observed=running after 8s
+# vhost-user: 10/10 running; create batch wall 7392 ms, settled at 7421 ms
+# vhost-user: batch walls create=7392 warm=n/a restore=n/a ms (settled)
+# vhost-user: wake gate telemetry:
+#   metal-1            state=ready     cats=10 cpu=20/128 memory=10240MiB/1031865MiB heartbeat=1s load=1.24
+== cleanup
+
+##### acceptance -- vhost-user
+== cleanup from previous runs ==
+== 1. cold create -> real VM boots ==
+  PASS  create converges to running
+  PASS  guest runs the direct-boot kernel
+  PASS  guest userland is Ubuntu 24.04
+  FAIL  guest includes apt, curl and git (wanted '/usr/bin/apt-get /usr/bin/curl /usr/bin/git', got '/usr/bin/apt-get')
+  PASS  guest uses the optimized reaping PID 1
+  PASS  Guest Agent is running
+  PASS  guest DNS and HTTPS egress work
+  PASS  guest ext4 root grew to the requested size
+  PASS  guest reports a kernel boot_id (b057e9ca-c5ca-4cdc-afc6-4e697a751612)
+== 2. durable write through the real ext4 root ==
+  PASS  wrote /data.txt + sync
+== 3. suspend/resume (vm.pause/resume): same boot ==
+  PASS  suspend
+  PASS  resume
+  PASS  boot_id preserved across suspend/resume
+== 4. warm (vm.snapshot + full exit) / restore: same boot ==
+  PASS  warm
+  PASS  no resident VMM while Warm
+  PASS  restore
+  PASS  boot_id preserved across warm/restore
+  PASS  file survives warm
+== 5. stop/start: fresh boot, durable data intact ==
+  PASS  stop
+  PASS  start
+  PASS  cold start is a fresh boot
+  PASS  flushed data survives cold restart
+== 6. destroy ==
+  PASS  destroy
+
+metal e2e: 22 passed, 1 failed
+
+== wrote /home/ubuntu/cats/experiments/vhost-user-blk-frontend-20260726/raw/metal-rebench.log
