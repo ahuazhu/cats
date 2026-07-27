@@ -632,20 +632,46 @@ us-east-1,真实 S3;串行那一列来自同机型同配置的前两轮)。
 只跑到 73 MiB/s——hydration 一个 chunk 一个 GET,不重叠,和上传原来的毛病一模一样,**还没修**。
 这也意味着 delta 链的冷读放大(最多 5 个对象/chunk)现在是在放大一个串行成本。
 
+## 并发拉起:端到端从 61.6 秒到 8.3 秒(2026-07-27 追加)
+
+上一节把并发创建剩下的 61.6 秒归给了「节点代理之上的一条队列」。查出来就是
+`Controller::tick`:它对每个 Cat **顺序 await** `reconcile_cat`,而 `start_flow → dispatch`
+会一直阻塞到那台 VM 完全起来(约 6 秒)。
+
+**不是把循环改并发就行**——placement 得先变成原子认领:`schedule()` 是把 `cats_on_node` 求和
+算出节点已用容量,再由 `start_flow` 在**另一次** store 调用里写 placement;十个 flow 一起跑会
+读到同一份空闲容量、全都认领它,把节点超卖。`Store::claim_node_for` 现在在一次加锁里完成
+「选节点 + 记 placement」,然后 tick 才敢并发(上限 32)。
+
+原始数据 [`raw/metal-concurrent-reconcile.log`](raw/metal-concurrent-reconcile.log)。10 个 Cat
+同时冷创建,i4i.metal + 真 KVM + 真实 S3:
+
+| 版本 | 墙钟 | min | p50 | max | 失败 |
+|---|---|---|---|---|---|
+| 复制 rootfs + 串行 reconcile | 121.4 s | 11.8 s | 88.5 s | 121.4 s | 4 |
+| golden root + 串行 reconcile | 61.6 s | 8.2 s | 28.1 s | 61.6 s | 0 |
+| golden root + **并发 reconcile** | **8.3 s** | **4.8 s** | **8.0 s** | **8.3 s** | **0** |
+
+**形状变了,不只是数字变小**:之前是一条 6 秒/个的斜坡(min 8.2、p50 28、max 61.6),现在
+十个 Cat 花的时间和一个差不多(min 4.8、p50 8.0、max 8.3)。整批已经落在单个 create
+(4.5–6.9 秒)的两倍以内,也就是说剩下的成本是 VM 启动和 guest agent 就绪,不再是排队。
+
+相对本分支起点(121.4 秒、4 个失败)是 **14.6×**,相对上一版是 **7.4×**。
+
+同一轮的验收:`metal e2e: 22 passed, 1 failed`,仍是那条 golden rootfs 里没有 `git` 的陈旧断言。
+
 ## 仍未验证 / 后续项
 
 1. **读路径也要并发**:hydration 一个 chunk 一个 GET,64 MiB 冷读只有 73 MiB/s。上传已经改了,
    读没有。delta 链的冷读放大现在放大的是一个串行成本。
-2. **减少每次提交的对象数**:并发上传之后这一项的收益变小了,但没消失(往返总数仍然线性)。
+2. ~~减少每次提交的对象数~~:**评估后不做**,理由与数字见
+   [ADR-0016](../../docs/decisions/0016-delta-pack-page-granular-commits.md)「关于打包成一个对象」。
 3. **delta 链的冷读放大**:满链 chunk 冷读取 5 个对象,链长分布与跨节点冷迁移的实际影响
    还没在真机上单独量过。
-4. **并发冷创建的串行源头**(已定位,未修):`Controller::tick` 对每个 Cat **顺序 await**
-   `reconcile_cat`,而 `start_flow → dispatch` 会一直阻塞到 launch 全部完成(约 6 s),这就是
-   10 个并发创建那条 6 秒/个的斜坡。不是一行能改完的:`schedule()` 先把 `cats_on_node` 求和算出
-   已用容量,再由 `start_flow` 写入 placement,两次 store 调用之间没有事务;并发跑会让多个 Cat
-   同时选中同一个节点、把它超卖。要先把「选节点 + 占容量」做成一次原子认领。
-5. **GC**:仍未实现。delta pack 要求把 base 与全部 delta 都视为存活,golden root 要求把镜像
-   对象视为镜像所有,两者都必须在实现 GC 时落到代码里。
+4. **单个 create 的 4.5–6.9 秒**:并发拉起解决之后,这就是下一个天花板,成分是 VM 启动
+   与 guest agent 就绪,不再是存储或排队。
+5. ~~GC~~:**已实现**,见[协议 §9](../../docs/specs/blockd-protocol.md)与
+   `cats-blockd --collect-garbage`。镜像本身的回收仍然是运营方显式操作。
 6. **多队列在真实 vCPU 数下的收益曲线**:本次只验了 1 和 4 两个点,而且已知队列多不等于更快。
 7. **长时间 soak 与多 Cat 同机压力**:本次每个场景都是单样本,不构成 SLA。
 8. **`nbd` 内核模块依赖的移除**:`install.sh` 仍无条件 `modprobe nbd`,以便随时切回默认路径。

@@ -89,6 +89,15 @@ fn object_store(dir: &Path, prefix: &str) -> Arc<dyn BlobStore> {
     }
 }
 
+/// A benchmark deliberately runs commits that take tens of seconds against a
+/// remote store, which the 5 s default lease does not survive.
+fn bench_lease_ttl_ms() -> i64 {
+    std::env::var("CATS_BENCH_LEASE_TTL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5_000)
+}
+
 struct Env {
     _dir: tempfile::TempDir,
     root: std::path::PathBuf,
@@ -105,12 +114,9 @@ impl Env {
 
     /// Attach again after the local cache has been deleted: a fresh host.
     fn reattach(&self, attachment: &str) -> Arc<ChunkEngine> {
-        ChunkEngine::attach(
-            EngineConfig::new("vol_commit", self.data_dir(), attachment),
-            self.blob.clone(),
-            self.meta.clone(),
-        )
-        .expect("reattach")
+        let mut cfg = EngineConfig::new("vol_commit", self.data_dir(), attachment);
+        cfg.lease_ttl_ms = bench_lease_ttl_ms();
+        ChunkEngine::attach(cfg, self.blob.clone(), self.meta.clone()).expect("reattach")
     }
 }
 
@@ -124,12 +130,9 @@ fn env(chunks: u64, run: &str) -> Env {
     meta.create_volume("vol_commit", chunks * CHUNK)
         .expect("volume");
     let meta_for_reattach = meta.clone();
-    let engine = ChunkEngine::attach(
-        EngineConfig::new("vol_commit", dir.path().join("data"), "att-commit"),
-        published.clone(),
-        meta,
-    )
-    .expect("attach");
+    let mut cfg = EngineConfig::new("vol_commit", dir.path().join("data"), "att-commit");
+    cfg.lease_ttl_ms = bench_lease_ttl_ms();
+    let engine = ChunkEngine::attach(cfg, published.clone(), meta).expect("attach");
     Env {
         root: dir.path().to_path_buf(),
         _dir: dir,
@@ -249,8 +252,8 @@ fn flush_cost_for_dense_writes() {
 fn cold_read_cost_by_delta_chain_length() {
     let chunks = 16u64;
     println!(
-        "\n{:>7} {:>16} {:>14} {:>12} {:>14}",
-        "layers", "objects to fetch", "cold read ms", "MiB/s", "ms per chunk"
+        "\n{:>7} {:>16} {:>14} {:>12} {:>14} {:>12}",
+        "layers", "objects", "chunk-at-a-time ms", "MiB/s", "one big read ms", "MiB/s"
     );
     for layers in [0u64, 1, 2, 4] {
         let env = env(chunks, &format!("chain-{layers}"));
@@ -272,22 +275,36 @@ fn cold_read_cost_by_delta_chain_length() {
         // A host with nothing cached.
         std::fs::remove_dir_all(env.data_dir()).ok();
         let engine = env.reattach("cold");
+        // Chunk at a time: what a Guest doing 4 MiB reads produces. Only the
+        // layers of one chunk can overlap here, which is the amplification
+        // ADR-0016 is charged for.
         let mut buf = vec![0u8; CHUNK as usize];
         let started = Instant::now();
         for chunk in 0..chunks {
             engine.read(chunk * CHUNK, &mut buf).expect("cold read");
         }
-        let elapsed = started.elapsed().as_secs_f64();
+        let per_chunk = started.elapsed().as_secs_f64();
+        engine.detach();
+
+        // Whole volume in one call: what a migration or a large sequential read
+        // produces, where chunks overlap too.
+        std::fs::remove_dir_all(env.data_dir()).ok();
+        let engine = env.reattach("cold-bulk");
+        let mut whole = vec![0u8; (chunks * CHUNK) as usize];
+        let started = Instant::now();
+        engine.read(0, &mut whole).expect("bulk cold read");
+        let bulk = started.elapsed().as_secs_f64();
         engine.detach();
 
         let mib = (chunks * CHUNK) as f64 / MIB;
         println!(
-            "{:>7} {:>16} {:>14.1} {:>12.0} {:>14.1}",
+            "{:>7} {:>16} {:>14.1} {:>12.0} {:>14.1} {:>12.0}",
             layers,
             chunks * (layers + 1),
-            elapsed * 1000.0,
-            mib / elapsed,
-            elapsed * 1000.0 / chunks as f64
+            per_chunk * 1000.0,
+            mib / per_chunk,
+            bulk * 1000.0,
+            mib / bulk
         );
     }
 }

@@ -153,17 +153,24 @@ fn golden_image(dir: &Path, mib: u64) -> PathBuf {
     path
 }
 
+fn bench_lease_ttl_ms() -> i64 {
+    std::env::var("CATS_BENCH_LEASE_TTL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5_000)
+}
+
 fn attach(env: &Env, volume: &str, size: u64) -> Arc<ChunkEngine> {
     match env.meta.create_volume(volume, size) {
         Ok(()) | Err(cats_storage::MetaError::AlreadyExists(_)) => {}
         Err(error) => panic!("create volume: {error}"),
     }
-    ChunkEngine::attach(
-        EngineConfig::new(volume, env.root.join(format!("data-{volume}")), volume),
-        env.blob.clone(),
-        env.meta.clone(),
-    )
-    .expect("attach")
+    let mut cfg = EngineConfig::new(volume, env.root.join(format!("data-{volume}")), volume);
+    // A benchmark deliberately runs commits that take tens of seconds against a
+    // remote store; the 5 s default lease would expire under the copy path and
+    // fail the CAS, which is a property of the benchmark, not of the code.
+    cfg.lease_ttl_ms = bench_lease_ttl_ms();
+    ChunkEngine::attach(cfg, env.blob.clone(), env.meta.clone()).expect("attach")
 }
 
 /// The old path: write the image through the engine and commit it.
