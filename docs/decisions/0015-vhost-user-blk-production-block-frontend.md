@@ -77,6 +77,9 @@ ADR-0001 第 3 条把「接入 Cloud Hypervisor vhost-user-blk」列为 V1 里�
 **2026-07-27 复测:判据 (a) 已满足,默认值仍然不翻。**delta pack 确实把提交成本降下来了
 (真实 S3 上 48 个 dirty chunk 的 FLUSH 1437 → 211 ms),于是按上面这条把六种 fio 负载重跑了一遍
 ([原始数据](../../experiments/vhost-user-blk-frontend-20260726/raw/metal-blockpath-fio-rerun.log))。
+(**这一轮的环境有配置失误**:ChunkStore 本地 cache 留在 EBS 上而不是实例本地 NVMe,对象存储也
+换成了 S3,所以**绝对值不能和 2026-07-26 那张表比**,也不能当作产品吞吐引用;下面这个结论靠的是
+同一轮内部的自相矛盾,不依赖绝对值。)
 结果测出来的是**宿主 page cache 而不是前端**:同一条 kernel-nbd 路径同一轮里,4k 随机写 QD32
 是 64419 IOPS / p99 237 µs,1M 顺序写却只有 8.7 MiB/s / p99 851 ms。要做 like-for-like 对比,
 kernel-nbd 必须以 `direct=on` 打开,而节点代理**今天没有这个选项**——这是现在真正的卡点,

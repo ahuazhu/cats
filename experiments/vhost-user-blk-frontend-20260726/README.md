@@ -696,6 +696,14 @@ ADR-0016 把「冷读放大」列为 delta pack 的主要代价(满链一个 chu
 [`raw/metal-blockpath-fio-rerun.log`](raw/metal-blockpath-fio-rerun.log)(i4i.metal + 真 KVM +
 真实 S3,fio 已经打进 golden image,单样本)。
 
+> ⚠️ **这一轮的环境配错了,绝对值不可用,也不能和上面 2026-07-26 那张 fio 表对比。**
+> ChunkStore 的本地 cache 留在了 EBS gp3 根卷上,而 2026-07-26 那轮把它挂在**实例本地 NVMe**
+> 上(`/dev/nvme0n1` → `/var/lib/cats`),对象存储也是那块 NVMe 上的 file adapter 而不是 S3。
+> 两处叠加,导致下面 4 KiB 随机写 QD32 只有 602 次/秒,而 2026-07-26 同一个负载是
+> 23379–33000 次/秒。**别把这里的绝对值当成产品的吞吐引用。**
+> 下面那个「默认值不翻」的结论仍然成立,因为它靠的是**同一轮内部自相矛盾**而不是任何绝对值;
+> 但这一轮要在文档记录的环境上重跑,数字才有意义。
+
 **结论:默认值不翻。**理由不是 delta pack 没效果,而是这组数字**测的是宿主 page cache 不是前端**
 ——同一条路径同一轮里自相矛盾:
 

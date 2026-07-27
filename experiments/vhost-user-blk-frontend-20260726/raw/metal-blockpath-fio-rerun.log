@@ -1,6 +1,23 @@
 Guest fio, both block paths, re-run after delta packs and concurrent uploads.
 
+!! READ THIS FIRST -- THE ENVIRONMENT IS NOT COMPARABLE TO THE 2026-07-26 TABLE !!
+!!
+!! The ChunkStore local cache was left on the EBS gp3 root volume. The 2026-07-26
+!! run this is naturally read against put it on the instance NVMe
+!! (/dev/nvme0n1 mounted at /var/lib/cats), and used a file object store on that
+!! same NVMe rather than S3. Both differences push write numbers down hard, and
+!! together they account for the 4k randwrite QD32 figure below being 602 IOPS
+!! where 2026-07-26 measured 23379-33000 for the same workload.
+!!
+!! So: do NOT quote the absolute numbers here as the product's throughput, and do
+!! NOT compare any row to the 2026-07-26 table. The kernel-nbd-versus-vhost-user
+!! conclusion at the bottom survives, because it rests on an internal
+!! contradiction within this run rather than on any absolute value -- but the run
+!! needs redoing on the documented environment before its numbers mean anything.
+
 host:     AWS i4i.metal, real KVM, Cloud Hypervisor, real in-region S3
+          ChunkStore cache on the EBS gp3 root volume -- NOT the instance NVMe the
+          2026-07-26 run used, which is the flaw described above
 build:    this branch; fio in the golden image, 4 vCPU / 2 GiB Cat, ext4 root,
           --direct=1, 1 GiB file, 10 s runtime, 2 s ramp, single sample per point
 date_utc: 2026-07-27
