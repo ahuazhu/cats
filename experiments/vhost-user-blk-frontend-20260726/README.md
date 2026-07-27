@@ -486,6 +486,31 @@ provision 延迟与镜像大小**无关**(恒定约 7 ms):它只写 map node 与
 [`raw/metal-concurrent-create-ab.log`](raw/metal-concurrent-create-ab.log)、
 [`raw/metal-e2e-golden-root.log`](raw/metal-e2e-golden-root.log)。
 
+### Delta Pack 在真实 S3 上:收益比本地**小**,不是更大
+
+原始数据 [`raw/metal-delta-pack-s3.log`](raw/metal-delta-pack-s3.log)(c6a.8xlarge,
+us-east-1;这是纯 blockd benchmark,不需要 KVM,所以用便宜机型跑,同机带本地对象存储对照)。
+
+同一轮内 dense(整块发布)→ sparse(delta pack)的 FLUSH 延迟:
+
+| dirty chunks | 真实 S3 | 同机本地文件存储 |
+|---|---|---|
+| 8 | 858.9 → 374.0 ms = **2.3×** | 166.4 → 43.8 ms = 3.8× |
+| 32 | 3031.5 → 1149.4 ms = **2.6×** | 1974.0 → 140.2 ms = 14.1× |
+| 48 | 4913.5 → 1669.3 ms = **2.9×** | 2974.7 → 312.6 ms = 9.5× |
+
+**这纠正了这一轮之前写下的一个猜测**(「两项改动在 S3 上应该只会更好」)。delta pack 把发布
+字节降 64×,但**每次提交的对象数不变**——每个 dirty chunk 仍然一个对象——而 S3 上一个对象就是
+一次 PUT 往返,于是 delta pack 没有触及的那部分固定成本占比大得多。sparse 那几行直接把它显示
+出来:48 chunk 时 **556 ms/发布 MiB**,而 dense 是 25.6 ms/发布 MiB;也就是说,sparse 提交付的
+是往返,不是字节。
+
+Golden root 没有这个性质(它把对象整个去掉了,所以 S3 上 162× 反而比本地 102× 更大);
+delta pack 有,而这正是 ADR-0016 已经点名的下一步最有力的论据:**把多个 chunk 的 delta 打包成
+一个对象**,让提交的对象数跟着字节数一起降。
+
+发布字节降 64× 是算术,在哪都成立;能换回多少 flush 时间取决于后端。
+
 ### Golden Root 在真实 S3 上的存储成本
 
 每个对象都是一次真实 PUT 往返,而不是本地的 create + `sync_data` + hard_link:
@@ -557,10 +582,8 @@ Error: seed volume from image /opt/cats/guest/rootfs.ext4
 5. **多队列在真实 vCPU 数下的收益曲线**:本次只验了 1 和 4 两个点,而且已知队列多不等于更快。
 6. **长时间 soak 与多 Cat 同机压力**:本次每个场景都是单样本,不构成 SLA。
 7. **`nbd` 内核模块依赖的移除**:`install.sh` 仍无条件 `modprobe nbd`,以便随时切回默认路径。
-8. **delta pack 没有在真实 S3 上量过**(golden root 已经量了,见上一节)。这一条对一个具体
-   说法有影响:delta pack 把发布**字节**降 64×,但每次提交的**对象数不变**,而 S3 上一个对象
-   就是一次 PUT 往返——所以那里的延迟收益应该**小于**本地测到的 3.8×,而不是更大。字节数的
-   下降是算术,在哪里都成立。
+8. **把多次 chunk 的 delta 合并成一个对象**:真实 S3 上 delta pack 只有 2.3–2.9×(本地
+   3.8–14×),差别全在「对象数没降」上,见上面那一节。这是目前证据最强的下一个杠杆。
 9. **并发拉起的天花板应该由实测饱和点决定**,而不是沿用 wake 的那个常量。
 
 ## 复现

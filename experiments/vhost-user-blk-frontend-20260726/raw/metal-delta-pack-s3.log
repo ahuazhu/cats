@@ -1,0 +1,69 @@
+Delta Pack (ADR-0016) against real S3, with a same-machine local-store control.
+
+host:     AWS c6a.8xlarge, 32 vCPU, us-east-1 (no KVM needed: this is a pure
+          blockd benchmark, so it runs on a cheap instance rather than metal)
+store:    temporary in-region S3 bucket; control is a file store on the root EBS
+build:    release, this branch
+date_utc: 2026-07-27
+
+blockd/tests/commit_cost.rs, median of 3, serial. "sparse" is one dirty 64 KiB
+page per chunk -- the shape a 4 KiB random-write Guest produces, and what delta
+packs change. "dense" is every page dirty, which still publishes full 4 MiB bases
+and is therefore both the control and a stand-in for the old behaviour on ANY
+dirty chunk.
+
+--- real S3 -------------------------------------------------------------------
+
+dense (full 4 MiB bases):
+dirty chunks  published MiB     flush ms   ms per pub MiB
+           8          32.00        858.9            26.84
+          32         128.00       3031.5            23.68
+          48         192.00       4913.5            25.59
+
+sparse (delta packs):
+dirty chunks  dirty pages  published MiB     flush ms   ms per pub MiB   sha256 MiB/s
+           1            1           0.06        125.4          2006.73           1227
+           8            8           0.50        374.0           748.09           1695
+          16           16           1.00        630.3           630.33           1566
+          32           32           2.00       1149.4           574.69           1656
+          48           48           3.00       1669.3           556.43           1685
+
+--- control: same machine, local file object store -----------------------------
+
+dense:
+           8          32.00        166.4             5.20
+          32         128.00       1974.0            15.42
+          48         192.00       2974.7            15.49
+
+sparse:
+           1            1           0.06         19.9           318.29           1681
+           8            8           0.50         43.8            87.53           1696
+          16           16           1.00         76.8            76.78           1654
+          32           32           2.00        140.2            70.08           1680
+          48           48           3.00        312.6           104.20           1673
+
+--- what this says -------------------------------------------------------------
+
+FLUSH latency, dense -> sparse, same run:
+
+  dirty chunks     on S3            on the local store
+             8     858.9 -> 374.0   =  2.3x     166.4 ->  43.8  =  3.8x
+            32    3031.5 -> 1149.4  =  2.6x    1974.0 -> 140.2  = 14.1x
+            48    4913.5 -> 1669.3  =  2.9x    2974.7 -> 312.6  =  9.5x
+
+**The win is SMALLER on S3, not larger.** This corrects the guess recorded before
+this run ("both changes should look better on S3"). Delta packs cut published
+bytes 64x but leave the object *count* unchanged -- one object per dirty chunk
+either way -- and on S3 an object is a PUT round trip, so the fixed per-object
+cost that delta packs do not touch is a much larger share of the total. It shows
+up directly in the sparse rows: 556 ms per published MiB at 48 chunks, against
+25.6 ms per published MiB for the dense case, i.e. the sparse commit is paying for
+round trips, not for bytes.
+
+Golden roots do not have this property (they remove the objects entirely, so they
+are 162x on S3 against 102x locally); delta packs do, and it is the clearest
+argument yet for the follow-up ADR-0016 already names: pack several chunks'
+deltas into one object, so a commit's object count falls with its byte count.
+
+The 64x reduction in published bytes is arithmetic and holds everywhere. What
+varies by backend is how much of the flush that buys back.
