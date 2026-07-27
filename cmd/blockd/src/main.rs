@@ -20,16 +20,18 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(name = "cats-blockd", about = "Cats ChunkStore block backend")]
 struct Args {
+    /// Required unless `--publish-image` is given, which serves no volume.
     #[arg(long)]
-    volume_id: String,
+    volume_id: Option<String>,
     #[arg(long)]
-    data_dir: PathBuf,
+    data_dir: Option<PathBuf>,
     #[arg(long)]
-    attachment_id: String,
+    attachment_id: Option<String>,
 
-    /// Provider-neutral metadata-store adapter name.
+    /// Provider-neutral metadata-store adapter name. Not needed to publish an
+    /// image, which touches no volume metadata.
     #[arg(long)]
-    metadata_store_adapter: String,
+    metadata_store_adapter: Option<String>,
     /// Opaque metadata adapter option (`key=value`); may be repeated.
     #[arg(long = "metadata-store-option", value_name = "KEY=VALUE")]
     metadata_store_options: Vec<String>,
@@ -64,13 +66,30 @@ struct Args {
     #[arg(long)]
     create_volume_size: Option<u64>,
 
-    /// Provision an empty volume from this raw image, sharing one published copy
-    /// of it across every volume that starts from it (ADR-0017).
+    /// Publish this raw image as a shared base image and exit, printing
+    /// `IMAGE <image-id>` (ADR-0017).
     ///
-    /// Publishing is idempotent and keyed by the image's digest, so passing this
-    /// on every launch is the intended usage: the first launch uploads the image,
-    /// every later one references it. A volume that already has a generation is
-    /// left alone, which is what makes this safe to pass on a resume too.
+    /// Separate from serving a volume on purpose: publishing uploads the whole
+    /// image and belongs to the fleet, not to one attachment. Doing it while
+    /// holding a volume's lease means holding a lease (1.5 s as the node agent
+    /// configures it) across a multi-second upload, which real hardware showed
+    /// loses the lease and fails the launch. Idempotent and keyed by the image's
+    /// digest, so calling it on every node start is the intended usage.
+    #[arg(long)]
+    publish_image: Option<PathBuf>,
+
+    /// Provision an empty volume from an already-published image (ADR-0017).
+    ///
+    /// This is the per-launch path: it costs one manifest GET plus a map write,
+    /// no data bytes. A volume that already has a generation is left alone, so it
+    /// is safe to pass on a resume too.
+    #[arg(long, conflicts_with = "seed_image")]
+    seed_image_id: Option<String>,
+
+    /// Provision an empty volume from this raw image, publishing it first if
+    /// needed. Convenient for standalone and dev use; a node agent should
+    /// `--publish-image` once and then pass `--seed-image-id`, because this path
+    /// re-hashes the image on every launch to learn its id.
     #[arg(long)]
     seed_image: Option<PathBuf>,
 
@@ -82,13 +101,33 @@ struct Args {
     acquire_wait_ms: u64,
 }
 
+/// Publish a shared base image and report what it cost.
+fn publish_image(blob: &dyn cats_storage::BlobStore, path: &Path) -> Result<()> {
+    let started = std::time::Instant::now();
+    let published = cats_blockd::image::publish(blob, path).context("publish base image")?;
+    tracing::info!(
+        image = %published.manifest.image_id,
+        chunks = published.manifest.chunks.len(),
+        already_published = published.already_present,
+        uploaded_objects = published.objects_written,
+        uploaded_bytes = published.bytes_written,
+        publish_ms = started.elapsed().as_millis(),
+        "published base image"
+    );
+    // Machine-readable, so a node agent can publish once and then pass
+    // --seed-image-id to every launch.
+    println!("IMAGE {}", published.manifest.image_id);
+    Ok(())
+}
+
 /// Provision a fresh volume from a shared base image, or do nothing if it already
-/// has data. Publishing the image happens here rather than in a separate step so
-/// a node needs no image-management state of its own.
+/// has data.
+///
+/// The manifest is resolved *before* attaching, so no lease is held while the
+/// image is being read or uploaded; only the map write happens under the lease.
 fn seed_from_image(
     engine: &cats_blockd::engine::ChunkEngine,
-    blob: &dyn cats_storage::BlobStore,
-    path: &Path,
+    manifest: &cats_blockd::format::ImageManifest,
 ) -> Result<()> {
     if engine.generation() != 0 {
         tracing::info!(
@@ -98,20 +137,13 @@ fn seed_from_image(
         return Ok(());
     }
     let started = std::time::Instant::now();
-    let published = cats_blockd::image::publish(blob, path).context("publish base image")?;
-    let publish_us = started.elapsed().as_micros();
-    let provision = std::time::Instant::now();
     let generation = engine
-        .provision_from_image(&published.manifest)
+        .provision_from_image(manifest)
         .context("provision from base image")?;
     tracing::info!(
-        image = %published.manifest.image_id,
-        chunks = published.manifest.chunks.len(),
-        image_already_published = published.already_present,
-        uploaded_objects = published.objects_written,
-        uploaded_bytes = published.bytes_written,
-        publish_us,
-        provision_us = provision.elapsed().as_micros(),
+        image = %manifest.image_id,
+        chunks = manifest.chunks.len(),
+        provision_ms = started.elapsed().as_millis(),
         generation,
         "seeded volume from a shared base image"
     );
@@ -133,33 +165,6 @@ fn main() -> Result<()> {
         queue_size: args.vhost_user_queue_size,
     };
 
-    // Reject an impossible listener set before taking the attachment lease.
-    if args.listen_unix.is_some() && args.listen_tcp.is_some() {
-        bail!("--listen-unix and --listen-tcp are mutually exclusive");
-    }
-    if args.listen_unix.is_none() && args.listen_tcp.is_none() && args.listen_vhost_user.is_none() {
-        bail!("give at least one of --listen-unix, --listen-tcp or --listen-vhost-user");
-    }
-
-    let metadata_config =
-        AdapterConfig::from_cli(args.metadata_store_options).context("metadata adapter options")?;
-    let metadata_factories: [&dyn MetadataStoreFactory; 2] =
-        [&SqliteMetadataStoreFactory, &PostgresMetadataStoreFactory];
-    let meta = open_metadata_store(
-        &args.metadata_store_adapter,
-        &metadata_config,
-        &metadata_factories,
-    )
-    .context("open metadata store")?;
-
-    if let Some(size) = args.create_volume_size {
-        let size = cats_api::chunk::round_up_to_chunk(size);
-        match meta.create_volume(&args.volume_id, size) {
-            Ok(()) | Err(MetaError::AlreadyExists(_)) => {}
-            Err(error) => return Err(error).context("create volume"),
-        }
-    }
-
     let object_config =
         AdapterConfig::from_cli(args.object_store_options).context("object adapter options")?;
     let object_factories: [&dyn BlobStoreFactory; 2] =
@@ -171,10 +176,74 @@ fn main() -> Result<()> {
     )
     .context("open object store")?;
 
+    // Publishing an image serves no volume, so it needs neither a lease nor a
+    // metadata store, and it must not hold one: the upload takes seconds.
+    if let Some(path) = &args.publish_image {
+        return publish_image(blob.as_ref(), path);
+    }
+
+    // Reject an impossible listener set before taking the attachment lease.
+    if args.listen_unix.is_some() && args.listen_tcp.is_some() {
+        bail!("--listen-unix and --listen-tcp are mutually exclusive");
+    }
+    if args.listen_unix.is_none() && args.listen_tcp.is_none() && args.listen_vhost_user.is_none() {
+        bail!("give at least one of --listen-unix, --listen-tcp or --listen-vhost-user");
+    }
+    let volume_id = args
+        .volume_id
+        .clone()
+        .context("--volume-id is required to serve a volume")?;
+    let data_dir = args
+        .data_dir
+        .clone()
+        .context("--data-dir is required to serve a volume")?;
+    let attachment_id = args
+        .attachment_id
+        .clone()
+        .context("--attachment-id is required to serve a volume")?;
+    let metadata_store_adapter = args
+        .metadata_store_adapter
+        .clone()
+        .context("--metadata-store-adapter is required to serve a volume")?;
+
+    // Resolve the image before attaching, for the same reason: reading and
+    // uploading it must not happen under the volume's lease.
+    let seed = match (&args.seed_image_id, &args.seed_image) {
+        (Some(image_id), _) => Some(
+            cats_blockd::image::load(blob.as_ref(), image_id)
+                .with_context(|| format!("load base image {image_id}"))?,
+        ),
+        (None, Some(path)) => Some(
+            cats_blockd::image::publish(blob.as_ref(), path)
+                .with_context(|| format!("publish base image {}", path.display()))?
+                .manifest,
+        ),
+        (None, None) => None,
+    };
+
+    let metadata_config =
+        AdapterConfig::from_cli(args.metadata_store_options).context("metadata adapter options")?;
+    let metadata_factories: [&dyn MetadataStoreFactory; 2] =
+        [&SqliteMetadataStoreFactory, &PostgresMetadataStoreFactory];
+    let meta = open_metadata_store(
+        &metadata_store_adapter,
+        &metadata_config,
+        &metadata_factories,
+    )
+    .context("open metadata store")?;
+
+    if let Some(size) = args.create_volume_size {
+        let size = cats_api::chunk::round_up_to_chunk(size);
+        match meta.create_volume(&volume_id, size) {
+            Ok(()) | Err(MetaError::AlreadyExists(_)) => {}
+            Err(error) => return Err(error).context("create volume"),
+        }
+    }
+
     let config = EngineConfig {
-        volume_id: args.volume_id.clone(),
-        data_dir: args.data_dir.clone(),
-        attachment_id: args.attachment_id.clone(),
+        volume_id: volume_id.clone(),
+        data_dir,
+        attachment_id,
         lease_ttl_ms: args.lease_ttl_ms,
     };
     let deadline =
@@ -193,15 +262,15 @@ fn main() -> Result<()> {
     };
 
     tracing::info!(
-        volume = %args.volume_id,
+        volume = %volume_id,
         epoch = engine.epoch(),
         generation = engine.generation(),
         "attached"
     );
 
-    if let Some(path) = &args.seed_image {
-        seed_from_image(&engine, blob.as_ref(), path)
-            .with_context(|| format!("seed volume from image {}", path.display()))?;
+    if let Some(manifest) = &seed {
+        seed_from_image(&engine, manifest)
+            .with_context(|| format!("seed volume {volume_id} from image {}", manifest.image_id))?;
     }
 
     // Bind every requested socket before printing READY: a VMM told to start on

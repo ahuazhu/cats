@@ -1,0 +1,72 @@
+Golden Root (ADR-0017) against real S3 on real hardware.
+
+host:     AWS i4i.metal, 128 logical cpus, 1 TiB RAM, Ubuntu 24.04, kernel 6.17
+region:   us-east-1, S3 bucket in-region, temporary
+build:    release, this branch
+date_utc: 2026-07-27
+
+blockd/tests/golden_root_cost.rs with CATS_BENCH_S3_BUCKET set, so every object is
+a real PUT round trip instead of a local create + sync_data + hard_link.
+
+  copy      = stream the image into the volume and commit it (what a create did)
+  reference = publish the image once, provision by referencing its chunks
+
+One create:
+
+ image MiB       path uploaded MiB    objects provision ms    speedup        gen
+        64       copy        64.00         19       1977.6       1.0x          1
+        64  reference         0.00          3        897.4       2.2x          1
+        64  (publish)         once          -       1601.8          -          -
+       256       copy       256.01         67       7534.7       1.0x          1
+       256  reference         0.01          3         88.1      85.5x          1
+       256  (publish)         once          -       6719.0          -          -
+       512       copy       512.01        131      15472.6       1.0x          1
+       512  reference         0.02          3         89.7     172.6x          1
+       512  (publish)         once          -       8310.1          -          -
+
+The 64 MiB "reference" row at 897 ms is the first S3 call of the process and
+carries connection and TLS setup; the steady-state figure is the ~88-90 ms of the
+256 and 512 MiB rows, and it does not grow with the image.
+
+N Cats from one image at once (256 MiB image, lease TTL raised, see below):
+
+    cats       path uploaded MiB    objects        wall ms    speedup
+       1       copy       256.01         67         7796.7       1.0x
+       1  reference         0.01          3          152.7      51.0x
+       4       copy      1024.02        268        13827.6       1.0x
+       4  reference         0.04         12          208.0      66.5x
+      10       copy      2560.05        670        27230.0       1.0x
+      10  reference         0.11         30          167.4     162.6x
+
+Reading:
+
+* On S3 the win is larger than on a local store (172x vs 178x for one create is a
+  coincidence of different baselines; for 10 concurrent it is 162x on S3 against
+  102x locally) because the copy side pays a PUT round trip per 4 MiB object.
+* The reference side is flat in both the image size and the number of Cats:
+  ~90-210 ms regardless. It writes map nodes and a commit record, nothing else.
+* Publishing 512 MiB costs 8.3 s once per image digest.
+
+Two things this run found, both fixed on this branch:
+
+1. The first attempt at wiring this had `cats-blockd --seed-image` publish the
+   image *after* attaching, i.e. while holding the volume lease. The node agent
+   configures a 1.5 s lease TTL, and an 8 s upload lost it:
+
+     INFO  attached volume=vol_f11ad38fc6d3 epoch=1 generation=0
+     ERROR lease renewal failed; fencing writes: lease epoch is stale or expired
+     Error: seed volume from image /opt/cats/guest/rootfs.ext4
+            provision from base image: attachment is fenced; refusing writes
+
+   Publishing is fleet-wide work and needs no lease, so it now happens before the
+   attach, and the node agent publishes once per node via
+   `cats-blockd --publish-image` and passes `--seed-image-id` to each launch.
+   A launch therefore pays one manifest GET plus a map write.
+
+2. The concurrent case of the benchmark itself failed the same way
+   (CasConflict{expected: 0}) because a 27 s copy-path commit outlives the
+   5 s default lease. Benchmarks that deliberately run multi-second commits now
+   set CATS_BENCH_LEASE_TTL_MS. Worth noting as an operational property: with
+   full-chunk commits a 512 MiB seed commit takes 15 s on S3 against a 1.5 s
+   lease, and survives only because renewal runs concurrently. Delta packs
+   shorten commits by the same factor they shrink them.

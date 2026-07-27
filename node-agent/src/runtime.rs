@@ -298,6 +298,11 @@ pub struct NodeRuntime {
     /// Bounds concurrent wakes so a wake storm degrades linearly instead of
     /// collapsing the way 10× concurrency on EBS did (19.05 s vs 0.53 s).
     admission: WakeAdmission,
+    /// Image id of the golden root, published once per node rather than once per
+    /// launch. Publishing uploads the whole image; a launch must not pay for that
+    /// (and must not hold a volume lease across it), so the node does it up front
+    /// and every launch then provisions by reference.
+    seed_image_id: Mutex<Option<String>>,
     /// Bounds concurrent cold launches, which no longer serialize node-wide.
     ///
     /// Separate from `admission` on purpose: the wake budget is sized in
@@ -319,6 +324,7 @@ impl NodeRuntime {
             cat_ops: Mutex::new(HashMap::new()),
             journal: Mutex::new(HashMap::new()),
             usage_finalizer: None,
+            seed_image_id: Mutex::new(None),
             admission: WakeAdmission::new(cfg_wake_budget),
             launch_admission: WakeAdmission::new(WakeBudget {
                 commitment_bytes: u64::MAX,
@@ -820,15 +826,18 @@ impl NodeRuntime {
             // Cloud Hypervisor refuses num_queues > boot vCPUs, and the backend
             // must expose exactly the queues the VMM will configure.
             let vhost_user_queues = ch::vhost_user_queues_for(chc, cpus);
+            // The root disk is provisioned from the shared golden image instead of
+            // streaming a private copy of the rootfs through the block frontend
+            // (ADR-0017). Publishing happens once per node, not per launch.
+            let seed_image_id = match (&chc.seed_image, warm_restore) {
+                (Some(image), false) => Some(self.ensure_image_published(image)?),
+                _ => None,
+            };
             for grant in &volumes {
-                // The root disk is provisioned from the shared golden image inside
-                // blockd, before it announces readiness, so a launch no longer
-                // streams a private copy of the rootfs through the block frontend
-                // (ADR-0017). Data disks have no image.
-                let seed = chc
-                    .seed_image
+                // Data disks have no image.
+                let seed = seed_image_id
                     .as_deref()
-                    .filter(|_| !warm_restore && grant.mount_path == "/");
+                    .filter(|_| grant.mount_path == "/");
                 let proc = self.spawn_blockd(cat_id, &dir, grant, vhost_user_queues, seed)?;
                 let process_id = proc.child.id();
                 rt.blockds.insert(grant.disk_id.clone(), proc);
@@ -963,13 +972,59 @@ impl NodeRuntime {
         }
     }
 
+    /// Publish the golden root once and return its image id (ADR-0017).
+    ///
+    /// Runs `cats-blockd --publish-image`, which needs only the object store, so
+    /// the node needs no object-store wiring of its own and publishing stays in
+    /// the one component that already speaks every adapter. Idempotent, so a
+    /// second node — or a restart — costs one manifest HEAD.
+    fn ensure_image_published(&self, image: &Path) -> Result<String> {
+        let mut cached = self.seed_image_id.lock().unwrap();
+        if let Some(image_id) = cached.as_ref() {
+            return Ok(image_id.clone());
+        }
+        let started = Instant::now();
+        let mut cmd = Command::new(&self.cfg.blockd_bin);
+        cmd.arg("--publish-image")
+            .arg(image)
+            .arg("--object-store-adapter")
+            .arg(&self.cfg.object_store.name);
+        for option in self.cfg.object_store.config.to_cli() {
+            cmd.arg("--object-store-option").arg(option);
+        }
+        let output = cmd.output().context("run cats-blockd --publish-image")?;
+        if !output.status.success() {
+            bail!(
+                "publishing {} failed: {} {}",
+                image.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .last()
+                    .unwrap_or_default()
+            );
+        }
+        let image_id = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("IMAGE ").map(|id| id.trim().to_string()))
+            .context("cats-blockd --publish-image printed no image id")?;
+        tracing::info!(
+            image = %image.display(),
+            image_id = %image_id,
+            publish_ms = started.elapsed().as_millis(),
+            "published the golden root"
+        );
+        *cached = Some(image_id.clone());
+        Ok(image_id)
+    }
+
     fn spawn_blockd(
         &self,
         cat_id: &str,
         cat_dir: &Path,
         grant: &VolumeGrant,
         vhost_user_queues: usize,
-        seed_image: Option<&Path>,
+        seed_image_id: Option<&str>,
     ) -> Result<BlockdProc> {
         let socket = short_socket_path(
             &self.cfg.state_dir,
@@ -1016,11 +1071,11 @@ impl NodeRuntime {
             .arg(grant.size_bytes.to_string())
             .arg("--lease-ttl-ms")
             .arg(self.cfg.blockd_lease_ttl_ms.to_string());
-        if let Some(image) = seed_image {
-            // blockd publishes the image once for the whole fleet and provisions
-            // this volume by reference (ADR-0017). Passing it unconditionally is
-            // safe: a volume that already has a generation is left alone.
-            cmd.arg("--seed-image").arg(image);
+        if let Some(image_id) = seed_image_id {
+            // Provision from the already-published image: one manifest GET plus a
+            // map write, no data bytes (ADR-0017). Safe unconditionally, because a
+            // volume that already has a generation is left alone.
+            cmd.arg("--seed-image-id").arg(image_id);
         }
         if let (Some(socket), VmmMode::CloudHypervisor(chc)) = (&vhost_user_socket, &self.cfg.vmm) {
             cmd.arg("--listen-vhost-user")

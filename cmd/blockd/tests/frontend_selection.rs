@@ -228,6 +228,96 @@ fn a_root_disk_is_provisioned_from_a_shared_image_without_copying_it() {
     assert_eq!(env.objects("volumes/vol_frontends/data").len(), 1);
 }
 
+/// The node agent's path: publish once, then provision by id. Publishing must not
+/// need a volume, a lease or a metadata store — on real hardware, publishing while
+/// holding a 1.5 s attachment lease lost the lease and failed the launch.
+#[test]
+fn an_image_is_published_once_and_then_referenced_by_id() {
+    use cats_blockd::nbd::NbdClient;
+    use std::io::Write;
+    use std::process::Stdio;
+
+    const CHUNK: usize = cats_api::chunk::CHUNK_SIZE as usize;
+    let env = Env::new();
+    let image = env.path("publish-once.raw");
+    let body: Vec<u8> = (0..CHUNK).map(|i| (i % 251) as u8 + 3).collect();
+    let mut file = std::fs::File::create(&image).unwrap();
+    file.write_all(&body).unwrap();
+    file.sync_all().unwrap();
+
+    // No --volume-id, --data-dir, --attachment-id, --metadata-store-adapter or
+    // listener: publishing serves no volume.
+    let published = Command::new(env!("CARGO_BIN_EXE_cats-blockd"))
+        .arg("--publish-image")
+        .arg(&image)
+        .arg("--object-store-adapter")
+        .arg("file")
+        .arg("--object-store-option")
+        .arg(format!("root={}", env.dir.path().join("blob").display()))
+        .output()
+        .expect("run cats-blockd --publish-image");
+    assert!(
+        published.status.success(),
+        "publish failed: {}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    let image_id = String::from_utf8_lossy(&published.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("IMAGE ").map(str::to_string))
+        .expect("publish printed an image id");
+    assert_eq!(image_id.len(), 64, "image id is a sha256: {image_id:?}");
+    assert_eq!(env.objects("images").len(), 2);
+
+    // Publishing again is a no-op that reports the same id.
+    let again = Command::new(env!("CARGO_BIN_EXE_cats-blockd"))
+        .arg("--publish-image")
+        .arg(&image)
+        .arg("--object-store-adapter")
+        .arg("file")
+        .arg("--object-store-option")
+        .arg(format!("root={}", env.dir.path().join("blob").display()))
+        .output()
+        .expect("run cats-blockd --publish-image again");
+    assert!(String::from_utf8_lossy(&again.stdout).contains(&image_id));
+
+    let nbd = env.path("byid-nbd.sock");
+    let mut child = env
+        .command("att-byid")
+        .arg("--listen-unix")
+        .arg(&nbd)
+        .arg("--seed-image-id")
+        .arg(&image_id)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn cats-blockd");
+    wait_ready(&mut child);
+    let mut client = NbdClient::connect_unix(&nbd).expect("nbd connect");
+    assert_eq!(client.read(0, CHUNK as u32).unwrap(), body);
+    assert!(
+        env.objects("volumes/vol_frontends/data").is_empty(),
+        "provisioning by id must publish no volume data"
+    );
+    client.disconnect().ok();
+    child.kill().ok();
+    child.wait().ok();
+
+    // An unknown image id fails loudly instead of serving an empty disk.
+    let bogus = env
+        .command("att-bogus")
+        .arg("--listen-unix")
+        .arg(env.path("bogus.sock"))
+        .arg("--seed-image-id")
+        .arg("f".repeat(64))
+        .output()
+        .expect("run cats-blockd");
+    assert!(!bogus.status.success());
+    assert!(
+        String::from_utf8_lossy(&bogus.stderr).contains("load base image"),
+        "unhelpful error: {}",
+        String::from_utf8_lossy(&bogus.stderr)
+    );
+}
+
 /// The Linux-only half: vhost-user needs eventfd, memfd and SCM_RIGHTS.
 #[cfg(target_os = "linux")]
 mod vhost_user {
