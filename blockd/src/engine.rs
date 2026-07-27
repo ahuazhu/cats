@@ -362,12 +362,9 @@ impl ChunkEngine {
 
     pub fn read(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         self.check_bounds(offset, buf.len() as u64)?;
-        let mut chunk_idx = offset / CHUNK_SIZE as u64;
-        let end = offset + buf.len() as u64;
-        while chunk_idx * (CHUNK_SIZE as u64) < end {
-            self.ensure_cache_complete(chunk_idx)?;
-            chunk_idx += 1;
-        }
+        let first = offset / CHUNK_SIZE as u64;
+        let last = (offset + buf.len() as u64 - 1) / CHUNK_SIZE as u64;
+        self.hydrate_range(first, last)?;
         self.cache.read_exact_at(buf, offset)?;
         Ok(())
     }
@@ -383,9 +380,7 @@ impl ChunkEngine {
         let _gate = self.io_gate.read().unwrap();
         let first_chunk = offset / CHUNK_SIZE as u64;
         let last_chunk = (offset + data.len() as u64 - 1) / CHUNK_SIZE as u64;
-        for c in first_chunk..=last_chunk {
-            self.ensure_cache_complete(c)?;
-        }
+        self.hydrate_range(first_chunk, last_chunk)?;
         self.cache.write_all_at(data, offset)?;
         self.mark_dirty(offset, data.len() as u64)?;
         Ok(())
@@ -835,6 +830,57 @@ impl ChunkEngine {
 
     /// Ensure the cache holds the full content of `chunk_idx` (committed
     /// base hydrated, or the chunk is a hole / locally dirty).
+    /// Make every chunk in `first..=last` present in the local cache.
+    ///
+    /// Misses are fetched concurrently. Serially, a cold read cost one round trip
+    /// per chunk: 64 MiB off S3 ran at 73 MiB/s on a 12.5 Gbps instance because
+    /// nothing overlapped. The chunks are independent objects, and
+    /// `ensure_cache_complete` already coordinates concurrent hydration of the
+    /// same chunk, so the only thing missing was issuing them together.
+    ///
+    /// The common case is that everything is already cached, so the fast path
+    /// takes the state lock once and spawns nothing.
+    fn hydrate_range(&self, first: u64, last: u64) -> Result<()> {
+        let misses: Vec<u64> = {
+            let st = self.state.lock().unwrap();
+            (first..=last)
+                .filter(|c| !st.hydrated[*c as usize])
+                .collect()
+        };
+        match misses.len() {
+            0 => return Ok(()),
+            1 => return self.ensure_cache_complete(misses[0]),
+            _ => {}
+        }
+
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let failure: Mutex<Option<EngineError>> = Mutex::new(None);
+        std::thread::scope(|scope| {
+            for _ in 0..fetch_workers(misses.len()) {
+                scope.spawn(|| loop {
+                    if failure.lock().unwrap().is_some() {
+                        return;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(chunk_idx) = misses.get(index) else {
+                        return;
+                    };
+                    if let Err(error) = self.ensure_cache_complete(*chunk_idx) {
+                        let mut slot = failure.lock().unwrap();
+                        if slot.is_none() {
+                            *slot = Some(error);
+                        }
+                        return;
+                    }
+                });
+            }
+        });
+        match failure.into_inner().unwrap() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     fn ensure_cache_complete(&self, chunk_idx: u64) -> Result<()> {
         loop {
             let chunk_ref = {
@@ -898,6 +944,65 @@ impl ChunkEngine {
         Ok(bytes)
     }
 
+    /// Fetch a layered chunk's base and every delta at once.
+    ///
+    /// Returns them in the order they must be applied. Each is verified against
+    /// the reference that named it, exactly as a serial fetch would.
+    fn fetch_layers(
+        &self,
+        base: Option<&format::BaseRef>,
+        deltas: &[format::DeltaRef],
+    ) -> Result<Layers> {
+        if deltas.len() + usize::from(base.is_some()) <= 1 {
+            let base_bytes = match base {
+                Some(base) => Some(self.fetch_verified(
+                    &base.object_id,
+                    base.len,
+                    base.sha256,
+                    base.image.as_deref(),
+                )?),
+                None => None,
+            };
+            let delta_bytes = deltas
+                .iter()
+                // Deltas are always written by this volume, never shared.
+                .map(|d| self.fetch_verified(&d.object_id, d.len, d.sha256, None))
+                .collect::<Result<Vec<_>>>()?;
+            return Ok((base_bytes, delta_bytes));
+        }
+
+        // A chain is at most MAX_DELTA_LAYERS + 1 objects, so one thread each.
+        let (base_bytes, delta_bytes) = std::thread::scope(|scope| {
+            let base_handle = base.map(|base| {
+                scope.spawn(move || {
+                    self.fetch_verified(
+                        &base.object_id,
+                        base.len,
+                        base.sha256,
+                        base.image.as_deref(),
+                    )
+                })
+            });
+            let delta_handles: Vec<_> = deltas
+                .iter()
+                .map(|delta| {
+                    scope.spawn(move || {
+                        self.fetch_verified(&delta.object_id, delta.len, delta.sha256, None)
+                    })
+                })
+                .collect();
+            let base_bytes = base_handle
+                .map(|handle| handle.join().expect("layer fetch thread panicked"))
+                .transpose();
+            let delta_bytes: Result<Vec<Vec<u8>>> = delta_handles
+                .into_iter()
+                .map(|handle| handle.join().expect("layer fetch thread panicked"))
+                .collect();
+            (base_bytes, delta_bytes)
+        });
+        Ok((base_bytes?, delta_bytes?))
+    }
+
     /// Materialize one chunk into the local cache from its committed objects.
     ///
     /// A layered chunk is assembled base-first and then delta by delta, so a
@@ -912,13 +1017,12 @@ impl ChunkEngine {
                 self.fetch_verified(&base.object_id, base.len, base.sha256, base.image.as_deref())?
             }
             ChunkRef::Layered { base, deltas } => {
-                let mut image = match base {
-                    Some(base) => self.fetch_verified(
-                        &base.object_id,
-                        base.len,
-                        base.sha256,
-                        base.image.as_deref(),
-                    )?,
+                // Fetch the whole layer stack at once. Applying the deltas is
+                // order-dependent; fetching them is not, and a full chain is five
+                // objects, which serially is five round trips.
+                let (base_bytes, delta_bytes) = self.fetch_layers(base.as_ref(), deltas)?;
+                let mut image = match base_bytes {
+                    Some(bytes) => bytes,
                     None => vec![0u8; CHUNK_SIZE as usize],
                 };
                 if image.len() != CHUNK_SIZE as usize {
@@ -926,10 +1030,7 @@ impl ChunkEngine {
                         "layered chunk base is not a full chunk".into(),
                     ));
                 }
-                for delta in deltas {
-                    // Deltas are always written by this volume, never shared.
-                    let bytes =
-                        self.fetch_verified(&delta.object_id, delta.len, delta.sha256, None)?;
+                for (delta, bytes) in deltas.iter().zip(delta_bytes) {
                     let mut consumed = 0usize;
                     for page_idx in 0..cats_api::chunk::PAGES_PER_CHUNK {
                         if delta.page_mask & (1u64 << page_idx) == 0 {
@@ -1082,6 +1183,17 @@ const MAX_UPLOAD_CONCURRENCY: usize = 16;
 
 fn upload_workers(objects: usize) -> usize {
     objects.clamp(1, MAX_UPLOAD_CONCURRENCY)
+}
+
+/// A layered chunk's fetched objects: the base (absent when the chunk's base is a
+/// hole) and each delta, in the order they must be applied.
+type Layers = (Option<Vec<u8>>, Vec<Vec<u8>>);
+
+/// How many chunks one read hydrates at once. Same reasoning as the upload cap,
+/// and the same number: a cold read is round-trip bound in exactly the same way a
+/// commit is.
+fn fetch_workers(chunks: usize) -> usize {
+    chunks.clamp(1, MAX_UPLOAD_CONCURRENCY)
 }
 
 fn object_id_hex(object_id: &str) -> &str {
@@ -1680,6 +1792,14 @@ mod tests {
             self.inner.put_immutable(k, d)
         }
         fn get(&self, k: &str) -> cats_storage::blob::Result<Vec<u8>> {
+            if k.contains("/data/") {
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(20));
+                let result = self.inner.get(k);
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                return result;
+            }
             self.inner.get(k)
         }
         fn exists(&self, k: &str) -> cats_storage::blob::Result<bool> {
@@ -1732,6 +1852,62 @@ mod tests {
         for chunk in 0..8u64 {
             e.read(chunk * CHUNK_SIZE as u64, &mut back).unwrap();
             assert_eq!(back, page, "chunk {chunk} came back wrong");
+        }
+        e.detach();
+    }
+
+    #[test]
+    fn a_cold_read_fetches_its_chunks_and_layers_concurrently() {
+        // Reads had the same shape of problem the commit path did: one blocking
+        // GET per object, none overlapping. A cold 64 MiB read off S3 ran at
+        // 73 MiB/s on a 12.5 Gbps instance because of it.
+        let env = env();
+        let probe = Arc::new(ConcurrencyProbe {
+            inner: env.blob.clone(),
+            in_flight: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
+            data_puts: AtomicU64::new(0),
+        });
+
+        // Four chunks with a base plus two deltas each: 12 objects to fetch.
+        let e = attach_with(&env, probe.clone(), "attA");
+        let whole = pattern(CHUNK_SIZE as usize, 5);
+        for chunk in 0..4u64 {
+            e.write(chunk * CHUNK_SIZE as u64, &whole).unwrap();
+        }
+        e.flush().unwrap();
+        for round in 0..2u8 {
+            for chunk in 0..4u64 {
+                e.write(chunk * CHUNK_SIZE as u64, &pattern(4096, round + 20))
+                    .unwrap();
+            }
+            e.flush().unwrap();
+        }
+        {
+            let st = e.state.lock().unwrap();
+            assert_eq!(st.map[0].layer_count(), 2, "expected a base plus 2 deltas");
+        }
+        e.detach();
+
+        // A brand-new host: every one of those objects has to come back.
+        fs::remove_dir_all(&env.data_dir).unwrap();
+        probe.peak.store(0, Ordering::SeqCst);
+        let e = attach_with(&env, probe.clone(), "attB");
+        let mut back = vec![0u8; 4 * CHUNK_SIZE as usize];
+        e.read(0, &mut back).unwrap();
+
+        assert!(
+            probe.peak.load(Ordering::SeqCst) >= 2,
+            "cold read fetched one object at a time (peak in flight {})",
+            probe.peak.load(Ordering::SeqCst)
+        );
+        assert_eq!(probe.in_flight.load(Ordering::SeqCst), 0, "a fetch leaked");
+        // Concurrency must not change what comes back: the last write wins on the
+        // page it touched, the base shows through everywhere else.
+        for chunk in 0..4usize {
+            let at = chunk * CHUNK_SIZE as usize;
+            assert_eq!(&back[at..at + 4096], &pattern(4096, 21)[..], "chunk {chunk}");
+            assert_eq!(&back[at + 4096..at + CHUNK_SIZE as usize], &whole[4096..]);
         }
         e.detach();
     }
