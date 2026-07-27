@@ -98,6 +98,11 @@ pub enum Command {
     /// Run a command inside the cat (wakes it if needed).
     Exec {
         name: String,
+        /// How long the command may run, in seconds. The API accepts up to an
+        /// hour; without this the default is 120 s, which a build or a test suite
+        /// can exceed.
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
         /// Command argv, after `--`.
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -572,11 +577,16 @@ pub fn run(cli: Cli) -> Result<()> {
             println!("destroyed {name}");
             Ok(())
         }
-        Command::Exec { name, command } => {
-            let v = client.post(
-                &format!("/cats/{name}/exec"),
-                Some(json!({ "command": command })),
-            )?;
+        Command::Exec {
+            name,
+            timeout,
+            command,
+        } => {
+            let mut body = json!({ "command": command });
+            if let Some(seconds) = timeout {
+                body["timeout_ms"] = json!(seconds * 1000);
+            }
+            let v = client.post(&format!("/cats/{name}/exec"), Some(body))?;
             let out: ExecResponse = serde_json::from_value(v)?;
             print!("{}", out.stdout);
             eprint!("{}", out.stderr);
@@ -959,9 +969,25 @@ mod tests {
                 ..
             }
         ));
+        let with_timeout =
+            Cli::parse_from(["cats", "exec", "dev", "--timeout", "900", "--", "cargo", "build"]);
+        match with_timeout.command {
+            Command::Exec {
+                timeout, command, ..
+            } => {
+                assert_eq!(timeout, Some(900), "a long build needs more than the default");
+                assert_eq!(command, vec!["cargo", "build"]);
+            }
+            other => panic!("expected exec, got {other:?}"),
+        }
         let cli = Cli::parse_from(["cats", "exec", "dev", "--", "git", "status"]);
         match cli.command {
-            Command::Exec { command, .. } => assert_eq!(command, vec!["git", "status"]),
+            Command::Exec {
+                command, timeout, ..
+            } => {
+                assert_eq!(command, vec!["git", "status"]);
+                assert_eq!(timeout, None, "no flag means the API default");
+            }
             _ => panic!("wrong parse"),
         }
         assert!(matches!(

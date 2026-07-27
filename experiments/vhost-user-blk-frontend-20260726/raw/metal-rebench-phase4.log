@@ -2,3 +2,47 @@ date_utc: 2026-07-27T09:37:54Z
 cache_mount: /dev/nvme8n1 ext4
 
 ##### warm restore timings -- kernel-nbd
+Jul 27 08:38:56 ip-172-31-84-83 cats-noded[55594]: 2026-07-27T08:38:56.519934Z  INFO cats_node_agent::runtime: warm restore phase timings cat="cat_42c68f6b8f9b" block_path="vhost-user" total_us=51430 blockd_us=10952 block_attach_us=1 vmm_spawn_us=220 api_ready_us=27407 resume_us=1158 guest_health_us=11590
+Jul 27 08:54:52 ip-172-31-84-83 cats-noded[70092]: 2026-07-27T08:54:52.181934Z  INFO cats_node_agent::runtime: warm restore phase timings cat="cat_21ba10456e0b" block_path="kernel-nbd" total_us=224734 blockd_us=71449 block_attach_us=32388 vmm_spawn_us=126 api_ready_us=103617 resume_us=1255 guest_health_us=15800
+Jul 27 08:55:18 ip-172-31-84-83 cats-noded[72428]: 2026-07-27T08:55:18.430309Z  INFO cats_node_agent::runtime: warm restore phase timings cat="cat_f7e08de41a4c" block_path="vhost-user" total_us=103483 blockd_us=71103 block_attach_us=1 vmm_spawn_us=208 api_ready_us=17029 resume_us=1240 guest_health_us=13868
+
+##### warm restore timings -- vhost-user
+Jul 27 08:38:56 ip-172-31-84-83 cats-noded[55594]: 2026-07-27T08:38:56.519934Z  INFO cats_node_agent::runtime: warm restore phase timings cat="cat_42c68f6b8f9b" block_path="vhost-user" total_us=51430 blockd_us=10952 block_attach_us=1 vmm_spawn_us=220 api_ready_us=27407 resume_us=1158 guest_health_us=11590
+Jul 27 08:54:52 ip-172-31-84-83 cats-noded[70092]: 2026-07-27T08:54:52.181934Z  INFO cats_node_agent::runtime: warm restore phase timings cat="cat_21ba10456e0b" block_path="kernel-nbd" total_us=224734 blockd_us=71449 block_attach_us=32388 vmm_spawn_us=126 api_ready_us=103617 resume_us=1255 guest_health_us=15800
+Jul 27 08:55:18 ip-172-31-84-83 cats-noded[72428]: 2026-07-27T08:55:18.430309Z  INFO cats_node_agent::runtime: warm restore phase timings cat="cat_f7e08de41a4c" block_path="vhost-user" total_us=103483 blockd_us=71103 block_attach_us=1 vmm_spawn_us=208 api_ready_us=17029 resume_us=1240 guest_health_us=13868
+
+##### GC and TRIM on a real Guest (vhost-user, file object store on local NVMe)
+volume under test: vol_8974f6254de7
+after create:            objects=23 bytes=3708895
+after write round 1:   objects=23 bytes=3708895
+after write round 2:   objects=23 bytes=3708895
+after write round 3:   objects=23 bytes=3708895
+after write round 4:   objects=23 bytes=3708895
+error: wake timed out (DeadlineExceeded)
+after rm + fstrim:       objects=23 bytes=3708895
+# the GC thread runs every 10 min; force one now
+Caused by:
+    volume not found: vol_8974f6254de7
+after explicit GC:       objects=23 bytes=3708895
+
+##### 10 concurrent cold creates -- vhost-user, real S3 (comparable with the record)
+== cleanup
+label,phase,requested,completed,min_ms,p50_ms,p95_ms,max_ms,failures
+# FAILURE create-p4-6 rc=1: error: operation op_ad9525eba725 did not finish in time 
+# FAILURE create-p4-5 rc=1: error: operation op_aa7a6294e261 did not finish in time 
+# FAILURE create-p4-1 rc=1: error: operation op_540a16f8c429 did not finish in time 
+# FAILURE create-p4-4 rc=1: error: operation op_f4bed12c1845 did not finish in time 
+# FAILURE create-p4-2 rc=1: error: operation op_78f7284cb694 did not finish in time 
+# FAILURE create-p4-10 rc=1: error: operation op_46f70c925981 did not finish in time 
+# FAILURE create-p4-7 rc=1: error: operation op_19830a0a5c9b did not finish in time 
+# FAILURE create-p4-3 rc=1: error: operation op_82165730d69b did not finish in time 
+# FAILURE create-p4-8 rc=1: error: operation op_9983359ded39 did not finish in time 
+# FAILURE create-p4-9 rc=1: error: operation op_006d78fbff0f did not finish in time 
+vhost-user-s3,create,10,10,120130,120131,120132,120132,10
+# NOT SETTLED: 0/10 observed=running after 300s
+# vhost-user-s3: 0/10 running; create batch wall 120137 ms, settled at 420720 ms
+# vhost-user-s3: batch walls create=120137 warm=n/a restore=n/a ms (settled)
+# vhost-user-s3: wake gate telemetry:
+#   metal-1            state=lost      cats=0 cpu=0/128 memory=0MiB/1031865MiB heartbeat=2419s load=3.00
+== cleanup
+== phase 4 done

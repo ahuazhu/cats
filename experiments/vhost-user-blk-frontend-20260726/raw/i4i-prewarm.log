@@ -1,0 +1,16 @@
+date_utc: 2026-07-27T10:56:55Z
+device: /dev/nvme8n1
+/dev/nvme8n1    3.4T  203G  3.0T   7% /var/lib/cats
+
+##### before pre-warm: dense flush, local file store
+           8          32.00        145.0             4.53
+          32         128.00       1960.0            15.31
+          48         192.00       2945.5            15.34
+
+##### pre-warming 200 GiB of the device
+  wrote: 20G in 10:57:20
+
+##### after pre-warm: dense flush, local file store
+           8          32.00        176.7             5.52
+          32         128.00       1965.2            15.35
+          48         192.00       2950.5            15.37
