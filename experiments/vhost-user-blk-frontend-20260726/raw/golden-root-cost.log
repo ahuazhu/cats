@@ -1,0 +1,65 @@
+blockd/tests/golden_root_cost.rs, release, aarch64 Linux container (18 logical
+cpus, Docker volume for the target dir), median of 3, local file object store.
+Same platform as raw/commit-cost-delta-pack.log so the two changes are comparable.
+
+Same process, same object store, same volume geometry -- the only variable is how
+a volume gets its rootfs:
+
+  copy      = stream the image into the volume and commit it (what a create did)
+  reference = publish the image once, provision by referencing its chunks (ADR-0017)
+
+One create:
+
+ image MiB       path uploaded MiB    objects provision ms    speedup        gen
+        64       copy        64.00         19        187.8       1.0x          1
+        64  reference         0.00          3          6.5      28.9x          1
+        64  (publish)         once          -        456.5          -          -
+       256       copy       256.01         67        815.1       1.0x          1
+       256  reference         0.01          3          7.5     108.4x          1
+       256  (publish)         once          -       1762.4          -          -
+       512       copy       512.01        131       1239.8       1.0x          1
+       512  reference         0.02          3          7.0     178.3x          1
+       512  (publish)         once          -       2732.7          -          -
+
+N Cats from one image at once (256 MiB image):
+
+    cats       path uploaded MiB    objects        wall ms    speedup
+       1       copy       256.01         67          700.1       1.0x
+       1  reference         0.01          3            7.0      99.6x
+       4       copy      1024.02        268         2130.7       1.0x
+       4  reference         0.04         12           17.4     122.7x
+      10       copy      2560.05        670         5725.1       1.0x
+      10  reference         0.11         30           56.0     102.2x
+
+Cold read of every chunk on a host with an empty cache (64 MiB):
+
+        path       cold read ms              MiB/s
+        copy              143.5                446
+   reference              141.5                452
+
+Reading:
+
+* Provisioning cost is independent of image size (~7 ms): it writes map nodes and
+  a commit record and nothing else. The 0.01-0.02 MiB "uploaded" is those nodes.
+* Concurrent creates no longer contend on the object store at all: 10 Cats upload
+  0.11 MiB between them instead of 2.5 GiB.
+* Referencing a shared chunk costs nothing to read -- a provisioned chunk is one
+  object exactly like a private one (446 vs 452 MiB/s, i.e. within noise, with the
+  referenced side marginally ahead).
+* The `copy` column is the engine-level copy, not the old path that streamed the
+  image through an NBD socket, so these speedups are conservative.
+* Publishing costs ~2.7 s for 512 MiB and happens once per image digest. Today the
+  first launch that uses an image pays it.
+
+macOS arm64 (APFS) for a second platform: raw/golden-root-cost-macos.log. Same
+shape, smaller multiples (124x single / 38x for 10 concurrent) because APFS makes
+the `copy` side cheaper relative to overlayfs in the container.
+
+Also found by this bench: `ChunkEngine::detach` joined a lease-renewal thread that
+was sleeping out lease_ttl_ms/3, so every detach -- every stop, suspend and cold
+migration, per volume -- waited out a third of the lease TTL. That is ~0.5 s per
+volume as the node agent configures blockd (--blockd-lease-ttl-ms 1500) and 1.67 s
+at blockd's own 5 s default, which is what this benchmark used. Before the fix every
+row above had a ~1674 ms floor, which is what made it visible. Renewal now waits on
+a condvar; regression test:
+engine::tests::detaching_does_not_wait_out_the_lease_renewal_interval.

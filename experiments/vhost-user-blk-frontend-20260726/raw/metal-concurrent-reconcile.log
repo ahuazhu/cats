@@ -1,0 +1,36 @@
+Concurrent cold create, end to end, after making the reconcile loop concurrent.
+
+host:     AWS i4i.metal, real KVM, Cloud Hypervisor, real in-region S3
+build:    this branch; earlier rows from the same script on the same instance type
+date_utc: 2026-07-27
+
+experiments/metal-cluster-20260726/concurrent-start.sh, CATS_PHASES=create, 10
+Cats, 2 GiB root disks from the same 512 MiB golden rootfs, vhost-user block path.
+
+  build                                   wall ms   min ms   p50 ms   max ms  failed
+  copy the rootfs, serial reconcile        121448    11775    88477   121448       4
+  golden root, serial reconcile             61637     8203    28134    61634       0
+  golden root, concurrent reconcile          8328     4830     8027     8324       0
+
+  concurrent-reconcile,create,10,10,4830,8027,8324,8324,0
+  # settled: 10/10 observed=running after 9s
+
+Reading:
+
+* Ten cold creates now finish in 8.3 s, against 61.6 s before and 121.4 s at the
+  start of this branch. That is 7.4x over the previous build and 14.6x over where
+  it started, with the four failures gone.
+* The shape changed, not just the number. Before: min 8.2 s, p50 28 s, max 61.6 s
+  -- a queue draining at ~6 s per Cat. Now: min 4.8 s, p50 8.0 s, max 8.3 s -- ten
+  Cats take about as long as one, which is what "concurrent" should look like.
+* The whole batch is now within a factor of two of a single create (4.5-6.9 s),
+  so the remaining cost is VM boot and guest-agent readiness, not queuing.
+
+What made it possible was not the loop change on its own. Placement had to become
+an atomic claim first: `schedule()` summed `cats_on_node` to find a node's free
+capacity and `start_flow` wrote the placement in a separate call, so ten flows
+running at once would all have read the same free capacity and overcommitted the
+node. `Store::claim_node_for` decides and claims under one lock.
+
+Acceptance on the same box and the same run: metal e2e 22 passed, 1 failed -- the
+same stale "golden rootfs has no git" assertion as every previous run.

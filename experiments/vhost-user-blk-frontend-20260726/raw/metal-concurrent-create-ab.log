@@ -1,0 +1,25 @@
+# 10 concurrent cold create, this branch (golden root), vhost-user, real S3
+== cleanup
+label,phase,requested,completed,min_ms,p50_ms,p95_ms,max_ms,failures
+golden-root-vhost-user,create,10,10,8203,28134,61634,61634,0
+# settled: 10/10 observed=running after 62s
+# golden-root-vhost-user: 10/10 running; create batch wall 61637 ms, settled at 61665 ms
+# golden-root-vhost-user: batch walls create=61637 warm=n/a restore=n/a ms (settled)
+# golden-root-vhost-user: wake gate telemetry:
+#   metal-1            state=ready     cats=10 cpu=20/128 memory=10240MiB/1031865MiB heartbeat=0s load=5.88
+== cleanup
+
+# 10 concurrent cold create, parent commit (copy the rootfs), same box
+== cleanup
+label,phase,requested,completed,min_ms,p50_ms,p95_ms,max_ms,failures
+# FAILURE create-oldv-8 rc=1: error: operation op_0bca04a4a718 did not finish in time 
+# FAILURE create-oldv-7 rc=1: error: operation op_7bdda0043978 did not finish in time 
+# FAILURE create-oldv-10 rc=1: error: operation op_83cc99a858bc did not finish in time 
+# FAILURE create-oldv-5 rc=1: error: operation op_546df11959b4 did not finish in time 
+copy-rootfs-vhost-user,create,10,10,11775,88477,121448,121448,4
+# NOT SETTLED: 0/10 observed=running after 600s
+# copy-rootfs-vhost-user: 0/10 running; create batch wall 121452 ms, settled at 721801 ms
+# copy-rootfs-vhost-user: batch walls create=121452 warm=n/a restore=n/a ms (settled)
+# copy-rootfs-vhost-user: wake gate telemetry:
+#   metal-1            state=ready     cats=1 cpu=1/128 memory=512MiB/1031865MiB heartbeat=1s load=0.45
+== cleanup

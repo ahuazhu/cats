@@ -17,8 +17,16 @@ use cats_api::error::ErrorBody;
 use cats_api::nodejob::{self, JobPhase, NodeJob, NodeJobAction, NodeJobResult, VolumeGrant};
 use cats_api::resources::*;
 use cats_storage::{MetaError, MetadataStore};
+use futures_util::StreamExt;
 
 use crate::store::{now_ms, Store};
+
+/// How many Cats one reconcile tick drives at once.
+///
+/// Bounded because each one holds a node-agent request open for the length of a
+/// launch; unbounded fan-out would let one tick open a request per Cat in the
+/// fleet. The node agent has its own launch ceiling underneath this.
+const MAX_CONCURRENT_RECONCILES: usize = 32;
 
 /// Time-based automatic deeper-sleep policy. `None` disables that boundary.
 /// The timers begin only after the corresponding stable observed state has
@@ -95,12 +103,24 @@ impl Controller {
         )? {
             self.maybe_auto_tier(&cat_id)?;
         }
+        // Reconcile Cats concurrently. A flow spends nearly all of its time in one
+        // blocking dispatch to a node agent -- a cold start is ~6 s of VM boot --
+        // so awaiting them one at a time turned ten concurrent creates into a
+        // ten-deep queue: measured 61.6 s of wall clock for 10, as a 6 s-per-Cat
+        // ramp, with the storage part of all ten adding up to 167 ms.
+        //
+        // Different Cats are independent: node jobs are idempotent and keyed per
+        // Cat, the node agent already serializes per Cat, and placement is an
+        // atomic claim (`Store::claim_node_for`), so concurrent flows cannot
+        // overcommit a node between deciding and recording.
         let cats = self.store.cats_needing_work()?;
-        for cat in cats {
-            if let Err(e) = self.reconcile_cat(&cat).await {
-                tracing::warn!(cat = %cat.id, "reconcile failed: {e}");
-            }
-        }
+        futures_util::stream::iter(cats)
+            .for_each_concurrent(MAX_CONCURRENT_RECONCILES, |cat| async move {
+                if let Err(e) = self.reconcile_cat(&cat).await {
+                    tracing::warn!(cat = %cat.id, "reconcile failed: {e}");
+                }
+            })
+            .await;
         Ok(())
     }
 
@@ -313,11 +333,19 @@ impl Controller {
     }
 
     async fn start_flow(&self, cat: &Cat) -> anyhow::Result<()> {
-        let Some(node) = self.schedule(cat)? else {
+        // Choosing a node and claiming its capacity is one step, so several start
+        // flows can run at once without two Cats claiming the same free capacity.
+        let Some(node) = self.store.claim_node_for(
+            &cat.id,
+            cat.spec.cpus,
+            cat.spec.memory_mib,
+            self.node_lease_timeout_ms,
+            now_ms(),
+        )?
+        else {
             tracing::info!(cat = %cat.id, "no schedulable node; will retry");
             return Ok(());
         };
-        self.store.set_placement(&cat.id, Some(&node.id))?;
         self.store.set_observed(&cat.id, ObservedState::Starting)?;
 
         let grants = self.volume_grants(cat).await?;
@@ -568,6 +596,9 @@ impl Controller {
     // Scheduler: filter + least-loaded score (arch doc §13.2, minimal)
     // ------------------------------------------------------------------
 
+    /// Which node *would* take this Cat, without claiming anything. Placement
+    /// itself goes through `Store::claim_node_for`, which decides and claims in
+    /// one step; this is for callers that only want to look.
     pub fn schedule(&self, cat: &Cat) -> crate::store::Result<Option<Node>> {
         let now = now_ms();
         let mut candidates = Vec::new();

@@ -1408,6 +1408,62 @@ impl Store {
         })
     }
 
+    /// Pick a node with room for this Cat and record the placement, in one step.
+    ///
+    /// Scheduling used to be a read (`list_nodes`, then `cats_on_node` per node)
+    /// followed by a separate `set_placement` write. That is only safe while Cats
+    /// are placed one at a time: two concurrent start flows would both read the
+    /// same free capacity and both claim it, overcommitting the node. Choosing and
+    /// claiming under one lock is what makes concurrent placement safe.
+    ///
+    /// Returns `None` when nothing fits, which the caller retries on a later tick.
+    pub fn claim_node_for(
+        &self,
+        cat_id: &str,
+        cpus: u32,
+        memory_mib: u64,
+        node_lease_timeout_ms: i64,
+        now_ms: i64,
+    ) -> Result<Option<Node>> {
+        self.with(|c| {
+            let mut stmt = c.prepare("SELECT * FROM nodes ORDER BY id")?;
+            let nodes = stmt
+                .query_map([], row_to_node)?
+                .collect::<rusqlite::Result<Vec<Node>>>()?;
+            let mut best: Option<(u64, Node)> = None;
+            for node in nodes {
+                if node.state != NodeState::Ready {
+                    continue;
+                }
+                if now_ms - node.last_heartbeat_unix * 1000 > node_lease_timeout_ms {
+                    continue;
+                }
+                // This Cat's own row is excluded so re-placing it does not count
+                // its resources against itself.
+                let (used_cpus, used_mem): (u32, u64) = c.query_row(
+                    "SELECT COALESCE(SUM(cpus), 0), COALESCE(SUM(memory_mib), 0)
+                       FROM cats WHERE node_id = ?1 AND id <> ?2",
+                    params![node.id, cat_id],
+                    |row| Ok((row.get::<_, i64>(0)? as u32, row.get::<_, i64>(1)? as u64)),
+                )?;
+                if used_cpus + cpus <= node.capacity.cpus
+                    && used_mem + memory_mib <= node.capacity.memory_mib
+                    && best.as_ref().is_none_or(|(mem, _)| used_mem < *mem)
+                {
+                    best = Some((used_mem, node));
+                }
+            }
+            let Some((_, node)) = best else {
+                return Ok(None);
+            };
+            c.execute(
+                "UPDATE cats SET node_id = ?2 WHERE id = ?1",
+                params![cat_id, node.id],
+            )?;
+            Ok(Some(node))
+        })
+    }
+
     pub fn set_placement(&self, cat_id: &str, node_id: Option<&str>) -> Result<()> {
         self.with(|c| {
             c.execute(
@@ -3916,6 +3972,55 @@ mod tests {
         let sleeping = store.must_get_cat_by_id(&cat.id).unwrap();
         assert_eq!(sleeping.desired_state, DesiredState::Suspended);
         assert_eq!(sleeping.generation, 2);
+    }
+
+    #[test]
+    fn concurrent_placement_cannot_overcommit_a_node() {
+        // Placement used to be a read of the node's free capacity followed by a
+        // separate write, which only holds up while one Cat is placed at a time.
+        // The reconcile loop now runs flows concurrently, so this is the property
+        // that keeps it honest.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.path().join("control.db")).unwrap());
+        let workspace = legacy_workspace(&store, "alpha");
+        // Room for exactly 4 of these Cats: 8 cpus / 8192 MiB, 2 cpus each.
+        store
+            .register_node("node-1", "http://node", "http://gateway", 8, 8192)
+            .unwrap();
+        let mut ids = Vec::new();
+        for n in 0..10 {
+            let (cat, _, _) = store
+                .create_cat(&workspace, &format!("web{n}"), "test", 2, 1024, 1 << 20, true, None)
+                .unwrap();
+            ids.push(cat.id);
+        }
+
+        let now = now_ms();
+        // All ten threads release together, so a read-then-write implementation
+        // has the widest possible window to place two Cats in the same slot.
+        let gate = std::sync::Barrier::new(ids.len());
+        let placed: Vec<Option<Node>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = ids
+                .iter()
+                .map(|id| {
+                    let store = store.clone();
+                    let gate = &gate;
+                    scope.spawn(move || {
+                        gate.wait();
+                        store.claim_node_for(id, 2, 1024, 60_000, now).unwrap()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        // 8 cpus / 2 per Cat = 4, and 8192 MiB / 1024 = 8, so cpus binds first.
+        let winners = placed.iter().filter(|p| p.is_some()).count();
+        assert_eq!(winners, 4, "node was overcommitted or underfilled");
+        let on_node = store.cats_on_node("node-1").unwrap();
+        assert_eq!(on_node.len(), 4);
+        assert_eq!(on_node.iter().map(|c| c.spec.cpus).sum::<u32>(), 8);
+        assert!(on_node.iter().map(|c| c.spec.memory_mib).sum::<u64>() <= 8192);
     }
 
     #[test]

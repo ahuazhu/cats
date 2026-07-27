@@ -29,7 +29,7 @@ use crate::admission::{resume_commitment_bytes, WakeAdmission, WakeBudget, WakeL
 use cats_api::requests::{ProxyHttpRequest, ProxyHttpResponse};
 use cats_api::resources::{NodeTelemetry, ObservedState};
 use cats_guest_agent::DiskMapEntry;
-use cats_storage::{AdapterSelection, MetadataStore};
+use cats_storage::AdapterSelection;
 
 use crate::ch::{self, BlockPath, ChConfig, ChRuntime, GUEST_VSOCK_PORT};
 use crate::guest_client::{GuestClient, GuestShell};
@@ -284,7 +284,6 @@ fn symlink_socket(link: &Path, target: &Path) {
 
 pub struct NodeRuntime {
     pub cfg: NodeConfig,
-    storage_meta: Arc<dyn MetadataStore>,
     /// Serializes job execution; jobs are rare and idempotent. Held by every
     /// action except `ResumeCat`, which allocates no node-global resource and
     /// instead serializes per Cat so several Cats can wake in parallel.
@@ -299,6 +298,11 @@ pub struct NodeRuntime {
     /// Bounds concurrent wakes so a wake storm degrades linearly instead of
     /// collapsing the way 10× concurrency on EBS did (19.05 s vs 0.53 s).
     admission: WakeAdmission,
+    /// Image id of the golden root, published once per node rather than once per
+    /// launch. Publishing uploads the whole image; a launch must not pay for that
+    /// (and must not hold a volume lease across it), so the node does it up front
+    /// and every launch then provisions by reference.
+    seed_image_id: Mutex<Option<String>>,
     /// Bounds concurrent cold launches, which no longer serialize node-wide.
     ///
     /// Separate from `admission` on purpose: the wake budget is sized in
@@ -311,16 +315,16 @@ pub struct NodeRuntime {
 }
 
 impl NodeRuntime {
-    pub fn new(cfg: NodeConfig, storage_meta: Arc<dyn MetadataStore>) -> Self {
+    pub fn new(cfg: NodeConfig) -> Self {
         let cfg_wake_budget = cfg.wake_budget;
         Self {
             cfg,
-            storage_meta,
             ops: Mutex::new(()),
             cats: Mutex::new(HashMap::new()),
             cat_ops: Mutex::new(HashMap::new()),
             journal: Mutex::new(HashMap::new()),
             usage_finalizer: None,
+            seed_image_id: Mutex::new(None),
             admission: WakeAdmission::new(cfg_wake_budget),
             launch_admission: WakeAdmission::new(WakeBudget {
                 commitment_bytes: u64::MAX,
@@ -691,7 +695,7 @@ impl NodeRuntime {
         let launch = (|| -> Result<String> {
             for grant in &volumes {
                 // FakeVmm never consumes vhost-user; NBD is its only frontend.
-                let proc = self.spawn_blockd(cat_id, &dir, grant, 1)?;
+                let proc = self.spawn_blockd(cat_id, &dir, grant, 1, None)?;
                 let process_id = proc.child.id();
                 rt.blockds.insert(grant.disk_id.clone(), proc);
                 self.attach_to_metering(&rt, process_id)?;
@@ -822,26 +826,25 @@ impl NodeRuntime {
             // Cloud Hypervisor refuses num_queues > boot vCPUs, and the backend
             // must expose exactly the queues the VMM will configure.
             let vhost_user_queues = ch::vhost_user_queues_for(chc, cpus);
+            // The root disk is provisioned from the shared golden image instead of
+            // streaming a private copy of the rootfs through the block frontend
+            // (ADR-0017). Publishing happens once per node, not per launch.
+            let seed_image_id = match (&chc.seed_image, warm_restore) {
+                (Some(image), false) => Some(self.ensure_image_published(image)?),
+                _ => None,
+            };
             for grant in &volumes {
-                let proc = self.spawn_blockd(cat_id, &dir, grant, vhost_user_queues)?;
+                // Data disks have no image.
+                let seed = seed_image_id
+                    .as_deref()
+                    .filter(|_| grant.mount_path == "/");
+                let proc = self.spawn_blockd(cat_id, &dir, grant, vhost_user_queues, seed)?;
                 let process_id = proc.child.id();
                 rt.blockds.insert(grant.disk_id.clone(), proc);
                 self.attach_to_metering(&rt, process_id)?;
             }
             let blockd_us = blockd_started.elapsed().as_micros();
-            // 2. Seed a brand-new root volume with the golden image.
-            if !warm_restore {
-                if let Some(image) = &chc.seed_image {
-                    for grant in volumes.iter().filter(|g| g.mount_path == "/") {
-                        let head = self.storage_meta.load_head(&grant.volume_id)?;
-                        if head.generation == 0 {
-                            tracing::info!(volume = %grant.volume_id, "seeding golden root");
-                            ch::seed_volume(&rt.blockds[&grant.disk_id].socket, image)?;
-                        }
-                    }
-                }
-            }
-            // 3. Block attach (root first => /dev/vda). On a kernel-NBD restore
+            // 2. Block attach (root first => /dev/vda). On a kernel-NBD restore
             //    the device indices must match the snapshot exactly; vhost-user
             //    sockets are derived from the Cat and disk id, so they are
             //    already stable across a Warm restore.
@@ -880,7 +883,7 @@ impl NodeRuntime {
                 chrt.network = ch::prepare_network(chc, cat_id)?;
                 rt.ch = Some(chrt.clone());
             }
-            // 4. VMM. Store the child in `rt` immediately so a failure in
+            // 3. VMM. Store the child in `rt` immediately so a failure in
             //    readiness/health still lets `teardown` kill it (no orphan
             //    holding the api socket).
             let serial_log = dir.join("serial.log");
@@ -910,7 +913,7 @@ impl NodeRuntime {
                 ch::resume(&chrt.api_sock)?;
             }
             let resume_us = resume_started.elapsed().as_micros();
-            // 5. Guest agent over vsock.
+            // 4. Guest agent over vsock.
             let conn = GuestConn::Vsock(chrt.vsock_sock.clone(), GUEST_VSOCK_PORT);
             // Keep this below the control plane's 60-second node-job timeout
             // so a failed start tears down its partial VMM before the control
@@ -969,12 +972,59 @@ impl NodeRuntime {
         }
     }
 
+    /// Publish the golden root once and return its image id (ADR-0017).
+    ///
+    /// Runs `cats-blockd --publish-image`, which needs only the object store, so
+    /// the node needs no object-store wiring of its own and publishing stays in
+    /// the one component that already speaks every adapter. Idempotent, so a
+    /// second node — or a restart — costs one manifest HEAD.
+    fn ensure_image_published(&self, image: &Path) -> Result<String> {
+        let mut cached = self.seed_image_id.lock().unwrap();
+        if let Some(image_id) = cached.as_ref() {
+            return Ok(image_id.clone());
+        }
+        let started = Instant::now();
+        let mut cmd = Command::new(&self.cfg.blockd_bin);
+        cmd.arg("--publish-image")
+            .arg(image)
+            .arg("--object-store-adapter")
+            .arg(&self.cfg.object_store.name);
+        for option in self.cfg.object_store.config.to_cli() {
+            cmd.arg("--object-store-option").arg(option);
+        }
+        let output = cmd.output().context("run cats-blockd --publish-image")?;
+        if !output.status.success() {
+            bail!(
+                "publishing {} failed: {} {}",
+                image.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .last()
+                    .unwrap_or_default()
+            );
+        }
+        let image_id = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("IMAGE ").map(|id| id.trim().to_string()))
+            .context("cats-blockd --publish-image printed no image id")?;
+        tracing::info!(
+            image = %image.display(),
+            image_id = %image_id,
+            publish_ms = started.elapsed().as_millis(),
+            "published the golden root"
+        );
+        *cached = Some(image_id.clone());
+        Ok(image_id)
+    }
+
     fn spawn_blockd(
         &self,
         cat_id: &str,
         cat_dir: &Path,
         grant: &VolumeGrant,
         vhost_user_queues: usize,
+        seed_image_id: Option<&str>,
     ) -> Result<BlockdProc> {
         let socket = short_socket_path(
             &self.cfg.state_dir,
@@ -1021,6 +1071,12 @@ impl NodeRuntime {
             .arg(grant.size_bytes.to_string())
             .arg("--lease-ttl-ms")
             .arg(self.cfg.blockd_lease_ttl_ms.to_string());
+        if let Some(image_id) = seed_image_id {
+            // Provision from the already-published image: one manifest GET plus a
+            // map write, no data bytes (ADR-0017). Safe unconditionally, because a
+            // volume that already has a generation is left alone.
+            cmd.arg("--seed-image-id").arg(image_id);
+        }
         if let (Some(socket), VmmMode::CloudHypervisor(chc)) = (&vhost_user_socket, &self.cfg.vmm) {
             cmd.arg("--listen-vhost-user")
                 .arg(socket)
@@ -1630,7 +1686,7 @@ impl NodeRuntime {
         }
         let dir = rt.dir.clone();
         // Unreachable in Cloud Hypervisor mode (hot attach is rejected above).
-        let proc = self.spawn_blockd(cat_id, &dir, &grant, 1)?;
+        let proc = self.spawn_blockd(cat_id, &dir, &grant, 1, None)?;
         let process_id = proc.child.id();
         rt.blockds.insert(grant.disk_id.clone(), proc);
         if let Err(error) = self.attach_to_metering(rt, process_id) {

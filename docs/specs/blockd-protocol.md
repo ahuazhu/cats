@@ -19,9 +19,12 @@
 ## 2. 远端对象布局（BlobStore 键空间）
 
 ```text
-volumes/<volume-id>/data/<object-id>            # 不可变数据对象（一个完整 chunk 的密文/明文）
+volumes/<volume-id>/data/<object-id>            # 不可变数据对象（整块 base 或一组脏页，见 §6.2）
 volumes/<volume-id>/maps/<hex-sha256>.node      # 不可变 Map Leaf/Root 节点
 volumes/<volume-id>/commits/<gen>-<txn>.json    # 不可变提交记录（审计/恢复辅助）
+
+images/<image-id>/data/<chunk-sha256>           # 共享基础镜像的 chunk（系统所有，见 §6.3）
+images/<image-id>/manifest.json                 # 镜像清单；最后写入
 ```
 
 - `object-id` = `<txn>-c<chunk_idx>`；同一 txn 内对同一 chunk 幂等重传时键不变，重复 PUT 内容必须字节一致。
@@ -43,12 +46,17 @@ entry_count × ChunkRef
 `ChunkRef`：
 
 ```text
-[tag u8]            # 0 = Hole；1 = Base
+[tag u8]            # 0 = Hole；1 = Base；2 = Layered（版本 ≥ 2，见 §6.2）
 tag==1 时:
   [object_id_len u16] [object_id bytes]
   [data_len u32]     # chunk 有效字节数（恒为 CHUNK_SIZE，卷尾不足时为余量）
   [sha256 32B]       # 明文校验和；READ miss 下载后必须验证
+  版本 ≥ 3 追加:
+  [image_id_len u16] [image_id bytes]   # 空串 = 本卷自己的对象；非空 = images/<image-id>/
 ```
+
+版本按「用到才升」：leaf 只在实际包含 `Layered` 时写版本 2、只在实际包含镜像 base 时写版本 3，
+所以没用到这些特性的卷 map node 逐字节不变（对象 id 也不变）。解码同时接受 1、2、3。
 
 ### 3.2 Root
 
@@ -118,7 +126,7 @@ chunk_count × u64（小端；bit i = 页 i dirty）
 
 ### 5.2 Pending Commit Pack（V1：内嵌冻结数据）
 
-FLUSH 冻结时把每个 dirty chunk 的**完整当前内容**拷入 pack（屏障后的新写继续进 cache，不影响已冻结输入）：
+FLUSH 冻结时把每个 dirty chunk 本次要发布的内容拷入 pack——默认是它的脏 64 KiB 页，整块重写时是完整 chunk（§6.2）。屏障后的新写继续进 cache，不影响已冻结输入：
 
 ```text
 [magic "CATSPACK"] [version u16 = 1]
@@ -166,6 +174,45 @@ dirty set 为空时 FLUSH 直接成功（generation 不变）。
 - 重放前必须验证租约 epoch 仍属于本 attachment；已被 fence 则丢弃 pack 并保持只读。
 - CAS 前崩溃产生的无 Root 引用对象成为 Orphan，由 GC 按 grace period 清理；恢复流程不负责删除。
 
+### 6.2 发布粒度：Delta Pack（[ADR-0016](../decisions/0016-delta-pack-page-granular-commits.md)）
+
+一次提交对每个 dirty chunk 只发布**该 chunk 的脏 64 KiB 页**，按页序拼接成一个对象。
+未携带的页自上次提交以来未被修改，其内容已作为不可变对象存在，因此省略它们不影响点时刻
+一致性——屏障必须拷贝的是**本次要发布的内容**，而不是必须是整块。
+
+- `PackEntry` 的 `page_mask` 说明携带哪些页；`page_mask == u64::MAX`（且 `len == CHUNK_SIZE`）
+  表示整块 base。该字段有 serde 默认值，旧版本写下的 pending pack 仍按整块重放。
+- Map 的 `ChunkRef` 增加 `Layered { base: Option<BaseRef>, deltas: [DeltaRef] }`；`base` 为
+  `None` 表示底座是空洞。后写的 delta 在重叠页上覆盖先写的。
+- 对象键：base 为 `data/<txn>-c<idx>`，delta 为 `data/<txn>-c<idx>-d`。一次提交对一个 chunk
+  最多产生一个对象。
+- **自压缩**：满足任一条件时本次提交对该 chunk 发布新的整块 base 并清空链——链长达到
+  `MAX_DELTA_LAYERS`（当前 4），或本次脏页超过半块（> 32 页）。因此冷读放大有硬上限
+  （≤ 5 个对象/chunk），正确性不依赖后台 Compactor。
+- 读路径在 hydration 处解析层：base（或全零）+ 按序应用 delta，一次性整块写入本地 cache；
+  每个对象按其引用中的 `len` 与 `sha256` 校验。
+- **GC 必须把 base 与全部 delta 都视为存活**（存活判据仍是"被当前 Root 引用"）。
+- Leaf 编码只在实际包含 `Layered` 时写版本 2，未产生 delta 的卷 map node 逐字节不变。
+
+### 6.3 共享基础镜像：Golden Root（[ADR-0017](../decisions/0017-golden-root-shared-base-images.md)）
+
+镜像是系统所有的一等不可变工件，放在 `images/` 命名空间下（**不在任何 `volumes/` 前缀里**），
+新卷通过**引用**它的 chunk 来完成 provision，不移动任何数据字节。
+
+- `<image-id>` = 镜像文件的 sha256；chunk 对象按内容寻址（`data/<chunk-sha256>`），因此镜像内
+  重复的 chunk 只存一份，全零 chunk 根本不存。卷尾不足一块的部分补零成整块。
+- **发布幂等**：任何节点对同一镜像算出同一个 id，重复发布是把相同字节写到相同 key（§2 的
+  `put_immutable` 契约里这是 no-op），多节点并发发布安全。
+- **manifest 最后写**：读到 manifest 即意味着它引用的每个对象都已持久。半途中断只留下无引用
+  的对象，不会留下「可引用但不完整」的镜像。
+- **provision** 从 manifest 构造 Map（每个非空洞 chunk 一条 `Base`，`image_id` 指向该镜像），
+  然后走与任何一次提交完全相同的 §6 步骤 3–5（leaf → root → commit record → Root CAS）。
+  只允许在 `generation == 0` 且无未提交脏页的卷上执行。
+- **写入不整块私有化**：Guest 写一页就发布一页 delta（§6.2），镜像对象继续做 base。只有写满
+  半块或链达到 `MAX_DELTA_LAYERS` 才改写成私有整块 base。
+- **GC**：镜像对象属于镜像而不属于卷，存活判据**不是**「某个卷的 Root 引用它」。V1 规则是镜像
+  对象不自动回收，由运营方在确认没有卷引用该 image-id 后显式删除。
+
 ## 7. NBD 前端（开发/测试/恢复通道）
 
 - 协议：NBD newstyle fixed（`NBD_OPT_GO`），仅导出单卷；支持 `READ / WRITE / FLUSH / TRIM / WRITE_ZEROES / DISC`。
@@ -208,3 +255,22 @@ socket，两者服务同一个 engine 与同一个 attachment lease。
 3. 旧 epoch 的 blockd 无法完成任何 Root CAS，也无法在续租失败后继续 ACK 写。
 4. 同一 txn 重放不产生第二个 generation。
 5. Hole 读取恒为零且不产生远端 GET。
+
+## 9. GC（对象回收）
+
+存活判据是**从卷当前 Root 可达**:root 节点、它命名的 leaf 节点,以及每个 `ChunkRef` 命名的每个
+对象——delta pack 之后这意味着 **base 加上它的全部 delta**,而不是"每个 chunk 最新的那个对象"。
+删掉一个 chunk 的 base 只留最新 delta,会直接损坏该 chunk。
+
+- **绝不碰 `images/`。**镜像对象属于镜像、被所有从它 provision 的卷共享,删一个卷不能删掉全队列
+  的 rootfs(§6.3)。GC 只列举和删除本卷前缀下的对象;`ChunkRef` 里带 image origin 的 base 根本
+  不算本卷的对象。这也意味着**镜像的回收是另一件事**:V1 不自动回收,由运营方在确认无卷引用
+  该 image-id 后显式删除。
+- **必须持有卷租约运行**,这样没有别的写者会在发布 Root 尚未命名的对象。本写者自己的 pending
+  pack 无所谓:恢复会从 pack 文件重放并重新上传被删掉的对象。
+- **commit record 不删**:它是审计线索、体积极小,清理它属于保留策略而不是垃圾回收。
+- 完全被后来的 delta 覆盖的旧 delta**根本不会进入 Map**:`with_delta` 在追加时就把
+  `page_mask` 被新 delta 完全覆盖的旧 delta 丢掉了(它在 hydration 里会被逐字节覆盖,留着只是
+  让链更长、冷读更贵、GC 还得当它活着)。
+
+入口:`cats-blockd --collect-garbage`(不需要监听套接字,扫完即退出)。

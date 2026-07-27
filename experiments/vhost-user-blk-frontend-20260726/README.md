@@ -398,31 +398,310 @@ cat/disk id 决定,天然不冲突。并发上限用一个**独立**的 launch �
 反而快 2.7–3.2×(一次 kick 排干整批、只发一次通知),拆队列要付每队列 kick/唤醒与跨线程争用。
 真机上那个"一个 vring worker 90.9% CPU、另三个空闲"是写路径卡在提交协议,不是调度缺陷。
 
-### 4. golden root 复用 —— 当前设计下不可行,需要先做决定
+### 4. golden root 复用 —— 做了,创建不再上传根盘(见下一节)
 
-收益是确定的(并发 create 在 S3 上 5.3×),但对象 key 是**按卷做命名空间**的
-(`volumes/<volume-id>/data/<object-id>`),所以新卷的 Map 无法引用另一个卷已提交的 chunk 对象;
-而 GC 按"没有 Root 引用"删除,跨卷引用会被误删。要拿到这个收益必须先决定其中一条:把数据对象
-改为内容寻址的全局命名空间,或者引入显式的 clone/snapshot 血缘让 GC 理解跨卷引用。两者都是
-ADR 级别的改动,不是补丁。
+当时记为「需要先做决定」:对象 key 按卷做命名空间,GC 按「没有 Root 引用」删除,所以新卷的 Map
+无法引用另一个卷的 chunk。那个决定现在做了([ADR-0017](../../docs/decisions/0017-golden-root-shared-base-images.md)):
+镜像放进**系统所有的 `images/` 命名空间**,而不是把用户数据对象改成全局内容寻址——后者会让
+「另一个租户是否已存有这段内容」通过 PUT 是否命中变得可观测,并且把 GC 变成全局引用计数。
 
-### 关于"中间形态 delta pack"的自我修正
+### 关于"中间形态 delta pack"的自我修正,以及对这个自我修正的更正
 
-我先前提过一个"只拷脏页、不改 Map 和读路径"的中间形态。**它不成立**:屏障必须拷贝它将要上传的
-内容,而对象是整个 chunk;只拷脏页就得在上传时重建整块,而重建时再读缓存会读到屏障之后的新写,
-破坏点时刻一致性。要绕开只有 CoW 或者按 P4 改 Map 表达 base+delta。真正的 delta pack 仍然是
-独立 ADR 的工作。
+我先前提过一个"只拷脏页、不改 Map 和读路径"的中间形态,并判断它不成立——**那个判断的理由对,
+结论的范围错了**。理由:屏障必须拷贝它将要上传的内容,所以不能"只拷脏页、却上传整块"。但由此
+推不出"发布必须是整块":一次提交**没有携带**的页自上次提交以来未被修改,其内容已经作为不可变
+对象存在于对象存储里,所以直接**只发布脏页**是安全的。必须成立的约束是「屏障拷贝的就是本次要
+发布的」。ADR-0016 就是按这个约束做的,见下一节。
+
+## Delta Pack 与 Golden Root 的实测结果(2026-07-26 追加)
+
+上一节列的四项之外,写放大与创建成本这两个真机测量指出的根因也做了,并且**互相正交、互相放大**:
+delta pack 降低**写**的发布量,golden root 降低**创建**的发布量。
+
+### Delta Pack:一次提交只发布脏的 64 KiB 页([ADR-0016](../../docs/decisions/0016-delta-pack-page-granular-commits.md))
+
+原始数据 [`raw/commit-cost-delta-pack.log`](raw/commit-cost-delta-pack.log)。release,aarch64 Linux
+容器,median of 3,单独串行跑。48 个 dirty chunk、每 chunk 一个脏页(即 4 KiB 随机写的形态):
+
+| | 整块发布(旧行为) | Delta Pack |
+|---|---|---|
+| 发布字节 | 192 MiB | **3 MiB(64× 少)** |
+| FLUSH 延迟 | 412 ms(同一轮内的密集写对照) | **109 ms(3.8×)** |
+| 对比 delta pack 之前记录的串行基线 749.5 ms | | **6.9×** |
+| 8 个 dirty chunk | 83 ms | **30.5 ms** |
+| 32 个 dirty chunk | 301 ms | **85.9 ms** |
+
+密集写(整块脏)**故意不变**:192 MiB / 412 ms。延迟没有跟着字节数降 64×,是因为成本结构翻转
+了——36 ms/发布 MiB vs 密集写的 2.15,残余是**每对象固定开销**(约 2.3 ms/对象:file store 里
+一次 create + `sync_data` + hard_link,S3 上一次 PUT 往返)。下一个杠杆是**减少每次提交的对象数**,
+不是继续减字节。
+
+代价:满链 chunk 的冷读要取 5 个对象而不是 1 个,`MAX_DELTA_LAYERS = 4` 就是为此选的。
+
+### Golden Root:创建卷改为引用共享镜像([ADR-0017](../../docs/decisions/0017-golden-root-shared-base-images.md))
+
+原始数据 [`raw/golden-root-cost.log`](raw/golden-root-cost.log)(与 delta pack 同一平台:
+release,aarch64 Linux 容器,median of 3;macOS 作为第二平台见
+[`raw/golden-root-cost-macos.log`](raw/golden-root-cost-macos.log))。同一进程、同一对象存储,
+唯一变量是卷如何获得 rootfs;`copy` 是**引擎层**的复制,比旧的「经 NBD socket 流式写入」更快,
+所以下面的倍数是保守的。
+
+| 单个 create | 上传字节 | 对象数 | provision 延迟 | |
+|---|---|---|---|---|
+| 512 MiB 镜像,复制 | 512.01 MiB | 131 | 1239.8 ms | 1.0× |
+| 512 MiB 镜像,引用 | **0.02 MiB** | **3** | **7.0 ms** | **178×** |
+| 256 MiB 镜像,引用 | 0.01 MiB | 3 | 7.5 ms | 108× |
+| 64 MiB 镜像,引用 | 0.00 MiB | 3 | 6.5 ms | 29× |
+
+provision 延迟与镜像大小**无关**(恒定约 7 ms):它只写 map node 与 commit record,那
+0.01–0.02 MiB 就是这些 map node。
+
+| 10 个 Cat 同时创建(256 MiB 镜像) | 上传字节 | 对象数 | 墙钟 | |
+|---|---|---|---|---|
+| 复制 | 2560 MiB | 670 | 5725 ms | 1.0× |
+| 引用 | **0.11 MiB** | **30** | **56 ms** | **102×** |
+
+冷读代价:空 cache 逐 chunk 读完 64 MiB,复制 446 MiB/s vs 引用 452 MiB/s——**在噪声内**
+(引用侧还略快一点)。被引用的 chunk 就是一个对象,和私有 chunk 完全一样,共享在读路径上不要钱。
+
+代价:第一次发布落在第一个用到该镜像的 launch 上(512 MiB 约 2.7 s,之后每次都是 `exists`
+命中);以及 GC 必须把镜像对象视为镜像所有而不是卷所有(ADR-0017 第 8 条)。
+
+### 组合效果
+
+一个刚创建的 Cat 写一页,总共向对象存储写 **64 KiB**。旧行为是 512 MiB(创建)+ 4 MiB(那次写)。
+
+### 顺带查出的两个缺陷(都已修,都有回归测试)
+
+1. **`ChunkEngine::detach` 要等掉三分之一个租约 TTL。** golden root 的 benchmark 一开始每行都有
+   一个 1674 ms 的地板,查出来是 detach 去 join 一个正在 `sleep(lease_ttl_ms / 3)` 的续期线程——
+   也就是**每次 stop、suspend、冷迁移,按卷计,都白等三分之一个租约 TTL**——节点代理给 blockd 配的是
+   1500 ms(约 **0.5 s/卷**),blockd 自己的默认值 5000 ms 下是 1.67 s,后者就是这个 benchmark 撞到的。
+   续期改为等 condvar。
+2. **8 个进程同时打开同一个新建 sqlite 元数据库,有 2 个失败**(`database is locked`):
+   `PRAGMA journal_mode=WAL` 的切换不受 `busy_timeout` 保护。之前一直被"总有人先打开过"掩盖着,
+   删掉节点代理里那个不再需要的元数据 handle 之后就露出来了。改为重试并把"已经是 WAL"视为成功。
+
+## 真机复测:AWS i4i.metal + 真 KVM + 真实 S3(2026-07-27)
+
+原始数据:[`raw/metal-golden-root-s3.log`](raw/metal-golden-root-s3.log)、
+[`raw/metal-concurrent-create-ab.log`](raw/metal-concurrent-create-ab.log)、
+[`raw/metal-e2e-golden-root.log`](raw/metal-e2e-golden-root.log)。
+
+### Delta Pack 在真实 S3 上:收益比本地**小**,不是更大
+
+原始数据 [`raw/metal-delta-pack-s3.log`](raw/metal-delta-pack-s3.log)(c6a.8xlarge,
+us-east-1;这是纯 blockd benchmark,不需要 KVM,所以用便宜机型跑,同机带本地对象存储对照)。
+
+**这里的倍数量的是什么**:Guest 调一次 fsync 要卡多久。场景是 Guest 改了 N 个地方、每处只改
+了几 KB,然后等数据落到对象存储。改之前每处要把整块 4 MiB 传上去,改之后只传改动的那 64 KiB。
+
+| Guest 改了几处 | 真实 S3:卡多久 | 同机本地文件存储:卡多久 |
+|---|---|---|
+| 8 | 858.9 ms → **374.0 ms**(少 2.3×) | 166.4 ms → 43.8 ms(少 3.8×) |
+| 32 | 3031.5 ms → **1149.4 ms**(少 2.6×) | 1974.0 ms → 140.2 ms(少 14.1×) |
+| 48 | 4913.5 ms → **1669.3 ms**(少 2.9×) | 2974.7 ms → 312.6 ms(少 9.5×) |
+
+48 处那一行:传的数据从 192 MiB 降到 3 MiB(少 64×),但等待只从 4.9 s 降到 1.7 s(少 2.9×)。
+
+**为什么没跟着降 64×**:成本从「传多少字节」变成了「发多少次请求」。48 处改动 = 48 个对象 =
+48 次 PUT 往返,每次一个网络往返(约 25 ms),对象是 4 MiB 还是 64 KiB 都躲不掉这一次往返。
+我们把每次请求变小了,请求次数一次没减。本地文件存储上写一个小文件是真的比写大文件便宜,
+没有这笔"接通费",所以那边的收益接近字节数的降幅。
+
+**这纠正了这一轮之前写下的一个猜测**(「两项改动在 S3 上应该只会更好」)。delta pack 把发布
+字节降 64×,但每次提交的对象数不变,而 S3 上一个对象就是一次 PUT 往返。数据里看得最清楚的是
+单位成本反过来了:改 48 处时每发布 1 MiB 要 **556 ms**,而整块发布时每发布 1 MiB 只要
+25.6 ms——按字节算反而"更贵",因为这笔钱付的根本不是字节。
+
+Golden root 没有这个问题——它把对象**整个消掉**了,不是改小,所以 S3 上反而比本地更划算
+(162× vs 102×)。delta pack 只是把对象改小了,所以真机数据给出了 ADR-0016 已经点名的下一步
+最有力的论据:**把多个 chunk 的 delta 打包成一个对象**,让请求次数跟着字节数一起降。
+
+发布字节降 64× 是算术,在哪都成立;能换回多少 flush 时间取决于后端。
+
+### Golden Root 在真实 S3 上的存储成本
+
+每个对象都是一次真实 PUT 往返,而不是本地的 create + `sync_data` + hard_link:
+
+| | 复制 | 引用 |
+|---|---|---|
+| 单个 create,512 MiB 镜像 | 15472.6 ms / 512 MiB | **89.7 ms / 0.02 MiB(172×)** |
+| 10 个并发 | 27230 ms / 2560 MiB | **167.4 ms / 0.11 MiB(162×)** |
+
+引用侧对镜像大小和并发数都**不敏感**(90–210 ms)。S3 上的倍数比本地更大,因为复制侧每 4 MiB
+对象要付一次 PUT 往返。
+
+### 端到端:同一台机器、同一个 S3、同一个 VMM,10 个并发冷创建
+
+唯一的变量是二进制:`复制` 是本分支的父提交(有 delta pack、无 golden root)。
+
+| | 墙钟 | 失败的操作 |
+|---|---|---|
+| 复制 rootfs(父提交) | 121.4 s | **4** |
+| 引用共享镜像(本分支) | **61.6 s** | **0** |
+
+复制那一行复现了 2026-07-26 记录的 128 s(不同机器、不同日期),两个数字互相印证。复制路径
+**10 个里失败了 4 个**:每个 Cat 各传 512 MiB、传十遍,会把 launch 顶过它自己的超时——真机日志里
+看到的就是提交 286 MiB 的过程中租约续不上(`lease renewal failed; fencing writes`)。
+
+单个 create:节点上第一个 Cat 6.9 s(顺带发布镜像),第二个 **4.5 s**,Guest 从引用的 chunk
+正常起来(`/dev/vda 2.0G 279M used`、`/usr/bin` 411 个可执行文件、真实 ext4)。
+
+**剩下的 61.6 s 不是存储**:十个 create 的存储部分合计 167 ms。墙钟是一条约 6 s/个的斜坡
+(min 8.2 s、p50 28 s、max 61.6 s),看起来是完全串行的;换成 kernel-nbd 路径是 60.4 s,几乎一样,
+所以也不是块路径(`launch_allocates_node_global_state` 只在 kernel-nbd 下加节点全局锁)。
+**golden root 拿掉了并发创建的存储成本,剩下的是节点代理之上的某个队列**,那是下一个要量的东西。
+
+### 验收未回退
+
+`deploy/metal/e2e.sh` 走 vhost-user + 真实 S3:**22 passed / 1 failed**,唯一失败仍是 PR #8 就
+记录过的陈旧断言(golden rootfs 里没有 `git`),与块路径和本次改动无关。
+
+桶里最后的样子:`images/` 74 个对象 / 306 MB —— 512 MiB rootfs 去掉全零 chunk 后的**唯一一份**,
+被这一轮创建的 43 个卷共同引用。
+
+### 真机顺带查出的一个设计错误(已修)
+
+第一版接线让 `cats-blockd --seed-image` 在 **attach 之后**发布镜像,也就是握着卷租约做一次 8 秒的
+512 MiB 上传。节点代理配的租约 TTL 是 1.5 s,于是租约丢了、launch 失败:
+
+```
+INFO  attached volume=vol_f11ad38fc6d3 epoch=1 generation=0
+ERROR lease renewal failed; fencing writes: lease epoch is stale or expired
+Error: seed volume from image /opt/cats/guest/rootfs.ext4
+       provision from base image: attachment is fenced; refusing writes
+```
+
+发布根本不需要租约(它只写 `images/` 命名空间,不属于任何卷),所以现在发布在 attach 之前;
+更进一步,发布是**全队列一次性**的工作,不该落在某次 launch 上,于是拆成
+`cats-blockd --publish-image`(发布并打印 image id)与 `--seed-image-id`(按 id provision,
+成本是一次 manifest GET 加一次 map 写),节点代理每个节点发布一次。
+
+## 上传并发化:把串行往返摊平(2026-07-27 追加)
+
+上一节量出来的「delta pack 在 S3 上只有 2.3–2.9×」其实还有一层原因:提交路径的上传是一个
+**串行 `for` 循环**,一个对象一次阻塞往返(实测约 33 ms),`image::publish` 也一样。改成有界并发
+(`MAX_UPLOAD_CONCURRENCY = 16`),join 仍然在任何 map node 引用这些对象之前,所以
+`AFTER_DATA_UPLOAD` 这个崩溃点的含义一个字没变。
+
+原始数据 [`raw/metal-concurrent-upload-s3.log`](raw/metal-concurrent-upload-s3.log)(c6a.8xlarge,
+us-east-1,真实 S3;串行那一列来自同机型同配置的前两轮)。
+
+### Guest 一次 fsync 卡多久(改 48 处)
+
+| | 串行上传 | 并发上传 | |
+|---|---|---|---|
+| 只发脏页(3 MiB) | 1669.3 ms | **243.5 ms** | 快 6.9× |
+| 整块发布(192 MiB) | 4913.5 ms | **1429.9 ms** | 快 3.4× |
+
+**这把 delta pack 的收益还回来了。**同样是「只发脏页 vs 整块发布」:
+
+- 串行上传下:4913.5 → 1669.3 ms(**2.9×**)
+- 并发上传下:1429.9 → 243.5 ms(**5.9×**)
+
+所以「delta pack 在 S3 上不划算」这个结论,真实原因是**串行上传把它盖住了**:每个对象都要一次
+往返、往返又不重叠时,字节少 64× 根本显不出来;把往返摊平,字节数的降幅就回来了。
+
+### 发布镜像(节点上第一个 Cat 要等的那一次)
+
+| 镜像 | 串行 | 并发 | |
+|---|---|---|---|
+| 512 MiB | 8310 ms | **1156 ms** | 快 7.2× |
+
+8.3 秒变 1.2 秒,基本上不需要再为此单独做「节点启动时预发布」了。
+
+### 对 golden root 的影响:诚实地说,倍数变小了
+
+并发上传把**旧路径也加速了**,所以 golden root 相对它的倍数缩水:
+
+| | 串行 | 并发 |
+|---|---|---|
+| 单个 create(512 MiB):复制 | 15472.6 ms | 5334.7 ms |
+| 单个 create:引用 | 89.7 ms | **86.0 ms** |
+| 倍数 | 172× | **62×** |
+| 10 并发:复制 | 27230 ms | 22488 ms |
+| 10 并发:引用 | 167.4 ms | **157.4 ms** |
+| 倍数 | 162× | **143×** |
+
+引用那一侧本来就不上传任何数据,所以并发对它没影响。绝对值才是重点:**86 ms vs 5.3 秒**。
+
+### 顺带发现:冷读还是串行的
+
+空缓存读回 64 MiB:复制 881.9 ms(73 MiB/s)、引用 818.1 ms(78 MiB/s)。一台 12.5 Gbps 的机器
+只跑到 73 MiB/s——hydration 一个 chunk 一个 GET,不重叠,和上传原来的毛病一模一样,**还没修**。
+这也意味着 delta 链的冷读放大(最多 5 个对象/chunk)现在是在放大一个串行成本。
+
+## 冷读与 delta 链:链长几乎不要钱(2026-07-27 追加)
+
+ADR-0016 把「冷读放大」列为 delta pack 的主要代价(满链一个 chunk 要取 5 个对象),
+`MAX_DELTA_LAYERS = 4` 就是照着它选的,但这一项一直没量过。读路径改成并发之后量了:
+原始数据 [`raw/metal-cold-read-and-chains.log`](raw/metal-cold-read-and-chains.log)
+(i4i.metal + 真实 S3;16 个 chunk 各写一个 base 再写 N 次不同页,删掉本地 cache 后读回 64 MiB)。
+
+两种读法要分开看,因为行为不同:
+- **一次读一个 chunk**——Guest 的形态,只有一个 chunk 内部的层能重叠;
+- **一次读完整卷**——迁移/大顺序读的形态,chunk 之间也重叠。
+
+| 层数 | 要取的对象数 | 一次一个 chunk | 一次读完 |
+|---|---|---|---|
+| 0 | 16 | 840.5 ms(76 MiB/s) | **155.4 ms(412 MiB/s)** |
+| 1 | 32 | 852.0 ms | 154.7 ms |
+| 2 | 48 | 916.9 ms | 165.8 ms |
+| 4 | 80 | 857.7 ms | **171.9 ms(372 MiB/s)** |
+
+- **满链几乎不要钱**:4 层是每个 chunk 5 个对象(80 次取而不是 16 次),代价 171.9 ms
+  对 155.4 ms,约 **11%**。层一起取之后,ADR-0016 最担心的那项代价很小。上限仍然要留着当上限,
+  但它不是下一个该优化的东西。
+- **让 chunk 之间重叠值 5.4×**:同样 64 MiB,155 ms 对 840 ms(412 MiB/s 对 76)。单个 chunk 的
+  读按定义没法重叠,所以 Guest 每个在飞请求仍然是约 76 MiB/s,并行度来自它自己的队列深度;
+  迁移这类大块读的并行度来自这里。
+
+同一台机器上的 FLUSH(真实 S3):48 个 chunk,整块发布 1437.5 ms → 只发脏页 **211.0 ms**,**6.8×**。
+
+## 并发拉起:端到端从 61.6 秒到 8.3 秒(2026-07-27 追加)
+
+上一节把并发创建剩下的 61.6 秒归给了「节点代理之上的一条队列」。查出来就是
+`Controller::tick`:它对每个 Cat **顺序 await** `reconcile_cat`,而 `start_flow → dispatch`
+会一直阻塞到那台 VM 完全起来(约 6 秒)。
+
+**不是把循环改并发就行**——placement 得先变成原子认领:`schedule()` 是把 `cats_on_node` 求和
+算出节点已用容量,再由 `start_flow` 在**另一次** store 调用里写 placement;十个 flow 一起跑会
+读到同一份空闲容量、全都认领它,把节点超卖。`Store::claim_node_for` 现在在一次加锁里完成
+「选节点 + 记 placement」,然后 tick 才敢并发(上限 32)。
+
+原始数据 [`raw/metal-concurrent-reconcile.log`](raw/metal-concurrent-reconcile.log)。10 个 Cat
+同时冷创建,i4i.metal + 真 KVM + 真实 S3:
+
+| 版本 | 墙钟 | min | p50 | max | 失败 |
+|---|---|---|---|---|---|
+| 复制 rootfs + 串行 reconcile | 121.4 s | 11.8 s | 88.5 s | 121.4 s | 4 |
+| golden root + 串行 reconcile | 61.6 s | 8.2 s | 28.1 s | 61.6 s | 0 |
+| golden root + **并发 reconcile** | **8.3 s** | **4.8 s** | **8.0 s** | **8.3 s** | **0** |
+
+**形状变了,不只是数字变小**:之前是一条 6 秒/个的斜坡(min 8.2、p50 28、max 61.6),现在
+十个 Cat 花的时间和一个差不多(min 4.8、p50 8.0、max 8.3)。整批已经落在单个 create
+(4.5–6.9 秒)的两倍以内,也就是说剩下的成本是 VM 启动和 guest agent 就绪,不再是排队。
+
+相对本分支起点(121.4 秒、4 个失败)是 **14.6×**,相对上一版是 **7.4×**。
+
+同一轮的验收:`metal e2e: 22 passed, 1 failed`,仍是那条 golden rootfs 里没有 `git` 的陈旧断言。
 
 ## 仍未验证 / 后续项
 
-1. **delta pack**(只提交脏的 64 KiB 页,Direct-S3 设计 P4):写放大 ~100× 的唯一根治办法,
-   需要 Map 表达 base+delta、读路径合并、Compactor/GC 与重做崩溃矩阵。
-2. **golden root 复用**:见上面第 4 条,先要一个命名空间/血缘的决定。
-3. **多队列在真实 vCPU 数下的收益曲线**:本次只验了 1 和 4 两个点,而且已知队列多不等于更快。
-4. **长时间 soak 与多 Cat 同机压力**:本次每个场景都是单样本,不构成 SLA。
-5. **`nbd` 内核模块依赖的移除**:`install.sh` 仍无条件 `modprobe nbd`,以便随时切回默认路径。
-6. **本轮四项优化的真机复测**:并行提交与并发拉起都是在本机容器/FakeVmm 上量的,真机数字
-   要等下一轮裸金属。
+1. ~~读路径也要并发~~:**已做**,一次读完整卷从 840 ms 降到 155 ms(412 MiB/s),见上一节。
+2. ~~减少每次提交的对象数~~:**评估后不做**,理由与数字见
+   [ADR-0016](../../docs/decisions/0016-delta-pack-page-granular-commits.md)「关于打包成一个对象」。
+3. ~~delta 链的冷读放大~~:**已量**,满链只贵 11%,见上一节。
+4. **单个 create 的 4.5–6.9 秒**:并发拉起解决之后,这就是下一个天花板,成分是 VM 启动
+   与 guest agent 就绪,不再是存储或排队。
+5. ~~GC~~:**已实现**,见[协议 §9](../../docs/specs/blockd-protocol.md)与
+   `cats-blockd --collect-garbage`。镜像本身的回收仍然是运营方显式操作。
+6. **多队列在真实 vCPU 数下的收益曲线**:本次只验了 1 和 4 两个点,而且已知队列多不等于更快。
+7. **长时间 soak 与多 Cat 同机压力**:本次每个场景都是单样本,不构成 SLA。
+8. **`nbd` 内核模块依赖的移除**:`install.sh` 仍无条件 `modprobe nbd`,以便随时切回默认路径。
+9. **镜像预发布**:并发发布之后 512 MiB 只要 1.2 s,这一项的必要性大幅下降。
+10. **并发拉起的天花板应该由实测饱和点决定**,而不是沿用 wake 的那个常量。
 
 ## 复现
 

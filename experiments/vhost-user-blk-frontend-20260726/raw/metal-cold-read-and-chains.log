@@ -1,0 +1,89 @@
+What a delta chain costs to read back cold, and what read concurrency is worth.
+
+host:     AWS i4i.metal, 128 logical cpus, real in-region S3
+build:    this branch (concurrent hydration across chunks and across a chunk's
+          layers); "serial" figures for comparison are from
+          raw/metal-concurrent-upload-s3.log, same setup
+date_utc: 2026-07-27
+
+blockd/tests/commit_cost.rs::cold_read_cost_by_delta_chain_length. Each of 16
+chunks is written once densely (a base) and then `layers` more times, each
+touching a different page, so the chain really is that deep. The local cache is
+then deleted and all 64 MiB is read back -- what a cross-node migration or a fresh
+host does.
+
+Two read shapes, because they behave differently:
+  chunk-at-a-time -- one 4 MiB read per call, what a Guest produces. Only the
+                     layers within a chunk can overlap.
+  one big read    -- the whole volume in one call, what a migration produces.
+                     Chunks overlap as well.
+
+--- real S3 --------------------------------------------------------------------
+
+ layers          objects chunk-at-a-time ms        MiB/s one big read ms        MiB/s
+      0               16          840.5           76          155.4          412
+      1               32          852.0           75          154.7          414
+      2               48          916.9           70          165.8          386
+      4               80          857.7           75          171.9          372
+
+--- control: local file store, same machine ------------------------------------
+
+      0               16           81.8          783           52.0         1232
+      1               32           80.4          796           52.7         1214
+      2               48           81.1          789           51.9         1234
+      4               80           82.0          781           53.1         1206
+
+Reading:
+
+* **A full delta chain is nearly free to read.** Four layers is five objects per
+  chunk -- 80 fetches instead of 16 -- and costs 171.9 ms against 155.4 ms, about
+  **11%**. ADR-0016 charges cold-read amplification as its main cost and sized
+  MAX_DELTA_LAYERS around it; measured, with the layers fetched together, that
+  cost is small. The bound still matters as a bound, but it is not the thing to
+  optimize next.
+* **Overlapping chunks is worth 5.4x**: 155 ms against 840 ms for the same 64 MiB,
+  412 MiB/s against 76. A single-chunk read cannot overlap anything by definition,
+  so a Guest reading 4 MiB at a time still sees ~76 MiB/s per outstanding request
+  and gets its parallelism from its own queue depth; a migration reading in bulk
+  gets it from here.
+* 412 MiB/s is a single volume against S3 and is not the instance's ceiling. The
+  next thing in the way is per-object GET latency at this concurrency, not the
+  chain length.
+
+--- FLUSH on this machine (i4i.metal, real S3) ---------------------------------
+
+sparse (delta packs):
+dirty chunks  dirty pages  published MiB     flush ms   ms per pub MiB   sha256 MiB/s
+           1            1           0.06        111.6          1786.19           1277
+           8            8           0.50        148.1           296.21           1281
+          16           16           1.00        148.6           148.63           1276
+          32           32           2.00        189.3            94.63           1269
+          48           48           3.00        211.0            70.32           1280
+
+dense (full 4 MiB bases):
+           8          32.00        284.5             8.89
+          32         128.00        792.0             6.19
+          48         192.00       1437.5             7.49
+
+Delta packs against full-chunk publishing at 48 chunks: 1437.5 -> 211.0 ms, 6.8x.
+
+--- Golden root on this machine (i4i.metal, real S3) ---------------------------
+
+ image MiB       path uploaded MiB    objects provision ms    speedup
+        64       copy        64.00         19        505.2       1.0x
+        64  reference         0.00          3        183.1       2.8x
+        64  (publish)         once          -        182.9          -
+       256       copy       256.01         67       2618.8       1.0x
+       256  reference         0.01          3        189.1      13.8x
+       256  (publish)         once          -        518.5          -
+       512       copy       512.01        131       5339.1       1.0x
+       512  reference         0.02          3        152.6      35.0x
+       512  (publish)         once          -        931.6          -
+
+    cats       path uploaded MiB    objects        wall ms    speedup
+       1       copy       256.01         67         2588.2       1.0x
+       1  reference         0.01          3          149.2      17.3x
+       4       copy      1024.02        268         9415.7       1.0x
+       4  reference         0.04         12          197.7      47.6x
+      10       copy      2560.05        670        22594.2       1.0x
+      10  reference         0.11         30          158.4     142.6x

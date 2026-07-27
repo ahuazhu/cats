@@ -13,11 +13,10 @@ use std::time::Instant;
 
 use cats_api::nodejob::{job_id, NodeJob, NodeJobAction, VolumeGrant};
 use cats_api::resources::ObservedState;
-use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_node_agent::admission::WakeBudget;
 use cats_node_agent::runtime::{NodeConfig, NodeRuntime, VmmMode};
 use cats_node_agent::testutil::workspace_bin;
-use cats_storage::{AdapterConfig, AdapterSelection, MetadataStore};
+use cats_storage::{AdapterConfig, AdapterSelection};
 
 const SIZE: u64 = 2 * cats_api::chunk::CHUNK_SIZE as u64;
 
@@ -27,8 +26,6 @@ fn runtime(dir: &std::path::Path) -> Arc<NodeRuntime> {
 
 fn runtime_with(dir: &std::path::Path, wake_budget: WakeBudget) -> Arc<NodeRuntime> {
     let meta_path = dir.join("meta.db");
-    let storage_meta: Arc<dyn MetadataStore> =
-        Arc::new(SqliteMetadataStore::open(&meta_path).unwrap());
     Arc::new(NodeRuntime::new(
         NodeConfig {
             node_id: "node_conc".into(),
@@ -50,7 +47,6 @@ fn runtime_with(dir: &std::path::Path, wake_budget: WakeBudget) -> Arc<NodeRunti
             wake_budget,
             vmm: VmmMode::Fake,
         },
-        storage_meta,
     ))
 }
 

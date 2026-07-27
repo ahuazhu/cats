@@ -6,7 +6,6 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use cats_api::guest::{
     AcquireGuestWorkLeaseRequest, GuestRequestBody, GuestResponseBody, GuestWorkLease,
@@ -14,11 +13,10 @@ use cats_api::guest::{
 };
 use cats_api::nodejob::{job_id, JobPhase, NodeJob, NodeJobAction, SuspendWorkFence, VolumeGrant};
 use cats_api::resources::ObservedState;
-use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_node_agent::guest_client::GuestClient;
 use cats_node_agent::runtime::{NodeConfig, NodeRuntime};
 use cats_node_agent::testutil::workspace_bin;
-use cats_storage::{AdapterConfig, AdapterSelection, MetadataStore};
+use cats_storage::{AdapterConfig, AdapterSelection};
 
 const CAT: &str = "cat_rt";
 const SIZE: u64 = 2 * cats_api::chunk::CHUNK_SIZE as u64;
@@ -45,8 +43,6 @@ fn env() -> Env {
         )])
         .unwrap(),
     };
-    let storage_meta: Arc<dyn MetadataStore> =
-        Arc::new(SqliteMetadataStore::open(&meta_path).unwrap());
     let runtime = NodeRuntime::new(
         NodeConfig {
             node_id: "node_test".into(),
@@ -60,7 +56,6 @@ fn env() -> Env {
             wake_budget: Default::default(),
             vmm: cats_node_agent::runtime::VmmMode::Fake,
         },
-        storage_meta,
     );
     Env {
         _dir: dir,
