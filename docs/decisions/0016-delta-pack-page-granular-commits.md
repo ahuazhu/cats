@@ -115,9 +115,11 @@ sparse 行的 556 ms/发布 MiB 对 dense 的 25.6 ms/发布 MiB,说明 sparse �
 
 ## 代价与风险
 
-- **冷读放大**:一个满链 chunk 的冷读要取 5 个对象而不是 1 个。这是本决定最主要的代价,
-  `MAX_DELTA_LAYERS = 4` 就是为此选的(而不是 8 或更多)。跨节点冷迁移与空缓存恢复会更慢,
-  幅度取决于链长分布;真机上尚未单独测量这一项。
+- **冷读放大**:一个满链 chunk 的冷读要取 5 个对象而不是 1 个。**2026-07-27 在真机 + 真实 S3
+  上量过了,代价比预期小得多**:一次读完 64 MiB,0 层 155.4 ms、4 层 171.9 ms,**只贵约 11%**
+  (原始数据 [`raw/metal-cold-read-and-chains.log`](../../experiments/vhost-user-blk-frontend-20260726/raw/metal-cold-read-and-chains.log))。
+  前提是读路径把一个 chunk 的各层一起取——这一点在同一轮里补上了。`MAX_DELTA_LAYERS = 4`
+  作为硬上限继续保留,但它不再是下一个该动的地方。
 - **GC 必须把 base 与全部 delta 都视为存活**:存活判据仍然是"被当前 Root 引用",只是一个
   chunk 现在可能引用多个对象。已实现(见[协议 §9](../specs/blockd-protocol.md)),遍历的正是
   `ChunkRef::object_ids()`;回归测试 `gc_keeps_every_layer_of_a_live_chain_and_drops_superseded_objects`
