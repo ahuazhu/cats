@@ -19,7 +19,8 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
 # libssl-dev is required by the PostgreSQL metadata adapter's native-tls stack.
 apt-get install -qy build-essential curl git nbd-client busybox-static \
-  musl-tools e2fsprogs cpio zstd pkg-config libssl-dev debootstrap iptables
+  musl-tools e2fsprogs cpio zstd pkg-config libssl-dev debootstrap iptables \
+  util-linux
 
 echo "==> rust toolchain"
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -62,6 +63,44 @@ CATS_GUEST_NETWORK_CIDR=${CATS_GUEST_NETWORK_CIDR:-10.240.0.0/16} \
 
 echo "==> guest image"
 OUT="$PREFIX/guest" "$REPO/deploy/metal/build-guest-image.sh"
+
+# --------------------------------------------------------------------------
+# Local NVMe for the ChunkStore cache and the file object store.
+#
+# On i4i and friends the instance store is the whole point of the machine, and
+# leaving /var/lib/cats on the EBS root silently turns every storage measurement
+# into an EBS measurement -- which is exactly what happened on 2026-07-27, where
+# 4 KiB random write read 40x lower than the run that had mounted it. Mount it
+# here so the documented environment is what you get, rather than something an
+# operator has to remember.
+#
+# CATS_DATA_DEVICE=none skips this; CATS_DATA_DEVICE=/dev/nvmeXn1 picks one.
+# --------------------------------------------------------------------------
+DATA_DEVICE=${CATS_DATA_DEVICE:-auto}
+if [[ $DATA_DEVICE == auto ]]; then
+  # An unmounted, unpartitioned NVMe that is not the root disk.
+  root_src=$(findmnt -no SOURCE / | sed 's/p\?[0-9]*$//')
+  DATA_DEVICE=$(lsblk -dnp -o NAME,TYPE,MOUNTPOINT |
+    awk -v root="$root_src" '$2 == "disk" && $1 != root && $3 == "" {print $1; exit}')
+  DATA_DEVICE=${DATA_DEVICE:-none}
+fi
+if [[ $DATA_DEVICE != none ]]; then
+  if mountpoint -q /var/lib/cats; then
+    echo "==> /var/lib/cats is already a mount point; leaving it alone"
+  else
+    echo "==> local data device $DATA_DEVICE -> /var/lib/cats"
+    [[ -b $DATA_DEVICE ]] || { echo "$DATA_DEVICE is not a block device" >&2; exit 1; }
+    blkid "$DATA_DEVICE" >/dev/null 2>&1 || mkfs.ext4 -q -F "$DATA_DEVICE"
+    install -d /var/lib/cats
+    mount "$DATA_DEVICE" /var/lib/cats
+    # Instance storage does not survive a stop/start, so this is deliberately not
+    # written to /etc/fstab: a reboot should come up with an empty cache, not fail
+    # to boot on a device that no longer has a filesystem.
+  fi
+else
+  echo "==> no local data device found; /var/lib/cats stays on the root filesystem"
+  echo "    (fine for functional testing, NOT comparable for storage benchmarks)"
+fi
 
 echo "==> state dirs + config"
 install -d /var/lib/cats/{node,blob} /etc/cats

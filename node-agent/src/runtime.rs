@@ -873,7 +873,7 @@ impl NodeRuntime {
                         // Record the attachment before any later fallible setup
                         // so the shared failure teardown cannot leak it.
                         rt.ch = Some(chrt.clone());
-                        disks.push(ch::file_disk_arg(&dev));
+                        disks.push(ch::file_disk_arg(&dev, chc.block_direct));
                     }
                     BlockPath::VhostUser => {
                         let socket = proc

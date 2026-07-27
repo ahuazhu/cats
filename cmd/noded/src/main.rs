@@ -88,6 +88,12 @@ struct Args {
     /// virtio-blk straight into cats-blockd).
     #[arg(long, default_value = "kernel-nbd")]
     ch_block_path: String,
+    /// Open the kernel-NBD device with O_DIRECT, so the host page cache stops
+    /// acking Guest writes the engine has not seen yet. Off matches Cloud
+    /// Hypervisor's default and is what the fleet runs today; on is what a
+    /// like-for-like comparison against vhost-user requires (ADR-0015).
+    #[arg(long, default_value_t = false)]
+    ch_block_direct: bool,
     /// virtio-blk queues per disk on the vhost-user path.
     #[arg(long, default_value_t = 1)]
     ch_vhost_user_queues: usize,
@@ -152,6 +158,7 @@ async fn main() -> anyhow::Result<()> {
             cmdline: args.ch_cmdline.clone(),
             seed_image: args.ch_seed_image.clone(),
             block_path: cats_node_agent::ch::BlockPath::parse(&args.ch_block_path)?,
+            block_direct: args.ch_block_direct,
             vhost_user_queues: args.ch_vhost_user_queues,
             vhost_user_queue_size: args.ch_vhost_user_queue_size,
             nbd_client_bin: args.ch_nbd_client.clone(),

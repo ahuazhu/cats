@@ -71,6 +71,10 @@ impl BlockPath {
 
 #[derive(Debug, Clone)]
 pub struct ChConfig {
+    /// Open the kernel-NBD block device with O_DIRECT, bypassing the host page
+    /// cache. Only meaningful on [`BlockPath::KernelNbd`]; the vhost-user path
+    /// never had a host-side cache to bypass.
+    pub block_direct: bool,
     pub ch_bin: PathBuf,
     pub kernel: PathBuf,
     pub initramfs: Option<PathBuf>,
@@ -387,8 +391,15 @@ pub fn nbd_detach(cfg: &ChConfig, dev: &str) {
 ///
 /// `image_type=raw` is required: CH v53 otherwise auto-detects raw and enables a
 /// sector-0 write protection that fails ext4 writes.
-pub fn file_disk_arg(path: &str) -> String {
-    format!("path={path},image_type=raw")
+pub fn file_disk_arg(path: &str, direct: bool) -> String {
+    // `direct=on` makes Cloud Hypervisor open the device with O_DIRECT, so the
+    // host page cache stops acking Guest writes before the engine has seen them.
+    // Off (CH's default) is faster on paper and the write is not durable yet;
+    // on is slower and honest. It is also the only way to compare this path with
+    // vhost-user, which has no such cache -- without it every write number is a
+    // page-cache measurement (see ADR-0015).
+    let direct = if direct { "on" } else { "off" };
+    format!("path={path},image_type=raw,direct={direct}")
 }
 
 /// Effective virtio-blk queue count for one Cat.
@@ -749,6 +760,7 @@ mod tests {
     #[test]
     fn queue_count_never_exceeds_the_cats_vcpus() {
         let mut cfg = ChConfig {
+            block_direct: false,
             ch_bin: PathBuf::from("ch"),
             kernel: PathBuf::from("vmlinuz"),
             initramfs: None,
@@ -776,9 +788,16 @@ mod tests {
     #[test]
     fn disk_arguments_describe_both_block_paths() {
         assert_eq!(
-            file_disk_arg("/dev/nbd3"),
-            "path=/dev/nbd3,image_type=raw",
+            file_disk_arg("/dev/nbd3", false),
+            "path=/dev/nbd3,image_type=raw,direct=off",
             "image_type is required for CH v53 raw disks"
+        );
+        // direct=on is what makes a kernel-nbd measurement comparable with
+        // vhost-user: without it the host page cache acks writes the engine has
+        // not seen (ADR-0015).
+        assert_eq!(
+            file_disk_arg("/dev/nbd3", true),
+            "path=/dev/nbd3,image_type=raw,direct=on"
         );
         assert_eq!(
             vhost_user_disk_arg(Path::new("/tmp/cats-sock/abc.sock"), 4, 256).unwrap(),
@@ -850,6 +869,7 @@ mod tests {
         let memory_file = dir.path().join(GUEST_MEMORY_FILE);
         prepare_memory_backing(&memory_file, 256).unwrap();
         let cfg = ChConfig {
+            block_direct: false,
             ch_bin: fake_ch,
             kernel,
             initramfs: None,
