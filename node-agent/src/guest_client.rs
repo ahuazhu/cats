@@ -78,6 +78,35 @@ impl GuestClient {
         Ok(Self { stream, next_id: 1 })
     }
 
+    /// Connect for a command that may run for a long time without printing.
+    ///
+    /// The 30 s read timeout the other connects use is right for a health probe
+    /// and wrong for `cats exec`: a build, a test run or a large install is
+    /// routinely silent for longer than that, and the timeout killed the command
+    /// rather than the connection. Measured before the fix, `cats exec -- sleep
+    /// 40` failed after 30.7 s with "Resource temporarily unavailable".
+    ///
+    /// Same trade-off the interactive shell already accepts: a wedged guest agent
+    /// holds the connection until the socket dies. The health probes keep their
+    /// bound, so a wedged agent is still detected.
+    pub fn connect_long_running(path: &Path) -> Result<Self> {
+        let client = Self::connect(path)?;
+        client
+            .stream
+            .set_read_timeout(None)
+            .context("clear exec read timeout")?;
+        Ok(client)
+    }
+
+    pub fn connect_hybrid_vsock_long_running(path: &Path, port: u32) -> Result<Self> {
+        let client = Self::connect_hybrid_vsock(path, port)?;
+        client
+            .stream
+            .set_read_timeout(None)
+            .context("clear exec read timeout")?;
+        Ok(client)
+    }
+
     pub fn connect_hybrid_vsock_shell(path: &Path, port: u32) -> Result<Self> {
         let client = Self::connect_hybrid_vsock(path, port)?;
         // Cloud Hypervisor runs on Linux, where an active SO_RCVTIMEO can be

@@ -159,7 +159,10 @@ fn config_space_reports_the_engine_geometry() {
     let max_discard_sectors = u32::from_le_bytes(config[36..40].try_into().unwrap());
     assert!(max_discard_sectors > 0, "DISCARD needs a non-zero limit");
     let write_zeroes_may_unmap = config[56];
-    assert_eq!(write_zeroes_may_unmap, 0, "V1 writes zeroes, never unmaps");
+    assert_eq!(
+        write_zeroes_may_unmap, 1,
+        "a fully covered chunk really is unmapped (spec §7.2) and reads as zeros"
+    );
 
     // A short read of the config space must still be answered.
     let short = frontend.config(8).expect("short get config");

@@ -259,9 +259,10 @@ impl BlkBackend {
         // WRITE_ZEROES limits.
         out.extend_from_slice(&max_zero_sectors.to_le_bytes());
         out.extend_from_slice(&1u32.to_le_bytes());
-        // write_zeroes_may_unmap: V1 writes real zeroes and keeps the mapping
-        // (spec §7 TRIM mapping), so the Guest must not assume a hole.
-        out.push(0);
+        // write_zeroes_may_unmap: a chunk covered end to end really is unmapped —
+        // its map entry becomes a Hole and its objects are freed (spec §7.2) —
+        // and a Hole reads as zeros, which is exactly what this bit promises.
+        out.push(1);
         out.extend_from_slice(&[0u8; 3]);
         out
     }

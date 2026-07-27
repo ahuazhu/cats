@@ -6,6 +6,7 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use cats_api::guest::{
     AcquireGuestWorkLeaseRequest, GuestRequestBody, GuestResponseBody, GuestWorkLease,
@@ -135,6 +136,32 @@ fn guest_work(socket: &Path, method: &str, route: &str, body: &[u8]) -> (u16, Ve
         .parse()
         .unwrap();
     (status, response[split + 4..].to_vec())
+}
+
+/// `cats exec` must survive a command that prints nothing for a long time.
+///
+/// The guest-agent connection carried a 30 s read timeout meant for health
+/// probes, so any quiet command -- a build, a test run, a large install -- was
+/// killed at 30 s with "Resource temporarily unavailable". Measured on real
+/// hardware before the fix: `sleep 20` returned, `sleep 40` failed after 30.7 s.
+#[test]
+fn exec_survives_a_command_that_is_quiet_for_longer_than_a_health_probe() {
+    let env = env();
+    assert_eq!(
+        env.runtime.execute(start_job(1)).observed_state,
+        ObservedState::Running
+    );
+    let started = std::time::Instant::now();
+    let (code, stdout, stderr) = env
+        .runtime
+        .exec(CAT, vec!["sh".into(), "-c".into(), "sleep 35; echo awake".into()])
+        .expect("a long quiet command must not be cut off");
+    assert!(
+        started.elapsed() >= Duration::from_secs(35),
+        "the command did not actually run for 35 s"
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "awake");
 }
 
 #[test]

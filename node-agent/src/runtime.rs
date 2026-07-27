@@ -202,6 +202,17 @@ pub enum GuestConn {
 }
 
 impl GuestConn {
+    /// For `exec`: no read timeout, because a command may be silent for a long
+    /// time. Health probes use `connect`, which keeps its bound.
+    pub fn connect_long_running(&self) -> Result<GuestClient> {
+        match self {
+            GuestConn::Unix(path) => GuestClient::connect_long_running(path),
+            GuestConn::Vsock(path, port) => {
+                GuestClient::connect_hybrid_vsock_long_running(path, *port)
+            }
+        }
+    }
+
     pub fn connect(&self) -> Result<GuestClient> {
         match self {
             GuestConn::Unix(path) => GuestClient::connect(path),
@@ -1745,7 +1756,7 @@ impl NodeRuntime {
             (rt.conn(), rt.activity.clone())
         };
         let _guard = activity.acquire()?;
-        let mut client = conn.connect()?;
+        let mut client = conn.connect_long_running()?;
         client.exec(command)
     }
 

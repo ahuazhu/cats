@@ -231,7 +231,7 @@ socket，两者服务同一个 engine 与同一个 attachment lease。
   `SEG_MAX`、`BLK_SIZE`、`FLUSH`、`DISCARD`、`WRITE_ZEROES`，`num_queues > 1` 时加 `MQ`。
 - Config space：`capacity` = 卷字节数 / 512；`blk_size` = 512（与 §7 路径 Guest 可见
   几何一致）；`size_max` = 32 MiB；`seg_max` = queue_size − 2；`writeback` = 1；
-  `write_zeroes_may_unmap` = 0。
+  `write_zeroes_may_unmap` = 1(整块覆盖的 chunk 确实会被解除映射,见 §7.2,而 Hole 读出来就是零)。
 - 请求映射（与 §7 完全同构，调用同一批 engine 入口）：
 
   | virtio-blk 请求 | 语义 |
