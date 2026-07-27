@@ -1,0 +1,919 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="先按三种方式给沙箱市场分层：机器能活多久、隔离用什么技术、产品从哪一类老产品改过来。再看 Cats 落在哪一层、最大的优点是什么、谁会为此付费，以及选定的目标客户。">
+  <title>Cats 在沙箱市场中的位置</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg:#f4f6f7; --paper:#fff; --ink:#18252c; --muted:#5b6c73;
+      --line:#ced9dd; --blue:#1768ac; --blue-bg:#ebf4fc;
+      --green:#087d59; --green-bg:#e9f8f1; --orange:#ae5518;
+      --orange-bg:#fff3e7; --purple:#7041a5; --purple-bg:#f4effb;
+      --red:#b42318; --red-bg:#fff0ef; --gray-bg:#eef2f4;
+      --radius:10px; --shadow:0 8px 24px rgb(22 43 53 / 7%);
+    }
+    * { box-sizing:border-box; }
+    html { scroll-behavior:smooth; }
+    body { margin:0; min-width:320px; background:var(--bg); color:var(--ink); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; line-height:1.66; }
+    a { color:var(--blue); }
+    code,pre { font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace; }
+    code { color:#102832; }
+    .page { width:min(1380px,calc(100% - 32px)); margin:0 auto; }
+    header { background:var(--paper); border-bottom:1px solid var(--line); }
+    .header-inner { padding:38px 0 31px; }
+    h1 { margin:0; font-size:clamp(31px,4vw,49px); line-height:1.14; letter-spacing:-.035em; }
+    .subtitle { max-width:1080px; margin:14px 0 0; color:var(--muted); font-size:16px; }
+    .meta { display:flex; gap:18px; flex-wrap:wrap; margin-top:17px; color:var(--muted); font-size:12px; }
+    nav { position:sticky; z-index:20; top:0; background:rgb(255 255 255 / 95%); border-bottom:1px solid var(--line); backdrop-filter:blur(10px); }
+    .nav-inner { display:flex; gap:20px; overflow-x:auto; padding:11px 0; white-space:nowrap; font-size:12px; }
+    .nav-inner a { color:var(--muted); text-decoration:none; }
+    .nav-inner a:hover { color:var(--blue); }
+    .nav-inner a.on { color:var(--ink); font-weight:750; }
+    main { padding-bottom:64px; }
+    section { padding:48px 0; border-bottom:1px solid var(--line); scroll-margin-top:48px; }
+    section:last-child { border-bottom:0; }
+    h2 { margin:0 0 10px; font-size:clamp(24px,3vw,34px); line-height:1.25; letter-spacing:-.025em; }
+    h3 { margin:26px 0 8px; font-size:18px; }
+    h4 { margin:0 0 6px; font-size:14px; }
+    .lead { max-width:1060px; margin:0 0 24px; color:var(--muted); font-size:14px; }
+    p { max-width:1060px; }
+    .part { display:inline-block; margin-bottom:12px; padding:3px 10px; border-radius:99px; background:var(--gray-bg); color:#43565e; font-size:11px; font-weight:750; letter-spacing:.06em; }
+    .part.b { background:var(--green-bg); color:var(--green); }
+    .decision-grid,.two-col,.three-col,.four-col { display:grid; gap:14px; }
+    .decision-grid,.two-col { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .three-col { grid-template-columns:repeat(3,minmax(0,1fr)); }
+    .four-col { grid-template-columns:repeat(4,minmax(0,1fr)); }
+    .decision,.card { padding:18px; border:1px solid var(--line); border-radius:var(--radius); background:var(--paper); }
+    .decision { border-left:4px solid var(--blue); }
+    .decision strong { display:block; font-size:15px; }
+    .decision p,.card p { max-width:none; margin:6px 0 0; color:var(--muted); font-size:13px; }
+    .card ul,.card ol { margin:10px 0 0; padding-left:19px; color:var(--muted); font-size:12.5px; }
+    .card li + li { margin-top:5px; }
+    .card h4 { color:var(--ink); }
+    .table-wrap { overflow-x:auto; border:1px solid var(--line); border-radius:var(--radius); background:var(--paper); }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th,td { padding:12px 14px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+    tr:last-child td { border-bottom:0; }
+    th { background:var(--gray-bg); color:#43565e; font-size:12px; }
+    td:first-child { font-weight:650; }
+    td.rank { color:var(--blue); font-size:17px; font-weight:750; text-align:center; }
+    td.num { font-variant-numeric:tabular-nums; text-align:right; }
+    .diagram-frame { overflow-x:auto; padding:12px; border:1px solid var(--line); border-radius:var(--radius); background:var(--paper); box-shadow:var(--shadow); }
+    .diagram-frame svg { display:block; width:100%; min-width:1080px; height:auto; }
+    .figcap { margin:10px 2px 0; color:var(--muted); font-size:12px; }
+    .callout { margin-top:18px; padding:15px 17px; border:1px solid #bad5e8; border-left:4px solid var(--blue); border-radius:8px; background:var(--blue-bg); color:#29434f; font-size:13.5px; }
+    .callout.green { border-color:#b8dfd0; border-left-color:var(--green); background:var(--green-bg); }
+    .callout.orange { border-color:#eed0b6; border-left-color:var(--orange); background:var(--orange-bg); }
+    .callout.red { border-color:#efc2be; border-left-color:var(--red); background:var(--red-bg); }
+    .callout.purple { border-color:#d9c9ef; border-left-color:var(--purple); background:var(--purple-bg); }
+    .callout ul { margin:8px 0 0; padding-left:19px; }
+    .callout li + li { margin-top:5px; }
+    .status { display:inline-block; padding:2px 7px; border-radius:99px; font-size:10px; font-weight:750; white-space:nowrap; }
+    .status.ok { background:var(--green-bg); color:var(--green); }
+    .status.gap { background:var(--red-bg); color:var(--red); }
+    .status.mid { background:var(--orange-bg); color:var(--orange); }
+    .status.unk { background:var(--gray-bg); color:var(--muted); }
+    .source-list { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+    .source-list a { padding:13px 15px; border:1px solid var(--line); border-radius:8px; background:var(--paper); text-decoration:none; font-size:12px; }
+    .source-list strong { display:block; color:var(--ink); font-size:13px; }
+    footer { padding:24px 0 38px; border-top:1px solid var(--line); color:var(--muted); font-size:12px; }
+    .mt { margin-top:14px; }
+    @media (max-width:980px) {
+      .page { width:calc(100% - 24px); }
+      h1 { font-size:28px; overflow-wrap:anywhere; }
+      .subtitle,.decision,.card,.callout,th,td { overflow-wrap:anywhere; }
+      .decision-grid,.two-col,.three-col,.four-col,.source-list { grid-template-columns:1fr; }
+      .decision,.card { min-width:0; }
+    }
+    @media print {
+      @page { size:A4 landscape; margin:11mm; }
+      body { background:white; font-size:9pt; }
+      .page { width:100%; }
+      nav { display:none; }
+      section { padding:24px 0; }
+      .decision,.card,.table-wrap,.callout,.diagram-frame { break-inside:avoid; page-break-inside:avoid; }
+      .diagram-frame { box-shadow:none; overflow:visible; }
+      .diagram-frame svg { min-width:0; width:100%; }
+      a { color:inherit; text-decoration:none; }
+    }
+  </style>
+</head>
+<body>
+  <div style="margin:16px auto 0;max-width:1080px;padding:12px 18px;border:2px solid #1768ac;background:#ebf4fc;color:#244a64;font-size:14px;line-height:1.7;border-radius:10px;">
+    <strong>这份文档是分析，不是实现依据。</strong>跨组件的决定以 <code>docs/decisions/</code> 的 ADR 为准，Cats 自己的性能数字以实验总报告和原始 CSV 为准。同名 Markdown 见 <a href="cats-market-positioning.md">cats-market-positioning.md</a>；逐个产品的详细档案、定价原始数据和用户原话见<a href="cats-competitive-landscape.md">竞品与市场格局分析</a>。
+  </div>
+  <header>
+    <div class="page header-inner">
+      <h1>Cats 在沙箱市场中的位置</h1>
+      <p class="subtitle">先按三种方式给这个市场分层——机器能活多久、隔离用什么技术、产品是从哪一类老产品改过来的。前六节讲行业，不提 Cats；第七节起才看 Cats 落在哪一层、最大的优点是什么、谁会为此付费。目标客户已选定为「每个用户一台长驻机器」的产品（第 11 节）。</p>
+      <div class="meta"><span>竞品事实核实于 2026-07-27</span><span>来源：厂商官方文档、产品 changelog、第三方实测</span><span>Cats 事实来源：本仓库代码、ADR、实验报告</span></div>
+    </div>
+  </header>
+
+  <nav><div class="page nav-inner">
+    <a href="#market">1 卖什么</a><a href="#lifespan">2 能活多久</a><a href="#isolation">3 隔离技术</a>
+    <a href="#origin">4 从哪改的</a><a href="#money">5 钱在哪</a><a href="#gaps">6 没解决的</a>
+    <a href="#cats">7 Cats 在哪层</a><a href="#advantage">8 最大的优点</a><a href="#missing">9 缺什么</a>
+    <a href="#payers">10 谁会付费</a><a href="#target" class="on">11 目标客户</a><a href="#todo">12 要做的事</a>
+    <a href="#wrong">13 判断可能错在哪</a><a href="#boundary">14 来源与边界</a>
+  </div></nav>
+
+  <main class="page">
+
+    <section id="market">
+      <span class="part">第一部分 · 行业</span>
+      <h2>1. 这个市场在卖什么</h2>
+      <div class="callout" style="margin-top:0;font-size:16px;">
+        一句话：<strong>让 AI 写出来的代码有个地方跑，跑坏了不牵连别人。</strong>
+      </div>
+      <div class="two-col mt">
+        <div class="card">
+          <h4>买家一：做 AI 产品的公司</h4>
+          <p>他们的用户每分钟产生大量代码要执行。Manus 买 E2B，Lovable 买 Modal，LangChain 买 Daytona。</p>
+          <p><strong>他们要的是「同时能跑几万个、别崩」。</strong></p>
+        </div>
+        <div class="card">
+          <h4>买家二：开发者自己</h4>
+          <p>想要一台云上的机器，交给 agent 用，人不在的时候它继续干活。</p>
+          <p><strong>他们要的是「我回来的时候它还在」。</strong></p>
+        </div>
+      </div>
+      <p class="mt" style="color:var(--muted);font-size:14px;">市场目前主要服务第一类。判断任何一个产品的位置，先看它是给哪一类人做的。</p>
+    </section>
+
+    <section id="lifespan">
+      <span class="part">第一部分 · 行业</span>
+      <h2>2. 第一种分法：机器能活多久</h2>
+      <p class="lead">这是最重要的一条线。一个产品认为机器该活多久，决定了它其他所有部分怎么设计——存储怎么做、账单怎么算、有没有固定网址。</p>
+
+      <div class="diagram-frame">
+        <svg viewBox="0 0 1320 620" role="img" aria-labelledby="lad-title lad-desc">
+          <title id="lad-title">沙箱产品按机器能活多久分成五层</title>
+          <desc id="lad-desc">第一层跑完就没，第二层一次会话超时删除，第三层可以睡也能醒来，第四层不设时长上限并有固定网址，第五层机器和硬盘分开活。第三层产品最多，第四层只有一家对外销售，第五层几乎是空的。</desc>
+          <defs>
+            <style>
+              .lb{stroke-width:1.6;rx:10}
+              .l1{fill:#eef2f4;stroke:#9baab1}
+              .l2{fill:#ebf4fc;stroke:#1768ac}
+              .l3{fill:#e9f8f1;stroke:#087d59}
+              .l4{fill:#fff3e7;stroke:#ae5518}
+              .l5{fill:#fbf9fd;stroke:#7041a5;stroke-dasharray:7 5}
+              .ln{font:700 26px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#1d3038}
+              .lt{font:700 14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#1d3038}
+              .lr{font:12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#5e7078}
+              .lp{font:11.5px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#3d535c}
+              .lx{font:700 12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+              .ax{stroke:#b4c1c6;stroke-width:1.5}
+            </style>
+          </defs>
+
+          <path d="M18 566 H1302" class="ax"/>
+          <path d="M18 566 V70" class="ax"/>
+          <text x="30" y="58" class="lr">机器活得越久 →</text>
+
+          <rect x="34" y="452" width="246" height="114" class="lb l1"/>
+          <text x="52" y="486" class="ln" style="font-size:20px">一</text>
+          <text x="82" y="486" class="lt">跑完就没</text>
+          <text x="52" y="510" class="lr">关掉后：什么都不剩</text>
+          <text x="52" y="530" class="lp">Cloudflare · AWS Lambda</text>
+          <text x="52" y="548" class="lp">Cloud Run · Azure · 百度</text>
+
+          <rect x="292" y="392" width="246" height="174" class="lb l2"/>
+          <text x="310" y="426" class="ln" style="font-size:20px">二</text>
+          <text x="340" y="426" class="lt">一次会话，超时删</text>
+          <text x="310" y="450" class="lr">关掉后：什么都不剩</text>
+          <text x="310" y="472" class="lp">Modal · Vercel · Runloop</text>
+          <text x="310" y="490" class="lp">E2B 免费档 · 腾讯</text>
+          <text x="310" y="508" class="lp">火山 · 阿里</text>
+          <text x="310" y="538" class="lx" style="fill:#1768ac">上限普遍 24 小时</text>
+
+          <rect x="550" y="292" width="246" height="274" class="lb l3"/>
+          <text x="568" y="326" class="ln" style="font-size:20px">三</text>
+          <text x="598" y="326" class="lt">能睡，睡醒还在</text>
+          <text x="568" y="350" class="lr">关掉后：硬盘在，</text>
+          <text x="568" y="368" class="lr">有的连内存和进程也在</text>
+          <text x="568" y="396" class="lp">E2B 付费档 · Blaxel</text>
+          <text x="568" y="414" class="lp">Freestyle · Together</text>
+          <text x="568" y="432" class="lp">Daytona · CreateOS</text>
+          <text x="568" y="450" class="lp">Claude Managed Agents</text>
+          <rect x="568" y="478" width="210" height="62" rx="8" fill="#fff" stroke="#087d59" stroke-width="1.2"/>
+          <text x="586" y="502" class="lx" style="fill:#087d59">这一层最挤</text>
+          <text x="586" y="524" class="lr">比的是唤醒快多少毫秒</text>
+
+          <rect x="808" y="202" width="246" height="364" class="lb l4"/>
+          <text x="826" y="236" class="ln" style="font-size:20px">四</text>
+          <text x="856" y="236" class="lt">不设上限 + 固定网址</text>
+          <text x="826" y="260" class="lr">关掉后：硬盘在，网址</text>
+          <text x="826" y="278" class="lr">不变，换台机器也能起</text>
+          <rect x="826" y="302" width="210" height="52" rx="8" fill="#fff" stroke="#ae5518" stroke-width="1.4"/>
+          <text x="844" y="326" class="lx" style="fill:#ae5518">Fly Sprites</text>
+          <text x="844" y="345" class="lr">唯一对外卖的一家</text>
+          <text x="826" y="382" class="lp">做到这一层但不卖的：</text>
+          <text x="826" y="402" class="lp">Perplexity SPACE</text>
+          <text x="826" y="420" class="lp">Cognition Devin</text>
+
+          <rect x="1066" y="92" width="222" height="474" class="lb l5"/>
+          <text x="1084" y="126" class="ln" style="font-size:20px;fill:#7041a5">五</text>
+          <text x="1114" y="126" class="lt" style="fill:#7041a5">机器和硬盘分开活</text>
+          <text x="1084" y="150" class="lr">删掉机器，硬盘还在，</text>
+          <text x="1084" y="168" class="lr">可以挂到下一台上</text>
+          <rect x="1084" y="196" width="186" height="86" rx="8" fill="#fff" stroke="#7041a5" stroke-width="1.2" stroke-dasharray="5 4"/>
+          <text x="1102" y="224" class="lx" style="fill:#7041a5">几乎没有</text>
+          <text x="1102" y="246" class="lr">这是虚拟机世界的常识，</text>
+          <text x="1102" y="264" class="lr">但沙箱市场很少这么做</text>
+          <text x="1084" y="312" class="lr">为什么空着 → 第 4 节</text>
+
+          <text x="157" y="592" class="lr" style="text-anchor:middle">秒级</text>
+          <text x="415" y="592" class="lr" style="text-anchor:middle">小时级</text>
+          <text x="673" y="592" class="lr" style="text-anchor:middle">可无限期挂起</text>
+          <text x="931" y="592" class="lr" style="text-anchor:middle">长期存在</text>
+          <text x="1177" y="592" class="lr" style="text-anchor:middle">数据比机器活得久</text>
+        </svg>
+      </div>
+      <p class="figcap">纵向高度表示机器能活多久。第三层产品最多、能力接近；第四层只有一家对外销售；第五层几乎是空的。</p>
+
+      <h3>2.1 时长上限的具体数字</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th style="width:22%">上限</th><th style="width:78%">产品</th></tr></thead>
+          <tbody>
+            <tr><td>300 秒</td><td>百度</td></tr>
+            <tr><td>1 小时</td><td>PPIO、E2B 免费档</td></tr>
+            <tr><td>8 小时</td><td>AWS AgentCore、AWS Lambda MicroVMs</td></tr>
+            <tr><td><strong>24 小时</strong></td><td><strong>E2B、Vercel、Modal、腾讯、火山 —— 这是行业默认天花板</strong></td></tr>
+            <tr><td>48 小时</td><td>Runloop</td></tr>
+            <tr><td>不设上限</td><td>Fly Sprites、Fly Machines、Northflank、Daytona</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout">
+        <strong>第五层是什么意思：</strong>一台机器和它的硬盘是两样东西，可以分开管，换机器的时候数据不用搬。这在传统云服务上是常识（云服务器和云硬盘本来就是分开的），但沙箱市场很少这么做。<strong>为什么，见第 4 节。</strong>
+      </div>
+    </section>
+
+    <section id="isolation">
+      <span class="part">第一部分 · 行业</span>
+      <h2>3. 第二种分法：隔离用什么技术 —— 已经不是区别了</h2>
+      <p class="lead">四种做法：浏览器里的 WASM、共享内核的容器、用户态内核（gVisor）、独立的小虚拟机。</p>
+      <div class="callout orange" style="margin-top:0;font-size:16px;">
+        <strong>29 个产品里 19 个用小虚拟机。这一项现在是入场券，不是卖点。</strong>
+      </div>
+      <div class="two-col mt">
+        <div class="card">
+          <h4>门槛已经被开源清掉了</h4>
+          <p>腾讯的 CubeSandbox 和阿里的 OpenSandbox 都开源了，加起来两万多个 star，冷启动 60 毫秒，快照、挂起、唤醒都有，还带一键部署。</p>
+          <p><strong>两年前「能做出 60 毫秒的小虚拟机」是壁垒，现在是下载下来就能用。</strong></p>
+        </div>
+        <div class="card">
+          <h4>剩下的两条路各有硬伤</h4>
+          <p><strong>共享内核的容器</strong>（Daytona 默认档、Sealos、Codespaces）：有完整的 Linux，但内核和宿主机共用，不敢跑完全不可信的代码。</p>
+          <p><strong>gVisor</strong>（Modal 默认档）：挂不了块设备文件系统，部分程序会悄悄失效，还会把内核版本报成 4.4.0。Modal 自己的工程师说过它的软肋就是系统调用不全。</p>
+        </div>
+      </div>
+      <p class="mt" style="font-size:14px;">所以任何产品拿「我们用 microVM」当卖点，已经说明不了什么。</p>
+    </section>
+
+    <section id="origin">
+      <span class="part">第一部分 · 行业</span>
+      <h2>4. 第三种分法：产品是从哪一类老产品改过来的</h2>
+      <p class="lead">这条线最能解释一个产品为什么有某些能力、为什么缺某些能力。</p>
+
+      <div class="diagram-frame">
+        <svg viewBox="0 0 1320 500" role="img" aria-labelledby="org-title org-desc">
+          <title id="org-title">沙箱产品的三种来源，以及它们各自继承了什么、缺了什么</title>
+          <desc id="org-desc">从函数计算改来的产品默认认为代码跑完就结束，保存状态是后加的；从云端 IDE 改来的产品自带工作区持久化，但隔离是后补的；从虚拟机改来的产品自带开机关机和挂硬盘的概念。第五层空着，是因为机器和硬盘分开管是虚拟机世界的常识，而市场大部分玩家来自函数计算世界。</desc>
+          <defs>
+            <marker id="og-a" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#5b6c73"/></marker>
+            <style>
+              .gb{fill:#fff;stroke-width:1.6;rx:10}
+              .gf{stroke:#1768ac}.gi{stroke:#7041a5}.gv{stroke:#087d59}
+              .gh{font:700 16px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+              .gn{font:700 13px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#1d3038}
+              .gs{font:12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#5e7078}
+              .gk{font:700 11.5px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#3d535c}
+              .gar{stroke:#9baab1;stroke-width:1.6;fill:none;marker-end:url(#og-a)}
+            </style>
+          </defs>
+
+          <rect x="30" y="40" width="400" height="300" class="gb gf" fill="#ebf4fc"/>
+          <text x="52" y="74" class="gh" style="fill:#1768ac">从函数计算改的</text>
+          <text x="52" y="100" class="gs">Vercel · Cloudflare · Modal · 阿里云函数 · 百度函数</text>
+          <text x="52" y="136" class="gn">本来是干什么的</text>
+          <text x="52" y="158" class="gs">收到一个请求，跑一段代码，返回结果</text>
+          <text x="52" y="192" class="gn">它默认认为</text>
+          <text x="52" y="214" class="gs">代码跑完就该结束</text>
+          <text x="52" y="248" class="gn">所以</text>
+          <text x="52" y="270" class="gs">「能保存状态」是后来加的功能</text>
+          <rect x="52" y="288" width="356" height="36" rx="7" fill="#fff" stroke="#1768ac" stroke-width="1.1"/>
+          <text x="70" y="311" class="gk" style="fill:#1768ac">明显的痕迹：这几家都按调用次数收费</text>
+
+          <rect x="460" y="40" width="400" height="300" class="gb gi" fill="#f4effb"/>
+          <text x="482" y="74" class="gh" style="fill:#7041a5">从云端 IDE 改的</text>
+          <text x="482" y="100" class="gs">Daytona · Coder · Ona · Codespaces · Sealos</text>
+          <text x="482" y="136" class="gn">本来是干什么的</text>
+          <text x="482" y="158" class="gs">给人在浏览器里写代码</text>
+          <text x="482" y="192" class="gn">它默认认为</text>
+          <text x="482" y="214" class="gs">工作区要一直在</text>
+          <text x="482" y="248" class="gn">所以</text>
+          <text x="482" y="270" class="gs">保存状态自带，但隔离是后补的</text>
+          <rect x="482" y="288" width="356" height="36" rx="7" fill="#fff" stroke="#7041a5" stroke-width="1.1"/>
+          <text x="500" y="311" class="gk" style="fill:#7041a5">明显的痕迹：好几家到现在还是共享内核</text>
+
+          <rect x="890" y="40" width="400" height="300" class="gb gv" fill="#e9f8f1"/>
+          <text x="912" y="74" class="gh" style="fill:#087d59">从虚拟机改的</text>
+          <text x="912" y="100" class="gs">Fly Machines · Fly Sprites</text>
+          <text x="912" y="136" class="gn">本来是干什么的</text>
+          <text x="912" y="158" class="gs">租一台机器给你</text>
+          <text x="912" y="192" class="gn">它默认认为</text>
+          <text x="912" y="214" class="gs">机器有开机关机，硬盘可以挂</text>
+          <text x="912" y="248" class="gn">所以</text>
+          <text x="912" y="270" class="gs">开关机、挂盘、绑地址都是现成概念</text>
+          <rect x="912" y="288" width="356" height="36" rx="7" fill="#fff" stroke="#087d59" stroke-width="1.1"/>
+          <text x="930" y="311" class="gk" style="fill:#087d59">只有这条线走到了第四层</text>
+
+          <path d="M1090 340 V378" class="gar"/>
+
+          <rect x="30" y="382" width="1260" height="98" rx="10" fill="#fff3e7" stroke="#ae5518" stroke-width="1.6"/>
+          <text x="54" y="412" class="gh" style="fill:#ae5518">第五层为什么空着</text>
+          <text x="54" y="440" class="gs" style="font-size:13px">机器和硬盘分开管，是虚拟机世界的常识；而这个市场大部分玩家来自函数计算世界，那个世界里没有硬盘这个东西。</text>
+          <text x="54" y="464" class="gs" style="font-size:13px">Fly Sprites 是唯一从虚拟机那条线改过来做 agent 的，所以它做到了第四层——但它为了让产品简单，把硬盘并回了机器里。</text>
+        </svg>
+      </div>
+      <p class="figcap">一个产品继承了什么、缺了什么，往往由它改自哪一类老产品决定。</p>
+
+      <div class="callout orange">
+        <strong>Fly Sprites 的取舍看得很清楚：</strong>删掉一个 Sprite，它的快照一起删掉；官方文档里搜不到 volume 这个词。想换个系统镜像，官方给的办法是<strong>删了重建，再自己把文件拷过去</strong>。
+      </div>
+      <div class="callout"><strong>这一节是给工程师看的分法。同一件事怎么说给客户听，见 7.1。</strong></div>
+      <div class="callout purple">
+        <strong>云端 IDE 那条线正在被收编。</strong>OpenAI 在 2026 年 6 月 11 日买下 Ona（原来的 Gitpod），用来给 Codex 提供能跑几小时到几天的云端环境，卖点之一是装在客户自己的云里。Coder 在 5 月发了自己的 agent 产品，主打企业自己部署。
+      </div>
+    </section>
+
+    <section id="money">
+      <span class="part">第一部分 · 行业</span>
+      <h2>5. 这个行业的钱在哪里</h2>
+      <div class="callout green" style="margin-top:0;font-size:15px;">
+        目前唯一公开的硬数字：<strong>Modal 年收入超过 3 亿美元，沙箱业务占三分之一以上。</strong>它服务的是 Lovable 这类客户——48 小时创建 25 万个应用，峰值同时 2 万个沙箱。
+      </div>
+      <div class="two-col mt">
+        <div class="card" style="border-left:4px solid var(--green);">
+          <h4>已经被证明能赚钱的</h4>
+          <p><strong>同时跑很多个短任务。</strong></p>
+          <p>Manus 买 E2B 的理由是「Docker 起容器要 10 到 20 秒，太慢」；Lovable 换到 Modal 的理由是上一家扛不住峰值，换完之后自己的代码从 15000 行降到 700 行。</p>
+        </div>
+        <div class="card" style="border-left:4px solid var(--red);">
+          <h4>还没有被证明的</h4>
+          <p><strong>长期养着几台机器。</strong></p>
+          <p>厂商都在做这个功能：Vercel 说「保存状态是默认行为」，E2B 的暂停不限时长，Anthropic 说自己的沙箱「设计上就是有状态的」。</p>
+          <p style="color:var(--red);font-weight:650;">但到现在找不到一个公开的客户案例，是愿意为「能长期存在」单独付钱的。</p>
+        </div>
+      </div>
+      <div class="callout red">这件事必须先摆在桌面上，再谈定位。第 11 节会给出一个解释：这有一部分是价格造成的，不一定是需求不存在。</div>
+    </section>
+
+    <section id="gaps">
+      <span class="part">第一部分 · 行业</span>
+      <h2>6. 行业普遍没解决的三件事</h2>
+      <div class="three-col">
+        <div class="card" style="border-left:4px solid var(--orange);">
+          <h4>一、账单看不懂</h4>
+          <p>Fly Sprites 发布帖下面票数最高的两个问题是「我花了多少钱」和「我的机器为什么没有自动睡觉」。<strong>到现在没有厂商在产品里回答这两个问题。</strong></p>
+          <p>大部分产品按你申请的规格收费，不按你实际用掉的收。Vercel 的文档写得直白：内存按申请的数量乘以运行时长收，机器闲着也照收。</p>
+          <p style="color:var(--orange);font-weight:650;">一台 4GB 的机器什么都不干，一个月 61 美元。</p>
+        </div>
+        <div class="card" style="border-left:4px solid var(--orange);">
+          <h4>二、机器和数据怎么分开</h4>
+          <p>就是第五层。</p>
+          <p>市面上有独立硬盘的几家，硬盘大多是挂对象存储的目录：没有原子改名、不是事务性的、两边同时写就看谁最后写。</p>
+          <p style="color:var(--orange);font-weight:650;">git、SQLite、node_modules 这三类最常见的负载，在上面表现不对或者很慢。</p>
+        </div>
+        <div class="card" style="border-left:4px solid var(--orange);">
+          <h4>三、agent 往外发请求怎么管</h4>
+          <p>只有 Cloudflare 认真做了：按域名做白名单，默认禁止一切外发；凭据由平台注入，沙箱里看不到明文；HTTPS 用每个沙箱一张临时证书做拦截。</p>
+          <p style="color:var(--orange);font-weight:650;">Figma、Anthropic、Cognition 选 Cloudflare，很可能就是买这个——Cognition 自己有完整的快照能力，不需要 Cloudflare 的持久化。</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="cats">
+      <span class="part b">第二部分 · Cats</span>
+      <h2>7. Cats 落在哪一层</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th style="width:24%">按哪条线看</th><th style="width:20%">Cats 在哪</th><th style="width:56%">说明</th></tr></thead>
+          <tbody>
+            <tr><td>能活多久</td><td><strong>第五层</strong></td><td>Cat 是机器，Disk 是硬盘，两样东西分开管。可以单独建一块盘、挂到一台机器上、卸下来、挂到另一台上；删掉机器，盘还在。快照挂在盘上而不是机器上，所以删掉机器不会把快照一起删掉。代码里 <code>DiskState::Available</code> 就是「这块盘现在没挂在任何机器上，但它活着」这个状态</td></tr>
+            <tr><td>隔离技术</td><td>小虚拟机</td><td>和大多数一样。<strong>这一项不构成区别</strong></td></tr>
+            <tr><td>从哪改的</td><td><strong>虚拟机那条</strong></td><td>产品结构就是「云服务器 + 云硬盘 + 固定地址 + 开机关机」那一套，搬到 agent 的场景上</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <h3>7.1 怎么把这件事说给客户听：不是「手和大脑」，是「动作」和「场所」</h3>
+      <p class="lead">第 4 节那套「从哪一类老产品改过来」是给工程师看的。同一件事对客户要换个说法。</p>
+      <div class="body">
+        <p><strong>一个常见但站不住的说法是「别人跑的是 agent 的手和眼，我们跑的是大脑」。</strong>问题在于：不管哪家沙箱，模型调用都是往外发的。E2B、Modal、Vercel 里跑的是「调用模型的那段循环」，不是模型本身；就算把 agent 进程也放进虚拟机（Devin 那种），思考仍然发生在远端 API。客户听到这句的第一反应会是「我的模型又不在你那儿跑」，然后后面真正成立的部分就被挡住了。</p>
+        <p><strong>但这个说法指向的东西是真的。</strong>换个角度：模型是无状态的，同一个模型谁调都一样。那么一个 agent 凭什么是「这一个」而不是另一个？靠它积累下来的东西——装过的依赖、改了一半的工作树、当前在哪个分支、还没关的服务、试错留下的痕迹。<strong>这些全在盘上。</strong></p>
+      </div>
+      <div class="callout purple">所以盒子里装的不是 agent 的思考，是<strong>它的记忆和没干完的活</strong>。删掉盒子，agent 不是变笨了，是失忆了，得从头再来一遍。</div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th style="width:18%"></th><th style="width:41%">大部分沙箱</th><th>Cats</th></tr></thead>
+          <tbody>
+            <tr><td>它是什么</td><td>一次<strong>动作</strong></td><td style="color:var(--green)">一个<strong>场所</strong></td></tr>
+            <tr><td>怎么用</td><td>调用一次，做一件事，拿结果</td><td>有名字、有地址、有自己的盘</td></tr>
+            <tr><td>有没有归属</td><td>没有。这次和上次没关系</td><td>有。同一个用户回来还是那个地方</td></tr>
+            <tr><td>结束之后</td><td>什么都不剩</td><td>东西都还在原地</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="two-col mt">
+        <div class="card" style="border-left:4px solid var(--green);">
+          <h4>好处一：躲开「模型在哪跑」的争论</h4>
+          <p>直接落在客户能自己验证的事实上：<strong>关掉再回来，东西还在不在。</strong></p>
+        </div>
+        <div class="card" style="border-left:4px solid var(--blue);">
+          <h4>好处二：它能解释计费方式</h4>
+          <p>卖动作就按次数收费，卖场所就按时间和面积收租。回头看第 4 节：Vercel、Cloudflare、阿里云函数、百度函数<strong>都收调用次数费</strong>，而 Cats 和 Sprites 都不收。</p>
+          <p><strong>一个说法能预测出观察到的定价差异，说明它抓到的是真东西，不只是修辞。</strong></p>
+        </div>
+      </div>
+      <div class="callout orange">
+        <strong>但把 Sprites 和 Cats 放在同一格，只对到这一层为止。</strong>再往下问一句就分开了——<strong>这个场所能不能搬家？</strong>Sprites 的盘是机器的一部分，删掉机器快照跟着删，换基础镜像要删了重建再自己拷文件。它是个场所，但是<strong>搬不了家的场所</strong>：换房子就得扔家具。Cats 的盘独立于机器。
+      </div>
+      <div class="callout green" style="font-size:15px;line-height:1.85;">
+        所以完整的说法是三段，<strong>能收钱的是第三段</strong>，前两段是让客户听懂第三段的铺垫：
+        <ol style="margin:10px 0 0;padding-left:22px;">
+          <li>大部分沙箱是<strong>一次动作</strong>——跑段脚本、查个网页，做完就散。</li>
+          <li>Cats 和 Sprites 是<strong>一个场所</strong>——有名字、有地址、有自己的盘，agent 的记忆和没干完的活存在这儿。</li>
+          <li>而在这一类里，<strong>Cats 是能搬家的那个</strong>——盘的命比机器长（见 7.3 与 11.6）。</li>
+        </ol>
+      </div>
+
+      <h3>7.2 「关机」在 Cats 这里分四种，不是一种</h3>
+      <p class="lead">大部分产品只有「开着」和「关了」。Cats 把中间摊开，让用户能挑自己要的那种取舍。</p>
+
+      <div class="diagram-frame">
+        <svg viewBox="0 0 1320 420" role="img" aria-labelledby="st-title st-desc">
+          <title id="st-title">Cats 的四种状态分别保留和释放了什么</title>
+          <desc id="st-desc">Running 保留全部。Suspended 停掉 CPU 并把内存换到本地盘，虚拟机进程和进程状态都还在。Warm 连虚拟机进程也退出，不再占内存，进程状态仍然保留，但还绑在这台物理机上。Cold 本机什么都不留，进程状态丢失，任何一台机器都能把它拉起来。</desc>
+          <defs>
+            <style>
+              .sh{font:700 15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#1d3038;text-anchor:middle}
+              .sr{font:12.5px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#43565e}
+              .sw{font:700 13px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;text-anchor:middle}
+              .sm{font:11.5px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#5e7078;text-anchor:middle}
+              .gl{stroke:#e2e8ea;stroke-width:1}
+            </style>
+          </defs>
+
+          <rect x="30" y="30" width="1260" height="46" rx="9" fill="#eef2f4"/>
+          <text x="46" y="59" class="sr" style="font-weight:700">保留 / 释放</text>
+          <text x="452" y="59" class="sh">Running</text>
+          <text x="682" y="59" class="sh">Suspended</text>
+          <text x="912" y="59" class="sh">Warm</text>
+          <text x="1142" y="59" class="sh">Cold</text>
+
+          <path d="M30 122 H1290 M30 168 H1290 M30 214 H1290 M30 260 H1290 M30 306 H1290" class="gl"/>
+          <path d="M337 76 V306 M567 76 V306 M797 76 V306 M1027 76 V306" class="gl"/>
+
+          <text x="46" y="107" class="sr">CPU 在跑</text>
+          <text x="452" y="107" class="sw" style="fill:#087d59">是</text>
+          <text x="682" y="107" class="sw" style="fill:#b42318">否</text>
+          <text x="912" y="107" class="sw" style="fill:#b42318">否</text>
+          <text x="1142" y="107" class="sw" style="fill:#b42318">否</text>
+
+          <text x="46" y="153" class="sr">占着物理内存</text>
+          <text x="452" y="153" class="sw" style="fill:#087d59">是</text>
+          <text x="682" y="153" class="sw" style="fill:#ae5518">换到本地盘</text>
+          <text x="912" y="153" class="sw" style="fill:#b42318">否</text>
+          <text x="1142" y="153" class="sw" style="fill:#b42318">否</text>
+
+          <text x="46" y="199" class="sr">虚拟机进程还在</text>
+          <text x="452" y="199" class="sw" style="fill:#087d59">是</text>
+          <text x="682" y="199" class="sw" style="fill:#087d59">是</text>
+          <text x="912" y="199" class="sw" style="fill:#b42318">否</text>
+          <text x="1142" y="199" class="sw" style="fill:#b42318">否</text>
+
+          <text x="46" y="245" class="sr">绑在这台物理机上</text>
+          <text x="452" y="245" class="sw" style="fill:#ae5518">是</text>
+          <text x="682" y="245" class="sw" style="fill:#ae5518">是</text>
+          <text x="912" y="245" class="sw" style="fill:#ae5518">是</text>
+          <text x="1142" y="245" class="sw" style="fill:#087d59">否</text>
+
+          <rect x="337" y="260" width="920" height="46" fill="#e9f8f1" opacity=".55"/>
+          <text x="46" y="291" class="sr" style="font-weight:700">进程状态还在</text>
+          <text x="452" y="291" class="sw" style="fill:#087d59">是</text>
+          <text x="682" y="291" class="sw" style="fill:#087d59">是</text>
+          <text x="912" y="291" class="sw" style="fill:#087d59">是</text>
+          <text x="1142" y="291" class="sw" style="fill:#b42318">否</text>
+
+          <text x="46" y="340" class="sr" style="font-weight:700">醒来要多久</text>
+          <text x="452" y="340" class="sw" style="fill:#5e7078">—</text>
+          <text x="682" y="340" class="sw" style="fill:#1768ac">0.21 秒</text>
+          <text x="912" y="340" class="sw" style="fill:#1768ac">0.38 秒</text>
+          <text x="1142" y="340" class="sw" style="fill:#1768ac">1.755 秒</text>
+
+          <rect x="797" y="360" width="230" height="46" rx="8" fill="#e9f8f1" stroke="#087d59" stroke-width="1.4"/>
+          <text x="912" y="380" class="sw" style="fill:#087d59">别人没有这一档</text>
+          <text x="912" y="398" class="sm">不占内存，进程还在</text>
+
+          <text x="46" y="390" class="sm" style="text-anchor:start">数字是实验室结果，AWS 裸金属 + 本地 NVMe，小样本中位数，不是服务承诺。</text>
+        </svg>
+      </div>
+      <p class="figcap">Warm 是别人没有的那一档：虚拟机进程已经退出、不再占内存，但进程状态还在。Fly Sprites 只有三档，想省掉常驻内存就必须把进程状态丢掉。</p>
+
+      <h3>7.3 但「第五层」这三个字要说全</h3>
+      <p class="lead">单说「有独立硬盘」或者「能睡」，都已经有人做到了。Cats 站得住的是三件事同时成立。</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th style="width:26%">要求</th><th style="width:32%">谁做到了</th><th style="width:42%">谁没有</th></tr></thead>
+          <tbody>
+            <tr><td>硬盘不随机器消亡</td><td>Cats、Vercel Drives、Modal、Daytona、Fly Machines</td><td>Fly Sprites、Cloudflare</td></tr>
+            <tr><td>硬盘是<strong>真硬盘</strong>（标准块设备加没改过的 ext4，不是挂对象存储的目录）</td><td>Cats、Fly Machines</td><td>Vercel Drives（官方写的是「挂在沙箱上的一个目录」）、Daytona、Modal、Cloudflare</td></tr>
+            <tr><td>能记住内存和进程，还能<strong>换一台物理机</strong>恢复</td><td>Cats、Fly Sprites、Perplexity SPACE（不卖）</td><td>Vercel（只记硬盘，恢复后要自己重启进程）、Cloudflare（硬盘不保留）、Fly Machines（硬盘绑死在一台物理机上）</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout green">三条都占的，目前只有 Cats。<strong>但对外必须三条一起说</strong>——只说其中一条，随时会被别人的一次更新抹平。</div>
+      <div class="callout orange">
+        <strong>一个例子说明为什么要这么小心。</strong>Vercel 的 Drives 在 2026 年 6 月已经是「生命周期独立于沙箱」的硬盘了，官方写着「手动删除之前一直在」——<strong>第一条已经不是 Cats 独有。</strong><br>
+        但同一张官方对比表里，Drive 的性能写的是「写入和命中缓存的读取是 NVMe 速度，<strong>没命中缓存的读取会慢</strong>」，而快照那一列写的是「读写都是 NVMe 速度」。<strong>这就说明 Drive 是本地缓存加远端主存，不是一块真硬盘。</strong>官方也建议「私有测试期间只用来做缓存，不要放生产数据」。
+      </div>
+    </section>
+
+    
+    <section id="advantage">
+      <span class="part b">第二部分 · Cats</span>
+      <h2>8. 最大的优点：关机不是损失</h2>
+      <p class="lead">市面上每一家，关掉机器都要付出一样代价——<strong>要么丢东西，要么继续掏钱</strong>。</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th style="width:20%">产品</th><th>关掉之后</th></tr></thead>
+          <tbody>
+            <tr><td>Vercel</td><td>状态留着，但内存按申请的规格乘全时长收，闲着照收。4GB 的机器什么都不干，一个月 61 美元</td></tr>
+            <tr><td>Cloudflare</td><td>不收钱，但磁盘清空，下次是全新的</td></tr>
+            <tr><td>E2B、Blaxel 这一档</td><td>暂停不收计算费，但盘跟着沙箱走，沙箱没了盘就没了</td></tr>
+            <tr><td>Fly Sprites</td><td>前两条都躲开了，但睡久了必然掉到 Cold——内存丢掉、进程重启；而且盘是 sprite 的一部分，删机器等于删数据</td></tr>
+            <tr><td style="color:var(--green)">Cats</td><td><strong>不花钱、不丢进程、盘还独立活着</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout green">
+        <strong>这条比其他优点大，是因为它改变的是用户的行为，不只是一个更好的数字。</strong>冷启动从 500 毫秒降到 200 毫秒，用户的用法不变；而「关掉不吃亏」会让用户不再管生命周期这件事——不用想什么时候该销毁、不用把状态往外倒、不用写 <code>onResume</code> 重建现场。别的优点是参数更好，这条是一类操心事直接消失。
+      </div>
+
+      <h3>8.1 但最难被抄走的是另一条：按实际用量收费</h3>
+      <div class="body">
+        <p>这两件事是一件事的两面。<strong>「能休眠」只有在休眠真的不花钱时才成立</strong>，而休眠花不花钱取决于计费方式，不取决于技术。</p>
+        <p>这一条特殊在：<strong>别人不是做不到，是不会做。</strong>Cats 其他所有优点，对手要么还没做、要么技术上受限——前者会被补上，后者会被绕开。只有计费这条，挡在对手面前的是他们自己的收入。</p>
+      </div>
+      <div class="callout">技术上最大的优点是<strong>「关机不是损失」</strong>，能守最久的是<strong>「按实际用量收费」</strong>，而后者是前者能成立的前提。</div>
+
+      <h3>8.2 按「别人要追上来得改什么」排序</h3>
+      <p class="lead" style="padding-left:0">改代码容易，改收入结构难。</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th class="rank">排</th><th style="width:24%">差异</th><th style="width:40%">别人要追上来得改什么</th><th>判断</th></tr></thead>
+          <tbody>
+            <tr><td class="rank">1</td><td>按实际用量收费<span class="sub">CPU 按累计时间，内存按实际占用的时间积分。申请 4GB 只用了 1GB，就按 1GB 收</span></td><td>改的不是代码，是自己的收入结构。Vercel 满载时一个机位卖 <strong>0.34 美元</strong>，自己买机器的成本是 <strong>0.064 美元</strong>，中间的差价有一大半来自「内存按申请量收，闲着也收」。</td><td><strong>技术上一周能改完，商业上不会改。这种差异最难被抹平。</strong></td></tr>
+            <tr><td class="rank">2</td><td>机器和硬盘分开</td><td>要改产品的基本结构：接口要改、计费要改、用户理解产品的方式也要改。Fly Sprites 做这件事等于重做一遍产品。</td><td>最难追，也最容易演示给人看</td></tr>
+            <tr><td class="rank">3</td><td>Warm 这一档<span class="sub">不占内存但进程还在</span></td><td>要换虚拟机管理程序。用 Firecracker 的那几家（E2B、Vercel、Fly、Sprites）还撞上一条硬限制：Firecracker 从 1.6.0 起，<strong>自定义硬盘后端和虚拟机快照只能二选一</strong>，官方文档写明前者禁止用于生产。</td><td>难，而且目前没有竞品公开讨论过这个岔路口</td></tr>
+            <tr><td class="rank">4</td><td>让程序自己说「我在忙」<span class="sub">平台入口和用户程序都能持有一个工作租约，清零才睡；平台不去猜</span></td><td>改接口，不难。</td><td>容易追，但没人做——做了等于承认「多久没动静就睡」这个猜法不对</td></tr>
+            <tr><td class="rank">5</td><td>出错时不会悄悄弄坏数据</td><td>别人做得到，只是没公开。Cats 这边有崩溃注入测试、旧机器写入被拒绝的测试、清空本地缓存后换一台机器恢复的测试。</td><td>追平成本中等，但<strong>客户看不见</strong>——除非出事</td></tr>
+            <tr><td class="rank">6</td><td>真的 root、没改过的 ext4、独立内核</td><td>走 gVisor 那条路（Modal 默认）做不到，gVisor 挂不了块设备文件系统。用 Firecracker 的做得到。</td><td>是入场券，不是区别</td></tr>
+            <tr><td class="rank">7</td><td>可以装在自己机房里</td><td>在沙箱产品里是独一份。</td><td>但按「一台机器」来定位，对面就是 Coder 和 Ona，<strong>它们本来就干这个</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout green">前三条有个共同点：<strong>都不是「我们也能做」，而是「别人做了会伤到自己」。</strong></div>
+
+      <h3>8.3 第 1 条值得算一笔账</h3>
+      <p class="lead" style="padding-left:0">2 核 4GB 的机器，CPU 用了一成，实际占内存 1GB，跑一小时：</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th style="width:18%">产品</th><th>怎么收</th><th class="num" style="width:20%">一小时</th></tr></thead>
+          <tbody>
+            <tr><td>E2B</td><td>按申请的规格全收</td><td class="num">$0.1656</td></tr>
+            <tr><td>Vercel</td><td>CPU 按实际，内存按申请量乘全时长</td><td class="num">$0.1104</td></tr>
+            <tr><td style="color:var(--green)">Cats</td><td><strong>CPU 和内存都按实际</strong></td><td class="num"><strong>$0.0590</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout red"><strong>Cats 的标价是三家里最高的</strong>（每 CPU 小时 $0.07、每 GiB 小时 $0.045），<strong>实际账单是最低的。</strong>这件事现在没有出现在任何对外材料里。</div>
+    </section>
+
+    <section id="missing">
+      <span class="part b">第二部分 · Cats</span>
+      <h2>9. 这个位置缺什么</h2>
+      <div class="two-col">
+        <div class="card" style="border-left:4px solid var(--green);">
+          <h4>已经有的，共同点是「把一台机器做深」</h4>
+          <ul>
+            <li>四种关机状态，不是一种</li>
+            <li>硬盘独立于机器</li>
+            <li>出错时不会悄悄弄坏数据</li>
+            <li>按实际用量收费</li>
+            <li>让程序自己说在不在忙</li>
+            <li>固定网址，绑名字不绑物理机，被访问就醒</li>
+          </ul>
+        </div>
+        <div class="card" style="border-left:4px solid var(--red);">
+          <h4>缺的，共同点是「很多台机器」</h4>
+          <ul>
+            <li>不能从一台机器复制出很多台（没有 fork）</li>
+            <li>没有预装好的模板和预热池</li>
+            <li>没有现成可用的镜像</li>
+            <li>单节点的并发唤醒有排队和限额了，<strong>但集群层面的配额和限速没做，对外也没有能公布的并发数字</strong></li>
+            <li>一块盘只能挂一台机器，多台机器读同一份数据做不了</li>
+          </ul>
+        </div>
+      </div>
+      <div class="callout red">第 5 节说过，<strong>这个行业现在赚到的钱在「很多台」那边。</strong>这不是「还没排上」，是「把一台机器做深」这个选择的另一面。</div>
+      <div class="callout orange"><strong>还有一条要单独说：Cats 的价目表里，存储那一项是空的。</strong>代码里注册了热存储和冷存储两个计量项，但没填价格。而「关机之后盘还在」正是 Cats 的主要卖点——<strong>这部分的收入现在没有。</strong></div>
+      <div class="callout">第 11 节选定目标客户之后，这份清单里有几条的紧急程度会变——<strong>有些不必做，有些要提前。</strong></div>
+    </section>
+
+    <section id="payers">
+      <span class="part b">第二部分 · Cats</span>
+      <h2>10. 谁会为此付费</h2>
+      <div class="callout red" style="margin-top:0">
+        先说一件不舒服的事：<strong>到现在为止，找不到一个公开案例是为「能长期存在」单独付钱的。</strong>厂商都在做这个功能，但没人证明有人愿意为它多掏钱。所以下面按证据强度排，不按「应该」排。
+      </div>
+
+      <h3>10.1 第一类：agent 要等外部事情发生。证据最硬</h3>
+      <div class="body">
+        <p>agent 提交了 PR，要等 CI 跑 20 分钟；等人 review 两天；等审批。这段时间机器必须活着——上下文、依赖、改到一半的工作树都在里面——但什么都不干。</p>
+        <p>Cognition 为 Devin 自己造了 hypervisor 级快照，花了一年多，官方说法就是「CI 结果或 review 评论到来时原地恢复」。<strong>有人已经用自建行为证明这件事值钱了。</strong></p>
+        <p>算一笔账：2 核 4GB，一个任务跨 8 小时，真正在算的只有半小时。</p>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th style="width:60%">计费方式</th><th class="num">8 小时合计</th></tr></thead>
+          <tbody>
+            <tr><td>按预留收（E2B 口径 $0.1656/机时）</td><td class="num">$1.32</td></tr>
+            <tr><td style="color:var(--green)">Cats（CPU 按实际约 $0.07，中间七小时在 Warm、内存几乎不计）</td><td class="num"><strong>约 $0.12</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout green"><strong>差一个数量级。</strong>而且这不是极端假设——「等待时间远长于计算时间」是异步 agent 的常态。</div>
+
+      <h3>10.2 第二类：每个用户一台长驻机器的产品</h3>
+      <div class="body">
+        <p>不是「每个任务开一个沙箱」，是「每个用户有一台自己的机器」：给每个客户一个数据分析工作区、给每个研究员一个长期实验环境、给每个项目一台不会重置的开发机。</p>
+        <p>这类产品的形状是：<strong>机器数等于用户数，但同时活跃的可能只有百分之几。</strong>按预留计费的话，剩下 95% 全在烧钱。这是 Cats 的经济模型最贴合的形状。</p>
+      </div>
+      <div class="callout green"><strong>这一类已选定为目标客户，详见第 11 节。</strong></div>
+
+      <h3>10.3 第三类：吃真硬盘语义的负载</h3>
+      <div class="body">
+        <p>git 仓库、SQLite、node_modules。这三样在挂对象存储的目录上要么行为不对、要么很慢——没有原子改名、不是事务性的。市面上大多数「独立硬盘」都是这种目录挂载。要跑这些又要长期保留的，选择很少。</p>
+        <p>这一类更像是<strong>别人被淘汰出局，剩下 Cats</strong>，不是 Cats 主动赢——但它最容易做成演示：同一个仓库，在别家上 <code>git status</code> 慢或者出错，在 Cats 上和本机一样。</p>
+      </div>
+
+      <h3>10.4 谁不会付费</h3>
+      <div class="three-col">
+        <div class="card"><h4>头部大客户</h4><p>长期挂着超过一千台机器就该自己搭了。Cursor、Cognition、Perplexity 都是这么做的。</p></div>
+        <div class="card"><h4>跑短任务要并发的</h4><p>这是 Modal 和 E2B 的地盘，也是这个行业目前真正赚到钱的地方。Cats 现在缺的正好是这一块。</p></div>
+        <div class="card"><h4>只想便宜一点的</h4><p>单看标价 Cats 是最贵的，省钱要在低利用率下才成立。</p></div>
+      </div>
+
+      <h3>10.5 一句话提醒</h3>
+      <div class="callout orange" style="margin-top:0;font-size:15px">
+        <strong>没有人会为「持久化」付钱，但会为「账单降了一个数量级」付钱。</strong><br>
+        这是同一件事的两种说法，但只有后者能卖。现在产品站上「状态比进程活得久」是第一条推论，而「按实际用量收费」排在第五条——应该反过来。
+      </div>
+      <div class="callout">而且有个连带的活儿躲不掉：<strong>按实际用量收费的账单没法提前估。</strong>别家的客户能自己乘一乘算出来，Cats 的客户不能。所以「能看懂自己花了多少钱」对 Cats 不是加分项，是卖这个优点的前置条件。</div>
+    </section>
+
+    <section id="target">
+      <span class="part b">第二部分 · Cats</span>
+      <h2>11. 目标客户：每个用户一台长驻机器的产品</h2>
+      <p class="lead">选这一类，理由不是「这块市场更大」，而是<strong>它同时躲开了两个陷阱</strong>。</p>
+
+      <h3>11.1 躲开了「客户越成功越自建」</h3>
+      <p class="lead" style="padding-left:0">算一个一万用户、每人一个 10 GiB 工作区、同时活跃 3%（300 台）的产品：</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th style="width:62%">项</th><th class="num">每月</th></tr></thead>
+          <tbody>
+            <tr><td>全部按预留计费常驻（E2B 口径）</td><td class="num" style="color:var(--red)">约 120 万美元</td></tr>
+            <tr><td>Cats：300 台活跃 × $0.059/机时</td><td class="num">约 1.3 万美元</td></tr>
+            <tr><td>Cats：9,700 台休眠的计算费</td><td class="num">约 0</td></tr>
+            <tr><td>存储 10 万 GiB，按冷存储 $0.02/GB·月</td><td class="num">约 2,000 美元</td></tr>
+            <tr><td><strong>合计</strong></td><td class="num" style="color:var(--green)"><strong>约 1.5 万美元</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout green">这个客户一年付 18 万美元。而他自建要三个基础设施工程师，一年 90 万——<strong>是他账单的五倍，永远回不了本。</strong></div>
+      <div class="callout">
+        对比 10.4 那条警告：那条算的是高并发计算型客户，他们的账单里全是算力，而算力有 2.6 倍加价可省，所以到一千台就该自己搭。<strong>这类客户的账单主要是存储，存储没有那么大的加价空间可赚，自建的动机就没了。</strong>
+      </div>
+      <div class="callout purple">
+        顺带一个推论，它也解释了第 5 节那个「找不到人为持久化付钱」的现象：<strong>市场看起来都在做「一次任务」，有一部分原因是长驻在现行计费下付不起。需求是被价格压掉的，不一定是不存在。</strong>
+      </div>
+
+      <h3>11.2 躲开了「宽度是空的」</h3>
+      <div class="body">
+        <p>每个用户一台机器，不需要从一台复制出很多台（不需要 fork）、不需要峰值两万并发、不需要百毫秒冷启动——用户打开自己的工作区，等一两秒是正常的。</p>
+        <p><strong>第 9 节列的那些缺口，这个客户群基本不需要。这是选它最实际的一个理由。</strong></p>
+      </div>
+
+      <h3>11.3 存储费率从第二优先级变成第一</h3>
+      <p class="lead" style="padding-left:0">看 11.1 那张表：97% 的机器在睡觉，<strong>存储就是价格本身，算力反而是零头。</strong>而热冷两档的差距在这个规模上是决定性的：</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th style="width:50%">费率</th><th class="num">10 万 GiB 每月</th></tr></thead>
+          <tbody>
+            <tr><td>冷存储 $0.02/GB·月</td><td class="num" style="color:var(--green)">2,000 美元</td></tr>
+            <tr><td>热存储 $0.50/GB·月</td><td class="num" style="color:var(--red)">50,000 美元<span class="sub">比算力还贵四倍，成本优势没了</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout red"><strong>热冷两档不是定价上的讲究，是这门生意能不能成立的分界线。</strong></div>
+
+      <h3>11.4 有一个前提今天还没满足：跨机器不去重</h3>
+      <p class="lead" style="padding-left:0">这是选定这个方向之后暴露出来的、最要紧的一条技术缺口。当前代码的事实：</p>
+      <div class="body">
+        <ul style="font-size:14px;line-height:1.75;color:var(--ink)">
+          <li>新机器创建时，基础镜像是<strong>整份流进新卷</strong>的（<code>node-agent/src/ch.rs</code> 的 <code>seed_volume</code>，注释写着 “Golden-root seeding: stream a raw image into a fresh volume”）</li>
+          <li>提交时数据对象的键是 <code>volumes/&lt;卷 id&gt;/data/&lt;object-id&gt;</code>（<code>api/src/chunk.rs</code>）</li>
+          <li>而 <code>object-id</code> 由<strong>事务号加 chunk 序号</strong>生成（<code>data_object_id(txn, chunk_idx) = "{txn}-c{chunk_idx}"</code>），<strong>不是内容哈希</strong></li>
+        </ul>
+      </div>
+      <div class="callout red">
+        <strong>一万个用户从同一个基础镜像开出来，对象存储里就是一万份完整副本。</strong>11.1 里那 10 万 GiB 就是这么来的。<br>
+        如果跨卷共享，基础镜像存一份加上每人的增量——假设人均增量 1 GiB，存储从 10 万 GiB 降到约 1 万 GiB，<strong>账单从 2,000 降到 200 美元</strong>。
+      </div>
+      <div class="callout orange">
+        <strong>改造的难度要说清楚，不要低估：</strong>
+        <ul>
+          <li>sha256 已经算了，但它存在映射表里<strong>做完整性校验，不做寻址</strong></li>
+          <li>map 节点已经是内容寻址（<code>maps/&lt;hex-sha256&gt;.node</code>），所以这个模式在代码库里有先例</li>
+          <li>但数据对象改成内容寻址，会动到提交协议的幂等性——现在用事务号派生键，换来的是「同一个事务重放会写到同一个键」这个性质</li>
+          <li>还要加跨卷的引用计数或者标记清扫，共享之后回收变难</li>
+          <li><code>blockd</code> 协议是 Frozen v1，改键布局要新开 ADR</li>
+        </ul>
+      </div>
+      <div class="callout green"><strong>动手之前先测一个数：从同一个基础镜像派生 N 个工作区、各自装点东西之后，实际重合的 chunk 有多少。</strong>这个数决定了跨卷去重值不值得做，也决定了 11.1 的成本模型是那个样子还是要打折。<strong>这比继续优化冷启动重要。</strong></div>
+
+      <h3>11.5 对手换人了</h3>
+      <div class="body">
+        <p>选了这个方向，E2B、Modal、Vercel 基本不在牌桌上——<strong>不是它们不想做，是它们的计费方式把自己挡在门外了。</strong>按预留收费的产品做不了「一万台机器 97% 在睡觉」这个形状。Cloudflare 更直接：磁盘不保留，压根做不了每人一个工作区。</p>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th style="width:24%">对手</th><th>情况</th></tr></thead>
+          <tbody>
+            <tr><td>Fly Sprites</td><td>官方说法就是「给 agent 用的持久 Linux 机器」，冷存储也是 $0.02/GB·月。<strong>正面对手</strong></td></tr>
+            <tr><td>Daytona 的 Archived 状态</td><td>盘搬到对象存储、完全不计费。但天花板只有 4 核 8G、默认共享内核，而且 2026 年 6 月闭源</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout green">对手从五六家变成两家，而且都是能打的仗。</div>
+
+      <h3>11.6 对 Sprites 最锋利的一句话：换基础镜像</h3>
+      <div class="callout orange" style="margin-top:0;font-size:15px">
+        这个客户群一定会遇到：一万个用户的工作区都从 v3 镜像开出来，现在要升到 v4。<br><br>
+        <strong>Sprites 官方给的办法是删掉重建，然后自己把文件拷回去。对一万个用户做这件事是场事故。</strong>而 Cats 的盘独立于机器，换镜像就是换机器不换盘。
+      </div>
+      <div class="callout">「盘独立于机器」原本只是最容易演示的一条。选定这个客户群之后，<strong>它变成了这个客户每年都会撞上一次的具体麻烦。</strong></div>
+
+      <h3>11.7 这个选择的两个风险</h3>
+      <div class="two-col">
+        <div class="card" style="border-left:4px solid var(--red);">
+          <h4>客户集中</h4>
+          <p>平台型客户是少数几个大单，不是很多小单。签一个要谈很久，丢一个伤很重。</p>
+          <p class="punch" style="color:var(--red);font-weight:650">前期至少要同时推进三四个，不能押一个。</p>
+        </div>
+        <div class="card" style="border-left:4px solid var(--red);">
+          <h4>这个市场仍然没有被证明</h4>
+          <p>11.1 的账能算通，不等于有人已经在这么花钱。</p>
+          <p style="color:var(--red);font-weight:650">建议尽早找一个真实客户把这笔账当面算一遍——如果他看完不动心，说明这套推理里有一环是错的，越早知道越好。</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="todo">
+      <span class="part b">第二部分 · Cats</span>
+      <h2>12. 要做的事</h2>
+      <p class="lead">按第 11 节选定的目标客户排序。<strong>顺序和没选目标之前不一样。</strong></p>
+
+      <h3>12.1 必须做</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th class="rank">序</th><th style="width:30%">做什么</th><th>为什么</th></tr></thead>
+          <tbody>
+            <tr><td class="rank">1</td><td style="color:var(--green)">测出同一基础镜像派生多个工作区之后的 chunk 重合率</td><td>服务 11.4。这个数决定成本模型成不成立，也决定第 2 条怎么定价。<strong>先做这个，它最便宜也最要紧。</strong></td></tr>
+            <tr><td class="rank">2</td><td>把存储价格填上，分热和冷两档</td><td>服务 11.3。对目标客户，存储就是价格本身。Fly Sprites 是被社区抱怨「睡着的机器还按每月每 GB 0.5 美元收」之后才加的两档结构，答案是现成的。</td></tr>
+            <tr><td class="rank">3</td><td>跨卷去重</td><td>服务 11.4。视第 1 条的结果决定投入。要新开 ADR，注意提交协议的幂等性和共享对象的回收。</td></tr>
+            <tr><td class="rank">4</td><td>把「按实际用量收费」和「账单能看懂」做成用户看得见的东西</td><td>服务 8.1、10.5。这是最难被抹平的一条，现在对外一个字都没提。而且按实际用量收费的账单更难提前估，所以账单可视化不是加分项，是必需品。采样和记账的链路已经有了。</td></tr>
+            <tr><td class="rank">5</td><td>测出一个真实的冷启动数字</td><td>服务 7.3。现在的两个数字是两条路径：1.755 秒是本地 NVMe 上优化过的启动路径，39.868 秒是从 S3 拉数据的 Python 原型。真实生产情况两者都不是。</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>12.2 目标客户直接要的</h3>
+      <div class="four-col">
+        <div class="card"><h4>6 · 基础镜像的版本和升级路径</h4><p>服务 11.6。一万个工作区从 v3 迁到 v4，要有 API，不能靠客户自己写脚本。</p></div>
+        <div class="card"><h4>7 · 批量操作接口</h4><p>批量创建、批量休眠、批量迁移。注意这和「高并发」不是一回事，容易得多。</p></div>
+        <div class="card"><h4>8 · 一个节点能挂多少台休眠机器</h4><p>这是目标客户真正拿来比价的数字，<strong>现在没人公布</strong>。</p></div>
+        <div class="card"><h4>9 · 原生 vhost-user-blk 真机验收</h4><p>也是 Warm 恢复时块设备状态对齐的前提。</p></div>
+      </div>
+
+      <h3>12.3 往后放</h3>
+      <div class="callout" style="margin-top:12px">
+        <ul>
+          <li><strong>fork / branch</strong> —— 每个用户一台机器，不需要分叉。</li>
+          <li><strong>万级并发和集群限流</strong> —— 活跃是散开的，不是尖峰。仍然要做，但不紧急。</li>
+          <li><strong>只读共享（RO-many）</strong> —— 基础镜像加去重能覆盖大部分「共享同一份数据」的需求。如果要做，作为新 ADR，不要悄悄放宽现有的「同时只能一个写入方」这条约束。</li>
+          <li><strong>出网管控和凭据注入</strong> —— 学 Cloudflare，与定位不冲突，但不是目标客户的第一诉求。</li>
+        </ul>
+      </div>
+
+      <h3>12.4 明确不做</h3>
+      <div class="callout orange" style="margin-top:12px">
+        <ul>
+          <li><strong>不跟人比谁更便宜、谁能同时跑更多。</strong>那是另一条路上的比法。</li>
+          <li><strong>不做多台机器同时读写一块盘。</strong></li>
+          <li><strong>不追冷启动毫秒数。</strong>厂商都把它当头条，但在用户抱怨里它排第七，而且目标客户打开自己的工作区，等一两秒是正常的。</li>
+          <li><strong>不拿「我们也会做 microVM」当卖点。</strong>这一项 2026 年已经不值钱了。</li>
+        </ul>
+      </div>
+    </section>
+
+    <section id="wrong">
+      <span class="part b">第二部分 · Cats</span>
+      <h2>13. 什么情况说明这个判断错了</h2>
+      <p class="lead">如果下面任何一条发生，这份文档的结论要重写，不是打补丁。</p>
+
+      <h3>关于定位（第 7、8 节）</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th style="width:34%">信号</th><th style="width:28%">说明什么</th><th>现在的情况</th></tr></thead>
+          <tbody>
+            <tr><td>Vercel Drives 正式发布，去掉「只当缓存用」的建议，并且支持保留内存和进程</td><td>7.3 那三条同时成立的说法被打破</td><td>私有测试，是目录不是硬盘，官方建议只做缓存</td></tr>
+            <tr><td>Cloudflare 的原生整盘快照上线，并且容器和它的持久对象跑在同一处</td><td>第 4 节对 Cloudflare 的判断失效</td><td>到 2026-07-01 的 changelog 为止未上线，现在用的还是目录级备份</td></tr>
+            <tr><td>Fly Sprites 加上独立硬盘</td><td>最像的对手补上了唯一明显的缺口，11.6 那句话失效</td><td>官方文档搜不到 volume，也没有路线图</td></tr>
+            <tr><td>任何一家头部厂商改成按实际用量收内存</td><td>8.2 第 1 条消失</td><td>没人这么做，那是它们的利润来源</td></tr>
+            <tr><td>Firecracker 解禁自定义硬盘后端并支持快照</td><td>8.2 第 3 条的理由失效</td><td>仍是开发者预览版、禁止用于生产、不支持快照</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>关于目标客户（第 11 节）</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th style="width:34%">信号</th><th style="width:28%">说明什么</th><th>现在的情况</th></tr></thead>
+          <tbody>
+            <tr><td style="color:var(--red)">实测的 chunk 重合率很低（用户各自装的东西差异大）</td><td>11.1 的成本模型要打折，存储费率必须按不去重定</td><td><strong>未测。这是第 12 节的第 1 件事</strong></td></tr>
+            <tr><td>找不到一个客户愿意坐下来把 11.1 那笔账算完</td><td>这个客户群不成立，或者痛点没到掏钱的程度</td><td>未验证</td></tr>
+            <tr><td>Fly Sprites 开始认真做平台型客户</td><td>正面对手，而且它有 Fly 的基础设施和品牌</td><td>Fly 自己说 Sprites 面向个人和探索性用途，不做横向扩展</td></tr>
+            <tr><td>OpenAI 或 Anthropic 把持久环境做成模型订阅的附赠</td><td>这类产品被捆绑掉，不是被竞争打掉</td><td>Anthropic 的沙箱每小时 0.05 美元，和联网搜索一起用时免费；OpenAI 已经买下 Ona</td></tr>
+            <tr><td>Coder 或 Ona 做出真硬盘加内存级休眠的自部署版本</td><td>企业自部署这条路被堵</td><td>两家都是从云端 IDE 改过来的，隔离是后补的</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="boundary">
+      <h2>14. 材料来源和这份文档的边界</h2>
+      <div class="two-col">
+        <div class="card" style="border-left:4px solid var(--orange);">
+          <h4>这份文档是推论，不是证据</h4>
+          <p>竞品事实取自厂商官方文档、产品 changelog 和第三方实测，核实于 2026-07-27；Cats 的事实取自本仓库代码、ADR 和实验报告。逐个产品的详细档案、定价原始数据和用户原话见<a href="cats-competitive-landscape.md">竞品与市场格局分析</a>。</p>
+        </div>
+        <div class="card" style="border-left:4px solid var(--red);">
+          <h4>11.1 的成本测算是单点估算，不是报价</h4>
+          <p>它假设一万用户、每人 10 GiB、活跃率 3%、常驻集 1 GiB、冷存储 $0.02/GB·月。这些假设里任何一个变动都会显著改变结论，<strong>尤其是重合率这一项目前完全没有实测</strong>（11.4）。</p>
+        </div>
+        <div class="card" style="border-left:4px solid var(--orange);">
+          <h4>Cats 的性能数字全部来自实验环境</h4>
+          <p>不是服务承诺，而且测量条件互不相同、不能互换：Suspended 0.213 秒、Warm 0.382 秒、优化后的 Cold 1.755 秒，都是 AWS 裸金属本地 NVMe；Warm 在 EBS 上是 1.090 秒；从 S3 拉数据的原型冷启动 39.868 秒。都是小样本中位数。</p>
+        </div>
+        <div class="card" style="border-left:4px solid var(--orange);">
+          <h4>竞品的宣传文案和实际发布的能力可能不一致</h4>
+          <p>凡是判断「有没有上线」，以 changelog 或产品文档为准，不采信博客文章。竞品的暂停和唤醒数字大多是厂商自己报的，测量条件不可比，所以没有和 Cats 的实验数字放在一起直接比较。</p>
+        </div>
+      </div>
+      <div class="callout">未覆盖：国内市场和合规、融资并购细节、逐个产品的定价原始数据。</div>
+
+      <h3>相关文档</h3>
+      <div class="source-list">
+        <a href="cats-competitive-landscape.md"><strong>竞品与市场格局分析</strong>逐个产品的详细档案、五项指标横比、定价原始数据、自己搭和买的成本测算、用户原话。</a>
+        <a href="cats-market-positioning.md"><strong>本文的 Markdown 版本</strong>面向 Agent 和实现者的可检索正文，内容与本页一致。</a>
+        <a href="cats-complete-product-technical-architecture.html"><strong>完整产品与技术架构</strong>Cat、Disk、Endpoint 这套资源模型的出处。</a>
+        <a href="cats-sleep-wake-vmm-resource-reclamation.html"><strong>睡眠、唤醒与资源回收</strong>四种状态各自保留和释放什么，以及失败时怎么处理。</a>
+        <a href="cats-auto-tier-product-and-implementation-design.md"><strong>工作驱动快速休眠</strong>「让程序自己说在不在忙」这套机制的设计。</a>
+        <a href="experiments-2026-07-21-storage-lifecycle.md"><strong>实验总报告</strong>本文引用的所有性能数字的测量方法、样本数、硬件和测量条件。</a>
+      </div>
+    </section>
+
+  </main>
+
+  <footer><div class="page">Cats 在沙箱市场中的位置 · 分析文档，不是实现依据 · 竞品事实核实于 2026-07-27 · 目标客户：每个用户一台长驻机器的产品（第 11 节）</div></footer>
+</body>
+</html>
