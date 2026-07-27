@@ -159,7 +159,7 @@ debootstrap \
   --arch=amd64 \
   --variant=minbase \
   --components=main,universe \
-  --include=systemd-sysv,tini,e2fsprogs,ca-certificates,curl,wget,git,iproute2,iputils-ping,netbase,procps,less,nano,openssh-client,bash-completion,ncurses-term \
+  --include=systemd-sysv,tini,e2fsprogs,ca-certificates,curl,wget,git,iproute2,iputils-ping,netbase,procps,less,nano,openssh-client,bash-completion,ncurses-term,fio \
   "$UBUNTU_SUITE" "$RF" "$UBUNTU_MIRROR"
 
 mkdir -p "$RF"/usr/bin "$RF"/etc/systemd/system/sysinit.target.wants \
