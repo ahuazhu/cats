@@ -33,6 +33,16 @@ fi
 echo "==> build workspace (release)"
 (cd "$REPO" && cargo build --release --workspace)
 
+# This script runs as root with the caller's HOME, so the build leaves root-owned
+# files in ~/.cargo, ~/.rustup and the repo's target/. Any later `cargo` as the
+# normal user then dies with "Permission denied" on the registry cache -- which
+# silently cost a whole set of benchmark phases twice. Hand it all back.
+if [[ -n ${SUDO_USER:-} ]]; then
+  for dir in "$HOME/.cargo" "$HOME/.rustup" "$REPO/target"; do
+    [[ -d $dir ]] && chown -R "$SUDO_USER:$(id -gn "$SUDO_USER")" "$dir"
+  done
+fi
+
 echo "==> install binaries to $PREFIX/bin"
 install -d "$PREFIX/bin"
 for bin in cats cats-controld cats-noded cats-gatewayd cats-blockd cats-guest-agent; do

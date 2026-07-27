@@ -1,0 +1,188 @@
+date_utc: 2026-07-27T09:32:06Z
+instance_type: c5.metal
+uname: Linux 6.17.0-1019-aws x86_64
+cpus: 96
+memory_kb: 197657044
+cache_mount: /var/lib/cats on /dev/nvme0n1p1 (unknown model)
+cache_fs: 
+blob_store: object-store-adapter file
+cloud_hypervisor: cloud-hypervisor v53.0
+rustc: rustc 1.97.1 (8bab26f4f 2026-07-14)
+git: not a git checkout
+
+
+##### commit_cost -- local file object store on /dev/nvme0n1p1
+error: failed to open `/home/ubuntu/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/tempfile-3.27.0.crate`
+
+Caused by:
+  Permission denied (os error 13)
+
+##### golden_root_cost -- local file object store on /dev/nvme0n1p1
+error: failed to open `/home/ubuntu/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/tempfile-3.27.0.crate`
+
+Caused by:
+  Permission denied (os error 13)
+
+##### commit_cost -- real S3 (s3://cats-bench-20260727f-19334)
+error: failed to open `/home/ubuntu/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/tempfile-3.27.0.crate`
+
+Caused by:
+  Permission denied (os error 13)
+
+##### golden_root_cost -- real S3 (s3://cats-bench-20260727f-19334)
+error: failed to open `/home/ubuntu/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/tempfile-3.27.0.crate`
+
+Caused by:
+  Permission denied (os error 13)
+
+##### fio kernel-nbd round 1
+# kernel-nbd: guest hw queues=1 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+kernel-nbd,randread-4k-qd1,randread,4k,1,43039,168.1,17.0,15,26
+kernel-nbd,randwrite-4k-qd1,randwrite,4k,1,2396,9.4,411.3,35,45
+kernel-nbd,randread-4k-qd32,randread,4k,32,186570,728.8,167.2,148,237
+kernel-nbd,randwrite-4k-qd32,randwrite,4k,32,154259,602.6,203.0,140,297
+kernel-nbd,seqread-1m-qd1,read,1M,1,429,428.6,2309.3,134,146
+kernel-nbd,seqwrite-1m-qd1,write,1M,1,826,826.2,1060.0,326,461
+
+##### fio kernel-nbd-direct round 1
+# kernel-nbd-direct: guest hw queues=1 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+kernel-nbd-direct,randread-4k-qd1,randread,4k,1,21283,83.1,40.2,40,52
+kernel-nbd-direct,randwrite-4k-qd1,randwrite,4k,1,504,2.0,1925.4,1630,5734
+kernel-nbd-direct,randread-4k-qd32,randread,4k,32,111672,436.2,283.7,264,399
+kernel-nbd-direct,randwrite-4k-qd32,randwrite,4k,32,513,2.0,62093.9,31588,683672
+kernel-nbd-direct,seqread-1m-qd1,read,1M,1,2315,2314.9,401.3,383,444
+kernel-nbd-direct,seqwrite-1m-qd1,write,1M,1,417,417.1,2317.3,807,2441
+
+##### fio vhost-user round 1
+# vhost-user: guest hw queues=4 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+vhost-user,randread-4k-qd1,randread,4k,1,57637,225.1,11.9,11,18
+vhost-user,randwrite-4k-qd1,randwrite,4k,1,733,2.9,1328.2,1106,7176
+vhost-user,randread-4k-qd32,randread,4k,32,210529,822.4,148.2,144,167
+vhost-user,randwrite-4k-qd32,randwrite,4k,32,947,3.7,33722.8,30540,125305
+vhost-user,seqread-1m-qd1,read,1M,1,3249,3249.0,273.3,220,395
+vhost-user,seqwrite-1m-qd1,write,1M,1,816,816.2,1170.6,322,1647
+
+##### fio kernel-nbd round 2
+# kernel-nbd: guest hw queues=1 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+kernel-nbd,randread-4k-qd1,randread,4k,1,49279,192.5,14.3,15,19
+kernel-nbd,randwrite-4k-qd1,randwrite,4k,1,13839,54.1,65.7,34,53
+kernel-nbd,randread-4k-qd32,randread,4k,32,250829,979.8,124.2,122,183
+kernel-nbd,randwrite-4k-qd32,randwrite,4k,32,101664,397.1,310.3,132,457
+kernel-nbd,seqread-1m-qd1,read,1M,1,4015,4015.3,202.1,181,399
+kernel-nbd,seqwrite-1m-qd1,write,1M,1,1877,1877.4,368.1,313,594
+
+##### fio kernel-nbd-direct round 2
+# kernel-nbd-direct: guest hw queues=1 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+kernel-nbd-direct,randread-4k-qd1,randread,4k,1,23017,89.9,37.7,37,43
+kernel-nbd-direct,randwrite-4k-qd1,randwrite,4k,1,524,2.0,1867.2,1450,5734
+kernel-nbd-direct,randread-4k-qd32,randread,4k,32,114122,445.8,277.6,259,375
+kernel-nbd-direct,randwrite-4k-qd32,randwrite,4k,32,598,2.3,53300.3,30015,935330
+kernel-nbd-direct,seqread-1m-qd1,read,1M,1,1174,1174.5,798.3,782,848
+kernel-nbd-direct,seqwrite-1m-qd1,write,1M,1,450,450.1,2138.4,750,2146
+
+##### fio vhost-user round 2
+# vhost-user: guest hw queues=4 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+vhost-user,randread-4k-qd1,randread,4k,1,65149,254.5,10.5,10,14
+vhost-user,randwrite-4k-qd1,randwrite,4k,1,781,3.1,1243.6,1139,3424
+vhost-user,randread-4k-qd32,randread,4k,32,182446,712.7,170.6,161,230
+vhost-user,randwrite-4k-qd32,randwrite,4k,32,944,3.7,33867.4,30015,88605
+vhost-user,seqread-1m-qd1,read,1M,1,3950,3949.6,226.8,224,247
+vhost-user,seqwrite-1m-qd1,write,1M,1,1915,1915.4,474.1,313,1417
+
+##### 10 concurrent cold creates -- kernel-nbd
+== cleanup
+label,phase,requested,completed,min_ms,p50_ms,p95_ms,max_ms,failures
+kernel-nbd,create,10,10,5907,12371,20538,20538,0
+# settled: 10/10 observed=running after 21s
+# kernel-nbd: 10/10 running; create batch wall 20542 ms, settled at 20574 ms
+# kernel-nbd: batch walls create=20542 warm=n/a restore=n/a ms (settled)
+# kernel-nbd: wake gate telemetry:
+#   metal-1            state=ready     cats=10 cpu=20/96 memory=10240MiB/193024MiB heartbeat=1s load=5.26
+== cleanup
+
+##### acceptance -- kernel-nbd
+== cleanup from previous runs ==
+== 1. cold create -> real VM boots ==
+  PASS  create converges to running
+  PASS  guest runs the direct-boot kernel
+  PASS  guest userland is Ubuntu 24.04
+  PASS  guest includes apt, curl and git
+  PASS  guest uses the optimized reaping PID 1
+  PASS  Guest Agent is running
+  PASS  guest DNS and HTTPS egress work
+  PASS  guest ext4 root grew to the requested size
+  PASS  guest reports a kernel boot_id (93322282-1a48-40e5-a439-1d87c9fd7cf2)
+== 2. durable write through the real ext4 root ==
+  PASS  wrote /data.txt + sync
+== 3. suspend/resume (vm.pause/resume): same boot ==
+  PASS  suspend
+  PASS  resume
+  PASS  boot_id preserved across suspend/resume
+== 4. warm (vm.snapshot + full exit) / restore: same boot ==
+  PASS  warm
+  PASS  no resident VMM while Warm
+  PASS  restore
+  PASS  boot_id preserved across warm/restore
+  PASS  file survives warm
+== 5. stop/start: fresh boot, durable data intact ==
+  PASS  stop
+  PASS  start
+  PASS  cold start is a fresh boot
+  PASS  flushed data survives cold restart
+== 6. destroy ==
+  PASS  destroy
+
+metal e2e: 23 passed, 0 failed
+
+##### 10 concurrent cold creates -- vhost-user
+== cleanup
+label,phase,requested,completed,min_ms,p50_ms,p95_ms,max_ms,failures
+vhost-user,create,10,10,5910,8020,8172,8172,0
+# settled: 10/10 observed=running after 8s
+# vhost-user: 10/10 running; create batch wall 8177 ms, settled at 8209 ms
+# vhost-user: batch walls create=8177 warm=n/a restore=n/a ms (settled)
+# vhost-user: wake gate telemetry:
+#   metal-1            state=ready     cats=10 cpu=20/96 memory=10240MiB/193024MiB heartbeat=0s load=4.07
+== cleanup
+
+##### acceptance -- vhost-user
+== cleanup from previous runs ==
+== 1. cold create -> real VM boots ==
+  PASS  create converges to running
+  PASS  guest runs the direct-boot kernel
+  PASS  guest userland is Ubuntu 24.04
+  PASS  guest includes apt, curl and git
+  PASS  guest uses the optimized reaping PID 1
+  PASS  Guest Agent is running
+  PASS  guest DNS and HTTPS egress work
+  PASS  guest ext4 root grew to the requested size
+  PASS  guest reports a kernel boot_id (9cd0d1a4-293f-4f55-8b6f-62243ee5e88b)
+== 2. durable write through the real ext4 root ==
+  PASS  wrote /data.txt + sync
+== 3. suspend/resume (vm.pause/resume): same boot ==
+  PASS  suspend
+  PASS  resume
+  PASS  boot_id preserved across suspend/resume
+== 4. warm (vm.snapshot + full exit) / restore: same boot ==
+  PASS  warm
+  PASS  no resident VMM while Warm
+  PASS  restore
+  PASS  boot_id preserved across warm/restore
+  PASS  file survives warm
+== 5. stop/start: fresh boot, durable data intact ==
+  PASS  stop
+  PASS  start
+  PASS  cold start is a fresh boot
+  PASS  flushed data survives cold restart
+== 6. destroy ==
+  PASS  destroy
+
+metal e2e: 23 passed, 0 failed
+
+== wrote /home/ubuntu/cats/experiments/vhost-user-blk-frontend-20260726/raw/metal-rebench.log

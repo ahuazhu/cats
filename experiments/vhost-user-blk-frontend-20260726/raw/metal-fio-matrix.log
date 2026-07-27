@@ -1,0 +1,66 @@
+date_utc: 2026-07-27T09:05:16Z
+cache_mount: /dev/nvme8n1 ext4
+blob_store: object-store-adapter aws-s3
+note: exec timeout fix deployed; sleep 70 verified before this run
+
+
+##### fio kernel-nbd round 1
+# kernel-nbd: guest hw queues=1 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+kernel-nbd,randread-4k-qd1,randread,4k,1,43763,170.9,17.2,15,27
+kernel-nbd,randwrite-4k-qd1,randwrite,4k,1,7132,27.9,135.1,40,51
+kernel-nbd,randread-4k-qd32,randread,4k,32,338753,1323.3,92.0,92,106
+kernel-nbd,randwrite-4k-qd32,randwrite,4k,32,199041,777.5,158.0,124,234
+kernel-nbd,seqread-1m-qd1,read,1M,1,3980,3980.4,219.6,212,281
+kernel-nbd,seqwrite-1m-qd1,write,1M,1,2160,2159.9,417.6,228,249
+
+##### fio kernel-nbd-direct round 1
+# kernel-nbd-direct: guest hw queues=1 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+kernel-nbd-direct,randread-4k-qd1,randread,4k,1,23305,91.0,37.9,36,45
+kernel-nbd-direct,randwrite-4k-qd1,randwrite,4k,1,7321,28.6,131.5,46,84
+kernel-nbd-direct,randread-4k-qd32,randread,4k,32,124961,488.1,253.8,234,354
+kernel-nbd-direct,randwrite-4k-qd32,randwrite,4k,32,19533,76.3,1632.9,528,1286
+kernel-nbd-direct,seqread-1m-qd1,read,1M,1,1224,1224.3,784.5,733,815
+kernel-nbd-direct,seqwrite-1m-qd1,write,1M,1,638,638.2,1517.3,514,807
+
+##### fio vhost-user round 1
+# vhost-user: guest hw queues=4 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+vhost-user,randread-4k-qd1,randread,4k,1,59299,231.6,11.8,12,16
+vhost-user,randwrite-4k-qd1,randwrite,4k,1,9449,36.9,100.1,38,84
+vhost-user,randread-4k-qd32,randread,4k,32,174675,682.3,226.7,148,167
+vhost-user,randwrite-4k-qd32,randwrite,4k,32,45664,178.4,698.9,395,1237
+vhost-user,seqread-1m-qd1,read,1M,1,3662,3662.5,253.2,257,268
+vhost-user,seqwrite-1m-qd1,write,1M,1,2675,2675.0,335.8,334,383
+
+##### fio kernel-nbd round 2
+# kernel-nbd: guest hw queues=1 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+kernel-nbd,randread-4k-qd1,randread,4k,1,49437,193.1,15.4,14,23
+kernel-nbd,randwrite-4k-qd1,randwrite,4k,1,7370,28.8,130.3,34,52
+kernel-nbd,randread-4k-qd32,randread,4k,32,313680,1225.3,99.5,98,134
+kernel-nbd,randwrite-4k-qd32,randwrite,4k,32,128113,500.5,245.6,148,350
+kernel-nbd,seqread-1m-qd1,read,1M,1,5582,5582.3,157.6,146,208
+kernel-nbd,seqwrite-1m-qd1,write,1M,1,2095,2095.2,435.8,206,1004
+
+##### fio kernel-nbd-direct round 2
+# kernel-nbd-direct: guest hw queues=1 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+kernel-nbd-direct,randread-4k-qd1,randread,4k,1,23653,92.4,37.6,35,41
+kernel-nbd-direct,randwrite-4k-qd1,randwrite,4k,1,6890,26.9,139.6,49,87
+kernel-nbd-direct,randread-4k-qd32,randread,4k,32,118060,461.2,268.8,249,387
+kernel-nbd-direct,randwrite-4k-qd32,randwrite,4k,32,21021,82.1,1518.4,522,1253
+kernel-nbd-direct,seqread-1m-qd1,read,1M,1,1119,1119.2,861.5,791,872
+kernel-nbd-direct,seqwrite-1m-qd1,write,1M,1,471,470.7,2081.2,514,750
+
+##### fio vhost-user round 2
+# vhost-user: guest hw queues=4 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+vhost-user,randread-4k-qd1,randread,4k,1,64689,252.7,10.8,10,15
+vhost-user,randwrite-4k-qd1,randwrite,4k,1,20762,81.1,43.1,25,88
+vhost-user,randread-4k-qd32,randread,4k,32,257456,1005.7,121.3,121,134
+vhost-user,randwrite-4k-qd32,randwrite,4k,32,35636,139.2,896.1,403,1745
+vhost-user,seqread-1m-qd1,read,1M,1,3549,3549.3,260.8,264,276
+vhost-user,seqwrite-1m-qd1,write,1M,1,1321,1320.8,729.0,317,375
+== fio matrix done

@@ -1,0 +1,45 @@
+date_utc: 2026-07-27T09:23:50Z
+cache_mount: /dev/nvme8n1 ext4
+blob_store: aws-s3 (pair with metal-fio-matrix.log = file store on the same NVMe)
+
+
+##### fio kernel-nbd-direct round 1 (S3)
+# kernel-nbd-direct-s3: guest hw queues=1 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+kernel-nbd-direct-s3,randread-4k-qd1,randread,4k,1,22575,88.2,39.4,36,50
+kernel-nbd-direct-s3,randwrite-4k-qd1,randwrite,4k,1,11047,43.2,84.6,48,90
+kernel-nbd-direct-s3,randread-4k-qd32,randread,4k,32,120806,471.9,346.6,253,391
+kernel-nbd-direct-s3,randwrite-4k-qd32,randwrite,4k,32,19579,76.5,1629.9,553,1417
+kernel-nbd-direct-s3,seqread-1m-qd1,read,1M,1,2168,2168.5,397.5,391,436
+kernel-nbd-direct-s3,seqwrite-1m-qd1,write,1M,1,333,333.1,2862.0,717,1516
+
+##### fio vhost-user round 1 (S3)
+# vhost-user-s3: guest hw queues=4 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+vhost-user-s3,randread-4k-qd1,randread,4k,1,68201,266.4,10.3,9,14
+vhost-user-s3,randwrite-4k-qd1,randwrite,4k,1,11549,45.1,81.2,24,73
+vhost-user-s3,randread-4k-qd32,randread,4k,32,259584,1014.0,120.0,119,132
+vhost-user-s3,randwrite-4k-qd32,randwrite,4k,32,24242,94.7,1318.0,387,1663
+vhost-user-s3,seqread-1m-qd1,read,1M,1,3724,3723.9,245.5,230,276
+vhost-user-s3,seqwrite-1m-qd1,write,1M,1,2002,2002.2,466.2,272,358
+
+##### fio kernel-nbd-direct round 2 (S3)
+# kernel-nbd-direct-s3: guest hw queues=1 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+kernel-nbd-direct-s3,randread-4k-qd1,randread,4k,1,24541,95.9,36.2,34,44
+kernel-nbd-direct-s3,randwrite-4k-qd1,randwrite,4k,1,11371,44.4,82.9,45,82
+kernel-nbd-direct-s3,randread-4k-qd32,randread,4k,32,125995,492.2,332.5,239,358
+kernel-nbd-direct-s3,randwrite-4k-qd32,randwrite,4k,32,19591,76.5,1629.7,594,1368
+kernel-nbd-direct-s3,seqread-1m-qd1,read,1M,1,989,989.4,979.0,922,1057
+kernel-nbd-direct-s3,seqwrite-1m-qd1,write,1M,1,694,693.8,1402.1,465,651
+
+##### fio vhost-user round 2 (S3)
+# vhost-user-s3: guest hw queues=4 logical_block_size=512
+path,workload,rw,block,iodepth,iops,mib_per_sec,mean_us,p50_us,p99_us
+vhost-user-s3,randread-4k-qd1,randread,4k,1,63131,246.6,11.1,10,15
+vhost-user-s3,randwrite-4k-qd1,randwrite,4k,1,11110,43.4,84.9,24,69
+vhost-user-s3,randread-4k-qd32,randread,4k,32,256675,1002.6,121.4,120,136
+vhost-user-s3,randwrite-4k-qd32,randwrite,4k,32,19022,74.3,1680.2,391,1614
+vhost-user-s3,seqread-1m-qd1,read,1M,1,3644,3644.1,249.2,234,281
+vhost-user-s3,seqwrite-1m-qd1,write,1M,1,1672,1672.1,565.0,272,362
+== fio s3 done
