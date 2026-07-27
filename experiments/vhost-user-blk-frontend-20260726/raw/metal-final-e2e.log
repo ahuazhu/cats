@@ -1,0 +1,35 @@
+##### acceptance, vhost-user, local file store
+== cleanup from previous runs ==
+== 1. cold create -> real VM boots ==
+  PASS  create converges to running
+  INFO  create-to-running 910 ms (single sample; includes scheduling and root seeding)
+  PASS  guest runs the direct-boot kernel
+  PASS  guest userland is Ubuntu 24.04
+  PASS  guest includes apt, curl and git
+  PASS  guest uses the optimized reaping PID 1
+  PASS  Guest Agent is running
+  PASS  guest DNS and HTTPS egress work
+  PASS  guest ext4 root grew to the requested size
+  PASS  guest reports a kernel boot_id (7784c7f2-abff-4076-940b-6b517bc92a55)
+== 2. durable write through the real ext4 root ==
+  PASS  wrote /data.txt + sync
+== 3. suspend/resume (vm.pause/resume): same boot ==
+  PASS  suspend
+  PASS  resume
+  PASS  boot_id preserved across suspend/resume
+== 4. warm (vm.snapshot + full exit) / restore: same boot ==
+  PASS  warm
+  PASS  no resident VMM while Warm
+  PASS  restore
+  PASS  boot_id preserved across warm/restore
+  PASS  file survives warm
+== 5. stop/start: fresh boot, durable data intact ==
+  PASS  stop
+  PASS  start
+  INFO  cold-to-running 909 ms (single sample; warm remote/root cache state)
+  PASS  cold start is a fresh boot
+  PASS  flushed data survives cold restart
+== 6. destroy ==
+  PASS  destroy
+
+metal e2e: 23 passed, 0 failed

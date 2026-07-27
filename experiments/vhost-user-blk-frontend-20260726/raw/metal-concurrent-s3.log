@@ -1,0 +1,11 @@
+##### 10 concurrent cold creates, vhost-user, real S3
+object-store-adapter aws-s3
+== cleanup
+label,phase,requested,completed,min_ms,p50_ms,p95_ms,max_ms,failures
+vhost-user-s3,create,10,10,4832,7842,8144,8144,0
+# settled: 10/10 observed=running after 9s
+# vhost-user-s3: 10/10 running; create batch wall 8146 ms, settled at 8173 ms
+# vhost-user-s3: batch walls create=8146 warm=n/a restore=n/a ms (settled)
+# vhost-user-s3: wake gate telemetry:
+#   metal-1            state=ready     cats=10 cpu=20/128 memory=10240MiB/1031865MiB heartbeat=1s load=0.12
+== cleanup

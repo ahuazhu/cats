@@ -1,0 +1,43 @@
+GC and TRIM reclaiming real objects, on a real Guest.
+
+host:     AWS i4i.metal, real KVM, Cloud Hypervisor
+cache:    /var/lib/cats on the instance NVMe (/dev/nvme8n1, ext4)
+store:    file adapter on that same NVMe (asserted before measuring)
+path:     vhost-user (the path that advertises VIRTIO_BLK_F_DISCARD; guest
+          discard_max_bytes = 33554432)
+date_utc: 2026-07-27
+volume:   vol_c5020850b919
+
+The Guest rewrites the same 128 MiB file three times with O_DIRECT + sync. Each
+rewrite publishes new objects and makes the previous ones unreachable, which is
+the garbage a long-running Cat accumulates.
+
+  start                  objects=36   size=61 MiB
+  after rewrite 1        objects=74   size=191 MiB
+  after rewrite 2        objects=113  size=325 MiB
+  after rewrite 3        objects=149  size=454 MiB
+  rm + fstrim            objects=152  size=454 MiB   <- fstrim reported 3.5 GiB trimmed
+  before GC              objects=188  size=575 MiB
+  after GC               objects=56   size=186 MiB
+
+  GC report: data_live=56 data_deleted=133 nodes_live=5 nodes_deleted=25
+
+Reading:
+
+* 575 MiB -> 186 MiB on one volume: 389 MiB reclaimed, 3.1x. Before this branch
+  nothing deleted any of it -- the objects stayed for the life of the volume.
+* The object count does NOT fall at the fstrim line, and that is correct. TRIM
+  turns the chunk's map entry into a Hole, which makes its objects unreachable;
+  deleting them is GC's job. The +3 objects there are the commit that recorded
+  the discard.
+* `images/` still holds all 104 files afterwards. The shared golden root is
+  referenced by this volume and has to survive its GC -- the property
+  gc_never_deletes_a_shared_image_even_though_the_volume_references_it asserts in
+  the unit tests, confirmed here against a real image on a real Guest.
+* The 56 live objects are the volume's current content; the 133 deleted were
+  superseded by later rewrites.
+
+Method note: the first two attempts produced a flat line of identical numbers,
+because the node was still configured for S3 while the script counted files in the
+local blob directory, and because it guessed the volume id from a directory
+listing containing stale volumes. Both are asserted before measuring now.

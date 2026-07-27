@@ -1,0 +1,27 @@
+Final end-to-end results, i4i.metal with the cache on instance NVMe.
+
+date_utc: 2026-07-27
+
+Acceptance, vhost-user, local file object store:
+
+  metal e2e: 23 passed, 0 failed
+
+First fully green acceptance run. The one check that had failed on every previous
+run -- "guest includes apt, curl and git" -- was broken, not the image: it asked
+dash for three tools in a single `command -v`, which resolves only the first
+operand. See metal-rebench.log for the earlier 22/1 runs.
+
+10 concurrent cold creates, vhost-user, real S3:
+
+  vhost-user-s3,create,10,10,...   batch wall 8146 ms, settled at 8173 ms, 0 failures
+
+Compare with the same test earlier in the day:
+
+  copy the rootfs, serial reconcile        121448 ms   4 failed
+  golden root, serial reconcile             61637 ms   0 failed
+  golden root, concurrent reconcile          8328 ms   0 failed  (local file store)
+  golden root, concurrent reconcile          8146 ms   0 failed  (real S3)
+
+The object store no longer affects concurrent create at all -- 8146 ms on S3
+against 8328 ms on a local store -- because golden roots mean a create uploads no
+data. Before, the same test was 121 s and lost four of ten.
