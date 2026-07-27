@@ -3,8 +3,8 @@
     <div class="content-shell hero-grid">
       <div class="hero-copy">
         <span class="eyebrow">一个设计取向</span>
-        <h1>大多数沙箱是一次任务。<em>Cats 是一台机器。</em></h1>
-        <p>这不是措辞差别。把环境当作任务，状态就成了副产品、停机就等于丢弃、账单就按你申请的规格算。把它当作一台机器，这三件事全部反过来——本页其余部分都是这一个决定的推论，不是一张功能清单。</p>
+        <h1>大多数沙箱是一次动作。<em>Cats 是你回得来的那台机器。</em></h1>
+        <p>这不是措辞差别。动作做完就散——状态成了副产品、停机等于丢弃、账单按你申请的规格算。而一台你回得来的机器，这三件事全部反过来——本页其余部分都是这一个决定的推论，不是一张功能清单。</p>
         <div class="hero-actions">
           <a class="button-link primary" href="/user/">打开控制台 <span aria-hidden="true">→</span></a>
           <a class="button-link secondary" href="/zh-CN/docs/getting-started/">阅读快速入门</a>
@@ -46,7 +46,7 @@ src/main.rs:42: // TODO: 收敛重试策略</pre>
 
   <section class="band white" id="durability">
     <div class="content-shell truth-grid">
-      <div class="section-heading"><span class="eyebrow">推论一</span><h2>状态必须比进程活得久。</h2><p>如果它是一台机器，那么关掉它就不能等于失去它。这条推论决定了整个存储层：对象存储保存真相，本地盘只是缓存，而承诺必须是可以被测试的。</p></div>
+      <div class="section-heading"><span class="eyebrow">推论一</span><h2>状态必须比进程活得久。</h2><p>如果你要回得来，那么关掉它就不能等于失去它——装过的依赖、改到一半的工作树、还没关的服务，都得还在原地。这条推论决定了整个存储层：对象存储保存真相，本地盘只是缓存，而承诺必须是可以被测试的。</p></div>
       <div class="truth-list">
         <div class="truth-item"><span>✓</span><div><strong>成功的 FLUSH 扛得住 Host 永久丢失</strong><p>这是一句可测试的承诺，不是形容词。它是我们所有崩溃恢复测试的判据。</p></div></div>
         <div class="truth-item"><span>✓</span><div><strong>本地 NVMe 是可以删掉的缓存</strong><p>删光本地缓存后，磁盘仍能按读请求从远端逐块恢复，文件树逐字节一致。</p></div></div>

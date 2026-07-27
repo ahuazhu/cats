@@ -1,8 +1,8 @@
 One design choice
 
-# Most sandboxes are a task. *A Cat is a machine.*
+# Most sandboxes are an action. *A Cat is the machine you come back to.*
 
-That is not a turn of phrase. Treat the environment as a task and state becomes a by-product, stopping means discarding, and the bill follows what you requested. Treat it as a machine and all three invert. Everything below is a consequence of that one choice, not a feature list.
+That is not a turn of phrase. An action ends and scatters — state becomes a by-product, stopping means discarding, and the bill follows what you requested. A machine you come back to inverts all three. Everything below is a consequence of that one choice, not a feature list.
 
 <a href="/user/" class="button-link primary">Open the console →</a> <a href="/docs/getting-started/" class="button-link secondary">Read the quickstart</a>
 
@@ -36,7 +36,7 @@ Consequence one
 
 ## State has to outlive the process.
 
-If it is a machine, turning it off cannot mean losing it. That single requirement shapes the whole storage layer: object storage holds the truth, the local disk is only a cache, and the promise has to be testable.
+If you are going to come back, turning it off cannot mean losing it — the dependencies you installed, the half-finished working tree, the server you left running all have to still be there. That single requirement shapes the whole storage layer: object storage holds the truth, the local disk is only a cache, and the promise has to be testable.
 
 ✓
 
