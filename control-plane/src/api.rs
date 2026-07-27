@@ -896,6 +896,10 @@ async fn exec_cat(
     }
     let owner = format!("exec_{}", uuid::Uuid::new_v4().simple());
     let cat_id = cat.id.clone();
+    // Bounds both the work lease and the transport timeout below, so a caller
+    // asking for a long-running command gets one instead of a 60 s transport
+    // failure. Note the Guest agent does not enforce it: a runaway command keeps
+    // running there until the Cat is stopped.
     let ttl_ms = req.timeout_ms.unwrap_or(120_000).clamp(1_000, 3_600_000);
     let lease = state
         .store
@@ -924,6 +928,13 @@ async fn exec_cat(
                 .controller
                 .http
                 .post(url)
+                // The shared client carries a 60 s timeout meant for node job
+                // dispatch, which is shorter than the exec timeout this handler
+                // already accepted (`timeout_ms`, 120 s by default). Without this
+                // override a command that runs longer than 60 s fails in transport
+                // while its work lease is still valid -- measured: fio write
+                // workloads returned nothing at all, and `sleep 70` failed.
+                .timeout(Duration::from_millis(ttl_ms) + Duration::from_secs(15))
                 .bearer_auth(&state.cfg.auth_token)
                 .json(&req)
                 .send()
