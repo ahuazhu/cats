@@ -585,6 +585,71 @@ impl ChunkEngine {
         Ok(new_gen)
     }
 
+    /// Upload one object per pack entry, concurrently.
+    ///
+    /// The objects are independent: distinct keys, immutable content, no ordering
+    /// among them. The only ordering the protocol needs is that all of them are
+    /// durable before a map node references them, and the join at the end of this
+    /// function is exactly that boundary — `AFTER_DATA_UPLOAD` still means what it
+    /// meant, so the crash matrix is unaffected.
+    ///
+    /// Serially this cost one network round trip per object. Measured on S3, a
+    /// 48-chunk commit spent about 1.6 s of its 1.7 s waiting for 48 sequential
+    /// PUTs of 64 KiB each, which is why publishing 64x fewer bytes only bought
+    /// 2.9x (see experiments/vhost-user-blk-frontend-20260726).
+    fn upload_objects(&self, header: &PackHeader, payload: &[u8]) -> Result<()> {
+        let vol = &self.cfg.volume_id;
+        let entries = &header.entries;
+        let put = |entry: &PackEntry| -> Result<()> {
+            let at = entry.payload_offset as usize;
+            let bytes = &payload[at..at + entry.len as usize];
+            let object_id = Self::object_id(&header.txn, entry);
+            self.blob
+                .put_immutable(&chunk::keys::data(vol, &object_id), bytes)?;
+            Ok(())
+        };
+
+        let workers = upload_workers(entries.len());
+        if workers <= 1 {
+            for entry in entries {
+                put(entry)?;
+            }
+            return Ok(());
+        }
+
+        // Work-stealing over one shared cursor rather than a static split: object
+        // sizes differ (a base is 4 MiB, a delta can be one 64 KiB page), so a
+        // fixed slice per worker would leave some idle while others upload bases.
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let failure: Mutex<Option<EngineError>> = Mutex::new(None);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    if failure.lock().unwrap().is_some() {
+                        return;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(entry) = entries.get(index) else {
+                        return;
+                    };
+                    if let Err(error) = put(entry) {
+                        let mut slot = failure.lock().unwrap();
+                        if slot.is_none() {
+                            *slot = Some(error);
+                        }
+                        return;
+                    }
+                });
+            }
+        });
+        match failure.into_inner().unwrap() {
+            // The pack file stays on disk, so recovery replays every object
+            // including any that did land before the failure.
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     fn commit_pack(
         &self,
         header: &PackHeader,
@@ -592,16 +657,8 @@ impl ChunkEngine {
         base_map: Vec<ChunkRef>,
         base_leaves: Vec<LeafRef>,
     ) -> Result<i64> {
-        let vol = &self.cfg.volume_id;
-
         // 1. Data objects (idempotent keys derived from txn).
-        for e in &header.entries {
-            let bytes =
-                &payload[e.payload_offset as usize..e.payload_offset as usize + e.len as usize];
-            let object_id = Self::object_id(&header.txn, e);
-            self.blob
-                .put_immutable(&chunk::keys::data(vol, &object_id), bytes)?;
-        }
+        self.upload_objects(header, payload)?;
         crashpoint::maybe_crash(crashpoint::AFTER_DATA_UPLOAD);
 
         // 2. New map: a base entry replaces the chunk's reference outright, a
@@ -1012,6 +1069,19 @@ impl Drop for ChunkEngine {
     fn drop(&mut self) {
         self.stop_renewal();
     }
+}
+
+/// How many objects a commit uploads at once.
+///
+/// Not derived from the core count the way `commit_workers` is: this work is a
+/// blocked socket, not a busy CPU, so the useful number is set by the object
+/// store's round-trip time and its per-connection throughput rather than by the
+/// machine. Sixteen keeps a remote store's pipe full without turning a large
+/// commit into hundreds of concurrent connections.
+const MAX_UPLOAD_CONCURRENCY: usize = 16;
+
+fn upload_workers(objects: usize) -> usize {
+    objects.clamp(1, MAX_UPLOAD_CONCURRENCY)
 }
 
 fn object_id_hex(object_id: &str) -> &str {
@@ -1585,6 +1655,85 @@ mod tests {
         // Silently dropping the tail would give the Guest a corrupt rootfs.
         assert!(e.provision_from_image(&published.manifest).is_err());
         assert_eq!(e.generation(), 0);
+    }
+
+    /// A blob store that measures how many uploads were in flight at once, and
+    /// makes each one slow enough for overlap to be visible.
+    struct ConcurrencyProbe {
+        inner: Arc<dyn BlobStore>,
+        in_flight: AtomicU64,
+        peak: AtomicU64,
+        data_puts: AtomicU64,
+    }
+    impl BlobStore for ConcurrencyProbe {
+        fn put_immutable(&self, k: &str, d: &[u8]) -> cats_storage::blob::Result<()> {
+            if k.contains("/data/") {
+                self.data_puts.fetch_add(1, Ordering::SeqCst);
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                // Stand in for a network round trip.
+                std::thread::sleep(Duration::from_millis(20));
+                let result = self.inner.put_immutable(k, d);
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                return result;
+            }
+            self.inner.put_immutable(k, d)
+        }
+        fn get(&self, k: &str) -> cats_storage::blob::Result<Vec<u8>> {
+            self.inner.get(k)
+        }
+        fn exists(&self, k: &str) -> cats_storage::blob::Result<bool> {
+            self.inner.exists(k)
+        }
+        fn delete(&self, k: &str) -> cats_storage::blob::Result<()> {
+            self.inner.delete(k)
+        }
+        fn list(&self, p: &str) -> cats_storage::blob::Result<Vec<String>> {
+            self.inner.list(p)
+        }
+    }
+
+    #[test]
+    fn a_commit_uploads_its_objects_concurrently() {
+        // A commit's objects have distinct keys and no ordering between them, so
+        // uploading them one round trip at a time is pure latency. On S3 that was
+        // ~33 ms per object and most of a commit.
+        let env = env();
+        let probe = Arc::new(ConcurrencyProbe {
+            inner: env.blob.clone(),
+            in_flight: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
+            data_puts: AtomicU64::new(0),
+        });
+        let e = attach_with(&env, probe.clone(), "attA");
+        let page = vec![0x33u8; PAGE as usize];
+        for chunk in 0..8u64 {
+            e.write(chunk * CHUNK_SIZE as u64, &page).unwrap();
+        }
+        assert_eq!(e.flush().unwrap(), 1);
+
+        assert_eq!(probe.data_puts.load(Ordering::SeqCst), 8);
+        // Peak concurrency, not wall clock: the whole suite runs in parallel, so a
+        // latency bound here would measure the machine's load. Serial uploads peak
+        // at exactly 1, which is the regression this catches.
+        assert!(
+            probe.peak.load(Ordering::SeqCst) >= 2,
+            "uploads ran one at a time (peak in flight {})",
+            probe.peak.load(Ordering::SeqCst)
+        );
+        assert_eq!(probe.in_flight.load(Ordering::SeqCst), 0, "a worker leaked");
+        e.detach();
+
+        // The committed data is still readable from a cold cache, which is the
+        // part concurrency could plausibly have broken.
+        fs::remove_dir_all(&env.data_dir).unwrap();
+        let e = attach_with(&env, probe.clone(), "attB");
+        let mut back = vec![0u8; PAGE as usize];
+        for chunk in 0..8u64 {
+            e.read(chunk * CHUNK_SIZE as u64, &mut back).unwrap();
+            assert_eq!(back, page, "chunk {chunk} came back wrong");
+        }
+        e.detach();
     }
 
     #[test]

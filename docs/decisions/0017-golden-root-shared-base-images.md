@@ -63,6 +63,11 @@
 
 ## 实测结果
 
+> 下面这组是本地文件对象存储的数字。真实 S3 上的实测(以及并发上传之后旧路径也加速、
+> 因此倍数从 172× 收窄到 62× 这件事)见
+> [`raw/metal-golden-root-s3.log`](../../experiments/vhost-user-blk-frontend-20260726/raw/metal-golden-root-s3.log)
+> 与 [`raw/metal-concurrent-upload-s3.log`](../../experiments/vhost-user-blk-frontend-20260726/raw/metal-concurrent-upload-s3.log)。
+
 `blockd/tests/golden_root_cost.rs`(release,aarch64 Linux 容器,median of 3,本地文件对象
 存储;同一进程、同一对象存储,唯一变量是卷如何获得 rootfs)。原始数据:
 [`raw/golden-root-cost.log`](../../experiments/vhost-user-blk-frontend-20260726/raw/golden-root-cost.log);
@@ -95,8 +100,9 @@ macOS arm64 作为第二平台见
 
 ## 代价与风险
 
-- **首次发布的成本落在第一个用到该镜像的 launch 上**:512 MiB 约 2.7 s(本地存储)。之后每次
-  launch 都是 `exists` 命中后直接引用。在镜像部署时预发布可以把这一次也去掉——尚未实现。
+- **首次发布的成本落在第一个用到该镜像的 launch 上**:512 MiB 在真实 S3 上约 1.2 s(并发发布
+  之后;串行时是 8.3 s)。之后每次 launch 只需一次 manifest GET。在镜像部署时预发布可以把这
+  1.2 s 也去掉,但并发化之后必要性已经不大。
 - **卷的删除不再意味着数据可删**:见第 8 条,GC 必须区分镜像对象与卷对象。这是本决定引入的
   最主要的运维约束。
 - **镜像对象是长生命周期的写一次对象**:同一个 image-id 一旦被任何卷引用,就必须一直存在。

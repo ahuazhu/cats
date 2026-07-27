@@ -1,0 +1,87 @@
+Uploading a commit's objects concurrently instead of one round trip at a time.
+
+host:     AWS c6a.8xlarge, 32 vCPU, us-east-1, temporary in-region S3 bucket
+build:    release; "serial" rows are from raw/metal-delta-pack-s3.log and
+          raw/metal-golden-root-s3.log, same instance type and same setup
+date_utc: 2026-07-27
+
+Before this change, `commit_pack` uploaded its data objects in a plain `for` loop
+and `image::publish` did the same, so a commit cost one blocking HTTPS round trip
+per object (~33 ms measured). Both now upload with a bounded pool
+(MAX_UPLOAD_CONCURRENCY = 16); the join still happens before any map node
+references the objects, so AFTER_DATA_UPLOAD means what it always meant.
+
+--- FLUSH: how long a Guest's fsync stalls -------------------------------------
+
+48 chunks touched, one 64 KiB page each (delta packs -- publishes 3 MiB):
+  serial       1669.3 ms
+  concurrent    243.5 ms      6.9x faster
+
+48 chunks fully rewritten (full 4 MiB bases -- publishes 192 MiB):
+  serial       4913.5 ms
+  concurrent   1429.9 ms      3.4x faster   (= 134 MB/s, still not the pipe)
+
+sparse row by size, concurrent:
+dirty chunks  dirty pages  published MiB     flush ms   ms per pub MiB   sha256 MiB/s
+           1            1           0.06        109.6          1753.58           1678
+           8            8           0.50        147.5           295.04           1687
+          16           16           1.00        233.0           232.96           1302
+          32           32           2.00        217.8           108.89           1455
+          48           48           3.00        243.5            81.17           1566
+
+dense row by size, concurrent:
+dirty chunks  published MiB     flush ms   ms per pub MiB
+           8          32.00        291.2             9.10
+          32         128.00        797.2             6.23
+          48         192.00       1429.9             7.45
+
+**This restores delta packs.** Delta pack versus full-chunk publishing, 48 chunks:
+
+  serial uploads:     4913.5 -> 1669.3 ms   2.9x
+  concurrent uploads: 1429.9 ->  243.5 ms   5.9x
+
+The earlier finding that "delta packs are worth less on S3" was really "serial
+uploads were hiding them": when every object costs a round trip and the round
+trips do not overlap, cutting bytes 64x cannot show through. Overlap the round
+trips and the byte reduction is visible again. Flush latency no longer flattens
+with size either -- 8 chunks 147 ms, 48 chunks 243 ms, where serially it was
+374 ms -> 1669 ms.
+
+--- Golden root: publish and provision -----------------------------------------
+
+Publishing a base image once (this is the cost the first launch on a node pays):
+  image MiB     serial   concurrent
+         64    1601.8      308.9      5.2x
+        256    6719.0      957.1      7.0x
+        512    8310.1     1155.7      7.2x
+
+512 MiB drops from 8.3 s to 1.2 s, which mostly removes the reason to pre-publish
+images at node start.
+
+Provisioning one root disk (the create path), 512 MiB image:
+  copy       15472.6 ->  5334.7 ms   (the baseline got 2.9x faster too)
+  reference     89.7 ->    86.0 ms   (unchanged: it never uploaded anything)
+  golden root advantage: 172x -> 62x
+
+Ten concurrent creates, 256 MiB image:
+  copy       27230.0 -> 22488.4 ms   (only 1.2x: ten threads already kept the
+                                      pipe busy, so per-commit concurrency adds
+                                      little on top)
+  reference    167.4 ->   157.4 ms
+  golden root advantage: 162x -> 143x
+
+Reported honestly: concurrency speeds up the *old* path as well, so golden root's
+multiple over it shrinks. It is still 62x on a single create, and the absolute
+figure is what matters -- 86 ms against 5.3 s.
+
+--- A new finding: cold reads are still serial ---------------------------------
+
+Reading 64 MiB of a cold volume back from S3:
+        path       cold read ms              MiB/s
+        copy              881.9                 73
+   reference              818.1                 78
+
+73-78 MiB/s from a 12.5 Gbps instance. Hydration fetches one chunk per GET and
+does not overlap them, which is the same shape as the upload problem and has not
+been fixed. It also means the cold-read amplification of delta chains (up to 5
+objects per chunk) currently multiplies a serial cost. Next.
