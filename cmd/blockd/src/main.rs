@@ -101,6 +101,14 @@ struct Args {
     #[arg(long)]
     seed_image: Option<PathBuf>,
 
+    /// Sweep unreachable objects every N ms while serving (0 disables it).
+    ///
+    /// On by default: without it, superseded objects accumulate for the life of a
+    /// volume and nothing else is in a position to remove them, because a sweep
+    /// needs the volume's lease and this process holds it.
+    #[arg(long, default_value_t = 600_000)]
+    gc_interval_ms: u64,
+
     #[arg(long, default_value_t = 5_000)]
     lease_ttl_ms: i64,
 
@@ -298,6 +306,8 @@ fn main() -> Result<()> {
         );
         return Ok(());
     }
+
+    engine.start_gc_thread(std::time::Duration::from_millis(args.gc_interval_ms));
 
     // Bind every requested socket before printing READY: a VMM told to start on
     // readiness must never race a socket that does not exist yet.

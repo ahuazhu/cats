@@ -217,7 +217,7 @@ dirty set 为空时 FLUSH 直接成功（generation 不变）。
 
 - 协议：NBD newstyle fixed（`NBD_OPT_GO`），仅导出单卷；支持 `READ / WRITE / FLUSH / TRIM / WRITE_ZEROES / DISC`。
 - 传输：unix socket（默认）或 TCP。
-- 语义映射：WRITE→§5 写路径；FLUSH→§6；TRIM/WRITE_ZEROES→写零（V1 不改 Map 为 Hole，Compaction 阶段优化）；`FUA` 位按 FLUSH 处理。
+- 语义映射：WRITE→§5 写路径；FLUSH→§6；TRIM/WRITE_ZEROES→见 §7.2；`FUA` 位按 FLUSH 处理。
 - NBD 永久保留用于恢复工具、golden root seeding、readiness 探测与 oracle 测试；生产 Guest 路径见 §7.1。
 
 ## 7.1 vhost-user-blk 前端（生产 Guest 路径，Linux）
@@ -239,7 +239,7 @@ socket，两者服务同一个 engine 与同一个 attachment lease。
   | `IN` | §5 读路径，`sector * 512` 偏移，长度为可写描述符总长减状态字节 |
   | `OUT` | §5 写路径 |
   | `FLUSH` | §6 提交协议；dirty set 为空则直接成功 |
-  | `DISCARD` / `WRITE_ZEROES` | 写零（V1 不改 Map 为 Hole）；每段 16 字节 `{sector, num_sectors, flags}` |
+  | `DISCARD` / `WRITE_ZEROES` | 见 §7.2；每段 16 字节 `{sector, num_sectors, flags}` |
   | `GET_ID` | 返回 volume id（截断到 20 字节） |
 
 - 状态码：成功 `OK`；未知请求类型与未定义 flag `UNSUPP`；越界、fenced attachment
@@ -247,6 +247,22 @@ socket，两者服务同一个 engine 与同一个 attachment lease。
   `IOERR`，不允许 ACK 永远无法提交的数据。
 - 每个队列一个 worker 线程；队列数不改变提交协议，FLUSH 始终是整卷屏障。
 - 畸形描述符链（缺状态字节、header 被截断）只失败该请求并记日志，队列继续服务。
+
+### 7.2 TRIM / WRITE_ZEROES:整块丢弃变成 Hole
+
+被**完整覆盖**的 chunk 走「丢弃」而不是写零:提交对它不发布任何对象,Map 项改成 `Hole`。
+它引用过的对象因此不再可达,GC 就能收走(§9),而且这个 chunk 之后的冷读一个对象都不用取。
+写零的老做法正好相反——每个 chunk 发布 4 MiB 的零,还让旧对象继续活着。
+
+- **没被整块覆盖的部分仍然写字面零**,因为半块的 chunk 里还有数据。
+- 本地 cache 仍然被清零:它比这次丢弃活得久,读者直接命中它。
+- **丢弃不进 dirty bitmap**,所以提交前崩溃会丢掉这次丢弃(旧内容回来)——TRIM 是建议性的,
+  这可以接受;重新 attach 时 cache 会按 Map 重新 hydrate,不会不一致。
+- **提交前又写了这个 chunk**:丢弃不能简单取消。丢弃已经把该 chunk 在 cache 里清零了,如果只
+  发布新写的那几页,那些零就永远到不了对象存储,被丢弃的数据会在下次冷读时复活。所以此时
+  **整块转为 dirty**,把 cache 里的真相(零 + 新写)整块发布。
+- pending pack 用 `page_mask == 0` 表示丢弃(delta 至少携带一页,所以不会混淆),恢复重放得到
+  同样的结果。
 
 ## 8. 正确性判据（测试必须覆盖）
 
@@ -273,4 +289,9 @@ socket，两者服务同一个 engine 与同一个 attachment lease。
   `page_mask` 被新 delta 完全覆盖的旧 delta 丢掉了(它在 hydration 里会被逐字节覆盖,留着只是
   让链更长、冷读更贵、GC 还得当它活着)。
 
-入口:`cats-blockd --collect-garbage`(不需要监听套接字,扫完即退出)。
+入口有两个:
+
+- `cats-blockd --collect-garbage`:附着、扫一遍、退出,不需要监听套接字。
+- 服务期间**按 `--gc-interval-ms` 定时自动跑**(默认 600000,设 0 关闭)。默认开着,因为没有它
+  被取代的对象会伴随卷的整个生命周期堆积,而**只有持有租约的这个进程有资格扫**。扫描失败只是
+  记一条 warn,下一轮重试,不会挡住 Guest。

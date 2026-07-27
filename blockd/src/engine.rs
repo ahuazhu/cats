@@ -75,6 +75,11 @@ impl EngineConfig {
 struct EngineState {
     /// Volatile dirty bitmap; one u64 word per chunk (64 x 64KiB pages).
     dirty: Vec<u64>,
+    /// Chunks the Guest discarded in full since the last commit. Kept apart from
+    /// `dirty` because the commit publishes nothing for them: the chunk's map
+    /// entry becomes a Hole, which is what actually frees the old objects.
+    /// Mutually exclusive with a non-zero `dirty` word for the same chunk.
+    discarded: HashSet<u64>,
     /// Committed chunk references at `generation`.
     map: Vec<ChunkRef>,
     /// Committed leaf references matching `map`.
@@ -106,6 +111,7 @@ pub struct ChunkEngine {
     /// have to wait out its sleep interval.
     stop_renew: Arc<(Mutex<bool>, Condvar)>,
     renew_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    gc_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl ChunkEngine {
@@ -167,6 +173,7 @@ impl ChunkEngine {
                 map: vec![ChunkRef::Hole; chunk_count as usize],
                 leaf_refs: vec![LeafRef::Empty; chunk::leaf_count(size) as usize],
                 generation: 0,
+                discarded: HashSet::new(),
                 hydrated: vec![false; chunk_count as usize],
                 hydrating: HashSet::new(),
             }),
@@ -177,6 +184,7 @@ impl ChunkEngine {
             epoch,
             stop_renew: Arc::new((Mutex::new(false), Condvar::new())),
             renew_thread: Mutex::new(None),
+            gc_thread: Mutex::new(None),
             cfg,
         });
 
@@ -490,7 +498,38 @@ impl ChunkEngine {
             return Err(EngineError::Fenced);
         }
         self.check_bounds(offset, len)?;
+        if len == 0 {
+            return Ok(());
+        }
+        // Whole chunks are discarded rather than filled with zeros: the commit
+        // publishes nothing for them and their map entry becomes a Hole, so the
+        // objects they used to reference stop being reachable and GC can take
+        // them. Writing literal zeros instead would publish 4 MiB of zeros per
+        // chunk and keep the old objects alive, which is the opposite of what a
+        // Guest asking for space back wants.
+        let chunk = CHUNK_SIZE as u64;
+        let first_whole = offset.div_ceil(chunk);
+        let last_whole = (offset + len) / chunk; // exclusive
+        let (head_end, tail_start) = if first_whole < last_whole {
+            (first_whole * chunk, last_whole * chunk)
+        } else {
+            // No chunk is covered end to end; it is all partial.
+            (offset + len, offset + len)
+        };
+
+        self.write_literal_zeroes(offset, head_end - offset)?;
+        if first_whole < last_whole {
+            self.discard_chunks(first_whole, last_whole)?;
+            self.write_literal_zeroes(tail_start, offset + len - tail_start)?;
+        }
+        Ok(())
+    }
+
+    fn write_literal_zeroes(&self, offset: u64, len: u64) -> Result<()> {
         const ZBUF: usize = 1 << 20;
+        if len == 0 {
+            return Ok(());
+        }
         let zeros = vec![0u8; ZBUF.min(len as usize).max(1)];
         let mut done = 0u64;
         while done < len {
@@ -498,6 +537,33 @@ impl ChunkEngine {
             self.write(offset + done, &zeros[..step])?;
             done += step as u64;
         }
+        Ok(())
+    }
+
+    /// Mark `first..last` as discarded and make the local cache read as zeros.
+    ///
+    /// The cache still gets zeroed because it outlives the discard and readers
+    /// come straight off it; what changes is that nothing is published. A crash
+    /// before the next commit simply loses the discard — the old content comes
+    /// back, which TRIM allows — and the cache is re-hydrated from the map on the
+    /// next attach either way.
+    fn discard_chunks(&self, first: u64, last: u64) -> Result<()> {
+        let _gate = self.io_gate.read().unwrap();
+        let chunk = CHUNK_SIZE as u64;
+        let zeros = vec![0u8; CHUNK_SIZE as usize];
+        for chunk_idx in first..last {
+            self.cache.write_all_at(&zeros, chunk_idx * chunk)?;
+        }
+        let mut st = self.state.lock().unwrap();
+        let bitmap = self.bitmap.lock().unwrap();
+        for chunk_idx in first..last {
+            // A discard supersedes any uncommitted write to the same chunk.
+            st.dirty[chunk_idx as usize] = 0;
+            bitmap.write_all_at(&0u64.to_le_bytes(), BITMAP_HEADER_LEN + chunk_idx * 8)?;
+            st.discarded.insert(chunk_idx);
+            st.hydrated[chunk_idx as usize] = true;
+        }
+        bitmap.sync_data()?;
         Ok(())
     }
 
@@ -529,18 +595,21 @@ impl ChunkEngine {
                 .filter(|&c| st.dirty[c as usize] != 0)
                 .map(|c| (c, st.dirty[c as usize]))
                 .collect();
-            if dirty.is_empty() {
+            let mut discarded: Vec<u64> = st.discarded.iter().copied().collect();
+            discarded.sort_unstable();
+            if dirty.is_empty() && discarded.is_empty() {
                 return Ok(st.generation);
             }
             for &(c, _) in &dirty {
                 st.dirty[c as usize] = 0;
             }
+            st.discarded.clear();
             let base_generation = st.generation;
             let base_map = st.map.clone();
             let base_leaves = st.leaf_refs.clone();
             drop(st);
 
-            let plans = plan_commit(&dirty, &base_map);
+            let plans = plan_commit(&dirty, &base_map, &discarded);
             let bytes: usize = plans.iter().map(|p| p.len()).sum();
             // One allocation for the whole pack: `vec![0u8; n]` for a large `n`
             // comes from fresh zero pages, while an allocation per chunk charged
@@ -694,6 +763,9 @@ impl ChunkEngine {
         let vol = &self.cfg.volume_id;
         let entries = &header.entries;
         let put = |entry: &PackEntry| -> Result<()> {
+            if entry.is_discard() {
+                return Ok(());
+            }
             let at = entry.payload_offset as usize;
             let bytes = &payload[at..at + entry.len as usize];
             let object_id = Self::object_id(&header.txn, entry);
@@ -758,12 +830,18 @@ impl ChunkEngine {
         //    delta entry appends a layer to whatever the chunk already had.
         let mut new_map = base_map;
         for e in &header.entries {
+            let slot = &mut new_map[e.chunk_idx as usize];
+            if e.is_discard() {
+                // The chunk's old objects stop being reachable here; GC removes
+                // them, and a cold read of the chunk now costs nothing at all.
+                *slot = ChunkRef::Hole;
+                continue;
+            }
             let sha: [u8; 32] = hex::decode(&e.sha256_hex)
                 .ok()
                 .and_then(|v| v.try_into().ok())
                 .ok_or_else(|| EngineError::Corrupt("bad sha in pack".into()))?;
             let object_id = Self::object_id(&header.txn, e);
-            let slot = &mut new_map[e.chunk_idx as usize];
             *slot = if e.is_base() {
                 ChunkRef::Base(format::BaseRef::local(object_id, e.len, sha))
             } else {
@@ -1166,6 +1244,17 @@ impl ChunkEngine {
             let in_chunk = (pos - chunk_start) as u32;
             let span = ((end - pos) as u32).min(CHUNK_SIZE - in_chunk);
             let mask = format::page_mask(in_chunk, span);
+            // A write landing on a chunk discarded since the last commit cannot
+            // simply cancel the discard: the discard zeroed the rest of the chunk
+            // in the cache, and if the commit published only the written pages
+            // those zeros would never reach the store and the discarded data
+            // would come back on the next cold read. The cache holds the truth,
+            // so promote the whole chunk to dirty and publish all of it.
+            let mask = if st.discarded.remove(&chunk_idx) {
+                format::full_page_mask()
+            } else {
+                mask
+            };
             let word = &mut st.dirty[chunk_idx as usize];
             if *word | mask != *word {
                 *word |= mask;
@@ -1198,6 +1287,51 @@ impl ChunkEngine {
     // -----------------------------------------------------------------
     // Lease renewal / shutdown
     // -----------------------------------------------------------------
+
+    /// Sweep unreachable objects on a timer for as long as this attachment lives.
+    ///
+    /// The lease holder is the only place a sweep is safe without a grace period,
+    /// and this process is it. Without something on a timer, superseded objects
+    /// accumulate for the life of a volume: a Guest that rewrites the same chunk
+    /// all day leaves a dead 4 MiB object behind every time its delta chain
+    /// resets, and nothing would ever remove them.
+    pub fn start_gc_thread(self: &Arc<Self>, interval: Duration) {
+        if interval.is_zero() {
+            return;
+        }
+        let engine = Arc::downgrade(self);
+        let stop = self.stop_renew.clone();
+        let handle = std::thread::Builder::new()
+            .name("gc".into())
+            .spawn(move || loop {
+                // Shares the renewal stop signal: both threads exist exactly as
+                // long as the attachment does, and detach must not wait on either.
+                let (lock, cv) = &*stop;
+                let stopped = {
+                    let guard = lock.lock().unwrap();
+                    let (guard, _timeout) = cv
+                        .wait_timeout_while(guard, interval, |stopped| !*stopped)
+                        .unwrap();
+                    *guard
+                };
+                if stopped {
+                    return;
+                }
+                let Some(engine) = engine.upgrade() else {
+                    return;
+                };
+                if engine.is_fenced() {
+                    return;
+                }
+                if let Err(error) = engine.collect_garbage() {
+                    // Garbage is not urgent: a failed sweep is retried next tick
+                    // and never blocks the Guest.
+                    tracing::warn!("garbage collection failed: {error}");
+                }
+            })
+            .expect("spawn gc thread");
+        *self.gc_thread.lock().unwrap() = Some(handle);
+    }
 
     fn start_renew_thread(self: &Arc<Self>) {
         let engine = Arc::downgrade(self);
@@ -1259,6 +1393,9 @@ impl ChunkEngine {
         *lock.lock().unwrap() = true;
         cv.notify_all();
         if let Some(handle) = self.renew_thread.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.gc_thread.lock().unwrap().take() {
             let _ = handle.join();
         }
     }
@@ -1373,11 +1510,19 @@ struct CopyRun {
 /// A base is written when the chunk's delta chain is full, or when the Guest
 /// dirtied more than half the chunk — past that point a delta saves little and
 /// resetting the chain is worth more than the bytes.
-fn plan_commit(dirty: &[(u64, u64)], base_map: &[ChunkRef]) -> Vec<ChunkPlan> {
+fn plan_commit(dirty: &[(u64, u64)], base_map: &[ChunkRef], discarded: &[u64]) -> Vec<ChunkPlan> {
     let pages_per_chunk = cats_api::chunk::PAGES_PER_CHUNK;
-    dirty
+    // A discarded chunk carries no pages: `ChunkPlan::len()` is zero, so it
+    // occupies no payload and its pack entry publishes no object. It still has to
+    // be in the plan, because the commit is what turns its map entry into a Hole
+    // and a pending pack has to be able to replay that.
+    discarded
         .iter()
-        .map(|&(chunk_idx, mask)| {
+        .map(|&chunk_idx| ChunkPlan {
+            chunk_idx,
+            page_mask: 0,
+        })
+        .chain(dirty.iter().map(|&(chunk_idx, mask)| {
             let dense = mask.count_ones() * 2 > pages_per_chunk;
             let chain_full = base_map[chunk_idx as usize].layer_count() >= MAX_DELTA_LAYERS;
             let page_mask = if dense || chain_full {
@@ -1389,7 +1534,7 @@ fn plan_commit(dirty: &[(u64, u64)], base_map: &[ChunkRef]) -> Vec<ChunkPlan> {
                 chunk_idx,
                 page_mask,
             }
-        })
+        }))
         .collect()
 }
 
@@ -2120,6 +2265,123 @@ mod tests {
         let second = e.collect_garbage().unwrap();
         assert_eq!(second, first);
         e.detach();
+    }
+
+    #[test]
+    fn discarding_whole_chunks_frees_their_objects_instead_of_publishing_zeros() {
+        let (env, sizing) = sizing_env();
+        let e = attach_with(&env, sizing.clone(), "attA");
+        let whole = pattern(CHUNK_SIZE as usize, 8);
+        for chunk in 0..3u64 {
+            e.write(chunk * CHUNK_SIZE as u64, &whole).unwrap();
+        }
+        assert_eq!(e.flush().unwrap(), 1);
+        assert_eq!(sizing.data_bytes.load(Ordering::SeqCst), 3 * CHUNK_SIZE as u64);
+        sizing.data_bytes.store(0, Ordering::SeqCst);
+
+        // Discard chunks 1 and 2 in full.
+        e.write_zeroes(CHUNK_SIZE as u64, 2 * CHUNK_SIZE as u64).unwrap();
+        assert_eq!(e.flush().unwrap(), 2);
+
+        // Nothing was published for them: writing 8 MiB of zeros would have been
+        // the old behaviour, and would also have kept the old objects alive.
+        assert_eq!(sizing.data_bytes.load(Ordering::SeqCst), 0);
+        {
+            let st = e.state.lock().unwrap();
+            assert!(matches!(st.map[0], ChunkRef::Base(_)), "chunk 0 untouched");
+            assert!(matches!(st.map[1], ChunkRef::Hole));
+            assert!(matches!(st.map[2], ChunkRef::Hole));
+        }
+
+        // And GC can now take what they used to reference.
+        let stats = e.collect_garbage().unwrap();
+        assert_eq!(stats.data_objects_live, 1);
+        assert_eq!(stats.data_objects_deleted, 2);
+
+        // The Guest sees zeros, from a host with nothing cached.
+        e.detach();
+        fs::remove_dir_all(&env.data_dir).unwrap();
+        let e = attach_with(&env, sizing.clone(), "attB");
+        let mut back = vec![0xffu8; CHUNK_SIZE as usize];
+        e.read(CHUNK_SIZE as u64, &mut back).unwrap();
+        assert!(back.iter().all(|b| *b == 0), "discarded chunk must read zero");
+        e.read(0, &mut back).unwrap();
+        assert_eq!(back, whole, "an untouched chunk must survive a neighbour's discard");
+        e.detach();
+    }
+
+    #[test]
+    fn a_partial_discard_writes_zeros_and_a_later_write_cancels_a_discard() {
+        let (env, sizing) = sizing_env();
+        let e = attach_with(&env, sizing.clone(), "attA");
+        let whole = pattern(CHUNK_SIZE as usize, 9);
+        e.write(0, &whole).unwrap();
+        e.flush().unwrap();
+        sizing.data_bytes.store(0, Ordering::SeqCst);
+
+        // Not chunk-aligned: only the covered pages are zeroed, and the chunk
+        // stays a real object because most of it still holds data.
+        e.write_zeroes(PAGE, PAGE).unwrap();
+        e.flush().unwrap();
+        assert_eq!(sizing.data_bytes.load(Ordering::SeqCst), PAGE);
+        {
+            let st = e.state.lock().unwrap();
+            assert!(!matches!(st.map[0], ChunkRef::Hole));
+        }
+        let mut back = vec![0u8; CHUNK_SIZE as usize];
+        e.read(0, &mut back).unwrap();
+        assert_eq!(&back[..PAGE as usize], &whole[..PAGE as usize]);
+        assert!(back[PAGE as usize..2 * PAGE as usize].iter().all(|b| *b == 0));
+
+        // A write after a discard, before the commit, must win: the chunk is real
+        // data again, not a hole.
+        e.write_zeroes(0, CHUNK_SIZE as u64).unwrap();
+        let patch = pattern(4096, 3);
+        e.write(0, &patch).unwrap();
+        e.flush().unwrap();
+        {
+            let st = e.state.lock().unwrap();
+            assert!(
+                !matches!(st.map[0], ChunkRef::Hole),
+                "a write after a discard was lost"
+            );
+        }
+        e.detach();
+        fs::remove_dir_all(&env.data_dir).unwrap();
+        let e = attach_with(&env, sizing.clone(), "attB");
+        let mut back = vec![0xffu8; CHUNK_SIZE as usize];
+        e.read(0, &mut back).unwrap();
+        assert_eq!(&back[..4096], &patch[..]);
+        assert!(back[4096..].iter().all(|b| *b == 0), "the discard still applied");
+        e.detach();
+    }
+
+    #[test]
+    fn the_gc_thread_sweeps_on_its_own_and_does_not_delay_detach() {
+        let env = env();
+        let e = attach(&env, "attA");
+        // Two dense generations of one chunk: the first object becomes garbage.
+        e.write(0, &pattern(CHUNK_SIZE as usize, 1)).unwrap();
+        e.flush().unwrap();
+        e.write(0, &pattern(CHUNK_SIZE as usize, 2)).unwrap();
+        e.flush().unwrap();
+        assert_eq!(env.blob.list("volumes/vol_test/data/").unwrap().len(), 2);
+
+        e.start_gc_thread(Duration::from_millis(50));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while env.blob.list("volumes/vol_test/data/").unwrap().len() > 1 {
+            assert!(std::time::Instant::now() < deadline, "gc thread never swept");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // And it must not hold up a stop, the way lease renewal used to.
+        let started = std::time::Instant::now();
+        e.detach();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "detach waited {:?} on the gc thread",
+            started.elapsed()
+        );
     }
 
     #[test]

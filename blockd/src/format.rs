@@ -437,6 +437,13 @@ impl PackEntry {
     pub fn is_base(&self) -> bool {
         self.page_mask == full_page_mask()
     }
+
+    /// A discard: the chunk carries no pages and publishes no object, and the
+    /// commit turns its map entry into a Hole. Distinguishable from every other
+    /// entry because a delta always carries at least one page.
+    pub fn is_discard(&self) -> bool {
+        self.page_mask == 0
+    }
 }
 
 pub fn encode_pack(header: &PackHeader, payload: &[u8]) -> Vec<u8> {
