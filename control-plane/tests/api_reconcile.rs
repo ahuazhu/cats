@@ -41,8 +41,24 @@ struct StubNode {
     cats: Arc<Mutex<HashMap<String, ObservedState>>>,
     jobs: Arc<Mutex<Vec<String>>>,
     alive: Arc<AtomicBool>,
+    /// Held for read while a heartbeat is in flight.
+    heartbeat_gate: Arc<tokio::sync::RwLock<()>>,
     exec_attempts: Arc<AtomicUsize>,
     exec_conflicts_remaining: Arc<AtomicUsize>,
+}
+
+impl StubNode {
+    /// Stop heartbeating, and return only once nothing is still in flight.
+    ///
+    /// Clearing `alive` on its own is not enough. The loop tests it before it
+    /// builds the request, so a heartbeat that already passed the test can land
+    /// after the caller has moved the node to Lost and quietly revive it --
+    /// recovering a Lost node on heartbeat is intended behaviour, which is
+    /// exactly why the test has to be sure none is outstanding.
+    async fn quiesce(&self) {
+        self.alive.store(false, Ordering::SeqCst);
+        let _idle = self.heartbeat_gate.write().await;
+    }
 }
 
 async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Json<NodeJobResult> {
@@ -96,6 +112,7 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
         cats: Arc::new(Mutex::new(HashMap::new())),
         jobs: Arc::new(Mutex::new(Vec::new())),
         alive: Arc::new(AtomicBool::new(true)),
+        heartbeat_gate: Arc::new(tokio::sync::RwLock::new(())),
         exec_attempts: Arc::new(AtomicUsize::new(0)),
         exec_conflicts_remaining: Arc::new(AtomicUsize::new(0)),
     };
@@ -132,6 +149,9 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(300)).await;
+            // Held across the send so `quiesce` cannot return while a
+            // heartbeat is still on its way to the control plane.
+            let _in_flight = hb.heartbeat_gate.read().await;
             if !hb.alive.load(Ordering::SeqCst) {
                 continue;
             }
@@ -873,7 +893,7 @@ async fn node_loss_fences_and_reschedules() {
 
     // Second node joins; first node dies (heartbeats stop).
     let _node_b = start_stub_node(&ctx.cp, "node_b").await;
-    node_a.alive.store(false, Ordering::SeqCst);
+    node_a.quiesce().await;
 
     // The cat must converge back to Running on the surviving node.
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -1666,18 +1686,38 @@ async fn admin_can_monitor_and_drain_nodes() {
         Some(50 * 1024 * 1024 * 1024)
     );
 
-    let node_cats: ListResponse<NodeCatSummary> = ctx
-        .http
-        .get(ctx.url("/v1/admin/nodes/node_a/cats"))
-        .bearer_auth("dev-admin-token")
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    // Per-Cat telemetry rides the heartbeat, and the heartbeat that first
+    // carried node-level telemetry can predate the Cat's placement. Waiting
+    // only for the node level, as the loop above does, leaves `actual` empty
+    // whenever the next heartbeat has not landed yet -- which is most of the
+    // time on a loaded machine.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let node_cats: ListResponse<NodeCatSummary> = loop {
+        let listed: ListResponse<NodeCatSummary> = ctx
+            .http
+            .get(ctx.url("/v1/admin/nodes/node_a/cats"))
+            .bearer_auth("dev-admin-token")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if listed
+            .items
+            .first()
+            .is_some_and(|item| item.actual.is_some())
+        {
+            break listed;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "per-cat telemetry missing"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     assert_eq!(node_cats.items.len(), 1);
     assert_eq!(node_cats.items[0].cat.name, "drain-me");
     assert_eq!(node_cats.items[0].requested_disk_bytes, 8 << 20);
@@ -1766,7 +1806,7 @@ async fn admin_can_monitor_and_drain_nodes() {
 
     // Cordon records scheduling intent without hiding Lost health; a later
     // registration recovery must not silently defeat that intent.
-    node_a.alive.store(false, Ordering::SeqCst);
+    node_a.quiesce().await;
     ctx.cp
         .state
         .store

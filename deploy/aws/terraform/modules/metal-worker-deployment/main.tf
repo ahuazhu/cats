@@ -10,8 +10,49 @@ locals {
     Project     = "Cats"
   })
 
+  # Non-secret worker configuration, used only to seed a host that has no
+  # worker.env yet. Secrets never appear here: they arrive through Secrets
+  # Manager and are merged over this by the overlay below.
+  worker_base_environment = join("\n", [
+    for key in sort(keys(var.worker_base_environment)) :
+    "${key}=${var.worker_base_environment[key]}"
+  ])
+
   deployment_script = <<-SCRIPT
     set -eu
+
+    # The association assumed the AWS CLI was already on the host. A stock
+    # Ubuntu 24.04 AMI has neither the CLI nor an awscli apt candidate, so a
+    # freshly launched worker failed here with "aws: not found" before it ever
+    # reached the bundle. Bootstrap it once; an already-provisioned host skips
+    # straight through.
+    export PATH="/usr/local/bin:$PATH"
+    export DEBIAN_FRONTEND=noninteractive
+
+    if ! command -v aws >/dev/null 2>&1; then
+      if ! command -v unzip >/dev/null 2>&1; then
+        apt-get update -qq
+        apt-get install -qy --no-install-recommends unzip
+      fi
+      cli_stage="$(mktemp -d /var/tmp/awscli.XXXXXX)"
+      curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "$cli_stage/awscliv2.zip"
+      unzip -q "$cli_stage/awscliv2.zip" -d "$cli_stage"
+      "$cli_stage/aws/install" --update
+      rm -rf -- "$cli_stage"
+    fi
+
+    if ! command -v zstd >/dev/null 2>&1; then
+      apt-get update -qq
+      apt-get install -qy --no-install-recommends zstd
+    fi
+
+    for required in aws zstd tar sha256sum findmnt; do
+      command -v "$required" >/dev/null 2>&1 || {
+        echo "worker deployment needs $required on the host" >&2
+        exit 1
+      }
+    done
+
     artifact_path="/var/tmp/cats-worker-${var.worker_bundle_sha256}.tar.zst"
     stage_path="$(mktemp -d /var/tmp/cats-worker-stage.XXXXXX)"
     runtime_secret=""
@@ -32,13 +73,27 @@ locals {
     echo "${var.worker_bundle_sha256}  $artifact_path" | sha256sum --check --strict -
     tar --zstd -xf "$artifact_path" -C "$stage_path"
 
-    install -m 0755 "$stage_path/cats-noded" "${var.install_root}/bin/cats-noded"
-    install -m 0755 "$stage_path/cats-blockd" "${var.install_root}/bin/cats-blockd"
-    install -m 0755 "$stage_path/cats-guest-agent" "${var.install_root}/bin/cats-guest-agent"
+    # -D creates the parent directory. Without it a host that has never been
+    # touched by install.sh fails here: /opt/cats/bin does not exist yet, and
+    # the association only ever ran against hosts that had been set up by hand.
+    install -D -m 0755 "$stage_path/cats-noded" "${var.install_root}/bin/cats-noded"
+    install -D -m 0755 "$stage_path/cats-blockd" "${var.install_root}/bin/cats-blockd"
+    install -D -m 0755 "$stage_path/cats-guest-agent" "${var.install_root}/bin/cats-guest-agent"
     install -m 0644 "$stage_path/cats-worker.service" /etc/systemd/system/cats-worker.service
 
     cgroup_mount="$(findmnt --noheadings --first-only --types cgroup2 --output TARGET)"
+
+    # ControlGroup is only populated once the unit has actually run. On a first
+    # install it is empty, and `test -n` then killed the association with no
+    # message at all -- the deployment had only ever met hosts where the service
+    # had already started. Slice is populated while the unit is merely loaded,
+    # and gives the same path systemd will use.
     service_cgroup="$(systemctl show cats-worker --property ControlGroup --value)"
+    if [ -z "$service_cgroup" ]; then
+      service_slice="$(systemctl show cats-worker --property Slice --value)"
+      test -n "$service_slice"
+      service_cgroup="/$service_slice/cats-worker.service"
+    fi
     test -n "$cgroup_mount"
     test -n "$service_cgroup"
     metering_root="$${cgroup_mount}$${service_cgroup}/metering"
@@ -57,6 +112,19 @@ locals {
         to_entries[] | "\(.key)=\(.value)"
       end
     ' "$runtime_secret" > "$runtime_overlay"
+
+    # The overlay merges onto an existing worker.env. A host that has never run
+    # install.sh has no such file and awk died on it, so nothing in the
+    # production path ever created the non-secret half of the configuration.
+    # Seed it once; an existing file is left alone so operator edits survive.
+    if [ ! -f "${var.worker_environment_file}" ]; then
+      mkdir -p "$(dirname "${var.worker_environment_file}")"
+      cat > "${var.worker_environment_file}" <<'CATS_BASE_ENVIRONMENT'
+${local.worker_base_environment}
+CATS_BASE_ENVIRONMENT
+      chmod 0600 "${var.worker_environment_file}"
+      chown root:root "${var.worker_environment_file}"
+    fi
 
     environment_temp="$(mktemp /var/tmp/cats-worker-env.XXXXXX)"
     awk -v metering_root="$metering_root" '

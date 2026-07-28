@@ -125,6 +125,12 @@ resource "kubernetes_persistent_volume_claim_v1" "control_data" {
     labels    = local.labels
   }
 
+  # The storage class binds WaitForFirstConsumer, so the claim stays Pending
+  # until a Pod schedules against it. Waiting for Bound here deadlocks: the
+  # claim waits for the Deployment and Terraform waits for the claim. This only
+  # shows up on a fresh cluster -- an imported claim is already bound.
+  wait_until_bound = false
+
   spec {
     access_modes       = ["ReadWriteOnce"]
     storage_class_name = kubernetes_storage_class_v1.control_data.metadata[0].name

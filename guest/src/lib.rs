@@ -950,34 +950,51 @@ impl GuestAgent {
             (1..=1_000).contains(&rows) && (1..=1_000).contains(&cols),
             "terminal dimensions must be in 1..=1000"
         );
-        let pair = native_pty_system().openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
+        // Every step below can fail with a bare io error. Without context the
+        // caller receives "Permission denied (os error 13)" and cannot tell a
+        // PTY allocation failure from an exec failure.
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("allocate shell pty")?;
         let shell = if Path::new("/bin/bash").is_file() {
             "/bin/bash"
         } else {
             "/bin/sh"
         };
+        // Inside a real Guest the agent is root and /root is its home. The
+        // FakeVmm topology runs the agent as an ordinary host process, where
+        // /root exists but is mode 0700 owned by root, so `is_dir` says yes and
+        // the spawn then fails with EACCES on the chdir. Test for reachability,
+        // not existence.
+        let home = if std::fs::read_dir("/root").is_ok() {
+            "/root"
+        } else {
+            "/"
+        };
         let mut command = CommandBuilder::new(shell);
         command.arg("-l");
         command.env("SHELL", shell);
-        command.env("HOME", "/root");
+        command.env("HOME", home);
         command.env("USER", "root");
         command.env("LOGNAME", "root");
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
-        command.cwd(if Path::new("/root").is_dir() {
-            "/root"
-        } else {
-            "/"
-        });
-        let mut child = pair.slave.spawn_command(command)?;
+        command.cwd(home);
+        let mut child = pair
+            .slave
+            .spawn_command(command)
+            .with_context(|| format!("spawn shell {shell} in {home}"))?;
         drop(pair.slave);
-        let mut pty_reader = pair.master.try_clone_reader()?;
-        let mut pty_writer = pair.master.take_writer()?;
+        let mut pty_reader = pair
+            .master
+            .try_clone_reader()
+            .context("clone shell pty reader")?;
+        let mut pty_writer = pair.master.take_writer().context("take shell pty writer")?;
 
         write_frame(
             stream,

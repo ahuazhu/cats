@@ -1,0 +1,40 @@
+aws_region  = "us-east-1"
+environment = "production"
+
+# Network. Keep clear of CATS_GUEST_NETWORK_CIDR (10.240.0.0/16).
+vpc_cidr                = "10.20.0.0/16"
+availability_zone_count = 2
+one_nat_gateway_per_az  = false
+
+# Cluster. Dedicated to Cats — do not point this at another product's cluster.
+cluster_name       = "cats-production"
+kubernetes_version = "1.34"
+
+# Narrow this to the operator egress ranges once they are known.
+cluster_public_access_cidrs  = ["0.0.0.0/0"]
+cluster_admin_principal_arns = []
+
+# Database.
+database_engine_version        = "16.13"
+database_instance_class        = "db.t4g.micro"
+database_allocated_storage     = 20
+database_multi_az              = false
+database_backup_retention_days = 7
+database_deletion_protection   = true
+database_skip_final_snapshot   = false
+
+# DNS. Leave wait_for_certificate_validation false until the registrar points
+# at this zone's name servers; ACM cannot validate before that and the apply
+# would sit waiting for a record the world cannot resolve.
+domain_name                     = "cats.run"
+wait_for_certificate_validation = false
+
+# Release identity.
+github_repository           = "ahuazhu/cats"
+github_default_branch       = "main"
+create_github_oidc_provider = true
+ecr_repository_name         = "cats/control-plane"
+
+tags = {
+  Owner = "platform"
+}

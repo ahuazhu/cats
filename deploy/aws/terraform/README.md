@@ -11,6 +11,7 @@ No cloud resource is created merely by checking in this directory.
 | Directory | State boundary | Owns |
 |---|---|---|
 | `bootstrap/` | bootstrap state | Versioned, encrypted, private S3 state bucket |
+| `stacks/platform/` | platform state | VPC, EKS cluster, RDS PostgreSQL, Route 53 zone, ACM certificate, ECR repository, bare-metal worker security group, GitHub Actions release role |
 | `stacks/production-infrastructure/` | infrastructure state | Usage stream/archive/checkpoints, Pod Identity, alarms, worker artifacts/secrets/SSM deployment |
 | `stacks/production-payments/` | payments state | Stripe prepaid-credit Product, fixed one-time Prices and signed webhook endpoint |
 | `stacks/production-application/` | application state | Cats Namespace/ServiceAccount, Secret/ConfigMap, EBS PVC, Deployments, Services and public ingress |
@@ -20,11 +21,19 @@ Keep the infrastructure and application states separate. The application
 provider must connect to an already healthy EKS API; coupling its state to EKS
 creation makes cluster recovery and provider initialization fragile.
 
-The existing VPC, EKS cluster, RDS instance, ACM certificate, ECR repositories,
-ChunkStore bucket and bare-metal workers are inputs during migration. They are
-not owned by these new states yet. Add exact resource declarations to a
-dedicated platform state and import the live resources before changing them.
-A Terraform data source is not ownership.
+`stacks/platform/` now owns the resources that used to be unmanaged inputs.
+In a greenfield account it creates them outright, so no import is required and
+a Terraform data source never stands in for ownership. In an account where they
+already exist by hand, declare them from their exact live configuration and
+import them before Terraform changes anything.
+
+The ChunkStore bucket and the bare-metal instances themselves remain outside
+Terraform. The instances are long-lived capacity referenced by id; the platform
+state owns only the security group that positions them on the network.
+
+Apply order is `bootstrap` → `platform` → `production-infrastructure` →
+`production-application`. Bootstrap comes first and keeps local state because it
+creates the bucket every later state stores its state in.
 
 ## State bootstrap
 
@@ -45,6 +54,46 @@ The state bucket uses versioning, SSE-S3, public-access block, TLS-only access
 and destroy protection. Restrict bucket access with the deployment role's IAM
 policy. The production stacks use S3 native `use_lockfile`; no DynamoDB state
 lock table is needed.
+
+## Platform
+
+Creates the network, cluster, database and public identity the later stacks
+assume. Apply it directly after bootstrap:
+
+```sh
+cd deploy/aws/terraform/stacks/platform
+cp backend.hcl.example backend.hcl
+cp platform.tfvars.example platform.auto.tfvars
+terraform init -backend-config=backend.hcl
+terraform plan -out=platform.tfplan
+terraform apply platform.tfplan
+```
+
+Three things about this stack are easy to get wrong.
+
+**The certificate cannot validate before the registrar moves.** A Route 53
+hosted zone cannot be transferred between accounts, so this stack creates a new
+zone with new name servers. ACM's DNS validation only resolves once the
+registrar points at them. `wait_for_certificate_validation` therefore defaults
+to false: the first apply requests the certificate and writes the validation
+records without blocking. Read `route53_name_servers`, change them at the
+registrar, then re-apply with the flag set — or simply wait, because ACM polls
+and issues on its own.
+
+**The VPC CIDR must not overlap the guest network.** Workers NAT each Cat's tap
+`/30` onto the host interface, and `CATS_GUEST_NETWORK_CIDR` is `10.240.0.0/16`
+by default. The `vpc_cidr` default of `10.20.0.0/16` is clear of it; if you
+change either, keep them disjoint.
+
+**The database password is not in this state.** RDS generates and rotates it in
+Secrets Manager. Read `database_master_user_secret_arn` to assemble
+`storage_postgres_url` and `usage_postgres_url` for the application stack.
+
+The stack also creates the GitHub Actions release role. Its trust policy pins
+both the audience and the subject to `github_repository` — widening the subject
+to a wildcard owner would let any repository assume it. Publish
+`github_release_role_arn` as the `AWS_ROLE_ARN` repository variable, alongside
+`AWS_REGION` and `ECR_REPOSITORY`.
 
 ## Usage infrastructure
 
@@ -213,12 +262,15 @@ Never use dual writers during the cutover.
 
 ## Local checks
 
-These checks do not contact or mutate AWS/EKS:
+These checks do not contact or mutate AWS/EKS, and the `terraform` job in
+`.github/workflows/ci.yml` runs the same set on every pull request:
 
 ```sh
 terraform fmt -check -recursive deploy/aws/terraform
 terraform -chdir=deploy/aws/terraform/bootstrap init -backend=false
 terraform -chdir=deploy/aws/terraform/bootstrap validate
+terraform -chdir=deploy/aws/terraform/stacks/platform init -backend=false
+terraform -chdir=deploy/aws/terraform/stacks/platform validate
 terraform -chdir=deploy/aws/terraform/stacks/production-infrastructure init -backend=false
 terraform -chdir=deploy/aws/terraform/stacks/production-infrastructure validate
 terraform -chdir=deploy/aws/terraform/stacks/production-payments init -backend=false

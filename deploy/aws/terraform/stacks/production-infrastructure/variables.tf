@@ -55,34 +55,57 @@ variable "worker_artifact_bucket_name" {
   type        = string
 }
 
+# The usage pipeline and the worker release path share this state but not a
+# schedule. The control plane needs Kinesis, the archive and the checkpoint
+# table before it can serve anything; the worker release path needs a
+# bare-metal instance that may not exist yet -- new accounts start well below
+# the vCPU quota one requires. Leaving metal_worker_instance_id empty skips the
+# worker module so the usage side can go up first, then fills it in later.
+variable "metal_worker_enabled" {
+  description = "Manage the bare-metal worker release path. Defaults to whether metal_worker_instance_id is set."
+  type        = bool
+  default     = null
+}
+
 variable "worker_bundle_path" {
   description = "Absolute path to the reviewed linux/amd64 worker tar.zst bundle."
   type        = string
+  default     = ""
 }
 
 variable "worker_bundle_sha256" {
   description = "SHA-256 digest for worker_bundle_path."
   type        = string
+  default     = ""
 }
 
 variable "metal_worker_instance_id" {
   description = "Existing production bare-metal worker EC2 instance."
   type        = string
+  default     = ""
 }
 
 variable "metal_worker_instance_role_name" {
   description = "Existing IAM role attached to the production bare-metal worker."
   type        = string
+  default     = ""
 }
 
 variable "worker_runtime_secret_data" {
   description = "Worker CATS_AUTH_TOKEN and CATS_POSTGRES_URL delivered through Secrets Manager."
   type        = map(string)
   sensitive   = true
+  default     = {}
 }
 
 variable "tags" {
   description = "Additional resource tags."
+  type        = map(string)
+  default     = {}
+}
+
+variable "worker_base_environment" {
+  description = "Non-secret worker.env entries used to seed a host that has none yet. Passed through to the worker deployment module."
   type        = map(string)
   default     = {}
 }

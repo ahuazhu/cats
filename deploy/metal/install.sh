@@ -93,20 +93,31 @@ if [[ $DATA_DEVICE == auto ]]; then
   # module this script loads a few lines up creates /dev/nbd0..63, and lsblk
   # reports those as TYPE=disk with no mountpoint -- picking one of those is how
   # the first version of this got it wrong.
+  # -P emits key="value" pairs. Column output cannot be used: awk collapses an
+  # empty MOUNTPOINT, so $4 becomes the first word of MODEL and `$4 == ""` never
+  # matches. This branch therefore never selected anything, and every host so
+  # far was picked by the size fallback below -- which will happily choose a
+  # data EBS volume on a machine that has one.
   root_src=$(findmnt -no SOURCE / | sed 's/p\?[0-9]*$//')
-  DATA_DEVICE=$(lsblk -dnp -o NAME,TYPE,SIZE,MOUNTPOINT,MODEL |
-    awk -v root="$root_src" '
-      $2 == "disk" && $1 != root && $4 == "" && $3 != "0B" &&
-      $1 !~ /\/dev\/(nbd|loop|ram|zram|md|dm-)/ &&
-      $0 ~ /Instance Storage/ {print $1; exit}')
+  DATA_DEVICE=$(lsblk -dnp -P -o NAME,TYPE,SIZE,MOUNTPOINT,MODEL |
+    while read -r entry; do
+      NAME= TYPE= SIZE= MOUNTPOINT= MODEL=
+      eval "$entry"
+      [[ $TYPE == disk && $NAME != "$root_src" && -z $MOUNTPOINT ]] || continue
+      [[ $NAME =~ ^/dev/(nbd|loop|ram|zram|md|dm-) ]] && continue
+      [[ $MODEL == *"Instance Storage"* ]] && { echo "$NAME"; break; }
+    done | head -1)
   if [[ -z ${DATA_DEVICE:-} ]]; then
     # No vendor label: fall back to the largest unmounted real disk, still
     # excluding the virtual device classes.
-    DATA_DEVICE=$(lsblk -dnpb -o NAME,TYPE,SIZE,MOUNTPOINT |
-      awk -v root="$root_src" '
-        $2 == "disk" && $1 != root && $4 == "" && $3 > 0 &&
-        $1 !~ /\/dev\/(nbd|loop|ram|zram|md|dm-)/ {print $3, $1}' |
-      sort -rn | head -1 | awk '{print $2}')
+    DATA_DEVICE=$(lsblk -dnpb -P -o NAME,TYPE,SIZE,MOUNTPOINT |
+      while read -r entry; do
+        NAME= TYPE= SIZE= MOUNTPOINT=
+        eval "$entry"
+        [[ $TYPE == disk && $NAME != "$root_src" && -z $MOUNTPOINT && $SIZE -gt 0 ]] || continue
+        [[ $NAME =~ ^/dev/(nbd|loop|ram|zram|md|dm-) ]] && continue
+        echo "$SIZE $NAME"
+      done | sort -rn | head -1 | awk '{print $2}')
   fi
   DATA_DEVICE=${DATA_DEVICE:-none}
 fi

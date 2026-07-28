@@ -1,0 +1,139 @@
+name: Release
+
+# Builds the two reviewed production artifacts:
+#
+#   * the control-plane container image (cats-controld + cats-gatewayd),
+#     pushed to ECR; its immutable digest is what the application stack's
+#     tfvars must reference.
+#   * the metal worker bundle (cats-noded + cats-blockd + cats-guest-agent +
+#     the systemd unit) as a tar.zst plus SHA-256, which the infrastructure
+#     stack uploads to the content-addressed artifact bucket.
+#
+# Authentication is GitHub OIDC into an AWS role; no long-lived access key is
+# stored in the repository. The role is created by the platform stack.
+#
+# Required repository variables (Settings -> Secrets and variables -> Actions):
+#   AWS_REGION       e.g. us-east-1
+#   AWS_ROLE_ARN     arn:aws:iam::869621413820:role/cats-github-actions-release
+#   ECR_REPOSITORY   cats/control-plane
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      push_image:
+        description: Push the control-plane image to ECR
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  control-plane-image:
+    name: Control-plane image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive image tag
+        id: meta
+        run: echo "tag=${GITHUB_REF_NAME}-$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Assume AWS role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # The runtime is linux/amd64 (EKS Auto Mode general-purpose nodes), so the
+      # platform is pinned rather than inherited from the runner.
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/aws/Dockerfile.control-plane
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+          tags: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # tfvars requires an immutable @sha256 reference. Reading the digest back
+      # from the registry is deliberate: never copy a digest from a previous
+      # build or another account.
+      - name: Report image reference
+        run: |
+          {
+            echo "### Control-plane image"
+            echo
+            echo '```'
+            echo "${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}@${{ steps.build.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  worker-bundle:
+    name: Metal worker bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Dockerfile.worker-artifact's final stage is FROM scratch, so exporting
+      # it to the local filesystem yields exactly the four files to ship.
+      - name: Build worker binaries
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/aws/Dockerfile.worker-artifact
+          target: artifact
+          platforms: linux/amd64
+          outputs: type=local,dest=worker-out
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Package
+        id: pkg
+        run: |
+          set -euo pipefail
+          ls -l worker-out
+          tar -C worker-out -cf - . | zstd -19 -T0 -o cats-worker.tar.zst
+          sha256=$(sha256sum cats-worker.tar.zst | cut -d' ' -f1)
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Worker bundle"
+            echo
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| file | \`cats-worker.tar.zst\` |"
+            echo "| sha256 | \`$sha256\` |"
+            echo
+            echo "Set \`worker_bundle_path\` to the downloaded file and"
+            echo "\`worker_bundle_sha256\` to the digest above."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cats-worker-bundle
+          path: cats-worker.tar.zst
+          if-no-files-found: error

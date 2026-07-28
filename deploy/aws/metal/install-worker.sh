@@ -26,6 +26,60 @@ fi
 (cd "$CATS_REPO" && cargo build --locked --release \
   -p cats-node-agent-daemon -p cats-blockd-daemon -p cats-guest-agent)
 
+# Local NVMe for the ChunkStore cache and the per-Cat state filesystem.
+#
+# deploy/metal/install.sh grew this on 2026-07-27 after an i4i run measured 4 KiB
+# random write 40x low purely because /var/lib/cats had been left on the EBS
+# root. This installer -- the one production workers actually run -- never got
+# the same treatment, so every AWS worker silently benchmarked and ran its
+# ChunkStore cache on EBS. Mount it before anything creates state under it.
+#
+# CATS_DATA_DEVICE=none skips this; CATS_DATA_DEVICE=/dev/nvmeXn1 picks one.
+DATA_DEVICE=${CATS_DATA_DEVICE:-auto}
+if [[ $DATA_DEVICE == auto ]]; then
+  # -P emits key="value" pairs. Column output cannot be used here: awk collapses
+  # an empty MOUNTPOINT, so $4 becomes the first word of MODEL and a test for an
+  # unmounted disk never matches. That is why the equivalent block in
+  # deploy/metal/install.sh only ever selected through its size fallback.
+  root_src=$(findmnt -no SOURCE / | sed 's/p\?[0-9]*$//')
+  DATA_DEVICE=$(lsblk -dnp -P -o NAME,TYPE,SIZE,MOUNTPOINT,MODEL |
+    while read -r entry; do
+      NAME= TYPE= SIZE= MOUNTPOINT= MODEL=
+      eval "$entry"
+      [[ $TYPE == disk && $NAME != "$root_src" && -z $MOUNTPOINT ]] || continue
+      [[ $NAME =~ ^/dev/(nbd|loop|ram|zram|md|dm-) ]] && continue
+      [[ $MODEL == *"Instance Storage"* ]] && { echo "$NAME"; break; }
+    done | head -1)
+  if [[ -z ${DATA_DEVICE:-} ]]; then
+    # No vendor label: largest unmounted real disk, excluding virtual classes.
+    DATA_DEVICE=$(lsblk -dnpb -P -o NAME,TYPE,SIZE,MOUNTPOINT |
+      while read -r entry; do
+        eval "$entry"
+        [[ $TYPE == disk && $NAME != "$root_src" && -z $MOUNTPOINT && $SIZE -gt 0 ]] || continue
+        [[ $NAME =~ ^/dev/(nbd|loop|ram|zram|md|dm-) ]] && continue
+        echo "$SIZE $NAME"
+      done | sort -rn | head -1 | awk '{print $2}')
+  fi
+  DATA_DEVICE=${DATA_DEVICE:-none}
+fi
+if [[ $DATA_DEVICE != none ]]; then
+  if mountpoint -q /var/lib/cats; then
+    echo "==> /var/lib/cats is already a mount point; leaving it alone"
+  else
+    echo "==> local data device $DATA_DEVICE -> /var/lib/cats"
+    [[ -b $DATA_DEVICE ]] || { echo "$DATA_DEVICE is not a block device" >&2; exit 1; }
+    blkid "$DATA_DEVICE" >/dev/null 2>&1 || mkfs.ext4 -q -F "$DATA_DEVICE"
+    install -d /var/lib/cats
+    mount "$DATA_DEVICE" /var/lib/cats
+    # Deliberately not in /etc/fstab: instance storage does not survive a
+    # stop/start, and a reboot should come up with an empty cache rather than
+    # fail to boot on a device that no longer has a filesystem.
+  fi
+else
+  echo "==> no local data device found; /var/lib/cats stays on the root filesystem"
+  echo "    (fine for functional testing, NOT comparable for storage benchmarks)"
+fi
+
 install -d "$CATS_PREFIX/bin" "$CATS_PREFIX/guest" /var/lib/cats/node /etc/cats
 install -m 0755 "$CATS_REPO/target/release/cats-noded" "$CATS_PREFIX/bin/cats-noded"
 install -m 0755 "$CATS_REPO/target/release/cats-blockd" "$CATS_PREFIX/bin/cats-blockd"
