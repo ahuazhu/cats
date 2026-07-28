@@ -74,16 +74,38 @@ ADR-0001 第 3 条把「接入 Cloud Hypervisor vhost-user-blk」列为 V1 里�
 成本降下来,或 (b) 明确接受"用写吞吐换随机读延迟与 Warm 速度"这个权衡并有对应负载证据;
 外加 (c) 一轮多样本 soak。在此之前 vhost-user 是显式选项。
 
-**2026-07-27 复测:判据 (a) 已满足,默认值仍然不翻。**delta pack 确实把提交成本降下来了
-(真实 S3 上 48 个 dirty chunk 的 FLUSH 1437 → 211 ms),于是按上面这条把六种 fio 负载重跑了一遍
-([原始数据](../../experiments/vhost-user-blk-frontend-20260726/raw/metal-blockpath-fio-rerun.log))。
-(**这一轮的环境有配置失误**:ChunkStore 本地 cache 留在 EBS 上而不是实例本地 NVMe,对象存储也
-换成了 S3,所以**绝对值不能和 2026-07-26 那张表比**,也不能当作产品吞吐引用;下面这个结论靠的是
-同一轮内部的自相矛盾,不依赖绝对值。)
-结果测出来的是**宿主 page cache 而不是前端**:同一条 kernel-nbd 路径同一轮里,4k 随机写 QD32
-是 64419 IOPS / p99 237 µs,1M 顺序写却只有 8.7 MiB/s / p99 851 ms。要做 like-for-like 对比,
-kernel-nbd 必须以 `direct=on` 打开,而节点代理**今天没有这个选项**——这是现在真正的卡点,
-比 (b) 和 (c) 都更靠前。读这边 vhost-user 稳定占优约 1.10×(4k 随机读 QD1 60735 vs 54729)。
+**2026-07-27 全量复测(第二次,环境已对齐):只剩判据 (c) 没做。**
+给 kernel-nbd 补上 `--ch-block-direct` 之后,公平对照终于可做,结果是**单向的**
+([原始数据](../../experiments/vhost-user-blk-frontend-20260726/raw/metal-fio-matrix.log)):
+
+| 负载(i4i,本地 NVMe,median of 2 轮) | kernel-nbd `direct=on` | vhost-user | |
+|---|---|---|---|
+| 4 KiB 随机读 QD1 | 23 479 | **61 994** | 2.6× |
+| 4 KiB 随机写 QD1 | 7 106 | **15 106** | 2.1× |
+| 4 KiB 随机读 QD32 | 121 510 | **216 066** | 1.8× |
+| 4 KiB 随机写 QD32 | 20 277 | **40 650** | 2.0× |
+| 1 MiB 顺序读 | 1 172 MiB/s | **3 606** | 3.1× |
+| 1 MiB 顺序写 | 554 MiB/s | **1 998** | 3.6× |
+
+**六项全胜。**并发上差距更大:10 个并发创建 16 692 → **3874 ms(4.3×)**、10 个并发唤醒
+1129 → **371 ms(3.0×)**,而单个 Cat 的创建/唤醒/挂起两条路用户感觉不出差别
+([`raw/c5-lifecycle-summary.log`](../../experiments/vhost-user-blk-frontend-20260726/raw/c5-lifecycle-summary.log))。
+并发那部分的原因很具体:节点代理为每个 kernel-nbd 启动都要拿一把**全机器共享的 `/dev/nbdN`
+分配锁**,vhost-user 从不需要。
+
+还有一条不是性能的理由:**cats-blockd 死掉而 `/dev/nbdN` 还连着时,任何碰这个设备的进程进入
+不可中断睡眠**——节点代理扛过 SIGKILL、继续占着端口、systemd 无法重启,只能手工 `nbd-client -d`。
+vhost-user 没有内核设备可以变成孤儿。
+
+所以判据 (b)「明确接受权衡」**已经不适用了:没有权衡需要接受**。**唯一剩下的是 (c) 一轮多样本
+soak** —— 现有数据是 fio 2 轮中位数、生命周期 3 次中位数、并发单样本,不够 SLA 级别。在那之前
+默认值保持 `kernel-nbd`。
+
+**上一次(同日早些时候)那轮复测作废**,留作记录:那轮把 ChunkStore 的本地 cache 落在了 EBS
+而不是实例 NVMe,对象存储也换成了 S3,所以绝对值既不能引用也不能和 2026-07-26 的表比
+([原始数据](../../experiments/vhost-user-blk-frontend-20260726/raw/metal-blockpath-fio-rerun.log)
+顶部有警告)。它当时得出的「卡点是节点代理没有 `direct=on` 选项」这个判断是对的,该选项随后
+就加上了(`--ch-block-direct`),上面那组数字就是用它测的。
 
 ## 后续优化的验证结果(2026-07-26)
 

@@ -67,13 +67,26 @@ Cats 相对 Sprites 有**五条结构性优势**（不是参数优化，是架�
 1. **四态 vs 三态。** Sprites 是 Active → Warm（内存冻结）→ Cold（内存丢弃）。
    它**没有** Cats 的 Warm 层——snapshot + VMM/backend exit、专属 RSS = 0、进程状态仍保留。
    Sprites 想省掉常驻 VMM 就必须丢掉进程状态；Cats 能两者兼得。这直接决定休眠密度与成本结构。
-2. **★ VMM 选型：Cloud Hypervisor 是这条路线唯一可行的载体。**
+2. **VMM 选型：Cloud Hypervisor 让自定义块后端走最短的数据通路。**
    **Firecracker 的 vhost-user-blk 自 v1.6.0 起是 developer preview、明确禁止生产，
    且不支持快照**【官】（`docs/api_requests/block-vhost-user.md`）。
-   这意味着所有 Firecracker 系产品——**E2B、Vercel Sandbox、Fly Machines、Fly Sprites**——
-   **结构上无法同时拥有自定义块设备后端和 VM 快照**，只能二选一。
-   Cats 选 Cloud Hypervisor（原生 vhost-user-blk + 快照/恢复）恰好绕开了这个分叉点。
-   这是 ADR-0003/ADR-0004 技术选型最强的一条外部背书，而且**目前没有任何竞品公开讨论过它**。
+   但**这不等于 Firecracker 系产品拿不到"自定义块后端 + VM 快照"**：绕开 vhost-user，
+   用 Linux **ublk** 把用户态后端暴露成一个普通块设备 `/dev/ublkbN`，
+   再按普通 `path_on_host` 走标准 Drive API，Firecracker 看到的只是一个路径，
+   原生快照（`SnapshotType::Diff`）照常工作。
+   **公开反例已经存在**：kvcache-ai/AgentENV（MIT，Rust，自述用于 Kimi K3 的 agentic RL 训练）
+   正是这么做的，两者同时成立——详见 §3.7。
+   所以这一条应当写成**延迟代价**而不是能力缺口：ublk 路径的每个请求要多穿一次宿主内核块层，
+   数据通路上也多一个用户态进程（Firecracker 与 ublk daemon 两个）；
+   Cats 的 vhost-user 把虚拟队列放在共享 Guest 内存里由 `cats-blockd` 直接解码，
+   Cloud Hypervisor 不在数据通路上。
+   > ⚠️ **这是结构推演，不是实测结论。** Cats 与 ublk 路径之间目前**没有任何同机对照数据**。
+   > 可参考的量级只有本仓库同一条 vhost-user 路径上、仅改驱动等待方式（poll → spin）
+   > 就把 QD1 4 KiB p50 从 25 µs 压到 9 µs
+   > （[`raw/notification-cost.log`](../experiments/vhost-user-blk-frontend-20260726/raw/notification-cost.log)），
+   > 即**一次用户态线程唤醒是十几微秒量级，与 QD1 请求总延迟同数量级**；
+   > 但实验报告自己把那组数字标注为无 KVM 开发机上的 **harness 伪影**，不可当作 Guest 可见性能。
+   > **待验证项：同机、同后端、统一驱动等待方式的 QD1 4 KiB fio 对照（vhost-user vs ublk）。**
 3. **Guest 是真未修改 Linux + 真 root。** Sprites 官方自述"We've slid a container between you and
    the kernel"【官】，用户不在 root namespace。Cats 的 Guest 看到标准 virtio-blk 和未修改 ext4，
    拥有完整内核（ADR-0001 不可协商约束）。
@@ -158,7 +171,7 @@ Cats 相对 Sprites 有**五条结构性优势**（不是参数优化，是架�
 |---|---|---|---|
 | 1 | 纯无状态一次性 | Google Cloud Run sandboxes（执行完即弃、靠 tar 搬状态）、Vertex Code Execution、AWS Lambda/Fargate、**Cloudflare（磁盘易失）**、百度 AX、Azure dynamic sessions、AWS AgentCore | **最拥挤**，云厂商全在这 |
 | 2 | 会话内持久、超时即毁 | Modal（≤24h）、Vercel（≤24h⚠️）、Runloop（≤48h）、腾讯 AGSX（≤24h）、火山 veFaaS（≤24h）、阿里 ACS、PPIO（**≤3600s**）、阿里 FC AIO（≤6h）、OpenAI CI（20min 且**不可复活**） | 拥挤；**agent「隔天回来」全部失败** |
-| 3 | 快照休眠、可长期挂起 | E2B（暂停无 TTL）、Together CSB、Blaxel（<25ms）、**Freestyle**、CreateOS、Claude Managed Agents、Devin（自用）、Daytona VM class（experimental） | **2026 的主战场，同质化严重** |
+| 3 | 快照休眠、可长期挂起 | E2B（暂停无 TTL）、Together CSB、Blaxel（<25ms）、**Freestyle**、CreateOS、Claude Managed Agents、Devin（自用）、Daytona VM class（experimental）、**AgentENV**（开源自建，pause/resume 无 TTL；路由靠请求头而非常驻域名，卷不独立，故到不了第 4 级） | **2026 的主战场，同质化严重** |
 | 4 | 盘随实例持久 + 跨主机可迁移 + 常驻入站 URL | **Fly Sprites**（唯一对外售）、**Perplexity SPACE**（不外售）、Northflank（半只脚：内存恢复延迟与跨主机均未公开）、Codespaces（盘持久但无内存快照、≤30 天） | 极稀薄 |
 | 5 | **上述 + 卷生命周期独立于实例** | **Cats（目标形态）** | **空的** |
 
@@ -461,7 +474,8 @@ Daytona 的致命项：**资源天花板仅 4 vCPU / 8 GB / 10 GB disk**；
 
 ### 3.7 不外售的自建者 —— Cats 真正的技术对标
 
-这三家把 Cats 的目标形态做出来了，但都不对外卖。**它们的公开技术资料是 Cats 最好的参照系。**
+这几家把 Cats 的目标形态（或其中的关键部分）做出来了，但都不对外卖。
+**它们的公开技术资料是 Cats 最好的参照系。**
 
 **Perplexity SPACE**（最重要的新变量，架构与 Cats 高度重合）：
 - **Firecracker + btrfs CoW**
@@ -480,8 +494,27 @@ runtime 不单独售，但 **Devin Outposts 同时跑在 E2B 与 Daytona 上**�
 **Cursor**：完全自建。官方文档："Cursor manages VM provisioning, isolation, **snapshots**,
 startup, artifacts, and capacity for every Cloud Agent"。
 
-**这告诉 Cats 两件事**：(1) 目标形态技术上可行且已被三家独立验证；
-(2) **有能力自建的头部客户都会自建**——Cats 的可服务市场不包括 Cursor / Cognition / Perplexity 这一层。
+**★ kvcache-ai / AgentENV**（本节唯一**完全开源**的自建样本，MIT，Rust；
+自述 "powering agentic RL training for **Kimi K3**"）：
+- **Firecracker + ublk，绕开 vhost-user**：overlaybd 分层镜像由一个独立的用户态
+  `uvm-ublk-daemon` 进程服务，经 Linux ublk 驱动暴露成 `/dev/ublkbN`
+  （`storage/ublk/src/dev.rs:383`），再以普通 `path_on_host` 走 Firecracker 标准 Drive API
+  `PUT /drives/{id}`（`src/sandbox/firecracker/instance.rs:315-331`；实际传入的是
+  Firecracker 工作目录下指向该设备的符号链接）。
+- **因此原生快照照常工作**：`SnapshotType::Diff`（`instance.rs:441`）；
+  恢复时把快照内存做成**只读 ublk 设备**当 file-backed memory backend 交给 Firecracker
+  （`instance.rs:517`、`src/sandbox/firecracker/sandbox.rs:1437-1466`），
+  多个同源沙箱共享同一设备以复用页缓存。
+- **这是 §1.2 第 2 条那句"Firecracker 系结构上只能二选一"的直接反例**：
+  自定义块设备后端与 VM 快照在同一套系统里同时成立。代价是数据通路更长——
+  Firecracker 与 ublk daemon 两个用户态进程，外加一次完整的宿主内核块层往返。
+- 另有 E2B 兼容 HTTP API（把 `E2B_API_URL` 指过去即可直接用官方 SDK）。不外售。
+
+**这告诉 Cats 三件事**：(1) 目标形态技术上可行且已被多家独立验证；
+(2) **有能力自建的头部客户都会自建**——Cats 的可服务市场不包括 Cursor / Cognition /
+Perplexity / kvcache-ai 这一层，AgentENV 更是把整套自建实现连同 E2B 兼容层一起开源，
+是 §10.3「客户自建等效成本才是定价天花板」最硬的一个公开样本；
+(3) **"Firecracker 做不到 X"这类能力缺失论断要格外小心**——本文原先就在这里判断错了一次。
 
 ### 3.8 长尾要点
 
@@ -856,7 +889,7 @@ FunctionGraph 每月 100 万次 + 40 万 GB-秒；PPIO 送 20GB 本地 + 60GB �
 | 5 | **可自托管**（Rust workspace + Ports and Adapters + Terraform） | ADR-0005、ADR-0012 | Sprites 承诺未交付；Daytona 2026-06 闭源；Modal/Vercel/Cloudflare 全无 |
 | 6 | **按脏页计费的天然基础**（只提交 dirty logical chunk） | ADR-0003；实验：100GiB/10 万文件 → 仅 521 个 1MiB chunk、475MiB 对象数据 | 业界刚开始讨论 `cost ∝ 基线 + 脏页`（cortex.io 2026-07-23），Cats 的引擎天生支持 |
 | 7 | **跨节点恢复是架构原生** | 已测空缓存跨节点冷恢复 | Fly Machines 的 Volume 是单机 NVMe 切片；Sprites 单区域 |
-| 8 | **★ VMM 选型让"自定义块后端 + 快照"同时成立** | Cloud Hypervisor 原生 vhost-user-blk + 快照/恢复；v53.0 已有 postcopy+UFFD、自动推进 guest clock | **Firecracker 的 vhost-user-blk 自 v1.6.0 起是 developer preview、禁止生产、且不支持快照**【官】→ E2B / Vercel / Fly Machines / Fly Sprites **结构上只能二选一**。gVisor 路线（Modal）更进一步：**不能 mount ext4 等块设备文件系统**【官】 |
+| 8 | **VMM 选型让自定义块后端走最短数据通路**（⚠️ 未实测，见下） | Cloud Hypervisor 原生 vhost-user-blk + 快照/恢复，虚拟队列在共享 Guest 内存里由 `cats-blockd` 直接解码，CH 不在数据通路上；v53.0 已有 postcopy+UFFD、自动推进 guest clock | **Firecracker 的 vhost-user-blk 自 v1.6.0 起是 developer preview、禁止生产、且不支持快照**【官】，但 Firecracker 系可用 **ublk** 绕开并保住原生快照（AgentENV 已公开做到，§3.7）→ 这**不是能力缺口，只是延迟代价**：ublk 路径多一个用户态进程 + 一次宿主内核块层往返。⚠️ **无同机对照实测，属结构推演**（§1.2 第 2 条）。gVisor 路线（Modal）更进一步：**不能 mount ext4 等块设备文件系统**【官】 |
 | 9 | **难点排序上占住了最贵的两格** | `blockd/` 的 lease/fencing epoch + stale epoch fail-closed + 4 个提交窗口 kill -9 崩溃注入 + 空缓存跨节点冷恢复 | 跨 host 恢复正确性与单写保护是自建者唯一真正做不好的两件事（§10.1）；**无任何竞品公开过等价的正确性证据** |
 | 10 | **★ PersistentDisk：生命周期独立于 Cat 的真块设备** | `cats disk` + `cats mount/unmount` 已实现；`DiskKind::Persistent`、`DiskState::Available`、`bound_cat_id`；计费按 provisioned GiB-month 且是否挂载不影响 | **Sprites 完全没有这个原语**（§5.1）；市场上多数"卷"是 FUSE 挂对象存储、POSIX 语义降级；Fly Machines 的卷是真块设备但绑死单机。**"真块设备 + 跨主机可迁移"两项同时成立的目前只有 Cats** |
 
@@ -865,7 +898,7 @@ FunctionGraph 每月 100 万次 + 40 万 GB-秒；PPIO 送 20GB 本地 + 60GB �
 | # | 差距 | 现状 | 对标 |
 |---|---|---|---|
 | 1 | **空缓存跨节点恢复路径未产品化** | ⚠️ 注意区分两条路径：**优化 Cold = 1.755 s**（i4i Local NVMe，新内核新进程，5 轮 P50）**已与 Sprites 持平**；**Direct-S3 原型 = 39.868 s**（S3、无初始 Cache、串行 Python，S3 GET 累计 18.91 s）是**另一个测量边界**，官方标注为"仅验证语义"。缺口是**两者尚未合并**——生产 Rust blockd + 本地热 cache 的组合数字不存在 | Sprites 的 Cold 1-2s **同样是热本地 cache 口径**（sparse 100GB NVMe 做 dm-cache-like read-through），**它从未公开空缓存跨节点恢复的等价数字**。Perplexity SPACE create P90 89ms（btrfs CoW + 高频 disk snapshot） |
-| 2 | **原生 vhost-user-blk 未实现** | Phase A 走内核 NBD（正确性等价，性能里程碑未达）。参考量级：SPDK vhost-user-blk 是内核 vhost-scsi 的 **2.34×** IOPS；ublk ≈ qemu-nbd 的 **2×** —— 内核 NBD 是最慢一档 | ⚠️ **但这不是竞争劣势**：Firecracker 系竞品连"vhost-user-blk + 快照"都不能同时拥有（§8.1 第 8 条）。这是 Cats 相对自己的性能债，不是相对对手的功能差距 |
+| 2 | **原生 vhost-user-blk 未实现** | Phase A 走内核 NBD（正确性等价，性能里程碑未达）。参考量级：SPDK vhost-user-blk 是内核 vhost-scsi 的 **2.34×** IOPS；ublk ≈ qemu-nbd 的 **2×** —— 内核 NBD 是最慢一档 | ⚠️ Firecracker 系竞品虽然用不了 vhost-user-blk，但可用 **ublk** 拿到同等能力（§8.1 第 8 条、§3.7），只是数据通路更长。所以这主要是 Cats 相对自己的性能债，相对对手则是一个**尚未测量**的延迟差 |
 | 3 | **跨 Node Guest overlay 未实现** | per-Cat `/30` tap 与 owning-node HTTP 入站已实现 | — |
 | 4 | **无 fork/branch** | 未实现 | Sprites 也没公开（仅内部 admin ~90s）；**Daytona VM class 是唯一对外交付含内存 fork**；Morph 宣称 <250ms |
 | 5 | **无预装镜像生态** | — | Sprites 预装 Node/Python/Go/Rust/Claude/Gemini/Codex 开箱即用 |
@@ -1141,11 +1174,14 @@ S3 首字节 100–200ms，200 个 1 MiB GET 若不并发发出且无中间层�
    量化收益参考：SPDK vhost-user-blk 同限 1 核 4K 随机读 QD64 达 **833.55k IOPS / 152.99µs**，
    是内核 vhost-scsi 的 **2.34×**；ublk-qcow2 约为 qemu-nbd 的 **2× IOPS**
    ——**内核 NBD 是三者中最慢的一档**。
-4. **把 Warm 层与 Cloud Hypervisor 选型一起做成对外叙事。**
-   「零 VMM 驻留 + 保进程状态 + 0.382s 唤醒」是 Sprites 结构上做不到的；
-   而 **Firecracker 系产品结构上无法同时拥有自定义块后端和快照**（§1.2 第 2 条）。
-   这两条目前都只写在 ADR 与内部文档里，**没有任何对外表达**，
-   而它们恰好是最难被竞品追平的部分。
+4. **把 Warm 层做成对外叙事；块通路那条先补测再讲。**
+   「零 VMM 驻留 + 保进程状态 + 0.382s 唤醒」是 Sprites 结构上做不到的，**且已有实测**。
+   块通路那条要降级表述：Firecracker 系可以用 ublk 绕开 vhost-user 禁令并保住原生快照
+   （AgentENV 已公开做到，§1.2 第 2 条、§3.7），Cats 剩下的是**少一个用户态进程、
+   少一次宿主内核块层往返**这个延迟差。
+   ⚠️ **这个差目前没有任何同机对照数据**，对外讲之前必须先补测
+   （同机、同后端、统一驱动等待方式的 QD1 4 KiB fio 对照）。
+   两条目前都只写在 ADR 与内部文档里，**没有任何对外表达**。
 5. **评估 Cloud Hypervisor v53.0（2026-07-12）的升级收益。**
    新增 **offload snapshot daemon、postcopy + UFFD 按需分页、自动推进 guest clock、mTLS 迁移**
    ——其中"自动推进 guest clock"直接对应跨 host 恢复的墙钟难题（难点 1 的一个子项），
@@ -1235,7 +1271,7 @@ Daytona 2026-06 闭源后 E2B 立刻借势营销"唯一严肃的开源沙箱"—
 | **kubernetes-sigs/agent-sandbox 的 deep hibernation** | K8s 官方进入第四派 | roadmap，v0.x |
 | **Vercel 24h vs 5h 的真实上限** | 官方文档自相矛盾 | 需实测 |
 | **国内备案对"每沙箱一个公网 URL"的实际口径** | Cats 国内落地的最大不确定项 | 各家文档均未提及，需向通管局与云商核实 |
-| **Firecracker diff 快照是否转正** | 若转正 + vhost-user-blk 解禁，Cats 的 VMM 选型优势（§8.1 第 8 条）会被削弱 | diff 快照仍 developer preview；vhost-user-blk 仍禁止生产且不支持快照 |
+| **Firecracker diff 快照是否转正** | 若转正 + vhost-user-blk 解禁，Firecracker 系连 ublk 绕道都不用走，Cats 仅剩的那点数据通路优势（§8.1 第 8 条）会被彻底抹平 | diff 快照仍 developer preview；vhost-user-blk 仍禁止生产且不支持快照。注意**绕道现在就存在**：ublk 路径已被 AgentENV 公开验证（§3.7） |
 | **Cloud Hypervisor 的快照跨版本兼容** | 决定 Warm 态能否跨 Node 升级存活（现在必须先降 Cold） | v53.0 仍"不支持跨版本" |
 | **Kata 4.0.0（Go→Rust 全量重写）的冷启动数字** | 若 Kata + CH 组合能给出接近数字，会降低自建门槛 | 2026-07-20 发布，冷启动数字未公开 |
 
@@ -1252,6 +1288,12 @@ Daytona 2026-06 闭源后 E2B 立刻借势营销"唯一严肃的开源沙箱"—
   与环境限制见[实验总报告](experiments-2026-07-21-storage-lifecycle.md) §2、§3、§12。
 - **竞品的休眠/唤醒数字多为厂商自报，测量边界不可比。** 少数有第三方实测的已标注【三】。
   同一 harness 的横向对比只有 ComputeSDK 一处（Vercel vs Daytona），且两者隔离等级不同。
+- **★ Cats 的块通路优势（§1.2 第 2 条、§8.1 第 8 条）是结构推演，不是测量结论。**
+  vhost-user 与 Firecracker 系走的 ublk 绕道之间**没有任何同机对照数据**；
+  本文只能确认通路上的进程数与内核块层往返次数不同，无法给出延迟差的量值。
+  引用的 25 µs → 9 µs（poll → spin）来自无 KVM 开发机上的 harness，
+  实验报告自己标注为**伪影**，只能用作"一次用户态线程唤醒是十几微秒量级"的量级参考。
+  **补测方案：同机、同后端、统一驱动等待方式的 QD1 4 KiB fio 对照。**
 - **本文的定价换算已逐处标注。** 华为 CCI 单价为从官方计费样例反解；
   Daytona 与 Sprites 的部分单价来自第三方，官方页 JS 渲染未能一手核实。
 - **§10.3 的 S3 成本计算有两处降级**：AWS 官方 S3 与 EBS 价格表为 JS 渲染无法抓取，

@@ -33,9 +33,16 @@
    把它关掉,同一条 NBD 路径就比 vhost-user 慢。详见 [根因](#写路径根因flush-bound不是前端)。
 5. **协议级验收 10/10**,外加真实二进制的双前端集成测试;QEMU/TCG 下真实 Linux 6.1 内核的
    `virtio_blk` + 真实 ext4 也全通过,含删掉本地缓存后重新 attach 仍 fsck clean、四个 sha256 一致。
-6. **默认值仍是 `kernel-nbd`。** 理由不再是"没验过",而是第 4 条那个按当前部署形态的写吞吐
-   权衡:在 delta pack(Direct-S3 设计 P4)落地把提交成本降下来之前,不建议把带缓冲的
-   NBD 路径换成 vhost-user 作为默认。翻转默认值的判据写在 [ADR-0015](../../docs/decisions/0015-vhost-user-blk-production-block-frontend.md)。
+6. **默认值仍是 `kernel-nbd`,但理由已经只剩一条了(2026-07-27 更新)。** delta pack 落地后重做了
+   公平对照(给 kernel-nbd 加了 `--ch-block-direct` 关掉宿主缓存):**vhost-user 六项 fio 全胜,
+   1.8×–3.6×**;**并发创建 4.3×、并发唤醒 3.0×**;单个 Cat 用户感觉不出差别。再加上「blockd 死掉
+   后孤儿 `/dev/nbdN` 会让节点代理变成不可杀进程」这个健壮性缺陷 —— 证据是单向的。
+   [ADR-0015](../../docs/decisions/0015-vhost-user-blk-production-block-frontend.md) 的三条判据里
+   只剩 **(c) 一轮多样本 soak** 没做。见[全量复测](#全量复测环境对齐后的完整结果2026-07-27)。
+7. **存储侧四项优化全部落地并实测**:delta pack、golden root、上传并发、读路径并发。GC 与 TRIM
+   首次在真机上验证确实回收空间(一个卷 575 → 186 MiB)。真机验收 **23/23 全绿**(历史首次)。
+8. **本地 NVMe 不是可选项。** 同一套代码在 c5.metal(纯 EBS)上,绕开宿主缓存后 Guest 的 4 KiB
+   随机写只有 514–946 IOPS,i4i(本地 NVMe)是 7 106–40 650,**差 14–43 倍**。
 
 ## 环境与测量边界
 
@@ -51,6 +58,14 @@
   文件跑 `--direct=1`,单 job,每点 10 s(2 s ramp)。fio 两轮(`-r2` 后缀)。
 - 环境摘要 [`raw/metal-environment.txt`](raw/metal-environment.txt);实例、RDS、S3 桶、
   IAM 角色、key pair 与安全组在跑完后全部销毁。
+
+**2026-07-27 全量复测追加了第二台机器**,用来回答「本地高速盘值多少」:
+
+- **c5.metal**,96 vCPU / 188 GiB,**没有实例存储** —— ChunkStore 的本地 cache 与 file 对象存储
+  都在 EBS gp3 根卷(6000 IOPS / 500 MB/s)。这就是"普通裸金属"的形态。
+- i4i 那一侧这次把 `/var/lib/cats` 明确挂在实例 NVMe 上,并且 `install.sh` 现在**自己挂**,
+  不再依赖操作者记得 —— 上一次正是因为漏挂,写数字低了 40 倍才被发现。
+- 两台机器跑同一套脚本,同一套对象存储选项(本地 file 与真实 S3 各一遍)。
 
 ### 本机容器(前端传输成本,次要证据)
 
@@ -687,85 +702,277 @@ ADR-0016 把「冷读放大」列为 delta pack 的主要代价(满链一个 chu
 
 同一轮的验收:`metal e2e: 22 passed, 1 failed`,仍是那条 golden rootfs 里没有 `git` 的陈旧断言。
 
-## 默认块路径的 fio 复测:不翻,而且卡点变了(2026-07-27 追加)
+## 全量复测:环境对齐后的完整结果(2026-07-27)
 
-[ADR-0015](../../docs/decisions/0015-vhost-user-blk-production-block-frontend.md) 把翻转默认值的
-判据 (a) 定为「delta pack 落地并把提交成本降下来」。**这条已经满足**(真实 S3 上 48 个 dirty chunk
-的 FLUSH 从 1437 ms 降到 211 ms)。当初那组「带缓冲的 NBD 在写上更快」的对比是在 flush-bound 的
-引擎上量的,前提没了,所以重量了一遍。原始数据
-[`raw/metal-blockpath-fio-rerun.log`](raw/metal-blockpath-fio-rerun.log)(i4i.metal + 真 KVM +
-真实 S3,fio 已经打进 golden image,单样本)。
+前一次块路径复测的环境配错了(ChunkStore 本地 cache 留在 EBS 而不是实例 NVMe),那一轮的绝对值
+作废,原始日志 [`raw/metal-blockpath-fio-rerun.log`](raw/metal-blockpath-fio-rerun.log) 顶部标了
+警告保留作为记录。这一节是**在文档记录的环境上重做**的全套结果。
 
-> ⚠️ **这一轮的环境配错了,绝对值不可用,也不能和上面 2026-07-26 那张 fio 表对比。**
-> ChunkStore 的本地 cache 留在了 EBS gp3 根卷上,而 2026-07-26 那轮把它挂在**实例本地 NVMe**
-> 上(`/dev/nvme0n1` → `/var/lib/cats`),对象存储也是那块 NVMe 上的 file adapter 而不是 S3。
-> 两处叠加,导致下面 4 KiB 随机写 QD32 只有 602 次/秒,而 2026-07-26 同一个负载是
-> 23379–33000 次/秒。**别把这里的绝对值当成产品的吞吐引用。**
-> 下面那个「默认值不翻」的结论仍然成立,因为它靠的是**同一轮内部自相矛盾**而不是任何绝对值;
-> 但这一轮要在文档记录的环境上重跑,数字才有意义。
+### 方法与前提
 
-**结论:默认值不翻。**理由不是 delta pack 没效果,而是这组数字**测的是宿主 page cache 不是前端**
-——同一条路径同一轮里自相矛盾:
+- **i4i.metal**:`/var/lib/cats` 挂在实例本地 NVMe(`/dev/nvme8n1`,ext4)。`install.sh` 现在
+  自己挂,不再靠人记得。
+- **c5.metal**:**没有实例存储**,cache 与 file 对象存储都在 EBS gp3(6000 IOPS / 500 MB/s)。
+  这就是"普通裸金属"的形态,也是这次要对比的东西。
+- `metal-rebench.sh` **开跑前先过环境闸**(cache 必须在本地 NVMe、要有 KVM 与 cloud-hypervisor),
+  不满足直接拒绝启动;c5 那轮显式加 `CATS_REBENCH_ALLOW_ANY_CACHE=1` 覆盖并在日志里留 NOTE。
+- fio 已打进 golden image,不再依赖 Guest 能连上 apt 源。
+- `verify-rebench.sh` **数数据行而不是数阶段标题**,跑完必须打印 `COMPLETE` 才允许销毁机器。
+  这一轮之前有三次「阶段显示完成、实际零数据」,原因各不相同(Guest 没装 fio、CATS_TOKEN 静默为空、
+  install.sh 留下 root 拥有的 cargo 目录),都已在脚本里修掉。
 
-| kernel-nbd | 结果 | p99 |
+### Guest 可见 fio(i4i,本地 NVMe,median of 2 轮)
+
+**公平对照是中间那列**(kernel-nbd 关掉宿主 page cache)。左列是今天的默认形态,它的写数字里含
+一层易失缓存。
+
+| 负载 | kernel-nbd 缓冲(默认) | kernel-nbd `direct=on` | vhost-user | 公平对照倍数 |
+|---|---|---|---|---|
+| 4 KiB 随机读 QD1 | 46 600 | 23 479 | **61 994** | **2.6×** |
+| 4 KiB 随机写 QD1 | 7 251 | 7 106 | **15 106** | **2.1×** |
+| 4 KiB 随机读 QD32 | 326 216 | 121 510 | **216 066** | **1.8×** |
+| 4 KiB 随机写 QD32 | 163 577 | 20 277 | **40 650** | **2.0×** |
+| 1 MiB 顺序读 | 4 781 MiB/s | 1 172 | **3 606** | **3.1×** |
+| 1 MiB 顺序写 | 2 128 MiB/s | 554 | **1 998** | **3.6×** |
+
+**公平对照下 vhost-user 六项全胜,1.8×–3.6×。** 带缓冲的 kernel-nbd 在 QD32 和顺序负载上数字更
+漂亮,但那是宿主内存先 ack 了尚未持久的写。
+
+原始数据 [`raw/metal-fio-matrix.log`](raw/metal-fio-matrix.log)(3 配置 × 2 轮 × 6 负载 = 36 行,
+无空行)。
+
+### 换成真实 S3,结论不变(i4i,median of 2 轮)
+
+| 负载 | kernel-nbd `direct=on` | vhost-user | |
+|---|---|---|---|
+| 4 KiB 随机读 QD1 | 23 558 | **65 666** | 2.8× |
+| 4 KiB 随机读 QD32 | 123 400 | **258 130** | 2.1× |
+| 4 KiB 随机写 QD1 | 11 209 | 11 330 | 持平 |
+| 4 KiB 随机写 QD32 | 19 585 | 21 632 | 持平 |
+| 1 MiB 顺序读 | 1 579 MiB/s | **3 684** | 2.3× |
+| 1 MiB 顺序写 | 514 MiB/s | **1 837** | 3.6× |
+
+读上 vhost-user 仍然 2–3×,写在 S3 后端下两条路被后端拉平。原始数据
+[`raw/metal-fio-s3.log`](raw/metal-fio-s3.log)。
+
+### c5.metal(EBS,无本地盘):写会塌
+
+| 负载 | kernel-nbd 缓冲 | kernel-nbd `direct=on` | vhost-user |
+|---|---|---|---|
+| 4 KiB 随机读 QD1 | 46 159 | 22 150 | **61 393** |
+| 4 KiB 随机写 QD1 | 8 118 | **514** | **757** |
+| 4 KiB 随机写 QD32 | 127 962 | **556** | **946** |
+| 1 MiB 顺序读 | 2 222 MiB/s | 1 745 | **3 600** |
+| 1 MiB 顺序写 | 1 352 MiB/s | 434 | **1 366** |
+
+读和 i4i 基本一致(读走 cache,和底层盘关系不大),**写塌得很厉害**:绕开宿主缓存后
+4 KiB 随机写只有 514–946 IOPS,而 i4i 上是 7 106–40 650,差 **14–43 倍**。带缓冲那一列看起来
+没事(127 962 IOPS),但那是 188 GiB 内存在替 EBS 挡着。
+
+**结论:Guest 的直写性能由本地盘决定,而不是由块路径决定。** 要跑写密集负载,本地 NVMe 不是
+可选项。
+
+### 存储层:机器 × 后端的四宫格
+
+同一套 `commit_cost` / `golden_root_cost`,只换机器和对象存储:
+
+| 48 chunk 提交 | i4i 本地 NVMe | i4i 真实 S3 | c5 本地 EBS | c5 真实 S3 |
+|---|---|---|---|---|
+| 密集写 192 MiB | 2947 ms | 1437 ms | **578 ms** | 891 ms |
+| 只发脏页 3 MiB(delta pack) | **48 ms** | 221 ms | 71 ms | 333 ms |
+| 冷读 64 MiB(一次读完) | **55 ms** | 168 ms | 82 ms | 215 ms |
+
+- **小提交和冷读:i4i 明显更好**(冷读 55 vs 82 ms,小提交 48 vs 71 ms),符合预期。
+- **大写反常:i4i 本地 NVMe 是四者中最慢的**,甚至比它自己打 S3 还慢 2×。见下面「未解决的异常」。
+- **S3 对小提交的代价是 4.6×**(48 → 221 ms),对冷读是 3×(55 → 168 ms);对大写反而更快,
+  因为并发上传把往返摊平了而本地路径卡在别处。
+
+### 未解决的异常:i4i 的大写只用到设备能力的 1/36
+
+i4i 的密集提交是 15.35 ms/发布 MiB(约 65 MB/s),c5 的 EBS 是 3.01(约 332 MB/s)。查证过程:
+
+- **不是首次写惩罚**:预热设备后重测,2945.5 → 2950.5 ms,四次独立测量差 0.2% 以内
+  ([`raw/i4i-prewarm.log`](raw/i4i-prewarm.log))。
+- **不是硬件**:设备级同样的 pattern(4 MiB 写 + 每次 fdatasync + 16 深),i4i 实例盘
+  **2375 MiB/s**,c5 的 EBS **137 MiB/s** —— i4i 的盘快 **17 倍**。
+- **也不是 Guest 直写路径**:上面 fio 那张表里,i4i 的 4 KiB 直写比 c5 快 14–43 倍。
+
+所以**瓶颈在 ChunkStore 的提交路径里,只在这台机器上显现,而且离设备能力有 36 倍余量**。
+具体在哪(pack 文件落盘、屏障内拷贝、还是别的)没有定位,不猜。列为待办第一项。
+
+### Cat 生命周期延迟(c5.metal,两条块路径)
+
+原始数据 [`raw/c5-lifecycle.log`](raw/c5-lifecycle.log)、
+[`raw/c5-lifecycle-summary.log`](raw/c5-lifecycle-summary.log)。median of 3,ms。节点上第一个
+create 会顺带发布一次镜像(5.9–6.2 s),不计入中位数。
+
+| 操作 | kernel-nbd | vhost-user |
 |---|---|---|
-| 4k 随机写 QD32 | 64419 IOPS(251 MiB/s) | 237 µs |
-| 1M 顺序写 | **8.7 MiB/s** | **851 ms** |
+| 冷创建 | 1681 | 1827 |
+| warm(快照 + 退出 VMM) | 465 | 464 |
+| restore(从快照恢复) | 163 | 163 |
+| suspend / resume | 162 / 163 | 163 / 162 |
+| stop / cold start | 163 / 1674 | 162 / 1674 |
 
-同一个设备。前者装得进宿主 page cache,后者持续到必须回写,于是塌了 29 倍、p99 逼近一秒。
-vhost-user 没有这层缓存,数字自洽(4k 随机写 2.4 MiB/s、1M 顺序写 273 MiB/s——顺序 1 MiB 写产生
-密集 chunk,提交起来划算;4 KiB 随机写不是)。
+**单个 Cat 两条路用户感觉不出差别。**创建和冷启动同为约 1.7 秒 —— golden root 之后两者都只是在
+启动一台 VM,存储不再是成本。restore 比 warm 便宜 3 倍,存快照才是贵的那一半。
 
-读这边混淆小一些,vhost-user 占优:4k 随机读 QD1 **60735 vs 54729**、QD32 **215097 vs 194971**
-(都约 1.10×),各分位延迟都更低;1M 顺序读 kernel-nbd 2977 vs 2533 MiB/s——还是 page cache。
+**但节点内部不是这样。**warm restore 的分阶段遥测(µs,各 3 个样本的均值):
 
-**真正的卡点**:要做 like-for-like 对比,kernel-nbd 必须以 `direct=on` 打开,而节点代理今天**没有
-这个选项**(PR #8 那次是手工改的)。加上 ADR-0015 还要求一轮多样本 soak,而这里单样本的 p99 跨了
-三个数量级(237 µs 到 2.4 s),单样本定不了。
+| | 总计 | blockd 启动 | **挂盘** | api ready | resume | guest health |
+|---|---|---|---|---|---|---|
+| kernel-nbd | 92 336 | 11 013 | **35 556** | 41 831 | 1416 | 2051 |
+| vhost-user | **37 816** | 11 246 | **4** | 23 380 | 1396 | 1395 |
 
-所以默认值继续是 `kernel-nbd`,但理由换了第三个:不是「没验过」,也不是「已知权衡」,而是
-**「能定这件事的那个测量,需要一个还不存在的 `direct=on` 开关」**。
+内部总计 **2.4×**,挂盘从 35.6 ms(占整个恢复的 **38%**)降到 **4 µs**。用户看到的 163 ms 两条路
+一样,只是因为上面压着约 125 ms 的控制面往返,把差别盖住了。
+
+### 并发才是分水岭(c5.metal,min / p50 / max ms,全部 0 失败)
+
+| 10 个并发 | kernel-nbd | vhost-user | |
+|---|---|---|---|
+| create | 1823 / 8236 / **16 692** | 1822 / 3873 / **3874** | **4.3×** |
+| restore | 207 / 642 / **1129** | 218 / 235 / **371** | **3.0×** |
+| warm | 6051 / 14 260 / 14 713 | 6218 / 14 085 / 14 394 | 持平 |
+
+4 个并发的中间点:create 6670 vs 3665 ms,restore 467 vs 182 ms。
+
+vhost-user 的 p50 在 10 并发下几乎没离开单个 Cat 的水平(3873 vs 1828),kernel-nbd 涨到 8236
+还拖出 16.7 秒的尾巴 —— 这就是那把**全机器共享的 `/dev/nbdN` 分配锁**,节点代理为每个 kernel-nbd
+启动都要拿,vhost-user 从不需要。之前只能从代码上推断,现在量出来了。warm 两条路一样,合理:
+写快照不是块路径的活。
+
+### GC 与 TRIM 在真机上确实回收空间
+
+原始数据 [`raw/metal-reclaim.log`](raw/metal-reclaim.log)。Guest 用 O_DIRECT 反复重写同一个
+128 MiB 文件三遍,每遍都让上一遍的对象变得不可达:
+
+| | 对象数 | 卷占用 |
+|---|---|---|
+| 创建后 | 36 | 61 MiB |
+| 重写三遍后 | 149 | 454 MiB |
+| `rm` + `fstrim`(报告 trim 了 3.5 GiB) | 152 | 454 MiB |
+| GC 之前 | 188 | 575 MiB |
+| **GC 之后** | **56** | **186 MiB** |
+
+删掉 133 个数据对象 + 25 个 map 节点,**回收 389 MiB(3.1×)**。改之前这些会伴随卷的整个生命周期。
+
+两个要点:`fstrim` 那一行对象数**没有下降是对的** —— TRIM 把 map 项变成空洞让旧对象不可达,
+删除是 GC 的活;而 `images/` 的 104 个文件**一个没动**,共享 golden root 被这个卷引用着必须活下来
+(单测 `gc_never_deletes_a_shared_image_even_though_the_volume_references_it` 断言的正是这条)。
+
+### 验收:23 passed / 0 failed(历史首次全绿)
+
+[`raw/metal-final-e2e.log`](raw/metal-final-e2e.log)。此前每一轮都是 22/1,那条一直失败的
+「guest includes apt, curl and git」**是检查本身写错了**:它用一次 `command -v` 问 dash 三个工具,
+而 dash 只解析第一个操作数,所以从来没检查过 curl 和 git。镜像一直是全的。
+
+### 并发创建:后端已经不影响它了
+
+| 10 个并发冷创建 | 墙钟 | 失败 |
+|---|---|---|
+| 复制 rootfs + 串行 reconcile | 121 448 ms | 4 |
+| golden root + 串行 reconcile | 61 637 ms | 0 |
+| golden root + 并发 reconcile(本地存储) | 8328 ms | 0 |
+| golden root + 并发 reconcile(**真实 S3**) | **8146 ms** | 0 |
+
+S3 与本地相差 2%——golden root 之后创建不上传任何数据,对象存储在这条路径上已经不重要了。
+
+### 一个健壮性缺陷:孤儿 nbd 设备会让节点代理变成不可杀进程
+
+不是测量,是恢复这轮故障时观察到的,但值得记:**cats-blockd 死掉而它的 `/dev/nbdN` 还连着时,
+任何碰这个设备的进程进入不可中断睡眠**。节点代理扛过了 SIGKILL、继续占着 7301 端口,systemd
+无法重启它,后续每个阶段全部失败,直到手工 `nbd-client -d` 才恢复。**vhost-user 没有内核设备可以
+变成孤儿。**
+
+### 这些数据对「默认块路径」这个决定意味着什么
+
+[ADR-0015](../../docs/decisions/0015-vhost-user-blk-production-block-frontend.md) 的三条判据:
+
+- **(a) delta pack 落地并把提交成本降下来** —— ✅ 满足(真实 S3 上 48 chunk 的 FLUSH 1437 → 211 ms)。
+- **(b) 明确接受权衡并有负载证据** —— 现在**不需要"接受权衡"了**:公平对照下 vhost-user 六项全胜
+  (1.8×–3.6×),并发创建 4.3×、并发唤醒 3.0×,单个 Cat 用户感觉不出差别,再加上孤儿 nbd 设备
+  那个健壮性缺陷。**证据是单向的。**
+- **(c) 一轮多样本 soak** —— ❌ **仍未做**。fio 是 2 轮中位数、生命周期是 3 次中位数、并发是单样本,
+  都不构成 SLA 级别的证据。
+
+**所以默认值仍然不翻,但卡点只剩 (c) 一条了**,而且是个明确的、可执行的任务,不再是"需要一个还
+不存在的开关"。`--ch-block-direct` 已经加上,公平对照随时可复现。
 
 ## 仍未验证 / 后续项
 
-1. ~~读路径也要并发~~:**已做**,一次读完整卷从 840 ms 降到 155 ms(412 MiB/s),见上一节。
-2. ~~减少每次提交的对象数~~:**评估后不做**,理由与数字见
-   [ADR-0016](../../docs/decisions/0016-delta-pack-page-granular-commits.md)「关于打包成一个对象」。
-3. ~~delta 链的冷读放大~~:**已量**,满链只贵 11%,见上一节。
-4. **给 kernel-nbd 路径加一个 `direct=on` 选项**——不加,默认值就没法判。fio 已经重跑了
-   (见下一节),结论是**默认值不翻**,而且卡点很具体:节点代理今天没有办法让 CH 以 `direct=on`
-   打开 `/dev/nbdN`,所以每一行写的数据量的都是宿主 page cache,不是前端。
-5. **单个 create 的 4.5–6.9 秒**:并发拉起解决之后,这就是下一个天花板,成分是 VM 启动
-   与 guest agent 就绪,不再是存储或排队。
-6. ~~没有任何东西调度 GC~~:**已做**,服务期间按 `--gc-interval-ms` 定时跑(默认 10 分钟)。
-   仍然**没有工具能找出「没有卷再引用」的镜像**,镜像回收还是运营方手动操作。
-7. ~~TRIM 不回收对象~~:**已做**,整块覆盖的 chunk 变成 Hole,旧对象随即被 GC 收走(协议 §7.2)。
-8. **多队列在真实 vCPU 数下的收益曲线**:本次只验了 1 和 4 两个点,而且已知队列多不等于更快。
-9. **长时间 soak 与多 Cat 同机压力**:本次每个场景都是单样本,不构成 SLA。这一条同时卡着第 4 项。
-10. **`nbd` 内核模块依赖的移除**:`install.sh` 仍无条件 `modprobe nbd`,以便随时切回默认路径。
-11. **镜像预发布**:并发发布之后 512 MiB 只要 1.2 s,这一项的必要性大幅下降。
-12. **并发拉起的天花板应该由实测饱和点决定**,而不是沿用 wake 的那个常量。
-13. **一次未定位的偶发**:早期一轮 10 并发里有一个 Guest 的 vsock 健康检查失败(9/10),
-    后续几轮没复现,记为「见过一次」。
+按证据强弱排。删除线的是本轮已经做掉或已经决定不做的。
+
+1. **i4i 上的大写只用到设备能力的 1/36**(65 MB/s,设备本身 2375 MiB/s)。已排除首次写惩罚
+   与硬件,也排除了 Guest 直写路径 —— 瓶颈在 ChunkStore 的提交路径里,只在该机型显现,未定位。
+   **余量最大的一项。**
+2. **一轮多样本 soak**:ADR-0015 翻转默认块路径**唯一剩下**的判据。现有数据是 fio 2 轮中位数、
+   生命周期 3 次中位数、并发单样本,都不够 SLA 级别。
+3. **单个 Cat 创建/冷启动的约 1.7 秒**:并发问题解决之后的下一个天花板,成分是 VM 启动与
+   guest agent 就绪,已经不是存储也不是排队。
+4. **没有工具能找出「没有卷再引用」的镜像**:GC 现在会定时跑,但镜像本身的回收仍是运营方
+   手动操作,而且没有工具告诉他们哪些可以删。
+5. **多队列在真实 vCPU 数下的收益曲线**:只验了 1 和 4 两个点,且已知队列多不等于更快。
+6. **`nbd` 内核模块依赖的移除**:`install.sh` 仍无条件 `modprobe nbd`,以便随时切回默认路径。
+   注意孤儿设备那个健壮性缺陷正来自这里。
+7. **并发拉起的天花板应该由实测饱和点决定**,而不是沿用 wake 的那个常量。
+8. **一次未定位的偶发**:早期一轮 10 并发里有一个 Guest 的 vsock 健康检查失败(9/10),
+   后续几轮没复现,记为「见过一次」。
+9. **`cats exec` 的超时在 Guest 侧不被强制执行**:`timeout_ms` 现在决定工作租约与传输超时,
+   但 Guest agent 忽略它,失控的命令会一直跑到 Cat 停掉为止。
+
+已做掉:~~读路径并发~~(一次读完整卷 840 → 155 ms)、~~delta 链冷读放大~~(满链只贵 11%)、
+~~给 kernel-nbd 加 `direct=on`~~(`--ch-block-direct`)、~~GC 没人调度~~(`--gc-interval-ms`,
+默认 10 分钟)、~~TRIM 不回收对象~~(协议 §7.2)、~~镜像预发布~~(并发发布后 512 MiB 只要 1.2 s,
+必要性消失)。
+
+评估后决定不做:~~把多个 chunk 的 delta 打包成一个对象~~ —— 往返重叠之后只值约 1.4×,却要引入
+Compactor、BlobStore range read 和一条不变量的丢失,理由与数字见
+[ADR-0016](../../docs/decisions/0016-delta-pack-page-granular-commits.md)。
 
 ## 复现
 
-真机部分:在 `i4i.metal` 上 `sudo deploy/metal/install.sh`,把 `/etc/cats/cats.env` 的
-`CATS_BLOCK_PATH_ARGS` 在空(kernel-nbd)与 `--ch-block-path vhost-user --ch-vhost-user-queues 4`
-之间切换,每次 `systemctl restart cats-noded` 后跑 `deploy/metal/e2e.sh` 与
-`experiments/vhost-user-blk-frontend-20260726/metal-guest-fio.sh <label>`。
+**全量复测(2026-07-27 的那一套)**,在一台 `i4i.metal` 上:
 
-本机部分:
-
-```bash
-# 协议级验收 + 进程内前端成本（不需要 KVM / root；macOS 上自动进容器）
-experiments/vhost-user-blk-frontend-20260726/run.sh
-
-# 真实 Guest：QEMU/TCG 当 frontend，真实内核驱动 + 真实 ext4（不需要 KVM）
-experiments/vhost-user-blk-frontend-20260726/qemu-guest-smoke.sh
-
-# 真实内核 NBD 链路对照（需要 nbd 模块、nbd-client、fio 与 privileged 容器）
-experiments/vhost-user-blk-frontend-20260726/kernel-nbd-baseline.sh
+```sh
+sudo deploy/metal/install.sh                 # 自己挂实例 NVMe 到 /var/lib/cats
+CATS_REBENCH_S3_BUCKET=<bucket> AWS_REGION=us-east-1 \
+  experiments/vhost-user-blk-frontend-20260726/metal-rebench.sh
+experiments/vhost-user-blk-frontend-20260726/verify-rebench.sh   # 必须打印 COMPLETE
 ```
 
-环境摘要写入 [`raw/environment.txt`](raw/environment.txt)。
+`metal-rebench.sh` 会跑:两种对象存储下的存储层 benchmark、三种块路径配置 × 2 轮的 Guest fio、
+并发创建、两条路径的验收。**它在开跑前检查环境**(cache 必须在本地 NVMe、要有 KVM 与
+cloud-hypervisor),不满足就拒绝启动 —— 这正是上一轮出错的地方。
+
+在**没有本地盘**的机器上(比如 c5.metal)做对比时,显式覆盖那道闸:
+
+```sh
+CATS_REBENCH_ALLOW_ANY_CACHE=1 CATS_REBENCH_S3_BUCKET=<bucket> \
+  experiments/vhost-user-blk-frontend-20260726/metal-rebench.sh
+```
+
+**销毁机器之前先跑 `verify-rebench.sh`。** 它数的是数据行而不是阶段标题:这一轮有三次「阶段
+显示完成、实际零数据」(Guest 没装 fio、`CATS_TOKEN` 静默为空、`install.sh` 留下 root 拥有的
+cargo 目录),日志看上去都是正常的。
+
+**只跑某一部分**:
+
+```sh
+CATS_REBENCH_SKIP_FIO=1 experiments/.../metal-rebench.sh    # 跳过最慢的 fio 矩阵
+cargo test --release -p cats-blockd --test commit_cost      -- --ignored --nocapture
+cargo test --release -p cats-blockd --test golden_root_cost -- --ignored --nocapture
+CATS_BENCH_S3_BUCKET=<bucket> cargo test --release -p cats-blockd --test commit_cost -- --ignored --nocapture
+```
+
+存储层的两个 benchmark 不需要 KVM,任何机器都能跑;设 `CATS_BENCH_S3_BUCKET` 就打真实 S3,
+设 `CATS_BENCH_LEASE_TTL_MS` 给那些故意跑几十秒的提交留够租约。
+
+**不需要机器的部分**:`./run.sh` 在本机容器里跑协议级验收与前端成本;`./qemu-guest-smoke.sh`
+用 QEMU/TCG 起一个真实 Linux Guest,不需要 KVM。
+
+**旧的单项复现**(2026-07-26 那轮):在 `i4i.metal` 上 `sudo deploy/metal/install.sh`,把
+`/etc/cats/cats.env` 的 `CATS_BLOCK_PATH_ARGS` 在空(kernel-nbd)与
+`--ch-block-path vhost-user --ch-vhost-user-queues 4` 之间切换,每次 `systemctl restart cats-noded`
+后跑 `deploy/metal/e2e.sh` 与 `metal-guest-fio.sh <label>`。加 `--ch-block-direct` 可以关掉
+kernel-nbd 那侧的宿主 page cache,这是做公平对照的前提。
