@@ -84,3 +84,15 @@ output "metal_worker_role_name" {
 output "metal_worker_instance_profile" {
   value = aws_iam_instance_profile.metal_worker.name
 }
+
+output "metal_worker_instance_ids" {
+  value = aws_instance.metal_worker[*].id
+}
+
+output "metal_worker_private_ips" {
+  value = aws_instance.metal_worker[*].private_ip
+}
+
+output "instance_connect_endpoint_id" {
+  value = one(aws_ec2_instance_connect_endpoint.workers[*].id)
+}

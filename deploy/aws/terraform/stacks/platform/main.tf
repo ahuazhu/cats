@@ -81,13 +81,10 @@ module "github_release" {
   tags                 = var.tags
 }
 
-# Bare-metal workers.
-#
-# The instances themselves are not created here: they are long-lived, hand-sized
-# capacity that the infrastructure stack configures by instance id. What is
-# managed here is the network position they must occupy — cats-noded listens on
+# Bare-metal workers: the network position they occupy. cats-noded listens on
 # 7301 and is reached by cats-gatewayd and cats-controld from inside the
-# cluster. Nothing else may reach it.
+# cluster; nothing else may reach it. The instances themselves are declared
+# further down, and the infrastructure stack installs onto them by id.
 resource "aws_security_group" "metal_worker" {
   name        = "${var.name_prefix}-${var.environment}-metal-worker"
   description = "Cats bare-metal worker"
@@ -107,6 +104,21 @@ resource "aws_vpc_security_group_ingress_rule" "metal_worker_node_agent" {
   to_port                      = 7301
   ip_protocol                  = "tcp"
   description                  = "cats-noded from the cluster"
+}
+
+# Workers sit in private subnets with no public address, so the operator path in
+# is an EC2 Instance Connect Endpoint placed in this same group. The rule is
+# self-referencing rather than a CIDR: only something already inside the group
+# can open a shell.
+resource "aws_vpc_security_group_ingress_rule" "metal_worker_ssh" {
+  count = var.metal_worker_ssh_from_instance_connect ? 1 : 0
+
+  security_group_id            = aws_security_group.metal_worker.id
+  referenced_security_group_id = aws_security_group.metal_worker.id
+  from_port                    = 22
+  to_port                      = 22
+  ip_protocol                  = "tcp"
+  description                  = "sshd from the EC2 Instance Connect Endpoint"
 }
 
 # S3, RDS, SSM and ECR are all reached outbound; the guest tap NAT also egresses
@@ -311,4 +323,63 @@ resource "aws_iam_role_policy" "metal_worker_chunkstore" {
   name   = "chunkstore"
   role   = aws_iam_role.metal_worker.id
   policy = data.aws_iam_policy_document.metal_worker_chunkstore.json
+}
+
+# The bare-metal worker itself.
+#
+# Long-lived capacity, and therefore Terraform's to own. Leaving it as a hand
+# made instance is precisely the pattern this migration kept paying for: the
+# DNS records, the ChunkStore bucket, the worker role and the instance-store
+# mount were all created by hand in the previous account and all four were
+# invisible to a rebuild.
+#
+# Instance storage is not declared here. c5d exposes it unconditionally and
+# install-worker.sh mounts it at /var/lib/cats; it is ephemeral cache in front
+# of the S3 ChunkStore, so a stop/start losing it is by design.
+resource "aws_instance" "metal_worker" {
+  count = var.metal_worker_instance_count
+
+  ami                    = var.metal_worker_ami
+  instance_type          = var.metal_worker_instance_type
+  subnet_id              = module.network.private_subnet_ids[0]
+  vpc_security_group_ids = [aws_security_group.metal_worker.id]
+  iam_instance_profile   = aws_iam_instance_profile.metal_worker.name
+
+  instance_initiated_shutdown_behavior = "stop"
+
+  root_block_device {
+    volume_size           = var.metal_worker_root_volume_gib
+    volume_type           = "gp3"
+    encrypted             = true
+    delete_on_termination = true
+  }
+
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 2
+  }
+
+  tags = merge(var.tags, {
+    Name    = "cats-metal-1"
+    Project = "Cats"
+  })
+
+  lifecycle {
+    # user_data only runs on first boot, and rewriting it would replace a
+    # worker that is serving Cats. The AMI is pinned rather than tracked, for
+    # the same reason: a new Canonical publication must not recycle the fleet.
+    ignore_changes = [user_data, user_data_base64, ami]
+  }
+}
+
+# Operator access to a worker that has no public address.
+resource "aws_ec2_instance_connect_endpoint" "workers" {
+  count = var.metal_worker_ssh_from_instance_connect ? 1 : 0
+
+  subnet_id          = module.network.private_subnet_ids[0]
+  security_group_ids = [aws_security_group.metal_worker.id]
+  preserve_client_ip = false
+
+  tags = merge(var.tags, { Name = "cats-eic" })
 }

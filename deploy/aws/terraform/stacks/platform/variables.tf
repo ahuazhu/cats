@@ -191,3 +191,37 @@ variable "chunkstore_versioning_enabled" {
   type        = bool
   default     = true
 }
+
+variable "metal_worker_ssh_from_instance_connect" {
+  description = "Allow sshd on the worker from an EC2 Instance Connect Endpoint in the same security group. The endpoint itself is created outside this stack."
+  type        = bool
+  default     = true
+}
+
+variable "metal_worker_instance_count" {
+  description = "Bare-metal workers managed by this stack."
+  type        = number
+  default     = 1
+}
+
+variable "metal_worker_instance_type" {
+  description = "Worker instance type. Must be .metal for /dev/kvm, and should carry instance storage: the ChunkStore cache on EBS measures 14-43x lower on 4 KiB random write."
+  type        = string
+  default     = "c5d.metal"
+
+  validation {
+    condition     = endswith(var.metal_worker_instance_type, ".metal")
+    error_message = "Cloud Hypervisor needs /dev/kvm, which only bare-metal instance types expose."
+  }
+}
+
+variable "metal_worker_ami" {
+  description = "Pinned Ubuntu 24.04 LTS x86_64 AMI. Pinned deliberately: tracking the latest publication would recycle running workers."
+  type        = string
+}
+
+variable "metal_worker_root_volume_gib" {
+  description = "Root volume size. The guest image build and package cache need room; the ChunkStore cache lives on instance storage."
+  type        = number
+  default     = 200
+}
