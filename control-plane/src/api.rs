@@ -1867,7 +1867,7 @@ async fn billing_projection(state: &AppState, workspace: &str) -> ApiResult<Bill
         .credits
         .ensure_account(
             &ledger.billing_account_id,
-            &ledger.owner_id,
+            &ledger.account_id,
             "USD",
             ledger.signup_credit_nanos,
             now_ms,

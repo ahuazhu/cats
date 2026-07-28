@@ -274,7 +274,7 @@ impl Ctx {
             .credits
             .ensure_account(
                 &ledger.billing_account_id,
-                &ledger.owner_id,
+                &ledger.account_id,
                 "USD",
                 10_000_000_000,
                 1,
