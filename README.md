@@ -85,7 +85,7 @@ docs/                     架构、决策、协议规格和实验报告
 | 元数据存储 | ✅ SQLite + PostgreSQL | SQLite 用于本地开发；PostgreSQL adapter 实现 root/lease/fencing 的数据库时钟与原子 CAS，并用于 AWS EKS/metal 共享元数据 |
 | Usage / billing ledger | ✅ provisional 全链路 | 1 秒 cgroup 采样、10 秒累计 checkpoint、Node 持久 outbox、lifecycle final checkpoint、Kinesis、七年 Object Lock S3 archive、PostgreSQL projection、DynamoDB checkpoint，以及 account/Cat/metric 查询和整数计价；正式收费仍待 replay/shadow invoice 验收 |
 | 虚拟化 | FakeVmm + **Cloud Hypervisor 模式**（`--vmm ch`，Linux+KVM） | CH 直接内核启动、vsock Guest Agent、vm.pause/resume、Warm=vm.snapshot/--restore；块路径可选内核 NBD（默认）或原生 vhost-user-blk（`--ch-block-path vhost-user`，ADR-0015）——**两者都通过同一套 22/23 项 i4i.metal 真机验收（含 Warm 状态对齐）**，默认值按写吞吐权衡仍留 kernel-nbd；部署见 `deploy/metal/` |
-| Guest 网络 / tap / overlay | 未实现 | 下一里程碑；exec/健康走 vsock；Endpoint 演示仅 FakeVmm 形态 |
+| Guest 网络 / tap / overlay | 部分实现 | 每 Cat `/30` tap 与 owning-node HTTP 入站已实现（`node-agent/src/ch.rs`）；跨 Node overlay 与 WebSocket 入站是下一里程碑；exec/健康走 vsock |
 
 ## 构建与测试
 

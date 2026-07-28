@@ -273,7 +273,7 @@ Fly Machines 的卷绑死单机、不可跨主机）。反过来，够到第 4 �
 | AWS AgentCore | — | 默认 **25 并发**/账号/区域 | 官方 |
 | Runloop | — | 试用限 3 devbox | 官方 |
 | **Fly Sprites** | **不做横向扩展**（tptacek 明说面向个人项目、不适合高流量） | **数据冲突**：HN 称 PAYG 3 / 高档 10；第三方研究页称 $20=20 / $2000=2000。**官方无 limits 页** | 冲突 |
-| **Cats** | **未公开、未测** | — | **已测规模仅"10 并发、小规格"的 Warm wake storm**（ADR-0002 待验证事项）；准入控制与限流未实现 |
+| **Cats** | **未公开、未测** | — | **已测规模仅"10 并发、小规格"的 Warm wake storm**（ADR-0002 待验证事项）；准入控制与限流已实现（`node-agent/src/admission.rs`，ADR-0002 §8），但未在更大规模上验证 |
 
 **这一格是 Cats 最薄的一环，而它正是旗舰客户唯一在意的指标。**
 Lovable 迁到 Modal 的直接原因就是前一家扛不住峰值。
@@ -898,7 +898,7 @@ FunctionGraph 每月 100 万次 + 40 万 GB-秒；PPIO 送 20GB 本地 + 60GB �
 | # | 差距 | 现状 | 对标 |
 |---|---|---|---|
 | 1 | **空缓存跨节点恢复路径未产品化** | ⚠️ 注意区分两条路径：**优化 Cold = 1.755 s**（i4i Local NVMe，新内核新进程，5 轮 P50）**已与 Sprites 持平**；**Direct-S3 原型 = 39.868 s**（S3、无初始 Cache、串行 Python，S3 GET 累计 18.91 s）是**另一个测量边界**，官方标注为"仅验证语义"。缺口是**两者尚未合并**——生产 Rust blockd + 本地热 cache 的组合数字不存在 | Sprites 的 Cold 1-2s **同样是热本地 cache 口径**（sparse 100GB NVMe 做 dm-cache-like read-through），**它从未公开空缓存跨节点恢复的等价数字**。Perplexity SPACE create P90 89ms（btrfs CoW + 高频 disk snapshot） |
-| 2 | **原生 vhost-user-blk 未实现** | Phase A 走内核 NBD（正确性等价，性能里程碑未达）。参考量级：SPDK vhost-user-blk 是内核 vhost-scsi 的 **2.34×** IOPS；ublk ≈ qemu-nbd 的 **2×** —— 内核 NBD 是最慢一档 | ⚠️ Firecracker 系竞品虽然用不了 vhost-user-blk，但可用 **ublk** 拿到同等能力（§8.1 第 8 条、§3.7），只是数据通路更长。所以这主要是 Cats 相对自己的性能债，相对对手则是一个**尚未测量**的延迟差 |
+| 2 | **原生 vhost-user-blk 已实现但不是默认** | ADR-0015 已落地（`blockd/src/vhost_user.rs`），与内核 NBD 通过同一套 i4i.metal 真机验收。默认仍留 kernel-nbd，原因是实测的写吞吐权衡（CH 带缓冲打开 `/dev/nbdN`，宿主 page cache 吸收合并了写），翻转条件写在 ADR-0015。所以差距不是"没有"，而是**生产默认还没吃到 QD1 延迟收益**（9–10 µs vs 32 µs） | ⚠️ Firecracker 系竞品虽然用不了 vhost-user-blk，但可用 **ublk** 拿到同等能力（§8.1 第 8 条、§3.7），只是数据通路更长。所以这主要是 Cats 相对自己的性能债，相对对手则是一个**尚未测量**的延迟差 |
 | 3 | **跨 Node Guest overlay 未实现** | per-Cat `/30` tap 与 owning-node HTTP 入站已实现 | — |
 | 4 | **无 fork/branch** | 未实现 | Sprites 也没公开（仅内部 admin ~90s）；**Daytona VM class 是唯一对外交付含内存 fork**；Morph 宣称 <250ms |
 | 5 | **无预装镜像生态** | — | Sprites 预装 Node/Python/Go/Rust/Claude/Gemini/Codex 开箱即用 |

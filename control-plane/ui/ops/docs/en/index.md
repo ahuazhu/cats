@@ -61,4 +61,4 @@ Supported node action verbs are `cordon`, `uncordon`, and `drain`. Use `uncordon
 
 ## Source-version caveats
 
-The current repository still lacks native vhost-user-blk, tap/overlay Guest networking, Suspended page-out (the CH path currently pauses only), PostgreSQL for the project resource store, and privilege separation. The Cloud Hypervisor Phase-A path has passed the recorded bare-metal acceptance run, but those remaining items must be closed before calling the entire stack production-ready.
+The current repository still lacks tap/overlay Guest networking, PostgreSQL for the project resource store, and privilege separation. Native vhost-user-blk (ADR-0015) and Suspended page-out (`process_madvise(MADV_PAGEOUT)` over a per-Cat file-backed memory zone) have both landed; kernel NBD remains the default block path for a measured write-throughput trade-off, not for lack of validation. The Cloud Hypervisor path has passed the recorded bare-metal acceptance run, but those remaining items must be closed before calling the entire stack production-ready.
