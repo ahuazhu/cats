@@ -99,9 +99,25 @@ async fn run_async(base: &str, project: &str, token: &str, cat: &str) -> Result<
         HeaderValue::from_str(&format!("Bearer {token}"))
             .context("invalid authorization header")?,
     );
-    let (socket, _) = tokio_tungstenite::connect_async(request)
-        .await
-        .context("connect interactive shell")?;
+    // A rejected upgrade carries the reason in the response body — "cat is not
+    // running on this node", a stale route, and so on. Tungstenite's Display
+    // prints only the status line, so surface the body or the failure is
+    // undiagnosable from the message alone.
+    let (socket, _) = match tokio_tungstenite::connect_async(request).await {
+        Ok(connected) => connected,
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            let status = response.status();
+            let body = response
+                .into_body()
+                .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+                .unwrap_or_default();
+            if body.is_empty() {
+                bail!("connect interactive shell: HTTP {status}");
+            }
+            bail!("connect interactive shell: HTTP {status}: {body}");
+        }
+        Err(error) => return Err(error).context("connect interactive shell"),
+    };
     let _raw_mode = RawModeGuard::enable_if_terminal()?;
     let (mut sender, mut receiver) = socket.split();
     // Tokio's stdin uses a blocking-pool read that cannot be cancelled. In an
