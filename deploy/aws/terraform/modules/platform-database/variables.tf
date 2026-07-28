@@ -20,9 +20,13 @@ variable "private_subnet_ids" {
 }
 
 variable "allowed_security_group_ids" {
-  type        = list(string)
-  description = "Security groups allowed to reach port 5432 — the EKS cluster group and the bare-metal worker group."
-  default     = []
+  type        = map(string)
+  description = <<-EOT
+    Security groups allowed to reach port 5432, keyed by a stable label such as
+    "cluster" or "metal_worker". A map rather than a list because the ids are
+    only known after apply, and for_each needs keys that are known during plan.
+  EOT
+  default     = {}
 }
 
 variable "engine_version" {

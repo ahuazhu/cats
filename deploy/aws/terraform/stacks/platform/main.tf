@@ -46,10 +46,10 @@ module "database" {
   private_subnet_ids = module.network.private_subnet_ids
 
   # Both sides of the EKS/metal boundary reach this instance.
-  allowed_security_group_ids = [
-    module.cluster.cluster_security_group_id,
-    aws_security_group.metal_worker.id,
-  ]
+  allowed_security_group_ids = {
+    cluster      = module.cluster.cluster_security_group_id
+    metal_worker = aws_security_group.metal_worker.id
+  }
 
   engine_version        = var.database_engine_version
   instance_class        = var.database_instance_class
