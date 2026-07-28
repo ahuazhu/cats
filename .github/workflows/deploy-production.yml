@@ -101,6 +101,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
           for name in \
             AWS_REGION \
             TF_STATE_BUCKET \
@@ -123,26 +124,24 @@ jobs:
             --alias "$EKS_CLUSTER_NAME" \
             --kubeconfig "$RUNNER_TEMP/kubeconfig"
 
-          live_secret_json="$(
-            kubectl \
-              --kubeconfig "$RUNNER_TEMP/kubeconfig" \
-              --namespace cats \
-              get secret cats-runtime \
-              --output json \
-              | jq -c '
-                  .data
-                  | with_entries(.value |= @base64d)
-                  | if has("CATS_WORKOS_PROJECT_ORGANIZATIONS")
-                       and (has("CATS_WORKOS_ACCOUNT_ORGANIZATIONS") | not)
-                    then .CATS_WORKOS_ACCOUNT_ORGANIZATIONS =
-                           .CATS_WORKOS_PROJECT_ORGANIZATIONS
-                    else .
-                    end
-                  | del(.CATS_WORKOS_PROJECT_ORGANIZATIONS)
-                '
-          )"
-          runtime_secret_json="$(
-            jq -c '
+          kubectl \
+            --kubeconfig "$RUNNER_TEMP/kubeconfig" \
+            --namespace cats \
+            get secret cats-runtime \
+            --output json \
+            | jq -c '
+                .data
+                | with_entries(.value |= @base64d)
+                | if has("CATS_WORKOS_PROJECT_ORGANIZATIONS")
+                     and (has("CATS_WORKOS_ACCOUNT_ORGANIZATIONS") | not)
+                  then .CATS_WORKOS_ACCOUNT_ORGANIZATIONS =
+                         .CATS_WORKOS_PROJECT_ORGANIZATIONS
+                  else .
+                  end
+                | del(.CATS_WORKOS_PROJECT_ORGANIZATIONS)
+              ' \
+            > "$RUNNER_TEMP/live-secret.json"
+          jq -c '
               del(
                 .CATS_POSTGRES_URL,
                 .CATS_USAGE_STORE_ADAPTER,
@@ -163,15 +162,14 @@ jobs:
                 .CATS_STRIPE_LIVEMODE,
                 .CATS_BILLING_ENFORCEMENT_ENABLED
               )
-            ' <<< "$live_secret_json"
-          )"
-          rds_ca_pem="$(
-            kubectl \
-              --kubeconfig "$RUNNER_TEMP/kubeconfig" \
-              --namespace cats \
-              get configmap cats-rds-ca \
-              --output jsonpath='{.data.rds-ca\.pem}'
-          )"
+            ' "$RUNNER_TEMP/live-secret.json" \
+            > "$RUNNER_TEMP/runtime-secret.json"
+          kubectl \
+            --kubeconfig "$RUNNER_TEMP/kubeconfig" \
+            --namespace cats \
+            get configmap cats-rds-ca \
+            --output jsonpath='{.data.rds-ca\.pem}' \
+            > "$RUNNER_TEMP/rds-ca.pem"
 
           for key in \
             CATS_POSTGRES_URL \
@@ -179,22 +177,36 @@ jobs:
             STRIPE_SECRET_KEY \
             STRIPE_WEBHOOK_SECRET
           do
-            value="$(jq -er --arg key "$key" '.[$key]' <<< "$live_secret_json")"
+            value="$(
+              jq -er \
+                --arg key "$key" \
+                '.[$key]' \
+                "$RUNNER_TEMP/live-secret.json"
+            )"
             echo "::add-mask::$value"
           done
-          echo "::add-mask::$live_secret_json"
-          echo "::add-mask::$runtime_secret_json"
 
-          {
-            echo "TF_VAR_runtime_secret_data=$runtime_secret_json"
-            echo "TF_VAR_storage_postgres_url=$(jq -er '.CATS_POSTGRES_URL' <<< "$live_secret_json")"
-            echo "TF_VAR_usage_postgres_url=$(jq -er '.CATS_USAGE_POSTGRES_URL' <<< "$live_secret_json")"
-            echo "TF_VAR_stripe_secret_key=$(jq -er '.STRIPE_SECRET_KEY' <<< "$live_secret_json")"
-            echo "TF_VAR_stripe_webhook_secret=$(jq -er '.STRIPE_WEBHOOK_SECRET' <<< "$live_secret_json")"
-            echo "TF_VAR_rds_ca_pem<<CATS_RDS_CA_PEM"
-            printf '%s\n' "$rds_ca_pem"
-            echo "CATS_RDS_CA_PEM"
-          } >> "$GITHUB_ENV"
+          # The RDS bundle is larger than Linux's per-environment-variable
+          # exec limit. Keep all sensitive Terraform inputs in an ephemeral
+          # var file instead of exporting them through GITHUB_ENV.
+          jq -n \
+            --slurpfile runtime_secret_data "$RUNNER_TEMP/runtime-secret.json" \
+            --slurpfile live_secret "$RUNNER_TEMP/live-secret.json" \
+            --rawfile rds_ca_pem "$RUNNER_TEMP/rds-ca.pem" \
+            '{
+              runtime_secret_data: $runtime_secret_data[0],
+              storage_postgres_url: $live_secret[0].CATS_POSTGRES_URL,
+              usage_postgres_url: $live_secret[0].CATS_USAGE_POSTGRES_URL,
+              stripe_secret_key: $live_secret[0].STRIPE_SECRET_KEY,
+              stripe_webhook_secret: $live_secret[0].STRIPE_WEBHOOK_SECRET,
+              rds_ca_pem: $rds_ca_pem
+            }' \
+            > "$RUNNER_TEMP/production-secrets.tfvars.json"
+          chmod 600 \
+            "$RUNNER_TEMP/live-secret.json" \
+            "$RUNNER_TEMP/runtime-secret.json" \
+            "$RUNNER_TEMP/rds-ca.pem" \
+            "$RUNNER_TEMP/production-secrets.tfvars.json"
 
       - name: Check control database compatibility
         shell: bash
@@ -317,6 +329,7 @@ jobs:
             -lock-timeout=5m \
             -out="$RUNNER_TEMP/production.tfplan" \
             -var-file="$RUNNER_TEMP/production.tfvars" \
+            -var-file="$RUNNER_TEMP/production-secrets.tfvars.json" \
             -var="kubeconfig_path=$RUNNER_TEMP/kubeconfig" \
             -var="kubeconfig_context=$EKS_CLUSTER_NAME" \
             -var="control_plane_image=$IMAGE_REF" \
