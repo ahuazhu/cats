@@ -165,3 +165,150 @@ resource "aws_ecr_lifecycle_policy" "control_plane" {
     ]
   })
 }
+
+# ChunkStore.
+#
+# The durable truth for every Cat's disks: immutable content-addressed objects,
+# with PostgreSQL holding the roots, leases and fencing epochs that point at
+# them (ADR-0003). No Terraform state owned this bucket in the account being
+# replaced -- it was created by hand, so a rebuild had no way to learn that the
+# workers depend on it.
+#
+# Versioning matches the previous bucket. The objects are immutable by
+# construction, so this is purely a guard against an erroneous delete.
+resource "aws_s3_bucket" "chunkstore" {
+  bucket        = var.chunkstore_bucket_name
+  force_destroy = false
+
+  lifecycle {
+    prevent_destroy = true
+  }
+
+  tags = merge(var.tags, { Name = var.chunkstore_bucket_name })
+}
+
+resource "aws_s3_bucket_ownership_controls" "chunkstore" {
+  bucket = aws_s3_bucket.chunkstore.id
+
+  rule {
+    object_ownership = "BucketOwnerEnforced"
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "chunkstore" {
+  bucket = aws_s3_bucket.chunkstore.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_versioning" "chunkstore" {
+  bucket = aws_s3_bucket.chunkstore.id
+
+  versioning_configuration {
+    status = var.chunkstore_versioning_enabled ? "Enabled" : "Suspended"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "chunkstore" {
+  bucket = aws_s3_bucket.chunkstore.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+data "aws_iam_policy_document" "chunkstore_tls_only" {
+  statement {
+    sid    = "DenyInsecureTransport"
+    effect = "Deny"
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+
+    actions = ["s3:*"]
+    resources = [
+      aws_s3_bucket.chunkstore.arn,
+      "${aws_s3_bucket.chunkstore.arn}/*",
+    ]
+
+    condition {
+      test     = "Bool"
+      variable = "aws:SecureTransport"
+      values   = ["false"]
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "chunkstore" {
+  bucket = aws_s3_bucket.chunkstore.id
+  policy = data.aws_iam_policy_document.chunkstore_tls_only.json
+}
+
+# Bare-metal worker instance identity.
+#
+# The S3 adapter uses these instance credentials and refreshes them, so no
+# long-lived AWS key ever reaches worker.env. The infrastructure stack attaches
+# SSM and artifact-bucket access to this same role; what it cannot know about
+# is the ChunkStore, so that grant lives here with the bucket.
+data "aws_iam_policy_document" "metal_worker_assume" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "metal_worker" {
+  name               = "${var.name_prefix}-${var.environment}-metal-worker"
+  assume_role_policy = data.aws_iam_policy_document.metal_worker_assume.json
+
+  tags = var.tags
+}
+
+resource "aws_iam_instance_profile" "metal_worker" {
+  name = aws_iam_role.metal_worker.name
+  role = aws_iam_role.metal_worker.name
+
+  tags = var.tags
+}
+
+data "aws_iam_policy_document" "metal_worker_chunkstore" {
+  statement {
+    sid       = "ListChunkStore"
+    effect    = "Allow"
+    actions   = ["s3:GetBucketLocation", "s3:ListBucket"]
+    resources = [aws_s3_bucket.chunkstore.arn]
+  }
+
+  statement {
+    sid    = "ReadWriteChunkStore"
+    effect = "Allow"
+
+    actions = [
+      "s3:AbortMultipartUpload",
+      "s3:DeleteObject",
+      "s3:GetObject",
+      "s3:ListMultipartUploadParts",
+      "s3:PutObject",
+    ]
+
+    resources = ["${aws_s3_bucket.chunkstore.arn}/*"]
+  }
+}
+
+resource "aws_iam_role_policy" "metal_worker_chunkstore" {
+  name   = "chunkstore"
+  role   = aws_iam_role.metal_worker.id
+  policy = data.aws_iam_policy_document.metal_worker_chunkstore.json
+}

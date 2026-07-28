@@ -180,3 +180,14 @@ variable "tags" {
   description = "Additional tags applied to every resource."
   default     = {}
 }
+
+variable "chunkstore_bucket_name" {
+  description = "Globally unique S3 bucket holding immutable ChunkStore objects."
+  type        = string
+}
+
+variable "chunkstore_versioning_enabled" {
+  description = "Versioning on the ChunkStore bucket. Objects are immutable by construction; this only guards against an erroneous delete."
+  type        = bool
+  default     = true
+}

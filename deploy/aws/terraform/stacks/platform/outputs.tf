@@ -71,3 +71,16 @@ output "github_release_role_arn" {
   description = "Set as the AWS_ROLE_ARN repository variable for the release workflow."
   value       = module.github_release.release_role_arn
 }
+
+output "chunkstore_bucket_name" {
+  value = aws_s3_bucket.chunkstore.id
+}
+
+output "metal_worker_role_name" {
+  description = "Feed to the infrastructure stack's metal_worker_instance_role_name."
+  value       = aws_iam_role.metal_worker.name
+}
+
+output "metal_worker_instance_profile" {
+  value = aws_iam_instance_profile.metal_worker.name
+}
