@@ -28,7 +28,7 @@ ExecStart=/opt/cats/bin/cats-noded \
   --ch-bin /opt/cats/bin/cloud-hypervisor \
   --ch-kernel /opt/cats/guest/vmlinuz \
   --ch-initramfs /opt/cats/guest/initramfs.img \
-  --ch-cmdline "console=ttyS0 root=/dev/vda rw" \
+  --ch-cmdline "console=ttyS0 root=/dev/vda rw clocksource=kvm-clock" \
   --ch-network-cidr $CATS_GUEST_NETWORK_CIDR \
   --ch-seed-image /opt/cats/guest/rootfs.ext4
 Restart=always

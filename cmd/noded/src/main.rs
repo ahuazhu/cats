@@ -79,7 +79,20 @@ struct Args {
     ch_kernel: PathBuf,
     #[arg(long)]
     ch_initramfs: Option<PathBuf>,
-    #[arg(long, default_value = "console=ttyS0 root=/dev/vda rw quiet")]
+    /// `clocksource=kvm-clock` is load-bearing, not cosmetic. On a host with an
+    /// invariant TSC the guest kernel demotes kvm-clock to rating 299 and picks
+    /// raw `tsc` instead (`arch/x86/kernel/kvmclock.c`), because reading `rdtsc`
+    /// is cheaper. But a Warm restore re-establishes the guest clock through
+    /// `KVM_SET_CLOCK`, which moves kvmclock -- a clock a `tsc` guest never
+    /// reads. Its TSC is restored to the snapshot value instead, so all three
+    /// guest clocks resume frozen at the moment of the snapshot and the lag
+    /// accumulates across every Warm cycle
+    /// (`experiments/suspend-clock-semantics-20260727`). Pinning kvm-clock puts
+    /// the guest back on the clock the restore path actually adjusts.
+    #[arg(
+        long,
+        default_value = "console=ttyS0 root=/dev/vda rw quiet clocksource=kvm-clock"
+    )]
     ch_cmdline: String,
     /// Raw golden-root image written into fresh root volumes.
     #[arg(long)]
@@ -234,11 +247,60 @@ fn parse_linux_memory_mib(contents: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
+
     #[test]
     fn parses_linux_host_memory() {
         assert_eq!(
             super::parse_linux_memory_mib("MemTotal:       197659444 kB\nMemFree: 1 kB\n"),
             Some(193_026)
         );
+    }
+
+    #[test]
+    fn default_guest_cmdline_pins_kvm_clock() {
+        let command = super::Args::command();
+        let arg = command
+            .get_arguments()
+            .find(|a| a.get_id() == "ch_cmdline")
+            .expect("--ch-cmdline argument");
+        let default = arg
+            .get_default_values()
+            .first()
+            .expect("--ch-cmdline has a default")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            default.contains("clocksource=kvm-clock"),
+            "a guest left on the `tsc` clocksource resumes from a Warm restore with \
+             all three clocks frozen at the snapshot instant; got {default:?}"
+        );
+    }
+
+    /// The units pass `--ch-cmdline` explicitly, so they override the default
+    /// above rather than inheriting it. A fix applied only to the default would
+    /// never reach a deployed node.
+    #[test]
+    fn deployment_units_pin_kvm_clock_too() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root");
+        for unit in [
+            "deploy/metal/systemd/cats-noded.service",
+            "deploy/aws/metal/cats-worker.service",
+        ] {
+            let path = root.join(unit);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let line = text
+                .lines()
+                .find(|l| l.contains("--ch-cmdline"))
+                .unwrap_or_else(|| panic!("{unit} no longer passes --ch-cmdline"));
+            assert!(
+                line.contains("clocksource=kvm-clock"),
+                "{unit} overrides the guest cmdline without pinning kvm-clock: {line}"
+            );
+        }
     }
 }
