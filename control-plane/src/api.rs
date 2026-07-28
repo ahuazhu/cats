@@ -398,6 +398,10 @@ pub fn router(state: AppState) -> Router {
             "/v1/workspaces/{workspace}/cats/{cat}/auto-suspend",
             get(get_auto_suspend).put(update_auto_suspend),
         )
+        .route(
+            "/v1/workspaces/{workspace}/cats/{cat}/expiry",
+            get(get_expiry).put(update_expiry),
+        )
         .route("/v1/workspaces/{workspace}/cats/{cat}/work", get(get_cat_work))
         .route(
             "/v1/workspaces/{workspace}/cats/{cat}/endpoints",
@@ -850,6 +854,9 @@ async fn create_cat(
                 .into_response());
         }
     }
+    if req.expires_at_unix.is_some_and(|at| at <= 0) {
+        return Err(ApiError::invalid("expires_at_unix must be a positive unix timestamp").into());
+    }
     let extra = req
         .disk
         .as_ref()
@@ -863,6 +870,7 @@ async fn create_cat(
         req.root_size_bytes,
         req.auto_suspend,
         extra,
+        req.expires_at_unix,
     )?;
     if let Some(key) = idem_key(&headers) {
         state.store.idempotency_store(&key, &route, &op.id)?;
@@ -1278,6 +1286,33 @@ async fn update_auto_suspend(
         .store
         .work_status(&cat.id, state.cfg.node_lease_timeout_ms)?;
     Ok(Json(AutoSuspendResponse { cat, work }))
+}
+
+async fn get_expiry(
+    State(state): State<AppState>,
+    Path((workspace, cat)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Cat>> {
+    check_workspace_auth(&state, &headers, &workspace).await?;
+    Ok(Json(state.store.get_cat(&workspace, &cat)?))
+}
+
+async fn update_expiry(
+    State(state): State<AppState>,
+    Path((workspace, cat)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateExpiryRequest>,
+) -> ApiResult<Json<Cat>> {
+    check_workspace_auth(&state, &headers, &workspace).await?;
+    if request.expires_at_unix.is_some_and(|at| at <= 0) {
+        return Err(ApiError::invalid("expires_at_unix must be a positive unix timestamp").into());
+    }
+    let cat = state.store.get_cat(&workspace, &cat)?;
+    let cat = state.store.set_expiry(&cat.id, request.expires_at_unix)?;
+    // An expiry moved into the past should be reaped on the next tick, not on
+    // the next unrelated wake-up.
+    state.notify.notify_one();
+    Ok(Json(cat))
 }
 
 async fn get_cat_work(

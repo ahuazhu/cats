@@ -404,6 +404,69 @@ async fn work_driven_fast_suspend_and_gateway_wake_loop() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn absolute_expiry_reaps_the_cat_without_any_caller() {
+    let cluster = Cluster::start(&["node-a"]).await;
+    cluster
+        .cli_ok(&[
+            "create",
+            "ephemeral",
+            "--root-size",
+            "8MiB",
+            "--memory",
+            "256MiB",
+            "--cpus",
+            "1",
+            "--expires-in",
+            "3600",
+        ])
+        .await;
+    let shown = cluster.cli_ok(&["expiry", "ephemeral"]).await;
+    assert!(shown.contains("expires at unix"), "expiry get: {shown}");
+
+    // Renew, then move the expiry into the past; the controller must reap it
+    // with no further API traffic.
+    cluster
+        .cli_ok(&["expiry", "ephemeral", "--in", "7200"])
+        .await;
+    let renewed = cluster.cli_ok(&["expiry", "ephemeral"]).await;
+    assert!(renewed.contains("expires at unix"), "renewed: {renewed}");
+    cluster.cli_ok(&["expiry", "ephemeral", "--at", "1"]).await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let (ok, stdout, stderr) = cluster.cli(&["get", "ephemeral"]).await;
+        if !ok && (stdout + &stderr).contains("NotFound") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expired cat was never reaped"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    // A cat whose expiry was cleared survives the same window.
+    cluster
+        .cli_ok(&[
+            "create",
+            "keeper",
+            "--root-size",
+            "8MiB",
+            "--memory",
+            "256MiB",
+            "--cpus",
+            "1",
+            "--expires-in",
+            "3600",
+        ])
+        .await;
+    cluster.cli_ok(&["expiry", "keeper", "--never"]).await;
+    let shown = cluster.cli_ok(&["expiry", "keeper"]).await;
+    assert!(shown.contains("never expires"), "cleared: {shown}");
+    cluster.cli_ok(&["destroy", "keeper"]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn public_endpoint_proxies_websocket_frames() {
     let cluster = Cluster::start(&["node-a"]).await;
     cluster

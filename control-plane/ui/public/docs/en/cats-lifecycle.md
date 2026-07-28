@@ -55,6 +55,18 @@ disable the two boundaries with
 `CATS_AUTO_WARM_AFTER_SECONDS`/`CATS_AUTO_COLD_AFTER_SECONDS`; `0` disables
 that boundary.
 
+## Absolute expiry
+
+A Cat can carry an absolute expiry: once the time passes, the control plane deletes it exactly as `cats destroy` would. The root disk goes with it; persistent disks survive. This is how temporary environments (CI previews, demos) get reclaimed without an external sweeper.
+
+    cats create preview --expires-in 28800
+    cats expiry preview                 # show
+    cats expiry preview --in 28800     # renew: 8 more hours from now
+    cats expiry preview --at 1790000000
+    cats expiry preview --never        # keep it
+
+Renewal writes a new absolute time (`PUT /cats/{cat}/expiry`), so retries and replays need no special rules. A Cat without an expiry never expires.
+
 ## Connections and time
 
 Preserving Guest memory does not promise that old TCP or WebSocket connections survive. Edge, NAT, and remote peers may time out while the Cat sleeps. Clients should reconnect through the stable Endpoint. Guest time must not move backward across pause/resume.

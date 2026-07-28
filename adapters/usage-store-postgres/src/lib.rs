@@ -994,6 +994,26 @@ CREATE TABLE IF NOT EXISTS {schema}.stripe_events (
 );
 INSERT INTO {schema}.schema_migrations (version)
 VALUES (3) ON CONFLICT (version) DO NOTHING;
+DO $migration$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM {schema}.schema_migrations WHERE version = 4
+    ) THEN
+        -- The Project -> Account rename (ADR-0018) changed this column in the
+        -- CREATE DDL without migrating databases that already had the table.
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = '{schema}'
+              AND table_name = 'billing_accounts'
+              AND column_name = 'project_id'
+        ) THEN
+            ALTER TABLE {schema}.billing_accounts
+                RENAME COLUMN project_id TO account_id;
+        END IF;
+        INSERT INTO {schema}.schema_migrations (version) VALUES (4);
+    END IF;
+END
+$migration$;
 "#
     )
 }
@@ -1425,6 +1445,10 @@ mod tests {
         assert!(sql.contains("NUMERIC(39, 0)"));
         assert!(sql.contains("version = 2"));
         assert!(sql.contains("VALUES (3) ON CONFLICT"));
+        // The v4 rung heals databases created before the Project -> Account
+        // rename, where billing_accounts still carries project_id.
+        assert!(sql.contains("version = 4"));
+        assert!(sql.contains("RENAME COLUMN project_id TO account_id"));
         assert!(sql.contains("credit_ledger_entries"));
         assert!(sql.contains("checkout_intents"));
         assert!(sql.contains("stripe_events"));

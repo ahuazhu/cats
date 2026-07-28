@@ -32,7 +32,9 @@ POST   /v1/workspaces/{workspace_id}/cats/{cat}/actions/{verb}
 POST   /v1/workspaces/{workspace_id}/cats/{cat}/exec
 GET    /v1/workspaces/{workspace_id}/cats/{cat}/work
 GET    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
-PUT    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend</code></pre>
+PUT    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
+GET    /v1/workspaces/{workspace_id}/cats/{cat}/expiry
+PUT    /v1/workspaces/{workspace_id}/cats/{cat}/expiry</code></pre>
 <p>Lifecycle Verb 包括 <code>start</code>、<code>stop</code>、<code>suspend</code>、<code>resume</code> 与 <code>warm</code>。Create 省略 <code>auto_suspend</code> 时默认为 <code>true</code>。Cat 的 Create/Lifecycle/Delete 返回异步 Operation；请求超时后应查询 Operation，而不是用新意图重复变更。</p>
 <p>Cat、Disk 和 Operation 响应都包含不可变 <code>workspace_id</code>，它是唯一的资源归属键。</p>
 <p><code>exec</code> 接受 <code>command</code>、可选 <code>timeout_ms</code>、可选字符串 Map <code>env</code> 与可选字节数组 <code>stdin</code>。<code>env</code> 只传给子进程，不写入 Cats Registry。响应包含 <code>exit_code</code>、<code>stdout</code> 与 <code>stderr</code>。</p>

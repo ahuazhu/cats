@@ -77,6 +77,11 @@ pub struct Cat {
     /// reset the Suspended/Warm retention clock.
     #[serde(default)]
     pub observed_state_since_unix_ms: i64,
+    /// Absolute wall-clock expiry (unix seconds). Once this passes, the
+    /// control plane converges the Cat to Deleted exactly as an API delete
+    /// would. Absent = the Cat never expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix: Option<i64>,
 }
 
 /// Sources that can hold a Cat Running. Guest leases are created explicitly

@@ -53,6 +53,18 @@ Warm 的 Cat 在 24 小时后进入 Cold。计时从 observed state 提交时开
 `CATS_AUTO_WARM_AFTER_SECONDS` / `CATS_AUTO_COLD_AFTER_SECONDS` 调整阈值，
 设为 `0` 可关闭对应边界。
 
+## 绝对到期时间
+
+Cat 可以携带一个绝对到期时间：时间一到，控制面就按 `cats destroy` 的语义删除它。RootDisk 随之删除，PersistentDisk 存续。临时环境（CI 预览、演示）因此不需要外部 sweeper 来回收。
+
+    cats create preview --expires-in 28800
+    cats expiry preview                 # 查看
+    cats expiry preview --in 28800     # 续期：从现在起再 8 小时
+    cats expiry preview --at 1790000000
+    cats expiry preview --never        # 永久保留
+
+续期就是写一个新的绝对时间（`PUT /cats/{cat}/expiry`），重试与重放无需额外规则。没有到期时间的 Cat 永不过期。
+
 ## 连接与时间
 
 保留 Guest 内存并不承诺旧 TCP 或 WebSocket 连接仍然存在。Edge、NAT 与远端对端可能在休眠期间超时。客户端应通过稳定 Endpoint 重新连接。Guest 时间在 pause/resume 后不能倒退。

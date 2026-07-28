@@ -30,6 +30,10 @@ pub struct CreateCatRequest {
     /// Optional persistent disk created and mounted at create time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk: Option<CreateCatDisk>,
+    /// Optional absolute expiry (unix seconds). Once it passes, the control
+    /// plane deletes the Cat automatically. Omitted = the Cat never expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix: Option<i64>,
 }
 
 fn default_cpus() -> u32 {
@@ -179,6 +183,13 @@ pub const MAX_SHELL_MESSAGE_BYTES: usize = 64 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateAutoSuspendRequest {
     pub enabled: bool,
+}
+
+/// `PUT /cats/{cat}/expiry`. `expires_at_unix: null` clears the expiry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateExpiryRequest {
+    #[serde(default)]
+    pub expires_at_unix: Option<i64>,
 }
 
 #[cfg(test)]

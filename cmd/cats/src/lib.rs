@@ -84,6 +84,9 @@ pub enum Command {
         /// Keep this Cat running when the distributed work count reaches 0.
         #[arg(long)]
         no_auto_suspend: bool,
+        /// Delete this Cat automatically after SECONDS from now.
+        #[arg(long, value_name = "SECONDS")]
+        expires_in: Option<u64>,
     },
     /// List cats.
     Ls,
@@ -126,6 +129,19 @@ pub enum Command {
     Sleep {
         #[command(subcommand)]
         cmd: SleepCommand,
+    },
+    /// Show or change a cat's absolute expiry (automatic deletion time).
+    Expiry {
+        name: String,
+        /// Expire SECONDS from now.
+        #[arg(long, value_name = "SECONDS", conflicts_with_all = ["at", "never"])]
+        r#in: Option<u64>,
+        /// Expire at an absolute unix timestamp (seconds).
+        #[arg(long, value_name = "UNIX", conflicts_with_all = ["in", "never"])]
+        at: Option<i64>,
+        /// Clear the expiry so the cat never expires.
+        #[arg(long, conflicts_with_all = ["in", "at"])]
+        never: bool,
     },
     /// Disk management.
     Disk {
@@ -636,6 +652,7 @@ pub fn run(cli: Cli) -> Result<()> {
             disk_size,
             mount_at,
             no_auto_suspend,
+            expires_in,
         } => {
             let body = CreateCatRequest {
                 name: name.clone(),
@@ -649,6 +666,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     size_bytes: parse_size(disk_size).unwrap_or(1 << 30),
                     mount_at: mount_at.clone(),
                 }),
+                expires_at_unix: expires_in.map(|secs| unix_now() + secs as i64),
             };
             let resp = client.send(
                 client
@@ -781,6 +799,39 @@ pub fn run(cli: Cli) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&response)?);
             } else {
                 print_work_status(&response.work);
+            }
+            Ok(())
+        }
+        Command::Expiry {
+            name,
+            r#in,
+            at,
+            never,
+        } => {
+            let cat: Cat = if r#in.is_none() && at.is_none() && !never {
+                serde_json::from_value(client.get(&format!("/cats/{name}/expiry"))?)?
+            } else {
+                let expires_at_unix = match (r#in, at, never) {
+                    (Some(secs), None, false) => Some(unix_now() + *secs as i64),
+                    (None, Some(unix), false) => Some(*unix),
+                    (None, None, true) => None,
+                    _ => unreachable!("clap conflicts_with_all"),
+                };
+                serde_json::from_value(client.put(
+                    &format!("/cats/{name}/expiry"),
+                    json!({ "expires_at_unix": expires_at_unix }),
+                )?)?
+            };
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&cat)?);
+            } else {
+                match cat.expires_at_unix {
+                    Some(unix) => {
+                        let remaining = unix - unix_now();
+                        println!("{} expires at unix {unix} ({remaining}s from now)", cat.name);
+                    }
+                    None => println!("{} never expires", cat.name),
+                }
             }
             Ok(())
         }
@@ -1102,6 +1153,14 @@ fn print_disk(d: &Disk, json_mode: bool) {
             d.bound_cat_id.as_deref().unwrap_or("-")
         );
     }
+}
+
+fn unix_now() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 /// Random idempotency key without pulling a uuid dependency.

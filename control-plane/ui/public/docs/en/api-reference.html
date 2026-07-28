@@ -32,7 +32,9 @@ POST   /v1/workspaces/{workspace_id}/cats/{cat}/actions/{verb}
 POST   /v1/workspaces/{workspace_id}/cats/{cat}/exec
 GET    /v1/workspaces/{workspace_id}/cats/{cat}/work
 GET    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
-PUT    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend</code></pre>
+PUT    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
+GET    /v1/workspaces/{workspace_id}/cats/{cat}/expiry
+PUT    /v1/workspaces/{workspace_id}/cats/{cat}/expiry</code></pre>
 <p>Lifecycle verbs are <code>start</code>, <code>stop</code>, <code>suspend</code>, <code>resume</code>, and <code>warm</code>. <code>auto_suspend</code> defaults to <code>true</code> when omitted from create. Cat create/lifecycle/delete returns an asynchronous Operation response; poll the Operation URL instead of repeating a timed-out mutation with a new intent.</p>
 <p>Cat, Disk, and Operation responses include the immutable <code>workspace_id</code>, which is the only ownership key.</p>
 <p><code>exec</code> accepts <code>command</code>, optional <code>timeout_ms</code>, an optional string map <code>env</code>, and optional byte array <code>stdin</code>. <code>env</code> is passed only to the child process and is not stored in the Cats registry. The response contains <code>exit_code</code>, <code>stdout</code>, and <code>stderr</code>.</p>

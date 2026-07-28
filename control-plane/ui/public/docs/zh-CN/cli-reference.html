@@ -28,6 +28,7 @@ cats token revoke ID</code></pre>
 <pre><code>cats create NAME [--image IMAGE] [--cpus N] [--memory SIZE]
                  [--root-size SIZE] [--disk NAME]
                  [--disk-size SIZE] [--mount-at PATH] [--no-auto-suspend]
+                 [--expires-in SECONDS]
 cats ls
 cats get NAME
 cats start NAME
@@ -36,6 +37,7 @@ cats suspend NAME
 cats resume NAME
 cats warm NAME
 cats destroy NAME
+cats expiry NAME [--in SECONDS | --at UNIX | --never]
 cats exec NAME [--timeout SECONDS] [--env-file PATH]
                [--stdin-file PATH] -- COMMAND [ARG...]</code></pre>
 <p><code>create</code> 默认使用 <code>ubuntu-24.04</code> 镜像、2 CPU、2 GiB 内存、1 GiB RootDisk，并开启自动休眠。容量支持 <code>KiB</code>、<code>MiB</code>、<code>GiB</code> 或原始字节。</p>
