@@ -1073,6 +1073,23 @@ async fn prepare_node_shell(
                 retried_suspend_conflict = true;
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
+            // The node explains itself in the response body -- which Cat, which
+            // state, which node. Tungstenite's Display prints only the status
+            // line, so pass the body through or the caller sees one opaque 503
+            // wrapped in another.
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                let status = response.status();
+                let body = response
+                    .into_body()
+                    .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+                    .unwrap_or_default();
+                let detail = if body.is_empty() {
+                    format!("node shell connection failed: HTTP {status}")
+                } else {
+                    format!("node shell connection failed: HTTP {status}: {body}")
+                };
+                return Err(ApiError::unavailable(detail).into());
+            }
             Err(error) => {
                 return Err(
                     ApiError::unavailable(format!("node shell connection failed: {error}")).into(),
