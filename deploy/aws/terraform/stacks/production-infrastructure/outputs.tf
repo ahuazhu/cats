@@ -31,17 +31,17 @@ output "usage_pod_identity_association_id" {
 }
 
 output "worker_artifact_bucket_name" {
-  value = module.metal_worker_deployment.artifact_bucket_name
+  value = one(module.metal_worker_deployment[*].artifact_bucket_name)
 }
 
 output "worker_bundle_key" {
-  value = module.metal_worker_deployment.worker_bundle_key
+  value = one(module.metal_worker_deployment[*].worker_bundle_key)
 }
 
 output "worker_deployment_association_id" {
-  value = module.metal_worker_deployment.association_id
+  value = one(module.metal_worker_deployment[*].association_id)
 }
 
 output "worker_runtime_secret_arn" {
-  value = module.metal_worker_deployment.runtime_secret_arn
+  value = one(module.metal_worker_deployment[*].runtime_secret_arn)
 }

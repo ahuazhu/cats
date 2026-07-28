@@ -13,8 +13,37 @@ module "usage_infrastructure" {
   tags                            = var.tags
 }
 
+locals {
+  metal_worker_enabled = (
+    var.metal_worker_enabled != null
+    ? var.metal_worker_enabled
+    : var.metal_worker_instance_id != ""
+  )
+}
+
+# Guard the half-configured case explicitly. Without it, enabling the worker
+# without a bundle fails deep inside the module on an empty S3 key.
+resource "terraform_data" "metal_worker_inputs" {
+  count = local.metal_worker_enabled ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition = alltrue([
+        var.metal_worker_instance_id != "",
+        var.metal_worker_instance_role_name != "",
+        var.worker_bundle_path != "",
+        var.worker_bundle_sha256 != "",
+        length(var.worker_runtime_secret_data) > 0,
+      ])
+      error_message = "The metal worker release path needs instance id, instance role, bundle path, bundle sha256 and runtime secret data. Leave metal_worker_instance_id empty to skip it until the hardware exists."
+    }
+  }
+}
+
 module "metal_worker_deployment" {
   source = "../../modules/metal-worker-deployment"
+
+  count = local.metal_worker_enabled ? 1 : 0
 
   name_prefix                = "cats"
   environment                = var.environment
