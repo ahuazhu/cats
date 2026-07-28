@@ -217,16 +217,8 @@ jobs:
               's/^const SCHEMA_VERSION: i64 = ([0-9]+);$/\1/p' \
               control-plane/src/store.rs
           )"
-          min_supported_schema="$(
-            sed -nE \
-              's/^const MIN_SUPPORTED_SCHEMA_VERSION: i64 = ([0-9]+);$/\1/p' \
-              control-plane/src/store.rs
-          )"
-          if [[ ! "$required_schema" =~ ^[0-9]+$ ]] \
-            || [[ ! "$min_supported_schema" =~ ^[0-9]+$ ]] \
-            || (( min_supported_schema > required_schema ))
-          then
-            echo "::error::Could not read a valid control-plane schema compatibility range"
+          if [[ ! "$required_schema" =~ ^[0-9]+$ ]]; then
+            echo "::error::Could not read control-plane SCHEMA_VERSION"
             exit 1
           fi
 
@@ -267,12 +259,9 @@ jobs:
           PY
             )"
 
-            if (( actual_schema < min_supported_schema || actual_schema > required_schema )); then
-              echo "::error::Control database schema $actual_schema is outside this build's supported range $min_supported_schema..$required_schema. The deployment will not replace the live Pod or delete production data automatically."
-              exit 1
-            fi
             if [[ "$actual_schema" != "$required_schema" ]]; then
-              echo "::notice::Control database schema $actual_schema will be migrated to $required_schema by cats-controld."
+              echo "::error::Control database schema $actual_schema is incompatible with build schema $required_schema. cats-controld does not migrate; recreate the database with the reviewed runbook before retrying. The deployment will not replace the live Pod or delete production data automatically."
+              exit 1
             fi
           fi
 

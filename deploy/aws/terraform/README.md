@@ -240,11 +240,11 @@ environment; the first application install still needs the explicit secret
 injection described above.
 
 Before planning, the workflow reads only the live SQLite header with Python and
-compares `PRAGMA user_version` with the build's
-`MIN_SUPPORTED_SCHEMA_VERSION..SCHEMA_VERSION` range. It permits only migrations
-the build explicitly carries and tests, and fails before replacing the live Pod
-for any version outside that range. It never copies resource rows or deletes the
-PVC.
+compares `PRAGMA user_version` with the build's `SCHEMA_VERSION`. `cats-controld`
+does not migrate, so the workflow fails before replacing the live Pod on any
+mismatch. It never copies resource rows or deletes the PVC — recreating the
+database stays an explicit operator action described in the AWS deployment
+runbook.
 
 ## Importing the existing Kubernetes deployment
 
