@@ -950,12 +950,17 @@ impl GuestAgent {
             (1..=1_000).contains(&rows) && (1..=1_000).contains(&cols),
             "terminal dimensions must be in 1..=1000"
         );
-        let pair = native_pty_system().openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
+        // Every step below can fail with a bare io error. Without context the
+        // caller receives "Permission denied (os error 13)" and cannot tell a
+        // PTY allocation failure from an exec failure.
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("allocate shell pty")?;
         let shell = if Path::new("/bin/bash").is_file() {
             "/bin/bash"
         } else {
@@ -969,15 +974,22 @@ impl GuestAgent {
         command.env("LOGNAME", "root");
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
-        command.cwd(if Path::new("/root").is_dir() {
+        let cwd = if Path::new("/root").is_dir() {
             "/root"
         } else {
             "/"
-        });
-        let mut child = pair.slave.spawn_command(command)?;
+        };
+        command.cwd(cwd);
+        let mut child = pair
+            .slave
+            .spawn_command(command)
+            .with_context(|| format!("spawn shell {shell} in {cwd}"))?;
         drop(pair.slave);
-        let mut pty_reader = pair.master.try_clone_reader()?;
-        let mut pty_writer = pair.master.take_writer()?;
+        let mut pty_reader = pair
+            .master
+            .try_clone_reader()
+            .context("clone shell pty reader")?;
+        let mut pty_writer = pair.master.take_writer().context("take shell pty writer")?;
 
         write_frame(
             stream,
