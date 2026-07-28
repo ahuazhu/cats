@@ -1014,6 +1014,44 @@ BEGIN
     END IF;
 END
 $migration$;
+DO $migration$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM {schema}.schema_migrations WHERE version = 5
+    ) THEN
+        -- Remaining legacy project_id columns from the same pre-rename shape:
+        -- the usage tables track the Workspace, checkout intents the Account.
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = '{schema}'
+              AND table_name = 'usage_checkpoints'
+              AND column_name = 'project_id'
+        ) THEN
+            ALTER TABLE {schema}.usage_checkpoints
+                RENAME COLUMN project_id TO workspace_id;
+        END IF;
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = '{schema}'
+              AND table_name = 'usage_intervals'
+              AND column_name = 'project_id'
+        ) THEN
+            ALTER TABLE {schema}.usage_intervals
+                RENAME COLUMN project_id TO workspace_id;
+        END IF;
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = '{schema}'
+              AND table_name = 'checkout_intents'
+              AND column_name = 'project_id'
+        ) THEN
+            ALTER TABLE {schema}.checkout_intents
+                RENAME COLUMN project_id TO account_id;
+        END IF;
+        INSERT INTO {schema}.schema_migrations (version) VALUES (5);
+    END IF;
+END
+$migration$;
 "#
     )
 }
@@ -1445,10 +1483,12 @@ mod tests {
         assert!(sql.contains("NUMERIC(39, 0)"));
         assert!(sql.contains("version = 2"));
         assert!(sql.contains("VALUES (3) ON CONFLICT"));
-        // The v4 rung heals databases created before the Project -> Account
-        // rename, where billing_accounts still carries project_id.
+        // Rungs 4 and 5 heal databases created before the Project -> Account/
+        // Workspace rename, where the tables still carry project_id.
         assert!(sql.contains("version = 4"));
         assert!(sql.contains("RENAME COLUMN project_id TO account_id"));
+        assert!(sql.contains("version = 5"));
+        assert!(sql.contains("RENAME COLUMN project_id TO workspace_id"));
         assert!(sql.contains("credit_ledger_entries"));
         assert!(sql.contains("checkout_intents"));
         assert!(sql.contains("stripe_events"));
