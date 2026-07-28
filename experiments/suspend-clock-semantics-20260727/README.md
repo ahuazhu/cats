@@ -230,9 +230,34 @@ Warm 之后 guest 的墙钟是静默错误的。**
 
 - **Warm 已测（§6.5），但只到 120 秒静置。** 跨小时的 Warm 静置、以及"累加漂移"在几十次
   循环后的实际幅度都没测。按机制推断是线性累加，但没有数据。
-- **CH 的 `SnapshotRestore` 为什么没有推进时钟，没有查清。** 可能是没被这条 `vm.restore`
-  路径触发、可能需要额外标志、也可能是 CH 的缺陷。这决定 Cats 是"自己补一次校时"还是
-  "只要触发到 CH 已有的机制"，工作量差别很大。
+- ~~**CH 的 `SnapshotRestore` 为什么没有推进时钟，没有查清。**~~ **已定位（2026-07-28，读源码，
+  未重测）：三个猜测都不对，CH 和内核各自都是对的，问题在 guest 读的是哪个时钟。**
+
+  `vmm/src/vm.rs` 从快照重建时确实传了 `mode: SnapshotRestore`，`snapshot_clock` 也确实用
+  `with_realtime_filled()` 把 `KVM_CLOCK_REALTIME` 标志和快照时刻的 host realtime 存进了快照
+  ——所以既不是"没触发"，也不是"缺标志"。但 x86_64 的 `restore_clock`
+  （`hypervisor/src/kvm/mod.rs`）忽略 `mode`，只调 `set_clock(state)`，作用对象是 **kvmclock**；
+  trait 注释也明说 "x86 ignores it"。而本轮 guest 的串口日志显示它启动 0.3 秒后就切走了：
+
+  ```
+  [    0.247310] clocksource: Switched to clocksource kvm-clock
+  [    0.298774] clocksource: Switched to clocksource tsc
+  ```
+
+  原因在内核 `arch/x86/kernel/kvmclock.c`：host 暴露 invariant TSC 时，内核**主动**把 kvm-clock
+  的 rating 从 400 降到 299（低于 tsc 的 300），注释是 "Invariant TSC exposed by host means
+  kvmclock is not necessary"。于是 CH 调的是 kvmclock，guest 读的是 TSC，而 TSC 在 restore 时
+  被恢复成快照值——三个时钟一起冻在快照那一刻。这是 c5.metal / i4i.metal 这类裸金属上的
+  **预期行为**，不是配置失误。
+
+  对照 aarch64 的 `restore_clock`：它推进的是 `cntvct`，正是 guest 读的东西，所以那条路径是对的。
+  缺内核原语的架构在用户态实现了推进，有原语的 x86 用了一个 guest 可能不读的时钟。
+
+  **修法**：guest 内核 cmdline 加 `clocksource=kvm-clock`，把 guest 放回 restore 路径真正调整的
+  那个时钟上。已应用到 `cmd/noded` 的默认值与两个 systemd unit。**但本修复尚未在真机重测**
+  ——特别是 `CLOCK_MONOTONIC` 是否也跟着推进还没有数据，而那决定「只叫醒」在 Warm 下成不成立
+  （见 §9）。重跑 `run-warm.sh` 时应一并确认 `PVCLOCK_TSC_STABLE_BIT` 已设，否则 pvclock 会退出
+  vDSO 变成系统调用。
 - **Warm 循环用的是匿名 guest RAM**（为了让快照自包含）。生产的 Suspended 路径用
   file-backed memory zone，两者在 snapshot 时的行为不同（file-backed zone 会被跳过），
   所以生产形态下的 Warm 需要再验一次。
