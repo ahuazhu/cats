@@ -41,6 +41,7 @@ Fleet 管理员指南不属于官网用户文档。其双语源文件位于
 | Direct-S3 ChunkStore（Direct-OS 实现）详细设计 | [HTML](direct-s3-chunkstore-architecture.html) | [Markdown](direct-s3-chunkstore-architecture.md) | 已选定存储基线（ADR-0003） | cats-blockd 的对象块存储：Chunk/Map、Pending Commit、FLUSH、lease/fencing、Snapshot、GC 与恢复 |
 | 睡眠、唤醒与资源回收 | [HTML](cats-sleep-wake-vmm-resource-reclamation.html) | [Markdown](cats-sleep-wake-vmm-resource-reclamation.md) | 生命周期基线（ADR-0002 四态） | Running、Suspended（pause/page-out）、Warm（snapshot/VMM exit）、Cold 的资源与失败处理 |
 | 工作驱动快速休眠 | — | [Markdown](cats-auto-tier-product-and-implementation-design.md) | V1 dev shape（ADR-0007 Guest ABI） | 显式工作租约、立即 Suspend、Guest Runtime HTTP、竞态栅栏与 fail-awake |
+| 让真实应用能睡 | [HTML](cats-sleepable-workload-design.html) | [Markdown](cats-sleepable-workload-design.md) | 设计提案，未实现 | 真实负载被休眠时的十一类症状与责任划分：Service 定义、`pin`/`drain` 两种保活语义、`slept_ms`、只叫醒的时刻表 + 错过清单、框架适配器 |
 | 实验总报告 | — | [Markdown](experiments-2026-07-21-storage-lifecycle.md) | 实验证据 | 方法、代码、正式数字、失败尝试、结论和未验证事项 |
 
 ## 历史方案与外部参考
