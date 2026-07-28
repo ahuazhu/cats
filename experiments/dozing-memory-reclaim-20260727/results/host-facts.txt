@@ -1,0 +1,17 @@
+date_utc=2026-07-27T08:38:02Z
+instance_type=i4i.metal
+host_kernel=6.17.0-1019-aws
+guest_kernel=6.17.0-1019-aws  # cats guest image reuses the host kernel
+ch_version=cloud-hypervisor v53.0
+nproc=128
+memtotal_kib=1056630388
+halt_poll_ns=200000
+mglru_host=0x0007
+thp=always [madvise] never
+cgroup_version=cgroup2fs
+host_swap_kib=0
+guest_mem_mib=1024
+guest_vcpus=2
+jvm_xmx=384m
+block_backend=virtio-blk file (NOT vhost-user: see report caveats)
+work_dir_fs=/dev/nvme0n1 ext4 

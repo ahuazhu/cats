@@ -1,0 +1,20 @@
+[    0.000002] clocksource: kvm-clock: mask: 0xffffffffffffffff max_cycles: 0x1cd42e4dffb, max_idle_ns: 881590591483 ns
+[    0.007064] clocksource: refined-jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 1910969940391419 ns
+[    0.020068] rcu: Hierarchical RCU implementation.
+[    0.020069] rcu: 	RCU restricting CPUs from NR_CPUS=8192 to nr_cpu_ids=2.
+[    0.020070] 	Rude variant of Tasks RCU enabled.
+[    0.020071] 	Tracing variant of Tasks RCU enabled.
+[    0.020072] rcu: RCU calculated value of scheduler-enlistment delay is 100 jiffies.
+[    0.020072] rcu: Adjusting geometry for rcu_fanout_leaf=16, nr_cpu_ids=2
+[    0.020079] RCU Tasks Rude: Setting shift to 1 and lim to 1 rcu_task_cb_adjust=1 rcu_task_cpu_ids=2.
+[    0.020080] RCU Tasks Trace: Setting shift to 1 and lim to 1 rcu_task_cb_adjust=1 rcu_task_cpu_ids=2.
+[    0.023090] rcu: srcu_init: Setting srcu_struct sizes based on contention.
+[    0.070364] clocksource: tsc-early: mask: 0xffffffffffffffff max_cycles: 0x29cd2e00b34, max_idle_ns: 440795203668 ns
+[    0.075918] rcu: Hierarchical SRCU implementation.
+[    0.076132] rcu: 	Max phase no-delay instances is 400.
+[    0.081153] clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 1911260446275000 ns
+[    0.159489] clocksource: Switched to clocksource kvm-clock
+[    0.168364] clocksource: acpi_pm: mask: 0xffffff max_cycles: 0xffffff, max_idle_ns: 2085701024 ns
+[    0.190318] clocksource: tsc: mask: 0xffffffffffffffff max_cycles: 0x29cd2e00b34, max_idle_ns: 440795203668 ns
+[    0.191348] clocksource: Switched to clocksource tsc
+

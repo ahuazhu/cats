@@ -1,0 +1,1265 @@
+[    0.000000] Linux version 6.17.0-1019-aws (buildd@lcy02-amd64-070) (x86_64-linux-gnu-gcc-13 (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, GNU ld (GNU Binutils for Ubuntu) 2.42) #19~24.04.1-Ubuntu SMP Tue Jun 23 18:53:06 UTC 2026 (Ubuntu 6.17.0-1019.19~24.04.1-aws 6.17.13)
+[    0.000000] Command line: console=ttyS0 root=/dev/vda rw
+[    0.000000] KERNEL supported cpus:
+[    0.000000]   Intel GenuineIntel
+[    0.000000]   AMD AuthenticAMD
+[    0.000000]   Hygon HygonGenuine
+[    0.000000]   Centaur CentaurHauls
+[    0.000000]   zhaoxin   Shanghai  
+[    0.000000] BIOS-provided physical RAM map:
+[    0.000000] BIOS-e820: [mem 0x0000000000000000-0x000000000009ffff] usable
+[    0.000000] BIOS-e820: [mem 0x0000000000100000-0x000000001fffffff] usable
+[    0.000000] BIOS-e820: [mem 0x00000000e8000000-0x00000000f7ffffff] reserved
+[    0.000000] NX (Execute Disable) protection: active
+[    0.000000] APIC: Static calls initialized
+[    0.000000] SMBIOS 3.2.0 present.
+[    0.000000] DMI: Cloud Hypervisor cloud-hypervisor, BIOS 0 
+[    0.000000] DMI: Memory slots populated: 0/0
+[    0.000000] Hypervisor detected: KVM
+[    0.000000] last_pfn = 0x20000 max_arch_pfn = 0x400000000
+[    0.000000] kvm-clock: Using msrs 4b564d01 and 4b564d00
+[    0.000001] kvm-clock: using sched offset of 159697002 cycles
+[    0.000003] clocksource: kvm-clock: mask: 0xffffffffffffffff max_cycles: 0x1cd42e4dffb, max_idle_ns: 881590591483 ns
+[    0.000006] tsc: Detected 3000.000 MHz processor
+[    0.000019] last_pfn = 0x20000 max_arch_pfn = 0x400000000
+[    0.000044] MTRR map: 0 entries (0 fixed + 0 variable; max 16), built from 8 variable MTRRs
+[    0.000046] x86/PAT: Configuration [0-7]: WB  WC  UC- UC  WB  WP  UC- WT  
+[    0.000179] found SMP MP-table at [mem 0x000f0090-0x000f009f]
+[    0.000192] Using GB pages for direct mapping
+[    0.000277] RAMDISK: [mem 0x1fee0000-0x1fffffff]
+[    0.000282] ACPI: Early table checksum verification disabled
+[    0.000285] ACPI: RSDP 0x00000000000A0000 000024 (v02 CLOUDH)
+[    0.000288] ACPI: XSDT 0x00000000000A1469 00003C (v01 CLOUDH CHXSDT   00000001 RVAT 01000000)
+[    0.000294] ACPI: FACP 0x00000000000A12B7 000114 (v06 CLOUDH CHFACP   00000001 RVAT 01000000)
+[    0.000299] ACPI: DSDT 0x00000000000A0024 001293 (v06 CLOUDH CHDSDT   00000001 RVAT 01000000)
+[    0.000303] ACPI: APIC 0x00000000000A13CB 000062 (v05 CLOUDH CHMADT   00000001 RVAT 01000000)
+[    0.000306] ACPI: MCFG 0x00000000000A142D 00003C (v01 CLOUDH CHMCFG   00000001 RVAT 01000000)
+[    0.000308] ACPI: Reserving FACP table memory at [mem 0xa12b7-0xa13ca]
+[    0.000309] ACPI: Reserving DSDT table memory at [mem 0xa0024-0xa12b6]
+[    0.000310] ACPI: Reserving APIC table memory at [mem 0xa13cb-0xa142c]
+[    0.000311] ACPI: Reserving MCFG table memory at [mem 0xa142d-0xa1468]
+[    0.000854] No NUMA configuration found
+[    0.000855] Faking a node at [mem 0x0000000000000000-0x000000001fffffff]
+[    0.000864] NODE_DATA(0) allocated [mem 0x1feb52c0-0x1fedffff]
+[    0.001014] Zone ranges:
+[    0.001015]   DMA      [mem 0x0000000000001000-0x0000000000ffffff]
+[    0.001016]   DMA32    [mem 0x0000000001000000-0x000000001fffffff]
+[    0.001017]   Normal   empty
+[    0.001018]   Device   empty
+[    0.001019] Movable zone start for each node
+[    0.001020] Early memory node ranges
+[    0.001021]   node   0: [mem 0x0000000000001000-0x000000000009ffff]
+[    0.001022]   node   0: [mem 0x0000000000100000-0x000000001fffffff]
+[    0.001023] Initmem setup node 0 [mem 0x0000000000001000-0x000000001fffffff]
+[    0.001380] On node 0, zone DMA: 1 pages in unavailable ranges
+[    0.001400] On node 0, zone DMA: 96 pages in unavailable ranges
+[    0.003320] ACPI: PM-Timer IO Port: 0x608
+[    0.003415] IOAPIC[0]: apic_id 0, version 17, address 0xfec00000, GSI 0-23
+[    0.003420] ACPI: INT_SRC_OVR (bus 0 bus_irq 4 global_irq 4 dfl dfl)
+[    0.003423] ACPI: Using ACPI (MADT) for SMP configuration information
+[    0.003425] TSC deadline timer available
+[    0.003429] CPU topo: Max. logical packages:   1
+[    0.003429] CPU topo: Max. logical dies:       1
+[    0.003430] CPU topo: Max. dies per package:   1
+[    0.003434] CPU topo: Max. threads per core:   1
+[    0.003435] CPU topo: Num. cores per package:     2
+[    0.003435] CPU topo: Num. threads per package:   2
+[    0.003436] CPU topo: Allowing 2 present CPUs plus 0 hotplug CPUs
+[    0.003452] kvm-guest: APIC: eoi() replaced with kvm_guest_apic_eoi_write()
+[    0.003463] kvm-guest: KVM setup pv remote TLB flush
+[    0.003466] kvm-guest: setup PV sched yield
+[    0.003469] PM: hibernation: Registered nosave memory: [mem 0x00000000-0x00000fff]
+[    0.003471] PM: hibernation: Registered nosave memory: [mem 0x000a0000-0x000fffff]
+[    0.003472] [mem 0x20000000-0xe7ffffff] available for PCI devices
+[    0.003473] Booting paravirtualized kernel on KVM
+[    0.003475] clocksource: refined-jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 1910969940391419 ns
+[    0.003479] setup_percpu: NR_CPUS:8192 nr_cpumask_bits:2 nr_cpu_ids:2 nr_node_ids:1
+[    0.003989] percpu: Embedded 84 pages/cpu s221184 r8192 d114688 u1048576
+[    0.004020] kvm-guest: PV spinlocks enabled
+[    0.004022] PV qspinlock hash table entries: 256 (order: 0, 4096 bytes, linear)
+[    0.004024] Kernel command line: console=ttyS0 root=/dev/vda rw
+[    0.004066] random: crng init done
+[    0.004067] printk: log buffer data + meta data: 262144 + 917504 = 1179648 bytes
+[    0.004113] Dentry cache hash table entries: 65536 (order: 7, 524288 bytes, linear)
+[    0.004127] Inode-cache hash table entries: 32768 (order: 6, 262144 bytes, linear)
+[    0.004176] Fallback order for Node 0: 0 
+[    0.004178] Built 1 zonelists, mobility grouping on.  Total pages: 130975
+[    0.004179] Policy zone: DMA32
+[    0.004184] mem auto-init: stack:all(zero), heap alloc:on, heap free:off
+[    0.005758] SLUB: HWalign=64, Order=0-3, MinObjects=0, CPUs=2, Nodes=1
+[    0.005844] ftrace section at ffffffff8f2d7be0 sorted properly
+[    0.016431] ftrace: allocating 61817 entries in 244 pages
+[    0.016433] ftrace: allocated 244 pages with 5 groups
+[    0.016952] rcu: Hierarchical RCU implementation.
+[    0.016954] rcu: 	RCU restricting CPUs from NR_CPUS=8192 to nr_cpu_ids=2.
+[    0.016955] 	Rude variant of Tasks RCU enabled.
+[    0.016955] 	Tracing variant of Tasks RCU enabled.
+[    0.016956] rcu: RCU calculated value of scheduler-enlistment delay is 100 jiffies.
+[    0.016956] rcu: Adjusting geometry for rcu_fanout_leaf=16, nr_cpu_ids=2
+[    0.016963] RCU Tasks Rude: Setting shift to 1 and lim to 1 rcu_task_cb_adjust=1 rcu_task_cpu_ids=2.
+[    0.016964] RCU Tasks Trace: Setting shift to 1 and lim to 1 rcu_task_cb_adjust=1 rcu_task_cpu_ids=2.
+[    0.020612] NR_IRQS: 524544, nr_irqs: 424, preallocated irqs: 0
+[    0.020650] rcu: srcu_init: Setting srcu_struct sizes based on contention.
+[    0.020714] Console: colour dummy device 80x25
+[    0.020767] printk: legacy console [ttyS0] enabled
+[    0.104608] ACPI: Core revision 20250404
+[    0.105171] APIC: Switch to symmetric I/O mode setup
+[    0.106456] x2apic enabled
+[    0.107478] APIC: Switched APIC routing to: physical x2apic
+[    0.108210] kvm-guest: APIC: send_IPI_mask() replaced with kvm_send_ipi_mask()
+[    0.109151] kvm-guest: APIC: send_IPI_mask_allbutself() replaced with kvm_send_ipi_mask_allbutself()
+[    0.110330] kvm-guest: setup PV IPIs
+[    0.110851] clocksource: tsc-early: mask: 0xffffffffffffffff max_cycles: 0x2b3e459bf4c, max_idle_ns: 440795289890 ns
+[    0.112222] Calibrating delay loop (skipped) preset value.. 6000.00 BogoMIPS (lpj=3000000)
+[    0.113219] x86/cpu: User Mode Instruction Prevention (UMIP) activated
+[    0.113219] Last level iTLB entries: 4KB 64, 2MB 8, 4MB 8
+[    0.113219] Last level dTLB entries: 4KB 64, 2MB 32, 4MB 32, 1GB 4
+[    0.113219] mitigations: Enabled attack vectors: user_kernel, user_user, guest_host, guest_guest, SMT mitigations: auto
+[    0.113219] Speculative Store Bypass: Mitigation: Speculative Store Bypass disabled via prctl
+[    0.113219] Spectre V2 : Mitigation: Enhanced / Automatic IBRS
+[    0.113219] RETBleed: Mitigation: Enhanced IBRS
+[    0.113219] ITS: Mitigation: Aligned branch/return thunks
+[    0.113219] MMIO Stale Data: Mitigation: Clear CPU buffers
+[    0.113219] Spectre V1 : Mitigation: usercopy/swapgs barriers and __user pointer sanitization
+[    0.113219] Spectre V2 : Spectre v2 / PBRSB-eIBRS: Retire a single CALL on VMEXIT
+[    0.113219] Spectre V2 : mitigation: Enabling conditional Indirect Branch Prediction Barrier
+[    0.113219] GDS: Unknown: Dependent on hypervisor status
+[    0.113219] active return thunk: its_return_thunk
+[    0.113219] Spectre V2 : Spectre BHI mitigation: SW BHB clearing on syscall and VM exit
+[    0.113219] x86/fpu: Supporting XSAVE feature 0x001: 'x87 floating point registers'
+[    0.113219] x86/fpu: Supporting XSAVE feature 0x002: 'SSE registers'
+[    0.113219] x86/fpu: Supporting XSAVE feature 0x004: 'AVX registers'
+[    0.113219] x86/fpu: Supporting XSAVE feature 0x008: 'MPX bounds registers'
+[    0.113219] x86/fpu: Supporting XSAVE feature 0x010: 'MPX CSR'
+[    0.113219] x86/fpu: Supporting XSAVE feature 0x020: 'AVX-512 opmask'
+[    0.113219] x86/fpu: Supporting XSAVE feature 0x040: 'AVX-512 Hi256'
+[    0.113219] x86/fpu: Supporting XSAVE feature 0x080: 'AVX-512 ZMM_Hi256'
+[    0.113219] x86/fpu: Supporting XSAVE feature 0x200: 'Protection Keys User registers'
+[    0.113219] x86/fpu: xstate_offset[2]:  576, xstate_sizes[2]:  256
+[    0.113219] x86/fpu: xstate_offset[3]:  832, xstate_sizes[3]:   64
+[    0.113219] x86/fpu: xstate_offset[4]:  896, xstate_sizes[4]:   64
+[    0.113219] x86/fpu: xstate_offset[5]:  960, xstate_sizes[5]:   64
+[    0.113219] x86/fpu: xstate_offset[6]: 1024, xstate_sizes[6]:  512
+[    0.113219] x86/fpu: xstate_offset[7]: 1536, xstate_sizes[7]: 1024
+[    0.113219] x86/fpu: xstate_offset[9]: 2560, xstate_sizes[9]:    8
+[    0.113219] x86/fpu: Enabled xstate features 0x2ff, context size is 2568 bytes, using 'compacted' format.
+[    0.113219] Freeing SMP alternatives memory: 52K
+[    0.113219] pid_max: default: 32768 minimum: 301
+[    0.113219] LSM: initializing lsm=lockdown,capability,landlock,yama,apparmor,ima,evm
+[    0.113219] landlock: Up and running.
+[    0.113219] Yama: becoming mindful.
+[    0.113219] AppArmor: AppArmor initialized
+[    0.113219] Mount-cache hash table entries: 1024 (order: 1, 8192 bytes, linear)
+[    0.113219] Mountpoint-cache hash table entries: 1024 (order: 1, 8192 bytes, linear)
+[    0.113219] smpboot: CPU0: Intel(R) Xeon(R) Platinum 8275CL CPU @ 3.00GHz (family: 0x6, model: 0x55, stepping: 0x7)
+[    0.113414] Performance Events: Skylake events, 32-deep LBR, full-width counters, Intel PMU driver.
+[    0.115225] ... version:                2
+[    0.115765] ... bit width:              48
+[    0.116222] ... generic registers:      4
+[    0.116763] ... value mask:             0000ffffffffffff
+[    0.117222] ... max period:             00007fffffffffff
+[    0.117930] ... fixed-purpose events:   3
+[    0.118222] ... event mask:             000000070000000f
+[    0.119028] signal: max sigframe size: 3632
+[    0.119259] rcu: Hierarchical SRCU implementation.
+[    0.119902] rcu: 	Max phase no-delay instances is 400.
+[    0.120633] Timer migration: 1 hierarchy levels; 8 children per group; 1 crossnode level
+[    0.121901] smp: Bringing up secondary CPUs ...
+[    0.122336] smpboot: x86: Booting SMP configuration:
+[    0.122999] .... node  #0, CPUs:      #1
+[    0.123265] smp: Brought up 1 node, 2 CPUs
+[    0.124225] smpboot: Total of 2 processors activated (12000.00 BogoMIPS)
+[    0.125299] Memory: 449480K/523900K available (22157K kernel code, 4676K rwdata, 15576K rodata, 5396K init, 6104K bss, 66968K reserved, 0K cma-reserved)
+[    0.126294] devtmpfs: initialized
+[    0.126748] x86/mm: Memory block size: 128MB
+[    0.127423] clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 1911260446275000 ns
+[    0.128235] posixtimers hash table entries: 1024 (order: 2, 16384 bytes, linear)
+[    0.129228] futex hash table entries: 512 (32768 bytes on 1 NUMA nodes, total 32 KiB, linear).
+[    0.130280] pinctrl core: initialized pinctrl subsystem
+[    0.131202] PM: RTC time: 09:49:20, date: 2026-07-27
+[    0.132256] NET: Registered PF_NETLINK/PF_ROUTE protocol family
+[    0.133149] DMA: preallocated 128 KiB GFP_KERNEL pool for atomic allocations
+[    0.133250] DMA: preallocated 128 KiB GFP_KERNEL|GFP_DMA pool for atomic allocations
+[    0.134231] DMA: preallocated 128 KiB GFP_KERNEL|GFP_DMA32 pool for atomic allocations
+[    0.135231] audit: initializing netlink subsys (disabled)
+[    0.135957] audit: type=2000 audit(1785145759.914:1): state=initialized audit_enabled=0 res=1
+[    0.135957] thermal_sys: Registered thermal governor 'fair_share'
+[    0.136219] thermal_sys: Registered thermal governor 'bang_bang'
+[    0.136224] thermal_sys: Registered thermal governor 'step_wise'
+[    0.137222] thermal_sys: Registered thermal governor 'user_space'
+[    0.138223] thermal_sys: Registered thermal governor 'power_allocator'
+[    0.139223] cpuidle: using governor ladder
+[    0.140803] cpuidle: using governor menu
+[    0.141299] acpiphp: ACPI Hot Plug PCI Controller Driver version: 0.5
+[    0.142323] PCI: ECAM [mem 0xe8000000-0xe80fffff] (base 0xe8000000) for domain 0000 [bus 00-00]
+[    0.143223] PCI: ECAM [mem 0xe8000000-0xe80fffff] reserved as E820 entry
+[    0.144168] PCI: Using configuration type 1 for base access
+[    0.145288] kprobes: kprobe jump-optimization is enabled. All kprobes are optimized if possible.
+[    0.161249] HugeTLB: registered 1.00 GiB page size, pre-allocated 0 pages
+[    0.162206] HugeTLB: 16380 KiB vmemmap can be freed for a 1.00 GiB page
+[    0.162223] HugeTLB: registered 2.00 MiB page size, pre-allocated 0 pages
+[    0.163150] HugeTLB: 28 KiB vmemmap can be freed for a 2.00 MiB page
+[    0.166573] ACPI: Added _OSI(Module Device)
+[    0.167178] ACPI: Added _OSI(Processor Device)
+[    0.167223] ACPI: Added _OSI(Processor Aggregator Device)
+[    0.168316] ACPI: 1 ACPI AML tables successfully acquired and loaded
+[    0.172537] ACPI: Interpreter enabled
+[    0.173229] ACPI: PM: (supports S0 S5)
+[    0.173764] ACPI: Using IOAPIC for interrupt routing
+[    0.174296] PCI: Using host bridge windows from ACPI; if necessary, use "pci=nocrs" and report a bug
+[    0.175222] PCI: Using E820 reservations for host bridge windows
+[    0.177589] ACPI: PCI Root Bridge [PC00] (domain 0000 [bus 00])
+[    0.178226] acpi PNP0A08:00: _OSC: OS supports [ExtendedConfig ASPM ClockPM Segments MSI EDR HPX-Type3]
+[    0.179226] acpi PNP0A08:00: _OSC: OS requested [PCIeHotplug SHPCHotplug PME AER PCIeCapability LTR DPC]
+[    0.180223] acpi PNP0A08:00: _OSC: platform willing to grant [PCIeHotplug SHPCHotplug PME AER PCIeCapability LTR DPC]
+[    0.181222] acpi PNP0A08:00: _OSC: platform retains control of PCIe features (AE_NOT_FOUND)
+[    0.182461] acpiphp: Slot [0] registered
+[    0.183044] acpiphp: Slot [1] registered
+[    0.183241] acpiphp: Slot [2] registered
+[    0.183788] acpiphp: Slot [3] registered
+[    0.184240] acpiphp: Slot [4] registered
+[    0.184798] acpiphp: Slot [5] registered
+[    0.185241] acpiphp: Slot [6] registered
+[    0.185787] acpiphp: Slot [7] registered
+[    0.186240] acpiphp: Slot [8] registered
+[    0.186786] acpiphp: Slot [9] registered
+[    0.187240] acpiphp: Slot [10] registered
+[    0.187794] acpiphp: Slot [11] registered
+[    0.188240] acpiphp: Slot [12] registered
+[    0.188792] acpiphp: Slot [13] registered
+[    0.189241] acpiphp: Slot [14] registered
+[    0.189793] acpiphp: Slot [15] registered
+[    0.190240] acpiphp: Slot [16] registered
+[    0.190793] acpiphp: Slot [17] registered
+[    0.191240] acpiphp: Slot [18] registered
+[    0.191802] acpiphp: Slot [19] registered
+[    0.192240] acpiphp: Slot [20] registered
+[    0.192798] acpiphp: Slot [21] registered
+[    0.193239] acpiphp: Slot [22] registered
+[    0.193797] acpiphp: Slot [23] registered
+[    0.194240] acpiphp: Slot [24] registered
+[    0.194796] acpiphp: Slot [25] registered
+[    0.195240] acpiphp: Slot [26] registered
+[    0.195797] acpiphp: Slot [27] registered
+[    0.196240] acpiphp: Slot [28] registered
+[    0.196795] acpiphp: Slot [29] registered
+[    0.197240] acpiphp: Slot [30] registered
+[    0.197794] acpiphp: Slot [31] registered
+[    0.198254] PCI host bridge to bus 0000:00
+[    0.198816] pci_bus 0000:00: root bus resource [mem 0xe8000000-0xe80fffff]
+[    0.199222] pci_bus 0000:00: root bus resource [mem 0xc0000000-0xe7ffffff window]
+[    0.200210] pci_bus 0000:00: root bus resource [mem 0x100000000-0x3fffffeeffff window]
+[    0.200222] pci_bus 0000:00: root bus resource [io  0x0000-0x0cf7 window]
+[    0.201117] pci_bus 0000:00: root bus resource [io  0x0d00-0xffff window]
+[    0.201222] pci_bus 0000:00: root bus resource [bus 00]
+[    0.202010] pci 0000:00:00.0: [8086:0d57] type 00 class 0x060000 conventional PCI endpoint
+[    0.203112] pci 0000:00:01.0: [1af4:1042] type 00 class 0x018000 conventional PCI endpoint
+[    0.203578] pci 0000:00:01.0: BAR 0 [mem 0xe7f80000-0xe7ffffff]
+[    0.205254] pci 0000:00:02.0: [1af4:1044] type 00 class 0xffff00 conventional PCI endpoint
+[    0.206588] pci 0000:00:02.0: BAR 0 [mem 0x3fffff800000-0x3fffff87ffff 64bit]
+[    0.208121] pci 0000:00:03.0: [1af4:1053] type 00 class 0xffff00 conventional PCI endpoint
+[    0.208586] pci 0000:00:03.0: BAR 0 [mem 0x3fffff000000-0x3fffff07ffff 64bit]
+[    0.216668] iommu: Default domain type: Translated
+[    0.217227] iommu: DMA domain TLB invalidation policy: lazy mode
+[    0.218040] SCSI subsystem initialized
+[    0.218248] ACPI: bus type USB registered
+[    0.218801] usbcore: registered new interface driver usbfs
+[    0.219230] usbcore: registered new interface driver hub
+[    0.219943] usbcore: registered new device driver usb
+[    0.220240] pps_core: LinuxPPS API ver. 1 registered
+[    0.220901] pps_core: Software ver. 5.3.6 - Copyright 2005-2007 Rodolfo Giometti <giometti@linux.it>
+[    0.221224] PTP clock support registered
+[    0.221786] EDAC MC: Ver: 3.0.0
+[    0.222426] NetLabel: Initializing
+[    0.222890] NetLabel:  domain hash size = 128
+[    0.223223] NetLabel:  protocols = UNLABELED CIPSOv4 CALIPSO
+[    0.223985] NetLabel:  unlabeled traffic allowed by default
+[    0.224254] mctp: management component transport protocol core
+[    0.225009] NET: Registered PF_MCTP protocol family
+[    0.225232] PCI: Using ACPI for IRQ routing
+[    0.225888] vgaarb: loaded
+[    0.226263] clocksource: Switched to clocksource kvm-clock
+[    0.227439] VFS: Disk quotas dquot_6.6.0
+[    0.228015] VFS: Dquot-cache hash table entries: 512 (order 0, 4096 bytes)
+[    0.229142] AppArmor: AppArmor Filesystem Enabled
+[    0.229792] pnp: PnP ACPI init
+[    0.230270] system 00:00: [mem 0xe8000000-0xe80fffff] has been reserved
+[    0.231276] pnp: PnP ACPI: found 2 devices
+[    0.237887] clocksource: acpi_pm: mask: 0xffffff max_cycles: 0xffffff, max_idle_ns: 2085701024 ns
+[    0.239111] NET: Registered PF_INET protocol family
+[    0.239787] IP idents hash table entries: 8192 (order: 4, 65536 bytes, linear)
+[    0.253341] tcp_listen_portaddr_hash hash table entries: 256 (order: 0, 4096 bytes, linear)
+[    0.254470] Table-perturb hash table entries: 65536 (order: 6, 262144 bytes, linear)
+[    0.255514] TCP established hash table entries: 4096 (order: 3, 32768 bytes, linear)
+[    0.256547] TCP bind hash table entries: 4096 (order: 5, 131072 bytes, linear)
+[    0.257511] TCP: Hash tables configured (established 4096 bind 4096)
+[    0.258381] MPTCP token hash table entries: 512 (order: 2, 12288 bytes, linear)
+[    0.259357] UDP hash table entries: 256 (order: 2, 16384 bytes, linear)
+[    0.260240] UDP-Lite hash table entries: 256 (order: 2, 16384 bytes, linear)
+[    0.261202] NET: Registered PF_UNIX/PF_LOCAL protocol family
+[    0.261969] NET: Registered PF_XDP protocol family
+[    0.262614] pci_bus 0000:00: resource 4 [mem 0xe8000000-0xe80fffff]
+[    0.263440] pci_bus 0000:00: resource 5 [mem 0xc0000000-0xe7ffffff window]
+[    0.264349] pci_bus 0000:00: resource 6 [mem 0x100000000-0x3fffffeeffff window]
+[    0.265311] pci_bus 0000:00: resource 7 [io  0x0000-0x0cf7 window]
+[    0.266138] pci_bus 0000:00: resource 8 [io  0x0d00-0xffff window]
+[    0.267023] PCI: CLS 0 bytes, default 64
+[    0.267635] clocksource: tsc: mask: 0xffffffffffffffff max_cycles: 0x2b3e459bf4c, max_idle_ns: 440795289890 ns
+[    0.267720] Trying to unpack rootfs image as initramfs...
+[    0.269776] clocksource: Switched to clocksource tsc
+[    0.270455] platform rtc_cmos: registered platform RTC device (no PNP device found)
+[    0.278778] Initialise system trusted keyrings
+[    0.279440] Key type blacklist registered
+[    0.280057] workingset: timestamp_bits=36 max_order=17 bucket_order=0
+[    0.281167] squashfs: version 4.0 (2009/01/31) Phillip Lougher
+[    0.282033] fuse: init (API version 7.44)
+[    0.282175] Freeing initrd memory: 1152K
+[    0.283149] integrity: Platform Keyring initialized
+[    0.283815] integrity: Machine keyring initialized
+[    0.293700] Key type asymmetric registered
+[    0.294256] Asymmetric key parser 'x509' registered
+[    0.294922] Block layer SCSI generic (bsg) driver version 0.4 loaded (major 242)
+[    0.296017] io scheduler mq-deadline registered
+[    0.296705] ledtrig-cpu: registered to indicate activity on CPUs
+[    0.297957] input: Power Button as /devices/LNXSYSTM:00/LNXSYBUS:00/PNP0C0C:00/input/input0
+[    0.299204] ACPI: button: Power Button [PWRB]
+[    0.300102] virtio-pci 0000:00:01.0: enabling device (0000 -> 0002)
+[    0.301775] virtio-pci 0000:00:02.0: enabling device (0000 -> 0002)
+[    0.303406] virtio-pci 0000:00:03.0: enabling device (0000 -> 0002)
+[    0.305086] Serial: 8250/16550 driver, 4 ports, IRQ sharing enabled
+[    0.328709] 00:01: ttyS0 at I/O 0x3f8 (irq = 24, base_baud = 115200) is a U6_16550A
+[    0.330223] Linux agpgart interface v0.103
+[    0.331790] loop: module loaded
+[    0.332415] virtio_blk virtio0: 1/0/0 default/read/poll queues
+[    0.333997] virtio_blk virtio0: [vda] 1843200 512-byte logical blocks (944 MB/900 MiB)
+[    0.336108] Key type psk registered
+[    0.336878] ACPI: bus type drm_connector registered
+[    0.337734] tun: Universal TUN/TAP device driver, 1.6
+[    0.338556] PPP generic driver version 2.4.2
+[    0.339327] i8042: PNP: No PS/2 controller found.
+[    0.340075] mousedev: PS/2 mouse device common for all mice
+[    0.341090] rtc_cmos rtc_cmos: only 24-hr supported
+[    0.341801] i2c_dev: i2c /dev entries driver
+[    0.342435] device-mapper: core: CONFIG_IMA_DISABLE_HTABLE is disabled. Duplicate IMA measurements will not be recorded in the IMA log.
+[    0.344152] device-mapper: uevent: version 1.0.3
+[    0.344863] device-mapper: ioctl: 4.50.0-ioctl (2025-04-28) initialised: dm-devel@lists.linux.dev
+[    0.346138] intel_pstate: CPU model not supported
+[    0.346831] drop_monitor: Initializing network drop monitor service
+[    0.347827] NET: Registered PF_INET6 protocol family
+[    0.349212] Segment Routing with IPv6
+[    0.349763] In-situ OAM (IOAM) with IPv6
+[    0.350357] NET: Registered PF_PACKET protocol family
+[    0.351113] Key type dns_resolver registered
+[    0.351964] resctrl: No MBM correction factor available
+[    0.352721] IPI shorthand broadcast: enabled
+[    0.355229] sched_clock: Marking stable (263311228, 91564348)->(454572836, -99697260)
+[    0.356476] registered taskstats version 1
+[    0.357219] Loading compiled-in X.509 certificates
+[    0.358412] Loaded X.509 cert 'Build time autogenerated kernel key: dbca36f52726e823ed7884ff5f66bb394f32a30d'
+[    0.360254] Loaded X.509 cert 'Canonical Ltd. Live Patch Signing 2025 Kmod: d541cef61dc7e793b7eb7e899970a2eef0b5dc8c'
+[    0.362117] Loaded X.509 cert 'Canonical Ltd. Live Patch Signing: 14df34d1a87cf37625abec039ef2bf521249b969'
+[    0.363903] Loaded X.509 cert 'Canonical Ltd. Kernel Module Signing 2025 Kmod: 4627603d2357a2a3f81006370894c221175893e9'
+[    0.365812] Loaded X.509 cert 'Canonical Ltd. Kernel Module Signing: 88f752e560a1e0737e31163a466ad7b70a850c19'
+[    0.367224] blacklist: Loading compiled-in revocation X.509 certificates
+[    0.368210] Loaded X.509 cert 'Canonical Ltd. Secure Boot Signing: 61482aa2830d0ab2ad5af10b7250da9033ddcef0'
+[    0.369586] Loaded X.509 cert 'Canonical Ltd. Secure Boot Signing (2017): 242ade75ac4a15e50d50c84b0d45ff3eae707a03'
+[    0.371042] Loaded X.509 cert 'Canonical Ltd. Secure Boot Signing (ESM 2018): 365188c1d374d6b07c3c8f240f8ef722433d6a8b'
+[    0.372536] Loaded X.509 cert 'Canonical Ltd. Secure Boot Signing (2019): c0746fd6c5da3ae827864651ad66ae47fe24b3e8'
+[    0.374001] Loaded X.509 cert 'Canonical Ltd. Secure Boot Signing (2021 v1): a8d54bbb3825cfb94fa13c9f8a594a195c107b8d'
+[    0.375454] Loaded X.509 cert 'Canonical Ltd. Secure Boot Signing (2021 v2): 4cf046892d6fd3c9a5b03f98d845f90851dc6a8c'
+[    0.376943] Loaded X.509 cert 'Canonical Ltd. Secure Boot Signing (2021 v3): 100437bb6de6e469b581e61cd66bce3ef4ed53af'
+[    0.378364] Loaded X.509 cert 'Canonical Ltd. Secure Boot Signing (Ubuntu Core 2019): c1d57b8f6b743f23ee41f4f7ee292f06eecadfb9'
+[    0.383197] Demotion targets for Node 0: null
+[    0.383917] Key type .fscrypt registered
+[    0.384479] Key type fscrypt-provisioning registered
+[    0.385234] Key type big_key registered
+[    0.386103] Key type encrypted registered
+[    0.386656] AppArmor: AppArmor sha256 policy hashing enabled
+[    0.387464] ima: No TPM chip found, activating TPM-bypass!
+[    0.388241] Loading compiled-in module X.509 certificates
+[    0.389395] Loaded X.509 cert 'Build time autogenerated kernel key: dbca36f52726e823ed7884ff5f66bb394f32a30d'
+[    0.390697] ima: Allocated hash algorithm: sha256
+[    0.391377] ima: No architecture policies found
+[    0.392029] evm: Initialising EVM extended attributes:
+[    0.392751] evm: security.selinux
+[    0.393225] evm: security.SMACK64
+[    0.393674] evm: security.SMACK64EXEC
+[    0.394170] evm: security.SMACK64TRANSMUTE
+[    0.394722] evm: security.SMACK64MMAP
+[    0.395253] evm: security.apparmor
+[    0.395739] evm: security.ima
+[    0.396166] evm: security.capability
+[    0.396674] evm: HMAC attrs: 0x1
+[    0.397338] PM:   Magic number: 2:776:829
+[    0.400536] RAS: Correctable Errors collector initialized.
+[    0.409960] clk: Disabling unused clocks
+[    0.410520] PM: genpd: Disabling unused power domains
+[    0.413065] Freeing unused decrypted memory: 2028K
+[    0.414783] Freeing unused kernel image (initmem) memory: 5396K
+[    0.415297] Write protecting the kernel read-only data: 38912k
+[    0.416069] Freeing unused kernel image (text/rodata gap) memory: 368K
+[    0.416865] Freeing unused kernel image (rodata/data gap) memory: 808K
+[    0.430782] x86/mm: Checked W+X mappings: passed, no W+X pages found.
+[    0.431318] Run /init as init process
+[    0.434644] NET: Registered PF_VSOCK protocol family
+[    0.653613] EXT4-fs (vda): mounted filesystem 435078ac-c3b5-4de1-ab0c-eaf94fbc8003 r/w with ordered data mode. Quota mode: none.
+resize2fs 1.47.0 (5-Feb-2023)
+The filesystem is already 230400 (4k) blocks long.  Nothing to do!
+
+[2m2026-07-27T09:49:25.570969Z[0m [32m INFO[0m [2mcats_guest_agent[0m[2m:[0m guest agent booting [3mboot_id[0m[2m=[0m"453e7c38f18f41759fb319576b75e7f2" [3mmode[0m[2m=[0mvm
+[2m2026-07-27T09:49:25.572082Z[0m [32m INFO[0m [2mcats_guest_agent[0m[2m:[0m Guest runtime HTTP API listening [3msocket[0m[2m=[0m/run/cats/runtime.sock
+READY
+INFO,1785145765.5911,5.7201,5.7201,probe_start,sample_interval_s=0.25,rate_period_s=20.0,deadline_at_s=45.0
+INFO,1785145765.5921,5.7211,5.7211,guest_uptime_at_start,5.72
+CLKPROBE,1785145765.5929,5.7218,5.7218,1
+INFO,1785145765.5934,5.7223,5.7223,deadline_target_mono,50.7223
+CLKPROBE,1785145765.8436,5.9725,5.9725,2
+CLKPROBE,1785145766.0946,6.2236,6.2236,3
+CLKPROBE,1785145766.3457,6.4747,6.4747,4
+CLKPROBE,1785145766.5965,6.7255,6.7255,5
+CLKPROBE,1785145766.8475,6.9765,6.9765,6
+CLKPROBE,1785145767.0986,7.2275,7.2275,7
+CLKPROBE,1785145767.3497,7.4787,7.4787,8
+CLKPROBE,1785145767.6008,7.7297,7.7297,9
+CLKPROBE,1785145767.8516,7.9805,7.9805,10
+CLKPROBE,1785145768.1026,8.2315,8.2315,11
+CLKPROBE,1785145768.3536,8.4826,8.4826,12
+CLKPROBE,1785145768.6048,8.7337,8.7337,13
+CLKPROBE,1785145768.8558,8.9848,8.9848,14
+CLKPROBE,1785145769.1069,9.2358,9.2358,15
+CLKPROBE,1785145769.3579,9.4868,9.4868,16
+CLKPROBE,1785145769.6089,9.7378,9.7378,17
+CLKPROBE,1785145769.8598,9.9888,9.9888,18
+CLKPROBE,1785145770.1109,10.2399,10.2399,19
+CLKPROBE,1785145770.3619,10.4908,10.4908,20
+CLKPROBE,1785145770.6128,10.7418,10.7418,21
+CLKPROBE,1785145770.8647,10.9937,10.9937,22
+CLKPROBE,1785145771.1159,11.2448,11.2448,23
+CLKPROBE,1785145771.3669,11.4959,11.4959,24
+CLKPROBE,1785145771.6179,11.7469,11.7469,25
+CLKPROBE,1785145771.8688,11.9978,11.9978,26
+CLKPROBE,1785145772.1198,12.2487,12.2487,27
+CLKPROBE,1785145772.3709,12.4999,12.4999,28
+CLKPROBE,1785145772.6216,12.7506,12.7506,29
+CLKPROBE,1785145772.8727,13.0016,13.0016,30
+CLKPROBE,1785145773.1237,13.2527,13.2527,31
+CLKPROBE,1785145773.3745,13.5035,13.5035,32
+CLKPROBE,1785145773.6257,13.7547,13.7547,33
+CLKPROBE,1785145773.8769,14.0058,14.0058,34
+CLKPROBE,1785145774.1279,14.2568,14.2568,35
+CLKPROBE,1785145774.3788,14.5078,14.5078,36
+CLKPROBE,1785145774.6298,14.7587,14.7587,37
+CLKPROBE,1785145774.8809,15.0098,15.0098,38
+CLKPROBE,1785145775.1318,15.2608,15.2608,39
+CLKPROBE,1785145775.3828,15.5118,15.5118,40
+CLKPROBE,1785145775.6338,15.7628,15.7628,41
+CLKPROBE,1785145775.8849,16.0139,16.0139,42
+CLKPROBE,1785145776.1358,16.2647,16.2647,43
+CLKPROBE,1785145776.3866,16.5156,16.5156,44
+CLKPROBE,1785145776.6377,16.7667,16.7667,45
+CLKPROBE,1785145776.8889,17.0178,17.0178,46
+CLKPROBE,1785145777.1399,17.2688,17.2688,47
+CLKPROBE,1785145777.3909,17.5198,17.5198,48
+CLKPROBE,1785145777.6418,17.7708,17.7708,49
+CLKPROBE,1785145777.8928,18.0218,18.0218,50
+CLKPROBE,1785145778.1438,18.2728,18.2728,51
+CLKPROBE,1785145778.3947,18.5236,18.5236,52
+CLKPROBE,1785145778.6457,18.7746,18.7746,53
+CLKPROBE,1785145778.8968,19.0257,19.0257,54
+CLKPROBE,1785145779.1479,19.2769,19.2769,55
+CLKPROBE,1785145779.3989,19.5278,19.5278,56
+CLKPROBE,1785145779.6497,19.7786,19.7786,57
+CLKPROBE,1785145779.9007,20.0297,20.0297,58
+CLKPROBE,1785145780.1517,20.2807,20.2807,59
+CLKPROBE,1785145780.4026,20.5315,20.5315,60
+CLKPROBE,1785145780.6537,20.7826,20.7826,61
+CLKPROBE,1785145780.9049,21.0338,21.0338,62
+CLKPROBE,1785145781.1559,21.2849,21.2849,63
+CLKPROBE,1785145781.4066,21.5356,21.5356,64
+CLKPROBE,1785145781.6577,21.7867,21.7867,65
+CLKPROBE,1785145781.9088,22.0378,22.0378,66
+CLKPROBE,1785145782.1596,22.2886,22.2886,67
+CLKPROBE,1785145782.4108,22.5397,22.5397,68
+CLKPROBE,1785145782.6618,22.7908,22.7908,69
+CLKPROBE,1785145782.9128,23.0417,23.0417,70
+CLKPROBE,1785145783.1638,23.2927,23.2927,71
+CLKPROBE,1785145783.4146,23.5435,23.5435,72
+CLKPROBE,1785145783.6656,23.7946,23.7946,73
+CLKPROBE,1785145783.9165,24.0454,24.0454,74
+CLKPROBE,1785145784.1675,24.2965,24.2965,75
+CLKPROBE,1785145784.4187,24.5476,24.5476,76
+CLKPROBE,1785145784.6697,24.7987,24.7987,77
+CLKPROBE,1785145784.9207,25.0497,25.0497,78
+CLKPROBE,1785145785.1718,25.3008,25.3008,79
+CLKPROBE,1785145785.4228,25.5517,25.5517,80
+RATE,1785145785.5943,25.7232,25.7232,fire=1,k=1,target_mono=25.7230,behind_s=0.0002,ontime
+CLKPROBE,1785145785.6738,25.8027,25.8027,81
+CLKPROBE,1785145785.9248,26.0537,26.0537,82
+CLKPROBE,1785145786.1757,26.3047,26.3047,83
+CLKPROBE,1785145786.4269,26.5558,26.5558,84
+CLKPROBE,1785145786.6779,26.8069,26.8069,85
+CLKPROBE,1785145786.9290,27.0580,27.0580,86
+CLKPROBE,1785145787.1797,27.3087,27.3087,87
+CLKPROBE,1785145787.4306,27.5595,27.5595,88
+CLKPROBE,1785145787.6817,27.8107,27.8107,89
+CLKPROBE,1785145787.9327,28.0617,28.0617,90
+CLKPROBE,1785145788.1838,28.3128,28.3128,91
+CLKPROBE,1785145788.4349,28.5639,28.5639,92
+CLKPROBE,1785145788.6858,28.8147,28.8147,93
+CLKPROBE,1785145788.9366,29.0656,29.0656,94
+CLKPROBE,1785145789.1878,29.3167,29.3167,95
+CLKPROBE,1785145789.4388,29.5677,29.5677,96
+CLKPROBE,1785145789.6899,29.8188,29.8188,97
+CLKPROBE,1785145789.9409,30.0699,30.0699,98
+CLKPROBE,1785145790.1918,30.3207,30.3207,99
+CLKPROBE,1785145790.4426,30.5716,30.5716,100
+CLKPROBE,1785145790.6937,30.8227,30.8227,101
+[  120.978222] sched: DL replenish lagged too much
+CLKPROBE,1785145880.7570,120.8859,120.8859,102
+RATE,1785145880.7580,120.8869,120.8869,fire=2,k=2,target_mono=45.7230,behind_s=75.1639,ontime
+DEADLINE,1785145880.7588,120.8878,120.8878,fired,target_mono=50.7223,late_by_mono_s=70.1654
+RATE,1785145880.7590,120.8880,120.8880,fire=3,k=3,target_mono=65.7230,behind_s=55.1650,BURST
+RATE,1785145880.7609,120.8898,120.8898,fire=4,k=4,target_mono=85.7230,behind_s=35.1668,BURST
+RATE,1785145880.7617,120.8906,120.8906,fire=5,k=5,target_mono=105.7230,behind_s=15.1677,BURST
+CLKPROBE,1785145881.0081,121.1371,121.1371,103
+CLKPROBE,1785145881.2595,121.3885,121.3885,104
+CLKPROBE,1785145881.5103,121.6392,121.6392,105
+CLKPROBE,1785145881.7616,121.8906,121.8906,106
+CLKPROBE,1785145882.0126,122.1416,122.1416,107
+CLKPROBE,1785145882.2638,122.3928,122.3928,108
+CLKPROBE,1785145882.5147,122.6436,122.6436,109
+CLKPROBE,1785145882.7657,122.8946,122.8946,110
+CLKPROBE,1785145883.0167,123.1457,123.1457,111
+CLKPROBE,1785145883.2679,123.3969,123.3969,112
+CLKPROBE,1785145883.5189,123.6479,123.6479,113
+CLKPROBE,1785145883.7699,123.8989,123.8989,114
+CLKPROBE,1785145884.0210,124.1499,124.1499,115
+CLKPROBE,1785145884.2720,124.4009,124.4009,116
+CLKPROBE,1785145884.5230,124.6519,124.6519,117
+CLKPROBE,1785145884.7738,124.9028,124.9028,118
+CLKPROBE,1785145885.0249,125.1538,125.1538,119
+CLKPROBE,1785145885.2759,125.4049,125.4049,120
+CLKPROBE,1785145885.5269,125.6559,125.6559,121
+RATE,1785145885.5943,125.7232,125.7232,fire=6,k=6,target_mono=125.7230,behind_s=0.0002,ontime
+CLKPROBE,1785145885.7777,125.9066,125.9066,122
+CLKPROBE,1785145886.0288,126.1577,126.1577,123
+CLKPROBE,1785145886.2799,126.4089,126.4089,124
+CLKPROBE,1785145886.5310,126.6599,126.6599,125
+CLKPROBE,1785145886.7820,126.9110,126.9110,126
+CLKPROBE,1785145887.0330,127.1619,127.1619,127
+CLKPROBE,1785145887.2837,127.4127,127.4127,128
+CLKPROBE,1785145887.5347,127.6637,127.6637,129
+CLKPROBE,1785145887.7858,127.9147,127.9147,130
+CLKPROBE,1785145888.0369,128.1659,128.1659,131
+CLKPROBE,1785145888.2879,128.4169,128.4169,132
+CLKPROBE,1785145888.5390,128.6679,128.6679,133
+CLKPROBE,1785145888.7900,128.9189,128.9189,134
+CLKPROBE,1785145889.0409,129.1698,129.1698,135
+CLKPROBE,1785145889.2917,129.4206,129.4206,136
+CLKPROBE,1785145889.5428,129.6718,129.6718,137
+CLKPROBE,1785145889.7939,129.9229,129.9229,138
+CLKPROBE,1785145890.0448,130.1738,130.1738,139
+CLKPROBE,1785145890.2958,130.4248,130.4248,140
+CLKPROBE,1785145890.5466,130.6756,130.6756,141
+CLKPROBE,1785145890.7977,130.9267,130.9267,142
+CLKPROBE,1785145891.0486,131.1776,131.1776,143
+CLKPROBE,1785145891.2997,131.4286,131.4286,144
+CLKPROBE,1785145891.5508,131.6798,131.6798,145
+CLKPROBE,1785145891.8019,131.9309,131.9309,146
+CLKPROBE,1785145892.0527,132.1817,132.1817,147
+CLKPROBE,1785145892.3036,132.4325,132.4325,148
+CLKPROBE,1785145892.5547,132.6836,132.6836,149
+CLKPROBE,1785145892.8057,132.9346,132.9346,150
+CLKPROBE,1785145893.0567,133.1856,133.1856,151
+CLKPROBE,1785145893.3076,133.4366,133.4366,152
+CLKPROBE,1785145893.5588,133.6878,133.6878,153
+CLKPROBE,1785145893.8099,133.9388,133.9388,154
+CLKPROBE,1785145894.0608,134.1898,134.1898,155
+CLKPROBE,1785145894.3119,134.4408,134.4408,156
+CLKPROBE,1785145894.5627,134.6916,134.6916,157
+CLKPROBE,1785145894.8138,134.9427,134.9427,158
+CLKPROBE,1785145895.0649,135.1938,135.1938,159
+CLKPROBE,1785145895.3156,135.4446,135.4446,160
+CLKPROBE,1785145895.5667,135.6956,135.6956,161
+CLKPROBE,1785145895.8179,135.9469,135.9469,162
+CLKPROBE,1785145896.0687,136.1976,136.1976,163
+CLKPROBE,1785145896.3197,136.4486,136.4486,164
+CLKPROBE,1785145896.5708,136.6997,136.6997,165
+CLKPROBE,1785145896.8218,136.9507,136.9507,166
+CLKPROBE,1785145897.0726,137.2016,137.2016,167
+CLKPROBE,1785145897.3236,137.4526,137.4526,168
+CLKPROBE,1785145897.5746,137.7035,137.7035,169
+CLKPROBE,1785145897.8256,137.9546,137.9546,170
+CLKPROBE,1785145898.0766,138.2055,138.2055,171
+CLKPROBE,1785145898.3278,138.4567,138.4567,172
+CLKPROBE,1785145898.5789,138.7079,138.7079,173
+CLKPROBE,1785145898.8298,138.9588,138.9588,174
+CLKPROBE,1785145899.0810,139.2099,139.2099,175
+CLKPROBE,1785145899.3320,139.4609,139.4609,176
+CLKPROBE,1785145899.5828,139.7118,139.7118,177
+CLKPROBE,1785145899.8339,139.9629,139.9629,178
+CLKPROBE,1785145900.0848,140.2137,140.2137,179
+CLKPROBE,1785145900.3356,140.4646,140.4646,180
+CLKPROBE,1785145900.5868,140.7158,140.7158,181
+CLKPROBE,1785145900.8376,140.9666,140.9666,182
+CLKPROBE,1785145901.0888,141.2178,141.2178,183
+CLKPROBE,1785145901.3398,141.4687,141.4687,184
+CLKPROBE,1785145901.5906,141.7196,141.7196,185
+CLKPROBE,1785145901.8415,141.9705,141.9705,186
+CLKPROBE,1785145902.0928,142.2217,142.2217,187
+CLKPROBE,1785145902.3438,142.4728,142.4728,188
+CLKPROBE,1785145902.5948,142.7238,142.7238,189
+CLKPROBE,1785145902.8458,142.9748,142.9748,190
+CLKPROBE,1785145903.0967,143.2256,143.2256,191
+CLKPROBE,1785145903.3479,143.4768,143.4768,192
+CLKPROBE,1785145903.5990,143.7280,143.7280,193
+CLKPROBE,1785145903.8499,143.9789,143.9789,194
+CLKPROBE,1785145904.1009,144.2298,144.2298,195
+CLKPROBE,1785145904.3519,144.4809,144.4809,196
+CLKPROBE,1785145904.6030,144.7320,144.7320,197
+CLKPROBE,1785145904.8540,144.9830,144.9830,198
+CLKPROBE,1785145905.1047,145.2337,145.2337,199
+CLKPROBE,1785145905.3558,145.4847,145.4847,200
+RATE,1785145905.5943,145.7232,145.7232,fire=7,k=7,target_mono=145.7230,behind_s=0.0002,ontime
+CLKPROBE,1785145905.6069,145.7358,145.7358,201
+CLKPROBE,1785145905.8580,145.9870,145.9870,202
+CLKPROBE,1785145906.1088,146.2378,146.2378,203
+CLKPROBE,1785145906.3598,146.4888,146.4888,204
+CLKPROBE,1785145906.6109,146.7399,146.7399,205
+CLKPROBE,1785145906.8619,146.9908,146.9908,206
+CLKPROBE,1785145907.1129,147.2419,147.2419,207
+CLKPROBE,1785145907.3638,147.4927,147.4927,208
+CLKPROBE,1785145907.6148,147.7437,147.7437,209
+CLKPROBE,1785145907.8658,147.9947,147.9947,210
+CLKPROBE,1785145908.1169,148.2458,148.2458,211
+CLKPROBE,1785145908.3679,148.4968,148.4968,212
+CLKPROBE,1785145908.6189,148.7478,148.7478,213
+CLKPROBE,1785145908.8697,148.9986,148.9986,214
+CLKPROBE,1785145909.1207,149.2497,149.2497,215
+CLKPROBE,1785145909.3718,149.5007,149.5007,216
+CLKPROBE,1785145909.6229,149.7518,149.7518,217
+CLKPROBE,1785145909.8737,150.0026,150.0026,218
+CLKPROBE,1785145910.1248,150.2538,150.2538,219
+CLKPROBE,1785145910.3759,150.5048,150.5048,220
+CLKPROBE,1785145910.6269,150.7559,150.7559,221
+CLKPROBE,1785145910.8778,151.0068,151.0068,222
+CLKPROBE,1785145911.1287,151.2576,151.2576,223
+CLKPROBE,1785145911.3796,151.5085,151.5085,224
+CLKPROBE,1785145911.6306,151.7596,151.7596,225
+CLKPROBE,1785145911.8818,152.0108,152.0108,226
+CLKPROBE,1785145912.1327,152.2616,152.2616,227
+CLKPROBE,1785145912.3835,152.5125,152.5125,228
+CLKPROBE,1785145912.6347,152.7636,152.7636,229
+CLKPROBE,1785145912.8859,153.0149,153.0149,230
+CLKPROBE,1785145913.1370,153.2659,153.2659,231
+CLKPROBE,1785145913.3876,153.5166,153.5166,232
+CLKPROBE,1785145913.6388,153.7678,153.7678,233
+CLKPROBE,1785145913.8900,154.0190,154.0190,234
+CLKPROBE,1785145914.1410,154.2699,154.2699,235
+CLKPROBE,1785145914.3919,154.5209,154.5209,236
+CLKPROBE,1785145914.6428,154.7717,154.7717,237
+CLKPROBE,1785145914.8936,155.0225,155.0225,238
+CLKPROBE,1785145915.1443,155.2733,155.2733,239
+CLKPROBE,1785145915.3957,155.5247,155.5247,240
+CLKPROBE,1785145915.6466,155.7756,155.7756,241
+CLKPROBE,1785145915.8978,156.0267,156.0267,242
+CLKPROBE,1785145916.1488,156.2778,156.2778,243
+CLKPROBE,1785145916.3999,156.5289,156.5289,244
+CLKPROBE,1785145916.6510,156.7799,156.7799,245
+CLKPROBE,1785145916.9019,157.0308,157.0308,246
+CLKPROBE,1785145917.1529,157.2819,157.2819,247
+CLKPROBE,1785145917.4038,157.5328,157.5328,248
+CLKPROBE,1785145917.6547,157.7837,157.7837,249
+CLKPROBE,1785145917.9058,158.0348,158.0348,250
+CLKPROBE,1785145918.1568,158.2858,158.2858,251
+CLKPROBE,1785145918.4078,158.5367,158.5367,252
+CLKPROBE,1785145918.6589,158.7878,158.7879,253
+CLKPROBE,1785145918.9098,159.0387,159.0387,254
+CLKPROBE,1785145919.1607,159.2896,159.2896,255
+CLKPROBE,1785145919.4115,159.5404,159.5404,256
+CLKPROBE,1785145919.6626,159.7916,159.7916,257
+CLKPROBE,1785145919.9137,160.0427,160.0427,258
+CLKPROBE,1785145920.1647,160.2937,160.2937,259
+CLKPROBE,1785145920.4157,160.5446,160.5446,260
+CLKPROBE,1785145920.6669,160.7959,160.7959,261
+CLKPROBE,1785145920.9180,161.0469,161.0469,262
+CLKPROBE,1785145921.1687,161.2977,161.2977,263
+CLKPROBE,1785145921.4196,161.5485,161.5485,264
+CLKPROBE,1785145921.6709,161.7998,161.7998,265
+CLKPROBE,1785145921.9217,162.0506,162.0506,266
+CLKPROBE,1785145922.1727,162.3017,162.3017,267
+CLKPROBE,1785145922.4236,162.5525,162.5525,268
+CLKPROBE,1785145922.6747,162.8037,162.8037,269
+CLKPROBE,1785145922.9256,163.0545,163.0545,270
+CLKPROBE,1785145923.1766,163.3056,163.3056,271
+CLKPROBE,1785145923.4277,163.5567,163.5567,272
+CLKPROBE,1785145923.6786,163.8075,163.8075,273
+CLKPROBE,1785145923.9298,164.0587,164.0587,274
+CLKPROBE,1785145924.1809,164.3098,164.3098,275
+CLKPROBE,1785145924.4318,164.5608,164.5608,276
+CLKPROBE,1785145924.6826,164.8116,164.8116,277
+CLKPROBE,1785145924.9336,165.0626,165.0626,278
+CLKPROBE,1785145925.1848,165.3138,165.3138,279
+CLKPROBE,1785145925.4359,165.5648,165.5648,280
+RATE,1785145925.5943,165.7232,165.7232,fire=8,k=8,target_mono=165.7230,behind_s=0.0003,ontime
+CLKPROBE,1785145925.6869,165.8159,165.8159,281
+CLKPROBE,1785145925.9377,166.0666,166.0666,282
+CLKPROBE,1785145926.1889,166.3178,166.3178,283
+CLKPROBE,1785145926.4396,166.5686,166.5686,284
+CLKPROBE,1785145926.6907,166.8196,166.8196,285
+CLKPROBE,1785145926.9419,167.0708,167.0708,286
+CLKPROBE,1785145927.1930,167.3219,167.3219,287
+CLKPROBE,1785145927.4440,167.5729,167.5729,288
+CLKPROBE,1785145927.6948,167.8238,167.8238,289
+CLKPROBE,1785145927.9456,168.0746,168.0746,290
+CLKPROBE,1785145928.1968,168.3257,168.3257,291
+CLKPROBE,1785145928.4479,168.5768,168.5768,292
+CLKPROBE,1785145928.6986,168.8276,168.8276,293
+CLKPROBE,1785145928.9497,169.0787,169.0787,294
+CLKPROBE,1785145929.2008,169.3298,169.3298,295
+CLKPROBE,1785145929.4519,169.5808,169.5808,296
+CLKPROBE,1785145929.7029,169.8319,169.8319,297
+CLKPROBE,1785145929.9539,170.0829,170.0829,298
+CLKPROBE,1785145930.2050,170.3340,170.3340,299
+CLKPROBE,1785145930.4558,170.5847,170.5847,300
+CLKPROBE,1785145930.7068,170.8358,170.8358,301
+CLKPROBE,1785145930.9576,171.0866,171.0866,302
+CLKPROBE,1785145931.2088,171.3378,171.3378,303
+CLKPROBE,1785145931.4598,171.5888,171.5888,304
+CLKPROBE,1785145931.7106,171.8396,171.8396,305
+CLKPROBE,1785145931.9616,172.0906,172.0906,306
+CLKPROBE,1785145932.2128,172.3417,172.3417,307
+CLKPROBE,1785145932.4636,172.5926,172.5926,308
+CLKPROBE,1785145932.7146,172.8436,172.8436,309
+CLKPROBE,1785145932.9658,173.0947,173.0947,310
+CLKPROBE,1785145933.2168,173.3457,173.3457,311
+CLKPROBE,1785145933.4679,173.5969,173.5969,312
+CLKPROBE,1785145933.7189,173.8479,173.8479,313
+CLKPROBE,1785145933.9698,174.0987,174.0987,314
+CLKPROBE,1785145934.2206,174.3495,174.3495,315
+CLKPROBE,1785145934.4717,174.6006,174.6006,316
+CLKPROBE,1785145934.7229,174.8518,174.8518,317
+CLKPROBE,1785145934.9736,175.1026,175.1026,318
+CLKPROBE,1785145935.2249,175.3538,175.3538,319
+CLKPROBE,1785145935.4757,175.6046,175.6046,320
+CLKPROBE,1785145935.7268,175.8558,175.8558,321
+CLKPROBE,1785145935.9779,176.1068,176.1069,322
+CLKPROBE,1785145936.2288,176.3577,176.3577,323
+CLKPROBE,1785145936.4796,176.6085,176.6085,324
+CLKPROBE,1785145936.7306,176.8595,176.8595,325
+CLKPROBE,1785145936.9815,177.1105,177.1105,326
+CLKPROBE,1785145937.2325,177.3615,177.3615,327
+CLKPROBE,1785145937.4836,177.6126,177.6126,328
+CLKPROBE,1785145937.7346,177.8636,177.8636,329
+CLKPROBE,1785145937.9859,178.1148,178.1148,330
+CLKPROBE,1785145938.2369,178.3658,178.3658,331
+CLKPROBE,1785145938.4876,178.6166,178.6166,332
+CLKPROBE,1785145938.7387,178.8676,178.8676,333
+CLKPROBE,1785145938.9896,179.1185,179.1185,334
+CLKPROBE,1785145939.2408,179.3697,179.3697,335
+CLKPROBE,1785145939.4916,179.6206,179.6206,336
+CLKPROBE,1785145939.7427,179.8717,179.8717,337
+CLKPROBE,1785145939.9936,180.1225,180.1225,338
+CLKPROBE,1785145940.2447,180.3737,180.3737,339
+CLKPROBE,1785145940.4958,180.6247,180.6247,340
+CLKPROBE,1785145940.7466,180.8755,180.8755,341
+CLKPROBE,1785145970.7804,210.9094,210.9094,342
+RATE,1785145970.7819,210.9109,210.9109,fire=9,k=9,target_mono=185.7230,behind_s=25.1878,ontime
+RATE,1785145970.7830,210.9120,210.9120,fire=10,k=10,target_mono=205.7230,behind_s=5.1890,BURST
+CLKPROBE,1785145971.0320,211.1609,211.1609,343
+CLKPROBE,1785145971.2828,211.4117,211.4117,344
+CLKPROBE,1785145971.5339,211.6628,211.6628,345
+CLKPROBE,1785145971.7849,211.9139,211.9139,346
+CLKPROBE,1785145972.0358,212.1647,212.1647,347
+CLKPROBE,1785145972.2869,212.4158,212.4158,348
+CLKPROBE,1785145972.5381,212.6670,212.6670,349
+CLKPROBE,1785145972.7889,212.9178,212.9178,350
+CLKPROBE,1785145973.0400,213.1690,213.1690,351
+CLKPROBE,1785145973.2909,213.4199,213.4199,352
+CLKPROBE,1785145973.5421,213.6710,213.6710,353
+CLKPROBE,1785145973.7929,213.9219,213.9219,354
+CLKPROBE,1785145974.0439,214.1728,214.1728,355
+CLKPROBE,1785145974.2949,214.4239,214.4239,356
+CLKPROBE,1785145974.5459,214.6749,214.6749,357
+CLKPROBE,1785145974.7970,214.9259,214.9259,358
+CLKPROBE,1785145975.0481,215.1770,215.1770,359
+CLKPROBE,1785145975.2990,215.4280,215.4280,360
+CLKPROBE,1785145975.5498,215.6788,215.6788,361
+CLKPROBE,1785145975.8009,215.9299,215.9299,362
+CLKPROBE,1785145976.0519,216.1809,216.1809,363
+CLKPROBE,1785145976.3031,216.4320,216.4320,364
+CLKPROBE,1785145976.5540,216.6829,216.6829,365
+CLKPROBE,1785145976.8050,216.9340,216.9340,366
+CLKPROBE,1785145977.0561,217.1850,217.1850,367
+CLKPROBE,1785145977.3070,217.4359,217.4359,368
+CLKPROBE,1785145977.5579,217.6869,217.6869,369
+CLKPROBE,1785145977.8087,217.9377,217.9377,370
+CLKPROBE,1785145978.0600,218.1889,218.1889,371
+CLKPROBE,1785145978.3110,218.4399,218.4399,372
+CLKPROBE,1785145978.5619,218.6909,218.6909,373
+CLKPROBE,1785145978.8130,218.9420,218.9420,374
+CLKPROBE,1785145979.0640,219.1930,219.1930,375
+CLKPROBE,1785145979.3149,219.4439,219.4439,376
+CLKPROBE,1785145979.5660,219.6950,219.6950,377
+CLKPROBE,1785145979.8171,219.9460,219.9460,378
+CLKPROBE,1785145980.0692,220.1981,220.1981,379
+CLKPROBE,1785145980.3200,220.4489,220.4489,380
+CLKPROBE,1785145980.5710,220.6999,220.6999,381
+CLKPROBE,1785145980.8217,220.9507,220.9507,382
+CLKPROBE,1785145981.0729,221.2019,221.2019,383
+CLKPROBE,1785145981.3238,221.4528,221.4528,384
+CLKPROBE,1785145981.5749,221.7039,221.7039,385
+CLKPROBE,1785145981.8260,221.9550,221.9550,386
+CLKPROBE,1785145982.0771,222.2060,222.2060,387
+CLKPROBE,1785145982.3287,222.4576,222.4576,388
+CLKPROBE,1785145982.5797,222.7086,222.7086,389
+CLKPROBE,1785145982.8308,222.9598,222.9598,390
+CLKPROBE,1785145983.0820,223.2109,223.2109,391
+CLKPROBE,1785145983.3330,223.4620,223.4620,392
+CLKPROBE,1785145983.5839,223.7129,223.7129,393
+CLKPROBE,1785145983.8349,223.9639,223.9639,394
+CLKPROBE,1785145984.0858,224.2147,224.2147,395
+CLKPROBE,1785145984.3369,224.4659,224.4659,396
+CLKPROBE,1785145984.5880,224.7170,224.7170,397
+CLKPROBE,1785145984.8391,224.9680,224.9680,398
+CLKPROBE,1785145985.0899,225.2189,225.2189,399
+CLKPROBE,1785145985.3407,225.4697,225.4697,400
+CLKPROBE,1785145985.5918,225.7208,225.7208,401
+RATE,1785145985.5943,225.7233,225.7233,fire=11,k=11,target_mono=225.7230,behind_s=0.0003,ontime
+CLKPROBE,1785145985.8430,225.9719,225.9719,402
+CLKPROBE,1785145986.0940,226.2230,226.2230,403
+CLKPROBE,1785145986.3451,226.4741,226.4741,404
+CLKPROBE,1785145986.5960,226.7249,226.7249,405
+CLKPROBE,1785145986.8469,226.9759,226.9759,406
+CLKPROBE,1785145987.0981,227.2270,227.2270,407
+CLKPROBE,1785145987.3489,227.4779,227.4779,408
+CLKPROBE,1785145987.6000,227.7290,227.7290,409
+CLKPROBE,1785145987.8509,227.9799,227.9799,410
+CLKPROBE,1785145988.1020,228.2309,228.2309,411
+CLKPROBE,1785145988.3530,228.4820,228.4820,412
+CLKPROBE,1785145988.6038,228.7327,228.7327,413
+CLKPROBE,1785145988.8549,228.9838,228.9838,414
+CLKPROBE,1785145989.1059,229.2349,229.2349,415
+CLKPROBE,1785145989.3569,229.4858,229.4858,416
+CLKPROBE,1785145989.6079,229.7369,229.7369,417
+CLKPROBE,1785145989.8590,229.9879,229.9879,418
+CLKPROBE,1785145990.1099,230.2388,230.2388,419
+CLKPROBE,1785145990.3607,230.4897,230.4897,420
+CLKPROBE,1785145990.6120,230.7409,230.7409,421
+CLKPROBE,1785145990.8630,230.9920,230.9920,422
+CLKPROBE,1785145991.1139,231.2428,231.2428,423
+CLKPROBE,1785145991.3649,231.4939,231.4939,424
+CLKPROBE,1785145991.6159,231.7449,231.7449,425
+CLKPROBE,1785145991.8667,231.9956,231.9956,426
+CLKPROBE,1785145992.1179,232.2468,232.2468,427
+CLKPROBE,1785145992.3690,232.4979,232.4979,428
+CLKPROBE,1785145992.6199,232.7489,232.7489,429
+CLKPROBE,1785145992.8710,232.9999,232.9999,430
+CLKPROBE,1785145993.1217,233.2506,233.2506,431
+CLKPROBE,1785145993.3729,233.5018,233.5018,432
+CLKPROBE,1785145993.6237,233.7526,233.7526,433
+CLKPROBE,1785145993.8749,234.0038,234.0038,434
+CLKPROBE,1785145994.1259,234.2549,234.2549,435
+CLKPROBE,1785145994.3768,234.5058,234.5058,436
+CLKPROBE,1785145994.6279,234.7568,234.7568,437
+CLKPROBE,1785145994.8787,235.0076,235.0076,438
+CLKPROBE,1785145995.1298,235.2588,235.2588,439
+CLKPROBE,1785145995.3806,235.5096,235.5096,440
+CLKPROBE,1785145995.6318,235.7608,235.7608,441
+CLKPROBE,1785145995.8827,236.0116,236.0116,442
+CLKPROBE,1785145996.1337,236.2627,236.2627,443
+CLKPROBE,1785145996.3848,236.5137,236.5137,444
+CLKPROBE,1785145996.6359,236.7648,236.7648,445
+CLKPROBE,1785145996.8870,237.0159,237.0159,446
+CLKPROBE,1785145997.1378,237.2667,237.2667,447
+CLKPROBE,1785145997.3889,237.5179,237.5179,448
+CLKPROBE,1785145997.6399,237.7688,237.7688,449
+CLKPROBE,1785145997.8909,238.0198,238.0198,450
+CLKPROBE,1785145998.1419,238.2708,238.2708,451
+CLKPROBE,1785145998.3929,238.5219,238.5219,452
+CLKPROBE,1785145998.6440,238.7729,238.7729,453
+CLKPROBE,1785145998.8949,239.0238,239.0238,454
+CLKPROBE,1785145999.1459,239.2749,239.2749,455
+CLKPROBE,1785145999.3968,239.5258,239.5258,456
+CLKPROBE,1785145999.6477,239.7767,239.7767,457
+CLKPROBE,1785145999.8989,240.0279,240.0279,458
+CLKPROBE,1785146000.1498,240.2787,240.2787,459
+CLKPROBE,1785146000.4009,240.5298,240.5298,460
+CLKPROBE,1785146000.6517,240.7807,240.7807,461
+CLKPROBE,1785146000.9028,241.0318,241.0318,462
+CLKPROBE,1785146001.1538,241.2828,241.2828,463
+CLKPROBE,1785146001.4048,241.5338,241.5338,464
+CLKPROBE,1785146001.6559,241.7848,241.7848,465
+CLKPROBE,1785146001.9068,242.0358,242.0358,466
+CLKPROBE,1785146002.1578,242.2868,242.2868,467
+CLKPROBE,1785146002.4090,242.5379,242.5379,468
+CLKPROBE,1785146002.6600,242.7889,242.7889,469
+CLKPROBE,1785146002.9109,243.0398,243.0398,470
+CLKPROBE,1785146003.1619,243.2909,243.2909,471
+CLKPROBE,1785146003.4130,243.5419,243.5419,472
+CLKPROBE,1785146003.6638,243.7928,243.7928,473
+CLKPROBE,1785146003.9146,244.0435,244.0435,474
+CLKPROBE,1785146004.1659,244.2949,244.2949,475
+CLKPROBE,1785146004.4170,244.5459,244.5459,476
+CLKPROBE,1785146004.6679,244.7969,244.7969,477
+CLKPROBE,1785146004.9187,245.0476,245.0476,478
+CLKPROBE,1785146005.1695,245.2984,245.2984,479
+CLKPROBE,1785146005.4207,245.5497,245.5497,480
+RATE,1785146005.5943,245.7233,245.7233,fire=12,k=12,target_mono=245.7230,behind_s=0.0003,ontime
+CLKPROBE,1785146005.6718,245.8008,245.8008,481
+CLKPROBE,1785146005.9227,246.0517,246.0517,482
+CLKPROBE,1785146006.1738,246.3027,246.3027,483
+CLKPROBE,1785146006.4249,246.5538,246.5538,484
+CLKPROBE,1785146006.6758,246.8048,246.8048,485
+CLKPROBE,1785146006.9269,247.0559,247.0559,486
+CLKPROBE,1785146007.1779,247.3068,247.3068,487
+CLKPROBE,1785146007.4289,247.5579,247.5579,488
+CLKPROBE,1785146007.6797,247.8087,247.8087,489
+CLKPROBE,1785146007.9308,248.0598,248.0598,490
+CLKPROBE,1785146008.1819,248.3109,248.3109,491
+CLKPROBE,1785146008.4331,248.5620,248.5621,492
+CLKPROBE,1785146008.6847,248.8136,248.8136,493
+CLKPROBE,1785146008.9359,249.0648,249.0648,494
+CLKPROBE,1785146009.1868,249.3157,249.3157,495
+CLKPROBE,1785146009.4379,249.5668,249.5668,496
+CLKPROBE,1785146009.6888,249.8178,249.8178,497
+CLKPROBE,1785146009.9399,250.0689,250.0689,498
+CLKPROBE,1785146010.1910,250.3200,250.3200,499
+CLKPROBE,1785146010.4419,250.5708,250.5708,500
+CLKPROBE,1785146010.6928,250.8218,250.8218,501
+CLKPROBE,1785146010.9439,251.0728,251.0728,502
+CLKPROBE,1785146011.1950,251.3239,251.3239,503
+CLKPROBE,1785146011.4461,251.5750,251.5750,504
+CLKPROBE,1785146011.6969,251.8258,251.8258,505
+CLKPROBE,1785146011.9477,252.0766,252.0766,506
+CLKPROBE,1785146012.1985,252.3275,252.3275,507
+CLKPROBE,1785146012.4497,252.5787,252.5787,508
+CLKPROBE,1785146012.7008,252.8298,252.8298,509
+CLKPROBE,1785146012.9519,253.0808,253.0808,510
+CLKPROBE,1785146013.2030,253.3319,253.3319,511
+CLKPROBE,1785146013.4540,253.5829,253.5829,512
+CLKPROBE,1785146013.7049,253.8339,253.8339,513
+CLKPROBE,1785146013.9558,254.0848,254.0848,514
+CLKPROBE,1785146014.2069,254.3359,254.3359,515
+CLKPROBE,1785146014.4579,254.5869,254.5869,516
+CLKPROBE,1785146014.7087,254.8377,254.8377,517
+CLKPROBE,1785146014.9597,255.0887,255.0887,518
+CLKPROBE,1785146015.2108,255.3397,255.3397,519
+CLKPROBE,1785146015.4619,255.5908,255.5908,520
+CLKPROBE,1785146015.7129,255.8418,255.8418,521
+CLKPROBE,1785146015.9636,256.0926,256.0926,522
+CLKPROBE,1785146016.2146,256.3436,256.3436,523
+CLKPROBE,1785146016.4657,256.5947,256.5947,524
+CLKPROBE,1785146016.7166,256.8456,256.8456,525
+CLKPROBE,1785146016.9677,257.0966,257.0966,526
+CLKPROBE,1785146017.2186,257.3475,257.3475,527
+CLKPROBE,1785146017.4696,257.5986,257.5986,528
+CLKPROBE,1785146017.7207,257.8497,257.8497,529
+CLKPROBE,1785146017.9717,258.1007,258.1007,530
+CLKPROBE,1785146018.2226,258.3515,258.3515,531
+CLKPROBE,1785146018.4736,258.6025,258.6025,532
+CLKPROBE,1785146018.7247,258.8537,258.8537,533
+CLKPROBE,1785146018.9757,259.1047,259.1047,534
+CLKPROBE,1785146019.2266,259.3555,259.3555,535
+CLKPROBE,1785146019.4776,259.6066,259.6066,536
+CLKPROBE,1785146019.7288,259.8577,259.8577,537
+CLKPROBE,1785146019.9798,260.1087,260.1087,538
+CLKPROBE,1785146020.2308,260.3597,260.3597,539
+CLKPROBE,1785146020.4820,260.6109,260.6109,540
+CLKPROBE,1785146020.7328,260.8617,260.8617,541
+CLKPROBE,1785146020.9837,261.1126,261.1126,542
+CLKPROBE,1785146021.2347,261.3637,261.3637,543
+CLKPROBE,1785146021.4859,261.6148,261.6148,544
+CLKPROBE,1785146021.7368,261.8657,261.8657,545
+CLKPROBE,1785146021.9879,262.1169,262.1169,546
+CLKPROBE,1785146022.2389,262.3679,262.3679,547
+CLKPROBE,1785146022.4899,262.6189,262.6189,548
+CLKPROBE,1785146022.7407,262.8696,262.8696,549
+CLKPROBE,1785146022.9919,263.1209,263.1209,550
+CLKPROBE,1785146023.2428,263.3717,263.3717,551
+CLKPROBE,1785146023.4938,263.6227,263.6227,552
+CLKPROBE,1785146023.7449,263.8738,263.8738,553
+CLKPROBE,1785146023.9958,264.1247,264.1247,554
+CLKPROBE,1785146024.2468,264.3757,264.3757,555
+CLKPROBE,1785146024.4977,264.6267,264.6267,556
+CLKPROBE,1785146024.7485,264.8774,264.8774,557
+CLKPROBE,1785146024.9997,265.1286,265.1286,558
+CLKPROBE,1785146025.2509,265.3798,265.3798,559
+CLKPROBE,1785146025.5018,265.6308,265.6308,560
+RATE,1785146025.5943,265.7232,265.7232,fire=13,k=13,target_mono=265.7230,behind_s=0.0003,ontime
+CLKPROBE,1785146025.7529,265.8818,265.8818,561
+CLKPROBE,1785146026.0038,266.1327,266.1327,562
+CLKPROBE,1785146026.2545,266.3835,266.3835,563
+CLKPROBE,1785146026.5057,266.6347,266.6347,564
+CLKPROBE,1785146026.7566,266.8856,266.8856,565
+CLKPROBE,1785146027.0077,267.1366,267.1366,566
+CLKPROBE,1785146027.2587,267.3877,267.3877,567
+CLKPROBE,1785146027.5097,267.6387,267.6387,568
+CLKPROBE,1785146027.7609,267.8898,267.8898,569
+CLKPROBE,1785146028.0117,268.1407,268.1407,570
+CLKPROBE,1785146028.2628,268.3917,268.3917,571
+CLKPROBE,1785146028.5138,268.6427,268.6427,572
+CLKPROBE,1785146028.7649,268.8938,268.8938,573
+CLKPROBE,1785146029.0158,269.1448,269.1448,574
+CLKPROBE,1785146029.2669,269.3958,269.3958,575
+CLKPROBE,1785146029.5177,269.6467,269.6467,576
+CLKPROBE,1785146029.7687,269.8977,269.8977,577
+CLKPROBE,1785146030.0197,270.1487,270.1487,578
+CLKPROBE,1785146030.2706,270.3995,270.3995,579
+CLKPROBE,1785146030.5218,270.6508,270.6508,580
+CLKPROBE,1785146030.7730,270.9020,270.9020,581
+RATE,1785146270.8025,510.9315,510.9315,fire=14,k=14,target_mono=285.7230,behind_s=225.2084,ontime
+RATE,1785146270.8037,510.9327,510.9327,fire=15,k=15,target_mono=305.7230,behind_s=205.2097,BURST
+CLKPROBE,1785146270.8026,510.9315,510.9315,582
+RATE,1785146270.8047,510.9337,510.9337,fire=16,k=16,target_mono=325.7230,behind_s=185.2107,BURST
+RATE,1785146270.8062,510.9352,510.9352,fire=17,k=17,target_mono=345.7230,behind_s=165.2122,BURST
+RATE,1785146270.8071,510.9361,510.9361,fire=18,k=18,target_mono=365.7230,behind_s=145.2131,BURST
+RATE,1785146270.8080,510.9369,510.9369,fire=19,k=19,target_mono=385.7230,behind_s=125.2139,BURST
+RATE,1785146270.8088,510.9378,510.9378,fire=20,k=20,target_mono=405.7230,behind_s=105.2148,BURST
+RATE,1785146270.8097,510.9387,510.9387,fire=21,k=21,target_mono=425.7230,behind_s=85.2157,BURST
+RATE,1785146270.8106,510.9395,510.9395,fire=22,k=22,target_mono=445.7230,behind_s=65.2165,BURST
+RATE,1785146270.8114,510.9404,510.9404,fire=23,k=23,target_mono=465.7230,behind_s=45.2174,BURST
+RATE,1785146270.8123,510.9412,510.9412,fire=24,k=24,target_mono=485.7230,behind_s=25.2182,BURST
+RATE,1785146270.8131,510.9421,510.9421,fire=25,k=25,target_mono=505.7230,behind_s=5.2191,BURST
+CLKPROBE,1785146271.0555,511.1845,511.1845,583
+CLKPROBE,1785146271.3066,511.4356,511.4356,584
+CLKPROBE,1785146271.5578,511.6868,511.6868,585
+CLKPROBE,1785146271.8089,511.9379,511.9379,586
+CLKPROBE,1785146272.0597,512.1886,512.1886,587
+CLKPROBE,1785146272.3108,512.4397,512.4397,588
+CLKPROBE,1785146272.5618,512.6908,512.6908,589
+CLKPROBE,1785146272.8128,512.9418,512.9418,590
+CLKPROBE,1785146273.0639,513.1928,513.1928,591
+CLKPROBE,1785146273.3149,513.4438,513.4438,592
+CLKPROBE,1785146273.5658,513.6948,513.6948,593
+CLKPROBE,1785146273.8166,513.9455,513.9455,594
+CLKPROBE,1785146274.0676,514.1965,514.1965,595
+CLKPROBE,1785146274.3186,514.4475,514.4475,596
+CLKPROBE,1785146274.5698,514.6988,514.6988,597
+CLKPROBE,1785146274.8206,514.9496,514.9496,598
+CLKPROBE,1785146275.0718,515.2008,515.2008,599
+CLKPROBE,1785146275.3229,515.4518,515.4518,600
+CLKPROBE,1785146275.5739,515.7029,515.7029,601
+CLKPROBE,1785146275.8248,515.9537,515.9537,602
+CLKPROBE,1785146276.0759,516.2049,516.2049,603
+CLKPROBE,1785146276.3266,516.4556,516.4556,604
+CLKPROBE,1785146276.5777,516.7067,516.7067,605
+CLKPROBE,1785146276.8289,516.9579,516.9579,606
+CLKPROBE,1785146277.0799,517.2088,517.2088,607
+CLKPROBE,1785146277.3308,517.4598,517.4598,608
+CLKPROBE,1785146277.5819,517.7109,517.7109,609
+CLKPROBE,1785146277.8329,517.9619,517.9619,610
+CLKPROBE,1785146278.0839,518.2129,518.2129,611
+CLKPROBE,1785146278.3348,518.4638,518.4638,612
+CLKPROBE,1785146278.5859,518.7148,518.7148,613
+CLKPROBE,1785146278.8369,518.9659,518.9659,614
+CLKPROBE,1785146279.0877,519.2166,519.2166,615
+CLKPROBE,1785146279.3388,519.4677,519.4677,616
+CLKPROBE,1785146279.5898,519.7187,519.7187,617
+CLKPROBE,1785146279.8408,519.9698,519.9698,618
+CLKPROBE,1785146280.0918,520.2208,520.2208,619
+CLKPROBE,1785146280.3426,520.4716,520.4716,620
+CLKPROBE,1785146280.5938,520.7227,520.7227,621
+CLKPROBE,1785146280.8448,520.9738,520.9738,622
+CLKPROBE,1785146281.0958,521.2248,521.2248,623
+CLKPROBE,1785146281.3469,521.4759,521.4759,624
+CLKPROBE,1785146281.5977,521.7266,521.7266,625
+CLKPROBE,1785146281.8485,521.9775,521.9775,626
+CLKPROBE,1785146282.0997,522.2286,522.2286,627
+CLKPROBE,1785146282.3510,522.4799,522.4799,628
+CLKPROBE,1785146282.6020,522.7310,522.7310,629
+CLKPROBE,1785146282.8529,522.9819,522.9819,630
+CLKPROBE,1785146283.1040,523.2329,523.2329,631
+CLKPROBE,1785146283.3547,523.4837,523.4837,632
+CLKPROBE,1785146283.6056,523.7345,523.7345,633
+CLKPROBE,1785146283.8565,523.9855,523.9855,634
+CLKPROBE,1785146284.1074,524.2364,524.2364,635
+CLKPROBE,1785146284.3585,524.4875,524.4875,636
+CLKPROBE,1785146284.6097,524.7387,524.7387,637
+CLKPROBE,1785146284.8609,524.9899,524.9899,638
+CLKPROBE,1785146285.1119,525.2409,525.2409,639
+CLKPROBE,1785146285.3628,525.4918,525.4918,640
+RATE,1785146285.5943,525.7232,525.7232,fire=26,k=26,target_mono=525.7230,behind_s=0.0003,ontime
+CLKPROBE,1785146285.6138,525.7428,525.7428,641
+CLKPROBE,1785146285.8649,525.9939,525.9939,642
+CLKPROBE,1785146286.1158,526.2447,526.2447,643
+CLKPROBE,1785146286.3665,526.4955,526.4955,644
+CLKPROBE,1785146286.6176,526.7465,526.7465,645
+CLKPROBE,1785146286.8687,526.9976,526.9976,646
+CLKPROBE,1785146287.1199,527.2488,527.2488,647
+CLKPROBE,1785146287.3708,527.4997,527.4997,648
+CLKPROBE,1785146287.6216,527.7505,527.7505,649
+CLKPROBE,1785146287.8727,528.0017,528.0017,650
+CLKPROBE,1785146288.1238,528.2528,528.2528,651
+CLKPROBE,1785146288.3748,528.5038,528.5038,652
+CLKPROBE,1785146288.6260,528.7549,528.7549,653
+CLKPROBE,1785146288.8767,529.0057,529.0057,654
+CLKPROBE,1785146289.1278,529.2568,529.2568,655
+CLKPROBE,1785146289.3789,529.5079,529.5079,656
+CLKPROBE,1785146289.6297,529.7586,529.7586,657
+CLKPROBE,1785146289.8806,530.0096,530.0096,658
+CLKPROBE,1785146290.1315,530.2605,530.2605,659
+CLKPROBE,1785146290.3828,530.5117,530.5117,660
+CLKPROBE,1785146290.6339,530.7628,530.7628,661
+CLKPROBE,1785146290.8849,531.0139,531.0139,662
+CLKPROBE,1785146291.1358,531.2648,531.2648,663
+CLKPROBE,1785146291.3867,531.5156,531.5156,664
+CLKPROBE,1785146291.6375,531.7665,531.7665,665
+CLKPROBE,1785146291.8885,532.0175,532.0175,666
+CLKPROBE,1785146292.1397,532.2686,532.2686,667
+CLKPROBE,1785146292.3909,532.5198,532.5198,668
+CLKPROBE,1785146292.6419,532.7709,532.7709,669
+CLKPROBE,1785146292.8928,533.0217,533.0217,670
+CLKPROBE,1785146293.1436,533.2725,533.2725,671
+CLKPROBE,1785146293.3947,533.5236,533.5236,672
+CLKPROBE,1785146293.6458,533.7748,533.7748,673
+CLKPROBE,1785146293.8966,534.0255,534.0255,674
+CLKPROBE,1785146294.1475,534.2764,534.2764,675
+CLKPROBE,1785146294.3987,534.5276,534.5276,676
+CLKPROBE,1785146294.6498,534.7787,534.7787,677
+CLKPROBE,1785146294.9009,535.0298,535.0298,678
+CLKPROBE,1785146295.1516,535.2806,535.2806,679
+CLKPROBE,1785146295.4026,535.5316,535.5316,680
+CLKPROBE,1785146295.6536,535.7826,535.7826,681
+CLKPROBE,1785146295.9047,536.0337,536.0337,682
+CLKPROBE,1785146296.1558,536.2847,536.2847,683
+CLKPROBE,1785146296.4068,536.5358,536.5358,684
+CLKPROBE,1785146296.6577,536.7866,536.7866,685
+CLKPROBE,1785146296.9086,537.0375,537.0375,686
+CLKPROBE,1785146297.1597,537.2887,537.2887,687
+CLKPROBE,1785146297.4106,537.5396,537.5396,688
+CLKPROBE,1785146297.6617,537.7907,537.7907,689
+CLKPROBE,1785146297.9129,538.0419,538.0419,690
+CLKPROBE,1785146298.1638,538.2928,538.2928,691
+CLKPROBE,1785146298.4146,538.5436,538.5436,692
+CLKPROBE,1785146298.6658,538.7947,538.7947,693
+CLKPROBE,1785146298.9169,539.0458,539.0458,694
+CLKPROBE,1785146299.1678,539.2967,539.2967,695
+CLKPROBE,1785146299.4186,539.5475,539.5475,696
+CLKPROBE,1785146299.6698,539.7987,539.7987,697
+CLKPROBE,1785146299.9205,540.0495,540.0495,698
+CLKPROBE,1785146300.1718,540.3007,540.3007,699
+CLKPROBE,1785146300.4228,540.5518,540.5518,700
+CLKPROBE,1785146300.6738,540.8028,540.8028,701
+CLKPROBE,1785146300.9248,541.0538,541.0538,702
+CLKPROBE,1785146301.1756,541.3045,541.3045,703
+CLKPROBE,1785146301.4266,541.5556,541.5556,704
+CLKPROBE,1785146301.6775,541.8064,541.8064,705
+CLKPROBE,1785146301.9288,542.0577,542.0577,706
+CLKPROBE,1785146302.1797,542.3086,542.3086,707
+CLKPROBE,1785146302.4309,542.5599,542.5599,708
+CLKPROBE,1785146302.6820,542.8110,542.8110,709
+CLKPROBE,1785146302.9329,543.0619,543.0619,710
+CLKPROBE,1785146303.1838,543.3128,543.3128,711
+CLKPROBE,1785146303.4348,543.5637,543.5637,712
+CLKPROBE,1785146303.6858,543.8148,543.8148,713
+CLKPROBE,1785146303.9369,544.0658,544.0658,714
+CLKPROBE,1785146304.1880,544.3170,544.3170,715
+CLKPROBE,1785146304.4389,544.5679,544.5679,716
+CLKPROBE,1785146304.6900,544.8190,544.8190,717
+CLKPROBE,1785146304.9410,545.0699,545.0699,718
+CLKPROBE,1785146305.1917,545.3207,545.3207,719
+CLKPROBE,1785146305.4429,545.5719,545.5719,720
+RATE,1785146305.5943,545.7232,545.7232,fire=27,k=27,target_mono=545.7230,behind_s=0.0002,ontime
+CLKPROBE,1785146305.6938,545.8228,545.8228,721
+CLKPROBE,1785146305.9450,546.0739,546.0739,722
+CLKPROBE,1785146306.1959,546.3248,546.3248,723
+CLKPROBE,1785146306.4469,546.5759,546.5759,724
+CLKPROBE,1785146306.6980,546.8270,546.8270,725
+CLKPROBE,1785146306.9489,547.0779,547.0779,726
+CLKPROBE,1785146307.2000,547.3290,547.3290,727
+CLKPROBE,1785146307.4508,547.5797,547.5797,728
+CLKPROBE,1785146307.7018,547.8308,547.8308,729
+CLKPROBE,1785146307.9528,548.0818,548.0818,730
+CLKPROBE,1785146308.2039,548.3328,548.3328,731
+CLKPROBE,1785146308.4549,548.5838,548.5838,732
+CLKPROBE,1785146308.7059,548.8348,548.8348,733
+CLKPROBE,1785146308.9566,549.0856,549.0856,734
+CLKPROBE,1785146309.2077,549.3366,549.3366,735
+CLKPROBE,1785146309.4587,549.5877,549.5877,736
+CLKPROBE,1785146309.7098,549.8387,549.8387,737
+CLKPROBE,1785146309.9609,550.0899,550.0899,738
+CLKPROBE,1785146310.2119,550.3409,550.3409,739
+CLKPROBE,1785146310.4629,550.5919,550.5919,740
+CLKPROBE,1785146310.7139,550.8429,550.8429,741
+CLKPROBE,1785146310.9650,551.0939,551.0939,742
+CLKPROBE,1785146311.2158,551.3448,551.3448,743
+CLKPROBE,1785146311.4666,551.5956,551.5956,744
+CLKPROBE,1785146311.7178,551.8467,551.8467,745
+CLKPROBE,1785146311.9688,552.0978,552.0978,746
+CLKPROBE,1785146312.2198,552.3488,552.3488,747
+CLKPROBE,1785146312.4707,552.5997,552.5997,748
+CLKPROBE,1785146312.7219,552.8509,552.8509,749
+CLKPROBE,1785146312.9728,553.1017,553.1017,750
+CLKPROBE,1785146313.2238,553.3527,553.3527,751
+CLKPROBE,1785146313.4746,553.6036,553.6036,752
+CLKPROBE,1785146313.7257,553.8547,553.8547,753
+CLKPROBE,1785146313.9766,554.1055,554.1055,754
+CLKPROBE,1785146314.2277,554.3566,554.3566,755
+CLKPROBE,1785146314.4787,554.6076,554.6076,756
+CLKPROBE,1785146314.7295,554.8585,554.8585,757
+CLKPROBE,1785146314.9809,555.1099,555.1099,758
+CLKPROBE,1785146315.2319,555.3609,555.3609,759
+CLKPROBE,1785146315.4828,555.6118,555.6118,760
+CLKPROBE,1785146315.7339,555.8628,555.8628,761
+CLKPROBE,1785146315.9849,556.1139,556.1139,762
+CLKPROBE,1785146316.2359,556.3649,556.3649,763
+CLKPROBE,1785146316.4867,556.6156,556.6156,764
+CLKPROBE,1785146316.7376,556.8666,556.8666,765
+CLKPROBE,1785146316.9885,557.1175,557.1175,766
+CLKPROBE,1785146317.2397,557.3686,557.3686,767
+CLKPROBE,1785146317.4906,557.6196,557.6196,768
+CLKPROBE,1785146317.7417,557.8707,557.8707,769
+CLKPROBE,1785146317.9929,558.1218,558.1218,770
+CLKPROBE,1785146318.2437,558.3727,558.3727,771
+CLKPROBE,1785146318.4948,558.6238,558.6238,772
+CLKPROBE,1785146318.7457,558.8746,558.8746,773
+CLKPROBE,1785146318.9968,559.1258,559.1258,774
+CLKPROBE,1785146319.2476,559.3766,559.3766,775
+CLKPROBE,1785146319.4987,559.6276,559.6276,776
+CLKPROBE,1785146319.7497,559.8786,559.8786,777
+CLKPROBE,1785146320.0007,560.1296,560.1296,778
+CLKPROBE,1785146320.2515,560.3805,560.3805,779
+CLKPROBE,1785146320.5026,560.6316,560.6316,780
+CLKPROBE,1785146320.7538,560.8827,560.8827,781
+CLKPROBE,1785146321.0049,561.1338,561.1338,782
+CLKPROBE,1785146321.2559,561.3848,561.3848,783
+CLKPROBE,1785146321.5069,561.6358,561.6358,784
+CLKPROBE,1785146321.7579,561.8868,561.8868,785
+CLKPROBE,1785146322.0089,562.1379,562.1379,786
+CLKPROBE,1785146322.2597,562.3887,562.3887,787
+CLKPROBE,1785146322.5107,562.6397,562.6397,788
+CLKPROBE,1785146322.7617,562.8907,562.8907,789
+CLKPROBE,1785146323.0129,563.1418,563.1418,790
+CLKPROBE,1785146323.2640,563.3929,563.3929,791
+CLKPROBE,1785146323.5150,563.6440,563.6440,792
+CLKPROBE,1785146323.7658,563.8948,563.8948,793
+CLKPROBE,1785146324.0169,564.1458,564.1458,794
+CLKPROBE,1785146324.2677,564.3966,564.3966,795
+CLKPROBE,1785146324.5188,564.6478,564.6478,796
+CLKPROBE,1785146324.7701,564.8990,564.8990,797
+CLKPROBE,1785146325.0216,565.1506,565.1506,798
+CLKPROBE,1785146325.2728,565.4018,565.4018,799
+CLKPROBE,1785146325.5236,565.6525,565.6525,800
+RATE,1785146325.5943,565.7233,565.7233,fire=28,k=28,target_mono=565.7230,behind_s=0.0003,ontime
+CLKPROBE,1785146325.7745,565.9035,565.9035,801
+CLKPROBE,1785146326.0257,566.1546,566.1546,802
+CLKPROBE,1785146326.2769,566.4058,566.4058,803
+CLKPROBE,1785146326.5279,566.6569,566.6569,804
+CLKPROBE,1785146326.7786,566.9076,566.9076,805
+CLKPROBE,1785146327.0298,567.1587,567.1587,806
+CLKPROBE,1785146327.2809,567.4099,567.4099,807
+CLKPROBE,1785146327.5319,567.6608,567.6608,808
+CLKPROBE,1785146327.7829,567.9119,567.9119,809
+CLKPROBE,1785146328.0337,568.1627,568.1627,810
+CLKPROBE,1785146328.2847,568.4136,568.4136,811
+CLKPROBE,1785146328.5360,568.6649,568.6649,812
+CLKPROBE,1785146328.7868,568.9157,568.9157,813
+CLKPROBE,1785146329.0379,569.1669,569.1669,814
+CLKPROBE,1785146329.2889,569.4179,569.4179,815
+CLKPROBE,1785146329.5398,569.6688,569.6688,816
+CLKPROBE,1785146329.7906,569.9196,569.9196,817
+CLKPROBE,1785146330.0418,570.1707,570.1707,818
+CLKPROBE,1785146330.2929,570.4219,570.4219,819
+CLKPROBE,1785146330.5437,570.6727,570.6727,820
+CLKPROBE,1785146330.7947,570.9237,570.9237,821

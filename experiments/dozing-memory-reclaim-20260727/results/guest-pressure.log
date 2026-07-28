@@ -1,0 +1,329 @@
+9
+--- before
+MemFree:          432544 kB
+Cached:           228184 kB
+SwapCached:            0 kB
+AnonPages:        273880 kB
+/bin/sh: 3: cannot create /sys/fs/cgroup/memory.reclaim: Directory nonexistent
+memory.reclaim unavailable
+/bin/sh: 3: cannot create /sys/fs/cgroup/memory.reclaim: Directory nonexistent
+memory.reclaim unavailable
+/bin/sh: 3: cannot create /sys/fs/cgroup/memory.reclaim: Directory nonexistent
+memory.reclaim unavailable
+/bin/sh: 3: cannot create /sys/fs/cgroup/memory.reclaim: Directory nonexistent
+memory.reclaim unavailable
+--- after
+MemFree:          623388 kB
+Cached:            27604 kB
+SwapCached:            0 kB
+AnonPages:        273964 kB
+
+NAME      TYPE SIZE USED PRIO
+/swapfile file 512M   0B   -2
+
+9
+--- before
+MemFree:          428420 kB
+Cached:           229156 kB
+SwapCached:            0 kB
+AnonPages:        273864 kB
+/bin/sh: 3: cannot create /sys/fs/cgroup/memory.reclaim: Directory nonexistent
+memory.reclaim unavailable
+/bin/sh: 3: cannot create /sys/fs/cgroup/memory.reclaim: Directory nonexistent
+memory.reclaim unavailable
+/bin/sh: 3: cannot create /sys/fs/cgroup/memory.reclaim: Directory nonexistent
+memory.reclaim unavailable
+/bin/sh: 3: cannot create /sys/fs/cgroup/memory.reclaim: Directory nonexistent
+memory.reclaim unavailable
+--- after
+MemFree:          611108 kB
+Cached:            27664 kB
+SwapCached:            0 kB
+AnonPages:        273908 kB
+
+NAME      TYPE SIZE USED PRIO
+/swapfile file 512M   0B   -2
+
+9
+--- before
+MemFree:          429160 kB
+Cached:           229156 kB
+SwapCached:            0 kB
+AnonPages:        278900 kB
+/bin/sh: 3: cannot create /sys/fs/cgroup/memory.reclaim: Directory nonexistent
+memory.reclaim unavailable
+/bin/sh: 3: cannot create /sys/fs/cgroup/memory.reclaim: Directory nonexistent
+memory.reclaim unavailable
+/bin/sh: 3: cannot create /sys/fs/cgroup/memory.reclaim: Directory nonexistent
+memory.reclaim unavailable
+/bin/sh: 3: cannot create /sys/fs/cgroup/memory.reclaim: Directory nonexistent
+memory.reclaim unavailable
+--- after
+MemFree:          612396 kB
+Cached:            27672 kB
+SwapCached:            0 kB
+AnonPages:        278932 kB
+
++ mkdir -p /sys/fs/cgroup/dozing
+mkdir: cannot create directory '/sys/fs/cgroup/dozing': No such file or directory
+/bin/sh: 3: cannot create /sys/fs/cgroup/cgroup.subtree_control: Directory nonexistent
++ true
++ pgrep -f dozing-probe.jar
++ head -1
++ pid=107
++ echo jvm pid=107
+jvm pid=107
+/bin/sh: 6: cannot create /sys/fs/cgroup/dozing/cgroup.procs: Directory nonexistent
++ echo MOVE FAILED
+MOVE FAILED
++ cat /sys/fs/cgroup/dozing/memory.current
++ echo no memory.current
+no memory.current
++ echo --- before
+--- before
++ grep -E MemFree|Cached|AnonPages|SwapFree /proc/meminfo
+MemFree:          490236 kB
+Cached:           230784 kB
+SwapCached:            0 kB
+SwapFree:              0 kB
+AnonPages:        215724 kB
+/bin/sh: 9: cannot create /sys/fs/cgroup/dozing/memory.high: Directory nonexistent
++ echo HIGH FAILED
+HIGH FAILED
+/bin/sh: 10: cannot create /sys/fs/cgroup/dozing/memory.reclaim: Directory nonexistent
++ echo reclaim step failed
+reclaim step failed
++ sleep 2
+/bin/sh: 10: cannot create /sys/fs/cgroup/dozing/memory.reclaim: Directory nonexistent
++ echo reclaim step failed
+reclaim step failed
++ sleep 2
+/bin/sh: 10: cannot create /sys/fs/cgroup/dozing/memory.reclaim: Directory nonexistent
++ echo reclaim step failed
+reclaim step failed
++ sleep 2
+/bin/sh: 10: cannot create /sys/fs/cgroup/dozing/memory.reclaim: Directory nonexistent
++ echo reclaim step failed
+reclaim step failed
++ sleep 2
++ sync
++ echo 3
++ sleep 3
++ echo --- after
+--- after
++ grep -E MemFree|Cached|AnonPages|SwapFree /proc/meminfo
+MemFree:          681096 kB
+Cached:            27732 kB
+SwapCached:            0 kB
+SwapFree:              0 kB
+AnonPages:        215760 kB
++ cat /sys/fs/cgroup/dozing/memory.current
+
++ mountpoint -q /sys/fs/cgroup
++ mount -t cgroup2 none /sys/fs/cgroup
++ cat /sys/fs/cgroup/cgroup.controllers
+cpuset cpu io memory hugetlb pids rdma misc dmem
++ mkdir -p /sys/fs/cgroup/dozing
++ echo +memory
++ pgrep -f dozing-probe.jar
++ head -1
++ pid=107
++ echo jvm pid=107
+jvm pid=107
++ echo 107
++ cat /sys/fs/cgroup/dozing/memory.current
++ echo jvm cgroup current: 0
+jvm cgroup current: 0
++ echo --- before
+--- before
++ grep -E MemFree|Cached|AnonPages|SwapFree /proc/meminfo
+MemFree:          486620 kB
+Cached:           230804 kB
+SwapCached:            0 kB
+SwapFree:              0 kB
+AnonPages:        210804 kB
++ echo 320M
++ echo 64M
++ echo reclaim failed at 320M
+reclaim failed at 320M
++ sleep 3
++ echo 256M
++ echo 64M
++ echo reclaim failed at 256M
+reclaim failed at 256M
++ sleep 3
++ echo 192M
++ echo 64M
++ echo reclaim failed at 192M
+reclaim failed at 192M
++ sleep 3
++ sync
++ echo 3
++ sleep 3
++ echo --- after
+--- after
++ grep -E MemFree|Cached|AnonPages|SwapFree /proc/meminfo
+MemFree:          678208 kB
+Cached:            27672 kB
+SwapCached:            0 kB
+SwapFree:              0 kB
+AnonPages:        210748 kB
++ cat /sys/fs/cgroup/dozing/memory.current
++ echo jvm cgroup current: 262144
+jvm cgroup current: 262144
+/bin/sh: 26: Syntax error: "(" unexpected (expecting ")")
+
+
+NAME      TYPE SIZE USED PRIO
+/swapfile file 512M   0B   -2
+
++ mountpoint -q /sys/fs/cgroup
++ cat /sys/fs/cgroup/cgroup.controllers
+cpuset cpu io memory hugetlb pids rdma misc dmem
++ mkdir -p /sys/fs/cgroup/dozing
++ echo +memory
++ echo jvm already started inside the cgroup by dozing-start
+jvm already started inside the cgroup by dozing-start
++ cat /sys/fs/cgroup/dozing/cgroup.procs
++ tr \n  
++ echo jvm cgroup procs: 107 156 160 161 162 
+jvm cgroup procs: 107 156 160 161 162 
++ cat /sys/fs/cgroup/dozing/memory.current
++ echo jvm cgroup current: 432721920
+jvm cgroup current: 432721920
++ echo --- before
+--- before
++ grep -E MemFree|Cached|AnonPages|SwapFree /proc/meminfo
+MemFree:          479300 kB
+Cached:           229256 kB
+SwapCached:            0 kB
+SwapFree:         524284 kB
+AnonPages:        213300 kB
++ echo 320M
++ echo 64M
++ sleep 3
++ echo 256M
++ echo 64M
++ sleep 3
++ echo 192M
++ echo 64M
++ sleep 3
++ sync
++ echo 3
++ sleep 3
++ echo --- after
+--- after
++ grep -E MemFree|Cached|AnonPages|SwapFree /proc/meminfo
+MemFree:          818248 kB
+Cached:            24180 kB
+SwapCached:         7464 kB
+SwapFree:         364576 kB
+AnonPages:         60264 kB
++ cat /sys/fs/cgroup/dozing/memory.current
++ echo jvm cgroup current: 86953984
+jvm cgroup current: 86953984
+/bin/sh: 25: Syntax error: "(" unexpected (expecting ")")
+
+
+NAME      TYPE SIZE USED PRIO
+/swapfile file 512M   0B   -2
+
++ mountpoint -q /sys/fs/cgroup
++ cat /sys/fs/cgroup/cgroup.controllers
+cpuset cpu io memory hugetlb pids rdma misc dmem
++ mkdir -p /sys/fs/cgroup/dozing
++ echo +memory
++ echo jvm already started inside the cgroup by dozing-start
+jvm already started inside the cgroup by dozing-start
++ cat /sys/fs/cgroup/dozing/cgroup.procs
++ tr \n  
++ echo jvm cgroup procs: 107 156 160 161 
+jvm cgroup procs: 107 156 160 161 
++ cat /sys/fs/cgroup/dozing/memory.current
++ echo jvm cgroup current: 436768768
+jvm cgroup current: 436768768
++ echo --- before
+--- before
++ grep -E MemFree|Cached|AnonPages|SwapFree /proc/meminfo
+MemFree:          480960 kB
+Cached:           229256 kB
+SwapCached:            0 kB
+SwapFree:         524284 kB
+AnonPages:        216948 kB
++ echo 320M
++ echo 64M
++ sleep 3
++ echo 256M
++ echo 64M
++ sleep 3
++ echo 192M
++ echo 64M
++ sleep 3
++ sync
++ echo 3
++ sleep 3
++ echo --- after
+--- after
++ grep -E MemFree|Cached|AnonPages|SwapFree /proc/meminfo
+MemFree:          822268 kB
+Cached:            17112 kB
+SwapCached:        12488 kB
+SwapFree:         350268 kB
+AnonPages:         51220 kB
++ cat /sys/fs/cgroup/dozing/memory.current
++ echo jvm cgroup current: 73486336
+jvm cgroup current: 73486336
+/bin/sh: 25: Syntax error: "(" unexpected (expecting ")")
+
+NAME      TYPE SIZE USED PRIO
+/swapfile file 512M   0B   -2
+
++ mountpoint -q /sys/fs/cgroup
++ cat /sys/fs/cgroup/cgroup.controllers
+cpuset cpu io memory hugetlb pids rdma misc dmem
++ mkdir -p /sys/fs/cgroup/dozing
++ echo +memory
++ echo jvm already started inside the cgroup by dozing-start
+jvm already started inside the cgroup by dozing-start
++ cat /sys/fs/cgroup/dozing/cgroup.procs
++ tr \n  
++ echo jvm cgroup procs: 107 157 161 162 163 
+jvm cgroup procs: 107 157 161 162 163 
++ cat /sys/fs/cgroup/dozing/memory.current
++ echo jvm cgroup current: 436097024
+jvm cgroup current: 436097024
++ echo --- before
+--- before
++ grep -E MemFree|Cached|AnonPages|SwapFree /proc/meminfo
+MemFree:          487988 kB
+Cached:           229256 kB
+SwapCached:            0 kB
+SwapFree:         524284 kB
+AnonPages:        216404 kB
++ echo 320M
++ echo 64M
++ sleep 3
++ echo 256M
++ echo 64M
++ sleep 3
++ echo 192M
++ echo 64M
++ sleep 3
++ sync
++ echo 3
++ sleep 3
++ echo --- after
+--- after
++ grep -E MemFree|Cached|AnonPages|SwapFree /proc/meminfo
+MemFree:          841012 kB
+Cached:            28132 kB
+SwapCached:         2584 kB
+SwapFree:         356392 kB
+AnonPages:         50648 kB
++ cat /sys/fs/cgroup/dozing/memory.current
++ echo jvm cgroup current: 80072704
+jvm cgroup current: 80072704
+/bin/sh: 25: Syntax error: "(" unexpected (expecting ")")
+
+order set to 0
+
