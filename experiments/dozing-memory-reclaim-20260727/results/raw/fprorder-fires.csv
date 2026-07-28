@@ -1,0 +1,4 @@
+kind,seq,wall_ms,nano_ms,uptime_ms,wall_delta_ms,nano_delta_ms
+fixed_rate,1,1785141485880,3196,3190,-1,-1
+cron,1,1785141600004,117320,117320,-1,-1
+fixed_rate,2,1785141605872,123188,123180,119992,119992
