@@ -148,8 +148,8 @@ impl StripeClient {
                 intent.billing_account_id.clone(),
             ),
             (
-                "metadata[project_id]".to_string(),
-                intent.project_id.clone(),
+                "metadata[account_id]".to_string(),
+                intent.account_id.clone(),
             ),
             (
                 "metadata[topup_cents]".to_string(),

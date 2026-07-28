@@ -140,7 +140,7 @@ billing、invoice close 与迟到 adjustment 验收。
 
 控制面把用户身份与机器身份分开：`CATS_AUTH_TOKEN` 仅供 node-agent/gateway 等内部
 服务，`CATS_ADMIN_TOKEN` 是 fleet 自动化的 break-glass 机器凭据；普通用户的 Web 和
-CLI 都使用 WorkOS 短期 session。服务端不再接受静态 project token。生产/共享环境
+CLI 都使用 WorkOS 短期 session。服务端不再接受静态用户 token。生产/共享环境
 必须显式设置两个机器凭据，例如：
 
 ```bash
@@ -172,7 +172,7 @@ Manifest 与品牌图形。控制台和认证/API 路径声明 `noindex`，资�
 两个控制台均提供英语和简体中文。未保存语言偏好时，页面按浏览器的
 `navigator.languages` / `navigator.language` 自动选择（中文环境使用简体中文，
 其他环境使用英语）；语言选择器可切换为英语、中文或“跟随系统”，显式选择保存在
-当前站点的浏览器本地存储中。语言偏好只影响展示，不参与 WorkOS session、Project
+当前站点的浏览器本地存储中。语言偏好只影响展示，不参与 WorkOS session、Account
 映射或权限判断。
 
 ### WorkOS AuthKit 登录
@@ -181,7 +181,7 @@ Manifest 与品牌图形。控制台和认证/API 路径声明 `noindex`，资�
 使用 WorkOS Device Authorization，并把 refresh/access token 存入操作系统 Keychain。
 服务端从 WorkOS JWKS 验证每个 CLI access JWT，不接收或保存用户 refresh token。
 Personal 与 Organization Account 都映射到 WorkOS Organization；一个 Account 可以
-拥有多个 Workspace（底层仍保留稳定的 legacy Project 资源命名空间）。新用户会幂等
+拥有多个 Workspace，资源只归属于不可变的 Workspace ID（ADR-0018）。新用户会幂等
 创建 Personal Account、`default` Workspace 和只属于该 Personal Billing Account 的
 一次性 10 美元赠金。管理员还必须在管理员 Organization 中拥有
 `cats:fleet:admin` permission：
@@ -192,7 +192,7 @@ export WORKOS_API_KEY='sk_...'
 export WORKOS_COOKIE_PASSWORD="$(openssl rand -hex 32)"
 export WORKOS_REDIRECT_URI='http://127.0.0.1:7300/auth/callback'
 export WORKOS_ISSUER='https://api.workos.com/user_management/client_...'
-export CATS_WORKOS_PROJECT_ORGANIZATIONS='acme-dev=org_...'
+export CATS_WORKOS_ACCOUNT_ORGANIZATIONS='acme=org_...'
 export CATS_WORKOS_ADMIN_ORGANIZATION_ID='org_admin_...'
 export CATS_WORKOS_ADMIN_PERMISSION='cats:fleet:admin'
 cargo run -p cats-control-plane-daemon --bin cats-controld

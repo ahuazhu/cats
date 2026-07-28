@@ -110,12 +110,12 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
     let cfg = Arc::new(cfg);
     let store = Arc::new(Store::open(&cfg.db_path)?);
     if let Some(workos) = &cfg.workos {
-        store.reconcile_legacy_projects(workos.project_organizations())?;
+        store.ensure_configured_accounts(workos.account_organizations())?;
     } else {
         // The credential-free development shape has one explicit bootstrap
         // account. Production WorkOS deployments provision Accounts through
-        // AuthKit or the configured legacy mapping instead.
-        store.reconcile_legacy_projects(&std::collections::BTreeMap::from([(
+        // AuthKit onboarding or the configured mapping instead.
+        store.ensure_configured_accounts(&std::collections::BTreeMap::from([(
             "default".to_string(),
             "local-development".to_string(),
         )]))?;

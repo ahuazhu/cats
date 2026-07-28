@@ -31,7 +31,8 @@ pub struct Cli {
     #[arg(long, env = "CATS_TOKEN", global = true)]
     pub token: Option<String>,
     /// Use one workspace for this command without changing the saved default.
-    #[arg(long, visible_alias = "project", env = "CATS_WORKSPACE", global = true)]
+    /// Accepts `workspace`, `account/workspace`, or a workspace ID.
+    #[arg(long, env = "CATS_WORKSPACE", global = true)]
     pub workspace: Option<String>,
     /// Do not wait for operations to finish.
     #[arg(long, global = true)]
@@ -273,19 +274,24 @@ struct Client {
     http: reqwest::blocking::Client,
     base: String,
     token: String,
-    project: String,
+    /// Immutable workspace ID; resource routes never key on a mutable slug.
+    workspace_id: String,
 }
 
 impl Client {
     fn new(cli: &Cli) -> Result<Self> {
         if let Some(token) = &cli.token {
+            let http = reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()?;
+            let base = auth::configured_api_url(cli.api_url.as_deref())?;
+            let selector = workspace_override(cli).unwrap_or_else(|| "default".to_string());
+            let workspace_id = resolve_workspace_id(&http, &base, token, &selector)?;
             return Ok(Self {
-                http: reqwest::blocking::Client::builder()
-                    .timeout(Duration::from_secs(120))
-                    .build()?,
-                base: auth::configured_api_url(cli.api_url.as_deref())?,
+                http,
+                base,
                 token: token.clone(),
-                project: workspace_override(cli).unwrap_or_else(|| "default".to_string()),
+                workspace_id,
             });
         }
         let session =
@@ -300,12 +306,12 @@ impl Client {
                 .build()?,
             base: session.api_url,
             token: session.access_token,
-            project: session.workspace,
+            workspace_id: session.workspace,
         })
     }
 
     fn url(&self, path: &str) -> String {
-        format!("{}/v1/projects/{}{}", self.base, self.project, path)
+        format!("{}/v1/workspaces/{}{}", self.base, self.workspace_id, path)
     }
 
     fn admin_url(&self, path: &str) -> String {
@@ -373,9 +379,46 @@ impl Client {
 }
 
 fn workspace_override(cli: &Cli) -> Option<String> {
-    cli.workspace
-        .clone()
-        .or_else(|| std::env::var("CATS_PROJECT").ok())
+    cli.workspace.clone()
+}
+
+/// Machine tokens have no WorkOS identity to enumerate workspaces from, so a
+/// non-ID selector is resolved through the admin workspace directory.
+fn resolve_workspace_id(
+    http: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    selector: &str,
+) -> Result<String> {
+    if selector.starts_with("ws_") {
+        return Ok(selector.to_string());
+    }
+    let response = http
+        .get(format!("{base}/v1/admin/workspaces"))
+        .bearer_auth(token)
+        .send()
+        .context("control plane unreachable")?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "could not resolve workspace {selector}: the token must be an admin token, \
+         or pass --workspace with a workspace ID"
+    );
+    let listed: cats_api::requests::ListResponse<cats_api::auth::Workspace> =
+        response.json().context("invalid workspace directory response")?;
+    let matched = listed
+        .items
+        .iter()
+        .find(|workspace| workspace.locator == selector)
+        .or_else(|| {
+            let mut slug_matches = listed
+                .items
+                .iter()
+                .filter(|workspace| workspace.slug == selector);
+            let first = slug_matches.next()?;
+            slug_matches.next().is_none().then_some(first)
+        })
+        .with_context(|| format!("unknown or ambiguous workspace {selector}"))?;
+    Ok(matched.id.clone())
 }
 
 fn print_cat(cat: &Cat, json_mode: bool) {
@@ -423,7 +466,13 @@ pub fn run(cli: Cli) -> Result<()> {
             } else {
                 println!("{}", me.user.email);
                 println!("User: {}", me.user.id);
-                println!("Workspace: {}", client.project);
+                let label = me
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == client.workspace_id)
+                    .map(|workspace| workspace.locator.clone())
+                    .unwrap_or_else(|| client.workspace_id.clone());
+                println!("Workspace: {label}");
             }
             return Ok(());
         }
@@ -595,7 +644,9 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Command::Shell { name } => shell::run(&client.base, &client.project, &client.token, name),
+        Command::Shell { name } => {
+            shell::run(&client.base, &client.workspace_id, &client.token, name)
+        }
         Command::Sleep { cmd } => {
             let response = match cmd {
                 SleepCommand::On { name } => client.put(

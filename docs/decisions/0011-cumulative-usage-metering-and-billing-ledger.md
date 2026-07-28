@@ -3,6 +3,10 @@
 - 状态：Accepted
 - 日期：2026-07-24
 
+> `billing_account/project/<project>` 映射与 usage 的 `project_id` 归属维度已由
+> ADR-0018 取代：资金归 Account（`account_id`），用量归 Workspace（`workspace_id`）。
+> 累计计数器语义、可重放 ledger 与整数计价决定继续有效。
+
 ## 背景
 
 Cats 已决定采用 Sprites 类似的实际用量模型，首个公开 Rate Card 为：

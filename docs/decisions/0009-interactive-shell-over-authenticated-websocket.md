@@ -19,7 +19,7 @@ Workspace 授权重复。
 1. CLI 提供 `cats shell <cat>`。它使用当前 `cats login` 的短期 WorkOS access token 和
    当前 Workspace，不建立 SSH 账号、SSH key 或 TCP 22 listener。
 2. 公开入口是
-   `GET /v1/projects/{workspace}/cats/{cat}/shell?rows={rows}&cols={cols}` 的 WebSocket
+   `GET /v1/workspaces/{workspace_id}/cats/{cat}/shell?rows={rows}&cols={cols}` 的 WebSocket
    upgrade。控制面必须在唤醒 Cat 和连接 Node 之前完成与普通资源 API 相同的 Workspace
    授权；内部 Control Plane → Node WebSocket 使用独立 service bearer token。
 3. Cat 非 Running 时，控制面先获取 work lease 并触发既有 singleflight wake。会话存活

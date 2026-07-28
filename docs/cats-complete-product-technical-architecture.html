@@ -250,7 +250,7 @@
       <div class="diagram-frame">
         <svg viewBox="0 0 1320 560" role="img" aria-labelledby="model-title model-desc">
           <title id="model-title">Cats 产品资源关系图</title>
-          <desc id="model-desc">Tenant、Project、Cat、RootDisk、PersistentDisk、Attachment、Snapshot、Endpoint、Secret、Image 与 Operation 的关系。</desc>
+          <desc id="model-desc">Account、Workspace、Cat、RootDisk、PersistentDisk、Attachment、Snapshot、Endpoint、Secret、Image 与 Operation 的关系。</desc>
           <defs>
             <marker id="model-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#6d7f87"/></marker>
             <style>
@@ -258,8 +258,8 @@
               .mt{font:700 14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#1d3038}.mm{font:11px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#60737b}.ml{stroke:#6d7f87;stroke-width:1.4;fill:none;marker-end:url(#model-arrow)}
             </style>
           </defs>
-          <rect x="45" y="68" width="170" height="74" class="mb mu"/><text x="68" y="98" class="mt">Tenant / Organization</text><text x="68" y="119" class="mm">身份、套餐、总配额</text>
-          <rect x="286" y="68" width="170" height="74" class="mb mu"/><text x="339" y="98" class="mt">Project</text><text x="308" y="119" class="mm">Region、网络、成员、预算</text>
+          <rect x="45" y="68" width="170" height="74" class="mb mu"/><text x="68" y="98" class="mt">Account</text><text x="68" y="119" class="mm">身份、计费所有者、总配额</text>
+          <rect x="286" y="68" width="170" height="74" class="mb mu"/><text x="339" y="98" class="mt">Workspace</text><text x="301" y="119" class="mm">Region、网络、资源隔离边界</text>
           <rect x="545" y="58" width="190" height="94" class="mb ms"/><text x="619" y="91" class="mt">Cat</text><text x="570" y="113" class="mm">规格、desired/observed state</text><text x="592" y="133" class="mm">root_disk_id / image_id</text>
           <rect x="838" y="35" width="190" height="74" class="mb ms"/><text x="895" y="66" class="mt">RootDisk</text><text x="856" y="87" class="mm">与 Cat 同生命周期、RWO</text>
           <rect x="838" y="137" width="190" height="74" class="mb ms"/><text x="866" y="168" class="mt">PersistentDisk</text><text x="860" y="189" class="mm">独立生命周期、RWO</text>
@@ -281,10 +281,10 @@
         <table>
           <thead><tr><th>资源</th><th>关键字段</th><th>生命周期与不变量</th></tr></thead>
           <tbody>
-            <tr><td>Tenant</td><td><code>tenant_id, plan, status, quotas</code></td><td>所有资源必须属于一个 Tenant；跨租户查询在数据库与 API 两层拒绝</td></tr>
-            <tr><td>Project</td><td><code>project_id, region, network_cidr, budget</code></td><td>Region 固定；成员、资源、账单和私网的管理边界</td></tr>
-            <tr><td>Cat</td><td><code>cat_id, spec, image_id, root_disk_id, desired_state, observed_state, generation</code></td><td>RootDisk 必须存在；Cat 删除最终级联删除 RootDisk，不删除外接盘</td></tr>
-            <tr><td>Disk</td><td><code>disk_id, kind, size, backend, state, current_root</code></td><td>Root 或 Persistent；只能扩容；RWO；删除前必须无有效 Attachment</td></tr>
+            <tr><td>Account</td><td><code>account_id, kind, workos_organization_id, billing_account_id, status, quotas</code></td><td>Personal/Organization 都是租户；成员和账单属于 Account；跨 Account 查询在数据库与 API 两层拒绝</td></tr>
+            <tr><td>Workspace</td><td><code>workspace_id, account_id, slug, region, network_cidr</code></td><td>Account 内的唯一资源隔离边界与归属键；slug 可改、ID 不变，资源只按 ID 路由（ADR-0018）</td></tr>
+            <tr><td>Cat</td><td><code>cat_id, workspace_id, spec, image_id, root_disk_id, desired_state, observed_state, generation</code></td><td>不可变 Workspace 归属随资源写入；RootDisk 必须存在；Cat 删除最终级联删除 RootDisk，不删除外接盘</td></tr>
+            <tr><td>Disk</td><td><code>disk_id, workspace_id, kind, size, backend, state, current_root</code></td><td>不可变 Workspace 归属随资源写入；Root 或 Persistent；只能扩容；RWO；删除前必须无有效 Attachment</td></tr>
             <tr><td>Attachment</td><td><code>attachment_id, disk_id, cat_id, node_id, lease_epoch, expires_at</code></td><td>唯一 active writer；epoch 单调增加；旧 epoch 永远不能再次提交</td></tr>
             <tr><td>Endpoint</td><td><code>endpoint_id, hostname, target_port, protocol, wake_policy</code></td><td>名称稳定；绑定随 Cat 位置变化；解绑时不能误路由到旧 Guest</td></tr>
             <tr><td>Image</td><td><code>image_id, version, digest, kernel_abi, status, signature</code></td><td>已发布版本不可变；RootDisk 从明确 digest 创建，不直接依赖 mutable tag</td></tr>
@@ -300,9 +300,9 @@
       <h2>4. 用户接口与端到端流程</h2>
       <p class="lead"><code>cats</code> 是唯一主 CLI。命令只描述用户意图，不暴露 node_id、S3 prefix、JuiceFS metadata URL、tap、socket 或 vhost-user 参数。Dashboard 和 SDK 使用同一 API。</p>
 
-      <pre class="code-block"><code># 登录和选择项目
-cats auth login
-cats project use acme/dev
+      <pre class="code-block"><code># 登录和选择工作区
+cats login
+cats workspace use acme/dev
 
 # 创建 Cat；RootDisk 自动创建
 cats create dev --image ubuntu-24.04 --cpus 4 --memory 8GiB --root-size 100GiB
@@ -356,7 +356,7 @@ cats disk delete project-data    # 必须先处于 Available</code></pre>
       <h3 style="margin-top:28px">4.2 Shell / Exec 数据路径</h3>
       <div class="two-col">
         <article class="card"><h3>控制建立</h3><ol><li>CLI 向 API 申请短期 Session Token。</li><li>Session Gateway 查 Cat 当前 node 与 activation epoch。</li><li>Cat 为 Cold 时触发一次 Start，其他并发请求复用同一 Operation。</li><li>Gateway 与目标 cat-agent 建立 mTLS stream。</li><li>cat-agent 通过 AF_VSOCK 连接 Guest Agent。</li></ol></article>
-        <article class="card"><h3>交互数据</h3><ol><li>PTY 字节、窗口 resize、exit code 在流式通道传输。</li><li>中央 Resource API 不转发终端数据。</li><li>Token 只允许一个 tenant/project/cat/session。</li><li>断线后进程是否继续由命令参数决定；默认交互 shell 随 session 结束。</li><li>审计记录谁在何时打开 session，不记录终端明文。</li></ol></article>
+        <article class="card"><h3>交互数据</h3><ol><li>PTY 字节、窗口 resize、exit code 在流式通道传输。</li><li>中央 Resource API 不转发终端数据。</li><li>Token 只允许一个 account/workspace/cat/session。</li><li>断线后进程是否继续由命令参数决定；默认交互 shell 随 session 结束。</li><li>审计记录谁在何时打开 session，不记录终端明文。</li></ol></article>
       </div>
 
       <div class="callout"><strong>API 行为：</strong>创建、启动、停止、挂载、快照等长操作返回 <code>202 + operation_id</code>。CLI 默认等待并显示阶段；<code>--no-wait</code> 立即返回。网络超时后用户查询同一个 Operation，不重复创建资源。</div>
@@ -589,7 +589,7 @@ COMMIT;
       <div class="flow">
         <div class="step"><b>1. DNS</b><p><code>dev-&lt;opaque-cat-suffix&gt;.cats.run</code> 指向区域 Edge；不指向某台裸金属 Node。</p></div>
         <div class="step"><b>2. TLS / WAF</b><p>Edge 选择证书、校验 Host/SNI、执行限流和最大请求策略。</p></div>
-        <div class="step"><b>3. Route Lookup</b><p>按 hostname 查只读缓存，得到 project/cat/node/port/epoch。</p></div>
+        <div class="step"><b>3. Route Lookup</b><p>按 hostname 查只读缓存，得到 workspace/cat/node/port/epoch。</p></div>
         <div class="step"><b>4. Activation</b><p>Cat 非 Running 时按 wake policy 唤醒；并发请求 singleflight。</p></div>
         <div class="step"><b>5. Node Hop</b><p>通过区域私网/mTLS 或受控 tunnel 发送到 owning Node gateway。</p></div>
         <div class="step"><b>6. Epoch Check</b><p>Node 再校验 route epoch 和 Guest IP，拒绝旧绑定与跨租户端口。</p></div>
@@ -601,17 +601,17 @@ COMMIT;
         <table>
           <thead><tr><th>项目</th><th>V1 方案</th><th>后续扩展</th></tr></thead>
           <tbody>
-            <tr><td>Guest 地址</td><td>每 Node 分配不重叠的私有前缀；Cat 获得固定 project 内地址或稳定 service name</td><td>IPv6 /128、用户自带地址空间</td></tr>
+            <tr><td>Guest 地址</td><td>每 Node 分配不重叠的私有前缀；Cat 获得固定 workspace 内地址或稳定 service name</td><td>IPv6 /128、用户自带地址空间</td></tr>
             <tr><td>跨 Node</td><td>WireGuard routed overlay；每 Node 发布自己拥有的 Guest prefix</td><td>eBPF dataplane / cloud route integration</td></tr>
             <tr><td>出站</td><td>Host SNAT，共享区域 egress；DNS 由平台 resolver 提供</td><td>项目固定 Egress IP、PrivateLink、NAT gateway pool</td></tr>
             <tr><td>入站</td><td>HTTP/HTTPS/WS/WSS，Edge TLS termination；Guest 不需要证书</td><td>受限 TCP endpoint、UDP、TLS passthrough</td></tr>
-            <tr><td>服务发现</td><td><code>&lt;cat&gt;.&lt;project&gt;.internal</code> → 项目内稳定地址</td><td>按 Endpoint 的服务别名与负载均衡</td></tr>
+            <tr><td>服务发现</td><td><code>&lt;cat&gt;.&lt;workspace&gt;.internal</code> → Workspace 内稳定地址</td><td>按 Endpoint 的服务别名与负载均衡</td></tr>
             <tr><td>策略</td><td>默认 HTTP Endpoint 公网可寻址；Host 反欺骗</td><td>私有 Endpoint、逐 Endpoint 身份策略、用户可配置 ingress/egress policy</td></tr>
           </tbody>
         </table>
       </div>
 
-      <div class="callout red"><strong>路由安全不变量：</strong>Route cache 的 key 必须包含规范化 hostname；结果必须包含 tenant/project/cat/node/epoch；Node gateway 必须再次验证 epoch 和目标端口。不能只相信 Edge 传来的 Guest IP，也不能让请求头直接指定后端地址。</div>
+      <div class="callout red"><strong>路由安全不变量：</strong>Route cache 的 key 必须包含规范化 hostname；结果必须包含 account/workspace/cat/node/epoch；Node gateway 必须再次验证 epoch 和目标端口。不能只相信 Edge 传来的 Guest IP，也不能让请求头直接指定后端地址。</div>
     </section>
 
     <section id="storage">
@@ -693,11 +693,11 @@ COMMIT;
       <p class="lead">安全模型按“用户身份、平台服务身份、Node 身份、Guest 隔离、数据加密、网络策略、供应链”分层。任何一层都不能依赖“资源 ID 很难猜”。</p>
 
       <div class="module-grid">
-        <article class="module"><span class="where">Identity</span><h3>用户与组织</h3><p>OIDC/WorkOS 提供登录；平台数据库保存 Tenant、Project、Role 映射。</p><ul><li>Owner / Admin / Developer / Viewer</li><li>短期 session cookie</li><li>CLI device login</li><li>细粒度 API token scopes</li></ul></article>
+        <article class="module"><span class="where">Identity</span><h3>用户与组织</h3><p>OIDC/WorkOS 提供登录；平台数据库保存 Account、Workspace、Role 映射。</p><ul><li>Owner / Admin / Developer / Viewer</li><li>短期 session cookie</li><li>CLI device login</li><li>细粒度 API token scopes</li></ul></article>
         <article class="module"><span class="where">Service ID</span><h3>服务间身份</h3><p>控制面与 Node 使用短期 mTLS 身份；证书与 workload/node 属性绑定。</p><ul><li>Node attestation</li><li>自动轮换</li><li>按服务授权</li><li>撤销与 quarantine</li></ul></article>
         <article class="module"><span class="where">Isolation</span><h3>Guest / Host</h3><p>KVM 是主要隔离边界；VMM 和后端继续使用最小权限收缩爆炸半径。</p><ul><li>非 root 进程</li><li>seccomp / Landlock</li><li>cgroup v2</li><li>最小设备与内核模块</li></ul></article>
         <article class="module"><span class="where">Data</span><h3>数据保护</h3><p>传输 mTLS/TLS；远端对象使用 KMS；敏感 metadata 列应用层加密。</p><ul><li>每租户或每卷 DEK</li><li>key_version</li><li>checksum / AEAD</li><li>删除与密钥销毁审计</li></ul></article>
-        <article class="module"><span class="where">Network</span><h3>网络策略</h3><p>Host 拦截 spoofing，默认阻断管理网和云 metadata endpoint。</p><ul><li>project boundary</li><li>Endpoint allowlist</li><li>egress DNS policy</li><li>DDoS / WAF / rate limit</li></ul></article>
+        <article class="module"><span class="where">Network</span><h3>网络策略</h3><p>Host 拦截 spoofing，默认阻断管理网和云 metadata endpoint。</p><ul><li>workspace boundary</li><li>Endpoint allowlist</li><li>egress DNS policy</li><li>DDoS / WAF / rate limit</li></ul></article>
         <article class="module"><span class="where">Supply chain</span><h3>发布安全</h3><p>Host image、VMM、Kernel、Guest Agent 和 Root Image 都由 digest 固定并签名。</p><ul><li>SBOM 和漏洞门禁</li><li>双人发布审批</li><li>canary node pool</li><li>可回滚但不跨版本 restore</li></ul></article>
       </div>
 
@@ -708,7 +708,7 @@ COMMIT;
           <tbody>
             <tr><td>Guest</td><td>用户显式注入的应用 Secret、一次性 session token</td><td>S3 bucket credentials、PostgreSQL DSN、KMS 主密钥、Node 证书</td></tr>
             <tr><td>cats-blockd</td><td>限定 volume/epoch 的短期 token 或 Node 身份换取的对象权限</td><td>跨租户 bucket 全权限、控制面管理员 token</td></tr>
-            <tr><td>cat-agent</td><td>Node 身份、该 Node 当前 placement/job 的短期授权</td><td>任意 Tenant 用户凭证、支付提供商密钥</td></tr>
+            <tr><td>cat-agent</td><td>Node 身份、该 Node 当前 placement/job 的短期授权</td><td>任意 Account 用户凭证、支付提供商密钥</td></tr>
             <tr><td>Edge / Session Gateway</td><td>路由读取、短期 backend session、TLS key 的受控访问</td><td>磁盘数据密钥、Host root 凭证</td></tr>
             <tr><td>控制面</td><td>资源 metadata、密文 Secret、外部服务受限凭证</td><td>用户 RootDisk 明文内容</td></tr>
           </tbody>
@@ -718,9 +718,9 @@ COMMIT;
       <h3 style="margin-top:28px">12.2 审计事件</h3>
       <pre class="code-block"><code>AuditEvent {
   event_id, timestamp, request_id
-  actor { type, tenant_id, user_id | service_id, source_ip }
+  actor { type, account_id, user_id | service_id, source_ip }
   action                     # cat.start / disk.attach / secret.read / admin.node.drain
-  resource { type, id, project_id }
+  resource { type, id, workspace_id }
   decision { allowed, policy_id, reason }
   before_version, after_version
   operation_id
@@ -750,7 +750,7 @@ COMMIT;
       <h3 style="margin-top:28px">13.2 调度算法</h3>
       <pre class="code-block"><code>candidates = nodes
   .filter(status == READY)
-  .filter(region == project.region)
+  .filter(region == workspace.region)
   .filter(runtime_version supports image + devices)
   .filter(free_memory >= requested_memory)
   .filter(free_dirty_nvme_reservation >= required_staging)
@@ -761,7 +761,7 @@ score(node) =
   + last_rootdisk_host_affinity_if_healthy
   + warm_clean_chunk_estimate
   + binpack_score_for_cpu_and_memory
-  + az_spread_score_for_project
+  + az_spread_score_for_workspace
   - node_load_and_io_pressure
   - failure_domain_concentration
   - pending_drain_or_upgrade_penalty
@@ -863,7 +863,7 @@ score(node) =
       <h3 style="margin-top:28px">16.1 Usage Ledger</h3>
       <pre class="code-block"><code>UsageRecord {
   usage_id                 # 全局唯一，消费端去重
-  tenant_id, project_id
+  account_id, workspace_id
   resource_type, resource_id
   metric                   # vcpu_second / ram_gib_second / disk_gib_second / egress_byte
   quantity, unit
@@ -883,23 +883,23 @@ score(node) =
       <p class="lead">外部 API 采用版本化 JSON/HTTPS；shell/logs 使用升级后的流式协议。内部 Node API 建议使用 gRPC/mTLS。数据库表按资源分离，不再让 Volume 同时代表 Cat、系统盘和用户身份。</p>
 
       <h3>17.1 外部 API 轮廓</h3>
-      <pre class="code-block"><code>POST   /v1/projects/{project}/cats
-GET    /v1/projects/{project}/cats/{cat}
-PATCH  /v1/projects/{project}/cats/{cat}          # spec / desired state
-DELETE /v1/projects/{project}/cats/{cat}
+      <pre class="code-block"><code>POST   /v1/workspaces/{workspace_id}/cats
+GET    /v1/workspaces/{workspace_id}/cats/{cat}
+PATCH  /v1/workspaces/{workspace_id}/cats/{cat}          # spec / desired state
+DELETE /v1/workspaces/{workspace_id}/cats/{cat}
 
-POST   /v1/projects/{project}/cats/{cat}:start
-POST   /v1/projects/{project}/cats/{cat}:suspend
-POST   /v1/projects/{project}/cats/{cat}:stop
-POST   /v1/projects/{project}/cats/{cat}:exec      # 创建短期 session
+POST   /v1/workspaces/{workspace_id}/cats/{cat}:start
+POST   /v1/workspaces/{workspace_id}/cats/{cat}:suspend
+POST   /v1/workspaces/{workspace_id}/cats/{cat}:stop
+POST   /v1/workspaces/{workspace_id}/cats/{cat}:exec      # 创建短期 session
 
-POST   /v1/projects/{project}/disks
-POST   /v1/projects/{project}/disks/{disk}:attach
-POST   /v1/projects/{project}/disks/{disk}:detach
-POST   /v1/projects/{project}/disks/{disk}:resize
-POST   /v1/projects/{project}/disks/{disk}/snapshots
+POST   /v1/workspaces/{workspace_id}/disks
+POST   /v1/workspaces/{workspace_id}/disks/{disk}:attach
+POST   /v1/workspaces/{workspace_id}/disks/{disk}:detach
+POST   /v1/workspaces/{workspace_id}/disks/{disk}:resize
+POST   /v1/workspaces/{workspace_id}/disks/{disk}/snapshots
 
-POST   /v1/projects/{project}/cats/{cat}/endpoints
+POST   /v1/workspaces/{workspace_id}/cats/{cat}/endpoints
 GET    /v1/operations/{operation}
 GET    /v1/operations/{operation}/events
 
@@ -918,7 +918,7 @@ Location: /v1/operations/op_01J...
     "id": "op_01J...",
     "kind": "CatCreate",
     "phase": "Running",
-    "resource": "/v1/projects/dev/cats/cat_01J...",
+    "resource": "/v1/workspaces/ws_01J.../cats/cat_01J...",
     "progress": { "stage": "BootGuest", "completed": 5, "total": 7 },
     "error": null
   },
@@ -937,7 +937,7 @@ Location: /v1/operations/op_01J...
         <table>
           <thead><tr><th>表组</th><th>主要表</th><th>关键约束</th></tr></thead>
           <tbody>
-            <tr><td>身份</td><td>tenant, user, membership, project, api_token</td><td>所有资源外键包含 tenant/project；token 只存 hash</td></tr>
+            <tr><td>身份</td><td>account, user, membership, workspace, api_token</td><td>所有资源外键包含 account/workspace；token 只存 hash</td></tr>
             <tr><td>计算</td><td>cat, cat_spec, allocation, node, node_lease, reservation</td><td>一个 Cat 最多一个 active allocation；generation 单调</td></tr>
             <tr><td>存储</td><td>disk, attachment, disk_snapshot, disk_root, storage_job</td><td>partial unique index 保证每 Disk 一个 active RWO attachment</td></tr>
             <tr><td>网络</td><td>endpoint, route_binding, ip_allocation, certificate</td><td>hostname 全局唯一；binding epoch 单调；IP 不重复</td></tr>
@@ -1097,7 +1097,7 @@ NodeJobResult {
             <tr><td>RootDisk 是否可独立保留</td><td>默认与 Cat 同生命周期；删除前可显式 snapshot/clone</td><td>删除语义、账单、恢复与用户预期</td></tr>
             <tr><td>PersistentDisk 多写</td><td>V1 仅 RWO，绝不提供 RWX ext4</td><td>存储协议、锁、一致性、故障恢复</td></tr>
             <tr><td>Endpoint 冷请求</td><td>按 Endpoint 配 wake_policy；默认交互项目可唤醒，长期服务建议 pin Running</td><td>首字节延迟、网关容量、费用和用户体验</td></tr>
-            <tr><td>Region</td><td>Project 创建后固定 Region；迁移是显式异步操作</td><td>网络、数据驻留、存储复制和域名</td></tr>
+            <tr><td>Region</td><td>Workspace 创建后固定 Region；迁移是显式异步操作</td><td>网络、数据驻留、存储复制和域名</td></tr>
             <tr><td>首发存储后端</td><td>用真实基准决定 JuiceFS raw 是否可上线；Direct-S3 不阻塞产品其他部分</td><td>研发周期、成本、正确性风险</td></tr>
             <tr><td>计费单位</td><td>Running compute + provisioned PersistentDisk + 超额 Root + egress；Suspend 单独定价</td><td>usage schema、产品套餐和毛利</td></tr>
           </tbody>

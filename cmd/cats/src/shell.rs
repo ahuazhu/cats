@@ -70,16 +70,16 @@ fn terminal_size() -> (u16, u16) {
         .unwrap_or((24, 80))
 }
 
-pub fn run(base: &str, project: &str, token: &str, cat: &str) -> Result<()> {
+pub fn run(base: &str, workspace_id: &str, token: &str, cat: &str) -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("start shell runtime")?;
-    let exit_code = runtime.block_on(run_async(base, project, token, cat))?;
+    let exit_code = runtime.block_on(run_async(base, workspace_id, token, cat))?;
     if exit_code != 0 {
         bail!("remote shell exited with {exit_code}");
     }
     Ok(())
 }
 
-async fn run_async(base: &str, project: &str, token: &str, cat: &str) -> Result<i32> {
+async fn run_async(base: &str, workspace_id: &str, token: &str, cat: &str) -> Result<i32> {
     let (rows, cols) = terminal_size();
     let mut url = reqwest::Url::parse(base).context("invalid control plane URL")?;
     url.set_scheme(match url.scheme() {
@@ -88,7 +88,7 @@ async fn run_async(base: &str, project: &str, token: &str, cat: &str) -> Result<
         other => bail!("unsupported control plane URL scheme {other}"),
     })
     .map_err(|_| anyhow::anyhow!("invalid WebSocket URL"))?;
-    url.set_path(&format!("/v1/projects/{project}/cats/{cat}/shell"));
+    url.set_path(&format!("/v1/workspaces/{workspace_id}/cats/{cat}/shell"));
     url.set_query(Some(&format!("rows={rows}&cols={cols}")));
     let mut request = url
         .as_str()

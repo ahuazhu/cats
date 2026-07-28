@@ -36,4 +36,4 @@ cats operation wait OPERATION_ID</code></pre>
 <p>已经 Running 的 Cat 可能继续运行，因为 API 进程不在 Guest I/O 热路径。新的生命周期变更与 durable Root 发布可能延迟或 fail closed。权威 Metadata CAS 不可用时，不能宣称 FLUSH 成功。</p>
 
 <h2 id="support-bundle">有用的故障证据</h2>
-<p>升级处理时请保留 Request ID、Operation ID、Workspace/Project Slug、Cat/Disk 名称、Node ID、Generation、Attachment/Route Epoch、时间戳、CLI 版本与结构化错误。移除 Token、Cookie、Secret、Guest 磁盘内容与终端明文。</p>
+<p>升级处理时请保留 Request ID、Operation ID、Account/Workspace Slug、Cat/Disk 名称、Node ID、Generation、Attachment/Route Epoch、时间戳、CLI 版本与结构化错误。移除 Token、Cookie、Secret、Guest 磁盘内容与终端明文。</p>

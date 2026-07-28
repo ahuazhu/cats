@@ -3,7 +3,7 @@
 | Option / environment | Default | Purpose |
 |----|----|----|
 | `--api-url` / `CATS_API_URL` | saved login target, otherwise `https://cats.run` | Control-plane base URL |
-| `--workspace` / `CATS_WORKSPACE` | saved Workspace | Override one command without changing the default; `--project` is a compatibility alias |
+| `--workspace` / `CATS_WORKSPACE` | saved Workspace | Override one command without changing the default; accepts `workspace`, `account/workspace`, or a workspace ID |
 | `--token` / `CATS_TOKEN` | none | Machine/administrator Bearer credential only; normal users run `cats login` |
 | `--no-wait` | off | Return after an Operation is accepted |
 | `--json` | off | Print machine-readable JSON where supported |

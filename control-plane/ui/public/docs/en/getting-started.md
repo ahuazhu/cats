@@ -23,7 +23,7 @@ Working inside the repository, you can also replace `cats` in every example with
 
 ## Configure access
 
-Users sign in with WorkOS. The CLI uses Device Authorization, opens the verification page in a browser, and stores its short-lived access token and rotating refresh credential only in the operating-system credential store. Cats no longer accepts static project tokens for normal users.
+Users sign in with WorkOS. The CLI uses Device Authorization, opens the verification page in a browser, and stores its short-lived access token and rotating refresh credential only in the operating-system credential store. Cats no longer accepts static user tokens for normal users.
 
     export CATS_API_URL='https://cats.run'
     cats login

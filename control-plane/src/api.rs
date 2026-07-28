@@ -2,7 +2,7 @@
 //! `Idempotency-Key` retries replay the original operation; actions live
 //! under `/actions/<verb>` (path-safe rendering of the `:verb` convention).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -30,8 +30,8 @@ use cats_api::metering::{
 use cats_api::requests::*;
 use cats_api::resources::*;
 use cats_metering::{
-    AttributedCheckpoint, CatAggregate, CheckoutIntent, CheckoutPayment, CheckoutRefund,
-    CreditApplyOutcome, IngestOutcome, RateCard, UsageAggregate, UsageAttribution, UsageInterval,
+    AttributedCheckpoint, CheckoutIntent, CheckoutPayment, CheckoutRefund,
+    CreditApplyOutcome, IngestOutcome, RateCard, UsageAttribution, UsageInterval,
     UsageQuery as MeterUsageQuery, UsageView,
 };
 
@@ -122,10 +122,10 @@ async fn check_authenticated(state: &AppState, headers: &HeaderMap) -> ApiResult
     Err(auth_failure(false))
 }
 
-async fn check_project_auth(
+async fn check_workspace_auth(
     state: &AppState,
     headers: &HeaderMap,
-    project: &str,
+    workspace: &str,
 ) -> ApiResult<crate::store::WorkspaceScope> {
     let principal = bearer_principal(state, headers).await?;
     let mut resolved_scope = None;
@@ -135,7 +135,7 @@ async fn check_project_auth(
             let Some(organization_id) = identity.organization_id.as_deref() else {
                 return Err(auth_failure(true));
             };
-            let scope = state.store.workspace_scope_for_project(project)?;
+            let scope = state.store.workspace_scope(workspace)?;
             let allowed = scope.account.status == "active"
                 && scope.account.workos_organization_id == organization_id
                 && state
@@ -150,10 +150,10 @@ async fn check_project_auth(
         }
         Some(Principal::Service) | None => false,
     };
-    if bearer_allowed || crate::auth::web_session_allows_project(state, headers, project).await? {
+    if bearer_allowed || crate::auth::web_session_allows_workspace(state, headers, workspace).await? {
         return resolved_scope
             .map(Ok)
-            .unwrap_or_else(|| state.store.workspace_scope_for_project(project))
+            .unwrap_or_else(|| state.store.workspace_scope(workspace))
             .map_err(Into::into);
     }
     Err(auth_failure(
@@ -277,8 +277,8 @@ fn if_match(headers: &HeaderMap) -> Option<i64> {
         .and_then(|s| s.parse().ok())
 }
 
-fn billing_account_id_for_project(state: &AppState, project: &str) -> Result<String, ApiError> {
-    state.store.billing_account_id_for_project(project)
+fn billing_account_id_for_workspace(state: &AppState, workspace: &str) -> Result<String, ApiError> {
+    state.store.billing_account_id_for_workspace(workspace)
 }
 
 fn metering_failure(error: cats_metering::MeteringError) -> Failure {
@@ -356,46 +356,46 @@ pub fn router(state: AppState) -> Router {
             axum::routing::patch(update_account_member).delete(deactivate_account_member),
         )
         .route(
-            "/v1/projects/{project}/cats",
+            "/v1/workspaces/{workspace}/cats",
             post(create_cat).get(list_cats),
         )
         .route(
-            "/v1/projects/{project}/cats/{cat}",
+            "/v1/workspaces/{workspace}/cats/{cat}",
             get(get_cat).delete(delete_cat),
         )
         .route(
-            "/v1/projects/{project}/cats/{cat}/actions/{verb}",
+            "/v1/workspaces/{workspace}/cats/{cat}/actions/{verb}",
             post(cat_action),
         )
-        .route("/v1/projects/{project}/cats/{cat}/exec", post(exec_cat))
-        .route("/v1/projects/{project}/cats/{cat}/shell", get(shell_cat))
+        .route("/v1/workspaces/{workspace}/cats/{cat}/exec", post(exec_cat))
+        .route("/v1/workspaces/{workspace}/cats/{cat}/shell", get(shell_cat))
         .route(
-            "/v1/projects/{project}/cats/{cat}/auto-suspend",
+            "/v1/workspaces/{workspace}/cats/{cat}/auto-suspend",
             get(get_auto_suspend).put(update_auto_suspend),
         )
-        .route("/v1/projects/{project}/cats/{cat}/work", get(get_cat_work))
+        .route("/v1/workspaces/{workspace}/cats/{cat}/work", get(get_cat_work))
         .route(
-            "/v1/projects/{project}/cats/{cat}/endpoints",
+            "/v1/workspaces/{workspace}/cats/{cat}/endpoints",
             post(create_endpoint).get(list_endpoints),
         )
         .route(
-            "/v1/projects/{project}/disks",
+            "/v1/workspaces/{workspace}/disks",
             post(create_disk).get(list_disks),
         )
         .route(
-            "/v1/projects/{project}/disks/{disk}",
+            "/v1/workspaces/{workspace}/disks/{disk}",
             get(get_disk).delete(delete_disk),
         )
         .route(
-            "/v1/projects/{project}/disks/{disk}/actions/{verb}",
+            "/v1/workspaces/{workspace}/disks/{disk}/actions/{verb}",
             post(disk_action),
         )
         .route(
-            "/v1/projects/{project}/disks/{disk}/snapshots",
+            "/v1/workspaces/{workspace}/disks/{disk}/snapshots",
             post(create_snapshot).get(list_snapshots),
         )
         .route("/v1/operations/{id}", get(get_operation))
-        .route("/v1/projects/{project}/operations", get(list_operations))
+        .route("/v1/workspaces/{workspace}/operations", get(list_operations))
         .route("/v1/nodes/register", post(register_node))
         .route("/v1/nodes/heartbeat", post(heartbeat))
         .route("/v1/nodes/work-status", post(node_work_status))
@@ -405,19 +405,20 @@ pub fn router(state: AppState) -> Router {
             "/v1/internal/usage/checkpoints",
             post(ingest_usage_checkpoints),
         )
-        .route("/v1/projects/{project}/billing/usage", get(project_usage))
+        .route("/v1/workspaces/{workspace}/billing/usage", get(workspace_usage))
         .route(
-            "/v1/projects/{project}/billing/balance",
-            get(project_billing_balance),
+            "/v1/workspaces/{workspace}/billing/balance",
+            get(workspace_billing_balance),
         )
         .route(
-            "/v1/projects/{project}/billing/checkout",
+            "/v1/workspaces/{workspace}/billing/checkout",
             post(create_billing_checkout),
         )
         .route("/v1/billing/stripe/webhook", post(stripe_webhook))
         .route("/v1/nodes/{id}/actions/cordon", post(cordon_node))
         .route("/v1/nodes", get(list_nodes))
         .route("/v1/admin/nodes", get(admin_list_nodes))
+        .route("/v1/admin/workspaces", get(admin_list_workspaces))
         .route(
             "/v1/admin/nodes/{id}",
             get(admin_get_node).delete(admin_delete_node),
@@ -742,12 +743,12 @@ async fn deactivate_account_member(
 
 async fn create_cat(
     State(state): State<AppState>,
-    Path(project): Path<String>,
+    Path(workspace): Path<String>,
     headers: HeaderMap,
     Json(req): Json<CreateCatRequest>,
 ) -> ApiResult<Response> {
-    let scope = check_project_auth(&state, &headers, &project).await?;
-    require_funded(&state, &project).await?;
+    let scope = check_workspace_auth(&state, &headers, &workspace).await?;
+    require_funded(&state, &workspace).await?;
     if req.name.is_empty()
         || !req
             .name
@@ -756,7 +757,7 @@ async fn create_cat(
     {
         return Err(ApiError::invalid("cat name must be non-empty [a-z0-9-]").into());
     }
-    let route = format!("POST /cats {project}/{}", req.name);
+    let route = format!("POST /cats {workspace}/{}", req.name);
     if let Some(key) = idem_key(&headers) {
         if let Some(op_id) = state.store.idempotency_lookup(&key, &route)? {
             let op = state.store.get_operation(&op_id)?;
@@ -795,31 +796,31 @@ async fn create_cat(
 
 async fn list_cats(
     State(state): State<AppState>,
-    Path(project): Path<String>,
+    Path(workspace): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<Cat>>> {
-    check_project_auth(&state, &headers, &project).await?;
+    check_workspace_auth(&state, &headers, &workspace).await?;
     Ok(Json(ListResponse {
-        items: state.store.list_cats(&project)?,
+        items: state.store.list_cats(&workspace)?,
     }))
 }
 
 async fn get_cat(
     State(state): State<AppState>,
-    Path((project, cat)): Path<(String, String)>,
+    Path((workspace, cat)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Cat>> {
-    check_project_auth(&state, &headers, &project).await?;
-    Ok(Json(state.store.get_cat(&project, &cat)?))
+    check_workspace_auth(&state, &headers, &workspace).await?;
+    Ok(Json(state.store.get_cat(&workspace, &cat)?))
 }
 
 async fn cat_action(
     State(state): State<AppState>,
-    Path((project, cat, verb)): Path<(String, String, String)>,
+    Path((workspace, cat, verb)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    check_project_auth(&state, &headers, &project).await?;
-    let cat = state.store.get_cat(&project, &cat)?;
+    check_workspace_auth(&state, &headers, &workspace).await?;
+    let cat = state.store.get_cat(&workspace, &cat)?;
     let desired = match verb.as_str() {
         "start" | "resume" => DesiredState::Running,
         "suspend" => DesiredState::Suspended,
@@ -828,7 +829,7 @@ async fn cat_action(
         _ => return Err(ApiError::invalid(format!("unknown action {verb}")).into()),
     };
     if desired == DesiredState::Running {
-        require_funded(&state, &project).await?;
+        require_funded(&state, &workspace).await?;
     }
     let route = format!("POST /cats/{}/actions/{verb}", cat.id);
     if let Some(key) = idem_key(&headers) {
@@ -860,11 +861,11 @@ async fn cat_action(
 
 async fn delete_cat(
     State(state): State<AppState>,
-    Path((project, cat)): Path<(String, String)>,
+    Path((workspace, cat)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    check_project_auth(&state, &headers, &project).await?;
-    let cat = state.store.get_cat(&project, &cat)?;
+    check_workspace_auth(&state, &headers, &workspace).await?;
+    let cat = state.store.get_cat(&workspace, &cat)?;
     let op = state.store.set_desired(
         &cat.id,
         DesiredState::Deleted,
@@ -885,12 +886,12 @@ async fn delete_cat(
 
 async fn exec_cat(
     State(state): State<AppState>,
-    Path((project, cat)): Path<(String, String)>,
+    Path((workspace, cat)): Path<(String, String)>,
     headers: HeaderMap,
     Json(req): Json<ExecRequest>,
 ) -> ApiResult<Json<ExecResponse>> {
-    check_project_auth(&state, &headers, &project).await?;
-    let cat = state.store.get_cat(&project, &cat)?;
+    check_workspace_auth(&state, &headers, &workspace).await?;
+    let cat = state.store.get_cat(&workspace, &cat)?;
     if req.command.is_empty() {
         return Err(ApiError::invalid("command must be a non-empty argv array").into());
     }
@@ -985,16 +986,16 @@ fn default_terminal_cols() -> u16 {
 
 async fn shell_cat(
     State(state): State<AppState>,
-    Path((project, cat)): Path<(String, String)>,
+    Path((workspace, cat)): Path<(String, String)>,
     Query(query): Query<ShellQuery>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> ApiResult<Response> {
-    check_project_auth(&state, &headers, &project).await?;
+    check_workspace_auth(&state, &headers, &workspace).await?;
     if !(1..=1_000).contains(&query.rows) || !(1..=1_000).contains(&query.cols) {
         return Err(ApiError::invalid("terminal dimensions must be in 1..=1000").into());
     }
-    let cat = state.store.get_cat(&project, &cat)?;
+    let cat = state.store.get_cat(&workspace, &cat)?;
     let owner = format!("shell_{}", uuid::Uuid::new_v4().simple());
     let lease = state
         .store
@@ -1168,11 +1169,11 @@ async fn proxy_shell(
 
 async fn get_auto_suspend(
     State(state): State<AppState>,
-    Path((project, cat)): Path<(String, String)>,
+    Path((workspace, cat)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<AutoSuspendResponse>> {
-    check_project_auth(&state, &headers, &project).await?;
-    let cat = state.store.get_cat(&project, &cat)?;
+    check_workspace_auth(&state, &headers, &workspace).await?;
+    let cat = state.store.get_cat(&workspace, &cat)?;
     let work = state
         .store
         .work_status(&cat.id, state.cfg.node_lease_timeout_ms)?;
@@ -1181,12 +1182,12 @@ async fn get_auto_suspend(
 
 async fn update_auto_suspend(
     State(state): State<AppState>,
-    Path((project, cat)): Path<(String, String)>,
+    Path((workspace, cat)): Path<(String, String)>,
     headers: HeaderMap,
     Json(request): Json<UpdateAutoSuspendRequest>,
 ) -> ApiResult<Json<AutoSuspendResponse>> {
-    check_project_auth(&state, &headers, &project).await?;
-    let cat = state.store.get_cat(&project, &cat)?;
+    check_workspace_auth(&state, &headers, &workspace).await?;
+    let cat = state.store.get_cat(&workspace, &cat)?;
     let cat = state.store.set_auto_suspend(&cat.id, request.enabled)?;
     if request.enabled {
         state.controller.maybe_auto_suspend(&cat.id)?;
@@ -1200,11 +1201,11 @@ async fn update_auto_suspend(
 
 async fn get_cat_work(
     State(state): State<AppState>,
-    Path((project, cat)): Path<(String, String)>,
+    Path((workspace, cat)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<CatWorkStatus>> {
-    check_project_auth(&state, &headers, &project).await?;
-    let cat = state.store.get_cat(&project, &cat)?;
+    check_workspace_auth(&state, &headers, &workspace).await?;
+    let cat = state.store.get_cat(&workspace, &cat)?;
     Ok(Json(
         state
             .store
@@ -1216,7 +1217,7 @@ async fn get_cat_work(
 pub async fn ensure_running(state: &AppState, cat: Cat) -> ApiResult<Cat> {
     let wake_started = std::time::Instant::now();
     let cat = state.store.must_get_cat_by_id(&cat.id)?;
-    require_funded(state, &cat.project).await?;
+    require_funded(state, &cat.workspace_id).await?;
     if cat.desired_state == DesiredState::Running && cat.observed_state == ObservedState::Running {
         return Ok(cat);
     }
@@ -1254,11 +1255,11 @@ pub async fn ensure_running(state: &AppState, cat: Cat) -> ApiResult<Cat> {
 
 async fn create_disk(
     State(state): State<AppState>,
-    Path(project): Path<String>,
+    Path(workspace): Path<String>,
     headers: HeaderMap,
     Json(req): Json<CreateDiskRequest>,
 ) -> ApiResult<Json<Disk>> {
-    let scope = check_project_auth(&state, &headers, &project).await?;
+    let scope = check_workspace_auth(&state, &headers, &workspace).await?;
     if req.size_bytes == 0 || req.size_bytes > cats_api::chunk::MAX_VOLUME_BYTES {
         return Err(ApiError::invalid("disk size out of range").into());
     }
@@ -1276,31 +1277,31 @@ async fn create_disk(
 
 async fn list_disks(
     State(state): State<AppState>,
-    Path(project): Path<String>,
+    Path(workspace): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<Disk>>> {
-    check_project_auth(&state, &headers, &project).await?;
+    check_workspace_auth(&state, &headers, &workspace).await?;
     Ok(Json(ListResponse {
-        items: state.store.list_disks(&project)?,
+        items: state.store.list_disks(&workspace)?,
     }))
 }
 
 async fn get_disk(
     State(state): State<AppState>,
-    Path((project, disk)): Path<(String, String)>,
+    Path((workspace, disk)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Disk>> {
-    check_project_auth(&state, &headers, &project).await?;
-    Ok(Json(state.store.get_disk(&project, &disk)?))
+    check_workspace_auth(&state, &headers, &workspace).await?;
+    Ok(Json(state.store.get_disk(&workspace, &disk)?))
 }
 
 async fn delete_disk(
     State(state): State<AppState>,
-    Path((project, disk)): Path<(String, String)>,
+    Path((workspace, disk)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<StatusCode> {
-    check_project_auth(&state, &headers, &project).await?;
-    let disk = state.store.get_disk(&project, &disk)?;
+    check_workspace_auth(&state, &headers, &workspace).await?;
+    let disk = state.store.get_disk(&workspace, &disk)?;
     if disk.kind == DiskKind::Root {
         return Err(ApiError::failed_precondition("root disks are deleted with their cat").into());
     }
@@ -1327,12 +1328,12 @@ struct DiskActionBody {
 
 async fn disk_action(
     State(state): State<AppState>,
-    Path((project, disk, verb)): Path<(String, String, String)>,
+    Path((workspace, disk, verb)): Path<(String, String, String)>,
     headers: HeaderMap,
     Json(body): Json<DiskActionBody>,
 ) -> ApiResult<Response> {
-    check_project_auth(&state, &headers, &project).await?;
-    let disk = state.store.get_disk(&project, &disk)?;
+    check_workspace_auth(&state, &headers, &workspace).await?;
+    let disk = state.store.get_disk(&workspace, &disk)?;
     match verb.as_str() {
         "mount" => {
             let cat_ref = body
@@ -1341,7 +1342,7 @@ async fn disk_action(
             let mount_at = body
                 .mount_at
                 .ok_or_else(|| ApiError::invalid("mount_at required"))?;
-            let cat = state.store.get_cat(&project, &cat_ref)?;
+            let cat = state.store.get_cat(&workspace, &cat_ref)?;
             if disk.kind == DiskKind::Root {
                 return Err(ApiError::failed_precondition("cannot mount a root disk").into());
             }
@@ -1389,7 +1390,7 @@ async fn disk_action(
                 .resize_volume(&disk.volume_id, rounded)
                 .map_err(|e| ApiError::failed_precondition(e.to_string()))?;
             state.store.set_disk_size(&disk.id, new_size)?;
-            Ok(Json(state.store.get_disk(&project, &disk.id)?).into_response())
+            Ok(Json(state.store.get_disk(&workspace, &disk.id)?).into_response())
         }
         _ => Err(ApiError::invalid(format!("unknown disk action {verb}")).into()),
     }
@@ -1512,11 +1513,11 @@ async fn dispatch_or_unavailable(
 
 async fn create_snapshot(
     State(state): State<AppState>,
-    Path((project, disk)): Path<(String, String)>,
+    Path((workspace, disk)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Snapshot>> {
-    check_project_auth(&state, &headers, &project).await?;
-    let disk = state.store.get_disk(&project, &disk)?;
+    check_workspace_auth(&state, &headers, &workspace).await?;
+    let disk = state.store.get_disk(&workspace, &disk)?;
     let snap_id = crate::store::new_id(cats_api::ids::SNAPSHOT_PREFIX);
     let row = state
         .storage_meta
@@ -1537,11 +1538,11 @@ fn hex_lower(h: [u8; 32]) -> String {
 
 async fn list_snapshots(
     State(state): State<AppState>,
-    Path((project, disk)): Path<(String, String)>,
+    Path((workspace, disk)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<Snapshot>>> {
-    check_project_auth(&state, &headers, &project).await?;
-    let disk = state.store.get_disk(&project, &disk)?;
+    check_workspace_auth(&state, &headers, &workspace).await?;
+    let disk = state.store.get_disk(&workspace, &disk)?;
     let rows = state
         .storage_meta
         .list_snapshots(&disk.volume_id)
@@ -1566,11 +1567,11 @@ async fn list_snapshots(
 
 async fn create_endpoint(
     State(state): State<AppState>,
-    Path((project, cat)): Path<(String, String)>,
+    Path((workspace, cat)): Path<(String, String)>,
     headers: HeaderMap,
     Json(req): Json<CreateEndpointRequest>,
 ) -> ApiResult<Json<EndpointResponse>> {
-    check_project_auth(&state, &headers, &project).await?;
+    check_workspace_auth(&state, &headers, &workspace).await?;
     if req.name.is_empty()
         || req.name.len() > 24
         || !req
@@ -1590,7 +1591,7 @@ async fn create_endpoint(
     if req.protocol != "http" {
         return Err(ApiError::invalid("only http endpoints are currently supported").into());
     }
-    let cat = state.store.get_cat(&project, &cat)?;
+    let cat = state.store.get_cat(&workspace, &cat)?;
     let ep = state.store.create_endpoint(
         &cat,
         &req.name,
@@ -1616,11 +1617,11 @@ async fn create_endpoint(
 
 async fn list_endpoints(
     State(state): State<AppState>,
-    Path((project, cat)): Path<(String, String)>,
+    Path((workspace, cat)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<Endpoint>>> {
-    check_project_auth(&state, &headers, &project).await?;
-    let cat = state.store.get_cat(&project, &cat)?;
+    check_workspace_auth(&state, &headers, &workspace).await?;
+    let cat = state.store.get_cat(&workspace, &cat)?;
     Ok(Json(ListResponse {
         items: state.store.endpoints_for_cat(&cat.id)?,
     }))
@@ -1776,8 +1777,8 @@ async fn ingest_usage_checkpoints(
                     attribution
                 } else {
                     UsageAttribution {
-                        billing_account_id: billing_account_id_for_project(&state, &cat.project)?,
-                        project_id: cat.project,
+                        billing_account_id: billing_account_id_for_workspace(&state, &cat.workspace_id)?,
+                        workspace_id: cat.workspace_id,
                         resource_type: "cat".to_string(),
                         resource_id: checkpoint.cat_id.clone(),
                         attributed_cat_id: Some(checkpoint.cat_id.clone()),
@@ -1822,16 +1823,16 @@ async fn ingest_usage_checkpoints(
 fn cat_attribution_matches(
     attribution: &UsageAttribution,
     cat_id: &str,
-    project: Option<&str>,
+    workspace: Option<&str>,
 ) -> bool {
     attribution.resource_type == "cat"
         && attribution.resource_id == cat_id
         && attribution.attributed_cat_id.as_deref() == Some(cat_id)
-        && project.is_none_or(|project| attribution.project_id == project)
+        && workspace.is_none_or(|workspace| attribution.workspace_id == workspace)
 }
 
 fn validate_cat_attribution(attribution: &UsageAttribution, cat: &Cat) -> Result<(), Failure> {
-    if cat_attribution_matches(attribution, &cat.id, Some(&cat.project)) {
+    if cat_attribution_matches(attribution, &cat.id, Some(&cat.workspace_id)) {
         Ok(())
     } else {
         Err(ApiError::conflict(
@@ -1858,80 +1859,66 @@ fn unix_millis() -> Result<i64, Failure> {
     i64::try_from(millis).map_err(|_| ApiError::internal("system time is out of range").into())
 }
 
-async fn billing_projection(state: &AppState, project: &str) -> ApiResult<BillingProjection> {
+async fn billing_projection(state: &AppState, workspace: &str) -> ApiResult<BillingProjection> {
     let now_ms = unix_millis()?;
-    let ledgers = state.store.billing_ledgers_for_project(project)?;
+    let ledger = state.store.billing_ledger_for_workspace(workspace)?;
     let rate_card = RateCard::sprites_compute_v1();
-    let mut signup_credit_nanos = 0_i128;
-    let mut credit_nanos = 0_i128;
+    let credit = state
+        .credits
+        .ensure_account(
+            &ledger.billing_account_id,
+            &ledger.owner_id,
+            "USD",
+            ledger.signup_credit_nanos,
+            now_ms,
+        )
+        .await
+        .map_err(metering_failure)?;
+    // Every Workspace in an Account bills to that Account, so the balance is
+    // read per Billing Account and never filtered by Workspace here.
+    let usage = state
+        .usage
+        .query(&MeterUsageQuery {
+            billing_account_id: ledger.billing_account_id,
+            workspace_id: None,
+            attributed_cat_id: None,
+            interval_start_unix_ms: 0,
+            interval_end_unix_ms: now_ms.max(1),
+        })
+        .await
+        .map_err(metering_failure)?;
     let mut usage_nanos = 0_u128;
-    let mut latest_interval_end_unix_ms = None;
-    let mut stripe_customer_id = None;
-    for ledger in ledgers {
-        signup_credit_nanos = signup_credit_nanos
-            .checked_add(ledger.signup_credit_nanos)
-            .ok_or_else(|| ApiError::internal("signup credit overflow"))?;
-        let credit = state
-            .credits
-            .ensure_account(
-                &ledger.billing_account_id,
-                &ledger.owner_id,
-                "USD",
-                ledger.signup_credit_nanos,
-                now_ms,
-            )
-            .await
-            .map_err(metering_failure)?;
-        credit_nanos = credit_nanos
-            .checked_add(credit.credit_nanos)
-            .ok_or_else(|| ApiError::internal("credit balance overflow"))?;
-        if stripe_customer_id.is_none() {
-            stripe_customer_id = credit.stripe_customer_id;
-        }
-        let usage = state
-            .usage
-            .query(&MeterUsageQuery {
-                billing_account_id: ledger.billing_account_id,
-                project_id: None,
-                attributed_cat_id: None,
-                interval_start_unix_ms: 0,
-                interval_end_unix_ms: now_ms.max(1),
-            })
-            .await
-            .map_err(metering_failure)?;
-        latest_interval_end_unix_ms =
-            latest_interval_end_unix_ms.max(usage.latest_interval_end_unix_ms);
-        for aggregate in usage.totals {
-            if let Some(amount) = rate_card
-                .rate_quantity(aggregate.metric, aggregate.quantity)
-                .map_err(metering_failure)?
-            {
-                usage_nanos = usage_nanos
-                    .checked_add(amount)
-                    .ok_or_else(|| ApiError::internal("rated balance overflow"))?;
-            }
+    for aggregate in usage.totals {
+        if let Some(amount) = rate_card
+            .rate_quantity(aggregate.metric, aggregate.quantity)
+            .map_err(metering_failure)?
+        {
+            usage_nanos = usage_nanos
+                .checked_add(amount)
+                .ok_or_else(|| ApiError::internal("rated balance overflow"))?;
         }
     }
     let usage_signed = i128::try_from(usage_nanos)
         .map_err(|_| ApiError::internal("rated balance exceeds signed money range"))?;
-    let available_nanos = credit_nanos
+    let available_nanos = credit
+        .credit_nanos
         .checked_sub(usage_signed)
         .ok_or_else(|| ApiError::internal("available balance overflow"))?;
     Ok(BillingProjection {
-        signup_credit_nanos,
-        credit_nanos,
+        signup_credit_nanos: ledger.signup_credit_nanos,
+        credit_nanos: credit.credit_nanos,
         usage_nanos,
         available_nanos,
-        latest_interval_end_unix_ms,
-        stripe_customer_id,
+        latest_interval_end_unix_ms: usage.latest_interval_end_unix_ms,
+        stripe_customer_id: credit.stripe_customer_id,
     })
 }
 
-async fn require_funded(state: &AppState, project: &str) -> ApiResult<()> {
+async fn require_funded(state: &AppState, workspace: &str) -> ApiResult<()> {
     if !state.cfg.billing_enforcement_enabled {
         return Ok(());
     }
-    let projection = billing_projection(state, project).await?;
+    let projection = billing_projection(state, workspace).await?;
     if projection.available_nanos <= 0 {
         return Err(ApiError::payment_required(
             "prepaid balance is exhausted; add funds in Billing before starting paid work",
@@ -1954,11 +1941,11 @@ pub(crate) async fn enforce_exhausted_billing_accounts(state: &AppState) -> ApiR
         .collect::<Result<Vec<_>, ApiError>>()?;
     let accounts = active_cats
         .iter()
-        .map(|(cat, account_id)| (account_id.clone(), cat.project.clone()))
+        .map(|(cat, account_id)| (account_id.clone(), cat.workspace_id.clone()))
         .collect::<BTreeMap<_, _>>();
     let mut changed = false;
-    for (account_id, project) in accounts {
-        let projection = billing_projection(state, &project).await?;
+    for (account_id, workspace) in accounts {
+        let projection = billing_projection(state, &workspace).await?;
         if projection.available_nanos > 0 {
             continue;
         }
@@ -1973,7 +1960,7 @@ pub(crate) async fn enforce_exhausted_billing_accounts(state: &AppState) -> ApiR
                 Ok(_) => {
                     changed = true;
                     tracing::warn!(
-                        billing_account = %billing_account_id_for_project(state, &project)?,
+                        billing_account = %billing_account_id_for_workspace(state, &workspace)?,
                         cat_id = %cat.id,
                         "prepaid balance exhausted; converging Cat to Cold"
                     );
@@ -1994,13 +1981,13 @@ pub(crate) async fn enforce_exhausted_billing_accounts(state: &AppState) -> ApiR
     Ok(())
 }
 
-async fn project_billing_balance(
+async fn workspace_billing_balance(
     State(state): State<AppState>,
-    Path(project): Path<String>,
+    Path(workspace): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    check_project_auth(&state, &headers, &project).await?;
-    let projection = billing_projection(&state, &project).await?;
+    check_workspace_auth(&state, &headers, &workspace).await?;
+    let projection = billing_projection(&state, &workspace).await?;
     let stripe_enabled = state.cfg.stripe.is_some();
     let topup_options_cents = state
         .cfg
@@ -2009,8 +1996,8 @@ async fn project_billing_balance(
         .map(|stripe| stripe.topup_options_cents())
         .unwrap_or_default();
     let balance = BillingBalance {
-        billing_account_id: billing_account_id_for_project(&state, &project)?,
-        project_id: project.clone(),
+        billing_account_id: billing_account_id_for_workspace(&state, &workspace)?,
+        workspace_id: workspace.clone(),
         currency: "USD".to_string(),
         status: if projection.available_nanos > 0 {
             "active"
@@ -2035,11 +2022,11 @@ async fn project_billing_balance(
 
 async fn create_billing_checkout(
     State(state): State<AppState>,
-    Path(project): Path<String>,
+    Path(workspace): Path<String>,
     headers: HeaderMap,
     Json(request): Json<CreateCheckoutRequest>,
 ) -> ApiResult<Response> {
-    check_project_auth(&state, &headers, &project).await?;
+    check_workspace_auth(&state, &headers, &workspace).await?;
     let stripe = state
         .cfg
         .stripe
@@ -2051,8 +2038,9 @@ async fn create_billing_checkout(
     let idempotency_key = idem_key(&headers)
         .filter(|value| !value.trim().is_empty() && value.len() <= 200)
         .ok_or_else(|| ApiError::invalid("Idempotency-Key is required for Checkout"))?;
-    let billing_account_id = billing_account_id_for_project(&state, &project)?;
-    let projection = billing_projection(&state, &project).await?;
+    let scope = state.store.workspace_scope(&workspace)?;
+    let billing_account_id = scope.account.billing_account_id.clone();
+    let projection = billing_projection(&state, &workspace).await?;
     let mut hasher = Sha256::new();
     for value in [&billing_account_id, &idempotency_key] {
         hasher.update((value.len() as u64).to_be_bytes());
@@ -2064,7 +2052,7 @@ async fn create_billing_checkout(
         .create_checkout_intent(&CheckoutIntent {
             intent_id,
             billing_account_id,
-            project_id: project,
+            account_id: scope.account.id,
             amount_cents: request.amount_cents,
             currency: "USD".to_string(),
             created_at_unix_ms: unix_millis()?,
@@ -2410,69 +2398,33 @@ fn usage_time_buckets(
         .collect()
 }
 
-async fn project_usage_view(
+async fn workspace_usage_view(
     state: &AppState,
-    project: &str,
+    workspace: &str,
     attributed_cat_id: Option<String>,
     interval_start_unix_ms: i64,
     interval_end_unix_ms: i64,
 ) -> ApiResult<(String, UsageView)> {
-    let ledgers = state.store.billing_ledgers_for_project(project)?;
-    let canonical_billing_account_id = ledgers
-        .first()
-        .map(|ledger| ledger.billing_account_id.clone())
-        .ok_or_else(|| ApiError::internal("account has no canonical billing ledger"))?;
-    let mut totals = HashMap::<UsageMetric, u128>::new();
-    let mut cats = HashMap::<String, HashMap<UsageMetric, u128>>::new();
-    let mut details = Vec::new();
-    let mut latest_interval_end_unix_ms = None;
-    for ledger in ledgers {
-        let view = state
-            .usage
-            .query(&MeterUsageQuery {
-                billing_account_id: ledger.billing_account_id,
-                project_id: Some(project.to_string()),
-                attributed_cat_id: attributed_cat_id.clone(),
-                interval_start_unix_ms,
-                interval_end_unix_ms,
-            })
-            .await
-            .map_err(metering_failure)?;
-        latest_interval_end_unix_ms =
-            latest_interval_end_unix_ms.max(view.latest_interval_end_unix_ms);
-        for aggregate in view.totals {
-            let quantity = totals.entry(aggregate.metric).or_default();
-            *quantity = quantity
-                .checked_add(aggregate.quantity)
-                .ok_or_else(|| ApiError::internal("usage total overflow"))?;
-        }
-        for cat in view.cats {
-            let cat_totals = cats.entry(cat.cat_id).or_default();
-            for aggregate in cat.items {
-                let quantity = cat_totals.entry(aggregate.metric).or_default();
-                *quantity = quantity
-                    .checked_add(aggregate.quantity)
-                    .ok_or_else(|| ApiError::internal("Cat usage total overflow"))?;
-            }
-        }
-        details.extend(view.details);
-    }
-    let mut totals = totals
-        .into_iter()
-        .map(|(metric, quantity)| UsageAggregate { metric, quantity })
-        .collect::<Vec<_>>();
-    totals.sort_by_key(|aggregate| aggregate.metric.slug());
-    let mut cats = cats
-        .into_iter()
-        .map(|(cat_id, items)| {
-            let mut items = items
-                .into_iter()
-                .map(|(metric, quantity)| UsageAggregate { metric, quantity })
-                .collect::<Vec<_>>();
-            items.sort_by_key(|aggregate| aggregate.metric.slug());
-            CatAggregate { cat_id, items }
+    let ledger = state.store.billing_ledger_for_workspace(workspace)?;
+    let view = state
+        .usage
+        .query(&MeterUsageQuery {
+            billing_account_id: ledger.billing_account_id.clone(),
+            workspace_id: Some(workspace.to_string()),
+            attributed_cat_id,
+            interval_start_unix_ms,
+            interval_end_unix_ms,
         })
-        .collect::<Vec<_>>();
+        .await
+        .map_err(metering_failure)?;
+    let latest_interval_end_unix_ms = view.latest_interval_end_unix_ms;
+    let mut totals = view.totals;
+    let mut cats = view.cats;
+    let mut details = view.details;
+    totals.sort_by_key(|aggregate| aggregate.metric.slug());
+    for cat in &mut cats {
+        cat.items.sort_by_key(|aggregate| aggregate.metric.slug());
+    }
     cats.sort_by(|left, right| left.cat_id.cmp(&right.cat_id));
     details.sort_by(|left, right| {
         (
@@ -2489,7 +2441,7 @@ async fn project_usage_view(
             ))
     });
     Ok((
-        canonical_billing_account_id,
+        ledger.billing_account_id,
         UsageView {
             totals,
             cats,
@@ -2499,13 +2451,13 @@ async fn project_usage_view(
     ))
 }
 
-async fn project_usage(
+async fn workspace_usage(
     State(state): State<AppState>,
-    Path(project): Path<String>,
+    Path(workspace): Path<String>,
     Query(query): Query<ProjectUsageQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    check_project_auth(&state, &headers, &project).await?;
+    check_workspace_auth(&state, &headers, &workspace).await?;
     if query.cat.is_some() && query.cat_id.is_some() {
         return Err(ApiError::invalid("cat and cat_id are mutually exclusive").into());
     }
@@ -2519,11 +2471,11 @@ async fn project_usage(
         query
             .cat
             .as_deref()
-            .map(|cat| state.store.get_cat(&project, cat).map(|cat| cat.id))
+            .map(|cat| state.store.get_cat(&workspace, cat).map(|cat| cat.id))
             .transpose()?
     };
     let (billing_account_id, view) =
-        project_usage_view(&state, &project, cat_id, query.from_ms, query.to_ms).await?;
+        workspace_usage_view(&state, &workspace, cat_id, query.from_ms, query.to_ms).await?;
     let rate_card = RateCard::sprites_compute_v1();
 
     let mut amount_nanos = 0_u128;
@@ -2608,7 +2560,7 @@ async fn project_usage(
     };
     let report = UsageReport {
         billing_account_id,
-        project_id: project,
+        workspace_id: workspace,
         interval_start_unix_ms: query.from_ms,
         interval_end_unix_ms: query.to_ms,
         status: "provisional".to_string(),
@@ -2701,6 +2653,19 @@ async fn admin_list_nodes(
     check_admin_auth(&state, &headers).await?;
     Ok(Json(ListResponse {
         items: state.store.list_node_summaries()?,
+    }))
+}
+
+/// Resource routes key on the immutable workspace ID, so a machine token — which
+/// has no WorkOS identity to enumerate its own workspaces from — needs a way to
+/// turn an `account/workspace` locator into that ID.
+async fn admin_list_workspaces(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ListResponse<cats_api::auth::Workspace>>> {
+    check_admin_auth(&state, &headers).await?;
+    Ok(Json(ListResponse {
+        items: state.store.list_all_workspace_views()?,
     }))
 }
 
@@ -3110,7 +3075,7 @@ async fn get_operation(
     // cannot use status differences to enumerate operations.
     check_authenticated(&state, &headers).await?;
     let operation = state.store.get_operation(&id)?;
-    let scope = check_project_auth(&state, &headers, &operation.project).await?;
+    let scope = check_workspace_auth(&state, &headers, &operation.workspace_id).await?;
     if scope.workspace.id != operation.workspace_id {
         return Err(ApiError::internal("operation workspace ownership is inconsistent").into());
     }
@@ -3119,11 +3084,11 @@ async fn get_operation(
 
 async fn list_operations(
     State(state): State<AppState>,
-    Path(project): Path<String>,
+    Path(workspace): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<Operation>>> {
-    check_project_auth(&state, &headers, &project).await?;
+    check_workspace_auth(&state, &headers, &workspace).await?;
     Ok(Json(ListResponse {
-        items: state.store.list_operations(&project)?,
+        items: state.store.list_operations(&workspace)?,
     }))
 }

@@ -16,7 +16,7 @@ cats --help</code></pre>
 <p>Working inside the repository, you can also replace <code>cats</code> in every example with <code>cargo run -p cats-cli --bin cats --</code>.</p>
 
 <h2 id="configure-access">Configure access</h2>
-<p>Users sign in with WorkOS. The CLI uses Device Authorization, opens the verification page in a browser, and stores its short-lived access token and rotating refresh credential only in the operating-system credential store. Cats no longer accepts static project tokens for normal users.</p>
+<p>Users sign in with WorkOS. The CLI uses Device Authorization, opens the verification page in a browser, and stores its short-lived access token and rotating refresh credential only in the operating-system credential store. Cats no longer accepts static user tokens for normal users.</p>
 <pre><code>export CATS_API_URL='https://cats.run'
 cats login
 cats whoami

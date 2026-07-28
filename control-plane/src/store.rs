@@ -1,7 +1,7 @@
 //! Control-plane persistence (SQLite dev implementation of the §17.3 tables).
 //!
 //! Every user-facing invariant that must hold under concurrency is enforced
-//! here with constraints, not in handler code: unique names per project,
+//! here with constraints, not in handler code: unique names per workspace,
 //! one mount binding per disk (RWO), at most one live attachment per disk,
 //! monotonic generations.
 
@@ -96,7 +96,6 @@ pub struct WorkspaceRecord {
     pub account_id: String,
     pub slug: String,
     pub display_name: String,
-    pub legacy_project: String,
     pub is_default: bool,
 }
 
@@ -131,152 +130,6 @@ fn is_constraint(e: &rusqlite::Error) -> bool {
     )
 }
 
-fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
-    let mut stmt = conn
-        .prepare(&format!("PRAGMA table_info({table})"))
-        .map_err(internal)?;
-    let names = stmt
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(internal)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(internal)?;
-    if !names.iter().any(|name| name == column) {
-        conn.execute(
-            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
-            [],
-        )
-        .map_err(internal)?;
-    }
-    Ok(())
-}
-
-fn backfill_public_endpoints(conn: &mut Connection) -> Result<()> {
-    let tx = conn.transaction().map_err(internal)?;
-    let cats = {
-        let mut stmt = tx.prepare("SELECT * FROM cats").map_err(internal)?;
-        let rows = stmt
-            .query_map([], row_to_cat)
-            .map_err(internal)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(internal)?;
-        rows
-    };
-    let cats_by_id = cats
-        .iter()
-        .map(|cat| (cat.id.as_str(), cat))
-        .collect::<HashMap<_, _>>();
-    let existing = {
-        let mut stmt = tx
-            .prepare("SELECT id, cat_id, name, hostname FROM endpoints")
-            .map_err(internal)?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })
-            .map_err(internal)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(internal)?;
-        rows
-    };
-
-    // Databases created by the local-only prototype used `.cats.local`.
-    // Move every endpoint to the public one-label namespace atomically while
-    // preserving route state and epoch.
-    for (endpoint_id, cat_id, name, old_hostname) in existing {
-        let Some(cat) = cats_by_id.get(cat_id.as_str()) else {
-            continue;
-        };
-        let hostname = public_endpoint_hostname(cat, &name);
-        if hostname == old_hostname {
-            continue;
-        }
-        tx.execute(
-            "UPDATE routes SET hostname=?2 WHERE hostname=?1",
-            params![old_hostname, hostname],
-        )
-        .map_err(internal)?;
-        tx.execute(
-            "UPDATE endpoints SET hostname=?2 WHERE id=?1",
-            params![endpoint_id, hostname],
-        )
-        .map_err(internal)?;
-    }
-
-    // Every Cat owns a default wake-on-request endpoint. Existing Cats get
-    // the same contract during control-plane startup.
-    for cat in cats {
-        let has_default: bool = tx
-            .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM endpoints WHERE cat_id=?1 AND name=?2
-                 )",
-                params![cat.id, DEFAULT_ENDPOINT_NAME],
-                |row| row.get(0),
-            )
-            .map_err(internal)?;
-        if has_default {
-            continue;
-        }
-        let endpoint_id = new_id(ids::ENDPOINT_PREFIX);
-        let hostname = public_endpoint_hostname(&cat, DEFAULT_ENDPOINT_NAME);
-        tx.execute(
-            "INSERT INTO endpoints
-                (id, cat_id, name, hostname, target_port, protocol, wake_policy)
-             VALUES (?1,?2,?3,?4,?5,'http','wake_on_request')",
-            params![
-                endpoint_id,
-                cat.id,
-                DEFAULT_ENDPOINT_NAME,
-                hostname,
-                DEFAULT_ENDPOINT_PORT
-            ],
-        )
-        .map_err(internal)?;
-
-        let gateway_url = match (
-            cat.observed_state == ObservedState::Running,
-            cat.node_id.as_deref(),
-        ) {
-            (true, Some(node_id)) => tx
-                .query_row(
-                    "SELECT gateway_url FROM nodes WHERE id=?1",
-                    params![node_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(internal)?,
-            _ => None,
-        };
-        let (node_id, epoch, state) = match (cat.node_id.as_deref(), gateway_url.as_deref()) {
-            (Some(node_id), Some(_)) if cat.observed_state == ObservedState::Running => {
-                (Some(node_id), 1, "active")
-            }
-            _ => (None, 0, "unbound"),
-        };
-        tx.execute(
-            "INSERT INTO routes
-                (hostname, cat_id, node_id, gateway_url, target_port, epoch, state)
-             VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![
-                hostname,
-                cat.id,
-                node_id,
-                gateway_url,
-                DEFAULT_ENDPOINT_PORT,
-                epoch,
-                state
-            ],
-        )
-        .map_err(internal)?;
-    }
-    tx.commit().map_err(internal)
-}
-
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).map_err(internal)?;
@@ -288,67 +141,30 @@ impl Store {
             .map_err(internal)?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(internal)?;
+        let stamped: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(internal)?;
+        // Key the gate on a control-plane table, not on "any table": the
+        // credential-free dev shape points the usage store at this same SQLite
+        // file, and its tables must not read as a stale control-plane schema.
+        let control_plane_schema_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type='table' AND name='cats'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        if control_plane_schema_exists > 0 && stamped != SCHEMA_VERSION {
+            return Err(ApiError::failed_precondition(format!(
+                "control-plane database {} is at schema version {stamped}, this build \
+                 requires {SCHEMA_VERSION}; recreate it",
+                path.display()
+            )));
+        }
         conn.execute_batch(SCHEMA).map_err(internal)?;
-        ensure_column(&conn, "operations", "project", "TEXT NOT NULL DEFAULT ''")?;
-        ensure_column(
-            &conn,
-            "cats",
-            "workspace_id",
-            "TEXT REFERENCES workspaces(id)",
-        )?;
-        ensure_column(
-            &conn,
-            "disks",
-            "workspace_id",
-            "TEXT REFERENCES workspaces(id)",
-        )?;
-        ensure_column(
-            &conn,
-            "operations",
-            "workspace_id",
-            "TEXT REFERENCES workspaces(id)",
-        )?;
-        ensure_column(&conn, "nodes", "telemetry_json", "TEXT")?;
-        ensure_column(
-            &conn,
-            "nodes",
-            "scheduling_disabled",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
-        ensure_column(&conn, "cats", "auto_suspend", "INTEGER NOT NULL DEFAULT 1")?;
-        ensure_column(&conn, "cats", "work_version", "INTEGER NOT NULL DEFAULT 0")?;
-        ensure_column(
-            &conn,
-            "cats",
-            "observed_state_since_ms",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
-        // Backfill ownership for databases created before operations carried
-        // their project explicitly. Deleted resources cannot be recovered and
-        // remain admin-only (empty project).
-        conn.execute_batch(
-            "UPDATE operations
-                SET project = COALESCE(
-                    (SELECT project FROM cats WHERE cats.id = operations.resource_id),
-                    (SELECT project FROM disks WHERE disks.id = operations.resource_id),
-                    project)
-              WHERE project = '';
-             UPDATE nodes
-                SET scheduling_disabled = 1
-              WHERE state IN ('cordoned', 'draining');",
-        )
-        .map_err(internal)?;
-        // Databases upgraded from a release without a persisted state clock
-        // start their automatic tier timers at migration time. Using the Cat
-        // creation time here could immediately demote an old but recently
-        // suspended Cat.
-        conn.execute(
-            "UPDATE cats
-                SET observed_state_since_ms=?1
-              WHERE observed_state_since_ms=0",
-            params![now_ms()],
-        )
-        .map_err(internal)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(internal)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -369,123 +185,23 @@ impl Store {
     // Accounts and workspaces
     // ------------------------------------------------------------------
 
-    /// Backfill the V1 project namespace into immutable Account/Workspace
-    /// identities. Re-running this migration is safe.
-    pub fn reconcile_legacy_projects(
+    /// Idempotently seed the Accounts a deployment is configured to own up
+    /// front. Personal Accounts come from AuthKit onboarding instead; this is
+    /// the path for self-hosted and development deployments whose Accounts map
+    /// to a WorkOS Organization by static configuration.
+    pub fn ensure_configured_accounts(
         &self,
-        project_organizations: &BTreeMap<String, String>,
+        account_organizations: &BTreeMap<String, String>,
     ) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(internal)?;
-        let projects = {
-            let mut stmt = tx
-                .prepare(
-                    "SELECT project FROM cats
-                     UNION SELECT project FROM disks
-                     UNION SELECT project FROM operations
-                     ORDER BY project",
-                )
-                .map_err(internal)?;
-            let rows = stmt
-                .query_map([], |row| row.get::<_, String>(0))
-                .map_err(internal)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(internal)?;
-            rows
-        };
-        let mut all_projects = projects;
-        all_projects.extend(project_organizations.keys().cloned());
-        all_projects.sort();
-        all_projects.dedup();
-        for project in all_projects
-            .into_iter()
-            .filter(|project| !project.is_empty())
-        {
-            let organization_id = project_organizations
-                .get(&project)
-                .cloned()
-                .unwrap_or_else(|| format!("legacy-unmapped:{project}"));
-            ensure_legacy_workspace(&tx, &project, &organization_id)?;
-        }
-        for table in ["cats", "disks", "operations"] {
-            tx.execute(
-                &format!(
-                    "UPDATE {table}
-                        SET workspace_id=(
-                            SELECT id FROM workspaces
-                             WHERE legacy_project={table}.project
-                        )
-                      WHERE workspace_id IS NULL OR workspace_id=''"
-                ),
-                [],
-            )
-            .map_err(internal)?;
-            let missing: i64 = tx
-                .query_row(
-                    &format!(
-                        "SELECT COUNT(*) FROM {table}
-                          WHERE workspace_id IS NULL OR workspace_id=''"
-                    ),
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(internal)?;
-            if missing != 0 {
-                return Err(ApiError::failed_precondition(format!(
-                    "{missing} historical {table} rows have no recoverable workspace owner"
-                )));
+        for (account_slug, organization_id) in account_organizations {
+            if account_slug.is_empty() || organization_id.is_empty() {
+                continue;
             }
+            ensure_configured_account(&tx, account_slug, organization_id)?;
         }
-        tx.execute_batch(
-            "CREATE TRIGGER IF NOT EXISTS cats_require_workspace
-                BEFORE INSERT ON cats
-                WHEN NEW.workspace_id IS NULL OR NEW.workspace_id=''
-                BEGIN SELECT RAISE(ABORT, 'cats.workspace_id is required'); END;
-             CREATE TRIGGER IF NOT EXISTS disks_require_workspace
-                BEFORE INSERT ON disks
-                WHEN NEW.workspace_id IS NULL OR NEW.workspace_id=''
-                BEGIN SELECT RAISE(ABORT, 'disks.workspace_id is required'); END;
-             CREATE TRIGGER IF NOT EXISTS operations_require_workspace
-                BEFORE INSERT ON operations
-                WHEN NEW.workspace_id IS NULL OR NEW.workspace_id=''
-                BEGIN SELECT RAISE(ABORT, 'operations.workspace_id is required'); END;
-             CREATE TRIGGER IF NOT EXISTS cats_workspace_matches_project
-                BEFORE INSERT ON cats
-                WHEN NOT EXISTS(
-                    SELECT 1 FROM workspaces
-                     WHERE id=NEW.workspace_id AND legacy_project=NEW.project
-                )
-                BEGIN SELECT RAISE(ABORT, 'cats workspace/project mismatch'); END;
-             CREATE TRIGGER IF NOT EXISTS disks_workspace_matches_project
-                BEFORE INSERT ON disks
-                WHEN NOT EXISTS(
-                    SELECT 1 FROM workspaces
-                     WHERE id=NEW.workspace_id AND legacy_project=NEW.project
-                )
-                BEGIN SELECT RAISE(ABORT, 'disks workspace/project mismatch'); END;
-             CREATE TRIGGER IF NOT EXISTS operations_workspace_matches_project
-                BEFORE INSERT ON operations
-                WHEN NOT EXISTS(
-                    SELECT 1 FROM workspaces
-                     WHERE id=NEW.workspace_id AND legacy_project=NEW.project
-                )
-                BEGIN SELECT RAISE(ABORT, 'operations workspace/project mismatch'); END;
-             CREATE TRIGGER IF NOT EXISTS cats_workspace_owner_is_immutable
-                BEFORE UPDATE OF workspace_id, project ON cats
-                WHEN NEW.workspace_id != OLD.workspace_id OR NEW.project != OLD.project
-                BEGIN SELECT RAISE(ABORT, 'cats workspace owner is immutable'); END;
-             CREATE TRIGGER IF NOT EXISTS disks_workspace_owner_is_immutable
-                BEFORE UPDATE OF workspace_id, project ON disks
-                WHEN NEW.workspace_id != OLD.workspace_id OR NEW.project != OLD.project
-                BEGIN SELECT RAISE(ABORT, 'disks workspace owner is immutable'); END;
-             CREATE TRIGGER IF NOT EXISTS operations_workspace_owner_is_immutable
-                BEFORE UPDATE OF workspace_id, project ON operations
-                WHEN NEW.workspace_id != OLD.workspace_id OR NEW.project != OLD.project
-                BEGIN SELECT RAISE(ABORT, 'operations workspace owner is immutable'); END;",
-        )
-        .map_err(internal)?;
-        tx.commit().map_err(internal)?;
-        backfill_public_endpoints(&mut conn)
+        tx.commit().map_err(internal)
     }
 
     /// Idempotently create the local half of a Personal Account provision.
@@ -535,7 +251,6 @@ impl Store {
             48,
         );
         let account_slug = unique_account_slug(&tx, &requested_slug)?;
-        let legacy_project = unique_legacy_project(&tx, &format!("personal-{workos_user_id}"))?;
         let billing_account_id = format!("billing_account/account/{account_id}");
         let created_at = now_unix();
         tx.execute(
@@ -556,10 +271,9 @@ impl Store {
         .map_err(internal)?;
         tx.execute(
             "INSERT INTO workspaces (
-                id, account_id, slug, display_name, legacy_project,
-                is_default, created_at
-             ) VALUES (?1,?2,'default','Default',?3,1,?4)",
-            params![workspace_id, account_id, legacy_project, created_at],
+                id, account_id, slug, display_name, is_default, created_at
+             ) VALUES (?1,?2,'default','Default',1,?3)",
+            params![workspace_id, account_id, created_at],
         )
         .map_err(internal)?;
         tx.execute(
@@ -683,7 +397,7 @@ impl Store {
     pub fn workspaces_for_account(&self, account_id: &str) -> Result<Vec<WorkspaceRecord>> {
         self.with(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, account_id, slug, display_name, legacy_project, is_default
+                "SELECT id, account_id, slug, display_name, is_default
                    FROM workspaces WHERE account_id=?1
                   ORDER BY is_default DESC, slug",
             )?;
@@ -726,18 +440,15 @@ impl Store {
             return Err(ApiError::failed_precondition("account is not active"));
         }
         let workspace_id = new_id(ids::WORKSPACE_PREFIX);
-        let legacy_project = unique_legacy_project(&tx, &format!("{}-{slug}", account.slug))?;
         tx.execute(
             "INSERT INTO workspaces (
-                id, account_id, slug, display_name, legacy_project,
-                is_default, created_at
-             ) VALUES (?1,?2,?3,?4,?5,0,?6)",
+                id, account_id, slug, display_name, is_default, created_at
+             ) VALUES (?1,?2,?3,?4,0,?5)",
             params![
                 workspace_id,
                 account.id,
                 slug,
                 display_name.trim(),
-                legacy_project,
                 now_unix()
             ],
         )
@@ -750,7 +461,7 @@ impl Store {
         })?;
         let workspace = tx
             .query_row(
-                "SELECT id, account_id, slug, display_name, legacy_project, is_default
+                "SELECT id, account_id, slug, display_name, is_default
                    FROM workspaces WHERE id=?1",
                 params![workspace_id],
                 row_to_workspace,
@@ -799,7 +510,7 @@ impl Store {
             return Err(ApiError::new(ErrorCode::NotFound, "workspace not found"));
         }
         conn.query_row(
-            "SELECT id, account_id, slug, display_name, legacy_project, is_default
+            "SELECT id, account_id, slug, display_name, is_default
                FROM workspaces WHERE id=?1",
             params![workspace_id],
             row_to_workspace,
@@ -807,31 +518,18 @@ impl Store {
         .map_err(internal)
     }
 
-    pub fn workspace_for_project(&self, project: &str) -> Result<Option<WorkspaceRecord>> {
-        self.with(|conn| {
-            conn.query_row(
-                "SELECT id, account_id, slug, display_name, legacy_project, is_default
-                   FROM workspaces WHERE legacy_project=?1",
-                params![project],
-                row_to_workspace,
-            )
-            .optional()
-        })
-    }
-
-    pub fn workspace_scope_for_project(&self, project: &str) -> Result<WorkspaceScope> {
+    pub fn workspace_scope(&self, workspace_id: &str) -> Result<WorkspaceScope> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT
                 a.id, a.slug, a.display_name, a.kind,
                 a.workos_organization_id, a.billing_account_id,
                 a.personal_owner_user_id, a.status,
-                w.id, w.account_id, w.slug, w.display_name,
-                w.legacy_project, w.is_default
+                w.id, w.account_id, w.slug, w.display_name, w.is_default
                FROM workspaces w
                JOIN accounts a ON a.id=w.account_id
-              WHERE w.legacy_project=?1",
-            params![project],
+              WHERE w.id=?1",
+            params![workspace_id],
             |row| {
                 Ok(WorkspaceScope {
                     account: row_to_account(row)?,
@@ -840,15 +538,14 @@ impl Store {
                         account_id: row.get(9)?,
                         slug: row.get(10)?,
                         display_name: row.get(11)?,
-                        legacy_project: row.get(12)?,
-                        is_default: row.get::<_, i64>(13)? != 0,
+                        is_default: row.get::<_, i64>(12)? != 0,
                     },
                 })
             },
         )
         .map_err(|error| match error {
             rusqlite::Error::QueryReturnedNoRows => {
-                ApiError::new(ErrorCode::NotFound, format!("workspace route {project}"))
+                ApiError::new(ErrorCode::NotFound, format!("workspace {workspace_id}"))
             }
             other => internal(other),
         })
@@ -857,7 +554,7 @@ impl Store {
     pub fn workspace_by_id(&self, workspace_id: &str) -> Result<WorkspaceRecord> {
         let conn = self.conn.lock().unwrap();
         match conn.query_row(
-            "SELECT id, account_id, slug, display_name, legacy_project, is_default
+            "SELECT id, account_id, slug, display_name, is_default
                    FROM workspaces WHERE id=?1",
             params![workspace_id],
             row_to_workspace,
@@ -870,9 +567,9 @@ impl Store {
         }
     }
 
-    pub fn project_belongs_to_organization(
+    pub fn workspace_belongs_to_organization(
         &self,
-        project: &str,
+        workspace_id: &str,
         organization_id: &str,
     ) -> Result<bool> {
         self.with(|conn| {
@@ -881,63 +578,57 @@ impl Store {
                     SELECT 1
                       FROM workspaces w
                       JOIN accounts a ON a.id=w.account_id
-                     WHERE w.legacy_project=?1
+                     WHERE w.id=?1
                        AND a.workos_organization_id=?2
                        AND a.status='active'
                  )",
-                params![project, organization_id],
+                params![workspace_id, organization_id],
                 |row| row.get(0),
             )
         })
     }
 
-    pub fn billing_account_id_for_project(&self, project: &str) -> Result<String> {
-        Ok(self
-            .workspace_scope_for_project(project)?
-            .account
-            .billing_account_id)
+    pub fn billing_account_id_for_workspace(&self, workspace_id: &str) -> Result<String> {
+        Ok(self.workspace_scope(workspace_id)?.account.billing_account_id)
     }
 
-    /// Return every ledger that contributes to an Account balance. The first
-    /// row is the canonical Account ledger used by all new writes; remaining
-    /// rows are immutable V1 bindings retained only to aggregate history.
-    pub fn billing_ledgers_for_project(&self, project: &str) -> Result<Vec<BillingLedgerRecord>> {
-        let scope = self.workspace_scope_for_project(project)?;
-        let mut historical = self.with(|conn| {
+    /// The single ledger that owns a Workspace's balance. Every Workspace in an
+    /// Account shares that Account's Billing Account, so a Workspace is never
+    /// itself a billing owner.
+    pub fn billing_ledger_for_workspace(&self, workspace_id: &str) -> Result<BillingLedgerRecord> {
+        let scope = self.workspace_scope(workspace_id)?;
+        Ok(BillingLedgerRecord {
+            billing_account_id: scope.account.billing_account_id,
+            owner_id: scope.account.id,
+            signup_credit_nanos: if scope.account.kind == AccountKind::Personal {
+                10_000_000_000
+            } else {
+                0
+            },
+        })
+    }
+
+    /// Every Workspace in the deployment, for the admin console and for machine
+    /// tokens resolving an `account/workspace` locator to its immutable ID.
+    pub fn list_all_workspace_views(&self) -> Result<Vec<Workspace>> {
+        let accounts = self.with(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT billing_account_id, legacy_project
-                   FROM legacy_billing_bindings
-                  WHERE account_id=?1
-                  ORDER BY legacy_project",
+                "SELECT id, slug, display_name, kind, workos_organization_id,
+                        billing_account_id, personal_owner_user_id, status
+                   FROM accounts ORDER BY slug",
             )?;
-            let rows = stmt.query_map(params![scope.account.id], |row| {
-                Ok(BillingLedgerRecord {
-                    billing_account_id: row.get(0)?,
-                    owner_id: row.get(1)?,
-                    signup_credit_nanos: 10_000_000_000,
-                })
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
+            let rows = stmt
+                .query_map([], row_to_account)?
+                .collect::<rusqlite::Result<Vec<_>>>();
+            rows
         })?;
-        // An early account-migration shape reused one V1 project ledger as
-        // the Account's canonical ledger. Preserve that immutable ledger's
-        // original owner and do not aggregate it twice.
-        let canonical = historical
-            .iter()
-            .position(|ledger| ledger.billing_account_id == scope.account.billing_account_id)
-            .map(|index| historical.remove(index))
-            .unwrap_or_else(|| BillingLedgerRecord {
-                billing_account_id: scope.account.billing_account_id.clone(),
-                owner_id: scope.account.id.clone(),
-                signup_credit_nanos: if scope.account.kind == AccountKind::Personal {
-                    10_000_000_000
-                } else {
-                    0
-                },
-            });
-        let mut ledgers = vec![canonical];
-        ledgers.append(&mut historical);
-        Ok(ledgers)
+        let mut views = Vec::new();
+        for account in accounts {
+            for workspace in self.workspaces_for_account(&account.id)? {
+                views.push(workspace_view(&account, workspace, None));
+            }
+        }
+        Ok(views)
     }
 
     pub fn account_and_workspace_views(
@@ -1049,7 +740,6 @@ impl Store {
         auto_suspend: bool,
         extra_disk: Option<(&str, u64, &str)>, // (name, size, mount_path)
     ) -> Result<(Cat, Vec<Disk>, Operation)> {
-        let project = &workspace.legacy_project;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(internal)?;
         let now = now_unix();
@@ -1067,20 +757,10 @@ impl Store {
          -> rusqlite::Result<()> {
             tx.execute(
                 "INSERT INTO disks (
-                    id, workspace_id, project, name, kind, size_bytes,
+                    id, workspace_id, name, kind, size_bytes,
                     state, volume_id, created_at
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                params![
-                    id,
-                    workspace.id,
-                    project,
-                    dname,
-                    kind,
-                    size as i64,
-                    state,
-                    vol,
-                    now
-                ],
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![id, workspace.id, dname, kind, size as i64, state, vol, now],
             )?;
             Ok(())
         };
@@ -1088,17 +768,16 @@ impl Store {
         let result: rusqlite::Result<()> = (|| {
             tx.execute(
                 "INSERT INTO cats (
-                    id, workspace_id, project, name, image, cpus, memory_mib,
+                    id, workspace_id, name, image, cpus, memory_mib,
                     root_disk_id, desired_state, observed_state, generation,
                     auto_suspend, created_at, observed_state_since_ms
                  ) VALUES (
-                    ?1,?2,?3,?4,?5,?6,?7,?8,
-                    'running','creating',1,?9,?10,?11
+                    ?1,?2,?3,?4,?5,?6,?7,
+                    'running','creating',1,?8,?9,?10
                  )",
                 params![
                     cat_id,
                     workspace.id,
-                    project,
                     name,
                     image,
                     cpus,
@@ -1114,7 +793,6 @@ impl Store {
                 &Cat {
                     id: cat_id.clone(),
                     workspace_id: workspace.id.clone(),
-                    project: project.to_string(),
                     name: name.to_string(),
                     image: image.to_string(),
                     spec: CatSpec { cpus, memory_mib },
@@ -1191,7 +869,7 @@ impl Store {
             }
         })?;
 
-        let op = Self::insert_operation(&tx, &workspace.id, project, "cat.create", &cat_id, 1)?;
+        let op = Self::insert_operation(&tx, &workspace.id, "cat.create", &cat_id, 1)?;
         tx.commit().map_err(internal)?;
         drop(conn);
 
@@ -1203,7 +881,6 @@ impl Store {
     fn insert_operation(
         tx: &rusqlite::Transaction<'_>,
         workspace_id: &str,
-        project: &str,
         kind: &str,
         resource_id: &str,
         generation: i64,
@@ -1212,24 +889,15 @@ impl Store {
         let id = new_id(ids::OPERATION_PREFIX);
         tx.execute(
             "INSERT INTO operations (
-                id, workspace_id, project, kind, resource_id,
+                id, workspace_id, kind, resource_id,
                 resource_generation, phase, created_at, updated_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,'pending',?7,?7)",
-            params![
-                id,
-                workspace_id,
-                project,
-                kind,
-                resource_id,
-                generation,
-                now
-            ],
+             ) VALUES (?1,?2,?3,?4,?5,'pending',?6,?6)",
+            params![id, workspace_id, kind, resource_id, generation, now],
         )
         .map_err(internal)?;
         Ok(Operation {
             id,
             workspace_id: workspace_id.to_string(),
-            project: project.to_string(),
             kind: kind.to_string(),
             resource_id: resource_id.to_string(),
             resource_generation: generation,
@@ -1258,11 +926,11 @@ impl Store {
         Ok(())
     }
 
-    pub fn get_cat(&self, project: &str, name_or_id: &str) -> Result<Cat> {
+    pub fn get_cat(&self, workspace_id: &str, name_or_id: &str) -> Result<Cat> {
         self.with(|c| {
             c.query_row(
-                "SELECT * FROM cats WHERE project=?1 AND (name=?2 OR id=?2)",
-                params![project, name_or_id],
+                "SELECT * FROM cats WHERE workspace_id=?1 AND (name=?2 OR id=?2)",
+                params![workspace_id, name_or_id],
                 row_to_cat,
             )
             .optional()
@@ -1278,10 +946,11 @@ impl Store {
         .ok_or_else(|| ApiError::not_found(format!("cat {id}")))
     }
 
-    pub fn list_cats(&self, project: &str) -> Result<Vec<Cat>> {
+    pub fn list_cats(&self, workspace_id: &str) -> Result<Vec<Cat>> {
         self.with(|c| {
-            let mut stmt = c.prepare("SELECT * FROM cats WHERE project=?1 ORDER BY created_at")?;
-            let rows = stmt.query_map(params![project], row_to_cat)?;
+            let mut stmt =
+                c.prepare("SELECT * FROM cats WHERE workspace_id=?1 ORDER BY created_at")?;
+            let rows = stmt.query_map(params![workspace_id], row_to_cat)?;
             rows.collect()
         })
     }
@@ -1304,15 +973,15 @@ impl Store {
     ) -> Result<Operation> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(internal)?;
-        let current: Option<(i64, String, String)> = tx
+        let current: Option<(i64, String)> = tx
             .query_row(
-                "SELECT generation, workspace_id, project FROM cats WHERE id=?1",
+                "SELECT generation, workspace_id FROM cats WHERE id=?1",
                 params![cat_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
             .map_err(internal)?;
-        let (current, workspace_id, project) =
+        let (current, workspace_id) =
             current.ok_or_else(|| ApiError::not_found(format!("cat {cat_id}")))?;
         if let Some(expected) = expected_generation {
             if expected != current {
@@ -1330,7 +999,7 @@ impl Store {
             params![cat_id, desired_str(desired), new_gen],
         )
         .map_err(internal)?;
-        let op = Self::insert_operation(&tx, &workspace_id, &project, op_kind, cat_id, new_gen)?;
+        let op = Self::insert_operation(&tx, &workspace_id, op_kind, cat_id, new_gen)?;
         tx.commit().map_err(internal)?;
         Ok(op)
     }
@@ -1341,15 +1010,15 @@ impl Store {
     pub fn ensure_desired_running(&self, cat_id: &str) -> Result<Option<Operation>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(internal)?;
-        let current: Option<(i64, String, String, String)> = tx
+        let current: Option<(i64, String, String)> = tx
             .query_row(
-                "SELECT generation, workspace_id, project, desired_state FROM cats WHERE id=?1",
+                "SELECT generation, workspace_id, desired_state FROM cats WHERE id=?1",
                 params![cat_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(internal)?;
-        let (generation, workspace_id, project, desired) =
+        let (generation, workspace_id, desired) =
             current.ok_or_else(|| ApiError::not_found(format!("cat {cat_id}")))?;
         if desired == "running" {
             return Ok(None);
@@ -1361,8 +1030,7 @@ impl Store {
             params![cat_id, next],
         )
         .map_err(internal)?;
-        let operation =
-            Self::insert_operation(&tx, &workspace_id, &project, "cat.wake", cat_id, next)?;
+        let operation = Self::insert_operation(&tx, &workspace_id, "cat.wake", cat_id, next)?;
         tx.commit().map_err(internal)?;
         Ok(Some(operation))
     }
@@ -1529,15 +1197,15 @@ impl Store {
         }
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(internal)?;
-        let project_exists: Option<String> = tx
+        let cat_exists: Option<String> = tx
             .query_row(
-                "SELECT project FROM cats WHERE id=?1",
+                "SELECT workspace_id FROM cats WHERE id=?1",
                 params![cat_id],
                 |row| row.get(0),
             )
             .optional()
             .map_err(internal)?;
-        project_exists.ok_or_else(|| ApiError::not_found(format!("cat {cat_id}")))?;
+        cat_exists.ok_or_else(|| ApiError::not_found(format!("cat {cat_id}")))?;
         let existing: Option<String> = tx
             .query_row(
                 "SELECT id FROM cat_work_leases
@@ -1633,9 +1301,9 @@ impl Store {
             .map_err(|_| ApiError::invalid("guest lease sequence is too large"))?;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(internal)?;
-        let cat: Option<(String, String, i64, String, String, Option<String>)> = tx
+        let cat: Option<(String, i64, String, String, Option<String>)> = tx
             .query_row(
-                "SELECT workspace_id, project, generation, desired_state, observed_state, node_id
+                "SELECT workspace_id, generation, desired_state, observed_state, node_id
                  FROM cats WHERE id=?1",
                 params![request.cat_id],
                 |row| {
@@ -1645,13 +1313,12 @@ impl Store {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
-                        row.get(5)?,
                     ))
                 },
             )
             .optional()
             .map_err(internal)?;
-        let (workspace_id, project, generation, desired, observed, node_id) =
+        let (workspace_id, generation, desired, observed, node_id) =
             cat.ok_or_else(|| ApiError::not_found(format!("cat {}", request.cat_id)))?;
         if node_id.as_deref() != Some(request.node_id.as_str()) {
             return Err(ApiError::conflict(
@@ -1773,7 +1440,6 @@ impl Store {
             Self::insert_operation(
                 &tx,
                 &workspace_id,
-                &project,
                 "cat.work_wake",
                 &request.cat_id,
                 new_generation,
@@ -1891,9 +1557,9 @@ impl Store {
             )
             .map_err(internal)?;
         }
-        let cat: Option<(String, String, i64, i64, String, String)> = tx
+        let cat: Option<(String, i64, i64, String, String)> = tx
             .query_row(
-                "SELECT workspace_id, project, generation, auto_suspend,
+                "SELECT workspace_id, generation, auto_suspend,
                         desired_state, observed_state
                  FROM cats WHERE id=?1",
                 params![cat_id],
@@ -1904,13 +1570,12 @@ impl Store {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
-                        row.get(5)?,
                     ))
                 },
             )
             .optional()
             .map_err(internal)?;
-        let Some((workspace_id, project, generation, auto_suspend, desired, observed)) = cat else {
+        let Some((workspace_id, generation, auto_suspend, desired, observed)) = cat else {
             return Ok(None);
         };
         if auto_suspend == 0 || desired != "running" || observed != "running" {
@@ -1953,14 +1618,8 @@ impl Store {
         if changed == 0 {
             return Ok(None);
         }
-        let operation = Self::insert_operation(
-            &tx,
-            &workspace_id,
-            &project,
-            "cat.auto_suspend",
-            cat_id,
-            next,
-        )?;
+        let operation =
+            Self::insert_operation(&tx, &workspace_id, "cat.auto_suspend", cat_id, next)?;
         tx.commit().map_err(internal)?;
         Ok(Some(operation))
     }
@@ -2034,9 +1693,9 @@ impl Store {
             .map_err(internal)?;
         }
 
-        let cat: Option<(String, String, i64, i64, String, String, i64)> = tx
+        let cat: Option<(String, i64, i64, String, String, i64)> = tx
             .query_row(
-                "SELECT workspace_id, project, generation, auto_suspend,
+                "SELECT workspace_id, generation, auto_suspend,
                         desired_state, observed_state, observed_state_since_ms
                    FROM cats WHERE id=?1",
                 params![cat_id],
@@ -2048,15 +1707,12 @@ impl Store {
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
-                        row.get(6)?,
                     ))
                 },
             )
             .optional()
             .map_err(internal)?;
-        let Some((workspace_id, project, generation, auto_suspend, desired, observed, since_ms)) =
-            cat
-        else {
+        let Some((workspace_id, generation, auto_suspend, desired, observed, since_ms)) = cat else {
             return Ok(None);
         };
         if auto_suspend == 0 || desired != observed {
@@ -2117,7 +1773,6 @@ impl Store {
         let operation = Self::insert_operation(
             &tx,
             &workspace_id,
-            &project,
             operation_kind,
             cat_id,
             next_generation,
@@ -2205,18 +1860,10 @@ impl Store {
         self.with(|c| {
             c.execute(
                 "INSERT INTO disks (
-                    id, workspace_id, project, name, kind, size_bytes,
+                    id, workspace_id, name, kind, size_bytes,
                     state, volume_id, created_at
-                 ) VALUES (?1,?2,?3,?4,'persistent',?5,'available',?6,?7)",
-                params![
-                    id,
-                    workspace.id,
-                    workspace.legacy_project,
-                    name,
-                    size_bytes as i64,
-                    vol,
-                    now
-                ],
+                 ) VALUES (?1,?2,?3,'persistent',?4,'available',?5,?6)",
+                params![id, workspace.id, name, size_bytes as i64, vol, now],
             )
             .map(|_| ())
         })
@@ -2227,15 +1874,15 @@ impl Store {
                 e
             }
         })?;
-        self.get_disk(&workspace.legacy_project, &id)
+        self.get_disk(&workspace.id, &id)
     }
 
-    pub fn get_disk(&self, project: &str, name_or_id: &str) -> Result<Disk> {
+    pub fn get_disk(&self, workspace_id: &str, name_or_id: &str) -> Result<Disk> {
         let mut disk = self
             .with(|c| {
                 c.query_row(
-                    "SELECT * FROM disks WHERE project=?1 AND (name=?2 OR id=?2)",
-                    params![project, name_or_id],
+                    "SELECT * FROM disks WHERE workspace_id=?1 AND (name=?2 OR id=?2)",
+                    params![workspace_id, name_or_id],
                     row_to_disk,
                 )
                 .optional()
@@ -2252,10 +1899,11 @@ impl Store {
         Ok(disk)
     }
 
-    pub fn list_disks(&self, project: &str) -> Result<Vec<Disk>> {
+    pub fn list_disks(&self, workspace_id: &str) -> Result<Vec<Disk>> {
         let mut disks = self.with(|c| {
-            let mut stmt = c.prepare("SELECT * FROM disks WHERE project=?1 ORDER BY created_at")?;
-            let rows = stmt.query_map(params![project], row_to_disk)?;
+            let mut stmt =
+                c.prepare("SELECT * FROM disks WHERE workspace_id=?1 ORDER BY created_at")?;
+            let rows = stmt.query_map(params![workspace_id], row_to_disk)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
         })?;
         for d in &mut disks {
@@ -2504,7 +2152,7 @@ impl Store {
     pub fn cats_on_node(&self, node_id: &str) -> Result<Vec<Cat>> {
         self.with(|c| {
             let mut stmt =
-                c.prepare("SELECT * FROM cats WHERE node_id=?1 ORDER BY project, name")?;
+                c.prepare("SELECT * FROM cats WHERE node_id=?1 ORDER BY workspace_id, name")?;
             let rows = stmt.query_map(params![node_id], row_to_cat)?;
             rows.collect()
         })
@@ -2605,12 +2253,13 @@ impl Store {
         .ok_or_else(|| ApiError::not_found(format!("operation {id}")))
     }
 
-    pub fn list_operations(&self, project: &str) -> Result<Vec<Operation>> {
+    pub fn list_operations(&self, workspace_id: &str) -> Result<Vec<Operation>> {
         self.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT * FROM operations WHERE project=?1 ORDER BY created_at DESC, id DESC",
+                "SELECT * FROM operations WHERE workspace_id=?1
+                  ORDER BY created_at DESC, id DESC",
             )?;
-            let rows = stmt.query_map(params![project], row_to_operation)?;
+            let rows = stmt.query_map(params![workspace_id], row_to_operation)?;
             rows.collect()
         })
     }
@@ -2806,7 +2455,7 @@ impl Store {
             .with(|c| {
                 c.query_row(
                     "SELECT r.hostname, r.cat_id, r.node_id, r.gateway_url, r.target_port, r.epoch,
-                            r.state, e.wake_policy, c.project
+                            r.state, e.wake_policy, c.workspace_id
                        FROM routes r
                        JOIN endpoints e ON e.hostname = r.hostname
                        JOIN cats c ON c.id = r.cat_id
@@ -2822,7 +2471,7 @@ impl Store {
                                 target_port: r.get::<_, u16>(4)?,
                                 epoch: r.get(5)?,
                                 wake_policy: parse_wake(&r.get::<_, String>(7)?),
-                                project: r.get(8)?,
+                                workspace_id: r.get(8)?,
                             },
                             r.get::<_, String>(6)?,
                         ))
@@ -2938,7 +2587,6 @@ fn row_to_cat(r: &rusqlite::Row<'_>) -> rusqlite::Result<Cat> {
     Ok(Cat {
         id: r.get("id")?,
         workspace_id: r.get("workspace_id")?,
-        project: r.get("project")?,
         name: r.get("name")?,
         image: r.get("image")?,
         spec: CatSpec {
@@ -2993,7 +2641,6 @@ fn row_to_disk(r: &rusqlite::Row<'_>) -> rusqlite::Result<Disk> {
     Ok(Disk {
         id: r.get("id")?,
         workspace_id: r.get("workspace_id")?,
-        project: r.get("project")?,
         name: r.get("name")?,
         kind: if kind == "root" {
             DiskKind::Root
@@ -3057,7 +2704,6 @@ fn row_to_operation(r: &rusqlite::Row<'_>) -> rusqlite::Result<Operation> {
     Ok(Operation {
         id: r.get("id")?,
         workspace_id: r.get("workspace_id")?,
-        project: r.get("project")?,
         kind: r.get("kind")?,
         resource_id: r.get("resource_id")?,
         resource_generation: r.get("resource_generation")?,
@@ -3108,8 +2754,7 @@ fn row_to_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord
         account_id: row.get(1)?,
         slug: row.get(2)?,
         display_name: row.get(3)?,
-        legacy_project: row.get(4)?,
-        is_default: row.get(5)?,
+        is_default: row.get(4)?,
     })
 }
 
@@ -3143,7 +2788,7 @@ fn find_account_by_personal_owner(
 
 fn default_workspace_for_account(conn: &Connection, account_id: &str) -> Result<WorkspaceRecord> {
     conn.query_row(
-        "SELECT id, account_id, slug, display_name, legacy_project, is_default
+        "SELECT id, account_id, slug, display_name, is_default
            FROM workspaces WHERE account_id=?1 AND is_default=1",
         params![account_id],
         row_to_workspace,
@@ -3174,177 +2819,71 @@ fn unique_account_slug(conn: &Connection, requested: &str) -> Result<String> {
     ))
 }
 
-fn unique_legacy_project(conn: &Connection, requested: &str) -> Result<String> {
-    for suffix in 0..10_000_u32 {
-        let candidate = if suffix == 0 {
-            requested.to_string()
-        } else {
-            format!("{requested}-{suffix}")
-        };
-        let exists: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM workspaces WHERE legacy_project=?1)",
-                params![candidate],
-                |row| row.get(0),
-            )
-            .map_err(internal)?;
-        if !exists {
-            return Ok(candidate);
-        }
-    }
-    Err(ApiError::conflict(
-        "could not allocate a unique legacy project route",
-    ))
-}
-
-fn ensure_legacy_workspace(conn: &Connection, project: &str, organization_id: &str) -> Result<()> {
-    let existing: Option<(String, String, String)> = conn
-        .query_row(
-            "SELECT w.account_id, a.workos_organization_id, a.status
-               FROM workspaces w JOIN accounts a ON a.id=w.account_id
-              WHERE w.legacy_project=?1",
-            params![project],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()
-        .map_err(internal)?;
-    if let Some((mut account_id, old_organization_id, old_status)) = existing {
-        if old_organization_id.starts_with("legacy-unmapped:")
-            && !organization_id.starts_with("legacy-unmapped:")
-        {
-            if let Some(other) =
-                find_account_by_organization(conn, organization_id).map_err(internal)?
-            {
-                if other.id != account_id {
-                    if old_status != "pending_mapping" {
-                        return Err(ApiError::conflict(format!(
-                            "project {project} cannot move between active accounts"
-                        )));
-                    }
-                    let workspace_slug: String = conn
-                        .query_row(
-                            "SELECT slug FROM workspaces WHERE legacy_project=?1",
-                            params![project],
-                            |row| row.get(0),
-                        )
-                        .map_err(internal)?;
-                    let workspace_slug = unique_workspace_slug(conn, &other.id, &workspace_slug)?;
-                    let target_has_default: bool = conn
-                        .query_row(
-                            "SELECT EXISTS(
-                                SELECT 1 FROM workspaces
-                                 WHERE account_id=?1 AND is_default=1
-                             )",
-                            params![other.id],
-                            |row| row.get(0),
-                        )
-                        .map_err(internal)?;
-                    conn.execute(
-                        "UPDATE workspaces
-                            SET account_id=?2, slug=?3,
-                                is_default=CASE WHEN ?4 THEN 0 ELSE is_default END
-                          WHERE legacy_project=?1",
-                        params![project, other.id, workspace_slug, target_has_default],
-                    )
-                    .map_err(internal)?;
-                    conn.execute(
-                        "UPDATE legacy_billing_bindings SET account_id=?2
-                          WHERE legacy_project=?1",
-                        params![project, other.id],
-                    )
-                    .map_err(internal)?;
-                    conn.execute(
-                        "DELETE FROM accounts
-                          WHERE id=?1
-                            AND status='pending_mapping'
-                            AND NOT EXISTS(
-                                SELECT 1 FROM workspaces WHERE account_id=?1
-                            )",
-                        params![account_id],
-                    )
-                    .map_err(internal)?;
-                    account_id = other.id;
-                }
-            } else {
-                conn.execute(
-                    "UPDATE accounts
-                        SET workos_organization_id=?2, status='active'
-                      WHERE id=?1",
-                    params![account_id, organization_id],
-                )
-                .map_err(internal)?;
-            }
-        }
-        conn.execute(
-            "INSERT OR IGNORE INTO legacy_billing_bindings (
-                legacy_project, account_id, billing_account_id, created_at
-             ) VALUES (?1,?2,?3,?4)",
-            params![
-                project,
-                account_id,
-                format!("billing_account/project/{project}"),
-                now_unix()
-            ],
-        )
-        .map_err(internal)?;
+/// Idempotently create one statically configured Organization Account and its
+/// default Workspace. Called on every startup, so it must converge rather than
+/// fail when the Account already exists.
+fn ensure_configured_account(
+    conn: &Connection,
+    account_slug: &str,
+    organization_id: &str,
+) -> Result<()> {
+    if let Some(account) = find_account_by_organization(conn, organization_id).map_err(internal)? {
+        ensure_default_workspace(conn, &account.id)?;
         return Ok(());
     }
-
-    let account = find_account_by_organization(conn, organization_id).map_err(internal)?;
-    let (account_id, is_default) = if let Some(account) = account {
-        (account.id, false)
-    } else {
-        let account_id = new_id(ids::ACCOUNT_PREFIX);
-        let account_slug = unique_account_slug(conn, &dns_slug(project, 48))?;
-        let billing_account_id = format!("billing_account/account/{account_id}");
-        let status = if organization_id.starts_with("legacy-unmapped:") {
-            "pending_mapping"
-        } else {
-            "active"
-        };
-        conn.execute(
-            "INSERT INTO accounts (
-                id, slug, display_name, kind, workos_organization_id,
-                billing_account_id, status, created_at
-             ) VALUES (?1,?2,?3,'organization',?4,?5,?6,?7)",
-            params![
-                account_id,
-                account_slug,
-                project,
-                organization_id,
-                billing_account_id,
-                status,
-                now_unix()
-            ],
+    let slug_taken: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM accounts WHERE slug=?1)",
+            params![account_slug],
+            |row| row.get(0),
         )
         .map_err(internal)?;
-        (account_id, true)
-    };
-    let workspace_slug = unique_workspace_slug(conn, &account_id, &dns_slug(project, 48))?;
-    let workspace_id = new_id(ids::WORKSPACE_PREFIX);
+    if slug_taken {
+        return Err(ApiError::conflict(format!(
+            "account {account_slug} is already bound to a different WorkOS organization"
+        )));
+    }
+    let account_id = new_id(ids::ACCOUNT_PREFIX);
     conn.execute(
-        "INSERT INTO workspaces (
-            id, account_id, slug, display_name, legacy_project,
-            is_default, created_at
-         ) VALUES (?1,?2,?3,?4,?4,?5,?6)",
+        "INSERT INTO accounts (
+            id, slug, display_name, kind, workos_organization_id,
+            billing_account_id, status, created_at
+         ) VALUES (?1,?2,?3,'organization',?4,?5,'active',?6)",
         params![
-            workspace_id,
             account_id,
-            workspace_slug,
-            project,
-            is_default,
+            account_slug,
+            account_slug,
+            organization_id,
+            format!("billing_account/account/{account_id}"),
             now_unix()
         ],
     )
     .map_err(internal)?;
+    ensure_default_workspace(conn, &account_id)
+}
+
+fn ensure_default_workspace(conn: &Connection, account_id: &str) -> Result<()> {
+    let has_default: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM workspaces WHERE account_id=?1 AND is_default=1
+             )",
+            params![account_id],
+            |row| row.get(0),
+        )
+        .map_err(internal)?;
+    if has_default {
+        return Ok(());
+    }
+    let slug = unique_workspace_slug(conn, account_id, "default")?;
     conn.execute(
-        "INSERT INTO legacy_billing_bindings (
-            legacy_project, account_id, billing_account_id, created_at
-         ) VALUES (?1,?2,?3,?4)",
+        "INSERT INTO workspaces (
+            id, account_id, slug, display_name, is_default, created_at
+         ) VALUES (?1,?2,?3,'Default',1,?4)",
         params![
-            project,
+            new_id(ids::WORKSPACE_PREFIX),
             account_id,
-            format!("billing_account/project/{project}"),
+            slug,
             now_unix()
         ],
     )
@@ -3399,7 +2938,6 @@ fn workspace_view(
         account_display_name: account.display_name.clone(),
         slug: workspace.slug,
         locator,
-        legacy_project: workspace.legacy_project,
         display_name: workspace.display_name,
         kind: account.kind,
         organization_id: account.workos_organization_id.clone(),
@@ -3407,6 +2945,13 @@ fn workspace_view(
         is_default: workspace.is_default,
     }
 }
+
+/// Bumped on any schema change an existing database cannot be upgraded into.
+/// `Store::open` refuses a database stamped with a different version instead of
+/// migrating it: no released deployment's control-plane state has to survive, and
+/// a migration ladder for shapes nobody runs is archaeology that still has to be
+/// read, tested and kept correct.
+const SCHEMA_VERSION: i64 = 1;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS accounts (
@@ -3417,7 +2962,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     workos_organization_id TEXT NOT NULL UNIQUE,
     billing_account_id TEXT NOT NULL UNIQUE,
     personal_owner_user_id TEXT UNIQUE,
-    status TEXT NOT NULL CHECK (status IN ('provisioning','active','pending_mapping','disabled')),
+    status TEXT NOT NULL CHECK (status IN ('provisioning','active','disabled')),
     created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS workspaces (
@@ -3425,19 +2970,12 @@ CREATE TABLE IF NOT EXISTS workspaces (
     account_id TEXT NOT NULL REFERENCES accounts(id),
     slug TEXT NOT NULL,
     display_name TEXT NOT NULL,
-    legacy_project TEXT NOT NULL UNIQUE,
     is_default INTEGER NOT NULL DEFAULT 0 CHECK (is_default IN (0,1)),
     created_at INTEGER NOT NULL,
     UNIQUE (account_id, slug)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS workspaces_one_default
 ON workspaces(account_id) WHERE is_default=1;
-CREATE TABLE IF NOT EXISTS legacy_billing_bindings (
-    legacy_project TEXT PRIMARY KEY,
-    account_id TEXT NOT NULL REFERENCES accounts(id),
-    billing_account_id TEXT NOT NULL UNIQUE,
-    created_at INTEGER NOT NULL
-);
 CREATE TABLE IF NOT EXISTS account_membership_shadow (
     workos_membership_id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL REFERENCES accounts(id),
@@ -3481,7 +3019,6 @@ CREATE TABLE IF NOT EXISTS workos_event_receipts (
 CREATE TABLE IF NOT EXISTS cats (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
-    project TEXT NOT NULL,
     name TEXT NOT NULL,
     image TEXT NOT NULL,
     cpus INTEGER NOT NULL,
@@ -3495,19 +3032,18 @@ CREATE TABLE IF NOT EXISTS cats (
     observed_state_since_ms INTEGER NOT NULL,
     node_id TEXT,
     created_at INTEGER NOT NULL,
-    UNIQUE (project, name)
+    UNIQUE (workspace_id, name)
 );
 CREATE TABLE IF NOT EXISTS disks (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
-    project TEXT NOT NULL,
     name TEXT NOT NULL,
     kind TEXT NOT NULL,
     size_bytes INTEGER NOT NULL,
     state TEXT NOT NULL,
     volume_id TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    UNIQUE (project, name)
+    UNIQUE (workspace_id, name)
 );
 CREATE TABLE IF NOT EXISTS mount_bindings (
     id TEXT PRIMARY KEY,
@@ -3529,7 +3065,6 @@ CREATE TABLE IF NOT EXISTS nodes (
 CREATE TABLE IF NOT EXISTS operations (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
-    project TEXT NOT NULL,
     kind TEXT NOT NULL,
     resource_id TEXT NOT NULL,
     resource_generation INTEGER NOT NULL,
@@ -3582,6 +3117,18 @@ CREATE TABLE IF NOT EXISTS cat_work_leases (
 );
 CREATE INDEX IF NOT EXISTS cat_work_leases_live
 ON cat_work_leases(cat_id, expires_at_ms);
+CREATE TRIGGER IF NOT EXISTS cats_workspace_owner_is_immutable
+   BEFORE UPDATE OF workspace_id ON cats
+   WHEN NEW.workspace_id != OLD.workspace_id
+   BEGIN SELECT RAISE(ABORT, 'cats workspace owner is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS disks_workspace_owner_is_immutable
+   BEFORE UPDATE OF workspace_id ON disks
+   WHEN NEW.workspace_id != OLD.workspace_id
+   BEGIN SELECT RAISE(ABORT, 'disks workspace owner is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS operations_workspace_owner_is_immutable
+   BEFORE UPDATE OF workspace_id ON operations
+   WHEN NEW.workspace_id != OLD.workspace_id
+   BEGIN SELECT RAISE(ABORT, 'operations workspace owner is immutable'); END;
 ";
 
 #[cfg(test)]
@@ -3589,66 +3136,81 @@ mod tests {
     use super::*;
     use cats_api::guest::GuestWorkLease;
     use cats_api::requests::NodeWorkStatusRequest;
-    use std::collections::BTreeSet;
     use std::sync::Arc;
 
-    fn legacy_workspace(store: &Store, project: &str) -> WorkspaceRecord {
+    /// Seed one configured Account and return its default Workspace.
+    fn bootstrap_workspace(store: &Store, account_slug: &str) -> WorkspaceRecord {
         store
-            .reconcile_legacy_projects(&BTreeMap::from([(
-                project.to_string(),
-                format!("org_{project}"),
+            .ensure_configured_accounts(&BTreeMap::from([(
+                account_slug.to_string(),
+                format!("org_{account_slug}"),
             )]))
             .unwrap();
-        store.workspace_for_project(project).unwrap().unwrap()
+        let account = store
+            .account_for_organization(&format!("org_{account_slug}"))
+            .unwrap()
+            .unwrap();
+        default_workspace_for_account_id(store, &account.id)
+    }
+
+    fn default_workspace_for_account_id(store: &Store, account_id: &str) -> WorkspaceRecord {
+        store
+            .workspaces_for_account(account_id)
+            .unwrap()
+            .into_iter()
+            .find(|workspace| workspace.is_default)
+            .unwrap()
     }
 
     #[test]
-    fn legacy_projects_share_canonical_billing_and_retain_history_bindings() {
+    fn workspaces_in_one_account_share_its_billing_account() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("control.db")).unwrap();
         let mappings = BTreeMap::from([
-            ("default".to_string(), "org_acme".to_string()),
-            ("sibling".to_string(), "org_acme".to_string()),
+            ("acme".to_string(), "org_acme".to_string()),
             ("other".to_string(), "org_other".to_string()),
         ]);
-        store.reconcile_legacy_projects(&mappings).unwrap();
-        store.reconcile_legacy_projects(&mappings).unwrap();
+        store.ensure_configured_accounts(&mappings).unwrap();
+        store.ensure_configured_accounts(&mappings).unwrap();
 
-        let default = store.workspace_for_project("default").unwrap().unwrap();
-        let sibling = store.workspace_for_project("sibling").unwrap().unwrap();
-        let other = store.workspace_for_project("other").unwrap().unwrap();
+        let acme = store.account_for_organization("org_acme").unwrap().unwrap();
+        let other = store.account_for_organization("org_other").unwrap().unwrap();
+        let default = default_workspace_for_account_id(&store, &acme.id);
+        let sibling = store.create_workspace(&acme.id, "sibling", "Sibling").unwrap();
+        let other_default = default_workspace_for_account_id(&store, &other.id);
         assert_eq!(default.account_id, sibling.account_id);
-        assert_ne!(default.account_id, other.account_id);
+        assert_ne!(default.account_id, other_default.account_id);
         assert!(default.is_default);
         assert!(!sibling.is_default);
         assert_eq!(
-            store.billing_account_id_for_project("default").unwrap(),
-            store.billing_account_id_for_project("sibling").unwrap()
+            store.billing_account_id_for_workspace(&default.id).unwrap(),
+            store.billing_account_id_for_workspace(&sibling.id).unwrap()
         );
         assert!(store
-            .billing_account_id_for_project("default")
+            .billing_account_id_for_workspace(&default.id)
             .unwrap()
             .starts_with("billing_account/account/"));
-        assert_eq!(
+        assert_ne!(
+            store.billing_account_id_for_workspace(&default.id).unwrap(),
             store
-                .billing_ledgers_for_project("default")
+                .billing_account_id_for_workspace(&other_default.id)
                 .unwrap()
-                .into_iter()
-                .map(|ledger| ledger.billing_account_id)
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                store.billing_account_id_for_project("default").unwrap(),
-                "billing_account/project/default".to_string(),
-                "billing_account/project/sibling".to_string(),
-            ])
         );
         assert_eq!(
-            store
-                .workspaces_for_account(&default.account_id)
-                .unwrap()
-                .len(),
-            2
+            store.workspaces_for_account(&acme.id).unwrap().len(),
+            2,
+            "re-running account seeding must not add a second default workspace"
         );
+    }
+
+    #[test]
+    fn renaming_a_workspace_keeps_resource_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("control.db")).unwrap();
+        let default = bootstrap_workspace(&store, "acme");
+        let sibling = store
+            .create_workspace(&default.account_id, "sibling", "Sibling")
+            .unwrap();
 
         let (cat, disks, operation) = store
             .create_cat(
@@ -3666,97 +3228,46 @@ mod tests {
             .update_workspace(&default.id, Some("renamed"), None)
             .unwrap();
         assert_eq!(renamed.id, default.id);
-        assert_eq!(renamed.legacy_project, "default");
+        assert_eq!(renamed.slug, "renamed");
         assert_eq!(
-            store.get_cat("default", &cat.id).unwrap().workspace_id,
+            store.get_cat(&default.id, &cat.id).unwrap().workspace_id,
             default.id
         );
         assert!(disks.iter().all(|disk| disk.workspace_id == default.id));
         assert_eq!(operation.workspace_id, default.id);
-        assert!(store
-            .with(|conn| {
-                conn.execute(
-                    "UPDATE cats SET workspace_id=?2 WHERE id=?1",
-                    params![cat.id, sibling.id],
-                )
-                .map(|_| ())
-            })
-            .is_err());
-    }
-
-    #[test]
-    fn pending_legacy_accounts_merge_when_authoritative_mapping_arrives() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(&dir.path().join("control.db")).unwrap();
-        store
-            .reconcile_legacy_projects(&BTreeMap::from([
-                ("first".to_string(), "legacy-unmapped:first".to_string()),
-                ("second".to_string(), "legacy-unmapped:second".to_string()),
-            ]))
-            .unwrap();
-        let first_before = store.workspace_for_project("first").unwrap().unwrap();
-        let second_before = store.workspace_for_project("second").unwrap().unwrap();
-        assert_ne!(first_before.account_id, second_before.account_id);
-
-        store
-            .reconcile_legacy_projects(&BTreeMap::from([
-                ("first".to_string(), "org_grouped".to_string()),
-                ("second".to_string(), "org_grouped".to_string()),
-            ]))
-            .unwrap();
-        let first_after = store.workspace_for_project("first").unwrap().unwrap();
-        let second_after = store.workspace_for_project("second").unwrap().unwrap();
-        assert_eq!(first_after.id, first_before.id);
-        assert_eq!(second_after.id, second_before.id);
-        assert_eq!(first_after.account_id, second_after.account_id);
-        assert_eq!(
+        assert!(
             store
-                .account_by_id(&first_after.account_id)
-                .unwrap()
-                .workos_organization_id,
-            "org_grouped"
+                .with(|conn| {
+                    conn.execute(
+                        "UPDATE cats SET workspace_id=?2 WHERE id=?1",
+                        params![cat.id, sibling.id],
+                    )
+                    .map(|_| ())
+                })
+                .is_err(),
+            "a Cat must not be movable between workspaces"
         );
     }
 
     #[test]
-    fn legacy_canonical_billing_alias_keeps_its_original_owner_once() {
+    fn the_same_name_is_free_in_a_second_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("control.db")).unwrap();
-        let mappings = BTreeMap::from([
-            ("default".to_string(), "org_acme".to_string()),
-            ("sibling".to_string(), "org_acme".to_string()),
-        ]);
-        store.reconcile_legacy_projects(&mappings).unwrap();
-        let account_id = store
-            .workspace_for_project("default")
-            .unwrap()
-            .unwrap()
-            .account_id;
-        store
-            .with(|conn| {
-                conn.execute(
-                    "UPDATE accounts SET billing_account_id=?2 WHERE id=?1",
-                    params![account_id, "billing_account/project/default"],
-                )?;
-                Ok(())
-            })
+        let default = bootstrap_workspace(&store, "acme");
+        let sibling = store
+            .create_workspace(&default.account_id, "sibling", "Sibling")
             .unwrap();
-
-        assert_eq!(
-            store.billing_ledgers_for_project("sibling").unwrap(),
-            vec![
-                BillingLedgerRecord {
-                    billing_account_id: "billing_account/project/default".to_string(),
-                    owner_id: "default".to_string(),
-                    signup_credit_nanos: 10_000_000_000,
-                },
-                BillingLedgerRecord {
-                    billing_account_id: "billing_account/project/sibling".to_string(),
-                    owner_id: "sibling".to_string(),
-                    signup_credit_nanos: 10_000_000_000,
-                },
-            ]
-        );
+        store
+            .create_cat(&default, "shared", "test", 1, 256, 1 << 20, true, None)
+            .unwrap();
+        store
+            .create_cat(&sibling, "shared", "test", 1, 256, 1 << 20, true, None)
+            .unwrap();
+        assert!(store
+            .create_cat(&default, "shared", "test", 1, 256, 1 << 20, true, None)
+            .is_err());
+        assert_eq!(store.list_cats(&default.id).unwrap().len(), 1);
+        assert_eq!(store.list_cats(&sibling.id).unwrap().len(), 1);
     }
 
     #[test]
@@ -3807,77 +3318,82 @@ mod tests {
     }
 
     #[test]
-    fn opens_and_backfills_the_pre_project_operation_schema() {
+    fn refuses_a_database_stamped_with_another_schema_version() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("control.db");
+        drop(Store::open(&path).unwrap());
         {
             let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE cats (
-                    id TEXT PRIMARY KEY, project TEXT NOT NULL, name TEXT NOT NULL,
-                    image TEXT NOT NULL, cpus INTEGER NOT NULL, memory_mib INTEGER NOT NULL,
-                    root_disk_id TEXT NOT NULL, desired_state TEXT NOT NULL,
-                    observed_state TEXT NOT NULL, generation INTEGER NOT NULL,
-                    node_id TEXT, created_at INTEGER NOT NULL, UNIQUE (project, name)
-                 );
-                 CREATE TABLE operations (
-                    id TEXT PRIMARY KEY, kind TEXT NOT NULL, resource_id TEXT NOT NULL,
-                    resource_generation INTEGER NOT NULL, phase TEXT NOT NULL,
-                    error_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
-                 );
-                 CREATE TABLE nodes (
-                    id TEXT PRIMARY KEY, agent_url TEXT NOT NULL, gateway_url TEXT NOT NULL,
-                    state TEXT NOT NULL, cpus INTEGER NOT NULL, memory_mib INTEGER NOT NULL,
-                    last_heartbeat_ms INTEGER NOT NULL
-                 );
-                 INSERT INTO cats VALUES
-                    ('cat_old', 'alpha', 'legacy', 'ubuntu', 1, 512, 'disk_old',
-                     'running', 'cold', 1, NULL, 1);
-                 INSERT INTO operations VALUES
-                    ('op_old', 'cat.create', 'cat_old', 1, 'pending', NULL, 1, 1);
-                 INSERT INTO nodes VALUES
-                    ('node_old', 'http://node', 'http://gateway', 'cordoned', 4, 8192, 1);",
-            )
-            .unwrap();
+            conn.pragma_update(None, "user_version", 0_i64).unwrap();
         }
 
-        let migration_started_ms = now_ms();
-        let store = Store::open(&path).unwrap();
-        store
-            .reconcile_legacy_projects(&BTreeMap::from([(
-                "alpha".to_string(),
-                "org_alpha".to_string(),
-            )]))
-            .unwrap();
-        assert_eq!(store.get_operation("op_old").unwrap().project, "alpha");
-        let upgraded_cat = store.must_get_cat_by_id("cat_old").unwrap();
-        assert_eq!(
-            upgraded_cat.workspace_id,
-            store.workspace_for_project("alpha").unwrap().unwrap().id
-        );
-        assert!(upgraded_cat.auto_suspend);
+        let Err(error) = Store::open(&path) else {
+            panic!("a database from another schema version must not open");
+        };
+        assert_eq!(error.code, ErrorCode::FailedPrecondition);
         assert!(
-            upgraded_cat.observed_state_since_unix_ms >= migration_started_ms,
-            "an upgraded Cat must begin its tier clock at migration time"
+            error.to_string().contains("recreate it"),
+            "the operator needs to be told what to do, got: {error}"
         );
-        let endpoints = store.endpoints_for_cat("cat_old").unwrap();
+        // A database this build wrote itself keeps opening.
+        assert!(Store::open(&dir.path().join("fresh.db")).is_ok());
+
+        // The dev shape points the usage store at the control-plane file. Its
+        // tables must not read as a stale control-plane schema.
+        let shared = dir.path().join("shared.db");
+        {
+            let conn = Connection::open(&shared).unwrap();
+            conn.execute_batch("CREATE TABLE usage_checkpoints (event_id TEXT PRIMARY KEY);")
+                .unwrap();
+        }
+        assert!(
+            Store::open(&shared).is_ok(),
+            "a foreign table in the same file is not an old control-plane schema"
+        );
+    }
+
+    #[test]
+    fn every_cat_gets_a_default_public_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("control.db")).unwrap();
+        let workspace = bootstrap_workspace(&store, "alpha");
+        let (cat, _, _) = store
+            .create_cat(&workspace, "legacy", "ubuntu", 1, 512, 1 << 20, true, None)
+            .unwrap();
+
+        let endpoints = store.endpoints_for_cat(&cat.id).unwrap();
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].name, DEFAULT_ENDPOINT_NAME);
-        assert_eq!(endpoints[0].hostname, "legacy-old.cats.run");
         assert_eq!(endpoints[0].target_port, DEFAULT_ENDPOINT_PORT);
-        let node = store.get_node("node_old").unwrap();
-        assert_eq!(node.state, NodeState::Cordoned);
-        assert!(node.telemetry.is_none());
+        assert!(
+            endpoints[0].hostname.ends_with(".cats.run"),
+            "the default endpoint must live in the public one-label namespace, got {}",
+            endpoints[0].hostname
+        );
+        assert!(
+            endpoints[0].hostname.starts_with("legacy-"),
+            "the hostname keeps the Cat name plus an opaque suffix, got {}",
+            endpoints[0].hostname
+        );
+    }
 
-        // An upgraded cordoned node remains unschedulable after a Lost ->
-        // register/heartbeat recovery cycle.
-        store.set_node_state("node_old", NodeState::Lost).unwrap();
+    #[test]
+    fn a_cordoned_node_stays_unschedulable_across_a_lost_recovery_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("control.db")).unwrap();
         store
-            .register_node("node_old", "http://node-new", "http://gateway", 4, 8192)
+            .register_node("node_a", "http://node", "http://gateway", 4, 8192)
+            .unwrap();
+        store.set_node_state("node_a", NodeState::Cordoned).unwrap();
+
+        store.set_node_state("node_a", NodeState::Lost).unwrap();
+        store
+            .register_node("node_a", "http://node-new", "http://gateway", 4, 8192)
             .unwrap();
         assert_eq!(
-            store.get_node("node_old").unwrap().state,
-            NodeState::Cordoned
+            store.get_node("node_a").unwrap().state,
+            NodeState::Cordoned,
+            "a re-registering node must not silently become schedulable again"
         );
 
         let telemetry = NodeTelemetry {
@@ -3886,18 +3402,20 @@ mod tests {
             allocated_memory_mib: 2048,
             ..NodeTelemetry::default()
         };
-        store.heartbeat_node("node_old", Some(&telemetry)).unwrap();
-        let stored = store.get_node("node_old").unwrap().telemetry.unwrap();
+        store.heartbeat_node("node_a", Some(&telemetry)).unwrap();
+        let stored = store.get_node("node_a").unwrap().telemetry.unwrap();
         assert_eq!(stored.observed_cats, 2);
         assert_eq!(stored.allocated_cpus, 3);
         assert_eq!(stored.allocated_memory_mib, 2048);
+        assert_eq!(store.get_node("node_a").unwrap().state, NodeState::Cordoned);
     }
+
 
     #[test]
     fn last_guest_work_release_is_immediately_suspend_eligible() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("control.db")).unwrap();
-        let workspace = legacy_workspace(&store, "alpha");
+        let workspace = bootstrap_workspace(&store, "alpha");
         let (cat, _, _) = store
             .create_cat(
                 &workspace,
@@ -3982,7 +3500,7 @@ mod tests {
         // that keeps it honest.
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(&dir.path().join("control.db")).unwrap());
-        let workspace = legacy_workspace(&store, "alpha");
+        let workspace = bootstrap_workspace(&store, "alpha");
         // Room for exactly 4 of these Cats: 8 cpus / 8192 MiB, 2 cpus each.
         store
             .register_node("node-1", "http://node", "http://gateway", 8, 8192)
@@ -4027,7 +3545,7 @@ mod tests {
     fn gateway_work_blocks_auto_suspend_and_wake_is_singleflight() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("control.db")).unwrap();
-        let workspace = legacy_workspace(&store, "alpha");
+        let workspace = bootstrap_workspace(&store, "alpha");
         let (cat, _, _) = store
             .create_cat(&workspace, "web", "test", 1, 256, 1024 * 1024, true, None)
             .unwrap();
@@ -4065,7 +3583,7 @@ mod tests {
     fn guest_work_cancels_an_inflight_suspend_without_generation_drift() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("control.db")).unwrap();
-        let workspace = legacy_workspace(&store, "alpha");
+        let workspace = bootstrap_workspace(&store, "alpha");
         let (cat, _, _) = store
             .create_cat(&workspace, "racer", "test", 1, 256, 1024 * 1024, true, None)
             .unwrap();
@@ -4118,7 +3636,7 @@ mod tests {
         let cat_id;
         {
             let store = Store::open(&path).unwrap();
-            let workspace = legacy_workspace(&store, "alpha");
+            let workspace = bootstrap_workspace(&store, "alpha");
             let (cat, _, _) = store
                 .create_cat(
                     &workspace,

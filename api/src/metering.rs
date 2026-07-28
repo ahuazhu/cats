@@ -132,7 +132,7 @@ pub struct UsageTimeBucket {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageReport {
     pub billing_account_id: String,
-    pub project_id: String,
+    pub workspace_id: String,
     pub interval_start_unix_ms: i64,
     pub interval_end_unix_ms: i64,
     /// V1 query results are provisional until an explicit invoice close.

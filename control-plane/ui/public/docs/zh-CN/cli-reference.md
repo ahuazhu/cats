@@ -3,7 +3,7 @@
 | 选项 / 环境变量 | 默认值 | 用途 |
 |----|----|----|
 | `--api-url` / `CATS_API_URL` | 已保存登录目标，否则为 `https://cats.run` | 控制面基础 URL |
-| `--workspace` / `CATS_WORKSPACE` | 已保存 Workspace | 仅覆盖一条命令且不改变默认选择；`--project` 是兼容别名 |
+| `--workspace` / `CATS_WORKSPACE` | 已保存 Workspace | 仅覆盖一条命令且不改变默认选择；接受 `workspace`、`account/workspace` 或 Workspace ID |
 | `--token` / `CATS_TOKEN` | 无 | 仅供 Machine/Administrator Bearer Credential；普通用户执行 `cats login` |
 | `--no-wait` | 关闭 | Operation 被接受后立即返回 |
 | `--json` | 关闭 | 在支持的位置输出机器可读 JSON |

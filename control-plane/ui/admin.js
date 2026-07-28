@@ -266,7 +266,7 @@ function renderNodeDetails() {
   body.innerHTML = state.nodeCats.map((item) => {
     const actual = item.actual || {};
     return `<tr>
-      <td><div class="resource-name"><span class="resource-avatar">C</span><span><strong>${escapeHtml(item.cat.name)}</strong><small>${escapeHtml(item.cat.project)} · ${escapeHtml(item.cat.id)}</small></span></div></td>
+      <td><div class="resource-name"><span class="resource-avatar">C</span><span><strong>${escapeHtml(item.cat.name)}</strong><small>${escapeHtml(item.cat.workspace_id)} · ${escapeHtml(item.cat.id)}</small></span></div></td>
       <td>${statusBadge(item.cat.observed_state)}<br><small>${escapeHtml(t("common.generation", { value: item.cat.generation }))}</small></td>
       <td>${requestedActual(
         `${item.cat.spec.cpus} ${t("admin.unit.vcpus")}`,

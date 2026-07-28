@@ -23,7 +23,7 @@ Workspace slugs are unique inside an Account and may be renamed; immutable Accou
 
 **User label versus API compatibility**
 
-The CLI and console call the boundary a *Workspace*. The V1 HTTP API path and resource-store column keep the compatible name `project`; each Workspace has a stable legacy Project route so renaming a slug does not move resources or rewrite usage and credit history.
+The CLI and console call the boundary a *Workspace*, and so does the HTTP API: resources are owned by an immutable workspace ID. Renaming a slug therefore cannot move resources or rewrite usage and credit history.
 
 Login and selection are separate. `cats workspace use acme/dev` saves a default; `--workspace acme/prod` overrides one command without changing it. Switching Workspaces inside one Account is local. Crossing Accounts rotates the WorkOS refresh token into the target Organization scope; concurrent CLI processes serialize that rotation.
 

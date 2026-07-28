@@ -15,7 +15,7 @@ The administrator machine token is a fleet automation/break-glass identity. Do n
 
 ## Read fleet monitoring
 
-`cats admin monitoring` reports Cat lifecycle counts, node states, CPU/memory assignments, and Operation phases. The administrator console adds auto-refresh, host telemetry, and raw Prometheus metrics. Investigate per-node and per-project data rather than relying only on fleet averages.
+`cats admin monitoring` reports Cat lifecycle counts, node states, CPU/memory assignments, and Operation phases. The administrator console adds auto-refresh, host telemetry, and raw Prometheus metrics. Investigate per-node and per-workspace data rather than relying only on fleet averages.
 
 ## Node actions
 
@@ -61,4 +61,4 @@ Supported node action verbs are `cordon`, `uncordon`, and `drain`. Use `uncordon
 
 ## Source-version caveats
 
-The current repository still lacks tap/overlay Guest networking, PostgreSQL for the project resource store, and privilege separation. Native vhost-user-blk (ADR-0015) and Suspended page-out (`process_madvise(MADV_PAGEOUT)` over a per-Cat file-backed memory zone) have both landed; kernel NBD remains the default block path for a measured write-throughput trade-off, not for lack of validation. The Cloud Hypervisor path has passed the recorded bare-metal acceptance run, but those remaining items must be closed before calling the entire stack production-ready.
+The current repository still lacks tap/overlay Guest networking, PostgreSQL for the workspace resource store, and privilege separation. Native vhost-user-blk (ADR-0015) and Suspended page-out (`process_madvise(MADV_PAGEOUT)` over a per-Cat file-backed memory zone) have both landed; kernel NBD remains the default block path for a measured write-throughput trade-off, not for lack of validation. The Cloud Hypervisor path has passed the recorded bare-metal acceptance run, but those remaining items must be closed before calling the entire stack production-ready.

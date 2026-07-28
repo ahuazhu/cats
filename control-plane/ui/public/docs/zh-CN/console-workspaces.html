@@ -16,7 +16,7 @@
 <h2 id="workspaces">Workspace</h2>
 <p>用户可以属于一个或多个 Personal/Organization Account；每个 Account 拥有一个或多个 Workspace 和一个计费边界。包括 Personal 在内的所有 Account 都映射到 WorkOS Organization。新用户只会获得一个 Personal Account、一个 slug 为 <code>default</code> 的 Workspace，以及只属于该 Personal Billing Account、不可转移的一次性 10 美元赠金。新建 Workspace 或加入 Organization 不会再次发放。</p>
 <p>Workspace slug 只需在 Account 内唯一并允许修改；不可变 Account/Workspace ID 保持授权与资源归属不变。控制台使用可复制的 <code>/user/ACCOUNT/WORKSPACE/</code> URL。CLI 接受同样的 <code>account/workspace</code> locator；只有无歧义时才接受裸 slug。</p>
-<div class="callout"><strong>用户名称与 API 兼容性</strong><p>CLI 与控制台把该边界称为 <em>Workspace</em>。V1 HTTP API 路径和资源库列仍保留兼容名称 <code>project</code>；每个 Workspace 都有稳定的 legacy Project 路由，因此修改 slug 不会移动资源，也不会改写 usage/credit 历史。</p></div>
+<div class="callout"><strong>用户名称与 API 兼容性</strong><p>CLI、控制台和 HTTP API 都把该边界称为 <em>Workspace</em>：资源归属于不可变 Workspace ID，因此修改 slug 不会移动资源，也不会改写 usage/credit 历史。</p></div>
 <p>登录与选择相互独立。<code>cats workspace use acme/dev</code> 保存默认值；<code>--workspace acme/prod</code> 仅覆盖一条命令。同一 Account 内切换只改本地选择；跨 Account 时才把轮换 Refresh Token 切到目标 WorkOS Organization scope，并通过跨进程锁串行化 CLI 刷新。</p>
 
 <h2 id="members">Organization 成员与邀请</h2>

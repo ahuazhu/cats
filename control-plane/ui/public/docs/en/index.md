@@ -8,7 +8,7 @@ Cats gives you a long-lived Linux microVM: its own kernel, its own persistent di
 
 ## Product model
 
-A **Cat** is a long-lived Linux microVM with a required RootDisk. Compute may stop while the Cat name and durable disk remain. A Workspace is the user-visible authorization and resource boundary; the V1 HTTP API keeps the compatible `project` path segment underneath.
+A **Cat** is a long-lived Linux microVM with a required RootDisk. Compute may stop while the Cat name and durable disk remain. A Workspace is the user-visible authorization and resource boundary, and its immutable ID is what the HTTP API routes on.
 
 - **RootDisk** follows the Cat and is deleted with it.
 - **PersistentDisk** is independent, grow-only in V1, and read-write attached to at most one Cat.

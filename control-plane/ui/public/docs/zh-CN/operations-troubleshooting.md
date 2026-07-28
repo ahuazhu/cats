@@ -44,4 +44,4 @@ Create、Lifecycle 与 Delete 请求是异步的。控制面记录包含 ID、�
 
 ## 有用的故障证据
 
-升级处理时请保留 Request ID、Operation ID、Workspace/Project Slug、Cat/Disk 名称、Node ID、Generation、Attachment/Route Epoch、时间戳、CLI 版本与结构化错误。移除 Token、Cookie、Secret、Guest 磁盘内容与终端明文。
+升级处理时请保留 Request ID、Operation ID、Account/Workspace Slug、Cat/Disk 名称、Node ID、Generation、Attachment/Route Epoch、时间戳、CLI 版本与结构化错误。移除 Token、Cookie、Secret、Guest 磁盘内容与终端明文。

@@ -312,7 +312,7 @@ impl Controller {
         let mut grants = Vec::new();
         let bindings = self.store.bindings_for_cat(&cat.id)?;
         for b in &bindings {
-            let disk = self.store.get_disk(&cat.project, &b.disk_id)?;
+            let disk = self.store.get_disk(&cat.workspace_id, &b.disk_id)?;
             let size = cats_api::chunk::round_up_to_chunk(disk.size_bytes);
             match self.storage_meta.create_volume(&disk.volume_id, size) {
                 Ok(()) | Err(MetaError::AlreadyExists(_)) => {}
@@ -556,7 +556,7 @@ impl Controller {
         }
         // Root disk dies with the cat; persistent disks return to Available.
         for binding in self.store.bindings_for_cat(&cat.id)? {
-            let disk = self.store.get_disk(&cat.project, &binding.disk_id)?;
+            let disk = self.store.get_disk(&cat.workspace_id, &binding.disk_id)?;
             self.store.unbind_disk(&disk.id)?;
             if disk.kind == DiskKind::Root {
                 match self.storage_meta.delete_volume(&disk.volume_id) {

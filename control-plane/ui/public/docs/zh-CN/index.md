@@ -8,7 +8,7 @@ Cats 给你一台长期存在的 Linux microVM：有自己的内核、自己的�
 
 ## 产品模型
 
-**Cat** 是一台长期存在的 Linux microVM，必须拥有 RootDisk。计算可以停止，Cat 名称与持久磁盘继续存在。Workspace 是面向用户的权限和资源边界；V1 HTTP API 底层仍保留兼容的 `project` 路径分段。
+**Cat** 是一台长期存在的 Linux microVM，必须拥有 RootDisk。计算可以停止，Cat 名称与持久磁盘继续存在。Workspace 是面向用户的权限和资源边界，HTTP API 按它的不可变 ID 路由。
 
 - **RootDisk** 跟随 Cat，并随 Cat 删除。
 - **PersistentDisk** 独立存在，V1 只允许扩容，且最多挂载给一个读写 Cat。

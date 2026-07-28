@@ -28,6 +28,8 @@ struct Cluster {
     nodes: Vec<NodeHandle>,
     http: reqwest::Client,
     cli_bin: PathBuf,
+    /// The bootstrap Account's default Workspace; resource routes key on its ID.
+    workspace_id: String,
 }
 
 impl Cluster {
@@ -67,6 +69,15 @@ impl Cluster {
         for id in node_ids {
             nodes.push(Self::start_node(&dir, &cp, &gateway, id).await);
         }
+        let workspace_id = cp
+            .state
+            .store
+            .list_all_workspace_views()
+            .unwrap()
+            .into_iter()
+            .find(|workspace| workspace.is_default)
+            .expect("the bootstrap account has a default workspace")
+            .id;
         Cluster {
             dir,
             cp,
@@ -74,6 +85,7 @@ impl Cluster {
             nodes,
             http: reqwest::Client::new(),
             cli_bin: workspace_bin("cats"),
+            workspace_id,
         }
     }
 
@@ -140,7 +152,7 @@ impl Cluster {
                 .args(&args)
                 .env("CATS_API_URL", api)
                 .env("CATS_TOKEN", token)
-                .env("CATS_PROJECT", "default")
+                .env("CATS_WORKSPACE", "default")
                 .output()
                 .expect("run cats CLI");
             (
@@ -172,7 +184,7 @@ impl Cluster {
                 .args(&args)
                 .env("CATS_API_URL", api)
                 .env("CATS_TOKEN", ADMIN_TOKEN)
-                .env("CATS_PROJECT", "default")
+                .env("CATS_WORKSPACE", "default")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -231,7 +243,10 @@ impl Cluster {
     }
 
     async fn cat_json(&self, name: &str) -> serde_json::Value {
-        self.api_get(&format!("/v1/projects/default/cats/{name}"))
+        self.api_get(&format!(
+            "/v1/workspaces/{}/cats/{name}",
+            self.workspace_id
+        ))
             .await
     }
 
@@ -526,7 +541,9 @@ async fn product_loop_end_to_end() {
     cluster
         .cli_ok(&["mount", "shared", "--cat", "dev", "--at", "/data"])
         .await;
-    let disks = cluster.api_get("/v1/projects/default/disks").await;
+    let disks = cluster
+        .api_get(&format!("/v1/workspaces/{}/disks", cluster.workspace_id))
+        .await;
     let shared_id = disks["items"]
         .as_array()
         .unwrap()
@@ -582,7 +599,9 @@ async fn product_loop_end_to_end() {
 
     // Destroy dev: its root disk goes away, the persistent disk stays.
     cluster.cli_ok(&["destroy", "dev"]).await;
-    let disks = cluster.api_get("/v1/projects/default/disks").await;
+    let disks = cluster
+        .api_get(&format!("/v1/workspaces/{}/disks", cluster.workspace_id))
+        .await;
     let names: Vec<&str> = disks["items"]
         .as_array()
         .unwrap()
@@ -747,7 +766,7 @@ async fn api_semantics_through_cli() {
     assert!(out.contains("api"));
 
     // The administrator view is available through the same CLI with an
-    // administrator credential, without exposing it to project users.
+    // administrator credential, without exposing it to workspace users.
     let monitoring = cluster.admin_cli_ok(&["admin", "monitoring"]).await;
     assert!(monitoring.contains("cats total="));
     let nodes = cluster.admin_cli_ok(&["admin", "nodes"]).await;

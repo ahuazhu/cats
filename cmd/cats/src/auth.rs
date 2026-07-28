@@ -147,7 +147,7 @@ pub fn user_session(
     Ok(UserSession {
         api_url,
         access_token: credentials.access_token,
-        workspace: workspace.project().to_string(),
+        workspace: workspace.id.clone(),
         config,
     })
 }
@@ -224,10 +224,7 @@ fn resolve_workspace(workspaces: &[Workspace], selector: &str) -> Option<Workspa
     {
         return Some(workspace.clone());
     }
-    if let Some(workspace) = workspaces
-        .iter()
-        .find(|workspace| workspace.project() == selector)
-    {
+    if let Some(workspace) = workspaces.iter().find(|workspace| workspace.id == selector) {
         return Some(workspace.clone());
     }
     let mut matches = workspaces
@@ -418,7 +415,6 @@ mod tests {
                 "account_display_name": "Acme",
                 "slug": "default",
                 "locator": "acme",
-                "legacy_project": "acme",
                 "display_name": "Default",
                 "kind": "organization",
                 "organization_id": "org_acme",
@@ -432,7 +428,6 @@ mod tests {
                 "account_display_name": "Acme",
                 "slug": "dev",
                 "locator": "acme/dev",
-                "legacy_project": "acme-dev",
                 "display_name": "Development",
                 "kind": "organization",
                 "organization_id": "org_acme",
@@ -446,7 +441,6 @@ mod tests {
                 "account_display_name": "Other",
                 "slug": "dev",
                 "locator": "other/dev",
-                "legacy_project": "other-dev",
                 "display_name": "Development",
                 "kind": "organization",
                 "organization_id": "org_other",
@@ -459,9 +453,18 @@ mod tests {
             "ws_acme_dev"
         );
         assert_eq!(
-            resolve_workspace(&workspaces, "acme-dev").unwrap().id,
-            "ws_acme_dev"
+            resolve_workspace(&workspaces, "ws_acme_dev").unwrap().id,
+            "ws_acme_dev",
+            "an immutable workspace ID must resolve to itself"
         );
-        assert!(resolve_workspace(&workspaces, "dev").is_none());
+        assert!(
+            resolve_workspace(&workspaces, "dev").is_none(),
+            "a bare slug shared by two accounts is ambiguous"
+        );
+        assert_eq!(
+            resolve_workspace(&workspaces, "default").unwrap().id,
+            "ws_acme_default",
+            "a bare slug unique across accounts still resolves"
+        );
     }
 }

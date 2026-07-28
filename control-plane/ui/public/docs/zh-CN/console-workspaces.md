@@ -23,7 +23,7 @@ Workspace slug 只需在 Account 内唯一并允许修改；不可变 Account/Wo
 
 **用户名称与 API 兼容性**
 
-CLI 与控制台把该边界称为 *Workspace*。V1 HTTP API 路径和资源库列仍保留兼容名称 `project`；每个 Workspace 都有稳定的 legacy Project 路由，因此修改 slug 不会移动资源，也不会改写 usage/credit 历史。
+CLI、控制台和 HTTP API 都把该边界称为 *Workspace*：资源归属于不可变 Workspace ID，因此修改 slug 不会移动资源，也不会改写 usage/credit 历史。
 
 登录与选择相互独立。`cats workspace use acme/dev` 保存默认值；`--workspace acme/prod` 仅覆盖一条命令。同一 Account 内切换只改本地选择；跨 Account 时才把轮换 Refresh Token 切到目标 WorkOS Organization scope，并通过跨进程锁串行化 CLI 刷新。
 
