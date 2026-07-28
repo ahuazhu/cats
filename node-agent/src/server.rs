@@ -623,6 +623,10 @@ struct HostTelemetrySampler {
     previous_cat_cpu: HashMap<String, CatCpuSample>,
     cat_disk_samples: HashMap<String, CatDiskSample>,
     cat_meter_samples: HashMap<String, CatMeterSample>,
+    /// Last finalized epoch per Cat. A heartbeat can capture its target
+    /// immediately before a lifecycle transition; rejecting that stale target
+    /// prevents it from reopening a retired billing stream.
+    retired_meter_epochs: HashMap<String, String>,
     disk_path: PathBuf,
 }
 
@@ -636,6 +640,7 @@ impl HostTelemetrySampler {
             previous_cat_cpu: HashMap::new(),
             cat_disk_samples: HashMap::new(),
             cat_meter_samples: HashMap::new(),
+            retired_meter_epochs: HashMap::new(),
             disk_path,
         }
     }
@@ -759,11 +764,21 @@ impl HostTelemetrySampler {
                 .iter()
                 .any(|item| &item.cat_id == cat_id)
         });
+        self.retired_meter_epochs.retain(|cat_id, _| {
+            telemetry
+                .cat_resources
+                .iter()
+                .any(|item| &item.cat_id == cat_id)
+        });
         (telemetry, usage_checkpoints)
     }
 
     fn finalize(&mut self, target: &CatTelemetryTarget) -> anyhow::Result<Vec<CatUsageCheckpoint>> {
         let checkpoints = self.sample_usage_target(target, Instant::now(), now_unix_ms(), true)?;
+        if let Some(metering) = &target.metering {
+            self.retired_meter_epochs
+                .insert(target.cat_id.clone(), metering.source_epoch.clone());
+        }
         self.cat_meter_samples.remove(&target.cat_id);
         Ok(checkpoints)
     }
@@ -778,6 +793,13 @@ impl HostTelemetrySampler {
         let Some(metering) = &target.metering else {
             return Ok(Vec::new());
         };
+        if self
+            .retired_meter_epochs
+            .get(&target.cat_id)
+            .is_some_and(|epoch| epoch == &metering.source_epoch)
+        {
+            return Ok(Vec::new());
+        }
         let replace = self
             .cat_meter_samples
             .get(&target.cat_id)
@@ -1270,5 +1292,27 @@ mod telemetry_tests {
             200
         );
         assert!(!sampler.cat_meter_samples.contains_key("cat-a"));
+
+        // A heartbeat that captured the old target before finalization must
+        // not reopen the retired epoch or emit post-Warm usage.
+        std::fs::write(cgroup.join("cpu.stat"), "usage_usec 300\n").unwrap();
+        std::fs::write(cgroup.join("memory.current"), "3000\n").unwrap();
+        let stale = sampler
+            .sample_usage_target(&target, Instant::now(), now_unix_ms(), false)
+            .unwrap();
+        assert!(stale.is_empty());
+        assert!(!sampler.cat_meter_samples.contains_key("cat-a"));
+
+        // A restore creates a fresh epoch and is sampled normally.
+        let mut restored = target.clone();
+        restored.generation = 2;
+        restored.metering.as_mut().unwrap().source_epoch = "epoch-b".to_string();
+        let restored_baseline = sampler
+            .sample_usage_target(&restored, Instant::now(), now_unix_ms(), false)
+            .unwrap();
+        assert_eq!(restored_baseline.len(), 2);
+        assert!(restored_baseline
+            .iter()
+            .all(|checkpoint| checkpoint.sequence == 0));
     }
 }
