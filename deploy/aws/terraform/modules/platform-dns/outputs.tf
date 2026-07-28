@@ -21,5 +21,6 @@ output "certificate_status" {
 }
 
 output "certificate_domains" {
-  value = concat([aws_acm_certificate.this.domain_name], aws_acm_certificate.this.subject_alternative_names)
+  # subject_alternative_names is a set; concat only takes lists and tuples.
+  value = concat([aws_acm_certificate.this.domain_name], tolist(aws_acm_certificate.this.subject_alternative_names))
 }
