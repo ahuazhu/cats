@@ -5,7 +5,8 @@
 
 > CLI project token 部分已由 ADR-0008 取代；本 ADR 的浏览器 session、组织映射和
 > user/admin 隔离决定继续有效。无 Organization 的 Personal Project 及
-> Organization/Workspace 一一映射已由 ADR-0014 取代。
+> Organization/Workspace 一一映射已由 ADR-0014 取代。文中全部 Project 资源边界已由
+> ADR-0018 的 Workspace 取代，映射键是 Account slug。
 
 ## 背景
 

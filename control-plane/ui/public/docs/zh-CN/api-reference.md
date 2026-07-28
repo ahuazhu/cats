@@ -1,6 +1,6 @@
 ## 约定
 
-外部 API 使用 HTTP + JSON。用户资源通过兼容路径 `/v1/projects/{project}/…` 确定作用域，其中 Project 值是 Workspace 的稳定 legacy route。已验证 WorkOS 身份只能访问 active Account membership 所拥有的 Workspace；修改 URL 不能凭空产生 membership。
+外部 API 使用 HTTP + JSON。用户资源通过不可变 Workspace ID 确定作用域（`/v1/workspaces/{workspace_id}/…`），可改的 slug 不会出现在资源路由里。已验证 WorkOS 身份只能访问 active Account membership 所拥有的 Workspace；修改 URL 不能凭空产生 membership。
 
     Authorization: Bearer <short-lived-workos-access-token>
     Accept: application/json
@@ -8,7 +8,7 @@
     Idempotency-Key: <unique-request-id>   # 变更请求
     If-Match: "<generation>"                # 带并发保护的状态变更
 
-`cats login` 通过 WorkOS Device Authorization 获取并刷新用户 Token，不会把它写入普通配置文件。其他用户客户端必须采用批准的 WorkOS Flow 与相同的已验证 JWT 契约；服务端不接受静态 Project Token。浏览器控制台使用 HttpOnly WorkOS Session，不会向 JavaScript 暴露 Bearer Token。Service 与 Administrator 机器身份拥有独立权限。
+`cats login` 通过 WorkOS Device Authorization 获取并刷新用户 Token，不会把它写入普通配置文件。其他用户客户端必须采用批准的 WorkOS Flow 与相同的已验证 JWT 契约；服务端不接受静态用户 Token。浏览器控制台使用 HttpOnly WorkOS Session，不会向 JavaScript 暴露 Bearer Token。Service 与 Administrator 机器身份拥有独立权限。
 
 ## 身份与 Workspace
 
@@ -23,25 +23,25 @@
     PATCH|DELETE /v1/accounts/{account}/members/{membership}
     POST /v1/auth/logout    # 撤销 CLI WorkOS Session
 
-Workspace 枚举根据 Active WorkOS Organization Membership 返回 Personal/Organization Account。创建或修改 Workspace 需要 Account 管理权限；修改 slug 不会改变不可变 ID 或 legacy Project route。邀请与成员变更要求 `cats:members:manage`、拒绝 Personal Account，并通过 WorkOS 执行。创建邀请还要求 `Idempotency-Key`，Cats 将其透传给 WorkOS，使网络重试返回同一个 invitation。授权前会校验 Access Token 签名、Issuer、Client ID、过期时间、Subject、Organization Scope、active membership、Account ID 与 Workspace 归属。
+Workspace 枚举根据 Active WorkOS Organization Membership 返回 Personal/Organization Account。创建或修改 Workspace 需要 Account 管理权限；修改 slug 不会改变不可变 ID，因此所有资源路由继续解析到同一个 Workspace。邀请与成员变更要求 `cats:members:manage`、拒绝 Personal Account，并通过 WorkOS 执行。创建邀请还要求 `Idempotency-Key`，Cats 将其透传给 WorkOS，使网络重试返回同一个 invitation。授权前会校验 Access Token 签名、Issuer、Client ID、过期时间、Subject、Organization Scope、active membership、Account ID 与 Workspace 归属。
 
 ## Cats
 
-    POST   /v1/projects/{project}/cats
-    GET    /v1/projects/{project}/cats
-    GET    /v1/projects/{project}/cats/{cat}
-    DELETE /v1/projects/{project}/cats/{cat}
-    POST   /v1/projects/{project}/cats/{cat}/actions/{verb}
-    POST   /v1/projects/{project}/cats/{cat}/exec
-    GET    /v1/projects/{project}/cats/{cat}/work
-    GET    /v1/projects/{project}/cats/{cat}/auto-suspend
-    PUT    /v1/projects/{project}/cats/{cat}/auto-suspend
+    POST   /v1/workspaces/{workspace_id}/cats
+    GET    /v1/workspaces/{workspace_id}/cats
+    GET    /v1/workspaces/{workspace_id}/cats/{cat}
+    DELETE /v1/workspaces/{workspace_id}/cats/{cat}
+    POST   /v1/workspaces/{workspace_id}/cats/{cat}/actions/{verb}
+    POST   /v1/workspaces/{workspace_id}/cats/{cat}/exec
+    GET    /v1/workspaces/{workspace_id}/cats/{cat}/work
+    GET    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
+    PUT    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
 
 Lifecycle Verb 包括 `start`、`stop`、`suspend`、`resume` 与 `warm`。Create 省略 `auto_suspend` 时默认为 `true`。Cat 的 Create/Lifecycle/Delete 返回异步 Operation；请求超时后应查询 Operation，而不是用新意图重复变更。
 
-Cat、Disk 和 Operation 响应都包含不可变 `workspace_id`。`project` 字段只是稳定的 V1 兼容路由，不是资源归属真相源。
+Cat、Disk 和 Operation 响应都包含不可变 `workspace_id`，它是唯一的资源归属键。
 
-    POST /v1/projects/acme-dev/cats
+    POST /v1/workspaces/ws_01J8QK.../cats
     Idempotency-Key: request-7f12
 
     {
@@ -54,20 +54,20 @@ Cat、Disk 和 Operation 响应都包含不可变 `workspace_id`。`project` 字
 
 ## 磁盘与快照
 
-    POST   /v1/projects/{project}/disks
-    GET    /v1/projects/{project}/disks
-    GET    /v1/projects/{project}/disks/{disk}
-    DELETE /v1/projects/{project}/disks/{disk}
-    POST   /v1/projects/{project}/disks/{disk}/actions/{verb}
-    POST   /v1/projects/{project}/disks/{disk}/snapshots
-    GET    /v1/projects/{project}/disks/{disk}/snapshots
+    POST   /v1/workspaces/{workspace_id}/disks
+    GET    /v1/workspaces/{workspace_id}/disks
+    GET    /v1/workspaces/{workspace_id}/disks/{disk}
+    DELETE /v1/workspaces/{workspace_id}/disks/{disk}
+    POST   /v1/workspaces/{workspace_id}/disks/{disk}/actions/{verb}
+    POST   /v1/workspaces/{workspace_id}/disks/{disk}/snapshots
+    GET    /v1/workspaces/{workspace_id}/disks/{disk}/snapshots
 
 Disk Action Verb 为 `mount`、`unmount` 与 `resize`。Mount Body 指定 Cat 与 Guest 路径。服务会强制执行 RWO，并拒绝过期或冲突的 Attachment 状态。
 
 ## Endpoint
 
-    POST /v1/projects/{project}/cats/{cat}/endpoints
-    GET  /v1/projects/{project}/cats/{cat}/endpoints
+    POST /v1/workspaces/{workspace_id}/cats/{cat}/endpoints
+    GET  /v1/workspaces/{workspace_id}/cats/{cat}/endpoints
 
     {
       "name": "web",
@@ -78,7 +78,7 @@ Disk Action Verb 为 `mount`、`unmount` 与 `resize`。Mount Body 指定 Cat �
 
 ## 用量与账单
 
-    GET /v1/projects/{project}/billing/usage
+    GET /v1/workspaces/{workspace_id}/billing/usage
         ?from_ms=<包含的-unix-毫秒>
         &to_ms=<不包含的-unix-毫秒>
         [&cat=<活跃-cat-名称> | &cat_id=<不可变-cat-id>]
@@ -89,8 +89,8 @@ Disk Action Verb 为 `mount`、`unmount` 与 `resize`。Mount Body 指定 Cat �
 
 当前 Rate Card 的 CPU 单价为 `$0.07 / CPU-hour`，内存为 `$0.045 / GiB-hour`。十进制 Quantity 与纳美元金额使用 JSON String，防止客户端丢失整数精度。范围总额在聚合后只计价一次；时间桶金额只用于展示预估，不是最终账单。
 
-    GET  /v1/projects/{project}/billing/balance
-    POST /v1/projects/{project}/billing/checkout
+    GET  /v1/workspaces/{workspace_id}/billing/balance
+    POST /v1/workspaces/{workspace_id}/billing/checkout
     Idempotency-Key: <唯一键>
     {"amount_cents": 1000}
 
@@ -100,10 +100,10 @@ Disk Action Verb 为 `mount`、`unmount` 与 `resize`。Mount Body 指定 Cat �
 
 ## Operation
 
-    GET /v1/projects/{project}/operations
+    GET /v1/workspaces/{workspace_id}/operations
     GET /v1/operations/{operation}
 
-Operation 包含不可变 `workspace_id` Owner、兼容 Project 路由、类型、目标 Resource ID/Generation、阶段、时间戳与可选结构化错误。即使单个 Operation URL 没有 Project 分段，访问仍按 Workspace 限制。
+Operation 包含不可变 `workspace_id` Owner、类型、目标 Resource ID/Generation、阶段、时间戳与可选结构化错误。即使单个 Operation URL 没有 Workspace 分段，访问仍按 Workspace 限制。
 
 ## 错误
 

@@ -6,6 +6,10 @@
 
 > Organization/Workspace 一一映射、organization-less Personal 和 workspace selector
 > 细节已由 ADR-0014 取代；Device Login、系统凭据存储和 JWT 校验决定继续有效。
+>
+> 第 4、5、8 条中的 `CATS_WORKOS_PROJECT_ORGANIZATIONS` 映射、`personal-<user_id>`
+> Project 命名和 `/v1/projects/{project}` 资源路径已由 ADR-0018 取代：映射键是 Account
+> slug，资源路由是 `/v1/workspaces/{workspace_id}`。
 
 ## 背景
 

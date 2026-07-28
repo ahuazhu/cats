@@ -38,9 +38,9 @@ pub struct Account {
 
 /// A user-visible workspace.
 ///
-/// `id` and `account_id` are the authorization identities. `slug` is unique
-/// only within the account. `legacy_project` is the stable V1 routing key used
-/// by `/v1/projects/{project}` while that compatibility API remains.
+/// `id` and `account_id` are the authorization identities and the only keys
+/// the resource API routes on. `slug` is unique only within the account, so
+/// clients must never treat a bare slug as a global primary key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: String,
@@ -49,7 +49,6 @@ pub struct Workspace {
     pub account_display_name: String,
     pub slug: String,
     pub locator: String,
-    pub legacy_project: String,
     pub display_name: String,
     pub kind: AccountKind,
     pub organization_id: String,
@@ -59,11 +58,6 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// Stable project route used by the V1 resource API.
-    pub fn project(&self) -> &str {
-        &self.legacy_project
-    }
-
     /// Account-qualified selector accepted by current CLI commands.
     pub fn selector(&self) -> &str {
         &self.locator

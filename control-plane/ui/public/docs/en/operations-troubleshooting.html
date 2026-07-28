@@ -36,4 +36,4 @@ cats operation wait OPERATION_ID</code></pre>
 <p>Existing Running Cats may continue because API processes are not in the Guest I/O hot path. New lifecycle changes and durable root publication may be delayed or fail closed. Do not claim a FLUSH succeeded while the authoritative metadata CAS is unavailable.</p>
 
 <h2 id="support-bundle">Useful evidence</h2>
-<p>When escalating, preserve the request ID, Operation ID, Workspace/project slug, Cat/Disk name, node ID, generation, attachment/route epoch, timestamps, CLI version, and the structured error. Remove tokens, cookies, Secret values, Guest disk contents, and terminal plaintext.</p>
+<p>When escalating, preserve the request ID, Operation ID, Account/Workspace slug, Cat/Disk name, node ID, generation, attachment/route epoch, timestamps, CLI version, and the structured error. Remove tokens, cookies, Secret values, Guest disk contents, and terminal plaintext.</p>

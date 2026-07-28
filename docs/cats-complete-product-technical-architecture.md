@@ -142,7 +142,7 @@ flowchart TD
 | 资源 | 关键字段 | 生命周期与不变量 |
 |----|----|----|
 | Account | `account_id, kind, workos_organization_id, billing_account_id, status, quotas` | Personal/Organization 都是租户；成员和账单属于 Account；跨 Account 查询在数据库与 API 两层拒绝 |
-| Workspace | `workspace_id, account_id, slug, legacy_project, region, network_cidr` | Account 内的资源隔离边界；slug 可改、ID 不变；V1 Project 路由键只用于兼容 |
+| Workspace | `workspace_id, account_id, slug, region, network_cidr` | Account 内的唯一资源隔离边界与归属键；slug 可改、ID 不变，资源只按 ID 路由（ADR-0018）|
 | Cat | `cat_id, workspace_id, spec, image_id, root_disk_id, desired_state, observed_state, generation` | 不可变 Workspace 归属随资源写入；RootDisk 必须存在；Cat 删除最终级联删除 RootDisk，不删除外接盘 |
 | Disk | `disk_id, workspace_id, kind, size, backend, state, current_root` | 不可变 Workspace 归属随资源写入；Root 或 Persistent；只能扩容；RWO；删除前必须无有效 Attachment |
 | Attachment | `attachment_id, disk_id, cat_id, node_id, lease_epoch, expires_at` | 唯一 active writer；epoch 单调增加；旧 epoch 永远不能再次提交 |
@@ -651,7 +651,7 @@ Edge 选择证书、校验 Host/SNI、执行限流和最大请求策略。
 
 **3. Route Lookup**
 
-按 hostname 查只读缓存，得到 project/cat/node/port/epoch。
+按 hostname 查只读缓存，得到 workspace/cat/node/port/epoch。
 
 **4. Activation**
 
@@ -673,14 +673,14 @@ Node 再校验 route epoch 和 Guest IP，拒绝旧绑定与跨租户端口。
 
 | 项目 | V1 方案 | 后续扩展 |
 |----|----|----|
-| Guest 地址 | 每 Node 分配不重叠的私有前缀；Cat 获得固定 project 内地址或稳定 service name | IPv6 /128、用户自带地址空间 |
+| Guest 地址 | 每 Node 分配不重叠的私有前缀；Cat 获得固定 workspace 内地址或稳定 service name | IPv6 /128、用户自带地址空间 |
 | 跨 Node | WireGuard routed overlay；每 Node 发布自己拥有的 Guest prefix | eBPF dataplane / cloud route integration |
 | 出站 | Host SNAT，共享区域 egress；DNS 由平台 resolver 提供 | 项目固定 Egress IP、PrivateLink、NAT gateway pool |
 | 入站 | HTTP/HTTPS/WS/WSS，Edge TLS termination；Guest 不需要证书 | 受限 TCP endpoint、UDP、TLS passthrough |
-| 服务发现 | `<cat>.<project>.internal` → 项目内稳定地址 | 按 Endpoint 的服务别名与负载均衡 |
+| 服务发现 | `<cat>.<workspace>.internal` → Workspace 内稳定地址 | 按 Endpoint 的服务别名与负载均衡 |
 | 策略 | 默认 HTTP Endpoint 公网可寻址；Host 反欺骗 | 私有 Endpoint、逐 Endpoint 身份策略、用户可配置 ingress/egress policy |
 
-**路由安全不变量：**Route cache 的 key 必须包含规范化 hostname；结果必须包含 tenant/project/cat/node/epoch；Node gateway 必须再次验证 epoch 和目标端口。不能只相信 Edge 传来的 Guest IP，也不能让请求头直接指定后端地址。
+**路由安全不变量：**Route cache 的 key 必须包含规范化 hostname；结果必须包含 account/workspace/cat/node/epoch；Node gateway 必须再次验证 epoch 和目标端口。不能只相信 Edge 传来的 Guest IP，也不能让请求头直接指定后端地址。
 
 ## 10. 存储在完整架构中的位置
 
@@ -769,8 +769,8 @@ Identity
 
 ### 用户与组织
 
-OIDC/WorkOS 提供登录；平台数据库保存 Account、Workspace、不可变 ID、legacy Project
-路由、Billing Account binding 与 membership shadow。Personal 和 Organization Account
+OIDC/WorkOS 提供登录；平台数据库保存 Account、Workspace、不可变 ID 路由、
+Billing Account binding 与 membership shadow。Personal 和 Organization Account
 都映射到 WorkOS Organization：同 Account 内切换 Workspace 不刷新 WorkOS token，
 跨 Account 使用旋转 refresh token 切换 Organization scope。服务端按 active
 membership、不可变 Account/Workspace ID 和 permission 重新授权，不信任 email、
@@ -826,7 +826,7 @@ Network
 
 Host 拦截 spoofing，默认阻断管理网和云 metadata endpoint。
 
-- project boundary
+- workspace boundary
 - Endpoint allowlist
 - egress DNS policy
 - DDoS / WAF / rate limit
@@ -857,9 +857,9 @@ Host image、VMM、Kernel、Guest Agent 和 Root Image 都由 digest 固定并�
 ``` code-block
 AuditEvent {
   event_id, timestamp, request_id
-  actor { type, tenant_id, user_id | service_id, source_ip }
+  actor { type, account_id, user_id | service_id, source_ip }
   action                     # cat.start / disk.attach / secret.read / admin.node.drain
-  resource { type, id, project_id }
+  resource { type, id, workspace_id }
   decision { allowed, policy_id, reason }
   before_version, after_version
   operation_id
@@ -887,7 +887,7 @@ AuditEvent {
 ``` code-block
 candidates = nodes
   .filter(status == READY)
-  .filter(region == project.region)
+  .filter(region == workspace.region)
   .filter(runtime_version supports image + devices)
   .filter(free_memory >= requested_memory)
   .filter(free_dirty_nvme_reservation >= required_staging)
@@ -898,7 +898,7 @@ score(node) =
   + last_rootdisk_host_affinity_if_healthy
   + warm_clean_chunk_estimate
   + binpack_score_for_cpu_and_memory
-  + az_spread_score_for_project
+  + az_spread_score_for_workspace
   - node_load_and_io_pressure
   - failure_domain_concentration
   - pending_drain_or_upgrade_penalty
@@ -1031,7 +1031,7 @@ score(node) =
 ``` code-block
 UsageRecord {
   usage_id                 # 全局唯一，消费端去重
-  tenant_id, project_id
+  account_id, workspace_id
   resource_type, resource_id
   metric                   # vcpu_second / ram_gib_second / disk_gib_second / egress_byte
   quantity, unit
@@ -1053,23 +1053,23 @@ UsageRecord {
 ### 17.1 外部 API 轮廓
 
 ``` code-block
-POST   /v1/projects/{project}/cats
-GET    /v1/projects/{project}/cats/{cat}
-PATCH  /v1/projects/{project}/cats/{cat}          # spec / desired state
-DELETE /v1/projects/{project}/cats/{cat}
+POST   /v1/workspaces/{workspace_id}/cats
+GET    /v1/workspaces/{workspace_id}/cats/{cat}
+PATCH  /v1/workspaces/{workspace_id}/cats/{cat}          # spec / desired state
+DELETE /v1/workspaces/{workspace_id}/cats/{cat}
 
-POST   /v1/projects/{project}/cats/{cat}:start
-POST   /v1/projects/{project}/cats/{cat}:suspend
-POST   /v1/projects/{project}/cats/{cat}:stop
-POST   /v1/projects/{project}/cats/{cat}:exec      # 创建短期 session
+POST   /v1/workspaces/{workspace_id}/cats/{cat}:start
+POST   /v1/workspaces/{workspace_id}/cats/{cat}:suspend
+POST   /v1/workspaces/{workspace_id}/cats/{cat}:stop
+POST   /v1/workspaces/{workspace_id}/cats/{cat}:exec      # 创建短期 session
 
-POST   /v1/projects/{project}/disks
-POST   /v1/projects/{project}/disks/{disk}:attach
-POST   /v1/projects/{project}/disks/{disk}:detach
-POST   /v1/projects/{project}/disks/{disk}:resize
-POST   /v1/projects/{project}/disks/{disk}/snapshots
+POST   /v1/workspaces/{workspace_id}/disks
+POST   /v1/workspaces/{workspace_id}/disks/{disk}:attach
+POST   /v1/workspaces/{workspace_id}/disks/{disk}:detach
+POST   /v1/workspaces/{workspace_id}/disks/{disk}:resize
+POST   /v1/workspaces/{workspace_id}/disks/{disk}/snapshots
 
-POST   /v1/projects/{project}/cats/{cat}/endpoints
+POST   /v1/workspaces/{workspace_id}/cats/{cat}/endpoints
 GET    /v1/operations/{operation}
 GET    /v1/operations/{operation}/events
 
@@ -1091,7 +1091,7 @@ Location: /v1/operations/op_01J...
     "id": "op_01J...",
     "kind": "CatCreate",
     "phase": "Running",
-    "resource": "/v1/projects/dev/cats/cat_01J...",
+    "resource": "/v1/workspaces/ws_01J.../cats/cat_01J...",
     "progress": { "stage": "BootGuest", "completed": 5, "total": 7 },
     "error": null
   },
@@ -1110,7 +1110,7 @@ Location: /v1/operations/op_01J...
 
 | 表组 | 主要表 | 关键约束 |
 |----|----|----|
-| 身份 | tenant, user, membership, project, api_token | 所有资源外键包含 tenant/project；token 只存 hash |
+| 身份 | account, user, membership, workspace, api_token | 所有资源外键包含 account/workspace；token 只存 hash |
 | 计算 | cat, cat_spec, allocation, node, node_lease, reservation | 一个 Cat 最多一个 active allocation；generation 单调 |
 | 存储 | disk, attachment, disk_snapshot, disk_root, storage_job | partial unique index 保证每 Disk 一个 active RWO attachment |
 | 网络 | endpoint, route_binding, ip_allocation, certificate | hostname 全局唯一；binding epoch 单调；IP 不重复 |
@@ -1335,7 +1335,7 @@ NodeJobResult {
 | RootDisk 是否可独立保留 | 默认与 Cat 同生命周期；删除前可显式 snapshot/clone | 删除语义、账单、恢复与用户预期 |
 | PersistentDisk 多写 | V1 仅 RWO，绝不提供 RWX ext4 | 存储协议、锁、一致性、故障恢复 |
 | Endpoint 冷请求 | 按 Endpoint 配 wake_policy；默认交互项目可唤醒，长期服务建议 pin Running | 首字节延迟、网关容量、费用和用户体验 |
-| Region | Project 创建后固定 Region；迁移是显式异步操作 | 网络、数据驻留、存储复制和域名 |
+| Region | Workspace 创建后固定 Region；迁移是显式异步操作 | 网络、数据驻留、存储复制和域名 |
 | 首发存储后端 | 已决定（ADR-0003）：Direct-OS ChunkStore（Direct-S3 实现）；不实现 JuiceFS 方案 | 研发周期、成本、正确性风险 |
 | 计费单位 | Running compute + provisioned PersistentDisk + 超额 Root + egress；Suspended/Warm 单独定价 | usage schema、产品套餐和毛利 |
 

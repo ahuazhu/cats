@@ -93,14 +93,14 @@ struct Args {
     /// Exact `iss` claim published in this WorkOS application's access tokens.
     #[arg(long, env = "WORKOS_ISSUER")]
     workos_issuer: Option<String>,
-    /// Bind a Cats project to exactly one WorkOS Organization.
+    /// Bind a Cats Account to exactly one WorkOS Organization.
     #[arg(
-        long = "workos-project-organization",
-        env = "CATS_WORKOS_PROJECT_ORGANIZATIONS",
+        long = "workos-account-organization",
+        env = "CATS_WORKOS_ACCOUNT_ORGANIZATIONS",
         value_delimiter = ',',
-        value_name = "PROJECT=ORG_ID"
+        value_name = "ACCOUNT=ORG_ID"
     )]
-    workos_project_organizations: Vec<String>,
+    workos_account_organizations: Vec<String>,
     #[arg(long, env = "CATS_WORKOS_ADMIN_ORGANIZATION_ID")]
     workos_admin_organization_id: Option<String>,
     #[arg(
@@ -277,7 +277,7 @@ async fn main() -> anyhow::Result<()> {
         || args.workos_cookie_password.is_some()
         || args.workos_redirect_uri.is_some()
         || args.workos_issuer.is_some()
-        || !args.workos_project_organizations.is_empty()
+        || !args.workos_account_organizations.is_empty()
         || args.workos_admin_organization_id.is_some()
         || args.workos_cookie_domain.is_some()
         || args.user_site_url.is_some()
@@ -302,19 +302,19 @@ async fn main() -> anyhow::Result<()> {
             .workos_admin_organization_id
             .ok_or_else(|| anyhow::anyhow!("CATS_WORKOS_ADMIN_ORGANIZATION_ID is required"))?;
         let mut mappings = BTreeMap::new();
-        for value in &args.workos_project_organizations {
-            let (project, organization_id) = value.split_once('=').ok_or_else(|| {
-                anyhow::anyhow!("--workos-project-organization must be PROJECT=ORG_ID")
+        for value in &args.workos_account_organizations {
+            let (account, organization_id) = value.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("--workos-account-organization must be ACCOUNT=ORG_ID")
             })?;
             anyhow::ensure!(
-                !project.is_empty() && !organization_id.is_empty(),
-                "--workos-project-organization must be PROJECT=ORG_ID"
+                !account.is_empty() && !organization_id.is_empty(),
+                "--workos-account-organization must be ACCOUNT=ORG_ID"
             );
             anyhow::ensure!(
                 mappings
-                    .insert(project.to_string(), organization_id.to_string())
+                    .insert(account.to_string(), organization_id.to_string())
                     .is_none(),
-                "duplicate WorkOS mapping for project {project}"
+                "duplicate WorkOS mapping for account {account}"
             );
         }
         let cookie_secure = args
@@ -328,7 +328,7 @@ async fn main() -> anyhow::Result<()> {
                 issuer_url,
                 redirect_uri,
                 cookie_password,
-                project_organizations: mappings,
+                account_organizations: mappings,
                 admin_organization_id,
                 admin_permission: args.workos_admin_permission,
                 cookie_secure,

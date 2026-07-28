@@ -1,11 +1,11 @@
 <h2 id="conventions">Conventions</h2>
-<p>The external API is JSON over HTTP. User resources are scoped by the compatible project segment in <code>/v1/projects/{project}/…</code>; its value is a Workspace's stable legacy route. A verified WorkOS identity may access Workspaces owned by its active Account membership, and changing a URL cannot create that membership.</p>
+<p>The external API is JSON over HTTP. User resources are scoped by the immutable workspace ID in <code>/v1/workspaces/{workspace_id}/…</code>; a mutable slug never appears in a resource route. A verified WorkOS identity may access Workspaces owned by its active Account membership, and changing a URL cannot create that membership.</p>
 <pre><code>Authorization: Bearer &lt;short-lived-workos-access-token&gt;
 Accept: application/json
 Content-Type: application/json
 Idempotency-Key: &lt;unique-request-id&gt;   # mutations
 If-Match: "&lt;generation&gt;"                # guarded state changes</code></pre>
-<p><code>cats login</code> obtains and refreshes the user token through WorkOS Device Authorization without writing it to the normal config file. Other user clients must use an approved WorkOS flow and the same verified JWT contract; static project tokens are not accepted. Browser consoles use their HttpOnly WorkOS session instead of exposing a Bearer token to JavaScript. Service and administrator machine identities have separate scopes.</p>
+<p><code>cats login</code> obtains and refreshes the user token through WorkOS Device Authorization without writing it to the normal config file. Other user clients must use an approved WorkOS flow and the same verified JWT contract; static user tokens are not accepted. Browser consoles use their HttpOnly WorkOS session instead of exposing a Bearer token to JavaScript. Service and administrator machine identities have separate scopes.</p>
 
 <h2 id="identity">Identity and Workspaces</h2>
 <pre><code>GET  /auth/config       # public WorkOS client/base-URL configuration
@@ -18,21 +18,21 @@ POST /v1/accounts/{account}/invitations/{invitation}/actions/revoke
 GET /v1/accounts/{account}/members
 PATCH|DELETE /v1/accounts/{account}/members/{membership}
 POST /v1/auth/logout    # revoke the CLI WorkOS session</code></pre>
-<p>Workspace enumeration returns Personal and Organization Accounts from active WorkOS Organization memberships. Creating or renaming a Workspace requires account-management permission; a rename does not change its immutable ID or legacy Project route. Invitation/member mutations require <code>cats:members:manage</code>, are rejected for Personal Accounts, and are performed through WorkOS. Creating an invitation also requires <code>Idempotency-Key</code>; Cats forwards it to WorkOS so a network retry returns the same invitation. User access-token signature, issuer, client ID, expiry, subject, Organization scope, active membership, Account ID, and Workspace ownership are checked before authorization.</p>
+<p>Workspace enumeration returns Personal and Organization Accounts from active WorkOS Organization memberships. Creating or renaming a Workspace requires account-management permission; a rename does not change its immutable ID, so every resource route keeps resolving. Invitation/member mutations require <code>cats:members:manage</code>, are rejected for Personal Accounts, and are performed through WorkOS. Creating an invitation also requires <code>Idempotency-Key</code>; Cats forwards it to WorkOS so a network retry returns the same invitation. User access-token signature, issuer, client ID, expiry, subject, Organization scope, active membership, Account ID, and Workspace ownership are checked before authorization.</p>
 
 <h2 id="cats">Cats</h2>
-<pre><code>POST   /v1/projects/{project}/cats
-GET    /v1/projects/{project}/cats
-GET    /v1/projects/{project}/cats/{cat}
-DELETE /v1/projects/{project}/cats/{cat}
-POST   /v1/projects/{project}/cats/{cat}/actions/{verb}
-POST   /v1/projects/{project}/cats/{cat}/exec
-GET    /v1/projects/{project}/cats/{cat}/work
-GET    /v1/projects/{project}/cats/{cat}/auto-suspend
-PUT    /v1/projects/{project}/cats/{cat}/auto-suspend</code></pre>
+<pre><code>POST   /v1/workspaces/{workspace_id}/cats
+GET    /v1/workspaces/{workspace_id}/cats
+GET    /v1/workspaces/{workspace_id}/cats/{cat}
+DELETE /v1/workspaces/{workspace_id}/cats/{cat}
+POST   /v1/workspaces/{workspace_id}/cats/{cat}/actions/{verb}
+POST   /v1/workspaces/{workspace_id}/cats/{cat}/exec
+GET    /v1/workspaces/{workspace_id}/cats/{cat}/work
+GET    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
+PUT    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend</code></pre>
 <p>Lifecycle verbs are <code>start</code>, <code>stop</code>, <code>suspend</code>, <code>resume</code>, and <code>warm</code>. <code>auto_suspend</code> defaults to <code>true</code> when omitted from create. Cat create/lifecycle/delete returns an asynchronous Operation response; poll the Operation URL instead of repeating a timed-out mutation with a new intent.</p>
-<p>Cat, Disk, and Operation responses include the immutable <code>workspace_id</code>. The <code>project</code> field is the stable V1 compatibility route and is not the ownership authority.</p>
-<pre><code>POST /v1/projects/acme-dev/cats
+<p>Cat, Disk, and Operation responses include the immutable <code>workspace_id</code>, which is the only ownership key.</p>
+<pre><code>POST /v1/workspaces/ws_01J8QK.../cats
 Idempotency-Key: request-7f12
 
 {
@@ -44,18 +44,18 @@ Idempotency-Key: request-7f12
 }</code></pre>
 
 <h2 id="disks">Disks and snapshots</h2>
-<pre><code>POST   /v1/projects/{project}/disks
-GET    /v1/projects/{project}/disks
-GET    /v1/projects/{project}/disks/{disk}
-DELETE /v1/projects/{project}/disks/{disk}
-POST   /v1/projects/{project}/disks/{disk}/actions/{verb}
-POST   /v1/projects/{project}/disks/{disk}/snapshots
-GET    /v1/projects/{project}/disks/{disk}/snapshots</code></pre>
+<pre><code>POST   /v1/workspaces/{workspace_id}/disks
+GET    /v1/workspaces/{workspace_id}/disks
+GET    /v1/workspaces/{workspace_id}/disks/{disk}
+DELETE /v1/workspaces/{workspace_id}/disks/{disk}
+POST   /v1/workspaces/{workspace_id}/disks/{disk}/actions/{verb}
+POST   /v1/workspaces/{workspace_id}/disks/{disk}/snapshots
+GET    /v1/workspaces/{workspace_id}/disks/{disk}/snapshots</code></pre>
 <p>Disk action verbs are <code>mount</code>, <code>unmount</code>, and <code>resize</code>. Mount bodies identify the Cat and Guest path. The service enforces RWO and rejects stale or conflicting attachment state.</p>
 
 <h2 id="endpoints">Endpoints</h2>
-<pre><code>POST /v1/projects/{project}/cats/{cat}/endpoints
-GET  /v1/projects/{project}/cats/{cat}/endpoints</code></pre>
+<pre><code>POST /v1/workspaces/{workspace_id}/cats/{cat}/endpoints
+GET  /v1/workspaces/{workspace_id}/cats/{cat}/endpoints</code></pre>
 <pre><code>{
   "name": "web",
   "target_port": 3000,
@@ -64,7 +64,7 @@ GET  /v1/projects/{project}/cats/{cat}/endpoints</code></pre>
 }</code></pre>
 
 <h2 id="usage-billing">Usage and billing</h2>
-<pre><code>GET /v1/projects/{project}/billing/usage
+<pre><code>GET /v1/workspaces/{workspace_id}/billing/usage
     ?from_ms=&lt;inclusive-unix-milliseconds&gt;
     &amp;to_ms=&lt;exclusive-unix-milliseconds&gt;
     [&amp;cat=&lt;active-cat-name&gt; | &amp;cat_id=&lt;immutable-cat-id&gt;]
@@ -72,17 +72,17 @@ GET  /v1/projects/{project}/cats/{cat}/endpoints</code></pre>
     [&amp;detail=true]</code></pre>
 <p>The response is a <code>provisional</code> estimate for the open period. It includes range totals, totals by meter, totals by Cat, the immutable rate-card ID, and the latest visible interval end. <code>cat_id</code> remains queryable after a Cat is deleted. <code>bucket_ms</code> returns server-side time buckets for charts and bounded period detail; it must be at least 60 seconds and produce no more than 512 buckets. <code>detail=true</code> returns raw ledger intervals and should be reserved for controlled reconciliation queries rather than long browser ranges.</p>
 <p>CPU is rated at <code>$0.07 / CPU-hour</code> and memory at <code>$0.045 / GiB-hour</code> by the current rate card. Decimal quantities and nanodollar amounts are JSON strings so clients do not lose integer precision. The range total is rated once after aggregation; bucket amounts are display estimates and are not a finalized invoice.</p>
-<pre><code>GET  /v1/projects/{project}/billing/balance
-POST /v1/projects/{project}/billing/checkout
+<pre><code>GET  /v1/workspaces/{workspace_id}/billing/balance
+POST /v1/workspaces/{workspace_id}/billing/checkout
 Idempotency-Key: &lt;unique-key&gt;
 {"amount_cents": 1000}</code></pre>
 <p>A new user receives one non-renewing <code>$10</code> signup credit on the user's Personal Billing Account. Organization Accounts, extra Workspaces, and invitations do not mint signup credit. The balance response subtracts all-time provisional usage from append-only grants and top-ups. Checkout accepts only the published fixed top-up amounts and returns a Stripe-hosted URL. Returning from Checkout does not add credit: Cats credits the account only after a signed Stripe webhook reports the session as paid.</p>
 <p>When available credit is exhausted, paid compute admission returns HTTP <code>402</code> with code <code>payment_required</code>. Stopping, suspending, and deleting resources remain available.</p>
 
 <h2 id="operations">Operations</h2>
-<pre><code>GET /v1/projects/{project}/operations
+<pre><code>GET /v1/workspaces/{workspace_id}/operations
 GET /v1/operations/{operation}</code></pre>
-<p>An Operation contains immutable <code>workspace_id</code> ownership, the compatible project route, kind, target resource ID/generation, phase, timestamps, and an optional structured error. Access is still Workspace-scoped even though the single-Operation URL does not contain the project segment.</p>
+<p>An Operation contains immutable <code>workspace_id</code> ownership, kind, target resource ID/generation, phase, timestamps, and an optional structured error. Access is still Workspace-scoped even though the single-Operation URL does not contain the workspace segment.</p>
 
 <h2 id="errors">Errors</h2>
 <pre><code>{

@@ -250,11 +250,11 @@ Guest sequence 是 Node/Guest 两阶段校验的直接 fence。`control_work_ver
 ### 5.1 用户 API
 
 ```text
-GET /v1/projects/{project}/cats/{cat}/auto-suspend
-PUT /v1/projects/{project}/cats/{cat}/auto-suspend
+GET /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
+PUT /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
   {"enabled": true}
 
-GET /v1/projects/{project}/cats/{cat}/work
+GET /v1/workspaces/{workspace_id}/cats/{cat}/work
 ```
 
 策略更新返回 `AutoSuspendResponse {cat, work}`。开启策略时立即评估，不等待下一轮 reconcile。

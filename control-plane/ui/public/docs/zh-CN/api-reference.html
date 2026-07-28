@@ -1,11 +1,11 @@
 <h2 id="conventions">约定</h2>
-<p>外部 API 使用 HTTP + JSON。用户资源通过兼容路径 <code>/v1/projects/{project}/…</code> 确定作用域，其中 Project 值是 Workspace 的稳定 legacy route。已验证 WorkOS 身份只能访问 active Account membership 所拥有的 Workspace；修改 URL 不能凭空产生 membership。</p>
+<p>外部 API 使用 HTTP + JSON。用户资源通过不可变 Workspace ID 确定作用域（<code>/v1/workspaces/{workspace_id}/…</code>），可改的 slug 不会出现在资源路由里。已验证 WorkOS 身份只能访问 active Account membership 所拥有的 Workspace；修改 URL 不能凭空产生 membership。</p>
 <pre><code>Authorization: Bearer &lt;short-lived-workos-access-token&gt;
 Accept: application/json
 Content-Type: application/json
 Idempotency-Key: &lt;unique-request-id&gt;   # 变更请求
 If-Match: "&lt;generation&gt;"                # 带并发保护的状态变更</code></pre>
-<p><code>cats login</code> 通过 WorkOS Device Authorization 获取并刷新用户 Token，不会把它写入普通配置文件。其他用户客户端必须采用批准的 WorkOS Flow 与相同的已验证 JWT 契约；服务端不接受静态 Project Token。浏览器控制台使用 HttpOnly WorkOS Session，不会向 JavaScript 暴露 Bearer Token。Service 与 Administrator 机器身份拥有独立权限。</p>
+<p><code>cats login</code> 通过 WorkOS Device Authorization 获取并刷新用户 Token，不会把它写入普通配置文件。其他用户客户端必须采用批准的 WorkOS Flow 与相同的已验证 JWT 契约；服务端不接受静态用户 Token。浏览器控制台使用 HttpOnly WorkOS Session，不会向 JavaScript 暴露 Bearer Token。Service 与 Administrator 机器身份拥有独立权限。</p>
 
 <h2 id="identity">身份与 Workspace</h2>
 <pre><code>GET  /auth/config       # 公开 WorkOS Client/Base URL 配置
@@ -18,21 +18,21 @@ POST /v1/accounts/{account}/invitations/{invitation}/actions/revoke
 GET /v1/accounts/{account}/members
 PATCH|DELETE /v1/accounts/{account}/members/{membership}
 POST /v1/auth/logout    # 撤销 CLI WorkOS Session</code></pre>
-<p>Workspace 枚举根据 Active WorkOS Organization Membership 返回 Personal/Organization Account。创建或修改 Workspace 需要 Account 管理权限；修改 slug 不会改变不可变 ID 或 legacy Project route。邀请与成员变更要求 <code>cats:members:manage</code>、拒绝 Personal Account，并通过 WorkOS 执行。创建邀请还要求 <code>Idempotency-Key</code>，Cats 将其透传给 WorkOS，使网络重试返回同一个 invitation。授权前会校验 Access Token 签名、Issuer、Client ID、过期时间、Subject、Organization Scope、active membership、Account ID 与 Workspace 归属。</p>
+<p>Workspace 枚举根据 Active WorkOS Organization Membership 返回 Personal/Organization Account。创建或修改 Workspace 需要 Account 管理权限；修改 slug 不会改变不可变 ID，因此所有资源路由继续解析到同一个 Workspace。邀请与成员变更要求 <code>cats:members:manage</code>、拒绝 Personal Account，并通过 WorkOS 执行。创建邀请还要求 <code>Idempotency-Key</code>，Cats 将其透传给 WorkOS，使网络重试返回同一个 invitation。授权前会校验 Access Token 签名、Issuer、Client ID、过期时间、Subject、Organization Scope、active membership、Account ID 与 Workspace 归属。</p>
 
 <h2 id="cats">Cats</h2>
-<pre><code>POST   /v1/projects/{project}/cats
-GET    /v1/projects/{project}/cats
-GET    /v1/projects/{project}/cats/{cat}
-DELETE /v1/projects/{project}/cats/{cat}
-POST   /v1/projects/{project}/cats/{cat}/actions/{verb}
-POST   /v1/projects/{project}/cats/{cat}/exec
-GET    /v1/projects/{project}/cats/{cat}/work
-GET    /v1/projects/{project}/cats/{cat}/auto-suspend
-PUT    /v1/projects/{project}/cats/{cat}/auto-suspend</code></pre>
+<pre><code>POST   /v1/workspaces/{workspace_id}/cats
+GET    /v1/workspaces/{workspace_id}/cats
+GET    /v1/workspaces/{workspace_id}/cats/{cat}
+DELETE /v1/workspaces/{workspace_id}/cats/{cat}
+POST   /v1/workspaces/{workspace_id}/cats/{cat}/actions/{verb}
+POST   /v1/workspaces/{workspace_id}/cats/{cat}/exec
+GET    /v1/workspaces/{workspace_id}/cats/{cat}/work
+GET    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
+PUT    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend</code></pre>
 <p>Lifecycle Verb 包括 <code>start</code>、<code>stop</code>、<code>suspend</code>、<code>resume</code> 与 <code>warm</code>。Create 省略 <code>auto_suspend</code> 时默认为 <code>true</code>。Cat 的 Create/Lifecycle/Delete 返回异步 Operation；请求超时后应查询 Operation，而不是用新意图重复变更。</p>
-<p>Cat、Disk 和 Operation 响应都包含不可变 <code>workspace_id</code>。<code>project</code> 字段只是稳定的 V1 兼容路由，不是资源归属真相源。</p>
-<pre><code>POST /v1/projects/acme-dev/cats
+<p>Cat、Disk 和 Operation 响应都包含不可变 <code>workspace_id</code>，它是唯一的资源归属键。</p>
+<pre><code>POST /v1/workspaces/ws_01J8QK.../cats
 Idempotency-Key: request-7f12
 
 {
@@ -44,18 +44,18 @@ Idempotency-Key: request-7f12
 }</code></pre>
 
 <h2 id="disks">磁盘与快照</h2>
-<pre><code>POST   /v1/projects/{project}/disks
-GET    /v1/projects/{project}/disks
-GET    /v1/projects/{project}/disks/{disk}
-DELETE /v1/projects/{project}/disks/{disk}
-POST   /v1/projects/{project}/disks/{disk}/actions/{verb}
-POST   /v1/projects/{project}/disks/{disk}/snapshots
-GET    /v1/projects/{project}/disks/{disk}/snapshots</code></pre>
+<pre><code>POST   /v1/workspaces/{workspace_id}/disks
+GET    /v1/workspaces/{workspace_id}/disks
+GET    /v1/workspaces/{workspace_id}/disks/{disk}
+DELETE /v1/workspaces/{workspace_id}/disks/{disk}
+POST   /v1/workspaces/{workspace_id}/disks/{disk}/actions/{verb}
+POST   /v1/workspaces/{workspace_id}/disks/{disk}/snapshots
+GET    /v1/workspaces/{workspace_id}/disks/{disk}/snapshots</code></pre>
 <p>Disk Action Verb 为 <code>mount</code>、<code>unmount</code> 与 <code>resize</code>。Mount Body 指定 Cat 与 Guest 路径。服务会强制执行 RWO，并拒绝过期或冲突的 Attachment 状态。</p>
 
 <h2 id="endpoints">Endpoint</h2>
-<pre><code>POST /v1/projects/{project}/cats/{cat}/endpoints
-GET  /v1/projects/{project}/cats/{cat}/endpoints</code></pre>
+<pre><code>POST /v1/workspaces/{workspace_id}/cats/{cat}/endpoints
+GET  /v1/workspaces/{workspace_id}/cats/{cat}/endpoints</code></pre>
 <pre><code>{
   "name": "web",
   "target_port": 3000,
@@ -64,7 +64,7 @@ GET  /v1/projects/{project}/cats/{cat}/endpoints</code></pre>
 }</code></pre>
 
 <h2 id="usage-billing">用量与账单</h2>
-<pre><code>GET /v1/projects/{project}/billing/usage
+<pre><code>GET /v1/workspaces/{workspace_id}/billing/usage
     ?from_ms=&lt;包含的-unix-毫秒&gt;
     &amp;to_ms=&lt;不包含的-unix-毫秒&gt;
     [&amp;cat=&lt;活跃-cat-名称&gt; | &amp;cat_id=&lt;不可变-cat-id&gt;]
@@ -72,17 +72,17 @@ GET  /v1/projects/{project}/cats/{cat}/endpoints</code></pre>
     [&amp;detail=true]</code></pre>
 <p>开放账期的响应是 <code>provisional</code> 预估，包含范围总额、按 Meter 汇总、按 Cat 汇总、不可变 Rate Card ID 与当前最新可见 Interval End。Cat 删除后仍可通过 <code>cat_id</code> 查询。<code>bucket_ms</code> 返回服务端时间桶，用于曲线和有界时段详单；不得小于 60 秒，且最多产生 512 个时间桶。<code>detail=true</code> 返回原始 Ledger Interval，应只用于受控对账查询，避免浏览器直接查询很长范围。</p>
 <p>当前 Rate Card 的 CPU 单价为 <code>$0.07 / CPU-hour</code>，内存为 <code>$0.045 / GiB-hour</code>。十进制 Quantity 与纳美元金额使用 JSON String，防止客户端丢失整数精度。范围总额在聚合后只计价一次；时间桶金额只用于展示预估，不是最终账单。</p>
-<pre><code>GET  /v1/projects/{project}/billing/balance
-POST /v1/projects/{project}/billing/checkout
+<pre><code>GET  /v1/workspaces/{workspace_id}/billing/balance
+POST /v1/workspaces/{workspace_id}/billing/checkout
 Idempotency-Key: &lt;唯一键&gt;
 {"amount_cents": 1000}</code></pre>
 <p>新用户只在自己的 Personal Billing Account 获得一次性、不续期的 <code>$10</code> 注册赠金；Organization Account、额外 Workspace 和邀请不会产生赠金。余额响应使用 append-only 赠金与充值总额减去全部准实时暂估用量。Checkout 只接受官网公布的固定充值档位，并返回 Stripe 托管支付地址。仅从 Checkout 返回不会入账；Cats 只在收到签名正确且状态为 paid 的 Stripe Webhook 后增加余额。</p>
 <p>可用额度耗尽时，付费计算 Admission 返回 HTTP <code>402</code> 和 <code>payment_required</code> Code；停止、休眠和删除资源仍然可用。</p>
 
 <h2 id="operations">Operation</h2>
-<pre><code>GET /v1/projects/{project}/operations
+<pre><code>GET /v1/workspaces/{workspace_id}/operations
 GET /v1/operations/{operation}</code></pre>
-<p>Operation 包含不可变 <code>workspace_id</code> Owner、兼容 Project 路由、类型、目标 Resource ID/Generation、阶段、时间戳与可选结构化错误。即使单个 Operation URL 没有 Project 分段，访问仍按 Workspace 限制。</p>
+<p>Operation 包含不可变 <code>workspace_id</code> Owner、类型、目标 Resource ID/Generation、阶段、时间戳与可选结构化错误。即使单个 Operation URL 没有 Workspace 分段，访问仍按 Workspace 限制。</p>
 
 <h2 id="errors">错误</h2>
 <pre><code>{

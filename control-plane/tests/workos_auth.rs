@@ -63,8 +63,8 @@ async fn authenticate(State(stub): State<WorkOsStub>, Json(body): Json<Value>) -
     };
     let (organization_id, permissions, email, user_id) = match code {
         "user-code" => (
-            Some("org_project"),
-            vec!["cats:project:write"],
+            Some("org_default"),
+            vec!["cats:workspace:write"],
             "user@example.com",
             "user_user-code",
         ),
@@ -89,7 +89,7 @@ async fn authenticate(State(stub): State<WorkOsStub>, Json(body): Json<Value>) -
         ),
         "admin-user-refreshed" => (
             body["organization_id"].as_str(),
-            vec!["cats:project:write"],
+            vec!["cats:workspace:write"],
             "admin-user@example.com",
             "user_admin-user-code",
         ),
@@ -101,13 +101,13 @@ async fn authenticate(State(stub): State<WorkOsStub>, Json(body): Json<Value>) -
         ),
         "user-refreshed" => (
             body["organization_id"].as_str(),
-            vec!["cats:project:write"],
+            vec!["cats:workspace:write"],
             "user@example.com",
             "user_user-code",
         ),
         "refreshed" => (
-            body["organization_id"].as_str().or(Some("org_project")),
-            vec!["cats:project:write"],
+            body["organization_id"].as_str().or(Some("org_default")),
+            vec!["cats:workspace:write"],
             "user@example.com",
             "user_refresh",
         ),
@@ -204,7 +204,7 @@ async fn list_memberships(
         vec![membership(
             "om_admin_user",
             user_id,
-            "org_project",
+            "org_default",
             "Default Workspace",
             "member",
         )]
@@ -213,7 +213,7 @@ async fn list_memberships(
             membership(
                 "om_1",
                 user_id,
-                "org_project",
+                "org_default",
                 "Default Workspace",
                 "member",
             ),
@@ -240,12 +240,12 @@ async fn list_memberships(
         data.retain(|item| item["organization_id"] == *expected_organization_id);
     }
     if !query.contains_key("user_id")
-        && query.get("organization_id").map(String::as_str) == Some("org_project")
+        && query.get("organization_id").map(String::as_str) == Some("org_default")
     {
         data.push(membership(
             "om_target",
             "user_target",
-            "org_project",
+            "org_default",
             "Default Workspace",
             "member",
         ));
@@ -348,7 +348,7 @@ async fn get_membership(Path(id): Path<String>) -> Json<Value> {
         "object": "organization_membership",
         "id": id,
         "user_id": user_id,
-        "organization_id": "org_project",
+        "organization_id": "org_default",
         "status": "active",
         "directory_managed": false,
         "organization_name": "Default Workspace",
@@ -440,7 +440,7 @@ async fn get_user(Path(id): Path<String>) -> Json<Value> {
 
 struct Ctx {
     _dir: tempfile::TempDir,
-    _cp: Handle,
+    cp: Handle,
     base: String,
     http: reqwest::Client,
     exchanges: Arc<AtomicUsize>,
@@ -509,9 +509,8 @@ impl Ctx {
             issuer_url: issuer.clone(),
             redirect_uri: "http://127.0.0.1:7300/auth/callback".into(),
             cookie_password: COOKIE_PASSWORD.into(),
-            project_organizations: BTreeMap::from([
-                ("default".into(), "org_project".into()),
-                ("sibling".into(), "org_project".into()),
+            account_organizations: BTreeMap::from([
+                ("default".into(), "org_default".into()),
                 ("second".into(), "org_second".into()),
             ]),
             admin_organization_id: "org_admin".into(),
@@ -543,9 +542,21 @@ impl Ctx {
         .await
         .unwrap();
         let base = cp.base_url();
+        // One Account with two Workspaces plus a second Account keeps the
+        // cross-Account and cross-Workspace authorization cases covered.
+        let default_account = cp
+            .state
+            .store
+            .account_for_organization("org_default")
+            .unwrap()
+            .unwrap();
+        cp.state
+            .store
+            .create_workspace(&default_account.id, "sibling", "Sibling")
+            .unwrap();
         Self {
             _dir: dir,
-            _cp: cp,
+            cp,
             base,
             http: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -559,6 +570,27 @@ impl Ctx {
 
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
+    }
+
+    /// Resolve an `account/workspace` locator to the immutable ID the resource
+    /// API routes on.
+    fn workspace_id(&self, locator: &str) -> String {
+        self.cp
+            .state
+            .store
+            .list_all_workspace_views()
+            .unwrap()
+            .into_iter()
+            .find(|workspace| workspace.locator == locator)
+            .unwrap_or_else(|| panic!("no workspace {locator}"))
+            .id
+    }
+
+    fn cats_url(&self, locator: &str) -> String {
+        self.url(&format!(
+            "/v1/workspaces/{}/cats",
+            self.workspace_id(locator)
+        ))
     }
 
     async fn begin_login(&self, site: &str) -> (String, String) {
@@ -691,7 +723,7 @@ async fn workos_user_and_admin_sessions_enforce_their_scopes() {
         .unwrap()
         .starts_with("http://127.0.0.1:"));
     assert!(public_config.get("token_login_enabled").is_none());
-    assert!(public_config.get("projects").is_none());
+    assert!(public_config.get("workspaces").is_none());
     assert!(!public_config.to_string().contains("sk_test_secret"));
 
     let user_cookie = ctx.login("user", "user-code").await;
@@ -706,25 +738,28 @@ async fn workos_user_and_admin_sessions_enforce_their_scopes() {
         .await
         .unwrap();
     assert_eq!(user_session["authenticated"], true);
-    assert_eq!(user_session["project"], "default");
+    assert_eq!(
+        user_session["active_workspace_id"],
+        ctx.workspace_id("default/default")
+    );
     assert_eq!(user_session["user"]["email"], "user@example.com");
 
-    let own_project = ctx
+    let own_workspace = ctx
         .http
-        .get(ctx.url("/v1/projects/default/cats"))
+        .get(ctx.cats_url("default/default"))
         .header("Cookie", &user_cookie)
         .send()
         .await
         .unwrap();
-    assert_eq!(own_project.status(), StatusCode::OK);
-    let other_project = ctx
+    assert_eq!(own_workspace.status(), StatusCode::OK);
+    let other_account = ctx
         .http
-        .get(ctx.url("/v1/projects/other/cats"))
+        .get(ctx.cats_url("second/default"))
         .header("Cookie", &user_cookie)
         .send()
         .await
         .unwrap();
-    assert_eq!(other_project.status(), StatusCode::FORBIDDEN);
+    assert_eq!(other_account.status(), StatusCode::FORBIDDEN);
     let user_cannot_admin = ctx
         .http
         .get(ctx.url("/v1/admin/monitoring"))
@@ -743,21 +778,21 @@ async fn workos_user_and_admin_sessions_enforce_their_scopes() {
         .await
         .unwrap();
     assert_eq!(fleet.status(), StatusCode::OK);
-    let admin_can_read_project = ctx
+    let admin_can_read_any_workspace = ctx
         .http
-        .get(ctx.url("/v1/projects/default/cats"))
+        .get(ctx.cats_url("default/default"))
         .header("Cookie", &admin_cookie)
         .send()
         .await
         .unwrap();
-    assert_eq!(admin_can_read_project.status(), StatusCode::OK);
+    assert_eq!(admin_can_read_any_workspace.status(), StatusCode::OK);
     assert_eq!(ctx.exchanges.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
 async fn cli_jwt_lists_and_enforces_multiple_workspaces() {
     let ctx = Ctx::new().await;
-    let default_token = ctx.cli_token("org_project");
+    let default_token = ctx.cli_token("org_default");
 
     let me = ctx
         .http
@@ -770,22 +805,30 @@ async fn cli_jwt_lists_and_enforces_multiple_workspaces() {
     let me: Value = me.json().await.unwrap();
     assert_eq!(me["user"]["id"], "user_cli");
     assert_eq!(me["workspaces"].as_array().unwrap().len(), 3);
-    assert_eq!(me["workspaces"][0]["slug"], "default");
-    assert_eq!(me["workspaces"][1]["slug"], "sibling");
-    assert_eq!(me["workspaces"][2]["slug"], "second");
+    assert_eq!(me["workspaces"][0]["locator"], "default/default");
+    assert_eq!(me["workspaces"][1]["locator"], "default/sibling");
+    assert_eq!(me["workspaces"][2]["locator"], "second/default");
     assert!(!me.to_string().contains("org_unmapped"));
 
     let own = ctx
         .http
-        .get(ctx.url("/v1/projects/default/cats"))
+        .get(ctx.cats_url("default/default"))
         .bearer_auth(&default_token)
         .send()
         .await
         .unwrap();
     assert_eq!(own.status(), StatusCode::OK);
+    let sibling_in_same_account = ctx
+        .http
+        .get(ctx.cats_url("default/sibling"))
+        .bearer_auth(&default_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sibling_in_same_account.status(), StatusCode::OK);
     let other = ctx
         .http
-        .get(ctx.url("/v1/projects/second/cats"))
+        .get(ctx.cats_url("second/default"))
         .bearer_auth(&default_token)
         .send()
         .await
@@ -795,7 +838,7 @@ async fn cli_jwt_lists_and_enforces_multiple_workspaces() {
     let second_token = ctx.cli_token("org_second");
     let selected = ctx
         .http
-        .get(ctx.url("/v1/projects/second/cats"))
+        .get(ctx.cats_url("second/default"))
         .bearer_auth(&second_token)
         .send()
         .await
@@ -803,7 +846,7 @@ async fn cli_jwt_lists_and_enforces_multiple_workspaces() {
     assert_eq!(selected.status(), StatusCode::OK);
     let wrong = ctx
         .http
-        .get(ctx.url("/v1/projects/default/cats"))
+        .get(ctx.cats_url("default/default"))
         .bearer_auth(&second_token)
         .send()
         .await
@@ -812,17 +855,17 @@ async fn cli_jwt_lists_and_enforces_multiple_workspaces() {
 
     let tampered = ctx
         .http
-        .get(ctx.url("/v1/projects/default/cats"))
+        .get(ctx.cats_url("default/default"))
         .bearer_auth(format!("{default_token}x"))
         .send()
         .await
         .unwrap();
     assert_eq!(tampered.status(), StatusCode::UNAUTHORIZED);
 
-    let wrong_issuer = ctx.cli_token_with_issuer("org_project", "https://api.workos.com");
+    let wrong_issuer = ctx.cli_token_with_issuer("org_default", "https://api.workos.com");
     let rejected = ctx
         .http
-        .get(ctx.url("/v1/projects/default/cats"))
+        .get(ctx.cats_url("default/default"))
         .bearer_auth(wrong_issuer)
         .send()
         .await
@@ -835,7 +878,10 @@ async fn workos_callback_rejects_tampered_state_before_code_exchange() {
     let ctx = Ctx::new().await;
     let login = ctx
         .http
-        .get(ctx.url("/auth/login?site=user&project=default"))
+        .get(ctx.url(&format!(
+            "/auth/login?site=user&workspace={}",
+            ctx.workspace_id("default/default")
+        )))
         .send()
         .await
         .unwrap();
@@ -911,28 +957,41 @@ async fn organizationless_workos_user_receives_an_isolated_personal_account() {
         .await
         .unwrap();
     assert_eq!(session["authenticated"], true);
-    assert_eq!(session["project"], "personal-user_new-user-code");
+    let personal_workspace_id = session["active_workspace_id"].as_str().unwrap().to_string();
+    let active = session["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|workspace| workspace["id"] == personal_workspace_id.as_str())
+        .expect("the active workspace is listed");
+    assert_eq!(active["kind"], "personal");
+    assert_eq!(active["slug"], "default");
+    assert!(active["is_default"].as_bool().unwrap());
 
-    let own_project = ctx
+    let own_workspace = ctx
         .http
-        .get(ctx.url("/v1/projects/personal-user_new-user-code/cats"))
+        .get(ctx.url(&format!(
+            "/v1/workspaces/{personal_workspace_id}/cats"
+        )))
         .header("Cookie", &user_cookie)
         .send()
         .await
         .unwrap();
-    assert_eq!(own_project.status(), StatusCode::OK);
-    let shared_project = ctx
+    assert_eq!(own_workspace.status(), StatusCode::OK);
+    let shared_workspace = ctx
         .http
-        .get(ctx.url("/v1/projects/default/cats"))
+        .get(ctx.cats_url("default/default"))
         .header("Cookie", &user_cookie)
         .send()
         .await
         .unwrap();
-    assert_eq!(shared_project.status(), StatusCode::FORBIDDEN);
+    assert_eq!(shared_workspace.status(), StatusCode::FORBIDDEN);
 
     let personal_login = ctx
         .http
-        .get(ctx.url("/auth/login?site=user&project=personal-user_new-user-code"))
+        .get(ctx.url(&format!(
+            "/auth/login?site=user&workspace={personal_workspace_id}"
+        )))
         .send()
         .await
         .unwrap();
@@ -988,7 +1047,10 @@ async fn user_login_switches_from_admin_org_to_the_only_mapped_workspace() {
         .await
         .unwrap();
     assert_eq!(session["authenticated"], true);
-    assert_eq!(session["project"], "default");
+    assert_eq!(
+        session["active_workspace_id"],
+        ctx.workspace_id("default/default")
+    );
     assert_eq!(session["user"]["id"], "user_admin-user-code");
     assert_eq!(ctx.exchanges.load(Ordering::SeqCst), 2);
 }
@@ -1041,9 +1103,9 @@ async fn expired_workos_session_is_refreshed_and_cookie_is_rotated() {
     let ctx = Ctx::new().await;
     let expired_claims = json!({
         "sid": "session_expired",
-        "org_id": "org_project",
+        "org_id": "org_default",
         "role": "member",
-        "permissions": ["cats:project:write"],
+        "permissions": ["cats:workspace:write"],
         "exp": cats_control_plane::store::now_unix() - 1,
     });
     let expired_token = format!(
@@ -1086,7 +1148,10 @@ async fn expired_workos_session_is_refreshed_and_cookie_is_rotated() {
         .any(|value| value.starts_with("cats_user_session=")));
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["authenticated"], true);
-    assert_eq!(body["project"], "default");
+    assert_eq!(
+        body["active_workspace_id"],
+        ctx.workspace_id("default/default")
+    );
     assert_eq!(ctx.exchanges.load(Ordering::SeqCst), 1);
 }
 
@@ -1096,7 +1161,7 @@ async fn organization_manager_invites_and_manages_members_through_workos() {
     let denied = ctx
         .http
         .post(ctx.url("/v1/accounts/unknown/invitations"))
-        .bearer_auth(ctx.cli_token("org_project"))
+        .bearer_auth(ctx.cli_token("org_default"))
         .json(&json!({"email": "new@example.com", "role_slug": "member"}))
         .send()
         .await
@@ -1106,7 +1171,7 @@ async fn organization_manager_invites_and_manages_members_through_workos() {
         StatusCode::NOT_FOUND | StatusCode::FORBIDDEN
     ));
 
-    let manager_token = ctx.cli_token_with_permissions("org_project", &["cats:members:manage"]);
+    let manager_token = ctx.cli_token_with_permissions("org_default", &["cats:members:manage"]);
     let me: Value = ctx
         .http
         .get(ctx.url("/v1/me"))
@@ -1121,7 +1186,7 @@ async fn organization_manager_invites_and_manages_members_through_workos() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|account| account["organization_id"] == "org_project")
+        .find(|account| account["organization_id"] == "org_default")
         .unwrap()["id"]
         .as_str()
         .unwrap()
@@ -1130,7 +1195,7 @@ async fn organization_manager_invites_and_manages_members_through_workos() {
     let no_permission = ctx
         .http
         .post(ctx.url(&format!("/v1/accounts/{account_id}/invitations")))
-        .bearer_auth(ctx.cli_token("org_project"))
+        .bearer_auth(ctx.cli_token("org_default"))
         .header("Idempotency-Key", "invite-without-permission")
         .json(&json!({"email": "new@example.com", "role_slug": "member"}))
         .send()
@@ -1151,7 +1216,6 @@ async fn organization_manager_invites_and_manages_members_through_workos() {
         .unwrap();
     assert_eq!(workspace["locator"], "default/dev");
     let workspace_id = workspace["id"].as_str().unwrap();
-    let legacy_project = workspace["legacy_project"].as_str().unwrap().to_string();
     let renamed: Value = ctx
         .http
         .patch(ctx.url(&format!("/v1/workspaces/{workspace_id}")))
@@ -1164,7 +1228,7 @@ async fn organization_manager_invites_and_manages_members_through_workos() {
         .await
         .unwrap();
     assert_eq!(renamed["locator"], "default/engineering");
-    assert_eq!(renamed["legacy_project"], legacy_project);
+    assert_eq!(renamed["id"], workspace_id);
 
     let created: Value = ctx
         .http
@@ -1276,19 +1340,19 @@ async fn web_switches_workspaces_locally_and_serializes_cross_account_refresh() 
         .json()
         .await
         .unwrap();
-    let workspace_id = |project: &str| {
+    let workspace_id = |locator: &str| {
         session["workspaces"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|workspace| workspace["legacy_project"] == project)
+            .find(|workspace| workspace["locator"] == locator)
             .unwrap()["id"]
             .as_str()
             .unwrap()
             .to_string()
     };
-    let sibling_id = workspace_id("sibling");
-    let second_id = workspace_id("second");
+    let sibling_id = workspace_id("default/sibling");
+    let second_id = workspace_id("second/default");
 
     let same_account = ctx
         .http
@@ -1307,7 +1371,7 @@ async fn web_switches_workspaces_locally_and_serializes_cross_account_refresh() 
         .filter_map(|value| value.to_str().ok())
         .any(|value| value.starts_with("cats_user_session=")));
     let body: Value = same_account.json().await.unwrap();
-    assert_eq!(body["project"], "sibling");
+    assert_eq!(body["active_workspace_id"], sibling_id);
 
     let first = ctx
         .http
@@ -1318,7 +1382,7 @@ async fn web_switches_workspaces_locally_and_serializes_cross_account_refresh() 
         .http
         .post(ctx.url("/auth/workspace"))
         .header("Cookie", &user_cookie)
-        .json(&json!({"workspace_id": workspace_id("second")}));
+        .json(&json!({"workspace_id": second_id.clone()}));
     let (first, second) = tokio::join!(first.send(), second.send());
     let first = first.unwrap();
     let second = second.unwrap();

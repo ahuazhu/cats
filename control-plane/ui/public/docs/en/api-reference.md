@@ -1,6 +1,6 @@
 ## Conventions
 
-The external API is JSON over HTTP. User resources are scoped by the compatible project segment in `/v1/projects/{project}/…`; its value is a Workspace's stable legacy route. A verified WorkOS identity may access Workspaces owned by its active Account membership, and changing a URL cannot create that membership.
+The external API is JSON over HTTP. User resources are scoped by the immutable workspace ID in `/v1/workspaces/{workspace_id}/…`; a mutable slug never appears in a resource route. A verified WorkOS identity may access Workspaces owned by its active Account membership, and changing a URL cannot create that membership.
 
     Authorization: Bearer <short-lived-workos-access-token>
     Accept: application/json
@@ -8,7 +8,7 @@ The external API is JSON over HTTP. User resources are scoped by the compatible 
     Idempotency-Key: <unique-request-id>   # mutations
     If-Match: "<generation>"                # guarded state changes
 
-`cats login` obtains and refreshes the user token through WorkOS Device Authorization without writing it to the normal config file. Other user clients must use an approved WorkOS flow and the same verified JWT contract; static project tokens are not accepted. Browser consoles use their HttpOnly WorkOS session instead of exposing a Bearer token to JavaScript. Service and administrator machine identities have separate scopes.
+`cats login` obtains and refreshes the user token through WorkOS Device Authorization without writing it to the normal config file. Other user clients must use an approved WorkOS flow and the same verified JWT contract; static user tokens are not accepted. Browser consoles use their HttpOnly WorkOS session instead of exposing a Bearer token to JavaScript. Service and administrator machine identities have separate scopes.
 
 ## Identity and Workspaces
 
@@ -23,25 +23,25 @@ The external API is JSON over HTTP. User resources are scoped by the compatible 
     PATCH|DELETE /v1/accounts/{account}/members/{membership}
     POST /v1/auth/logout    # revoke the CLI WorkOS session
 
-Workspace enumeration returns Personal and Organization Accounts from active WorkOS Organization memberships. Creating or renaming a Workspace requires account-management permission; a rename does not change its immutable ID or legacy Project route. Invitation/member mutations require `cats:members:manage`, are rejected for Personal Accounts, and are performed through WorkOS. Creating an invitation also requires `Idempotency-Key`; Cats forwards it to WorkOS so a network retry returns the same invitation. User access-token signature, issuer, client ID, expiry, subject, Organization scope, active membership, Account ID, and Workspace ownership are checked before authorization.
+Workspace enumeration returns Personal and Organization Accounts from active WorkOS Organization memberships. Creating or renaming a Workspace requires account-management permission; a rename does not change its immutable ID, so every resource route keeps resolving. Invitation/member mutations require `cats:members:manage`, are rejected for Personal Accounts, and are performed through WorkOS. Creating an invitation also requires `Idempotency-Key`; Cats forwards it to WorkOS so a network retry returns the same invitation. User access-token signature, issuer, client ID, expiry, subject, Organization scope, active membership, Account ID, and Workspace ownership are checked before authorization.
 
 ## Cats
 
-    POST   /v1/projects/{project}/cats
-    GET    /v1/projects/{project}/cats
-    GET    /v1/projects/{project}/cats/{cat}
-    DELETE /v1/projects/{project}/cats/{cat}
-    POST   /v1/projects/{project}/cats/{cat}/actions/{verb}
-    POST   /v1/projects/{project}/cats/{cat}/exec
-    GET    /v1/projects/{project}/cats/{cat}/work
-    GET    /v1/projects/{project}/cats/{cat}/auto-suspend
-    PUT    /v1/projects/{project}/cats/{cat}/auto-suspend
+    POST   /v1/workspaces/{workspace_id}/cats
+    GET    /v1/workspaces/{workspace_id}/cats
+    GET    /v1/workspaces/{workspace_id}/cats/{cat}
+    DELETE /v1/workspaces/{workspace_id}/cats/{cat}
+    POST   /v1/workspaces/{workspace_id}/cats/{cat}/actions/{verb}
+    POST   /v1/workspaces/{workspace_id}/cats/{cat}/exec
+    GET    /v1/workspaces/{workspace_id}/cats/{cat}/work
+    GET    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
+    PUT    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
 
 Lifecycle verbs are `start`, `stop`, `suspend`, `resume`, and `warm`. `auto_suspend` defaults to `true` when omitted from create. Cat create/lifecycle/delete returns an asynchronous Operation response; poll the Operation URL instead of repeating a timed-out mutation with a new intent.
 
-Cat, Disk, and Operation responses include the immutable `workspace_id`. The `project` field is the stable V1 compatibility route and is not the ownership authority.
+Cat, Disk, and Operation responses include the immutable `workspace_id`, which is the only ownership key.
 
-    POST /v1/projects/acme-dev/cats
+    POST /v1/workspaces/ws_01J8QK.../cats
     Idempotency-Key: request-7f12
 
     {
@@ -54,20 +54,20 @@ Cat, Disk, and Operation responses include the immutable `workspace_id`. The `pr
 
 ## Disks and snapshots
 
-    POST   /v1/projects/{project}/disks
-    GET    /v1/projects/{project}/disks
-    GET    /v1/projects/{project}/disks/{disk}
-    DELETE /v1/projects/{project}/disks/{disk}
-    POST   /v1/projects/{project}/disks/{disk}/actions/{verb}
-    POST   /v1/projects/{project}/disks/{disk}/snapshots
-    GET    /v1/projects/{project}/disks/{disk}/snapshots
+    POST   /v1/workspaces/{workspace_id}/disks
+    GET    /v1/workspaces/{workspace_id}/disks
+    GET    /v1/workspaces/{workspace_id}/disks/{disk}
+    DELETE /v1/workspaces/{workspace_id}/disks/{disk}
+    POST   /v1/workspaces/{workspace_id}/disks/{disk}/actions/{verb}
+    POST   /v1/workspaces/{workspace_id}/disks/{disk}/snapshots
+    GET    /v1/workspaces/{workspace_id}/disks/{disk}/snapshots
 
 Disk action verbs are `mount`, `unmount`, and `resize`. Mount bodies identify the Cat and Guest path. The service enforces RWO and rejects stale or conflicting attachment state.
 
 ## Endpoints
 
-    POST /v1/projects/{project}/cats/{cat}/endpoints
-    GET  /v1/projects/{project}/cats/{cat}/endpoints
+    POST /v1/workspaces/{workspace_id}/cats/{cat}/endpoints
+    GET  /v1/workspaces/{workspace_id}/cats/{cat}/endpoints
 
     {
       "name": "web",
@@ -78,7 +78,7 @@ Disk action verbs are `mount`, `unmount`, and `resize`. Mount bodies identify th
 
 ## Usage and billing
 
-    GET /v1/projects/{project}/billing/usage
+    GET /v1/workspaces/{workspace_id}/billing/usage
         ?from_ms=<inclusive-unix-milliseconds>
         &to_ms=<exclusive-unix-milliseconds>
         [&cat=<active-cat-name> | &cat_id=<immutable-cat-id>]
@@ -89,8 +89,8 @@ The response is a `provisional` estimate for the open period. It includes range 
 
 CPU is rated at `$0.07 / CPU-hour` and memory at `$0.045 / GiB-hour` by the current rate card. Decimal quantities and nanodollar amounts are JSON strings so clients do not lose integer precision. The range total is rated once after aggregation; bucket amounts are display estimates and are not a finalized invoice.
 
-    GET  /v1/projects/{project}/billing/balance
-    POST /v1/projects/{project}/billing/checkout
+    GET  /v1/workspaces/{workspace_id}/billing/balance
+    POST /v1/workspaces/{workspace_id}/billing/checkout
     Idempotency-Key: <unique-key>
     {"amount_cents": 1000}
 
@@ -100,10 +100,10 @@ When available credit is exhausted, paid compute admission returns HTTP `402` wi
 
 ## Operations
 
-    GET /v1/projects/{project}/operations
+    GET /v1/workspaces/{workspace_id}/operations
     GET /v1/operations/{operation}
 
-An Operation contains immutable `workspace_id` ownership, the compatible project route, kind, target resource ID/generation, phase, timestamps, and an optional structured error. Access is still Workspace-scoped even though the single-Operation URL does not contain the project segment.
+An Operation contains immutable `workspace_id` ownership, kind, target resource ID/generation, phase, timestamps, and an optional structured error. Access is still Workspace-scoped even though the single-Operation URL does not contain the workspace segment.
 
 ## Errors
 

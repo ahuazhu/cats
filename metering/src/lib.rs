@@ -44,7 +44,7 @@ impl From<rusqlite::Error> for MeteringError {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageAttribution {
     pub billing_account_id: String,
-    pub project_id: String,
+    pub workspace_id: String,
     pub resource_type: String,
     pub resource_id: String,
     pub attributed_cat_id: Option<String>,
@@ -89,7 +89,7 @@ pub struct CatAggregate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageQuery {
     pub billing_account_id: String,
-    pub project_id: Option<String>,
+    pub workspace_id: Option<String>,
     pub attributed_cat_id: Option<String>,
     pub interval_start_unix_ms: i64,
     pub interval_end_unix_ms: i64,
@@ -131,7 +131,8 @@ pub trait UsageStore: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreditSummary {
     pub billing_account_id: String,
-    pub project_id: String,
+    /// Cats Account that owns this Billing Account. Workspaces never own funds.
+    pub account_id: String,
     pub currency: String,
     /// Signed USD nanodollars. Credits are positive; reversals are negative.
     pub credit_nanos: i128,
@@ -143,7 +144,7 @@ pub struct CreditSummary {
 pub struct CheckoutIntent {
     pub intent_id: String,
     pub billing_account_id: String,
-    pub project_id: String,
+    pub account_id: String,
     pub amount_cents: i64,
     pub currency: String,
     pub created_at_unix_ms: i64,
@@ -196,7 +197,7 @@ pub trait CreditStore: Send + Sync {
     fn ensure_account<'a>(
         &'a self,
         billing_account_id: &'a str,
-        project_id: &'a str,
+        account_id: &'a str,
         currency: &'a str,
         signup_credit_nanos: i128,
         created_at_unix_ms: i64,
@@ -456,7 +457,7 @@ impl SqliteUsageStore {
 
         if let Some(existing) = tx
             .query_row(
-                "SELECT payload_json, billing_account_id, project_id,
+                "SELECT payload_json, billing_account_id, workspace_id,
                         resource_type, resource_id, attributed_cat_id
                    FROM usage_checkpoints WHERE event_id=?1",
                 params![value.checkpoint.event_id],
@@ -465,7 +466,7 @@ impl SqliteUsageStore {
                         row.get::<_, String>(0)?,
                         UsageAttribution {
                             billing_account_id: row.get(1)?,
-                            project_id: row.get(2)?,
+                            workspace_id: row.get(2)?,
                             resource_type: row.get(3)?,
                             resource_id: row.get(4)?,
                             attributed_cat_id: row.get(5)?,
@@ -487,7 +488,7 @@ impl SqliteUsageStore {
 
         if let Some(existing_attribution) = tx
             .query_row(
-                "SELECT billing_account_id, project_id, resource_type,
+                "SELECT billing_account_id, workspace_id, resource_type,
                         resource_id, attributed_cat_id
                    FROM usage_checkpoints
                   WHERE source_id=?1 AND source_epoch=?2
@@ -496,7 +497,7 @@ impl SqliteUsageStore {
                 |row| {
                     Ok(UsageAttribution {
                         billing_account_id: row.get(0)?,
-                        project_id: row.get(1)?,
+                        workspace_id: row.get(1)?,
                         resource_type: row.get(2)?,
                         resource_id: row.get(3)?,
                         attributed_cat_id: row.get(4)?,
@@ -520,7 +521,7 @@ impl SqliteUsageStore {
         tx.execute(
             "INSERT INTO usage_checkpoints (
                 event_id, source_id, source_epoch, sequence, observed_at_ms,
-                metric, cumulative_quantity, billing_account_id, project_id,
+                metric, cumulative_quantity, billing_account_id, workspace_id,
                 resource_type, resource_id, attributed_cat_id, payload_json
              ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
@@ -532,7 +533,7 @@ impl SqliteUsageStore {
                 value.checkpoint.metric.slug(),
                 quantity,
                 value.attribution.billing_account_id,
-                value.attribution.project_id,
+                value.attribution.workspace_id,
                 value.attribution.resource_type,
                 value.attribution.resource_id,
                 value.attribution.attributed_cat_id,
@@ -562,7 +563,7 @@ impl SqliteUsageStore {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(
             "SELECT interval_start_ms, interval_end_ms, quantity,
-                    billing_account_id, project_id, resource_type, resource_id,
+                    billing_account_id, workspace_id, resource_type, resource_id,
                     attributed_cat_id, metric, source_id, source_epoch, end_sequence
                FROM usage_intervals
               WHERE billing_account_id=?1
@@ -582,9 +583,9 @@ impl SqliteUsageStore {
         for row in rows {
             let interval = row?;
             if query
-                .project_id
+                .workspace_id
                 .as_ref()
-                .is_some_and(|project| project != &interval.attribution.project_id)
+                .is_some_and(|workspace| workspace != &interval.attribution.workspace_id)
                 || query
                     .attributed_cat_id
                     .as_ref()
@@ -605,7 +606,7 @@ impl SqliteUsageStore {
     ) -> Result<Option<UsageAttribution>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT billing_account_id, project_id, resource_type,
+            "SELECT billing_account_id, workspace_id, resource_type,
                     resource_id, attributed_cat_id
                FROM usage_checkpoints
               WHERE source_id=?1 AND source_epoch=?2
@@ -614,7 +615,7 @@ impl SqliteUsageStore {
             |row| {
                 Ok(UsageAttribution {
                     billing_account_id: row.get(0)?,
-                    project_id: row.get(1)?,
+                    workspace_id: row.get(1)?,
                     resource_type: row.get(2)?,
                     resource_id: row.get(3)?,
                     attributed_cat_id: row.get(4)?,
@@ -653,7 +654,7 @@ impl CreditStore for SqliteUsageStore {
     fn ensure_account<'a>(
         &'a self,
         billing_account_id: &'a str,
-        project_id: &'a str,
+        account_id: &'a str,
         currency: &'a str,
         signup_credit_nanos: i128,
         created_at_unix_ms: i64,
@@ -661,7 +662,7 @@ impl CreditStore for SqliteUsageStore {
         Box::pin(async move {
             validate_credit_account(
                 billing_account_id,
-                project_id,
+                account_id,
                 currency,
                 signup_credit_nanos,
                 created_at_unix_ms,
@@ -670,12 +671,12 @@ impl CreditStore for SqliteUsageStore {
             let transaction = conn.transaction()?;
             transaction.execute(
                 "INSERT OR IGNORE INTO billing_accounts (
-                    billing_account_id, project_id, currency, created_at_ms
+                    billing_account_id, account_id, currency, created_at_ms
                  ) VALUES (?1, ?2, ?3, ?4)",
-                params![billing_account_id, project_id, currency, created_at_unix_ms],
+                params![billing_account_id, account_id, currency, created_at_unix_ms],
             )?;
             let summary = sqlite_credit_summary(&transaction, billing_account_id)?;
-            if summary.project_id != project_id || summary.currency != currency {
+            if summary.account_id != account_id || summary.currency != currency {
                 return Err(MeteringError::Conflict(format!(
                     "billing account {billing_account_id} identity changed"
                 )));
@@ -719,13 +720,13 @@ impl CreditStore for SqliteUsageStore {
             let conn = self.conn.lock().unwrap();
             conn.execute(
                 "INSERT OR IGNORE INTO checkout_intents (
-                    intent_id, billing_account_id, project_id, amount_cents,
+                    intent_id, billing_account_id, account_id, amount_cents,
                     currency, created_at_ms, status
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')",
                 params![
                     intent.intent_id,
                     intent.billing_account_id,
-                    intent.project_id,
+                    intent.account_id,
                     intent.amount_cents,
                     intent.currency,
                     intent.created_at_unix_ms,
@@ -733,7 +734,7 @@ impl CreditStore for SqliteUsageStore {
             )?;
             let stored = sqlite_checkout_intent(&conn, &intent.intent_id)?;
             if stored.billing_account_id != intent.billing_account_id
-                || stored.project_id != intent.project_id
+                || stored.account_id != intent.account_id
                 || stored.amount_cents != intent.amount_cents
                 || stored.currency != intent.currency
             {
@@ -957,14 +958,14 @@ impl CreditStore for SqliteUsageStore {
 
 fn validate_credit_account(
     billing_account_id: &str,
-    project_id: &str,
+    account_id: &str,
     currency: &str,
     signup_credit_nanos: i128,
     created_at_unix_ms: i64,
 ) -> Result<()> {
-    if billing_account_id.is_empty() || project_id.is_empty() {
+    if billing_account_id.is_empty() || account_id.is_empty() {
         return Err(MeteringError::Invalid(
-            "billing account and project must not be empty".to_string(),
+            "billing account and account must not be empty".to_string(),
         ));
     }
     if currency != "USD" {
@@ -983,7 +984,7 @@ fn validate_credit_account(
 fn validate_checkout_intent(intent: &CheckoutIntent) -> Result<()> {
     if intent.intent_id.is_empty()
         || intent.billing_account_id.is_empty()
-        || intent.project_id.is_empty()
+        || intent.account_id.is_empty()
         || intent.amount_cents <= 0
         || intent.currency != "USD"
         || intent.created_at_unix_ms < 0
@@ -1051,9 +1052,9 @@ fn cents_to_nanos(amount_cents: i64) -> Result<i128> {
 }
 
 fn sqlite_credit_summary(conn: &Connection, billing_account_id: &str) -> Result<CreditSummary> {
-    let (project_id, currency, stripe_customer_id) = conn
+    let (account_id, currency, stripe_customer_id) = conn
         .query_row(
-            "SELECT project_id, currency, stripe_customer_id
+            "SELECT account_id, currency, stripe_customer_id
                FROM billing_accounts WHERE billing_account_id=?1",
             params![billing_account_id],
             |row| {
@@ -1082,7 +1083,7 @@ fn sqlite_credit_summary(conn: &Connection, billing_account_id: &str) -> Result<
     }
     Ok(CreditSummary {
         billing_account_id: billing_account_id.to_string(),
-        project_id,
+        account_id,
         currency,
         credit_nanos,
         stripe_customer_id,
@@ -1091,7 +1092,7 @@ fn sqlite_credit_summary(conn: &Connection, billing_account_id: &str) -> Result<
 
 fn sqlite_checkout_intent(conn: &Connection, intent_id: &str) -> Result<CheckoutIntent> {
     conn.query_row(
-        "SELECT intent_id, billing_account_id, project_id, amount_cents,
+        "SELECT intent_id, billing_account_id, account_id, amount_cents,
                 currency, created_at_ms, stripe_session_id, checkout_url
            FROM checkout_intents WHERE intent_id=?1",
         params![intent_id],
@@ -1099,7 +1100,7 @@ fn sqlite_checkout_intent(conn: &Connection, intent_id: &str) -> Result<Checkout
             Ok(CheckoutIntent {
                 intent_id: row.get(0)?,
                 billing_account_id: row.get(1)?,
-                project_id: row.get(2)?,
+                account_id: row.get(2)?,
                 amount_cents: row.get(3)?,
                 currency: row.get(4)?,
                 created_at_unix_ms: row.get(5)?,
@@ -1156,7 +1157,7 @@ fn adjacent_checkpoint(
     };
     let sql = format!(
         "SELECT event_id, source_id, source_epoch, sequence, observed_at_ms,
-                metric, cumulative_quantity, billing_account_id, project_id,
+                metric, cumulative_quantity, billing_account_id, workspace_id,
                 resource_type, resource_id, attributed_cat_id
            FROM usage_checkpoints
           WHERE source_id=?1 AND source_epoch=?2 AND metric=?3
@@ -1191,7 +1192,7 @@ pub fn validate_checkpoint(value: &AttributedCheckpoint) -> Result<()> {
             "billing_account_id",
             value.attribution.billing_account_id.as_str(),
         ),
-        ("project_id", value.attribution.project_id.as_str()),
+        ("workspace_id", value.attribution.workspace_id.as_str()),
         ("resource_type", value.attribution.resource_type.as_str()),
         ("resource_id", value.attribution.resource_id.as_str()),
     ] {
@@ -1259,9 +1260,9 @@ pub fn usage_view_from_intervals(
     for mut interval in intervals {
         if interval.attribution.billing_account_id != query.billing_account_id
             || query
-                .project_id
+                .workspace_id
                 .as_ref()
-                .is_some_and(|project| project != &interval.attribution.project_id)
+                .is_some_and(|workspace| workspace != &interval.attribution.workspace_id)
             || query
                 .attributed_cat_id
                 .as_ref()
@@ -1407,7 +1408,7 @@ fn insert_interval(
         "INSERT OR REPLACE INTO usage_intervals (
             end_event_id, start_event_id, source_id, source_epoch, end_sequence,
             interval_start_ms, interval_end_ms, metric, quantity,
-            billing_account_id, project_id, resource_type, resource_id,
+            billing_account_id, workspace_id, resource_type, resource_id,
             attributed_cat_id
          ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
         params![
@@ -1421,7 +1422,7 @@ fn insert_interval(
             end.metric.slug(),
             quantity.to_string(),
             end.attribution.billing_account_id,
-            end.attribution.project_id,
+            end.attribution.workspace_id,
             end.attribution.resource_type,
             end.attribution.resource_id,
             end.attribution.attributed_cat_id,
@@ -1442,7 +1443,7 @@ fn row_to_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCheckpoi
         cumulative_quantity: row_u128(row, 6)?,
         attribution: UsageAttribution {
             billing_account_id: row.get(7)?,
-            project_id: row.get(8)?,
+            workspace_id: row.get(8)?,
             resource_type: row.get(9)?,
             resource_id: row.get(10)?,
             attributed_cat_id: row.get(11)?,
@@ -1458,7 +1459,7 @@ fn row_to_interval(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageInterval> {
         quantity,
         attribution: UsageAttribution {
             billing_account_id: row.get(3)?,
-            project_id: row.get(4)?,
+            workspace_id: row.get(4)?,
             resource_type: row.get(5)?,
             resource_id: row.get(6)?,
             attributed_cat_id: row.get(7)?,
@@ -1531,22 +1532,22 @@ ALTER TABLE usage_intervals RENAME TO usage_intervals_i64_v1;
         "
 INSERT INTO usage_checkpoints (
     event_id, source_id, source_epoch, sequence, observed_at_ms, metric,
-    cumulative_quantity, billing_account_id, project_id, resource_type,
+    cumulative_quantity, billing_account_id, workspace_id, resource_type,
     resource_id, attributed_cat_id, payload_json
 )
 SELECT event_id, source_id, source_epoch, sequence, observed_at_ms, metric,
-       CAST(cumulative_quantity AS TEXT), billing_account_id, project_id,
+       CAST(cumulative_quantity AS TEXT), billing_account_id, workspace_id,
        resource_type, resource_id, attributed_cat_id, payload_json
   FROM usage_checkpoints_i64_v1;
 INSERT INTO usage_intervals (
     end_event_id, start_event_id, source_id, source_epoch, end_sequence,
     interval_start_ms, interval_end_ms, metric, quantity,
-    billing_account_id, project_id, resource_type, resource_id,
+    billing_account_id, workspace_id, resource_type, resource_id,
     attributed_cat_id
 )
 SELECT end_event_id, start_event_id, source_id, source_epoch, end_sequence,
        interval_start_ms, interval_end_ms, metric, CAST(quantity AS TEXT),
-       billing_account_id, project_id, resource_type, resource_id,
+       billing_account_id, workspace_id, resource_type, resource_id,
        attributed_cat_id
   FROM usage_intervals_i64_v1;
 DROP TABLE usage_intervals_i64_v1;
@@ -1567,7 +1568,7 @@ CREATE TABLE IF NOT EXISTS usage_checkpoints (
     metric TEXT NOT NULL,
     cumulative_quantity TEXT NOT NULL,
     billing_account_id TEXT NOT NULL,
-    project_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
     resource_type TEXT NOT NULL,
     resource_id TEXT NOT NULL,
     attributed_cat_id TEXT,
@@ -1588,7 +1589,7 @@ CREATE TABLE IF NOT EXISTS usage_intervals (
     metric TEXT NOT NULL,
     quantity TEXT NOT NULL,
     billing_account_id TEXT NOT NULL,
-    project_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
     resource_type TEXT NOT NULL,
     resource_id TEXT NOT NULL,
     attributed_cat_id TEXT,
@@ -1602,7 +1603,7 @@ ON usage_intervals(attributed_cat_id, interval_start_ms, interval_end_ms);
 
 CREATE TABLE IF NOT EXISTS billing_accounts (
     billing_account_id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
     currency TEXT NOT NULL CHECK (currency = 'USD'),
     stripe_customer_id TEXT,
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0)
@@ -1632,7 +1633,7 @@ END;
 CREATE TABLE IF NOT EXISTS checkout_intents (
     intent_id TEXT PRIMARY KEY,
     billing_account_id TEXT NOT NULL REFERENCES billing_accounts(billing_account_id),
-    project_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
     amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
     currency TEXT NOT NULL CHECK (currency = 'USD'),
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
@@ -1680,7 +1681,7 @@ mod tests {
             checkpoint,
             attribution: UsageAttribution {
                 billing_account_id: "ba-org-a".to_string(),
-                project_id: "project-a".to_string(),
+                workspace_id: "workspace-a".to_string(),
                 resource_type: "cat".to_string(),
                 resource_id: "cat-a".to_string(),
                 attributed_cat_id: Some("cat-a".to_string()),
@@ -1691,7 +1692,7 @@ mod tests {
     fn query() -> UsageQuery {
         UsageQuery {
             billing_account_id: "ba-org-a".to_string(),
-            project_id: None,
+            workspace_id: None,
             attributed_cat_id: None,
             interval_start_unix_ms: 1_000,
             interval_end_unix_ms: 31_000,
@@ -1791,7 +1792,7 @@ mod tests {
             .ingest(&checkpoint(1, 1_000, 100, UsageMetric::CpuUsec))
             .unwrap();
         let mut memory = checkpoint(1, 1_000, 100, UsageMetric::MemoryByteMillis);
-        memory.attribution.project_id = "project-other".to_string();
+        memory.attribution.workspace_id = "workspace-other".to_string();
         let error = ledger.ingest(&memory).unwrap_err();
         assert!(matches!(error, MeteringError::Conflict(_)));
     }
@@ -1832,8 +1833,8 @@ mod tests {
         let ledger = ledger();
         let first = CreditStore::ensure_account(
             &ledger,
-            "billing/project-a",
-            "project-a",
+            "billing/account-a",
+            "account-a",
             "USD",
             10_000_000_000,
             1_000,
@@ -1843,8 +1844,8 @@ mod tests {
         assert_eq!(first.credit_nanos, 10_000_000_000);
         let replay = CreditStore::ensure_account(
             &ledger,
-            "billing/project-a",
-            "project-a",
+            "billing/account-a",
+            "account-a",
             "USD",
             10_000_000_000,
             2_000,
@@ -1855,8 +1856,8 @@ mod tests {
 
         let intent = CheckoutIntent {
             intent_id: "checkout-a".into(),
-            billing_account_id: "billing/project-a".into(),
-            project_id: "project-a".into(),
+            billing_account_id: "billing/account-a".into(),
+            account_id: "account-a".into(),
             amount_cents: 2_500,
             currency: "USD".into(),
             created_at_unix_ms: 3_000,
@@ -1878,7 +1879,7 @@ mod tests {
             event_id: "evt_a".into(),
             payload_sha256: "a".repeat(64),
             intent_id: "checkout-a".into(),
-            billing_account_id: "billing/project-a".into(),
+            billing_account_id: "billing/account-a".into(),
             stripe_session_id: "cs_test_a".into(),
             stripe_payment_intent_id: "pi_a".into(),
             stripe_customer_id: Some("cus_a".into()),
@@ -1899,7 +1900,7 @@ mod tests {
                 .unwrap(),
             CreditApplyOutcome::Duplicate
         );
-        let summary = CreditStore::summary(&ledger, "billing/project-a")
+        let summary = CreditStore::summary(&ledger, "billing/account-a")
             .await
             .unwrap();
         assert_eq!(summary.credit_nanos, 35_000_000_000);
@@ -1922,7 +1923,7 @@ mod tests {
             CreditApplyOutcome::Accepted
         );
         assert_eq!(
-            CreditStore::summary(&ledger, "billing/project-a")
+            CreditStore::summary(&ledger, "billing/account-a")
                 .await
                 .unwrap()
                 .credit_nanos,
@@ -1958,8 +1959,8 @@ mod tests {
         let ledger = ledger();
         CreditStore::ensure_account(
             &ledger,
-            "billing/project-a",
-            "project-a",
+            "billing/account-a",
+            "account-a",
             "USD",
             10_000_000_000,
             1_000,

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BillingBalance {
     pub billing_account_id: String,
-    pub project_id: String,
+    pub workspace_id: String,
     pub currency: String,
     pub status: String,
     pub credit_nanos: String,

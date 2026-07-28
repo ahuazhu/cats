@@ -23,7 +23,7 @@
 
 ## 配置访问
 
-普通用户通过 WorkOS 登录。CLI 使用 Device Authorization，在浏览器中打开验证页面，并且只把短期 Access Token 与轮换 Refresh Credential 存进操作系统凭据存储。Cats 不再接受普通用户的静态 Project Token。
+普通用户通过 WorkOS 登录。CLI 使用 Device Authorization，在浏览器中打开验证页面，并且只把短期 Access Token 与轮换 Refresh Credential 存进操作系统凭据存储。Cats 不再接受普通用户的静态用户 Token。
 
     export CATS_API_URL='https://cats.run'
     cats login

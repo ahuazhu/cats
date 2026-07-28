@@ -55,9 +55,8 @@ pub struct CatSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cat {
     pub id: String,
-    /// Immutable resource-isolation owner. `project` remains the V1 route key.
+    /// Immutable resource-isolation owner and the only ownership key.
     pub workspace_id: String,
-    pub project: String,
     pub name: String,
     pub image: String,
     pub spec: CatSpec,
@@ -141,9 +140,8 @@ pub enum DiskState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Disk {
     pub id: String,
-    /// Immutable resource-isolation owner. `project` remains the V1 route key.
+    /// Immutable resource-isolation owner and the only ownership key.
     pub workspace_id: String,
-    pub project: String,
     pub name: String,
     pub kind: DiskKind,
     pub size_bytes: u64,
@@ -319,8 +317,6 @@ pub struct Operation {
     /// Immutable ownership is persisted so authorization still works after
     /// the target resource has been deleted.
     pub workspace_id: String,
-    /// Stable V1 compatibility route retained for existing clients.
-    pub project: String,
     pub kind: String,
     pub resource_id: String,
     pub resource_generation: i64,
@@ -431,7 +427,7 @@ pub struct Snapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteBinding {
     pub hostname: String,
-    pub project: String,
+    pub workspace_id: String,
     pub cat_id: String,
     pub node_id: String,
     pub gateway_url: String,

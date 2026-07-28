@@ -8,7 +8,7 @@
 ## 1. 公开连接
 
 ```http
-GET /v1/projects/{workspace}/cats/{cat}/shell?rows=24&cols=80 HTTP/1.1
+GET /v1/workspaces/{workspace_id}/cats/{cat}/shell?rows=24&cols=80 HTTP/1.1
 Authorization: Bearer <WorkOS access token>
 Connection: Upgrade
 Upgrade: websocket

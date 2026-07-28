@@ -15,7 +15,7 @@
 </div>
 
 <h2 id="product-model">Product model</h2>
-<p>A <strong>Cat</strong> is a long-lived Linux microVM with a required RootDisk. Compute may stop while the Cat name and durable disk remain. A Workspace is the user-visible authorization and resource boundary; the V1 HTTP API keeps the compatible <code>project</code> path segment underneath.</p>
+<p>A <strong>Cat</strong> is a long-lived Linux microVM with a required RootDisk. Compute may stop while the Cat name and durable disk remain. A Workspace is the user-visible authorization and resource boundary, and its immutable ID is what the HTTP API routes on.</p>
 <ul>
   <li><strong>RootDisk</strong> follows the Cat and is deleted with it.</li>
   <li><strong>PersistentDisk</strong> is independent, grow-only in V1, and read-write attached to at most one Cat.</li>

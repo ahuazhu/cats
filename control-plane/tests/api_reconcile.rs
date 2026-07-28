@@ -211,10 +211,25 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
 // Harness
 // ---------------------------------------------------------------------------
 
+/// The bootstrap Account's default Workspace ID. Resource routes key on the
+/// immutable ID, so every test resolves it once from the control plane.
+fn default_workspace_id(cp: &Handle) -> String {
+    cp.state
+        .store
+        .list_all_workspace_views()
+        .unwrap()
+        .into_iter()
+        .find(|workspace| workspace.is_default)
+        .expect("the bootstrap account has a default workspace")
+        .id
+}
+
 struct Ctx {
     _dir: tempfile::TempDir,
     cp: Handle,
     http: reqwest::Client,
+    /// The bootstrap Account's default Workspace; resource routes key on its ID.
+    workspace_id: String,
 }
 
 impl Ctx {
@@ -246,10 +261,31 @@ impl Ctx {
         })
         .await
         .unwrap();
+        let workspace_id = default_workspace_id(&cp);
+        // These tests run with billing enforcement on. An Organization Account
+        // gets no signup grant — only a user's Personal Account does — so the
+        // bootstrap Account starts pre-funded the way a real top-up leaves it.
+        let ledger = cp
+            .state
+            .store
+            .billing_ledger_for_workspace(&workspace_id)
+            .unwrap();
+        cp.state
+            .credits
+            .ensure_account(
+                &ledger.billing_account_id,
+                &ledger.owner_id,
+                "USD",
+                10_000_000_000,
+                1,
+            )
+            .await
+            .unwrap();
         Self {
             _dir: dir,
             cp,
             http: reqwest::Client::new(),
+            workspace_id,
         }
     }
 
@@ -257,12 +293,22 @@ impl Ctx {
         format!("{}{}", self.cp.base_url(), path)
     }
 
+    /// `path` is appended to this context's workspace route.
+    fn ws_url(&self, path: &str) -> String {
+        format!(
+            "{}/v1/workspaces/{}{}",
+            self.cp.base_url(),
+            self.workspace_id,
+            path
+        )
+    }
+
     async fn wait_observed(&self, name: &str, want: ObservedState) -> Cat {
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
             let cat: Cat = self
                 .http
-                .get(self.url(&format!("/v1/projects/default/cats/{name}")))
+                .get(self.ws_url(&format!("/cats/{name}")))
                 .bearer_auth("dev-admin-token")
                 .send()
                 .await
@@ -308,7 +354,7 @@ impl Ctx {
     async fn create_cat(&self, name: &str, idem: Option<&str>) -> CatOperationResponse {
         let mut req = self
             .http
-            .post(self.url("/v1/projects/default/cats"))
+            .post(self.ws_url("/cats"))
             .bearer_auth("dev-admin-token")
             .json(&serde_json::json!({
                 "name": name,
@@ -329,7 +375,7 @@ impl Ctx {
     async fn action(&self, name: &str, verb: &str) -> CatOperationResponse {
         let resp = self
             .http
-            .post(self.url(&format!("/v1/projects/default/cats/{name}/actions/{verb}")))
+            .post(self.ws_url(&format!("/cats/{name}/actions/{verb}")))
             .bearer_auth("dev-admin-token")
             .send()
             .await
@@ -600,7 +646,7 @@ async fn create_converges_and_idempotency_replays() {
     // A different key with the same name conflicts.
     let resp = ctx
         .http
-        .post(ctx.url("/v1/projects/default/cats"))
+        .post(ctx.ws_url("/cats"))
         .bearer_auth("dev-admin-token")
         .json(&CreateCatRequest {
             name: "dev".into(),
@@ -619,7 +665,7 @@ async fn create_converges_and_idempotency_replays() {
     // Unauthenticated requests are rejected.
     let resp = ctx
         .http
-        .get(ctx.url("/v1/projects/default/cats"))
+        .get(ctx.ws_url("/cats"))
         .send()
         .await
         .unwrap();
@@ -684,7 +730,7 @@ async fn default_auto_suspend_fires_on_the_last_guest_work_release() {
 
     let enabled: AutoSuspendResponse = ctx
         .http
-        .get(ctx.url("/v1/projects/default/cats/worker/auto-suspend"))
+        .get(ctx.ws_url("/cats/worker/auto-suspend"))
         .bearer_auth("dev-admin-token")
         .send()
         .await
@@ -722,7 +768,7 @@ async fn default_auto_suspend_fires_on_the_last_guest_work_release() {
 
     let operations: ListResponse<Operation> = ctx
         .http
-        .get(ctx.url("/v1/projects/default/operations"))
+        .get(ctx.ws_url("/operations"))
         .bearer_auth("dev-admin-token")
         .send()
         .await
@@ -775,7 +821,7 @@ async fn automatic_tiers_progress_from_suspended_through_warm_to_cold() {
 
     let operations: ListResponse<Operation> = ctx
         .http
-        .get(ctx.url("/v1/projects/default/operations"))
+        .get(ctx.ws_url("/operations"))
         .bearer_auth("dev-admin-token")
         .send()
         .await
@@ -816,7 +862,7 @@ async fn rwo_second_bind_is_rejected() {
 
     let disk: Disk = ctx
         .http
-        .post(ctx.url("/v1/projects/default/disks"))
+        .post(ctx.ws_url("/disks"))
         .bearer_auth("dev-admin-token")
         .json(&CreateDiskRequest {
             name: "shared".into(),
@@ -833,7 +879,7 @@ async fn rwo_second_bind_is_rejected() {
     let mount = |cat: &str| serde_json::json!({ "cat_id": cat, "mount_at": "/data" });
     let r1 = ctx
         .http
-        .post(ctx.url("/v1/projects/default/disks/shared/actions/mount"))
+        .post(ctx.ws_url("/disks/shared/actions/mount"))
         .bearer_auth("dev-admin-token")
         .json(&mount("cat-a"))
         .send()
@@ -847,7 +893,7 @@ async fn rwo_second_bind_is_rejected() {
 
     let r2 = ctx
         .http
-        .post(ctx.url("/v1/projects/default/disks/shared/actions/mount"))
+        .post(ctx.ws_url("/disks/shared/actions/mount"))
         .bearer_auth("dev-admin-token")
         .json(&mount("cat-b"))
         .send()
@@ -858,7 +904,7 @@ async fn rwo_second_bind_is_rejected() {
     // Deleting a bound disk is refused; unmount frees it.
     let del = ctx
         .http
-        .delete(ctx.url("/v1/projects/default/disks/shared"))
+        .delete(ctx.ws_url("/disks/shared"))
         .bearer_auth("dev-admin-token")
         .send()
         .await
@@ -866,7 +912,7 @@ async fn rwo_second_bind_is_rejected() {
     assert_eq!(del.status(), 412);
     let um = ctx
         .http
-        .post(ctx.url("/v1/projects/default/disks/shared/actions/unmount"))
+        .post(ctx.ws_url("/disks/shared/actions/unmount"))
         .bearer_auth("dev-admin-token")
         .json(&serde_json::json!({}))
         .send()
@@ -875,7 +921,7 @@ async fn rwo_second_bind_is_rejected() {
     assert!(um.status().is_success());
     let del = ctx
         .http
-        .delete(ctx.url("/v1/projects/default/disks/shared"))
+        .delete(ctx.ws_url("/disks/shared"))
         .bearer_auth("dev-admin-token")
         .send()
         .await
@@ -900,7 +946,7 @@ async fn node_loss_fences_and_reschedules() {
     loop {
         let cat: Cat = ctx
             .http
-            .get(ctx.url("/v1/projects/default/cats/dev"))
+            .get(ctx.ws_url("/cats/dev"))
             .bearer_auth("dev-admin-token")
             .send()
             .await
@@ -928,12 +974,21 @@ async fn control_plane_startup_grace_preserves_a_reconnecting_host_bound_cat() {
     {
         let store = Store::open(&db_path).unwrap();
         store
-            .reconcile_legacy_projects(&BTreeMap::from([(
+            .ensure_configured_accounts(&BTreeMap::from([(
                 "default".to_string(),
-                "org_default".to_string(),
+                "local-development".to_string(),
             )]))
             .unwrap();
-        let workspace = store.workspace_for_project("default").unwrap().unwrap();
+        let account = store
+            .account_for_organization("local-development")
+            .unwrap()
+            .unwrap();
+        let workspace = store
+            .workspaces_for_account(&account.id)
+            .unwrap()
+            .into_iter()
+            .find(|workspace| workspace.is_default)
+            .unwrap();
         store
             .register_node(
                 "node_a",
@@ -1023,7 +1078,7 @@ async fn exec_wakes_a_cold_cat() {
 
     let resp = ctx
         .http
-        .post(ctx.url("/v1/projects/default/cats/dev/exec"))
+        .post(ctx.ws_url("/cats/dev/exec"))
         .bearer_auth("dev-admin-token")
         .json(&ExecRequest {
             command: vec!["echo".into(), "hi".into()],
@@ -1089,7 +1144,7 @@ async fn exec_retries_a_transient_suspend_conflict() {
 
     let resp = ctx
         .http
-        .post(ctx.url("/v1/projects/default/cats/dev/exec"))
+        .post(ctx.ws_url("/cats/dev/exec"))
         .bearer_auth("dev-admin-token")
         .json(&ExecRequest {
             command: vec!["pwd".into()],
@@ -1112,7 +1167,7 @@ async fn destroy_deletes_root_disk_and_keeps_persistent() {
     ctx.wait_observed("dev", ObservedState::Running).await;
     // Attach a persistent disk.
     ctx.http
-        .post(ctx.url("/v1/projects/default/disks"))
+        .post(ctx.ws_url("/disks"))
         .bearer_auth("dev-admin-token")
         .json(&CreateDiskRequest {
             name: "keep".into(),
@@ -1122,7 +1177,7 @@ async fn destroy_deletes_root_disk_and_keeps_persistent() {
         .await
         .unwrap();
     ctx.http
-        .post(ctx.url("/v1/projects/default/disks/keep/actions/mount"))
+        .post(ctx.ws_url("/disks/keep/actions/mount"))
         .bearer_auth("dev-admin-token")
         .json(&serde_json::json!({"cat_id": "dev", "mount_at": "/data"}))
         .send()
@@ -1131,7 +1186,7 @@ async fn destroy_deletes_root_disk_and_keeps_persistent() {
 
     let resp = ctx
         .http
-        .delete(ctx.url("/v1/projects/default/cats/dev"))
+        .delete(ctx.ws_url("/cats/dev"))
         .bearer_auth("dev-admin-token")
         .send()
         .await
@@ -1143,7 +1198,7 @@ async fn destroy_deletes_root_disk_and_keeps_persistent() {
     loop {
         let resp = ctx
             .http
-            .get(ctx.url("/v1/projects/default/cats/dev"))
+            .get(ctx.ws_url("/cats/dev"))
             .bearer_auth("dev-admin-token")
             .send()
             .await
@@ -1156,7 +1211,7 @@ async fn destroy_deletes_root_disk_and_keeps_persistent() {
     }
     let disks: ListResponse<Disk> = ctx
         .http
-        .get(ctx.url("/v1/projects/default/disks"))
+        .get(ctx.ws_url("/disks"))
         .bearer_auth("dev-admin-token")
         .send()
         .await
@@ -1190,42 +1245,37 @@ async fn static_user_tokens_are_not_accepted() {
         auto_tier_policy: Default::default(),
     };
     let cp = spawn(cfg).await.unwrap();
-    cp.state
-        .store
-        .reconcile_legacy_projects(&BTreeMap::from([(
-            "alpha".to_string(),
-            "local-development".to_string(),
-        )]))
-        .unwrap();
+    let workspace_id = default_workspace_id(&cp);
+    let cats_url = format!("{}/v1/workspaces/{workspace_id}/cats", cp.base_url());
     let http = reqwest::Client::new();
 
-    let old_project_token = http
-        .get(format!("{}/v1/projects/alpha/cats", cp.base_url()))
+    let invented_user_token = http
+        .get(&cats_url)
         .bearer_auth("token-alpha")
         .send()
         .await
         .unwrap();
-    assert_eq!(old_project_token.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(invented_user_token.status(), StatusCode::UNAUTHORIZED);
 
     let service_as_user = http
-        .get(format!("{}/v1/projects/alpha/cats", cp.base_url()))
+        .get(&cats_url)
         .bearer_auth(SERVICE_TOKEN)
         .send()
         .await
         .unwrap();
     assert_eq!(service_as_user.status(), StatusCode::FORBIDDEN);
 
-    let admin_cross_project = http
-        .get(format!("{}/v1/projects/alpha/cats", cp.base_url()))
+    let admin_across_workspaces = http
+        .get(&cats_url)
         .bearer_auth("token-admin")
         .send()
         .await
         .unwrap();
-    assert_eq!(admin_cross_project.status(), StatusCode::OK);
+    assert_eq!(admin_across_workspaces.status(), StatusCode::OK);
 }
 
 #[tokio::test]
-async fn cumulative_usage_is_idempotent_and_queryable_by_project_cat_and_metric() {
+async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metric() {
     let ctx = Ctx::new().await;
     let _node = start_stub_node(&ctx.cp, "node_a").await;
     ctx.create_cat("metered", None).await;
@@ -1269,8 +1319,13 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_project_cat_and_metric(
             .usage
             .ingest(&AttributedCheckpoint {
                 attribution: UsageAttribution {
-                    billing_account_id: "billing_account/project/default".to_string(),
-                    project_id: "default".to_string(),
+                    billing_account_id: ctx
+                        .cp
+                        .state
+                        .store
+                        .billing_account_id_for_workspace(&ctx.workspace_id)
+                        .unwrap(),
+                    workspace_id: ctx.workspace_id.clone(),
                     resource_type: "cat".to_string(),
                     resource_id: cat.id.clone(),
                     attributed_cat_id: Some(cat.id.clone()),
@@ -1315,8 +1370,8 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_project_cat_and_metric(
 
     let report_response = ctx
         .http
-        .get(ctx.url(&format!(
-            "/v1/projects/default/billing/usage?from_ms=1000&to_ms={hour_end}&cat=metered&detail=true"
+        .get(ctx.ws_url(&format!(
+            "/billing/usage?from_ms=1000&to_ms={hour_end}&cat=metered&detail=true"
         )))
         .bearer_auth("dev-admin-token")
         .send()
@@ -1342,7 +1397,7 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_project_cat_and_metric(
 
     let balance: BillingBalance = ctx
         .http
-        .get(ctx.url("/v1/projects/default/billing/balance"))
+        .get(ctx.ws_url("/billing/balance"))
         .bearer_auth("dev-admin-token")
         .send()
         .await
@@ -1355,13 +1410,16 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_project_cat_and_metric(
     assert_eq!(balance.credit_nanos, "10000000000");
     assert_eq!(balance.provisional_usage_nanos, "115000000");
     assert_eq!(balance.available_credit_nanos, "9885000000");
-    assert_eq!(balance.signup_credit_nanos, "10000000000");
+    assert_eq!(
+        balance.signup_credit_nanos, "0",
+        "an Organization Account is never a signup-grant beneficiary"
+    );
     assert!(!balance.stripe_enabled);
 
     let bucketed: UsageReport = ctx
         .http
-        .get(ctx.url(&format!(
-            "/v1/projects/default/billing/usage?from_ms=1000&to_ms={hour_end}&cat_id={}&bucket_ms=1800000",
+        .get(ctx.ws_url(&format!(
+            "/billing/usage?from_ms=1000&to_ms={hour_end}&cat_id={}&bucket_ms=1800000",
             cat.id
         )))
         .bearer_auth("dev-admin-token")
@@ -1390,17 +1448,17 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_project_cat_and_metric(
 
     for query in [
         format!(
-            "/v1/projects/default/billing/usage?from_ms=1000&to_ms={hour_end}&cat_id={}&bucket_ms=1000",
+            "/billing/usage?from_ms=1000&to_ms={hour_end}&cat_id={}&bucket_ms=1000",
             cat.id
         ),
         format!(
-            "/v1/projects/default/billing/usage?from_ms=1000&to_ms=40000000&cat_id={}&bucket_ms=60000",
+            "/billing/usage?from_ms=1000&to_ms=40000000&cat_id={}&bucket_ms=60000",
             cat.id
         ),
     ] {
         let invalid_bucket = ctx
             .http
-            .get(ctx.url(&query))
+            .get(ctx.ws_url(&query))
             .bearer_auth("dev-admin-token")
             .send()
             .await
@@ -1455,7 +1513,7 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_project_cat_and_metric(
 
     let deleted = ctx
         .http
-        .delete(ctx.url("/v1/projects/default/cats/metered"))
+        .delete(ctx.ws_url("/cats/metered"))
         .bearer_auth("dev-admin-token")
         .send()
         .await
@@ -1465,7 +1523,7 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_project_cat_and_metric(
     loop {
         let response = ctx
             .http
-            .get(ctx.url("/v1/projects/default/cats/metered"))
+            .get(ctx.ws_url("/cats/metered"))
             .bearer_auth("dev-admin-token")
             .send()
             .await
@@ -1504,8 +1562,8 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_project_cat_and_metric(
 
     let historical_report: UsageReport = ctx
         .http
-        .get(ctx.url(&format!(
-            "/v1/projects/default/billing/usage?from_ms=1000&to_ms={}&cat_id={}&detail=true",
+        .get(ctx.ws_url(&format!(
+            "/billing/usage?from_ms=1000&to_ms={}&cat_id={}&detail=true",
             hour_end + 3_000,
             cat.id
         )))
@@ -1532,8 +1590,8 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_project_cat_and_metric(
 
     let ambiguous_cat_filter = ctx
         .http
-        .get(ctx.url(&format!(
-            "/v1/projects/default/billing/usage?from_ms=1000&to_ms={hour_end}&cat=metered&cat_id={}",
+        .get(ctx.ws_url(&format!(
+            "/billing/usage?from_ms=1000&to_ms={hour_end}&cat=metered&cat_id={}",
             cat.id
         )))
         .bearer_auth("dev-admin-token")
@@ -1544,8 +1602,8 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_project_cat_and_metric(
 
     let user_query_with_service_credential = ctx
         .http
-        .get(ctx.url(&format!(
-            "/v1/projects/default/billing/usage?from_ms=1000&to_ms={hour_end}"
+        .get(ctx.ws_url(&format!(
+            "/billing/usage?from_ms=1000&to_ms={hour_end}"
         )))
         .bearer_auth(SERVICE_TOKEN)
         .send()
@@ -1598,7 +1656,7 @@ async fn exhausted_prepaid_balance_blocks_new_or_waking_compute() {
     ctx.wait_observed("spender", ObservedState::Suspended).await;
     let resume = ctx
         .http
-        .post(ctx.url("/v1/projects/default/cats/spender/actions/resume"))
+        .post(ctx.ws_url("/cats/spender/actions/resume"))
         .bearer_auth("dev-admin-token")
         .send()
         .await
@@ -1609,7 +1667,7 @@ async fn exhausted_prepaid_balance_blocks_new_or_waking_compute() {
 
     let create = ctx
         .http
-        .post(ctx.url("/v1/projects/default/cats"))
+        .post(ctx.ws_url("/cats"))
         .bearer_auth("dev-admin-token")
         .json(&serde_json::json!({
             "name": "blocked",
@@ -1759,7 +1817,7 @@ async fn admin_can_monitor_and_drain_nodes() {
     loop {
         let cat: Cat = ctx
             .http
-            .get(ctx.url("/v1/projects/default/cats/drain-me"))
+            .get(ctx.ws_url("/cats/drain-me"))
             .bearer_auth("dev-admin-token")
             .send()
             .await

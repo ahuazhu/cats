@@ -16,7 +16,7 @@ cats --help</code></pre>
 <p>在仓库内开发时，也可以把示例中的 <code>cats</code> 替换为 <code>cargo run -p cats-cli --bin cats --</code>。</p>
 
 <h2 id="configure-access">配置访问</h2>
-<p>普通用户通过 WorkOS 登录。CLI 使用 Device Authorization，在浏览器中打开验证页面，并且只把短期 Access Token 与轮换 Refresh Credential 存进操作系统凭据存储。Cats 不再接受普通用户的静态 Project Token。</p>
+<p>普通用户通过 WorkOS 登录。CLI 使用 Device Authorization，在浏览器中打开验证页面，并且只把短期 Access Token 与轮换 Refresh Credential 存进操作系统凭据存储。Cats 不再接受普通用户的静态用户 Token。</p>
 <pre><code>export CATS_API_URL='https://cats.run'
 cats login
 cats whoami

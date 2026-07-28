@@ -5,6 +5,10 @@
 
 > “每个 Billing Account 首次建立时赠送 10 美元”已由 ADR-0014 的 Personal signup
 > eligibility 规则取代；不可变资金账本、Stripe 和余额控制决定继续有效。
+>
+> “一个 Project 一个 `billing_account/project/<project>`”已由 ADR-0018 取代：一个
+> Account 恰好一个 Billing Account，Workspace 永不是计费所有者；Stripe metadata 写
+> `account_id`。
 
 ## 背景
 

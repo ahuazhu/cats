@@ -61,7 +61,7 @@ pub struct WorkOsConfig {
     jwks: Arc<workos::helpers::JwksHelper>,
     redirect_uri: String,
     cookie_password: String,
-    project_organizations: BTreeMap<String, String>,
+    account_organizations: BTreeMap<String, String>,
     admin_organization_id: String,
     admin_permission: String,
     cookie_secure: bool,
@@ -79,8 +79,8 @@ pub struct WorkOsConfigParams {
     pub issuer_url: String,
     pub redirect_uri: String,
     pub cookie_password: String,
-    /// Cats project -> WorkOS Organization ID.
-    pub project_organizations: BTreeMap<String, String>,
+    /// Cats Account slug -> WorkOS Organization ID.
+    pub account_organizations: BTreeMap<String, String>,
     pub admin_organization_id: String,
     pub admin_permission: String,
     pub cookie_secure: bool,
@@ -109,8 +109,8 @@ impl WorkOsConfig {
             !params.admin_permission.is_empty(),
             "WorkOS admin permission must not be empty"
         );
-        for (project, organization_id) in &params.project_organizations {
-            anyhow::ensure!(!project.is_empty(), "Cats project name must not be empty");
+        for (account, organization_id) in &params.account_organizations {
+            anyhow::ensure!(!account.is_empty(), "Cats account slug must not be empty");
             anyhow::ensure!(
                 !organization_id.is_empty(),
                 "WorkOS organization ID must not be empty"
@@ -169,7 +169,7 @@ impl WorkOsConfig {
             jwks,
             redirect_uri: params.redirect_uri,
             cookie_password: params.cookie_password,
-            project_organizations: params.project_organizations,
+            account_organizations: params.account_organizations,
             admin_organization_id: params.admin_organization_id,
             admin_permission: params.admin_permission,
             cookie_secure: params.cookie_secure,
@@ -188,8 +188,8 @@ impl WorkOsConfig {
         &self.api_base_url
     }
 
-    pub fn project_organizations(&self) -> &BTreeMap<String, String> {
-        &self.project_organizations
+    pub fn account_organizations(&self) -> &BTreeMap<String, String> {
+        &self.account_organizations
     }
 
     async fn ensure_personal_organization(
@@ -522,8 +522,8 @@ impl WorkOsConfig {
     }
 
     /// Verify a CLI bearer token cryptographically and turn its organization
-    /// scope into the existing Cats project namespace. A valid token for an
-    /// unmapped organization remains authenticated but has no project access.
+    /// scope into the Cats Account that owns it. A valid token for an unmapped
+    /// organization remains authenticated but has no workspace access.
     pub async fn verify_access_token(&self, token: &str) -> Result<AccessIdentity, ApiError> {
         let header = decode_header(token)
             .map_err(|_| ApiError::unauthenticated("invalid WorkOS access token"))?;
@@ -966,7 +966,7 @@ struct LoginFlow {
     code_verifier: String,
     site: Site,
     organization_id: Option<String>,
-    project: Option<String>,
+    workspace_id: Option<String>,
     return_to: String,
     created_at_unix: i64,
 }
@@ -975,7 +975,7 @@ struct LoginFlow {
 pub struct LoginQuery {
     site: String,
     #[serde(default)]
-    project: Option<String>,
+    workspace: Option<String>,
     #[serde(default)]
     return_to: Option<String>,
 }
@@ -1006,7 +1006,6 @@ struct SessionUser {
 struct SessionResponse {
     authenticated: bool,
     site: Site,
-    project: Option<String>,
     active_account_id: Option<String>,
     active_workspace_id: Option<String>,
     accounts: Vec<Account>,
@@ -1057,20 +1056,18 @@ pub async fn login(
         .as_ref()
         .ok_or_else(|| ApiError::failed_precondition("WorkOS AuthKit is not configured"))?;
     let site = Site::parse(&query.site).ok_or_else(|| ApiError::invalid("unknown auth site"))?;
-    let (organization_id, project) = match site {
+    let (organization_id, workspace_id) = match site {
         Site::User => {
-            if let Some(project) = query.project.as_deref() {
-                let workspace = state.store.workspace_for_project(project)?.ok_or_else(|| {
-                    ApiError::new(cats_api::error::ErrorCode::NotFound, "unknown workspace")
-                })?;
-                let account = state.store.account_by_id(&workspace.account_id)?;
+            if let Some(workspace_id) = query.workspace.as_deref() {
+                let scope = state.store.workspace_scope(workspace_id)?;
                 (
-                    Some(account.workos_organization_id),
-                    Some(project.to_string()),
+                    Some(scope.account.workos_organization_id),
+                    Some(workspace_id.to_string()),
                 )
             } else {
-                // The public user site does not know a user's project before
-                // authentication. Resolve it from the returned WorkOS identity.
+                // The public user site does not know which workspace a user
+                // owns before authentication. Resolve it from the returned
+                // WorkOS identity.
                 (None, None)
             }
         }
@@ -1097,7 +1094,7 @@ pub async fn login(
         code_verifier: authorization.code_verifier,
         site,
         organization_id,
-        project,
+        workspace_id,
         return_to,
         created_at_unix: crate::store::now_unix(),
     };
@@ -1247,11 +1244,8 @@ pub async fn callback(
         config.cookie_domain.as_deref(),
     )?;
     if flow.site == Site::User {
-        let workspace = if let Some(project) = flow.project.as_deref() {
-            state
-                .store
-                .workspace_for_project(project)?
-                .ok_or_else(|| ApiError::internal("selected workspace disappeared"))?
+        let workspace = if let Some(workspace_id) = flow.workspace_id.as_deref() {
+            state.store.workspace_by_id(workspace_id)?
         } else {
             state.store.workspace_by_id(
                 identity
@@ -1357,7 +1351,7 @@ async fn scope_unmapped_user_session(
 ) -> (String, SessionState) {
     let should_rescope = flow.site == Site::User
         && flow.organization_id.is_none()
-        && flow.project.is_none()
+        && flow.workspace_id.is_none()
         && session.authenticated
         && !session.organization_id.is_empty()
         && store
@@ -1678,7 +1672,6 @@ async fn session_response(
             SessionResponse {
                 authenticated: true,
                 site,
-                project: None,
                 active_account_id: None,
                 active_workspace_id: None,
                 accounts: Vec::new(),
@@ -1761,7 +1754,6 @@ async fn session_response(
         SessionResponse {
             authenticated: true,
             site,
-            project: Some(selected.project().to_string()),
             active_account_id: Some(selected.account_id.clone()),
             active_workspace_id: Some(selected.id.clone()),
             accounts,
@@ -1827,16 +1819,17 @@ fn validate_flow_identity(
     session: &SessionState,
 ) -> Result<WebIdentity, Failure> {
     let identity = validate_session_identity(config, store, flow.site, session)?;
-    if flow.site == Site::User && flow.organization_id.is_none() && flow.project.is_none() {
+    if flow.site == Site::User && flow.organization_id.is_none() && flow.workspace_id.is_none() {
         return Ok(identity);
     }
-    let project_matches = match flow.project.as_deref() {
-        Some(project) => {
-            store.project_belongs_to_organization(project, &session.organization_id)?
+    let workspace_matches = match flow.workspace_id.as_deref() {
+        Some(workspace_id) => {
+            store.workspace_belongs_to_organization(workspace_id, &session.organization_id)?
         }
         None => true,
     };
-    if Some(session.organization_id.as_str()) != flow.organization_id.as_deref() || !project_matches
+    if Some(session.organization_id.as_str()) != flow.organization_id.as_deref()
+        || !workspace_matches
     {
         return Err(ApiError::new(
             cats_api::error::ErrorCode::PermissionDenied,
@@ -1935,10 +1928,10 @@ pub fn web_user_identity(state: &AppState, headers: &HeaderMap) -> Option<WebIde
     identity_from_cookie(state, headers, Site::User)
 }
 
-pub async fn web_session_allows_project(
+pub async fn web_session_allows_workspace(
     state: &AppState,
     headers: &HeaderMap,
-    project: &str,
+    workspace_id: &str,
 ) -> Result<bool, ApiError> {
     if identity_from_cookie(state, headers, Site::Admin)
         .is_some_and(|identity| identity.administrator)
@@ -1956,7 +1949,7 @@ pub async fn web_session_allows_project(
     };
     if !state
         .store
-        .project_belongs_to_organization(project, organization_id)?
+        .workspace_belongs_to_organization(workspace_id, organization_id)?
     {
         return Ok(false);
     }

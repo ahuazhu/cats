@@ -121,13 +121,13 @@ impl CreditStore for PostgresUsageStore {
     fn ensure_account<'a>(
         &'a self,
         billing_account_id: &'a str,
-        project_id: &'a str,
+        account_id: &'a str,
         currency: &'a str,
         signup_credit_nanos: i128,
         created_at_unix_ms: i64,
     ) -> CreditStoreFuture<'a, CreditSummary> {
         let billing_account_id = billing_account_id.to_string();
-        let project_id = project_id.to_string();
+        let account_id = account_id.to_string();
         let currency = currency.to_string();
         let schema = self.schema.clone();
         Box::pin(async move {
@@ -136,7 +136,7 @@ impl CreditStore for PostgresUsageStore {
                     client,
                     &schema,
                     &billing_account_id,
-                    &project_id,
+                    &account_id,
                     &currency,
                     signup_credit_nanos,
                     created_at_unix_ms,
@@ -218,13 +218,13 @@ impl CreditStore for PostgresUsageStore {
 
 fn validate_credit_account(
     billing_account_id: &str,
-    project_id: &str,
+    account_id: &str,
     currency: &str,
     signup_credit_nanos: i128,
     created_at_unix_ms: i64,
 ) -> Result<()> {
     if billing_account_id.is_empty()
-        || project_id.is_empty()
+        || account_id.is_empty()
         || currency != "USD"
         || signup_credit_nanos < 0
         || created_at_unix_ms < 0
@@ -239,7 +239,7 @@ fn validate_credit_account(
 fn validate_checkout_intent(intent: &CheckoutIntent) -> Result<()> {
     if intent.intent_id.is_empty()
         || intent.billing_account_id.is_empty()
-        || intent.project_id.is_empty()
+        || intent.account_id.is_empty()
         || intent.amount_cents <= 0
         || intent.currency != "USD"
         || intent.created_at_unix_ms < 0
@@ -255,14 +255,14 @@ fn pg_ensure_credit_account(
     client: &mut Client,
     schema: &str,
     billing_account_id: &str,
-    project_id: &str,
+    account_id: &str,
     currency: &str,
     signup_credit_nanos: i128,
     created_at_unix_ms: i64,
 ) -> Result<CreditSummary> {
     validate_credit_account(
         billing_account_id,
-        project_id,
+        account_id,
         currency,
         signup_credit_nanos,
         created_at_unix_ms,
@@ -272,7 +272,7 @@ fn pg_ensure_credit_account(
         .map_err(|error| pg_error("start credit-account transaction", error))?;
     let account_sql = format!(
         "INSERT INTO {schema}.billing_accounts (
-            billing_account_id, project_id, currency, created_at_ms
+            billing_account_id, account_id, currency, created_at_ms
          ) VALUES ($1, $2, $3, $4)
          ON CONFLICT (billing_account_id) DO NOTHING"
     );
@@ -281,14 +281,14 @@ fn pg_ensure_credit_account(
             &account_sql,
             &[
                 &billing_account_id,
-                &project_id,
+                &account_id,
                 &currency,
                 &created_at_unix_ms,
             ],
         )
         .map_err(|error| pg_error("ensure billing account", error))?;
     let summary = pg_credit_summary_transaction(&mut transaction, schema, billing_account_id)?;
-    if summary.project_id != project_id || summary.currency != currency {
+    if summary.account_id != account_id || summary.currency != currency {
         return Err(MeteringError::Conflict(format!(
             "billing account {billing_account_id} identity changed"
         )));
@@ -330,7 +330,7 @@ fn pg_credit_summary(
     billing_account_id: &str,
 ) -> Result<CreditSummary> {
     let account_sql = format!(
-        "SELECT project_id, currency, stripe_customer_id
+        "SELECT account_id, currency, stripe_customer_id
            FROM {schema}.billing_accounts WHERE billing_account_id=$1"
     );
     let row = client
@@ -349,7 +349,7 @@ fn pg_credit_summary(
         .map_err(|_| MeteringError::Store("invalid PostgreSQL credit total".to_string()))?;
     Ok(CreditSummary {
         billing_account_id: billing_account_id.to_string(),
-        project_id: row.get(0),
+        account_id: row.get(0),
         currency: row.get(1),
         stripe_customer_id: row.get(2),
         credit_nanos,
@@ -362,7 +362,7 @@ fn pg_credit_summary_transaction(
     billing_account_id: &str,
 ) -> Result<CreditSummary> {
     let account_sql = format!(
-        "SELECT project_id, currency, stripe_customer_id
+        "SELECT account_id, currency, stripe_customer_id
            FROM {schema}.billing_accounts WHERE billing_account_id=$1"
     );
     let row = transaction
@@ -381,7 +381,7 @@ fn pg_credit_summary_transaction(
         .map_err(|_| MeteringError::Store("invalid PostgreSQL credit total".to_string()))?;
     Ok(CreditSummary {
         billing_account_id: billing_account_id.to_string(),
-        project_id: row.get(0),
+        account_id: row.get(0),
         currency: row.get(1),
         stripe_customer_id: row.get(2),
         credit_nanos,
@@ -394,7 +394,7 @@ fn pg_checkout_intent(
     intent_id: &str,
 ) -> Result<CheckoutIntent> {
     let sql = format!(
-        "SELECT intent_id, billing_account_id, project_id, amount_cents,
+        "SELECT intent_id, billing_account_id, account_id, amount_cents,
                 currency, created_at_ms, stripe_session_id, checkout_url
            FROM {schema}.checkout_intents WHERE intent_id=$1"
     );
@@ -405,7 +405,7 @@ fn pg_checkout_intent(
     Ok(CheckoutIntent {
         intent_id: row.get(0),
         billing_account_id: row.get(1),
-        project_id: row.get(2),
+        account_id: row.get(2),
         amount_cents: row.get(3),
         currency: row.get(4),
         created_at_unix_ms: row.get(5),
@@ -422,7 +422,7 @@ fn pg_create_checkout_intent(
     validate_checkout_intent(intent)?;
     let sql = format!(
         "INSERT INTO {schema}.checkout_intents (
-            intent_id, billing_account_id, project_id, amount_cents,
+            intent_id, billing_account_id, account_id, amount_cents,
             currency, created_at_ms, status
          ) VALUES ($1, $2, $3, $4, $5, $6, 'pending')
          ON CONFLICT (intent_id) DO NOTHING"
@@ -433,7 +433,7 @@ fn pg_create_checkout_intent(
             &[
                 &intent.intent_id,
                 &intent.billing_account_id,
-                &intent.project_id,
+                &intent.account_id,
                 &intent.amount_cents,
                 &intent.currency,
                 &intent.created_at_unix_ms,
@@ -442,7 +442,7 @@ fn pg_create_checkout_intent(
         .map_err(|error| pg_error("create checkout intent", error))?;
     let stored = pg_checkout_intent(client, schema, &intent.intent_id)?;
     if stored.billing_account_id != intent.billing_account_id
-        || stored.project_id != intent.project_id
+        || stored.account_id != intent.account_id
         || stored.amount_cents != intent.amount_cents
         || stored.currency != intent.currency
     {
@@ -725,7 +725,7 @@ fn source_epoch_attribution(
     source_epoch: &str,
 ) -> Result<Option<UsageAttribution>> {
     let sql = format!(
-        "SELECT billing_account_id, project_id, resource_type,
+        "SELECT billing_account_id, workspace_id, resource_type,
                 resource_id, attributed_cat_id
            FROM {schema}.usage_checkpoints
           WHERE source_id=$1 AND source_epoch=$2
@@ -875,7 +875,7 @@ CREATE TABLE IF NOT EXISTS {schema}.usage_checkpoints (
     metric TEXT NOT NULL,
     cumulative_quantity NUMERIC(39, 0) NOT NULL CHECK (cumulative_quantity >= 0),
     billing_account_id TEXT NOT NULL,
-    project_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
     resource_type TEXT NOT NULL,
     resource_id TEXT NOT NULL,
     attributed_cat_id TEXT,
@@ -898,7 +898,7 @@ CREATE TABLE IF NOT EXISTS {schema}.usage_intervals (
     metric TEXT NOT NULL,
     quantity NUMERIC(39, 0) NOT NULL CHECK (quantity >= 0),
     billing_account_id TEXT NOT NULL,
-    project_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
     resource_type TEXT NOT NULL,
     resource_id TEXT NOT NULL,
     attributed_cat_id TEXT,
@@ -942,7 +942,7 @@ END
 $migration$;
 CREATE TABLE IF NOT EXISTS {schema}.billing_accounts (
     billing_account_id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
     currency TEXT NOT NULL CHECK (currency = 'USD'),
     stripe_customer_id TEXT,
     created_at_ms BIGINT NOT NULL CHECK (created_at_ms >= 0)
@@ -976,7 +976,7 @@ CREATE TABLE IF NOT EXISTS {schema}.checkout_intents (
     intent_id TEXT PRIMARY KEY,
     billing_account_id TEXT NOT NULL
         REFERENCES {schema}.billing_accounts(billing_account_id),
-    project_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
     amount_cents BIGINT NOT NULL CHECK (amount_cents > 0),
     currency TEXT NOT NULL CHECK (currency = 'USD'),
     created_at_ms BIGINT NOT NULL CHECK (created_at_ms >= 0),
@@ -1051,7 +1051,7 @@ fn ingest_checkpoint(
         .map_err(|error| pg_error("lock usage source epoch", error))?;
 
     let existing_sql = format!(
-        "SELECT payload_json, billing_account_id, project_id,
+        "SELECT payload_json, billing_account_id, workspace_id,
                 resource_type, resource_id, attributed_cat_id
            FROM {schema}.usage_checkpoints WHERE event_id=$1"
     );
@@ -1074,7 +1074,7 @@ fn ingest_checkpoint(
     }
 
     let attribution_sql = format!(
-        "SELECT billing_account_id, project_id, resource_type,
+        "SELECT billing_account_id, workspace_id, resource_type,
                 resource_id, attributed_cat_id
            FROM {schema}.usage_checkpoints
           WHERE source_id=$1 AND source_epoch=$2
@@ -1101,7 +1101,7 @@ fn ingest_checkpoint(
     let insert_sql = format!(
         "INSERT INTO {schema}.usage_checkpoints (
             event_id, source_id, source_epoch, sequence, observed_at_ms,
-            metric, cumulative_quantity, billing_account_id, project_id,
+            metric, cumulative_quantity, billing_account_id, workspace_id,
             resource_type, resource_id, attributed_cat_id, payload_json
          ) VALUES (
             $1,$2,$3,$4,$5,$6,$7::text::numeric,$8,$9,$10,$11,$12,$13
@@ -1119,7 +1119,7 @@ fn ingest_checkpoint(
                 &value.checkpoint.metric.slug(),
                 &cumulative_quantity,
                 &value.attribution.billing_account_id,
-                &value.attribution.project_id,
+                &value.attribution.workspace_id,
                 &value.attribution.resource_type,
                 &value.attribution.resource_id,
                 &value.attribution.attributed_cat_id,
@@ -1164,7 +1164,7 @@ fn adjacent_checkpoint(
     };
     let sql = format!(
         "SELECT event_id, source_id, source_epoch, sequence, observed_at_ms,
-                metric, cumulative_quantity::text, billing_account_id, project_id,
+                metric, cumulative_quantity::text, billing_account_id, workspace_id,
                 resource_type, resource_id, attributed_cat_id
            FROM {schema}.usage_checkpoints
           WHERE source_id=$1 AND source_epoch=$2 AND metric=$3
@@ -1245,7 +1245,7 @@ fn insert_interval(
         "INSERT INTO {schema}.usage_intervals (
             end_event_id, start_event_id, source_id, source_epoch,
             end_sequence, interval_start_ms, interval_end_ms, metric,
-            quantity, billing_account_id, project_id, resource_type,
+            quantity, billing_account_id, workspace_id, resource_type,
             resource_id, attributed_cat_id
          ) VALUES (
             $1,$2,$3,$4,$5,$6,$7,$8,$9::text::numeric,$10,$11,$12,$13,$14
@@ -1260,7 +1260,7 @@ fn insert_interval(
             metric=EXCLUDED.metric,
             quantity=EXCLUDED.quantity,
             billing_account_id=EXCLUDED.billing_account_id,
-            project_id=EXCLUDED.project_id,
+            workspace_id=EXCLUDED.workspace_id,
             resource_type=EXCLUDED.resource_type,
             resource_id=EXCLUDED.resource_id,
             attributed_cat_id=EXCLUDED.attributed_cat_id"
@@ -1279,7 +1279,7 @@ fn insert_interval(
                 &end.metric.slug(),
                 &quantity,
                 &end.attribution.billing_account_id,
-                &end.attribution.project_id,
+                &end.attribution.workspace_id,
                 &end.attribution.resource_type,
                 &end.attribution.resource_id,
                 &end.attribution.attributed_cat_id,
@@ -1293,12 +1293,12 @@ fn query_usage(client: &mut Client, schema: &str, query: &UsageQuery) -> Result<
     validate_usage_query(query)?;
     let sql = format!(
         "SELECT interval_start_ms, interval_end_ms, quantity::text,
-                billing_account_id, project_id, resource_type, resource_id,
+                billing_account_id, workspace_id, resource_type, resource_id,
                 attributed_cat_id, metric, source_id, source_epoch, end_sequence
            FROM {schema}.usage_intervals
           WHERE billing_account_id=$1
             AND interval_end_ms>$2 AND interval_start_ms<$3
-            AND ($4::text IS NULL OR project_id=$4)
+            AND ($4::text IS NULL OR workspace_id=$4)
             AND ($5::text IS NULL OR attributed_cat_id=$5)
           ORDER BY interval_start_ms, source_id, source_epoch,
                    end_sequence, metric"
@@ -1310,7 +1310,7 @@ fn query_usage(client: &mut Client, schema: &str, query: &UsageQuery) -> Result<
                 &query.billing_account_id,
                 &query.interval_start_unix_ms,
                 &query.interval_end_unix_ms,
-                &query.project_id,
+                &query.workspace_id,
                 &query.attributed_cat_id,
             ],
         )
@@ -1351,7 +1351,7 @@ fn usage_interval_from_row(row: &Row) -> Result<UsageInterval> {
 fn attribution_from_row(row: &Row, offset: usize) -> UsageAttribution {
     UsageAttribution {
         billing_account_id: row.get(offset),
-        project_id: row.get(offset + 1),
+        workspace_id: row.get(offset + 1),
         resource_type: row.get(offset + 2),
         resource_id: row.get(offset + 3),
         attributed_cat_id: row.get(offset + 4),
@@ -1460,7 +1460,7 @@ mod tests {
                 checkpoint,
                 attribution: UsageAttribution {
                     billing_account_id: "ba-org-a".to_string(),
-                    project_id: "project-a".to_string(),
+                    workspace_id: "workspace-a".to_string(),
                     resource_type: "cat".to_string(),
                     resource_id: "cat-a".to_string(),
                     attributed_cat_id: Some("cat-a".to_string()),
@@ -1500,7 +1500,7 @@ mod tests {
             &store,
             &UsageQuery {
                 billing_account_id: "ba-org-a".to_string(),
-                project_id: None,
+                workspace_id: None,
                 attributed_cat_id: Some("cat-a".to_string()),
                 interval_start_unix_ms: 1_000,
                 interval_end_unix_ms: 21_000,

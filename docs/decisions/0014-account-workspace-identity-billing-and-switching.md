@@ -7,6 +7,11 @@
   - ADR-0008 中“一个 WorkOS Organization 一一映射一个 Workspace”的决定；
   - ADR-0013 中“每个 Billing Account 首次建立即获得注册赠金”的决定。
 
+> 「slug、URL 与兼容路径」最后一条（保留 `/v1/projects/{project}`、资源表 `project` 列和
+> 每个 Workspace 一个 `legacy_project` 路由键）与「迁移顺序」中的 Project 合成步骤已由
+> ADR-0018 取代：Workspace 是唯一归属键，资源路由是 `/v1/workspaces/{workspace_id}`，
+> 历史 Project 数据不迁移。本 ADR 的领域模型、成员关系、赠金和会话切换决定继续有效。
+
 ## 背景
 
 Cats V1 把 Project 同时当作资源隔离边界、WorkOS Organization 映射和 Billing

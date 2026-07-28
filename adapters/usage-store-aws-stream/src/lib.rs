@@ -398,8 +398,8 @@ mod tests {
                     "cumulative_quantity": sequence_number
                 },
                 "attribution": {
-                    "billing_account_id": "billing_account/project/default",
-                    "project_id": "default",
+                    "billing_account_id": "billing_account/workspace_default",
+                    "workspace_id": "default",
                     "resource_type": "cat",
                     "resource_id": "cat-1",
                     "attributed_cat_id": "cat-1"

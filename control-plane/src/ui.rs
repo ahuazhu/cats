@@ -191,8 +191,8 @@ const DOCS: [DocPage; 10] = [
         slug: "console-workspaces",
         title_en: "Console, identity, and workspaces",
         title_zh: "控制台、身份与工作区",
-        description_en: "Use the bilingual Cats consoles with WorkOS AuthKit sessions, project/workspace isolation, personal workspaces, and separate admin permissions.",
-        description_zh: "通过 WorkOS AuthKit 会话使用双语 Cats 控制台，了解 Project/工作区隔离、个人工作区与独立管理员权限。",
+        description_en: "Use the bilingual Cats consoles with WorkOS AuthKit sessions, Account and Workspace isolation, personal workspaces, and separate admin permissions.",
+        description_zh: "通过 WorkOS AuthKit 会话使用双语 Cats 控制台，了解 Account 与工作区隔离、个人工作区与独立管理员权限。",
         body_en: include_str!("../ui/public/docs/en/console-workspaces.html"),
         body_zh: include_str!("../ui/public/docs/zh-CN/console-workspaces.html"),
     },
@@ -1249,6 +1249,7 @@ mod tests {
         }
         for retired_contract in [
             "CATS_PROJECT",
+            "/v1/projects/",
             "your-project-token",
             "Authorization: Bearer &lt;project-token&gt;",
             "cats create dev --auto-suspend",

@@ -44,4 +44,4 @@ Existing Running Cats may continue because API processes are not in the Guest I/
 
 ## Useful evidence
 
-When escalating, preserve the request ID, Operation ID, Workspace/project slug, Cat/Disk name, node ID, generation, attachment/route epoch, timestamps, CLI version, and the structured error. Remove tokens, cookies, Secret values, Guest disk contents, and terminal plaintext.
+When escalating, preserve the request ID, Operation ID, Account/Workspace slug, Cat/Disk name, node ID, generation, attachment/route epoch, timestamps, CLI version, and the structured error. Remove tokens, cookies, Secret values, Guest disk contents, and terminal plaintext.

@@ -18,7 +18,6 @@ import { getLocale, initI18n, localizedApiMessage, onLocaleChange, t } from "/ui
 initI18n();
 
 const state = {
-  project: "",
   accounts: [],
   workspaces: [],
   activeAccountId: "",
@@ -58,18 +57,14 @@ const switchView = initNavigation(
   },
   (view) => {
     state.activeView = view;
-    if (view === "billing" && state.project && !state.billing) {
+    if (view === "billing" && state.activeWorkspaceId && !state.billing) {
       loadBilling().catch(() => {});
     }
   },
 );
 
-function projectPath(path) {
-  return `/v1/projects/${encodeURIComponent(state.project)}${path}`;
-}
-
-function workspaceLabel(project) {
-  return project.startsWith("personal-user_") ? t("user.workspace.personal") : project;
+function workspacePath(path) {
+  return `/v1/workspaces/${encodeURIComponent(state.activeWorkspaceId)}${path}`;
 }
 
 function activeWorkspace() {
@@ -77,7 +72,6 @@ function activeWorkspace() {
 }
 
 function applySession(session) {
-  state.project = session.project || "";
   state.accounts = session.accounts || [];
   state.workspaces = session.workspaces || [];
   state.activeAccountId = session.active_account_id || "";
@@ -99,9 +93,9 @@ function renderWorkspaceSwitcher() {
   const workspace = activeWorkspace();
   const label = workspace
     ? `${workspace.account_display_name} / ${workspace.display_name}`
-    : workspaceLabel(state.project);
-  document.querySelector("#sidebar-project").textContent = label;
-  document.querySelector("#header-project").textContent = label;
+    : t("user.workspace.none");
+  document.querySelector("#sidebar-workspace").textContent = label;
+  document.querySelector("#header-workspace").textContent = label;
 }
 
 async function switchWorkspace(workspaceId, { updateUrl = true } = {}) {
@@ -190,9 +184,9 @@ async function loadAll({ quiet = false } = {}) {
   if (!quiet) setBusy(button, true, t("common.refreshing"));
   try {
     const [cats, disks, operations] = await Promise.all([
-      authenticatedRequest(projectPath("/cats")),
-      authenticatedRequest(projectPath("/disks")),
-      authenticatedRequest(projectPath("/operations")),
+      authenticatedRequest(workspacePath("/cats")),
+      authenticatedRequest(workspacePath("/disks")),
+      authenticatedRequest(workspacePath("/operations")),
     ]);
     state.cats = cats.items || [];
     state.disks = disks.items || [];
@@ -721,7 +715,7 @@ async function openBillingCatDetail(catId) {
       cat_id: catId,
       bucket_ms: String(billingBucketSize(range.fromMs, range.toMs)),
     });
-    state.billingDetail = await authenticatedRequest(projectPath(`/billing/usage?${query}`));
+    state.billingDetail = await authenticatedRequest(workspacePath(`/billing/usage?${query}`));
     renderBillingCatDetail();
   } catch (caught) {
     document.querySelector("#billing-detail-loading").classList.add("is-hidden");
@@ -757,7 +751,7 @@ function billingRange() {
 }
 
 async function loadBilling({ quiet = false } = {}) {
-  if (state.billingLoading || !state.project) return;
+  if (state.billingLoading || !state.activeWorkspaceId) return;
   const button = document.querySelector('#billing-range-form button[type="submit"]');
   const error = document.querySelector("#billing-error");
   state.billingLoading = true;
@@ -767,8 +761,8 @@ async function loadBilling({ quiet = false } = {}) {
     const range = billingRange();
     const query = new URLSearchParams({ from_ms: String(range.fromMs), to_ms: String(range.toMs) });
     const [balance, usage] = await Promise.all([
-      authenticatedRequest(projectPath("/billing/balance")),
-      authenticatedRequest(projectPath(`/billing/usage?${query}`)),
+      authenticatedRequest(workspacePath("/billing/balance")),
+      authenticatedRequest(workspacePath(`/billing/usage?${query}`)),
     ]);
     state.billingBalance = balance;
     state.billing = usage;
@@ -790,7 +784,7 @@ async function beginTopup(amountCents) {
   state.paymentRedirecting = true;
   document.querySelectorAll("[data-topup-cents]").forEach((button) => { button.disabled = true; });
   try {
-    const checkout = await authenticatedRequest(projectPath("/billing/checkout"), {
+    const checkout = await authenticatedRequest(workspacePath("/billing/checkout"), {
       method: "POST",
       headers: idempotencyHeaders(),
       body: JSON.stringify({ amount_cents: Number(amountCents) }),
@@ -810,7 +804,7 @@ async function beginTopup(amountCents) {
 async function redirectForPayment() {
   if (state.paymentRedirecting) return;
   if (!state.billingBalance) {
-    state.billingBalance = await authenticatedRequest(projectPath("/billing/balance"));
+    state.billingBalance = await authenticatedRequest(workspacePath("/billing/balance"));
     renderBillingBalance();
   }
   const amounts = state.billingBalance.topup_options_cents || [];
@@ -851,7 +845,7 @@ async function mutateCat(name, action, button) {
     if (endpointName === null) return;
     setBusy(button, true);
     try {
-      const response = await authenticatedRequest(projectPath(`/cats/${encodeURIComponent(name)}/endpoints`), {
+      const response = await authenticatedRequest(workspacePath(`/cats/${encodeURIComponent(name)}/endpoints`), {
         method: "POST",
         body: JSON.stringify({ name: endpointName, target_port: Number(port), protocol: "http", wake_policy: "wake_on_request" }),
       });
@@ -865,8 +859,8 @@ async function mutateCat(name, action, button) {
   setBusy(button, true);
   try {
     const path = action === "destroy"
-      ? projectPath(`/cats/${encodeURIComponent(name)}`)
-      : projectPath(`/cats/${encodeURIComponent(name)}/actions/${action}`);
+      ? workspacePath(`/cats/${encodeURIComponent(name)}`)
+      : workspacePath(`/cats/${encodeURIComponent(name)}/actions/${action}`);
     const response = await authenticatedRequest(path, {
       method: action === "destroy" ? "DELETE" : "POST",
       headers: idempotencyHeaders(),
@@ -884,7 +878,7 @@ async function mutateDisk(name, action, button) {
   const disk = state.disks.find((item) => item.name === name);
   if (!disk) return;
   let method = "POST";
-  let path = projectPath(`/disks/${encodeURIComponent(name)}/actions/${action}`);
+  let path = workspacePath(`/disks/${encodeURIComponent(name)}/actions/${action}`);
   let body;
   if (action === "mount") {
     if (!state.cats.length) throw new Error(t("user.mount.noCats"));
@@ -901,11 +895,11 @@ async function mutateDisk(name, action, button) {
   } else if (action === "unmount") {
     body = {};
   } else if (action === "snapshot") {
-    path = projectPath(`/disks/${encodeURIComponent(name)}/snapshots`);
+    path = workspacePath(`/disks/${encodeURIComponent(name)}/snapshots`);
   } else if (action === "delete") {
     if (!window.confirm(t("user.disk.deleteConfirm", { name }))) return;
     method = "DELETE";
-    path = projectPath(`/disks/${encodeURIComponent(name)}`);
+    path = workspacePath(`/disks/${encodeURIComponent(name)}`);
   }
   setBusy(button, true);
   try {
@@ -974,7 +968,7 @@ document.querySelector("#create-cat-form").addEventListener("submit", async (eve
   error.textContent = "";
   setBusy(button, true);
   try {
-    const response = await authenticatedRequest(projectPath("/cats"), {
+    const response = await authenticatedRequest(workspacePath("/cats"), {
       method: "POST",
       headers: idempotencyHeaders(),
       body: JSON.stringify({
@@ -1013,7 +1007,7 @@ document.querySelector("#create-disk-form").addEventListener("submit", async (ev
   error.textContent = "";
   setBusy(button, true);
   try {
-    const disk = await authenticatedRequest(projectPath("/disks"), {
+    const disk = await authenticatedRequest(workspacePath("/disks"), {
       method: "POST",
       body: JSON.stringify({ name: String(values.get("name")).trim(), size_bytes: Math.round(Number(values.get("size_gib")) * (1024 ** 3)) }),
     });
@@ -1041,7 +1035,7 @@ document.querySelector("#exec-form").addEventListener("submit", async (event) =>
   setBusy(button, true, t("user.execDialog.running"));
   try {
     const command = splitCommand(new FormData(form).get("command"));
-    const result = await authenticatedRequest(projectPath(`/cats/${encodeURIComponent(state.execCat)}/exec`), {
+    const result = await authenticatedRequest(workspacePath(`/cats/${encodeURIComponent(state.execCat)}/exec`), {
       method: "POST",
       body: JSON.stringify({ command }),
     });
@@ -1147,7 +1141,7 @@ initializeBillingRange();
 initializeAuth();
 
 window.setInterval(() => {
-  if (!document.hidden && state.project && !appShell.classList.contains("is-hidden")) {
+  if (!document.hidden && state.activeWorkspaceId && !appShell.classList.contains("is-hidden")) {
     loadAll({ quiet: true }).catch(() => {});
     if (state.activeView === "billing" && Date.now() - state.billingLoadedAt >= 10_000) {
       loadBilling({ quiet: true }).catch(() => {});
