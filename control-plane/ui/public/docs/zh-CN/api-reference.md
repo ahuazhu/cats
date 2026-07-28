@@ -40,6 +40,8 @@ Workspace 枚举根据 Active WorkOS Organization Membership 返回 Personal/Org
     GET    /v1/workspaces/{workspace_id}/cats/{cat}/work
     GET    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
     PUT    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
+    GET    /v1/workspaces/{workspace_id}/cats/{cat}/expiry
+    PUT    /v1/workspaces/{workspace_id}/cats/{cat}/expiry
 
 Lifecycle Verb 包括 `start`、`stop`、`suspend`、`resume` 与 `warm`。Create 省略 `auto_suspend` 时默认为 `true`。Cat 的 Create/Lifecycle/Delete 返回异步 Operation；请求超时后应查询 Operation，而不是用新意图重复变更。
 

@@ -656,6 +656,7 @@ async fn create_converges_and_idempotency_replays() {
             root_size_bytes: 4 << 20,
             auto_suspend: true,
             disk: None,
+            expires_at_unix: None,
         })
         .send()
         .await
@@ -1007,6 +1008,7 @@ async fn control_plane_startup_grace_preserves_a_reconnecting_host_bound_cat() {
                 256,
                 8 << 20,
                 true,
+                None,
                 None,
             )
             .unwrap();

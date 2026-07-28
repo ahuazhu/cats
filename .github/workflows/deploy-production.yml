@@ -217,8 +217,17 @@ jobs:
               's/^const SCHEMA_VERSION: i64 = ([0-9]+);$/\1/p' \
               control-plane/src/store.rs
           )"
+          oldest_migratable="$(
+            sed -nE \
+              's/^const OLDEST_MIGRATABLE_SCHEMA_VERSION: i64 = ([0-9]+);$/\1/p' \
+              control-plane/src/store.rs
+          )"
           if [[ ! "$required_schema" =~ ^[0-9]+$ ]]; then
             echo "::error::Could not read control-plane SCHEMA_VERSION"
+            exit 1
+          fi
+          if [[ ! "$oldest_migratable" =~ ^[0-9]+$ ]]; then
+            echo "::error::Could not read control-plane OLDEST_MIGRATABLE_SCHEMA_VERSION"
             exit 1
           fi
 
@@ -259,8 +268,8 @@ jobs:
           PY
             )"
 
-            if [[ "$actual_schema" != "$required_schema" ]]; then
-              echo "::error::Control database schema $actual_schema is incompatible with build schema $required_schema. cats-controld does not migrate; recreate the database with the reviewed runbook before retrying. The deployment will not replace the live Pod or delete production data automatically."
+            if (( actual_schema < oldest_migratable || actual_schema > required_schema )); then
+              echo "::error::Control database schema $actual_schema is incompatible with build schema $required_schema (migratable from $oldest_migratable). cats-controld only migrates stamped versions inside that range; recreate the database with the reviewed runbook before retrying. The deployment will not replace the live Pod or delete production data automatically."
               exit 1
             fi
           fi

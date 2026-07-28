@@ -40,6 +40,8 @@ Token creation returns `{ "access_token": {…metadata…}, "token": "cats_wst_�
     GET    /v1/workspaces/{workspace_id}/cats/{cat}/work
     GET    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
     PUT    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
+    GET    /v1/workspaces/{workspace_id}/cats/{cat}/expiry
+    PUT    /v1/workspaces/{workspace_id}/cats/{cat}/expiry
 
 Lifecycle verbs are `start`, `stop`, `suspend`, `resume`, and `warm`. `auto_suspend` defaults to `true` when omitted from create. Cat create/lifecycle/delete returns an asynchronous Operation response; poll the Operation URL instead of repeating a timed-out mutation with a new intent.
 

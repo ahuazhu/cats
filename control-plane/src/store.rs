@@ -158,12 +158,22 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(internal)?;
-        if control_plane_schema_exists > 0 && stamped != SCHEMA_VERSION {
+        if control_plane_schema_exists > 0
+            && !(OLDEST_MIGRATABLE_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&stamped)
+        {
             return Err(ApiError::failed_precondition(format!(
                 "control-plane database {} is at schema version {stamped}, this build \
-                 requires {SCHEMA_VERSION}; recreate it",
+                 requires {SCHEMA_VERSION} (migratable from \
+                 {OLDEST_MIGRATABLE_SCHEMA_VERSION}); recreate it",
                 path.display()
             )));
+        }
+        if control_plane_schema_exists > 0 && stamped < 2 {
+            // v1 -> v2: absolute Cat expiry. ALTER is idempotent-by-guard: it
+            // only runs while the stamp is below 2, and the stamp update below
+            // commits in the same process before any caller can observe v2.
+            conn.execute_batch("ALTER TABLE cats ADD COLUMN expires_at_unix INTEGER")
+                .map_err(internal)?;
         }
         conn.execute_batch(SCHEMA).map_err(internal)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -828,6 +838,7 @@ impl Store {
         root_disk_size: u64,
         auto_suspend: bool,
         extra_disk: Option<(&str, u64, &str)>, // (name, size, mount_path)
+        expires_at_unix: Option<i64>,
     ) -> Result<(Cat, Vec<Disk>, Operation)> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(internal)?;
@@ -859,10 +870,10 @@ impl Store {
                 "INSERT INTO cats (
                     id, workspace_id, name, image, cpus, memory_mib,
                     root_disk_id, desired_state, observed_state, generation,
-                    auto_suspend, created_at, observed_state_since_ms
+                    auto_suspend, created_at, observed_state_since_ms, expires_at_unix
                  ) VALUES (
                     ?1,?2,?3,?4,?5,?6,?7,
-                    'running','creating',1,?8,?9,?10
+                    'running','creating',1,?8,?9,?10,?11
                  )",
                 params![
                     cat_id,
@@ -874,7 +885,8 @@ impl Store {
                     root_disk_id,
                     i64::from(auto_suspend),
                     now,
-                    now.saturating_mul(1000)
+                    now.saturating_mul(1000),
+                    expires_at_unix
                 ],
             )?;
             let default_endpoint_id = new_id(ids::ENDPOINT_PREFIX);
@@ -893,6 +905,7 @@ impl Store {
                     node_id: None,
                     created_at_unix: now,
                     observed_state_since_unix_ms: now.saturating_mul(1000),
+                    expires_at_unix,
                 },
                 DEFAULT_ENDPOINT_NAME,
             );
@@ -1265,6 +1278,35 @@ impl Store {
             .map(|_| ())
         })?;
         self.must_get_cat_by_id(cat_id)
+    }
+
+    /// Set or clear the absolute expiry. Does not bump the generation: expiry
+    /// is bookkeeping about the future, not a lifecycle mutation.
+    pub fn set_expiry(&self, cat_id: &str, expires_at_unix: Option<i64>) -> Result<Cat> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE cats SET expires_at_unix=?2 WHERE id=?1",
+                params![cat_id, expires_at_unix],
+            )
+            .map(|_| ())
+        })?;
+        self.must_get_cat_by_id(cat_id)
+    }
+
+    /// Cats whose absolute expiry has passed and that are not already being
+    /// deleted. The controller converges each one to Deleted.
+    pub fn expired_cat_candidates(&self) -> Result<Vec<String>> {
+        let now = now_unix();
+        self.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id FROM cats
+                 WHERE expires_at_unix IS NOT NULL
+                   AND expires_at_unix <= ?1
+                   AND desired_state != 'deleted'",
+            )?;
+            let rows = stmt.query_map(params![now], |row| row.get(0))?;
+            rows.collect()
+        })
     }
 
     pub fn acquire_work(
@@ -2690,6 +2732,7 @@ fn row_to_cat(r: &rusqlite::Row<'_>) -> rusqlite::Result<Cat> {
         node_id: r.get("node_id")?,
         created_at_unix: r.get("created_at")?,
         observed_state_since_unix_ms: r.get("observed_state_since_ms")?,
+        expires_at_unix: r.get("expires_at_unix")?,
     })
 }
 
@@ -3035,13 +3078,17 @@ fn workspace_view(
     }
 }
 
-/// Bumped on any schema change an existing database cannot be upgraded into.
-/// `Store::open` refuses a database stamped with a different version instead of
-/// migrating it: no released deployment's control-plane state has to survive, and
-/// a migration ladder for shapes nobody runs is archaeology that still has to be
-/// read, tested and kept correct. Deployment automation reads this constant and
-/// refuses to replace a live Pod whose database does not match it.
-const SCHEMA_VERSION: i64 = 1;
+/// Bumped on every schema change. `Store::open` upgrades a database stamped
+/// inside `[OLDEST_MIGRATABLE_SCHEMA_VERSION, SCHEMA_VERSION]` in place and
+/// refuses anything else: production now carries control-plane state that has
+/// to survive (workspaces, tokens), so each release keeps exactly the ladder
+/// the live fleet needs and deletes rungs once no deployment is below them.
+/// Deployment automation reads both constants and refuses to replace a live
+/// Pod whose database this build can neither run nor migrate.
+const SCHEMA_VERSION: i64 = 2;
+
+/// The oldest stamped version `Store::open` can still upgrade in place.
+const OLDEST_MIGRATABLE_SCHEMA_VERSION: i64 = 1;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS accounts (
@@ -3132,6 +3179,7 @@ CREATE TABLE IF NOT EXISTS cats (
     observed_state_since_ms INTEGER NOT NULL,
     node_id TEXT,
     created_at INTEGER NOT NULL,
+    expires_at_unix INTEGER,
     UNIQUE (workspace_id, name)
 );
 CREATE TABLE IF NOT EXISTS disks (
@@ -3321,6 +3369,7 @@ mod tests {
                 1 << 20,
                 true,
                 None,
+                None,
             )
             .unwrap();
         let renamed = store
@@ -3357,16 +3406,110 @@ mod tests {
             .create_workspace(&default.account_id, "sibling", "Sibling")
             .unwrap();
         store
-            .create_cat(&default, "shared", "test", 1, 256, 1 << 20, true, None)
+            .create_cat(&default, "shared", "test", 1, 256, 1 << 20, true, None, None)
             .unwrap();
         store
-            .create_cat(&sibling, "shared", "test", 1, 256, 1 << 20, true, None)
+            .create_cat(&sibling, "shared", "test", 1, 256, 1 << 20, true, None, None)
             .unwrap();
         assert!(store
-            .create_cat(&default, "shared", "test", 1, 256, 1 << 20, true, None)
+            .create_cat(&default, "shared", "test", 1, 256, 1 << 20, true, None, None)
             .is_err());
         assert_eq!(store.list_cats(&default.id).unwrap().len(), 1);
         assert_eq!(store.list_cats(&sibling.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migrates_a_v1_database_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.db");
+        let cat_id = {
+            let store = Store::open(&path).unwrap();
+            let workspace = bootstrap_workspace(&store, "acme");
+            let (cat, _, _) = store
+                .create_cat(&workspace, "web", "test", 1, 256, 1 << 20, true, None, None)
+                .unwrap();
+            cat.id
+        };
+        {
+            // Reshape the file into the v1 schema: no expiry column, stamp 1.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("ALTER TABLE cats DROP COLUMN expires_at_unix")
+                .unwrap();
+            conn.pragma_update(None, "user_version", 1_i64).unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let cat = store.must_get_cat_by_id(&cat_id).unwrap();
+        assert_eq!(cat.expires_at_unix, None, "v1 rows surface as never-expiring");
+        {
+            let conn = Connection::open(&path).unwrap();
+            let stamped: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(stamped, SCHEMA_VERSION);
+        }
+        // The migrated column is writable like a natively-v2 one.
+        store.set_expiry(&cat_id, Some(12345)).unwrap();
+        assert_eq!(
+            store.must_get_cat_by_id(&cat_id).unwrap().expires_at_unix,
+            Some(12345)
+        );
+    }
+
+    #[test]
+    fn absolute_expiry_selects_only_due_undeleted_cats() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("control.db")).unwrap();
+        let workspace = bootstrap_workspace(&store, "acme");
+        let past = now_unix() - 60;
+        let future = now_unix() + 3600;
+
+        let (expired, _, _) = store
+            .create_cat(
+                &workspace,
+                "expired",
+                "test",
+                1,
+                256,
+                1 << 20,
+                true,
+                None,
+                Some(past),
+            )
+            .unwrap();
+        let (fresh, _, _) = store
+            .create_cat(
+                &workspace,
+                "fresh",
+                "test",
+                1,
+                256,
+                1 << 20,
+                true,
+                None,
+                Some(future),
+            )
+            .unwrap();
+        let (forever, _, _) = store
+            .create_cat(&workspace, "forever", "test", 1, 256, 1 << 20, true, None, None)
+            .unwrap();
+        assert_eq!(expired.expires_at_unix, Some(past));
+
+        assert_eq!(store.expired_cat_candidates().unwrap(), vec![expired.id.clone()]);
+
+        // Renewal takes the Cat out of the reap set; clearing does too.
+        store.set_expiry(&expired.id, Some(future)).unwrap();
+        assert!(store.expired_cat_candidates().unwrap().is_empty());
+        store.set_expiry(&expired.id, Some(past)).unwrap();
+        store.set_expiry(&fresh.id, None).unwrap();
+        assert_eq!(store.expired_cat_candidates().unwrap(), vec![expired.id.clone()]);
+
+        // A Cat already converging to Deleted is not re-deleted every tick.
+        store
+            .set_desired(&expired.id, DesiredState::Deleted, None, "cat.expire")
+            .unwrap();
+        assert!(store.expired_cat_candidates().unwrap().is_empty());
+        let _ = forever;
     }
 
     #[test]
@@ -3455,7 +3598,8 @@ mod tests {
         drop(Store::open(&path).unwrap());
         {
             let conn = Connection::open(&path).unwrap();
-            conn.pragma_update(None, "user_version", 2_i64).unwrap();
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+                .unwrap();
         }
 
         let Err(error) = Store::open(&path) else {
@@ -3463,7 +3607,7 @@ mod tests {
         };
         assert_eq!(error.code, ErrorCode::FailedPrecondition);
         assert!(
-            error.to_string().contains("requires 1"),
+            error.to_string().contains(&format!("requires {SCHEMA_VERSION}")),
             "the operator needs to see the required schema version, got: {error}"
         );
         // A database this build wrote itself keeps opening.
@@ -3489,7 +3633,7 @@ mod tests {
         let store = Store::open(&dir.path().join("control.db")).unwrap();
         let workspace = bootstrap_workspace(&store, "alpha");
         let (cat, _, _) = store
-            .create_cat(&workspace, "legacy", "ubuntu", 1, 512, 1 << 20, true, None)
+            .create_cat(&workspace, "legacy", "ubuntu", 1, 512, 1 << 20, true, None, None)
             .unwrap();
 
         let endpoints = store.endpoints_for_cat(&cat.id).unwrap();
@@ -3555,6 +3699,7 @@ mod tests {
                 256,
                 1024 * 1024,
                 true,
+                None,
                 None,
             )
             .unwrap();
@@ -3638,7 +3783,7 @@ mod tests {
         let mut ids = Vec::new();
         for n in 0..10 {
             let (cat, _, _) = store
-                .create_cat(&workspace, &format!("web{n}"), "test", 2, 1024, 1 << 20, true, None)
+                .create_cat(&workspace, &format!("web{n}"), "test", 2, 1024, 1 << 20, true, None, None)
                 .unwrap();
             ids.push(cat.id);
         }
@@ -3677,7 +3822,7 @@ mod tests {
         let store = Store::open(&dir.path().join("control.db")).unwrap();
         let workspace = bootstrap_workspace(&store, "alpha");
         let (cat, _, _) = store
-            .create_cat(&workspace, "web", "test", 1, 256, 1024 * 1024, true, None)
+            .create_cat(&workspace, "web", "test", 1, 256, 1024 * 1024, true, None, None)
             .unwrap();
         store
             .register_node("node-1", "http://node", "http://gateway", 4, 8192)
@@ -3715,7 +3860,7 @@ mod tests {
         let store = Store::open(&dir.path().join("control.db")).unwrap();
         let workspace = bootstrap_workspace(&store, "alpha");
         let (cat, _, _) = store
-            .create_cat(&workspace, "racer", "test", 1, 256, 1024 * 1024, true, None)
+            .create_cat(&workspace, "racer", "test", 1, 256, 1024 * 1024, true, None, None)
             .unwrap();
         store
             .register_node("node-1", "http://node", "http://gateway", 4, 8192)
@@ -3776,6 +3921,7 @@ mod tests {
                     256,
                     1024 * 1024,
                     true,
+                    None,
                     None,
                 )
                 .unwrap();

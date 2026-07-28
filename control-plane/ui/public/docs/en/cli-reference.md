@@ -35,6 +35,7 @@ A Workspace token is a revocable machine credential for CI. It can manage resour
     cats create NAME [--image IMAGE] [--cpus N] [--memory SIZE]
                      [--root-size SIZE] [--disk NAME]
                      [--disk-size SIZE] [--mount-at PATH] [--no-auto-suspend]
+                     [--expires-in SECONDS]
     cats ls
     cats get NAME
     cats start NAME
@@ -43,6 +44,7 @@ A Workspace token is a revocable machine credential for CI. It can manage resour
     cats resume NAME
     cats warm NAME
     cats destroy NAME
+    cats expiry NAME [--in SECONDS | --at UNIX | --never]
     cats exec NAME [--timeout SECONDS] [--env-file PATH]
                    [--stdin-file PATH] -- COMMAND [ARG...]
 

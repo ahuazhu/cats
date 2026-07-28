@@ -103,6 +103,16 @@ impl Controller {
         )? {
             self.maybe_auto_tier(&cat_id)?;
         }
+        // Absolute expiry: converge each expired Cat to Deleted exactly as an
+        // API delete would. One failure must not starve the other candidates.
+        for cat_id in self.store.expired_cat_candidates()? {
+            if let Err(e) = self
+                .store
+                .set_desired(&cat_id, DesiredState::Deleted, None, "cat.expire")
+            {
+                tracing::warn!(cat_id, "expiry delete failed: {e}");
+            }
+        }
         // Reconcile Cats concurrently. A flow spends nearly all of its time in one
         // blocking dispatch to a node agent -- a cold start is ~6 s of VM boot --
         // so awaiting them one at a time turned ten concurrent creates into a
