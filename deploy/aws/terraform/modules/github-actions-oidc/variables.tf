@@ -14,6 +14,13 @@ variable "github_repository" {
   }
 }
 
+variable "github_subject_repository" {
+  type        = string
+  description = "Repository identity embedded in GitHub's OIDC subject. Defaults to github_repository; set the immutable owner@id/repository@id prefix when enabled for the repository."
+  default     = null
+  nullable    = true
+}
+
 variable "default_branch" {
   type        = string
   description = "Branch allowed to release when allowed_subjects is not set."

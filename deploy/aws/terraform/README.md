@@ -93,7 +93,10 @@ The stack also creates the GitHub Actions release role. Its trust policy pins
 both the audience and the subject to `github_repository` — widening the subject
 to a wildcard owner would let any repository assume it. Publish
 `github_release_role_arn` as the `AWS_ROLE_ARN` repository variable, alongside
-`AWS_REGION` and `ECR_REPOSITORY`.
+`AWS_REGION` and `ECR_REPOSITORY`. GitHub may issue immutable OIDC subjects that
+include numeric owner and repository IDs; keep `github_subject_repository`
+aligned with the repository's `sub_claim_prefix` so the exact subject remains
+trusted after a rename.
 
 ## Usage infrastructure
 

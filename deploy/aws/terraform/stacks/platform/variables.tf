@@ -136,6 +136,12 @@ variable "github_repository" {
   default     = "ahuazhu/cats"
 }
 
+variable "github_subject_repository" {
+  type        = string
+  description = "Immutable repository identity used by the GitHub OIDC subject template."
+  default     = "ahuazhu@1306468/cats@1308574751"
+}
+
 variable "github_default_branch" {
   type        = string
   description = "Branch allowed to release."

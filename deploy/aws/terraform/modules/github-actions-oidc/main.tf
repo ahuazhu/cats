@@ -11,9 +11,11 @@
 locals {
   name = "${var.name_prefix}-github-actions-release"
 
+  subject_repository = coalesce(var.github_subject_repository, var.github_repository)
+
   subjects = length(var.allowed_subjects) > 0 ? var.allowed_subjects : [
-    "repo:${var.github_repository}:ref:refs/heads/${var.default_branch}",
-    "repo:${var.github_repository}:ref:refs/tags/*",
+    "repo:${local.subject_repository}:ref:refs/heads/${var.default_branch}",
+    "repo:${local.subject_repository}:ref:refs/tags/*",
   ]
 
   provider_arn = var.create_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : var.existing_oidc_provider_arn
