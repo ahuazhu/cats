@@ -5,7 +5,7 @@ Accept: application/json
 Content-Type: application/json
 Idempotency-Key: &lt;unique-request-id&gt;   # mutations
 If-Match: "&lt;generation&gt;"                # guarded state changes</code></pre>
-<p><code>cats login</code> obtains and refreshes the user token through WorkOS Device Authorization without writing it to the normal config file. Other user clients must use an approved WorkOS flow and the same verified JWT contract; static user tokens are not accepted. Browser consoles use their HttpOnly WorkOS session instead of exposing a Bearer token to JavaScript. Service and administrator machine identities have separate scopes.</p>
+<p><code>cats login</code> obtains and refreshes the user token through WorkOS Device Authorization without writing it to the normal config file. Other user clients must use an approved WorkOS flow and the same verified JWT contract; static user tokens are not accepted. Browser consoles use their HttpOnly WorkOS session instead of exposing a Bearer token to JavaScript. A Workspace manager may issue a revocable <code>cats_wst_…</code> machine credential for CI; it authorizes only the immutable Workspace that issued it and cannot mint another token. Service and administrator machine identities have separate scopes.</p>
 
 <h2 id="identity">Identity and Workspaces</h2>
 <pre><code>GET  /auth/config       # public WorkOS client/base-URL configuration
@@ -13,12 +13,15 @@ GET  /v1/me             # user profile and available Workspaces
 GET  /v1/workspaces     # refresh the available Workspace list
 POST /v1/accounts/{account}/workspaces
 PATCH /v1/workspaces/{workspace}
+GET|POST /v1/workspaces/{workspace}/tokens
+DELETE /v1/workspaces/{workspace}/tokens/{token}
 GET|POST /v1/accounts/{account}/invitations
 POST /v1/accounts/{account}/invitations/{invitation}/actions/revoke
 GET /v1/accounts/{account}/members
 PATCH|DELETE /v1/accounts/{account}/members/{membership}
 POST /v1/auth/logout    # revoke the CLI WorkOS session</code></pre>
 <p>Workspace enumeration returns Personal and Organization Accounts from active WorkOS Organization memberships. Creating or renaming a Workspace requires account-management permission; a rename does not change its immutable ID, so every resource route keeps resolving. Invitation/member mutations require <code>cats:members:manage</code>, are rejected for Personal Accounts, and are performed through WorkOS. Creating an invitation also requires <code>Idempotency-Key</code>; Cats forwards it to WorkOS so a network retry returns the same invitation. User access-token signature, issuer, client ID, expiry, subject, Organization scope, active membership, Account ID, and Workspace ownership are checked before authorization.</p>
+<p>Token creation returns <code>{ "access_token": {…metadata…}, "token": "cats_wst_…" }</code>; the plaintext <code>token</code> is returned once and only its SHA-256 digest is stored. List responses never include the secret. Revocation takes effect on the next request.</p>
 
 <h2 id="cats">Cats</h2>
 <pre><code>POST   /v1/workspaces/{workspace_id}/cats
@@ -32,6 +35,7 @@ GET    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
 PUT    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend</code></pre>
 <p>Lifecycle verbs are <code>start</code>, <code>stop</code>, <code>suspend</code>, <code>resume</code>, and <code>warm</code>. <code>auto_suspend</code> defaults to <code>true</code> when omitted from create. Cat create/lifecycle/delete returns an asynchronous Operation response; poll the Operation URL instead of repeating a timed-out mutation with a new intent.</p>
 <p>Cat, Disk, and Operation responses include the immutable <code>workspace_id</code>, which is the only ownership key.</p>
+<p><code>exec</code> accepts <code>command</code>, optional <code>timeout_ms</code>, an optional string map <code>env</code>, and optional byte array <code>stdin</code>. <code>env</code> is passed only to the child process and is not stored in the Cats registry. The response contains <code>exit_code</code>, <code>stdout</code>, and <code>stderr</code>.</p>
 <pre><code>POST /v1/workspaces/ws_01J8QK.../cats
 Idempotency-Key: request-7f12
 

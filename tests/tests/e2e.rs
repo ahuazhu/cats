@@ -17,6 +17,8 @@ use cats_node_agent::runtime::NodeConfig;
 use cats_node_agent::server::{spawn as spawn_node, Handle as NodeHandle, ServerConfig};
 use cats_node_agent::testutil::workspace_bin;
 use cats_storage::{AdapterConfig, AdapterSelection, MetadataStore};
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 const SERVICE_TOKEN: &str = "dev-service-token";
 const ADMIN_TOKEN: &str = "dev-admin-token";
@@ -399,6 +401,131 @@ async fn work_driven_fast_suspend_and_gateway_wake_loop() {
 
     cluster.cli_ok(&["sleep", "off", "nap"]).await;
     cluster.cli_ok(&["destroy", "nap"]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_endpoint_proxies_websocket_frames() {
+    let cluster = Cluster::start(&["node-a"]).await;
+    cluster
+        .cli_ok(&[
+            "create",
+            "realtime",
+            "--root-size",
+            "8MiB",
+            "--memory",
+            "256MiB",
+            "--cpus",
+            "1",
+            "--no-auto-suspend",
+        ])
+        .await;
+    let hostname = cluster.endpoint_hostname("realtime", "web").await;
+    let url = format!("{}/agent-ws", cluster.gateway.base_url()).replacen("http://", "ws://", 1);
+    let mut request = url.into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("host", hostname.parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+
+    socket.send("hello from pr staging".into()).await.unwrap();
+    assert_eq!(
+        socket.next().await.unwrap().unwrap().into_text().unwrap(),
+        "hello from pr staging"
+    );
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            vec![0, 1, 2, 255].into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        socket.next().await.unwrap().unwrap().into_data(),
+        vec![0, 1, 2, 255]
+    );
+    socket.close(None).await.unwrap();
+    cluster.cli_ok(&["destroy", "realtime"]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automation_token_is_confined_to_one_workspace_and_revocable() {
+    let cluster = Cluster::start(&["node-a"]).await;
+    let created = cluster
+        .http
+        .post(format!(
+            "{}/v1/workspaces/{}/tokens",
+            cluster.cp.base_url(),
+            cluster.workspace_id
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .json(&serde_json::json!({ "label": "CI preview" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let created: cats_api::requests::CreatedWorkspaceToken = created.json().await.unwrap();
+
+    let own = cluster
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{}/cats",
+            cluster.cp.base_url(),
+            cluster.workspace_id
+        ))
+        .bearer_auth(&created.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(own.status(), 200);
+    let other = cluster
+        .http
+        .get(format!(
+            "{}/v1/workspaces/ws_not_owned/cats",
+            cluster.cp.base_url()
+        ))
+        .bearer_auth(&created.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other.status(), 403);
+    let mint_another = cluster
+        .http
+        .post(format!(
+            "{}/v1/workspaces/{}/tokens",
+            cluster.cp.base_url(),
+            cluster.workspace_id
+        ))
+        .bearer_auth(&created.token)
+        .json(&serde_json::json!({ "label": "not allowed" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mint_another.status(), 403);
+
+    let revoked = cluster
+        .http
+        .delete(format!(
+            "{}/v1/workspaces/{}/tokens/{}",
+            cluster.cp.base_url(),
+            cluster.workspace_id,
+            created.access_token.id
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), 204);
+    let after_revoke = cluster
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{}/cats",
+            cluster.cp.base_url(),
+            cluster.workspace_id
+        ))
+        .bearer_auth(&created.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(after_revoke.status(), 401);
 }
 
 /// §20.1 正常路径 (KVM-free rendition): create -> exec -> endpoint ->

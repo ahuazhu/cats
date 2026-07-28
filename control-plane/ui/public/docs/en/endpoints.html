@@ -23,11 +23,11 @@ cats endpoint ls dev</code></pre>
 <p>A client should tolerate <code>503</code> with retry guidance during activation and reconnect after lifecycle or host changes. Stable hostname does not mean stable long-lived connections.</p>
 
 <h2 id="protocols">Protocols and routing safety</h2>
-<p>The implemented path supports HTTP/1.1 with HTTPS termination at the regional edge. It preserves method, path/query, application headers, response status, and request/response bodies. The owning node revalidates Cat ownership and Running state; an old cached route fails closed instead of reaching a different Guest. WebSocket support is a later milestone.</p>
+<p>The implemented path supports HTTP/1.1 and WebSocket Upgrade with TLS termination at the regional edge. HTTP preserves method, path/query, application headers, response status, and request/response bodies. WebSocket preserves application headers and relays text, binary, ping, pong, and close frames while holding a work lease for the connection. The owning node revalidates Cat ownership and Running state; an old cached route fails closed instead of reaching a different Guest.</p>
 
 <h2 id="availability">Where this stands today</h2>
-<p>HTTP ingress works: Endpoint addresses, route binding and wake-on-request are all in place.</p>
-<p>Not yet available: <strong>inbound WebSocket</strong>, and <strong>private Guest-to-Guest networking across nodes</strong>.</p></div>
+<p>HTTP and WebSocket ingress work: Endpoint addresses, route binding, wake-on-request, and connection-length work leases are in place.</p>
+<p>Not yet available: <strong>private Guest-to-Guest networking across nodes</strong>.</p></div>
 
 <h2 id="guest-service">Prepare the Guest service</h2>
 <ol>

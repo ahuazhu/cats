@@ -58,6 +58,11 @@ pub enum Command {
         #[command(subcommand)]
         cmd: WorkspaceCommand,
     },
+    /// Manage revocable machine credentials for the selected workspace.
+    Token {
+        #[command(subcommand)]
+        cmd: TokenCommand,
+    },
     /// Create a cat (its root disk is created automatically).
     Create {
         name: String,
@@ -104,6 +109,13 @@ pub enum Command {
         /// can exceed.
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<u64>,
+        /// Read newline-delimited NAME=VALUE entries and pass them only to the
+        /// child process. This avoids putting deploy secrets in argv.
+        #[arg(long, value_name = "PATH")]
+        env_file: Option<std::path::PathBuf>,
+        /// Connect the contents of PATH to the command's standard input.
+        #[arg(long, value_name = "PATH")]
+        stdin_file: Option<std::path::PathBuf>,
         /// Command argv, after `--`.
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -165,6 +177,22 @@ pub enum WorkspaceCommand {
     List,
     /// Save the default workspace for subsequent commands.
     Use { name: String },
+    /// Create a workspace beside the currently selected one.
+    Create {
+        slug: String,
+        #[arg(long)]
+        display_name: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TokenCommand {
+    /// Create a token. The secret is printed once and never stored by Cats.
+    Create { label: String },
+    /// List active tokens without revealing their secrets.
+    List,
+    /// Revoke one token by ID.
+    Revoke { id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -507,6 +535,34 @@ pub fn run(cli: Cli) -> Result<()> {
                     let workspace = auth::switch_workspace(cli.api_url.as_deref(), name)?;
                     println!("Current workspace: {}", workspace.selector());
                 }
+                WorkspaceCommand::Create { slug, display_name } => {
+                    let session = auth::user_session(
+                        cli.api_url.as_deref(),
+                        workspace_override(&cli).as_deref(),
+                    )?;
+                    let account_id = session
+                        .config
+                        .workspaces
+                        .iter()
+                        .find(|workspace| workspace.id == session.workspace)
+                        .map(|workspace| workspace.account_id.clone())
+                        .context("selected workspace disappeared from the login session")?;
+                    let client = Client::from_user_session(session)?;
+                    let value = client.send(
+                        client
+                            .http
+                            .post(format!(
+                                "{}/v1/accounts/{}/workspaces",
+                                client.base, account_id
+                            ))
+                            .json(&cats_api::auth::CreateWorkspaceRequest {
+                                slug: slug.clone(),
+                                display_name: display_name.clone().unwrap_or_else(|| slug.clone()),
+                            }),
+                    )?;
+                    let workspace: cats_api::auth::Workspace = serde_json::from_value(value)?;
+                    println!("{}", workspace.selector());
+                }
             }
             return Ok(());
         }
@@ -539,6 +595,37 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Login | Command::Logout | Command::Whoami | Command::Workspace { .. } => {
             unreachable!("handled before API client construction")
         }
+        Command::Token { cmd } => match cmd {
+            TokenCommand::Create { label } => {
+                let value = client.post("/tokens", Some(json!({ "label": label })))?;
+                let created: CreatedWorkspaceToken = serde_json::from_value(value)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&created)?);
+                } else {
+                    println!("Token ID: {}", created.access_token.id);
+                    println!("Token: {}", created.token);
+                    println!("Save it now; Cats will not show it again.");
+                }
+                Ok(())
+            }
+            TokenCommand::List => {
+                let list: ListResponse<WorkspaceToken> =
+                    serde_json::from_value(client.get("/tokens")?)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&list.items)?);
+                } else {
+                    for token in list.items {
+                        println!("{}  {}", token.id, token.label);
+                    }
+                }
+                Ok(())
+            }
+            TokenCommand::Revoke { id } => {
+                client.send(client.http.delete(client.url(&format!("/tokens/{id}"))))?;
+                println!("revoked {id}");
+                Ok(())
+            }
+        },
         Command::Create {
             name,
             image,
@@ -629,13 +716,34 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Exec {
             name,
             timeout,
+            env_file,
+            stdin_file,
             command,
         } => {
-            let mut body = json!({ "command": command });
+            let env = env_file
+                .as_deref()
+                .map(read_exec_env_file)
+                .transpose()?
+                .unwrap_or_default();
+            let stdin = stdin_file
+                .as_deref()
+                .map(std::fs::read)
+                .transpose()
+                .context("read exec stdin file")?
+                .unwrap_or_default();
+            let mut body = json!({ "command": command, "env": env, "stdin": stdin });
             if let Some(seconds) = timeout {
                 body["timeout_ms"] = json!(seconds * 1000);
             }
-            let v = client.post(&format!("/cats/{name}/exec"), Some(body))?;
+            let request_timeout =
+                Duration::from_secs(timeout.unwrap_or(120).saturating_add(15));
+            let v = client.send(
+                client
+                    .http
+                    .post(client.url(&format!("/cats/{name}/exec")))
+                    .timeout(request_timeout)
+                    .json(&body),
+            )?;
             let out: ExecResponse = serde_json::from_value(v)?;
             print!("{}", out.stdout);
             eprint!("{}", out.stderr);
@@ -766,6 +874,43 @@ pub fn run(cli: Cli) -> Result<()> {
         },
         Command::Admin { cmd } => run_admin(&client, &cli, cmd),
     }
+}
+
+fn read_exec_env_file(
+    path: &std::path::Path,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("read exec environment file {}", path.display()))?;
+    let mut env = std::collections::BTreeMap::new();
+    for (index, raw) in contents.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (name, value) = line.split_once('=').with_context(|| {
+            format!(
+                "{}:{} must be NAME=VALUE",
+                path.display(),
+                index.saturating_add(1)
+            )
+        })?;
+        anyhow::ensure!(
+            valid_env_name(name),
+            "{}:{} has invalid environment name",
+            path.display(),
+            index.saturating_add(1)
+        );
+        env.insert(name.to_string(), value.to_string());
+    }
+    Ok(env)
+}
+
+fn valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 fn print_work_status(work: &CatWorkStatus) {

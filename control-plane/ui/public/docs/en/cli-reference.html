@@ -12,10 +12,17 @@
 <pre><code>cats login
 cats whoami
 cats workspace list
+cats workspace create SLUG [--display-name NAME]
 cats workspace use ACCOUNT/WORKSPACE
 cats --workspace ACCOUNT/WORKSPACE ls
 cats logout</code></pre>
-<p><code>login</code> uses WorkOS Device Authorization and stores access/refresh material only in the operating-system credential store. Active WorkOS Organization memberships expose Personal and Organization Accounts and their Workspaces. <code>workspace use</code> changes the saved default; <code>--workspace</code> affects one command only. A same-Account switch is local, while a cross-Account switch rotates the WorkOS refresh token under a cross-process credential lock. <code>logout</code> attempts remote revocation and always removes the local credential.</p>
+<p><code>login</code> uses WorkOS Device Authorization and stores access/refresh material only in the operating-system credential store. Active WorkOS Organization memberships expose Personal and Organization Accounts and their Workspaces. <code>workspace create</code> adds an isolated Workspace to the selected Account and requires account-management permission. <code>workspace use</code> changes the saved default; <code>--workspace</code> affects one command only. A same-Account switch is local, while a cross-Account switch rotates the WorkOS refresh token under a cross-process credential lock. <code>logout</code> attempts remote revocation and always removes the local credential.</p>
+
+<h2 id="automation-tokens">Automation tokens</h2>
+<pre><code>cats token create LABEL
+cats token list
+cats token revoke ID</code></pre>
+<p>A Workspace token is a revocable machine credential for CI. It can manage resources only in the Workspace that issued it, cannot enumerate another Workspace, and cannot create or revoke tokens. The secret is shown once; store it in the CI secret manager and pass it as <code>CATS_TOKEN</code> together with the immutable Workspace ID in <code>CATS_WORKSPACE</code>.</p>
 
 <h2 id="cat-commands">Cat commands</h2>
 <pre><code>cats create NAME [--image IMAGE] [--cpus N] [--memory SIZE]
@@ -29,8 +36,10 @@ cats suspend NAME
 cats resume NAME
 cats warm NAME
 cats destroy NAME
-cats exec NAME -- COMMAND [ARG...]</code></pre>
+cats exec NAME [--timeout SECONDS] [--env-file PATH]
+               [--stdin-file PATH] -- COMMAND [ARG...]</code></pre>
 <p><code>create</code> defaults to image <code>ubuntu-24.04</code>, 2 CPUs, 2 GiB memory, a 1 GiB RootDisk, and auto-suspend enabled. Sizes accept <code>KiB</code>, <code>MiB</code>, <code>GiB</code>, or raw bytes.</p>
+<p><code>exec --env-file</code> accepts newline-delimited <code>NAME=VALUE</code> entries and adds them only to the Guest child process. <code>--stdin-file</code> sends arbitrary file bytes to standard input. These options let automation transfer a bootstrap script and runtime credentials without putting either in the command line; do not print secret-bearing files or command environments.</p>
 
 <h2 id="sleep-commands">Auto-suspend commands</h2>
 <pre><code>cats sleep on NAME
@@ -64,5 +73,5 @@ cats operation wait ID</code></pre>
   <li>Use <code>--json</code> instead of scraping aligned human output.</li>
   <li>Treat non-zero exit status as failure. <code>exec</code> also fails when the Guest command exits non-zero.</li>
   <li>Do not parse resource IDs, work lease IDs, or Operation IDs for meaning.</li>
-  <li>Use WorkOS login for users. Do not log token values or substitute service/administrator credentials for a user session.</li>
+  <li>Use WorkOS login for users and a Workspace token for CI. Do not log token values or substitute service/administrator credentials for either scope.</li>
 </ul>

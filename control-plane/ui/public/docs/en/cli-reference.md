@@ -15,11 +15,20 @@ Global options may appear before or after the subcommand. Use `cats --help` and 
     cats login
     cats whoami
     cats workspace list
+    cats workspace create SLUG [--display-name NAME]
     cats workspace use ACCOUNT/WORKSPACE
     cats --workspace ACCOUNT/WORKSPACE ls
     cats logout
 
-`login` uses WorkOS Device Authorization and stores access/refresh material only in the operating-system credential store. Active WorkOS Organization memberships expose Personal and Organization Accounts and their Workspaces. `workspace use` changes the saved default; `--workspace` affects one command only. A same-Account switch is local, while a cross-Account switch rotates the WorkOS refresh token under a cross-process credential lock. `logout` attempts remote revocation and always removes the local credential.
+`login` uses WorkOS Device Authorization and stores access/refresh material only in the operating-system credential store. Active WorkOS Organization memberships expose Personal and Organization Accounts and their Workspaces. `workspace create` adds an isolated Workspace to the selected Account and requires account-management permission. `workspace use` changes the saved default; `--workspace` affects one command only. A same-Account switch is local, while a cross-Account switch rotates the WorkOS refresh token under a cross-process credential lock. `logout` attempts remote revocation and always removes the local credential.
+
+## Automation tokens
+
+    cats token create LABEL
+    cats token list
+    cats token revoke ID
+
+A Workspace token is a revocable machine credential for CI. It can manage resources only in the Workspace that issued it, cannot enumerate another Workspace, and cannot create or revoke tokens. The secret is shown once; store it in the CI secret manager and pass it as `CATS_TOKEN` together with the immutable Workspace ID in `CATS_WORKSPACE`.
 
 ## Cat commands
 
@@ -34,9 +43,12 @@ Global options may appear before or after the subcommand. Use `cats --help` and 
     cats resume NAME
     cats warm NAME
     cats destroy NAME
-    cats exec NAME -- COMMAND [ARG...]
+    cats exec NAME [--timeout SECONDS] [--env-file PATH]
+                   [--stdin-file PATH] -- COMMAND [ARG...]
 
 `create` defaults to image `ubuntu-24.04`, 2 CPUs, 2 GiB memory, a 1 GiB RootDisk, and auto-suspend enabled. Sizes accept `KiB`, `MiB`, `GiB`, or raw bytes.
+
+`exec --env-file` accepts newline-delimited `NAME=VALUE` entries and adds them only to the Guest child process. `--stdin-file` sends arbitrary file bytes to standard input. These options let automation transfer a bootstrap script and runtime credentials without putting either in the command line; do not print secret-bearing files or command environments.
 
 ## Auto-suspend commands
 
@@ -77,4 +89,4 @@ Mutations normally wait up to 120 seconds. With `--no-wait`, save the returned I
 - Use `--json` instead of scraping aligned human output.
 - Treat non-zero exit status as failure. `exec` also fails when the Guest command exits non-zero.
 - Do not parse resource IDs, work lease IDs, or Operation IDs for meaning.
-- Use WorkOS login for users. Do not log token values or substitute service/administrator credentials for a user session.
+- Use WorkOS login for users and a Workspace token for CI. Do not log token values or substitute service/administrator credentials for either scope.

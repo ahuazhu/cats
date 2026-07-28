@@ -164,6 +164,13 @@ pub(crate) struct RuntimeActivityGuard {
     activity: Arc<RuntimeActivity>,
 }
 
+/// Network target for a streaming endpoint connection. FakeVmm exposes the
+/// guest workload on a Unix socket; real Cats use the guest tap address.
+pub(crate) enum ProxyTarget {
+    Unix(PathBuf),
+    Tcp(std::net::SocketAddr),
+}
+
 /// Process and filesystem identities used by the heartbeat sampler to
 /// attribute host resource use to one Cat.
 #[derive(Clone)]
@@ -1808,6 +1815,16 @@ impl NodeRuntime {
     // ------------------------------------------------------------------
 
     pub fn exec(&self, cat_id: &str, command: Vec<String>) -> Result<(i32, String, String)> {
+        self.exec_with_input(cat_id, command, Default::default(), Vec::new())
+    }
+
+    pub fn exec_with_input(
+        &self,
+        cat_id: &str,
+        command: Vec<String>,
+        env: std::collections::BTreeMap<String, String>,
+        stdin: Vec<u8>,
+    ) -> Result<(i32, String, String)> {
         let (conn, activity) = {
             let cats = self.cats.lock().unwrap();
             let rt = cats
@@ -1820,7 +1837,7 @@ impl NodeRuntime {
         };
         let _guard = activity.acquire()?;
         let mut client = conn.connect_long_running()?;
-        client.exec(command)
+        client.exec_with_input(command, env, stdin)
     }
 
     pub(crate) fn open_shell(
@@ -1854,11 +1871,6 @@ impl NodeRuntime {
         request: &ProxyHttpRequest,
     ) -> Result<ProxyHttpResponse> {
         use std::io::{Read, Write};
-        enum Target {
-            Unix(PathBuf),
-            Tcp(std::net::SocketAddr),
-        }
-
         anyhow::ensure!(
             request.target_port > 0,
             "endpoint target port must be non-zero"
@@ -1879,9 +1891,9 @@ impl NodeRuntime {
                         .context("invalid guest address")?
                         .parse::<std::net::IpAddr>()
                         .context("invalid guest IP")?;
-                    Target::Tcp(std::net::SocketAddr::new(ip, request.target_port))
+                    ProxyTarget::Tcp(std::net::SocketAddr::new(ip, request.target_port))
                 }
-                None => Target::Unix(rt.web_socket()),
+                None => ProxyTarget::Unix(rt.web_socket()),
             };
             (target, rt.activity.clone())
         };
@@ -1889,7 +1901,7 @@ impl NodeRuntime {
         let raw_request = build_guest_http_request(request)?;
         let mut buf = Vec::new();
         match target {
-            Target::Unix(path) => {
+            ProxyTarget::Unix(path) => {
                 let mut stream = std::os::unix::net::UnixStream::connect(&path)?;
                 stream.set_read_timeout(Some(Duration::from_secs(30)))?;
                 stream.set_write_timeout(Some(Duration::from_secs(10)))?;
@@ -1898,7 +1910,7 @@ impl NodeRuntime {
                     .take((MAX_PROXY_RESPONSE_BYTES + 1) as u64)
                     .read_to_end(&mut buf)?;
             }
-            Target::Tcp(address) => {
+            ProxyTarget::Tcp(address) => {
                 let mut stream =
                     std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5))
                         .with_context(|| format!("connect guest service {address}"))?;
@@ -1915,6 +1927,43 @@ impl NodeRuntime {
             "guest response exceeds {MAX_PROXY_RESPONSE_BYTES} bytes"
         );
         parse_guest_http_response(&buf)
+    }
+
+    /// Resolve a streaming endpoint and hold the runtime activity fence for
+    /// the entire connection. Callers must keep the returned guard alive.
+    pub(crate) fn open_proxy_target(
+        &self,
+        cat_id: &str,
+        target_port: u16,
+    ) -> Result<(ProxyTarget, RuntimeActivityGuard)> {
+        anyhow::ensure!(target_port > 0, "endpoint target port must be non-zero");
+        let (target, activity) = {
+            let cats = self.cats.lock().unwrap();
+            let runtime = cats.get(cat_id).context("cat is not active on this node")?;
+            if runtime.state != ObservedState::Running {
+                bail!("cat is not active on this node (state {:?})", runtime.state);
+            }
+            let target = match runtime.ch.as_ref() {
+                Some(ch_runtime) => {
+                    let network = ch_runtime
+                        .network
+                        .as_ref()
+                        .context("cat has no guest network")?;
+                    let ip = network
+                        .guest_ip
+                        .split('/')
+                        .next()
+                        .context("invalid guest address")?
+                        .parse::<std::net::IpAddr>()
+                        .context("invalid guest IP")?;
+                    ProxyTarget::Tcp(std::net::SocketAddr::new(ip, target_port))
+                }
+                None => ProxyTarget::Unix(runtime.web_socket()),
+            };
+            (target, runtime.activity.clone())
+        };
+        let guard = activity.acquire()?;
+        Ok((target, guard))
     }
 }
 
@@ -2056,8 +2105,18 @@ fn build_guest_http_request(request: &ProxyHttpRequest) -> Result<Vec<u8>> {
             && !request.path.contains('\n'),
         "invalid HTTP request path"
     );
+    let guest_host = request
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-forwarded-host"))
+        .map(|(_, value)| value.as_str())
+        .unwrap_or("guest");
+    anyhow::ensure!(
+        !guest_host.contains('\r') && !guest_host.contains('\n'),
+        "invalid forwarded host"
+    );
     let mut raw = format!(
-        "{} {} HTTP/1.1\r\nhost: guest\r\n",
+        "{} {} HTTP/1.1\r\nhost: {guest_host}\r\n",
         request.method, request.path
     )
     .into_bytes();
@@ -2307,6 +2366,7 @@ mod proxy_tests {
         let raw = build_guest_http_request(&request).unwrap();
         let text = String::from_utf8(raw).unwrap();
         assert!(text.starts_with("POST /api/items?q=one HTTP/1.1\r\n"));
+        assert!(text.contains("host: guest\r\n"));
         assert!(text.contains("content-type: application/json\r\n"));
         assert!(text.contains("x-cats-route-epoch: 7\r\n"));
         assert!(!text.contains("keep-alive"));

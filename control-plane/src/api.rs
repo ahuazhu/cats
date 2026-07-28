@@ -75,7 +75,12 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 enum Principal {
     Service,
     Administrator,
+    WorkspaceAutomation { workspace_id: String },
     User(crate::auth::AccessIdentity),
+}
+
+fn workspace_token_hash(token: &str) -> String {
+    hex::encode(Sha256::digest(token.as_bytes()))
 }
 
 async fn bearer_principal(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<Principal>> {
@@ -87,6 +92,12 @@ async fn bearer_principal(state: &AppState, headers: &HeaderMap) -> ApiResult<Op
     }
     if token == state.cfg.admin_token {
         return Ok(Some(Principal::Administrator));
+    }
+    if let Some(workspace_id) = state
+        .store
+        .active_workspace_for_token_hash(&workspace_token_hash(token))?
+    {
+        return Ok(Some(Principal::WorkspaceAutomation { workspace_id }));
     }
     let workos =
         state.cfg.workos.as_ref().ok_or_else(|| {
@@ -148,6 +159,7 @@ async fn check_workspace_auth(
             resolved_scope = Some(scope);
             allowed
         }
+        Some(Principal::WorkspaceAutomation { workspace_id }) => workspace_id == workspace,
         Some(Principal::Service) | None => false,
     };
     if bearer_allowed || crate::auth::web_session_allows_workspace(state, headers, workspace).await? {
@@ -161,6 +173,19 @@ async fn check_workspace_auth(
     ))
 }
 
+async fn check_workspace_token_admin(
+    state: &AppState,
+    headers: &HeaderMap,
+    workspace: &str,
+) -> ApiResult<crate::store::WorkspaceScope> {
+    match bearer_principal(state, headers).await? {
+        Some(Principal::WorkspaceAutomation { .. }) | Some(Principal::Service) => {
+            Err(auth_failure(true))
+        }
+        _ => check_workspace_auth(state, headers, workspace).await,
+    }
+}
+
 async fn check_admin_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
     let principal = bearer_principal(state, headers).await?;
     let bearer_allowed = match &principal {
@@ -170,7 +195,7 @@ async fn check_admin_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()
             .workos
             .as_ref()
             .is_some_and(|workos| workos.is_fleet_administrator(identity)),
-        Some(Principal::Service) | None => false,
+        Some(Principal::Service | Principal::WorkspaceAutomation { .. }) | None => false,
     };
     if bearer_allowed || crate::auth::web_session_is_admin(state, headers) {
         return Ok(());
@@ -379,6 +404,14 @@ pub fn router(state: AppState) -> Router {
             post(create_endpoint).get(list_endpoints),
         )
         .route(
+            "/v1/workspaces/{workspace}/tokens",
+            post(create_workspace_token).get(list_workspace_tokens),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/tokens/{token}",
+            axum::routing::delete(revoke_workspace_token),
+        )
+        .route(
             "/v1/workspaces/{workspace}/disks",
             post(create_disk).get(list_disks),
         )
@@ -514,6 +547,54 @@ async fn create_account_workspace(
         Json(workspace_response(&state, &account, &workspace.id)?),
     )
         .into_response())
+}
+
+async fn create_workspace_token(
+    State(state): State<AppState>,
+    Path(workspace): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<CreateWorkspaceTokenRequest>,
+) -> ApiResult<Response> {
+    check_workspace_token_admin(&state, &headers, &workspace).await?;
+    let secret = format!(
+        "cats_wst_{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let access_token = state.store.create_workspace_token(
+        &workspace,
+        &request.label,
+        &workspace_token_hash(&secret),
+    )?;
+    Ok((
+        StatusCode::CREATED,
+        Json(CreatedWorkspaceToken {
+            access_token,
+            token: secret,
+        }),
+    )
+        .into_response())
+}
+
+async fn list_workspace_tokens(
+    State(state): State<AppState>,
+    Path(workspace): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ListResponse<WorkspaceToken>>> {
+    check_workspace_token_admin(&state, &headers, &workspace).await?;
+    Ok(Json(ListResponse {
+        items: state.store.workspace_tokens(&workspace)?,
+    }))
+}
+
+async fn revoke_workspace_token(
+    State(state): State<AppState>,
+    Path((workspace, token)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    check_workspace_token_admin(&state, &headers, &workspace).await?;
+    state.store.revoke_workspace_token(&workspace, &token)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn update_workspace(

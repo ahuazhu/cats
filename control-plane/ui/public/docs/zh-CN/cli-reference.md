@@ -15,11 +15,20 @@
     cats login
     cats whoami
     cats workspace list
+    cats workspace create SLUG [--display-name NAME]
     cats workspace use ACCOUNT/WORKSPACE
     cats --workspace ACCOUNT/WORKSPACE ls
     cats logout
 
-`login` 使用 WorkOS Device Authorization，并且只把 Access/Refresh 信息保存到操作系统凭据存储。Active WorkOS Organization Membership 会暴露 Personal/Organization Account 及其 Workspace。`workspace use` 修改已保存默认值，`--workspace` 只影响一条命令；同 Account 切换为本地操作，跨 Account 则在跨进程凭据锁内轮换 WorkOS Refresh Token。`logout` 会尝试远端撤销，并始终删除本地凭据。
+`login` 使用 WorkOS Device Authorization，并且只把 Access/Refresh 信息保存到操作系统凭据存储。Active WorkOS Organization Membership 会暴露 Personal/Organization Account 及其 Workspace。`workspace create` 会在当前 Account 下增加一个隔离 Workspace，并要求 Account 管理权限。`workspace use` 修改已保存默认值，`--workspace` 只影响一条命令；同 Account 切换为本地操作，跨 Account 则在跨进程凭据锁内轮换 WorkOS Refresh Token。`logout` 会尝试远端撤销，并始终删除本地凭据。
+
+## 自动化 Token
+
+    cats token create LABEL
+    cats token list
+    cats token revoke ID
+
+Workspace Token 是供 CI 使用、可撤销的机器凭据。它只能管理签发 Workspace 内的资源，不能枚举其他 Workspace，也不能创建或撤销 Token。Secret 只展示一次；请保存到 CI 的 Secret Manager，并将它作为 `CATS_TOKEN`、将不可变 Workspace ID 作为 `CATS_WORKSPACE` 传入。
 
 ## Cat 命令
 
@@ -34,9 +43,12 @@
     cats resume NAME
     cats warm NAME
     cats destroy NAME
-    cats exec NAME -- COMMAND [ARG...]
+    cats exec NAME [--timeout SECONDS] [--env-file PATH]
+                   [--stdin-file PATH] -- COMMAND [ARG...]
 
 `create` 默认使用 `ubuntu-24.04` 镜像、2 CPU、2 GiB 内存、1 GiB RootDisk，并开启自动休眠。容量支持 `KiB`、`MiB`、`GiB` 或原始字节。
+
+`exec --env-file` 接受逐行 `NAME=VALUE`，并且只把它们加入 Guest 子进程环境；`--stdin-file` 将任意文件字节送入标准输入。自动化可以用它们传递 Bootstrap Script 和运行时凭据，而无需把内容放到命令行。不要打印含 Secret 的文件或进程环境。
 
 ## 自动休眠命令
 
@@ -77,4 +89,4 @@
 - 使用 `--json`，不要解析对齐后的人类可读输出。
 - 把非零退出码视为失败。Guest 命令非零时，`exec` 也会失败。
 - 不要从 Resource ID、Work Lease ID 或 Operation ID 中解析含义。
-- 普通用户使用 WorkOS 登录；不要记录 Token，也不要用 Service/Administrator 凭据代替用户 Session。
+- 普通用户使用 WorkOS 登录，CI 使用 Workspace Token；不要记录 Token，也不要用 Service/Administrator 凭据替代这两种 Scope。

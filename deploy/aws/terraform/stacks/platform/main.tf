@@ -73,12 +73,13 @@ module "dns" {
 module "github_release" {
   source = "../../modules/github-actions-oidc"
 
-  name_prefix          = var.name_prefix
-  github_repository    = var.github_repository
-  default_branch       = var.github_default_branch
-  create_oidc_provider = var.create_github_oidc_provider
-  ecr_repository_arns  = [aws_ecr_repository.control_plane.arn]
-  tags                 = var.tags
+  name_prefix               = var.name_prefix
+  github_repository         = var.github_repository
+  github_subject_repository = var.github_subject_repository
+  default_branch            = var.github_default_branch
+  create_oidc_provider      = var.create_github_oidc_provider
+  ecr_repository_arns       = [aws_ecr_repository.control_plane.arn]
+  tags                      = var.tags
 }
 
 # Bare-metal workers: the network position they occupy. cats-noded listens on

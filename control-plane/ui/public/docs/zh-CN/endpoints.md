@@ -30,13 +30,13 @@
 
 ## 协议与路由安全
 
-当前实现支持 HTTP/1.1，并由区域 Edge 终止 HTTPS；method、path/query、应用 headers、响应状态和请求/响应 body 都会保留。Owning Node 会重新校验 Cat ownership 与 Running 状态；旧 Route Cache 必须 fail closed，不能到达另一个 Guest。WebSocket 属于后续里程碑。
+当前实现支持 HTTP/1.1 和 WebSocket Upgrade，并由区域 Edge 终止 TLS。HTTP 会保留 method、path/query、应用 headers、响应状态和请求/响应 body；WebSocket 会保留应用 headers，转发 text、binary、ping、pong、close frame，并在整条连接期间持有 work lease。Owning Node 会重新校验 Cat ownership 与 Running 状态；旧 Route Cache 必须 fail closed，不能到达另一个 Guest。
 
 ## 现在支持到哪
 
-HTTP 入站已经可用：Endpoint 地址、路由绑定和按请求唤醒都能正常工作。
+HTTP 与 WebSocket 入站已经可用：Endpoint 地址、路由绑定、按请求唤醒和覆盖整条连接的 work lease 都能正常工作。
 
-尚未提供：**WebSocket 入站**，以及**跨 Node 的 Guest 私网互通**。
+尚未提供：**跨 Node 的 Guest 私网互通**。
 
 ## 准备 Guest 服务
 

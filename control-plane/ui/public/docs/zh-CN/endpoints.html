@@ -23,11 +23,11 @@ cats endpoint ls dev</code></pre>
 <p>激活期间客户端应能处理带重试提示的 <code>503</code>，并在生命周期或 Host 变化后重新连接。稳定域名不代表长连接永不变化。</p>
 
 <h2 id="protocols">协议与路由安全</h2>
-<p>当前实现支持 HTTP/1.1，并由区域 Edge 终止 HTTPS；method、path/query、应用 headers、响应状态和请求/响应 body 都会保留。Owning Node 会重新校验 Cat ownership 与 Running 状态；旧 Route Cache 必须 fail closed，不能到达另一个 Guest。WebSocket 属于后续里程碑。</p>
+<p>当前实现支持 HTTP/1.1 和 WebSocket Upgrade，并由区域 Edge 终止 TLS。HTTP 会保留 method、path/query、应用 headers、响应状态和请求/响应 body；WebSocket 会保留应用 headers，转发 text、binary、ping、pong、close frame，并在整条连接期间持有 work lease。Owning Node 会重新校验 Cat ownership 与 Running 状态；旧 Route Cache 必须 fail closed，不能到达另一个 Guest。</p>
 
 <h2 id="availability">现在支持到哪</h2>
-<p>HTTP 入站已经可用：Endpoint 地址、路由绑定和按请求唤醒都能正常工作。</p>
-<p>尚未提供：<strong>WebSocket 入站</strong>，以及<strong>跨 Node 的 Guest 私网互通</strong>。</p></div>
+<p>HTTP 与 WebSocket 入站已经可用：Endpoint 地址、路由绑定、按请求唤醒和覆盖整条连接的 work lease 都能正常工作。</p>
+<p>尚未提供：<strong>跨 Node 的 Guest 私网互通</strong>。</p></div>
 
 <h2 id="guest-service">准备 Guest 服务</h2>
 <ol>

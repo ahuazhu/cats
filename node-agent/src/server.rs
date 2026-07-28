@@ -12,11 +12,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use cats_api::guest::GuestShellFrame;
 use cats_api::metering::{CatUsageCheckpoint, IngestUsageCheckpointsRequest, UsageMetric};
@@ -32,7 +35,8 @@ use cats_storage::MetadataStore;
 
 use crate::guest_client::GuestShell;
 use crate::runtime::{
-    CatTelemetryTarget, GuestConn, NodeConfig, NodeRuntime, RuntimeActivityGuard, UsageFinalizer,
+    CatTelemetryTarget, GuestConn, NodeConfig, NodeRuntime, ProxyTarget, RuntimeActivityGuard,
+    UsageFinalizer,
 };
 use crate::usage_spool::UsageSpool;
 
@@ -221,7 +225,10 @@ async fn handle_exec(
         return code.into_response();
     }
     let runtime = state.runtime.clone();
-    let result = tokio::task::spawn_blocking(move || runtime.exec(&cat_id, req.command)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        runtime.exec_with_input(&cat_id, req.command, req.env, req.stdin)
+    })
+    .await;
     match result {
         Ok(Ok((exit_code, stdout, stderr))) => Json(ExecResponse {
             exit_code,
@@ -411,6 +418,183 @@ async fn handle_proxy(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct ProxyWebSocketQuery {
+    target_port: u16,
+    #[allow(dead_code)]
+    route_epoch: i64,
+    path: String,
+}
+
+trait ProxyIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> ProxyIo for T {}
+type BoxProxyIo = Box<dyn ProxyIo>;
+type GuestWebSocket = tokio_tungstenite::WebSocketStream<BoxProxyIo>;
+
+async fn handle_proxy_websocket(
+    State(state): State<NodeState>,
+    Path(cat_id): Path<String>,
+    Query(query): Query<ProxyWebSocketQuery>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Err(code) = check_auth(&state.cfg, &headers) {
+        return code.into_response();
+    }
+    let forwarded = match decode_forwarded_headers(&headers) {
+        Ok(headers) => headers,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let runtime = state.runtime.clone();
+    let target_port = query.target_port;
+    let opened =
+        tokio::task::spawn_blocking(move || runtime.open_proxy_target(&cat_id, target_port)).await;
+    let (target, activity_guard) = match opened {
+        Ok(Ok(opened)) => opened,
+        Ok(Err(error)) => {
+            let message = format!("{error:#}");
+            let status = if message.contains("cat is not active on this node") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            return (status, message).into_response();
+        }
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+    };
+    let guest = match connect_guest_websocket(target, &query.path, forwarded).await {
+        Ok(guest) => guest,
+        Err(error) => return (StatusCode::BAD_GATEWAY, format!("{error:#}")).into_response(),
+    };
+    let selected_protocol = guest
+        .1
+        .headers()
+        .get(header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let upgrade = if let Some(protocol) = selected_protocol {
+        ws.protocols([protocol])
+    } else {
+        ws
+    };
+    upgrade.on_upgrade(move |socket| bridge_endpoint_websocket(socket, guest.0, activity_guard))
+}
+
+fn decode_forwarded_headers(headers: &HeaderMap) -> Result<Vec<(String, String)>, String> {
+    let encoded = headers
+        .get("x-cats-forwarded-headers")
+        .ok_or_else(|| "missing forwarded headers".to_string())?
+        .to_str()
+        .map_err(|_| "forwarded headers are not text".to_string())?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| "forwarded headers are not valid base64".to_string())?;
+    serde_json::from_slice(&bytes).map_err(|_| "forwarded headers are not valid JSON".to_string())
+}
+
+async fn connect_guest_websocket(
+    target: ProxyTarget,
+    path: &str,
+    forwarded: Vec<(String, String)>,
+) -> anyhow::Result<(GuestWebSocket, axum::http::Response<Option<Vec<u8>>>)> {
+    let request = build_guest_websocket_request(path, forwarded)?;
+    let stream: BoxProxyIo = match target {
+        ProxyTarget::Unix(path) => Box::new(
+            tokio::net::UnixStream::connect(path)
+                .await
+                .context("connect guest WebSocket Unix socket")?,
+        ),
+        ProxyTarget::Tcp(address) => Box::new(
+            tokio::net::TcpStream::connect(address)
+                .await
+                .with_context(|| format!("connect guest WebSocket {address}"))?,
+        ),
+    };
+    tokio_tungstenite::client_async(request, stream)
+        .await
+        .context("guest WebSocket handshake")
+}
+
+fn build_guest_websocket_request(
+    path: &str,
+    forwarded: Vec<(String, String)>,
+) -> anyhow::Result<axum::http::Request<()>> {
+    anyhow::ensure!(path.starts_with('/'), "invalid WebSocket request path");
+    let mut request = format!("ws://guest{path}")
+        .into_client_request()
+        .context("build guest WebSocket request")?;
+    if let Some((_, host)) = forwarded
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-forwarded-host"))
+    {
+        request.headers_mut().insert(
+            header::HOST,
+            HeaderValue::try_from(host).context("invalid forwarded host")?,
+        );
+    }
+    for (name, value) in forwarded {
+        if name.eq_ignore_ascii_case("host")
+            || name.eq_ignore_ascii_case("connection")
+            || name.eq_ignore_ascii_case("upgrade")
+            || name.eq_ignore_ascii_case("sec-websocket-key")
+            || name.eq_ignore_ascii_case("sec-websocket-version")
+            || name.eq_ignore_ascii_case("sec-websocket-accept")
+            || name.eq_ignore_ascii_case("sec-websocket-extensions")
+        {
+            continue;
+        }
+        let name = HeaderName::try_from(name).context("invalid forwarded header name")?;
+        let value = HeaderValue::try_from(value).context("invalid forwarded header value")?;
+        request.headers_mut().append(name, value);
+    }
+    Ok(request)
+}
+
+async fn bridge_endpoint_websocket(
+    socket: WebSocket,
+    guest: GuestWebSocket,
+    _activity_guard: RuntimeActivityGuard,
+) {
+    let (mut client_sender, mut client_receiver) = socket.split();
+    let (mut guest_sender, mut guest_receiver) = guest.split();
+    loop {
+        tokio::select! {
+            incoming = client_receiver.next() => {
+                let Some(Ok(message)) = incoming else { break };
+                let message = match message {
+                    Message::Text(data) => tokio_tungstenite::tungstenite::Message::Text(data.to_string().into()),
+                    Message::Binary(data) => tokio_tungstenite::tungstenite::Message::Binary(data),
+                    Message::Ping(data) => tokio_tungstenite::tungstenite::Message::Ping(data),
+                    Message::Pong(data) => tokio_tungstenite::tungstenite::Message::Pong(data),
+                    Message::Close(_) => tokio_tungstenite::tungstenite::Message::Close(None),
+                };
+                if guest_sender.send(message).await.is_err() {
+                    break;
+                }
+            }
+            outgoing = guest_receiver.next() => {
+                let Some(Ok(message)) = outgoing else { break };
+                let message = match message {
+                    tokio_tungstenite::tungstenite::Message::Text(data) => Message::Text(data.to_string().into()),
+                    tokio_tungstenite::tungstenite::Message::Binary(data) => Message::Binary(data),
+                    tokio_tungstenite::tungstenite::Message::Ping(data) => Message::Ping(data),
+                    tokio_tungstenite::tungstenite::Message::Pong(data) => Message::Pong(data),
+                    tokio_tungstenite::tungstenite::Message::Close(_) => Message::Close(None),
+                    tokio_tungstenite::tungstenite::Message::Frame(_) => continue,
+                };
+                if client_sender.send(message).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = guest_sender
+        .send(tokio_tungstenite::tungstenite::Message::Close(None))
+        .await;
+}
+
 pub fn router(state: NodeState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -418,7 +602,35 @@ pub fn router(state: NodeState) -> Router {
         .route("/v1/cats/{id}/exec", post(handle_exec))
         .route("/v1/cats/{id}/shell", get(handle_shell))
         .route("/v1/cats/{id}/proxy", post(handle_proxy))
+        .route("/v1/cats/{id}/proxy-websocket", get(handle_proxy_websocket))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod proxy_websocket_tests {
+    use super::build_guest_websocket_request;
+
+    #[test]
+    fn guest_handshake_uses_the_trusted_public_host() {
+        let request = build_guest_websocket_request(
+            "/socket?token=one",
+            vec![
+                (
+                    "x-forwarded-host".to_string(),
+                    "preview-123.cats.run".to_string(),
+                ),
+                ("origin".to_string(), "https://preview-123.cats.run".to_string()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(request.uri().path_and_query().unwrap(), "/socket?token=one");
+        assert_eq!(request.headers()["host"], "preview-123.cats.run");
+        assert_eq!(
+            request.headers()["origin"],
+            "https://preview-123.cats.run"
+        );
+    }
 }
 
 #[derive(Clone, Copy)]

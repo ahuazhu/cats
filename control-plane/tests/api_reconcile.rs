@@ -1083,6 +1083,8 @@ async fn exec_wakes_a_cold_cat() {
         .json(&ExecRequest {
             command: vec!["echo".into(), "hi".into()],
             timeout_ms: None,
+            env: Default::default(),
+            stdin: Vec::new(),
         })
         .send()
         .await
@@ -1149,6 +1151,8 @@ async fn exec_retries_a_transient_suspend_conflict() {
         .json(&ExecRequest {
             command: vec!["pwd".into()],
             timeout_ms: None,
+            env: Default::default(),
+            stdin: Vec::new(),
         })
         .send()
         .await
