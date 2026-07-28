@@ -253,6 +253,21 @@ impl CatRuntime {
     }
 
     fn telemetry_target(&self, cat_id: &str) -> CatTelemetryTarget {
+        self.telemetry_target_with_metering(cat_id, self.state != ObservedState::Warm)
+    }
+
+    /// Lifecycle boundaries need one last authoritative cgroup sample even
+    /// after the runtime has entered Warm. Regular heartbeats must not see
+    /// that meter: Warm has no resident compute runtime (ADR-0002).
+    fn lifecycle_telemetry_target(&self, cat_id: &str) -> CatTelemetryTarget {
+        self.telemetry_target_with_metering(cat_id, true)
+    }
+
+    fn telemetry_target_with_metering(
+        &self,
+        cat_id: &str,
+        include_metering: bool,
+    ) -> CatTelemetryTarget {
         let mut process_ids = Vec::with_capacity(self.blockds.len() + 1);
         if let Some(guest) = &self.guest {
             process_ids.push(guest.id());
@@ -263,10 +278,14 @@ impl CatRuntime {
             generation: self.generation,
             process_ids,
             runtime_dir: self.dir.clone(),
-            metering: self.metering.as_ref().map(|metering| CatMeteringTarget {
-                cgroup_path: metering.cgroup_path.clone(),
-                source_epoch: metering.source_epoch.clone(),
-            }),
+            metering: if include_metering {
+                self.metering.as_ref().map(|metering| CatMeteringTarget {
+                    cgroup_path: metering.cgroup_path.clone(),
+                    source_epoch: metering.source_epoch.clone(),
+                })
+            } else {
+                None
+            },
         }
     }
 }
@@ -485,23 +504,32 @@ impl NodeRuntime {
         let job_id = job.job_id.clone();
         let cat_id = job.action.cat_id().to_string();
         let result = match self.run_action(&job) {
-            Ok(observed) => match self.set_runtime_generation(&cat_id, job.cat_generation) {
-                Ok(()) => NodeJobResult::ok(&job_id, observed),
-                Err(error) => {
-                    tracing::error!(
-                        job = %job_id,
-                        cat = %cat_id,
-                        %error,
-                        "final usage checkpoint failed; lifecycle job failed closed"
-                    );
-                    NodeJobResult::fail(
-                        &job_id,
-                        self.observed_of(&cat_id),
-                        format!("final usage checkpoint failed: {error:#}"),
-                        true,
-                    )
+            Ok(observed) => {
+                let lifecycle_boundary = if observed == ObservedState::Warm {
+                    self.retire_warm_metering(&cat_id)
+                } else {
+                    Ok(())
+                };
+                match lifecycle_boundary
+                    .and_then(|()| self.set_runtime_generation(&cat_id, job.cat_generation))
+                {
+                    Ok(()) => NodeJobResult::ok(&job_id, observed),
+                    Err(error) => {
+                        tracing::error!(
+                            job = %job_id,
+                            cat = %cat_id,
+                            %error,
+                            "final usage checkpoint failed; lifecycle job failed closed"
+                        );
+                        NodeJobResult::fail(
+                            &job_id,
+                            self.observed_of(&cat_id),
+                            format!("final usage checkpoint failed: {error:#}"),
+                            true,
+                        )
+                    }
                 }
-            },
+            }
             Err(e) => {
                 tracing::warn!(job = %job_id, "job failed: {e:#}");
                 let observed = self.observed_of(&cat_id);
@@ -539,7 +567,7 @@ impl NodeRuntime {
             if runtime.generation == generation {
                 return Ok(());
             }
-            runtime.telemetry_target(cat_id)
+            runtime.lifecycle_telemetry_target(cat_id)
         };
         self.finalize_usage(target)?;
         let mut cats = self.cats.lock().unwrap();
@@ -556,6 +584,46 @@ impl NodeRuntime {
             // in the new epoch establishes a fresh baseline.
             metering.source_epoch = uuid::Uuid::new_v4().simple().to_string();
         }
+        Ok(())
+    }
+
+    fn retire_warm_metering(&self, cat_id: &str) -> Result<()> {
+        let target = {
+            let cats = self.cats.lock().unwrap();
+            let runtime = cats
+                .get(cat_id)
+                .context("warm runtime vanished before usage finalization")?;
+            anyhow::ensure!(
+                runtime.state == ObservedState::Warm,
+                "cannot retire compute metering from {:?}",
+                runtime.state
+            );
+            runtime.lifecycle_telemetry_target(cat_id)
+        };
+        let Some(expected_metering) = target.metering.clone() else {
+            return Ok(());
+        };
+
+        // The Warm state already hides this epoch from heartbeat sampling.
+        // Persist its final checkpoint before dropping the cgroup identity so
+        // a failed lifecycle job can retry without inventing an interval.
+        self.finalize_usage(target)?;
+
+        let retired = {
+            let mut cats = self.cats.lock().unwrap();
+            cats.get_mut(cat_id).and_then(|runtime| {
+                let still_same_epoch = runtime.state == ObservedState::Warm
+                    && runtime.metering.as_ref().is_some_and(|metering| {
+                        metering.source_epoch == expected_metering.source_epoch
+                    });
+                if still_same_epoch {
+                    runtime.metering.take()
+                } else {
+                    None
+                }
+            })
+        };
+        Self::remove_metering_cgroup(retired.as_ref());
         Ok(())
     }
 
@@ -650,7 +718,9 @@ impl NodeRuntime {
                     runtime.state,
                     ObservedState::Running | ObservedState::Suspended | ObservedState::Warm
                 ) {
-                    if let Err(error) = self.finalize_usage(runtime.telemetry_target(cat_id)) {
+                    if let Err(error) =
+                        self.finalize_usage(runtime.lifecycle_telemetry_target(cat_id))
+                    {
                         self.cats
                             .lock()
                             .unwrap()
@@ -1258,7 +1328,7 @@ impl NodeRuntime {
             rt.state,
             ObservedState::Running | ObservedState::Suspended | ObservedState::Warm
         ) {
-            if let Err(error) = self.finalize_usage(rt.telemetry_target(cat_id)) {
+            if let Err(error) = self.finalize_usage(rt.lifecycle_telemetry_target(cat_id)) {
                 self.cats.lock().unwrap().insert(cat_id.to_string(), rt);
                 return Err(error);
             }
@@ -1628,14 +1698,7 @@ impl NodeRuntime {
                 bail!("cannot restore from {:?}", rt.state);
             }
         }
-        let target = self
-            .cats
-            .lock()
-            .unwrap()
-            .get(cat_id)
-            .map(|runtime| runtime.telemetry_target(cat_id))
-            .context("warm runtime vanished before usage finalization")?;
-        self.finalize_usage(target)?;
+        self.retire_warm_metering(cat_id)?;
         // CH mode keeps the runtime entry (start_cat_ch consumes it).
         if matches!(self.cfg.vmm, VmmMode::Fake) {
             self.cats.lock().unwrap().remove(cat_id);
@@ -2129,6 +2192,104 @@ fn signal(child: &Child, sig: i32) {
 #[cfg(test)]
 mod proxy_tests {
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingUsageFinalizer {
+        targets: Mutex<Vec<CatTelemetryTarget>>,
+    }
+
+    impl UsageFinalizer for RecordingUsageFinalizer {
+        fn finalize(&self, target: CatTelemetryTarget) -> Result<()> {
+            self.targets.lock().unwrap().push(target);
+            Ok(())
+        }
+    }
+
+    fn test_runtime(state: ObservedState, cgroup_path: PathBuf) -> CatRuntime {
+        CatRuntime {
+            generation: 1,
+            cpus: 1,
+            memory_mib: 256,
+            state,
+            guest: None,
+            boot_id: Some("boot-a".to_string()),
+            blockds: HashMap::new(),
+            volumes: Vec::new(),
+            dir: PathBuf::from("/tmp/cats-metering-test"),
+            ctl_sock: PathBuf::from("/tmp/cats-metering-test-ctl"),
+            web_sock: PathBuf::from("/tmp/cats-metering-test-web"),
+            runtime_sock: PathBuf::from("/tmp/cats-metering-test-runtime"),
+            activity: Arc::new(RuntimeActivity::default()),
+            metering: Some(RuntimeMetering {
+                cgroup_path,
+                source_epoch: "epoch-a".to_string(),
+            }),
+            ch: None,
+        }
+    }
+
+    #[test]
+    fn warm_hides_compute_meter_while_suspended_keeps_it() {
+        let mut runtime = test_runtime(
+            ObservedState::Suspended,
+            PathBuf::from("/sys/fs/cgroup/cats/cat-a"),
+        );
+
+        assert!(runtime.telemetry_target("cat-a").metering.is_some());
+        runtime.state = ObservedState::Warm;
+        assert!(runtime.telemetry_target("cat-a").metering.is_none());
+        assert!(runtime
+            .lifecycle_telemetry_target("cat-a")
+            .metering
+            .is_some());
+    }
+
+    #[test]
+    fn warm_retirement_finalizes_then_drops_the_metering_cgroup() {
+        let temp = tempfile::tempdir().unwrap();
+        let cgroup = temp.path().join("cat-a");
+        std::fs::create_dir(&cgroup).unwrap();
+        let adapter = AdapterSelection::new("unused", cats_storage::AdapterConfig::default());
+        let finalizer = Arc::new(RecordingUsageFinalizer::default());
+        let runtime = NodeRuntime::new(NodeConfig {
+            node_id: "node-a".to_string(),
+            state_dir: temp.path().to_path_buf(),
+            blockd_bin: PathBuf::from("unused-blockd"),
+            guest_agent_bin: PathBuf::from("unused-guest-agent"),
+            metadata_store: adapter.clone(),
+            object_store: adapter,
+            blockd_lease_ttl_ms: 1_000,
+            metering_cgroup_root: None,
+            vmm: VmmMode::Fake,
+            wake_budget: WakeBudget::default(),
+        })
+        .with_usage_finalizer(finalizer.clone());
+        runtime.cats.lock().unwrap().insert(
+            "cat-a".to_string(),
+            test_runtime(ObservedState::Warm, cgroup.clone()),
+        );
+
+        runtime.retire_warm_metering("cat-a").unwrap();
+
+        let targets = finalizer.targets.lock().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].metering.as_ref().unwrap().source_epoch,
+            "epoch-a"
+        );
+        drop(targets);
+        assert!(
+            runtime
+                .cats
+                .lock()
+                .unwrap()
+                .get("cat-a")
+                .unwrap()
+                .metering
+                .is_none()
+        );
+        assert!(!cgroup.exists());
+    }
 
     #[test]
     fn proxy_request_preserves_method_path_headers_and_body() {
