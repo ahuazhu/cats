@@ -96,7 +96,11 @@ to a wildcard owner would let any repository assume it. Publish
 `AWS_REGION` and `ECR_REPOSITORY`. GitHub may issue immutable OIDC subjects that
 include numeric owner and repository IDs; keep `github_subject_repository`
 aligned with the repository's `sub_claim_prefix` so the exact subject remains
-trusted after a rename.
+trusted after a rename. Set
+`github_actions_application_state_bucket_arn` to the bootstrap state bucket
+ARN; the role can update only `github_actions_application_state_key`, describe
+the one EKS cluster, reconcile the application DNS records and access the
+cluster through an explicit EKS access entry.
 
 ## Usage infrastructure
 
@@ -211,6 +215,35 @@ infrastructure stack outputs. All container images must include an immutable
 the runtime Secret or RDS CA alter Pod template checksums and therefore trigger
 a rollout. `cats-controld` remains one replica with `Recreate`, because its
 control-resource SQLite file is on an RWO EBS PVC.
+
+### Automatic main deployment
+
+`Deploy production` starts after the `CI` workflow succeeds for a `main`
+commit. It builds and pushes the control-plane image, pins the registry digest,
+creates a saved application plan, applies that exact plan and waits for both
+Deployments to report the same immutable image reference. A failed build,
+plan, apply or rollout records a failed GitHub deployment.
+
+Configure these non-secret repository variables:
+
+- `AWS_REGION`, `AWS_ROLE_ARN` and `ECR_REPOSITORY`;
+- `EKS_CLUSTER_NAME`;
+- `TF_STATE_BUCKET` and `TF_STATE_APPLICATION_KEY`;
+- `PRODUCTION_TFVARS_B64`, the Base64 encoding of the private non-secret
+  application tfvars with `kubeconfig_*` and both image inputs omitted.
+
+The workflow does not copy production credentials into GitHub. After assuming
+the branch-pinned role, it reads the existing Terraform-managed `cats-runtime`
+Secret and `cats-rds-ca` ConfigMap and supplies those values back as sensitive
+Terraform inputs. This is a deployment path for an already bootstrapped
+environment; the first application install still needs the explicit secret
+injection described above.
+
+Before planning, the workflow reads the live SQLite header with Python and
+compares `PRAGMA user_version` with the build's `SCHEMA_VERSION`. It fails
+closed on a mismatch and never deletes the PVC. The one-time database
+recreation described in the AWS deployment runbook remains an explicit
+operator action.
 
 ## Importing the existing Kubernetes deployment
 

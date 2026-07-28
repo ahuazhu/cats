@@ -28,13 +28,16 @@ module "network" {
 module "cluster" {
   source = "../../modules/platform-cluster"
 
-  cluster_name                 = var.cluster_name
-  kubernetes_version           = var.kubernetes_version
-  public_subnet_ids            = module.network.public_subnet_ids
-  private_subnet_ids           = module.network.private_subnet_ids
-  public_access_cidrs          = var.cluster_public_access_cidrs
-  cluster_admin_principal_arns = var.cluster_admin_principal_arns
-  tags                         = var.tags
+  cluster_name        = var.cluster_name
+  kubernetes_version  = var.kubernetes_version
+  public_subnet_ids   = module.network.public_subnet_ids
+  private_subnet_ids  = module.network.private_subnet_ids
+  public_access_cidrs = var.cluster_public_access_cidrs
+  cluster_admin_principal_arns = distinct(concat(
+    var.cluster_admin_principal_arns,
+    [module.github_release.release_role_arn],
+  ))
+  tags = var.tags
 }
 
 module "database" {
@@ -80,6 +83,84 @@ module "github_release" {
   create_oidc_provider      = var.create_github_oidc_provider
   ecr_repository_arns       = [aws_ecr_repository.control_plane.arn]
   tags                      = var.tags
+}
+
+# The same branch-pinned OIDC identity deploys the reviewed application state
+# after main CI succeeds. Its AWS permissions are intentionally limited to the
+# application state, one EKS cluster, the public load balancer lookup and this
+# hosted zone. Kubernetes authorization is granted above through the EKS access
+# entry rather than an aws-auth ConfigMap.
+data "aws_partition" "current" {}
+
+data "aws_iam_policy_document" "github_application_deploy" {
+  statement {
+    sid       = "ApplicationStateBucket"
+    effect    = "Allow"
+    actions   = ["s3:GetBucketLocation", "s3:ListBucket"]
+    resources = [var.github_actions_application_state_bucket_arn]
+
+    condition {
+      test     = "StringLike"
+      variable = "s3:prefix"
+      values = [
+        var.github_actions_application_state_key,
+        "${var.github_actions_application_state_key}.tflock",
+      ]
+    }
+  }
+
+  statement {
+    sid       = "ApplicationState"
+    effect    = "Allow"
+    actions   = ["s3:GetObject", "s3:PutObject"]
+    resources = ["${var.github_actions_application_state_bucket_arn}/${var.github_actions_application_state_key}"]
+  }
+
+  statement {
+    sid       = "ApplicationStateLock"
+    effect    = "Allow"
+    actions   = ["s3:DeleteObject", "s3:GetObject", "s3:PutObject"]
+    resources = ["${var.github_actions_application_state_bucket_arn}/${var.github_actions_application_state_key}.tflock"]
+  }
+
+  statement {
+    sid       = "DescribeEksCluster"
+    effect    = "Allow"
+    actions   = ["eks:DescribeCluster"]
+    resources = [module.cluster.cluster_arn]
+  }
+
+  # The application stack locates the EKS Auto Mode ALB by tag. Describe
+  # actions do not support useful resource scoping.
+  statement {
+    sid    = "ReadApplicationLoadBalancer"
+    effect = "Allow"
+    actions = [
+      "elasticloadbalancing:DescribeLoadBalancerAttributes",
+      "elasticloadbalancing:DescribeLoadBalancers",
+      "elasticloadbalancing:DescribeTags",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "ManageApplicationDns"
+    effect = "Allow"
+    actions = [
+      "route53:ChangeResourceRecordSets",
+      "route53:GetHostedZone",
+      "route53:ListResourceRecordSets",
+    ]
+    resources = [
+      "arn:${data.aws_partition.current.partition}:route53:::hostedzone/${module.dns.zone_id}",
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "github_application_deploy" {
+  name   = "application-deploy"
+  role   = module.github_release.release_role_name
+  policy = data.aws_iam_policy_document.github_application_deploy.json
 }
 
 # Bare-metal workers: the network position they occupy. cats-noded listens on

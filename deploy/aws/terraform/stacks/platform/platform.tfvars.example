@@ -35,6 +35,11 @@ github_default_branch       = "main"
 create_github_oidc_provider = true
 ecr_repository_name         = "cats/control-plane"
 
+# Exact application state the main-branch deployment role may plan and apply.
+# Keep the account-specific bucket ARN outside the repository.
+github_actions_application_state_bucket_arn = "arn:aws:s3:::REPLACE_WITH_TERRAFORM_STATE_BUCKET"
+github_actions_application_state_key        = "cats/production/application.tfstate"
+
 tags = {
   Owner = "platform"
 }
