@@ -696,12 +696,24 @@ impl GuestAgent {
             GuestRequestBody::Exec {
                 command,
                 timeout_ms: _,
+                env,
+                stdin,
             } => {
                 let (argv0, rest) = command
                     .split_first()
                     .context("command must be a non-empty argv array")?;
-                let out = match std::process::Command::new(argv0).args(rest).output() {
-                    Ok(out) => out,
+                let mut child = std::process::Command::new(argv0);
+                child.args(rest).envs(env);
+                if stdin.is_empty() {
+                    child.stdin(std::process::Stdio::null());
+                } else {
+                    child.stdin(std::process::Stdio::piped());
+                }
+                child
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                let mut child = match child.spawn() {
+                    Ok(child) => child,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         return Ok(GuestResponseBody::Exec {
                             exit_code: 127,
@@ -711,6 +723,18 @@ impl GuestAgent {
                     }
                     Err(error) => return Err(error).with_context(|| format!("spawn {argv0}")),
                 };
+                if !stdin.is_empty() {
+                    use std::io::Write as _;
+                    child
+                        .stdin
+                        .take()
+                        .context("child stdin was not piped")?
+                        .write_all(&stdin)
+                        .with_context(|| format!("write stdin for {argv0}"))?;
+                }
+                let out = child
+                    .wait_with_output()
+                    .with_context(|| format!("wait for {argv0}"))?;
                 Ok(GuestResponseBody::Exec {
                     exit_code: out.status.code().unwrap_or(-1),
                     stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -1137,6 +1161,41 @@ impl GuestAgent {
         for conn in listener.incoming() {
             let Ok(mut stream) = conn else { return };
             let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let mut peek = [0u8; 4096];
+            // SAFETY: `stream` owns a live Unix socket descriptor, `peek`
+            // provides a writable buffer of exactly `peek.len()` bytes, and
+            // MSG_PEEK does not retain the pointer after this call.
+            let peeked = unsafe {
+                libc::recv(
+                    std::os::fd::AsRawFd::as_raw_fd(&stream),
+                    peek.as_mut_ptr().cast(),
+                    peek.len(),
+                    libc::MSG_PEEK,
+                )
+            };
+            if peeked > 0
+                && String::from_utf8_lossy(&peek[..peeked as usize])
+                    .to_ascii_lowercase()
+                    .contains("\r\nupgrade: websocket\r\n")
+            {
+                std::thread::spawn(move || {
+                    let Ok(mut socket) = tungstenite::accept(stream) else {
+                        return;
+                    };
+                    while let Ok(message) = socket.read() {
+                        if message.is_close() {
+                            let _ = socket.close(None);
+                            break;
+                        }
+                        if (message.is_text() || message.is_binary())
+                            && socket.send(message).is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+                continue;
+            }
             let mut buf = [0u8; 4096];
             let n = match stream.read(&mut buf) {
                 Ok(n) if n > 0 => n,
@@ -1357,6 +1416,8 @@ mod tests {
         match agent.handle(GuestRequestBody::Exec {
             command: vec!["echo".into(), "hello".into()],
             timeout_ms: None,
+            env: Default::default(),
+            stdin: Vec::new(),
         }) {
             GuestResponseBody::Exec {
                 exit_code, stdout, ..
@@ -1367,8 +1428,30 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         match agent.handle(GuestRequestBody::Exec {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "read payload; printf '%s:%s' \"$DEPLOY_REF\" \"$payload\"".into(),
+            ],
+            timeout_ms: None,
+            env: [("DEPLOY_REF".into(), "refs/pull/42/head".into())]
+                .into_iter()
+                .collect(),
+            stdin: b"bundle-from-stdin\n".to_vec(),
+        }) {
+            GuestResponseBody::Exec {
+                exit_code, stdout, ..
+            } => {
+                assert_eq!(exit_code, 0);
+                assert_eq!(stdout, "refs/pull/42/head:bundle-from-stdin");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match agent.handle(GuestRequestBody::Exec {
             command: vec!["/definitely/not/a/cats-command".into()],
             timeout_ms: None,
+            env: Default::default(),
+            stdin: Vec::new(),
         }) {
             GuestResponseBody::Exec {
                 exit_code,

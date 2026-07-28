@@ -1106,11 +1106,13 @@ dependencies = [
  "cats-network",
  "cats-node-agent",
  "cats-storage",
+ "futures-util",
  "hex",
  "reqwest",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tracing-subscriber",
  "uuid",
 ]
@@ -1132,6 +1134,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tracing",
  "tracing-subscriber",
+ "tungstenite",
  "uuid",
 ]
 
@@ -1175,14 +1178,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "cats-api",
  "clap",
+ "futures-util",
  "reqwest",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -1194,6 +1200,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "cats-api",
  "cats-blockd",
  "cats-guest-agent",
@@ -1210,6 +1217,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "uuid",
 ]

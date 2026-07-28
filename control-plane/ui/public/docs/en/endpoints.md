@@ -30,13 +30,13 @@ A client should tolerate `503` with retry guidance during activation and reconne
 
 ## Protocols and routing safety
 
-The implemented path supports HTTP/1.1 with HTTPS termination at the regional edge. It preserves method, path/query, application headers, response status, and request/response bodies. The owning node revalidates Cat ownership and Running state; an old cached route fails closed instead of reaching a different Guest. WebSocket support is a later milestone.
+The implemented path supports HTTP/1.1 and WebSocket Upgrade with TLS termination at the regional edge. HTTP preserves method, path/query, application headers, response status, and request/response bodies. WebSocket preserves application headers and relays text, binary, ping, pong, and close frames while holding a work lease for the connection. The owning node revalidates Cat ownership and Running state; an old cached route fails closed instead of reaching a different Guest.
 
 ## Where this stands today
 
-HTTP ingress works: Endpoint addresses, route binding and wake-on-request are all in place.
+HTTP and WebSocket ingress work: Endpoint addresses, route binding, wake-on-request, and connection-length work leases are in place.
 
-Not yet available: **inbound WebSocket**, and **private Guest-to-Guest networking across nodes**.
+Not yet available: **private Guest-to-Guest networking across nodes**.
 
 ## Prepare the Guest service
 

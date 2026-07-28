@@ -7,6 +7,7 @@
 //! echoed in the response; commands are argument arrays, never shell strings.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 
@@ -69,6 +70,10 @@ pub enum GuestRequestBody {
         command: Vec<String>,
         #[serde(default)]
         timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        env: BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        stdin: Vec<u8>,
     },
     /// Start an interactive login shell attached to a pseudoterminal. After
     /// `ShellReady`, this control connection switches to `GuestShellFrame`

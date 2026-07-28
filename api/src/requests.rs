@@ -7,6 +7,7 @@
 //! - `If-Match: "<generation>"` guards concurrent modification.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::guest::GuestWorkLease;
 use crate::resources::{
@@ -95,6 +96,14 @@ pub struct ExecRequest {
     pub command: Vec<String>,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// Environment additions for the child process. Values travel in the
+    /// authenticated request body instead of argv, so deploy credentials do
+    /// not appear in process listings.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Optional bytes connected to the child process' standard input.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stdin: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +111,27 @@ pub struct ExecResponse {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateWorkspaceTokenRequest {
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceToken {
+    pub id: String,
+    pub workspace_id: String,
+    pub label: String,
+    pub created_at_unix: i64,
+}
+
+/// Returned only once when a workspace token is created. Cats stores only
+/// the SHA-256 digest of `token`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatedWorkspaceToken {
+    pub access_token: WorkspaceToken,
+    pub token: String,
 }
 
 /// Internal gateway -> owning-node HTTP proxy request.

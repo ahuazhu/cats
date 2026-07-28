@@ -201,9 +201,20 @@ impl GuestClient {
     }
 
     pub fn exec(&mut self, command: Vec<String>) -> Result<(i32, String, String)> {
+        self.exec_with_input(command, Default::default(), Vec::new())
+    }
+
+    pub fn exec_with_input(
+        &mut self,
+        command: Vec<String>,
+        env: std::collections::BTreeMap<String, String>,
+        stdin: Vec<u8>,
+    ) -> Result<(i32, String, String)> {
         match self.request(GuestRequestBody::Exec {
             command,
             timeout_ms: None,
+            env,
+            stdin,
         })? {
             GuestResponseBody::Exec {
                 exit_code,

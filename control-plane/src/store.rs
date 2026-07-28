@@ -16,6 +16,7 @@ use uuid::Uuid;
 use cats_api::auth::{Account, AccountInvitation, AccountKind, Workspace};
 use cats_api::error::{ApiError, ErrorBody, ErrorCode};
 use cats_api::ids;
+use cats_api::requests::WorkspaceToken;
 use cats_api::resources::*;
 
 pub type Result<T> = std::result::Result<T, ApiError>;
@@ -567,6 +568,92 @@ impl Store {
             }
             Err(error) => Err(internal(error)),
         }
+    }
+
+    pub fn create_workspace_token(
+        &self,
+        workspace_id: &str,
+        label: &str,
+        token_hash: &str,
+    ) -> Result<WorkspaceToken> {
+        let label = label.trim();
+        if label.is_empty() || label.len() > 100 {
+            return Err(ApiError::invalid("token label must be 1 to 100 characters"));
+        }
+        self.workspace_by_id(workspace_id)?;
+        let token = WorkspaceToken {
+            id: new_id("wst"),
+            workspace_id: workspace_id.to_string(),
+            label: label.to_string(),
+            created_at_unix: now_unix(),
+        };
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO workspace_tokens
+                (id, workspace_id, label, token_hash, created_at, revoked_at)
+             VALUES (?1,?2,?3,?4,?5,NULL)",
+            params![
+                token.id,
+                token.workspace_id,
+                token.label,
+                token_hash,
+                token.created_at_unix
+            ],
+        )
+        .map_err(internal)?;
+        Ok(token)
+    }
+
+    pub fn active_workspace_for_token_hash(&self, token_hash: &str) -> Result<Option<String>> {
+        self.with(|conn| {
+            conn.query_row(
+                "SELECT workspace_id FROM workspace_tokens
+                  WHERE token_hash=?1 AND revoked_at IS NULL",
+                params![token_hash],
+                |row| row.get(0),
+            )
+            .optional()
+        })
+    }
+
+    pub fn workspace_tokens(&self, workspace_id: &str) -> Result<Vec<WorkspaceToken>> {
+        self.with(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT id, workspace_id, label, created_at
+                   FROM workspace_tokens
+                  WHERE workspace_id=?1 AND revoked_at IS NULL
+                  ORDER BY created_at, id",
+            )?;
+            let rows = statement
+                .query_map(params![workspace_id], |row| {
+                    Ok(WorkspaceToken {
+                        id: row.get(0)?,
+                        workspace_id: row.get(1)?,
+                        label: row.get(2)?,
+                        created_at_unix: row.get(3)?,
+                    })
+                })?
+                .collect();
+            rows
+        })
+    }
+
+    pub fn revoke_workspace_token(&self, workspace_id: &str, token_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE workspace_tokens SET revoked_at=?3
+                  WHERE id=?1 AND workspace_id=?2 AND revoked_at IS NULL",
+                params![token_id, workspace_id, now_unix()],
+            )
+            .map_err(internal)?;
+        if changed == 0 {
+            return Err(ApiError::new(
+                ErrorCode::NotFound,
+                "workspace token not found",
+            ));
+        }
+        Ok(())
     }
 
     pub fn workspace_belongs_to_organization(
@@ -2994,6 +3081,16 @@ CREATE TABLE IF NOT EXISTS workspace_grants (
     created_at INTEGER NOT NULL,
     PRIMARY KEY (workspace_id, workos_user_id)
 );
+CREATE TABLE IF NOT EXISTS workspace_tokens (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+    label TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL,
+    revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS workspace_tokens_active
+ON workspace_tokens(token_hash) WHERE revoked_at IS NULL;
 CREATE TABLE IF NOT EXISTS signup_grant_eligibility (
     workos_user_id TEXT NOT NULL,
     campaign TEXT NOT NULL,
@@ -3204,7 +3301,6 @@ mod tests {
             "re-running account seeding must not add a second default workspace"
         );
     }
-
     #[test]
     fn renaming_a_workspace_keeps_resource_ownership() {
         let dir = tempfile::tempdir().unwrap();
@@ -3270,6 +3366,38 @@ mod tests {
             .is_err());
         assert_eq!(store.list_cats(&default.id).unwrap().len(), 1);
         assert_eq!(store.list_cats(&sibling.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn workspace_tokens_resolve_only_while_active() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("control.db")).unwrap();
+        let workspace = bootstrap_workspace(&store, "automation");
+        let token = store
+            .create_workspace_token(&workspace.id, "CI preview", "sha256-example")
+            .unwrap();
+
+        assert_eq!(
+            store
+                .active_workspace_for_token_hash("sha256-example")
+                .unwrap(),
+            Some(workspace.id.clone())
+        );
+        assert_eq!(
+            store.workspace_tokens(&workspace.id).unwrap(),
+            vec![token.clone()]
+        );
+
+        store
+            .revoke_workspace_token(&workspace.id, &token.id)
+            .unwrap();
+        assert_eq!(
+            store
+                .active_workspace_for_token_hash("sha256-example")
+                .unwrap(),
+            None
+        );
+        assert!(store.workspace_tokens(&workspace.id).unwrap().is_empty());
     }
 
     #[test]
@@ -3411,7 +3539,6 @@ mod tests {
         assert_eq!(stored.allocated_memory_mib, 2048);
         assert_eq!(store.get_node("node_a").unwrap().state, NodeState::Cordoned);
     }
-
 
     #[test]
     fn last_guest_work_release_is_immediately_suspend_eligible() {

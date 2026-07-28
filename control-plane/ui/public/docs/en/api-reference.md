@@ -8,7 +8,7 @@ The external API is JSON over HTTP. User resources are scoped by the immutable w
     Idempotency-Key: <unique-request-id>   # mutations
     If-Match: "<generation>"                # guarded state changes
 
-`cats login` obtains and refreshes the user token through WorkOS Device Authorization without writing it to the normal config file. Other user clients must use an approved WorkOS flow and the same verified JWT contract; static user tokens are not accepted. Browser consoles use their HttpOnly WorkOS session instead of exposing a Bearer token to JavaScript. Service and administrator machine identities have separate scopes.
+`cats login` obtains and refreshes the user token through WorkOS Device Authorization without writing it to the normal config file. Other user clients must use an approved WorkOS flow and the same verified JWT contract; static user tokens are not accepted. Browser consoles use their HttpOnly WorkOS session instead of exposing a Bearer token to JavaScript. A Workspace manager may issue a revocable `cats_wst_…` machine credential for CI; it authorizes only the immutable Workspace that issued it and cannot mint another token. Service and administrator machine identities have separate scopes.
 
 ## Identity and Workspaces
 
@@ -17,6 +17,8 @@ The external API is JSON over HTTP. User resources are scoped by the immutable w
     GET  /v1/workspaces     # refresh the available Workspace list
     POST /v1/accounts/{account}/workspaces
     PATCH /v1/workspaces/{workspace}
+    GET|POST /v1/workspaces/{workspace}/tokens
+    DELETE /v1/workspaces/{workspace}/tokens/{token}
     GET|POST /v1/accounts/{account}/invitations
     POST /v1/accounts/{account}/invitations/{invitation}/actions/revoke
     GET /v1/accounts/{account}/members
@@ -24,6 +26,8 @@ The external API is JSON over HTTP. User resources are scoped by the immutable w
     POST /v1/auth/logout    # revoke the CLI WorkOS session
 
 Workspace enumeration returns Personal and Organization Accounts from active WorkOS Organization memberships. Creating or renaming a Workspace requires account-management permission; a rename does not change its immutable ID, so every resource route keeps resolving. Invitation/member mutations require `cats:members:manage`, are rejected for Personal Accounts, and are performed through WorkOS. Creating an invitation also requires `Idempotency-Key`; Cats forwards it to WorkOS so a network retry returns the same invitation. User access-token signature, issuer, client ID, expiry, subject, Organization scope, active membership, Account ID, and Workspace ownership are checked before authorization.
+
+Token creation returns `{ "access_token": {…metadata…}, "token": "cats_wst_…" }`; the plaintext `token` is returned once and only its SHA-256 digest is stored. List responses never include the secret. Revocation takes effect on the next request.
 
 ## Cats
 
@@ -40,6 +44,8 @@ Workspace enumeration returns Personal and Organization Accounts from active Wor
 Lifecycle verbs are `start`, `stop`, `suspend`, `resume`, and `warm`. `auto_suspend` defaults to `true` when omitted from create. Cat create/lifecycle/delete returns an asynchronous Operation response; poll the Operation URL instead of repeating a timed-out mutation with a new intent.
 
 Cat, Disk, and Operation responses include the immutable `workspace_id`, which is the only ownership key.
+
+`exec` accepts `command`, optional `timeout_ms`, an optional string map `env`, and optional byte array `stdin`. `env` is passed only to the child process and is not stored in the Cats registry. The response contains `exit_code`, `stdout`, and `stderr`.
 
     POST /v1/workspaces/ws_01J8QK.../cats
     Idempotency-Key: request-7f12

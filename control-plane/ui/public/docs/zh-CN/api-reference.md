@@ -8,7 +8,7 @@
     Idempotency-Key: <unique-request-id>   # 变更请求
     If-Match: "<generation>"                # 带并发保护的状态变更
 
-`cats login` 通过 WorkOS Device Authorization 获取并刷新用户 Token，不会把它写入普通配置文件。其他用户客户端必须采用批准的 WorkOS Flow 与相同的已验证 JWT 契约；服务端不接受静态用户 Token。浏览器控制台使用 HttpOnly WorkOS Session，不会向 JavaScript 暴露 Bearer Token。Service 与 Administrator 机器身份拥有独立权限。
+`cats login` 通过 WorkOS Device Authorization 获取并刷新用户 Token，不会把它写入普通配置文件。其他用户客户端必须采用批准的 WorkOS Flow 与相同的已验证 JWT 契约；服务端不接受静态用户 Token。浏览器控制台使用 HttpOnly WorkOS Session，不会向 JavaScript 暴露 Bearer Token。Workspace Manager 可以为 CI 签发可撤销的 `cats_wst_…` 机器凭据；它只授权签发它的不可变 Workspace，且不能继续签发 Token。Service 与 Administrator 机器身份拥有独立权限。
 
 ## 身份与 Workspace
 
@@ -17,6 +17,8 @@
     GET  /v1/workspaces     # 刷新可用 Workspace 列表
     POST /v1/accounts/{account}/workspaces
     PATCH /v1/workspaces/{workspace}
+    GET|POST /v1/workspaces/{workspace}/tokens
+    DELETE /v1/workspaces/{workspace}/tokens/{token}
     GET|POST /v1/accounts/{account}/invitations
     POST /v1/accounts/{account}/invitations/{invitation}/actions/revoke
     GET /v1/accounts/{account}/members
@@ -24,6 +26,8 @@
     POST /v1/auth/logout    # 撤销 CLI WorkOS Session
 
 Workspace 枚举根据 Active WorkOS Organization Membership 返回 Personal/Organization Account。创建或修改 Workspace 需要 Account 管理权限；修改 slug 不会改变不可变 ID，因此所有资源路由继续解析到同一个 Workspace。邀请与成员变更要求 `cats:members:manage`、拒绝 Personal Account，并通过 WorkOS 执行。创建邀请还要求 `Idempotency-Key`，Cats 将其透传给 WorkOS，使网络重试返回同一个 invitation。授权前会校验 Access Token 签名、Issuer、Client ID、过期时间、Subject、Organization Scope、active membership、Account ID 与 Workspace 归属。
+
+创建 Token 返回 `{ "access_token": {…元数据…}, "token": "cats_wst_…" }`；明文 `token` 只返回一次，Cats 只保存其 SHA-256 Digest。List 永远不包含 Secret；撤销会从下一次请求开始生效。
 
 ## Cats
 
@@ -40,6 +44,8 @@ Workspace 枚举根据 Active WorkOS Organization Membership 返回 Personal/Org
 Lifecycle Verb 包括 `start`、`stop`、`suspend`、`resume` 与 `warm`。Create 省略 `auto_suspend` 时默认为 `true`。Cat 的 Create/Lifecycle/Delete 返回异步 Operation；请求超时后应查询 Operation，而不是用新意图重复变更。
 
 Cat、Disk 和 Operation 响应都包含不可变 `workspace_id`，它是唯一的资源归属键。
+
+`exec` 接受 `command`、可选 `timeout_ms`、可选字符串 Map `env` 与可选字节数组 `stdin`。`env` 只传给子进程，不写入 Cats Registry。响应包含 `exit_code`、`stdout` 与 `stderr`。
 
     POST /v1/workspaces/ws_01J8QK.../cats
     Idempotency-Key: request-7f12
