@@ -14,6 +14,16 @@ variable "github_repository" {
   }
 }
 
+variable "subject_repository" {
+  type        = string
+  description = <<-EOT
+    Repository exactly as it appears in the OIDC `sub` claim, when that differs
+    from `github_repository`. GitHub mints `owner@<owner_id>/name@<repo_id>` for
+    repositories using immutable subject claims. Null uses `github_repository`.
+  EOT
+  default     = null
+}
+
 variable "default_branch" {
   type        = string
   description = "Branch allowed to release when allowed_subjects is not set."

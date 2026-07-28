@@ -7,13 +7,23 @@
 #
 # The trust policy pins both the audience and the subject. Without the subject
 # condition any GitHub repository in the world could assume this role.
+#
+# The subject is not always `owner/name`. A repository configured for immutable
+# subject claims gets `owner@<owner_id>/name@<repo_id>` instead, and a policy
+# written for the plain form then fails closed on every branch and tag at once
+# with `sts AccessDenied` — the trust policy, provider, audience and branch all
+# read as correct while nothing can authenticate. `subject_repository` carries
+# whichever form the repository actually mints; confirm it against a real token
+# claim rather than inferring it.
 
 locals {
   name = "${var.name_prefix}-github-actions-release"
 
+  subject_repository = coalesce(var.subject_repository, var.github_repository)
+
   subjects = length(var.allowed_subjects) > 0 ? var.allowed_subjects : [
-    "repo:${var.github_repository}:ref:refs/heads/${var.default_branch}",
-    "repo:${var.github_repository}:ref:refs/tags/*",
+    "repo:${local.subject_repository}:ref:refs/heads/${var.default_branch}",
+    "repo:${local.subject_repository}:ref:refs/tags/*",
   ]
 
   provider_arn = var.create_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : var.existing_oidc_provider_arn

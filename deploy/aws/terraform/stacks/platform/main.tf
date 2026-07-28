@@ -75,6 +75,7 @@ module "github_release" {
 
   name_prefix          = var.name_prefix
   github_repository    = var.github_repository
+  subject_repository   = var.github_subject_repository
   default_branch       = var.github_default_branch
   create_oidc_provider = var.create_github_oidc_provider
   ecr_repository_arns  = [aws_ecr_repository.control_plane.arn]

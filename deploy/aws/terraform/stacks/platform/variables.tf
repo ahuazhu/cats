@@ -136,6 +136,17 @@ variable "github_repository" {
   default     = "ahuazhu/cats"
 }
 
+variable "github_subject_repository" {
+  type        = string
+  description = <<-EOT
+    Repository as GitHub writes it into the OIDC `sub` claim. This repository
+    uses immutable subject claims, so the claim carries the numeric owner and
+    repository IDs and does not equal `github_repository`. Verify with a real
+    token claim before changing it; a mismatch denies every branch and tag.
+  EOT
+  default     = "ahuazhu@1306468/cats@1308574751"
+}
+
 variable "github_default_branch" {
   type        = string
   description = "Branch allowed to release."
