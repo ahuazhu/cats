@@ -103,3 +103,9 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "worker_base_environment" {
+  description = "Non-secret worker.env entries used to seed a host that has none yet. Passed through to the worker deployment module."
+  type        = map(string)
+  default     = {}
+}

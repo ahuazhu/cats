@@ -97,3 +97,29 @@ variable "tags" {
   type    = map(string)
   default = {}
 }
+
+variable "worker_base_environment" {
+  description = <<-EOT
+    Non-secret worker.env entries used only when the host has no worker.env
+    yet -- node identity, control plane and gateway URLs, region, ChunkStore
+    bucket, guest network CIDR. An existing file is never rewritten, so
+    operator edits survive. Secrets belong in worker_runtime_secret_data;
+    CATS_METERING_CGROUP_ROOT is discovered on the host and must not be set
+    here.
+  EOT
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition     = !contains(keys(var.worker_base_environment), "CATS_METERING_CGROUP_ROOT")
+    error_message = "CATS_METERING_CGROUP_ROOT is discovered from the host's cgroup2 mount and systemd slice; do not pin it."
+  }
+
+  validation {
+    condition = length(setintersection(
+      toset(keys(var.worker_base_environment)),
+      toset(["CATS_AUTH_TOKEN", "CATS_POSTGRES_URL"]),
+    )) == 0
+    error_message = "Secrets must go through worker_runtime_secret_data, not worker_base_environment."
+  }
+}

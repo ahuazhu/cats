@@ -53,5 +53,6 @@ module "metal_worker_deployment" {
   instance_id                = var.metal_worker_instance_id
   instance_role_name         = var.metal_worker_instance_role_name
   worker_runtime_secret_data = var.worker_runtime_secret_data
+  worker_base_environment    = var.worker_base_environment
   tags                       = var.tags
 }
