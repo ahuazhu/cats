@@ -124,13 +124,9 @@ resource "aws_eks_cluster" "this" {
   depends_on = [aws_iam_role_policy_attachment.cluster]
 }
 
-# A custom Auto Mode node role is only honoured once the cluster grants it
-# access; without this entry nodes launch and never join.
-resource "aws_eks_access_entry" "node" {
-  cluster_name  = aws_eks_cluster.this.name
-  principal_arn = aws_iam_role.node.arn
-  type          = "EC2"
-}
+# No access entry for the node role: Auto Mode creates its own EC2-type entry
+# for whatever node_role_arn compute_config names, and declaring a second one
+# fails with ResourceInUseException.
 
 resource "aws_eks_access_entry" "admin" {
   for_each = toset(var.cluster_admin_principal_arns)
