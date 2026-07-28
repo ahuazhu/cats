@@ -93,13 +93,14 @@ The control resource database remains SQLite on one encrypted RWO EBS volume,
 so `cats-controld` intentionally has one replica and uses `Recreate`. Shared
 storage metadata is PostgreSQL and is safe across the EKS/metal boundary.
 
-That database carries a schema version. The current build has one deliberately
-bounded migration: the unstamped V0 Project-shaped database is rebuilt as V1 in
-one SQLite transaction, preserving resource IDs and relationships, checking
-foreign keys and stamping version 1 before commit. Versions outside
-`MIN_SUPPORTED_SCHEMA_VERSION..SCHEMA_VERSION` still fail closed. Deployment
-automation checks that range before replacing the live Pod and never deletes
-the `cats-control-data` PVC automatically.
+That database carries a schema version and is never migrated. `cats-controld`
+refuses to start against any other version — `control-plane database ... is at
+schema version N, this build requires M; recreate it` — so an incompatible
+schema is a crashloop, not a degraded start. The EBS volume is designed to
+survive Pod replacement, so restarting or redeploying does not clear it: delete
+the `cats-control-data` PersistentVolumeClaim in the `cats` namespace and let the
+`WaitForFirstConsumer` class bind a fresh one. A deployment that has never run an
+earlier version needs none of this — a first install has no database to refuse.
 
 The usage ledger has the same rule for the same reason. ADR-0018 replaced the V1
 `project` ownership column with `workspace_id` on usage rows and `account_id` on
@@ -110,8 +111,6 @@ this code to destroy a credit ledger at startup, so the wipe stays an explicit
 operator action.
 
 Check both before the first deploy of a build whose `SCHEMA_VERSION` moved.
-Bumping that constant declares the new on-disk shape; lowering
-`MIN_SUPPORTED_SCHEMA_VERSION` is allowed only when the code contains and tests
-the complete migration chain. A schema change that forgets to update these
-bounds can let an old database open as if it were current or block a supported
-upgrade.
+Bumping that constant is what declares a control-plane schema incompatible; a
+schema change that forgets to bump it lets an old database open as if it were
+current.

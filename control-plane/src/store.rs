@@ -133,132 +133,9 @@ fn is_constraint(e: &rusqlite::Error) -> bool {
     )
 }
 
-fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
-    let mut statement = conn
-        .prepare(&format!("PRAGMA table_info({table})"))
-        .map_err(internal)?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(internal)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(internal)?;
-    Ok(columns.iter().any(|candidate| candidate == column))
-}
-
-fn migrate_v0_to_v1(conn: &mut Connection) -> Result<()> {
-    // Version 0 predates schema stamping. Its compatibility columns are
-    // NOT NULL, so merely running the current CREATE TABLE IF NOT EXISTS
-    // statements would leave future inserts broken. Rebuild the five changed
-    // tables atomically and keep every resource ID and relationship intact.
-    conn.pragma_update(None, "foreign_keys", "OFF")
-        .map_err(internal)?;
-    conn.pragma_update(None, "legacy_alter_table", "ON")
-        .map_err(internal)?;
-
-    let migrated = (|| {
-        let transaction = conn.transaction().map_err(internal)?;
-        transaction
-            .execute_batch(
-                "
-                ALTER TABLE accounts RENAME TO accounts_v0;
-                ALTER TABLE workspaces RENAME TO workspaces_v0;
-                ALTER TABLE cats RENAME TO cats_v0;
-                ALTER TABLE disks RENAME TO disks_v0;
-                ALTER TABLE operations RENAME TO operations_v0;
-                ",
-            )
-            .map_err(internal)?;
-        transaction.execute_batch(SCHEMA).map_err(internal)?;
-        transaction
-            .execute_batch(
-                "
-                INSERT INTO accounts (
-                    id, slug, display_name, kind, workos_organization_id,
-                    billing_account_id, personal_owner_user_id, status, created_at
-                )
-                SELECT
-                    id, slug, display_name, kind, workos_organization_id,
-                    billing_account_id, personal_owner_user_id,
-                    CASE status WHEN 'pending_mapping' THEN 'disabled' ELSE status END,
-                    created_at
-                FROM accounts_v0;
-
-                INSERT INTO workspaces (
-                    id, account_id, slug, display_name, is_default, created_at
-                )
-                SELECT id, account_id, slug, display_name, is_default, created_at
-                FROM workspaces_v0;
-
-                INSERT INTO cats (
-                    id, workspace_id, name, image, cpus, memory_mib, root_disk_id,
-                    desired_state, observed_state, generation, auto_suspend,
-                    work_version, observed_state_since_ms, node_id, created_at
-                )
-                SELECT
-                    id, workspace_id, name, image, cpus, memory_mib, root_disk_id,
-                    desired_state, observed_state, generation, auto_suspend,
-                    work_version, observed_state_since_ms, node_id, created_at
-                FROM cats_v0;
-
-                INSERT INTO disks (
-                    id, workspace_id, name, kind, size_bytes, state, volume_id, created_at
-                )
-                SELECT id, workspace_id, name, kind, size_bytes, state, volume_id, created_at
-                FROM disks_v0;
-
-                INSERT INTO operations (
-                    id, workspace_id, kind, resource_id, resource_generation,
-                    phase, error_json, created_at, updated_at
-                )
-                SELECT
-                    id, workspace_id, kind, resource_id, resource_generation,
-                    phase, error_json, created_at, updated_at
-                FROM operations_v0;
-
-                DROP TABLE operations_v0;
-                DROP TABLE cats_v0;
-                DROP TABLE disks_v0;
-                DROP TABLE workspaces_v0;
-                DROP TABLE accounts_v0;
-                ",
-            )
-            .map_err(internal)?;
-        // Index and trigger names belonged to the renamed v0 tables during the
-        // first schema pass. Re-run after dropping those tables so the current
-        // definitions are attached to the rebuilt tables.
-        transaction.execute_batch(SCHEMA).map_err(internal)?;
-        transaction
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
-            .map_err(internal)?;
-
-        let violation = transaction
-            .query_row("PRAGMA foreign_key_check", [], |row| {
-                row.get::<_, String>(0)
-            })
-            .optional()
-            .map_err(internal)?;
-        if let Some(table) = violation {
-            return Err(ApiError::failed_precondition(format!(
-                "control-plane v0 to v1 migration left an invalid foreign key in {table}"
-            )));
-        }
-        transaction.commit().map_err(internal)
-    })();
-
-    let restore_legacy = conn
-        .pragma_update(None, "legacy_alter_table", "OFF")
-        .map_err(internal);
-    let restore_foreign_keys = conn
-        .pragma_update(None, "foreign_keys", "ON")
-        .map_err(internal);
-    migrated?;
-    restore_legacy?;
-    restore_foreign_keys
-}
-
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
-        let mut conn = Connection::open(path).map_err(internal)?;
+        let conn = Connection::open(path).map_err(internal)?;
         conn.busy_timeout(std::time::Duration::from_secs(10))
             .map_err(internal)?;
         conn.pragma_update(None, "journal_mode", "WAL")
@@ -281,18 +158,10 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(internal)?;
-        if control_plane_schema_exists > 0 && stamped == MIN_SUPPORTED_SCHEMA_VERSION {
-            if table_has_column(&conn, "workspaces", "legacy_project")? {
-                migrate_v0_to_v1(&mut conn)?;
-            } else {
-                conn.execute_batch(SCHEMA).map_err(internal)?;
-                conn.pragma_update(None, "user_version", SCHEMA_VERSION)
-                    .map_err(internal)?;
-            }
-        } else if control_plane_schema_exists > 0 && stamped != SCHEMA_VERSION {
+        if control_plane_schema_exists > 0 && stamped != SCHEMA_VERSION {
             return Err(ApiError::failed_precondition(format!(
                 "control-plane database {} is at schema version {stamped}, this build \
-                 requires {SCHEMA_VERSION}",
+                 requires {SCHEMA_VERSION}; recreate it",
                 path.display()
             )));
         }
@@ -3166,13 +3035,12 @@ fn workspace_view(
     }
 }
 
-/// Oldest schema for which this build carries a complete, tested migration.
-///
-/// Deployment automation reads this alongside `SCHEMA_VERSION` and refuses to
-/// replace the live Pod when its database falls outside the supported range.
-const MIN_SUPPORTED_SCHEMA_VERSION: i64 = 0;
-
-/// Current on-disk schema written after every successful open or migration.
+/// Bumped on any schema change an existing database cannot be upgraded into.
+/// `Store::open` refuses a database stamped with a different version instead of
+/// migrating it: no released deployment's control-plane state has to survive, and
+/// a migration ladder for shapes nobody runs is archaeology that still has to be
+/// read, tested and kept correct. Deployment automation reads this constant and
+/// refuses to replace a live Pod whose database does not match it.
 const SCHEMA_VERSION: i64 = 1;
 
 const SCHEMA: &str = "
@@ -3578,181 +3446,6 @@ mod tests {
                 "billing_account/account/another",
             )
             .is_err());
-    }
-
-    #[test]
-    fn migrates_an_unstamped_v0_database_without_losing_control_plane_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("control.db");
-        {
-            let connection = Connection::open(&path).unwrap();
-            connection
-                .execute_batch(
-                    "
-                    PRAGMA foreign_keys=ON;
-                    CREATE TABLE accounts (
-                        id TEXT PRIMARY KEY,
-                        slug TEXT NOT NULL UNIQUE,
-                        display_name TEXT NOT NULL,
-                        kind TEXT NOT NULL CHECK (kind IN ('personal','organization')),
-                        workos_organization_id TEXT NOT NULL UNIQUE,
-                        billing_account_id TEXT NOT NULL UNIQUE,
-                        personal_owner_user_id TEXT UNIQUE,
-                        status TEXT NOT NULL CHECK (
-                            status IN ('provisioning','active','pending_mapping','disabled')
-                        ),
-                        created_at INTEGER NOT NULL
-                    );
-                    CREATE TABLE workspaces (
-                        id TEXT PRIMARY KEY,
-                        account_id TEXT NOT NULL REFERENCES accounts(id),
-                        slug TEXT NOT NULL,
-                        display_name TEXT NOT NULL,
-                        legacy_project TEXT NOT NULL UNIQUE,
-                        is_default INTEGER NOT NULL DEFAULT 0 CHECK (is_default IN (0,1)),
-                        created_at INTEGER NOT NULL,
-                        UNIQUE (account_id, slug)
-                    );
-                    CREATE UNIQUE INDEX workspaces_one_default
-                    ON workspaces(account_id) WHERE is_default=1;
-                    CREATE TABLE cats (
-                        id TEXT PRIMARY KEY,
-                        workspace_id TEXT NOT NULL REFERENCES workspaces(id),
-                        project TEXT NOT NULL,
-                        name TEXT NOT NULL,
-                        image TEXT NOT NULL,
-                        cpus INTEGER NOT NULL,
-                        memory_mib INTEGER NOT NULL,
-                        root_disk_id TEXT NOT NULL,
-                        desired_state TEXT NOT NULL,
-                        observed_state TEXT NOT NULL,
-                        generation INTEGER NOT NULL,
-                        auto_suspend INTEGER NOT NULL DEFAULT 1,
-                        work_version INTEGER NOT NULL DEFAULT 0,
-                        observed_state_since_ms INTEGER NOT NULL,
-                        node_id TEXT,
-                        created_at INTEGER NOT NULL,
-                        UNIQUE (project, name)
-                    );
-                    CREATE TABLE disks (
-                        id TEXT PRIMARY KEY,
-                        workspace_id TEXT NOT NULL REFERENCES workspaces(id),
-                        project TEXT NOT NULL,
-                        name TEXT NOT NULL,
-                        kind TEXT NOT NULL,
-                        size_bytes INTEGER NOT NULL,
-                        state TEXT NOT NULL,
-                        volume_id TEXT NOT NULL,
-                        created_at INTEGER NOT NULL,
-                        UNIQUE (project, name)
-                    );
-                    CREATE TABLE operations (
-                        id TEXT PRIMARY KEY,
-                        workspace_id TEXT NOT NULL REFERENCES workspaces(id),
-                        project TEXT NOT NULL,
-                        kind TEXT NOT NULL,
-                        resource_id TEXT NOT NULL,
-                        resource_generation INTEGER NOT NULL,
-                        phase TEXT NOT NULL,
-                        error_json TEXT,
-                        created_at INTEGER NOT NULL,
-                        updated_at INTEGER NOT NULL
-                    );
-                    CREATE TABLE mount_bindings (
-                        id TEXT PRIMARY KEY,
-                        disk_id TEXT NOT NULL UNIQUE,
-                        cat_id TEXT NOT NULL,
-                        mount_path TEXT NOT NULL
-                    );
-                    CREATE TABLE endpoints (
-                        id TEXT PRIMARY KEY,
-                        cat_id TEXT NOT NULL,
-                        name TEXT NOT NULL,
-                        hostname TEXT NOT NULL UNIQUE,
-                        target_port INTEGER NOT NULL,
-                        protocol TEXT NOT NULL,
-                        wake_policy TEXT NOT NULL
-                    );
-
-                    INSERT INTO accounts VALUES (
-                        'acct_v0', 'default', 'Default', 'organization', 'org_v0',
-                        'billing_account/account/acct_v0', NULL, 'active', 10
-                    );
-                    INSERT INTO workspaces VALUES (
-                        'ws_v0', 'acct_v0', 'default', 'Default', 'default', 1, 11
-                    );
-                    INSERT INTO disks VALUES (
-                        'disk_v0', 'ws_v0', 'default', 'root', 'root',
-                        34359738368, 'attached', 'vol_v0', 12
-                    );
-                    INSERT INTO cats VALUES (
-                        'cat_v0', 'ws_v0', 'default', 'staging', 'ubuntu-24.04',
-                        4, 8192, 'disk_v0', 'running', 'running', 7, 0, 9,
-                        123456, 'node_v0', 13
-                    );
-                    INSERT INTO operations VALUES (
-                        'op_v0', 'ws_v0', 'default', 'cat.create', 'cat_v0',
-                        7, 'succeeded', NULL, 14, 15
-                    );
-                    INSERT INTO mount_bindings VALUES (
-                        'mount_v0', 'disk_v0', 'cat_v0', '/workspace'
-                    );
-                    INSERT INTO endpoints VALUES (
-                        'endpoint_v0', 'cat_v0', 'web', 'web-v0.cats.run',
-                        3000, 'http', 'wake_on_request'
-                    );
-                    ",
-                )
-                .unwrap();
-        }
-
-        let store = Store::open(&path).unwrap();
-        let preserved = store
-            .with(|connection| {
-                connection.query_row(
-                    "SELECT
-                        (SELECT COUNT(*) FROM accounts WHERE id='acct_v0'),
-                        (SELECT COUNT(*) FROM workspaces WHERE id='ws_v0'),
-                        (SELECT COUNT(*) FROM cats WHERE id='cat_v0' AND generation=7),
-                        (SELECT COUNT(*) FROM disks WHERE id='disk_v0'),
-                        (SELECT COUNT(*) FROM operations WHERE id='op_v0'),
-                        (SELECT COUNT(*) FROM mount_bindings WHERE id='mount_v0'),
-                        (SELECT COUNT(*) FROM endpoints WHERE id='endpoint_v0')",
-                    [],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, i64>(3)?,
-                            row.get::<_, i64>(4)?,
-                            row.get::<_, i64>(5)?,
-                            row.get::<_, i64>(6)?,
-                        ))
-                    },
-                )
-            })
-            .unwrap();
-        assert_eq!(preserved, (1, 1, 1, 1, 1, 1, 1));
-        assert!(
-            !table_has_column(&store.conn.lock().unwrap(), "workspaces", "legacy_project").unwrap()
-        );
-        assert!(!table_has_column(&store.conn.lock().unwrap(), "cats", "project").unwrap());
-        assert_eq!(
-            store
-                .with(|connection| {
-                    connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                })
-                .unwrap(),
-            SCHEMA_VERSION
-        );
-        let workspace = store.workspace_by_id("ws_v0").unwrap();
-        store
-            .create_workspace(&workspace.account_id, "preview", "Preview")
-            .unwrap();
-        store
-            .create_workspace_token("ws_v0", "CI", "sha256-v0-migration")
-            .unwrap();
     }
 
     #[test]
