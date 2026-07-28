@@ -239,11 +239,12 @@ Terraform inputs. This is a deployment path for an already bootstrapped
 environment; the first application install still needs the explicit secret
 injection described above.
 
-Before planning, the workflow reads the live SQLite header with Python and
-compares `PRAGMA user_version` with the build's `SCHEMA_VERSION`. It fails
-closed on a mismatch and never deletes the PVC. The one-time database
-recreation described in the AWS deployment runbook remains an explicit
-operator action.
+Before planning, the workflow reads only the live SQLite header with Python and
+compares `PRAGMA user_version` with the build's
+`MIN_SUPPORTED_SCHEMA_VERSION..SCHEMA_VERSION` range. It permits only migrations
+the build explicitly carries and tests, and fails before replacing the live Pod
+for any version outside that range. It never copies resource rows or deletes the
+PVC.
 
 ## Importing the existing Kubernetes deployment
 

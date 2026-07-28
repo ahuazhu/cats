@@ -281,7 +281,7 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(internal)?;
-        if control_plane_schema_exists > 0 && stamped == 0 {
+        if control_plane_schema_exists > 0 && stamped == MIN_SUPPORTED_SCHEMA_VERSION {
             if table_has_column(&conn, "workspaces", "legacy_project")? {
                 migrate_v0_to_v1(&mut conn)?;
             } else {
@@ -3166,11 +3166,13 @@ fn workspace_view(
     }
 }
 
-/// Bumped on any schema change an existing database cannot be upgraded into.
-/// `Store::open` refuses a database stamped with a different version instead of
-/// migrating it: no released deployment's control-plane state has to survive, and
-/// a migration ladder for shapes nobody runs is archaeology that still has to be
-/// read, tested and kept correct.
+/// Oldest schema for which this build carries a complete, tested migration.
+///
+/// Deployment automation reads this alongside `SCHEMA_VERSION` and refuses to
+/// replace the live Pod when its database falls outside the supported range.
+const MIN_SUPPORTED_SCHEMA_VERSION: i64 = 0;
+
+/// Current on-disk schema written after every successful open or migration.
 const SCHEMA_VERSION: i64 = 1;
 
 const SCHEMA: &str = "

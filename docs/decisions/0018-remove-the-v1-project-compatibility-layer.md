@@ -44,25 +44,28 @@ ADR-0014 已经把 V1 的 Project 拆成 Account（租户与计费所有者）�
    `GET /v1/admin/workspaces`（admin 鉴权）作为目录，用于把 `account/workspace` locator
    解析成不可变 ID。它不是用户 API，不出现在公开文档里。
 
-## 迁移：没有迁移
+## 迁移：一个有边界的 V0 → V1 例外
 
-历史数据不迁移，也不为迁移留脚手架。`project` 列记录的归属指向已经不存在的
-Account/Workspace 合成结果，无法可靠重建；Cats 没有任何已发布部署的控制面状态必须存活。
-因此这次同时删掉了兼容层和"检测兼容层"的代码：
+原决定认为没有已发布控制面状态需要存活，因此不保留通用迁移梯。生产 EKS 随后确实运行了
+未打版本戳的 V0 Project-shaped SQLite；直接重建会丢失 Account、Workspace、Cat、Disk、
+Operation、挂载和 Endpoint。这个事实使「没有状态需要存活」的前提失效，但不恢复长期兼容层。
 
-- 控制面 SQLite 用 `PRAGMA user_version` 单一版本闸门。`Store::open` 只做两件事：
-  版本不匹配就以 `FailedPrecondition` 拒绝并要求重建，匹配就建表。原来的
-  `ensure_column` 迁移梯（`telemetry_json`、`auto_suspend`、`work_version`、
-  `observed_state_since_ms`）、`.cats.local` → 公网 hostname 改写和默认 Endpoint 补齐
-  （`backfill_public_endpoints`）全部删除：它们服务的每一个数据库形态都在版本闸门之外，
-  留着就是一份没人跑、却仍然要被读懂和维护的考古层。
+- 控制面 SQLite 继续用 `PRAGMA user_version` 作版本闸门，并显式发布
+  `MIN_SUPPORTED_SCHEMA_VERSION..SCHEMA_VERSION`。当前唯一支持的旧版本是 0。
+- `Store::open` 以 `workspaces.legacy_project` 识别 Project-shaped V0，在一个事务内重命名并
+  重建 `accounts`、`workspaces`、`cats`、`disks`、`operations`，按不可变 ID 复制记录，
+  删除只为兼容 Project 存在的列，运行 `foreign_key_check`，最后才写入版本 1 并提交。
+  `mount_bindings`、`endpoints` 等引用同一 ID 的表原样保留。
+- 已经是 V1 形状但尚未打版本戳的空白/开发数据库只补建当前 schema 并写入版本 1。
+- 不恢复原来的 `ensure_column` 迁移梯、`.cats.local` hostname 改写或默认 Endpoint 回填。
+  版本超出显式支持范围仍以 `FailedPrecondition` 拒绝，发布流水线也在替换 live Pod 前拒绝。
 - 用量 PostgreSQL schema 不加 `project_id` 改名迁移。一个只为消灭旧名字而永久保留旧名字
   的 DDL，本身就是要清理的东西。既有 usage schema 需要重建，或用 `--usage-schema`
   指向新名字。这条路不写自动 `DROP`：即使历史数据可弃，启动时静默摧毁资金账本不是
   这套代码该有的行为。
 
-代价明确：任何早于本次变更的控制面数据库都必须重建，没有升级路径。这是被显式接受的，
-不是遗漏。
+代价明确：仓库永久承担这一条真实生产形状的迁移及回归测试；这不是允许继续累积无人运行的
+兼容考古层。以后扩大支持范围必须同时提交完整迁移链、生产副本演练和版本边界更新。
 
 ## 不变量与验收
 
@@ -71,8 +74,8 @@ Account/Workspace 合成结果，无法可靠重建；Cats 没有任何已发布
 - 改 Workspace slug 或 display name 不影响资源、用量、余额或任何 URL 的解析结果。
 - 一个 Account 内的所有 Workspace 读到同一个余额；跨 Account 的余额互相隔离。
 - 重复执行 Account provision 不会产生第二个 default Workspace。
-- 版本号不匹配的控制面数据库拒绝启动，并给出可执行的错误信息；本 build 自己写出的
-  数据库可以反复打开。
+- 支持范围内的控制面数据库无损迁移；范围外的版本拒绝启动并给出版本信息；本 build
+  自己写出的数据库可以反复打开。
 - 代码库中不存在 Project 概念的任何实现载体。仅存三类同形字符串：ADR 本身、
   usage projector 的"投影"词义（`project_shard` 等），以及公开文档的 retired-contract
   断言列表（`/v1/projects/`、`CATS_PROJECT`）——那是防止文档回退的围栏，不是残留。
