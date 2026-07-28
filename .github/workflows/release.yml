@@ -73,8 +73,8 @@ jobs:
           push: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
           tags: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
           provenance: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=control-plane
+          cache-to: type=gha,mode=max,scope=control-plane
 
       # tfvars requires an immutable @sha256 reference. Reading the digest back
       # from the registry is deliberate: never copy a digest from a previous
@@ -109,8 +109,8 @@ jobs:
           platforms: linux/amd64
           outputs: type=local,dest=worker-out
           provenance: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=worker-bundle
+          cache-to: type=gha,mode=max,scope=worker-bundle
 
       - name: Package
         id: pkg

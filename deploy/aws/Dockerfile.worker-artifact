@@ -1,14 +1,27 @@
 # syntax=docker/dockerfile:1.7
-FROM rust:1.97-bookworm AS builder
+# Keep this builder identical to the control-plane builder: cargo-chef requires
+# the same Rust version for the dependency and application stages to share
+# artifacts reliably.
+FROM lukemathwalker/cargo-chef:0.1.77-rust-1.97-bookworm@sha256:1689f62cfaa6603480356923cb5966544b2dd6ea523e30486bee4f149965d5bc AS chef
 
 WORKDIR /src
+
+FROM chef AS planner
 COPY . .
-RUN --mount=type=cache,id=cats-cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=cats-worker-target,target=/src/target \
-    cargo build --locked --release \
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /src/recipe.json recipe.json
+RUN cargo chef cook --locked --release --recipe-path recipe.json \
     -p cats-node-agent-daemon \
     -p cats-blockd-daemon \
-    -p cats-guest-agent \
+    -p cats-guest-agent
+
+COPY . .
+RUN cargo build --locked --release \
+      -p cats-node-agent-daemon \
+      -p cats-blockd-daemon \
+      -p cats-guest-agent \
     && strip \
       target/release/cats-noded \
       target/release/cats-blockd \

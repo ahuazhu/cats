@@ -1,6 +1,8 @@
 target*
 dist
 .git
+.github
+.openai
 .DS_Store
 .env
 .env.*
@@ -13,3 +15,7 @@ dist
 docs
 experiments
 deploy/metal
+deploy/aws/terraform
+tools
+AGENTS.md
+README.md
