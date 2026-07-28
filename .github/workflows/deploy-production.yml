@@ -1,0 +1,391 @@
+name: Deploy production
+
+# A main deployment starts only after the CI workflow for that exact main SHA
+# succeeds. workflow_dispatch is a break-glass retry and is accepted only from
+# main. The AWS role's OIDC subject is also pinned to refs/heads/main.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  deployments: write
+  id-token: write
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  deploy:
+    name: Build image and deploy
+    if: >-
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository) ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      RELEASE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_STATE_APPLICATION_KEY: ${{ vars.TF_STATE_APPLICATION_KEY }}
+      EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+      PRODUCTION_TFVARS_B64: ${{ vars.PRODUCTION_TFVARS_B64 }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Assume production deployment role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Derive image tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "tag=main-${RELEASE_SHA:0:12}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push control-plane image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/aws/Dockerfile.control-plane
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Pin image digest
+        id: image
+        shell: bash
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          image_ref="${ECR_REGISTRY}/${ECR_REPOSITORY}@${IMAGE_DIGEST}"
+          echo "ref=$image_ref" >> "$GITHUB_OUTPUT"
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Configure Terraform and Kubernetes
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in \
+            AWS_REGION \
+            TF_STATE_BUCKET \
+            TF_STATE_APPLICATION_KEY \
+            EKS_CLUSTER_NAME \
+            PRODUCTION_TFVARS_B64
+          do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing required repository variable $name"
+              exit 1
+            fi
+          done
+
+          printf '%s' "$PRODUCTION_TFVARS_B64" \
+            | base64 --decode > "$RUNNER_TEMP/production.tfvars"
+
+          aws eks update-kubeconfig \
+            --name "$EKS_CLUSTER_NAME" \
+            --region "$AWS_REGION" \
+            --alias "$EKS_CLUSTER_NAME" \
+            --kubeconfig "$RUNNER_TEMP/kubeconfig"
+
+          live_secret_json="$(
+            kubectl \
+              --kubeconfig "$RUNNER_TEMP/kubeconfig" \
+              --namespace cats \
+              get secret cats-runtime \
+              --output json \
+              | jq -c '
+                  .data
+                  | with_entries(.value |= @base64d)
+                  | if has("CATS_WORKOS_PROJECT_ORGANIZATIONS")
+                       and (has("CATS_WORKOS_ACCOUNT_ORGANIZATIONS") | not)
+                    then .CATS_WORKOS_ACCOUNT_ORGANIZATIONS =
+                           .CATS_WORKOS_PROJECT_ORGANIZATIONS
+                    else .
+                    end
+                  | del(.CATS_WORKOS_PROJECT_ORGANIZATIONS)
+                '
+          )"
+          runtime_secret_json="$(
+            jq -c '
+              del(
+                .CATS_POSTGRES_URL,
+                .CATS_USAGE_STORE_ADAPTER,
+                .CATS_USAGE_POSTGRES_URL,
+                .CATS_USAGE_POSTGRES_SCHEMA,
+                .CATS_USAGE_POSTGRES_WORKERS,
+                .CATS_USAGE_POSTGRES_CA_FILE,
+                .CATS_USAGE_DELIVERY_ADAPTER,
+                .CATS_USAGE_AWS_REGION,
+                .CATS_USAGE_KINESIS_STREAM,
+                .CATS_USAGE_ARCHIVE_BUCKET,
+                .CATS_USAGE_CHECKPOINT_TABLE,
+                .STRIPE_SECRET_KEY,
+                .STRIPE_WEBHOOK_SECRET,
+                .CATS_STRIPE_TOPUP_PRICES,
+                .CATS_STRIPE_CHECKOUT_SUCCESS_URL,
+                .CATS_STRIPE_CHECKOUT_CANCEL_URL,
+                .CATS_STRIPE_LIVEMODE,
+                .CATS_BILLING_ENFORCEMENT_ENABLED
+              )
+            ' <<< "$live_secret_json"
+          )"
+          rds_ca_pem="$(
+            kubectl \
+              --kubeconfig "$RUNNER_TEMP/kubeconfig" \
+              --namespace cats \
+              get configmap cats-rds-ca \
+              --output jsonpath='{.data.rds-ca\.pem}'
+          )"
+
+          for key in \
+            CATS_POSTGRES_URL \
+            CATS_USAGE_POSTGRES_URL \
+            STRIPE_SECRET_KEY \
+            STRIPE_WEBHOOK_SECRET
+          do
+            value="$(jq -er --arg key "$key" '.[$key]' <<< "$live_secret_json")"
+            echo "::add-mask::$value"
+          done
+          echo "::add-mask::$live_secret_json"
+          echo "::add-mask::$runtime_secret_json"
+
+          {
+            echo "TF_VAR_runtime_secret_data=$runtime_secret_json"
+            echo "TF_VAR_storage_postgres_url=$(jq -er '.CATS_POSTGRES_URL' <<< "$live_secret_json")"
+            echo "TF_VAR_usage_postgres_url=$(jq -er '.CATS_USAGE_POSTGRES_URL' <<< "$live_secret_json")"
+            echo "TF_VAR_stripe_secret_key=$(jq -er '.STRIPE_SECRET_KEY' <<< "$live_secret_json")"
+            echo "TF_VAR_stripe_webhook_secret=$(jq -er '.STRIPE_WEBHOOK_SECRET' <<< "$live_secret_json")"
+            echo "TF_VAR_rds_ca_pem<<CATS_RDS_CA_PEM"
+            printf '%s\n' "$rds_ca_pem"
+            echo "CATS_RDS_CA_PEM"
+          } >> "$GITHUB_ENV"
+
+      - name: Check control database compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          required_schema="$(
+            sed -nE \
+              's/^const SCHEMA_VERSION: i64 = ([0-9]+);$/\1/p' \
+              control-plane/src/store.rs
+          )"
+          if [[ ! "$required_schema" =~ ^[0-9]+$ ]]; then
+            echo "::error::Could not read control-plane SCHEMA_VERSION"
+            exit 1
+          fi
+
+          pod="$(
+            kubectl \
+              --kubeconfig "$RUNNER_TEMP/kubeconfig" \
+              --namespace cats \
+              get pods \
+              --selector app.kubernetes.io/name=cats-controld \
+              --field-selector status.phase=Running \
+              --output jsonpath='{.items[0].metadata.name}' 2>/dev/null || true
+          )"
+
+          if [[ -n "$pod" ]] && kubectl \
+            --kubeconfig "$RUNNER_TEMP/kubeconfig" \
+            --namespace cats \
+            exec "$pod" -- \
+            test -f /var/lib/cats/control/control.db
+          then
+            # Only copy SQLite's fixed-size database header. It carries
+            # user_version at bytes 60..63, so production resource rows never
+            # leave the cluster merely to perform this compatibility check.
+            kubectl \
+              --kubeconfig "$RUNNER_TEMP/kubeconfig" \
+              --namespace cats \
+              exec "$pod" -- \
+              head -c 100 /var/lib/cats/control/control.db \
+              > "$RUNNER_TEMP/control.db.header"
+
+            actual_schema="$(
+              python3 - "$RUNNER_TEMP/control.db.header" <<'PY'
+          import sys
+
+          header = open(sys.argv[1], "rb").read()
+          if len(header) != 100 or header[:16] != b"SQLite format 3\0":
+              raise SystemExit("invalid SQLite database header")
+          print(int.from_bytes(header[60:64], byteorder="big"))
+          PY
+            )"
+
+            if [[ "$actual_schema" != "$required_schema" ]]; then
+              echo "::error::Control database schema $actual_schema is incompatible with build schema $required_schema. Follow the reviewed one-time database recreation runbook before retrying; the deployment will not delete production data automatically."
+              exit 1
+            fi
+          fi
+
+      - name: Initialize application state
+        shell: bash
+        run: |
+          set -euo pipefail
+          terraform \
+            -chdir=deploy/aws/terraform/stacks/production-application \
+            init \
+            -input=false \
+            -reconfigure \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=$TF_STATE_APPLICATION_KEY" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Create GitHub deployment
+        id: deployment
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          deployment_id="$(
+            jq -n \
+              --arg ref "$RELEASE_SHA" \
+              '{
+                ref: $ref,
+                environment: "production",
+                auto_merge: false,
+                required_contexts: [],
+                description: "Terraform deployment after successful main CI"
+              }' \
+              | gh api \
+                  --method POST \
+                  "repos/${GITHUB_REPOSITORY}/deployments" \
+                  --input - \
+                  --jq '.id'
+          )"
+          echo "id=$deployment_id" >> "$GITHUB_OUTPUT"
+
+      - name: Plan production deployment
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: |
+          set -euo pipefail
+          terraform \
+            -chdir=deploy/aws/terraform/stacks/production-application \
+            plan \
+            -input=false \
+            -lock-timeout=5m \
+            -out="$RUNNER_TEMP/production.tfplan" \
+            -var-file="$RUNNER_TEMP/production.tfvars" \
+            -var="kubeconfig_path=$RUNNER_TEMP/kubeconfig" \
+            -var="kubeconfig_context=$EKS_CLUSTER_NAME" \
+            -var="control_plane_image=$IMAGE_REF" \
+            -var="gateway_image=$IMAGE_REF"
+
+      - name: Apply reviewed plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          terraform \
+            -chdir=deploy/aws/terraform/stacks/production-application \
+            apply \
+            -input=false \
+            -auto-approve \
+            "$RUNNER_TEMP/production.tfplan"
+
+      - name: Verify rollout and immutable image
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: |
+          set -euo pipefail
+          for deployment in cats-controld cats-gatewayd
+          do
+            kubectl \
+              --kubeconfig "$RUNNER_TEMP/kubeconfig" \
+              --namespace cats \
+              rollout status "deployment/$deployment" \
+              --timeout=10m
+            observed="$(
+              kubectl \
+                --kubeconfig "$RUNNER_TEMP/kubeconfig" \
+                --namespace cats \
+                get "deployment/$deployment" \
+                --output jsonpath='{.spec.template.spec.containers[0].image}'
+            )"
+            [[ "$observed" == "$IMAGE_REF" ]]
+          done
+
+      - name: Mark deployment successful
+        if: success() && steps.deployment.outputs.id != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOYMENT_ID: ${{ steps.deployment.outputs.id }}
+        run: |
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/deployments/${DEPLOYMENT_ID}/statuses" \
+            -f state=success \
+            -f environment=production \
+            -f environment_url=https://cats.run \
+            -f log_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+      - name: Mark deployment failed
+        if: failure() && steps.deployment.outputs.id != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOYMENT_ID: ${{ steps.deployment.outputs.id }}
+        run: |
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/deployments/${DEPLOYMENT_ID}/statuses" \
+            -f state=failure \
+            -f environment=production \
+            -f log_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+      - name: Report release
+        if: success()
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: |
+          {
+            echo "### Production deployment"
+            echo
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| commit | \`$RELEASE_SHA\` |"
+            echo "| image | \`$IMAGE_REF\` |"
+            echo "| method | Terraform saved plan + apply |"
+          } >> "$GITHUB_STEP_SUMMARY"

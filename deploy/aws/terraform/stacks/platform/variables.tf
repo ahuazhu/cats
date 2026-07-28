@@ -148,6 +148,31 @@ variable "github_default_branch" {
   default     = "main"
 }
 
+variable "github_actions_application_state_bucket_arn" {
+  type        = string
+  description = "ARN of the remote-state bucket containing the production application state."
+
+  validation {
+    condition     = can(regex("^arn:[^:]+:s3:::[^/]+$", var.github_actions_application_state_bucket_arn))
+    error_message = "github_actions_application_state_bucket_arn must be an S3 bucket ARN without a key suffix."
+  }
+}
+
+variable "github_actions_application_state_key" {
+  type        = string
+  description = "Exact remote-state object key the main-branch deployment may update."
+  default     = "cats/production/application.tfstate"
+
+  validation {
+    condition = (
+      length(trimspace(var.github_actions_application_state_key)) > 0 &&
+      !startswith(var.github_actions_application_state_key, "/") &&
+      !endswith(var.github_actions_application_state_key, "/")
+    )
+    error_message = "github_actions_application_state_key must be a non-empty object key without leading or trailing slash."
+  }
+}
+
 variable "create_github_oidc_provider" {
   type        = bool
   description = "Create the GitHub OIDC provider. An account may only have one per URL."
