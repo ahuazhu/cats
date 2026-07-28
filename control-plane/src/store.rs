@@ -108,7 +108,9 @@ pub struct WorkspaceScope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BillingLedgerRecord {
     pub billing_account_id: String,
-    pub owner_id: String,
+    /// Account that owns this Billing Account. Named for what it holds: the
+    /// funds side keys on Accounts, never on Workspaces.
+    pub account_id: String,
     pub signup_credit_nanos: i128,
 }
 
@@ -599,7 +601,7 @@ impl Store {
         let scope = self.workspace_scope(workspace_id)?;
         Ok(BillingLedgerRecord {
             billing_account_id: scope.account.billing_account_id,
-            owner_id: scope.account.id,
+            account_id: scope.account.id,
             signup_credit_nanos: if scope.account.kind == AccountKind::Personal {
                 10_000_000_000
             } else {
