@@ -1,13 +1,25 @@
 # syntax=docker/dockerfile:1.7
-FROM rust:1.97-bookworm AS builder
+# Pin both cargo-chef and its multi-platform image. The recipe layer changes
+# only when Cargo manifests or Cargo.lock change, so ordinary source edits
+# reuse the optimized third-party dependency build.
+FROM lukemathwalker/cargo-chef:0.1.77-rust-1.97-bookworm@sha256:1689f62cfaa6603480356923cb5966544b2dd6ea523e30486bee4f149965d5bc AS chef
 
 WORKDIR /src
+
+FROM chef AS planner
 COPY . .
-RUN --mount=type=cache,id=cats-cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=cats-control-target,target=/src/target \
-    cargo build --locked --release \
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /src/recipe.json recipe.json
+RUN cargo chef cook --locked --release --recipe-path recipe.json \
     -p cats-control-plane-daemon \
-    -p cats-network \
+    -p cats-network
+
+COPY . .
+RUN cargo build --locked --release \
+      -p cats-control-plane-daemon \
+      -p cats-network \
     && strip \
       target/release/cats-controld \
       target/release/cats-gatewayd \
