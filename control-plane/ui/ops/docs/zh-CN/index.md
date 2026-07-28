@@ -61,4 +61,4 @@
 
 ## 当前源码的生产限制
 
-仓库仍缺少原生 vhost-user-blk、tap/overlay Guest 网络、Suspended page-out（CH 路径当前仅 Pause）、Project Resource Store 的 PostgreSQL 实现与权限隔离。Cloud Hypervisor Phase-A 路径已经通过已记录的裸金属验收，但在这些剩余项完成前，不能称整个技术栈已经 Production Ready。
+仓库仍缺少 tap/overlay Guest 网络、Project Resource Store 的 PostgreSQL 实现与权限隔离。原生 vhost-user-blk（ADR-0015）与 Suspended page-out（在每 Cat 的 file-backed 内存区上使用 `process_madvise(MADV_PAGEOUT)`）都已落地；内核 NBD 仍是默认块路径，原因是实测的写吞吐权衡，而非缺少验证。Cloud Hypervisor 路径已经通过已记录的裸金属验收，但在这些剩余项完成前，不能称整个技术栈已经 Production Ready。
