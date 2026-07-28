@@ -966,24 +966,29 @@ impl GuestAgent {
         } else {
             "/bin/sh"
         };
-        let mut command = CommandBuilder::new(shell);
-        command.arg("-l");
-        command.env("SHELL", shell);
-        command.env("HOME", "/root");
-        command.env("USER", "root");
-        command.env("LOGNAME", "root");
-        command.env("TERM", "xterm-256color");
-        command.env("COLORTERM", "truecolor");
-        let cwd = if Path::new("/root").is_dir() {
+        // Inside a real Guest the agent is root and /root is its home. The
+        // FakeVmm topology runs the agent as an ordinary host process, where
+        // /root exists but is mode 0700 owned by root, so `is_dir` says yes and
+        // the spawn then fails with EACCES on the chdir. Test for reachability,
+        // not existence.
+        let home = if std::fs::read_dir("/root").is_ok() {
             "/root"
         } else {
             "/"
         };
-        command.cwd(cwd);
+        let mut command = CommandBuilder::new(shell);
+        command.arg("-l");
+        command.env("SHELL", shell);
+        command.env("HOME", home);
+        command.env("USER", "root");
+        command.env("LOGNAME", "root");
+        command.env("TERM", "xterm-256color");
+        command.env("COLORTERM", "truecolor");
+        command.cwd(home);
         let mut child = pair
             .slave
             .spawn_command(command)
-            .with_context(|| format!("spawn shell {shell} in {cwd}"))?;
+            .with_context(|| format!("spawn shell {shell} in {home}"))?;
         drop(pair.slave);
         let mut pty_reader = pair
             .master
