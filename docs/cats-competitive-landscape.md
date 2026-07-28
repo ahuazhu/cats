@@ -505,9 +505,9 @@ startup, artifacts, and capacity for every Cloud Agent"。
   恢复时把快照内存做成**只读 ublk 设备**当 file-backed memory backend 交给 Firecracker
   （`instance.rs:517`、`src/sandbox/firecracker/sandbox.rs:1437-1466`），
   多个同源沙箱共享同一设备以复用页缓存。
-- **这是 §1.2 第 2 条那句"Firecracker 系结构上只能二选一"的直接反例**：
-  自定义块设备后端与 VM 快照在同一套系统里同时成立。代价是数据通路更长——
-  Firecracker 与 ublk daemon 两个用户态进程，外加一次完整的宿主内核块层往返。
+- **本文原先断言"Firecracker 系结构上只能在自定义块后端与 VM 快照之间二选一"，
+  这个反例把它证伪了**：两者在同一套系统里同时成立。真正的代价是数据通路更长——
+  Firecracker 与 ublk daemon 两个用户态进程，外加一次完整的宿主内核块层往返（§1.2 第 2 条）。
 - 另有 E2B 兼容 HTTP API（把 `E2B_API_URL` 指过去即可直接用官方 SDK）。不外售。
 
 **这告诉 Cats 三件事**：(1) 目标形态技术上可行且已被多家独立验证；
