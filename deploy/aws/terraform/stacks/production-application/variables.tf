@@ -148,3 +148,15 @@ variable "auto_cold_after_seconds" {
   type    = number
   default = 86400
 }
+
+variable "aws_region" {
+  description = "Region holding the load balancer and the hosted zone."
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "route53_zone_id" {
+  description = "Hosted zone receiving alias records for every public host. Null leaves DNS to another system."
+  type        = string
+  default     = null
+}
