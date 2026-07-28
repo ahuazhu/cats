@@ -20,6 +20,7 @@ dist/
 *.tfstate.*
 *.tfplan
 *.auto.tfvars
+backend.hcl
 crash.log
 override.tf
 override.tf.json
