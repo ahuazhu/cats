@@ -1,0 +1,90 @@
+Cat lifecycle latency on plain bare metal, both block paths.
+
+host:     AWS c5.metal, 96 cpus, 188 GiB -- NO instance store, so the ChunkStore
+          cache and the file object store both sit on the EBS gp3 root
+          (6000 IOPS / 500 MB/s provisioned). This is the "ordinary bare metal"
+          shape, as opposed to i4i.metal's local NVMe.
+date_utc: 2026-07-27
+raw:      c5-lifecycle.log
+
+--- single Cat: the two paths are indistinguishable to a user -----------------
+
+Median of 3, ms. The first create on a node is excluded from the median: it
+publishes the golden image once (6192 ms kernel-nbd / 5891 ms vhost-user).
+
+  operation                 kernel-nbd   vhost-user
+  create (cold)                   1681         1827
+  warm (snapshot + VMM exit)       465          464
+  restore (from snapshot)          163          163
+  suspend (vm.pause)               162          163
+  resume (vm.resume)               163          162
+  stop                             163          162
+  start (cold, after stop)        1674         1674
+
+Create and cold start land on the same number (~1.7 s), which is what should
+happen once golden roots mean neither uploads any data: both are dominated by
+booting a VM. Restore at 163 ms is 3x cheaper than warm at 465 ms -- storing the
+snapshot is the expensive half, which is the shape the Warm state wants.
+
+--- but the node agent's own telemetry is NOT indistinguishable ---------------
+
+Warm restore, internal phase timings (µs), 3 samples each:
+
+  path         total   blockd   block_attach   api_ready   resume   guest_health
+  kernel-nbd   93705    11047          37311       41456     1544          1776
+  kernel-nbd   92818    11150          32371       44516     1464          2827
+  kernel-nbd   90486    10843          36986       39521     1241          1551
+  vhost-user   35307    11216              3       21368     1229          1127
+  vhost-user   39750    11256              4       25418     1531          1146
+  vhost-user   38391    11266              5       23355     1427          1912
+
+  mean total:         92.3 ms  ->  37.8 ms      2.4x faster
+  mean block attach:  35.6 ms  ->  4 µs         and it was 38% of the restore
+
+The user-visible restore is 163 ms on both paths because ~125 ms of control-plane
+round trip sits on top and swamps the difference. So the block path advantage is
+real and measurable, but today it is hidden end-to-end by overhead above it.
+
+--- concurrency is where they separate ----------------------------------------
+
+concurrent-start.sh, 0 failures in every cell. min / p50 / max ms.
+
+  create        kernel-nbd                    vhost-user
+       1        1679 / 1679 / 1679            1828 / 1828 / 1828
+       4        1853 / 5008 / 6670            1826 / 3665 / 3665
+      10        1823 / 8236 / 16692           1822 / 3873 / 3874
+
+  restore       kernel-nbd                    vhost-user
+       1         162 /  162 /  162             162 /  162 /  162
+       4         162 /  330 /  467             178 /  182 /  182
+      10         207 /  642 / 1129             218 /  235 /  371
+
+  warm          kernel-nbd                    vhost-user
+       1         466 /  466 /  466             463 /  463 /  463
+       4        2122 / 2584 / 2735            2577 / 2903 / 3053
+      10        6051 / 14260 / 14713          6218 / 14085 / 14394
+
+* 10 concurrent creates: 16692 ms on kernel-nbd against 3874 ms on vhost-user,
+  4.3x. And look at the shape: vhost-user's p50 at n=10 (3873 ms) is barely above
+  its single-Cat time, while kernel-nbd's climbs to 8236 ms with a 16.7 s tail.
+  That is the node-wide /dev/nbdN allocation lock, which the node agent takes for
+  every kernel-nbd launch and never for vhost-user.
+* 10 concurrent restores: 1129 ms against 371 ms, 3.0x, and far tighter
+  (p50 642 vs 235).
+* Warm is the same on both paths, which fits: writing a snapshot is not
+  block-path work.
+
+--- what this adds to the default-path decision ------------------------------
+
+Single Cat: no user-visible difference. Concurrency: vhost-user is 3-4x better on
+both create and wake. Combined with the fio result from i4i (vhost-user wins all
+six workloads once the host page cache is out of the comparison) and with the
+robustness finding below, the case for vhost-user no longer rests on throughput
+alone.
+
+Robustness, observed on i4i earlier the same day, not a measurement but worth
+recording: when a cats-blockd dies with its /dev/nbdN still attached, any process
+touching that device enters uninterruptible sleep. The node agent became
+unkillable -- it survived SIGKILL -- and kept port 7301 bound, so systemd could
+not restart it and every later phase failed. Recovery needed a manual
+`nbd-client -d`. The vhost-user path has no kernel device to orphan.

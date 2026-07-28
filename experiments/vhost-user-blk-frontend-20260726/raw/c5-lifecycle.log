@@ -1,0 +1,51 @@
+date_utc: 2026-07-27T12:42:17Z
+instance: c5.metal, 96 cpus, 188 GiB
+cache_mount:  -- EBS, no instance store on c5
+object_store: object-store-adapter file
+block_path: kernel-nbd (default)
+
+##### single-Cat lifecycle, kernel-nbd (3 iterations, ms)
+iter         create     warm  restore  suspend   resume     stop    start
+1              6192      465      163      164      163      163     1673
+2              1683      464      161      162      163      163     1674
+3              1679      465      163      162      163      313     1825
+
+##### node-agent phase timings for the warm restores above, kernel-nbd
+warm restore phase timings cat="cat_606e0d572de6" block_path="kernel-nbd" total_us=93705 blockd_us=11047 block_attach_us=37311 vmm_spawn_us=491 api_ready_us=41456 resume_us=1544 guest_health_us=1776
+warm restore phase timings cat="cat_fa52ad33e247" block_path="kernel-nbd" total_us=92818 blockd_us=11150 block_attach_us=32371 vmm_spawn_us=406 api_ready_us=44516 resume_us=1464 guest_health_us=2827
+warm restore phase timings cat="cat_1b9041ac4a3d" block_path="kernel-nbd" total_us=90486 blockd_us=10843 block_attach_us=36986 vmm_spawn_us=303 api_ready_us=39521 resume_us=1241 guest_health_us=1551
+
+##### concurrency, kernel-nbd -- create / warm / restore
+kernel-nbd-n1,create,1,1,1679,1679,1679,1679,0
+kernel-nbd-n1,warm,1,1,466,466,466,466,0
+kernel-nbd-n1,restore,1,1,162,162,162,162,0
+kernel-nbd-n4,create,4,4,1853,5008,6670,6670,0
+kernel-nbd-n4,warm,4,4,2122,2584,2735,2735,0
+kernel-nbd-n4,restore,4,4,162,330,467,467,0
+kernel-nbd-n10,create,10,10,1823,8236,16692,16692,0
+kernel-nbd-n10,warm,10,10,6051,14260,14713,14713,0
+kernel-nbd-n10,restore,10,10,207,642,1129,1129,0
+
+##### single-Cat lifecycle, vhost-user (3 iterations, ms)
+iter         create     warm  restore  suspend   resume     stop    start
+1              5891      464      163      163      163      161     1675
+2              1827      464      162      163      162      162     1674
+3              1827      464      163      161      161      162     1672
+
+##### node-agent phase timings for the warm restores above, vhost-user
+warm restore phase timings cat="cat_0cd154be1269" block_path="vhost-user" total_us=35307 blockd_us=11216 block_attach_us=3 vmm_spawn_us=287 api_ready_us=21368 resume_us=1229 guest_health_us=1127
+warm restore phase timings cat="cat_672bd5fd7f85" block_path="vhost-user" total_us=39750 blockd_us=11256 block_attach_us=4 vmm_spawn_us=315 api_ready_us=25418 resume_us=1531 guest_health_us=1146
+warm restore phase timings cat="cat_9fe0487a7804" block_path="vhost-user" total_us=38391 blockd_us=11266 block_attach_us=5 vmm_spawn_us=345 api_ready_us=23355 resume_us=1427 guest_health_us=1912
+
+##### concurrency, vhost-user -- create / warm / restore
+vhost-user-n1,create,1,1,1828,1828,1828,1828,0
+vhost-user-n1,warm,1,1,463,463,463,463,0
+vhost-user-n1,restore,1,1,162,162,162,162,0
+vhost-user-n4,create,4,4,1826,3665,3665,3665,0
+vhost-user-n4,warm,4,4,2577,2903,3053,3053,0
+vhost-user-n4,restore,4,4,178,182,182,182,0
+vhost-user-n10,create,10,10,1822,3873,3874,3874,0
+vhost-user-n10,warm,10,10,6218,14085,14394,14394,0
+vhost-user-n10,restore,10,10,218,235,371,371,0
+
+== lifecycle done
