@@ -219,8 +219,8 @@ tbody tr:hover { background: #fbfcfb; }
 .billing-funds > div { min-height: 142px; padding: 22px; }
 .billing-funds > div + div { border-left: 1px solid rgb(255 255 255 / 14%); }
 .billing-funds .eyebrow { color: #b9df4b; }
-.billing-funds h2 { margin: 11px 0 0; font-size: 13px; font-weight: 650; }
-.billing-funds h2 strong { display: block; margin-top: 7px; font-size: 32px; line-height: 1; letter-spacing: -.04em; }
+.billing-funds h2 { margin: 12px 0 0; font-size: 13px; font-weight: 650; }
+.billing-funds h2 strong { display: block; font-size: 32px; line-height: 1; letter-spacing: -.04em; }
 .billing-funds-balance p { margin: 13px 0 0; color: #c9ddd1; font-size: 10px; }
 .billing-funds-breakdown { display: grid; grid-template-columns: repeat(3, 1fr); align-content: center; gap: 12px; }
 .billing-funds-breakdown span, .billing-funds-breakdown strong { display: block; }
