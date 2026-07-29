@@ -64,10 +64,17 @@ pub trait MetadataStore: Send + Sync {
     fn revoke_lease(&self, volume_id: &str) -> Result<()>;
 
     /// Atomically publish a new root and return the new generation.
+    ///
+    /// `new_generation` must be greater than `expected_generation`; a batched
+    /// commit publishes several packs under one swap by jumping more than one
+    /// step (ADR-0021 follow-up). The compare stays on `expected_generation`,
+    /// so the fencing and lineage semantics are unchanged.
+    #[allow(clippy::too_many_arguments)]
     fn cas_head(
         &self,
         volume_id: &str,
         expected_generation: i64,
+        new_generation: i64,
         new_root_hash: [u8; 32],
         new_root_object_id: &str,
         attachment_id: &str,

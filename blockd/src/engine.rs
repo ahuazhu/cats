@@ -57,17 +57,44 @@ pub enum DurabilityMode {
     /// the host outright.
     Strict,
     /// FLUSH acks once the pack is durable on the local disk; a background
-    /// committer publishes staged packs in order. Acknowledged-but-unpublished
-    /// writes survive a blockd crash on the same host (pack replay), but not
-    /// the loss of the host. The loss window is bounded by the drain interval
-    /// plus the staged backlog.
+    /// committer publishes staged packs in order — on its timer, and eagerly
+    /// whenever the queue crosses `EAGER_DRAIN_WATERMARK`, so the interval
+    /// bounds the idle-tail latency rather than paces bursts.
+    /// Acknowledged-but-unpublished writes survive a blockd crash on the same
+    /// host (pack replay), but not the loss of the host. The loss window is
+    /// bounded by the drain interval plus the staged backlog.
+    ///
+    /// `drain_interval_ms == 0` disables the background committer entirely
+    /// (drains still happen on backpressure, detach and demand) — a
+    /// deterministic mode for tests.
     Relaxed { drain_interval_ms: u64 },
 }
 
 /// Staged packs a relaxed volume may accumulate before FLUSH stops acking
-/// locally and drains inline. The cap turns an object-store outage into
-/// strict-like latency instead of an unbounded loss window.
-pub const MAX_STAGED_PACKS: usize = 16;
+/// locally. Past the cap a FLUSH waits for the committer to pop a batch
+/// (bounded by one publish round) — or drains inline when no committer runs —
+/// so an object-store outage degrades latency instead of growing the loss
+/// window. Batched publishing keeps a drain round flat-cost, which is what
+/// lets the cap sit this high.
+pub const MAX_STAGED_PACKS: usize = 64;
+
+/// Queue depth past which a relaxed stage kicks the committer instead of
+/// letting packs sit until the timer. Above one so the single-pack case (an
+/// idle volume's periodic journal commit) still batches with whatever the
+/// next few milliseconds bring, and low enough that a burst starts draining
+/// long before the `MAX_STAGED_PACKS` backpressure cap is in sight.
+const EAGER_DRAIN_WATERMARK: usize = 2;
+
+/// Payload bytes one drain batch may hold in memory at once. A batch of
+/// sparse packs is far below this; a run of dense 4 MiB-base commits gets
+/// split into successive batches instead of pulling gigabytes into RAM.
+const MAX_BATCH_BYTES: usize = 256 << 20;
+
+/// What wakes the background committer.
+struct CommitterSignal {
+    stop: bool,
+    kick: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -142,11 +169,19 @@ pub struct ChunkEngine {
     /// provisioning — takes `flush_lock` first, then this.
     publish_lock: Mutex<()>,
     staged: Mutex<StagedQueue>,
+    /// Signaled (with `staged` held) whenever a drain pops a batch, so a FLUSH
+    /// blocked on the backpressure cap wakes as soon as there is room.
+    staged_space: Condvar,
     fenced: AtomicBool,
     epoch: i64,
     /// Signals the lease-renewal thread to stop, and wakes it so a detach does not
     /// have to wait out its sleep interval.
     stop_renew: Arc<(Mutex<bool>, Condvar)>,
+    /// Wakes the background committer: `stop` ends it, `kick` asks for an
+    /// immediate drain (a relaxed stage sets it once the queue crosses the
+    /// eager watermark, so bursts drain continuously instead of waiting out
+    /// the timer).
+    committer_signal: Arc<(Mutex<CommitterSignal>, Condvar)>,
     renew_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     gc_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     committer_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -237,6 +272,7 @@ impl ChunkEngine {
             io_gate: RwLock::new(()),
             flush_lock: Mutex::new(()),
             publish_lock: Mutex::new(()),
+            staged_space: Condvar::new(),
             staged: Mutex::new(StagedQueue {
                 packs: std::collections::VecDeque::new(),
                 next_base: 0,
@@ -244,6 +280,13 @@ impl ChunkEngine {
             fenced: AtomicBool::new(false),
             epoch,
             stop_renew: Arc::new((Mutex::new(false), Condvar::new())),
+            committer_signal: Arc::new((
+                Mutex::new(CommitterSignal {
+                    stop: false,
+                    kick: false,
+                }),
+                Condvar::new(),
+            )),
             renew_thread: Mutex::new(None),
             gc_thread: Mutex::new(None),
             committer_thread: Mutex::new(None),
@@ -430,7 +473,8 @@ impl ChunkEngine {
         let chunks: Vec<u64> = manifest.chunks.iter().map(|c| c.chunk_idx).collect();
         let txn = format!("img-{}", &manifest.image_id[..16]);
         let mut new_leaves = vec![LeafRef::Empty; chunk::leaf_count(self.size) as usize];
-        let new_gen = self.publish_map(&txn, 0, self.epoch, &new_map, &mut new_leaves, &chunks)?;
+        let new_gen =
+            self.publish_map(&txn, 0, 1, self.epoch, &new_map, &mut new_leaves, &chunks)?;
 
         let mut st = self.state.lock().unwrap();
         st.map = new_map;
@@ -673,9 +717,49 @@ impl ChunkEngine {
         };
         match self.cfg.durability {
             DurabilityMode::Strict => self.drain_staged(),
+            DurabilityMode::Relaxed { drain_interval_ms }
+                if backlog > MAX_STAGED_PACKS && drain_interval_ms > 0 =>
+            {
+                // Parked, not conscripted: joining the drain itself would put
+                // this FLUSH in a publish_lock convoy behind every other
+                // capped FLUSH — the exact pathology sustained fsync load
+                // showed in production (fsync floor rose to a full publish
+                // round, p90 to several).
+                self.wait_for_staging_space()?;
+                Ok(self.staged.lock().unwrap().next_base)
+            }
             DurabilityMode::Relaxed { .. } if backlog > MAX_STAGED_PACKS => self.drain_staged(),
             DurabilityMode::Relaxed { .. } => Ok(self.staged.lock().unwrap().next_base),
         }
+    }
+
+    /// A FLUSH past the backpressure cap parks here until the committer pops
+    /// a batch, so it stalls for at most about one publish round. Falls back
+    /// to an inline drain if no room appears — a wedged committer (store
+    /// outage) must not park guest FLUSHes forever.
+    fn wait_for_staging_space(&self) -> Result<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut staged = self.staged.lock().unwrap();
+        while staged.packs.len() > MAX_STAGED_PACKS {
+            self.kick_committer();
+            if std::time::Instant::now() >= deadline {
+                drop(staged);
+                self.drain_staged()?;
+                return Ok(());
+            }
+            let (guard, _timeout) = self
+                .staged_space
+                .wait_timeout(staged, Duration::from_millis(100))
+                .unwrap();
+            staged = guard;
+        }
+        Ok(())
+    }
+
+    fn kick_committer(&self) {
+        let (lock, cv) = &*self.committer_signal;
+        lock.lock().unwrap().kick = true;
+        cv.notify_all();
     }
 
     /// Freeze the dirty set and write it as a pending pack on local disk.
@@ -761,6 +845,13 @@ impl ChunkEngine {
                 path: self.pack_path(base_generation, &txn),
             });
             staged.next_base += 1;
+            let backlog = staged.packs.len();
+            drop(staged);
+            if backlog > EAGER_DRAIN_WATERMARK {
+                // A burst is forming: drain continuously instead of letting
+                // the queue climb toward the backpressure cap on the timer.
+                self.kick_committer();
+            }
         }
         crashpoint::maybe_crash(crashpoint::AFTER_PACK);
         Ok(())
@@ -774,38 +865,73 @@ impl ChunkEngine {
     /// their frozen sets were cleared, but the pack files and the persistent
     /// bitmap survive, so neither a retry nor a restart can lose the data.
     pub fn drain_staged(&self) -> Result<i64> {
-        let _publish = self.publish_lock.lock().unwrap();
         loop {
-            let next = {
-                let staged = self.staged.lock().unwrap();
-                staged
-                    .packs
-                    .front()
-                    .map(|p| (p.txn.clone(), p.path.clone()))
-            };
-            let Some((txn, path)) = next else {
+            if self.drain_one_batch()? {
                 return Ok(self.generation());
-            };
-            let bytes = fs::read(&path)?;
+            }
+        }
+    }
+
+    /// Publish one batch under one `publish_lock` hold; returns true once the
+    /// queue is empty. The lock is released between batches so a parked FLUSH
+    /// or a GC scan never waits out an entire multi-batch drain.
+    fn drain_one_batch(&self) -> Result<bool> {
+        let _publish = self.publish_lock.lock().unwrap();
+        // Batch the queue: one upload wave, one CAS, however many packs are
+        // waiting — bounded by bytes so a run of dense commits does not pull
+        // gigabytes of payload into memory at once.
+        let snapshot: Vec<(String, PathBuf)> = {
+            let staged = self.staged.lock().unwrap();
+            staged
+                .packs
+                .iter()
+                .map(|p| (p.txn.clone(), p.path.clone()))
+                .collect()
+        };
+        if snapshot.is_empty() {
+            return Ok(true);
+        }
+        let mut decoded: Vec<(PackHeader, Vec<u8>)> = Vec::new();
+        let mut batched_bytes = 0usize;
+        for (txn, path) in &snapshot {
+            let bytes = fs::read(path)?;
+            batched_bytes += bytes.len();
             let (header, payload) = format::decode_pack(&bytes)
                 .map_err(|e| EngineError::Corrupt(format!("staged pack {txn}: {e}")))?;
-            let (base_map, base_leaves) = {
-                let st = self.state.lock().unwrap();
-                (st.map.clone(), st.leaf_refs.clone())
-            };
-            match self.commit_pack(&header, &payload, base_map, base_leaves) {
-                Ok(_) => {
-                    self.finish_committed_pack(&header)?;
-                    self.staged.lock().unwrap().packs.pop_front();
+            decoded.push((header, payload));
+            if batched_bytes >= MAX_BATCH_BYTES {
+                break;
+            }
+        }
+        let (base_map, base_leaves) = {
+            let st = self.state.lock().unwrap();
+            (st.map.clone(), st.leaf_refs.clone())
+        };
+        let packs: Vec<(&PackHeader, &[u8])> = decoded
+            .iter()
+            .map(|(header, payload)| (header, payload.as_slice()))
+            .collect();
+        match self.commit_pack_batch(&packs, base_map, base_leaves) {
+            Ok(_) => {
+                for (header, _) in &decoded {
+                    self.finish_committed_pack(header)?;
                 }
-                Err(e) => {
-                    if matches!(e, EngineError::Meta(MetaError::CasConflict { .. }))
-                        || matches!(e, EngineError::Meta(MetaError::Fenced))
-                    {
-                        self.fenced.store(true, Ordering::SeqCst);
-                    }
-                    return Err(e);
+                let mut staged = self.staged.lock().unwrap();
+                for _ in 0..decoded.len() {
+                    staged.packs.pop_front();
                 }
+                drop(staged);
+                // Room just opened up: wake any FLUSH parked on the cap.
+                self.staged_space.notify_all();
+                Ok(false)
+            }
+            Err(e) => {
+                if matches!(e, EngineError::Meta(MetaError::CasConflict { .. }))
+                    || matches!(e, EngineError::Meta(MetaError::Fenced))
+                {
+                    self.fenced.store(true, Ordering::SeqCst);
+                }
+                Err(e)
             }
         }
     }
@@ -832,10 +958,12 @@ impl ChunkEngine {
     /// Shared by the commit path and by provisioning from a shared base image,
     /// which differ only in where the chunk refs came from — everything about
     /// durability, fencing and the CAS is the same, and must stay that way.
+    #[allow(clippy::too_many_arguments)]
     fn publish_map(
         &self,
         txn: &str,
         base_generation: i64,
+        new_generation: i64,
         lease_epoch: i64,
         new_map: &[ChunkRef],
         new_leaves: &mut [LeafRef],
@@ -869,13 +997,13 @@ impl ChunkEngine {
             .put_immutable(&chunk::keys::map_node(vol, &root_hex), &root_encoded)?;
         let record = serde_json::json!({
             "txn": txn,
-            "generation": base_generation + 1,
+            "generation": new_generation,
             "root_hash": root_hex,
             "lease_epoch": lease_epoch,
             "chunks": chunks,
         });
         self.blob.put_immutable(
-            &chunk::keys::commit_record(vol, base_generation + 1, txn),
+            &chunk::keys::commit_record(vol, new_generation, txn),
             record.to_string().as_bytes(),
         )?;
         crashpoint::maybe_crash(crashpoint::BEFORE_CAS);
@@ -883,6 +1011,7 @@ impl ChunkEngine {
         let new_gen = self.meta.cas_head(
             vol,
             base_generation,
+            new_generation,
             root_hash,
             &root_object_id,
             &self.cfg.attachment_id,
@@ -904,25 +1033,29 @@ impl ChunkEngine {
     /// 48-chunk commit spent about 1.6 s of its 1.7 s waiting for 48 sequential
     /// PUTs of 64 KiB each, which is why publishing 64x fewer bytes only bought
     /// 2.9x (see experiments/vhost-user-blk-frontend-20260726).
-    fn upload_objects(&self, header: &PackHeader, payload: &[u8]) -> Result<()> {
+    fn upload_batch(&self, packs: &[(&PackHeader, &[u8])]) -> Result<()> {
         let vol = &self.cfg.volume_id;
-        let entries = &header.entries;
-        let put = |entry: &PackEntry| -> Result<()> {
-            if entry.is_discard() {
-                return Ok(());
-            }
-            let at = entry.payload_offset as usize;
-            let bytes = &payload[at..at + entry.len as usize];
-            let object_id = Self::object_id(&header.txn, entry);
-            self.blob
-                .put_immutable(&chunk::keys::data(vol, &object_id), bytes)?;
+        let items: Vec<(String, &[u8])> = packs
+            .iter()
+            .flat_map(|(header, payload)| {
+                header.entries.iter().filter(|e| !e.is_discard()).map(|e| {
+                    let at = e.payload_offset as usize;
+                    let bytes = &payload[at..at + e.len as usize];
+                    let object_id = Self::object_id(&header.txn, e);
+                    (chunk::keys::data(vol, &object_id), bytes)
+                })
+            })
+            .collect();
+
+        let put = |item: &(String, &[u8])| -> Result<()> {
+            self.blob.put_immutable(&item.0, item.1)?;
             Ok(())
         };
 
-        let workers = upload_workers(entries.len());
+        let workers = upload_workers(items.len());
         if workers <= 1 {
-            for entry in entries {
-                put(entry)?;
+            for item in &items {
+                put(item)?;
             }
             return Ok(());
         }
@@ -939,10 +1072,10 @@ impl ChunkEngine {
                         return;
                     }
                     let index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(entry) = entries.get(index) else {
+                    let Some(item) = items.get(index) else {
                         return;
                     };
-                    if let Err(error) = put(entry) {
+                    if let Err(error) = put(item) {
                         let mut slot = failure.lock().unwrap();
                         if slot.is_none() {
                             *slot = Some(error);
@@ -953,7 +1086,7 @@ impl ChunkEngine {
             }
         });
         match failure.into_inner().unwrap() {
-            // The pack file stays on disk, so recovery replays every object
+            // The pack files stay on disk, so recovery replays every object
             // including any that did land before the failure.
             Some(error) => Err(error),
             None => Ok(()),
@@ -967,18 +1100,82 @@ impl ChunkEngine {
         base_map: Vec<ChunkRef>,
         base_leaves: Vec<LeafRef>,
     ) -> Result<i64> {
-        // 1. Data objects (idempotent keys derived from txn).
-        self.upload_objects(header, payload)?;
+        self.commit_pack_batch(&[(header, payload)], base_map, base_leaves)
+    }
+
+    /// Commit a chain of staged packs as ONE published step: every pack's
+    /// objects go up in a single concurrent wave, the map applies the packs in
+    /// chain order, and a single CAS advances the head by the number of packs.
+    /// With one pack this is exactly the old per-pack commit.
+    ///
+    /// Only the final generation gets a commit record. On a crash after the
+    /// CAS the batch's earlier pack files replay as "superseded lineage" and
+    /// are discarded — correct, because their content is already in the
+    /// committed map. On a crash before it, recovery replays them one by one
+    /// through this same path, and writes their records then. Records are NOT
+    /// pre-uploaded for intermediate packs on purpose: a pre-CAS crash would
+    /// replay per pack with a real root hash, and the differing bytes would
+    /// trip `put_immutable`'s immutability check on the same record key.
+    fn commit_pack_batch(
+        &self,
+        packs: &[(&PackHeader, &[u8])],
+        base_map: Vec<ChunkRef>,
+        base_leaves: Vec<LeafRef>,
+    ) -> Result<i64> {
+        let first = packs.first().expect("commit batch must not be empty").0;
+        let last = packs.last().expect("checked").0;
+        let base_generation = first.base_generation;
+
+        // 1. Data objects for the whole batch (idempotent keys from the txns).
+        self.upload_batch(packs)?;
         crashpoint::maybe_crash(crashpoint::AFTER_DATA_UPLOAD);
 
-        // 2. New map: a base entry replaces the chunk's reference outright, a
-        //    delta entry appends a layer to whatever the chunk already had.
+        // 2. Apply the packs to the map in chain order.
         let mut new_map = base_map;
+        let mut chunks: Vec<u64> = Vec::new();
+        for (header, _) in packs {
+            Self::apply_pack_entries(&mut new_map, header)?;
+            chunks.extend(header.entries.iter().map(|e| e.chunk_idx));
+        }
+        chunks.sort_unstable();
+        chunks.dedup();
+
+        // 3-5. Map, root, commit record, CAS jumping one step per pack.
+        let mut new_leaves = base_leaves;
+        let new_gen = self.publish_map(
+            &last.txn,
+            base_generation,
+            base_generation + packs.len() as i64,
+            last.lease_epoch,
+            &new_map,
+            &mut new_leaves,
+            &chunks,
+        )?;
+
+        // 6. Swap in the committed map.
+        {
+            let mut st = self.state.lock().unwrap();
+            st.map = new_map;
+            st.leaf_refs = new_leaves;
+            st.generation = new_gen;
+            for (header, _) in packs {
+                for e in &header.entries {
+                    // The frozen image is the committed base; cache holds it.
+                    st.hydrated[e.chunk_idx as usize] = true;
+                }
+            }
+        }
+        Ok(new_gen)
+    }
+
+    /// Apply one pack's entries onto a map: a base entry replaces the chunk's
+    /// reference outright, a delta entry appends a layer to whatever the chunk
+    /// already had, a discard turns it into a hole (GC removes the orphaned
+    /// objects, and a cold read of the chunk then costs nothing at all).
+    fn apply_pack_entries(map: &mut [ChunkRef], header: &PackHeader) -> Result<()> {
         for e in &header.entries {
-            let slot = &mut new_map[e.chunk_idx as usize];
+            let slot = &mut map[e.chunk_idx as usize];
             if e.is_discard() {
-                // The chunk's old objects stop being reachable here; GC removes
-                // them, and a cold read of the chunk now costs nothing at all.
                 *slot = ChunkRef::Hole;
                 continue;
             }
@@ -998,31 +1195,7 @@ impl ChunkEngine {
                 })
             };
         }
-
-        // 3-5. Map, root, commit record, CAS.
-        let chunks: Vec<u64> = header.entries.iter().map(|e| e.chunk_idx).collect();
-        let mut new_leaves = base_leaves;
-        let new_gen = self.publish_map(
-            &header.txn,
-            header.base_generation,
-            header.lease_epoch,
-            &new_map,
-            &mut new_leaves,
-            &chunks,
-        )?;
-
-        // 6. Swap in the committed map.
-        {
-            let mut st = self.state.lock().unwrap();
-            st.map = new_map;
-            st.leaf_refs = new_leaves;
-            st.generation = new_gen;
-            for e in &header.entries {
-                // The frozen image is the committed base; cache holds it.
-                st.hydrated[e.chunk_idx as usize] = true;
-            }
-        }
-        Ok(new_gen)
+        Ok(())
     }
 
     /// Post-commit cleanup: sync the persistent bitmap with the volatile
@@ -1530,19 +1703,25 @@ impl ChunkEngine {
         let DurabilityMode::Relaxed { drain_interval_ms } = self.cfg.durability else {
             return;
         };
+        if drain_interval_ms == 0 {
+            // No background committer: drains happen on demand (backpressure,
+            // detach, `cats sync`). Deterministic mode for tests.
+            return;
+        }
         let engine = Arc::downgrade(self);
-        let stop = self.stop_renew.clone();
+        let signal = self.committer_signal.clone();
         let interval = Duration::from_millis(drain_interval_ms.max(50));
         let handle = std::thread::Builder::new()
             .name("pack-committer".into())
             .spawn(move || loop {
-                let (lock, cv) = &*stop;
+                let (lock, cv) = &*signal;
                 let stopped = {
                     let guard = lock.lock().unwrap();
-                    let (guard, _timeout) = cv
-                        .wait_timeout_while(guard, interval, |stopped| !*stopped)
+                    let (mut guard, _timeout) = cv
+                        .wait_timeout_while(guard, interval, |s| !s.stop && !s.kick)
                         .unwrap();
-                    *guard
+                    guard.kick = false;
+                    guard.stop
                 };
                 if stopped {
                     return;
@@ -1555,9 +1734,9 @@ impl ChunkEngine {
                 }
                 if let Err(e) = engine.drain_staged() {
                     // Transient store trouble: the queue keeps the packs and
-                    // the next tick retries. FLUSH drains inline once the
-                    // backlog cap is hit, so the window stays bounded even if
-                    // this keeps failing.
+                    // the next tick (or the next kick) retries. FLUSH drains
+                    // inline once the backlog cap is hit, so the window stays
+                    // bounded even if this keeps failing.
                     tracing::warn!(volume = %engine.cfg.volume_id, "background drain failed: {e}");
                 }
             })
@@ -1595,6 +1774,9 @@ impl ChunkEngine {
     fn stop_renewal(&self) {
         let (lock, cv) = &*self.stop_renew;
         *lock.lock().unwrap() = true;
+        cv.notify_all();
+        let (lock, cv) = &*self.committer_signal;
+        lock.lock().unwrap().stop = true;
         cv.notify_all();
         if let Some(handle) = self.renew_thread.lock().unwrap().take() {
             let _ = handle.join();
@@ -1986,14 +2168,14 @@ mod tests {
         e.detach();
     }
 
-    /// An hour, i.e. "never during a test": relaxed engines in these tests
-    /// drain explicitly, not on the committer's timer.
-    const NEVER_MS: u64 = 3_600_000;
+    /// Interval 0 = no background committer: relaxed engines in these tests
+    /// drain explicitly, deterministically.
+    const NO_TIMER: u64 = 0;
 
     fn attach_relaxed(env: &Env, attachment: &str) -> Arc<ChunkEngine> {
         let mut cfg = EngineConfig::new(VOL, &env.data_dir, attachment);
         cfg.durability = DurabilityMode::Relaxed {
-            drain_interval_ms: NEVER_MS,
+            drain_interval_ms: NO_TIMER,
         };
         ChunkEngine::attach(cfg, env.blob.clone(), env.meta.clone()).unwrap()
     }
@@ -2010,7 +2192,7 @@ mod tests {
         meta.create_volume(VOL, SIZE).unwrap();
         let mut cfg = EngineConfig::new(VOL, dir.path().join("data"), "attA");
         cfg.durability = DurabilityMode::Relaxed {
-            drain_interval_ms: NEVER_MS,
+            drain_interval_ms: NO_TIMER,
         };
         let e = ChunkEngine::attach(cfg, counting.clone(), meta).unwrap();
 
@@ -2080,6 +2262,295 @@ mod tests {
         let mut back = vec![0u8; 4096];
         e.read(2 * CHUNK_SIZE as u64, &mut back).unwrap();
         assert_eq!(back, data);
+        e.detach();
+    }
+
+    /// Counts head swaps, so a test can prove a batch is one CAS.
+    struct CountingMeta {
+        inner: Arc<dyn MetadataStore>,
+        cas_calls: AtomicU64,
+    }
+
+    impl MetadataStore for CountingMeta {
+        fn create_volume(&self, v: &str, s: u64) -> cats_storage::metadata::Result<()> {
+            self.inner.create_volume(v, s)
+        }
+        fn load_head(&self, v: &str) -> cats_storage::metadata::Result<cats_storage::metadata::VolumeHead> {
+            self.inner.load_head(v)
+        }
+        fn delete_volume(&self, v: &str) -> cats_storage::metadata::Result<()> {
+            self.inner.delete_volume(v)
+        }
+        fn resize_volume(&self, v: &str, s: u64) -> cats_storage::metadata::Result<()> {
+            self.inner.resize_volume(v, s)
+        }
+        fn acquire_lease(
+            &self,
+            v: &str,
+            a: &str,
+            ttl: i64,
+        ) -> cats_storage::metadata::Result<i64> {
+            self.inner.acquire_lease(v, a, ttl)
+        }
+        fn renew_lease(
+            &self,
+            v: &str,
+            a: &str,
+            epoch: i64,
+            ttl: i64,
+        ) -> cats_storage::metadata::Result<()> {
+            self.inner.renew_lease(v, a, epoch, ttl)
+        }
+        fn release_lease(
+            &self,
+            v: &str,
+            a: &str,
+            epoch: i64,
+        ) -> cats_storage::metadata::Result<()> {
+            self.inner.release_lease(v, a, epoch)
+        }
+        fn revoke_lease(&self, v: &str) -> cats_storage::metadata::Result<()> {
+            self.inner.revoke_lease(v)
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn cas_head(
+            &self,
+            v: &str,
+            expected: i64,
+            new_generation: i64,
+            hash: [u8; 32],
+            object: &str,
+            a: &str,
+            epoch: i64,
+        ) -> cats_storage::metadata::Result<i64> {
+            self.cas_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .cas_head(v, expected, new_generation, hash, object, a, epoch)
+        }
+        fn create_snapshot(
+            &self,
+            s: &str,
+            v: &str,
+        ) -> cats_storage::metadata::Result<cats_storage::metadata::SnapshotRow> {
+            self.inner.create_snapshot(s, v)
+        }
+        fn list_snapshots(
+            &self,
+            v: &str,
+        ) -> cats_storage::metadata::Result<Vec<cats_storage::metadata::SnapshotRow>> {
+            self.inner.list_snapshots(v)
+        }
+    }
+
+    #[test]
+    fn batched_drain_publishes_the_whole_queue_in_one_cas() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStore> =
+            Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+        let meta = Arc::new(CountingMeta {
+            inner: Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap()),
+            cas_calls: AtomicU64::new(0),
+        });
+        meta.create_volume(VOL, SIZE).unwrap();
+        let mut cfg = EngineConfig::new(VOL, dir.path().join("data"), "attA");
+        cfg.durability = DurabilityMode::Relaxed {
+            drain_interval_ms: NO_TIMER,
+        };
+        let e = ChunkEngine::attach(cfg, blob.clone(), meta.clone()).unwrap();
+
+        for i in 0..5u8 {
+            e.write(i as u64 * CHUNK_SIZE as u64, &pattern(4096, i + 1))
+                .unwrap();
+            assert_eq!(e.flush().unwrap(), i as i64 + 1);
+        }
+        assert_eq!(e.generation(), 0, "five packs staged, none committed");
+        let before = meta.cas_calls.load(Ordering::SeqCst);
+
+        assert_eq!(e.drain_staged().unwrap(), 5, "head jumps one step per pack");
+        assert_eq!(
+            meta.cas_calls.load(Ordering::SeqCst) - before,
+            1,
+            "the whole batch publishes under a single swap"
+        );
+        e.detach();
+
+        // A fresh host sees every pack's content: the batch really committed.
+        let mut cfg = EngineConfig::new(VOL, dir.path().join("data-b"), "attB");
+        cfg.durability = DurabilityMode::Strict;
+        let e = ChunkEngine::attach(cfg, blob, meta).unwrap();
+        assert_eq!(e.generation(), 5);
+        for i in 0..5u8 {
+            let mut back = vec![0u8; 4096];
+            e.read(i as u64 * CHUNK_SIZE as u64, &mut back).unwrap();
+            assert_eq!(back, pattern(4096, i + 1), "chunk {i}");
+        }
+        e.detach();
+    }
+
+    #[test]
+    fn eager_committer_drains_a_burst_without_the_timer() {
+        let env = env();
+        let mut cfg = EngineConfig::new(VOL, &env.data_dir, "attA");
+        // An hour on the timer: only the eager kick can drain in test time.
+        cfg.durability = DurabilityMode::Relaxed {
+            drain_interval_ms: 3_600_000,
+        };
+        let e = ChunkEngine::attach(cfg, env.blob.clone(), env.meta.clone()).unwrap();
+        for i in 0..8u8 {
+            e.write(i as u64 * CHUNK_SIZE as u64, &pattern(4096, i + 1))
+                .unwrap();
+            e.flush().unwrap();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while e.generation() < 8 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the eager kick never drained the queue: generation {}",
+                e.generation()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        e.detach();
+    }
+
+    /// The regression this branch exists to kill: a store with visible
+    /// per-object latency must not turn an fsync burst into multi-second
+    /// stalls once the staged queue crosses the backpressure cap.
+    #[test]
+    fn a_slow_store_burst_never_stalls_a_flush_for_long() {
+        struct SlowBlob {
+            inner: Arc<dyn BlobStore>,
+        }
+        impl BlobStore for SlowBlob {
+            fn put_immutable(&self, k: &str, d: &[u8]) -> cats_storage::blob::Result<()> {
+                std::thread::sleep(Duration::from_millis(25));
+                self.inner.put_immutable(k, d)
+            }
+            fn get(&self, k: &str) -> cats_storage::blob::Result<Vec<u8>> {
+                self.inner.get(k)
+            }
+            fn exists(&self, k: &str) -> cats_storage::blob::Result<bool> {
+                self.inner.exists(k)
+            }
+            fn delete(&self, k: &str) -> cats_storage::blob::Result<()> {
+                self.inner.delete(k)
+            }
+            fn list(&self, p: &str) -> cats_storage::blob::Result<Vec<String>> {
+                self.inner.list(p)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStore> = Arc::new(SlowBlob {
+            inner: Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap()),
+        });
+        let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+        meta.create_volume(VOL, SIZE).unwrap();
+        let mut cfg = EngineConfig::new(VOL, dir.path().join("data"), "attA");
+        cfg.durability = DurabilityMode::Relaxed {
+            drain_interval_ms: 3_600_000,
+        };
+        let e = ChunkEngine::attach(cfg, blob, meta).unwrap();
+
+        let mut lat_ms = Vec::new();
+        for i in 0..24u32 {
+            e.write((i as u64 % 8) * CHUNK_SIZE as u64, &pattern(4096, i as u8))
+                .unwrap();
+            let t0 = std::time::Instant::now();
+            e.flush().unwrap();
+            lat_ms.push(t0.elapsed().as_millis());
+        }
+        println!("slow-store burst flush latencies (ms): {lat_ms:?}");
+        let max = lat_ms.iter().max().copied().unwrap_or(0);
+        assert!(
+            max < 300,
+            "a flush stalled for {max} ms; a flush below the cap must never \
+             touch the publish path"
+        );
+        e.detach();
+    }
+
+    /// Sustained fsync load past the cap: the production regression had every
+    /// FLUSH join a publish_lock convoy (fsync floor = one full publish round,
+    /// p90 = several). A capped FLUSH must now park for about one batch round.
+    #[test]
+    fn a_capped_flush_parks_for_one_round_instead_of_joining_a_convoy() {
+        struct SlowBlob {
+            inner: Arc<dyn BlobStore>,
+        }
+        impl BlobStore for SlowBlob {
+            fn put_immutable(&self, k: &str, d: &[u8]) -> cats_storage::blob::Result<()> {
+                std::thread::sleep(Duration::from_millis(100));
+                self.inner.put_immutable(k, d)
+            }
+            fn get(&self, k: &str) -> cats_storage::blob::Result<Vec<u8>> {
+                self.inner.get(k)
+            }
+            fn exists(&self, k: &str) -> cats_storage::blob::Result<bool> {
+                self.inner.exists(k)
+            }
+            fn delete(&self, k: &str) -> cats_storage::blob::Result<()> {
+                self.inner.delete(k)
+            }
+            fn list(&self, p: &str) -> cats_storage::blob::Result<Vec<String>> {
+                self.inner.list(p)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStore> = Arc::new(SlowBlob {
+            inner: Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap()),
+        });
+        let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+        meta.create_volume(VOL, SIZE).unwrap();
+        let mut cfg = EngineConfig::new(VOL, dir.path().join("data"), "attA");
+        cfg.durability = DurabilityMode::Relaxed {
+            drain_interval_ms: 3_600_000,
+        };
+        let e = ChunkEngine::attach(cfg, blob, meta).unwrap();
+
+        let mut lat_ms = Vec::new();
+        for i in 0..80u32 {
+            e.write((i as u64 % 8) * CHUNK_SIZE as u64, &pattern(4096, i as u8))
+                .unwrap();
+            let t0 = std::time::Instant::now();
+            e.flush().unwrap();
+            lat_ms.push(t0.elapsed().as_millis());
+        }
+        let max = lat_ms.iter().max().copied().unwrap_or(0);
+        println!("capped burst: max flush {max} ms, tail {:?}", &lat_ms[64..]);
+        assert!(
+            max < 3_000,
+            "a capped flush stalled {max} ms; parking should bound it near one \
+             batch round"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while e.generation() < 80 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "committer never converged: generation {}",
+                e.generation()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        e.detach();
+    }
+
+    #[test]
+    fn cap_overflow_without_a_committer_still_drains_inline() {
+        let env = env();
+        let e = attach_relaxed(&env, "attA");
+        for i in 0..70u32 {
+            e.write((i as u64 % 8) * CHUNK_SIZE as u64, &pattern(4096, i as u8))
+                .unwrap();
+            e.flush().unwrap();
+        }
+        // Flushes past the cap fell back to inline batched drains (interval 0
+        // means no committer to park behind), and nothing was lost.
+        assert_eq!(e.drain_staged().unwrap(), 70);
+        let mut back = vec![0u8; 4096];
+        e.read((69 % 8) * CHUNK_SIZE as u64, &mut back).unwrap();
+        assert_eq!(back, pattern(4096, 69));
         e.detach();
     }
 

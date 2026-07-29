@@ -411,17 +411,23 @@ impl MetadataStore for PostgresMetadataStore {
         &self,
         volume_id: &str,
         expected_generation: i64,
+        new_generation: i64,
         new_root_hash: [u8; 32],
         new_root_object_id: &str,
         attachment_id: &str,
         epoch: i64,
     ) -> Result<i64> {
+        if new_generation <= expected_generation {
+            return Err(MetaError::InvalidArgument(format!(
+                "cas_head must advance the generation: {expected_generation} -> {new_generation}"
+            )));
+        }
         let volume_id = volume_id.to_string();
         let new_root_object_id = new_root_object_id.to_string();
         let attachment_id = attachment_id.to_string();
         let sql = format!(
             "UPDATE cats_storage_volumes
-                SET root_hash = $3, root_object_id = $4, generation = generation + 1
+                SET root_hash = $3, root_object_id = $4, generation = $7
               WHERE volume_id = $1
                 AND generation = $2
                 AND lease_owner = $5
@@ -440,6 +446,7 @@ impl MetadataStore for PostgresMetadataStore {
                         &new_root_object_id,
                         &attachment_id,
                         &epoch,
+                        &new_generation,
                     ],
                 )
                 .map_err(pg_err)?
