@@ -61,3 +61,31 @@ relaxed 盘上：fsync 在本地提交后返回；数据在 ≤5 秒内到达对
 - 跨多个 staged pack 反复写同一 chunk 时，delta 链可能暂超
   `MAX_DELTA_LAYERS`（plan 以已提交 map 为准），上限受队列长度约束，
   只影响冷读 GET 数，不影响正确性。
+
+## 修订（2026-07-29，同日）：合批 publish 与停车式背压
+
+首日生产暴露了 v1 泄压设计的车队病理：持续 fsync 负载下队列贴着
+16-pack 上限运行，每个撞限的 FLUSH 排队等 `publish_lock` 并亲自串行
+publish 整个积压——fsync 地板升到一整轮 publish（实测 min 672ms、
+p90 4.6s），relaxed 反而比旁边的 strict 卷更慢。修订如下：
+
+- **合批 publish**：一次 drain 把整个队列作为一批——所有 pack 的对象
+  合成一个并发上传波、按链序套用 map、单次 CAS 让 head 一次跳 N 代
+  （`MetadataStore::cas_head` 增加显式 `new_generation`，比较仍在
+  expected 上，fencing 语义不变）。批内存驻留以 256 MiB 为界分段。
+- **commit record 按批留档**：只写批尾一条（中间 record 不能预写——
+  CAS 前崩溃的逐 pack 重放会以真实 root 重写同名 key，撞
+  `put_immutable` 的不可变检查）。审计轨迹的 generation 序列因此有
+  空洞。
+- **恢复路径不变**：CAS 前崩溃逐 pack 重放如旧；CAS 后残留 pack 落入
+  既有 superseded 清理（内容已在已提交 map 中）。
+- **eager committer**：队列超过 2 个即被踢醒并持续 drain；
+  `drain_interval_ms` 降级为空闲兜底（0 = 不起后台线程，测试确定性
+  模式）。
+- **停车式背压**：撞限的 FLUSH 在 condvar 上等 committer 每批 pop 的
+  唤醒（约一轮 publish 的停顿），不再亲自 drain；10 秒无空位退回内联
+  drain，对象存储瘫痪不得无限扣押 guest FLUSH。committer 批间释放
+  `publish_lock`。上限 16 → 64（合批后单轮 drain 成本与 pack 数无关）。
+
+复验：100ms/PUT 的存储上 80 连发 fsync，单次最大 88ms（修订前同形态
+负载为 0.7–4.6s）。
