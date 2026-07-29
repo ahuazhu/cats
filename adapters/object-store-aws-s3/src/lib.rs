@@ -32,12 +32,31 @@ pub struct AwsS3Config {
     pub session_token: Option<String>,
     /// Key prefix inside the bucket (tenant/env isolation).
     pub prefix: String,
+    /// SigV4 signing service name. `s3` for standard S3/MinIO; S3 Express One
+    /// Zone directory buckets sign with `s3express`.
+    pub signing_service: String,
+    /// Virtual-hosted addressing: the endpoint host already names the bucket,
+    /// so object paths omit the bucket segment. Required by S3 Express One
+    /// Zone zonal endpoints, which reject path-style requests.
+    pub virtual_host: bool,
+    /// Authenticate data-plane requests with S3 Express `CreateSession`
+    /// temporary credentials (`x-amz-s3session-token`) instead of per-request
+    /// IAM credentials.
+    pub express_session: bool,
 }
 
 pub struct AwsS3BlobStore {
     cfg: AwsS3Config,
     client: reqwest::blocking::Client,
     credentials: Mutex<CredentialState>,
+    /// S3 Express One Zone session credentials (5-minute expiry), present only
+    /// when `cfg.express_session` is set.
+    express_session: Mutex<Option<ExpressSession>>,
+}
+
+struct ExpressSession {
+    credentials: SigningCredentials,
+    created_at: Instant,
 }
 
 #[derive(Clone)]
@@ -89,6 +108,22 @@ impl AwsS3BlobStore {
                 message: "AWS S3 bucket must not be empty".into(),
             });
         }
+        // Misconfigured Express combinations produce signed requests the
+        // service rejects with an opaque 403, so refuse them up front.
+        if cfg.express_session && cfg.signing_service != "s3express" {
+            return Err(BlobError::Backend {
+                key: "<config>".into(),
+                message: "express-session requires signing-service=s3express".into(),
+            });
+        }
+        if cfg.signing_service == "s3express" && !cfg.virtual_host {
+            return Err(BlobError::Backend {
+                key: "<config>".into(),
+                message:
+                    "S3 Express directory buckets reject path-style requests; set virtual-host=true"
+                        .into(),
+            });
+        }
         cfg.endpoint = endpoint.origin().ascii_serialization();
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(60))
@@ -106,6 +141,7 @@ impl AwsS3BlobStore {
             cfg,
             client,
             credentials: Mutex::new(CredentialState::Static(credentials)),
+            express_session: Mutex::new(None),
         })
     }
 
@@ -188,6 +224,98 @@ impl AwsS3BlobStore {
         extra_headers: &[(&str, &str)],
         key_for_errors: &str,
     ) -> Result<(u16, Vec<u8>)> {
+        let (credentials, token_header) = if self.cfg.express_session {
+            (
+                self.express_session_credentials(key_for_errors)?,
+                "x-amz-s3session-token",
+            )
+        } else {
+            (
+                self.signing_credentials(key_for_errors)?,
+                "x-amz-security-token",
+            )
+        };
+        self.signed_request(
+            method,
+            path,
+            query,
+            body,
+            extra_headers,
+            &credentials,
+            token_header,
+            key_for_errors,
+        )
+    }
+
+    /// S3 Express One Zone sessions expire after five minutes; refresh well
+    /// before that so a request never carries an expired token.
+    fn express_session_credentials(&self, key_for_errors: &str) -> Result<SigningCredentials> {
+        let mut session = self.express_session.lock().map_err(|_| BlobError::Backend {
+            key: key_for_errors.into(),
+            message: "S3 Express session mutex was poisoned".into(),
+        })?;
+        if let Some(existing) = &*session {
+            if existing.created_at.elapsed() < Duration::from_secs(4 * 60) {
+                return Ok(existing.credentials.clone());
+            }
+        }
+        let base = self.signing_credentials(key_for_errors)?;
+        let (status, body) = self.signed_request(
+            "GET",
+            "/",
+            &[("session".to_string(), String::new())],
+            b"",
+            &[],
+            &base,
+            "x-amz-security-token",
+            key_for_errors,
+        )?;
+        if !(200..300).contains(&status) {
+            return Err(BlobError::Backend {
+                key: key_for_errors.into(),
+                message: format!("CreateSession status {status}: {}", snippet(&body)),
+            });
+        }
+        let xml = String::from_utf8_lossy(&body);
+        let field = |tag: &str| -> Result<String> {
+            extract_tags(&xml, tag)
+                .into_iter()
+                .next()
+                .map(|value| xml_unescape(&value))
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| BlobError::Backend {
+                    key: key_for_errors.into(),
+                    message: format!("CreateSession response is missing {tag}"),
+                })
+        };
+        let credentials = SigningCredentials {
+            access_key: field("AccessKeyId")?,
+            secret_key: field("SecretAccessKey")?,
+            session_token: Some(field("SessionToken")?),
+        };
+        *session = Some(ExpressSession {
+            credentials: credentials.clone(),
+            created_at: Instant::now(),
+        });
+        Ok(credentials)
+    }
+
+    /// Sign and execute one request with explicit credentials. The session
+    /// token, when present, is carried in `token_header` (`x-amz-security-token`
+    /// for IAM/STS credentials, `x-amz-s3session-token` for S3 Express session
+    /// credentials).
+    #[allow(clippy::too_many_arguments)]
+    fn signed_request(
+        &self,
+        method: &str,
+        path: &str,
+        query: &[(String, String)],
+        body: &[u8],
+        extra_headers: &[(&str, &str)],
+        credentials: &SigningCredentials,
+        token_header: &str,
+        key_for_errors: &str,
+    ) -> Result<(u16, Vec<u8>)> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| BlobError::Backend {
@@ -202,7 +330,6 @@ impl AwsS3BlobStore {
         let (amz_date, date_stamp) = amz_timestamp(now);
         let payload_hash = hex::encode(Sha256::digest(body));
         let host = self.host();
-        let credentials = self.signing_credentials(key_for_errors)?;
 
         let mut headers = vec![
             ("host".to_string(), host.clone()),
@@ -210,7 +337,7 @@ impl AwsS3BlobStore {
             ("x-amz-date".to_string(), amz_date.clone()),
         ];
         if let Some(token) = &credentials.session_token {
-            headers.push(("x-amz-security-token".to_string(), token.clone()));
+            headers.push((token_header.to_string(), token.clone()));
         }
         headers.extend(
             extra_headers
@@ -226,7 +353,7 @@ impl AwsS3BlobStore {
             &amz_date,
             &date_stamp,
             &self.cfg.region,
-            "s3",
+            &self.cfg.signing_service,
             &credentials.access_key,
             &credentials.secret_key,
         );
@@ -261,11 +388,21 @@ impl AwsS3BlobStore {
 
     fn object_path(&self, key: &str) -> Result<String> {
         validate_key(key)?;
-        Ok(format!(
-            "/{}/{}",
-            uri_encode(&self.cfg.bucket, false),
-            uri_encode(&self.full_key(key), false)
-        ))
+        let key = uri_encode(&self.full_key(key), false);
+        if self.cfg.virtual_host {
+            Ok(format!("/{key}"))
+        } else {
+            Ok(format!("/{}/{key}", uri_encode(&self.cfg.bucket, false)))
+        }
+    }
+
+    /// The bucket-level path LIST requests use.
+    fn bucket_path(&self) -> String {
+        if self.cfg.virtual_host {
+            "/".to_string()
+        } else {
+            format!("/{}", uri_encode(&self.cfg.bucket, false))
+        }
     }
 }
 
@@ -364,7 +501,18 @@ impl BlobStoreFactory for AwsS3BlobStoreFactory {
         &self,
         config: &AdapterConfig,
     ) -> std::result::Result<Arc<dyn BlobStore>, AdapterError> {
-        config.ensure_only(ADAPTER_NAME, &["endpoint", "bucket", "region", "prefix"])?;
+        config.ensure_only(
+            ADAPTER_NAME,
+            &[
+                "endpoint",
+                "bucket",
+                "region",
+                "prefix",
+                "signing-service",
+                "virtual-host",
+                "express-session",
+            ],
+        )?;
         let bucket = config.required(ADAPTER_NAME, "bucket")?.to_string();
         let region = config.optional("region").unwrap_or("us-east-1").to_string();
         let endpoint = config
@@ -388,6 +536,12 @@ impl BlobStoreFactory for AwsS3BlobStoreFactory {
             secret_key: secret_key.unwrap_or_default(),
             session_token,
             prefix: config.optional("prefix").unwrap_or_default().to_string(),
+            signing_service: config
+                .optional("signing-service")
+                .unwrap_or("s3")
+                .to_string(),
+            virtual_host: config.optional("virtual-host") == Some("true"),
+            express_session: config.optional("express-session") == Some("true"),
         };
         if access_key.is_some() {
             AwsS3BlobStore::new(config)
@@ -484,7 +638,7 @@ impl BlobStore for AwsS3BlobStore {
             if let Some(t) = &token {
                 query.push(("continuation-token".to_string(), t.clone()));
             }
-            let path = format!("/{}", uri_encode(&self.cfg.bucket, false));
+            let path = self.bucket_path();
             let (status, body) = self.request("GET", &path, &query, b"", &[], prefix)?;
             if !(200..300).contains(&status) {
                 return Err(BlobError::Backend {
@@ -670,6 +824,9 @@ mod tests {
             secret_key: "unused".into(),
             session_token: None,
             prefix: String::new(),
+            signing_service: "s3".into(),
+            virtual_host: false,
+            express_session: false,
         })
         .unwrap();
         assert!(matches!(

@@ -1,0 +1,21 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.13s
+     Running tests/commit_cost.rs (target/release/deps/commit_cost-8b7b1ad0c13b872f)
+
+running 2 tests
+test flush_cost_for_dense_writes ... 
+dirty chunks  published MiB     flush ms   ms per pub MiB
+           8          32.00        156.1             4.88
+          32         128.00        393.4             3.07
+          48         192.00        626.0             3.26
+ok
+test flush_cost_scales_with_the_dirty_set ... 
+dirty chunks  dirty pages  published MiB     flush ms   ms per pub MiB   sha256 MiB/s
+           1            1           0.06         64.0          1024.69            699
+           8            8           0.50         98.1           196.17            939
+          16           16           1.00        126.9           126.93           1693
+          32           32           2.00        188.6            94.30           1645
+          48           48           3.00        249.4            83.12           1617
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 6.34s
+

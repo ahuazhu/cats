@@ -34,6 +34,9 @@ fn live_store(prefix: &str) -> Option<AwsS3BlobStore> {
             secret_key,
             session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
             prefix: prefix.to_string(),
+            signing_service: "s3".into(),
+            virtual_host: false,
+            express_session: false,
         })
         .unwrap(),
     )

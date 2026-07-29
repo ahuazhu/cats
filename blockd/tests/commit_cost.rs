@@ -74,6 +74,22 @@ fn object_store(dir: &Path, prefix: &str) -> Arc<dyn BlobStore> {
             if let Ok(region) = std::env::var("AWS_REGION") {
                 pairs.push(("region".to_string(), region));
             }
+            // S3 Express One Zone (directory buckets) needs a zonal endpoint,
+            // virtual-hosted addressing, the `s3express` signing service, and
+            // (typically) CreateSession auth. All optional; unset means
+            // standard S3.
+            for (var, option) in [
+                ("CATS_BENCH_S3_ENDPOINT", "endpoint"),
+                ("CATS_BENCH_S3_SIGNING_SERVICE", "signing-service"),
+                ("CATS_BENCH_S3_VIRTUAL_HOST", "virtual-host"),
+                ("CATS_BENCH_S3_EXPRESS_SESSION", "express-session"),
+            ] {
+                if let Ok(value) = std::env::var(var) {
+                    if !value.is_empty() {
+                        pairs.push((option.to_string(), value));
+                    }
+                }
+            }
             let config = AdapterConfig::from_pairs(
                 pairs.iter().map(|(k, v)| (k.as_str(), v.clone())),
             )

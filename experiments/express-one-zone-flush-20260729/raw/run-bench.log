@@ -1,0 +1,37 @@
++ EXPRESS_BUCKET=cats-bench-8283b76c--use1-az4--x-s3
++ EXPRESS_ENDPOINT=https://cats-bench-8283b76c--use1-az4--x-s3.s3express-use1-az4.us-east-1.amazonaws.com
++ STD_BUCKET=cats-bench-8283b76c-std
++ COMMON='--release -p cats-blockd --test commit_cost'
++ FILTER='--ignored --nocapture --test-threads=1 flush_cost'
++ CATS_BENCH_S3_BUCKET=cats-bench-8283b76c--use1-az4--x-s3
++ CATS_BENCH_S3_ENDPOINT=https://cats-bench-8283b76c--use1-az4--x-s3.s3express-use1-az4.us-east-1.amazonaws.com
++ CATS_BENCH_S3_SIGNING_SERVICE=s3express
++ CATS_BENCH_S3_VIRTUAL_HOST=true
++ CATS_BENCH_S3_EXPRESS_SESSION=true
++ AWS_REGION=us-east-1
++ cargo test --release -p cats-object-store-aws-s3 --test express_smoke -- --ignored --nocapture
++ SESSION_OK=0
++ CATS_BENCH_S3_BUCKET=cats-bench-8283b76c--use1-az4--x-s3
++ CATS_BENCH_S3_ENDPOINT=https://cats-bench-8283b76c--use1-az4--x-s3.s3express-use1-az4.us-east-1.amazonaws.com
++ CATS_BENCH_S3_SIGNING_SERVICE=s3express
++ CATS_BENCH_S3_VIRTUAL_HOST=true
++ AWS_REGION=us-east-1
++ CATS_BENCH_LEASE_TTL_MS=600000
++ cargo test --release -p cats-blockd --test commit_cost -- --ignored --nocapture --test-threads=1 flush_cost
++ '[' 0 -eq 0 ']'
++ CATS_BENCH_S3_BUCKET=cats-bench-8283b76c--use1-az4--x-s3
++ CATS_BENCH_S3_ENDPOINT=https://cats-bench-8283b76c--use1-az4--x-s3.s3express-use1-az4.us-east-1.amazonaws.com
++ CATS_BENCH_S3_SIGNING_SERVICE=s3express
++ CATS_BENCH_S3_VIRTUAL_HOST=true
++ CATS_BENCH_S3_EXPRESS_SESSION=true
++ AWS_REGION=us-east-1
++ CATS_BENCH_LEASE_TTL_MS=600000
++ cargo test --release -p cats-blockd --test commit_cost -- --ignored --nocapture --test-threads=1 flush_cost
++ CATS_BENCH_S3_BUCKET=cats-bench-8283b76c-std
++ AWS_REGION=us-east-1
++ CATS_BENCH_LEASE_TTL_MS=600000
++ cargo test --release -p cats-blockd --test commit_cost -- --ignored --nocapture --test-threads=1 flush_cost
++ CATS_BENCH_LEASE_TTL_MS=600000
++ cargo test --release -p cats-blockd --test commit_cost -- --ignored --nocapture --test-threads=1 flush_cost
++ date -u
++ touch /tmp/BENCH-DONE
