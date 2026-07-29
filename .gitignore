@@ -26,3 +26,6 @@ override.tf
 override.tf.json
 *_override.tf
 *_override.tf.json
+
+# Scratch binaries from local builds/experiments (a .tmp-blockd once slipped in).
+.tmp-*
