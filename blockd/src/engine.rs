@@ -54,6 +54,15 @@ pub struct EngineConfig {
     pub volume_id: String,
     pub data_dir: PathBuf,
     pub attachment_id: String,
+    /// How long a lease stays valid without a renewal.
+    ///
+    /// This is the window a live attachment has to survive a slow metadata
+    /// round trip, and losing it is not a delay but a fence: `renew_lease`
+    /// refuses an already-expired row, so a single missed window ends the
+    /// attachment for good and the Guest's filesystem aborts on the write
+    /// errors. It also bounds how long another Host must wait to take a lost
+    /// Host's volume, so it stays in the same order as node fencing rather than
+    /// being made arbitrarily long.
     pub lease_ttl_ms: i64,
 }
 
@@ -67,7 +76,7 @@ impl EngineConfig {
             volume_id: volume_id.into(),
             data_dir: data_dir.into(),
             attachment_id: attachment_id.into(),
-            lease_ttl_ms: 5_000,
+            lease_ttl_ms: 15_000,
         }
     }
 }

@@ -200,7 +200,12 @@ pub fn handle_connection<S: Read + Write>(
                 let mut buf = vec![0u8; length as usize];
                 match engine.read(offset, &mut buf) {
                     Ok(()) => simple_reply(&mut stream, 0, handle, &buf)?,
-                    Err(e) => simple_reply(&mut stream, errno_for(&e), handle, &[])?,
+                    Err(e) => simple_reply(
+                        &mut stream,
+                        errno_for("read", offset, length, &e),
+                        handle,
+                        &[],
+                    )?,
                 }
             }
             CMD_WRITE => {
@@ -218,12 +223,22 @@ pub fn handle_connection<S: Read + Write>(
                 }
                 match result {
                     Ok(()) => simple_reply(&mut stream, 0, handle, &[])?,
-                    Err(e) => simple_reply(&mut stream, errno_for(&e), handle, &[])?,
+                    Err(e) => simple_reply(
+                        &mut stream,
+                        errno_for("write", offset, length, &e),
+                        handle,
+                        &[],
+                    )?,
                 }
             }
             CMD_FLUSH => match engine.flush() {
                 Ok(_) => simple_reply(&mut stream, 0, handle, &[])?,
-                Err(e) => simple_reply(&mut stream, errno_for(&e), handle, &[])?,
+                Err(e) => simple_reply(
+                    &mut stream,
+                    errno_for("flush", offset, length, &e),
+                    handle,
+                    &[],
+                )?,
             },
             CMD_TRIM | CMD_WRITE_ZEROES => {
                 let mut result = engine.write_zeroes(offset, length as u64);
@@ -232,7 +247,12 @@ pub fn handle_connection<S: Read + Write>(
                 }
                 match result {
                     Ok(()) => simple_reply(&mut stream, 0, handle, &[])?,
-                    Err(e) => simple_reply(&mut stream, errno_for(&e), handle, &[])?,
+                    Err(e) => simple_reply(
+                        &mut stream,
+                        errno_for("write_zeroes", offset, length, &e),
+                        handle,
+                        &[],
+                    )?,
                 }
             }
             CMD_DISC => return Ok(()),
@@ -251,11 +271,33 @@ fn drain<S: Read>(stream: &mut S, mut n: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-fn errno_for(e: &EngineError) -> u32 {
+/// Map an engine failure to an NBD errno, and say what it was.
+///
+/// The Guest only ever learns the errno, and an errno is not a diagnosis: an
+/// EIO returned for a FLUSH makes ext4 abort its journal and remount the root
+/// read-only, which surfaces to the operator as a broken Cat with nothing in
+/// any log explaining why. Log the underlying error where it is still known.
+/// `Fenced` is an expected outcome of losing an attachment race, so it stays at
+/// warn; everything else is a real I/O failure.
+fn errno_for(cmd: &str, offset: u64, length: u32, e: &EngineError) -> u32 {
     match e {
-        EngineError::Fenced => EPERM,
-        EngineError::OutOfBounds { .. } => EINVAL,
-        _ => EIO,
+        EngineError::Fenced => {
+            tracing::warn!(
+                cmd,
+                offset,
+                length,
+                "nbd request rejected: attachment fenced"
+            );
+            EPERM
+        }
+        EngineError::OutOfBounds { .. } => {
+            tracing::warn!(cmd, offset, length, error = %e, "nbd request out of bounds");
+            EINVAL
+        }
+        _ => {
+            tracing::error!(cmd, offset, length, error = %e, "nbd request failed");
+            EIO
+        }
     }
 }
 
