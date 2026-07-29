@@ -80,7 +80,27 @@ struct BlockdProc {
     socket: PathBuf,
     /// vhost-user socket the VMM consumes, when the Cat runs on that path.
     vhost_user_socket: Option<PathBuf>,
+    /// Control socket for host-side commands (`drain`, ADR-0021).
+    control_socket: PathBuf,
     grant: VolumeGrant,
+}
+
+impl BlockdProc {
+    /// Publish everything the engine has staged. The forced flush points of
+    /// the relaxed contract call this after the guest-side flush; on a strict
+    /// volume the queue is already empty and it returns immediately.
+    fn drain(&self) -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        let mut stream = std::os::unix::net::UnixStream::connect(&self.control_socket)
+            .with_context(|| format!("connect blockd control for {}", self.grant.disk_id))?;
+        stream.write_all(b"drain\n")?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line)?;
+        match line.trim().strip_prefix("OK ") {
+            Some(_generation) => Ok(()),
+            None => bail!("drain of {} failed: {}", self.grant.disk_id, line.trim()),
+        }
+    }
 }
 
 struct CatRuntime {
@@ -690,6 +710,7 @@ impl NodeRuntime {
                 self.attach_disk(cat_id, volume.clone())
             }
             NodeJobAction::DetachDisk { cat_id, disk_id } => self.detach_disk(cat_id, disk_id),
+            NodeJobAction::SyncCat { cat_id } => self.sync_cat(cat_id),
             NodeJobAction::CleanupCat { cat_id } => self.stop_cat(cat_id, false),
         }
     }
@@ -1159,6 +1180,19 @@ impl NodeRuntime {
             .arg(grant.size_bytes.to_string())
             .arg("--lease-ttl-ms")
             .arg(self.cfg.blockd_lease_ttl_ms.to_string());
+        let control_socket = short_socket_path(
+            &self.cfg.state_dir,
+            cat_id,
+            &format!("ctl-{}", grant.disk_id),
+        );
+        symlink_socket(
+            &cat_dir.join(format!("ctl-{}.sock", grant.disk_id)),
+            &control_socket,
+        );
+        cmd.arg("--listen-control").arg(&control_socket);
+        if grant.durability == cats_api::resources::DiskDurability::Relaxed {
+            cmd.arg("--durability").arg("relaxed");
+        }
         if let Some(image_id) = seed_image_id {
             // Provision from the already-published image: one manifest GET plus a
             // map write, no data bytes (ADR-0017). Safe unconditionally, because a
@@ -1191,6 +1225,7 @@ impl NodeRuntime {
             child,
             socket,
             vhost_user_socket,
+            control_socket,
             grant: grant.clone(),
         };
         self.wait_blockd_ready(&mut proc)
@@ -1368,12 +1403,24 @@ impl NodeRuntime {
                 }
             }
         }
+        let was_graceful = graceful && rt.guest.is_some();
         if let Some(mut vmm) = rt.guest.take() {
             match &rt.ch {
                 Some(chrt) => ch::shutdown_vmm(&chrt.api_sock, &mut vmm),
                 None => {
                     let _ = vmm.kill();
                     let _ = vmm.wait();
+                }
+            }
+        }
+        if was_graceful {
+            // syncfs pushed the guest page cache into the engines; on relaxed
+            // volumes that only stages. A stop is a forced flush point
+            // (ADR-0021), so publish before the backends die — and only now,
+            // with the VMM gone, can no late fsync slip in behind the drain.
+            for proc in rt.blockds.values() {
+                if let Err(e) = proc.drain() {
+                    tracing::warn!("teardown drain: {e:#}");
                 }
             }
         }
@@ -1611,6 +1658,11 @@ impl NodeRuntime {
                 client.syncfs()?;
                 ch::pause(&api)?;
             }
+            // Warm is a forced flush point (ADR-0021): the VMM exits and a
+            // restore may happen after this host is long gone.
+            for proc in rt.blockds.values() {
+                proc.drain()?;
+            }
             let memory_file = rt.ch.as_ref().expect("checked").memory_file.clone();
             ch::sync_memory_backing(&memory_file)?;
             let snap_dir = rt.dir.join("snapshot");
@@ -1782,6 +1834,30 @@ impl NodeRuntime {
         Ok(ObservedState::Running)
     }
 
+    /// `cats sync`: everything acknowledged inside the guest becomes durable
+    /// in the object store before this returns (ADR-0021). Guest page cache
+    /// first, then every engine's staged packs.
+    fn sync_cat(&self, cat_id: &str) -> Result<ObservedState> {
+        let activity = self
+            .cats
+            .lock()
+            .unwrap()
+            .get(cat_id)
+            .context("cat is not running on this node")?
+            .activity
+            .clone();
+        let _activity = activity.acquire()?;
+        let cats = self.cats.lock().unwrap();
+        let rt = cats
+            .get(cat_id)
+            .context("cat is not running on this node")?;
+        rt.conn().connect()?.syncfs().context("guest syncfs")?;
+        for proc in rt.blockds.values() {
+            proc.drain()?;
+        }
+        Ok(rt.state)
+    }
+
     fn detach_disk(&self, cat_id: &str, disk_id: &str) -> Result<ObservedState> {
         let activity = self
             .cats
@@ -1803,6 +1879,11 @@ impl NodeRuntime {
         // Final durable flush through the guest before the backend exits.
         if let Ok(mut client) = rt.conn().connect() {
             let _ = client.flush_disk(disk_id);
+        }
+        // Detach is a forced flush point (ADR-0021): on a relaxed disk the
+        // guest flush above only staged.
+        if let Err(e) = proc.drain() {
+            tracing::warn!("detach drain of {disk_id}: {e:#}");
         }
         self.write_disk_map(rt)?;
         let _ = proc.child.kill();

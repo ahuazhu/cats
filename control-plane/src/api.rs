@@ -871,6 +871,7 @@ async fn create_cat(
         req.auto_suspend,
         extra,
         req.expires_at_unix,
+        req.durability,
     )?;
     if let Some(key) = idem_key(&headers) {
         state.store.idempotency_store(&key, &route, &op.id)?;
@@ -910,6 +911,11 @@ async fn cat_action(
 ) -> ApiResult<Response> {
     check_workspace_auth(&state, &headers, &workspace).await?;
     let cat = state.store.get_cat(&workspace, &cat)?;
+    if verb == "sync" {
+        // Imperative, not a desired-state change: force every attached disk
+        // to a durable point right now (ADR-0021) and answer once it holds.
+        return sync_cat(&state, &cat).await;
+    }
     let desired = match verb.as_str() {
         "start" | "resume" => DesiredState::Running,
         "suspend" => DesiredState::Suspended,
@@ -1381,7 +1387,7 @@ async fn create_disk(
     }
     let disk = state
         .store
-        .create_disk(&scope.workspace, &req.name, req.size_bytes)?;
+        .create_disk(&scope.workspace, &req.name, req.size_bytes, req.durability)?;
     // Create the storage volume eagerly so snapshots/resize work pre-attach.
     let size = cats_api::chunk::round_up_to_chunk(req.size_bytes);
     match state.storage_meta.create_volume(&disk.volume_id, size) {
@@ -1548,6 +1554,7 @@ async fn hot_attach(state: &AppState, cat: &Cat, disk: &Disk, mount_path: &str) 
                     epoch: 0,
                     size_bytes: size,
                     mount_path: mount_path.to_string(),
+                    durability: disk.durability,
                 },
             },
         };
@@ -1592,6 +1599,46 @@ async fn hot_detach(state: &AppState, cat: &Cat, disk: &Disk) -> ApiResult<()> {
     let _ = state.store.release_work(&lease.id);
     let _ = state.controller.maybe_auto_suspend(&cat_id);
     result
+}
+
+/// Force every attached disk of a running cat to a durable point (ADR-0021):
+/// guest page cache down through the engines, staged packs published. On a
+/// cat that is not running this is a no-op — every transition out of Running
+/// is itself a forced flush point, so the durable state is already current.
+async fn sync_cat(state: &AppState, cat: &Cat) -> ApiResult<Response> {
+    if cat.observed_state != ObservedState::Running {
+        return Ok((StatusCode::OK, Json(cat.clone())).into_response());
+    }
+    let owner = format!("control_{}", uuid::Uuid::new_v4().simple());
+    let lease = state
+        .store
+        .acquire_work(&cat.id, WorkKind::Control, &owner, "cat_sync", 120_000)?;
+    let result = async {
+        let node = state
+            .store
+            .list_nodes()?
+            .into_iter()
+            .find(|n| Some(&n.id) == cat.node_id.as_ref())
+            .ok_or_else(|| ApiError::unavailable("cat node missing"))?;
+        // The uuid keeps repeated syncs at one generation from replaying the
+        // first run's journaled result: each call must actually drain.
+        let job = cats_api::nodejob::NodeJob {
+            job_id: cats_api::nodejob::job_id(
+                &cat.id,
+                cat.generation,
+                &format!("sync_{}", uuid::Uuid::new_v4().simple()),
+            ),
+            cat_generation: cat.generation,
+            action: cats_api::nodejob::NodeJobAction::SyncCat {
+                cat_id: cat.id.clone(),
+            },
+        };
+        dispatch_or_unavailable(state, &node.agent_url, &job).await
+    }
+    .await;
+    let _ = state.store.release_work(&lease.id);
+    result?;
+    Ok((StatusCode::OK, Json(state.store.must_get_cat_by_id(&cat.id)?)).into_response())
 }
 
 async fn dispatch_or_unavailable(

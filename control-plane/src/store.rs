@@ -175,6 +175,14 @@ impl Store {
             conn.execute_batch("ALTER TABLE cats ADD COLUMN expires_at_unix INTEGER")
                 .map_err(internal)?;
         }
+        if control_plane_schema_exists > 0 && stamped < 3 {
+            // v2 -> v3: per-disk durability tier (ADR-0021). Existing disks
+            // keep the semantics they were created under: strict.
+            conn.execute_batch(
+                "ALTER TABLE disks ADD COLUMN durability TEXT NOT NULL DEFAULT 'strict'",
+            )
+            .map_err(internal)?;
+        }
         conn.execute_batch(SCHEMA).map_err(internal)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(internal)?;
@@ -839,6 +847,7 @@ impl Store {
         auto_suspend: bool,
         extra_disk: Option<(&str, u64, &str)>, // (name, size, mount_path)
         expires_at_unix: Option<i64>,
+        durability: DiskDurability,
     ) -> Result<(Cat, Vec<Disk>, Operation)> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(internal)?;
@@ -858,9 +867,19 @@ impl Store {
             tx.execute(
                 "INSERT INTO disks (
                     id, workspace_id, name, kind, size_bytes,
-                    state, volume_id, created_at
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![id, workspace.id, dname, kind, size as i64, state, vol, now],
+                    state, volume_id, created_at, durability
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    id,
+                    workspace.id,
+                    dname,
+                    kind,
+                    size as i64,
+                    state,
+                    vol,
+                    now,
+                    durability.as_str()
+                ],
             )?;
             Ok(())
         };
@@ -1984,6 +2003,7 @@ impl Store {
         workspace: &WorkspaceRecord,
         name: &str,
         size_bytes: u64,
+        durability: DiskDurability,
     ) -> Result<Disk> {
         let id = new_id(ids::DISK_PREFIX);
         let vol = new_id(ids::VOLUME_PREFIX);
@@ -1992,9 +2012,17 @@ impl Store {
             c.execute(
                 "INSERT INTO disks (
                     id, workspace_id, name, kind, size_bytes,
-                    state, volume_id, created_at
-                 ) VALUES (?1,?2,?3,'persistent',?4,'available',?5,?6)",
-                params![id, workspace.id, name, size_bytes as i64, vol, now],
+                    state, volume_id, created_at, durability
+                 ) VALUES (?1,?2,?3,'persistent',?4,'available',?5,?6,?7)",
+                params![
+                    id,
+                    workspace.id,
+                    name,
+                    size_bytes as i64,
+                    vol,
+                    now,
+                    durability.as_str()
+                ],
             )
             .map(|_| ())
         })
@@ -2787,6 +2815,8 @@ fn row_to_disk(r: &rusqlite::Row<'_>) -> rusqlite::Result<Disk> {
             "deleted" => DiskState::Deleted,
             _ => DiskState::Available,
         },
+        durability: DiskDurability::parse(&r.get::<_, String>("durability")?)
+            .unwrap_or(DiskDurability::Strict),
         volume_id: r.get("volume_id")?,
         bound_cat_id: None,
         created_at_unix: r.get("created_at")?,
@@ -3085,7 +3115,7 @@ fn workspace_view(
 /// the live fleet needs and deletes rungs once no deployment is below them.
 /// Deployment automation reads both constants and refuses to replace a live
 /// Pod whose database this build can neither run nor migrate.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// The oldest stamped version `Store::open` can still upgrade in place.
 const OLDEST_MIGRATABLE_SCHEMA_VERSION: i64 = 1;
@@ -3191,6 +3221,7 @@ CREATE TABLE IF NOT EXISTS disks (
     state TEXT NOT NULL,
     volume_id TEXT NOT NULL,
     created_at INTEGER NOT NULL,
+    durability TEXT NOT NULL DEFAULT 'strict',
     UNIQUE (workspace_id, name)
 );
 CREATE TABLE IF NOT EXISTS mount_bindings (
@@ -3370,6 +3401,7 @@ mod tests {
                 true,
                 None,
                 None,
+                DiskDurability::Strict,
             )
             .unwrap();
         let renamed = store
@@ -3406,13 +3438,13 @@ mod tests {
             .create_workspace(&default.account_id, "sibling", "Sibling")
             .unwrap();
         store
-            .create_cat(&default, "shared", "test", 1, 256, 1 << 20, true, None, None)
+            .create_cat(&default, "shared", "test", 1, 256, 1 << 20, true, None, None, DiskDurability::Strict)
             .unwrap();
         store
-            .create_cat(&sibling, "shared", "test", 1, 256, 1 << 20, true, None, None)
+            .create_cat(&sibling, "shared", "test", 1, 256, 1 << 20, true, None, None, DiskDurability::Strict)
             .unwrap();
         assert!(store
-            .create_cat(&default, "shared", "test", 1, 256, 1 << 20, true, None, None)
+            .create_cat(&default, "shared", "test", 1, 256, 1 << 20, true, None, None, DiskDurability::Strict)
             .is_err());
         assert_eq!(store.list_cats(&default.id).unwrap().len(), 1);
         assert_eq!(store.list_cats(&sibling.id).unwrap().len(), 1);
@@ -3426,14 +3458,17 @@ mod tests {
             let store = Store::open(&path).unwrap();
             let workspace = bootstrap_workspace(&store, "acme");
             let (cat, _, _) = store
-                .create_cat(&workspace, "web", "test", 1, 256, 1 << 20, true, None, None)
+                .create_cat(&workspace, "web", "test", 1, 256, 1 << 20, true, None, None, DiskDurability::Strict)
                 .unwrap();
             cat.id
         };
         {
-            // Reshape the file into the v1 schema: no expiry column, stamp 1.
+            // Reshape the file into the v1 schema: no expiry column, no disk
+            // durability column, stamp 1.
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch("ALTER TABLE cats DROP COLUMN expires_at_unix")
+                .unwrap();
+            conn.execute_batch("ALTER TABLE disks DROP COLUMN durability")
                 .unwrap();
             conn.pragma_update(None, "user_version", 1_i64).unwrap();
         }
@@ -3441,6 +3476,13 @@ mod tests {
         let store = Store::open(&path).unwrap();
         let cat = store.must_get_cat_by_id(&cat_id).unwrap();
         assert_eq!(cat.expires_at_unix, None, "v1 rows surface as never-expiring");
+        let disks = store.list_disks_for_cat(&cat_id).unwrap();
+        assert!(
+            disks
+                .iter()
+                .all(|d| d.durability == DiskDurability::Strict),
+            "v1 disks keep the semantics they were created under"
+        );
         {
             let conn = Connection::open(&path).unwrap();
             let stamped: i64 = conn
@@ -3475,6 +3517,7 @@ mod tests {
                 true,
                 None,
                 Some(past),
+                DiskDurability::Strict,
             )
             .unwrap();
         let (fresh, _, _) = store
@@ -3488,10 +3531,11 @@ mod tests {
                 true,
                 None,
                 Some(future),
+                DiskDurability::Strict,
             )
             .unwrap();
         let (forever, _, _) = store
-            .create_cat(&workspace, "forever", "test", 1, 256, 1 << 20, true, None, None)
+            .create_cat(&workspace, "forever", "test", 1, 256, 1 << 20, true, None, None, DiskDurability::Strict)
             .unwrap();
         assert_eq!(expired.expires_at_unix, Some(past));
 
@@ -3633,7 +3677,7 @@ mod tests {
         let store = Store::open(&dir.path().join("control.db")).unwrap();
         let workspace = bootstrap_workspace(&store, "alpha");
         let (cat, _, _) = store
-            .create_cat(&workspace, "legacy", "ubuntu", 1, 512, 1 << 20, true, None, None)
+            .create_cat(&workspace, "legacy", "ubuntu", 1, 512, 1 << 20, true, None, None, DiskDurability::Strict)
             .unwrap();
 
         let endpoints = store.endpoints_for_cat(&cat.id).unwrap();
@@ -3701,6 +3745,7 @@ mod tests {
                 true,
                 None,
                 None,
+                DiskDurability::Strict,
             )
             .unwrap();
         assert!(cat.auto_suspend);
@@ -3783,7 +3828,7 @@ mod tests {
         let mut ids = Vec::new();
         for n in 0..10 {
             let (cat, _, _) = store
-                .create_cat(&workspace, &format!("web{n}"), "test", 2, 1024, 1 << 20, true, None, None)
+                .create_cat(&workspace, &format!("web{n}"), "test", 2, 1024, 1 << 20, true, None, None, DiskDurability::Strict)
                 .unwrap();
             ids.push(cat.id);
         }
@@ -3822,7 +3867,7 @@ mod tests {
         let store = Store::open(&dir.path().join("control.db")).unwrap();
         let workspace = bootstrap_workspace(&store, "alpha");
         let (cat, _, _) = store
-            .create_cat(&workspace, "web", "test", 1, 256, 1024 * 1024, true, None, None)
+            .create_cat(&workspace, "web", "test", 1, 256, 1024 * 1024, true, None, None, DiskDurability::Strict)
             .unwrap();
         store
             .register_node("node-1", "http://node", "http://gateway", 4, 8192)
@@ -3860,7 +3905,7 @@ mod tests {
         let store = Store::open(&dir.path().join("control.db")).unwrap();
         let workspace = bootstrap_workspace(&store, "alpha");
         let (cat, _, _) = store
-            .create_cat(&workspace, "racer", "test", 1, 256, 1024 * 1024, true, None, None)
+            .create_cat(&workspace, "racer", "test", 1, 256, 1024 * 1024, true, None, None, DiskDurability::Strict)
             .unwrap();
         store
             .register_node("node-1", "http://node", "http://gateway", 4, 8192)
@@ -3923,6 +3968,7 @@ mod tests {
                     true,
                     None,
                     None,
+                    DiskDurability::Strict,
                 )
                 .unwrap();
             cat_id = cat.id.clone();

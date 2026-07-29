@@ -73,6 +73,7 @@ fn grant(cat: &str) -> VolumeGrant {
         epoch: 0,
         size_bytes: SIZE,
         mount_path: "/".into(),
+        durability: Default::default(),
     }
 }
 

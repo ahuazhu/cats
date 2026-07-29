@@ -21,6 +21,9 @@ pub struct VolumeGrant {
     pub size_bytes: u64,
     /// Mount path inside the guest ("/" for the root disk).
     pub mount_path: String,
+    /// Passed to blockd as the engine's durability mode (ADR-0021).
+    #[serde(default)]
+    pub durability: crate::resources::DiskDurability,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +61,10 @@ pub enum NodeJobAction {
     AttachDisk { cat_id: String, volume: VolumeGrant },
     /// Flush + detach a disk from a running cat.
     DetachDisk { cat_id: String, disk_id: String },
+    /// Force every attached disk to a durable point: guest page cache down to
+    /// the engines, staged packs published (ADR-0021). The escape hatch that
+    /// lets a relaxed workload buy one strict moment on demand.
+    SyncCat { cat_id: String },
     /// Remove any local residue for a cat (idempotent; used after failures).
     CleanupCat { cat_id: String },
 }
@@ -73,6 +80,7 @@ impl NodeJobAction {
             NodeJobAction::RestoreCat { .. } => "restore_cat",
             NodeJobAction::AttachDisk { .. } => "attach_disk",
             NodeJobAction::DetachDisk { .. } => "detach_disk",
+            NodeJobAction::SyncCat { .. } => "sync_cat",
             NodeJobAction::CleanupCat { .. } => "cleanup_cat",
         }
     }
@@ -87,6 +95,7 @@ impl NodeJobAction {
             | NodeJobAction::RestoreCat { cat_id }
             | NodeJobAction::AttachDisk { cat_id, .. }
             | NodeJobAction::DetachDisk { cat_id, .. }
+            | NodeJobAction::SyncCat { cat_id }
             | NodeJobAction::CleanupCat { cat_id } => cat_id,
         }
     }

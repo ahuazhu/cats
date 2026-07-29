@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 
 use crate::guest::GuestWorkLease;
 use crate::resources::{
-    Cat, CatWorkStatus, Disk, Endpoint, NodeTelemetry, Operation, WakePolicy, WorkKind, WorkLease,
+    Cat, CatWorkStatus, Disk, DiskDurability, Endpoint, NodeTelemetry, Operation, WakePolicy,
+    WorkKind, WorkLease,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +35,10 @@ pub struct CreateCatRequest {
     /// plane deletes the Cat automatically. Omitted = the Cat never expires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_unix: Option<i64>,
+    /// Durability of the disks this request creates — the root disk and the
+    /// optional `disk` (ADR-0021). Omitted = strict.
+    #[serde(default)]
+    pub durability: DiskDurability,
 }
 
 fn default_cpus() -> u32 {
@@ -60,6 +65,8 @@ pub struct CreateCatDisk {
 pub struct CreateDiskRequest {
     pub name: String,
     pub size_bytes: u64,
+    #[serde(default)]
+    pub durability: DiskDurability,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
