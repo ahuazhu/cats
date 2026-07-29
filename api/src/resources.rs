@@ -130,6 +130,38 @@ pub enum DiskKind {
     Persistent,
 }
 
+/// What a guest fsync acknowledgment promises for this disk (ADR-0021).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskDurability {
+    /// fsync returns only once the data is durable in the object store; an
+    /// acknowledged write survives losing the host outright.
+    #[default]
+    Strict,
+    /// fsync returns after a local commit; data reaches the object store
+    /// within the drain window. On unclean host loss, the most recent writes
+    /// — including acknowledged fsyncs — may be lost. Lifecycle transitions
+    /// (stop, suspend, warm, detach) and `cats sync` force a full drain.
+    Relaxed,
+}
+
+impl DiskDurability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DiskDurability::Strict => "strict",
+            DiskDurability::Relaxed => "relaxed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "strict" => Some(DiskDurability::Strict),
+            "relaxed" => Some(DiskDurability::Relaxed),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiskState {
@@ -151,6 +183,11 @@ pub struct Disk {
     pub kind: DiskKind,
     pub size_bytes: u64,
     pub state: DiskState,
+    /// What an fsync acknowledgment promises (ADR-0021). Immutable for now:
+    /// changing it on a live attachment would change the meaning of acks the
+    /// guest already received.
+    #[serde(default)]
+    pub durability: DiskDurability,
     /// Internal volume id; exposed for diagnostics, not part of the stable API.
     pub volume_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

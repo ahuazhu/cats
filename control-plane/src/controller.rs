@@ -335,6 +335,7 @@ impl Controller {
                 epoch: 0,
                 size_bytes: size,
                 mount_path: b.mount_path.clone(),
+                durability: disk.durability,
             });
         }
         // Root disk first (mount path "/").

@@ -49,6 +49,26 @@ pub struct GcStats {
     pub map_nodes_deleted: usize,
 }
 
+/// When a FLUSH acknowledgment is allowed to reach the Guest (ADR-0021).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurabilityMode {
+    /// FLUSH acks only after the commit is durable in the object store and the
+    /// map CAS has succeeded (spec §6). Any acknowledged write survives losing
+    /// the host outright.
+    Strict,
+    /// FLUSH acks once the pack is durable on the local disk; a background
+    /// committer publishes staged packs in order. Acknowledged-but-unpublished
+    /// writes survive a blockd crash on the same host (pack replay), but not
+    /// the loss of the host. The loss window is bounded by the drain interval
+    /// plus the staged backlog.
+    Relaxed { drain_interval_ms: u64 },
+}
+
+/// Staged packs a relaxed volume may accumulate before FLUSH stops acking
+/// locally and drains inline. The cap turns an object-store outage into
+/// strict-like latency instead of an unbounded loss window.
+pub const MAX_STAGED_PACKS: usize = 16;
+
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub volume_id: String,
@@ -64,6 +84,7 @@ pub struct EngineConfig {
     /// Host's volume, so it stays in the same order as node fencing rather than
     /// being made arbitrarily long.
     pub lease_ttl_ms: i64,
+    pub durability: DurabilityMode,
 }
 
 impl EngineConfig {
@@ -77,6 +98,7 @@ impl EngineConfig {
             data_dir: data_dir.into(),
             attachment_id: attachment_id.into(),
             lease_ttl_ms: 15_000,
+            durability: DurabilityMode::Strict,
         }
     }
 }
@@ -114,6 +136,12 @@ pub struct ChunkEngine {
     /// atomic point-in-time image of the barrier.
     io_gate: RwLock<()>,
     flush_lock: Mutex<()>,
+    /// Serializes publishing staged packs. Distinct from `flush_lock` so a
+    /// relaxed FLUSH can stage (and ack) while a slow publish is in flight.
+    /// Anything that must not race a commit against the object store — GC,
+    /// provisioning — takes `flush_lock` first, then this.
+    publish_lock: Mutex<()>,
+    staged: Mutex<StagedQueue>,
     fenced: AtomicBool,
     epoch: i64,
     /// Signals the lease-renewal thread to stop, and wakes it so a detach does not
@@ -121,6 +149,25 @@ pub struct ChunkEngine {
     stop_renew: Arc<(Mutex<bool>, Condvar)>,
     renew_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     gc_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    committer_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+/// Packs staged locally but not yet published to the object store.
+struct StagedQueue {
+    packs: std::collections::VecDeque<StagedPack>,
+    /// Base generation the next staged pack chains onto: the committed
+    /// generation plus one per pack already staged ahead of it. Kept as its
+    /// own monotonic counter rather than derived from `generation` and the
+    /// queue length, because a publish bumps the one and pops the other in
+    /// two steps and a stage between them must not see the half-applied sum.
+    next_base: i64,
+}
+
+/// One staged pack; the payload stays in the pack file so the queue costs
+/// memory proportional to its length, not to the bytes awaiting upload.
+struct StagedPack {
+    txn: String,
+    path: PathBuf,
 }
 
 impl ChunkEngine {
@@ -189,17 +236,27 @@ impl ChunkEngine {
             hydration_cv: Condvar::new(),
             io_gate: RwLock::new(()),
             flush_lock: Mutex::new(()),
+            publish_lock: Mutex::new(()),
+            staged: Mutex::new(StagedQueue {
+                packs: std::collections::VecDeque::new(),
+                next_base: 0,
+            }),
             fenced: AtomicBool::new(false),
             epoch,
             stop_renew: Arc::new((Mutex::new(false), Condvar::new())),
             renew_thread: Mutex::new(None),
             gc_thread: Mutex::new(None),
+            committer_thread: Mutex::new(None),
             cfg,
         });
 
         engine.load_committed_map()?;
         engine.recover_pending_packs()?;
+        // Recovery published or discarded every pending pack, so the staged
+        // chain restarts at the committed generation.
+        engine.staged.lock().unwrap().next_base = engine.generation();
         engine.start_renew_thread();
+        engine.start_committer_thread();
         Ok(engine)
     }
 
@@ -336,8 +393,17 @@ impl ChunkEngine {
             return Err(EngineError::Fenced);
         }
         let _flush = self.flush_lock.lock().unwrap();
+        let _publish = self.publish_lock.lock().unwrap();
         let _gate = self.io_gate.write().unwrap();
 
+        if !self.staged.lock().unwrap().packs.is_empty() {
+            // Staged packs are acknowledged writes; publishing an image map
+            // over them would discard them just as silently as dirty bits.
+            return Err(EngineError::InvalidConfig(format!(
+                "volume {} has staged commits; refusing to provision over them",
+                self.cfg.volume_id
+            )));
+        }
         let new_map = {
             let st = self.state.lock().unwrap();
             if st.generation != 0 {
@@ -370,6 +436,10 @@ impl ChunkEngine {
         st.map = new_map;
         st.leaf_refs = new_leaves;
         st.generation = new_gen;
+        // Provisioning published a generation without going through the staged
+        // queue; the next staged pack chains onto it. (The queue is empty —
+        // checked above — so next_base is exactly the committed generation.)
+        self.staged.lock().unwrap().next_base = new_gen;
         // Unlike a commit, the cache does not hold this content: the chunks are in
         // the image namespace and get hydrated on first read. A reader that ran
         // before this point cannot have left stale content behind either — at
@@ -412,8 +482,12 @@ impl ChunkEngine {
         if self.is_fenced() {
             return Err(EngineError::Fenced);
         }
-        // Block commits for the scan so the live set and the Root agree.
+        // Block commits for the scan so the live set and the Root agree. Both
+        // locks: `flush_lock` stops new stages, `publish_lock` stops the
+        // background committer from uploading objects the Root does not name
+        // yet — GC would sweep those as garbage right before their CAS.
         let _flush = self.flush_lock.lock().unwrap();
+        let _publish = self.publish_lock.lock().unwrap();
         let vol = &self.cfg.volume_id;
 
         let (live_data, live_nodes) = {
@@ -576,14 +650,37 @@ impl ChunkEngine {
         Ok(())
     }
 
-    /// Durable FLUSH: freeze the dirty set, publish a new generation
-    /// (spec §6), return the committed generation.
+    /// FLUSH (spec §6): freeze the dirty set into a staged pack, then publish
+    /// according to the durability mode (ADR-0021).
+    ///
+    /// Strict: returns only after this pack — and anything staged before it —
+    /// is committed to the object store; the acknowledgment IS the durability
+    /// point. Relaxed: returns once the pack is durable on local disk and
+    /// leaves publishing to the background committer, unless the backlog has
+    /// hit `MAX_STAGED_PACKS`, in which case it drains inline so an object
+    /// store outage degrades latency instead of growing the loss window.
+    ///
+    /// Returns the generation the acknowledged state is (or, staged, will be)
+    /// committed at.
     pub fn flush(&self) -> Result<i64> {
         if self.is_fenced() {
             return Err(EngineError::Fenced);
         }
-        let _flush = self.flush_lock.lock().unwrap();
+        let backlog = {
+            let _flush = self.flush_lock.lock().unwrap();
+            self.stage_pack()?;
+            self.staged.lock().unwrap().packs.len()
+        };
+        match self.cfg.durability {
+            DurabilityMode::Strict => self.drain_staged(),
+            DurabilityMode::Relaxed { .. } if backlog > MAX_STAGED_PACKS => self.drain_staged(),
+            DurabilityMode::Relaxed { .. } => Ok(self.staged.lock().unwrap().next_base),
+        }
+    }
 
+    /// Freeze the dirty set and write it as a pending pack on local disk.
+    /// No-op on a clean volume. Caller holds `flush_lock`.
+    fn stage_pack(&self) -> Result<()> {
         // ---- freeze the barrier ----
         //
         // Everything in here blocks every Guest read and write on this volume, so
@@ -597,7 +694,7 @@ impl ChunkEngine {
         // them out cannot make the image inconsistent — which is what makes the
         // barrier proportional to what the Guest actually wrote instead of to the
         // 4 MiB chunks it touched.
-        let (plans, base_generation, base_map, base_leaves, payload) = {
+        let (plans, base_generation, payload) = {
             let _barrier = self.io_gate.write().unwrap();
             let mut st = self.state.lock().unwrap();
             let dirty: Vec<(u64, u64)> = (0..self.chunk_count)
@@ -607,15 +704,20 @@ impl ChunkEngine {
             let mut discarded: Vec<u64> = st.discarded.iter().copied().collect();
             discarded.sort_unstable();
             if dirty.is_empty() && discarded.is_empty() {
-                return Ok(st.generation);
+                return Ok(());
             }
             for &(c, _) in &dirty {
                 st.dirty[c as usize] = 0;
             }
             st.discarded.clear();
-            let base_generation = st.generation;
+            // Plans are made against the committed map even when packs are
+            // staged ahead of this one. A stale view can only misjudge a
+            // chunk's delta-chain length (a chunk written across many staged
+            // packs grows past MAX_DELTA_LAYERS until its next base rewrite);
+            // it cannot affect correctness, because deltas apply in pack
+            // order at publish either way.
             let base_map = st.map.clone();
-            let base_leaves = st.leaf_refs.clone();
+            let base_generation = self.staged.lock().unwrap().next_base;
             drop(st);
 
             let plans = plan_commit(&dirty, &base_map, &discarded);
@@ -625,7 +727,7 @@ impl ChunkEngine {
             // a page-fault storm to the barrier.
             let mut payload = vec![0u8; bytes];
             copy_planned_pages(&self.cache, &plans, &mut payload)?;
-            (plans, base_generation, base_map, base_leaves, payload)
+            (plans, base_generation, payload)
         };
 
         // Barrier released: hash the frozen bytes and describe the pack.
@@ -652,24 +754,58 @@ impl ChunkEngine {
             entries,
         };
         self.write_pack_file(&header, &payload)?;
+        {
+            let mut staged = self.staged.lock().unwrap();
+            staged.packs.push_back(StagedPack {
+                txn: txn.clone(),
+                path: self.pack_path(base_generation, &txn),
+            });
+            staged.next_base += 1;
+        }
         crashpoint::maybe_crash(crashpoint::AFTER_PACK);
+        Ok(())
+    }
 
-        let committed = self.commit_pack(&header, &payload, base_map, base_leaves);
-        match committed {
-            Ok(gen) => {
-                self.finish_committed_pack(&header)?;
-                Ok(gen)
-            }
-            Err(e) => {
-                // The pack stays behind for recovery; volatile dirty bits for
-                // the frozen set were cleared, but the persistent bitmap still
-                // has them, so a restart cannot lose the data.
-                if matches!(e, EngineError::Meta(MetaError::CasConflict { .. }))
-                    || matches!(e, EngineError::Meta(MetaError::Fenced))
-                {
-                    self.fenced.store(true, Ordering::SeqCst);
+    /// Publish every staged pack, oldest first; returns the committed
+    /// generation once the queue is empty.
+    ///
+    /// On a fencing failure the engine fails closed. On a transient store
+    /// failure the queue keeps the remaining packs — volatile dirty bits for
+    /// their frozen sets were cleared, but the pack files and the persistent
+    /// bitmap survive, so neither a retry nor a restart can lose the data.
+    pub fn drain_staged(&self) -> Result<i64> {
+        let _publish = self.publish_lock.lock().unwrap();
+        loop {
+            let next = {
+                let staged = self.staged.lock().unwrap();
+                staged
+                    .packs
+                    .front()
+                    .map(|p| (p.txn.clone(), p.path.clone()))
+            };
+            let Some((txn, path)) = next else {
+                return Ok(self.generation());
+            };
+            let bytes = fs::read(&path)?;
+            let (header, payload) = format::decode_pack(&bytes)
+                .map_err(|e| EngineError::Corrupt(format!("staged pack {txn}: {e}")))?;
+            let (base_map, base_leaves) = {
+                let st = self.state.lock().unwrap();
+                (st.map.clone(), st.leaf_refs.clone())
+            };
+            match self.commit_pack(&header, &payload, base_map, base_leaves) {
+                Ok(_) => {
+                    self.finish_committed_pack(&header)?;
+                    self.staged.lock().unwrap().packs.pop_front();
                 }
-                Err(e)
+                Err(e) => {
+                    if matches!(e, EngineError::Meta(MetaError::CasConflict { .. }))
+                        || matches!(e, EngineError::Meta(MetaError::Fenced))
+                    {
+                        self.fenced.store(true, Ordering::SeqCst);
+                    }
+                    return Err(e);
+                }
             }
         }
     }
@@ -901,18 +1037,21 @@ impl ChunkEngine {
             }
             bitmap.sync_data()?;
         }
-        let path = self.pack_path(&header.txn);
+        let path = self.pack_path(header.base_generation, &header.txn);
         if path.exists() {
             fs::remove_file(&path)?;
         }
         Ok(())
     }
 
-    fn pack_path(&self, txn: &str) -> PathBuf {
+    /// The base-generation prefix makes lexicographic order equal generation
+    /// order, which recovery relies on to replay a staged chain (relaxed mode
+    /// leaves several pending packs behind; spec §6.1 replays them sorted).
+    fn pack_path(&self, base_generation: i64, txn: &str) -> PathBuf {
         self.cfg
             .data_dir
             .join("pending")
-            .join(format!("{txn}.pack"))
+            .join(format!("{base_generation:020}-{txn}.pack"))
     }
 
     fn write_pack_file(&self, header: &PackHeader, payload: &[u8]) -> Result<()> {
@@ -924,7 +1063,7 @@ impl ChunkEngine {
             f.write_all(&encoded)?;
             f.sync_data()?;
         }
-        fs::rename(&tmp, self.pack_path(&header.txn))?;
+        fs::rename(&tmp, self.pack_path(header.base_generation, &header.txn))?;
         File::open(&dir)?.sync_all()?;
         Ok(())
     }
@@ -1384,9 +1523,65 @@ impl ChunkEngine {
         *self.renew_thread.lock().unwrap() = Some(handle);
     }
 
-    /// Graceful detach: callers should `flush()` first. Releases the lease
-    /// unless this attachment has been fenced.
+    /// Relaxed mode only: publish staged packs on a timer. Shares the
+    /// stop/wake condvar with lease renewal so detach interrupts the wait
+    /// instead of sleeping it out.
+    fn start_committer_thread(self: &Arc<Self>) {
+        let DurabilityMode::Relaxed { drain_interval_ms } = self.cfg.durability else {
+            return;
+        };
+        let engine = Arc::downgrade(self);
+        let stop = self.stop_renew.clone();
+        let interval = Duration::from_millis(drain_interval_ms.max(50));
+        let handle = std::thread::Builder::new()
+            .name("pack-committer".into())
+            .spawn(move || loop {
+                let (lock, cv) = &*stop;
+                let stopped = {
+                    let guard = lock.lock().unwrap();
+                    let (guard, _timeout) = cv
+                        .wait_timeout_while(guard, interval, |stopped| !*stopped)
+                        .unwrap();
+                    *guard
+                };
+                if stopped {
+                    return;
+                }
+                let Some(engine) = engine.upgrade() else {
+                    return;
+                };
+                if engine.is_fenced() {
+                    return;
+                }
+                if let Err(e) = engine.drain_staged() {
+                    // Transient store trouble: the queue keeps the packs and
+                    // the next tick retries. FLUSH drains inline once the
+                    // backlog cap is hit, so the window stays bounded even if
+                    // this keeps failing.
+                    tracing::warn!(volume = %engine.cfg.volume_id, "background drain failed: {e}");
+                }
+            })
+            .expect("spawn pack committer thread");
+        *self.committer_thread.lock().unwrap() = Some(handle);
+    }
+
+    /// Graceful detach: publishes anything still staged (a forced flush point
+    /// of the relaxed contract, ADR-0021), then releases the lease unless this
+    /// attachment has been fenced.
+    ///
+    /// If the final drain fails the lease is released anyway: holding it
+    /// hostage to a store outage would trade the documented relaxed loss
+    /// window for unavailability. The staged packs stay on disk, so a
+    /// same-host reattach still replays them.
     pub fn detach(&self) {
+        if !self.is_fenced() {
+            if let Err(e) = self.drain_staged() {
+                tracing::error!(
+                    volume = %self.cfg.volume_id,
+                    "final drain on detach failed; staged packs remain on disk: {e}"
+                );
+            }
+        }
         self.stop_renewal();
         if !self.is_fenced() {
             let _ =
@@ -1405,6 +1600,9 @@ impl ChunkEngine {
             let _ = handle.join();
         }
         if let Some(handle) = self.gc_thread.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.committer_thread.lock().unwrap().take() {
             let _ = handle.join();
         }
     }
@@ -1788,6 +1986,123 @@ mod tests {
         e.detach();
     }
 
+    /// An hour, i.e. "never during a test": relaxed engines in these tests
+    /// drain explicitly, not on the committer's timer.
+    const NEVER_MS: u64 = 3_600_000;
+
+    fn attach_relaxed(env: &Env, attachment: &str) -> Arc<ChunkEngine> {
+        let mut cfg = EngineConfig::new(VOL, &env.data_dir, attachment);
+        cfg.durability = DurabilityMode::Relaxed {
+            drain_interval_ms: NEVER_MS,
+        };
+        ChunkEngine::attach(cfg, env.blob.clone(), env.meta.clone()).unwrap()
+    }
+
+    #[test]
+    fn relaxed_flush_acks_locally_and_the_drain_publishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let counting = Arc::new(CountingBlob {
+            inner: Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap()),
+            gets: AtomicU64::new(0),
+            data_puts: AtomicU64::new(0),
+        });
+        let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+        meta.create_volume(VOL, SIZE).unwrap();
+        let mut cfg = EngineConfig::new(VOL, dir.path().join("data"), "attA");
+        cfg.durability = DurabilityMode::Relaxed {
+            drain_interval_ms: NEVER_MS,
+        };
+        let e = ChunkEngine::attach(cfg, counting.clone(), meta).unwrap();
+
+        e.write(0, &pattern(4096, 7)).unwrap();
+        let acked = e.flush().unwrap();
+        assert_eq!(acked, 1, "flush reports the pack's target generation");
+        assert_eq!(
+            counting.data_puts.load(Ordering::SeqCst),
+            0,
+            "a relaxed ack must not wait on the object store"
+        );
+        assert_eq!(e.generation(), 0, "nothing committed yet");
+
+        // An empty flush with a staged backlog still acks the same target.
+        assert_eq!(e.flush().unwrap(), 1);
+
+        assert_eq!(e.drain_staged().unwrap(), 1);
+        assert!(counting.data_puts.load(Ordering::SeqCst) > 0);
+        assert_eq!(e.generation(), 1);
+        e.detach();
+    }
+
+    #[test]
+    fn staged_packs_replay_in_order_after_a_crash() {
+        let env = env();
+        {
+            let e = attach_relaxed(&env, "attA");
+            e.write(100, &pattern(4096, 1)).unwrap();
+            assert_eq!(e.flush().unwrap(), 1);
+            // Overwrite the same pages in a second staged pack: replay order
+            // becomes observable in the final bytes.
+            e.write(100, &pattern(4096, 2)).unwrap();
+            e.write(CHUNK_SIZE as u64 + 7, b"second-chunk").unwrap();
+            assert_eq!(e.flush().unwrap(), 2);
+            assert_eq!(e.generation(), 0, "both packs staged, none committed");
+            // Crash: drop without detach. Drop stops threads but must not
+            // drain — draining here would hide recovery bugs. The local state
+            // survives as a whole (cache, bitmap and pending packs are one
+            // deletable unit; a pack replay reads the frozen bytes from the
+            // pack but trusts the cache for everything it re-marks hydrated).
+        }
+        let e = attach(&env, "attA");
+        assert_eq!(e.generation(), 2, "recovery replayed the staged chain");
+        let mut b = vec![0u8; 4096];
+        e.read(100, &mut b).unwrap();
+        assert_eq!(b, pattern(4096, 2), "the later staged pack wins");
+        let mut s = vec![0u8; 12];
+        e.read(CHUNK_SIZE as u64 + 7, &mut s).unwrap();
+        assert_eq!(&s, b"second-chunk");
+        e.detach();
+    }
+
+    #[test]
+    fn relaxed_detach_publishes_staged_packs() {
+        let env = env();
+        let data = pattern(4096, 5);
+        {
+            let e = attach_relaxed(&env, "attA");
+            e.write(2 * CHUNK_SIZE as u64, &data).unwrap();
+            e.flush().unwrap();
+            assert_eq!(e.generation(), 0);
+            e.detach();
+        }
+        // A different host with nothing local sees the detach-drained state.
+        let e = attach_at(&env, "attB", "data-b");
+        assert_eq!(e.generation(), 1);
+        let mut back = vec![0u8; 4096];
+        e.read(2 * CHUNK_SIZE as u64, &mut back).unwrap();
+        assert_eq!(back, data);
+        e.detach();
+    }
+
+    #[test]
+    fn provisioning_refuses_staged_commits() {
+        let env = env();
+        let e = attach_relaxed(&env, "attA");
+        e.write(0, &pattern(4096, 3)).unwrap();
+        e.flush().unwrap();
+        let manifest = format::ImageManifest {
+            version: 1,
+            image_id: "0123456789abcdef0123456789abcdef".into(),
+            size_bytes: SIZE,
+            chunks: vec![],
+        };
+        let err = e.provision_from_image(&manifest).unwrap_err();
+        assert!(
+            err.to_string().contains("staged commits"),
+            "unexpected error: {err}"
+        );
+        e.detach();
+    }
+
     #[test]
     fn multi_generation_overwrites_read_latest() {
         let env = env();
@@ -1811,13 +2126,18 @@ mod tests {
         e.detach();
     }
 
-    /// Counting wrapper to prove holes never hit the blobstore.
+    /// Counting wrapper to prove holes never hit the blobstore and that a
+    /// relaxed ack publishes nothing.
     struct CountingBlob {
         inner: Arc<dyn BlobStore>,
         gets: AtomicU64,
+        data_puts: AtomicU64,
     }
     impl BlobStore for CountingBlob {
         fn put_immutable(&self, k: &str, d: &[u8]) -> cats_storage::blob::Result<()> {
+            if k.contains("/data/") {
+                self.data_puts.fetch_add(1, Ordering::SeqCst);
+            }
             self.inner.put_immutable(k, d)
         }
         fn get(&self, k: &str) -> cats_storage::blob::Result<Vec<u8>> {
@@ -2520,6 +2840,7 @@ mod tests {
         let counting = Arc::new(CountingBlob {
             inner: env.blob.clone(),
             gets: AtomicU64::new(0),
+            data_puts: AtomicU64::new(0),
         });
         let e = ChunkEngine::attach(
             EngineConfig::new(VOL, &env.data_dir, "attB"),
@@ -2643,6 +2964,7 @@ mod tests {
                 data_dir: env.data_dir.clone(),
                 attachment_id: "attDetach".into(),
                 lease_ttl_ms: 6_000,
+                durability: DurabilityMode::Strict,
             },
             env.blob.clone(),
             env.meta.clone(),

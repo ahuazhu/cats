@@ -72,6 +72,7 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Jso
         NodeJobAction::RestoreCat { cat_id } => (cat_id.clone(), ObservedState::Running),
         NodeJobAction::AttachDisk { cat_id, .. } => (cat_id.clone(), ObservedState::Running),
         NodeJobAction::DetachDisk { cat_id, .. } => (cat_id.clone(), ObservedState::Running),
+        NodeJobAction::SyncCat { cat_id } => (cat_id.clone(), ObservedState::Running),
         NodeJobAction::CleanupCat { cat_id } => (cat_id.clone(), ObservedState::Cold),
     };
     let mut cats = node.cats.lock().unwrap();
@@ -657,6 +658,7 @@ async fn create_converges_and_idempotency_replays() {
             auto_suspend: true,
             disk: None,
             expires_at_unix: None,
+            durability: Default::default(),
         })
         .send()
         .await
@@ -868,6 +870,7 @@ async fn rwo_second_bind_is_rejected() {
         .json(&CreateDiskRequest {
             name: "shared".into(),
             size_bytes: 8 << 20,
+            durability: Default::default(),
         })
         .send()
         .await
@@ -1010,6 +1013,7 @@ async fn control_plane_startup_grace_preserves_a_reconnecting_host_bound_cat() {
                 true,
                 None,
                 None,
+                cats_api::resources::DiskDurability::Strict,
             )
             .unwrap();
         cat_id = cat.id.clone();
@@ -1178,6 +1182,7 @@ async fn destroy_deletes_root_disk_and_keeps_persistent() {
         .json(&CreateDiskRequest {
             name: "keep".into(),
             size_bytes: 8 << 20,
+            durability: Default::default(),
         })
         .send()
         .await

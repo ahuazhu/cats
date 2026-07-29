@@ -87,6 +87,14 @@ pub enum Command {
         /// Delete this Cat automatically after SECONDS from now.
         #[arg(long, value_name = "SECONDS")]
         expires_in: Option<u64>,
+        /// What an fsync inside the Cat promises, for the disks this command
+        /// creates. `strict`: fsync returns once the data is durable in the
+        /// object store and survives losing the host. `relaxed`: fsync
+        /// returns after a local commit and the data reaches the object store
+        /// within ~5 s; an unclean host loss may drop those last seconds, so
+        /// use `cats sync` before promising the outside world anything.
+        #[arg(long, default_value = "strict", value_parser = ["strict", "relaxed"])]
+        durability: String,
     },
     /// List cats.
     Ls,
@@ -102,6 +110,10 @@ pub enum Command {
     Resume { name: String },
     /// Demote a cat to Warm (snapshot + VMM exit; host-bound).
     Warm { name: String },
+    /// Force everything written inside the cat to durable storage now.
+    /// On relaxed disks this is the escape hatch that buys one strict
+    /// moment on demand; on strict disks it is a cheap no-op.
+    Sync { name: String },
     /// Destroy a cat and its root disk (persistent disks survive).
     Destroy { name: String },
     /// Run a command inside the cat (wakes it if needed).
@@ -224,6 +236,9 @@ pub enum DiskCommand {
         name: String,
         #[arg(long)]
         size: String,
+        /// See `cats create --durability`.
+        #[arg(long, default_value = "strict", value_parser = ["strict", "relaxed"])]
+        durability: String,
     },
     Ls,
     Get {
@@ -653,6 +668,7 @@ pub fn run(cli: Cli) -> Result<()> {
             mount_at,
             no_auto_suspend,
             expires_in,
+            durability,
         } => {
             let body = CreateCatRequest {
                 name: name.clone(),
@@ -667,6 +683,8 @@ pub fn run(cli: Cli) -> Result<()> {
                     mount_at: mount_at.clone(),
                 }),
                 expires_at_unix: expires_in.map(|secs| unix_now() + secs as i64),
+                durability: DiskDurability::parse(durability)
+                    .expect("clap validated the value"),
             };
             let resp = client.send(
                 client
@@ -720,6 +738,11 @@ pub fn run(cli: Cli) -> Result<()> {
             mutate(client.post(&format!("/cats/{name}/actions/resume"), None)?)
         }
         Command::Warm { name } => mutate(client.post(&format!("/cats/{name}/actions/warm"), None)?),
+        Command::Sync { name } => {
+            client.post(&format!("/cats/{name}/actions/sync"), None)?;
+            println!("synced {name}: all acknowledged writes are durable");
+            Ok(())
+        }
         Command::Destroy { name } => {
             let resp = client.send(client.http.delete(client.url(&format!("/cats/{name}"))))?;
             let parsed: CatOperationResponse = serde_json::from_value(resp)?;
@@ -1096,10 +1119,18 @@ fn print_node(summary: &NodeSummary) {
 
 fn run_disk(client: &Client, cli: &Cli, cmd: &DiskCommand) -> Result<()> {
     match cmd {
-        DiskCommand::Create { name, size } => {
+        DiskCommand::Create {
+            name,
+            size,
+            durability,
+        } => {
             let v = client.post(
                 "/disks",
-                Some(json!({ "name": name, "size_bytes": parse_size(size)? })),
+                Some(json!({
+                    "name": name,
+                    "size_bytes": parse_size(size)?,
+                    "durability": durability,
+                })),
             )?;
             let disk: Disk = serde_json::from_value(v)?;
             print_disk(&disk, cli.json);
@@ -1145,11 +1176,12 @@ fn print_disk(d: &Disk, json_mode: bool) {
         println!("{}", serde_json::to_string_pretty(d).unwrap());
     } else {
         println!(
-            "{:<16} {:>8} MiB  kind={:<10} state={:<10} cat={}",
+            "{:<16} {:>8} MiB  kind={:<10} state={:<10} durability={:<7} cat={}",
             d.name,
             d.size_bytes >> 20,
             format!("{:?}", d.kind).to_lowercase(),
             format!("{:?}", d.state).to_lowercase(),
+            d.durability.as_str(),
             d.bound_cat_id.as_deref().unwrap_or("-")
         );
     }
@@ -1223,6 +1255,22 @@ mod tests {
                 no_auto_suspend: true,
                 ..
             }
+        ));
+        let cli = Cli::parse_from(["cats", "create", "ci", "--durability", "relaxed"]);
+        match cli.command {
+            Command::Create { durability, .. } => assert_eq!(durability, "relaxed"),
+            _ => panic!("wrong parse"),
+        }
+        // No flag means strict: the honest default.
+        let cli = Cli::parse_from(["cats", "create", "db"]);
+        match cli.command {
+            Command::Create { durability, .. } => assert_eq!(durability, "strict"),
+            _ => panic!("wrong parse"),
+        }
+        assert!(Cli::try_parse_from(["cats", "create", "x", "--durability", "fast"]).is_err());
+        assert!(matches!(
+            Cli::parse_from(["cats", "sync", "dev"]).command,
+            Command::Sync { name } if name == "dev"
         ));
         let with_timeout =
             Cli::parse_from(["cats", "exec", "dev", "--timeout", "900", "--", "cargo", "build"]);

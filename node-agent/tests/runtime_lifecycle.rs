@@ -77,6 +77,7 @@ fn grant(disk: &str, attempt: i64) -> VolumeGrant {
         } else {
             "/data".into()
         },
+        durability: Default::default(),
     }
 }
 

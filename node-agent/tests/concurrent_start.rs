@@ -66,6 +66,7 @@ fn start_job(cat: &str) -> NodeJob {
                 epoch: 0,
                 size_bytes: SIZE,
                 mount_path: "/".into(),
+                durability: Default::default(),
             }],
         },
     }

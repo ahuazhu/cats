@@ -115,6 +115,27 @@ struct Args {
     /// How long to wait for a held lease to expire before giving up.
     #[arg(long, default_value_t = 15_000)]
     acquire_wait_ms: u64,
+
+    /// When a FLUSH acknowledgment reaches the Guest (ADR-0021).
+    ///
+    /// `strict` (default): after the commit is durable in the object store.
+    /// `relaxed`: after the pack is durable on local disk; a background
+    /// committer publishes every `drain_interval_ms`. Relaxed trades a bounded
+    /// loss window on host loss for local-latency fsync.
+    #[arg(long, default_value = "strict")]
+    durability: String,
+
+    /// Relaxed mode: how often the background committer publishes staged
+    /// packs. Bounds the loss window together with the staged-pack cap.
+    #[arg(long, default_value_t = 5_000)]
+    drain_interval_ms: u64,
+
+    /// Host-side control socket. One command per connection, one line each
+    /// way: `drain` publishes every staged pack and answers `OK <generation>`
+    /// or `ERR <message>`. The node agent uses it at the forced flush points
+    /// of the relaxed contract (ADR-0021); on a strict volume it is a no-op.
+    #[arg(long)]
+    listen_control: Option<PathBuf>,
 }
 
 /// Publish a shared base image and report what it cost.
@@ -261,11 +282,19 @@ fn main() -> Result<()> {
         }
     }
 
+    let durability = match args.durability.as_str() {
+        "strict" => cats_blockd::engine::DurabilityMode::Strict,
+        "relaxed" => cats_blockd::engine::DurabilityMode::Relaxed {
+            drain_interval_ms: args.drain_interval_ms,
+        },
+        other => anyhow::bail!("unknown --durability {other:?}; expected strict or relaxed"),
+    };
     let config = EngineConfig {
         volume_id: volume_id.clone(),
         data_dir,
         attachment_id,
         lease_ttl_ms: args.lease_ttl_ms,
+        durability,
     };
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_millis(args.acquire_wait_ms);
@@ -330,6 +359,15 @@ fn main() -> Result<()> {
         None => None,
     };
     let vhost_user = bind_vhost_user(&vhost_user_args)?;
+    if let Some(path) = &args.listen_control {
+        if path.exists() {
+            std::fs::remove_file(path).ok();
+        }
+        let listener = UnixListener::bind(path)
+            .with_context(|| format!("bind control socket {}", path.display()))?;
+        let engine = engine.clone();
+        std::thread::spawn(move || serve_control(listener, engine));
+    }
 
     let ready = args
         .listen_vhost_user
@@ -362,6 +400,31 @@ fn main() -> Result<()> {
         }));
     }
     serve_vhost_user(vhost_user, &vhost_user_args, engine, nbd_threads)
+}
+
+/// The host-side control plane of one blockd: line-oriented, one command per
+/// connection. Failure to serve one connection never takes the loop down.
+fn serve_control(listener: UnixListener, engine: std::sync::Arc<cats_blockd::engine::ChunkEngine>) {
+    use std::io::{BufRead, BufReader, Write};
+    for connection in listener.incoming() {
+        let Ok(connection) = connection else { return };
+        let engine = engine.clone();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(&connection);
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() {
+                return;
+            }
+            let reply = match line.trim() {
+                "drain" => match engine.drain_staged() {
+                    Ok(generation) => format!("OK {generation}\n"),
+                    Err(error) => format!("ERR {error}\n"),
+                },
+                other => format!("ERR unknown command {other:?}\n"),
+            };
+            let _ = (&connection).write_all(reply.as_bytes());
+        });
+    }
 }
 
 /// NBD-only mode: the listener threads own the work, so the process lives as
