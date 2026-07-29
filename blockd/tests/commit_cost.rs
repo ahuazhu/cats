@@ -37,7 +37,8 @@ struct SizingBlob {
 impl BlobStore for SizingBlob {
     fn put_immutable(&self, key: &str, data: &[u8]) -> BlobResult<()> {
         if key.contains("/data/") {
-            self.data_bytes.fetch_add(data.len() as u64, Ordering::SeqCst);
+            self.data_bytes
+                .fetch_add(data.len() as u64, Ordering::SeqCst);
         }
         self.inner.put_immutable(key, data)
     }
@@ -74,10 +75,25 @@ fn object_store(dir: &Path, prefix: &str) -> Arc<dyn BlobStore> {
             if let Ok(region) = std::env::var("AWS_REGION") {
                 pairs.push(("region".to_string(), region));
             }
-            let config = AdapterConfig::from_pairs(
-                pairs.iter().map(|(k, v)| (k.as_str(), v.clone())),
-            )
-            .expect("s3 adapter options");
+            // S3 Express One Zone (directory buckets) needs a zonal endpoint,
+            // virtual-hosted addressing, the `s3express` signing service, and
+            // (typically) CreateSession auth. All optional; unset means
+            // standard S3.
+            for (var, option) in [
+                ("CATS_BENCH_S3_ENDPOINT", "endpoint"),
+                ("CATS_BENCH_S3_SIGNING_SERVICE", "signing-service"),
+                ("CATS_BENCH_S3_VIRTUAL_HOST", "virtual-host"),
+                ("CATS_BENCH_S3_EXPRESS_SESSION", "express-session"),
+            ] {
+                if let Ok(value) = std::env::var(var) {
+                    if !value.is_empty() {
+                        pairs.push((option.to_string(), value));
+                    }
+                }
+            }
+            let config =
+                AdapterConfig::from_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.clone())))
+                    .expect("s3 adapter options");
             open_blob_store(
                 cats_object_store_aws_s3::ADAPTER_NAME,
                 &config,
@@ -152,7 +168,12 @@ fn flush_cost_scales_with_the_dirty_set() {
     let repeats = 3;
     println!(
         "\n{:>12} {:>12} {:>14} {:>12} {:>16} {:>14}",
-        "dirty chunks", "dirty pages", "published MiB", "flush ms", "ms per pub MiB", "sha256 MiB/s"
+        "dirty chunks",
+        "dirty pages",
+        "published MiB",
+        "flush ms",
+        "ms per pub MiB",
+        "sha256 MiB/s"
     );
     for dirty_chunks in [1u64, 8, 16, 32, 48] {
         let mut samples = Vec::new();
