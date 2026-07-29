@@ -3525,7 +3525,18 @@ mod tests {
         let workspace = bootstrap_workspace(&store, "acme");
 
         let (cat, _, op) = store
-            .create_cat(&workspace, "web", "ubuntu-24.04", 1, 512, 1 << 30, true, None, None)
+            .create_cat(
+                &workspace,
+                "web",
+                "ubuntu-24.04",
+                1,
+                512,
+                1 << 30,
+                true,
+                None,
+                None,
+                DiskDurability::Strict,
+            )
             .unwrap();
         let route = "POST /cats acme/web";
         store.idempotency_store("k1", route, &op.id).unwrap();
