@@ -320,17 +320,23 @@ impl MetadataStore for SqliteMetadataStore {
         &self,
         volume_id: &str,
         expected_generation: i64,
+        new_generation: i64,
         new_root_hash: [u8; 32],
         new_root_object_id: &str,
         attachment_id: &str,
         epoch: i64,
     ) -> Result<i64> {
+        if new_generation <= expected_generation {
+            return Err(MetaError::InvalidArgument(format!(
+                "cas_head must advance the generation: {expected_generation} -> {new_generation}"
+            )));
+        }
         let now = now_ms();
         let conn = self.connection()?;
         let n = conn
             .execute(
                 "UPDATE volumes
-                    SET root_hash = ?3, root_object_id = ?4, generation = generation + 1
+                    SET root_hash = ?3, root_object_id = ?4, generation = ?8
                   WHERE volume_id = ?1
                     AND generation = ?2
                     AND lease_owner = ?5
@@ -343,7 +349,8 @@ impl MetadataStore for SqliteMetadataStore {
                     new_root_object_id,
                     attachment_id,
                     epoch,
-                    now
+                    now,
+                    new_generation
                 ],
             )
             .map_err(sql_err)?;
@@ -352,7 +359,7 @@ impl MetadataStore for SqliteMetadataStore {
                 expected: expected_generation,
             });
         }
-        Ok(expected_generation + 1)
+        Ok(new_generation)
     }
 
     fn create_snapshot(&self, snapshot_id: &str, volume_id: &str) -> Result<SnapshotRow> {
@@ -542,20 +549,20 @@ mod tests {
         let (_d, m) = store();
         m.create_volume("v1", 1 << 22).unwrap();
         let epoch = m.acquire_lease("v1", "attA", 60_000).unwrap();
-        let g1 = m.cas_head("v1", 0, [1; 32], "obj1", "attA", epoch).unwrap();
+        let g1 = m.cas_head("v1", 0, 1, [1; 32], "obj1", "attA", epoch).unwrap();
         assert_eq!(g1, 1);
         // Wrong expected generation.
-        assert!(m.cas_head("v1", 0, [2; 32], "obj2", "attA", epoch).is_err());
+        assert!(m.cas_head("v1", 0, 1, [2; 32], "obj2", "attA", epoch).is_err());
         // Wrong epoch.
         assert!(m
-            .cas_head("v1", 1, [2; 32], "obj2", "attA", epoch + 1)
+            .cas_head("v1", 1, 2, [2; 32], "obj2", "attA", epoch + 1)
             .is_err());
         // Fenced holder cannot CAS.
         m.revoke_lease("v1").unwrap();
-        assert!(m.cas_head("v1", 1, [2; 32], "obj2", "attA", epoch).is_err());
+        assert!(m.cas_head("v1", 1, 2, [2; 32], "obj2", "attA", epoch).is_err());
         // New holder continues from the committed generation.
         let e2 = m.acquire_lease("v1", "attB", 60_000).unwrap();
-        let g2 = m.cas_head("v1", 1, [3; 32], "obj3", "attB", e2).unwrap();
+        let g2 = m.cas_head("v1", 1, 2, [3; 32], "obj3", "attB", e2).unwrap();
         assert_eq!(g2, 2);
         let head = m.load_head("v1").unwrap();
         assert_eq!(head.root_hash, Some([3; 32]));
@@ -570,8 +577,8 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         let e2 = m.acquire_lease("v1", "attB", 60_000).unwrap();
         assert!(e2 > e1);
-        assert!(m.cas_head("v1", 0, [1; 32], "obj", "attA", e1).is_err());
-        assert!(m.cas_head("v1", 0, [1; 32], "obj", "attB", e2).is_ok());
+        assert!(m.cas_head("v1", 0, 1, [1; 32], "obj", "attA", e1).is_err());
+        assert!(m.cas_head("v1", 0, 1, [1; 32], "obj", "attB", e2).is_ok());
     }
 
     #[test]
@@ -579,7 +586,7 @@ mod tests {
         let (_d, m) = store();
         m.create_volume("v1", 1 << 22).unwrap();
         let epoch = m.acquire_lease("v1", "attA", 60_000).unwrap();
-        m.cas_head("v1", 0, [7; 32], "obj7", "attA", epoch).unwrap();
+        m.cas_head("v1", 0, 1, [7; 32], "obj7", "attA", epoch).unwrap();
         let snap = m.create_snapshot("snap_1", "v1").unwrap();
         assert_eq!(snap.generation, 1);
         assert_eq!(snap.root_hash, Some([7; 32]));
