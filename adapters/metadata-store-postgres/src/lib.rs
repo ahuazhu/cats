@@ -45,36 +45,24 @@ const DB_NOW_MS: &str = "floor(extract(epoch FROM clock_timestamp()) * 1000)::bi
 
 pub struct PostgresMetadataStore {
     jobs: mpsc::Sender<Job>,
+    /// Lease operations get their own connection and worker.
+    ///
+    /// Every operation on a shared worker is serial, so a renewal queued behind
+    /// a commit's metadata work waits for it. A volume lease is only seconds
+    /// long and its renewal SQL refuses an already-expired row, so one late
+    /// renewal fences a live attachment permanently — the Guest then sees write
+    /// errors and its filesystem aborts. Renewals must not be able to queue
+    /// behind bulk work.
+    lease_jobs: mpsc::Sender<Job>,
 }
 
 type Job = Box<dyn FnOnce(&mut Client) + Send + 'static>;
 
 impl PostgresMetadataStore {
     pub fn connect(url: &str, ca_file: Option<&str>) -> Result<Self> {
-        let url = url.to_string();
-        let ca_file = ca_file.map(str::to_string);
-        let (jobs, receiver) = mpsc::channel::<Job>();
-        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        std::thread::Builder::new()
-            .name("cats-postgres-metadata".into())
-            .spawn(move || match connect_client(&url, ca_file.as_deref()) {
-                Ok(mut client) => {
-                    let _ = ready_tx.send(Ok(()));
-                    for job in receiver {
-                        job(&mut client);
-                    }
-                }
-                Err(error) => {
-                    let _ = ready_tx.send(Err(error));
-                }
-            })
-            .map_err(|error| {
-                MetaError::Backend(format!("start PostgreSQL metadata thread: {error}"))
-            })?;
-        ready_rx.recv().map_err(|_| {
-            MetaError::Backend("PostgreSQL metadata thread exited at startup".into())
-        })??;
-        Ok(Self { jobs })
+        let jobs = spawn_worker("cats-postgres-metadata", url, ca_file)?;
+        let lease_jobs = spawn_worker("cats-postgres-lease", url, ca_file)?;
+        Ok(Self { jobs, lease_jobs })
     }
 
     fn dispatch<T>(
@@ -84,16 +72,61 @@ impl PostgresMetadataStore {
     where
         T: Send + 'static,
     {
-        let (result_tx, result_rx) = mpsc::sync_channel(1);
-        self.jobs
-            .send(Box::new(move |client| {
-                let _ = result_tx.send(operation(client));
-            }))
-            .map_err(|_| MetaError::Backend("PostgreSQL metadata thread exited".into()))?;
-        result_rx
-            .recv()
-            .map_err(|_| MetaError::Backend("PostgreSQL metadata operation was canceled".into()))?
+        dispatch_on(&self.jobs, operation)
     }
+
+    /// Dispatch on the lease connection, which no bulk work shares.
+    fn dispatch_lease<T>(
+        &self,
+        operation: impl FnOnce(&mut Client) -> Result<T> + Send + 'static,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+    {
+        dispatch_on(&self.lease_jobs, operation)
+    }
+}
+
+fn spawn_worker(name: &str, url: &str, ca_file: Option<&str>) -> Result<mpsc::Sender<Job>> {
+    let url = url.to_string();
+    let ca_file = ca_file.map(str::to_string);
+    let (jobs, receiver) = mpsc::channel::<Job>();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || match connect_client(&url, ca_file.as_deref()) {
+            Ok(mut client) => {
+                let _ = ready_tx.send(Ok(()));
+                for job in receiver {
+                    job(&mut client);
+                }
+            }
+            Err(error) => {
+                let _ = ready_tx.send(Err(error));
+            }
+        })
+        .map_err(|error| MetaError::Backend(format!("start PostgreSQL metadata thread: {error}")))?;
+    ready_rx
+        .recv()
+        .map_err(|_| MetaError::Backend("PostgreSQL metadata thread exited at startup".into()))??;
+    Ok(jobs)
+}
+
+fn dispatch_on<T>(
+    jobs: &mpsc::Sender<Job>,
+    operation: impl FnOnce(&mut Client) -> Result<T> + Send + 'static,
+) -> Result<T>
+where
+    T: Send + 'static,
+{
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    jobs.send(Box::new(move |client| {
+        let _ = result_tx.send(operation(client));
+    }))
+    .map_err(|_| MetaError::Backend("PostgreSQL metadata thread exited".into()))?;
+    result_rx
+        .recv()
+        .map_err(|_| MetaError::Backend("PostgreSQL metadata operation was canceled".into()))?
 }
 
 fn connect_client(url: &str, ca_file: Option<&str>) -> Result<Client> {
@@ -296,7 +329,7 @@ impl MetadataStore for PostgresMetadataStore {
                      OR lease_owner = $2)
               RETURNING lease_epoch"
         );
-        self.dispatch(move |client| {
+        self.dispatch_lease(move |client| {
             if let Some(row) = client
                 .query_opt(&sql, &[&volume_id, &attachment_id, &ttl_ms])
                 .map_err(pg_err)?
@@ -334,7 +367,7 @@ impl MetadataStore for PostgresMetadataStore {
               WHERE volume_id = $1 AND lease_owner = $2 AND lease_epoch = $3
                 AND lease_expires_at_ms > {DB_NOW_MS}"
         );
-        self.dispatch(move |client| {
+        self.dispatch_lease(move |client| {
             let rows = client
                 .execute(&sql, &[&volume_id, &attachment_id, &epoch, &ttl_ms])
                 .map_err(pg_err)?;
@@ -348,7 +381,7 @@ impl MetadataStore for PostgresMetadataStore {
     fn release_lease(&self, volume_id: &str, attachment_id: &str, epoch: i64) -> Result<()> {
         let volume_id = volume_id.to_string();
         let attachment_id = attachment_id.to_string();
-        self.dispatch(move |client| {
+        self.dispatch_lease(move |client| {
             client
                 .execute(
                     "UPDATE cats_storage_volumes
