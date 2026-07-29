@@ -1059,12 +1059,16 @@ impl Store {
         .ok_or_else(|| ApiError::not_found(format!("cat {name_or_id}")))
     }
 
-    pub fn must_get_cat_by_id(&self, id: &str) -> Result<Cat> {
+    pub fn find_cat_by_id(&self, id: &str) -> Result<Option<Cat>> {
         self.with(|c| {
             c.query_row("SELECT * FROM cats WHERE id=?1", params![id], row_to_cat)
                 .optional()
-        })?
-        .ok_or_else(|| ApiError::not_found(format!("cat {id}")))
+        })
+    }
+
+    pub fn must_get_cat_by_id(&self, id: &str) -> Result<Cat> {
+        self.find_cat_by_id(id)?
+            .ok_or_else(|| ApiError::not_found(format!("cat {id}")))
     }
 
     pub fn list_cats(&self, workspace_id: &str) -> Result<Vec<Cat>> {
@@ -2400,7 +2404,7 @@ impl Store {
     // Operations / idempotency
     // ------------------------------------------------------------------
 
-    pub fn get_operation(&self, id: &str) -> Result<Operation> {
+    pub fn find_operation(&self, id: &str) -> Result<Option<Operation>> {
         self.with(|c| {
             c.query_row(
                 "SELECT * FROM operations WHERE id=?1",
@@ -2408,8 +2412,12 @@ impl Store {
                 row_to_operation,
             )
             .optional()
-        })?
-        .ok_or_else(|| ApiError::not_found(format!("operation {id}")))
+        })
+    }
+
+    pub fn get_operation(&self, id: &str) -> Result<Operation> {
+        self.find_operation(id)?
+            .ok_or_else(|| ApiError::not_found(format!("operation {id}")))
     }
 
     pub fn list_operations(&self, workspace_id: &str) -> Result<Vec<Operation>> {
@@ -2481,6 +2489,18 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()
+        })
+    }
+
+    /// Drops a record whose operation or resource no longer exists, so the key
+    /// can be used again instead of replaying a reference to something deleted.
+    pub fn idempotency_forget(&self, key: &str, route: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM idempotency WHERE key=?1 AND route=?2",
+                params![key, route],
+            )
+            .map(|_| ())
         })
     }
 
@@ -3496,6 +3516,41 @@ mod tests {
             store.must_get_cat_by_id(&cat_id).unwrap().expires_at_unix,
             Some(12345)
         );
+    }
+
+    #[test]
+    fn an_idempotency_record_outlives_the_cat_it_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("control.db")).unwrap();
+        let workspace = bootstrap_workspace(&store, "acme");
+
+        let (cat, _, op) = store
+            .create_cat(
+                &workspace,
+                "web",
+                "ubuntu-24.04",
+                1,
+                512,
+                1 << 30,
+                true,
+                None,
+                None,
+                DiskDurability::Strict,
+            )
+            .unwrap();
+        let route = "POST /cats acme/web";
+        store.idempotency_store("k1", route, &op.id).unwrap();
+
+        store.delete_cat_row(&cat.id).unwrap();
+
+        // The record still resolves to an operation, but its cat is gone — the
+        // state that used to make a replay answer 404 for good.
+        let op_id = store.idempotency_lookup("k1", route).unwrap().unwrap();
+        let stale = store.find_operation(&op_id).unwrap().unwrap();
+        assert!(store.find_cat_by_id(&stale.resource_id).unwrap().is_none());
+
+        store.idempotency_forget("k1", route).unwrap();
+        assert!(store.idempotency_lookup("k1", route).unwrap().is_none());
     }
 
     #[test]

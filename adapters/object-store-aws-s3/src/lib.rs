@@ -17,6 +17,11 @@ use cats_storage::{AdapterConfig, AdapterError, BlobStoreFactory};
 
 pub const ADAPTER_NAME: &str = "aws-s3";
 
+/// Total attempts for one object-store request, including the first.
+const RETRY_ATTEMPTS: u32 = 5;
+const RETRY_INITIAL_DELAY_MS: u64 = 100;
+const RETRY_MAX_DELAY_MS: u64 = 3_000;
+
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
@@ -178,8 +183,62 @@ impl AwsS3BlobStore {
         url
     }
 
-    /// Execute a signed request. `path` must start with `/`.
+    /// Execute a signed request, retrying transient failures.
+    ///
+    /// A single failed object-store call is not a tolerable outcome here: the
+    /// caller is a block device, so the error reaches the Guest as an I/O error
+    /// on FLUSH, and its filesystem aborts its journal and remounts read-only.
+    /// Object storage answers 5xx and drops connections as normal operation, so
+    /// those must be retried rather than surfaced. Every operation this adapter
+    /// issues is safe to repeat: reads and deletes are idempotent, and an
+    /// immutable put that finds its object already present verifies the bytes
+    /// (see the module docs).
     fn request(
+        &self,
+        method: &str,
+        path: &str,
+        query: &[(String, String)],
+        body: &[u8],
+        extra_headers: &[(&str, &str)],
+        key_for_errors: &str,
+    ) -> Result<(u16, Vec<u8>)> {
+        let mut delay = Duration::from_millis(RETRY_INITIAL_DELAY_MS);
+        let mut attempt = 1;
+        loop {
+            let outcome = self.request_once(method, path, query, body, extra_headers, key_for_errors);
+            let retryable = match &outcome {
+                Err(BlobError::Backend { .. }) => true,
+                Ok((status, _)) => *status == 429 || (500..600).contains(status),
+                _ => false,
+            };
+            if !retryable || attempt >= RETRY_ATTEMPTS {
+                if attempt > 1 {
+                    tracing::warn!(
+                        key = key_for_errors,
+                        method,
+                        attempts = attempt,
+                        "object-store request settled after retries"
+                    );
+                }
+                return outcome;
+            }
+            match &outcome {
+                Err(error) => tracing::warn!(
+                    key = key_for_errors, method, attempt, %error,
+                    "object-store request failed; retrying"
+                ),
+                Ok((status, _)) => tracing::warn!(
+                    key = key_for_errors, method, attempt, status,
+                    "object-store request returned a retryable status; retrying"
+                ),
+            }
+            std::thread::sleep(delay);
+            delay = (delay * 4).min(Duration::from_millis(RETRY_MAX_DELAY_MS));
+            attempt += 1;
+        }
+    }
+
+    fn request_once(
         &self,
         method: &str,
         path: &str,
@@ -659,6 +718,36 @@ fn xml_unescape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dead endpoint is the cheapest stand-in for a transient failure: every
+    /// attempt fails to connect. The call must exhaust the retry budget rather
+    /// than give up on the first error, because a single object-store failure
+    /// reaches the Guest as an I/O error and takes its filesystem read-only.
+    #[test]
+    fn a_failing_endpoint_is_retried_before_the_error_is_returned() {
+        let store = AwsS3BlobStore::new(AwsS3Config {
+            // Port 1 refuses immediately, so the elapsed time is the backoff.
+            endpoint: "http://127.0.0.1:1".into(),
+            bucket: "test".into(),
+            region: "us-east-1".into(),
+            access_key: "unused".into(),
+            secret_key: "unused".into(),
+            session_token: None,
+            prefix: String::new(),
+        })
+        .unwrap();
+
+        let started = Instant::now();
+        assert!(matches!(store.get("some-key"), Err(BlobError::Backend { .. })));
+        let elapsed = started.elapsed();
+
+        // 100 ms + 400 ms + 1600 ms + 3000 ms of sleeps between five attempts.
+        let minimum = Duration::from_millis(RETRY_INITIAL_DELAY_MS * 5);
+        assert!(
+            elapsed >= minimum,
+            "expected the retry budget to be spent, got {elapsed:?} (< {minimum:?})"
+        );
+    }
 
     #[test]
     fn malformed_object_key_fails_before_network_io() {

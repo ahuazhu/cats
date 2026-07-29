@@ -32,6 +32,24 @@ A client should tolerate `503` with retry guidance during activation and reconne
 
 The implemented path supports HTTP/1.1 and WebSocket Upgrade with TLS termination at the regional edge. HTTP preserves method, path/query, application headers, response status, and request/response bodies. WebSocket preserves application headers and relays text, binary, ping, pong, and close frames while holding a work lease for the connection. The owning node revalidates Cat ownership and Running state; an old cached route fails closed instead of reaching a different Guest.
 
+## Response size
+
+An HTTP response crosses the hop to the Guest as one piece, and a response of
+16 MiB or more is refused: the caller gets `502` with `node hop status 502 Bad
+Gateway`, immediately and regardless of how healthy the Guest is. A `HEAD`
+whose `Content-Length` declares that much is refused on the declaration alone,
+so the size of a large object cannot be probed that way either.
+
+Serve anything larger with range requests. A one-byte range reports the total
+in `Content-Range`, and chunks below the limit transfer normally:
+
+    curl -sS -r 0-0 -D - -o /dev/null "$URL"   # Content-Range: bytes 0-0/92326622
+    curl -sS -r 0-8388607 "$URL" >> part       # 8 MiB at a time
+
+WebSocket messages are framed the same way and carry the same per-message
+ceiling. For objects that are routinely large, prefer a signed object-storage
+URL over serving them through an Endpoint.
+
 ## Where this stands today
 
 HTTP and WebSocket ingress work: Endpoint addresses, route binding, wake-on-request, and connection-length work leases are in place.

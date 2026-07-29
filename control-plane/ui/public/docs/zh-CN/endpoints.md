@@ -32,6 +32,22 @@
 
 当前实现支持 HTTP/1.1 和 WebSocket Upgrade，并由区域 Edge 终止 TLS。HTTP 会保留 method、path/query、应用 headers、响应状态和请求/响应 body；WebSocket 会保留应用 headers，转发 text、binary、ping、pong、close frame，并在整条连接期间持有 work lease。Owning Node 会重新校验 Cat ownership 与 Running 状态；旧 Route Cache 必须 fail closed，不能到达另一个 Guest。
 
+## 响应大小
+
+HTTP 响应会整体穿过到 Guest 的那一跳，**16 MiB 及以上的响应会被直接拒绝**：
+调用方立刻收到 `502`，响应体为 `node hop status 502 Bad Gateway`，与 Guest
+是否健康无关。`HEAD` 只要声明的 `Content-Length` 达到这个量级也会被拒，因此
+也无法用 HEAD 探测大对象的大小。
+
+更大的内容请用 range 请求。一字节 range 会在 `Content-Range` 里报出总长，
+低于上限的分块可以正常传输：
+
+    curl -sS -r 0-0 -D - -o /dev/null "$URL"   # Content-Range: bytes 0-0/92326622
+    curl -sS -r 0-8388607 "$URL" >> part       # 每次 8 MiB
+
+WebSocket 消息同样分帧，单条消息受同一上限约束。经常需要传输大对象时，优先
+用对象存储的签名 URL，而不是经 Endpoint 提供。
+
 ## 现在支持到哪
 
 HTTP 与 WebSocket 入站已经可用：Endpoint 地址、路由绑定、按请求唤醒和覆盖整条连接的 work lease 都能正常工作。

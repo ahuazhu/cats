@@ -845,13 +845,29 @@ async fn create_cat(
     let route = format!("POST /cats {workspace}/{}", req.name);
     if let Some(key) = idem_key(&headers) {
         if let Some(op_id) = state.store.idempotency_lookup(&key, &route)? {
-            let op = state.store.get_operation(&op_id)?;
-            let cat = state.store.must_get_cat_by_id(&op.resource_id)?;
-            return Ok((
-                StatusCode::ACCEPTED,
-                Json(CatOperationResponse { operation: op, cat }),
-            )
-                .into_response());
+            // Replaying means answering with the cat the original request
+            // created. The record outlives that cat, so once it is deleted the
+            // key would answer 404 for good, and a caller recreating a cat
+            // under the same name could never get past its own earlier
+            // success. Such a record is stale, not a conflict: forget it and
+            // create as if the key had never been seen.
+            let replay = match state.store.find_operation(&op_id)? {
+                Some(op) => state
+                    .store
+                    .find_cat_by_id(&op.resource_id)?
+                    .map(|cat| (op, cat)),
+                None => None,
+            };
+            match replay {
+                Some((operation, cat)) => {
+                    return Ok((
+                        StatusCode::ACCEPTED,
+                        Json(CatOperationResponse { operation, cat }),
+                    )
+                        .into_response());
+                }
+                None => state.store.idempotency_forget(&key, &route)?,
+            }
         }
     }
     if req.expires_at_unix.is_some_and(|at| at <= 0) {
