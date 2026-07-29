@@ -185,6 +185,16 @@ mount -t tmpfs tmpfs /dev/shm -o mode=1777
 mount -t tmpfs tmpfs /run
 mount -t tmpfs tmpfs /tmp -o mode=1777
 
+# The standard /dev file-descriptor names. devtmpfs does not create them and
+# systemd never runs here, so without this a shell's process substitution
+# (`cmd < <(other)`) fails with "/dev/fd/63: No such file or directory" and
+# anything writing to /dev/stdout fails too — both are ordinary idioms, and
+# neither failure names the missing file as the cause.
+ln -sfn /proc/self/fd /dev/fd
+ln -sfn /proc/self/fd/0 /dev/stdin
+ln -sfn /proc/self/fd/1 /dev/stdout
+ln -sfn /proc/self/fd/2 /dev/stderr
+
 hostname cat 2>/dev/null || true
 resize2fs /dev/vda
 
