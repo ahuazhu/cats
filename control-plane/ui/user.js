@@ -86,16 +86,15 @@ function workspaceUrl(workspace) {
 function renderWorkspaceSwitcher() {
   const select = document.querySelector("#workspace-switcher");
   if (!select) return;
-  select.innerHTML = state.workspaces.map((workspace) => {
-    const label = `${workspace.account_display_name} / ${workspace.display_name}`;
-    return `<option value="${escapeHtml(workspace.id)}"${workspace.id === state.activeWorkspaceId ? " selected" : ""}>${escapeHtml(label)}</option>`;
-  }).join("");
+  select.innerHTML = state.workspaces.length
+    ? state.workspaces.map((workspace) => (
+      `<option value="${escapeHtml(workspace.id)}"${workspace.id === state.activeWorkspaceId ? " selected" : ""}>${escapeHtml(workspace.display_name)}</option>`
+    )).join("")
+    : `<option value="" selected>${escapeHtml(t("user.workspace.none"))}</option>`;
   const workspace = activeWorkspace();
-  const label = workspace
-    ? `${workspace.account_display_name} / ${workspace.display_name}`
+  document.querySelector("#header-workspace").textContent = workspace
+    ? workspace.display_name
     : t("user.workspace.none");
-  document.querySelector("#sidebar-workspace").textContent = label;
-  document.querySelector("#header-workspace").textContent = label;
 }
 
 async function switchWorkspace(workspaceId, { updateUrl = true } = {}) {
@@ -385,6 +384,23 @@ function formatUsdNanos(value, currency = "USD") {
   return `${negative ? "-" : ""}${prefix}${whole.toLocaleString(getLocale())}.${fraction}`;
 }
 
+// Wallet amounts read as money, not as a rated quantity: two decimals, floored
+// toward negative infinity so the displayed figure never claims more spendable
+// credit than the ledger holds. Usage and rates keep the sub-cent precision of
+// formatUsdNanos.
+function formatUsdBalance(value, currency = "USD") {
+  const decimal = String(value ?? "0");
+  const nanos = /^-?\d+$/.test(decimal) ? BigInt(decimal) : 0n;
+  const nanosPerCent = 10_000_000n;
+  let cents = nanos / nanosPerCent;
+  if (nanos < 0n && nanos % nanosPerCent !== 0n) cents -= 1n;
+  const negative = cents < 0n;
+  const magnitude = negative ? -cents : cents;
+  const fraction = (magnitude % 100n).toString().padStart(2, "0");
+  const prefix = currency === "USD" ? "$" : `${currency} `;
+  return `${negative ? "-" : ""}${prefix}${(magnitude / 100n).toLocaleString(getLocale())}.${fraction}`;
+}
+
 function billingMeter(metric) {
   return BILLING_METERS[metric] || {
     name: () => metric,
@@ -431,10 +447,10 @@ function renderBillingBalance() {
     note.textContent = t("user.billing.topup.loading");
     return;
   }
-  available.textContent = formatUsdNanos(balance.available_credit_nanos, balance.currency);
-  totalCredit.textContent = formatUsdNanos(balance.credit_nanos, balance.currency);
+  available.textContent = formatUsdBalance(balance.available_credit_nanos, balance.currency);
+  totalCredit.textContent = formatUsdBalance(balance.credit_nanos, balance.currency);
   totalUsage.textContent = formatUsdNanos(balance.provisional_usage_nanos, balance.currency);
-  signupCredit.textContent = formatUsdNanos(balance.signup_credit_nanos, balance.currency);
+  signupCredit.textContent = formatUsdBalance(balance.signup_credit_nanos, balance.currency);
   status.textContent = balance.status === "payment_required"
     ? t("user.billing.balance.exhausted")
     : t("user.billing.balance.active");
