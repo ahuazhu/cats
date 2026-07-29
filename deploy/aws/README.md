@@ -39,7 +39,16 @@ manually.
 Production worker releases use the Terraform-managed artifact bucket,
 Secrets Manager secret and SSM State Manager association. The bundle digest is
 verified before installing `cats-noded`, `cats-blockd`, `cats-guest-agent` and
-the systemd unit. `metal/install-worker.sh` remains a bootstrap/development
+the systemd unit. **The bundle carries binaries only — not the Guest
+boot artifacts.** A change to the golden root (`metal/build-guest-image.sh`,
+`cats-init`, or anything the Guest Agent needs baked into `rootfs.ext4`) does
+not ship with a worker release: rebuild the image on the Host with
+`OUT=/opt/cats/guest metal/build-guest-image.sh` — the Guest kernel is the
+Host's own, which is why this is not a CI artifact — and then restart
+`cats-worker`. The restart is required, not cosmetic: `ensure_image_published`
+caches the golden root's image id for the life of the node process, so a
+rebuilt image is otherwise ignored. Existing Cats keep their current root until
+they are recreated. `metal/install-worker.sh` remains a bootstrap/development
 helper. Cloud Hypervisor stays under `/opt/cats/bin` so it does not replace a
 host-wide binary used by another workload. The S3 adapter uses the EC2
 instance role and refreshes its temporary credentials; no long-lived AWS key is
