@@ -57,6 +57,22 @@ Creation also creates the RootDisk and enables work-driven auto-suspend by defau
 
 `exec` wakes a Suspended, Warm, or Cold Cat when necessary. Arguments after `--` become the Guest command argv; shell syntax only works when you explicitly invoke a shell as in the second example.
 
+## What the Guest kernel provides
+
+The Guest runs a purpose-built minimal kernel: virtio block, network and vsock, ext4 — and no loadable modules (`/lib/modules` is empty, there is no `modprobe`). Two absences surprise ordinary Linux software:
+
+- **no overlayfs** — container runtimes cannot use their default `overlay2`/`fuse-overlayfs` storage driver;
+- **no nf_tables** — `iptables` fails with `Failed to initialize nft: Protocol not supported`, so nothing can create NAT or filter chains.
+
+Both are avoidable rather than fatal. A container runtime works inside a Cat when it stops relying on either:
+
+    dockerd --storage-driver=vfs --iptables=false --ip6tables=false --bridge=none
+    docker run --network host ...
+
+With host networking the containers share the Cat's own network namespace: they reach each other over `127.0.0.1` instead of the runtime's DNS, and a container listening on `0.0.0.0:8080` is served by the Cat's endpoint with no port publishing. `vfs` copies each image layer instead of stacking it, so size the RootDisk for the images you load.
+
+Loopback itself is configured: `lo` is up with `127.0.0.1/8`, so localhost between processes works normally.
+
 ## Manage work-driven auto-suspend
 
     cats sleep on dev
