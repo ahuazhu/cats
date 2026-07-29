@@ -958,6 +958,7 @@ impl ChunkEngine {
     /// Shared by the commit path and by provisioning from a shared base image,
     /// which differ only in where the chunk refs came from — everything about
     /// durability, fencing and the CAS is the same, and must stay that way.
+    #[allow(clippy::too_many_arguments)]
     fn publish_map(
         &self,
         txn: &str,

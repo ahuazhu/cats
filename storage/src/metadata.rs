@@ -69,6 +69,7 @@ pub trait MetadataStore: Send + Sync {
     /// commit publishes several packs under one swap by jumping more than one
     /// step (ADR-0021 follow-up). The compare stays on `expected_generation`,
     /// so the fencing and lineage semantics are unchanged.
+    #[allow(clippy::too_many_arguments)]
     fn cas_head(
         &self,
         volume_id: &str,
