@@ -71,9 +71,12 @@ pub enum DurabilityMode {
 }
 
 /// Staged packs a relaxed volume may accumulate before FLUSH stops acking
-/// locally and drains inline. The cap turns an object-store outage into
-/// strict-like latency instead of an unbounded loss window.
-pub const MAX_STAGED_PACKS: usize = 16;
+/// locally. Past the cap a FLUSH waits for the committer to pop a batch
+/// (bounded by one publish round) — or drains inline when no committer runs —
+/// so an object-store outage degrades latency instead of growing the loss
+/// window. Batched publishing keeps a drain round flat-cost, which is what
+/// lets the cap sit this high.
+pub const MAX_STAGED_PACKS: usize = 64;
 
 /// Queue depth past which a relaxed stage kicks the committer instead of
 /// letting packs sit until the timer. Above one so the single-pack case (an
@@ -166,6 +169,9 @@ pub struct ChunkEngine {
     /// provisioning — takes `flush_lock` first, then this.
     publish_lock: Mutex<()>,
     staged: Mutex<StagedQueue>,
+    /// Signaled (with `staged` held) whenever a drain pops a batch, so a FLUSH
+    /// blocked on the backpressure cap wakes as soon as there is room.
+    staged_space: Condvar,
     fenced: AtomicBool,
     epoch: i64,
     /// Signals the lease-renewal thread to stop, and wakes it so a detach does not
@@ -266,6 +272,7 @@ impl ChunkEngine {
             io_gate: RwLock::new(()),
             flush_lock: Mutex::new(()),
             publish_lock: Mutex::new(()),
+            staged_space: Condvar::new(),
             staged: Mutex::new(StagedQueue {
                 packs: std::collections::VecDeque::new(),
                 next_base: 0,
@@ -710,9 +717,49 @@ impl ChunkEngine {
         };
         match self.cfg.durability {
             DurabilityMode::Strict => self.drain_staged(),
+            DurabilityMode::Relaxed { drain_interval_ms }
+                if backlog > MAX_STAGED_PACKS && drain_interval_ms > 0 =>
+            {
+                // Parked, not conscripted: joining the drain itself would put
+                // this FLUSH in a publish_lock convoy behind every other
+                // capped FLUSH — the exact pathology sustained fsync load
+                // showed in production (fsync floor rose to a full publish
+                // round, p90 to several).
+                self.wait_for_staging_space()?;
+                Ok(self.staged.lock().unwrap().next_base)
+            }
             DurabilityMode::Relaxed { .. } if backlog > MAX_STAGED_PACKS => self.drain_staged(),
             DurabilityMode::Relaxed { .. } => Ok(self.staged.lock().unwrap().next_base),
         }
+    }
+
+    /// A FLUSH past the backpressure cap parks here until the committer pops
+    /// a batch, so it stalls for at most about one publish round. Falls back
+    /// to an inline drain if no room appears — a wedged committer (store
+    /// outage) must not park guest FLUSHes forever.
+    fn wait_for_staging_space(&self) -> Result<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut staged = self.staged.lock().unwrap();
+        while staged.packs.len() > MAX_STAGED_PACKS {
+            self.kick_committer();
+            if std::time::Instant::now() >= deadline {
+                drop(staged);
+                self.drain_staged()?;
+                return Ok(());
+            }
+            let (guard, _timeout) = self
+                .staged_space
+                .wait_timeout(staged, Duration::from_millis(100))
+                .unwrap();
+            staged = guard;
+        }
+        Ok(())
+    }
+
+    fn kick_committer(&self) {
+        let (lock, cv) = &*self.committer_signal;
+        lock.lock().unwrap().kick = true;
+        cv.notify_all();
     }
 
     /// Freeze the dirty set and write it as a pending pack on local disk.
@@ -803,9 +850,7 @@ impl ChunkEngine {
             if backlog > EAGER_DRAIN_WATERMARK {
                 // A burst is forming: drain continuously instead of letting
                 // the queue climb toward the backpressure cap on the timer.
-                let (lock, cv) = &*self.committer_signal;
-                lock.lock().unwrap().kick = true;
-                cv.notify_all();
+                self.kick_committer();
             }
         }
         crashpoint::maybe_crash(crashpoint::AFTER_PACK);
@@ -820,60 +865,73 @@ impl ChunkEngine {
     /// their frozen sets were cleared, but the pack files and the persistent
     /// bitmap survive, so neither a retry nor a restart can lose the data.
     pub fn drain_staged(&self) -> Result<i64> {
-        let _publish = self.publish_lock.lock().unwrap();
         loop {
-            // Batch the queue: one upload wave, one CAS, however many packs
-            // are waiting — bounded by bytes so a run of dense commits does
-            // not pull gigabytes of payload into memory at once.
-            let snapshot: Vec<(String, PathBuf)> = {
-                let staged = self.staged.lock().unwrap();
-                staged
-                    .packs
-                    .iter()
-                    .map(|p| (p.txn.clone(), p.path.clone()))
-                    .collect()
-            };
-            if snapshot.is_empty() {
+            if self.drain_one_batch()? {
                 return Ok(self.generation());
             }
-            let mut decoded: Vec<(PackHeader, Vec<u8>)> = Vec::new();
-            let mut batched_bytes = 0usize;
-            for (txn, path) in &snapshot {
-                let bytes = fs::read(path)?;
-                batched_bytes += bytes.len();
-                let (header, payload) = format::decode_pack(&bytes)
-                    .map_err(|e| EngineError::Corrupt(format!("staged pack {txn}: {e}")))?;
-                decoded.push((header, payload));
-                if batched_bytes >= MAX_BATCH_BYTES {
-                    break;
-                }
-            }
-            let (base_map, base_leaves) = {
-                let st = self.state.lock().unwrap();
-                (st.map.clone(), st.leaf_refs.clone())
-            };
-            let packs: Vec<(&PackHeader, &[u8])> = decoded
+        }
+    }
+
+    /// Publish one batch under one `publish_lock` hold; returns true once the
+    /// queue is empty. The lock is released between batches so a parked FLUSH
+    /// or a GC scan never waits out an entire multi-batch drain.
+    fn drain_one_batch(&self) -> Result<bool> {
+        let _publish = self.publish_lock.lock().unwrap();
+        // Batch the queue: one upload wave, one CAS, however many packs are
+        // waiting — bounded by bytes so a run of dense commits does not pull
+        // gigabytes of payload into memory at once.
+        let snapshot: Vec<(String, PathBuf)> = {
+            let staged = self.staged.lock().unwrap();
+            staged
+                .packs
                 .iter()
-                .map(|(header, payload)| (header, payload.as_slice()))
-                .collect();
-            match self.commit_pack_batch(&packs, base_map, base_leaves) {
-                Ok(_) => {
-                    for (header, _) in &decoded {
-                        self.finish_committed_pack(header)?;
-                    }
-                    let mut staged = self.staged.lock().unwrap();
-                    for _ in 0..decoded.len() {
-                        staged.packs.pop_front();
-                    }
+                .map(|p| (p.txn.clone(), p.path.clone()))
+                .collect()
+        };
+        if snapshot.is_empty() {
+            return Ok(true);
+        }
+        let mut decoded: Vec<(PackHeader, Vec<u8>)> = Vec::new();
+        let mut batched_bytes = 0usize;
+        for (txn, path) in &snapshot {
+            let bytes = fs::read(path)?;
+            batched_bytes += bytes.len();
+            let (header, payload) = format::decode_pack(&bytes)
+                .map_err(|e| EngineError::Corrupt(format!("staged pack {txn}: {e}")))?;
+            decoded.push((header, payload));
+            if batched_bytes >= MAX_BATCH_BYTES {
+                break;
+            }
+        }
+        let (base_map, base_leaves) = {
+            let st = self.state.lock().unwrap();
+            (st.map.clone(), st.leaf_refs.clone())
+        };
+        let packs: Vec<(&PackHeader, &[u8])> = decoded
+            .iter()
+            .map(|(header, payload)| (header, payload.as_slice()))
+            .collect();
+        match self.commit_pack_batch(&packs, base_map, base_leaves) {
+            Ok(_) => {
+                for (header, _) in &decoded {
+                    self.finish_committed_pack(header)?;
                 }
-                Err(e) => {
-                    if matches!(e, EngineError::Meta(MetaError::CasConflict { .. }))
-                        || matches!(e, EngineError::Meta(MetaError::Fenced))
-                    {
-                        self.fenced.store(true, Ordering::SeqCst);
-                    }
-                    return Err(e);
+                let mut staged = self.staged.lock().unwrap();
+                for _ in 0..decoded.len() {
+                    staged.packs.pop_front();
                 }
+                drop(staged);
+                // Room just opened up: wake any FLUSH parked on the cap.
+                self.staged_space.notify_all();
+                Ok(false)
+            }
+            Err(e) => {
+                if matches!(e, EngineError::Meta(MetaError::CasConflict { .. }))
+                    || matches!(e, EngineError::Meta(MetaError::Fenced))
+                {
+                    self.fenced.store(true, Ordering::SeqCst);
+                }
+                Err(e)
             }
         }
     }
@@ -2404,9 +2462,94 @@ mod tests {
         println!("slow-store burst flush latencies (ms): {lat_ms:?}");
         let max = lat_ms.iter().max().copied().unwrap_or(0);
         assert!(
-            max < 1_000,
-            "a flush stalled for {max} ms; the serial per-pack drain is back"
+            max < 300,
+            "a flush stalled for {max} ms; a flush below the cap must never \
+             touch the publish path"
         );
+        e.detach();
+    }
+
+    /// Sustained fsync load past the cap: the production regression had every
+    /// FLUSH join a publish_lock convoy (fsync floor = one full publish round,
+    /// p90 = several). A capped FLUSH must now park for about one batch round.
+    #[test]
+    fn a_capped_flush_parks_for_one_round_instead_of_joining_a_convoy() {
+        struct SlowBlob {
+            inner: Arc<dyn BlobStore>,
+        }
+        impl BlobStore for SlowBlob {
+            fn put_immutable(&self, k: &str, d: &[u8]) -> cats_storage::blob::Result<()> {
+                std::thread::sleep(Duration::from_millis(100));
+                self.inner.put_immutable(k, d)
+            }
+            fn get(&self, k: &str) -> cats_storage::blob::Result<Vec<u8>> {
+                self.inner.get(k)
+            }
+            fn exists(&self, k: &str) -> cats_storage::blob::Result<bool> {
+                self.inner.exists(k)
+            }
+            fn delete(&self, k: &str) -> cats_storage::blob::Result<()> {
+                self.inner.delete(k)
+            }
+            fn list(&self, p: &str) -> cats_storage::blob::Result<Vec<String>> {
+                self.inner.list(p)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStore> = Arc::new(SlowBlob {
+            inner: Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap()),
+        });
+        let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+        meta.create_volume(VOL, SIZE).unwrap();
+        let mut cfg = EngineConfig::new(VOL, dir.path().join("data"), "attA");
+        cfg.durability = DurabilityMode::Relaxed {
+            drain_interval_ms: 3_600_000,
+        };
+        let e = ChunkEngine::attach(cfg, blob, meta).unwrap();
+
+        let mut lat_ms = Vec::new();
+        for i in 0..80u32 {
+            e.write((i as u64 % 8) * CHUNK_SIZE as u64, &pattern(4096, i as u8))
+                .unwrap();
+            let t0 = std::time::Instant::now();
+            e.flush().unwrap();
+            lat_ms.push(t0.elapsed().as_millis());
+        }
+        let max = lat_ms.iter().max().copied().unwrap_or(0);
+        println!("capped burst: max flush {max} ms, tail {:?}", &lat_ms[64..]);
+        assert!(
+            max < 3_000,
+            "a capped flush stalled {max} ms; parking should bound it near one \
+             batch round"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while e.generation() < 80 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "committer never converged: generation {}",
+                e.generation()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        e.detach();
+    }
+
+    #[test]
+    fn cap_overflow_without_a_committer_still_drains_inline() {
+        let env = env();
+        let e = attach_relaxed(&env, "attA");
+        for i in 0..70u32 {
+            e.write((i as u64 % 8) * CHUNK_SIZE as u64, &pattern(4096, i as u8))
+                .unwrap();
+            e.flush().unwrap();
+        }
+        // Flushes past the cap fell back to inline batched drains (interval 0
+        // means no committer to park behind), and nothing was lost.
+        assert_eq!(e.drain_staged().unwrap(), 70);
+        let mut back = vec![0u8; 4096];
+        e.read((69 % 8) * CHUNK_SIZE as u64, &mut back).unwrap();
+        assert_eq!(back, pattern(4096, 69));
         e.detach();
     }
 
