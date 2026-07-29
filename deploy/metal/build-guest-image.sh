@@ -188,6 +188,13 @@ mount -t tmpfs tmpfs /tmp -o mode=1777
 hostname cat 2>/dev/null || true
 resize2fs /dev/vda
 
+# Loopback. cats-init execs the Agent directly, so systemd-networkd never runs
+# and `lo` would stay DOWN: 127.0.0.1 is then unassignable and every program
+# that binds or dials it fails ("cannot assign requested address"). Ordinary
+# Linux software assumes loopback exists — containerd's CRI plugin, database
+# clients on localhost, health probes.
+ip link set dev lo up
+
 # The Node encodes the assigned /30 Guest address in the final four bytes of
 # the locally administered MAC. This avoids DHCP on the Cold path while still
 # allowing every Cat to have an isolated tap and default route.
