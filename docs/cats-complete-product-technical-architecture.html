@@ -631,8 +631,8 @@ COMMIT;
           <thead><tr><th>Guest 操作</th><th>Host 行为</th><th>返回成功条件</th><th>Host 丢失后的保证</th></tr></thead>
           <tbody>
             <tr><td>普通 WRITE</td><td>写入本地 cache，先保守标记 dirty</td><td>数据已进入受管理本地写缓存</td><td>如果还没有 FLUSH，允许丢失</td></tr>
-            <tr><td>FUA WRITE</td><td>按协商能力作为带持久屏障的写处理</td><td>对应数据达到远端 durable root</td><td>必须恢复</td></tr>
-            <tr><td>FLUSH</td><td>冻结当前 dirty set，创建 immutable Pending Commit Pack，上传并原子发布 root</td><td>远端对象和权威 root/metadata 提交完成</td><td>必须恢复；可以重复执行同一 transaction</td></tr>
+            <tr><td>FUA WRITE</td><td>按盘的 durability 模式作为持久屏障</td><td>Strict：远端 root；Relaxed：本地 immutable pack</td><td>Strict 必须恢复；Relaxed 从远端水位恢复</td></tr>
+            <tr><td>FLUSH</td><td>冻结 dirty set 并持久化 Pending Pack；后台按序上传并 CAS root</td><td>Strict：R == L；Relaxed：本地水位 L 前进</td><td>Strict Host-loss RPO 0；Relaxed 可丢故障时 L-R</td></tr>
             <tr><td>READ hit</td><td>从 NVMe clean/dirty cache 返回</td><td>校验内存/本地元数据成功</td><td>不影响持久状态</td></tr>
             <tr><td>READ miss</td><td>按 LBA map 从对象存储 lazy GET，校验后进入 clean cache</td><td>下载和 checksum 通过</td><td>无需下载整块逻辑盘</td></tr>
             <tr><td>DISCARD/TRIM</td><td>更新 sparse map / punch hole，后续随 FLUSH 发布</td><td>按 negotiated 语义完成</td><td>成功 FLUSH 后不再要求保留被 trim 的逻辑内容</td></tr>
@@ -641,6 +641,7 @@ COMMIT;
       </div>
 
       <div class="callout orange"><strong>不是完整 WAL：</strong>V1 使用 Dirty Bitmap + 每次 FLUSH 的 immutable Pending Commit Pack。它固定屏障前的数据集合，让屏障后的新写入进入下一组 dirty set。只有当产品要求“所有已 ACK 但未 FLUSH 的普通写在 Host 永久损坏后也不丢”时，才需要跨 Host 复制的低延迟 WAL；单机 NVMe WAL 不能解决 Host 丢失。</div>
+      <div class="callout green"><strong>ADR-0022 双水位：</strong>L 是本地 NVMe durable generation，R 是 S3 + PostgreSQL durable generation，始终 R ≤ L。Relaxed Guest WRITE/FLUSH 不执行 S3/DB 调用；R &lt; L 时 pending 不是 cache，Stop/Warm/Snapshot/Detach/计划迁移必须 drain 到 R == L 才能清理源。</div>
 
       <h3 style="margin-top:28px">10.2 两种后端的边界</h3>
       <div class="table-wrap">
@@ -784,7 +785,7 @@ score(node) =
         <div class="metric"><strong>99.9%</strong><span>目标：Resource API 月可用性</span></div>
         <div class="metric"><strong>&lt; 1s P99</strong><span>目标：Suspended → Running</span></div>
         <div class="metric"><strong>&lt; 30s P99</strong><span>目标：Cold → shell ready（标准镜像）</span></div>
-        <div class="metric"><strong>RPO 0*</strong><span>*对成功返回的磁盘 FLUSH，区域内设计目标</span></div>
+        <div class="metric"><strong>RPO 0*</strong><span>*只适用于 Strict；Relaxed RPO 是故障时实际 L-R</span></div>
       </div>
 
       <h3 style="margin-top:28px">14.1 故障矩阵</h3>
@@ -794,13 +795,13 @@ score(node) =
           <tbody>
             <tr><td>单 API Pod</td><td>重试一次请求</td><td>LB 切换；幂等键返回原 Operation</td><td>事务已提交则不重复；未提交则无变化</td></tr>
             <tr><td>Controller Pod</td><td>长操作暂缓</td><td>reconcile lease 到期，其他副本接管并读取当前状态</td><td>不影响运行中 I/O</td></tr>
-            <tr><td>PostgreSQL 主库</td><td>新变更/FLUSH root CAS 暂停</td><td>托管 HA failover；客户端重连</td><td>同步提交的控制 metadata 不丢；写路径回压</td></tr>
+            <tr><td>PostgreSQL 主库</td><td>控制变更/远端 publish 暂停</td><td>托管 HA failover；有界排队、deadline、重连</td><td>Strict 等待/失败；Relaxed 本地 ACK 到配额水位后背压</td></tr>
             <tr><td>Event Bus</td><td>操作唤醒延迟</td><td>Outbox 保留；Controller 周期扫描补偿</td><td>数据库仍是权威状态</td></tr>
             <tr><td>Edge 实例</td><td>部分连接断开</td><td>LB 切换；客户端重连，route cache 重建</td><td>无磁盘影响</td></tr>
             <tr><td>cat-agent</td><td>该 Node 新管理操作暂停；Guest 可继续运行</td><td>systemd 重启；与 VMM 实际状态重建 inventory</td><td>块后端独立存活时 I/O 继续</td></tr>
-            <tr><td>单 VMM</td><td>一个 Cat 中断</td><td>同 Node 重启或重新调度</td><td>从最后 FLUSH 的 RootDisk 恢复；未 flush 写可丢</td></tr>
-            <tr><td>整台 Node</td><td>该 Node 上 Cat 连接中断</td><td>云 fencing/Node lease 确认后，在其他 Node 批量冷恢复</td><td>成功 FLUSH 的磁盘恢复；RAM 丢失</td></tr>
-            <tr><td>对象存储限流</td><td>冷读和 FLUSH 变慢</td><td>指数退避、并发整形、clean cache 继续读；dirty 达上限后回压 Guest</td><td>绝不能在远端未持久时返回 FLUSH 成功</td></tr>
+            <tr><td>单 VMM/blockd</td><td>一个 Cat 中断</td><td>同 Host 从 pending 重建 blockd，必要时重启 VMM</td><td>Relaxed 重建 L 后后台发布，不在 attach 阶段做远端写</td></tr>
+            <tr><td>整台 Node</td><td>该 Node 上 Cat 连接中断</td><td>云 fencing 后在其他 Node 批量冷恢复</td><td>Strict 恢复成功 FLUSH；Relaxed 恢复到 R，丢故障时 L-R；RAM 丢失</td></tr>
+            <tr><td>对象存储限流</td><td>冷读/Strict FLUSH 变慢；Relaxed 积压增长</td><td>publisher 重试、clean cache 淘汰；只剩 pin 后背压</td><td>Relaxed 不向 ext4 注入普通远端错误；drain 失败不清理源</td></tr>
             <tr><td>区域故障</td><td>V1 服务中断</td><td>按灾备 Runbook 恢复控制面与副本</td><td>取决于跨 Region 复制；V1 不承诺 RPO 0</td></tr>
           </tbody>
         </table>
@@ -830,7 +831,7 @@ score(node) =
             <tr><td>Scheduler</td><td>pending、filter reason、reservation、placement latency</td><td>候选数、最终 score、拒绝原因</td><td>无容量、偏斜、reservation 泄漏</td></tr>
             <tr><td>Node/VMM</td><td>CPU、RSS、steal、VM exits、boot time、cgroup throttling</td><td>VMM event、agent job、kernel error</td><td>KVM error、NVMe SMART、心跳、VMM crash loop</td></tr>
             <tr><td>网络</td><td>pps/bytes/conns、route lookup、TLS、backend latency、egress</td><td>route epoch、endpoint、reset reason</td><td>route miss、旧 epoch、连接耗尽、错误率</td></tr>
-            <tr><td>存储</td><td>IOPS、latency、cache hit、dirty bytes、FLUSH、GET/PUT、GC</td><td>generation、txn、lease、checksum</td><td>dirty 高水位、FLUSH 超时、stale writer、checksum failure</td></tr>
+            <tr><td>存储</td><td>IOPS、local/remote FLUSH、cache hit、allocated/accounted/max local bytes、GET/PUT、GC</td><td>local/remote generation、unpublished bytes/age、publish error、lease epoch</td><td>积压不收敛、物理/预留水位、backpressure、fenced、stale writer、checksum failure</td></tr>
             <tr><td>产品</td><td>create/start success、cold start、shell connect、active cats</td><td>用户可读 operation timeline</td><td>按套餐/Region 的成功率和 SLO burn</td></tr>
           </tbody>
         </table>
@@ -1043,7 +1044,7 @@ NodeJobResult {
         <article class="card"><h3>持久服务</h3><ul><li>S3 兼容对象存储</li><li>JuiceFS + TiKV/合适 HA metadata（首发候选）</li><li>KMS + workload PKI</li><li>OCI Registry</li><li>托管日志/指标/trace backend</li></ul></article>
       </div>
 
-      <div class="callout red"><strong>上线阻断项：</strong>任何成功 FLUSH 在删除整台 Host 后不能恢复；旧 Attachment epoch 仍能写；同一 PersistentDisk 能出现两个 writer；Route 能跨租户或落到旧 Guest；API 重试能创建重复资源；Secret 出现在日志；Node 升级没有 drain/rollback；或无法从备份恢复 PostgreSQL。</div>
+      <div class="callout red"><strong>上线阻断项：</strong>Strict 成功 FLUSH 在删除 Host 后不能恢复；Relaxed 无法报告实际 L-R，或强制 drain 失败仍删除源；旧 Attachment epoch 仍能写；同一 PersistentDisk 能出现两个 writer；Route 能跨租户或落到旧 Guest；Node 升级没有 drain/rollback；或无法从备份恢复 PostgreSQL。</div>
     </section>
 
     <section id="validation">
@@ -1057,7 +1058,7 @@ NodeJobResult {
             <tr><td>Unit / property</td><td>状态机、RBAC、quota、scheduler、Map、bitmap、serialization、错误分类</td><td>覆盖率、随机种子、失败最小样例</td></tr>
             <tr><td>API contract</td><td>CLI/API/UI parity、Idempotency、If-Match、operation、pagination、tenant scope</td><td>OpenAPI diff、兼容测试、越权用例</td></tr>
             <tr><td>Node integration</td><td>真实 CH、vsock、tap、vhost-user-blk、cgroup、Guest Agent</td><td>版本矩阵、boot logs、性能分布</td></tr>
-            <tr><td>Storage crash</td><td>kill -9 blockd/agent/VMM/Host；S3 timeout；DB failover；FLUSH 各阶段崩溃</td><td>恢复 generation、fsck、digest、orphan 清单</td></tr>
+            <tr><td>Storage crash</td><td>kill -9 blockd/agent/VMM/Host；S3 timeout；DB failover；双水位各阶段崩溃；强制 drain 失败</td><td>恢复 local/remote generation、实际 RPO、fsck、digest、源状态与 orphan 清单</td></tr>
             <tr><td>Multi-node</td><td>cordon/drain、Node Lost、route rebinding、RWO fencing、恢复风暴</td><td>timeline、旧 epoch 拒绝、连接错误率</td></tr>
             <tr><td>Workload</td><td>git clone/checkout/status、apt/npm/pip、SQLite/PostgreSQL client、编译、大量小文件</td><td>wall time、IOPS、PUT/GET、写放大、FLUSH P99</td></tr>
             <tr><td>Security</td><td>Guest escape 面、SSRF、metadata access、path traversal、token replay、cross-tenant route/disk</td><td>威胁模型、渗透报告、修复追踪</td></tr>
