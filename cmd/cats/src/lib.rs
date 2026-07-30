@@ -480,17 +480,46 @@ fn resolve_workspace_id(
     Ok(matched.id.clone())
 }
 
+/// Time left before the control plane deletes this cat, shortest readable
+/// form. Every listing carries it: an expiry destroys data on its own, so it
+/// must not be something you only see when you go looking for it.
+fn expires_in(cat: &Cat) -> String {
+    match cat.expires_at_unix {
+        None => "never".to_string(),
+        Some(at) => time_left(at - unix_now()),
+    }
+}
+
+/// Shortest readable form of a countdown, `overdue` once it has run out.
+fn time_left(secs: i64) -> String {
+    if secs <= 0 {
+        return "overdue".to_string();
+    }
+    let (days, hours, minutes) = (secs / 86_400, secs % 86_400 / 3_600, secs % 3_600 / 60);
+    if days > 0 {
+        format!("{days}d{hours}h")
+    } else if hours > 0 {
+        format!("{hours}h{minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        format!("{secs}s")
+    }
+}
+
 fn print_cat(cat: &Cat, json_mode: bool) {
     if json_mode {
         println!("{}", serde_json::to_string_pretty(cat).unwrap());
     } else {
         println!(
-            "{:<16} {:>4} cpu {:>6} MiB  desired={:<9} observed={:<9} auto-suspend={} node={}",
+            "{:<16} {:>4} cpu {:>6} MiB  desired={:<9} observed={:<9} expires={:<8} \
+             auto-suspend={} node={}",
             cat.name,
             cat.spec.cpus,
             cat.spec.memory_mib,
             format!("{:?}", cat.desired_state).to_lowercase(),
             format!("{:?}", cat.observed_state).to_lowercase(),
+            expires_in(cat),
             if cat.auto_suspend { "on" } else { "off" },
             cat.node_id.as_deref().unwrap_or("-")
         );
@@ -849,10 +878,16 @@ pub fn run(cli: Cli) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&cat)?);
             } else {
                 match cat.expires_at_unix {
-                    Some(unix) => {
-                        let remaining = unix - unix_now();
-                        println!("{} expires at unix {unix} ({remaining}s from now)", cat.name);
-                    }
+                    Some(unix) if unix <= unix_now() => println!(
+                        "{} expires at unix {unix}, already past; the control plane \
+                         deletes it on the next tick",
+                        cat.name
+                    ),
+                    Some(unix) => println!(
+                        "{} expires at unix {unix} (in {})",
+                        cat.name,
+                        expires_in(&cat)
+                    ),
                     None => println!("{} never expires", cat.name),
                 }
             }
@@ -1216,6 +1251,17 @@ mod tests {
         assert_eq!(parse_size("512MiB").unwrap(), 512 << 20);
         assert_eq!(parse_size("4KiB").unwrap(), 4096);
         assert!(parse_size("abc").is_err());
+    }
+
+    #[test]
+    fn countdown_formatting() {
+        assert_eq!(time_left(0), "overdue");
+        assert_eq!(time_left(-5), "overdue");
+        assert_eq!(time_left(45), "45s");
+        assert_eq!(time_left(90), "1m");
+        assert_eq!(time_left(3_600), "1h0m");
+        assert_eq!(time_left(28_800), "8h0m");
+        assert_eq!(time_left(90_000), "1d1h");
     }
 
     #[test]

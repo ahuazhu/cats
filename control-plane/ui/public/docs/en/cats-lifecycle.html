@@ -39,12 +39,13 @@ cats sleep on dev</code></pre>
 <p>The same opt-in policy continues a stable Suspended Cat to Warm after 10 minutes, then a stable Warm Cat to Cold after 24 hours. These clocks begin when the observed state is committed, survive control-plane restarts, and are rechecked against live work before each transition. Operators can change or disable the two boundaries with <code>CATS_AUTO_WARM_AFTER_SECONDS</code>/<code>CATS_AUTO_COLD_AFTER_SECONDS</code>; <code>0</code> disables that boundary.</p>
 
 <h2 id="expiry">Absolute expiry</h2>
-<p>A Cat can carry an absolute expiry: once the time passes, the control plane deletes it exactly as <code>cats destroy</code> would. The root disk goes with it; persistent disks survive. Temporary environments (CI previews, demos) get reclaimed without an external sweeper.</p>
-<pre><code>cats create preview --expires-in 28800
-cats expiry preview                 # show
-cats expiry preview --in 28800     # renew: 8 more hours from now
-cats expiry preview --at 1790000000
-cats expiry preview --never        # keep it</code></pre>
+<p>A Cat can carry an absolute expiry: once the time passes, the control plane deletes it exactly as <code>cats destroy</code> would. The root disk goes with it; persistent disks survive. Reclamation happens inside the control plane; nothing outside it has to track the deadline.</p>
+<pre><code>cats create scratch --expires-in 28800
+cats expiry scratch                 # show
+cats expiry scratch --in 28800      # renew: 8 more hours from now
+cats expiry scratch --at 1790000000
+cats expiry scratch --never         # keep it</code></pre>
+<p>Every <code>cats ls</code> row carries <code>expires=</code>: the time left, <code>never</code>, or <code>overdue</code>.</p>
 <p>Renewal writes a new absolute time (<code>PUT /cats/{cat}/expiry</code>), so retries and replays need no special rules. A Cat without an expiry never expires.</p>
 
 <h2 id="connections">Connections and time</h2>
