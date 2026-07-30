@@ -2,7 +2,7 @@
 
 - 状态：Implemented v1
 - 决策依据：[ADR-0009](../decisions/0009-interactive-shell-over-authenticated-websocket.md)
-- 实现：`cmd/cats/src/shell.rs`、`control-plane/src/api.rs`、
+- 实现：`cmd/cats/src/shell.rs`、`control-plane/src/api/sessions.rs`、
   `node-agent/src/server.rs`、`guest/src/lib.rs`
 
 ## 1. 公开连接
