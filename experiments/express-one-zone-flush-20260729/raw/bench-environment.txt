@@ -1,0 +1,15 @@
++ uname -a
+Linux <private-hostname> 6.1.176-223.369.amzn2023.x86_64 #1 SMP PREEMPT_DYNAMIC Fri Jul 24 13:34:27 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
++ rustc --version
+rustc 1.97.1 (8bab26f4f 2026-07-14)
++ nproc
+32
++ curl -s http://169.254.169.254/latest/meta-data/instance-type
++ echo
+
++ curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone-id
++ echo
+
++ date -u
+Wed Jul 29 06:36:00 UTC 2026
+Wed Jul 29 06:36:24 UTC 2026

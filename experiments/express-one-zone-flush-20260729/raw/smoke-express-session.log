@@ -1,0 +1,15 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.12s
+     Running tests/express_smoke.rs (target/release/deps/express_smoke-09069e235ebe965d)
+
+running 1 test
+put_immutable #1: ok
+put_immutable #2 (same bytes): ok (idempotent)
+put_immutable #3 (different bytes): rejected as expected
+get: ok
+exists / not-exists: ok
+list: ok (["volumes/smoke/data/obj-1"])
+delete: ok
+smoke test passed for run prefix smoke-1785306960409
+test full_surface_against_real_bucket ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
