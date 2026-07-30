@@ -4,21 +4,68 @@
 
 The repository contains the full Rust workspace implementation (V1 dev shape) plus architecture documents and validated experiments. Implemented and tested: ChunkStore engine (`blockd/`, spec in `docs/specs/blockd-protocol.md`) with both frontends — NBD (portable) and native vhost-user-blk (Linux, ADR-0015) — provider-neutral storage ports and adapters, workspace-scoped control plane and fleet administration/monitoring, separate embedded user and administrator web consoles with optional WorkOS AuthKit sessions, node agent (FakeVmm plus a Cloud Hypervisor Phase-A path, `--ch-block-path kernel-nbd|vhost-user`), guest agent (Unix socket plus real-Guest vsock), systemd as the default Guest PID 1 with ordinary enabled Linux services (ADR-0023), CLI, endpoint gateway — automated workspace tests include adapter contracts, crash injection, fencing, cross-workspace authorization, AuthKit PKCE/session scopes and refresh, schema migration, node drain and cross-node cold restore, plus Linux-only vhost-user-blk acceptance tests driven by a userspace VMM stand-in (`blockd/tests/vhost_user_blk.rs`). The Cloud Hypervisor path has also passed the 17-check AWS bare-metal acceptance run recorded under `experiments/metal-e2e-20260721/`. Both block paths have now passed the same 22/23 acceptance run on AWS `i4i.metal` with real KVM and Cloud Hypervisor, including Warm `vm.snapshot`/`--restore` state alignment, and a two-node cluster over real S3 + RDS PostgreSQL did cross-node Cold migration 12/12 (`experiments/vhost-user-blk-frontend-20260726/`, `experiments/metal-cluster-20260726/`). Kernel NBD stays the default block path for a measured write-throughput trade-off, not for lack of validation; the flip criteria are in ADR-0015. Concurrent cold launches are no longer serialized node-wide (per-Cat lock always, node-wide lock only for the kernel-NBD device allocation, bounded by a separate launch ceiling) and the commit path parallelizes its copy and hashing (FLUSH 1.6x-1.8x). Delta packs (ADR-0016) and golden roots (ADR-0017) have since landed and are no longer future work: a commit publishes each dirty chunk's dirty 64 KiB pages as a delta object instead of the whole 4 MiB chunk, and the exclusive barrier copies exactly the page set the pack uploads (`copy_planned_pages`), so the "copy only dirty pages" form the earlier note ruled out is what the code now does; a chunk carries at most `MAX_DELTA_LAYERS` (4) deltas over its base, so a cold chunk read fetches at most five objects, and `plan_commit` publishes a fresh full 4 MiB base instead whenever the Guest dirtied more than half the chunk or the chain is full. Root disks are provisioned by referencing a shared, content-addressed image namespace (`images/<image-id>/`, `BaseRef::image`, `ChunkEngine::provision_from_image`) rather than every Cat uploading a byte-identical private copy. NOT yet implemented: tap/overlay Guest networking beyond per-Cat taps, and privilege separation. Do not infer other modules exist because a design document names them; check the workspace.
 
-Quality gates for any change: `cargo test --workspace` green and `cargo clippy --workspace --all-targets` warning-free.
+Quality gates for any change: `./scripts/quality.sh full` green. This checks Rust formatting and shared agent-skill contracts, builds the workspace first, runs Clippy with warnings denied, and then runs all workspace tests. Use `./scripts/quality.sh fast` while iterating.
+
+Shared audit, refactor, and PR-review workflows live canonically under `agent-skills/` and are linked into both `.agents/skills/` and `.claude/skills/`. Keep the audit and review workflows read-only unless the user explicitly asks for fixes.
 
 The vhost-user-blk frontend and the node agent's Linux-only code compile out on macOS, so a change touching either must also be gated on Linux. Without a Linux box, a container is enough (no KVM needed for the protocol tests):
 
 ```bash
-docker run --rm --platform linux/arm64 -v "$PWD":/work -w /work \
-  -v cats-cargo-registry:/usr/local/cargo/registry \
-  -v cats-target-linux:/target rust:1.97-bookworm \
-  sh -c 'rustup component add clippy &&
-         cargo build --workspace --target-dir /target &&
-         cargo clippy --workspace --all-targets --target-dir /target &&
-         cargo test --workspace --target-dir /target'
+./scripts/quality.sh linux
 ```
 
-Keep the target directory in a Docker volume (`/target` above), not in the bind-mounted repository: the shared macOS filesystem is slow and has produced spurious "can't find crate" failures mid-build. `cargo build` must come first because some integration tests shell out to `cargo build` for helper binaries and would otherwise deadlock on the build-directory lock.
+The script keeps the target directory in a Docker volume, not in the bind-mounted repository: the shared macOS filesystem is slow and has produced spurious "can't find crate" failures mid-build. Override the defaults with `CATS_LINUX_PLATFORM`, `CATS_LINUX_TARGET_VOLUME`, or `CATS_LINUX_JOBS` when needed. The Linux gate defaults to two Cargo jobs to avoid parallel linker OOMs in constrained Docker runtimes, and child Cargo processes inherit the same limit. `cargo build` must come first because some integration tests shell out to `cargo build` for helper binaries and would otherwise deadlock on the build-directory lock.
+
+## Working agreement
+
+### Verification
+
+- Run `./scripts/quality.sh fast` while iterating and `./scripts/quality.sh full` before handoff.
+- Report the exact verification commands run and their results.
+- Clearly separate pre-existing failures from regressions introduced by the change.
+- Run `./scripts/quality.sh linux` when a change touches code that compiles out on macOS.
+
+### Change discipline
+
+- Preserve observable behavior unless the task explicitly changes it.
+- Before a non-trivial refactor, identify or add characterization tests.
+- Keep each patch focused on one coherent purpose; do not perform unrelated cleanup.
+- Do not add a production dependency without explaining why the standard library and existing dependencies are insufficient.
+- Do not change public APIs, protocols, persisted formats or lifecycle semantics unless the task requires it.
+- Never silence a lint globally to make CI pass. Keep any new suppression as narrow as possible and document the invariant or reason.
+- Do not introduce an abstraction without a current boundary or multiple real uses.
+
+### Rust conventions
+
+- Fallible input, request, persistence and background-worker paths must return errors rather than panic.
+- Use `unwrap` or `expect` only in tests or for a locally proven invariant that is obvious or documented.
+- Do not hold a mutex or rwlock guard across `.await`, and do not put blocking work directly on an async executor.
+- Prefer enums and domain-specific newtypes over new boolean-flag APIs or string protocols.
+- Default visibility to private or `pub(crate)`; expose only deliberate public API.
+- Avoid cloning data merely to satisfy the borrow checker; document intentionally expensive clones.
+- Keep unsafe code small and isolated. Every unsafe block must explain its safety invariant.
+- Do not leak framework-specific types across a domain or provider-neutral boundary without a concrete reason.
+
+### Testing
+
+- Test externally observable behavior rather than private implementation details.
+- Bug fixes require a regression test that fails before the fix.
+- Refactors must not weaken existing assertions.
+- Parsers, decoders and other untrusted-input boundaries need malformed-input and boundary-value coverage.
+- Concurrency changes must cover cancellation, shutdown and resource cleanup when relevant.
+
+### Review priorities
+
+Review in this order:
+
+1. Correctness and data loss.
+2. Memory safety and concurrency.
+3. Error handling and cancellation.
+4. Public API and architecture boundaries.
+5. Missing tests.
+6. Maintainability.
+
+Do not report formatting issues already covered by Rustfmt or Clippy.
 
 ## Read before implementation
 

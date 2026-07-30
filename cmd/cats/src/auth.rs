@@ -10,14 +10,14 @@ use workos::resources::user_management::AuthenticateWithRefreshTokenParams;
 
 use crate::config::{CliStateLock, Credentials, StoredConfig, DEFAULT_API_URL};
 
-pub struct UserSession {
+pub(crate) struct UserSession {
     pub api_url: String,
     pub access_token: String,
     pub workspace: String,
     pub config: StoredConfig,
 }
 
-pub fn configured_api_url(provided: Option<&str>) -> Result<String> {
+pub(crate) fn configured_api_url(provided: Option<&str>) -> Result<String> {
     if let Some(value) = provided {
         return Ok(normalize_api_url(value));
     }
@@ -26,7 +26,7 @@ pub fn configured_api_url(provided: Option<&str>) -> Result<String> {
         .unwrap_or_else(|| DEFAULT_API_URL.to_string()))
 }
 
-pub fn login(provided_api_url: Option<&str>) -> Result<StoredConfig> {
+pub(crate) fn login(provided_api_url: Option<&str>) -> Result<StoredConfig> {
     let api_url = configured_api_url(provided_api_url)?;
     let http = http_client()?;
     let public: CliAuthConfigResponse = get_json(&http, &format!("{api_url}/auth/config"), None)?;
@@ -109,7 +109,7 @@ pub fn login(provided_api_url: Option<&str>) -> Result<StoredConfig> {
     Ok(config)
 }
 
-pub fn user_session(
+pub(crate) fn user_session(
     provided_api_url: Option<&str>,
     workspace_override: Option<&str>,
 ) -> Result<UserSession> {
@@ -152,7 +152,7 @@ pub fn user_session(
     })
 }
 
-pub fn sync_workspaces(session: &mut UserSession) -> Result<Vec<Workspace>> {
+pub(crate) fn sync_workspaces(session: &mut UserSession) -> Result<Vec<Workspace>> {
     let http = http_client()?;
     let response: ListResponse<Workspace> = get_json(
         &http,
@@ -183,7 +183,10 @@ pub fn sync_workspaces(session: &mut UserSession) -> Result<Vec<Workspace>> {
     Ok(response.items)
 }
 
-pub fn switch_workspace(provided_api_url: Option<&str>, selector: &str) -> Result<Workspace> {
+pub(crate) fn switch_workspace(
+    provided_api_url: Option<&str>,
+    selector: &str,
+) -> Result<Workspace> {
     let mut session = user_session(provided_api_url, None)?;
     sync_workspaces(&mut session)?;
     let _state_lock = CliStateLock::acquire()?;
@@ -234,7 +237,7 @@ fn resolve_workspace(workspaces: &[Workspace], selector: &str) -> Option<Workspa
     matches.next().is_none().then_some(workspace)
 }
 
-pub fn logout(provided_api_url: Option<&str>) -> Result<()> {
+pub(crate) fn logout(provided_api_url: Option<&str>) -> Result<()> {
     let Some(config) = StoredConfig::load()? else {
         return Ok(());
     };

@@ -70,7 +70,7 @@ fn terminal_size() -> (u16, u16) {
         .unwrap_or((24, 80))
 }
 
-pub fn run(base: &str, workspace_id: &str, token: &str, cat: &str) -> Result<()> {
+pub(crate) fn run(base: &str, workspace_id: &str, token: &str, cat: &str) -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("start shell runtime")?;
     let exit_code = runtime.block_on(run_async(base, workspace_id, token, cat))?;
     if exit_code != 0 {

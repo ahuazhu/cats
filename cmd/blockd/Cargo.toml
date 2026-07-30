@@ -8,6 +8,9 @@ publish = false
 [[bin]]
 name = "cats-blockd"
 path = "src/main.rs"
+# The binary name normalizes to the `cats_blockd` library's rustdoc output
+# directory. Document the library API and avoid a Cargo output collision.
+doc = false
 
 [dependencies]
 cats-api = { workspace = true }

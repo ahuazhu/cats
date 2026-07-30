@@ -18,7 +18,7 @@ mod platform {
     const POLL_INTERVAL: Duration = Duration::from_millis(25);
     const SET_SECURITY_ARGS: [&str; 1] = ["-i"];
 
-    pub fn get(service: &str, account: &str) -> Result<Option<String>> {
+    pub(super) fn get(service: &str, account: &str) -> Result<Option<String>> {
         let output = run_security(
             "read Cats login",
             &["find-generic-password", "-s", service, "-wa", account],
@@ -37,7 +37,7 @@ mod platform {
             .context("decode Cats login from macOS Keychain")
     }
 
-    pub fn set(service: &str, account: &str, secret: &str) -> Result<()> {
+    pub(super) fn set(service: &str, account: &str, secret: &str) -> Result<()> {
         let stored = format!("{ENCODING_PREFIX}{}", STANDARD.encode(secret));
         let command = add_command(service, account, &stored)?;
         let output = run_security(
@@ -49,7 +49,7 @@ mod platform {
         ensure_success("save Cats login in macOS Keychain", &output)
     }
 
-    pub fn delete(service: &str, account: &str) -> Result<()> {
+    pub(super) fn delete(service: &str, account: &str) -> Result<()> {
         let output = run_security(
             "delete Cats login",
             &["delete-generic-password", "-s", service, "-a", account],
@@ -221,7 +221,7 @@ mod platform {
 mod platform {
     use anyhow::{Context, Result};
 
-    pub fn get(service: &str, account: &str) -> Result<Option<String>> {
+    pub(super) fn get(service: &str, account: &str) -> Result<Option<String>> {
         let entry = keyring::Entry::new(service, account)
             .context("open the operating-system credential store")?;
         match entry.get_password() {
@@ -231,7 +231,7 @@ mod platform {
         }
     }
 
-    pub fn set(service: &str, account: &str, secret: &str) -> Result<()> {
+    pub(super) fn set(service: &str, account: &str, secret: &str) -> Result<()> {
         let entry = keyring::Entry::new(service, account)
             .context("open the operating-system credential store")?;
         entry
@@ -239,7 +239,7 @@ mod platform {
             .context("save Cats login in credential store")
     }
 
-    pub fn delete(service: &str, account: &str) -> Result<()> {
+    pub(super) fn delete(service: &str, account: &str) -> Result<()> {
         let entry = keyring::Entry::new(service, account)
             .context("open the operating-system credential store")?;
         match entry.delete_credential() {
@@ -249,14 +249,14 @@ mod platform {
     }
 }
 
-pub fn get(service: &str, account: &str) -> Result<Option<String>> {
+pub(crate) fn get(service: &str, account: &str) -> Result<Option<String>> {
     platform::get(service, account)
 }
 
-pub fn set(service: &str, account: &str, secret: &str) -> Result<()> {
+pub(crate) fn set(service: &str, account: &str, secret: &str) -> Result<()> {
     platform::set(service, account, secret)
 }
 
-pub fn delete(service: &str, account: &str) -> Result<()> {
+pub(crate) fn delete(service: &str, account: &str) -> Result<()> {
     platform::delete(service, account)
 }

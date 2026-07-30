@@ -1,0 +1,4 @@
+interface:
+  display_name: "Rust PR Review"
+  short_description: "Review Cats Rust pull requests for merge risks"
+  default_prompt: "Use $rust-pr-review to review this Cats Rust pull request for concrete merge-blocking risks."
