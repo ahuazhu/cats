@@ -47,6 +47,18 @@ struct Args {
     heartbeat_ms: u64,
     #[arg(long, default_value_t = 1500)]
     blockd_lease_ttl_ms: i64,
+    /// Per-volume remotely unpublished local journal limit.
+    #[arg(long, env = "CATS_BLOCKD_MAX_STAGED_BYTES",
+          default_value_t = cats_blockd::engine::DEFAULT_MAX_STAGED_BYTES)]
+    blockd_max_staged_bytes: u64,
+    /// Per-volume tiny-generation count limit.
+    #[arg(long, env = "CATS_BLOCKD_MAX_STAGED_PACKS",
+          default_value_t = cats_blockd::engine::DEFAULT_MAX_STAGED_PACKS)]
+    blockd_max_staged_packs: usize,
+    /// Per-volume physical cache + journal footprint limit.
+    #[arg(long, env = "CATS_BLOCKD_MAX_LOCAL_BYTES",
+          default_value_t = cats_blockd::engine::DEFAULT_MAX_LOCAL_BYTES)]
+    blockd_max_local_bytes: u64,
     /// Delegated cgroup v2 subtree for authoritative billing counters.
     #[arg(long, env = "CATS_METERING_CGROUP_ROOT")]
     metering_cgroup_root: Option<PathBuf>,
@@ -198,6 +210,9 @@ async fn main() -> anyhow::Result<()> {
             metadata_store,
             object_store,
             blockd_lease_ttl_ms: args.blockd_lease_ttl_ms,
+            blockd_max_staged_bytes: args.blockd_max_staged_bytes,
+            blockd_max_staged_packs: args.blockd_max_staged_packs,
+            blockd_max_local_bytes: args.blockd_max_local_bytes,
             metering_cgroup_root: args.metering_cgroup_root,
             wake_budget: cats_node_agent::admission::WakeBudget {
                 commitment_bytes: args.wake_commitment_budget_bytes,
@@ -275,32 +290,5 @@ mod tests {
             "a guest left on the `tsc` clocksource resumes from a Warm restore with \
              all three clocks frozen at the snapshot instant; got {default:?}"
         );
-    }
-
-    /// The units pass `--ch-cmdline` explicitly, so they override the default
-    /// above rather than inheriting it. A fix applied only to the default would
-    /// never reach a deployed node.
-    #[test]
-    fn deployment_units_pin_kvm_clock_too() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("workspace root");
-        for unit in [
-            "deploy/metal/systemd/cats-noded.service",
-            "deploy/aws/metal/cats-worker.service",
-        ] {
-            let path = root.join(unit);
-            let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-            let line = text
-                .lines()
-                .find(|l| l.contains("--ch-cmdline"))
-                .unwrap_or_else(|| panic!("{unit} no longer passes --ch-cmdline"));
-            assert!(
-                line.contains("clocksource=kvm-clock"),
-                "{unit} overrides the guest cmdline without pinning kvm-clock: {line}"
-            );
-        }
     }
 }

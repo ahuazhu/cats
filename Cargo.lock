@@ -1019,6 +1019,7 @@ dependencies = [
  "cats-object-store-file",
  "cats-storage",
  "clap",
+ "serde_json",
  "tempfile",
  "tracing",
  "tracing-subscriber",
@@ -1099,6 +1100,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cats-api",
+ "cats-blockd",
  "cats-control-plane",
  "cats-guest-agent",
  "cats-metadata-store-sqlite",
@@ -1227,6 +1229,7 @@ name = "cats-node-agent-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cats-blockd",
  "cats-metadata-store-postgres",
  "cats-metadata-store-sqlite",
  "cats-node-agent",

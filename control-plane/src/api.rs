@@ -30,9 +30,9 @@ use cats_api::metering::{
 use cats_api::requests::*;
 use cats_api::resources::*;
 use cats_metering::{
-    AttributedCheckpoint, CheckoutIntent, CheckoutPayment, CheckoutRefund,
-    CreditApplyOutcome, IngestOutcome, RateCard, UsageAttribution, UsageInterval,
-    UsageQuery as MeterUsageQuery, UsageView,
+    AttributedCheckpoint, CheckoutIntent, CheckoutPayment, CheckoutRefund, CreditApplyOutcome,
+    IngestOutcome, RateCard, UsageAttribution, UsageInterval, UsageQuery as MeterUsageQuery,
+    UsageView,
 };
 
 use crate::server::AppState;
@@ -162,7 +162,9 @@ async fn check_workspace_auth(
         Some(Principal::WorkspaceAutomation { workspace_id }) => workspace_id == workspace,
         Some(Principal::Service) | None => false,
     };
-    if bearer_allowed || crate::auth::web_session_allows_workspace(state, headers, workspace).await? {
+    if bearer_allowed
+        || crate::auth::web_session_allows_workspace(state, headers, workspace).await?
+    {
         return resolved_scope
             .map(Ok)
             .unwrap_or_else(|| state.store.workspace_scope(workspace))
@@ -393,7 +395,10 @@ pub fn router(state: AppState) -> Router {
             post(cat_action),
         )
         .route("/v1/workspaces/{workspace}/cats/{cat}/exec", post(exec_cat))
-        .route("/v1/workspaces/{workspace}/cats/{cat}/shell", get(shell_cat))
+        .route(
+            "/v1/workspaces/{workspace}/cats/{cat}/shell",
+            get(shell_cat),
+        )
         .route(
             "/v1/workspaces/{workspace}/cats/{cat}/auto-suspend",
             get(get_auto_suspend).put(update_auto_suspend),
@@ -402,7 +407,10 @@ pub fn router(state: AppState) -> Router {
             "/v1/workspaces/{workspace}/cats/{cat}/expiry",
             get(get_expiry).put(update_expiry),
         )
-        .route("/v1/workspaces/{workspace}/cats/{cat}/work", get(get_cat_work))
+        .route(
+            "/v1/workspaces/{workspace}/cats/{cat}/work",
+            get(get_cat_work),
+        )
         .route(
             "/v1/workspaces/{workspace}/cats/{cat}/endpoints",
             post(create_endpoint).get(list_endpoints),
@@ -432,7 +440,10 @@ pub fn router(state: AppState) -> Router {
             post(create_snapshot).get(list_snapshots),
         )
         .route("/v1/operations/{id}", get(get_operation))
-        .route("/v1/workspaces/{workspace}/operations", get(list_operations))
+        .route(
+            "/v1/workspaces/{workspace}/operations",
+            get(list_operations),
+        )
         .route("/v1/nodes/register", post(register_node))
         .route("/v1/nodes/heartbeat", post(heartbeat))
         .route("/v1/nodes/work-status", post(node_work_status))
@@ -442,7 +453,10 @@ pub fn router(state: AppState) -> Router {
             "/v1/internal/usage/checkpoints",
             post(ingest_usage_checkpoints),
         )
-        .route("/v1/workspaces/{workspace}/billing/usage", get(workspace_usage))
+        .route(
+            "/v1/workspaces/{workspace}/billing/usage",
+            get(workspace_usage),
+        )
         .route(
             "/v1/workspaces/{workspace}/billing/balance",
             get(workspace_billing_balance),
@@ -929,7 +943,7 @@ async fn cat_action(
     let cat = state.store.get_cat(&workspace, &cat)?;
     if verb == "sync" {
         // Imperative, not a desired-state change: force every attached disk
-        // to a durable point right now (ADR-0021) and answer once it holds.
+        // to a remote durable point right now (ADR-0022) and answer once it holds.
         return sync_cat(&state, &cat).await;
     }
     let desired = match verb.as_str() {
@@ -1401,9 +1415,10 @@ async fn create_disk(
     if req.size_bytes == 0 || req.size_bytes > cats_api::chunk::MAX_VOLUME_BYTES {
         return Err(ApiError::invalid("disk size out of range").into());
     }
-    let disk = state
-        .store
-        .create_disk(&scope.workspace, &req.name, req.size_bytes, req.durability)?;
+    let disk =
+        state
+            .store
+            .create_disk(&scope.workspace, &req.name, req.size_bytes, req.durability)?;
     // Create the storage volume eagerly so snapshots/resize work pre-attach.
     let size = cats_api::chunk::round_up_to_chunk(req.size_bytes);
     match state.storage_meta.create_volume(&disk.volume_id, size) {
@@ -1617,18 +1632,23 @@ async fn hot_detach(state: &AppState, cat: &Cat, disk: &Disk) -> ApiResult<()> {
     result
 }
 
-/// Force every attached disk of a running cat to a durable point (ADR-0021):
+/// Force every attached disk of a running cat to a remote durable point (ADR-0022):
 /// guest page cache down through the engines, staged packs published. On a
-/// cat that is not running this is a no-op — every transition out of Running
-/// is itself a forced flush point, so the durable state is already current.
+/// Suspended cats can also be synced: they were syncfs'd before pause and their
+/// frozen engines can be remotely drained without resuming. Warm/Cold cats have
+/// already crossed a mandatory drain boundary.
 async fn sync_cat(state: &AppState, cat: &Cat) -> ApiResult<Response> {
-    if cat.observed_state != ObservedState::Running {
+    if !matches!(
+        cat.observed_state,
+        ObservedState::Running | ObservedState::Suspended
+    ) {
         return Ok((StatusCode::OK, Json(cat.clone())).into_response());
     }
     let owner = format!("control_{}", uuid::Uuid::new_v4().simple());
-    let lease = state
-        .store
-        .acquire_work(&cat.id, WorkKind::Control, &owner, "cat_sync", 120_000)?;
+    let lease =
+        state
+            .store
+            .acquire_work(&cat.id, WorkKind::Control, &owner, "cat_sync", 120_000)?;
     let result = async {
         let node = state
             .store
@@ -1654,7 +1674,11 @@ async fn sync_cat(state: &AppState, cat: &Cat) -> ApiResult<Response> {
     .await;
     let _ = state.store.release_work(&lease.id);
     result?;
-    Ok((StatusCode::OK, Json(state.store.must_get_cat_by_id(&cat.id)?)).into_response())
+    Ok((
+        StatusCode::OK,
+        Json(state.store.must_get_cat_by_id(&cat.id)?),
+    )
+        .into_response())
 }
 
 async fn dispatch_or_unavailable(
@@ -1697,6 +1721,24 @@ async fn create_snapshot(
 ) -> ApiResult<Json<Snapshot>> {
     check_workspace_auth(&state, &headers, &workspace).await?;
     let disk = state.store.get_disk(&workspace, &disk)?;
+    if let Some(cat_id) = &disk.bound_cat_id {
+        let cat = state.store.must_get_cat_by_id(cat_id)?;
+        match cat.observed_state {
+            ObservedState::Running | ObservedState::Suspended => {
+                // Snapshot metadata must name the remote watermark, never an
+                // older generation while acknowledged relaxed writes exist
+                // only in a Host-local journal.
+                sync_cat(&state, &cat).await?;
+            }
+            ObservedState::Warm | ObservedState::Cold => {}
+            state => {
+                return Err(ApiError::failed_precondition(format!(
+                    "cannot snapshot disk while its cat is {state:?}"
+                ))
+                .into())
+            }
+        }
+    }
     let snap_id = crate::store::new_id(cats_api::ids::SNAPSHOT_PREFIX);
     let row = state
         .storage_meta
@@ -1956,7 +1998,10 @@ async fn ingest_usage_checkpoints(
                     attribution
                 } else {
                     UsageAttribution {
-                        billing_account_id: billing_account_id_for_workspace(&state, &cat.workspace_id)?,
+                        billing_account_id: billing_account_id_for_workspace(
+                            &state,
+                            &cat.workspace_id,
+                        )?,
                         workspace_id: cat.workspace_id,
                         resource_type: "cat".to_string(),
                         resource_id: checkpoint.cat_id.clone(),
@@ -3220,6 +3265,77 @@ async fn prometheus_metrics(
                 }
                 if let Some(bytes) = cat.host_disk_used_bytes {
                     metric!(format!("cats_cat_host_disk_used_bytes{{{labels}}}"), bytes);
+                }
+                for disk in cat.disk_durability {
+                    let disk_id = disk
+                        .disk_id
+                        .replace('\\', "\\\\")
+                        .replace('\n', "\\n")
+                        .replace('\r', "\\r")
+                        .replace('"', "\\\"");
+                    let mode = disk
+                        .mode
+                        .replace('\\', "\\\\")
+                        .replace('\n', "\\n")
+                        .replace('\r', "\\r")
+                        .replace('"', "\\\"");
+                    let disk_labels = format!("{labels},disk_id=\"{disk_id}\",mode=\"{mode}\"");
+                    metric!(
+                        format!("cats_disk_local_durable_generation{{{disk_labels}}}"),
+                        disk.local_durable_generation
+                    );
+                    metric!(
+                        format!("cats_disk_remote_durable_generation{{{disk_labels}}}"),
+                        disk.remote_durable_generation
+                    );
+                    metric!(
+                        format!("cats_disk_unpublished_generations{{{disk_labels}}}"),
+                        disk.unpublished_generations
+                    );
+                    metric!(
+                        format!("cats_disk_unpublished_bytes{{{disk_labels}}}"),
+                        disk.unpublished_bytes
+                    );
+                    metric!(
+                        format!("cats_disk_oldest_unpublished_age_ms{{{disk_labels}}}"),
+                        disk.oldest_unpublished_age_ms
+                    );
+                    metric!(
+                        format!("cats_disk_max_unpublished_generations{{{disk_labels}}}"),
+                        disk.max_unpublished_generations
+                    );
+                    metric!(
+                        format!("cats_disk_max_unpublished_bytes{{{disk_labels}}}"),
+                        disk.max_unpublished_bytes
+                    );
+                    metric!(
+                        format!("cats_disk_local_allocated_bytes{{{disk_labels}}}"),
+                        disk.local_allocated_bytes
+                    );
+                    metric!(
+                        format!("cats_disk_local_accounted_bytes{{{disk_labels}}}"),
+                        disk.local_accounted_bytes
+                    );
+                    metric!(
+                        format!("cats_disk_max_local_bytes{{{disk_labels}}}"),
+                        disk.max_local_bytes
+                    );
+                    metric!(
+                        format!("cats_disk_evicted_cache_chunks{{{disk_labels}}}"),
+                        disk.evicted_cache_chunks
+                    );
+                    metric!(
+                        format!("cats_disk_backpressured{{{disk_labels}}}"),
+                        u8::from(disk.backpressured)
+                    );
+                    metric!(
+                        format!("cats_disk_fenced{{{disk_labels}}}"),
+                        u8::from(disk.fenced)
+                    );
+                    metric!(
+                        format!("cats_disk_publish_error{{{disk_labels}}}"),
+                        u8::from(disk.last_publish_error.is_some())
+                    );
                 }
             }
         }

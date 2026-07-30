@@ -1,0 +1,4 @@
+phase,cycle,cat_ready_us,service_ready_us,pid_before,pid_after,start_count
+initial,0,19758128,19758128,359,359,1
+warm_restore,0,433533,433533,359,359,1
+cold_restart,0,14236743,14821743,359,302,2

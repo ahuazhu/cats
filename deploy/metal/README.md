@@ -71,10 +71,14 @@ Guest 的 BusyBox 只存在于 initramfs，用来加载 virtio/ext4/vsock 并
 `switch_root`。用户进入的是完整 Ubuntu root，默认包含 `apt`、`curl`、`git`、
 `wget`、`iproute2`、`ping`、`procps`、`nano` 和 OpenSSH client。`cats shell`
 默认启动 login Bash，启用 256 色 prompt、Readline 路径补全和
-`bash-completion`（后续安装的 `gh` 等软件可直接注册自己的补全）。一个负责转发信号
-和回收子进程的轻量 PID 1 会在根盘扩容后直接启动 Guest Agent，Cold 路径无需等待完整
-systemd transaction；systemd 仍保留用于兼容和调试。golden root 默认 512 MiB，
-首次启动会把 ext4 在线扩到用户请求的 RootDisk 大小；因此生产创建建议至少 1 GiB。
+`bash-completion`（后续安装的 `gh` 等软件可直接注册自己的补全）。systemd 是默认
+PID 1，普通 enabled service 会在 `multi-user.target` 正常启动；根盘扩容、确定性的
+tap `/30` 配置和 Guest Agent 是 `sysinit.target` 之前的早期 unit，所以 Agent
+readiness 不等待完整 multi-user transaction。未使用的 serial getty、wait-online 和
+apt timer 已 mask。golden root 默认 512 MiB，首次启动会把 ext4 在线扩到用户请求的
+RootDisk 大小；因此生产创建建议至少 1 GiB。`GUEST_INIT_MODE=direct` 仅用于复现
+历史实验，不是默认产品形态。Guest unit 的源码位于 `guest-systemd/`，镜像构建脚本
+只负责把它们安装到 rootfs。
 
 `cats-noded` 启动时默认探测 Host 的逻辑 CPU 与内存总量作为可调度容量；管理员页面
 同时展示 Host CPU、内存和节点状态目录所在文件系统的实时使用量。若需要给 Host
@@ -86,8 +90,9 @@ systemd transaction；systemd 仍保留用于兼容和调试。golden root 默�
 sudo deploy/metal/e2e.sh
 ```
 
-断言（全部基于**真实内核 boot_id**）：create→Running、guest 内核版本=直接启
-动的内核、DNS/HTTPS 出站、写文件+sync、suspend/resume 同 boot、warm 后无常驻
+断言（全部基于**真实内核 boot_id**）：create→Running、systemd PID 1、
+Guest Agent unit active、guest 内核版本=直接启动的内核、DNS/HTTPS 出站、写文件+sync、
+普通 enabled service 在 Suspend/Warm 不重启、Cold 后恰好再启动一次、warm 后无常驻
 VMM、restore 同 boot 且文件在、stop/start 换 boot 且数据从 durable 层恢复、destroy。
 
 2026-07-21 的 AWS i4i.metal + 真实 S3 验收结果与失败诊断记录保存在

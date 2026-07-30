@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use cats_blockd::engine::{ChunkEngine, EngineConfig};
+use cats_blockd::engine::{ChunkEngine, EngineConfig, EngineError};
 use cats_blockd::nbd::{self, NbdClient};
 use cats_blockd::vhost_user::{self, VhostUserOptions};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
@@ -32,7 +32,7 @@ const VOLUME_SIZE: u64 = 16 * 1024 * 1024;
 /// One engine served by both frontends, mirroring how the node agent runs
 /// `cats-blockd`: vhost-user for the Guest, NBD for seeding and recovery.
 struct Harness {
-    dir: tempfile::TempDir,
+    _dir: tempfile::TempDir,
     engine: Arc<ChunkEngine>,
     meta: Arc<SqliteMetadataStore>,
     vhost_user_socket: PathBuf,
@@ -60,9 +60,8 @@ impl Harness {
         let vhost_user_socket = dir.path().join("vhu.sock");
         let mut listener = vhost_user::bind(&vhost_user_socket, options).expect("bind vhost-user");
         let served = engine.clone();
-        let server = std::thread::spawn(move || {
-            vhost_user::serve_listener(&mut listener, served, options)
-        });
+        let server =
+            std::thread::spawn(move || vhost_user::serve_listener(&mut listener, served, options));
 
         let nbd_socket = dir.path().join("nbd.sock");
         let nbd_listener = UnixListener::bind(&nbd_socket).expect("bind nbd");
@@ -70,7 +69,7 @@ impl Harness {
         std::thread::spawn(move || nbd::serve_unix(nbd_listener, nbd_engine));
 
         Self {
-            dir,
+            _dir: dir,
             engine,
             meta,
             vhost_user_socket,
@@ -121,12 +120,24 @@ impl Harness {
     /// Drop the frontend and confirm the backend treats the disconnect as a
     /// clean device teardown rather than an error.
     fn shutdown(mut self, frontend: BlkFrontend) {
+        self.shutdown_with_fencing(frontend, false);
+    }
+
+    fn shutdown_fenced(mut self, frontend: BlkFrontend) {
+        self.shutdown_with_fencing(frontend, true);
+    }
+
+    fn shutdown_with_fencing(&mut self, frontend: BlkFrontend, expect_fenced: bool) {
         drop(frontend);
         let server = self.server.take().expect("server handle");
         let result = server.join().expect("vhost-user server panicked");
         result.expect("vhost-user server ended with an error");
-        self.engine.detach();
-        drop(self.dir);
+        let detach = self.engine.detach();
+        if expect_fenced {
+            assert!(matches!(detach, Err(EngineError::Fenced)));
+        } else {
+            detach.unwrap();
+        }
     }
 }
 
@@ -153,7 +164,10 @@ fn config_space_reports_the_engine_geometry() {
     assert_eq!(seg_max, 126, "queue_size minus header and status");
     let blk_size = u32::from_le_bytes(config[20..24].try_into().unwrap());
     assert_eq!(blk_size, 512, "same logical block size as the NBD path");
-    assert_eq!(config[32], 1, "writeback cache: durability comes from FLUSH");
+    assert_eq!(
+        config[32], 1,
+        "writeback cache: durability comes from FLUSH"
+    );
     let num_queues = u16::from_le_bytes(config[34..36].try_into().unwrap());
     assert_eq!(num_queues, 2);
     let max_discard_sectors = u32::from_le_bytes(config[36..40].try_into().unwrap());
@@ -188,7 +202,10 @@ fn write_read_flush_matches_the_nbd_oracle() {
     assert_eq!(read_back.data, data);
     assert_eq!(read_back.used_len, data.len() as u32 + 1);
     // ... and through the oracle, which reads the engine independently.
-    assert_eq!(harness.oracle_read(8 * SECTOR_SIZE, data.len() as u32), data);
+    assert_eq!(
+        harness.oracle_read(8 * SECTOR_SIZE, data.len() as u32),
+        data
+    );
 
     // A hole still reads as zeroes and a FLUSH commits one generation.
     let hole = queue.read_at(1024, 4096).expect("read hole");
@@ -203,7 +220,10 @@ fn write_read_flush_matches_the_nbd_oracle() {
     // Writes made through the oracle are visible to the Guest path: one engine.
     let oracle_data = pattern(512, 99);
     harness.oracle_write(64 * SECTOR_SIZE, &oracle_data);
-    let seen = frontend.queue(0).read_at(64, 512).expect("read oracle write");
+    let seen = frontend
+        .queue(0)
+        .read_at(64, 512)
+        .expect("read oracle write");
     assert_eq!(seen.data, oracle_data);
 
     harness.shutdown(frontend);
@@ -222,7 +242,10 @@ fn payload_split_across_descriptors_is_reassembled() {
         .request_split(vhu_frontend::VIRTIO_BLK_T_OUT, 32, &data, 0, 3)
         .expect("split write");
     assert_eq!(completion.status, VIRTIO_BLK_S_OK);
-    assert_eq!(harness.oracle_read(32 * SECTOR_SIZE, data.len() as u32), data);
+    assert_eq!(
+        harness.oracle_read(32 * SECTOR_SIZE, data.len() as u32),
+        data
+    );
 
     harness.shutdown(frontend);
 }
@@ -321,7 +344,10 @@ fn out_of_range_and_unknown_requests_fail_the_request_only() {
 
     // The queue keeps working after all three failures.
     let data = pattern(512, 5);
-    assert_eq!(queue.write_at(0, &data).expect("write").status, VIRTIO_BLK_S_OK);
+    assert_eq!(
+        queue.write_at(0, &data).expect("write").status,
+        VIRTIO_BLK_S_OK
+    );
     assert_eq!(queue.read_at(0, 512).expect("read").data, data);
 
     harness.shutdown(frontend);
@@ -343,12 +369,14 @@ fn fenced_attachment_fails_closed_for_the_guest() {
 
     // Every later write must fail closed rather than acknowledge data that can
     // never be committed.
-    let write = queue.write_at(8, &pattern(512, 3)).expect("write completes");
+    let write = queue
+        .write_at(8, &pattern(512, 3))
+        .expect("write completes");
     assert_eq!(write.status, VIRTIO_BLK_S_IOERR);
     let flush_again = queue.flush().expect("flush completes");
     assert_eq!(flush_again.status, VIRTIO_BLK_S_IOERR);
 
-    harness.shutdown(frontend);
+    harness.shutdown_fenced(frontend);
 }
 
 #[test]
@@ -411,7 +439,10 @@ fn works_without_event_idx() {
     let queue = frontend.queue(0);
     queue.set_timeout(Duration::from_secs(20));
     let data = pattern(4096, 21);
-    assert_eq!(queue.write_at(16, &data).expect("write").status, VIRTIO_BLK_S_OK);
+    assert_eq!(
+        queue.write_at(16, &data).expect("write").status,
+        VIRTIO_BLK_S_OK
+    );
     let read = queue.read_at(16, data.len()).expect("read");
     assert_eq!(read.data, data);
     assert_eq!(queue.flush().expect("flush").status, VIRTIO_BLK_S_OK);
@@ -433,7 +464,13 @@ fn pipelined_requests_complete_out_of_order_safely() {
         pending.push((
             slot,
             queue
-                .submit(vhu_frontend::VIRTIO_BLK_T_OUT, u64::from(slot) * 8, &data, 0, 1)
+                .submit(
+                    vhu_frontend::VIRTIO_BLK_T_OUT,
+                    u64::from(slot) * 8,
+                    &data,
+                    0,
+                    1,
+                )
                 .expect("submit"),
         ));
     }

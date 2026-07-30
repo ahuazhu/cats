@@ -45,7 +45,7 @@ Cloud Hypervisor 停 vCPU、保存时钟、暂停设备并维护/导出 VM 状�
 ```mermaid
 stateDiagram-v2
     [*] --> Running
-    Running --> Suspended: syncfs + durable FLUSH + pause + page-out
+    Running --> Suspended: syncfs + local durability barrier + pause + page-out
     Suspended --> Running: resume + demand page fault
     Suspended --> Warm: snapshot + VMM/backend exit
     Warm --> Running: rebuild runtime + on-demand restore + resume
@@ -103,9 +103,11 @@ Cat generation 进入 Suspending；平台工作租约与 Guest 用户程序租�
 
 Guest Agent 对 RootDisk/PersistentDisk 执行 syncfs；应用 hook 有严格 deadline。
 
-**3. Durable FLUSH**
+**3. Local durability barrier**
 
-cats-blockd 完成屏障前 Dirty Set，记录 durable generation；失败则不进入 Suspended。
+cats-blockd 完成屏障前 Dirty Set，记录 local durable generation；失败则不进入
+Suspended。Strict 此时也已经远端 durable；Relaxed 可以在 Host-bound 的
+Suspended 状态继续由后台 publisher 推进 remote generation。
 
 **4. VMM Pause**
 
@@ -135,11 +137,13 @@ Cat=Suspended；Endpoint 按 wake_policy 返回唤醒响应或触发 Wake。
 
 ### Host Block Cache
 
-Guest 已发 FLUSH 不代表只写到本地 NVMe 就够了。平台的 FLUSH 语义要求对象和权威 Root 已提交。
+Guest 已发 FLUSH 后，Strict 要求对象和权威 Root 已提交；Relaxed 只承诺本地
+immutable pack。Suspend 本来就是 Host-bound，可以记录本地水位后 pause；
+Warm/Cold/Snapshot/Detach/迁移会删除或转移 Host 所有权，必须再 drain 到远端。
 
 - Pending Commit Pack 固定提交输入
-- 对象先写，Root 后发布
-- 只有 durable generation 完成才允许标记安全
+- 始终满足 `remote_generation <= local_generation`
+- 只有 `remote_generation == local_generation` 才允许越过 Host 所有权边界
 
 **fsfreeze 不是普通 Suspend 的必需步骤：**syncfs + 完成 FLUSH 后再 pause 已能形成一致运行状态。fsfreeze 更适合需要把文件系统与磁盘 Snapshot 精确对齐的场景；冻结后必须有 watchdog 保证 unfreeze。
 
@@ -370,7 +374,9 @@ Warm 在 Suspended 的基础上退出 VMM 与设备后端，把进程状态固�
 
 ### 进入 Warm
 
-1.  确认无未完成 Pending Commit；沿用进入 Suspended 时记录的 durable generation。
+1.  停止晚到写并强制 drain；确认所有卷
+    `remote_generation == local_generation`。不能仅沿用进入 Suspended 时的
+    本地水位。
 2.  Cloud Hypervisor 对已暂停的 VM 生成 memory/device snapshot 到本地 NVMe，校验完整性并记录 VMM 版本。
 3.  VMM 与 cats-blockd 退出；删除 memory backing file；清理 tap 与 socket。
 4.  保留 Attachment/fencing epoch、Host 亲和与 Endpoint sleeping 状态；记账 snapshot bytes 与 resume commitment。
@@ -393,8 +399,9 @@ Cold 的目标是让 Cat 不再依赖原 Host。进入 Cold 前必须确保远�
 ### 进入 Cold
 
 1.  阻止新 exec、deploy、mount 和流量激活。
-2.  如果还在 Running，Guest syncfs；如果已 Suspended/Warm，使用其进入时记录的 durable generation。
-3.  确保所有 Pending Commit 已完成或明确失败。
+2.  如果还在 Running，Guest syncfs；Suspended 的 Guest 已冻结，Warm 已经越过强制 drain。
+3.  对每卷强制 drain 到 `remote_generation == local_generation`；失败时保留
+    blockd、pending、lease 和本地 runtime，状态保持可重试，不能继续 cleanup。
 4.  Route 变为 unbound/cold。
 5.  Cloud Hypervisor shutdown/exit（Warm 时 VMM 已不存在，跳过）。
 6.  停止 cats-blockd，释放 runtime lease。
@@ -410,7 +417,8 @@ Cold 的目标是让 Cat 不再依赖原 Host。进入 Cold 前必须确保远�
 5.  启动全新的 Cloud Hypervisor。
 6.  Guest 从 RootDisk boot；ext4 journal recovery。
 7.  Guest Agent Ready 后发布 route epoch。
-8.  用户进程按 image/service policy 重新启动。
+8.  默认 Ubuntu Guest 的 systemd 重新启动 enabled user service；Guest Agent
+    readiness 与 User Service readiness 分开报告（ADR-0023）。
 
 ### 9.1 VMM 退出后真正释放的内容
 
@@ -569,7 +577,8 @@ if wake_requested(cat):
 | 故障点 | 正确状态 | 恢复动作 |
 |----|----|----|
 | Guest sync 超时 | 保持 Running 或标记 SuspendFailed | 不强行宣称 durable；按策略重试或执行受控 Cold shutdown |
-| 磁盘 FLUSH 失败 | 不进入 Suspended/Cold durable 状态 | blockd 回压；保留 dirty/pending；对象/DB 恢复后重试 |
+| 本地 durability barrier 失败 | 不进入 Suspended | 保留 Guest/runtime；本地 fsync/ENOSPC 恢复后重试 |
+| 强制 remote drain 失败 | 不进入 Warm/Cold，不创建 Snapshot，不 Detach/迁移 | 保留 blockd、pending、lease 与源 runtime；对象/DB 恢复后同一 job 重试 |
 | vCPU 已 pause，Device pause 失败 | VM 处于 Pausing/Error | 优先尝试 resume 回 Running；不执行 page-out 或 cleanup |
 | Pause 成功，Page-out 部分失败 | 可以保持 Suspended，但记录低回收率 | page-out 是 best-effort；稍后重试；持续高 RSS 则转 Cold |
 | Page-out 过程中收到 Wake | 相同 Cat lifecycle generation 仲裁 | 取消后续 page-out，等待当前 syscall 返回，再 resume |
@@ -616,7 +625,7 @@ Warm
 
 Running | Suspended | Warm
   → ColdStopRequested
-  → FlushingDisks              # Warm 使用已记录的 durable generation
+  → FlushingDisks              # 强制 remote_generation == local_generation
   → StoppingVmm                # Warm 时 VMM 已不存在，跳过
   → ReleasingAttachment
   → CleaningLocalState         # 含 memory backing 与 RAM snapshot
@@ -627,7 +636,10 @@ Running | Suspended | Warm
 # Warm restore 任一阶段失败 → ColdStopRequested，不允许停留在 Restoring。
 ```
 
-**禁止操作：**不能在未确认磁盘 FLUSH 时删除 dirty cache；不能在旧 VMM 可能继续运行时给新 Host 发相同 Attachment epoch；不能把 page-out 失败误认为 Cold；不能仅凭控制面状态删除 Host 上未知 PID。
+**禁止操作：**不能在 `remote_generation < local_generation` 时删除 pending/local
+runtime 或释放 lease；不能在旧 VMM 可能继续运行时给新 Host 发相同 Attachment
+epoch；不能把 page-out 失败误认为 Cold；不能仅凭控制面状态删除 Host 上未知
+PID。
 
 ## 13. Cats 中的模块职责
 
@@ -638,7 +650,7 @@ Running | Suspended | Warm
 | cat-agent | Guest sync、调用 CH pause、pidfd/process_madvise、状态检查 | 调用 resume 或 shutdown；进程、tap、socket、cgroup cleanup |
 | Cloud Hypervisor | 暂停 vCPU/clock/device/hypervisor VM | 按序恢复；Cold 时退出并释放 KVM 状态 |
 | Guest Agent | `/run/cats/runtime.sock` HTTP 工作租约、sequence/quiesce fence、syncfs、应用 hook、磁盘/服务状态报告 | Ready、重新开放租约 admission、session 重建、Cold boot 后 mount/resize 检查 |
-| cats-blockd | 完成 FLUSH，保留 lease/backend，停止新 Guest I/O 后继续必要后台提交 | Resume 继续；Cold final drain、释放 lease；新 Host 使用新 epoch |
+| cats-blockd | 完成本地 barrier，保留 lease/backend，后台推进 remote generation | Resume 继续；Warm/Cold/Snapshot/Detach final drain 成功后才释放 lease；新 Host 使用新 epoch |
 | NVMe Manager | memory backing quota、page-out 统计、clean cache 淘汰 | Cold 删除 backing 和 staging；密钥清理；Wake 可选预热 |
 | Route Controller | active → sleeping，应用 wake_policy | Wake singleflight；Ready 后发布新 activation epoch |
 | Node Controller | 观察内存/NVMe 水位，触发自动分层 | Node Lost、cordon/drain 与批量恢复限流 |
@@ -653,7 +665,7 @@ async fn suspend_cat(job: SuspendJob) -> Result<SuspendResult> {
     session_gate.block_new_sessions(job.cat_id).await?;
 
     guest.sync_filesystems(job.deadline).await?;
-    let durable = blockd.flush_all(job.attachment_epochs).await?;
+    let local = blockd.flush_all_local(job.attachment_epochs).await?;
 
     ch.pause(job.api_socket).await?;
     verify_vmm_state(job.api_socket, "Paused").await?;
@@ -664,7 +676,8 @@ async fn suspend_cat(job: SuspendJob) -> Result<SuspendResult> {
     let after = wait_for_reclaim_or_deadline(job.vmm_pid, job.reclaim_target).await;
 
     persist_observation(Suspended {
-        durable_generation: durable,
+        local_durable_generation: local,
+        remote_durable_generation: blockd.remote_watermarks(),
         advised_bytes: advised,
         resident_bytes: after.rss,
         backing_bytes: stat_blocks(job.memory_backing),
@@ -685,7 +698,8 @@ async fn resume_cat(job: ResumeJob) -> Result<()> {
 
 ## 14. 必须采集的指标
 
-睡眠是否有效，不能只看状态变成 Suspended。必须同时证明 CPU 降低、RAM 回收、NVMe 成本可控、磁盘达到 durable generation、唤醒按时成功。
+睡眠是否有效，不能只看状态变成 Suspended。必须同时证明 CPU 降低、RAM
+回收、NVMe 成本可控、磁盘水位与积压可解释、唤醒按时成功。
 
 | 类别 | 指标 | 用途 |
 |----|----|----|
@@ -693,7 +707,7 @@ async fn resume_cat(job: ResumeJob) -> Result<()> {
 | CPU | VMM CPU seconds、vCPU thread state、KVM exits、paused duration | 证明暂停后接近 0 CPU |
 | Memory | logical、RSS、PSS、anonymous/file、advised bytes、reclaimed bytes、major/minor faults | 证明 page-out 效果和 Resume refault 成本 |
 | NVMe | memory backing 与 RAM snapshot 的 logical/allocated bytes、写入/读取带宽、latency、quota、水位 | 量化“RAM 换 NVMe”的真实成本 |
-| Storage | dirty bytes、pending packs、FLUSH latency、durable generation、lease epoch | 确保睡眠前远端持久性成立 |
+| Storage | local/remote generation、unpublished generations/bytes/oldest age、local/remote FLUSH latency、allocated/accounted/max local bytes、eviction、backpressure、publish error、lease epoch/fenced | Suspend 证明本地 barrier；Warm/Cold/Snapshot/Detach 证明 `R == L`；暴露实际 Host-loss RPO |
 | VMM/Device | pause/resume result、device pause latency、socket state、eventfd errors | 发现 vhost-user/virtio 恢复问题 |
 | Wake | queue time、admission reject、first shell、first HTTP、working-set refault bytes | 用户实际体验而不只是 VMM API 时间 |
 | Capacity | suspended count、resume commitment、overcommit ratio、concurrent wake、Cold demotion | 防止批量唤醒引发 OOM/抖动 |

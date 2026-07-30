@@ -15,6 +15,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
+libc = { workspace = true }
 
 # The vhost-user-blk frontend is a Linux data-plane feature (vhost-user needs
 # eventfd/memfd and shared guest memory); the NBD frontend stays portable so the
@@ -26,7 +27,6 @@ virtio-bindings = { workspace = true }
 virtio-queue = { workspace = true }
 vm-memory = { workspace = true }
 vmm-sys-util = { workspace = true }
-libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

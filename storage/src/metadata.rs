@@ -26,7 +26,7 @@ pub enum MetaError {
     AlreadyExists(String),
     #[error("lease is held by another attachment")]
     LeaseHeld,
-    #[error("lease epoch is stale or expired (fenced)")]
+    #[error("lease owner or epoch is stale (fenced)")]
     Fenced,
     #[error("root CAS conflict: expected generation {expected}")]
     CasConflict { expected: i64 },
@@ -41,8 +41,11 @@ pub type Result<T> = std::result::Result<T, MetaError>;
 /// Authoritative metadata operations.
 ///
 /// Implementations must be safe for concurrent callers and must preserve the
-/// single-statement generation/owner/epoch/expiry CAS required before a FLUSH
-/// may be acknowledged.
+/// single-statement generation/owner/epoch CAS required before a FLUSH may be
+/// acknowledged. Expiry controls when another attachment may acquire the
+/// lease; acquisition bumps the epoch. A bare expiry lapse must not fence the
+/// unchanged owner, because owner + epoch remain the authoritative fencing
+/// token until a revoke or competing acquire changes them.
 pub trait MetadataStore: Send + Sync {
     fn create_volume(&self, volume_id: &str, size_bytes: u64) -> Result<()>;
     fn load_head(&self, volume_id: &str) -> Result<VolumeHead>;
@@ -72,7 +75,9 @@ pub trait MetadataStore: Send + Sync {
     /// `new_generation` must be greater than `expected_generation`; a batched
     /// commit publishes several packs under one swap by jumping more than one
     /// step (ADR-0021 follow-up). The compare stays on `expected_generation`,
-    /// so the fencing and lineage semantics are unchanged.
+    /// so the fencing and lineage semantics are unchanged. The CAS checks
+    /// owner + epoch, not wall-clock expiry: if another attachment acquired an
+    /// expired lease it necessarily bumped the epoch first.
     #[allow(clippy::too_many_arguments)]
     fn cas_head(
         &self,

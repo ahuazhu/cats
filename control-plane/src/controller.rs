@@ -106,9 +106,9 @@ impl Controller {
         // Absolute expiry: converge each expired Cat to Deleted exactly as an
         // API delete would. One failure must not starve the other candidates.
         for cat_id in self.store.expired_cat_candidates()? {
-            if let Err(e) = self
-                .store
-                .set_desired(&cat_id, DesiredState::Deleted, None, "cat.expire")
+            if let Err(e) =
+                self.store
+                    .set_desired(&cat_id, DesiredState::Deleted, None, "cat.expire")
             {
                 tracing::warn!(cat_id, "expiry delete failed: {e}");
             }
@@ -498,6 +498,23 @@ impl Controller {
                 self.notify.notify_one();
                 Ok(())
             }
+            other if action == "warm" => {
+                let err = match other {
+                    Ok(res) => res.error.unwrap_or_default(),
+                    Err(e) => e.to_string(),
+                };
+                // Warm creation is a source-preserving transition. In
+                // particular, a failed mandatory relaxed drain must keep the
+                // Host-local journal and lease alive for retry; a destructive
+                // Cold fallback here would turn a remote outage into data loss.
+                tracing::warn!(
+                    cat = %cat.id,
+                    "warm transition failed: {err}; retaining source state for retry"
+                );
+                self.store.set_observed(&cat.id, cat.observed_state)?;
+                self.notify.notify_one();
+                Ok(())
+            }
             other => {
                 let err = match other {
                     Ok(res) => res.error.unwrap_or_default(),
@@ -545,9 +562,16 @@ impl Controller {
             };
             match self.dispatch(&node.agent_url, &job).await {
                 Ok(res) if res.phase == JobPhase::Succeeded => {}
-                Ok(res) => tracing::warn!(cat = %cat.id, "stop job failed: {:?}", res.error),
+                Ok(res) => {
+                    tracing::warn!(cat = %cat.id, "stop job failed: {:?}; retaining source state for retry", res.error);
+                    self.store.set_observed(&cat.id, cat.observed_state)?;
+                    self.notify.notify_one();
+                    return Ok(());
+                }
                 Err(e) => {
                     tracing::warn!(cat = %cat.id, "stop dispatch failed: {e}; retrying next tick");
+                    self.store.set_observed(&cat.id, cat.observed_state)?;
+                    self.notify.notify_one();
                     return Ok(());
                 }
             }
@@ -564,6 +588,12 @@ impl Controller {
         if cat.node_id.is_some() {
             // Stop first (also fences + unbinds routes).
             self.stop_flow(cat).await?;
+            let current = self.store.must_get_cat_by_id(&cat.id)?;
+            if current.node_id.is_some() || current.observed_state != ObservedState::Cold {
+                // Graceful stop (including its mandatory remote drain) has not
+                // completed. Keep every disk and retry the delete flow later.
+                return Ok(());
+            }
         }
         // Root disk dies with the cat; persistent disks return to Available.
         for binding in self.store.bindings_for_cat(&cat.id)? {

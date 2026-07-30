@@ -13,6 +13,7 @@ Cats 是一个从零实现的独立项目：为用户提供可休眠、可迁移
 - 存储后端已选定为 Direct-OS ChunkStore（Direct-S3 实现，[ADR-0003](docs/decisions/0003-direct-s3-chunkstore-backend.md)）；JuiceFS 方案不再实现，仅作历史参考。
 - 存储依赖边界采用 Ports and Adapters（[ADR-0005](docs/decisions/0005-provider-neutral-storage-ports-and-adapters.md)）：核心只依赖云无关契约，AWS S3 是第一版 durable adapter。
 - 生命周期状态统一为 Running / Suspended / Warm / Cold（[ADR-0002](docs/decisions/0002-lifecycle-states-running-suspended-warm-cold.md)）。
+- 默认 Ubuntu Guest 以 systemd 为 PID 1；普通 enabled service 在 Warm 保留进程、Cold fresh boot 后重新启动（[ADR-0023](docs/decisions/0023-systemd-as-the-default-guest-init.md)）。
 - 浏览器身份使用 WorkOS AuthKit；CLI 使用 WorkOS Device Login，内部服务使用独立机器 Bearer Token（[ADR-0006](docs/decisions/0006-workos-authkit-for-browser-identity.md)、[ADR-0008](docs/decisions/0008-workos-device-login-and-cli-workspaces.md)）。
 - Guest 可选运行时能力使用 Unix socket 上的标准 HTTP，不要求 Cats SDK/CLI 或固定 TCP 端口（[ADR-0007](docs/decisions/0007-guest-runtime-http-over-unix-socket.md)）。
 - `cats shell` 使用受 Workspace 鉴权的 WebSocket PTY，不在 Guest 运行 sshd（[ADR-0009](docs/decisions/0009-interactive-shell-over-authenticated-websocket.md)）。
@@ -37,6 +38,7 @@ Cats 是一个从零实现的独立项目：为用户提供可休眠、可迁移
 |---|---|---|
 | Lazy ext4 over ChunkStore | 100 GiB 虚拟盘和 10 万小文件是否需要整盘上传；删掉本地 Cache 后能否按需恢复 | [experiments/lazy-ext4-demo](experiments/lazy-ext4-demo/README.md) |
 | VM lifecycle benchmark | EBS 与本地 NVMe 的 Warm restore、pause + page-out、完整 Cold、Direct-S3 的正确性与性能 | [experiments/warm-snapshot-benchmark](experiments/warm-snapshot-benchmark/README.md) |
+| systemd PID 1 A/B | systemd 对 create/Warm/Cold 的影响，以及普通 Linux Service 跨生命周期行为 | [experiments/systemd-pid1-20260730](experiments/systemd-pid1-20260730/README.md) |
 
 正式数据、环境报告和原始日志索引见 [experiments/README.md](experiments/README.md)。
 
@@ -50,6 +52,7 @@ Cats 是一个从零实现的独立项目：为用户提供可休眠、可迁移
 - 并发唤醒按 resume commitment 字节数计入节点预算并有界排队（ADR-0002 §8）；默认取实验验证点 10 并发，`ResumeCat` 已可节点内并发。
 - Warm（snapshot + VMM/backend exit）：本地 NVMe 唤醒约 0.38–0.40 秒，进程状态保留且无常驻 VMM。
 - Cold：直接内核、精简 initramfs、提前网络和 Agent，本轮完整新内核/新进程 P50 为 1.755 秒。
+- Guest init：systemd 是默认 PID 1；受控真机 A/B 中 Warm restore 未见实质回归，Cold start P50 增加约 3.0 秒。样本和边界见 systemd 实验报告，不作为生产 SLA。
 - Direct-S3：语义原型成立，当前串行 Python 实现约 39.87 秒，只用于验证和定位瓶颈。
 
 这些数字不是生产 SLA（AWS metal 实验口径）。本仓库的自动化测试已经覆盖：跨节点空 Cache 恢复、租约 fencing/僵尸写拒绝、FLUSH 各窗口 kill -9 崩溃恢复——但均在 FakeVmm/本地 BlobStore 形态下；真实 KVM 与大规模并发见"实现状态"。

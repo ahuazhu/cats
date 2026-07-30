@@ -258,7 +258,9 @@ fn run_nbd(bench: &Bench, workload: Workload, seed: u64) -> Sample {
                         client.write(offset, &payload).expect("nbd write");
                     }
                     Op::Flush => {
-                        client.write(offset, &payload[..SMALL_BLOCK]).expect("nbd write");
+                        client
+                            .write(offset, &payload[..SMALL_BLOCK])
+                            .expect("nbd write");
                         client.flush().expect("nbd flush");
                     }
                 }
@@ -399,14 +401,56 @@ fn frontend_cost_nbd_versus_vhost_user() {
 
     let workloads = [
         // Core comparison: identical work, one request in flight.
-        Workload { op: Op::RandRead, block: SMALL_BLOCK, ops: SMALL_OPS, threads: 1, depth: 1 },
-        Workload { op: Op::RandWrite, block: SMALL_BLOCK, ops: SMALL_OPS, threads: 1, depth: 1 },
-        Workload { op: Op::RandRead, block: SMALL_BLOCK, ops: SMALL_OPS, threads: 4, depth: 1 },
-        Workload { op: Op::RandWrite, block: SMALL_BLOCK, ops: SMALL_OPS, threads: 4, depth: 1 },
-        Workload { op: Op::SeqRead, block: LARGE_BLOCK, ops: LARGE_OPS, threads: 1, depth: 1 },
-        Workload { op: Op::SeqWrite, block: LARGE_BLOCK, ops: LARGE_OPS, threads: 1, depth: 1 },
+        Workload {
+            op: Op::RandRead,
+            block: SMALL_BLOCK,
+            ops: SMALL_OPS,
+            threads: 1,
+            depth: 1,
+        },
+        Workload {
+            op: Op::RandWrite,
+            block: SMALL_BLOCK,
+            ops: SMALL_OPS,
+            threads: 1,
+            depth: 1,
+        },
+        Workload {
+            op: Op::RandRead,
+            block: SMALL_BLOCK,
+            ops: SMALL_OPS,
+            threads: 4,
+            depth: 1,
+        },
+        Workload {
+            op: Op::RandWrite,
+            block: SMALL_BLOCK,
+            ops: SMALL_OPS,
+            threads: 4,
+            depth: 1,
+        },
+        Workload {
+            op: Op::SeqRead,
+            block: LARGE_BLOCK,
+            ops: LARGE_OPS,
+            threads: 1,
+            depth: 1,
+        },
+        Workload {
+            op: Op::SeqWrite,
+            block: LARGE_BLOCK,
+            ops: LARGE_OPS,
+            threads: 1,
+            depth: 1,
+        },
         // Control: dominated by the commit protocol, not the transport.
-        Workload { op: Op::Flush, block: SMALL_BLOCK, ops: FLUSH_OPS, threads: 1, depth: 1 },
+        Workload {
+            op: Op::Flush,
+            block: SMALL_BLOCK,
+            ops: FLUSH_OPS,
+            threads: 1,
+            depth: 1,
+        },
     ];
 
     let mut csv = String::from(
@@ -468,7 +512,7 @@ fn frontend_cost_nbd_versus_vhost_user() {
                 totals[index].1 += sample.mib_per_sec();
                 // The engine holds the volume lease; release it before the next
                 // run attaches.
-                bench.engine.detach();
+                bench.engine.detach().unwrap();
                 drop(bench);
                 if let Some(server) = server {
                     let _ = server.join();
@@ -491,11 +535,17 @@ fn frontend_cost_nbd_versus_vhost_user() {
     }
 
     println!("\nmean over {repeats} repeats (ops/s):");
-    println!("{:<24} {:>12} {:>15} {:>9}", "workload", "nbd", "vhost-user-blk", "speedup");
+    println!(
+        "{:<24} {:>12} {:>15} {:>9}",
+        "workload", "nbd", "vhost-user-blk", "speedup"
+    );
     for (name, nbd_mean, vhu_mean) in &summary {
         println!(
             "{:<24} {:>12.0} {:>15.0} {:>8.2}x",
-            name, nbd_mean, vhu_mean, vhu_mean / nbd_mean
+            name,
+            nbd_mean,
+            vhu_mean,
+            vhu_mean / nbd_mean
         );
     }
 
@@ -514,7 +564,10 @@ fn frontend_cost_nbd_versus_vhost_user() {
 #[test]
 #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
 fn vhost_user_queue_depth_scaling() {
-    println!("\n{:<10} {:>3} {:>12} {:>10}", "workload", "qd", "ops/s", "MiB/s");
+    println!(
+        "\n{:<10} {:>3} {:>12} {:>10}",
+        "workload", "qd", "ops/s", "MiB/s"
+    );
     for depth in [1usize, 4, 8, 16, 32] {
         // One backend serves one VMM connection, so each depth gets a fresh
         // engine and daemon.
@@ -541,7 +594,7 @@ fn vhost_user_queue_depth_scaling() {
             sample.ops_per_sec(),
             sample.mib_per_sec()
         );
-        bench.engine.detach();
+        bench.engine.detach().unwrap();
         drop(bench);
         if let Some(server) = server {
             let _ = server.join();
@@ -588,7 +641,7 @@ fn vhost_user_queue_count_versus_depth() {
             sample.ops_per_sec(),
             sample.mib_per_sec()
         );
-        bench.engine.detach();
+        bench.engine.detach().unwrap();
         drop(bench);
         if let Some(server) = server {
             let _ = server.join();
@@ -637,7 +690,7 @@ fn vhost_user_notification_cost() {
                 sample.mib_per_sec(),
                 sample.percentile_us(&sorted, 0.50)
             );
-            bench.engine.detach();
+            bench.engine.detach().unwrap();
             drop(bench);
             if let Some(server) = server {
                 let _ = server.join();

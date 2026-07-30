@@ -1,0 +1,10 @@
+[Unit]
+Description=Configure the Cats Guest network
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=cats-guest-agent.service network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/cats-network-setup
+RemainAfterExit=yes

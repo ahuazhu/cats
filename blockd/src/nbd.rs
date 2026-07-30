@@ -561,6 +561,6 @@ mod tests {
 
         client.disconnect().unwrap();
         server.join().unwrap().unwrap();
-        engine.detach();
+        engine.detach().unwrap();
     }
 }

@@ -22,17 +22,23 @@ Direct-S3（Direct-OS：Direct-ObjectStorage 接口的一种实现）ChunkStore 
 
 Guest 只看到 `/dev/vda`、`/dev/vdb` 和标准 ext4。Guest 不安装存储客户端，不持有 S3 或 Metadata 凭证。
 
-**数据 Ground Truth 在 S3**
+**远端 Ground Truth 与本地待发布真相**
 
-Data Object、Delta Segment、Map Node 和 Commit Record 都是不可变对象。本地 NVMe 在提交完成后只是可删除 Cache。
+Data Object、Delta Segment、Map Node 和 Commit Record 都是不可变对象。对
+Strict，成功 FLUSH 的 Ground Truth 已在 S3/PostgreSQL；对 Relaxed，
+`local_generation > remote_generation` 时本地 pending pack 是唯一权威副本，
+不能当作可删除 Cache。
 
 **Root 与 Lease 由强一致数据库管理**
 
 PostgreSQL 保存当前 `root_hash`、Generation、Lease Owner 和 Fencing Epoch；它不保存用户数据块。
 
-**FLUSH 是远端持久化边界**
+**FLUSH 按盘选择持久化边界**
 
-只有 S3 对象上传完成且 Root CAS 成功后，才向 Guest 返回 FLUSH/FUA 成功。
+Strict 只有 S3 对象上传完成且 Root CAS 成功后才 ACK；Relaxed 在 immutable
+pending pack 完成本地 fsync/rename/directory fsync 后 ACK，由有界后台
+publisher 异步推进远端水位。完整契约见
+[ADR-0022](decisions/0022-relaxed-local-first-dual-watermark.md)。
 
 **与现有架构的关系：**Cloud Hypervisor、vhost-user-blk、Guest ext4、RootDisk、PersistentDisk、MountBinding、Attachment 和 `cats` CLI 都不改变。本设计就是 `cats-blockd` 的数据路径（ADR-0003）；JuiceFS raw-file 方案已放弃，不再实现。
 
@@ -314,7 +320,17 @@ WRITE ACK尚未承诺远端持久
 
 ## 7. FLUSH/FUA 提交协议
 
-FLUSH 是整个设计的持久性边界。顺序必须是“对象先持久、Root 后发布、Dirty 最后清理”，不能交换。
+提交顺序仍必须是“本地 pack 先持久、对象先持久、Root 后发布、本地 pack
+最后清理”，不能交换。每卷维护两个单调水位：
+
+- `L = local_durable_generation`：相应 pending pack 已在本地 NVMe 持久；
+- `R = remote_durable_generation`：相应对象和 Map 已上传且 Root CAS 成功。
+
+始终满足 `R <= L`。Strict 在 `R == L` 后 ACK；Relaxed 在 `L` 前进后 ACK，
+步骤 3–6 只由后台 publisher 执行。Relaxed 冷缓存上的局部 WRITE 记录精确
+byte ranges，不在 Guest WRITE/FLUSH 线程中同步 GET 旧 page；publisher
+读取远端 base、按 generation 顺序合并这些 ranges，再产生 64 KiB delta 或
+4 MiB base。冷 READ 仍可能依赖 S3。
 
 步骤
 
@@ -404,7 +420,7 @@ CAS generation + epoch + owner
 
 收到成功
 
-返回 FLUSH/FUA 成功
+Strict 在 R 前进后 ACK；Relaxed 在步骤 2 的 L 前进后已 ACK
 
 清理已提交 Pending Pack
 
@@ -420,11 +436,15 @@ SET root_hash       = :new_root,
 WHERE volume_id     = :volume_id
   AND generation    = :expected_generation
   AND lease_epoch   = :expected_epoch
-  AND lease_owner   = :this_attachment
-  AND lease_expires_at > now();
+  AND lease_owner   = :this_attachment;
 
--- affected_rows 必须恰好为 1，否则不能向 Guest 返回 FLUSH 成功。
+-- affected_rows 必须恰好为 1，否则本次远端发布失败。
 ```
+
+`lease_expires_at` 决定竞争者何时可以 acquire，不参与当前 owner/epoch 的
+Root CAS。竞争 acquire 或显式 revoke 必须先增加 epoch；旧 epoch 随后 CAS
+为 0 行并永久 fenced。仅仅 lease renewal 因调度/DB 抖动短暂越过 expiry，
+而 owner/epoch 尚未变化时，不应自我 fencing。
 
 ### CAS 前崩溃
 
@@ -436,9 +456,15 @@ WHERE volume_id     = :volume_id
 
 ### CAS 失败
 
-说明 Generation 冲突、Lease 过期或 Writer 已被 Fence。立即停止写路径，不能覆盖新 Owner 的 Root。
+Generation、owner 或 epoch 冲突说明 Writer 已被 Fence，立即停止写路径，
+不能覆盖新 Owner 的 Root。S3/DB timeout、连接错误和限流只记录为可重试的
+publish error：Relaxed 保留本地 pack，不能把瞬时远端错误直接作为 Guest
+FLUSH 的 EIO。
 
-**延迟下限：**严格 FLUSH 至少包含一次 S3 PUT 完成和一次 Metadata CAS。不能同时承诺“纯 NVMe fsync 延迟”和“Host 永久损坏零丢失”。如果 fsync 密集型数据库无法接受，需要增加独立的区域级 Replicated Write Log，而不是提前返回成功。
+**延迟与风险边界：**Strict FLUSH 至少包含一次 S3 PUT 完成和一次 Metadata
+CAS；Relaxed FLUSH 的关键路径是本地 pack 持久化，但 Host 永久损坏只恢复到
+`R`，会丢当时的 `L-R`。要同时获得本地级 fsync 和 Host-loss RPO 0，必须增加
+跨 Host Replicated Write Log，不能靠缩短后台定时器冒充。
 
 ## 8. RWO Lease 与 Fencing
 
@@ -609,12 +635,13 @@ ChunkRef {
 
 | 故障 | 正确行为 | 不能发生 | 恢复动作 |
 |----|----|----|----|
-| blockd 进程崩溃 | 设备暂停或 I/O 失败；旧 Root 保持完整 | 自动跳过未完成 FLUSH 并返回成功 | 读取 Pending Pack；检查远端 generation/txn；幂等重试或回滚该 Dirty Set。 |
-| Host 永久损坏 | 从最后成功 FLUSH 的 Root 恢复 | 依赖旧 NVMe 才能启动 | 等待/撤销 Lease；新 Host 获取更高 Epoch；空 Cache Cold Start。 |
-| S3 PUT 超时 | 重试同一不可变 Object ID；FLUSH 保持等待或失败 | 不知道对象是否完成时发布 Root | HEAD/GET 验证对象和 checksum；确认后继续提交。 |
+| blockd 进程崩溃 | 同 Host 从 Pending Pack 重建 `L`；旧 Root 保持完整 | attach 恢复阶段先做远端写或跳过已 ACK pack | 先恢复本地队列，再由 publisher 按 generation 幂等重放。 |
+| Host 永久损坏 | Strict 从最后成功 FLUSH 恢复；Relaxed 从 `R` 恢复并报告丢失窗口 | 把定时器误报成真实 RPO | 新 Host 获取更高 Epoch；空 Cache Cold Start；以故障时 `L-R` 的 age/bytes/generations 记账。 |
+| S3 PUT 超时 | Strict FLUSH 等待/失败；Relaxed ACK 本地 pack，publisher 重试同一 Object ID | 将普通 timeout 当 fencing，或直接向 Relaxed ext4 注入 EIO | 保留 pack 和 lease；记录 publish error；远端恢复后继续。 |
 | S3 返回损坏数据 | Checksum 失败，拒绝将数据交给 Guest | 把损坏内容写入 Cache 后继续运行 | 重试、读取其他副本/区域；无法恢复时 Volume 进入 Faulted。 |
-| PostgreSQL 不可用 | 已有 Clean Cache 的读可继续；新 FLUSH 不能成功 | 绕过 CAS 直接修改 S3 HEAD | 回压写请求；超时后冻结或只读；数据库恢复后重试。 |
-| Lease 续租失败 | 在安全窗口内停止新写和 Root 发布 | 旧 Host 无限期继续写 | 设备进入 fenced 状态；由控制面重新 Attach。 |
+| PostgreSQL 不可用 | Clean Cache 读继续；Strict FLUSH 等待/失败；Relaxed 本地推进到配额水位 | 绕过 CAS，或让本地队列无界增长 | 有界队列和 deadline；只剩 pin 数据时背压；数据库恢复后重连/重试。 |
+| Lease renewal 越过 expiry | owner/epoch 未变时继续 renew/publish | 因瞬时抖动自我 fence | 竞争 acquire/revoke 增加 epoch 后，旧 Writer 才 fail closed。 |
+| 强制 lifecycle drain 失败 | Stop/Warm/Snapshot/Detach/迁移不越过远端持久化边界 | 释放 lease、删除 runtime/pending 或宣称 Cold | 保留 blockd、journal 和 lease；控制器重试到 `R == L`。 |
 | GC 进程崩溃 | 最多延迟空间回收 | 删除任何仍被 Root/Snapshot 引用的对象 | GC Job 使用 epoch、checkpoint 和幂等 delete，重新扫描。 |
 | Compaction 崩溃 | 旧 Base + Delta 仍可读 | 先删除旧对象再发布新 Map | 新 Base 成为 Orphan 或在重试时复用；Root CAS 后才允许旧对象进入 GC。 |
 
@@ -626,16 +653,16 @@ ChunkRef {
 
 **\< 1ms**目标：非 FUA 本地 WRITE P99
 
-**实测决定**FLUSH P50/P99：S3 PUT + DB CAS
+**分别实测**Strict 远端 FLUSH 与 Relaxed 本地 FLUSH P50/P99
 
 **\> 95%**目标：稳态工作集 Cache Hit Rate
 
 | 类别 | 必须导出的指标 |
 |----|----|
 | I/O | read/write/flush/trim IOPS、bytes、P50/P95/P99、queue depth、barrier wait |
-| Cache | hit/miss、hydrated bytes、eviction、clean/dirty bytes、quota、NVMe fsync latency |
+| Cache | hit/miss、hydrated bytes、eviction、clean/dirty/pinned bytes、allocated/accounted/max local bytes、NVMe fsync latency |
 | Remote | GET/PUT 数、bytes、latency、retry、checksum failure、throttle、error code |
-| Commit | generation、dirty pages/txn、delta bytes、CAS conflict、flush durable seq、Pending Pack backlog |
+| Commit | local/remote generation、unpublished generations/bytes/oldest age、publish error、backpressure、CAS conflict、fenced |
 | Lifecycle | attach latency、cold start first-read、migration time、lease renewal、fencing event |
 | Space | live bytes、orphan bytes、snapshot retained bytes、GC reclaimed bytes、compaction amplification |
 
@@ -690,9 +717,11 @@ trait MetadataStore {
 - Data PUT 前、中、后 kill -9
 - Map PUT 后、CAS 前崩溃
 - CAS 后、ACK 前崩溃
-- Lease 过期和旧 Host 恢复
+- lease expiry lapse、竞争 acquire/revoke 和旧 Host 恢复
 - S3 延迟、5xx、超时、损坏响应
 - PostgreSQL failover 和重复事务
+- Relaxed 远端失败期间的本地 ACK、配额/淘汰/背压
+- Stop/Warm/Snapshot/Detach/Node drain 失败时源状态保留与重试
 
 ### 工作负载
 
@@ -708,11 +737,16 @@ trait MetadataStore {
 - 远端上传/下载字节
 - S3 GET/PUT 数和费用模型
 - Full Chunk 与 Delta 写放大
-- FLUSH P50/P99
+- Strict 远端 FLUSH 与 Relaxed 本地 FLUSH P50/P99
+- `L-R` generations/bytes/oldest age 与 publisher throughput
 - Cold Start 首次响应和 Hotset
 - GC/Compaction 对前台 I/O 的影响
 
-**上线阻断条件：**任何一次成功返回的 FLUSH 在删除整台 Host 后无法恢复；旧 Fencing Epoch 能发布 Root；GC 能删除可达对象；Checksum 错误未被发现；或无法给出明确的 Dirty/Pending Commit 上限。
+**上线阻断条件：**Strict 的成功 FLUSH 在删除整台 Host 后无法恢复；Relaxed
+未明确/暴露故障时 `L-R`；强制 drain 失败后仍删除唯一的本地副本；旧
+Fencing Epoch 能发布 Root；GC 能删除可达对象；Checksum 错误未被发现；或
+无法给出明确的 pending/local 物理上限。当前上限是每卷隔离，不等价于 Host
+全局容量证明，节点仍必须为所有卷、Warm snapshot、日志和系统空间做总预算。
 
 ### 上线决策门
 

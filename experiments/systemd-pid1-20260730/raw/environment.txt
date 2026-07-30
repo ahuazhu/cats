@@ -1,0 +1,12 @@
+instance_type=c5d.metal
+kernel=Linux 6.17.0-1019-aws x86_64 GNU/Linux
+cpus=96
+block_path=kernel-nbd
+durability=strict
+cat_cpus=1
+cat_memory_mib=512
+base_image_sha256=86814247f6d8ae200384f33c5f630a8cb4f29d8f84c21ec866ea4eef06b323ca
+systemd_image_sha256=22f65550dda8e1cb46203f2b920268397ab859942dd4cd9908c4fa77c19a5a8b
+blockd_sha256=1942e485a56dc95d965ebf5e708f5639dd370c347d0fa278afcc6d8052f8f162
+cloud_hypervisor_sha256=448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b5ee6c4fce7c29ecc
+other_soak_active=true

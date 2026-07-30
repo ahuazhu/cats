@@ -2,6 +2,11 @@
 
 - 状态：Accepted
 - 日期：2026-07-29
+- 后续修订：2026-07-30 的
+  [ADR-0022](0022-relaxed-local-first-dual-watermark.md) 取代本文关于
+  “固定 ≤5 秒窗口”、满队列/10 秒后内联 publish、detach 失败仍释放 lease
+  以及 Snapshot 不强制 sync 的设计。本文保留按盘选择与 strict/relaxed
+  产品分层的原始决策；实现语义以 ADR-0022 为准。
 
 ## 背景
 
@@ -24,10 +29,10 @@ guest 已收到的 ack 的含义）：
   strict）；经 `VolumeGrant.durability` 到 blockd argv。
 - **引擎实现（stage/publish 拆分）**：`flush()` 拆为 stage（冻结屏障 +
   本地 pack fsync）与 publish（对象上传 + 元数据 CAS）。strict 的 ack
-  在 publish 后（行为不变）；relaxed 的 ack 在 stage 后（~1 ms），后台
-  committer 每 `drain_interval_ms`（默认 5 s）按序 publish。staged 队列
-  超过 `MAX_STAGED_PACKS`(16) 时 FLUSH 退化为内联 drain——对象存储故障
-  表现为延迟，不表现为无界丢失窗口。
+  在 publish 后（行为不变）；relaxed 的 ack 在 stage 后，只有有界后台
+  publisher 执行远端 I/O。`drain_interval_ms` 是空闲尾部目标，不是 RPO
+  上限；积压到 staged/local 物理水位时先淘汰 clean cache，只剩 pin 数据后
+  在 condvar 背压，不允许 Guest 线程退化为内联 S3/DB 调用。
 - **pack 链**：staged pack 以 `next_base` 单调计数器链式分配
   base_generation，文件名以其为前缀使字典序 = 世代序；崩溃后
   `recover_pending_packs` 按序重放整条链。同机重启（blockd 崩溃、进程
@@ -38,31 +43,33 @@ guest 已收到的 ack 的含义）：
 
 ## 契约（用户可见文案）
 
-relaxed 盘上：fsync 在本地提交后返回；数据在 ≤5 秒内到达对象存储；
-**宿主机非计划死亡时，最近 ≤5 秒的写入（含已 fsync 的）可能丢失**。
+relaxed 盘上：fsync 在本地提交后返回；后台尽快推进对象存储水位。宿主机
+非计划死亡时，可能丢失故障时 `local_generation - remote_generation` 的
+数据；真实窗口必须以 generations、bytes、oldest age 暴露，不能用固定秒数
+替代。
 以下点位强制全量 publish，完成前不返回：
 
 - 生命周期：stop/teardown（VMM 退出后 drain，杜绝末尾窗口）、warm
-  （pause 之后）、hot detach。suspend 不显式 drain：VMM 驻留同机，
-  后台 committer 在一个周期内自然清空。
+  （pause 之后）、hot detach、Snapshot、计划迁移/Node drain。suspend
+  只要求本地水位，因为 VMM 与 pending 都驻留同机。
 - `cats sync <name>`：随时买一个 strict 时刻（guest syncfs → 每个
   blockd 经控制 socket `drain`）。脚本在对外承诺之前调它。
-- fencing 时已 staged 未 publish 的 pack 随 lease 作废——这在 relaxed
-  契约允许的窗口内；strict 盘不受影响（无 staged 队列）。
+- fencing 时旧 epoch 禁止发布，但本地 pack 必须保留供审计/恢复；不能因为
+  lease 转移就把已 ACK 的唯一副本当 cache 删除。
 
 ## 后果
 
-- blockd 新增 `--durability`、`--drain-interval-ms`、`--listen-control`
-  （行协议：`drain` → `OK <generation>`）；node-agent 在四个强制点调用。
+- blockd 新增 `--durability`、`--drain-interval-ms`、staged/local quota、
+  `--listen-control`（`drain` 与 `status`）；node-agent 在所有 Host
+  所有权边界强制 drain。
 - relaxed 合批天然降低 S3 PUT 次数与请求费。
-- 已知缺口：`create_snapshot` 不强制 sync，快照捕获的是最近提交的
-  generation（strict 下同样存在，relaxed 下窗口更宽）——后续应在快照
-  路径前置一次 sync。
+- Snapshot 已在创建元数据前对 Running/Suspended Cat 执行 sync/drain；
+  失败时不创建快照。
 - 跨多个 staged pack 反复写同一 chunk 时，delta 链可能暂超
   `MAX_DELTA_LAYERS`（plan 以已提交 map 为准），上限受队列长度约束，
   只影响冷读 GET 数，不影响正确性。
 
-## 修订（2026-07-29，同日）：合批 publish 与停车式背压
+## 历史修订（2026-07-29，同日，泄压策略已由 ADR-0022 取代）
 
 首日生产暴露了 v1 泄压设计的车队病理：持续 fsync 负载下队列贴着
 16-pack 上限运行，每个撞限的 FLUSH 排队等 `publish_lock` 并亲自串行

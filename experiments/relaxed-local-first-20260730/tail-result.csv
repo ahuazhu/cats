@@ -1,0 +1,5 @@
+dirty_chunks,guest_bytes_per_chunk,sample_count,percentile_method,local_pack_kib,local_p50_ms,local_p95_ms,local_p99_ms,local_max_ms,remote_p50_ms,remote_p95_ms,remote_p99_ms,remote_max_ms,published_mib,object_adapter,metadata_adapter
+1,4096,500,nearest-rank,4.3,10.33,22.08,27.21,49.25,53.47,76.44,86.43,102.36,0.06,file,sqlite
+8,4096,500,nearest-rank,33.8,9.72,18.95,26.89,144.34,81.05,119.22,135.48,2219.35,0.50,file,sqlite
+32,4096,500,nearest-rank,134.9,11.27,21.48,27.44,50.48,219.12,278.22,310.02,1836.62,2.00,file,sqlite
+64,4096,500,nearest-rank,269.7,11.27,17.78,21.73,24.08,373.87,499.92,535.17,2468.06,4.00,file,sqlite
