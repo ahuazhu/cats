@@ -417,7 +417,8 @@ Cold 的目标是让 Cat 不再依赖原 Host。进入 Cold 前必须确保远�
 5.  启动全新的 Cloud Hypervisor。
 6.  Guest 从 RootDisk boot；ext4 journal recovery。
 7.  Guest Agent Ready 后发布 route epoch。
-8.  用户进程按 image/service policy 重新启动。
+8.  默认 Ubuntu Guest 的 systemd 重新启动 enabled user service；Guest Agent
+    readiness 与 User Service readiness 分开报告（ADR-0023）。
 
 ### 9.1 VMM 退出后真正释放的内容
 

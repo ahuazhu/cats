@@ -57,13 +57,15 @@ that boundary.
 
 ## Absolute expiry
 
-A Cat can carry an absolute expiry: once the time passes, the control plane deletes it exactly as `cats destroy` would. The root disk goes with it; persistent disks survive. This is how temporary environments (CI previews, demos) get reclaimed without an external sweeper.
+A Cat can carry an absolute expiry: once the time passes, the control plane deletes it exactly as `cats destroy` would. The root disk goes with it; persistent disks survive. Reclamation happens inside the control plane; nothing outside it has to track the deadline.
 
-    cats create preview --expires-in 28800
-    cats expiry preview                 # show
-    cats expiry preview --in 28800     # renew: 8 more hours from now
-    cats expiry preview --at 1790000000
-    cats expiry preview --never        # keep it
+    cats create scratch --expires-in 28800
+    cats expiry scratch                 # show
+    cats expiry scratch --in 28800      # renew: 8 more hours from now
+    cats expiry scratch --at 1790000000
+    cats expiry scratch --never         # keep it
+
+Every `cats ls` row carries `expires=`: the time left, `never`, or `overdue`.
 
 Renewal writes a new absolute time (`PUT /cats/{cat}/expiry`), so retries and replays need no special rules. A Cat without an expiry never expires.
 

@@ -1,0 +1,16 @@
+phase,cycle,duration_us,boot_id_before,boot_id_after,boot_preserved,canary_ok
+suspend_resume,0,6946399,fb4a3436-f7ae-451a-b3d6-ab40f79d6be0,fb4a3436-f7ae-451a-b3d6-ab40f79d6be0,true,true
+suspend_resume,1,7097371,fb4a3436-f7ae-451a-b3d6-ab40f79d6be0,fb4a3436-f7ae-451a-b3d6-ab40f79d6be0,true,true
+suspend_resume,2,8013083,fb4a3436-f7ae-451a-b3d6-ab40f79d6be0,fb4a3436-f7ae-451a-b3d6-ab40f79d6be0,true,true
+suspend_resume,3,7887236,fb4a3436-f7ae-451a-b3d6-ab40f79d6be0,fb4a3436-f7ae-451a-b3d6-ab40f79d6be0,true,true
+suspend_resume,4,6698797,fb4a3436-f7ae-451a-b3d6-ab40f79d6be0,fb4a3436-f7ae-451a-b3d6-ab40f79d6be0,true,true
+warm_restore,0,1265108,fb4a3436-f7ae-451a-b3d6-ab40f79d6be0,fb4a3436-f7ae-451a-b3d6-ab40f79d6be0,true,true
+warm_restore,1,884657,fb4a3436-f7ae-451a-b3d6-ab40f79d6be0,fb4a3436-f7ae-451a-b3d6-ab40f79d6be0,true,true
+warm_restore,2,1083437,fb4a3436-f7ae-451a-b3d6-ab40f79d6be0,fb4a3436-f7ae-451a-b3d6-ab40f79d6be0,true,true
+warm_restore,3,1003674,fb4a3436-f7ae-451a-b3d6-ab40f79d6be0,fb4a3436-f7ae-451a-b3d6-ab40f79d6be0,true,true
+warm_restore,4,911805,fb4a3436-f7ae-451a-b3d6-ab40f79d6be0,fb4a3436-f7ae-451a-b3d6-ab40f79d6be0,true,true
+cold_restart,0,12356759,fb4a3436-f7ae-451a-b3d6-ab40f79d6be0,2ec0fa5f-788f-44e0-b0be-83e63f67bef8,false,true
+cold_restart,1,11458844,2ec0fa5f-788f-44e0-b0be-83e63f67bef8,d19324ca-f51e-48a3-b47f-1b889fca42f4,false,true
+cold_restart,2,10805622,d19324ca-f51e-48a3-b47f-1b889fca42f4,e0ffe3e1-3b37-4ddc-bd16-70fc9ac2207e,false,true
+cold_restart,3,10363681,e0ffe3e1-3b37-4ddc-bd16-70fc9ac2207e,9138f050-1929-4438-95d3-9ebbe9f87570,false,true
+cold_restart,4,10312887,9138f050-1929-4438-95d3-9ebbe9f87570,3c0bc4aa-5f57-4d82-bd10-b4074fa92bdc,false,true

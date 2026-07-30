@@ -1,0 +1,10 @@
+[Unit]
+Description=Grow the Cats root filesystem
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=cats-guest-agent.service
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/resize2fs /dev/vda
+RemainAfterExit=yes
