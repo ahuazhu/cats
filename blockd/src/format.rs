@@ -217,7 +217,10 @@ fn push_id(out: &mut Vec<u8>, id: &str) {
 fn leaf_version(entries: &[ChunkRef]) -> u16 {
     if entries.iter().any(|e| e.image().is_some()) {
         LEAF_VERSION_IMAGE_BASE
-    } else if entries.iter().any(|e| matches!(e, ChunkRef::Layered { .. })) {
+    } else if entries
+        .iter()
+        .any(|e| matches!(e, ChunkRef::Layered { .. }))
+    {
         LEAF_VERSION_LAYERED
     } else {
         FORMAT_VERSION
@@ -430,6 +433,21 @@ pub struct PackEntry {
     /// Which of the chunk's 64 pages this entry carries.
     #[serde(default = "full_page_mask")]
     pub page_mask: u64,
+    /// Relaxed local-first packs may carry only the exact byte ranges written
+    /// by the Guest. The background publisher materializes those ranges into
+    /// the complete 64 KiB pages named by `page_mask` before uploading. Empty
+    /// means the payload is already a publishable base/delta (the V1 format).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub byte_ranges: Vec<PackByteRange>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PackByteRange {
+    /// Offset within the 4 MiB chunk.
+    pub chunk_offset: u32,
+    /// Offset within the pack's shared payload.
+    pub payload_offset: u64,
+    pub len: u32,
 }
 
 impl PackEntry {
@@ -443,6 +461,10 @@ impl PackEntry {
     /// entry because a delta always carries at least one page.
     pub fn is_discard(&self) -> bool {
         self.page_mask == 0
+    }
+
+    pub fn is_byte_overlay(&self) -> bool {
+        !self.byte_ranges.is_empty()
     }
 }
 
@@ -635,6 +657,7 @@ mod tests {
                 len: 4,
                 sha256_hex: hex::encode(sha256(b"data")),
                 page_mask: full_page_mask(),
+                byte_ranges: Vec::new(),
             }],
         };
         let enc = encode_pack(&header, b"data");
@@ -696,7 +719,10 @@ mod tests {
 
         assert_eq!(layered[0].layer_count(), 1);
         assert_eq!(layered[1].layer_count(), 2);
-        assert_eq!(layered[1].object_ids(), vec!["txn1-c1", "txn2-c1-d", "txn3-c1-d"]);
+        assert_eq!(
+            layered[1].object_ids(),
+            vec!["txn1-c1", "txn2-c1-d", "txn3-c1-d"]
+        );
         assert_eq!(layered[0].base(), None);
     }
 
@@ -728,9 +754,7 @@ mod tests {
         assert_eq!(spread.object_ids(), vec!["b", "d3"]);
 
         // A partial overlap keeps the older delta: it still owns a page.
-        let overlap = chunk
-            .with_delta(page(0b011, 1))
-            .with_delta(page(0b001, 2));
+        let overlap = chunk.with_delta(page(0b011, 1)).with_delta(page(0b001, 2));
         assert_eq!(overlap.layer_count(), 2);
         assert_eq!(overlap.object_ids(), vec!["b", "d1", "d2"]);
     }
@@ -835,7 +859,10 @@ mod tests {
         assert_eq!(map.len(), 4);
         assert_eq!(map[0].image(), Some(manifest.image_id.as_str()));
         assert_eq!(map[0].base().unwrap().object_id, object);
-        assert_eq!(map[0].base().unwrap().sha256, decode_sha256_hex(&object).unwrap());
+        assert_eq!(
+            map[0].base().unwrap().sha256,
+            decode_sha256_hex(&object).unwrap()
+        );
         assert!(matches!(map[1], ChunkRef::Hole));
         assert!(matches!(map[3], ChunkRef::Hole));
 

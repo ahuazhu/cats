@@ -3,11 +3,12 @@
 //! Lease expiry uses the database clock so workers on different hosts cannot
 //! disagree because of local clock skew. Root publication remains one
 //! conditional `UPDATE ... RETURNING` over generation, owner, epoch and lease
-//! expiry; a caller may acknowledge FLUSH only after that statement commits.
+//! fencing token; a caller may acknowledge a remote-durable FLUSH only after
+//! that statement commits.
 
 use std::fs;
 use std::sync::mpsc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cats_storage::metadata::{MetaError, MetadataStore, Result, SnapshotRow, VolumeHead};
 use cats_storage::{AdapterConfig, AdapterError, MetadataStoreFactory};
@@ -44,19 +45,21 @@ CREATE INDEX IF NOT EXISTS cats_storage_snapshots_volume_created_idx
 const DB_NOW_MS: &str = "floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint";
 
 pub struct PostgresMetadataStore {
-    jobs: mpsc::Sender<Job>,
+    jobs: mpsc::SyncSender<Job>,
     /// Lease operations get their own connection and worker.
     ///
     /// Every operation on a shared worker is serial, so a renewal queued behind
-    /// a commit's metadata work waits for it. A volume lease is only seconds
-    /// long and its renewal SQL refuses an already-expired row, so one late
-    /// renewal fences a live attachment permanently — the Guest then sees write
-    /// errors and its filesystem aborts. Renewals must not be able to queue
-    /// behind bulk work.
-    lease_jobs: mpsc::Sender<Job>,
+    /// a commit's metadata work waits for it. Renewals use a separate connection
+    /// to keep the lease fresh and make takeover latency predictable. A bare
+    /// expiry lapse is not itself a fence: only a revoke or competing acquire
+    /// changes the owner/epoch token.
+    lease_jobs: mpsc::SyncSender<Job>,
 }
 
-type Job = Box<dyn FnOnce(&mut Client) + Send + 'static>;
+type Job = Box<dyn for<'a> FnOnce(std::result::Result<&'a mut Client, MetaError>) + Send + 'static>;
+
+const WORK_QUEUE_DEPTH: usize = 64;
+const OPERATION_DEADLINE: Duration = Duration::from_secs(7);
 
 impl PostgresMetadataStore {
     pub fn connect(url: &str, ca_file: Option<&str>) -> Result<Self> {
@@ -87,10 +90,10 @@ impl PostgresMetadataStore {
     }
 }
 
-fn spawn_worker(name: &str, url: &str, ca_file: Option<&str>) -> Result<mpsc::Sender<Job>> {
+fn spawn_worker(name: &str, url: &str, ca_file: Option<&str>) -> Result<mpsc::SyncSender<Job>> {
     let url = url.to_string();
     let ca_file = ca_file.map(str::to_string);
-    let (jobs, receiver) = mpsc::channel::<Job>();
+    let (jobs, receiver) = mpsc::sync_channel::<Job>(WORK_QUEUE_DEPTH);
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name(name.to_string())
@@ -98,14 +101,25 @@ fn spawn_worker(name: &str, url: &str, ca_file: Option<&str>) -> Result<mpsc::Se
             Ok(mut client) => {
                 let _ = ready_tx.send(Ok(()));
                 for job in receiver {
-                    job(&mut client);
+                    if client.is_closed() {
+                        match connect_client(&url, ca_file.as_deref()) {
+                            Ok(reconnected) => client = reconnected,
+                            Err(error) => {
+                                job(Err(error));
+                                continue;
+                            }
+                        }
+                    }
+                    job(Ok(&mut client));
                 }
             }
             Err(error) => {
                 let _ = ready_tx.send(Err(error));
             }
         })
-        .map_err(|error| MetaError::Backend(format!("start PostgreSQL metadata thread: {error}")))?;
+        .map_err(|error| {
+            MetaError::Backend(format!("start PostgreSQL metadata thread: {error}"))
+        })?;
     ready_rx
         .recv()
         .map_err(|_| MetaError::Backend("PostgreSQL metadata thread exited at startup".into()))??;
@@ -113,20 +127,38 @@ fn spawn_worker(name: &str, url: &str, ca_file: Option<&str>) -> Result<mpsc::Se
 }
 
 fn dispatch_on<T>(
-    jobs: &mpsc::Sender<Job>,
+    jobs: &mpsc::SyncSender<Job>,
     operation: impl FnOnce(&mut Client) -> Result<T> + Send + 'static,
 ) -> Result<T>
 where
     T: Send + 'static,
 {
     let (result_tx, result_rx) = mpsc::sync_channel(1);
-    jobs.send(Box::new(move |client| {
-        let _ = result_tx.send(operation(client));
+    jobs.try_send(Box::new(move |client| {
+        let result = match client {
+            Ok(client) => operation(client),
+            Err(error) => Err(error),
+        };
+        let _ = result_tx.send(result);
     }))
-    .map_err(|_| MetaError::Backend("PostgreSQL metadata thread exited".into()))?;
+    .map_err(|error| match error {
+        mpsc::TrySendError::Full(_) => {
+            MetaError::Backend("PostgreSQL metadata work queue is full".into())
+        }
+        mpsc::TrySendError::Disconnected(_) => {
+            MetaError::Backend("PostgreSQL metadata thread exited".into())
+        }
+    })?;
     result_rx
-        .recv()
-        .map_err(|_| MetaError::Backend("PostgreSQL metadata operation was canceled".into()))?
+        .recv_timeout(OPERATION_DEADLINE)
+        .map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => {
+                MetaError::Backend("PostgreSQL metadata operation timed out".into())
+            }
+            mpsc::RecvTimeoutError::Disconnected => {
+                MetaError::Backend("PostgreSQL metadata operation was canceled".into())
+            }
+        })?
 }
 
 fn connect_client(url: &str, ca_file: Option<&str>) -> Result<Client> {
@@ -147,8 +179,16 @@ fn connect_client(url: &str, ca_file: Option<&str>) -> Result<Client> {
     let connector = builder
         .build()
         .map_err(|error| MetaError::Backend(format!("build PostgreSQL TLS client: {error}")))?;
-    let mut client = Client::connect(url, MakeTlsConnector::new(connector))
+    let mut config: postgres::Config = url
+        .parse()
+        .map_err(|error| MetaError::Backend(format!("parse PostgreSQL URL: {error}")))?;
+    config.connect_timeout(Duration::from_secs(5));
+    let mut client = config
+        .connect(MakeTlsConnector::new(connector))
         .map_err(|error| MetaError::Backend(format!("connect PostgreSQL: {error}")))?;
+    client
+        .batch_execute("SET statement_timeout = '5s'; SET lock_timeout = '2s'")
+        .map_err(pg_err)?;
     client.batch_execute(SCHEMA).map_err(pg_err)?;
     Ok(client)
 }
@@ -433,20 +473,17 @@ impl MetadataStore for PostgresMetadataStore {
         let volume_id = volume_id.to_string();
         let new_root_object_id = new_root_object_id.to_string();
         let attachment_id = attachment_id.to_string();
-        let sql = format!(
-            "UPDATE cats_storage_volumes
+        let sql = "UPDATE cats_storage_volumes
                 SET root_hash = $3, root_object_id = $4, generation = $7
               WHERE volume_id = $1
                 AND generation = $2
                 AND lease_owner = $5
                 AND lease_epoch = $6
-                AND lease_expires_at_ms > {DB_NOW_MS}
-              RETURNING generation"
-        );
+              RETURNING generation";
         self.dispatch(move |client| {
             client
                 .query_opt(
-                    &sql,
+                    sql,
                     &[
                         &volume_id,
                         &expected_generation,

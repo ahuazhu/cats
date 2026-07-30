@@ -10,12 +10,13 @@
 //! Ignored by default; run with
 //! `cargo test --release -p cats-blockd --test commit_cost -- --ignored --nocapture`.
 
+use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use cats_blockd::engine::{ChunkEngine, EngineConfig};
+use cats_blockd::engine::{ChunkEngine, DurabilityMode, EngineConfig};
 use cats_blockd::format;
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
@@ -37,7 +38,8 @@ struct SizingBlob {
 impl BlobStore for SizingBlob {
     fn put_immutable(&self, key: &str, data: &[u8]) -> BlobResult<()> {
         if key.contains("/data/") {
-            self.data_bytes.fetch_add(data.len() as u64, Ordering::SeqCst);
+            self.data_bytes
+                .fetch_add(data.len() as u64, Ordering::SeqCst);
         }
         self.inner.put_immutable(key, data)
     }
@@ -74,10 +76,9 @@ fn object_store(dir: &Path, prefix: &str) -> Arc<dyn BlobStore> {
             if let Ok(region) = std::env::var("AWS_REGION") {
                 pairs.push(("region".to_string(), region));
             }
-            let config = AdapterConfig::from_pairs(
-                pairs.iter().map(|(k, v)| (k.as_str(), v.clone())),
-            )
-            .expect("s3 adapter options");
+            let config =
+                AdapterConfig::from_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.clone())))
+                    .expect("s3 adapter options");
             open_blob_store(
                 cats_object_store_aws_s3::ADAPTER_NAME,
                 &config,
@@ -96,6 +97,20 @@ fn bench_lease_ttl_ms() -> i64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5_000)
+}
+
+fn bench_samples() -> usize {
+    std::env::var("CATS_BENCH_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|samples| *samples > 0)
+        .unwrap_or(5)
+}
+
+/// Nearest-rank percentile over an already sorted, non-empty sample.
+fn percentile(sorted: &[f64], percent: usize) -> f64 {
+    let rank = (sorted.len() * percent).div_ceil(100);
+    sorted[rank.saturating_sub(1)]
 }
 
 struct Env {
@@ -143,6 +158,136 @@ fn env(chunks: u64, run: &str) -> Env {
     }
 }
 
+fn relaxed_env(chunks: u64, run: &str) -> Env {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let published = Arc::new(SizingBlob {
+        inner: object_store(dir.path(), run),
+        data_bytes: AtomicU64::new(0),
+    });
+    let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).expect("meta"));
+    meta.create_volume("vol_commit", chunks * CHUNK)
+        .expect("volume");
+    let meta_for_reattach = meta.clone();
+    let mut cfg = EngineConfig::new("vol_commit", dir.path().join("data"), "att-commit");
+    cfg.lease_ttl_ms = bench_lease_ttl_ms();
+    // No timer makes the two measured boundaries explicit: Guest FLUSH can
+    // only stage locally; the benchmark invokes the remote drain separately.
+    cfg.durability = DurabilityMode::Relaxed {
+        drain_interval_ms: 0,
+    };
+    let engine = ChunkEngine::attach(cfg, published.clone(), meta).expect("attach");
+    Env {
+        root: dir.path().to_path_buf(),
+        _dir: dir,
+        blob: published.clone(),
+        meta: meta_for_reattach,
+        engine,
+        published,
+    }
+}
+
+/// Measures the two Relaxed boundaries separately. The first number is what
+/// ext4 waits for (local immutable pack durability); the second is background
+/// S3/metadata publication. This deliberately asserts that no data object was
+/// published before the local ACK instead of accidentally reporting the sum.
+#[test]
+#[ignore = "benchmark; run explicitly with --ignored --nocapture"]
+fn relaxed_local_ack_and_remote_publish_cost_are_separate() {
+    let repeats = bench_samples();
+    let mut csv = std::env::var_os("CATS_BENCH_CSV").map(|path| {
+        let mut output = BufWriter::new(std::fs::File::create(path).expect("create benchmark CSV"));
+        writeln!(
+            output,
+            "dirty_chunks,sample,local_pack_bytes,local_flush_ms,remote_drain_ms,published_bytes"
+        )
+        .expect("write benchmark CSV header");
+        output
+    });
+    println!(
+        "\n{:>7} {:>7} {:>10}  {:>9} {:>9} {:>9} {:>9}  {:>9} {:>9} {:>9} {:>9}  {:>9}",
+        "chunks",
+        "samples",
+        "pack KiB",
+        "L p50 ms",
+        "L p95 ms",
+        "L p99 ms",
+        "L max ms",
+        "R p50 ms",
+        "R p95 ms",
+        "R p99 ms",
+        "R max ms",
+        "pub MiB"
+    );
+    for dirty_chunks in [1u64, 8, 32, 64] {
+        let mut local_samples = Vec::new();
+        let mut remote_samples = Vec::new();
+        let mut staged_bytes = 0;
+        let mut published_bytes = 0;
+        for repeat in 0..repeats {
+            let env = relaxed_env(
+                dirty_chunks,
+                &format!("relaxed-local-{dirty_chunks}-{repeat}"),
+            );
+            for chunk in 0..dirty_chunks {
+                env.engine
+                    .write(chunk * CHUNK + 123, &[0x7bu8; 4096])
+                    .expect("partial cold-cache write");
+            }
+
+            let started = Instant::now();
+            env.engine.flush().expect("local relaxed flush");
+            local_samples.push(started.elapsed().as_secs_f64() * 1000.0);
+
+            let local = env.engine.durability_status();
+            assert_eq!(local.local_durable_generation, 1);
+            assert_eq!(local.remote_durable_generation, 0);
+            assert_eq!(local.unpublished_generations, 1);
+            assert_eq!(env.published.data_bytes.load(Ordering::SeqCst), 0);
+            staged_bytes = local.unpublished_bytes;
+
+            let started = Instant::now();
+            env.engine.drain_staged().expect("remote drain");
+            remote_samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            let remote = env.engine.durability_status();
+            assert_eq!(
+                remote.local_durable_generation,
+                remote.remote_durable_generation
+            );
+            published_bytes = env.published.data_bytes.load(Ordering::SeqCst);
+            if let Some(output) = &mut csv {
+                writeln!(
+                    output,
+                    "{dirty_chunks},{repeat},{staged_bytes},{},{},{published_bytes}",
+                    local_samples.last().unwrap(),
+                    remote_samples.last().unwrap()
+                )
+                .expect("write benchmark CSV sample");
+            }
+            env.engine.detach().unwrap();
+        }
+        local_samples.sort_by(f64::total_cmp);
+        remote_samples.sort_by(f64::total_cmp);
+        println!(
+            "{:>7} {:>7} {:>10.1}  {:>9.2} {:>9.2} {:>9.2} {:>9.2}  {:>9.2} {:>9.2} {:>9.2} {:>9.2}  {:>9.2}",
+            dirty_chunks,
+            repeats,
+            staged_bytes as f64 / 1024.0,
+            percentile(&local_samples, 50),
+            percentile(&local_samples, 95),
+            percentile(&local_samples, 99),
+            local_samples.last().unwrap(),
+            percentile(&remote_samples, 50),
+            percentile(&remote_samples, 95),
+            percentile(&remote_samples, 99),
+            remote_samples.last().unwrap(),
+            published_bytes as f64 / MIB
+        );
+    }
+    if let Some(output) = &mut csv {
+        output.flush().expect("flush benchmark CSV");
+    }
+}
+
 /// One 64 KiB page dirtied per chunk: the shape a 4 KiB random-write Guest
 /// workload produces, where a tiny write used to dirty a whole 4 MiB chunk.
 #[test]
@@ -152,7 +297,12 @@ fn flush_cost_scales_with_the_dirty_set() {
     let repeats = 3;
     println!(
         "\n{:>12} {:>12} {:>14} {:>12} {:>16} {:>14}",
-        "dirty chunks", "dirty pages", "published MiB", "flush ms", "ms per pub MiB", "sha256 MiB/s"
+        "dirty chunks",
+        "dirty pages",
+        "published MiB",
+        "flush ms",
+        "ms per pub MiB",
+        "sha256 MiB/s"
     );
     for dirty_chunks in [1u64, 8, 16, 32, 48] {
         let mut samples = Vec::new();
@@ -169,7 +319,7 @@ fn flush_cost_scales_with_the_dirty_set() {
             env.engine.flush().expect("flush");
             samples.push(started.elapsed().as_secs_f64() * 1000.0);
             published = env.published.data_bytes.load(Ordering::SeqCst);
-            env.engine.detach();
+            env.engine.detach().unwrap();
         }
         samples.sort_by(f64::total_cmp);
         let flush_ms = samples[samples.len() / 2];
@@ -225,7 +375,7 @@ fn flush_cost_for_dense_writes() {
             env.engine.flush().expect("flush");
             samples.push(started.elapsed().as_secs_f64() * 1000.0);
             published = env.published.data_bytes.load(Ordering::SeqCst);
-            env.engine.detach();
+            env.engine.detach().unwrap();
         }
         samples.sort_by(f64::total_cmp);
         let flush_ms = samples[samples.len() / 2];
@@ -270,7 +420,7 @@ fn cold_read_cost_by_delta_chain_length() {
             }
             env.engine.flush().expect("delta flush");
         }
-        env.engine.detach();
+        env.engine.detach().unwrap();
 
         // A host with nothing cached.
         std::fs::remove_dir_all(env.data_dir()).ok();
@@ -284,7 +434,7 @@ fn cold_read_cost_by_delta_chain_length() {
             engine.read(chunk * CHUNK, &mut buf).expect("cold read");
         }
         let per_chunk = started.elapsed().as_secs_f64();
-        engine.detach();
+        engine.detach().unwrap();
 
         // Whole volume in one call: what a migration or a large sequential read
         // produces, where chunks overlap too.
@@ -294,7 +444,7 @@ fn cold_read_cost_by_delta_chain_length() {
         let started = Instant::now();
         engine.read(0, &mut whole).expect("bulk cold read");
         let bulk = started.elapsed().as_secs_f64();
-        engine.detach();
+        engine.detach().unwrap();
 
         let mib = (chunks * CHUNK) as f64 / MIB;
         println!(

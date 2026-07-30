@@ -29,9 +29,7 @@ use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
 use cats_object_store_file::FileBlobStore;
 use cats_storage::blob::{BlobStore, Result as BlobResult};
-use cats_storage::{
-    open_blob_store, AdapterConfig, BlobStoreFactory, MetadataStore, VolumeHead,
-};
+use cats_storage::{open_blob_store, AdapterConfig, BlobStoreFactory, MetadataStore, VolumeHead};
 
 const CHUNK: u64 = cats_api::chunk::CHUNK_SIZE as u64;
 const MIB: f64 = 1024.0 * 1024.0;
@@ -96,10 +94,9 @@ fn object_store(dir: &Path, prefix: &str) -> Arc<dyn BlobStore> {
             if let Ok(region) = std::env::var("AWS_REGION") {
                 pairs.push(("region".to_string(), region));
             }
-            let config = AdapterConfig::from_pairs(
-                pairs.iter().map(|(k, v)| (k.as_str(), v.clone())),
-            )
-            .expect("s3 adapter options");
+            let config =
+                AdapterConfig::from_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.clone())))
+                    .expect("s3 adapter options");
             open_blob_store(
                 cats_object_store_aws_s3::ADAPTER_NAME,
                 &config,
@@ -188,16 +185,21 @@ fn provision_by_copy(env: &Env, volume: &str, image: &Path, size: u64) {
         offset = end;
     }
     engine.flush().expect("seed flush");
-    engine.detach();
+    engine.detach().unwrap();
 }
 
 /// The new path: reference the already-published image.
-fn provision_by_reference(env: &Env, volume: &str, manifest: &cats_blockd::format::ImageManifest, size: u64) {
+fn provision_by_reference(
+    env: &Env,
+    volume: &str,
+    manifest: &cats_blockd::format::ImageManifest,
+    size: u64,
+) {
     let engine = attach(env, volume, size);
     engine
         .provision_from_image(manifest)
         .expect("provision from image");
-    engine.detach();
+    engine.detach().unwrap();
 }
 
 fn head(env: &Env, volume: &str) -> VolumeHead {
@@ -312,8 +314,11 @@ fn provisioning_many_root_disks_from_one_image() {
         for (index, by_reference) in [false, true].into_iter().enumerate() {
             let env = env(&format!("many-{cats}-{by_reference}"));
             let image = golden_image(&env.root, image_mib);
-            let manifest = by_reference
-                .then(|| image::publish(env.blob.as_ref(), &image).expect("publish").manifest);
+            let manifest = by_reference.then(|| {
+                image::publish(env.blob.as_ref(), &image)
+                    .expect("publish")
+                    .manifest
+            });
             env.counters.volume_bytes.store(0, Ordering::SeqCst);
             env.counters.volume_objects.store(0, Ordering::SeqCst);
 
@@ -358,10 +363,7 @@ fn first_read_of_a_referenced_chunk_versus_a_private_one() {
     let image_mib = 64u64;
     let size = cats_api::chunk::round_up_to_chunk(image_mib * MIB as u64);
     let chunks = size / CHUNK;
-    println!(
-        "\n{:>12} {:>18} {:>18}",
-        "path", "cold read ms", "MiB/s"
-    );
+    println!("\n{:>12} {:>18} {:>18}", "path", "cold read ms", "MiB/s");
     for by_reference in [false, true] {
         let env = env(&format!("read-{by_reference}"));
         let image = golden_image(&env.root, image_mib);
@@ -381,7 +383,7 @@ fn first_read_of_a_referenced_chunk_versus_a_private_one() {
             engine.read(chunk * CHUNK, &mut buf).expect("cold read");
         }
         let elapsed = started.elapsed().as_secs_f64();
-        engine.detach();
+        engine.detach().unwrap();
         println!(
             "{:>12} {:>18.1} {:>18.0}",
             if by_reference { "reference" } else { "copy" },

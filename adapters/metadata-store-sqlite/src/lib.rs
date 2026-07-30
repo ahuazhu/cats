@@ -338,17 +338,15 @@ impl MetadataStore for SqliteMetadataStore {
                 "cas_head must advance the generation: {expected_generation} -> {new_generation}"
             )));
         }
-        let now = now_ms();
         let conn = self.connection()?;
         let n = conn
             .execute(
                 "UPDATE volumes
-                    SET root_hash = ?3, root_object_id = ?4, generation = ?8
+                    SET root_hash = ?3, root_object_id = ?4, generation = ?7
                   WHERE volume_id = ?1
                     AND generation = ?2
                     AND lease_owner = ?5
-                    AND lease_epoch = ?6
-                    AND lease_expires_at_ms > ?7",
+                    AND lease_epoch = ?6",
                 params![
                     volume_id,
                     expected_generation,
@@ -356,7 +354,6 @@ impl MetadataStore for SqliteMetadataStore {
                     new_root_object_id,
                     attachment_id,
                     epoch,
-                    now,
                     new_generation
                 ],
             )
@@ -553,21 +550,27 @@ mod tests {
     }
 
     #[test]
-    fn cas_requires_generation_owner_epoch_and_live_lease() {
+    fn cas_requires_generation_owner_and_epoch() {
         let (_d, m) = store();
         m.create_volume("v1", 1 << 22).unwrap();
         let epoch = m.acquire_lease("v1", "attA", 60_000).unwrap();
-        let g1 = m.cas_head("v1", 0, 1, [1; 32], "obj1", "attA", epoch).unwrap();
+        let g1 = m
+            .cas_head("v1", 0, 1, [1; 32], "obj1", "attA", epoch)
+            .unwrap();
         assert_eq!(g1, 1);
         // Wrong expected generation.
-        assert!(m.cas_head("v1", 0, 1, [2; 32], "obj2", "attA", epoch).is_err());
+        assert!(m
+            .cas_head("v1", 0, 1, [2; 32], "obj2", "attA", epoch)
+            .is_err());
         // Wrong epoch.
         assert!(m
             .cas_head("v1", 1, 2, [2; 32], "obj2", "attA", epoch + 1)
             .is_err());
         // Fenced holder cannot CAS.
         m.revoke_lease("v1").unwrap();
-        assert!(m.cas_head("v1", 1, 2, [2; 32], "obj2", "attA", epoch).is_err());
+        assert!(m
+            .cas_head("v1", 1, 2, [2; 32], "obj2", "attA", epoch)
+            .is_err());
         // New holder continues from the committed generation.
         let e2 = m.acquire_lease("v1", "attB", 60_000).unwrap();
         let g2 = m.cas_head("v1", 1, 2, [3; 32], "obj3", "attB", e2).unwrap();
@@ -587,6 +590,23 @@ mod tests {
         assert!(e2 > e1);
         assert!(m.cas_head("v1", 0, 1, [1; 32], "obj", "attA", e1).is_err());
         assert!(m.cas_head("v1", 0, 1, [1; 32], "obj", "attB", e2).is_ok());
+    }
+
+    #[test]
+    fn lapsed_but_unclaimed_owner_can_publish() {
+        let (_d, m) = store();
+        m.create_volume("v1", 1 << 22).unwrap();
+        let epoch = m.acquire_lease("v1", "attA", 1).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Expiry only opens the acquisition window. Until another attachment
+        // actually acquires (and bumps the epoch), attA is still the sole
+        // fencing-token holder and must not self-fence during a publish.
+        assert_eq!(
+            m.cas_head("v1", 0, 1, [9; 32], "obj9", "attA", epoch)
+                .unwrap(),
+            1
+        );
     }
 
     /// A lapse alone must stay renewable: a slow attach or a metadata hiccup
@@ -623,7 +643,8 @@ mod tests {
         let (_d, m) = store();
         m.create_volume("v1", 1 << 22).unwrap();
         let epoch = m.acquire_lease("v1", "attA", 60_000).unwrap();
-        m.cas_head("v1", 0, 1, [7; 32], "obj7", "attA", epoch).unwrap();
+        m.cas_head("v1", 0, 1, [7; 32], "obj7", "attA", epoch)
+            .unwrap();
         let snap = m.create_snapshot("snap_1", "v1").unwrap();
         assert_eq!(snap.generation, 1);
         assert_eq!(snap.root_hash, Some([7; 32]));

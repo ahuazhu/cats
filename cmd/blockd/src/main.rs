@@ -120,20 +120,39 @@ struct Args {
     ///
     /// `strict` (default): after the commit is durable in the object store.
     /// `relaxed`: after the pack is durable on local disk; a background
-    /// committer publishes every `drain_interval_ms`. Relaxed trades a bounded
-    /// loss window on host loss for local-latency fsync.
+    /// committer publishes every `drain_interval_ms`. Relaxed trades the
+    /// currently observed unpublished age/bytes on Host loss for local-latency
+    /// fsync; the interval is a publication target, not an RPO guarantee.
     #[arg(long, default_value = "strict")]
     durability: String,
 
-    /// Relaxed mode: how often the background committer publishes staged
-    /// packs. Bounds the loss window together with the staged-pack cap.
+    /// Relaxed mode: target interval for publishing staged packs. A remote
+    /// outage can extend the actual RPO; query `status` on the control socket
+    /// for the authoritative unpublished age and bytes.
     #[arg(long, default_value_t = 5_000)]
     drain_interval_ms: u64,
 
+    /// Relaxed mode: local NVMe bytes reserved for acknowledged generations
+    /// that have not reached the remote durability watermark.
+    #[arg(long, default_value_t = cats_blockd::engine::DEFAULT_MAX_STAGED_BYTES)]
+    max_staged_bytes: u64,
+
+    /// Relaxed mode: maximum number of locally durable, remotely unpublished
+    /// generations. Complements the byte cap for tiny fsync-heavy workloads.
+    #[arg(long, default_value_t = cats_blockd::engine::DEFAULT_MAX_STAGED_PACKS)]
+    max_staged_packs: usize,
+
+    /// Physical local footprint ceiling for this volume's cache blocks plus
+    /// remotely unpublished packs. Clean LRU chunks are hole-punched first;
+    /// authoritative local state is backpressured, never evicted.
+    #[arg(long, default_value_t = cats_blockd::engine::DEFAULT_MAX_LOCAL_BYTES)]
+    max_local_bytes: u64,
+
     /// Host-side control socket. One command per connection, one line each
     /// way: `drain` publishes every staged pack and answers `OK <generation>`
-    /// or `ERR <message>`. The node agent uses it at the forced flush points
-    /// of the relaxed contract (ADR-0021); on a strict volume it is a no-op.
+    /// or `ERR <message>`; `status` answers `OK <json>` with both durability
+    /// watermarks and the local backlog. The node agent uses `drain` at forced
+    /// flush points; on a strict volume it is a no-op.
     #[arg(long)]
     listen_control: Option<PathBuf>,
 }
@@ -295,6 +314,9 @@ fn main() -> Result<()> {
         attachment_id,
         lease_ttl_ms: args.lease_ttl_ms,
         durability,
+        max_staged_bytes: args.max_staged_bytes,
+        max_staged_packs: args.max_staged_packs,
+        max_local_bytes: args.max_local_bytes,
     };
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_millis(args.acquire_wait_ms);
@@ -325,7 +347,7 @@ fn main() -> Result<()> {
 
     if args.collect_garbage {
         let stats = engine.collect_garbage().context("collect garbage")?;
-        engine.detach();
+        engine.detach().context("detach after garbage collection")?;
         println!(
             "GC data_live={} data_deleted={} nodes_live={} nodes_deleted={}",
             stats.data_objects_live,
@@ -384,7 +406,9 @@ fn main() -> Result<()> {
     let mut nbd_threads = Vec::new();
     if let Some(listener) = nbd_unix {
         let engine = engine.clone();
-        nbd_threads.push(std::thread::spawn(move || nbd::serve_unix(listener, engine)));
+        nbd_threads.push(std::thread::spawn(move || {
+            nbd::serve_unix(listener, engine)
+        }));
     }
     if let Some(listener) = nbd_tcp {
         let engine = engine.clone();
@@ -399,7 +423,10 @@ fn main() -> Result<()> {
             }
         }));
     }
-    serve_vhost_user(vhost_user, &vhost_user_args, engine, nbd_threads)
+    let serving = serve_vhost_user(vhost_user, &vhost_user_args, engine.clone(), nbd_threads);
+    let detached = engine.detach().context("final blockd drain and detach");
+    serving?;
+    detached
 }
 
 /// The host-side control plane of one blockd: line-oriented, one command per
@@ -419,6 +446,10 @@ fn serve_control(listener: UnixListener, engine: std::sync::Arc<cats_blockd::eng
                 "drain" => match engine.drain_staged() {
                     Ok(generation) => format!("OK {generation}\n"),
                     Err(error) => format!("ERR {error}\n"),
+                },
+                "status" => match serde_json::to_string(&engine.durability_status()) {
+                    Ok(status) => format!("OK {status}\n"),
+                    Err(error) => format!("ERR serialize status: {error}\n"),
                 },
                 other => format!("ERR unknown command {other:?}\n"),
             };
@@ -470,7 +501,9 @@ fn bind_vhost_user(args: &VhostUserArgs) -> Result<Option<vhost::vhost_user::Lis
 #[cfg(not(target_os = "linux"))]
 fn bind_vhost_user(args: &VhostUserArgs) -> Result<Option<()>> {
     if args.socket.is_some() {
-        bail!("--listen-vhost-user requires Linux (vhost-user needs eventfd and shared Guest memory)");
+        bail!(
+            "--listen-vhost-user requires Linux (vhost-user needs eventfd and shared Guest memory)"
+        );
     }
     Ok(None)
 }
@@ -484,8 +517,12 @@ fn serve_vhost_user(
 ) -> Result<()> {
     match listener {
         Some(mut listener) => {
-            cats_blockd::vhost_user::serve_listener(&mut listener, engine, vhost_user_options(args))
-                .context("serve vhost-user-blk")?;
+            cats_blockd::vhost_user::serve_listener(
+                &mut listener,
+                engine,
+                vhost_user_options(args),
+            )
+            .context("serve vhost-user-blk")?;
             tracing::info!("vhost-user client disconnected; detaching");
             Ok(())
         }

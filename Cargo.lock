@@ -1019,6 +1019,7 @@ dependencies = [
  "cats-object-store-file",
  "cats-storage",
  "clap",
+ "serde_json",
  "tempfile",
  "tracing",
  "tracing-subscriber",

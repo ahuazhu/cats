@@ -94,9 +94,8 @@ UPDATE volumes
  WHERE volume_id = :vol
    AND generation = :expected_generation
    AND lease_owner = :attachment_id
-   AND lease_epoch = :epoch
-   AND lease_expires_at > now
--- 受影响行数必须恰好为 1，否则本次 FLUSH 失败且不得 ACK
+   AND lease_epoch = :epoch;
+-- 受影响行数必须恰好为 1，否则本次远端发布失败
 ```
 
 ### 4.1 Lease / Fencing
@@ -104,8 +103,11 @@ UPDATE volumes
 - `acquire_lease(volume, attachment, ttl)`：仅当无有效租约（过期或空）时成功；成功即 `lease_epoch += 1` 并返回新 epoch。
 - `renew_lease` 必须携带当前 epoch；不匹配即失败，blockd 进入 **fenced**：拒绝新 WRITE/FLUSH（返回错误），在飞提交一律作废。
 - 旧 epoch 的任何 Root CAS 必然 0 行受影响 —— 这是双写防护的最后一道闸，与租约到期判断相互独立。
+- expiry 只打开竞争 acquire 的窗口，不参与相同 owner/epoch 的 Root CAS。短暂
+  renewal lapse 不得自我 fence；竞争 acquire 或显式 revoke 必须原子增加 epoch，
+  之后旧 Writer 的 renew/CAS 才 fail closed。
 
-## 5. 本地状态（可全部删除的 Cache + 提交暂存）
+## 5. 本地状态（Cache + Relaxed 权威暂存）
 
 ```text
 <data-dir>/cache.data                  # 单个稀疏 cache 文件，offset = 逻辑偏移
@@ -113,9 +115,14 @@ UPDATE volumes
 <data-dir>/pending/<txn>.pack          # 冻结的 Pending Commit Pack
 ```
 
-- **写路径**：WRITE → 若目标 chunk 已有已提交 Base 且 cache 未水化，先整 chunk 水化（读远端→cache）；写 cache；置位 dirty 页；对 bitmap 文件 fdatasync 后 ACK（普通写=易失缓存语义，bitmap 持久化保证的是重启后不"漏提交"，不是数据持久）。
+- **Strict 写路径**：WRITE → 若目标 chunk 已有已提交 Base 且 cache 未水化，先整
+  chunk 水化；写 cache；记录 dirty page/range。
+- **Relaxed 写路径**：冷缓存局部 WRITE 不先 GET 旧 chunk。只写新 bytes，并记录
+  精确 dirty byte ranges；FLUSH 把 ranges 与 payload 固定进本地 pack，后台
+  publisher 才读取 remote base 并合成可发布 page/base。
 - **读路径**：cache 命中直接返回；miss 按当前 Map 解析 → Hole 返回零 → Base 下载并验 sha256 后水化 cache。同一 chunk 的并发 miss 必须合并为一次下载（singleflight）。
-- 删除整个 `<data-dir>` 后，凭 MetadataStore 的 Root + 远端对象必须能完整重建（空缓存冷恢复）。
+- `R == L` 时删除整个 `<data-dir>` 后可凭远端状态重建；Relaxed 的 `R < L`
+  时 pending pack 是唯一权威副本，绝不能删除。
 
 ### 5.1 dirty.bitmap
 
@@ -143,35 +150,57 @@ header JSON：
   "base_generation": N,
   "lease_epoch": E,
   "entries": [
-    {"chunk_idx": i, "payload_offset": o, "len": l, "sha256_hex": "…"}
+    {
+      "chunk_idx": i,
+      "payload_offset": o,
+      "len": l,
+      "sha256_hex": "…",
+      "page_mask": m,
+      "byte_ranges": [{"chunk_offset": b, "payload_offset": p, "len": n}]
+    }
   ]
 }
 ```
 
 写入顺序：写临时文件 → fdatasync → rename 为 `<txn>.pack` → fdatasync 目录。
+`byte_ranges` 缺失/为空表示旧 pack，继续按 `page_mask`/整块格式重放。
 
-## 6. FLUSH 提交协议（持久性边界）
+## 6. FLUSH 提交协议（双持久化水位）
 
-顺序固定，不可交换（Direct-S3 设计 §7）：
+每卷维护 `L = local_durable_generation` 和
+`R = remote_durable_generation`，始终 `R <= L`。顺序固定，不可交换
+（Direct-S3 设计 §7、[ADR-0022](../decisions/0022-relaxed-local-first-dual-watermark.md)）：
 
 1. 捕获屏障：冻结当前 dirty set（清 volatile 位图对应位，新写进入下一集合）。
-2. 生成并落盘 Pending Pack（§5.2）。
-3. 对每个 entry：PUT `data/<txn>-c<idx>`（幂等，重试同键）。
+2. 生成并落盘 Pending Pack（§5.2）；完成 fsync/rename/directory fsync 后 `L`
+   前进。Relaxed 此时向 Guest ACK；Strict 继续等待。
+3. 后台 publisher 按 generation 读取 pack。若有 `byte_ranges`，读取远端 base
+   并按序叠加，构造完整 page/base；PUT `data/<txn>-c<idx>`（幂等，重试同键）。
 4. 构造新 Leaf/Root，PUT `maps/…`；PUT `commits/<gen+1>-<txn>.json`。
-5. Root CAS（§4）。恰好 1 行 → 持久点达成。
+5. Root CAS（§4）。恰好 1 行 → `R` 前进；Strict 此时向 Guest ACK。
 6. 清持久 bitmap 中该集合的位；删除 pack。
-7. 向 Guest 返回 FLUSH 成功。
 
 dirty set 为空时 FLUSH 直接成功（generation 不变）。
 
+Relaxed 的 Guest WRITE/FLUSH 线程不得调用 S3 PUT/GET 或 PostgreSQL CAS。S3/DB
+普通错误由 publisher 记录并重试，不直接作为 Guest EIO；CAS owner/epoch
+冲突、校验损坏、本地 fsync/ENOSPC 则仍 fail closed。到 staged/physical quota
+时先 LRU hole-punch clean committed cache；dirty/staged/I/O chunks 被 pin。
+只剩 pin 数据时前台在 condvar 背压，等待 publisher 回收空间。
+admission 必须把“当前 dirty set 的未来 pack”作为 accounted reservation；
+接近水位可隐式执行一次仅本地 stage 并 kick publisher，防止 cache 吃满后再也
+没有空间生成 pack。
+
 ### 6.1 崩溃恢复规则
 
-启动时扫描 `pending/*.pack`，对每个 pack：
+启动时扫描 `pending/*.pack`，先重建 `L` 和本地有序队列，不在 Relaxed attach
+恢复阶段执行远端写；后台 publisher 随后对每个 pack：
 
 - 读 MetadataStore 当前 generation：
   - `generation > base_generation` 且 `commits/<base+1>-<txn>` 存在 → **CAS 已发生**：只清位图/删 pack，不得重复提交；
   - 否则 → 从 pack 幂等重放步骤 3–6（对象 PUT 键不变）。
-- 重放前必须验证租约 epoch 仍属于本 attachment；已被 fence 则丢弃 pack 并保持只读。
+- 重放前必须验证租约 epoch 仍属于本 attachment；已被 fence 则保持 pack 并
+  fail closed，不能把唯一的本地 ACK 数据当 cache 丢弃。
 - CAS 前崩溃产生的无 Root 引用对象成为 Orphan，由 GC 按 grace period 清理；恢复流程不负责删除。
 
 ### 6.2 发布粒度：Delta Pack（[ADR-0016](../decisions/0016-delta-pack-page-granular-commits.md)）
@@ -266,11 +295,27 @@ socket，两者服务同一个 engine 与同一个 attachment lease。
 
 ## 8. 正确性判据（测试必须覆盖）
 
-1. 任意时刻 kill -9 blockd，重启恢复后：已 ACK 的 FLUSH 数据可读且 digest 一致；未 ACK 的 FLUSH 要么完整可见要么完全不可见（generation 原子推进）。
-2. 删除全部本地状态后空缓存懒读，全卷 digest 与删除前一致，且只下载被读到的对象。
-3. 旧 epoch 的 blockd 无法完成任何 Root CAS，也无法在续租失败后继续 ACK 写。
+1. Strict：任意时刻 kill -9/删除 Host 后，已 ACK FLUSH 从远端可恢复；
+   Relaxed：同 Host blockd 重启从 pack 恢复全部 ACK 数据，Host 永久丢失只承诺
+   `R` 并准确报告故障时 `L-R`。
+2. 仅在 `R == L` 后删除全部本地状态，空缓存懒读全卷 digest 与删除前一致。
+3. 竞争 acquire/revoke 增加 epoch 后，旧 blockd 无法完成任何 Root CAS 或继续
+   ACK 写；单纯 expiry lapse 不自我 fence。
 4. 同一 txn 重放不产生第二个 generation。
 5. Hole 读取恒为零且不产生远端 GET。
+6. Relaxed 冷 cache 局部 WRITE/FLUSH 不产生远端 GET；publisher 合并后 fresh-host
+   byte digest 一致。
+7. Stop/Warm/Snapshot/Detach/计划迁移必须 drain 到 `R == L`；失败保留
+   pending、lease 与源 runtime，重试成功前不得越过生命周期边界。
+
+### 8.1 控制命令与可观测性
+
+- `status` 返回 durability mode、local/remote generation、unpublished
+  generations/bytes/oldest age、max staged/local bytes、allocated/accounted
+  bytes、eviction、backpressure、fenced 和 last publish error。
+- `drain`/final detach 只在 `R == L` 后成功并释放 lease。失败必须可重试，
+  不能清理 journal。
+- 上述 quota 当前是每卷隔离；不是跨 blockd 进程的 Host 总容量证明。
 
 ## 9. GC（对象回收）
 
