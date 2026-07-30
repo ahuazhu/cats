@@ -711,13 +711,20 @@ object-store adapter，而不是核心代码的云依赖。
 | Guest 操作 | Host 行为 | 返回成功条件 | Host 丢失后的保证 |
 |----|----|----|----|
 | 普通 WRITE | 写入本地 cache，先保守标记 dirty | 数据已进入受管理本地写缓存 | 如果还没有 FLUSH，允许丢失 |
-| FUA WRITE | 按协商能力作为带持久屏障的写处理 | 对应数据达到远端 durable root | 必须恢复 |
-| FLUSH | 冻结当前 dirty set，创建 immutable Pending Commit Pack，上传并原子发布 root | 远端对象和权威 root/metadata 提交完成 | 必须恢复；可以重复执行同一 transaction |
+| FUA WRITE | 按盘的 durability 模式作为带持久屏障的写处理 | Strict：远端 root；Relaxed：本地 immutable pack | Strict 必须恢复；Relaxed 从远端水位恢复 |
+| FLUSH | 冻结 dirty set 并持久化 immutable Pending Pack；后台按序上传并 CAS root | Strict：`R == L`；Relaxed：本地水位 `L` 前进 | Strict 为 Host-loss RPO 0；Relaxed 可丢故障时 `L-R` |
 | READ hit | 从 NVMe clean/dirty cache 返回 | 校验内存/本地元数据成功 | 不影响持久状态 |
 | READ miss | 按 LBA map 从对象存储 lazy GET，校验后进入 clean cache | 下载和 checksum 通过 | 无需下载整块逻辑盘 |
 | DISCARD/TRIM | 更新 sparse map / punch hole，后续随 FLUSH 发布 | 按 negotiated 语义完成 | 成功 FLUSH 后不再要求保留被 trim 的逻辑内容 |
 
 **不是完整 WAL：**V1 使用 Dirty Bitmap + 每次 FLUSH 的 immutable Pending Commit Pack。它固定屏障前的数据集合，让屏障后的新写入进入下一组 dirty set。只有当产品要求“所有已 ACK 但未 FLUSH 的普通写在 Host 永久损坏后也不丢”时，才需要跨 Host 复制的低延迟 WAL；单机 NVMe WAL 不能解决 Host 丢失。
+
+**双水位（[ADR-0022](decisions/0022-relaxed-local-first-dual-watermark.md)）：**
+`L` 是本地 NVMe 已持久的 generation，`R` 是 S3 对象 + PostgreSQL Root CAS
+已持久的 generation，始终 `R <= L`。Relaxed 的 Guest WRITE/FLUSH 不执行
+S3/DB 调用；有界后台 publisher 推进 `R`。因此远端瞬时故障首先表现为真实
+RPO 积压和配额背压，而不是 ext4 EIO。`R < L` 时本地 pending 不是 cache，
+Stop/Warm/Snapshot/Detach/计划迁移必须 drain 到 `R == L` 才能清理源。
 
 ### 10.2 后端决策（ADR-0003）
 
@@ -934,7 +941,9 @@ score(node) =
 
 **\< 30s P99**目标：Cold → shell ready（标准镜像）
 
-**RPO 0（目标）**：对成功返回的磁盘 FLUSH，区域内设计目标
+**RPO 0（目标）**：只适用于 Strict 成功 FLUSH。Relaxed 的 Host-loss RPO
+是故障瞬间实际 `L-R` 的 generation、bytes 和 oldest age，不是 publisher
+定时器配置。
 
 ### 14.1 故障矩阵
 
@@ -942,13 +951,13 @@ score(node) =
 |----|----|----|----|
 | 单 API Pod | 重试一次请求 | LB 切换；幂等键返回原 Operation | 事务已提交则不重复；未提交则无变化 |
 | Controller Pod | 长操作暂缓 | reconcile lease 到期，其他副本接管并读取当前状态 | 不影响运行中 I/O |
-| PostgreSQL 主库 | 新变更/FLUSH root CAS 暂停 | 托管 HA failover；客户端重连 | 同步提交的控制 metadata 不丢；写路径回压 |
+| PostgreSQL 主库 | 控制变更/远端 publish 暂停 | 托管 HA failover；客户端有界排队、deadline、重连 | Strict FLUSH 等待/失败；Relaxed 本地 ACK 到配额水位后背压 |
 | Event Bus | 操作唤醒延迟 | Outbox 保留；Controller 周期扫描补偿 | 数据库仍是权威状态 |
 | Edge 实例 | 部分连接断开 | LB 切换；客户端重连，route cache 重建 | 无磁盘影响 |
 | cat-agent | 该 Node 新管理操作暂停；Guest 可继续运行 | systemd 重启；与 VMM 实际状态重建 inventory | 块后端独立存活时 I/O 继续 |
-| 单 VMM | 一个 Cat 中断 | 同 Node 重启或重新调度 | 从最后 FLUSH 的 RootDisk 恢复；未 flush 写可丢 |
-| 整台 Node | 该 Node 上 Cat 连接中断 | 云 fencing/Node lease 确认后，在其他 Node 批量冷恢复 | 成功 FLUSH 的磁盘恢复；RAM 丢失 |
-| 对象存储限流 | 冷读和 FLUSH 变慢 | 指数退避、并发整形、clean cache 继续读；dirty 达上限后回压 Guest | 绝不能在远端未持久时返回 FLUSH 成功 |
+| 单 VMM/blockd | 一个 Cat 中断 | 同 Host 从本地 pending 恢复 blockd，必要时重启 VMM | Relaxed 重建 `L` 后后台发布；不在 attach 阶段做远端写 |
+| 整台 Node | 该 Node 上 Cat 连接中断 | 云 fencing/Node lease 确认后，在其他 Node 批量冷恢复 | Strict 成功 FLUSH 恢复；Relaxed 恢复到 `R`，丢故障时 `L-R`；RAM 丢失 |
+| 对象存储限流 | 冷读变慢；Strict FLUSH 变慢；Relaxed 积压增长 | publisher 重试、clean cache 继续读、LRU 淘汰；只剩 pin 数据后背压 | Relaxed 不把普通远端错误注入 ext4；强制 drain 不成功就不清理源 |
 | 区域故障 | V1 服务中断 | 按灾备 Runbook 恢复控制面与副本 | 取决于跨 Region 复制；V1 不承诺 RPO 0 |
 
 ### 14.2 Host 故障的风暴控制
@@ -992,7 +1001,7 @@ score(node) =
 | Scheduler | pending、filter reason、reservation、placement latency | 候选数、最终 score、拒绝原因 | 无容量、偏斜、reservation 泄漏 |
 | Node/VMM | CPU、RSS、steal、VM exits、boot time、cgroup throttling | VMM event、agent job、kernel error | KVM error、NVMe SMART、心跳、VMM crash loop |
 | 网络 | pps/bytes/conns、route lookup、TLS、backend latency、egress | route epoch、endpoint、reset reason | route miss、旧 epoch、连接耗尽、错误率 |
-| 存储 | IOPS、latency、cache hit、dirty bytes、FLUSH、GET/PUT、GC | generation、txn、lease、checksum | dirty 高水位、FLUSH 超时、stale writer、checksum failure |
+| 存储 | IOPS、local/remote FLUSH latency、cache hit、allocated/accounted/max local bytes、GET/PUT、GC | local/remote generation、unpublished bytes/age、publish error、lease epoch | 积压不收敛、物理/预留水位、backpressure、fenced、stale writer、checksum failure |
 | 产品 | create/start success、cold start、shell connect、active cats | 用户可读 operation timeline | 按套餐/Region 的成功率和 SLO burn |
 
 ### 15.1 日志保留与隐私
@@ -1278,7 +1287,11 @@ NodeJobResult {
 - OCI Registry
 - 托管日志/指标/trace backend
 
-**上线阻断项：**任何成功 FLUSH 在删除整台 Host 后不能恢复；旧 Attachment epoch 仍能写；同一 PersistentDisk 能出现两个 writer；Route 能跨租户或落到旧 Guest；API 重试能创建重复资源；Secret 出现在日志；Node 升级没有 drain/rollback；或无法从备份恢复 PostgreSQL。
+**上线阻断项：**Strict 成功 FLUSH 在删除整台 Host 后不能恢复；Relaxed 无法
+报告实际 `L-R`，或强制 drain 失败后仍删除源；旧 Attachment epoch 仍能写；
+同一 PersistentDisk 能出现两个 writer；Route 能跨租户或落到旧 Guest；API
+重试能创建重复资源；Secret 出现在日志；Node 升级没有 drain/rollback；或
+无法从备份恢复 PostgreSQL。
 
 ## 20. 验收与测试体系
 
@@ -1289,7 +1302,7 @@ NodeJobResult {
 | Unit / property | 状态机、RBAC、quota、scheduler、Map、bitmap、serialization、错误分类 | 覆盖率、随机种子、失败最小样例 |
 | API contract | CLI/API/UI parity、Idempotency、If-Match、operation、pagination、tenant scope | OpenAPI diff、兼容测试、越权用例 |
 | Node integration | 真实 CH、vsock、tap、vhost-user-blk、cgroup、Guest Agent | 版本矩阵、boot logs、性能分布 |
-| Storage crash | kill -9 blockd/agent/VMM/Host；S3 timeout；DB failover；FLUSH 各阶段崩溃 | 恢复 generation、fsck、digest、orphan 清单 |
+| Storage crash | kill -9 blockd/agent/VMM/Host；S3 timeout；DB failover；双水位各阶段崩溃；强制 drain 失败 | 恢复 local/remote generation、实际 RPO、fsck、digest、源状态与 orphan 清单 |
 | Multi-node | cordon/drain、Node Lost、route rebinding、RWO fencing、恢复风暴 | timeline、旧 epoch 拒绝、连接错误率 |
 | Workload | git clone/checkout/status、apt/npm/pip、SQLite/PostgreSQL client、编译、大量小文件 | wall time、IOPS、PUT/GET、写放大、FLUSH P99 |
 | Security | Guest escape 面、SSRF、metadata access、path traversal、token replay、cross-tenant route/disk | 威胁模型、渗透报告、修复追踪 |

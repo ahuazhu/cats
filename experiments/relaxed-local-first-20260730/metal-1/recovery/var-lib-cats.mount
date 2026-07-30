@@ -1,0 +1,13 @@
+[Unit]
+Description=Cats local instance-store data
+Before=cats-worker.service
+
+[Mount]
+What=/dev/disk/by-label/cats-data
+Where=/var/lib/cats
+Type=ext4
+Options=noatime
+TimeoutSec=60
+
+[Install]
+WantedBy=multi-user.target
