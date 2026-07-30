@@ -743,6 +743,11 @@ Cat 不是容器，但镜像分发可以复用 OCI 的内容寻址和 Registry �
 5.  漏洞扫描、SBOM、签名。
 6.  写入不可变 digest；通过 channel 指针推广 dev → canary → stable。
 
+默认 Ubuntu Guest 以 systemd 为 PID 1（ADR-0023）。RootDisk 扩容、确定性 tap
+配置和 Guest Agent 是 `sysinit.target` 前的早期 unit；普通 enabled user service
+继续按标准 `multi-user.target` 启动。平台 readiness 只等待 Guest Agent，不把完整
+systemd transaction 或所有用户服务混成同一个边界。
+
 ### Cat 启动
 
 1.  Image digest 决定 Kernel/Root 基线，不读取 mutable tag。
@@ -1248,7 +1253,7 @@ NodeJobResult {
 | `control-plane/` | Resource API、Operation、Scheduler、Controllers、PostgreSQL/outbox | 单节点 create → run → stop → start reconcile 闭环 |
 | `node-agent/` | Cloud Hypervisor、cgroup、tap、blockd 和 Guest Agent 生命周期 | mTLS Job、job journal、inventory 重建、Cold fallback |
 | `blockd/` | vhost-user-blk、Cache、Chunk/Manifest、FLUSH、lease/fencing | 先复用 lazy-ext4 oracle 完成单写和 crash consistency |
-| `guest/` | versioned kernel、initramfs、PID 1 / Guest Agent | direct boot、vsock readiness、mount/sync/resize |
+| `guest/` | versioned kernel、initramfs、systemd PID 1 / Guest Agent | direct boot、early-unit vsock readiness、mount/sync/resize |
 | `network/` | Node gateway、Endpoint route、TLS、private network | 一个 Cat 的 HTTP/WS 和 shell/exec 稳定路由 |
 | `experiments/` | 机制验证、原始 CSV、故障现场 | 继续作为证据，不被生产代码依赖 |
 

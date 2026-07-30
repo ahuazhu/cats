@@ -397,7 +397,7 @@
 
       <div class="two-col">
         <article class="card"><h3>进入 Cold</h3><ol><li>阻止新 exec、deploy、mount 和流量激活。</li><li>如果还在 Running，Guest syncfs；如果已 Suspended，使用暂停前的 durable generation。</li><li>确保所有 Pending Commit 已完成或明确失败。</li><li>Route 变为 unbound/cold。</li><li>Cloud Hypervisor shutdown/exit。</li><li>停止 cats-blockd，释放 runtime lease。</li><li>删除 tap、socket、cgroup、memory backing 和本地 Secret。</li><li>clean cache 进入立即可淘汰队列。</li></ol></article>
-        <article class="card"><h3>Cold 唤醒</h3><ol><li>Scheduler 选择任意健康 Node。</li><li>创建更高 Attachment fencing epoch。</li><li>启动空或复用 clean cache 的 cats-blockd。</li><li>建立 tap、vsock、cgroup 和 VMM 配置。</li><li>启动全新的 Cloud Hypervisor。</li><li>Guest 从 RootDisk boot；ext4 journal recovery。</li><li>Guest Agent Ready 后发布 route epoch。</li><li>用户进程按 image/service policy 重新启动。</li></ol></article>
+        <article class="card"><h3>Cold 唤醒</h3><ol><li>Scheduler 选择任意健康 Node。</li><li>创建更高 Attachment fencing epoch。</li><li>启动空或复用 clean cache 的 cats-blockd。</li><li>建立 tap、vsock、cgroup 和 VMM 配置。</li><li>启动全新的 Cloud Hypervisor。</li><li>Guest 从 RootDisk boot；ext4 journal recovery。</li><li>Guest Agent Ready 后发布 route epoch。</li><li>默认 Ubuntu Guest 的 systemd 重新启动 enabled user service；Guest Agent readiness 与 User Service readiness 分开报告（ADR-0023）。</li></ol></article>
       </div>
 
       <h3 style="margin-top:28px">9.1 VMM 退出后真正释放的内容</h3>

@@ -1,0 +1,103 @@
+{
+  "backlog": {
+    "max_oldest_age_ms": 189,
+    "max_unpublished_bytes": 4260289,
+    "max_unpublished_generations": 1,
+    "saw_backpressure": false,
+    "saw_publish_error": false
+  },
+  "burst_final_drain_us": 358,
+  "concurrency": {
+    "cats": 0,
+    "cold_launch_per_cat": null,
+    "cold_launch_wall_us": 0,
+    "warm_restore_per_cat": null,
+    "warm_restore_wall_us": 0
+  },
+  "environment": {
+    "active_nbd_after_bench_start": [
+      "nbd0",
+      "nbd1",
+      "nbd2",
+      "nbd3",
+      "nbd4",
+      "nbd5"
+    ],
+    "active_nbd_after_launches": [
+      "nbd0",
+      "nbd1",
+      "nbd2",
+      "nbd3",
+      "nbd4",
+      "nbd5"
+    ],
+    "active_nbd_before": [
+      "nbd0",
+      "nbd1",
+      "nbd2",
+      "nbd3",
+      "nbd4"
+    ],
+    "block_path": "kernel-nbd",
+    "s3_prefix": "cats-soak/sdsvc3",
+    "state_dir": "/var/lib/cats/sab/sdsvc3",
+    "vhost_user_queues": 1
+  },
+  "lifecycle": {
+    "canary_sha256": "1cc5926b94c7123eaad899e58647eb35ce7da75eb943766dd5c3af3bbc2c8f8a",
+    "cold_start": {
+      "count": 1,
+      "max_us": 14236743,
+      "p50_us": 14236743,
+      "p95_us": 14236743,
+      "p99_us": 14236743
+    },
+    "cold_stop": {
+      "count": 1,
+      "max_us": 369301,
+      "p50_us": 369301,
+      "p95_us": 369301,
+      "p99_us": 369301
+    },
+    "restore": {
+      "count": 1,
+      "max_us": 433533,
+      "p50_us": 433533,
+      "p95_us": 433533,
+      "p99_us": 433533
+    },
+    "suspend": null,
+    "warm": {
+      "count": 1,
+      "max_us": 320397,
+      "p50_us": 320397,
+      "p95_us": 320397,
+      "p99_us": 320397
+    }
+  },
+  "local_flush": {
+    "count": 1,
+    "max_us": 344773,
+    "p50_us": 344773,
+    "p95_us": 344773,
+    "p99_us": 344773
+  },
+  "local_write_plus_flush": {
+    "count": 1,
+    "max_us": 344781,
+    "p50_us": 344781,
+    "p95_us": 344781,
+    "p99_us": 344781
+  },
+  "remote_drain": null,
+  "remote_phase_local_flush": {
+    "count": 1,
+    "max_us": 271664,
+    "p50_us": 271664,
+    "p95_us": 271664,
+    "p99_us": 271664
+  },
+  "remote_timer_races": 1,
+  "run_id": "sdsvc3",
+  "single_create_us": 19758128
+}
