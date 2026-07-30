@@ -9,12 +9,12 @@ use serde::{Deserialize, Serialize};
 
 use cats_api::auth::{UserProfile, Workspace};
 
-pub const DEFAULT_API_URL: &str = "https://cats.run";
+pub(crate) const DEFAULT_API_URL: &str = "https://cats.run";
 const CONFIG_VERSION: u32 = 2;
 const KEYRING_SERVICE: &str = "cats.run CLI";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StoredConfig {
+pub(crate) struct StoredConfig {
     pub version: u32,
     pub api_url: String,
     pub workos_client_id: String,
@@ -28,7 +28,11 @@ pub struct StoredConfig {
 }
 
 impl StoredConfig {
-    pub fn new(api_url: String, workos_client_id: String, workos_api_base_url: String) -> Self {
+    pub(crate) fn new(
+        api_url: String,
+        workos_client_id: String,
+        workos_api_base_url: String,
+    ) -> Self {
         Self {
             version: CONFIG_VERSION,
             api_url,
@@ -40,7 +44,7 @@ impl StoredConfig {
         }
     }
 
-    pub fn load() -> Result<Option<Self>> {
+    pub(crate) fn load() -> Result<Option<Self>> {
         Self::load_from(&config_path())
     }
 
@@ -79,7 +83,7 @@ impl StoredConfig {
         Ok(Some(config))
     }
 
-    pub fn save(&self) -> Result<()> {
+    pub(crate) fn save(&self) -> Result<()> {
         self.save_to(&config_path())
     }
 
@@ -105,7 +109,7 @@ impl StoredConfig {
         Ok(())
     }
 
-    pub fn clear_identity(&mut self) {
+    pub(crate) fn clear_identity(&mut self) {
         self.user = None;
         self.current_workspace = None;
         self.workspaces.clear();
@@ -124,7 +128,7 @@ struct LegacyStoredConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Credentials {
+pub(crate) struct Credentials {
     pub access_token: String,
     pub refresh_token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -132,7 +136,7 @@ pub struct Credentials {
 }
 
 impl Credentials {
-    pub fn load(api_url: &str) -> Result<Option<Self>> {
+    pub(crate) fn load(api_url: &str) -> Result<Option<Self>> {
         let encoded = match crate::credential_store::get(KEYRING_SERVICE, api_url)? {
             Some(value) => value,
             None => return Ok(None),
@@ -142,21 +146,21 @@ impl Credentials {
         ))
     }
 
-    pub fn save(&self, api_url: &str) -> Result<()> {
+    pub(crate) fn save(&self, api_url: &str) -> Result<()> {
         crate::credential_store::set(KEYRING_SERVICE, api_url, &serde_json::to_string(self)?)
     }
 
-    pub fn delete(api_url: &str) -> Result<()> {
+    pub(crate) fn delete(api_url: &str) -> Result<()> {
         crate::credential_store::delete(KEYRING_SERVICE, api_url)
     }
 }
 
-pub struct CliStateLock {
+pub(crate) struct CliStateLock {
     file: std::fs::File,
 }
 
 impl CliStateLock {
-    pub fn acquire() -> Result<Self> {
+    pub(crate) fn acquire() -> Result<Self> {
         let path = config_path().with_file_name("credentials.lock");
         let parent = path
             .parent()
@@ -184,7 +188,7 @@ impl Drop for CliStateLock {
     }
 }
 
-pub fn config_path() -> PathBuf {
+pub(crate) fn config_path() -> PathBuf {
     if let Some(directory) = std::env::var_os("CATS_CONFIG_DIR") {
         return PathBuf::from(directory).join("config.json");
     }

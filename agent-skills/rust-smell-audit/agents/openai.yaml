@@ -1,0 +1,4 @@
+interface:
+  display_name: "Rust Smell Audit"
+  short_description: "Audit Rust changes for correctness and maintainability"
+  default_prompt: "Use $rust-smell-audit to inspect this Cats Rust code for concrete correctness and maintainability risks."

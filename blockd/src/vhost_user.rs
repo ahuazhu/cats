@@ -40,7 +40,9 @@ use vm_memory::{
     ByteValued, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap,
 };
 use vmm_sys_util::epoll::EventSet;
-use vmm_sys_util::event::{new_event_consumer_and_notifier, EventConsumer, EventFlag, EventNotifier};
+use vmm_sys_util::event::{
+    new_event_consumer_and_notifier, EventConsumer, EventFlag, EventNotifier,
+};
 
 use crate::engine::{ChunkEngine, EngineError};
 
@@ -553,9 +555,9 @@ impl VhostUserBackend for BlkBackend {
         vrings: &[VringRwLock],
         thread_id: usize,
     ) -> io::Result<()> {
-        let vring = vrings
-            .get(device_event as usize)
-            .ok_or_else(|| io::Error::other(format!("event {device_event} on thread {thread_id}")))?;
+        let vring = vrings.get(device_event as usize).ok_or_else(|| {
+            io::Error::other(format!("event {device_event} on thread {thread_id}"))
+        })?;
 
         if self.inner.event_idx.load(Ordering::Acquire) {
             // With EVENT_IDX the Guest suppresses kicks while we are draining,

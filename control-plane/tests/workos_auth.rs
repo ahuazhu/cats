@@ -970,9 +970,7 @@ async fn organizationless_workos_user_receives_an_isolated_personal_account() {
 
     let own_workspace = ctx
         .http
-        .get(ctx.url(&format!(
-            "/v1/workspaces/{personal_workspace_id}/cats"
-        )))
+        .get(ctx.url(&format!("/v1/workspaces/{personal_workspace_id}/cats")))
         .header("Cookie", &user_cookie)
         .send()
         .await

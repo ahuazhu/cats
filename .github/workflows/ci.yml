@@ -22,11 +22,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust 1.97
+      - name: Install Rust 1.97.1
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.97"
-          components: clippy
+          toolchain: "1.97.1"
+          components: clippy,rustfmt
 
       - uses: Swatinem/rust-cache@v2
 
@@ -37,25 +37,32 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
 
-      # No `cargo fmt --check` gate: the workspace is not currently
-      # rustfmt-clean (74 diffs across 19 files) and AGENTS.md defines the
-      # quality gates as clippy + test only. Reformat in a dedicated commit
-      # first, then add the gate here.
+      - name: Agent skill contracts
+        run: ./scripts/quality.sh skills
+
+      - name: Formatting
+        run: ./scripts/quality.sh fmt
+
+      - name: Check
+        run: ./scripts/quality.sh check
 
       # `cargo build` must come first: some integration tests shell out to
       # `cargo build` for helper binaries and would otherwise deadlock on the
       # build-directory lock (AGENTS.md).
       - name: Build
-        run: cargo build --workspace --locked
+        run: ./scripts/quality.sh build
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: ./scripts/quality.sh clippy
 
       # Runs on Linux, so the vhost-user-blk and node-agent code that compiles
       # out on macOS is covered here. Benchmarks are `#[ignore]` and excluded;
       # `s3_live` skips itself unless CATS_AWS_S3_TEST_ENDPOINT is set.
       - name: Test
-        run: cargo test --workspace --locked
+        run: ./scripts/quality.sh test
+
+      - name: Documentation
+        run: ./scripts/quality.sh doc
 
   terraform:
     name: Terraform

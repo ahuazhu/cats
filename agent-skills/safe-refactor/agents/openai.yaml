@@ -1,0 +1,4 @@
+interface:
+  display_name: "Safe Rust Refactor"
+  short_description: "Refactor Rust safely with focused tests and gates"
+  default_prompt: "Use $safe-refactor to improve this Cats Rust code without changing its external behavior."

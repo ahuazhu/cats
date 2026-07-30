@@ -462,8 +462,9 @@ fn resolve_workspace_id(
         "could not resolve workspace {selector}: the token must be an admin token, \
          or pass --workspace with a workspace ID"
     );
-    let listed: cats_api::requests::ListResponse<cats_api::auth::Workspace> =
-        response.json().context("invalid workspace directory response")?;
+    let listed: cats_api::requests::ListResponse<cats_api::auth::Workspace> = response
+        .json()
+        .context("invalid workspace directory response")?;
     let matched = listed
         .items
         .iter()
@@ -712,8 +713,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     mount_at: mount_at.clone(),
                 }),
                 expires_at_unix: expires_in.map(|secs| unix_now() + secs as i64),
-                durability: DiskDurability::parse(durability)
-                    .expect("clap validated the value"),
+                durability: DiskDurability::parse(durability).expect("clap validated the value"),
             };
             let resp = client.send(
                 client
@@ -805,8 +805,7 @@ pub fn run(cli: Cli) -> Result<()> {
             if let Some(seconds) = timeout {
                 body["timeout_ms"] = json!(seconds * 1000);
             }
-            let request_timeout =
-                Duration::from_secs(timeout.unwrap_or(120).saturating_add(15));
+            let request_timeout = Duration::from_secs(timeout.unwrap_or(120).saturating_add(15));
             let v = client.send(
                 client
                     .http
@@ -1318,13 +1317,25 @@ mod tests {
             Cli::parse_from(["cats", "sync", "dev"]).command,
             Command::Sync { name } if name == "dev"
         ));
-        let with_timeout =
-            Cli::parse_from(["cats", "exec", "dev", "--timeout", "900", "--", "cargo", "build"]);
+        let with_timeout = Cli::parse_from([
+            "cats",
+            "exec",
+            "dev",
+            "--timeout",
+            "900",
+            "--",
+            "cargo",
+            "build",
+        ]);
         match with_timeout.command {
             Command::Exec {
                 timeout, command, ..
             } => {
-                assert_eq!(timeout, Some(900), "a long build needs more than the default");
+                assert_eq!(
+                    timeout,
+                    Some(900),
+                    "a long build needs more than the default"
+                );
                 assert_eq!(command, vec!["cargo", "build"]);
             }
             other => panic!("expected exec, got {other:?}"),

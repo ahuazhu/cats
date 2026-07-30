@@ -154,14 +154,14 @@ pub struct UsageReport {
 mod decimal_u128 {
     use serde::{de, Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
+    pub(super) fn serialize<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         serializer.serialize_str(&value.to_string())
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<u128, D::Error>
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<u128, D::Error>
     where
         D: Deserializer<'de>,
     {

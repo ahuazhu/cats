@@ -32,18 +32,18 @@ use vm_memory::{
 };
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
 
-pub const VIRTIO_BLK_T_IN: u32 = 0;
-pub const VIRTIO_BLK_T_OUT: u32 = 1;
-pub const VIRTIO_BLK_T_FLUSH: u32 = 4;
-pub const VIRTIO_BLK_T_GET_ID: u32 = 8;
-pub const VIRTIO_BLK_T_DISCARD: u32 = 11;
-pub const VIRTIO_BLK_T_WRITE_ZEROES: u32 = 13;
+pub(crate) const VIRTIO_BLK_T_IN: u32 = 0;
+pub(crate) const VIRTIO_BLK_T_OUT: u32 = 1;
+pub(crate) const VIRTIO_BLK_T_FLUSH: u32 = 4;
+pub(crate) const VIRTIO_BLK_T_GET_ID: u32 = 8;
+pub(crate) const VIRTIO_BLK_T_DISCARD: u32 = 11;
+pub(crate) const VIRTIO_BLK_T_WRITE_ZEROES: u32 = 13;
 
-pub const VIRTIO_BLK_S_OK: u8 = 0;
-pub const VIRTIO_BLK_S_IOERR: u8 = 1;
-pub const VIRTIO_BLK_S_UNSUPP: u8 = 2;
+pub(crate) const VIRTIO_BLK_S_OK: u8 = 0;
+pub(crate) const VIRTIO_BLK_S_IOERR: u8 = 1;
+pub(crate) const VIRTIO_BLK_S_UNSUPP: u8 = 2;
 
-pub const SECTOR_SIZE: u64 = 512;
+pub(crate) const SECTOR_SIZE: u64 = 512;
 
 const VRING_DESC_F_NEXT: u16 = 1;
 const VRING_DESC_F_WRITE: u16 = 2;
@@ -57,7 +57,7 @@ const RING_STRIDE: u64 = 3 * 4096;
 const MAX_QUEUE_SIZE: u16 = 256;
 
 /// Largest single transfer the harness can stage in one slot.
-pub const MAX_XFER: usize = 1024 * 1024;
+pub(crate) const MAX_XFER: usize = 1024 * 1024;
 /// Scratch bytes per in-flight request: header/status page, then the outgoing
 /// and incoming payload areas.
 const SLOT_SIZE: u64 = 4096 + 2 * MAX_XFER as u64;
@@ -111,7 +111,7 @@ impl RingLayout {
 
 /// Connected vhost-user frontend. Dropping it closes the control socket, which
 /// is how a VMM tells the backend the device is gone.
-pub struct BlkFrontend {
+pub(crate) struct BlkFrontend {
     frontend: Frontend,
     mem: Arc<GuestMemoryMmap<()>>,
     _memfd: File,
@@ -122,7 +122,7 @@ pub struct BlkFrontend {
 
 impl BlkFrontend {
     /// Connect to `socket`, negotiate, and set up `num_queues` ready virtqueues.
-    pub fn connect(
+    pub(crate) fn connect(
         socket: &Path,
         num_queues: usize,
         queue_size: u16,
@@ -262,12 +262,12 @@ impl BlkFrontend {
         })
     }
 
-    pub fn acked_features(&self) -> u64 {
+    pub(crate) fn acked_features(&self) -> u64 {
         self.acked_features
     }
 
     /// Read the virtio-blk configuration space over `VHOST_USER_GET_CONFIG`.
-    pub fn config(&mut self, size: u32) -> io::Result<Vec<u8>> {
+    pub(crate) fn config(&mut self, size: u32) -> io::Result<Vec<u8>> {
         let request = vec![0u8; size as usize];
         let (_, payload) = self
             .frontend
@@ -277,7 +277,7 @@ impl BlkFrontend {
     }
 
     /// Borrow one queue's driver. Panics if it was taken with [`Self::take`].
-    pub fn queue(&mut self, index: usize) -> &mut BlkQueue {
+    pub(crate) fn queue(&mut self, index: usize) -> &mut BlkQueue {
         self.queues[index]
             .as_mut()
             .expect("queue was moved out of the frontend")
@@ -285,23 +285,23 @@ impl BlkFrontend {
 
     /// Move a queue driver out so it can be run from its own thread. The
     /// frontend must stay alive: dropping it disconnects the backend.
-    pub fn take(&mut self, index: usize) -> BlkQueue {
+    pub(crate) fn take(&mut self, index: usize) -> BlkQueue {
         self.queues[index]
             .take()
             .expect("queue already taken from the frontend")
     }
 
-    pub fn num_queues(&self) -> usize {
+    pub(crate) fn num_queues(&self) -> usize {
         self.num_queues
     }
 
-    pub fn memory(&self) -> &Arc<GuestMemoryMmap<()>> {
+    pub(crate) fn memory(&self) -> &Arc<GuestMemoryMmap<()>> {
         &self.mem
     }
 }
 
 /// One virtqueue driven from the driver side.
-pub struct BlkQueue {
+pub(crate) struct BlkQueue {
     mem: Arc<GuestMemoryMmap<()>>,
     ring: RingLayout,
     slot_base: u64,
@@ -319,23 +319,23 @@ pub struct BlkQueue {
 
 /// A submitted, not yet completed request.
 #[derive(Debug, Clone, Copy)]
-pub struct Pending {
-    pub head: u16,
+pub(crate) struct Pending {
+    pub(crate) head: u16,
     slot: u16,
     in_len: usize,
 }
 
 /// A completed request as the driver sees it.
 #[derive(Debug, Clone)]
-pub struct Completion {
-    pub status: u8,
-    pub data: Vec<u8>,
+pub(crate) struct Completion {
+    pub(crate) status: u8,
+    pub(crate) data: Vec<u8>,
     /// `len` field of the used-ring element: bytes the device says it wrote.
-    pub used_len: u32,
+    pub(crate) used_len: u32,
 }
 
 impl BlkQueue {
-    pub fn set_timeout(&mut self, timeout: Duration) {
+    pub(crate) fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
     }
 
@@ -345,11 +345,11 @@ impl BlkQueue {
     /// a wakeup per completion. Real drivers pay neither: in a VM the completion
     /// arrives as an injected interrupt. Benchmarks use this to separate the
     /// backend's cost from the harness's notification cost.
-    pub fn set_spin_iterations(&mut self, iterations: u32) {
+    pub(crate) fn set_spin_iterations(&mut self, iterations: u32) {
         self.spin_iterations = iterations;
     }
 
-    pub fn slots(&self) -> u16 {
+    pub(crate) fn slots(&self) -> u16 {
         self.slots
     }
 
@@ -379,7 +379,7 @@ impl BlkQueue {
     /// the device-writable payload size (excluding the status byte), and
     /// `out_chunks` how many descriptors the outgoing payload is split across
     /// (a real driver splits at page boundaries).
-    pub fn submit(
+    pub(crate) fn submit(
         &mut self,
         request_type: u32,
         sector: u64,
@@ -520,7 +520,7 @@ impl BlkQueue {
     /// not copy the payload into a staging buffer per request. Benchmarks call
     /// this once and then use [`Self::submit_staged`] so the measurement does
     /// not include a copy that no real driver performs.
-    pub fn prestage_out(&mut self, data: &[u8]) -> io::Result<()> {
+    pub(crate) fn prestage_out(&mut self, data: &[u8]) -> io::Result<()> {
         assert!(data.len() <= MAX_XFER, "outgoing payload too large");
         for slot in 0..self.slots {
             let base = self.slot_addr(slot);
@@ -533,7 +533,7 @@ impl BlkQueue {
 
     /// Like [`Self::submit`], but the outgoing payload is whatever
     /// [`Self::prestage_out`] already placed in the slot.
-    pub fn submit_staged(
+    pub(crate) fn submit_staged(
         &mut self,
         request_type: u32,
         sector: u64,
@@ -545,7 +545,7 @@ impl BlkQueue {
 
     /// Notify the device. Always kicking is spec-legal and keeps the harness
     /// independent of the device's suppression state.
-    pub fn kick(&self) -> io::Result<()> {
+    pub(crate) fn kick(&self) -> io::Result<()> {
         self.kick.write(1)
     }
 
@@ -556,7 +556,7 @@ impl BlkQueue {
     }
 
     /// Wait for one used-ring element.
-    pub fn reap(&mut self) -> io::Result<(u16, u32)> {
+    pub(crate) fn reap(&mut self) -> io::Result<(u16, u32)> {
         let deadline = Instant::now() + self.timeout;
         for _ in 0..self.spin_iterations {
             if self.used_idx()? != self.last_used {
@@ -616,7 +616,7 @@ impl BlkQueue {
 
     /// Read back only the status byte, leaving the incoming payload in place
     /// (a real driver does not copy it out either).
-    pub fn collect_status(&self, pending: Pending) -> io::Result<u8> {
+    pub(crate) fn collect_status(&self, pending: Pending) -> io::Result<u8> {
         let base = self.slot_addr(pending.slot);
         self.mem
             .read_obj(GuestAddress(base + SLOT_STATUS))
@@ -624,7 +624,7 @@ impl BlkQueue {
     }
 
     /// Read back a completion's status byte and incoming payload.
-    pub fn collect(&self, pending: Pending, used_len: u32) -> io::Result<Completion> {
+    pub(crate) fn collect(&self, pending: Pending, used_len: u32) -> io::Result<Completion> {
         let base = self.slot_addr(pending.slot);
         let status: u8 = self
             .mem
@@ -644,7 +644,7 @@ impl BlkQueue {
     }
 
     /// Submit one request and wait for it (the common case in tests).
-    pub fn request(
+    pub(crate) fn request(
         &mut self,
         request_type: u32,
         sector: u64,
@@ -654,7 +654,7 @@ impl BlkQueue {
         self.request_split(request_type, sector, out, in_len, 1)
     }
 
-    pub fn request_split(
+    pub(crate) fn request_split(
         &mut self,
         request_type: u32,
         sector: u64,
@@ -674,25 +674,25 @@ impl BlkQueue {
         self.collect(pending, used_len)
     }
 
-    pub fn read_at(&mut self, sector: u64, len: usize) -> io::Result<Completion> {
+    pub(crate) fn read_at(&mut self, sector: u64, len: usize) -> io::Result<Completion> {
         self.request(VIRTIO_BLK_T_IN, sector, &[], len)
     }
 
-    pub fn write_at(&mut self, sector: u64, data: &[u8]) -> io::Result<Completion> {
+    pub(crate) fn write_at(&mut self, sector: u64, data: &[u8]) -> io::Result<Completion> {
         self.request(VIRTIO_BLK_T_OUT, sector, data, 0)
     }
 
-    pub fn flush(&mut self) -> io::Result<Completion> {
+    pub(crate) fn flush(&mut self) -> io::Result<Completion> {
         self.request(VIRTIO_BLK_T_FLUSH, 0, &[], 0)
     }
 
-    pub fn get_id(&mut self) -> io::Result<Completion> {
+    pub(crate) fn get_id(&mut self) -> io::Result<Completion> {
         self.request(VIRTIO_BLK_T_GET_ID, 0, &[], 20)
     }
 
     /// DISCARD / WRITE_ZEROES take their ranges as a payload, one 16-byte
     /// segment per range.
-    pub fn zero_range(
+    pub(crate) fn zero_range(
         &mut self,
         request_type: u32,
         segments: &[(u64, u32, u32)],

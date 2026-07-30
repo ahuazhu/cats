@@ -21,21 +21,29 @@ impl Env {
 
     fn command(&self, attachment: &str) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_cats-blockd"));
-        cmd.args(["--volume-id", "vol_frontends", "--attachment-id", attachment])
-            .arg("--data-dir")
-            .arg(self.dir.path().join(format!("data-{attachment}")))
-            .arg("--metadata-store-adapter")
-            .arg("sqlite")
-            .arg("--metadata-store-option")
-            .arg(format!("path={}", self.dir.path().join("meta.db").display()))
-            .arg("--object-store-adapter")
-            .arg("file")
-            .arg("--object-store-option")
-            .arg(format!("root={}", self.dir.path().join("blob").display()))
-            .arg("--create-volume-size")
-            .arg(VOL_SIZE.to_string())
-            .arg("--lease-ttl-ms")
-            .arg("1500");
+        cmd.args([
+            "--volume-id",
+            "vol_frontends",
+            "--attachment-id",
+            attachment,
+        ])
+        .arg("--data-dir")
+        .arg(self.dir.path().join(format!("data-{attachment}")))
+        .arg("--metadata-store-adapter")
+        .arg("sqlite")
+        .arg("--metadata-store-option")
+        .arg(format!(
+            "path={}",
+            self.dir.path().join("meta.db").display()
+        ))
+        .arg("--object-store-adapter")
+        .arg("file")
+        .arg("--object-store-option")
+        .arg(format!("root={}", self.dir.path().join("blob").display()))
+        .arg("--create-volume-size")
+        .arg(VOL_SIZE.to_string())
+        .arg("--lease-ttl-ms")
+        .arg("1500");
         cmd
     }
 
@@ -73,17 +81,17 @@ fn wait_ready(child: &mut Child) -> String {
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
     reader.read_line(&mut line).expect("read READY line");
-    assert!(line.starts_with("READY "), "unexpected first line: {line:?}");
+    assert!(
+        line.starts_with("READY "),
+        "unexpected first line: {line:?}"
+    );
     line.trim().to_string()
 }
 
 #[test]
 fn requires_at_least_one_listener() {
     let env = Env::new();
-    let output = env
-        .command("att-none")
-        .output()
-        .expect("run cats-blockd");
+    let output = env.command("att-none").output().expect("run cats-blockd");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -219,7 +227,11 @@ fn a_root_disk_is_provisioned_from_a_shared_image_without_copying_it() {
     let mut client = NbdClient::connect_unix(&env.path("seed-nbd3.sock")).unwrap();
     let back = client.read(0, CHUNK as u32).unwrap();
     assert_eq!(&back[..4096], &patch[..], "re-seeding clobbered Guest data");
-    assert_eq!(&back[4096..], &body[4096..CHUNK], "lost the shared image tail");
+    assert_eq!(
+        &back[4096..],
+        &body[4096..CHUNK],
+        "lost the shared image tail"
+    );
     client.disconnect().ok();
     third.kill().ok();
     third.wait().ok();
@@ -362,7 +374,10 @@ fn collecting_garbage_needs_no_listener_and_leaves_live_objects_alone() {
         String::from_utf8_lossy(&gc.stderr)
     );
     let report = String::from_utf8_lossy(&gc.stdout);
-    assert!(report.contains("data_deleted=1"), "unexpected report: {report}");
+    assert!(
+        report.contains("data_deleted=1"),
+        "unexpected report: {report}"
+    );
     assert_eq!(env.objects("volumes/vol_frontends/data").len(), 1);
 
     // And the volume still serves the live generation.
@@ -397,7 +412,10 @@ mod vhost_user {
             if let Some(status) = child.try_wait().unwrap() {
                 return status;
             }
-            assert!(Instant::now() < deadline, "cats-blockd did not exit in time");
+            assert!(
+                Instant::now() < deadline,
+                "cats-blockd did not exit in time"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
     }
