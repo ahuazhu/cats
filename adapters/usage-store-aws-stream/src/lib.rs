@@ -15,7 +15,7 @@ use aws_sdk_kinesis::primitives::Blob;
 use aws_sdk_kinesis::types::ShardIteratorType;
 use aws_sdk_s3::primitives::ByteStream;
 use cats_metering::{
-    AttributedCheckpoint, IngestOutcome, UsageAttribution, UsageQuery, UsageStore,
+    AttributedCheckpoint, IngestOutcome, MeteringError, UsageAttribution, UsageQuery, UsageStore,
     UsageStoreFuture, UsageView,
 };
 
@@ -216,13 +216,7 @@ impl AwsUsageStreamStore {
             return Ok(None);
         };
         self.archive(&batch.key, batch.payload).await?;
-        for record in records {
-            self.projection
-                .ingest(&record.envelope)
-                .await
-                .map_err(|error| anyhow::anyhow!(error))
-                .context("apply usage checkpoint projection")?;
-        }
+        apply_projection(self.projection.as_ref(), records).await?;
         Ok(Some(batch.last_sequence_number))
     }
 
@@ -316,6 +310,35 @@ impl AwsUsageStreamStore {
     }
 }
 
+async fn apply_projection(projection: &dyn UsageStore, records: &[PendingRecord]) -> Result<()> {
+    for record in records {
+        match projection.ingest(&record.envelope).await {
+            Ok(_) => {}
+            Err(
+                error @ (MeteringError::Invalid(_)
+                | MeteringError::Conflict(_)
+                | MeteringError::Overflow
+                | MeteringError::Serialization(_)),
+            ) => {
+                let checkpoint = &record.envelope.checkpoint;
+                tracing::error!(
+                    event_id = %checkpoint.event_id,
+                    source_id = %checkpoint.source_id,
+                    source_epoch = %checkpoint.source_epoch,
+                    sequence = checkpoint.sequence,
+                    metric = checkpoint.metric.slug(),
+                    %error,
+                    "permanently invalid usage checkpoint remains in the immutable archive; skipping PostgreSQL projection"
+                );
+            }
+            Err(error @ MeteringError::Store(_)) => {
+                return Err(anyhow::anyhow!(error)).context("apply usage checkpoint projection");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn encode_archive_batch(shard_id: &str, records: &[PendingRecord]) -> Result<Option<ArchiveBatch>> {
     let Some(first) = records.first() else {
         return Ok(None);
@@ -378,6 +401,8 @@ impl UsageStore for AwsUsageStreamStore {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use cats_metering::AttributedCheckpoint;
 
     use super::*;
@@ -472,5 +497,81 @@ mod tests {
     #[test]
     fn empty_archive_batch_is_a_noop() {
         assert!(encode_archive_batch("shard", &[]).unwrap().is_none());
+    }
+
+    struct RecordingProjection {
+        attempted: Mutex<Vec<u64>>,
+        permanent_failure: Option<u64>,
+        store_failure: Option<u64>,
+    }
+
+    impl RecordingProjection {
+        fn new(permanent_failure: Option<u64>, store_failure: Option<u64>) -> Self {
+            Self {
+                attempted: Mutex::new(Vec::new()),
+                permanent_failure,
+                store_failure,
+            }
+        }
+    }
+
+    impl UsageStore for RecordingProjection {
+        fn ingest<'a>(
+            &'a self,
+            value: &'a AttributedCheckpoint,
+        ) -> UsageStoreFuture<'a, IngestOutcome> {
+            Box::pin(async move {
+                let sequence = value.checkpoint.sequence;
+                self.attempted.lock().unwrap().push(sequence);
+                if self.permanent_failure == Some(sequence) {
+                    return Err(MeteringError::Conflict(
+                        "counter epoch reopened".to_string(),
+                    ));
+                }
+                if self.store_failure == Some(sequence) {
+                    return Err(MeteringError::Store("database unavailable".to_string()));
+                }
+                Ok(IngestOutcome::Accepted)
+            })
+        }
+
+        fn query<'a>(&'a self, _query: &'a UsageQuery) -> UsageStoreFuture<'a, UsageView> {
+            Box::pin(async { unreachable!("projection tests do not query usage") })
+        }
+
+        fn source_epoch_attribution<'a>(
+            &'a self,
+            _source_id: &'a str,
+            _source_epoch: &'a str,
+        ) -> UsageStoreFuture<'a, Option<UsageAttribution>> {
+            Box::pin(async { unreachable!("projection tests do not query attribution") })
+        }
+    }
+
+    #[tokio::test]
+    async fn permanent_checkpoint_failure_does_not_block_the_shard() {
+        let projection = RecordingProjection::new(Some(2), None);
+        let records = [
+            pending("1", 86_400_000),
+            pending("2", 86_400_010),
+            pending("3", 86_400_020),
+        ];
+        apply_projection(&projection, &records).await.unwrap();
+        assert_eq!(*projection.attempted.lock().unwrap(), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn store_failure_still_retries_without_advancing_the_checkpoint() {
+        let projection = RecordingProjection::new(None, Some(2));
+        let records = [
+            pending("1", 86_400_000),
+            pending("2", 86_400_010),
+            pending("3", 86_400_020),
+        ];
+        let error = apply_projection(&projection, &records).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("apply usage checkpoint projection"));
+        assert_eq!(*projection.attempted.lock().unwrap(), vec![1, 2]);
     }
 }

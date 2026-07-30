@@ -971,18 +971,13 @@ impl HostTelemetrySampler {
                 .iter()
                 .any(|item| &item.cat_id == cat_id)
         });
-        self.cat_meter_samples.retain(|cat_id, _| {
-            telemetry
-                .cat_resources
-                .iter()
-                .any(|item| &item.cat_id == cat_id)
-        });
-        self.retired_meter_epochs.retain(|cat_id, _| {
-            telemetry
-                .cat_resources
-                .iter()
-                .any(|item| &item.cat_id == cat_id)
-        });
+        // A lifecycle job removes its runtime from the supervisor map while it
+        // performs finalization and teardown. A concurrent heartbeat can
+        // therefore observe the Cat as temporarily absent even though a
+        // failed teardown will put the same runtime and source epoch back.
+        // Dropping either entry here would reopen that epoch at sequence zero.
+        // Finalization removes the live accumulator explicitly; a later,
+        // genuinely new epoch replaces the retired marker below.
         (telemetry, usage_checkpoints)
     }
 
@@ -1006,12 +1001,11 @@ impl HostTelemetrySampler {
         let Some(metering) = &target.metering else {
             return Ok(Vec::new());
         };
-        if self
-            .retired_meter_epochs
-            .get(&target.cat_id)
-            .is_some_and(|epoch| epoch == &metering.source_epoch)
-        {
-            return Ok(Vec::new());
+        if let Some(retired_epoch) = self.retired_meter_epochs.get(&target.cat_id) {
+            if retired_epoch == &metering.source_epoch {
+                return Ok(Vec::new());
+            }
+            self.retired_meter_epochs.remove(&target.cat_id);
         }
         let replace = self
             .cat_meter_samples
@@ -1361,6 +1355,7 @@ mod telemetry_tests {
     };
     use crate::runtime::{CatMeteringTarget, CatTelemetryTarget};
     use cats_api::metering::{CatUsageCheckpoint, UsageMetric};
+    use cats_api::resources::NodeTelemetry;
     use cats_metering::deterministic_event_id;
     use std::time::Instant;
 
@@ -1526,5 +1521,51 @@ mod telemetry_tests {
         assert!(restored_baseline
             .iter()
             .all(|checkpoint| checkpoint.sequence == 0));
+    }
+
+    #[test]
+    fn transient_runtime_absence_does_not_reopen_a_metering_epoch() {
+        let temp = tempfile::tempdir().unwrap();
+        let cgroup = temp.path().join("metering");
+        std::fs::create_dir(&cgroup).unwrap();
+        std::fs::write(cgroup.join("cpu.stat"), "usage_usec 100\n").unwrap();
+        std::fs::write(cgroup.join("memory.current"), "1000\n").unwrap();
+        let target = CatTelemetryTarget {
+            cat_id: "cat-a".to_string(),
+            generation: 1,
+            process_ids: Vec::new(),
+            runtime_dir: temp.path().to_path_buf(),
+            metering: Some(CatMeteringTarget {
+                cgroup_path: cgroup.clone(),
+                source_epoch: "epoch-a".to_string(),
+            }),
+            disk_durability: Vec::new(),
+        };
+        let mut sampler =
+            HostTelemetrySampler::new("node-a".to_string(), temp.path().to_path_buf());
+        let baseline = sampler
+            .sample_usage_target(&target, Instant::now(), now_unix_ms(), false)
+            .unwrap();
+        assert!(baseline.iter().all(|checkpoint| checkpoint.sequence == 0));
+
+        // stop_cat removes a runtime before finalizing it. A heartbeat can
+        // sample the empty supervisor map in that window.
+        let _ = sampler.sample(NodeTelemetry::default(), Vec::new());
+
+        std::fs::write(cgroup.join("cpu.stat"), "usage_usec 200\n").unwrap();
+        std::fs::write(cgroup.join("memory.current"), "2000\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let final_checkpoints = sampler.finalize(&target).unwrap();
+        assert!(final_checkpoints
+            .iter()
+            .all(|checkpoint| checkpoint.sequence == 1));
+
+        // A failed teardown may reinsert the same runtime. Even another empty
+        // heartbeat must not erase the retired-epoch fence.
+        let _ = sampler.sample(NodeTelemetry::default(), Vec::new());
+        let stale = sampler
+            .sample_usage_target(&target, Instant::now(), now_unix_ms(), false)
+            .unwrap();
+        assert!(stale.is_empty());
     }
 }
