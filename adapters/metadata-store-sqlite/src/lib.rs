@@ -601,7 +601,7 @@ mod tests {
         let e1 = m.acquire_lease("v1", "attA", 1).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
         m.renew_lease("v1", "attA", e1, 60_000).unwrap();
-        assert!(m.cas_head("v1", 0, [1; 32], "obj1", "attA", e1).is_ok());
+        assert!(m.cas_head("v1", 0, 1, [1; 32], "obj1", "attA", e1).is_ok());
         // Stolen during the lapse: the old holder's renewal dies on the epoch.
         let e1b = m.acquire_lease("v1", "attA", 1).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
