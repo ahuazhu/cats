@@ -229,11 +229,11 @@
 
     <section id="suspend">
       <h2>4. Running → Suspended 的完整流程</h2>
-      <p class="lead">Suspend 的正确顺序是“停止新活动 → Guest 落盘 → 远端持久点 → VMM pause → RAM page-out”。不能先停 Guest 再希望 Guest 自己执行 sync。</p>
+      <p class="lead">Suspend 的正确顺序是“停止新活动 → Guest 落盘 → 本地持久水位 → VMM pause → RAM page-out”。Suspend 是 Host-bound；Warm/Cold/Snapshot/Detach/迁移才必须强制推进到远端水位。</p>
       <div class="flow">
         <div class="step"><b>1. 工作与状态门禁</b><p>平台与 Guest 工作租约必须为空。Node 关闭 exec/proxy gate，Guest Agent 以 sequence fence 原子关闭 <code>/run/cats/runtime.sock</code> 的新 acquire/renew；任一新工作拒绝本次 Suspend 并恢复 Running。</p></div>
         <div class="step"><b>2. Guest Quiesce</b><p>Guest Agent 对 RootDisk/PersistentDisk 执行 syncfs；应用 hook 有严格 deadline。</p></div>
-        <div class="step"><b>3. Durable FLUSH</b><p>cats-blockd 完成屏障前 Dirty Set，记录 durable generation；失败则不进入 Suspended。</p></div>
+        <div class="step"><b>3. Local durability barrier</b><p>cats-blockd 记录 local durable generation；Strict 同时已远端 durable，Relaxed 可在 Suspended 后继续后台 publish。</p></div>
         <div class="step"><b>4. VMM Pause</b><p>Cloud Hypervisor 暂停 vCPU、保存时钟、暂停设备并进入 Paused。</p></div>
         <div class="step"><b>5. Memory Page-out</b><p>cat-agent 对 Guest RAM mmap 执行 MADV_PAGEOUT，把大部分物理页写回/丢弃。</p></div>
         <div class="step"><b>6. 资源记账</b><p>释放 vCPU run budget；更新 resident_bytes、NVMe backing bytes 和 resume commitment。</p></div>
@@ -243,7 +243,7 @@
       <h3 style="margin-top:28px">4.1 为什么先 sync/FLUSH</h3>
       <div class="two-col">
         <article class="card"><h3>Guest Page Cache</h3><p>应用的 write 可能只修改 Guest Linux Page Cache。VMM pause 不会替 Guest 调用 sync，也不会让 ext4 自动产生 FLUSH。</p><ul><li>先通过 Guest Agent 调用 syncfs</li><li>等待 virtio-blk 请求完成</li><li>普通未 fsync 写仍遵循 volatile cache 语义</li></ul></article>
-        <article class="card"><h3>Host Block Cache</h3><p>Guest 已发 FLUSH 不代表只写到本地 NVMe 就够了。平台的 FLUSH 语义要求对象和权威 Root 已提交。</p><ul><li>Pending Commit Pack 固定提交输入</li><li>对象先写，Root 后发布</li><li>只有 durable generation 完成才允许标记安全</li></ul></article>
+        <article class="card"><h3>Host Block Cache</h3><p>Strict FLUSH 要求远端 Root；Relaxed 只承诺本地 immutable pack。Suspend 可记录本地水位；越过 Host 所有权边界前必须 drain。</p><ul><li>Pending Commit Pack 固定提交输入</li><li>始终 remote generation ≤ local generation</li><li>只有 R == L 才允许 Warm/Cold/Snapshot/Detach/迁移</li></ul></article>
       </div>
       <div class="callout orange"><strong>fsfreeze 不是普通 Suspend 的必需步骤：</strong>syncfs + 完成 FLUSH 后再 pause 已能形成一致运行状态。fsfreeze 更适合需要把文件系统与磁盘 Snapshot 精确对齐的场景；冻结后必须有 watchdog 保证 unfreeze。</div>
     </section>
@@ -396,7 +396,7 @@
       <p class="lead">Cold 的目标是让 Cat 不再依赖原 Host。进入 Cold 前必须确保远端磁盘 durable；之后退出 VMM、停止设备 backend、清理本地资源并撤销运行时 Attachment。</p>
 
       <div class="two-col">
-        <article class="card"><h3>进入 Cold</h3><ol><li>阻止新 exec、deploy、mount 和流量激活。</li><li>如果还在 Running，Guest syncfs；如果已 Suspended，使用暂停前的 durable generation。</li><li>确保所有 Pending Commit 已完成或明确失败。</li><li>Route 变为 unbound/cold。</li><li>Cloud Hypervisor shutdown/exit。</li><li>停止 cats-blockd，释放 runtime lease。</li><li>删除 tap、socket、cgroup、memory backing 和本地 Secret。</li><li>clean cache 进入立即可淘汰队列。</li></ol></article>
+        <article class="card"><h3>进入 Cold</h3><ol><li>阻止新 exec、deploy、mount 和流量激活。</li><li>Running 先 Guest syncfs；Suspended 的 Guest 已冻结。</li><li>每卷强制 drain 到 remote generation == local generation。</li><li>drain 失败保留 blockd、pending、lease 与源 runtime，等待重试。</li><li>成功后 Route unbound，VMM/backend 退出并释放 lease。</li><li>删除 tap、socket、cgroup、memory backing 和本地 Secret。</li><li>clean cache 进入立即可淘汰队列。</li></ol></article>
         <article class="card"><h3>Cold 唤醒</h3><ol><li>Scheduler 选择任意健康 Node。</li><li>创建更高 Attachment fencing epoch。</li><li>启动空或复用 clean cache 的 cats-blockd。</li><li>建立 tap、vsock、cgroup 和 VMM 配置。</li><li>启动全新的 Cloud Hypervisor。</li><li>Guest 从 RootDisk boot；ext4 journal recovery。</li><li>Guest Agent Ready 后发布 route epoch。</li><li>默认 Ubuntu Guest 的 systemd 重新启动 enabled user service；Guest Agent readiness 与 User Service readiness 分开报告（ADR-0023）。</li></ol></article>
       </div>
 
@@ -504,7 +504,8 @@ if wake_requested(cat):
         <thead><tr><th>故障点</th><th>正确状态</th><th>恢复动作</th></tr></thead>
         <tbody>
           <tr><td>Guest sync 超时</td><td>保持 Running 或标记 SuspendFailed</td><td>不强行宣称 durable；按策略重试或执行受控 Cold shutdown</td></tr>
-          <tr><td>磁盘 FLUSH 失败</td><td>不进入 Suspended/Cold durable 状态</td><td>blockd 回压；保留 dirty/pending；对象/DB 恢复后重试</td></tr>
+          <tr><td>本地 durability barrier 失败</td><td>不进入 Suspended</td><td>保留 Guest/runtime；本地 fsync/ENOSPC 恢复后重试</td></tr>
+          <tr><td>强制 remote drain 失败</td><td>不进入 Warm/Cold，不创建 Snapshot，不 Detach/迁移</td><td>保留 blockd、pending、lease 与源 runtime；对象/DB 恢复后同一 job 重试</td></tr>
           <tr><td>vCPU 已 pause，Device pause 失败</td><td>VM 处于 Pausing/Error</td><td>优先尝试 resume 回 Running；不执行 page-out 或 cleanup</td></tr>
           <tr><td>Pause 成功，Page-out 部分失败</td><td>可以保持 Suspended，但记录低回收率</td><td>page-out 是 best-effort；稍后重试；持续高 RSS 则转 Cold</td></tr>
           <tr><td>Page-out 过程中收到 Wake</td><td>相同 Cat lifecycle generation 仲裁</td><td>取消后续 page-out，等待当前 syscall 返回，再 resume</td></tr>
@@ -601,7 +602,7 @@ async fn resume_cat(job: ResumeJob) -> Result&lt;()&gt; {
 
     <section id="observability">
       <h2>14. 必须采集的指标</h2>
-      <p class="lead">睡眠是否有效，不能只看状态变成 Suspended。必须同时证明 CPU 降低、RAM 回收、NVMe 成本可控、磁盘达到 durable generation、唤醒按时成功。</p>
+      <p class="lead">睡眠是否有效，不能只看状态变成 Suspended。必须同时证明 CPU 降低、RAM 回收、NVMe 成本可控、磁盘水位与积压可解释、唤醒按时成功。</p>
       <div class="table-wrap"><table>
         <thead><tr><th>类别</th><th>指标</th><th>用途</th></tr></thead>
         <tbody>
@@ -609,7 +610,7 @@ async fn resume_cat(job: ResumeJob) -> Result&lt;()&gt; {
           <tr><td>CPU</td><td>VMM CPU seconds、vCPU thread state、KVM exits、paused duration</td><td>证明暂停后接近 0 CPU</td></tr>
           <tr><td>Memory</td><td>logical、RSS、PSS、anonymous/file、advised bytes、reclaimed bytes、major/minor faults</td><td>证明 page-out 效果和 Resume refault 成本</td></tr>
           <tr><td>NVMe</td><td>memory backing logical/allocated bytes、写入/读取带宽、latency、quota、水位</td><td>量化“RAM 换 NVMe”的真实成本</td></tr>
-          <tr><td>Storage</td><td>dirty bytes、pending packs、FLUSH latency、durable generation、lease epoch</td><td>确保睡眠前远端持久性成立</td></tr>
+          <tr><td>Storage</td><td>local/remote generation、unpublished generations/bytes/oldest age、local/remote FLUSH latency、allocated/accounted/max local bytes、eviction、backpressure、publish error、lease epoch/fenced</td><td>Suspend 证明本地 barrier；Warm/Cold/Snapshot/Detach 证明 R == L；暴露实际 Host-loss RPO</td></tr>
           <tr><td>VMM/Device</td><td>pause/resume result、device pause latency、socket state、eventfd errors</td><td>发现 vhost-user/virtio 恢复问题</td></tr>
           <tr><td>Wake</td><td>queue time、admission reject、first shell、first HTTP、working-set refault bytes</td><td>用户实际体验而不只是 VMM API 时间</td></tr>
           <tr><td>Capacity</td><td>suspended count、resume commitment、overcommit ratio、concurrent wake、Cold demotion</td><td>防止批量唤醒引发 OOM/抖动</td></tr>

@@ -471,9 +471,9 @@
 
       <div class="decision-grid">
         <article class="decision"><strong>Guest 接口保持不变</strong><p>Guest 只看到 <code>/dev/vda</code>、<code>/dev/vdb</code> 和标准 ext4。Guest 不安装存储客户端，不持有 S3 或 Metadata 凭证。</p></article>
-        <article class="decision"><strong>数据 Ground Truth 在 S3</strong><p>Data Object、Delta Segment、Map Node 和 Commit Record 都是不可变对象。本地 NVMe 在提交完成后只是可删除 Cache。</p></article>
+        <article class="decision"><strong>远端 Ground Truth 与本地待发布真相</strong><p>Strict 成功 FLUSH 的 Ground Truth 已在 S3/PostgreSQL；Relaxed 的 local generation 大于 remote generation 时，本地 pending pack 是唯一权威副本，不能当作可删除 Cache。</p></article>
         <article class="decision"><strong>Root 与 Lease 由强一致数据库管理</strong><p>PostgreSQL 保存当前 <code>root_hash</code>、Generation、Lease Owner 和 Fencing Epoch；它不保存用户数据块。</p></article>
-        <article class="decision"><strong>FLUSH 是远端持久化边界</strong><p>只有 S3 对象上传完成且 Root CAS 成功后，才向 Guest 返回 FLUSH/FUA 成功。</p></article>
+        <article class="decision"><strong>FLUSH 按盘选择持久化边界</strong><p>Strict 在 S3 + Root CAS 后 ACK；Relaxed 在本地 immutable pack 持久后 ACK，由有界后台 publisher 推进远端水位。完整契约见 ADR-0022。</p></article>
       </div>
 
       <div class="callout green"><strong>与现有架构的关系：</strong>Cloud Hypervisor、vhost-user-blk、Guest ext4、RootDisk、PersistentDisk、MountBinding、Attachment 和 <code>cats</code> CLI 都不改变。只替换 <code>cats-blockd</code> 下方的 JuiceFS raw-file 数据路径。</div>
@@ -707,7 +707,8 @@ PostgreSQL volumes:
 
     <section id="flush">
       <h2>7. FLUSH/FUA 提交协议</h2>
-      <p class="lead">FLUSH 是整个设计的持久性边界。顺序必须是“对象先持久、Root 后发布、Dirty 最后清理”，不能交换。</p>
+      <p class="lead">顺序必须是“本地 pack 先持久、对象先持久、Root 后发布、本地 pack 最后清理”，不能交换。每卷维护 L=local durable generation 与 R=remote durable generation，并始终满足 R ≤ L。</p>
+      <div class="callout orange"><strong>Strict / Relaxed：</strong>Strict 在 R 前进后 ACK；Relaxed 在 L 前进后 ACK，步骤 3–6 只由后台 publisher 执行。Relaxed 冷缓存局部 WRITE 记录精确 byte ranges，不在 Guest WRITE/FLUSH 线程同步 GET/PUT/CAS；Host 永久丢失只恢复到 R。</div>
 
       <div class="sequence" aria-label="FLUSH 提交时序">
         <div class="sequence-grid">
@@ -718,7 +719,7 @@ PostgreSQL volumes:
           <div class="seq-cell seq-num">4</div><div class="seq-cell seq-warn">等待</div><div class="seq-cell">创建新 Leaf 和 Root</div><div class="seq-cell seq-empty">—</div><div class="seq-cell seq-meta">PUT Map Nodes + Commit Record</div><div class="seq-cell seq-empty">—</div>
           <div class="seq-cell seq-num">5</div><div class="seq-cell seq-warn">等待</div><div class="seq-cell">提交 root=R(N+1)</div><div class="seq-cell seq-empty">—</div><div class="seq-cell">对象已经可读</div><div class="seq-cell seq-meta">CAS generation + epoch + owner</div>
           <div class="seq-cell seq-num">6</div><div class="seq-cell seq-warn">等待</div><div class="seq-cell">确认远端 Generation 已发布</div><div class="seq-cell seq-active">清该集合 Dirty；Pending Pack 可删</div><div class="seq-cell seq-empty">—</div><div class="seq-cell">新 Root 可见</div>
-          <div class="seq-cell seq-num">7</div><div class="seq-cell seq-active">收到成功</div><div class="seq-cell seq-active">返回 FLUSH/FUA 成功</div><div class="seq-cell">清理已提交 Pending Pack</div><div class="seq-cell seq-empty">—</div><div class="seq-cell seq-empty">—</div>
+          <div class="seq-cell seq-num">7</div><div class="seq-cell seq-active">收到成功</div><div class="seq-cell seq-active">Strict 在 R 前进后 ACK；Relaxed 已在本地 pack 持久后 ACK</div><div class="seq-cell">清理已提交 Pending Pack</div><div class="seq-cell seq-empty">—</div><div class="seq-cell seq-empty">—</div>
         </div>
       </div>
 
@@ -729,18 +730,17 @@ SET root_hash       = :new_root,
 WHERE volume_id     = :volume_id
   AND generation    = :expected_generation
   AND lease_epoch   = :expected_epoch
-  AND lease_owner   = :this_attachment
-  AND lease_expires_at &gt; now();
+  AND lease_owner   = :this_attachment;
 
--- affected_rows 必须恰好为 1，否则不能向 Guest 返回 FLUSH 成功。</code></pre>
+-- affected_rows 必须恰好为 1，否则本次远端发布失败。</code></pre>
 
       <div class="three-col" style="margin-top:14px">
         <article class="card"><h3>CAS 前崩溃</h3><p>旧 Root 继续可见。已经上传的对象没有 Root 引用，经过安全等待期后由 GC 删除。</p></article>
         <article class="card"><h3>CAS 后、ACK 前崩溃</h3><p>新 Root 已经是 Ground Truth。重启后根据 txn/generation 识别已提交状态，只清理 Pending Pack，不重复增加 Generation。</p></article>
-        <article class="card"><h3>CAS 失败</h3><p>说明 Generation 冲突、Lease 过期或 Writer 已被 Fence。立即停止写路径，不能覆盖新 Owner 的 Root。</p></article>
+        <article class="card"><h3>CAS 失败</h3><p>Generation、owner 或 epoch 冲突才说明 Writer 已被 Fence。S3/DB timeout 只是可重试 publish error；Relaxed 保留本地 pack，不能直接向 ext4 注入 EIO。</p></article>
       </div>
 
-      <div class="callout red"><strong>延迟下限：</strong>严格 FLUSH 至少包含一次 S3 PUT 完成和一次 Metadata CAS。不能同时承诺“纯 NVMe fsync 延迟”和“Host 永久损坏零丢失”。如果 fsync 密集型数据库无法接受，需要增加独立的区域级 Replicated Write Log，而不是提前返回成功。</div>
+      <div class="callout red"><strong>延迟与风险边界：</strong>Strict FLUSH 至少包含一次 S3 PUT + Metadata CAS；Relaxed 关键路径只有本地 pack 持久化，但 Host 永久损坏会丢当时的 L-R。要同时获得本地级 fsync 与 Host-loss RPO 0，必须增加跨 Host Replicated Write Log。</div>
     </section>
 
     <section id="fencing">
@@ -859,12 +859,13 @@ ChunkRef {
         <table>
           <thead><tr><th>故障</th><th>正确行为</th><th>不能发生</th><th>恢复动作</th></tr></thead>
           <tbody>
-            <tr><td>blockd 进程崩溃</td><td>设备暂停或 I/O 失败；旧 Root 保持完整</td><td>自动跳过未完成 FLUSH 并返回成功</td><td>读取 Pending Pack；检查远端 generation/txn；幂等重试或回滚该 Dirty Set。</td></tr>
-            <tr><td>Host 永久损坏</td><td>从最后成功 FLUSH 的 Root 恢复</td><td>依赖旧 NVMe 才能启动</td><td>等待/撤销 Lease；新 Host 获取更高 Epoch；空 Cache Cold Start。</td></tr>
-            <tr><td>S3 PUT 超时</td><td>重试同一不可变 Object ID；FLUSH 保持等待或失败</td><td>不知道对象是否完成时发布 Root</td><td>HEAD/GET 验证对象和 checksum；确认后继续提交。</td></tr>
+            <tr><td>blockd 进程崩溃</td><td>同 Host 从 pending pack 重建 L；旧 Root 完整</td><td>attach 恢复阶段先做远端写或跳过 ACK pack</td><td>先恢复本地队列，再由 publisher 按 generation 幂等重放。</td></tr>
+            <tr><td>Host 永久损坏</td><td>Strict 从成功 FLUSH 恢复；Relaxed 从 R 恢复</td><td>把 publisher 定时器当作真实 RPO</td><td>新 Host 获取更高 Epoch；以故障时 L-R 的 age/bytes/generations 记账。</td></tr>
+            <tr><td>S3 PUT 超时</td><td>Strict 等待/失败；Relaxed 本地 ACK 后后台重试</td><td>将普通 timeout 当 fencing 或向 Relaxed ext4 注入 EIO</td><td>保留 pack 和 lease；记录 publish error；远端恢复后继续。</td></tr>
             <tr><td>S3 返回损坏数据</td><td>Checksum 失败，拒绝将数据交给 Guest</td><td>把损坏内容写入 Cache 后继续运行</td><td>重试、读取其他副本/区域；无法恢复时 Volume 进入 Faulted。</td></tr>
-            <tr><td>PostgreSQL 不可用</td><td>已有 Clean Cache 的读可继续；新 FLUSH 不能成功</td><td>绕过 CAS 直接修改 S3 HEAD</td><td>回压写请求；超时后冻结或只读；数据库恢复后重试。</td></tr>
-            <tr><td>Lease 续租失败</td><td>在安全窗口内停止新写和 Root 发布</td><td>旧 Host 无限期继续写</td><td>设备进入 fenced 状态；由控制面重新 Attach。</td></tr>
+            <tr><td>PostgreSQL 不可用</td><td>Strict 等待/失败；Relaxed 本地推进到配额水位</td><td>绕过 CAS 或让本地队列无界增长</td><td>有界队列/deadline；只剩 pin 数据时背压；恢复后重连。</td></tr>
+            <tr><td>Lease expiry lapse</td><td>owner/epoch 未变时继续 renew/publish</td><td>因瞬时抖动自我 fence</td><td>竞争 acquire/revoke 增加 epoch 后旧 Writer 才 fail closed。</td></tr>
+            <tr><td>强制 lifecycle drain 失败</td><td>不越过 Stop/Warm/Snapshot/Detach/迁移边界</td><td>释放 lease、删除 pending 或宣称 Cold</td><td>保留源 runtime；控制器重试到 R == L。</td></tr>
             <tr><td>GC 进程崩溃</td><td>最多延迟空间回收</td><td>删除任何仍被 Root/Snapshot 引用的对象</td><td>GC Job 使用 epoch、checkpoint 和幂等 delete，重新扫描。</td></tr>
             <tr><td>Compaction 崩溃</td><td>旧 Base + Delta 仍可读</td><td>先删除旧对象再发布新 Map</td><td>新 Base 成为 Orphan 或在重试时复用；Root CAS 后才允许旧对象进入 GC。</td></tr>
           </tbody>
@@ -878,7 +879,7 @@ ChunkRef {
       <div class="metric-grid">
         <div class="metric"><strong>&lt; 1ms</strong><span>目标：NVMe Cache Hit READ P99</span></div>
         <div class="metric"><strong>&lt; 1ms</strong><span>目标：非 FUA 本地 WRITE P99</span></div>
-        <div class="metric"><strong>实测决定</strong><span>FLUSH P50/P99：S3 PUT + DB CAS</span></div>
+        <div class="metric"><strong>分别实测</strong><span>Strict 远端 FLUSH 与 Relaxed 本地 FLUSH P50/P99</span></div>
         <div class="metric"><strong>&gt; 95%</strong><span>目标：稳态工作集 Cache Hit Rate</span></div>
       </div>
 
@@ -887,9 +888,9 @@ ChunkRef {
           <thead><tr><th>类别</th><th>必须导出的指标</th></tr></thead>
           <tbody>
             <tr><td>I/O</td><td>read/write/flush/trim IOPS、bytes、P50/P95/P99、queue depth、barrier wait</td></tr>
-            <tr><td>Cache</td><td>hit/miss、hydrated bytes、eviction、clean/dirty bytes、quota、NVMe fsync latency</td></tr>
+            <tr><td>Cache</td><td>hit/miss、eviction、clean/dirty/pinned bytes、allocated/accounted/max local bytes、NVMe fsync latency</td></tr>
             <tr><td>Remote</td><td>GET/PUT 数、bytes、latency、retry、checksum failure、throttle、error code</td></tr>
-            <tr><td>Commit</td><td>generation、dirty pages/txn、delta bytes、CAS conflict、flush durable seq、Pending Pack backlog</td></tr>
+            <tr><td>Commit</td><td>local/remote generation、unpublished generations/bytes/oldest age、publish error、backpressure、CAS conflict、fenced</td></tr>
             <tr><td>Lifecycle</td><td>attach latency、cold start first-read、migration time、lease renewal、fencing event</td></tr>
             <tr><td>Space</td><td>live bytes、orphan bytes、snapshot retained bytes、GC reclaimed bytes、compaction amplification</td></tr>
           </tbody>
@@ -935,12 +936,12 @@ trait MetadataStore {
       <h2>16. 验收与故障注入</h2>
       <div class="two-col">
         <article class="card"><h3>正确性</h3><ul><li>ext4 mkfs、mount、unmount、journal replay</li><li>tree digest 冷恢复一致</li><li>fsck.ext4 强制检查</li><li>fio verify、fsx、随机断电点</li><li>TRIM 后读取全零</li><li>Snapshot/Restore/Clone 内容一致</li></ul></article>
-        <article class="card"><h3>故障注入</h3><ul><li>Data PUT 前、中、后 kill -9</li><li>Map PUT 后、CAS 前崩溃</li><li>CAS 后、ACK 前崩溃</li><li>Lease 过期和旧 Host 恢复</li><li>S3 延迟、5xx、超时、损坏响应</li><li>PostgreSQL failover 和重复事务</li></ul></article>
+        <article class="card"><h3>故障注入</h3><ul><li>双水位各阶段 kill -9</li><li>lease expiry lapse、竞争 acquire/revoke</li><li>S3/DB 延迟、5xx、超时、failover</li><li>Relaxed 配额、淘汰与背压</li><li>强制 drain 失败时保留源并重试</li><li>旧 Host 恢复后 stale epoch 发布</li></ul></article>
         <article class="card"><h3>工作负载</h3><ul><li>100GiB / 100,000 小文件</li><li>git clone、checkout、gc</li><li>apt、npm、pip install</li><li>SQLite WAL + 每事务 fsync</li><li>PostgreSQL/MySQL 开发实例</li><li>Docker/OCI layer 解包</li></ul></article>
-        <article class="card"><h3>必须记录</h3><ul><li>远端上传/下载字节</li><li>S3 GET/PUT 数和费用模型</li><li>Full Chunk 与 Delta 写放大</li><li>FLUSH P50/P99</li><li>Cold Start 首次响应和 Hotset</li><li>GC/Compaction 对前台 I/O 的影响</li></ul></article>
+        <article class="card"><h3>必须记录</h3><ul><li>远端上传/下载字节</li><li>S3 GET/PUT 数和费用模型</li><li>Full Chunk 与 Delta 写放大</li><li>Strict/Relaxed FLUSH P50/P99</li><li>L-R generations/bytes/oldest age</li><li>publisher throughput 与配额背压</li></ul></article>
       </div>
 
-      <div class="callout red"><strong>上线阻断条件：</strong>任何一次成功返回的 FLUSH 在删除整台 Host 后无法恢复；旧 Fencing Epoch 能发布 Root；GC 能删除可达对象；Checksum 错误未被发现；或无法给出明确的 Dirty/Pending Commit 上限。</div>
+      <div class="callout red"><strong>上线阻断条件：</strong>Strict 成功 FLUSH 在删除 Host 后无法恢复；Relaxed 未暴露实际 L-R，或 drain 失败仍删除唯一的本地副本；旧 Fencing Epoch 能发布 Root；或没有明确的每卷 pending/local 物理上限。每卷上限不等于 Host 全局容量证明。</div>
 
       <h3 style="margin-top:30px">Direct-S3 替换 JuiceFS 的决策门</h3>
       <div class="table-wrap">

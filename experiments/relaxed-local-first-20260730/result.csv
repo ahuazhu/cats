@@ -1,0 +1,5 @@
+dirty_chunks,guest_bytes_per_chunk,sample_count,statistic,local_pack_kib,local_flush_ms,remote_drain_ms,published_mib,object_adapter,metadata_adapter
+1,4096,5,median,4.3,9.90,45.05,0.06,file,sqlite
+8,4096,5,median,33.8,8.81,79.07,0.50,file,sqlite
+32,4096,5,median,134.9,13.39,184.18,2.00,file,sqlite
+64,4096,5,median,269.7,10.04,350.03,4.00,file,sqlite
