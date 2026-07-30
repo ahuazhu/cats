@@ -45,12 +45,12 @@ struct Counters {
     image_objects: AtomicU64,
 }
 
-struct CountingBlob {
+struct GoldenRootAccountingBlob {
     inner: Arc<dyn BlobStore>,
     counters: Arc<Counters>,
 }
 
-impl BlobStore for CountingBlob {
+impl BlobStore for GoldenRootAccountingBlob {
     fn put_immutable(&self, key: &str, data: &[u8]) -> BlobResult<()> {
         let (bytes, objects) = if key.starts_with("images/") {
             (&self.counters.image_bytes, &self.counters.image_objects)
@@ -111,7 +111,7 @@ fn object_store(dir: &Path, prefix: &str) -> Arc<dyn BlobStore> {
 struct Env {
     _dir: tempfile::TempDir,
     root: PathBuf,
-    blob: Arc<CountingBlob>,
+    blob: Arc<GoldenRootAccountingBlob>,
     meta: Arc<dyn MetadataStore>,
     counters: Arc<Counters>,
 }
@@ -119,7 +119,7 @@ struct Env {
 fn env(run: &str) -> Env {
     let dir = tempfile::tempdir().expect("tempdir");
     let counters = Arc::new(Counters::default());
-    let blob = Arc::new(CountingBlob {
+    let blob = Arc::new(GoldenRootAccountingBlob {
         inner: object_store(dir.path(), run),
         counters: counters.clone(),
     });

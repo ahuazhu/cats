@@ -13,10 +13,9 @@ use cats_api::guest::{GuestRequestBody, GuestResponseBody};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::SqliteUsageStore;
 use cats_node_agent::guest_client::GuestClient;
-use cats_node_agent::runtime::NodeConfig;
 use cats_node_agent::server::{spawn as spawn_node, Handle as NodeHandle, ServerConfig};
-use cats_node_agent::testutil::workspace_bin;
 use cats_storage::{AdapterConfig, AdapterSelection, MetadataStore};
+use cats_test_support::{fake_node_config, workspace_bin, NodeConfigBuilder};
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
@@ -122,21 +121,10 @@ impl Cluster {
             memory_mib: 32_768,
             heartbeat_ms: 300,
             storage_meta,
-            node: NodeConfig {
-                node_id: id.to_string(),
-                state_dir: dir.path().join(format!("node-{id}")),
-                blockd_bin: workspace_bin("cats-blockd"),
-                guest_agent_bin: workspace_bin("cats-guest-agent"),
-                metadata_store,
-                object_store,
-                blockd_lease_ttl_ms: 1_200,
-                blockd_max_staged_bytes: cats_blockd::engine::DEFAULT_MAX_STAGED_BYTES,
-                blockd_max_staged_packs: cats_blockd::engine::DEFAULT_MAX_STAGED_PACKS,
-                blockd_max_local_bytes: cats_blockd::engine::DEFAULT_MAX_LOCAL_BYTES,
-                metering_cgroup_root: None,
-                wake_budget: Default::default(),
-                vmm: cats_node_agent::runtime::VmmMode::Fake,
-            },
+            node: fake_node_config!(NodeConfigBuilder::new(dir.path(), id.to_string())
+                .with_state_dir(dir.path().join(format!("node-{id}")))
+                .with_metadata_store(metadata_store)
+                .with_object_store(object_store)),
         })
         .await
         .unwrap()

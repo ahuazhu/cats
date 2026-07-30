@@ -451,12 +451,6 @@ impl MetadataStoreFactory for SqliteMetadataStoreFactory {
 mod tests {
     use super::*;
 
-    fn store() -> (tempfile::TempDir, SqliteMetadataStore) {
-        let dir = tempfile::tempdir().unwrap();
-        let meta = SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap();
-        (dir, meta)
-    }
-
     #[test]
     fn several_processes_can_open_a_fresh_database_at_once() {
         // A node starting N Cats at once starts N `cats-blockd` processes, each of
@@ -490,164 +484,11 @@ mod tests {
     }
 
     #[test]
-    fn volume_lifecycle_and_head() {
-        let (_d, m) = store();
-        m.create_volume("v1", 1 << 22).unwrap();
-        assert!(matches!(
-            m.create_volume("v1", 1),
-            Err(MetaError::AlreadyExists(_))
-        ));
-        let head = m.load_head("v1").unwrap();
-        assert_eq!(head.generation, 0);
-        assert!(head.root_hash.is_none());
-        assert!(matches!(m.load_head("nope"), Err(MetaError::NotFound(_))));
-    }
-
-    #[test]
-    fn invalid_numeric_inputs_are_rejected_without_wrapping() {
-        let (_d, m) = store();
-        assert!(matches!(
-            m.create_volume("too-large", u64::MAX),
-            Err(MetaError::InvalidArgument(_))
-        ));
-        m.create_volume("v1", 1 << 22).unwrap();
-        assert!(matches!(
-            m.acquire_lease("v1", "attA", 0),
-            Err(MetaError::InvalidArgument(_))
-        ));
-        assert!(matches!(
-            m.acquire_lease("v1", "attA", i64::MAX),
-            Err(MetaError::InvalidArgument(_))
-        ));
-    }
-
-    #[test]
-    fn lease_acquire_renew_fence() {
-        let (_d, m) = store();
-        m.create_volume("v1", 1 << 22).unwrap();
-        let e1 = m.acquire_lease("v1", "attA", 60_000).unwrap();
-        assert_eq!(e1, 1);
-        // Another attachment cannot steal an unexpired lease.
-        assert!(matches!(
-            m.acquire_lease("v1", "attB", 60_000),
-            Err(MetaError::LeaseHeld)
-        ));
-        m.renew_lease("v1", "attA", e1, 60_000).unwrap();
-        // Revoke fences the current holder (it bumps the epoch, so the old
-        // holder cannot renew back in even though renewals tolerate expiry).
-        m.revoke_lease("v1").unwrap();
-        assert!(matches!(
-            m.renew_lease("v1", "attA", e1, 60_000),
-            Err(MetaError::Fenced)
-        ));
-        let e2 = m.acquire_lease("v1", "attB", 60_000).unwrap();
-        assert_eq!(e2, 3, "revoke and acquire each consume an epoch");
-        // Old epoch renew still fails even though owner column changed.
-        assert!(matches!(
-            m.renew_lease("v1", "attA", e1, 60_000),
-            Err(MetaError::Fenced)
-        ));
-    }
-
-    #[test]
-    fn cas_requires_generation_owner_and_epoch() {
-        let (_d, m) = store();
-        m.create_volume("v1", 1 << 22).unwrap();
-        let epoch = m.acquire_lease("v1", "attA", 60_000).unwrap();
-        let g1 = m
-            .cas_head("v1", 0, 1, [1; 32], "obj1", "attA", epoch)
-            .unwrap();
-        assert_eq!(g1, 1);
-        // Wrong expected generation.
-        assert!(m
-            .cas_head("v1", 0, 1, [2; 32], "obj2", "attA", epoch)
-            .is_err());
-        // Wrong epoch.
-        assert!(m
-            .cas_head("v1", 1, 2, [2; 32], "obj2", "attA", epoch + 1)
-            .is_err());
-        // Fenced holder cannot CAS.
-        m.revoke_lease("v1").unwrap();
-        assert!(m
-            .cas_head("v1", 1, 2, [2; 32], "obj2", "attA", epoch)
-            .is_err());
-        // New holder continues from the committed generation.
-        let e2 = m.acquire_lease("v1", "attB", 60_000).unwrap();
-        let g2 = m.cas_head("v1", 1, 2, [3; 32], "obj3", "attB", e2).unwrap();
-        assert_eq!(g2, 2);
-        let head = m.load_head("v1").unwrap();
-        assert_eq!(head.root_hash, Some([3; 32]));
-        assert_eq!(head.root_object_id.as_deref(), Some("obj3"));
-    }
-
-    #[test]
-    fn expired_lease_can_be_taken_and_old_epoch_is_dead() {
-        let (_d, m) = store();
-        m.create_volume("v1", 1 << 22).unwrap();
-        let e1 = m.acquire_lease("v1", "attA", 1).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let e2 = m.acquire_lease("v1", "attB", 60_000).unwrap();
-        assert!(e2 > e1);
-        assert!(m.cas_head("v1", 0, 1, [1; 32], "obj", "attA", e1).is_err());
-        assert!(m.cas_head("v1", 0, 1, [1; 32], "obj", "attB", e2).is_ok());
-    }
-
-    #[test]
-    fn lapsed_but_unclaimed_owner_can_publish() {
-        let (_d, m) = store();
-        m.create_volume("v1", 1 << 22).unwrap();
-        let epoch = m.acquire_lease("v1", "attA", 1).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(5));
-
-        // Expiry only opens the acquisition window. Until another attachment
-        // actually acquires (and bumps the epoch), attA is still the sole
-        // fencing-token holder and must not self-fence during a publish.
-        assert_eq!(
-            m.cas_head("v1", 0, 1, [9; 32], "obj9", "attA", epoch)
-                .unwrap(),
-            1
-        );
-    }
-
-    /// A lapse alone must stay renewable: a slow attach or a metadata hiccup
-    /// is not a fence, and turning it into one permanently killed every start
-    /// of a volume whose attach outlived the TTL (2026-07-29). Only a revoke
-    /// or a competing acquire — both bump the epoch — ends the attachment.
-    #[test]
-    fn lapsed_lease_renews_until_revoked_or_stolen() {
-        let (_d, m) = store();
-        m.create_volume("v1", 1 << 22).unwrap();
-        // Expired but unclaimed: renewal succeeds and the lease works again.
-        let e1 = m.acquire_lease("v1", "attA", 1).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        m.renew_lease("v1", "attA", e1, 60_000).unwrap();
-        assert!(m.cas_head("v1", 0, 1, [1; 32], "obj1", "attA", e1).is_ok());
-        // Stolen during the lapse: the old holder's renewal dies on the epoch.
-        let e1b = m.acquire_lease("v1", "attA", 1).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let e2 = m.acquire_lease("v1", "attB", 60_000).unwrap();
-        assert!(matches!(
-            m.renew_lease("v1", "attA", e1b, 60_000),
-            Err(MetaError::Fenced)
-        ));
-        // Revoked during a lapse: same, the revoke bumped the epoch.
-        m.revoke_lease("v1").unwrap();
-        assert!(matches!(
-            m.renew_lease("v1", "attB", e2, 60_000),
-            Err(MetaError::Fenced)
-        ));
-    }
-
-    #[test]
-    fn snapshots_capture_current_root() {
-        let (_d, m) = store();
-        m.create_volume("v1", 1 << 22).unwrap();
-        let epoch = m.acquire_lease("v1", "attA", 60_000).unwrap();
-        m.cas_head("v1", 0, 1, [7; 32], "obj7", "attA", epoch)
-            .unwrap();
-        let snap = m.create_snapshot("snap_1", "v1").unwrap();
-        assert_eq!(snap.generation, 1);
-        assert_eq!(snap.root_hash, Some([7; 32]));
-        assert_eq!(m.list_snapshots("v1").unwrap().len(), 1);
+    fn shared_metadata_store_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("meta.db");
+        cats_test_support::metadata_store_contract(|| {
+            std::sync::Arc::new(SqliteMetadataStore::open(&path).unwrap())
+        });
     }
 }

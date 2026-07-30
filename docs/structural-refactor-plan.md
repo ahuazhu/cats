@@ -72,6 +72,10 @@ cats-metering    -> rusqlite
 
 ## 5. 阶段 0：建立重构护栏
 
+> 实施状态：已完成（2026-07-30）。SQLite/File 契约进入默认 workspace test；
+> PostgreSQL/S3 契约分别由 `CATS_POSTGRES_URL` 和
+> `CATS_AWS_S3_TEST_ENDPOINT` 显式启用。
+
 ### 5.1 创建共享测试支持 crate
 
 新增仅供 `dev-dependencies` 使用的 `cats-test-support`，建议路径：

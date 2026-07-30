@@ -18,7 +18,7 @@ use std::sync::Arc;
 use cats_blockd::engine::{ChunkEngine, EngineConfig};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_object_store_aws_s3::{AwsS3BlobStore, AwsS3Config};
-use cats_storage::{BlobError, BlobStore, MetadataStore};
+use cats_storage::{BlobStore, MetadataStore};
 
 fn live_store(prefix: &str) -> Option<AwsS3BlobStore> {
     let endpoint = std::env::var("CATS_AWS_S3_TEST_ENDPOINT").ok()?;
@@ -45,38 +45,7 @@ fn blobstore_contract_against_live_s3() {
         eprintln!("skipped: CATS_AWS_S3_TEST_ENDPOINT not set");
         return;
     };
-    store
-        .put_immutable("volumes/v1/data/a", b"hello-s3")
-        .unwrap();
-    store
-        .put_immutable("volumes/v1/data/a", b"hello-s3")
-        .unwrap(); // idempotent
-    assert!(matches!(
-        store.put_immutable("volumes/v1/data/a", b"different"),
-        Err(BlobError::Backend { .. })
-    ));
-    assert_eq!(store.get("volumes/v1/data/a").unwrap(), b"hello-s3");
-    assert!(store.exists("volumes/v1/data/a").unwrap());
-    assert!(!store.exists("volumes/v1/data/missing").unwrap());
-    assert!(matches!(
-        store.get("volumes/v1/data/missing"),
-        Err(BlobError::NotFound(_))
-    ));
-    store
-        .put_immutable("volumes/v1/maps/m1.node", b"node")
-        .unwrap();
-    let listed = store.list("volumes/v1/").unwrap();
-    assert_eq!(
-        listed,
-        vec![
-            "volumes/v1/data/a".to_string(),
-            "volumes/v1/maps/m1.node".to_string()
-        ]
-    );
-    store.delete("volumes/v1/data/a").unwrap();
-    store.delete("volumes/v1/data/a").unwrap(); // idempotent delete
-    assert!(!store.exists("volumes/v1/data/a").unwrap());
-    store.delete("volumes/v1/maps/m1.node").unwrap();
+    cats_test_support::blob_store_contract(|| Arc::new(store));
 }
 
 #[test]

@@ -1,6 +1,9 @@
 use super::*;
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_object_store_file::FileBlobStore;
+use cats_test_support::blob_doubles::{
+    ConcurrencyProbe, CountingBlob, SizingBlob, SlowBlob, SwitchableFailureBlob,
+};
 use std::sync::atomic::AtomicU64;
 
 struct Env {
@@ -118,11 +121,9 @@ fn attach_relaxed(env: &Env, attachment: &str) -> Arc<ChunkEngine> {
 #[test]
 fn relaxed_flush_acks_locally_and_the_drain_publishes() {
     let dir = tempfile::tempdir().unwrap();
-    let counting = Arc::new(CountingBlob {
-        inner: Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap()),
-        gets: AtomicU64::new(0),
-        data_puts: AtomicU64::new(0),
-    });
+    let counting = Arc::new(CountingBlob::new(Arc::new(
+        FileBlobStore::open(dir.path().join("blob")).unwrap(),
+    )));
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
     meta.create_volume(VOL, SIZE).unwrap();
     let mut cfg = EngineConfig::new(VOL, dir.path().join("data"), "attA");
@@ -135,7 +136,7 @@ fn relaxed_flush_acks_locally_and_the_drain_publishes() {
     let acked = e.flush().unwrap();
     assert_eq!(acked, 1, "flush reports the pack's target generation");
     assert_eq!(
-        counting.data_puts.load(Ordering::SeqCst),
+        counting.data_put_count(),
         0,
         "a relaxed ack must not wait on the object store"
     );
@@ -152,7 +153,7 @@ fn relaxed_flush_acks_locally_and_the_drain_publishes() {
     assert_eq!(e.flush().unwrap(), 1);
 
     assert_eq!(e.drain_staged().unwrap(), 1);
-    assert!(counting.data_puts.load(Ordering::SeqCst) > 0);
+    assert!(counting.data_put_count() > 0);
     assert_eq!(e.generation(), 1);
     e.detach().unwrap();
 }
@@ -261,36 +262,6 @@ fn remote_outage_is_observable_but_does_not_fail_relaxed_flush() {
 
 #[test]
 fn relaxed_cold_cache_write_and_flush_issue_no_remote_read() {
-    struct SwitchableGetFailure {
-        inner: Arc<dyn BlobStore>,
-        fail_gets: AtomicBool,
-        gets: AtomicU64,
-    }
-    impl BlobStore for SwitchableGetFailure {
-        fn put_immutable(&self, key: &str, data: &[u8]) -> cats_storage::blob::Result<()> {
-            self.inner.put_immutable(key, data)
-        }
-        fn get(&self, key: &str) -> cats_storage::blob::Result<Vec<u8>> {
-            self.gets.fetch_add(1, Ordering::SeqCst);
-            if self.fail_gets.load(Ordering::SeqCst) {
-                return Err(BlobError::Backend {
-                    key: key.to_string(),
-                    message: "injected GET outage".into(),
-                });
-            }
-            self.inner.get(key)
-        }
-        fn exists(&self, key: &str) -> cats_storage::blob::Result<bool> {
-            self.inner.exists(key)
-        }
-        fn delete(&self, key: &str) -> cats_storage::blob::Result<()> {
-            self.inner.delete(key)
-        }
-        fn list(&self, prefix: &str) -> cats_storage::blob::Result<Vec<String>> {
-            self.inner.list(prefix)
-        }
-    }
-
     let dir = tempfile::tempdir().unwrap();
     let healthy: Arc<dyn BlobStore> =
         Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
@@ -309,28 +280,24 @@ fn relaxed_cold_cache_write_and_flush_issue_no_remote_read() {
         e.detach().unwrap();
     }
 
-    let switched = Arc::new(SwitchableGetFailure {
-        inner: healthy.clone(),
-        fail_gets: AtomicBool::new(false),
-        gets: AtomicU64::new(0),
-    });
+    let switched = Arc::new(SwitchableFailureBlob::new(healthy.clone()));
     let mut cfg = EngineConfig::new(VOL, dir.path().join("relaxed"), "attA");
     cfg.durability = DurabilityMode::Relaxed {
         drain_interval_ms: NO_TIMER,
     };
     let e = ChunkEngine::attach(cfg, switched.clone(), meta.clone()).unwrap();
-    let before = switched.gets.load(Ordering::SeqCst);
-    switched.fail_gets.store(true, Ordering::SeqCst);
+    let before = switched.get_count();
+    switched.set_fail_gets(true);
     let update = pattern(4096, 99);
     e.write(123, &update).unwrap();
     assert_eq!(e.flush().unwrap(), 2);
     assert_eq!(
-        switched.gets.load(Ordering::SeqCst),
+        switched.get_count(),
         before,
         "cold-cache relaxed WRITE/FLUSH must not issue an object GET"
     );
 
-    switched.fail_gets.store(false, Ordering::SeqCst);
+    switched.set_fail_gets(false);
     let mut live = vec![0u8; CHUNK_SIZE as usize];
     e.read(0, &mut live).unwrap();
     let mut expected = original.clone();
@@ -743,32 +710,13 @@ fn eager_committer_drains_a_burst_without_the_timer() {
 /// stalls once the staged queue crosses the backpressure cap.
 #[test]
 fn a_slow_store_burst_never_stalls_a_flush_for_long() {
-    struct SlowBlob {
-        inner: Arc<dyn BlobStore>,
-    }
-    impl BlobStore for SlowBlob {
-        fn put_immutable(&self, k: &str, d: &[u8]) -> cats_storage::blob::Result<()> {
-            std::thread::sleep(Duration::from_millis(25));
-            self.inner.put_immutable(k, d)
-        }
-        fn get(&self, k: &str) -> cats_storage::blob::Result<Vec<u8>> {
-            self.inner.get(k)
-        }
-        fn exists(&self, k: &str) -> cats_storage::blob::Result<bool> {
-            self.inner.exists(k)
-        }
-        fn delete(&self, k: &str) -> cats_storage::blob::Result<()> {
-            self.inner.delete(k)
-        }
-        fn list(&self, p: &str) -> cats_storage::blob::Result<Vec<String>> {
-            self.inner.list(p)
-        }
-    }
-
     let dir = tempfile::tempdir().unwrap();
-    let blob: Arc<dyn BlobStore> = Arc::new(SlowBlob {
-        inner: Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap()),
-    });
+    let blob: Arc<dyn BlobStore> = Arc::new(
+        SlowBlob::new(Arc::new(
+            FileBlobStore::open(dir.path().join("blob")).unwrap(),
+        ))
+        .with_put_delay(Duration::from_millis(25)),
+    );
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
     meta.create_volume(VOL, SIZE).unwrap();
     let mut cfg = EngineConfig::new(VOL, dir.path().join("data"), "attA");
@@ -904,34 +852,8 @@ fn multi_generation_overwrites_read_latest() {
     e.detach().unwrap();
 }
 
-/// Object store whose reads are slower than the lease TTL, reproducing
-/// the 2026-07-29 production failure: a 60 GiB volume's attach (map load
-/// and recovery) took 1.9 s against a 1.5 s TTL, renewal only began after
-/// attach, so the first renewal always found the lease expired and every
-/// start of that Cat self-fenced before the Guest's first write.
-struct SlowBlob {
-    inner: Arc<dyn BlobStore>,
-    delay: std::time::Duration,
-}
-impl BlobStore for SlowBlob {
-    fn put_immutable(&self, k: &str, d: &[u8]) -> cats_storage::blob::Result<()> {
-        self.inner.put_immutable(k, d)
-    }
-    fn get(&self, k: &str) -> cats_storage::blob::Result<Vec<u8>> {
-        std::thread::sleep(self.delay);
-        self.inner.get(k)
-    }
-    fn exists(&self, k: &str) -> cats_storage::blob::Result<bool> {
-        self.inner.exists(k)
-    }
-    fn delete(&self, k: &str) -> cats_storage::blob::Result<()> {
-        self.inner.delete(k)
-    }
-    fn list(&self, p: &str) -> cats_storage::blob::Result<Vec<String>> {
-        self.inner.list(p)
-    }
-}
-
+/// Object-store reads slower than the lease TTL reproduce the 2026-07-29
+/// production failure: attach outlived the TTL and used to self-fence.
 #[test]
 fn attach_slower_than_the_lease_ttl_does_not_self_fence() {
     let env = env();
@@ -943,10 +865,9 @@ fn attach_slower_than_the_lease_ttl_does_not_self_fence() {
     }
     // Cold host: the committed map must be read back through the store.
     fs::remove_dir_all(&env.data_dir).unwrap();
-    let slow: Arc<dyn BlobStore> = Arc::new(SlowBlob {
-        inner: env.blob.clone(),
-        delay: std::time::Duration::from_millis(150),
-    });
+    let slow: Arc<dyn BlobStore> = Arc::new(
+        SlowBlob::new(env.blob.clone()).with_get_delay(std::time::Duration::from_millis(150)),
+    );
     let mut cfg = EngineConfig::new(VOL, &env.data_dir, "attB");
     cfg.lease_ttl_ms = 100;
     let e = ChunkEngine::attach(cfg, slow, env.meta.clone()).unwrap();
@@ -959,78 +880,9 @@ fn attach_slower_than_the_lease_ttl_does_not_self_fence() {
     e.detach().unwrap();
 }
 
-/// Counting wrapper to prove holes never hit the blobstore and that a
-/// relaxed ack publishes nothing.
-struct CountingBlob {
-    inner: Arc<dyn BlobStore>,
-    gets: AtomicU64,
-    data_puts: AtomicU64,
-}
-impl BlobStore for CountingBlob {
-    fn put_immutable(&self, k: &str, d: &[u8]) -> cats_storage::blob::Result<()> {
-        if k.contains("/data/") {
-            self.data_puts.fetch_add(1, Ordering::SeqCst);
-        }
-        self.inner.put_immutable(k, d)
-    }
-    fn get(&self, k: &str) -> cats_storage::blob::Result<Vec<u8>> {
-        self.gets.fetch_add(1, Ordering::SeqCst);
-        self.inner.get(k)
-    }
-    fn exists(&self, k: &str) -> cats_storage::blob::Result<bool> {
-        self.inner.exists(k)
-    }
-    fn delete(&self, k: &str) -> cats_storage::blob::Result<()> {
-        self.inner.delete(k)
-    }
-    fn list(&self, p: &str) -> cats_storage::blob::Result<Vec<String>> {
-        self.inner.list(p)
-    }
-}
-
-/// Bytes a commit actually publishes, so a test can assert that a small Guest
-/// write does not turn into a 4 MiB upload.
-struct SizingBlob {
-    inner: Arc<dyn BlobStore>,
-    data_bytes: AtomicU64,
-    data_objects: AtomicU64,
-    image_bytes: AtomicU64,
-}
-impl BlobStore for SizingBlob {
-    fn put_immutable(&self, k: &str, d: &[u8]) -> cats_storage::blob::Result<()> {
-        // Image objects also live under a `/data/` path, but they belong to the
-        // image and are written once for the whole fleet, so a volume's cost has
-        // to be counted separately from them.
-        if k.starts_with("images/") && k.contains("/data/") {
-            self.image_bytes.fetch_add(d.len() as u64, Ordering::SeqCst);
-        } else if k.contains("/data/") {
-            self.data_bytes.fetch_add(d.len() as u64, Ordering::SeqCst);
-            self.data_objects.fetch_add(1, Ordering::SeqCst);
-        }
-        self.inner.put_immutable(k, d)
-    }
-    fn get(&self, k: &str) -> cats_storage::blob::Result<Vec<u8>> {
-        self.inner.get(k)
-    }
-    fn exists(&self, k: &str) -> cats_storage::blob::Result<bool> {
-        self.inner.exists(k)
-    }
-    fn delete(&self, k: &str) -> cats_storage::blob::Result<()> {
-        self.inner.delete(k)
-    }
-    fn list(&self, p: &str) -> cats_storage::blob::Result<Vec<String>> {
-        self.inner.list(p)
-    }
-}
-
 fn sizing_env() -> (Env, Arc<SizingBlob>) {
     let env = env();
-    let sizing = Arc::new(SizingBlob {
-        inner: env.blob.clone(),
-        data_bytes: AtomicU64::new(0),
-        data_objects: AtomicU64::new(0),
-        image_bytes: AtomicU64::new(0),
-    });
+    let sizing = Arc::new(SizingBlob::new(env.blob.clone()));
     (env, sizing)
 }
 
@@ -1070,11 +922,9 @@ fn a_volume_provisioned_from_an_image_publishes_no_data_of_its_own() {
     let published = crate::image::publish(sizing.as_ref(), &image).unwrap();
     // Chunk 1 was all zeros, so the image stored 2 chunks plus the padded tail.
     assert_eq!(published.manifest.chunks.len(), 3);
-    let image_cost = sizing.image_bytes.load(Ordering::SeqCst);
+    let image_cost = sizing.image_bytes();
     assert_eq!(image_cost, 3 * CHUNK_SIZE as u64);
-    sizing.data_bytes.store(0, Ordering::SeqCst);
-    sizing.data_objects.store(0, Ordering::SeqCst);
-    sizing.image_bytes.store(0, Ordering::SeqCst);
+    sizing.reset();
 
     let e = attach_with(&env, sizing.clone(), "attA");
     let gen = e.provision_from_image(&published.manifest).unwrap();
@@ -1082,9 +932,9 @@ fn a_volume_provisioned_from_an_image_publishes_no_data_of_its_own() {
 
     // This is the whole point: a Cat's private cost for its root disk is zero
     // data objects, only map nodes.
-    assert_eq!(sizing.data_bytes.load(Ordering::SeqCst), 0);
-    assert_eq!(sizing.data_objects.load(Ordering::SeqCst), 0);
-    assert_eq!(sizing.image_bytes.load(Ordering::SeqCst), 0);
+    assert_eq!(sizing.data_bytes(), 0);
+    assert_eq!(sizing.data_objects(), 0);
+    assert_eq!(sizing.image_bytes(), 0);
 
     // And a fresh host still reads the image content, chunk 1 as zeros and the
     // padded tail included.
@@ -1111,8 +961,7 @@ fn writing_onto_a_provisioned_chunk_publishes_one_page_and_keeps_sharing_the_bas
     let published = crate::image::publish(sizing.as_ref(), &image).unwrap();
     let e = attach_with(&env, sizing.clone(), "attA");
     e.provision_from_image(&published.manifest).unwrap();
-    sizing.data_bytes.store(0, Ordering::SeqCst);
-    sizing.image_bytes.store(0, Ordering::SeqCst);
+    sizing.reset();
 
     // One 4 KiB write into a shared chunk.
     let patch = pattern(4096, 7);
@@ -1121,8 +970,8 @@ fn writing_onto_a_provisioned_chunk_publishes_one_page_and_keeps_sharing_the_bas
 
     // Delta packs and image sharing compose: the Cat publishes the 64 KiB page
     // it dirtied, not a 4 MiB private copy of the shared chunk.
-    assert_eq!(sizing.data_bytes.load(Ordering::SeqCst), PAGE);
-    assert_eq!(sizing.image_bytes.load(Ordering::SeqCst), 0);
+    assert_eq!(sizing.data_bytes(), PAGE);
+    assert_eq!(sizing.image_bytes(), 0);
     {
         let st = e.state.lock().unwrap();
         // The base is still the image's object — sharing did not erode.
@@ -1182,62 +1031,16 @@ fn an_image_larger_than_the_volume_is_refused_rather_than_truncated() {
     assert_eq!(e.generation(), 0);
 }
 
-/// A blob store that measures how many uploads were in flight at once, and
-/// makes each one slow enough for overlap to be visible.
-struct ConcurrencyProbe {
-    inner: Arc<dyn BlobStore>,
-    in_flight: AtomicU64,
-    peak: AtomicU64,
-    data_puts: AtomicU64,
-}
-impl BlobStore for ConcurrencyProbe {
-    fn put_immutable(&self, k: &str, d: &[u8]) -> cats_storage::blob::Result<()> {
-        if k.contains("/data/") {
-            self.data_puts.fetch_add(1, Ordering::SeqCst);
-            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-            self.peak.fetch_max(now, Ordering::SeqCst);
-            // Stand in for a network round trip.
-            std::thread::sleep(Duration::from_millis(20));
-            let result = self.inner.put_immutable(k, d);
-            self.in_flight.fetch_sub(1, Ordering::SeqCst);
-            return result;
-        }
-        self.inner.put_immutable(k, d)
-    }
-    fn get(&self, k: &str) -> cats_storage::blob::Result<Vec<u8>> {
-        if k.contains("/data/") {
-            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-            self.peak.fetch_max(now, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(20));
-            let result = self.inner.get(k);
-            self.in_flight.fetch_sub(1, Ordering::SeqCst);
-            return result;
-        }
-        self.inner.get(k)
-    }
-    fn exists(&self, k: &str) -> cats_storage::blob::Result<bool> {
-        self.inner.exists(k)
-    }
-    fn delete(&self, k: &str) -> cats_storage::blob::Result<()> {
-        self.inner.delete(k)
-    }
-    fn list(&self, p: &str) -> cats_storage::blob::Result<Vec<String>> {
-        self.inner.list(p)
-    }
-}
-
 #[test]
 fn a_commit_uploads_its_objects_concurrently() {
     // A commit's objects have distinct keys and no ordering between them, so
     // uploading them one round trip at a time is pure latency. On S3 that was
     // ~33 ms per object and most of a commit.
     let env = env();
-    let probe = Arc::new(ConcurrencyProbe {
-        inner: env.blob.clone(),
-        in_flight: AtomicU64::new(0),
-        peak: AtomicU64::new(0),
-        data_puts: AtomicU64::new(0),
-    });
+    let probe = Arc::new(ConcurrencyProbe::new(
+        env.blob.clone(),
+        Duration::from_millis(20),
+    ));
     let e = attach_with(&env, probe.clone(), "attA");
     let page = vec![0x33u8; PAGE as usize];
     for chunk in 0..8u64 {
@@ -1245,16 +1048,16 @@ fn a_commit_uploads_its_objects_concurrently() {
     }
     assert_eq!(e.flush().unwrap(), 1);
 
-    assert_eq!(probe.data_puts.load(Ordering::SeqCst), 8);
+    assert_eq!(probe.data_put_count(), 8);
     // Peak concurrency, not wall clock: the whole suite runs in parallel, so a
     // latency bound here would measure the machine's load. Serial uploads peak
     // at exactly 1, which is the regression this catches.
     assert!(
-        probe.peak.load(Ordering::SeqCst) >= 2,
+        probe.peak() >= 2,
         "uploads ran one at a time (peak in flight {})",
-        probe.peak.load(Ordering::SeqCst)
+        probe.peak()
     );
-    assert_eq!(probe.in_flight.load(Ordering::SeqCst), 0, "a worker leaked");
+    assert_eq!(probe.in_flight(), 0, "a worker leaked");
     e.detach().unwrap();
 
     // The committed data is still readable from a cold cache, which is the
@@ -1275,12 +1078,10 @@ fn a_cold_read_fetches_its_chunks_and_layers_concurrently() {
     // GET per object, none overlapping. A cold 64 MiB read off S3 ran at
     // 73 MiB/s on a 12.5 Gbps instance because of it.
     let env = env();
-    let probe = Arc::new(ConcurrencyProbe {
-        inner: env.blob.clone(),
-        in_flight: AtomicU64::new(0),
-        peak: AtomicU64::new(0),
-        data_puts: AtomicU64::new(0),
-    });
+    let probe = Arc::new(ConcurrencyProbe::new(
+        env.blob.clone(),
+        Duration::from_millis(20),
+    ));
 
     // Four chunks with a base plus two deltas each: 12 objects to fetch.
     let e = attach_with(&env, probe.clone(), "attA");
@@ -1309,17 +1110,17 @@ fn a_cold_read_fetches_its_chunks_and_layers_concurrently() {
 
     // A brand-new host: every one of those objects has to come back.
     fs::remove_dir_all(&env.data_dir).unwrap();
-    probe.peak.store(0, Ordering::SeqCst);
+    probe.reset_peak();
     let e = attach_with(&env, probe.clone(), "attB");
     let mut back = vec![0u8; 4 * CHUNK_SIZE as usize];
     e.read(0, &mut back).unwrap();
 
     assert!(
-        probe.peak.load(Ordering::SeqCst) >= 2,
+        probe.peak() >= 2,
         "cold read fetched one object at a time (peak in flight {})",
-        probe.peak.load(Ordering::SeqCst)
+        probe.peak()
     );
-    assert_eq!(probe.in_flight.load(Ordering::SeqCst), 0, "a fetch leaked");
+    assert_eq!(probe.in_flight(), 0, "a fetch leaked");
     // Concurrency must not change what comes back: each round's write wins on
     // the page it touched, the base shows through everywhere else.
     for chunk in 0..4usize {
@@ -1454,11 +1255,8 @@ fn discarding_whole_chunks_frees_their_objects_instead_of_publishing_zeros() {
         e.write(chunk * CHUNK_SIZE as u64, &whole).unwrap();
     }
     assert_eq!(e.flush().unwrap(), 1);
-    assert_eq!(
-        sizing.data_bytes.load(Ordering::SeqCst),
-        3 * CHUNK_SIZE as u64
-    );
-    sizing.data_bytes.store(0, Ordering::SeqCst);
+    assert_eq!(sizing.data_bytes(), 3 * CHUNK_SIZE as u64);
+    sizing.reset();
 
     // Discard chunks 1 and 2 in full.
     e.write_zeroes(CHUNK_SIZE as u64, 2 * CHUNK_SIZE as u64)
@@ -1467,7 +1265,7 @@ fn discarding_whole_chunks_frees_their_objects_instead_of_publishing_zeros() {
 
     // Nothing was published for them: writing 8 MiB of zeros would have been
     // the old behaviour, and would also have kept the old objects alive.
-    assert_eq!(sizing.data_bytes.load(Ordering::SeqCst), 0);
+    assert_eq!(sizing.data_bytes(), 0);
     {
         let st = e.state.lock().unwrap();
         assert!(matches!(st.map[0], ChunkRef::Base(_)), "chunk 0 untouched");
@@ -1505,13 +1303,13 @@ fn a_partial_discard_writes_zeros_and_a_later_write_cancels_a_discard() {
     let whole = pattern(CHUNK_SIZE as usize, 9);
     e.write(0, &whole).unwrap();
     e.flush().unwrap();
-    sizing.data_bytes.store(0, Ordering::SeqCst);
+    sizing.reset();
 
     // Not chunk-aligned: only the covered pages are zeroed, and the chunk
     // stays a real object because most of it still holds data.
     e.write_zeroes(PAGE, PAGE).unwrap();
     e.flush().unwrap();
-    assert_eq!(sizing.data_bytes.load(Ordering::SeqCst), PAGE);
+    assert_eq!(sizing.data_bytes(), PAGE);
     {
         let st = e.state.lock().unwrap();
         assert!(!matches!(st.map[0], ChunkRef::Hole));
@@ -1593,11 +1391,11 @@ fn a_sparse_write_publishes_only_its_dirty_pages() {
     assert_eq!(e.flush().unwrap(), 1);
 
     assert_eq!(
-        sizing.data_bytes.load(Ordering::SeqCst),
+        sizing.data_bytes(),
         3 * PAGE,
         "a commit must publish dirty pages, not whole chunks"
     );
-    assert_eq!(sizing.data_objects.load(Ordering::SeqCst), 3);
+    assert_eq!(sizing.data_objects(), 3);
     let st = e.state.lock().unwrap();
     for chunk in 0..3usize {
         match &st.map[chunk] {
@@ -1623,7 +1421,7 @@ fn a_dense_write_publishes_a_full_base() {
         .unwrap();
     e.flush().unwrap();
     assert_eq!(
-        sizing.data_bytes.load(Ordering::SeqCst),
+        sizing.data_bytes(),
         CHUNK_SIZE as u64,
         "a dense write should publish one full chunk"
     );
@@ -1657,7 +1455,7 @@ fn delta_chains_are_capped_by_a_base_rewrite() {
     }
     // Cheap for the first four commits, one full chunk for the rewrite.
     assert_eq!(
-        sizing.data_bytes.load(Ordering::SeqCst),
+        sizing.data_bytes(),
         MAX_DELTA_LAYERS as u64 * PAGE + CHUNK_SIZE as u64
     );
     e.detach().unwrap();
@@ -1706,31 +1504,23 @@ fn hole_reads_do_not_touch_the_blobstore() {
         e.detach().unwrap();
     }
     fs::remove_dir_all(&env.data_dir).unwrap();
-    let counting = Arc::new(CountingBlob {
-        inner: env.blob.clone(),
-        gets: AtomicU64::new(0),
-        data_puts: AtomicU64::new(0),
-    });
+    let counting = Arc::new(CountingBlob::new(env.blob.clone()));
     let e = ChunkEngine::attach(
         EngineConfig::new(VOL, &env.data_dir, "attB"),
         counting.clone(),
         env.meta.clone(),
     )
     .unwrap();
-    let after_attach = counting.gets.load(Ordering::SeqCst); // root + leaf loads
+    let after_attach = counting.get_count(); // root + leaf loads
     let mut z = vec![1u8; 4096];
     e.read(6 * CHUNK_SIZE as u64, &mut z).unwrap();
     assert!(z.iter().all(|&b| b == 0));
-    assert_eq!(
-        counting.gets.load(Ordering::SeqCst),
-        after_attach,
-        "hole read must not GET"
-    );
+    assert_eq!(counting.get_count(), after_attach, "hole read must not GET");
     // Reading committed data hydrates exactly once.
     let mut b = vec![0u8; 4096];
     e.read(0, &mut b).unwrap();
     e.read(0, &mut b).unwrap();
-    assert_eq!(counting.gets.load(Ordering::SeqCst), after_attach + 1);
+    assert_eq!(counting.get_count(), after_attach + 1);
     e.detach().unwrap();
 }
 

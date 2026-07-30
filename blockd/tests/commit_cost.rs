@@ -12,7 +12,6 @@
 
 use std::io::{BufWriter, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -21,41 +20,13 @@ use cats_blockd::format;
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
 use cats_object_store_file::FileBlobStore;
-use cats_storage::blob::{BlobStore, Result as BlobResult};
+use cats_storage::blob::BlobStore;
 use cats_storage::{open_blob_store, AdapterConfig, BlobStoreFactory, MetadataStore};
+use cats_test_support::blob_doubles::SizingBlob;
 
 const CHUNK: u64 = cats_api::chunk::CHUNK_SIZE as u64;
 const PAGE: u64 = cats_api::chunk::DIRTY_PAGE_SIZE as u64;
 const MIB: f64 = 1024.0 * 1024.0;
-
-/// Counts the bytes a commit actually publishes, which is the number the flush
-/// cost should track.
-struct SizingBlob {
-    inner: Arc<dyn BlobStore>,
-    data_bytes: AtomicU64,
-}
-
-impl BlobStore for SizingBlob {
-    fn put_immutable(&self, key: &str, data: &[u8]) -> BlobResult<()> {
-        if key.contains("/data/") {
-            self.data_bytes
-                .fetch_add(data.len() as u64, Ordering::SeqCst);
-        }
-        self.inner.put_immutable(key, data)
-    }
-    fn get(&self, key: &str) -> BlobResult<Vec<u8>> {
-        self.inner.get(key)
-    }
-    fn exists(&self, key: &str) -> BlobResult<bool> {
-        self.inner.exists(key)
-    }
-    fn delete(&self, key: &str) -> BlobResult<()> {
-        self.inner.delete(key)
-    }
-    fn list(&self, prefix: &str) -> BlobResult<Vec<String>> {
-        self.inner.list(prefix)
-    }
-}
 
 /// The object store a benchmark run measures against.
 ///
@@ -137,10 +108,7 @@ impl Env {
 
 fn env(chunks: u64, run: &str) -> Env {
     let dir = tempfile::tempdir().expect("tempdir");
-    let published = Arc::new(SizingBlob {
-        inner: object_store(dir.path(), run),
-        data_bytes: AtomicU64::new(0),
-    });
+    let published = Arc::new(SizingBlob::new(object_store(dir.path(), run)));
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).expect("meta"));
     meta.create_volume("vol_commit", chunks * CHUNK)
         .expect("volume");
@@ -160,10 +128,7 @@ fn env(chunks: u64, run: &str) -> Env {
 
 fn relaxed_env(chunks: u64, run: &str) -> Env {
     let dir = tempfile::tempdir().expect("tempdir");
-    let published = Arc::new(SizingBlob {
-        inner: object_store(dir.path(), run),
-        data_bytes: AtomicU64::new(0),
-    });
+    let published = Arc::new(SizingBlob::new(object_store(dir.path(), run)));
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).expect("meta"));
     meta.create_volume("vol_commit", chunks * CHUNK)
         .expect("volume");
@@ -242,7 +207,7 @@ fn relaxed_local_ack_and_remote_publish_cost_are_separate() {
             assert_eq!(local.local_durable_generation, 1);
             assert_eq!(local.remote_durable_generation, 0);
             assert_eq!(local.unpublished_generations, 1);
-            assert_eq!(env.published.data_bytes.load(Ordering::SeqCst), 0);
+            assert_eq!(env.published.data_bytes(), 0);
             staged_bytes = local.unpublished_bytes;
 
             let started = Instant::now();
@@ -253,7 +218,7 @@ fn relaxed_local_ack_and_remote_publish_cost_are_separate() {
                 remote.local_durable_generation,
                 remote.remote_durable_generation
             );
-            published_bytes = env.published.data_bytes.load(Ordering::SeqCst);
+            published_bytes = env.published.data_bytes();
             if let Some(output) = &mut csv {
                 writeln!(
                     output,
@@ -318,7 +283,7 @@ fn flush_cost_scales_with_the_dirty_set() {
             let started = Instant::now();
             env.engine.flush().expect("flush");
             samples.push(started.elapsed().as_secs_f64() * 1000.0);
-            published = env.published.data_bytes.load(Ordering::SeqCst);
+            published = env.published.data_bytes();
             env.engine.detach().unwrap();
         }
         samples.sort_by(f64::total_cmp);
@@ -374,7 +339,7 @@ fn flush_cost_for_dense_writes() {
             let started = Instant::now();
             env.engine.flush().expect("flush");
             samples.push(started.elapsed().as_secs_f64() * 1000.0);
-            published = env.published.data_bytes.load(Ordering::SeqCst);
+            published = env.published.data_bytes();
             env.engine.detach().unwrap();
         }
         samples.sort_by(f64::total_cmp);

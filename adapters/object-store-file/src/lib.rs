@@ -208,41 +208,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn contract_roundtrip_immutability_listing_and_idempotent_delete() {
+    fn shared_blob_store_contract() {
         let directory = tempfile::tempdir().unwrap();
-        let store = FileBlobStore::open(directory.path()).unwrap();
-        store.put_immutable("volumes/v1/data/a", b"hello").unwrap();
-        assert_eq!(store.get("volumes/v1/data/a").unwrap(), b"hello");
-        assert!(store.exists("volumes/v1/data/a").unwrap());
-        store.put_immutable("volumes/v1/data/a", b"hello").unwrap();
-        assert!(store.put_immutable("volumes/v1/data/a", b"other").is_err());
-        assert!(matches!(
-            store.get("volumes/v1/data/missing"),
-            Err(BlobError::NotFound(_))
-        ));
-        store.put_immutable("volumes/v1/maps/x.node", b"n").unwrap();
-        assert_eq!(
-            store.list("volumes/v1/").unwrap(),
-            vec![
-                "volumes/v1/data/a".to_string(),
-                "volumes/v1/maps/x.node".to_string(),
-            ]
-        );
-        store.delete("volumes/v1/data/a").unwrap();
-        store.delete("volumes/v1/data/a").unwrap();
-        assert!(!store.exists("volumes/v1/data/a").unwrap());
-    }
-
-    #[test]
-    fn malformed_keys_fail_without_panicking() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = FileBlobStore::open(directory.path()).unwrap();
-        for key in ["", "/absolute", "../escape", "a//b", "a/./b"] {
-            assert!(matches!(
-                store.put_immutable(key, b"value"),
-                Err(BlobError::InvalidKey { .. })
-            ));
-        }
+        cats_test_support::blob_store_contract(|| {
+            Arc::new(FileBlobStore::open(directory.path()).unwrap())
+        });
     }
 
     #[test]

@@ -14,9 +14,8 @@ use std::time::Instant;
 use cats_api::nodejob::{job_id, NodeJob, NodeJobAction, VolumeGrant};
 use cats_api::resources::ObservedState;
 use cats_node_agent::admission::WakeBudget;
-use cats_node_agent::runtime::{NodeConfig, NodeRuntime, VmmMode};
-use cats_node_agent::testutil::workspace_bin;
-use cats_storage::{AdapterConfig, AdapterSelection};
+use cats_node_agent::runtime::NodeRuntime;
+use cats_test_support::{fake_node_config, NodeConfigBuilder};
 
 const SIZE: u64 = 2 * cats_api::chunk::CHUNK_SIZE as u64;
 
@@ -25,29 +24,11 @@ fn runtime(dir: &std::path::Path) -> Arc<NodeRuntime> {
 }
 
 fn runtime_with(dir: &std::path::Path, wake_budget: WakeBudget) -> Arc<NodeRuntime> {
-    let meta_path = dir.join("meta.db");
-    Arc::new(NodeRuntime::new(NodeConfig {
-        node_id: "node_conc".into(),
-        state_dir: dir.join("node-state"),
-        blockd_bin: workspace_bin("cats-blockd"),
-        guest_agent_bin: workspace_bin("cats-guest-agent"),
-        metadata_store: AdapterSelection {
-            name: "sqlite".into(),
-            config: AdapterConfig::from_pairs([("path", meta_path.display().to_string())]).unwrap(),
-        },
-        object_store: AdapterSelection {
-            name: "file".into(),
-            config: AdapterConfig::from_pairs([("root", dir.join("blob").display().to_string())])
-                .unwrap(),
-        },
-        blockd_lease_ttl_ms: 1500,
-        blockd_max_staged_bytes: cats_blockd::engine::DEFAULT_MAX_STAGED_BYTES,
-        blockd_max_staged_packs: cats_blockd::engine::DEFAULT_MAX_STAGED_PACKS,
-        blockd_max_local_bytes: cats_blockd::engine::DEFAULT_MAX_LOCAL_BYTES,
-        metering_cgroup_root: None,
-        wake_budget,
-        vmm: VmmMode::Fake,
-    }))
+    let builder = NodeConfigBuilder::new(dir, "node_conc").with_lease_ttl_ms(1_500);
+    Arc::new(NodeRuntime::new(fake_node_config!(
+        builder,
+        wake_budget = wake_budget
+    )))
 }
 
 fn start_job(cat: &str) -> NodeJob {
