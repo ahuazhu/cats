@@ -9,8 +9,9 @@
 #
 # BusyBox is deliberately limited to the initramfs. The user-visible root is
 # regular Ubuntu: apt, curl, git and the glibc resolver are available after
-# switch_root. A tiny PID 1 starts the Guest Agent without waiting for a full
-# systemd transaction; systemd remains installed for compatibility/debugging.
+# switch_root. systemd is PID 1 by default so ordinary enabled Linux services
+# and timers work. The Cats Guest Agent is an early systemd service and does
+# not wait for multi-user.target, network-online, or background package work.
 #
 # Requires: busybox-static, cpio, zstd/gzip, e2fsprogs, debootstrap, musl
 # target rustup. Run on Ubuntu/Debian x86_64 as root.
@@ -24,6 +25,7 @@ BUSYBOX=${BUSYBOX:-/usr/bin/busybox}   # busybox-static
 UBUNTU_SUITE=${UBUNTU_SUITE:-noble}
 UBUNTU_MIRROR=${UBUNTU_MIRROR:-http://archive.ubuntu.com/ubuntu}
 INITRAMFS_BASE=${INITRAMFS_BASE:-}
+GUEST_INIT_MODE=${GUEST_INIT_MODE:-systemd}
 WORK=$(mktemp -d)
 
 cleanup() {
@@ -48,6 +50,22 @@ trap 'exit 143' TERM
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 [[ $(uname -m) == x86_64 ]] || { echo "x86_64 is required" >&2; exit 1; }
 command -v debootstrap >/dev/null || { echo "debootstrap is required" >&2; exit 1; }
+case "$GUEST_INIT_MODE" in
+  systemd)
+    PRIMARY_INIT=/sbin/init
+    FALLBACK_INIT=/usr/bin/cats-init
+    ;;
+  direct)
+    # Retained for reproducing the pre-systemd lifecycle experiments. It is
+    # not the production Guest contract.
+    PRIMARY_INIT=/usr/bin/cats-init
+    FALLBACK_INIT=/sbin/init
+    ;;
+  *)
+    echo "GUEST_INIT_MODE must be systemd or direct (got: $GUEST_INIT_MODE)" >&2
+    exit 1
+    ;;
+esac
 
 mkdir -p "$OUT"
 
@@ -140,19 +158,24 @@ while [ ! -b /dev/vda ] && [ $i -lt 100 ]; do /bin/busybox sleep 0.1; i=$((i+1))
 /bin/busybox mount -o rw /dev/vda /newroot || exec /bin/busybox sh
 /bin/busybox mount --move /dev /newroot/dev
 /bin/busybox umount /proc /sys 2>/dev/null
-if [ -x /newroot/usr/bin/cats-init ]; then
-  exec /bin/busybox switch_root /newroot /usr/bin/cats-init
+if [ -e /newroot@PRIMARY_INIT@ ] || [ -L /newroot@PRIMARY_INIT@ ]; then
+  exec /bin/busybox switch_root /newroot @PRIMARY_INIT@
 fi
-# RootDisks created by the previous BusyBox image only have /sbin/init.
-# Keep them bootable during a rolling worker/image upgrade; newly created
-# Ubuntu roots always take the optimized cats-init path above.
-exec /bin/busybox switch_root /newroot /sbin/init
+if [ -e /newroot@FALLBACK_INIT@ ] || [ -L /newroot@FALLBACK_INIT@ ]; then
+  exec /bin/busybox switch_root /newroot @FALLBACK_INIT@
+fi
+echo "Cats Guest root has neither @PRIMARY_INIT@ nor @FALLBACK_INIT@" >&2
+exec /bin/busybox sh
 EOF
+sed -i \
+  -e "s|@PRIMARY_INIT@|$PRIMARY_INIT|g" \
+  -e "s|@FALLBACK_INIT@|$FALLBACK_INIT|g" \
+  "$IR/init"
 chmod +x "$IR/init"
 (cd "$IR" && find . | cpio -o -H newc --quiet | gzip -9) > "$OUT/initramfs.img"
 
 # --------------------------------------------------------------------------
-# 3. Golden rootfs: Ubuntu 24.04 minbase + early Guest Agent on vsock 5000.
+# 3. Golden rootfs: Ubuntu 24.04 minbase + systemd + early Guest Agent.
 # --------------------------------------------------------------------------
 RF="$WORK/rootfs"
 debootstrap \
@@ -167,11 +190,47 @@ mkdir -p "$RF"/usr/bin "$RF"/etc/systemd/system/sysinit.target.wants \
   "$RF"/etc/profile.d
 cp "$AGENT" "$RF/usr/bin/cats-guest-agent"
 
-# Fast PID 1. The root is still normal Ubuntu; this only removes the generic
-# boot transaction from the Cold-to-Agent critical path. tini forwards signals
-# and reaps orphaned children, which is important for long-lived interactive
-# Cats. Required virtual filesystems are mounted before exec/shell requests can
-# arrive, and root growth completes before the Agent reports healthy.
+# Both init modes use exactly the same deterministic Cat network setup. The
+# Node encodes the assigned /30 Guest address in the final four bytes of the
+# locally administered MAC. Avoiding DHCP keeps network-online off the Cold
+# path without hard-coding a per-Cat address in the golden root.
+cat > "$RF/usr/bin/cats-network-setup" <<'EOF'
+#!/bin/sh
+set -eu
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+ip link set dev lo up
+
+interface=
+attempt=0
+while [ "$attempt" -lt 100 ] && [ -z "$interface" ]; do
+  for candidate in /sys/class/net/*; do
+    name=${candidate##*/}
+    if [ "$name" != lo ]; then interface=$name; break; fi
+  done
+  [ -n "$interface" ] || sleep 0.05
+  attempt=$((attempt + 1))
+done
+
+# A node may intentionally run without the optional tap path. Guest control
+# still works over vsock in that shape.
+[ -n "$interface" ] || exit 0
+
+IFS=: read -r _ _ first second third fourth < "/sys/class/net/$interface/address"
+first=$((0x$first)); second=$((0x$second))
+third=$((0x$third)); fourth=$((0x$fourth))
+gateway="$first.$second.$third.$((fourth - 1))"
+address="$first.$second.$third.$fourth/30"
+
+ip link set dev "$interface" up
+ip addr replace "$address" dev "$interface"
+ip route replace default via "$gateway" dev "$interface"
+EOF
+chmod +x "$RF/usr/bin/cats-network-setup"
+
+# Legacy direct PID 1. Production boots systemd; this path remains available
+# through GUEST_INIT_MODE=direct so historical lifecycle experiments keep a
+# reproducible control image. tini forwards signals and reaps orphaned children.
 cat > "$RF/usr/bin/cats-init" <<'EOF'
 #!/bin/sh
 set -eu
@@ -197,36 +256,7 @@ ln -sfn /proc/self/fd/2 /dev/stderr
 
 hostname cat 2>/dev/null || true
 resize2fs /dev/vda
-
-# Loopback. cats-init execs the Agent directly, so systemd-networkd never runs
-# and `lo` would stay DOWN: 127.0.0.1 is then unassignable and every program
-# that binds or dials it fails ("cannot assign requested address"). Ordinary
-# Linux software assumes loopback exists — containerd's CRI plugin, database
-# clients on localhost, health probes.
-ip link set dev lo up
-
-# The Node encodes the assigned /30 Guest address in the final four bytes of
-# the locally administered MAC. This avoids DHCP on the Cold path while still
-# allowing every Cat to have an isolated tap and default route.
-interface=
-attempt=0
-while [ "$attempt" -lt 100 ] && [ -z "$interface" ]; do
-  for candidate in /sys/class/net/*; do
-    name=${candidate##*/}
-    if [ "$name" != lo ]; then interface=$name; break; fi
-  done
-  [ -n "$interface" ] || sleep 0.05
-  attempt=$((attempt + 1))
-done
-if [ -n "$interface" ]; then
-  IFS=: read -r _ _ first second third fourth < "/sys/class/net/$interface/address"
-  first=$((0x$first)); second=$((0x$second))
-  third=$((0x$third)); fourth=$((0x$fourth))
-  gateway="$first.$second.$third.$((fourth - 1))"
-  ip link set dev "$interface" up
-  ip addr add "$first.$second.$third.$fourth/30" dev "$interface"
-  ip route replace default via "$gateway" dev "$interface"
-fi
+/usr/bin/cats-network-setup
 exec /usr/bin/tini -- /usr/bin/cats-guest-agent --mode vm --vsock-port 5000
 EOF
 chmod +x "$RF/usr/bin/cats-init"
@@ -249,14 +279,32 @@ EOF
 ln -s ../cats-grow-root.service \
   "$RF/etc/systemd/system/sysinit.target.wants/cats-grow-root.service"
 
+# Configure the platform-owned tap address before Guest Agent readiness. This
+# is a bounded local operation, not systemd's generic network-online contract.
+cat > "$RF/etc/systemd/system/cats-network.service" <<'EOF'
+[Unit]
+Description=Configure the Cats Guest network
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=cats-guest-agent.service network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/cats-network-setup
+RemainAfterExit=yes
+EOF
+ln -s ../cats-network.service \
+  "$RF/etc/systemd/system/sysinit.target.wants/cats-network.service"
+
 # Readiness is deliberately independent from cloud-init, network-online and
-# the rest of multi-user.target. The agent only needs the root filesystem and
-# AF_VSOCK; all required kernel modules were loaded by the initramfs.
+# the rest of multi-user.target. Root growth and deterministic tap setup finish
+# first; ordinary user services continue in parallel after Agent readiness.
 cat > "$RF/etc/systemd/system/cats-guest-agent.service" <<'EOF'
 [Unit]
 Description=Cats Guest Agent
 DefaultDependencies=no
-After=cats-grow-root.service systemd-remount-fs.service
+Requires=cats-grow-root.service cats-network.service
+After=cats-grow-root.service cats-network.service systemd-remount-fs.service
 Before=sysinit.target
 
 [Service]
@@ -272,28 +320,31 @@ ln -s ../cats-guest-agent.service \
   "$RF/etc/systemd/system/sysinit.target.wants/cats-guest-agent.service"
 ln -sf /lib/systemd/system/multi-user.target "$RF/etc/systemd/system/default.target"
 
-# Prepare DHCP/DNS for the upcoming tap path without putting it on the Agent
-# readiness dependency chain. Phase A still has no Guest NIC.
+# Keep a networkd policy available for users who explicitly enable networkd,
+# but do not start a second manager for the platform-owned link by default.
 cat > "$RF/etc/systemd/network/20-cats.network" <<'EOF'
 [Match]
 Name=en*
 
 [Network]
-DHCP=yes
+DHCP=no
+KeepConfiguration=static
 EOF
-ln -sf /lib/systemd/system/systemd-networkd.service \
-  "$RF/etc/systemd/system/multi-user.target.wants/systemd-networkd.service"
-# Keep DNS independent from systemd-resolved: its package post-install cannot
-# safely replace /etc/resolv.conf while debootstrap is running in containers,
-# and a regular resolv.conf also works before the full systemd transaction.
+rm -f \
+  "$RF/etc/systemd/system/multi-user.target.wants/systemd-networkd.service" \
+  "$RF/etc/systemd/system/sockets.target.wants/systemd-networkd.socket" \
+  "$RF/etc/systemd/system/dbus-org.freedesktop.network1.service"
+# Keep DNS independent from systemd-resolved: a regular resolv.conf is ready
+# before the rest of the systemd transaction and works in both init modes.
 rm -f "$RF/etc/resolv.conf"
 printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:1 attempts:3\n' \
   > "$RF/etc/resolv.conf"
 
 # Keep generic Ubuntu background work off the Cold-to-Agent critical path.
 # cloud-init/snapd/LXD are not installed by minbase; explicitly mask the
-# wait-online and package timers that would otherwise add nondeterminism.
+# unused serial getty, wait-online and package timers that add nondeterminism.
 for unit in \
+  serial-getty@ttyS0.service \
   systemd-networkd-wait-online.service \
   apt-daily.service apt-daily.timer \
   apt-daily-upgrade.service apt-daily-upgrade.timer; do
@@ -350,7 +401,8 @@ chroot "$RF" dpkg-query -W -f='${binary:Package}\t${Version}\n' \
 
 for required in \
   bin/bash usr/bin/apt-get usr/bin/curl usr/bin/wget usr/bin/git usr/bin/cats-init \
-  usr/bin/cats-guest-agent usr/bin/tini lib/systemd/systemd sbin/resize2fs \
+  usr/bin/cats-network-setup usr/bin/cats-guest-agent usr/bin/tini \
+  lib/systemd/systemd sbin/init sbin/resize2fs \
   usr/share/bash-completion/bash_completion; do
   [[ -e "$RF/$required" ]] || {
     echo "Ubuntu rootfs is missing required path: /$required" >&2

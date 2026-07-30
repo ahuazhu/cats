@@ -41,7 +41,8 @@ Secrets Manager secret and SSM State Manager association. The bundle digest is
 verified before installing `cats-noded`, `cats-blockd`, `cats-guest-agent` and
 the systemd unit. **The bundle carries binaries only — not the Guest
 boot artifacts.** A change to the golden root (`metal/build-guest-image.sh`,
-`cats-init`, or anything the Guest Agent needs baked into `rootfs.ext4`) does
+the Guest systemd units, or anything the Guest Agent needs baked into
+`rootfs.ext4`) does
 not ship with a worker release: rebuild the image on the Host with
 `OUT=/opt/cats/guest metal/build-guest-image.sh` — the Guest kernel is the
 Host's own, which is why this is not a CI artifact — and then restart
@@ -56,9 +57,11 @@ stored in `worker.env`.
 
 The worker builds an optimized Ubuntu 24.04 Guest: direct kernel, a minimal
 BusyBox initramfs used only for `switch_root`, and an Ubuntu minbase golden root
-with a small reaping PID 1 that starts the Guest Agent without a full systemd
-transaction. The visible Guest includes apt/curl/wget/git; cloud-init, snapd,
-LXD and wait-online are not on the Cold-to-Agent readiness path. Each Cat gets
+with systemd as PID 1. Root growth, deterministic tap setup and the Guest Agent
+are early units ordered before `sysinit.target`; ordinary enabled user services
+start normally through `multi-user.target`. The visible Guest includes
+apt/curl/wget/git; cloud-init, snapd, LXD, wait-online, package timers and the
+unused serial getty are not on the Cold-to-Agent readiness path. Each Cat gets
 an isolated tap `/30` with outbound host NAT; host, VPC-private and cloud
 metadata destinations are blocked before the general egress allow rule.
 Every Cat receives a stable wildcard HTTPS Endpoint for Guest port 8080; the

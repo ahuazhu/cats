@@ -249,6 +249,13 @@ fn parse_linux_memory_mib(contents: &str) -> Option<u64> {
 mod tests {
     use clap::CommandFactory;
 
+    fn workspace_root() -> &'static std::path::Path {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root")
+    }
+
     #[test]
     fn parses_linux_host_memory() {
         assert_eq!(
@@ -282,15 +289,11 @@ mod tests {
     /// never reach a deployed node.
     #[test]
     fn deployment_units_pin_kvm_clock_too() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("workspace root");
         for unit in [
             "deploy/metal/systemd/cats-noded.service",
             "deploy/aws/metal/cats-worker.service",
         ] {
-            let path = root.join(unit);
+            let path = workspace_root().join(unit);
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
             let line = text
@@ -300,6 +303,52 @@ mod tests {
             assert!(
                 line.contains("clocksource=kvm-clock"),
                 "{unit} overrides the guest cmdline without pinning kvm-clock: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn guest_image_defaults_to_systemd_with_early_agent_readiness() {
+        let path = workspace_root().join("deploy/metal/build-guest-image.sh");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+        for required in [
+            "GUEST_INIT_MODE=${GUEST_INIT_MODE:-systemd}",
+            "PRIMARY_INIT=/sbin/init",
+            "FALLBACK_INIT=/usr/bin/cats-init",
+            "Description=Configure the Cats Guest network",
+            "Before=cats-guest-agent.service network.target",
+            "Requires=cats-grow-root.service cats-network.service",
+            "After=cats-grow-root.service cats-network.service systemd-remount-fs.service",
+            "Before=sysinit.target",
+            "WantedBy=sysinit.target",
+            "serial-getty@ttyS0.service",
+            "systemd-networkd-wait-online.service",
+        ] {
+            assert!(
+                text.contains(required),
+                "guest image lost systemd support contract fragment {required:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_acceptance_covers_systemd_service_lifecycle() {
+        let path = workspace_root().join("deploy/metal/e2e.sh");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+        for required in [
+            "guest uses systemd as PID 1",
+            "systemctl enable --now cats-e2e.service",
+            "Warm preserves the service PID",
+            "Warm does not restart the service",
+            "Cold starts the service exactly once again",
+        ] {
+            assert!(
+                text.contains(required),
+                "metal acceptance lost systemd lifecycle oracle {required:?}"
             );
         }
     }

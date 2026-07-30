@@ -34,7 +34,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
-
 /// Guest-agent vsock port (must match the guest image's init script).
 pub const GUEST_VSOCK_PORT: u32 = 5000;
 /// Named, per-Cat RAM backing kept under the Cat's host-local runtime.
@@ -156,7 +155,8 @@ fn network_for(cidr: &str, cat_id: &str) -> Result<ChNetwork> {
     let guest_ip = format!("{}.{}.{}.{}/30", octets[0], octets[1], third, fourth + 2);
     Ok(ChNetwork {
         tap: format!("cat{:011x}", hash & 0x7ff_ffff_ffff),
-        // cats-init derives its address from these final two octets.
+        // The Guest's early cats-network service derives its address from
+        // these final two octets before Guest Agent readiness.
         mac: format!(
             "02:ca:{:02x}:{:02x}:{third:02x}:{:02x}",
             octets[0],
