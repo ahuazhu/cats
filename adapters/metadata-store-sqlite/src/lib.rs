@@ -272,6 +272,11 @@ impl MetadataStore for SqliteMetadataStore {
         .map_err(sql_err)
     }
 
+    // Deliberately no expiry check: an expired-but-unclaimed lease means
+    // nobody revoked or acquired it in between (both bump the epoch), so the
+    // holder renews straight through a lapse. A slow attach or a metadata
+    // hiccup must not become a permanent self-fence; everything that must
+    // fence does so via the epoch.
     fn renew_lease(
         &self,
         volume_id: &str,
@@ -279,14 +284,13 @@ impl MetadataStore for SqliteMetadataStore {
         epoch: i64,
         ttl_ms: i64,
     ) -> Result<()> {
-        let (now, expires_at) = lease_window(ttl_ms)?;
+        let (_now, expires_at) = lease_window(ttl_ms)?;
         let conn = self.connection()?;
         let n = conn
             .execute(
                 "UPDATE volumes SET lease_expires_at_ms = ?4
-                  WHERE volume_id = ?1 AND lease_owner = ?2 AND lease_epoch = ?3
-                    AND lease_expires_at_ms > ?5",
-                params![volume_id, attachment_id, epoch, expires_at, now],
+                  WHERE volume_id = ?1 AND lease_owner = ?2 AND lease_epoch = ?3",
+                params![volume_id, attachment_id, epoch, expires_at],
             )
             .map_err(sql_err)?;
         if n == 0 {
@@ -306,10 +310,13 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(())
     }
 
+    // The epoch bump is what makes a revoke stick: renewal tolerates a bare
+    // expiry, so expiring the row alone would let the old holder renew back in.
     fn revoke_lease(&self, volume_id: &str) -> Result<()> {
         let conn = self.connection()?;
         conn.execute(
-            "UPDATE volumes SET lease_expires_at_ms = 0 WHERE volume_id = ?1",
+            "UPDATE volumes SET lease_expires_at_ms = 0, lease_epoch = lease_epoch + 1
+              WHERE volume_id = ?1",
             params![volume_id],
         )
         .map_err(sql_err)?;
@@ -522,14 +529,15 @@ mod tests {
             Err(MetaError::LeaseHeld)
         ));
         m.renew_lease("v1", "attA", e1, 60_000).unwrap();
-        // Revoke fences the current holder.
+        // Revoke fences the current holder (it bumps the epoch, so the old
+        // holder cannot renew back in even though renewals tolerate expiry).
         m.revoke_lease("v1").unwrap();
         assert!(matches!(
             m.renew_lease("v1", "attA", e1, 60_000),
             Err(MetaError::Fenced)
         ));
         let e2 = m.acquire_lease("v1", "attB", 60_000).unwrap();
-        assert_eq!(e2, 2);
+        assert_eq!(e2, 3, "revoke and acquire each consume an epoch");
         // Old epoch renew still fails even though owner column changed.
         assert!(matches!(
             m.renew_lease("v1", "attA", e1, 60_000),
@@ -572,6 +580,35 @@ mod tests {
         assert!(e2 > e1);
         assert!(m.cas_head("v1", 0, [1; 32], "obj", "attA", e1).is_err());
         assert!(m.cas_head("v1", 0, [1; 32], "obj", "attB", e2).is_ok());
+    }
+
+    /// A lapse alone must stay renewable: a slow attach or a metadata hiccup
+    /// is not a fence, and turning it into one permanently killed every start
+    /// of a volume whose attach outlived the TTL (2026-07-29). Only a revoke
+    /// or a competing acquire — both bump the epoch — ends the attachment.
+    #[test]
+    fn lapsed_lease_renews_until_revoked_or_stolen() {
+        let (_d, m) = store();
+        m.create_volume("v1", 1 << 22).unwrap();
+        // Expired but unclaimed: renewal succeeds and the lease works again.
+        let e1 = m.acquire_lease("v1", "attA", 1).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        m.renew_lease("v1", "attA", e1, 60_000).unwrap();
+        assert!(m.cas_head("v1", 0, [1; 32], "obj1", "attA", e1).is_ok());
+        // Stolen during the lapse: the old holder's renewal dies on the epoch.
+        let e1b = m.acquire_lease("v1", "attA", 1).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let e2 = m.acquire_lease("v1", "attB", 60_000).unwrap();
+        assert!(matches!(
+            m.renew_lease("v1", "attA", e1b, 60_000),
+            Err(MetaError::Fenced)
+        ));
+        // Revoked during a lapse: same, the revoke bumped the epoch.
+        m.revoke_lease("v1").unwrap();
+        assert!(matches!(
+            m.renew_lease("v1", "attB", e2, 60_000),
+            Err(MetaError::Fenced)
+        ));
     }
 
     #[test]

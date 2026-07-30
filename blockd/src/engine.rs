@@ -76,13 +76,13 @@ pub struct EngineConfig {
     pub attachment_id: String,
     /// How long a lease stays valid without a renewal.
     ///
-    /// This is the window a live attachment has to survive a slow metadata
-    /// round trip, and losing it is not a delay but a fence: `renew_lease`
-    /// refuses an already-expired row, so a single missed window ends the
-    /// attachment for good and the Guest's filesystem aborts on the write
-    /// errors. It also bounds how long another Host must wait to take a lost
-    /// Host's volume, so it stays in the same order as node fencing rather than
-    /// being made arbitrarily long.
+    /// This bounds how long another Host must wait to take a lost Host's
+    /// volume, so it stays in the same order as node fencing rather than being
+    /// made arbitrarily long. An expiry lapse alone does not end the
+    /// attachment: renewal succeeds as long as the row still names this
+    /// attachment and epoch, and only a revoke or a competing acquire (both
+    /// bump the epoch) fences it for good. Publishes are independently guarded
+    /// by the epoch CAS, so a lapse can never let two writers commit.
     pub lease_ttl_ms: i64,
     pub durability: DurabilityMode,
 }
@@ -172,7 +172,8 @@ struct StagedPack {
 
 impl ChunkEngine {
     /// Attach to a volume: acquire the lease (bumping the fencing epoch),
-    /// recover pending packs, load the committed map, start lease renewal.
+    /// start lease renewal, then load the committed map and recover pending
+    /// packs under the live lease.
     pub fn attach(
         cfg: EngineConfig,
         blob: Arc<dyn BlobStore>,
@@ -250,12 +251,30 @@ impl ChunkEngine {
             cfg,
         });
 
-        engine.load_committed_map()?;
-        engine.recover_pending_packs()?;
+        // Renewal starts before recovery, not after: map load and pack replay
+        // walk the object store and scale with volume size and commit history,
+        // so on a large volume attach alone can outlive the lease TTL (a 60 GiB
+        // volume at generation 2112 measured 1.9 s against a 1.5 s TTL, which
+        // fenced every start of that Cat). Publishes issued by recovery are
+        // still guarded by the epoch CAS.
+        engine.start_renew_thread();
+        let recovered = engine
+            .load_committed_map()
+            .and_then(|()| engine.recover_pending_packs());
+        if let Err(error) = recovered {
+            engine.stop_renewal();
+            return Err(error);
+        }
         // Recovery published or discarded every pending pack, so the staged
         // chain restarts at the committed generation.
         engine.staged.lock().unwrap().next_base = engine.generation();
-        engine.start_renew_thread();
+        if engine.is_fenced() {
+            // The lease was revoked or taken while recovery ran. Serving the
+            // Guest read-only from here would end at its first write with an
+            // I/O error it cannot interpret; fail the attach with the reason.
+            engine.stop_renewal();
+            return Err(EngineError::Meta(MetaError::Fenced));
+        }
         engine.start_committer_thread();
         Ok(engine)
     }
@@ -1508,15 +1527,28 @@ impl ChunkEngine {
                 if engine.is_fenced() {
                     return;
                 }
-                if let Err(e) = engine.meta.renew_lease(
+                match engine.meta.renew_lease(
                     &engine.cfg.volume_id,
                     &engine.cfg.attachment_id,
                     engine.epoch,
                     engine.cfg.lease_ttl_ms,
                 ) {
-                    tracing::error!("lease renewal failed; fencing writes: {e}");
-                    engine.fenced.store(true, Ordering::SeqCst);
-                    return;
+                    Ok(()) => {}
+                    // The row no longer names this attachment and epoch: the
+                    // lease was revoked or acquired by someone else. That is
+                    // the one terminal outcome.
+                    Err(e @ (MetaError::Fenced | MetaError::NotFound(_))) => {
+                        tracing::error!("lease renewal failed; fencing writes: {e}");
+                        engine.fenced.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    // A slow or unreachable metadata store is not a fence: the
+                    // row still names this attachment, so the next attempt
+                    // renews straight through an expiry lapse, and publishes
+                    // stay guarded by the epoch CAS in the meantime.
+                    Err(e) => {
+                        tracing::warn!("lease renewal attempt failed; will retry: {e}");
+                    }
                 }
             })
             .expect("spawn lease renew thread");
@@ -2123,6 +2155,61 @@ mod tests {
         let mut s = vec![0u8; 12];
         e.read(CHUNK_SIZE as u64 + 7, &mut s).unwrap();
         assert_eq!(&s, b"second-chunk");
+        e.detach();
+    }
+
+    /// Object store whose reads are slower than the lease TTL, reproducing
+    /// the 2026-07-29 production failure: a 60 GiB volume's attach (map load
+    /// and recovery) took 1.9 s against a 1.5 s TTL, renewal only began after
+    /// attach, so the first renewal always found the lease expired and every
+    /// start of that Cat self-fenced before the Guest's first write.
+    struct SlowBlob {
+        inner: Arc<dyn BlobStore>,
+        delay: std::time::Duration,
+    }
+    impl BlobStore for SlowBlob {
+        fn put_immutable(&self, k: &str, d: &[u8]) -> cats_storage::blob::Result<()> {
+            self.inner.put_immutable(k, d)
+        }
+        fn get(&self, k: &str) -> cats_storage::blob::Result<Vec<u8>> {
+            std::thread::sleep(self.delay);
+            self.inner.get(k)
+        }
+        fn exists(&self, k: &str) -> cats_storage::blob::Result<bool> {
+            self.inner.exists(k)
+        }
+        fn delete(&self, k: &str) -> cats_storage::blob::Result<()> {
+            self.inner.delete(k)
+        }
+        fn list(&self, p: &str) -> cats_storage::blob::Result<Vec<String>> {
+            self.inner.list(p)
+        }
+    }
+
+    #[test]
+    fn attach_slower_than_the_lease_ttl_does_not_self_fence() {
+        let env = env();
+        {
+            let e = attach(&env, "attA");
+            e.write(0, &pattern(CHUNK_SIZE as usize, 5)).unwrap();
+            e.flush().unwrap();
+            e.detach();
+        }
+        // Cold host: the committed map must be read back through the store.
+        fs::remove_dir_all(&env.data_dir).unwrap();
+        let slow: Arc<dyn BlobStore> = Arc::new(SlowBlob {
+            inner: env.blob.clone(),
+            delay: std::time::Duration::from_millis(150),
+        });
+        let mut cfg = EngineConfig::new(VOL, &env.data_dir, "attB");
+        cfg.lease_ttl_ms = 100;
+        let e = ChunkEngine::attach(cfg, slow, env.meta.clone()).unwrap();
+        // Outlive several renewal intervals to prove the thread keeps the
+        // lease alive rather than the attach merely squeaking through.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert!(!e.is_fenced(), "an uncontended lapse must not fence");
+        e.write(100, b"still writable").unwrap();
+        e.flush().unwrap();
         e.detach();
     }
 

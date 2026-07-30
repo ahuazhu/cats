@@ -493,3 +493,68 @@ fn hot_attach_detach_and_journal_idempotency() {
         NodeJobAction::StopCat { cat_id: CAT.into() },
     ));
 }
+
+/// A failed job must be retried for real when its id is resubmitted, not
+/// answered from the journal: the control plane's retry loop reuses the job
+/// id within a generation, and replaying the first failure turned "three
+/// start attempts" into one attempt plus two instant echoes (2026-07-29).
+/// Completed results keep replaying, which is what the journal is for.
+#[test]
+fn a_failed_job_is_retried_not_replayed() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("node-state");
+    let flaky_guest_bin = dir.path().join("flaky-guest-agent");
+    let metadata_store = AdapterSelection {
+        name: "sqlite".into(),
+        config: AdapterConfig::from_pairs([(
+            "path",
+            dir.path().join("meta.db").display().to_string(),
+        )])
+        .unwrap(),
+    };
+    let object_store = AdapterSelection {
+        name: "file".into(),
+        config: AdapterConfig::from_pairs([(
+            "root",
+            dir.path().join("blob").display().to_string(),
+        )])
+        .unwrap(),
+    };
+    let runtime = NodeRuntime::new(NodeConfig {
+        node_id: "node_test".into(),
+        state_dir,
+        blockd_bin: workspace_bin("cats-blockd"),
+        guest_agent_bin: flaky_guest_bin.clone(),
+        metadata_store,
+        object_store,
+        blockd_lease_ttl_ms: 1200,
+        metering_cgroup_root: None,
+        wake_budget: Default::default(),
+        vmm: cats_node_agent::runtime::VmmMode::Fake,
+    });
+
+    // The guest agent binary does not exist yet: the start fails for real.
+    let first = runtime.execute(start_job(1));
+    assert_eq!(first.phase, JobPhase::Failed, "{:?}", first.error);
+
+    // Fault repaired. The same job id must now do the work again — a replay
+    // of the journaled failure would return Failed without trying.
+    std::os::unix::fs::symlink(workspace_bin("cats-guest-agent"), &flaky_guest_bin).unwrap();
+    let second = runtime.execute(start_job(1));
+    assert_eq!(
+        second.phase,
+        JobPhase::Succeeded,
+        "resubmitted failed job must re-execute: {:?}",
+        second.error
+    );
+
+    // The success is journaled: a duplicate submission replays it.
+    let third = runtime.execute(start_job(1));
+    assert_eq!(third.phase, JobPhase::Succeeded);
+
+    runtime.execute(simple(
+        2,
+        "stop_cat",
+        NodeJobAction::StopCat { cat_id: CAT.into() },
+    ));
+}

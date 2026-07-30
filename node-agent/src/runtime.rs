@@ -10,10 +10,11 @@
 //! is implemented in `ch.rs`: direct-kernel boot, kernel-NBD block path,
 //! vsock guest control, vm.pause/resume and vm.snapshot/--restore.
 //!
-//! Job idempotency: results are journaled by job_id and replayed for
-//! duplicate submissions (arch doc §17.4). The journal is in-memory; a node
-//! restart loses it, which is safe because every action is itself
-//! idempotent at the process level.
+//! Job idempotency: completed results are journaled by job_id and replayed
+//! for duplicate submissions (arch doc §17.4); failures are not journaled,
+//! so resubmitting a failed job's id retries it for real. The journal is
+//! in-memory; a node restart loses it, which is safe because every action
+//! is itself idempotent at the process level.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -23,7 +24,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
-use cats_api::nodejob::{NodeJob, NodeJobAction, NodeJobResult, SuspendWorkFence, VolumeGrant};
+use cats_api::nodejob::{
+    JobPhase, NodeJob, NodeJobAction, NodeJobResult, SuspendWorkFence, VolumeGrant,
+};
 
 use crate::admission::{resume_commitment_bytes, WakeAdmission, WakeBudget, WakeLoad};
 use cats_api::requests::{ProxyHttpRequest, ProxyHttpResponse};
@@ -581,7 +584,14 @@ impl NodeRuntime {
                 }
             }
         };
-        self.journal.lock().unwrap().insert(job_id, result.clone());
+        // Failures are deliberately not journaled. The journal answers
+        // duplicate submissions of one logical job, but the control plane
+        // retries a failed start under the same job id and expects real work;
+        // replaying the first failure turned "three attempts" into one attempt
+        // and two instant echoes of it.
+        if result.phase != JobPhase::Failed {
+            self.journal.lock().unwrap().insert(job_id, result.clone());
+        }
         result
     }
 
