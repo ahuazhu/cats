@@ -176,8 +176,7 @@ pub fn publish(blob: &dyn BlobStore, path: &Path) -> Result<Published> {
                             // upload; the manifest would name the wrong bytes.
                             return Err(ImageError::Invalid {
                                 path: path.display().to_string(),
-                                message: "image file changed while it was being published"
-                                    .into(),
+                                message: "image file changed while it was being published".into(),
                             });
                         }
                         blob.put_immutable(&key, &buf)?;
@@ -222,8 +221,8 @@ pub fn publish(blob: &dyn BlobStore, path: &Path) -> Result<Published> {
 
 pub fn load(blob: &dyn BlobStore, image_id: &str) -> Result<ImageManifest> {
     let bytes = blob.get(&chunk::keys::image_manifest(image_id))?;
-    let manifest: ImageManifest = serde_json::from_slice(&bytes)
-        .map_err(|_| ImageError::Corrupt(image_id.to_string()))?;
+    let manifest: ImageManifest =
+        serde_json::from_slice(&bytes).map_err(|_| ImageError::Corrupt(image_id.to_string()))?;
     if manifest.image_id != image_id {
         return Err(ImageError::Corrupt(image_id.to_string()));
     }

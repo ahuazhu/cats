@@ -205,7 +205,8 @@ impl AwsS3BlobStore {
         let mut delay = Duration::from_millis(RETRY_INITIAL_DELAY_MS);
         let mut attempt = 1;
         loop {
-            let outcome = self.request_once(method, path, query, body, extra_headers, key_for_errors);
+            let outcome =
+                self.request_once(method, path, query, body, extra_headers, key_for_errors);
             let retryable = match &outcome {
                 Err(BlobError::Backend { .. }) => true,
                 Ok((status, _)) => *status == 429 || (500..600).contains(status),
@@ -228,7 +229,10 @@ impl AwsS3BlobStore {
                     "object-store request failed; retrying"
                 ),
                 Ok((status, _)) => tracing::warn!(
-                    key = key_for_errors, method, attempt, status,
+                    key = key_for_errors,
+                    method,
+                    attempt,
+                    status,
                     "object-store request returned a retryable status; retrying"
                 ),
             }
@@ -738,7 +742,10 @@ mod tests {
         .unwrap();
 
         let started = Instant::now();
-        assert!(matches!(store.get("some-key"), Err(BlobError::Backend { .. })));
+        assert!(matches!(
+            store.get("some-key"),
+            Err(BlobError::Backend { .. })
+        ));
         let elapsed = started.elapsed();
 
         // 100 ms + 400 ms + 1600 ms + 3000 ms of sleeps between five attempts.
