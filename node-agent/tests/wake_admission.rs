@@ -45,20 +45,21 @@ fn env(budget: WakeBudget) -> Env {
         )])
         .unwrap(),
     };
-    let runtime = NodeRuntime::new(
-        NodeConfig {
-            node_id: "node_wake".into(),
-            state_dir: dir.path().join("node-state"),
-            blockd_bin: workspace_bin("cats-blockd"),
-            guest_agent_bin: workspace_bin("cats-guest-agent"),
-            metadata_store,
-            object_store,
-            blockd_lease_ttl_ms: 1200,
-            metering_cgroup_root: None,
-            wake_budget: budget,
-            vmm: VmmMode::Fake,
-        },
-    );
+    let runtime = NodeRuntime::new(NodeConfig {
+        node_id: "node_wake".into(),
+        state_dir: dir.path().join("node-state"),
+        blockd_bin: workspace_bin("cats-blockd"),
+        guest_agent_bin: workspace_bin("cats-guest-agent"),
+        metadata_store,
+        object_store,
+        blockd_lease_ttl_ms: 1200,
+        blockd_max_staged_bytes: cats_blockd::engine::DEFAULT_MAX_STAGED_BYTES,
+        blockd_max_staged_packs: cats_blockd::engine::DEFAULT_MAX_STAGED_PACKS,
+        blockd_max_local_bytes: cats_blockd::engine::DEFAULT_MAX_LOCAL_BYTES,
+        metering_cgroup_root: None,
+        wake_budget: budget,
+        vmm: VmmMode::Fake,
+    });
     Env {
         _dir: dir,
         runtime: Arc::new(runtime),
@@ -183,7 +184,10 @@ fn concurrent_resumes_are_allowed_and_stay_within_budget() {
 
     let load = env.runtime.wake_load();
     assert_eq!(load.wakes, 0, "wake permits leaked after the storm");
-    assert_eq!(load.commitment_bytes, 0, "commitment leaked after the storm");
+    assert_eq!(
+        load.commitment_bytes, 0,
+        "commitment leaked after the storm"
+    );
     assert!(
         load.peak_wakes <= CEILING,
         "peak {} exceeded the ceiling {CEILING}",
@@ -229,7 +233,11 @@ fn a_cat_larger_than_the_node_budget_fails_instead_of_hanging() {
     );
     // ADR-0002 §7: a failed wake must not leave the Cat wedged mid-state.
     assert_eq!(result.observed_state, ObservedState::Suspended);
-    assert_eq!(env.runtime.wake_load().wakes, 0, "failed wake leaked a permit");
+    assert_eq!(
+        env.runtime.wake_load().wakes,
+        0,
+        "failed wake leaked a permit"
+    );
 }
 
 #[test]

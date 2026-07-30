@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -30,7 +31,7 @@ use cats_api::nodejob::{
 
 use crate::admission::{resume_commitment_bytes, WakeAdmission, WakeBudget, WakeLoad};
 use cats_api::requests::{ProxyHttpRequest, ProxyHttpResponse};
-use cats_api::resources::{NodeTelemetry, ObservedState};
+use cats_api::resources::{DiskDurabilityTelemetry, NodeTelemetry, ObservedState};
 use cats_guest_agent::DiskMapEntry;
 use cats_storage::AdapterSelection;
 
@@ -59,6 +60,9 @@ pub struct NodeConfig {
     pub metadata_store: AdapterSelection,
     pub object_store: AdapterSelection,
     pub blockd_lease_ttl_ms: i64,
+    pub blockd_max_staged_bytes: u64,
+    pub blockd_max_staged_packs: usize,
+    pub blockd_max_local_bytes: u64,
     /// Delegated cgroup v2 subtree used for authoritative per-Cat billing
     /// counters. When absent, monitoring remains available but billing
     /// checkpoints are deliberately not produced.
@@ -83,26 +87,77 @@ struct BlockdProc {
     socket: PathBuf,
     /// vhost-user socket the VMM consumes, when the Cat runs on that path.
     vhost_user_socket: Option<PathBuf>,
-    /// Control socket for host-side commands (`drain`, ADR-0021).
+    /// Control socket for host-side commands (`drain`/`status`, ADR-0022).
     control_socket: PathBuf,
     grant: VolumeGrant,
 }
 
+const BLOCKD_STATUS_TIMEOUT: Duration = Duration::from_millis(500);
+// A forced drain contains real object-store and metadata-store I/O. Keep its
+// deadline below the control plane's 60-second node-job timeout, but do not
+// reuse the heartbeat status probe's 500 ms deadline: measured remote-drain
+// tails on metal legitimately exceed that.
+const BLOCKD_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const BLOCKD_CONTROL_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+
 impl BlockdProc {
+    fn command(
+        control_socket: &Path,
+        disk_id: &str,
+        command: &str,
+        read_timeout: Duration,
+    ) -> Result<String> {
+        use std::io::{BufRead, BufReader, Write};
+        let mut stream = std::os::unix::net::UnixStream::connect(control_socket)
+            .with_context(|| format!("connect blockd control for {disk_id}"))?;
+        stream.set_read_timeout(Some(read_timeout))?;
+        stream.set_write_timeout(Some(BLOCKD_CONTROL_WRITE_TIMEOUT))?;
+        stream.write_all(command.as_bytes())?;
+        stream.write_all(b"\n")?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line)?;
+        match line.trim().strip_prefix("OK ") {
+            Some(payload) => Ok(payload.to_string()),
+            None => bail!("{command} of {disk_id} failed: {}", line.trim()),
+        }
+    }
+
     /// Publish everything the engine has staged. The forced flush points of
     /// the relaxed contract call this after the guest-side flush; on a strict
     /// volume the queue is already empty and it returns immediately.
     fn drain(&self) -> Result<()> {
-        use std::io::{BufRead, BufReader, Write};
-        let mut stream = std::os::unix::net::UnixStream::connect(&self.control_socket)
-            .with_context(|| format!("connect blockd control for {}", self.grant.disk_id))?;
-        stream.write_all(b"drain\n")?;
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line)?;
-        match line.trim().strip_prefix("OK ") {
-            Some(_generation) => Ok(()),
-            None => bail!("drain of {} failed: {}", self.grant.disk_id, line.trim()),
-        }
+        Self::drain_at(&self.control_socket, &self.grant.disk_id)
+    }
+
+    fn drain_at(control_socket: &Path, disk_id: &str) -> Result<()> {
+        Self::command(control_socket, disk_id, "drain", BLOCKD_DRAIN_TIMEOUT).map(|_| ())
+    }
+
+    fn durability_status_at(
+        control_socket: &Path,
+        disk_id: &str,
+    ) -> Result<DiskDurabilityTelemetry> {
+        let payload = Self::command(control_socket, disk_id, "status", BLOCKD_STATUS_TIMEOUT)?;
+        let status: cats_blockd::engine::DurabilityStatus =
+            serde_json::from_str(&payload).context("decode blockd durability status")?;
+        Ok(DiskDurabilityTelemetry {
+            disk_id: disk_id.to_string(),
+            mode: status.mode,
+            local_durable_generation: status.local_durable_generation,
+            remote_durable_generation: status.remote_durable_generation,
+            unpublished_generations: status.unpublished_generations as u64,
+            unpublished_bytes: status.unpublished_bytes,
+            oldest_unpublished_age_ms: status.oldest_unpublished_age_ms,
+            max_unpublished_generations: status.max_unpublished_generations as u64,
+            max_unpublished_bytes: status.max_unpublished_bytes,
+            local_allocated_bytes: status.local_allocated_bytes,
+            local_accounted_bytes: status.local_accounted_bytes,
+            max_local_bytes: status.max_local_bytes,
+            evicted_cache_chunks: status.evicted_cache_chunks,
+            backpressured: status.backpressured,
+            fenced: status.fenced,
+            last_publish_error: status.last_publish_error,
+        })
     }
 
     fn remove_socket_files(&self, cat_dir: &Path) {
@@ -224,6 +279,7 @@ pub(crate) struct CatTelemetryTarget {
     pub process_ids: Vec<u32>,
     pub runtime_dir: PathBuf,
     pub metering: Option<CatMeteringTarget>,
+    pub disk_durability: Vec<DiskDurabilityTelemetry>,
 }
 
 #[derive(Debug, Clone)]
@@ -337,6 +393,7 @@ impl CatRuntime {
             } else {
                 None
             },
+            disk_durability: Vec::new(),
         }
     }
 }
@@ -476,12 +533,72 @@ impl NodeRuntime {
 
     /// Runtime identities for actual per-Cat host resource sampling.
     pub(crate) fn telemetry_targets(&self) -> Vec<CatTelemetryTarget> {
-        self.cats
+        let mut targets: Vec<(CatTelemetryTarget, Vec<(String, PathBuf)>)> = self
+            .cats
             .lock()
             .unwrap()
             .iter()
-            .map(|(cat_id, runtime)| runtime.telemetry_target(cat_id))
-            .collect()
+            .map(|(cat_id, runtime)| {
+                (
+                    runtime.telemetry_target(cat_id),
+                    runtime
+                        .blockds
+                        .iter()
+                        .map(|(disk_id, blockd)| (disk_id.clone(), blockd.control_socket.clone()))
+                        .collect(),
+                )
+            })
+            .collect();
+        let jobs: Vec<(usize, String, String, PathBuf)> = targets
+            .iter()
+            .enumerate()
+            .flat_map(|(target_index, (target, controls))| {
+                controls.iter().map(move |(disk_id, socket)| {
+                    (
+                        target_index,
+                        target.cat_id.clone(),
+                        disk_id.clone(),
+                        socket.clone(),
+                    )
+                })
+            })
+            .collect();
+        if !jobs.is_empty() {
+            // A dead blockd has a 500 ms socket deadline. Sampling disks
+            // serially would turn N dead Cats into an N*500 ms heartbeat stall,
+            // so use a small bounded fan-out independent of Cat count.
+            const STATUS_WORKERS: usize = 16;
+            let workers = jobs.len().min(STATUS_WORKERS);
+            let next = AtomicUsize::new(0);
+            let sampled: Mutex<Vec<(usize, DiskDurabilityTelemetry)>> = Mutex::new(Vec::new());
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    scope.spawn(|| loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some((target_index, cat_id, disk_id, socket)) = jobs.get(index) else {
+                            return;
+                        };
+                        match BlockdProc::durability_status_at(socket, disk_id) {
+                            Ok(status) => sampled.lock().unwrap().push((*target_index, status)),
+                            Err(error) => tracing::warn!(
+                                cat = %cat_id,
+                                disk = %disk_id,
+                                "read blockd durability status: {error:#}"
+                            ),
+                        }
+                    });
+                }
+            });
+            for (target_index, status) in sampled.into_inner().unwrap() {
+                targets[target_index].0.disk_durability.push(status);
+            }
+            for (target, _) in &mut targets {
+                target
+                    .disk_durability
+                    .sort_by(|left, right| left.disk_id.cmp(&right.disk_id));
+            }
+        }
+        targets.into_iter().map(|(target, _)| target).collect()
     }
 
     fn cat_lock(&self, cat_id: &str) -> Arc<Mutex<()>> {
@@ -787,7 +904,7 @@ impl NodeRuntime {
                         return Err(error);
                     }
                 }
-                self.teardown(&mut runtime, false);
+                let _ = self.teardown(&mut runtime, false);
                 let _ = std::fs::remove_dir_all(&runtime.dir);
             }
         }
@@ -856,7 +973,7 @@ impl NodeRuntime {
                     && rt.boot_id.is_some()
                     && rt.boot_id.as_deref() != Some(boot_id.as_str())
                 {
-                    self.teardown(&mut rt, false);
+                    let _ = self.teardown(&mut rt, false);
                     bail!("warm restore produced a different boot id");
                 }
                 rt.boot_id = Some(boot_id);
@@ -865,7 +982,7 @@ impl NodeRuntime {
                 Ok(ObservedState::Running)
             }
             Err(e) => {
-                self.teardown(&mut rt, true);
+                let _ = self.teardown(&mut rt, true);
                 Err(e)
             }
         }
@@ -975,9 +1092,7 @@ impl NodeRuntime {
             };
             for grant in &volumes {
                 // Data disks have no image.
-                let seed = seed_image_id
-                    .as_deref()
-                    .filter(|_| grant.mount_path == "/");
+                let seed = seed_image_id.as_deref().filter(|_| grant.mount_path == "/");
                 let proc = self.spawn_blockd(cat_id, &dir, grant, vhost_user_queues, seed)?;
                 let process_id = proc.child.id();
                 rt.blockds.insert(grant.disk_id.clone(), proc);
@@ -1095,7 +1210,7 @@ impl NodeRuntime {
                     && expected_boot.as_deref() != Some(&boot_id)
                 {
                     rt.ch = Some(chrt);
-                    self.teardown(&mut rt, false);
+                    let _ = self.teardown(&mut rt, false);
                     bail!("warm restore produced a different kernel boot id");
                 }
                 rt.boot_id = Some(boot_id);
@@ -1106,7 +1221,7 @@ impl NodeRuntime {
             }
             Err(e) => {
                 rt.ch = Some(chrt);
-                self.teardown(&mut rt, false);
+                let _ = self.teardown(&mut rt, false);
                 Err(e)
             }
         }
@@ -1210,7 +1325,13 @@ impl NodeRuntime {
             .arg("--create-volume-size")
             .arg(grant.size_bytes.to_string())
             .arg("--lease-ttl-ms")
-            .arg(self.cfg.blockd_lease_ttl_ms.to_string());
+            .arg(self.cfg.blockd_lease_ttl_ms.to_string())
+            .arg("--max-staged-bytes")
+            .arg(self.cfg.blockd_max_staged_bytes.to_string())
+            .arg("--max-staged-packs")
+            .arg(self.cfg.blockd_max_staged_packs.to_string())
+            .arg("--max-local-bytes")
+            .arg(self.cfg.blockd_max_local_bytes.to_string());
         let control_socket = short_socket_path(
             &self.cfg.state_dir,
             cat_id,
@@ -1392,9 +1513,20 @@ impl NodeRuntime {
 
     fn stop_cat(&self, cat_id: &str, graceful: bool) -> Result<ObservedState> {
         let Some(mut rt) = self.cats.lock().unwrap().remove(cat_id) else {
-            // Idempotent: also sweep any residue from a previous life.
             let dir = self.cfg.state_dir.join("cats").join(cat_id);
-            let _ = std::fs::remove_dir_all(&dir);
+            if graceful && dir.exists() {
+                // After an agent restart the in-memory supervisor may be gone
+                // while blockd journals still exist. A graceful lifecycle
+                // request must never equate "not in the map" with "safe to
+                // delete"; recovery/cleanup needs an explicit path.
+                bail!(
+                    "cat runtime directory {} exists but is not supervised; refusing to discard possible local durability state",
+                    dir.display()
+                );
+            }
+            if !graceful {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
             return Ok(ObservedState::Cold);
         };
         if matches!(
@@ -1406,19 +1538,34 @@ impl NodeRuntime {
                 return Err(error);
             }
         }
-        self.teardown(&mut rt, graceful);
+        let prior_state = rt.state;
+        if let Err(error) = self.teardown(&mut rt, graceful) {
+            // If the Guest is already gone, only the forced remote drain is
+            // outstanding. Keep the blockd processes and local journals alive
+            // under an explicit transitional state so a retry can finish it.
+            if rt.guest.is_none() {
+                rt.state = ObservedState::Stopping;
+            } else {
+                rt.state = prior_state;
+            }
+            self.cats.lock().unwrap().insert(cat_id.to_string(), rt);
+            return Err(error);
+        }
         let _ = std::fs::remove_dir_all(&rt.dir);
         Ok(ObservedState::Cold)
     }
 
-    /// Best-effort teardown: durable flush (graceful), then kill children.
-    fn teardown(&self, rt: &mut CatRuntime, graceful: bool) {
+    /// Teardown one runtime. A graceful transition is fail-closed: after the
+    /// Guest page cache is frozen and the VMM is gone, every relaxed blockd
+    /// must reach its remote durability watermark before its journal or lease
+    /// may be discarded.
+    fn teardown(&self, rt: &mut CatRuntime, graceful: bool) -> Result<()> {
         if graceful && rt.guest.is_some() {
             if rt.state == ObservedState::Suspended {
                 // A paused guest cannot flush; wake it first.
                 match &rt.ch {
                     Some(chrt) => {
-                        let _ = ch::resume(&chrt.api_sock);
+                        ch::resume(&chrt.api_sock)?;
                     }
                     None => {
                         if let Some(g) = &rt.guest {
@@ -1427,14 +1574,15 @@ impl NodeRuntime {
                     }
                 }
             }
-            if let Ok(mut client) = rt.conn().connect() {
-                let _ = client.syncfs();
-                if rt.ch.is_none() {
-                    let _ = client.shutdown();
-                }
+            let mut client = rt
+                .conn()
+                .connect()
+                .context("connect guest for final sync")?;
+            client.syncfs().context("guest final syncfs")?;
+            if rt.ch.is_none() {
+                let _ = client.shutdown();
             }
         }
-        let was_graceful = graceful && rt.guest.is_some();
         if let Some(mut vmm) = rt.guest.take() {
             match &rt.ch {
                 Some(chrt) => ch::shutdown_vmm(&chrt.api_sock, &mut vmm),
@@ -1444,15 +1592,13 @@ impl NodeRuntime {
                 }
             }
         }
-        if was_graceful {
+        if graceful {
             // syncfs pushed the guest page cache into the engines; on relaxed
-            // volumes that only stages. A stop is a forced flush point
-            // (ADR-0021), so publish before the backends die — and only now,
-            // with the VMM gone, can no late fsync slip in behind the drain.
+            // volumes that only advances the local watermark. The VMM is gone,
+            // so no late fsync can slip in behind this mandatory drain.
             for proc in rt.blockds.values() {
-                if let Err(e) = proc.drain() {
-                    tracing::warn!("teardown drain: {e:#}");
-                }
+                proc.drain()
+                    .with_context(|| format!("final drain of {}", proc.grant.disk_id))?;
             }
         }
         if let (Some(chrt), VmmMode::CloudHypervisor(chc)) = (&rt.ch, &self.cfg.vmm) {
@@ -1480,6 +1626,7 @@ impl NodeRuntime {
         let _ = std::fs::remove_file(rt.runtime_socket());
         Self::remove_metering_cgroup(rt.metering.as_ref());
         rt.state = ObservedState::Cold;
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -1675,6 +1822,10 @@ impl NodeRuntime {
         let rt = cats.get_mut(cat_id).context("cat is not on this node")?;
         match rt.state {
             ObservedState::Warm => return Ok(ObservedState::Warm),
+            // A prior FakeVmm attempt may have stopped the Guest and then
+            // failed its remote drain. Its blockds and local journals remain,
+            // so the same job can retry the drain without recreating state.
+            ObservedState::Warming if rt.ch.is_none() && rt.guest.is_none() => {}
             ObservedState::Suspended | ObservedState::Running => {}
             other => bail!("cannot warm from {other:?}"),
         }
@@ -1687,10 +1838,11 @@ impl NodeRuntime {
                 client.syncfs()?;
                 ch::pause(&api)?;
             }
-            // Warm is a forced flush point (ADR-0021): the VMM exits and a
+            // Warm is a forced remote-drain point (ADR-0022): the VMM exits and a
             // restore may happen after this host is long gone.
             for proc in rt.blockds.values() {
-                proc.drain()?;
+                proc.drain()
+                    .with_context(|| format!("warm drain of {}", proc.grant.disk_id))?;
             }
             let memory_file = rt.ch.as_ref().expect("checked").memory_file.clone();
             ch::sync_memory_backing(&memory_file)?;
@@ -1725,18 +1877,27 @@ impl NodeRuntime {
             rt.state = ObservedState::Warm;
             return Ok(ObservedState::Warm);
         }
-        if let Some(g) = &rt.guest {
-            signal(g, libc::SIGCONT); // wake a suspended guest to snapshot it
+        if rt.guest.is_some() {
+            if let Some(g) = &rt.guest {
+                signal(g, libc::SIGCONT); // wake a suspended guest to snapshot it
+            }
+            let mut client = rt.conn().connect()?;
+            // First freeze the Guest-visible state locally and persist the
+            // process identity. The Guest must then exit before the remote
+            // drain, otherwise a late fsync could advance the local watermark
+            // after the supposedly final publish.
+            client.syncfs()?;
+            client.save_state(&rt.state_file())?;
+            let _ = client.shutdown();
+            if let Some(mut g) = rt.guest.take() {
+                let _ = g.kill();
+                let _ = g.wait();
+            }
+            rt.state = ObservedState::Warming;
         }
-        let mut client = rt.conn().connect()?;
-        // Durable point, then persist the process identity ("snapshot"),
-        // then exit the VMM and the block backends (ADR-0002 Warm).
-        client.syncfs()?;
-        client.save_state(&rt.state_file())?;
-        let _ = client.shutdown();
-        if let Some(mut g) = rt.guest.take() {
-            let _ = g.kill();
-            let _ = g.wait();
+        for proc in rt.blockds.values() {
+            proc.drain()
+                .with_context(|| format!("warm drain of {}", proc.grant.disk_id))?;
         }
         let cat_dir = rt.dir.clone();
         for (_, mut p) in rt.blockds.drain() {
@@ -1868,23 +2029,29 @@ impl NodeRuntime {
     }
 
     /// `cats sync`: everything acknowledged inside the guest becomes durable
-    /// in the object store before this returns (ADR-0021). Guest page cache
-    /// first, then every engine's staged packs.
+    /// in the object store before this returns. A Running Cat flushes the Guest
+    /// page cache first. A Suspended Cat was already syncfs'd before pause, so
+    /// its frozen block engines can be drained without resuming it.
     fn sync_cat(&self, cat_id: &str) -> Result<ObservedState> {
-        let activity = self
-            .cats
-            .lock()
-            .unwrap()
-            .get(cat_id)
-            .context("cat is not running on this node")?
-            .activity
-            .clone();
-        let _activity = activity.acquire()?;
+        let (state, activity) = {
+            let cats = self.cats.lock().unwrap();
+            let rt = cats.get(cat_id).context("cat is not on this node")?;
+            (rt.state, rt.activity.clone())
+        };
+        let _activity = if state == ObservedState::Running {
+            Some(activity.acquire()?)
+        } else {
+            None
+        };
         let cats = self.cats.lock().unwrap();
-        let rt = cats
-            .get(cat_id)
-            .context("cat is not running on this node")?;
-        rt.conn().connect()?.syncfs().context("guest syncfs")?;
+        let rt = cats.get(cat_id).context("cat is not on this node")?;
+        match rt.state {
+            ObservedState::Running => {
+                rt.conn().connect()?.syncfs().context("guest syncfs")?;
+            }
+            ObservedState::Suspended => {}
+            other => bail!("cannot sync cat in {other:?}"),
+        }
         for proc in rt.blockds.values() {
             proc.drain()?;
         }
@@ -1905,20 +2072,37 @@ impl NodeRuntime {
         let rt = cats
             .get_mut(cat_id)
             .context("cat is not running on this node")?;
-        let Some(mut proc) = rt.blockds.remove(disk_id) else {
+        if !rt.blockds.contains_key(disk_id) {
             return Ok(rt.state); // idempotent
-        };
-        rt.volumes.retain(|v| v.disk_id != disk_id);
+        }
         // Final durable flush through the guest before the backend exits.
-        if let Ok(mut client) = rt.conn().connect() {
-            let _ = client.flush_disk(disk_id);
+        rt.conn()
+            .connect()
+            .context("connect guest for disk detach")?
+            .flush_disk(disk_id)
+            .with_context(|| format!("guest flush of {disk_id}"))?;
+        // A relaxed Guest FLUSH only advances the local watermark. Keep the
+        // binding, blockd and journal intact unless the forced remote drain
+        // succeeds.
+        rt.blockds
+            .get(disk_id)
+            .expect("checked")
+            .drain()
+            .with_context(|| format!("detach drain of {disk_id}"))?;
+
+        let mut proc = rt.blockds.remove(disk_id).expect("checked");
+        let volume_index = rt
+            .volumes
+            .iter()
+            .position(|volume| volume.disk_id == disk_id);
+        let removed_volume = volume_index.map(|index| rt.volumes.remove(index));
+        if let Err(error) = self.write_disk_map(rt) {
+            rt.blockds.insert(disk_id.to_string(), proc);
+            if let (Some(index), Some(volume)) = (volume_index, removed_volume) {
+                rt.volumes.insert(index, volume);
+            }
+            return Err(error);
         }
-        // Detach is a forced flush point (ADR-0021): on a relaxed disk the
-        // guest flush above only staged.
-        if let Err(e) = proc.drain() {
-            tracing::warn!("detach drain of {disk_id}: {e:#}");
-        }
-        self.write_disk_map(rt)?;
         let _ = proc.child.kill();
         let _ = proc.child.wait();
         Ok(rt.state)
@@ -2371,6 +2555,31 @@ mod proxy_tests {
         targets: Mutex<Vec<CatTelemetryTarget>>,
     }
 
+    #[test]
+    fn forced_blockd_drain_allows_remote_tail_beyond_status_probe_deadline() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("blockd-control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let responder = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut command = String::new();
+            std::io::BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut command)
+                .unwrap();
+            assert_eq!(command, "drain\n");
+            std::thread::sleep(BLOCKD_STATUS_TIMEOUT + Duration::from_millis(250));
+            stream.write_all(b"OK {}\n").unwrap();
+        });
+
+        let started = Instant::now();
+        BlockdProc::drain_at(&socket, "disk-a").unwrap();
+        assert!(started.elapsed() > BLOCKD_STATUS_TIMEOUT);
+        responder.join().unwrap();
+    }
+
     impl UsageFinalizer for RecordingUsageFinalizer {
         fn finalize(&self, target: CatTelemetryTarget) -> Result<()> {
             self.targets.lock().unwrap().push(target);
@@ -2432,6 +2641,9 @@ mod proxy_tests {
             metadata_store: adapter.clone(),
             object_store: adapter,
             blockd_lease_ttl_ms: 1_000,
+            blockd_max_staged_bytes: cats_blockd::engine::DEFAULT_MAX_STAGED_BYTES,
+            blockd_max_staged_packs: cats_blockd::engine::DEFAULT_MAX_STAGED_PACKS,
+            blockd_max_local_bytes: cats_blockd::engine::DEFAULT_MAX_LOCAL_BYTES,
             metering_cgroup_root: None,
             vmm: VmmMode::Fake,
             wake_budget: WakeBudget::default(),
@@ -2451,16 +2663,14 @@ mod proxy_tests {
             "epoch-a"
         );
         drop(targets);
-        assert!(
-            runtime
-                .cats
-                .lock()
-                .unwrap()
-                .get("cat-a")
-                .unwrap()
-                .metering
-                .is_none()
-        );
+        assert!(runtime
+            .cats
+            .lock()
+            .unwrap()
+            .get("cat-a")
+            .unwrap()
+            .metering
+            .is_none());
         assert!(!cgroup.exists());
     }
 

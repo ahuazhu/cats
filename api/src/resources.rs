@@ -259,6 +259,34 @@ pub struct CatResourceTelemetry {
     pub memory_rss_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_disk_used_bytes: Option<u64>,
+    /// Per-volume local/remote durability watermarks. This is deliberately a
+    /// list rather than a Cat-wide aggregate: one unhealthy PersistentDisk
+    /// must not be hidden by an up-to-date RootDisk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disk_durability: Vec<DiskDurabilityTelemetry>,
+}
+
+/// One block engine's local-first replication state as observed by its node.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DiskDurabilityTelemetry {
+    pub disk_id: String,
+    pub mode: String,
+    pub local_durable_generation: i64,
+    pub remote_durable_generation: i64,
+    pub unpublished_generations: u64,
+    pub unpublished_bytes: u64,
+    pub oldest_unpublished_age_ms: u64,
+    pub max_unpublished_generations: u64,
+    pub max_unpublished_bytes: u64,
+    pub local_allocated_bytes: u64,
+    #[serde(default)]
+    pub local_accounted_bytes: u64,
+    pub max_local_bytes: u64,
+    pub evicted_cache_chunks: u64,
+    pub backpressured: bool,
+    pub fenced: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_publish_error: Option<String>,
 }
 
 fn is_zero_u64(value: &u64) -> bool {
