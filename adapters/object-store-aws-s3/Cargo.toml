@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 cats-storage = { workspace = true }
 hex = { workspace = true }
-hmac = "0.12"
+hmac = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

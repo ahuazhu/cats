@@ -13,6 +13,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CATS_CARGO_DENY_VERSION: 0.19.4
+  CATS_CARGO_MACHETE_VERSION: 0.9.2
 
 jobs:
   rust:
@@ -28,6 +30,12 @@ jobs:
           toolchain: "1.97.1"
           components: clippy,rustfmt
 
+      - name: Install dependency policy tools
+        uses: taiki-e/install-action@13608cbb45b01feb47ef444ab1a42dc41ad56f1a # v2.79.11
+        with:
+          tool: cargo-deny@${{ env.CATS_CARGO_DENY_VERSION }},cargo-machete@${{ env.CATS_CARGO_MACHETE_VERSION }}
+          fallback: none
+
       - uses: Swatinem/rust-cache@v2
 
       # native-tls needs OpenSSL headers; rusqlite is `bundled` and compiles
@@ -39,6 +47,9 @@ jobs:
 
       - name: Agent skill contracts
         run: ./scripts/quality.sh skills
+
+      - name: Dependency policy
+        run: ./scripts/quality.sh deps
 
       - name: Formatting
         run: ./scripts/quality.sh fmt

@@ -4,6 +4,9 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+CATS_CARGO_DENY_VERSION="${CATS_CARGO_DENY_VERSION:-0.19.4}"
+CATS_CARGO_MACHETE_VERSION="${CATS_CARGO_MACHETE_VERSION:-0.9.2}"
+
 SKILLS=(
   rust-smell-audit
   safe-refactor
@@ -11,7 +14,7 @@ SKILLS=(
 )
 
 usage() {
-  echo "usage: $0 {fmt|skills|check|build|clippy|test|doc|fast|full|linux}" >&2
+  echo "usage: $0 {fmt|skills|deps|check|build|clippy|test|doc|fast|full|linux}" >&2
 }
 
 run_fmt() {
@@ -66,6 +69,53 @@ run_skills() {
   done
 }
 
+require_tool_version() {
+  local executable="$1"
+  local expected="$2"
+  local install_command="$3"
+  local actual
+
+  command -v "$executable" >/dev/null 2>&1 || {
+    echo "$executable is required; install it with:" >&2
+    echo "  $install_command" >&2
+    return 1
+  }
+
+  actual="$("$executable" --version)"
+  [[ "$actual" == "$expected" ]] || {
+    echo "$executable version mismatch: expected '$expected', found '$actual'" >&2
+    echo "install the pinned version with:" >&2
+    echo "  $install_command" >&2
+    return 1
+  }
+}
+
+run_deps() {
+  local lock_before
+  local lock_after
+
+  require_tool_version \
+    cargo-deny \
+    "cargo-deny $CATS_CARGO_DENY_VERSION" \
+    "cargo install --locked cargo-deny --version $CATS_CARGO_DENY_VERSION"
+  require_tool_version \
+    cargo-machete \
+    "$CATS_CARGO_MACHETE_VERSION" \
+    "cargo install --locked cargo-machete --version $CATS_CARGO_MACHETE_VERSION"
+
+  echo "==> cargo deny"
+  cargo deny --locked check --hide-inclusion-graph
+
+  echo "==> cargo machete"
+  lock_before="$(cksum Cargo.lock)"
+  cargo machete --with-metadata
+  lock_after="$(cksum Cargo.lock)"
+  [[ "$lock_before" == "$lock_after" ]] || {
+    echo "cargo machete changed Cargo.lock; regenerate and commit the lockfile" >&2
+    return 1
+  }
+}
+
 run_build() {
   echo "==> cargo build"
   cargo build --workspace --locked
@@ -101,6 +151,7 @@ run_fast() {
 run_full() {
   run_fmt
   run_skills
+  run_deps
   run_check
   run_build
   run_clippy
@@ -136,6 +187,7 @@ run_linux() {
 case "${1:-full}" in
   fmt) run_fmt ;;
   skills) run_skills ;;
+  deps) run_deps ;;
   check) run_check ;;
   build) run_build ;;
   clippy) run_clippy ;;
