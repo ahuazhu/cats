@@ -78,7 +78,7 @@ rand = "0.9"
 libc = "0.2"
 tempfile = "3"
 workos = "2.5"
-jsonwebtoken = { version = "10.4", default-features = false, features = ["rust_crypto", "use_pem"] }
+jsonwebtoken = { version = "10.4", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 directories = "6"
 keyring = "4.1"
 open = "5.4"
@@ -89,9 +89,9 @@ crossterm = "0.29"
 portable-pty = "0.9"
 fs2 = "0.4"
 aws-config = "1"
-aws-sdk-dynamodb = "1"
-aws-sdk-kinesis = "1"
-aws-sdk-s3 = "1"
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-kinesis = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
 
 # rust-vmm ecosystem (Linux-only data plane: vhost-user-blk frontend, ADR-0004).
 vhost = "0.17"
