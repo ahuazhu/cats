@@ -52,6 +52,9 @@ pub trait MetadataStore: Send + Sync {
 
     /// Acquire the sole writer lease and return a newly incremented epoch.
     fn acquire_lease(&self, volume_id: &str, attachment_id: &str, ttl_ms: i64) -> Result<i64>;
+    /// Extend the lease. Succeeds while the row still names this attachment
+    /// and epoch: an expiry lapse alone stays renewable, because everything
+    /// that must fence — a revoke, a competing acquire — bumps the epoch.
     fn renew_lease(
         &self,
         volume_id: &str,
@@ -60,7 +63,8 @@ pub trait MetadataStore: Send + Sync {
         ttl_ms: i64,
     ) -> Result<()>;
     fn release_lease(&self, volume_id: &str, attachment_id: &str, epoch: i64) -> Result<()>;
-    /// Expire the current lease immediately so an old holder fails closed.
+    /// Expire the current lease immediately and bump the epoch, so the old
+    /// holder fails closed and cannot renew back in.
     fn revoke_lease(&self, volume_id: &str) -> Result<()>;
 
     /// Atomically publish a new root and return the new generation.

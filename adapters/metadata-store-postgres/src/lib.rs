@@ -361,11 +361,15 @@ impl MetadataStore for PostgresMetadataStore {
         validate_lease_ttl(ttl_ms)?;
         let volume_id = volume_id.to_string();
         let attachment_id = attachment_id.to_string();
+        // Deliberately no expiry check: an expired-but-unclaimed lease means
+        // nobody revoked or acquired it in between (both bump the epoch), so
+        // the holder renews straight through a lapse. A slow attach or a
+        // metadata hiccup must not become a permanent self-fence; everything
+        // that must fence does so via the epoch.
         let sql = format!(
             "UPDATE cats_storage_volumes
                 SET lease_expires_at_ms = {DB_NOW_MS} + $4
-              WHERE volume_id = $1 AND lease_owner = $2 AND lease_epoch = $3
-                AND lease_expires_at_ms > {DB_NOW_MS}"
+              WHERE volume_id = $1 AND lease_owner = $2 AND lease_epoch = $3"
         );
         self.dispatch_lease(move |client| {
             let rows = client
@@ -394,12 +398,16 @@ impl MetadataStore for PostgresMetadataStore {
         })
     }
 
+    // The epoch bump is what makes a revoke stick: renewal tolerates a bare
+    // expiry, so expiring the row alone would let the old holder renew back in.
     fn revoke_lease(&self, volume_id: &str) -> Result<()> {
         let volume_id = volume_id.to_string();
         self.dispatch(move |client| {
             client
                 .execute(
-                    "UPDATE cats_storage_volumes SET lease_expires_at_ms = 0 WHERE volume_id = $1",
+                    "UPDATE cats_storage_volumes
+                        SET lease_expires_at_ms = 0, lease_epoch = lease_epoch + 1
+                      WHERE volume_id = $1",
                     &[&volume_id],
                 )
                 .map(|_| ())
