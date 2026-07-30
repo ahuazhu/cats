@@ -130,6 +130,9 @@ impl Cluster {
                 metadata_store,
                 object_store,
                 blockd_lease_ttl_ms: 1_200,
+                blockd_max_staged_bytes: cats_blockd::engine::DEFAULT_MAX_STAGED_BYTES,
+                blockd_max_staged_packs: cats_blockd::engine::DEFAULT_MAX_STAGED_PACKS,
+                blockd_max_local_bytes: cats_blockd::engine::DEFAULT_MAX_LOCAL_BYTES,
                 metering_cgroup_root: None,
                 wake_budget: Default::default(),
                 vmm: cats_node_agent::runtime::VmmMode::Fake,
@@ -245,10 +248,7 @@ impl Cluster {
     }
 
     async fn cat_json(&self, name: &str) -> serde_json::Value {
-        self.api_get(&format!(
-            "/v1/workspaces/{}/cats/{name}",
-            self.workspace_id
-        ))
+        self.api_get(&format!("/v1/workspaces/{}/cats/{name}", self.workspace_id))
             .await
     }
 

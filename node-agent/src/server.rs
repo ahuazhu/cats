@@ -619,17 +619,17 @@ mod proxy_websocket_tests {
                     "x-forwarded-host".to_string(),
                     "preview-123.cats.run".to_string(),
                 ),
-                ("origin".to_string(), "https://preview-123.cats.run".to_string()),
+                (
+                    "origin".to_string(),
+                    "https://preview-123.cats.run".to_string(),
+                ),
             ],
         )
         .unwrap();
 
         assert_eq!(request.uri().path_and_query().unwrap(), "/socket?token=one");
         assert_eq!(request.headers()["host"], "preview-123.cats.run");
-        assert_eq!(
-            request.headers()["origin"],
-            "https://preview-123.cats.run"
-        );
+        assert_eq!(request.headers()["origin"], "https://preview-123.cats.run");
     }
 }
 
@@ -960,6 +960,7 @@ impl HostTelemetrySampler {
                     cpu_usage_cores,
                     memory_rss_bytes,
                     host_disk_used_bytes,
+                    disk_durability: target.disk_durability,
                 }
             })
             .collect();
@@ -1195,10 +1196,8 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
         .timeout(Duration::from_secs(10))
         .build()?;
     let cfg = Arc::new(cfg);
-    let runtime = Arc::new(
-        NodeRuntime::new(cfg.node.clone())
-            .with_usage_finalizer(usage_pipeline.clone()),
-    );
+    let runtime =
+        Arc::new(NodeRuntime::new(cfg.node.clone()).with_usage_finalizer(usage_pipeline.clone()));
     let state = NodeState {
         runtime: runtime.clone(),
         cfg: cfg.clone(),
@@ -1478,6 +1477,7 @@ mod telemetry_tests {
                 cgroup_path: cgroup.clone(),
                 source_epoch: "epoch-a".to_string(),
             }),
+            disk_durability: Vec::new(),
         };
         let mut sampler =
             HostTelemetrySampler::new("node-a".to_string(), temp.path().to_path_buf());

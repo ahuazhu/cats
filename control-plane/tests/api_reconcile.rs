@@ -45,6 +45,7 @@ struct StubNode {
     heartbeat_gate: Arc<tokio::sync::RwLock<()>>,
     exec_attempts: Arc<AtomicUsize>,
     exec_conflicts_remaining: Arc<AtomicUsize>,
+    fail_jobs_remaining: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl StubNode {
@@ -63,6 +64,33 @@ impl StubNode {
 
 async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Json<NodeJobResult> {
     node.jobs.lock().unwrap().push(job.job_id.clone());
+    let kind = job.action.kind().to_string();
+    let should_fail = {
+        let mut failures = node.fail_jobs_remaining.lock().unwrap();
+        failures.get_mut(&kind).is_some_and(|remaining| {
+            if *remaining == 0 {
+                false
+            } else {
+                *remaining -= 1;
+                true
+            }
+        })
+    };
+    if should_fail {
+        let observed = node
+            .cats
+            .lock()
+            .unwrap()
+            .get(job.action.cat_id())
+            .copied()
+            .unwrap_or(ObservedState::Failed);
+        return Json(NodeJobResult::fail(
+            job.job_id,
+            observed,
+            format!("injected {kind} failure"),
+            true,
+        ));
+    }
     let (cat_id, observed) = match &job.action {
         NodeJobAction::StartCat { cat_id, .. } => (cat_id.clone(), ObservedState::Running),
         NodeJobAction::StopCat { cat_id } => (cat_id.clone(), ObservedState::Cold),
@@ -116,6 +144,7 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
         heartbeat_gate: Arc::new(tokio::sync::RwLock::new(())),
         exec_attempts: Arc::new(AtomicUsize::new(0)),
         exec_conflicts_remaining: Arc::new(AtomicUsize::new(0)),
+        fail_jobs_remaining: Arc::new(Mutex::new(HashMap::new())),
     };
     let app = Router::new()
         .route("/v1/jobs", post(stub_job))
@@ -175,6 +204,7 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
                     cpu_usage_cores: Some(0.25),
                     memory_rss_bytes: Some(128 * 1024 * 1024),
                     host_disk_used_bytes: Some(32 * 1024 * 1024),
+                    disk_durability: Vec::new(),
                 })
                 .collect();
             let _ = client
@@ -666,12 +696,7 @@ async fn create_converges_and_idempotency_replays() {
     assert_eq!(resp.status(), 409);
 
     // Unauthenticated requests are rejected.
-    let resp = ctx
-        .http
-        .get(ctx.ws_url("/cats"))
-        .send()
-        .await
-        .unwrap();
+    let resp = ctx.http.get(ctx.ws_url("/cats")).send().await.unwrap();
     assert_eq!(resp.status(), 401);
 }
 
@@ -696,6 +721,87 @@ async fn lifecycle_stop_start_suspend_resume() {
     ctx.wait_observed("dev", ObservedState::Warm).await;
     ctx.action("dev", "resume").await;
     ctx.wait_observed("dev", ObservedState::Running).await;
+}
+
+#[tokio::test]
+async fn failed_mandatory_stop_drain_retains_source_until_retry_succeeds() {
+    let ctx = Ctx::new().await;
+    let node = start_stub_node(&ctx.cp, "node_a").await;
+    ctx.create_cat("drain-safe", None).await;
+    let running = ctx
+        .wait_observed("drain-safe", ObservedState::Running)
+        .await;
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("stop_cat".into(), usize::MAX);
+
+    let stop = ctx.action("drain-safe", "stop").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let retained: Cat = ctx
+        .http
+        .get(ctx.ws_url("/cats/drain-safe"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(matches!(
+        retained.observed_state,
+        ObservedState::Running | ObservedState::Stopping
+    ));
+    assert_eq!(retained.node_id, running.node_id);
+
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("stop_cat".into(), 0);
+    ctx.wait_operation(&stop.operation.id).await;
+    let cold = ctx.wait_observed("drain-safe", ObservedState::Cold).await;
+    assert!(cold.node_id.is_none());
+}
+
+#[tokio::test]
+async fn failed_warm_drain_keeps_the_host_bound_source_for_retry() {
+    let ctx = Ctx::new().await;
+    let node = start_stub_node(&ctx.cp, "node_a").await;
+    ctx.create_cat("warm-safe", None).await;
+    ctx.wait_observed("warm-safe", ObservedState::Running).await;
+    ctx.action("warm-safe", "suspend").await;
+    let suspended = ctx
+        .wait_observed("warm-safe", ObservedState::Suspended)
+        .await;
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("warm_cat".into(), usize::MAX);
+
+    let warm = ctx.action("warm-safe", "warm").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let retained: Cat = ctx
+        .http
+        .get(ctx.ws_url("/cats/warm-safe"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(matches!(
+        retained.observed_state,
+        ObservedState::Suspended | ObservedState::Warming
+    ));
+    assert_eq!(retained.node_id, suspended.node_id);
+
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("warm_cat".into(), 0);
+    ctx.wait_operation(&warm.operation.id).await;
+    ctx.wait_observed("warm-safe", ObservedState::Warm).await;
 }
 
 #[tokio::test]
@@ -931,6 +1037,72 @@ async fn rwo_second_bind_is_rejected() {
         .await
         .unwrap();
     assert_eq!(del.status(), 204);
+}
+
+#[tokio::test]
+async fn snapshot_requires_the_running_disks_remote_watermark() {
+    let ctx = Ctx::new().await;
+    let node = start_stub_node(&ctx.cp, "node_a").await;
+    ctx.create_cat("snap-safe", None).await;
+    ctx.wait_observed("snap-safe", ObservedState::Running).await;
+    let disks: ListResponse<Disk> = ctx
+        .http
+        .get(ctx.ws_url("/disks"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let root = disks
+        .items
+        .into_iter()
+        .find(|disk| disk.kind == DiskKind::Root)
+        .unwrap();
+
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("sync_cat".into(), 100);
+    let failed = ctx
+        .http
+        .post(ctx.ws_url(&format!("/disks/{}/snapshots", root.id)))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let empty: ListResponse<Snapshot> = ctx
+        .http
+        .get(ctx.ws_url(&format!("/disks/{}/snapshots", root.id)))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(empty.items.is_empty());
+
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("sync_cat".into(), 0);
+    let created = ctx
+        .http
+        .post(ctx.ws_url(&format!("/disks/{}/snapshots", root.id)))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    assert!(node
+        .jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|job| job.contains("_sync_")));
 }
 
 #[tokio::test]
@@ -1613,9 +1785,7 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
 
     let user_query_with_service_credential = ctx
         .http
-        .get(ctx.ws_url(&format!(
-            "/billing/usage?from_ms=1000&to_ms={hour_end}"
-        )))
+        .get(ctx.ws_url(&format!("/billing/usage?from_ms=1000&to_ms={hour_end}")))
         .bearer_auth(SERVICE_TOKEN)
         .send()
         .await

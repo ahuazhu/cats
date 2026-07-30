@@ -26,28 +26,28 @@ fn runtime(dir: &std::path::Path) -> Arc<NodeRuntime> {
 
 fn runtime_with(dir: &std::path::Path, wake_budget: WakeBudget) -> Arc<NodeRuntime> {
     let meta_path = dir.join("meta.db");
-    Arc::new(NodeRuntime::new(
-        NodeConfig {
-            node_id: "node_conc".into(),
-            state_dir: dir.join("node-state"),
-            blockd_bin: workspace_bin("cats-blockd"),
-            guest_agent_bin: workspace_bin("cats-guest-agent"),
-            metadata_store: AdapterSelection {
-                name: "sqlite".into(),
-                config: AdapterConfig::from_pairs([("path", meta_path.display().to_string())])
-                    .unwrap(),
-            },
-            object_store: AdapterSelection {
-                name: "file".into(),
-                config: AdapterConfig::from_pairs([("root", dir.join("blob").display().to_string())])
-                    .unwrap(),
-            },
-            blockd_lease_ttl_ms: 1500,
-            metering_cgroup_root: None,
-            wake_budget,
-            vmm: VmmMode::Fake,
+    Arc::new(NodeRuntime::new(NodeConfig {
+        node_id: "node_conc".into(),
+        state_dir: dir.join("node-state"),
+        blockd_bin: workspace_bin("cats-blockd"),
+        guest_agent_bin: workspace_bin("cats-guest-agent"),
+        metadata_store: AdapterSelection {
+            name: "sqlite".into(),
+            config: AdapterConfig::from_pairs([("path", meta_path.display().to_string())]).unwrap(),
         },
-    ))
+        object_store: AdapterSelection {
+            name: "file".into(),
+            config: AdapterConfig::from_pairs([("root", dir.join("blob").display().to_string())])
+                .unwrap(),
+        },
+        blockd_lease_ttl_ms: 1500,
+        blockd_max_staged_bytes: cats_blockd::engine::DEFAULT_MAX_STAGED_BYTES,
+        blockd_max_staged_packs: cats_blockd::engine::DEFAULT_MAX_STAGED_PACKS,
+        blockd_max_local_bytes: cats_blockd::engine::DEFAULT_MAX_LOCAL_BYTES,
+        metering_cgroup_root: None,
+        wake_budget,
+        vmm: VmmMode::Fake,
+    }))
 }
 
 fn start_job(cat: &str) -> NodeJob {
@@ -170,7 +170,11 @@ fn concurrent_launches_queue_under_the_ceiling_instead_of_failing() {
             "a queued launch must still succeed: {result:?}"
         );
     }
-    assert_eq!(runtime.wake_load().wakes, 0, "a launch leaked a wake permit");
+    assert_eq!(
+        runtime.wake_load().wakes,
+        0,
+        "a launch leaked a wake permit"
+    );
 }
 
 /// Where does concurrent launch actually flatten out, and why?

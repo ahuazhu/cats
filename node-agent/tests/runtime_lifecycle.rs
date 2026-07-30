@@ -44,20 +44,21 @@ fn env() -> Env {
         )])
         .unwrap(),
     };
-    let runtime = NodeRuntime::new(
-        NodeConfig {
-            node_id: "node_test".into(),
-            state_dir: state_dir.clone(),
-            blockd_bin: workspace_bin("cats-blockd"),
-            guest_agent_bin: workspace_bin("cats-guest-agent"),
-            metadata_store,
-            object_store,
-            blockd_lease_ttl_ms: 1200,
-            metering_cgroup_root: None,
-            wake_budget: Default::default(),
-            vmm: cats_node_agent::runtime::VmmMode::Fake,
-        },
-    );
+    let runtime = NodeRuntime::new(NodeConfig {
+        node_id: "node_test".into(),
+        state_dir: state_dir.clone(),
+        blockd_bin: workspace_bin("cats-blockd"),
+        guest_agent_bin: workspace_bin("cats-guest-agent"),
+        metadata_store,
+        object_store,
+        blockd_lease_ttl_ms: 1200,
+        blockd_max_staged_bytes: cats_blockd::engine::DEFAULT_MAX_STAGED_BYTES,
+        blockd_max_staged_packs: cats_blockd::engine::DEFAULT_MAX_STAGED_PACKS,
+        blockd_max_local_bytes: cats_blockd::engine::DEFAULT_MAX_LOCAL_BYTES,
+        metering_cgroup_root: None,
+        wake_budget: Default::default(),
+        vmm: cats_node_agent::runtime::VmmMode::Fake,
+    });
     Env {
         _dir: dir,
         runtime,
@@ -91,6 +92,22 @@ fn start_job(generation: i64) -> NodeJob {
             cpus: 1,
             memory_mib: 256,
             volumes: vec![grant("root", generation)],
+        },
+    }
+}
+
+fn start_job_relaxed(generation: i64) -> NodeJob {
+    let mut root = grant("root", generation);
+    root.durability = cats_api::resources::DiskDurability::Relaxed;
+    NodeJob {
+        job_id: job_id(CAT, generation, "start_cat_relaxed"),
+        cat_generation: generation,
+        action: NodeJobAction::StartCat {
+            cat_id: CAT.into(),
+            image: "test".into(),
+            cpus: 1,
+            memory_mib: 256,
+            volumes: vec![root],
         },
     }
 }
@@ -155,7 +172,10 @@ fn exec_survives_a_command_that_is_quiet_for_longer_than_a_health_probe() {
     let started = std::time::Instant::now();
     let (code, stdout, stderr) = env
         .runtime
-        .exec(CAT, vec!["sh".into(), "-c".into(), "sleep 35; echo awake".into()])
+        .exec(
+            CAT,
+            vec!["sh".into(), "-c".into(), "sleep 35; echo awake".into()],
+        )
         .expect("a long quiet command must not be cut off");
     assert!(
         started.elapsed() >= Duration::from_secs(35),
@@ -264,7 +284,7 @@ fn full_lifecycle_ladder_with_boot_id_oracles() {
     let env = env();
 
     // Cold start.
-    let res = env.runtime.execute(start_job(1));
+    let res = env.runtime.execute(start_job_relaxed(1));
     assert_eq!(
         res.observed_state,
         ObservedState::Running,
@@ -385,7 +405,7 @@ fn full_lifecycle_ladder_with_boot_id_oracles() {
         NodeJobAction::StopCat { cat_id: CAT.into() },
     ));
     assert_eq!(res.observed_state, ObservedState::Cold);
-    let res = env.runtime.execute(start_job(2));
+    let res = env.runtime.execute(start_job_relaxed(2));
     assert_eq!(
         res.observed_state,
         ObservedState::Running,
@@ -411,6 +431,84 @@ fn full_lifecycle_ladder_with_boot_id_oracles() {
     env.runtime.execute(simple(
         2,
         "stop_cat",
+        NodeJobAction::StopCat { cat_id: CAT.into() },
+    ));
+}
+
+#[test]
+fn relaxed_stop_keeps_local_state_when_the_forced_drain_fails() {
+    let env = env();
+    let started = env.runtime.execute(start_job_relaxed(1));
+    assert_eq!(started.observed_state, ObservedState::Running);
+
+    // Replace the configured blob-store directory with a regular file before
+    // the local ACK. Unlike chmod, this remains a deterministic write failure
+    // when the Linux acceptance container runs the test as root.
+    let blob = env._dir.path().join("blob");
+    let available_blob = env._dir.path().join("blob.available");
+    std::fs::rename(&blob, &available_blob).unwrap();
+    std::fs::write(&blob, b"remote object store unavailable").unwrap();
+
+    let payload = b"locally-acked-before-outage";
+    let mut g = guest(&env);
+    g.request(GuestRequestBody::WriteBlock {
+        disk_id: "root".into(),
+        offset: 8192,
+        data_hex: hex::encode(payload),
+    })
+    .unwrap();
+    g.flush_disk("root").unwrap();
+
+    let stop = simple(
+        1,
+        "stop_during_remote_outage",
+        NodeJobAction::StopCat { cat_id: CAT.into() },
+    );
+    let failed = env.runtime.execute(stop.clone());
+    assert_eq!(failed.phase, JobPhase::Failed);
+    assert_eq!(failed.observed_state, ObservedState::Stopping);
+    let volume_dir = env.state_dir.join("cats").join(CAT).join("vol-root");
+    assert!(
+        volume_dir.exists(),
+        "local journal was destroyed on drain failure"
+    );
+    assert!(
+        std::fs::read_dir(volume_dir.join("pending"))
+            .unwrap()
+            .next()
+            .is_some(),
+        "the acknowledged pending pack must remain"
+    );
+
+    std::fs::remove_file(&blob).unwrap();
+    std::fs::rename(&available_blob, &blob).unwrap();
+    let retried = env.runtime.execute(stop);
+    assert_eq!(
+        retried.observed_state,
+        ObservedState::Cold,
+        "retry failed: {:?}",
+        retried.error
+    );
+
+    let restarted = env.runtime.execute(start_job_relaxed(2));
+    assert_eq!(restarted.observed_state, ObservedState::Running);
+    let mut g = guest(&env);
+    match g
+        .request(GuestRequestBody::ReadBlock {
+            disk_id: "root".into(),
+            offset: 8192,
+            len: payload.len() as u32,
+        })
+        .unwrap()
+    {
+        GuestResponseBody::Data { data_hex } => {
+            assert_eq!(hex::decode(data_hex).unwrap(), payload)
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    env.runtime.execute(simple(
+        2,
+        "stop_after_outage",
         NodeJobAction::StopCat { cat_id: CAT.into() },
     ));
 }
@@ -535,6 +633,9 @@ fn a_failed_job_is_retried_not_replayed() {
         metadata_store,
         object_store,
         blockd_lease_ttl_ms: 1200,
+        blockd_max_staged_bytes: cats_blockd::engine::DEFAULT_MAX_STAGED_BYTES,
+        blockd_max_staged_packs: cats_blockd::engine::DEFAULT_MAX_STAGED_PACKS,
+        blockd_max_local_bytes: cats_blockd::engine::DEFAULT_MAX_LOCAL_BYTES,
         metering_cgroup_root: None,
         wake_budget: Default::default(),
         vmm: cats_node_agent::runtime::VmmMode::Fake,
