@@ -1,0 +1,8 @@
+   Compiling cats-node-agent v0.1.0 (/var/lib/cats/soak-runs/relaxed-vhost-fixed-20260730T092859Z/source/node-agent)
+    Finished `release` profile [optimized + debuginfo] target(s) in 9.35s
+     Running tests/runtime_lifecycle.rs (/var/lib/cats/soak-runs/relaxed-vhost-fixed-20260730T092859Z/target/release/deps/runtime_lifecycle-c549552929f6cf2d)
+
+running 1 test
+test relaxed_stop_keeps_local_state_when_the_forced_drain_fails ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 1.37s

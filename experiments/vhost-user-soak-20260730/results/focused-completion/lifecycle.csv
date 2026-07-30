@@ -1,0 +1,7 @@
+phase,cycle,duration_us,boot_id_before,boot_id_after,boot_preserved,canary_ok
+suspend_resume,0,4476897,5eb5f6c7-79fc-46c7-ab4f-b3f118ce3a70,5eb5f6c7-79fc-46c7-ab4f-b3f118ce3a70,true,true
+suspend_resume,1,3183750,5eb5f6c7-79fc-46c7-ab4f-b3f118ce3a70,5eb5f6c7-79fc-46c7-ab4f-b3f118ce3a70,true,true
+warm_restore,0,961817,5eb5f6c7-79fc-46c7-ab4f-b3f118ce3a70,5eb5f6c7-79fc-46c7-ab4f-b3f118ce3a70,true,true
+warm_restore,1,828025,5eb5f6c7-79fc-46c7-ab4f-b3f118ce3a70,5eb5f6c7-79fc-46c7-ab4f-b3f118ce3a70,true,true
+cold_restart,0,10342051,5eb5f6c7-79fc-46c7-ab4f-b3f118ce3a70,fd5eee65-5098-4b35-a2dc-774ab5199be3,false,true
+cold_restart,1,10447247,fd5eee65-5098-4b35-a2dc-774ab5199be3,a08ae227-bb4c-48d6-af16-1d395d8674ff,false,true

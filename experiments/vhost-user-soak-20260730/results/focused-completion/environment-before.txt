@@ -1,0 +1,13 @@
+started_at=2026-07-30T10:23:26,122537765+00:00
+run_id=relaxed-vhost-fixed-20260730T092859Z
+hostname=<private-hostname>
+kernel=Linux 6.17.0-1019-aws x86_64 GNU/Linux
+cpus=96
+mount=/dev/nvme3n1 ext4 rw,noatime
+worker_active=active
+blockd_processes=6
+vmm_processes=6
+active_nbd=nbd0 nbd1 nbd2 nbd3 nbd4
+load=0.96 1.27 1.91 1/1411 594774
+Filesystem     Type  Size  Used Avail Use% Mounted on
+/dev/nvme3n1   ext4  824G   24G  759G   3% /var/lib/cats

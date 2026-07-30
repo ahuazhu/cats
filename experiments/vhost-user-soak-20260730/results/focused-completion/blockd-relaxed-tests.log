@@ -1,0 +1,38 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.14s
+     Running unittests src/lib.rs (/var/lib/cats/soak-runs/relaxed-vhost-fixed-20260730T092859Z/target/release/deps/cats_blockd-b753a2efd4c9eb02)
+
+running 7 tests
+test engine::tests::remote_outage_is_observable_but_does_not_fail_relaxed_flush ... ok
+test engine::tests::relaxed_flush_acks_locally_and_the_drain_publishes ... ok
+test engine::tests::relaxed_restart_rebuilds_the_local_watermark_without_remote_writes ... ok
+test engine::tests::relaxed_detach_publishes_staged_packs ... ok
+test engine::tests::relaxed_cold_cache_write_and_flush_issue_no_remote_read ... ok
+test engine::tests::relaxed_dirty_cache_reserves_pack_space_and_cannot_deadlock_the_quota ... ok
+test engine::tests::relaxed_read_waits_until_a_frozen_cold_overlay_is_journaled ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 50 filtered out; finished in 0.41s
+
+     Running tests/commit_cost.rs (/var/lib/cats/soak-runs/relaxed-vhost-fixed-20260730T092859Z/target/release/deps/commit_cost-d63b39b3b6a27550)
+
+running 1 test
+test relaxed_local_ack_and_remote_publish_cost_are_separate ... ignored, benchmark; run explicitly with --ignored --nocapture
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/golden_root_cost.rs (/var/lib/cats/soak-runs/relaxed-vhost-fixed-20260730T092859Z/target/release/deps/golden_root_cost-810c16534870fdfc)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/vhost_user_bench.rs (/var/lib/cats/soak-runs/relaxed-vhost-fixed-20260730T092859Z/target/release/deps/vhost_user_bench-722d5299de4a1c3d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/vhost_user_blk.rs (/var/lib/cats/soak-runs/relaxed-vhost-fixed-20260730T092859Z/target/release/deps/vhost_user_blk-2d7bfce143d4fb2e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
