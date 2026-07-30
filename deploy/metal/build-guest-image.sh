@@ -261,61 +261,31 @@ exec /usr/bin/tini -- /usr/bin/cats-guest-agent --mode vm --vsock-port 5000
 EOF
 chmod +x "$RF/usr/bin/cats-init"
 
+# Keep the Guest unit definitions as reviewable, directly verifiable source
+# files. This script only installs and enables them in the golden root.
+for unit in \
+  cats-grow-root.service \
+  cats-network.service \
+  cats-guest-agent.service; do
+  install -m 0644 \
+    "$REPO/deploy/metal/guest-systemd/$unit" \
+    "$RF/etc/systemd/system/$unit"
+done
+
 # Grow the ext4 filesystem to the Cat's requested RootDisk size once per boot.
 # This lets the golden image stay small while the normal CLI default remains
 # 1 GiB and larger disks expose their full capacity to Ubuntu.
-cat > "$RF/etc/systemd/system/cats-grow-root.service" <<'EOF'
-[Unit]
-Description=Grow the Cats root filesystem
-DefaultDependencies=no
-After=systemd-remount-fs.service
-Before=cats-guest-agent.service
-
-[Service]
-Type=oneshot
-ExecStart=/sbin/resize2fs /dev/vda
-RemainAfterExit=yes
-EOF
 ln -s ../cats-grow-root.service \
   "$RF/etc/systemd/system/sysinit.target.wants/cats-grow-root.service"
 
 # Configure the platform-owned tap address before Guest Agent readiness. This
 # is a bounded local operation, not systemd's generic network-online contract.
-cat > "$RF/etc/systemd/system/cats-network.service" <<'EOF'
-[Unit]
-Description=Configure the Cats Guest network
-DefaultDependencies=no
-After=systemd-remount-fs.service
-Before=cats-guest-agent.service network.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/cats-network-setup
-RemainAfterExit=yes
-EOF
 ln -s ../cats-network.service \
   "$RF/etc/systemd/system/sysinit.target.wants/cats-network.service"
 
 # Readiness is deliberately independent from cloud-init, network-online and
 # the rest of multi-user.target. Root growth and deterministic tap setup finish
 # first; ordinary user services continue in parallel after Agent readiness.
-cat > "$RF/etc/systemd/system/cats-guest-agent.service" <<'EOF'
-[Unit]
-Description=Cats Guest Agent
-DefaultDependencies=no
-Requires=cats-grow-root.service cats-network.service
-After=cats-grow-root.service cats-network.service systemd-remount-fs.service
-Before=sysinit.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/cats-guest-agent --mode vm --vsock-port 5000
-Restart=always
-RestartSec=1
-
-[Install]
-WantedBy=sysinit.target
-EOF
 ln -s ../cats-guest-agent.service \
   "$RF/etc/systemd/system/sysinit.target.wants/cats-guest-agent.service"
 ln -sf /lib/systemd/system/multi-user.target "$RF/etc/systemd/system/default.target"

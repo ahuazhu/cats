@@ -41,8 +41,8 @@ Secrets Manager secret and SSM State Manager association. The bundle digest is
 verified before installing `cats-noded`, `cats-blockd`, `cats-guest-agent` and
 the systemd unit. **The bundle carries binaries only — not the Guest
 boot artifacts.** A change to the golden root (`metal/build-guest-image.sh`,
-the Guest systemd units, or anything the Guest Agent needs baked into
-`rootfs.ext4`) does
+the Guest units under `metal/guest-systemd/`, or anything the Guest Agent needs
+baked into `rootfs.ext4`) does
 not ship with a worker release: rebuild the image on the Host with
 `OUT=/opt/cats/guest metal/build-guest-image.sh` — the Guest kernel is the
 Host's own, which is why this is not a CI artifact — and then restart

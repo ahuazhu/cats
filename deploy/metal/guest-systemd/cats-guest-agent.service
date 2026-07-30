@@ -1,0 +1,15 @@
+[Unit]
+Description=Cats Guest Agent
+DefaultDependencies=no
+Requires=cats-grow-root.service cats-network.service
+After=cats-grow-root.service cats-network.service systemd-remount-fs.service
+Before=sysinit.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/cats-guest-agent --mode vm --vsock-port 5000
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=sysinit.target

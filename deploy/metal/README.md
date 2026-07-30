@@ -77,7 +77,8 @@ tap `/30` 配置和 Guest Agent 是 `sysinit.target` 之前的早期 unit，所�
 readiness 不等待完整 multi-user transaction。未使用的 serial getty、wait-online 和
 apt timer 已 mask。golden root 默认 512 MiB，首次启动会把 ext4 在线扩到用户请求的
 RootDisk 大小；因此生产创建建议至少 1 GiB。`GUEST_INIT_MODE=direct` 仅用于复现
-历史实验，不是默认产品形态。
+历史实验，不是默认产品形态。Guest unit 的源码位于 `guest-systemd/`，镜像构建脚本
+只负责把它们安装到 rootfs。
 
 `cats-noded` 启动时默认探测 Host 的逻辑 CPU 与内存总量作为可调度容量；管理员页面
 同时展示 Host CPU、内存和节点状态目录所在文件系统的实时使用量。若需要给 Host
