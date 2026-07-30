@@ -1,0 +1,4 @@
+phase,cycle,duration_us,boot_id_before,boot_id_after,boot_preserved,canary_ok
+suspend_resume,0,3907499,cd96d496-178c-4a93-8240-6f4b4e24b8fa,cd96d496-178c-4a93-8240-6f4b4e24b8fa,true,true
+warm_restore,0,1379031,cd96d496-178c-4a93-8240-6f4b4e24b8fa,cd96d496-178c-4a93-8240-6f4b4e24b8fa,true,true
+cold_restart,0,10430385,cd96d496-178c-4a93-8240-6f4b4e24b8fa,3305886f-5b79-4e13-8939-a7ccd17c8ded,false,true

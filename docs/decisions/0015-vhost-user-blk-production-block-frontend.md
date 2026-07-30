@@ -101,6 +101,30 @@ vhost-user 没有内核设备可以变成孤儿。
 soak** —— 现有数据是 fio 2 轮中位数、生命周期 3 次中位数、并发单样本,不够 SLA 级别。在那之前
 默认值保持 `kernel-nbd`。
 
+**2026-07-30 多样本 soak 的正确性部分通过，但原 fsync A/B 作废。**真实
+KVM/Cloud Hypervisor、S3/RDS 上，50 次 Suspend/Resume、30 次 Warm/Restore、
+10 次 Cold、8-Cat cold launch + concurrent Warm restore、seed/NBD/Guest 三方
+摘要和“vhost run 不分配 `/dev/nbd`”均已通过。
+
+同轮曾记录下面的 Guest `pwrite(4 KiB) + fsync` 数字：
+
+| block path | P50 | P95 | P99 | Max | `> 4 ms` |
+|---|---:|---:|---:|---:|---:|
+| vhost-user | 1.111 ms | 1.616 ms | **70.137 ms** | **128.403 ms** | 13/1,000 |
+| kernel-NBD (`direct=off`) | 1.219 ms | 1.391 ms | **2.112 ms** | **3.063 ms** | 0/1,000 |
+
+但这不是有效的前端 A/B：runner 把约 14 GiB Cargo target 与 Cats state 放在同一
+ext4/NVMe，vhost-user 总是在构建和失败尝试后先跑，kernel-NBD 约 19 分钟后才跑；
+Dirty 一度仍约 4.7 GiB，且没有 ABBA/随机顺序。后续 strace 把慢时间定位到
+`fdatasync(temp pack) → rename → fsync(pending dir)`，没有定位到 vhost-user
+notification/EVENT_IDX。完整证据和纠偏见
+[`vhost-user-soak-20260730`](../../experiments/vhost-user-soak-20260730/README.md)。
+
+因此正确性 soak 不再是阻断项，但性能翻转门仍未关闭。必须把构建 target 移出被测
+NVMe、固定缓存/Dirty 状态，以 ABBA 或随机顺序重新测相同 end-to-end 边界；在此之前
+继续以 `kernel-nbd` 为默认，vhost-user 保持显式选项。不能再引用 70.137 ms 对
+2.112 ms 作为前端差异。
+
 **上一次(同日早些时候)那轮复测作废**,留作记录:那轮把 ChunkStore 的本地 cache 落在了 EBS
 而不是实例 NVMe,对象存储也换成了 S3,所以绝对值既不能引用也不能和 2026-07-26 的表比
 ([原始数据](../../experiments/vhost-user-blk-frontend-20260726/raw/metal-blockpath-fio-rerun.log)

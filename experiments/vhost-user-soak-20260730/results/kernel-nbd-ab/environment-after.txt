@@ -1,0 +1,8 @@
+finished_at=2026-07-30T10:30:51,235674512+00:00
+exit_status=0
+mount=/dev/nvme3n1 ext4 rw,noatime
+worker_active=active
+blockd_processes=6
+vmm_processes=6
+active_nbd=nbd0 nbd1 nbd2 nbd3 nbd4
+load=0.45 0.98 1.59 1/1434 600185

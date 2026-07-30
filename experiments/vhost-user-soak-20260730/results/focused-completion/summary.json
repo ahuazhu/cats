@@ -1,0 +1,125 @@
+{
+  "backlog": {
+    "max_oldest_age_ms": 850,
+    "max_unpublished_bytes": 8496634,
+    "max_unpublished_generations": 14,
+    "saw_backpressure": false,
+    "saw_publish_error": false
+  },
+  "burst_final_drain_us": 730330,
+  "concurrency": {
+    "cats": 8,
+    "cold_launch_per_cat": {
+      "count": 8,
+      "max_us": 10468152,
+      "p50_us": 9783155,
+      "p95_us": 10468152,
+      "p99_us": 10468152
+    },
+    "cold_launch_wall_us": 10468647,
+    "warm_restore_per_cat": {
+      "count": 8,
+      "max_us": 429764,
+      "p50_us": 359005,
+      "p95_us": 429764,
+      "p99_us": 429764
+    },
+    "warm_restore_wall_us": 430339
+  },
+  "environment": {
+    "active_nbd_after_bench_start": [
+      "nbd0",
+      "nbd1",
+      "nbd2",
+      "nbd3",
+      "nbd4"
+    ],
+    "active_nbd_after_launches": [
+      "nbd0",
+      "nbd1",
+      "nbd2",
+      "nbd3",
+      "nbd4"
+    ],
+    "active_nbd_before": [
+      "nbd0",
+      "nbd1",
+      "nbd2",
+      "nbd3",
+      "nbd4"
+    ],
+    "block_path": "vhost-user",
+    "s3_prefix": "cats-soak/relaxed-vhost-fixed-20260730T092859Z",
+    "state_dir": "/var/lib/cats/soak-runs/relaxed-vhost-fixed-20260730T092859Z/state",
+    "vhost_user_queues": 1
+  },
+  "lifecycle": {
+    "canary_sha256": "1cc5926b94c7123eaad899e58647eb35ce7da75eb943766dd5c3af3bbc2c8f8a",
+    "cold_start": {
+      "count": 2,
+      "max_us": 9847416,
+      "p50_us": 9487896,
+      "p95_us": 9847416,
+      "p99_us": 9847416
+    },
+    "cold_stop": {
+      "count": 2,
+      "max_us": 959351,
+      "p50_us": 494635,
+      "p95_us": 959351,
+      "p99_us": 959351
+    },
+    "restore": {
+      "count": 2,
+      "max_us": 288159,
+      "p50_us": 277667,
+      "p95_us": 288159,
+      "p99_us": 288159
+    },
+    "suspend": {
+      "count": 2,
+      "max_us": 4472897,
+      "p50_us": 3161805,
+      "p95_us": 4472897,
+      "p99_us": 4472897
+    },
+    "warm": {
+      "count": 2,
+      "max_us": 673658,
+      "p50_us": 550358,
+      "p95_us": 673658,
+      "p99_us": 673658
+    }
+  },
+  "local_flush": {
+    "count": 20,
+    "max_us": 216121,
+    "p50_us": 80655,
+    "p95_us": 200489,
+    "p99_us": 216121
+  },
+  "local_write_plus_flush": {
+    "count": 20,
+    "max_us": 216141,
+    "p50_us": 80696,
+    "p95_us": 200518,
+    "p99_us": 216141
+  },
+  "remote_drain": {
+    "count": 10,
+    "max_us": 438222,
+    "p50_us": 236431,
+    "p95_us": 438222,
+    "p99_us": 438222
+  },
+  "remote_phase_local_flush": {
+    "count": 10,
+    "max_us": 84521,
+    "p50_us": 80777,
+    "p95_us": 84521,
+    "p99_us": 84521
+  },
+  "remote_timer_races": 0,
+  "run_id": "relaxed-vhost-fixed-20260730T092859Z",
+  "single_create_us": 15446363
+}

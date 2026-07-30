@@ -1,0 +1,2 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.20s
+  Executable tests/metal_vhost_soak.rs (/var/lib/cats/soak-runs/relaxed-vhost-fixed-20260730T092859Z/target/release/deps/metal_vhost_soak-7e3d273ce74c5f78)
