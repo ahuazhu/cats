@@ -331,6 +331,13 @@ fn full_lifecycle_ladder_with_boot_id_oracles() {
         GuestClient::connect(&env.state_dir.join("cats").join(CAT).join("ctl.sock")).is_err(),
         "guest must be gone while Warm"
     );
+    let cat_dir = env.state_dir.join("cats").join(CAT);
+    for socket in ["nbd-root.sock", "ctl-root.sock"] {
+        assert!(
+            std::fs::symlink_metadata(cat_dir.join(socket)).is_err(),
+            "Warm retained the stale blockd socket link {socket}"
+        );
+    }
 
     let res = env.runtime.execute(simple(
         1,

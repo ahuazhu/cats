@@ -104,6 +104,27 @@ impl BlockdProc {
             None => bail!("drain of {} failed: {}", self.grant.disk_id, line.trim()),
         }
     }
+
+    fn remove_socket_files(&self, cat_dir: &Path) {
+        let disk_id = &self.grant.disk_id;
+        for socket in [
+            Some(&self.socket),
+            self.vhost_user_socket.as_ref(),
+            Some(&self.control_socket),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = std::fs::remove_file(socket);
+        }
+        for link in [
+            cat_dir.join(format!("nbd-{disk_id}.sock")),
+            cat_dir.join(format!("vhu-{disk_id}.sock")),
+            cat_dir.join(format!("ctl-{disk_id}.sock")),
+        ] {
+            let _ = std::fs::remove_file(link);
+        }
+    }
 }
 
 struct CatRuntime {
@@ -1442,13 +1463,11 @@ impl NodeRuntime {
                 ch::remove_network(chc, network);
             }
         }
+        let cat_dir = rt.dir.clone();
         for (_, mut p) in rt.blockds.drain() {
             let _ = p.child.kill();
             let _ = p.child.wait();
-            let _ = std::fs::remove_file(&p.socket);
-            if let Some(socket) = &p.vhost_user_socket {
-                let _ = std::fs::remove_file(socket);
-            }
+            p.remove_socket_files(&cat_dir);
         }
         if let Some(chrt) = &mut rt.ch {
             let _ = std::fs::remove_file(&chrt.api_sock);
@@ -1694,9 +1713,11 @@ impl NodeRuntime {
                     ch::nbd_detach(chc, dev);
                 }
             }
+            let cat_dir = rt.dir.clone();
             for (_, mut p) in rt.blockds.drain() {
                 let _ = p.child.kill();
                 let _ = p.child.wait();
+                p.remove_socket_files(&cat_dir);
             }
             if let Some(chrt) = &mut rt.ch {
                 chrt.snapshot_dir = Some(snap_dir);
@@ -1717,9 +1738,11 @@ impl NodeRuntime {
             let _ = g.kill();
             let _ = g.wait();
         }
+        let cat_dir = rt.dir.clone();
         for (_, mut p) in rt.blockds.drain() {
             let _ = p.child.kill();
             let _ = p.child.wait();
+            p.remove_socket_files(&cat_dir);
         }
         rt.state = ObservedState::Warm;
         Ok(ObservedState::Warm)
