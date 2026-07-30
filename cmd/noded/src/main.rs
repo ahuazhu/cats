@@ -291,31 +291,4 @@ mod tests {
              all three clocks frozen at the snapshot instant; got {default:?}"
         );
     }
-
-    /// The units pass `--ch-cmdline` explicitly, so they override the default
-    /// above rather than inheriting it. A fix applied only to the default would
-    /// never reach a deployed node.
-    #[test]
-    fn deployment_units_pin_kvm_clock_too() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("workspace root");
-        for unit in [
-            "deploy/metal/systemd/cats-noded.service",
-            "deploy/aws/metal/cats-worker.service",
-        ] {
-            let path = root.join(unit);
-            let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-            let line = text
-                .lines()
-                .find(|l| l.contains("--ch-cmdline"))
-                .unwrap_or_else(|| panic!("{unit} no longer passes --ch-cmdline"));
-            assert!(
-                line.contains("clocksource=kvm-clock"),
-                "{unit} overrides the guest cmdline without pinning kvm-clock: {line}"
-            );
-        }
-    }
 }

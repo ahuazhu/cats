@@ -55,13 +55,15 @@ Warm 的 Cat 在 24 小时后进入 Cold。计时从 observed state 提交时开
 
 ## 绝对到期时间
 
-Cat 可以携带一个绝对到期时间：时间一到，控制面就按 `cats destroy` 的语义删除它。RootDisk 随之删除，PersistentDisk 存续。临时环境（CI 预览、演示）因此不需要外部 sweeper 来回收。
+Cat 可以携带一个绝对到期时间：时间一到，控制面就按 `cats destroy` 的语义删除它。RootDisk 随之删除，PersistentDisk 存续。回收发生在控制面内部，不需要外部 sweeper 记账。
 
-    cats create preview --expires-in 28800
-    cats expiry preview                 # 查看
-    cats expiry preview --in 28800     # 续期：从现在起再 8 小时
-    cats expiry preview --at 1790000000
-    cats expiry preview --never        # 永久保留
+    cats create scratch --expires-in 28800
+    cats expiry scratch                 # 查看
+    cats expiry scratch --in 28800      # 续期：从现在起再 8 小时
+    cats expiry scratch --at 1790000000
+    cats expiry scratch --never         # 永久保留
+
+`cats ls` 每一行都会显示 `expires=`，值是剩余时间、`never` 或 `overdue`。
 
 续期就是写一个新的绝对时间（`PUT /cats/{cat}/expiry`），重试与重放无需额外规则。没有到期时间的 Cat 永不过期。
 

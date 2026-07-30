@@ -16,6 +16,7 @@
 | [`dozing-memory-reclaim-20260727/`](dozing-memory-reclaim-20260727/) | 不暂停虚拟机、只回收它的内存能省多少（结论：最多 44%，而现有的暂停+踢出内存省 99.98%，所以不值得做成新档位）；附带测出 halt-polling 不是问题、以及定时任务在纯 guest 侧回收下精度不受影响 | [`README`](dozing-memory-reclaim-20260727/README.md) |
 | [`suspend-clock-semantics-20260727/`](suspend-clock-semantics-20260727/) | Cat 暂停期间 guest 的三个时钟走不走（结论：Suspended 下全都照走，所以"控制面只叫醒、guest 自己发现该干活"这个架构成立；但 Warm 下三个时钟全部冻结且漂移累加）；同时量出 Java `fixedRate` 醒来会补跑「睡眠时长÷周期」次，240 秒暂停挤出 12 次 | [`README`](suspend-clock-semantics-20260727/README.md) |
 | [`vhost-user-soak-20260730/`](vhost-user-soak-20260730/) | vhost-user-blk 生命周期正确性 soak、被同盘构建负载污染的 fsync A/B 结论撤回，以及 host 端 pack 持久化 syscall 尾延迟定位；公平 ABBA 复测仍待执行 | [`README`](vhost-user-soak-20260730/README.md) |
+| [`systemd-pid1-20260730/`](systemd-pid1-20260730/) | systemd PID 1 与 direct-init 的真实 KVM 生命周期 A/B，以及普通 enabled Linux service 跨 Warm 保持、跨 Cold 重启的行为证明 | [`README`](systemd-pid1-20260730/README.md) |
 
 ## 2026-07-21 正式结果
 

@@ -673,6 +673,7 @@ COMMIT;
         <article class="card"><h3>系统镜像流水线</h3><ol><li>从固定上游 digest 构建 rootfs。</li><li>安装 Guest Agent、CA、基础诊断工具。</li><li>生成 ext4 Golden Root；清理 machine-id、SSH host key 等实例身份。</li><li>生成 manifest：kernel ABI、agent version、filesystem UUID policy。</li><li>漏洞扫描、SBOM、签名。</li><li>写入不可变 digest；通过 channel 指针推广 dev → canary → stable。</li></ol></article>
         <article class="card"><h3>Cat 启动</h3><ol><li>Image digest 决定 Kernel/Root 基线，不读取 mutable tag。</li><li>RootDisk 使用 CoW clone，避免复制整个镜像。</li><li>实例 metadata 使用只读 config device 或 vsock 提供。</li><li>Secret 在 Guest Ready 后用一次性加密 session 注入。</li><li>Guest Agent 建立 readiness；用户服务是否 Ready 单独判断。</li><li>升级系统通过新建 Cat 或显式 image rebase，不静默替换用户 RootDisk。</li></ol></article>
       </div>
+      <p>默认 Ubuntu Guest 以 systemd 为 PID 1（ADR-0023）。RootDisk 扩容、确定性 tap 配置和 Guest Agent 是 <code>sysinit.target</code> 前的早期 unit；普通 enabled user service 继续按标准 <code>multi-user.target</code> 启动。平台 readiness 只等待 Guest Agent，不把完整 systemd transaction 或所有用户服务混成同一个边界。</p>
 
       <h3 style="margin-top:28px">11.1 两种工作负载交付方式</h3>
       <div class="table-wrap">
@@ -1028,7 +1029,7 @@ NodeJobResult {
             <tr><td><code>control-plane/</code></td><td>Resource API、Operation、Scheduler、Controllers、PostgreSQL/outbox</td><td>单节点 create → run → stop → start reconcile 闭环</td></tr>
             <tr><td><code>node-agent/</code></td><td>Cloud Hypervisor、cgroup、tap、blockd 和 Guest Agent 生命周期</td><td>mTLS Job、job journal、inventory 重建、Cold fallback</td></tr>
             <tr><td><code>blockd/</code></td><td>vhost-user-blk、Cache、Chunk/Manifest、FLUSH、lease/fencing</td><td>先复用 lazy-ext4 oracle 完成单写和 crash consistency</td></tr>
-            <tr><td><code>guest/</code></td><td>versioned kernel、initramfs、PID 1 / Guest Agent</td><td>direct boot、vsock readiness、mount/sync/resize</td></tr>
+            <tr><td><code>guest/</code></td><td>versioned kernel、initramfs、systemd PID 1 / Guest Agent</td><td>direct boot、early-unit vsock readiness、mount/sync/resize</td></tr>
             <tr><td><code>network/</code></td><td>Node gateway、Endpoint route、TLS、private network</td><td>一个 Cat 的 HTTP/WS 和 shell/exec 稳定路由</td></tr>
             <tr><td><code>experiments/</code></td><td>机制验证、原始 CSV、故障现场</td><td>继续作为证据，不被生产代码依赖</td></tr>
           </tbody>
