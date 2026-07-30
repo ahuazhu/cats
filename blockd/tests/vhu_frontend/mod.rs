@@ -169,7 +169,9 @@ impl BlkFrontend {
             .get_features()
             .map_err(|e| other(format!("GET_FEATURES: {e}")))?;
         if backend_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() == 0 {
-            return Err(other("backend does not offer VHOST_USER_F_PROTOCOL_FEATURES"));
+            return Err(other(
+                "backend does not offer VHOST_USER_F_PROTOCOL_FEATURES",
+            ));
         }
         if backend_features & VIRTIO_F_VERSION_1 == 0 {
             return Err(other("backend does not offer VIRTIO_F_VERSION_1"));
@@ -385,7 +387,14 @@ impl BlkQueue {
         in_len: usize,
         out_chunks: usize,
     ) -> io::Result<Pending> {
-        self.submit_inner(request_type, sector, Some(out), out.len(), in_len, out_chunks)
+        self.submit_inner(
+            request_type,
+            sector,
+            Some(out),
+            out.len(),
+            in_len,
+            out_chunks,
+        )
     }
 
     fn submit_inner(
@@ -481,7 +490,11 @@ impl BlkQueue {
             .map_err(|e| other(format!("publish avail entry: {e}")))?;
         self.avail_idx = self.avail_idx.wrapping_add(1);
         self.mem
-            .store(self.avail_idx, GuestAddress(self.ring.avail + 2), Ordering::Release)
+            .store(
+                self.avail_idx,
+                GuestAddress(self.ring.avail + 2),
+                Ordering::Release,
+            )
             .map_err(|e| other(format!("publish avail index: {e}")))?;
         if self.event_idx {
             // Ask to be notified as soon as the next used entry lands.

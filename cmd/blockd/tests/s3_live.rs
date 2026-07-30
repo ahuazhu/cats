@@ -101,7 +101,7 @@ fn engine_flush_and_empty_cache_restore_through_live_s3() {
         .unwrap();
         engine.write(4096, &payload).unwrap();
         assert_eq!(engine.flush().unwrap(), 1);
-        engine.detach();
+        engine.detach().unwrap();
     }
     // Fresh "host", empty cache: everything must come back from S3.
     let engine = ChunkEngine::attach(
@@ -113,5 +113,5 @@ fn engine_flush_and_empty_cache_restore_through_live_s3() {
     let mut back = vec![0u8; payload.len()];
     engine.read(4096, &mut back).unwrap();
     assert_eq!(back, payload, "cold restore through live S3 lost data");
-    engine.detach();
+    engine.detach().unwrap();
 }
