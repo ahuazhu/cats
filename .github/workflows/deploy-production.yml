@@ -214,13 +214,13 @@ jobs:
           set -euo pipefail
           required_schema="$(
             sed -nE \
-              's/^const SCHEMA_VERSION: i64 = ([0-9]+);$/\1/p' \
-              control-plane/src/store.rs
+              's/^(pub\(super\)[[:space:]]+)?const[[:space:]]+SCHEMA_VERSION:[[:space:]]+i64[[:space:]]+=[[:space:]]+([0-9]+);$/\2/p' \
+              control-plane/src/store/schema.rs
           )"
           oldest_migratable="$(
             sed -nE \
-              's/^const OLDEST_MIGRATABLE_SCHEMA_VERSION: i64 = ([0-9]+);$/\1/p' \
-              control-plane/src/store.rs
+              's/^(pub\(super\)[[:space:]]+)?const[[:space:]]+OLDEST_MIGRATABLE_SCHEMA_VERSION:[[:space:]]+i64[[:space:]]+=[[:space:]]+([0-9]+);$/\2/p' \
+              control-plane/src/store/schema.rs
           )"
           if [[ ! "$required_schema" =~ ^[0-9]+$ ]]; then
             echo "::error::Could not read control-plane SCHEMA_VERSION"
