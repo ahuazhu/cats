@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::process::Command;
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -177,4 +179,130 @@ fn metal_acceptance_drives_real_mount_propagation_and_postgresql() {
             "metal mount-propagation acceptance driver lost fragment {required:?}"
         );
     }
+}
+
+#[test]
+fn production_worker_bundle_updates_guest_seed_before_restart() {
+    let dockerfile = read_workspace_file("deploy/aws/Dockerfile.worker-artifact");
+    for required in [
+        "COPY deploy/aws/metal/update-guest-seed.sh /out/update-guest-seed.sh",
+        "COPY deploy/metal/guest-systemd /out/guest-systemd",
+        "COPY --from=builder /out/update-guest-seed.sh /update-guest-seed.sh",
+        "COPY --from=builder /out/guest-systemd /guest-systemd",
+    ] {
+        assert!(
+            dockerfile.contains(required),
+            "worker artifact lost guest-seed payload fragment {required:?}"
+        );
+    }
+
+    let deployment =
+        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
+    let update = deployment
+        .find("# Replace the golden RootDisk immediately before restarting the node.")
+        .expect("worker deployment has the guest-seed update phase");
+    let restart = deployment
+        .find("systemctl restart cats-worker")
+        .expect("worker deployment restarts cats-worker");
+    assert!(
+        update < restart
+            && deployment[update..restart]
+                .contains("\"${var.install_root}/bin/update-guest-seed\""),
+        "worker must invoke the guest-seed updater immediately before restart"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_release_atomically_updates_the_cloud_hypervisor_guest_seed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("temporary deployment fixture");
+    let old_root = temp.path().join("old-root");
+    for directory in [
+        "usr/bin",
+        "etc/systemd/system/sysinit.target.wants",
+        "etc/systemd/system",
+    ] {
+        std::fs::create_dir_all(old_root.join(directory)).expect("create seed directory");
+    }
+    std::fs::write(old_root.join("usr/bin/cats-guest-agent"), b"old-agent")
+        .expect("write old guest agent");
+
+    let seed = temp.path().join("rootfs.ext4");
+    let seed_file = std::fs::File::create(&seed).expect("create seed image");
+    seed_file
+        .set_len(32 * 1024 * 1024)
+        .expect("size seed image");
+    let mkfs = Command::new("mkfs.ext4")
+        .args(["-q", "-F", "-d"])
+        .arg(&old_root)
+        .arg(&seed)
+        .status()
+        .expect("run mkfs.ext4");
+    assert!(mkfs.success(), "mkfs.ext4 failed");
+
+    let new_agent = temp.path().join("cats-guest-agent");
+    std::fs::write(&new_agent, b"new-agent").expect("write new guest agent");
+    let mut permissions = std::fs::metadata(&new_agent)
+        .expect("read new guest agent metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&new_agent, permissions).expect("make guest agent executable");
+
+    let updater = workspace_root().join("deploy/aws/metal/update-guest-seed.sh");
+    let units = workspace_root().join("deploy/metal/guest-systemd");
+    for pass in 0..2 {
+        let output = Command::new(&updater)
+            .arg(&seed)
+            .arg(&new_agent)
+            .arg(&units)
+            .output()
+            .unwrap_or_else(|error| panic!("run seed updater pass {pass}: {error}"));
+        assert!(
+            output.status.success(),
+            "seed updater pass {pass} failed: stdout={:?}, stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let dumped_agent = temp.path().join("dumped-agent");
+    let dump_request = format!("dump /usr/bin/cats-guest-agent {}", dumped_agent.display());
+    let dump = Command::new("debugfs")
+        .args(["-R", &dump_request])
+        .arg(&seed)
+        .output()
+        .expect("dump updated guest agent");
+    assert!(
+        dump.status.success(),
+        "debugfs dump failed: {}",
+        String::from_utf8_lossy(&dump.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&dumped_agent).expect("read dumped guest agent"),
+        b"new-agent"
+    );
+
+    let stat = Command::new("debugfs")
+        .args([
+            "-R",
+            "stat /etc/systemd/system/sysinit.target.wants/cats-mount-propagation.service",
+        ])
+        .arg(&seed)
+        .output()
+        .expect("stat mount-propagation symlink");
+    let stat_output = String::from_utf8_lossy(&stat.stdout);
+    assert!(
+        stat.status.success()
+            && stat_output.contains("Type: symlink")
+            && stat_output.contains("../cats-mount-propagation.service"),
+        "mount-propagation symlink is wrong: stdout={stat_output:?}, stderr={:?}",
+        String::from_utf8_lossy(&stat.stderr)
+    );
+
+    assert!(
+        seed.with_extension("ext4.previous").is_file(),
+        "updater did not preserve the previous seed"
+    );
 }

@@ -275,9 +275,12 @@ reviewed `linux/amd64` bundle, supplies its absolute path and SHA-256, and
 Terraform uploads it under a content-addressed S3 key. The EC2 role may read
 only worker artifacts and the dedicated Secrets Manager runtime secret.
 An SSM State Manager association downloads the bundle, verifies the digest,
-installs the binaries/unit, creates the delegated metering cgroup root and
-restarts `cats-worker`. Do not copy production binaries or edit `worker.env`
-manually; update the bundle digest or secret input and apply Terraform.
+installs the host binaries/unit, atomically updates the Cloud Hypervisor guest
+seed with the matching Guest Agent and systemd units, creates the delegated
+metering cgroup root and restarts `cats-worker`. The previous guest seed stays
+at `rootfs.ext4.previous` for recovery. Do not copy production binaries, patch
+the seed, or edit `worker.env` manually; update the bundle digest or secret
+input and apply Terraform.
 
 ## PostgreSQL split runbook
 

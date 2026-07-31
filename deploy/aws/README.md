@@ -39,17 +39,22 @@ manually.
 Production worker releases use the Terraform-managed artifact bucket,
 Secrets Manager secret and SSM State Manager association. The bundle digest is
 verified before installing `cats-noded`, `cats-blockd`, `cats-guest-agent` and
-the systemd unit. **The bundle carries binaries only — not the Guest
-boot artifacts.** A change to the golden root (`metal/build-guest-image.sh`,
-the Guest units under `metal/guest-systemd/`, or anything the Guest Agent needs
-baked into `rootfs.ext4`) does
-not ship with a worker release: rebuild the image on the Host with
-`OUT=/opt/cats/guest metal/build-guest-image.sh` — the Guest kernel is the
-Host's own, which is why this is not a CI artifact — and then restart
-`cats-worker`. The restart is required, not cosmetic: `ensure_image_published`
-caches the golden root's image id for the life of the node process, so a
-rebuilt image is otherwise ignored. Existing Cats keep their current root until
-they are recreated. `metal/install-worker.sh` remains a bootstrap/development
+the worker systemd unit. The same bundle carries the Guest Agent and standalone
+Guest systemd units as a golden-root payload. The association patches them
+into a private copy of `rootfs.ext4`, verifies the ext4 image, preserves
+`rootfs.ext4.previous`, atomically replaces the seed and immediately restarts
+`cats-worker`. The restart is required, not cosmetic:
+`ensure_image_published` caches the golden root's image id for the life of the
+node process, so an updated image is otherwise ignored. Existing Cats keep
+their current root until they are recreated.
+
+The bundle does **not** carry the Host kernel, initramfs or a freshly
+debootstrapped Ubuntu filesystem. Changes to those parts of
+`metal/build-guest-image.sh` (including the base package set,
+`cats-init` or `cats-network-setup`) still require rebuilding on the Host with
+`OUT=/opt/cats/guest metal/build-guest-image.sh`, followed by a worker restart;
+the Guest kernel is the Host's own, which is why the complete boot artifact is
+not built in CI. `metal/install-worker.sh` remains a bootstrap/development
 helper. Cloud Hypervisor stays under `/opt/cats/bin` so it does not replace a
 host-wide binary used by another workload. The S3 adapter uses the EC2
 instance role and refreshes its temporary credentials; no long-lived AWS key is

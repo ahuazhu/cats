@@ -5,9 +5,9 @@ name: Release
 #   * the control-plane container image (cats-controld + cats-gatewayd),
 #     pushed to ECR; its immutable digest is what the application stack's
 #     tfvars must reference.
-#   * the metal worker bundle (cats-noded + cats-blockd + cats-guest-agent +
-#     the systemd unit) as a tar.zst plus SHA-256, which the infrastructure
-#     stack uploads to the content-addressed artifact bucket.
+#   * the metal worker bundle (host binaries, guest-agent + guest units, seed
+#     updater and the worker systemd unit) as a tar.zst plus SHA-256, which the
+#     infrastructure stack uploads to the content-addressed artifact bucket.
 #
 # Authentication is GitHub OIDC into an AWS role; no long-lived access key is
 # stored in the repository. The role is created by the platform stack.
@@ -105,7 +105,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       # Dockerfile.worker-artifact's final stage is FROM scratch, so exporting
-      # it to the local filesystem yields exactly the four files to ship.
+      # it to the local filesystem yields exactly the reviewed release payload.
       - name: Build worker binaries
         uses: docker/build-push-action@v6
         with:

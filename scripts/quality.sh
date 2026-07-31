@@ -174,7 +174,9 @@ run_linux() {
     -v cats-cargo-registry:/usr/local/cargo/registry \
     -v "$target_volume:/target" \
     rust:1.97.1-bookworm \
-    sh -c 'rustup component add clippy rustfmt &&
+    sh -c 'apt-get update -qq &&
+           apt-get install -qy --no-install-recommends e2fsprogs &&
+           rustup component add clippy rustfmt &&
            ./scripts/quality.sh skills &&
            cargo fmt --all -- --check &&
            cargo check --workspace --all-targets --locked --target-dir /target &&
