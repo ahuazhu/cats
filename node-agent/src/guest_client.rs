@@ -8,10 +8,9 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use cats_api::guest::{
-    GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody, GuestShellFrame,
-    GuestWorkStatus,
+    read_frame, write_frame, GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody,
+    GuestShellFrame, GuestWorkStatus,
 };
-use cats_guest_agent::{read_frame, write_frame};
 
 pub struct GuestClient {
     stream: UnixStream,
@@ -254,8 +253,9 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::thread;
 
-    use cats_api::guest::{GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody};
-    use cats_guest_agent::{read_frame, write_frame};
+    use cats_api::guest::{
+        read_frame, write_frame, GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody,
+    };
 
     use super::GuestClient;
 

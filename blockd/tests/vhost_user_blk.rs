@@ -15,8 +15,9 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use cats_block_client::NbdClient;
 use cats_blockd::engine::{ChunkEngine, EngineConfig, EngineError};
-use cats_blockd::nbd::{self, NbdClient};
+use cats_blockd::nbd;
 use cats_blockd::vhost_user::{self, VhostUserOptions};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_object_store_file::FileBlobStore;

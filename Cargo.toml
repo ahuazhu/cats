@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "api",
+    "block-client",
     "metering",
     "blockd",
     "storage",
@@ -30,6 +31,7 @@ rust-version = "1.97"
 
 [workspace.dependencies]
 cats-api = { path = "api" }
+cats-block-client = { path = "block-client" }
 cats-metering = { path = "metering" }
 cats-blockd = { path = "blockd" }
 cats-storage = { path = "storage" }

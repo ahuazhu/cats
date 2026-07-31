@@ -13,6 +13,7 @@ cats-metering = { workspace = true }
 cats-control-plane = { workspace = true }
 cats-node-agent = { workspace = true }
 cats-blockd = { workspace = true }
+cats-block-client = { workspace = true }
 cats-network = { workspace = true }
 cats-storage = { workspace = true }
 cats-metadata-store-sqlite = { workspace = true }

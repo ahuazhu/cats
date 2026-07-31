@@ -15,7 +15,7 @@ path = "src/work_main.rs"
 
 [dependencies]
 cats-api = { workspace = true }
-cats-blockd = { workspace = true }
+cats-block-client = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

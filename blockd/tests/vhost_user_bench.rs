@@ -16,7 +16,7 @@
 //!
 //! * vhost-user-blk: virtqueue in shared memory + eventfd kick, exactly the
 //!   path a Guest driver uses.
-//! * NBD: this crate's userspace `NbdClient` over a Unix socket — one
+//! * NBD: `cats-block-client`'s userspace `NbdClient` over a Unix socket — one
 //!   `write`/`read` syscall pair per request, strictly one request in flight.
 //!
 //! The Phase A production path has an extra hop this harness does not model
@@ -35,8 +35,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cats_block_client::NbdClient;
 use cats_blockd::engine::{ChunkEngine, EngineConfig};
-use cats_blockd::nbd::{self, NbdClient};
+use cats_blockd::nbd;
 use cats_blockd::vhost_user::{self, VhostUserOptions};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_object_store_file::FileBlobStore;

@@ -1,4 +1,6 @@
 use super::*;
+use cats_api::blockd::{BlockdControlCommand, BlockdControlResponse, DurabilityStatus};
+use cats_block_client::NbdClient;
 
 pub(super) struct BlockdProc {
     pub(super) child: Child,
@@ -24,7 +26,7 @@ impl BlockdProc {
     fn command(
         control_socket: &Path,
         disk_id: &str,
-        command: &str,
+        command: BlockdControlCommand,
         read_timeout: Duration,
     ) -> Result<String> {
         use std::io::{BufRead, BufReader, Write};
@@ -32,13 +34,15 @@ impl BlockdProc {
             .with_context(|| format!("connect blockd control for {disk_id}"))?;
         stream.set_read_timeout(Some(read_timeout))?;
         stream.set_write_timeout(Some(BLOCKD_CONTROL_WRITE_TIMEOUT))?;
-        stream.write_all(command.as_bytes())?;
+        stream.write_all(command.as_wire().as_bytes())?;
         stream.write_all(b"\n")?;
         let mut line = String::new();
         BufReader::new(stream).read_line(&mut line)?;
-        match line.trim().strip_prefix("OK ") {
-            Some(payload) => Ok(payload.to_string()),
-            None => bail!("{command} of {disk_id} failed: {}", line.trim()),
+        match BlockdControlResponse::parse_wire(&line) {
+            Ok(BlockdControlResponse::Ok(payload)) => Ok(payload),
+            Ok(BlockdControlResponse::Error(_)) | Err(_) => {
+                bail!("{command} of {disk_id} failed: {}", line.trim())
+            }
         }
     }
 
@@ -50,15 +54,26 @@ impl BlockdProc {
     }
 
     pub(super) fn drain_at(control_socket: &Path, disk_id: &str) -> Result<()> {
-        Self::command(control_socket, disk_id, "drain", BLOCKD_DRAIN_TIMEOUT).map(|_| ())
+        Self::command(
+            control_socket,
+            disk_id,
+            BlockdControlCommand::Drain,
+            BLOCKD_DRAIN_TIMEOUT,
+        )
+        .map(|_| ())
     }
 
     pub(super) fn durability_status_at(
         control_socket: &Path,
         disk_id: &str,
     ) -> Result<DiskDurabilityTelemetry> {
-        let payload = Self::command(control_socket, disk_id, "status", BLOCKD_STATUS_TIMEOUT)?;
-        let status: cats_blockd::engine::DurabilityStatus =
+        let payload = Self::command(
+            control_socket,
+            disk_id,
+            BlockdControlCommand::Status,
+            BLOCKD_STATUS_TIMEOUT,
+        )?;
+        let status: DurabilityStatus =
             serde_json::from_str(&payload).context("decode blockd durability status")?;
         Ok(DiskDurabilityTelemetry {
             disk_id: disk_id.to_string(),
@@ -264,7 +279,7 @@ impl NodeRuntime {
     fn wait_blockd_ready(&self, proc: &mut BlockdProc) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            if let Ok(client) = cats_blockd::nbd::NbdClient::connect_unix(&proc.socket) {
+            if let Ok(client) = NbdClient::connect_unix(&proc.socket) {
                 let _ = client.disconnect();
                 return Ok(());
             }

@@ -16,6 +16,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+pub use cats_api::blockd::{
+    DurabilityStatus, DEFAULT_MAX_LOCAL_BYTES, DEFAULT_MAX_STAGED_BYTES, DEFAULT_MAX_STAGED_PACKS,
+};
 use cats_api::chunk::{self, CHUNKS_PER_LEAF, CHUNK_SIZE};
 
 use crate::crashpoint;
@@ -39,8 +42,7 @@ use pack::{apply_local_entry, merge_dirty_range, DirtyByteRange, StagedPack, Sta
 use plan::{commit_workers, copy_planned_pages, plan_commit, ChunkPlan};
 use publish::{CommitterSignal, EAGER_DRAIN_WATERMARK, MAX_UPLOAD_CONCURRENCY};
 use quota::{pack_reservation_upper, punch_hole};
-pub use quota::{DEFAULT_MAX_LOCAL_BYTES, DEFAULT_MAX_STAGED_BYTES, DEFAULT_MAX_STAGED_PACKS};
-pub use status::{DurabilityMode, DurabilityStatus};
+pub use status::DurabilityMode;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {

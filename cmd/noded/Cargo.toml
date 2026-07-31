@@ -10,8 +10,8 @@ name = "cats-noded"
 path = "src/main.rs"
 
 [dependencies]
+cats-api = { workspace = true }
 cats-node-agent = { workspace = true }
-cats-blockd = { workspace = true }
 cats-storage = { workspace = true }
 cats-metadata-store-sqlite = { workspace = true }
 cats-metadata-store-postgres = { workspace = true }

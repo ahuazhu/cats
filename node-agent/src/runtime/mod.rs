@@ -35,12 +35,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
+use cats_api::guest::DiskMapEntry;
 use cats_api::nodejob::{
     JobPhase, NodeJob, NodeJobAction, NodeJobResult, SuspendWorkFence, VolumeGrant,
 };
 use cats_api::requests::{ProxyHttpRequest, ProxyHttpResponse};
 use cats_api::resources::{DiskDurabilityTelemetry, NodeTelemetry, ObservedState};
-use cats_guest_agent::DiskMapEntry;
 use cats_storage::AdapterSelection;
 
 use crate::admission::{resume_commitment_bytes, WakeAdmission, WakeBudget, WakeLoad};
