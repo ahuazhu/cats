@@ -97,13 +97,20 @@ impl ImageReference {
         {
             bail!("OCI registry must be a host with an optional port");
         }
+        let registry = if registry.eq_ignore_ascii_case("docker.io")
+            || registry.eq_ignore_ascii_case("index.docker.io")
+        {
+            "registry-1.docker.io".to_string()
+        } else {
+            registry.to_string()
+        };
         let scheme = if registry_url.host_str().is_some_and(is_loopback_host) {
             "http"
         } else {
             "https"
         };
         Ok(Self {
-            registry: registry.to_string(),
+            registry,
             repository: repository.to_string(),
             digest: digest.to_ascii_lowercase(),
             scheme,
@@ -1190,6 +1197,16 @@ mod tests {
             "ghcr.io/paperboy-ai/server?redirect=evil@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         )
         .is_err());
+
+        let docker_hub = ImageReference::parse(
+            "docker.io/library/busybox@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        assert_eq!(docker_hub.registry, "registry-1.docker.io");
+        assert_eq!(
+            docker_hub.base(),
+            "https://registry-1.docker.io/v2/library/busybox"
+        );
     }
 
     #[test]
