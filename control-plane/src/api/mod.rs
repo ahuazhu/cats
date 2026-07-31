@@ -27,6 +27,7 @@ use cats_api::metering::{
     CatUsageSummary, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse,
     UsageDetailLine, UsageMetric, UsageReport, UsageSummaryLine, UsageTimeBucket,
 };
+use cats_api::oci::{DeployOciRequest, OciDeployment};
 use cats_api::requests::*;
 use cats_api::resources::*;
 use cats_metering::{
@@ -421,6 +422,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/workspaces/{workspace}/cats/{cat}/exec", post(exec_cat))
         .route(
+            "/v1/workspaces/{workspace}/cats/{cat}/oci-deployments",
+            post(deploy_oci),
+        )
+        .route(
             "/v1/workspaces/{workspace}/cats/{cat}/shell",
             get(shell_cat),
         )
@@ -672,6 +677,7 @@ POST /v1/workspaces/{workspace}/cats
 POST /v1/workspaces/{workspace}/cats/{cat}/actions/{verb}
 POST /v1/workspaces/{workspace}/cats/{cat}/endpoints
 POST /v1/workspaces/{workspace}/cats/{cat}/exec
+POST /v1/workspaces/{workspace}/cats/{cat}/oci-deployments
 POST /v1/workspaces/{workspace}/disks
 POST /v1/workspaces/{workspace}/disks/{disk}/actions/{verb}
 POST /v1/workspaces/{workspace}/disks/{disk}/snapshots

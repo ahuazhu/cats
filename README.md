@@ -18,6 +18,7 @@ Cats 是一个从零实现的独立项目：为用户提供可休眠、可迁移
 - Guest 可选运行时能力使用 Unix socket 上的标准 HTTP，不要求 Cats SDK/CLI 或固定 TCP 端口（[ADR-0007](docs/decisions/0007-guest-runtime-http-over-unix-socket.md)）。
 - `cats shell` 使用受 Workspace 鉴权的 WebSocket PTY，不在 Guest 运行 sshd（[ADR-0009](docs/decisions/0009-interactive-shell-over-authenticated-websocket.md)）。
 - 每个 Cat 创建时自动获得稳定的 `*.cats.run` HTTPS URL，默认转发 Guest 8080 并按请求唤醒（[ADR-0010](docs/decisions/0010-default-http-endpoint-per-cat.md)）。
+- 应用可按 OCI digest 直接部署；Guest 校验并扁平化 image layers，再交给 systemd 守护，不依赖 Docker、containerd 或 OverlayFS（[ADR-0024](docs/decisions/0024-digest-pinned-oci-bundle-deploy.md)）。
 
 具体边界记录在 [`ADR-0001: Greenfield implementation baseline`](docs/decisions/0001-greenfield-implementation-baseline.md) 及后续 ADR。
 
@@ -82,7 +83,7 @@ docs/                     架构、决策、协议规格和实验报告
 | 层 | 状态 | 说明 |
 |---|---|---|
 | 存储引擎（blockd） | ✅ 实现并测试 | 协议见 [docs/specs/blockd-protocol.md](docs/specs/blockd-protocol.md)；4 个提交窗口 kill -9 恢复、空缓存冷恢复、stale epoch 拒绝均有测试 |
-| 控制面 / Web 控制台 / CLI / 网关 / node-agent / guest-agent | ✅ 实现并测试 | Workspace 鉴权、生命周期、交互式 PTY shell、独立 user/admin 站点、fleet 管理、监控、单元 + 集成 + E2E 覆盖完整开发闭环 |
+| 控制面 / Web 控制台 / CLI / 网关 / node-agent / guest-agent | ✅ 实现并测试 | Workspace 鉴权、生命周期、交互式 PTY shell、按 digest 固定的 OCI Bundle Deploy、独立 user/admin 站点、fleet 管理、监控、单元 + 集成 + E2E 覆盖完整开发闭环 |
 | 存储 ports / adapters | ✅ 接口拆分 | `cats-storage` 不含厂商依赖；File/SQLite 为开发 adapter，AWS S3 与 PostgreSQL 为 AWS 生产部署 adapter |
 | AWS S3 adapter | ✅ 代码 + 签名向量测试 | SigV4 通过 AWS 官方测试向量；对真实 AWS S3/MinIO 的联测按需运行 |
 | 元数据存储 | ✅ SQLite + PostgreSQL | SQLite 用于本地开发；PostgreSQL adapter 实现 root/lease/fencing 的数据库时钟与原子 CAS，并用于 AWS EKS/metal 共享元数据 |

@@ -11,6 +11,7 @@ use cats_api::guest::{
     read_frame, write_frame, GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody,
     GuestShellFrame, GuestWorkStatus,
 };
+use cats_api::oci::{DeployOciRequest, OciDeployment};
 
 pub struct GuestClient {
     stream: UnixStream,
@@ -221,6 +222,13 @@ impl GuestClient {
                 stderr,
             } => Ok((exit_code, stdout, stderr)),
             other => bail!("unexpected exec response: {other:?}"),
+        }
+    }
+
+    pub fn deploy_oci(&mut self, deploy: DeployOciRequest) -> Result<OciDeployment> {
+        match self.request(GuestRequestBody::DeployOci { deploy })? {
+            GuestResponseBody::OciDeployed { deployment } => Ok(deployment),
+            other => bail!("unexpected OCI deploy response: {other:?}"),
         }
     }
 

@@ -57,6 +57,25 @@
 
 `exec` 会在必要时唤醒 Suspended、Warm 或 Cold Cat。`--` 后的内容会成为 Guest 命令 argv；只有像第二个示例那样显式调用 Shell 时，Shell 语法才会生效。
 
+## 部署 OCI 应用
+
+CI 已经发布 OCI 镜像时，直接使用 Cats 原生 Bundle Deploy：
+
+    cats deploy dev server \
+      --image ghcr.io/acme/server@sha256:<64位十六进制digest>
+
+私有 Registry 的拉取 Token 不应进入 argv：
+
+    printf '%s\n' "$REGISTRY_TOKEN" | \
+      cats deploy dev server \
+        --image ghcr.io/acme/server@sha256:<64位十六进制digest> \
+        --registry-username "$REGISTRY_USER" \
+        --registry-password-stdin
+
+Cats 会校验 manifest/config/layer digest，把镜像扁平化写到持久 RootDisk，并 enable 一个 systemd service；不运行 Docker，也不需要 OverlayFS。同一 Cat 内多个应用共享网络 namespace，可以通过 `127.0.0.1` 互访；应用直接监听 Endpoint 端口即可对外服务。
+
+`deploy --env-file` 是写入 RootDisk systemd unit 的持久应用配置，不能放 Secret。Registry 拉取凭据是 transient；通用 Secret 注入属于尚未实现的独立资源。
+
 ## Guest 内核提供什么
 
 Guest 跑的是专用的最小内核：virtio 块设备/网络/vsock、ext4——没有可加载模块（`/lib/modules` 是空的，也没有 `modprobe`）。其中两项缺失会让常规 Linux 软件意外失败：
@@ -64,7 +83,7 @@ Guest 跑的是专用的最小内核：virtio 块设备/网络/vsock、ext4—�
 - **没有 overlayfs** —— 容器运行时无法使用默认的 `overlay2`/`fuse-overlayfs` 存储驱动；
 - **没有 nf_tables** —— `iptables` 报 `Failed to initialize nft: Protocol not supported`，任何 NAT / filter 链都建不起来。
 
-这两点是可以绕开的，不是死路。容器运行时只要不依赖这两者，就能在 Cat 里正常工作：
+OCI 应用交付优先使用 `cats deploy`。如果确实要在 Cat 内再运行容器 runtime，它只有在不依赖这两项内核能力时才能工作：
 
     dockerd --storage-driver=vfs --iptables=false --ip6tables=false --bridge=none
     docker run --network host ...

@@ -92,6 +92,9 @@ tungstenite = "0.29"
 crossterm = "0.29"
 portable-pty = "0.9"
 fs2 = "0.4"
+flate2 = "1"
+tar = "0.4"
+zstd = "0.13"
 aws-config = "1"
 aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-kinesis = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }

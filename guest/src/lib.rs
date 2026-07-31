@@ -33,6 +33,8 @@ use cats_api::guest::{
 };
 use cats_block_client::NbdClient;
 
+mod oci;
+
 // ---------------------------------------------------------------------------
 // Guest runtime HTTP/1.1 over Unix socket.
 // ---------------------------------------------------------------------------
@@ -298,6 +300,7 @@ pub struct GuestAgent {
     counter: AtomicU64,
     volumes: Mutex<HashMap<String, NbdClient>>,
     work: WorkRegistry,
+    oci: Mutex<oci::OciDeployer>,
 }
 
 struct WorkLeaseEntry {
@@ -559,6 +562,7 @@ impl GuestAgent {
             (GuestMode::Fake, Some(s)) => (s.boot_id, s.counter),
             (GuestMode::Fake, None) => (uuid::Uuid::new_v4().simple().to_string(), 0),
         };
+        let oci = oci::OciDeployer::for_mode(&mode, &disk_map_path);
         Self {
             mode,
             boot_id,
@@ -567,6 +571,7 @@ impl GuestAgent {
             counter: AtomicU64::new(counter),
             volumes: Mutex::new(HashMap::new()),
             work: WorkRegistry::new(),
+            oci: Mutex::new(oci),
         }
     }
 
@@ -706,6 +711,10 @@ impl GuestAgent {
                     stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
                     stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
                 })
+            }
+            GuestRequestBody::DeployOci { deploy } => {
+                let deployment = self.oci.lock().unwrap().deploy(deploy)?;
+                Ok(GuestResponseBody::OciDeployed { deployment })
             }
             GuestRequestBody::Shell { .. } => Ok(GuestResponseBody::Error {
                 message: "shell requires a dedicated streaming connection".to_string(),

@@ -84,6 +84,76 @@ pub(super) async fn exec_cat(
     result.map(Json)
 }
 
+pub(super) async fn deploy_oci(
+    State(state): State<AppState>,
+    Path((workspace, cat)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<DeployOciRequest>,
+) -> ApiResult<Json<OciDeployment>> {
+    check_workspace_auth(&state, &headers, &workspace).await?;
+    let cat = state.store.get_cat(&workspace, &cat)?;
+    let owner = format!("deploy_{}", uuid::Uuid::new_v4().simple());
+    let cat_id = cat.id.clone();
+    // Registry transfer + layer extraction can legitimately take minutes.
+    // Holding explicit work prevents auto-suspend from racing the deployment.
+    let ttl_ms = 3_600_000;
+    let lease =
+        state
+            .store
+            .acquire_work(&cat.id, WorkKind::Control, &owner, "oci-deploy", ttl_ms)?;
+    let result: ApiResult<OciDeployment> = async {
+        let mut cat = cat;
+        let mut retried_suspend_conflict = false;
+        loop {
+            cat = ensure_running(&state, cat).await?;
+            let node = state
+                .store
+                .list_nodes()?
+                .into_iter()
+                .find(|node| Some(&node.id) == cat.node_id.as_ref())
+                .ok_or_else(|| ApiError::unavailable("cat has no live node"))?;
+            let url = format!(
+                "{}/v1/cats/{}/oci-deployments",
+                node.agent_url.trim_end_matches('/'),
+                cat.id
+            );
+            let response = state
+                .controller
+                .http
+                .post(url)
+                .timeout(Duration::from_millis(ttl_ms) + Duration::from_secs(15))
+                .bearer_auth(&state.cfg.auth_token)
+                .json(&request)
+                .send()
+                .await
+                .map_err(|error| {
+                    ApiError::unavailable(format!("node agent unreachable: {error}"))
+                })?;
+            let status = response.status();
+            if status.is_success() {
+                break response.json::<OciDeployment>().await.map_err(|error| {
+                    ApiError::internal(format!("bad OCI deployment response: {error}")).into()
+                });
+            }
+            if status == StatusCode::CONFLICT && !retried_suspend_conflict {
+                retried_suspend_conflict = true;
+                continue;
+            }
+            let detail = response.text().await.unwrap_or_default();
+            let message = if detail.trim().is_empty() {
+                format!("OCI deployment failed: {status}")
+            } else {
+                format!("OCI deployment failed: {}", detail.trim())
+            };
+            break Err(ApiError::unavailable(message).into());
+        }
+    }
+    .await;
+    let _ = state.store.release_work(&lease.id);
+    let _ = state.controller.maybe_auto_suspend(&cat_id);
+    result.map(Json)
+}
+
 #[derive(Debug, Deserialize)]
 pub(super) struct ShellQuery {
     #[serde(default = "default_terminal_rows")]

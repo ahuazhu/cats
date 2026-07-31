@@ -41,13 +41,26 @@ cats get dev</code></pre>
 cats exec dev -- sh -lc 'printf "hello\n" &gt; /tmp/hello'</code></pre>
 <p><code>exec</code> wakes a Suspended, Warm, or Cold Cat when necessary. Arguments after <code>--</code> become the Guest command argv; shell syntax only works when you explicitly invoke a shell as in the second example.</p>
 
+<h2 id="deploy-oci">Deploy an OCI application</h2>
+<p>Use Cats' native Bundle Deploy when CI already publishes an OCI image:</p>
+<pre><code>cats deploy dev server \
+  --image ghcr.io/acme/server@sha256:&lt;64-hex-digest&gt;</code></pre>
+<p>For a private Registry, keep the pull token out of argv:</p>
+<pre><code>printf '%s\n' "$REGISTRY_TOKEN" | \
+  cats deploy dev server \
+    --image ghcr.io/acme/server@sha256:&lt;64-hex-digest&gt; \
+    --registry-username "$REGISTRY_USER" \
+    --registry-password-stdin</code></pre>
+<p>Cats verifies the manifest/config/layer digests, flattens the image onto the persistent RootDisk, and enables a systemd service. It does not run Docker or require OverlayFS. Multiple apps in one Cat share its network namespace, so they reach each other over <code>127.0.0.1</code>; an app listening on the endpoint port is directly reachable.</p>
+<p><code>--env-file</code> on <code>deploy</code> is persistent application configuration stored in the RootDisk's systemd unit. Do not put secrets there. Registry pull credentials are transient; general Secret injection is a separate, not-yet-implemented resource.</p>
+
 <h2 id="guest-kernel">What the Guest kernel provides</h2>
 <p>The Guest runs a purpose-built minimal kernel: virtio block, network and vsock, ext4 — and no loadable modules (<code>/lib/modules</code> is empty, there is no <code>modprobe</code>). Two absences surprise ordinary Linux software:</p>
 <ul>
   <li><strong>no overlayfs</strong> — container runtimes cannot use their default <code>overlay2</code>/<code>fuse-overlayfs</code> storage driver;</li>
   <li><strong>no nf_tables</strong> — <code>iptables</code> fails with <code>Failed to initialize nft: Protocol not supported</code>, so nothing can create NAT or filter chains.</li>
 </ul>
-<p>Both are avoidable rather than fatal. A container runtime works inside a Cat when it stops relying on either:</p>
+<p>Prefer <code>cats deploy</code> for OCI application delivery. If you specifically need a container runtime inside the Cat, it works only when it stops relying on either missing feature:</p>
 <pre><code>dockerd --storage-driver=vfs --iptables=false --ip6tables=false --bridge=none
 docker run --network host ...</code></pre>
 <p>With host networking the containers share the Cat's own network namespace: they reach each other over <code>127.0.0.1</code> instead of the runtime's DNS, and a container listening on <code>0.0.0.0:8080</code> is served by the Cat's endpoint with no port publishing. <code>vfs</code> copies each image layer instead of stacking it, so size the RootDisk for the images you load.</p>

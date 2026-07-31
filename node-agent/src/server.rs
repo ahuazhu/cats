@@ -24,6 +24,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use cats_api::guest::GuestShellFrame;
 use cats_api::metering::{CatUsageCheckpoint, IngestUsageCheckpointsRequest, UsageMetric};
 use cats_api::nodejob::{JobPhase, NodeJob, NodeJobResult};
+use cats_api::oci::{DeployOciRequest, OciDeployment};
 use cats_api::requests::{
     ExecRequest, ExecResponse, HeartbeatCat, HeartbeatRequest, NodeWorkStatusRequest,
     ProxyHttpRequest, RegisterNodeRequest, ShellClientControl, ShellServerControl,
@@ -241,6 +242,27 @@ async fn handle_exec(
         }
         Ok(Err(e)) => (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn handle_deploy_oci(
+    State(state): State<NodeState>,
+    Path(cat_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<DeployOciRequest>,
+) -> impl IntoResponse {
+    if let Err(code) = check_auth(&state.cfg, &headers) {
+        return code.into_response();
+    }
+    let runtime = state.runtime.clone();
+    let result = tokio::task::spawn_blocking(move || runtime.deploy_oci(&cat_id, request)).await;
+    match result {
+        Ok(Ok(deployment)) => Json::<OciDeployment>(deployment).into_response(),
+        Ok(Err(error)) if crate::runtime::is_activity_changed(&error) => {
+            (StatusCode::CONFLICT, format!("{error:#}")).into_response()
+        }
+        Ok(Err(error)) => (StatusCode::SERVICE_UNAVAILABLE, format!("{error:#}")).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
 }
 
@@ -600,6 +622,7 @@ pub fn router(state: NodeState) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/jobs", post(handle_job))
         .route("/v1/cats/{id}/exec", post(handle_exec))
+        .route("/v1/cats/{id}/oci-deployments", post(handle_deploy_oci))
         .route("/v1/cats/{id}/shell", get(handle_shell))
         .route("/v1/cats/{id}/proxy", post(handle_proxy))
         .route("/v1/cats/{id}/proxy-websocket", get(handle_proxy_websocket))

@@ -37,6 +37,7 @@ Workspace 枚举根据 Active WorkOS Organization Membership 返回 Personal/Org
     DELETE /v1/workspaces/{workspace_id}/cats/{cat}
     POST   /v1/workspaces/{workspace_id}/cats/{cat}/actions/{verb}
     POST   /v1/workspaces/{workspace_id}/cats/{cat}/exec
+    POST   /v1/workspaces/{workspace_id}/cats/{cat}/oci-deployments
     GET    /v1/workspaces/{workspace_id}/cats/{cat}/work
     GET    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
     PUT    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
@@ -48,6 +49,16 @@ Lifecycle Verb 包括 `start`、`stop`、`suspend`、`resume` 与 `warm`。Creat
 Cat、Disk 和 Operation 响应都包含不可变 `workspace_id`，它是唯一的资源归属键。
 
 `exec` 接受 `command`、可选 `timeout_ms`、可选字符串 Map `env` 与可选字节数组 `stdin`。`env` 只传给子进程，不写入 Cats Registry。响应包含 `exit_code`、`stdout` 与 `stderr`。
+
+`oci-deployments` 接受稳定的 `app`、固定到 digest 的 `image`、可选 argv 覆盖 `command`、持久非 Secret `env`，以及仅用于一次拉取的可选 `registry_auth`。Cats 不保存 Registry Credential。Guest 校验并扁平化 OCI layer，返回请求 image digest、选中的平台 manifest digest、systemd service 名和 active 状态。
+
+    {
+      "app": "server",
+      "image": "ghcr.io/acme/server@sha256:0123...cdef",
+      "env": { "PORT": "8080" }
+    }
+
+镜像必须使用完整 64 位十六进制 `sha256` digest；mutable tag 会被拒绝。`env` 会写入 RootDisk 上的 service unit，以便 Cold boot 后继续启动，因此不能包含 Secret。
 
     POST /v1/workspaces/ws_01J8QK.../cats
     Idempotency-Key: request-7f12

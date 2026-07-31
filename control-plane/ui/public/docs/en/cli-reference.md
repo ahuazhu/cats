@@ -47,10 +47,16 @@ A Workspace token is a revocable machine credential for CI. It can manage resour
     cats expiry NAME [--in SECONDS | --at UNIX | --never]
     cats exec NAME [--timeout SECONDS] [--env-file PATH]
                    [--stdin-file PATH] -- COMMAND [ARG...]
+    cats deploy CAT APP --image REGISTRY/REPOSITORY@sha256:DIGEST
+                    [--env-file PATH]
+                    [--registry-username USER --registry-password-stdin]
+                    [-- COMMAND [ARG...]]
 
 `create` defaults to image `ubuntu-24.04`, 2 CPUs, 2 GiB memory, a 1 GiB RootDisk, and auto-suspend enabled. Sizes accept `KiB`, `MiB`, `GiB`, or raw bytes.
 
 `exec --env-file` accepts newline-delimited `NAME=VALUE` entries and adds them only to the Guest child process. `--stdin-file` sends arbitrary file bytes to standard input. These options let automation transfer a bootstrap script and runtime credentials without putting either in the command line; do not print secret-bearing files or command environments.
+
+`deploy` pulls OCI/Docker manifests and layers inside the Cat, verifies every `sha256` descriptor, flattens the layers onto the RootDisk, and runs the image under systemd. It uses neither Docker nor OverlayFS. The image must be digest-pinned; tags are rejected. Registry passwords are read from stdin and are not persisted. `deploy --env-file` is different from `exec --env-file`: it becomes persistent systemd configuration on the RootDisk so the service survives Cold boot, and must not contain secrets.
 
 ## Auto-suspend commands
 

@@ -30,6 +30,7 @@ GET    /v1/workspaces/{workspace_id}/cats/{cat}
 DELETE /v1/workspaces/{workspace_id}/cats/{cat}
 POST   /v1/workspaces/{workspace_id}/cats/{cat}/actions/{verb}
 POST   /v1/workspaces/{workspace_id}/cats/{cat}/exec
+POST   /v1/workspaces/{workspace_id}/cats/{cat}/oci-deployments
 GET    /v1/workspaces/{workspace_id}/cats/{cat}/work
 GET    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
 PUT    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
@@ -38,6 +39,13 @@ PUT    /v1/workspaces/{workspace_id}/cats/{cat}/expiry</code></pre>
 <p>Lifecycle Verb 包括 <code>start</code>、<code>stop</code>、<code>suspend</code>、<code>resume</code> 与 <code>warm</code>。Create 省略 <code>auto_suspend</code> 时默认为 <code>true</code>。Cat 的 Create/Lifecycle/Delete 返回异步 Operation；请求超时后应查询 Operation，而不是用新意图重复变更。</p>
 <p>Cat、Disk 和 Operation 响应都包含不可变 <code>workspace_id</code>，它是唯一的资源归属键。</p>
 <p><code>exec</code> 接受 <code>command</code>、可选 <code>timeout_ms</code>、可选字符串 Map <code>env</code> 与可选字节数组 <code>stdin</code>。<code>env</code> 只传给子进程，不写入 Cats Registry。响应包含 <code>exit_code</code>、<code>stdout</code> 与 <code>stderr</code>。</p>
+<p><code>oci-deployments</code> 接受稳定的 <code>app</code>、固定到 digest 的 <code>image</code>、可选 argv 覆盖 <code>command</code>、持久非 Secret <code>env</code>，以及仅用于一次拉取的可选 <code>registry_auth</code>。Cats 不保存 Registry Credential。Guest 校验并扁平化 OCI layer，返回请求 image digest、选中的平台 manifest digest、systemd service 名和 active 状态。</p>
+<pre><code>{
+  "app": "server",
+  "image": "ghcr.io/acme/server@sha256:0123...cdef",
+  "env": { "PORT": "8080" }
+}</code></pre>
+<p>镜像必须使用完整 64 位十六进制 <code>sha256</code> digest；mutable tag 会被拒绝。<code>env</code> 会写入 RootDisk 上的 service unit，以便 Cold boot 后继续启动，因此不能包含 Secret。</p>
 <pre><code>POST /v1/workspaces/ws_01J8QK.../cats
 Idempotency-Key: request-7f12
 

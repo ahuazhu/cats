@@ -683,12 +683,14 @@ COMMIT;
           <thead><tr><th>方式</th><th>适用场景</th><th>实现</th><th>持久性</th></tr></thead>
           <tbody>
             <tr><td>Interactive</td><td>开发、调试、长期工作区</td><td>用户 shell 进入 Cat，自行 git clone / install / run</td><td>所有系统和工作区变化进入 RootDisk</td></tr>
-            <tr><td>Bundle Deploy</td><td>CI 临时环境、预览服务</td><td><code>cats deploy</code> 引用 OCI artifact/bundle digest；Guest Agent 拉取或 Node 通过受控通道注入</td><td>spec 写 registry；bundle 按 digest；运行结果可写 Root/PersistentDisk</td></tr>
+            <tr><td>Bundle Deploy</td><td>CI 临时环境、预览服务</td><td><code>cats deploy</code> 引用 OCI image digest；Guest Agent 拉取、校验并扁平化 layers</td><td>systemd unit 与展开目录写 RootDisk；应用数据可写 Root/PersistentDisk</td></tr>
           </tbody>
         </table>
       </div>
 
-      <div class="callout"><strong>Secret 处理：</strong>环境变量适合短期进程 Secret，但不能进入镜像 manifest 或可读 operation payload。需要文件 Secret 时，Guest Agent 写入 tmpfs 并设置 mode/owner；用户明确选择持久化时才写 RootDisk，并提示其进入快照。</div>
+      <p>当前 Bundle Deploy 实现由 <a href="decisions/0024-digest-pinned-oci-bundle-deploy.md">ADR-0024</a> 固定：只接受 <code>registry/repository@sha256:...</code>，Guest 校验并扁平化 OCI/Docker layers，以 systemd <code>RootDirectory=</code> 运行；不需要 Docker daemon 或 OverlayFS。它复用 Cat 网络与 RootDisk，OCI chroot 不是另一个多租户隔离边界。</p>
+
+      <div class="callout"><strong>Secret 处理：</strong>当前 Registry pull credential 只随一次 deploy 转发，不持久化；<code>cats deploy --env-file</code> 则是会进入 RootDisk/systemd unit 的<strong>持久配置</strong>，不能当作 Secret。目标 Secret Resource 仍应在 Guest Ready 后以 tmpfs/进程 credential 注入，控制面只保存密文与 reference；该能力未实现前，不能宣称 deploy env 不落盘。</div>
     </section>
 
     <section id="security">
