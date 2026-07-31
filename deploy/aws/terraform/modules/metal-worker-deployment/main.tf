@@ -79,6 +79,7 @@ locals {
     install -D -m 0755 "$stage_path/cats-noded" "${var.install_root}/bin/cats-noded"
     install -D -m 0755 "$stage_path/cats-blockd" "${var.install_root}/bin/cats-blockd"
     install -D -m 0755 "$stage_path/cats-guest-agent" "${var.install_root}/bin/cats-guest-agent"
+    install -D -m 0755 "$stage_path/update-guest-seed.sh" "${var.install_root}/bin/update-guest-seed"
     install -m 0644 "$stage_path/cats-worker.service" /etc/systemd/system/cats-worker.service
 
     cgroup_mount="$(findmnt --noheadings --first-only --types cgroup2 --output TARGET)"
@@ -161,6 +162,14 @@ CATS_BASE_ENVIRONMENT
       }
     ' "$runtime_overlay" "${var.worker_environment_file}" > "$environment_temp"
     install -o root -g root -m 0600 "$environment_temp" "${var.worker_environment_file}"
+
+    # Replace the golden RootDisk immediately before restarting the node. This
+    # minimizes the window in which a create request could reuse the old
+    # in-memory golden-root ID after the on-disk seed has changed.
+    "${var.install_root}/bin/update-guest-seed" \
+      "${var.install_root}/guest/rootfs.ext4" \
+      "$stage_path/cats-guest-agent" \
+      "$stage_path/guest-systemd"
 
     systemctl daemon-reload
     systemctl restart cats-worker
