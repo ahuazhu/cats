@@ -54,7 +54,14 @@ $CATS destroy $CAT >/dev/null 2>&1
 
 echo "== 1. cold create -> real VM boots =="
 cold_create_started_ms=$(date +%s%3N)
-out=$($CATS create $CAT --root-size 1GiB --cpus 1 --memory 512MiB ${CATS_CREATE_ARGS:-} 2>&1)
+# This suite drives every lifecycle transition explicitly. Automatic suspend
+# races those assertions as soon as the create/exec lease is released.
+out=$($CATS create "$CAT" \
+  --root-size 1GiB \
+  --cpus 1 \
+  --memory 512MiB \
+  --no-auto-suspend \
+  ${CATS_CREATE_ARGS:-} 2>&1)
 cold_create_ms=$(( $(date +%s%3N) - cold_create_started_ms ))
 check "create converges to running" "observed=running" "$out"
 echo "  INFO  create-to-running ${cold_create_ms} ms (single sample; includes scheduling and root seeding)"

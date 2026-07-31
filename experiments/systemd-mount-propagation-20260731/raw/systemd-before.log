@@ -1,0 +1,59 @@
+$ cat /proc/1/comm
+systemd
+$ systemd --version | head -1
+systemd 255 (255.4-1ubuntu8)
+$ findmnt -o TARGET,SOURCE,FSTYPE,OPTIONS,PROPAGATION / /dev /dev/shm
+/      /dev/vda ext4   rw,relatime,mb_optimize_scan=0 shared
+/dev   dev      devtmpfs rw,relatime,size=1998956k,nr_inodes=499739,mode=755,inode64 shared
+/dev/shm tmpfs  tmpfs  rw,nosuid,nodev,inode64 shared
+$ stat -c '%a %u:%g %n' / /dev /dev/shm
+755 0:0 /
+755 0:0 /dev
+1777 0:0 /dev/shm
+$ setpriv --reuid=70 --regid=70 --clear-groups sh -c \
+    'name=/dev/shm/cats-before-$$; : > "$name"; rm "$name"'
+uid70-create=PASS
+
+$ mount --rbind /dev /var/tmp/cats-mountprop/root-a/dev
+$ mount --rbind /dev /var/tmp/cats-mountprop/root-b/dev
+$ findmnt -o TARGET,PROPAGATION \
+    /dev /dev/shm \
+    /var/tmp/cats-mountprop/root-a/dev \
+    /var/tmp/cats-mountprop/root-a/dev/shm \
+    /var/tmp/cats-mountprop/root-b/dev \
+    /var/tmp/cats-mountprop/root-b/dev/shm
+/dev                                        shared
+/dev/shm                                    shared
+/var/tmp/cats-mountprop/root-a/dev          shared
+/var/tmp/cats-mountprop/root-a/dev/shm      shared
+/var/tmp/cats-mountprop/root-b/dev          shared
+/var/tmp/cats-mountprop/root-b/dev/shm      shared
+$ # /proc/self/mountinfo peer IDs:
+$ # / is shared:1; the three devtmpfs peers are shared:2; the three
+$ # /dev/shm tmpfs peers are shared:3.
+
+$ findmnt -Rrn -o TARGET /var/tmp/cats-mountprop/root-a/dev |
+    awk '{ depth = gsub("/", "/"); print depth, $0 }' |
+    sort -k1,1nr | cut -d' ' -f2- |
+    while read -r mount; do umount -l "$mount"; done
+
+$ findmnt -n -o TARGET,SOURCE,FSTYPE,OPTIONS,PROPAGATION /dev
+/dev dev devtmpfs rw,relatime,size=1998956k,nr_inodes=499739,mode=755,inode64 shared
+$ findmnt -n /dev/shm || echo UNMOUNTED
+UNMOUNTED
+$ findmnt -n /var/tmp/cats-mountprop/root-b/dev/shm || echo UNMOUNTED
+UNMOUNTED
+$ stat -c '%a %u:%g %n' /dev/shm /var/tmp/cats-mountprop/root-b/dev/shm
+755 0:0 /dev/shm
+755 0:0 /var/tmp/cats-mountprop/root-b/dev/shm
+$ setpriv --reuid=70 --regid=70 --clear-groups sh -c \
+    'name=/dev/shm/cats-after-$$; : > "$name"; rm "$name"'
+sh: 1: cannot create /dev/shm/cats-after-...: Permission denied
+uid70-create=FAIL
+
+$ systemctl stop postgresql@17-main
+$ # repeat two /dev recursive binds and deepest-first old-root lazy unmount
+$ systemctl restart postgresql@17-main
+Job for postgresql@17-main.service failed because the control process exited with error code.
+$ journalctl -u postgresql@17-main.service --no-pager
+2026-07-31 05:33:56.868 UTC [...] FATAL: could not open shared memory segment "/PostgreSQL.682784492": Permission denied

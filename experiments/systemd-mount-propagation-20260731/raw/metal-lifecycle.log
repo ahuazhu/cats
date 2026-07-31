@@ -1,0 +1,52 @@
+$ sudo deploy/metal/e2e.sh
+# Current default auto-suspend raced create/resume assertions:
+FAIL create converges to running
+  got desired=suspended observed=suspending auto-suspend=on
+FAIL resume
+  got desired=suspended observed=suspended auto-suspend=on
+FAIL restore
+  got desired=suspended observed=suspending auto-suspend=on
+metal e2e: 29 passed, 3 failed
+
+$ sudo env CATS_CREATE_ARGS=--no-auto-suspend deploy/metal/e2e.sh
+== 1. cold create -> real VM boots ==
+PASS create converges to running
+PASS guest runs the direct-boot kernel
+PASS guest userland is Ubuntu 24.04
+PASS guest includes apt, curl and git
+PASS guest uses systemd as PID 1
+PASS Guest Agent is running
+PASS Guest Agent is managed by systemd
+PASS guest DNS and HTTPS egress work
+PASS guest ext4 root grew to the requested size
+PASS guest reports a kernel boot_id
+== 2. ordinary enabled systemd service ==
+PASS enabled and started a normal Type=simple service
+PASS service starts once on the initial boot
+PASS service records the initial kernel boot
+== 3. durable write through the real ext4 root ==
+PASS wrote /data.txt + sync
+== 4. suspend/resume (vm.pause/resume): same boot ==
+PASS suspend
+PASS resume
+PASS boot_id preserved across suspend/resume
+== 5. warm (vm.snapshot + full exit) / restore: same boot ==
+PASS warm
+PASS no resident VMM while Warm
+PASS restore
+PASS boot_id preserved across warm/restore
+PASS file survives warm
+PASS Warm preserves the service PID
+PASS Warm does not restart the service
+== 6. stop/start: fresh boot, durable data and enabled service intact ==
+PASS stop
+PASS start
+PASS cold start is a fresh boot
+PASS flushed data survives cold restart
+PASS enabled service returns after Cold boot
+PASS Cold starts the service exactly once again
+PASS restarted service records the new kernel boot
+== 7. destroy ==
+PASS destroy
+
+metal e2e: 32 passed, 0 failed

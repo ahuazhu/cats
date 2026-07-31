@@ -675,6 +675,7 @@ COMMIT;
         <article class="card"><h3>Cat 启动</h3><ol><li>Image digest 决定 Kernel/Root 基线，不读取 mutable tag。</li><li>RootDisk 使用 CoW clone，避免复制整个镜像。</li><li>实例 metadata 使用只读 config device 或 vsock 提供。</li><li>Secret 在 Guest Ready 后用一次性加密 session 注入。</li><li>Guest Agent 建立 readiness；用户服务是否 Ready 单独判断。</li><li>升级系统通过新建 Cat 或显式 image rebase，不静默替换用户 RootDisk。</li></ol></article>
       </div>
       <p>默认 Ubuntu Guest 以 systemd 为 PID 1（ADR-0023）。RootDisk 扩容、确定性 tap 配置和 Guest Agent 是 <code>sysinit.target</code> 前的早期 unit；普通 enabled user service 继续按标准 <code>multi-user.target</code> 启动。平台 readiness 只等待 Guest Agent，不把完整 systemd transaction 或所有用户服务混成同一个边界。</p>
+      <p>systemd 启动时会把 Host mount tree 递归设为 shared；Cats 必须在其他 early unit 和用户 service 前执行 <code>mount --make-rprivate /</code>。Guest 发布的 mount propagation contract 是 <code>/</code>、<code>/dev</code>、<code>/dev/shm</code> 均为 private，且 <code>/dev/shm</code> 是 root 拥有、mode 1777 的 tmpfs。用户在 chroot/container 里 recursive-bind 后卸载 <code>/dev</code> 子树，不能传播回 Guest 或 sibling tree；非 root 用户仍须能创建 POSIX shared memory。</p>
 
       <h3 style="margin-top:28px">11.1 两种工作负载交付方式</h3>
       <div class="table-wrap">
