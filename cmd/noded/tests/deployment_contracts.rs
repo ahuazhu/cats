@@ -183,6 +183,17 @@ fn metal_acceptance_drives_real_mount_propagation_and_postgresql() {
 
 #[test]
 fn production_worker_bundle_updates_guest_seed_before_restart() {
+    let dockerignore = read_workspace_file(".dockerignore");
+    for required in [
+        "!deploy/metal/guest-systemd/",
+        "!deploy/metal/guest-systemd/**",
+    ] {
+        assert!(
+            dockerignore.lines().any(|line| line == required),
+            "worker artifact build context lost guest units allowlist {required:?}"
+        );
+    }
+
     let dockerfile = read_workspace_file("deploy/aws/Dockerfile.worker-artifact");
     for required in [
         "COPY deploy/aws/metal/update-guest-seed.sh /out/update-guest-seed.sh",
