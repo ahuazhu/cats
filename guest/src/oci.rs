@@ -757,6 +757,29 @@ fn unit_quote(value: &str) -> Result<String> {
     Ok(format!("\"{escaped}\""))
 }
 
+fn unit_path_value(value: &str) -> Result<String> {
+    if !value.starts_with('/') {
+        bail!("systemd path value must be absolute");
+    }
+    if value.contains('\0') || value.contains('\n') || value.contains('\r') {
+        bail!("OCI process metadata contains a NUL or newline");
+    }
+    let mut escaped = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' => {
+                escaped.push(char::from(byte))
+            }
+            b'%' => escaped.push_str("%%"),
+            _ => {
+                escaped.push_str("\\x");
+                escaped.push_str(&hex::encode([byte]));
+            }
+        }
+    }
+    Ok(escaped)
+}
+
 fn unit_exec_quote(value: &str) -> Result<String> {
     if value.contains('\0') || value.contains('\n') || value.contains('\r') {
         bail!("OCI process metadata contains a NUL or newline");
@@ -943,8 +966,8 @@ fn render_unit(
         "[Unit]\nDescription=Cats OCI application {app}\nAfter=network.target\n\n\
          [Service]\nType=simple\nRootDirectory={}\nMountAPIVFS=yes\nPrivateTmp=yes\n\
          WorkingDirectory={}\nRestart=always\nRestartSec=1\nKillMode=mixed\n",
-        unit_quote(&service_root.display().to_string())?,
-        unit_quote(&working_dir)?,
+        unit_path_value(&service_root.display().to_string())?,
+        unit_path_value(&working_dir)?,
     );
     if let Some((uid, gid)) = resolve_user(release_root, &config.user)? {
         unit.push_str(&format!("User={uid}\nGroup={gid}\n"));
@@ -1143,8 +1166,11 @@ impl OciDeployer {
             // Resolve argv/user/working-directory and finish the unit before
             // changing the active symlink. Invalid image metadata therefore
             // cannot replace a working release.
-            let unit = render_unit(&request.app, &release, &current, &config.config, &request)?;
-            write_atomic(&self.unit_dir.join(&unit_name), unit.as_bytes())?;
+            //
+            // RootDirectory must name the immutable release itself: systemd
+            // bind-mounts this path and rejects a final `current` symlink with
+            // status=226/NAMESPACE.
+            let unit = render_unit(&request.app, &release, &release, &config.config, &request)?;
             let next = app_root.join(format!(".current-{}", Uuid::new_v4().simple()));
             #[cfg(unix)]
             std::os::unix::fs::symlink(
@@ -1153,6 +1179,7 @@ impl OciDeployer {
             )?;
             fs::rename(&next, &current).context("activate OCI release")?;
             File::open(&app_root)?.sync_all()?;
+            write_atomic(&self.unit_dir.join(&unit_name), unit.as_bytes())?;
             if self.systemd {
                 systemctl(&["daemon-reload"])?;
                 systemctl(&["enable", &unit_name])?;
@@ -1207,6 +1234,16 @@ mod tests {
             docker_hub.base(),
             "https://registry-1.docker.io/v2/library/busybox"
         );
+    }
+
+    #[test]
+    fn systemd_path_values_are_unquoted_and_escape_unit_syntax() {
+        assert_eq!(
+            unit_path_value("/srv/work dir/100%").unwrap(),
+            "/srv/work\\x20dir/100%%"
+        );
+        assert!(unit_path_value("relative/path").is_err());
+        assert!(unit_path_value("/srv/bad\npath").is_err());
     }
 
     #[test]
@@ -1281,7 +1318,8 @@ mod tests {
             registry_auth: None,
         };
         let unit = render_unit("paperboy-server", &root, &root, &config, &request).unwrap();
-        assert!(unit.contains("RootDirectory="));
+        assert!(unit.contains(&format!("RootDirectory={}", root.display())));
+        assert!(unit.contains("WorkingDirectory=/usr/bin"));
         assert!(unit.contains("ExecStart=\"/usr/bin/app\" \"serve\" \"$$MODE\""));
         assert!(unit.contains("Environment=\"MODE=staging\""));
         assert!(!unit.contains("overlay"));
@@ -1472,6 +1510,14 @@ mod tests {
             .join("oci/fixture/current/usr/bin/cats-fixture")
             .exists());
         let unit = fs::read_to_string(dir.path().join("units/cats-oci-fixture.service")).unwrap();
+        let release_root = dir
+            .path()
+            .join("oci/fixture/releases")
+            .join(manifest_digest.trim_start_matches("sha256:"));
+        assert!(unit.contains(&format!(
+            "RootDirectory={}",
+            unit_path_value(&release_root.display().to_string()).unwrap()
+        )));
         assert!(unit.contains("ExecStart=\"/usr/bin/cats-fixture\""));
     }
 }
