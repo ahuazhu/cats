@@ -14,7 +14,9 @@ dist
 **/backend.hcl
 docs
 experiments
-deploy/metal
+deploy/metal/*
+!deploy/metal/guest-systemd/
+!deploy/metal/guest-systemd/**
 deploy/aws/terraform
 tools
 AGENTS.md
