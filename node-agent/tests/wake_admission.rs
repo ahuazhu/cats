@@ -18,48 +18,21 @@ use std::time::Duration;
 use cats_api::nodejob::{job_id, NodeJob, NodeJobAction, VolumeGrant};
 use cats_api::resources::ObservedState;
 use cats_node_agent::admission::WakeBudget;
-use cats_node_agent::runtime::{NodeConfig, NodeRuntime, VmmMode};
-use cats_node_agent::testutil::workspace_bin;
-use cats_storage::{AdapterConfig, AdapterSelection};
+use cats_node_agent::runtime::NodeRuntime;
+use cats_test_support::{fake_node_config, TempDirFixture};
 
 const SIZE: u64 = 2 * cats_api::chunk::CHUNK_SIZE as u64;
 const MEMORY_MIB: u64 = 256;
 
 struct Env {
-    _dir: tempfile::TempDir,
+    _dir: TempDirFixture,
     runtime: Arc<NodeRuntime>,
 }
 
 fn env(budget: WakeBudget) -> Env {
-    let dir = tempfile::tempdir().unwrap();
-    let meta_path = dir.path().join("meta.db");
-    let metadata_store = AdapterSelection {
-        name: "sqlite".into(),
-        config: AdapterConfig::from_pairs([("path", meta_path.display().to_string())]).unwrap(),
-    };
-    let object_store = AdapterSelection {
-        name: "file".into(),
-        config: AdapterConfig::from_pairs([(
-            "root",
-            dir.path().join("blob").display().to_string(),
-        )])
-        .unwrap(),
-    };
-    let runtime = NodeRuntime::new(NodeConfig {
-        node_id: "node_wake".into(),
-        state_dir: dir.path().join("node-state"),
-        blockd_bin: workspace_bin("cats-blockd"),
-        guest_agent_bin: workspace_bin("cats-guest-agent"),
-        metadata_store,
-        object_store,
-        blockd_lease_ttl_ms: 1200,
-        blockd_max_staged_bytes: cats_blockd::engine::DEFAULT_MAX_STAGED_BYTES,
-        blockd_max_staged_packs: cats_blockd::engine::DEFAULT_MAX_STAGED_PACKS,
-        blockd_max_local_bytes: cats_blockd::engine::DEFAULT_MAX_LOCAL_BYTES,
-        metering_cgroup_root: None,
-        wake_budget: budget,
-        vmm: VmmMode::Fake,
-    });
+    let dir = TempDirFixture::new();
+    let builder = dir.node_config("node_wake");
+    let runtime = NodeRuntime::new(fake_node_config!(builder, wake_budget = budget));
     Env {
         _dir: dir,
         runtime: Arc::new(runtime),

@@ -723,6 +723,33 @@ fn xml_unescape(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn shared_blob_store_contract_when_s3_is_configured() {
+        let Ok(endpoint) = std::env::var("CATS_AWS_S3_TEST_ENDPOINT") else {
+            eprintln!("skipped: CATS_AWS_S3_TEST_ENDPOINT not set");
+            return;
+        };
+        let bucket =
+            std::env::var("CATS_AWS_S3_TEST_BUCKET").unwrap_or_else(|_| "cats-test".into());
+        let access_key = std::env::var("AWS_ACCESS_KEY_ID").expect("AWS_ACCESS_KEY_ID");
+        let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").expect("AWS_SECRET_ACCESS_KEY");
+        let prefix = format!("contract-{}", std::process::id());
+        cats_test_support::blob_store_contract(|| {
+            Arc::new(
+                AwsS3BlobStore::new(AwsS3Config {
+                    endpoint,
+                    bucket,
+                    region: "us-east-1".into(),
+                    access_key,
+                    secret_key,
+                    session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
+                    prefix,
+                })
+                .unwrap(),
+            )
+        });
+    }
+
     /// A dead endpoint is the cheapest stand-in for a transient failure: every
     /// attempt fails to connect. The call must exhaust the retry budget rather
     /// than give up on the first error, because a single object-store failure

@@ -19,6 +19,7 @@ members = [
     "cmd/blockd",
     "cmd/controld",
     "cmd/noded",
+    "tests/support",
     "tests",
 ]
 
@@ -42,6 +43,7 @@ cats-control-plane = { path = "control-plane" }
 cats-node-agent = { path = "node-agent" }
 cats-guest-agent = { path = "guest" }
 cats-network = { path = "network" }
+cats-test-support = { path = "tests/support" }
 
 anyhow = "1"
 thiserror = "2"

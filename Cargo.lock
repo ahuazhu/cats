@@ -984,6 +984,7 @@ dependencies = [
  "cats-object-store-aws-s3",
  "cats-object-store-file",
  "cats-storage",
+ "cats-test-support",
  "hex",
  "libc",
  "serde",
@@ -1013,6 +1014,7 @@ dependencies = [
  "cats-object-store-aws-s3",
  "cats-object-store-file",
  "cats-storage",
+ "cats-test-support",
  "clap",
  "serde_json",
  "tempfile",
@@ -1104,6 +1106,7 @@ dependencies = [
  "cats-node-agent",
  "cats-object-store-aws-s3",
  "cats-storage",
+ "cats-test-support",
  "futures-util",
  "hex",
  "reqwest",
@@ -1139,6 +1142,7 @@ name = "cats-metadata-store-postgres"
 version = "0.1.0"
 dependencies = [
  "cats-storage",
+ "cats-test-support",
  "native-tls",
  "postgres",
  "postgres-native-tls",
@@ -1149,6 +1153,7 @@ name = "cats-metadata-store-sqlite"
 version = "0.1.0"
 dependencies = [
  "cats-storage",
+ "cats-test-support",
  "rusqlite",
  "tempfile",
 ]
@@ -1199,6 +1204,7 @@ dependencies = [
  "cats-guest-agent",
  "cats-metering",
  "cats-storage",
+ "cats-test-support",
  "futures-util",
  "hex",
  "libc",
@@ -1236,6 +1242,7 @@ name = "cats-object-store-aws-s3"
 version = "0.1.0"
 dependencies = [
  "cats-storage",
+ "cats-test-support",
  "hex",
  "hmac 0.12.1",
  "reqwest",
@@ -1250,6 +1257,7 @@ name = "cats-object-store-file"
 version = "0.1.0"
 dependencies = [
  "cats-storage",
+ "cats-test-support",
  "tempfile",
 ]
 
@@ -1258,6 +1266,14 @@ name = "cats-storage"
 version = "0.1.0"
 dependencies = [
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "cats-test-support"
+version = "0.1.0"
+dependencies = [
+ "cats-storage",
+ "tempfile",
 ]
 
 [[package]]

@@ -15,50 +15,23 @@ use cats_api::guest::{
 use cats_api::nodejob::{job_id, JobPhase, NodeJob, NodeJobAction, SuspendWorkFence, VolumeGrant};
 use cats_api::resources::ObservedState;
 use cats_node_agent::guest_client::GuestClient;
-use cats_node_agent::runtime::{NodeConfig, NodeRuntime};
-use cats_node_agent::testutil::workspace_bin;
-use cats_storage::{AdapterConfig, AdapterSelection};
+use cats_node_agent::runtime::NodeRuntime;
+use cats_test_support::{fake_node_config, workspace_bin, NodeConfigBuilder, TempDirFixture};
 
 const CAT: &str = "cat_rt";
 const SIZE: u64 = 2 * cats_api::chunk::CHUNK_SIZE as u64;
 
 struct Env {
-    _dir: tempfile::TempDir,
+    _dir: TempDirFixture,
     runtime: NodeRuntime,
     state_dir: PathBuf,
 }
 
 fn env() -> Env {
-    let dir = tempfile::tempdir().unwrap();
-    let state_dir = dir.path().join("node-state");
-    let meta_path = dir.path().join("meta.db");
-    let metadata_store = AdapterSelection {
-        name: "sqlite".into(),
-        config: AdapterConfig::from_pairs([("path", meta_path.display().to_string())]).unwrap(),
-    };
-    let object_store = AdapterSelection {
-        name: "file".into(),
-        config: AdapterConfig::from_pairs([(
-            "root",
-            dir.path().join("blob").display().to_string(),
-        )])
-        .unwrap(),
-    };
-    let runtime = NodeRuntime::new(NodeConfig {
-        node_id: "node_test".into(),
-        state_dir: state_dir.clone(),
-        blockd_bin: workspace_bin("cats-blockd"),
-        guest_agent_bin: workspace_bin("cats-guest-agent"),
-        metadata_store,
-        object_store,
-        blockd_lease_ttl_ms: 1200,
-        blockd_max_staged_bytes: cats_blockd::engine::DEFAULT_MAX_STAGED_BYTES,
-        blockd_max_staged_packs: cats_blockd::engine::DEFAULT_MAX_STAGED_PACKS,
-        blockd_max_local_bytes: cats_blockd::engine::DEFAULT_MAX_LOCAL_BYTES,
-        metering_cgroup_root: None,
-        wake_budget: Default::default(),
-        vmm: cats_node_agent::runtime::VmmMode::Fake,
-    });
+    let dir = TempDirFixture::new();
+    let builder = dir.node_config("node_test");
+    let state_dir = builder.state_dir().to_path_buf();
+    let runtime = NodeRuntime::new(fake_node_config!(builder));
     Env {
         _dir: dir,
         runtime,
@@ -606,40 +579,11 @@ fn hot_attach_detach_and_journal_idempotency() {
 /// Completed results keep replaying, which is what the journal is for.
 #[test]
 fn a_failed_job_is_retried_not_replayed() {
-    let dir = tempfile::tempdir().unwrap();
-    let state_dir = dir.path().join("node-state");
+    let dir = TempDirFixture::new();
     let flaky_guest_bin = dir.path().join("flaky-guest-agent");
-    let metadata_store = AdapterSelection {
-        name: "sqlite".into(),
-        config: AdapterConfig::from_pairs([(
-            "path",
-            dir.path().join("meta.db").display().to_string(),
-        )])
-        .unwrap(),
-    };
-    let object_store = AdapterSelection {
-        name: "file".into(),
-        config: AdapterConfig::from_pairs([(
-            "root",
-            dir.path().join("blob").display().to_string(),
-        )])
-        .unwrap(),
-    };
-    let runtime = NodeRuntime::new(NodeConfig {
-        node_id: "node_test".into(),
-        state_dir,
-        blockd_bin: workspace_bin("cats-blockd"),
-        guest_agent_bin: flaky_guest_bin.clone(),
-        metadata_store,
-        object_store,
-        blockd_lease_ttl_ms: 1200,
-        blockd_max_staged_bytes: cats_blockd::engine::DEFAULT_MAX_STAGED_BYTES,
-        blockd_max_staged_packs: cats_blockd::engine::DEFAULT_MAX_STAGED_PACKS,
-        blockd_max_local_bytes: cats_blockd::engine::DEFAULT_MAX_LOCAL_BYTES,
-        metering_cgroup_root: None,
-        wake_budget: Default::default(),
-        vmm: cats_node_agent::runtime::VmmMode::Fake,
-    });
+    let builder =
+        NodeConfigBuilder::new(dir.path(), "node_test").with_guest_agent_bin(&flaky_guest_bin);
+    let runtime = NodeRuntime::new(fake_node_config!(builder));
 
     // The guest agent binary does not exist yet: the start fails for real.
     let first = runtime.execute(start_job(1));

@@ -11,5 +11,8 @@ native-tls = { workspace = true }
 postgres = { workspace = true }
 postgres-native-tls = { workspace = true }
 
+[dev-dependencies]
+cats-test-support = { workspace = true }
+
 [lints]
 workspace = true

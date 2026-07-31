@@ -604,4 +604,15 @@ mod tests {
             Err(MetaError::Backend(_))
         ));
     }
+
+    #[test]
+    fn shared_metadata_store_contract_when_postgres_is_configured() {
+        let Ok(url) = std::env::var(DEFAULT_URL_ENV) else {
+            eprintln!("skipped: {DEFAULT_URL_ENV} not set");
+            return;
+        };
+        cats_test_support::metadata_store_contract(|| {
+            std::sync::Arc::new(PostgresMetadataStore::connect(&url, None).unwrap())
+        });
+    }
 }
