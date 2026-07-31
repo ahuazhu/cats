@@ -73,15 +73,6 @@ locals {
     echo "${var.worker_bundle_sha256}  $artifact_path" | sha256sum --check --strict -
     tar --zstd -xf "$artifact_path" -C "$stage_path"
 
-    # -D creates the parent directory. Without it a host that has never been
-    # touched by install.sh fails here: /opt/cats/bin does not exist yet, and
-    # the association only ever ran against hosts that had been set up by hand.
-    install -D -m 0755 "$stage_path/cats-noded" "${var.install_root}/bin/cats-noded"
-    install -D -m 0755 "$stage_path/cats-blockd" "${var.install_root}/bin/cats-blockd"
-    install -D -m 0755 "$stage_path/cats-guest-agent" "${var.install_root}/bin/cats-guest-agent"
-    install -D -m 0755 "$stage_path/update-guest-seed.sh" "${var.install_root}/bin/update-guest-seed"
-    install -m 0644 "$stage_path/cats-worker.service" /etc/systemd/system/cats-worker.service
-
     cgroup_mount="$(findmnt --noheadings --first-only --types cgroup2 --output TARGET)"
 
     # ControlGroup is only populated once the unit has actually run. On a first
@@ -98,6 +89,23 @@ locals {
     test -n "$cgroup_mount"
     test -n "$service_cgroup"
     metering_root="$${cgroup_mount}$${service_cgroup}/metering"
+
+    # A worker release is an operator-controlled drain boundary. Killing a
+    # Cloud Hypervisor while its kernel-NBD backend is still publishing can
+    # leave an uninterruptible VMM thread in the delegated cgroup and prevent
+    # systemd from starting the replacement worker. Fail before changing any
+    # installed file unless the target node is already drained and cordoned.
+    "$stage_path/require-idle-worker.sh" "$metering_root"
+
+    # -D creates the parent directory. Without it a host that has never been
+    # touched by install.sh fails here: /opt/cats/bin does not exist yet, and
+    # the association only ever ran against hosts that had been set up by hand.
+    install -D -m 0755 "$stage_path/cats-noded" "${var.install_root}/bin/cats-noded"
+    install -D -m 0755 "$stage_path/cats-blockd" "${var.install_root}/bin/cats-blockd"
+    install -D -m 0755 "$stage_path/cats-guest-agent" "${var.install_root}/bin/cats-guest-agent"
+    install -D -m 0755 "$stage_path/update-guest-seed.sh" "${var.install_root}/bin/update-guest-seed"
+    install -D -m 0755 "$stage_path/require-idle-worker.sh" "${var.install_root}/bin/require-idle-worker"
+    install -m 0644 "$stage_path/cats-worker.service" /etc/systemd/system/cats-worker.service
 
     runtime_secret="$(mktemp /var/tmp/cats-worker-runtime.XXXXXX)"
     runtime_overlay="$(mktemp /var/tmp/cats-worker-overlay.XXXXXX)"
@@ -163,7 +171,7 @@ CATS_BASE_ENVIRONMENT
     ' "$runtime_overlay" "${var.worker_environment_file}" > "$environment_temp"
     install -o root -g root -m 0600 "$environment_temp" "${var.worker_environment_file}"
 
-    # Replace the golden RootDisk immediately before restarting the node. This
+    # Replace the golden RootDisk immediately before stopping the idle node. This
     # minimizes the window in which a create request could reuse the old
     # in-memory golden-root ID after the on-disk seed has changed.
     "${var.install_root}/bin/update-guest-seed" \
@@ -172,7 +180,8 @@ CATS_BASE_ENVIRONMENT
       "$stage_path/guest-systemd"
 
     systemctl daemon-reload
-    systemctl restart cats-worker
+    systemctl stop cats-worker
+    systemctl start cats-worker
     systemctl is-active --quiet cats-worker
     "${var.install_root}/bin/cats-noded" --help | grep -q -- "--metering-cgroup-root"
     # Secret version ${aws_secretsmanager_secret_version.worker_runtime.version_id}

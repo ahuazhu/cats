@@ -278,9 +278,23 @@ An SSM State Manager association downloads the bundle, verifies the digest,
 installs the host binaries/unit, atomically updates the Cloud Hypervisor guest
 seed with the matching Guest Agent and systemd units, creates the delegated
 metering cgroup root and restarts `cats-worker`. The previous guest seed stays
-at `rootfs.ext4.previous` for recovery. Do not copy production binaries, patch
-the seed, or edit `worker.env` manually; update the bundle digest or secret
-input and apply Terraform.
+at `rootfs.ext4.previous` for recovery.
+
+A worker release is a drain boundary. Before applying a new bundle:
+
+1. run `cats admin node drain <node-id>`;
+2. wait until `cats admin node get <node-id>` reports
+   `state=cordoned cats=0`;
+3. apply the reviewed infrastructure plan and wait for the SSM association to
+   succeed;
+4. run `cats admin node uncordon <node-id>`.
+
+The association independently refuses to change installed files while any Cat
+PID remains in the worker's metering cgroups. This is a fail-closed guard
+against bypassing the drain runbook; it does not cordon the node itself and
+therefore is not a substitute for step 1. Do not copy production binaries,
+patch the seed, or edit `worker.env` manually; update the bundle digest or
+secret input and apply Terraform.
 
 ## PostgreSQL split runbook
 

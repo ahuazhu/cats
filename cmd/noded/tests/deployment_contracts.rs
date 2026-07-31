@@ -182,7 +182,7 @@ fn metal_acceptance_drives_real_mount_propagation_and_postgresql() {
 }
 
 #[test]
-fn production_worker_bundle_updates_guest_seed_before_restart() {
+fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
     let dockerignore = read_workspace_file(".dockerignore");
     for required in [
         "!deploy/metal/guest-systemd/",
@@ -197,8 +197,10 @@ fn production_worker_bundle_updates_guest_seed_before_restart() {
     let dockerfile = read_workspace_file("deploy/aws/Dockerfile.worker-artifact");
     for required in [
         "COPY deploy/aws/metal/update-guest-seed.sh /out/update-guest-seed.sh",
+        "COPY deploy/aws/metal/require-idle-worker.sh /out/require-idle-worker.sh",
         "COPY deploy/metal/guest-systemd /out/guest-systemd",
         "COPY --from=builder /out/update-guest-seed.sh /update-guest-seed.sh",
+        "COPY --from=builder /out/require-idle-worker.sh /require-idle-worker.sh",
         "COPY --from=builder /out/guest-systemd /guest-systemd",
     ] {
         assert!(
@@ -209,17 +211,67 @@ fn production_worker_bundle_updates_guest_seed_before_restart() {
 
     let deployment =
         read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
+    let idle_guard = deployment
+        .find("\"$stage_path/require-idle-worker.sh\" \"$metering_root\"")
+        .expect("worker deployment rejects active Cat processes");
+    let first_install = deployment
+        .find("install -D -m 0755 \"$stage_path/cats-noded\"")
+        .expect("worker deployment installs cats-noded");
     let update = deployment
-        .find("# Replace the golden RootDisk immediately before restarting the node.")
+        .find("# Replace the golden RootDisk immediately before stopping the idle node.")
         .expect("worker deployment has the guest-seed update phase");
-    let restart = deployment
-        .find("systemctl restart cats-worker")
-        .expect("worker deployment restarts cats-worker");
+    let stop = deployment
+        .find("systemctl stop cats-worker")
+        .expect("worker deployment stops the idle worker");
+    let start = deployment
+        .find("systemctl start cats-worker")
+        .expect("worker deployment starts the replacement worker");
     assert!(
-        update < restart
-            && deployment[update..restart]
-                .contains("\"${var.install_root}/bin/update-guest-seed\""),
-        "worker must invoke the guest-seed updater immediately before restart"
+        idle_guard < first_install
+            && first_install < update
+            && update < stop
+            && deployment[update..stop].contains("\"${var.install_root}/bin/update-guest-seed\""),
+        "worker must guard the drain before install and update the seed immediately before stop"
+    );
+    assert!(stop < start, "worker must stop cleanly before starting");
+    assert!(
+        !deployment.contains("systemctl restart cats-worker"),
+        "worker deployment must not abruptly restart active delegated cgroups"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_release_refuses_active_cat_cgroups() {
+    let temp = tempfile::tempdir().expect("temporary cgroup fixture");
+    let metering_root = temp.path().join("metering");
+    let active_cat = metering_root.join("metal-1/cat-active");
+    std::fs::create_dir_all(&active_cat).expect("create cgroup fixture");
+    let cgroup_procs = active_cat.join("cgroup.procs");
+    std::fs::write(&cgroup_procs, "").expect("write empty cgroup");
+
+    let guard = workspace_root().join("deploy/aws/metal/require-idle-worker.sh");
+    let idle = std::process::Command::new(&guard)
+        .arg(&metering_root)
+        .output()
+        .expect("run idle worker guard");
+    assert!(
+        idle.status.success(),
+        "empty metering cgroups must be releasable: {}",
+        String::from_utf8_lossy(&idle.stderr)
+    );
+
+    std::fs::write(&cgroup_procs, "1818070\n").expect("write active cgroup");
+    let active = std::process::Command::new(&guard)
+        .arg(&metering_root)
+        .output()
+        .expect("run active worker guard");
+    assert!(!active.status.success(), "active Cat must block release");
+    let stderr = String::from_utf8_lossy(&active.stderr);
+    assert!(
+        stderr.contains("active Cat processes: 1818070")
+            && stderr.contains("state=cordoned cats=0"),
+        "guard must name the active PID and recovery contract: {stderr}"
     );
 }
 

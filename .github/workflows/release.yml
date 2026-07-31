@@ -134,8 +134,12 @@ jobs:
             echo "| file | \`cats-worker.tar.zst\` |"
             echo "| sha256 | \`$sha256\` |"
             echo
-            echo "Set \`worker_bundle_path\` to the downloaded file and"
-            echo "\`worker_bundle_sha256\` to the digest above."
+            echo "Before Terraform apply, run \`cats admin node drain <node-id>\`"
+            echo "and wait until \`cats admin node get <node-id>\` reports"
+            echo "\`state=cordoned cats=0\`. Set \`worker_bundle_path\` to the"
+            echo "downloaded file and \`worker_bundle_sha256\` to the digest above."
+            echo "After the association succeeds, run"
+            echo "\`cats admin node uncordon <node-id>\`."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
