@@ -31,6 +31,7 @@ RUN cargo build --locked --release \
     && install -D -m 0755 target/release/cats-guest-agent /out/cats-guest-agent
 
 COPY deploy/aws/metal/update-guest-seed.sh /out/update-guest-seed.sh
+COPY deploy/aws/metal/require-idle-worker.sh /out/require-idle-worker.sh
 COPY deploy/metal/guest-systemd /out/guest-systemd
 
 FROM scratch AS artifact
@@ -39,5 +40,6 @@ COPY --from=builder /out/cats-noded /cats-noded
 COPY --from=builder /out/cats-blockd /cats-blockd
 COPY --from=builder /out/cats-guest-agent /cats-guest-agent
 COPY --from=builder /out/update-guest-seed.sh /update-guest-seed.sh
+COPY --from=builder /out/require-idle-worker.sh /require-idle-worker.sh
 COPY --from=builder /out/guest-systemd /guest-systemd
 COPY deploy/aws/metal/cats-worker.service /cats-worker.service
