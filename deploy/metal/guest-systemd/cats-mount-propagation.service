@@ -1,0 +1,10 @@
+[Unit]
+Description=Isolate Cats Guest mount propagation
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=cats-grow-root.service cats-network.service cats-guest-agent.service sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/mount --make-rprivate /
+RemainAfterExit=yes

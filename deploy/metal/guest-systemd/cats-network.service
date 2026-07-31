@@ -1,6 +1,8 @@
 [Unit]
 Description=Configure the Cats Guest network
 DefaultDependencies=no
+Requires=cats-mount-propagation.service
+After=cats-mount-propagation.service
 After=systemd-remount-fs.service
 Before=cats-guest-agent.service network.target
 

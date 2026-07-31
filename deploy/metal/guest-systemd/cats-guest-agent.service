@@ -1,8 +1,8 @@
 [Unit]
 Description=Cats Guest Agent
 DefaultDependencies=no
-Requires=cats-grow-root.service cats-network.service
-After=cats-grow-root.service cats-network.service systemd-remount-fs.service
+Requires=cats-mount-propagation.service cats-grow-root.service cats-network.service
+After=cats-mount-propagation.service cats-grow-root.service cats-network.service systemd-remount-fs.service
 Before=sysinit.target
 
 [Service]

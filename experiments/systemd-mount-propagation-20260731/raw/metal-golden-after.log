@@ -1,0 +1,93 @@
+$ sudo deploy/metal/install.sh
+guest artifacts ready in /opt/cats/guest:
+-rw-r--r-- 1 root root   1176950 Jul 31 06:18 initramfs.img
+-rw-r--r-- 1 root root 536870912 Jul 31 06:20 rootfs.ext4
+-rw-r--r-- 1 root root      5717 Jul 31 06:20 rootfs.manifest
+-rw------- 1 root root  16660552 Jul 31 06:18 vmlinuz
+● cats-controld.service - Cats control plane
+     Active: active (running)
+● cats-gatewayd.service - Cats endpoint gateway
+     Active: active (running)
+● cats-noded.service - Cats node agent (Cloud Hypervisor microVMs)
+     Active: active (running)
+
+$ # Fresh Guest from that rootfs.ext4
+$ systemctl is-active cats-mount-propagation.service
+active
+$ systemctl show cats-mount-propagation.service \
+    -p ActiveState -p SubState -p Result -p ExecMainStatus
+Result=success
+ExecMainStatus=0
+ActiveState=active
+SubState=exited
+$ findmnt -o TARGET,SOURCE,FSTYPE,OPTIONS,PROPAGATION / /dev /dev/shm
+/      /dev/vda ext4   rw,relatime private
+/dev   dev    devtmpfs rw,relatime,size=228640k,nr_inodes=57160,mode=755,inode64 private
+/dev/shm tmpfs  tmpfs  rw,nosuid,nodev,inode64 private
+$ stat -c '%a %u:%g %n' /dev/shm
+1777 0:0 /dev/shm
+
+$ sudo deploy/metal/mount-propagation-e2e.sh
+metal-mount-propagation-e2e    2 cpu   2048 MiB  desired=running observed=running auto-suspend=off node=metal-1
+
+=== Guest baseline before chroot operations ===
+pid1=systemd
+/      /dev/vda ext4   rw,relatime,mb_optimize_scan=0 private
+/dev   dev    devtmpfs rw,relatime,size=1001456k,nr_inodes=250364,mode=755,inode64 private
+/dev/shm tmpfs  tmpfs  rw,nosuid,nodev,inode64 private
+755 0:0 /
+755 0:0 /dev
+1777 0:0 /dev/shm
+=== Recursive bind peers ===
+/dev   dev    devtmpfs rw,relatime,size=1001456k,nr_inodes=250364,mode=755,inode64 private
+/dev/shm tmpfs  tmpfs  rw,nosuid,nodev,inode64 private
+/var/tmp/cats-mount-propagation-e2e/root-old/dev dev    devtmpfs rw,relatime,size=1001456k,nr_inodes=250364,mode=755,inode64 private
+/var/tmp/cats-mount-propagation-e2e/root-old/dev/shm tmpfs  tmpfs  rw,nosuid,nodev,inode64 private
+/var/tmp/cats-mount-propagation-e2e/root-new/dev dev    devtmpfs rw,relatime,size=1001456k,nr_inodes=250364,mode=755,inode64 private
+/var/tmp/cats-mount-propagation-e2e/root-new/dev/shm tmpfs  tmpfs  rw,nosuid,nodev,inode64 private
+
+The files belonging to this database system will be owned by user "paperboy".
+selecting dynamic shared memory implementation ... posix
+The files belonging to this database system will be owned by user "paperboy".
+selecting dynamic shared memory implementation ... posix
+
+=== PostgreSQL 17 old-root start/stop as uid:gid 70:70 ===
+postgres (PostgreSQL) 17.10 (Ubuntu 17.10-1.pgdg24.04+1)
+waiting for server to start.... done
+server started
+waiting for server to shut down.... done
+server stopped
+=== Deepest-first lazy unmount of old root ===
+/var/tmp/cats-mount-propagation-e2e/root-old/dev/hugepages
+/var/tmp/cats-mount-propagation-e2e/root-old/dev/mqueue
+/var/tmp/cats-mount-propagation-e2e/root-old/dev/pts
+/var/tmp/cats-mount-propagation-e2e/root-old/dev/shm
+/var/tmp/cats-mount-propagation-e2e/root-old/dev
+umount -l /var/tmp/cats-mount-propagation-e2e/root-old/dev/hugepages: ok
+umount -l /var/tmp/cats-mount-propagation-e2e/root-old/dev/mqueue: ok
+umount -l /var/tmp/cats-mount-propagation-e2e/root-old/dev/pts: ok
+umount -l /var/tmp/cats-mount-propagation-e2e/root-old/dev/shm: ok
+umount -l /var/tmp/cats-mount-propagation-e2e/root-old/dev: ok
+=== State after old-root unmount ===
+/dev   dev    devtmpfs rw,relatime,size=1001456k,nr_inodes=250364,mode=755,inode64 private
+/dev/shm tmpfs  tmpfs  rw,nosuid,nodev,inode64 private
+UNMOUNTED /var/tmp/cats-mount-propagation-e2e/root-old/dev
+UNMOUNTED /var/tmp/cats-mount-propagation-e2e/root-old/dev/shm
+/var/tmp/cats-mount-propagation-e2e/root-new/dev dev    devtmpfs rw,relatime,size=1001456k,nr_inodes=250364,mode=755,inode64 private
+/var/tmp/cats-mount-propagation-e2e/root-new/dev/shm tmpfs  tmpfs  rw,nosuid,nodev,inode64 private
+755 0:0 /dev
+1777 0:0 /dev/shm
+755 0:0 /var/tmp/cats-mount-propagation-e2e/root-new/dev
+1777 0:0 /var/tmp/cats-mount-propagation-e2e/root-new/dev/shm
+=== PostgreSQL 17 replacement-root restart as uid:gid 70:70 ===
+waiting for server to start.... done
+server started
+waiting for server to shut down.... done
+server stopped
+PASS: recursive unmount stayed private, uid 70 retained POSIX shm access, and PostgreSQL 17 restarted
+umount -l /var/tmp/cats-mount-propagation-e2e/root-new/dev/hugepages: ok
+umount -l /var/tmp/cats-mount-propagation-e2e/root-new/dev/mqueue: ok
+umount -l /var/tmp/cats-mount-propagation-e2e/root-new/dev/pts: ok
+umount -l /var/tmp/cats-mount-propagation-e2e/root-new/dev/shm: ok
+umount -l /var/tmp/cats-mount-propagation-e2e/root-new/dev: ok
+destroyed metal-mount-propagation-e2e

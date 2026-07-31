@@ -755,6 +755,12 @@ Cat 不是容器，但镜像分发可以复用 OCI 的内容寻址和 Registry �
 继续按标准 `multi-user.target` 启动。平台 readiness 只等待 Guest Agent，不把完整
 systemd transaction 或所有用户服务混成同一个边界。
 
+systemd 启动时会把 Host mount tree 递归设为 shared；Cats 必须在其他 early unit 和
+用户 service 前执行 `mount --make-rprivate /`。Guest 发布的 mount propagation
+contract 是 `/`、`/dev`、`/dev/shm` 均为 private，且 `/dev/shm` 是 root 拥有、
+mode 1777 的 tmpfs。用户在 chroot/container 里 recursive-bind 后卸载 `/dev` 子树，
+不能传播回 Guest 或 sibling tree；非 root 用户仍须能创建 POSIX shared memory。
+
 ### Cat 启动
 
 1.  Image digest 决定 Kernel/Root 基线，不读取 mutable tag。

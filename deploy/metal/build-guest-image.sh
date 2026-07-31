@@ -236,6 +236,9 @@ cat > "$RF/usr/bin/cats-init" <<'EOF'
 set -eu
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
+# Match the production systemd Guest contract: mounts created by Guest
+# workloads must not propagate to the Guest root or unrelated peer trees.
+mount --make-rprivate /
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mkdir -p /dev/pts /dev/shm /run /tmp
@@ -264,6 +267,7 @@ chmod +x "$RF/usr/bin/cats-init"
 # Keep the Guest unit definitions as reviewable, directly verifiable source
 # files. This script only installs and enables them in the golden root.
 for unit in \
+  cats-mount-propagation.service \
   cats-grow-root.service \
   cats-network.service \
   cats-guest-agent.service; do
@@ -271,6 +275,12 @@ for unit in \
     "$REPO/deploy/metal/guest-systemd/$unit" \
     "$RF/etc/systemd/system/$unit"
 done
+
+# systemd makes the host mount tree recursively shared during manager startup.
+# Restore the Cats Guest isolation contract before any platform or user service
+# can create recursive bind mounts.
+ln -s ../cats-mount-propagation.service \
+  "$RF/etc/systemd/system/sysinit.target.wants/cats-mount-propagation.service"
 
 # Grow the ext4 filesystem to the Cat's requested RootDisk size once per boot.
 # This lets the golden image stay small while the normal CLI default remains

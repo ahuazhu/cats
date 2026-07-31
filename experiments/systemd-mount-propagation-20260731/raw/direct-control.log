@@ -1,0 +1,31 @@
+$ cat /proc/1/comm
+tini
+$ findmnt -o TARGET,PROPAGATION / /dev /dev/shm
+/        private
+/dev     private
+/dev/shm private
+$ stat -c '%a %u:%g %n' /dev/shm
+1777 0:0 /dev/shm
+$ setpriv --reuid=70 --regid=70 --clear-groups sh -c \
+    'name=/dev/shm/cats-before-$$; : > "$name"; rm "$name"'
+uid70-create=PASS
+
+$ mount --rbind /dev /var/tmp/cats-mount-propagation-e2e/root-old/dev
+$ mount --rbind /dev /var/tmp/cats-mount-propagation-e2e/root-new/dev
+$ # start and stop PostgreSQL 17 in root-old as 70:70
+$ # deepest-first: umount -l every mount under root-old/dev
+
+=== State after old-root unmount ===
+/dev                                                       private
+/dev/shm                                                   private
+/var/tmp/cats-mount-propagation-e2e/root-new/dev           private
+/var/tmp/cats-mount-propagation-e2e/root-new/dev/shm       private
+1777 0:0 /dev/shm
+1777 0:0 /var/tmp/cats-mount-propagation-e2e/root-new/dev/shm
+
+=== PostgreSQL 17 replacement-root restart as uid:gid 70:70 ===
+waiting for server to start.... done
+server started
+waiting for server to shut down.... done
+server stopped
+PASS: recursive unmount stayed private, uid 70 retained POSIX shm access, and PostgreSQL 17 restarted

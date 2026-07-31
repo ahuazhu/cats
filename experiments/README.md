@@ -19,6 +19,7 @@
 | [`vhost-user-soak-20260730/`](vhost-user-soak-20260730/) | vhost-user-blk 生命周期正确性 soak、被同盘构建负载污染的 fsync A/B 结论撤回，以及 host 端 pack 持久化 syscall 尾延迟定位；公平 ABBA 复测仍待执行 | [`README`](vhost-user-soak-20260730/README.md) |
 | [`relaxed-local-first-20260730/`](relaxed-local-first-20260730/) | Relaxed 双水位边界、macOS APFS 与 production `c5d.metal` 本地 NVMe 各 2,000 样本的 Local FLUSH / drain P50/P95/P99/max；附带发现 metal-1 重启后 `/var/lib/cats` 落在根 EBS | [`README`](relaxed-local-first-20260730/README.md) |
 | [`systemd-pid1-20260730/`](systemd-pid1-20260730/) | systemd PID 1 与 direct-init 的真实 KVM 生命周期 A/B，以及普通 enabled Linux service 跨 Warm 保持、跨 Cold 重启的行为证明 | [`README`](systemd-pid1-20260730/README.md) |
+| [`systemd-mount-propagation-20260731/`](systemd-mount-propagation-20260731/) | 当前生产 Guest image 的 systemd/direct-init 挂载传播 A/B，Paperboy 风格双 chroot recursive bind/unmount 复现，以及 PostgreSQL 17 shm_open 回归证据 | [`README`](systemd-mount-propagation-20260731/README.md) |
 
 ## 2026-07-21 正式结果
 

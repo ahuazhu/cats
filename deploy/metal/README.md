@@ -80,6 +80,13 @@ RootDisk 大小；因此生产创建建议至少 1 GiB。`GUEST_INIT_MODE=direct
 历史实验，不是默认产品形态。Guest unit 的源码位于 `guest-systemd/`，镜像构建脚本
 只负责把它们安装到 rootfs。
 
+systemd 作为 Host manager 启动时会把 Guest 根挂载递归改成 shared。Cats 的
+`cats-mount-propagation.service` 在其他平台 early unit 和普通用户 service 之前执行
+`mount --make-rprivate /`。因此 `/`、`/dev` 和 `/dev/shm` 的发布契约都是 private，
+`/dev/shm` 仍是 root 拥有、mode 1777 的 tmpfs；用户工作负载在 chroot/container
+中递归 bind 和卸载 `/dev`，不能反向卸载 Guest 或另一个 peer tree 的 `/dev/shm`。
+direct 诊断 init 也显式建立同一契约。
+
 `cats-noded` 启动时默认探测 Host 的逻辑 CPU 与内存总量作为可调度容量；管理员页面
 同时展示 Host CPU、内存和节点状态目录所在文件系统的实时使用量。若需要给 Host
 保留资源，可在环境文件中设置 `CATS_NODE_CPUS` / `CATS_NODE_MEMORY_MIB` 降低调度上限。
@@ -100,6 +107,23 @@ VMM、restore 同 boot 且文件在、stop/start 换 boot 且数据从 durable �
 最终 `17 passed, 0 failed`。这是单次正确性验收，不是性能样本或生产 SLA。
 
 手动玩法与本地 CLI 相同（`cats create/exec/suspend/warm/...`）。
+
+挂载传播与 PostgreSQL 17 有单独的真实 Guest 验收。它只创建带自动过期时间的
+`metal-mount-propagation-e2e` Cat，安装真实 PostgreSQL 17，构造两个真实 chroot，
+执行 `/dev` recursive bind 和 deepest-first lazy unmount，再验证 Guest 与 replacement
+root 的 `/dev/shm`、uid 70 POSIX shared memory 和 PostgreSQL restart：
+
+```bash
+sudo deploy/metal/mount-propagation-e2e.sh
+```
+
+该脚本应只在隔离的 metal acceptance stack 上运行；它不是生产部署步骤。
+
+发布这个契约变更需要重建 golden root。NodeRuntime 会缓存已发布的 image id，因此
+节点应先 drain，再受控重启 `cats-noded`；不需要重建 Host OS 或重启整台 worker。
+已经基于旧 golden 创建的 RootDisk 不会自动 rebase，需要单独安装/enable 同一 early
+unit 后 Cold boot，或显式重建 Cat。不要在未授权时用 worker restart 或批量修改现有
+Cat 代替迁移。
 
 ## 5. 已知边界（Phase A）
 
