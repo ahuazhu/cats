@@ -24,40 +24,14 @@ use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
 
+pub use cats_api::guest::{read_frame, write_frame, DiskMap, DiskMapEntry};
 use cats_api::guest::{
     AcquireGuestWorkLeaseRequest, GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody,
     GuestRuntimeApiError, GuestRuntimeApiErrorResponse, GuestShellFrame, GuestWorkLease,
-    GuestWorkStatus, RenewGuestWorkLeaseRequest, GUEST_WORK_LEASES_PATH, MAX_FRAME_BYTES,
-    MAX_WORK_LEASES, MAX_WORK_LEASE_TTL_MS,
+    GuestWorkStatus, RenewGuestWorkLeaseRequest, GUEST_WORK_LEASES_PATH, MAX_WORK_LEASES,
+    MAX_WORK_LEASE_TTL_MS,
 };
-use cats_blockd::nbd::NbdClient;
-
-// ---------------------------------------------------------------------------
-// Framing: u32 big-endian length + JSON body.
-// ---------------------------------------------------------------------------
-
-pub fn write_frame<W: Write, T: Serialize>(w: &mut W, value: &T) -> std::io::Result<()> {
-    let body = serde_json::to_vec(value).map_err(std::io::Error::other)?;
-    let len = u32::try_from(body.len()).map_err(|_| std::io::Error::other("oversized frame"))?;
-    if len > MAX_FRAME_BYTES {
-        return Err(std::io::Error::other("oversized frame"));
-    }
-    w.write_all(&len.to_be_bytes())?;
-    w.write_all(&body)?;
-    w.flush()
-}
-
-pub fn read_frame<R: Read, T: for<'a> Deserialize<'a>>(r: &mut R) -> std::io::Result<T> {
-    let mut len_buf = [0u8; 4];
-    r.read_exact(&mut len_buf)?;
-    let len = u32::from_be_bytes(len_buf);
-    if len > MAX_FRAME_BYTES {
-        return Err(std::io::Error::other("oversized frame"));
-    }
-    let mut body = vec![0u8; len as usize];
-    r.read_exact(&mut body)?;
-    serde_json::from_slice(&body).map_err(std::io::Error::other)
-}
+use cats_block_client::NbdClient;
 
 // ---------------------------------------------------------------------------
 // Guest runtime HTTP/1.1 over Unix socket.
@@ -283,14 +257,6 @@ fn read_work_http_request(
 // Disk map: written by the node agent, re-read on every block operation so
 // hot attach/detach need no push channel.
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiskMapEntry {
-    pub socket: PathBuf,
-    pub mount_path: String,
-}
-
-pub type DiskMap = HashMap<String, DiskMapEntry>;
 
 fn load_disk_map(path: &Path) -> DiskMap {
     std::fs::read(path)

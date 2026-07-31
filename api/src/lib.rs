@@ -5,6 +5,7 @@
 //! - lifecycle states per ADR-0002 (`resources::CatState` and friends)
 //! - control-plane -> node-agent job protocol (`nodejob`)
 //! - guest agent protocol frames (`guest`)
+//! - blockd host-control protocol and observability DTOs (`blockd`)
 //! - ChunkStore protocol constants per ADR-0003 (`chunk`)
 //! - error codes shared across HTTP surfaces (`error`)
 //!
@@ -13,6 +14,7 @@
 
 pub mod auth;
 pub mod billing;
+pub mod blockd;
 pub mod chunk;
 pub mod error;
 pub mod guest;

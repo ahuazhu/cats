@@ -976,10 +976,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cats-block-client"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "cats-blockd"
 version = "0.1.0"
 dependencies = [
  "cats-api",
+ "cats-block-client",
  "cats-metadata-store-sqlite",
  "cats-object-store-aws-s3",
  "cats-object-store-file",
@@ -1008,6 +1016,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cats-api",
+ "cats-block-client",
  "cats-blockd",
  "cats-metadata-store-postgres",
  "cats-metadata-store-sqlite",
@@ -1097,6 +1106,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cats-api",
+ "cats-block-client",
  "cats-blockd",
  "cats-control-plane",
  "cats-metadata-store-postgres",
@@ -1122,7 +1132,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cats-api",
- "cats-blockd",
+ "cats-block-client",
  "clap",
  "hex",
  "libc",
@@ -1200,8 +1210,7 @@ dependencies = [
  "axum",
  "base64",
  "cats-api",
- "cats-blockd",
- "cats-guest-agent",
+ "cats-block-client",
  "cats-metering",
  "cats-storage",
  "cats-test-support",
@@ -1225,7 +1234,7 @@ name = "cats-node-agent-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cats-blockd",
+ "cats-api",
  "cats-metadata-store-postgres",
  "cats-metadata-store-sqlite",
  "cats-node-agent",

@@ -40,23 +40,6 @@ pub(super) fn punch_hole(file: &File, offset: u64, len: u64) -> std::io::Result<
     }
 }
 
-/// Default per-volume local replication backlog. This is an admission boundary,
-/// not an RPO promise: while remote publication is unavailable, acknowledged
-/// relaxed FLUSHes remain durable on this Host and consume this reservation.
-/// Once it is full, new dirty barriers park without calling the remote stores.
-pub const DEFAULT_MAX_STAGED_BYTES: u64 = 8 << 30;
-
-/// A second bound prevents a workload made entirely of tiny barriers from
-/// exhausting directory entries and in-memory queue metadata before it reaches
-/// the byte limit.
-pub const DEFAULT_MAX_STAGED_PACKS: usize = 4_096;
-
-/// Per-volume physical local footprint ceiling for cache blocks plus pending
-/// packs. Clean committed cache chunks are evicted below this watermark;
-/// dirty or remotely unpublished chunks are pinned and cause local
-/// backpressure instead.
-pub const DEFAULT_MAX_LOCAL_BYTES: u64 = 16 << 30;
-
 /// Conservative space accounting for the JSON metadata around one pending
 /// pack. Admission must reserve the later pack before dirty cache can consume
 /// the whole local quota, or no publisher input could ever be created.

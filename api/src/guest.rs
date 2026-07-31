@@ -7,7 +7,9 @@
 //! echoed in the response; commands are argument arrays, never shell strings.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::io::{Read, Write};
+use std::path::PathBuf;
 
 pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 
@@ -19,9 +21,45 @@ pub const DEFAULT_WORK_LEASE_TTL_MS: u64 = 5 * 60 * 1000;
 pub const MAX_WORK_LEASE_TTL_MS: u64 = 60 * 60 * 1000;
 pub const MAX_WORK_LEASES: usize = 64;
 
+/// Write one bounded `u32` big-endian length-prefixed JSON frame.
+pub fn write_frame<W: Write, T: Serialize>(writer: &mut W, value: &T) -> std::io::Result<()> {
+    let body = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+    let len = u32::try_from(body.len()).map_err(|_| std::io::Error::other("oversized frame"))?;
+    if len > MAX_FRAME_BYTES {
+        return Err(std::io::Error::other("oversized frame"));
+    }
+    writer.write_all(&len.to_be_bytes())?;
+    writer.write_all(&body)?;
+    writer.flush()
+}
+
+/// Read one bounded `u32` big-endian length-prefixed JSON frame.
+pub fn read_frame<R: Read, T: for<'de> Deserialize<'de>>(reader: &mut R) -> std::io::Result<T> {
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf);
+    if len > MAX_FRAME_BYTES {
+        return Err(std::io::Error::other("oversized frame"));
+    }
+    let mut body = vec![0u8; len as usize];
+    reader.read_exact(&mut body)?;
+    serde_json::from_slice(&body).map_err(std::io::Error::other)
+}
+
 pub fn default_work_lease_ttl_ms() -> u64 {
     DEFAULT_WORK_LEASE_TTL_MS
 }
+
+/// One FakeVmm disk attachment written by the node and consumed by the Guest
+/// Agent. Real Guests discover the corresponding standard virtio block
+/// devices instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskMapEntry {
+    pub socket: PathBuf,
+    pub mount_path: String,
+}
+
+pub type DiskMap = HashMap<String, DiskMapEntry>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestWorkLease {
@@ -178,4 +216,46 @@ pub struct GuestRuntimeApiError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuestRuntimeApiErrorResponse {
     pub error: GuestRuntimeApiError,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guest_health_frame_is_byte_stable() {
+        let request = GuestRequest {
+            id: 7,
+            body: GuestRequestBody::Health,
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+        assert_eq!(bytes, b"\0\0\0\x16{\"id\":7,\"op\":\"health\"}");
+
+        let decoded: GuestRequest = read_frame(&mut &bytes[..]).unwrap();
+        assert_eq!(decoded.id, 7);
+        assert!(matches!(decoded.body, GuestRequestBody::Health));
+    }
+
+    #[test]
+    fn guest_framing_rejects_an_oversized_length_before_allocating() {
+        let bytes = (MAX_FRAME_BYTES + 1).to_be_bytes();
+        let error = read_frame::<_, GuestRequest>(&mut &bytes[..]).unwrap_err();
+        assert_eq!(error.to_string(), "oversized frame");
+    }
+
+    #[test]
+    fn fake_guest_disk_map_json_is_byte_stable() {
+        let map = DiskMap::from([(
+            "root".to_string(),
+            DiskMapEntry {
+                socket: PathBuf::from("/run/cats/root.sock"),
+                mount_path: "/".to_string(),
+            },
+        )]);
+        assert_eq!(
+            serde_json::to_string(&map).unwrap(),
+            "{\"root\":{\"socket\":\"/run/cats/root.sock\",\"mount_path\":\"/\"}}"
+        );
+    }
 }

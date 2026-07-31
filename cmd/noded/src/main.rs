@@ -49,15 +49,15 @@ struct Args {
     blockd_lease_ttl_ms: i64,
     /// Per-volume remotely unpublished local journal limit.
     #[arg(long, env = "CATS_BLOCKD_MAX_STAGED_BYTES",
-          default_value_t = cats_blockd::engine::DEFAULT_MAX_STAGED_BYTES)]
+          default_value_t = cats_api::blockd::DEFAULT_MAX_STAGED_BYTES)]
     blockd_max_staged_bytes: u64,
     /// Per-volume tiny-generation count limit.
     #[arg(long, env = "CATS_BLOCKD_MAX_STAGED_PACKS",
-          default_value_t = cats_blockd::engine::DEFAULT_MAX_STAGED_PACKS)]
+          default_value_t = cats_api::blockd::DEFAULT_MAX_STAGED_PACKS)]
     blockd_max_staged_packs: usize,
     /// Per-volume physical cache + journal footprint limit.
     #[arg(long, env = "CATS_BLOCKD_MAX_LOCAL_BYTES",
-          default_value_t = cats_blockd::engine::DEFAULT_MAX_LOCAL_BYTES)]
+          default_value_t = cats_api::blockd::DEFAULT_MAX_LOCAL_BYTES)]
     blockd_max_local_bytes: u64,
     /// Delegated cgroup v2 subtree for authoritative billing counters.
     #[arg(long, env = "CATS_METERING_CGROUP_ROOT")]

@@ -2,14 +2,15 @@
 //! transmission commands READ / WRITE / FLUSH / TRIM / WRITE_ZEROES / DISC.
 //!
 //! The server is the dev/test/recovery frontend for `ChunkEngine`; the
-//! userspace client is shared by tests and by the fake guest, and speaks the
-//! exact same protocol a Linux `nbd-client` would.
+//! lightweight userspace client lives in `cats-block-client` and speaks the
+//! same protocol a Linux `nbd-client` would.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::os::unix::net::UnixListener;
 use std::sync::Arc;
+
+#[cfg(test)]
+use std::os::unix::net::UnixStream;
 
 use crate::engine::{ChunkEngine, EngineError};
 
@@ -328,198 +329,15 @@ fn simple_reply<S: Read + Write>(
     stream.flush()
 }
 
-// ---------------------------------------------------------------------------
-// Client
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, thiserror::Error)]
-pub enum NbdError {
-    #[error("nbd i/o error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("nbd protocol error: {0}")]
-    Protocol(String),
-    #[error("nbd server returned errno {0}")]
-    Server(u32),
-}
-
-pub type NbdResult<T> = std::result::Result<T, NbdError>;
-
-pub trait ReadWriteSend: Read + Write + Send {}
-impl<T: Read + Write + Send> ReadWriteSend for T {}
-
-/// Synchronous userspace NBD client.
-pub struct NbdClient {
-    stream: Box<dyn ReadWriteSend>,
-    size: u64,
-    next_handle: u64,
-}
-
-impl NbdClient {
-    pub fn connect_unix(path: &Path) -> NbdResult<Self> {
-        let stream = UnixStream::connect(path)?;
-        Self::handshake(Box::new(stream))
-    }
-
-    pub fn connect_tcp(addr: &str) -> NbdResult<Self> {
-        let stream = TcpStream::connect(addr)?;
-        stream.set_nodelay(true).ok();
-        Self::handshake(Box::new(stream))
-    }
-
-    /// Handshake over an arbitrary stream (tests use `UnixStream::pair`).
-    pub fn handshake(mut stream: Box<dyn ReadWriteSend>) -> NbdResult<Self> {
-        let magic = stream.get_u64()?;
-        if magic != NBD_MAGIC {
-            return Err(NbdError::Protocol("bad server magic".into()));
-        }
-        let opt_magic = stream.get_u64()?;
-        if opt_magic != IHAVEOPT {
-            return Err(NbdError::Protocol("server is not newstyle".into()));
-        }
-        let _server_flags = stream.get_u16()?;
-        stream.put_u32(CFLAG_FIXED_NEWSTYLE | CFLAG_NO_ZEROES)?;
-
-        // NBD_OPT_GO with the default (empty) export name, no info requests.
-        stream.put_u64(IHAVEOPT)?;
-        stream.put_u32(OPT_GO)?;
-        stream.put_u32(6)?; // u32 name_len(0) + u16 n_infos(0)
-        stream.put_u32(0)?;
-        stream.put_u16(0)?;
-        stream.flush()?;
-
-        let mut size: Option<u64> = None;
-        loop {
-            let magic = stream.get_u64()?;
-            if magic != REPLY_MAGIC {
-                return Err(NbdError::Protocol("bad option reply magic".into()));
-            }
-            let _option = stream.get_u32()?;
-            let reply_type = stream.get_u32()?;
-            let len = stream.get_u32()?;
-            let mut data = vec![0u8; len as usize];
-            stream.read_exact(&mut data)?;
-            match reply_type {
-                REP_INFO => {
-                    if data.len() >= 12 {
-                        let info_type = u16::from_be_bytes([data[0], data[1]]);
-                        if info_type == INFO_EXPORT {
-                            size = Some(u64::from_be_bytes(data[2..10].try_into().unwrap()));
-                        }
-                    }
-                }
-                REP_ACK => break,
-                t if t >= 0x8000_0000 => {
-                    return Err(NbdError::Protocol(format!("GO rejected: {t:#x}")));
-                }
-                _ => {}
-            }
-        }
-        let size = size.ok_or_else(|| NbdError::Protocol("no export info".into()))?;
-        Ok(Self {
-            stream,
-            size,
-            next_handle: 1,
-        })
-    }
-
-    pub fn size(&self) -> u64 {
-        self.size
-    }
-
-    fn roundtrip(
-        &mut self,
-        cmd: u16,
-        flags: u16,
-        offset: u64,
-        length: u32,
-        payload: Option<&[u8]>,
-        read_back: bool,
-    ) -> NbdResult<Vec<u8>> {
-        let handle = self.next_handle;
-        self.next_handle += 1;
-        self.stream.put_u32(REQUEST_MAGIC)?;
-        self.stream.put_u16(flags)?;
-        self.stream.put_u16(cmd)?;
-        self.stream.put_u64(handle)?;
-        self.stream.put_u64(offset)?;
-        self.stream.put_u32(length)?;
-        if let Some(p) = payload {
-            self.stream.write_all(p)?;
-        }
-        self.stream.flush()?;
-
-        let magic = self.stream.get_u32()?;
-        if magic != SIMPLE_REPLY_MAGIC {
-            return Err(NbdError::Protocol("bad reply magic".into()));
-        }
-        let error = self.stream.get_u32()?;
-        let reply_handle = self.stream.get_u64()?;
-        if reply_handle != handle {
-            return Err(NbdError::Protocol("reply handle mismatch".into()));
-        }
-        if error != 0 {
-            return Err(NbdError::Server(error));
-        }
-        if read_back {
-            let mut data = vec![0u8; length as usize];
-            self.stream.read_exact(&mut data)?;
-            Ok(data)
-        } else {
-            Ok(Vec::new())
-        }
-    }
-
-    pub fn read(&mut self, offset: u64, length: u32) -> NbdResult<Vec<u8>> {
-        self.roundtrip(CMD_READ, 0, offset, length, None, true)
-    }
-
-    pub fn write(&mut self, offset: u64, data: &[u8]) -> NbdResult<()> {
-        self.roundtrip(CMD_WRITE, 0, offset, data.len() as u32, Some(data), false)?;
-        Ok(())
-    }
-
-    pub fn write_fua(&mut self, offset: u64, data: &[u8]) -> NbdResult<()> {
-        self.roundtrip(
-            CMD_WRITE,
-            CMD_FLAG_FUA,
-            offset,
-            data.len() as u32,
-            Some(data),
-            false,
-        )?;
-        Ok(())
-    }
-
-    pub fn flush(&mut self) -> NbdResult<()> {
-        self.roundtrip(CMD_FLUSH, 0, 0, 0, None, false)?;
-        Ok(())
-    }
-
-    pub fn trim(&mut self, offset: u64, length: u32) -> NbdResult<()> {
-        self.roundtrip(CMD_TRIM, 0, offset, length, None, false)?;
-        Ok(())
-    }
-
-    pub fn disconnect(mut self) -> NbdResult<()> {
-        let handle = self.next_handle;
-        self.stream.put_u32(REQUEST_MAGIC)?;
-        self.stream.put_u16(0)?;
-        self.stream.put_u16(CMD_DISC)?;
-        self.stream.put_u64(handle)?;
-        self.stream.put_u64(0)?;
-        self.stream.put_u32(0)?;
-        self.stream.flush()?;
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::EngineConfig;
+    use cats_block_client::{NbdClient, NbdError};
     use cats_metadata_store_sqlite::SqliteMetadataStore;
     use cats_object_store_file::FileBlobStore;
     use cats_storage::MetadataStore;
+    use std::path::Path;
 
     fn engine(dir: &Path) -> Arc<ChunkEngine> {
         let blob = Arc::new(FileBlobStore::open(dir.join("blob")).unwrap());

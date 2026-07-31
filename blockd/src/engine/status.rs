@@ -1,4 +1,5 @@
 use super::*;
+use cats_api::blockd::DurabilityStatus;
 
 /// When a FLUSH acknowledgment is allowed to reach the Guest (ADR-0022).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,32 +20,6 @@ pub enum DurabilityMode {
     /// `drain_interval_ms == 0` disables the background committer entirely;
     /// explicit drains still work. This is a deterministic mode for tests.
     Relaxed { drain_interval_ms: u64 },
-}
-
-/// Observable local/remote durability watermarks for one attached volume.
-///
-/// `local_durable_generation` is what a relaxed Guest FLUSH has reached on the
-/// Host NVMe. `remote_durable_generation` is the latest S3 + metadata-CAS
-/// generation and therefore the restore point after permanent Host loss.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct DurabilityStatus {
-    pub mode: String,
-    pub local_durable_generation: i64,
-    pub remote_durable_generation: i64,
-    pub unpublished_generations: usize,
-    pub unpublished_bytes: u64,
-    pub oldest_unpublished_age_ms: u64,
-    pub max_unpublished_generations: usize,
-    pub max_unpublished_bytes: u64,
-    pub local_allocated_bytes: u64,
-    /// Physical bytes plus space reserved to stage the current dirty set.
-    #[serde(default)]
-    pub local_accounted_bytes: u64,
-    pub max_local_bytes: u64,
-    pub evicted_cache_chunks: u64,
-    pub backpressured: bool,
-    pub fenced: bool,
-    pub last_publish_error: Option<String>,
 }
 
 impl ChunkEngine {

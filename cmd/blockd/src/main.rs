@@ -5,6 +5,7 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use cats_api::blockd::{BlockdControlCommand, BlockdControlResponse};
 use cats_blockd::engine::{ChunkEngine, EngineConfig};
 use cats_blockd::nbd;
 use cats_metadata_store_postgres::PostgresMetadataStoreFactory;
@@ -442,18 +443,24 @@ fn serve_control(listener: UnixListener, engine: std::sync::Arc<cats_blockd::eng
             if reader.read_line(&mut line).is_err() {
                 return;
             }
-            let reply = match line.trim() {
-                "drain" => match engine.drain_staged() {
-                    Ok(generation) => format!("OK {generation}\n"),
-                    Err(error) => format!("ERR {error}\n"),
+            let reply = match line.trim().parse::<BlockdControlCommand>() {
+                Ok(BlockdControlCommand::Drain) => match engine.drain_staged() {
+                    Ok(generation) => BlockdControlResponse::ok(generation.to_string()),
+                    Err(error) => BlockdControlResponse::error(error.to_string()),
                 },
-                "status" => match serde_json::to_string(&engine.durability_status()) {
-                    Ok(status) => format!("OK {status}\n"),
-                    Err(error) => format!("ERR serialize status: {error}\n"),
-                },
-                other => format!("ERR unknown command {other:?}\n"),
+                Ok(BlockdControlCommand::Status) => {
+                    match serde_json::to_string(&engine.durability_status()) {
+                        Ok(status) => BlockdControlResponse::ok(status),
+                        Err(error) => {
+                            BlockdControlResponse::error(format!("serialize status: {error}"))
+                        }
+                    }
+                }
+                Err(error) => {
+                    BlockdControlResponse::error(format!("unknown command {:?}", error.command()))
+                }
             };
-            let _ = (&connection).write_all(reply.as_bytes());
+            let _ = (&connection).write_all(reply.to_wire().as_bytes());
         });
     }
 }

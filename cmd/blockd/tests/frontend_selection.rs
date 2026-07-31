@@ -141,7 +141,7 @@ fn vhost_user_is_rejected_off_linux() {
 /// private copy of the rootfs, so this asserts on what landed in the object store.
 #[test]
 fn a_root_disk_is_provisioned_from_a_shared_image_without_copying_it() {
-    use cats_blockd::nbd::NbdClient;
+    use cats_block_client::NbdClient;
     use std::io::Write;
     use std::process::Stdio;
 
@@ -245,7 +245,7 @@ fn a_root_disk_is_provisioned_from_a_shared_image_without_copying_it() {
 /// holding a 1.5 s attachment lease lost the lease and failed the launch.
 #[test]
 fn an_image_is_published_once_and_then_referenced_by_id() {
-    use cats_blockd::nbd::NbdClient;
+    use cats_block_client::NbdClient;
     use std::io::Write;
     use std::process::Stdio;
 
@@ -333,7 +333,7 @@ fn an_image_is_published_once_and_then_referenced_by_id() {
 /// GC through the real binary: it attaches, sweeps, and exits without a listener.
 #[test]
 fn collecting_garbage_needs_no_listener_and_leaves_live_objects_alone() {
-    use cats_blockd::nbd::NbdClient;
+    use cats_block_client::NbdClient;
     use std::process::Stdio;
 
     let env = Env::new();
@@ -402,7 +402,7 @@ mod vhost_user {
     use std::process::{Child, Stdio};
     use std::time::{Duration, Instant};
 
-    use cats_blockd::nbd::NbdClient;
+    use cats_block_client::NbdClient;
 
     use super::{wait_ready, Env, VOL_SIZE};
 

@@ -7,7 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cats_blockd::nbd::{NbdClient, NbdError, EPERM};
+use cats_block_client::{NbdClient, NbdError, EPERM};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_storage::MetadataStore;
 

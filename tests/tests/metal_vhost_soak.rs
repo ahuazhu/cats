@@ -25,10 +25,10 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, ensure, Context, Result};
 use cats_api::nodejob::{JobPhase, NodeJob, NodeJobAction, NodeJobResult, VolumeGrant};
 use cats_api::resources::{DiskDurability, ObservedState};
+use cats_block_client::NbdClient;
 use cats_blockd::engine::{
     DurabilityStatus, DEFAULT_MAX_LOCAL_BYTES, DEFAULT_MAX_STAGED_BYTES, DEFAULT_MAX_STAGED_PACKS,
 };
-use cats_blockd::nbd::NbdClient;
 use cats_metadata_store_postgres::PostgresMetadataStoreFactory;
 use cats_node_agent::admission::WakeBudget;
 use cats_node_agent::ch::{BlockPath, ChConfig};
