@@ -39,9 +39,14 @@ cats warm NAME
 cats destroy NAME
 cats expiry NAME [--in SECONDS | --at UNIX | --never]
 cats exec NAME [--timeout SECONDS] [--env-file PATH]
-               [--stdin-file PATH] -- COMMAND [ARG...]</code></pre>
+               [--stdin-file PATH] -- COMMAND [ARG...]
+cats deploy CAT APP --image REGISTRY/REPOSITORY@sha256:DIGEST
+                [--env-file PATH]
+                [--registry-username USER --registry-password-stdin]
+                [-- COMMAND [ARG...]]</code></pre>
 <p><code>create</code> 默认使用 <code>ubuntu-24.04</code> 镜像、2 CPU、2 GiB 内存、1 GiB RootDisk，并开启自动休眠。容量支持 <code>KiB</code>、<code>MiB</code>、<code>GiB</code> 或原始字节。</p>
 <p><code>exec --env-file</code> 接受逐行 <code>NAME=VALUE</code>，并且只把它们加入 Guest 子进程环境；<code>--stdin-file</code> 将任意文件字节送入标准输入。自动化可以用它们传递 Bootstrap Script 和运行时凭据，而无需把内容放到命令行。不要打印含 Secret 的文件或进程环境。</p>
+<p><code>deploy</code> 在 Cat 内拉取 OCI/Docker manifest 与 layer，校验每个 <code>sha256</code> descriptor，将 layer 扁平化写入 RootDisk，再由 systemd 运行应用；不需要 Docker 或 OverlayFS。镜像必须固定到 digest，tag 会被拒绝。Registry 密码从 stdin 读取且不持久化。<code>deploy --env-file</code> 与 <code>exec --env-file</code> 不同：它会成为 RootDisk 上的持久 systemd 配置，以便 Cold boot 后继续启动服务，所以不能包含 Secret。</p>
 
 <h2 id="sleep-commands">自动休眠命令</h2>
 <pre><code>cats sleep on NAME

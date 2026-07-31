@@ -14,6 +14,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 
+use cats_api::oci::{DeployOciRequest, OciDeployment, OciRegistryAuth};
 use cats_api::requests::*;
 use cats_api::resources::*;
 
@@ -133,6 +134,28 @@ pub enum Command {
         stdin_file: Option<std::path::PathBuf>,
         /// Command argv, after `--`.
         #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Deploy a digest-pinned OCI image as a supervised service in a Cat.
+    Deploy {
+        /// Cat name or ID.
+        name: String,
+        /// Stable application and systemd service name.
+        app: String,
+        /// Explicit registry reference ending in `@sha256:<digest>`.
+        #[arg(long)]
+        image: String,
+        /// NAME=VALUE lines merged over the OCI image environment.
+        #[arg(long, value_name = "PATH")]
+        env_file: Option<std::path::PathBuf>,
+        /// Registry username. Pair with --registry-password-stdin.
+        #[arg(long, requires = "registry_password_stdin")]
+        registry_username: Option<String>,
+        /// Read one registry password/token from stdin, keeping it out of argv.
+        #[arg(long, requires = "registry_username")]
+        registry_password_stdin: bool,
+        /// Replace the OCI Entrypoint + Cmd, after `--`.
+        #[arg(last = true)]
         command: Vec<String>,
     },
     /// Open an interactive login shell inside the cat.
@@ -821,6 +844,69 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Command::Deploy {
+            name,
+            app,
+            image,
+            env_file,
+            registry_username,
+            registry_password_stdin,
+            command,
+        } => {
+            let env = env_file
+                .as_deref()
+                .map(read_exec_env_file)
+                .transpose()?
+                .unwrap_or_default();
+            let registry_auth = if *registry_password_stdin {
+                use std::io::Read as _;
+                let mut password = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut password)
+                    .context("read registry password from stdin")?;
+                let password = password.trim_end_matches(['\r', '\n']).to_string();
+                anyhow::ensure!(!password.is_empty(), "registry password stdin was empty");
+                Some(OciRegistryAuth {
+                    username: registry_username
+                        .clone()
+                        .expect("clap requires a registry username"),
+                    password,
+                })
+            } else {
+                None
+            };
+            let body = DeployOciRequest {
+                app: app.clone(),
+                image: image.clone(),
+                command: command.clone(),
+                env,
+                registry_auth,
+            };
+            let value = client.send(
+                client
+                    .http
+                    .post(client.url(&format!("/cats/{name}/oci-deployments")))
+                    .timeout(Duration::from_secs(3_615))
+                    .json(&body),
+            )?;
+            let deployment: OciDeployment = serde_json::from_value(value)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&deployment)?);
+            } else {
+                println!(
+                    "deployed {} {} as {} ({})",
+                    deployment.app,
+                    deployment.manifest_digest,
+                    deployment.service,
+                    if deployment.active {
+                        "active"
+                    } else {
+                        "installed"
+                    }
+                );
+            }
+            Ok(())
+        }
         Command::Shell { name } => {
             shell::run(&client.base, &client.workspace_id, &client.token, name)
         }
@@ -1349,6 +1435,31 @@ mod tests {
                 assert_eq!(timeout, None, "no flag means the API default");
             }
             _ => panic!("wrong parse"),
+        }
+        let deploy = Cli::parse_from([
+            "cats",
+            "deploy",
+            "preview",
+            "server",
+            "--image",
+            "ghcr.io/paperboy/server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--",
+            "/app/server",
+        ]);
+        match deploy.command {
+            Command::Deploy {
+                name,
+                app,
+                command,
+                registry_password_stdin,
+                ..
+            } => {
+                assert_eq!(name, "preview");
+                assert_eq!(app, "server");
+                assert_eq!(command, vec!["/app/server"]);
+                assert!(!registry_password_stdin);
+            }
+            other => panic!("expected deploy, got {other:?}"),
         }
         assert!(matches!(
             Cli::parse_from(["cats", "shell", "dev"]).command,

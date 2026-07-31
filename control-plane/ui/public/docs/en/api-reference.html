@@ -30,6 +30,7 @@ GET    /v1/workspaces/{workspace_id}/cats/{cat}
 DELETE /v1/workspaces/{workspace_id}/cats/{cat}
 POST   /v1/workspaces/{workspace_id}/cats/{cat}/actions/{verb}
 POST   /v1/workspaces/{workspace_id}/cats/{cat}/exec
+POST   /v1/workspaces/{workspace_id}/cats/{cat}/oci-deployments
 GET    /v1/workspaces/{workspace_id}/cats/{cat}/work
 GET    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
 PUT    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
@@ -38,6 +39,13 @@ PUT    /v1/workspaces/{workspace_id}/cats/{cat}/expiry</code></pre>
 <p>Lifecycle verbs are <code>start</code>, <code>stop</code>, <code>suspend</code>, <code>resume</code>, and <code>warm</code>. <code>auto_suspend</code> defaults to <code>true</code> when omitted from create. Cat create/lifecycle/delete returns an asynchronous Operation response; poll the Operation URL instead of repeating a timed-out mutation with a new intent.</p>
 <p>Cat, Disk, and Operation responses include the immutable <code>workspace_id</code>, which is the only ownership key.</p>
 <p><code>exec</code> accepts <code>command</code>, optional <code>timeout_ms</code>, an optional string map <code>env</code>, and optional byte array <code>stdin</code>. <code>env</code> is passed only to the child process and is not stored in the Cats registry. The response contains <code>exit_code</code>, <code>stdout</code>, and <code>stderr</code>.</p>
+<p><code>oci-deployments</code> accepts a stable <code>app</code>, a digest-pinned <code>image</code>, optional argv override <code>command</code>, persistent non-secret <code>env</code>, and optional one-pull <code>registry_auth</code>. Cats does not store Registry credentials. The Guest verifies and flattens the OCI layers and returns the requested image digest, selected platform-manifest digest, systemd service name, and active state.</p>
+<pre><code>{
+  "app": "server",
+  "image": "ghcr.io/acme/server@sha256:0123...cdef",
+  "env": { "PORT": "8080" }
+}</code></pre>
+<p>The image must use a full 64-hex-character <code>sha256</code> digest; mutable tags are rejected. <code>env</code> is written into the service unit on the RootDisk so it survives Cold boot and therefore must not contain secrets.</p>
 <pre><code>POST /v1/workspaces/ws_01J8QK.../cats
 Idempotency-Key: request-7f12
 

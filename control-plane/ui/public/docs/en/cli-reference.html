@@ -39,9 +39,14 @@ cats warm NAME
 cats destroy NAME
 cats expiry NAME [--in SECONDS | --at UNIX | --never]
 cats exec NAME [--timeout SECONDS] [--env-file PATH]
-               [--stdin-file PATH] -- COMMAND [ARG...]</code></pre>
+               [--stdin-file PATH] -- COMMAND [ARG...]
+cats deploy CAT APP --image REGISTRY/REPOSITORY@sha256:DIGEST
+                [--env-file PATH]
+                [--registry-username USER --registry-password-stdin]
+                [-- COMMAND [ARG...]]</code></pre>
 <p><code>create</code> defaults to image <code>ubuntu-24.04</code>, 2 CPUs, 2 GiB memory, a 1 GiB RootDisk, and auto-suspend enabled. Sizes accept <code>KiB</code>, <code>MiB</code>, <code>GiB</code>, or raw bytes.</p>
 <p><code>exec --env-file</code> accepts newline-delimited <code>NAME=VALUE</code> entries and adds them only to the Guest child process. <code>--stdin-file</code> sends arbitrary file bytes to standard input. These options let automation transfer a bootstrap script and runtime credentials without putting either in the command line; do not print secret-bearing files or command environments.</p>
+<p><code>deploy</code> pulls OCI/Docker manifests and layers inside the Cat, verifies every <code>sha256</code> descriptor, flattens the layers onto the RootDisk, and runs the image under systemd. It uses neither Docker nor OverlayFS. The image must be digest-pinned; tags are rejected. Registry passwords are read from stdin and are not persisted. <code>deploy --env-file</code> is different from <code>exec --env-file</code>: it becomes persistent systemd configuration on the RootDisk so the service survives Cold boot, and must not contain secrets.</p>
 
 <h2 id="sleep-commands">Auto-suspend commands</h2>
 <pre><code>cats sleep on NAME

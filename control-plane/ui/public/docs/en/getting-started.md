@@ -57,6 +57,25 @@ Creation also creates the RootDisk and enables work-driven auto-suspend by defau
 
 `exec` wakes a Suspended, Warm, or Cold Cat when necessary. Arguments after `--` become the Guest command argv; shell syntax only works when you explicitly invoke a shell as in the second example.
 
+## Deploy an OCI application
+
+Use Cats' native Bundle Deploy when CI already publishes an OCI image:
+
+    cats deploy dev server \
+      --image ghcr.io/acme/server@sha256:<64-hex-digest>
+
+For a private Registry, keep the pull token out of argv:
+
+    printf '%s\n' "$REGISTRY_TOKEN" | \
+      cats deploy dev server \
+        --image ghcr.io/acme/server@sha256:<64-hex-digest> \
+        --registry-username "$REGISTRY_USER" \
+        --registry-password-stdin
+
+Cats verifies the manifest/config/layer digests, flattens the image onto the persistent RootDisk, and enables a systemd service. It does not run Docker or require OverlayFS. Multiple apps in one Cat share its network namespace, so they reach each other over `127.0.0.1`; an app listening on the endpoint port is directly reachable.
+
+`--env-file` on `deploy` is persistent application configuration stored in the RootDisk's systemd unit. Do not put secrets there. Registry pull credentials are transient; general Secret injection is a separate, not-yet-implemented resource.
+
 ## What the Guest kernel provides
 
 The Guest runs a purpose-built minimal kernel: virtio block, network and vsock, ext4 — and no loadable modules (`/lib/modules` is empty, there is no `modprobe`). Two absences surprise ordinary Linux software:
@@ -64,7 +83,7 @@ The Guest runs a purpose-built minimal kernel: virtio block, network and vsock, 
 - **no overlayfs** — container runtimes cannot use their default `overlay2`/`fuse-overlayfs` storage driver;
 - **no nf_tables** — `iptables` fails with `Failed to initialize nft: Protocol not supported`, so nothing can create NAT or filter chains.
 
-Both are avoidable rather than fatal. A container runtime works inside a Cat when it stops relying on either:
+Prefer `cats deploy` for OCI application delivery. If you specifically need a container runtime inside the Cat, it works only when it stops relying on either missing feature:
 
     dockerd --storage-driver=vfs --iptables=false --ip6tables=false --bridge=none
     docker run --network host ...

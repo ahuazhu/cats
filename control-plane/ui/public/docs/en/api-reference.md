@@ -37,6 +37,7 @@ Token creation returns `{ "access_token": {…metadata…}, "token": "cats_wst_�
     DELETE /v1/workspaces/{workspace_id}/cats/{cat}
     POST   /v1/workspaces/{workspace_id}/cats/{cat}/actions/{verb}
     POST   /v1/workspaces/{workspace_id}/cats/{cat}/exec
+    POST   /v1/workspaces/{workspace_id}/cats/{cat}/oci-deployments
     GET    /v1/workspaces/{workspace_id}/cats/{cat}/work
     GET    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
     PUT    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
@@ -48,6 +49,16 @@ Lifecycle verbs are `start`, `stop`, `suspend`, `resume`, and `warm`. `auto_susp
 Cat, Disk, and Operation responses include the immutable `workspace_id`, which is the only ownership key.
 
 `exec` accepts `command`, optional `timeout_ms`, an optional string map `env`, and optional byte array `stdin`. `env` is passed only to the child process and is not stored in the Cats registry. The response contains `exit_code`, `stdout`, and `stderr`.
+
+`oci-deployments` accepts a stable `app`, a digest-pinned `image`, optional argv override `command`, persistent non-secret `env`, and optional one-pull `registry_auth`. Cats does not store Registry credentials. The Guest verifies and flattens the OCI layers and returns the requested image digest, selected platform-manifest digest, systemd service name, and active state.
+
+    {
+      "app": "server",
+      "image": "ghcr.io/acme/server@sha256:0123...cdef",
+      "env": { "PORT": "8080" }
+    }
+
+The image must use a full 64-hex-character `sha256` digest; mutable tags are rejected. `env` is written into the service unit on the RootDisk so it survives Cold boot and therefore must not contain secrets.
 
     POST /v1/workspaces/ws_01J8QK.../cats
     Idempotency-Key: request-7f12

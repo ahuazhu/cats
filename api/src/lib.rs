@@ -21,5 +21,6 @@ pub mod guest;
 pub mod ids;
 pub mod metering;
 pub mod nodejob;
+pub mod oci;
 pub mod requests;
 pub mod resources;

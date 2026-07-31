@@ -11,6 +11,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+use crate::oci::{DeployOciRequest, OciDeployment};
+
 pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 
 /// Stable Guest ABI endpoint. The Guest Agent serves HTTP/1.1 over this Unix
@@ -113,6 +115,8 @@ pub enum GuestRequestBody {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         stdin: Vec<u8>,
     },
+    /// Pull, verify, flatten and start a digest-pinned OCI application.
+    DeployOci { deploy: DeployOciRequest },
     /// Start an interactive login shell attached to a pseudoterminal. After
     /// `ShellReady`, this control connection switches to `GuestShellFrame`
     /// messages until the shell exits or the caller closes it.
@@ -166,6 +170,9 @@ pub enum GuestResponseBody {
         exit_code: i32,
         stdout: String,
         stderr: String,
+    },
+    OciDeployed {
+        deployment: OciDeployment,
     },
     ShellReady,
     Ok,

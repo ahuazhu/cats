@@ -102,6 +102,26 @@ impl NodeRuntime {
         client.exec_with_input(command, env, stdin)
     }
 
+    pub fn deploy_oci(
+        &self,
+        cat_id: &str,
+        deploy: cats_api::oci::DeployOciRequest,
+    ) -> Result<cats_api::oci::OciDeployment> {
+        let (conn, activity) = {
+            let cats = self.cats.lock().unwrap();
+            let runtime = cats
+                .get(cat_id)
+                .context("cat is not running on this node")?;
+            if runtime.state != ObservedState::Running {
+                bail!("cat is not running (state {:?})", runtime.state);
+            }
+            (runtime.conn(), runtime.activity.clone())
+        };
+        let _guard = activity.acquire()?;
+        let mut client = conn.connect_long_running()?;
+        client.deploy_oci(deploy)
+    }
+
     pub(crate) fn open_shell(
         &self,
         cat_id: &str,

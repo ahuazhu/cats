@@ -775,9 +775,18 @@ mode 1777 的 tmpfs。用户在 chroot/container 里 recursive-bind 后卸载 `/
 | 方式 | 适用场景 | 实现 | 持久性 |
 |----|----|----|----|
 | Interactive | 开发、调试、长期工作区 | 用户 shell 进入 Cat，自行 git clone / install / run | 所有系统和工作区变化进入 RootDisk |
-| Bundle Deploy | CI 临时环境、预览服务 | `cats deploy` 引用 OCI artifact/bundle digest；Guest Agent 拉取或 Node 通过受控通道注入 | spec 写 registry；bundle 按 digest；运行结果可写 Root/PersistentDisk |
+| Bundle Deploy | CI 临时环境、预览服务 | `cats deploy` 引用 OCI image digest；Guest Agent 拉取、校验并扁平化 layers | systemd unit 与展开目录写 RootDisk；应用数据可写 Root/PersistentDisk |
 
-**Secret 处理：**环境变量适合短期进程 Secret，但不能进入镜像 manifest 或可读 operation payload。需要文件 Secret 时，Guest Agent 写入 tmpfs 并设置 mode/owner；用户明确选择持久化时才写 RootDisk，并提示其进入快照。
+当前 Bundle Deploy 实现由
+[ADR-0024](decisions/0024-digest-pinned-oci-bundle-deploy.md) 固定：只接受
+`registry/repository@sha256:...`，Guest 校验并扁平化 OCI/Docker layers，以 systemd
+`RootDirectory=` 运行；不需要 Docker daemon 或 OverlayFS。它复用 Cat 网络与 RootDisk，
+OCI chroot 不是另一个多租户隔离边界。
+
+**Secret 处理：**当前 Registry pull credential 只随一次 deploy 转发，不持久化；
+`cats deploy --env-file` 则是会进入 RootDisk/systemd unit 的**持久配置**，不能当作
+Secret。目标 Secret Resource 仍应在 Guest Ready 后以 tmpfs/进程 credential 注入，
+控制面只保存密文与 reference；该能力未实现前，不能宣称 deploy env 不落盘。
 
 ## 12. 安全与多租户
 
