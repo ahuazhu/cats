@@ -35,8 +35,11 @@ whiteout 和进程配置，这些能力可以独立于 Docker/OverlayFS 复用�
    对应一个完整展开的目录，因此换取的是实现与故障边界简单，代价是每个 app/digest
    占一份展开后的 RootDisk 空间。RootDisk 的 Direct-S3/Delta/CoW 仍按普通文件写处理，
    本 ADR 不改变 Golden Root、ChunkStore、FLUSH、GC 或 durability 协议。
-6. 激活使用原子 `current` symlink，并写入 `cats-oci-<app>.service`。systemd
-   `RootDirectory=` 提供 chroot 视图，`MountAPIVFS=yes` 提供标准 API 文件系统；
+6. 激活使用原子 `current` symlink，并原子写入 `cats-oci-<app>.service`。unit 的
+   `RootDirectory=` 必须直接钉住不可变的 `releases/<manifest-digest>` 目录；
+   systemd 会 bind-mount 该路径，不能把最终分量为 symlink 的 `current` 直接交给它。
+   `current` 保留为当前 release 的稳定检查/回滚指针，unit 中的 digest 路径是实际执行
+   来源。`RootDirectory=` 提供 chroot 视图，`MountAPIVFS=yes` 提供标准 API 文件系统；
    进程共享 Cat 的网络 namespace，因此直接监听 Guest 端口，不做 `docker -p`。
    OCI `Entrypoint + Cmd`、`Env`、`WorkingDir`、数字/名字形式的 `User[:Group]`
    被翻译成 unit；CLI 可覆盖 argv 和非敏感环境配置。

@@ -1166,8 +1166,11 @@ impl OciDeployer {
             // Resolve argv/user/working-directory and finish the unit before
             // changing the active symlink. Invalid image metadata therefore
             // cannot replace a working release.
-            let unit = render_unit(&request.app, &release, &current, &config.config, &request)?;
-            write_atomic(&self.unit_dir.join(&unit_name), unit.as_bytes())?;
+            //
+            // RootDirectory must name the immutable release itself: systemd
+            // bind-mounts this path and rejects a final `current` symlink with
+            // status=226/NAMESPACE.
+            let unit = render_unit(&request.app, &release, &release, &config.config, &request)?;
             let next = app_root.join(format!(".current-{}", Uuid::new_v4().simple()));
             #[cfg(unix)]
             std::os::unix::fs::symlink(
@@ -1176,6 +1179,7 @@ impl OciDeployer {
             )?;
             fs::rename(&next, &current).context("activate OCI release")?;
             File::open(&app_root)?.sync_all()?;
+            write_atomic(&self.unit_dir.join(&unit_name), unit.as_bytes())?;
             if self.systemd {
                 systemctl(&["daemon-reload"])?;
                 systemctl(&["enable", &unit_name])?;
@@ -1506,6 +1510,14 @@ mod tests {
             .join("oci/fixture/current/usr/bin/cats-fixture")
             .exists());
         let unit = fs::read_to_string(dir.path().join("units/cats-oci-fixture.service")).unwrap();
+        let release_root = dir
+            .path()
+            .join("oci/fixture/releases")
+            .join(manifest_digest.trim_start_matches("sha256:"));
+        assert!(unit.contains(&format!(
+            "RootDirectory={}",
+            unit_path_value(&release_root.display().to_string()).unwrap()
+        )));
         assert!(unit.contains("ExecStart=\"/usr/bin/cats-fixture\""));
     }
 }
