@@ -529,6 +529,23 @@ fn a_cordoned_node_stays_unschedulable_across_a_lost_recovery_cycle() {
 }
 
 #[test]
+fn a_fenced_node_identity_cannot_reregister_or_heartbeat_back_to_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("control.db")).unwrap();
+    store
+        .register_node("node_a", "http://node", "http://gateway", 4, 8192)
+        .unwrap();
+    store.set_node_state("node_a", NodeState::Fenced).unwrap();
+
+    store
+        .register_node("node_a", "http://node-new", "http://gateway", 4, 8192)
+        .unwrap();
+    store.heartbeat_node("node_a", None).unwrap();
+    store.set_node_state("node_a", NodeState::Ready).unwrap();
+    assert_eq!(store.get_node("node_a").unwrap().state, NodeState::Fenced);
+}
+
+#[test]
 fn last_guest_work_release_is_immediately_suspend_eligible() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("control.db")).unwrap();

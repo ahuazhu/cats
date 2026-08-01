@@ -85,6 +85,15 @@ pub struct ResizeDiskRequest {
     pub size_bytes: u64,
 }
 
+/// Explicit authorization for destructive lost-Host fencing.
+///
+/// A stale heartbeat is not sufficient evidence: the caller must first prove
+/// through an external mechanism that the old Host can no longer execute.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FenceNodeRequest {
+    pub confirm_host_stopped_or_isolated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateEndpointRequest {
     pub name: String,

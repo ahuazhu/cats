@@ -323,7 +323,14 @@ pub enum AdminNodeCommand {
     Drain {
         id: String,
     },
-    /// Remove an empty cordoned/lost node from the registry.
+    /// Revoke claims on a lost node after external Host fencing is proven.
+    Fence {
+        id: String,
+        /// Confirm the old Host is powered off or isolated from execution.
+        #[arg(long)]
+        confirm_host_stopped_or_isolated: bool,
+    },
+    /// Remove an empty cordoned/lost/fenced node from the registry.
     Delete {
         id: String,
     },
@@ -1146,12 +1153,13 @@ fn run_admin(client: &Client, cli: &Cli, cmd: &AdminCommand) -> Result<()> {
                     overview.cats.failed_or_unknown
                 );
                 println!(
-                    "nodes total={} ready={} cordoned={} draining={} lost={}",
+                    "nodes total={} ready={} cordoned={} draining={} lost={} fenced={}",
                     overview.nodes.total,
                     overview.nodes.ready,
                     overview.nodes.cordoned,
                     overview.nodes.draining,
-                    overview.nodes.lost
+                    overview.nodes.lost,
+                    overview.nodes.fenced
                 );
                 println!(
                     "capacity cpu={}/{} memory={}MiB/{}MiB",
@@ -1183,11 +1191,27 @@ fn run_admin(client: &Client, cli: &Cli, cmd: &AdminCommand) -> Result<()> {
             Ok(())
         }
         AdminCommand::Node { cmd } => {
-            let (id, action) = match cmd {
-                AdminNodeCommand::Get { id } => (id, None),
-                AdminNodeCommand::Cordon { id } => (id, Some("cordon")),
-                AdminNodeCommand::Uncordon { id } => (id, Some("uncordon")),
-                AdminNodeCommand::Drain { id } => (id, Some("drain")),
+            let (id, action, fence_request) = match cmd {
+                AdminNodeCommand::Get { id } => (id, None, None),
+                AdminNodeCommand::Cordon { id } => (id, Some("cordon"), None),
+                AdminNodeCommand::Uncordon { id } => (id, Some("uncordon"), None),
+                AdminNodeCommand::Drain { id } => (id, Some("drain"), None),
+                AdminNodeCommand::Fence {
+                    id,
+                    confirm_host_stopped_or_isolated,
+                } => {
+                    anyhow::ensure!(
+                        confirm_host_stopped_or_isolated,
+                        "refusing to fence without --confirm-host-stopped-or-isolated"
+                    );
+                    (
+                        id,
+                        Some("fence"),
+                        Some(FenceNodeRequest {
+                            confirm_host_stopped_or_isolated: true,
+                        }),
+                    )
+                }
                 AdminNodeCommand::Delete { id } => {
                     client.send(
                         client
@@ -1199,10 +1223,14 @@ fn run_admin(client: &Client, cli: &Cli, cmd: &AdminCommand) -> Result<()> {
                 }
             };
             let request = if let Some(action) = action {
-                client
+                let request = client
                     .http
-                    .post(client.admin_url(&format!("/nodes/{id}/actions/{action}")))
-                    .header("content-length", "0")
+                    .post(client.admin_url(&format!("/nodes/{id}/actions/{action}")));
+                if let Some(body) = fence_request {
+                    request.json(&body)
+                } else {
+                    request.header("content-length", "0")
+                }
             } else {
                 client.http.get(client.admin_url(&format!("/nodes/{id}")))
             };
@@ -1473,6 +1501,25 @@ mod tests {
             Command::Admin {
                 cmd: AdminCommand::Node {
                     cmd: AdminNodeCommand::Drain { .. }
+                }
+            }
+        ));
+        let cli = Cli::parse_from([
+            "cats",
+            "admin",
+            "node",
+            "fence",
+            "node-a",
+            "--confirm-host-stopped-or-isolated",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::Admin {
+                cmd: AdminCommand::Node {
+                    cmd: AdminNodeCommand::Fence {
+                        confirm_host_stopped_or_isolated: true,
+                        ..
+                    }
                 }
             }
         ));

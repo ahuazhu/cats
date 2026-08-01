@@ -16,12 +16,14 @@ CATS_TOKEN='administrator-credential' cats admin monitoring</code></pre>
 cats admin node cordon node-a
 cats admin node drain node-a
 cats admin node uncordon node-a
+cats admin node fence node-a --confirm-host-stopped-or-isolated
 cats admin node delete node-a</code></pre>
 <table><thead><tr><th>Action</th><th>Use</th><th>Safety condition</th></tr></thead><tbody>
   <tr><td>Cordon</td><td>Stop new placement</td><td>Existing Cats continue.</td></tr>
   <tr><td>Drain</td><td>Stop/fence and reschedule Cats, then leave node cordoned</td><td>Durable disk gate and recovery capacity must be available.</td></tr>
   <tr><td>Uncordon</td><td>Return a healthy node to scheduling</td><td>Version, KVM, NVMe, network, and time checks pass.</td></tr>
-  <tr><td>Delete</td><td>Remove registry record</td><td>Node is empty and cordoned or lost.</td></tr>
+  <tr><td>Fence</td><td>Revoke claims on a Lost node and cold-recover its Cats</td><td>An external mechanism has proved the old Host is powered off or isolated. Heartbeat expiry alone is insufficient.</td></tr>
+  <tr><td>Delete</td><td>Remove registry record</td><td>Node is empty and cordoned, lost, or fenced.</td></tr>
 </tbody></table>
 
 <h2 id="drain">Drain workflow</h2>
@@ -34,7 +36,8 @@ cats admin node delete node-a</code></pre>
 </ol>
 
 <h2 id="lost-node">Lost node</h2>
-<p>Do not immediately start duplicate Guests. Wait for the node lease or cloud fencing evidence, revoke old disk ownership, issue a higher attachment epoch, and recover Cats in controlled batches. Rate-limit boot, object GET, and database pressure to avoid a recovery storm.</p>
+<p>Heartbeat expiry marks the node Lost and its Cats Unknown, but deliberately preserves placement, routes, and disk epochs. It does not start duplicate Guests. If the heartbeat returns, matching runtime inventory recovers the existing claim in place.</p>
+<p>For a permanently lost Host, first obtain independent evidence that it is powered off or isolated (for example from the cloud API, BMC, or network fencing). Then run the explicit <code>fence</code> action. Cats persists the terminal Fenced node state, revokes old disk ownership, and cold-recovers its Cats with higher attachment epochs. A Fenced node identity cannot be uncordoned or revived by a late heartbeat; remove it only after Host identity and local-cache cleanup. Rate-limit boot, object GET, and database pressure to avoid a recovery storm.</p>
 
 <h2 id="metrics">Metrics and audit</h2>
 <p>The <code>/metrics</code> endpoint requires administrator authorization. Correlate request ID → Operation → Cat → node → attachment → route epoch. Audit node actions and authorization decisions, but never log tokens, cookies, DSNs, Secret content, terminal plaintext, or Guest disk data.</p>
@@ -46,7 +49,7 @@ GET    /v1/admin/nodes/{id}
 DELETE /v1/admin/nodes/{id}
 POST   /v1/admin/nodes/{id}/actions/{verb}
 GET    /metrics</code></pre>
-<p>Supported node action verbs are <code>cordon</code>, <code>uncordon</code>, and <code>drain</code>. Use <code>uncordon</code> to cancel a drain. All routes require the fleet administrator identity; node registration, heartbeat, route resolution, and internal work endpoints remain service-only APIs.</p>
+<p>Supported node action verbs are <code>cordon</code>, <code>uncordon</code>, <code>drain</code>, and <code>fence</code>. <code>fence</code> requires <code>{"confirm_host_stopped_or_isolated":true}</code> and is accepted only for a Lost/Fenced node. Use <code>uncordon</code> to cancel a drain. All routes require the fleet administrator identity; node registration, heartbeat, route resolution, and internal work endpoints remain service-only APIs.</p>
 
 <h2 id="production-caveats">Source-version caveats</h2>
 <p>The current repository still lacks tap/overlay Guest networking, PostgreSQL for the workspace resource store, and privilege separation. Native vhost-user-blk (ADR-0015) and Suspended page-out (<code>process_madvise(MADV_PAGEOUT)</code> over a per-Cat file-backed memory zone) have both landed; kernel NBD remains the default block path for a measured write-throughput trade-off, not for lack of validation. The Cloud Hypervisor path has passed the recorded bare-metal acceptance run, but those remaining items must be closed before calling the entire stack production-ready.</p>

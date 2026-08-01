@@ -1,10 +1,11 @@
 //! Level-triggered reconciler: converges every cat's observed state to its
 //! desired state by dispatching idempotent jobs to node agents, handles node
-//! loss with lease fencing, and completes operations.
+//! loss detection, explicit Host fencing, and operation completion.
 //!
 //! Invariants owned here (arch doc §6/§8, ADR-0002/0003):
-//! - a cat is started on a node only after every one of its volumes' stale
-//!   leases has been revoked (fence before double-start);
+//! - heartbeat expiry only marks a Host lost and preserves its claims;
+//! - a cat moves off a lost Host only after external fencing is explicitly
+//!   confirmed and every stale volume lease has been revoked;
 //! - Suspended/Warm failures always converge to a clean Cold fallback;
 //! - Suspended/Warm on a lost host are discarded and cold-started elsewhere;
 //! - route epochs bump on every publish/unbind.
@@ -92,7 +93,8 @@ impl Controller {
     }
 
     pub async fn tick(&self) -> anyhow::Result<()> {
-        self.fence_lost_nodes().await?;
+        self.detect_lost_nodes()?;
+        self.converge_confirmed_fences().await?;
         self.drain_nodes().await?;
         for cat_id in self.store.auto_suspend_candidates()? {
             self.maybe_auto_suspend(&cat_id)?;
@@ -172,10 +174,10 @@ impl Controller {
     }
 
     // ------------------------------------------------------------------
-    // Node loss / fencing
+    // Node loss detection / explicit fencing
     // ------------------------------------------------------------------
 
-    async fn fence_lost_nodes(&self) -> anyhow::Result<()> {
+    fn detect_lost_nodes(&self) -> anyhow::Result<()> {
         let now = now_ms();
         if now < self.node_fencing_starts_at_ms {
             return Ok(());
@@ -185,17 +187,68 @@ impl Controller {
             if node.state == NodeState::Lost || fresh {
                 continue;
             }
-            tracing::warn!(node = %node.id, "node lease expired; fencing");
+            if node.state == NodeState::Fenced {
+                continue;
+            }
+            tracing::warn!(
+                node = %node.id,
+                "node heartbeat expired; preserving claims until explicit fencing"
+            );
             self.store.set_node_state(&node.id, NodeState::Lost)?;
             for cat in self.store.cats_on_node(&node.id)? {
-                // Memory states die with the host (ADR-0002): fence the
-                // volumes, drop the placement, converge through Cold.
+                // Lost means unreachable, not dead. Keep placement, routes,
+                // and storage epochs so a transient partition cannot turn a
+                // healthy Guest's root disk read-only.
                 self.store.set_observed(&cat.id, ObservedState::Unknown)?;
-                self.fence_cat_volumes(&cat).await?;
-                self.store.unbind_routes(&cat.id)?;
-                self.store.set_placement(&cat.id, None)?;
-                self.store.set_observed(&cat.id, ObservedState::Cold)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Complete a lost-Host handoff after an external actor has proved that
+    /// the old Host is stopped or isolated. The API owns that explicit safety
+    /// confirmation; this method performs the idempotent state transition.
+    pub(crate) async fn confirm_node_fenced(&self, node_id: &str) -> anyhow::Result<()> {
+        let node = self.store.get_node(node_id)?;
+        anyhow::ensure!(
+            matches!(node.state, NodeState::Lost | NodeState::Fenced),
+            "node {node_id} is not lost"
+        );
+
+        // Persist the terminal, unschedulable identity before revoking any
+        // Cat. If a later volume operation fails, retrying the same action can
+        // finish the remaining Cats without reviving this Host identity.
+        self.store.set_node_state(node_id, NodeState::Fenced)?;
+        tracing::warn!(
+            node = node_id,
+            "external Host fencing confirmed; revoking Cat claims"
+        );
+        self.converge_fenced_node(node_id).await?;
+        self.notify.notify_one();
+        Ok(())
+    }
+
+    /// Resume any handoff whose external fencing confirmation was persisted
+    /// before a controller crash or metadata outage interrupted convergence.
+    async fn converge_confirmed_fences(&self) -> anyhow::Result<()> {
+        for node in self
+            .store
+            .list_nodes()?
+            .into_iter()
+            .filter(|node| node.state == NodeState::Fenced)
+        {
+            self.converge_fenced_node(&node.id).await?;
+        }
+        Ok(())
+    }
+
+    async fn converge_fenced_node(&self, node_id: &str) -> anyhow::Result<()> {
+        for cat in self.store.cats_on_node(node_id)? {
+            self.store.set_observed(&cat.id, ObservedState::Unknown)?;
+            self.fence_cat_volumes(&cat).await?;
+            self.store.unbind_routes(&cat.id)?;
+            self.store.set_placement(&cat.id, None)?;
+            self.store.set_observed(&cat.id, ObservedState::Cold)?;
         }
         Ok(())
     }
@@ -262,6 +315,15 @@ impl Controller {
     // ------------------------------------------------------------------
 
     async fn reconcile_cat(&self, cat: &Cat) -> anyhow::Result<()> {
+        if let Some(node_id) = &cat.node_id {
+            let node = self.store.get_node(node_id)?;
+            if matches!(node.state, NodeState::Lost | NodeState::Fenced) {
+                // The owner remains authoritative while merely Lost. A
+                // confirmed fence clears placement itself; until then no
+                // lifecycle request may implicitly hand the Cat to a peer.
+                return Ok(());
+            }
+        }
         use DesiredState as D;
         use ObservedState as O;
         match (cat.desired_state, cat.observed_state) {
@@ -294,8 +356,8 @@ impl Controller {
             (D::Cold, O::Running | O::Suspended | O::Warm | O::Starting) => {
                 self.stop_flow(cat).await
             }
-            // Unknown clears via fence_lost_nodes; transitional states are
-            // re-driven by their owning flow on the next tick.
+            // Unknown clears when the owning node heartbeats again or an
+            // explicit Host fence converges the Cat through Cold.
             _ => Ok(()),
         }
     }
@@ -344,24 +406,39 @@ impl Controller {
     }
 
     async fn start_flow(&self, cat: &Cat) -> anyhow::Result<()> {
-        // Choosing a node and claiming its capacity is one step, so several start
-        // flows can run at once without two Cats claiming the same free capacity.
-        let Some(node) = self.store.claim_node_for(
-            &cat.id,
-            cat.spec.cpus,
-            cat.spec.memory_mib,
-            self.node_lease_timeout_ms,
-            now_ms(),
-        )?
-        else {
-            tracing::info!(cat = %cat.id, "no schedulable node; will retry");
-            return Ok(());
+        // `Starting` is the durable dispatch boundary. Once it is persisted, a
+        // StartCat may already be running (or its successful response may have
+        // been lost), so replay only the same deterministic job on the same
+        // claimed node and never revoke its newly acquired disk epoch.
+        let replaying_dispatch =
+            cat.observed_state == ObservedState::Starting && cat.node_id.is_some();
+        let node = if let Some(node_id) = &cat.node_id {
+            self.store.get_node(node_id)?
+        } else {
+            // Choosing a node and claiming its capacity is one step, so several
+            // start flows can run at once without overcommitting one node.
+            let Some(node) = self.store.claim_node_for(
+                &cat.id,
+                cat.spec.cpus,
+                cat.spec.memory_mib,
+                self.node_lease_timeout_ms,
+                now_ms(),
+            )?
+            else {
+                tracing::info!(cat = %cat.id, "no schedulable node; will retry");
+                return Ok(());
+            };
+            node
         };
-        self.store.set_observed(&cat.id, ObservedState::Starting)?;
 
         let grants = self.volume_grants(cat).await?;
-        // Fence any stale writer before handing the volumes to a new node.
-        self.fence_cat_volumes(cat).await?;
+        if !replaying_dispatch {
+            // Fence stale writers before crossing the durable dispatch
+            // boundary. A crash before `Starting` can safely repeat this step;
+            // a crash after it must preserve the epoch a live blockd may hold.
+            self.fence_cat_volumes(cat).await?;
+            self.store.set_observed(&cat.id, ObservedState::Starting)?;
+        }
 
         let job = NodeJob {
             job_id: nodejob::job_id(&cat.id, cat.generation, "start_cat"),
@@ -384,7 +461,19 @@ impl Controller {
                 Ok(())
             }
             Ok(res) => self.start_failed(cat, res.error.unwrap_or_default()).await,
-            Err(e) => self.start_failed(cat, e.to_string()).await,
+            Err(error) => {
+                // Transport/protocol failure is ambiguous: the Host may have
+                // completed StartCat. Keep placement + Starting and replay the
+                // same idempotent job next tick; moving elsewhere would revoke
+                // a live root-disk epoch and turn the old Guest read-only.
+                tracing::warn!(
+                    cat = %cat.id,
+                    node = %node.id,
+                    %error,
+                    "StartCat result unknown; retaining claim for same-node retry"
+                );
+                Ok(())
+            }
         }
     }
 

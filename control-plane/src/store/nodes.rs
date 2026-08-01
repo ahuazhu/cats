@@ -23,6 +23,7 @@ impl Store {
                    agent_url=?2, gateway_url=?3,
                    state=CASE
                        WHEN nodes.state='draining' THEN 'draining'
+                       WHEN nodes.state='fenced' THEN 'fenced'
                        WHEN nodes.scheduling_disabled=1 THEN 'cordoned'
                        ELSE 'ready'
                    END,
@@ -87,12 +88,14 @@ impl Store {
             c.execute(
                 "UPDATE nodes
                     SET state=CASE
+                            WHEN state='fenced' AND ?2<>'fenced' THEN state
                             WHEN ?2='cordoned' AND state='lost' THEN state
                             ELSE ?2
                         END,
                         scheduling_disabled=CASE
+                            WHEN state='fenced' THEN 1
                             WHEN ?2='ready' THEN 0
-                            WHEN ?2 IN ('cordoned','draining') THEN 1
+                            WHEN ?2 IN ('cordoned','draining','fenced') THEN 1
                             ELSE scheduling_disabled
                         END
                   WHERE id=?1",
@@ -185,7 +188,7 @@ impl Store {
         let state = state.ok_or_else(|| ApiError::not_found(format!("node {node_id}")))?;
         if state == "ready" || state == "draining" {
             return Err(ApiError::failed_precondition(
-                "only cordoned or lost nodes can be deleted",
+                "only cordoned, lost, or fenced nodes can be deleted",
             ));
         }
         tx.execute("DELETE FROM nodes WHERE id=?1", params![node_id])

@@ -53,9 +53,9 @@ stateDiagram-v2
     Suspended --> Cold: confirm durable generation + VMM/backend exit
     Warm --> Cold: discard snapshot + release runtime lease
     Cold --> Running: schedule + attach/fence + fresh boot
-    Running --> Cold: Host lost; discard RAM; fence old epoch
-    Suspended --> Cold: Host lost; discard RAM; fence old epoch
-    Warm --> Cold: Host lost; snapshot lost; fence old epoch
+    Running --> Cold: Host externally fenced; discard RAM; fence old epoch
+    Suspended --> Cold: Host externally fenced; discard RAM; fence old epoch
+    Warm --> Cold: Host externally fenced; snapshot lost; fence old epoch
 ```
 
 | 状态 | 进程内存 | Host 绑定 | 恢复方式 | 适用时长 |
@@ -411,8 +411,8 @@ Cold 的目标是让 Cat 不再依赖原 Host。进入 Cold 前必须确保远�
 ### Cold 唤醒
 
 1.  Scheduler 选择任意健康 Node。
-2.  创建更高 Attachment fencing epoch。
-3.  启动空或复用 clean cache 的 cats-blockd。
+2.  Controller 在 metadata DB 撤销旧 epoch，随后才持久化 `Starting`。
+3.  启动空或复用 clean cache 的 cats-blockd；blockd 直接向 metadata DB 获取实际 Attachment fencing epoch。`Starting` 后的控制面崩溃或回包丢失只允许在同一 Node 重放同一 StartCat Job，不得再次 revoke 或改投另一 Node。
 4.  建立 tap、vsock、cgroup 和 VMM 配置。
 5.  启动全新的 Cloud Hypervisor。
 6.  Guest 从 RootDisk boot；ext4 journal recovery。
@@ -583,7 +583,7 @@ if wake_requested(cat):
 | Pause 成功，Page-out 部分失败 | 可以保持 Suspended，但记录低回收率 | page-out 是 best-effort；稍后重试；持续高 RSS 则转 Cold |
 | Page-out 过程中收到 Wake | 相同 Cat lifecycle generation 仲裁 | 取消后续 page-out，等待当前 syscall 返回，再 resume |
 | VMM 在 Suspended 时崩溃 | 进程状态丢失；不可只靠 memory file restore | Fence 旧 runtime，按 Cold Recovery fresh boot |
-| 整台 Host 丢失 | Suspended memory 视为丢失 | 云 fencing/Node lease 确认；新 Host 获取更高 disk epoch；Cold start |
+| 整台 Host 丢失 | heartbeat 超时先标 Lost；保留 Host 绑定与旧 epoch | 心跳恢复则原地恢复；永久丢失时先从外部确认停机/隔离，再显式 fence；新 Host 获取更高 disk epoch 并 Cold start |
 | Resume 后 Guest Agent 未 Ready | Resuming 超时 | 收集 console/VMM/device 指标；一次 resume 修复失败后 Cold reboot |
 | Warm snapshot 损坏、丢失或 VMM 版本不匹配 | 不进入 Restoring；标记 WarmInvalid | 丢弃快照与本地状态，按 Cold Recovery fresh boot |
 | Warm restore 中途失败（restore API/resume 错误） | Restoring 超时/错误 | 清理半建 VMM/tap/backend；最多重试一次后 Cold fallback |

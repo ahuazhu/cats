@@ -35,7 +35,10 @@ pub(super) async fn heartbeat(
                 && cat.observed_state != hb.state
                 && matches!(
                     cat.observed_state,
-                    ObservedState::Running | ObservedState::Suspended | ObservedState::Warm
+                    ObservedState::Running
+                        | ObservedState::Suspended
+                        | ObservedState::Warm
+                        | ObservedState::Unknown
                 )
             {
                 state.store.set_observed(&cat.id, hb.state)?;
@@ -159,6 +162,7 @@ pub(super) async fn admin_node_action(
     State(state): State<AppState>,
     Path((id, verb)): Path<(String, String)>,
     headers: HeaderMap,
+    body: Bytes,
 ) -> ApiResult<Response> {
     check_admin_auth(&state, &headers).await?;
     let node = state.store.get_node(&id)?;
@@ -168,9 +172,9 @@ pub(super) async fn admin_node_action(
             StatusCode::OK
         }
         "uncordon" => {
-            if node.state == NodeState::Lost {
+            if matches!(node.state, NodeState::Lost | NodeState::Fenced) {
                 return Err(ApiError::failed_precondition(
-                    "lost node must heartbeat or register before uncordon",
+                    "lost node must heartbeat before uncordon; a fenced node identity cannot be reused",
                 )
                 .into());
             }
@@ -179,15 +183,33 @@ pub(super) async fn admin_node_action(
             StatusCode::OK
         }
         "drain" => {
-            if node.state == NodeState::Lost {
+            if matches!(node.state, NodeState::Lost | NodeState::Fenced) {
                 return Err(ApiError::failed_precondition(
-                    "lost nodes are fenced automatically and cannot be drained",
+                    "lost or fenced nodes cannot be drained",
                 )
                 .into());
             }
             state.store.set_node_state(&id, NodeState::Draining)?;
             state.notify.notify_one();
             StatusCode::ACCEPTED
+        }
+        "fence" => {
+            if !matches!(node.state, NodeState::Lost | NodeState::Fenced) {
+                return Err(ApiError::failed_precondition("only a lost node can be fenced").into());
+            }
+            let request: FenceNodeRequest = serde_json::from_slice(&body)
+                .map_err(|_| ApiError::invalid("fence requires a JSON confirmation body"))?;
+            if !request.confirm_host_stopped_or_isolated {
+                return Err(
+                    ApiError::invalid("confirm_host_stopped_or_isolated must be true").into(),
+                );
+            }
+            state
+                .controller
+                .confirm_node_fenced(&id)
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            StatusCode::OK
         }
         _ => return Err(ApiError::invalid(format!("unknown node action {verb}")).into()),
     };
@@ -238,13 +260,14 @@ fn monitoring_snapshot(state: &AppState) -> crate::store::Result<MonitoringOverv
             NodeState::Cordoned => node_counts.cordoned += 1,
             NodeState::Draining => node_counts.draining += 1,
             NodeState::Lost => node_counts.lost += 1,
+            NodeState::Fenced => node_counts.fenced += 1,
         }
         capacity.total_cpus += u64::from(summary.node.capacity.cpus);
         capacity.total_memory_mib += summary.node.capacity.memory_mib;
         capacity.assigned_cpus += u64::from(summary.assigned_cpus);
         capacity.assigned_memory_mib += summary.assigned_memory_mib;
 
-        if summary.node.state == NodeState::Lost {
+        if matches!(summary.node.state, NodeState::Lost | NodeState::Fenced) {
             continue;
         }
         let Some(telemetry) = &summary.node.telemetry else {
@@ -343,6 +366,7 @@ pub(super) async fn prometheus_metrics(
     metric!("cats_control_plane_nodes_cordoned", overview.nodes.cordoned);
     metric!("cats_control_plane_nodes_draining", overview.nodes.draining);
     metric!("cats_control_plane_nodes_lost", overview.nodes.lost);
+    metric!("cats_control_plane_nodes_fenced", overview.nodes.fenced);
     metric!(
         "cats_control_plane_operations_pending",
         overview.operations.pending
