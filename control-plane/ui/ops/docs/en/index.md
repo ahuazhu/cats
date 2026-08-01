@@ -44,7 +44,7 @@ The administrator machine token is a fleet automation/break-glass identity. Do n
 
 ## Lost node
 
-Heartbeat expiry marks the node Lost and its Cats Unknown, but deliberately preserves placement, routes, and disk epochs. It does not start duplicate Guests. If the heartbeat returns, matching runtime inventory recovers the existing claim in place.
+Heartbeat expiry marks the node Lost and its Cats Unknown, but deliberately preserves placement, routes, and disk epochs. It does not start duplicate Guests. The Node returns to Ready only when one heartbeat contains a complete, same-generation runtime inventory for every preserved claim. Registration or an incomplete inventory leaves it Lost so the fence action remains available.
 
 For a permanently lost Host, first obtain independent evidence that it is powered off or isolated (for example from the cloud API, BMC, or network fencing). Then run the explicit `fence` action. Cats persists the terminal Fenced node state, revokes old disk ownership, and cold-recovers its Cats with higher attachment epochs. A Fenced node identity cannot be uncordoned or revived by a late heartbeat; remove it only after Host identity and local-cache cleanup. Rate-limit boot, object GET, and database pressure to avoid a recovery storm.
 

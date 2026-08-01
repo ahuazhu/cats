@@ -510,8 +510,8 @@ fn a_cordoned_node_stays_unschedulable_across_a_lost_recovery_cycle() {
         .unwrap();
     assert_eq!(
         store.get_node("node_a").unwrap().state,
-        NodeState::Cordoned,
-        "a re-registering node must not silently become schedulable again"
+        NodeState::Lost,
+        "registration alone cannot prove preserved Cat claims are alive"
     );
 
     let telemetry = NodeTelemetry {
@@ -525,6 +525,8 @@ fn a_cordoned_node_stays_unschedulable_across_a_lost_recovery_cycle() {
     assert_eq!(stored.observed_cats, 2);
     assert_eq!(stored.allocated_cpus, 3);
     assert_eq!(stored.allocated_memory_mib, 2048);
+    assert_eq!(store.get_node("node_a").unwrap().state, NodeState::Lost);
+    assert!(store.recover_lost_node("node_a").unwrap());
     assert_eq!(store.get_node("node_a").unwrap().state, NodeState::Cordoned);
 }
 

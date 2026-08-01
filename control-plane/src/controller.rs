@@ -212,7 +212,7 @@ impl Controller {
         let node = self.store.get_node(node_id)?;
         anyhow::ensure!(
             matches!(node.state, NodeState::Lost | NodeState::Fenced),
-            "node {node_id} is not lost"
+            "node {node_id} is neither Lost nor an idempotent Fenced retry"
         );
 
         // Persist the terminal, unschedulable identity before revoking any
@@ -356,8 +356,9 @@ impl Controller {
             (D::Cold, O::Running | O::Suspended | O::Warm | O::Starting) => {
                 self.stop_flow(cat).await
             }
-            // Unknown clears when the owning node heartbeats again or an
-            // explicit Host fence converges the Cat through Cold.
+            // Unknown clears when the owning node reports a complete,
+            // same-generation inventory or an explicit Host fence converges
+            // the Cat through Cold.
             _ => Ok(()),
         }
     }

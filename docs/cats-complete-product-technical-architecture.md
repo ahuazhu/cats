@@ -598,7 +598,7 @@ MountBinding 可以保留，但 runtime Attachment 必须结束。
 ### Host Lost → Running
 
 1.  Node heartbeat 超时；Controller 将 Node 标为 Lost、Cat 标为 Unknown，但保留 placement、Route 与旧 disk epoch。心跳超时只是怀疑信号，不能自动撤销 claim 或在另一 Host 双启。
-2.  如果原 Node 恢复心跳，同 generation 的 inventory 让 Cat 原地恢复，不发生 attachment 交接。
+2.  如果原 Node 恢复心跳，只有一份覆盖其全部保留 claim、且每个 Cat generation 都匹配的完整 inventory 才能让 Node 回到 Ready、让 Cat 原地恢复而不发生 attachment 交接。仅重新注册或漏报任一 claim 都保持 Lost，以保留显式 fence 路径。
 3.  如果确认 Host 永久丢失，先由云 API、BMC/电源控制或网络隔离证明旧 Host 已停止执行，再由管理员显式确认 fence；Controller 持久化 Fenced 状态。
 4.  撤销旧 disk epoch、解绑 Route 与 placement；旧 Host 即使恢复也保持不可调度，旧 epoch fail closed。
 5.  在新 Node 冷启动并创建新 epoch；不尝试保留内存。Ready 后切 Route，旧长连接由客户端重连。

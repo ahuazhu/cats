@@ -46,6 +46,32 @@ pub(super) async fn heartbeat(
             }
         }
     }
+    let node = state.store.get_node(&req.node_id)?;
+    if node.state == NodeState::Lost {
+        let claims = state.store.cats_on_node(&req.node_id)?;
+        let complete_inventory = claims.iter().all(|cat| {
+            req.cats
+                .iter()
+                .any(|hb| hb.cat_id == cat.id && hb.generation == cat.generation)
+        });
+        if complete_inventory {
+            if state.store.recover_lost_node(&req.node_id)? {
+                tracing::info!(
+                    node = %req.node_id,
+                    claims = claims.len(),
+                    "complete same-generation inventory recovered lost node claims"
+                );
+                state.notify.notify_one();
+            }
+        } else {
+            tracing::warn!(
+                node = %req.node_id,
+                claims = claims.len(),
+                reported = req.cats.len(),
+                "lost node heartbeat omitted a preserved claim; keeping node lost"
+            );
+        }
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -195,7 +221,10 @@ pub(super) async fn admin_node_action(
         }
         "fence" => {
             if !matches!(node.state, NodeState::Lost | NodeState::Fenced) {
-                return Err(ApiError::failed_precondition("only a lost node can be fenced").into());
+                return Err(ApiError::failed_precondition(
+                    "only a Lost node or an idempotent Fenced retry can be fenced",
+                )
+                .into());
             }
             let request: FenceNodeRequest = serde_json::from_slice(&body)
                 .map_err(|_| ApiError::invalid("fence requires a JSON confirmation body"))?;

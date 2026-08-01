@@ -510,7 +510,7 @@ if wake_requested(cat):
           <tr><td>Pause 成功，Page-out 部分失败</td><td>可以保持 Suspended，但记录低回收率</td><td>page-out 是 best-effort；稍后重试；持续高 RSS 则转 Cold</td></tr>
           <tr><td>Page-out 过程中收到 Wake</td><td>相同 Cat lifecycle generation 仲裁</td><td>取消后续 page-out，等待当前 syscall 返回，再 resume</td></tr>
           <tr><td>VMM 在 Suspended 时崩溃</td><td>进程状态丢失；不可只靠 memory file restore</td><td>Fence 旧 runtime，按 Cold Recovery fresh boot</td></tr>
-          <tr><td>整台 Host 丢失</td><td>heartbeat 超时先标 Lost；保留 Host 绑定与旧 epoch</td><td>心跳恢复则原地恢复；永久丢失时先从外部确认停机/隔离，再显式 fence；新 Host 获取更高 disk epoch 并 Cold start</td></tr>
+          <tr><td>整台 Host 丢失</td><td>heartbeat 超时先标 Lost；保留 Host 绑定与旧 epoch</td><td>完整、同 generation 的全量 claim inventory 才原地恢复；仅重注册或 inventory 漏报时保持 Lost；永久丢失时先从外部确认停机/隔离，再显式 fence；新 Host 获取更高 disk epoch 并 Cold start</td></tr>
           <tr><td>Resume 后 Guest Agent 未 Ready</td><td>Resuming 超时</td><td>收集 console/VMM/device 指标；一次 resume 修复失败后 Cold reboot</td></tr>
           <tr><td>Cold cleanup 中控制面重试</td><td>Job 幂等</td><td>按明确路径和 PID identity 重做；不存在视为已清理</td></tr>
           <tr><td>旧 Route cache</td><td>Node 再检查 activation epoch</td><td>旧 epoch 返回 409/503，不代理到错误 Guest</td></tr>

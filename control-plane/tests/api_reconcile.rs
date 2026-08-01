@@ -60,7 +60,7 @@ impl StubNode {
     /// Clearing `alive` on its own is not enough. The loop tests it before it
     /// builds the request, so a heartbeat that already passed the test can land
     /// after the caller has moved the node to Lost and quietly revive it --
-    /// recovering a Lost node on heartbeat is intended behaviour, which is
+    /// a complete same-generation heartbeat can recover a Lost node, which is
     /// exactly why the test has to be sure none is outstanding.
     async fn quiesce(&self) {
         self.alive.store(false, Ordering::SeqCst);
@@ -1263,8 +1263,58 @@ async fn node_loss_preserves_claim_until_fencing_is_explicitly_confirmed() {
         .renew_lease(&root.volume_id, old_attachment, old_epoch, 60_000)
         .expect("heartbeat loss alone must not revoke the old epoch");
 
+    // A restarted agent cannot prove that its preserved claims are still
+    // running by merely re-registering and sending an empty inventory. Keep
+    // the node Lost so an operator can either restore the runtimes in place or
+    // explicitly fence the Host; silently making it Ready would strand these
+    // Unknown Cats outside both recovery paths.
+    let registered = ctx.cp.state.store.get_node("node_a").unwrap();
+    ctx.http
+        .post(ctx.url("/v1/nodes/register"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&RegisterNodeRequest {
+            node_id: registered.id.clone(),
+            agent_url: registered.agent_url.clone(),
+            gateway_url: registered.gateway_url.clone(),
+            cpus: registered.capacity.cpus,
+            memory_mib: registered.capacity.memory_mib,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    ctx.http
+        .post(ctx.url("/v1/nodes/heartbeat"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&HeartbeatRequest {
+            node_id: "node_a".into(),
+            cats: Vec::new(),
+            telemetry: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        ctx.cp.state.store.get_node("node_a").unwrap().state,
+        NodeState::Lost
+    );
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .must_get_cat_by_id(&cat.id)
+            .unwrap()
+            .observed_state,
+        ObservedState::Unknown
+    );
+    assert!(node_b.cats.lock().unwrap().is_empty());
+
     // If the heartbeat returns before an explicit handoff, ownership recovers
-    // in place instead of cold-starting another Guest.
+    // in place only after its complete, same-generation inventory proves every
+    // preserved claim instead of cold-starting another Guest.
     node_a.alive.store(true, Ordering::SeqCst);
     ctx.http
         .post(ctx.url("/v1/nodes/heartbeat"))
@@ -2290,8 +2340,10 @@ async fn admin_can_monitor_and_drain_nodes() {
         NodeState::Ready
     );
 
-    // Cordon records scheduling intent without hiding Lost health; a later
-    // registration recovery must not silently defeat that intent.
+    // Cordon records scheduling intent without hiding Lost health. A later
+    // registration alone cannot clear Lost; with no preserved claims, the
+    // following empty heartbeat is a complete inventory and recovers the Node
+    // to Cordoned without silently defeating that intent.
     node_a.quiesce().await;
     ctx.cp
         .state
@@ -2325,6 +2377,19 @@ async fn admin_can_monitor_and_drain_nodes() {
         .await
         .unwrap();
     assert_eq!(register.status(), StatusCode::NO_CONTENT);
+    let heartbeat = ctx
+        .http
+        .post(ctx.url("/v1/nodes/heartbeat"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&HeartbeatRequest {
+            node_id: "node_a".into(),
+            cats: Vec::new(),
+            telemetry: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(heartbeat.status(), StatusCode::NO_CONTENT);
     let node: NodeSummary = ctx
         .http
         .get(ctx.url("/v1/admin/nodes/node_a"))
