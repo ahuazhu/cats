@@ -590,18 +590,18 @@ MountBinding 可以保留，但 runtime Attachment 必须结束。
 ### Cold → Running
 
 1.  Scheduler 选择 Node 并预留资源。
-2.  Disk Controller 创建更高 attachment epoch。
-3.  Node 启动空或复用的 clean cache、cats-blockd 和 tap。
-4.  启动 Guest，ext4 通过 journal recovery 恢复。
+2.  Controller 在 metadata DB 撤销旧 attachment epoch，随后才持久化 `Starting`，形成不可倒置的 dispatch boundary。
+3.  Node 启动空或复用的 clean cache 与 cats-blockd；blockd 直接在 metadata DB 原子获取实际 owner/epoch，再建立 tap。
+4.  启动 Guest，ext4 通过 journal recovery 恢复。若控制面在 `Starting` 后崩溃或 StartCat 回包丢失，只在同一 Node 重放同一幂等 Job，不重新 revoke，也不改投其他 Node。
 5.  Guest Ready 后使用新 route epoch 发布流量。
 
 ### Host Lost → Running
 
-1.  Node lease 超时；Controller 将 Cat 标为 Unknown。
-2.  阻止快速双启：等待 fencing 条件或云 API 确认旧 Host 已关机。
-3.  撤销旧 disk epoch，创建新 epoch。
-4.  在新 Node 冷启动；不尝试保留内存。
-5.  Ready 后切 Route；旧长连接由客户端重连。
+1.  Node heartbeat 超时；Controller 将 Node 标为 Lost、Cat 标为 Unknown，但保留 placement、Route 与旧 disk epoch。心跳超时只是怀疑信号，不能自动撤销 claim 或在另一 Host 双启。
+2.  如果原 Node 恢复心跳，只有一份覆盖其全部保留 claim、且每个 Cat generation 都匹配的完整 inventory 才能让 Node 回到 Ready、让 Cat 原地恢复而不发生 attachment 交接。仅重新注册或漏报任一 claim 都保持 Lost，以保留显式 fence 路径。
+3.  如果确认 Host 永久丢失，先由云 API、BMC/电源控制或网络隔离证明旧 Host 已停止执行，再由管理员显式确认 fence；Controller 持久化 Fenced 状态。
+4.  撤销旧 disk epoch、解绑 Route 与 placement；旧 Host 即使恢复也保持不可调度，旧 epoch fail closed。
+5.  在新 Node 冷启动并创建新 epoch；不尝试保留内存。Ready 后切 Route，旧长连接由客户端重连。
 
 ### 8.2 自动空闲策略
 
@@ -976,13 +976,13 @@ score(node) =
 | Edge 实例 | 部分连接断开 | LB 切换；客户端重连，route cache 重建 | 无磁盘影响 |
 | cat-agent | 该 Node 新管理操作暂停；Guest 可继续运行 | systemd 重启；与 VMM 实际状态重建 inventory | 块后端独立存活时 I/O 继续 |
 | 单 VMM/blockd | 一个 Cat 中断 | 同 Host 从本地 pending 恢复 blockd，必要时重启 VMM | Relaxed 重建 `L` 后后台发布；不在 attach 阶段做远端写 |
-| 整台 Node | 该 Node 上 Cat 连接中断 | 云 fencing/Node lease 确认后，在其他 Node 批量冷恢复 | Strict 成功 FLUSH 恢复；Relaxed 恢复到 `R`，丢故障时 `L-R`；RAM 丢失 |
+| 整台 Node | 该 Node 上 Cat 连接中断 | heartbeat 超时只标 Lost 并保留 claim；外部确认停机/隔离并显式 fence 后，在其他 Node 批量冷恢复 | Strict 成功 FLUSH 恢复；Relaxed 恢复到 `R`，丢故障时 `L-R`；RAM 丢失 |
 | 对象存储限流 | 冷读变慢；Strict FLUSH 变慢；Relaxed 积压增长 | publisher 重试、clean cache 继续读、LRU 淘汰；只剩 pin 数据后背压 | Relaxed 不把普通远端错误注入 ext4；强制 drain 不成功就不清理源 |
 | 区域故障 | V1 服务中断 | 按灾备 Runbook 恢复控制面与副本 | 取决于跨 Region 复制；V1 不承诺 RPO 0 |
 
 ### 14.2 Host 故障的风暴控制
 
-**不能同时重启所有 Cat：**Node Lost 后，Recovery Controller 按租户公平、服务优先级、磁盘冷读预算和目标 Node 容量分批恢复。必须限制每秒 Activation、对象存储 GET 带宽和单 Node 并发 boot，避免一次 Host 故障放大成区域对象存储/数据库故障。
+**不能同时重启所有 Cat：**Node Lost 本身不触发重启；外部 fencing 被显式确认后，Recovery Controller 才按租户公平、服务优先级、磁盘冷读预算和目标 Node 容量分批恢复。必须限制每秒 Activation、对象存储 GET 带宽和单 Node 并发 boot，避免一次 Host 故障放大成区域对象存储/数据库故障。
 
 ### 14.3 备份与恢复
 

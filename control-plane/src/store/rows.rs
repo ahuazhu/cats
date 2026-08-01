@@ -74,6 +74,7 @@ pub(super) fn node_state_str(s: NodeState) -> &'static str {
         NodeState::Cordoned => "cordoned",
         NodeState::Draining => "draining",
         NodeState::Lost => "lost",
+        NodeState::Fenced => "fenced",
     }
 }
 
@@ -184,6 +185,7 @@ pub(super) fn row_to_node(r: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
             "cordoned" => NodeState::Cordoned,
             "draining" => NodeState::Draining,
             "lost" => NodeState::Lost,
+            "fenced" => NodeState::Fenced,
             _ => NodeState::Ready,
         },
         capacity: NodeCapacity {

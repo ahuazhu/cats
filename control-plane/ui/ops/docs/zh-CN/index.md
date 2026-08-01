@@ -23,6 +23,7 @@
     cats admin node cordon node-a
     cats admin node drain node-a
     cats admin node uncordon node-a
+    cats admin node fence node-a --confirm-host-stopped-or-isolated
     cats admin node delete node-a
 
 | 操作 | 用途 | 安全条件 |
@@ -30,7 +31,8 @@
 | Cordon | 停止新 Placement | 现有 Cats 继续运行。 |
 | Drain | Stop/Fence 并重调度 Cats，最终保持 Cordoned | Durable Disk Gate 与恢复容量可用。 |
 | Uncordon | 让健康 Node 重新参与调度 | 版本、KVM、NVMe、网络与时钟检查通过。 |
-| Delete | 移除 Registry 记录 | Node 为空且处于 Cordoned 或 Lost。 |
+| Fence | 撤销 Lost Node 的 claim，并对其 Cats 执行 Cold Recovery | 外部机制已经证明旧 Host 停机或被隔离；仅心跳超时不够。 |
+| Delete | 移除 Registry 记录 | Node 为空且处于 Cordoned、Lost 或 Fenced。 |
 
 ## Drain 流程
 
@@ -42,7 +44,9 @@
 
 ## Node 丢失
 
-不要立即启动重复 Guest。等待 Node Lease 或云 Fencing 证据，撤销旧磁盘 Owner，签发更高 Attachment Epoch，并分批恢复 Cat。限制 Boot、对象 GET 与数据库压力，避免恢复风暴。
+心跳超时会把 Node 标为 Lost、Cat 标为 Unknown，但特意保留 placement、Route 和磁盘 epoch，也不会启动重复 Guest。只有一次心跳完整报告全部保留 claim、且每个 Cat 的 generation 都匹配时，Node 才恢复 Ready 并原地恢复 claim；仅重新注册或 inventory 不完整时仍保持 Lost，让显式 fence 路径继续可用。
+
+如果 Host 永久丢失，先取得它已停机或隔离的独立证据（例如云 API、BMC 或网络 fencing），再执行显式 `fence`。Cats 会持久化终态 Fenced、撤销旧磁盘 Owner，并用更高 Attachment Epoch 对 Cats 执行 Cold Recovery。迟到的心跳不能让 Fenced Node 身份恢复调度；完成 Host 身份和本地 Cache 清理后才能删除该记录。限制 Boot、对象 GET 与数据库压力，避免恢复风暴。
 
 ## Metrics 与审计
 
@@ -57,7 +61,7 @@
     POST   /v1/admin/nodes/{id}/actions/{verb}
     GET    /metrics
 
-支持的 Node Action Verb 是 `cordon`、`uncordon` 与 `drain`；取消 Drain 也使用 `uncordon`。所有路由都要求 Fleet Administrator 身份；Node Register/Heartbeat、Route Resolve 与 Internal Work Endpoint 仍是仅供 Service 使用的 API。
+支持的 Node Action Verb 是 `cordon`、`uncordon`、`drain` 与 `fence`；`fence` 必须携带 `{"confirm_host_stopped_or_isolated":true}`，且只接受 Lost/Fenced Node。取消 Drain 使用 `uncordon`。所有路由都要求 Fleet Administrator 身份；Node Register/Heartbeat、Route Resolve 与 Internal Work Endpoint 仍是仅供 Service 使用的 API。
 
 ## 当前源码的生产限制
 

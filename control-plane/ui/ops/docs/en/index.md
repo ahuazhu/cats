@@ -23,6 +23,7 @@ The administrator machine token is a fleet automation/break-glass identity. Do n
     cats admin node cordon node-a
     cats admin node drain node-a
     cats admin node uncordon node-a
+    cats admin node fence node-a --confirm-host-stopped-or-isolated
     cats admin node delete node-a
 
 | Action | Use | Safety condition |
@@ -30,7 +31,8 @@ The administrator machine token is a fleet automation/break-glass identity. Do n
 | Cordon | Stop new placement | Existing Cats continue. |
 | Drain | Stop/fence and reschedule Cats, then leave node cordoned | Durable disk gate and recovery capacity must be available. |
 | Uncordon | Return a healthy node to scheduling | Version, KVM, NVMe, network, and time checks pass. |
-| Delete | Remove registry record | Node is empty and cordoned or lost. |
+| Fence | Revoke claims on a Lost node and cold-recover its Cats | An external mechanism has proved the old Host is powered off or isolated. Heartbeat expiry alone is insufficient. |
+| Delete | Remove registry record | Node is empty and cordoned, lost, or fenced. |
 
 ## Drain workflow
 
@@ -42,7 +44,9 @@ The administrator machine token is a fleet automation/break-glass identity. Do n
 
 ## Lost node
 
-Do not immediately start duplicate Guests. Wait for the node lease or cloud fencing evidence, revoke old disk ownership, issue a higher attachment epoch, and recover Cats in controlled batches. Rate-limit boot, object GET, and database pressure to avoid a recovery storm.
+Heartbeat expiry marks the node Lost and its Cats Unknown, but deliberately preserves placement, routes, and disk epochs. It does not start duplicate Guests. The Node returns to Ready only when one heartbeat contains a complete, same-generation runtime inventory for every preserved claim. Registration or an incomplete inventory leaves it Lost so the fence action remains available.
+
+For a permanently lost Host, first obtain independent evidence that it is powered off or isolated (for example from the cloud API, BMC, or network fencing). Then run the explicit `fence` action. Cats persists the terminal Fenced node state, revokes old disk ownership, and cold-recovers its Cats with higher attachment epochs. A Fenced node identity cannot be uncordoned or revived by a late heartbeat; remove it only after Host identity and local-cache cleanup. Rate-limit boot, object GET, and database pressure to avoid a recovery storm.
 
 ## Metrics and audit
 
@@ -57,7 +61,7 @@ The `/metrics` endpoint requires administrator authorization. Correlate request 
     POST   /v1/admin/nodes/{id}/actions/{verb}
     GET    /metrics
 
-Supported node action verbs are `cordon`, `uncordon`, and `drain`. Use `uncordon` to cancel a drain. All routes require the fleet administrator identity; node registration, heartbeat, route resolution, and internal work endpoints remain service-only APIs.
+Supported node action verbs are `cordon`, `uncordon`, `drain`, and `fence`. `fence` requires `{"confirm_host_stopped_or_isolated":true}` and is accepted only for a Lost/Fenced node. Use `uncordon` to cancel a drain. All routes require the fleet administrator identity; node registration, heartbeat, route resolution, and internal work endpoints remain service-only APIs.
 
 ## Source-version caveats
 

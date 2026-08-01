@@ -182,7 +182,7 @@
           <path d="M950 265 C895 305 865 305 810 265" class="b"/><text x="844" y="347" class="l">schedule → fresh boot</text>
 
           <rect x="70" y="420" width="1180" height="105" class="z"/>
-          <text x="95" y="452" class="l">Host Lost 降级路径</text><text x="95" y="478" class="s">Running 或 Suspended 的原 Host 永久失联 → Fence 旧 Attachment epoch → 丢弃 Guest RAM/进程状态 → 在新 Host 按 Cold 路径启动。</text>
+          <text x="95" y="452" class="l">Host Lost 降级路径</text><text x="95" y="478" class="s">heartbeat 超时只标 Lost 并保留 claim；从外部确认旧 Host 已停机/隔离 → 显式 Fence 旧 Attachment epoch → 在新 Host 按 Cold 路径启动。</text>
           <path d="M656 325 V420" class="a dash"/><text x="674" y="385" class="s">原 Host 丢失</text>
         </svg>
       </div>
@@ -397,7 +397,7 @@
 
       <div class="two-col">
         <article class="card"><h3>进入 Cold</h3><ol><li>阻止新 exec、deploy、mount 和流量激活。</li><li>Running 先 Guest syncfs；Suspended 的 Guest 已冻结。</li><li>每卷强制 drain 到 remote generation == local generation。</li><li>drain 失败保留 blockd、pending、lease 与源 runtime，等待重试。</li><li>成功后 Route unbound，VMM/backend 退出并释放 lease。</li><li>删除 tap、socket、cgroup、memory backing 和本地 Secret。</li><li>clean cache 进入立即可淘汰队列。</li></ol></article>
-        <article class="card"><h3>Cold 唤醒</h3><ol><li>Scheduler 选择任意健康 Node。</li><li>创建更高 Attachment fencing epoch。</li><li>启动空或复用 clean cache 的 cats-blockd。</li><li>建立 tap、vsock、cgroup 和 VMM 配置。</li><li>启动全新的 Cloud Hypervisor。</li><li>Guest 从 RootDisk boot；ext4 journal recovery。</li><li>Guest Agent Ready 后发布 route epoch。</li><li>默认 Ubuntu Guest 的 systemd 重新启动 enabled user service；Guest Agent readiness 与 User Service readiness 分开报告（ADR-0023）。</li></ol></article>
+        <article class="card"><h3>Cold 唤醒</h3><ol><li>Scheduler 选择任意健康 Node。</li><li>Controller 在 metadata DB 撤销旧 epoch，随后才持久化 <code>Starting</code>。</li><li>启动 clean cache 与 cats-blockd；blockd 直接向 metadata DB 获取实际 Attachment epoch。<code>Starting</code> 后控制面崩溃或回包丢失，只在同一 Node 重放同一 StartCat Job，不再次 revoke 或改投其他 Node。</li><li>建立 tap、vsock、cgroup 和 VMM 配置。</li><li>启动全新的 Cloud Hypervisor。</li><li>Guest 从 RootDisk boot；ext4 journal recovery。</li><li>Guest Agent Ready 后发布 route epoch。</li><li>默认 Ubuntu Guest 的 systemd 重新启动 enabled user service；Guest Agent readiness 与 User Service readiness 分开报告（ADR-0023）。</li></ol></article>
       </div>
 
       <h3 style="margin-top:28px">9.1 VMM 退出后真正释放的内容</h3>
@@ -510,7 +510,7 @@ if wake_requested(cat):
           <tr><td>Pause 成功，Page-out 部分失败</td><td>可以保持 Suspended，但记录低回收率</td><td>page-out 是 best-effort；稍后重试；持续高 RSS 则转 Cold</td></tr>
           <tr><td>Page-out 过程中收到 Wake</td><td>相同 Cat lifecycle generation 仲裁</td><td>取消后续 page-out，等待当前 syscall 返回，再 resume</td></tr>
           <tr><td>VMM 在 Suspended 时崩溃</td><td>进程状态丢失；不可只靠 memory file restore</td><td>Fence 旧 runtime，按 Cold Recovery fresh boot</td></tr>
-          <tr><td>整台 Host 丢失</td><td>Suspended memory 视为丢失</td><td>云 fencing/Node lease 确认；新 Host 获取更高 disk epoch；Cold start</td></tr>
+          <tr><td>整台 Host 丢失</td><td>heartbeat 超时先标 Lost；保留 Host 绑定与旧 epoch</td><td>完整、同 generation 的全量 claim inventory 才原地恢复；仅重注册或 inventory 漏报时保持 Lost；永久丢失时先从外部确认停机/隔离，再显式 fence；新 Host 获取更高 disk epoch 并 Cold start</td></tr>
           <tr><td>Resume 后 Guest Agent 未 Ready</td><td>Resuming 超时</td><td>收集 console/VMM/device 指标；一次 resume 修复失败后 Cold reboot</td></tr>
           <tr><td>Cold cleanup 中控制面重试</td><td>Job 幂等</td><td>按明确路径和 PID identity 重做；不存在视为已清理</td></tr>
           <tr><td>旧 Route cache</td><td>Node 再检查 activation epoch</td><td>旧 epoch 返回 409/503，不代理到错误 Guest</td></tr>

@@ -81,7 +81,7 @@
 
         <section class="view" id="view-nodes">
           <section class="panel">
-            <header class="panel-header"><div><small data-i18n="admin.nodes.eyebrow">FLEET MANAGEMENT</small><h2 data-i18n="admin.nodes.title">Worker nodes</h2><p data-i18n="admin.nodes.description">Cordon stops new scheduling. Drain safely stops, fences, and reschedules existing Cats.</p></div></header>
+            <header class="panel-header"><div><small data-i18n="admin.nodes.eyebrow">FLEET MANAGEMENT</small><h2 data-i18n="admin.nodes.title">Worker nodes</h2><p data-i18n="admin.nodes.description">Heartbeat loss preserves claims. Fence only after the old Host is externally stopped or isolated.</p></div></header>
             <div class="table-wrap"><table><thead><tr><th data-i18n="common.node">Node</th><th data-i18n="common.status">Status</th><th data-i18n="admin.nodes.assignments">Assignments</th><th data-i18n="common.capacity">Capacity</th><th data-i18n="admin.nodes.heartbeat">Heartbeat</th><th data-i18n="admin.nodes.telemetry">Host telemetry</th><th class="align-right" data-i18n="common.actions">Actions</th></tr></thead><tbody id="nodes-table"></tbody></table></div>
             <div class="empty-state is-hidden" id="nodes-empty"><span>▦</span><h3 data-i18n="admin.nodes.emptyTitle">No registered nodes</h3><p data-i18n="admin.nodes.emptyDescription">Nodes register and begin heartbeating after cats-noded starts.</p></div>
           </section>

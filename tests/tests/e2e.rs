@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cats_api::guest::{GuestRequestBody, GuestResponseBody};
+use cats_api::resources::NodeState;
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::SqliteUsageStore;
 use cats_node_agent::guest_client::GuestClient;
@@ -801,12 +802,12 @@ async fn product_loop_end_to_end() {
     cluster.cli_ok(&["destroy", "second"]).await;
 }
 
-/// §20.1 破坏路径: kill an entire "host" while its cat runs. The control
-/// plane must fence the volumes, cold-start the cat on the surviving node
-/// with every flushed byte intact, and the zombie writer on the dead node
-/// must be unable to write.
+/// §20.1 破坏路径: kill an entire "host" while its cat runs. Heartbeat loss
+/// only makes the claim Unknown; after an independent actor confirms Host
+/// isolation, explicit fencing cold-starts the Cat on the surviving node with
+/// every flushed byte intact and rejects the zombie writer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn host_loss_fences_and_recovers_elsewhere() {
+async fn host_loss_preserves_claim_until_explicit_fence_then_recovers_elsewhere() {
     let cluster = Cluster::start(&["node-a", "node-b"]).await;
 
     // Force placement onto node-a.
@@ -858,7 +859,49 @@ async fn host_loss_fences_and_recovers_elsewhere() {
         .unwrap();
     assert!(resp.status().is_success());
 
-    // Wait for fencing + rescheduling onto node-b.
+    // Heartbeat expiry is only suspicion. The old Guest and disk epoch remain
+    // intact, and no replacement starts while the Host could still execute.
+    let lost_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let cat = cluster.cat_json("victim").await;
+        let node = cluster.cp.state.store.get_node("node-a").unwrap();
+        if node.state == NodeState::Lost && cat["observed_state"] == "unknown" {
+            assert_eq!(cat["node_id"], "node-a");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < lost_deadline,
+            "node-a never became Lost with its claim preserved: {cat}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut partitioned = GuestClient::connect(&cluster.guest_ctl("node-a", &cat_id)).unwrap();
+    partitioned
+        .request(GuestRequestBody::WriteBlock {
+            disk_id: root_disk.clone(),
+            offset: 2 << 20,
+            data_hex: hex::encode(b"accepted-before-explicit-fence"),
+        })
+        .expect("heartbeat loss alone must not fence the live blockd");
+
+    // The test harness now plays the independent cloud/BMC fencing actor: the
+    // node-agent is stopped, so it explicitly confirms Host isolation.
+    let fenced = cluster
+        .http
+        .post(format!(
+            "{}/v1/admin/nodes/node-a/actions/fence",
+            cluster.cp.base_url()
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .json(&serde_json::json!({
+            "confirm_host_stopped_or_isolated": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(fenced.status().is_success());
+
+    // Only the explicit fence may revoke epochs and reschedule onto node-b.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let cat = cluster.cat_json("victim").await;

@@ -16,12 +16,14 @@ CATS_TOKEN='administrator-credential' cats admin monitoring</code></pre>
 cats admin node cordon node-a
 cats admin node drain node-a
 cats admin node uncordon node-a
+cats admin node fence node-a --confirm-host-stopped-or-isolated
 cats admin node delete node-a</code></pre>
 <table><thead><tr><th>操作</th><th>用途</th><th>安全条件</th></tr></thead><tbody>
   <tr><td>Cordon</td><td>停止新 Placement</td><td>现有 Cats 继续运行。</td></tr>
   <tr><td>Drain</td><td>Stop/Fence 并重调度 Cats，最终保持 Cordoned</td><td>Durable Disk Gate 与恢复容量可用。</td></tr>
   <tr><td>Uncordon</td><td>让健康 Node 重新参与调度</td><td>版本、KVM、NVMe、网络与时钟检查通过。</td></tr>
-  <tr><td>Delete</td><td>移除 Registry 记录</td><td>Node 为空且处于 Cordoned 或 Lost。</td></tr>
+  <tr><td>Fence</td><td>撤销 Lost Node 的 claim，并对其 Cats 执行 Cold Recovery</td><td>外部机制已经证明旧 Host 停机或被隔离；仅心跳超时不够。</td></tr>
+  <tr><td>Delete</td><td>移除 Registry 记录</td><td>Node 为空且处于 Cordoned、Lost 或 Fenced。</td></tr>
 </tbody></table>
 
 <h2 id="drain">Drain 流程</h2>
@@ -34,7 +36,8 @@ cats admin node delete node-a</code></pre>
 </ol>
 
 <h2 id="lost-node">Node 丢失</h2>
-<p>不要立即启动重复 Guest。等待 Node Lease 或云 Fencing 证据，撤销旧磁盘 Owner，签发更高 Attachment Epoch，并分批恢复 Cat。限制 Boot、对象 GET 与数据库压力，避免恢复风暴。</p>
+<p>心跳超时会把 Node 标为 Lost、Cat 标为 Unknown，但特意保留 placement、Route 和磁盘 epoch，也不会启动重复 Guest。只有一次心跳完整报告全部保留 claim、且每个 Cat 的 generation 都匹配时，Node 才恢复 Ready 并原地恢复 claim；仅重新注册或 inventory 不完整时仍保持 Lost，让显式 fence 路径继续可用。</p>
+<p>如果 Host 永久丢失，先取得它已停机或隔离的独立证据（例如云 API、BMC 或网络 fencing），再执行显式 <code>fence</code>。Cats 会持久化终态 Fenced、撤销旧磁盘 Owner，并用更高 Attachment Epoch 对 Cats 执行 Cold Recovery。迟到的心跳不能让 Fenced Node 身份恢复调度；完成 Host 身份和本地 Cache 清理后才能删除该记录。限制 Boot、对象 GET 与数据库压力，避免恢复风暴。</p>
 
 <h2 id="metrics">Metrics 与审计</h2>
 <p><code>/metrics</code> 需要管理员权限。关联 Request ID → Operation → Cat → Node → Attachment → Route Epoch。审计 Node 操作和授权决策，但绝不能记录 Token、Cookie、DSN、Secret、终端明文或 Guest 磁盘数据。</p>
@@ -46,7 +49,7 @@ GET    /v1/admin/nodes/{id}
 DELETE /v1/admin/nodes/{id}
 POST   /v1/admin/nodes/{id}/actions/{verb}
 GET    /metrics</code></pre>
-<p>支持的 Node Action Verb 是 <code>cordon</code>、<code>uncordon</code> 与 <code>drain</code>；取消 Drain 也使用 <code>uncordon</code>。所有路由都要求 Fleet Administrator 身份；Node Register/Heartbeat、Route Resolve 与 Internal Work Endpoint 仍是仅供 Service 使用的 API。</p>
+<p>支持的 Node Action Verb 是 <code>cordon</code>、<code>uncordon</code>、<code>drain</code> 与 <code>fence</code>；<code>fence</code> 必须携带 <code>{"confirm_host_stopped_or_isolated":true}</code>，且只接受 Lost/Fenced Node。取消 Drain 使用 <code>uncordon</code>。所有路由都要求 Fleet Administrator 身份；Node Register/Heartbeat、Route Resolve 与 Internal Work Endpoint 仍是仅供 Service 使用的 API。</p>
 
 <h2 id="production-caveats">当前源码的生产限制</h2>
 <p>仓库仍缺少 tap/overlay Guest 网络、Workspace Resource Store 的 PostgreSQL 实现与权限隔离。原生 vhost-user-blk（ADR-0015）与 Suspended page-out（在每 Cat 的 file-backed 内存区上使用 <code>process_madvise(MADV_PAGEOUT)</code>）都已落地；内核 NBD 仍是默认块路径，原因是实测的写吞吐权衡，而非缺少验证。Cloud Hypervisor 路径已经通过已记录的裸金属验收，但在这些剩余项完成前，不能称整个技术栈已经 Production Ready。</p>

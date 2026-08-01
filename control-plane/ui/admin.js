@@ -145,7 +145,7 @@ function render() {
   const overview = state.overview;
   const usage = overview.usage || {};
   document.querySelector("#admin-metrics").innerHTML = [
-    metricCard(t("admin.metric.fleetNodes"), overview.nodes.total, t("admin.metric.nodeDetail", { ready: overview.nodes.ready, lost: overview.nodes.lost })),
+    metricCard(t("admin.metric.fleetNodes"), overview.nodes.total, t("admin.metric.nodeDetail", { ready: overview.nodes.ready, lost: overview.nodes.lost, fenced: overview.nodes.fenced })),
     metricCard(t("admin.metric.totalCats"), overview.cats.total, t("admin.metric.running", { count: overview.cats.running })),
     metricCard(t("admin.metric.cpuUsage"), formatPercent(usage.cpu_usage_percent), t("admin.metric.cpuDetail", { logical: usage.logical_cpus ?? overview.capacity.total_cpus, assigned: overview.capacity.assigned_cpus })),
     metricCard(t("admin.metric.memoryUsage"), formatPercent(usage.memory_total_mib == null ? null : (usage.memory_used_mib / usage.memory_total_mib) * 100), usageDetail(usage.memory_used_mib, usage.memory_total_mib, formatMib)),
@@ -180,6 +180,8 @@ function nodeActions(summary) {
   } else if (summary.node.state === "draining") {
     actions.push(["uncordon", t("admin.action.cancelDrain")]);
   } else if (summary.node.state === "lost") {
+    actions.push(["fence", t("admin.action.fence")]);
+  } else if (summary.node.state === "fenced") {
     actions.push(["delete", t("admin.action.delete")]);
   }
   return actions.map(([action, label]) => `<button class="mini-button ${action === "delete" ? "danger" : ""}" data-node-action="${action}" data-node="${escapeHtml(summary.node.id)}">${label}</button>`).join("");
@@ -319,6 +321,8 @@ function openNodeDetails(id) {
 async function mutateNode(id, action, button) {
   const warning = action === "drain"
     ? t("admin.node.drainConfirm", { id })
+    : action === "fence"
+      ? t("admin.node.fenceConfirm", { id })
     : action === "delete"
       ? t("admin.node.deleteConfirm", { id })
       : t("admin.node.actionConfirm", { id, action: t(`admin.action.${action}`) });
@@ -328,7 +332,12 @@ async function mutateNode(id, action, button) {
     const path = action === "delete"
       ? `/v1/admin/nodes/${encodeURIComponent(id)}`
       : `/v1/admin/nodes/${encodeURIComponent(id)}/actions/${action}`;
-    await authenticatedRequest(path, { method: action === "delete" ? "DELETE" : "POST" });
+    await authenticatedRequest(path, {
+      method: action === "delete" ? "DELETE" : "POST",
+      body: action === "fence"
+        ? JSON.stringify({ confirm_host_stopped_or_isolated: true })
+        : undefined,
+    });
     await loadAll({ quiet: true });
     toast(t("admin.node.operationCompleted"), `${id} · ${t(`admin.action.${action}`)}`);
   } finally {

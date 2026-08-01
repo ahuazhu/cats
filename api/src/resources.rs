@@ -235,7 +235,12 @@ pub enum NodeState {
     Cordoned,
     /// Existing Cats are being stopped and rescheduled; no new placements.
     Draining,
+    /// Heartbeats are stale. Existing Cat and disk claims are preserved until
+    /// the Host recovers or an administrator confirms external fencing.
     Lost,
+    /// The old Host was confirmed stopped or isolated and its Cat/disk claims
+    /// were revoked. This node identity must not become schedulable again.
+    Fenced,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -415,6 +420,8 @@ pub struct NodeStateCounts {
     pub cordoned: u64,
     pub draining: u64,
     pub lost: u64,
+    #[serde(default)]
+    pub fenced: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

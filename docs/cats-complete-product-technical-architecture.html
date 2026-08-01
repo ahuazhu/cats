@@ -562,8 +562,8 @@ COMMIT;
       <div class="two-col">
         <article class="card"><h3>Running → Suspended</h3><ol><li>Guest Agent 执行 syncfs。</li><li>等待所有要求的磁盘 FLUSH 完成。</li><li>Cloud Hypervisor pause。</li><li>可对 file-backed Guest RAM 执行 page-out。</li><li>保持 VMM、设备 backend、tap 与 Host reservation。</li></ol><p>恢复只执行 resume。首版不在带外部设备时依赖内存 snapshot restore。</p></article>
         <article class="card"><h3>Running → Cold</h3><ol><li>停止接受新 exec/deploy。</li><li>Guest syncfs；应用可选 pre-stop hook 有严格 deadline。</li><li>块设备执行最后 FLUSH，记录 durable generation。</li><li>解绑 Endpoint，关闭 Guest/VMM。</li><li>释放 Attachment runtime lease、tap、RAM 和 NVMe reservation。</li></ol><p>MountBinding 可以保留，但 runtime Attachment 必须结束。</p></article>
-        <article class="card"><h3>Cold → Running</h3><ol><li>Scheduler 选择 Node 并预留资源。</li><li>Disk Controller 创建更高 attachment epoch。</li><li>Node 启动空或复用的 clean cache、cats-blockd 和 tap。</li><li>启动 Guest，ext4 通过 journal recovery 恢复。</li><li>Guest Ready 后使用新 route epoch 发布流量。</li></ol></article>
-        <article class="card"><h3>Host Lost → Running</h3><ol><li>Node lease 超时；Controller 将 Cat 标为 Unknown。</li><li>阻止快速双启：等待 fencing 条件或云 API 确认旧 Host 已关机。</li><li>撤销旧 disk epoch，创建新 epoch。</li><li>在新 Node 冷启动；不尝试保留内存。</li><li>Ready 后切 Route；旧长连接由客户端重连。</li></ol></article>
+        <article class="card"><h3>Cold → Running</h3><ol><li>Scheduler 选择 Node 并预留资源。</li><li>Controller 在 metadata DB 撤销旧 attachment epoch，随后才持久化 <code>Starting</code>，形成 dispatch boundary。</li><li>Node 启动 clean cache 与 cats-blockd；blockd 直接在 metadata DB 原子获取实际 owner/epoch，再建立 tap。</li><li>启动 Guest；若 <code>Starting</code> 后控制面崩溃或 StartCat 回包丢失，只在同一 Node 重放同一幂等 Job，不重新 revoke 或改投其他 Node。</li><li>Guest Ready 后使用新 route epoch 发布流量。</li></ol></article>
+        <article class="card"><h3>Host Lost → Running</h3><ol><li>Node heartbeat 超时；Controller 将 Node 标为 Lost、Cat 标为 Unknown，但保留 placement、Route 与旧 disk epoch。心跳超时不能自动撤销 claim 或双启。</li><li>原 Node 恢复心跳时，只有覆盖全部保留 claim、且每个 Cat generation 都匹配的完整 inventory 才让 Node 回到 Ready、让 Cat 原地恢复；仅重新注册或漏报任一 claim 都保持 Lost。</li><li>确认永久丢失时，先由云 API、BMC/电源控制或网络隔离证明旧 Host 已停止执行，再由管理员显式确认 fence；Controller 持久化 Fenced 状态。</li><li>撤销旧 disk epoch、解绑 Route 与 placement；旧 Host 即使恢复也保持不可调度。</li><li>在新 Node 冷启动并创建新 epoch；Ready 后切 Route。</li></ol></article>
       </div>
 
       <h3 style="margin-top:28px">8.2 自动空闲策略</h3>
@@ -803,7 +803,7 @@ score(node) =
             <tr><td>Edge 实例</td><td>部分连接断开</td><td>LB 切换；客户端重连，route cache 重建</td><td>无磁盘影响</td></tr>
             <tr><td>cat-agent</td><td>该 Node 新管理操作暂停；Guest 可继续运行</td><td>systemd 重启；与 VMM 实际状态重建 inventory</td><td>块后端独立存活时 I/O 继续</td></tr>
             <tr><td>单 VMM/blockd</td><td>一个 Cat 中断</td><td>同 Host 从 pending 重建 blockd，必要时重启 VMM</td><td>Relaxed 重建 L 后后台发布，不在 attach 阶段做远端写</td></tr>
-            <tr><td>整台 Node</td><td>该 Node 上 Cat 连接中断</td><td>云 fencing 后在其他 Node 批量冷恢复</td><td>Strict 恢复成功 FLUSH；Relaxed 恢复到 R，丢故障时 L-R；RAM 丢失</td></tr>
+            <tr><td>整台 Node</td><td>该 Node 上 Cat 连接中断</td><td>heartbeat 超时只标 Lost 并保留 claim；外部确认停机/隔离并显式 fence 后，在其他 Node 批量冷恢复</td><td>Strict 恢复成功 FLUSH；Relaxed 恢复到 R，丢故障时 L-R；RAM 丢失</td></tr>
             <tr><td>对象存储限流</td><td>冷读/Strict FLUSH 变慢；Relaxed 积压增长</td><td>publisher 重试、clean cache 淘汰；只剩 pin 后背压</td><td>Relaxed 不向 ext4 注入普通远端错误；drain 失败不清理源</td></tr>
             <tr><td>区域故障</td><td>V1 服务中断</td><td>按灾备 Runbook 恢复控制面与副本</td><td>取决于跨 Region 复制；V1 不承诺 RPO 0</td></tr>
           </tbody>
@@ -811,7 +811,7 @@ score(node) =
       </div>
 
       <h3 style="margin-top:28px">14.2 Host 故障的风暴控制</h3>
-      <div class="callout orange"><strong>不能同时重启所有 Cat：</strong>Node Lost 后，Recovery Controller 按租户公平、服务优先级、磁盘冷读预算和目标 Node 容量分批恢复。必须限制每秒 Activation、对象存储 GET 带宽和单 Node 并发 boot，避免一次 Host 故障放大成区域对象存储/数据库故障。</div>
+      <div class="callout orange"><strong>不能同时重启所有 Cat：</strong>Node Lost 本身不触发重启；外部 fencing 被显式确认后，Recovery Controller 才按租户公平、服务优先级、磁盘冷读预算和目标 Node 容量分批恢复。必须限制每秒 Activation、对象存储 GET 带宽和单 Node 并发 boot，避免一次 Host 故障放大成区域对象存储/数据库故障。</div>
 
       <h3 style="margin-top:28px">14.3 备份与恢复</h3>
       <div class="three-col">

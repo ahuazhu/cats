@@ -23,6 +23,8 @@ impl Store {
                    agent_url=?2, gateway_url=?3,
                    state=CASE
                        WHEN nodes.state='draining' THEN 'draining'
+                       WHEN nodes.state='fenced' THEN 'fenced'
+                       WHEN nodes.state='lost' THEN 'lost'
                        WHEN nodes.scheduling_disabled=1 THEN 'cordoned'
                        ELSE 'ready'
                    END,
@@ -45,12 +47,7 @@ impl Store {
             .map(|value| serde_json::to_string(value).expect("node telemetry must serialize"));
         let n = self.with(|c| {
             c.execute(
-                "UPDATE nodes SET last_heartbeat_ms=?2, telemetry_json=?3,
-                                  state=CASE
-                                      WHEN state='lost' AND scheduling_disabled=1 THEN 'cordoned'
-                                      WHEN state='lost' THEN 'ready'
-                                      ELSE state
-                                  END
+                "UPDATE nodes SET last_heartbeat_ms=?2, telemetry_json=?3
                  WHERE id=?1",
                 params![node_id, now_ms(), telemetry_json],
             )
@@ -59,6 +56,24 @@ impl Store {
             return Err(ApiError::not_found(format!("node {node_id}")));
         }
         Ok(())
+    }
+
+    /// Make a reachable Lost node schedulable again after its heartbeat has
+    /// proved every preserved Cat claim with a same-generation runtime entry.
+    /// The state predicate makes this safe against a concurrent admin fence.
+    pub fn recover_lost_node(&self, node_id: &str) -> Result<bool> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE nodes
+                    SET state=CASE
+                            WHEN scheduling_disabled=1 THEN 'cordoned'
+                            ELSE 'ready'
+                        END
+                  WHERE id=?1 AND state='lost'",
+                params![node_id],
+            )
+            .map(|changed| changed == 1)
+        })
     }
 
     pub fn list_nodes(&self) -> Result<Vec<Node>> {
@@ -87,12 +102,14 @@ impl Store {
             c.execute(
                 "UPDATE nodes
                     SET state=CASE
+                            WHEN state='fenced' AND ?2<>'fenced' THEN state
                             WHEN ?2='cordoned' AND state='lost' THEN state
                             ELSE ?2
                         END,
                         scheduling_disabled=CASE
+                            WHEN state='fenced' THEN 1
                             WHEN ?2='ready' THEN 0
-                            WHEN ?2 IN ('cordoned','draining') THEN 1
+                            WHEN ?2 IN ('cordoned','draining','fenced') THEN 1
                             ELSE scheduling_disabled
                         END
                   WHERE id=?1",
@@ -185,7 +202,7 @@ impl Store {
         let state = state.ok_or_else(|| ApiError::not_found(format!("node {node_id}")))?;
         if state == "ready" || state == "draining" {
             return Err(ApiError::failed_precondition(
-                "only cordoned or lost nodes can be deleted",
+                "only cordoned, lost, or fenced nodes can be deleted",
             ));
         }
         tx.execute("DELETE FROM nodes WHERE id=?1", params![node_id])

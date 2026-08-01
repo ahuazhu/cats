@@ -1,5 +1,5 @@
 //! Control-plane contract tests with a stub node agent: reconcile loop,
-//! operations, idempotency, RWO enforcement, node-loss fencing/rescheduling.
+//! operations, idempotency, RWO enforcement, and explicit node-loss fencing.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -46,6 +46,12 @@ struct StubNode {
     exec_attempts: Arc<AtomicUsize>,
     exec_conflicts_remaining: Arc<AtomicUsize>,
     fail_jobs_remaining: Arc<Mutex<HashMap<String, usize>>>,
+    /// Apply a StartCat, acquire its disk epochs, then return HTTP 503. This
+    /// models the ambiguous boundary where the Host is already serving the
+    /// Guest but the control plane never receives the successful job result.
+    lose_start_responses_remaining: Arc<AtomicUsize>,
+    started_volume_epochs: Arc<Mutex<Vec<(String, String, i64)>>>,
+    storage_meta: Arc<dyn MetadataStore>,
 }
 
 impl StubNode {
@@ -54,7 +60,7 @@ impl StubNode {
     /// Clearing `alive` on its own is not enough. The loop tests it before it
     /// builds the request, so a heartbeat that already passed the test can land
     /// after the caller has moved the node to Lost and quietly revive it --
-    /// recovering a Lost node on heartbeat is intended behaviour, which is
+    /// a complete same-generation heartbeat can recover a Lost node, which is
     /// exactly why the test has to be sure none is outstanding.
     async fn quiesce(&self) {
         self.alive.store(false, Ordering::SeqCst);
@@ -62,7 +68,7 @@ impl StubNode {
     }
 }
 
-async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Json<NodeJobResult> {
+async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Response {
     node.jobs.lock().unwrap().push(job.job_id.clone());
     let kind = job.action.kind().to_string();
     let should_fail = {
@@ -89,7 +95,32 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Jso
             observed,
             format!("injected {kind} failure"),
             true,
-        ));
+        ))
+        .into_response();
+    }
+    let lose_start_response = matches!(&job.action, NodeJobAction::StartCat { .. })
+        && node
+            .lose_start_responses_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok();
+    if lose_start_response {
+        let NodeJobAction::StartCat { volumes, .. } = &job.action else {
+            unreachable!("checked StartCat above")
+        };
+        let mut epochs = node.started_volume_epochs.lock().unwrap();
+        for volume in volumes {
+            let epoch = node
+                .storage_meta
+                .acquire_lease(&volume.volume_id, &volume.attachment_id, 60_000)
+                .unwrap();
+            epochs.push((
+                volume.volume_id.clone(),
+                volume.attachment_id.clone(),
+                epoch,
+            ));
+        }
     }
     let (cat_id, observed) = match &job.action {
         NodeJobAction::StartCat { cat_id, .. } => (cat_id.clone(), ObservedState::Running),
@@ -109,7 +140,15 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Jso
     } else {
         cats.insert(cat_id, observed);
     }
-    Json(NodeJobResult::ok(job.job_id, observed))
+    if lose_start_response {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "injected lost StartCat response",
+        )
+            .into_response()
+    } else {
+        Json(NodeJobResult::ok(job.job_id, observed)).into_response()
+    }
 }
 
 async fn stub_exec(State(node): State<StubNode>, Json(req): Json<ExecRequest>) -> Response {
@@ -145,6 +184,9 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
         exec_attempts: Arc::new(AtomicUsize::new(0)),
         exec_conflicts_remaining: Arc::new(AtomicUsize::new(0)),
         fail_jobs_remaining: Arc::new(Mutex::new(HashMap::new())),
+        lose_start_responses_remaining: Arc::new(AtomicUsize::new(0)),
+        started_volume_epochs: Arc::new(Mutex::new(Vec::new())),
+        storage_meta: cp.state.storage_meta.clone(),
     };
     let app = Router::new()
         .route("/v1/jobs", post(stub_job))
@@ -1106,40 +1148,295 @@ async fn snapshot_requires_the_running_disks_remote_watermark() {
 }
 
 #[tokio::test]
-async fn node_loss_fences_and_reschedules() {
+async fn ambiguous_start_response_retries_the_same_claim_without_revoking_its_epoch() {
+    let ctx = Ctx::new_with_auto_tier(Default::default(), 1_500).await;
+    let source = start_stub_node(&ctx.cp, "node_z").await;
+    source
+        .lose_start_responses_remaining
+        .store(1, Ordering::SeqCst);
+    source.quiesce().await;
+
+    ctx.create_cat("ambiguous-start", None).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let (volume_id, attachment_id, epoch) = loop {
+        if let Some(epoch) = source
+            .started_volume_epochs
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+        {
+            break epoch;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the injected StartCat never acquired its disk epoch"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    // If the control plane treats the missing response as a failed launch, this
+    // lexicographically earlier node wins the next placement. A safe retry must
+    // retain node_z and replay the same idempotent job there.
+    let replacement = start_stub_node(&ctx.cp, "node_a").await;
+    let cat = ctx
+        .wait_observed("ambiguous-start", ObservedState::Running)
+        .await;
+    assert_eq!(cat.node_id.as_deref(), Some("node_z"));
+    assert_eq!(
+        source
+            .jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|job| job.contains("_start_cat"))
+            .count(),
+        2,
+        "the deterministic StartCat job should be replayed on its owning node"
+    );
+    assert!(
+        replacement
+            .jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|job| !job.contains("_start_cat")),
+        "an ambiguous launch must not move to another Host"
+    );
+    ctx.cp
+        .state
+        .storage_meta
+        .renew_lease(&volume_id, &attachment_id, epoch, 60_000)
+        .expect("replaying an ambiguous StartCat must preserve its live disk epoch");
+}
+
+#[tokio::test]
+async fn node_loss_preserves_claim_until_fencing_is_explicitly_confirmed() {
     let ctx = Ctx::new().await;
     let node_a = start_stub_node(&ctx.cp, "node_a").await;
     ctx.create_cat("dev", None).await;
     let cat = ctx.wait_observed("dev", ObservedState::Running).await;
     assert_eq!(cat.node_id.as_deref(), Some("node_a"));
+    ctx.create_cat("doomed", None).await;
+    let doomed = ctx.wait_observed("doomed", ObservedState::Running).await;
+    assert_eq!(doomed.node_id.as_deref(), Some("node_a"));
+    let root = ctx
+        .cp
+        .state
+        .store
+        .get_disk(&cat.workspace_id, &cat.root_disk_id)
+        .unwrap();
+    let old_attachment = "old-node-a-attachment";
+    let old_epoch = ctx
+        .cp
+        .state
+        .storage_meta
+        .acquire_lease(&root.volume_id, old_attachment, 60_000)
+        .unwrap();
 
-    // Second node joins; first node dies (heartbeats stop).
-    let _node_b = start_stub_node(&ctx.cp, "node_b").await;
+    // A second node joins and the first heartbeat stream is interrupted. This
+    // is suspicion, not proof that the old runtime has stopped.
+    let node_b = start_stub_node(&ctx.cp, "node_b").await;
     node_a.quiesce().await;
 
-    // The cat must converge back to Running on the surviving node.
+    // Heartbeat expiry marks both records unknown/lost but preserves the old
+    // placement and storage claim. In particular, it must not start a second
+    // Guest or revoke the old block engine's epoch.
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
-        let cat: Cat = ctx
-            .http
-            .get(ctx.ws_url("/cats/dev"))
-            .bearer_auth("dev-admin-token")
-            .send()
-            .await
+        if ctx.cp.state.store.get_node("node_a").unwrap().state == NodeState::Lost {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node_a was never marked lost"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let cat = ctx.cp.state.store.must_get_cat_by_id(&cat.id).unwrap();
+    assert_eq!(cat.observed_state, ObservedState::Unknown);
+    assert_eq!(cat.node_id.as_deref(), Some("node_a"));
+    assert!(node_b.cats.lock().unwrap().is_empty());
+    ctx.cp
+        .state
+        .storage_meta
+        .renew_lease(&root.volume_id, old_attachment, old_epoch, 60_000)
+        .expect("heartbeat loss alone must not revoke the old epoch");
+
+    // A restarted agent cannot prove that its preserved claims are still
+    // running by merely re-registering and sending an empty inventory. Keep
+    // the node Lost so an operator can either restore the runtimes in place or
+    // explicitly fence the Host; silently making it Ready would strand these
+    // Unknown Cats outside both recovery paths.
+    let registered = ctx.cp.state.store.get_node("node_a").unwrap();
+    ctx.http
+        .post(ctx.url("/v1/nodes/register"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&RegisterNodeRequest {
+            node_id: registered.id.clone(),
+            agent_url: registered.agent_url.clone(),
+            gateway_url: registered.gateway_url.clone(),
+            cpus: registered.capacity.cpus,
+            memory_mib: registered.capacity.memory_mib,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    ctx.http
+        .post(ctx.url("/v1/nodes/heartbeat"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&HeartbeatRequest {
+            node_id: "node_a".into(),
+            cats: Vec::new(),
+            telemetry: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        ctx.cp.state.store.get_node("node_a").unwrap().state,
+        NodeState::Lost
+    );
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .must_get_cat_by_id(&cat.id)
             .unwrap()
-            .json()
-            .await
-            .unwrap();
-        if cat.observed_state == ObservedState::Running && cat.node_id.as_deref() == Some("node_b")
+            .observed_state,
+        ObservedState::Unknown
+    );
+    assert!(node_b.cats.lock().unwrap().is_empty());
+
+    // If the heartbeat returns before an explicit handoff, ownership recovers
+    // in place only after its complete, same-generation inventory proves every
+    // preserved claim instead of cold-starting another Guest.
+    node_a.alive.store(true, Ordering::SeqCst);
+    ctx.http
+        .post(ctx.url("/v1/nodes/heartbeat"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&HeartbeatRequest {
+            node_id: "node_a".into(),
+            cats: vec![
+                HeartbeatCat {
+                    cat_id: cat.id.clone(),
+                    generation: cat.generation,
+                    state: ObservedState::Running,
+                },
+                HeartbeatCat {
+                    cat_id: doomed.id.clone(),
+                    generation: doomed.generation,
+                    state: ObservedState::Running,
+                },
+            ],
+            telemetry: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let cat = ctx.cp.state.store.must_get_cat_by_id(&cat.id).unwrap();
+        if ctx.cp.state.store.get_node("node_a").unwrap().state == NodeState::Ready
+            && cat.observed_state == ObservedState::Running
         {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "never rescheduled to node_b"
+            "node_a did not recover its existing claim"
         );
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    assert!(node_b.cats.lock().unwrap().is_empty());
+
+    // Lose it again. A false confirmation cannot trigger the destructive
+    // handoff; a positive confirmation means an external actor has stopped or
+    // isolated the Host, so the control plane may now fence and reschedule.
+    node_a.quiesce().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while ctx.cp.state.store.get_node("node_a").unwrap().state != NodeState::Lost {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node_a was not marked lost a second time"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let delete: CatOperationResponse = ctx
+        .http
+        .delete(ctx.ws_url("/cats/doomed"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let still_claimed = ctx.cp.state.store.must_get_cat_by_id(&doomed.id).unwrap();
+    assert_eq!(still_claimed.desired_state, DesiredState::Deleted);
+    assert_eq!(still_claimed.observed_state, ObservedState::Unknown);
+    assert_eq!(still_claimed.node_id.as_deref(), Some("node_a"));
+    let rejected = ctx
+        .http
+        .post(ctx.url("/v1/admin/nodes/node_a/actions/fence"))
+        .bearer_auth("dev-admin-token")
+        .json(&serde_json::json!({"confirm_host_stopped_or_isolated": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    ctx.cp
+        .state
+        .storage_meta
+        .renew_lease(&root.volume_id, old_attachment, old_epoch, 60_000)
+        .expect("a rejected fence confirmation must leave the claim intact");
+
+    let fenced = ctx
+        .http
+        .post(ctx.url("/v1/admin/nodes/node_a/actions/fence"))
+        .bearer_auth("dev-admin-token")
+        .json(&serde_json::json!({"confirm_host_stopped_or_isolated": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fenced.status(), StatusCode::OK);
+    assert_eq!(
+        fenced.json::<NodeSummary>().await.unwrap().node.state,
+        NodeState::Fenced
+    );
+
+    let cat = ctx.wait_observed("dev", ObservedState::Running).await;
+    assert_eq!(cat.node_id.as_deref(), Some("node_b"));
+    assert_eq!(
+        ctx.wait_operation(&delete.operation.id).await.phase,
+        OperationPhase::Succeeded
+    );
+    assert_eq!(
+        ctx.http
+            .get(ctx.ws_url("/cats/doomed"))
+            .bearer_auth("dev-admin-token")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert!(matches!(
+        ctx.cp
+            .state
+            .storage_meta
+            .renew_lease(&root.volume_id, old_attachment, old_epoch, 60_000),
+        Err(cats_storage::MetaError::Fenced)
+    ));
 }
 
 #[tokio::test]
@@ -2043,8 +2340,10 @@ async fn admin_can_monitor_and_drain_nodes() {
         NodeState::Ready
     );
 
-    // Cordon records scheduling intent without hiding Lost health; a later
-    // registration recovery must not silently defeat that intent.
+    // Cordon records scheduling intent without hiding Lost health. A later
+    // registration alone cannot clear Lost; with no preserved claims, the
+    // following empty heartbeat is a complete inventory and recovers the Node
+    // to Cordoned without silently defeating that intent.
     node_a.quiesce().await;
     ctx.cp
         .state
@@ -2078,6 +2377,19 @@ async fn admin_can_monitor_and_drain_nodes() {
         .await
         .unwrap();
     assert_eq!(register.status(), StatusCode::NO_CONTENT);
+    let heartbeat = ctx
+        .http
+        .post(ctx.url("/v1/nodes/heartbeat"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&HeartbeatRequest {
+            node_id: "node_a".into(),
+            cats: Vec::new(),
+            telemetry: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(heartbeat.status(), StatusCode::NO_CONTENT);
     let node: NodeSummary = ctx
         .http
         .get(ctx.url("/v1/admin/nodes/node_a"))
