@@ -15,9 +15,9 @@ use axum::{Json, Router};
 use cats_api::billing::BillingBalance;
 use cats_api::metering::{
     CatUsageCheckpoint, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse, UsageMetric,
-    UsageReport,
+    UsageReport, MAX_USAGE_INGEST_BODY_BYTES,
 };
-use cats_api::nodejob::{NodeJob, NodeJobAction, NodeJobResult};
+use cats_api::nodejob::{NodeJob, NodeJobAction, NodeJobResult, StopCatDisposition};
 use cats_api::requests::*;
 use cats_api::resources::*;
 use cats_control_plane::controller::AutoTierPolicy;
@@ -52,6 +52,7 @@ struct StubNode {
     lose_start_responses_remaining: Arc<AtomicUsize>,
     started_volume_epochs: Arc<Mutex<Vec<(String, String, i64)>>>,
     storage_meta: Arc<dyn MetadataStore>,
+    stop_dispositions: Arc<Mutex<Vec<StopCatDisposition>>>,
 }
 
 impl StubNode {
@@ -70,6 +71,12 @@ impl StubNode {
 
 async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Response {
     node.jobs.lock().unwrap().push(job.job_id.clone());
+    if let NodeJobAction::StopCat { disposition, .. } = &job.action {
+        node.stop_dispositions
+            .lock()
+            .unwrap()
+            .push(disposition.clone());
+    }
     let kind = job.action.kind().to_string();
     let should_fail = {
         let mut failures = node.fail_jobs_remaining.lock().unwrap();
@@ -124,7 +131,7 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Res
     }
     let (cat_id, observed) = match &job.action {
         NodeJobAction::StartCat { cat_id, .. } => (cat_id.clone(), ObservedState::Running),
-        NodeJobAction::StopCat { cat_id } => (cat_id.clone(), ObservedState::Cold),
+        NodeJobAction::StopCat { cat_id, .. } => (cat_id.clone(), ObservedState::Cold),
         NodeJobAction::SuspendCat { cat_id, .. } => (cat_id.clone(), ObservedState::Suspended),
         NodeJobAction::ResumeCat { cat_id } => (cat_id.clone(), ObservedState::Running),
         NodeJobAction::WarmCat { cat_id } => (cat_id.clone(), ObservedState::Warm),
@@ -187,6 +194,7 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
         lose_start_responses_remaining: Arc::new(AtomicUsize::new(0)),
         started_volume_epochs: Arc::new(Mutex::new(Vec::new())),
         storage_meta: cp.state.storage_meta.clone(),
+        stop_dispositions: Arc::new(Mutex::new(Vec::new())),
     };
     let app = Router::new()
         .route("/v1/jobs", post(stub_job))
@@ -745,7 +753,7 @@ async fn create_converges_and_idempotency_replays() {
 #[tokio::test]
 async fn lifecycle_stop_start_suspend_resume() {
     let ctx = Ctx::new().await;
-    let _node = start_stub_node(&ctx.cp, "node_a").await;
+    let node = start_stub_node(&ctx.cp, "node_a").await;
     ctx.create_cat("dev", None).await;
     ctx.wait_observed("dev", ObservedState::Running).await;
 
@@ -753,6 +761,10 @@ async fn lifecycle_stop_start_suspend_resume() {
     ctx.wait_operation(&stop.operation.id).await;
     let cat = ctx.wait_observed("dev", ObservedState::Cold).await;
     assert!(cat.node_id.is_none(), "placement must clear on stop");
+    assert_eq!(
+        node.stop_dispositions.lock().unwrap().last(),
+        Some(&StopCatDisposition::Cold)
+    );
 
     ctx.action("dev", "start").await;
     ctx.wait_observed("dev", ObservedState::Running).await;
@@ -1641,7 +1653,7 @@ async fn exec_retries_a_transient_suspend_conflict() {
 #[tokio::test]
 async fn destroy_deletes_root_disk_and_keeps_persistent() {
     let ctx = Ctx::new().await;
-    let _node = start_stub_node(&ctx.cp, "node_a").await;
+    let node = start_stub_node(&ctx.cp, "node_a").await;
     ctx.create_cat("dev", None).await;
     ctx.wait_observed("dev", ObservedState::Running).await;
     // Attach a persistent disk.
@@ -1702,6 +1714,16 @@ async fn destroy_deletes_root_disk_and_keeps_persistent() {
     assert_eq!(disks.items.len(), 1);
     assert_eq!(disks.items[0].name, "keep");
     assert_eq!(disks.items[0].state, DiskState::Available);
+    let dispositions = node.stop_dispositions.lock().unwrap();
+    let Some(StopCatDisposition::Destroy {
+        disposable_root_disk_ids,
+        retained_persistent_disk_ids,
+    }) = dispositions.last()
+    else {
+        panic!("delete did not dispatch a destroy-specific StopCat");
+    };
+    assert_eq!(disposable_root_disk_ids.len(), 1);
+    assert_eq!(retained_persistent_disk_ids, &[disks.items[0].id.clone()]);
 }
 
 #[tokio::test]
@@ -1752,6 +1774,21 @@ async fn static_user_tokens_are_not_accepted() {
         .await
         .unwrap();
     assert_eq!(admin_across_workspaces.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn usage_ingestion_rejects_bodies_above_the_explicit_limit() {
+    let ctx = Ctx::new().await;
+    let response = ctx
+        .http
+        .post(ctx.url("/v1/internal/usage/checkpoints"))
+        .bearer_auth(SERVICE_TOKEN)
+        .header("content-type", "application/json")
+        .body(vec![b' '; MAX_USAGE_INGEST_BODY_BYTES + 1])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 #[tokio::test]

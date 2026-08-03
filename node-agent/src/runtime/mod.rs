@@ -30,14 +30,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
 use cats_api::guest::DiskMapEntry;
 use cats_api::nodejob::{
-    JobPhase, NodeJob, NodeJobAction, NodeJobResult, SuspendWorkFence, VolumeGrant,
+    JobPhase, NodeJob, NodeJobAction, NodeJobResult, StopCatDisposition, SuspendWorkFence,
+    VolumeGrant,
 };
 use cats_api::requests::{ProxyHttpRequest, ProxyHttpResponse};
 use cats_api::resources::{DiskDurabilityTelemetry, NodeTelemetry, ObservedState};
@@ -266,9 +267,9 @@ fn symlink_socket(link: &Path, target: &Path) {
 
 pub struct NodeRuntime {
     pub cfg: NodeConfig,
-    /// Serializes job execution; jobs are rare and idempotent. Held by every
-    /// action except `ResumeCat`, which allocates no node-global resource and
-    /// instead serializes per Cat so several Cats can wake in parallel.
+    /// Conservative node-wide serialization for lifecycle/hot-plug paths that
+    /// have not yet been made concurrent, plus kernel-NBD allocation. Stop and
+    /// Resume are explicitly exempt; every action still holds its per-Cat lock.
     ops: Mutex<()>,
     /// Per-Cat execution locks for the concurrent wake path. Keeps the
     /// existing "one job per Cat at a time" idempotency guarantee while
@@ -294,6 +295,54 @@ pub struct NodeRuntime {
     /// be refused for the same reason — only counted. Same configured
     /// concurrency, byte ceiling removed.
     launch_admission: WakeAdmission,
+    /// Remote Stop/Cold drains may run across Cats, but an expiry wave must not
+    /// create unbounded S3/PostgreSQL fan-out.
+    stop_admission: StopAdmission,
+}
+
+const MAX_CONCURRENT_STOPS: usize = 4;
+
+#[derive(Debug)]
+struct StopAdmission {
+    limit: usize,
+    in_flight: Mutex<usize>,
+    released: Condvar,
+}
+
+impl StopAdmission {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            in_flight: Mutex::new(0),
+            released: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> StopPermit<'_> {
+        let mut in_flight = self.in_flight.lock().expect("stop admission mutex");
+        while *in_flight >= self.limit {
+            in_flight = self.released.wait(in_flight).expect("stop admission mutex");
+        }
+        *in_flight += 1;
+        StopPermit { admission: self }
+    }
+
+    fn release(&self) {
+        let mut in_flight = self.in_flight.lock().expect("stop admission mutex");
+        *in_flight = in_flight.saturating_sub(1);
+        drop(in_flight);
+        self.released.notify_one();
+    }
+}
+
+struct StopPermit<'a> {
+    admission: &'a StopAdmission,
+}
+
+impl Drop for StopPermit<'_> {
+    fn drop(&mut self) {
+        self.admission.release();
+    }
 }
 
 impl NodeRuntime {
@@ -312,6 +361,7 @@ impl NodeRuntime {
                 commitment_bytes: u64::MAX,
                 ..cfg_wake_budget
             }),
+            stop_admission: StopAdmission::new(MAX_CONCURRENT_STOPS),
         }
     }
 

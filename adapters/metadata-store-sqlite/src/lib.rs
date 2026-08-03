@@ -138,6 +138,8 @@ fn row_to_head(row: &rusqlite::Row<'_>) -> rusqlite::Result<VolumeHead> {
         generation: row.get(2)?,
         root_hash: decode_hash(hash, 3)?,
         root_object_id: row.get(4)?,
+        lease_owner: row.get(5)?,
+        lease_epoch: row.get(6)?,
     })
 }
 
@@ -177,7 +179,8 @@ impl MetadataStore for SqliteMetadataStore {
     fn load_head(&self, volume_id: &str) -> Result<VolumeHead> {
         let conn = self.connection()?;
         conn.query_row(
-            "SELECT volume_id, size_bytes, generation, root_hash, root_object_id
+            "SELECT volume_id, size_bytes, generation, root_hash, root_object_id,
+                    lease_owner, lease_epoch
                FROM volumes WHERE volume_id = ?1",
             params![volume_id],
             row_to_head,
@@ -370,7 +373,8 @@ impl MetadataStore for SqliteMetadataStore {
         let conn = self.connection()?;
         let head = conn
             .query_row(
-                "SELECT volume_id, size_bytes, generation, root_hash, root_object_id
+                "SELECT volume_id, size_bytes, generation, root_hash, root_object_id,
+                        lease_owner, lease_epoch
                    FROM volumes WHERE volume_id = ?1",
                 params![volume_id],
                 row_to_head,

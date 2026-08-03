@@ -26,6 +26,31 @@ pub struct VolumeGrant {
     pub durability: crate::resources::DiskDurability,
 }
 
+/// Why a Cat runtime is being stopped.
+///
+/// A normal Cold transition preserves every disk and therefore drains every
+/// local durability journal. Destroy removes the Cat-owned RootDisk, so the
+/// node may discard only that disk's local state; independently-owned
+/// PersistentDisks still cross the mandatory remote-drain boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum StopCatDisposition {
+    #[default]
+    Cold,
+    Destroy {
+        /// Cat-owned RootDisks whose local journal/cache may be discarded.
+        disposable_root_disk_ids: Vec<String>,
+        /// Independently-owned disks that must still complete final drain.
+        retained_persistent_disk_ids: Vec<String>,
+    },
+}
+
+impl StopCatDisposition {
+    fn is_cold(&self) -> bool {
+        matches!(self, Self::Cold)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SuspendWorkFence {
     pub control_work_version: i64,
@@ -44,7 +69,13 @@ pub enum NodeJobAction {
         volumes: Vec<VolumeGrant>,
     },
     /// Flush disks, stop guest/VMM/backends, release runtime state.
-    StopCat { cat_id: String },
+    StopCat {
+        cat_id: String,
+        /// Omitted by older controllers and for ordinary Cold stops. The safe
+        /// compatibility default is to preserve and drain every disk.
+        #[serde(default, skip_serializing_if = "StopCatDisposition::is_cold")]
+        disposition: StopCatDisposition,
+    },
     /// Pause + page-out (Suspended, ADR-0002).
     SuspendCat {
         cat_id: String,
@@ -88,7 +119,7 @@ impl NodeJobAction {
     pub fn cat_id(&self) -> &str {
         match self {
             NodeJobAction::StartCat { cat_id, .. }
-            | NodeJobAction::StopCat { cat_id }
+            | NodeJobAction::StopCat { cat_id, .. }
             | NodeJobAction::SuspendCat { cat_id, .. }
             | NodeJobAction::ResumeCat { cat_id }
             | NodeJobAction::WarmCat { cat_id }
@@ -191,4 +222,56 @@ pub fn job_id(cat_id: &str, generation: i64, action_kind: &str) -> String {
         generation,
         action_kind
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_stop_payload_defaults_to_cold() {
+        let job: NodeJob = serde_json::from_str(
+            r#"{"job_id":"job_cat-a_1_stop_cat","cat_generation":1,"action":"stop_cat","cat_id":"cat-a"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            job.action,
+            NodeJobAction::StopCat {
+                disposition: StopCatDisposition::Cold,
+                ..
+            }
+        ));
+
+        let encoded = serde_json::to_value(job).unwrap();
+        assert_eq!(encoded.get("action").unwrap(), "stop_cat");
+        assert!(
+            encoded.get("disposition").is_none(),
+            "ordinary Cold stops keep the legacy wire shape"
+        );
+    }
+
+    #[test]
+    fn destroy_disk_disposition_is_explicit_on_the_wire() {
+        let job = NodeJob {
+            job_id: "job_cat-a_2_stop_cat".to_string(),
+            cat_generation: 2,
+            action: NodeJobAction::StopCat {
+                cat_id: "cat-a".to_string(),
+                disposition: StopCatDisposition::Destroy {
+                    disposable_root_disk_ids: vec!["root".to_string()],
+                    retained_persistent_disk_ids: vec!["data".to_string()],
+                },
+            },
+        };
+        let encoded = serde_json::to_value(job).unwrap();
+        assert_eq!(encoded["disposition"]["mode"], "destroy");
+        assert_eq!(
+            encoded["disposition"]["disposable_root_disk_ids"][0],
+            "root"
+        );
+        assert_eq!(
+            encoded["disposition"]["retained_persistent_disk_ids"][0],
+            "data"
+        );
+    }
 }

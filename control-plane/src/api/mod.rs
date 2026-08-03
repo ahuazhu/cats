@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -26,6 +26,7 @@ use cats_api::error::{ApiError, ErrorBody, ErrorCode};
 use cats_api::metering::{
     CatUsageSummary, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse,
     UsageDetailLine, UsageMetric, UsageReport, UsageSummaryLine, UsageTimeBucket,
+    MAX_USAGE_INGEST_BODY_BYTES,
 };
 use cats_api::oci::{DeployOciRequest, OciDeployment};
 use cats_api::requests::*;
@@ -481,7 +482,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/internal/work/release", post(release_work))
         .route(
             "/v1/internal/usage/checkpoints",
-            post(ingest_usage_checkpoints),
+            post(ingest_usage_checkpoints)
+                .layer(DefaultBodyLimit::max(MAX_USAGE_INGEST_BODY_BYTES)),
         )
         .route(
             "/v1/workspaces/{workspace}/billing/usage",

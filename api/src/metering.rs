@@ -7,6 +7,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Hard limit enforced by the control-plane JSON extractor. Producers should
+/// target materially less than this so headers and intermediary framing never
+/// put an otherwise valid checkpoint batch on the boundary.
+pub const MAX_USAGE_INGEST_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// Independent cardinality defense for a syntactically small request.
+pub const MAX_USAGE_CHECKPOINTS_PER_REQUEST: usize = 10_000;
+
 /// Canonical V1 meter definitions. Their units are immutable once emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

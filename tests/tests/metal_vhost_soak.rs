@@ -683,6 +683,7 @@ impl Soak {
         for cat_id in cats {
             let stop = self.runtime.execute(self.job(NodeJobAction::StopCat {
                 cat_id: cat_id.clone(),
+                disposition: cats_api::nodejob::StopCatDisposition::Cold,
             }));
             if stop.phase != JobPhase::Succeeded {
                 let cleanup = self.runtime.execute(self.job(NodeJobAction::CleanupCat {
@@ -1066,6 +1067,7 @@ impl Soak {
             self.execute(
                 NodeJobAction::StopCat {
                     cat_id: cat_id.clone(),
+                    disposition: cats_api::nodejob::StopCatDisposition::Cold,
                 },
                 ObservedState::Cold,
             )?;

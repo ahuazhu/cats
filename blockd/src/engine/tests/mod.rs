@@ -571,6 +571,137 @@ struct CountingMeta {
     cas_calls: AtomicU64,
 }
 
+/// Commits the first CAS but drops its response, reproducing a database
+/// timeout after PostgreSQL made the new root authoritative.
+#[derive(Clone, Copy)]
+enum CasFault {
+    ResponseLost,
+    ResponseLostAndFirstReconciliationFails,
+    ResponseLostThenLeaseRevoked,
+    ResponseLostThenGenerationAdvanced,
+    UnrelatedRootPublished,
+    ExplicitFenced,
+}
+
+struct LostCasResponseMeta {
+    inner: Arc<dyn MetadataStore>,
+    fault: Mutex<Option<CasFault>>,
+    fail_next_load: AtomicBool,
+}
+
+impl MetadataStore for LostCasResponseMeta {
+    fn create_volume(&self, v: &str, s: u64) -> cats_storage::metadata::Result<()> {
+        self.inner.create_volume(v, s)
+    }
+    fn load_head(
+        &self,
+        v: &str,
+    ) -> cats_storage::metadata::Result<cats_storage::metadata::VolumeHead> {
+        if self.fail_next_load.swap(false, Ordering::SeqCst) {
+            return Err(MetaError::Backend(
+                "injected authoritative-head read failure".into(),
+            ));
+        }
+        self.inner.load_head(v)
+    }
+    fn delete_volume(&self, v: &str) -> cats_storage::metadata::Result<()> {
+        self.inner.delete_volume(v)
+    }
+    fn resize_volume(&self, v: &str, s: u64) -> cats_storage::metadata::Result<()> {
+        self.inner.resize_volume(v, s)
+    }
+    fn acquire_lease(&self, v: &str, a: &str, ttl: i64) -> cats_storage::metadata::Result<i64> {
+        self.inner.acquire_lease(v, a, ttl)
+    }
+    fn renew_lease(
+        &self,
+        v: &str,
+        a: &str,
+        epoch: i64,
+        ttl: i64,
+    ) -> cats_storage::metadata::Result<()> {
+        self.inner.renew_lease(v, a, epoch, ttl)
+    }
+    fn release_lease(&self, v: &str, a: &str, epoch: i64) -> cats_storage::metadata::Result<()> {
+        self.inner.release_lease(v, a, epoch)
+    }
+    fn revoke_lease(&self, v: &str) -> cats_storage::metadata::Result<()> {
+        self.inner.revoke_lease(v)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn cas_head(
+        &self,
+        v: &str,
+        expected: i64,
+        new_generation: i64,
+        hash: [u8; 32],
+        object: &str,
+        a: &str,
+        epoch: i64,
+    ) -> cats_storage::metadata::Result<i64> {
+        let fault = self.fault.lock().unwrap().take();
+        match fault {
+            Some(CasFault::ExplicitFenced) => return Err(MetaError::Fenced),
+            Some(CasFault::UnrelatedRootPublished) => {
+                self.inner.cas_head(
+                    v,
+                    expected,
+                    new_generation,
+                    [0xa5; 32],
+                    "unrelated-root.node",
+                    a,
+                    epoch,
+                )?;
+                return Err(MetaError::Backend(
+                    "injected unrelated publication during ambiguous CAS".into(),
+                ));
+            }
+            _ => {}
+        }
+        let generation =
+            self.inner
+                .cas_head(v, expected, new_generation, hash, object, a, epoch)?;
+        if let Some(fault) = fault {
+            match fault {
+                CasFault::ResponseLost => {}
+                CasFault::ResponseLostAndFirstReconciliationFails => {
+                    self.fail_next_load.store(true, Ordering::SeqCst);
+                }
+                CasFault::ResponseLostThenLeaseRevoked => self.inner.revoke_lease(v)?,
+                CasFault::ResponseLostThenGenerationAdvanced => {
+                    self.inner.cas_head(
+                        v,
+                        new_generation,
+                        new_generation + 1,
+                        [0xa5; 32],
+                        "unrelated-root.node",
+                        a,
+                        epoch,
+                    )?;
+                }
+                CasFault::UnrelatedRootPublished | CasFault::ExplicitFenced => unreachable!(),
+            }
+            return Err(MetaError::Backend(
+                "injected timeout after root CAS committed".into(),
+            ));
+        }
+        Ok(generation)
+    }
+    fn create_snapshot(
+        &self,
+        s: &str,
+        v: &str,
+    ) -> cats_storage::metadata::Result<cats_storage::metadata::SnapshotRow> {
+        self.inner.create_snapshot(s, v)
+    }
+    fn list_snapshots(
+        &self,
+        v: &str,
+    ) -> cats_storage::metadata::Result<Vec<cats_storage::metadata::SnapshotRow>> {
+        self.inner.list_snapshots(v)
+    }
+}
+
 impl MetadataStore for CountingMeta {
     fn create_volume(&self, v: &str, s: u64) -> cats_storage::metadata::Result<()> {
         self.inner.create_volume(v, s)
@@ -677,6 +808,170 @@ fn batched_drain_publishes_the_whole_queue_in_one_cas() {
         assert_eq!(back, pattern(4096, i + 1), "chunk {i}");
     }
     e.detach().unwrap();
+}
+
+#[test]
+fn committed_cas_with_a_lost_response_is_reconciled_without_fencing() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let inner: Arc<dyn MetadataStore> =
+        Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+    inner.create_volume(VOL, SIZE).unwrap();
+    let meta = Arc::new(LostCasResponseMeta {
+        inner,
+        fault: Mutex::new(Some(CasFault::ResponseLost)),
+        fail_next_load: AtomicBool::new(false),
+    });
+    let data_dir = dir.path().join("data-a");
+    let e = ChunkEngine::attach(
+        EngineConfig::new(VOL, &data_dir, "attA"),
+        blob.clone(),
+        meta.clone(),
+    )
+    .unwrap();
+    let data = pattern(4096, 73);
+    e.write(0, &data).unwrap();
+
+    assert_eq!(
+        e.flush().unwrap(),
+        1,
+        "a committed root must survive a lost CAS response"
+    );
+    assert!(!e.is_fenced(), "an ambiguous success is not a stale writer");
+    assert!(fs::read_dir(data_dir.join("pending"))
+        .unwrap()
+        .next()
+        .is_none());
+    e.detach().unwrap();
+
+    let restored = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data-b"), "attB"),
+        blob,
+        meta,
+    )
+    .unwrap();
+    let mut back = vec![0; data.len()];
+    restored.read(0, &mut back).unwrap();
+    assert_eq!(back, data);
+    restored.detach().unwrap();
+}
+
+fn fault_meta(dir: &tempfile::TempDir, fault: CasFault) -> Arc<LostCasResponseMeta> {
+    let inner: Arc<dyn MetadataStore> =
+        Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+    inner.create_volume(VOL, SIZE).unwrap();
+    Arc::new(LostCasResponseMeta {
+        inner,
+        fault: Mutex::new(Some(fault)),
+        fail_next_load: AtomicBool::new(false),
+    })
+}
+
+#[test]
+fn a_lost_cas_response_can_be_reconciled_by_the_next_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let meta = fault_meta(&dir, CasFault::ResponseLostAndFirstReconciliationFails);
+    let e = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        blob,
+        meta,
+    )
+    .unwrap();
+    e.write(0, &pattern(4096, 74)).unwrap();
+
+    assert!(matches!(
+        e.flush(),
+        Err(EngineError::Meta(MetaError::Backend(_)))
+    ));
+    assert!(!e.is_fenced());
+    assert_eq!(
+        e.drain_staged().unwrap(),
+        1,
+        "the retry's CAS conflict must reconcile the earlier ambiguous success"
+    );
+    assert!(!e.is_fenced());
+    e.detach().unwrap();
+}
+
+#[test]
+fn a_matching_root_under_a_revoked_lease_still_fences() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let meta = fault_meta(&dir, CasFault::ResponseLostThenLeaseRevoked);
+    let e = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        blob,
+        meta,
+    )
+    .unwrap();
+    e.write(0, &pattern(4096, 75)).unwrap();
+
+    assert!(matches!(
+        e.flush(),
+        Err(EngineError::Meta(MetaError::Fenced))
+    ));
+    assert!(e.is_fenced());
+}
+
+#[test]
+fn an_authoritative_generation_beyond_the_target_fences() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let meta = fault_meta(&dir, CasFault::ResponseLostThenGenerationAdvanced);
+    let e = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        blob,
+        meta,
+    )
+    .unwrap();
+    e.write(0, &pattern(4096, 76)).unwrap();
+
+    assert!(matches!(
+        e.flush(),
+        Err(EngineError::Meta(MetaError::CasConflict { expected: 0 }))
+    ));
+    assert!(e.is_fenced());
+}
+
+#[test]
+fn an_unrelated_root_at_the_target_generation_fences() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let meta = fault_meta(&dir, CasFault::UnrelatedRootPublished);
+    let e = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        blob,
+        meta,
+    )
+    .unwrap();
+    e.write(0, &pattern(4096, 78)).unwrap();
+
+    assert!(matches!(
+        e.flush(),
+        Err(EngineError::Meta(MetaError::CasConflict { expected: 0 }))
+    ));
+    assert!(e.is_fenced());
+}
+
+#[test]
+fn an_explicit_fenced_error_is_never_rewritten_as_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let meta = fault_meta(&dir, CasFault::ExplicitFenced);
+    let e = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        blob,
+        meta,
+    )
+    .unwrap();
+    e.write(0, &pattern(4096, 77)).unwrap();
+
+    assert!(matches!(
+        e.flush(),
+        Err(EngineError::Meta(MetaError::Fenced))
+    ));
+    assert!(e.is_fenced());
 }
 
 #[test]

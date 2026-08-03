@@ -408,6 +408,19 @@ Cold 的目标是让 Cat 不再依赖原 Host。进入 Cold 前必须确保远�
 7.  删除 tap、socket、cgroup、memory backing、RAM snapshot 和本地 Secret。
 8.  clean cache 进入立即可淘汰队列。
 
+### Cat Destroy 与普通 Cold 的磁盘处置不同（ADR-0024）
+
+普通 Stop/Cold 会保留 RootDisk 和全部 PersistentDisk，因此仍严格执行上面的
+`remote_generation == local_generation` 门禁。Cat Destroy 会永久删除 RootDisk；Guest/VMM
+停止后，这块盘的未发布本地 tail 已没有需要保留的产品语义，可以直接停止其 blockd 并删除
+journal/cache。与 Cat 独立存在、随后返回 Available 的 PersistentDisk 不享受这个例外，仍须
+逐盘完成 final drain，失败时保留 blockd、journal、lease 和本地目录供同一 job 重试。
+
+控制面在 Destroy Stop job 中按权威 `DiskKind` 显式列出 disposable RootDisk 和 retained
+PersistentDisk。Node 不从 mount path 猜测；清单重叠、遗漏当前 blockd 或无监督目录中出现
+未知 volume 时一律 fail closed。这样 node-agent 重启后，root-only 残留可以安全收敛，而任何
+可能属于 PersistentDisk 的残留都不会被误删。
+
 ### Cold 唤醒
 
 1.  Scheduler 选择任意健康 Node。

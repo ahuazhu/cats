@@ -22,7 +22,10 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use cats_api::guest::GuestShellFrame;
-use cats_api::metering::{CatUsageCheckpoint, IngestUsageCheckpointsRequest, UsageMetric};
+use cats_api::metering::{
+    CatUsageCheckpoint, IngestUsageCheckpointsRequest, UsageMetric,
+    MAX_USAGE_CHECKPOINTS_PER_REQUEST, MAX_USAGE_INGEST_BODY_BYTES,
+};
 use cats_api::nodejob::{JobPhase, NodeJob, NodeJobResult};
 use cats_api::oci::{DeployOciRequest, OciDeployment};
 use cats_api::requests::{
@@ -148,37 +151,187 @@ fn check_auth(cfg: &ServerConfig, headers: &HeaderMap) -> Result<(), StatusCode>
 
 impl NodeState {
     async fn deliver_pending_usage(&self) -> anyhow::Result<()> {
-        loop {
-            let pending_checkpoints = self.usage_pipeline.spool.peek(10_000)?;
-            if pending_checkpoints.is_empty() {
-                return Ok(());
-            }
-            let request = IngestUsageCheckpointsRequest {
-                node_id: self.cfg.node.node_id.clone(),
-                checkpoints: pending_checkpoints.clone(),
-            };
-            let response = self
-                .client
-                .post(format!(
-                    "{}/v1/internal/usage/checkpoints",
-                    self.cfg.control_plane_url.trim_end_matches('/')
-                ))
-                .bearer_auth(&self.cfg.auth_token)
-                .json(&request)
-                .send()
-                .await
-                .context("send durable usage checkpoints")?;
-            anyhow::ensure!(
-                response.status().is_success(),
-                "usage ingestion returned {}",
-                response.status()
-            );
-            let event_ids = pending_checkpoints
-                .iter()
-                .map(|checkpoint| checkpoint.event_id.clone())
-                .collect::<Vec<_>>();
-            self.usage_pipeline.spool.acknowledge(&event_ids)?;
+        deliver_usage_batches(
+            &self.client,
+            &format!(
+                "{}/v1/internal/usage/checkpoints",
+                self.cfg.control_plane_url.trim_end_matches('/')
+            ),
+            &self.cfg.auth_token,
+            &self.cfg.node.node_id,
+            &self.usage_pipeline.spool,
+            &self.usage_pipeline.delivery,
+        )
+        .await
+    }
+}
+
+/// Use half the server's explicit JSON limit. The budget covers the complete
+/// serialized request, not just the checkpoint objects, and leaves room for
+/// intermediary behavior that is stricter than the final Axum extractor.
+const USAGE_REQUEST_TARGET_BYTES: usize = MAX_USAGE_INGEST_BODY_BYTES / 2;
+const USAGE_DELIVERY_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const USAGE_DELIVERY_MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+#[derive(Debug)]
+struct UsageDeliveryState {
+    request_budget_bytes: usize,
+    consecutive_failures: u32,
+    retry_not_before: Option<Instant>,
+}
+
+impl Default for UsageDeliveryState {
+    fn default() -> Self {
+        Self {
+            request_budget_bytes: USAGE_REQUEST_TARGET_BYTES,
+            consecutive_failures: 0,
+            retry_not_before: None,
         }
+    }
+}
+
+impl UsageDeliveryState {
+    fn retry_delay(&self, now: Instant) -> Option<Duration> {
+        self.retry_not_before
+            .and_then(|deadline| deadline.checked_duration_since(now))
+    }
+
+    fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.retry_not_before = None;
+    }
+
+    fn record_failure(&mut self, now: Instant) -> Duration {
+        let exponent = self.consecutive_failures.min(6);
+        let multiplier = 1_u32 << exponent;
+        let delay = USAGE_DELIVERY_INITIAL_BACKOFF
+            .saturating_mul(multiplier)
+            .min(USAGE_DELIVERY_MAX_BACKOFF);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.retry_not_before = now.checked_add(delay);
+        delay
+    }
+
+    fn shrink_after_payload_too_large(
+        &mut self,
+        node_id: &str,
+        rejected: &[CatUsageCheckpoint],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            rejected.len() > 1,
+            "control plane rejected one usage checkpoint as payload too large; the queue head was retained"
+        );
+        let smaller_count = rejected.len() / 2;
+        let smaller = IngestUsageCheckpointsRequest {
+            node_id: node_id.to_string(),
+            checkpoints: rejected[..smaller_count].to_vec(),
+        };
+        let smaller_bytes = serde_json::to_vec(&smaller)?.len();
+        anyhow::ensure!(
+            smaller_bytes < self.request_budget_bytes,
+            "payload-too-large retry did not reduce the usage request budget"
+        );
+        self.request_budget_bytes = smaller_bytes;
+        Ok(())
+    }
+}
+
+async fn deliver_usage_batches(
+    client: &reqwest::Client,
+    endpoint: &str,
+    auth_token: &str,
+    node_id: &str,
+    spool: &UsageSpool,
+    delivery: &tokio::sync::Mutex<UsageDeliveryState>,
+) -> anyhow::Result<()> {
+    // Heartbeats and lifecycle finalization share one ordered delivery lane.
+    // Holding an async mutex across the request is intentional; a std mutex is
+    // not held across await, and later batches cannot overtake earlier ones.
+    let mut delivery = delivery.lock().await;
+    if spool.is_empty()? {
+        delivery.record_success();
+        return Ok(());
+    }
+    if let Some(delay) = delivery.retry_delay(Instant::now()) {
+        anyhow::bail!(
+            "usage delivery is backing off for another {} ms",
+            delay.as_millis()
+        );
+    }
+
+    loop {
+        let pending_checkpoints = match spool.peek_request_batch(
+            node_id,
+            MAX_USAGE_CHECKPOINTS_PER_REQUEST,
+            delivery.request_budget_bytes,
+        ) {
+            Ok(checkpoints) => checkpoints,
+            Err(error) => {
+                let delay = delivery.record_failure(Instant::now());
+                return Err(error).context(format!(
+                    "build bounded usage request; retrying after {} ms",
+                    delay.as_millis()
+                ));
+            }
+        };
+        if pending_checkpoints.is_empty() {
+            delivery.record_success();
+            return Ok(());
+        }
+        let request = IngestUsageCheckpointsRequest {
+            node_id: node_id.to_string(),
+            checkpoints: pending_checkpoints.clone(),
+        };
+        let request_json = serde_json::to_vec(&request)?;
+        anyhow::ensure!(
+            request_json.len() <= delivery.request_budget_bytes,
+            "usage request serialized to {} bytes above its {}-byte budget",
+            request_json.len(),
+            delivery.request_budget_bytes
+        );
+        let response = match client
+            .post(endpoint)
+            .bearer_auth(auth_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(request_json)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let delay = delivery.record_failure(Instant::now());
+                return Err(error).context(format!(
+                    "send durable usage checkpoints; retrying after {} ms",
+                    delay.as_millis()
+                ));
+            }
+        };
+        if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            if pending_checkpoints.len() == 1 {
+                let delay = delivery.record_failure(Instant::now());
+                anyhow::bail!(
+                    "control plane rejected one usage checkpoint as payload too large; the queue head was retained and will retry after {} ms",
+                    delay.as_millis()
+                );
+            }
+            delivery.shrink_after_payload_too_large(node_id, &pending_checkpoints)?;
+            continue;
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let delay = delivery.record_failure(Instant::now());
+            anyhow::bail!(
+                "usage ingestion returned {status}; retrying after {} ms",
+                delay.as_millis()
+            );
+        }
+
+        let event_ids = pending_checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.event_id.clone())
+            .collect::<Vec<_>>();
+        spool.acknowledge(&event_ids)?;
+        delivery.record_success();
     }
 }
 
@@ -656,6 +809,174 @@ mod proxy_websocket_tests {
     }
 }
 
+#[cfg(test)]
+mod usage_delivery_tests {
+    use super::{deliver_usage_batches, UsageDeliveryState};
+    use crate::usage_spool::UsageSpool;
+    use axum::body::Bytes;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use axum::Router;
+    use cats_api::metering::{CatUsageCheckpoint, IngestUsageCheckpointsRequest, UsageMetric};
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    #[derive(Clone, Default)]
+    struct MockIngestion {
+        responses: Arc<Mutex<VecDeque<StatusCode>>>,
+        requests: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    async fn ingest(State(state): State<MockIngestion>, body: Bytes) -> StatusCode {
+        let request: IngestUsageCheckpointsRequest = serde_json::from_slice(&body).unwrap();
+        state.requests.lock().unwrap().push(
+            request
+                .checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.event_id.clone())
+                .collect(),
+        );
+        state
+            .responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(StatusCode::OK)
+    }
+
+    async fn spawn_mock(
+        responses: impl IntoIterator<Item = StatusCode>,
+    ) -> (String, MockIngestion, tokio::task::JoinHandle<()>) {
+        let state = MockIngestion::default();
+        state.responses.lock().unwrap().extend(responses);
+        let app = Router::new()
+            .route("/", post(ingest))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}/"), state, server)
+    }
+
+    fn checkpoint(sequence: u64) -> CatUsageCheckpoint {
+        CatUsageCheckpoint {
+            event_id: format!("event-{sequence:02}"),
+            source_id: "node/node-a/cat/cat-a".to_string(),
+            source_epoch: "epoch-a".to_string(),
+            sequence,
+            observed_at_unix_ms: 1_000 + i64::try_from(sequence).unwrap(),
+            cat_id: "cat-a".to_string(),
+            cat_generation: 1,
+            metric: UsageMetric::CpuUsec,
+            cumulative_quantity: u128::from(sequence),
+        }
+    }
+
+    fn spool_with(checkpoints: &[CatUsageCheckpoint]) -> (tempfile::TempDir, UsageSpool) {
+        let directory = tempfile::tempdir().unwrap();
+        let spool = UsageSpool::open(&directory.path().join("usage-spool.sqlite3")).unwrap();
+        spool.enqueue(checkpoints).unwrap();
+        (directory, spool)
+    }
+
+    #[tokio::test]
+    async fn payload_too_large_retries_smaller_prefixes_without_replaying_the_large_batch() {
+        let checkpoints = (0..8).map(checkpoint).collect::<Vec<_>>();
+        let (_directory, spool) = spool_with(&checkpoints);
+        let (endpoint, mock, server) = spawn_mock([StatusCode::PAYLOAD_TOO_LARGE]).await;
+        let delivery = tokio::sync::Mutex::new(UsageDeliveryState::default());
+
+        deliver_usage_batches(
+            &reqwest::Client::new(),
+            &endpoint,
+            "token",
+            "node-a",
+            &spool,
+            &delivery,
+        )
+        .await
+        .unwrap();
+
+        assert!(spool.is_empty().unwrap());
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.iter().map(Vec::len).collect::<Vec<_>>(), [8, 4, 4]);
+        assert_eq!(
+            requests[1],
+            checkpoints[..4]
+                .iter()
+                .map(|c| c.event_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            requests[2],
+            checkpoints[4..]
+                .iter()
+                .map(|c| c.event_id.clone())
+                .collect::<Vec<_>>()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn bad_gateway_does_not_ack_and_retries_the_same_order_after_backoff() {
+        let checkpoints = (0..3).map(checkpoint).collect::<Vec<_>>();
+        let (_directory, spool) = spool_with(&checkpoints);
+        let (endpoint, mock, server) = spawn_mock([StatusCode::BAD_GATEWAY, StatusCode::OK]).await;
+        let delivery = tokio::sync::Mutex::new(UsageDeliveryState::default());
+        let client = reqwest::Client::new();
+
+        let error = deliver_usage_batches(&client, &endpoint, "token", "node-a", &spool, &delivery)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("502 Bad Gateway"));
+        assert_eq!(spool.len().unwrap(), 3);
+
+        let backed_off =
+            deliver_usage_batches(&client, &endpoint, "token", "node-a", &spool, &delivery)
+                .await
+                .unwrap_err();
+        assert!(backed_off.to_string().contains("backing off"));
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+        {
+            let mut state = delivery.lock().await;
+            state.retry_not_before = Some(Instant::now());
+        }
+
+        deliver_usage_batches(&client, &endpoint, "token", "node-a", &spool, &delivery)
+            .await
+            .unwrap();
+        assert!(spool.is_empty().unwrap());
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn single_checkpoint_rejected_as_too_large_stays_at_the_queue_head() {
+        let (_directory, spool) = spool_with(&[checkpoint(0)]);
+        let (endpoint, mock, server) = spawn_mock([StatusCode::PAYLOAD_TOO_LARGE]).await;
+        let delivery = tokio::sync::Mutex::new(UsageDeliveryState::default());
+
+        let error = deliver_usage_batches(
+            &reqwest::Client::new(),
+            &endpoint,
+            "token",
+            "node-a",
+            &spool,
+            &delivery,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("queue head was retained"));
+        assert_eq!(spool.len().unwrap(), 1);
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+        server.abort();
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CpuTimes {
     total: u64,
@@ -1108,6 +1429,7 @@ struct UsageMeteringPipeline {
     sampler: Mutex<HostTelemetrySampler>,
     spool: UsageSpool,
     unspooled: Mutex<Vec<CatUsageCheckpoint>>,
+    delivery: tokio::sync::Mutex<UsageDeliveryState>,
 }
 
 impl UsageMeteringPipeline {
@@ -1117,6 +1439,7 @@ impl UsageMeteringPipeline {
             sampler: Mutex::new(HostTelemetrySampler::new(node_id, state_dir)),
             spool,
             unspooled: Mutex::new(Vec::new()),
+            delivery: tokio::sync::Mutex::new(UsageDeliveryState::default()),
         })
     }
 
