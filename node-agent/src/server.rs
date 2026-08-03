@@ -26,7 +26,7 @@ use cats_api::metering::{
     CatUsageCheckpoint, IngestUsageCheckpointsRequest, UsageMetric,
     MAX_USAGE_CHECKPOINTS_PER_REQUEST, MAX_USAGE_INGEST_BODY_BYTES,
 };
-use cats_api::nodejob::{JobPhase, NodeJob, NodeJobResult};
+use cats_api::nodejob::{JobPhase, NodeJob};
 use cats_api::oci::{DeployOciRequest, OciDeployment};
 use cats_api::requests::{
     ExecRequest, ExecResponse, HeartbeatCat, HeartbeatRequest, NodeWorkStatusRequest,
@@ -172,6 +172,12 @@ impl NodeState {
 const USAGE_REQUEST_TARGET_BYTES: usize = MAX_USAGE_INGEST_BODY_BYTES / 2;
 const USAGE_DELIVERY_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const USAGE_DELIVERY_MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// How often the uploader drains the spool when nothing nudges it.
+///
+/// Independent of the heartbeat interval on purpose: billing tolerates delay,
+/// liveness does not, so the two cadences must not be the same knob.
+const USAGE_DELIVERY_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 struct UsageDeliveryState {
@@ -347,22 +353,18 @@ async fn handle_job(
     let result = tokio::task::spawn_blocking(move || runtime.execute(job)).await;
     match result {
         Ok(res) if res.phase == JobPhase::Succeeded => {
-            if let Err(error) = state.deliver_pending_usage().await {
-                tracing::error!(
-                    job = %res.job_id,
-                    %error,
-                    "lifecycle result withheld until final usage checkpoints are acknowledged"
-                );
-                Json(NodeJobResult::fail(
-                    res.job_id,
-                    res.observed_state,
-                    format!("final usage delivery failed: {error:#}"),
-                    true,
-                ))
-                .into_response()
-            } else {
-                Json(res).into_response()
-            }
+            // A lifecycle result is not withheld for usage delivery. The
+            // durable outbox is what makes a final checkpoint survive, not the
+            // upload: `runtime.execute` has already persisted it, and ADR-0011
+            // designs delivery to replay after the resource is deleted. Waiting
+            // here added no durability and made an upload outage a lifecycle
+            // outage -- a blocked stop could not converge, which kept a Cat's
+            // claim alive and, through it, held its Host in recovery limbo.
+            //
+            // Nudge the uploader so a final checkpoint still leaves promptly on
+            // the happy path, without making this response depend on it.
+            state.usage_pipeline.wake_delivery();
+            Json(res).into_response()
         }
         Ok(res) => Json(res).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -1430,6 +1432,11 @@ struct UsageMeteringPipeline {
     spool: UsageSpool,
     unspooled: Mutex<Vec<CatUsageCheckpoint>>,
     delivery: tokio::sync::Mutex<UsageDeliveryState>,
+    /// Asks the uploader to attempt a drain now instead of at its next tick.
+    ///
+    /// A hint, never a dependency: nothing waits on the result, so a caller can
+    /// nudge delivery without inheriting its latency or its failures.
+    delivery_wake: tokio::sync::Notify,
 }
 
 impl UsageMeteringPipeline {
@@ -1440,7 +1447,12 @@ impl UsageMeteringPipeline {
             spool,
             unspooled: Mutex::new(Vec::new()),
             delivery: tokio::sync::Mutex::new(UsageDeliveryState::default()),
+            delivery_wake: tokio::sync::Notify::new(),
         })
+    }
+
+    fn wake_delivery(&self) {
+        self.delivery_wake.notify_one();
     }
 
     fn sample(
@@ -1671,6 +1683,15 @@ async fn heartbeat_until_failure(
                 "usage checkpoints are not durable; billing remains failed closed"
             );
         }
+        // Liveness owns this channel alone. Sampling above is local work
+        // against the durable spool; nothing else in this loop may await a
+        // remote call, because the interval between heartbeats is what the
+        // control plane reads as "this Host is alive". Usage upload used to run
+        // here and its 10 s client timeout was enough, on its own, to push the
+        // gap past the node lease and have the Host declared Lost. The
+        // registration retry this loop returns to is not an exception: it only
+        // runs once the control plane is already unreachable, so there is no
+        // liveness left to protect.
         let sent = client
             .post(format!("{control_plane_url}/v1/nodes/heartbeat"))
             .bearer_auth(auth_token)
@@ -1681,9 +1702,6 @@ async fn heartbeat_until_failure(
             })
             .send()
             .await;
-        if let Err(error) = state.deliver_pending_usage().await {
-            tracing::warn!(%error, "durable usage checkpoint delivery deferred");
-        }
         let reason = match sent {
             Ok(response) if response.status().is_success() => {
                 link.record_success();
@@ -1799,6 +1817,24 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
         }
     });
 
+    // Usage upload: its own channel, best effort. It may be slow, it may fail,
+    // it may back off for a minute -- none of that is allowed to reach liveness
+    // or a lifecycle result. Durability comes from the spool it drains, so a
+    // deferred upload costs delay, not data. One task keeps deliveries ordered,
+    // which is the only reason the old shared lane existed.
+    let usage_state = state.clone();
+    let usage_uploader = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = usage_state.usage_pipeline.delivery_wake.notified() => {}
+                _ = tokio::time::sleep(USAGE_DELIVERY_INTERVAL) => {}
+            }
+            if let Err(error) = usage_state.deliver_pending_usage().await {
+                tracing::warn!(%error, "durable usage checkpoint delivery deferred");
+            }
+        }
+    });
+
     // One long-poll watcher per Running Cat. Lease changes are pushed to the
     // control plane immediately; the 1s timeout refreshes source freshness
     // and repairs a lost event without high-rate polling.
@@ -1844,7 +1880,7 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
     Ok(Handle {
         addr,
         state,
-        tasks: vec![server, connection, activity_watchers],
+        tasks: vec![server, connection, usage_uploader, activity_watchers],
     })
 }
 
