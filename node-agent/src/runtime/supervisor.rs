@@ -150,6 +150,20 @@ impl NodeRuntime {
                 }
             }
         };
+        // The final state is settled here — `run_action` returned and the
+        // generation/metering step has run — so this is the one place the
+        // runtime ledger is written (ADR-0028 §1). Doing it here rather than at
+        // the individual `cats` mutation sites is what keeps intermediate states
+        // (the Running -> Suspended -> Running bounce inside `suspend_cat`, for
+        // example) out of the record. Failed jobs are recorded too: a failure
+        // can still leave a mutated runtime, such as the Stopping state a failed
+        // remote drain converges to.
+        if self.cats.lock().unwrap().contains_key(&cat_id) {
+            self.persist_cat(&cat_id);
+        } else {
+            // The Cat is no longer on this node: it reached Cold.
+            self.forget_cat(&cat_id);
+        }
         // Failures are deliberately not journaled. The journal answers
         // duplicate submissions of one logical job, but the control plane
         // retries a failed start under the same job id and expects real work;

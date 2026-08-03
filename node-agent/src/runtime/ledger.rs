@@ -16,17 +16,11 @@
 //! version it understands: guessing the meaning of an unknown layout is exactly
 //! the failure mode that would let a stale identity be mistaken for a live one.
 
-// ADR-0028 lands in stages, and this is stage 1: the format and the write path
-// only, deliberately with no caller. The reader (startup scan and identity
-// proof) is stage 2, and wiring `put`/`remove` into the lifecycle paths belongs
-// with it, so that a half-written inventory can never be treated as authority.
-// The allow is scoped to this module and comes off as soon as stage 2 lands.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -35,6 +29,8 @@ use cats_api::nodejob::VolumeGrant;
 use cats_api::resources::ObservedState;
 
 use crate::ch::ChNetwork;
+
+use super::{CatRuntime, NodeRuntime};
 
 /// Persisted format version. A record written by any other version is not
 /// interpreted; see the module docs.
@@ -252,6 +248,12 @@ impl Ledger {
     /// A record that is unreadable, malformed, or written by another format
     /// version is skipped with a warning rather than failing the scan: one
     /// corrupt record must not stop the node from re-adopting the rest.
+    ///
+    /// The reader belongs to the next ADR-0028 stage (startup scan and identity
+    /// proof), so nothing outside this module's own tests calls it yet. It is
+    /// kept — with its malformed-input coverage — because that stage is what the
+    /// whole format exists for.
+    #[allow(dead_code)]
     pub(super) fn load_all(&self) -> Result<Vec<CatLedgerRecord>> {
         let entries = std::fs::read_dir(&self.dir)
             .with_context(|| format!("read runtime ledger directory {}", self.dir.display()))?;
@@ -352,6 +354,114 @@ fn ledger_file_stem(cat_id: &str) -> Result<&str> {
         bail!("refusing to use cat id {cat_id:?} as a runtime ledger file name");
     }
     Ok(cat_id)
+}
+
+/// Wall-clock milliseconds for `updated_at_ms`.
+///
+/// Diagnostic only: none of the ADR-0028 §3 identity checks depend on it, so an
+/// unreadable clock is recorded as 0 rather than failing an otherwise good
+/// write.
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+impl NodeRuntime {
+    /// Record what this node is now running for `cat_id`.
+    ///
+    /// Called once per job from `execute_locked`, after the final state has
+    /// settled. Intermediate states (the Running -> Suspended -> Running bounce
+    /// inside `suspend_cat`, for instance) are deliberately never written.
+    pub(super) fn persist_cat(&self, cat_id: &str) {
+        // Snapshot under `cats`, then drop the guard before writing. `put`
+        // fsyncs the record and then the directory; holding the map across those
+        // two syncs would queue every other job on this node behind disk
+        // latency.
+        let record = {
+            let cats = self.cats.lock().unwrap();
+            let Some(runtime) = cats.get(cat_id) else {
+                return;
+            };
+            self.ledger_record(cat_id, runtime)
+        };
+        if let Err(error) = self.ledger.put(&record) {
+            // A failed write must not fail the job. The ledger is a local
+            // recovery aid and explicitly not a source of authority
+            // (ADR-0028 §2), so tearing down a healthy running Cat because a
+            // JSON file could not be written would be strictly worse than
+            // losing the ability to re-adopt it later.
+            tracing::error!(cat = %cat_id, "writing the node runtime ledger record failed: {error:#}");
+        }
+    }
+
+    /// Drop `cat_id` from the inventory once it no longer runs here.
+    pub(super) fn forget_cat(&self, cat_id: &str) {
+        if let Err(error) = self.ledger.remove(cat_id) {
+            // Same policy as `persist_cat`: a stale record is a re-adoption
+            // problem for the next stage to reject, not a reason to fail a job
+            // whose real work already succeeded.
+            tracing::error!(cat = %cat_id, "removing the node runtime ledger record failed: {error:#}");
+        }
+    }
+
+    fn ledger_record(&self, cat_id: &str, runtime: &CatRuntime) -> CatLedgerRecord {
+        let mut blockds: Vec<BlockdRecord> = runtime
+            .blockds
+            .values()
+            .map(|blockd| BlockdRecord {
+                grant: blockd.grant.clone(),
+                proc: ProcIdentity::sample(blockd.child.id()),
+                socket: blockd.socket.clone(),
+                vhost_user_socket: blockd.vhost_user_socket.clone(),
+                control_socket: blockd.control_socket.clone(),
+                // The same path `spawn_blockd` passes as `--data-dir`.
+                data_dir: runtime.dir.join(format!("vol-{}", blockd.grant.disk_id)),
+            })
+            .collect();
+        // `blockds` is a HashMap, so fix an order: the serialized record should
+        // not churn between two writes that describe the same runtime.
+        blockds.sort_by(|left, right| left.grant.disk_id.cmp(&right.grant.disk_id));
+        CatLedgerRecord {
+            ledger_version: LEDGER_VERSION,
+            node_id: self.cfg.node_id.clone(),
+            host_boot_id: host_boot_id(),
+            updated_at_ms: now_unix_ms(),
+            cat_id: cat_id.to_string(),
+            generation: runtime.generation,
+            state: runtime.state,
+            cpus: runtime.cpus,
+            memory_mib: runtime.memory_mib,
+            dir: runtime.dir.clone(),
+            ctl_sock: runtime.ctl_sock.clone(),
+            web_sock: runtime.web_sock.clone(),
+            runtime_sock: runtime.runtime_sock.clone(),
+            guest: runtime
+                .guest
+                .as_ref()
+                .map(|guest| ProcIdentity::sample(guest.id())),
+            boot_id: runtime.boot_id.clone(),
+            blockds,
+            volumes: runtime.volumes.clone(),
+            ch: runtime.ch.as_ref().map(|ch| ChRecord {
+                api_sock: ch.api_sock.clone(),
+                vsock_sock: ch.vsock_sock.clone(),
+                memory_file: ch.memory_file.clone(),
+                nbd: ch
+                    .nbd
+                    .iter()
+                    .map(|(disk_id, device)| (disk_id.clone(), device.clone()))
+                    .collect(),
+                snapshot_dir: ch.snapshot_dir.clone(),
+                network: ch.network.clone(),
+            }),
+            metering: runtime.metering.as_ref().map(|metering| MeteringRecord {
+                cgroup_path: metering.cgroup_path.clone(),
+                source_epoch: metering.source_epoch.clone(),
+            }),
+        }
+    }
 }
 
 #[cfg(test)]

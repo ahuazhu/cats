@@ -1,5 +1,7 @@
 use super::*;
 
+mod ledger_writes;
+
 #[derive(Default)]
 struct RecordingUsageFinalizer {
     targets: Mutex<Vec<CatTelemetryTarget>>,
@@ -98,6 +100,7 @@ fn warm_retirement_finalizes_then_drops_the_metering_cgroup() {
         vmm: VmmMode::Fake,
         wake_budget: WakeBudget::default(),
     })
+    .unwrap()
     .with_usage_finalizer(finalizer.clone());
     runtime.cats.lock().unwrap().insert(
         "cat-a".to_string(),

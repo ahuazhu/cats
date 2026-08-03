@@ -51,6 +51,7 @@ use crate::guest_client::{GuestClient, GuestShell};
 use crate::proc::ProcHandle;
 
 use blockd_control::BlockdProc;
+use ledger::Ledger;
 use metering::RuntimeMetering;
 use proxy::{ActivityChanged, RuntimeActivity};
 
@@ -277,6 +278,10 @@ pub struct NodeRuntime {
     /// dropping the node-wide serialization.
     cat_ops: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     cats: Mutex<HashMap<String, CatRuntime>>,
+    /// On-disk mirror of `cats`, rewritten once per job after the final state
+    /// has settled (ADR-0028 §1). Local recovery aid only: it never grants a
+    /// storage write right and is never consulted for authority.
+    ledger: Ledger,
     journal: Mutex<HashMap<String, NodeJobResult>>,
     usage_finalizer: Option<Arc<dyn UsageFinalizer>>,
     /// Bounds concurrent wakes so a wake storm degrades linearly instead of
@@ -347,12 +352,14 @@ impl Drop for StopPermit<'_> {
 }
 
 impl NodeRuntime {
-    pub fn new(cfg: NodeConfig) -> Self {
+    pub fn new(cfg: NodeConfig) -> Result<Self> {
         let cfg_wake_budget = cfg.wake_budget;
-        Self {
+        let ledger = Ledger::open(&cfg.state_dir.join("runtime-ledger"))?;
+        Ok(Self {
             cfg,
             ops: Mutex::new(()),
             cats: Mutex::new(HashMap::new()),
+            ledger,
             cat_ops: Mutex::new(HashMap::new()),
             journal: Mutex::new(HashMap::new()),
             usage_finalizer: None,
@@ -363,7 +370,7 @@ impl NodeRuntime {
                 ..cfg_wake_budget
             }),
             stop_admission: StopAdmission::new(MAX_CONCURRENT_STOPS),
-        }
+        })
     }
 
     /// Current wake saturation, for heartbeats and tests.

@@ -32,7 +32,7 @@ struct Env {
 fn env(budget: WakeBudget) -> Env {
     let dir = TempDirFixture::new();
     let builder = dir.node_config("node_wake");
-    let runtime = NodeRuntime::new(fake_node_config!(builder, wake_budget = budget));
+    let runtime = NodeRuntime::new(fake_node_config!(builder, wake_budget = budget)).unwrap();
     Env {
         _dir: dir,
         runtime: Arc::new(runtime),

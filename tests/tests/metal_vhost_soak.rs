@@ -404,7 +404,7 @@ impl Soak {
                 network_cidr: None,
                 ip_bin: PathBuf::from("/usr/sbin/ip"),
             }),
-        }));
+        })?);
         Ok(Self {
             cfg,
             runtime,

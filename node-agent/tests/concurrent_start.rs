@@ -25,10 +25,10 @@ fn runtime(dir: &std::path::Path) -> Arc<NodeRuntime> {
 
 fn runtime_with(dir: &std::path::Path, wake_budget: WakeBudget) -> Arc<NodeRuntime> {
     let builder = NodeConfigBuilder::new(dir, "node_conc").with_lease_ttl_ms(1_500);
-    Arc::new(NodeRuntime::new(fake_node_config!(
-        builder,
-        wake_budget = wake_budget
-    )))
+    Arc::new(
+        NodeRuntime::new(fake_node_config!(builder, wake_budget = wake_budget))
+            .expect("open node runtime"),
+    )
 }
 
 fn start_job(cat: &str) -> NodeJob {

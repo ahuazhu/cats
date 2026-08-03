@@ -1537,7 +1537,7 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
         .build()?;
     let cfg = Arc::new(cfg);
     let runtime =
-        Arc::new(NodeRuntime::new(cfg.node.clone()).with_usage_finalizer(usage_pipeline.clone()));
+        Arc::new(NodeRuntime::new(cfg.node.clone())?.with_usage_finalizer(usage_pipeline.clone()));
     let state = NodeState {
         runtime: runtime.clone(),
         cfg: cfg.clone(),
