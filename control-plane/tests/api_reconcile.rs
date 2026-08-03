@@ -3109,3 +3109,78 @@ async fn a_running_claim_missing_from_the_inventory_still_holds_the_node_lost() 
         "the preserved claim must survive for an explicit fence or restore"
     );
 }
+
+/// A stop that keeps failing must back off, not spin.
+///
+/// The failure path restored the Cat's previous observed state and then called
+/// `notify_one()`, which woke the reconciler immediately -- so a stop blocked on
+/// something external re-dispatched as fast as the loop could run. In production
+/// two Cats whose stop was blocked behind a backing-off final usage delivery
+/// produced ~288 dispatches per second against one node agent, and a no-op
+/// `exec` on an unrelated Cat went from milliseconds to over a minute.
+#[tokio::test]
+async fn a_persistently_failing_stop_backs_off_instead_of_spinning() {
+    let ctx = Ctx::new().await;
+    let node = start_stub_node(&ctx.cp, "node_a").await;
+    ctx.create_cat("wedged", None).await;
+    let cat = ctx.wait_observed("wedged", ObservedState::Running).await;
+    // Requesting the stop bumps the generation, which is part of the job id, so
+    // match on the Cat and action rather than a generation captured beforehand.
+    let stop_job_suffix = "_stop_cat";
+    let cat_job_prefix = format!("job_{}_", cat.id);
+
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("stop_cat".into(), usize::MAX);
+    ctx.action("wedged", "stop").await;
+
+    // Long enough that an unthrottled retry would be unmistakable: the harness
+    // ticks every 200 ms, and the immediate self-notify made it far faster.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let attempts = node
+        .jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|id| id.starts_with(&cat_job_prefix) && id.ends_with(stop_job_suffix))
+        .count();
+    assert!(
+        attempts >= 1,
+        "the stop must be attempted at least once, got {attempts}"
+    );
+    assert!(
+        attempts <= 5,
+        "a failing stop must back off; {attempts} dispatches in 2 s is a hot loop"
+    );
+
+    // Backing off must not wedge it: once the dependency recovers, the stop
+    // converges without needing a new request.
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("stop_cat".into(), 0);
+    let cold = ctx.wait_observed("wedged", ObservedState::Cold).await;
+    assert!(cold.node_id.is_none());
+}
+
+/// Backoff is per Cat and per generation, so one wedged Cat must not delay an
+/// unrelated one -- the reconciler still has to make progress elsewhere.
+#[tokio::test]
+async fn one_backing_off_cat_does_not_delay_another() {
+    let ctx = Ctx::new().await;
+    let node = start_stub_node(&ctx.cp, "node_a").await;
+    ctx.create_cat("stuck", None).await;
+    ctx.wait_observed("stuck", ObservedState::Running).await;
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("stop_cat".into(), usize::MAX);
+    ctx.action("stuck", "stop").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // A second Cat created while the first is backing off must still converge.
+    ctx.create_cat("healthy", None).await;
+    let healthy = ctx.wait_observed("healthy", ObservedState::Running).await;
+    assert_eq!(healthy.node_id.as_deref(), Some("node_a"));
+}
