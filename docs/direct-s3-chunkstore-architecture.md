@@ -516,7 +516,7 @@ Detachflush + release
 | Active | 普通系统盘读写 | Guest 中挂载到 /data 等路径 | NVMe Cache 加速；FLUSH 提交到 S3 + Metadata。 |
 | Cold | Cat 停止但 Volume 保留 | 如果仍 Bound，MountBinding 保留；也可先 Detach | 最终 FLUSH；关闭 backend；删除本地 Cache；远端 Root 不变。 |
 | Wake/Migrate | 新 Host 从最后 Root 启动 | 在新的 Cat/Host 上重新 Attach | 只加载 Root/Leaf；数据按需 GET，不搬迁整个逻辑盘。 |
-| Cat Destroy | 进入 deleting，最终删除 | 保留；先安全 Detach | RootDisk Tombstone 后异步 GC；PersistentDisk 不受影响。 |
+| Cat Destroy | 进入 deleting，最终删除；按 ADR-0025 可丢弃该 RootDisk 的本地未发布 journal | 保留；先逐盘 FLUSH + drain 到 `R == L`，失败时保留源 | RootDisk Tombstone 后异步 GC；PersistentDisk 不受影响。 |
 | Disk Delete | 随 Cat Destroy | 用户显式执行，必须无有效 Attachment | 撤销访问、保留安全期、删除 Volume Prefix 和 Metadata Row。 |
 
 ``` code-block
@@ -641,7 +641,7 @@ ChunkRef {
 | S3 返回损坏数据 | Checksum 失败，拒绝将数据交给 Guest | 把损坏内容写入 Cache 后继续运行 | 重试、读取其他副本/区域；无法恢复时 Volume 进入 Faulted。 |
 | PostgreSQL 不可用 | Clean Cache 读继续；Strict FLUSH 等待/失败；Relaxed 本地推进到配额水位 | 绕过 CAS，或让本地队列无界增长 | 有界队列和 deadline；只剩 pin 数据时背压；数据库恢复后重连/重试。 |
 | Lease renewal 越过 expiry | owner/epoch 未变时继续 renew/publish | 因瞬时抖动自我 fence | 竞争 acquire/revoke 增加 epoch 后，旧 Writer 才 fail closed。 |
-| 强制 lifecycle drain 失败 | Stop/Warm/Snapshot/Detach/迁移不越过远端持久化边界 | 释放 lease、删除 runtime/pending 或宣称 Cold | 保留 blockd、journal 和 lease；控制器重试到 `R == L`。 |
+| 强制 lifecycle drain 失败 | 普通 Stop/Warm/Snapshot/Detach/迁移不越过远端持久化边界；Destroy 只可丢弃显式待删除的 RootDisk | 释放 PersistentDisk lease、删除其 runtime/pending 或宣称安全解绑 | 保留 PersistentDisk blockd、journal 和 lease；控制器重试到 `R == L`。待删除 RootDisk 的本地 tail 可随 Cat 丢弃。 |
 | GC 进程崩溃 | 最多延迟空间回收 | 删除任何仍被 Root/Snapshot 引用的对象 | GC Job 使用 epoch、checkpoint 和幂等 delete，重新扫描。 |
 | Compaction 崩溃 | 旧 Base + Delta 仍可读 | 先删除旧对象再发布新 Map | 新 Base 成为 Orphan 或在重试时复用；Root CAS 后才允许旧对象进入 GC。 |
 

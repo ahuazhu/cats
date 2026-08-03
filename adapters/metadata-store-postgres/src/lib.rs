@@ -8,6 +8,10 @@
 
 use std::fs;
 use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicU8, Ordering},
+    Arc,
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cats_storage::metadata::{MetaError, MetadataStore, Result, SnapshotRow, VolumeHead};
@@ -56,7 +60,35 @@ pub struct PostgresMetadataStore {
     lease_jobs: mpsc::SyncSender<Job>,
 }
 
-type Job = Box<dyn for<'a> FnOnce(std::result::Result<&'a mut Client, MetaError>) + Send + 'static>;
+type JobOperation =
+    Box<dyn for<'a> FnOnce(std::result::Result<&'a mut Client, MetaError>) + Send + 'static>;
+
+const JOB_PENDING: u8 = 0;
+const JOB_RUNNING: u8 = 1;
+const JOB_CANCELED: u8 = 2;
+const JOB_FINISHED: u8 = 3;
+
+struct Job {
+    state: Arc<AtomicU8>,
+    operation: JobOperation,
+}
+
+impl Job {
+    /// Claim immediately before touching PostgreSQL. A caller whose deadline
+    /// expires while this job is still queued changes `PENDING` to `CANCELED`,
+    /// so an expired mutation can never execute later behind its back.
+    fn run(self, client: std::result::Result<&mut Client, MetaError>) {
+        if self
+            .state
+            .compare_exchange(JOB_PENDING, JOB_RUNNING, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        (self.operation)(client);
+        self.state.store(JOB_FINISHED, Ordering::SeqCst);
+    }
+}
 
 const WORK_QUEUE_DEPTH: usize = 64;
 const OPERATION_DEADLINE: Duration = Duration::from_secs(7);
@@ -105,12 +137,12 @@ fn spawn_worker(name: &str, url: &str, ca_file: Option<&str>) -> Result<mpsc::Sy
                         match connect_client(&url, ca_file.as_deref()) {
                             Ok(reconnected) => client = reconnected,
                             Err(error) => {
-                                job(Err(error));
+                                job.run(Err(error));
                                 continue;
                             }
                         }
                     }
-                    job(Ok(&mut client));
+                    job.run(Ok(&mut client));
                 }
             }
             Err(error) => {
@@ -133,14 +165,29 @@ fn dispatch_on<T>(
 where
     T: Send + 'static,
 {
+    dispatch_on_with_deadline(jobs, operation, OPERATION_DEADLINE)
+}
+
+fn dispatch_on_with_deadline<T>(
+    jobs: &mpsc::SyncSender<Job>,
+    operation: impl FnOnce(&mut Client) -> Result<T> + Send + 'static,
+    deadline: Duration,
+) -> Result<T>
+where
+    T: Send + 'static,
+{
     let (result_tx, result_rx) = mpsc::sync_channel(1);
-    jobs.try_send(Box::new(move |client| {
-        let result = match client {
-            Ok(client) => operation(client),
-            Err(error) => Err(error),
-        };
-        let _ = result_tx.send(result);
-    }))
+    let state = Arc::new(AtomicU8::new(JOB_PENDING));
+    jobs.try_send(Job {
+        state: state.clone(),
+        operation: Box::new(move |client| {
+            let result = match client {
+                Ok(client) => operation(client),
+                Err(error) => Err(error),
+            };
+            let _ = result_tx.send(result);
+        }),
+    })
     .map_err(|error| match error {
         mpsc::TrySendError::Full(_) => {
             MetaError::Backend("PostgreSQL metadata work queue is full".into())
@@ -149,16 +196,42 @@ where
             MetaError::Backend("PostgreSQL metadata thread exited".into())
         }
     })?;
-    result_rx
-        .recv_timeout(OPERATION_DEADLINE)
-        .map_err(|error| match error {
-            mpsc::RecvTimeoutError::Timeout => {
-                MetaError::Backend("PostgreSQL metadata operation timed out".into())
+    match result_rx.recv_timeout(deadline) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(MetaError::Backend(
+            "PostgreSQL metadata operation was canceled".into(),
+        )),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            if state
+                .compare_exchange(
+                    JOB_PENDING,
+                    JOB_CANCELED,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                return Err(MetaError::Backend(
+                    "PostgreSQL metadata operation timed out before execution; operation canceled"
+                        .into(),
+                ));
             }
-            mpsc::RecvTimeoutError::Disconnected => {
-                MetaError::Backend("PostgreSQL metadata operation was canceled".into())
+
+            // The operation crossed the only safe cancellation boundary. It
+            // may have committed, so never report a definite failure. Close
+            // races prefer an already-delivered result when one is available.
+            match result_rx.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty) => Err(MetaError::Backend(
+                    "PostgreSQL metadata operation timed out while executing; outcome unknown"
+                        .into(),
+                )),
+                Err(mpsc::TryRecvError::Disconnected) => Err(MetaError::Backend(
+                    "PostgreSQL metadata operation ended without a result; outcome unknown".into(),
+                )),
             }
-        })?
+        }
+    }
 }
 
 fn connect_client(url: &str, ca_file: Option<&str>) -> Result<Client> {
@@ -264,6 +337,8 @@ fn row_to_head(row: &Row) -> Result<VolumeHead> {
         generation: row.get(2),
         root_hash: decode_hash(row.get(3))?,
         root_object_id: row.get(4),
+        lease_owner: row.get(5),
+        lease_epoch: row.get(6),
     })
 }
 
@@ -291,7 +366,8 @@ impl MetadataStore for PostgresMetadataStore {
         self.dispatch(move |client| {
             client
                 .query_opt(
-                    "SELECT volume_id, size_bytes, generation, root_hash, root_object_id
+                    "SELECT volume_id, size_bytes, generation, root_hash, root_object_id,
+                            lease_owner, lease_epoch
                        FROM cats_storage_volumes WHERE volume_id = $1",
                     &[&volume_id],
                 )
@@ -603,6 +679,44 @@ mod tests {
             pem_certificates(b"-----BEGIN CERTIFICATE-----"),
             Err(MetaError::Backend(_))
         ));
+    }
+
+    #[test]
+    fn a_queued_mutation_cannot_execute_after_its_caller_times_out() {
+        let (jobs, receiver) = mpsc::sync_channel(1);
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let operation_executed = executed.clone();
+        let caller = std::thread::spawn(move || {
+            dispatch_on_with_deadline(
+                &jobs,
+                move |_client| {
+                    operation_executed.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+                Duration::from_millis(20),
+            )
+        });
+
+        // Simulate the worker having dequeued the job but being stuck before
+        // the last-moment claim (for example while reconnecting).
+        let job = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        let error = caller.join().unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("timed out before execution"),
+            "unexpected timeout classification: {error}"
+        );
+        assert_eq!(
+            job.state.load(Ordering::SeqCst),
+            JOB_CANCELED,
+            "the deadline must win the PENDING -> CANCELED transition"
+        );
+        let state = job.state.clone();
+        job.run(Err(MetaError::Backend("unused test client".into())));
+        assert_eq!(state.load(Ordering::SeqCst), JOB_CANCELED);
+        assert!(
+            !executed.load(Ordering::SeqCst),
+            "an expired queued mutation executed after its caller returned"
+        );
     }
 
     #[test]

@@ -12,6 +12,18 @@ pub(super) const EAGER_DRAIN_WATERMARK: usize = 2;
 /// split into successive batches instead of pulling gigabytes into RAM.
 const MAX_BATCH_BYTES: usize = 256 << 20;
 
+/// Roots on both sides of one attempted CAS. Keeping the evidence together
+/// makes it harder for reconciliation to compare a generation without its
+/// corresponding root identity.
+struct CasEvidence<'a> {
+    base_generation: i64,
+    base_root_hash: Option<[u8; 32]>,
+    base_root_object_id: Option<&'a str>,
+    target_generation: i64,
+    target_root_hash: [u8; 32],
+    target_root_object_id: &'a str,
+}
+
 /// What wakes the background committer.
 pub(super) struct CommitterSignal {
     pub(super) stop: bool,
@@ -160,10 +172,20 @@ impl ChunkEngine {
         new_generation: i64,
         lease_epoch: i64,
         new_map: &[ChunkRef],
-        new_leaves: &mut [LeafRef],
+        leaves: &mut [LeafRef],
         chunks: &[u64],
     ) -> Result<i64> {
         let vol = &self.cfg.volume_id;
+        // `leaves` still describes the base root here. Capture that evidence
+        // before the touched entries below mutate it in place into the target
+        // root used by the CAS.
+        let (base_root_hash, base_root_object_id) = if base_generation == 0 {
+            (None, None)
+        } else {
+            let encoded = format::encode_root(self.size, leaves);
+            let hash = format::sha256(&encoded);
+            (Some(hash), Some(format!("{}.node", hex::encode(hash))))
+        };
         let mut touched: Vec<u64> = chunks.iter().map(|c| c / CHUNKS_PER_LEAF as u64).collect();
         touched.sort_unstable();
         touched.dedup();
@@ -172,7 +194,7 @@ impl ChunkEngine {
             let end = (first + CHUNKS_PER_LEAF as u64).min(self.chunk_count);
             let slice = &new_map[first as usize..end as usize];
             if slice.iter().all(|r| r.is_hole()) {
-                new_leaves[leaf_idx as usize] = LeafRef::Empty;
+                leaves[leaf_idx as usize] = LeafRef::Empty;
                 continue;
             }
             let encoded = format::encode_leaf(first, slice);
@@ -180,10 +202,10 @@ impl ChunkEngine {
             let object_id = format!("{}.node", hex::encode(hash));
             self.blob
                 .put_immutable(&chunk::keys::map_node(vol, &hex::encode(hash)), &encoded)?;
-            new_leaves[leaf_idx as usize] = LeafRef::Present { hash, object_id };
+            leaves[leaf_idx as usize] = LeafRef::Present { hash, object_id };
         }
 
-        let root_encoded = format::encode_root(self.size, new_leaves);
+        let root_encoded = format::encode_root(self.size, leaves);
         let root_hash = format::sha256(&root_encoded);
         let root_hex = hex::encode(root_hash);
         let root_object_id = format!("{root_hex}.node");
@@ -202,7 +224,7 @@ impl ChunkEngine {
         )?;
         crashpoint::maybe_crash(crashpoint::BEFORE_CAS);
 
-        let new_gen = self.meta.cas_head(
+        let requested = self.meta.cas_head(
             vol,
             base_generation,
             new_generation,
@@ -210,9 +232,71 @@ impl ChunkEngine {
             &root_object_id,
             &self.cfg.attachment_id,
             self.epoch,
-        )?;
+        );
+        let new_gen = match requested {
+            Ok(generation) => generation,
+            Err(error @ (MetaError::Backend(_) | MetaError::CasConflict { .. })) => self
+                .reconcile_ambiguous_cas(
+                    error,
+                    CasEvidence {
+                        base_generation,
+                        base_root_hash,
+                        base_root_object_id: base_root_object_id.as_deref(),
+                        target_generation: new_generation,
+                        target_root_hash: root_hash,
+                        target_root_object_id: &root_object_id,
+                    },
+                )?,
+            Err(error) => return Err(EngineError::Meta(error)),
+        };
         crashpoint::maybe_crash(crashpoint::AFTER_CAS);
         Ok(new_gen)
+    }
+
+    /// Resolve a CAS whose response did not prove whether the new root became
+    /// authoritative. The PostgreSQL adapter orders this read behind the CAS,
+    /// even when the original caller timed out while that statement ran.
+    ///
+    /// Root bytes are not enough: an attachment may have committed and then
+    /// been revoked. Only the exact target generation/root under this same
+    /// owner and epoch proves success. Every other authoritative change is an
+    /// unrelated lineage and fails closed.
+    fn reconcile_ambiguous_cas(&self, error: MetaError, evidence: CasEvidence<'_>) -> Result<i64> {
+        let head = match self.meta.load_head(&self.cfg.volume_id) {
+            Ok(head) => head,
+            Err(_) => return Err(EngineError::Meta(error)),
+        };
+
+        if head.lease_owner.as_deref() != Some(self.cfg.attachment_id.as_str())
+            || head.lease_epoch != self.epoch
+        {
+            return Err(EngineError::Meta(MetaError::Fenced));
+        }
+        if head.generation == evidence.target_generation
+            && head.root_hash == Some(evidence.target_root_hash)
+            && head.root_object_id.as_deref() == Some(evidence.target_root_object_id)
+        {
+            tracing::warn!(
+                volume = %self.cfg.volume_id,
+                generation = evidence.target_generation,
+                "root CAS response was ambiguous; authoritative head proves it committed"
+            );
+            return Ok(evidence.target_generation);
+        }
+
+        // A transport/backend failure with the unchanged base is retryable:
+        // the pack remains the local durability oracle. A reported conflict,
+        // or any generation movement, means another lineage won.
+        if matches!(&error, MetaError::Backend(_))
+            && head.generation == evidence.base_generation
+            && head.root_hash == evidence.base_root_hash
+            && head.root_object_id.as_deref() == evidence.base_root_object_id
+        {
+            return Err(EngineError::Meta(error));
+        }
+        Err(EngineError::Meta(MetaError::CasConflict {
+            expected: evidence.base_generation,
+        }))
     }
 
     /// Upload one object per pack entry, concurrently.

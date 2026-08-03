@@ -371,9 +371,11 @@ blockd FLUSH；确认 JFS 对象与元数据持久。
 
 umount → FLUSH → remove-disk；PersistentDisk 回到 Available。
 
-**3. RootDisk flush**
+**3. RootDisk 处置**
 
-完成最后一次远端提交并停止数据面。
+本文原方案要求完成最后一次远端提交。当前 Direct-S3 实现按 ADR-0025 处理：普通
+Stop/Cold 仍强制 drain；Cat Destroy 可丢弃随后会 tombstone 的 RootDisk 本地未发布
+journal，但任何 PersistentDisk 仍必须安全 FLUSH + drain。
 
 **4. RootDisk 删除**
 

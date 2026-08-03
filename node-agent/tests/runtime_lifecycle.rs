@@ -6,13 +6,16 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use cats_api::guest::{
     AcquireGuestWorkLeaseRequest, GuestRequestBody, GuestResponseBody, GuestWorkLease,
     GUEST_WORK_LEASES_PATH,
 };
-use cats_api::nodejob::{job_id, JobPhase, NodeJob, NodeJobAction, SuspendWorkFence, VolumeGrant};
+use cats_api::nodejob::{
+    job_id, JobPhase, NodeJob, NodeJobAction, StopCatDisposition, SuspendWorkFence, VolumeGrant,
+};
 use cats_api::resources::ObservedState;
 use cats_node_agent::guest_client::GuestClient;
 use cats_node_agent::runtime::NodeRuntime;
@@ -46,13 +49,87 @@ fn grant(disk: &str, attempt: i64) -> VolumeGrant {
         attachment_id: format!("att_{disk}_{attempt}"),
         epoch: 0,
         size_bytes: SIZE,
-        mount_path: if disk == "root" {
+        mount_path: if disk.starts_with("root") {
             "/".into()
         } else {
             "/data".into()
         },
         durability: Default::default(),
     }
+}
+
+fn start_job_for(cat_id: &str, generation: i64, disks: &[&str], relaxed: bool) -> NodeJob {
+    let volumes = disks
+        .iter()
+        .map(|disk| {
+            let mut volume = grant(disk, generation);
+            if relaxed {
+                volume.durability = cats_api::resources::DiskDurability::Relaxed;
+            }
+            volume
+        })
+        .collect();
+    NodeJob {
+        job_id: job_id(cat_id, generation, "start_cat"),
+        cat_generation: generation,
+        action: NodeJobAction::StartCat {
+            cat_id: cat_id.to_string(),
+            image: "test".into(),
+            cpus: 1,
+            memory_mib: 256,
+            volumes,
+        },
+    }
+}
+
+fn stop_job_for(
+    cat_id: &str,
+    generation: i64,
+    job_kind: &str,
+    disposition: StopCatDisposition,
+) -> NodeJob {
+    NodeJob {
+        job_id: job_id(cat_id, generation, job_kind),
+        cat_generation: generation,
+        action: NodeJobAction::StopCat {
+            cat_id: cat_id.to_string(),
+            disposition,
+        },
+    }
+}
+
+fn intercept_drain(
+    state_dir: &Path,
+    cat_id: &str,
+    disk_id: &str,
+    arrived: mpsc::Sender<String>,
+    release: mpsc::Receiver<()>,
+) -> std::thread::JoinHandle<()> {
+    use std::io::{BufRead, Write};
+    use std::os::unix::net::UnixListener;
+
+    let link = state_dir
+        .join("cats")
+        .join(cat_id)
+        .join(format!("ctl-{disk_id}.sock"));
+    let mut socket = std::fs::read_link(&link).unwrap();
+    if socket.is_relative() {
+        socket = link.parent().unwrap().join(socket);
+    }
+    std::fs::remove_file(&socket).unwrap();
+    let listener = UnixListener::bind(&socket).unwrap();
+    let cat_id = cat_id.to_string();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut command = String::new();
+        std::io::BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut command)
+            .unwrap();
+        assert_eq!(command, "drain\n");
+        arrived.send(cat_id).unwrap();
+        release.recv().unwrap();
+        stream.write_all(b"OK {}\n").unwrap();
+    })
 }
 
 fn start_job(generation: i64) -> NodeJob {
@@ -375,7 +452,10 @@ fn full_lifecycle_ladder_with_boot_id_oracles() {
     let res = env.runtime.execute(simple(
         1,
         "stop_cat",
-        NodeJobAction::StopCat { cat_id: CAT.into() },
+        NodeJobAction::StopCat {
+            cat_id: CAT.into(),
+            disposition: StopCatDisposition::Cold,
+        },
     ));
     assert_eq!(res.observed_state, ObservedState::Cold);
     let res = env.runtime.execute(start_job_relaxed(2));
@@ -404,7 +484,10 @@ fn full_lifecycle_ladder_with_boot_id_oracles() {
     env.runtime.execute(simple(
         2,
         "stop_cat",
-        NodeJobAction::StopCat { cat_id: CAT.into() },
+        NodeJobAction::StopCat {
+            cat_id: CAT.into(),
+            disposition: StopCatDisposition::Cold,
+        },
     ));
 }
 
@@ -435,7 +518,10 @@ fn relaxed_stop_keeps_local_state_when_the_forced_drain_fails() {
     let stop = simple(
         1,
         "stop_during_remote_outage",
-        NodeJobAction::StopCat { cat_id: CAT.into() },
+        NodeJobAction::StopCat {
+            cat_id: CAT.into(),
+            disposition: StopCatDisposition::Cold,
+        },
     );
     let failed = env.runtime.execute(stop.clone());
     assert_eq!(failed.phase, JobPhase::Failed);
@@ -482,8 +568,317 @@ fn relaxed_stop_keeps_local_state_when_the_forced_drain_fails() {
     env.runtime.execute(simple(
         2,
         "stop_after_outage",
-        NodeJobAction::StopCat { cat_id: CAT.into() },
+        NodeJobAction::StopCat {
+            cat_id: CAT.into(),
+            disposition: StopCatDisposition::Cold,
+        },
     ));
+}
+
+#[test]
+fn root_only_destroy_discards_unpublished_root_journal() {
+    let env = env();
+    let started = env.runtime.execute(start_job_relaxed(1));
+    assert_eq!(started.observed_state, ObservedState::Running);
+
+    let blob = env._dir.path().join("blob");
+    let available_blob = env._dir.path().join("blob.available");
+    std::fs::rename(&blob, &available_blob).unwrap();
+    std::fs::write(&blob, b"remote object store unavailable").unwrap();
+
+    let mut g = guest(&env);
+    g.request(GuestRequestBody::WriteBlock {
+        disk_id: "root".into(),
+        offset: 12_288,
+        data_hex: hex::encode(b"disposable-root-tail"),
+    })
+    .unwrap();
+    g.flush_disk("root").unwrap();
+
+    let destroyed = env.runtime.execute(stop_job_for(
+        CAT,
+        2,
+        "destroy_cat",
+        StopCatDisposition::Destroy {
+            disposable_root_disk_ids: vec!["root".into()],
+            retained_persistent_disk_ids: Vec::new(),
+        },
+    ));
+    assert_eq!(destroyed.phase, JobPhase::Succeeded, "{destroyed:?}");
+    assert_eq!(destroyed.observed_state, ObservedState::Cold);
+    assert!(
+        !env.state_dir.join("cats").join(CAT).exists(),
+        "destroy retained a disposable RootDisk journal"
+    );
+}
+
+#[test]
+fn destroy_still_fails_closed_for_a_persistent_disk_and_retries() {
+    let env = env();
+    let mut root = grant("root", 1);
+    let mut data = grant("data", 1);
+    root.durability = cats_api::resources::DiskDurability::Relaxed;
+    data.durability = cats_api::resources::DiskDurability::Relaxed;
+    let started = env.runtime.execute(NodeJob {
+        job_id: job_id(CAT, 1, "start_with_persistent"),
+        cat_generation: 1,
+        action: NodeJobAction::StartCat {
+            cat_id: CAT.into(),
+            image: "test".into(),
+            cpus: 1,
+            memory_mib: 256,
+            volumes: vec![root, data],
+        },
+    });
+    assert_eq!(
+        started.observed_state,
+        ObservedState::Running,
+        "{started:?}"
+    );
+
+    let blob = env._dir.path().join("blob");
+    let available_blob = env._dir.path().join("blob.available");
+    std::fs::rename(&blob, &available_blob).unwrap();
+    std::fs::write(&blob, b"remote object store unavailable").unwrap();
+
+    let mut g = guest(&env);
+    g.request(GuestRequestBody::WriteBlock {
+        disk_id: "data".into(),
+        offset: 16_384,
+        data_hex: hex::encode(b"persistent-tail"),
+    })
+    .unwrap();
+    g.flush_disk("data").unwrap();
+
+    let destroy = stop_job_for(
+        CAT,
+        2,
+        "destroy_with_persistent",
+        StopCatDisposition::Destroy {
+            disposable_root_disk_ids: vec!["root".into()],
+            retained_persistent_disk_ids: vec!["data".into()],
+        },
+    );
+    let failed = env.runtime.execute(destroy.clone());
+    assert_eq!(failed.phase, JobPhase::Failed);
+    assert_eq!(failed.observed_state, ObservedState::Stopping);
+    let cat_dir = env.state_dir.join("cats").join(CAT);
+    assert!(
+        !cat_dir.join("vol-root").exists(),
+        "disposable RootDisk was retained after the Guest stopped"
+    );
+    assert!(
+        std::fs::read_dir(cat_dir.join("vol-data").join("pending"))
+            .unwrap()
+            .next()
+            .is_some(),
+        "persistent journal was discarded on drain failure"
+    );
+
+    std::fs::remove_file(&blob).unwrap();
+    std::fs::rename(&available_blob, &blob).unwrap();
+    let retried = env.runtime.execute(destroy);
+    assert_eq!(retried.phase, JobPhase::Succeeded, "{retried:?}");
+    assert_eq!(retried.observed_state, ObservedState::Cold);
+    assert!(!cat_dir.exists());
+}
+
+#[test]
+fn destroy_rejects_overlapping_or_unclassified_disk_plans_before_teardown() {
+    let env = env();
+    let started = env.runtime.execute(start_job(1));
+    assert_eq!(started.observed_state, ObservedState::Running);
+    let boot = boot_id(&env);
+
+    let overlap = env.runtime.execute(stop_job_for(
+        CAT,
+        2,
+        "destroy_overlap",
+        StopCatDisposition::Destroy {
+            disposable_root_disk_ids: vec!["root".into()],
+            retained_persistent_disk_ids: vec!["root".into()],
+        },
+    ));
+    assert_eq!(overlap.phase, JobPhase::Failed);
+    assert_eq!(overlap.observed_state, ObservedState::Running);
+    assert_eq!(
+        boot_id(&env),
+        boot,
+        "overlap killed the Guest before rejection"
+    );
+
+    let unknown = env.runtime.execute(stop_job_for(
+        CAT,
+        2,
+        "destroy_unclassified",
+        StopCatDisposition::Destroy {
+            disposable_root_disk_ids: Vec::new(),
+            retained_persistent_disk_ids: Vec::new(),
+        },
+    ));
+    assert_eq!(unknown.phase, JobPhase::Failed);
+    assert_eq!(unknown.observed_state, ObservedState::Running);
+    assert_eq!(
+        boot_id(&env),
+        boot,
+        "unclassified disk killed the Guest before rejection"
+    );
+
+    let cleaned = env.runtime.execute(stop_job_for(
+        CAT,
+        2,
+        "destroy_valid",
+        StopCatDisposition::Destroy {
+            disposable_root_disk_ids: vec!["root".into()],
+            retained_persistent_disk_ids: Vec::new(),
+        },
+    ));
+    assert_eq!(cleaned.phase, JobPhase::Succeeded, "{cleaned:?}");
+}
+
+#[test]
+fn restart_residue_cleanup_is_root_only_and_fail_closed_for_persistent_data() {
+    let env = env();
+    let root_only = env.state_dir.join("cats").join("cat_root_only");
+    std::fs::create_dir_all(root_only.join("vol-root").join("pending")).unwrap();
+    std::fs::write(root_only.join("vol-root/pending/pack"), b"tail").unwrap();
+    let destroyed = env.runtime.execute(stop_job_for(
+        "cat_root_only",
+        2,
+        "destroy_after_restart",
+        StopCatDisposition::Destroy {
+            disposable_root_disk_ids: vec!["root".into()],
+            retained_persistent_disk_ids: Vec::new(),
+        },
+    ));
+    assert_eq!(destroyed.phase, JobPhase::Succeeded, "{destroyed:?}");
+    assert!(!root_only.exists());
+
+    let mixed = env.state_dir.join("cats").join("cat_with_data");
+    std::fs::create_dir_all(mixed.join("vol-root").join("pending")).unwrap();
+    std::fs::create_dir_all(mixed.join("vol-data").join("pending")).unwrap();
+    std::fs::write(mixed.join("vol-data/pending/pack"), b"must survive").unwrap();
+    let refused = env.runtime.execute(stop_job_for(
+        "cat_with_data",
+        2,
+        "destroy_after_restart",
+        StopCatDisposition::Destroy {
+            disposable_root_disk_ids: vec!["root".into()],
+            retained_persistent_disk_ids: vec!["data".into()],
+        },
+    ));
+    assert_eq!(refused.phase, JobPhase::Failed);
+    assert_eq!(
+        std::fs::read(mixed.join("vol-data/pending/pack")).unwrap(),
+        b"must survive"
+    );
+}
+
+#[test]
+fn different_cats_stop_concurrently_but_one_cat_remains_serialized() {
+    let Env {
+        _dir,
+        runtime,
+        state_dir,
+    } = env();
+    let runtime = Arc::new(runtime);
+    for (cat_id, disk_id) in [("cat_a", "root-a"), ("cat_b", "root-b")] {
+        let started = runtime.execute(start_job_for(cat_id, 1, &[disk_id], false));
+        assert_eq!(
+            started.observed_state,
+            ObservedState::Running,
+            "{started:?}"
+        );
+    }
+
+    let (arrived_tx, arrived_rx) = mpsc::channel();
+    let mut releases = Vec::new();
+    let mut responders = Vec::new();
+    for (cat_id, disk_id) in [("cat_a", "root-a"), ("cat_b", "root-b")] {
+        let (release_tx, release_rx) = mpsc::channel();
+        responders.push(intercept_drain(
+            &state_dir,
+            cat_id,
+            disk_id,
+            arrived_tx.clone(),
+            release_rx,
+        ));
+        releases.push(release_tx);
+    }
+
+    let mut workers = Vec::new();
+    for cat_id in ["cat_a", "cat_b"] {
+        let runtime = Arc::clone(&runtime);
+        workers.push(std::thread::spawn(move || {
+            runtime.execute(stop_job_for(
+                cat_id,
+                2,
+                "stop_concurrently",
+                StopCatDisposition::Cold,
+            ))
+        }));
+    }
+    let first = arrived_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let second = arrived_rx.recv_timeout(Duration::from_secs(2));
+    for release in releases {
+        release.send(()).unwrap();
+    }
+    let results: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    for responder in responders {
+        responder.join().unwrap();
+    }
+    let second = second.unwrap_or_else(|_| {
+        panic!("second Cat was serialized behind {first} by the node-wide lock")
+    });
+    assert_ne!(first, second);
+    assert!(results
+        .iter()
+        .all(|result| result.phase == JobPhase::Succeeded));
+
+    let started = runtime.execute(start_job_for(CAT, 3, &["root"], false));
+    assert_eq!(
+        started.observed_state,
+        ObservedState::Running,
+        "{started:?}"
+    );
+    let (arrived_tx, arrived_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let responder = intercept_drain(&state_dir, CAT, "root", arrived_tx, release_rx);
+    let first_runtime = Arc::clone(&runtime);
+    let first = std::thread::spawn(move || {
+        first_runtime.execute(stop_job_for(
+            CAT,
+            4,
+            "stop_same_cat_first",
+            StopCatDisposition::Cold,
+        ))
+    });
+    arrived_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let second_runtime = Arc::clone(&runtime);
+    let second = std::thread::spawn(move || {
+        let result = second_runtime.execute(stop_job_for(
+            CAT,
+            5,
+            "stop_same_cat_second",
+            StopCatDisposition::Cold,
+        ));
+        completed_tx.send(()).unwrap();
+        result
+    });
+    assert!(
+        completed_rx
+            .recv_timeout(Duration::from_millis(300))
+            .is_err(),
+        "a second job for the same Cat bypassed the per-Cat lock"
+    );
+    release_tx.send(()).unwrap();
+    assert_eq!(first.join().unwrap().phase, JobPhase::Succeeded);
+    assert_eq!(second.join().unwrap().phase, JobPhase::Succeeded);
+    responder.join().unwrap();
 }
 
 #[test]
@@ -568,7 +963,10 @@ fn hot_attach_detach_and_journal_idempotency() {
     env.runtime.execute(simple(
         1,
         "stop_cat",
-        NodeJobAction::StopCat { cat_id: CAT.into() },
+        NodeJobAction::StopCat {
+            cat_id: CAT.into(),
+            disposition: StopCatDisposition::Cold,
+        },
     ));
 }
 
@@ -607,6 +1005,9 @@ fn a_failed_job_is_retried_not_replayed() {
     runtime.execute(simple(
         2,
         "stop_cat",
-        NodeJobAction::StopCat { cat_id: CAT.into() },
+        NodeJobAction::StopCat {
+            cat_id: CAT.into(),
+            disposition: StopCatDisposition::Cold,
+        },
     ));
 }

@@ -15,7 +15,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cats_api::error::ErrorBody;
-use cats_api::nodejob::{self, JobPhase, NodeJob, NodeJobAction, NodeJobResult, VolumeGrant};
+use cats_api::nodejob::{
+    self, JobPhase, NodeJob, NodeJobAction, NodeJobResult, StopCatDisposition, VolumeGrant,
+};
 use cats_api::resources::*;
 use cats_storage::{MetaError, MetadataStore};
 use futures_util::StreamExt;
@@ -280,6 +282,7 @@ impl Controller {
                     cat_generation: cat.generation,
                     action: NodeJobAction::StopCat {
                         cat_id: cat.id.clone(),
+                        disposition: StopCatDisposition::Cold,
                     },
                 };
                 match self.dispatch(&node.agent_url, &job).await {
@@ -354,7 +357,7 @@ impl Controller {
             (D::Warm, O::Suspended) => self.simple_transition(cat, "warm").await,
             (D::Suspended, O::Warm) => self.simple_transition(cat, "restore").await,
             (D::Cold, O::Running | O::Suspended | O::Warm | O::Starting) => {
-                self.stop_flow(cat).await
+                self.stop_flow(cat, StopCatDisposition::Cold).await
             }
             // Unknown clears when the owning node reports a complete,
             // same-generation inventory or an explicit Host fence converges
@@ -630,7 +633,7 @@ impl Controller {
         }
     }
 
-    async fn stop_flow(&self, cat: &Cat) -> anyhow::Result<()> {
+    async fn stop_flow(&self, cat: &Cat, disposition: StopCatDisposition) -> anyhow::Result<()> {
         let Some(node_id) = &cat.node_id else {
             self.store.set_observed(&cat.id, ObservedState::Cold)?;
             self.complete_ops_if_converged(&cat.id).await?;
@@ -648,6 +651,7 @@ impl Controller {
                 cat_generation: cat.generation,
                 action: NodeJobAction::StopCat {
                     cat_id: cat.id.clone(),
+                    disposition,
                 },
             };
             match self.dispatch(&node.agent_url, &job).await {
@@ -676,8 +680,25 @@ impl Controller {
 
     async fn delete_flow(&self, cat: &Cat) -> anyhow::Result<()> {
         if cat.node_id.is_some() {
-            // Stop first (also fences + unbinds routes).
-            self.stop_flow(cat).await?;
+            // Stop first (also fences + unbinds routes). The RootDisk is being
+            // deleted, so the node may discard only its local journal/cache;
+            // PersistentDisks still cross the mandatory remote-drain boundary.
+            let mut disposable_root_disk_ids = Vec::new();
+            let mut retained_persistent_disk_ids = Vec::new();
+            for disk in self.store.list_disks_for_cat(&cat.id)? {
+                match disk.kind {
+                    DiskKind::Root => disposable_root_disk_ids.push(disk.id),
+                    DiskKind::Persistent => retained_persistent_disk_ids.push(disk.id),
+                }
+            }
+            self.stop_flow(
+                cat,
+                StopCatDisposition::Destroy {
+                    disposable_root_disk_ids,
+                    retained_persistent_disk_ids,
+                },
+            )
+            .await?;
             let current = self.store.must_get_cat_by_id(&cat.id)?;
             if current.node_id.is_some() || current.observed_state != ObservedState::Cold {
                 // Graceful stop (including its mandatory remote drain) has not

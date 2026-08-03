@@ -1,13 +1,18 @@
 use super::*;
 
+use cats_api::metering::MAX_USAGE_CHECKPOINTS_PER_REQUEST;
+
 pub(super) async fn ingest_usage_checkpoints(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<IngestUsageCheckpointsRequest>,
 ) -> ApiResult<Json<IngestUsageCheckpointsResponse>> {
     check_service_auth(&state, &headers).await?;
-    if req.checkpoints.len() > 10_000 {
-        return Err(ApiError::invalid("at most 10000 checkpoints per request").into());
+    if req.checkpoints.len() > MAX_USAGE_CHECKPOINTS_PER_REQUEST {
+        return Err(ApiError::invalid(format!(
+            "at most {MAX_USAGE_CHECKPOINTS_PER_REQUEST} checkpoints per request"
+        ))
+        .into());
     }
     // A missing/lost node cannot invent a producer identity. Registration is
     // also what lets operations fence a replaced node before accepting data.

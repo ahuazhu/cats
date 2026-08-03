@@ -548,7 +548,7 @@ Cloud Hypervisor/VMM 不访问 Guest 内的 runtime socket，也不解析 HTTP �
 | Warm | 0；VMM/backend 已退出，进程状态在本地 RAM snapshot | snapshot 必须保留；clean cache 可淘汰；绑定当前 Host | 保持进入前记录的 durable generation | 默认返回休眠/唤醒状态 | 同 Host 重建 runtime + on-demand restore；目标 \<1s；失败转 Cold |
 | Cold | 0；VMM 不存在 | 可全部回收 | RootDisk/PersistentDisk 是唯一恢复来源 | route 保留但 unbound | 重新调度、空缓存 boot |
 | Failed | 未知或不可用 | 视 Host 状态 | 保持最后 durable generation | 旧 epoch 失效 | fence 旧 Host 后冷恢复 |
-| Deleted | 无 | 清理 | RootDisk tombstone 后 GC；外接盘保留 | Endpoint 删除 | 不可恢复，除非有独立 Snapshot 保留策略 |
+| Deleted | 无 | 清理 | 按 ADR-0025，待 tombstone 的 RootDisk 可丢弃本地未发布 journal；外接 PersistentDisk 必须 drain 后保留 | Endpoint 删除 | 不可恢复，除非有独立 Snapshot 保留策略 |
 
 ### 8.1 状态转换不变量
 

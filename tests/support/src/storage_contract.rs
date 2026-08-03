@@ -88,6 +88,8 @@ fn volume_and_resize_contract(store: &dyn MetadataStore) {
     assert_eq!(head.generation, 0);
     assert_eq!(head.root_hash, None);
     assert_eq!(head.root_object_id, None);
+    assert_eq!(head.lease_owner, None);
+    assert_eq!(head.lease_epoch, 0);
     assert!(matches!(
         store.load_head(&unique_id("missing")),
         Err(MetaError::NotFound(_))
@@ -135,6 +137,9 @@ fn lease_contract(store: &dyn MetadataStore) {
         .acquire_lease(&volume, "attachment-a", 60_000)
         .unwrap();
     assert_eq!(first, 1);
+    let head = store.load_head(&volume).unwrap();
+    assert_eq!(head.lease_owner.as_deref(), Some("attachment-a"));
+    assert_eq!(head.lease_epoch, first);
     assert!(matches!(
         store.acquire_lease(&volume, "attachment-b", 60_000),
         Err(MetaError::LeaseHeld)
@@ -143,6 +148,9 @@ fn lease_contract(store: &dyn MetadataStore) {
         .renew_lease(&volume, "attachment-a", first, 60_000)
         .unwrap();
     store.revoke_lease(&volume).unwrap();
+    let revoked = store.load_head(&volume).unwrap();
+    assert_eq!(revoked.lease_owner.as_deref(), Some("attachment-a"));
+    assert_eq!(revoked.lease_epoch, first + 1);
     assert!(matches!(
         store.renew_lease(&volume, "attachment-a", first, 60_000),
         Err(MetaError::Fenced)
@@ -159,6 +167,7 @@ fn lease_contract(store: &dyn MetadataStore) {
     store
         .release_lease(&volume, "attachment-b", second)
         .unwrap();
+    assert_eq!(store.load_head(&volume).unwrap().lease_owner, None);
     let third = store
         .acquire_lease(&volume, "attachment-c", 60_000)
         .unwrap();

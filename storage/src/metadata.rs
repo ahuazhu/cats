@@ -7,6 +7,11 @@ pub struct VolumeHead {
     pub generation: i64,
     pub root_hash: Option<[u8; 32]>,
     pub root_object_id: Option<String>,
+    /// Current fencing identity. A caller reconciling an ambiguous root CAS
+    /// must validate these fields together with the root before treating the
+    /// operation as committed.
+    pub lease_owner: Option<String>,
+    pub lease_epoch: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

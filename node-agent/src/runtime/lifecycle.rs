@@ -1,3 +1,4 @@
+use super::supervisor::TeardownMode;
 use super::*;
 
 impl NodeRuntime {
@@ -27,7 +28,10 @@ impl NodeRuntime {
                     false,
                 )
             }
-            NodeJobAction::StopCat { cat_id } => self.stop_cat(cat_id, true),
+            NodeJobAction::StopCat {
+                cat_id,
+                disposition,
+            } => self.stop_cat(cat_id, disposition.clone().into()),
             NodeJobAction::SuspendCat { cat_id, work_fence } => {
                 self.suspend_cat(cat_id, work_fence.as_ref())
             }
@@ -39,7 +43,7 @@ impl NodeRuntime {
             }
             NodeJobAction::DetachDisk { cat_id, disk_id } => self.detach_disk(cat_id, disk_id),
             NodeJobAction::SyncCat { cat_id } => self.sync_cat(cat_id),
-            NodeJobAction::CleanupCat { cat_id } => self.stop_cat(cat_id, false),
+            NodeJobAction::CleanupCat { cat_id } => self.stop_cat(cat_id, TeardownMode::Discard),
         }
     }
 
@@ -390,7 +394,7 @@ impl NodeRuntime {
             .get(cat_id)
             .and_then(|rt| rt.boot_id.clone());
         if expected_boot_id.is_some() && now_boot != expected_boot_id {
-            let _ = self.stop_cat(cat_id, false);
+            let _ = self.stop_cat(cat_id, TeardownMode::Discard);
             bail!("warm restore lost process identity");
         }
         Ok(observed)

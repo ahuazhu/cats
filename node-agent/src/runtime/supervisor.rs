@@ -1,4 +1,32 @@
 use super::*;
+use std::collections::HashSet;
+
+pub(super) enum TeardownMode {
+    /// Ordinary transition to Cold: every attached disk is preserved.
+    Cold,
+    /// Cat deletion: only the explicitly named RootDisks are disposable.
+    Destroy {
+        disposable_root_disk_ids: Vec<String>,
+        retained_persistent_disk_ids: Vec<String>,
+    },
+    /// Failure cleanup after ownership has already been fenced elsewhere.
+    Discard,
+}
+
+impl From<StopCatDisposition> for TeardownMode {
+    fn from(disposition: StopCatDisposition) -> Self {
+        match disposition {
+            StopCatDisposition::Cold => Self::Cold,
+            StopCatDisposition::Destroy {
+                disposable_root_disk_ids,
+                retained_persistent_disk_ids,
+            } => Self::Destroy {
+                disposable_root_disk_ids,
+                retained_persistent_disk_ids,
+            },
+        }
+    }
+}
 
 impl NodeRuntime {
     fn cat_lock(&self, cat_id: &str) -> Arc<Mutex<()>> {
@@ -15,19 +43,12 @@ impl NodeRuntime {
         if let Some(prev) = self.journal.lock().unwrap().get(&job.job_id) {
             return prev.clone();
         }
-        // Suspended resume is the one action that allocates no node-global
-        // resource: it resumes a VMM that is already up (no blockd child, no
-        // NBD device, no tap). It therefore runs under a per-Cat lock so that
-        // several Cats wake in parallel, bounded by the wake admission budget
-        // (ADR-0002 §8). The 2026-07-21 run measured ten concurrent restores
-        // at 0.53 s versus 0.380 s for one, so node-wide serialization costs
-        // roughly 7x on a wake storm for no correctness benefit.
-        //
-        // Everything else keeps the node-wide lock. In particular Warm
-        // `RestoreCat` goes through `start_cat`, which allocates node-global
-        // NBD devices and tap slots; making those concurrency-safe is separate
-        // work. Warm is still charged its resume commitment, so the ceiling is
-        // already in place for when that lands.
+        // Every action is serialized per Cat. Stop/Cold addresses devices
+        // already owned by one Cat, and its remote drains are independently
+        // bounded by `stop_admission`, so unrelated Cats can stop in parallel.
+        // Resume and vhost-user launches keep their existing lock exemptions;
+        // other lifecycle/hot-plug paths remain conservatively node-serialized
+        // until they receive their own concurrency coverage.
         // The per-Cat lock is unconditional: it is what keeps "one job per Cat at
         // a time" true, so a stop can never interleave with a start of the same
         // Cat. The node-wide lock is then layered on top only for actions that
@@ -35,16 +56,23 @@ impl NodeRuntime {
         // a thread holding the node-wide lock never waits for a per-Cat lock and
         // the pair cannot deadlock.
         let needs_node_lock = match &job.action {
-            NodeJobAction::ResumeCat { .. } => false,
-            // A launch is independent of other Cats unless it has to pick a
-            // node-global resource; see `launch_allocates_node_global_state`.
+            NodeJobAction::ResumeCat { .. } | NodeJobAction::StopCat { .. } => false,
             NodeJobAction::StartCat { .. } | NodeJobAction::RestoreCat { .. } => {
                 self.launch_allocates_node_global_state()
             }
-            _ => true,
+            // Keep the existing conservative serialization for lifecycle and
+            // hot-plug paths not covered by this Stop concurrency change.
+            NodeJobAction::SuspendCat { .. }
+            | NodeJobAction::WarmCat { .. }
+            | NodeJobAction::AttachDisk { .. }
+            | NodeJobAction::DetachDisk { .. }
+            | NodeJobAction::SyncCat { .. }
+            | NodeJobAction::CleanupCat { .. } => true,
         };
         let per_cat = self.cat_lock(job.action.cat_id());
         let _cat_guard = per_cat.lock().unwrap();
+        let _stop_permit = matches!(&job.action, NodeJobAction::StopCat { .. })
+            .then(|| self.stop_admission.acquire());
         let _node_guard = needs_node_lock.then(|| self.ops.lock().unwrap());
         self.execute_locked(job)
     }
@@ -183,7 +211,7 @@ impl NodeRuntime {
                         return Err(error);
                     }
                 }
-                let _ = self.teardown(&mut runtime, false);
+                let _ = self.teardown(&mut runtime, TeardownMode::Discard);
                 let _ = std::fs::remove_dir_all(&runtime.dir);
             }
         }
@@ -252,7 +280,7 @@ impl NodeRuntime {
                     && rt.boot_id.is_some()
                     && rt.boot_id.as_deref() != Some(boot_id.as_str())
                 {
-                    let _ = self.teardown(&mut rt, false);
+                    let _ = self.teardown(&mut rt, TeardownMode::Discard);
                     bail!("warm restore produced a different boot id");
                 }
                 rt.boot_id = Some(boot_id);
@@ -261,7 +289,7 @@ impl NodeRuntime {
                 Ok(ObservedState::Running)
             }
             Err(e) => {
-                let _ = self.teardown(&mut rt, true);
+                let _ = self.teardown(&mut rt, TeardownMode::Cold);
                 Err(e)
             }
         }
@@ -489,7 +517,7 @@ impl NodeRuntime {
                     && expected_boot.as_deref() != Some(&boot_id)
                 {
                     rt.ch = Some(chrt);
-                    let _ = self.teardown(&mut rt, false);
+                    let _ = self.teardown(&mut rt, TeardownMode::Discard);
                     bail!("warm restore produced a different kernel boot id");
                 }
                 rt.boot_id = Some(boot_id);
@@ -500,7 +528,7 @@ impl NodeRuntime {
             }
             Err(e) => {
                 rt.ch = Some(chrt);
-                let _ = self.teardown(&mut rt, false);
+                let _ = self.teardown(&mut rt, TeardownMode::Discard);
                 Err(e)
             }
         }
@@ -510,21 +538,30 @@ impl NodeRuntime {
     // Stop / cleanup
     // ------------------------------------------------------------------
 
-    pub(super) fn stop_cat(&self, cat_id: &str, graceful: bool) -> Result<ObservedState> {
+    pub(super) fn stop_cat(&self, cat_id: &str, mode: TeardownMode) -> Result<ObservedState> {
         let Some(mut rt) = self.cats.lock().unwrap().remove(cat_id) else {
             let dir = self.cfg.state_dir.join("cats").join(cat_id);
-            if graceful && dir.exists() {
-                // After an agent restart the in-memory supervisor may be gone
-                // while blockd journals still exist. A graceful lifecycle
-                // request must never equate "not in the map" with "safe to
-                // delete"; recovery/cleanup needs an explicit path.
-                bail!(
-                    "cat runtime directory {} exists but is not supervised; refusing to discard possible local durability state",
-                    dir.display()
-                );
-            }
-            if !graceful {
-                let _ = std::fs::remove_dir_all(&dir);
+            match &mode {
+                TeardownMode::Destroy {
+                    disposable_root_disk_ids,
+                    retained_persistent_disk_ids,
+                } if dir.exists() && retained_persistent_disk_ids.is_empty() => {
+                    self.remove_unsupervised_destroy_residue(&dir, disposable_root_disk_ids)?;
+                }
+                TeardownMode::Cold | TeardownMode::Destroy { .. } if dir.exists() => {
+                    // After an agent restart the in-memory supervisor may be
+                    // gone while an independently-owned disk journal remains.
+                    // Only a root-only Destroy plan is sufficient authority to
+                    // discard that residue.
+                    bail!(
+                        "cat runtime directory {} exists but is not supervised; refusing to discard possible persistent durability state",
+                        dir.display()
+                    );
+                }
+                TeardownMode::Discard => {
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+                _ => {}
             }
             return Ok(ObservedState::Cold);
         };
@@ -538,7 +575,7 @@ impl NodeRuntime {
             }
         }
         let prior_state = rt.state;
-        if let Err(error) = self.teardown(&mut rt, graceful) {
+        if let Err(error) = self.teardown(&mut rt, mode) {
             // If the Guest is already gone, only the forced remote drain is
             // outstanding. Keep the blockd processes and local journals alive
             // under an explicit transitional state so a retry can finish it.
@@ -554,12 +591,24 @@ impl NodeRuntime {
         Ok(ObservedState::Cold)
     }
 
-    /// Teardown one runtime. A graceful transition is fail-closed: after the
-    /// Guest page cache is frozen and the VMM is gone, every relaxed blockd
-    /// must reach its remote durability watermark before its journal or lease
-    /// may be discarded.
-    fn teardown(&self, rt: &mut CatRuntime, graceful: bool) -> Result<()> {
-        if graceful && rt.guest.is_some() {
+    /// Teardown one runtime. Cold preserves and drains every disk. Destroy may
+    /// discard only the RootDisks explicitly authorized by the control plane;
+    /// every remaining blockd is still a fail-closed remote-drain boundary.
+    fn teardown(&self, rt: &mut CatRuntime, mode: TeardownMode) -> Result<()> {
+        let persistent_to_flush = match &mode {
+            TeardownMode::Destroy {
+                disposable_root_disk_ids,
+                retained_persistent_disk_ids,
+            } => Self::validate_destroy_plan(
+                rt,
+                disposable_root_disk_ids,
+                retained_persistent_disk_ids,
+            )?,
+            _ => Vec::new(),
+        };
+        let needs_guest_flush = matches!(mode, TeardownMode::Cold)
+            || matches!(mode, TeardownMode::Destroy { .. }) && !persistent_to_flush.is_empty();
+        if needs_guest_flush && rt.guest.is_some() {
             if rt.state == ObservedState::Suspended {
                 // A paused guest cannot flush; wake it first.
                 match &rt.ch {
@@ -577,7 +626,17 @@ impl NodeRuntime {
                 .conn()
                 .connect()
                 .context("connect guest for final sync")?;
-            client.syncfs().context("guest final syncfs")?;
+            match &mode {
+                TeardownMode::Cold => client.syncfs().context("guest final syncfs")?,
+                TeardownMode::Destroy { .. } => {
+                    for disk_id in &persistent_to_flush {
+                        client
+                            .flush_disk(disk_id)
+                            .with_context(|| format!("guest final flush of {disk_id}"))?;
+                    }
+                }
+                TeardownMode::Discard => unreachable!("discard does not flush the guest"),
+            }
             if rt.ch.is_none() {
                 let _ = client.shutdown();
             }
@@ -591,7 +650,14 @@ impl NodeRuntime {
                 }
             }
         }
-        if graceful {
+        if let TeardownMode::Destroy {
+            disposable_root_disk_ids,
+            ..
+        } = &mode
+        {
+            self.discard_root_runtimes(rt, disposable_root_disk_ids);
+        }
+        if !matches!(mode, TeardownMode::Discard) {
             // syncfs pushed the guest page cache into the engines; on relaxed
             // volumes that only advances the local watermark. The VMM is gone,
             // so no late fsync can slip in behind this mandatory drain.
@@ -625,6 +691,84 @@ impl NodeRuntime {
         let _ = std::fs::remove_file(rt.runtime_socket());
         Self::remove_metering_cgroup(rt.metering.as_ref());
         rt.state = ObservedState::Cold;
+        Ok(())
+    }
+
+    fn discard_root_runtimes(&self, rt: &mut CatRuntime, root_disk_ids: &[String]) {
+        if let (Some(chrt), VmmMode::CloudHypervisor(chc)) = (&mut rt.ch, &self.cfg.vmm) {
+            for disk_id in root_disk_ids {
+                if let Some(device) = chrt.nbd.remove(disk_id) {
+                    ch::nbd_detach(chc, &device);
+                }
+            }
+        }
+        for disk_id in root_disk_ids {
+            if let Some(mut proc) = rt.blockds.remove(disk_id) {
+                let _ = proc.child.kill();
+                let _ = proc.child.wait();
+                proc.remove_socket_files(&rt.dir);
+            }
+            let _ = std::fs::remove_dir_all(rt.dir.join(format!("vol-{disk_id}")));
+        }
+        rt.volumes
+            .retain(|volume| !root_disk_ids.contains(&volume.disk_id));
+    }
+
+    fn validate_destroy_plan(
+        rt: &CatRuntime,
+        disposable_root_disk_ids: &[String],
+        retained_persistent_disk_ids: &[String],
+    ) -> Result<Vec<String>> {
+        let disposable: HashSet<&str> = disposable_root_disk_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let retained: HashSet<&str> = retained_persistent_disk_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        anyhow::ensure!(
+            disposable.is_disjoint(&retained),
+            "destroy disk plan marks one disk as both disposable and retained"
+        );
+        let mut persistent_to_flush = Vec::new();
+        for disk_id in rt.blockds.keys() {
+            match (
+                disposable.contains(disk_id.as_str()),
+                retained.contains(disk_id.as_str()),
+            ) {
+                (true, false) => {}
+                (false, true) => persistent_to_flush.push(disk_id.clone()),
+                (false, false) => {
+                    anyhow::bail!("destroy disk plan does not classify attached disk {disk_id}")
+                }
+                (true, true) => unreachable!("disjoint sets checked above"),
+            }
+        }
+        Ok(persistent_to_flush)
+    }
+
+    fn remove_unsupervised_destroy_residue(
+        &self,
+        dir: &Path,
+        disposable_root_disk_ids: &[String],
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !disposable_root_disk_ids.is_empty(),
+            "destroy supplied no disposable RootDisk"
+        );
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(disk_id) = name.strip_prefix("vol-") {
+                anyhow::ensure!(
+                    disposable_root_disk_ids.iter().any(|root| root == disk_id),
+                    "unsupervised runtime contains non-disposable disk {disk_id}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 }

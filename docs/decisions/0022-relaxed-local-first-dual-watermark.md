@@ -5,6 +5,8 @@
 - 修订：取代 ADR-0021 中“5 秒固定丢失窗口”“pack 满后前台/超时内联
   publish”“detach 失败仍释放 lease”以及 Snapshot 不强制同步的部分；
   strict 契约与按盘选择不变。
+- 后续修订：ADR-0025 仅允许 Cat Destroy 丢弃随后会 tombstone 的 RootDisk；
+  PersistentDisk 与其他生命周期边界仍必须强制 drain。
 
 ## 背景
 
@@ -107,6 +109,13 @@ lease 到期时间只决定竞争者何时可以 acquire。只要数据库行仍
 - Stop/Cold、Warm、hot detach、Snapshot、`cats sync`、计划内 Node drain/
   冷迁移都必须先停止晚到的 Guest 写，再强制 drain。失败时保留 blockd、
   local journal 和 lease，控制器重试；不得标记 Cold、解绑/删除盘或清理源。
+- **Cat Destroy 的 RootDisk 例外**：RootDisk 与 Cat 同生命周期且本次操作会删除
+  它的 metadata/对象，因此 Guest/VMM 停止后可以不发布其本地 tail，直接丢弃该
+  RootDisk 的 blockd、journal 与 cache。这个例外不能扩展到普通 Stop/Cold，也不能
+  扩展到 PersistentDisk；同一次 Destroy 中需要返回 Available 的 PersistentDisk 仍
+  必须完成 final drain，任一失败就保留其 blockd/journal/lease 并重试。Node job 必须
+  携带控制面按 `DiskKind` 生成的显式 disposable/retained 清单，未知或冲突分类 fail
+  closed，不能由 mount path 猜测。
 - Snapshot 在 Running 时先 guest syncfs + drain；Suspended 已在 pause 前
   syncfs，只需 drain frozen engines。Warm/Cold 已跨过强制 drain 边界。
 - 非计划 Host 丢失无法 drain，按 Relaxed 的实时 `L-R` 暴露 RPO，控制面提高
@@ -140,8 +149,9 @@ lease 到期时间只决定竞争者何时可以 acquire。只要数据库行仍
    合并正确；
 3. blockd 崩溃后不做远端写即可重建本地水位，恢复发布保持 generation 顺序；
 4. 配额只淘汰 clean chunks，pin 数据不丢，背压期间远端调用只来自 publisher；
-5. drain 失败时 Stop/Warm/Snapshot/Detach/Node drain 不销毁源，远端恢复后同一
-   job 可重试并从新 Host 校验 digest；
+5. drain 失败时普通 Stop/Warm/Snapshot/Detach/Node drain 不销毁源；Destroy 只允许
+   销毁显式列出的 RootDisk，PersistentDisk 源必须保留，远端恢复后同一 job 可重试
+   并从新 Host 校验 digest；
 6. expiry lapse 不自我 fence，而 revoke/竞争 acquire 后旧 epoch 必须失败。
 
 测试数字只说明相应测试环境和边界，不是生产 SLA。生产 rollout 还必须观察
