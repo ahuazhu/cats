@@ -43,7 +43,25 @@ pub struct Config {
     pub node_lease_timeout_ms: i64,
     pub reconcile_interval_ms: u64,
     pub auto_tier_policy: AutoTierPolicy,
+    /// How long `POST .../oci-deployments` may hold a request open before it
+    /// answers `202` with an operation to poll.
+    ///
+    /// This is a transition affordance, not a correctness boundary: the deploy
+    /// is durable and pollable either way. It exists so a caller written
+    /// against the older synchronous response keeps receiving `200`, and it
+    /// must stay comfortably below the idle timeout of whatever proxy fronts
+    /// Cats -- otherwise that proxy answers 504 first and the caller learns
+    /// nothing. Lower it as callers adopt polling.
+    pub oci_deploy_sync_wait_ms: u64,
 }
+
+/// Default synchronous wait for an OCI deploy.
+///
+/// Covers a first-pull deploy of a multi-hundred-megabyte image, which is the
+/// case that was timing out. The edge in front of Cats must allow more than
+/// this; `deploy/aws/terraform/modules/cats-kubernetes` sets the ALB's idle
+/// timeout accordingly.
+pub const DEFAULT_OCI_DEPLOY_SYNC_WAIT_MS: u64 = 240_000;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -119,6 +137,20 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
             "default".to_string(),
             "local-development".to_string(),
         )]))?;
+    }
+    // An OCI deploy is driven by an in-memory task holding one-pull registry
+    // credentials that are never persisted, so a deploy in flight when this
+    // process died cannot be resumed. Report it as failed instead of leaving
+    // its operation unresolved and its (cat, app, digest) identity blocked --
+    // a caller polling that operation would otherwise wait forever.
+    match store.fail_interrupted_oci_deployments() {
+        Ok(0) => {}
+        Ok(count) => {
+            tracing::warn!("failed {count} OCI deployment(s) interrupted by a restart")
+        }
+        Err(error) => {
+            tracing::error!("converging interrupted OCI deployments failed: {error}")
+        }
     }
     let usage = cfg.usage_store.clone();
     let credits = cfg.credit_store.clone();

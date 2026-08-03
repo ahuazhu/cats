@@ -680,3 +680,55 @@ impl Store {
         })
     }
 }
+
+/// A work lease released when this value is dropped.
+///
+/// A long request can lose its client at any moment -- an intermediary idle
+/// timeout is enough -- and dropping the handler future skips whatever release
+/// call sits after the awaited work. That leaked a lease for its whole TTL and
+/// pinned the Cat out of auto-suspend. `Drop` runs on cancellation too, so
+/// tying the lease to a value makes the release unconditional.
+///
+/// Releasing does not nudge auto-suspend: the reconciler's `tick` already
+/// re-examines every auto-suspend candidate, so a cancelled request converges
+/// on the next tick instead of needing the handler to still be alive.
+pub struct WorkLeaseGuard {
+    store: Arc<Store>,
+    lease: WorkLease,
+}
+
+impl WorkLeaseGuard {
+    pub fn lease(&self) -> &WorkLease {
+        &self.lease
+    }
+}
+
+impl Drop for WorkLeaseGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.store.release_work(&self.lease.id) {
+            tracing::warn!(
+                lease = %self.lease.id,
+                cat = %self.lease.cat_id,
+                "releasing work lease failed; it expires with its TTL: {error}"
+            );
+        }
+    }
+}
+
+impl Store {
+    /// Acquire a work lease whose release survives request cancellation.
+    pub fn acquire_work_guarded(
+        self: &Arc<Self>,
+        cat_id: &str,
+        kind: WorkKind,
+        owner_id: &str,
+        label: &str,
+        ttl_ms: u64,
+    ) -> Result<WorkLeaseGuard> {
+        let lease = self.acquire_work(cat_id, kind, owner_id, label, ttl_ms)?;
+        Ok(WorkLeaseGuard {
+            store: Arc::clone(self),
+            lease,
+        })
+    }
+}

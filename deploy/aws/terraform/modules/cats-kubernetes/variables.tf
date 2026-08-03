@@ -284,6 +284,39 @@ variable "ingress_class_name" {
   default     = "cats-public"
 }
 
+variable "oci_deploy_sync_wait_ms" {
+  description = <<-EOT
+    How long POST /oci-deployments holds a request open before answering 202
+    with an operation to poll. A transition affordance for callers written
+    against the older synchronous response; lower it as callers adopt polling.
+  EOT
+  type        = number
+  default     = 240000
+}
+
+variable "public_ingress_idle_timeout_seconds" {
+  description = <<-EOT
+    ALB idle timeout for the public ingress.
+
+    AWS defaults this to 60 s, which is shorter than several legitimate Cats
+    requests: an OCI deploy pulls and flattens an image, and `exec` accepts a
+    caller-supplied timeout up to an hour. When the target has not answered by
+    the idle timeout the ALB returns 504, which says nothing about whether the
+    work succeeded -- it did keep running -- so callers retried operations that
+    were already in flight.
+
+    This must stay above the control plane's `--oci-deploy-sync-wait-ms`, or
+    the ALB answers 504 before the control plane can answer 202.
+  EOT
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.public_ingress_idle_timeout_seconds >= 60 && var.public_ingress_idle_timeout_seconds <= 4000
+    error_message = "ALB idle timeout must be between 60 and 4000 seconds."
+  }
+}
+
 variable "acm_certificate_arn" {
   description = "ACM certificate ARN used by the public HTTPS listener."
   type        = string

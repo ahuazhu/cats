@@ -50,6 +50,11 @@ impl Store {
             )
             .map_err(internal)?;
         }
+        // v3 -> v4 adds `oci_deployments` and needs no guarded step: the batch
+        // below creates missing tables unconditionally. A v3 database therefore
+        // upgrades by being opened, and every deployment recorded before v4 is
+        // simply absent -- correct, because a Cat's applications are Guest-side
+        // state that a fresh deployment re-establishes.
         conn.execute_batch(SCHEMA).map_err(internal)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(internal)?;
@@ -66,7 +71,7 @@ impl Store {
 /// the live fleet needs and deletes rungs once no deployment is below them.
 /// Deployment automation reads both constants and refuses to replace a live
 /// Pod whose database this build can neither run nor migrate.
-pub(super) const SCHEMA_VERSION: i64 = 3;
+pub(super) const SCHEMA_VERSION: i64 = 4;
 
 /// The oldest stamped version `Store::open` can still upgrade in place.
 const OLDEST_MIGRATABLE_SCHEMA_VERSION: i64 = 1;
@@ -208,6 +213,28 @@ CREATE TABLE IF NOT EXISTS idempotency (
     route TEXT NOT NULL,
     operation_id TEXT NOT NULL,
     PRIMARY KEY (key, route)
+);
+-- One row per (cat, app, pinned digest): the deployment's identity, so a
+-- retried request finds the first attempt instead of starting a second one.
+-- The UNIQUE constraint is the idempotency mechanism; handler code only reads
+-- what the constraint decided. Registry credentials are deliberately absent --
+-- they are transient pull credentials and must never be persisted, which is
+-- also why an interrupted deploy cannot be resumed after a restart and is
+-- converged to 'failed' instead.
+CREATE TABLE IF NOT EXISTS oci_deployments (
+    id TEXT PRIMARY KEY,
+    cat_id TEXT NOT NULL,
+    app TEXT NOT NULL,
+    image_digest TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK (phase IN ('running','succeeded','failed')),
+    manifest_digest TEXT,
+    service TEXT,
+    active INTEGER NOT NULL DEFAULT 0,
+    error_json TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (cat_id, app, image_digest)
 );
 CREATE TABLE IF NOT EXISTS endpoints (
     id TEXT PRIMARY KEY,

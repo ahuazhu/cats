@@ -72,6 +72,24 @@ pub struct OciDeployment {
     pub active: bool,
 }
 
+/// The digest a caller pinned in `image`, without the `@`.
+///
+/// Cats accepts only digest-pinned references, which makes the digest part of
+/// the request's identity: `(cat, app, digest)` names one deployment, so the
+/// control plane can recognise a retry of the same deploy without reaching a
+/// registry. Returns `None` for anything that is not a well-formed
+/// `…@sha256:<64 lowercase hex>` suffix; the Guest performs the full reference
+/// parse and reports the specific defect.
+pub fn pinned_digest(image: &str) -> Option<&str> {
+    let (_, digest) = image.rsplit_once('@')?;
+    let hex = digest.strip_prefix("sha256:")?;
+    let well_formed = hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b"abcdef".contains(&b));
+    well_formed.then_some(digest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +111,53 @@ mod tests {
         assert!(output.contains("[REDACTED]"));
         assert!(!output.contains("secret-db-url"));
         assert!(!output.contains("secret-registry-token"));
+    }
+
+    const HEX: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn pinned_digest_accepts_a_digest_reference_and_keeps_the_algorithm_prefix() {
+        assert_eq!(
+            pinned_digest(&format!("ghcr.io/acme/server@sha256:{HEX}")),
+            Some(format!("sha256:{HEX}").as_str())
+        );
+        // A port in the registry host must not be mistaken for the digest.
+        assert_eq!(
+            pinned_digest(&format!("registry.local:5000/acme/server@sha256:{HEX}")),
+            Some(format!("sha256:{HEX}").as_str())
+        );
+    }
+
+    #[test]
+    fn pinned_digest_rejects_references_that_do_not_name_one_immutable_image() {
+        // A tag is not an identity: the same tag can resolve to new bytes.
+        assert_eq!(pinned_digest("ghcr.io/acme/server:latest"), None);
+        assert_eq!(pinned_digest("ghcr.io/acme/server"), None);
+        // Malformed digests must not become idempotency keys.
+        assert_eq!(pinned_digest("ghcr.io/acme/server@sha256:"), None);
+        assert_eq!(pinned_digest("ghcr.io/acme/server@sha512:{HEX}"), None);
+        assert_eq!(
+            pinned_digest(&format!("ghcr.io/acme/server@sha256:{}", &HEX[..63])),
+            None,
+            "a 63-hex digest is short by one and must be rejected"
+        );
+        assert_eq!(
+            pinned_digest(&format!("ghcr.io/acme/server@sha256:{HEX}a")),
+            None,
+            "a 65-hex digest is long by one and must be rejected"
+        );
+        assert_eq!(
+            pinned_digest(&format!(
+                "ghcr.io/acme/server@sha256:{}",
+                HEX.to_uppercase()
+            )),
+            None,
+            "uppercase hex would key two spellings of one digest apart"
+        );
+        assert_eq!(
+            pinned_digest(&format!("ghcr.io/acme/server@sha256:{}g", &HEX[..63])),
+            None,
+            "non-hex characters must be rejected"
+        );
     }
 }

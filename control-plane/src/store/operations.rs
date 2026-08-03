@@ -93,6 +93,22 @@ impl Store {
         })
     }
 
+    /// Move a freshly created operation to `Running`.
+    ///
+    /// Lets a poller tell "accepted, not started" from "in flight", which for a
+    /// deploy is the difference between waiting on a queue and waiting on a
+    /// registry transfer. A terminal operation is left alone.
+    pub fn start_operation(&self, op_id: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE operations SET phase='running', updated_at=?2
+                  WHERE id=?1 AND phase='pending'",
+                params![op_id, now_unix()],
+            )
+            .map(|_| ())
+        })
+    }
+
     pub fn finish_operation(&self, op_id: &str, error: Option<&ErrorBody>) -> Result<()> {
         let phase = if error.is_some() {
             "failed"
