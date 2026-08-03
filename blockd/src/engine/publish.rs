@@ -172,14 +172,17 @@ impl ChunkEngine {
         new_generation: i64,
         lease_epoch: i64,
         new_map: &[ChunkRef],
-        new_leaves: &mut [LeafRef],
+        leaves: &mut [LeafRef],
         chunks: &[u64],
     ) -> Result<i64> {
         let vol = &self.cfg.volume_id;
+        // `leaves` still describes the base root here. Capture that evidence
+        // before the touched entries below mutate it in place into the target
+        // root used by the CAS.
         let (base_root_hash, base_root_object_id) = if base_generation == 0 {
             (None, None)
         } else {
-            let encoded = format::encode_root(self.size, new_leaves);
+            let encoded = format::encode_root(self.size, leaves);
             let hash = format::sha256(&encoded);
             (Some(hash), Some(format!("{}.node", hex::encode(hash))))
         };
@@ -191,7 +194,7 @@ impl ChunkEngine {
             let end = (first + CHUNKS_PER_LEAF as u64).min(self.chunk_count);
             let slice = &new_map[first as usize..end as usize];
             if slice.iter().all(|r| r.is_hole()) {
-                new_leaves[leaf_idx as usize] = LeafRef::Empty;
+                leaves[leaf_idx as usize] = LeafRef::Empty;
                 continue;
             }
             let encoded = format::encode_leaf(first, slice);
@@ -199,10 +202,10 @@ impl ChunkEngine {
             let object_id = format!("{}.node", hex::encode(hash));
             self.blob
                 .put_immutable(&chunk::keys::map_node(vol, &hex::encode(hash)), &encoded)?;
-            new_leaves[leaf_idx as usize] = LeafRef::Present { hash, object_id };
+            leaves[leaf_idx as usize] = LeafRef::Present { hash, object_id };
         }
 
-        let root_encoded = format::encode_root(self.size, new_leaves);
+        let root_encoded = format::encode_root(self.size, leaves);
         let root_hash = format::sha256(&root_encoded);
         let root_hex = hex::encode(root_hash);
         let root_object_id = format!("{root_hex}.node");
