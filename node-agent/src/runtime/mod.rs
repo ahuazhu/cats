@@ -18,6 +18,7 @@
 
 mod blockd_control;
 mod fake;
+mod ledger;
 mod lifecycle;
 mod metering;
 mod proxy;
