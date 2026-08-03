@@ -1,5 +1,6 @@
 use super::*;
 
+mod adoption;
 mod ledger_writes;
 
 #[derive(Default)]

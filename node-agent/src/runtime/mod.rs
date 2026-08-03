@@ -16,6 +16,10 @@
 //! in-memory; a node restart loses it, which is safe because every action
 //! is itself idempotent at the process level.
 
+/// Crate-visible, unlike its sibling modules: the startup path that scans the
+/// local inventory before registering with the control plane (ADR-0028 §5)
+/// lives outside `runtime`.
+pub(crate) mod adopt;
 mod blockd_control;
 mod fake;
 mod ledger;
@@ -265,6 +269,20 @@ fn short_socket_path(state_dir: &Path, cat_id: &str, kind: &str) -> PathBuf {
 fn symlink_socket(link: &Path, target: &Path) {
     let _ = std::fs::remove_file(link);
     let _ = std::os::unix::fs::symlink(target, link);
+}
+
+/// Directory-name prefix of one volume's blockd journal and cache.
+const VOLUME_DIR_PREFIX: &str = "vol-";
+
+/// The `--data-dir` the blockd serving `disk_id` for this Cat was given.
+///
+/// Spawn, teardown, the runtime ledger and re-adoption all name this directory,
+/// and re-adoption only accepts a record whose recorded `data_dir` still exists
+/// (ADR-0028 §3 step 4). Four independent spellings of the same `format!` would
+/// make that check silently vacuous the first time one of them drifted, so
+/// there is exactly one.
+fn volume_data_dir(cat_dir: &Path, disk_id: &str) -> PathBuf {
+    cat_dir.join(format!("{VOLUME_DIR_PREFIX}{disk_id}"))
 }
 
 pub struct NodeRuntime {

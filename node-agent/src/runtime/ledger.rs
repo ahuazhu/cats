@@ -29,8 +29,9 @@ use cats_api::nodejob::VolumeGrant;
 use cats_api::resources::ObservedState;
 
 use crate::ch::ChNetwork;
+use crate::proc::{host_boot_id, ProcIdentity};
 
-use super::{CatRuntime, NodeRuntime};
+use super::{volume_data_dir, CatRuntime, NodeRuntime};
 
 /// Persisted format version. A record written by any other version is not
 /// interpreted; see the module docs.
@@ -112,86 +113,6 @@ pub(super) struct MeteringRecord {
     pub source_epoch: String,
 }
 
-/// Enough of a process's identity to tell it apart from a recycled PID.
-///
-/// A bare PID proves nothing: the kernel reuses PIDs, and after a restart the
-/// agent has no parent/child relationship left to lean on. `start_ticks` plus
-/// the executable path make the check specific to the process this node
-/// actually spawned.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct ProcIdentity {
-    pub pid: u32,
-    pub start_ticks: Option<u64>,
-    pub exe: Option<PathBuf>,
-}
-
-impl ProcIdentity {
-    /// Sample a live process. A process that exits mid-sample yields absent
-    /// fields rather than an error: a weaker identity is a reason to refuse
-    /// re-adoption later, not a reason to fail the write now.
-    pub(super) fn sample(pid: u32) -> Self {
-        Self {
-            pid,
-            start_ticks: sample_start_ticks(pid),
-            exe: sample_exe(pid),
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn sample_start_ticks(pid: u32) -> Option<u64> {
-    parse_start_ticks(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
-}
-
-/// Dev and macOS hosts have no `/proc`, so process identity is weaker there.
-/// ADR-0028 §6 accepts that: those paths never carry production workload.
-#[cfg(not(target_os = "linux"))]
-fn sample_start_ticks(_pid: u32) -> Option<u64> {
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn sample_exe(pid: u32) -> Option<PathBuf> {
-    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn sample_exe(_pid: u32) -> Option<PathBuf> {
-    None
-}
-
-/// `starttime` — field 22 of `/proc/<pid>/stat`, in clock ticks since boot.
-///
-/// Field 2 (`comm`) is wrapped in parentheses and may itself contain spaces and
-/// parentheses (it is the first 15 bytes of the executable's basename, which
-/// the kernel does not sanitize), so the fields cannot be taken by splitting the
-/// line on whitespace. Splitting after the *last* `)` is the documented way to
-/// parse this file. Getting it wrong yields a plausible but wrong start time,
-/// which would later let a recycled PID pass for a surviving process.
-#[cfg(any(target_os = "linux", test))]
-fn parse_start_ticks(stat: &str) -> Option<u64> {
-    // Everything after the comm field starts at field 3 (`state`), so field 22
-    // is at index 19.
-    let (_, after_comm) = stat.rsplit_once(')')?;
-    after_comm.split_whitespace().nth(19)?.parse().ok()
-}
-
-/// Identity of the current host boot. Used to reject every recorded PID at once
-/// after a host reboot (ADR-0028 §3 step 1).
-pub(super) fn host_boot_id() -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-            .ok()
-            .map(|id| id.trim().to_string())
-            .filter(|id| !id.is_empty())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
-}
-
 /// Handle over `<state_dir>/runtime-ledger/`.
 pub(super) struct Ledger {
     dir: PathBuf,
@@ -248,12 +169,6 @@ impl Ledger {
     /// A record that is unreadable, malformed, or written by another format
     /// version is skipped with a warning rather than failing the scan: one
     /// corrupt record must not stop the node from re-adopting the rest.
-    ///
-    /// The reader belongs to the next ADR-0028 stage (startup scan and identity
-    /// proof), so nothing outside this module's own tests calls it yet. It is
-    /// kept — with its malformed-input coverage — because that stage is what the
-    /// whole format exists for.
-    #[allow(dead_code)]
     pub(super) fn load_all(&self) -> Result<Vec<CatLedgerRecord>> {
         let entries = std::fs::read_dir(&self.dir)
             .with_context(|| format!("read runtime ledger directory {}", self.dir.display()))?;
@@ -417,7 +332,7 @@ impl NodeRuntime {
                 vhost_user_socket: blockd.vhost_user_socket.clone(),
                 control_socket: blockd.control_socket.clone(),
                 // The same path `spawn_blockd` passes as `--data-dir`.
-                data_dir: runtime.dir.join(format!("vol-{}", blockd.grant.disk_id)),
+                data_dir: volume_data_dir(&runtime.dir, &blockd.grant.disk_id),
             })
             .collect();
         // `blockds` is a HashMap, so fix an order: the serialized record should
@@ -722,59 +637,5 @@ mod tests {
             .map(|entry| entry.expect("entry").file_name())
             .collect();
         assert_eq!(stray, ["runtime-ledger"]);
-    }
-
-    #[test]
-    fn start_ticks_come_from_the_field_after_the_last_paren() {
-        // Real shape of /proc/<pid>/stat, truncated after starttime.
-        let stat =
-            "4242 (cats-blockd) S 1 4242 4242 0 -1 4194560 512 0 0 0 11 3 0 0 20 0 5 0 918273 ";
-        assert_eq!(parse_start_ticks(stat), Some(918_273));
-
-        // comm is the unsanitized executable basename, so it can contain
-        // spaces and parentheses. Splitting on whitespace, or on the first
-        // `)`, silently returns a different field's value here.
-        let tricky =
-            "4242 (odd ) name (x) S 1 4242 4242 0 -1 4194560 512 0 0 0 11 3 0 0 20 0 5 0 918273 ";
-        assert_eq!(parse_start_ticks(tricky), Some(918_273));
-
-        let trailing_paren =
-            "4242 (weird)) S 1 4242 4242 0 -1 4194560 512 0 0 0 11 3 0 0 20 0 5 0 4242424 0 0";
-        assert_eq!(parse_start_ticks(trailing_paren), Some(4_242_424));
-    }
-
-    #[test]
-    fn a_malformed_stat_line_yields_no_start_ticks() {
-        assert_eq!(parse_start_ticks(""), None);
-        assert_eq!(parse_start_ticks("4242 (cats-blockd S 1 2 3"), None);
-        // Truncated before field 22.
-        assert_eq!(parse_start_ticks("4242 (cats-blockd) S 1 4242"), None);
-        // Field 22 present but not a number.
-        assert_eq!(
-            parse_start_ticks(
-                "4242 (cats-blockd) S 1 4242 4242 0 -1 4194560 512 0 0 0 11 3 0 0 20 0 5 0 x"
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn sampling_a_process_that_is_not_there_does_not_fail() {
-        // PID 0 is never a live process, so every /proc lookup misses.
-        let identity = ProcIdentity::sample(0);
-        assert_eq!(identity.pid, 0);
-        assert_eq!(identity.start_ticks, None);
-        assert_eq!(identity.exe, None);
-    }
-
-    #[test]
-    fn host_boot_id_is_stable_within_one_boot() {
-        // None off Linux by design; on Linux the value must not vary between
-        // reads, or step 1 of the re-adoption check would reject everything.
-        assert_eq!(host_boot_id(), host_boot_id());
-        #[cfg(target_os = "linux")]
-        assert!(host_boot_id().is_some_and(|id| !id.trim().is_empty()));
-        #[cfg(not(target_os = "linux"))]
-        assert_eq!(host_boot_id(), None);
     }
 }

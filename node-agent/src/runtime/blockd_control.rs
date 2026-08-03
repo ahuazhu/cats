@@ -63,18 +63,24 @@ impl BlockdProc {
         .map(|_| ())
     }
 
-    pub(super) fn durability_status_at(
-        control_socket: &Path,
-        disk_id: &str,
-    ) -> Result<DiskDurabilityTelemetry> {
+    /// The raw `Status` payload, including the volume identity that ADR-0028 §3
+    /// re-adoption proves a blockd with. Heartbeat telemetry drops those two
+    /// fields, so it cannot be reused for the proof.
+    pub(super) fn status_at(control_socket: &Path, disk_id: &str) -> Result<DurabilityStatus> {
         let payload = Self::command(
             control_socket,
             disk_id,
             BlockdControlCommand::Status,
             BLOCKD_STATUS_TIMEOUT,
         )?;
-        let status: DurabilityStatus =
-            serde_json::from_str(&payload).context("decode blockd durability status")?;
+        serde_json::from_str(&payload).context("decode blockd durability status")
+    }
+
+    pub(super) fn durability_status_at(
+        control_socket: &Path,
+        disk_id: &str,
+    ) -> Result<DiskDurabilityTelemetry> {
+        let status = Self::status_at(control_socket, disk_id)?;
         Ok(DiskDurabilityTelemetry {
             disk_id: disk_id.to_string(),
             mode: status.mode,
@@ -199,7 +205,7 @@ impl NodeRuntime {
             }
             _ => None,
         };
-        let data_dir = cat_dir.join(format!("vol-{}", grant.disk_id));
+        let data_dir = volume_data_dir(cat_dir, &grant.disk_id);
         let mut cmd = Command::new(&self.cfg.blockd_bin);
         cmd.arg("--volume-id")
             .arg(&grant.volume_id)

@@ -717,7 +717,7 @@ impl NodeRuntime {
                 proc.child.kill_and_reap();
                 proc.remove_socket_files(&rt.dir);
             }
-            let _ = std::fs::remove_dir_all(rt.dir.join(format!("vol-{disk_id}")));
+            let _ = std::fs::remove_dir_all(volume_data_dir(&rt.dir, disk_id));
         }
         rt.volumes
             .retain(|volume| !root_disk_ids.contains(&volume.disk_id));
@@ -770,7 +770,7 @@ impl NodeRuntime {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if let Some(disk_id) = name.strip_prefix("vol-") {
+            if let Some(disk_id) = name.strip_prefix(VOLUME_DIR_PREFIX) {
                 anyhow::ensure!(
                     disposable_root_disk_ids.iter().any(|root| root == disk_id),
                     "unsupervised runtime contains non-disposable disk {disk_id}"

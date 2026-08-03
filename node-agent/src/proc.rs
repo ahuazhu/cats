@@ -1,19 +1,26 @@
-//! One handle for every host process the node agent supervises.
+//! Host process identity and one handle for every process the node agent
+//! supervises.
 //!
 //! A process this agent forked is a `std::process::Child`: it can be waited on
 //! and reaped. A process the agent *adopts* — recovered by pid after an agent
-//! restart — is not a child of this process, so `waitpid` would fail with
-//! `ECHILD` and its exit has to be observed by probing the pid instead. Both
-//! kinds appear on the same supervision paths (guest/VMM and `cats-blockd`), so
-//! they share one type rather than splitting every call site.
+//! restart (ADR-0028 §3) — is not a child of this process, so `waitpid` would
+//! fail with `ECHILD` and its exit has to be observed by probing the pid
+//! instead. Both kinds appear on the same supervision paths (guest/VMM and
+//! `cats-blockd`), so they share one type rather than splitting every call site.
+//!
+//! Identity lives here too, next to the handle it guards: a bare pid proves
+//! nothing, because the kernel reuses pids and an adopted process leaves the
+//! agent no parent/child relationship to lean on.
 //!
 //! This lives at the crate root because both `runtime` and `ch` supervise
 //! processes.
 
+use std::path::PathBuf;
 use std::process::Child;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 /// How long [`ProcHandle::kill_and_reap`] waits for an adopted process to
 /// disappear. It is not our child, so there is nothing to reap and nothing that
@@ -26,18 +33,22 @@ pub(crate) enum ProcHandle {
     Owned(Child),
     /// Recovered by pid after an agent restart. Signals still work; `waitpid`
     /// does not.
-    // Constructed by the reattach path that this type is groundwork for, and by
-    // this module's tests. Narrowly scoped so the rest of the crate keeps its
-    // dead-code coverage.
-    #[allow(dead_code)]
-    Adopted { pid: u32 },
+    ///
+    /// The start ticks recorded at adoption travel with the pid on purpose
+    /// (ADR-0028 §3). Adoption and teardown can be hours apart; an adopted
+    /// process is not this agent's child, so the moment it exits the kernel may
+    /// hand its pid to something unrelated. Signalling on the pid alone would
+    /// then kill a stranger's process, so every signal is re-proved against
+    /// this value first. Owned children need no such guard: the kernel reserves
+    /// a child's pid until it is reaped.
+    Adopted { pid: u32, start_ticks: Option<u64> },
 }
 
 impl ProcHandle {
     pub(crate) fn id(&self) -> u32 {
         match self {
             Self::Owned(child) => child.id(),
-            Self::Adopted { pid } => *pid,
+            Self::Adopted { pid, .. } => *pid,
         }
     }
 
@@ -45,11 +56,18 @@ impl ProcHandle {
     ///
     /// An owned child is reaped here as a side effect, exactly as `try_wait`
     /// always did. An adopted process is only probed: a zombie it left behind
-    /// is its real parent's to reap, and still answers a signal-0 probe.
+    /// is its real parent's to reap, and still answers a signal-0 probe. A pid
+    /// whose start ticks no longer match counts as gone — whatever holds that
+    /// pid now, it is not the process this handle names.
     pub(crate) fn exited(&mut self) -> Result<bool> {
         match self {
             Self::Owned(child) => Ok(child.try_wait()?.is_some()),
-            Self::Adopted { pid } => adopted_exited(*pid),
+            Self::Adopted { pid, start_ticks } => {
+                if !is_recorded_process(*pid, *start_ticks) {
+                    return Ok(true);
+                }
+                adopted_exited(*pid)
+            }
         }
     }
 
@@ -60,11 +78,18 @@ impl ProcHandle {
                 let _ = child.kill();
                 let _ = child.wait();
             }
-            Self::Adopted { pid } => {
-                let pid = *pid;
+            Self::Adopted { pid, start_ticks } => {
+                let (pid, start_ticks) = (*pid, *start_ticks);
+                if !is_recorded_process(pid, start_ticks) {
+                    tracing::warn!(
+                        pid,
+                        "not killing adopted pid: it no longer names the recorded process"
+                    );
+                    return;
+                }
                 signal_pid(pid, libc::SIGKILL);
                 let deadline = Instant::now() + ADOPTED_EXIT_DEADLINE;
-                while !matches!(adopted_exited(pid), Ok(true)) {
+                while !adopted_is_gone(pid, start_ticks) {
                     if Instant::now() >= deadline {
                         tracing::warn!(pid, "adopted process outlived its SIGKILL deadline");
                         return;
@@ -76,7 +101,20 @@ impl ProcHandle {
     }
 
     pub(crate) fn signal(&self, sig: i32) {
-        signal_pid(self.id(), sig);
+        match self {
+            Self::Owned(child) => signal_pid(child.id(), sig),
+            Self::Adopted { pid, start_ticks } => {
+                if !is_recorded_process(*pid, *start_ticks) {
+                    tracing::warn!(
+                        pid = *pid,
+                        signal = sig,
+                        "not signalling adopted pid: it no longer names the recorded process"
+                    );
+                    return;
+                }
+                signal_pid(*pid, sig);
+            }
+        }
     }
 }
 
@@ -91,6 +129,21 @@ fn signal_pid(pid: u32, sig: i32) {
     unsafe {
         libc::kill(pid, sig);
     }
+}
+
+/// Whether `pid` still names the process whose start ticks were recorded.
+///
+/// Off Linux, and for a record written without start ticks, both sides are
+/// `None` and this is a no-op — the dev path has no `/proc` to sample
+/// (ADR-0028 §6). Anywhere the sample fails while a value was recorded, the
+/// answer is "not the same process", which is the fail-closed side: the caller
+/// then refuses to signal rather than risk a recycled pid.
+fn is_recorded_process(pid: u32, start_ticks: Option<u64>) -> bool {
+    sample_start_ticks(pid) == start_ticks
+}
+
+fn adopted_is_gone(pid: u32, start_ticks: Option<u64>) -> bool {
+    !is_recorded_process(pid, start_ticks) || matches!(adopted_exited(pid), Ok(true))
 }
 
 fn adopted_exited(pid: u32) -> Result<bool> {
@@ -118,6 +171,86 @@ fn pid_t(pid: u32) -> Option<libc::pid_t> {
     libc::pid_t::try_from(pid).ok()
 }
 
+/// Enough of a process's identity to tell it apart from a recycled pid.
+///
+/// A bare pid proves nothing: the kernel reuses pids, and after a restart the
+/// agent has no parent/child relationship left to lean on. `start_ticks` plus
+/// the executable path make the check specific to the process this node
+/// actually spawned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ProcIdentity {
+    pub pid: u32,
+    pub start_ticks: Option<u64>,
+    pub exe: Option<PathBuf>,
+}
+
+impl ProcIdentity {
+    /// Sample a live process. A process that exits mid-sample yields absent
+    /// fields rather than an error: a weaker identity is a reason to refuse
+    /// re-adoption later, not a reason to fail the write now.
+    pub(crate) fn sample(pid: u32) -> Self {
+        Self {
+            pid,
+            start_ticks: sample_start_ticks(pid),
+            exe: sample_exe(pid),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sample_start_ticks(pid: u32) -> Option<u64> {
+    parse_start_ticks(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// Dev and macOS hosts have no `/proc`, so process identity is weaker there.
+/// ADR-0028 §6 accepts that: those paths never carry production workload.
+#[cfg(not(target_os = "linux"))]
+fn sample_start_ticks(_pid: u32) -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn sample_exe(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sample_exe(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+/// `starttime` — field 22 of `/proc/<pid>/stat`, in clock ticks since boot.
+///
+/// Field 2 (`comm`) is wrapped in parentheses and may itself contain spaces and
+/// parentheses (it is the first 15 bytes of the executable's basename, which
+/// the kernel does not sanitize), so the fields cannot be taken by splitting the
+/// line on whitespace. Splitting after the *last* `)` is the documented way to
+/// parse this file. Getting it wrong yields a plausible but wrong start time,
+/// which would later let a recycled pid pass for a surviving process.
+#[cfg(any(target_os = "linux", test))]
+fn parse_start_ticks(stat: &str) -> Option<u64> {
+    // Everything after the comm field starts at field 3 (`state`), so field 22
+    // is at index 19.
+    let (_, after_comm) = stat.rsplit_once(')')?;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Identity of the current host boot. Used to reject every recorded pid at once
+/// after a host reboot (ADR-0028 §3 step 1).
+pub(crate) fn host_boot_id() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,6 +261,21 @@ mod tests {
             .arg("30")
             .spawn()
             .expect("spawn test process")
+    }
+
+    /// Adopt a live process the way the ADR-0028 §3 proof does: with the start
+    /// ticks sampled from the pid itself.
+    fn adopt(pid: u32) -> ProcHandle {
+        ProcHandle::Adopted {
+            pid,
+            start_ticks: sample_start_ticks(pid),
+        }
+    }
+
+    /// Start ticks that provably do not belong to `pid`, on any host: off Linux
+    /// nothing can be sampled, so any recorded value is already a mismatch.
+    fn wrong_start_ticks(pid: u32) -> Option<u64> {
+        Some(sample_start_ticks(pid).unwrap_or(0).wrapping_add(1))
     }
 
     /// An adopted pid killed inside this test is still a child of the test
@@ -167,7 +315,7 @@ mod tests {
     fn adopted_handle_observes_a_process_it_did_not_fork() {
         let child = spawn_sleeper();
         let pid = child.id();
-        let mut handle = ProcHandle::Adopted { pid };
+        let mut handle = adopt(pid);
         assert_eq!(handle.id(), pid);
         assert!(
             !handle.exited().unwrap(),
@@ -191,12 +339,95 @@ mod tests {
         wait_until_exited(&mut owned);
 
         let adopted_child = spawn_sleeper();
-        let mut adopted = ProcHandle::Adopted {
-            pid: adopted_child.id(),
-        };
+        let mut adopted = adopt(adopted_child.id());
         let reaper = reap_in_background(adopted_child);
         adopted.signal(libc::SIGKILL);
         reaper.join().expect("reaper thread");
         wait_until_exited(&mut adopted);
+    }
+
+    /// ADR-0028 §3: an adopted process can exit long after adoption and the
+    /// kernel can hand its pid to something unrelated. Neither `signal` nor
+    /// `kill_and_reap` may touch a pid whose start ticks have moved.
+    #[test]
+    fn a_recycled_adopted_pid_is_never_signalled() {
+        let child = spawn_sleeper();
+        let pid = child.id();
+        let mut probe = adopt(pid);
+        let mut stale = ProcHandle::Adopted {
+            pid,
+            start_ticks: wrong_start_ticks(pid),
+        };
+
+        stale.signal(libc::SIGKILL);
+        assert!(
+            !probe.exited().expect("probe process"),
+            "signal must not reach a pid whose start ticks no longer match"
+        );
+        stale.kill_and_reap();
+        assert!(
+            !probe.exited().expect("probe process"),
+            "kill_and_reap must not reach a pid whose start ticks no longer match"
+        );
+        // The handle itself reports the process it names as gone, because that
+        // process is not what holds the pid any more.
+        assert!(stale.exited().expect("probe stale handle"));
+
+        probe.kill_and_reap();
+        reap_in_background(child).join().expect("reaper thread");
+    }
+
+    #[test]
+    fn start_ticks_come_from_the_field_after_the_last_paren() {
+        // Real shape of /proc/<pid>/stat, truncated after starttime.
+        let stat =
+            "4242 (cats-blockd) S 1 4242 4242 0 -1 4194560 512 0 0 0 11 3 0 0 20 0 5 0 918273 ";
+        assert_eq!(parse_start_ticks(stat), Some(918_273));
+
+        // comm is the unsanitized executable basename, so it can contain
+        // spaces and parentheses. Splitting on whitespace, or on the first
+        // `)`, silently returns a different field's value here.
+        let tricky =
+            "4242 (odd ) name (x) S 1 4242 4242 0 -1 4194560 512 0 0 0 11 3 0 0 20 0 5 0 918273 ";
+        assert_eq!(parse_start_ticks(tricky), Some(918_273));
+
+        let trailing_paren =
+            "4242 (weird)) S 1 4242 4242 0 -1 4194560 512 0 0 0 11 3 0 0 20 0 5 0 4242424 0 0";
+        assert_eq!(parse_start_ticks(trailing_paren), Some(4_242_424));
+    }
+
+    #[test]
+    fn a_malformed_stat_line_yields_no_start_ticks() {
+        assert_eq!(parse_start_ticks(""), None);
+        assert_eq!(parse_start_ticks("4242 (cats-blockd S 1 2 3"), None);
+        // Truncated before field 22.
+        assert_eq!(parse_start_ticks("4242 (cats-blockd) S 1 4242"), None);
+        // Field 22 present but not a number.
+        assert_eq!(
+            parse_start_ticks(
+                "4242 (cats-blockd) S 1 4242 4242 0 -1 4194560 512 0 0 0 11 3 0 0 20 0 5 0 x"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn sampling_a_process_that_is_not_there_does_not_fail() {
+        // PID 0 is never a live process, so every /proc lookup misses.
+        let identity = ProcIdentity::sample(0);
+        assert_eq!(identity.pid, 0);
+        assert_eq!(identity.start_ticks, None);
+        assert_eq!(identity.exe, None);
+    }
+
+    #[test]
+    fn host_boot_id_is_stable_within_one_boot() {
+        // None off Linux by design; on Linux the value must not vary between
+        // reads, or step 1 of the re-adoption check would reject everything.
+        assert_eq!(host_boot_id(), host_boot_id());
+        #[cfg(target_os = "linux")]
+        assert!(host_boot_id().is_some_and(|id| !id.trim().is_empty()));
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(host_boot_id(), None);
     }
 }
