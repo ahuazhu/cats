@@ -2948,3 +2948,164 @@ async fn redeploying_a_superseded_digest_activates_it_again() {
     assert_eq!(for_app.len(), 1);
     assert_eq!(for_app[0].image_digest, TEST_DIGEST);
 }
+
+/// A Cat being deleted must not block its Host from recovering.
+///
+/// Production deadlock: `metal-1` held nine preserved claims, one of which was
+/// a Cat with `desired_state = deleted` that the Host had already torn down and
+/// so no longer reported. Recovery demanded a complete inventory including that
+/// claim, while `reconcile_cat` declines every flow -- the delete included --
+/// for a Cat whose node is Lost. Neither side could move, and nothing self
+/// healed: the node stayed Lost with its Cats stranded.
+#[tokio::test]
+async fn a_deleting_cat_does_not_block_its_lost_node_from_recovering() {
+    let ctx = Ctx::new().await;
+    let node_a = start_stub_node(&ctx.cp, "node_a").await;
+    ctx.create_cat("keeper", None).await;
+    let keeper = ctx.wait_observed("keeper", ObservedState::Running).await;
+    ctx.create_cat("going", None).await;
+    let going = ctx.wait_observed("going", ObservedState::Running).await;
+
+    // Lose the Host first, so the delete below cannot be dispatched and stays a
+    // preserved claim -- the state production was wedged in.
+    node_a.quiesce().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while ctx.cp.state.store.get_node("node_a").unwrap().state != NodeState::Lost {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node_a was never marked lost"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    ctx.http
+        .delete(ctx.ws_url("/cats/going"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let deleting = ctx.cp.state.store.must_get_cat_by_id(&going.id).unwrap();
+    assert_eq!(deleting.desired_state, DesiredState::Deleted);
+    assert_eq!(
+        deleting.node_id.as_deref(),
+        Some("node_a"),
+        "the claim is preserved while the Host is Lost"
+    );
+
+    // The Host has already torn this Guest down, so its inventory will never
+    // include it again -- absence is the delete succeeding, not an anomaly.
+    node_a.cats.lock().unwrap().remove(&going.id);
+    node_a.alive.store(true, Ordering::SeqCst);
+    ctx.http
+        .post(ctx.url("/v1/nodes/heartbeat"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&HeartbeatRequest {
+            node_id: "node_a".into(),
+            cats: vec![HeartbeatCat {
+                cat_id: keeper.id.clone(),
+                generation: keeper.generation,
+                state: ObservedState::Running,
+            }],
+            telemetry: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    assert_eq!(
+        ctx.cp.state.store.get_node("node_a").unwrap().state,
+        NodeState::Ready,
+        "a claim whose Cat is being deleted must not hold the node Lost"
+    );
+
+    // And once recovered the delete finally converges, which is what makes the
+    // deadlock gone rather than merely deferred.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while ctx
+        .cp
+        .state
+        .store
+        .find_cat_by_id(&going.id)
+        .unwrap()
+        .is_some()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the delete never completed after recovery"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .must_get_cat_by_id(&keeper.id)
+            .unwrap()
+            .observed_state,
+        ObservedState::Running,
+        "recovery must restore the surviving claim, not disturb it"
+    );
+}
+
+/// A claim the control plane still intends to run must keep holding the node
+/// Lost. Narrowing the requirement to non-deleting claims must not weaken the
+/// split-brain guard it exists for.
+#[tokio::test]
+async fn a_running_claim_missing_from_the_inventory_still_holds_the_node_lost() {
+    let ctx = Ctx::new().await;
+    let node_a = start_stub_node(&ctx.cp, "node_a").await;
+    ctx.create_cat("reported", None).await;
+    let reported = ctx.wait_observed("reported", ObservedState::Running).await;
+    ctx.create_cat("omitted", None).await;
+    let omitted = ctx.wait_observed("omitted", ObservedState::Running).await;
+
+    node_a.quiesce().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while ctx.cp.state.store.get_node("node_a").unwrap().state != NodeState::Lost {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node_a was never marked lost"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    ctx.http
+        .post(ctx.url("/v1/nodes/heartbeat"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&HeartbeatRequest {
+            node_id: "node_a".into(),
+            cats: vec![HeartbeatCat {
+                cat_id: reported.id.clone(),
+                generation: reported.generation,
+                state: ObservedState::Running,
+            }],
+            telemetry: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    assert_eq!(
+        ctx.cp.state.store.get_node("node_a").unwrap().state,
+        NodeState::Lost,
+        "a Cat still meant to be running there is unaccounted for; recovering \
+         would resurrect a claim that may have moved on"
+    );
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .must_get_cat_by_id(&omitted.id)
+            .unwrap()
+            .node_id
+            .as_deref(),
+        Some("node_a"),
+        "the preserved claim must survive for an explicit fence or restore"
+    );
+}

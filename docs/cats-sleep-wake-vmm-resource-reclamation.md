@@ -596,7 +596,7 @@ if wake_requested(cat):
 | Pause 成功，Page-out 部分失败 | 可以保持 Suspended，但记录低回收率 | page-out 是 best-effort；稍后重试；持续高 RSS 则转 Cold |
 | Page-out 过程中收到 Wake | 相同 Cat lifecycle generation 仲裁 | 取消后续 page-out，等待当前 syscall 返回，再 resume |
 | VMM 在 Suspended 时崩溃 | 进程状态丢失；不可只靠 memory file restore | Fence 旧 runtime，按 Cold Recovery fresh boot |
-| 整台 Host 丢失 | heartbeat 超时先标 Lost；保留 Host 绑定与旧 epoch | 完整、同 generation 的全量 claim inventory 才原地恢复；仅重注册或 inventory 漏报时保持 Lost；永久丢失时先从外部确认停机/隔离，再显式 fence；新 Host 获取更高 disk epoch 并 Cold start |
+| 整台 Host 丢失 | heartbeat 超时先标 Lost；保留 Host 绑定与旧 epoch | 完整、同 generation 的全量 claim inventory 才原地恢复（不含 `desired_state = Deleted` 的 claim，ADR-0027）；仅重注册或 inventory 漏报时保持 Lost；永久丢失时先从外部确认停机/隔离，再显式 fence；新 Host 获取更高 disk epoch 并 Cold start |
 | Resume 后 Guest Agent 未 Ready | Resuming 超时 | 收集 console/VMM/device 指标；一次 resume 修复失败后 Cold reboot |
 | Warm snapshot 损坏、丢失或 VMM 版本不匹配 | 不进入 Restoring；标记 WarmInvalid | 丢弃快照与本地状态，按 Cold Recovery fresh boot |
 | Warm restore 中途失败（restore API/resume 错误） | Restoring 超时/错误 | 清理半建 VMM/tap/backend；最多重试一次后 Cold fallback |
