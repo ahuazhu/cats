@@ -27,6 +27,7 @@ base64 = { workspace = true }
 
 [dev-dependencies]
 cats-test-support = { workspace = true }
+cats-metadata-store-sqlite = { workspace = true }
 tempfile = { workspace = true }
 hex = { workspace = true }
 
