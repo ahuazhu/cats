@@ -29,10 +29,9 @@ use super::*;
 use crate::proc::{host_boot_id, ProcIdentity};
 
 /// What one [`NodeRuntime::adopt_from_ledger`] pass concluded.
-// Constructed and logged here; the startup wiring that consumes it is the
-// ADR-0028 §5 ordering change, which is deliberately a separate patch. Until it
-// lands, only this module's tests read the fields.
-#[allow(dead_code)]
+///
+/// Summarised into the startup log by `server::spawn`, which is where an
+/// operator recovering a node reads which Cat is blocking it (ADR-0028 §5).
 pub(crate) struct AdoptionOutcome {
     /// Cat ids now present in `NodeRuntime::cats`.
     pub adopted: Vec<String>,
@@ -46,8 +45,9 @@ impl NodeRuntime {
     ///
     /// Never fails: an unreadable ledger, a malformed record and a vanished
     /// process are all just Cats that do not get adopted.
-    // See the note on `AdoptionOutcome`.
-    #[allow(dead_code)]
+    ///
+    /// Blocking: probes `/proc`, Unix sockets and directories. `server::spawn`
+    /// calls it before it serves anything or contacts the control plane.
     pub(crate) fn adopt_from_ledger(&self) -> AdoptionOutcome {
         let mut outcome = AdoptionOutcome {
             adopted: Vec::new(),
