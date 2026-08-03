@@ -100,7 +100,7 @@ pub struct ChConfig {
     pub ip_bin: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChNetwork {
     pub tap: String,
     pub mac: String,
