@@ -344,14 +344,15 @@ impl Controller {
     /// the tick pick this Cat up later instead of immediately.
     fn defer_retry(&self, cat: &Cat) -> Duration {
         let mut deferred = self.retry_after.lock().unwrap();
+        let now = std::time::Instant::now();
         let entry = deferred
             .entry(attempt_key(cat))
-            .or_insert((0, std::time::Instant::now()));
+            .or_insert((0, now));
         entry.0 = entry.0.saturating_add(1);
         let delay = RETRY_BACKOFF_BASE
             .saturating_mul(1u32 << entry.0.saturating_sub(1).min(6))
             .min(RETRY_BACKOFF_MAX);
-        entry.1 = std::time::Instant::now() + delay;
+        entry.1 = now + delay;
         delay
     }
 
