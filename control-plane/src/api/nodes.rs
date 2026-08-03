@@ -63,8 +63,9 @@ pub(super) async fn heartbeat(
             .iter()
             .filter(|cat| cat.desired_state != DesiredState::Deleted)
             .collect();
-        let missing: Vec<&&Cat> = required
+        let missing: Vec<&Cat> = required
             .iter()
+            .copied()
             .filter(|cat| {
                 !req.cats
                     .iter()
