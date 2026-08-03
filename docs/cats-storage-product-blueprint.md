@@ -373,7 +373,7 @@ umount → FLUSH → remove-disk；PersistentDisk 回到 Available。
 
 **3. RootDisk 处置**
 
-本文原方案要求完成最后一次远端提交。当前 Direct-S3 实现按 ADR-0024 处理：普通
+本文原方案要求完成最后一次远端提交。当前 Direct-S3 实现按 ADR-0025 处理：普通
 Stop/Cold 仍强制 drain；Cat Destroy 可丢弃随后会 tombstone 的 RootDisk 本地未发布
 journal，但任何 PersistentDisk 仍必须安全 FLUSH + drain。
 

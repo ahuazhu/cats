@@ -5,7 +5,7 @@
 - 修订：取代 ADR-0021 中“5 秒固定丢失窗口”“pack 满后前台/超时内联
   publish”“detach 失败仍释放 lease”以及 Snapshot 不强制同步的部分；
   strict 契约与按盘选择不变。
-- 后续修订：ADR-0024 仅允许 Cat Destroy 丢弃随后会 tombstone 的 RootDisk；
+- 后续修订：ADR-0025 仅允许 Cat Destroy 丢弃随后会 tombstone 的 RootDisk；
   PersistentDisk 与其他生命周期边界仍必须强制 drain。
 
 ## 背景

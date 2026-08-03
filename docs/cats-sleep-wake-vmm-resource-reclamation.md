@@ -408,7 +408,7 @@ Cold 的目标是让 Cat 不再依赖原 Host。进入 Cold 前必须确保远�
 7.  删除 tap、socket、cgroup、memory backing、RAM snapshot 和本地 Secret。
 8.  clean cache 进入立即可淘汰队列。
 
-### Cat Destroy 与普通 Cold 的磁盘处置不同（ADR-0024）
+### Cat Destroy 与普通 Cold 的磁盘处置不同（ADR-0025）
 
 普通 Stop/Cold 会保留 RootDisk 和全部 PersistentDisk，因此仍严格执行上面的
 `remote_generation == local_generation` 门禁。Cat Destroy 会永久删除 RootDisk；Guest/VMM

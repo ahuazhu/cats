@@ -1,4 +1,4 @@
-# ADR-0024：Destroy 可丢弃待删除 RootDisk，PersistentDisk 仍强制 drain
+# ADR-0025：Destroy 可丢弃待删除 RootDisk，PersistentDisk 仍强制 drain
 
 - 状态：Accepted
 - 日期：2026-08-03
@@ -55,4 +55,3 @@ Cat Destroy 的 RootDisk 不同：控制面随后会 tombstone 该卷并异步 G
   Cold 或故障恢复语义。需要保留内容的用户必须先 `cats sync` 并创建独立 Snapshot/
   PersistentDisk，不能把 Destroy 当成可恢复的 Stop。
 - Stop 风暴从节点全串行变为有界并行；吞吐提高，但对象存储和元数据压力仍有硬上限。
-

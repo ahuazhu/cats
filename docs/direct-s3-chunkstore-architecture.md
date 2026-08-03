@@ -516,7 +516,7 @@ Detachflush + release
 | Active | 普通系统盘读写 | Guest 中挂载到 /data 等路径 | NVMe Cache 加速；FLUSH 提交到 S3 + Metadata。 |
 | Cold | Cat 停止但 Volume 保留 | 如果仍 Bound，MountBinding 保留；也可先 Detach | 最终 FLUSH；关闭 backend；删除本地 Cache；远端 Root 不变。 |
 | Wake/Migrate | 新 Host 从最后 Root 启动 | 在新的 Cat/Host 上重新 Attach | 只加载 Root/Leaf；数据按需 GET，不搬迁整个逻辑盘。 |
-| Cat Destroy | 进入 deleting，最终删除；按 ADR-0024 可丢弃该 RootDisk 的本地未发布 journal | 保留；先逐盘 FLUSH + drain 到 `R == L`，失败时保留源 | RootDisk Tombstone 后异步 GC；PersistentDisk 不受影响。 |
+| Cat Destroy | 进入 deleting，最终删除；按 ADR-0025 可丢弃该 RootDisk 的本地未发布 journal | 保留；先逐盘 FLUSH + drain 到 `R == L`，失败时保留源 | RootDisk Tombstone 后异步 GC；PersistentDisk 不受影响。 |
 | Disk Delete | 随 Cat Destroy | 用户显式执行，必须无有效 Attachment | 撤销访问、保留安全期、删除 Volume Prefix 和 Metadata Row。 |
 
 ``` code-block
