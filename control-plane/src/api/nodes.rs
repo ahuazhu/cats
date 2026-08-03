@@ -48,26 +48,67 @@ pub(super) async fn heartbeat(
     }
     let node = state.store.get_node(&req.node_id)?;
     if node.state == NodeState::Lost {
+        // Recovery requires the Host to still hold everything the control plane
+        // believes it holds -- otherwise a Cat may have moved on and recovering
+        // would resurrect a stale claim.
+        //
+        // A Cat being deleted is exempt, because for it absence *is* the
+        // expected end state: the Host reporting it would be the anomaly. Left
+        // in the requirement it deadlocks the pair, since `reconcile_cat`
+        // declines to run any flow -- including the delete -- while the node is
+        // Lost, so the claim can never be settled and the node can never
+        // recover.
         let claims = state.store.cats_on_node(&req.node_id)?;
-        let complete_inventory = claims.iter().all(|cat| {
-            req.cats
-                .iter()
-                .any(|hb| hb.cat_id == cat.id && hb.generation == cat.generation)
-        });
-        if complete_inventory {
+        let required: Vec<&Cat> = claims
+            .iter()
+            .filter(|cat| cat.desired_state != DesiredState::Deleted)
+            .collect();
+        let missing: Vec<&Cat> = required
+            .iter()
+            .copied()
+            .filter(|cat| {
+                !req.cats
+                    .iter()
+                    .any(|hb| hb.cat_id == cat.id && hb.generation == cat.generation)
+            })
+            .collect();
+        if missing.is_empty() {
             if state.store.recover_lost_node(&req.node_id)? {
                 tracing::info!(
                     node = %req.node_id,
-                    claims = claims.len(),
+                    claims = required.len(),
+                    deleting = claims.len() - required.len(),
                     "complete same-generation inventory recovered lost node claims"
                 );
                 state.notify.notify_one();
             }
         } else {
+            // Name what is missing and why. Recovering a fleet needs to know
+            // which claim blocks it, and whether the Host omitted the Cat
+            // entirely or reported a different generation.
+            let detail = missing
+                .iter()
+                .map(|cat| {
+                    let reported_generation = req
+                        .cats
+                        .iter()
+                        .find(|hb| hb.cat_id == cat.id)
+                        .map(|hb| hb.generation);
+                    match reported_generation {
+                        Some(generation) => format!(
+                            "{} ({}) generation {} != claimed {}",
+                            cat.id, cat.name, generation, cat.generation
+                        ),
+                        None => format!("{} ({}) not reported", cat.id, cat.name),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
             tracing::warn!(
                 node = %req.node_id,
-                claims = claims.len(),
+                claims = required.len(),
                 reported = req.cats.len(),
+                blocked_by = %detail,
                 "lost node heartbeat omitted a preserved claim; keeping node lost"
             );
         }

@@ -20,7 +20,7 @@
    - **Warm** = snapshot + VMM/backend exit（即实验报告的 WARM_SNAPSHOT）。Guest 进程状态保存在本地 NVMe 的 VM snapshot 中；无常驻 VMM/后端进程（专属 runtime RSS = 0）；唤醒 = 重建 tap/blockd + 新 VMM userfaultfd on-demand restore + resume。
    - **Cold** = 无任何本地依赖，仅剩远端磁盘与控制面记录；任意 Host fresh boot。
 2. 旧文档中的“浅层 Warm / 深层 Warm”不再使用；“Hibernate”仅指未来的跨 Host 快照恢复能力。
-3. Suspended 与 Warm 都绑定原 Host（backing 与快照均在本地 NVMe），都不是跨 Host 持久状态；Host 永久丢失时两者一律按 Cold Recovery 处理。心跳超时只证明 Host 当前不可达，不证明它已经停止执行：此时保留 placement 与 attachment epoch；只有外部电源关闭/隔离已经确认后，显式 fencing 才能撤销旧 epoch 并进入 Cold Recovery。Lost Node 只有在一次心跳完整报告全部保留 claim、且每个 Cat generation 都匹配后才能恢复；重新注册或不完整 inventory 不能把它变为 Ready。Cold start 只有在撤销旧 epoch 后才能持久化 `Starting`；`Starting` 之后控制面崩溃或 StartCat 回包丢失都只能在同一 Node 重放同一幂等 Job，不得再次撤销 epoch 或改投另一 Node。
+3. Suspended 与 Warm 都绑定原 Host（backing 与快照均在本地 NVMe），都不是跨 Host 持久状态；Host 永久丢失时两者一律按 Cold Recovery 处理。心跳超时只证明 Host 当前不可达，不证明它已经停止执行：此时保留 placement 与 attachment epoch；只有外部电源关闭/隔离已经确认后，显式 fencing 才能撤销旧 epoch 并进入 Cold Recovery。Lost Node 只有在一次心跳完整报告全部保留 claim、且每个 Cat generation 都匹配后才能恢复；重新注册或不完整 inventory 不能把它变为 Ready（判定范围经 ADR-0027 收窄为 `desired_state != Deleted` 的 claim：正在删除的 Cat 不再被 Host 上报正是删除成功的证据，把它算进来会与删除流程互相死锁）。Cold start 只有在撤销旧 epoch 后才能持久化 `Starting`；`Starting` 之后控制面崩溃或 StartCat 回包丢失都只能在同一 Node 重放同一幂等 Job，不得再次撤销 epoch 或改投另一 Node。
 4. 自动分层默认沿 Running → Suspended → Warm → Cold 单向降级；唤醒总是回到 Running。允许策略跳级（如直接 Running → Cold），不允许 Cold 向 Warm/Suspended“回填”。
 5. 进入 Suspended/Warm 之前必须确认磁盘 durable generation（FLUSH 完成，或使用暂停前记录值）；进入 Warm 前 Dirty/Pending Commit 必须为零。
 6. Warm 约束：
