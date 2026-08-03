@@ -52,6 +52,13 @@ locals {
   )
 }
 
+check "oci_deploy_sync_wait_fits_under_the_edge" {
+  assert {
+    condition     = var.oci_deploy_sync_wait_ms < var.public_ingress_idle_timeout_seconds * 1000
+    error_message = "oci_deploy_sync_wait_ms must be below the ALB idle timeout, or the ALB answers 504 before the control plane can answer 202."
+  }
+}
+
 check "usage_delivery_configuration" {
   assert {
     condition = var.usage_delivery_adapter != "aws-kinesis" || alltrue([
@@ -261,6 +268,11 @@ resource "kubernetes_deployment_v1" "control_plane" {
           env {
             name  = "CATS_AUTO_COLD_AFTER_SECONDS"
             value = tostring(var.auto_cold_after_seconds)
+          }
+
+          env {
+            name  = "CATS_OCI_DEPLOY_SYNC_WAIT_MS"
+            value = tostring(var.oci_deploy_sync_wait_ms)
           }
 
           env_from {
@@ -570,6 +582,9 @@ resource "kubernetes_ingress_v1" "public" {
     annotations = {
       "alb.ingress.kubernetes.io/healthcheck-path" = "/healthz"
       "alb.ingress.kubernetes.io/ssl-redirect"     = "443"
+      # Without this the ALB keeps the AWS default of 60 s and cuts off longer
+      # requests with a 504 that misreports work which is still running.
+      "alb.ingress.kubernetes.io/load-balancer-attributes" = "idle_timeout.timeout_seconds=${var.public_ingress_idle_timeout_seconds}"
     }
   }
 

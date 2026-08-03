@@ -13,6 +13,7 @@ pub const MOUNT_PREFIX: &str = "mnt_";
 pub const OPERATION_PREFIX: &str = "op_";
 pub const NODE_PREFIX: &str = "node_";
 pub const ENDPOINT_PREFIX: &str = "ep_";
+pub const OCI_DEPLOYMENT_PREFIX: &str = "ocid_";
 pub const SNAPSHOT_PREFIX: &str = "snap_";
 pub const JOB_PREFIX: &str = "job_";
 pub const SESSION_PREFIX: &str = "sess_";

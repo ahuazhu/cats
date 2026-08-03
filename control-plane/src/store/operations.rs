@@ -93,6 +93,50 @@ impl Store {
         })
     }
 
+    /// Move a freshly created operation to `Running`.
+    ///
+    /// Lets a poller tell "accepted, not started" from "in flight", which for a
+    /// deploy is the difference between waiting on a queue and waiting on a
+    /// registry transfer. A terminal operation is left alone.
+    pub fn start_operation(&self, op_id: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE operations SET phase='running', updated_at=?2
+                  WHERE id=?1 AND phase='pending'",
+                params![op_id, now_unix()],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// `finish_operation`, inside a caller's transaction.
+    ///
+    /// Lets a resource's terminal state and its operation's terminal phase
+    /// commit together, so a crash between them cannot leave a finished piece
+    /// of work behind an operation that never resolves.
+    pub(super) fn finish_operation_in(
+        tx: &rusqlite::Transaction<'_>,
+        op_id: &str,
+        error: Option<&ErrorBody>,
+    ) -> Result<()> {
+        let phase = if error.is_some() {
+            "failed"
+        } else {
+            "succeeded"
+        };
+        let err_json = error
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(internal)?;
+        tx.execute(
+            "UPDATE operations SET phase=?2, error_json=?3, updated_at=?4
+              WHERE id=?1 AND phase IN ('pending','running')",
+            params![op_id, phase, err_json, now_unix()],
+        )
+        .map_err(internal)
+        .map(|_| ())
+    }
+
     pub fn finish_operation(&self, op_id: &str, error: Option<&ErrorBody>) -> Result<()> {
         let phase = if error.is_some() {
             "failed"

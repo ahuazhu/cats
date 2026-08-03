@@ -537,6 +537,7 @@ impl Ctx {
             billing_enforcement_enabled: false,
             node_lease_timeout_ms: 3_000,
             reconcile_interval_ms: 200,
+            oci_deploy_sync_wait_ms: 5_000,
             auto_tier_policy: Default::default(),
         })
         .await

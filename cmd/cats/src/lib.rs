@@ -408,6 +408,15 @@ impl Client {
     }
 
     fn send(&self, req: reqwest::blocking::RequestBuilder) -> Result<serde_json::Value> {
+        self.send_with_status(req).map(|(_, value)| value)
+    }
+
+    /// `send`, keeping the status so a caller can tell `200` (the work is done)
+    /// from `202` (it is still running and named by an operation).
+    fn send_with_status(
+        &self,
+        req: reqwest::blocking::RequestBuilder,
+    ) -> Result<(reqwest::StatusCode, serde_json::Value)> {
         let resp = req
             .bearer_auth(&self.token)
             .send()
@@ -422,9 +431,10 @@ impl Client {
             bail!("HTTP {status}: {text}");
         }
         if text.is_empty() {
-            Ok(serde_json::Value::Null)
+            Ok((status, serde_json::Value::Null))
         } else {
-            serde_json::from_str(&text).context("malformed response")
+            let value = serde_json::from_str(&text).context("malformed response")?;
+            Ok((status, value))
         }
     }
 
@@ -889,14 +899,22 @@ pub fn run(cli: Cli) -> Result<()> {
                 env,
                 registry_auth,
             };
-            let value = client.send(
+            let (status, value) = client.send_with_status(
                 client
                     .http
                     .post(client.url(&format!("/cats/{name}/oci-deployments")))
                     .timeout(Duration::from_secs(3_615))
                     .json(&body),
             )?;
-            let deployment: OciDeployment = serde_json::from_value(value)?;
+            // A deploy long enough to outrun the control plane's synchronous
+            // wait is named by an operation instead of being answered inline.
+            // Both are successes; follow the operation and read the result.
+            let deployment: OciDeployment = if status == reqwest::StatusCode::ACCEPTED {
+                let accepted: OciDeploymentOperationResponse = serde_json::from_value(value)?;
+                follow_oci_deployment(&client, &accepted.operation.id, name, app)?
+            } else {
+                serde_json::from_value(value)?
+            };
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&deployment)?);
             } else {
@@ -1075,6 +1093,49 @@ pub fn run(cli: Cli) -> Result<()> {
         },
         Command::Admin { cmd } => run_admin(&client, &cli, cmd),
     }
+}
+
+/// Follow an accepted OCI deployment to its outcome.
+///
+/// Polls the operation, then reads the deployment back. The deploy is durable
+/// and keyed on `(cat, app, digest)`, so interrupting this wait loses only the
+/// waiting: re-running the same deploy replays the result rather than
+/// redeploying.
+fn follow_oci_deployment(
+    client: &Client,
+    operation_id: &str,
+    cat: &str,
+    app: &str,
+) -> Result<OciDeployment> {
+    loop {
+        let operation: Operation = serde_json::from_value(
+            client.send(
+                client
+                    .http
+                    .get(format!("{}/v1/operations/{operation_id}", client.base)),
+            )?,
+        )?;
+        match operation.phase {
+            OperationPhase::Succeeded => break,
+            OperationPhase::Failed => {
+                let message = operation
+                    .error
+                    .map(|error| error.message)
+                    .unwrap_or_else(|| "deployment failed".to_string());
+                bail!("{message}");
+            }
+            OperationPhase::Pending | OperationPhase::Running => {
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        }
+    }
+    let listed: ListResponse<OciDeployment> =
+        serde_json::from_value(client.get(&format!("/cats/{cat}/oci-deployments"))?)?;
+    listed
+        .items
+        .into_iter()
+        .find(|deployment| deployment.app == app)
+        .with_context(|| format!("deployment of {app} succeeded but is not listed"))
 }
 
 fn read_exec_env_file(

@@ -10,6 +10,7 @@ mod cats;
 mod disks;
 mod endpoints;
 mod nodes;
+mod oci;
 mod operations;
 mod rows;
 mod schema;
@@ -18,12 +19,14 @@ mod work;
 #[cfg(test)]
 mod tests;
 
+pub use oci::{OciDeploymentClaim, OCI_DEPLOY_OPERATION_KIND};
 pub use rows::{parse_desired, parse_observed, parse_wake};
+pub use work::WorkLeaseGuard;
 
 use rows::{
     desired_str, disk_state_str, node_state_str, observed_str, row_to_account, row_to_cat,
-    row_to_disk, row_to_endpoint, row_to_node, row_to_operation, row_to_work_lease,
-    row_to_workspace, summarize_node, wake_str, work_kind_str,
+    row_to_disk, row_to_endpoint, row_to_node, row_to_oci_deployment, row_to_operation,
+    row_to_work_lease, row_to_workspace, summarize_node, wake_str, work_kind_str,
 };
 
 #[cfg(test)]
@@ -31,7 +34,7 @@ use schema::SCHEMA_VERSION;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -40,6 +43,7 @@ use uuid::Uuid;
 use cats_api::auth::{Account, AccountInvitation, AccountKind, Workspace};
 use cats_api::error::{ApiError, ErrorBody, ErrorCode};
 use cats_api::ids;
+use cats_api::oci::OciDeployment;
 use cats_api::requests::WorkspaceToken;
 use cats_api::resources::*;
 

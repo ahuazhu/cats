@@ -53,6 +53,13 @@ struct StubNode {
     started_volume_epochs: Arc<Mutex<Vec<(String, String, i64)>>>,
     storage_meta: Arc<dyn MetadataStore>,
     stop_dispositions: Arc<Mutex<Vec<StopCatDisposition>>>,
+    /// Every OCI deploy that reached this node, as `(cat, app, image)`. The
+    /// count is the assertion that matters: a retried or duplicated request
+    /// must not produce a second pull, flatten and service restart.
+    oci_deploys: Arc<Mutex<Vec<(String, String, String)>>>,
+    /// Makes one deploy take longer than the caller's synchronous wait.
+    oci_deploy_delay: Arc<Mutex<Duration>>,
+    oci_deploy_failures_remaining: Arc<AtomicUsize>,
 }
 
 impl StubNode {
@@ -181,6 +188,45 @@ async fn stub_exec(State(node): State<StubNode>, Json(req): Json<ExecRequest>) -
     .into_response()
 }
 
+/// Stand in for the Guest-side pull, flatten and activation.
+///
+/// The delay models the part that outran the 60 s edge timeout in production.
+/// The request is answered on its own task-local delay rather than a shared
+/// lock so a genuinely concurrent second request would be observable in
+/// `oci_deploys` rather than serialised behind the first.
+async fn stub_deploy_oci(
+    State(node): State<StubNode>,
+    axum::extract::Path(cat_id): axum::extract::Path<String>,
+    Json(req): Json<cats_api::oci::DeployOciRequest>,
+) -> Response {
+    node.oci_deploys
+        .lock()
+        .unwrap()
+        .push((cat_id, req.app.clone(), req.image.clone()));
+    let delay = *node.oci_deploy_delay.lock().unwrap();
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+    if node
+        .oci_deploy_failures_remaining
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, "injected registry failure").into_response();
+    }
+    let digest = cats_api::oci::pinned_digest(&req.image).expect("test images are digest-pinned");
+    Json(cats_api::oci::OciDeployment {
+        app: req.app.clone(),
+        image_digest: digest.to_string(),
+        manifest_digest: digest.to_string(),
+        service: format!("cats-oci-{}.service", req.app),
+        active: true,
+    })
+    .into_response()
+}
+
 async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
     let node = StubNode {
         id: id.to_string(),
@@ -195,10 +241,14 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
         started_volume_epochs: Arc::new(Mutex::new(Vec::new())),
         storage_meta: cp.state.storage_meta.clone(),
         stop_dispositions: Arc::new(Mutex::new(Vec::new())),
+        oci_deploys: Arc::new(Mutex::new(Vec::new())),
+        oci_deploy_delay: Arc::new(Mutex::new(Duration::ZERO)),
+        oci_deploy_failures_remaining: Arc::new(AtomicUsize::new(0)),
     };
     let app = Router::new()
         .route("/v1/jobs", post(stub_job))
         .route("/v1/cats/{id}/exec", post(stub_exec))
+        .route("/v1/cats/{id}/oci-deployments", post(stub_deploy_oci))
         .with_state(node.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -338,6 +388,7 @@ impl Ctx {
             billing_enforcement_enabled: true,
             node_lease_timeout_ms: 3_000,
             reconcile_interval_ms,
+            oci_deploy_sync_wait_ms: 5_000,
             auto_tier_policy,
         })
         .await
@@ -1525,6 +1576,7 @@ async fn control_plane_startup_grace_preserves_a_reconnecting_host_bound_cat() {
         billing_enforcement_enabled: false,
         node_lease_timeout_ms: 2_000,
         reconcile_interval_ms: 10,
+        oci_deploy_sync_wait_ms: 5_000,
         auto_tier_policy: Default::default(),
     })
     .await
@@ -1744,6 +1796,7 @@ async fn static_user_tokens_are_not_accepted() {
         billing_enforcement_enabled: false,
         node_lease_timeout_ms: 3_000,
         reconcile_interval_ms: 200,
+        oci_deploy_sync_wait_ms: 5_000,
         auto_tier_policy: Default::default(),
     };
     let cp = spawn(cfg).await.unwrap();
@@ -2455,4 +2508,443 @@ async fn admin_can_monitor_and_drain_nodes() {
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// OCI deployments: a deploy outlives its request
+//
+// Production reached Cats through an ALB whose 60 s idle timeout answered 504
+// while the deploy kept running and succeeded. The caller read 504 as a
+// transient failure and retried, which restarted a service that had just come
+// up. These tests pin the contract that replaced that: the deploy is owned by a
+// record keyed on (cat, app, digest), a caller that goes away neither cancels
+// nor loses it, and no retry or duplicate produces a second execution.
+// ---------------------------------------------------------------------------
+
+const TEST_DIGEST: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+const OTHER_DIGEST: &str =
+    "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+fn test_image(digest: &str) -> String {
+    format!("registry.test/acme/app@{digest}")
+}
+
+impl Ctx {
+    /// POST a deploy, returning the status and body without interpreting them.
+    async fn deploy_oci_raw(
+        &self,
+        name: &str,
+        app: &str,
+        digest: &str,
+        wait_ms: Option<u64>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut url = self.ws_url(&format!("/cats/{name}/oci-deployments"));
+        if let Some(wait_ms) = wait_ms {
+            url.push_str(&format!("?wait_ms={wait_ms}"));
+        }
+        let resp = self
+            .http
+            .post(url)
+            .bearer_auth("dev-admin-token")
+            .json(&serde_json::json!({ "app": app, "image": test_image(digest) }))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, resp.json().await.unwrap())
+    }
+
+    /// A running Cat on a stub node, ready to receive deployments.
+    async fn running_cat_on_node(&self, name: &str) -> StubNode {
+        let node = start_stub_node(&self.cp, "node_a").await;
+        self.create_cat(name, None).await;
+        self.wait_observed(name, ObservedState::Running).await;
+        node
+    }
+
+    fn live_control_leases(&self, cat_id: &str) -> usize {
+        self.cp
+            .state
+            .store
+            .work_status(cat_id, 3_000)
+            .unwrap()
+            .leases
+            .iter()
+            .filter(|lease| lease.kind == WorkKind::Control)
+            .count()
+    }
+}
+
+/// A deploy slower than the caller's wait answers 202, and the operation it
+/// hands back reaches Succeeded on its own with the deployment attached.
+#[tokio::test]
+async fn an_oci_deploy_slower_than_the_wait_answers_an_operation_and_finishes_anyway() {
+    let ctx = Ctx::new().await;
+    let node = ctx.running_cat_on_node("slow").await;
+    // Longer than the 200 ms wait this request asks for, so the answer has to
+    // be an operation -- the case that used to become a 504.
+    *node.oci_deploy_delay.lock().unwrap() = Duration::from_millis(1_500);
+
+    let (status, body) = ctx
+        .deploy_oci_raw("slow", "server", TEST_DIGEST, Some(200))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "a deploy that outruns the wait must be accepted, not failed: {body}"
+    );
+    let response: OciDeploymentOperationResponse = serde_json::from_value(body).unwrap();
+    assert!(
+        response.deployment.is_none(),
+        "the deployment is not available yet"
+    );
+    assert_eq!(response.operation.kind, "cat.oci-deploy");
+
+    let finished = ctx.wait_operation(&response.operation.id).await;
+    assert_eq!(
+        finished.phase,
+        OperationPhase::Succeeded,
+        "the deploy kept running after the response: {:?}",
+        finished.error
+    );
+    assert_eq!(
+        node.oci_deploys.lock().unwrap().len(),
+        1,
+        "answering 202 must not re-dispatch the deploy"
+    );
+}
+
+/// The production sequence: the first request's answer is lost, the deploy
+/// succeeds in the background, and the retry must return that same deployment
+/// without touching the Guest again.
+#[tokio::test]
+async fn retrying_after_a_lost_answer_replays_the_deployment_instead_of_redeploying() {
+    let ctx = Ctx::new().await;
+    let node = ctx.running_cat_on_node("retry").await;
+    *node.oci_deploy_delay.lock().unwrap() = Duration::from_millis(1_000);
+
+    // First request gives up waiting, exactly as the ALB made the caller do.
+    let (status, body) = ctx
+        .deploy_oci_raw("retry", "server", TEST_DIGEST, Some(0))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let accepted: OciDeploymentOperationResponse = serde_json::from_value(body).unwrap();
+    let finished = ctx.wait_operation(&accepted.operation.id).await;
+    assert_eq!(finished.phase, OperationPhase::Succeeded);
+
+    // The retry the caller would have sent on seeing 504.
+    let (status, body) = ctx
+        .deploy_oci_raw("retry", "server", TEST_DIGEST, None)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a completed deploy replays synchronously: {body}"
+    );
+    let replayed: cats_api::oci::OciDeployment = serde_json::from_value(body).unwrap();
+    assert_eq!(replayed.image_digest, TEST_DIGEST);
+    assert_eq!(replayed.service, "cats-oci-server.service");
+    assert_eq!(
+        node.oci_deploys.lock().unwrap().len(),
+        1,
+        "the retry must not pull, flatten or restart a second time"
+    );
+}
+
+/// Two identical requests in flight together must produce one execution.
+#[tokio::test]
+async fn concurrent_identical_oci_deploys_execute_once() {
+    let ctx = Ctx::new().await;
+    let node = ctx.running_cat_on_node("concurrent").await;
+    *node.oci_deploy_delay.lock().unwrap() = Duration::from_millis(700);
+
+    let (first, second) = tokio::join!(
+        ctx.deploy_oci_raw("concurrent", "server", TEST_DIGEST, None),
+        ctx.deploy_oci_raw("concurrent", "server", TEST_DIGEST, None),
+    );
+    for (status, body) in [&first, &second] {
+        assert_eq!(
+            *status,
+            StatusCode::OK,
+            "both callers get the result: {body}"
+        );
+        let deployment: cats_api::oci::OciDeployment =
+            serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(deployment.image_digest, TEST_DIGEST);
+    }
+    assert_eq!(
+        node.oci_deploys.lock().unwrap().len(),
+        1,
+        "the second request must join the first, not start its own deploy"
+    );
+}
+
+/// A different digest for the same app is a different deployment and must run.
+#[tokio::test]
+async fn a_new_digest_for_the_same_app_is_a_new_deployment() {
+    let ctx = Ctx::new().await;
+    let node = ctx.running_cat_on_node("redeploy").await;
+
+    let (first, _) = ctx
+        .deploy_oci_raw("redeploy", "server", TEST_DIGEST, None)
+        .await;
+    assert_eq!(first, StatusCode::OK);
+    let (second, body) = ctx
+        .deploy_oci_raw("redeploy", "server", OTHER_DIGEST, None)
+        .await;
+    assert_eq!(second, StatusCode::OK);
+    let deployment: cats_api::oci::OciDeployment = serde_json::from_value(body).unwrap();
+    assert_eq!(deployment.image_digest, OTHER_DIGEST);
+    assert_eq!(
+        node.oci_deploys.lock().unwrap().len(),
+        2,
+        "idempotency is keyed on the digest, so new bytes must be deployed"
+    );
+}
+
+/// A failed deploy is reported as failed, and retrying the same digest is
+/// allowed to make progress rather than replaying the failure forever.
+#[tokio::test]
+async fn a_failed_oci_deploy_can_be_retried_on_the_same_digest() {
+    let ctx = Ctx::new().await;
+    let node = ctx.running_cat_on_node("recover").await;
+    node.oci_deploy_failures_remaining
+        .store(1, Ordering::SeqCst);
+
+    let (status, body) = ctx
+        .deploy_oci_raw("recover", "server", TEST_DIGEST, None)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a failed deploy must not read as success: {body}"
+    );
+
+    let (status, body) = ctx
+        .deploy_oci_raw("recover", "server", TEST_DIGEST, None)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the same digest must be retryable after a failure: {body}"
+    );
+    let deployment: cats_api::oci::OciDeployment = serde_json::from_value(body).unwrap();
+    assert_eq!(deployment.image_digest, TEST_DIGEST);
+    assert_eq!(node.oci_deploys.lock().unwrap().len(), 2);
+}
+
+/// Deploying into a Cat that has gone Warm wakes it first, and the deployment
+/// that follows is a normal one.
+#[tokio::test]
+async fn deploying_into_a_warm_cat_wakes_it_first() {
+    let ctx = Ctx::new().await;
+    let node = ctx.running_cat_on_node("warm").await;
+    ctx.action("warm", "warm").await;
+    ctx.wait_observed("warm", ObservedState::Warm).await;
+
+    let (status, body) = ctx
+        .deploy_oci_raw("warm", "server", TEST_DIGEST, None)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a warm redeploy must wake and deploy: {body}"
+    );
+    let deployment: cats_api::oci::OciDeployment = serde_json::from_value(body).unwrap();
+    assert_eq!(deployment.image_digest, TEST_DIGEST);
+    assert_eq!(node.oci_deploys.lock().unwrap().len(), 1);
+    assert_eq!(
+        ctx.wait_observed("warm", ObservedState::Running)
+            .await
+            .observed_state,
+        ObservedState::Running
+    );
+}
+
+/// The work lease must not outlive the deploy it protects.
+///
+/// It used to be released by a call placed after the awaited work, so a
+/// cancelled request skipped it and left a one-hour lease pinning the Cat out
+/// of auto-suspend. Answering 202 exercises the same path: the request ends
+/// while the deploy continues, and the lease must be gone once it finishes.
+#[tokio::test]
+async fn a_deploy_that_answers_early_still_releases_its_work_lease() {
+    let ctx = Ctx::new().await;
+    let node = ctx.running_cat_on_node("lease").await;
+    *node.oci_deploy_delay.lock().unwrap() = Duration::from_millis(800);
+
+    let cat_id = ctx
+        .cp
+        .state
+        .store
+        .get_cat(&ctx.workspace_id, "lease")
+        .unwrap()
+        .id;
+
+    let (status, body) = ctx
+        .deploy_oci_raw("lease", "server", TEST_DIGEST, Some(0))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let accepted: OciDeploymentOperationResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(
+        ctx.live_control_leases(&cat_id),
+        1,
+        "the lease must still be held while the deploy runs"
+    );
+
+    ctx.wait_operation(&accepted.operation.id).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while ctx.live_control_leases(&cat_id) > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the deploy finished but its work lease leaked"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// An image without a digest cannot be given an identity, so it must be
+/// rejected before any work or record is created.
+#[tokio::test]
+async fn an_oci_deploy_without_a_pinned_digest_is_rejected() {
+    let ctx = Ctx::new().await;
+    let node = ctx.running_cat_on_node("unpinned").await;
+
+    let resp = ctx
+        .http
+        .post(ctx.ws_url("/cats/unpinned/oci-deployments"))
+        .bearer_auth("dev-admin-token")
+        .json(&serde_json::json!({
+            "app": "server",
+            "image": "registry.test/acme/app:latest"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(node.oci_deploys.lock().unwrap().is_empty());
+}
+
+/// A deploy interrupted by a restart cannot be resumed, because the pull
+/// credentials it needs are deliberately never persisted. It must be reported
+/// as failed rather than left pending forever, and its identity must be free
+/// for a retry.
+#[tokio::test]
+async fn an_interrupted_oci_deploy_is_failed_at_startup_rather_than_left_pending() {
+    let ctx = Ctx::new().await;
+    let node = ctx.running_cat_on_node("interrupted").await;
+    *node.oci_deploy_delay.lock().unwrap() = Duration::from_secs(30);
+
+    let (status, body) = ctx
+        .deploy_oci_raw("interrupted", "server", TEST_DIGEST, Some(0))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let accepted: OciDeploymentOperationResponse = serde_json::from_value(body).unwrap();
+
+    // Stand in for the process dying with the deploy in flight.
+    let converged = ctx
+        .cp
+        .state
+        .store
+        .fail_interrupted_oci_deployments()
+        .unwrap();
+    assert_eq!(converged, 1);
+
+    let operation = ctx
+        .cp
+        .state
+        .store
+        .get_operation(&accepted.operation.id)
+        .unwrap();
+    assert_eq!(
+        operation.phase,
+        OperationPhase::Failed,
+        "an unresumable deploy must resolve, not hang"
+    );
+    assert!(operation
+        .error
+        .expect("a failed operation carries its error")
+        .message
+        .contains("retry the deploy"));
+}
+
+/// A Cat runs one version of an app, so listing its deployments must answer
+/// with one row per app -- the one actually activated.
+#[tokio::test]
+async fn listing_deployments_reports_only_the_current_digest_for_an_app() {
+    let ctx = Ctx::new().await;
+    let _node = ctx.running_cat_on_node("listed").await;
+
+    ctx.deploy_oci_raw("listed", "server", TEST_DIGEST, None)
+        .await;
+    ctx.deploy_oci_raw("listed", "server", OTHER_DIGEST, None)
+        .await;
+
+    let listed: ListResponse<cats_api::oci::OciDeployment> = ctx
+        .http
+        .get(ctx.ws_url("/cats/listed/oci-deployments"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let for_app: Vec<_> = listed
+        .items
+        .iter()
+        .filter(|deployment| deployment.app == "server")
+        .collect();
+    assert_eq!(
+        for_app.len(),
+        1,
+        "one app runs one image; superseded records must not be listed: {:?}",
+        listed.items
+    );
+    assert_eq!(
+        for_app[0].image_digest, OTHER_DIGEST,
+        "the listed digest must be the one that was activated last"
+    );
+}
+
+/// Rolling back to a digest that has since been superseded must actually
+/// redeploy it. Replaying the old record would report success while the Cat
+/// keeps running the newer image.
+#[tokio::test]
+async fn redeploying_a_superseded_digest_activates_it_again() {
+    let ctx = Ctx::new().await;
+    let node = ctx.running_cat_on_node("rollback").await;
+
+    ctx.deploy_oci_raw("rollback", "server", TEST_DIGEST, None)
+        .await;
+    ctx.deploy_oci_raw("rollback", "server", OTHER_DIGEST, None)
+        .await;
+    let (status, body) = ctx
+        .deploy_oci_raw("rollback", "server", TEST_DIGEST, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(
+        node.oci_deploys.lock().unwrap().len(),
+        3,
+        "a superseded digest is no longer deployed, so re-requesting it must \
+         reach the Guest instead of replaying a stale record"
+    );
+    let listed: ListResponse<cats_api::oci::OciDeployment> = ctx
+        .http
+        .get(ctx.ws_url("/cats/rollback/oci-deployments"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let for_app: Vec<_> = listed
+        .items
+        .iter()
+        .filter(|deployment| deployment.app == "server")
+        .collect();
+    assert_eq!(for_app.len(), 1);
+    assert_eq!(for_app[0].image_digest, TEST_DIGEST);
 }

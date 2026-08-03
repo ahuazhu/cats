@@ -233,6 +233,26 @@ pub(super) fn row_to_operation(r: &rusqlite::Row<'_>) -> rusqlite::Result<Operat
     })
 }
 
+/// `None` while the deployment has not succeeded: a running or failed record
+/// has no manifest digest or service name yet, and inventing one would let a
+/// caller read an unfinished deploy as a result.
+pub(super) fn row_to_oci_deployment(
+    r: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Option<OciDeployment>> {
+    let manifest_digest: Option<String> = r.get("manifest_digest")?;
+    let service: Option<String> = r.get("service")?;
+    let (Some(manifest_digest), Some(service)) = (manifest_digest, service) else {
+        return Ok(None);
+    };
+    Ok(Some(OciDeployment {
+        app: r.get("app")?,
+        image_digest: r.get("image_digest")?,
+        manifest_digest,
+        service,
+        active: r.get::<_, i64>("active")? != 0,
+    }))
+}
+
 pub(super) fn row_to_endpoint(r: &rusqlite::Row<'_>) -> rusqlite::Result<Endpoint> {
     Ok(Endpoint {
         id: r.get("id")?,

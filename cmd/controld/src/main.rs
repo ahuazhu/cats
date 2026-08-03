@@ -172,6 +172,15 @@ struct Args {
     /// Zero disables this automatic boundary.
     #[arg(long, env = "CATS_AUTO_COLD_AFTER_SECONDS", default_value_t = 86_400)]
     auto_cold_after_seconds: u64,
+    /// Milliseconds an OCI deploy may hold its request open before answering
+    /// `202` with an operation to poll. Must stay below the idle timeout of the
+    /// proxy in front of Cats, or that proxy answers 504 first.
+    #[arg(
+        long,
+        env = "CATS_OCI_DEPLOY_SYNC_WAIT_MS",
+        default_value_t = cats_control_plane::server::DEFAULT_OCI_DEPLOY_SYNC_WAIT_MS
+    )]
+    oci_deploy_sync_wait_ms: u64,
 }
 
 fn threshold_ms(seconds: u64, name: &str) -> anyhow::Result<Option<i64>> {
@@ -404,6 +413,7 @@ async fn main() -> anyhow::Result<()> {
             warm_after_ms: threshold_ms(args.auto_warm_after_seconds, "automatic Warm")?,
             cold_after_ms: threshold_ms(args.auto_cold_after_seconds, "automatic Cold")?,
         },
+        oci_deploy_sync_wait_ms: args.oci_deploy_sync_wait_ms,
     })
     .await?;
     println!("READY {}", handle.addr);

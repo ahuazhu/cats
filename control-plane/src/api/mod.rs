@@ -38,6 +38,7 @@ use cats_metering::{
 };
 
 use crate::server::AppState;
+use crate::store::OciDeploymentClaim;
 
 mod accounts;
 mod billing;
@@ -424,7 +425,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/workspaces/{workspace}/cats/{cat}/exec", post(exec_cat))
         .route(
             "/v1/workspaces/{workspace}/cats/{cat}/oci-deployments",
-            post(deploy_oci),
+            post(deploy_oci).get(list_oci_deployments),
         )
         .route(
             "/v1/workspaces/{workspace}/cats/{cat}/shell",
@@ -644,6 +645,7 @@ GET /v1/workspaces/{workspace}/cats/{cat}
 GET /v1/workspaces/{workspace}/cats/{cat}/auto-suspend
 GET /v1/workspaces/{workspace}/cats/{cat}/endpoints
 GET /v1/workspaces/{workspace}/cats/{cat}/expiry
+GET /v1/workspaces/{workspace}/cats/{cat}/oci-deployments
 GET /v1/workspaces/{workspace}/cats/{cat}/shell
 GET /v1/workspaces/{workspace}/cats/{cat}/work
 GET /v1/workspaces/{workspace}/disks

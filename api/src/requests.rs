@@ -276,6 +276,19 @@ pub struct DiskOperationResponse {
     pub disk: Disk,
 }
 
+/// `202 Accepted` body for an OCI deployment that outran the synchronous wait.
+///
+/// A deploy that finishes inside the wait answers `200` with a bare
+/// [`crate::oci::OciDeployment`] instead, so a caller that predates operations
+/// keeps working. `deployment` is populated once the operation reaches
+/// `Succeeded`, which lets one poll carry both the phase and the result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OciDeploymentOperationResponse {
+    pub operation: Operation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<crate::oci::OciDeployment>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointResponse {
     pub endpoint: Endpoint,

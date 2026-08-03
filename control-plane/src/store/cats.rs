@@ -405,6 +405,10 @@ impl Store {
             )?;
             c.execute("DELETE FROM endpoints WHERE cat_id=?1", params![cat_id])?;
             c.execute("DELETE FROM routes WHERE cat_id=?1", params![cat_id])?;
+            c.execute(
+                "DELETE FROM oci_deployments WHERE cat_id=?1",
+                params![cat_id],
+            )?;
             c.execute("DELETE FROM cats WHERE id=?1", params![cat_id])
                 .map(|_| ())
         })

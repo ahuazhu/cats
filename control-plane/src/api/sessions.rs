@@ -18,9 +18,13 @@ pub(super) async fn exec_cat(
     // failure. Note the Guest agent does not enforce it: a runaway command keeps
     // running there until the Cat is stopped.
     let ttl_ms = req.timeout_ms.unwrap_or(120_000).clamp(1_000, 3_600_000);
-    let lease = state
-        .store
-        .acquire_work(&cat.id, WorkKind::Exec, &owner, "exec", ttl_ms)?;
+    // Guarded because an exec can outlive its caller too: an intermediary idle
+    // timeout drops this future, and a release call placed after the awaited
+    // work would never run, leaking the lease for its whole TTL.
+    let _lease =
+        state
+            .store
+            .acquire_work_guarded(&cat.id, WorkKind::Exec, &owner, "exec", ttl_ms)?;
     let result: ApiResult<ExecResponse> = async {
         let mut cat = cat;
         let mut retried_suspend_conflict = false;
@@ -79,79 +83,280 @@ pub(super) async fn exec_cat(
         }
     }
     .await;
-    let _ = state.store.release_work(&lease.id);
+    drop(_lease);
     let _ = state.controller.maybe_auto_suspend(&cat_id);
     result.map(Json)
 }
 
-pub(super) async fn deploy_oci(
+/// How often the handler re-reads the operation it is waiting on. A deploy runs
+/// for tens of seconds at least, so this only bounds the reply's latency.
+const OCI_DEPLOY_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// The applications currently deployed in a Cat.
+///
+/// This is how a caller that received `202` collects the result: poll the
+/// operation until it is terminal, then read the deployment here. Re-sending
+/// the original request works too -- it replays -- but a read should not have
+/// to be a write.
+pub(super) async fn list_oci_deployments(
     State(state): State<AppState>,
     Path((workspace, cat)): Path<(String, String)>,
     headers: HeaderMap,
-    Json(request): Json<DeployOciRequest>,
-) -> ApiResult<Json<OciDeployment>> {
+) -> ApiResult<Json<ListResponse<OciDeployment>>> {
     check_workspace_auth(&state, &headers, &workspace).await?;
     let cat = state.store.get_cat(&workspace, &cat)?;
+    Ok(Json(ListResponse {
+        items: state.store.list_oci_deployments(&cat.id)?,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct DeployOciQuery {
+    /// How long to hold the response open before answering with an operation.
+    /// `0` answers `202` immediately; omitted uses the configured default.
+    /// Clamped to the configured maximum, which is what keeps a caller from
+    /// asking for a wait longer than the edge in front of Cats will allow.
+    wait_ms: Option<u64>,
+}
+
+/// Deploy one OCI application into a Cat.
+///
+/// The deploy outlives its request. It is driven by a detached task keyed on
+/// `(cat, app, digest)`, so a caller that goes away -- an idle timeout at an
+/// intermediary needs only 60 s -- neither cancels the work nor loses it: the
+/// deployment record holds the outcome and the retry finds it.
+///
+/// Answers `200` with the deployment when it finishes inside the wait, and
+/// `202` with an `Operation` when it does not. Both are successes; a caller
+/// that predates operations sees only the `200` it already handled, as long as
+/// its deploys finish inside the wait.
+pub(super) async fn deploy_oci(
+    State(state): State<AppState>,
+    Path((workspace, cat)): Path<(String, String)>,
+    Query(query): Query<DeployOciQuery>,
+    headers: HeaderMap,
+    Json(request): Json<DeployOciRequest>,
+) -> ApiResult<Response> {
+    check_workspace_auth(&state, &headers, &workspace).await?;
+    let cat = state.store.get_cat(&workspace, &cat)?;
+    // Reject a reference Cats cannot make an identity out of before claiming
+    // anything: without a pinned digest there is nothing to be idempotent on.
+    // The Guest reports the specific defect for anything subtler than this.
+    let image_digest = cats_api::oci::pinned_digest(&request.image)
+        .ok_or_else(|| {
+            ApiError::invalid(
+                "image must be pinned by digest, as <reference>@sha256:<64 hex lowercase>",
+            )
+        })?
+        .to_string();
+    let max_wait_ms = state.cfg.oci_deploy_sync_wait_ms;
+    let wait = Duration::from_millis(query.wait_ms.unwrap_or(max_wait_ms).min(max_wait_ms));
+
+    let operation = match state
+        .store
+        .claim_oci_deployment(&cat, &request.app, &image_digest)?
+    {
+        // Same cat, same app, same digest, already deployed. Answering from
+        // the record is the point: re-running activation would restart a
+        // service that is already running the requested image.
+        OciDeploymentClaim::Replay {
+            operation,
+            deployment,
+        } => {
+            tracing::info!(
+                cat = %cat.id, app = %request.app, operation = %operation.id,
+                "replaying an OCI deployment that already succeeded"
+            );
+            return Ok((StatusCode::OK, Json(deployment)).into_response());
+        }
+        // A concurrent request already owns this identity. Wait on it rather
+        // than starting a second pull, flatten and restart.
+        OciDeploymentClaim::AlreadyRunning {
+            operation,
+            record_id,
+        } => {
+            tracing::info!(
+                cat = %cat.id, app = %request.app, operation = %operation.id,
+                record = %record_id,
+                "joining an OCI deployment that is already in flight"
+            );
+            operation
+        }
+        OciDeploymentClaim::Claimed {
+            operation,
+            record_id,
+        } => {
+            spawn_oci_deploy(&state, &cat, request, record_id, operation.id.clone())?;
+            operation
+        }
+    };
+
+    await_oci_deployment(&state, &operation.id, wait).await
+}
+
+/// Drive a claimed deploy to a terminal phase in a detached task.
+///
+/// Detached on purpose: the work must not be cancellable by the caller
+/// disappearing, and it must be able to outlive the response. The task owns the
+/// work lease, so the lease covers the deploy rather than the request, and is
+/// released by `Drop` when the task ends however it ends.
+///
+/// The request -- which carries one-pull registry credentials -- is moved into
+/// the task and never persisted, which is also why an interrupted deploy is
+/// failed at startup rather than resumed.
+fn spawn_oci_deploy(
+    state: &AppState,
+    cat: &Cat,
+    request: DeployOciRequest,
+    record_id: String,
+    operation_id: String,
+) -> ApiResult<()> {
     let owner = format!("deploy_{}", uuid::Uuid::new_v4().simple());
-    let cat_id = cat.id.clone();
     // Registry transfer + layer extraction can legitimately take minutes.
     // Holding explicit work prevents auto-suspend from racing the deployment.
     let ttl_ms = 3_600_000;
-    let lease =
-        state
-            .store
-            .acquire_work(&cat.id, WorkKind::Control, &owner, "oci-deploy", ttl_ms)?;
-    let result: ApiResult<OciDeployment> = async {
-        let mut cat = cat;
-        let mut retried_suspend_conflict = false;
-        loop {
-            cat = ensure_running(&state, cat).await?;
-            let node = state
+    let lease = state.store.acquire_work_guarded(
+        &cat.id,
+        WorkKind::Control,
+        &owner,
+        "oci-deploy",
+        ttl_ms,
+    )?;
+    state.store.start_operation(&operation_id)?;
+    let state = state.clone();
+    let cat = cat.clone();
+    tokio::spawn(async move {
+        // Bind the lease to this task, not to the request that started it.
+        let _lease = lease;
+        let app = request.app.clone();
+        let outcome = drive_oci_deploy(&state, cat.clone(), request, ttl_ms).await;
+        let recorded = match &outcome {
+            Ok(deployment) => state.store.succeed_oci_deployment(&record_id, deployment),
+            Err(error) => state
                 .store
-                .list_nodes()?
-                .into_iter()
-                .find(|node| Some(&node.id) == cat.node_id.as_ref())
-                .ok_or_else(|| ApiError::unavailable("cat has no live node"))?;
-            let url = format!(
-                "{}/v1/cats/{}/oci-deployments",
-                node.agent_url.trim_end_matches('/'),
-                cat.id
-            );
-            let response = state
-                .controller
-                .http
-                .post(url)
-                .timeout(Duration::from_millis(ttl_ms) + Duration::from_secs(15))
-                .bearer_auth(&state.cfg.auth_token)
-                .json(&request)
-                .send()
-                .await
-                .map_err(|error| {
-                    ApiError::unavailable(format!("node agent unreachable: {error}"))
-                })?;
-            let status = response.status();
-            if status.is_success() {
-                break response.json::<OciDeployment>().await.map_err(|error| {
-                    ApiError::internal(format!("bad OCI deployment response: {error}")).into()
-                });
+                .fail_oci_deployment(&record_id, &ErrorBody::new(error.code, &error.message)),
+        };
+        match (&outcome, recorded) {
+            (Ok(_), Ok(())) => {
+                tracing::info!(cat = %cat.id, app = %app, "OCI deployment succeeded")
             }
-            if status == StatusCode::CONFLICT && !retried_suspend_conflict {
-                retried_suspend_conflict = true;
-                continue;
+            (Err(error), Ok(())) => {
+                tracing::warn!(cat = %cat.id, app = %app, "OCI deployment failed: {}", error.message)
             }
-            let detail = response.text().await.unwrap_or_default();
-            let message = if detail.trim().is_empty() {
-                format!("OCI deployment failed: {status}")
-            } else {
-                format!("OCI deployment failed: {}", detail.trim())
-            };
-            break Err(ApiError::unavailable(message).into());
+            // The deploy resolved but its outcome did not reach the store, so
+            // the record stays `running` and no poller can ever see the answer.
+            // Startup convergence is the backstop; say so loudly meanwhile.
+            (_, Err(write_error)) => tracing::error!(
+                cat = %cat.id, app = %app, record = %record_id,
+                "recording the OCI deployment outcome failed: {write_error}"
+            ),
         }
+        let _ = state.controller.maybe_auto_suspend(&cat.id);
+    });
+    Ok(())
+}
+
+/// One deploy attempt against the Cat's node, waking it if necessary.
+async fn drive_oci_deploy(
+    state: &AppState,
+    cat: Cat,
+    request: DeployOciRequest,
+    ttl_ms: u64,
+) -> std::result::Result<OciDeployment, ApiError> {
+    let mut cat = cat;
+    let mut retried_suspend_conflict = false;
+    loop {
+        cat = ensure_running(state, cat)
+            .await
+            .map_err(|failure| failure.0)?;
+        let node = state
+            .store
+            .list_nodes()?
+            .into_iter()
+            .find(|node| Some(&node.id) == cat.node_id.as_ref())
+            .ok_or_else(|| ApiError::unavailable("cat has no live node"))?;
+        let url = format!(
+            "{}/v1/cats/{}/oci-deployments",
+            node.agent_url.trim_end_matches('/'),
+            cat.id
+        );
+        let response = state
+            .controller
+            .http
+            .post(url)
+            .timeout(Duration::from_millis(ttl_ms) + Duration::from_secs(15))
+            .bearer_auth(&state.cfg.auth_token)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|error| ApiError::unavailable(format!("node agent unreachable: {error}")))?;
+        let status = response.status();
+        if status.is_success() {
+            return response.json::<OciDeployment>().await.map_err(|error| {
+                ApiError::internal(format!("bad OCI deployment response: {error}"))
+            });
+        }
+        if status == StatusCode::CONFLICT && !retried_suspend_conflict {
+            retried_suspend_conflict = true;
+            continue;
+        }
+        let detail = response.text().await.unwrap_or_default();
+        let message = if detail.trim().is_empty() {
+            format!("OCI deployment failed: {status}")
+        } else {
+            format!("OCI deployment failed: {}", detail.trim())
+        };
+        return Err(ApiError::unavailable(message));
     }
-    .await;
-    let _ = state.store.release_work(&lease.id);
-    let _ = state.controller.maybe_auto_suspend(&cat_id);
-    result.map(Json)
+}
+
+/// Wait for a deploy operation to reach a terminal phase, up to `wait`.
+///
+/// Polls the record rather than joining the task, so a request that merely
+/// joined an in-flight deploy waits the same way the request that started it
+/// does -- including across a caller that reconnects.
+async fn await_oci_deployment(
+    state: &AppState,
+    operation_id: &str,
+    wait: Duration,
+) -> ApiResult<Response> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let operation = state.store.get_operation(operation_id)?;
+        match operation.phase {
+            OperationPhase::Succeeded => {
+                let deployment = state
+                    .store
+                    .oci_deployment_for_operation(operation_id)?
+                    .ok_or_else(|| {
+                        ApiError::internal("succeeded OCI deployment is missing its result")
+                    })?;
+                return Ok((StatusCode::OK, Json(deployment)).into_response());
+            }
+            OperationPhase::Failed => {
+                let error = operation.error.unwrap_or_else(|| {
+                    ErrorBody::new(ErrorCode::Unavailable, "OCI deployment failed")
+                });
+                return Err(ApiError::new(error.code, error.message).into());
+            }
+            OperationPhase::Pending | OperationPhase::Running => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            // Not an error: the deploy is still running and its outcome is
+            // durable. The caller polls the operation instead of retrying,
+            // which is what stops a retry from restarting the service.
+            let deployment = state.store.oci_deployment_for_operation(operation_id)?;
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(OciDeploymentOperationResponse {
+                    operation,
+                    deployment,
+                }),
+            )
+                .into_response());
+        }
+        tokio::time::sleep(OCI_DEPLOY_POLL_INTERVAL).await;
+    }
 }
 
 #[derive(Debug, Deserialize)]
