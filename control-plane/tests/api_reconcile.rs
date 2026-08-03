@@ -2867,3 +2867,84 @@ async fn an_interrupted_oci_deploy_is_failed_at_startup_rather_than_left_pending
         .message
         .contains("retry the deploy"));
 }
+
+/// A Cat runs one version of an app, so listing its deployments must answer
+/// with one row per app -- the one actually activated.
+#[tokio::test]
+async fn listing_deployments_reports_only_the_current_digest_for_an_app() {
+    let ctx = Ctx::new().await;
+    let _node = ctx.running_cat_on_node("listed").await;
+
+    ctx.deploy_oci_raw("listed", "server", TEST_DIGEST, None)
+        .await;
+    ctx.deploy_oci_raw("listed", "server", OTHER_DIGEST, None)
+        .await;
+
+    let listed: ListResponse<cats_api::oci::OciDeployment> = ctx
+        .http
+        .get(ctx.ws_url("/cats/listed/oci-deployments"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let for_app: Vec<_> = listed
+        .items
+        .iter()
+        .filter(|deployment| deployment.app == "server")
+        .collect();
+    assert_eq!(
+        for_app.len(),
+        1,
+        "one app runs one image; superseded records must not be listed: {:?}",
+        listed.items
+    );
+    assert_eq!(
+        for_app[0].image_digest, OTHER_DIGEST,
+        "the listed digest must be the one that was activated last"
+    );
+}
+
+/// Rolling back to a digest that has since been superseded must actually
+/// redeploy it. Replaying the old record would report success while the Cat
+/// keeps running the newer image.
+#[tokio::test]
+async fn redeploying_a_superseded_digest_activates_it_again() {
+    let ctx = Ctx::new().await;
+    let node = ctx.running_cat_on_node("rollback").await;
+
+    ctx.deploy_oci_raw("rollback", "server", TEST_DIGEST, None)
+        .await;
+    ctx.deploy_oci_raw("rollback", "server", OTHER_DIGEST, None)
+        .await;
+    let (status, body) = ctx
+        .deploy_oci_raw("rollback", "server", TEST_DIGEST, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(
+        node.oci_deploys.lock().unwrap().len(),
+        3,
+        "a superseded digest is no longer deployed, so re-requesting it must \
+         reach the Guest instead of replaying a stale record"
+    );
+    let listed: ListResponse<cats_api::oci::OciDeployment> = ctx
+        .http
+        .get(ctx.ws_url("/cats/rollback/oci-deployments"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let for_app: Vec<_> = listed
+        .items
+        .iter()
+        .filter(|deployment| deployment.app == "server")
+        .collect();
+    assert_eq!(for_app.len(), 1);
+    assert_eq!(for_app[0].image_digest, TEST_DIGEST);
+}

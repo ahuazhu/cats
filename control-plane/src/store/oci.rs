@@ -95,8 +95,11 @@ impl Store {
                     operation,
                 }
             }
-            // 'failed': retry in place. The operation is replaced so a caller
-            // polling the new one cannot read the previous failure.
+            // 'failed' or 'superseded': deploy again on the same row. Failed
+            // means it never took effect; superseded means it no longer is in
+            // effect, which is what makes a rollback to an older digest real
+            // work rather than a replay. The operation is replaced so a caller
+            // polling the new one cannot read the previous outcome.
             Some((record_id, _, _)) => {
                 let operation = Self::insert_operation(
                     &tx,
@@ -146,54 +149,77 @@ impl Store {
     }
 
     /// Record a finished deploy and move its operation to `Succeeded`.
+    ///
+    /// Supersedes whatever was activated for this app before, in the same
+    /// transaction: the app's previous digest is no longer what the Guest runs,
+    /// and `oci_deployments_one_current_per_app` would reject the write if both
+    /// rows claimed to be current. Doing it atomically with the operation also
+    /// means a crash cannot leave a terminal record behind a running operation.
     pub fn succeed_oci_deployment(
         &self,
         record_id: &str,
         deployment: &OciDeployment,
     ) -> Result<()> {
-        let operation_id = self.with(|c| {
-            c.execute(
-                "UPDATE oci_deployments SET
-                    phase='succeeded', manifest_digest=?2, service=?3, active=?4,
-                    error_json=NULL, updated_at=?5
-                  WHERE id=?1",
-                params![
-                    record_id,
-                    deployment.manifest_digest,
-                    deployment.service,
-                    i64::from(deployment.active),
-                    now_unix()
-                ],
-            )?;
-            c.query_row(
-                "SELECT operation_id FROM oci_deployments WHERE id=?1",
-                params![record_id],
-                |row| row.get::<_, String>(0),
-            )
-        })?;
-        self.finish_operation(&operation_id, None)
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(internal)?;
+        let (cat_id, app, operation_id) = Self::oci_deployment_keys(&tx, record_id)?;
+        let now = now_unix();
+        tx.execute(
+            "UPDATE oci_deployments SET phase='superseded', active=0, updated_at=?4
+              WHERE cat_id=?1 AND app=?2 AND phase='succeeded' AND id<>?3",
+            params![cat_id, app, record_id, now],
+        )
+        .map_err(internal)?;
+        tx.execute(
+            "UPDATE oci_deployments SET
+                phase='succeeded', manifest_digest=?2, service=?3, active=?4,
+                error_json=NULL, updated_at=?5
+              WHERE id=?1",
+            params![
+                record_id,
+                deployment.manifest_digest,
+                deployment.service,
+                i64::from(deployment.active),
+                now
+            ],
+        )
+        .map_err(internal)?;
+        Self::finish_operation_in(&tx, &operation_id, None)?;
+        tx.commit().map_err(internal)
     }
 
     /// Record a failed deploy and move its operation to `Failed`.
     ///
     /// The error is persisted on the record as well as the operation so a
     /// retry of the same digest can see it is recovering a failure, and so an
-    /// operator reading the record alone learns why it failed.
+    /// operator reading the record alone learns why it failed. A failure leaves
+    /// whatever was already activated for the app alone -- it is still what the
+    /// Guest runs.
     pub fn fail_oci_deployment(&self, record_id: &str, error: &ErrorBody) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(internal)?;
+        let (_, _, operation_id) = Self::oci_deployment_keys(&tx, record_id)?;
         let error_json = serde_json::to_string(error).map_err(internal)?;
-        let operation_id = self.with(|c| {
-            c.execute(
-                "UPDATE oci_deployments SET phase='failed', error_json=?2, updated_at=?3
-                  WHERE id=?1",
-                params![record_id, error_json, now_unix()],
-            )?;
-            c.query_row(
-                "SELECT operation_id FROM oci_deployments WHERE id=?1",
-                params![record_id],
-                |row| row.get::<_, String>(0),
-            )
-        })?;
-        self.finish_operation(&operation_id, Some(error))
+        tx.execute(
+            "UPDATE oci_deployments SET phase='failed', error_json=?2, updated_at=?3
+              WHERE id=?1",
+            params![record_id, error_json, now_unix()],
+        )
+        .map_err(internal)?;
+        Self::finish_operation_in(&tx, &operation_id, Some(error))?;
+        tx.commit().map_err(internal)
+    }
+
+    fn oci_deployment_keys(
+        tx: &rusqlite::Transaction<'_>,
+        record_id: &str,
+    ) -> Result<(String, String, String)> {
+        tx.query_row(
+            "SELECT cat_id, app, operation_id FROM oci_deployments WHERE id=?1",
+            params![record_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(internal)
     }
 
     /// The deployment result behind an operation, once it has succeeded.
@@ -212,7 +238,11 @@ impl Store {
         })
     }
 
-    /// Every application currently deployed in a Cat.
+    /// Every application currently deployed in a Cat, one row per app.
+    ///
+    /// `oci_deployments_one_current_per_app` is what makes that true, so this
+    /// needs no ordering trick or de-duplication to avoid answering with a
+    /// digest the Guest has already replaced.
     pub fn list_oci_deployments(&self, cat_id: &str) -> Result<Vec<OciDeployment>> {
         self.with(|c| {
             let mut stmt = c.prepare(
