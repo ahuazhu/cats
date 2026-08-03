@@ -47,9 +47,9 @@ use cats_storage::AdapterSelection;
 use crate::admission::{resume_commitment_bytes, WakeAdmission, WakeBudget, WakeLoad};
 use crate::ch::{self, BlockPath, ChConfig, ChRuntime, GUEST_VSOCK_PORT};
 use crate::guest_client::{GuestClient, GuestShell};
+use crate::proc::ProcHandle;
 
 use blockd_control::BlockdProc;
-use fake::signal;
 use metering::RuntimeMetering;
 use proxy::{ActivityChanged, RuntimeActivity};
 
@@ -102,7 +102,7 @@ struct CatRuntime {
     cpus: u32,
     memory_mib: u64,
     state: ObservedState,
-    guest: Option<Child>,
+    guest: Option<ProcHandle>,
     boot_id: Option<String>,
     blockds: HashMap<String, BlockdProc>,
     /// Grants remembered for Warm restore.

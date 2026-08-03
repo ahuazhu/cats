@@ -57,13 +57,3 @@ impl NodeRuntime {
         }
     }
 }
-
-pub(super) fn signal(child: &Child, sig: i32) {
-    if let Ok(pid) = i32::try_from(child.id()) {
-        // SAFETY: `pid` comes from the live `Child`; `kill` copies both scalar
-        // arguments and does not retain any borrowed memory.
-        unsafe {
-            libc::kill(pid, sig);
-        }
-    }
-}

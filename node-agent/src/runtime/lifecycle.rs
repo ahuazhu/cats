@@ -104,7 +104,7 @@ impl NodeRuntime {
                 Some(chrt) => ch::pause(&chrt.api_sock)?,
                 None => {
                     let guest = rt.guest.as_ref().context("guest process missing")?;
-                    signal(guest, libc::SIGSTOP);
+                    guest.signal(libc::SIGSTOP);
                 }
             }
             let page_out_target = match &rt.ch {
@@ -127,7 +127,7 @@ impl NodeRuntime {
                     Some(chrt) => ch::resume(&chrt.api_sock)?,
                     None => {
                         let guest = rt.guest.as_ref().context("guest process missing")?;
-                        signal(guest, libc::SIGCONT);
+                        guest.signal(libc::SIGCONT);
                     }
                 }
                 rt.state = ObservedState::Running;
@@ -207,7 +207,7 @@ impl NodeRuntime {
             Some(chrt) => ch::resume(&chrt.api_sock)?,
             None => {
                 let guest = rt.guest.as_ref().context("guest process missing")?;
-                signal(guest, libc::SIGCONT);
+                guest.signal(libc::SIGCONT);
             }
         }
         let expected = rt.boot_id.clone();
@@ -285,8 +285,7 @@ impl NodeRuntime {
             }
             let cat_dir = rt.dir.clone();
             for (_, mut p) in rt.blockds.drain() {
-                let _ = p.child.kill();
-                let _ = p.child.wait();
+                p.child.kill_and_reap();
                 p.remove_socket_files(&cat_dir);
             }
             if let Some(chrt) = &mut rt.ch {
@@ -297,7 +296,7 @@ impl NodeRuntime {
         }
         if rt.guest.is_some() {
             if let Some(g) = &rt.guest {
-                signal(g, libc::SIGCONT); // wake a suspended guest to snapshot it
+                g.signal(libc::SIGCONT); // wake a suspended guest to snapshot it
             }
             let mut client = rt.conn().connect()?;
             // First freeze the Guest-visible state locally and persist the
@@ -308,8 +307,7 @@ impl NodeRuntime {
             client.save_state(&rt.state_file())?;
             let _ = client.shutdown();
             if let Some(mut g) = rt.guest.take() {
-                let _ = g.kill();
-                let _ = g.wait();
+                g.kill_and_reap();
             }
             rt.state = ObservedState::Warming;
         }
@@ -319,8 +317,7 @@ impl NodeRuntime {
         }
         let cat_dir = rt.dir.clone();
         for (_, mut p) in rt.blockds.drain() {
-            let _ = p.child.kill();
-            let _ = p.child.wait();
+            p.child.kill_and_reap();
             p.remove_socket_files(&cat_dir);
         }
         rt.state = ObservedState::Warm;
@@ -436,8 +433,7 @@ impl NodeRuntime {
         rt.blockds.insert(grant.disk_id.clone(), proc);
         if let Err(error) = self.attach_to_metering(rt, process_id) {
             if let Some(mut proc) = rt.blockds.remove(&grant.disk_id) {
-                let _ = proc.child.kill();
-                let _ = proc.child.wait();
+                proc.child.kill_and_reap();
             }
             return Err(error);
         }
@@ -521,8 +517,7 @@ impl NodeRuntime {
             }
             return Err(error);
         }
-        let _ = proc.child.kill();
-        let _ = proc.child.wait();
+        proc.child.kill_and_reap();
         Ok(rt.state)
     }
 }
