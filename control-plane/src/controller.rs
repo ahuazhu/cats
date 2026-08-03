@@ -54,7 +54,26 @@ pub struct Controller {
     node_fencing_starts_at_ms: i64,
     /// Start attempts per (cat, generation): after 3 failures -> Failed.
     attempts: Mutex<HashMap<String, u32>>,
+    /// Earliest next attempt per (cat, generation) for a source-preserving
+    /// retry, with the consecutive-failure count that set it.
+    ///
+    /// A transition that fails without changing the Cat's state is retried for
+    /// as long as it keeps failing, so it needs a delay of its own. Without one
+    /// the reconciler re-dispatched immediately and a persistent failure --
+    /// notably a stop blocked behind a backing-off final usage delivery --
+    /// became a hot loop: measured ~288 dispatches per second against one node
+    /// agent, which pushed a no-op `exec` on an unrelated Cat from
+    /// milliseconds to over a minute.
+    retry_after: Mutex<HashMap<String, (u32, std::time::Instant)>>,
 }
+
+/// First delay after a source-preserving transition failure.
+const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(1);
+
+/// Ceiling for the exponential retry delay. A stop blocked on an external
+/// dependency should keep retrying, just not faster than the dependency can
+/// plausibly recover.
+const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 impl Controller {
     pub fn new(
@@ -79,6 +98,7 @@ impl Controller {
             node_fencing_starts_at_ms: now_ms()
                 .saturating_add(node_lease_timeout_ms.max(0).saturating_mul(2)),
             attempts: Mutex::new(HashMap::new()),
+            retry_after: Mutex::new(HashMap::new()),
         })
     }
 
@@ -317,7 +337,45 @@ impl Controller {
     // Per-cat reconcile
     // ------------------------------------------------------------------
 
+    /// Delay the next attempt for a transition that failed without changing the
+    /// Cat's state, and report how long the caller is waiting.
+    ///
+    /// Deliberately does *not* notify the reconciler: the whole point is to let
+    /// the tick pick this Cat up later instead of immediately.
+    fn defer_retry(&self, cat: &Cat) -> Duration {
+        let mut deferred = self.retry_after.lock().unwrap();
+        let now = std::time::Instant::now();
+        let entry = deferred
+            .entry(attempt_key(cat))
+            .or_insert((0, now));
+        entry.0 = entry.0.saturating_add(1);
+        let delay = RETRY_BACKOFF_BASE
+            .saturating_mul(1u32 << entry.0.saturating_sub(1).min(6))
+            .min(RETRY_BACKOFF_MAX);
+        entry.1 = now + delay;
+        delay
+    }
+
+    /// True while a previously failed transition for this Cat is still waiting.
+    fn retry_deferred(&self, cat: &Cat) -> bool {
+        let deferred = self.retry_after.lock().unwrap();
+        deferred
+            .get(&attempt_key(cat))
+            .is_some_and(|(_, at)| std::time::Instant::now() < *at)
+    }
+
+    /// Forget any backoff for this Cat, because it made progress.
+    fn clear_retry_backoff(&self, cat: &Cat) {
+        self.retry_after.lock().unwrap().remove(&attempt_key(cat));
+    }
+
     async fn reconcile_cat(&self, cat: &Cat) -> anyhow::Result<()> {
+        // A source-preserving failure leaves the Cat exactly as it was, so the
+        // next tick would re-dispatch the identical job. Honour its backoff
+        // before doing anything, or a persistent failure spins.
+        if self.retry_deferred(cat) {
+            return Ok(());
+        }
         if let Some(node_id) = &cat.node_id {
             let node = self.store.get_node(node_id)?;
             if matches!(node.state, NodeState::Lost | NodeState::Fenced) {
@@ -461,6 +519,7 @@ impl Controller {
                 self.store
                     .publish_routes(&cat.id, &node.id, &node.gateway_url)?;
                 self.attempts.lock().unwrap().remove(&attempt_key(cat));
+                self.clear_retry_backoff(cat);
                 self.complete_ops_if_converged(&cat.id).await?;
                 Ok(())
             }
@@ -580,6 +639,7 @@ impl Controller {
                     self.store
                         .publish_routes(&cat.id, &node.id, &node.gateway_url)?;
                 }
+                self.clear_retry_backoff(cat);
                 self.complete_ops_if_converged(&cat.id).await?;
                 self.notify.notify_one();
                 Ok(())
@@ -600,12 +660,13 @@ impl Controller {
                 // particular, a failed mandatory relaxed drain must keep the
                 // Host-local journal and lease alive for retry; a destructive
                 // Cold fallback here would turn a remote outage into data loss.
+                self.store.set_observed(&cat.id, cat.observed_state)?;
+                let retry_in = self.defer_retry(cat);
                 tracing::warn!(
                     cat = %cat.id,
+                    retry_in_ms = retry_in.as_millis(),
                     "warm transition failed: {err}; retaining source state for retry"
                 );
-                self.store.set_observed(&cat.id, cat.observed_state)?;
-                self.notify.notify_one();
                 Ok(())
             }
             other => {
@@ -627,6 +688,7 @@ impl Controller {
                 self.store.unbind_routes(&cat.id)?;
                 self.store.set_placement(&cat.id, None)?;
                 self.store.set_observed(&cat.id, ObservedState::Cold)?;
+                self.clear_retry_backoff(cat);
                 self.notify.notify_one();
                 Ok(())
             }
@@ -657,15 +719,24 @@ impl Controller {
             match self.dispatch(&node.agent_url, &job).await {
                 Ok(res) if res.phase == JobPhase::Succeeded => {}
                 Ok(res) => {
-                    tracing::warn!(cat = %cat.id, "stop job failed: {:?}; retaining source state for retry", res.error);
                     self.store.set_observed(&cat.id, cat.observed_state)?;
-                    self.notify.notify_one();
+                    let retry_in = self.defer_retry(cat);
+                    tracing::warn!(
+                        cat = %cat.id,
+                        retry_in_ms = retry_in.as_millis(),
+                        "stop job failed: {:?}; retaining source state for retry",
+                        res.error
+                    );
                     return Ok(());
                 }
                 Err(e) => {
-                    tracing::warn!(cat = %cat.id, "stop dispatch failed: {e}; retrying next tick");
                     self.store.set_observed(&cat.id, cat.observed_state)?;
-                    self.notify.notify_one();
+                    let retry_in = self.defer_retry(cat);
+                    tracing::warn!(
+                        cat = %cat.id,
+                        retry_in_ms = retry_in.as_millis(),
+                        "stop dispatch failed: {e}; retaining source state for retry"
+                    );
                     return Ok(());
                 }
             }
@@ -674,6 +745,7 @@ impl Controller {
         self.fence_cat_volumes(cat).await?;
         self.store.set_placement(&cat.id, None)?;
         self.store.set_observed(&cat.id, ObservedState::Cold)?;
+        self.clear_retry_backoff(cat);
         self.complete_ops_if_converged(&cat.id).await?;
         Ok(())
     }
