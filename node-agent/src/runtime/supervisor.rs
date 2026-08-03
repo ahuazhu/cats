@@ -268,7 +268,7 @@ impl NodeRuntime {
             let state_file = rt.state_file();
             let guest = self.spawn_guest(&rt, warm_restore.then_some(state_file.as_path()))?;
             let process_id = guest.id();
-            rt.guest = Some(guest);
+            rt.guest = Some(ProcHandle::Owned(guest));
             self.attach_to_metering(&rt, process_id)?;
             let boot_id = self.wait_guest_ready(&rt)?;
             Ok(boot_id)
@@ -463,7 +463,7 @@ impl NodeRuntime {
                 network: chrt.network.as_ref(),
             })?;
             let process_id = vmm.id();
-            rt.guest = Some(vmm);
+            rt.guest = Some(ProcHandle::Owned(vmm));
             self.attach_to_metering(&rt, process_id)?;
             let vmm_spawn_us = vmm_spawn_started.elapsed().as_micros();
             rt.ch = Some(chrt.clone());
@@ -617,7 +617,7 @@ impl NodeRuntime {
                     }
                     None => {
                         if let Some(g) = &rt.guest {
-                            signal(g, libc::SIGCONT);
+                            g.signal(libc::SIGCONT);
                         }
                     }
                 }
@@ -644,10 +644,7 @@ impl NodeRuntime {
         if let Some(mut vmm) = rt.guest.take() {
             match &rt.ch {
                 Some(chrt) => ch::shutdown_vmm(&chrt.api_sock, &mut vmm),
-                None => {
-                    let _ = vmm.kill();
-                    let _ = vmm.wait();
-                }
+                None => vmm.kill_and_reap(),
             }
         }
         if let TeardownMode::Destroy {
@@ -676,8 +673,7 @@ impl NodeRuntime {
         }
         let cat_dir = rt.dir.clone();
         for (_, mut p) in rt.blockds.drain() {
-            let _ = p.child.kill();
-            let _ = p.child.wait();
+            p.child.kill_and_reap();
             p.remove_socket_files(&cat_dir);
         }
         if let Some(chrt) = &mut rt.ch {
@@ -704,8 +700,7 @@ impl NodeRuntime {
         }
         for disk_id in root_disk_ids {
             if let Some(mut proc) = rt.blockds.remove(disk_id) {
-                let _ = proc.child.kill();
-                let _ = proc.child.wait();
+                proc.child.kill_and_reap();
                 proc.remove_socket_files(&rt.dir);
             }
             let _ = std::fs::remove_dir_all(rt.dir.join(format!("vol-{disk_id}")));

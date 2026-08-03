@@ -3,7 +3,7 @@ use cats_api::blockd::{BlockdControlCommand, BlockdControlResponse, DurabilitySt
 use cats_block_client::NbdClient;
 
 pub(super) struct BlockdProc {
-    pub(super) child: Child,
+    pub(super) child: ProcHandle,
     /// NBD socket: readiness probe, golden-root seeding and recovery tooling.
     /// Always present, on both block paths.
     pub(super) socket: PathBuf,
@@ -265,7 +265,7 @@ impl NodeRuntime {
             .spawn()
             .context("spawn cats-blockd")?;
         let mut proc = BlockdProc {
-            child,
+            child: ProcHandle::Owned(child),
             socket,
             vhost_user_socket,
             control_socket,
@@ -283,8 +283,8 @@ impl NodeRuntime {
                 let _ = client.disconnect();
                 return Ok(());
             }
-            if let Some(status) = proc.child.try_wait()? {
-                bail!("cats-blockd exited during startup: {status} (lease held or bad config?)");
+            if proc.child.exited()? {
+                bail!("cats-blockd exited during startup (lease held or bad config?)");
             }
             if Instant::now() > deadline {
                 bail!("timed out waiting for blockd socket");

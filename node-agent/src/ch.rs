@@ -34,6 +34,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
+use crate::proc::ProcHandle;
+
 /// Guest-agent vsock port (must match the guest image's init script).
 pub const GUEST_VSOCK_PORT: u32 = 5000;
 /// Named, per-Cat RAM backing kept under the Cat's host-local runtime.
@@ -690,7 +692,7 @@ pub fn page_out_memory(_pid: u32, _backing: &Path) -> Result<PageOutStats> {
     bail!("Guest memory page-out requires Linux")
 }
 
-pub fn wait_api_ready(api_sock: &Path, child: &mut Child) -> Result<()> {
+pub(crate) fn wait_api_ready(api_sock: &Path, vmm: &mut ProcHandle) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         // vmm.ping (not vm.ping): confirms the VMM HTTP thread is serving.
@@ -699,8 +701,8 @@ pub fn wait_api_ready(api_sock: &Path, child: &mut Child) -> Result<()> {
                 return Ok(());
             }
         }
-        if let Some(status) = child.try_wait()? {
-            bail!("cloud-hypervisor exited during startup: {status}");
+        if vmm.exited()? {
+            bail!("cloud-hypervisor exited during startup");
         }
         if Instant::now() > deadline {
             bail!("timed out waiting for CH api socket");
@@ -726,17 +728,17 @@ pub fn snapshot(api_sock: &Path, dest_dir: &Path) -> Result<()> {
     ch_api_ok(api_sock, "PUT", "/api/v1/vm.snapshot", Some(&body))
 }
 
-pub fn shutdown_vmm(api_sock: &Path, child: &mut Child) {
+pub(crate) fn shutdown_vmm(api_sock: &Path, vmm: &mut ProcHandle) {
     let _ = ch_api_ok(api_sock, "PUT", "/api/v1/vmm.shutdown", None);
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if child.try_wait().ok().flatten().is_some() {
+        // A probe that fails is not evidence of an exit; keep waiting.
+        if vmm.exited().unwrap_or(false) {
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    vmm.kill_and_reap();
 }
 
 #[cfg(test)]

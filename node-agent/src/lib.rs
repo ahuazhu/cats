@@ -5,6 +5,7 @@
 pub mod admission;
 pub mod ch;
 pub mod guest_client;
+pub(crate) mod proc;
 pub mod runtime;
 pub mod server;
 pub mod usage_spool;
