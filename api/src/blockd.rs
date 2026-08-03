@@ -138,6 +138,18 @@ impl std::error::Error for InvalidBlockdControlResponse {}
 /// Host loss.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DurabilityStatus {
+    /// The volume this blockd was configured to serve.
+    ///
+    /// Empty means the payload came from a `cats-blockd` that predates this
+    /// field, so the process cannot prove which volume it holds. A node agent
+    /// must then treat it as not adoptable rather than binding a live blockd to
+    /// a volume on a PID match alone; refusing to adopt is the safe default.
+    #[serde(default)]
+    pub volume_id: String,
+    /// The attachment this blockd was configured to serve. Empty carries the
+    /// same "identity unproven, do not adopt" meaning as [`Self::volume_id`].
+    #[serde(default)]
+    pub attachment_id: String,
     pub mode: String,
     pub local_durable_generation: i64,
     pub remote_durable_generation: i64,
@@ -181,9 +193,15 @@ mod tests {
         );
     }
 
+    /// A payload byte-for-byte as an older `cats-blockd` emitted it, before the
+    /// status carried any volume identity.
+    const LEGACY_STATUS_JSON: &str = "{\"mode\":\"relaxed\",\"local_durable_generation\":7,\"remote_durable_generation\":5,\"unpublished_generations\":2,\"unpublished_bytes\":65536,\"oldest_unpublished_age_ms\":250,\"max_unpublished_generations\":4096,\"max_unpublished_bytes\":8589934592,\"local_allocated_bytes\":131072,\"local_accounted_bytes\":196608,\"max_local_bytes\":17179869184,\"evicted_cache_chunks\":3,\"backpressured\":false,\"fenced\":false,\"last_publish_error\":\"timeout\"}";
+
     #[test]
     fn durability_status_json_is_byte_stable() {
         let status = DurabilityStatus {
+            volume_id: "vol_x".to_string(),
+            attachment_id: "att_x".to_string(),
             mode: "relaxed".to_string(),
             local_durable_generation: 7,
             remote_durable_generation: 5,
@@ -202,7 +220,42 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&status).unwrap(),
-            "{\"mode\":\"relaxed\",\"local_durable_generation\":7,\"remote_durable_generation\":5,\"unpublished_generations\":2,\"unpublished_bytes\":65536,\"oldest_unpublished_age_ms\":250,\"max_unpublished_generations\":4096,\"max_unpublished_bytes\":8589934592,\"local_allocated_bytes\":131072,\"local_accounted_bytes\":196608,\"max_local_bytes\":17179869184,\"evicted_cache_chunks\":3,\"backpressured\":false,\"fenced\":false,\"last_publish_error\":\"timeout\"}"
+            "{\"volume_id\":\"vol_x\",\"attachment_id\":\"att_x\",\"mode\":\"relaxed\",\"local_durable_generation\":7,\"remote_durable_generation\":5,\"unpublished_generations\":2,\"unpublished_bytes\":65536,\"oldest_unpublished_age_ms\":250,\"max_unpublished_generations\":4096,\"max_unpublished_bytes\":8589934592,\"local_allocated_bytes\":131072,\"local_accounted_bytes\":196608,\"max_local_bytes\":17179869184,\"evicted_cache_chunks\":3,\"backpressured\":false,\"fenced\":false,\"last_publish_error\":\"timeout\"}"
         );
+        assert_eq!(
+            serde_json::from_str::<DurabilityStatus>(&serde_json::to_string(&status).unwrap())
+                .unwrap(),
+            status,
+            "identity fields round-trip"
+        );
+    }
+
+    #[test]
+    fn status_without_identity_deserializes_as_unproven() {
+        let status: DurabilityStatus = serde_json::from_str(LEGACY_STATUS_JSON).unwrap();
+        // An older blockd cannot prove which volume it holds; empty identity is
+        // what the node agent must read as "not adoptable".
+        assert_eq!(status.volume_id, "");
+        assert_eq!(status.attachment_id, "");
+        // Every pre-existing field keeps its value and meaning.
+        assert_eq!(status.mode, "relaxed");
+        assert_eq!(status.local_durable_generation, 7);
+        assert_eq!(status.remote_durable_generation, 5);
+        assert_eq!(status.unpublished_generations, 2);
+        assert_eq!(status.local_accounted_bytes, 196_608);
+        assert_eq!(status.last_publish_error.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn unknown_fields_are_ignored_so_old_readers_survive_new_payloads() {
+        // The same tolerance an older node agent relies on when a newer blockd
+        // adds fields it has never heard of.
+        let forward = LEGACY_STATUS_JSON.replace(
+            "{\"mode\"",
+            "{\"a_field_from_the_future\":{\"nested\":[1]},\"mode\"",
+        );
+        let status: DurabilityStatus = serde_json::from_str(&forward).unwrap();
+        assert_eq!(status.mode, "relaxed");
+        assert_eq!(status.volume_id, "");
     }
 }
