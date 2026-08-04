@@ -531,6 +531,22 @@ pub(super) async fn prometheus_metrics(
                 format!("cats_node_wake_commitment_budget_bytes{{node_id=\"{node_id}\"}}"),
                 telemetry.wake_commitment_budget_bytes
             );
+            // Leaked kernel NBD devices (issue #79). Exported with the pool
+            // size so an alarm can fire on a fraction of the pool: the count
+            // alone has no threshold, and by the time it is obviously large
+            // the host is already deadlocking on it.
+            if let Some(leaked) = telemetry.leaked_nbd_devices {
+                metric!(
+                    format!("cats_node_leaked_nbd_devices{{node_id=\"{node_id}\"}}"),
+                    leaked
+                );
+            }
+            if let Some(total) = telemetry.nbd_devices_total {
+                metric!(
+                    format!("cats_node_nbd_devices_total{{node_id=\"{node_id}\"}}"),
+                    total
+                );
+            }
             if let Some(logical_cpus) = telemetry.host_logical_cpus {
                 metric!(
                     format!("cats_node_logical_cpus{{node_id=\"{node_id}\"}}"),

@@ -54,7 +54,7 @@ use crate::ch::{self, BlockPath, ChConfig, ChRuntime, GUEST_VSOCK_PORT};
 use crate::guest_client::{GuestClient, GuestShell};
 use crate::proc::ProcHandle;
 
-use blockd_control::BlockdProc;
+use blockd_control::{blockd_log_path, BlockdProc};
 use ledger::Ledger;
 use metering::RuntimeMetering;
 use proxy::{ActivityChanged, RuntimeActivity};
@@ -405,6 +405,34 @@ impl NodeRuntime {
         self.admission.load()
     }
 
+    /// Reclaim kernel NBD devices left connected to a server that is gone.
+    ///
+    /// Runs once at boot, before the agent registers and can be given a
+    /// `StartCat`. Nothing else ever reclaims such a device, so without this
+    /// pass the pool only shrinks: one `systemctl stop` of the worker kills
+    /// every blockd in the unit cgroup, and each one leaves its device behind
+    /// (issue #79).
+    pub fn reclaim_leaked_block_devices(&self) {
+        let VmmMode::CloudHypervisor(chc) = &self.cfg.vmm else {
+            return;
+        };
+        // Deliberately not gated on the configured block path: a node moved to
+        // vhost-user still has to clear what its kernel-NBD past left behind,
+        // and a pool with nothing leaked runs no `nbd-client` at all.
+        match ch::reclaim_leaked_nbd_devices(chc) {
+            Ok(reclaim) if reclaim.reclaimed.is_empty() && reclaim.unreclaimed.is_empty() => {}
+            Ok(reclaim) => tracing::warn!(
+                reclaimed = ?reclaim.reclaimed,
+                unreclaimed = ?reclaim.unreclaimed,
+                "reclaimed kernel NBD devices left behind by an earlier node agent"
+            ),
+            Err(error) => tracing::error!(
+                error = format!("{error:#}"),
+                "could not sweep kernel NBD devices; leaked ones stay unusable"
+            ),
+        }
+    }
+
     pub(crate) fn with_usage_finalizer(mut self, finalizer: Arc<dyn UsageFinalizer>) -> Self {
         self.usage_finalizer = Some(finalizer);
         self
@@ -444,11 +472,21 @@ impl NodeRuntime {
     /// Allocation telemetry reported with heartbeats. These values come from
     /// the runtime inventory (actual node ownership), not control-plane intent.
     pub fn telemetry(&self) -> NodeTelemetry {
-        // Sample the wake gate before taking `cats`: the two locks are never
-        // held together anywhere, and this keeps it that way.
+        // Sample the wake gate and the device pool before taking `cats`: the
+        // two locks are never held together anywhere, and this keeps it that
+        // way.
         let wake = self.admission.load();
+        let (leaked_nbd_devices, nbd_devices_total) = match &self.cfg.vmm {
+            VmmMode::CloudHypervisor(chc) => (
+                Some(ch::leaked_nbd_device_count(chc)),
+                Some(u64::from(chc.nbd_devices)),
+            ),
+            VmmMode::Fake => (None, None),
+        };
         let cats = self.cats.lock().unwrap();
         NodeTelemetry {
+            leaked_nbd_devices,
+            nbd_devices_total,
             observed_cats: cats.len() as u64,
             allocated_cpus: cats.values().map(|runtime| runtime.cpus).sum(),
             allocated_memory_mib: cats.values().map(|runtime| runtime.memory_mib).sum(),

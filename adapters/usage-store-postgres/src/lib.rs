@@ -6,6 +6,7 @@
 //! deterministic even when several consumers replay concurrently.
 
 use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
@@ -14,7 +15,8 @@ use cats_metering::{
     metric_from_slug, usage_view_from_intervals, validate_checkpoint, validate_usage_query,
     AttributedCheckpoint, CheckoutIntent, CheckoutPayment, CheckoutRefund, CreditApplyOutcome,
     CreditStore, CreditStoreFuture, CreditSummary, IngestOutcome, MeteringError, Result,
-    UsageAttribution, UsageInterval, UsageQuery, UsageStore, UsageStoreFuture, UsageView,
+    UsageAggregate, UsageAttribution, UsageInterval, UsageQuery, UsageStore, UsageStoreFuture,
+    UsageTotals, UsageView,
 };
 use native_tls::{Certificate, TlsConnector};
 use postgres::{Client, Row, Transaction};
@@ -23,7 +25,49 @@ use postgres_native_tls::MakeTlsConnector;
 pub const DEFAULT_SCHEMA: &str = "cats_usage";
 pub const DEFAULT_WORKERS: usize = 4;
 
-type Job = Box<dyn FnOnce(&mut Client) + Send + 'static>;
+/// A job receives the connection or the reason there is not one. Dropping it
+/// unrun would reach the caller as "operation was canceled", which is the kind
+/// of wrapper that hid a credential failure for thirteen hours.
+type Job = Box<dyn for<'a> FnOnce(Result<&'a mut Client>) + Send + 'static>;
+
+/// Where a worker obtains its DSN, consulted afresh for every connect.
+///
+/// Duplicated from `cats-metadata-store-postgres` rather than shared: the two
+/// live on opposite sides of the storage/metering boundary with no common
+/// crate, and their error types differ. A crate existing only to hold this
+/// would be a worse trade than thirty lines.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DsnSource {
+    /// A literal DSN, fixed for the life of the process.
+    Literal(String),
+    /// A file re-read on every connect, kept current by the platform.
+    File(PathBuf),
+}
+
+impl DsnSource {
+    /// Never include the file's contents in an error. It holds the password.
+    fn resolve(&self) -> Result<String> {
+        match self {
+            Self::Literal(url) => Ok(url.clone()),
+            Self::File(path) => {
+                let contents = fs::read_to_string(path).map_err(|error| {
+                    MeteringError::Store(format!(
+                        "read PostgreSQL DSN from {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                let url = contents.trim();
+                if url.is_empty() {
+                    return Err(MeteringError::Store(format!(
+                        "PostgreSQL DSN file {} is empty",
+                        path.display()
+                    )));
+                }
+                Ok(url.to_string())
+            }
+        }
+    }
+}
 
 /// A small fixed connection pool whose workers own synchronous PostgreSQL
 /// clients. Callers await a Tokio oneshot, so database I/O never blocks an
@@ -36,6 +80,20 @@ pub struct PostgresUsageStore {
 
 impl PostgresUsageStore {
     pub fn connect(url: &str, ca_file: Option<&str>, schema: &str, workers: usize) -> Result<Self> {
+        Self::connect_from(
+            &DsnSource::Literal(url.to_string()),
+            ca_file,
+            schema,
+            workers,
+        )
+    }
+
+    pub fn connect_from(
+        dsn: &DsnSource,
+        ca_file: Option<&str>,
+        schema: &str,
+        workers: usize,
+    ) -> Result<Self> {
         validate_schema_name(schema)?;
         if !(1..=64).contains(&workers) {
             return Err(MeteringError::Invalid(
@@ -45,7 +103,7 @@ impl PostgresUsageStore {
         let mut senders = Vec::with_capacity(workers);
         for worker_index in 0..workers {
             senders.push(spawn_worker(
-                url.to_string(),
+                dsn.clone(),
                 ca_file.map(str::to_string),
                 schema.to_string(),
                 worker_index,
@@ -69,7 +127,10 @@ impl PostgresUsageStore {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         self.workers[index]
             .send(Box::new(move |client| {
-                let _ = result_tx.send(operation(client));
+                let _ = result_tx.send(match client {
+                    Ok(client) => operation(client),
+                    Err(error) => Err(error),
+                });
             }))
             .map_err(|_| MeteringError::Store("PostgreSQL usage worker exited".to_string()))?;
         result_rx.await.map_err(|_| {
@@ -96,6 +157,15 @@ impl UsageStore for PostgresUsageStore {
         let schema = self.schema.clone();
         Box::pin(async move {
             self.dispatch(move |client| query_usage(client, &schema, &query))
+                .await
+        })
+    }
+
+    fn query_totals<'a>(&'a self, query: &'a UsageQuery) -> UsageStoreFuture<'a, UsageTotals> {
+        let query = query.clone();
+        let schema = self.schema.clone();
+        Box::pin(async move {
+            self.dispatch(move |client| query_usage_totals(client, &schema, &query))
                 .await
         })
     }
@@ -738,7 +808,7 @@ fn source_epoch_attribution(
 }
 
 fn spawn_worker(
-    url: String,
+    dsn: DsnSource,
     ca_file: Option<String>,
     schema: String,
     worker_index: usize,
@@ -747,24 +817,46 @@ fn spawn_worker(
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name(format!("cats-postgres-usage-{worker_index}"))
-        .spawn(
-            move || match connect_client(&url, ca_file.as_deref(), &schema) {
-                Ok(mut client) => {
+        .spawn(move || {
+            let mut client = match connect_resolved(&dsn, ca_file.as_deref(), &schema) {
+                Ok(client) => {
                     let _ = ready_tx.send(Ok(()));
-                    for job in receiver {
-                        job(&mut client);
-                    }
+                    client
                 }
                 Err(error) => {
                     let _ = ready_tx.send(Err(error));
+                    return;
                 }
-            },
-        )
+            };
+            for job in receiver {
+                // This worker previously had no reconnect at all: a dropped
+                // connection left it running every later job against a dead
+                // client, so usage ingestion stayed broken until the process
+                // restarted -- and after a credential rotation, restarting is
+                // exactly what cannot succeed.
+                if client.is_closed() {
+                    match connect_resolved(&dsn, ca_file.as_deref(), &schema) {
+                        Ok(reconnected) => client = reconnected,
+                        Err(error) => {
+                            job(Err(error));
+                            continue;
+                        }
+                    }
+                }
+                job(Ok(&mut client));
+            }
+        })
         .map_err(|error| MeteringError::Store(format!("start PostgreSQL usage worker: {error}")))?;
     ready_rx
         .recv()
         .map_err(|_| MeteringError::Store("PostgreSQL usage worker exited at startup".into()))??;
     Ok(jobs)
+}
+
+/// The one place a connection is established, so the DSN is resolved on every
+/// attempt -- first connect and every reconnect alike.
+fn connect_resolved(dsn: &DsnSource, ca_file: Option<&str>, schema: &str) -> Result<Client> {
+    connect_client(&dsn.resolve()?, ca_file, schema)
 }
 
 fn connect_client(url: &str, ca_file: Option<&str>, schema: &str) -> Result<Client> {
@@ -1380,6 +1472,80 @@ fn query_usage(client: &mut Client, schema: &str, query: &UsageQuery) -> Result<
     usage_view_from_intervals(query, intervals)
 }
 
+/// Totals for the window, aggregated by PostgreSQL rather than by returning
+/// every interval for the caller to fold.
+///
+/// This is the admission path. `query_usage` is unbounded below there
+/// (`interval_start_unix_ms: 0`), so it selected, sorted and shipped every
+/// interval a Billing Account had ever accrued -- growing without limit and
+/// putting a no-op `exec` at ~35 s while the node agent answered the same call
+/// in 2 ms.
+///
+/// The arithmetic mirrors `usage_view_from_intervals` exactly: prorate by the
+/// overlap and truncate **per row** with `div`, then sum. `div` truncates toward
+/// zero like the integer division the fold performs; summing before dividing
+/// would round differently and mis-bill. `HAVING` reproduces the fold skipping
+/// zero-quantity intervals, so a metric that contributes nothing is absent
+/// rather than present with zero.
+fn query_usage_totals(
+    client: &mut Client,
+    schema: &str,
+    query: &UsageQuery,
+) -> Result<UsageTotals> {
+    validate_usage_query(query)?;
+    let prorated = "div(quantity * (LEAST(interval_end_ms, $3) - GREATEST(interval_start_ms, $2))::numeric,                     (interval_end_ms - interval_start_ms)::numeric)";
+    let sql = format!(
+        "SELECT metric, SUM({prorated})::text, MAX(LEAST(interval_end_ms, $3))
+           FROM {schema}.usage_intervals
+          WHERE billing_account_id=$1
+            AND interval_end_ms>$2 AND interval_start_ms<$3
+            AND LEAST(interval_end_ms, $3) > GREATEST(interval_start_ms, $2)
+            AND ($4::text IS NULL OR workspace_id=$4)
+            AND ($5::text IS NULL OR attributed_cat_id=$5)
+          GROUP BY metric"
+    );
+    let rows = client
+        .query(
+            &sql,
+            &[
+                &query.billing_account_id,
+                &query.interval_start_unix_ms,
+                &query.interval_end_unix_ms,
+                &query.workspace_id,
+                &query.attributed_cat_id,
+            ],
+        )
+        .map_err(|error| pg_error("aggregate usage totals", error))?;
+    let mut totals = Vec::new();
+    let mut latest_interval_end_unix_ms: Option<i64> = None;
+    for row in &rows {
+        let metric: String = row.get(0);
+        let quantity: String = row.get(1);
+        let latest_end: i64 = row.get(2);
+        let metric = metric_from_slug(&metric)?;
+        let quantity = quantity
+            .parse::<u128>()
+            .map_err(|_| MeteringError::Invalid(format!("usage total {quantity} is not a u128")))?;
+        // The fold records a row's clipped end before it discards a zero
+        // quantity, so a metric that prorates entirely to zero still advances
+        // how far usage is visible. Filtering zero here rather than in `HAVING`
+        // keeps that: the group is dropped from the totals, not from the max.
+        if quantity > 0 {
+            totals.push(UsageAggregate { metric, quantity });
+        }
+        latest_interval_end_unix_ms = Some(
+            latest_interval_end_unix_ms
+                .unwrap_or(i64::MIN)
+                .max(latest_end),
+        );
+    }
+    totals.sort_by_key(|aggregate| aggregate.metric.slug());
+    Ok(UsageTotals {
+        totals,
+        latest_interval_end_unix_ms,
+    })
+}
+
 fn stored_checkpoint_from_row(row: &Row) -> Result<StoredCheckpoint> {
     Ok(StoredCheckpoint {
         event_id: row.get(0),
@@ -1453,6 +1619,110 @@ fn pg_error(context: &str, error: postgres::Error) -> MeteringError {
 mod tests {
     use super::*;
     use cats_metering::{deterministic_event_id, UsageAggregate};
+
+    /// The worker resolves this on every connect, so a rotated credential
+    /// reaches the next reconnect instead of waiting for a restart that a
+    /// stale credential would prevent anyway.
+    #[test]
+    fn the_dsn_is_read_again_for_every_connect() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("usage-postgres-url");
+        let dsn = DsnSource::File(path.clone());
+
+        fs::write(&path, "postgres://cats:before@db.example/cats\n").unwrap();
+        assert_eq!(
+            dsn.resolve().unwrap(),
+            "postgres://cats:before@db.example/cats"
+        );
+
+        fs::write(&path, "postgres://cats:after@db.example/cats\n").unwrap();
+        assert_eq!(
+            dsn.resolve().unwrap(),
+            "postgres://cats:after@db.example/cats"
+        );
+    }
+
+    #[test]
+    fn an_absent_or_empty_dsn_file_is_reported_as_such() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("absent");
+        let error = DsnSource::File(missing.clone()).resolve().unwrap_err();
+        assert!(error.to_string().contains(&missing.display().to_string()));
+
+        let empty = directory.path().join("empty");
+        fs::write(&empty, "\n\n").unwrap();
+        let error = DsnSource::File(empty).resolve().unwrap_err();
+        assert!(error.to_string().contains("is empty"), "{error}");
+    }
+
+    #[test]
+    fn a_literal_dsn_stays_fixed() {
+        let dsn = DsnSource::Literal("postgres://cats@db.example/cats".to_string());
+        assert_eq!(dsn.resolve().unwrap(), "postgres://cats@db.example/cats");
+    }
+
+    /// A renderer writes this file, and a trailing newline is the norm. Left
+    /// in, it becomes part of the database name and the failure is baffling.
+    #[test]
+    fn surrounding_whitespace_is_not_part_of_the_dsn() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("usage-postgres-url");
+        fs::write(&path, "  postgres://cats@db.example/cats\n").unwrap();
+        assert_eq!(
+            DsnSource::File(path).resolve().unwrap(),
+            "postgres://cats@db.example/cats"
+        );
+    }
+
+    /// The DSN carries the password. An error about the file may name the
+    /// file; it may never quote what is inside it.
+    #[test]
+    fn a_dsn_file_error_never_quotes_the_credential() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("usage-postgres-url");
+        fs::write(&path, "not a dsn but it contains hunter2\n").unwrap();
+        let resolved = DsnSource::File(path).resolve().unwrap();
+        // Resolution does not validate; the driver rejects a bad DSN. What
+        // matters is that the value never lands in one of our messages.
+        assert!(resolved.contains("hunter2"));
+
+        // A directory cannot be read as a file, so this exercises the same
+        // error path with contents that must not be echoed.
+        let error = DsnSource::File(directory.path().to_path_buf())
+            .resolve()
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("hunter2"), "credential leaked: {error}");
+    }
+
+    /// A worker that cannot reconnect must say so. Before this change the job
+    /// was dropped unrun and the caller saw "operation was canceled", which
+    /// says nothing about the credential that actually failed.
+    #[test]
+    fn a_worker_without_a_connection_reports_the_reason() {
+        let (jobs, receiver) = mpsc::channel::<Job>();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        jobs.send(Box::new(move |client| {
+            let _ = result_tx.send(match client {
+                Ok(_) => Ok(()),
+                Err(error) => Err(error),
+            });
+        }))
+        .unwrap();
+        drop(jobs);
+
+        for job in receiver {
+            job(Err(MeteringError::Store(
+                "connect PostgreSQL: FATAL password authentication failed [28P01]".to_string(),
+            )));
+        }
+
+        let error = result_rx.recv().unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("password authentication failed"),
+            "the reason must survive the worker boundary: {error}"
+        );
+    }
 
     #[test]
     fn schema_names_are_strictly_validated() {

@@ -106,6 +106,34 @@ variable "performance_insights_enabled" {
   default     = false
 }
 
+variable "log_retention_days" {
+  type        = number
+  description = "Retention for the exported PostgreSQL error log. Long enough to reconstruct an incident, short enough not to accumulate cost."
+  default     = 30
+
+  validation {
+    condition     = var.log_retention_days >= 7
+    error_message = "Keep at least a week: this log is the only place a credential or connection failure is stated plainly."
+  }
+}
+
+# Required, with no default, and validated non-empty.
+#
+# This started as a `check` block, which only warns: a caller could omit it and
+# still apply successfully, producing an alarm with `alarm_actions = []` -- an
+# alarm that changes colour in a console nobody watches. That is the state the
+# three usage-pipeline alarms are already in, and it is part of why a credential
+# failure went unnoticed for thirteen hours. Refusing to plan is the point.
+variable "alarm_action_arns" {
+  type        = list(string)
+  description = "SNS topics notified when PostgreSQL rejects a connection's credentials. Required: an alarm nobody receives is not a detector."
+
+  validation {
+    condition     = length(var.alarm_action_arns) > 0
+    error_message = "alarm_action_arns must name at least one SNS topic, or the credential alarm notifies nobody. Confirm the topic's subscription too: Terraform reports an unconfirmed email subscription as created."
+  }
+}
+
 variable "tags" {
   type        = map(string)
   description = "Additional tags."

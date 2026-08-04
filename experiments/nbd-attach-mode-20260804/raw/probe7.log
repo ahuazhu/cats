@@ -1,0 +1,17 @@
+### mode=netlink
+  write: IOPS=15.1k, BW=59.2MiB/s (62.0MB/s)(1479MiB/25002msec); 0 zone resets
+   iops        : min= 1096, max=22068, avg=15017.31, stdev=8768.52, samples=49
+/tmp/probe7.sh: line 5: 18224 Killed                  $BLOCKD --volume-id v --attachment-id a --lease-ttl-ms 5000 --data-dir $R/data --metadata-store-adapter sqlite --metadata-store-option path=$R/meta.db --object-store-adapter file --object-store-option root=$R/blob --listen-unix $R/nbd.sock --create-volume-size $((1024*1024*1024)) > $R/log 2>&1
+### mode=ioctl
+  write: IOPS=14.1k, BW=55.0MiB/s (57.7MB/s)(1376MiB/25002msec); 0 zone resets
+   iops        : min=   58, max=22092, avg=13930.49, stdev=9222.34, samples=49
+/tmp/probe7.sh: line 5: 18261 Killed                  $BLOCKD --volume-id v --attachment-id a --lease-ttl-ms 5000 --data-dir $R/data --metadata-store-adapter sqlite --metadata-store-option path=$R/meta.db --object-store-adapter file --object-store-option root=$R/blob --listen-unix $R/nbd.sock --create-volume-size $((1024*1024*1024)) > $R/log 2>&1
+### mode=netlink
+  write: IOPS=15.0k, BW=58.6MiB/s (61.5MB/s)(1465MiB/25002msec); 0 zone resets
+   iops        : min=   60, max=21942, avg=14870.98, stdev=8741.08, samples=49
+/tmp/probe7.sh: line 5: 18305 Killed                  $BLOCKD --volume-id v --attachment-id a --lease-ttl-ms 5000 --data-dir $R/data --metadata-store-adapter sqlite --metadata-store-option path=$R/meta.db --object-store-adapter file --object-store-option root=$R/blob --listen-unix $R/nbd.sock --create-volume-size $((1024*1024*1024)) > $R/log 2>&1
+### mode=ioctl
+  write: IOPS=13.2k, BW=51.7MiB/s (54.2MB/s)(1292MiB/25002msec); 0 zone resets
+   iops        : min=   94, max=22204, avg=13054.61, stdev=9532.78, samples=49
+/tmp/probe7.sh: line 5: 18343 Killed                  $BLOCKD --volume-id v --attachment-id a --lease-ttl-ms 5000 --data-dir $R/data --metadata-store-adapter sqlite --metadata-store-option path=$R/meta.db --object-store-adapter file --object-store-option root=$R/blob --listen-unix $R/nbd.sock --create-volume-size $((1024*1024*1024)) > $R/log 2>&1
+PROBE7 DONE

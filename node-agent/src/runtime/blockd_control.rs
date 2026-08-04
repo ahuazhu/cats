@@ -4,6 +4,9 @@ use cats_block_client::NbdClient;
 
 pub(super) struct BlockdProc {
     pub(super) child: ProcHandle,
+    /// Where this process's stderr was redirected. A blockd that dies during
+    /// startup has already written why it died here, and nowhere else.
+    pub(super) log_path: PathBuf,
     /// NBD socket: readiness probe, golden-root seeding and recovery tooling.
     /// Always present, on both block paths.
     pub(super) socket: PathBuf,
@@ -256,8 +259,8 @@ impl NodeRuntime {
                 .arg("--vhost-user-queue-size")
                 .arg(chc.vhost_user_queue_size.to_string());
         }
-        let log = std::fs::File::create(cat_dir.join(format!("blockd-{}.log", grant.disk_id)))
-            .context("create blockd log")?;
+        let log_path = blockd_log_path(cat_dir, &grant.disk_id);
+        let log = std::fs::File::create(&log_path).context("create blockd log")?;
         for option in self.cfg.metadata_store.config.to_cli() {
             cmd.arg("--metadata-store-option").arg(option);
         }
@@ -272,6 +275,7 @@ impl NodeRuntime {
             .context("spawn cats-blockd")?;
         let mut proc = BlockdProc {
             child: ProcHandle::Owned(child),
+            log_path,
             socket,
             vhost_user_socket,
             control_socket,
@@ -290,12 +294,117 @@ impl NodeRuntime {
                 return Ok(());
             }
             if proc.child.exited()? {
-                bail!("cats-blockd exited during startup (lease held or bad config?)");
+                // Quote what blockd actually said. Guessing here ("lease held or
+                // bad config?") sent an operator looking for a stale lease while
+                // the log held `connect PostgreSQL: FATAL password
+                // authentication failed`, and the wrong hypothesis was acted on.
+                let reason = blockd_failure_reason(&proc.log_path);
+                match proc.child.owned_exit_status() {
+                    Some(status) => {
+                        bail!("cats-blockd exited during startup: {status}: {reason}")
+                    }
+                    None => bail!("cats-blockd exited during startup: {reason}"),
+                }
             }
             if Instant::now() > deadline {
                 bail!("timed out waiting for blockd socket");
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+}
+
+/// Where a blockd's stderr goes. Shared with adoption, which has to name the
+/// same file for a process it did not spawn.
+pub(super) fn blockd_log_path(cat_dir: &Path, disk_id: &str) -> PathBuf {
+    cat_dir.join(format!("blockd-{disk_id}.log"))
+}
+
+/// The tail of blockd's own stderr, for reporting why it exited.
+///
+/// Bounded: this is read into an error message, and the log also carries steady
+/// -state warnings we do not want to quote wholesale.
+fn blockd_failure_reason(log_path: &Path) -> String {
+    const MAX_LINES: usize = 6;
+    const MAX_CHARS: usize = 600;
+    match std::fs::read_to_string(log_path) {
+        Ok(contents) => {
+            let tail = contents
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .rev()
+                .take(MAX_LINES)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join(" | ");
+            if tail.is_empty() {
+                format!("no output in {}", log_path.display())
+            } else {
+                tail.chars().take(MAX_CHARS).collect()
+            }
+        }
+        Err(error) => format!("could not read {}: {error}", log_path.display()),
+    }
+}
+
+#[cfg(test)]
+mod failure_reason_tests {
+    use super::blockd_failure_reason;
+
+    /// A startup failure must quote what blockd wrote, not a guess.
+    ///
+    /// The message used to be a fixed "(lease held or bad config?)". During the
+    /// 2026-08-04 outage the log actually held a PostgreSQL authentication
+    /// failure, so the hint pointed at a stale lease that did not exist and the
+    /// wrong hypothesis was acted on.
+    #[test]
+    fn the_reason_comes_from_the_log_not_a_guess() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("blockd-disk_a.log");
+        std::fs::write(
+            &log,
+            "Error: open metadata store\n\nCaused by:\n    connect PostgreSQL: FATAL \
+             password authentication failed for user \"catsadmin\" [28P01]\n",
+        )
+        .unwrap();
+        let reason = blockd_failure_reason(&log);
+        assert!(
+            reason.contains("password authentication failed"),
+            "the operator must see the real cause, got: {reason}"
+        );
+        assert!(!reason.contains("lease held"));
+    }
+
+    /// A missing or silent log must say so rather than produce an empty reason.
+    #[test]
+    fn an_absent_or_empty_log_is_reported_as_such() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.log");
+        assert!(blockd_failure_reason(&missing).contains("could not read"));
+
+        let empty = dir.path().join("empty.log");
+        std::fs::write(&empty, "\n\n   \n").unwrap();
+        assert!(blockd_failure_reason(&empty).contains("no output"));
+    }
+
+    /// A long, chatty log must not be quoted wholesale into an error.
+    #[test]
+    fn a_long_log_is_bounded_and_keeps_the_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("chatty.log");
+        let mut contents = String::new();
+        for line in 0..500 {
+            contents.push_str(&format!("warn: nbd request rejected #{line}\n"));
+        }
+        contents.push_str("Error: the thing that actually killed it\n");
+        std::fs::write(&log, contents).unwrap();
+        let reason = blockd_failure_reason(&log);
+        assert!(
+            reason.contains("actually killed it"),
+            "the tail is the interesting part: {reason}"
+        );
+        assert!(reason.len() <= 600, "bounded, got {} chars", reason.len());
     }
 }

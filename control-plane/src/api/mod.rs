@@ -25,8 +25,8 @@ use cats_api::billing::{BillingBalance, CreateCheckoutRequest, CreateCheckoutRes
 use cats_api::error::{ApiError, ErrorBody, ErrorCode};
 use cats_api::metering::{
     CatUsageSummary, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse,
-    UsageDetailLine, UsageMetric, UsageReport, UsageSummaryLine, UsageTimeBucket,
-    MAX_USAGE_INGEST_BODY_BYTES,
+    RejectedCheckpoint, UsageDetailLine, UsageMetric, UsageReport, UsageSummaryLine,
+    UsageTimeBucket, MAX_USAGE_INGEST_BODY_BYTES,
 };
 use cats_api::oci::{DeployOciRequest, OciDeployment};
 use cats_api::requests::*;

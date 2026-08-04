@@ -71,6 +71,20 @@ impl ProcHandle {
         }
     }
 
+    /// The wait status of an owned child that has already exited.
+    ///
+    /// `None` for an adopted process: its status went to whoever really
+    /// parented it, so there is nothing here to wait for. Only worth asking
+    /// after [`Self::exited`] says the process is gone; it exists so a startup
+    /// failure can still report *how* a child this agent spawned died, next to
+    /// what its log said.
+    pub(crate) fn owned_exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        match self {
+            Self::Owned(child) => child.try_wait().ok().flatten(),
+            Self::Adopted { .. } => None,
+        }
+    }
+
     /// Terminate the process and leave nothing waitable behind.
     pub(crate) fn kill_and_reap(&mut self) {
         match self {

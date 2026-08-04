@@ -200,6 +200,10 @@ fn proven_resident_runtime(
             blockd.grant.disk_id.clone(),
             BlockdProc {
                 child,
+                // Same path `spawn_blockd` redirects stderr to. An adopted
+                // blockd is still writing to the file the agent that spawned
+                // it created, so a later startup failure quotes the right log.
+                log_path: blockd_log_path(&record.dir, &blockd.grant.disk_id),
                 socket: blockd.socket.clone(),
                 vhost_user_socket: blockd.vhost_user_socket.clone(),
                 control_socket: blockd.control_socket.clone(),

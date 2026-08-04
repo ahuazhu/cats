@@ -6,7 +6,7 @@ use cats_metadata_store_sqlite::SqliteMetadataStoreFactory;
 use cats_metering::{CreditStore, SqliteUsageStore, UsageStore};
 use cats_storage::{open_metadata_store, AdapterConfig, MetadataStoreFactory};
 use cats_usage_store_aws_stream::{AwsUsageStreamConfig, AwsUsageStreamStore};
-use cats_usage_store_postgres::{PostgresUsageStore, DEFAULT_SCHEMA, DEFAULT_WORKERS};
+use cats_usage_store_postgres::{DsnSource, PostgresUsageStore, DEFAULT_SCHEMA, DEFAULT_WORKERS};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -53,6 +53,14 @@ struct Args {
         default_value = "CATS_USAGE_POSTGRES_URL"
     )]
     usage_postgres_url_env: String,
+    /// File holding the usage PostgreSQL URL, re-read on every connect.
+    ///
+    /// Prefer this over `--usage-postgres-url-env` wherever the password is
+    /// rotated: an environment variable is fixed for the life of the process,
+    /// so a reconnect after a rotation presents a credential the server has
+    /// already stopped accepting. Takes precedence when both are given.
+    #[arg(long, env = "CATS_USAGE_POSTGRES_URL_FILE")]
+    usage_postgres_url_file: Option<std::path::PathBuf>,
     #[arg(long, env = "CATS_USAGE_POSTGRES_CA_FILE")]
     usage_postgres_ca_file: Option<String>,
     #[arg(
@@ -238,14 +246,36 @@ async fn main() -> anyhow::Result<()> {
                 (store.clone(), store)
             }
             "postgres" => {
-                let url = std::env::var(&args.usage_postgres_url_env).map_err(|_| {
-                    anyhow::anyhow!(
-                        "usage PostgreSQL URL environment variable {} is not set",
-                        args.usage_postgres_url_env
-                    )
-                })?;
-                let store = Arc::new(PostgresUsageStore::connect(
-                    &url,
+                let dsn = match args.usage_postgres_url_file.as_deref() {
+                    Some(path) => {
+                        // The metadata adapter refuses this ambiguity outright.
+                        // Here it cannot: --usage-postgres-url-env carries a
+                        // clap default, so it is always "set". Say plainly
+                        // which source won instead of ranking them in silence
+                        // -- an operator mid-cutover has both in place, and
+                        // which one holds the current password is the exact
+                        // question that cost an outage.
+                        if std::env::var_os(&args.usage_postgres_url_env).is_some() {
+                            tracing::warn!(
+                                file = %path.display(),
+                                ignored_environment_variable = %args.usage_postgres_url_env,
+                                "usage PostgreSQL DSN comes from the file; the environment \
+                                 variable is set but not read"
+                            );
+                        }
+                        DsnSource::File(path.to_path_buf())
+                    }
+                    None => DsnSource::Literal(
+                        std::env::var(&args.usage_postgres_url_env).map_err(|_| {
+                            anyhow::anyhow!(
+                                "usage PostgreSQL URL environment variable {} is not set",
+                                args.usage_postgres_url_env
+                            )
+                        })?,
+                    ),
+                };
+                let store = Arc::new(PostgresUsageStore::connect_from(
+                    &dsn,
                     args.usage_postgres_ca_file.as_deref(),
                     &args.usage_postgres_schema,
                     args.usage_postgres_workers,

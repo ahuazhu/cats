@@ -318,6 +318,16 @@ pub struct NodeTelemetry {
     pub wake_commitment_budget_bytes: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cat_resources: Vec<CatResourceTelemetry>,
+    /// Kernel NBD devices the host holds connected to a server that is gone,
+    /// and the size of the pool they come from. Absent off the kernel-NBD
+    /// path. Nothing reported these before, so a pool two thirds leaked looked
+    /// exactly like a pool two thirds busy until the host deadlocked on it
+    /// (issue #79); the total is reported alongside so an alarm can be a
+    /// fraction of the pool rather than a bare count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leaked_nbd_devices: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nbd_devices_total: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_logical_cpus: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

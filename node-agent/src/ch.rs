@@ -318,9 +318,310 @@ fn nbd_lock() -> Result<std::fs::File> {
     Ok(file)
 }
 
-fn nbd_device_busy(n: u32) -> bool {
-    // A connected NBD device exposes a `pid` attribute.
-    Path::new(&format!("/sys/block/nbd{n}/pid")).exists()
+/// Where the kernel publishes per-device NBD state, and where process liveness
+/// is read from.
+///
+/// Fixed in production. It is a value rather than a constant only so the scan
+/// and the reclaim sweep can be exercised against a fixture on a host that has
+/// no nbd driver.
+#[derive(Debug, Clone)]
+struct NbdSysfs {
+    sys_block: PathBuf,
+    proc_root: PathBuf,
+}
+
+impl Default for NbdSysfs {
+    fn default() -> Self {
+        Self {
+            sys_block: PathBuf::from("/sys/block"),
+            proc_root: PathBuf::from("/proc"),
+        }
+    }
+}
+
+/// What the kernel currently holds on one `/dev/nbdN`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NbdDeviceState {
+    /// No server and no capacity: allocatable.
+    Free,
+    /// A live process is serving the device.
+    Serving { pid: i32 },
+    /// The kernel still has the device connected, but nothing is serving it.
+    ///
+    /// The slot is spent: it can never be allocated and, on a device attached
+    /// the way an older node agent attached them, nothing but an explicit
+    /// disconnect gets it back. 27 of a 64-device pool were in this state on
+    /// `metal-1` on 2026-08-04, and nothing reported the number.
+    ///
+    /// I/O to such a device fails rather than hangs — a measured `EIO` in
+    /// every mode tried (`experiments/nbd-attach-mode-20260804/`). That run
+    /// did not reproduce the uninterruptible-sleep stalls seen during the
+    /// incident, so treat those as observed alongside pool exhaustion, not as
+    /// demonstrated to follow from touching one of these.
+    Leaked { pid: Option<i32> },
+}
+
+/// Attach through the classic ioctl interface instead of `nbd-client`'s
+/// default netlink one.
+///
+/// This is what makes a leaked device both rare and recognizable, measured on
+/// Linux 6.17 with nbd-client 3.26.1 against a real `cats-blockd`
+/// (`experiments/nbd-attach-mode-20260804/`):
+///
+/// * Netlink leaves no process behind. `/sys/block/nbdN/pid` names the
+///   nbd-client that configured the device and then exited, so it is a dead
+///   pid on a perfectly healthy device -- a leaked device and a working one
+///   are byte-for-byte identical in sysfs, and no scan can tell them apart.
+///   Worse, nothing ever reclaims one: with no resident client the kernel
+///   holds the configuration open waiting for a reconnect that never comes,
+///   and the device stays connected even after its last opener closes.
+/// * ioctl keeps one `nbd-client` resident per device. When the server dies
+///   the client's ioctl returns and it clears the socket, so the usual case
+///   reclaims itself. When something still holds the device open -- Cloud
+///   Hypervisor, in production -- the device is left with a *dead* recorded
+///   pid and a non-zero size, which is exactly the state
+///   [`NbdDeviceState::Leaked`] recognizes.
+///
+/// The trade-off, same run: sequential O_DIRECT writes are a wash (36.0/36.1
+/// vs 36.0/33.4 MB/s), 4 KiB random writes measured 7-12% lower under ioctl
+/// (55.0/51.7 vs 59.2/58.6 MiB/s over two rounds each). That is a debug build
+/// against a file-backed object store, so it bounds nothing in production; see
+/// ADR-0015 for why this is a question about the kernel-NBD default at all.
+const NBD_IOCTL_MODE: &str = "-nonetlink";
+
+/// A leaked device is disconnected before the node agent registers, so the
+/// sweep must not be the reason a host stays out of service. All of them are
+/// disconnected concurrently and share this deadline.
+const NBD_RECLAIM_TIMEOUT: Duration = Duration::from_secs(30);
+/// The kernel clears `pid` and resets the capacity from the disconnect ioctl,
+/// not necessarily before `nbd-client` has exited.
+const NBD_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn nbd_attribute(sysfs: &NbdSysfs, n: u32, name: &str) -> Option<String> {
+    std::fs::read_to_string(sysfs.sys_block.join(format!("nbd{n}")).join(name))
+        .ok()
+        .map(|value| value.trim().to_string())
+}
+
+fn nbd_device_state_of(sysfs: &NbdSysfs, n: u32) -> NbdDeviceState {
+    // A connected NBD device exposes a `pid` attribute naming the task that
+    // serves it, and a non-zero `size`. Both are driver attributes: reading
+    // them costs no I/O to the device at all (measured at 1-2 ms against
+    // leaked devices), which is what makes this scan cheap enough to run on
+    // the heartbeat and safe to point at devices nothing is serving.
+    // This only discriminates because the attach uses [`NBD_IOCTL_MODE`]: the
+    // recorded pid is then a resident `nbd-client`, alive for exactly as long
+    // as the device is served. Under nbd-client's default netlink mode the
+    // recorded pid is dead on healthy devices too, and every judgement below
+    // would be a false positive.
+    let pid = nbd_attribute(sysfs, n, "pid").and_then(|pid| pid.parse::<i32>().ok());
+    match pid {
+        // A live pid is trusted. Proving it is still the *same* process that
+        // attached needs the recorded process identity (start ticks), which
+        // the node agent does not persist today; without it, pid reuse can
+        // only make this scan leave a leaked device alone, never disconnect a
+        // live one.
+        Some(pid) if pid > 0 && sysfs.proc_root.join(pid.to_string()).is_dir() => {
+            NbdDeviceState::Serving { pid }
+        }
+        Some(pid) => NbdDeviceState::Leaked { pid: Some(pid) },
+        // No serving task, but the kernel still reports a capacity: the device
+        // is half torn down, and just as unusable.
+        None => {
+            let sectors = nbd_attribute(sysfs, n, "size")
+                .and_then(|size| size.parse::<u64>().ok())
+                .unwrap_or(0);
+            if sectors > 0 {
+                NbdDeviceState::Leaked { pid: None }
+            } else {
+                NbdDeviceState::Free
+            }
+        }
+    }
+}
+
+/// Whether a live process still has `/dev/nbdN` open.
+///
+/// The guard on every disconnect this module issues. A device attached by an
+/// older node agent — before [`NBD_IOCTL_MODE`] — records a dead pid even when
+/// it is healthy and serving a Cat, so on the first boot after that change the
+/// sweep would otherwise pull the disk out from under a running Guest. Nothing
+/// in sysfs distinguishes those two, but an open file descriptor does: Cloud
+/// Hypervisor holds the device for as long as the Cat runs, and a genuinely
+/// leaked device is held by nobody.
+///
+/// Conservative in the safe direction. A leaked device that some orphan still
+/// holds open is left alone and stays visible in the leak count until that
+/// process goes; a device in use is never disconnected.
+fn nbd_device_is_open(sysfs: &NbdSysfs, n: u32) -> bool {
+    let device = PathBuf::from(format!("/dev/nbd{n}"));
+    let Ok(entries) = std::fs::read_dir(&sysfs.proc_root) else {
+        // Without /proc there is no way to prove the device is unused, and an
+        // unprovable disconnect is not one worth issuing.
+        return true;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .chars()
+            .all(|c| c.is_ascii_digit())
+        {
+            continue;
+        }
+        let Ok(descriptors) = std::fs::read_dir(entry.path().join("fd")) else {
+            // A process that exited mid-scan, or one this agent may not look
+            // into. Neither can be holding a device open on our behalf.
+            continue;
+        };
+        for descriptor in descriptors.flatten() {
+            if std::fs::read_link(descriptor.path()).is_ok_and(|target| target == device) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn leaked_nbd_devices_of(sysfs: &NbdSysfs, devices: u32) -> Vec<u32> {
+    (0..devices)
+        .filter(|n| {
+            matches!(
+                nbd_device_state_of(sysfs, *n),
+                NbdDeviceState::Leaked { .. }
+            )
+        })
+        .collect()
+}
+
+/// How many devices in the pool the kernel holds connected with no server
+/// behind them.
+///
+/// Cheap enough for the heartbeat: two attribute reads per device. Nothing
+/// reported this count before, so a pool that was two thirds leaked looked
+/// exactly like a pool that was two thirds busy (issue #79).
+pub fn leaked_nbd_device_count(cfg: &ChConfig) -> u64 {
+    leaked_nbd_devices_of(&NbdSysfs::default(), cfg.nbd_devices).len() as u64
+}
+
+/// What one reclaim sweep managed to disconnect.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct NbdReclaim {
+    pub reclaimed: Vec<String>,
+    /// Still connected after the sweep asked for a disconnect, usually
+    /// because something still holds the device open. Excluded from
+    /// allocation until it settles.
+    pub unreclaimed: Vec<String>,
+}
+
+/// Disconnect every device the kernel holds connected to a server that is gone.
+///
+/// The node agent runs this at boot, before it registers and can be given a
+/// `StartCat`. A blockd killed without a teardown — which one `systemctl stop`
+/// of the worker does to every blockd in the unit cgroup — leaves its device
+/// behind, and nothing else ever reclaims it, so without this pass the pool
+/// only shrinks (issue #79).
+pub fn reclaim_leaked_nbd_devices(cfg: &ChConfig) -> Result<NbdReclaim> {
+    let sysfs = NbdSysfs::default();
+    let _lock = nbd_lock()?;
+    Ok(reclaim_leaked_nbd_devices_of(cfg, &sysfs))
+}
+
+fn reclaim_leaked_nbd_devices_of(cfg: &ChConfig, sysfs: &NbdSysfs) -> NbdReclaim {
+    let mut report = NbdReclaim::default();
+    let leaked = leaked_nbd_devices_of(sysfs, cfg.nbd_devices);
+    if leaked.is_empty() {
+        return report;
+    }
+    tracing::warn!(
+        leaked = leaked.len(),
+        pool = cfg.nbd_devices,
+        "reclaiming kernel NBD devices left connected to a dead server"
+    );
+    // Disconnect concurrently: `nbd-client -d` has always returned promptly in
+    // practice (all 27 devices of the 2026-08-04 incident disconnected
+    // cleanly), but one that does not must not hold up the whole node.
+    let mut pending: Vec<(u32, String, Option<Child>)> = Vec::new();
+    for n in leaked {
+        let dev = format!("/dev/nbd{n}");
+        if nbd_device_is_open(sysfs, n) {
+            tracing::warn!(
+                device = %dev,
+                "leaving a leaked NBD device alone: a live process still has it open"
+            );
+            report.unreclaimed.push(dev);
+            continue;
+        }
+        match Command::new(&cfg.nbd_client_bin)
+            .args(["-d", &dev])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => pending.push((n, dev, Some(child))),
+            Err(error) => {
+                tracing::error!(device = %dev, %error, "could not run nbd-client");
+                pending.push((n, dev, None));
+            }
+        }
+    }
+    let deadline = Instant::now() + NBD_RECLAIM_TIMEOUT;
+    for (n, dev, child) in &mut pending {
+        if let Some(child) = child {
+            wait_for_exit(child, deadline);
+        }
+        if wait_until_free(sysfs, *n, deadline) {
+            report.reclaimed.push(std::mem::take(dev));
+        } else {
+            report.unreclaimed.push(std::mem::take(dev));
+        }
+    }
+    report
+}
+
+/// Wait for a child until `deadline` and then stop waiting on it.
+///
+/// A `nbd-client -d` that is itself stuck in the kernel cannot be killed, so
+/// abandoning it is all the deadline can do; it is reaped by the next wait if
+/// it ever finishes.
+fn wait_for_exit(child: &mut Child, deadline: Instant) {
+    loop {
+        match child.try_wait() {
+            Ok(None) => {}
+            _ => return,
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_until_free(sysfs: &NbdSysfs, n: u32, deadline: Instant) -> bool {
+    let deadline = deadline.min(Instant::now() + NBD_SETTLE_TIMEOUT);
+    loop {
+        if nbd_device_state_of(sysfs, n) == NbdDeviceState::Free {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Disconnect one leaked device and report whether the kernel let go of it.
+///
+/// A `false` here does not mean the disconnect was refused: a device someone
+/// still holds open keeps its attributes until the last opener closes
+/// (measured: cleared 200 ms after the holder exited). Either way it is not
+/// safe to allocate, which is all the caller asks.
+fn reclaim_nbd_device(cfg: &ChConfig, sysfs: &NbdSysfs, n: u32) -> bool {
+    if nbd_device_is_open(sysfs, n) {
+        return false;
+    }
+    nbd_detach(cfg, &format!("/dev/nbd{n}"));
+    wait_until_free(sysfs, n, Instant::now() + NBD_SETTLE_TIMEOUT)
 }
 
 /// Attach the blockd unix socket to a specific or any free /dev/nbdN.
@@ -329,6 +630,7 @@ pub fn nbd_attach(
     blockd_socket: &Path,
     want_device: Option<&str>,
 ) -> Result<String> {
+    let sysfs = NbdSysfs::default();
     let _lock = nbd_lock()?;
     let candidates: Vec<String> = match want_device {
         Some(dev) => vec![dev.to_string()],
@@ -336,18 +638,43 @@ pub fn nbd_attach(
             .map(|n| format!("/dev/nbd{n}"))
             .collect(),
     };
+    let mut serving = 0;
+    let mut unreclaimable = 0;
     for dev in candidates {
-        let n: u32 = dev
-            .trim_start_matches("/dev/nbd")
-            .parse()
-            .unwrap_or(u32::MAX);
-        if n == u32::MAX || nbd_device_busy(n) {
-            if want_device.is_some() {
-                bail!("required NBD device {dev} is busy");
+        let Ok(n) = dev.trim_start_matches("/dev/nbd").parse::<u32>() else {
+            bail!("required NBD device {dev} is not a kernel NBD device");
+        };
+        match nbd_device_state_of(&sysfs, n) {
+            NbdDeviceState::Free => {}
+            NbdDeviceState::Serving { pid } => {
+                if want_device.is_some() {
+                    bail!("required NBD device {dev} is busy (served by pid {pid})");
+                }
+                serving += 1;
+                continue;
             }
-            continue;
+            // Never hand a Cat a device the kernel still has connected to a
+            // dead server: its I/O fails, so the Guest would come up with a
+            // broken root disk. Reclaiming here also returns the slot to the
+            // pool instead of losing it until the next boot.
+            NbdDeviceState::Leaked { pid } => {
+                tracing::warn!(
+                    device = %dev,
+                    leaked_pid = ?pid,
+                    "reclaiming a kernel NBD device left connected to a dead server"
+                );
+                if !reclaim_nbd_device(cfg, &sysfs, n) {
+                    tracing::error!(device = %dev, "leaked NBD device is still connected after a disconnect; something is holding it open");
+                    if want_device.is_some() {
+                        bail!("required NBD device {dev} is leaked and is still connected");
+                    }
+                    unreclaimable += 1;
+                    continue;
+                }
+            }
         }
         let out = Command::new(&cfg.nbd_client_bin)
+            .arg(NBD_IOCTL_MODE)
             .arg("-unix")
             .arg(blockd_socket)
             .arg(&dev)
@@ -365,9 +692,8 @@ pub fn nbd_attach(
         // Wait until the kernel reports a non-zero size.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let size: u64 = std::fs::read_to_string(format!("/sys/block/nbd{n}/size"))
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
+            let size: u64 = nbd_attribute(&sysfs, n, "size")
+                .and_then(|size| size.parse().ok())
                 .unwrap_or(0);
             if size > 0 {
                 return Ok(dev);
@@ -378,7 +704,11 @@ pub fn nbd_attach(
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-    bail!("no free /dev/nbdN device (raise --ch-nbd-devices / nbds_max)")
+    bail!(
+        "no free /dev/nbdN device in a pool of {} ({serving} busy, {unreclaimable} leaked and \
+         still connected); raise --ch-nbd-devices / nbds_max",
+        cfg.nbd_devices
+    )
 }
 
 pub fn nbd_detach(cfg: &ChConfig, dev: &str) {
@@ -757,6 +1087,222 @@ mod tests {
         // The Phase A path stays the default until the vhost-user path passes a
         // real-VMM acceptance run (ADR-0015).
         assert_eq!(BlockPath::default(), BlockPath::KernelNbd);
+    }
+
+    /// A stand-in for `/sys/block` and `/proc`, so the leak scan can be
+    /// exercised on a host that has no nbd driver.
+    struct FakeSysfs {
+        _dir: tempfile::TempDir,
+        sysfs: NbdSysfs,
+    }
+
+    impl FakeSysfs {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let sysfs = NbdSysfs {
+                sys_block: dir.path().join("sys-block"),
+                proc_root: dir.path().join("proc"),
+            };
+            std::fs::create_dir_all(&sysfs.sys_block).unwrap();
+            std::fs::create_dir_all(&sysfs.proc_root).unwrap();
+            Self { _dir: dir, sysfs }
+        }
+
+        fn device(&self, n: u32) -> PathBuf {
+            let dir = self.sysfs.sys_block.join(format!("nbd{n}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        /// The kernel's view of a connected device: a serving task and a size.
+        fn connected(&self, n: u32, pid: i32) {
+            let dir = self.device(n);
+            std::fs::write(dir.join("pid"), format!("{pid}\n")).unwrap();
+            std::fs::write(dir.join("size"), "2097152\n").unwrap();
+        }
+
+        /// Connected with no serving task at all: the half-torn-down shape.
+        fn sized_without_a_server(&self, n: u32) {
+            std::fs::write(self.device(n).join("size"), "2097152\n").unwrap();
+        }
+
+        fn free(&self, n: u32) {
+            std::fs::write(self.device(n).join("size"), "0\n").unwrap();
+        }
+
+        fn live_process(&self, pid: i32) {
+            std::fs::create_dir_all(self.sysfs.proc_root.join(pid.to_string())).unwrap();
+        }
+    }
+
+    fn probe_config(nbd_client_bin: PathBuf, nbd_devices: u32) -> ChConfig {
+        ChConfig {
+            block_direct: false,
+            ch_bin: PathBuf::from("ch"),
+            kernel: PathBuf::from("vmlinuz"),
+            initramfs: None,
+            cmdline: String::new(),
+            seed_image: None,
+            block_path: BlockPath::KernelNbd,
+            vhost_user_queues: 1,
+            vhost_user_queue_size: 256,
+            nbd_client_bin,
+            nbd_devices,
+            network_cidr: None,
+            ip_bin: PathBuf::from("ip"),
+        }
+    }
+
+    /// The pool has three ways of not being free, and only one of them is a
+    /// device someone is actually using.
+    ///
+    /// The old check asked only whether `pid` existed, which called a dead
+    /// server "busy" (so the slot was never reused) and called a device with a
+    /// size but no server "free" (so it was handed to the next Cat, whose disk
+    /// then answered every request with an error).
+    #[test]
+    fn a_device_is_free_only_when_nothing_holds_it() {
+        let fake = FakeSysfs::new();
+        let live = std::process::id() as i32;
+        fake.live_process(live);
+        fake.connected(0, live);
+        fake.connected(1, 4_194_303);
+        fake.sized_without_a_server(2);
+        fake.free(3);
+
+        assert_eq!(
+            nbd_device_state_of(&fake.sysfs, 0),
+            NbdDeviceState::Serving { pid: live }
+        );
+        assert_eq!(
+            nbd_device_state_of(&fake.sysfs, 1),
+            NbdDeviceState::Leaked {
+                pid: Some(4_194_303)
+            },
+            "a recorded pid that is gone is the leak, not a busy device"
+        );
+        assert_eq!(
+            nbd_device_state_of(&fake.sysfs, 2),
+            NbdDeviceState::Leaked { pid: None },
+            "a size with no serving task is just as unusable"
+        );
+        assert_eq!(nbd_device_state_of(&fake.sysfs, 3), NbdDeviceState::Free);
+        assert_eq!(leaked_nbd_devices_of(&fake.sysfs, 4), vec![1, 2]);
+    }
+
+    /// The boot sweep disconnects every leaked device, leaves live ones alone,
+    /// and reports honestly the ones the kernel would not let go of.
+    #[test]
+    fn the_sweep_reclaims_the_leaked_devices_and_nothing_else() {
+        let fake = FakeSysfs::new();
+        let live = std::process::id() as i32;
+        fake.live_process(live);
+        fake.connected(0, live);
+        fake.connected(1, 4_194_301);
+        fake.free(2);
+        fake.sized_without_a_server(3);
+
+        let dir = tempfile::tempdir().unwrap();
+        let calls = dir.path().join("calls");
+        let fake_client = dir.path().join("nbd-client");
+        // Stands in for the kernel letting go: clear the attributes the real
+        // disconnect clears. Device 3 is left connected on purpose, to prove a
+        // device that will not disconnect is reported rather than assumed
+        // reclaimed.
+        std::fs::write(
+            &fake_client,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nn=${{2#/dev/nbd}}\n\
+                 [ \"$n\" = 3 ] && exit 1\nrm -f '{}'/nbd$n/pid\nprintf '0\\n' > '{}'/nbd$n/size\n",
+                calls.display(),
+                fake.sysfs.sys_block.display(),
+                fake.sysfs.sys_block.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_client, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let report = reclaim_leaked_nbd_devices_of(&probe_config(fake_client, 4), &fake.sysfs);
+        assert_eq!(report.reclaimed, vec!["/dev/nbd1".to_string()]);
+        assert_eq!(report.unreclaimed, vec!["/dev/nbd3".to_string()]);
+
+        let calls = std::fs::read_to_string(&calls).unwrap();
+        // Sorted: the disconnects are deliberately issued concurrently, so
+        // which one lands in the log first is not part of the contract.
+        let mut called: Vec<&str> = calls.lines().collect();
+        called.sort_unstable();
+        assert_eq!(
+            called,
+            vec!["-d /dev/nbd1", "-d /dev/nbd3"],
+            "the device a live process serves, and the free one, must not be touched"
+        );
+        assert_eq!(
+            nbd_device_state_of(&fake.sysfs, 0),
+            NbdDeviceState::Serving { pid: live }
+        );
+    }
+
+    /// A device a live process still has open is never disconnected, however
+    /// leaked it looks.
+    ///
+    /// This is what makes the first boot after [`NBD_IOCTL_MODE`] safe. A
+    /// device attached by the previous, netlink-based code records a dead pid
+    /// even while it is healthily serving a Cat, so sysfs alone cannot tell it
+    /// from a leak — but Cloud Hypervisor is holding it open, and a real leak
+    /// is held by nobody.
+    #[test]
+    fn a_device_someone_still_has_open_is_never_disconnected() {
+        let fake = FakeSysfs::new();
+        fake.connected(0, 4_194_299);
+        fake.connected(1, 4_194_298);
+        // /proc/<pid>/fd/7 -> /dev/nbd0, the shape of a VMM holding a disk.
+        let holder = fake.sysfs.proc_root.join("4242").join("fd");
+        std::fs::create_dir_all(&holder).unwrap();
+        std::os::unix::fs::symlink("/dev/nbd0", holder.join("7")).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let calls = dir.path().join("calls");
+        let fake_client = dir.path().join("nbd-client");
+        std::fs::write(
+            &fake_client,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nn=${{2#/dev/nbd}}\n\
+                 rm -f '{}'/nbd$n/pid\nprintf '0\\n' > '{}'/nbd$n/size\n",
+                calls.display(),
+                fake.sysfs.sys_block.display(),
+                fake.sysfs.sys_block.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_client, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let report = reclaim_leaked_nbd_devices_of(&probe_config(fake_client, 2), &fake.sysfs);
+        assert_eq!(report.reclaimed, vec!["/dev/nbd1".to_string()]);
+        assert_eq!(
+            report.unreclaimed,
+            vec!["/dev/nbd0".to_string()],
+            "held open, so left alone and still reported"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap().trim(),
+            "-d /dev/nbd1",
+            "the held device must never be handed to nbd-client -d"
+        );
+    }
+
+    /// A pool with nothing leaked must not run `nbd-client` at all: every node
+    /// runs this sweep at boot, including nodes on the vhost-user path that
+    /// may not have the binary installed.
+    #[test]
+    fn a_clean_pool_runs_no_disconnects() {
+        let fake = FakeSysfs::new();
+        fake.free(0);
+        fake.free(1);
+        let cfg = probe_config(PathBuf::from("/nonexistent/nbd-client"), 2);
+        assert_eq!(
+            reclaim_leaked_nbd_devices_of(&cfg, &fake.sysfs),
+            NbdReclaim::default()
+        );
     }
 
     #[test]
