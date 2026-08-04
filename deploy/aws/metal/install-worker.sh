@@ -116,14 +116,18 @@ install -m 0644 "$CATS_REPO/deploy/aws/metal/cats-postgres-url.service" \
 install -m 0644 "$CATS_REPO/deploy/aws/metal/cats-postgres-url.timer" \
   /etc/systemd/system/cats-postgres-url.timer
 systemctl daemon-reload
-# Only useful where CATS_POSTGRES_SECRET_ARN is set; harmless otherwise, since
-# the renderer then just copies the DSN already in the environment file.
-systemctl enable cats-postgres-url.timer
 
+# The timer is started, not merely enabled: an enabled-but-unstarted timer
+# leaves the mid-run rotation window unbounded until the next boot fires
+# OnBootSec. It can only start once worker.env exists, since the unit reads it.
 if [[ -f /etc/cats/worker.env ]]; then
   chmod 0600 /etc/cats/worker.env
+  systemctl enable --now cats-postgres-url.timer
   systemctl enable --now cats-worker
 else
   install -m 0600 "$CATS_REPO/deploy/aws/metal/worker.env.example" /etc/cats/worker.env
-  echo "created /etc/cats/worker.env; fill its values, then enable cats-worker" >&2
+  systemctl enable cats-postgres-url.timer
+  echo "created /etc/cats/worker.env; fill its values, then:" >&2
+  echo "  systemctl start cats-postgres-url.timer" >&2
+  echo "  systemctl enable --now cats-worker" >&2
 fi

@@ -104,12 +104,24 @@ variable "worker_managed_environment" {
   type        = map(string)
   default     = {}
 
+  # CATS_POSTGRES_SECRET_ARN is blocked here even though it is not a secret.
+  # Setting it directly delivers the ARN to worker.env without emitting the IAM
+  # statement that grants GetSecretValue on it, because that statement is keyed
+  # on database_master_user_secret_arn. The renderer then fails with
+  # AccessDeniedException in ExecStartPre and cats-worker does not start -- a
+  # host wedged by a Terraform apply that validated cleanly. The two must move
+  # together, so there is one way to set them.
   validation {
     condition = length(setintersection(
       toset(keys(var.worker_managed_environment)),
-      toset(["CATS_AUTH_TOKEN", "CATS_POSTGRES_URL", "CATS_METERING_CGROUP_ROOT"]),
+      toset([
+        "CATS_AUTH_TOKEN",
+        "CATS_POSTGRES_URL",
+        "CATS_POSTGRES_SECRET_ARN",
+        "CATS_METERING_CGROUP_ROOT",
+      ]),
     )) == 0
-    error_message = "Secrets go through worker_runtime_secret_data, and CATS_METERING_CGROUP_ROOT is discovered on the host."
+    error_message = "Secrets go through worker_runtime_secret_data; CATS_POSTGRES_SECRET_ARN goes through database_master_user_secret_arn so the matching IAM statement is emitted with it; CATS_METERING_CGROUP_ROOT is discovered on the host."
   }
 
   validation {
