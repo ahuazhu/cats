@@ -34,7 +34,7 @@ fn env() -> Env {
     let dir = TempDirFixture::new();
     let builder = dir.node_config("node_test");
     let state_dir = builder.state_dir().to_path_buf();
-    let runtime = NodeRuntime::new(fake_node_config!(builder));
+    let runtime = NodeRuntime::new(fake_node_config!(builder)).unwrap();
     Env {
         _dir: dir,
         runtime,
@@ -981,7 +981,7 @@ fn a_failed_job_is_retried_not_replayed() {
     let flaky_guest_bin = dir.path().join("flaky-guest-agent");
     let builder =
         NodeConfigBuilder::new(dir.path(), "node_test").with_guest_agent_bin(&flaky_guest_bin);
-    let runtime = NodeRuntime::new(fake_node_config!(builder));
+    let runtime = NodeRuntime::new(fake_node_config!(builder)).unwrap();
 
     // The guest agent binary does not exist yet: the start fails for real.
     let first = runtime.execute(start_job(1));

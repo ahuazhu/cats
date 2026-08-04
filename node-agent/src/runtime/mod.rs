@@ -16,8 +16,13 @@
 //! in-memory; a node restart loses it, which is safe because every action
 //! is itself idempotent at the process level.
 
+/// Crate-visible, unlike its sibling modules: the startup path that scans the
+/// local inventory before registering with the control plane (ADR-0028 §5)
+/// lives outside `runtime`.
+pub(crate) mod adopt;
 mod blockd_control;
 mod fake;
+mod ledger;
 mod lifecycle;
 mod metering;
 mod proxy;
@@ -47,9 +52,10 @@ use cats_storage::AdapterSelection;
 use crate::admission::{resume_commitment_bytes, WakeAdmission, WakeBudget, WakeLoad};
 use crate::ch::{self, BlockPath, ChConfig, ChRuntime, GUEST_VSOCK_PORT};
 use crate::guest_client::{GuestClient, GuestShell};
+use crate::proc::ProcHandle;
 
-use blockd_control::BlockdProc;
-use fake::signal;
+use blockd_control::{blockd_log_path, BlockdProc};
+use ledger::Ledger;
 use metering::RuntimeMetering;
 use proxy::{ActivityChanged, RuntimeActivity};
 
@@ -102,7 +108,7 @@ struct CatRuntime {
     cpus: u32,
     memory_mib: u64,
     state: ObservedState,
-    guest: Option<Child>,
+    guest: Option<ProcHandle>,
     boot_id: Option<String>,
     blockds: HashMap<String, BlockdProc>,
     /// Grants remembered for Warm restore.
@@ -201,7 +207,7 @@ impl CatRuntime {
     }
 
     fn state_file(&self) -> PathBuf {
-        self.dir.join("warm-state.json")
+        warm_state_file(&self.dir)
     }
 
     fn telemetry_target(&self, cat_id: &str) -> CatTelemetryTarget {
@@ -265,6 +271,29 @@ fn symlink_socket(link: &Path, target: &Path) {
     let _ = std::os::unix::fs::symlink(target, link);
 }
 
+/// Directory-name prefix of one volume's blockd journal and cache.
+const VOLUME_DIR_PREFIX: &str = "vol-";
+
+/// The `--data-dir` the blockd serving `disk_id` for this Cat was given.
+///
+/// Spawn, teardown, the runtime ledger and re-adoption all name this directory,
+/// and re-adoption only accepts a record whose recorded `data_dir` still exists
+/// (ADR-0028 §3 step 4). Four independent spellings of the same `format!` would
+/// make that check silently vacuous the first time one of them drifted, so
+/// there is exactly one.
+fn volume_data_dir(cat_dir: &Path, disk_id: &str) -> PathBuf {
+    cat_dir.join(format!("{VOLUME_DIR_PREFIX}{disk_id}"))
+}
+
+/// Where a FakeVmm Cat's Guest state is saved when it goes Warm.
+///
+/// Written by `warm_cat`, required by `restore_cat` before it will restore, and
+/// checked by re-adoption's Warm proof (ADR-0028 §3) — one spelling, for the
+/// same reason [`volume_data_dir`] has one.
+fn warm_state_file(cat_dir: &Path) -> PathBuf {
+    cat_dir.join("warm-state.json")
+}
+
 pub struct NodeRuntime {
     pub cfg: NodeConfig,
     /// Conservative node-wide serialization for lifecycle/hot-plug paths that
@@ -276,6 +305,10 @@ pub struct NodeRuntime {
     /// dropping the node-wide serialization.
     cat_ops: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     cats: Mutex<HashMap<String, CatRuntime>>,
+    /// On-disk mirror of `cats`, rewritten once per job after the final state
+    /// has settled (ADR-0028 §1). Local recovery aid only: it never grants a
+    /// storage write right and is never consulted for authority.
+    ledger: Ledger,
     journal: Mutex<HashMap<String, NodeJobResult>>,
     usage_finalizer: Option<Arc<dyn UsageFinalizer>>,
     /// Bounds concurrent wakes so a wake storm degrades linearly instead of
@@ -346,12 +379,14 @@ impl Drop for StopPermit<'_> {
 }
 
 impl NodeRuntime {
-    pub fn new(cfg: NodeConfig) -> Self {
+    pub fn new(cfg: NodeConfig) -> Result<Self> {
         let cfg_wake_budget = cfg.wake_budget;
-        Self {
+        let ledger = Ledger::open(&cfg.state_dir.join("runtime-ledger"))?;
+        Ok(Self {
             cfg,
             ops: Mutex::new(()),
             cats: Mutex::new(HashMap::new()),
+            ledger,
             cat_ops: Mutex::new(HashMap::new()),
             journal: Mutex::new(HashMap::new()),
             usage_finalizer: None,
@@ -362,7 +397,7 @@ impl NodeRuntime {
                 ..cfg_wake_budget
             }),
             stop_admission: StopAdmission::new(MAX_CONCURRENT_STOPS),
-        }
+        })
     }
 
     /// Current wake saturation, for heartbeats and tests.

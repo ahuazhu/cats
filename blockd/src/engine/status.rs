@@ -42,6 +42,8 @@ impl ChunkEngine {
             .map(|pack| unix_time_ms().saturating_sub(pack.staged_at_unix_ms))
             .unwrap_or(0);
         let status = DurabilityStatus {
+            volume_id: self.cfg.volume_id.clone(),
+            attachment_id: self.cfg.attachment_id.clone(),
             mode: match self.cfg.durability {
                 DurabilityMode::Strict => "strict",
                 DurabilityMode::Relaxed { .. } => "relaxed",

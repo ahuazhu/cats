@@ -1601,7 +1601,234 @@ fn compact_pending_checkpoints(checkpoints: Vec<CatUsageCheckpoint>) -> Vec<CatU
     compacted
 }
 
-/// Start the node agent: HTTP server + registration + heartbeat loop.
+/// Retry cadence for control-plane exchanges.
+///
+/// ADR-0028 §5 keeps the agent alive and serving its local runtime through a
+/// control-plane outage, so the retry has to be patient rather than fast: an
+/// outage lasting hours must not become a 200 ms spin. The ceiling only bounds
+/// how long a recovered control plane waits to hear from this node again.
+const CONTROL_PLANE_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
+const CONTROL_PLANE_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Reachability of the control plane, as this agent last observed it.
+///
+/// ADR-0028 §5 names the unreachable side the `ControlPlaneDisconnected`
+/// condition. The Conditions API is a later work package, so this stays
+/// internal state driving one log line per transition — it is deliberately not
+/// exposed over HTTP, and in particular not through `/healthz`, which means
+/// process liveness and nothing else.
+struct ControlPlaneLink {
+    node_id: String,
+    control_plane_url: String,
+    /// Starts optimistic so the first failed exchange logs the transition.
+    connected: bool,
+    backoff: Duration,
+}
+
+impl ControlPlaneLink {
+    fn new(node_id: String, control_plane_url: String) -> Self {
+        Self {
+            node_id,
+            control_plane_url,
+            connected: true,
+            backoff: CONTROL_PLANE_INITIAL_BACKOFF,
+        }
+    }
+
+    /// Record one failed exchange and return how long to wait before retrying.
+    fn record_failure(&mut self, reason: &str) -> Duration {
+        if self.connected {
+            self.connected = false;
+            tracing::warn!(
+                node = %self.node_id,
+                control_plane = %self.control_plane_url,
+                reason,
+                "control plane disconnected; the node agent keeps serving its local runtime and keeps retrying"
+            );
+        }
+        let delay = self.backoff;
+        self.backoff = self
+            .backoff
+            .saturating_mul(2)
+            .min(CONTROL_PLANE_MAX_BACKOFF);
+        delay
+    }
+
+    fn record_success(&mut self) {
+        if !self.connected {
+            self.connected = true;
+            tracing::info!(
+                node = %self.node_id,
+                control_plane = %self.control_plane_url,
+                "control plane reconnected"
+            );
+        }
+        self.backoff = CONTROL_PLANE_INITIAL_BACKOFF;
+    }
+}
+
+/// One operator-readable line naming every Cat adoption refused, and why.
+fn residue_summary(residue: &[(String, String)]) -> String {
+    if residue.is_empty() {
+        return "none".to_string();
+    }
+    residue
+        .iter()
+        .map(|(cat_id, reason)| format!("{cat_id}: {reason}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Register until the control plane accepts, retrying indefinitely.
+///
+/// ADR-0028 §5: a control-plane outage must not end the node agent process.
+/// This also runs before every heartbeat run, not only at startup, because the
+/// control plane's heartbeat handler looks the node up and rejects an unknown
+/// one — a control plane that lost this node re-learns it here instead of
+/// needing an agent restart.
+/// One registration attempt. Returns whether the control plane accepted it.
+///
+/// Used at startup so that `spawn` still means "registered" whenever the
+/// control plane is reachable, without ever blocking on one that is not.
+async fn try_register_once(
+    client: &reqwest::Client,
+    control_plane_url: &str,
+    auth_token: &str,
+    request: &RegisterNodeRequest,
+    link: &mut ControlPlaneLink,
+) -> bool {
+    match client
+        .post(format!("{control_plane_url}/v1/nodes/register"))
+        .bearer_auth(auth_token)
+        .json(request)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            link.record_success();
+            tracing::info!(
+                node = %request.node_id,
+                agent_url = %request.agent_url,
+                "node agent registered"
+            );
+            true
+        }
+        Ok(response) => {
+            link.record_failure(&format!("registration returned {}", response.status()));
+            false
+        }
+        Err(error) => {
+            link.record_failure(&format!("registration request failed: {error}"));
+            false
+        }
+    }
+}
+
+async fn register_until_accepted(
+    client: &reqwest::Client,
+    control_plane_url: &str,
+    auth_token: &str,
+    request: &RegisterNodeRequest,
+    link: &mut ControlPlaneLink,
+) {
+    loop {
+        let reason = match client
+            .post(format!("{control_plane_url}/v1/nodes/register"))
+            .bearer_auth(auth_token)
+            .json(request)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                link.record_success();
+                tracing::info!(
+                    node = %request.node_id,
+                    agent_url = %request.agent_url,
+                    "node agent registered"
+                );
+                return;
+            }
+            Ok(response) => format!("registration returned {}", response.status()),
+            Err(error) => format!("registration request failed: {error}"),
+        };
+        tokio::time::sleep(link.record_failure(&reason)).await;
+    }
+}
+
+/// Heartbeat on the configured interval until one fails, then return so the
+/// caller can register again.
+///
+/// The reported inventory is exactly [`NodeRuntime::snapshot`]: a Cat adoption
+/// refused is absent from it and must stay absent (ADR-0028 §7). Reporting it
+/// as `Cold` would tell the control plane the disk was released while an old
+/// blockd may still hold its lease; omitting it only keeps the node Lost.
+async fn heartbeat_until_failure(
+    state: &NodeState,
+    client: &reqwest::Client,
+    control_plane_url: &str,
+    auth_token: &str,
+    interval: Duration,
+    link: &mut ControlPlaneLink,
+) {
+    loop {
+        tokio::time::sleep(interval).await;
+        let cats: Vec<HeartbeatCat> = state
+            .runtime
+            .snapshot()
+            .into_iter()
+            .map(|(cat_id, generation, state)| HeartbeatCat {
+                cat_id,
+                generation,
+                state,
+            })
+            .collect();
+        let (telemetry, persisted) = state
+            .usage_pipeline
+            .sample(state.runtime.telemetry(), state.runtime.telemetry_targets());
+        if let Err(error) = persisted {
+            tracing::error!(
+                %error,
+                "usage checkpoints are not durable; billing remains failed closed"
+            );
+        }
+        // Liveness owns this channel alone. Sampling above is local work
+        // against the durable spool; nothing else in this loop may await a
+        // remote call, because the interval between heartbeats is what the
+        // control plane reads as "this Host is alive". Usage upload used to run
+        // here and its 10 s client timeout was enough, on its own, to push the
+        // gap past the node lease and have the Host declared Lost. The
+        // registration retry this loop returns to is not an exception: it only
+        // runs once the control plane is already unreachable, so there is no
+        // liveness left to protect.
+        let sent = client
+            .post(format!("{control_plane_url}/v1/nodes/heartbeat"))
+            .bearer_auth(auth_token)
+            .json(&HeartbeatRequest {
+                node_id: state.cfg.node.node_id.clone(),
+                cats,
+                telemetry: Some(telemetry),
+            })
+            .send()
+            .await;
+        let reason = match sent {
+            Ok(response) if response.status().is_success() => {
+                link.record_success();
+                continue;
+            }
+            Ok(response) => format!("heartbeat returned {}", response.status()),
+            Err(error) => format!("heartbeat request failed: {error}"),
+        };
+        tokio::time::sleep(link.record_failure(&reason)).await;
+        return;
+    }
+}
+
+/// Start the node agent: local inventory adoption, HTTP server, then a
+/// background registration + heartbeat loop.
+///
+/// Returns once the agent is serving. Reaching the control plane is not a
+/// precondition (ADR-0028 §5): a control plane that is down at startup leaves
+/// this node disconnected but running, not dead.
 pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
     anyhow::ensure!(cfg.heartbeat_ms > 0, "heartbeat interval must be positive");
     anyhow::ensure!(
@@ -1619,11 +1846,39 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
         .build()?;
     let cfg = Arc::new(cfg);
     let runtime =
-        Arc::new(NodeRuntime::new(cfg.node.clone()).with_usage_finalizer(usage_pipeline.clone()));
-    // Before the agent is reachable and can be given a StartCat: allocation
-    // is the next thing to touch these devices, and a device the kernel still
-    // has connected to a dead server cannot serve a Guest (issue #79).
-    runtime.reclaim_leaked_block_devices();
+        Arc::new(NodeRuntime::new(cfg.node.clone())?.with_usage_finalizer(usage_pipeline.clone()));
+
+    // ADR-0028 §5: rebuild the local inventory before serving anything and
+    // before announcing this node. The control plane recovers a Lost node only
+    // from a heartbeat carrying every non-deleting claim at its claimed
+    // generation, so the first heartbeat has to already know what this node is
+    // running. Adoption probes /proc, Unix sockets and directories, so it runs
+    // off the async executor.
+    let adopting = runtime.clone();
+    let adoption = tokio::task::spawn_blocking(move || adopting.adopt_from_ledger())
+        .await
+        .context("scan the node runtime ledger")?;
+    tracing::info!(
+        node = %cfg.node.node_id,
+        adopted = adoption.adopted.len(),
+        residue = adoption.residue.len(),
+        not_adopted = %residue_summary(&adoption.residue),
+        "rebuilt the node runtime inventory from the ledger"
+    );
+
+    // Then reclaim what is provably dead, still before the agent is reachable
+    // and can be given a StartCat: allocation is the next thing to touch these
+    // devices, and one the kernel still has connected to a dead server cannot
+    // serve a Guest (issue #79). Deliberately after adoption -- what this node
+    // is still running is decided there, and the sweep should never be in a
+    // position to disconnect a device belonging to a Cat just proven alive.
+    // Runs `nbd-client` and waits for the kernel to settle, so like the scan
+    // above it stays off the async executor.
+    let sweeping = runtime.clone();
+    tokio::task::spawn_blocking(move || sweeping.reclaim_leaked_block_devices())
+        .await
+        .context("sweep leaked kernel NBD devices")?;
+
     let state = NodeState {
         runtime: runtime.clone(),
         cfg: cfg.clone(),
@@ -1642,7 +1897,6 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
         }
     });
 
-    // Register with the control plane (retry until it is reachable).
     let agent_url = cfg
         .advertise_url
         .clone()
@@ -1662,72 +1916,50 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
     };
     let cp = cfg.control_plane_url.trim_end_matches('/').to_string();
     let token = cfg.auth_token.clone();
-    {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let resp = client
-                .post(format!("{cp}/v1/nodes/register"))
-                .bearer_auth(&token)
-                .json(&register)
-                .send()
-                .await;
-            match resp {
-                Ok(r) if r.status().is_success() => break,
-                _ if std::time::Instant::now() > deadline => {
-                    anyhow::bail!("could not register with control plane at {cp}")
-                }
-                _ => tokio::time::sleep(Duration::from_millis(200)).await,
-            }
-        }
-    }
-    tracing::info!(node = %cfg.node.node_id, %addr, "node agent registered");
 
-    // Heartbeat loop.
+    // One synchronous registration attempt before returning. Dropping the old
+    // blocking registration entirely would have quietly changed a contract
+    // callers depend on: `spawn` returning used to mean "the control plane
+    // knows this node", so anything that starts an agent and immediately
+    // addresses it by id -- the e2e cluster harness cordoning a node it just
+    // started, an operator scripting against `READY` -- would now race.
+    //
+    // ADR-0028 §5 only requires that an unreachable control plane must not end
+    // the process, not that startup must stop announcing itself. So: try once,
+    // keep the guarantee whenever the control plane is up, and hand an
+    // unreachable one to the retry loop instead of dying on it.
+    let mut link = ControlPlaneLink::new(cfg.node.node_id.clone(), cp.clone());
+    let registered = try_register_once(&client, &cp, &token, &register, &mut link).await;
+    if !registered {
+        tracing::warn!(
+            node = %cfg.node.node_id,
+            "starting without a control-plane registration; serving the local runtime and retrying in the background"
+        );
+    }
+
+    // Connection loop: ensure registered, heartbeat until one fails, register
+    // again. Registration has to precede heartbeats — the control plane's
+    // heartbeat handler rejects a node it does not know — and it is retried
+    // rather than fatal, so a control plane that is down at startup or that
+    // forgot this node needs no agent restart.
     let hb_state = state.clone();
     let hb_client = client.clone();
     let hb_cp = cp.clone();
     let hb_token = token.clone();
     let interval = Duration::from_millis(cfg.heartbeat_ms);
-    let hb_usage_pipeline = usage_pipeline.clone();
-    let heartbeat = tokio::spawn(async move {
+    let connection = tokio::spawn(async move {
+        let mut registered = registered;
         loop {
-            tokio::time::sleep(interval).await;
-            let cats: Vec<HeartbeatCat> = hb_state
-                .runtime
-                .snapshot()
-                .into_iter()
-                .map(|(cat_id, generation, state)| HeartbeatCat {
-                    cat_id,
-                    generation,
-                    state,
-                })
-                .collect();
-            let (telemetry, persisted) = hb_usage_pipeline.sample(
-                hb_state.runtime.telemetry(),
-                hb_state.runtime.telemetry_targets(),
-            );
-            if let Err(error) = persisted {
-                tracing::error!(
-                    error = format!("{error:#}"),
-                    "usage checkpoints are not durable; billing remains failed closed"
-                );
+            // `take` consumes the startup registration exactly once: the first
+            // pass skips re-registering if it already succeeded, and every
+            // later pass follows a failed heartbeat and must register again.
+            if !std::mem::take(&mut registered) {
+                register_until_accepted(&hb_client, &hb_cp, &hb_token, &register, &mut link).await;
             }
-            // Liveness owns this channel alone. Sampling above is local work
-            // against the durable spool; nothing else in this loop may await a
-            // remote call, because the interval between heartbeats is what the
-            // control plane reads as "this Host is alive". Usage upload used to
-            // run here and its 10 s client timeout was enough, on its own, to
-            // push the gap past the node lease and have the Host declared Lost.
-            let _ = hb_client
-                .post(format!("{hb_cp}/v1/nodes/heartbeat"))
-                .bearer_auth(&hb_token)
-                .json(&HeartbeatRequest {
-                    node_id: hb_state.cfg.node.node_id.clone(),
-                    cats,
-                    telemetry: Some(telemetry),
-                })
-                .send()
-                .await;
+            heartbeat_until_failure(
+                &hb_state, &hb_client, &hb_cp, &hb_token, interval, &mut link,
+            )
+            .await;
         }
     });
 
@@ -1801,7 +2033,7 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
     Ok(Handle {
         addr,
         state,
-        tasks: vec![server, heartbeat, usage_uploader, activity_watchers],
+        tasks: vec![server, connection, usage_uploader, activity_watchers],
     })
 }
 

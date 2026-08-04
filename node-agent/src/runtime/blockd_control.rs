@@ -3,7 +3,7 @@ use cats_api::blockd::{BlockdControlCommand, BlockdControlResponse, DurabilitySt
 use cats_block_client::NbdClient;
 
 pub(super) struct BlockdProc {
-    pub(super) child: Child,
+    pub(super) child: ProcHandle,
     /// Where this process's stderr was redirected. A blockd that dies during
     /// startup has already written why it died here, and nowhere else.
     pub(super) log_path: PathBuf,
@@ -66,18 +66,24 @@ impl BlockdProc {
         .map(|_| ())
     }
 
-    pub(super) fn durability_status_at(
-        control_socket: &Path,
-        disk_id: &str,
-    ) -> Result<DiskDurabilityTelemetry> {
+    /// The raw `Status` payload, including the volume identity that ADR-0028 §3
+    /// re-adoption proves a blockd with. Heartbeat telemetry drops those two
+    /// fields, so it cannot be reused for the proof.
+    pub(super) fn status_at(control_socket: &Path, disk_id: &str) -> Result<DurabilityStatus> {
         let payload = Self::command(
             control_socket,
             disk_id,
             BlockdControlCommand::Status,
             BLOCKD_STATUS_TIMEOUT,
         )?;
-        let status: DurabilityStatus =
-            serde_json::from_str(&payload).context("decode blockd durability status")?;
+        serde_json::from_str(&payload).context("decode blockd durability status")
+    }
+
+    pub(super) fn durability_status_at(
+        control_socket: &Path,
+        disk_id: &str,
+    ) -> Result<DiskDurabilityTelemetry> {
+        let status = Self::status_at(control_socket, disk_id)?;
         Ok(DiskDurabilityTelemetry {
             disk_id: disk_id.to_string(),
             mode: status.mode,
@@ -202,7 +208,7 @@ impl NodeRuntime {
             }
             _ => None,
         };
-        let data_dir = cat_dir.join(format!("vol-{}", grant.disk_id));
+        let data_dir = volume_data_dir(cat_dir, &grant.disk_id);
         let mut cmd = Command::new(&self.cfg.blockd_bin);
         cmd.arg("--volume-id")
             .arg(&grant.volume_id)
@@ -253,7 +259,7 @@ impl NodeRuntime {
                 .arg("--vhost-user-queue-size")
                 .arg(chc.vhost_user_queue_size.to_string());
         }
-        let log_path = cat_dir.join(format!("blockd-{}.log", grant.disk_id));
+        let log_path = blockd_log_path(cat_dir, &grant.disk_id);
         let log = std::fs::File::create(&log_path).context("create blockd log")?;
         for option in self.cfg.metadata_store.config.to_cli() {
             cmd.arg("--metadata-store-option").arg(option);
@@ -268,7 +274,7 @@ impl NodeRuntime {
             .spawn()
             .context("spawn cats-blockd")?;
         let mut proc = BlockdProc {
-            child,
+            child: ProcHandle::Owned(child),
             log_path,
             socket,
             vhost_user_socket,
@@ -287,13 +293,18 @@ impl NodeRuntime {
                 let _ = client.disconnect();
                 return Ok(());
             }
-            if let Some(status) = proc.child.try_wait()? {
+            if proc.child.exited()? {
                 // Quote what blockd actually said. Guessing here ("lease held or
                 // bad config?") sent an operator looking for a stale lease while
                 // the log held `connect PostgreSQL: FATAL password
                 // authentication failed`, and the wrong hypothesis was acted on.
                 let reason = blockd_failure_reason(&proc.log_path);
-                bail!("cats-blockd exited during startup: {status}: {reason}");
+                match proc.child.owned_exit_status() {
+                    Some(status) => {
+                        bail!("cats-blockd exited during startup: {status}: {reason}")
+                    }
+                    None => bail!("cats-blockd exited during startup: {reason}"),
+                }
             }
             if Instant::now() > deadline {
                 bail!("timed out waiting for blockd socket");
@@ -301,6 +312,12 @@ impl NodeRuntime {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+}
+
+/// Where a blockd's stderr goes. Shared with adoption, which has to name the
+/// same file for a process it did not spawn.
+pub(super) fn blockd_log_path(cat_dir: &Path, disk_id: &str) -> PathBuf {
+    cat_dir.join(format!("blockd-{disk_id}.log"))
 }
 
 /// The tail of blockd's own stderr, for reporting why it exited.

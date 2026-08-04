@@ -27,6 +27,9 @@ base64 = { workspace = true }
 
 [dev-dependencies]
 cats-test-support = { workspace = true }
+# The stub control planes in `tests/control_plane_connection.rs` and
+# `tests/heartbeat_independence.rs` need a real `MetadataStore` for
+# `ServerConfig`; this is the workspace's SQLite adapter.
 cats-metadata-store-sqlite = { workspace = true }
 tempfile = { workspace = true }
 hex = { workspace = true }
