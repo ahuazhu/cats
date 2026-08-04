@@ -3184,3 +3184,90 @@ async fn one_backing_off_cat_does_not_delay_another() {
     let healthy = ctx.wait_observed("healthy", ObservedState::Running).await;
     assert_eq!(healthy.node_id.as_deref(), Some("node_a"));
 }
+
+/// One permanently unacceptable checkpoint must not fail the whole batch.
+///
+/// A durable outbox delivers an ordered prefix, so a checkpoint the ledger can
+/// never accept blocked every checkpoint behind it -- and retrying could not
+/// change the answer, so it blocked them forever. Production hit exactly this:
+/// a Cat deleted before any checkpoint of its runtime epoch was ingested left
+/// no frozen attribution, and the 409 that produced stalled a 111,864-row
+/// outbox. That in turn stalled every lifecycle stop, because a stop withholds
+/// its result until its final usage is acknowledged, so Cats stopped being able
+/// to converge deletions at all.
+#[tokio::test]
+async fn an_unattributable_checkpoint_is_rejected_without_failing_its_batch() {
+    let ctx = Ctx::new().await;
+    let _node = start_stub_node(&ctx.cp, "node_a").await;
+    ctx.create_cat("billable", None).await;
+    let cat = ctx.wait_observed("billable", ObservedState::Running).await;
+
+    let checkpoint = |cat_id: &str, sequence, observed_at_unix_ms, quantity| {
+        let mut checkpoint = CatUsageCheckpoint {
+            event_id: String::new(),
+            source_id: format!("node/node_a/cat/{cat_id}"),
+            source_epoch: "epoch-a".to_string(),
+            sequence,
+            observed_at_unix_ms,
+            cat_id: cat_id.to_string(),
+            cat_generation: 1,
+            metric: UsageMetric::CpuUsec,
+            cumulative_quantity: quantity,
+        };
+        checkpoint.event_id = deterministic_event_id(&checkpoint);
+        checkpoint
+    };
+
+    // `cat_vanished` never existed, so it stands in for a Cat deleted before any
+    // checkpoint of its epoch was attributed: nothing will ever make it
+    // ingestible. It sits at the head, where it used to block the rest.
+    let poison = checkpoint("cat_vanished", 0, 1_000, 0);
+    let response = ctx
+        .http
+        .post(ctx.url("/v1/internal/usage/checkpoints"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&IngestUsageCheckpointsRequest {
+            node_id: "node_a".to_string(),
+            checkpoints: vec![
+                poison.clone(),
+                checkpoint(&cat.id, 0, 1_000, 0),
+                checkpoint(&cat.id, 1, 61_000, 60_000_000),
+            ],
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "one unacceptable checkpoint must not fail the batch behind it"
+    );
+    let body: IngestUsageCheckpointsResponse = response.json().await.unwrap();
+    assert_eq!(
+        body.rejected.len(),
+        1,
+        "the unacceptable checkpoint must be named so the producer stops resending it"
+    );
+    assert_eq!(body.rejected[0].event_id, poison.event_id);
+    assert!(
+        body.rejected[0].reason.contains("cat_vanished"),
+        "the reason must identify what was dropped: {}",
+        body.rejected[0].reason
+    );
+    assert!(
+        body.accepted >= 1,
+        "the billable checkpoints behind it must still be ingested, got {}",
+        body.accepted
+    );
+
+    // And the usage that did land is billed, so rejecting one checkpoint has not
+    // quietly discarded the rest of the batch.
+    let report = ctx
+        .http
+        .get(ctx.ws_url("/billing/balance"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(report.status(), StatusCode::OK);
+}

@@ -20,6 +20,7 @@ pub(super) async fn ingest_usage_checkpoints(
 
     let mut accepted = 0_u64;
     let mut duplicates = 0_u64;
+    let mut rejected = Vec::new();
     for checkpoint in req.checkpoints {
         let expected_source = format!("node/{}/cat/{}", req.node_id, checkpoint.cat_id);
         if checkpoint.source_id != expected_source {
@@ -73,12 +74,30 @@ pub(super) async fn ingest_usage_checkpoints(
                 // Durable outboxes can replay after resource deletion. Reuse
                 // attribution already frozen in this exact source epoch; the
                 // node never supplies or changes billing ownership.
-                let attribution = frozen_attribution.ok_or_else(|| {
-                    ApiError::conflict(format!(
+                let Some(attribution) = frozen_attribution else {
+                    // Nothing can ever make this acceptable: the Cat is gone, so
+                    // no future request will freeze attribution for its epoch.
+                    // Failing the request instead blocked the producer's whole
+                    // ordered queue permanently -- observed in production as a
+                    // 111,864-row outbox stalled behind one such checkpoint,
+                    // which in turn stalled every lifecycle stop waiting on a
+                    // final delivery. Reject this one and keep going.
+                    let reason = format!(
                         "no frozen attribution exists for deleted Cat {} source epoch",
                         checkpoint.cat_id
-                    ))
-                })?;
+                    );
+                    tracing::warn!(
+                        event = %checkpoint.event_id,
+                        cat = %checkpoint.cat_id,
+                        source_epoch = %checkpoint.source_epoch,
+                        "rejecting an unattributable usage checkpoint; its usage is not billed"
+                    );
+                    rejected.push(RejectedCheckpoint {
+                        event_id: checkpoint.event_id,
+                        reason,
+                    });
+                    continue;
+                };
                 if !cat_attribution_matches(&attribution, &checkpoint.cat_id, None) {
                     return Err(ApiError::conflict(
                         "stored source-epoch attribution does not match checkpoint Cat",
@@ -101,6 +120,7 @@ pub(super) async fn ingest_usage_checkpoints(
     Ok(Json(IngestUsageCheckpointsResponse {
         accepted,
         duplicates,
+        rejected,
     }))
 }
 
