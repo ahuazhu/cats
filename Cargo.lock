@@ -1167,6 +1167,7 @@ dependencies = [
  "native-tls",
  "postgres",
  "postgres-native-tls",
+ "tempfile",
 ]
 
 [[package]]
@@ -1323,6 +1324,7 @@ dependencies = [
  "postgres",
  "postgres-native-tls",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

@@ -7,6 +7,7 @@
 //! that statement commits.
 
 use std::fs;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{
     atomic::{AtomicU8, Ordering},
@@ -93,10 +94,58 @@ impl Job {
 const WORK_QUEUE_DEPTH: usize = 64;
 const OPERATION_DEADLINE: Duration = Duration::from_secs(7);
 
+/// Where a worker obtains its DSN, consulted afresh for every connect.
+///
+/// The password is part of the DSN, and RDS rotates the managed master
+/// password underneath a running process. Capturing the string once meant a
+/// reconnect reused a password the server had already stopped accepting: a
+/// process that had been healthy for hours could never get back in, and
+/// nothing said why, because PostgreSQL only authenticates on connect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DsnSource {
+    /// A literal DSN, fixed for the life of the process. Correct for a
+    /// development credential that nothing rotates.
+    Literal(String),
+    /// A file re-read on every connect, kept current by the platform: a
+    /// systemd timer on a metal worker, a mounted Secret in Kubernetes.
+    File(PathBuf),
+}
+
+impl DsnSource {
+    /// Never include the file's contents in an error. It holds the password.
+    fn resolve(&self) -> Result<String> {
+        match self {
+            Self::Literal(url) => Ok(url.clone()),
+            Self::File(path) => {
+                let contents = fs::read_to_string(path).map_err(|error| {
+                    MetaError::Backend(format!(
+                        "read PostgreSQL DSN from {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                // A renderer writes this file; a trailing newline is the norm
+                // and would otherwise become part of the database name.
+                let url = contents.trim();
+                if url.is_empty() {
+                    return Err(MetaError::Backend(format!(
+                        "PostgreSQL DSN file {} is empty",
+                        path.display()
+                    )));
+                }
+                Ok(url.to_string())
+            }
+        }
+    }
+}
+
 impl PostgresMetadataStore {
     pub fn connect(url: &str, ca_file: Option<&str>) -> Result<Self> {
-        let jobs = spawn_worker("cats-postgres-metadata", url, ca_file)?;
-        let lease_jobs = spawn_worker("cats-postgres-lease", url, ca_file)?;
+        Self::connect_from(&DsnSource::Literal(url.to_string()), ca_file)
+    }
+
+    pub fn connect_from(dsn: &DsnSource, ca_file: Option<&str>) -> Result<Self> {
+        let jobs = spawn_worker("cats-postgres-metadata", dsn.clone(), ca_file)?;
+        let lease_jobs = spawn_worker("cats-postgres-lease", dsn.clone(), ca_file)?;
         Ok(Self { jobs, lease_jobs })
     }
 
@@ -122,31 +171,41 @@ impl PostgresMetadataStore {
     }
 }
 
-fn spawn_worker(name: &str, url: &str, ca_file: Option<&str>) -> Result<mpsc::SyncSender<Job>> {
-    let url = url.to_string();
+fn spawn_worker(
+    name: &str,
+    dsn: DsnSource,
+    ca_file: Option<&str>,
+) -> Result<mpsc::SyncSender<Job>> {
     let ca_file = ca_file.map(str::to_string);
     let (jobs, receiver) = mpsc::sync_channel::<Job>(WORK_QUEUE_DEPTH);
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name(name.to_string())
-        .spawn(move || match connect_client(&url, ca_file.as_deref()) {
-            Ok(mut client) => {
-                let _ = ready_tx.send(Ok(()));
-                for job in receiver {
-                    if client.is_closed() {
-                        match connect_client(&url, ca_file.as_deref()) {
-                            Ok(reconnected) => client = reconnected,
-                            Err(error) => {
-                                job.run(Err(error));
-                                continue;
-                            }
+        .spawn(move || {
+            let mut client = match connect_resolved(&dsn, ca_file.as_deref()) {
+                Ok(client) => {
+                    let _ = ready_tx.send(Ok(()));
+                    client
+                }
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error));
+                    return;
+                }
+            };
+            for job in receiver {
+                if client.is_closed() {
+                    // Resolve again rather than reuse the DSN this worker
+                    // started with: the credential in it may have been rotated
+                    // since, and reconnecting with the old one fails forever.
+                    match connect_resolved(&dsn, ca_file.as_deref()) {
+                        Ok(reconnected) => client = reconnected,
+                        Err(error) => {
+                            job.run(Err(error));
+                            continue;
                         }
                     }
-                    job.run(Ok(&mut client));
                 }
-            }
-            Err(error) => {
-                let _ = ready_tx.send(Err(error));
+                job.run(Ok(&mut client));
             }
         })
         .map_err(|error| {
@@ -156,6 +215,12 @@ fn spawn_worker(name: &str, url: &str, ca_file: Option<&str>) -> Result<mpsc::Sy
         .recv()
         .map_err(|_| MetaError::Backend("PostgreSQL metadata thread exited at startup".into()))??;
     Ok(jobs)
+}
+
+/// The one place a connection is established, so the DSN is resolved on every
+/// attempt -- first connect and every reconnect alike.
+fn connect_resolved(dsn: &DsnSource, ca_file: Option<&str>) -> Result<Client> {
+    connect_client(&dsn.resolve()?, ca_file)
 }
 
 fn dispatch_on<T>(
@@ -629,6 +694,27 @@ impl MetadataStore for PostgresMetadataStore {
     }
 }
 
+/// `url-file` wins nothing by default: an operator asks for it explicitly, and
+/// asking for both is rejected rather than silently ranked, because which one
+/// holds the current password is exactly the question that cost an outage.
+fn dsn_source(config: &AdapterConfig) -> std::result::Result<DsnSource, AdapterError> {
+    match (config.optional("url-file"), config.optional("url-env")) {
+        (Some(_), Some(_)) => Err(AdapterError::InvalidConfig {
+            adapter: ADAPTER_NAME,
+            message: "set url-file or url-env, not both".to_string(),
+        }),
+        (Some(path), None) => Ok(DsnSource::File(PathBuf::from(path))),
+        (None, url_env) => {
+            let url_env = url_env.unwrap_or(DEFAULT_URL_ENV);
+            let url = std::env::var(url_env).map_err(|_| AdapterError::InvalidConfig {
+                adapter: ADAPTER_NAME,
+                message: format!("environment variable {url_env} is not set"),
+            })?;
+            Ok(DsnSource::Literal(url))
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PostgresMetadataStoreFactory;
 
@@ -641,13 +727,9 @@ impl MetadataStoreFactory for PostgresMetadataStoreFactory {
         &self,
         config: &AdapterConfig,
     ) -> std::result::Result<std::sync::Arc<dyn MetadataStore>, AdapterError> {
-        config.ensure_only(ADAPTER_NAME, &["url-env", "ca-file"])?;
-        let url_env = config.optional("url-env").unwrap_or(DEFAULT_URL_ENV);
-        let url = std::env::var(url_env).map_err(|_| AdapterError::InvalidConfig {
-            adapter: ADAPTER_NAME,
-            message: format!("environment variable {url_env} is not set"),
-        })?;
-        PostgresMetadataStore::connect(&url, config.optional("ca-file"))
+        config.ensure_only(ADAPTER_NAME, &["url-env", "url-file", "ca-file"])?;
+        let dsn = dsn_source(config)?;
+        PostgresMetadataStore::connect_from(&dsn, config.optional("ca-file"))
             .map(|store| std::sync::Arc::new(store) as std::sync::Arc<dyn MetadataStore>)
             .map_err(|error| AdapterError::Open {
                 adapter: ADAPTER_NAME,
@@ -716,6 +798,107 @@ mod tests {
         assert!(
             !executed.load(Ordering::SeqCst),
             "an expired queued mutation executed after its caller returned"
+        );
+    }
+
+    /// The defect this crate carried: a worker captured its DSN once, so every
+    /// reconnect reused a password the server may have stopped accepting.
+    #[test]
+    fn the_dsn_is_read_again_for_every_connect() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("postgres-url");
+        let dsn = DsnSource::File(path.clone());
+
+        fs::write(&path, "postgres://cats:before@db.example/cats").unwrap();
+        assert_eq!(
+            dsn.resolve().unwrap(),
+            "postgres://cats:before@db.example/cats"
+        );
+
+        // What a rotation looks like from the process's point of view.
+        fs::write(&path, "postgres://cats:after@db.example/cats").unwrap();
+        assert_eq!(
+            dsn.resolve().unwrap(),
+            "postgres://cats:after@db.example/cats",
+            "a rotated credential must reach the next connect, not the next restart"
+        );
+    }
+
+    #[test]
+    fn a_literal_dsn_stays_fixed() {
+        let dsn = DsnSource::Literal("postgres://cats@db.example/cats".to_string());
+        assert_eq!(dsn.resolve().unwrap(), "postgres://cats@db.example/cats");
+    }
+
+    /// A renderer writes this file, and a trailing newline is the norm. Left
+    /// in, it becomes part of the database name and the failure is baffling.
+    #[test]
+    fn surrounding_whitespace_is_not_part_of_the_dsn() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("postgres-url");
+        fs::write(&path, "  postgres://cats@db.example/cats\n").unwrap();
+        assert_eq!(
+            DsnSource::File(path).resolve().unwrap(),
+            "postgres://cats@db.example/cats"
+        );
+    }
+
+    #[test]
+    fn an_absent_or_empty_dsn_file_is_reported_as_such() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("absent");
+        let error = DsnSource::File(missing.clone()).resolve().unwrap_err();
+        assert!(
+            error.to_string().contains(&missing.display().to_string()),
+            "the error must name the file an operator has to fix: {error}"
+        );
+
+        let empty = directory.path().join("empty");
+        fs::write(&empty, "   \n").unwrap();
+        let error = DsnSource::File(empty).resolve().unwrap_err();
+        assert!(
+            error.to_string().contains("is empty"),
+            "a whitespace-only file must not be handed to the driver: {error}"
+        );
+    }
+
+    /// The DSN carries the password. An error about the file may name the
+    /// file; it may never quote what is inside it.
+    #[test]
+    fn a_dsn_file_error_never_quotes_the_credential() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("postgres-url");
+        fs::write(&path, "not a dsn but it contains hunter2\n").unwrap();
+        let resolved = DsnSource::File(path.clone()).resolve().unwrap();
+        // Resolution itself does not validate; the driver rejects it. What
+        // matters is that the value never lands in one of our messages.
+        assert!(resolved.contains("hunter2"));
+
+        let unreadable = DsnSource::File(directory.path().to_path_buf());
+        let error = unreadable.resolve().unwrap_err().to_string();
+        assert!(!error.contains("hunter2"), "credential leaked: {error}");
+    }
+
+    #[test]
+    fn asking_for_both_dsn_sources_is_rejected() {
+        let config = AdapterConfig::from_pairs([
+            ("url-file", "/run/cats/postgres-url"),
+            ("url-env", "CATS_POSTGRES_URL"),
+        ])
+        .unwrap();
+        let error = dsn_source(&config).unwrap_err();
+        assert!(
+            error.to_string().contains("not both"),
+            "which source holds the current password must never be ambiguous: {error}"
+        );
+    }
+
+    #[test]
+    fn url_file_selects_the_file_source() {
+        let config = AdapterConfig::from_pairs([("url-file", "/run/cats/postgres-url")]).unwrap();
+        assert_eq!(
+            dsn_source(&config).unwrap(),
+            DsnSource::File(PathBuf::from("/run/cats/postgres-url"))
         );
     }
 
