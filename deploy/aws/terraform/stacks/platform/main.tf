@@ -40,6 +40,30 @@ module "cluster" {
   tags = var.tags
 }
 
+# Alarms in this account had no destination: production-infrastructure passes
+# `alarm_sns_topic_arns = []`, so the usage-pipeline alarms have been firing
+# into a console nobody watches. A detector that notifies nobody is not a
+# detector, so the topic is created here alongside the resources it reports on.
+#
+# Not encrypted: the alarm text carries no secret, and the AWS-managed SNS key
+# cannot be used, because CloudWatch cannot be granted access to it.
+resource "aws_sns_topic" "alerts" {
+  name = "${var.name_prefix}-${var.environment}-alerts"
+
+  tags = merge(var.tags, { Name = "${var.name_prefix}-${var.environment}-alerts" })
+}
+
+# An email subscription stays "pending confirmation" until the recipient clicks
+# the link AWS sends. Terraform reports it as created either way, so confirm out
+# of band before treating the alarm as wired up.
+resource "aws_sns_topic_subscription" "alert_email" {
+  for_each = toset(var.alert_email_addresses)
+
+  topic_arn = aws_sns_topic.alerts.arn
+  protocol  = "email"
+  endpoint  = each.value
+}
+
 module "database" {
   source = "../../modules/platform-database"
 
@@ -61,6 +85,8 @@ module "database" {
   backup_retention_days = var.database_backup_retention_days
   deletion_protection   = var.database_deletion_protection
   skip_final_snapshot   = var.database_skip_final_snapshot
+  log_retention_days    = var.database_log_retention_days
+  alarm_action_arns     = [aws_sns_topic.alerts.arn]
   tags                  = var.tags
 }
 

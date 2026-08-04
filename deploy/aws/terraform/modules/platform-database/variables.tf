@@ -106,6 +106,23 @@ variable "performance_insights_enabled" {
   default     = false
 }
 
+variable "log_retention_days" {
+  type        = number
+  description = "Retention for the exported PostgreSQL error log. Long enough to reconstruct an incident, short enough not to accumulate cost."
+  default     = 30
+
+  validation {
+    condition     = var.log_retention_days >= 7
+    error_message = "Keep at least a week: this log is the only place a credential or connection failure is stated plainly."
+  }
+}
+
+variable "alarm_action_arns" {
+  type        = list(string)
+  description = "SNS topics notified when PostgreSQL rejects a connection's credentials."
+  default     = []
+}
+
 variable "tags" {
   type        = map(string)
   description = "Additional tags."
