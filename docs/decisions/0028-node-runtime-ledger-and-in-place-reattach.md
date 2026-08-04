@@ -69,6 +69,11 @@ blockd 已死亡时，本地 residue 可以保留，但不得离线复活旧 epo
 
 1. `host_boot_id` 与当前一致。不一致说明 Host 重启过，任何记录的 PID 都不可信，直接
    进入 residue 处理，不做进程接管。
+
+   **例外是 `Warm`**：Warm 的 VMM 已经退出、blockd 已经终止，它根本没有活进程，全部事实
+   都在本地磁盘上（snapshot 目录、Guest 内存 backing、disk map）。Host 重启不会让这些
+   失效，因此 Warm 记录不受 boot id 门限约束，否则一次 Host 重启会白白丢掉所有本可以
+   restore 的 Warm Cat。Warm 仍然是 host-bound（ADR-0002），本地状态没了就没了。
 2. PID 仍存在，且 `start_ticks`、可执行文件路径、所属 cgroup 与记录一致。任一不符按
    PID 复用处理，视为进程已消失。
 3. 协议握手确认身份：Guest/VMM 的 `health()` 返回的 `boot_id` 必须等于记录值；blockd
@@ -124,7 +129,9 @@ FakeVmm/开发与 macOS 路径没有 systemd。这些路径不使用 scope，仅
 - `Suspended`/`Warm`：证据齐全则保持原状态；无法安全重建时按 ADR-0002 收敛到 Cold
   fallback，但只有在保留盘已跨过远端 drain 或旧 Host 已被明确 fencing 后才能清理本地
   状态。
-- `Stopping`：保留 blockd 与 journal，等待控制面重试同一 job。
+- `Stopping`：blockd 仍存活且持有 journal，必须接管，否则这些 journal 变成无人认领的
+  residue。在 `R < L` 的 Relaxed 卷上它们是未发布写入的唯一权威副本（ADR-0021/0022），
+  所以这是三种非 Running 状态里唯一有真实数据风险的一种。接管后等控制面重试同一 job。
 - 无法证明归属的 residue：维持现有 fail-closed 行为不变。
 
 心跳只上报已证明归属的 Cat。无法证明的 Cat 必须**完全不出现在心跳里**，不得上报为
@@ -165,8 +172,15 @@ FakeVmm/开发与 macOS 路径没有 systemd。这些路径不使用 scope，仅
 2. 启动扫描与身份校验（含 blockd 控制协议身份字段），能接管 `Running`；控制面不可达
    不再退出。
 3. NodeJob journal 持久化与重放。
-4. `Suspended`/`Warm` 接管与 Cold fallback 收敛。
+4. `Suspended`/`Warm`/`Stopping` 接管与 Cold fallback 收敛。判据是「这个状态下还有没有
+   活进程」：有活进程而不能接管，上了阶段 5 就是孤儿。
 5. per-Cat systemd scope 与 `KillMode` 变更，附运维文档更新。
+
+**阶段 4 是阶段 5 的前提，不是可以并列或跳过的一项。** 今天 Suspended 的 VMM 是活着的、
+暂停着的，Agent 重启时被 systemd 一并杀掉，Cat 因此干净地收敛到 Cold。一旦阶段 5 让子进程
+活过 Agent 重启，而阶段 4 还没让 Suspended 可被接管，那个暂停的 VMM 就会变成无人认领的孤儿：
+Resume 找不到它，Cold fallback 又会因为无监督 residue 的 fail-closed 规则拒绝清理，结果是一只
+卡死的 Cat 和一块泄漏的内存。顺序必须是 4 在 5 之前。
 
 每阶段独立 PR，先补 characterization test。第 2 与第 5 阶段触及 Linux-only 路径，必须
 额外运行 `./scripts/quality.sh linux`。
