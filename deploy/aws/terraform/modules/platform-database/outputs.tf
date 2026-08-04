@@ -33,3 +33,12 @@ output "master_user_secret_arn" {
 output "security_group_id" {
   value = aws_security_group.this.id
 }
+
+output "postgresql_log_group_name" {
+  description = "Where the server states a connection failure plainly. Read this first when new connections fail while established ones keep working."
+  value       = aws_cloudwatch_log_group.postgresql.name
+}
+
+output "password_authentication_alarm_name" {
+  value = aws_cloudwatch_metric_alarm.password_authentication_failed.alarm_name
+}

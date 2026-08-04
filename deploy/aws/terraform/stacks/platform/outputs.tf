@@ -45,6 +45,16 @@ output "database_master_user_secret_arn" {
   value = module.database.master_user_secret_arn
 }
 
+output "database_postgresql_log_group_name" {
+  description = "Read this before diagnosing a connection failure: the server states the reason here, and nowhere the client can see."
+  value       = module.database.postgresql_log_group_name
+}
+
+output "alert_sns_topic_arn" {
+  description = "Feed to the infrastructure stack's alarm_sns_topic_arns, which is currently empty, so its usage-pipeline alarms notify nobody."
+  value       = aws_sns_topic.alerts.arn
+}
+
 output "metal_worker_security_group_id" {
   value = aws_security_group.metal_worker.id
 }

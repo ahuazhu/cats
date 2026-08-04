@@ -110,6 +110,20 @@ variable "database_skip_final_snapshot" {
   default     = false
 }
 
+variable "database_log_retention_days" {
+  type        = number
+  description = "Retention for the exported PostgreSQL error log."
+  default     = 30
+}
+
+# Alerting -------------------------------------------------------------------
+
+variable "alert_email_addresses" {
+  type        = list(string)
+  description = "Addresses subscribed to the platform alert topic. Each recipient must confirm the AWS subscription mail before the topic reaches them."
+  default     = []
+}
+
 # DNS -----------------------------------------------------------------------
 
 variable "domain_name" {
