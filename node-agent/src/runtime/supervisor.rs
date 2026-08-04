@@ -891,6 +891,10 @@ mod teardown_tests {
                 "dsk_root".to_string(),
                 BlockdProc {
                     child: dead,
+                    // Same name spawn_blockd gives it, so a failure here reads
+                    // the way it would in production. Nothing writes it in this
+                    // test; an absent log is reported as absent.
+                    log_path: dir.join("blockd-dsk_root.log"),
                     socket: dir.join("nbd.sock"),
                     vhost_user_socket: None,
                     control_socket: dir.join("ctl.sock"),
