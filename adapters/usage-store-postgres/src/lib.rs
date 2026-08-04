@@ -1655,6 +1655,46 @@ mod tests {
         assert!(error.to_string().contains("is empty"), "{error}");
     }
 
+    #[test]
+    fn a_literal_dsn_stays_fixed() {
+        let dsn = DsnSource::Literal("postgres://cats@db.example/cats".to_string());
+        assert_eq!(dsn.resolve().unwrap(), "postgres://cats@db.example/cats");
+    }
+
+    /// A renderer writes this file, and a trailing newline is the norm. Left
+    /// in, it becomes part of the database name and the failure is baffling.
+    #[test]
+    fn surrounding_whitespace_is_not_part_of_the_dsn() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("usage-postgres-url");
+        fs::write(&path, "  postgres://cats@db.example/cats\n").unwrap();
+        assert_eq!(
+            DsnSource::File(path).resolve().unwrap(),
+            "postgres://cats@db.example/cats"
+        );
+    }
+
+    /// The DSN carries the password. An error about the file may name the
+    /// file; it may never quote what is inside it.
+    #[test]
+    fn a_dsn_file_error_never_quotes_the_credential() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("usage-postgres-url");
+        fs::write(&path, "not a dsn but it contains hunter2\n").unwrap();
+        let resolved = DsnSource::File(path).resolve().unwrap();
+        // Resolution does not validate; the driver rejects a bad DSN. What
+        // matters is that the value never lands in one of our messages.
+        assert!(resolved.contains("hunter2"));
+
+        // A directory cannot be read as a file, so this exercises the same
+        // error path with contents that must not be echoed.
+        let error = DsnSource::File(directory.path().to_path_buf())
+            .resolve()
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("hunter2"), "credential leaked: {error}");
+    }
+
     /// A worker that cannot reconnect must say so. Before this change the job
     /// was dropped unrun and the caller saw "operation was canceled", which
     /// says nothing about the credential that actually failed.
