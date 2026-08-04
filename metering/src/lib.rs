@@ -103,6 +103,13 @@ pub struct UsageView {
     pub latest_interval_end_unix_ms: Option<i64>,
 }
 
+/// Per-metric totals for a query window, without the per-interval detail.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageTotals {
+    pub totals: Vec<UsageAggregate>,
+    pub latest_interval_end_unix_ms: Option<i64>,
+}
+
 pub type UsageStoreFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 /// Durable usage-ledger port used by the control plane.
@@ -116,6 +123,28 @@ pub trait UsageStore: Send + Sync {
         -> UsageStoreFuture<'a, IngestOutcome>;
 
     fn query<'a>(&'a self, query: &'a UsageQuery) -> UsageStoreFuture<'a, UsageView>;
+
+    /// Totals for the window, without materialising per-interval detail.
+    ///
+    /// Admission (`require_funded`) needs one fact -- whether the Account has
+    /// anything left -- and answering it through [`UsageStore::query`] fetches,
+    /// sorts and folds every interval the Account has ever accrued: the
+    /// admission window is unbounded below, so the cost grows with the whole
+    /// history. That sat on every paid operation and put a no-op `exec` at ~35 s
+    /// while the node agent answered the identical call in 2 ms.
+    ///
+    /// Implementations should push the aggregation into the store. The default
+    /// keeps an adapter correct until it does, so this can never be silently
+    /// wrong -- only slow.
+    fn query_totals<'a>(&'a self, query: &'a UsageQuery) -> UsageStoreFuture<'a, UsageTotals> {
+        Box::pin(async move {
+            let view = self.query(query).await?;
+            Ok(UsageTotals {
+                totals: view.totals,
+                latest_interval_end_unix_ms: view.latest_interval_end_unix_ms,
+            })
+        })
+    }
 
     /// Return the immutable attribution already established for a producer
     /// epoch. This lets a durable node outbox replay the tail of a deleted
