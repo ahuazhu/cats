@@ -13,15 +13,6 @@ locals {
   metric_namespace = "Cats/Database"
 }
 
-# An alarm with no action changes colour in a console nobody is looking at. The
-# existing usage-pipeline alarms are already in that state, which is part of why
-# a credential failure went unnoticed for thirteen hours.
-check "the_credential_alarm_reaches_someone" {
-  assert {
-    condition     = length(var.alarm_action_arns) > 0
-    error_message = "alarm_action_arns is empty, so ${local.name}-password-authentication-failed will notify nobody. Point it at an SNS topic with a confirmed subscription."
-  }
-}
 
 resource "aws_db_subnet_group" "this" {
   name       = local.name

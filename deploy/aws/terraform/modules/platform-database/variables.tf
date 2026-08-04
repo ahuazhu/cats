@@ -117,10 +117,21 @@ variable "log_retention_days" {
   }
 }
 
+# Required, with no default, and validated non-empty.
+#
+# This started as a `check` block, which only warns: a caller could omit it and
+# still apply successfully, producing an alarm with `alarm_actions = []` -- an
+# alarm that changes colour in a console nobody watches. That is the state the
+# three usage-pipeline alarms are already in, and it is part of why a credential
+# failure went unnoticed for thirteen hours. Refusing to plan is the point.
 variable "alarm_action_arns" {
   type        = list(string)
-  description = "SNS topics notified when PostgreSQL rejects a connection's credentials."
-  default     = []
+  description = "SNS topics notified when PostgreSQL rejects a connection's credentials. Required: an alarm nobody receives is not a detector."
+
+  validation {
+    condition     = length(var.alarm_action_arns) > 0
+    error_message = "alarm_action_arns must name at least one SNS topic, or the credential alarm notifies nobody. Confirm the topic's subscription too: Terraform reports an unconfirmed email subscription as created."
+  }
 }
 
 variable "tags" {
