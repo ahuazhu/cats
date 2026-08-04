@@ -87,6 +87,23 @@ pub struct IngestUsageCheckpointsRequest {
 pub struct IngestUsageCheckpointsResponse {
     pub accepted: u64,
     pub duplicates: u64,
+    /// Checkpoints the ledger will never be able to accept.
+    ///
+    /// A durable outbox delivers an ordered prefix, so one permanently
+    /// unacceptable checkpoint used to fail the whole request and block every
+    /// checkpoint behind it -- forever, because retrying could not change the
+    /// answer. Naming them lets the request still succeed: the producer stops
+    /// resending them and the queue drains. Empty in the ordinary case, and
+    /// absent on the wire, so an older producer is unaffected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected: Vec<RejectedCheckpoint>,
+}
+
+/// One checkpoint the ledger refused for good, with why.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RejectedCheckpoint {
+    pub event_id: String,
+    pub reason: String,
 }
 
 /// Provisional usage line returned by the near-real-time billing API.
