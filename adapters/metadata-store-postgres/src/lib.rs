@@ -323,7 +323,7 @@ fn connect_client(url: &str, ca_file: Option<&str>) -> Result<Client> {
     config.connect_timeout(Duration::from_secs(5));
     let mut client = config
         .connect(MakeTlsConnector::new(connector))
-        .map_err(|error| MetaError::Backend(format!("connect PostgreSQL: {error}")))?;
+        .map_err(|error| MetaError::Backend(connect_failure(error)))?;
     client
         .batch_execute("SET statement_timeout = '5s'; SET lock_timeout = '2s'")
         .map_err(pg_err)?;
@@ -356,6 +356,42 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+/// Describe a failed connect using the server's own words.
+///
+/// `postgres::Error`'s `Display` renders a server-side failure as just
+/// "db error", so the reason -- which PostgreSQL states plainly, e.g.
+/// `FATAL: password authentication failed for user "catsadmin"` -- is only
+/// reachable through `as_db_error`. Losing it cost real time: a rotated master
+/// password surfaced to operators as `connect PostgreSQL: db error`, and the
+/// caller above it guessed at causes it had no evidence for.
+fn connect_failure(error: postgres::Error) -> String {
+    match error.as_db_error() {
+        Some(database_error) => {
+            let detail = database_error
+                .detail()
+                .map(|value| format!("; {value}"))
+                .unwrap_or_default();
+            format!(
+                "connect PostgreSQL: {} {} [{}]{detail}",
+                database_error.severity(),
+                database_error.message(),
+                database_error.code().code()
+            )
+        }
+        // Not a server response: DNS, TCP, TLS or timeout. `Display` alone can
+        // still be terse, so include the source chain.
+        None => {
+            let mut described = format!("connect PostgreSQL: {error}");
+            let mut source = std::error::Error::source(&error);
+            while let Some(cause) = source {
+                described.push_str(&format!(": {cause}"));
+                source = cause.source();
+            }
+            described
+        }
+    }
 }
 
 fn pg_err(error: postgres::Error) -> MetaError {
