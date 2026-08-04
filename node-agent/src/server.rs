@@ -173,6 +173,11 @@ const USAGE_REQUEST_TARGET_BYTES: usize = MAX_USAGE_INGEST_BODY_BYTES / 2;
 const USAGE_DELIVERY_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const USAGE_DELIVERY_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
+/// Bound on how much of a rejection body is quoted into an error. Enough for
+/// the control plane's structured message, short enough that remote input
+/// cannot flood the journal.
+const MAX_INGEST_ERROR_DETAIL_CHARS: usize = 512;
+
 /// How often the uploader drains the spool when nothing nudges it.
 ///
 /// Independent of the heartbeat interval on purpose: billing tolerates delay,
@@ -325,9 +330,23 @@ async fn deliver_usage_batches(
         }
         if !response.status().is_success() {
             let status = response.status();
+            // Carry the control plane's reason. It names the offending
+            // checkpoint and what is wrong with it, which is the difference
+            // between "the batch is rejected" and knowing that one specific Cat
+            // changed owner. Checkpoints carry no credentials, so the body is
+            // safe to log; bound it anyway because it is remote input.
+            let detail = response.text().await.unwrap_or_default();
+            let detail = detail.trim();
+            let detail: String = detail.chars().take(MAX_INGEST_ERROR_DETAIL_CHARS).collect();
             let delay = delivery.record_failure(Instant::now());
+            if detail.is_empty() {
+                anyhow::bail!(
+                    "usage ingestion returned {status}; retrying after {} ms",
+                    delay.as_millis()
+                );
+            }
             anyhow::bail!(
-                "usage ingestion returned {status}; retrying after {} ms",
+                "usage ingestion returned {status}: {detail}; retrying after {} ms",
                 delay.as_millis()
             );
         }
@@ -848,6 +867,19 @@ mod usage_delivery_tests {
             .unwrap_or(StatusCode::OK)
     }
 
+    /// Answers every request with one status and one body, for asserting what
+    /// a rejection reason turns into on the node side.
+    async fn spawn_rejecting_mock(
+        status: StatusCode,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route("/", post(move || async move { (status, body) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}/"), server)
+    }
+
     async fn spawn_mock(
         responses: impl IntoIterator<Item = StatusCode>,
     ) -> (String, MockIngestion, tokio::task::JoinHandle<()>) {
@@ -975,6 +1007,44 @@ mod usage_delivery_tests {
         assert!(error.to_string().contains("queue head was retained"));
         assert_eq!(spool.len().unwrap(), 1);
         assert_eq!(mock.requests.lock().unwrap().len(), 1);
+        server.abort();
+    }
+
+    /// A rejection must say what was rejected and why.
+    ///
+    /// The status alone was logged and the response body discarded, so a
+    /// poisoned batch read as a bare "returned 409 Conflict" -- which named
+    /// neither the offending checkpoint nor the reason, and left diagnosis to
+    /// guesswork against a live cluster.
+    #[tokio::test]
+    async fn a_rejection_carries_the_control_planes_reason() {
+        let (_directory, spool) = spool_with(&[checkpoint(0)]);
+        let (endpoint, server) = spawn_rejecting_mock(
+            StatusCode::CONFLICT,
+            r#"{"code":"conflict","message":"node node-a does not own Cat cat-a"}"#,
+        )
+        .await;
+        let delivery = tokio::sync::Mutex::new(UsageDeliveryState::default());
+
+        let error = deliver_usage_batches(
+            &reqwest::Client::new(),
+            &endpoint,
+            "token",
+            "node-a",
+            &spool,
+            &delivery,
+        )
+        .await
+        .unwrap_err();
+        let reported = format!("{error:#}");
+        assert!(
+            reported.contains("does not own Cat cat-a"),
+            "the reason must reach the operator, got: {reported}"
+        );
+        assert!(reported.contains("409"), "the status is still useful");
+        // A rejected batch is retained: discarding usage is a separate,
+        // deliberate decision and must never be a side effect of a bad reply.
+        assert_eq!(spool.len().unwrap(), 1);
         server.abort();
     }
 }
@@ -1255,7 +1325,7 @@ impl HostTelemetrySampler {
                 Err(error) => {
                     tracing::error!(
                         cat = %target.cat_id,
-                        %error,
+                        error = format!("{error:#}"),
                         "authoritative billing sample failed closed until a new runtime epoch"
                     );
                 }
@@ -1634,7 +1704,7 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
             );
             if let Err(error) = persisted {
                 tracing::error!(
-                    %error,
+                    error = format!("{error:#}"),
                     "usage checkpoints are not durable; billing remains failed closed"
                 );
             }
@@ -1670,7 +1740,14 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
                 _ = tokio::time::sleep(USAGE_DELIVERY_INTERVAL) => {}
             }
             if let Err(error) = usage_state.deliver_pending_usage().await {
-                tracing::warn!(%error, "durable usage checkpoint delivery deferred");
+                // Alternate Display prints the whole context chain. Plain `%error`
+                // shows only the outermost `.context(...)`, which hid the actual
+                // transport or status failure behind "send durable usage
+                // checkpoints" and made this undiagnosable from logs alone.
+                tracing::warn!(
+                    error = format!("{error:#}"),
+                    "durable usage checkpoint delivery deferred"
+                );
             }
         }
     });
