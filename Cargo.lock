@@ -1103,6 +1103,7 @@ dependencies = [
  "cats-usage-store-postgres",
  "clap",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 

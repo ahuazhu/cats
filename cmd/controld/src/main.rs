@@ -247,7 +247,24 @@ async fn main() -> anyhow::Result<()> {
             }
             "postgres" => {
                 let dsn = match args.usage_postgres_url_file.as_deref() {
-                    Some(path) => DsnSource::File(path.to_path_buf()),
+                    Some(path) => {
+                        // The metadata adapter refuses this ambiguity outright.
+                        // Here it cannot: --usage-postgres-url-env carries a
+                        // clap default, so it is always "set". Say plainly
+                        // which source won instead of ranking them in silence
+                        // -- an operator mid-cutover has both in place, and
+                        // which one holds the current password is the exact
+                        // question that cost an outage.
+                        if std::env::var_os(&args.usage_postgres_url_env).is_some() {
+                            tracing::warn!(
+                                file = %path.display(),
+                                ignored_environment_variable = %args.usage_postgres_url_env,
+                                "usage PostgreSQL DSN comes from the file; the environment \
+                                 variable is set but not read"
+                            );
+                        }
+                        DsnSource::File(path.to_path_buf())
+                    }
                     None => DsnSource::Literal(
                         std::env::var(&args.usage_postgres_url_env).map_err(|_| {
                             anyhow::anyhow!(
