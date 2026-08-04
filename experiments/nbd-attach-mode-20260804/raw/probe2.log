@@ -1,0 +1,122 @@
+
+############ nbd0 mode=netlink hold ############
+server_pid=9028 socket=/tmp/nbd-0.sock
+Negotiation: ..size = 64MB
+Connected /dev/nbd0
+[attached, server alive]
+  pid_attr=present pid_value=9033 size=131072
+  pid_alive=NO
+  resident_nbd_clients=[]
+  attr_read_ms=1
+  direct_read_healthy=ok
+  holder_pid=9059 (stands in for Cloud Hypervisor holding the disk open)
+[server SIGKILLed]
+  pid_attr=present pid_value=9033 size=131072
+  pid_alive=NO
+  resident_nbd_clients=[]
+  attr_read_ms=1
+dd: /dev/nbd0: cannot skip: Invalid argument
+  reader_finished=yes (device did NOT block)
+[nbd-client -d rc=0 in 4ms]
+  pid_attr=present pid_value=9033 size=131072
+  pid_alive=NO
+  resident_nbd_clients=[]
+  attr_read_ms=1
+/tmp/probe2.sh: line 39:  9059 Killed                  setsid sleep 900 < $DEV
+[holder released]
+  settled_after_release_ms=200
+  pid_attr=absent pid_value=none size=0
+  resident_nbd_clients=[]
+  attr_read_ms=1
+[reuse: can a new attach take this device?]
+server_pid=9167 socket=/tmp/nbd-90.sock
+  reattach=ok
+  read_after_reuse=ok
+
+############ nbd1 mode=netlink nohold ############
+server_pid=9186 socket=/tmp/nbd-1.sock
+Negotiation: ..size = 64MB
+Connected /dev/nbd1
+[attached, server alive]
+  pid_attr=present pid_value=9194 size=131072
+  pid_alive=NO
+  resident_nbd_clients=[]
+  attr_read_ms=1
+  direct_read_healthy=ok
+[server SIGKILLed]
+  pid_attr=present pid_value=9194 size=131072
+  pid_alive=NO
+  resident_nbd_clients=[]
+  attr_read_ms=1
+dd: /dev/nbd1: cannot skip: Invalid argument
+  reader_finished=yes (device did NOT block)
+[nbd-client -d rc=0 in 4ms]
+  settled_ms=200
+  pid_attr=absent pid_value=none size=0
+  resident_nbd_clients=[]
+  attr_read_ms=1
+[reuse: can a new attach take this device?]
+server_pid=9260 socket=/tmp/nbd-91.sock
+  reattach=ok
+  read_after_reuse=ok
+
+############ nbd2 mode=ioctl hold ############
+server_pid=9279 socket=/tmp/nbd-2.sock
+Negotiation: ..size = 64MB
+bs=512, sz=67108864 bytes
+[attached, server alive]
+  pid_attr=present pid_value=9291 size=131072
+  pid_alive=YES comm=nbd-client state=S
+  resident_nbd_clients=[9291 nbd-client -nonetlink -unix /tmp/nbd-2.sock /dev/nbd2 -b 512 -N cats;]
+  attr_read_ms=1
+  direct_read_healthy=ok
+  holder_pid=9317 (stands in for Cloud Hypervisor holding the disk open)
+[server SIGKILLed]
+  pid_attr=present pid_value=9291 size=131072
+  pid_alive=YES comm=nbd-client state=S
+  resident_nbd_clients=[9291 nbd-client -nonetlink -unix /tmp/nbd-2.sock /dev/nbd2 -b 512 -N cats;]
+  attr_read_ms=1
+  reader_finished=yes (device did NOT block)
+[nbd-client -d rc=0 in 4ms]
+  pid_attr=present pid_value=9291 size=131072
+  pid_alive=NO
+  resident_nbd_clients=[]
+  attr_read_ms=1
+/tmp/probe2.sh: line 39:  9317 Killed                  setsid sleep 900 < $DEV
+[holder released]
+  settled_after_release_ms=200
+  pid_attr=absent pid_value=none size=0
+  resident_nbd_clients=[]
+  attr_read_ms=1
+[reuse: can a new attach take this device?]
+server_pid=9431 socket=/tmp/nbd-92.sock
+  reattach=ok
+  read_after_reuse=ok
+
+############ nbd3 mode=ioctl nohold ############
+server_pid=9451 socket=/tmp/nbd-3.sock
+Negotiation: ..size = 64MB
+bs=512, sz=67108864 bytes
+[attached, server alive]
+  pid_attr=present pid_value=9460 size=131072
+  pid_alive=YES comm=nbd-client state=S
+  resident_nbd_clients=[9460 nbd-client -nonetlink -unix /tmp/nbd-3.sock /dev/nbd3 -b 512 -N cats;]
+  attr_read_ms=1
+  direct_read_healthy=ok
+[server SIGKILLed]
+  pid_attr=present pid_value=9460 size=131072
+  pid_alive=YES comm=nbd-client state=S
+  resident_nbd_clients=[9460 nbd-client -nonetlink -unix /tmp/nbd-3.sock /dev/nbd3 -b 512 -N cats;]
+  attr_read_ms=1
+  reader_finished=yes (device did NOT block)
+[nbd-client -d rc=0 in 4ms]
+  settled_ms=200
+  pid_attr=absent pid_value=none size=0
+  resident_nbd_clients=[]
+  attr_read_ms=1
+[reuse: can a new attach take this device?]
+server_pid=9532 socket=/tmp/nbd-93.sock
+  reattach=ok
+  read_after_reuse=ok
+
+PROBE2 DONE
