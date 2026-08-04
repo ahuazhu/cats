@@ -1,0 +1,34 @@
+
+############ nbd4 ioctl :: kill=both hold=hold ############
+healthy_read=ok
+healthy: pid=14271 alive=YES comm=nbd-client size=131072
+holder=14286
+after: pid=[14271] alive=NO size=131072 servers=0 clients=0
+  VERDICT=LEAKED (dead pid + non-zero size: exactly what the detector looks for)
+--- reclaim ---
+  rc=0 in 5ms
+  after_reclaim: pid_attr=present size=131072
+/tmp/probe5.sh: line 7: 14286 Killed                  setsid sleep 900 < $DEV
+  settled_after_holder_ms=200
+  after_holder: pid_attr=absent size=0
+--- reuse ---
+  size_after_reattach=131072
+  reuse_read=ok
+
+############ nbd5 ioctl :: kill=server hold=hold ############
+healthy_read=ok
+healthy: pid=14401 alive=YES comm=nbd-client size=131072
+holder=14415
+after: pid=[14401] alive=NO size=131072 servers=0 clients=0
+  VERDICT=LEAKED (dead pid + non-zero size: exactly what the detector looks for)
+--- reclaim ---
+  rc=0 in 5ms
+  after_reclaim: pid_attr=present size=131072
+/tmp/probe5.sh: line 7: 14415 Killed                  setsid sleep 900 < $DEV
+  settled_after_holder_ms=200
+  after_holder: pid_attr=absent size=0
+--- reuse ---
+  size_after_reattach=131072
+  reuse_read=ok
+
+PROBE5 DONE

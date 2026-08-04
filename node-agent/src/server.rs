@@ -1620,6 +1620,10 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
     let cfg = Arc::new(cfg);
     let runtime =
         Arc::new(NodeRuntime::new(cfg.node.clone()).with_usage_finalizer(usage_pipeline.clone()));
+    // Before the agent is reachable and can be given a StartCat: allocation
+    // is the next thing to touch these devices, and a device the kernel still
+    // has connected to a dead server cannot serve a Guest (issue #79).
+    runtime.reclaim_leaked_block_devices();
     let state = NodeState {
         runtime: runtime.clone(),
         cfg: cfg.clone(),

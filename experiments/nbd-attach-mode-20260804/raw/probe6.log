@@ -1,0 +1,36 @@
+blockd_pid=17769 sock=/tmp/b0/nbd.sock
+
+########## cats-blockd on nbd0 mode=netlink ##########
+attached: pid=17776 alive=NO size=2097152
+--- throughput, O_DIRECT (this is the number ADR-0015 cares about) ---
+  seq_write_256MiB_run1: 268435456 bytes (268 MB, 256 MiB) copied, 7.46279 s, 36.0 MB/s
+  seq_write_256MiB_run2: 268435456 bytes (268 MB, 256 MiB) copied, 8.03198 s, 33.4 MB/s
+  seq_read_256MiB: 268435456 bytes (268 MB, 256 MiB) copied, 0.107977 s, 2.5 GB/s
+  --- 4k random write, qd32 ---
+  fio_write_KiBps=1339628 iops=16743 lat_us_mean=1910.428199
+--- now leak it: kill blockd while the device is held open (production shape) ---
+/tmp/probe6.sh: line 21: 17769 Killed                  $BLOCKD --volume-id vol_p$1 --attachment-id att_p$1 --lease-ttl-ms 5000 --data-dir $R/data --metadata-store-adapter sqlite --metadata-store-option path=$R/meta.db --object-store-adapter file --object-store-option root=$R/blob --listen-unix $R/nbd.sock --create-volume-size $((1024*1024*1024)) > $R/blockd.log 2>&1
+  after_blockd_death: pid=[17776] alive=NO size=2097152
+  DETECTOR=would flag this device as leaked
+/tmp/probe6.sh: line 21: 17878 Killed                  setsid sleep 900 < $DEV
+  after_holder_gone: pid=[17776] size=2097152
+  after_reclaim: pid_attr=absent size=0
+blockd_pid=17902 sock=/tmp/b1/nbd.sock
+
+########## cats-blockd on nbd1 mode=ioctl ##########
+attached: pid=17911 alive=YES size=2097152
+--- throughput, O_DIRECT (this is the number ADR-0015 cares about) ---
+  seq_write_256MiB_run1: 268435456 bytes (268 MB, 256 MiB) copied, 7.46611 s, 36.0 MB/s
+  seq_write_256MiB_run2: 268435456 bytes (268 MB, 256 MiB) copied, 7.43057 s, 36.1 MB/s
+  seq_read_256MiB: 268435456 bytes (268 MB, 256 MiB) copied, 0.108486 s, 2.5 GB/s
+  --- 4k random write, qd32 ---
+  fio_write_KiBps=1503940 iops=18797 lat_us_mean=1701.592069
+--- now leak it: kill blockd while the device is held open (production shape) ---
+/tmp/probe6.sh: line 21: 17902 Killed                  $BLOCKD --volume-id vol_p$1 --attachment-id att_p$1 --lease-ttl-ms 5000 --data-dir $R/data --metadata-store-adapter sqlite --metadata-store-option path=$R/meta.db --object-store-adapter file --object-store-option root=$R/blob --listen-unix $R/nbd.sock --create-volume-size $((1024*1024*1024)) > $R/blockd.log 2>&1
+  after_blockd_death: pid=[17911] alive=NO size=2097152
+  DETECTOR=would flag this device as leaked
+/tmp/probe6.sh: line 21: 18013 Killed                  setsid sleep 900 < $DEV
+  after_holder_gone: pid=[] size=0
+  after_reclaim: pid_attr=absent size=0
+
+PROBE6 DONE

@@ -1,0 +1,227 @@
+
+############ nbd6 ioctl :: kill=client hold=nohold ############
+healthy_read=ok
+healthy: pid=13592 alive=YES comm=nbd-client size=131072
+after: pid=[] alive=n/a size=0 servers=1 clients=0
+  VERDICT=SELF-CLEANED
+--- reclaim ---
+  rc=0 in 3ms
+  settled_ms=200
+  after_reclaim: pid_attr=absent size=0
+--- reuse ---
+  size_after_reattach=131072
+  reuse_read=ok
+
+############ nbd7 ioctl :: kill=both hold=nohold ############
+healthy_read=ok
+healthy: pid=13665 alive=YES comm=nbd-client size=131072
+after: pid=[] alive=n/a size=0 servers=0 clients=0
+  VERDICT=SELF-CLEANED
+--- reclaim ---
+  rc=0 in 3ms
+  settled_ms=200
+  after_reclaim: pid_attr=absent size=0
+--- reuse ---
+  size_after_reattach=131072
+  reuse_read=ok
+
+############ nbd8 ioctl :: kill=both hold=hold ############
+dd: failed to open '/dev/nbd8': No such file or directory
+cat: /sys/block/nbd8/pid: No such file or directory
+cat: /proc//comm: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+healthy: pid= alive=YES comm= size=
+/tmp/probe5.sh: line 19: /dev/nbd8: No such file or directory
+holder=13741
+kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]
+cat: /sys/block/nbd8/size: No such file or directory
+after: pid=[] alive=n/a size= servers=0 clients=0
+cat: /sys/block/nbd8/size: No such file or directory
+  VERDICT=other
+--- reclaim ---
+  rc=1 in 4ms
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+  after_reclaim: pid_attr=absent size=
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+cat: /sys/block/nbd8/size: No such file or directory
+  after_holder: pid_attr=absent size=
+--- reuse ---
+cat: /sys/block/nbd8/size: No such file or directory
+  size_after_reattach=
+dd: failed to open '/dev/nbd8': No such file or directory
+  reuse_read=FAILED
+
+############ nbd9 ioctl :: kill=server hold=hold ############
+dd: failed to open '/dev/nbd9': No such file or directory
+cat: /sys/block/nbd9/pid: No such file or directory
+cat: /proc//comm: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+healthy: pid= alive=YES comm= size=
+/tmp/probe5.sh: line 19: /dev/nbd9: No such file or directory
+holder=13937
+cat: /sys/block/nbd9/size: No such file or directory
+after: pid=[] alive=n/a size= servers=0 clients=0
+cat: /sys/block/nbd9/size: No such file or directory
+  VERDICT=other
+--- reclaim ---
+  rc=1 in 5ms
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+  after_reclaim: pid_attr=absent size=
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+cat: /sys/block/nbd9/size: No such file or directory
+  after_holder: pid_attr=absent size=
+--- reuse ---
+cat: /sys/block/nbd9/size: No such file or directory
+  size_after_reattach=
+dd: failed to open '/dev/nbd9': No such file or directory
+  reuse_read=FAILED
+
+PROBE5 DONE

@@ -661,9 +661,17 @@ impl NodeRuntime {
             // syncfs pushed the guest page cache into the engines; on relaxed
             // volumes that only advances the local watermark. The VMM is gone,
             // so no late fsync can slip in behind this mandatory drain.
-            for proc in rt.blockds.values() {
+            let drained = rt.blockds.values().try_for_each(|proc| {
                 proc.drain()
-                    .with_context(|| format!("final drain of {}", proc.grant.disk_id))?;
+                    .with_context(|| format!("final drain of {}", proc.grant.disk_id))
+            });
+            if let Err(error) = drained {
+                // Returning here used to skip the kernel-NBD detach below. A
+                // blockd that exited on its own can never answer a drain, so
+                // every attempt took this path and left its /dev/nbdN attached
+                // to nothing -- the leak that deadlocked a host (issue #79).
+                self.detach_exited_blockd_devices(rt);
+                return Err(error);
             }
         }
         if let (Some(chrt), VmmMode::CloudHypervisor(chc)) = (&rt.ch, &self.cfg.vmm) {
@@ -692,6 +700,35 @@ impl NodeRuntime {
         Self::remove_metering_cgroup(rt.metering.as_ref());
         rt.state = ObservedState::Cold;
         Ok(())
+    }
+
+    /// Detach the kernel-NBD devices of blockds that have already exited.
+    ///
+    /// Teardown normally detaches at the end, after the drain. That is too
+    /// late for a blockd that died on its own: the drain fails first, and the
+    /// device stays attached to a server that no longer exists -- a pool slot
+    /// no later Cat can use, on every retry, forever. Only exited
+    /// blockds are reclaimed here -- a live one whose drain failed for another
+    /// reason (an unreachable object store, say) is still serving its device
+    /// and a retry can still publish its writes.
+    fn detach_exited_blockd_devices(&self, rt: &mut CatRuntime) {
+        let (Some(chrt), VmmMode::CloudHypervisor(chc)) = (&mut rt.ch, &self.cfg.vmm) else {
+            return;
+        };
+        for (disk_id, proc) in &mut rt.blockds {
+            if !matches!(proc.child.try_wait(), Ok(Some(_))) {
+                continue;
+            }
+            let Some(device) = chrt.nbd.remove(disk_id) else {
+                continue;
+            };
+            tracing::warn!(
+                disk = %disk_id,
+                device = %device,
+                "detaching the NBD device of a blockd that exited on its own"
+            );
+            ch::nbd_detach(chc, &device);
+        }
     }
 
     fn discard_root_runtimes(&self, rt: &mut CatRuntime, root_disk_ids: &[String]) {
@@ -770,5 +807,128 @@ impl NodeRuntime {
         }
         std::fs::remove_dir_all(dir)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod teardown_tests {
+    use super::*;
+    use crate::admission::WakeBudget;
+    use cats_api::resources::DiskDurability;
+    use cats_storage::AdapterSelection;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A blockd that exited on its own must give its kernel NBD device back,
+    /// even though teardown cannot finish.
+    ///
+    /// The mandatory final drain runs before the detach. A dead blockd can
+    /// never answer it, so teardown returned at the drain and the detach below
+    /// it never ran: every retry took the same path, and the device stayed
+    /// connected to a server that no longer existed until someone found it by
+    /// hand (issue #79). The drain failure is still reported -- it means
+    /// unpublished writes, which is not this fix's to swallow.
+    #[test]
+    fn a_dead_blockd_gives_its_nbd_device_back_even_when_the_drain_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let calls = temp.path().join("nbd-client-calls");
+        let nbd_client = temp.path().join("nbd-client");
+        std::fs::write(
+            &nbd_client,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&nbd_client, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let adapter = AdapterSelection::new("unused", cats_storage::AdapterConfig::default());
+        let runtime = NodeRuntime::new(NodeConfig {
+            node_id: "node-a".to_string(),
+            state_dir: temp.path().to_path_buf(),
+            blockd_bin: PathBuf::from("unused-blockd"),
+            guest_agent_bin: PathBuf::from("unused-guest-agent"),
+            metadata_store: adapter.clone(),
+            object_store: adapter,
+            blockd_lease_ttl_ms: 1_000,
+            blockd_max_staged_bytes: cats_api::blockd::DEFAULT_MAX_STAGED_BYTES,
+            blockd_max_staged_packs: cats_api::blockd::DEFAULT_MAX_STAGED_PACKS,
+            blockd_max_local_bytes: cats_api::blockd::DEFAULT_MAX_LOCAL_BYTES,
+            metering_cgroup_root: None,
+            vmm: VmmMode::CloudHypervisor(ChConfig {
+                block_direct: false,
+                ch_bin: PathBuf::from("unused-ch"),
+                kernel: PathBuf::from("unused-kernel"),
+                initramfs: None,
+                cmdline: String::new(),
+                seed_image: None,
+                block_path: BlockPath::KernelNbd,
+                vhost_user_queues: 1,
+                vhost_user_queue_size: 256,
+                nbd_client_bin: nbd_client,
+                nbd_devices: 8,
+                network_cidr: None,
+                ip_bin: PathBuf::from("unused-ip"),
+            }),
+            wake_budget: WakeBudget::default(),
+        });
+
+        let mut dead = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        dead.wait().unwrap();
+        let dir = temp.path().join("cat-a");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut rt = CatRuntime {
+            generation: 1,
+            cpus: 1,
+            memory_mib: 256,
+            state: ObservedState::Running,
+            guest: None,
+            boot_id: None,
+            blockds: HashMap::from([(
+                "dsk_root".to_string(),
+                BlockdProc {
+                    child: dead,
+                    socket: dir.join("nbd.sock"),
+                    vhost_user_socket: None,
+                    control_socket: dir.join("ctl.sock"),
+                    grant: VolumeGrant {
+                        disk_id: "dsk_root".to_string(),
+                        volume_id: "vol_a".to_string(),
+                        attachment_id: "att_a".to_string(),
+                        epoch: 1,
+                        size_bytes: 1024,
+                        mount_path: "/".to_string(),
+                        durability: DiskDurability::Strict,
+                    },
+                },
+            )]),
+            volumes: Vec::new(),
+            dir: dir.clone(),
+            ctl_sock: dir.join("ctl"),
+            web_sock: dir.join("web"),
+            runtime_sock: dir.join("runtime"),
+            activity: Arc::new(RuntimeActivity::default()),
+            metering: None,
+            ch: Some(ChRuntime {
+                nbd: HashMap::from([("dsk_root".to_string(), "/dev/nbd7".to_string())]),
+                ..ChRuntime::default()
+            }),
+        };
+
+        let error = runtime
+            .teardown(&mut rt, TeardownMode::Cold)
+            .expect_err("a dead blockd cannot be drained");
+        assert!(
+            format!("{error:#}").contains("final drain of dsk_root"),
+            "the drain failure must still be reported: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap_or_default().trim(),
+            "-d /dev/nbd7",
+            "the device of a blockd that exited on its own must be detached"
+        );
     }
 }

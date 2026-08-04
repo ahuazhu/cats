@@ -1,0 +1,36 @@
+
+############ nbd4 mode=netlink ############
+healthy_read=ok
+healthy: pid=13255 alive=NO size=131072 nbd_clients=[0] nbd_servers=[2]
+--- kill EVERY nbd-server (master and the forked connection child) ---
+remaining_servers=0
+after_death: pid=[13255] alive=NO size=131072 resident_clients=[]
+--- O_DIRECT read of a dead-server device ---
+  read_returned err=[dd: error reading '/dev/nbd4': Input/output error ]
+--- sysfs attribute read on the dead device ---
+  attr_read_ms=1
+--- nbd-client -d ---
+  rc=0 in 5ms
+  settled_ms=200
+  final: pid_attr=absent size=0
+--- reuse after reclaim ---
+  reuse=ok
+
+############ nbd5 mode=ioctl ############
+healthy_read=ok
+healthy: pid=13331 alive=YES size=131072 nbd_clients=[1] nbd_servers=[2]
+--- kill EVERY nbd-server (master and the forked connection child) ---
+remaining_servers=0
+after_death: pid=[] alive=n/a size=0 resident_clients=[]
+--- O_DIRECT read of a dead-server device ---
+  read_returned err=[dd: /dev/nbd5: cannot skip: Invalid argument ]
+--- sysfs attribute read on the dead device ---
+  attr_read_ms=2
+--- nbd-client -d ---
+  rc=0 in 3ms
+  settled_ms=200
+  final: pid_attr=absent size=0
+--- reuse after reclaim ---
+dd: /dev/nbd5: cannot skip: Invalid argument
+
+PROBE4 DONE
