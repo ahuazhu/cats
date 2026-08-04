@@ -346,12 +346,16 @@ pub enum NbdDeviceState {
     Serving { pid: i32 },
     /// The kernel still has the device connected, but nothing is serving it.
     ///
-    /// Any I/O that touches such a device — a udev scan, a fresh allocation, a
-    /// plain `open` — blocks in uninterruptible sleep that `SIGKILL` does not
-    /// end. 27 of these in a 64-device pool deadlocked `metal-1` on
-    /// 2026-08-04: `systemd-udevd`, the worker's own shutdown and every later
-    /// `StartCat` all stalled on devices whose server had been killed without
-    /// a teardown.
+    /// The slot is spent: it can never be allocated and, on a device attached
+    /// the way an older node agent attached them, nothing but an explicit
+    /// disconnect gets it back. 27 of a 64-device pool were in this state on
+    /// `metal-1` on 2026-08-04, and nothing reported the number.
+    ///
+    /// I/O to such a device fails rather than hangs — a measured `EIO` in
+    /// every mode tried (`experiments/nbd-attach-mode-20260804/`). That run
+    /// did not reproduce the uninterruptible-sleep stalls seen during the
+    /// incident, so treat those as observed alongside pool exhaustion, not as
+    /// demonstrated to follow from touching one of these.
     Leaked { pid: Option<i32> },
 }
 
@@ -400,8 +404,9 @@ fn nbd_attribute(sysfs: &NbdSysfs, n: u32, name: &str) -> Option<String> {
 fn nbd_device_state_of(sysfs: &NbdSysfs, n: u32) -> NbdDeviceState {
     // A connected NBD device exposes a `pid` attribute naming the task that
     // serves it, and a non-zero `size`. Both are driver attributes: reading
-    // them costs no I/O to the device, which is what makes this scan safe to
-    // run against devices that would block any real access.
+    // them costs no I/O to the device at all (measured at 1-2 ms against
+    // leaked devices), which is what makes this scan cheap enough to run on
+    // the heartbeat and safe to point at devices nothing is serving.
     // This only discriminates because the attach uses [`NBD_IOCTL_MODE`]: the
     // recorded pid is then a resident `nbd-client`, alive for exactly as long
     // as the device is served. Under nbd-client's default netlink mode the
@@ -419,7 +424,7 @@ fn nbd_device_state_of(sysfs: &NbdSysfs, n: u32) -> NbdDeviceState {
         }
         Some(pid) => NbdDeviceState::Leaked { pid: Some(pid) },
         // No serving task, but the kernel still reports a capacity: the device
-        // is half torn down and blocks exactly the same way.
+        // is half torn down, and just as unusable.
         None => {
             let sectors = nbd_attribute(sysfs, n, "size")
                 .and_then(|size| size.parse::<u64>().ok())
@@ -647,9 +652,9 @@ pub fn nbd_attach(
                 continue;
             }
             // Never hand a Cat a device the kernel still has connected to a
-            // dead server: the first touch of it blocks forever, and the block
-            // outlives the Cat that caused it. Reclaiming here also returns the
-            // slot to the pool instead of losing it until the next boot.
+            // dead server: its I/O fails, so the Guest would come up with a
+            // broken root disk. Reclaiming here also returns the slot to the
+            // pool instead of losing it until the next boot.
             NbdDeviceState::Leaked { pid } => {
                 tracing::warn!(
                     device = %dev,
@@ -699,7 +704,7 @@ pub fn nbd_attach(
     }
     bail!(
         "no free /dev/nbdN device in a pool of {} ({serving} busy, {unreclaimable} leaked and \
-         leaked and still connected); raise --ch-nbd-devices / nbds_max",
+         still connected); raise --ch-nbd-devices / nbds_max",
         cfg.nbd_devices
     )
 }
@@ -1151,8 +1156,8 @@ mod tests {
     ///
     /// The old check asked only whether `pid` existed, which called a dead
     /// server "busy" (so the slot was never reused) and called a device with a
-    /// size but no server "free" (so it was handed to the next Cat, which then
-    /// blocked on it forever). Both were seen on `metal-1` on 2026-08-04.
+    /// size but no server "free" (so it was handed to the next Cat, whose disk
+    /// then answered every request with an error).
     #[test]
     fn a_device_is_free_only_when_nothing_holds_it() {
         let fake = FakeSysfs::new();
@@ -1177,7 +1182,7 @@ mod tests {
         assert_eq!(
             nbd_device_state_of(&fake.sysfs, 2),
             NbdDeviceState::Leaked { pid: None },
-            "a size with no serving task blocks exactly the same way"
+            "a size with no serving task is just as unusable"
         );
         assert_eq!(nbd_device_state_of(&fake.sysfs, 3), NbdDeviceState::Free);
         assert_eq!(leaked_nbd_devices_of(&fake.sysfs, 4), vec![1, 2]);

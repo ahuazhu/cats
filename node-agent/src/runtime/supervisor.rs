@@ -706,8 +706,8 @@ impl NodeRuntime {
     ///
     /// Teardown normally detaches at the end, after the drain. That is too
     /// late for a blockd that died on its own: the drain fails first, and the
-    /// device stays attached to a server that no longer exists, where the next
-    /// process to touch it blocks in uninterruptible sleep. Only exited
+    /// device stays attached to a server that no longer exists -- a pool slot
+    /// no later Cat can use, on every retry, forever. Only exited
     /// blockds are reclaimed here -- a live one whose drain failed for another
     /// reason (an unreachable object store, say) is still serving its device
     /// and a retry can still publish its writes.
