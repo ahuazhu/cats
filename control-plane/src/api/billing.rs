@@ -34,9 +34,12 @@ async fn billing_projection(state: &AppState, workspace: &str) -> ApiResult<Bill
         .map_err(metering_failure)?;
     // Every Workspace in an Account bills to that Account, so the balance is
     // read per Billing Account and never filtered by Workspace here.
+    // Totals only. The window is unbounded below, so asking for per-interval
+    // detail here made the cost of every paid request grow with the Account's
+    // whole billing history; nothing below reads anything but the totals.
     let usage = state
         .usage
-        .query(&MeterUsageQuery {
+        .query_totals(&MeterUsageQuery {
             billing_account_id: ledger.billing_account_id,
             workspace_id: None,
             attributed_cat_id: None,

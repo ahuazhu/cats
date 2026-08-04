@@ -14,7 +14,8 @@ use cats_metering::{
     metric_from_slug, usage_view_from_intervals, validate_checkpoint, validate_usage_query,
     AttributedCheckpoint, CheckoutIntent, CheckoutPayment, CheckoutRefund, CreditApplyOutcome,
     CreditStore, CreditStoreFuture, CreditSummary, IngestOutcome, MeteringError, Result,
-    UsageAttribution, UsageInterval, UsageQuery, UsageStore, UsageStoreFuture, UsageView,
+    UsageAggregate, UsageAttribution, UsageInterval, UsageQuery, UsageStore, UsageStoreFuture,
+    UsageTotals, UsageView,
 };
 use native_tls::{Certificate, TlsConnector};
 use postgres::{Client, Row, Transaction};
@@ -96,6 +97,15 @@ impl UsageStore for PostgresUsageStore {
         let schema = self.schema.clone();
         Box::pin(async move {
             self.dispatch(move |client| query_usage(client, &schema, &query))
+                .await
+        })
+    }
+
+    fn query_totals<'a>(&'a self, query: &'a UsageQuery) -> UsageStoreFuture<'a, UsageTotals> {
+        let query = query.clone();
+        let schema = self.schema.clone();
+        Box::pin(async move {
+            self.dispatch(move |client| query_usage_totals(client, &schema, &query))
                 .await
         })
     }
@@ -1378,6 +1388,80 @@ fn query_usage(client: &mut Client, schema: &str, query: &UsageQuery) -> Result<
         .map(usage_interval_from_row)
         .collect::<Result<Vec<_>>>()?;
     usage_view_from_intervals(query, intervals)
+}
+
+/// Totals for the window, aggregated by PostgreSQL rather than by returning
+/// every interval for the caller to fold.
+///
+/// This is the admission path. `query_usage` is unbounded below there
+/// (`interval_start_unix_ms: 0`), so it selected, sorted and shipped every
+/// interval a Billing Account had ever accrued -- growing without limit and
+/// putting a no-op `exec` at ~35 s while the node agent answered the same call
+/// in 2 ms.
+///
+/// The arithmetic mirrors `usage_view_from_intervals` exactly: prorate by the
+/// overlap and truncate **per row** with `div`, then sum. `div` truncates toward
+/// zero like the integer division the fold performs; summing before dividing
+/// would round differently and mis-bill. `HAVING` reproduces the fold skipping
+/// zero-quantity intervals, so a metric that contributes nothing is absent
+/// rather than present with zero.
+fn query_usage_totals(
+    client: &mut Client,
+    schema: &str,
+    query: &UsageQuery,
+) -> Result<UsageTotals> {
+    validate_usage_query(query)?;
+    let prorated = "div(quantity * (LEAST(interval_end_ms, $3) - GREATEST(interval_start_ms, $2))::numeric,                     (interval_end_ms - interval_start_ms)::numeric)";
+    let sql = format!(
+        "SELECT metric, SUM({prorated})::text, MAX(LEAST(interval_end_ms, $3))
+           FROM {schema}.usage_intervals
+          WHERE billing_account_id=$1
+            AND interval_end_ms>$2 AND interval_start_ms<$3
+            AND LEAST(interval_end_ms, $3) > GREATEST(interval_start_ms, $2)
+            AND ($4::text IS NULL OR workspace_id=$4)
+            AND ($5::text IS NULL OR attributed_cat_id=$5)
+          GROUP BY metric"
+    );
+    let rows = client
+        .query(
+            &sql,
+            &[
+                &query.billing_account_id,
+                &query.interval_start_unix_ms,
+                &query.interval_end_unix_ms,
+                &query.workspace_id,
+                &query.attributed_cat_id,
+            ],
+        )
+        .map_err(|error| pg_error("aggregate usage totals", error))?;
+    let mut totals = Vec::new();
+    let mut latest_interval_end_unix_ms: Option<i64> = None;
+    for row in &rows {
+        let metric: String = row.get(0);
+        let quantity: String = row.get(1);
+        let latest_end: i64 = row.get(2);
+        let metric = metric_from_slug(&metric)?;
+        let quantity = quantity
+            .parse::<u128>()
+            .map_err(|_| MeteringError::Invalid(format!("usage total {quantity} is not a u128")))?;
+        // The fold records a row's clipped end before it discards a zero
+        // quantity, so a metric that prorates entirely to zero still advances
+        // how far usage is visible. Filtering zero here rather than in `HAVING`
+        // keeps that: the group is dropped from the totals, not from the max.
+        if quantity > 0 {
+            totals.push(UsageAggregate { metric, quantity });
+        }
+        latest_interval_end_unix_ms = Some(
+            latest_interval_end_unix_ms
+                .unwrap_or(i64::MIN)
+                .max(latest_end),
+        );
+    }
+    totals.sort_by_key(|aggregate| aggregate.metric.slug());
+    Ok(UsageTotals {
+        totals,
+        latest_interval_end_unix_ms,
+    })
 }
 
 fn stored_checkpoint_from_row(row: &Row) -> Result<StoredCheckpoint> {
