@@ -1,0 +1,17 @@
+[Unit]
+Description=Keep the Cats PostgreSQL DSN current with its authority
+
+# cats-worker renders this file itself before every start, so this timer only
+# covers the case that actually hurt: a rotation while the worker keeps
+# running. Without it a stale DSN survives until the next restart, and the
+# first thing to notice would be a Cat that cannot start.
+#
+# Fifteen minutes bounds that window. One GetSecretValue per interval is
+# nothing next to what a missed rotation costs.
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

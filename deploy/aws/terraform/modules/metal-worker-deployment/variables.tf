@@ -52,22 +52,72 @@ variable "worker_runtime_secret_data" {
   type        = map(string)
   sensitive   = true
 
+  # CATS_POSTGRES_URL is accepted but no longer required, and nothing reads it
+  # once the worker passes url-file: the DSN is rendered from the managed
+  # secret at every start. Drop it from this map when the fleet has cut over.
   validation {
     condition = (
       length(setsubtract(
         toset(keys(var.worker_runtime_secret_data)),
         toset(["CATS_AUTH_TOKEN", "CATS_POSTGRES_URL"])
       )) == 0 &&
-      alltrue([
-        for key in ["CATS_AUTH_TOKEN", "CATS_POSTGRES_URL"] :
-        try(length(trimspace(var.worker_runtime_secret_data[key])) > 0, false)
-      ]) &&
+      try(length(trimspace(var.worker_runtime_secret_data["CATS_AUTH_TOKEN"])) > 0, false) &&
       alltrue([
         for value in values(var.worker_runtime_secret_data) :
+        length(trimspace(value)) > 0 &&
         !strcontains(value, "\n") && !strcontains(value, "\r")
       ])
     )
-    error_message = "worker_runtime_secret_data must contain only non-empty, single-line CATS_AUTH_TOKEN and CATS_POSTGRES_URL values."
+    error_message = "worker_runtime_secret_data must contain a non-empty single-line CATS_AUTH_TOKEN, and nothing but that and an optional legacy CATS_POSTGRES_URL."
+  }
+}
+
+variable "database_master_user_secret_arn" {
+  description = <<-EOT
+    ARN of the RDS managed master user secret, the one authority for the
+    database password. Set it and the worker renders its DSN from it at every
+    start and on a timer, so a rotation costs nothing; leave it null and the
+    worker keeps using whatever CATS_POSTGRES_URL is in worker.env, which is
+    the arrangement that turned a rotation into an outage.
+  EOT
+  type        = string
+  default     = null
+
+  validation {
+    condition = (
+      var.database_master_user_secret_arn == null ||
+      can(regex("^arn:[^:]+:secretsmanager:", var.database_master_user_secret_arn))
+    )
+    error_message = "database_master_user_secret_arn must be a Secrets Manager ARN."
+  }
+}
+
+variable "worker_managed_environment" {
+  description = <<-EOT
+    Non-secret worker.env entries Terraform owns outright and rewrites on every
+    deployment, unlike worker_base_environment which only seeds a host that has
+    no file yet. Use it for values that must reach an existing host --
+    CATS_POSTGRES_HOST, CATS_POSTGRES_PORT, CATS_POSTGRES_DATABASE,
+    CATS_POSTGRES_SSLMODE. CATS_POSTGRES_SECRET_ARN is added automatically from
+    database_master_user_secret_arn.
+  EOT
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition = length(setintersection(
+      toset(keys(var.worker_managed_environment)),
+      toset(["CATS_AUTH_TOKEN", "CATS_POSTGRES_URL", "CATS_METERING_CGROUP_ROOT"]),
+    )) == 0
+    error_message = "Secrets go through worker_runtime_secret_data, and CATS_METERING_CGROUP_ROOT is discovered on the host."
+  }
+
+  validation {
+    condition = alltrue([
+      for value in values(var.worker_managed_environment) :
+      length(trimspace(value)) > 0 && !strcontains(value, "\n") && !strcontains(value, "\r")
+    ])
+    error_message = "worker_managed_environment values must be non-empty and single-line."
   }
 }
 

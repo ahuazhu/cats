@@ -91,8 +91,30 @@ variable "metal_worker_instance_role_name" {
   default     = ""
 }
 
+variable "database_master_user_secret_arn" {
+  description = <<-EOT
+    Platform stack's database_master_user_secret_arn output. Set it and the
+    worker renders its DSN from the RDS managed secret at every start and on a
+    timer; leave it null and the worker keeps the static copy in worker.env,
+    which is what a rotation silently invalidates.
+  EOT
+  type        = string
+  default     = null
+}
+
+variable "worker_managed_environment" {
+  description = <<-EOT
+    Non-secret worker.env entries Terraform rewrites on every deployment, so
+    they reach a host that already has the file. Carries the non-secret half of
+    the DSN: CATS_POSTGRES_HOST, CATS_POSTGRES_PORT, CATS_POSTGRES_DATABASE,
+    CATS_POSTGRES_SSLMODE.
+  EOT
+  type        = map(string)
+  default     = {}
+}
+
 variable "worker_runtime_secret_data" {
-  description = "Worker CATS_AUTH_TOKEN and CATS_POSTGRES_URL delivered through Secrets Manager."
+  description = "Worker CATS_AUTH_TOKEN delivered through Secrets Manager. A legacy CATS_POSTGRES_URL is still accepted but no longer read."
   type        = map(string)
   sensitive   = true
   default     = {}

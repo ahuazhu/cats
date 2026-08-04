@@ -32,6 +32,7 @@ RUN cargo build --locked --release \
 
 COPY deploy/aws/metal/update-guest-seed.sh /out/update-guest-seed.sh
 COPY deploy/aws/metal/require-idle-worker.sh /out/require-idle-worker.sh
+COPY deploy/aws/metal/render-postgres-url.sh /out/render-postgres-url.sh
 COPY deploy/metal/guest-systemd /out/guest-systemd
 
 FROM scratch AS artifact
@@ -41,5 +42,8 @@ COPY --from=builder /out/cats-blockd /cats-blockd
 COPY --from=builder /out/cats-guest-agent /cats-guest-agent
 COPY --from=builder /out/update-guest-seed.sh /update-guest-seed.sh
 COPY --from=builder /out/require-idle-worker.sh /require-idle-worker.sh
+COPY --from=builder /out/render-postgres-url.sh /render-postgres-url.sh
 COPY --from=builder /out/guest-systemd /guest-systemd
 COPY deploy/aws/metal/cats-worker.service /cats-worker.service
+COPY deploy/aws/metal/cats-postgres-url.service /cats-postgres-url.service
+COPY deploy/aws/metal/cats-postgres-url.timer /cats-postgres-url.timer

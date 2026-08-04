@@ -107,9 +107,18 @@ curl -fsSL https://truststore.pki.rds.amazonaws.com/us-east-1/us-east-1-bundle.p
   -o /etc/cats/rds-ca.pem
 chmod 0644 /etc/cats/rds-ca.pem
 
+install -m 0755 "$CATS_REPO/deploy/aws/metal/render-postgres-url.sh" \
+  "$CATS_PREFIX/bin/render-postgres-url"
 install -m 0644 "$CATS_REPO/deploy/aws/metal/cats-worker.service" \
   /etc/systemd/system/cats-worker.service
+install -m 0644 "$CATS_REPO/deploy/aws/metal/cats-postgres-url.service" \
+  /etc/systemd/system/cats-postgres-url.service
+install -m 0644 "$CATS_REPO/deploy/aws/metal/cats-postgres-url.timer" \
+  /etc/systemd/system/cats-postgres-url.timer
 systemctl daemon-reload
+# Only useful where CATS_POSTGRES_SECRET_ARN is set; harmless otherwise, since
+# the renderer then just copies the DSN already in the environment file.
+systemctl enable cats-postgres-url.timer
 
 if [[ -f /etc/cats/worker.env ]]; then
   chmod 0600 /etc/cats/worker.env
