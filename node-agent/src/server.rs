@@ -1616,6 +1616,44 @@ fn residue_summary(residue: &[(String, String)]) -> String {
 /// control plane's heartbeat handler looks the node up and rejects an unknown
 /// one — a control plane that lost this node re-learns it here instead of
 /// needing an agent restart.
+/// One registration attempt. Returns whether the control plane accepted it.
+///
+/// Used at startup so that `spawn` still means "registered" whenever the
+/// control plane is reachable, without ever blocking on one that is not.
+async fn try_register_once(
+    client: &reqwest::Client,
+    control_plane_url: &str,
+    auth_token: &str,
+    request: &RegisterNodeRequest,
+    link: &mut ControlPlaneLink,
+) -> bool {
+    match client
+        .post(format!("{control_plane_url}/v1/nodes/register"))
+        .bearer_auth(auth_token)
+        .json(request)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            link.record_success();
+            tracing::info!(
+                node = %request.node_id,
+                agent_url = %request.agent_url,
+                "node agent registered"
+            );
+            true
+        }
+        Ok(response) => {
+            link.record_failure(&format!("registration returned {}", response.status()));
+            false
+        }
+        Err(error) => {
+            link.record_failure(&format!("registration request failed: {error}"));
+            false
+        }
+    }
+}
+
 async fn register_until_accepted(
     client: &reqwest::Client,
     control_plane_url: &str,
@@ -1796,6 +1834,26 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
     let cp = cfg.control_plane_url.trim_end_matches('/').to_string();
     let token = cfg.auth_token.clone();
 
+    // One synchronous registration attempt before returning. Dropping the old
+    // blocking registration entirely would have quietly changed a contract
+    // callers depend on: `spawn` returning used to mean "the control plane
+    // knows this node", so anything that starts an agent and immediately
+    // addresses it by id -- the e2e cluster harness cordoning a node it just
+    // started, an operator scripting against `READY` -- would now race.
+    //
+    // ADR-0028 §5 only requires that an unreachable control plane must not end
+    // the process, not that startup must stop announcing itself. So: try once,
+    // keep the guarantee whenever the control plane is up, and hand an
+    // unreachable one to the retry loop instead of dying on it.
+    let mut link = ControlPlaneLink::new(cfg.node.node_id.clone(), cp.clone());
+    let registered = try_register_once(&client, &cp, &token, &register, &mut link).await;
+    if !registered {
+        tracing::warn!(
+            node = %cfg.node.node_id,
+            "starting without a control-plane registration; serving the local runtime and retrying in the background"
+        );
+    }
+
     // Connection loop: ensure registered, heartbeat until one fails, register
     // again. Registration has to precede heartbeats — the control plane's
     // heartbeat handler rejects a node it does not know — and it is retried
@@ -1807,9 +1865,14 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
     let hb_token = token.clone();
     let interval = Duration::from_millis(cfg.heartbeat_ms);
     let connection = tokio::spawn(async move {
-        let mut link = ControlPlaneLink::new(hb_state.cfg.node.node_id.clone(), hb_cp.clone());
+        let mut registered = registered;
         loop {
-            register_until_accepted(&hb_client, &hb_cp, &hb_token, &register, &mut link).await;
+            // `take` consumes the startup registration exactly once: the first
+            // pass skips re-registering if it already succeeded, and every
+            // later pass follows a failed heartbeat and must register again.
+            if !std::mem::take(&mut registered) {
+                register_until_accepted(&hb_client, &hb_cp, &hb_token, &register, &mut link).await;
+            }
             heartbeat_until_failure(
                 &hb_state, &hb_client, &hb_cp, &hb_token, interval, &mut link,
             )
