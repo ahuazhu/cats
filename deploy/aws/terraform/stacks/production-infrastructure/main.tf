@@ -54,5 +54,10 @@ module "metal_worker_deployment" {
   instance_role_name         = var.metal_worker_instance_role_name
   worker_runtime_secret_data = var.worker_runtime_secret_data
   worker_base_environment    = var.worker_base_environment
-  tags                       = var.tags
+
+  # The worker reads the database password from its authority instead of a copy.
+  database_master_user_secret_arn = var.database_master_user_secret_arn
+  worker_managed_environment      = var.worker_managed_environment
+
+  tags = var.tags
 }

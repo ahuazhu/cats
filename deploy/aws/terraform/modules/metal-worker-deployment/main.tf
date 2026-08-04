@@ -18,6 +18,22 @@ locals {
     "${key}=${var.worker_base_environment[key]}"
   ])
 
+  # Non-secret configuration Terraform owns outright, merged onto an existing
+  # worker.env on every deployment rather than only seeding a new one.
+  #
+  # worker_base_environment cannot carry these: it is written once and then
+  # left alone so operator edits survive, which means a key added to it never
+  # reaches a host that already has the file. The DSN source has to reach one.
+  worker_managed_environment = join("\n", concat(
+    [
+      for key in sort(keys(var.worker_managed_environment)) :
+      "${key}=${var.worker_managed_environment[key]}"
+    ],
+    var.database_master_user_secret_arn == null ? [] : [
+      "CATS_POSTGRES_SECRET_ARN=${var.database_master_user_secret_arn}",
+    ],
+  ))
+
   deployment_script = <<-SCRIPT
     set -eu
 
@@ -46,7 +62,14 @@ locals {
       apt-get install -qy --no-install-recommends zstd
     fi
 
-    for required in aws zstd tar sha256sum findmnt; do
+    if ! command -v jq >/dev/null 2>&1; then
+      apt-get update -qq
+      apt-get install -qy --no-install-recommends jq
+    fi
+
+    # jq was already being used below without ever being checked for. It is
+    # also what render-postgres-url uses to read the managed secret.
+    for required in aws jq zstd tar sha256sum findmnt; do
       command -v "$required" >/dev/null 2>&1 || {
         echo "worker deployment needs $required on the host" >&2
         exit 1
@@ -105,7 +128,10 @@ locals {
     install -D -m 0755 "$stage_path/cats-guest-agent" "${var.install_root}/bin/cats-guest-agent"
     install -D -m 0755 "$stage_path/update-guest-seed.sh" "${var.install_root}/bin/update-guest-seed"
     install -D -m 0755 "$stage_path/require-idle-worker.sh" "${var.install_root}/bin/require-idle-worker"
+    install -D -m 0755 "$stage_path/render-postgres-url.sh" "${var.install_root}/bin/render-postgres-url"
     install -m 0644 "$stage_path/cats-worker.service" /etc/systemd/system/cats-worker.service
+    install -m 0644 "$stage_path/cats-postgres-url.service" /etc/systemd/system/cats-postgres-url.service
+    install -m 0644 "$stage_path/cats-postgres-url.timer" /etc/systemd/system/cats-postgres-url.timer
 
     runtime_secret="$(mktemp /var/tmp/cats-worker-runtime.XXXXXX)"
     runtime_overlay="$(mktemp /var/tmp/cats-worker-overlay.XXXXXX)"
@@ -114,13 +140,27 @@ locals {
       --query SecretString \
       --output text > "$runtime_secret"
     chmod 0600 "$runtime_secret"
+    # CATS_POSTGRES_URL is tolerated but no longer required or read: the DSN now
+    # comes from render-postgres-url, which reads the managed secret directly.
+    # A host still carrying the old key in worker.env is harmless once
+    # cats-worker passes url-file.
     jq -er '
-      if (keys | sort) != ["CATS_AUTH_TOKEN", "CATS_POSTGRES_URL"] then
+      if (keys - ["CATS_AUTH_TOKEN", "CATS_POSTGRES_URL"]) != [] then
         error("unexpected worker runtime secret keys")
+      elif (has("CATS_AUTH_TOKEN") | not) then
+        error("worker runtime secret is missing CATS_AUTH_TOKEN")
       else
         to_entries[] | "\(.key)=\(.value)"
       end
     ' "$runtime_secret" > "$runtime_overlay"
+
+    # Terraform-owned non-secret keys are merged the same way, so they reach a
+    # host that already has a worker.env instead of only seeding a new one.
+    # sed rather than grep: with nothing to merge, grep would exit non-zero and
+    # take the whole association down under `set -e`.
+    sed '/^$/d' >> "$runtime_overlay" <<'CATS_MANAGED_ENVIRONMENT'
+${local.worker_managed_environment}
+CATS_MANAGED_ENVIRONMENT
 
     # The overlay merges onto an existing worker.env. A host that has never run
     # install.sh has no such file and awk died on it, so nothing in the
@@ -180,6 +220,14 @@ CATS_BASE_ENVIRONMENT
       "$stage_path/guest-systemd"
 
     systemctl daemon-reload
+
+    # The timer covers a rotation that happens while the worker keeps running.
+    # cats-worker renders the DSN itself before every start, so this is not on
+    # the startup path; `--now` also proves the renderer works on this host
+    # before the worker is stopped, rather than after it fails to come back.
+    systemctl enable --now cats-postgres-url.timer
+    systemctl start cats-postgres-url.service
+
     systemctl stop cats-worker
     systemctl start cats-worker
     systemctl is-active --quiet cats-worker
@@ -334,6 +382,19 @@ data "aws_iam_policy_document" "artifact_reader" {
     sid       = "ReadWorkerRuntimeSecret"
     actions   = ["secretsmanager:GetSecretValue"]
     resources = [aws_secretsmanager_secret.worker_runtime.arn]
+  }
+
+  # render-postgres-url reads the database password from the one place that
+  # holds the current one. Scoped to that secret; the worker gets no broader
+  # Secrets Manager access.
+  dynamic "statement" {
+    for_each = var.database_master_user_secret_arn == null ? [] : [var.database_master_user_secret_arn]
+
+    content {
+      sid       = "ReadDatabaseMasterUserSecret"
+      actions   = ["secretsmanager:GetSecretValue"]
+      resources = [statement.value]
+    }
   }
 }
 

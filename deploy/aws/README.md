@@ -36,10 +36,22 @@ EKS Pod Identity grants the control plane only the Kinesis/S3/DynamoDB usage
 permissions; gateway Pods receive none. Do not create or patch these objects
 manually.
 
+The worker does not hold a copy of the database password. Set
+`database_master_user_secret_arn` and the non-secret half of the DSN in
+`worker_managed_environment`, and `render-postgres-url` composes
+`/run/cats/postgres-url` from the RDS managed master secret before every
+`cats-worker` start, with `cats-postgres-url.timer` refreshing it every fifteen
+minutes in between. `cats-noded` and every `cats-blockd` it spawns read that
+file at connect time, so a managed rotation reaches the fleet without a deploy
+and without a restart. Leaving the ARN unset keeps the old behaviour — a static
+`CATS_POSTGRES_URL` in `worker.env` — which is what a rotation silently
+invalidates: established connections keep serving while every new one fails,
+so the fleet looks healthy and only new Cats break.
+
 Production worker releases use the Terraform-managed artifact bucket,
 Secrets Manager secret and SSM State Manager association. The bundle digest is
-verified before installing `cats-noded`, `cats-blockd`, `cats-guest-agent` and
-the worker systemd unit. The same bundle carries the Guest Agent and standalone
+verified before installing `cats-noded`, `cats-blockd`, `cats-guest-agent`,
+`render-postgres-url` and the worker systemd units. The same bundle carries the Guest Agent and standalone
 Guest systemd units as a golden-root payload. The association patches them
 into a private copy of `rootfs.ext4`, verifies the ext4 image, preserves
 `rootfs.ext4.previous`, atomically replaces the seed and immediately restarts

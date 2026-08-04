@@ -1,0 +1,10 @@
+[Unit]
+Description=Render the Cats PostgreSQL DSN from its authority
+Documentation=https://github.com/ahuazhu/cats/issues/77
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/cats/worker.env
+ExecStart=/opt/cats/bin/render-postgres-url
