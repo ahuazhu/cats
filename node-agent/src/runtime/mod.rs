@@ -207,7 +207,7 @@ impl CatRuntime {
     }
 
     fn state_file(&self) -> PathBuf {
-        self.dir.join("warm-state.json")
+        warm_state_file(&self.dir)
     }
 
     fn telemetry_target(&self, cat_id: &str) -> CatTelemetryTarget {
@@ -283,6 +283,15 @@ const VOLUME_DIR_PREFIX: &str = "vol-";
 /// there is exactly one.
 fn volume_data_dir(cat_dir: &Path, disk_id: &str) -> PathBuf {
     cat_dir.join(format!("{VOLUME_DIR_PREFIX}{disk_id}"))
+}
+
+/// Where a FakeVmm Cat's Guest state is saved when it goes Warm.
+///
+/// Written by `warm_cat`, required by `restore_cat` before it will restore, and
+/// checked by re-adoption's Warm proof (ADR-0028 §3) — one spelling, for the
+/// same reason [`volume_data_dir`] has one.
+fn warm_state_file(cat_dir: &Path) -> PathBuf {
+    cat_dir.join("warm-state.json")
 }
 
 pub struct NodeRuntime {

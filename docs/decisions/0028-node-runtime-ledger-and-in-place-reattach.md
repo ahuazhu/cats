@@ -70,10 +70,13 @@ blockd 已死亡时，本地 residue 可以保留，但不得离线复活旧 epo
 1. `host_boot_id` 与当前一致。不一致说明 Host 重启过，任何记录的 PID 都不可信，直接
    进入 residue 处理，不做进程接管。
 
-   **例外是 `Warm`**：Warm 的 VMM 已经退出、blockd 已经终止，它根本没有活进程，全部事实
-   都在本地磁盘上（snapshot 目录、Guest 内存 backing、disk map）。Host 重启不会让这些
-   失效，因此 Warm 记录不受 boot id 门限约束，否则一次 Host 重启会白白丢掉所有本可以
-   restore 的 Warm Cat。Warm 仍然是 host-bound（ADR-0002），本地状态没了就没了。
+   **例外是且只是 `Warm`**：`warm_cat` 已经排空并杀掉全部 blockd、关闭 VMM，所以 Warm
+   记录里没有任何存活进程——也就没有任何可以被 PID 复用冒充的对象，boot id 这道门本来
+   就是为了防这个。它的全部事实是本地磁盘上的快照目录、Guest 内存 backing 和各卷的
+   journal 目录，Host 重启不会让这些文件失效。对 Warm 套用 boot id 门，只会在每次 Host
+   重启时把所有本可以 restore 的 Warm Cat 白白变成 residue。因此 Warm 走纯磁盘证据，不做
+   进程接管，也不检查 boot id。其余可能留下存活进程的状态（`Running`/`Suspended`/
+   `Stopping`）一律适用。Warm 仍然是 host-bound（ADR-0002），本地状态没了就没了。
 2. PID 仍存在，且 `start_ticks`、可执行文件路径、所属 cgroup 与记录一致。任一不符按
    PID 复用处理，视为进程已消失。
 3. 协议握手确认身份：Guest/VMM 的 `health()` 返回的 `boot_id` 必须等于记录值；blockd
