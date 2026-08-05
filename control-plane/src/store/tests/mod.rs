@@ -4,11 +4,17 @@ use cats_api::requests::NodeWorkStatusRequest;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-struct ActiveSingletonGuard(Arc<AtomicUsize>);
+struct ActiveSingletonGuard {
+    active: Arc<AtomicUsize>,
+    drop_delay: std::time::Duration,
+}
 
 impl Drop for ActiveSingletonGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        if !self.drop_delay.is_zero() {
+            std::thread::sleep(self.drop_delay);
+        }
+        self.active.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -510,7 +516,12 @@ async fn singleton_task_cancellation_aborts_old_leader_before_failover() {
                     starts.fetch_add(1, Ordering::SeqCst);
                     let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
                     max_active.fetch_max(now_active, Ordering::SeqCst);
-                    let _active = ActiveSingletonGuard(active);
+                    let _active = ActiveSingletonGuard {
+                        active,
+                        // Widen the cancellation window: the advisory lock
+                        // must stay held until this delayed destructor ends.
+                        drop_delay: std::time::Duration::from_millis(500),
+                    };
                     std::future::pending::<()>().await;
                 }
             }
@@ -536,7 +547,10 @@ async fn singleton_task_cancellation_aborts_old_leader_before_failover() {
                     starts.fetch_add(1, Ordering::SeqCst);
                     let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
                     max_active.fetch_max(now_active, Ordering::SeqCst);
-                    let _active = ActiveSingletonGuard(active);
+                    let _active = ActiveSingletonGuard {
+                        active,
+                        drop_delay: std::time::Duration::ZERO,
+                    };
                     std::future::pending::<()>().await;
                 }
             }
