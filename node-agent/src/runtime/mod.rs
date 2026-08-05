@@ -361,6 +361,7 @@ struct LaunchProbeState {
 #[derive(Debug)]
 struct LaunchOverlapProbe {
     target: usize,
+    timeout: Duration,
     state: Mutex<LaunchProbeState>,
     changed: Condvar,
     timed_out: AtomicUsize,
@@ -369,8 +370,13 @@ struct LaunchOverlapProbe {
 #[cfg(test)]
 impl LaunchOverlapProbe {
     fn new(target: usize) -> Self {
+        Self::with_timeout(target, Duration::from_secs(15))
+    }
+
+    fn with_timeout(target: usize, timeout: Duration) -> Self {
         Self {
             target,
+            timeout,
             state: Mutex::new(LaunchProbeState::default()),
             changed: Condvar::new(),
             timed_out: AtomicUsize::new(0),
@@ -388,7 +394,7 @@ impl LaunchOverlapProbe {
             return Ok(());
         }
 
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + self.timeout;
         while state.arrived < self.target && !state.failed {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -411,7 +417,7 @@ impl LaunchOverlapProbe {
 
         if state.failed {
             bail!(
-                "only {} of {} Cat launches reached the overlap point",
+                "launch overlap probe saw only {} of {} Cat launches",
                 state.arrived,
                 self.target
             );
@@ -462,11 +468,15 @@ pub struct NodeRuntime {
     /// be refused for the same reason — only counted. Same configured
     /// concurrency, byte ceiling removed.
     launch_admission: WakeAdmission,
-    /// Unit-test rendezvous placed after each FakeVmm launch has started its
-    /// block backends. It proves real launch work overlaps without exposing a
-    /// production hook or deriving concurrency from wall-clock speedup.
+    /// Unit-test rendezvous inside `spawn_blockd`, after its child is ready but
+    /// before the function returns. It proves the block-backend launch stage
+    /// itself overlaps without exposing a production hook.
     #[cfg(test)]
     launch_overlap_probe: Option<Arc<LaunchOverlapProbe>>,
+    /// Known-negative injection that serializes only the `spawn_blockd` stage.
+    /// A sound launch-overlap probe must reject this shape.
+    #[cfg(test)]
+    spawn_blockd_test_lock: Option<Arc<Mutex<()>>>,
     /// Remote Stop/Cold drains may run across Cats, but an expiry wave must not
     /// create unbounded S3/PostgreSQL fan-out.
     stop_admission: StopAdmission,
@@ -545,6 +555,8 @@ impl NodeRuntime {
             }),
             #[cfg(test)]
             launch_overlap_probe: None,
+            #[cfg(test)]
+            spawn_blockd_test_lock: None,
             stop_admission: StopAdmission::new(MAX_CONCURRENT_STOPS),
             residue: Mutex::new(None),
         })

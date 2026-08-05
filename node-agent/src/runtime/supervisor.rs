@@ -280,10 +280,6 @@ impl NodeRuntime {
                 self.attach_to_metering(&rt, process_id)?;
             }
             self.write_disk_map(&rt)?;
-            #[cfg(test)]
-            if let Some(probe) = &self.launch_overlap_probe {
-                probe.arrive()?;
-            }
             let state_file = rt.state_file();
             let guest = self.spawn_guest(&rt, warm_restore.then_some(state_file.as_path()))?;
             let process_id = guest.id();
