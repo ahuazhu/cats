@@ -87,6 +87,20 @@ output "github_qualification_worker_role_arn" {
   value       = one(aws_iam_role.github_qualification_worker[*].arn)
 }
 
+output "github_qualification_worker_ami_owner_id" {
+  description = "Set as Q124_WORKER_AMI_OWNER_ID with the exact reviewed qualification AMI owner."
+  value       = one(data.aws_ami.qualification_worker[*].owner_id)
+}
+
+output "github_qualification_worker_ami_snapshot_ids" {
+  description = "Set as the JSON repository variable Q124_WORKER_AMI_SNAPSHOT_IDS_JSON."
+  value = one([
+    for image in data.aws_ami.qualification_worker : sort(distinct(compact([
+      for mapping in image.block_device_mappings : try(mapping.ebs.snapshot_id, "")
+    ])))
+  ])
+}
+
 output "chunkstore_bucket_name" {
   value = aws_s3_bucket.chunkstore.id
 }

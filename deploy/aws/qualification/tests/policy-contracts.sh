@@ -44,6 +44,25 @@ jq -e '
       "arn:aws:ec2:us-east-1::snapshot/snap-0124bbb"
     ] | sort)) and
   ([.. | strings | select(test("snapshot/\\*"))] | length) == 0 and
+  ([.Statement[] | select(.Sid == "ReadRegionalEc2AndSsmInventory")][0] as $s |
+    ($s.Action | sort) == ([
+      "ec2:DescribeImages",
+      "ec2:DescribeInstances",
+      "ec2:DescribeInstanceStatus",
+      "ec2:DescribeVolumes",
+      "ssm:DescribeInstanceInformation"
+    ] | sort) and
+    $s.Resource == "*" and
+    $s.Condition.StringEquals["aws:RequestedRegion"] == "us-east-1") and
+  ([.Statement[] | select(.Sid == "ReadRegionalSsmCommandResult")][0] as $s |
+    $s.Action == "ssm:GetCommandInvocation" and
+    $s.Resource == "*" and
+    $s.Condition.StringEquals["aws:RequestedRegion"] == "us-east-1") and
+  ([.Statement[] | select(.Sid == "CancelRegionalSsmCommand")][0] as $s |
+    $s.Action == "ssm:CancelCommand" and
+    $s.Resource == "*" and
+    $s.Condition.StringEquals["aws:RequestedRegion"] == "us-east-1") and
+  ([.. | strings | select(. == "ssm:ListCommandInvocations")] | length) == 0 and
   ([.Statement[] | select(.Sid == "LaunchPrivateInterfaceInFixedSubnet")][0] as $s |
     $s.Resource == "arn:aws:ec2:us-east-1:111122223333:network-interface/*" and
     $s.Condition.ArnEquals["ec2:Subnet"] == "arn:aws:ec2:us-east-1:111122223333:subnet/subnet-0124" and

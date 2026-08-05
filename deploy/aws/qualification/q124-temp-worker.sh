@@ -26,8 +26,33 @@ emit_evidence() {
   local status=$1 count=${2:-0} instance=${3:-}
   jq -n --arg status "$status" --arg node "${Q124_NODE_ID:-}" --arg run "${run_id:-}" \
     --arg source_sha "${sha:-}" --arg instance "$instance" --argjson count "$count" \
-    '{schema:1,issue:124,status:$status,node_id:$node,github_run_id:$run,source_sha:$source_sha,discovered_instances:$count,instance_id:(if $instance == "" then null else $instance end)}' \
+    --arg manifest_sha "${Q124_EXPECTED_MANIFEST_SHA256:-}" --argjson start_attempted "$WORKER_START_ATTEMPTED" \
+    '{schema:1,issue:124,status:$status,node_id:$node,github_run_id:$run,source_sha:$source_sha,manifest_sha256:(if $manifest_sha == "" then null else $manifest_sha end),worker_start_attempted:($start_attempted == 1),discovered_instances:$count,instance_id:(if $instance == "" then null else $instance end)}' \
     >"$Q124_EVIDENCE_OUT"
+}
+
+require_operation_window() {
+  [[ ${Q124_OPERATION_DEADLINE_EPOCH:-} =~ ^[0-9]{10}$ ]] || die "missing/invalid operation deadline"
+  [[ ${Q124_CLEANUP_RESERVE_SECONDS:-} =~ ^[1-9][0-9]{2,3}$ ]] || die "missing/invalid cleanup reserve"
+  now_epoch=$(date -u +%s)
+  (( now_epoch + Q124_CLEANUP_RESERVE_SECONDS < Q124_OPERATION_DEADLINE_EPOCH )) \
+    || die "operation deadline reached; preserving cleanup reserve"
+}
+
+prepare_remote_budget() {
+  local now_epoch available configured
+  require_operation_window
+  configured=${Q124_SSM_MAX_EXECUTION_TIMEOUT_SECONDS:-4200}
+  [[ $configured =~ ^[1-9][0-9]{2,3}$ ]] && (( configured <= 4200 )) || die "invalid SSM maximum execution timeout"
+  now_epoch=$(date -u +%s)
+  available=$((Q124_OPERATION_DEADLINE_EPOCH - now_epoch - 270))
+  (( available >= 60 )) || die "insufficient time for another bounded SSM command"
+  (( configured < available )) && available=$configured
+  Q124_SSM_EXECUTION_TIMEOUT_SECONDS=$available
+  Q124_SSM_DELIVERY_TIMEOUT_SECONDS=60
+  Q124_SSM_POLL_TIMEOUT_SECONDS=$((available + 120))
+  Q124_SSM_CANCEL_TIMEOUT_SECONDS=180
+  export Q124_SSM_EXECUTION_TIMEOUT_SECONDS Q124_SSM_DELIVERY_TIMEOUT_SECONDS Q124_SSM_POLL_TIMEOUT_SECONDS Q124_SSM_CANCEL_TIMEOUT_SECONDS
 }
 
 validate_fixed_inputs() {
@@ -96,15 +121,25 @@ load_manifest() {
       (.temporary.private_ip | test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$")) and
       .launch.method == "run-instances" and .launch.launch_template == null and
       (.launch.ami | test("^ami-[0-9a-f]+$")) and (.launch.instance_type | endswith(".metal")) and
+      (.launch.ami_owner_id | test("^[0-9]{12}$")) and
+      (.launch.ami_snapshot_ids | type == "array" and length > 0 and all(.[]; test("^snap-[0-9a-f]+$"))) and
       (.launch.subnet_id | test("^subnet-[0-9A-Za-z]+$")) and (.launch.security_group_id | test("^sg-[0-9A-Za-z]+$")) and
       (.launch.instance_profile | test("^[A-Za-z0-9+=,.@_-]+$")) and (.launch.cache_device | test("^/dev/[A-Za-z0-9._-]+$")) and
-      (.launch.root_volume_id | test("^vol-[0-9A-Za-z]+$")) and
+      .launch.root_device == "/dev/sda1" and (.launch.root_volume_id | test("^vol-[0-9A-Za-z]+$")) and
+      .launch.root_delete_on_termination == true and .launch.root_encrypted == true and
+      .launch.root_volume_type == "gp3" and .launch.root_volume_size_gib == 200 and
+      (.toolchain.aws_cli_version | test("^2\\.[0-9]+\\.[0-9]+$")) and
+      (.toolchain.aws_cli_x86_64_sha256 | test("^[0-9a-f]{64}$")) and
+      (.toolchain.jq_version | test("^jq-[0-9]+\\.[0-9]+(\\.[0-9]+)?$")) and
       (.bundle.source_sha | test("^[0-9a-f]{40,64}$")) and
       (.bundle.github_run_id | test("^[0-9]+$")) and
       (.bundle.archive_sha256 | test("^[0-9a-f]{64}$")) and
       .bundle.archive_key == ("worker/qualification-124/" + .bundle.source_sha + "/q124-source-" + .bundle.archive_sha256 + ".tar.gz") and
       (.bundle.orchestrator_sha256 | test("^[0-9a-f]{64}$")) and
-      (.bundle.remote_sha256 | test("^[0-9a-f]{64}$"))
+      (.bundle.remote_sha256 | test("^[0-9a-f]{64}$")) and
+      (.bundle.ssm_sha256 | test("^[0-9a-f]{64}$")) and
+      (.bundle.bootstrap_sha256 | test("^[0-9a-f]{64}$")) and
+      (.bundle.command_guard_sha256 | test("^[0-9a-f]{64}$"))
     ' "$Q124_MANIFEST" >/dev/null || die "manifest provenance/scope mismatch"
   Q124_INSTANCE_ID=$(jq -er '.temporary.instance_id' "$Q124_MANIFEST")
   Q124_NODE_ID=$(jq -er '.temporary.node_id' "$Q124_MANIFEST")
@@ -112,11 +147,22 @@ load_manifest() {
   Q124_MANIFEST_SOURCE_SHA=$(jq -er '.bundle.source_sha' "$Q124_MANIFEST")
   Q124_MANIFEST_RUN_ID=$(jq -er '.bundle.github_run_id' "$Q124_MANIFEST")
   Q124_EXPECTED_AMI=$(jq -er '.launch.ami' "$Q124_MANIFEST")
+  Q124_EXPECTED_AMI_OWNER=$(jq -er '.launch.ami_owner_id' "$Q124_MANIFEST")
+  Q124_EXPECTED_AMI_SNAPSHOTS=$(jq -ec '.launch.ami_snapshot_ids' "$Q124_MANIFEST")
   Q124_EXPECTED_INSTANCE_TYPE=$(jq -er '.launch.instance_type' "$Q124_MANIFEST")
   Q124_EXPECTED_SUBNET=$(jq -er '.launch.subnet_id' "$Q124_MANIFEST")
   Q124_EXPECTED_SECURITY_GROUP=$(jq -er '.launch.security_group_id' "$Q124_MANIFEST")
   Q124_EXPECTED_INSTANCE_PROFILE=$(jq -er '.launch.instance_profile' "$Q124_MANIFEST")
   Q124_EXPECTED_CACHE_DEVICE=$(jq -er '.launch.cache_device' "$Q124_MANIFEST")
+  Q124_EXPECTED_ROOT_DEVICE=$(jq -er '.launch.root_device' "$Q124_MANIFEST")
+  Q124_EXPECTED_ROOT_VOLUME_ID=$(jq -er '.launch.root_volume_id' "$Q124_MANIFEST")
+  Q124_EXPECTED_ROOT_DELETE_ON_TERMINATION=$(jq -er '.launch.root_delete_on_termination' "$Q124_MANIFEST")
+  Q124_EXPECTED_ROOT_ENCRYPTED=$(jq -er '.launch.root_encrypted' "$Q124_MANIFEST")
+  Q124_EXPECTED_ROOT_VOLUME_TYPE=$(jq -er '.launch.root_volume_type' "$Q124_MANIFEST")
+  Q124_EXPECTED_ROOT_VOLUME_SIZE_GIB=$(jq -er '.launch.root_volume_size_gib' "$Q124_MANIFEST")
+  Q124_MANIFEST_AWS_CLI_VERSION=$(jq -er '.toolchain.aws_cli_version' "$Q124_MANIFEST")
+  Q124_MANIFEST_AWS_CLI_SHA256=$(jq -er '.toolchain.aws_cli_x86_64_sha256' "$Q124_MANIFEST")
+  Q124_MANIFEST_JQ_VERSION=$(jq -er '.toolchain.jq_version' "$Q124_MANIFEST")
   created_epoch=$(iso_epoch "$(jq -er '.timestamps.created_at' "$Q124_MANIFEST")") || die "invalid manifest created_at"
   expires_epoch=$(iso_epoch "$(jq -er '.timestamps.expires_at' "$Q124_MANIFEST")") || die "invalid manifest expires_at"
   now_epoch=$(date -u +%s)
@@ -128,7 +174,9 @@ load_manifest() {
     printf 'q124: manifest TTL expired; cleanup transition remains enabled\n' >&2
   fi
   export Q124_INSTANCE_ID Q124_NODE_ID Q124_PRIVATE_IP Q124_MANIFEST_SOURCE_SHA Q124_MANIFEST_RUN_ID
-  export Q124_EXPECTED_AMI Q124_EXPECTED_INSTANCE_TYPE Q124_EXPECTED_SUBNET Q124_EXPECTED_SECURITY_GROUP Q124_EXPECTED_INSTANCE_PROFILE Q124_EXPECTED_CACHE_DEVICE
+  export Q124_EXPECTED_AMI Q124_EXPECTED_AMI_OWNER Q124_EXPECTED_AMI_SNAPSHOTS Q124_EXPECTED_INSTANCE_TYPE Q124_EXPECTED_SUBNET Q124_EXPECTED_SECURITY_GROUP Q124_EXPECTED_INSTANCE_PROFILE Q124_EXPECTED_CACHE_DEVICE
+  export Q124_EXPECTED_ROOT_DEVICE Q124_EXPECTED_ROOT_VOLUME_ID Q124_EXPECTED_ROOT_DELETE_ON_TERMINATION Q124_EXPECTED_ROOT_ENCRYPTED Q124_EXPECTED_ROOT_VOLUME_TYPE Q124_EXPECTED_ROOT_VOLUME_SIZE_GIB
+  export Q124_MANIFEST_AWS_CLI_VERSION Q124_MANIFEST_AWS_CLI_SHA256 Q124_MANIFEST_JQ_VERSION
 }
 
 assert_instance_identity() {
@@ -199,12 +247,52 @@ no_duplicate_identity() {
 exact_root_volume() {
   local volume=$1 json
   json=$(awsq ec2 describe-volumes --filters "Name=volume-id,Values=$volume" --output json)
-  jq -e --arg volume "$volume" --arg instance "$Q124_INSTANCE_ID" --arg node "$Q124_NODE_ID" '
+  jq -e --arg volume "$volume" --arg instance "$Q124_INSTANCE_ID" --arg node "$Q124_NODE_ID" \
+    --arg device "$Q124_EXPECTED_ROOT_DEVICE" --argjson delete_on_termination "$Q124_EXPECTED_ROOT_DELETE_ON_TERMINATION" \
+    --arg type "$Q124_EXPECTED_ROOT_VOLUME_TYPE" --argjson size "$Q124_EXPECTED_ROOT_VOLUME_SIZE_GIB" --argjson encrypted "$Q124_EXPECTED_ROOT_ENCRYPTED" '
     (.Volumes | length) == 1 and .Volumes[0].VolumeId == $volume and
-    .Volumes[0].Encrypted == true and .Volumes[0].Size == 200 and .Volumes[0].VolumeType == "gp3" and
+    .Volumes[0].Encrypted == $encrypted and .Volumes[0].Size == $size and .Volumes[0].VolumeType == $type and
     (.Volumes[0].Attachments | length) == 1 and .Volumes[0].Attachments[0].InstanceId == $instance and
+    .Volumes[0].Attachments[0].Device == $device and
+    .Volumes[0].Attachments[0].State == "attached" and
+    .Volumes[0].Attachments[0].DeleteOnTermination == $delete_on_termination and
     (.Volumes[0].Tags | from_entries | .CatsIssue == "124" and .CatsPurpose == "temporary-worker-qualification" and .CatsNodeId == $node)
   ' <<<"$json" >/dev/null || die "root volume identity/configuration mismatch"
+}
+
+assert_root_binding() {
+  local instance_json=$1 root_volume
+  root_volume=$(jq -er --arg device "$Q124_EXPECTED_ROOT_DEVICE" --arg volume "$Q124_EXPECTED_ROOT_VOLUME_ID" \
+    --argjson delete_on_termination "$Q124_EXPECTED_ROOT_DELETE_ON_TERMINATION" '
+      [.Reservations[0].Instances[0].BlockDeviceMappings[] | select(.DeviceName == $device)] as $roots |
+      ($roots | length) == 1 and $roots[0].Ebs.VolumeId == $volume and
+      $roots[0].Ebs.DeleteOnTermination == $delete_on_termination |
+      select(.) | $roots[0].Ebs.VolumeId
+    ' <<<"$instance_json") || die "immutable root mapping drifted"
+  exact_root_volume "$root_volume"
+}
+
+assert_ami() {
+  local json snapshots expected_ami expected_owner expected_snapshots
+  expected_ami=${Q124_EXPECTED_AMI:-$Q124_AMI_ID}
+  expected_owner=${Q124_EXPECTED_AMI_OWNER:-$Q124_AMI_OWNER_ID}
+  expected_snapshots=${Q124_EXPECTED_AMI_SNAPSHOTS:-$Q124_AMI_SNAPSHOT_IDS_JSON}
+  json=$(awsq ec2 describe-images --image-ids "$expected_ami" --output json) || die "AMI lookup failed"
+  jq -e --arg image "$expected_ami" --arg owner "$expected_owner" '
+    (.Images | length) == 1 and (.Images[0] as $i |
+      $i.ImageId == $image and $i.OwnerId == $owner and $i.Public == true and
+      $i.State == "available" and $i.Architecture == "x86_64" and
+      $i.RootDeviceType == "ebs" and $i.RootDeviceName == "/dev/sda1" and
+      $i.VirtualizationType == "hvm" and $i.EnaSupport == true and
+      ($i.BlockDeviceMappings | length) > 0 and
+      all($i.BlockDeviceMappings[]; (.Ebs.SnapshotId | type == "string" and test("^snap-[0-9a-f]+$"))) and
+      ([$i.BlockDeviceMappings[] | select(.DeviceName == $i.RootDeviceName)] | length) == 1)
+  ' <<<"$json" >/dev/null || die "AMI owner/architecture/root mapping contract failed"
+  snapshots=$(jq -c '[.Images[0].BlockDeviceMappings[].Ebs.SnapshotId] | unique | sort' <<<"$json") \
+    || die "AMI snapshot set was invalid"
+  jq -ne --argjson actual "$snapshots" --argjson expected "$expected_snapshots" \
+    '$actual == ($expected | unique | sort) and ($actual | length) == ($expected | length) and ($actual | length) > 0' \
+    >/dev/null || die "AMI snapshot set differs from the reviewed exact set"
 }
 
 confirm() {
@@ -213,10 +301,16 @@ confirm() {
 }
 
 current_policy_matches_manifest() {
-  for name in Q124_AMI_ID Q124_INSTANCE_TYPE Q124_SUBNET_ID Q124_SECURITY_GROUP_ID Q124_INSTANCE_PROFILE_NAME Q124_CACHE_DEVICE; do need "$name"; done
+  for name in Q124_AMI_ID Q124_AMI_OWNER_ID Q124_AMI_SNAPSHOT_IDS_JSON Q124_INSTANCE_TYPE Q124_SUBNET_ID Q124_SECURITY_GROUP_ID Q124_INSTANCE_PROFILE_NAME Q124_CACHE_DEVICE Q124_AWS_CLI_VERSION Q124_AWS_CLI_X86_64_SHA256 Q124_JQ_VERSION; do need "$name"; done
+  local current_snapshots
+  current_snapshots=$(jq -ce 'if type == "array" and length > 0 and all(.[]; type == "string" and test("^snap-[0-9a-f]+$")) then unique | sort else error("invalid") end' <<<"$Q124_AMI_SNAPSHOT_IDS_JSON") \
+    || die "current AMI snapshot set is invalid"
   [[ $Q124_AMI_ID == "$Q124_EXPECTED_AMI" && $Q124_INSTANCE_TYPE == "$Q124_EXPECTED_INSTANCE_TYPE" &&
+     $Q124_AMI_OWNER_ID == "$Q124_EXPECTED_AMI_OWNER" && $current_snapshots == "$Q124_EXPECTED_AMI_SNAPSHOTS" &&
      $Q124_SUBNET_ID == "$Q124_EXPECTED_SUBNET" && $Q124_SECURITY_GROUP_ID == "$Q124_EXPECTED_SECURITY_GROUP" &&
-     $Q124_INSTANCE_PROFILE_NAME == "$Q124_EXPECTED_INSTANCE_PROFILE" && $Q124_CACHE_DEVICE == "$Q124_EXPECTED_CACHE_DEVICE" ]] \
+     $Q124_INSTANCE_PROFILE_NAME == "$Q124_EXPECTED_INSTANCE_PROFILE" && $Q124_CACHE_DEVICE == "$Q124_EXPECTED_CACHE_DEVICE" &&
+     $Q124_AWS_CLI_VERSION == "$Q124_MANIFEST_AWS_CLI_VERSION" && $Q124_AWS_CLI_X86_64_SHA256 == "$Q124_MANIFEST_AWS_CLI_SHA256" &&
+     $Q124_JQ_VERSION == "$Q124_MANIFEST_JQ_VERSION" ]] \
     || die "current launch policy differs from the immutable manifest"
 }
 
@@ -252,46 +346,65 @@ discover_created_instance() {
 }
 
 cleanup_provision_failure() {
-  local rc=${1:-$?}
+  local rc=${1:-$?} fail_rc
+  fail_rc=$rc
+  (( fail_rc != 0 )) || fail_rc=1
   trap - EXIT INT TERM
   if (( CLEANUP_ARMED )) && [[ -n $CREATED_INSTANCE ]]; then
     printf 'q124: failure cleanup for exact instance %s\n' "$CREATED_INSTANCE" >&2
     Q124_INSTANCE_ID=$CREATED_INSTANCE
-    if exact_instance >/dev/null 2>&1; then
+    if instance_json=$(exact_instance 2>/dev/null); then
+      assert_ami >/dev/null 2>&1 || exit "$fail_rc"
+      if [[ -z ${Q124_EXPECTED_ROOT_VOLUME_ID:-} ]]; then
+        Q124_EXPECTED_ROOT_VOLUME_ID=$(jq -er --arg device "$Q124_EXPECTED_ROOT_DEVICE" '
+          [.Reservations[0].Instances[0].BlockDeviceMappings[] | select(.DeviceName == $device)] as $roots |
+          ($roots | length) == 1 and $roots[0].Ebs.DeleteOnTermination == true |
+          select(.) | $roots[0].Ebs.VolumeId | select(test("^vol-[0-9A-Za-z]+$"))
+        ' <<<"$instance_json") || exit "$fail_rc"
+        export Q124_EXPECTED_ROOT_VOLUME_ID
+      fi
+      assert_root_binding "$instance_json" >/dev/null 2>&1 || exit "$fail_rc"
+      if [[ ${Q124_EXPECTED_MANIFEST_SHA256:-} =~ ^[0-9a-f]{64}$ ]]; then
+        remote "$CREATED_INSTANCE" recover-active >/dev/null 2>&1 || exit "$fail_rc"
+      fi
       # Never kill a host whose workload inventory is unknown or non-empty.
       if control get "$Q124_NODE_ID" >/dev/null 2>&1; then
-        control cordon "$Q124_NODE_ID" >/dev/null 2>&1 || true
+        control cordon "$Q124_NODE_ID" >/dev/null 2>&1 || exit "$fail_rc"
         if control cats-scope "$Q124_NODE_ID" "$Q124_WORKSPACE_ID" q124- 2>/dev/null | jq -e 'length == 0' >/dev/null \
-          && control get "$Q124_NODE_ID" | jq -e '.assigned_cats == 0 and .orphan_cats == 0' >/dev/null; then
-          remote "$CREATED_INSTANCE" assert-idle >/dev/null 2>&1 || exit "$rc"
-          remote "$CREATED_INSTANCE" stop >/dev/null 2>&1 || exit "$rc"
-          control delete "$Q124_NODE_ID" "$Q124_SOURCE_NODE_ID" "$Q124_WORKSPACE_ID" q124- >/dev/null 2>&1 || exit "$rc"
+          && control get "$Q124_NODE_ID" | jq -e '(.node.state == "cordoned" or .node.state == "lost") and .assigned_cats == 0 and .orphan_cats == 0' >/dev/null; then
+          remote "$CREATED_INSTANCE" assert-idle >/dev/null 2>&1 || exit "$fail_rc"
+          control get "$Q124_NODE_ID" | jq -e '(.node.state == "cordoned" or .node.state == "lost") and .assigned_cats == 0 and .orphan_cats == 0' >/dev/null || exit "$fail_rc"
+          control cats-scope "$Q124_NODE_ID" "$Q124_WORKSPACE_ID" q124- 2>/dev/null | jq -e 'length == 0' >/dev/null || exit "$fail_rc"
+          remote "$CREATED_INSTANCE" stop >/dev/null 2>&1 || exit "$fail_rc"
+          control delete "$Q124_NODE_ID" "$Q124_SOURCE_NODE_ID" "$Q124_WORKSPACE_ID" q124- >/dev/null 2>&1 || exit "$fail_rc"
         else
           printf 'q124: cleanup stopped: node emptiness was not proven\n' >&2
-          exit "$rc"
+          exit "$fail_rc"
         fi
       else
         # A failed GET is not evidence of absence. The adapter must first
         # prove the source node through the same API and then observe an exact
         # 404 for this node; auth/network/5xx failures stop cleanup.
-        control absent "$Q124_SOURCE_NODE_ID" "$Q124_NODE_ID" >/dev/null 2>&1 || exit "$rc"
+        control absent "$Q124_SOURCE_NODE_ID" "$Q124_NODE_ID" >/dev/null 2>&1 || exit "$fail_rc"
         # Before the first worker start attempt, this invocation's exact fresh
         # instance cannot have accepted a Cat. Bootstrap installs and stages
         # configuration but deliberately does not start cats-worker. Once a
         # start has been attempted, absence from the control plane is not
         # enough: require the host idle/stop gates as well.
-        if (( WORKER_START_ATTEMPTED )); then
-          remote "$CREATED_INSTANCE" assert-idle >/dev/null 2>&1 || exit "$rc"
-          remote "$CREATED_INSTANCE" stop >/dev/null 2>&1 || exit "$rc"
-        fi
+        (( WORKER_START_ATTEMPTED == 0 )) || exit "$fail_rc"
       fi
+      instance_json=$(exact_instance 2>/dev/null) || exit "$fail_rc"
+      assert_root_binding "$instance_json" >/dev/null 2>&1 || exit "$fail_rc"
+      assert_ami >/dev/null 2>&1 || exit "$fail_rc"
       awsq ec2 modify-instance-attribute --instance-id "$CREATED_INSTANCE" --disable-api-termination '{"Value":false}' >/dev/null
       awsq ec2 terminate-instances --instance-ids "$CREATED_INSTANCE" >/dev/null
       awsq ec2 wait instance-terminated --instance-ids "$CREATED_INSTANCE"
       emit_evidence cleanup-terminated 1 "$CREATED_INSTANCE"
+    else
+      exit "$fail_rc"
     fi
   elif (( CLEANUP_ARMED )); then
-    discover_created_instance || exit "$rc"
+    discover_created_instance || exit "$fail_rc"
     cleanup_provision_failure "$rc"
   fi
   exit "$rc"
@@ -299,12 +412,18 @@ cleanup_provision_failure() {
 
 provision() {
   confirm PROVISION_Q124_TEMP_WORKER
-  for name in Q124_AMI_ID Q124_INSTANCE_TYPE Q124_SUBNET_ID Q124_SECURITY_GROUP_ID Q124_INSTANCE_PROFILE_NAME Q124_ARTIFACT_BUCKET Q124_ARCHIVE_KEY Q124_ARCHIVE_SHA256 Q124_CACHE_DEVICE Q124_CONTROL_URL Q124_CHUNKSTORE_BUCKET Q124_RUNTIME_SECRET_ARN Q124_DB_SECRET_ARN Q124_DB_NAME Q124_MANIFEST_OUT GITHUB_REPOSITORY GH_TOKEN; do need "$name"; done
+  for name in Q124_AMI_ID Q124_AMI_OWNER_ID Q124_AMI_SNAPSHOT_IDS_JSON Q124_INSTANCE_TYPE Q124_SUBNET_ID Q124_SECURITY_GROUP_ID Q124_INSTANCE_PROFILE_NAME Q124_ARTIFACT_BUCKET Q124_ARCHIVE_KEY Q124_ARCHIVE_SHA256 Q124_CACHE_DEVICE Q124_CONTROL_URL Q124_CHUNKSTORE_BUCKET Q124_RUNTIME_SECRET_ARN Q124_DB_SECRET_ARN Q124_DB_NAME Q124_MANIFEST_OUT Q124_AWS_CLI_VERSION Q124_AWS_CLI_X86_64_SHA256 Q124_JQ_VERSION Q124_OPERATION_DEADLINE_EPOCH Q124_CLEANUP_RESERVE_SECONDS GITHUB_REPOSITORY GH_TOKEN; do need "$name"; done
   [[ $GITHUB_REPOSITORY =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "invalid GitHub repository"
   [[ $Q124_INSTANCE_TYPE == *.metal ]] || die "qualification requires a bare-metal instance"
+  [[ $Q124_AMI_OWNER_ID =~ ^[0-9]{12}$ ]] || die "invalid expected AMI owner"
+  Q124_AMI_SNAPSHOT_IDS_JSON=$(jq -ce 'if type == "array" and length > 0 and all(.[]; type == "string" and test("^snap-[0-9a-f]+$")) then unique | sort else error("invalid") end' <<<"$Q124_AMI_SNAPSHOT_IDS_JSON") \
+    || die "invalid exact AMI snapshot set"
+  export Q124_AMI_SNAPSHOT_IDS_JSON
   [[ ${Q124_TTL_HOURS:-0} =~ ^([1-9]|1[0-9]|2[0-4])$ ]] || die "TTL must be 1..24 hours"
+  assert_ami
   source_positive
   source_template
+  require_operation_window
   run_id=${GITHUB_RUN_ID:-local}
   sha=${GITHUB_SHA:-$(git -C "$ROOT" rev-parse HEAD)}
   [[ $run_id =~ ^[0-9]+$ ]] || die "provision requires numeric GITHUB_RUN_ID"
@@ -328,6 +447,12 @@ provision() {
       {Key:"CatsPurpose",Value:"temporary-worker-qualification"},{Key:"CatsNodeId",Value:$node}
     ]}]')
   block=$(jq -cn '[{DeviceName:"/dev/sda1",Ebs:{VolumeSize:200,VolumeType:"gp3",Encrypted:true,DeleteOnTermination:true}}]')
+  Q124_EXPECTED_ROOT_DEVICE=/dev/sda1
+  Q124_EXPECTED_ROOT_DELETE_ON_TERMINATION=true
+  Q124_EXPECTED_ROOT_ENCRYPTED=true
+  Q124_EXPECTED_ROOT_VOLUME_TYPE=gp3
+  Q124_EXPECTED_ROOT_VOLUME_SIZE_GIB=200
+  export Q124_EXPECTED_ROOT_DEVICE Q124_EXPECTED_ROOT_DELETE_ON_TERMINATION Q124_EXPECTED_ROOT_ENCRYPTED Q124_EXPECTED_ROOT_VOLUME_TYPE Q124_EXPECTED_ROOT_VOLUME_SIZE_GIB
   # Arm before RunInstances. AWS may create the instance even when the CLI
   # loses the response or this job receives TERM. The trap can recover only a
   # singular identity matching all five immutable request tags; it never
@@ -368,9 +493,41 @@ provision() {
     ($roots[0].Ebs.VolumeId | test("^vol-[0-9A-Za-z]+$")) |
     select(.) | $roots[0].Ebs.VolumeId
   ' <<<"$instance") || die "root mapping is not singular and DeleteOnTermination=true"
-  exact_root_volume "$root_volume"
+  Q124_EXPECTED_ROOT_VOLUME_ID=$root_volume
+  export Q124_EXPECTED_ROOT_VOLUME_ID
+  assert_root_binding "$instance"
   export Q124_PRIVATE_IP
 
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  expires=$(date -u -d "+${Q124_TTL_HOURS} hours" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+"${Q124_TTL_HOURS}"H +%Y-%m-%dT%H:%M:%SZ)
+  script_sha=$(sha256_file "$ROOT/deploy/aws/qualification/q124-temp-worker.sh")
+  remote_sha=$(sha256_file "$ROOT/deploy/aws/qualification/q124-remote.sh")
+  ssm_sha=$(sha256_file "$ROOT/deploy/aws/qualification/q124-ssm.sh")
+  bootstrap_sha=$(sha256_file "$ROOT/deploy/aws/qualification/q124-bootstrap-prereqs.sh")
+  command_guard_sha=$(sha256_file "$ROOT/deploy/aws/qualification/q124-command-guard.sh")
+  jq -n \
+    --arg account "$Q124_ACCOUNT_ID" --arg region "$Q124_REGION" --arg cluster "$Q124_CLUSTER" --arg workspace "$Q124_WORKSPACE_ID" \
+    --arg source_i "$Q124_SOURCE_INSTANCE_ID" --arg source_n "$Q124_SOURCE_NODE_ID" \
+    --arg instance "$Q124_INSTANCE_ID" --arg node "$Q124_NODE_ID" --arg ip "$Q124_PRIVATE_IP" \
+    --arg ami "$Q124_AMI_ID" --arg ami_owner "$Q124_AMI_OWNER_ID" --argjson ami_snapshots "$Q124_AMI_SNAPSHOT_IDS_JSON" \
+    --arg type "$Q124_INSTANCE_TYPE" --arg az "$az" --arg subnet "$Q124_SUBNET_ID" --arg sg "$Q124_SECURITY_GROUP_ID" --arg profile "$Q124_INSTANCE_PROFILE_NAME" --arg root_volume "$root_volume" \
+    --arg source_sha "$sha" --arg github_run_id "$run_id" --arg archive_key "$Q124_ARCHIVE_KEY" --arg archive_sha "$Q124_ARCHIVE_SHA256" --arg script_sha "$script_sha" --arg remote_sha "$remote_sha" --arg ssm_sha "$ssm_sha" --arg bootstrap_sha "$bootstrap_sha" --arg command_guard_sha "$command_guard_sha" \
+    --arg created "$now" --arg expires "$expires" --arg cache "$Q124_CACHE_DEVICE" \
+    --arg aws_cli_version "$Q124_AWS_CLI_VERSION" --arg aws_cli_sha "$Q124_AWS_CLI_X86_64_SHA256" --arg jq_version "$Q124_JQ_VERSION" '
+      {schema:1,issue:124,fixed:{account_id:$account,region:$region,cluster:$cluster,workspace_id:$workspace},
+       source:{instance_id:$source_i,node_id:$source_n},temporary:{instance_id:$instance,node_id:$node,private_ip:$ip},
+       launch:{method:"run-instances",launch_template:null,ami:$ami,ami_owner_id:$ami_owner,ami_snapshot_ids:$ami_snapshots,instance_type:$type,availability_zone:$az,subnet_id:$subnet,security_group_id:$sg,instance_profile:$profile,root_device:"/dev/sda1",root_volume_id:$root_volume,root_delete_on_termination:true,root_encrypted:true,root_volume_type:"gp3",root_volume_size_gib:200,cache_device:$cache},
+       toolchain:{aws_cli_version:$aws_cli_version,aws_cli_x86_64_sha256:$aws_cli_sha,jq_version:$jq_version},
+       bundle:{source_sha:$source_sha,github_run_id:$github_run_id,archive_key:$archive_key,archive_sha256:$archive_sha,orchestrator_sha256:$script_sha,remote_sha256:$remote_sha,ssm_sha256:$ssm_sha,bootstrap_sha256:$bootstrap_sha,command_guard_sha256:$command_guard_sha},
+       timestamps:{created_at:$created,expires_at:$expires}}
+    ' | jq -S . >"$Q124_MANIFEST_OUT"
+  Q124_EXPECTED_MANIFEST_SHA256=$(canonical_manifest "$Q124_MANIFEST_OUT" | sha256sum | awk '{print $1}')
+  export Q124_EXPECTED_MANIFEST_SHA256
+  emit_evidence manifest-staged 1 "$Q124_INSTANCE_ID"
+  "$MANIFEST_PUBLISH_BIN" "$Q124_MANIFEST_OUT" "$Q124_EXPECTED_MANIFEST_SHA256"
+  emit_evidence manifest-published 1 "$Q124_INSTANCE_ID"
+
+  require_operation_window
   awsq ssm describe-instance-information --filters "Key=InstanceIds,Values=$Q124_SOURCE_INSTANCE_ID" --output json | jq -e '.InstanceInformationList | length == 1 and .[0].PingStatus == "Online"' >/dev/null || die "source SSM positive probe failed"
   deadline=$((SECONDS + ${Q124_SSM_TIMEOUT_SECONDS:-600}))
   until awsq ssm describe-instance-information --filters "Key=InstanceIds,Values=$Q124_INSTANCE_ID" --output json | jq -e '.InstanceInformationList | length == 1 and .[0].PingStatus == "Online"' >/dev/null; do
@@ -379,49 +536,37 @@ provision() {
   done
   Q124_FORMAT_CONFIRMATION="FORMAT_EPHEMERAL_CACHE_${Q124_INSTANCE_ID}_${Q124_CACHE_DEVICE}"
   export Q124_FORMAT_CONFIRMATION
+  prepare_remote_budget
   remote "$Q124_INSTANCE_ID" bootstrap
   control absent "$Q124_SOURCE_NODE_ID" "$Q124_NODE_ID"
   WORKER_START_ATTEMPTED=1
+  emit_evidence worker-start-attempted 1 "$Q124_INSTANCE_ID"
+  prepare_remote_budget
   remote "$Q124_INSTANCE_ID" start
   control wait-cordoned "$Q124_NODE_ID" "$Q124_SOURCE_NODE_ID" 1 >/dev/null
+  prepare_remote_budget
   remote "$Q124_INSTANCE_ID" set-capacity
   control wait-cordoned "$Q124_NODE_ID" "$Q124_SOURCE_NODE_ID" 1024 >/dev/null
+  prepare_remote_budget
   remote "$Q124_INSTANCE_ID" validate
 
-  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  expires=$(date -u -d "+${Q124_TTL_HOURS} hours" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+"${Q124_TTL_HOURS}"H +%Y-%m-%dT%H:%M:%SZ)
-  script_sha=$(sha256_file "$ROOT/deploy/aws/qualification/q124-temp-worker.sh")
-  remote_sha=$(sha256_file "$ROOT/deploy/aws/qualification/q124-remote.sh")
-  jq -n \
-    --arg account "$Q124_ACCOUNT_ID" --arg region "$Q124_REGION" --arg cluster "$Q124_CLUSTER" --arg workspace "$Q124_WORKSPACE_ID" \
-    --arg source_i "$Q124_SOURCE_INSTANCE_ID" --arg source_n "$Q124_SOURCE_NODE_ID" \
-    --arg instance "$Q124_INSTANCE_ID" --arg node "$Q124_NODE_ID" --arg ip "$Q124_PRIVATE_IP" \
-    --arg ami "$Q124_AMI_ID" --arg type "$Q124_INSTANCE_TYPE" --arg az "$az" --arg subnet "$Q124_SUBNET_ID" --arg sg "$Q124_SECURITY_GROUP_ID" --arg profile "$Q124_INSTANCE_PROFILE_NAME" --arg root_volume "$root_volume" \
-    --arg source_sha "$sha" --arg github_run_id "$run_id" --arg archive_key "$Q124_ARCHIVE_KEY" --arg archive_sha "$Q124_ARCHIVE_SHA256" --arg script_sha "$script_sha" --arg remote_sha "$remote_sha" \
-    --arg created "$now" --arg expires "$expires" --arg cache "$Q124_CACHE_DEVICE" '
-      {schema:1,issue:124,fixed:{account_id:$account,region:$region,cluster:$cluster,workspace_id:$workspace},
-       source:{instance_id:$source_i,node_id:$source_n},temporary:{instance_id:$instance,node_id:$node,private_ip:$ip},
-       launch:{method:"run-instances",launch_template:null,ami:$ami,instance_type:$type,availability_zone:$az,subnet_id:$subnet,security_group_id:$sg,instance_profile:$profile,root_volume_id:$root_volume,cache_device:$cache},
-       bundle:{source_sha:$source_sha,github_run_id:$github_run_id,archive_key:$archive_key,archive_sha256:$archive_sha,orchestrator_sha256:$script_sha,remote_sha256:$remote_sha},
-       timestamps:{created_at:$created,expires_at:$expires}}
-    ' | jq -S . >"$Q124_MANIFEST_OUT"
-  manifest_sha=$(canonical_manifest "$Q124_MANIFEST_OUT" | sha256sum | awk '{print $1}')
-  "$MANIFEST_PUBLISH_BIN" "$Q124_MANIFEST_OUT" "$manifest_sha"
-  printf 'manifest-sha256=%s\n' "$manifest_sha"
+  printf 'manifest-sha256=%s\n' "$Q124_EXPECTED_MANIFEST_SHA256"
   CLEANUP_ARMED=0
   trap - EXIT INT TERM
 }
 
 validate_mode() {
   confirm "VALIDATE_Q124_${Q124_EXPECTED_MANIFEST_SHA256:0:12}"
-  load_manifest; current_policy_matches_manifest; source_positive; exact_instance >/dev/null; no_duplicate_identity
+  load_manifest; current_policy_matches_manifest; source_positive; assert_ami
+  instance=$(exact_instance); assert_root_binding "$instance"; no_duplicate_identity
   control get "$Q124_NODE_ID" | jq -e '.node.state == "cordoned"' >/dev/null || die "node is not Cordoned"
   remote "$Q124_INSTANCE_ID" validate
 }
 
 drain_mode() {
   confirm "DRAIN_Q124_${Q124_EXPECTED_MANIFEST_SHA256:0:12}"
-  load_manifest; source_positive; exact_instance >/dev/null; no_duplicate_identity
+  load_manifest; source_positive; assert_ami
+  instance=$(exact_instance); assert_root_binding "$instance"; no_duplicate_identity
   assigned=$(control cats-scope "$Q124_NODE_ID" "$Q124_WORKSPACE_ID" q124-)
   snapshot=$(remote "$Q124_INSTANCE_ID" snapshot)
   jq -e --argjson assigned "$assigned" '([.cats[]] | sort) == ([$assigned[]] | sort)' <<<"$snapshot" >/dev/null || die "control assignment and runtime ledger differ"
@@ -434,11 +579,14 @@ drain_mode() {
 
 withdraw_mode() {
   confirm "WITHDRAW_Q124_${Q124_EXPECTED_MANIFEST_SHA256:0:12}"
-  load_manifest; source_positive; exact_instance >/dev/null; no_duplicate_identity
+  load_manifest; source_positive; assert_ami
+  instance=$(exact_instance); assert_root_binding "$instance"; no_duplicate_identity
   if summary=$(control get "$Q124_NODE_ID" 2>/dev/null); then
     jq -e '(.node.state == "cordoned" or .node.state == "lost") and .assigned_cats == 0 and .orphan_cats == 0' <<<"$summary" >/dev/null || die "withdraw requires an empty Cordoned/Lost node"
     control cats-scope "$Q124_NODE_ID" "$Q124_WORKSPACE_ID" q124- >/dev/null
     remote "$Q124_INSTANCE_ID" assert-idle
+    control get "$Q124_NODE_ID" | jq -e '(.node.state == "cordoned" or .node.state == "lost") and .assigned_cats == 0 and .orphan_cats == 0' >/dev/null || die "node changed before worker stop"
+    control cats-scope "$Q124_NODE_ID" "$Q124_WORKSPACE_ID" q124- >/dev/null
     remote "$Q124_INSTANCE_ID" stop
     control delete "$Q124_NODE_ID" "$Q124_SOURCE_NODE_ID" "$Q124_WORKSPACE_ID" q124-
   else
@@ -452,6 +600,7 @@ return_mode() {
   load_manifest
   confirm "RETURN_Q124_${Q124_INSTANCE_ID}_${Q124_NODE_ID}"
   source_positive
+  assert_ami
   control absent "$Q124_SOURCE_NODE_ID" "$Q124_NODE_ID"
   root_volume=$(jq -er '.launch.root_volume_id' "$Q124_MANIFEST")
   lookup_return_instance
@@ -461,10 +610,13 @@ return_mode() {
   if [[ $RETURN_INSTANCE_COUNT == 1 ]]; then
     state=$(jq -er '.Reservations[0].Instances[0].State.Name' <<<"$RETURN_INSTANCE_JSON")
     if [[ $state != terminated ]]; then
-      exact_root_volume "$root_volume"
+      assert_root_binding "$RETURN_INSTANCE_JSON"
       # A stopped service plus empty ledger is the last data-safety gate.
       remote "$Q124_INSTANCE_ID" assert-idle
       remote "$Q124_INSTANCE_ID" stop
+      instance=$(exact_instance)
+      assert_root_binding "$instance"
+      assert_ami
       awsq ec2 modify-instance-attribute --instance-id "$Q124_INSTANCE_ID" --disable-api-termination '{"Value":false}' >/dev/null
       awsq ec2 terminate-instances --instance-ids "$Q124_INSTANCE_ID" >/dev/null
       awsq ec2 wait instance-terminated --instance-ids "$Q124_INSTANCE_ID"
@@ -485,6 +637,22 @@ return_mode() {
   control absent "$Q124_SOURCE_NODE_ID" "$Q124_NODE_ID"
 }
 
+recover_provision_mode() {
+  confirm "RECOVER_Q124_${Q124_EXPECTED_MANIFEST_SHA256:0:12}"
+  need Q124_EVIDENCE_OUT
+  [[ -f $Q124_EVIDENCE_OUT && ! -L $Q124_EVIDENCE_OUT ]] || die "recovery evidence must be a regular non-symlink"
+  load_manifest
+  jq -e --arg instance "$Q124_INSTANCE_ID" --arg node "$Q124_NODE_ID" --arg manifest "$Q124_EXPECTED_MANIFEST_SHA256" '
+    .schema == 1 and .issue == 124 and .instance_id == $instance and .node_id == $node and
+    .manifest_sha256 == $manifest and (.worker_start_attempted | type == "boolean")
+  ' "$Q124_EVIDENCE_OUT" >/dev/null || die "recovery evidence identity mismatch"
+  source_positive
+  WORKER_START_ATTEMPTED=$(jq -er 'if .worker_start_attempted then 1 else 0 end' "$Q124_EVIDENCE_OUT")
+  CREATED_INSTANCE=$Q124_INSTANCE_ID
+  CLEANUP_ARMED=1
+  cleanup_provision_failure 0
+}
+
 validate_fixed_inputs
 case $MODE in
   provision) provision ;;
@@ -492,5 +660,6 @@ case $MODE in
   drain) drain_mode ;;
   withdraw) withdraw_mode ;;
   return) return_mode ;;
-  *) die "mode must be provision, validate, drain, withdraw, or return" ;;
+  recover-provision) recover_provision_mode ;;
+  *) die "mode must be provision, validate, drain, withdraw, return, or recover-provision" ;;
 esac

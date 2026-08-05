@@ -42,11 +42,46 @@ resource "aws_iam_role" "github_qualification_worker" {
 data "aws_ami" "qualification_worker" {
   count = var.github_qualification_worker_enabled ? 1 : 0
 
-  executable_users = ["self"]
+  owners = [var.github_qualification_worker_ami_owner_id]
 
   filter {
     name   = "image-id"
     values = [var.metal_worker_ami]
+  }
+
+  filter {
+    name   = "architecture"
+    values = ["x86_64"]
+  }
+
+  filter {
+    name   = "root-device-type"
+    values = ["ebs"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+
+  filter {
+    name   = "root-device-name"
+    values = ["/dev/sda1"]
+  }
+
+  filter {
+    name   = "ena-support"
+    values = ["true"]
+  }
+
+  filter {
+    name   = "is-public"
+    values = ["true"]
+  }
+
+  filter {
+    name   = "state"
+    values = ["available"]
   }
 }
 

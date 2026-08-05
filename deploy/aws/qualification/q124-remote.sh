@@ -45,7 +45,7 @@ clean_host() {
 }
 
 prepare() {
-  for name in Q124_NODE_ID Q124_PRIVATE_IP Q124_CONTROL_URL Q124_REGION Q124_CHUNKSTORE_BUCKET Q124_RUNTIME_SECRET_ARN Q124_DB_SECRET_ARN Q124_DB_NAME Q124_CACHE_DEVICE; do need "$name"; done
+  for name in Q124_NODE_ID Q124_PRIVATE_IP Q124_CONTROL_URL Q124_REGION Q124_CHUNKSTORE_BUCKET Q124_RUNTIME_SECRET_ARN Q124_DB_SECRET_ARN Q124_DB_NAME Q124_CACHE_DEVICE Q124_AWS_CLI_VERSION Q124_JQ_VERSION; do need "$name"; done
   prove_identity
   clean_host
   prove_cache_device
@@ -57,6 +57,9 @@ prepare() {
   # remaining runtime client here; Ubuntu 24.04 has no awscli apt candidate.
   command -v aws >/dev/null 2>&1 || die "AWS CLI bootstrap is missing"
   command -v jq >/dev/null 2>&1 || die "jq bootstrap is missing"
+  actual_aws=$(aws --version 2>&1 | sed -n 's/^aws-cli\/\([^ ]*\).*/\1/p')
+  [[ $actual_aws == "$Q124_AWS_CLI_VERSION" ]] || die "AWS CLI version differs from pinned bootstrap"
+  [[ $(jq --version) == "$Q124_JQ_VERSION" ]] || die "jq version differs from pinned bootstrap"
   apt-get install -qy postgresql-client
 
   runtime=$(awsq secretsmanager get-secret-value --secret-id "$Q124_RUNTIME_SECRET_ARN" --query SecretString --output text)
@@ -170,15 +173,21 @@ assert_cache_mount() {
   else
     [[ -b $Q124_CACHE_DEVICE ]] || die "manifest cache device is not a block device"
   fi
-  local mount_source expected_source actual_source
-  mount_source=$(
-    "$FINDMNT_BIN" --noheadings --raw --first-only --mountpoint /var/lib/cats --output SOURCE
-  ) || die "cache mount probe failed"
-  [[ -n $mount_source && $mount_source != *$'\n'* ]] || die "cache mount source is missing or ambiguous"
+  local mount_source expected_source actual_source mount_table
+  mount_table=$(mktemp)
+  trap 'rm -f "$mount_table"' RETURN
+  "$FINDMNT_BIN" --json --output TARGET,SOURCE >"$mount_table" \
+    || die "cache mount table probe failed"
+  mount_source=$(jq -er '
+    [.filesystems[] | select(.target == "/var/lib/cats")] |
+    select(length == 1) | .[0].source | select(type == "string" and length > 0)
+  ' "$mount_table") || die "cache mount record is missing or overmounted"
   expected_source=$(readlink -f -- "$Q124_CACHE_DEVICE") || die "cache device resolution failed"
   actual_source=$(readlink -f -- "$mount_source") || die "cache mount source resolution failed"
   [[ -n $expected_source && $actual_source == "$expected_source" ]] \
     || die "cache mount is not backed by the manifest device"
+  rm -f "$mount_table"
+  trap - RETURN
 }
 
 assert_idle() {

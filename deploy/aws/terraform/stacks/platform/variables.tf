@@ -302,6 +302,17 @@ variable "github_qualification_worker_enabled" {
   default     = false
 }
 
+variable "github_qualification_worker_ami_owner_id" {
+  description = "Expected AWS account ID that owns the exact public x86_64 qualification AMI. Required when the temporary worker role is enabled."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = !var.github_qualification_worker_enabled || can(regex("^[0-9]{12}$", var.github_qualification_worker_ami_owner_id))
+    error_message = "Enablement requires the reviewed 12-digit owner account ID for the qualification AMI."
+  }
+}
+
 variable "github_qualification_artifact_bucket_arn" {
   description = "Existing worker artifact bucket ARN. Required when github_qualification_worker_enabled is true; the role receives only worker/qualification-124/*."
   type        = string

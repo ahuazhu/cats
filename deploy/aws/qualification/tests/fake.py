@@ -63,8 +63,8 @@ def instance(s, source=False):
         "InstanceInitiatedShutdownBehavior": "stop",
         "PrivateIpAddress": "10.0.1.124",
         "Placement": {"AvailabilityZone": "us-east-1a"},
-        "BlockDeviceMappings": [{"DeviceName": "/dev/sda1", "Ebs": {
-            "VolumeId": "vol-q124", "DeleteOnTermination": s.get("root_delete_on_termination", True)
+        "BlockDeviceMappings": [{"DeviceName": s.get("root_device", "/dev/sda1"), "Ebs": {
+            "VolumeId": s.get("root_volume_id", "vol-q124"), "DeleteOnTermination": s.get("root_delete_on_termination", True)
         }}],
         "Tags": [{"Key": k, "Value": v} for k, v in tags.items()],
     }
@@ -80,6 +80,9 @@ def fake_aws(args):
     service, action = args[:2]
     record(s, f"aws {service} {action} " + " ".join(args[2:]))
     s = load()
+    if s.get("credentials_expired"):
+        print("ExpiredToken", file=sys.stderr)
+        return 255
     if (service, action) == ("sts", "get-caller-identity"):
         print(s["account"])
     elif (service, action) == ("ec2", "describe-instances"):
@@ -113,6 +116,26 @@ def fake_aws(args):
                 other["InstanceId"] = "i-0def124"
                 items.append(other)
         print(json.dumps({"Reservations": [{"Instances": items}] if items else []}))
+    elif (service, action) == ("ec2", "describe-images"):
+        image = {
+            "ImageId": "ami-0124",
+            "OwnerId": s["ami_owner"],
+            "Public": s["ami_public"],
+            "State": s["ami_state"],
+            "Architecture": s["ami_architecture"],
+            "RootDeviceType": s["ami_root_device_type"],
+            "RootDeviceName": s["ami_root_device"],
+            "VirtualizationType": s["ami_virtualization_type"],
+            "EnaSupport": s["ami_ena_support"],
+            "BlockDeviceMappings": [
+                {"DeviceName": device, "Ebs": {"SnapshotId": snapshot}}
+                for device, snapshot in s["ami_mappings"]
+            ],
+        }
+        images = [] if s.get("ami_zero") else [image]
+        if s.get("ami_ambiguous"):
+            images.append(dict(image))
+        print(json.dumps({"Images": images}))
     elif (service, action) == ("ec2", "run-instances"):
         if s.get("run_preaccept_fail"):
             return 1
@@ -134,8 +157,16 @@ def fake_aws(args):
     elif (service, action) == ("ec2", "describe-volumes"):
         present = s["instance_state"] not in ("absent", "terminated")
         volume = {
-            "VolumeId": "vol-q124", "Encrypted": True, "Size": 200, "VolumeType": "gp3",
-            "Attachments": [{"InstanceId": s["instance"]}],
+            "VolumeId": s.get("root_volume_id", "vol-q124"),
+            "Encrypted": s.get("root_encrypted", True),
+            "Size": s.get("root_size", 200),
+            "VolumeType": s.get("root_type", "gp3"),
+            "Attachments": [{
+                "InstanceId": s["instance"],
+                "Device": s.get("root_device", "/dev/sda1"),
+                "State": "attached",
+                "DeleteOnTermination": s.get("root_delete_on_termination", True),
+            }],
             "Tags": [
                 {"Key": "CatsIssue", "Value": "124"},
                 {"Key": "CatsPurpose", "Value": "temporary-worker-qualification"},
@@ -205,7 +236,7 @@ def fake_control(args):
             return 1
         print(json.dumps(node_summary(node, memory=s["memory_mib"])))
     elif action == "cordon":
-        if not s["control_present"]:
+        if not s["control_present"] or s.get("cordon_fail"):
             return 1
         s["control_state"] = "cordoned"
         save(s)
@@ -263,6 +294,16 @@ def fake_remote(args):
         s["memory_mib"] = 1024
         save(s)
     elif action == "validate":
+        if s.get("root_drift_on_validate"):
+            s["root_encrypted"] = False
+            save(s)
+        if s.get("root_dot_drift_on_validate"):
+            s["root_delete_on_termination"] = False
+            save(s)
+        if s.get("credentials_expire_on_validate"):
+            s["credentials_expired"] = True
+            s["recover_active_fail"] = True
+            save(s)
         if s.get("fail_validate"):
             return 1
         if not s["worker_running"]:
@@ -273,12 +314,22 @@ def fake_remote(args):
     elif action == "assert-idle":
         if not s["prepared"] or s.get("fail_assert_idle") or s["ledger_cats"] or s["attachments"] or s["pending_packs"]:
             return 1
+        if s.get("ready_after_idle"):
+            s["control_state"] = "ready"
+            save(s)
+        if s.get("assignment_after_idle"):
+            s["cats"] = [{"id": "cat-race", "workspace": "ws-q124", "name": "q124-race"}]
+            save(s)
         print("idle")
     elif action == "stop":
         if not s["prepared"] or s.get("fail_assert_idle") or s["ledger_cats"] or s["attachments"] or s["pending_packs"]:
             return 1
         s["worker_running"] = False
         save(s)
+    elif action == "recover-active":
+        if s.get("recover_active_fail"):
+            return 1
+        print("ssm-recovery=terminal")
     else:
         return 2
     return 0
@@ -292,7 +343,14 @@ def init():
         "termination_protection": False, "control_present": False, "control_state": "cordoned",
         "cats": [], "ledger_cats": [], "attachments": [], "pending_packs": 0, "orphans": 0,
         "prepared": False, "worker_running": False, "memory_mib": 0,
-        "root_delete_on_termination": True, "published_manifests": 0, "log": []
+        "root_device": "/dev/sda1", "root_volume_id": "vol-q124",
+        "root_delete_on_termination": True, "root_encrypted": True,
+        "root_size": 200, "root_type": "gp3",
+        "ami_owner": "111122223333", "ami_public": True, "ami_state": "available",
+        "ami_architecture": "x86_64", "ami_root_device_type": "ebs",
+        "ami_root_device": "/dev/sda1", "ami_virtualization_type": "hvm",
+        "ami_ena_support": True, "ami_mappings": [["/dev/sda1", "snap-0124aaa"]],
+        "published_manifests": 0, "log": []
     })
 
 

@@ -35,7 +35,7 @@ expect_stop_fail_closed() {
 }
 
 Q124_REMOTE_SCENARIO=idle "$REMOTE" assert-idle >/dev/null
-for Q124_REMOTE_SCENARIO in mount-error ledger-find-error pending-find-error pack-find-error runtime-find-error cgroup-find-error; do
+for Q124_REMOTE_SCENARIO in mount-error overmount ledger-find-error pending-find-error pack-find-error runtime-find-error cgroup-find-error; do
   export Q124_REMOTE_SCENARIO
   expect_stop_fail_closed
 done

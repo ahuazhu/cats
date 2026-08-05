@@ -11,10 +11,34 @@ locals {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "ReadEc2AndSsmInventory"
+        Sid      = "ReadRegionalEc2AndSsmInventory"
         Effect   = "Allow"
-        Action   = ["ec2:DescribeInstances", "ec2:DescribeInstanceStatus", "ec2:DescribeVolumes", "ssm:DescribeInstanceInformation", "ssm:GetCommandInvocation", "ssm:ListCommandInvocations"]
+        Action   = ["ec2:DescribeImages", "ec2:DescribeInstances", "ec2:DescribeInstanceStatus", "ec2:DescribeVolumes", "ssm:DescribeInstanceInformation"]
         Resource = "*"
+        Condition = {
+          StringEquals = { "aws:RequestedRegion" = var.region }
+        }
+      },
+      # SSM does not expose command-invocation resource ARNs for these APIs.
+      # Bind the unavoidable wildcard to the one qualification region; the
+      # tool also supplies and revalidates an exact instance/command pair.
+      {
+        Sid      = "ReadRegionalSsmCommandResult"
+        Effect   = "Allow"
+        Action   = "ssm:GetCommandInvocation"
+        Resource = "*"
+        Condition = {
+          StringEquals = { "aws:RequestedRegion" = var.region }
+        }
+      },
+      {
+        Sid      = "CancelRegionalSsmCommand"
+        Effect   = "Allow"
+        Action   = "ssm:CancelCommand"
+        Resource = "*"
+        Condition = {
+          StringEquals = { "aws:RequestedRegion" = var.region }
+        }
       },
       # AWS evaluates RunInstances once for every participating resource.
       # Existing/fixed resources cannot carry request-tag or instance-profile

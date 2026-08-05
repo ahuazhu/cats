@@ -48,6 +48,8 @@ jobs:
       Q124_SOURCE_INSTANCE_ID: ${{ vars.Q124_SOURCE_INSTANCE_ID }}
       Q124_SOURCE_NODE_ID: ${{ vars.Q124_SOURCE_NODE_ID }}
       Q124_AMI_ID: ${{ vars.Q124_WORKER_AMI_ID }}
+      Q124_AMI_OWNER_ID: ${{ vars.Q124_WORKER_AMI_OWNER_ID }}
+      Q124_AMI_SNAPSHOT_IDS_JSON: ${{ vars.Q124_WORKER_AMI_SNAPSHOT_IDS_JSON }}
       Q124_INSTANCE_TYPE: ${{ vars.Q124_WORKER_INSTANCE_TYPE }}
       Q124_SUBNET_ID: ${{ vars.Q124_WORKER_SUBNET_ID }}
       Q124_SECURITY_GROUP_ID: ${{ vars.Q124_WORKER_SECURITY_GROUP_ID }}
@@ -61,6 +63,11 @@ jobs:
       Q124_DB_SECRET_ARN: ${{ vars.RDS_MASTER_USER_SECRET_ARN }}
       Q124_DB_NAME: ${{ vars.Q124_DB_NAME }}
       Q124_AWS_ROLE_ARN: ${{ vars.Q124_AWS_ROLE_ARN }}
+      Q124_AWS_CLI_VERSION: ${{ vars.Q124_AWS_CLI_VERSION }}
+      Q124_AWS_CLI_X86_64_SHA256: ${{ vars.Q124_AWS_CLI_X86_64_SHA256 }}
+      Q124_JQ_VERSION: ${{ vars.Q124_JQ_VERSION }}
+      Q124_CLEANUP_RESERVE_SECONDS: "1800"
+      Q124_SSM_MAX_EXECUTION_TIMEOUT_SECONDS: "4200"
 
     steps:
       - uses: actions/checkout@v4
@@ -85,7 +92,7 @@ jobs:
           [[ "$Q124_MODE" =~ ^(provision|validate|drain|withdraw|return)$ ]]
           required=(Q124_AWS_ROLE_ARN Q124_ACCOUNT_ID Q124_REGION Q124_CLUSTER Q124_WORKSPACE_ID Q124_SOURCE_INSTANCE_ID Q124_SOURCE_NODE_ID Q124_CONTROL_URL Q124_CONTROL_AUTHORITY)
           if [[ "$Q124_MODE" == provision || "$Q124_MODE" == validate ]]; then
-            required+=(Q124_AMI_ID Q124_INSTANCE_TYPE Q124_SUBNET_ID Q124_SECURITY_GROUP_ID Q124_INSTANCE_PROFILE_NAME Q124_CACHE_DEVICE)
+            required+=(Q124_AMI_ID Q124_AMI_OWNER_ID Q124_AMI_SNAPSHOT_IDS_JSON Q124_INSTANCE_TYPE Q124_SUBNET_ID Q124_SECURITY_GROUP_ID Q124_INSTANCE_PROFILE_NAME Q124_CACHE_DEVICE Q124_AWS_CLI_VERSION Q124_AWS_CLI_X86_64_SHA256 Q124_JQ_VERSION)
           fi
           if [[ "$Q124_MODE" == provision ]]; then
             required+=(Q124_ARTIFACT_BUCKET Q124_CHUNKSTORE_BUCKET Q124_RUNTIME_SECRET_ARN Q124_DB_SECRET_ARN Q124_DB_NAME)
@@ -121,6 +128,14 @@ jobs:
         with:
           role-to-assume: ${{ vars.Q124_AWS_ROLE_ARN }}
           aws-region: ${{ env.Q124_REGION }}
+          role-duration-seconds: 7200
+
+      - name: Reserve a fresh-session cleanup window
+        shell: bash
+        run: |
+          set -euo pipefail
+          now=$(date -u +%s)
+          printf 'Q124_OPERATION_DEADLINE_EPOCH=%s\n' "$((now + 4800))" >>"$GITHUB_ENV"
 
       - name: Package exact reviewed source
         if: inputs.mode == 'provision'
@@ -155,6 +170,28 @@ jobs:
           manifest_sha=$(sed -n 's/^manifest-sha256=//p' <<<"$output")
           [[ -z "$manifest_sha" || "$manifest_sha" =~ ^[0-9a-f]{64}$ ]]
           echo "manifest_sha=$manifest_sha" >>"$GITHUB_OUTPUT"
+
+      - name: Refresh qualification identity for bounded cleanup
+        if: always() && inputs.mode == 'provision'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.Q124_AWS_ROLE_ARN }}
+          aws-region: ${{ env.Q124_REGION }}
+          role-duration-seconds: 1800
+
+      - name: Recover a failed provision with the fresh session
+        if: failure() && inputs.mode == 'provision'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f "$Q124_MANIFEST_OUT" && ! -L "$Q124_MANIFEST_OUT" && -f "$Q124_EVIDENCE_OUT" && ! -L "$Q124_EVIDENCE_OUT" ]]; then
+            Q124_EXPECTED_MANIFEST_SHA256=$(jq -S -c . "$Q124_MANIFEST_OUT" | sha256sum | awk '{print $1}')
+            export Q124_EXPECTED_MANIFEST_SHA256
+            export Q124_MANIFEST=$Q124_MANIFEST_OUT
+            export Q124_MODE=recover-provision
+            export Q124_CONFIRMATION="RECOVER_Q124_${Q124_EXPECTED_MANIFEST_SHA256:0:12}"
+            deploy/aws/qualification/q124-temp-worker.sh
+          fi
 
       - name: Record bounded provisioning failure evidence
         if: failure() && inputs.mode == 'provision'
