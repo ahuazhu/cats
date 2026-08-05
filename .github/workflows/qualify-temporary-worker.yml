@@ -74,6 +74,7 @@ jobs:
           printf 'Q124_MANIFEST=%s/q124-manifest.json\n' "$RUNNER_TEMP" >>"$GITHUB_ENV"
           printf 'Q124_MANIFEST_OUT=%s/q124-manifest.json\n' "$RUNNER_TEMP" >>"$GITHUB_ENV"
           printf 'Q124_ADMIN_TOKEN_FILE=%s/q124-admin-token\n' "$RUNNER_TEMP" >>"$GITHUB_ENV"
+          printf 'Q124_EVIDENCE_OUT=%s/q124-failure-evidence.json\n' "$RUNNER_TEMP" >>"$GITHUB_ENV"
 
       - name: Reject incomplete or user-controlled scope
         shell: bash
@@ -81,7 +82,10 @@ jobs:
           set -euo pipefail
           [[ "$GITHUB_REF" == refs/heads/main ]]
           [[ "$Q124_MODE" =~ ^(provision|validate|drain|withdraw|return)$ ]]
-          required=(Q124_AWS_ROLE_ARN Q124_ACCOUNT_ID Q124_REGION Q124_CLUSTER Q124_WORKSPACE_ID Q124_SOURCE_INSTANCE_ID Q124_SOURCE_NODE_ID Q124_CONTROL_URL Q124_AMI_ID Q124_INSTANCE_TYPE Q124_SUBNET_ID Q124_SECURITY_GROUP_ID Q124_INSTANCE_PROFILE_NAME Q124_CACHE_DEVICE)
+          required=(Q124_AWS_ROLE_ARN Q124_ACCOUNT_ID Q124_REGION Q124_CLUSTER Q124_WORKSPACE_ID Q124_SOURCE_INSTANCE_ID Q124_SOURCE_NODE_ID Q124_CONTROL_URL)
+          if [[ "$Q124_MODE" == provision || "$Q124_MODE" == validate ]]; then
+            required+=(Q124_AMI_ID Q124_INSTANCE_TYPE Q124_SUBNET_ID Q124_SECURITY_GROUP_ID Q124_INSTANCE_PROFILE_NAME Q124_CACHE_DEVICE)
+          fi
           if [[ "$Q124_MODE" == provision ]]; then
             required+=(Q124_ARTIFACT_BUCKET Q124_CHUNKSTORE_BUCKET Q124_RUNTIME_SECRET_ARN Q124_DB_SECRET_ARN Q124_DB_NAME)
             [[ "$Q124_TTL_HOURS" =~ ^([1-9]|1[0-9]|2[0-4])$ ]]
@@ -135,14 +139,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          marker="<!-- cats-q124-manifest:${Q124_EXPECTED_MANIFEST_SHA256} -->"
-          mapfile -t bodies < <(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/124/comments" --jq ".[] | select(.body | contains(\"$marker\")) | .body")
-          [[ ${#bodies[@]} == 1 ]] || { echo "::error::manifest comment was not unique"; exit 1; }
-          encoded=$(sed -n 's/^q124-manifest-base64: //p' <<<"${bodies[0]}")
-          [[ -n "$encoded" ]]
-          printf '%s' "$encoded" | base64 --decode >"$Q124_MANIFEST"
-          actual=$(jq -S -c . "$Q124_MANIFEST" | sha256sum | awk '{print $1}')
-          [[ "$actual" == "$Q124_EXPECTED_MANIFEST_SHA256" ]]
+          bash deploy/aws/qualification/q124-manifest-recovery.sh
 
       - name: Execute exact lifecycle transition
         id: lifecycle
@@ -155,6 +152,18 @@ jobs:
           manifest_sha=$(sed -n 's/^manifest-sha256=//p' <<<"$output")
           [[ -z "$manifest_sha" || "$manifest_sha" =~ ^[0-9a-f]{64}$ ]]
           echo "manifest_sha=$manifest_sha" >>"$GITHUB_OUTPUT"
+
+      - name: Record bounded provisioning failure evidence
+        if: failure() && inputs.mode == 'provision'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f "$Q124_EVIDENCE_OUT" && ! -L "$Q124_EVIDENCE_OUT" ]] && jq -e '.schema == 1 and .issue == 124' "$Q124_EVIDENCE_OUT" >/dev/null; then
+            body=$(printf 'Issue #124 temporary-worker provisioning failed closed. No live PASS is claimed.\n\nRun: %s/actions/runs/%s\n\n```json\n%s\n```\n' "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$(jq . "$Q124_EVIDENCE_OUT")")
+            gh api "repos/${GITHUB_REPOSITORY}/issues/124/comments" -f body="$body" >/dev/null
+          fi
 
       - name: Publish no-secret manifest evidence
         if: inputs.mode == 'provision' && success()
@@ -188,6 +197,7 @@ jobs:
             "$RUNNER_TEMP/q124-admin-token" \
             "$RUNNER_TEMP/q124-source.tar.gz" \
             "$RUNNER_TEMP/q124-manifest.json" \
+            "$RUNNER_TEMP/q124-failure-evidence.json" \
             "$RUNNER_TEMP/kubeconfig"
           do
             [[ "$path" == "$RUNNER_TEMP"/* ]]

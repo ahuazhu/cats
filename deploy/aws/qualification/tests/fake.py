@@ -23,13 +23,13 @@ def record(s, entry):
     save(s)
 
 
-def node_summary(node, state="cordoned", cats=None, orphans=0):
+def node_summary(node, state="cordoned", cats=None, orphans=0, memory=1024):
     cats = cats or []
     return {
         "node": {
             "id": node,
             "state": state,
-            "capacity": {"cpus": 1, "memory_mib": 1024},
+            "capacity": {"cpus": 1, "memory_mib": memory},
         },
         "assigned_cats": len(cats),
         "orphan_cats": orphans,
@@ -91,9 +91,29 @@ def fake_aws(args):
                 print("unknown instance", file=sys.stderr)
                 return 1
         else:
-            items = [instance(s)] if s.get("duplicate") or (s["instance_state"] not in ("absent", "terminated")) else []
+            return_lookup = any(value.startswith("Name=instance-id,Values=") for value in args)
+            if return_lookup and s.get("return_lookup_error"):
+                print("return lookup failed", file=sys.stderr)
+                return 1
+            if return_lookup:
+                purged = s["instance_state"] == "absent" or (
+                    s["instance_state"] == "terminated" and s.get("purge_terminated_inventory")
+                )
+                items = [] if purged else [instance(s)]
+            else:
+                items = [instance(s)] if s.get("duplicate") or (s["instance_state"] not in ("absent", "terminated")) else []
+                if s.get("conflicting_identity"):
+                    other = dict(instance(s))
+                    other["InstanceId"] = "i-0def124"
+                    items.append(other)
+            if (s.get("discovery_multiple") or (return_lookup and s.get("return_lookup_multiple"))) and items:
+                other = dict(instance(s))
+                other["InstanceId"] = "i-0def124"
+                items.append(other)
         print(json.dumps({"Reservations": [{"Instances": items}] if items else []}))
     elif (service, action) == ("ec2", "run-instances"):
+        if s.get("run_preaccept_fail"):
+            return 1
         if s["instance_state"] != "absent":
             return 1
         tag_json = json.loads(args[args.index("--tag-specifications") + 1])
@@ -103,6 +123,11 @@ def fake_aws(args):
         s["run_id"] = tags["CatsRunId"]
         s["instance_state"] = "pending"
         save(s)
+        if s.get("sleep_run_response_loss"):
+            time.sleep(s["sleep_run_response_loss"])
+            return 1
+        if s.get("run_response_lost"):
+            return 1
         print(json.dumps({"Instances": [{"InstanceId": s["instance"]}]}))
     elif (service, action) == ("ec2", "describe-volumes"):
         present = s["instance_state"] not in ("absent", "terminated")
@@ -158,7 +183,7 @@ def fake_control(args):
         if node == s["source_node"]:
             print(json.dumps(node_summary(node, "ready")))
         elif node == s["node"] and s["control_present"]:
-            print(json.dumps(node_summary(node, s["control_state"], s["cats"], s["orphans"])))
+            print(json.dumps(node_summary(node, s["control_state"], s["cats"], s["orphans"], s["memory_mib"])))
         else:
             return 1
     elif action == "absent":
@@ -173,9 +198,10 @@ def fake_control(args):
             return 1
         print(json.dumps([c["id"] for c in s["cats"]]))
     elif action == "wait-cordoned":
-        if not s["control_present"] or s["control_state"] != "cordoned" or s["cats"] or s["orphans"]:
+        expected_memory = int(args[3])
+        if not s["control_present"] or s["control_state"] != "cordoned" or s["cats"] or s["orphans"] or s["memory_mib"] != expected_memory:
             return 1
-        print(json.dumps(node_summary(node)))
+        print(json.dumps(node_summary(node, memory=s["memory_mib"])))
     elif action == "cordon":
         if not s["control_present"]:
             return 1
@@ -218,7 +244,13 @@ def fake_remote(args):
             return 1
         s["worker_running"] = True
         s["control_present"] = True
-        s["control_state"] = "cordoned"
+        s["control_state"] = "ready" if s.get("start_ready") else "cordoned"
+        s["memory_mib"] = 1
+        save(s)
+    elif action == "set-capacity":
+        if not s["worker_running"] or s["control_state"] != "cordoned" or s["cats"]:
+            return 1
+        s["memory_mib"] = 1024
         save(s)
     elif action == "validate":
         if s.get("fail_validate"):
@@ -249,7 +281,7 @@ def init():
         "source_sha": "", "run_id": "", "security_groups": ["sg-0124"],
         "termination_protection": False, "control_present": False, "control_state": "cordoned",
         "cats": [], "ledger_cats": [], "attachments": [], "pending_packs": 0, "orphans": 0,
-        "prepared": False, "worker_running": False, "log": []
+        "prepared": False, "worker_running": False, "memory_mib": 0, "log": []
     })
 
 

@@ -7,7 +7,7 @@ die() { printf 'q124-ssm: %s\n' "$*" >&2; exit 1; }
 instance=${1:?instance id required}
 mode=${2:?remote mode required}
 [[ $instance =~ ^i-[0-9a-f]+$ ]] || die "invalid instance id"
-[[ $mode =~ ^(bootstrap|start|validate|snapshot|assert-idle|stop)$ ]] || die "invalid mode"
+[[ $mode =~ ^(bootstrap|start|set-capacity|validate|snapshot|assert-idle|stop)$ ]] || die "invalid mode"
 
 quote_env() {
   local name

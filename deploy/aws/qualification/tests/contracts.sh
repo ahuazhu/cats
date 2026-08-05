@@ -8,6 +8,9 @@ ROOT=$(cd "$HERE/../../../.." && pwd)
 TOOL=$ROOT/deploy/aws/qualification/q124-temp-worker.sh
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
+"$HERE/device-contracts.sh"
+"$HERE/manifest-recovery-contracts.sh"
+"$HERE/policy-contracts.sh"
 
 fail() { printf 'contracts: %s\n' "$*" >&2; exit 1; }
 state_set() {
@@ -16,6 +19,14 @@ state_set() {
 }
 assert_state() { jq -e "$1" "$Q124_FAKE_STATE" >/dev/null || fail "state assertion failed: $1"; }
 expect_fail() { if "$@" >/dev/null 2>&1; then fail "expected failure: $*"; fi; }
+wait_for_state() {
+  local filter=$1
+  for _ in {1..100}; do
+    jq -e "$filter" "$Q124_FAKE_STATE" >/dev/null && return 0
+    sleep 0.02
+  done
+  fail "timed out waiting for fake state: $filter"
+}
 
 reset_case() {
   local name=$1
@@ -34,9 +45,13 @@ reset_case() {
   export Q124_CHUNKSTORE_BUCKET=cats-chunks Q124_RUNTIME_SECRET_ARN=arn:aws:secretsmanager:us-east-1:111122223333:secret:runtime
   export Q124_DB_SECRET_ARN=arn:aws:secretsmanager:us-east-1:111122223333:secret:db Q124_DB_NAME=cats
   export Q124_TTL_HOURS=8 GITHUB_RUN_ID=124001 GITHUB_SHA=0124abc0124abc0124abc0124abc0124abc0124a
+  export Q124_DISCOVERY_TIMEOUT_SECONDS=0
   export Q124_ARCHIVE_KEY="worker/qualification-124/${GITHUB_SHA}/q124-source-${Q124_ARCHIVE_SHA256}.tar.gz"
   export Q124_MANIFEST_OUT=$TMP/$name-manifest.json Q124_MANIFEST=$TMP/$name-manifest.json
   unset Q124_EXPECTED_MANIFEST_SHA256
+  unset Q124_EVIDENCE_OUT
+  unset Q124_MANIFEST_SOURCE_SHA Q124_MANIFEST_RUN_ID Q124_EXPECTED_AMI Q124_EXPECTED_INSTANCE_TYPE
+  unset Q124_EXPECTED_SUBNET Q124_EXPECTED_SECURITY_GROUP Q124_EXPECTED_INSTANCE_PROFILE Q124_EXPECTED_CACHE_DEVICE
 }
 
 provision_ok() {
@@ -45,6 +60,11 @@ provision_ok() {
   export Q124_EXPECTED_MANIFEST_SHA256
   Q124_EXPECTED_MANIFEST_SHA256=$(jq -S -c . "$Q124_MANIFEST" | sha256sum | awk '{print $1}')
   assert_state '.instance_state == "running" and .termination_protection == true and .control_present == true and .control_state == "cordoned" and .worker_running == true'
+  jq -e '
+    .log as $l |
+    ($l | index("control wait-cordoned q124-124001-0124abc metal-source 1")) < ($l | index("remote i-0abc124 set-capacity")) and
+    ($l | index("remote i-0abc124 set-capacity")) < ($l | index("control wait-cordoned q124-124001-0124abc metal-source 1024"))
+  ' "$Q124_FAKE_STATE" >/dev/null || fail "capacity was not staged 1 MiB -> 1024 MiB"
 }
 
 reset_case wrong-account
@@ -63,6 +83,49 @@ state_set '.security_groups = ["sg-0124", "sg-unreviewed"]'
 export Q124_MODE=provision Q124_CONFIRMATION=PROVISION_Q124_TEMP_WORKER
 expect_fail "$TOOL"
 assert_state '[.log[] | select(contains("run-instances"))] == []'
+
+reset_case initial-ready
+state_set '.start_ready = true'
+export Q124_MODE=provision Q124_CONFIRMATION=PROVISION_Q124_TEMP_WORKER
+expect_fail "$TOOL"
+assert_state '.instance_state == "terminated"'
+assert_state '[.log[] | select(contains("set-capacity"))] == []'
+
+reset_case response-lost
+state_set '.run_response_lost = true'
+export Q124_MODE=provision Q124_CONFIRMATION=PROVISION_Q124_TEMP_WORKER Q124_EVIDENCE_OUT=$TMP/response-lost-evidence.json
+expect_fail "$TOOL"
+assert_state '.instance_state == "terminated"'
+assert_state '[.log[] | select(contains("terminate-instances"))] as $calls | ($calls | length) == 1 and ($calls[0] | contains("--instance-ids i-0abc124"))'
+jq -e '.status == "cleanup-terminated" and .instance_id == "i-0abc124" and .discovered_instances == 1' "$Q124_EVIDENCE_OUT" >/dev/null
+
+reset_case response-lost-multiple
+state_set '.run_response_lost = true | .discovery_multiple = true'
+export Q124_MODE=provision Q124_CONFIRMATION=PROVISION_Q124_TEMP_WORKER Q124_EVIDENCE_OUT=$TMP/response-lost-multiple-evidence.json
+expect_fail "$TOOL"
+assert_state '.instance_state == "pending" and ([.log[] | select(contains("terminate-instances"))] | length == 0)'
+jq -e '.status == "discovery-count-2-preserved" and .discovered_instances == 2 and .instance_id == null' "$Q124_EVIDENCE_OUT" >/dev/null
+
+reset_case response-lost-zero
+state_set '.run_preaccept_fail = true'
+export Q124_MODE=provision Q124_CONFIRMATION=PROVISION_Q124_TEMP_WORKER Q124_EVIDENCE_OUT=$TMP/response-lost-zero-evidence.json
+expect_fail "$TOOL"
+assert_state '.instance_state == "absent" and ([.log[] | select(contains("terminate-instances"))] | length == 0)'
+jq -e '.status == "discovery-count-0-preserved" and .discovered_instances == 0' "$Q124_EVIDENCE_OUT" >/dev/null
+
+reset_case response-loss-cancelled
+state_set '.sleep_run_response_loss = 2'
+export Q124_MODE=provision Q124_CONFIRMATION=PROVISION_Q124_TEMP_WORKER Q124_EVIDENCE_OUT=$TMP/response-loss-cancelled-evidence.json
+set +e
+"$TOOL" >/dev/null 2>&1 & response_loss_pid=$!
+wait_for_state '.instance_state == "pending"'
+kill -TERM "$response_loss_pid"
+wait "$response_loss_pid"
+response_loss_rc=$?
+set -e
+[[ $response_loss_rc -ne 0 ]] || fail "response-loss cancellation unexpectedly succeeded"
+assert_state '.instance_state == "terminated" and ([.log[] | select(contains("terminate-instances"))] | length == 1)'
+jq -e '.status == "cleanup-terminated" and .instance_id == "i-0abc124"' "$Q124_EVIDENCE_OUT" >/dev/null
 
 reset_case bad-hash
 provision_ok
@@ -98,6 +161,12 @@ export Q124_MODE=validate Q124_CONFIRMATION="VALIDATE_Q124_${Q124_EXPECTED_MANIF
 expect_fail "$TOOL"
 assert_state '[.log[] | select(contains("terminate-instances"))] == []'
 
+reset_case validate-policy-drift
+provision_ok
+export Q124_AMI_ID=ami-dead Q124_MODE=validate Q124_CONFIRMATION="VALIDATE_Q124_${Q124_EXPECTED_MANIFEST_SHA256:0:12}"
+expect_fail "$TOOL"
+assert_state '.instance_state == "running" and ([.log[] | select(contains("terminate-instances"))] | length == 0)'
+
 reset_case half-scope
 provision_ok
 state_set '.cats=[{"id":"cat-1","name":"q124-owned","workspace":"ws-q124"},{"id":"cat-2","name":"other","workspace":"ws-other"}] | .ledger_cats=["cat-1","cat-2"]'
@@ -130,7 +199,7 @@ state_set '.sleep_bootstrap = 2'
 export Q124_MODE=provision Q124_CONFIRMATION=PROVISION_Q124_TEMP_WORKER
 set +e
 "$TOOL" >/dev/null 2>&1 & cancelled_pid=$!
-sleep 0.5
+wait_for_state '[.log[] | select(contains("remote i-0abc124 bootstrap"))] | length == 1'
 kill -TERM "$cancelled_pid"
 wait "$cancelled_pid"
 cancelled_rc=$?
@@ -144,6 +213,7 @@ provision_ok
 # Cleanup must remain possible after main advances; the manifest and live tags,
 # not the runner's newer checkout, are the provenance pair.
 export GITHUB_SHA=ffffffffffffffffffffffffffffffffffffffff
+unset Q124_AMI_ID Q124_INSTANCE_TYPE Q124_SUBNET_ID Q124_SECURITY_GROUP_ID Q124_INSTANCE_PROFILE_NAME Q124_CACHE_DEVICE
 export Q124_MODE=drain Q124_CONFIRMATION="DRAIN_Q124_${Q124_EXPECTED_MANIFEST_SHA256:0:12}"
 "$TOOL" >/dev/null
 "$TOOL" >/dev/null # retry is idempotent
@@ -157,7 +227,20 @@ expect_fail "$TOOL"
 assert_state ".log[$before:] | any(contains(\"terminate-instances\")) | not"
 state_set 'del(.tag_overrides)'
 "$TOOL" >/dev/null
-"$TOOL" >/dev/null # terminated + absent retry is idempotent
+before=$(jq '.log|length' "$Q124_FAKE_STATE")
+state_set '.return_lookup_multiple = true'
+expect_fail "$TOOL"
+assert_state ".log[$before:] | any(contains(\"terminate-instances\")) | not"
+state_set '.return_lookup_multiple = false'
+before=$(jq '.log|length' "$Q124_FAKE_STATE")
+state_set '.return_lookup_error = true'
+expect_fail "$TOOL"
+assert_state ".log[$before:] | any(contains(\"terminate-instances\")) | not"
+state_set '.return_lookup_error = false | .purge_terminated_inventory = true'
+"$TOOL" >/dev/null # purged terminated instance + final absence oracles are idempotent
+state_set '.conflicting_identity = true'
+expect_fail "$TOOL" # purged exact id does not hide a conflicting active identity
+state_set '.conflicting_identity = false'
 assert_state '.instance_state == "terminated" and .control_present == false'
 assert_state '[.log[] | select(contains("terminate-instances"))] | length == 1'
 

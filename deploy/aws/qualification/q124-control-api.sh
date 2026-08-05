@@ -63,7 +63,8 @@ case ${1:-} in
     jq -c '[.items[].cat.id]' "$out"
     ;;
   wait-cordoned)
-    node=${2:?node id required}; source_node=${3:?source node required}; deadline=$((SECONDS + ${Q124_CONTROL_TIMEOUT_SECONDS:-300}))
+    node=${2:?node id required}; source_node=${3:?source node required}; expected_memory=${4:?expected memory MiB required}; deadline=$((SECONDS + ${Q124_CONTROL_TIMEOUT_SECONDS:-300}))
+    [[ $expected_memory =~ ^[0-9]+$ ]] || die "invalid expected memory"
     first=1
     while (( SECONDS < deadline )); do
       summary=$(node_get "$node" 2>/dev/null || true)
@@ -73,7 +74,7 @@ case ${1:-} in
           first=0
         fi
         if jq -e '.node.state == "cordoned" and .assigned_cats == 0 and .orphan_cats == 0' <<<"$summary" >/dev/null; then
-          jq -e '.node.capacity.cpus == 1 and .node.capacity.memory_mib == 1024' <<<"$summary" >/dev/null || die "qualification capacity is not 1 CPU / 1024 MiB"
+          jq -e --argjson memory "$expected_memory" '.node.capacity.cpus == 1 and .node.capacity.memory_mib == $memory' <<<"$summary" >/dev/null || die "qualification capacity differs from the staged value"
           jq -e '.heartbeat_age_seconds <= 30' <<<"$summary" >/dev/null || die "qualification heartbeat is stale"
           printf '%s\n' "$summary"
           exit 0

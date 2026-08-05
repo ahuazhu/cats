@@ -21,15 +21,7 @@ prove_identity() {
 
 prove_cache_device() {
   need Q124_CACHE_DEVICE; need Q124_FORMAT_CONFIRMATION; need Q124_INSTANCE_ID
-  [[ $Q124_FORMAT_CONFIRMATION == "FORMAT_EPHEMERAL_CACHE_${Q124_INSTANCE_ID}_${Q124_CACHE_DEVICE}" ]] || die "cache format confirmation mismatch"
-  [[ -b $Q124_CACHE_DEVICE ]] || die "cache device is not a block device"
-  local root parent model
-  root=$(findmnt -no SOURCE /)
-  parent="/dev/$(lsblk -no PKNAME "$root" | head -1)"
-  [[ $Q124_CACHE_DEVICE != "$root" && $Q124_CACHE_DEVICE != "$parent" ]] || die "refusing root disk"
-  [[ -z $(lsblk -nrpo MOUNTPOINT "$Q124_CACHE_DEVICE" | sed '/^$/d') ]] || die "cache device or child is mounted"
-  model=$(lsblk -dno MODEL "$Q124_CACHE_DEVICE")
-  [[ $model == *'Instance Storage'* ]] || die "device is not EC2 NVMe Instance Storage"
+  "${Q124_SOURCE_ROOT:-/opt/cats/q124/source}/deploy/aws/qualification/q124-device-proof.sh" >/dev/null
 }
 
 clean_host() {
@@ -57,7 +49,9 @@ prepare() {
   {
     printf 'CATS_NODE_ID=%q\n' "$Q124_NODE_ID"
     printf 'CATS_NODE_ADVERTISE_URL=http://%s:7301\n' "$Q124_PRIVATE_IP"
-    printf 'CATS_NODE_CPUS=1\nCATS_NODE_MEMORY_MIB=1024\n'
+    # The first registration deliberately cannot fit any real Cat. Provision
+    # proves 404 -> empty Cordoned before set-capacity raises this to 1024.
+    printf 'CATS_NODE_CPUS=1\nCATS_NODE_MEMORY_MIB=1\n'
     printf 'CATS_CONTROL_PLANE_URL=%q\nCATS_GATEWAY_URL=%q\n' "$Q124_CONTROL_URL" "$Q124_CONTROL_URL"
     printf 'CATS_AWS_REGION=%q\nCATS_S3_BUCKET=%q\n' "$Q124_REGION" "$Q124_CHUNKSTORE_BUCKET"
     printf 'CATS_POSTGRES_SECRET_ARN=%q\nCATS_POSTGRES_HOST=%q\nCATS_POSTGRES_PORT=%q\n' "$Q124_DB_SECRET_ARN" "$db_host" "$db_port"
@@ -88,6 +82,17 @@ validate() {
   /opt/cats/bin/render-postgres-url
   psql "$(</run/cats/postgres-url)" -v ON_ERROR_STOP=1 -Atqc 'SELECT 1' | grep -qx 1
   echo validated
+}
+
+set_capacity() {
+  prove_identity
+  systemctl is-active --quiet cats-worker || die "worker is not running at staged 1 MiB capacity"
+  [[ $(grep -c '^CATS_NODE_MEMORY_MIB=' /etc/cats/worker.env) == 1 ]] || die "memory capacity line is not unique"
+  [[ $(grep -c '^CATS_NODE_MEMORY_MIB=1$' /etc/cats/worker.env) == 1 ]] || die "initial 1 MiB capacity line is not unique"
+  sed -i 's/^CATS_NODE_MEMORY_MIB=1$/CATS_NODE_MEMORY_MIB=1024/' /etc/cats/worker.env
+  [[ $(grep -c '^CATS_NODE_MEMORY_MIB=1024$' /etc/cats/worker.env) == 1 ]] || die "capacity transition failed"
+  systemctl restart cats-worker
+  systemctl is-active --quiet cats-worker
 }
 
 snapshot() {
@@ -135,9 +140,10 @@ assert_idle() {
 case ${1:-} in
   prepare) prepare ;;
   start) prove_identity; systemctl enable --now cats-worker; systemctl is-active --quiet cats-worker ;;
+  set-capacity) set_capacity ;;
   validate) validate ;;
   snapshot) snapshot ;;
   assert-idle) assert_idle ;;
   stop) assert_idle; systemctl disable --now cats-worker cats-postgres-url.timer ;;
-  *) die "usage: $0 {prepare|start|validate|snapshot|assert-idle|stop}" ;;
+  *) die "usage: $0 {prepare|start|set-capacity|validate|snapshot|assert-idle|stop}" ;;
 esac

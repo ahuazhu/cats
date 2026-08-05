@@ -39,145 +39,42 @@ resource "aws_iam_role" "github_qualification_worker" {
   tags                 = merge(var.tags, { CatsIssue = "124" })
 }
 
-data "aws_iam_policy_document" "github_qualification_worker" {
+data "aws_ami" "qualification_worker" {
   count = var.github_qualification_worker_enabled ? 1 : 0
 
-  statement {
-    sid       = "ReadEc2AndSsmInventory"
-    effect    = "Allow"
-    actions   = ["ec2:DescribeInstances", "ec2:DescribeInstanceStatus", "ec2:DescribeVolumes", "ssm:DescribeInstanceInformation", "ssm:GetCommandInvocation", "ssm:ListCommandInvocations"]
-    resources = ["*"]
-  }
+  executable_users = ["self"]
 
-  # RunInstances authorizes every resource that participates in the request.
-  # The infrastructure resources are exact; new instance/volume/ENI ARNs are
-  # necessarily wildcard but are coupled to mandatory request tags.
-  statement {
-    sid     = "LaunchWithFixedInfrastructure"
-    effect  = "Allow"
-    actions = ["ec2:RunInstances"]
-    resources = [
-      "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}::image/${var.metal_worker_ami}",
-      "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:subnet/${module.network.private_subnet_ids[0]}",
-      aws_security_group.metal_worker.arn,
-      "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:network-interface/*",
-      "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/*",
-      "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:volume/*",
-    ]
-
-    condition {
-      test     = "StringEquals"
-      variable = "ec2:InstanceType"
-      values   = [var.metal_worker_instance_type]
-    }
-    # RunInstances has no instance-profile resource type. AWS authorizes the
-    # role through iam:PassRole; this EC2 condition separately pins the exact
-    # profile object named in the request.
-    condition {
-      test     = "ArnEquals"
-      variable = "ec2:InstanceProfile"
-      values   = [aws_iam_instance_profile.metal_worker.arn]
-    }
-    condition {
-      test     = "StringEquals"
-      variable = "aws:RequestTag/CatsIssue"
-      values   = ["124"]
-    }
-    condition {
-      test     = "StringEquals"
-      variable = "aws:RequestTag/CatsPurpose"
-      values   = ["temporary-worker-qualification"]
-    }
+  filter {
+    name   = "image-id"
+    values = [var.metal_worker_ami]
   }
+}
 
-  statement {
-    sid       = "TagOnlyDuringLaunch"
-    effect    = "Allow"
-    actions   = ["ec2:CreateTags"]
-    resources = ["arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/*", "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:volume/*"]
-    condition {
-      test     = "StringEquals"
-      variable = "ec2:CreateAction"
-      values   = ["RunInstances"]
-    }
-  }
+module "github_qualification_worker_policy" {
+  count  = var.github_qualification_worker_enabled ? 1 : 0
+  source = "../../modules/qualification-worker-policy"
 
-  statement {
-    sid       = "OperateOnlyQualificationInstances"
-    effect    = "Allow"
-    actions   = ["ec2:ModifyInstanceAttribute", "ec2:TerminateInstances"]
-    resources = ["arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/*"]
-    condition {
-      test     = "StringEquals"
-      variable = "ec2:ResourceTag/CatsIssue"
-      values   = ["124"]
-    }
-    condition {
-      test     = "StringEquals"
-      variable = "ec2:ResourceTag/CatsPurpose"
-      values   = ["temporary-worker-qualification"]
-    }
-  }
-
-  statement {
-    sid       = "PassOnlyWorkerRoleToEc2"
-    effect    = "Allow"
-    actions   = ["iam:PassRole"]
-    resources = [aws_iam_role.metal_worker.arn]
-    condition {
-      test     = "StringEquals"
-      variable = "iam:PassedToService"
-      values   = ["ec2.amazonaws.com"]
-    }
-  }
-
-  statement {
-    sid       = "UseReviewedSsmDocument"
-    effect    = "Allow"
-    actions   = ["ssm:SendCommand"]
-    resources = ["arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}::document/AWS-RunShellScript"]
-  }
-
-  statement {
-    sid       = "CommandOnlyQualificationInstances"
-    effect    = "Allow"
-    actions   = ["ssm:SendCommand"]
-    resources = ["arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/*"]
-    condition {
-      test     = "StringEquals"
-      variable = "ssm:resourceTag/CatsIssue"
-      values   = ["124"]
-    }
-    condition {
-      test     = "StringEquals"
-      variable = "ssm:resourceTag/CatsPurpose"
-      values   = ["temporary-worker-qualification"]
-    }
-  }
-
-  statement {
-    sid       = "QualificationBundleBucket"
-    effect    = "Allow"
-    actions   = ["s3:GetBucketLocation", "s3:ListBucket"]
-    resources = [var.github_qualification_artifact_bucket_arn]
-    condition {
-      test     = "StringLike"
-      variable = "s3:prefix"
-      values   = ["worker/qualification-124/*"]
-    }
-  }
-
-  statement {
-    sid       = "QualificationBundles"
-    effect    = "Allow"
-    actions   = ["s3:GetObject", "s3:PutObject"]
-    resources = ["${var.github_qualification_artifact_bucket_arn}/worker/qualification-124/*"]
-  }
+  partition  = data.aws_partition.current.partition
+  region     = var.aws_region
+  account_id = data.aws_caller_identity.current.account_id
+  ami_id     = var.metal_worker_ami
+  snapshot_arns = toset([
+    for snapshot_id in compact([
+      for mapping in data.aws_ami.qualification_worker[0].block_device_mappings :
+      try(mapping.ebs.snapshot_id, "")
+    ]) : "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}::snapshot/${snapshot_id}"
+  ])
+  subnet_id            = module.network.private_subnet_ids[0]
+  security_group_id    = aws_security_group.metal_worker.id
+  instance_type        = var.metal_worker_instance_type
+  instance_profile_arn = aws_iam_instance_profile.metal_worker.arn
+  worker_role_arn      = aws_iam_role.metal_worker.arn
+  artifact_bucket_arn  = var.github_qualification_artifact_bucket_arn
 }
 
 resource "aws_iam_role_policy" "github_qualification_worker" {
   count  = var.github_qualification_worker_enabled ? 1 : 0
   name   = "issue-124-temporary-worker"
   role   = aws_iam_role.github_qualification_worker[0].id
-  policy = data.aws_iam_policy_document.github_qualification_worker[0].json
+  policy = module.github_qualification_worker_policy[0].json
 }

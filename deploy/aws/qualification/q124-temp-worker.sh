@@ -2,6 +2,7 @@
 # Issue #124 temporary worker lifecycle. Every mutating operation is bound to
 # an exact instance id, node id, source proof and canonical manifest digest.
 set -euo pipefail
+umask 077
 
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 AWS_BIN=${Q124_AWS_BIN:-aws}
@@ -18,8 +19,17 @@ control() { "$CONTROL_BIN" "$@"; }
 remote() { "$REMOTE_BIN" "$@"; }
 sha256_file() { sha256sum "$1" | awk '{print $1}'; }
 
+emit_evidence() {
+  [[ -n ${Q124_EVIDENCE_OUT:-} ]] || return 0
+  local status=$1 count=${2:-0} instance=${3:-}
+  jq -n --arg status "$status" --arg node "${Q124_NODE_ID:-}" --arg run "${run_id:-}" \
+    --arg source_sha "${sha:-}" --arg instance "$instance" --argjson count "$count" \
+    '{schema:1,issue:124,status:$status,node_id:$node,github_run_id:$run,source_sha:$source_sha,discovered_instances:$count,instance_id:(if $instance == "" then null else $instance end)}' \
+    >"$Q124_EVIDENCE_OUT"
+}
+
 validate_fixed_inputs() {
-  for name in Q124_ACCOUNT_ID Q124_REGION Q124_CLUSTER Q124_WORKSPACE_ID Q124_SOURCE_INSTANCE_ID Q124_SOURCE_NODE_ID Q124_CONTROL_URL Q124_AMI_ID Q124_INSTANCE_TYPE Q124_SUBNET_ID Q124_SECURITY_GROUP_ID Q124_INSTANCE_PROFILE_NAME Q124_CACHE_DEVICE; do need "$name"; done
+  for name in Q124_ACCOUNT_ID Q124_REGION Q124_CLUSTER Q124_WORKSPACE_ID Q124_SOURCE_INSTANCE_ID Q124_SOURCE_NODE_ID Q124_CONTROL_URL; do need "$name"; done
   [[ $Q124_ACCOUNT_ID =~ ^[0-9]{12}$ ]] || die "invalid fixed account"
   [[ $Q124_REGION =~ ^[a-z]{2}(-gov)?-[a-z]+-[0-9]$ ]] || die "invalid fixed region"
   [[ $Q124_CLUSTER =~ ^[A-Za-z0-9._-]+$ && $Q124_WORKSPACE_ID =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid cluster/workspace id"
@@ -70,16 +80,16 @@ load_manifest() {
   [[ $actual == "$Q124_EXPECTED_MANIFEST_SHA256" ]] || die "manifest hash mismatch"
   jq -e \
     --arg account "$Q124_ACCOUNT_ID" --arg region "$Q124_REGION" --arg cluster "$Q124_CLUSTER" \
-    --arg workspace "$Q124_WORKSPACE_ID" --arg source_i "$Q124_SOURCE_INSTANCE_ID" --arg source_n "$Q124_SOURCE_NODE_ID" \
-    --arg ami "$Q124_AMI_ID" --arg type "$Q124_INSTANCE_TYPE" --arg subnet "$Q124_SUBNET_ID" --arg sg "$Q124_SECURITY_GROUP_ID" --arg profile "$Q124_INSTANCE_PROFILE_NAME" --arg cache "$Q124_CACHE_DEVICE" '
+    --arg workspace "$Q124_WORKSPACE_ID" --arg source_i "$Q124_SOURCE_INSTANCE_ID" --arg source_n "$Q124_SOURCE_NODE_ID" '
       .schema == 1 and .issue == 124 and
       .fixed.account_id == $account and .fixed.region == $region and .fixed.cluster == $cluster and
       .fixed.workspace_id == $workspace and .source.instance_id == $source_i and .source.node_id == $source_n and
       (.temporary.instance_id | test("^i-[0-9a-f]+$")) and (.temporary.node_id | test("^q124-[A-Za-z0-9.-]+$")) and
       (.temporary.private_ip | test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$")) and
       .launch.method == "run-instances" and .launch.launch_template == null and
-      .launch.ami == $ami and .launch.instance_type == $type and .launch.subnet_id == $subnet and
-      .launch.security_group_id == $sg and .launch.instance_profile == $profile and .launch.cache_device == $cache and
+      (.launch.ami | test("^ami-[0-9a-f]+$")) and (.launch.instance_type | endswith(".metal")) and
+      (.launch.subnet_id | test("^subnet-[0-9A-Za-z]+$")) and (.launch.security_group_id | test("^sg-[0-9A-Za-z]+$")) and
+      (.launch.instance_profile | test("^[A-Za-z0-9+=,.@_-]+$")) and (.launch.cache_device | test("^/dev/[A-Za-z0-9._-]+$")) and
       (.launch.root_volume_id | test("^vol-[0-9A-Za-z]+$")) and
       (.bundle.source_sha | test("^[0-9a-f]{40,64}$")) and
       (.bundle.github_run_id | test("^[0-9]+$")) and
@@ -93,6 +103,12 @@ load_manifest() {
   Q124_PRIVATE_IP=$(jq -er '.temporary.private_ip' "$Q124_MANIFEST")
   Q124_MANIFEST_SOURCE_SHA=$(jq -er '.bundle.source_sha' "$Q124_MANIFEST")
   Q124_MANIFEST_RUN_ID=$(jq -er '.bundle.github_run_id' "$Q124_MANIFEST")
+  Q124_EXPECTED_AMI=$(jq -er '.launch.ami' "$Q124_MANIFEST")
+  Q124_EXPECTED_INSTANCE_TYPE=$(jq -er '.launch.instance_type' "$Q124_MANIFEST")
+  Q124_EXPECTED_SUBNET=$(jq -er '.launch.subnet_id' "$Q124_MANIFEST")
+  Q124_EXPECTED_SECURITY_GROUP=$(jq -er '.launch.security_group_id' "$Q124_MANIFEST")
+  Q124_EXPECTED_INSTANCE_PROFILE=$(jq -er '.launch.instance_profile' "$Q124_MANIFEST")
+  Q124_EXPECTED_CACHE_DEVICE=$(jq -er '.launch.cache_device' "$Q124_MANIFEST")
   created_epoch=$(iso_epoch "$(jq -er '.timestamps.created_at' "$Q124_MANIFEST")") || die "invalid manifest created_at"
   expires_epoch=$(iso_epoch "$(jq -er '.timestamps.expires_at' "$Q124_MANIFEST")") || die "invalid manifest expires_at"
   now_epoch=$(date -u +%s)
@@ -104,17 +120,21 @@ load_manifest() {
     printf 'q124: manifest TTL expired; cleanup transition remains enabled\n' >&2
   fi
   export Q124_INSTANCE_ID Q124_NODE_ID Q124_PRIVATE_IP Q124_MANIFEST_SOURCE_SHA Q124_MANIFEST_RUN_ID
+  export Q124_EXPECTED_AMI Q124_EXPECTED_INSTANCE_TYPE Q124_EXPECTED_SUBNET Q124_EXPECTED_SECURITY_GROUP Q124_EXPECTED_INSTANCE_PROFILE Q124_EXPECTED_CACHE_DEVICE
 }
 
-exact_instance() {
-  local json count expected_sha expected_run
-  json=$(awsq ec2 describe-instances --instance-ids "$Q124_INSTANCE_ID" --output json)
-  count=$(jq '[.Reservations[].Instances[]] | length' <<<"$json")
-  [[ $count == 1 ]] || die "instance lookup was not singular"
+assert_instance_identity() {
+  local json=$1 expected_sha expected_run expected_ami expected_type expected_subnet expected_sg expected_profile
   expected_sha=${Q124_MANIFEST_SOURCE_SHA:-${GITHUB_SHA:-}}
   expected_run=${Q124_MANIFEST_RUN_ID:-${GITHUB_RUN_ID:-}}
+  expected_ami=${Q124_EXPECTED_AMI:-${Q124_AMI_ID:-}}
+  expected_type=${Q124_EXPECTED_INSTANCE_TYPE:-${Q124_INSTANCE_TYPE:-}}
+  expected_subnet=${Q124_EXPECTED_SUBNET:-${Q124_SUBNET_ID:-}}
+  expected_sg=${Q124_EXPECTED_SECURITY_GROUP:-${Q124_SECURITY_GROUP_ID:-}}
+  expected_profile=${Q124_EXPECTED_INSTANCE_PROFILE:-${Q124_INSTANCE_PROFILE_NAME:-}}
+  [[ -n $expected_ami && -n $expected_type && -n $expected_subnet && -n $expected_sg && -n $expected_profile ]] || die "missing immutable launch allowlist"
   jq -e --arg id "$Q124_INSTANCE_ID" --arg node "$Q124_NODE_ID" --arg ip "${Q124_PRIVATE_IP:-}" --arg source_sha "$expected_sha" --arg run "$expected_run" \
-    --arg ami "$Q124_AMI_ID" --arg type "$Q124_INSTANCE_TYPE" --arg subnet "$Q124_SUBNET_ID" --arg sg "$Q124_SECURITY_GROUP_ID" --arg profile "$Q124_INSTANCE_PROFILE_NAME" '
+    --arg ami "$expected_ami" --arg type "$expected_type" --arg subnet "$expected_subnet" --arg sg "$expected_sg" --arg profile "$expected_profile" '
     .Reservations[0].Instances[0] as $i |
     $i.InstanceId == $id and
     $i.ImageId == $ami and $i.InstanceType == $type and $i.SubnetId == $subnet and
@@ -126,7 +146,35 @@ exact_instance() {
       .CatsNodeId == $node and .Name == ("cats-" + $node) and
       ($source_sha == "" or .CatsSourceSha == $source_sha) and ($run == "" or .CatsRunId == $run))
   ' <<<"$json" >/dev/null || die "instance tags/identity mismatch"
+}
+
+exact_instance() {
+  local json count
+  if ! json=$(awsq ec2 describe-instances --instance-ids "$Q124_INSTANCE_ID" --output json); then
+    die "instance lookup failed"
+  fi
+  count=$(jq -er '[.Reservations[].Instances[]] | length' <<<"$json") || die "instance lookup response was invalid"
+  [[ $count == 1 ]] || die "instance lookup was not singular"
+  assert_instance_identity "$json"
   printf '%s\n' "$json"
+}
+
+lookup_return_instance() {
+  # A filter query returns a successful empty result after EC2 purges an old
+  # terminated instance, unlike --instance-ids which may return NotFound.
+  # Keep count and payload in globals so an API/JQ failure cannot be confused
+  # with the only accepted absence state (a successful, valid count of zero).
+  if ! RETURN_INSTANCE_JSON=$(awsq ec2 describe-instances --filters \
+    "Name=instance-id,Values=$Q124_INSTANCE_ID" --output json); then
+    die "return instance lookup failed"
+  fi
+  RETURN_INSTANCE_COUNT=$(jq -er '[.Reservations[].Instances[]] | length' <<<"$RETURN_INSTANCE_JSON") \
+    || die "return instance lookup response was invalid"
+  case $RETURN_INSTANCE_COUNT in
+    0) ;;
+    1) assert_instance_identity "$RETURN_INSTANCE_JSON" ;;
+    *) die "return instance lookup was not singular" ;;
+  esac
 }
 
 no_duplicate_identity() {
@@ -154,6 +202,45 @@ exact_root_volume() {
 confirm() {
   local expected=$1
   [[ ${Q124_CONFIRMATION:-} == "$expected" ]] || die "confirmation mismatch; expected $expected"
+}
+
+current_policy_matches_manifest() {
+  for name in Q124_AMI_ID Q124_INSTANCE_TYPE Q124_SUBNET_ID Q124_SECURITY_GROUP_ID Q124_INSTANCE_PROFILE_NAME Q124_CACHE_DEVICE; do need "$name"; done
+  [[ $Q124_AMI_ID == "$Q124_EXPECTED_AMI" && $Q124_INSTANCE_TYPE == "$Q124_EXPECTED_INSTANCE_TYPE" &&
+     $Q124_SUBNET_ID == "$Q124_EXPECTED_SUBNET" && $Q124_SECURITY_GROUP_ID == "$Q124_EXPECTED_SECURITY_GROUP" &&
+     $Q124_INSTANCE_PROFILE_NAME == "$Q124_EXPECTED_INSTANCE_PROFILE" && $Q124_CACHE_DEVICE == "$Q124_EXPECTED_CACHE_DEVICE" ]] \
+    || die "current launch policy differs from the immutable manifest"
+}
+
+discover_created_instance() {
+  local json count discovered deadline
+  deadline=$((SECONDS + ${Q124_DISCOVERY_TIMEOUT_SECONDS:-60}))
+  while true; do
+    if ! json=$(awsq ec2 describe-instances --filters \
+      "Name=tag:CatsIssue,Values=124" "Name=tag:CatsPurpose,Values=temporary-worker-qualification" \
+      "Name=tag:CatsNodeId,Values=$Q124_NODE_ID" "Name=tag:CatsRunId,Values=$run_id" \
+      "Name=tag:CatsSourceSha,Values=$sha" \
+      'Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down' --output json); then
+      emit_evidence discovery-error 0
+      return 1
+    fi
+    count=$(jq '[.Reservations[].Instances[]] | length' <<<"$json")
+    [[ $count == 1 ]] && break
+    if [[ $count != 0 ]] || (( SECONDS >= deadline )); then
+      emit_evidence "discovery-count-$count-preserved" "$count"
+      printf 'q124: bounded discovery found %s instances; refusing any mutation\n' "$count" >&2
+      return 1
+    fi
+    sleep 5
+  done
+  discovered=$(jq -er '.Reservations[0].Instances[0].InstanceId | select(test("^i-[0-9a-f]+$"))' <<<"$json") || {
+    emit_evidence discovery-invalid-id 1
+    return 1
+  }
+  CREATED_INSTANCE=$discovered
+  Q124_INSTANCE_ID=$discovered
+  export Q124_INSTANCE_ID
+  emit_evidence discovered-singular 1 "$discovered"
 }
 
 cleanup_provision_failure() {
@@ -184,7 +271,11 @@ cleanup_provision_failure() {
       awsq ec2 modify-instance-attribute --instance-id "$CREATED_INSTANCE" --disable-api-termination '{"Value":false}' >/dev/null
       awsq ec2 terminate-instances --instance-ids "$CREATED_INSTANCE" >/dev/null
       awsq ec2 wait instance-terminated --instance-ids "$CREATED_INSTANCE"
+      emit_evidence cleanup-terminated 1 "$CREATED_INSTANCE"
     fi
+  elif (( CLEANUP_ARMED )); then
+    discover_created_instance || exit "$rc"
+    cleanup_provision_failure "$rc"
   fi
   exit "$rc"
 }
@@ -219,6 +310,15 @@ provision() {
       {Key:"CatsPurpose",Value:"temporary-worker-qualification"},{Key:"CatsNodeId",Value:$node}
     ]}]')
   block=$(jq -cn '[{DeviceName:"/dev/sda1",Ebs:{VolumeSize:200,VolumeType:"gp3",Encrypted:true,DeleteOnTermination:true}}]')
+  # Arm before RunInstances. AWS may create the instance even when the CLI
+  # loses the response or this job receives TERM. The trap can recover only a
+  # singular identity matching all five immutable request tags; it never
+  # mutates a tag-filter result directly.
+  CLEANUP_ARMED=1
+  trap cleanup_provision_failure EXIT
+  trap 'cleanup_provision_failure 130' INT
+  trap 'cleanup_provision_failure 143' TERM
+  emit_evidence launch-armed 0
   launched=$(awsq ec2 run-instances --image-id "$Q124_AMI_ID" --instance-type "$Q124_INSTANCE_TYPE" \
     --subnet-id "$Q124_SUBNET_ID" --security-group-ids "$Q124_SECURITY_GROUP_ID" \
     --iam-instance-profile "Name=$Q124_INSTANCE_PROFILE_NAME" --count 1 \
@@ -230,10 +330,7 @@ provision() {
   [[ $CREATED_INSTANCE =~ ^i-[0-9a-f]+$ ]] || die "RunInstances returned no singular instance"
   Q124_INSTANCE_ID=$CREATED_INSTANCE
   export Q124_INSTANCE_ID
-  CLEANUP_ARMED=1
-  trap cleanup_provision_failure EXIT
-  trap 'cleanup_provision_failure 130' INT
-  trap 'cleanup_provision_failure 143' TERM
+  emit_evidence launch-returned-id 1 "$CREATED_INSTANCE"
   awsq ec2 modify-instance-attribute --instance-id "$Q124_INSTANCE_ID" --disable-api-termination '{"Value":true}' >/dev/null
   awsq ec2 wait instance-running --instance-ids "$Q124_INSTANCE_ID"
   awsq ec2 wait instance-status-ok --instance-ids "$Q124_INSTANCE_ID"
@@ -262,7 +359,9 @@ provision() {
   remote "$Q124_INSTANCE_ID" bootstrap
   control absent "$Q124_SOURCE_NODE_ID" "$Q124_NODE_ID"
   remote "$Q124_INSTANCE_ID" start
-  control wait-cordoned "$Q124_NODE_ID" "$Q124_SOURCE_NODE_ID" >/dev/null
+  control wait-cordoned "$Q124_NODE_ID" "$Q124_SOURCE_NODE_ID" 1 >/dev/null
+  remote "$Q124_INSTANCE_ID" set-capacity
+  control wait-cordoned "$Q124_NODE_ID" "$Q124_SOURCE_NODE_ID" 1024 >/dev/null
   remote "$Q124_INSTANCE_ID" validate
 
   now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -289,7 +388,7 @@ provision() {
 
 validate_mode() {
   confirm "VALIDATE_Q124_${Q124_EXPECTED_MANIFEST_SHA256:0:12}"
-  load_manifest; source_positive; exact_instance >/dev/null; no_duplicate_identity
+  load_manifest; current_policy_matches_manifest; source_positive; exact_instance >/dev/null; no_duplicate_identity
   control get "$Q124_NODE_ID" | jq -e '.node.state == "cordoned"' >/dev/null || die "node is not Cordoned"
   remote "$Q124_INSTANCE_ID" validate
 }
@@ -301,7 +400,7 @@ drain_mode() {
   snapshot=$(remote "$Q124_INSTANCE_ID" snapshot)
   jq -e --argjson assigned "$assigned" '([.cats[]] | sort) == ([$assigned[]] | sort)' <<<"$snapshot" >/dev/null || die "control assignment and runtime ledger differ"
   control drain "$Q124_NODE_ID" "$Q124_WORKSPACE_ID"
-  control wait-cordoned "$Q124_NODE_ID" "$Q124_SOURCE_NODE_ID" >/dev/null
+  control wait-cordoned "$Q124_NODE_ID" "$Q124_SOURCE_NODE_ID" 1024 >/dev/null
   Q124_PRIOR_ATTACHMENTS_JSON=$(jq -c '.attachments' <<<"$snapshot")
   export Q124_PRIOR_ATTACHMENTS_JSON
   remote "$Q124_INSTANCE_ID" assert-idle
@@ -327,18 +426,22 @@ return_mode() {
   confirm "RETURN_Q124_${Q124_INSTANCE_ID}_${Q124_NODE_ID}"
   source_positive
   control absent "$Q124_SOURCE_NODE_ID" "$Q124_NODE_ID"
-  instance=$(exact_instance)
-  no_duplicate_identity
   root_volume=$(jq -er '.launch.root_volume_id' "$Q124_MANIFEST")
-  state=$(jq -r '.Reservations[0].Instances[0].State.Name' <<<"$instance")
-  if [[ $state != terminated ]]; then
-    exact_root_volume "$root_volume"
-    # A stopped service plus empty ledger is the last data-safety gate.
-    remote "$Q124_INSTANCE_ID" assert-idle
-    remote "$Q124_INSTANCE_ID" stop
-    awsq ec2 modify-instance-attribute --instance-id "$Q124_INSTANCE_ID" --disable-api-termination '{"Value":false}' >/dev/null
-    awsq ec2 terminate-instances --instance-ids "$Q124_INSTANCE_ID" >/dev/null
-    awsq ec2 wait instance-terminated --instance-ids "$Q124_INSTANCE_ID"
+  lookup_return_instance
+  # Even after the exact old id is purged, fail if another active instance has
+  # appeared with this qualification node identity.
+  no_duplicate_identity
+  if [[ $RETURN_INSTANCE_COUNT == 1 ]]; then
+    state=$(jq -er '.Reservations[0].Instances[0].State.Name' <<<"$RETURN_INSTANCE_JSON")
+    if [[ $state != terminated ]]; then
+      exact_root_volume "$root_volume"
+      # A stopped service plus empty ledger is the last data-safety gate.
+      remote "$Q124_INSTANCE_ID" assert-idle
+      remote "$Q124_INSTANCE_ID" stop
+      awsq ec2 modify-instance-attribute --instance-id "$Q124_INSTANCE_ID" --disable-api-termination '{"Value":false}' >/dev/null
+      awsq ec2 terminate-instances --instance-ids "$Q124_INSTANCE_ID" >/dev/null
+      awsq ec2 wait instance-terminated --instance-ids "$Q124_INSTANCE_ID"
+    fi
   fi
   # Calibrate the same SSM inventory probe against the source before accepting absence.
   awsq ssm describe-instance-information --filters "Key=InstanceIds,Values=$Q124_SOURCE_INSTANCE_ID" --output json | jq -e '.InstanceInformationList | length == 1 and .[0].PingStatus == "Online"' >/dev/null || die "source SSM calibrator failed"
