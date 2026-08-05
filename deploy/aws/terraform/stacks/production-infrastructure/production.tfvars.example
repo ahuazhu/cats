@@ -22,6 +22,8 @@ metal_worker_instance_role_name = "REPLACE_WITH_INSTANCE_ROLE_NAME"
 
 # Rolling release across a serving fleet: drain one worker, apply with only it
 # listed here, undrain, then move to the next. Omit to deploy every worker.
+# Never subset while rotating worker_runtime_secret_data: an omitted worker
+# keeps the old token and drops off the control plane when the new one lands.
 # metal_worker_deploy_instances = ["metal-1"]
 
 # Supply worker_runtime_secret_data through TF_VAR_worker_runtime_secret_data

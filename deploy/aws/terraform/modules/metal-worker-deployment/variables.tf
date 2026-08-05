@@ -64,6 +64,12 @@ variable "deploy_instances" {
     goes one worker at a time: drain one, list only it here, apply, undrain,
     repeat. A worker left out keeps running its installed version -- its
     association is removed, not its software.
+
+    Never subset an apply that changes worker_runtime_secret_data: this
+    association is the only path that writes the shared token onto a host and
+    the control plane accepts exactly one, so an omitted worker keeps the old
+    token and is rejected the moment the control plane picks up the new one.
+    Credential rotation deploys every worker in one drained window.
   EOT
   type        = set(string)
   default     = null

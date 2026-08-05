@@ -441,6 +441,15 @@ resource "aws_ssm_association" "worker_deploy" {
 
   wait_for_success_timeout_seconds = 900
 
+  lifecycle {
+    # SSM caps AssociationName at 128 characters. The worker-key validation
+    # bounds only its own part; name_prefix and environment are unrestricted.
+    precondition {
+      condition     = length("${local.resource_name}-${each.key}-${substr(var.worker_bundle_sha256, 0, 12)}") <= 128
+      error_message = "The association name (name_prefix-environment-worker-<name>-<sha12>) exceeds SSM's 128-character limit; shorten the worker name or name_prefix."
+    }
+  }
+
   depends_on = [
     aws_iam_role_policy_attachment.ssm_core,
     aws_iam_role_policy_attachment.artifact_reader,
