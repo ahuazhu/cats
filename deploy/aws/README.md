@@ -125,7 +125,11 @@ second replica stay Pending until EKS Auto Mode supplies another eligible node;
 the scheduler cannot silently co-locate both replicas on one node. Reconciler,
 billing enforcer and usage projector roles elect independently through
 dedicated PostgreSQL session advisory locks; losing that session cancels the
-role before failover.
+role before failover. A terminating control-plane Pod stays alive in `preStop`
+for 15 seconds while Kubernetes removes it from EndpointSlices and the EKS Auto
+Mode ALB drains the target; SIGTERM then stops its singleton roles and HTTP
+server within the 30-second termination grace period. This ordering prevents
+the edge from routing to an already-exited process during target propagation.
 
 The database carries a schema version. `cats-controld` migrates only stamped
 versions inside the build's supported range and fails closed on incompatible
