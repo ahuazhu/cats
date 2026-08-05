@@ -298,6 +298,12 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
         "diagnostic, pre-disruption and post-disruption probes must avoid attach replay"
     );
     assert_eq!(
+        workflow.matches("SELECT host(a.client_addr)").count(),
+        2,
+        "both owner probes must remove the PostgreSQL inet mask before matching a Pod IP"
+    );
+    assert!(!workflow.contains("SELECT a.client_addr::text FROM pg_locks"));
+    assert_eq!(
         workflow.matches("if: inputs.mode == 'disrupt'").count(),
         2,
         "both destructive and post-disruption steps must require disrupt mode"
