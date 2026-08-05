@@ -330,6 +330,11 @@ flowchart LR
 
 控制面使用声明式状态机，不把“SSH 到某台 Host 执行脚本”当作架构。所有 Node 操作都是带 generation、deadline 和幂等键的结构化 Job。
 
+当前生产 V1 的 API 层运行至少两个 `cats-controld` 副本，并以 PostgreSQL 事务作为
+跨副本资源与幂等权威；reconciler、billing enforcer 和 usage projector 通过各自的
+PostgreSQL session advisory lock 选主。单 Pod 或单 Kubernetes Node 故障由 Service
+切流，旧主的数据库 session 消失后备用副本接管单例循环（ADR-0032）。
+
 Edge
 
 ### API Gateway

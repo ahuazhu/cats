@@ -1,11 +1,30 @@
 use super::*;
 use cats_api::guest::GuestWorkLease;
 use cats_api::requests::NodeWorkStatusRequest;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+struct ActiveSingletonGuard(Arc<AtomicUsize>);
+
+impl Drop for ActiveSingletonGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// Fresh store on an isolated schema of the disposable test server.
 fn test_store() -> Store {
     Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap()
+}
+
+/// Two process-shaped stores sharing one schema. Unlike cloning an `Arc<Store>`,
+/// this does not serialize calls through the same in-process connection mutex.
+fn test_store_pair() -> (Store, Store) {
+    let url = crate::testsupport::isolated_control_store_url();
+    (
+        Store::connect(&url, None).unwrap(),
+        Store::connect(&url, None).unwrap(),
+    )
 }
 
 /// Seed one configured Account and return its default Workspace.
@@ -207,6 +226,31 @@ fn reconnect_rereads_a_dsn_file() {
 }
 
 #[test]
+fn a_dropped_postgres_session_reconnects_without_losing_committed_state() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let store = Store::connect(&url, None).unwrap();
+    let workspace = bootstrap_workspace(&store, "acme");
+    let (cat, _, _) = create_test_cat(&store, &workspace, "survivor").unwrap();
+    let backend_pid: i32 = store
+        .with(|client| client.query_one("SELECT pg_backend_pid()", &[])?.try_get(0))
+        .unwrap();
+
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    assert!(admin
+        .query_one("SELECT pg_terminate_backend($1)", &[&backend_pid])
+        .unwrap()
+        .try_get::<_, bool>(0)
+        .unwrap());
+
+    // The request whose connection was severed may fail. The next request
+    // must open a fresh session and observe every earlier commit.
+    let _ = store.list_cats(&workspace.id);
+    let recovered = store.list_cats(&workspace.id).unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].id, cat.id);
+}
+
+#[test]
 fn dsn_file_errors_do_not_expose_credential_contents() {
     let directory = tempfile::tempdir().unwrap();
     let missing = directory.path().join("missing-postgres-url");
@@ -307,6 +351,217 @@ fn an_idempotency_record_outlives_the_cat_it_created() {
 
     store.idempotency_forget("k1", route).unwrap();
     assert!(store.idempotency_lookup("k1", route).unwrap().is_none());
+}
+
+#[test]
+fn two_store_instances_linearize_create_and_action_idempotency() {
+    let (first, second) = test_store_pair();
+    let workspace = bootstrap_workspace(&first, "replicas");
+    let create_gate = std::sync::Barrier::new(2);
+    let create = |store: &Store| {
+        create_gate.wait();
+        store
+            .create_cat_idempotent(
+                &workspace,
+                "one",
+                "test",
+                1,
+                256,
+                1 << 20,
+                true,
+                None,
+                None,
+                DiskDurability::Strict,
+                "create-key",
+                "POST /cats replicas/one",
+            )
+            .unwrap()
+    };
+    let (left, right) = std::thread::scope(|scope| {
+        let left = scope.spawn(|| create(&first));
+        let right = scope.spawn(|| create(&second));
+        (left.join().unwrap(), right.join().unwrap())
+    });
+    assert_eq!(left.0.id, right.0.id);
+    assert_eq!(left.2.id, right.2.id);
+    assert_eq!(first.list_cats(&workspace.id).unwrap().len(), 1);
+
+    let action_gate = std::sync::Barrier::new(2);
+    let act = |store: &Store| {
+        action_gate.wait();
+        store
+            .set_desired_idempotent(
+                &left.0.id,
+                DesiredState::Cold,
+                None,
+                "cat.stop",
+                "stop-key",
+                "POST /cats/one/actions/stop",
+            )
+            .unwrap()
+    };
+    let (left_action, right_action) = std::thread::scope(|scope| {
+        let left_action = scope.spawn(|| act(&first));
+        let right_action = scope.spawn(|| act(&second));
+        (left_action.join().unwrap(), right_action.join().unwrap())
+    });
+    assert_eq!(left_action.id, right_action.id);
+    assert_eq!(first.must_get_cat_by_id(&left.0.id).unwrap().generation, 2);
+}
+
+#[test]
+fn oci_owner_lock_distinguishes_a_live_replica_from_a_dead_one() {
+    let (first, second) = test_store_pair();
+    let workspace = bootstrap_workspace(&first, "replicas");
+    let (cat, _, _) = create_test_cat(&first, &workspace, "oci").unwrap();
+    let digest = format!("sha256:{}", "a".repeat(64));
+
+    let (record_id, operation_id, lease) =
+        match first.claim_oci_deployment(&cat, "server", &digest).unwrap() {
+            OciDeploymentClaim::Claimed {
+                record_id,
+                operation,
+                lease,
+            } => (record_id, operation.id, lease),
+            _ => panic!("the first replica must own the new deployment"),
+        };
+    assert_eq!(
+        second.fail_interrupted_oci_deployments().unwrap(),
+        0,
+        "a live task's session lock must protect it from another replica's reaper"
+    );
+    match second
+        .claim_oci_deployment(&cat, "server", &digest)
+        .unwrap()
+    {
+        OciDeploymentClaim::AlreadyRunning { operation, .. } => {
+            assert_eq!(operation.id, operation_id)
+        }
+        _ => panic!("the second replica must join the live deployment"),
+    }
+
+    drop(lease);
+    assert_eq!(second.fail_interrupted_oci_deployments().unwrap(), 1);
+    assert_eq!(
+        second.get_operation(&operation_id).unwrap().phase,
+        OperationPhase::Failed
+    );
+
+    let replacement_operation = match second
+        .claim_oci_deployment(&cat, "server", &digest)
+        .unwrap()
+    {
+        OciDeploymentClaim::Claimed { operation, .. } => operation,
+        _ => panic!("the identity must be retryable after its owner disappears"),
+    };
+    assert_ne!(replacement_operation.id, operation_id);
+    let stale_result = OciDeployment {
+        app: "server".into(),
+        image_digest: digest.clone(),
+        manifest_digest: digest,
+        service: "cats-oci-server.service".into(),
+        active: true,
+    };
+    assert!(!first
+        .succeed_oci_deployment(&record_id, &operation_id, &stale_result)
+        .unwrap());
+}
+
+#[test]
+fn singleton_roles_elect_independently_and_release_on_session_drop() {
+    let (first, second) = test_store_pair();
+    let mut first_reconciler = first.singleton_session(SingletonRole::Reconciler).unwrap();
+    let mut second_reconciler = second.singleton_session(SingletonRole::Reconciler).unwrap();
+    let mut second_billing = second
+        .singleton_session(SingletonRole::BillingEnforcer)
+        .unwrap();
+
+    assert!(first_reconciler.try_acquire().unwrap());
+    assert!(!second_reconciler.try_acquire().unwrap());
+    assert!(
+        second_billing.try_acquire().unwrap(),
+        "one role's leader must not make every other role a hot standby"
+    );
+
+    drop(first_reconciler);
+    assert!(
+        second_reconciler.try_acquire().unwrap(),
+        "PostgreSQL must release leadership with the owner session"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn singleton_task_cancellation_aborts_old_leader_before_failover() {
+    let (first, second) = test_store_pair();
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let starts = Arc::new(AtomicUsize::new(0));
+
+    let first_task =
+        crate::server::spawn_singleton_task(Arc::new(first), SingletonRole::Reconciler, {
+            let active = active.clone();
+            let max_active = max_active.clone();
+            let starts = starts.clone();
+            move || {
+                let active = active.clone();
+                let max_active = max_active.clone();
+                let starts = starts.clone();
+                async move {
+                    starts.fetch_add(1, Ordering::SeqCst);
+                    let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(now_active, Ordering::SeqCst);
+                    let _active = ActiveSingletonGuard(active);
+                    std::future::pending::<()>().await;
+                }
+            }
+        });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while starts.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the first replica should acquire leadership");
+
+    let second_task =
+        crate::server::spawn_singleton_task(Arc::new(second), SingletonRole::Reconciler, {
+            let active = active.clone();
+            let max_active = max_active.clone();
+            let starts = starts.clone();
+            move || {
+                let active = active.clone();
+                let max_active = max_active.clone();
+                let starts = starts.clone();
+                async move {
+                    starts.fetch_add(1, Ordering::SeqCst);
+                    let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(now_active, Ordering::SeqCst);
+                    let _active = ActiveSingletonGuard(active);
+                    std::future::pending::<()>().await;
+                }
+            }
+        });
+    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    assert_eq!(starts.load(Ordering::SeqCst), 1, "the standby must not run");
+
+    first_task.abort();
+    let _ = first_task.await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while starts.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the standby should take over after leader cancellation");
+
+    assert_eq!(active.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        max_active.load(Ordering::SeqCst),
+        1,
+        "the old role must stop before the replacement starts"
+    );
+    second_task.abort();
+    let _ = second_task.await;
 }
 
 #[test]
@@ -625,15 +880,16 @@ fn concurrent_placement_cannot_overcommit_a_node() {
     // separate write, which only holds up while one Cat is placed at a time.
     // The reconcile loop now runs flows concurrently, so this is the property
     // that keeps it honest.
-    let store = Arc::new(test_store());
-    let workspace = bootstrap_workspace(&store, "alpha");
+    let (first, second) = test_store_pair();
+    let stores = [Arc::new(first), Arc::new(second)];
+    let workspace = bootstrap_workspace(&stores[0], "alpha");
     // Room for exactly 4 of these Cats: 8 cpus / 8192 MiB, 2 cpus each.
-    store
+    stores[0]
         .register_node("node-1", "http://node", "http://gateway", 8, 8192)
         .unwrap();
     let mut ids = Vec::new();
     for n in 0..10 {
-        let (cat, _, _) = store
+        let (cat, _, _) = stores[0]
             .create_cat(
                 &workspace,
                 &format!("web{n}"),
@@ -657,8 +913,9 @@ fn concurrent_placement_cannot_overcommit_a_node() {
     let placed: Vec<Option<Node>> = std::thread::scope(|scope| {
         let handles: Vec<_> = ids
             .iter()
-            .map(|id| {
-                let store = store.clone();
+            .enumerate()
+            .map(|(index, id)| {
+                let store = stores[index % stores.len()].clone();
                 let gate = &gate;
                 scope.spawn(move || {
                     gate.wait();
@@ -672,7 +929,7 @@ fn concurrent_placement_cannot_overcommit_a_node() {
     // 8 cpus / 2 per Cat = 4, and 8192 MiB / 1024 = 8, so cpus binds first.
     let winners = placed.iter().filter(|p| p.is_some()).count();
     assert_eq!(winners, 4, "node was overcommitted or underfilled");
-    let on_node = store.cats_on_node("node-1").unwrap();
+    let on_node = stores[0].cats_on_node("node-1").unwrap();
     assert_eq!(on_node.len(), 4);
     assert_eq!(on_node.iter().map(|c| c.spec.cpus).sum::<u32>(), 8);
     assert!(on_node.iter().map(|c| c.spec.memory_mib).sum::<u64>() <= 8192);

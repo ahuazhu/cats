@@ -19,11 +19,92 @@ impl Store {
         expires_at_unix: Option<i64>,
         durability: DiskDurability,
     ) -> Result<(Cat, Vec<Disk>, Operation)> {
+        self.create_cat_inner(
+            workspace,
+            name,
+            image,
+            cpus,
+            memory_mib,
+            root_disk_size,
+            auto_suspend,
+            extra_disk,
+            expires_at_unix,
+            durability,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_cat_idempotent(
+        &self,
+        workspace: &WorkspaceRecord,
+        name: &str,
+        image: &str,
+        cpus: u32,
+        memory_mib: u64,
+        root_disk_size: u64,
+        auto_suspend: bool,
+        extra_disk: Option<(&str, u64, &str)>,
+        expires_at_unix: Option<i64>,
+        durability: DiskDurability,
+        key: &str,
+        route: &str,
+    ) -> Result<(Cat, Vec<Disk>, Operation)> {
+        self.create_cat_inner(
+            workspace,
+            name,
+            image,
+            cpus,
+            memory_mib,
+            root_disk_size,
+            auto_suspend,
+            extra_disk,
+            expires_at_unix,
+            durability,
+            Some((key, route)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_cat_inner(
+        &self,
+        workspace: &WorkspaceRecord,
+        name: &str,
+        image: &str,
+        cpus: u32,
+        memory_mib: u64,
+        root_disk_size: u64,
+        auto_suspend: bool,
+        extra_disk: Option<(&str, u64, &str)>,
+        expires_at_unix: Option<i64>,
+        durability: DiskDurability,
+        idempotency: Option<(&str, &str)>,
+    ) -> Result<(Cat, Vec<Disk>, Operation)> {
         // The lock covers exactly the transaction; the follow-up reads below
         // re-enter the store and would deadlock inside it.
         let (cat_id, op) = self.enter(|client| -> Result<(String, Operation)> {
             let client = client?;
             let mut tx = client.transaction().map_err(internal)?;
+            if let Some((key, route)) = idempotency {
+                if let Some(operation) = Self::idempotency_operation_in(&mut tx, key, route)? {
+                    let cat_exists = tx
+                        .query_opt("SELECT 1 FROM cats WHERE id=$1", &[&operation.resource_id])
+                        .map_err(internal)?
+                        .is_some();
+                    if cat_exists {
+                        let cat_id = operation.resource_id.clone();
+                        tx.commit().map_err(internal)?;
+                        return Ok((cat_id, operation));
+                    }
+                    // A create key outlives the Cat it created. Once that Cat
+                    // is gone, the key is stale and may create the name again.
+                    tx.execute(
+                        "DELETE FROM idempotency WHERE key=$1 AND route=$2",
+                        &[&key, &route],
+                    )
+                    .map_err(internal)?;
+                }
+            }
             let now = now_unix();
             let cat_id = new_id(ids::CAT_PREFIX);
             let root_disk_id = new_id(ids::DISK_PREFIX);
@@ -168,6 +249,9 @@ impl Store {
             })?;
 
             let op = Self::insert_operation(&mut tx, &workspace.id, "cat.create", &cat_id, 1)?;
+            if let Some((key, route)) = idempotency {
+                Self::store_idempotency_in(&mut tx, key, route, &op.id)?;
+            }
             tx.commit().map_err(internal)?;
             Ok((cat_id, op))
         })?;
@@ -235,12 +319,47 @@ impl Store {
         expected_generation: Option<i64>,
         op_kind: &str,
     ) -> Result<Operation> {
+        self.set_desired_inner(cat_id, desired, expected_generation, op_kind, None)
+    }
+
+    pub fn set_desired_idempotent(
+        &self,
+        cat_id: &str,
+        desired: DesiredState,
+        expected_generation: Option<i64>,
+        op_kind: &str,
+        key: &str,
+        route: &str,
+    ) -> Result<Operation> {
+        self.set_desired_inner(
+            cat_id,
+            desired,
+            expected_generation,
+            op_kind,
+            Some((key, route)),
+        )
+    }
+
+    fn set_desired_inner(
+        &self,
+        cat_id: &str,
+        desired: DesiredState,
+        expected_generation: Option<i64>,
+        op_kind: &str,
+        idempotency: Option<(&str, &str)>,
+    ) -> Result<Operation> {
         self.enter(|client| {
             let client = client?;
             let mut tx = client.transaction().map_err(internal)?;
+            if let Some((key, route)) = idempotency {
+                if let Some(operation) = Self::idempotency_operation_in(&mut tx, key, route)? {
+                    tx.commit().map_err(internal)?;
+                    return Ok(operation);
+                }
+            }
             let current: Option<(i64, String)> = tx
                 .query_opt(
-                    "SELECT generation, workspace_id FROM cats WHERE id=$1",
+                    "SELECT generation, workspace_id FROM cats WHERE id=$1 FOR UPDATE",
                     &[&cat_id],
                 )
                 .map_err(internal)?
@@ -268,6 +387,9 @@ impl Store {
             )
             .map_err(internal)?;
             let op = Self::insert_operation(&mut tx, &workspace_id, op_kind, cat_id, new_gen)?;
+            if let Some((key, route)) = idempotency {
+                Self::store_idempotency_in(&mut tx, key, route, &op.id)?;
+            }
             tx.commit().map_err(internal)?;
             Ok(op)
         })
@@ -282,7 +404,7 @@ impl Store {
             let mut tx = client.transaction().map_err(internal)?;
             let current: Option<(i64, String, String)> = tx
                 .query_opt(
-                    "SELECT generation, workspace_id, desired_state FROM cats WHERE id=$1",
+                    "SELECT generation, workspace_id, desired_state FROM cats WHERE id=$1 FOR UPDATE",
                     &[&cat_id],
                 )
                 .map_err(internal)?
@@ -372,12 +494,26 @@ impl Store {
         node_lease_timeout_ms: i64,
         now_ms: i64,
     ) -> Result<Option<Node>> {
-        self.with(|client| {
-            let nodes = client
-                .query("SELECT * FROM nodes ORDER BY id", &[])?
+        self.enter(|client| {
+            let client = client?;
+            let mut tx = client.transaction().map_err(internal)?;
+            // Capacity is a fleet-wide invariant, not a per-row one. The
+            // transaction lock serializes the read-sum-claim sequence across
+            // Store instances without blocking node heartbeat row updates.
+            tx.query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended(
+                    current_schema() || ':placement', 0::BIGINT
+                 ))",
+                &[],
+            )
+            .map_err(internal)?;
+            let nodes = tx
+                .query("SELECT * FROM nodes ORDER BY id", &[])
+                .map_err(internal)?
                 .iter()
                 .map(row_to_node)
-                .collect::<std::result::Result<Vec<Node>, postgres::Error>>()?;
+                .collect::<std::result::Result<Vec<Node>, postgres::Error>>()
+                .map_err(internal)?;
             let mut best: Option<(u64, Node)> = None;
             for node in nodes {
                 if node.state != NodeState::Ready {
@@ -388,14 +524,16 @@ impl Store {
                 }
                 // This Cat's own row is excluded so re-placing it does not count
                 // its resources against itself.
-                let usage = client.query_one(
+                let usage = tx
+                    .query_one(
                     "SELECT COALESCE(SUM(cpus), 0)::BIGINT, COALESCE(SUM(memory_mib), 0)::BIGINT
                        FROM cats WHERE node_id = $1 AND id <> $2",
                     &[&node.id, &cat_id],
-                )?;
+                )
+                    .map_err(internal)?;
                 let (used_cpus, used_mem): (u32, u64) = (
-                    usage.try_get::<_, i64>(0)? as u32,
-                    usage.try_get::<_, i64>(1)? as u64,
+                    usage.try_get::<_, i64>(0).map_err(internal)? as u32,
+                    usage.try_get::<_, i64>(1).map_err(internal)? as u64,
                 );
                 if used_cpus + cpus <= node.capacity.cpus
                     && used_mem + memory_mib <= node.capacity.memory_mib
@@ -405,12 +543,19 @@ impl Store {
                 }
             }
             let Some((_, node)) = best else {
+                tx.commit().map_err(internal)?;
                 return Ok(None);
             };
-            client.execute(
-                "UPDATE cats SET node_id = $2 WHERE id = $1",
-                &[&cat_id, &node.id],
-            )?;
+            let changed = tx
+                .execute(
+                    "UPDATE cats SET node_id = $2 WHERE id = $1",
+                    &[&cat_id, &node.id],
+                )
+                .map_err(internal)?;
+            if changed == 0 {
+                return Err(ApiError::not_found(format!("cat {cat_id}")));
+            }
+            tx.commit().map_err(internal)?;
             Ok(Some(node))
         })
     }

@@ -145,9 +145,10 @@ The projector batches one shard for at most 50 seconds, 4 MiB or 1000 records,
 writes newline-delimited JSON to S3, applies the idempotent PostgreSQL
 projection and advances the DynamoDB checkpoint last. S3 Object Lock is the
 long-term raw evidence; PostgreSQL remains a rebuildable query projection.
-The current application is one `Recreate` replica, so the table stores
-checkpoints only. Add a conditional shard-lease protocol before running more
-than one projector replica.
+The application runs multiple API replicas, but a PostgreSQL session advisory
+lock elects exactly one usage projector. The table stores checkpoints only.
+Add a conditional shard-lease protocol before running multiple projector
+workers concurrently.
 
 ## Stripe payments
 
@@ -213,8 +214,8 @@ Set the usage stream, archive bucket and checkpoint table inputs from the
 infrastructure stack outputs. All container images must include an immutable
 `@sha256:...` digest. Changes to
 the runtime Secret or RDS CA alter Pod template checksums and therefore trigger
-a rollout. `cats-controld` remains one replica with `Recreate`, because its
-control-resource SQLite file is on an RWO EBS PVC.
+a zero-unavailable rolling rollout. `cats-controld` runs at least two replicas
+on distinct nodes; singleton loops elect independently through PostgreSQL.
 
 ### Automatic main deployment
 
@@ -253,8 +254,8 @@ Deployment update that removes its mount, the production workflow handles this
 one legacy edge explicitly: after saving the complete reviewed plan, it checks
 for `cats-control-data`. If the claim is still mounted only by
 `cats-controld`, the workflow verifies that the saved plan restores the
-PostgreSQL-era Deployment to one replica, scales the old Deployment to zero,
-waits until no Pod consumes the claim, and only then applies the saved plan. It
+PostgreSQL-era Deployment to at least two replicas, scales the old Deployment
+to zero, waits until no Pod consumes the claim, and only then applies the saved plan. It
 never removes the PVC protection finalizer or force-deletes the volume. Once a
 state has crossed the cutover and the PVC is absent, the step is a no-op.
 

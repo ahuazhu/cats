@@ -92,15 +92,22 @@ impl AwsUsageStreamStore {
     }
 
     pub fn spawn_projector(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
-        let store = self.clone();
-        tokio::spawn(async move {
-            loop {
-                if let Err(error) = store.project_all_shards().await {
-                    tracing::error!(%error, "usage stream projector supervisor failed");
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::spawn(self.clone().run_projector())
+    }
+
+    /// Project every shard until the caller cancels this future.
+    ///
+    /// Production runs it behind the control plane's PostgreSQL leadership
+    /// fence. Keeping the loop as a future (rather than an untracked spawned
+    /// task) lets leadership loss cancel every shard consumer before a standby
+    /// takes over.
+    pub async fn run_projector(self: Arc<Self>) {
+        loop {
+            if let Err(error) = self.project_all_shards().await {
+                tracing::error!(%error, "usage stream projector supervisor failed");
             }
-        })
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
     }
 
     async fn project_all_shards(self: &Arc<Self>) -> Result<()> {
@@ -111,17 +118,17 @@ impl AwsUsageStreamStore {
             .send()
             .await
             .context("list usage Kinesis shards")?;
-        let mut tasks = Vec::new();
+        let mut tasks = tokio::task::JoinSet::new();
         for shard in output.shards() {
             let shard_id = shard.shard_id().to_string();
             let store = self.clone();
-            tasks.push(tokio::spawn(async move {
+            tasks.spawn(async move {
                 store.project_shard_forever(shard_id).await;
-            }));
+            });
         }
         anyhow::ensure!(!tasks.is_empty(), "usage Kinesis stream has no shards");
-        for task in tasks {
-            task.await.context("usage shard projector task panicked")?;
+        while let Some(task) = tasks.join_next().await {
+            task.context("usage shard projector task panicked")?;
         }
         Ok(())
     }

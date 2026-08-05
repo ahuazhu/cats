@@ -222,9 +222,10 @@ ledger、支付提供商不是真相源、欠费保留策略等原则继续有�
 - storage/egress Rate Card；
 - invoice close 与迟到 adjustment；Stripe 预付费 collection 已由 ADR-0013
   实现，但仍需完成 shadow reconciliation 和财务上线验收；
-- projector 多副本 shard lease。当前 `cats-controld` 是 `Recreate` 的单副本，
-  DynamoDB 只保存每个 shard 的 durable checkpoint；扩成多副本前必须增加条件租约，
-  不能让多个 projector 无协调地消费同一 shard。
+- projector 的 shard 级并行租约。ADR-0032 先用 PostgreSQL session advisory lock
+  在全部 `cats-controld` 副本中选出一个 projector leader；DynamoDB 仍只保存每个
+  shard 的 durable checkpoint。若未来要让多个 projector 同时分摊 shards，仍须增加
+  条件 shard lease，不能让多个 projector 无协调地消费同一 shard。
 
 当前只提供 `provisional` 账单分析，正式扣费保持关闭。开启生产收费前仍必须完成
 stream/Node 故障注入、S3 全量 replay reconciliation、连续 shadow billing、invoice

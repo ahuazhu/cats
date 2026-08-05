@@ -14,6 +14,7 @@ mod accounts;
 mod cats;
 mod disks;
 mod endpoints;
+mod leadership;
 mod nodes;
 mod oci;
 mod operations;
@@ -24,6 +25,7 @@ mod work;
 #[cfg(test)]
 mod tests;
 
+pub use leadership::{OciDeploymentLease, SingletonRole};
 pub use oci::{OciDeploymentClaim, OCI_DEPLOY_OPERATION_KIND};
 pub use rows::{parse_desired, parse_observed, parse_wake};
 pub use work::WorkLeaseGuard;

@@ -19,6 +19,17 @@ variable "control_plane_image" {
   }
 }
 
+variable "control_plane_replicas" {
+  description = "Number of active-active control-plane API replicas; singleton loops elect independently through PostgreSQL."
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.control_plane_replicas >= 2 && floor(var.control_plane_replicas) == var.control_plane_replicas
+    error_message = "control_plane_replicas must be an integer of at least 2."
+  }
+}
+
 variable "gateway_image" {
   description = "Immutable cats-gatewayd container image, including its sha256 digest."
   type        = string

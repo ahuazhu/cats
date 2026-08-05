@@ -1,6 +1,65 @@
 use super::*;
 
 impl Store {
+    pub(super) fn idempotency_operation_in(
+        tx: &mut postgres::Transaction<'_>,
+        key: &str,
+        route: &str,
+    ) -> Result<Option<Operation>> {
+        // The row may not exist yet, so a row lock cannot serialize the first
+        // two requests. A transaction advisory lock supplies that absent-row
+        // linearization point; the record and resource mutation then commit
+        // together below it.
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended(
+                current_schema() || ':idempotency:' || $1 || ':' || $2,
+                0::BIGINT
+             ))",
+            &[&key, &route],
+        )
+        .map_err(internal)?;
+        let operation_id: Option<String> = tx
+            .query_opt(
+                "SELECT operation_id FROM idempotency WHERE key=$1 AND route=$2",
+                &[&key, &route],
+            )
+            .map_err(internal)?
+            .map(|row| row.try_get(0))
+            .transpose()
+            .map_err(internal)?;
+        let Some(operation_id) = operation_id else {
+            return Ok(None);
+        };
+        let operation = tx
+            .query_opt("SELECT * FROM operations WHERE id=$1", &[&operation_id])
+            .map_err(internal)?
+            .map(|row| row_to_operation(&row))
+            .transpose()
+            .map_err(internal)?;
+        if operation.is_none() {
+            tx.execute(
+                "DELETE FROM idempotency WHERE key=$1 AND route=$2",
+                &[&key, &route],
+            )
+            .map_err(internal)?;
+        }
+        Ok(operation)
+    }
+
+    pub(super) fn store_idempotency_in(
+        tx: &mut postgres::Transaction<'_>,
+        key: &str,
+        route: &str,
+        operation_id: &str,
+    ) -> Result<()> {
+        tx.execute(
+            "INSERT INTO idempotency (key, route, operation_id) VALUES ($1,$2,$3)",
+            &[&key, &route, &operation_id],
+        )
+        .map_err(internal)
+        .map(|_| ())
+    }
+
     pub(super) fn insert_operation(
         tx: &mut postgres::Transaction<'_>,
         workspace_id: &str,

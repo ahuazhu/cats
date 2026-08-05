@@ -100,6 +100,43 @@ fn production_database_clients_read_the_rotating_secret_files() {
 }
 
 #[test]
+fn production_control_plane_survives_one_pod_or_node_disruption() {
+    let terraform = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    let variables =
+        read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/variables.tf");
+    let deployment = terraform
+        .split("resource \"kubernetes_deployment_v1\" \"control_plane\"")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("resource \"kubernetes_service_v1\" \"control_plane\"")
+                .next()
+        })
+        .expect("control-plane Deployment block");
+
+    for expected in [
+        "replicas = var.control_plane_replicas",
+        "type = \"RollingUpdate\"",
+        "max_unavailable = \"0\"",
+        "topology_key       = \"kubernetes.io/hostname\"",
+        "when_unsatisfiable = \"DoNotSchedule\"",
+    ] {
+        assert!(
+            deployment.contains(expected),
+            "control-plane Deployment is missing {expected:?}"
+        );
+    }
+    assert!(variables.contains("var.control_plane_replicas >= 2"));
+    assert!(
+        terraform.contains("resource \"kubernetes_pod_disruption_budget_v1\" \"control_plane\"")
+    );
+    assert!(terraform.contains("min_available = \"1\""));
+    assert!(
+        !deployment.contains("type = \"Recreate\""),
+        "Recreate deliberately creates a total control-plane outage"
+    );
+}
+
+#[test]
 fn production_deploy_detaches_the_legacy_control_volume_after_plan_and_before_apply() {
     let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
     let plan = workflow
@@ -123,6 +160,7 @@ fn production_deploy_detaches_the_legacy_control_volume_after_plan_and_before_ap
         "get pvc \"$legacy_claim\" --ignore-not-found --output=name",
         "show -json \"$RUNNER_TEMP/production.tfplan\"",
         "module.cats_kubernetes.kubernetes_deployment_v1.control_plane",
+        ".change.after.spec[0].replicas >= 2",
         "persistentVolumeClaim.claimName == $claim",
         "scale deployment \"$control_deployment\" --replicas=0",
         "remaining_consumers=\"$(control_volume_consumers)\"",

@@ -40,6 +40,7 @@ struct StubNode {
     id: String,
     cats: Arc<Mutex<HashMap<String, ObservedState>>>,
     jobs: Arc<Mutex<Vec<String>>>,
+    job_kinds: Arc<Mutex<Vec<String>>>,
     alive: Arc<AtomicBool>,
     /// Held for read while a heartbeat is in flight.
     heartbeat_gate: Arc<tokio::sync::RwLock<()>>,
@@ -78,6 +79,10 @@ impl StubNode {
 
 async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Response {
     node.jobs.lock().unwrap().push(job.job_id.clone());
+    node.job_kinds
+        .lock()
+        .unwrap()
+        .push(job.action.kind().to_string());
     if let NodeJobAction::StopCat { disposition, .. } = &job.action {
         node.stop_dispositions
             .lock()
@@ -232,6 +237,7 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
         id: id.to_string(),
         cats: Arc::new(Mutex::new(HashMap::new())),
         jobs: Arc::new(Mutex::new(Vec::new())),
+        job_kinds: Arc::new(Mutex::new(Vec::new())),
         alive: Arc::new(AtomicBool::new(true)),
         heartbeat_gate: Arc::new(tokio::sync::RwLock::new(())),
         exec_attempts: Arc::new(AtomicUsize::new(0)),
@@ -856,6 +862,155 @@ async fn create_converges_and_idempotency_replays() {
     // Unauthenticated requests are rejected.
     let resp = ctx.http.get(ctx.ws_url("/cats")).send().await.unwrap();
     assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_api_replicas_linearize_create_start_and_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let control_store_url = cats_control_plane::testsupport::isolated_control_store_url();
+    let usage: Arc<SqliteUsageStore> =
+        Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap());
+    let storage_meta: Arc<dyn MetadataStore> =
+        Arc::new(SqliteMetadataStore::open(&dir.path().join("storage-meta.db")).unwrap());
+    let config = Config {
+        listen: "127.0.0.1:0".into(),
+        control_store_dsn: cats_control_plane::store::DsnSource::Literal(control_store_url),
+        control_store_ca_file: None,
+        usage_store: usage.clone(),
+        credit_store: usage,
+        storage_meta,
+        auth_token: SERVICE_TOKEN.into(),
+        admin_token: "dev-admin-token".into(),
+        workos: None,
+        stripe: None,
+        billing_enforcement_enabled: false,
+        node_lease_timeout_ms: 3_000,
+        reconcile_interval_ms: 25,
+        oci_deploy_sync_wait_ms: 5_000,
+        auto_tier_policy: Default::default(),
+    };
+    let first = spawn(config.clone()).await.unwrap();
+    let node = start_stub_node(&first, "node_a").await;
+    let second = spawn(config).await.unwrap();
+    let workspace_id = default_workspace_id(&first);
+    let http = reqwest::Client::new();
+    let cats_path = format!("/v1/workspaces/{workspace_id}/cats");
+    let request = serde_json::json!({
+        "name": "replicated",
+        "image": "ubuntu-24.04",
+        "cpus": 2,
+        "memory_mib": 1024,
+        "root_size_bytes": 8 << 20,
+        "disk": null
+    });
+
+    let create_first = http
+        .post(format!("{}{cats_path}", first.base_url()))
+        .bearer_auth("dev-admin-token")
+        .header("Idempotency-Key", "replica-create")
+        .json(&request)
+        .send();
+    let create_second = http
+        .post(format!("{}{cats_path}", second.base_url()))
+        .bearer_auth("dev-admin-token")
+        .header("Idempotency-Key", "replica-create")
+        .json(&request)
+        .send();
+    let (created_first, created_second) = tokio::join!(create_first, create_second);
+    let created_first = created_first.unwrap();
+    let created_second = created_second.unwrap();
+    assert_eq!(created_first.status(), StatusCode::ACCEPTED);
+    assert_eq!(created_second.status(), StatusCode::ACCEPTED);
+    let created_first: CatOperationResponse = created_first.json().await.unwrap();
+    let created_second: CatOperationResponse = created_second.json().await.unwrap();
+    assert_eq!(created_first.cat.id, created_second.cat.id);
+    assert_eq!(created_first.operation.id, created_second.operation.id);
+    assert_eq!(first.state.store.list_cats(&workspace_id).unwrap().len(), 1);
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let cat = first
+                .state
+                .store
+                .must_get_cat_by_id(&created_first.cat.id)
+                .unwrap();
+            if cat.observed_state == ObservedState::Running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the elected reconciler should place and start the Cat");
+
+    let action_path = format!("{cats_path}/{}/actions/start", created_first.cat.id);
+    let start_first = http
+        .post(format!("{}{action_path}", first.base_url()))
+        .bearer_auth("dev-admin-token")
+        .header("Idempotency-Key", "replica-start")
+        .send();
+    let start_second = http
+        .post(format!("{}{action_path}", second.base_url()))
+        .bearer_auth("dev-admin-token")
+        .header("Idempotency-Key", "replica-start")
+        .send();
+    let (started_first, started_second) = tokio::join!(start_first, start_second);
+    let started_first = started_first.unwrap();
+    let started_second = started_second.unwrap();
+    assert_eq!(started_first.status(), StatusCode::ACCEPTED);
+    assert_eq!(started_second.status(), StatusCode::ACCEPTED);
+    let started_first: CatOperationResponse = started_first.json().await.unwrap();
+    let started_second: CatOperationResponse = started_second.json().await.unwrap();
+    assert_eq!(started_first.operation.id, started_second.operation.id);
+    assert_eq!(started_first.operation.resource_generation, 2);
+
+    let delete_path = format!("{cats_path}/{}", created_first.cat.id);
+    let delete_first = http
+        .delete(format!("{}{delete_path}", first.base_url()))
+        .bearer_auth("dev-admin-token")
+        .header("Idempotency-Key", "replica-delete")
+        .send();
+    let delete_second = http
+        .delete(format!("{}{delete_path}", second.base_url()))
+        .bearer_auth("dev-admin-token")
+        .header("Idempotency-Key", "replica-delete")
+        .send();
+    let (deleted_first, deleted_second) = tokio::join!(delete_first, delete_second);
+    let deleted_first = deleted_first.unwrap();
+    let deleted_second = deleted_second.unwrap();
+    assert_eq!(deleted_first.status(), StatusCode::ACCEPTED);
+    assert_eq!(deleted_second.status(), StatusCode::ACCEPTED);
+    let deleted_first: CatOperationResponse = deleted_first.json().await.unwrap();
+    let deleted_second: CatOperationResponse = deleted_second.json().await.unwrap();
+    assert_eq!(deleted_first.operation.id, deleted_second.operation.id);
+    assert_eq!(deleted_first.operation.resource_generation, 3);
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if first
+                .state
+                .store
+                .find_cat_by_id(&created_first.cat.id)
+                .unwrap()
+                .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the elected reconciler should delete the Cat once");
+    assert_eq!(
+        node.job_kinds
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|kind| kind.as_str() == "start_cat")
+            .count(),
+        1,
+        "cross-replica replay must not dispatch a duplicate start"
+    );
 }
 
 #[tokio::test]
@@ -2736,12 +2891,11 @@ async fn an_oci_deploy_without_a_pinned_digest_is_rejected() {
     assert!(node.oci_deploys.lock().unwrap().is_empty());
 }
 
-/// A deploy interrupted by a restart cannot be resumed, because the pull
-/// credentials it needs are deliberately never persisted. It must be reported
-/// as failed rather than left pending forever, and its identity must be free
-/// for a retry.
+/// A different replica's reaper must not fail a deployment whose owner still
+/// has its PostgreSQL session lock. Process-death recovery is covered at the
+/// Store boundary, where the owner lease can be dropped deterministically.
 #[tokio::test]
-async fn an_interrupted_oci_deploy_is_failed_at_startup_rather_than_left_pending() {
+async fn a_live_oci_deploy_is_not_failed_by_another_replica_reaper() {
     let ctx = Ctx::new().await;
     let node = ctx.running_cat_on_node("interrupted").await;
     *node.oci_deploy_delay.lock().unwrap() = Duration::from_secs(30);
@@ -2752,14 +2906,14 @@ async fn an_interrupted_oci_deploy_is_failed_at_startup_rather_than_left_pending
     assert_eq!(status, StatusCode::ACCEPTED);
     let accepted: OciDeploymentOperationResponse = serde_json::from_value(body).unwrap();
 
-    // Stand in for the process dying with the deploy in flight.
+    // Stand in for a second replica's periodic recovery pass.
     let converged = ctx
         .cp
         .state
         .store
         .fail_interrupted_oci_deployments()
         .unwrap();
-    assert_eq!(converged, 1);
+    assert_eq!(converged, 0);
 
     let operation = ctx
         .cp
@@ -2769,14 +2923,9 @@ async fn an_interrupted_oci_deploy_is_failed_at_startup_rather_than_left_pending
         .unwrap();
     assert_eq!(
         operation.phase,
-        OperationPhase::Failed,
-        "an unresumable deploy must resolve, not hang"
+        OperationPhase::Running,
+        "a live owner must not be mistaken for a dead replica"
     );
-    assert!(operation
-        .error
-        .expect("a failed operation carries its error")
-        .message
-        .contains("retry the deploy"));
 }
 
 /// A Cat runs one version of an app, so listing its deployments must answer
