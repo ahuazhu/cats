@@ -180,32 +180,43 @@ jobs:
           probe_pid=""
 
           stop_evidence_processes() {
-            local pid children
+            local pid cleanup_failed=0
             for pid in "${evidence_pids[@]}"; do
-              if kill -0 "$pid" 2>/dev/null; then
-                children="$(pgrep -P "$pid" || true)"
-                if [[ -n "$children" ]]; then
-                  kill $children 2>/dev/null || true
-                fi
-                kill "$pid" 2>/dev/null || true
+              if ! python3 deploy/aws/terminate-process-tree.py \
+                --root-pid "$pid" \
+                --timeout-seconds 2
+              then
+                cleanup_failed=1
               fi
             done
             for pid in "${evidence_pids[@]}"; do
               wait "$pid" 2>/dev/null || true
             done
             evidence_pids=()
+            return "$cleanup_failed"
           }
 
           cleanup_evidence() {
             if [[ -n "$probe_pid" ]] && kill -0 "$probe_pid" 2>/dev/null; then
-              children="$(pgrep -P "$probe_pid" || true)"
-              if [[ -n "$children" ]]; then
-                kill $children 2>/dev/null || true
-              fi
+              # The probe owns its curl children. Signal its common finalizer
+              # and let it reap those children before evidence is uploaded.
               kill "$probe_pid" 2>/dev/null || true
+              for _ in {1..100}; do
+                if ! kill -0 "$probe_pid" 2>/dev/null; then
+                  break
+                fi
+                sleep 0.05
+              done
+              if kill -0 "$probe_pid" 2>/dev/null; then
+                echo "::error::public probe finalizer exceeded its five-second cleanup bound"
+                python3 deploy/aws/terminate-process-tree.py \
+                  --root-pid "$probe_pid" \
+                  --timeout-seconds 1 \
+                  || true
+              fi
               wait "$probe_pid" 2>/dev/null || true
             fi
-            stop_evidence_processes
+            stop_evidence_processes || true
           }
           trap cleanup_evidence EXIT
 
@@ -260,37 +271,102 @@ jobs:
             > "$evidence/metadata.json"
 
           watch_pods() {
+            local output=$1
             "${kube[@]}" get pods \
               --selector app.kubernetes.io/name=cats-controld \
               --watch \
               --output-watch-events \
               --output=json \
-              | jq --unbuffered -c '{observed_epoch: now, event: .}'
+              | jq --unbuffered -c '{
+                  observed_epoch: now,
+                  event_type: .type,
+                  pod: {
+                    name: .object.metadata.name,
+                    uid: .object.metadata.uid,
+                    resource_version: .object.metadata.resourceVersion,
+                    deletion_timestamp: .object.metadata.deletionTimestamp,
+                    node: .object.spec.nodeName,
+                    phase: .object.status.phase,
+                    pod_ip: .object.status.podIP,
+                    host_ip: .object.status.hostIP,
+                    conditions: [
+                      .object.status.conditions[]?
+                      | {type, status, reason, last_transition_time: .lastTransitionTime}
+                    ],
+                    containers: [
+                      .object.status.containerStatuses[]?
+                      | {
+                          name,
+                          ready,
+                          restart_count: .restartCount,
+                          state: (.state | keys)
+                        }
+                    ]
+                  }
+                }' \
+              | python3 deploy/aws/retain-bounded-jsonl.py \
+                  --output "$output" \
+                  --max-lines 2000 \
+                  --max-bytes 1048576
           }
           watch_endpoint_slices() {
+            local output=$1
             "${kube[@]}" get endpointslices.discovery.k8s.io \
               --selector kubernetes.io/service-name=cats-controld \
               --watch \
               --output-watch-events \
               --output=json \
-              | jq --unbuffered -c '{observed_epoch: now, event: .}'
+              | jq --unbuffered -c '{
+                  observed_epoch: now,
+                  event_type: .type,
+                  endpoint_slice: {
+                    name: .object.metadata.name,
+                    uid: .object.metadata.uid,
+                    resource_version: .object.metadata.resourceVersion,
+                    deletion_timestamp: .object.metadata.deletionTimestamp,
+                    address_type: .object.addressType,
+                    endpoints: [
+                      .object.endpoints[]?
+                      | {
+                          addresses,
+                          conditions,
+                          node_name: .nodeName,
+                          zone,
+                          target_ref: {
+                            kind: .targetRef.kind,
+                            name: .targetRef.name,
+                            uid: .targetRef.uid
+                          }
+                        }
+                    ]
+                  }
+                }' \
+              | python3 deploy/aws/retain-bounded-jsonl.py \
+                  --output "$output" \
+                  --max-lines 2000 \
+                  --max-bytes 1048576
           }
-
-          watch_pods \
-            > "$evidence/pods-timeline.jsonl" \
-            2> "$evidence/pods-timeline.stderr" &
-          evidence_pids+=("$!")
-          watch_endpoint_slices \
-            > "$evidence/endpointslices-timeline.jsonl" \
-            2> "$evidence/endpointslices-timeline.stderr" &
-          evidence_pids+=("$!")
-          while IFS= read -r pod; do
+          stream_pod_log_summaries() {
+            local pod=$1
+            local output=$2
             "${kube[@]}" logs --follow "pod/$pod" \
               --container=controld \
-              --prefix \
               --timestamps \
-              > "$evidence/$pod.log" \
-              2> "$evidence/$pod.log.stderr" &
+              | python3 deploy/aws/summarize-control-plane-log.py \
+              | python3 deploy/aws/retain-bounded-jsonl.py \
+                  --output "$output" \
+                  --max-lines 2000 \
+                  --max-bytes 1048576
+          }
+
+          watch_pods "$evidence/pods-timeline.jsonl" &
+          evidence_pids+=("$!")
+          watch_endpoint_slices "$evidence/endpointslices-timeline.jsonl" &
+          evidence_pids+=("$!")
+          while IFS= read -r pod; do
+            stream_pod_log_summaries \
+              "$pod" \
+              "$evidence/$pod-log-summary.jsonl" &
             evidence_pids+=("$!")
           done < <(jq -r '.items[].metadata.name' "$pods_file")
 
@@ -351,26 +427,13 @@ jobs:
           probe_pid=$!
 
           # The first scheduled request is the same probe as the disruption
-          # oracle, not a weaker curl. Require its complete known-positive
-          # result before crossing the destructive boundary while the helper
-          # continues launching later attempts on its fixed schedule.
-          baseline="$evidence/public-probes/partial-results/attempt-0001.json"
-          for _ in $(seq 1 100); do
-            if [[ -s "$baseline" ]]; then
-              break
-            fi
-            if ! kill -0 "$probe_pid" 2>/dev/null; then
-              echo "::error::fixed-rate public probe exited before its calibrated baseline"
-              exit 1
-            fi
-            sleep 0.1
-          done
-          if [[ ! -s "$baseline" ]] \
-            || ! jq -e '.failure_reasons | length == 0' "$baseline" >/dev/null
-          then
-            echo "::error::fixed-rate public probe did not establish a healthy pre-eviction baseline"
-            exit 1
-          fi
+          # oracle, not a weaker curl. The executable readiness gate requires
+          # that completed result and its safe header evidence before crossing
+          # the destructive boundary; later attempts keep their fixed schedule.
+          python3 deploy/aws/wait-for-public-probe-baseline.py \
+            --probe-pid "$probe_pid" \
+            --output-dir "$evidence/public-probes" \
+            --timeout-seconds 10
 
           observed_uid="$("${kube[@]}" get pod "$target" \
             --output=jsonpath='{.metadata.uid}')"

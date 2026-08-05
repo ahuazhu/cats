@@ -25,6 +25,15 @@ fn read_workspace_file(path: &str) -> String {
     })
 }
 
+#[cfg(unix)]
+fn ha_fixture_guard() -> std::sync::MutexGuard<'static, ()> {
+    static FIXTURE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    FIXTURE_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .expect("HA fixture lock is not poisoned")
+}
+
 #[test]
 fn production_deploy_extracts_versions_from_the_current_store_schema() {
     let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
@@ -567,8 +576,14 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
         ".status.phase == \"Running\"",
         "https://cats.run/healthz",
         "deploy/aws/probe-public-endpoint.py",
+        "deploy/aws/wait-for-public-probe-baseline.py",
+        "deploy/aws/retain-bounded-jsonl.py",
+        "deploy/aws/summarize-control-plane-log.py",
+        "deploy/aws/terminate-process-tree.py",
         "--interval-ms 250",
         "--max-in-flight 16",
+        "--max-lines 2000",
+        "--max-bytes 1048576",
         "endpointslices.discovery.k8s.io",
         "--output-watch-events",
         "actions/upload-artifact@v4",
@@ -628,6 +643,23 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
     );
     assert!(workflow.contains("observed_uid"));
     assert!(workflow.contains("target_uid"));
+    let readiness = workflow
+        .find("deploy/aws/wait-for-public-probe-baseline.py")
+        .expect("HA drill has an executable public-probe readiness gate");
+    let uid_guard = workflow
+        .find("observed_uid=\"")
+        .expect("HA drill rechecks the selected Pod UID");
+    let eviction = workflow
+        .find("deploy/aws/evict-pod-with-uid.sh cats \"$target\" \"$target_uid\"")
+        .expect("HA drill uses guarded Eviction");
+    assert!(
+        readiness < uid_guard && uid_guard < eviction,
+        "a completed healthy public attempt must gate the UID check and Eviction"
+    );
+    assert!(
+        !workflow.contains("--prefix"),
+        "raw application log text must not be retained as HA evidence"
+    );
     assert!(
         !workflow.contains("for attempt in $(seq 1 240)"),
         "a serial curl loop becomes blind for the duration of a slow request"
@@ -637,6 +669,7 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
 #[cfg(unix)]
 #[test]
 fn production_ha_probe_models_stale_target_drain_ordering() {
+    let _fixture_guard = ha_fixture_guard();
     let probe = read_workspace_file("deploy/aws/probe-public-endpoint.py");
     for expected in [
         "asyncio.Semaphore",
@@ -649,6 +682,16 @@ fn production_ha_probe_models_stale_target_drain_ordering() {
         "time_total",
         "remote_ip",
         "headers",
+        "HEADER_POLICY",
+        "DIGEST_HEADER_ALLOWLIST",
+        "SIGTERM",
+        "SIGINT",
+        "configured_count",
+        "scheduled_count",
+        "started_count",
+        "completed_count",
+        "missing_count",
+        "attempt_incomplete",
         r#""/dev/null""#,
     ] {
         assert!(
@@ -672,6 +715,97 @@ fn production_ha_probe_models_stale_target_drain_ordering() {
     let stdout = String::from_utf8(output.stdout).expect("fixture output is UTF-8");
     assert!(stdout.contains("unsafe immediate exit: failures observed"));
     assert!(stdout.contains("drained exit: all probes succeeded"));
+}
+
+#[cfg(unix)]
+#[test]
+fn production_ha_probe_signal_finalizer_accounts_for_every_attempt() {
+    let _fixture_guard = ha_fixture_guard();
+    let output = Command::new("python3")
+        .arg(workspace_root().join("deploy/aws/probe-public-endpoint-signal-fixture.py"))
+        .arg("--probe")
+        .arg(workspace_root().join("deploy/aws/probe-public-endpoint.py"))
+        .output()
+        .expect("run the HA probe signal-finalizer fixture");
+    assert!(
+        output.status.success(),
+        "signal-finalizer fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("no orphan curl"));
+
+    let interrupt = Command::new("python3")
+        .arg(workspace_root().join("deploy/aws/probe-public-endpoint-signal-fixture.py"))
+        .arg("--probe")
+        .arg(workspace_root().join("deploy/aws/probe-public-endpoint.py"))
+        .args(["--signal", "SIGINT"])
+        .output()
+        .expect("run the HA probe SIGINT-finalizer fixture");
+    assert!(
+        interrupt.status.success(),
+        "SIGINT-finalizer fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&interrupt.stdout),
+        String::from_utf8_lossy(&interrupt.stderr)
+    );
+    assert!(String::from_utf8_lossy(&interrupt.stdout).contains("SIGINT finalizer"));
+}
+
+#[cfg(unix)]
+#[test]
+fn production_ha_probe_readiness_gate_precedes_eviction() {
+    let _fixture_guard = ha_fixture_guard();
+    let output = Command::new("python3")
+        .arg(workspace_root().join("deploy/aws/public-probe-readiness-fixture.py"))
+        .arg("--probe")
+        .arg(workspace_root().join("deploy/aws/probe-public-endpoint.py"))
+        .arg("--wait-helper")
+        .arg(workspace_root().join("deploy/aws/wait-for-public-probe-baseline.py"))
+        .output()
+        .expect("run the public-probe readiness fixture");
+    assert!(
+        output.status.success(),
+        "readiness fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("zero Evictions before readiness, exactly one after"));
+}
+
+#[cfg(unix)]
+#[test]
+fn production_ha_evidence_is_bounded_and_non_sensitive() {
+    let _fixture_guard = ha_fixture_guard();
+    let output = Command::new("python3")
+        .arg(workspace_root().join("deploy/aws/ha-evidence-boundary-fixture.py"))
+        .arg("--bounded-jsonl")
+        .arg(workspace_root().join("deploy/aws/retain-bounded-jsonl.py"))
+        .arg("--log-summarizer")
+        .arg(workspace_root().join("deploy/aws/summarize-control-plane-log.py"))
+        .output()
+        .expect("run the HA evidence boundary fixture");
+    assert!(
+        output.status.success(),
+        "evidence-boundary fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("raw log sentinel excluded"));
+
+    let cleanup = Command::new("python3")
+        .arg(workspace_root().join("deploy/aws/process-tree-cleanup-fixture.py"))
+        .arg("--helper")
+        .arg(workspace_root().join("deploy/aws/terminate-process-tree.py"))
+        .output()
+        .expect("run the HA evidence process-tree cleanup fixture");
+    assert!(
+        cleanup.status.success(),
+        "process-tree cleanup fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&cleanup.stdout),
+        String::from_utf8_lossy(&cleanup.stderr)
+    );
+    assert!(String::from_utf8_lossy(&cleanup.stdout).contains("no orphan"));
 }
 
 #[cfg(unix)]
