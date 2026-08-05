@@ -188,6 +188,14 @@ struct Args {
     node_lease_timeout_ms: i64,
     #[arg(long, default_value_t = 500)]
     reconcile_interval_ms: u64,
+    /// Enable phase-B writes of exact lifecycle dispatch provenance. Roll out
+    /// this binary fleet-wide with the flag false before changing it to true.
+    #[arg(
+        long,
+        env = "CATS_LIFECYCLE_PROVENANCE_WRITES_ENABLED",
+        default_value_t = false
+    )]
+    lifecycle_provenance_writes_enabled: bool,
     /// Seconds a stable Suspended Cat remains before automatic Warm.
     /// Zero disables this automatic boundary.
     #[arg(long, env = "CATS_AUTO_WARM_AFTER_SECONDS", default_value_t = 600)]
@@ -477,6 +485,7 @@ async fn main() -> anyhow::Result<()> {
             warm_after_ms: threshold_ms(args.auto_warm_after_seconds, "automatic Warm")?,
             cold_after_ms: threshold_ms(args.auto_cold_after_seconds, "automatic Cold")?,
         },
+        lifecycle_provenance_writes_enabled: args.lifecycle_provenance_writes_enabled,
         oci_deploy_sync_wait_ms: args.oci_deploy_sync_wait_ms,
     })
     .await?;

@@ -292,16 +292,28 @@ fn suspend_rejects_active_guest_work_then_succeeds_on_last_release() {
 }
 
 #[test]
-fn cold_fallback_tears_down_an_existing_suspended_runtime_before_restart() {
+fn cold_start_cannot_discard_a_relaxed_suspended_journal_without_explicit_cleanup() {
     let env = env();
-    let started = env.runtime.execute(start_job(1));
+    let started = env.runtime.execute(start_job_relaxed(1));
     assert_eq!(
         started.observed_state,
         ObservedState::Running,
         "start failed: {:?}",
         started.error
     );
-    let original_boot = boot_id(&env);
+    let blob = env._dir.path().join("blob");
+    let available_blob = env._dir.path().join("blob.available");
+    std::fs::rename(&blob, &available_blob).unwrap();
+    std::fs::write(&blob, b"remote object store unavailable").unwrap();
+    let mut guest = guest(&env);
+    guest
+        .request(GuestRequestBody::WriteBlock {
+            disk_id: "root".into(),
+            offset: 24_576,
+            data_hex: hex::encode(b"unique-relaxed-tail"),
+        })
+        .unwrap();
+    guest.flush_disk("root").unwrap();
     let suspended = env.runtime.execute(simple(
         1,
         "suspend_before_cold_fallback",
@@ -312,20 +324,100 @@ fn cold_fallback_tears_down_an_existing_suspended_runtime_before_restart() {
     ));
     assert_eq!(suspended.observed_state, ObservedState::Suspended);
 
-    // A control plane that lost placement can legitimately send a fresh Cold
-    // start while the old Node process still remembers the host-bound
-    // runtime. The Node must clean the old runtime first.
+    let pending = env
+        .state_dir
+        .join("cats")
+        .join(CAT)
+        .join("vol-root/pending");
+    assert!(std::fs::read_dir(&pending).unwrap().next().is_some());
+
+    // StartCat is not an ownership proof and may be a handoff bug that confused
+    // ResumeCat with Cold start.  The unique R<L journal must survive until an
+    // explicit CleanupCat arrives after control-plane fencing.
     let restarted = env.runtime.execute(start_job(2));
     assert_eq!(
-        restarted.observed_state,
-        ObservedState::Running,
-        "cold fallback restart failed: {:?}",
-        restarted.error
+        restarted.phase,
+        JobPhase::Failed,
+        "StartCat silently discarded Suspended state"
     );
-    assert_ne!(
-        boot_id(&env),
-        original_boot,
-        "Cold fallback must replace the old process identity"
+    assert!(
+        std::fs::read_dir(&pending).unwrap().next().is_some(),
+        "StartCat discarded the only authoritative relaxed journal"
+    );
+
+    let cleaned = env.runtime.execute(simple(
+        2,
+        "cleanup_cat",
+        NodeJobAction::CleanupCat { cat_id: CAT.into() },
+    ));
+    assert_eq!(cleaned.phase, JobPhase::Succeeded);
+    std::fs::remove_file(&blob).unwrap();
+    std::fs::rename(&available_blob, &blob).unwrap();
+}
+
+#[test]
+fn stale_generation_stop_is_rejected_before_touching_the_newer_runtime() {
+    let env = env();
+    let started = env.runtime.execute(start_job(3));
+    assert_eq!(started.phase, JobPhase::Succeeded, "{started:?}");
+    let boot = boot_id(&env);
+
+    let stale = env.runtime.execute(simple(
+        2,
+        "stale_stop_cat",
+        NodeJobAction::StopCat {
+            cat_id: CAT.into(),
+            disposition: StopCatDisposition::Cold,
+        },
+    ));
+    assert_eq!(stale.phase, JobPhase::Failed, "{stale:?}");
+    assert_eq!(stale.observed_state, ObservedState::Running);
+    assert_eq!(boot_id(&env), boot, "stale StopCat replaced the Guest");
+
+    assert_eq!(
+        env.runtime
+            .execute(simple(
+                4,
+                "stop_after_stale",
+                NodeJobAction::StopCat {
+                    cat_id: CAT.into(),
+                    disposition: StopCatDisposition::Cold,
+                },
+            ))
+            .phase,
+        JobPhase::Succeeded
+    );
+}
+
+#[test]
+fn newer_start_or_restore_cannot_claim_an_older_running_runtime() {
+    let env = env();
+    let started = env.runtime.execute(start_job(2));
+    assert_eq!(started.phase, JobPhase::Succeeded, "{started:?}");
+    let boot = boot_id(&env);
+
+    let newer_start = env.runtime.execute(start_job(3));
+    assert_eq!(newer_start.phase, JobPhase::Failed, "{newer_start:?}");
+    let newer_restore = env.runtime.execute(simple(
+        3,
+        "restore_cat",
+        NodeJobAction::RestoreCat { cat_id: CAT.into() },
+    ));
+    assert_eq!(newer_restore.phase, JobPhase::Failed, "{newer_restore:?}");
+    assert_eq!(boot_id(&env), boot);
+
+    assert_eq!(
+        env.runtime
+            .execute(simple(
+                3,
+                "stop_after_newer_rejections",
+                NodeJobAction::StopCat {
+                    cat_id: CAT.into(),
+                    disposition: StopCatDisposition::Cold,
+                },
+            ))
+            .phase,
+        JobPhase::Succeeded
     );
 }
 

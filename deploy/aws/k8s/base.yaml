@@ -80,6 +80,8 @@ spec:
               value: "600"
             - name: CATS_AUTO_COLD_AFTER_SECONDS
               value: "86400"
+            - name: CATS_LIFECYCLE_PROVENANCE_WRITES_ENABLED
+              value: "false"
           envFrom:
             - secretRef:
                 name: cats-runtime

@@ -357,18 +357,27 @@ impl Store {
                     return Ok(operation);
                 }
             }
-            let current: Option<(i64, String)> = tx
+            let current: Option<(i64, String, String, String, Option<String>, i64)> = tx
                 .query_opt(
-                    "SELECT generation, workspace_id FROM cats WHERE id=$1 FOR UPDATE",
+                    "SELECT generation, workspace_id, desired_state, observed_state,
+                            lifecycle_dispatch_json, observed_generation
+                       FROM cats WHERE id=$1 FOR UPDATE",
                     &[&cat_id],
                 )
                 .map_err(internal)?
-                .map(|r| -> std::result::Result<(i64, String), postgres::Error> {
-                    Ok((r.try_get(0)?, r.try_get(1)?))
+                .map(|r| -> std::result::Result<_, postgres::Error> {
+                    Ok((
+                        r.try_get(0)?,
+                        r.try_get(1)?,
+                        r.try_get(2)?,
+                        r.try_get(3)?,
+                        r.try_get(4)?,
+                        r.try_get(5)?,
+                    ))
                 })
                 .transpose()
                 .map_err(internal)?;
-            let (current, workspace_id) =
+            let (current, workspace_id, current_desired, observed, dispatch, observed_generation) =
                 current.ok_or_else(|| ApiError::not_found(format!("cat {cat_id}")))?;
             if let Some(expected) = expected_generation {
                 if expected != current {
@@ -377,10 +386,35 @@ impl Store {
                     )));
                 }
             }
+            if current_desired == desired_str(desired) && observed != "failed" {
+                if let Some(operation) =
+                    Self::lifecycle_operation_for_generation_in(&mut tx, cat_id, current)?
+                {
+                    if let Some((key, route)) = idempotency {
+                        Self::store_idempotency_in(&mut tx, key, route, &operation.id)?;
+                    }
+                    tx.commit().map_err(internal)?;
+                    return Ok(operation);
+                }
+                let operation =
+                    Self::insert_operation(&mut tx, &workspace_id, op_kind, cat_id, current)?;
+                let physically_converged = dispatch.is_none()
+                    && observed_generation == current
+                    && desired_matches_observed_state(&current_desired, &observed);
+                if physically_converged {
+                    Self::finish_operation_in(&mut tx, &operation.id, None)?;
+                }
+                if let Some((key, route)) = idempotency {
+                    Self::store_idempotency_in(&mut tx, key, route, &operation.id)?;
+                }
+                tx.commit().map_err(internal)?;
+                return Ok(row_to_finished_operation(operation, physically_converged));
+            }
             if op_kind != "cat.auto_suspend" {
                 Self::fail_pending_auto_tier(&mut tx, cat_id, "superseded by a newer Cat action")?;
             }
             let new_gen = current + 1;
+            Self::fail_active_lifecycle_operations_before(&mut tx, cat_id, new_gen)?;
             tx.execute(
                 "UPDATE cats SET desired_state=$2, generation=$3 WHERE id=$1",
                 &[&cat_id, &desired_str(desired), &new_gen],
@@ -422,6 +456,7 @@ impl Store {
             }
             Self::fail_pending_auto_tier(&mut tx, cat_id, "superseded by active work")?;
             let next = generation + 1;
+            Self::fail_active_lifecycle_operations_before(&mut tx, cat_id, next)?;
             tx.execute(
                 "UPDATE cats SET desired_state='running', generation=$2 WHERE id=$1",
                 &[&cat_id, &next],
@@ -448,6 +483,40 @@ impl Store {
                     &[&cat_id, &observed_str(observed), &now_ms()],
                 )
                 .map(|_| ())
+        })
+    }
+
+    pub fn set_observed_for_generation(
+        &self,
+        cat_id: &str,
+        observed: ObservedState,
+        generation: i64,
+    ) -> Result<()> {
+        self.with(|client| {
+            client
+                .execute(
+                    "UPDATE cats
+                        SET observed_state_since_ms = CASE
+                                WHEN observed_state=$2 THEN observed_state_since_ms
+                                ELSE $4
+                            END,
+                            observed_state=$2,
+                            observed_generation=$3
+                      WHERE id=$1",
+                    &[&cat_id, &observed_str(observed), &generation, &now_ms()],
+                )
+                .map(|_| ())
+        })
+    }
+
+    pub fn observed_generation(&self, cat_id: &str) -> Result<i64> {
+        self.with(|client| {
+            client
+                .query_one(
+                    "SELECT observed_generation FROM cats WHERE id=$1",
+                    &[&cat_id],
+                )?
+                .try_get(0)
         })
     }
 
@@ -627,4 +696,19 @@ impl Store {
                 .collect::<std::result::Result<Vec<_>, postgres::Error>>()
         })
     }
+}
+
+fn desired_matches_observed_state(desired: &str, observed: &str) -> bool {
+    matches!(
+        (desired, observed),
+        ("running", "running") | ("suspended", "suspended") | ("warm", "warm") | ("cold", "cold")
+    )
+}
+
+fn row_to_finished_operation(mut operation: Operation, finished: bool) -> Operation {
+    if finished {
+        operation.phase = OperationPhase::Succeeded;
+        operation.updated_at_unix = now_unix();
+    }
+    operation
 }

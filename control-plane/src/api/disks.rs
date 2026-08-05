@@ -238,11 +238,21 @@ pub(super) async fn hot_detach(state: &AppState, cat: &Cat, disk: &Disk) -> ApiR
 /// frozen engines can be remotely drained without resuming. Warm/Cold cats have
 /// already crossed a mandatory drain boundary.
 pub(super) async fn sync_cat(state: &AppState, cat: &Cat) -> ApiResult<Response> {
+    let cat = state.store.must_get_cat_by_id(&cat.id)?;
     if !matches!(
         cat.observed_state,
         ObservedState::Running | ObservedState::Suspended
     ) {
         return Ok((StatusCode::OK, Json(cat.clone())).into_response());
+    }
+    if state.store.lifecycle_dispatch(&cat.id)?.is_some()
+        || state.store.observed_generation(&cat.id)? != cat.generation
+    {
+        state.notify.notify_one();
+        return Err(ApiError::unavailable(
+            "cat lifecycle generation is still converging; retry sync",
+        )
+        .into());
     }
     let owner = format!("control_{}", uuid::Uuid::new_v4().simple());
     let lease =

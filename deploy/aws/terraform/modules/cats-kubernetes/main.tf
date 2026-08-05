@@ -274,6 +274,11 @@ resource "kubernetes_deployment_v1" "control_plane" {
             value = tostring(var.oci_deploy_sync_wait_ms)
           }
 
+          env {
+            name  = "CATS_LIFECYCLE_PROVENANCE_WRITES_ENABLED"
+            value = tostring(var.lifecycle_provenance_writes_enabled)
+          }
+
           # All PostgreSQL clients verify RDS TLS with this CA. Their DSNs are
           # mounted as files below so reconnects observe credential rotation.
           env {

@@ -30,6 +30,12 @@ variable "control_plane_replicas" {
   }
 }
 
+variable "lifecycle_provenance_writes_enabled" {
+  description = "One-way phase-B activation for exact lifecycle dispatch markers. Keep false for the reader rollout; set true only after every old control-plane Pod is gone."
+  type        = bool
+  default     = false
+}
+
 variable "gateway_image" {
   description = "Immutable cats-gatewayd container image, including its sha256 digest."
   type        = string

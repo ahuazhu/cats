@@ -528,6 +528,53 @@ fn a_warm_cat_is_adopted_with_no_processes_at_all() {
     env.run(stop_job(CAT, 3));
 }
 
+#[test]
+fn a_restarted_agent_replays_same_generation_restore_after_adopting_running() {
+    const CAT: &str = "cat_restore_replay";
+    let env = real_cat_env("node_restore_replay");
+    env.run(start_job(CAT, 1, &[("root", "/")]));
+    env.run(simple_job(
+        CAT,
+        2,
+        "warm_cat",
+        NodeJobAction::WarmCat {
+            cat_id: CAT.to_string(),
+        },
+    ));
+
+    let restored_agent = env.restarted_agent();
+    adopt_only_cat(&restored_agent, CAT);
+    let restore = simple_job(
+        CAT,
+        3,
+        "restore_cat",
+        NodeJobAction::RestoreCat {
+            cat_id: CAT.to_string(),
+        },
+    );
+    assert_eq!(
+        restored_agent.execute(restore.clone()).phase,
+        JobPhase::Succeeded
+    );
+
+    // The completed-job journal is process-local.  A second agent restart must
+    // use the adopted Running ledger as the idempotency oracle for the exact
+    // same generation, rather than rejecting the replay as "not Warm".
+    let replaying_agent = env.restarted_agent();
+    adopt_only_cat(&replaying_agent, CAT);
+    let replayed = replaying_agent.execute(restore);
+    assert_eq!(replayed.phase, JobPhase::Succeeded, "{replayed:?}");
+    assert_eq!(replayed.observed_state, ObservedState::Running);
+    assert_eq!(
+        replaying_agent.snapshot(),
+        vec![(CAT.to_string(), 3, ObservedState::Running)]
+    );
+    assert_eq!(
+        replaying_agent.execute(stop_job(CAT, 4)).phase,
+        JobPhase::Succeeded
+    );
+}
+
 /// The reboot exception (ADR-0028 §3). The boot-id gate exists to reject
 /// recorded pids, and Warm records none; its snapshot and journals are files,
 /// which a reboot does not invalidate. Gating Warm on the boot id would turn

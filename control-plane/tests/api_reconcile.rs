@@ -40,6 +40,7 @@ struct StubNode {
     id: String,
     cats: Arc<Mutex<HashMap<String, ObservedState>>>,
     jobs: Arc<Mutex<Vec<String>>>,
+    job_payloads: Arc<Mutex<Vec<NodeJob>>>,
     job_kinds: Arc<Mutex<Vec<String>>>,
     alive: Arc<AtomicBool>,
     /// Held for read while a heartbeat is in flight.
@@ -114,6 +115,7 @@ impl StubNode {
 
 async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Response {
     node.jobs.lock().unwrap().push(job.job_id.clone());
+    node.job_payloads.lock().unwrap().push(job.clone());
     node.job_kinds
         .lock()
         .unwrap()
@@ -121,7 +123,9 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Res
     if matches!(
         &job.action,
         NodeJobAction::SuspendCat { .. }
+            | NodeJobAction::ResumeCat { .. }
             | NodeJobAction::WarmCat { .. }
+            | NodeJobAction::RestoreCat { .. }
             | NodeJobAction::StopCat { .. }
     ) {
         if let Some(result) = node
@@ -224,7 +228,9 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Res
         if matches!(
             &job.action,
             NodeJobAction::SuspendCat { .. }
+                | NodeJobAction::ResumeCat { .. }
                 | NodeJobAction::WarmCat { .. }
+                | NodeJobAction::RestoreCat { .. }
                 | NodeJobAction::StopCat { .. }
         ) {
             node.applied_lifecycle_jobs
@@ -304,6 +310,7 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
         id: id.to_string(),
         cats: Arc::new(Mutex::new(HashMap::new())),
         jobs: Arc::new(Mutex::new(Vec::new())),
+        job_payloads: Arc::new(Mutex::new(Vec::new())),
         job_kinds: Arc::new(Mutex::new(Vec::new())),
         alive: Arc::new(AtomicBool::new(true)),
         heartbeat_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -469,6 +476,21 @@ impl Ctx {
         reconcile_interval_ms: u64,
         node_lease_timeout_ms: i64,
     ) -> Self {
+        Self::new_with_provenance(
+            auto_tier_policy,
+            reconcile_interval_ms,
+            node_lease_timeout_ms,
+            true,
+        )
+        .await
+    }
+
+    async fn new_with_provenance(
+        auto_tier_policy: AutoTierPolicy,
+        reconcile_interval_ms: u64,
+        node_lease_timeout_ms: i64,
+        lifecycle_provenance_writes_enabled: bool,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let storage_meta: Arc<dyn MetadataStore> =
             Arc::new(SqliteMetadataStore::open(&dir.path().join("storage-meta.db")).unwrap());
@@ -490,6 +512,7 @@ impl Ctx {
             reconcile_interval_ms,
             oci_deploy_sync_wait_ms: 5_000,
             auto_tier_policy,
+            lifecycle_provenance_writes_enabled,
         };
         let cp = spawn(config.clone()).await.unwrap();
         let workspace_id = default_workspace_id(&cp);
@@ -975,6 +998,7 @@ async fn two_api_replicas_linearize_create_start_and_delete() {
         reconcile_interval_ms: 25,
         oci_deploy_sync_wait_ms: 5_000,
         auto_tier_policy: Default::default(),
+        lifecycle_provenance_writes_enabled: true,
     };
     let first = spawn(config.clone()).await.unwrap();
     let node = start_stub_node(&first, "node_a").await;
@@ -1049,7 +1073,7 @@ async fn two_api_replicas_linearize_create_start_and_delete() {
     let started_first: CatOperationResponse = started_first.json().await.unwrap();
     let started_second: CatOperationResponse = started_second.json().await.unwrap();
     assert_eq!(started_first.operation.id, started_second.operation.id);
-    assert_eq!(started_first.operation.resource_generation, 2);
+    assert_eq!(started_first.operation.resource_generation, 1);
 
     let delete_path = format!("{cats_path}/{}", created_first.cat.id);
     let delete_first = http
@@ -1070,7 +1094,7 @@ async fn two_api_replicas_linearize_create_start_and_delete() {
     let deleted_first: CatOperationResponse = deleted_first.json().await.unwrap();
     let deleted_second: CatOperationResponse = deleted_second.json().await.unwrap();
     assert_eq!(deleted_first.operation.id, deleted_second.operation.id);
-    assert_eq!(deleted_first.operation.resource_generation, 3);
+    assert_eq!(deleted_first.operation.resource_generation, 2);
 
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -1124,6 +1148,7 @@ async fn reconciler_handoff_replays_persisted_suspending_with_the_same_job() {
         reconcile_interval_ms: 25,
         oci_deploy_sync_wait_ms: 5_000,
         auto_tier_policy: Default::default(),
+        lifecycle_provenance_writes_enabled: true,
     };
     let first = spawn(config.clone()).await.unwrap();
     let node = start_stub_node(&first, "node_suspend_handoff").await;
@@ -1253,6 +1278,843 @@ async fn reconciler_handoff_replays_persisted_suspending_with_the_same_job() {
         "the node applied the replayed SuspendCat twice"
     );
     node.job_response_release.notify_waiters();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lifecycle_provenance_uses_a_two_phase_global_activation_gate() {
+    let ctx = Ctx::new_with_provenance(Default::default(), 25, 30_000, false).await;
+    let node = start_stub_node(&ctx.cp, "node_provenance_rollout").await;
+    let created = ctx.create_cat("provenance-rollout", None).await;
+    ctx.wait_observed("provenance-rollout", ObservedState::Running)
+        .await;
+    assert!(!ctx
+        .cp
+        .state
+        .store
+        .lifecycle_provenance_writes_enabled()
+        .unwrap());
+
+    // Phase A writes the legacy boundary, so a pre-reader leader remains able
+    // to take over during the first rolling deployment.
+    node.quiesce().await;
+    node.hold_next_job_response("suspend_cat");
+    let legacy_suspend = ctx.action("provenance-rollout", "suspend").await;
+    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .expect("phase-A SuspendCat was not dispatched");
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .must_get_cat_by_id(&created.cat.id)
+            .unwrap()
+            .observed_state,
+        ObservedState::Suspending
+    );
+    assert!(ctx
+        .cp
+        .state
+        .store
+        .lifecycle_dispatch(&created.cat.id)
+        .unwrap()
+        .is_none());
+    node.job_response_release.notify_waiters();
+    ctx.wait_operation(&legacy_suspend.operation.id).await;
+
+    // The same phase-A binary is already a marker reader. Seed an exact Resume
+    // while the node is Lost to keep its reconciler from racing construction,
+    // then recover ownership and prove it replays the marker with writes off.
+    ctx.cp
+        .state
+        .store
+        .set_node_state("node_provenance_rollout", NodeState::Lost)
+        .unwrap();
+    let resume = ctx
+        .cp
+        .state
+        .store
+        .set_desired(&created.cat.id, DesiredState::Running, None, "cat.resume")
+        .unwrap();
+    ctx.cp
+        .state
+        .store
+        .begin_lifecycle_dispatch(
+            &created.cat.id,
+            "node_provenance_rollout",
+            ObservedState::Suspended,
+            ObservedState::Starting,
+            ObservedState::Running,
+            NodeJob {
+                job_id: cats_api::nodejob::job_id(
+                    &created.cat.id,
+                    resume.resource_generation,
+                    "resume_cat",
+                ),
+                cat_generation: resume.resource_generation,
+                action: NodeJobAction::ResumeCat {
+                    cat_id: created.cat.id.clone(),
+                },
+            },
+        )
+        .unwrap()
+        .unwrap();
+    ctx.cp
+        .state
+        .store
+        .set_node_state("node_provenance_rollout", NodeState::Ready)
+        .unwrap();
+    ctx.cp.state.notify.notify_one();
+    ctx.wait_operation(&resume.id).await;
+    assert!(node.job_payloads.lock().unwrap().iter().any(|job| {
+        job.cat_generation == resume.resource_generation
+            && matches!(job.action, NodeJobAction::ResumeCat { .. })
+    }));
+
+    // A false replica and a true bootstrap share one monotonic database gate.
+    // Activation by the new process changes the behavior of the already-live
+    // phase-A controller too; no second rolling true/false writer split exists.
+    let phase_a_peer = spawn(ctx.config.clone()).await.unwrap();
+    assert!(!phase_a_peer
+        .state
+        .store
+        .lifecycle_provenance_writes_enabled()
+        .unwrap());
+    let mut activating = ctx.config.clone();
+    activating.lifecycle_provenance_writes_enabled = true;
+    let phase_b = spawn(activating).await.unwrap();
+    assert!(ctx
+        .cp
+        .state
+        .store
+        .lifecycle_provenance_writes_enabled()
+        .unwrap());
+    assert!(phase_a_peer
+        .state
+        .store
+        .lifecycle_provenance_writes_enabled()
+        .unwrap());
+
+    node.hold_next_job_response("suspend_cat");
+    let marker_suspend = ctx.action("provenance-rollout", "suspend").await;
+    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .expect("globally activated writer did not dispatch SuspendCat");
+    assert!(ctx
+        .cp
+        .state
+        .store
+        .lifecycle_dispatch(&created.cat.id)
+        .unwrap()
+        .is_some());
+    node.job_response_release.notify_waiters();
+    ctx.wait_operation(&marker_suspend.operation.id).await;
+    drop(phase_b);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconciler_handoff_replays_resume_instead_of_cold_starting_suspended_state() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_resume_handoff").await;
+    let created = ctx.create_cat("handoff-resume", None).await;
+    ctx.wait_observed("handoff-resume", ObservedState::Running)
+        .await;
+    let suspend = ctx.action("handoff-resume", "suspend").await;
+    ctx.wait_operation(&suspend.operation.id).await;
+    ctx.wait_observed("handoff-resume", ObservedState::Suspended)
+        .await;
+
+    node.quiesce().await;
+    node.hold_next_job_response("resume_cat");
+    let resume = ctx.action("handoff-resume", "resume").await;
+    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .expect("the first leader never dispatched ResumeCat");
+    let boundary = ctx
+        .cp
+        .state
+        .store
+        .must_get_cat_by_id(&created.cat.id)
+        .unwrap();
+    assert_eq!(boundary.observed_state, ObservedState::Starting);
+
+    let second = spawn(ctx.config.clone()).await.unwrap();
+    ctx.cp.shutdown();
+    wait_for_persisted_transition(
+        &second,
+        &created.cat.id,
+        &resume.operation.id,
+        ObservedState::Running,
+        OperationPhase::Succeeded,
+    )
+    .await;
+
+    let generation = resume.operation.resource_generation;
+    let replayed: Vec<_> = node
+        .job_payloads
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|job| job.cat_generation == generation)
+        .cloned()
+        .collect();
+    assert_eq!(replayed.len(), 2, "handoff did not replay one exact job");
+    assert!(
+        replayed
+            .iter()
+            .all(|job| matches!(job.action, NodeJobAction::ResumeCat { .. })),
+        "a replacement leader cold-started Suspended state: {replayed:?}"
+    );
+    assert_eq!(replayed[0].job_id, replayed[1].job_id);
+    node.job_response_release.notify_waiters();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn superseded_result_atomically_hands_off_to_current_generation_alignment() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_generation_alignment").await;
+    let created = ctx.create_cat("generation-alignment", None).await;
+    ctx.wait_observed("generation-alignment", ObservedState::Running)
+        .await;
+
+    node.quiesce().await;
+    node.hold_next_job_response("suspend_cat");
+    let old_suspend = ctx.action("generation-alignment", "suspend").await;
+    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .expect("generation 2 SuspendCat was not dispatched");
+    let resume = ctx.action("generation-alignment", "resume").await;
+    let current_suspend = ctx.action("generation-alignment", "suspend").await;
+    assert_eq!(old_suspend.operation.resource_generation, 2);
+    assert_eq!(resume.operation.resource_generation, 3);
+    assert_eq!(current_suspend.operation.resource_generation, 4);
+
+    // The replacement replays generation 2 from the node journal. Settlement
+    // must create generation 4 provenance in that same database transaction;
+    // hold its response so the intermediate durable contract is observable.
+    node.hold_next_job_response("suspend_cat");
+    let second = spawn(ctx.config.clone()).await.unwrap();
+    ctx.cp.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .expect("generation 4 alignment SuspendCat was not dispatched");
+
+    let marker = second
+        .state
+        .store
+        .lifecycle_dispatch(&created.cat.id)
+        .unwrap()
+        .expect("old settlement exposed a markerless generation split");
+    assert_eq!(marker.job.cat_generation, 4);
+    assert!(matches!(
+        marker.job.action,
+        NodeJobAction::SuspendCat { .. }
+    ));
+    assert_eq!(
+        second
+            .state
+            .store
+            .observed_generation(&created.cat.id)
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        second
+            .state
+            .store
+            .get_operation(&current_suspend.operation.id)
+            .unwrap()
+            .phase,
+        OperationPhase::Pending,
+        "state equality completed generation 4 before its exact job result"
+    );
+
+    // Lose the Host in the old-result -> current-alignment window. The marker
+    // must let its generation-2 source inventory recover ownership; without
+    // the atomic handoff this row would be markerless and permanently require
+    // an otherwise unnecessary external fence.
+    second
+        .state
+        .store
+        .set_node_state("node_generation_alignment", NodeState::Lost)
+        .unwrap();
+    let heartbeat = reqwest::Client::new()
+        .post(format!("{}/v1/nodes/heartbeat", second.base_url()))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&HeartbeatRequest {
+            node_id: "node_generation_alignment".into(),
+            cats: vec![HeartbeatCat {
+                cat_id: created.cat.id.clone(),
+                generation: 2,
+                state: ObservedState::Suspended,
+            }],
+            telemetry: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(heartbeat.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        second
+            .state
+            .store
+            .get_node("node_generation_alignment")
+            .unwrap()
+            .state,
+        NodeState::Ready
+    );
+
+    node.job_response_release.notify_waiters();
+    wait_for_persisted_transition(
+        &second,
+        &created.cat.id,
+        &current_suspend.operation.id,
+        ObservedState::Suspended,
+        OperationPhase::Succeeded,
+    )
+    .await;
+    assert_eq!(
+        second
+            .state
+            .store
+            .observed_generation(&created.cat.id)
+            .unwrap(),
+        4
+    );
+    let suspend_generations: Vec<_> = node
+        .job_payloads
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|job| {
+            matches!(job.action, NodeJobAction::SuspendCat { .. }).then_some(job.cat_generation)
+        })
+        .collect();
+    assert!(suspend_generations.contains(&2));
+    assert!(suspend_generations.contains(&4));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lost_node_recovers_from_marker_source_target_and_transitional_inventory() {
+    struct Case {
+        label: &'static str,
+        desired: DesiredState,
+        source: ObservedState,
+        transitional: ObservedState,
+        target: ObservedState,
+        heartbeat_generation: i64,
+        heartbeat_state: ObservedState,
+    }
+    let cases = [
+        Case {
+            label: "suspend-source",
+            desired: DesiredState::Suspended,
+            source: ObservedState::Running,
+            transitional: ObservedState::Suspending,
+            target: ObservedState::Suspended,
+            heartbeat_generation: 1,
+            heartbeat_state: ObservedState::Running,
+        },
+        Case {
+            label: "suspend-target",
+            desired: DesiredState::Suspended,
+            source: ObservedState::Running,
+            transitional: ObservedState::Suspending,
+            target: ObservedState::Suspended,
+            heartbeat_generation: 2,
+            heartbeat_state: ObservedState::Suspended,
+        },
+        Case {
+            label: "warm-transitional",
+            desired: DesiredState::Warm,
+            source: ObservedState::Running,
+            transitional: ObservedState::Warming,
+            target: ObservedState::Warm,
+            heartbeat_generation: 1,
+            heartbeat_state: ObservedState::Warming,
+        },
+        Case {
+            label: "stop-transitional",
+            desired: DesiredState::Cold,
+            source: ObservedState::Running,
+            transitional: ObservedState::Stopping,
+            target: ObservedState::Cold,
+            heartbeat_generation: 1,
+            heartbeat_state: ObservedState::Stopping,
+        },
+    ];
+
+    for case in cases {
+        let ctx = Ctx::new_with_stable_node_lease().await;
+        let node_id = format!("node_lost_marker_{}", case.label);
+        let node = start_stub_node(&ctx.cp, &node_id).await;
+        let cat_name = format!("lost-marker-{}", case.label);
+        let created = ctx.create_cat(&cat_name, None).await;
+        ctx.wait_observed(&cat_name, ObservedState::Running).await;
+        node.quiesce().await;
+        ctx.cp
+            .state
+            .store
+            .set_node_state(&node_id, NodeState::Lost)
+            .unwrap();
+        let operation = ctx
+            .cp
+            .state
+            .store
+            .set_desired(
+                &created.cat.id,
+                case.desired,
+                None,
+                match case.desired {
+                    DesiredState::Suspended => "cat.suspend",
+                    DesiredState::Warm => "cat.warm",
+                    DesiredState::Cold => "cat.stop",
+                    _ => unreachable!(),
+                },
+            )
+            .unwrap();
+        let action = match case.desired {
+            DesiredState::Suspended => NodeJobAction::SuspendCat {
+                cat_id: created.cat.id.clone(),
+                work_fence: None,
+            },
+            DesiredState::Warm => NodeJobAction::WarmCat {
+                cat_id: created.cat.id.clone(),
+            },
+            DesiredState::Cold => NodeJobAction::StopCat {
+                cat_id: created.cat.id.clone(),
+                disposition: StopCatDisposition::Cold,
+            },
+            _ => unreachable!(),
+        };
+        ctx.cp
+            .state
+            .store
+            .begin_lifecycle_dispatch(
+                &created.cat.id,
+                &node_id,
+                case.source,
+                case.transitional,
+                case.target,
+                NodeJob {
+                    job_id: cats_api::nodejob::job_id(
+                        &created.cat.id,
+                        operation.resource_generation,
+                        action.kind(),
+                    ),
+                    cat_generation: operation.resource_generation,
+                    action,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        ctx.cp
+            .state
+            .store
+            .set_observed(&created.cat.id, ObservedState::Unknown)
+            .unwrap();
+
+        ctx.post_service(
+            ctx.url("/v1/nodes/heartbeat"),
+            &HeartbeatRequest {
+                node_id: node_id.clone(),
+                cats: vec![HeartbeatCat {
+                    cat_id: created.cat.id.clone(),
+                    generation: case.heartbeat_generation,
+                    state: case.heartbeat_state,
+                }],
+                telemetry: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            ctx.cp.state.store.get_node(&node_id).unwrap().state,
+            NodeState::Ready,
+            "{} inventory could not recover its exact marker",
+            case.label
+        );
+        ctx.wait_operation(&operation.id).await;
+        assert_eq!(
+            ctx.cp
+                .state
+                .store
+                .observed_generation(&created.cat.id)
+                .unwrap(),
+            operation.resource_generation,
+            "{} replay did not prove the current generation",
+            case.label
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn imperative_node_jobs_cannot_cross_a_lifecycle_generation_split() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_imperative_generation_gate").await;
+    let created = ctx.create_cat("imperative-generation-gate", None).await;
+    ctx.wait_observed("imperative-generation-gate", ObservedState::Running)
+        .await;
+    node.quiesce().await;
+    ctx.cp
+        .state
+        .store
+        .set_node_state("node_imperative_generation_gate", NodeState::Lost)
+        .unwrap();
+    let warm = ctx
+        .cp
+        .state
+        .store
+        .set_desired(&created.cat.id, DesiredState::Warm, None, "cat.warm")
+        .unwrap();
+    let old = ctx
+        .cp
+        .state
+        .store
+        .begin_lifecycle_dispatch(
+            &created.cat.id,
+            "node_imperative_generation_gate",
+            ObservedState::Running,
+            ObservedState::Warming,
+            ObservedState::Warm,
+            NodeJob {
+                job_id: cats_api::nodejob::job_id(
+                    &created.cat.id,
+                    warm.resource_generation,
+                    "warm_cat",
+                ),
+                cat_generation: warm.resource_generation,
+                action: NodeJobAction::WarmCat {
+                    cat_id: created.cat.id.clone(),
+                },
+            },
+        )
+        .unwrap()
+        .unwrap();
+    ctx.cp
+        .state
+        .store
+        .settle_lifecycle_dispatch(&old, ObservedState::Running, false, None, None, false)
+        .unwrap();
+    let running = ctx
+        .cp
+        .state
+        .store
+        .set_desired(&created.cat.id, DesiredState::Running, None, "cat.resume")
+        .unwrap();
+    assert_eq!(running.resource_generation, 3);
+
+    let before = node.job_payloads.lock().unwrap().len();
+    let sync = ctx
+        .http
+        .post(ctx.ws_url("/cats/imperative-generation-gate/actions/sync"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sync.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(node.job_payloads.lock().unwrap().len(), before);
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .observed_generation(&created.cat.id)
+            .unwrap(),
+        1,
+        "SyncCat advanced the node past its exact lifecycle marker"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconciler_handoff_replays_restore_instead_of_cold_starting_warm_state() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_restore_handoff").await;
+    let created = ctx.create_cat("handoff-restore", None).await;
+    ctx.wait_observed("handoff-restore", ObservedState::Running)
+        .await;
+    let suspend = ctx.action("handoff-restore", "suspend").await;
+    ctx.wait_operation(&suspend.operation.id).await;
+    let warm = ctx.action("handoff-restore", "warm").await;
+    ctx.wait_operation(&warm.operation.id).await;
+    ctx.wait_observed("handoff-restore", ObservedState::Warm)
+        .await;
+
+    node.quiesce().await;
+    node.hold_next_job_response("restore_cat");
+    let restore = ctx.action("handoff-restore", "resume").await;
+    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .expect("the first leader never dispatched RestoreCat");
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .must_get_cat_by_id(&created.cat.id)
+            .unwrap()
+            .observed_state,
+        ObservedState::Starting
+    );
+
+    let second = spawn(ctx.config.clone()).await.unwrap();
+    ctx.cp.shutdown();
+    wait_for_persisted_transition(
+        &second,
+        &created.cat.id,
+        &restore.operation.id,
+        ObservedState::Running,
+        OperationPhase::Succeeded,
+    )
+    .await;
+    let generation = restore.operation.resource_generation;
+    let replayed: Vec<_> = node
+        .job_payloads
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|job| job.cat_generation == generation)
+        .cloned()
+        .collect();
+    assert_eq!(replayed.len(), 2);
+    assert!(replayed
+        .iter()
+        .all(|job| matches!(job.action, NodeJobAction::RestoreCat { .. })));
+    assert_eq!(replayed[0].job_id, replayed[1].job_id);
+    node.job_response_release.notify_waiters();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cold_superseding_suspending_settles_old_job_before_stop() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_cold_supersede_suspend").await;
+    let created = ctx.create_cat("cold-supersede-suspend", None).await;
+    ctx.wait_observed("cold-supersede-suspend", ObservedState::Running)
+        .await;
+
+    node.quiesce().await;
+    node.hold_next_job_response("suspend_cat");
+    let suspend = ctx.action("cold-supersede-suspend", "suspend").await;
+    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .expect("SuspendCat was not dispatched");
+    let stop = ctx.action("cold-supersede-suspend", "stop").await;
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .must_get_cat_by_id(&created.cat.id)
+            .unwrap()
+            .observed_state,
+        ObservedState::Suspending
+    );
+
+    let second = spawn(ctx.config.clone()).await.unwrap();
+    ctx.cp.shutdown();
+    wait_for_persisted_transition(
+        &second,
+        &created.cat.id,
+        &stop.operation.id,
+        ObservedState::Cold,
+        OperationPhase::Succeeded,
+    )
+    .await;
+    assert_eq!(
+        second
+            .state
+            .store
+            .get_operation(&suspend.operation.id)
+            .unwrap()
+            .phase,
+        OperationPhase::Failed
+    );
+    let jobs = node.job_payloads.lock().unwrap();
+    assert!(jobs.iter().any(|job| {
+        job.cat_generation == suspend.operation.resource_generation
+            && matches!(job.action, NodeJobAction::SuspendCat { .. })
+    }));
+    assert!(jobs.iter().any(|job| {
+        job.cat_generation == stop.operation.resource_generation
+            && matches!(job.action, NodeJobAction::StopCat { .. })
+    }));
+    drop(jobs);
+    node.job_response_release.notify_waiters();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cold_superseding_warming_settles_old_job_before_stop() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_cold_supersede_warm").await;
+    let created = ctx.create_cat("cold-supersede-warm", None).await;
+    ctx.wait_observed("cold-supersede-warm", ObservedState::Running)
+        .await;
+    let suspend = ctx.action("cold-supersede-warm", "suspend").await;
+    ctx.wait_operation(&suspend.operation.id).await;
+    ctx.wait_observed("cold-supersede-warm", ObservedState::Suspended)
+        .await;
+
+    node.quiesce().await;
+    node.hold_next_job_response("warm_cat");
+    let warm = ctx.action("cold-supersede-warm", "warm").await;
+    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .expect("WarmCat was not dispatched");
+    let stop = ctx.action("cold-supersede-warm", "stop").await;
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .must_get_cat_by_id(&created.cat.id)
+            .unwrap()
+            .observed_state,
+        ObservedState::Warming
+    );
+
+    let second = spawn(ctx.config.clone()).await.unwrap();
+    ctx.cp.shutdown();
+    wait_for_persisted_transition(
+        &second,
+        &created.cat.id,
+        &stop.operation.id,
+        ObservedState::Cold,
+        OperationPhase::Succeeded,
+    )
+    .await;
+    assert_eq!(
+        second
+            .state
+            .store
+            .get_operation(&warm.operation.id)
+            .unwrap()
+            .phase,
+        OperationPhase::Failed
+    );
+    let jobs = node.job_payloads.lock().unwrap();
+    assert!(jobs.iter().any(|job| {
+        job.cat_generation == warm.operation.resource_generation
+            && matches!(job.action, NodeJobAction::WarmCat { .. })
+    }));
+    assert!(jobs.iter().any(|job| {
+        job.cat_generation == stop.operation.resource_generation
+            && matches!(job.action, NodeJobAction::StopCat { .. })
+    }));
+    drop(jobs);
+    node.job_response_release.notify_waiters();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn running_superseding_stopping_settles_old_stop_before_new_start() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_running_supersede_stop").await;
+    let created = ctx.create_cat("running-supersede-stop", None).await;
+    ctx.wait_observed("running-supersede-stop", ObservedState::Running)
+        .await;
+
+    node.quiesce().await;
+    node.hold_next_job_response("stop_cat");
+    let stop = ctx.action("running-supersede-stop", "stop").await;
+    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .expect("StopCat was not dispatched");
+    let restart = ctx.action("running-supersede-stop", "resume").await;
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .must_get_cat_by_id(&created.cat.id)
+            .unwrap()
+            .observed_state,
+        ObservedState::Stopping
+    );
+
+    let second = spawn(ctx.config.clone()).await.unwrap();
+    ctx.cp.shutdown();
+    wait_for_persisted_transition(
+        &second,
+        &created.cat.id,
+        &restart.operation.id,
+        ObservedState::Running,
+        OperationPhase::Succeeded,
+    )
+    .await;
+    assert_eq!(
+        second
+            .state
+            .store
+            .get_operation(&stop.operation.id)
+            .unwrap()
+            .phase,
+        OperationPhase::Failed
+    );
+    let jobs = node.job_payloads.lock().unwrap();
+    assert!(jobs.iter().any(|job| {
+        job.cat_generation == stop.operation.resource_generation
+            && matches!(job.action, NodeJobAction::StopCat { .. })
+    }));
+    assert!(jobs.iter().any(|job| {
+        job.cat_generation == restart.operation.resource_generation
+            && matches!(job.action, NodeJobAction::StartCat { .. })
+    }));
+    drop(jobs);
+    node.job_response_release.notify_waiters();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn markerless_legacy_starting_fails_closed_without_dispatching_start_cat() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_markerless_starting").await;
+    let created = ctx.create_cat("markerless-starting", None).await;
+    ctx.wait_observed("markerless-starting", ObservedState::Running)
+        .await;
+    node.quiesce().await;
+    let jobs_before = node.job_payloads.lock().unwrap().len();
+    ctx.cp
+        .state
+        .store
+        .set_observed(&created.cat.id, ObservedState::Starting)
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    let cat = ctx
+        .cp
+        .state
+        .store
+        .must_get_cat_by_id(&created.cat.id)
+        .unwrap();
+    assert_eq!(cat.observed_state, ObservedState::Starting);
+    assert!(ctx
+        .cp
+        .state
+        .store
+        .lifecycle_dispatch(&created.cat.id)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        node.job_payloads.lock().unwrap().len(),
+        jobs_before,
+        "a markerless Starting row was guessed to be StartCat"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_immediately_after_create_without_a_node_converges_cold() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let created = ctx.create_cat("stop-before-placement", None).await;
+    let stop = ctx.action("stop-before-placement", "stop").await;
+    let cold = wait_for_persisted_transition(
+        &ctx.cp,
+        &created.cat.id,
+        &stop.operation.id,
+        ObservedState::Cold,
+        OperationPhase::Succeeded,
+    )
+    .await;
+    assert!(cold.node_id.is_none());
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .get_operation(&created.operation.id)
+            .unwrap()
+            .phase,
+        OperationPhase::Failed
+    );
 }
 
 async fn wait_for_persisted_transition(
@@ -1623,8 +2485,8 @@ async fn reconciler_handoff_finishes_a_converged_operation_without_replaying_nod
             .get_operation("op_handoff_historical")
             .unwrap()
             .phase,
-        OperationPhase::Succeeded,
-        "a superseded historical operation should not remain pending forever"
+        OperationPhase::Failed,
+        "a superseded historical operation should fail instead of remaining pending forever"
     );
     for operation_id in ["op_handoff_future", "op_handoff_deleted"] {
         assert_eq!(
@@ -2003,7 +2865,10 @@ async fn snapshot_requires_the_running_disks_remote_watermark() {
 
 #[tokio::test]
 async fn ambiguous_start_response_retries_the_same_claim_without_revoking_its_epoch() {
-    let ctx = Ctx::new_with_auto_tier(Default::default(), 1_500).await;
+    // Exercise the phase-A markerless boundary explicitly. Phase B persists
+    // exact grants in its marker; phase A must still preserve the live epoch
+    // when StartCat succeeded but its response was lost.
+    let ctx = Ctx::new_with_provenance(Default::default(), 1_500, 3_000, false).await;
     let source = start_stub_node(&ctx.cp, "node_z").await;
     source
         .lose_start_responses_remaining
@@ -2361,6 +3226,7 @@ async fn control_plane_startup_grace_preserves_a_reconnecting_host_bound_cat() {
         reconcile_interval_ms: 10,
         oci_deploy_sync_wait_ms: 5_000,
         auto_tier_policy: Default::default(),
+        lifecycle_provenance_writes_enabled: false,
     })
     .await
     .unwrap();
@@ -2687,6 +3553,7 @@ async fn static_user_tokens_are_not_accepted() {
         reconcile_interval_ms: 200,
         oci_deploy_sync_wait_ms: 5_000,
         auto_tier_policy: Default::default(),
+        lifecycle_provenance_writes_enabled: true,
     };
     let cp = spawn(cfg).await.unwrap();
     let workspace_id = default_workspace_id(&cp);

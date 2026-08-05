@@ -1,6 +1,58 @@
 use super::*;
 
 impl Store {
+    pub(super) fn fail_active_lifecycle_operations_before(
+        tx: &mut postgres::Transaction<'_>,
+        resource_id: &str,
+        next_generation: i64,
+    ) -> Result<()> {
+        let error = serde_json::to_string(&ErrorBody::new(
+            ErrorCode::Conflict,
+            "superseded by a newer Cat desired state",
+        ))
+        .map_err(internal)?;
+        tx.execute(
+            "UPDATE operations SET phase='failed', error_json=$3, updated_at=$4
+              WHERE resource_id=$1 AND resource_generation < $2
+                AND phase IN ('pending','running')
+                AND kind IN (
+                    'cat.create', 'cat.start', 'cat.resume',
+                    'cat.suspend', 'cat.warm', 'cat.stop', 'cat.delete',
+                    'cat.auto_suspend', 'cat.auto_warm', 'cat.auto_cold',
+                    'cat.work_wake', 'cat.wake',
+                    'cat.credit_exhausted', 'cat.expire'
+                )",
+            &[&resource_id, &next_generation, &error, &now_unix()],
+        )
+        .map_err(internal)?;
+        Ok(())
+    }
+
+    pub(super) fn lifecycle_operation_for_generation_in(
+        tx: &mut postgres::Transaction<'_>,
+        resource_id: &str,
+        generation: i64,
+    ) -> Result<Option<Operation>> {
+        tx.query_opt(
+            "SELECT * FROM operations
+              WHERE resource_id=$1 AND resource_generation=$2
+                AND phase IN ('pending','running')
+                AND kind IN (
+                    'cat.create', 'cat.start', 'cat.resume',
+                    'cat.suspend', 'cat.warm', 'cat.stop', 'cat.delete',
+                    'cat.auto_suspend', 'cat.auto_warm', 'cat.auto_cold',
+                    'cat.work_wake', 'cat.wake',
+                    'cat.credit_exhausted', 'cat.expire'
+                )
+              ORDER BY created_at DESC, id DESC
+              LIMIT 1",
+            &[&resource_id, &generation],
+        )
+        .map_err(internal)?
+        .map(|row| row_to_operation(&row).map_err(internal))
+        .transpose()
+    }
+
     pub(super) fn idempotency_operation_in(
         tx: &mut postgres::Transaction<'_>,
         key: &str,

@@ -330,6 +330,17 @@ impl NodeRuntime {
             let rt = cats
                 .get(cat_id)
                 .context("no warm state for cat on this node")?;
+            if rt.state == ObservedState::Running {
+                // The completed-job journal is process-local, while the
+                // runtime ledger survives an agent restart.  Running at this
+                // generation is the durable idempotency oracle for replaying
+                // a RestoreCat whose successful response was lost.
+                anyhow::ensure!(
+                    rt.generation == generation,
+                    "Running runtime does not prove this RestoreCat generation completed"
+                );
+                return Ok(ObservedState::Running);
+            }
             if rt.state != ObservedState::Warm {
                 bail!("cannot restore from {:?}", rt.state);
             }

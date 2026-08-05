@@ -83,7 +83,7 @@ impl NodeRuntime {
             let Some(runtime) = cats.get(cat_id) else {
                 return Ok(());
             };
-            if runtime.generation == generation {
+            if runtime.generation >= generation {
                 return Ok(());
             }
             runtime.lifecycle_telemetry_target(cat_id)
@@ -93,7 +93,7 @@ impl NodeRuntime {
         let Some(runtime) = cats.get_mut(cat_id) else {
             return Ok(());
         };
-        if runtime.generation == generation {
+        if runtime.generation >= generation {
             return Ok(());
         }
         runtime.generation = generation;

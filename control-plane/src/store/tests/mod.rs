@@ -1,5 +1,6 @@
 use super::*;
 use cats_api::guest::GuestWorkLease;
+use cats_api::nodejob::{job_id, NodeJob, NodeJobAction, SuspendWorkFence};
 use cats_api::requests::NodeWorkStatusRequest;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -203,6 +204,97 @@ fn state_survives_a_reconnect() {
         store.must_get_cat_by_id(&cat_id).unwrap().expires_at_unix,
         Some(12345)
     );
+}
+
+#[test]
+fn schema_v1_upgrades_in_place_with_lifecycle_provenance_and_observed_generation() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let cat_id;
+    {
+        let store = Store::connect(&url, None).unwrap();
+        let workspace = bootstrap_workspace(&store, "schema-v1");
+        let (cat, _, create) = create_test_cat(&store, &workspace, "schema-v1-cat").unwrap();
+        cat_id = cat.id.clone();
+        store
+            .register_node(
+                "legacy-node",
+                "http://node",
+                "http://gateway",
+                4,
+                8192,
+                false,
+            )
+            .unwrap();
+        store.set_placement(&cat.id, Some("legacy-node")).unwrap();
+        store.set_observed(&cat.id, ObservedState::Running).unwrap();
+        store.finish_operation(&create.id, None).unwrap();
+        store
+            .publish_routes(&cat.id, "legacy-node", "http://gateway")
+            .unwrap();
+        store
+            .with(|client| {
+                client.batch_execute(
+                    "ALTER TABLE cats DROP COLUMN lifecycle_dispatch_json;
+                     ALTER TABLE cats DROP COLUMN observed_generation;
+                     UPDATE control_schema_version SET version=1 WHERE singleton",
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            store.must_get_cat_by_id(&cat.id).unwrap().name,
+            "schema-v1-cat"
+        );
+    }
+
+    let upgraded = Store::connect(&url, None).unwrap();
+    let version: i64 = upgraded
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT version FROM control_schema_version WHERE singleton",
+                    &[],
+                )?
+                .try_get(0)
+        })
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+    let marker: Option<String> = upgraded
+        .with(|client| {
+            client
+                .query_one("SELECT lifecycle_dispatch_json FROM cats", &[])?
+                .try_get(0)
+        })
+        .unwrap();
+    assert!(marker.is_none());
+    let observed_generation: i64 = upgraded
+        .with(|client| {
+            client
+                .query_one("SELECT observed_generation FROM cats", &[])?
+                .try_get(0)
+        })
+        .unwrap();
+    assert_eq!(observed_generation, 1);
+    assert!(
+        upgraded
+            .cats_needing_work()
+            .unwrap()
+            .into_iter()
+            .all(|cat| cat.name != "schema-v1-cat"),
+        "rolling upgrade scheduled a no-op lifecycle alignment"
+    );
+    let (route, state) = upgraded
+        .resolve_route(
+            &upgraded
+                .endpoints_for_cat(&cat_id)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+                .hostname,
+        )
+        .unwrap();
+    assert_eq!(route.gateway_url, "http://gateway");
+    assert_eq!(state, "active");
 }
 
 #[test]
@@ -968,7 +1060,9 @@ fn last_guest_work_release_is_immediately_suspend_eligible() {
         .register_node("node-1", "http://node", "http://gateway", 4, 8192, false)
         .unwrap();
     store.set_placement(&cat.id, Some("node-1")).unwrap();
-    store.set_observed(&cat.id, ObservedState::Running).unwrap();
+    store
+        .set_observed_for_generation(&cat.id, ObservedState::Running, 1)
+        .unwrap();
     let status = |sequence, leases| NodeWorkStatusRequest {
         node_id: "node-1".into(),
         cat_id: cat.id.clone(),
@@ -1271,7 +1365,9 @@ fn gateway_work_blocks_auto_suspend_and_wake_is_singleflight() {
         .register_node("node-1", "http://node", "http://gateway", 4, 8192, false)
         .unwrap();
     store.set_placement(&cat.id, Some("node-1")).unwrap();
-    store.set_observed(&cat.id, ObservedState::Running).unwrap();
+    store
+        .set_observed_for_generation(&cat.id, ObservedState::Running, 1)
+        .unwrap();
     store.set_auto_suspend(&cat.id, true).unwrap();
     store
         .ingest_guest_work(&NodeWorkStatusRequest {
@@ -1306,7 +1402,9 @@ fn guest_work_cancels_an_inflight_suspend_without_generation_drift() {
         .register_node("node-1", "http://node", "http://gateway", 4, 8192, false)
         .unwrap();
     store.set_placement(&cat.id, Some("node-1")).unwrap();
-    store.set_observed(&cat.id, ObservedState::Running).unwrap();
+    store
+        .set_observed_for_generation(&cat.id, ObservedState::Running, 1)
+        .unwrap();
     store.set_auto_suspend(&cat.id, true).unwrap();
     let report = |sequence, leases| NodeWorkStatusRequest {
         node_id: "node-1".into(),
@@ -1345,6 +1443,417 @@ fn guest_work_cancels_an_inflight_suspend_without_generation_drift() {
 }
 
 #[test]
+fn late_old_generation_result_cannot_clear_or_complete_the_new_dispatch() {
+    let store = test_store();
+    let workspace = bootstrap_workspace(&store, "dispatch-cas");
+    let (cat, _, create) = create_test_cat(&store, &workspace, "dispatch-cas").unwrap();
+    store
+        .register_node("node-1", "http://node", "http://gateway", 4, 8192, false)
+        .unwrap();
+    store.set_placement(&cat.id, Some("node-1")).unwrap();
+    store
+        .set_observed_for_generation(&cat.id, ObservedState::Running, 1)
+        .unwrap();
+    store.finish_operation(&create.id, None).unwrap();
+
+    let suspend = store
+        .set_desired(&cat.id, DesiredState::Suspended, None, "cat.suspend")
+        .unwrap();
+    let old_job = NodeJob {
+        job_id: job_id(&cat.id, 2, "suspend_cat"),
+        cat_generation: 2,
+        action: NodeJobAction::SuspendCat {
+            cat_id: cat.id.clone(),
+            work_fence: Some(SuspendWorkFence {
+                control_work_version: 17,
+                guest_lease_sequence: 29,
+            }),
+        },
+    };
+    let old = store
+        .begin_lifecycle_dispatch(
+            &cat.id,
+            "node-1",
+            ObservedState::Running,
+            ObservedState::Suspending,
+            ObservedState::Suspended,
+            old_job,
+        )
+        .unwrap()
+        .unwrap();
+    let persisted = store.lifecycle_dispatch(&cat.id).unwrap().unwrap();
+    assert_eq!(persisted.job.job_id, old.job.job_id);
+    assert!(matches!(
+        persisted.job.action,
+        NodeJobAction::SuspendCat {
+            work_fence: Some(SuspendWorkFence {
+                control_work_version: 17,
+                guest_lease_sequence: 29,
+            }),
+            ..
+        }
+    ));
+
+    let resume = store
+        .set_desired(&cat.id, DesiredState::Running, None, "cat.resume")
+        .unwrap();
+    assert_eq!(resume.resource_generation, 3);
+    assert_eq!(
+        store.get_operation(&suspend.id).unwrap().phase,
+        OperationPhase::Failed,
+        "superseded generation stayed active"
+    );
+    assert!(store
+        .settle_lifecycle_dispatch(&old, ObservedState::Suspended, true, None, None, false,)
+        .unwrap());
+    assert_eq!(
+        store.get_operation(&resume.id).unwrap().phase,
+        OperationPhase::Pending
+    );
+
+    let new_job = NodeJob {
+        job_id: job_id(&cat.id, 3, "resume_cat"),
+        cat_generation: 3,
+        action: NodeJobAction::ResumeCat {
+            cat_id: cat.id.clone(),
+        },
+    };
+    let new = store
+        .begin_lifecycle_dispatch(
+            &cat.id,
+            "node-1",
+            ObservedState::Suspended,
+            ObservedState::Starting,
+            ObservedState::Running,
+            new_job,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        !store
+            .settle_lifecycle_dispatch(
+                &old,
+                ObservedState::Suspended,
+                true,
+                None,
+                Some(("stale-node", "http://stale-gateway")),
+                false,
+            )
+            .unwrap(),
+        "late gen2 response cleared the gen3 marker"
+    );
+    assert_eq!(
+        store
+            .lifecycle_dispatch(&cat.id)
+            .unwrap()
+            .unwrap()
+            .dispatch_id,
+        new.dispatch_id
+    );
+    assert_eq!(
+        store.get_operation(&resume.id).unwrap().phase,
+        OperationPhase::Pending
+    );
+    let stale_route_count: i64 = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT COUNT(*) FROM routes
+                      WHERE cat_id=$1 AND gateway_url='http://stale-gateway'",
+                    &[&cat.id],
+                )?
+                .try_get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        stale_route_count, 0,
+        "late result republished a stale route"
+    );
+
+    assert!(store
+        .settle_lifecycle_dispatch(
+            &new,
+            ObservedState::Running,
+            true,
+            None,
+            Some(("node-1", "http://gateway")),
+            false,
+        )
+        .unwrap());
+    assert_eq!(
+        store.get_operation(&resume.id).unwrap().phase,
+        OperationPhase::Succeeded
+    );
+}
+
+#[test]
+fn confirmed_fence_atomically_clears_every_host_claim() {
+    let store = test_store();
+    let workspace = bootstrap_workspace(&store, "fenced-cat-atomic");
+    let (cat, _, _) = create_test_cat(&store, &workspace, "fenced-cat-atomic").unwrap();
+    store
+        .register_node("node-1", "http://node", "http://gateway", 4, 8192, false)
+        .unwrap();
+    store.set_placement(&cat.id, Some("node-1")).unwrap();
+    store.set_observed(&cat.id, ObservedState::Running).unwrap();
+    store
+        .publish_routes(&cat.id, "node-1", "http://gateway")
+        .unwrap();
+    let suspend = store
+        .set_desired(&cat.id, DesiredState::Suspended, None, "cat.suspend")
+        .unwrap();
+    let _dispatch = store
+        .begin_lifecycle_dispatch(
+            &cat.id,
+            "node-1",
+            ObservedState::Running,
+            ObservedState::Suspending,
+            ObservedState::Suspended,
+            NodeJob {
+                job_id: job_id(&cat.id, suspend.resource_generation, "suspend_cat"),
+                cat_generation: suspend.resource_generation,
+                action: NodeJobAction::SuspendCat {
+                    cat_id: cat.id.clone(),
+                    work_fence: None,
+                },
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+    assert!(store.converge_fenced_cat(&cat.id, "node-1").unwrap());
+    let converged = store.must_get_cat_by_id(&cat.id).unwrap();
+    assert_eq!(converged.observed_state, ObservedState::Cold);
+    assert!(converged.node_id.is_none());
+    assert_eq!(
+        store.observed_generation(&cat.id).unwrap(),
+        suspend.resource_generation
+    );
+    assert!(store.lifecycle_dispatch(&cat.id).unwrap().is_none());
+    let (route_node, gateway, route_state): (Option<String>, Option<String>, String) = store
+        .with(|client| {
+            let row = client.query_one(
+                "SELECT node_id, gateway_url, state FROM routes WHERE cat_id=$1",
+                &[&cat.id],
+            )?;
+            Ok((row.try_get(0)?, row.try_get(1)?, row.try_get(2)?))
+        })
+        .unwrap();
+    assert!(route_node.is_none());
+    assert!(gateway.is_none());
+    assert_eq!(route_state, "unbound");
+
+    // A stale retry after reassignment cannot revoke the successor's claim.
+    store.set_placement(&cat.id, Some("node-2")).unwrap();
+    assert!(!store.converge_fenced_cat(&cat.id, "node-1").unwrap());
+    assert_eq!(
+        store
+            .must_get_cat_by_id(&cat.id)
+            .unwrap()
+            .node_id
+            .as_deref(),
+        Some("node-2")
+    );
+}
+
+#[test]
+fn repeated_same_desired_coalesces_without_inventing_a_node_generation() {
+    let store = test_store();
+    let workspace = bootstrap_workspace(&store, "same-desired");
+    let (cat, _, create) = create_test_cat(&store, &workspace, "same-desired").unwrap();
+    store
+        .set_observed_for_generation(&cat.id, ObservedState::Running, 1)
+        .unwrap();
+    store.finish_operation(&create.id, None).unwrap();
+
+    let repeated = store
+        .set_desired(&cat.id, DesiredState::Running, None, "cat.start")
+        .unwrap();
+    assert_eq!(repeated.resource_generation, 1);
+    assert_eq!(repeated.phase, OperationPhase::Succeeded);
+    assert_eq!(store.must_get_cat_by_id(&cat.id).unwrap().generation, 1);
+
+    store.set_observed(&cat.id, ObservedState::Failed).unwrap();
+    let retry = store
+        .set_desired(&cat.id, DesiredState::Running, None, "cat.start")
+        .unwrap();
+    assert_eq!(retry.resource_generation, 2);
+    assert_eq!(retry.phase, OperationPhase::Pending);
+}
+
+#[test]
+fn generation_split_is_scheduled_and_same_desired_does_not_claim_success() {
+    let store = test_store();
+    let workspace = bootstrap_workspace(&store, "generation-split-work");
+    let (cat, _, create) = create_test_cat(&store, &workspace, "generation-split-work").unwrap();
+    store.finish_operation(&create.id, None).unwrap();
+    store
+        .with(|client| {
+            client
+                .execute(
+                    "UPDATE cats
+                        SET observed_state='running', desired_state='running',
+                            generation=2, observed_generation=1
+                      WHERE id=$1",
+                    &[&cat.id],
+                )
+                .map(|_| ())
+        })
+        .unwrap();
+
+    assert!(store
+        .cats_needing_work()
+        .unwrap()
+        .iter()
+        .any(|candidate| candidate.id == cat.id));
+    let repeated = store
+        .set_desired(&cat.id, DesiredState::Running, None, "cat.start")
+        .unwrap();
+    assert_eq!(repeated.resource_generation, 2);
+    assert_eq!(repeated.phase, OperationPhase::Pending);
+}
+
+#[test]
+fn automatic_tiers_require_exact_markerless_physical_convergence() {
+    let store = test_store();
+    let workspace = bootstrap_workspace(&store, "auto-generation-split");
+    let (cat, _, _) = create_test_cat(&store, &workspace, "auto-generation-split").unwrap();
+    store
+        .with(|client| {
+            client
+                .execute(
+                    "UPDATE cats
+                        SET desired_state='suspended', observed_state='suspended',
+                            generation=2, observed_generation=1,
+                            observed_state_since_ms=$2
+                      WHERE id=$1",
+                    &[&cat.id, &(now_ms() - 10_000)],
+                )
+                .map(|_| ())
+        })
+        .unwrap();
+    assert!(store
+        .auto_tier_candidates(Some(1), Some(1))
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .try_auto_tier(&cat.id, Some(1), Some(1))
+        .unwrap()
+        .is_none());
+
+    store
+        .with(|client| {
+            client
+                .execute(
+                    "UPDATE cats
+                        SET desired_state='running', observed_state='running',
+                            observed_generation=generation,
+                            lifecycle_dispatch_json='{}'
+                      WHERE id=$1",
+                    &[&cat.id],
+                )
+                .map(|_| ())
+        })
+        .unwrap();
+    assert!(!store.auto_suspend_candidates().unwrap().contains(&cat.id));
+    assert!(store.try_auto_suspend(&cat.id, 5_000).unwrap().is_none());
+}
+
+#[test]
+fn global_provenance_activation_linearizes_against_legacy_begin() {
+    let (legacy_store, activation_store) = test_store_pair();
+    let workspace = bootstrap_workspace(&legacy_store, "provenance-activation-race");
+    let (cat, _, create) =
+        create_test_cat(&legacy_store, &workspace, "provenance-activation-race").unwrap();
+    legacy_store
+        .register_node("node-1", "http://node", "http://gateway", 4, 8192, false)
+        .unwrap();
+    legacy_store.set_placement(&cat.id, Some("node-1")).unwrap();
+    legacy_store
+        .set_observed_for_generation(&cat.id, ObservedState::Running, 1)
+        .unwrap();
+    legacy_store.finish_operation(&create.id, None).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let cat_id = cat.id.clone();
+    let (legacy, activation) = std::thread::scope(|scope| {
+        let legacy_barrier = barrier.clone();
+        let legacy_store = &legacy_store;
+        let cat_id = &cat_id;
+        let legacy = scope.spawn(move || {
+            legacy_barrier.wait();
+            legacy_store.begin_legacy_lifecycle(
+                cat_id,
+                "node-1",
+                1,
+                ObservedState::Running,
+                ObservedState::Suspending,
+            )
+        });
+        let activation_barrier = barrier.clone();
+        let activation_store = &activation_store;
+        let activation = scope.spawn(move || {
+            activation_barrier.wait();
+            activation_store.activate_lifecycle_provenance_writes()
+        });
+        (legacy.join().unwrap().unwrap(), activation.join().unwrap())
+    });
+
+    match legacy {
+        LegacyLifecycleBegin::GateEnabled => {
+            activation.unwrap();
+            assert!(legacy_store.lifecycle_provenance_writes_enabled().unwrap());
+            assert_eq!(
+                legacy_store
+                    .must_get_cat_by_id(&cat.id)
+                    .unwrap()
+                    .observed_state,
+                ObservedState::Running
+            );
+        }
+        LegacyLifecycleBegin::Begun => {
+            assert!(activation.is_err());
+            assert!(!legacy_store.lifecycle_provenance_writes_enabled().unwrap());
+            assert_eq!(
+                legacy_store
+                    .must_get_cat_by_id(&cat.id)
+                    .unwrap()
+                    .observed_state,
+                ObservedState::Suspending
+            );
+        }
+        LegacyLifecycleBegin::Stale => panic!("race lost without either legal writer"),
+    }
+}
+
+#[test]
+fn global_provenance_activation_rejects_active_lifecycle_work() {
+    let store = test_store();
+    let workspace = bootstrap_workspace(&store, "provenance-activation-active");
+    let (cat, _, create) =
+        create_test_cat(&store, &workspace, "provenance-activation-active").unwrap();
+    assert!(store.activate_lifecycle_provenance_writes().is_err());
+    assert!(!store.lifecycle_provenance_writes_enabled().unwrap());
+    assert_eq!(
+        store.must_get_cat_by_id(&cat.id).unwrap().observed_state,
+        ObservedState::Creating
+    );
+    store.finish_operation(&create.id, None).unwrap();
+    store
+        .with(|client| {
+            client
+                .execute(
+                    "UPDATE cats SET desired_state='running', observed_state='running',
+                        generation=2, observed_generation=1 WHERE id=$1",
+                    &[&cat.id],
+                )
+                .map(|_| ())
+        })
+        .unwrap();
+    assert!(store.activate_lifecycle_provenance_writes().is_err());
+    assert!(!store.lifecycle_provenance_writes_enabled().unwrap());
+}
+
+#[test]
 fn automatic_deeper_tiers_use_persisted_state_age_and_respect_work() {
     let url = crate::testsupport::isolated_control_store_url();
     let cat_id;
@@ -1357,7 +1866,11 @@ fn automatic_deeper_tiers_use_persisted_state_age_and_respect_work() {
             .set_desired(&cat.id, DesiredState::Suspended, None, "cat.suspend")
             .unwrap();
         store
-            .set_observed(&cat.id, ObservedState::Suspended)
+            .set_observed_for_generation(
+                &cat.id,
+                ObservedState::Suspended,
+                suspend.resource_generation,
+            )
             .unwrap();
         store.finish_operation(&suspend.id, None).unwrap();
         store
@@ -1384,7 +1897,9 @@ fn automatic_deeper_tiers_use_persisted_state_age_and_respect_work() {
             store.must_get_cat_by_id(&cat.id).unwrap().desired_state,
             DesiredState::Warm
         );
-        store.set_observed(&cat.id, ObservedState::Warm).unwrap();
+        store
+            .set_observed_for_generation(&cat.id, ObservedState::Warm, warm.resource_generation)
+            .unwrap();
         store.finish_operation(&warm.id, None).unwrap();
         store
             .with(|client| {

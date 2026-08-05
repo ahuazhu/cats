@@ -22,7 +22,7 @@ use cats_api::resources::*;
 use cats_storage::{MetaError, MetadataStore};
 use futures_util::StreamExt;
 
-use crate::store::{now_ms, Store};
+use crate::store::{now_ms, LegacyLifecycleBegin, LifecycleDispatch, Store};
 
 /// How many Cats one reconcile tick drives at once.
 ///
@@ -266,11 +266,10 @@ impl Controller {
 
     async fn converge_fenced_node(&self, node_id: &str) -> anyhow::Result<()> {
         for cat in self.store.cats_on_node(node_id)? {
-            self.store.set_observed(&cat.id, ObservedState::Unknown)?;
             self.fence_cat_volumes(&cat).await?;
-            self.store.unbind_routes(&cat.id)?;
-            self.store.set_placement(&cat.id, None)?;
-            self.store.set_observed(&cat.id, ObservedState::Cold)?;
+            if self.store.converge_fenced_cat(&cat.id, node_id)? {
+                self.complete_ops_if_converged(&cat.id).await?;
+            }
         }
         Ok(())
     }
@@ -305,34 +304,12 @@ impl Controller {
             .filter(|node| node.state == NodeState::Draining)
         {
             for cat in self.store.cats_on_node(&node.id)? {
-                let job = NodeJob {
-                    job_id: nodejob::job_id(&cat.id, cat.generation, "drain_stop_cat"),
-                    cat_generation: cat.generation,
-                    action: NodeJobAction::StopCat {
-                        cat_id: cat.id.clone(),
-                        disposition: StopCatDisposition::Cold,
-                    },
-                };
-                match self.dispatch(&node.agent_url, &job).await {
-                    Ok(result) if result.phase == JobPhase::Succeeded => {
-                        self.store.unbind_routes(&cat.id)?;
-                        self.fence_cat_volumes(&cat).await?;
-                        self.store.set_placement(&cat.id, None)?;
-                        self.store.set_observed(&cat.id, ObservedState::Cold)?;
-                    }
-                    Ok(result) => tracing::warn!(
-                        node = %node.id,
-                        cat = %cat.id,
-                        error = ?result.error,
-                        "node drain stop failed; will retry"
-                    ),
-                    Err(error) => tracing::warn!(
-                        node = %node.id,
-                        cat = %cat.id,
-                        %error,
-                        "node drain dispatch failed; will retry"
-                    ),
+                if self.store.lifecycle_dispatch(&cat.id)?.is_some() {
+                    // Per-Cat reconciliation owns the already-persisted job.
+                    // Draining must not overwrite or race that physical action.
+                    continue;
                 }
+                self.stop_flow(&cat, StopCatDisposition::Cold).await?;
             }
             for orphan in self.store.orphan_reported_cats(&node.id)? {
                 let key = format!("{}@{}", orphan.cat_id, orphan.generation);
@@ -408,10 +385,6 @@ impl Controller {
     ///
     /// Deliberately does *not* notify the reconciler: the whole point is to let
     /// the tick pick this Cat up later instead of immediately.
-    fn defer_retry(&self, cat: &Cat) -> Duration {
-        self.defer_retry_key(attempt_key(cat))
-    }
-
     fn defer_retry_key(&self, key: String) -> Duration {
         let mut deferred = self.retry_after.lock().unwrap();
         let now = std::time::Instant::now();
@@ -436,23 +409,63 @@ impl Controller {
             .is_some_and(|(_, at)| std::time::Instant::now() < *at)
     }
 
-    /// Forget any backoff for this Cat, because it made progress.
-    fn clear_retry_backoff(&self, cat: &Cat) {
-        self.clear_retry_backoff_key(&attempt_key(cat));
-    }
-
     fn clear_retry_backoff_key(&self, key: &str) {
         self.retry_after.lock().unwrap().remove(key);
     }
 
     async fn reconcile_cat(&self, cat: &Cat) -> anyhow::Result<()> {
-        // Stable state and operation completion are separate transactions.
-        // A leader can disappear between them, so the Store deliberately
-        // returns a converged Cat whose current-generation operation is still
-        // active. Finish that operation without replaying physical node work.
-        if lifecycle_converged(cat) {
-            self.complete_ops_if_converged(&cat.id).await?;
+        let provenance_writes_enabled = self.store.lifecycle_provenance_writes_enabled()?;
+        // A persisted dispatch owns the physical runtime even when a newer API
+        // request has changed desired_state/generation.  Settle that exact job
+        // before interpreting the newer desired state; otherwise Starting is
+        // ambiguous between StartCat, ResumeCat and RestoreCat.
+        if let Some(dispatch) = self.store.lifecycle_dispatch(&cat.id)? {
+            return self.drive_lifecycle_dispatch(cat, &dispatch).await;
+        }
+        if provenance_writes_enabled
+            && matches!(
+                cat.observed_state,
+                ObservedState::Starting
+                    | ObservedState::Suspending
+                    | ObservedState::Warming
+                    | ObservedState::Stopping
+            )
+        {
+            let legacy_key = format!("legacy-transition:{}@{}", cat.id, cat.generation);
+            if self.retry_deferred_key(&legacy_key) {
+                return Ok(());
+            }
+            let retry_in = self.defer_retry_key(legacy_key);
+            // Upgrade fail-closed rule for a row written by an older replica:
+            // Starting alone cannot prove whether the physical action was
+            // StartCat, ResumeCat or RestoreCat.  Guessing StartCat can discard
+            // the only authoritative Relaxed journal.  New writers publish the
+            // state and marker atomically, so only legacy/inconsistent rows land
+            // here and require inventory/operator recovery.
+            tracing::error!(
+                cat = %cat.id,
+                generation = cat.generation,
+                ?cat.observed_state,
+                retry_in_ms = retry_in.as_millis(),
+                "transitional Cat has no lifecycle provenance; refusing to infer a node job"
+            );
             return Ok(());
+        }
+        if let Some(node_id) = &cat.node_id {
+            let node = self.store.get_node(node_id)?;
+            if matches!(node.state, NodeState::Lost | NodeState::Fenced) {
+                // Heartbeat recovery or an explicit fence must resolve
+                // ownership before even an idempotent generation-alignment
+                // action is sent to this Host.
+                return Ok(());
+            }
+        }
+        // A stable state name alone is not convergence: an older dispatch may
+        // have reached the same state requested by a newer generation.  Prove
+        // the node adopted the current generation with an idempotent lifecycle
+        // action before completing its Operation.
+        if lifecycle_converged(cat) {
+            return self.align_converged_generation(cat).await;
         }
         // A source-preserving failure leaves the Cat exactly as it was, so the
         // next tick would re-dispatch the identical job. Honour its backoff
@@ -460,19 +473,15 @@ impl Controller {
         if self.retry_deferred(cat) {
             return Ok(());
         }
-        if let Some(node_id) = &cat.node_id {
-            let node = self.store.get_node(node_id)?;
-            if matches!(node.state, NodeState::Lost | NodeState::Fenced) {
-                // The owner remains authoritative while merely Lost. A
-                // confirmed fence clears placement itself; until then no
-                // lifecycle request may implicitly hand the Cat to a peer.
-                return Ok(());
-            }
-        }
         use DesiredState as D;
         use ObservedState as O;
         match (cat.desired_state, cat.observed_state) {
             (D::Deleted, _) => self.delete_flow(cat).await,
+            (D::Cold, O::Creating | O::Failed) if cat.node_id.is_none() => {
+                self.store
+                    .set_observed_for_generation(&cat.id, O::Cold, cat.generation)?;
+                self.complete_ops_if_converged(&cat.id).await
+            }
             // Anything that needs compute first goes through the start flow.
             (D::Running | D::Suspended | D::Warm, O::Creating | O::Cold | O::Starting) => {
                 self.start_flow(cat).await
@@ -503,12 +512,42 @@ impl Controller {
             }
             (D::Warm, O::Suspended | O::Warming) => self.simple_transition(cat, "warm").await,
             (D::Suspended, O::Warm) => self.simple_transition(cat, "restore").await,
-            (D::Cold, O::Running | O::Suspended | O::Warm | O::Starting | O::Stopping) => {
+            (D::Cold, O::Running | O::Suspended | O::Warm) => {
+                self.stop_flow(cat, StopCatDisposition::Cold).await
+            }
+            (D::Cold, O::Starting | O::Suspending | O::Warming | O::Stopping)
+                if !provenance_writes_enabled =>
+            {
                 self.stop_flow(cat, StopCatDisposition::Cold).await
             }
             // Unknown clears when the owning node reports a complete,
             // same-generation inventory or an explicit Host fence converges
             // the Cat through Cold.
+            _ => Ok(()),
+        }
+    }
+
+    async fn align_converged_generation(&self, cat: &Cat) -> anyhow::Result<()> {
+        if self.store.observed_generation(&cat.id)? == cat.generation {
+            return self.complete_ops_if_converged(&cat.id).await;
+        }
+        match cat.observed_state {
+            // These actions are deliberately idempotent in the node runtime.
+            // Their success advances its runtime generation even when the
+            // physical state already equals the requested state.
+            ObservedState::Running => self.simple_transition(cat, "resume").await,
+            ObservedState::Suspended => self.simple_transition(cat, "suspend").await,
+            ObservedState::Warm => self.simple_transition(cat, "warm").await,
+            ObservedState::Cold => {
+                // Cold with no in-flight marker means there is no runtime whose
+                // generation must be aligned.
+                self.store.set_observed_for_generation(
+                    &cat.id,
+                    ObservedState::Cold,
+                    cat.generation,
+                )?;
+                self.complete_ops_if_converged(&cat.id).await
+            }
             _ => Ok(()),
         }
     }
@@ -557,12 +596,6 @@ impl Controller {
     }
 
     async fn start_flow(&self, cat: &Cat) -> anyhow::Result<()> {
-        // `Starting` is the durable dispatch boundary. Once it is persisted, a
-        // StartCat may already be running (or its successful response may have
-        // been lost), so replay only the same deterministic job on the same
-        // claimed node and never revoke its newly acquired disk epoch.
-        let replaying_dispatch =
-            cat.observed_state == ObservedState::Starting && cat.node_id.is_some();
         let node = if let Some(node_id) = &cat.node_id {
             self.store.get_node(node_id)?
         } else {
@@ -583,14 +616,19 @@ impl Controller {
         };
 
         let grants = self.volume_grants(cat).await?;
-        if !replaying_dispatch {
-            // Fence stale writers before crossing the durable dispatch
-            // boundary. A crash before `Starting` can safely repeat this step;
-            // a crash after it must preserve the epoch a live blockd may hold.
+        let provenance_writes_enabled = self.store.lifecycle_provenance_writes_enabled()?;
+        // Fence stale writers before atomically publishing the exact job and
+        // Starting boundary.  After that commit the marker, including these
+        // exact grants, is the only payload a successor may replay.
+        //
+        // During phase A, however, an existing markerless Starting row is the
+        // legacy durable boundary.  Its StartCat may already own the epoch, so
+        // replay must preserve that claim exactly as the pre-provenance writer
+        // did.  Activation cannot race this exception: the global gate refuses
+        // to enable while a markerless transitional row exists.
+        if provenance_writes_enabled || cat.observed_state != ObservedState::Starting {
             self.fence_cat_volumes(cat).await?;
-            self.store.set_observed(&cat.id, ObservedState::Starting)?;
         }
-
         let job = NodeJob {
             job_id: nodejob::job_id(&cat.id, cat.generation, "start_cat"),
             cat_generation: cat.generation,
@@ -602,57 +640,29 @@ impl Controller {
                 volumes: grants,
             },
         };
-        match self.dispatch(&node.agent_url, &job).await {
-            Ok(res) if res.phase == JobPhase::Succeeded => {
-                self.store.set_observed(&cat.id, ObservedState::Running)?;
-                self.store
-                    .publish_routes(&cat.id, &node.id, &node.gateway_url)?;
-                self.attempts.lock().unwrap().remove(&attempt_key(cat));
-                self.clear_retry_backoff(cat);
-                self.complete_ops_if_converged(&cat.id).await?;
-                Ok(())
-            }
-            Ok(res) => self.start_failed(cat, res.error.unwrap_or_default()).await,
-            Err(error) => {
-                // Transport/protocol failure is ambiguous: the Host may have
-                // completed StartCat. Keep placement + Starting and replay the
-                // same idempotent job next tick; moving elsewhere would revoke
-                // a live root-disk epoch and turn the old Guest read-only.
-                tracing::warn!(
-                    cat = %cat.id,
-                    node = %node.id,
-                    %error,
-                    "StartCat result unknown; retaining claim for same-node retry"
-                );
-                Ok(())
-            }
+        if !provenance_writes_enabled {
+            return self
+                .drive_legacy_lifecycle(
+                    cat,
+                    &node,
+                    job,
+                    ObservedState::Starting,
+                    ObservedState::Running,
+                )
+                .await;
         }
-    }
-
-    async fn start_failed(&self, cat: &Cat, error: String) -> anyhow::Result<()> {
-        tracing::warn!(cat = %cat.id, "start failed: {error}");
-        let mut attempts = self.attempts.lock().unwrap();
-        let n = attempts.entry(attempt_key(cat)).or_insert(0);
-        *n += 1;
-        let give_up = *n >= 3;
-        drop(attempts);
-        self.store.set_placement(&cat.id, None)?;
-        if give_up {
-            self.store.set_observed(&cat.id, ObservedState::Failed)?;
-            for op in self.store.pending_operations_for(&cat.id)? {
-                self.store.finish_operation(
-                    &op.id,
-                    Some(&ErrorBody::new(
-                        cats_api::error::ErrorCode::Unavailable,
-                        format!("start failed after retries: {error}"),
-                    )),
-                )?;
-            }
-        } else {
-            self.store.set_observed(&cat.id, ObservedState::Cold)?;
-            self.notify.notify_one();
-        }
-        Ok(())
+        let Some(dispatch) = self.store.begin_lifecycle_dispatch(
+            &cat.id,
+            &node.id,
+            cat.observed_state,
+            ObservedState::Starting,
+            ObservedState::Running,
+            job,
+        )?
+        else {
+            return Ok(());
+        };
+        self.drive_lifecycle_dispatch(cat, &dispatch).await
     }
 
     /// suspend / resume / warm / restore on the current node, with the
@@ -661,7 +671,8 @@ impl Controller {
         let transition_started = std::time::Instant::now();
         let Some(node_id) = &cat.node_id else {
             // Placement lost (e.g. host fenced) - converge through Cold.
-            self.store.set_observed(&cat.id, ObservedState::Cold)?;
+            self.store
+                .set_observed_for_generation(&cat.id, ObservedState::Cold, cat.generation)?;
             return Ok(());
         };
         let node = self
@@ -704,175 +715,453 @@ impl Controller {
                 ),
                 _ => unreachable!("unknown transition"),
             };
-        if cat.observed_state != transitional {
-            self.store.set_observed(&cat.id, transitional)?;
-        }
         let job = NodeJob {
             job_id: nodejob::job_id(&cat.id, cat.generation, job_action.kind()),
             cat_generation: cat.generation,
             action: job_action,
         };
-        let dispatch_started = std::time::Instant::now();
-        let dispatched = self.dispatch(&node.agent_url, &job).await;
+        if !self.store.lifecycle_provenance_writes_enabled()? {
+            return self
+                .drive_legacy_lifecycle(cat, &node, job, transitional, target)
+                .await;
+        }
+        let Some(dispatch) = self.store.begin_lifecycle_dispatch(
+            &cat.id,
+            &node.id,
+            cat.observed_state,
+            transitional,
+            target,
+            job,
+        )?
+        else {
+            return Ok(());
+        };
         tracing::info!(
             cat = %cat.id,
             action,
-            setup_us = dispatch_started.duration_since(transition_started).as_micros(),
-            dispatch_us = dispatch_started.elapsed().as_micros(),
-            "lifecycle transition dispatch timings"
+            setup_us = transition_started.elapsed().as_micros(),
+            "lifecycle transition provenance persisted"
         );
-        match dispatched {
-            Ok(res) if res.phase == JobPhase::Succeeded => {
-                let recorded = self
-                    .store
-                    .finish_transition(&cat.id, transitional, target)?;
-                if recorded && target == ObservedState::Running {
-                    self.store
-                        .publish_routes(&cat.id, &node.id, &node.gateway_url)?;
-                }
-                self.clear_retry_backoff(cat);
+        self.drive_lifecycle_dispatch(cat, &dispatch).await
+    }
+
+    async fn drive_lifecycle_dispatch(
+        &self,
+        cat: &Cat,
+        dispatch: &LifecycleDispatch,
+    ) -> anyhow::Result<()> {
+        if self.retry_deferred_key(&dispatch.dispatch_id) {
+            return Ok(());
+        }
+        let node = self.store.get_node(&dispatch.node_id)?;
+        if matches!(node.state, NodeState::Lost | NodeState::Fenced) {
+            return Ok(());
+        }
+        let result = match self.dispatch(&node.agent_url, &dispatch.job).await {
+            Ok(result) if result.job_id == dispatch.job.job_id => result,
+            Ok(result) => {
+                let retry_in = self.defer_retry_key(dispatch.dispatch_id.clone());
+                tracing::warn!(
+                    cat = %cat.id,
+                    expected_job = %dispatch.job.job_id,
+                    returned_job = %result.job_id,
+                    retry_in_ms = retry_in.as_millis(),
+                    "node returned a mismatched lifecycle result; retaining exact dispatch"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                // The Host may have committed the job before its response was
+                // lost.  No control-plane field changes at an ambiguous
+                // transport boundary; the same marker is replayed later.
+                let retry_in = self.defer_retry_key(dispatch.dispatch_id.clone());
+                tracing::warn!(
+                    cat = %cat.id,
+                    job = %dispatch.job.job_id,
+                    retry_in_ms = retry_in.as_millis(),
+                    "lifecycle result unknown: {error}; retaining exact dispatch"
+                );
+                return Ok(());
+            }
+        };
+
+        if result.phase == JobPhase::Succeeded {
+            if matches!(&dispatch.job.action, NodeJobAction::StopCat { .. }) {
+                // These steps are idempotent and precede marker settlement.  A
+                // crash replays the already-successful StopCat, then repeats
+                // the cleanup; it never exposes Cold while a writable lease or
+                // route is still published.
+                self.fence_cat_volumes(cat).await?;
+            }
+            let running_route = (dispatch.target_state == ObservedState::Running)
+                .then_some((node.id.as_str(), node.gateway_url.as_str()));
+            let release_placement = matches!(&dispatch.job.action, NodeJobAction::StopCat { .. });
+            let settled = self.store.settle_lifecycle_dispatch(
+                dispatch,
+                dispatch.target_state,
+                true,
+                None,
+                running_route,
+                release_placement,
+            )?;
+            if settled {
+                self.attempts.lock().unwrap().remove(&dispatch.dispatch_id);
+                self.clear_retry_backoff_key(&dispatch.dispatch_id);
                 self.complete_ops_if_converged(&cat.id).await?;
                 self.notify.notify_one();
-                Ok(())
             }
-            Ok(res) if res.phase == JobPhase::Rejected && action == "suspend" => {
-                tracing::info!(cat = %cat.id, "suspend cancelled because work changed");
+            return Ok(());
+        }
+
+        if result.phase == JobPhase::Rejected
+            && matches!(&dispatch.job.action, NodeJobAction::SuspendCat { .. })
+        {
+            let error = ErrorBody::new(
+                cats_api::error::ErrorCode::Conflict,
+                "work arrived while preparing to suspend",
+            );
+            if self.store.settle_lifecycle_dispatch(
+                dispatch,
+                ObservedState::Running,
+                true,
+                Some(&error),
+                None,
+                false,
+            )? {
                 self.store
-                    .cancel_rejected_suspend(&cat.id, cat.generation)?;
-                self.notify.notify_one();
-                Ok(())
+                    .cancel_rejected_suspend(&cat.id, dispatch.job.cat_generation)?;
             }
-            Ok(res) if action == "warm" => {
-                let err = res.error.unwrap_or_default();
-                // Warm creation is a source-preserving transition. In
-                // particular, a failed mandatory relaxed drain must keep the
-                // Host-local journal and lease alive for retry; a destructive
-                // Cold fallback here would turn a remote outage into data loss.
-                // Trust only the legal pre-Warm state reported by the node. A
-                // failure after the VM reached Warm must remain Warming so a
-                // later retry can finish the same generation-derived job.
-                let retained = if res.observed_state == ObservedState::Suspended {
-                    ObservedState::Suspended
-                } else {
-                    transitional
+            self.clear_retry_backoff_key(&dispatch.dispatch_id);
+            self.notify.notify_one();
+            return Ok(());
+        }
+
+        let error = result
+            .error
+            .unwrap_or_else(|| "node lifecycle job failed".into());
+        match &dispatch.job.action {
+            NodeJobAction::WarmCat { .. }
+            | NodeJobAction::StopCat { .. }
+            | NodeJobAction::SuspendCat { .. } => {
+                // These are source-preserving or mandatory-drain transitions.
+                // A failure may leave the unique Relaxed journal on this Host;
+                // never replace it with a destructive Cold start.
+                let source_state = match &dispatch.job.action {
+                    NodeJobAction::WarmCat { .. } => matches!(
+                        result.observed_state,
+                        ObservedState::Running | ObservedState::Suspended
+                    ),
+                    NodeJobAction::SuspendCat { .. } => {
+                        result.observed_state == ObservedState::Running
+                    }
+                    NodeJobAction::StopCat { .. } => matches!(
+                        result.observed_state,
+                        ObservedState::Running | ObservedState::Suspended | ObservedState::Warm
+                    ),
+                    _ => false,
                 };
-                self.store.set_observed(&cat.id, retained)?;
-                let retry_in = self.defer_retry(cat);
+                let retained = if source_state {
+                    result.observed_state
+                } else {
+                    dispatch.transitional_state
+                };
+                self.store
+                    .settle_lifecycle_dispatch(dispatch, retained, false, None, None, false)?;
+                let retry_in = self.defer_retry_key(dispatch.dispatch_id.clone());
                 tracing::warn!(
                     cat = %cat.id,
+                    job = %dispatch.job.job_id,
                     ?retained,
                     retry_in_ms = retry_in.as_millis(),
-                    "warm transition failed: {err}; retaining source state for retry"
+                    "source-preserving lifecycle job failed: {error}"
                 );
-                Ok(())
             }
-            Err(e) if action == "warm" => {
-                // The node may have completed Warm before the response was
-                // lost. Preserve the durable dispatch boundary and replay the
-                // same job id; reverting to Suspended would claim more than the
-                // control plane knows.
-                let retry_in = self.defer_retry(cat);
-                tracing::warn!(
-                    cat = %cat.id,
-                    retry_in_ms = retry_in.as_millis(),
-                    "warm dispatch failed: {e}; retaining Warming for retry"
-                );
-                Ok(())
-            }
-            other => {
-                let err = match other {
-                    Ok(res) => res.error.unwrap_or_default(),
-                    Err(e) => e.to_string(),
+            NodeJobAction::StartCat { .. } => {
+                if result.observed_state == ObservedState::Running {
+                    self.store.settle_lifecycle_dispatch(
+                        dispatch,
+                        dispatch.transitional_state,
+                        false,
+                        None,
+                        None,
+                        false,
+                    )?;
+                    let retry_in = self.defer_retry_key(dispatch.dispatch_id.clone());
+                    tracing::warn!(
+                        cat = %cat.id,
+                        retry_in_ms = retry_in.as_millis(),
+                        "StartCat reached Running but failed its post-action boundary; retaining exact job"
+                    );
+                    return Ok(());
+                }
+                let give_up = {
+                    let mut attempts = self.attempts.lock().unwrap();
+                    let count = attempts.entry(dispatch.dispatch_id.clone()).or_insert(0);
+                    *count += 1;
+                    *count >= 3
                 };
-                tracing::warn!(cat = %cat.id, action, "transition failed: {err}; falling back to Cold");
-                // ADR-0002: converge to a clean Cold fallback.
+                if give_up {
+                    let terminal = ErrorBody::new(
+                        cats_api::error::ErrorCode::Unavailable,
+                        format!("start failed after retries: {error}"),
+                    );
+                    self.fence_cat_volumes(cat).await?;
+                    self.store.settle_lifecycle_dispatch(
+                        dispatch,
+                        ObservedState::Failed,
+                        true,
+                        Some(&terminal),
+                        None,
+                        true,
+                    )?;
+                    self.attempts.lock().unwrap().remove(&dispatch.dispatch_id);
+                } else {
+                    self.store.settle_lifecycle_dispatch(
+                        dispatch,
+                        dispatch.transitional_state,
+                        false,
+                        None,
+                        None,
+                        false,
+                    )?;
+                    let retry_in = self.defer_retry_key(dispatch.dispatch_id.clone());
+                    tracing::warn!(
+                        cat = %cat.id,
+                        retry_in_ms = retry_in.as_millis(),
+                        "StartCat failed: {error}; retaining exact job for retry"
+                    );
+                }
+            }
+            NodeJobAction::ResumeCat { .. } | NodeJobAction::RestoreCat { .. } => {
+                // ADR-0002: failed wake converges through an explicit clean
+                // Cold fallback.  Do not clear the original marker unless the
+                // node confirms cleanup; an ambiguous cleanup may have left
+                // the old runtime and its local journal intact.
                 let cleanup = NodeJob {
-                    job_id: nodejob::job_id(&cat.id, cat.generation, "cleanup_cat"),
-                    cat_generation: cat.generation,
+                    job_id: nodejob::job_id(&cat.id, dispatch.job.cat_generation, "cleanup_cat"),
+                    cat_generation: dispatch.job.cat_generation,
                     action: NodeJobAction::CleanupCat {
                         cat_id: cat.id.clone(),
                     },
                 };
-                let _ = self.dispatch(&node.agent_url, &cleanup).await;
+                match self.dispatch(&node.agent_url, &cleanup).await {
+                    Ok(cleaned)
+                        if cleaned.job_id == cleanup.job_id
+                            && cleaned.phase == JobPhase::Succeeded =>
+                    {
+                        self.fence_cat_volumes(cat).await?;
+                        self.store.settle_lifecycle_dispatch(
+                            dispatch,
+                            ObservedState::Cold,
+                            true,
+                            None,
+                            None,
+                            true,
+                        )?;
+                        self.clear_retry_backoff_key(&dispatch.dispatch_id);
+                        self.notify.notify_one();
+                    }
+                    other => {
+                        let retry_in = self.defer_retry_key(dispatch.dispatch_id.clone());
+                        tracing::warn!(
+                            cat = %cat.id,
+                            retry_in_ms = retry_in.as_millis(),
+                            cleanup_result = ?other,
+                            "wake failed ({error}); cleanup is unconfirmed, retaining exact dispatch"
+                        );
+                    }
+                }
+            }
+            _ => unreachable!("non-lifecycle action stored as lifecycle provenance"),
+        }
+        Ok(())
+    }
+
+    /// Phase-A writer used only while older replicas may still regain the
+    /// singleton lock. It deliberately persists the historical transitional
+    /// state without the new column, so old binaries remain able to reconcile
+    /// rows written during that rollout. The same binary always prefers and
+    /// replays a marker when one already exists, which is what makes it a
+    /// compatible reader before phase B enables marker writes fleet-wide.
+    async fn drive_legacy_lifecycle(
+        &self,
+        cat: &Cat,
+        node: &Node,
+        job: NodeJob,
+        transitional: ObservedState,
+        target: ObservedState,
+    ) -> anyhow::Result<()> {
+        match self.store.begin_legacy_lifecycle(
+            &cat.id,
+            &node.id,
+            job.cat_generation,
+            cat.observed_state,
+            transitional,
+        )? {
+            LegacyLifecycleBegin::Begun => {}
+            LegacyLifecycleBegin::Stale => return Ok(()),
+            LegacyLifecycleBegin::GateEnabled => {
+                let Some(dispatch) = self.store.begin_lifecycle_dispatch(
+                    &cat.id,
+                    &node.id,
+                    cat.observed_state,
+                    transitional,
+                    target,
+                    job,
+                )?
+                else {
+                    return Ok(());
+                };
+                return self.drive_lifecycle_dispatch(cat, &dispatch).await;
+            }
+        }
+        let result = match self.dispatch(&node.agent_url, &job).await {
+            Ok(result) if result.job_id == job.job_id => result,
+            Ok(result) => {
+                tracing::warn!(
+                    cat = %cat.id,
+                    expected_job = %job.job_id,
+                    returned_job = %result.job_id,
+                    "phase-A node returned mismatched lifecycle result"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                tracing::warn!(cat = %cat.id, job = %job.job_id, "phase-A lifecycle result unknown: {error}");
+                return Ok(());
+            }
+        };
+        if result.phase == JobPhase::Succeeded {
+            if matches!(&job.action, NodeJobAction::StopCat { .. }) {
                 self.fence_cat_volumes(cat).await?;
                 self.store.unbind_routes(&cat.id)?;
                 self.store.set_placement(&cat.id, None)?;
-                self.store.set_observed(&cat.id, ObservedState::Cold)?;
-                self.clear_retry_backoff(cat);
-                self.notify.notify_one();
-                Ok(())
+            } else if target == ObservedState::Running {
+                self.store
+                    .publish_routes(&cat.id, &node.id, &node.gateway_url)?;
             }
+            self.store
+                .set_observed_for_generation(&cat.id, target, job.cat_generation)?;
+            self.complete_ops_if_converged(&cat.id).await?;
+            self.notify.notify_one();
+            return Ok(());
         }
+        if result.phase == JobPhase::Rejected
+            && matches!(&job.action, NodeJobAction::SuspendCat { .. })
+        {
+            self.store.set_observed_for_generation(
+                &cat.id,
+                ObservedState::Running,
+                job.cat_generation,
+            )?;
+            self.store
+                .cancel_rejected_suspend(&cat.id, job.cat_generation)?;
+            self.notify.notify_one();
+            return Ok(());
+        }
+
+        match &job.action {
+            NodeJobAction::WarmCat { .. }
+            | NodeJobAction::StopCat { .. }
+            | NodeJobAction::SuspendCat { .. } => {
+                let retained = match result.observed_state {
+                    ObservedState::Running | ObservedState::Suspended | ObservedState::Warm => {
+                        result.observed_state
+                    }
+                    _ => transitional,
+                };
+                self.store.set_observed(&cat.id, retained)?;
+                self.defer_retry_key(attempt_key(cat));
+            }
+            NodeJobAction::StartCat { .. } => {
+                let give_up = {
+                    let mut attempts = self.attempts.lock().unwrap();
+                    let count = attempts.entry(attempt_key(cat)).or_insert(0);
+                    *count += 1;
+                    *count >= 3
+                };
+                if give_up {
+                    self.fence_cat_volumes(cat).await?;
+                    self.store.unbind_routes(&cat.id)?;
+                    self.store.set_placement(&cat.id, None)?;
+                    self.store.set_observed(&cat.id, ObservedState::Failed)?;
+                    let error = ErrorBody::new(
+                        cats_api::error::ErrorCode::Unavailable,
+                        "phase-A StartCat failed after retries",
+                    );
+                    for operation in self.store.pending_operations_for(&cat.id)? {
+                        if operation.resource_generation == job.cat_generation {
+                            self.store.finish_operation(&operation.id, Some(&error))?;
+                        }
+                    }
+                }
+            }
+            NodeJobAction::ResumeCat { .. } | NodeJobAction::RestoreCat { .. } => {
+                let cleanup = NodeJob {
+                    job_id: nodejob::job_id(&cat.id, job.cat_generation, "cleanup_cat"),
+                    cat_generation: job.cat_generation,
+                    action: NodeJobAction::CleanupCat {
+                        cat_id: cat.id.clone(),
+                    },
+                };
+                if let Ok(cleaned) = self.dispatch(&node.agent_url, &cleanup).await {
+                    if cleaned.job_id == cleanup.job_id && cleaned.phase == JobPhase::Succeeded {
+                        self.fence_cat_volumes(cat).await?;
+                        self.store.unbind_routes(&cat.id)?;
+                        self.store.set_placement(&cat.id, None)?;
+                        self.store.set_observed_for_generation(
+                            &cat.id,
+                            ObservedState::Cold,
+                            job.cat_generation,
+                        )?;
+                        self.notify.notify_one();
+                    }
+                }
+            }
+            _ => unreachable!("non-lifecycle action in phase-A lifecycle writer"),
+        }
+        Ok(())
     }
 
     async fn stop_flow(&self, cat: &Cat, disposition: StopCatDisposition) -> anyhow::Result<()> {
         let Some(node_id) = &cat.node_id else {
-            self.store.set_observed(&cat.id, ObservedState::Cold)?;
+            self.store
+                .set_observed_for_generation(&cat.id, ObservedState::Cold, cat.generation)?;
             self.complete_ops_if_converged(&cat.id).await?;
             return Ok(());
         };
-        let node = self
-            .store
-            .list_nodes()?
-            .into_iter()
-            .find(|n| &n.id == node_id);
-        if cat.observed_state != ObservedState::Stopping {
-            self.store.set_observed(&cat.id, ObservedState::Stopping)?;
+        let node = self.store.get_node(node_id)?;
+        let job = NodeJob {
+            job_id: nodejob::job_id(&cat.id, cat.generation, "stop_cat"),
+            cat_generation: cat.generation,
+            action: NodeJobAction::StopCat {
+                cat_id: cat.id.clone(),
+                disposition,
+            },
+        };
+        if !self.store.lifecycle_provenance_writes_enabled()? {
+            return self
+                .drive_legacy_lifecycle(
+                    cat,
+                    &node,
+                    job,
+                    ObservedState::Stopping,
+                    ObservedState::Cold,
+                )
+                .await;
         }
-        if let Some(node) = node {
-            let job = NodeJob {
-                job_id: nodejob::job_id(&cat.id, cat.generation, "stop_cat"),
-                cat_generation: cat.generation,
-                action: NodeJobAction::StopCat {
-                    cat_id: cat.id.clone(),
-                    disposition,
-                },
-            };
-            match self.dispatch(&node.agent_url, &job).await {
-                Ok(res) if res.phase == JobPhase::Succeeded => {}
-                Ok(res) => {
-                    // Restore only a stable state that can be the source of a
-                    // StopCat request. Anything else may mean the Host stopped
-                    // the VM before returning a failed result, so retain the
-                    // durable Stopping boundary and retry the same job id.
-                    let retained = match res.observed_state {
-                        ObservedState::Running | ObservedState::Suspended | ObservedState::Warm => {
-                            res.observed_state
-                        }
-                        _ => ObservedState::Stopping,
-                    };
-                    self.store.set_observed(&cat.id, retained)?;
-                    let retry_in = self.defer_retry(cat);
-                    tracing::warn!(
-                        cat = %cat.id,
-                        ?retained,
-                        retry_in_ms = retry_in.as_millis(),
-                        "stop job failed: {:?}; retaining source state for retry",
-                        res.error
-                    );
-                    return Ok(());
-                }
-                Err(e) => {
-                    // A lost response is ambiguous: the node may have already
-                    // stopped the Cat. Keep Stopping so a successor replays the
-                    // deterministic job instead of asserting the stale source.
-                    let retry_in = self.defer_retry(cat);
-                    tracing::warn!(
-                        cat = %cat.id,
-                        retry_in_ms = retry_in.as_millis(),
-                        "stop dispatch failed: {e}; retaining Stopping for retry"
-                    );
-                    return Ok(());
-                }
-            }
-        }
-        self.store.unbind_routes(&cat.id)?;
-        self.fence_cat_volumes(cat).await?;
-        self.store.set_placement(&cat.id, None)?;
-        self.store.set_observed(&cat.id, ObservedState::Cold)?;
-        self.clear_retry_backoff(cat);
-        self.complete_ops_if_converged(&cat.id).await?;
-        Ok(())
+        let Some(dispatch) = self.store.begin_lifecycle_dispatch(
+            &cat.id,
+            &node.id,
+            cat.observed_state,
+            ObservedState::Stopping,
+            ObservedState::Cold,
+            job,
+        )?
+        else {
+            return Ok(());
+        };
+        self.drive_lifecycle_dispatch(cat, &dispatch).await
     }
 
     async fn delete_flow(&self, cat: &Cat) -> anyhow::Result<()> {
@@ -924,10 +1213,21 @@ impl Controller {
 
     async fn complete_ops_if_converged(&self, cat_id: &str) -> anyhow::Result<()> {
         let cat = self.store.must_get_cat_by_id(cat_id)?;
-        if lifecycle_converged(&cat) {
+        if lifecycle_converged(&cat)
+            && self.store.lifecycle_dispatch(cat_id)?.is_none()
+            && self.store.observed_generation(cat_id)? == cat.generation
+        {
             for op in self.store.pending_lifecycle_operations_for(cat_id)? {
-                if op.resource_generation <= cat.generation {
+                if op.resource_generation == cat.generation {
                     self.store.finish_operation(&op.id, None)?;
+                } else if op.resource_generation < cat.generation {
+                    self.store.finish_operation(
+                        &op.id,
+                        Some(&ErrorBody::new(
+                            cats_api::error::ErrorCode::Conflict,
+                            "superseded by a newer Cat generation",
+                        )),
+                    )?;
                 }
             }
         }

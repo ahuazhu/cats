@@ -64,6 +64,9 @@ pub struct Config {
     pub node_lease_timeout_ms: i64,
     pub reconcile_interval_ms: u64,
     pub auto_tier_policy: AutoTierPolicy,
+    /// Phase-B switch for durable lifecycle-dispatch provenance. Keep false
+    /// for the first rollout so pre-reader replicas can still regain leadership.
+    pub lifecycle_provenance_writes_enabled: bool,
     /// How long `POST .../oci-deployments` may hold a request open before it
     /// answers `202` with an operation to poll.
     ///
@@ -289,6 +292,10 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
             .as_deref()
             .and_then(|p| p.to_str()),
     )?);
+    if cfg.lifecycle_provenance_writes_enabled {
+        store.activate_lifecycle_provenance_writes()?;
+        tracing::info!("durable lifecycle provenance writes are globally active");
+    }
     if let Some(workos) = &cfg.workos {
         store.ensure_configured_accounts(workos.account_organizations())?;
     } else {

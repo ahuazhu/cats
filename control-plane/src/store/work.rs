@@ -1,5 +1,8 @@
 use super::*;
 
+type AutoSuspendCatRow = (String, i64, bool, String, String, i64, Option<String>);
+type AutoTierCatRow = (String, i64, bool, String, String, i64, i64, Option<String>);
+
 impl Store {
     pub(super) fn fail_pending_auto_tier(
         tx: &mut postgres::Transaction<'_>,
@@ -281,6 +284,11 @@ impl Store {
             } else if wake_suspended {
                 Self::fail_pending_auto_tier(&mut tx, &request.cat_id, "superseded by Guest work")?;
                 let new_generation = generation + 1;
+                Self::fail_active_lifecycle_operations_before(
+                    &mut tx,
+                    &request.cat_id,
+                    new_generation,
+                )?;
                 tx.execute(
                     "UPDATE cats SET desired_state='running', generation=$2 WHERE id=$1",
                     &[&request.cat_id, &new_generation],
@@ -380,7 +388,9 @@ impl Store {
             client
                 .query(
                     "SELECT id FROM cats
-                     WHERE auto_suspend AND desired_state='running' AND observed_state='running'",
+                     WHERE auto_suspend AND desired_state='running' AND observed_state='running'
+                       AND observed_generation=generation
+                       AND lifecycle_dispatch_json IS NULL",
                     &[],
                 )?
                 .iter()
@@ -411,10 +421,11 @@ impl Store {
                 )
                 .map_err(internal)?;
             }
-            let cat: Option<(String, i64, bool, String, String)> = tx
+            let cat: Option<AutoSuspendCatRow> = tx
                 .query_opt(
                     "SELECT workspace_id, generation, auto_suspend,
-                        desired_state, observed_state
+                        desired_state, observed_state, observed_generation,
+                        lifecycle_dispatch_json
                  FROM cats WHERE id=$1",
                     &[&cat_id],
                 )
@@ -426,14 +437,30 @@ impl Store {
                         row.try_get(2)?,
                         row.try_get(3)?,
                         row.try_get(4)?,
+                        row.try_get(5)?,
+                        row.try_get(6)?,
                     ))
                 })
                 .transpose()
                 .map_err(internal)?;
-            let Some((workspace_id, generation, auto_suspend, desired, observed)) = cat else {
+            let Some((
+                workspace_id,
+                generation,
+                auto_suspend,
+                desired,
+                observed,
+                observed_generation,
+                dispatch,
+            )) = cat
+            else {
                 return Ok(None);
             };
-            if !auto_suspend || desired != "running" || observed != "running" {
+            if !auto_suspend
+                || desired != "running"
+                || observed != "running"
+                || observed_generation != generation
+                || dispatch.is_some()
+            {
                 return Ok(None);
             }
             let source_seen: Option<i64> = tx
@@ -461,11 +488,14 @@ impl Store {
                 return Ok(None);
             }
             let next = generation + 1;
+            Self::fail_active_lifecycle_operations_before(&mut tx, cat_id, next)?;
             let changed = tx
                 .execute(
                     "UPDATE cats SET desired_state='suspended', generation=$2
                  WHERE id=$1 AND generation=$3 AND desired_state='running'
                    AND observed_state='running' AND auto_suspend
+                   AND observed_generation=generation
+                   AND lifecycle_dispatch_json IS NULL
                    AND NOT EXISTS (
                      SELECT 1 FROM cat_work_leases
                      WHERE cat_id=$1 AND expires_at_ms>$4)",
@@ -497,7 +527,9 @@ impl Store {
                    FROM cats
                   WHERE auto_suspend
                     AND desired_state=observed_state
-                    AND observed_state IN ('suspended','warm')",
+                    AND observed_state IN ('suspended','warm')
+                    AND observed_generation=generation
+                    AND lifecycle_dispatch_json IS NULL",
                 &[],
             )?;
             let mut candidates = Vec::new();
@@ -550,10 +582,11 @@ impl Store {
                 .map_err(internal)?;
             }
 
-            let cat: Option<(String, i64, bool, String, String, i64)> = tx
+            let cat: Option<AutoTierCatRow> = tx
                 .query_opt(
                     "SELECT workspace_id, generation, auto_suspend,
-                        desired_state, observed_state, observed_state_since_ms
+                        desired_state, observed_state, observed_state_since_ms,
+                        observed_generation, lifecycle_dispatch_json
                    FROM cats WHERE id=$1",
                     &[&cat_id],
                 )
@@ -566,15 +599,30 @@ impl Store {
                         row.try_get(3)?,
                         row.try_get(4)?,
                         row.try_get(5)?,
+                        row.try_get(6)?,
+                        row.try_get(7)?,
                     ))
                 })
                 .transpose()
                 .map_err(internal)?;
-            let Some((workspace_id, generation, auto_suspend, desired, observed, since_ms)) = cat
+            let Some((
+                workspace_id,
+                generation,
+                auto_suspend,
+                desired,
+                observed,
+                since_ms,
+                observed_generation,
+                dispatch,
+            )) = cat
             else {
                 return Ok(None);
             };
-            if !auto_suspend || desired != observed {
+            if !auto_suspend
+                || desired != observed
+                || observed_generation != generation
+                || dispatch.is_some()
+            {
                 return Ok(None);
             }
             let (threshold_ms, next_state, operation_kind) = match observed.as_str() {
@@ -602,6 +650,7 @@ impl Store {
             }
 
             let next_generation = generation + 1;
+            Self::fail_active_lifecycle_operations_before(&mut tx, cat_id, next_generation)?;
             let changed = tx
                 .execute(
                     "UPDATE cats
@@ -611,6 +660,8 @@ impl Store {
                     AND auto_suspend
                     AND desired_state=$5
                     AND observed_state=$5
+                    AND observed_generation=generation
+                    AND lifecycle_dispatch_json IS NULL
                     AND observed_state_since_ms=$6
                     AND NOT EXISTS (
                         SELECT 1 FROM cat_work_leases
@@ -705,6 +756,11 @@ impl Store {
                     OR (c.desired_state='warm'      AND c.observed_state NOT IN ('warm'))
                     OR (c.desired_state='cold'      AND c.observed_state NOT IN ('cold'))
                     OR (c.desired_state='deleted'   AND c.observed_state NOT IN ('deleted'))
+                    OR (
+                        c.desired_state IN ('running','suspended','warm','cold')
+                        AND c.desired_state=c.observed_state
+                        AND c.observed_generation<>c.generation
+                    )
                     OR (
                         ((c.desired_state='running' AND c.observed_state='running')
                          OR (c.desired_state='suspended' AND c.observed_state='suspended')

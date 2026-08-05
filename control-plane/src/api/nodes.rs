@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::store::Store;
+
 pub(super) async fn register_node(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -49,27 +51,35 @@ pub(super) async fn heartbeat(
             );
         }
     }
+    let node = state.store.get_node(&req.node_id)?;
     // Drift detection: trust node reports for steady states at the same
-    // generation; the reconciler drives any resulting divergence.
+    // generation.  A Lost node may instead prove the source or target of an
+    // exact persisted dispatch; recording that inventory lets the node recover
+    // and replay the same job without guessing across a generation split.
     for hb in &req.cats {
         if let Ok(cat) = state.store.must_get_cat_by_id(&hb.cat_id) {
-            if cat.generation == hb.generation
+            let trusted_generation = if node.state == NodeState::Lost {
+                heartbeat_proves_claim(&state.store, &cat, hb)?
+            } else {
+                cat.generation == hb.generation
+            };
+            if node.state != NodeState::Fenced
+                && trusted_generation
                 && cat.node_id.as_deref() == Some(req.node_id.as_str())
-                && cat.observed_state != hb.state
                 && matches!(
-                    cat.observed_state,
-                    ObservedState::Running
-                        | ObservedState::Suspended
-                        | ObservedState::Warm
-                        | ObservedState::Unknown
+                    hb.state,
+                    ObservedState::Running | ObservedState::Suspended | ObservedState::Warm
                 )
+                && (cat.observed_state != hb.state
+                    || state.store.observed_generation(&cat.id)? != hb.generation)
             {
-                state.store.set_observed(&cat.id, hb.state)?;
+                state
+                    .store
+                    .set_observed_for_generation(&cat.id, hb.state, hb.generation)?;
                 state.notify.notify_one();
             }
         }
     }
-    let node = state.store.get_node(&req.node_id)?;
     if node.state == NodeState::Lost {
         // Recovery requires the Host to still hold everything the control plane
         // believes it holds -- otherwise a Cat may have moved on and recovering
@@ -86,22 +96,26 @@ pub(super) async fn heartbeat(
             .iter()
             .filter(|cat| cat.desired_state != DesiredState::Deleted)
             .collect();
-        let missing: Vec<&Cat> = required
-            .iter()
-            .copied()
-            .filter(|cat| {
-                !req.cats
-                    .iter()
-                    .any(|hb| hb.cat_id == cat.id && hb.generation == cat.generation)
-            })
-            .collect();
+        let mut missing = Vec::new();
+        for cat in required.iter().copied() {
+            let mut proved = false;
+            for hb in req.cats.iter().filter(|hb| hb.cat_id == cat.id) {
+                if heartbeat_proves_claim(&state.store, cat, hb)? {
+                    proved = true;
+                    break;
+                }
+            }
+            if !proved {
+                missing.push(cat);
+            }
+        }
         if missing.is_empty() {
             if state.store.recover_lost_node(&req.node_id)? {
                 tracing::info!(
                     node = %req.node_id,
                     claims = required.len(),
                     deleting = claims.len() - required.len(),
-                    "complete same-generation inventory recovered lost node claims"
+                    "complete provenance-matched inventory recovered lost node claims"
                 );
                 state.notify.notify_one();
             }
@@ -137,6 +151,24 @@ pub(super) async fn heartbeat(
         }
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn heartbeat_proves_claim(store: &Store, cat: &Cat, hb: &HeartbeatCat) -> ApiResult<bool> {
+    if cat.node_id.is_none() {
+        return Ok(false);
+    }
+    let observed_generation = store.observed_generation(&cat.id)?;
+    let Some(dispatch) = store.lifecycle_dispatch(&cat.id)? else {
+        return Ok(matches!(
+            hb.state,
+            ObservedState::Running | ObservedState::Suspended | ObservedState::Warm
+        ) && (hb.generation == cat.generation || hb.generation == observed_generation));
+    };
+    let marker_state = hb.state == dispatch.source_state
+        || hb.state == dispatch.transitional_state
+        || hb.state == dispatch.target_state;
+    Ok(marker_state
+        && (hb.generation == dispatch.job.cat_generation || hb.generation == observed_generation))
 }
 
 pub(super) async fn node_work_status(

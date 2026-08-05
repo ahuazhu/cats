@@ -54,6 +54,7 @@ impl Cluster {
             workos: None,
             stripe: None,
             billing_enforcement_enabled: false,
+            lifecycle_provenance_writes_enabled: true,
             node_lease_timeout_ms: 3_000,
             reconcile_interval_ms: 150,
             oci_deploy_sync_wait_ms: 5_000,

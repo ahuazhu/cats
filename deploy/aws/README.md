@@ -136,6 +136,18 @@ versions inside the build's supported range and fails closed on incompatible
 versions. The pre-cutover `cats-control-data` PVC is no longer part of the
 runtime; its final snapshot remains only as an archive.
 
+Lifecycle dispatch provenance has a two-phase rollout because an already
+running old replica can regain the PostgreSQL singleton lock during a rolling
+deployment. First deploy the new image with
+`lifecycle_provenance_writes_enabled=false`. Every new replica can read and
+replay markers but continues writing the legacy transitional boundary, so an
+old replica remains compatible. After the rollout reports every Pod at that
+image digest, set the variable to `true` once. Startup atomically activates a
+one-way database gate; every phase-A replica reads that shared gate before a
+lifecycle write and switches together. Setting the Terraform variable back to
+false does not disable the database gate. Do not activate phase B until the
+phase-A rollout and Pod-image verification are complete.
+
 Inspect the production singleton locks and control-plane network addresses from
 `main` without disrupting a Pod:
 

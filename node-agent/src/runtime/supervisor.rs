@@ -100,6 +100,23 @@ impl NodeRuntime {
         }
         let job_id = job.job_id.clone();
         let cat_id = job.action.cat_id().to_string();
+        let stale_generation = self
+            .cats
+            .lock()
+            .unwrap()
+            .get(&cat_id)
+            .is_some_and(|runtime| job.cat_generation < runtime.generation);
+        if stale_generation {
+            // Reject before run_action: checking only while recording metering
+            // is too late because an old Stop/Warm/Start may already have
+            // destroyed the newer runtime or its unique local journal.
+            return NodeJobResult::fail(
+                job_id,
+                self.observed_of(&cat_id),
+                "job generation is older than the runtime generation",
+                false,
+            );
+        }
         let result = match self.run_action(&job) {
             Ok(observed) => {
                 let lifecycle_boundary = if observed == ObservedState::Warm {
@@ -201,6 +218,10 @@ impl NodeRuntime {
     ) -> Result<ObservedState> {
         if let Some(rt) = self.cats.lock().unwrap().get(cat_id) {
             if rt.state == ObservedState::Running {
+                anyhow::ensure!(
+                    rt.generation == generation,
+                    "Running runtime does not prove this StartCat generation completed"
+                );
                 return Ok(ObservedState::Running);
             }
         }
@@ -210,24 +231,16 @@ impl NodeRuntime {
             // reconnect). Tear it down before removing/recreating its runtime
             // directory; otherwise the old VMM keeps the API socket and
             // memory backing open and the new VMM cannot start.
-            let existing = self.cats.lock().unwrap().remove(cat_id);
-            if let Some(mut runtime) = existing {
-                if matches!(
-                    runtime.state,
-                    ObservedState::Running | ObservedState::Suspended | ObservedState::Warm
-                ) {
-                    if let Err(error) =
-                        self.finalize_usage(runtime.lifecycle_telemetry_target(cat_id))
-                    {
-                        self.cats
-                            .lock()
-                            .unwrap()
-                            .insert(cat_id.to_string(), runtime);
-                        return Err(error);
-                    }
-                }
-                let _ = self.teardown(&mut runtime, TeardownMode::Discard);
-                let _ = std::fs::remove_dir_all(&runtime.dir);
+            let existing_state = self
+                .cats
+                .lock()
+                .unwrap()
+                .get(cat_id)
+                .map(|runtime| runtime.state);
+            if let Some(existing_state) = existing_state {
+                bail!(
+                    "cold StartCat cannot replace {existing_state:?} runtime without explicit CleanupCat"
+                );
             }
         }
         if let VmmMode::CloudHypervisor(chc) = &self.cfg.vmm {

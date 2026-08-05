@@ -159,7 +159,7 @@ fn ensure_schema(client: &mut Client) -> Result<()> {
 /// is not carried over). `connect` upgrades a database stamped inside
 /// `[OLDEST_MIGRATABLE_SCHEMA_VERSION, SCHEMA_VERSION]` in place and refuses
 /// anything else.
-pub(super) const SCHEMA_VERSION: i64 = 1;
+pub(super) const SCHEMA_VERSION: i64 = 3;
 
 /// The oldest stamped version `Store::connect` can still upgrade in place.
 const OLDEST_MIGRATABLE_SCHEMA_VERSION: i64 = 1;
@@ -167,8 +167,11 @@ const OLDEST_MIGRATABLE_SCHEMA_VERSION: i64 = 1;
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS control_schema_version (
     singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
-    version BIGINT NOT NULL
+    version BIGINT NOT NULL,
+    lifecycle_provenance_writes_enabled BOOLEAN NOT NULL DEFAULT FALSE
 );
+ALTER TABLE control_schema_version
+  ADD COLUMN IF NOT EXISTS lifecycle_provenance_writes_enabled BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE TABLE IF NOT EXISTS accounts (
     id TEXT PRIMARY KEY,
     slug TEXT NOT NULL UNIQUE,
@@ -251,6 +254,7 @@ CREATE TABLE IF NOT EXISTS cats (
     root_disk_id TEXT NOT NULL,
     desired_state TEXT NOT NULL,
     observed_state TEXT NOT NULL,
+    observed_generation BIGINT NOT NULL DEFAULT 0,
     generation BIGINT NOT NULL,
     auto_suspend BOOLEAN NOT NULL DEFAULT TRUE,
     work_version BIGINT NOT NULL DEFAULT 0,
@@ -258,8 +262,20 @@ CREATE TABLE IF NOT EXISTS cats (
     node_id TEXT,
     created_at BIGINT NOT NULL,
     expires_at_unix BIGINT,
+    lifecycle_dispatch_json TEXT,
     UNIQUE (workspace_id, name)
 );
+ALTER TABLE cats ADD COLUMN IF NOT EXISTS lifecycle_dispatch_json TEXT;
+ALTER TABLE cats ADD COLUMN IF NOT EXISTS observed_generation BIGINT NOT NULL DEFAULT 0;
+-- Versions before lifecycle provenance did not store an observed generation.
+-- A markerless stable row was written only after that generation's physical
+-- transition had completed, so it can be backfilled without replaying every
+-- production Cat during a rolling upgrade. Transitional rows remain 0 and
+-- therefore fail closed under the provenance rule.
+UPDATE cats SET observed_generation=generation
+ WHERE observed_generation=0
+   AND lifecycle_dispatch_json IS NULL
+   AND observed_state IN ('running','suspended','warm','cold');
 CREATE TABLE IF NOT EXISTS disks (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),

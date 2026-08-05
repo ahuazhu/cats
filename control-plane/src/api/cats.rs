@@ -241,7 +241,11 @@ pub async fn ensure_running(state: &AppState, cat: Cat) -> ApiResult<Cat> {
     let wake_started = std::time::Instant::now();
     let cat = state.store.must_get_cat_by_id(&cat.id)?;
     require_funded(state, &cat.workspace_id).await?;
-    if cat.desired_state == DesiredState::Running && cat.observed_state == ObservedState::Running {
+    if cat.desired_state == DesiredState::Running
+        && cat.observed_state == ObservedState::Running
+        && state.store.lifecycle_dispatch(&cat.id)?.is_none()
+        && state.store.observed_generation(&cat.id)? == cat.generation
+    {
         return Ok(cat);
     }
     state.store.ensure_desired_running(&cat.id)?;
@@ -251,7 +255,10 @@ pub async fn ensure_running(state: &AppState, cat: Cat) -> ApiResult<Cat> {
     loop {
         let current = state.store.must_get_cat_by_id(&cat.id)?;
         match current.observed_state {
-            ObservedState::Running => {
+            ObservedState::Running
+                if state.store.lifecycle_dispatch(&current.id)?.is_none()
+                    && state.store.observed_generation(&current.id)? == current.generation =>
+            {
                 tracing::info!(
                     cat = %cat.id,
                     total_us = wake_started.elapsed().as_micros(),

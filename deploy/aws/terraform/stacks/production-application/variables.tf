@@ -160,6 +160,12 @@ variable "auto_cold_after_seconds" {
   default = 86400
 }
 
+variable "lifecycle_provenance_writes_enabled" {
+  description = "One-way phase-B lifecycle provenance activation; enable only after the phase-A reader rollout is complete."
+  type        = bool
+  default     = false
+}
+
 variable "aws_region" {
   description = "Region holding the load balancer and the hosted zone."
   type        = string
