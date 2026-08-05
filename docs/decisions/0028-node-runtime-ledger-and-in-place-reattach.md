@@ -162,15 +162,18 @@ FakeVmm/开发与 macOS 路径没有 systemd。这些路径不使用 scope，仅
 
 ## 后果
 
-- Agent 升级与重启不再杀掉 Guest，也不再中断 Relaxed publisher；这是本 ADR 的主要收益。
+- 阶段 5 完成后，Agent 升级与重启不再杀掉 Guest，也不再中断 Relaxed publisher；这是本
+  ADR 的目标收益。当前阶段 5 尚未完成，#186 要求 systemd 保持默认的
+  `KillMode=control-group`，所以停止或重启 Agent 仍会终止同一 cgroup 中的 Guest、VMM 与
+  blockd。
 - 新增一个持久格式（ledger）和一次向后兼容的控制协议扩展，两者都需要版本策略与
   malformed-input 覆盖。
 - 接管路径是保守的：证据不足时宁可不接管。这意味着某些本可继续的 runtime 会退化为
   residue，需要人工或后续 job 处置，换取「绝不误接管别人的进程」。
 - 引入 systemd scope 后，Node 上的进程树与 cgroup 布局改变，metering 的 cgroup 归属需要
   同步确认不破坏 ADR-0011 的计费计数器连续性。
-- `systemctl stop cats-noded` 不再停止 Guest。运维文档必须显式说明这一点，停 Node 需要
-  走 drain 流程而不是停服务。
+- 在阶段 5 完成前，`systemctl stop cats-noded` 会停止 Guest。任何受控停止或重启都必须先
+  走 drain 流程并证明 `cats=0 orphans=0`；不能把停服务当作 drain。
 
 ## 分阶段实施
 
