@@ -414,9 +414,20 @@ resource "aws_iam_role_policy_attachment" "artifact_reader" {
   policy_arn = aws_iam_policy.artifact_reader.arn
 }
 
+# One association per worker rather than one association targeting the fleet:
+# an association re-runs its script whenever it is created or updated, and
+# require-idle-worker only lets that run on a drained host. Per-worker
+# associations keep the blast radius to one host and let deploy_instances roll
+# a release across a serving fleet one drained worker at a time.
 resource "aws_ssm_association" "worker_deploy" {
+  for_each = (
+    var.deploy_instances == null
+    ? var.instances
+    : { for name in var.deploy_instances : name => var.instances[name] }
+  )
+
   name             = "AWS-RunShellScript"
-  association_name = "${local.resource_name}-${substr(var.worker_bundle_sha256, 0, 12)}"
+  association_name = "${local.resource_name}-${each.key}-${substr(var.worker_bundle_sha256, 0, 12)}"
 
   parameters = {
     commands = local.deployment_script
@@ -424,7 +435,7 @@ resource "aws_ssm_association" "worker_deploy" {
 
   targets {
     key    = "InstanceIds"
-    values = [var.instance_id]
+    values = [each.value]
   }
 
   output_location {
@@ -433,6 +444,15 @@ resource "aws_ssm_association" "worker_deploy" {
   }
 
   wait_for_success_timeout_seconds = 900
+
+  lifecycle {
+    # SSM caps AssociationName at 128 characters. The worker-key validation
+    # bounds only its own part; name_prefix and environment are unrestricted.
+    precondition {
+      condition     = length("${local.resource_name}-${each.key}-${substr(var.worker_bundle_sha256, 0, 12)}") <= 128
+      error_message = "The association name (name_prefix-environment-worker-<name>-<sha12>) exceeds SSM's 128-character limit; shorten the worker name or name_prefix."
+    }
+  }
 
   depends_on = [
     aws_iam_role_policy_attachment.ssm_core,

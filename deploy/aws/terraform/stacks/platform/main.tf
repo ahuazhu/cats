@@ -541,7 +541,7 @@ resource "aws_instance" "metal_worker" {
   }
 
   tags = merge(var.tags, {
-    Name    = "cats-metal-1"
+    Name    = "cats-metal-${count.index + 1}"
     Project = "Cats"
   })
 
