@@ -406,6 +406,112 @@ jobs:
             -var="credential_refresher_image=$REFRESHER_REF" \
             -var="database_master_user_secret_arn=$RDS_MASTER_USER_SECRET_ARN"
 
+      # ADR-0031 removed the SQLite-era PVC and its Deployment mount in one
+      # release. Terraform schedules an orphaned resource destroy before an
+      # in-place update even when the old state recorded the dependency. A
+      # mounted claim then waits forever on pvc-protection while the Pod update
+      # waits behind that destroy. Detach only this reviewed legacy claim after
+      # the saved plan proves it will restore the Deployment to one replica.
+      - name: Detach legacy control volume
+        shell: bash
+        run: |
+          set -euo pipefail
+          namespace="cats"
+          legacy_claim="cats-control-data"
+          control_deployment="cats-controld"
+          kube=(
+            kubectl
+            --kubeconfig "$RUNNER_TEMP/kubeconfig"
+            --namespace "$namespace"
+          )
+
+          # Calibrate the cluster and namespace probe before treating an empty
+          # --ignore-not-found response as proof that the legacy claim is gone.
+          kubectl \
+            --kubeconfig "$RUNNER_TEMP/kubeconfig" \
+            get namespace "$namespace" --output=name >/dev/null
+          legacy_pvc="$(
+            "${kube[@]}" \
+              get pvc "$legacy_claim" --ignore-not-found --output=name
+          )"
+          if [[ -z "$legacy_pvc" ]]; then
+            echo "Legacy control PVC is absent; no detach is required."
+            exit 0
+          fi
+
+          control_volume_consumers() {
+            "${kube[@]}" get pods --output=json \
+              | jq -r --arg claim "$legacy_claim" '
+                  .items[]
+                  | select(any(
+                      .spec.volumes[]?;
+                      .persistentVolumeClaim.claimName == $claim
+                    ))
+                  | .metadata.name
+                '
+          }
+
+          attached_consumers="$(control_volume_consumers)"
+          if [[ -z "$attached_consumers" ]]; then
+            echo "Legacy control PVC is already detached."
+            exit 0
+          fi
+
+          unexpected_consumers="$(
+            "${kube[@]}" get pods --output=json \
+              | jq -r --arg claim "$legacy_claim" '
+                  .items[]
+                  | select(any(
+                      .spec.volumes[]?;
+                      .persistentVolumeClaim.claimName == $claim
+                    ))
+                  | select(
+                      .metadata.labels["app.kubernetes.io/name"]
+                        != "cats-controld"
+                    )
+                  | .metadata.name
+                '
+          )"
+          if [[ -n "$unexpected_consumers" ]]; then
+            echo "::error::Unexpected Pods mount $legacy_claim: $unexpected_consumers"
+            exit 1
+          fi
+
+          # Scaling outside Terraform is safe here only because the saved plan
+          # contains the matching PostgreSQL-era Deployment update and restores
+          # its desired replica count. Fail closed if that contract changes.
+          terraform \
+            -chdir=deploy/aws/terraform/stacks/production-application \
+            show -json "$RUNNER_TEMP/production.tfplan" \
+            | jq -e '
+                any(
+                  .resource_changes[]?;
+                  .address == "module.cats_kubernetes.kubernetes_deployment_v1.control_plane"
+                  and .change.after.spec[0].replicas == 1
+                  and (
+                    ((.change.actions | index("update")) != null)
+                    or ((.change.actions | index("create")) != null)
+                  )
+                )
+              ' >/dev/null
+
+          "${kube[@]}" get deployment "$control_deployment" --output=name >/dev/null
+          "${kube[@]}" scale deployment "$control_deployment" --replicas=0
+
+          deadline=$((SECONDS + 300))
+          while true; do
+            remaining_consumers="$(control_volume_consumers)"
+            if [[ -z "$remaining_consumers" ]]; then
+              break
+            fi
+            if (( SECONDS >= deadline )); then
+              echo "::error::Timed out detaching $legacy_claim from: $remaining_consumers"
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "Legacy control PVC is detached; applying the saved cutover plan."
+
       - name: Apply reviewed plan
         shell: bash
         run: |

@@ -74,3 +74,11 @@ migration ladder rather than abstracting over both.
 - A future backend change repeats this playbook (rewrite + fresh ladder)
   unless multiple backends must coexist, at which point the port abstraction
   this ADR declined becomes the right tool.
+- Removing a mounted PVC and its Deployment mount cannot share an unordered
+  Terraform apply: Kubernetes PVC protection waits for the old Pod while the
+  Deployment update can wait behind the PVC destroy. The production workflow
+  saves the complete plan first, then, only when the legacy claim exists and is
+  mounted exclusively by `cats-controld`, verifies that the plan restores the
+  PostgreSQL Deployment to one replica and drains the old Pod before applying
+  that saved plan. It does not bypass the PVC finalizer. States that have
+  already crossed the cutover take no action.
