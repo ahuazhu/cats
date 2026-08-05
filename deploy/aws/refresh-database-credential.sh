@@ -57,13 +57,19 @@ aws secretsmanager get-secret-value \
   --output text >"$work/authority.json"
 
 # 2. The live Secret, for everything the password is not: user, host, port,
-#    database, sslmode, and any other query parameter.
+#    database, sslmode, and any other query parameter. Its resourceVersion is
+#    kept as a precondition for the write in step 6: everything between here and
+#    there is derived from this exact revision.
 kube "$secret_url" >"$work/live.json"
 python3 -c '
 import base64, json, sys
-data = json.load(open(sys.argv[1]))["data"]
+live = json.load(open(sys.argv[1]))
+data = live["data"]
 json.dump({k: base64.b64decode(v).decode() for k, v in data.items()}, open(sys.argv[2], "w"))
-' "$work/live.json" "$work/live-decoded.json"
+open(sys.argv[3], "w").write(live["metadata"]["resourceVersion"])
+' "$work/live.json" "$work/live-decoded.json" "$work/resource-version"
+resource_version="$(cat "$work/resource-version")"
+test -n "$resource_version"
 
 # 3. Compose. Shared with the deployment so the two cannot drift.
 # shellcheck disable=SC2086
@@ -112,16 +118,49 @@ fi
 # 6. Patch, and only the keys that changed. A strategic merge on a Secret's
 #    data map leaves every other key alone, so this cannot disturb the WorkOS,
 #    Stripe or auth values that share it.
+#
+#    resourceVersion makes this a compare-and-swap. Without it, a deployment
+#    that writes the Secret while this job is between its read and its write
+#    would be silently reverted to the revision read in step 2 -- the password
+#    would still be the authority's, but a changed host, user or sslmode would
+#    go backwards, and nothing would notice until the next Pod restart.
 python3 -c '
 import base64, json, sys
 rotated = json.load(open(sys.argv[1]))
-patch = {"data": {k: base64.b64encode(v.encode()).decode() for k, v in rotated.items()}}
+patch = {
+    "metadata": {"resourceVersion": sys.argv[3]},
+    "data": {k: base64.b64encode(v.encode()).decode() for k, v in rotated.items()},
+}
 json.dump(patch, open(sys.argv[2], "w"))
-' "$work/rotated.json" "$work/patch.json"
+' "$work/rotated.json" "$work/patch.json" "$resource_version"
 
-kube --request PATCH \
-  --header 'Content-Type: application/strategic-merge-patch+json' \
-  --data @"$work/patch.json" \
-  "$secret_url" >/dev/null
+# --fail would collapse every HTTP error into one exit code, and a lost race has
+# to be told apart from a real failure.
+status="$(
+  curl --silent --show-error --output "$work/patch-response.json" \
+    --write-out '%{http_code}' \
+    --cacert "$service_account/ca.crt" \
+    --header "Authorization: Bearer $token" \
+    --request PATCH \
+    --header 'Content-Type: application/strategic-merge-patch+json' \
+    --data @"$work/patch.json" \
+    "$secret_url"
+)"
 
-echo "patched $CATS_RUNTIME_SECRET_NAME: $changed (connect verified before writing)"
+case "$status" in
+  2??)
+    echo "patched $CATS_RUNTIME_SECRET_NAME: $changed (connect verified before writing)"
+    ;;
+  409)
+    # Someone wrote the Secret first. That someone is the deployment, which
+    # composes from this same authority, so the value now in place is correct
+    # and there is nothing to repair -- retrying from a stale read is the only
+    # way to make this worse. The next scheduled run reads fresh.
+    echo "lost the race to a concurrent writer; the Secret has moved on, leaving it alone"
+    ;;
+  *)
+    echo "patching $CATS_RUNTIME_SECRET_NAME failed with HTTP $status" >&2
+    head -c 2000 "$work/patch-response.json" >&2
+    exit 1
+    ;;
+esac
