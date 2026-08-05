@@ -70,3 +70,72 @@ module "metal_worker_deployment" {
 
   tags = var.tags
 }
+
+# AWS identity for the in-cluster credential refresher (ADR-0029, #77).
+#
+# It lives in this state rather than the application state on purpose. The
+# application state is applied by the branch-pinned GitHub role, whose
+# `iam:CreateRole` is scoped to one specific role ARN; letting the automated
+# deployment mint IAM roles and Pod Identity associations would widen it well
+# past what it needs. The Kubernetes objects that use this identity are in the
+# application state, which is exactly the split of privilege they should have.
+#
+# Apply this before the deployment that creates the ServiceAccount. An
+# association may name a ServiceAccount that does not exist yet; the reverse
+# leaves the CronJob without credentials and it fails closed on its first run.
+
+data "aws_iam_policy_document" "credential_refresher_assume" {
+  count = var.database_master_user_secret_arn == null ? 0 : 1
+
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole", "sts:TagSession"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["pods.eks.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "credential_refresher" {
+  count = var.database_master_user_secret_arn == null ? 0 : 1
+
+  name               = "cats-${var.environment}-credential-refresher"
+  description        = "Reads the RDS managed master secret so the control plane's Secret can be reconciled against it."
+  assume_role_policy = data.aws_iam_policy_document.credential_refresher_assume[0].json
+
+  tags = var.tags
+}
+
+# One action, one secret. The refresher never writes to Secrets Manager and
+# never reads anything else.
+data "aws_iam_policy_document" "credential_refresher" {
+  count = var.database_master_user_secret_arn == null ? 0 : 1
+
+  statement {
+    sid       = "ReadDatabaseMasterUserSecret"
+    effect    = "Allow"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [var.database_master_user_secret_arn]
+  }
+}
+
+resource "aws_iam_role_policy" "credential_refresher" {
+  count = var.database_master_user_secret_arn == null ? 0 : 1
+
+  name   = "read-database-master-user-secret"
+  role   = aws_iam_role.credential_refresher[0].name
+  policy = data.aws_iam_policy_document.credential_refresher[0].json
+}
+
+resource "aws_eks_pod_identity_association" "credential_refresher" {
+  count = var.database_master_user_secret_arn == null ? 0 : 1
+
+  cluster_name    = var.eks_cluster_name
+  namespace       = var.credential_refresher_namespace
+  service_account = var.credential_refresher_service_account
+  role_arn        = aws_iam_role.credential_refresher[0].arn
+
+  tags = var.tags
+}
