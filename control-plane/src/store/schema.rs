@@ -119,14 +119,14 @@ fn ensure_schema(client: &mut Client) -> Result<()> {
         .batch_execute("SELECT pg_advisory_lock(hashtext(current_schema()), 420103)")
         .map_err(internal)?;
     let ensure = (|| -> Result<()> {
-        let stamped: Option<i64> = client
-            .query_opt(
-                "SELECT version FROM control_schema_version WHERE singleton",
-                &[],
-            )
-            .ok()
-            .flatten()
-            .map(|row| row.get(0));
+        let stamped: Option<i64> = match client.query_opt(
+            "SELECT version FROM control_schema_version WHERE singleton",
+            &[],
+        ) {
+            Ok(row) => row.map(|row| row.get(0)),
+            Err(error) if error.code() == Some(&postgres::error::SqlState::UNDEFINED_TABLE) => None,
+            Err(error) => return Err(internal(error)),
+        };
         if let Some(stamped) = stamped {
             if !(OLDEST_MIGRATABLE_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&stamped) {
                 return Err(ApiError::failed_precondition(format!(
