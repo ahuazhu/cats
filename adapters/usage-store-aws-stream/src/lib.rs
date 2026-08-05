@@ -5,6 +5,8 @@
 //! JSON envelope to an immutable S3 key, applies the idempotent PostgreSQL
 //! projection through `UsageStore`, and advances a DynamoDB checkpoint last.
 
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,6 +20,7 @@ use cats_metering::{
     AttributedCheckpoint, IngestOutcome, MeteringError, UsageAttribution, UsageQuery, UsageStore,
     UsageStoreFuture, UsageView,
 };
+use futures_util::{stream::FuturesUnordered, FutureExt, StreamExt};
 
 const KINESIS_RECORD_LIMIT: usize = 1_048_576;
 const ARCHIVE_BATCH_MAX_BYTES: usize = 4 * 1_048_576;
@@ -118,19 +121,18 @@ impl AwsUsageStreamStore {
             .send()
             .await
             .context("list usage Kinesis shards")?;
-        let mut tasks = tokio::task::JoinSet::new();
-        for shard in output.shards() {
-            let shard_id = shard.shard_id().to_string();
+        let shard_ids = output
+            .shards()
+            .iter()
+            .map(|shard| shard.shard_id().to_string())
+            .collect::<Vec<_>>();
+        run_shard_workers(shard_ids, |shard_id| {
             let store = self.clone();
-            tasks.spawn(async move {
+            async move {
                 store.project_shard_forever(shard_id).await;
-            });
-        }
-        anyhow::ensure!(!tasks.is_empty(), "usage Kinesis stream has no shards");
-        while let Some(task) = tasks.join_next().await {
-            task.context("usage shard projector task panicked")?;
-        }
-        Ok(())
+            }
+        })
+        .await
     }
 
     async fn project_shard_forever(&self, shard_id: String) {
@@ -317,6 +319,27 @@ impl AwsUsageStreamStore {
     }
 }
 
+async fn run_shard_workers<I, F, Fut>(shards: I, mut make_worker: F) -> Result<()>
+where
+    I: IntoIterator,
+    F: FnMut(I::Item) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    // These workers must stay owned by the singleton role future. Spawning
+    // them would make parent cancellation only schedule child cancellation;
+    // direct polling makes dropping the role synchronously drop every shard.
+    let mut tasks = FuturesUnordered::new();
+    for shard in shards {
+        tasks.push(AssertUnwindSafe(make_worker(shard)).catch_unwind());
+    }
+    drop(make_worker);
+    anyhow::ensure!(!tasks.is_empty(), "usage Kinesis stream has no shards");
+    while let Some(task) = tasks.next().await {
+        anyhow::ensure!(task.is_ok(), "usage shard projector task panicked");
+    }
+    Ok(())
+}
+
 async fn apply_projection(projection: &dyn UsageStore, records: &[PendingRecord]) -> Result<()> {
     for record in records {
         match projection.ingest(&record.envelope).await {
@@ -408,11 +431,163 @@ impl UsageStore for AwsUsageStreamStore {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
 
     use cats_metering::AttributedCheckpoint;
 
     use super::*;
+
+    struct ActiveRoleGuard {
+        active: Arc<AtomicUsize>,
+    }
+
+    impl ActiveRoleGuard {
+        fn enter(active: Arc<AtomicUsize>, max_active: &AtomicUsize) -> Self {
+            let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active.fetch_max(now_active, Ordering::SeqCst);
+            Self { active }
+        }
+    }
+
+    impl Drop for ActiveRoleGuard {
+        fn drop(&mut self) {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    struct BlockingChildGuard {
+        _role: Arc<ActiveRoleGuard>,
+        active_children: Arc<AtomicUsize>,
+        drops_started: Arc<AtomicUsize>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl Drop for BlockingChildGuard {
+        fn drop(&mut self) {
+            self.drops_started.fetch_add(1, Ordering::SeqCst);
+            let (released, wake) = &*self.release;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            self.active_children.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn wait_for_at_least(value: &AtomicUsize, expected: usize, context: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while value.load(Ordering::SeqCst) < expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {context}"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn shard_workers_stop_before_standby_acquires_leadership() {
+        let leadership = Arc::new(tokio::sync::Mutex::new(()));
+        let active_roles = Arc::new(AtomicUsize::new(0));
+        let max_active_roles = Arc::new(AtomicUsize::new(0));
+        let role_starts = Arc::new(AtomicUsize::new(0));
+        let active_children = Arc::new(AtomicUsize::new(0));
+        let child_starts = Arc::new(AtomicUsize::new(0));
+        let drops_started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let standby_started = Arc::new(tokio::sync::Notify::new());
+        let active_children_at_standby = Arc::new(AtomicUsize::new(usize::MAX));
+
+        let first = tokio::spawn({
+            let leadership = leadership.clone();
+            let active_roles = active_roles.clone();
+            let max_active_roles = max_active_roles.clone();
+            let role_starts = role_starts.clone();
+            let active_children = active_children.clone();
+            let child_starts = child_starts.clone();
+            let drops_started = drops_started.clone();
+            let release = release.clone();
+            async move {
+                let _session = leadership.lock().await;
+                role_starts.fetch_add(1, Ordering::SeqCst);
+                let role = Arc::new(ActiveRoleGuard::enter(active_roles, &max_active_roles));
+                run_shard_workers(0..2, move |_| {
+                    let role = role.clone();
+                    let active_children = active_children.clone();
+                    let child_starts = child_starts.clone();
+                    let drops_started = drops_started.clone();
+                    let release = release.clone();
+                    async move {
+                        active_children.fetch_add(1, Ordering::SeqCst);
+                        let _child = BlockingChildGuard {
+                            _role: role,
+                            active_children,
+                            drops_started,
+                            release,
+                        };
+                        child_starts.fetch_add(1, Ordering::SeqCst);
+                        std::future::pending::<()>().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+        });
+        wait_for_at_least(&child_starts, 2, "both old shard workers to start").await;
+
+        let second = tokio::spawn({
+            let leadership = leadership.clone();
+            let active_roles = active_roles.clone();
+            let max_active_roles = max_active_roles.clone();
+            let role_starts = role_starts.clone();
+            let active_children = active_children.clone();
+            let standby_started = standby_started.clone();
+            let active_children_at_standby = active_children_at_standby.clone();
+            async move {
+                let _session = leadership.lock().await;
+                active_children_at_standby
+                    .store(active_children.load(Ordering::SeqCst), Ordering::SeqCst);
+                role_starts.fetch_add(1, Ordering::SeqCst);
+                let _role = ActiveRoleGuard::enter(active_roles, &max_active_roles);
+                standby_started.notify_waiters();
+                std::future::pending::<()>().await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(role_starts.load(Ordering::SeqCst), 1);
+
+        first.abort();
+        wait_for_at_least(&drops_started, 1, "an old shard worker to begin dropping").await;
+        let standby_notification = standby_started.notified();
+        let standby_overlapped = role_starts.load(Ordering::SeqCst) > 1
+            || tokio::time::timeout(Duration::from_millis(250), standby_notification)
+                .await
+                .is_ok();
+
+        let (released, wake) = &*release;
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+        let _ = first.await;
+        wait_for_at_least(&role_starts, 2, "the standby role to start").await;
+
+        let children_at_standby = active_children_at_standby.load(Ordering::SeqCst);
+        let observed_max_active = max_active_roles.load(Ordering::SeqCst);
+        second.abort();
+        let _ = second.await;
+
+        assert!(
+            !standby_overlapped,
+            "the standby acquired leadership while an old shard worker was still dropping"
+        );
+        assert_eq!(
+            children_at_standby, 0,
+            "every old shard worker must drop before the standby starts"
+        );
+        assert_eq!(
+            observed_max_active, 1,
+            "old and replacement projector roles must never overlap"
+        );
+    }
 
     fn pending(sequence_number: &str, observed_at_unix_ms: i64) -> PendingRecord {
         PendingRecord {

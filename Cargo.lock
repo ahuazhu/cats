@@ -1312,6 +1312,7 @@ dependencies = [
  "aws-sdk-kinesis",
  "aws-sdk-s3",
  "cats-metering",
+ "futures-util",
  "serde_json",
  "tokio",
  "tracing",
