@@ -94,6 +94,21 @@ fn production_schema_probe_fails_closed() {
     );
 }
 
+#[test]
+fn linux_quality_gate_installs_the_postgres_probe_runtime() {
+    let quality = read_workspace_file("scripts/quality.sh");
+    let linux_gate = quality
+        .split("run_linux() {")
+        .nth(1)
+        .and_then(|rest| rest.split("case \"${1:-full}\"").next())
+        .expect("Linux quality-gate function");
+
+    assert!(
+        linux_gate.contains("apt-get install -qy --no-install-recommends e2fsprogs jq"),
+        "the Linux gate must install jq before deployment probe fixtures execute"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn production_postgres_probe_does_not_duplicate_a_known_positive() {
