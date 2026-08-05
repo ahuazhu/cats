@@ -4,7 +4,7 @@ environment = "production"
 # Network. Keep clear of CATS_GUEST_NETWORK_CIDR (10.240.0.0/16).
 vpc_cidr                = "10.20.0.0/16"
 availability_zone_count = 2
-one_nat_gateway_per_az  = false
+one_nat_gateway_per_az  = true
 
 # Cluster. Dedicated to Cats — do not point this at another product's cluster.
 cluster_name       = "cats-production"
@@ -18,7 +18,7 @@ cluster_admin_principal_arns = []
 database_engine_version        = "16.13"
 database_instance_class        = "db.t4g.micro"
 database_allocated_storage     = 20
-database_multi_az              = false
+database_multi_az              = true
 database_backup_retention_days = 7
 database_deletion_protection   = true
 database_skip_final_snapshot   = false

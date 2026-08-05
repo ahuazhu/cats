@@ -37,7 +37,7 @@ variable "availability_zone_count" {
 variable "one_nat_gateway_per_az" {
   type        = bool
   description = "One NAT gateway per zone instead of one shared."
-  default     = false
+  default     = true
 }
 
 # Cluster -------------------------------------------------------------------
@@ -89,7 +89,7 @@ variable "database_allocated_storage" {
 variable "database_multi_az" {
   type        = bool
   description = "Multi-AZ standby."
-  default     = false
+  default     = true
 }
 
 variable "database_backup_retention_days" {

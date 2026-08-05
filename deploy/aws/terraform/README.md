@@ -70,7 +70,7 @@ terraform plan -out=platform.tfplan
 terraform apply platform.tfplan
 ```
 
-Three things about this stack are easy to get wrong.
+Four things about this stack are easy to get wrong.
 
 **The certificate cannot validate before the registrar moves.** A Route 53
 hosted zone cannot be transferred between accounts, so this stack creates a new
@@ -89,6 +89,13 @@ change either, keep them disjoint.
 **The database password is not in this state.** RDS generates and rotates it in
 Secrets Manager. Read `database_master_user_secret_arn` to assemble
 `storage_postgres_url` and `usage_postgres_url` for the application stack.
+
+**Production dependencies span availability zones by default.** The RDS
+instance keeps a synchronous Multi-AZ standby, and each private subnet routes
+through a NAT gateway in its own zone. Disabling either setting is an explicit
+cost-versus-availability decision: an AZ failure can otherwise remove the
+authoritative metadata database or strand healthy workers and EKS nodes
+without external egress.
 
 The stack also creates the GitHub Actions release role. Its trust policy pins
 both the audience and the subject to `github_repository` — widening the subject

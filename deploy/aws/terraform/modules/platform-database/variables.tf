@@ -68,7 +68,7 @@ variable "master_username" {
 variable "multi_az" {
   type        = bool
   description = "Multi-AZ standby."
-  default     = false
+  default     = true
 }
 
 variable "backup_retention_days" {
