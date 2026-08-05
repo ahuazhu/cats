@@ -1950,20 +1950,11 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
     assert!(!balance.stripe_enabled);
 
     let bucketed: UsageReport = ctx
-        .http
-        .get(ctx.ws_url(&format!(
+        .get_json(ctx.ws_url(&format!(
             "/billing/usage?from_ms=1000&to_ms={hour_end}&cat_id={}&bucket_ms=1800000",
             cat.id
         )))
-        .bearer_auth("dev-admin-token")
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+        .await;
     assert_eq!(bucketed.time_buckets.len(), 2);
     assert_eq!(bucketed.time_buckets[0].interval_start_unix_ms, 1_000);
     assert_eq!(bucketed.time_buckets[1].interval_end_unix_ms, hour_end);
@@ -2084,21 +2075,12 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
     assert_eq!(deleted_tail.accepted, 1);
 
     let historical_report: UsageReport = ctx
-        .http
-        .get(ctx.ws_url(&format!(
+        .get_json(ctx.ws_url(&format!(
             "/billing/usage?from_ms=1000&to_ms={}&cat_id={}&detail=true",
             hour_end + 3_000,
             cat.id
         )))
-        .bearer_auth("dev-admin-token")
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+        .await;
     assert_eq!(historical_report.cats.len(), 1);
     assert_eq!(historical_report.cats[0].cat_id, cat.id);
     assert_eq!(historical_report.details.len(), 4);
@@ -3190,17 +3172,8 @@ async fn an_unattributable_checkpoint_is_rejected_without_failing_its_batch() {
 // ---------------------------------------------------------------------------
 
 async fn admin_node_summary(ctx: &Ctx, node_id: &str) -> NodeSummary {
-    ctx.http
-        .get(ctx.url(&format!("/v1/admin/nodes/{node_id}")))
-        .bearer_auth("dev-admin-token")
-        .send()
+    ctx.get_json(ctx.url(&format!("/v1/admin/nodes/{node_id}")))
         .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap()
 }
 
 /// Wait until the node's summary shows exactly `want` orphan runtimes.
