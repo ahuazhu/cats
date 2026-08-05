@@ -63,7 +63,7 @@ fn production_deploy_extracts_versions_from_the_current_store_schema() {
 #[test]
 fn production_schema_probe_fails_closed() {
     let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
-    let runner = read_workspace_file("deploy/aws/run-control-schema-probe.sh");
+    let runner = read_workspace_file("deploy/aws/run-postgres-probe.sh");
     let probe = workflow
         .split("# The control store lives in PostgreSQL.")
         .nth(1)
@@ -71,7 +71,8 @@ fn production_schema_probe_fails_closed() {
         .expect("control schema probe block");
 
     assert!(probe.contains("query_status=$?"));
-    assert!(probe.contains("deploy/aws/run-control-schema-probe.sh"));
+    assert!(probe.contains("deploy/aws/run-postgres-probe.sh"));
+    assert!(probe.contains("SELECT version FROM control_schema_version"));
     assert!(runner.contains("-v ON_ERROR_STOP=1"));
     assert!(runner.contains("logs \"$probe\" --container=psql"));
     assert!(runner.contains("state.terminated.exitCode"));
@@ -95,7 +96,7 @@ fn production_schema_probe_fails_closed() {
 
 #[cfg(unix)]
 #[test]
-fn production_schema_probe_does_not_duplicate_a_known_positive() {
+fn production_postgres_probe_does_not_duplicate_a_known_positive() {
     let fixture = tempfile::tempdir().expect("schema probe fixture");
     let fake_kubectl = fixture.path().join("kubectl");
     let calls = fixture.path().join("calls");
@@ -108,12 +109,12 @@ case " $* " in
   *" delete pod "*) exit 0 ;;
   *" run "*)
     if [[ " $* " == *" --attach "* ]]; then
-      printf '1\n1\n'
+      printf '10.20.18.70\n10.20.18.70\n'
     fi
     exit 0
     ;;
   *" get pod "*".status.phase"*) printf 'Succeeded' ;;
-  *" logs "*) printf '1\n' ;;
+  *" logs "*) printf '10.20.18.70\n' ;;
   *" get pod "*"state.terminated.exitCode"*) printf '0' ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 97 ;;
 esac
@@ -128,8 +129,13 @@ esac
 
     let inherited_path = std::env::var("PATH").expect("PATH");
     let output = Command::new("bash")
-        .arg(workspace_root().join("deploy/aws/run-control-schema-probe.sh"))
-        .args(["fixture-kubeconfig", "cats", "schema-probe"])
+        .arg(workspace_root().join("deploy/aws/run-postgres-probe.sh"))
+        .args([
+            "fixture-kubeconfig",
+            "cats",
+            "owner-probe",
+            "SELECT '10.20.18.70'",
+        ])
         .env(
             "PATH",
             format!("{}:{inherited_path}", fixture.path().display()),
@@ -143,12 +149,13 @@ esac
         "probe failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(output.stdout, b"1\n");
+    assert_eq!(output.stdout, b"10.20.18.70\n");
     let calls = std::fs::read_to_string(calls).expect("read fake kubectl calls");
     assert_eq!(
         calls.lines().filter(|call| call.contains(" logs ")).count(),
         1
     );
+    assert!(calls.contains("SELECT '10.20.18.70'"));
     assert!(
         !calls.contains("--attach"),
         "attach fallback can duplicate the known-positive output: {calls}"
@@ -239,6 +246,7 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
         "l.classid=hashtext(current_schema())::oid",
         "l.objid=420201",
         "l.objsubid=2",
+        "deploy/aws/run-postgres-probe.sh",
         "delete pod \"$target\" --wait=false",
         "https://cats.run/healthz",
         "rollout status deployment/cats-controld",
@@ -253,6 +261,13 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
     assert!(!workflow.contains("--force"));
     assert!(!workflow.contains("--grace-period=0"));
     assert!(!workflow.contains("scale deployment"));
+    assert!(!workflow.contains("--attach"));
+    assert!(!workflow.contains("tr -d '[:space:]' <<<\"$leader_ip\""));
+    assert_eq!(
+        workflow.matches("deploy/aws/run-postgres-probe.sh").count(),
+        2,
+        "both pre-disruption and post-disruption owner probes must avoid attach replay"
+    );
 }
 
 #[test]
