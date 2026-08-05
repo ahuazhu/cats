@@ -14,11 +14,18 @@
   "orphans": 0,
   "assigned_cats": [
     {
-      "cat_id": "cat_fixture_q124_fault",
-      "name": "q124-fixture-fault-cat",
+      "cat_id": "cat_q124_fixture_s3_strict",
+      "name": "q124-fixture-s3-strict",
       "workspace_id": "ws_788c5bfc3931",
       "node_id": "q124-20260805000000-abcdef",
       "durability": "strict"
+    },
+    {
+      "cat_id": "cat_q124_fixture_s3_relaxed",
+      "name": "q124-fixture-s3-relaxed",
+      "workspace_id": "ws_788c5bfc3931",
+      "node_id": "q124-20260805000000-abcdef",
+      "durability": "relaxed"
     }
   ],
   "test_sha": "1111111111111111111111111111111111111111",

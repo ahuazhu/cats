@@ -15,9 +15,11 @@ MOCK_BIN="${TEST_ROOT}/bin"
 MOCK_ROOT="${TEST_ROOT}/state"
 REMOTE="${TEST_ROOT}/remote.sh"
 CONFIG="${TEST_ROOT}/fault-targets.json"
-HOOK="${TEST_ROOT}/q124-fault-workload"
+HOOK="/opt/cats/qualification-124/1111111111111111111111111111111111111111/q124-fault-workload"
+HOOK_DIR="$(dirname "${HOOK}")"
 mkdir -p "${MOCK_BIN}" "${MOCK_ROOT}"
-trap 'rm -rf "${TEST_ROOT}"' EXIT
+mkdir -p "${HOOK_DIR}"
+trap 'rm -rf "${TEST_ROOT}"; rm -f "${HOOK}"; rmdir "${HOOK_DIR}" 2>/dev/null || true' EXIT
 
 awk '/^  cat <<'"'"'Q124_REMOTE'"'"'$/ {copy=1; next} copy && /^Q124_REMOTE$/ {exit} copy {print}' \
   "${HARNESS}" >"${REMOTE}"
@@ -182,6 +184,7 @@ cat >"${HOOK}" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
 command="$1"; shift
+printf '%s\n' "${command}" >>"${MOCK_ROOT}/hook-calls.log"
 scenario=""; phase=""; output=""; node=""; instance=""; address=""; port=""
 restored=""; remaining=""
 while (($#)); do
@@ -209,10 +212,9 @@ case "${command}" in
       {schema_version:1,captured_at:$now,temp_instance_id:$instance,node_id:$node,node_state:"Cordoned",
        workspace_id:"ws_788c5bfc3931",workspace:"default/qual-124-20260805",
        tags:{Issue:"124",CatsNodeId:$node,Purpose:"qualification-124"},orphans:0,
-       assigned_cats:(if ($scenario | contains("s3")) then
+       assigned_cats:
          [{cat_id:"cat_mock_strict",name:"q124-mock-strict",workspace_id:"ws_788c5bfc3931",node_id:$node,durability:"strict"},
-          {cat_id:"cat_mock_relaxed",name:"q124-mock-relaxed",workspace_id:"ws_788c5bfc3931",node_id:$node,durability:"relaxed"}]
-         else [{cat_id:"cat_mock_q124",name:"q124-mock-cat",workspace_id:"ws_788c5bfc3931",node_id:$node,durability:"strict"}] end),
+          {cat_id:"cat_mock_relaxed",name:"q124-mock-relaxed",workspace_id:"ws_788c5bfc3931",node_id:$node,durability:"relaxed"}],
        test_sha:$test_sha,dependency_endpoints:{db_host:"fixture.cluster.us-east-1.rds.amazonaws.com",
          s3_host:"s3.us-east-1.amazonaws.com",control_plane_host:"api.cats.run",node_listen_ip:"10.0.0.124"}}' >"${output}"
     if [[ "${MOCK_SECRET_EXTRA:-false}" == true ]]; then
@@ -247,12 +249,14 @@ case "${command}" in
          operation_ids:["op_mock_fault"],watermark:{local:11,remote:11,unpublished:0},disk_epoch:3,digest:$digest};
       {schema_version:1,captured_at:$now,phase:$phase,scenario:$scenario,
        workspace_id:"ws_788c5bfc3931",node_id:$node,
-       cats:(if ($scenario | contains("s3")) then
-         [cat("cat_mock_strict";"q124-mock-strict";"strict";($digest + "-strict")),
-          cat("cat_mock_relaxed";"q124-mock-relaxed";"relaxed";($digest + "-relaxed"))]
-         else [cat("cat_mock_q124";"q124-mock-cat";"strict";$digest)] end),
+       cats:[cat("cat_mock_strict";"q124-mock-strict";"strict";($digest + "-strict")),
+         cat("cat_mock_relaxed";"q124-mock-relaxed";"relaxed";($digest + "-relaxed"))],
        raw_operations:[{operation_id:"op_mock_fault",kind:"mock_fault",phase:"succeeded",started_at:$now,completed_at:$now,log_ref:"journal://q124/mock/op"}],
        log_refs:["journal://q124/mock/state"]}' >"${output}"
+    if [[ "${MOCK_STATE_CAT_MISMATCH:-false}" == true && "${phase}" == during ]]; then
+      jq '.cats[0].cat_id = "cat_schema_valid_but_not_admitted"' "${output}" >"${output}.bad"
+      mv "${output}.bad" "${output}"
+    fi
     ;;
   exercise)
     for state in "${MOCK_ROOT}"/rules4 "${MOCK_ROOT}"/rules6; do
@@ -305,11 +309,9 @@ run_remote() {
   local -a remote_env
   local cat_set_sha
   (($# == 0))
-  cat_set_sha="$(jq -Sc --arg scenario "${scenario}" --arg node q124-20260805000000-abcdef -n '
-    if ($scenario | contains("s3")) then
-      [{cat_id:"cat_mock_strict",name:"q124-mock-strict",workspace_id:"ws_788c5bfc3931",node_id:$node,durability:"strict"},
-       {cat_id:"cat_mock_relaxed",name:"q124-mock-relaxed",workspace_id:"ws_788c5bfc3931",node_id:$node,durability:"relaxed"}]
-    else [{cat_id:"cat_mock_q124",name:"q124-mock-cat",workspace_id:"ws_788c5bfc3931",node_id:$node,durability:"strict"}] end |
+  cat_set_sha="$(jq -Sc --arg node q124-20260805000000-abcdef -n '
+    [{cat_id:"cat_mock_strict",name:"q124-mock-strict",workspace_id:"ws_788c5bfc3931",node_id:$node,durability:"strict"},
+     {cat_id:"cat_mock_relaxed",name:"q124-mock-relaxed",workspace_id:"ws_788c5bfc3931",node_id:$node,durability:"relaxed"}] |
     sort_by(.cat_id)' | sha256sum | awk '{print $1}')"
   printf '%s' "${cat_set_sha}" >"${MOCK_ROOT}/expected-cat-set-sha"
   remote_env=(env PATH="${MOCK_BIN}:/usr/sbin:/usr/bin:/sbin:/bin" MOCK_ROOT="${MOCK_ROOT}" \
@@ -317,6 +319,7 @@ run_remote() {
     MOCK_IPV6_EMPTY="${MOCK_IPV6_EMPTY:-false}" MOCK_SECRET_EXTRA="${MOCK_SECRET_EXTRA:-false}" \
     MOCK_ARM_SAVE_FAILURE="${MOCK_ARM_SAVE_FAILURE:-false}" MOCK_PAUSE_EXERCISE="${MOCK_PAUSE_EXERCISE:-false}" \
     MOCK_PAUSE_SECONDS="${MOCK_PAUSE_SECONDS:-3}" \
+    MOCK_STATE_CAT_MISMATCH="${MOCK_STATE_CAT_MISMATCH:-false}" \
     MOCK_LARGE_EVIDENCE="${MOCK_LARGE_EVIDENCE:-false}" \
     MOCK_WATCHDOG_DELAY_SECONDS="${MOCK_WATCHDOG_DELAY_SECONDS:-15}" \
     Q124_RUN_ID="${run_id}" Q124_SCENARIO="${scenario}" Q124_INSTANCE_ID=i-0123456789abcdef0 \
@@ -324,7 +327,7 @@ run_remote() {
     Q124_CONFIG_REF="${CONFIG}" Q124_HOOK_REF="${HOOK}" \
     Q124_TEST_SHA=1111111111111111111111111111111111111111 \
     Q124_CONFIG_SHA256="$(sha256sum "${CONFIG}" | awk '{print $1}')" \
-    Q124_HOOK_SHA256="$(sha256sum "${HOOK}" | awk '{print $1}')" \
+    Q124_HOOK_SHA256="${MOCK_EXPECTED_HOOK_SHA256:-$(sha256sum "${HOOK}" | awk '{print $1}')}" \
     Q124_HARNESS_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
     Q124_HELPER_SHA256="$(sha256sum "${REMOTE}" | awk '{print $1}')" \
     Q124_CAT_SET_SHA256="${cat_set_sha}" \
@@ -413,6 +416,15 @@ grep -q 'unsafe evidence was rejected before SSM emission' "${TEST_ROOT}/secret.
 if grep -q '^Q124_OWNERSHIP_' "${TEST_ROOT}/secret.log"; then exit 1; fi
 case_result secret-extra-field PASS
 
+reset_mock
+set +e
+MOCK_STATE_CAT_MISMATCH=true run_remote mock-cat-set-mismatch >"${TEST_ROOT}/cat-set-mismatch.log" 2>&1
+rc=$?
+set -e
+[[ "${rc}" -ne 0 ]] && assert_rules_absent
+grep -q 'state Cat set is not the exact admitted ownership set' "${TEST_ROOT}/cat-set-mismatch.log"
+case_result schema-valid-cat-set-mismatch PASS
+
 assert_combo_evidence() {
   local run_id="$1" expected_count="$2" state_dir
   state_dir="/run/cats-q124-fault-${run_id}"
@@ -486,5 +498,19 @@ grep -q 'compressed evidence exceeds the safe SSM stdout budget' "${TEST_ROOT}/t
 }
 if grep -q '^Q124_STATE_' "${TEST_ROOT}/transport-budget.log"; then exit 1; fi
 case_result transport-budget-fail-closed PASS
+
+reset_mock
+reviewed_hook_sha="$(sha256sum "${HOOK}" | awk '{print $1}')"
+printf '%s\n' '# replacement after provisioning' >>"${HOOK}"
+set +e
+MOCK_EXPECTED_HOOK_SHA256="${reviewed_hook_sha}" \
+  run_remote mock-hook-replaced >"${TEST_ROOT}/hook-replaced.log" 2>&1
+rc=$?
+set -e
+[[ "${rc}" -ne 0 ]]
+[[ ! -e "${MOCK_ROOT}/hook-calls.log" ]]
+[[ ! -d /run/cats-q124-fault-mock-hook-replaced ]]
+grep -q 'qualification asset SHA mismatch' "${TEST_ROOT}/hook-replaced.log"
+case_result replaced-hook-pre-mutation PASS
 
 printf 'result=PASS linux_mock_cases=%s evidence=%s\n' "${pass}" "${TEST_ROOT}"

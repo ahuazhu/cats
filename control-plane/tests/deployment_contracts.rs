@@ -546,6 +546,9 @@ fn production_control_plane_survives_one_pod_or_node_disruption() {
 #[test]
 fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
     let workflow = read_workspace_file(".github/workflows/verify-control-plane-ha.yml");
+    let harness = read_workspace_file("test-results/qualification-20260805/ha-handoff.sh");
+    let admin_adapter =
+        read_workspace_file("test-results/qualification-20260805/live-hooks/q124-admin-node");
     for expected in [
         "workflow_dispatch:",
         "READ_ONLY_CONTROL_PLANE_LEADER_DIAGNOSTIC",
@@ -562,6 +565,12 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
         "deploy/aws/run-postgres-probe.sh",
         "deploy/aws/select-reconciler-owner.sh",
         "deploy/aws/evict-pod-with-uid.sh cats \"$target\" \"$target_uid\"",
+        "LOCK_Q124_LIFECYCLE",
+        "ws_788c5bfc3931",
+        "activeDeadlineSeconds: 300",
+        "FOR UPDATE OF c",
+        "PERFORM pg_sleep(90)",
+        "CATS_HA_EXACT_OPERATION_CONVERGED",
         "reconciler leadership changed before the disruption boundary",
         ".metadata.deletionTimestamp == null",
         ".status.phase == \"Running\"",
@@ -621,6 +630,42 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
     );
     assert!(workflow.contains("observed_uid"));
     assert!(workflow.contains("target_uid"));
+    let lifecycle_lock = workflow
+        .find("Lifecycle coordinator locked token=")
+        .expect("coordinator proves the lifecycle row lock before disruption");
+    let uid_preconditioned_eviction = workflow
+        .find("deploy/aws/evict-pod-with-uid.sh cats \"$target\" \"$target_uid\"")
+        .expect("workflow uses a PDB-aware UID-preconditioned eviction");
+    let final_owner_resolution = workflow[..uid_preconditioned_eviction]
+        .rfind("deploy/aws/select-reconciler-owner.sh")
+        .expect("workflow re-resolves the elected owner at the final boundary");
+    assert!(
+        lifecycle_lock < final_owner_resolution
+            && final_owner_resolution < uid_preconditioned_eviction,
+        "the final owner must be resolved after the optional lifecycle lock and immediately before eviction"
+    );
+    for expected in [
+        "CATS_SUT_WORKSPACE_ID must be exactly ws_788c5bfc3931",
+        "CATS_TEST_WORKSPACE must be exactly default/qual-124-20260805",
+        "verify_admin_hook_provenance",
+        "-f mode=disrupt",
+    ] {
+        assert!(
+            harness.contains(expected),
+            "HA harness is missing {expected:?}"
+        );
+    }
+    for expected in [
+        "case \"${ACTION}\" in get|cats|cordon|uncordon)",
+        "Node assignment escaped exact q124 scope",
+        "/etc/cats/qualification-124/admin-token",
+        "ws_788c5bfc3931",
+    ] {
+        assert!(
+            admin_adapter.contains(expected),
+            "q124 admin adapter is missing {expected:?}"
+        );
+    }
 }
 
 #[test]

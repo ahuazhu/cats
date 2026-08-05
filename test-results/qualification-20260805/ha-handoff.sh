@@ -29,6 +29,7 @@ ROUTE_TIMEOUT_SECONDS="${CATS_HA_ROUTE_TIMEOUT_SECONDS:-120}"
 WATERMARK_PROBE_CMD="${CATS_WATERMARK_PROBE_CMD:-}"
 REQUIRED_NODE_ID="${CATS_HA_REQUIRED_NODE_ID:-}"
 ADMIN_NODE_HOOK="${CATS_HA_ADMIN_NODE_HOOK:-}"
+ADMIN_NODE_HOOK_REPO_PATH="${CATS_HA_ADMIN_NODE_HOOK_REPO_PATH:-}"
 
 MODE="live"
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -91,6 +92,48 @@ validate_static() {
     [[ "${REQUIRED_NODE_ID}" =~ ^q124-[a-z0-9][a-z0-9-]{7,54}$ ]] ||
       die "CATS_HA_REQUIRED_NODE_ID must be one exact q124-* temporary Node ID"
   fi
+}
+
+validate_live_locator_scope() {
+  [[ "${WORKSPACE_ID}" == "ws_788c5bfc3931" ]] ||
+    die "CATS_SUT_WORKSPACE_ID must be exactly ws_788c5bfc3931"
+  [[ "${WORKSPACE}" == "default/qual-124-20260805" ]] ||
+    die "CATS_TEST_WORKSPACE must be exactly default/qual-124-20260805"
+  [[ "${SUT_API_ORIGIN}" == "https://cats.run" ]] ||
+    die "CATS_SUT_API_ORIGIN must be exactly https://cats.run"
+  [[ "${HA_WORKFLOW}" == "verify-control-plane-ha.yml" ]] ||
+    die "CATS_HA_WORKFLOW must be exactly verify-control-plane-ha.yml"
+  [[ "${GITHUB_REPOSITORY}" == "ahuazhu/cats" ]] ||
+    die "CATS_GITHUB_REPOSITORY must be exactly ahuazhu/cats"
+}
+
+file_uid_mode() {
+  if stat -f '%u %Lp' "$1" >/dev/null 2>&1; then
+    stat -f '%u %Lp' "$1"
+  else
+    stat -c '%u %a' "$1"
+  fi
+}
+
+verify_admin_hook_provenance() {
+  local expected_sha actual_sha owner mode
+  [[ "${ADMIN_NODE_HOOK_REPO_PATH}" == \
+      "test-results/qualification-20260805/live-hooks/q124-admin-node" ]] ||
+    die "CATS_HA_ADMIN_NODE_HOOK_REPO_PATH must name the reviewed q124 adapter"
+  [[ "${ADMIN_NODE_HOOK}" =~ ^/[A-Za-z0-9._/-]+$ && "${ADMIN_NODE_HOOK}" != *".."* \
+     && -f "${ADMIN_NODE_HOOK}" && ! -L "${ADMIN_NODE_HOOK}" && -x "${ADMIN_NODE_HOOK}" ]] ||
+    die "admin hook must be one absolute executable regular file"
+  read -r owner mode < <(file_uid_mode "${ADMIN_NODE_HOOK}")
+  [[ "${owner}" == "${EUID}" && "${mode}" == "700" ]] ||
+    die "admin hook must be owned by the harness user with mode 0700"
+  git cat-file -e "${SUT_RELEASE_SHA}^{commit}" 2>/dev/null ||
+    die "SUT release SHA is not locally reviewable"
+  git cat-file -e "${SUT_RELEASE_SHA}:${ADMIN_NODE_HOOK_REPO_PATH}" 2>/dev/null ||
+    die "reviewed admin hook is absent from the exact SUT release SHA"
+  expected_sha="$(git show "${SUT_RELEASE_SHA}:${ADMIN_NODE_HOOK_REPO_PATH}" | shasum -a 256 | awk '{print $1}')"
+  actual_sha="$(shasum -a 256 "${ADMIN_NODE_HOOK}" | awk '{print $1}')"
+  [[ "${actual_sha}" == "${expected_sha}" ]] ||
+    die "installed admin hook does not match the reviewed SUT release"
 }
 
 scenario_source() {
@@ -215,6 +258,7 @@ iso_to_epoch_ms() {
 validate_fixtures() {
   local fixture_root cat_file operation_file stale_file watermark_file log_file handoff_iso handoff_epoch
   local node_empty node_empty_cats node_owned node_owned_cats node_raced_cats
+  local harness_self call_log stub_bin stub_hook scope_log
   fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/cats-ha-fixture.XXXXXX")"
   FIXTURE_ROOT="${fixture_root}"
   trap 'rm -rf -- "${FIXTURE_ROOT}"' EXIT
@@ -228,6 +272,32 @@ validate_fixtures() {
   node_owned="${fixture_root}/node-owned.json"
   node_owned_cats="${fixture_root}/node-owned-cats.json"
   node_raced_cats="${fixture_root}/node-raced-cats.json"
+  harness_self="$(pwd)/test-results/qualification-20260805/ha-handoff.sh"
+  call_log="${fixture_root}/forbidden-calls.log"
+  stub_bin="${fixture_root}/bin"
+  stub_hook="${fixture_root}/admin-hook"
+  scope_log="${fixture_root}/wrong-workspace.log"
+  mkdir -p "${stub_bin}"
+  printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\\n" "$(basename "$0") $*" >>"${Q124_CALL_LOG}"' 'exit 99' \
+    >"${stub_bin}/cats"
+  cp "${stub_bin}/cats" "${stub_bin}/gh"
+  cp "${stub_bin}/cats" "${stub_hook}"
+  chmod 700 "${stub_bin}/cats" "${stub_bin}/gh" "${stub_hook}"
+  if env PATH="${stub_bin}:${PATH}" Q124_CALL_LOG="${call_log}" \
+    CATS_BIN="${stub_bin}/cats" CATS_HA_ADMIN_NODE_HOOK="${stub_hook}" \
+    CATS_HA_EXECUTE=RUN_ISSUE_124_HA_HANDOFF \
+    CATS_SUT_RELEASE_SHA=1111111111111111111111111111111111111111 \
+    CATS_SUT_DEPLOY_RUN_ID=1 CATS_SUT_WORKSPACE_ID=ws_wrong \
+    CATS_TEST_WORKSPACE=default/wrong CATS_HA_REQUIRED_NODE_ID=q124-fixture-node \
+    "${harness_self}" >"${scope_log}" 2>&1; then
+    echo "wrong workspace unexpectedly reached live execution" >&2
+    return 1
+  fi
+  [[ ! -s "${call_log}" ]] || {
+    echo "wrong workspace invoked Cats/admin/dispatch: $(<"${call_log}")" >&2
+    return 1
+  }
+  rg -Fq 'CATS_SUT_WORKSPACE_ID must be exactly ws_788c5bfc3931' "${scope_log}"
 
   printf '%s\n' '{"id":"cat_fixture","desired_state":"running","observed_state":"starting","generation":7}' >"${cat_file}"
   printf '%s\n' '{"id":"op_fixture","resource_id":"cat_fixture","resource_generation":7,"phase":"running"}' >"${operation_file}"
@@ -288,6 +358,7 @@ validate_fixtures() {
   [[ -f "${workflow_file}" ]]
   for workflow_guard in \
     'default: "disabled"' \
+    'mode == '\''disrupt'\''' \
     'uses: actions/checkout@v4' \
     'LOCK_Q124_LIFECYCLE' \
     'ws_788c5bfc3931' \
@@ -295,13 +366,15 @@ validate_fixtures() {
     'FOR UPDATE OF c' \
     'PERFORM pg_sleep(90)' \
     'refusing to delete lifecycle coordinator with an unverified UID' \
+    'deploy/aws/select-reconciler-owner.sh' \
+    'deploy/aws/evict-pod-with-uid.sh cats "$target" "$target_uid"' \
     'leader deletion was not enclosed by the lifecycle row-lock interval' \
     'CATS_HA_EXACT_OPERATION_CONVERGED'; do
     rg -Fq "${workflow_guard}" "${workflow_file}"
   done
   rm -rf -- "${FIXTURE_ROOT}"
   trap - EXIT
-  printf 'fixture_validation=PASS transition_generation=true stale_rejected=true relaxed_backlog=true watermark_node_bound=true node_empty=true node_exact_cat=true user_cat_race_rejected=true workflow_log=true\n'
+  printf 'fixture_validation=PASS wrong_workspace_zero_calls=true transition_generation=true stale_rejected=true relaxed_backlog=true watermark_node_bound=true node_empty=true node_exact_cat=true user_cat_race_rejected=true workflow_log=true\n'
 }
 
 dry_run() {
@@ -337,6 +410,11 @@ dry_run() {
 }
 
 validate_static
+if [[ "${MODE}" == live ]]; then
+  # This pure-shell gate deliberately precedes every command lookup, Cats call,
+  # admin-hook call and workflow dispatch.
+  validate_live_locator_scope
+fi
 require_command jq
 require_command perl
 require_command awk
@@ -358,24 +436,14 @@ fi
   die "CATS_SUT_RELEASE_SHA must be a full lowercase Git SHA"
 [[ "${SUT_DEPLOY_RUN_ID}" =~ ^[1-9][0-9]*$ ]] ||
   die "CATS_SUT_DEPLOY_RUN_ID must be a non-zero workflow run ID"
-[[ "${WORKSPACE_ID}" =~ ^ws_[A-Za-z0-9]+$ ]] ||
-  die "CATS_SUT_WORKSPACE_ID must be the exact ws_ identifier"
-[[ "${WORKSPACE}" == *qual-124-20260805* || "${WORKSPACE}" == "${WORKSPACE_ID}" ]] ||
-  die "refusing a non-q124 workspace selector: ${WORKSPACE}"
 [[ "${REQUIRED_NODE_ID}" =~ ^q124-[a-z0-9][a-z0-9-]{7,54}$ ]] ||
   die "live mode requires CATS_HA_REQUIRED_NODE_ID=q124-*"
-[[ "${ADMIN_NODE_HOOK}" =~ ^/[A-Za-z0-9._/-]+$ && "${ADMIN_NODE_HOOK}" != *".."* \
-   && -x "${ADMIN_NODE_HOOK}" ]] ||
-  die "live mode requires an absolute executable CATS_HA_ADMIN_NODE_HOOK"
 if [[ " ${DURABILITIES} " == *" relaxed " \
    && (" ${SCENARIOS} " == *" resume " || " ${SCENARIOS} " == *" restore ") \
    && -z "${WATERMARK_PROBE_CMD}" ]]; then
   die "live Relaxed resume/restore requires a reviewed CATS_WATERMARK_PROBE_CMD; coverage may not be downgraded"
 fi
-[[ "${GITHUB_REPOSITORY}" == ahuazhu/cats ]] ||
-  die "HA workflow and issue coordination are restricted to ahuazhu/cats"
 export GH_REPO="${GITHUB_REPOSITORY}"
-[[ -x "${CATS_BIN}" ]] || die "CATS_BIN is not executable: ${CATS_BIN}"
 require_command gh
 require_command curl
 require_command awk
@@ -385,6 +453,9 @@ require_command sort
 require_command tee
 require_command git
 require_command tr
+require_command shasum
+verify_admin_hook_provenance
+[[ -x "${CATS_BIN}" ]] || die "CATS_BIN is not executable: ${CATS_BIN}"
 
 mkdir -p "${RUN_DIR}/cases"
 SUMMARY="${RUN_DIR}/summary.log"
@@ -427,6 +498,9 @@ admin_node_json() {
     get|cats|cordon|uncordon) ;;
     *) echo "refusing unsupported admin-node hook action: ${action}" >&2; return 2 ;;
   esac
+  # Re-hash immediately before every adapter call so a replacement never
+  # reaches get, cats, cordon or uncordon.
+  verify_admin_hook_provenance
   output="$(CATS_HA_HOOK_WORKSPACE_ID="${WORKSPACE_ID}" \
     CATS_HA_HOOK_CAT_ID="${CURRENT_CAT_ID}" \
     CATS_HA_HOOK_CAT_NAME="${CURRENT_CAT}" \
@@ -899,6 +973,7 @@ dispatch_workflow() {
   [[ "${COORDINATION_TOKEN}" =~ ^q124-[a-z0-9-]{8,75}$ ]]
   WORKFLOW_DISPATCHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   output="$(gh workflow run "${HA_WORKFLOW}" --ref main \
+    -f mode=disrupt \
     -f confirmation=DELETE_ONE_CATS_CONTROLD_LEADER \
     -f coordination_mode=LOCK_Q124_LIFECYCLE \
     -f coordination_issue=124 \

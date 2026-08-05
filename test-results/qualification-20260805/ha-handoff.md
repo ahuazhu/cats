@@ -27,7 +27,8 @@ orphans before the next case.
 
 The harness does not contain `kubectl` and cannot delete a Pod itself. It only
 dispatches `verify-control-plane-ha.yml` on `main` with the workflow's exact
-`DELETE_ONE_CATS_CONTROLD_LEADER` confirmation and its default-off
+`mode=disrupt`, `DELETE_ONE_CATS_CONTROLD_LEADER` confirmation and its
+default-off
 `LOCK_Q124_LIFECYCLE` mode. That mode is hard-limited to issue 124, workspace
 `ws_788c5bfc3931`, and one exact `q124-ha-*` Cat/generation/transition tuple.
 
@@ -60,13 +61,23 @@ CATS_SUT_DEPLOY_RUN_ID=<successful-deploy-run-id> \
 CATS_SUT_WORKSPACE_ID=ws_788c5bfc3931 \
 CATS_TEST_WORKSPACE=default/qual-124-20260805 \
 CATS_HA_REQUIRED_NODE_ID=q124-<exact-temporary-node> \
-CATS_HA_ADMIN_NODE_HOOK=/absolute/path/to/reviewed-admin-adapter \
+CATS_HA_ADMIN_NODE_HOOK=/absolute/path/to/installed-q124-admin-node \
+CATS_HA_ADMIN_NODE_HOOK_REPO_PATH=test-results/qualification-20260805/live-hooks/q124-admin-node \
 CATS_WATERMARK_PROBE_CMD='<reviewed read-only root/SSM probe>' \
   ./test-results/qualification-20260805/ha-handoff.sh
 ```
 
-The administrator adapter keeps administrator authentication separate from
-the workspace CLI session. It is invoked only as `get NODE`, `cats NODE`,
+Before any Cats, administrator-adapter, or GitHub call, live mode requires the
+exact workspace ID `ws_788c5bfc3931`, locator
+`default/qual-124-20260805`, API `https://cats.run`, workflow filename, and
+repository. A wrong workspace therefore has zero create, uncordon, and dispatch
+calls. The adapter must be a regular mode-0700 file owned by the harness user;
+its hash is checked against the exact repository path at `CATS_SUT_RELEASE_SHA`
+both at startup and immediately before every invocation.
+
+The committed root-only administrator adapter keeps administrator
+authentication separate from the workspace CLI session. It is invoked only as
+`get NODE`, `cats NODE`,
 `cordon NODE`, or `uncordon NODE`. `get`, `cordon`, and `uncordon` return the
 single NodeSummary JSON; `cats` returns the JSON array from
 `/v1/admin/nodes/{id}/cats`. The adapter must accept the exact node argument,

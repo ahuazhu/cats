@@ -136,6 +136,21 @@ validate_snapshot() {
     die "ownership snapshot is not the strict Cordoned Issue=124 q124-only schema"
 }
 
+ownership_cat_set() {
+  jq -Sc '[.assigned_cats[] | {cat_id,name,workspace_id,node_id,durability}] | sort_by(.cat_id)' "$1"
+}
+
+state_cat_set() {
+  jq -Sc --arg workspace_id "${WORKSPACE_ID}" '
+    [.cats[] | {cat_id,name:.cat_name,workspace_id:$workspace_id,node_id,durability}] |
+    sort_by(.cat_id)
+  ' "$1"
+}
+
+state_matches_ownership() {
+  [[ "$(state_cat_set "$1")" == "$(ownership_cat_set "$2")" ]]
+}
+
 validate_manifest() {
   local manifest="$1"
   jq -e \
@@ -154,11 +169,31 @@ validate_manifest() {
       .tags.Environment == "production" and .tags.Purpose == "qualification-124" and
       .tags.Issue == "124" and .tags.CatsNodeId == $node and
       .tags.ExpiresAt == .expires_at and .tags.ManagedBy == "manual-q124" and
-      (.qualification_assets | keys | sort) == (["config_sha256","hook_sha256"] | sort) and
-      all(.qualification_assets[]; type == "string" and test("^[0-9a-f]{64}$"))
+      (.qualification_assets | keys | sort) == (["config_sha256","hook_sha256","hook_repo_path"] | sort) and
+      all([.qualification_assets.config_sha256,.qualification_assets.hook_sha256][];
+        type == "string" and test("^[0-9a-f]{64}$")) and
+      (.qualification_assets.hook_repo_path ==
+        "test-results/qualification-20260805/live-hooks/q124-fault-workload")
     ' "${manifest}" >/dev/null || die "provisioning manifest identity/TTL/schema is invalid"
   [[ "$(jq -r .test_sha "${manifest}")" == "$(jq -r .test_sha "${OWNERSHIP_SNAPSHOT}")" ]] ||
     die "ownership snapshot TEST_SHA does not match provisioning manifest"
+}
+
+verify_reviewed_hook_provenance() {
+  local test_sha repo_path expected_path source_sha manifest_sha
+  test_sha="$(jq -r .test_sha "${PROVISIONING_MANIFEST}")"
+  repo_path="$(jq -r .qualification_assets.hook_repo_path "${PROVISIONING_MANIFEST}")"
+  manifest_sha="$(jq -r .qualification_assets.hook_sha256 "${PROVISIONING_MANIFEST}")"
+  expected_path="/opt/cats/qualification-124/${test_sha}/q124-fault-workload"
+  [[ "${REMOTE_HOOK}" == "${expected_path}" ]] ||
+    die "live hook must be installed at the exact TEST_SHA-qualified path: ${expected_path}"
+  git cat-file -e "${test_sha}^{commit}" 2>/dev/null ||
+    die "manifest TEST_SHA is not a locally reviewable commit"
+  git cat-file -e "${test_sha}:${repo_path}" 2>/dev/null ||
+    die "reviewed hook is absent from the exact manifest TEST_SHA"
+  source_sha="$(git show "${test_sha}:${repo_path}" | shasum -a 256 | awk '{print $1}')"
+  [[ "${source_sha}" == "${manifest_sha}" ]] ||
+    die "manifest hook SHA does not match the version-controlled hook at TEST_SHA"
 }
 
 make_run_dir() {
@@ -188,12 +223,14 @@ write_run_metadata() {
     --arg test_sha "$(jq -r .test_sha "${PROVISIONING_MANIFEST}")" \
     --arg config_sha256 "$(jq -r .qualification_assets.config_sha256 "${PROVISIONING_MANIFEST}")" \
     --arg hook_sha256 "$(jq -r .qualification_assets.hook_sha256 "${PROVISIONING_MANIFEST}")" \
+    --arg hook_repo_path "$(jq -r .qualification_assets.hook_repo_path "${PROVISIONING_MANIFEST}")" \
     --arg started_at "$(date -u +%FT%TZ)" \
     '{run_id:$run_id,mode:$mode,scenario:$scenario,temp_instance_id:$instance,
       node_id:$node,issue:$issue,workspace_id:$workspace_id,workspace:$workspace,
       aws_region:$region,remote_config_ref:$config_ref,remote_hook_ref:$hook_ref,
       harness_sha256:$harness_sha256,test_sha:$test_sha,
       expected_config_sha256:$config_sha256,expected_hook_sha256:$hook_sha256,
+      reviewed_hook_repo_path:$hook_repo_path,
       started_at:$started_at}' >"${RUN_DIR}/run-metadata.json"
 }
 
@@ -314,10 +351,8 @@ fixture_state() {
          started_at:"2026-08-05T14:00:00Z",completed_at:"2026-08-05T14:00:01Z",
          log_ref:"journal://q124/fixture/op_fixture_124"}],
        log_refs:["journal://q124/fixture/state"],
-       cats:(if ($scenario | contains("s3")) then
-         [cat("q124-fixture-s3-strict";"strict";"sha256:fixture-strict"),
-          cat("q124-fixture-s3-relaxed";"relaxed";"sha256:fixture-relaxed")]
-       else [cat("q124-fixture-fault-cat";"strict";"sha256:fixture-q124-digest")] end)}'
+       cats:[cat("q124-fixture-s3-strict";"strict";"sha256:fixture-strict"),
+         cat("q124-fixture-s3-relaxed";"relaxed";"sha256:fixture-relaxed")]} '
 }
 
 fixture_oracle() {
@@ -460,6 +495,11 @@ run_fixture_scenario() {
   fixture_state before "${scenario}" >"${dir}/state-before.json"
   fixture_state during "${scenario}" >"${dir}/state-during.json"
   fixture_state after "${scenario}" >"${dir}/state-after.json"
+  if [[ "${CATS_FIXTURE_CAT_SET_MISMATCH:-false}" == "true" ]]; then
+    jq '.cats[0].cat_id = "cat_schema_valid_but_not_admitted"' \
+      "${dir}/state-during.json" >"${dir}/state-during.invalid.json"
+    mv "${dir}/state-during.invalid.json" "${dir}/state-during.json"
+  fi
   fixture_oracle isolated "${scenario}" >"${dir}/oracle-isolated.json"
   fixture_oracle recovered "${scenario}" >"${dir}/oracle-recovered.json"
   if [[ "${CATS_FIXTURE_ORACLE_FAIL:-false}" == "true" ]]; then
@@ -544,17 +584,25 @@ validate_scenario_evidence() {
       "$(jq -Sc '.assigned_cats | sort_by(.cat_id)' "${dir}/ownership-isolated.json")" &&
      "$(jq -Sc '.assigned_cats | sort_by(.cat_id)' "${dir}/ownership-before.json")" == \
       "$(jq -Sc '.assigned_cats | sort_by(.cat_id)' "${dir}/ownership-after.json")" ]] || return 1
+  state_matches_ownership "${dir}/state-before.json" "${dir}/ownership-before.json" || return 1
+  state_matches_ownership "${dir}/state-during.json" "${dir}/ownership-isolated.json" || return 1
+  state_matches_ownership "${dir}/state-after.json" "${dir}/ownership-after.json" || return 1
   jq -e --arg node "${NODE_ID}" '
     (keys | sort) == (["schema_version","operation_id","kind","phase","node_id","started_at","completed_at","log_ref"] | sort) and
     .schema_version == 1 and .kind == "ensure_node_cordoned" and .phase == "succeeded" and .node_id == $node
   ' "${dir}/cordon-operation.json" >/dev/null || return 1
   jq -e --arg run_id "${RUN_ID}" --arg scenario "${scenario}" --arg instance "${TEMP_INSTANCE_ID}" --arg node "${NODE_ID}" \
+    --arg test_sha "$(jq -r .test_sha "${PROVISIONING_MANIFEST}")" \
+    --arg harness_sha "${HARNESS_SHA256}" \
+    --arg config_sha "$(jq -r .qualification_assets.config_sha256 "${PROVISIONING_MANIFEST}")" \
+    --arg hook_sha "$(jq -r .qualification_assets.hook_sha256 "${PROVISIONING_MANIFEST}")" \
     --argjson combo "$(is_combo_scenario "${scenario}" && printf true || printf false)" '
     (keys | sort) == (["schema_version","run_id","scenario","temp_instance_id","node_id","test_sha","harness_sha256","helper_sha256","config_sha256","hook_sha256","firewall"] | sort) and
     .schema_version == 1 and .run_id == $run_id and .scenario == $scenario and
     .temp_instance_id == $instance and .node_id == $node and
-    all([.test_sha][]; test("^[0-9a-f]{40}$")) and
-    all([.harness_sha256,.helper_sha256,.config_sha256,.hook_sha256][]; test("^[0-9a-f]{64}$")) and
+    .test_sha == $test_sha and .harness_sha256 == $harness_sha and
+    .config_sha256 == $config_sha and .hook_sha256 == $hook_sha and
+    (.helper_sha256 | test("^[0-9a-f]{64}$")) and
     (if $combo then
       .firewall == {mode:"simultaneous",evidence_ref:"combination-provenance.json"}
      else
@@ -794,7 +842,13 @@ main() {
   validate_inputs
   validate_snapshot "${OWNERSHIP_SNAPSHOT}"
   validate_manifest "${PROVISIONING_MANIFEST}"
+  if [[ -z "${CATS_REMOTE_WORKLOAD_HOOK:-}" ]]; then
+    REMOTE_HOOK="/opt/cats/qualification-124/$(jq -r .test_sha "${PROVISIONING_MANIFEST}")/q124-fault-workload"
+  fi
   if [[ "${MODE}" == live ]]; then
+    require_command git
+    require_command shasum
+    verify_reviewed_hook_provenance
     jq -e '(.captured_at | fromdateiso8601) >= (now - 300) and
       (.captured_at | fromdateiso8601) <= (now + 30)' "${OWNERSHIP_SNAPSHOT}" >/dev/null ||
       die "live ownership snapshot must be fresh within five minutes"
@@ -914,6 +968,17 @@ validate_root_file() {
   fi
 }
 
+run_hook() {
+  local actual_sha
+  validate_root_file "${HOOK_REF}" hook || return 1
+  [[ -x "${HOOK_REF}" ]] || { fail "hook is not executable"; return 1; }
+  actual_sha="$(sha256sum "${HOOK_REF}" | awk '{print $1}')"
+  [[ "${actual_sha}" == "${EXPECTED_HOOK_SHA256}" ]] || {
+    fail "hook SHA changed before invocation; refusing command $1"; return 1;
+  }
+  "${HOOK_REF}" "$@"
+}
+
 conf_get() {
   jq -er --arg key "$1" '.[$key]' "${CONFIG_REF}"
 }
@@ -947,6 +1012,19 @@ snapshot_cat_set_sha() {
     sha256sum | awk '{print $1}'
 }
 
+state_cat_set_sha() {
+  jq -Sc --arg ws "${WORKSPACE_ID}" '
+    [.cats[] | {cat_id,name:.cat_name,workspace_id:$ws,node_id,durability}] |
+    sort_by(.cat_id)
+  ' "$1" | sha256sum | awk '{print $1}'
+}
+
+state_matches_snapshot() {
+  [[ "$(state_cat_set_sha "$1")" == "$(snapshot_cat_set_sha "$2")" ]] || {
+    fail "state Cat set is not the exact admitted ownership set"; return 1;
+  }
+}
+
 snapshot_matches_baseline() {
   snapshot_valid "$1" &&
     [[ "$(snapshot_cat_set_sha "$1")" == "${EXPECTED_CAT_SET_SHA256}" ]]
@@ -955,7 +1033,7 @@ snapshot_matches_baseline() {
 take_snapshot() {
   local phase="$1"
   local output="${STATE_DIR}/ownership-${phase}.json"
-  "${HOOK_REF}" snapshot --scenario "${SCENARIO}" --phase "${phase}" \
+  run_hook snapshot --scenario "${SCENARIO}" --phase "${phase}" \
     --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" --instance-id "${INSTANCE_ID}" \
     --output "${output}" >/dev/null 2>&1 || return 1
   snapshot_valid "${output}" || { fail "${phase} ownership snapshot schema/freshness is invalid"; return 1; }
@@ -1054,7 +1132,7 @@ tcp_probe() {
 }
 
 real_probe() {
-  "${HOOK_REF}" probe --scenario "${SCENARIO}" --address "$1" --port "$2" >/dev/null 2>&1
+  run_hook probe --scenario "${SCENARIO}" --address "$1" --port "$2" >/dev/null 2>&1
 }
 
 expect_probe() {
@@ -1373,7 +1451,7 @@ combo_probe_dep() {
   while IFS= read -r ip; do
     expect_probe tcp "${phase}-${dep}" "${expected}" "${ip}" "${port}" || return 1
     started="$(date -u +%FT%TZ)"; rc=0
-    "${HOOK_REF}" probe --scenario "${SCENARIO}" --dependency "${dep}" --address "${ip}" --port "${port}" >/dev/null 2>&1 || rc=$?
+    run_hook probe --scenario "${SCENARIO}" --dependency "${dep}" --address "${ip}" --port "${port}" >/dev/null 2>&1 || rc=$?
     completed="$(date -u +%FT%TZ)"
     printf '%s\t%s\treal-read\t%s-%s\t%s\t%s\t%s\t%s\n' \
       "${started}" "${completed}" "${phase}" "${dep}" "${ip}" "${port}" "${rc}" "${expected}" >>"${PROBES}"
@@ -1383,7 +1461,7 @@ combo_probe_dep() {
     while IFS= read -r ip; do
       expect_probe tcp "${phase}-${dep}" "${expected}" "${ip}" "${port}" || return 1
       started="$(date -u +%FT%TZ)"; rc=0
-      "${HOOK_REF}" probe --scenario "${SCENARIO}" --dependency "${dep}" --address "${ip}" --port "${port}" >/dev/null 2>&1 || rc=$?
+      run_hook probe --scenario "${SCENARIO}" --dependency "${dep}" --address "${ip}" --port "${port}" >/dev/null 2>&1 || rc=$?
       completed="$(date -u +%FT%TZ)"
       printf '%s\t%s\treal-read\t%s-%s\t%s\t%s\t%s\t%s\n' \
         "${started}" "${completed}" "${phase}" "${dep}" "${ip}" "${port}" "${rc}" "${expected}" >>"${PROBES}"
@@ -1481,6 +1559,12 @@ setup() {
   [[ "${EUID}" == 0 ]] || fail "remote helper must run as root"
   [[ "${INSTANCE_ID}" =~ ^i-[0-9a-f]{17}$ ]] || fail "invalid exact instance ID"
   [[ "${NODE_ID}" =~ ^q124-[a-z0-9-]{8,55}$ ]] || fail "invalid exact Node ID"
+  [[ "${WORKSPACE_ID}" == "ws_788c5bfc3931" ]] || {
+    fail "invalid qualification workspace ID"; return 1;
+  }
+  [[ "${HOOK_REF}" == "/opt/cats/qualification-124/${TEST_SHA}/q124-fault-workload" ]] || {
+    fail "hook is not installed at the exact TEST_SHA-qualified path"; return 1;
+  }
   case "${SCENARIO}" in
     db|s3|control-plane) ;;
     db-s3|db-control-plane|s3-control-plane|all-3) combo_init || return 1 ;;
@@ -1528,7 +1612,7 @@ setup() {
       helper_sha256:$helper_sha,config_sha256:$config_sha,hook_sha256:$hook_sha,
       firewall:{comment:$comment,chains:[$chain4o,$chain4i,$chain6o,$chain6i]}}' >"${PROVENANCE}"
 
-  "${HOOK_REF}" ensure-cordoned --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
+  run_hook ensure-cordoned --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
     --output "${STATE_DIR}/cordon-operation.json" >/dev/null 2>&1 || return 1
   cordon_evidence_valid "${STATE_DIR}/cordon-operation.json" || return 1
 
@@ -1612,7 +1696,7 @@ setup() {
 }
 
 pre_injection() {
-  "${HOOK_REF}" state --scenario "${SCENARIO}" --phase before \
+  run_hook state --scenario "${SCENARIO}" --phase before \
     --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
     --output "${STATE_DIR}/state-before.json" >/dev/null 2>&1 || return 1
   state_valid "${STATE_DIR}/state-before.json" || return 1
@@ -1622,6 +1706,7 @@ pre_injection() {
     record positive-tcp PASS
     record positive-real-read PASS
     take_snapshot before || return 1
+    state_matches_snapshot "${STATE_DIR}/state-before.json" "${STATE_DIR}/ownership-before.json" || return 1
     record ownership-before PASS
     return 0
   fi
@@ -1629,6 +1714,7 @@ pre_injection() {
   record positive-tcp PASS
   record positive-real-read PASS
   take_snapshot before || return 1
+  state_matches_snapshot "${STATE_DIR}/state-before.json" "${STATE_DIR}/ownership-before.json" || return 1
   record ownership-before PASS
 }
 
@@ -1652,7 +1738,7 @@ fault_window() {
       printf '%s=%s\n' "${dep}.packets_after_probe" "${before}" >>"${COUNTERS}"
       printf '%s' "${before}" >"$(combo_dep_dir "${dep}")/packets-after-probe"
     done
-    "${HOOK_REF}" exercise --scenario "${SCENARIO}" --phase isolated \
+    run_hook exercise --scenario "${SCENARIO}" --phase isolated \
       --dependencies "$(jq -r 'join(",")' <<<"${dependencies_json}")" \
       --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
       --output "${STATE_DIR}/oracle-isolated.json" >/dev/null 2>&1 || return 1
@@ -1667,11 +1753,12 @@ fault_window() {
     done
     printf 'workload_delta=%s\nipv6_routable=%s\n' "${total_delta}" "${IPV6_ROUTABLE}" >>"${COUNTERS}"
     record workload PASS
-    "${HOOK_REF}" state --scenario "${SCENARIO}" --phase during \
+    run_hook state --scenario "${SCENARIO}" --phase during \
       --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
       --output "${STATE_DIR}/state-during.json" >/dev/null 2>&1 || return 1
     state_valid "${STATE_DIR}/state-during.json" || return 1
     take_snapshot isolated || return 1
+    state_matches_snapshot "${STATE_DIR}/state-during.json" "${STATE_DIR}/ownership-isolated.json" || return 1
     record ownership-isolated PASS
     record packet-counter PASS
     return 0
@@ -1700,7 +1787,7 @@ fault_window() {
   record negative-real-read PASS
   packets_after_probe="$(packet_count)" || return 1
   (( packets_after_probe > 0 )) || return 1
-  "${HOOK_REF}" exercise --scenario "${SCENARIO}" --phase isolated \
+  run_hook exercise --scenario "${SCENARIO}" --phase isolated \
     --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
     --output "${STATE_DIR}/oracle-isolated.json" >/dev/null 2>&1 || return 1
   oracle_valid "${STATE_DIR}/oracle-isolated.json" isolated || return 1
@@ -1708,11 +1795,12 @@ fault_window() {
   (( packets_after_workload > packets_after_probe )) ||
     { fail "workload produced no firewall counter delta"; return 1; }
   record workload PASS
-  "${HOOK_REF}" state --scenario "${SCENARIO}" --phase during \
+  run_hook state --scenario "${SCENARIO}" --phase during \
     --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
     --output "${STATE_DIR}/state-during.json" >/dev/null 2>&1 || return 1
   state_valid "${STATE_DIR}/state-during.json" || return 1
   take_snapshot isolated || return 1
+  state_matches_snapshot "${STATE_DIR}/state-during.json" "${STATE_DIR}/ownership-isolated.json" || return 1
   record ownership-isolated PASS
   printf 'packets_after_probe=%s\npackets_after_workload=%s\nworkload_delta=%s\nipv6_routable=%s\n' \
     "${packets_after_probe}" "${packets_after_workload}" \
@@ -1740,7 +1828,7 @@ combo_ordered_recovery() {
       combo_probe_dep "${other}" partial-recovery negative || return 1
     done < <(jq -r '.[]' <<<"${remaining_json}")
     index=$((index + 1)); step_file="${STATE_DIR}/recovery-step-${index}.json"
-    "${HOOK_REF}" exercise --scenario "${SCENARIO}" --phase partial-recovery \
+    run_hook exercise --scenario "${SCENARIO}" --phase partial-recovery \
       --restored-dependency "${dep}" --remaining-dependencies "$(jq -r 'join(",")' <<<"${remaining_json}")" \
       --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
       --output "${step_file}" >/dev/null 2>&1 || {
@@ -1772,18 +1860,19 @@ post_recovery() {
     done
     record recovery-tcp PASS
     record recovery-real-read PASS
-    "${HOOK_REF}" exercise --scenario "${SCENARIO}" --phase recovered \
+    run_hook exercise --scenario "${SCENARIO}" --phase recovered \
       --recovery-order "$(IFS=,; printf '%s' "${COMBO_RECOVERY[*]}")" \
       --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
       --output "${STATE_DIR}/oracle-recovered.json" >/dev/null 2>&1 || return 1
     oracle_valid "${STATE_DIR}/oracle-recovered.json" recovered || return 1
-    "${HOOK_REF}" state --scenario "${SCENARIO}" --phase after \
+    run_hook state --scenario "${SCENARIO}" --phase after \
       --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
       --output "${STATE_DIR}/state-after.json" >/dev/null 2>&1 || return 1
     state_valid "${STATE_DIR}/state-after.json" || return 1
     take_snapshot after || return 1
+    state_matches_snapshot "${STATE_DIR}/state-after.json" "${STATE_DIR}/ownership-after.json" || return 1
     record ownership-after PASS
-    "${HOOK_REF}" assert --scenario "${SCENARIO}" \
+    run_hook assert --scenario "${SCENARIO}" \
       --before "${STATE_DIR}/state-before.json" --during "${STATE_DIR}/state-during.json" \
       --after "${STATE_DIR}/state-after.json" >/dev/null 2>&1 || return 1
     before_identity="$(jq -Sc '[.cats[] | {cat_name,digest}] | sort_by(.cat_name)' "${STATE_DIR}/state-before.json")"
@@ -1806,17 +1895,18 @@ post_recovery() {
   done
   record recovery-tcp PASS
   record recovery-real-read PASS
-  "${HOOK_REF}" exercise --scenario "${SCENARIO}" --phase recovered \
+  run_hook exercise --scenario "${SCENARIO}" --phase recovered \
     --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
     --output "${STATE_DIR}/oracle-recovered.json" >/dev/null 2>&1 || return 1
   oracle_valid "${STATE_DIR}/oracle-recovered.json" recovered || return 1
-  "${HOOK_REF}" state --scenario "${SCENARIO}" --phase after \
+  run_hook state --scenario "${SCENARIO}" --phase after \
     --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
     --output "${STATE_DIR}/state-after.json" >/dev/null 2>&1 || return 1
   state_valid "${STATE_DIR}/state-after.json" || return 1
   take_snapshot after || return 1
+  state_matches_snapshot "${STATE_DIR}/state-after.json" "${STATE_DIR}/ownership-after.json" || return 1
   record ownership-after PASS
-  "${HOOK_REF}" assert --scenario "${SCENARIO}" \
+  run_hook assert --scenario "${SCENARIO}" \
     --before "${STATE_DIR}/state-before.json" \
     --during "${STATE_DIR}/state-during.json" \
     --after "${STATE_DIR}/state-after.json" >/dev/null 2>&1 || return 1

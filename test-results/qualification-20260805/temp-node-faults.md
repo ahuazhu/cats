@@ -39,7 +39,10 @@ must remain Cordoned, have zero orphans, and have the identical Cat-set hash.
 The strict provisioning manifest binds the instance ID, unique Node ID, account,
 region, Name, launch time, expiry no more than 24 hours after launch, complete
 qualification tags, `TEST_SHA`, and expected SHA-256 values of the Host config
-and hook. At live start the harness requires at least ten minutes of TTL,
+and hook, plus the hook's exact repository path. At live start the harness
+requires that path to exist at the manifest `TEST_SHA`, hashes the Git blob,
+and accepts only `/opt/cats/qualification-124/<TEST_SHA>/q124-fault-workload`.
+It also requires at least ten minutes of TTL,
 compares EC2 `LaunchTime` and every required tag, and proves that the exact
 temporary instance is the only non-terminated EC2 instance with that Node ID.
 The fixed production source ID is not configurable and cannot equal the target.
@@ -49,6 +52,7 @@ Live mode additionally requires the exact confirmation string:
 ```sh
 export CATS_FAULT_MODE=live
 export CATS_FAULT_CONFIRM="RUN_Q124_FAULT_${TEMP_INSTANCE_ID}_${NODE_ID}_${CATS_FAULT_SCENARIO}"
+export CATS_REMOTE_WORKLOAD_HOOK="/opt/cats/qualification-124/${TEST_SHA}/q124-fault-workload"
 ./test-results/qualification-20260805/temp-node-faults.sh
 ```
 
@@ -74,11 +78,15 @@ The temporary Host must already contain:
   `node_listen_ip`, `node_listen_port`, `fault_duration_seconds`, and
   `control_plane_lease_timeout_seconds`. Both durations must be integer seconds
   from 5 through 300. No extra or secret field is accepted;
-- `/usr/local/libexec/cats/q124-fault-workload`, root-owned, mode 0700 or 0750.
+- `/opt/cats/qualification-124/<TEST_SHA>/q124-fault-workload`, root-owned,
+  mode 0700 or 0750 and byte-identical to the version-controlled hook at that
+  exact `TEST_SHA`.
 
 Provisioning records both SHA-256 values in the manifest. Before any snapshot or
 network mutation, the helper hashes both files and itself and requires exact
-matches. It records those values plus the local harness SHA, `TEST_SHA`, run ID,
+matches. It rechecks hook ownership, mode and hash immediately before every
+hook invocation, so an installed-hook replacement fails before the requested
+command. It records those values plus the local harness SHA, `TEST_SHA`, run ID,
 firewall comments and chain names in `provenance.json`. A Host-wide nonblocking
 `flock` and never-reused state directory reject concurrent or duplicate runs.
 
@@ -289,7 +297,10 @@ CATS_PROVISIONING_MANIFEST=test-results/qualification-20260805/temp-node-faults.
 ```
 
 Fixture mode exercises the serial and combination evidence validators without
-claiming that packet filtering or production behavior was tested.
+claiming that packet filtering or production behavior was tested. Every state
+file's exact `{cat_id,name,workspace_id,node_id,durability}` set must equal its
+same-phase ownership snapshot; a schema-valid but different Cat ID is a
+required known-negative rejection.
 
 The Linux mock additionally executes the embedded remote helper and its cleanup
 script against mock xtables/systemd adapters. It covers successful isolation,
@@ -299,7 +310,8 @@ set, duplicate RUN_ID, a secret extra JSON field, all three simultaneous pairs,
 and the simultaneous all-three case. Combination-specific negative cases cover
 partial creation, cleanup-ledger preservation, and SIGKILL/SSM loss with all
 independent watchdogs. A transport-budget case proves oversized but otherwise
-valid evidence fails closed before emission. The 16 cases verify distinct
+valid evidence fails closed before emission. Cat-set mismatch and installed
+hook-replacement cases prove both failures occur closed. The 18 cases verify distinct
 chains/timers, exact partial recovery, counters, and final cleanup:
 
 ```sh
