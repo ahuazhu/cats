@@ -176,7 +176,7 @@ jobs:
             --selector app.kubernetes.io/name=cats-controld \
             --output=json)"
           owner_probe="control-ha-owner-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          owner_query="SELECT a.client_addr::text FROM pg_locks AS l JOIN pg_stat_activity AS a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.classid=hashtext(current_schema())::oid AND l.objid=420201 AND l.objsubid=2 AND l.granted"
+          owner_query="SELECT host(a.client_addr) FROM pg_locks AS l JOIN pg_stat_activity AS a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.classid=hashtext(current_schema())::oid AND l.objid=420201 AND l.objsubid=2 AND l.granted"
           leader_ip="$(
             deploy/aws/run-postgres-probe.sh \
               "$KUBECONFIG" \
@@ -286,7 +286,7 @@ jobs:
           fi
 
           probe="control-ha-owner-after-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          owner_query="SELECT a.client_addr::text FROM pg_locks AS l JOIN pg_stat_activity AS a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.classid=hashtext(current_schema())::oid AND l.objid=420201 AND l.objsubid=2 AND l.granted"
+          owner_query="SELECT host(a.client_addr) FROM pg_locks AS l JOIN pg_stat_activity AS a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.classid=hashtext(current_schema())::oid AND l.objid=420201 AND l.objsubid=2 AND l.granted"
           leader_ip="$(
             deploy/aws/run-postgres-probe.sh \
               "$KUBECONFIG" \
