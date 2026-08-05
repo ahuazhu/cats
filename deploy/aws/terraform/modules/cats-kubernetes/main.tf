@@ -101,124 +101,6 @@ resource "kubernetes_namespace_v1" "cats" {
   }
 }
 
-resource "kubernetes_storage_class_v1" "control_data" {
-  metadata {
-    name   = var.control_data_storage_class
-    labels = local.labels
-  }
-
-  storage_provisioner    = "ebs.csi.eks.amazonaws.com"
-  volume_binding_mode    = "WaitForFirstConsumer"
-  allow_volume_expansion = true
-
-  allowed_topologies {
-    match_label_expressions {
-      key    = "eks.amazonaws.com/compute-type"
-      values = ["auto"]
-    }
-  }
-
-  parameters = {
-    type               = "gp3"
-    encrypted          = "true"
-    tagSpecification_1 = "Project=Cats"
-  }
-}
-
-resource "kubernetes_persistent_volume_claim_v1" "control_data" {
-  metadata {
-    name      = "cats-control-data"
-    namespace = kubernetes_namespace_v1.cats.metadata[0].name
-    labels    = local.labels
-  }
-
-  # The storage class binds WaitForFirstConsumer, so the claim stays Pending
-  # until a Pod schedules against it. Waiting for Bound here deadlocks: the
-  # claim waits for the Deployment and Terraform waits for the claim. This only
-  # shows up on a fresh cluster -- an imported claim is already bound.
-  wait_until_bound = false
-
-  spec {
-    access_modes       = ["ReadWriteOnce"]
-    storage_class_name = kubernetes_storage_class_v1.control_data.metadata[0].name
-
-    resources {
-      requests = {
-        storage = var.control_data_size
-      }
-    }
-  }
-}
-
-# Until the control resource store moves off its single SQLite volume
-# (ahuazhu/cats#103), this volume is the only copy of every account, workspace,
-# balance and route, and nothing else backs it up. Data Lifecycle Manager
-# snapshots it daily by tag: the EKS Auto Mode CSI provisioner stamps each
-# volume with its claim's name, so referencing the claim here keeps the target
-# in sync with a rename. A policy whose target tag matches nothing succeeds
-# silently -- the tag below is verified present on the production volume.
-data "aws_partition" "current" {}
-
-data "aws_iam_policy_document" "dlm_assume" {
-  statement {
-    effect  = "Allow"
-    actions = ["sts:AssumeRole"]
-
-    principals {
-      type        = "Service"
-      identifiers = ["dlm.amazonaws.com"]
-    }
-  }
-}
-
-resource "aws_iam_role" "control_data_snapshots" {
-  name               = "cats-control-data-snapshots"
-  assume_role_policy = data.aws_iam_policy_document.dlm_assume.json
-}
-
-resource "aws_iam_role_policy_attachment" "control_data_snapshots" {
-  role       = aws_iam_role.control_data_snapshots.name
-  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole"
-}
-
-resource "aws_dlm_lifecycle_policy" "control_data" {
-  description        = "Daily snapshots of the Cats control-plane data volume"
-  execution_role_arn = aws_iam_role.control_data_snapshots.arn
-  state              = "ENABLED"
-
-  policy_details {
-    resource_types = ["VOLUME"]
-
-    target_tags = {
-      "kubernetes.io/created-for/pvc/name" = kubernetes_persistent_volume_claim_v1.control_data.metadata[0].name
-    }
-
-    schedule {
-      name      = "daily"
-      copy_tags = true
-
-      create_rule {
-        interval      = 24
-        interval_unit = "HOURS"
-        times         = ["19:00"]
-      }
-
-      retain_rule {
-        count = var.control_data_snapshot_retention
-      }
-
-      tags_to_add = {
-        "cats.run/snapshot-of" = "control-data"
-      }
-    }
-  }
-
-  # The role reference above only orders this policy after the role itself.
-  # Without this, the initial apply can create the policy before the
-  # attachment that gives the role its snapshot permissions.
-  depends_on = [aws_iam_role_policy_attachment.control_data_snapshots]
-}
-
 resource "kubernetes_service_account_v1" "control_plane" {
   metadata {
     name      = "cats-controld"
@@ -304,11 +186,6 @@ resource "kubernetes_deployment_v1" "control_plane" {
         service_account_name             = kubernetes_service_account_v1.control_plane.metadata[0].name
         termination_grace_period_seconds = 5
 
-        security_context {
-          fs_group               = 10001
-          fs_group_change_policy = "OnRootMismatch"
-        }
-
         node_selector = {
           "kubernetes.io/arch" = "amd64"
         }
@@ -321,8 +198,6 @@ resource "kubernetes_deployment_v1" "control_plane" {
           args = [
             "--listen",
             "0.0.0.0:7300",
-            "--db-path",
-            "/var/lib/cats/control/control.db",
             "--metadata-store-adapter",
             "postgres",
             "--metadata-store-option",
@@ -342,6 +217,13 @@ resource "kubernetes_deployment_v1" "control_plane" {
           env {
             name  = "CATS_OCI_DEPLOY_SYNC_WAIT_MS"
             value = tostring(var.oci_deploy_sync_wait_ms)
+          }
+
+          # The control store reads its DSN from CATS_POSTGRES_URL (delivered
+          # by the runtime Secret below) and verifies RDS TLS with this CA.
+          env {
+            name  = "CATS_CONTROL_POSTGRES_CA_FILE"
+            value = "/etc/cats/rds-ca.pem"
           }
 
           env_from {
@@ -403,23 +285,10 @@ resource "kubernetes_deployment_v1" "control_plane" {
           }
 
           volume_mount {
-            name       = "control-data"
-            mount_path = "/var/lib/cats/control"
-          }
-
-          volume_mount {
             name       = "rds-ca"
             mount_path = "/etc/cats/rds-ca.pem"
             sub_path   = "rds-ca.pem"
             read_only  = true
-          }
-        }
-
-        volume {
-          name = "control-data"
-
-          persistent_volume_claim {
-            claim_name = kubernetes_persistent_volume_claim_v1.control_data.metadata[0].name
           }
         }
 

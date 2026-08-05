@@ -21,6 +21,22 @@ jobs:
     name: Rust workspace
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # The control store is PostgreSQL-only; its tests fail loudly without a
+    # server rather than silently skipping.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: cats
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      CATS_TEST_POSTGRES_URL: postgres://postgres:cats@127.0.0.1:5432/postgres
     steps:
       - uses: actions/checkout@v4
 

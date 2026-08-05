@@ -13,15 +13,17 @@ impl Store {
         &self,
         account_organizations: &BTreeMap<String, String>,
     ) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction().map_err(internal)?;
-        for (account_slug, organization_id) in account_organizations {
-            if account_slug.is_empty() || organization_id.is_empty() {
-                continue;
+        self.enter(|client| {
+            let client = client?;
+            let mut tx = client.transaction().map_err(internal)?;
+            for (account_slug, organization_id) in account_organizations {
+                if account_slug.is_empty() || organization_id.is_empty() {
+                    continue;
+                }
+                ensure_configured_account(&mut tx, account_slug, organization_id)?;
             }
-            ensure_configured_account(&tx, account_slug, organization_id)?;
-        }
-        tx.commit().map_err(internal)
+            tx.commit().map_err(internal)
+        })
     }
 
     /// Idempotently create the local half of a Personal Account provision.
@@ -37,84 +39,91 @@ impl Store {
                 "WorkOS user and organization IDs must not be empty",
             ));
         }
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction().map_err(internal)?;
-        if let Some(account) =
-            find_account_by_personal_owner(&tx, workos_user_id).map_err(internal)?
-        {
-            if account.workos_organization_id != workos_organization_id {
+        self.enter(|client| {
+            let client = client?;
+            let mut tx = client.transaction().map_err(internal)?;
+            if let Some(account) =
+                find_account_by_personal_owner(&mut tx, workos_user_id).map_err(internal)?
+            {
+                if account.workos_organization_id != workos_organization_id {
+                    return Err(ApiError::conflict(
+                        "personal account WorkOS organization changed",
+                    ));
+                }
+                let workspace = default_workspace_for_account(&mut tx, &account.id)?;
+                tx.commit().map_err(internal)?;
+                return Ok((account, workspace));
+            }
+
+            if find_account_by_organization(&mut tx, workos_organization_id)
+                .map_err(internal)?
+                .is_some()
+            {
                 return Err(ApiError::conflict(
-                    "personal account WorkOS organization changed",
+                    "WorkOS organization already belongs to another Cats account",
                 ));
             }
-            let workspace = default_workspace_for_account(&tx, &account.id)?;
-            tx.commit().map_err(internal)?;
-            return Ok((account, workspace));
-        }
-
-        if find_account_by_organization(&tx, workos_organization_id)
-            .map_err(internal)?
-            .is_some()
-        {
-            return Err(ApiError::conflict(
-                "WorkOS organization already belongs to another Cats account",
-            ));
-        }
-        let account_id = new_id(ids::ACCOUNT_PREFIX);
-        let workspace_id = new_id(ids::WORKSPACE_PREFIX);
-        let requested_slug = dns_slug(
-            display_name
-                .split('@')
-                .next()
-                .filter(|value| !value.is_empty())
-                .unwrap_or("personal"),
-            48,
-        );
-        let account_slug = unique_account_slug(&tx, &requested_slug)?;
-        let billing_account_id = format!("billing_account/account/{account_id}");
-        let created_at = now_unix();
-        tx.execute(
-            "INSERT INTO accounts (
+            let account_id = new_id(ids::ACCOUNT_PREFIX);
+            let workspace_id = new_id(ids::WORKSPACE_PREFIX);
+            let requested_slug = dns_slug(
+                display_name
+                    .split('@')
+                    .next()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("personal"),
+                48,
+            );
+            let account_slug = unique_account_slug(&mut tx, &requested_slug)?;
+            let billing_account_id = format!("billing_account/account/{account_id}");
+            let created_at = now_unix();
+            tx.execute(
+                "INSERT INTO accounts (
                 id, slug, display_name, kind, workos_organization_id,
                 billing_account_id, personal_owner_user_id, status, created_at
-             ) VALUES (?1,?2,?3,'personal',?4,?5,?6,'provisioning',?7)",
-            params![
-                account_id,
-                account_slug,
-                display_name,
-                workos_organization_id,
-                billing_account_id,
-                workos_user_id,
-                created_at
-            ],
-        )
-        .map_err(internal)?;
-        tx.execute(
-            "INSERT INTO workspaces (
+             ) VALUES ($1,$2,$3,'personal',$4,$5,$6,'provisioning',$7)",
+                &[
+                    &account_id,
+                    &account_slug,
+                    &display_name,
+                    &workos_organization_id,
+                    &billing_account_id,
+                    &workos_user_id,
+                    &created_at,
+                ],
+            )
+            .map_err(internal)?;
+            tx.execute(
+                "INSERT INTO workspaces (
                 id, account_id, slug, display_name, is_default, created_at
-             ) VALUES (?1,?2,'default','Default',1,?3)",
-            params![workspace_id, account_id, created_at],
-        )
-        .map_err(internal)?;
-        tx.execute(
-            "INSERT OR REPLACE INTO account_membership_shadow (
+             ) VALUES ($1,$2,'default','Default',TRUE,$3)",
+                &[&workspace_id, &account_id, &created_at],
+            )
+            .map_err(internal)?;
+            tx.execute(
+                "INSERT INTO account_membership_shadow (
                 workos_membership_id, account_id, workos_user_id, role_slug,
                 status, updated_at
-             ) VALUES (?1,?2,?3,'owner','active',?4)",
-            params![
-                format!("personal-owner:{workos_user_id}"),
-                account_id,
-                workos_user_id,
-                created_at
-            ],
-        )
-        .map_err(internal)?;
-        let account = find_account_by_personal_owner(&tx, workos_user_id)
-            .map_err(internal)?
-            .ok_or_else(|| ApiError::internal("personal account insert was not visible"))?;
-        let workspace = default_workspace_for_account(&tx, &account.id)?;
-        tx.commit().map_err(internal)?;
-        Ok((account, workspace))
+             ) VALUES ($1,$2,$3,'owner','active',$4)
+             ON CONFLICT (workos_membership_id) DO UPDATE SET
+                account_id=EXCLUDED.account_id,
+                workos_user_id=EXCLUDED.workos_user_id,
+                role_slug=EXCLUDED.role_slug, status=EXCLUDED.status,
+                updated_at=EXCLUDED.updated_at",
+                &[
+                    &format!("personal-owner:{workos_user_id}"),
+                    &account_id,
+                    &workos_user_id,
+                    &created_at,
+                ],
+            )
+            .map_err(internal)?;
+            let account = find_account_by_personal_owner(&mut tx, workos_user_id)
+                .map_err(internal)?
+                .ok_or_else(|| ApiError::internal("personal account insert was not visible"))?;
+            let workspace = default_workspace_for_account(&mut tx, &account.id)?;
+            tx.commit().map_err(internal)?;
+            Ok((account, workspace))
+        })
     }
 
     pub fn signup_grant_state(
@@ -123,32 +132,39 @@ impl Store {
         campaign: &str,
         billing_account_id: &str,
     ) -> Result<SignupGrantState> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR IGNORE INTO signup_grant_eligibility (
-                workos_user_id, campaign, billing_account_id, state, created_at
-             ) VALUES (?1,?2,?3,'pending',?4)",
-            params![workos_user_id, campaign, billing_account_id, now_unix()],
-        )
-        .map_err(internal)?;
-        let (beneficiary, state): (String, String) = conn
-            .query_row(
-                "SELECT billing_account_id, state
+        self.enter(|client| {
+            let client = client?;
+            client
+                .execute(
+                    "INSERT INTO signup_grant_eligibility (
+                    workos_user_id, campaign, billing_account_id, state, created_at
+                 ) VALUES ($1,$2,$3,'pending',$4)
+                 ON CONFLICT DO NOTHING",
+                    &[&workos_user_id, &campaign, &billing_account_id, &now_unix()],
+                )
+                .map_err(internal)?;
+            let row = client
+                .query_one(
+                    "SELECT billing_account_id, state
                    FROM signup_grant_eligibility
-                  WHERE workos_user_id=?1 AND campaign=?2",
-                params![workos_user_id, campaign],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(internal)?;
-        if beneficiary != billing_account_id {
-            return Err(ApiError::conflict(
-                "signup grant beneficiary cannot be changed",
-            ));
-        }
-        Ok(if state == "applied" {
-            SignupGrantState::Applied
-        } else {
-            SignupGrantState::Pending
+                  WHERE workos_user_id=$1 AND campaign=$2",
+                    &[&workos_user_id, &campaign],
+                )
+                .map_err(internal)?;
+            let (beneficiary, state): (String, String) = (
+                row.try_get(0).map_err(internal)?,
+                row.try_get(1).map_err(internal)?,
+            );
+            if beneficiary != billing_account_id {
+                return Err(ApiError::conflict(
+                    "signup grant beneficiary cannot be changed",
+                ));
+            }
+            Ok(if state == "applied" {
+                SignupGrantState::Applied
+            } else {
+                SignupGrantState::Pending
+            })
         })
     }
 
@@ -158,73 +174,75 @@ impl Store {
         campaign: &str,
         billing_account_id: &str,
     ) -> Result<()> {
-        self.with(|conn| {
-            let changed = conn.execute(
+        let changed = self.with(|client| {
+            client.execute(
                 "UPDATE signup_grant_eligibility
-                    SET state='applied', applied_at=?4
-                  WHERE workos_user_id=?1 AND campaign=?2
-                    AND billing_account_id=?3 AND state IN ('pending','applied')",
-                params![workos_user_id, campaign, billing_account_id, now_unix()],
-            )?;
-            if changed == 0 {
-                return Err(rusqlite::Error::QueryReturnedNoRows);
-            }
-            Ok(())
-        })
+                    SET state='applied', applied_at=$4
+                  WHERE workos_user_id=$1 AND campaign=$2
+                    AND billing_account_id=$3 AND state IN ('pending','applied')",
+                &[&workos_user_id, &campaign, &billing_account_id, &now_unix()],
+            )
+        })?;
+        if changed == 0 {
+            return Err(internal("Query returned no rows"));
+        }
+        Ok(())
     }
 
     pub fn activate_account(&self, account_id: &str) -> Result<()> {
-        self.with(|conn| {
-            let changed = conn.execute(
-                "UPDATE accounts SET status='active' WHERE id=?1",
-                params![account_id],
-            )?;
-            if changed == 0 {
-                return Err(rusqlite::Error::QueryReturnedNoRows);
-            }
-            Ok(())
-        })
+        let changed = self.with(|client| {
+            client.execute(
+                "UPDATE accounts SET status='active' WHERE id=$1",
+                &[&account_id],
+            )
+        })?;
+        if changed == 0 {
+            return Err(internal("Query returned no rows"));
+        }
+        Ok(())
     }
 
     pub fn account_for_organization(&self, organization_id: &str) -> Result<Option<AccountRecord>> {
-        self.with(|conn| find_account_by_organization(conn, organization_id))
+        self.with(|client| find_account_by_organization(client, organization_id))
     }
 
     pub fn account_for_personal_owner(
         &self,
         workos_user_id: &str,
     ) -> Result<Option<AccountRecord>> {
-        self.with(|conn| find_account_by_personal_owner(conn, workos_user_id))
+        self.with(|client| find_account_by_personal_owner(client, workos_user_id))
     }
 
     pub fn account_by_id(&self, account_id: &str) -> Result<AccountRecord> {
-        let conn = self.conn.lock().unwrap();
-        match conn.query_row(
-            "SELECT id, slug, display_name, kind, workos_organization_id,
-                        billing_account_id, personal_owner_user_id, status
-                   FROM accounts WHERE id=?1",
-            params![account_id],
-            row_to_account,
-        ) {
-            Ok(account) => Ok(account),
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                Err(ApiError::new(ErrorCode::NotFound, "account not found"))
+        self.enter(|client| {
+            let client = client?;
+            match client
+                .query_opt(
+                    "SELECT id, slug, display_name, kind, workos_organization_id,
+                            billing_account_id, personal_owner_user_id, status
+                       FROM accounts WHERE id=$1",
+                    &[&account_id],
+                )
+                .map_err(internal)?
+            {
+                Some(row) => row_to_account(&row).map_err(internal),
+                None => Err(ApiError::new(ErrorCode::NotFound, "account not found")),
             }
-            Err(error) => Err(internal(error)),
-        }
+        })
     }
 
     pub fn workspaces_for_account(&self, account_id: &str) -> Result<Vec<WorkspaceRecord>> {
-        self.with(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, account_id, slug, display_name, is_default
-                   FROM workspaces WHERE account_id=?1
-                  ORDER BY is_default DESC, slug",
-            )?;
-            let rows = stmt
-                .query_map(params![account_id], row_to_workspace)?
-                .collect();
-            rows
+        self.with(|client| {
+            client
+                .query(
+                    "SELECT id, account_id, slug, display_name, is_default
+                       FROM workspaces WHERE account_id=$1
+                      ORDER BY is_default DESC, slug",
+                    &[&account_id],
+                )?
+                .iter()
+                .map(row_to_workspace)
+                .collect::<std::result::Result<Vec<_>, postgres::Error>>()
         })
     }
 
@@ -240,55 +258,55 @@ impl Store {
                 "workspace display_name must be 1 to 100 characters",
             ));
         }
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction().map_err(internal)?;
-        let account = tx
-            .query_row(
-                "SELECT id, slug, display_name, kind, workos_organization_id,
+        self.enter(|client| {
+            let client = client?;
+            let mut tx = client.transaction().map_err(internal)?;
+            let account = match tx
+                .query_opt(
+                    "SELECT id, slug, display_name, kind, workos_organization_id,
                         billing_account_id, personal_owner_user_id, status
-                   FROM accounts WHERE id=?1",
-                params![account_id],
-                row_to_account,
-            )
-            .map_err(|error| match error {
-                rusqlite::Error::QueryReturnedNoRows => {
-                    ApiError::new(ErrorCode::NotFound, "account not found")
-                }
-                other => internal(other),
-            })?;
-        if account.status != "active" {
-            return Err(ApiError::failed_precondition("account is not active"));
-        }
-        let workspace_id = new_id(ids::WORKSPACE_PREFIX);
-        tx.execute(
-            "INSERT INTO workspaces (
-                id, account_id, slug, display_name, is_default, created_at
-             ) VALUES (?1,?2,?3,?4,0,?5)",
-            params![
-                workspace_id,
-                account.id,
-                slug,
-                display_name.trim(),
-                now_unix()
-            ],
-        )
-        .map_err(|error| {
-            if is_constraint(&error) {
-                ApiError::conflict("workspace slug already exists in this account")
-            } else {
-                internal(error)
+                   FROM accounts WHERE id=$1",
+                    &[&account_id],
+                )
+                .map_err(internal)?
+            {
+                Some(row) => row_to_account(&row).map_err(internal)?,
+                None => return Err(ApiError::new(ErrorCode::NotFound, "account not found")),
+            };
+            if account.status != "active" {
+                return Err(ApiError::failed_precondition("account is not active"));
             }
-        })?;
-        let workspace = tx
-            .query_row(
-                "SELECT id, account_id, slug, display_name, is_default
-                   FROM workspaces WHERE id=?1",
-                params![workspace_id],
-                row_to_workspace,
+            let workspace_id = new_id(ids::WORKSPACE_PREFIX);
+            tx.execute(
+                "INSERT INTO workspaces (
+                id, account_id, slug, display_name, is_default, created_at
+             ) VALUES ($1,$2,$3,$4,FALSE,$5)",
+                &[
+                    &workspace_id,
+                    &account.id,
+                    &slug,
+                    &display_name.trim(),
+                    &now_unix(),
+                ],
             )
-            .map_err(internal)?;
-        tx.commit().map_err(internal)?;
-        Ok(workspace)
+            .map_err(|error| {
+                if is_constraint(&error) {
+                    ApiError::conflict("workspace slug already exists in this account")
+                } else {
+                    internal(error)
+                }
+            })?;
+            let row = tx
+                .query_one(
+                    "SELECT id, account_id, slug, display_name, is_default
+                   FROM workspaces WHERE id=$1",
+                    &[&workspace_id],
+                )
+                .map_err(internal)?;
+            let workspace = row_to_workspace(&row).map_err(internal)?;
+            tx.commit().map_err(internal)?;
+            Ok(workspace)
+        })
     }
 
     pub fn update_workspace(
@@ -310,81 +328,87 @@ impl Store {
                 "workspace display_name must be 1 to 100 characters",
             ));
         }
-        let conn = self.conn.lock().unwrap();
-        let changed = conn
-            .execute(
-                "UPDATE workspaces
-                    SET slug=COALESCE(?2, slug),
-                        display_name=COALESCE(?3, display_name)
-                  WHERE id=?1",
-                params![workspace_id, slug, display_name.map(str::trim)],
-            )
-            .map_err(|error| {
-                if is_constraint(&error) {
-                    ApiError::conflict("workspace slug already exists in this account")
-                } else {
-                    internal(error)
-                }
-            })?;
-        if changed == 0 {
-            return Err(ApiError::new(ErrorCode::NotFound, "workspace not found"));
-        }
-        conn.query_row(
-            "SELECT id, account_id, slug, display_name, is_default
-               FROM workspaces WHERE id=?1",
-            params![workspace_id],
-            row_to_workspace,
-        )
-        .map_err(internal)
+        self.enter(|client| {
+            let client = client?;
+            let changed = client
+                .execute(
+                    "UPDATE workspaces
+                    SET slug=COALESCE($2, slug),
+                        display_name=COALESCE($3, display_name)
+                  WHERE id=$1",
+                    &[&workspace_id, &slug, &display_name.map(str::trim)],
+                )
+                .map_err(|error| {
+                    if is_constraint(&error) {
+                        ApiError::conflict("workspace slug already exists in this account")
+                    } else {
+                        internal(error)
+                    }
+                })?;
+            if changed == 0 {
+                return Err(ApiError::new(ErrorCode::NotFound, "workspace not found"));
+            }
+            let row = client
+                .query_one(
+                    "SELECT id, account_id, slug, display_name, is_default
+                   FROM workspaces WHERE id=$1",
+                    &[&workspace_id],
+                )
+                .map_err(internal)?;
+            row_to_workspace(&row).map_err(internal)
+        })
     }
 
     pub fn workspace_scope(&self, workspace_id: &str) -> Result<WorkspaceScope> {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT
-                a.id, a.slug, a.display_name, a.kind,
-                a.workos_organization_id, a.billing_account_id,
-                a.personal_owner_user_id, a.status,
-                w.id, w.account_id, w.slug, w.display_name, w.is_default
-               FROM workspaces w
-               JOIN accounts a ON a.id=w.account_id
-              WHERE w.id=?1",
-            params![workspace_id],
-            |row| {
-                Ok(WorkspaceScope {
-                    account: row_to_account(row)?,
+        self.enter(|client| {
+            let client = client?;
+            match client
+                .query_opt(
+                    "SELECT
+                    a.id, a.slug, a.display_name, a.kind,
+                    a.workos_organization_id, a.billing_account_id,
+                    a.personal_owner_user_id, a.status,
+                    w.id, w.account_id, w.slug, w.display_name, w.is_default
+                   FROM workspaces w
+                   JOIN accounts a ON a.id=w.account_id
+                  WHERE w.id=$1",
+                    &[&workspace_id],
+                )
+                .map_err(internal)?
+            {
+                Some(row) => Ok(WorkspaceScope {
+                    account: row_to_account(&row).map_err(internal)?,
                     workspace: WorkspaceRecord {
-                        id: row.get(8)?,
-                        account_id: row.get(9)?,
-                        slug: row.get(10)?,
-                        display_name: row.get(11)?,
-                        is_default: row.get::<_, i64>(12)? != 0,
+                        id: row.try_get(8).map_err(internal)?,
+                        account_id: row.try_get(9).map_err(internal)?,
+                        slug: row.try_get(10).map_err(internal)?,
+                        display_name: row.try_get(11).map_err(internal)?,
+                        is_default: row.try_get(12).map_err(internal)?,
                     },
-                })
-            },
-        )
-        .map_err(|error| match error {
-            rusqlite::Error::QueryReturnedNoRows => {
-                ApiError::new(ErrorCode::NotFound, format!("workspace {workspace_id}"))
+                }),
+                None => Err(ApiError::new(
+                    ErrorCode::NotFound,
+                    format!("workspace {workspace_id}"),
+                )),
             }
-            other => internal(other),
         })
     }
 
     pub fn workspace_by_id(&self, workspace_id: &str) -> Result<WorkspaceRecord> {
-        let conn = self.conn.lock().unwrap();
-        match conn.query_row(
-            "SELECT id, account_id, slug, display_name, is_default
-                   FROM workspaces WHERE id=?1",
-            params![workspace_id],
-            row_to_workspace,
-        ) {
-            Ok(workspace) => Ok(workspace),
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                Err(ApiError::new(ErrorCode::NotFound, "workspace not found"))
+        self.enter(|client| {
+            let client = client?;
+            match client
+                .query_opt(
+                    "SELECT id, account_id, slug, display_name, is_default
+                       FROM workspaces WHERE id=$1",
+                    &[&workspace_id],
+                )
+                .map_err(internal)?
+            {
+                Some(row) => row_to_workspace(&row).map_err(internal),
+                None => Err(ApiError::new(ErrorCode::NotFound, "workspace not found")),
             }
-            Err(error) => Err(internal(error)),
-        }
+        })
     }
 
     pub fn create_workspace_token(
@@ -404,73 +428,80 @@ impl Store {
             label: label.to_string(),
             created_at_unix: now_unix(),
         };
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO workspace_tokens
-                (id, workspace_id, label, token_hash, created_at, revoked_at)
-             VALUES (?1,?2,?3,?4,?5,NULL)",
-            params![
-                token.id,
-                token.workspace_id,
-                token.label,
-                token_hash,
-                token.created_at_unix
-            ],
-        )
-        .map_err(internal)?;
-        Ok(token)
+        self.enter(|client| {
+            let client = client?;
+            client
+                .execute(
+                    "INSERT INTO workspace_tokens
+                    (id, workspace_id, label, token_hash, created_at, revoked_at)
+                 VALUES ($1,$2,$3,$4,$5,NULL)",
+                    &[
+                        &token.id,
+                        &token.workspace_id,
+                        &token.label,
+                        &token_hash,
+                        &token.created_at_unix,
+                    ],
+                )
+                .map_err(internal)?;
+            Ok(token)
+        })
     }
 
     pub fn active_workspace_for_token_hash(&self, token_hash: &str) -> Result<Option<String>> {
-        self.with(|conn| {
-            conn.query_row(
-                "SELECT workspace_id FROM workspace_tokens
-                  WHERE token_hash=?1 AND revoked_at IS NULL",
-                params![token_hash],
-                |row| row.get(0),
-            )
-            .optional()
+        self.with(|client| {
+            client
+                .query_opt(
+                    "SELECT workspace_id FROM workspace_tokens
+                      WHERE token_hash=$1 AND revoked_at IS NULL",
+                    &[&token_hash],
+                )?
+                .map(|row| row.try_get(0))
+                .transpose()
         })
     }
 
     pub fn workspace_tokens(&self, workspace_id: &str) -> Result<Vec<WorkspaceToken>> {
-        self.with(|conn| {
-            let mut statement = conn.prepare(
-                "SELECT id, workspace_id, label, created_at
-                   FROM workspace_tokens
-                  WHERE workspace_id=?1 AND revoked_at IS NULL
-                  ORDER BY created_at, id",
-            )?;
-            let rows = statement
-                .query_map(params![workspace_id], |row| {
+        self.with(|client| {
+            client
+                .query(
+                    "SELECT id, workspace_id, label, created_at
+                       FROM workspace_tokens
+                      WHERE workspace_id=$1 AND revoked_at IS NULL
+                      ORDER BY created_at, id",
+                    &[&workspace_id],
+                )?
+                .iter()
+                .map(|row| {
                     Ok(WorkspaceToken {
-                        id: row.get(0)?,
-                        workspace_id: row.get(1)?,
-                        label: row.get(2)?,
-                        created_at_unix: row.get(3)?,
+                        id: row.try_get(0)?,
+                        workspace_id: row.try_get(1)?,
+                        label: row.try_get(2)?,
+                        created_at_unix: row.try_get(3)?,
                     })
-                })?
-                .collect();
-            rows
+                })
+                .collect::<std::result::Result<Vec<_>, postgres::Error>>()
         })
     }
 
     pub fn revoke_workspace_token(&self, workspace_id: &str, token_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let changed = conn
-            .execute(
-                "UPDATE workspace_tokens SET revoked_at=?3
-                  WHERE id=?1 AND workspace_id=?2 AND revoked_at IS NULL",
-                params![token_id, workspace_id, now_unix()],
-            )
-            .map_err(internal)?;
-        if changed == 0 {
-            return Err(ApiError::new(
-                ErrorCode::NotFound,
-                "workspace token not found",
-            ));
-        }
-        Ok(())
+        self.enter(|client| {
+            let client = client?;
+            let changed = client
+                .execute(
+                    "UPDATE workspace_tokens SET revoked_at=$3
+                  WHERE id=$1 AND workspace_id=$2 AND revoked_at IS NULL",
+                    &[&token_id, &workspace_id, &now_unix()],
+                )
+                .map_err(internal)?;
+            if changed == 0 {
+                return Err(ApiError::new(
+                    ErrorCode::NotFound,
+                    "workspace token not found",
+                ));
+            }
+            Ok(())
+        })
     }
 
     pub fn workspace_belongs_to_organization(
@@ -478,19 +509,20 @@ impl Store {
         workspace_id: &str,
         organization_id: &str,
     ) -> Result<bool> {
-        self.with(|conn| {
-            conn.query_row(
-                "SELECT EXISTS(
-                    SELECT 1
-                      FROM workspaces w
-                      JOIN accounts a ON a.id=w.account_id
-                     WHERE w.id=?1
-                       AND a.workos_organization_id=?2
-                       AND a.status='active'
-                 )",
-                params![workspace_id, organization_id],
-                |row| row.get(0),
-            )
+        self.with(|client| {
+            client
+                .query_one(
+                    "SELECT EXISTS(
+                        SELECT 1
+                          FROM workspaces w
+                          JOIN accounts a ON a.id=w.account_id
+                         WHERE w.id=$1
+                           AND a.workos_organization_id=$2
+                           AND a.status='active'
+                     )",
+                    &[&workspace_id, &organization_id],
+                )?
+                .try_get(0)
         })
     }
 
@@ -520,16 +552,17 @@ impl Store {
     /// Every Workspace in the deployment, for the admin console and for machine
     /// tokens resolving an `account/workspace` locator to its immutable ID.
     pub fn list_all_workspace_views(&self) -> Result<Vec<Workspace>> {
-        let accounts = self.with(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, slug, display_name, kind, workos_organization_id,
-                        billing_account_id, personal_owner_user_id, status
-                   FROM accounts ORDER BY slug",
-            )?;
-            let rows = stmt
-                .query_map([], row_to_account)?
-                .collect::<rusqlite::Result<Vec<_>>>();
-            rows
+        let accounts = self.with(|client| {
+            client
+                .query(
+                    "SELECT id, slug, display_name, kind, workos_organization_id,
+                            billing_account_id, personal_owner_user_id, status
+                       FROM accounts ORDER BY slug",
+                    &[],
+                )?
+                .iter()
+                .map(row_to_account)
+                .collect::<std::result::Result<Vec<_>, postgres::Error>>()
         })?;
         let mut views = Vec::new();
         for account in accounts {
@@ -577,25 +610,25 @@ impl Store {
         invitation: &AccountInvitation,
         workos_organization_id: &str,
     ) -> Result<()> {
-        self.with(|conn| {
-            conn.execute(
+        self.with(|client| {
+            client.execute(
                 "INSERT INTO account_invitations (
                     workos_invitation_id, account_id, workos_organization_id,
                     email, role_slug, state, expires_at, updated_at
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
                  ON CONFLICT(workos_invitation_id) DO UPDATE SET
                     email=excluded.email, role_slug=excluded.role_slug,
                     state=excluded.state, expires_at=excluded.expires_at,
                     updated_at=excluded.updated_at",
-                params![
-                    invitation.id,
-                    invitation.account_id,
-                    workos_organization_id,
-                    invitation.email,
-                    invitation.role_slug,
-                    invitation.state,
-                    invitation.expires_at,
-                    now_unix()
+                &[
+                    &invitation.id,
+                    &invitation.account_id,
+                    &workos_organization_id,
+                    &invitation.email,
+                    &invitation.role_slug,
+                    &invitation.state,
+                    &invitation.expires_at,
+                    &now_unix(),
                 ],
             )?;
             Ok(())
@@ -610,23 +643,23 @@ impl Store {
         role_slug: &str,
         status: &str,
     ) -> Result<()> {
-        self.with(|conn| {
-            conn.execute(
+        self.with(|client| {
+            client.execute(
                 "INSERT INTO account_membership_shadow (
                     workos_membership_id, account_id, workos_user_id,
                     role_slug, status, updated_at
-                 ) VALUES (?1,?2,?3,?4,?5,?6)
+                 ) VALUES ($1,$2,$3,$4,$5,$6)
                  ON CONFLICT(account_id, workos_user_id) DO UPDATE SET
                     workos_membership_id=excluded.workos_membership_id,
                     role_slug=excluded.role_slug, status=excluded.status,
                     updated_at=excluded.updated_at",
-                params![
-                    membership_id,
-                    account_id,
-                    workos_user_id,
-                    role_slug,
-                    status,
-                    now_unix()
+                &[
+                    &membership_id,
+                    &account_id,
+                    &workos_user_id,
+                    &role_slug,
+                    &status,
+                    &now_unix(),
                 ],
             )?;
             Ok(())
@@ -635,56 +668,63 @@ impl Store {
 }
 
 fn find_account_by_organization(
-    conn: &Connection,
+    client: &mut impl postgres::GenericClient,
     organization_id: &str,
-) -> rusqlite::Result<Option<AccountRecord>> {
-    conn.query_row(
-        "SELECT id, slug, display_name, kind, workos_organization_id,
-                billing_account_id, personal_owner_user_id, status
-           FROM accounts WHERE workos_organization_id=?1",
-        params![organization_id],
-        row_to_account,
-    )
-    .optional()
+) -> std::result::Result<Option<AccountRecord>, postgres::Error> {
+    client
+        .query_opt(
+            "SELECT id, slug, display_name, kind, workos_organization_id,
+                    billing_account_id, personal_owner_user_id, status
+               FROM accounts WHERE workos_organization_id=$1",
+            &[&organization_id],
+        )?
+        .map(|row| row_to_account(&row))
+        .transpose()
 }
 
 fn find_account_by_personal_owner(
-    conn: &Connection,
+    client: &mut impl postgres::GenericClient,
     workos_user_id: &str,
-) -> rusqlite::Result<Option<AccountRecord>> {
-    conn.query_row(
-        "SELECT id, slug, display_name, kind, workos_organization_id,
-                billing_account_id, personal_owner_user_id, status
-           FROM accounts WHERE personal_owner_user_id=?1",
-        params![workos_user_id],
-        row_to_account,
-    )
-    .optional()
+) -> std::result::Result<Option<AccountRecord>, postgres::Error> {
+    client
+        .query_opt(
+            "SELECT id, slug, display_name, kind, workos_organization_id,
+                    billing_account_id, personal_owner_user_id, status
+               FROM accounts WHERE personal_owner_user_id=$1",
+            &[&workos_user_id],
+        )?
+        .map(|row| row_to_account(&row))
+        .transpose()
 }
 
-fn default_workspace_for_account(conn: &Connection, account_id: &str) -> Result<WorkspaceRecord> {
-    conn.query_row(
-        "SELECT id, account_id, slug, display_name, is_default
-           FROM workspaces WHERE account_id=?1 AND is_default=1",
-        params![account_id],
-        row_to_workspace,
-    )
-    .map_err(internal)
+fn default_workspace_for_account(
+    client: &mut postgres::Transaction<'_>,
+    account_id: &str,
+) -> Result<WorkspaceRecord> {
+    let row = client
+        .query_one(
+            "SELECT id, account_id, slug, display_name, is_default
+               FROM workspaces WHERE account_id=$1 AND is_default",
+            &[&account_id],
+        )
+        .map_err(internal)?;
+    row_to_workspace(&row).map_err(internal)
 }
 
-fn unique_account_slug(conn: &Connection, requested: &str) -> Result<String> {
+fn unique_account_slug(client: &mut postgres::Transaction<'_>, requested: &str) -> Result<String> {
     for suffix in 0..10_000_u32 {
         let candidate = if suffix == 0 {
             requested.to_string()
         } else {
             format!("{requested}-{suffix}")
         };
-        let exists: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM accounts WHERE slug=?1)",
-                params![candidate],
-                |row| row.get(0),
+        let exists: bool = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM accounts WHERE slug=$1)",
+                &[&candidate],
             )
+            .map_err(internal)?
+            .try_get(0)
             .map_err(internal)?;
         if !exists {
             return Ok(candidate);
@@ -699,20 +739,23 @@ fn unique_account_slug(conn: &Connection, requested: &str) -> Result<String> {
 /// default Workspace. Called on every startup, so it must converge rather than
 /// fail when the Account already exists.
 fn ensure_configured_account(
-    conn: &Connection,
+    client: &mut postgres::Transaction<'_>,
     account_slug: &str,
     organization_id: &str,
 ) -> Result<()> {
-    if let Some(account) = find_account_by_organization(conn, organization_id).map_err(internal)? {
-        ensure_default_workspace(conn, &account.id)?;
+    if let Some(account) =
+        find_account_by_organization(client, organization_id).map_err(internal)?
+    {
+        ensure_default_workspace(client, &account.id)?;
         return Ok(());
     }
-    let slug_taken: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM accounts WHERE slug=?1)",
-            params![account_slug],
-            |row| row.get(0),
+    let slug_taken: bool = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM accounts WHERE slug=$1)",
+            &[&account_slug],
         )
+        .map_err(internal)?
+        .try_get(0)
         .map_err(internal)?;
     if slug_taken {
         return Err(ApiError::conflict(format!(
@@ -720,63 +763,79 @@ fn ensure_configured_account(
         )));
     }
     let account_id = new_id(ids::ACCOUNT_PREFIX);
-    conn.execute(
-        "INSERT INTO accounts (
-            id, slug, display_name, kind, workos_organization_id,
-            billing_account_id, status, created_at
-         ) VALUES (?1,?2,?3,'organization',?4,?5,'active',?6)",
-        params![
-            account_id,
-            account_slug,
-            account_slug,
-            organization_id,
-            format!("billing_account/account/{account_id}"),
-            now_unix()
-        ],
-    )
-    .map_err(internal)?;
-    ensure_default_workspace(conn, &account_id)
+    client
+        .execute(
+            "INSERT INTO accounts (
+                id, slug, display_name, kind, workos_organization_id,
+                billing_account_id, status, created_at
+             ) VALUES ($1,$2,$3,'organization',$4,$5,'active',$6)",
+            &[
+                &account_id,
+                &account_slug,
+                &account_slug,
+                &organization_id,
+                &format!("billing_account/account/{account_id}"),
+                &now_unix(),
+            ],
+        )
+        .map_err(internal)?;
+    ensure_default_workspace(client, &account_id)
 }
 
-fn ensure_default_workspace(conn: &Connection, account_id: &str) -> Result<()> {
-    let has_default: bool = conn
-        .query_row(
+fn ensure_default_workspace(
+    client: &mut postgres::Transaction<'_>,
+    account_id: &str,
+) -> Result<()> {
+    let has_default: bool = client
+        .query_one(
             "SELECT EXISTS(
-                SELECT 1 FROM workspaces WHERE account_id=?1 AND is_default=1
+                SELECT 1 FROM workspaces WHERE account_id=$1 AND is_default
              )",
-            params![account_id],
-            |row| row.get(0),
+            &[&account_id],
         )
+        .map_err(internal)?
+        .try_get(0)
         .map_err(internal)?;
     if has_default {
         return Ok(());
     }
-    let slug = unique_workspace_slug(conn, account_id, "default")?;
-    conn.execute(
-        "INSERT INTO workspaces (
-            id, account_id, slug, display_name, is_default, created_at
-         ) VALUES (?1,?2,?3,'Default',1,?4)",
-        params![new_id(ids::WORKSPACE_PREFIX), account_id, slug, now_unix()],
-    )
-    .map_err(internal)?;
+    let slug = unique_workspace_slug(client, account_id, "default")?;
+    client
+        .execute(
+            "INSERT INTO workspaces (
+                id, account_id, slug, display_name, is_default, created_at
+             ) VALUES ($1,$2,$3,'Default',TRUE,$4)",
+            &[
+                &new_id(ids::WORKSPACE_PREFIX),
+                &account_id,
+                &slug,
+                &now_unix(),
+            ],
+        )
+        .map_err(internal)?;
     Ok(())
 }
 
-fn unique_workspace_slug(conn: &Connection, account_id: &str, requested: &str) -> Result<String> {
+fn unique_workspace_slug(
+    client: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    requested: &str,
+) -> Result<String> {
     for suffix in 0..10_000_u32 {
         let candidate = if suffix == 0 {
             requested.to_string()
         } else {
             format!("{requested}-{suffix}")
         };
-        let exists: bool = conn
-            .query_row(
+        let exists: bool = client
+            .query_one(
                 "SELECT EXISTS(
-                    SELECT 1 FROM workspaces WHERE account_id=?1 AND slug=?2
+                    SELECT 1 FROM workspaces WHERE account_id=$1 AND slug=$2
                  )",
-                params![account_id, candidate],
-                |row| row.get(0),
+                &[&account_id, &candidate],
             )
+            .map_err(internal)?
+            .try_get(0)
             .map_err(internal)?;
         if !exists {
             return Ok(candidate);

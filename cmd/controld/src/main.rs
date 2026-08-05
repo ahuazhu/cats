@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use anyhow::Context;
 use cats_metadata_store_postgres::PostgresMetadataStoreFactory;
 use cats_metadata_store_sqlite::SqliteMetadataStoreFactory;
 use cats_metering::{CreditStore, SqliteUsageStore, UsageStore};
@@ -14,8 +15,17 @@ use clap::Parser;
 struct Args {
     #[arg(long, default_value = "127.0.0.1:7300")]
     listen: String,
+    /// Local SQLite file for the development-shape usage/credit ledger. The
+    /// control resource store itself is PostgreSQL (`--control-store-url`).
     #[arg(long, default_value = "cats-control.db")]
     db_path: std::path::PathBuf,
+    /// Control resource database. Falls back to CATS_POSTGRES_URL, the same
+    /// DSN the storage metadata adapter uses: one database, disjoint tables.
+    #[arg(long, env = "CATS_CONTROL_POSTGRES_URL")]
+    control_store_url: Option<String>,
+    /// CA bundle for the control database's TLS certificate (RDS).
+    #[arg(long, env = "CATS_CONTROL_POSTGRES_CA_FILE")]
+    control_store_ca_file: Option<std::path::PathBuf>,
     /// Usage ledger adapter. SQLite is for local development; production
     /// should use the independent PostgreSQL usage database/schema.
     #[arg(
@@ -426,9 +436,14 @@ async fn main() -> anyhow::Result<()> {
         !args.billing_enforcement_enabled || stripe.is_some(),
         "CATS_BILLING_ENFORCEMENT_ENABLED requires a complete Stripe top-up configuration"
     );
+    let control_store_url = args
+        .control_store_url
+        .or_else(|| std::env::var("CATS_POSTGRES_URL").ok())
+        .context("the control store needs a PostgreSQL URL: --control-store-url, CATS_CONTROL_POSTGRES_URL or CATS_POSTGRES_URL")?;
     let handle = cats_control_plane::server::spawn(cats_control_plane::server::Config {
         listen: args.listen,
-        db_path: args.db_path,
+        control_store_url,
+        control_store_ca_file: args.control_store_ca_file,
         usage_store,
         credit_store,
         storage_meta,

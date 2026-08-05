@@ -312,47 +312,48 @@ jobs:
             exit 1
           fi
 
-          pod="$(
-            kubectl \
-              --kubeconfig "$RUNNER_TEMP/kubeconfig" \
-              --namespace cats \
-              get pods \
-              --selector app.kubernetes.io/name=cats-controld \
-              --field-selector status.phase=Running \
-              --output jsonpath='{.items[0].metadata.name}' 2>/dev/null || true
-          )"
-
-          if [[ -n "$pod" ]] && kubectl \
+          # The control store lives in PostgreSQL. Query its stamped version
+          # from inside the cluster (the runner cannot reach RDS) through a
+          # one-off pod that reads the DSN from the same Secret the control
+          # plane uses, so no credential leaves the cluster. A fresh database
+          # has no version table yet and is always compatible; anything else
+          # that prevents reading the version fails the gate closed.
+          probe="control-schema-check-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          kubectl \
             --kubeconfig "$RUNNER_TEMP/kubeconfig" \
             --namespace cats \
-            exec "$pod" -- \
-            test -f /var/lib/cats/control/control.db
-          then
-            # Only copy SQLite's fixed-size database header. It carries
-            # user_version at bytes 60..63, so production resource rows never
-            # leave the cluster merely to perform this compatibility check.
+            delete pod "$probe" --ignore-not-found >/dev/null 2>&1 || true
+          query_output="$(
             kubectl \
               --kubeconfig "$RUNNER_TEMP/kubeconfig" \
               --namespace cats \
-              exec "$pod" -- \
-              head -c 100 /var/lib/cats/control/control.db \
-              > "$RUNNER_TEMP/control.db.header"
+              run "$probe" \
+              --restart=Never --rm --attach --quiet \
+              --image=postgres:16 \
+              --overrides='{
+                "spec": {
+                  "containers": [{
+                    "name": "psql",
+                    "image": "postgres:16",
+                    "command": ["sh", "-c",
+                      "psql \"$CATS_POSTGRES_URL\" -tA -c \"SELECT version FROM control_schema_version\" 2>&1"],
+                    "envFrom": [{"secretRef": {"name": "cats-runtime"}}]
+                  }]
+                }
+              }' 2>/dev/null || true
+          )"
 
-            actual_schema="$(
-              python3 - "$RUNNER_TEMP/control.db.header" <<'PY'
-          import sys
-
-          header = open(sys.argv[1], "rb").read()
-          if len(header) != 100 or header[:16] != b"SQLite format 3\0":
-              raise SystemExit("invalid SQLite database header")
-          print(int.from_bytes(header[60:64], byteorder="big"))
-          PY
-            )"
-
+          if [[ "$query_output" =~ ^[0-9]+$ ]]; then
+            actual_schema="$query_output"
             if (( actual_schema < oldest_migratable || actual_schema > required_schema )); then
               echo "::error::Control database schema $actual_schema is incompatible with build schema $required_schema (migratable from $oldest_migratable). cats-controld only migrates stamped versions inside that range; recreate the database with the reviewed runbook before retrying. The deployment will not replace the live Pod or delete production data automatically."
               exit 1
             fi
+          elif [[ -z "$query_output" || "$query_output" == *"does not exist"* ]]; then
+            echo "Control database has no stamped schema yet; the new Pod creates version $required_schema."
+          else
+            echo "::error::Could not read the control database schema version: $query_output"
+            exit 1
           fi
 
       - name: Initialize application state
