@@ -141,12 +141,13 @@ gh workflow run verify-control-plane-ha.yml \
   -f confirmation=DELETE_ONE_CATS_CONTROLD_LEADER
 ```
 
-The workflow refuses a different confirmation, verifies two ready Pods on
-different nodes and an allowed PDB disruption, locates the reconciler owner
-through its PostgreSQL advisory lock, then deletes only that Pod. It requires
-all 240 public `/healthz` probes to succeed while Kubernetes replaces the Pod,
-and finally proves that two node-spread replicas and a new reconciler owner are
-present. It never force-deletes or scales the Deployment.
+The workflow refuses a different confirmation, checks out the dispatched
+`main` revision, verifies two ready Pods on different nodes and an allowed PDB
+disruption, locates the reconciler owner through its PostgreSQL advisory lock,
+then deletes only that Pod. It requires all 240 public `/healthz` probes to
+succeed while Kubernetes replaces the Pod, and finally proves that two
+node-spread replicas and a new reconciler owner are present. It never
+force-deletes or scales the Deployment.
 
 The usage ledger has the same rule for the same reason. ADR-0018 replaced the V1
 `project` ownership column with `workspace_id` on usage rows and `account_id` on

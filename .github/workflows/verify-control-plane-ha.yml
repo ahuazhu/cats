@@ -39,6 +39,9 @@ jobs:
             exit 1
           fi
 
+      - name: Check out repository
+        uses: actions/checkout@v4
+
       - name: Assume production deployment role
         uses: aws-actions/configure-aws-credentials@v4
         with:

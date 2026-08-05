@@ -257,6 +257,7 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
         "workflow_dispatch:",
         "DELETE_ONE_CATS_CONTROLD_LEADER",
         "github.ref == 'refs/heads/main'",
+        "actions/checkout@v4",
         "disruptionsAllowed",
         "l.classid=hashtext(current_schema())::oid",
         "l.objid=420201",
@@ -273,6 +274,16 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
             "production HA drill is missing {expected:?}"
         );
     }
+    let checkout = workflow
+        .find("actions/checkout@v4")
+        .expect("HA drill checks out its dispatched revision");
+    let owner_probe = workflow
+        .find("deploy/aws/run-postgres-probe.sh")
+        .expect("HA drill invokes the PostgreSQL probe runner");
+    assert!(
+        checkout < owner_probe,
+        "the repository must be checked out before invoking its PostgreSQL probe runner"
+    );
     assert!(!workflow.contains("--force"));
     assert!(!workflow.contains("--grace-period=0"));
     assert!(!workflow.contains("scale deployment"));
