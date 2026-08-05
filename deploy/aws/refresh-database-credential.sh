@@ -50,6 +50,53 @@ kube() {
     "$@"
 }
 
+# 0. Resolve EKS Pod Identity credentials by hand.
+#
+# The AWS CLI in this image is v1, and its botocore predates Pod Identity: it
+# keeps an allowlist of container credential hosts -- 169.254.170.2 for an ECS
+# task role, plus localhost -- and refuses the Pod Identity agent outright:
+#
+#   Unsupported host '169.254.170.23'.  Can only retrieve metadata from these
+#   hosts: 169.254.170.2, localhost, 127.0.0.1
+#
+# The endpoint's contract is small enough to satisfy directly, which keeps this
+# image reproducible: Debian packages only, no CLI tarball fetched unpinned at
+# build time. Verified against the live agent, which answers AccessKeyId,
+# SecretAccessKey, Token, Expiration and AccountId.
+#
+# Skipped when credentials arrive some other way, so a local run or an instance
+# role still works.
+if [ -n "${AWS_CONTAINER_CREDENTIALS_FULL_URI:-}" ] && [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+  : "${AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE:?Pod Identity set a credential URI but no token file}"
+  curl --silent --show-error --fail \
+    --header "Authorization: $(cat "$AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE")" \
+    "$AWS_CONTAINER_CREDENTIALS_FULL_URI" >"$work/pod-identity.json"
+  # Through a file rather than a subshell's environment, so the secret access
+  # key and session token never appear in a process listing.
+  python3 -c '
+import json, shlex, sys
+
+credentials = json.load(open(sys.argv[1]))
+wanted = {
+    "AWS_ACCESS_KEY_ID": "AccessKeyId",
+    "AWS_SECRET_ACCESS_KEY": "SecretAccessKey",
+    "AWS_SESSION_TOKEN": "Token",
+}
+lines = []
+for variable, field in wanted.items():
+    value = credentials.get(field)
+    if not value:
+        raise SystemExit("Pod Identity response is missing " + field)
+    # Quoted: a session token is long and base64-ish, and one unlucky character
+    # would otherwise be reinterpreted when this file is sourced.
+    lines.append("export " + variable + "=" + shlex.quote(value) + "\n")
+open(sys.argv[2], "w").writelines(lines)
+' "$work/pod-identity.json" "$work/aws-env"
+  # shellcheck disable=SC1090
+  . "$work/aws-env"
+  rm -f "$work/pod-identity.json" "$work/aws-env"
+fi
+
 # 1. The authority.
 aws secretsmanager get-secret-value \
   --secret-id "$CATS_POSTGRES_SECRET_ARN" \
