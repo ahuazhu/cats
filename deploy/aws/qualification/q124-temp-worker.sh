@@ -8,9 +8,11 @@ ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 AWS_BIN=${Q124_AWS_BIN:-aws}
 CONTROL_BIN=${Q124_CONTROL_BIN:-$ROOT/deploy/aws/qualification/q124-control-api.sh}
 REMOTE_BIN=${Q124_REMOTE_BIN:-$ROOT/deploy/aws/qualification/q124-ssm.sh}
+MANIFEST_PUBLISH_BIN=${Q124_MANIFEST_PUBLISH_BIN:-$ROOT/deploy/aws/qualification/q124-manifest-publish.sh}
 MODE=${Q124_MODE:-${1:-}}
 CREATED_INSTANCE=
 CLEANUP_ARMED=0
+WORKER_START_ATTEMPTED=0
 
 die() { printf 'q124: %s\n' "$*" >&2; exit 1; }
 need() { [[ -n ${!1:-} ]] || die "missing $1"; }
@@ -29,13 +31,19 @@ emit_evidence() {
 }
 
 validate_fixed_inputs() {
-  for name in Q124_ACCOUNT_ID Q124_REGION Q124_CLUSTER Q124_WORKSPACE_ID Q124_SOURCE_INSTANCE_ID Q124_SOURCE_NODE_ID Q124_CONTROL_URL; do need "$name"; done
+  for name in Q124_ACCOUNT_ID Q124_REGION Q124_CLUSTER Q124_WORKSPACE_ID Q124_SOURCE_INSTANCE_ID Q124_SOURCE_NODE_ID Q124_CONTROL_URL Q124_CONTROL_AUTHORITY; do need "$name"; done
   [[ $Q124_ACCOUNT_ID =~ ^[0-9]{12}$ ]] || die "invalid fixed account"
   [[ $Q124_REGION =~ ^[a-z]{2}(-gov)?-[a-z]+-[0-9]$ ]] || die "invalid fixed region"
   [[ $Q124_CLUSTER =~ ^[A-Za-z0-9._-]+$ && $Q124_WORKSPACE_ID =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid cluster/workspace id"
   [[ $Q124_SOURCE_INSTANCE_ID =~ ^i-[0-9a-f]+$ ]] || die "invalid source instance id"
   [[ $Q124_SOURCE_NODE_ID =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid source node id"
   [[ $Q124_SOURCE_NODE_ID != q124-* ]] || die "source node cannot be a qualification node"
+  [[ $Q124_CONTROL_AUTHORITY =~ ^[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] || die "invalid control authority"
+  if [[ $Q124_CONTROL_AUTHORITY == *:* ]]; then
+    control_port=${Q124_CONTROL_AUTHORITY##*:}
+    (( control_port <= 65535 )) || die "control authority port is out of range"
+  fi
+  [[ ${Q124_CONTROL_URL%/} == "https://$Q124_CONTROL_AUTHORITY" ]] || die "control URL must be HTTPS on the expected authority with no path"
   actual=$(awsq sts get-caller-identity --query Account --output text)
   [[ $actual == "$Q124_ACCOUNT_ID" ]] || die "AWS account mismatch: expected $Q124_ACCOUNT_ID"
 }
@@ -257,7 +265,7 @@ cleanup_provision_failure() {
           && control get "$Q124_NODE_ID" | jq -e '.assigned_cats == 0 and .orphan_cats == 0' >/dev/null; then
           remote "$CREATED_INSTANCE" assert-idle >/dev/null 2>&1 || exit "$rc"
           remote "$CREATED_INSTANCE" stop >/dev/null 2>&1 || exit "$rc"
-          control delete "$Q124_NODE_ID" "$Q124_SOURCE_NODE_ID" >/dev/null 2>&1 || exit "$rc"
+          control delete "$Q124_NODE_ID" "$Q124_SOURCE_NODE_ID" "$Q124_WORKSPACE_ID" q124- >/dev/null 2>&1 || exit "$rc"
         else
           printf 'q124: cleanup stopped: node emptiness was not proven\n' >&2
           exit "$rc"
@@ -267,6 +275,15 @@ cleanup_provision_failure() {
         # prove the source node through the same API and then observe an exact
         # 404 for this node; auth/network/5xx failures stop cleanup.
         control absent "$Q124_SOURCE_NODE_ID" "$Q124_NODE_ID" >/dev/null 2>&1 || exit "$rc"
+        # Before the first worker start attempt, this invocation's exact fresh
+        # instance cannot have accepted a Cat. Bootstrap installs and stages
+        # configuration but deliberately does not start cats-worker. Once a
+        # start has been attempted, absence from the control plane is not
+        # enough: require the host idle/stop gates as well.
+        if (( WORKER_START_ATTEMPTED )); then
+          remote "$CREATED_INSTANCE" assert-idle >/dev/null 2>&1 || exit "$rc"
+          remote "$CREATED_INSTANCE" stop >/dev/null 2>&1 || exit "$rc"
+        fi
       fi
       awsq ec2 modify-instance-attribute --instance-id "$CREATED_INSTANCE" --disable-api-termination '{"Value":false}' >/dev/null
       awsq ec2 terminate-instances --instance-ids "$CREATED_INSTANCE" >/dev/null
@@ -282,7 +299,8 @@ cleanup_provision_failure() {
 
 provision() {
   confirm PROVISION_Q124_TEMP_WORKER
-  for name in Q124_AMI_ID Q124_INSTANCE_TYPE Q124_SUBNET_ID Q124_SECURITY_GROUP_ID Q124_INSTANCE_PROFILE_NAME Q124_ARTIFACT_BUCKET Q124_ARCHIVE_KEY Q124_ARCHIVE_SHA256 Q124_CACHE_DEVICE Q124_CONTROL_URL Q124_CHUNKSTORE_BUCKET Q124_RUNTIME_SECRET_ARN Q124_DB_SECRET_ARN Q124_DB_NAME Q124_MANIFEST_OUT; do need "$name"; done
+  for name in Q124_AMI_ID Q124_INSTANCE_TYPE Q124_SUBNET_ID Q124_SECURITY_GROUP_ID Q124_INSTANCE_PROFILE_NAME Q124_ARTIFACT_BUCKET Q124_ARCHIVE_KEY Q124_ARCHIVE_SHA256 Q124_CACHE_DEVICE Q124_CONTROL_URL Q124_CHUNKSTORE_BUCKET Q124_RUNTIME_SECRET_ARN Q124_DB_SECRET_ARN Q124_DB_NAME Q124_MANIFEST_OUT GITHUB_REPOSITORY GH_TOKEN; do need "$name"; done
+  [[ $GITHUB_REPOSITORY =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "invalid GitHub repository"
   [[ $Q124_INSTANCE_TYPE == *.metal ]] || die "qualification requires a bare-metal instance"
   [[ ${Q124_TTL_HOURS:-0} =~ ^([1-9]|1[0-9]|2[0-4])$ ]] || die "TTL must be 1..24 hours"
   source_positive
@@ -344,7 +362,12 @@ provision() {
   ' <<<"$instance" >/dev/null || die "launched instance differs from fixed template"
   Q124_PRIVATE_IP=$(jq -er '.Reservations[0].Instances[0].PrivateIpAddress' <<<"$instance")
   az=$(jq -er '.Reservations[0].Instances[0].Placement.AvailabilityZone' <<<"$instance")
-  root_volume=$(jq -er '.Reservations[0].Instances[0].BlockDeviceMappings[] | select(.DeviceName == "/dev/sda1") | .Ebs.VolumeId' <<<"$instance")
+  root_volume=$(jq -er '
+    [.Reservations[0].Instances[0].BlockDeviceMappings[] | select(.DeviceName == "/dev/sda1")] as $roots |
+    ($roots | length) == 1 and $roots[0].Ebs.DeleteOnTermination == true and
+    ($roots[0].Ebs.VolumeId | test("^vol-[0-9A-Za-z]+$")) |
+    select(.) | $roots[0].Ebs.VolumeId
+  ' <<<"$instance") || die "root mapping is not singular and DeleteOnTermination=true"
   exact_root_volume "$root_volume"
   export Q124_PRIVATE_IP
 
@@ -358,6 +381,7 @@ provision() {
   export Q124_FORMAT_CONFIRMATION
   remote "$Q124_INSTANCE_ID" bootstrap
   control absent "$Q124_SOURCE_NODE_ID" "$Q124_NODE_ID"
+  WORKER_START_ATTEMPTED=1
   remote "$Q124_INSTANCE_ID" start
   control wait-cordoned "$Q124_NODE_ID" "$Q124_SOURCE_NODE_ID" 1 >/dev/null
   remote "$Q124_INSTANCE_ID" set-capacity
@@ -381,7 +405,9 @@ provision() {
        bundle:{source_sha:$source_sha,github_run_id:$github_run_id,archive_key:$archive_key,archive_sha256:$archive_sha,orchestrator_sha256:$script_sha,remote_sha256:$remote_sha},
        timestamps:{created_at:$created,expires_at:$expires}}
     ' | jq -S . >"$Q124_MANIFEST_OUT"
-  printf 'manifest-sha256=%s\n' "$(canonical_manifest "$Q124_MANIFEST_OUT" | sha256sum | awk '{print $1}')"
+  manifest_sha=$(canonical_manifest "$Q124_MANIFEST_OUT" | sha256sum | awk '{print $1}')
+  "$MANIFEST_PUBLISH_BIN" "$Q124_MANIFEST_OUT" "$manifest_sha"
+  printf 'manifest-sha256=%s\n' "$manifest_sha"
   CLEANUP_ARMED=0
   trap - EXIT INT TERM
 }
@@ -410,10 +436,11 @@ withdraw_mode() {
   confirm "WITHDRAW_Q124_${Q124_EXPECTED_MANIFEST_SHA256:0:12}"
   load_manifest; source_positive; exact_instance >/dev/null; no_duplicate_identity
   if summary=$(control get "$Q124_NODE_ID" 2>/dev/null); then
-    jq -e '.node.state == "cordoned" and .assigned_cats == 0 and .orphan_cats == 0' <<<"$summary" >/dev/null || die "withdraw requires an empty Cordoned node"
+    jq -e '(.node.state == "cordoned" or .node.state == "lost") and .assigned_cats == 0 and .orphan_cats == 0' <<<"$summary" >/dev/null || die "withdraw requires an empty Cordoned/Lost node"
+    control cats-scope "$Q124_NODE_ID" "$Q124_WORKSPACE_ID" q124- >/dev/null
     remote "$Q124_INSTANCE_ID" assert-idle
     remote "$Q124_INSTANCE_ID" stop
-    control delete "$Q124_NODE_ID" "$Q124_SOURCE_NODE_ID"
+    control delete "$Q124_NODE_ID" "$Q124_SOURCE_NODE_ID" "$Q124_WORKSPACE_ID" q124-
   else
     control absent "$Q124_SOURCE_NODE_ID" "$Q124_NODE_ID"
     remote "$Q124_INSTANCE_ID" assert-idle

@@ -73,7 +73,15 @@ jq -e '
   ([.Statement[] | select(.Sid == "OperateOnlyQualificationInstances")][0] as $s |
     $s.Resource == "arn:aws:ec2:us-east-1:111122223333:instance/*" and
     $s.Condition.StringEquals["ec2:ResourceTag/CatsIssue"] == "124" and
-    $s.Condition.StringEquals["ec2:ResourceTag/CatsPurpose"] == "temporary-worker-qualification")
+    $s.Condition.StringEquals["ec2:ResourceTag/CatsPurpose"] == "temporary-worker-qualification") and
+  ([.Statement[] | select(.Sid == "QualificationBundleBucketLocation")][0] as $s |
+    $s.Action == "s3:GetBucketLocation" and
+    $s.Resource == "arn:aws:s3:::cats-artifacts" and
+    ($s | has("Condition") | not)) and
+  ([.Statement[] | select(.Sid == "ListQualificationBundlePrefix")][0] as $s |
+    $s.Action == "s3:ListBucket" and
+    $s.Resource == "arn:aws:s3:::cats-artifacts" and
+    $s.Condition.StringLike["s3:prefix"] == "worker/qualification-124/*")
 ' <<<"$policy" >/dev/null
 
 printf 'q124 IAM policy contracts: PASS\n'

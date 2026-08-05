@@ -63,7 +63,9 @@ def instance(s, source=False):
         "InstanceInitiatedShutdownBehavior": "stop",
         "PrivateIpAddress": "10.0.1.124",
         "Placement": {"AvailabilityZone": "us-east-1a"},
-        "BlockDeviceMappings": [{"DeviceName": "/dev/sda1", "Ebs": {"VolumeId": "vol-q124"}}],
+        "BlockDeviceMappings": [{"DeviceName": "/dev/sda1", "Ebs": {
+            "VolumeId": "vol-q124", "DeleteOnTermination": s.get("root_delete_on_termination", True)
+        }}],
         "Tags": [{"Key": k, "Value": v} for k, v in tags.items()],
     }
     if source:
@@ -191,7 +193,7 @@ def fake_control(args):
         if source != s["source_node"] or (wanted == s["node"] and s["control_present"]):
             return 1
     elif action == "cats-scope":
-        if node != s["node"] or not s["control_present"]:
+        if node != s["node"] or not s["control_present"] or s.get("cats_scope_error"):
             return 1
         workspace = args[2]
         if any(c["workspace"] != workspace or not c["name"].startswith(args[3]) for c in s["cats"]):
@@ -216,7 +218,15 @@ def fake_control(args):
         s["control_state"] = "cordoned"
         save(s)
     elif action == "delete":
-        if s["cats"] or s["orphans"] or s["control_state"] != "cordoned":
+        workspace = args[3]
+        prefix = args[4]
+        if (s["cats"] or s["orphans"] or s["control_state"] not in ("cordoned", "lost")
+                or workspace != "ws-q124" or prefix != "q124-"):
+            return 1
+        if s.get("delete_fail_once") and not s.get("delete_failed_once"):
+            s["delete_failed_once"] = True
+            s["control_state"] = "lost"
+            save(s)
             return 1
         s["control_present"] = False
         save(s)
@@ -261,11 +271,11 @@ def fake_remote(args):
     elif action == "snapshot":
         print(json.dumps({"cats": s["ledger_cats"], "attachments": s["attachments"], "pending_packs": s["pending_packs"]}))
     elif action == "assert-idle":
-        if s["ledger_cats"] or s["attachments"] or s["pending_packs"]:
+        if not s["prepared"] or s.get("fail_assert_idle") or s["ledger_cats"] or s["attachments"] or s["pending_packs"]:
             return 1
         print("idle")
     elif action == "stop":
-        if s["ledger_cats"] or s["attachments"] or s["pending_packs"]:
+        if not s["prepared"] or s.get("fail_assert_idle") or s["ledger_cats"] or s["attachments"] or s["pending_packs"]:
             return 1
         s["worker_running"] = False
         save(s)
@@ -281,8 +291,20 @@ def init():
         "source_sha": "", "run_id": "", "security_groups": ["sg-0124"],
         "termination_protection": False, "control_present": False, "control_state": "cordoned",
         "cats": [], "ledger_cats": [], "attachments": [], "pending_packs": 0, "orphans": 0,
-        "prepared": False, "worker_running": False, "memory_mib": 0, "log": []
+        "prepared": False, "worker_running": False, "memory_mib": 0,
+        "root_delete_on_termination": True, "published_manifests": 0, "log": []
     })
+
+
+def fake_publish(args):
+    s = load()
+    record(s, "publish " + " ".join(args))
+    s = load()
+    if s.get("fail_publish"):
+        return 1
+    s["published_manifests"] += 1
+    save(s)
+    return 0
 
 
 if __name__ == "__main__":
@@ -290,4 +312,4 @@ if __name__ == "__main__":
     if kind == "init":
         init()
         raise SystemExit(0)
-    raise SystemExit({"aws": fake_aws, "control": fake_control, "remote": fake_remote}[kind](args))
+    raise SystemExit({"aws": fake_aws, "control": fake_control, "remote": fake_remote, "publish": fake_publish}[kind](args))

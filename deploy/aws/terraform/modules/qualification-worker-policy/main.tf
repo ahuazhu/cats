@@ -135,9 +135,15 @@ locals {
         }
       },
       {
-        Sid      = "QualificationBundleBucket"
+        Sid      = "QualificationBundleBucketLocation"
         Effect   = "Allow"
-        Action   = ["s3:GetBucketLocation", "s3:ListBucket"]
+        Action   = "s3:GetBucketLocation"
+        Resource = var.artifact_bucket_arn
+      },
+      {
+        Sid      = "ListQualificationBundlePrefix"
+        Effect   = "Allow"
+        Action   = "s3:ListBucket"
         Resource = var.artifact_bucket_arn
         Condition = {
           StringLike = { "s3:prefix" = "worker/qualification-124/*" }

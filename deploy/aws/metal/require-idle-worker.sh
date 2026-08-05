@@ -3,6 +3,7 @@ set -eu
 
 metering_root=${1:?usage: require-idle-worker.sh ABSOLUTE_METERING_CGROUP_ROOT [RUNTIME_BIN_ROOT]}
 runtime_bin_root=${2:-/opt/cats/bin}
+find_bin=${Q124_FIND_BIN:-find}
 for required_absolute in "$metering_root" "$runtime_bin_root"; do
   case "$required_absolute" in
     /*) ;;
@@ -15,7 +16,13 @@ done
 
 active_cat_pids=""
 if [ -d "$metering_root" ]; then
-  for cgroup_procs in $(find "$metering_root" -type f -name cgroup.procs -print); do
+  cgroup_list=$(mktemp)
+  trap 'rm -f "$cgroup_list"' EXIT HUP INT TERM
+  if ! "$find_bin" "$metering_root" -type f -name cgroup.procs -print >"$cgroup_list"; then
+    echo "cannot traverse metering cgroups" >&2
+    exit 1
+  fi
+  while IFS= read -r cgroup_procs; do
     while IFS= read -r pid; do
       case "$pid" in
         ""|*[!0-9]*)
@@ -27,7 +34,12 @@ if [ -d "$metering_root" ]; then
           ;;
       esac
     done < "$cgroup_procs"
-  done
+  done <"$cgroup_list"
+  rm -f "$cgroup_list"
+  trap - EXIT HUP INT TERM
+elif [ -e "$metering_root" ]; then
+  echo "metering root is not a directory: $metering_root" >&2
+  exit 1
 fi
 
 if [ -n "$active_cat_pids" ]; then

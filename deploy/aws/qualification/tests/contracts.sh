@@ -9,7 +9,11 @@ TOOL=$ROOT/deploy/aws/qualification/q124-temp-worker.sh
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 "$HERE/device-contracts.sh"
+"$HERE/remote-contracts.sh"
+"$HERE/control-contracts.sh"
+"$HERE/ssm-contracts.sh"
 "$HERE/manifest-recovery-contracts.sh"
+"$HERE/manifest-publish-contracts.sh"
 "$HERE/policy-contracts.sh"
 
 fail() { printf 'contracts: %s\n' "$*" >&2; exit 1; }
@@ -35,16 +39,18 @@ reset_case() {
   export Q124_AWS_BIN=$HERE/fake-aws.sh
   export Q124_CONTROL_BIN=$HERE/fake-control.sh
   export Q124_REMOTE_BIN=$HERE/fake-remote.sh
+  export Q124_MANIFEST_PUBLISH_BIN=$HERE/fake-publish.sh
   export Q124_ACCOUNT_ID=111122223333 Q124_REGION=us-east-1 Q124_CLUSTER=cats-production
   export Q124_WORKSPACE_ID=ws-q124 Q124_SOURCE_INSTANCE_ID=i-a00124 Q124_SOURCE_NODE_ID=metal-source
   export Q124_AMI_ID=ami-0124 Q124_INSTANCE_TYPE=c5d.metal Q124_SUBNET_ID=subnet-0124
   export Q124_SECURITY_GROUP_ID=sg-0124 Q124_INSTANCE_PROFILE_NAME=cats-worker
   export Q124_ARTIFACT_BUCKET=cats-artifact
   export Q124_ARCHIVE_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-  export Q124_CACHE_DEVICE=/dev/nvme1n1 Q124_CONTROL_URL=https://cats.invalid
+  export Q124_CACHE_DEVICE=/dev/nvme1n1 Q124_CONTROL_URL=https://cats.invalid Q124_CONTROL_AUTHORITY=cats.invalid
   export Q124_CHUNKSTORE_BUCKET=cats-chunks Q124_RUNTIME_SECRET_ARN=arn:aws:secretsmanager:us-east-1:111122223333:secret:runtime
   export Q124_DB_SECRET_ARN=arn:aws:secretsmanager:us-east-1:111122223333:secret:db Q124_DB_NAME=cats
   export Q124_TTL_HOURS=8 GITHUB_RUN_ID=124001 GITHUB_SHA=0124abc0124abc0124abc0124abc0124abc0124a
+  export GITHUB_REPOSITORY=owner/cats GH_TOKEN=fake-token
   export Q124_DISCOVERY_TIMEOUT_SECONDS=0
   export Q124_ARCHIVE_KEY="worker/qualification-124/${GITHUB_SHA}/q124-source-${Q124_ARCHIVE_SHA256}.tar.gz"
   export Q124_MANIFEST_OUT=$TMP/$name-manifest.json Q124_MANIFEST=$TMP/$name-manifest.json
@@ -59,7 +65,7 @@ provision_ok() {
   "$TOOL" >/dev/null
   export Q124_EXPECTED_MANIFEST_SHA256
   Q124_EXPECTED_MANIFEST_SHA256=$(jq -S -c . "$Q124_MANIFEST" | sha256sum | awk '{print $1}')
-  assert_state '.instance_state == "running" and .termination_protection == true and .control_present == true and .control_state == "cordoned" and .worker_running == true'
+  assert_state '.instance_state == "running" and .termination_protection == true and .control_present == true and .control_state == "cordoned" and .worker_running == true and .published_manifests == 1'
   jq -e '
     .log as $l |
     ($l | index("control wait-cordoned q124-124001-0124abc metal-source 1")) < ($l | index("remote i-0abc124 set-capacity")) and
@@ -69,6 +75,11 @@ provision_ok() {
 
 reset_case wrong-account
 export Q124_ACCOUNT_ID=999900001111 Q124_MODE=provision Q124_CONFIRMATION=PROVISION_Q124_TEMP_WORKER
+expect_fail "$TOOL"
+assert_state '[.log[] | select(contains("run-instances") or contains("terminate-instances"))] == []'
+
+reset_case wrong-control-authority
+export Q124_CONTROL_URL=http://cats.invalid Q124_MODE=provision Q124_CONFIRMATION=PROVISION_Q124_TEMP_WORKER
 expect_fail "$TOOL"
 assert_state '[.log[] | select(contains("run-instances") or contains("terminate-instances"))] == []'
 
@@ -90,6 +101,12 @@ export Q124_MODE=provision Q124_CONFIRMATION=PROVISION_Q124_TEMP_WORKER
 expect_fail "$TOOL"
 assert_state '.instance_state == "terminated"'
 assert_state '[.log[] | select(contains("set-capacity"))] == []'
+
+reset_case root-not-deletable
+state_set '.root_delete_on_termination = false'
+export Q124_MODE=provision Q124_CONFIRMATION=PROVISION_Q124_TEMP_WORKER
+expect_fail "$TOOL"
+assert_state '.instance_state == "terminated" and .published_manifests == 0'
 
 reset_case response-lost
 state_set '.run_response_lost = true'
@@ -179,8 +196,32 @@ reset_case non-empty
 provision_ok
 state_set '.cats=[{"id":"cat-1","name":"q124-owned","workspace":"ws-q124"}] | .ledger_cats=["cat-1"]'
 export Q124_MODE=withdraw Q124_CONFIRMATION="WITHDRAW_Q124_${Q124_EXPECTED_MANIFEST_SHA256:0:12}"
+before=$(jq '.log|length' "$Q124_FAKE_STATE")
 expect_fail "$TOOL"
 assert_state '.control_present == true and .instance_state == "running"'
+assert_state "[.log[$before:][] | select(startswith(\"remote i-0abc124 stop\") or startswith(\"control delete\") or contains(\"terminate-instances\"))] == []"
+
+reset_case wrong-empty-scope
+provision_ok
+state_set '.cats_scope_error = true'
+export Q124_MODE=withdraw Q124_CONFIRMATION="WITHDRAW_Q124_${Q124_EXPECTED_MANIFEST_SHA256:0:12}"
+before=$(jq '.log|length' "$Q124_FAKE_STATE")
+expect_fail "$TOOL"
+assert_state "[.log[$before:][] | select(startswith(\"remote i-0abc124 stop\") or startswith(\"control delete\") or contains(\"terminate-instances\"))] == []"
+
+reset_case manifest-publication-failure
+state_set '.fail_publish = true'
+export Q124_MODE=provision Q124_CONFIRMATION=PROVISION_Q124_TEMP_WORKER
+expect_fail "$TOOL"
+assert_state '.published_manifests == 0 and .instance_state == "terminated" and .control_present == false'
+assert_state '[.log[] | select(startswith("publish "))] | length == 1'
+
+reset_case cleanup-idle-probe-failure
+state_set '.fail_validate = true | .fail_assert_idle = true'
+export Q124_MODE=provision Q124_CONFIRMATION=PROVISION_Q124_TEMP_WORKER
+expect_fail "$TOOL"
+assert_state '.instance_state == "running" and .control_present == true and .worker_running == true'
+assert_state '[.log[] | select(startswith("remote i-0abc124 stop") or startswith("control delete") or contains("terminate-instances"))] == []'
 
 reset_case partial-failure
 state_set '.fail_validate = true'
@@ -191,7 +232,7 @@ jq -er '
   [.log[] | select(startswith("remote") or startswith("control cordon") or startswith("control delete") or contains("modify-instance-attribute") or contains("terminate-instances"))] as $l |
   ($l | index("remote i-0abc124 start")) < ($l | index("remote i-0abc124 validate")) and
   ($l | index("remote i-0abc124 validate")) < ($l | index("control cordon q124-124001-0124abc")) and
-  ($l | index("control delete q124-124001-0124abc metal-source")) < ([range(0;$l|length) | select($l[.] | contains("terminate-instances"))] | first)
+  ($l | index("control delete q124-124001-0124abc metal-source ws-q124 q124-")) < ([range(0;$l|length) | select($l[.] | contains("terminate-instances"))] | first)
 ' "$Q124_FAKE_STATE" >/dev/null || fail "partial-failure cleanup order"
 
 reset_case cancelled
@@ -243,5 +284,15 @@ expect_fail "$TOOL" # purged exact id does not hide a conflicting active identit
 state_set '.conflicting_identity = false'
 assert_state '.instance_state == "terminated" and .control_present == false'
 assert_state '[.log[] | select(contains("terminate-instances"))] | length == 1'
+
+reset_case delete-response-lost
+provision_ok
+state_set '.delete_fail_once = true'
+export Q124_MODE=withdraw Q124_CONFIRMATION="WITHDRAW_Q124_${Q124_EXPECTED_MANIFEST_SHA256:0:12}"
+expect_fail "$TOOL"
+assert_state '.control_present == true and .control_state == "lost" and .worker_running == false and .instance_state == "running"'
+assert_state '[.log[] | select(contains("terminate-instances"))] | length == 0'
+"$TOOL" >/dev/null
+assert_state '.control_present == false and .instance_state == "running"'
 
 printf 'q124 contract tests: PASS\n'

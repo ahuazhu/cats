@@ -55,6 +55,7 @@ jobs:
       Q124_ARTIFACT_BUCKET: ${{ vars.Q124_WORKER_ARTIFACT_BUCKET }}
       Q124_CACHE_DEVICE: ${{ vars.Q124_WORKER_CACHE_DEVICE }}
       Q124_CONTROL_URL: ${{ vars.Q124_CONTROL_URL }}
+      Q124_CONTROL_AUTHORITY: ${{ vars.Q124_CONTROL_AUTHORITY }}
       Q124_CHUNKSTORE_BUCKET: ${{ vars.Q124_CHUNKSTORE_BUCKET }}
       Q124_RUNTIME_SECRET_ARN: ${{ vars.Q124_RUNTIME_SECRET_ARN }}
       Q124_DB_SECRET_ARN: ${{ vars.RDS_MASTER_USER_SECRET_ARN }}
@@ -82,7 +83,7 @@ jobs:
           set -euo pipefail
           [[ "$GITHUB_REF" == refs/heads/main ]]
           [[ "$Q124_MODE" =~ ^(provision|validate|drain|withdraw|return)$ ]]
-          required=(Q124_AWS_ROLE_ARN Q124_ACCOUNT_ID Q124_REGION Q124_CLUSTER Q124_WORKSPACE_ID Q124_SOURCE_INSTANCE_ID Q124_SOURCE_NODE_ID Q124_CONTROL_URL)
+          required=(Q124_AWS_ROLE_ARN Q124_ACCOUNT_ID Q124_REGION Q124_CLUSTER Q124_WORKSPACE_ID Q124_SOURCE_INSTANCE_ID Q124_SOURCE_NODE_ID Q124_CONTROL_URL Q124_CONTROL_AUTHORITY)
           if [[ "$Q124_MODE" == provision || "$Q124_MODE" == validate ]]; then
             required+=(Q124_AMI_ID Q124_INSTANCE_TYPE Q124_SUBNET_ID Q124_SECURITY_GROUP_ID Q124_INSTANCE_PROFILE_NAME Q124_CACHE_DEVICE)
           fi
@@ -129,7 +130,7 @@ jobs:
           git archive --format=tar "$GITHUB_SHA" | gzip -n >"$RUNNER_TEMP/q124-source.tar.gz"
           archive_sha=$(sha256sum "$RUNNER_TEMP/q124-source.tar.gz" | awk '{print $1}')
           key="worker/qualification-124/${GITHUB_SHA}/q124-source-${archive_sha}.tar.gz"
-          aws s3 cp "$RUNNER_TEMP/q124-source.tar.gz" "s3://${Q124_ARTIFACT_BUCKET}/${key}" --only-show-errors
+          aws --region "$Q124_REGION" s3 cp "$RUNNER_TEMP/q124-source.tar.gz" "s3://${Q124_ARTIFACT_BUCKET}/${key}" --only-show-errors
           printf 'Q124_ARCHIVE_SHA256=%s\nQ124_ARCHIVE_KEY=%s\n' "$archive_sha" "$key" >>"$GITHUB_ENV"
 
       - name: Recover exact no-secret manifest
@@ -143,6 +144,8 @@ jobs:
 
       - name: Execute exact lifecycle transition
         id: lifecycle
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -164,21 +167,6 @@ jobs:
             body=$(printf 'Issue #124 temporary-worker provisioning failed closed. No live PASS is claimed.\n\nRun: %s/actions/runs/%s\n\n```json\n%s\n```\n' "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$(jq . "$Q124_EVIDENCE_OUT")")
             gh api "repos/${GITHUB_REPOSITORY}/issues/124/comments" -f body="$body" >/dev/null
           fi
-
-      - name: Publish no-secret manifest evidence
-        if: inputs.mode == 'provision' && success()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          MANIFEST_SHA: ${{ steps.lifecycle.outputs.manifest_sha }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$MANIFEST_SHA" =~ ^[0-9a-f]{64}$ ]]
-          canonical=$(jq -S -c . "$Q124_MANIFEST_OUT")
-          [[ $(printf '%s\n' "$canonical" | sha256sum | awk '{print $1}') == "$MANIFEST_SHA" ]]
-          encoded=$(printf '%s\n' "$canonical" | base64 -w0)
-          body=$(printf '<!-- cats-q124-manifest:%s -->\nq124-manifest-base64: %s\n\nProvisioned manifest (contains identifiers, no credentials):\n```json\n%s\n```\n' "$MANIFEST_SHA" "$encoded" "$(jq . "$Q124_MANIFEST_OUT")")
-          gh api "repos/${GITHUB_REPOSITORY}/issues/124/comments" -f body="$body" >/dev/null
 
       - uses: actions/upload-artifact@v4
         if: always() && inputs.mode == 'provision'

@@ -28,6 +28,7 @@ outputs and the one selected healthy source worker:
 | `AWS_REGION`, `EKS_CLUSTER_NAME`, `AWS_ROLE_ARN` | existing production deployment variables |
 | `Q124_AWS_ROLE_ARN`, `Q124_ACCOUNT_ID` | platform qualification output / production account |
 | `Q124_WORKSPACE_ID`, `Q124_CONTROL_URL` | dedicated qualification workspace / production endpoint |
+| `Q124_CONTROL_AUTHORITY` | exact production `host[:port]`; the URL must equal `https://<authority>` with no path |
 | `Q124_SOURCE_INSTANCE_ID`, `Q124_SOURCE_NODE_ID` | one known-positive worker, probes only |
 | `Q124_WORKER_AMI_ID`, `Q124_WORKER_INSTANCE_TYPE` | platform `metal_worker_ami` / type |
 | `Q124_WORKER_SUBNET_ID`, `Q124_WORKER_SECURITY_GROUP_ID` | platform private subnet 0 / worker SG |
@@ -61,6 +62,9 @@ single concurrency group prevents overlapping lifecycle transitions.
    must be 404 -> empty `cordoned` at 1 CPU/1 MiB, a capacity that cannot fit a
    real Cat. Only after that proof does the host change to 1024 MiB and restart;
    the second heartbeat must remain empty `cordoned` at 1 CPU/1024 MiB.
+   A stock Ubuntu host first receives AWS CLI v2 and `jq`; every host and SSM
+   AWS call has the manifest region explicitly set. Before handoff, the sole
+   root mapping must still report `DeleteOnTermination=true`.
 2. `validate`: confirmation `VALIDATE_Q124_<first-12-manifest-hash>`.
 3. `drain`: confirmation `DRAIN_Q124_<first-12-manifest-hash>`. Every assigned
    Cat must belong to the fixed workspace and have a `q124-` name. The control
@@ -69,6 +73,9 @@ single concurrency group prevents overlapping lifecycle transitions.
    zero runtime records/processes and zero pending packs.
 4. `withdraw`: confirmation `WITHDRAW_Q124_<first-12-manifest-hash>`. It repeats
    the idle proof, stops the worker, and uses the supported exact node DELETE.
+   Empty `Lost` is also deletable, so retrying after stop plus a lost DELETE
+   response cannot strand the node. Every retry repeats the workspace/name
+   scope check; a non-empty or wrongly scoped node is never deleted.
 5. `return`: confirmation `RETURN_Q124_<instance-id>_<node-id>`. Only after the
    calibrated node-absence and idle proofs does it disable termination
    protection and terminate the exact manifest instance. It waits for EC2
@@ -86,6 +93,11 @@ boundaries, requires exactly one matching object and one bounded standard-base64
 line, then decodes and verifies the canonical hash before publishing the local
 manifest file.
 
+Provisioning keeps its failure-cleanup trap armed until the no-secret canonical
+manifest has been accepted by the issue API. A publication failure therefore
+cannot leave a live worker whose only recovery manifest existed in a later
+workflow step. Artifact upload remains a second copy after the transition.
+
 The manifest's 1–24 hour interval is parsed and checked. `validate` refuses an
 expired worker; drain/withdraw/return deliberately remain available after
 expiry so TTL enforcement cannot prevent safe cleanup. The provisioned source
@@ -101,10 +113,16 @@ requires today's policy variables to match.
 Failure and cancellation traps are intentionally narrower than normal cleanup:
 they can act only on the exact instance id returned to the current invocation
 after its issue/purpose/node tags are re-read. If the node has any assigned or
-orphan Cat, runtime record, pending pack, or ambiguous response, cleanup stops
+orphan Cat, runtime record, pending pack, failed state traversal, a cache mount
+not backed by the exact manifest device, or an ambiguous response, cleanup stops
 without terminating. No wildcard/tag-selector mutation, shared security-group,
 RDS, S3 policy, DNS, Terraform-state, data-volume or production-Cat deletion is
 implemented.
+
+All administrator requests require the exact configured HTTPS authority, TLS
+1.2 or newer, and bounded connect/overall timeouts. HTTP, a different authority,
+a path-bearing base URL, network ambiguity and unexpected statuses fail before
+a lifecycle mutation.
 
 The trap is armed before `RunInstances`, not after its response. If AWS accepts
 the request but the CLI loses its output or receives TERM, cleanup performs a
@@ -134,9 +152,13 @@ expired TTL, current-policy drift, multi-SG, partial scope, non-empty nodes,
 staged capacity, device partitions/signatures/holders, duplicate provisioning,
 cancellation, accepted-but-response-lost launch, zero/multiple recovery,
 partial-failure cleanup order, immutable-manifest cleanup after variables/main
-change, idempotent retries, tag mismatch and exact positive termination. A pure
-Terraform module also renders the actual IAM JSON for resource-type/condition
-contracts. These tests are local evidence only; they are not a live PASS.
+change, Cordoned/Lost DELETE retries, manifest-publication failure, root mapping
+deletion policy, cache-mount/traversal failures, tag mismatch and exact positive
+termination. One fixture executes the actual SSM wrapper, bootstraps an
+initially absent AWS CLI/`jq`, and reaches the actual remote `prepare`
+entrypoint. A pure Terraform module also renders the actual IAM JSON for
+resource-type/condition contracts. These tests are local evidence only; they
+are not a live PASS.
 
 ## Permissions and intentionally unexecuted work
 
@@ -147,6 +169,9 @@ only the qualification artifact prefix, and modify/terminate only tagged
 qualification instances. It has no permission to delete S3 objects or volumes,
 change shared networking/database/DNS resources, or read runtime/database
 secrets (the existing EC2 worker role does that from the host).
+`s3:GetBucketLocation` is unconditional on the exact artifact bucket;
+`s3:ListBucket` alone carries the qualification-prefix condition, while object
+access remains limited to that prefix.
 
 `RunInstances` has no IAM instance-profile resource type. The policy therefore
 uses both mechanisms AWS exposes: exact-role `iam:PassRole` with

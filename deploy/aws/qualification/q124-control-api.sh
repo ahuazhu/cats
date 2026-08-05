@@ -6,17 +6,31 @@ die() { printf 'q124-control: %s\n' "$*" >&2; exit 1; }
 need() { [[ -n ${!1:-} ]] || die "missing $1"; }
 
 need Q124_CONTROL_URL
+need Q124_CONTROL_AUTHORITY
 need Q124_ADMIN_TOKEN_FILE
+[[ $Q124_CONTROL_AUTHORITY =~ ^[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] || die "invalid control authority"
+if [[ $Q124_CONTROL_AUTHORITY == *:* ]]; then
+  control_port=${Q124_CONTROL_AUTHORITY##*:}
+  (( control_port <= 65535 )) || die "control authority port is out of range"
+fi
+[[ ${Q124_CONTROL_URL%/} == "https://$Q124_CONTROL_AUTHORITY" ]] || die "control URL must be HTTPS on the expected authority with no path"
+Q124_CURL_CONNECT_TIMEOUT=${Q124_CURL_CONNECT_TIMEOUT:-10}
+Q124_CURL_MAX_TIME=${Q124_CURL_MAX_TIME:-30}
+for timeout in "$Q124_CURL_CONNECT_TIMEOUT" "$Q124_CURL_MAX_TIME"; do
+  [[ $timeout =~ ^[1-9][0-9]{0,2}$ ]] && (( timeout <= 300 )) || die "invalid HTTP timeout"
+done
 [[ -f $Q124_ADMIN_TOKEN_FILE && ! -L $Q124_ADMIN_TOKEN_FILE ]] || die "token file must be a regular non-symlink"
 [[ $(stat -c '%a' "$Q124_ADMIN_TOKEN_FILE" 2>/dev/null || stat -f '%Lp' "$Q124_ADMIN_TOKEN_FILE") == 600 ]] || die "token file mode must be 0600"
 [[ $(<"$Q124_ADMIN_TOKEN_FILE") =~ ^[A-Za-z0-9._~-]+$ ]] || die "token contains characters unsafe for curl config"
 
 request() {
   local method=$1 path=$2 output=$3 expected=$4 status
-  status=$(curl --silent --show-error --output "$output" --write-out '%{http_code}' \
+  status=$(curl --silent --show-error --proto '=https' --tlsv1.2 \
+    --connect-timeout "$Q124_CURL_CONNECT_TIMEOUT" --max-time "$Q124_CURL_MAX_TIME" \
+    --output "$output" --write-out '%{http_code}' \
     --config <(printf 'header = "Authorization: Bearer %s"\n' "$(<"$Q124_ADMIN_TOKEN_FILE")") \
     --request "$method" "${Q124_CONTROL_URL%/}$path") || die "HTTP request failed"
-  [[ $status == "$expected" ]] || {
+  [[ " $expected " == *" $status "* ]] || {
     jq -c '{error:(.error // .message // "redacted")}' "$output" 2>/dev/null >&2 || true
     die "$method $path returned $status, expected $expected"
   }
@@ -32,10 +46,11 @@ node_get() {
   rm -f "$out"
 }
 
-assert_empty_cordoned() {
+assert_empty_deletable() {
   node_get "$1" | jq -e '
-    .node.state == "cordoned" and .assigned_cats == 0 and .orphan_cats == 0
-  ' >/dev/null || die "node is not cordoned with zero assigned and orphan Cats"
+    (.node.state == "cordoned" or .node.state == "lost") and
+    .assigned_cats == 0 and .orphan_cats == 0
+  ' >/dev/null || die "node is not empty in a deletable Cordoned/Lost state"
 }
 
 case ${1:-} in
@@ -96,10 +111,13 @@ case ${1:-} in
     request POST "/v1/admin/nodes/$node/actions/cordon" "$out" 200
     ;;
   delete)
-    node=${2:?node id required}; source_node=${3:?source node required}
-    assert_empty_cordoned "$node"
+    node=${2:?node id required}; source_node=${3:?source node required}; workspace=${4:?workspace required}; prefix=${5:-q124-}
+    assert_empty_deletable "$node"
+    "$0" cats-scope "$node" "$workspace" "$prefix" >/dev/null
     out=$(mktemp); trap 'rm -f "$out"' EXIT
-    request DELETE "/v1/admin/nodes/$node" "$out" 204
+    # DELETE may commit and lose its response. A 404 is accepted only after
+    # the pre-delete identity/scope proof and the calibrated absence oracle.
+    request DELETE "/v1/admin/nodes/$node" "$out" "204 404"
     "$0" absent "$source_node" "$node"
     ;;
   *)
