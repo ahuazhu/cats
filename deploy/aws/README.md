@@ -166,26 +166,29 @@ rollouts:
    The first command must report `version=4`, frozen `true`, both topology
    fields `false`, and provenance `false`; every Pod must report the reviewed
    digest.
-4. After the last pre-v4 Pod has disappeared, wait at least 65 seconds (the
-   old controller's node request timeout is 60 seconds). This is the
-   zero-in-flight boundary for a request that had committed a mount before
-   AttachDisk, or detached before deleting its binding. Then acknowledge the
-   drain exactly once:
+4. After the last pre-v4 Pod has disappeared, acknowledge that no old handler
+   can accept another topology request. Do not use a timeout as the in-flight
+   proof: a disconnected request's blocking node job can remain queued longer
+   than its former 60-second HTTP timeout.
 
    ```sh
-   sleep 65
    psql "$CATS_CONTROL_POSTGRES_URL" -v ON_ERROR_STOP=1 -c \
      'UPDATE control_schema_version SET legacy_topology_handlers_drained=TRUE WHERE singleton AND lifecycle_maintenance_frozen AND NOT lifecycle_provenance_writes_enabled RETURNING lifecycle_maintenance_epoch, legacy_topology_handlers_drained'
    ```
 
-   Phase-A controllers now replay an epoch-scoped AttachDisk for every
-   persistent binding of a stable host-bound Cat, making the Host match the
-   frozen database source of truth. Suspended/Warm Cats are temporarily woken,
-   repaired, and returned to the same state without publishing a route; Cold
-   Cats consume the binding on their next StartCat. This intentionally
+   Phase-A controllers first install the maintenance epoch on every node
+   agent. Each agent rejects later untagged Attach/Detach requests and does not
+   acknowledge until every request accepted before the fence has actually
+   exited its blocking execution queue. Controllers then replay an
+   epoch-scoped AttachDisk for every persistent binding of a stable host-bound
+   Cat, making the Host match the frozen database source of truth.
+   Suspended/Warm Cats are temporarily woken, repaired, and returned to the
+   same state without publishing a route; Cold Cats consume the binding on
+   their next StartCat. A Cloud Hypervisor runtime that truly lacks a bound
+   disk is rebuilt by an idempotent Stop/full-topology Start. This intentionally
    reattaches a disk if an old unmount stopped after physical detach. Do not
-   acknowledge while any old Pod or request is still live: repair must never
-   race the old action. Wait until reconciliation reports `true`:
+   acknowledge while any old Pod is still live. Wait until reconciliation
+   reports `true`:
 
    ```sh
    psql "$CATS_CONTROL_POSTGRES_URL" -v ON_ERROR_STOP=1 -c \

@@ -5,7 +5,7 @@ use std::ffi::CString;
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context};
@@ -25,7 +25,10 @@ use cats_api::metering::{
     CatUsageCheckpoint, IngestUsageCheckpointsRequest, UsageMetric,
     MAX_USAGE_CHECKPOINTS_PER_REQUEST, MAX_USAGE_INGEST_BODY_BYTES,
 };
-use cats_api::nodejob::{JobPhase, NodeJob};
+use cats_api::nodejob::{
+    JobPhase, NodeJob, NodeJobAction, TopologyBarrierMode, TopologyBarrierRequest,
+    TopologyBarrierResponse,
+};
 use cats_api::oci::{DeployOciRequest, OciDeployment};
 use cats_api::requests::{
     ExecRequest, ExecResponse, HeartbeatCat, HeartbeatRequest, NodeWorkStatusRequest,
@@ -113,6 +116,95 @@ pub struct NodeState {
     pub cfg: Arc<ServerConfig>,
     client: reqwest::Client,
     usage_pipeline: Arc<UsageMeteringPipeline>,
+    topology_gate: Arc<TopologyGate>,
+}
+
+const TOPOLOGY_EPOCH_HEADER: &str = "x-cats-topology-epoch";
+
+#[derive(Debug, Default)]
+struct TopologyGateState {
+    epoch: Option<i64>,
+    pre_fence_inflight: usize,
+}
+
+/// Counts topology jobs at acceptance, not at execution. The permit is moved
+/// into `spawn_blocking`, so a disconnected HTTP waiter cannot make a queued
+/// legacy Attach/Detach disappear from the drain proof while its closure still
+/// waits behind the runtime's node-wide operation lock.
+#[derive(Debug, Default)]
+struct TopologyGate {
+    state: Mutex<TopologyGateState>,
+    drained: Condvar,
+}
+
+#[derive(Debug)]
+struct TopologyPermit {
+    gate: Arc<TopologyGate>,
+    counted: bool,
+}
+
+impl Drop for TopologyPermit {
+    fn drop(&mut self) {
+        if !self.counted {
+            return;
+        }
+        let mut state = self.gate.state.lock().expect("topology gate mutex");
+        state.pre_fence_inflight = state
+            .pre_fence_inflight
+            .checked_sub(1)
+            .expect("a counted topology permit increments before it can drop");
+        let drained = state.pre_fence_inflight == 0;
+        drop(state);
+        if drained {
+            self.gate.drained.notify_all();
+        }
+    }
+}
+
+impl TopologyGate {
+    fn enter(self: &Arc<Self>, requested_epoch: Option<i64>) -> Result<TopologyPermit, StatusCode> {
+        let mut state = self.state.lock().expect("topology gate mutex");
+        let counted = match (state.epoch, requested_epoch) {
+            (None, None) => {
+                state.pre_fence_inflight = state.pre_fence_inflight.saturating_add(1);
+                true
+            }
+            (Some(active), Some(requested)) if active == requested => false,
+            // An epoch-tagged repair must not race ahead of the barrier, and an
+            // untagged legacy request must not enter after it.
+            _ => return Err(StatusCode::PRECONDITION_FAILED),
+        };
+        Ok(TopologyPermit {
+            gate: Arc::clone(self),
+            counted,
+        })
+    }
+
+    fn fence(&self, epoch: i64) -> Result<(), StatusCode> {
+        let mut state = self.state.lock().expect("topology gate mutex");
+        match state.epoch {
+            None => state.epoch = Some(epoch),
+            Some(active) if active == epoch => {}
+            Some(_) => return Err(StatusCode::CONFLICT),
+        }
+        while state.pre_fence_inflight != 0 {
+            state = self.drained.wait(state).expect("topology gate mutex");
+        }
+        Ok(())
+    }
+
+    fn release(&self, epoch: i64) -> Result<(), StatusCode> {
+        let mut state = self.state.lock().expect("topology gate mutex");
+        match state.epoch {
+            Some(active) if active == epoch && state.pre_fence_inflight == 0 => {
+                state.epoch = None;
+                Ok(())
+            }
+            Some(active) if active != epoch => Err(StatusCode::CONFLICT),
+            Some(_) => Err(StatusCode::CONFLICT),
+            None => Ok(()), // idempotent replay after a lost release response
+        }
+    }
 }
 
 pub struct Handle {
@@ -378,8 +470,35 @@ async fn handle_job(
     if let Err(code) = check_auth(&state.cfg, &headers) {
         return code.into_response();
     }
+    let topology_permit = if matches!(
+        &job.action,
+        NodeJobAction::AttachDisk { .. } | NodeJobAction::DetachDisk { .. }
+    ) {
+        let requested_epoch = match headers.get(TOPOLOGY_EPOCH_HEADER) {
+            None => None,
+            Some(value) => match value
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<i64>().ok())
+                .filter(|epoch| *epoch > 0)
+            {
+                Some(epoch) => Some(epoch),
+                None => return StatusCode::BAD_REQUEST.into_response(),
+            },
+        };
+        match state.topology_gate.enter(requested_epoch) {
+            Ok(permit) => Some(permit),
+            Err(code) => return code.into_response(),
+        }
+    } else {
+        None
+    };
     let runtime = state.runtime.clone();
-    let result = tokio::task::spawn_blocking(move || runtime.execute(job)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        let _topology_permit = topology_permit;
+        runtime.execute(job)
+    })
+    .await;
     match result {
         Ok(res) if res.phase == JobPhase::Succeeded => {
             // A lifecycle result is not withheld for usage delivery. The
@@ -397,6 +516,36 @@ async fn handle_job(
         }
         Ok(res) => Json(res).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn handle_topology_barrier(
+    State(state): State<NodeState>,
+    headers: HeaderMap,
+    Json(request): Json<TopologyBarrierRequest>,
+) -> Response {
+    if let Err(code) = check_auth(&state.cfg, &headers) {
+        return code.into_response();
+    }
+    if request.epoch <= 0 {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let gate = Arc::clone(&state.topology_gate);
+    let epoch = request.epoch;
+    let mode = request.mode;
+    let result = tokio::task::spawn_blocking(move || match mode {
+        TopologyBarrierMode::Fence => gate.fence(epoch),
+        TopologyBarrierMode::Release => gate.release(epoch),
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => Json(TopologyBarrierResponse {
+            epoch,
+            drained: true,
+        })
+        .into_response(),
+        Ok(Err(code)) => code.into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
 }
 
@@ -805,6 +954,7 @@ pub fn router(state: NodeState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/jobs", post(handle_job))
+        .route("/v1/topology-barrier", post(handle_topology_barrier))
         .route("/v1/cats/{id}/exec", post(handle_exec))
         .route("/v1/cats/{id}/oci-deployments", post(handle_deploy_oci))
         .route("/v1/cats/{id}/shell", get(handle_shell))
@@ -837,6 +987,63 @@ mod proxy_websocket_tests {
         assert_eq!(request.uri().path_and_query().unwrap(), "/socket?token=one");
         assert_eq!(request.headers()["host"], "preview-123.cats.run");
         assert_eq!(request.headers()["origin"], "https://preview-123.cats.run");
+    }
+}
+
+#[cfg(test)]
+mod topology_barrier_tests {
+    use super::TopologyGate;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[test]
+    fn queued_pre_v4_detach_cannot_execute_after_agent_barrier_acknowledges() {
+        let gate = Arc::new(TopologyGate::default());
+        // The request was accepted before fencing; its permit is owned by the
+        // blocking closure while it waits behind the node-wide runtime lock.
+        let permit = gate.enter(None).unwrap();
+        let runtime_ops = Arc::new(Mutex::new(()));
+        let held = runtime_ops.lock().unwrap();
+        let executed = Arc::new(AtomicBool::new(false));
+        let queued = {
+            let runtime_ops = Arc::clone(&runtime_ops);
+            let executed = Arc::clone(&executed);
+            std::thread::spawn(move || {
+                let _ops = runtime_ops.lock().unwrap();
+                executed.store(true, Ordering::SeqCst);
+                drop(permit);
+            })
+        };
+
+        let barrier_done = Arc::new(AtomicBool::new(false));
+        let barrier = {
+            let gate = Arc::clone(&gate);
+            let barrier_done = Arc::clone(&barrier_done);
+            std::thread::spawn(move || {
+                gate.fence(4).unwrap();
+                barrier_done.store(true, Ordering::SeqCst);
+            })
+        };
+        // Wait until the fence is active, then prove both properties: it has
+        // not acknowledged while Detach is queued, and a later untagged old
+        // request cannot enter the queue.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while gate.enter(Some(4)).is_err() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(!barrier_done.load(Ordering::SeqCst));
+        assert!(gate.enter(None).is_err());
+
+        drop(held);
+        queued.join().unwrap();
+        barrier.join().unwrap();
+        assert!(executed.load(Ordering::SeqCst));
+        assert!(barrier_done.load(Ordering::SeqCst));
+        // Therefore no pre-fence closure can first execute after this point.
+        gate.release(4).unwrap();
+        assert!(gate.enter(None).is_ok());
     }
 }
 
@@ -1873,6 +2080,7 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
         cfg: cfg.clone(),
         client: client.clone(),
         usage_pipeline: usage_pipeline.clone(),
+        topology_gate: Arc::new(TopologyGate::default()),
     };
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen)

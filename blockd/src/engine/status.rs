@@ -44,6 +44,7 @@ impl ChunkEngine {
         let status = DurabilityStatus {
             volume_id: self.cfg.volume_id.clone(),
             attachment_id: self.cfg.attachment_id.clone(),
+            lease_epoch: self.epoch,
             mode: match self.cfg.durability {
                 DurabilityMode::Strict => "strict",
                 DurabilityMode::Relaxed { .. } => "relaxed",

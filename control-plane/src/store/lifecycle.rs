@@ -33,6 +33,131 @@ pub enum LegacyLifecycleBegin {
 }
 
 impl Store {
+    /// Recover the one markerless Phase-A Stop that put this Cat into
+    /// `Stopping` before a newer Running request superseded its operation row.
+    /// The transitional state is unambiguous for Stop, but the old generation
+    /// must come from durable operation provenance rather than the current Cat
+    /// generation.
+    pub fn superseded_markerless_stop_generation(
+        &self,
+        cat_id: &str,
+        current_generation: i64,
+        node_id: &str,
+    ) -> Result<Option<i64>> {
+        self.with(|client| {
+            client
+                .query_opt(
+                    "SELECT o.resource_generation
+                       FROM cats c
+                       JOIN operations o ON o.resource_id=c.id
+                      WHERE c.id=$1 AND c.generation=$2 AND c.node_id=$3
+                        AND c.observed_state='stopping'
+                        AND c.desired_state='running'
+                        AND c.lifecycle_dispatch_json IS NULL
+                        AND c.topology_claim_json IS NULL
+                        AND NOT (SELECT lifecycle_provenance_writes_enabled
+                                   FROM control_schema_version WHERE singleton)
+                        AND o.resource_generation < c.generation
+                        AND o.phase='failed'
+                        AND o.kind IN ('cat.stop','cat.auto_cold','cat.credit_exhausted')
+                        AND EXISTS (
+                            SELECT 1 FROM operations current_op
+                             WHERE current_op.resource_id=c.id
+                               AND current_op.resource_generation=c.generation
+                               AND current_op.phase IN ('pending','running')
+                               AND current_op.kind IN (
+                                   'cat.create','cat.start','cat.resume',
+                                   'cat.work_wake','cat.wake'
+                               )
+                        )
+                      ORDER BY o.resource_generation DESC, o.created_at DESC, o.id DESC
+                      LIMIT 1",
+                    &[&cat_id, &current_generation, &node_id],
+                )?
+                .map(|row| row.try_get(0))
+                .transpose()
+        })
+    }
+
+    /// After replaying the exact old Stop and fencing its captured writers,
+    /// atomically publish the no-runtime fact for the current generation. The
+    /// current Running operation remains pending and the ordinary reconciler
+    /// cold-starts it on the next tick.
+    pub fn settle_superseded_markerless_stop(
+        &self,
+        cat_id: &str,
+        current_generation: i64,
+        old_stop_generation: i64,
+        node_id: &str,
+    ) -> Result<bool> {
+        self.enter(|client| {
+            let client = client?;
+            let mut tx = client.transaction().map_err(internal)?;
+            // Recheck the exact historical/current operation proof while the
+            // Cat row is locked; a concurrent desired-state write must win
+            // cleanly instead of being overwritten by a late response.
+            let row = tx
+                .query_opt(
+                    "SELECT 1 FROM cats c
+                      WHERE c.id=$1 AND c.generation=$2 AND c.node_id=$4
+                        AND c.observed_state='stopping'
+                        AND c.desired_state='running'
+                        AND c.lifecycle_dispatch_json IS NULL
+                        AND c.topology_claim_json IS NULL
+                        AND NOT (SELECT lifecycle_provenance_writes_enabled
+                                   FROM control_schema_version WHERE singleton)
+                        AND EXISTS (
+                            SELECT 1 FROM operations old_op
+                             WHERE old_op.resource_id=c.id
+                               AND old_op.resource_generation=$3
+                               AND old_op.phase='failed'
+                               AND old_op.kind IN (
+                                   'cat.stop','cat.auto_cold','cat.credit_exhausted'
+                               )
+                        )
+                        AND EXISTS (
+                            SELECT 1 FROM operations current_op
+                             WHERE current_op.resource_id=c.id
+                               AND current_op.resource_generation=c.generation
+                               AND current_op.phase IN ('pending','running')
+                               AND current_op.kind IN (
+                                   'cat.create','cat.start','cat.resume',
+                                   'cat.work_wake','cat.wake'
+                               )
+                        )
+                      FOR UPDATE",
+                    &[&cat_id, &current_generation, &old_stop_generation, &node_id],
+                )
+                .map_err(internal)?;
+            if row.is_none() {
+                tx.commit().map_err(internal)?;
+                return Ok(false);
+            }
+            tx.execute(
+                "UPDATE routes
+                    SET node_id=NULL, gateway_url=NULL, epoch=epoch+1, state='unbound'
+                  WHERE cat_id=$1",
+                &[&cat_id],
+            )
+            .map_err(internal)?;
+            let changed = tx
+                .execute(
+                    "UPDATE cats
+                        SET node_id=NULL, observed_state='cold',
+                            observed_state_since_ms=$3,
+                            observed_generation=$2
+                      WHERE id=$1 AND generation=$2 AND node_id=$4
+                        AND observed_state='stopping'
+                        AND lifecycle_dispatch_json IS NULL
+                        AND topology_claim_json IS NULL",
+                    &[&cat_id, &current_generation, &now_ms(), &node_id],
+                )
+                .map_err(internal)?;
+            tx.commit().map_err(internal)?;
+            Ok(changed == 1)
+        })
+    }
+
     pub fn lifecycle_maintenance_frozen(&self) -> Result<bool> {
         self.with(|client| {
             client
@@ -76,9 +201,9 @@ impl Store {
     }
 
     /// Operator acknowledgement that every pre-v4 topology handler has been
-    /// removed and its at-most-60-second node request has drained. The
-    /// reconciler may only repair database/Host ambiguity after this point;
-    /// otherwise it could race an old attach or detach still in flight.
+    /// removed, so none can accept new work. This does not guess that queued
+    /// node work drained from an HTTP timeout: the reconciler installs an
+    /// agent-side epoch barrier and waits for the exact accepted queue instead.
     pub fn confirm_legacy_topology_handlers_drained(&self) -> Result<()> {
         let changed = self.with(|client| {
             client.execute(
@@ -92,6 +217,10 @@ impl Store {
                               AND c.desired_state=c.observed_state
                               AND c.observed_generation=c.generation
                               AND c.node_id IS NOT NULL
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM cats
+                             WHERE topology_claim_json IS NOT NULL
                         )
                   WHERE singleton AND lifecycle_maintenance_frozen",
                 &[],
@@ -142,6 +271,19 @@ impl Store {
                     &[&epoch],
                 )
                 .map(|changed| changed == 1)
+        })
+    }
+
+    pub fn legacy_topology_claims_pending(&self) -> Result<bool> {
+        self.with(|client| {
+            client
+                .query_one(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM cats WHERE topology_claim_json IS NOT NULL
+                    )",
+                    &[],
+                )?
+                .try_get(0)
         })
     }
 

@@ -429,13 +429,34 @@ impl NodeRuntime {
         if rt.state != ObservedState::Running {
             bail!("hot attach requires a running cat");
         }
-        if rt.ch.is_some() {
-            // vm.add-disk hotplug lands with the vhost-user milestone; cold
-            // cats pick bindings up at the next start.
-            bail!("hot attach is not supported in Cloud Hypervisor mode yet");
+        if let Some(existing) = rt
+            .volumes
+            .iter()
+            .find(|existing| existing.disk_id == grant.disk_id)
+        {
+            // Lifecycle generations may change while the physical attachment
+            // remains, so attachment_id/epoch are intentionally not compared.
+            // The immutable disk identity and Guest placement still must agree.
+            anyhow::ensure!(
+                existing.volume_id == grant.volume_id
+                    && existing.mount_path == grant.mount_path
+                    && existing.size_bytes == grant.size_bytes
+                    && existing.durability == grant.durability,
+                "disk {} is already attached with conflicting volume metadata",
+                grant.disk_id
+            );
+            anyhow::ensure!(
+                rt.blockds.contains_key(&grant.disk_id),
+                "disk {} is present in runtime inventory without a block backend",
+                grant.disk_id
+            );
+            return Ok(ObservedState::Running); // idempotent existing attachment
         }
-        if rt.blockds.contains_key(&grant.disk_id) {
-            return Ok(ObservedState::Running); // idempotent
+        if rt.ch.is_some() {
+            return Err(HotAttachUnsupported {
+                disk_id: grant.disk_id,
+            }
+            .into());
         }
         let dir = rt.dir.clone();
         // Unreachable in Cloud Hypervisor mode (hot attach is rejected above).

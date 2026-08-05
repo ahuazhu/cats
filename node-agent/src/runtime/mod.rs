@@ -176,6 +176,16 @@ struct CatRuntime {
     ch: Option<ChRuntime>,
 }
 
+/// A CH runtime does not currently support hot-plug. This error is emitted
+/// only after inventory proved the requested disk is genuinely absent, so the
+/// control plane can distinguish a supported stop/start rebuild from an
+/// arbitrary attach failure.
+#[derive(Debug, thiserror::Error)]
+#[error("disk {disk_id} is absent and Cloud Hypervisor hot attach is unsupported")]
+struct HotAttachUnsupported {
+    disk_id: String,
+}
+
 /// Process and filesystem identities used by the heartbeat sampler to
 /// attribute host resource use to one Cat.
 #[derive(Clone)]

@@ -10,13 +10,15 @@
 //! - Suspended/Warm on a lost host are discarded and cold-started elsewhere;
 //! - route epochs bump on every publish/unbind.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use anyhow::Context as _;
 use cats_api::error::ErrorBody;
 use cats_api::nodejob::{
-    self, JobPhase, NodeJob, NodeJobAction, NodeJobResult, StopCatDisposition, VolumeGrant,
+    self, JobPhase, NodeJob, NodeJobAction, NodeJobErrorCode, NodeJobResult, StopCatDisposition,
+    TopologyBarrierMode, TopologyBarrierRequest, TopologyBarrierResponse, VolumeGrant,
 };
 use cats_api::resources::*;
 use cats_storage::{MetaError, MetadataStore};
@@ -172,6 +174,20 @@ impl Controller {
         let Some(epoch) = self.store.legacy_topology_reconciliation_epoch()? else {
             return Ok(());
         };
+        // Fence at request acceptance on every reachable node before reading
+        // the frozen binding set. An old Attach/Detach whose HTTP waiter has
+        // disappeared may still be queued in spawn_blocking; the agent does
+        // not acknowledge this barrier until that closure has really exited.
+        let nodes = self
+            .store
+            .list_nodes()?
+            .into_iter()
+            .filter(|node| !matches!(node.state, NodeState::Lost | NodeState::Fenced))
+            .collect::<Vec<_>>();
+        for node in &nodes {
+            self.set_topology_barrier(node, epoch, TopologyBarrierMode::Fence)
+                .await?;
+        }
         let candidates = self.store.legacy_topology_reconciliation_candidates()?;
         let mut cursor = 0;
         while cursor < candidates.len() {
@@ -254,8 +270,22 @@ impl Controller {
                         },
                     },
                 };
-                let result = self.dispatch(&node.agent_url, &job).await?;
+                let result = self
+                    .dispatch_topology(&node.agent_url, &job, Some(epoch))
+                    .await?;
                 if result.job_id != job.job_id || result.phase != JobPhase::Succeeded {
+                    if result.job_id == job.job_id
+                        && (result.error_code == Some(NodeJobErrorCode::HotAttachUnsupported)
+                            // A previous rebuild attempt may have completed
+                            // Stop and then lost/failed Start. Cold inventory
+                            // is the durable reason to replay the same
+                            // idempotent Stop/full-topology Start sequence.
+                            || result.observed_state == ObservedState::Cold)
+                    {
+                        self.rebuild_legacy_topology_cat(cat, &node, bindings, epoch)
+                            .await?;
+                        break;
+                    }
                     anyhow::bail!(
                         "legacy topology reconciliation {} failed: {}",
                         binding.id,
@@ -305,9 +335,125 @@ impl Controller {
                 }
             }
         }
+        // A pre-freeze claim is itself replayed later in this tick. Keep the
+        // barriers installed until it settles; otherwise the claim would race
+        // an old queued request or have to run untagged through a released
+        // gate. The next tick rechecks/repairs its committed outcome.
+        if self.store.legacy_topology_claims_pending()? {
+            return Ok(());
+        }
+        // Release while the database is still frozen. If this process dies
+        // before marking reconciliation complete, the next tick safely fences
+        // the same epoch again and replays the idempotent repair jobs.
+        for node in &nodes {
+            self.set_topology_barrier(node, epoch, TopologyBarrierMode::Release)
+                .await?;
+        }
         if self.store.mark_legacy_topology_reconciled(epoch)? {
             tracing::info!(epoch, "legacy disk topology reconciliation completed");
         }
+        Ok(())
+    }
+
+    async fn set_topology_barrier(
+        &self,
+        node: &Node,
+        epoch: i64,
+        mode: TopologyBarrierMode,
+    ) -> anyhow::Result<()> {
+        let response = self
+            .http
+            .post(format!(
+                "{}/v1/topology-barrier",
+                node.agent_url.trim_end_matches('/')
+            ))
+            .bearer_auth(&self.auth_token)
+            .json(&TopologyBarrierRequest { epoch, mode })
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            anyhow::bail!(
+                "node {} topology barrier returned {}",
+                node.id,
+                response.status()
+            );
+        }
+        let response = response.json::<TopologyBarrierResponse>().await?;
+        anyhow::ensure!(
+            response.epoch == epoch && response.drained,
+            "node {} returned a mismatched topology barrier proof",
+            node.id
+        );
+        Ok(())
+    }
+
+    /// Cloud Hypervisor cannot hot-plug a genuinely absent disk. Rebuild the
+    /// same-generation runtime from the complete frozen DB topology instead.
+    /// Stop and Start have distinct epoch-scoped ids, so every crash boundary
+    /// is replayable without guessing whether the old runtime still exists.
+    async fn rebuild_legacy_topology_cat(
+        &self,
+        cat: &Cat,
+        node: &Node,
+        bindings: &[(Cat, MountBinding)],
+        epoch: i64,
+    ) -> anyhow::Result<()> {
+        for (_, binding) in bindings {
+            anyhow::ensure!(
+                self.store.legacy_topology_binding_matches(cat, binding)?,
+                "frozen topology changed while rebuilding {}",
+                cat.id
+            );
+        }
+        let leases = self.capture_cat_volume_leases(cat)?;
+        let stop = NodeJob {
+            job_id: nodejob::job_id(
+                &cat.id,
+                cat.generation,
+                &format!("topology_reconcile_{epoch}_rebuild_stop"),
+            ),
+            cat_generation: cat.generation,
+            action: NodeJobAction::StopCat {
+                cat_id: cat.id.clone(),
+                disposition: StopCatDisposition::Cold,
+            },
+        };
+        let result = self.dispatch(&node.agent_url, &stop).await?;
+        anyhow::ensure!(
+            result.job_id == stop.job_id
+                && result.phase == JobPhase::Succeeded
+                && result.observed_state == ObservedState::Cold,
+            "legacy topology rebuild stop failed for {}: {}",
+            cat.id,
+            result.error.unwrap_or_else(|| "node job failed".into())
+        );
+        self.revoke_unclaimed_cat_leases(cat, &leases)?;
+
+        let volumes = self.volume_grants(cat).await?;
+        let start = NodeJob {
+            job_id: nodejob::job_id(
+                &cat.id,
+                cat.generation,
+                &format!("topology_reconcile_{epoch}_rebuild_start"),
+            ),
+            cat_generation: cat.generation,
+            action: NodeJobAction::StartCat {
+                cat_id: cat.id.clone(),
+                image: cat.image.clone(),
+                cpus: cat.spec.cpus,
+                memory_mib: cat.spec.memory_mib,
+                volumes,
+            },
+        };
+        let result = self.dispatch(&node.agent_url, &start).await?;
+        anyhow::ensure!(
+            result.job_id == start.job_id
+                && result.phase == JobPhase::Succeeded
+                && result.observed_state == ObservedState::Running,
+            "legacy topology rebuild start failed for {}: {}",
+            cat.id,
+            result.error.unwrap_or_else(|| "node job failed".into())
+        );
         Ok(())
     }
 
@@ -478,6 +624,63 @@ impl Controller {
             });
         }
         Ok(leases)
+    }
+
+    fn validate_action_volume_leases(
+        &self,
+        cat: &Cat,
+        dispatch: &LifecycleDispatch,
+        leases: &[VolumeLeaseAuthority],
+    ) -> anyhow::Result<()> {
+        let disks = self.store.list_disks_for_cat(&cat.id)?;
+        anyhow::ensure!(
+            leases.len() == disks.len(),
+            "node returned {} writer epochs for {} attached disks",
+            leases.len(),
+            disks.len()
+        );
+        let mut seen = HashSet::new();
+        for lease in leases {
+            anyhow::ensure!(lease.epoch > 0, "node returned an unproven writer epoch");
+            anyhow::ensure!(
+                seen.insert(lease.volume_id.as_str()),
+                "node returned duplicate writer authority for {}",
+                lease.volume_id
+            );
+            let disk = disks
+                .iter()
+                .find(|disk| disk.volume_id == lease.volume_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "node returned writer authority for foreign volume {}",
+                        lease.volume_id
+                    )
+                })?;
+            match &dispatch.job.action {
+                NodeJobAction::StartCat { volumes, .. } => {
+                    let grant = volumes
+                        .iter()
+                        .find(|grant| grant.volume_id == lease.volume_id)
+                        .context("StartCat result named a volume outside its action")?;
+                    anyhow::ensure!(
+                        grant.attachment_id == lease.attachment_id,
+                        "StartCat result changed the granted attachment identity"
+                    );
+                }
+                NodeJobAction::RestoreCat { .. } => {
+                    // Restore reuses the grant remembered by the Host. Every
+                    // control-plane grant uses this Cat/disk-scoped prefix;
+                    // generations and epochs may legitimately differ.
+                    let prefix = format!("att_{}_{}_", cat.id, disk.id);
+                    anyhow::ensure!(
+                        lease.attachment_id.starts_with(&prefix),
+                        "RestoreCat result named an attachment outside this Cat/disk"
+                    );
+                }
+                _ => anyhow::bail!("writer authority returned by a non-acquiring action"),
+            }
+        }
+        Ok(())
     }
 
     fn revoke_captured_leases(
@@ -759,6 +962,17 @@ impl Controller {
             // This is deliberately narrower than Starting, which can mean
             // StartCat, ResumeCat or RestoreCat.
             if !provenance_writes_enabled && cat.observed_state == ObservedState::Stopping {
+                if let Some(node_id) = cat.node_id.as_deref() {
+                    if let Some(old_generation) = self.store.superseded_markerless_stop_generation(
+                        &cat.id,
+                        cat.generation,
+                        node_id,
+                    )? {
+                        return self
+                            .replay_superseded_markerless_stop(cat, node_id, old_generation)
+                            .await;
+                    }
+                }
                 let operations = self.store.pending_lifecycle_operations_for(&cat.id)?;
                 let current = operations
                     .iter()
@@ -889,6 +1103,67 @@ impl Controller {
         }
     }
 
+    async fn replay_superseded_markerless_stop(
+        &self,
+        cat: &Cat,
+        node_id: &str,
+        old_generation: i64,
+    ) -> anyhow::Result<()> {
+        let key = format!("legacy-stop:{}@{old_generation}", cat.id);
+        if self.retry_deferred_key(&key) {
+            return Ok(());
+        }
+        let node = self.store.get_node(node_id)?;
+        if matches!(node.state, NodeState::Lost | NodeState::Fenced) {
+            return Ok(());
+        }
+        let leases = self.capture_cat_volume_leases(cat)?;
+        let job = NodeJob {
+            job_id: nodejob::job_id(&cat.id, old_generation, "stop_cat"),
+            cat_generation: old_generation,
+            action: NodeJobAction::StopCat {
+                cat_id: cat.id.clone(),
+                disposition: StopCatDisposition::Cold,
+            },
+        };
+        let result = match self.dispatch(&node.agent_url, &job).await {
+            Ok(result) if result.job_id == job.job_id => result,
+            other => {
+                let retry_in = self.defer_retry_key(key);
+                tracing::warn!(
+                    cat = %cat.id,
+                    old_generation,
+                    retry_in_ms = retry_in.as_millis(),
+                    result = ?other,
+                    "superseded markerless Stop result remains unknown"
+                );
+                return Ok(());
+            }
+        };
+        if result.phase != JobPhase::Succeeded || result.observed_state != ObservedState::Cold {
+            let retry_in = self.defer_retry_key(key);
+            tracing::warn!(
+                cat = %cat.id,
+                old_generation,
+                retry_in_ms = retry_in.as_millis(),
+                error = ?result.error,
+                "superseded markerless Stop did not prove Cold"
+            );
+            return Ok(());
+        }
+        self.revoke_unclaimed_cat_leases(cat, &leases)?;
+        if self.store.settle_superseded_markerless_stop(
+            &cat.id,
+            cat.generation,
+            old_generation,
+            node_id,
+        )? {
+            self.clear_retry_backoff_key(&format!("legacy-stop:{}@{old_generation}", cat.id));
+            self.notify.notify_one();
+        }
+        Ok(())
+    }
+
     async fn align_converged_generation(&self, cat: &Cat) -> anyhow::Result<()> {
         if self.store.observed_generation(&cat.id)? == cat.generation {
             return self.complete_ops_if_converged(&cat.id).await;
@@ -919,13 +1194,24 @@ impl Controller {
     }
 
     async fn dispatch(&self, agent_url: &str, job: &NodeJob) -> anyhow::Result<NodeJobResult> {
-        let resp = self
+        self.dispatch_topology(agent_url, job, None).await
+    }
+
+    async fn dispatch_topology(
+        &self,
+        agent_url: &str,
+        job: &NodeJob,
+        topology_epoch: Option<i64>,
+    ) -> anyhow::Result<NodeJobResult> {
+        let mut request = self
             .http
             .post(self.job_url(agent_url))
             .bearer_auth(&self.auth_token)
-            .json(job)
-            .send()
-            .await?;
+            .json(job);
+        if let Some(epoch) = topology_epoch {
+            request = request.header("x-cats-topology-epoch", epoch);
+        }
+        let resp = request.send().await?;
         if !resp.status().is_success() {
             anyhow::bail!("node agent returned {}", resp.status());
         }
@@ -1013,7 +1299,13 @@ impl Controller {
             cat_generation: claim.cat_generation,
             action,
         };
-        let result = self.dispatch(&node.agent_url, &job).await?;
+        // A claim that predates the maintenance freeze is still legitimate,
+        // but the agent barrier rejects every untagged legacy topology job.
+        // The persisted claim uses the active repair epoch until it settles.
+        let topology_epoch = self.store.legacy_topology_reconciliation_epoch()?;
+        let result = self
+            .dispatch_topology(&node.agent_url, &job, topology_epoch)
+            .await?;
         if result.job_id != job.job_id {
             anyhow::bail!(
                 "topology claim {} received mismatched result {}",
@@ -1303,6 +1595,45 @@ impl Controller {
         };
 
         if result.phase == JobPhase::Succeeded {
+            // Start/Restore may acquire writer epochs after the marker was
+            // committed. Persist the action's own proof before settlement so
+            // an atomic successor Stop inherits those exact identities. The
+            // metadata read is a rolling-upgrade fallback for older agents;
+            // the marker still excludes every successor action while it runs.
+            let effective_dispatch = if matches!(
+                &dispatch.job.action,
+                NodeJobAction::StartCat { .. } | NodeJobAction::RestoreCat { .. }
+            ) {
+                let acquired = if result.volume_leases.is_empty() {
+                    self.capture_cat_volume_leases(cat)?
+                } else {
+                    if let Err(error) =
+                        self.validate_action_volume_leases(cat, dispatch, &result.volume_leases)
+                    {
+                        let retry_in = self.defer_retry_key(dispatch.dispatch_id.clone());
+                        tracing::error!(
+                            cat = %cat.id,
+                            job = %dispatch.job.job_id,
+                            retry_in_ms = retry_in.as_millis(),
+                            "node returned invalid lifecycle writer authority; retaining dispatch: {error}"
+                        );
+                        return Ok(());
+                    }
+                    result.volume_leases.clone()
+                };
+                let Some(updated) = self
+                    .store
+                    .persist_lifecycle_fence_leases(dispatch, acquired)?
+                else {
+                    // A replacement marker/placement won the CAS. This late
+                    // result has no authority to settle anything.
+                    return Ok(());
+                };
+                updated
+            } else {
+                dispatch.clone()
+            };
+            let dispatch = &effective_dispatch;
             if matches!(&dispatch.job.action, NodeJobAction::StopCat { .. }) {
                 // These steps are idempotent and precede marker settlement.  A
                 // crash replays the already-successful StopCat, then repeats

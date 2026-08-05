@@ -26,6 +26,18 @@ pub struct VolumeGrant {
     pub durability: crate::resources::DiskDurability,
 }
 
+/// Exact writer authority acquired by one node lifecycle action.
+///
+/// Start/Restore can acquire a new fencing epoch after the control plane has
+/// persisted its dispatch marker. Returning the action's exact identities is
+/// what lets a superseding Stop revoke only that writer, never a replacement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeLeaseAuthority {
+    pub volume_id: String,
+    pub attachment_id: String,
+    pub epoch: i64,
+}
+
 /// Why a Cat runtime is being stopped.
 ///
 /// A normal Cold transition preserves every disk and therefore drains every
@@ -143,6 +155,26 @@ pub struct NodeJob {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum TopologyBarrierMode {
+    Fence,
+    Release,
+}
+
+/// Agent-side queue fence used while repairing pre-provenance disk topology.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologyBarrierRequest {
+    pub epoch: i64,
+    pub mode: TopologyBarrierMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologyBarrierResponse {
+    pub epoch: i64,
+    pub drained: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum JobPhase {
     Succeeded,
     Rejected,
@@ -153,6 +185,10 @@ pub enum JobPhase {
 #[serde(rename_all = "snake_case")]
 pub enum NodeJobErrorCode {
     ActivityChanged,
+    /// The requested disk is absent from a Cloud Hypervisor runtime, whose
+    /// current production configuration cannot hot-plug it. The control plane
+    /// may rebuild that Cat from its complete authoritative binding set.
+    HotAttachUnsupported,
     LifecycleFailed,
 }
 
@@ -167,6 +203,10 @@ pub struct NodeJobResult {
     pub error: Option<String>,
     #[serde(default)]
     pub retryable: bool,
+    /// Writer epochs acquired inside this successful action. Older agents omit
+    /// the field; controllers must then retain their pre-action authority.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volume_leases: Vec<VolumeLeaseAuthority>,
 }
 
 impl NodeJobResult {
@@ -178,6 +218,7 @@ impl NodeJobResult {
             error_code: None,
             error: None,
             retryable: false,
+            volume_leases: Vec::new(),
         }
     }
 
@@ -194,6 +235,7 @@ impl NodeJobResult {
             error_code: Some(NodeJobErrorCode::LifecycleFailed),
             error: Some(error.into()),
             retryable,
+            volume_leases: Vec::new(),
         }
     }
 
@@ -209,6 +251,25 @@ impl NodeJobResult {
             error_code: Some(NodeJobErrorCode::ActivityChanged),
             error: Some(error.into()),
             retryable: true,
+            volume_leases: Vec::new(),
+        }
+    }
+
+    pub fn fail_with_code(
+        job_id: impl Into<String>,
+        observed: ObservedState,
+        code: NodeJobErrorCode,
+        error: impl Into<String>,
+        retryable: bool,
+    ) -> Self {
+        Self {
+            job_id: job_id.into(),
+            phase: JobPhase::Failed,
+            observed_state: observed,
+            error_code: Some(code),
+            error: Some(error.into()),
+            retryable,
+            volume_leases: Vec::new(),
         }
     }
 }
@@ -273,5 +334,24 @@ mod tests {
             encoded["disposition"]["retained_persistent_disk_ids"][0],
             "data"
         );
+    }
+
+    #[test]
+    fn legacy_job_result_defaults_to_no_action_acquired_writer_authority() {
+        let result: NodeJobResult = serde_json::from_str(
+            r#"{"job_id":"job_cat-a_1_start_cat","phase":"succeeded","observed_state":"running","retryable":false}"#,
+        )
+        .unwrap();
+        assert!(result.volume_leases.is_empty());
+
+        let mut current = NodeJobResult::ok("job_cat-a_1_start_cat", ObservedState::Running);
+        current.volume_leases.push(VolumeLeaseAuthority {
+            volume_id: "vol-a".into(),
+            attachment_id: "att-a".into(),
+            epoch: 7,
+        });
+        let round_trip: NodeJobResult =
+            serde_json::from_value(serde_json::to_value(&current).unwrap()).unwrap();
+        assert_eq!(round_trip.volume_leases, current.volume_leases);
     }
 }

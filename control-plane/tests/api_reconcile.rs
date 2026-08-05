@@ -1,7 +1,7 @@
 //! Control-plane contract tests with a stub node agent: reconcile loop,
 //! operations, idempotency, RWO enforcement, and explicit node-loss fencing.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,7 +17,10 @@ use cats_api::metering::{
     CatUsageCheckpoint, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse, UsageMetric,
     UsageReport, MAX_USAGE_INGEST_BODY_BYTES,
 };
-use cats_api::nodejob::{NodeJob, NodeJobAction, NodeJobResult, StopCatDisposition};
+use cats_api::nodejob::{
+    NodeJob, NodeJobAction, NodeJobErrorCode, NodeJobResult, StopCatDisposition,
+    TopologyBarrierRequest, TopologyBarrierResponse, VolumeGrant, VolumeLeaseAuthority,
+};
 use cats_api::requests::*;
 use cats_api::resources::*;
 use cats_control_plane::controller::AutoTierPolicy;
@@ -187,6 +190,11 @@ struct StubNode {
     started_volume_epochs: Arc<Mutex<Vec<(String, String, i64)>>>,
     storage_meta: Arc<dyn MetadataStore>,
     stop_dispositions: Arc<Mutex<Vec<StopCatDisposition>>>,
+    /// Optional production-CH behavior: existing inventory is idempotent, but
+    /// a truly absent disk returns the typed no-hotplug result.
+    ch_inventory_mode: Arc<AtomicBool>,
+    runtime_volumes: Arc<Mutex<HashMap<String, Vec<VolumeGrant>>>>,
+    acquire_lifecycle_leases: Arc<AtomicBool>,
     /// Every OCI deploy that reached this node, as `(cat, app, image)`. The
     /// count is the assertion that matters: a retried or duplicated request
     /// must not produce a second pull, flatten and service restart.
@@ -207,6 +215,14 @@ impl StubNode {
     async fn quiesce(&self) {
         self.alive.store(false, Ordering::SeqCst);
         let _idle = self.heartbeat_gate.write().await;
+    }
+
+    fn use_ch_inventory(&self) {
+        self.ch_inventory_mode.store(true, Ordering::SeqCst);
+    }
+
+    fn return_acquired_lifecycle_leases(&self) {
+        self.acquire_lifecycle_leases.store(true, Ordering::SeqCst);
     }
 
     fn hold_next_job_response(&self, kind: &str) {
@@ -246,7 +262,8 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Res
         .push(job.action.kind().to_string());
     if matches!(
         &job.action,
-        NodeJobAction::SuspendCat { .. }
+        NodeJobAction::StartCat { .. }
+            | NodeJobAction::SuspendCat { .. }
             | NodeJobAction::ResumeCat { .. }
             | NodeJobAction::WarmCat { .. }
             | NodeJobAction::RestoreCat { .. }
@@ -299,6 +316,30 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Res
         node.hold_job_response_if_requested(&kind).await;
         return Json(result).into_response();
     }
+    if let NodeJobAction::AttachDisk { cat_id, volume } = &job.action {
+        if node.ch_inventory_mode.load(Ordering::SeqCst) {
+            let exists = node
+                .runtime_volumes
+                .lock()
+                .unwrap()
+                .get(cat_id)
+                .is_some_and(|volumes| {
+                    volumes
+                        .iter()
+                        .any(|existing| existing.disk_id == volume.disk_id)
+                });
+            if !exists {
+                return Json(NodeJobResult::fail_with_code(
+                    &job.job_id,
+                    ObservedState::Running,
+                    NodeJobErrorCode::HotAttachUnsupported,
+                    "disk is absent from CH runtime",
+                    true,
+                ))
+                .into_response();
+            }
+        }
+    }
     let lose_start_response = matches!(&job.action, NodeJobAction::StartCat { .. })
         && node
             .lose_start_responses_remaining
@@ -324,14 +365,37 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Res
         }
     }
     let (cat_id, observed) = match &job.action {
-        NodeJobAction::StartCat { cat_id, .. } => (cat_id.clone(), ObservedState::Running),
+        NodeJobAction::StartCat {
+            cat_id, volumes, ..
+        } => {
+            node.runtime_volumes
+                .lock()
+                .unwrap()
+                .insert(cat_id.clone(), volumes.clone());
+            (cat_id.clone(), ObservedState::Running)
+        }
         NodeJobAction::StopCat { cat_id, .. } => (cat_id.clone(), ObservedState::Cold),
         NodeJobAction::SuspendCat { cat_id, .. } => (cat_id.clone(), ObservedState::Suspended),
         NodeJobAction::ResumeCat { cat_id } => (cat_id.clone(), ObservedState::Running),
         NodeJobAction::WarmCat { cat_id } => (cat_id.clone(), ObservedState::Warm),
         NodeJobAction::RestoreCat { cat_id } => (cat_id.clone(), ObservedState::Running),
-        NodeJobAction::AttachDisk { cat_id, .. } => (cat_id.clone(), ObservedState::Running),
-        NodeJobAction::DetachDisk { cat_id, .. } => (cat_id.clone(), ObservedState::Running),
+        NodeJobAction::AttachDisk { cat_id, volume } => {
+            let mut inventories = node.runtime_volumes.lock().unwrap();
+            let volumes = inventories.entry(cat_id.clone()).or_default();
+            if !volumes
+                .iter()
+                .any(|existing| existing.disk_id == volume.disk_id)
+            {
+                volumes.push(volume.clone());
+            }
+            (cat_id.clone(), ObservedState::Running)
+        }
+        NodeJobAction::DetachDisk { cat_id, disk_id } => {
+            if let Some(volumes) = node.runtime_volumes.lock().unwrap().get_mut(cat_id) {
+                volumes.retain(|volume| volume.disk_id != *disk_id);
+            }
+            (cat_id.clone(), ObservedState::Running)
+        }
         NodeJobAction::SyncCat { cat_id } => (cat_id.clone(), ObservedState::Running),
         NodeJobAction::CleanupCat { cat_id } => (cat_id.clone(), ObservedState::Cold),
     };
@@ -339,6 +403,7 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Res
         let mut cats = node.cats.lock().unwrap();
         if observed == ObservedState::Cold {
             cats.remove(&cat_id);
+            node.runtime_volumes.lock().unwrap().remove(&cat_id);
         } else {
             cats.insert(cat_id, observed);
         }
@@ -350,10 +415,41 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Res
         )
             .into_response()
     } else {
-        let result = NodeJobResult::ok(&job.job_id, observed);
+        let mut result = NodeJobResult::ok(&job.job_id, observed);
+        if node.acquire_lifecycle_leases.load(Ordering::SeqCst)
+            && matches!(
+                &job.action,
+                NodeJobAction::StartCat { .. } | NodeJobAction::RestoreCat { .. }
+            )
+        {
+            let volumes = node
+                .runtime_volumes
+                .lock()
+                .unwrap()
+                .get(job.action.cat_id())
+                .cloned()
+                .unwrap_or_default();
+            for volume in volumes {
+                let epoch = node
+                    .storage_meta
+                    .acquire_lease(&volume.volume_id, &volume.attachment_id, 60_000)
+                    .unwrap();
+                node.started_volume_epochs.lock().unwrap().push((
+                    volume.volume_id.clone(),
+                    volume.attachment_id.clone(),
+                    epoch,
+                ));
+                result.volume_leases.push(VolumeLeaseAuthority {
+                    volume_id: volume.volume_id,
+                    attachment_id: volume.attachment_id,
+                    epoch,
+                });
+            }
+        }
         if matches!(
             &job.action,
-            NodeJobAction::SuspendCat { .. }
+            NodeJobAction::StartCat { .. }
+                | NodeJobAction::SuspendCat { .. }
                 | NodeJobAction::ResumeCat { .. }
                 | NodeJobAction::WarmCat { .. }
                 | NodeJobAction::RestoreCat { .. }
@@ -369,6 +465,16 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Res
         }
         Json(result).into_response()
     }
+}
+
+async fn stub_topology_barrier(
+    State(_node): State<StubNode>,
+    Json(request): Json<TopologyBarrierRequest>,
+) -> Json<TopologyBarrierResponse> {
+    Json(TopologyBarrierResponse {
+        epoch: request.epoch,
+        drained: true,
+    })
 }
 
 async fn stub_exec(State(node): State<StubNode>, Json(req): Json<ExecRequest>) -> Response {
@@ -453,12 +559,16 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
         started_volume_epochs: Arc::new(Mutex::new(Vec::new())),
         storage_meta: cp.state.storage_meta.clone(),
         stop_dispositions: Arc::new(Mutex::new(Vec::new())),
+        ch_inventory_mode: Arc::new(AtomicBool::new(false)),
+        runtime_volumes: Arc::new(Mutex::new(HashMap::new())),
+        acquire_lifecycle_leases: Arc::new(AtomicBool::new(false)),
         oci_deploys: Arc::new(Mutex::new(Vec::new())),
         oci_deploy_delay: Arc::new(Mutex::new(Duration::ZERO)),
         oci_deploy_failures_remaining: Arc::new(AtomicUsize::new(0)),
     };
     let app = Router::new()
         .route("/v1/jobs", post(stub_job))
+        .route("/v1/topology-barrier", post(stub_topology_barrier))
         .route("/v1/cats/{id}/exec", post(stub_exec))
         .route("/v1/cats/{id}/oci-deployments", post(stub_deploy_oci))
         .with_state(node.clone());
@@ -1473,11 +1583,7 @@ async fn reconciler_handoff_replays_persisted_suspending_with_the_same_job() {
         suspend_jobs[0], suspend_jobs[1],
         "handoff changed the deterministic SuspendCat job id"
     );
-    assert_eq!(
-        node.applied_lifecycle_jobs.lock().unwrap().len(),
-        1,
-        "the node applied the replayed SuspendCat twice"
-    );
+    assert_one_applied_lifecycle_job(&node, "_suspend_cat");
     node.job_response_release.notify_waiters();
 }
 
@@ -2337,6 +2443,181 @@ async fn running_superseding_stopping_settles_old_stop_before_new_start() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delayed_start_success_passes_new_writer_epoch_to_superseding_stop() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_delayed_start_epoch").await;
+    let created = ctx.create_cat("delayed-start-epoch", None).await;
+    ctx.wait_observed("delayed-start-epoch", ObservedState::Running)
+        .await;
+    let root = ctx
+        .cp
+        .state
+        .store
+        .list_disks_for_cat(&created.cat.id)
+        .unwrap()
+        .into_iter()
+        .find(|disk| disk.kind == DiskKind::Root)
+        .unwrap();
+    let first_stop = ctx.action("delayed-start-epoch", "stop").await;
+    ctx.wait_operation(&first_stop.operation.id).await;
+    ctx.wait_observed("delayed-start-epoch", ObservedState::Cold)
+        .await;
+
+    node.return_acquired_lifecycle_leases();
+    node.hold_next_job_response("start_cat");
+    let restart = ctx.action("delayed-start-epoch", "resume").await;
+    if tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .is_err()
+    {
+        panic!(
+            "StartCat did not acquire its writer before response hold; cat={:?} jobs={:?}",
+            ctx.cp
+                .state
+                .store
+                .must_get_cat_by_id(&created.cat.id)
+                .unwrap(),
+            node.job_payloads.lock().unwrap()
+        );
+    }
+    node.quiesce().await;
+    let (attachment, epoch) = node
+        .started_volume_epochs
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|(volume, _, _)| volume == &root.volume_id)
+        .map(|(_, attachment, epoch)| (attachment.clone(), *epoch))
+        .expect("StartCat returned no root writer epoch");
+
+    let stop = ctx.action("delayed-start-epoch", "stop").await;
+    ctx.cp.shutdown();
+    let second = spawn(ctx.config.clone()).await.unwrap();
+    second.state.notify.notify_one();
+    wait_for_persisted_transition(
+        &second,
+        &created.cat.id,
+        &stop.operation.id,
+        ObservedState::Cold,
+        OperationPhase::Succeeded,
+    )
+    .await;
+    assert_eq!(
+        second
+            .state
+            .store
+            .get_operation(&restart.operation.id)
+            .unwrap()
+            .phase,
+        OperationPhase::Failed
+    );
+    assert!(matches!(
+        second
+            .state
+            .storage_meta
+            .renew_lease(&root.volume_id, &attachment, epoch, 60_000),
+        Err(MetaError::Fenced)
+    ));
+    node.job_response_release.notify_waiters();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delayed_restore_success_passes_new_writer_epoch_to_superseding_delete() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_delayed_restore_epoch").await;
+    let _created = ctx.create_cat("delayed-restore-epoch", None).await;
+    ctx.wait_observed("delayed-restore-epoch", ObservedState::Running)
+        .await;
+    let persistent = ctx.create_disk("delayed-restore-persistent").await;
+    ctx.http
+        .post(ctx.ws_url("/disks/delayed-restore-persistent/actions/mount"))
+        .bearer_auth("dev-admin-token")
+        .json(&serde_json::json!({
+            "cat_id": "delayed-restore-epoch",
+            "mount_at": "/data"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let suspend = ctx.action("delayed-restore-epoch", "suspend").await;
+    ctx.wait_operation(&suspend.operation.id).await;
+    let warm = ctx.action("delayed-restore-epoch", "warm").await;
+    ctx.wait_operation(&warm.operation.id).await;
+    ctx.wait_observed("delayed-restore-epoch", ObservedState::Warm)
+        .await;
+
+    node.return_acquired_lifecycle_leases();
+    node.hold_next_job_response("restore_cat");
+    let restore = ctx.action("delayed-restore-epoch", "resume").await;
+    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .expect("RestoreCat did not acquire writers before response hold");
+    node.quiesce().await;
+    let (attachment, epoch) = node
+        .started_volume_epochs
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|(volume, _, _)| volume == &persistent.volume_id)
+        .map(|(_, attachment, epoch)| (attachment.clone(), *epoch))
+        .expect("RestoreCat returned no persistent-disk writer epoch");
+
+    let delete: CatOperationResponse = ctx
+        .http
+        .delete(ctx.ws_url("/cats/delayed-restore-epoch"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    ctx.cp.shutdown();
+    let second = spawn(ctx.config.clone()).await.unwrap();
+    second.state.notify.notify_one();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if second
+                .state
+                .store
+                .get_operation(&delete.operation.id)
+                .unwrap()
+                .phase
+                == OperationPhase::Succeeded
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("superseding Delete did not converge");
+    assert_eq!(
+        second
+            .state
+            .store
+            .get_operation(&restore.operation.id)
+            .unwrap()
+            .phase,
+        OperationPhase::Failed
+    );
+    assert!(matches!(
+        second
+            .state
+            .storage_meta
+            .renew_lease(&persistent.volume_id, &attachment, epoch, 60_000),
+        Err(MetaError::Fenced)
+    ));
+    node.job_response_release.notify_waiters();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn markerless_legacy_starting_fails_closed_without_dispatching_start_cat() {
     let ctx = Ctx::new_with_stable_node_lease().await;
     let node = start_stub_node(&ctx.cp, "node_markerless_starting").await;
@@ -2432,6 +2713,84 @@ async fn phase_a_markerless_stopping_replays_exact_stop_after_old_controller_die
     );
     assert_eq!(jobs[0], jobs[1]);
     assert_one_applied_lifecycle_job(&node, "_stop_cat");
+    node.job_response_release.notify_waiters();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase_a_superseded_markerless_stop_replays_old_generation_before_current_start() {
+    let ctx = Ctx::new_with_provenance(Default::default(), 25, 30_000, false).await;
+    let node = start_stub_node(&ctx.cp, "node_phase_a_superseded_stop").await;
+    let created = ctx.create_cat("phase-a-superseded-stop", None).await;
+    ctx.wait_observed("phase-a-superseded-stop", ObservedState::Running)
+        .await;
+
+    node.quiesce().await;
+    node.hold_next_job_response("stop_cat");
+    let stop = ctx.action("phase-a-superseded-stop", "stop").await;
+    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .expect("old phase-A StopCat did not reach delayed success");
+    let restart = ctx.action("phase-a-superseded-stop", "resume").await;
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .must_get_cat_by_id(&created.cat.id)
+            .unwrap()
+            .observed_state,
+        ObservedState::Stopping
+    );
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .get_operation(&stop.operation.id)
+            .unwrap()
+            .phase,
+        OperationPhase::Failed
+    );
+
+    ctx.cp
+        .state
+        .store
+        .set_lifecycle_maintenance_frozen(true)
+        .unwrap();
+    ctx.cp.shutdown();
+    let second = spawn(ctx.config.clone()).await.unwrap();
+    second.state.notify.notify_one();
+    wait_for_persisted_transition(
+        &second,
+        &created.cat.id,
+        &restart.operation.id,
+        ObservedState::Running,
+        OperationPhase::Succeeded,
+    )
+    .await;
+    let jobs = node.job_payloads.lock().unwrap();
+    let old_stop_id = cats_api::nodejob::job_id(
+        &created.cat.id,
+        stop.operation.resource_generation,
+        "stop_cat",
+    );
+    assert_eq!(
+        jobs.iter().filter(|job| job.job_id == old_stop_id).count(),
+        2,
+        "replacement did not replay the superseded old-generation Stop"
+    );
+    assert!(jobs.iter().any(|job| {
+        job.cat_generation == restart.operation.resource_generation
+            && matches!(job.action, NodeJobAction::StartCat { .. })
+    }));
+    drop(jobs);
+    assert_eq!(
+        node.applied_lifecycle_jobs
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|job_id| *job_id == &old_stop_id)
+            .count(),
+        1
+    );
     node.job_response_release.notify_waiters();
 }
 
@@ -3342,6 +3701,136 @@ async fn rwo_second_bind_is_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn topology_claim_committed_before_dispatch_is_completed_by_replacement_tick() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_claim_predispatch_handoff").await;
+    let created = ctx.create_cat("claim-predispatch-handoff", None).await;
+    ctx.wait_observed("claim-predispatch-handoff", ObservedState::Running)
+        .await;
+    let disk = ctx.create_disk("claim-predispatch-disk").await;
+
+    // Remove the handler/controller before committing the claim. The only
+    // remaining trigger is the replacement leader's ordinary reconcile tick.
+    ctx.cp.shutdown();
+    let claim = ctx
+        .cp
+        .state
+        .store
+        .begin_mount_topology_claim(&disk.id, &created.cat.id, "/data")
+        .unwrap();
+    let second = spawn(ctx.config.clone()).await.unwrap();
+    second.state.notify.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if second
+                .state
+                .store
+                .topology_claim(&created.cat.id)
+                .unwrap()
+                .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("replacement tick did not complete the pre-dispatch claim");
+    assert_eq!(
+        second
+            .state
+            .store
+            .get_disk(&created.cat.workspace_id, &disk.id)
+            .unwrap()
+            .bound_cat_id
+            .as_deref(),
+        Some(created.cat.id.as_str())
+    );
+    let expected = format!("topology_{}", claim.claim_id);
+    assert_eq!(
+        node.job_payloads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|job| job.job_id.contains(&expected))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn topology_claim_with_delayed_success_is_replayed_once_by_replacement_tick() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_claim_delayed_handoff").await;
+    let created = ctx.create_cat("claim-delayed-handoff", None).await;
+    ctx.wait_observed("claim-delayed-handoff", ObservedState::Running)
+        .await;
+    let disk = ctx.create_disk("claim-delayed-disk").await;
+    node.hold_next_job_response("attach_disk");
+    let claim = ctx
+        .cp
+        .state
+        .store
+        .begin_mount_topology_claim(&disk.id, &created.cat.id, "/data")
+        .unwrap();
+    let old_driver = {
+        let controller = Arc::clone(&ctx.cp.state.controller);
+        let claim = claim.clone();
+        tokio::spawn(async move { controller.drive_topology_claim(&claim).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .expect("old controller did not reach delayed AttachDisk success");
+    old_driver.abort();
+    ctx.cp.shutdown();
+
+    let second = spawn(ctx.config.clone()).await.unwrap();
+    second.state.notify.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if second
+                .state
+                .store
+                .topology_claim(&created.cat.id)
+                .unwrap()
+                .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("replacement tick did not replay the delayed-success claim");
+    let job_id = cats_api::nodejob::job_id(
+        &created.cat.id,
+        claim.cat_generation,
+        &format!("topology_{}", claim.claim_id),
+    );
+    assert_eq!(
+        node.job_payloads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|job| job.job_id == job_id)
+            .count(),
+        2,
+        "replacement must replay the exact deterministic job"
+    );
+    assert_eq!(
+        node.applied_lifecycle_jobs
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|applied| *applied == &job_id)
+            .count(),
+        1,
+        "node-side external AttachDisk applied more than once"
+    );
+    node.job_response_release.notify_waiters();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn topology_api_never_reports_success_after_lost_fenced_or_replaced_authority() {
     let ctx = Ctx::new_with_provenance(Default::default(), 30_000, 30_000, true).await;
     let node = start_stub_node(&ctx.cp, "node_topology_false_result").await;
@@ -3718,6 +4207,113 @@ async fn mixed_version_freeze_blocks_legacy_sql_and_repairs_both_topology_crash_
             .observed_state,
         ObservedState::Warm
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_ch_repair_accepts_existing_disk_and_rebuilds_a_real_missing_disk() {
+    let ctx = Ctx::new_with_provenance(Default::default(), 25, 30_000, false).await;
+    let node = start_stub_node(&ctx.cp, "node_legacy_ch_inventory").await;
+    node.use_ch_inventory();
+    let created = ctx.create_cat("legacy-ch-inventory", None).await;
+    ctx.wait_observed("legacy-ch-inventory", ObservedState::Running)
+        .await;
+    let existing = ctx.create_disk("legacy-ch-existing").await;
+    let missing = ctx.create_disk("legacy-ch-missing").await;
+    ctx.cp
+        .state
+        .store
+        .bind_disk(&existing.id, &created.cat.id, "/existing")
+        .unwrap();
+    ctx.cp
+        .state
+        .store
+        .bind_disk(&missing.id, &created.cat.id, "/missing")
+        .unwrap();
+    // Model the first legacy binding having reached Host inventory while the
+    // second crashed after its DB commit.
+    node.runtime_volumes
+        .lock()
+        .unwrap()
+        .entry(created.cat.id.clone())
+        .or_default()
+        .push(VolumeGrant {
+            disk_id: existing.id.clone(),
+            volume_id: existing.volume_id.clone(),
+            attachment_id: format!(
+                "att_{}_{}_{}",
+                created.cat.id, existing.id, created.cat.generation
+            ),
+            epoch: 0,
+            size_bytes: cats_api::chunk::round_up_to_chunk(existing.size_bytes),
+            mount_path: "/existing".into(),
+            durability: existing.durability,
+        });
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("start_cat".into(), 1);
+
+    ctx.cp
+        .state
+        .store
+        .set_lifecycle_maintenance_frozen(true)
+        .unwrap();
+    ctx.cp
+        .state
+        .store
+        .confirm_legacy_topology_handlers_drained()
+        .unwrap();
+    ctx.cp.state.notify.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if ctx
+                .cp
+                .state
+                .store
+                .activate_lifecycle_provenance_writes()
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("CH missing-disk rebuild never completed");
+
+    let jobs = node.job_payloads.lock().unwrap();
+    assert!(jobs.iter().any(|job| {
+        job.job_id.contains("rebuild_stop") && matches!(job.action, NodeJobAction::StopCat { .. })
+    }));
+    let rebuilt = jobs
+        .iter()
+        .find(|job| job.job_id.contains("rebuild_start"))
+        .expect("missing supported CH rebuild StartCat");
+    let NodeJobAction::StartCat { volumes, .. } = &rebuilt.action else {
+        panic!("rebuild job was not StartCat")
+    };
+    let disk_ids = volumes
+        .iter()
+        .map(|volume| volume.disk_id.as_str())
+        .collect::<HashSet<_>>();
+    assert!(disk_ids.contains(existing.id.as_str()));
+    assert!(disk_ids.contains(missing.id.as_str()));
+    assert_eq!(
+        jobs.iter()
+            .filter(|job| job.job_id.contains("rebuild_start"))
+            .count(),
+        2,
+        "a failed rebuild Start must replay the same supported recovery"
+    );
+    drop(jobs);
+    let cat = ctx
+        .cp
+        .state
+        .store
+        .must_get_cat_by_id(&created.cat.id)
+        .unwrap();
+    assert_eq!(cat.observed_state, ObservedState::Running);
+    assert_eq!(cat.node_id.as_deref(), Some(node.id.as_str()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

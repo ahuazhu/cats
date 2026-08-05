@@ -1,6 +1,7 @@
 use super::*;
 
 use cats_api::nodejob::job_id;
+use cats_api::nodejob::NodeJobErrorCode;
 
 use ledger::CatLedgerRecord;
 
@@ -139,6 +140,51 @@ fn forced_blockd_drain_allows_remote_tail_beyond_status_probe_deadline() {
     BlockdProc::drain_at(&socket, "disk-a").unwrap();
     assert!(started.elapsed() > BLOCKD_STATUS_TIMEOUT);
     responder.join().unwrap();
+}
+
+#[test]
+fn cloud_hypervisor_attach_distinguishes_existing_inventory_from_a_real_missing_disk() {
+    let env = real_cat_env("node-ch-inventory");
+    let cat_id = "cat-ch-inventory";
+    env.run(start_job(cat_id, 1, &[("root", "/"), ("data", "/data")]));
+    // Keep the real blockd/Guest stand-ins from the runtime harness, but mark
+    // this runtime as CH for the hotplug decision under test.
+    env.runtime.cats.lock().unwrap().get_mut(cat_id).unwrap().ch = Some(ChRuntime::default());
+
+    let existing = env.runtime.execute(NodeJob {
+        job_id: job_id(cat_id, 1, "probe_existing_data"),
+        cat_generation: 1,
+        action: NodeJobAction::AttachDisk {
+            cat_id: cat_id.to_string(),
+            volume: grant(cat_id, "data", "/data"),
+        },
+    });
+    assert_eq!(existing.phase, JobPhase::Succeeded, "{existing:?}");
+
+    let missing = env.runtime.execute(NodeJob {
+        job_id: job_id(cat_id, 1, "probe_missing_data"),
+        cat_generation: 1,
+        action: NodeJobAction::AttachDisk {
+            cat_id: cat_id.to_string(),
+            volume: grant(cat_id, "missing", "/missing"),
+        },
+    });
+    assert_eq!(missing.phase, JobPhase::Failed);
+    assert_eq!(
+        missing.error_code,
+        Some(NodeJobErrorCode::HotAttachUnsupported)
+    );
+
+    // Restore the harness's FakeVmm teardown path so no real child survives.
+    env.runtime.cats.lock().unwrap().get_mut(cat_id).unwrap().ch = None;
+    env.run(NodeJob {
+        job_id: job_id(cat_id, 2, "stop_cat"),
+        cat_generation: 2,
+        action: NodeJobAction::StopCat {
+            cat_id: cat_id.to_string(),
+            disposition: StopCatDisposition::Cold,
+        },
+    });
 }
 
 impl UsageFinalizer for RecordingUsageFinalizer {

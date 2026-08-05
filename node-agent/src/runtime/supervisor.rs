@@ -1,6 +1,8 @@
 use super::*;
 use std::collections::HashSet;
 
+use cats_api::nodejob::{NodeJobErrorCode, VolumeLeaseAuthority};
+
 pub(super) enum TeardownMode {
     /// Ordinary transition to Cold: every attached disk is preserved.
     Cold,
@@ -127,7 +129,28 @@ impl NodeRuntime {
                 match lifecycle_boundary
                     .and_then(|()| self.set_runtime_generation(&cat_id, job.cat_generation))
                 {
-                    Ok(()) => NodeJobResult::ok(&job_id, observed),
+                    Ok(()) => {
+                        let mut result = NodeJobResult::ok(&job_id, observed);
+                        if matches!(
+                            &job.action,
+                            NodeJobAction::StartCat { .. } | NodeJobAction::RestoreCat { .. }
+                        ) {
+                            match self.current_volume_leases(&cat_id) {
+                                Ok(volume_leases) => result.volume_leases = volume_leases,
+                                Err(error) => {
+                                    result = NodeJobResult::fail(
+                                        &job_id,
+                                        self.observed_of(&cat_id),
+                                        format!(
+                                            "started runtime could not prove its writer epochs: {error:#}"
+                                        ),
+                                        true,
+                                    );
+                                }
+                            }
+                        }
+                        result
+                    }
                     Err(error) => {
                         tracing::error!(
                             job = %job_id,
@@ -163,6 +186,14 @@ impl NodeRuntime {
                     } else {
                         NodeJobResult::rejected(&job_id, observed, format!("{e:#}"))
                     }
+                } else if e.downcast_ref::<HotAttachUnsupported>().is_some() {
+                    NodeJobResult::fail_with_code(
+                        &job_id,
+                        observed,
+                        NodeJobErrorCode::HotAttachUnsupported,
+                        format!("{e:#}"),
+                        true,
+                    )
                 } else {
                     NodeJobResult::fail(&job_id, observed, format!("{e:#}"), true)
                 }
@@ -200,6 +231,48 @@ impl NodeRuntime {
             .get(cat_id)
             .map(|rt| rt.state)
             .unwrap_or(ObservedState::Cold)
+    }
+
+    /// Read exact epochs from the blockd processes that performed this action.
+    /// The configured grant proves the expected identity; the status response
+    /// proves the epoch acquired inside blockd rather than guessing it from a
+    /// later metadata read.
+    fn current_volume_leases(&self, cat_id: &str) -> Result<Vec<VolumeLeaseAuthority>> {
+        let processes = {
+            let cats = self.cats.lock().unwrap();
+            let runtime = cats.get(cat_id).context("started cat runtime is missing")?;
+            runtime
+                .blockds
+                .values()
+                .map(|proc| {
+                    (
+                        proc.control_socket.clone(),
+                        proc.grant.disk_id.clone(),
+                        proc.grant.volume_id.clone(),
+                        proc.grant.attachment_id.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut leases = Vec::with_capacity(processes.len());
+        for (control_socket, disk_id, volume_id, attachment_id) in processes {
+            let status = BlockdProc::status_at(&control_socket, &disk_id)?;
+            anyhow::ensure!(
+                status.volume_id == volume_id && status.attachment_id == attachment_id,
+                "blockd {disk_id} reported a different writer identity"
+            );
+            anyhow::ensure!(
+                status.lease_epoch > 0,
+                "blockd {disk_id} did not report a proven lease epoch"
+            );
+            leases.push(VolumeLeaseAuthority {
+                volume_id,
+                attachment_id,
+                epoch: status.lease_epoch,
+            });
+        }
+        leases.sort_by(|left, right| left.volume_id.cmp(&right.volume_id));
+        Ok(leases)
     }
 
     // ------------------------------------------------------------------

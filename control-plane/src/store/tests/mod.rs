@@ -2016,7 +2016,15 @@ fn maintenance_trigger_allows_only_exact_pre_freeze_topology_claim_settlement() 
         .begin_mount_topology_claim(&disk.id, &cat.id, "/data")
         .unwrap();
     store.set_lifecycle_maintenance_frozen(true).unwrap();
+    store.confirm_legacy_topology_handlers_drained().unwrap();
+    assert!(store.legacy_topology_claims_pending().unwrap());
+    assert!(store
+        .legacy_topology_reconciliation_epoch()
+        .unwrap()
+        .is_some());
+    assert!(store.activate_lifecycle_provenance_writes().is_err());
     assert!(store.rollback_topology_claim(&mount).unwrap());
+    assert!(!store.legacy_topology_claims_pending().unwrap());
     assert!(store
         .get_disk(&workspace.id, &disk.id)
         .unwrap()

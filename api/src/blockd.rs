@@ -166,6 +166,10 @@ pub struct DurabilityStatus {
     /// same "identity unproven, do not adopt" meaning as [`Self::volume_id`].
     #[serde(default)]
     pub attachment_id: String,
+    /// Fencing epoch acquired by this exact blockd process. Zero means an old
+    /// status payload that cannot prove writer authority.
+    #[serde(default)]
+    pub lease_epoch: i64,
     pub mode: String,
     pub local_durable_generation: i64,
     pub remote_durable_generation: i64,
@@ -218,6 +222,7 @@ mod tests {
         let status = DurabilityStatus {
             volume_id: "vol_x".to_string(),
             attachment_id: "att_x".to_string(),
+            lease_epoch: 9,
             mode: "relaxed".to_string(),
             local_durable_generation: 7,
             remote_durable_generation: 5,
@@ -236,7 +241,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&status).unwrap(),
-            "{\"volume_id\":\"vol_x\",\"attachment_id\":\"att_x\",\"mode\":\"relaxed\",\"local_durable_generation\":7,\"remote_durable_generation\":5,\"unpublished_generations\":2,\"unpublished_bytes\":65536,\"oldest_unpublished_age_ms\":250,\"max_unpublished_generations\":4096,\"max_unpublished_bytes\":8589934592,\"local_allocated_bytes\":131072,\"local_accounted_bytes\":196608,\"max_local_bytes\":17179869184,\"evicted_cache_chunks\":3,\"backpressured\":false,\"fenced\":false,\"last_publish_error\":\"timeout\"}"
+            "{\"volume_id\":\"vol_x\",\"attachment_id\":\"att_x\",\"lease_epoch\":9,\"mode\":\"relaxed\",\"local_durable_generation\":7,\"remote_durable_generation\":5,\"unpublished_generations\":2,\"unpublished_bytes\":65536,\"oldest_unpublished_age_ms\":250,\"max_unpublished_generations\":4096,\"max_unpublished_bytes\":8589934592,\"local_allocated_bytes\":131072,\"local_accounted_bytes\":196608,\"max_local_bytes\":17179869184,\"evicted_cache_chunks\":3,\"backpressured\":false,\"fenced\":false,\"last_publish_error\":\"timeout\"}"
         );
         assert_eq!(
             serde_json::from_str::<DurabilityStatus>(&serde_json::to_string(&status).unwrap())
@@ -253,6 +258,7 @@ mod tests {
         // what the node agent must read as "not adoptable".
         assert_eq!(status.volume_id, "");
         assert_eq!(status.attachment_id, "");
+        assert_eq!(status.lease_epoch, 0);
         // Every pre-existing field keeps its value and meaning.
         assert_eq!(status.mode, "relaxed");
         assert_eq!(status.local_durable_generation, 7);

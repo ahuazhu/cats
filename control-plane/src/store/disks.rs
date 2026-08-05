@@ -1,16 +1,11 @@
 use super::*;
 
+pub use cats_api::nodejob::VolumeLeaseAuthority;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiskChangeMode {
     HotRunning,
     OfflineCold,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct VolumeLeaseAuthority {
-    pub volume_id: String,
-    pub attachment_id: String,
-    pub epoch: i64,
 }
 
 /// Durable ownership of one topology transition. The provisional binding is

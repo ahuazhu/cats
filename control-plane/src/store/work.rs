@@ -775,7 +775,9 @@ impl Store {
     }
 
     /// Cats whose desired/observed disagree, plus converged Cats whose current
-    /// generation still has an unfinished operation after a leader crash.
+    /// generation still has an unfinished operation after a leader crash, and
+    /// Cats carrying a durable topology claim whose original request waiter
+    /// may have disappeared.
     pub fn cats_needing_work(&self) -> Result<Vec<Cat>> {
         self.with(|client| {
             client
@@ -790,6 +792,10 @@ impl Store {
                     -- that state commits; keep selecting the Cat until the
                     -- final row deletion proves cleanup completed.
                     OR (c.desired_state='deleted')
+                    -- A topology claim is itself level-triggered work.  The
+                    -- API handler is only an eager waiter; cancellation or a
+                    -- leader handoff must not strand the provisional binding.
+                    OR (c.topology_claim_json IS NOT NULL)
                     OR (
                         c.desired_state IN ('running','suspended','warm','cold')
                         AND c.desired_state=c.observed_state
