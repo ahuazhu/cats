@@ -1133,22 +1133,18 @@ impl BlobStore for ThreadRecordingBlob {
 }
 
 /// A slow remote store must stay wholly behind the named publisher while a
-/// burst stages packs under the production-default admission caps. This
-/// records the actual remote-call owner instead of inferring it from FLUSH
-/// latency, which also measured how quickly a shared CI runner scheduled us.
+/// burst stages packs under the production-default admission caps. A
+/// controlled PUT holds the publisher active while another Guest FLUSH must
+/// finish, proving causal independence without a wall-clock performance cap.
 #[test]
 fn a_slow_store_burst_publishes_only_on_the_background_committer() {
     let dir = tempfile::tempdir().unwrap();
+    let put_gate = Arc::new(PutGate::default());
     let blob = Arc::new(ThreadRecordingBlob {
-        inner: Arc::new(
-            SlowBlob::new(Arc::new(
-                FileBlobStore::open(dir.path().join("blob")).unwrap(),
-            ))
-            .with_put_delay(Duration::from_millis(25)),
-        ),
+        inner: Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap()),
         put_calls: Mutex::new(Vec::new()),
         calls_changed: Condvar::new(),
-        put_gate: None,
+        put_gate: Some(Arc::clone(&put_gate)),
     });
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
     meta.create_volume(VOL, SIZE).unwrap();
@@ -1166,14 +1162,55 @@ fn a_slow_store_burst_publishes_only_on_the_background_committer() {
     );
     let e = ChunkEngine::attach(cfg, blob.clone(), meta).unwrap();
 
-    for i in 0..24u32 {
-        e.write((i as u64 % 8) * CHUNK_SIZE as u64, &pattern(4096, i as u8))
-            .unwrap();
-        e.flush().unwrap();
-    }
+    std::thread::scope(|scope| {
+        // If any assertion below unwinds, release the remote call before the
+        // scope joins its FLUSH worker and before ChunkEngine joins committer.
+        let _release = put_gate.release_on_drop();
 
-    // Calibrate the recorder on the named committer, not merely its upload
-    // workers. A publisher=false call fails immediately while we wait.
+        // Crossing the eager watermark starts a real publish under the
+        // production-default admission caps.
+        for i in 0..3u32 {
+            e.write(i as u64 * CHUNK_SIZE as u64, &pattern(4096, i as u8))
+                .unwrap();
+            assert_eq!(e.flush().unwrap(), i as i64 + 1);
+        }
+        put_gate.wait_until_entered().unwrap();
+        let calls = blob.put_calls.lock().unwrap().clone();
+        assert!(
+            !calls.is_empty() && calls.iter().all(|(_, publisher)| *publisher),
+            "the controlled active PUT must belong to the publisher: {calls:?}"
+        );
+
+        e.write(3 * CHUNK_SIZE as u64, &pattern(4096, 3)).unwrap();
+        let flush_engine = Arc::clone(&e);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let flush_worker = scope.spawn(move || {
+            let _ = result_tx.send(flush_engine.flush());
+        });
+
+        // This is a structural liveness guard, not a latency requirement: the
+        // publisher remains blocked until after the result is received. A
+        // FLUSH that synchronously waits for it cannot satisfy this ordering.
+        let generation = result_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("Relaxed FLUSH waited for the active background publisher")
+            .unwrap();
+        assert_eq!(generation, 4);
+
+        // Keep forming the original burst while the publisher is still held.
+        // It remains far below both production-default caps.
+        for i in 4..24u32 {
+            e.write((i as u64 % 8) * CHUNK_SIZE as u64, &pattern(4096, i as u8))
+                .unwrap();
+            assert_eq!(e.flush().unwrap(), i as i64 + 1);
+        }
+
+        put_gate.release();
+        flush_worker.join().unwrap();
+    });
+
+    // After releasing the upload workers, calibrate the full publish path on
+    // its named committer. A publisher=false call fails immediately.
     blob.wait_for_named_background_put().unwrap();
     e.detach().unwrap();
 }
