@@ -2,15 +2,19 @@
 
 `temp-node-faults.sh` is the executable companion to
 `temp-node-qualification-runbook.md`. It does not provision, drain, fence,
-withdraw, or terminate a Node. It only isolates one dependency from one exact
-temporary instance after the runbook's admission and ownership gates have
-passed.
+withdraw, or terminate a Node. It only isolates one dependency or one explicit
+simultaneous dependency combination from one exact temporary instance after the
+runbook's admission and ownership gates have passed.
 
 The default is `dry-run`, and the default scenario is only `db`. `all` is
-accepted only with `CATS_FAULT_ALLOW_ALL=true`; even then, DB, S3, and control
-plane run serially. The next SSM command is not submitted unless the previous
-scenario produced both `functional_rc=0` and `cleanup_rc=0`, its rules are
-absent, its original probes recover, and its q124 workload converges.
+accepted only with `CATS_FAULT_ALLOW_ALL=true`; it deliberately means the three
+single faults run serially. True simultaneous combinations are `db-s3`,
+`db-control-plane`, `s3-control-plane`, and `all-3`, and require the separate
+`CATS_FAULT_ALLOW_COMBINED=true` gate. `matrix` requires both gates and runs the
+three singles, three pairs, and all-three scenario serially at the SSM-command
+level. The next command is not submitted unless the previous scenario produced
+both `functional_rc=0` and `cleanup_rc=0`, its rules are absent, its original
+probes recover, and its q124 workload converges.
 
 ## Inputs and safety gates
 
@@ -68,7 +72,8 @@ The temporary Host must already contain:
   top-level keys must be exactly `schema_version`, `db_host`, `db_port`,
   `s3_host`, `s3_port`, `control_plane_host`, `control_plane_port`,
   `node_listen_ip`, `node_listen_port`, `fault_duration_seconds`, and
-  `control_plane_lease_timeout_seconds`. No extra or secret field is accepted;
+  `control_plane_lease_timeout_seconds`. Both durations must be integer seconds
+  from 5 through 300. No extra or secret field is accepted;
 - `/usr/local/libexec/cats/q124-fault-workload`, root-owned, mode 0700 or 0750.
 
 Provisioning records both SHA-256 values in the manifest. Before any snapshot or
@@ -89,6 +94,13 @@ state    --scenario S --phase before|during|after --workspace-id W --node-id N -
 exercise --scenario S --phase isolated|recovered --workspace-id W --node-id N --output F
 assert   --scenario S --before F --during F --after F
 ```
+
+For a simultaneous scenario, `probe` also receives `--dependency D`.
+`exercise --phase isolated` receives the exact comma-separated
+`--dependencies`; each `exercise --phase partial-recovery` receives one
+`--restored-dependency` and the exact comma-separated
+`--remaining-dependencies`; the final recovered call receives the exact
+`--recovery-order`. The hook must reject unknown or reordered dependency names.
 
 The same root-only executable must also implement the HA adapter contract:
 `get NODE`, `cats NODE`, `cordon NODE`, and `uncordon NODE`. `get`, `cordon`, and
@@ -126,6 +138,17 @@ following boolean evidence:
   admin fence and no generation/epoch replacement. Recovery must prove the same
   Node identity, complete inventory, placement, generation, disk epoch, and
   digest.
+
+Combination oracles must prove the relevant single-dependency false-success
+properties in one shared isolation window. Every pair/all-three isolated oracle
+also proves `simultaneous_window_confirmed`; combinations containing the
+control plane prove Lost without implicit/admin fence or generation/epoch
+replacement. Partial-recovery oracles prove the restored dependency is
+positive while every remaining dependency is still negative, with no false
+success and unchanged digest/generation/disk epoch. The final oracle proves the
+exact recovery order and the union of dependency reconnection, S3 convergence,
+same control-plane identity, and final digest invariants relevant to that
+combination.
 
 `assert` then checks the full before/during/after relationship as a second
 oracle.
@@ -183,6 +206,24 @@ Each fault has two independent rollback paths:
    30 seconds (lease timeout plus 35 seconds for the control plane), with
    automatic cleanup retry. The timer must be active before the first rule.
 
+In a simultaneous scenario every dependency has its own unique IPv4/IPv6
+chains and comment, its own cleanup ledger/script, and its own active transient
+timer. Address/port targets may not overlap, because an overlap would make
+per-dependency counters ambiguous. All dependencies are positively calibrated,
+then all independent faults are installed; only after all TCP and real-read
+probes are negative does the helper record `isolated-verified`. For combinations
+that include the control plane, every watchdog TTL covers at least the lease
+timeout plus the safety margin so an earlier DB/S3 timer cannot collapse the
+simultaneous window.
+
+Recovery order is fixed and evidence-checked: DB then S3 for `db-s3`; control
+plane then DB for `db-control-plane`; control plane then S3 for
+`s3-control-plane`; control plane, DB, then S3 for `all-3`. After each exact
+cleanup, the restored dependency must become positive while all remaining
+dependencies stay negative. The helper records exact injection/recovery order,
+per-dependency chain/timer/TTL provenance, every partial-recovery oracle, and a
+positive workload counter delta for every isolated dependency.
+
 After negative probes, the helper records a counter baseline. The controlled
 workload must produce a positive counter delta, proving it traversed the actual
 isolated dependency. Cleanup accumulates every xtables and save failure in a
@@ -199,15 +240,25 @@ Evidence is written under
 `test-results/qualification-20260805/raw/temp-node-faults/<run-id>/`, including
 the local ownership snapshot, exact instance identity, SSM command ID, state
 snapshots, timeline, counters, and separate `functional_rc`/`cleanup_rc`.
+Remote evidence files are individually gzip-compressed before base64 transport
+and decoded before validation. Before emitting anything, the helper calculates
+the complete encoded response size and fails closed if it would exceed the
+conservative 22,000-byte SSM standard-output budget; the all-three Linux mock
+also asserts this bound. This avoids silently validating truncated evidence
+without weakening per-file schemas.
 EC2 evidence is projected to an explicit allowlist. SSM output is scanned
-quietly before persistence and replaced with a rejection marker if it resembles
-credentials, cookies, signed headers, access keys, private keys, credentialed
-URLs, or JWTs. All JSON evidence rejects unknown fields.
+quietly before persistence. The Host scans every decoded evidence file and
+emits no evidence at all if one resembles credentials, cookies, signed headers,
+access keys, private keys, credentialed URLs, or JWTs; the caller independently
+scans residual stdout/stderr and replaces it with a rejection marker on a hit.
+All JSON evidence rejects unknown fields.
 
-`CATS_FAULT_SCENARIO=all` is deliberately only the serial three-single-fault
-gate; it is not evidence for simultaneous dependency failure. R10 simultaneous
-pair/all-three isolation requires separate per-dependency chains, timers and
-recovery ordering and is tracked separately until that implementation lands.
+`CATS_FAULT_SCENARIO=all` remains only the serial three-single-fault gate and is
+not evidence for simultaneous dependency failure. Use one of the four explicit
+combination names, or `matrix`, for simultaneous evidence. Combination results
+must include `combination-provenance.json`, `combination-order.tsv`, and
+`recovery-steps.json`; the validator rejects missing, duplicate, reordered, or
+extra dependencies/events.
 
 ## Local validation
 
@@ -227,16 +278,29 @@ NODE_ID=q124-20260805000000-abcdef \
 CATS_OWNERSHIP_SNAPSHOT=test-results/qualification-20260805/temp-node-faults.fixture.json \
 CATS_PROVISIONING_MANIFEST=test-results/qualification-20260805/temp-node-faults.provisioning.fixture.json \
 ./test-results/qualification-20260805/temp-node-faults.sh
+
+CATS_FAULT_MODE=fixture CATS_FAULT_SCENARIO=matrix \
+CATS_FAULT_ALLOW_ALL=true CATS_FAULT_ALLOW_COMBINED=true \
+TEMP_INSTANCE_ID=i-0123456789abcdef0 \
+NODE_ID=q124-20260805000000-abcdef \
+CATS_OWNERSHIP_SNAPSHOT=test-results/qualification-20260805/temp-node-faults.fixture.json \
+CATS_PROVISIONING_MANIFEST=test-results/qualification-20260805/temp-node-faults.provisioning.fixture.json \
+./test-results/qualification-20260805/temp-node-faults.sh
 ```
 
-Fixture mode exercises the serial orchestration and evidence validators without
+Fixture mode exercises the serial and combination evidence validators without
 claiming that packet filtering or production behavior was tested.
 
 The Linux mock additionally executes the embedded remote helper and its cleanup
 script against mock xtables/systemd adapters. It covers successful isolation,
 partial chain creation, xtables-save failure and error ledger, TERM cleanup,
 KILL/SSM interruption with watchdog retry, routable IPv6 with an empty AAAA
-set, duplicate RUN_ID, and a secret extra JSON field:
+set, duplicate RUN_ID, a secret extra JSON field, all three simultaneous pairs,
+and the simultaneous all-three case. Combination-specific negative cases cover
+partial creation, cleanup-ledger preservation, and SIGKILL/SSM loss with all
+independent watchdogs. A transport-budget case proves oversized but otherwise
+valid evidence fails closed before emission. The 16 cases verify distinct
+chains/timers, exact partial recovery, counters, and final cleanup:
 
 ```sh
 docker run --rm -v "$PWD:/work:ro" -w /work ubuntu:24.04 \
