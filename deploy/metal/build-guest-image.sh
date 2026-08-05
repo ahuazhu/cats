@@ -17,6 +17,12 @@
 # target rustup. Run on Ubuntu/Debian x86_64 as root.
 set -euo pipefail
 
+# The caller may be an operator shell or an automation runner with umask 077.
+# This image contains no Host credentials, and ordinary Guest system files must
+# not inherit caller-specific modes. Files needing tighter permissions set them
+# explicitly below.
+umask 022
+
 OUT=${OUT:-/opt/cats/guest}
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 KVER=${KVER:-$(uname -r)}
@@ -319,6 +325,7 @@ rm -f \
 rm -f "$RF/etc/resolv.conf"
 printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:1 attempts:3\n' \
   > "$RF/etc/resolv.conf"
+chmod 0644 "$RF/etc/resolv.conf"
 
 # Keep generic Ubuntu background work off the Cold-to-Agent critical path.
 # cloud-init/snapd/LXD are not installed by minbase; explicitly mask the
