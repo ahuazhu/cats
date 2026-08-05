@@ -32,18 +32,55 @@ variable "worker_bundle_sha256" {
   }
 }
 
-variable "instance_id" {
-  description = "Existing Cats bare-metal EC2 instance managed by the SSM association."
-  type        = string
+variable "instances" {
+  description = <<-EOT
+    Existing Cats bare-metal EC2 instances keyed by a stable worker name such
+    as "metal-1". The key names the worker's deployment association and is
+    what deploy_instances selects during a rolling release.
+  EOT
+  type        = map(string)
 
   validation {
-    condition     = can(regex("^i-[0-9a-f]+$", var.instance_id))
-    error_message = "instance_id must be an EC2 instance ID."
+    condition     = length(var.instances) > 0
+    error_message = "instances must contain at least one worker."
+  }
+
+  validation {
+    condition     = alltrue([for name, id in var.instances : can(regex("^i-[0-9a-f]+$", id))])
+    error_message = "instances values must be EC2 instance IDs."
+  }
+
+  validation {
+    condition     = alltrue([for name, id in var.instances : can(regex("^[a-z0-9][a-z0-9-]{0,62}$", name))])
+    error_message = "instances keys must be short lowercase names usable in an SSM association name."
+  }
+}
+
+variable "deploy_instances" {
+  description = <<-EOT
+    Worker names whose deployment association exists this apply; null means
+    every instance. Deploying re-runs the association, and require-idle-worker
+    only lets that run on a drained host, so a release across a serving fleet
+    goes one worker at a time: drain one, list only it here, apply, undrain,
+    repeat. A worker left out keeps running its installed version -- its
+    association is removed, not its software.
+  EOT
+  type        = set(string)
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = (
+      var.deploy_instances == null
+      ? true
+      : length(setsubtract(var.deploy_instances, toset(keys(var.instances)))) == 0
+    )
+    error_message = "deploy_instances must be a subset of the keys of instances."
   }
 }
 
 variable "instance_role_name" {
-  description = "Existing IAM role attached to the bare-metal instance profile."
+  description = "Existing IAM role shared by every bare-metal worker's instance profile."
   type        = string
 }
 

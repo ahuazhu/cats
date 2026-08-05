@@ -17,7 +17,7 @@ locals {
   metal_worker_enabled = (
     var.metal_worker_enabled != null
     ? var.metal_worker_enabled
-    : var.metal_worker_instance_id != ""
+    : length(var.metal_worker_instances) > 0
   )
 }
 
@@ -29,15 +29,23 @@ resource "terraform_data" "metal_worker_inputs" {
   lifecycle {
     precondition {
       condition = alltrue([
-        var.metal_worker_instance_id != "",
+        length(var.metal_worker_instances) > 0,
         var.metal_worker_instance_role_name != "",
         var.worker_bundle_path != "",
         var.worker_bundle_sha256 != "",
         length(var.worker_runtime_secret_data) > 0,
       ])
-      error_message = "The metal worker release path needs instance id, instance role, bundle path, bundle sha256 and runtime secret data. Leave metal_worker_instance_id empty to skip it until the hardware exists."
+      error_message = "The metal worker release path needs worker instances, instance role, bundle path, bundle sha256 and runtime secret data. Leave metal_worker_instances empty to skip it until the hardware exists."
     }
   }
+}
+
+# The single-worker deployment used one unkeyed association. Terraform must
+# see the fleet-keyed address as the same resource: a destroy-and-recreate
+# would re-run the deployment on a worker that may not be drained.
+moved {
+  from = module.metal_worker_deployment[0].aws_ssm_association.worker_deploy
+  to   = module.metal_worker_deployment[0].aws_ssm_association.worker_deploy["metal-1"]
 }
 
 module "metal_worker_deployment" {
@@ -50,7 +58,8 @@ module "metal_worker_deployment" {
   artifact_bucket_name       = var.worker_artifact_bucket_name
   worker_bundle_path         = var.worker_bundle_path
   worker_bundle_sha256       = var.worker_bundle_sha256
-  instance_id                = var.metal_worker_instance_id
+  instances                  = var.metal_worker_instances
+  deploy_instances           = var.metal_worker_deploy_instances
   instance_role_name         = var.metal_worker_instance_role_name
   worker_runtime_secret_data = var.worker_runtime_secret_data
   worker_base_environment    = var.worker_base_environment

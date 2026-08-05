@@ -15,8 +15,14 @@ alarm_sns_topic_arns = []
 worker_artifact_bucket_name    = "REPLACE_WITH_GLOBALLY_UNIQUE_CATS_WORKER_ARTIFACT_BUCKET"
 worker_bundle_path             = "/absolute/path/to/dist/worker/cats-worker.tar.zst"
 worker_bundle_sha256           = "REPLACE_WITH_64_HEX_CHARACTERS"
-metal_worker_instance_id       = "i-REPLACE"
+metal_worker_instances = {
+  "metal-1" = "i-REPLACE"
+}
 metal_worker_instance_role_name = "REPLACE_WITH_INSTANCE_ROLE_NAME"
+
+# Rolling release across a serving fleet: drain one worker, apply with only it
+# listed here, undrain, then move to the next. Omit to deploy every worker.
+# metal_worker_deploy_instances = ["metal-1"]
 
 # Supply worker_runtime_secret_data through TF_VAR_worker_runtime_secret_data
 # or the approved CI secret store; do not put it in this file.

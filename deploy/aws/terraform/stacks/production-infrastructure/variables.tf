@@ -59,10 +59,10 @@ variable "worker_artifact_bucket_name" {
 # schedule. The control plane needs Kinesis, the archive and the checkpoint
 # table before it can serve anything; the worker release path needs a
 # bare-metal instance that may not exist yet -- new accounts start well below
-# the vCPU quota one requires. Leaving metal_worker_instance_id empty skips the
+# the vCPU quota one requires. Leaving metal_worker_instances empty skips the
 # worker module so the usage side can go up first, then fills it in later.
 variable "metal_worker_enabled" {
-  description = "Manage the bare-metal worker release path. Defaults to whether metal_worker_instance_id is set."
+  description = "Manage the bare-metal worker release path. Defaults to whether metal_worker_instances is set."
   type        = bool
   default     = null
 }
@@ -79,14 +79,21 @@ variable "worker_bundle_sha256" {
   default     = ""
 }
 
-variable "metal_worker_instance_id" {
-  description = "Existing production bare-metal worker EC2 instance."
-  type        = string
-  default     = ""
+variable "metal_worker_instances" {
+  description = "Existing production bare-metal worker EC2 instances, keyed by a stable worker name such as \"metal-1\"."
+  type        = map(string)
+  default     = {}
+}
+
+variable "metal_worker_deploy_instances" {
+  description = "Worker names to (re)deploy this apply; null deploys every worker. Roll a release across a serving fleet one drained worker at a time."
+  type        = set(string)
+  default     = null
+  nullable    = true
 }
 
 variable "metal_worker_instance_role_name" {
-  description = "Existing IAM role attached to the production bare-metal worker."
+  description = "Existing IAM role shared by every production bare-metal worker."
   type        = string
   default     = ""
 }

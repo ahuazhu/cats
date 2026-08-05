@@ -38,8 +38,8 @@ output "worker_bundle_key" {
   value = one(module.metal_worker_deployment[*].worker_bundle_key)
 }
 
-output "worker_deployment_association_id" {
-  value = one(module.metal_worker_deployment[*].association_id)
+output "worker_deployment_association_ids" {
+  value = one(module.metal_worker_deployment[*].association_ids)
 }
 
 output "worker_runtime_secret_arn" {
