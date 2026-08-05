@@ -162,9 +162,11 @@ variable "worker_managed_environment" {
         "CATS_POSTGRES_URL",
         "CATS_POSTGRES_SECRET_ARN",
         "CATS_METERING_CGROUP_ROOT",
+        "CATS_NODE_ID",
+        "CATS_NODE_ADVERTISE_URL",
       ]),
     )) == 0
-    error_message = "Secrets go through worker_runtime_secret_data; CATS_POSTGRES_SECRET_ARN goes through database_master_user_secret_arn so the matching IAM statement is emitted with it; CATS_METERING_CGROUP_ROOT is discovered on the host."
+    error_message = "Secrets go through worker_runtime_secret_data; CATS_POSTGRES_SECRET_ARN goes through database_master_user_secret_arn so the matching IAM statement is emitted with it; CATS_METERING_CGROUP_ROOT is discovered on the host; node identity is per worker and this map is rewritten fleet-wide on every deployment."
   }
 
   validation {
@@ -205,12 +207,13 @@ variable "tags" {
 
 variable "worker_base_environment" {
   description = <<-EOT
-    Non-secret worker.env entries used only when the host has no worker.env
-    yet -- node identity, control plane and gateway URLs, region, ChunkStore
+    Non-secret, fleet-shared worker.env entries used only when the host has no
+    worker.env yet -- control plane and gateway URLs, region, ChunkStore
     bucket, guest network CIDR. An existing file is never rewritten, so
     operator edits survive. Secrets belong in worker_runtime_secret_data;
-    CATS_METERING_CGROUP_ROOT is discovered on the host and must not be set
-    here.
+    CATS_METERING_CGROUP_ROOT is discovered on the host; node identity
+    (CATS_NODE_ID, CATS_NODE_ADVERTISE_URL) is derived per worker at seed time
+    and must not be set here.
   EOT
   type        = map(string)
   default     = {}
@@ -226,5 +229,15 @@ variable "worker_base_environment" {
       toset(["CATS_AUTH_TOKEN", "CATS_POSTGRES_URL"]),
     )) == 0
     error_message = "Secrets must go through worker_runtime_secret_data, not worker_base_environment."
+  }
+
+  # Everything in this map reaches every fresh host identically, and a second
+  # host seeded with the first one's identity registers as its duplicate.
+  validation {
+    condition = length(setintersection(
+      toset(keys(var.worker_base_environment)),
+      toset(["CATS_NODE_ID", "CATS_NODE_ADVERTISE_URL"]),
+    )) == 0
+    error_message = "Node identity is per worker: CATS_NODE_ID comes from the instances key and CATS_NODE_ADVERTISE_URL from the host's IMDS at seed time."
   }
 }
