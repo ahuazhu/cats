@@ -197,7 +197,7 @@ pub(super) fn row_to_node(r: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
     })
 }
 
-pub(super) fn summarize_node(node: Node, cats: &[Cat]) -> NodeSummary {
+pub(super) fn summarize_node(node: Node, cats: &[Cat], orphan_cats: u64) -> NodeSummary {
     let assigned_cpus = cats.iter().map(|cat| cat.spec.cpus).sum();
     let assigned_memory_mib = cats.iter().map(|cat| cat.spec.memory_mib).sum();
     NodeSummary {
@@ -209,6 +209,7 @@ pub(super) fn summarize_node(node: Node, cats: &[Cat]) -> NodeSummary {
         assigned_cats: cats.len() as u64,
         assigned_cpus,
         assigned_memory_mib,
+        orphan_cats,
     }
 }
 

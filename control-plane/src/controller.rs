@@ -288,7 +288,15 @@ impl Controller {
     /// Evacuate every Cat from nodes explicitly placed in Draining. Desired
     /// Cat state is preserved: Running Cats cold-start elsewhere, while
     /// Suspended/Warm Cats re-establish their requested host-bound state on a
-    /// healthy node. A drain only becomes Cordoned after placement is empty.
+    /// healthy node.
+    ///
+    /// The node's own reported inventory is drained too: a Cat the agent
+    /// reports without a matching assignment (an orphan, issue #98) gets a
+    /// Cold stop by its reported identity. Cold is the safe verb -- whether
+    /// the runtime may publish is decided by storage fencing, not here. A
+    /// drain only becomes Cordoned once placement is empty AND the latest
+    /// report carries no orphans, so "cordoned, cats=0" again means what the
+    /// deploy runbook needs it to mean.
     async fn drain_nodes(&self) -> anyhow::Result<()> {
         for node in self
             .store
@@ -326,7 +334,65 @@ impl Controller {
                     ),
                 }
             }
-            if self.store.cats_on_node(&node.id)?.is_empty() {
+            for orphan in self.store.orphan_reported_cats(&node.id)? {
+                let key = format!("{}@{}", orphan.cat_id, orphan.generation);
+                if self.retry_deferred_key(&key) {
+                    continue;
+                }
+                let job = NodeJob {
+                    job_id: nodejob::job_id(
+                        &orphan.cat_id,
+                        orphan.generation,
+                        "drain_stop_orphan_cat",
+                    ),
+                    cat_generation: orphan.generation,
+                    action: NodeJobAction::StopCat {
+                        cat_id: orphan.cat_id.clone(),
+                        disposition: StopCatDisposition::Cold,
+                    },
+                };
+                match self.dispatch(&node.agent_url, &job).await {
+                    Ok(result) if result.phase == JobPhase::Succeeded => {
+                        // Nothing to update: there is no record. The agent
+                        // drops the Cat from its next heartbeat and the
+                        // stored report converges on its own.
+                        self.clear_retry_backoff_key(&key);
+                        tracing::info!(
+                            node = %node.id,
+                            cat = %orphan.cat_id,
+                            "drain stopped an orphan runtime the control plane had no assignment for"
+                        );
+                    }
+                    Ok(result) => {
+                        // A fencing refusal (root CAS conflict) never succeeds
+                        // on retry; back off instead of hammering the metadata
+                        // store every tick. Whether a stale journal may be
+                        // discarded is an explicit operator decision
+                        // (ADR-0030), never made here.
+                        let delay = self.defer_retry_key(key);
+                        tracing::warn!(
+                            node = %node.id,
+                            cat = %orphan.cat_id,
+                            error = ?result.error,
+                            ?delay,
+                            "orphan drain stop failed; deferring retry"
+                        );
+                    }
+                    Err(error) => {
+                        let delay = self.defer_retry_key(key);
+                        tracing::warn!(
+                            node = %node.id,
+                            cat = %orphan.cat_id,
+                            %error,
+                            ?delay,
+                            "orphan drain dispatch failed; deferring retry"
+                        );
+                    }
+                }
+            }
+            if self.store.cats_on_node(&node.id)?.is_empty()
+                && self.store.orphan_reported_cats(&node.id)?.is_empty()
+            {
                 self.store.set_node_state(&node.id, NodeState::Cordoned)?;
             }
         }
@@ -343,9 +409,13 @@ impl Controller {
     /// Deliberately does *not* notify the reconciler: the whole point is to let
     /// the tick pick this Cat up later instead of immediately.
     fn defer_retry(&self, cat: &Cat) -> Duration {
+        self.defer_retry_key(attempt_key(cat))
+    }
+
+    fn defer_retry_key(&self, key: String) -> Duration {
         let mut deferred = self.retry_after.lock().unwrap();
         let now = std::time::Instant::now();
-        let entry = deferred.entry(attempt_key(cat)).or_insert((0, now));
+        let entry = deferred.entry(key).or_insert((0, now));
         entry.0 = entry.0.saturating_add(1);
         let delay = RETRY_BACKOFF_BASE
             .saturating_mul(1u32 << entry.0.saturating_sub(1).min(6))
@@ -356,15 +426,23 @@ impl Controller {
 
     /// True while a previously failed transition for this Cat is still waiting.
     fn retry_deferred(&self, cat: &Cat) -> bool {
+        self.retry_deferred_key(&attempt_key(cat))
+    }
+
+    fn retry_deferred_key(&self, key: &str) -> bool {
         let deferred = self.retry_after.lock().unwrap();
         deferred
-            .get(&attempt_key(cat))
+            .get(key)
             .is_some_and(|(_, at)| std::time::Instant::now() < *at)
     }
 
     /// Forget any backoff for this Cat, because it made progress.
     fn clear_retry_backoff(&self, cat: &Cat) {
-        self.retry_after.lock().unwrap().remove(&attempt_key(cat));
+        self.clear_retry_backoff_key(&attempt_key(cat));
+    }
+
+    fn clear_retry_backoff_key(&self, key: &str) {
+        self.retry_after.lock().unwrap().remove(key);
     }
 
     async fn reconcile_cat(&self, cat: &Cat) -> anyhow::Result<()> {

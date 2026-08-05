@@ -44,7 +44,7 @@ use cats_api::auth::{Account, AccountInvitation, AccountKind, Workspace};
 use cats_api::error::{ApiError, ErrorBody, ErrorCode};
 use cats_api::ids;
 use cats_api::oci::OciDeployment;
-use cats_api::requests::WorkspaceToken;
+use cats_api::requests::{HeartbeatCat, WorkspaceToken};
 use cats_api::resources::*;
 
 pub type Result<T> = std::result::Result<T, ApiError>;

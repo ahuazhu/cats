@@ -28,7 +28,8 @@ impl Store {
                        WHEN nodes.scheduling_disabled=1 THEN 'cordoned'
                        ELSE 'ready'
                    END,
-                   cpus=?4, memory_mib=?5, last_heartbeat_ms=?6",
+                   cpus=?4, memory_mib=?5, last_heartbeat_ms=?6,
+                   reported_cats_json=NULL",
                 params![
                     node_id,
                     agent_url,
@@ -42,20 +43,81 @@ impl Store {
         })
     }
 
-    pub fn heartbeat_node(&self, node_id: &str, telemetry: Option<&NodeTelemetry>) -> Result<()> {
+    /// Record a heartbeat: telemetry plus the agent's own runtime inventory,
+    /// stored verbatim so the control plane can later be compared against
+    /// what the node actually runs (issue #98). Returns whether the reported
+    /// inventory differs from the previous heartbeat, so callers can log
+    /// changes without repeating themselves every beat.
+    pub fn heartbeat_node(
+        &self,
+        node_id: &str,
+        telemetry: Option<&NodeTelemetry>,
+        reported: &[HeartbeatCat],
+    ) -> Result<bool> {
         let telemetry_json = telemetry
             .map(|value| serde_json::to_string(value).expect("node telemetry must serialize"));
-        let n = self.with(|c| {
+        // The agent's map iteration order is not stable between heartbeats;
+        // sort so an unchanged inventory compares equal as a string.
+        let mut reported: Vec<&HeartbeatCat> = reported.iter().collect();
+        reported.sort_by(|a, b| a.cat_id.cmp(&b.cat_id));
+        let reported_json = serde_json::to_string(&reported).expect("reported cats must serialize");
+        self.with(|c| {
+            let previous: Option<Option<String>> = c
+                .query_row(
+                    "SELECT reported_cats_json FROM nodes WHERE id=?1",
+                    params![node_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(previous) = previous else {
+                return Ok(Err(ApiError::not_found(format!("node {node_id}"))));
+            };
             c.execute(
-                "UPDATE nodes SET last_heartbeat_ms=?2, telemetry_json=?3
+                "UPDATE nodes SET last_heartbeat_ms=?2, telemetry_json=?3,
+                        reported_cats_json=?4
                  WHERE id=?1",
-                params![node_id, now_ms(), telemetry_json],
-            )
-        })?;
-        if n == 0 {
-            return Err(ApiError::not_found(format!("node {node_id}")));
+                params![node_id, now_ms(), telemetry_json, reported_json],
+            )?;
+            Ok(Ok(previous.as_deref() != Some(reported_json.as_str())))
+        })?
+    }
+
+    /// The runtime inventory the agent carried in its most recent heartbeat.
+    /// Empty both for "reported nothing" and "never reported".
+    pub fn reported_cats(&self, node_id: &str) -> Result<Vec<HeartbeatCat>> {
+        let json: Option<String> = self
+            .with(|c| {
+                c.query_row(
+                    "SELECT reported_cats_json FROM nodes WHERE id=?1",
+                    params![node_id],
+                    |row| row.get(0),
+                )
+                .optional()
+            })?
+            .ok_or_else(|| ApiError::not_found(format!("node {node_id}")))?;
+        Ok(json
+            .as_deref()
+            .map(|json| serde_json::from_str(json).unwrap_or_default())
+            .unwrap_or_default())
+    }
+
+    /// Reported Cats with no matching assignment on this node: the agent runs
+    /// them, but no control-plane record places them here. These are exactly
+    /// the runtimes every operator surface would otherwise miss (issue #98).
+    pub fn orphan_reported_cats(&self, node_id: &str) -> Result<Vec<HeartbeatCat>> {
+        let reported = self.reported_cats(node_id)?;
+        if reported.is_empty() {
+            return Ok(reported);
         }
-        Ok(())
+        let assigned: std::collections::HashSet<String> = self
+            .cats_on_node(node_id)?
+            .into_iter()
+            .map(|cat| cat.id)
+            .collect();
+        Ok(reported
+            .into_iter()
+            .filter(|hb| !assigned.contains(&hb.cat_id))
+            .collect())
     }
 
     /// Make a reachable Lost node schedulable again after its heartbeat has
@@ -134,7 +196,8 @@ impl Store {
     pub fn node_summary(&self, node_id: &str) -> Result<NodeSummary> {
         let node = self.get_node(node_id)?;
         let cats = self.cats_on_node(node_id)?;
-        Ok(summarize_node(node, &cats))
+        let orphans = self.orphan_reported_cats(node_id)?.len() as u64;
+        Ok(summarize_node(node, &cats, orphans))
     }
 
     pub fn list_node_summaries(&self) -> Result<Vec<NodeSummary>> {
@@ -142,7 +205,8 @@ impl Store {
             .into_iter()
             .map(|node| {
                 let cats = self.cats_on_node(&node.id)?;
-                Ok(summarize_node(node, &cats))
+                let orphans = self.orphan_reported_cats(&node.id)?.len() as u64;
+                Ok(summarize_node(node, &cats, orphans))
             })
             .collect()
     }

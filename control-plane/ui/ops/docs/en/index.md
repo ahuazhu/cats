@@ -42,6 +42,8 @@ The administrator machine token is a fleet automation/break-glass identity. Do n
 4.  Verify allocations, dirty/pending commits, route bindings, and local snapshots reach zero.
 5.  Delete or replace the node only after identity and local-cache cleanup.
 
+A drain also cold-stops *orphan runtimes*: Cats the agent reports in its heartbeat that the control plane has not assigned to the node. Each node view shows the orphan count, and a drain will not reach Cordoned while it is non-zero. An orphan whose stop is refused by storage fencing (`root CAS conflict`) holds a journal that must not be published and can never stop cleanly; discarding it is a deliberate operator action against the node agent's job API, never automatic — see the worker release runbook in the deployment documentation.
+
 ## Lost node
 
 Heartbeat expiry marks the node Lost and its Cats Unknown, but deliberately preserves placement, routes, and disk epochs. It does not start duplicate Guests. The Node returns to Ready only when one heartbeat contains a complete, same-generation runtime inventory for every preserved claim. Registration or an incomplete inventory leaves it Lost so the fence action remains available.

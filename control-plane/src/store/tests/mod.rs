@@ -199,11 +199,13 @@ fn migrates_a_v1_database_in_place() {
     };
     {
         // Reshape the file into the v1 schema: no expiry column, no disk
-        // durability column, stamp 1.
+        // durability column, no reported node inventory, stamp 1.
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch("ALTER TABLE cats DROP COLUMN expires_at_unix")
             .unwrap();
         conn.execute_batch("ALTER TABLE disks DROP COLUMN durability")
+            .unwrap();
+        conn.execute_batch("ALTER TABLE nodes DROP COLUMN reported_cats_json")
             .unwrap();
         conn.pragma_update(None, "user_version", 1_i64).unwrap();
     }
@@ -231,6 +233,115 @@ fn migrates_a_v1_database_in_place() {
     assert_eq!(
         store.must_get_cat_by_id(&cat_id).unwrap().expires_at_unix,
         Some(12345)
+    );
+}
+
+#[test]
+fn migrates_a_v4_database_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control.db");
+    {
+        let store = Store::open(&path).unwrap();
+        store
+            .register_node("node_a", "http://node", "http://gateway", 4, 8192)
+            .unwrap();
+    }
+    {
+        // Reshape the file into the v4 schema: no reported inventory, stamp 4.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("ALTER TABLE nodes DROP COLUMN reported_cats_json")
+            .unwrap();
+        conn.pragma_update(None, "user_version", 4_i64).unwrap();
+    }
+
+    let store = Store::open(&path).unwrap();
+    assert!(
+        store.reported_cats("node_a").unwrap().is_empty(),
+        "a pre-v5 node surfaces as never having reported"
+    );
+    {
+        let conn = Connection::open(&path).unwrap();
+        let stamped: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stamped, SCHEMA_VERSION);
+    }
+    // The migrated column is writable like a natively-v5 one.
+    let reported = [HeartbeatCat {
+        cat_id: "cat_orphan1".into(),
+        generation: 7,
+        state: ObservedState::Running,
+    }];
+    store.heartbeat_node("node_a", None, &reported).unwrap();
+    assert_eq!(store.reported_cats("node_a").unwrap().len(), 1);
+}
+
+#[test]
+fn heartbeat_reported_inventory_round_trips_and_diffs_orphans() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("control.db")).unwrap();
+    let workspace = bootstrap_workspace(&store, "acme");
+    let (cat, _, _) = store
+        .create_cat(
+            &workspace,
+            "assigned",
+            "test",
+            1,
+            256,
+            1 << 20,
+            true,
+            None,
+            None,
+            DiskDurability::Strict,
+        )
+        .unwrap();
+    store
+        .register_node("node_a", "http://node", "http://gateway", 4, 8192)
+        .unwrap();
+    store.set_placement(&cat.id, Some("node_a")).unwrap();
+
+    let hb = |cat_id: &str| HeartbeatCat {
+        cat_id: cat_id.into(),
+        generation: 3,
+        state: ObservedState::Running,
+    };
+    assert!(
+        store
+            .heartbeat_node("node_a", None, &[hb(&cat.id), hb("cat_orphan1")])
+            .unwrap(),
+        "the first report differs from never-reported"
+    );
+    assert!(
+        !store
+            .heartbeat_node("node_a", None, &[hb("cat_orphan1"), hb(&cat.id)])
+            .unwrap(),
+        "the same inventory in a different order is not a change"
+    );
+
+    let orphans = store.orphan_reported_cats("node_a").unwrap();
+    assert_eq!(orphans.len(), 1, "the assigned Cat is not an orphan");
+    assert_eq!(orphans[0].cat_id, "cat_orphan1");
+    assert_eq!(orphans[0].generation, 3);
+    assert_eq!(store.node_summary("node_a").unwrap().orphan_cats, 1);
+
+    assert!(
+        store
+            .heartbeat_node("node_a", None, &[hb(&cat.id)])
+            .unwrap(),
+        "dropping the orphan is a change"
+    );
+    assert!(store.orphan_reported_cats("node_a").unwrap().is_empty());
+    assert_eq!(store.node_summary("node_a").unwrap().orphan_cats, 0);
+
+    // Re-registration wipes the report: the fresh agent has said nothing yet.
+    store
+        .register_node("node_a", "http://node-new", "http://gateway", 4, 8192)
+        .unwrap();
+    assert!(store.reported_cats("node_a").unwrap().is_empty());
+
+    assert!(
+        store.heartbeat_node("node_missing", None, &[]).is_err(),
+        "a heartbeat for an unregistered node is refused"
     );
 }
 
@@ -520,7 +631,9 @@ fn a_cordoned_node_stays_unschedulable_across_a_lost_recovery_cycle() {
         allocated_memory_mib: 2048,
         ..NodeTelemetry::default()
     };
-    store.heartbeat_node("node_a", Some(&telemetry)).unwrap();
+    store
+        .heartbeat_node("node_a", Some(&telemetry), &[])
+        .unwrap();
     let stored = store.get_node("node_a").unwrap().telemetry.unwrap();
     assert_eq!(stored.observed_cats, 2);
     assert_eq!(stored.allocated_cpus, 3);
@@ -542,7 +655,7 @@ fn a_fenced_node_identity_cannot_reregister_or_heartbeat_back_to_ready() {
     store
         .register_node("node_a", "http://node-new", "http://gateway", 4, 8192)
         .unwrap();
-    store.heartbeat_node("node_a", None).unwrap();
+    store.heartbeat_node("node_a", None, &[]).unwrap();
     store.set_node_state("node_a", NodeState::Ready).unwrap();
     assert_eq!(store.get_node("node_a").unwrap().state, NodeState::Fenced);
 }

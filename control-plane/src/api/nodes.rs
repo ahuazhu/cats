@@ -23,9 +23,31 @@ pub(super) async fn heartbeat(
     Json(req): Json<HeartbeatRequest>,
 ) -> ApiResult<StatusCode> {
     check_service_auth(&state, &headers).await?;
-    state
-        .store
-        .heartbeat_node(&req.node_id, req.telemetry.as_ref())?;
+    let inventory_changed =
+        state
+            .store
+            .heartbeat_node(&req.node_id, req.telemetry.as_ref(), &req.cats)?;
+    if inventory_changed {
+        // Reverse reconciliation (issue #98): a Cat the agent runs that the
+        // control plane has not assigned here must not stay invisible. It is
+        // surfaced on NodeSummary/monitoring/metrics; the log line fires only
+        // when the reported inventory changes, not on every beat.
+        let orphans = state.store.orphan_reported_cats(&req.node_id)?;
+        if !orphans.is_empty() {
+            let detail = orphans
+                .iter()
+                .map(|hb| format!("{} generation {} {:?}", hb.cat_id, hb.generation, hb.state))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::warn!(
+                node = %req.node_id,
+                orphans = orphans.len(),
+                reported = req.cats.len(),
+                detail = %detail,
+                "node reports cats the control plane has not assigned to it"
+            );
+        }
+    }
     // Drift detection: trust node reports for steady states at the same
     // generation; the reconciler drives any resulting divergence.
     for hb in &req.cats {
@@ -312,6 +334,7 @@ fn monitoring_snapshot(state: &AppState) -> crate::store::Result<MonitoringOverv
 
     let summaries = state.store.list_node_summaries()?;
     let mut node_counts = NodeStateCounts::default();
+    let mut orphan_cats = 0_u64;
     let mut capacity = FleetCapacity::default();
     let mut usage = FleetUsage::default();
     let mut cpu_weighted_sum = 0.0;
@@ -336,6 +359,10 @@ fn monitoring_snapshot(state: &AppState) -> crate::store::Result<MonitoringOverv
         capacity.total_memory_mib += summary.node.capacity.memory_mib;
         capacity.assigned_cpus += u64::from(summary.assigned_cpus);
         capacity.assigned_memory_mib += summary.assigned_memory_mib;
+        // Deliberately counted before the Lost/Fenced skip below: a Lost
+        // node's last report is stale, but the runtimes it named were real
+        // and unaccounted for -- exactly what this number must not hide.
+        orphan_cats += summary.orphan_cats;
 
         if matches!(summary.node.state, NodeState::Lost | NodeState::Fenced) {
             continue;
@@ -396,6 +423,7 @@ fn monitoring_snapshot(state: &AppState) -> crate::store::Result<MonitoringOverv
         operations: state.store.operation_counts()?,
         capacity,
         usage,
+        orphan_cats,
     })
 }
 
@@ -498,6 +526,10 @@ pub(super) async fn prometheus_metrics(
         metric!(
             format!("cats_node_heartbeat_age_seconds{{node_id=\"{node_id}\"}}"),
             summary.heartbeat_age_seconds
+        );
+        metric!(
+            format!("cats_node_orphan_cats{{node_id=\"{node_id}\"}}"),
+            summary.orphan_cats
         );
         if let Some(telemetry) = summary.node.telemetry {
             metric!(

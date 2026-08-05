@@ -116,9 +116,13 @@ locals {
     # A worker release is an operator-controlled drain boundary. Killing a
     # Cloud Hypervisor while its kernel-NBD backend is still publishing can
     # leave an uninterruptible VMM thread in the delegated cgroup and prevent
-    # systemd from starting the replacement worker. Fail before changing any
-    # installed file unless the target node is already drained and cordoned.
-    "$stage_path/require-idle-worker.sh" "$metering_root"
+    # systemd from starting the replacement worker. A live cats-blockd is not
+    # metered and so is invisible to the cgroup walk, yet stopping the unit
+    # would kill it along with any unpublished journal it holds (issue #98);
+    # the guard therefore also scans the process table for the installed
+    # runtime binaries. Fail before changing any installed file unless the
+    # target node is already drained and cordoned.
+    "$stage_path/require-idle-worker.sh" "$metering_root" "${var.install_root}/bin"
 
     # -D creates the parent directory. Without it a host that has never been
     # touched by install.sh fails here: /opt/cats/bin does not exist yet, and

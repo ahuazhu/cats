@@ -212,8 +212,10 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
     let deployment =
         read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
     let idle_guard = deployment
-        .find("\"$stage_path/require-idle-worker.sh\" \"$metering_root\"")
-        .expect("worker deployment rejects active Cat processes");
+        .find(
+            "\"$stage_path/require-idle-worker.sh\" \"$metering_root\" \"${var.install_root}/bin\"",
+        )
+        .expect("worker deployment rejects active Cat processes and live runtime binaries");
     let first_install = deployment
         .find("install -D -m 0755 \"$stage_path/cats-noded\"")
         .expect("worker deployment installs cats-noded");
@@ -250,9 +252,15 @@ fn worker_release_refuses_active_cat_cgroups() {
     let cgroup_procs = active_cat.join("cgroup.procs");
     std::fs::write(&cgroup_procs, "").expect("write empty cgroup");
 
+    // An isolated bin root keeps the process-table scan away from whatever
+    // the developer machine happens to run.
+    let bin_root = temp.path().join("bin");
+    std::fs::create_dir_all(&bin_root).expect("create bin fixture");
+
     let guard = workspace_root().join("deploy/aws/metal/require-idle-worker.sh");
     let idle = std::process::Command::new(&guard)
         .arg(&metering_root)
+        .arg(&bin_root)
         .output()
         .expect("run idle worker guard");
     assert!(
@@ -264,6 +272,7 @@ fn worker_release_refuses_active_cat_cgroups() {
     std::fs::write(&cgroup_procs, "1818070\n").expect("write active cgroup");
     let active = std::process::Command::new(&guard)
         .arg(&metering_root)
+        .arg(&bin_root)
         .output()
         .expect("run active worker guard");
     assert!(!active.status.success(), "active Cat must block release");
@@ -272,6 +281,70 @@ fn worker_release_refuses_active_cat_cgroups() {
         stderr.contains("active Cat processes: 1818070")
             && stderr.contains("state=cordoned cats=0"),
         "guard must name the active PID and recovery contract: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
+    let temp = tempfile::tempdir().expect("temporary runtime fixture");
+    let metering_root = temp.path().join("metering");
+    std::fs::create_dir_all(&metering_root).expect("create empty metering fixture");
+    let bin_root = temp.path().join("bin");
+    std::fs::create_dir_all(&bin_root).expect("create bin fixture");
+
+    // A cats-blockd is not metered, so it lives outside every metering cgroup;
+    // and the VMM's name is 16 characters, one past the kernel's 15-character
+    // comm, so comm-based matching (`pgrep cloud-hypervisor`) never sees it.
+    // The guard must catch both by their full argv[0] path (issue #98).
+    let blockd_bin = bin_root.join("cats-blockd");
+    let vmm_bin = bin_root.join("cloud-hypervisor");
+    std::fs::copy("/bin/sleep", &blockd_bin).expect("stage fake blockd");
+    std::fs::copy("/bin/sleep", &vmm_bin).expect("stage fake vmm");
+    let mut blockd = std::process::Command::new(&blockd_bin)
+        .arg("300")
+        .spawn()
+        .expect("spawn fake blockd");
+    let mut vmm = std::process::Command::new(&vmm_bin)
+        .arg("300")
+        .spawn()
+        .expect("spawn fake vmm");
+
+    let guard = workspace_root().join("deploy/aws/metal/require-idle-worker.sh");
+    let refused = std::process::Command::new(&guard)
+        .arg(&metering_root)
+        .arg(&bin_root)
+        .output()
+        .expect("run guard against live runtime binaries");
+
+    let blockd_pid = blockd.id();
+    let vmm_pid = vmm.id();
+    let _ = blockd.kill();
+    let _ = blockd.wait();
+    let _ = vmm.kill();
+    let _ = vmm.wait();
+
+    assert!(
+        !refused.status.success(),
+        "a live runtime binary must block the release even with empty metering cgroups"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains(&format!("{blockd_pid}(cats-blockd)"))
+            && stderr.contains(&format!("{vmm_pid}(cloud-hypervisor)"))
+            && stderr.contains("unpublished writes"),
+        "guard must name both runtime pids and the journal hazard: {stderr}"
+    );
+
+    let idle = std::process::Command::new(&guard)
+        .arg(&metering_root)
+        .arg(&bin_root)
+        .output()
+        .expect("run guard after the runtime binaries exited");
+    assert!(
+        idle.status.success(),
+        "a node with no runtime processes must be releasable: {}",
+        String::from_utf8_lossy(&idle.stderr)
     );
 }
 

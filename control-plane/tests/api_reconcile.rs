@@ -1596,7 +1596,7 @@ async fn control_plane_startup_grace_preserves_a_reconnecting_host_bound_cat() {
     );
 
     for _ in 0..11 {
-        cp.state.store.heartbeat_node("node_a", None).unwrap();
+        cp.state.store.heartbeat_node("node_a", None, &[]).unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     let cat = cp.state.store.must_get_cat_by_id(&cat_id).unwrap();
@@ -3272,4 +3272,240 @@ async fn an_unattributable_checkpoint_is_rejected_without_failing_its_batch() {
         .await
         .unwrap();
     assert_eq!(report.status(), StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// Reverse reconciliation of agent-reported runtimes (issue #98, ADR-0030)
+// ---------------------------------------------------------------------------
+
+async fn admin_node_summary(ctx: &Ctx, node_id: &str) -> NodeSummary {
+    ctx.http
+        .get(ctx.url(&format!("/v1/admin/nodes/{node_id}")))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// Wait until the node's summary shows exactly `want` orphan runtimes.
+async fn wait_orphan_cats(ctx: &Ctx, node_id: &str, want: u64) -> NodeSummary {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let summary = admin_node_summary(ctx, node_id).await;
+        if summary.orphan_cats == want {
+            return summary;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node {node_id} never reported {want} orphan runtimes, last {}",
+            summary.orphan_cats
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Issue #98: 13 orphan runtimes sat in the node's telemetry while every
+/// operator surface showed the 3 assigned Cats, and no view compared the two.
+/// A Cat the agent reports without a matching assignment must be counted on
+/// the node summary, the fleet monitoring overview, and the metrics endpoint.
+#[tokio::test]
+async fn an_agent_reported_cat_without_an_assignment_is_surfaced_as_an_orphan() {
+    let ctx = Ctx::new().await;
+    let node = start_stub_node(&ctx.cp, "node_a").await;
+    ctx.create_cat("legit", None).await;
+    ctx.wait_observed("legit", ObservedState::Running).await;
+
+    // A runtime the control plane never created: the incident shape.
+    node.cats
+        .lock()
+        .unwrap()
+        .insert("cat_orphan1".into(), ObservedState::Running);
+
+    let summary = wait_orphan_cats(&ctx, "node_a", 1).await;
+    assert_eq!(
+        summary.assigned_cats, 1,
+        "the assigned Cat must not count as an orphan"
+    );
+
+    let overview: MonitoringOverview = ctx
+        .http
+        .get(ctx.url("/v1/admin/monitoring"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        overview.orphan_cats, 1,
+        "the fleet overview must expose the orphan count"
+    );
+
+    let prometheus = ctx
+        .http
+        .get(ctx.url("/metrics"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        prometheus.contains("cats_node_orphan_cats{node_id=\"node_a\"} 1"),
+        "metrics must carry the per-node orphan gauge"
+    );
+}
+
+/// Issue #98: the drain went draining -> cordoned in a minute and left all 13
+/// orphans running, because it only enumerated the assignment table. A drain
+/// must Cold-stop what the agent reports too, and must not cordon while the
+/// agent still reports an orphan.
+#[tokio::test]
+async fn a_drain_stops_agent_reported_orphans_before_cordoning() {
+    let ctx = Ctx::new().await;
+    let node = start_stub_node(&ctx.cp, "node_a").await;
+    node.cats
+        .lock()
+        .unwrap()
+        .insert("cat_orphan1".into(), ObservedState::Running);
+
+    // The control plane must have seen the orphan before the drain starts;
+    // otherwise an immediate cordon would be indistinguishable from the bug.
+    wait_orphan_cats(&ctx, "node_a", 1).await;
+
+    let drain = ctx
+        .http
+        .post(ctx.url("/v1/admin/nodes/node_a/actions/drain"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(drain.status(), StatusCode::ACCEPTED);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let summary = admin_node_summary(&ctx, "node_a").await;
+        if summary.node.state == NodeState::Cordoned {
+            assert_eq!(
+                summary.orphan_cats, 0,
+                "cordoned must mean the agent no longer reports the orphan"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "drain never cordoned the node"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(
+        node.cats.lock().unwrap().is_empty(),
+        "the orphan runtime must actually have been stopped"
+    );
+    assert!(
+        node.jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|id| id == "job_cat_orphan1_0_drain_stop_orphan_cat"),
+        "the orphan must be stopped by its reported identity"
+    );
+    assert!(
+        node.stop_dispositions
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|disposition| matches!(disposition, StopCatDisposition::Cold)),
+        "an orphan stop must be Cold: whether it may publish is fencing's call"
+    );
+}
+
+/// Issue #98: 8 of the 13 orphans were refused by storage fencing
+/// (`root CAS conflict`) and can never stop cleanly. The drain must stay
+/// visibly open rather than cordon a node that still runs them, and must back
+/// off instead of re-dispatching the doomed stop every reconcile tick.
+/// Discarding the stale journal is an explicit operator action (ADR-0030);
+/// the injected recovery below stands in for it.
+#[tokio::test]
+async fn a_drain_with_an_unstoppable_orphan_stays_draining_and_backs_off() {
+    let ctx = Ctx::new().await;
+    let node = start_stub_node(&ctx.cp, "node_a").await;
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("stop_cat".into(), usize::MAX);
+    node.cats
+        .lock()
+        .unwrap()
+        .insert("cat_fenced1".into(), ObservedState::Stopping);
+    wait_orphan_cats(&ctx, "node_a", 1).await;
+
+    let drain = ctx
+        .http
+        .post(ctx.url("/v1/admin/nodes/node_a/actions/drain"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(drain.status(), StatusCode::ACCEPTED);
+
+    // Long enough that an unthrottled retry would be unmistakable: the
+    // reconciler ticks every 200 ms.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let summary = admin_node_summary(&ctx, "node_a").await;
+    assert_eq!(
+        summary.node.state,
+        NodeState::Draining,
+        "a node still running an unstoppable orphan must not read as cordoned"
+    );
+    assert_eq!(
+        summary.orphan_cats, 1,
+        "the unstoppable orphan must stay visible while the drain is open"
+    );
+    let attempts = node
+        .jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|id| id.ends_with("_drain_stop_orphan_cat"))
+        .count();
+    assert!(
+        attempts >= 1,
+        "the orphan stop must be attempted at least once"
+    );
+    assert!(
+        attempts <= 5,
+        "a failing orphan stop must back off; {attempts} dispatches in 2 s is a hot loop"
+    );
+
+    // Once the operator resolves the orphan, the open drain converges without
+    // a new request.
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("stop_cat".into(), 0);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let summary = admin_node_summary(&ctx, "node_a").await;
+        if summary.node.state == NodeState::Cordoned && summary.orphan_cats == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "drain did not converge after the orphan stop recovered"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
