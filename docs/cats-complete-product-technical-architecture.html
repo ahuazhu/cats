@@ -596,7 +596,7 @@ COMMIT;
         <div class="step"><b>7. Guest</b><p>转发到 tap 私网地址；响应字节计入 tenant egress ledger。</p></div>
       </div>
 
-      <div class="callout green"><strong>控制面故障契约（ADR-0033）：</strong>普通缓存过期后，只有 control-plane transport/5xx 故障才可在签名到期前继续使用已缓存的 active + Running Route Grant；明确 not-found、其他非成功响应、畸形响应和签名到期都 fail closed。HTTP/WS 的生命周期并发由 Node 本地 activity guard 仲裁，不再逐请求获取 PostgreSQL work lease；Wake 仍经过控制面。</div>
+      <div class="callout green"><strong>控制面故障契约（ADR-0033）：</strong>普通缓存过期后，只要 active + Running Route Grant 的签名时效仍有效，就立即准入并按 hostname 合并为一个后台 refresh；transport/5xx 失败保留该授权并进入有界退避，不会让每个请求等待两秒或放大控制面流量。观察到明确 not-found、其他非成功响应、畸形响应后立即失效缓存；签名到期也始终 fail closed。HTTP/WS 的生命周期并发由 Node 本地 activity guard 仲裁，不再逐请求获取 PostgreSQL work lease；Wake 仍经过控制面。</div>
 
       <h3 style="margin-top:28px">9.2 地址与路由</h3>
       <div class="table-wrap">

@@ -9,7 +9,7 @@
 //! (singleflight there), honoring the endpoint's wake policy.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -53,6 +53,115 @@ struct CachedRoute {
     fetched: Instant,
 }
 
+#[cfg(not(test))]
+const ROUTE_REFRESH_BACKOFF: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const ROUTE_REFRESH_BACKOFF: Duration = Duration::from_millis(50);
+const MAX_ROUTE_CACHE_ENTRIES: usize = 4_096;
+
+#[derive(Debug, Clone)]
+enum ResolveFailure {
+    Response {
+        status: StatusCode,
+        message: String,
+        retain_cached: bool,
+    },
+    Superseded,
+}
+
+impl ResolveFailure {
+    fn response(status: StatusCode, message: impl Into<String>, retain_cached: bool) -> Self {
+        Self::Response {
+            status,
+            message: message.into(),
+            retain_cached,
+        }
+    }
+
+    fn retains_cached_route(&self) -> bool {
+        matches!(
+            self,
+            Self::Response {
+                retain_cached: true,
+                ..
+            }
+        )
+    }
+
+    fn into_response(self) -> Response {
+        match self {
+            Self::Response {
+                status, message, ..
+            } => gw_error(status, message),
+            Self::Superseded => gw_error(
+                StatusCode::CONFLICT,
+                "route refresh was superseded".to_string(),
+            ),
+        }
+    }
+}
+
+struct RouteRefresh {
+    result: OnceLock<Result<ResolveResponse, ResolveFailure>>,
+    ready: tokio::sync::watch::Sender<bool>,
+}
+
+impl RouteRefresh {
+    fn new() -> Self {
+        let (ready, _) = tokio::sync::watch::channel(false);
+        Self {
+            result: OnceLock::new(),
+            ready,
+        }
+    }
+
+    fn complete(&self, result: Result<ResolveResponse, ResolveFailure>) {
+        if self.result.set(result).is_ok() {
+            self.ready.send_replace(true);
+        }
+    }
+
+    async fn wait(&self) -> Result<ResolveResponse, ResolveFailure> {
+        if let Some(result) = self.result.get() {
+            return result.clone();
+        }
+        let mut ready = self.ready.subscribe();
+        loop {
+            if *ready.borrow_and_update() {
+                return self
+                    .result
+                    .get()
+                    .expect("ready Route refresh has a result")
+                    .clone();
+            }
+            ready
+                .changed()
+                .await
+                .expect("Route refresh retains its readiness sender");
+        }
+    }
+}
+
+struct RouteCacheEntry {
+    cached: Option<CachedRoute>,
+    refresh: Option<Arc<RouteRefresh>>,
+    retry_after: Instant,
+    last_failure: Option<ResolveFailure>,
+    generation: u64,
+}
+
+impl RouteCacheEntry {
+    fn new(now: Instant) -> Self {
+        Self {
+            cached: None,
+            refresh: None,
+            retry_after: now,
+            last_failure: None,
+            generation: 0,
+        }
+    }
+}
+
 fn route_is_locally_usable(resolved: &ResolveResponse) -> bool {
     if resolved.state != "active" || resolved.observed_state != ObservedState::Running {
         return resolved.route_grant.is_none() && resolved.route_grant_expires_at_unix.is_none();
@@ -81,7 +190,7 @@ fn cached_outage_route(cached: Option<&CachedRoute>) -> Option<ResolveResponse> 
 pub struct Gateway {
     cfg: Arc<GatewayConfig>,
     http: reqwest::Client,
-    cache: Arc<Mutex<HashMap<String, CachedRoute>>>,
+    cache: Arc<Mutex<HashMap<String, RouteCacheEntry>>>,
 }
 
 pub struct Handle {
@@ -106,21 +215,7 @@ impl Gateway {
         self.cfg.control_plane_url.trim_end_matches('/').to_string()
     }
 
-    async fn resolve(&self, hostname: &str, use_cache: bool) -> Result<ResolveResponse, Response> {
-        let cached = if use_cache {
-            self.cache.lock().unwrap().get(hostname).cloned()
-        } else {
-            None
-        };
-        if use_cache {
-            if let Some(hit) = &cached {
-                if hit.fetched.elapsed() < Duration::from_millis(self.cfg.cache_ttl_ms)
-                    && route_is_locally_usable(&hit.resolved)
-                {
-                    return Ok(hit.resolved.clone());
-                }
-            }
-        }
+    async fn fetch_route(&self, hostname: &str) -> Result<ResolveResponse, ResolveFailure> {
         let resp = self
             .http
             .get(format!("{}/v1/routes/resolve", self.cp()))
@@ -132,73 +227,247 @@ impl Gateway {
         let resp = match resp {
             Ok(response) => response,
             Err(error) => {
-                if let Some(fallback) = cached_outage_route(cached.as_ref()) {
-                    tracing::warn!(
-                        hostname,
-                        ?fallback.route_grant_expires_at_unix,
-                        %error,
-                        "control-plane route resolve failed; using bounded cached Route Grant"
-                    );
-                    return Ok(fallback);
-                }
-                return Err(gw_error(
+                return Err(ResolveFailure::response(
                     StatusCode::BAD_GATEWAY,
                     format!("resolve failed: {error}"),
+                    true,
                 ));
             }
         };
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(gw_error(
+            return Err(ResolveFailure::response(
                 StatusCode::NOT_FOUND,
                 format!("no route for host {hostname}"),
+                false,
             ));
         }
         if resp.status().is_server_error() {
-            if let Some(fallback) = cached_outage_route(cached.as_ref()) {
-                tracing::warn!(
-                    hostname,
-                    status = %resp.status(),
-                    ?fallback.route_grant_expires_at_unix,
-                    "control-plane route resolve failed; using bounded cached Route Grant"
-                );
-                return Ok(fallback);
-            }
-        }
-        if !resp.status().is_success() {
-            return Err(gw_error(
+            return Err(ResolveFailure::response(
                 StatusCode::BAD_GATEWAY,
                 format!("resolve status {}", resp.status()),
+                true,
             ));
         }
-        let resolved: ResolveResponse = resp
-            .json()
-            .await
-            .map_err(|e| gw_error(StatusCode::BAD_GATEWAY, format!("bad resolve body: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(ResolveFailure::response(
+                StatusCode::BAD_GATEWAY,
+                format!("resolve status {}", resp.status()),
+                false,
+            ));
+        }
+        let resolved: ResolveResponse = resp.json().await.map_err(|error| {
+            ResolveFailure::response(
+                StatusCode::BAD_GATEWAY,
+                format!("bad resolve body: {error}"),
+                false,
+            )
+        })?;
         if resolved.state == "active" && resolved.observed_state == ObservedState::Running {
             if !route_is_locally_usable(&resolved) {
-                return Err(gw_error(
+                return Err(ResolveFailure::response(
                     StatusCode::BAD_GATEWAY,
                     "active Running route has no unexpired Route Grant".to_string(),
+                    false,
                 ));
             }
         } else if resolved.route_grant.is_some() || resolved.route_grant_expires_at_unix.is_some() {
-            return Err(gw_error(
+            return Err(ResolveFailure::response(
                 StatusCode::BAD_GATEWAY,
                 "inactive route unexpectedly carried a Route Grant".to_string(),
+                false,
             ));
         }
-        self.cache.lock().unwrap().insert(
-            hostname.to_string(),
-            CachedRoute {
-                resolved: resolved.clone(),
-                fetched: Instant::now(),
-            },
-        );
         Ok(resolved)
     }
 
+    fn complete_refresh(
+        &self,
+        hostname: &str,
+        generation: u64,
+        refresh: &Arc<RouteRefresh>,
+        result: Result<ResolveResponse, ResolveFailure>,
+    ) {
+        let now = Instant::now();
+        let mut cache = self.cache.lock().unwrap();
+        let Some(entry) = cache.get_mut(hostname) else {
+            refresh.complete(Err(ResolveFailure::Superseded));
+            return;
+        };
+        let is_current = entry.generation == generation
+            && entry
+                .refresh
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, refresh));
+        if !is_current {
+            refresh.complete(Err(ResolveFailure::Superseded));
+            return;
+        }
+
+        match &result {
+            Ok(resolved) => {
+                entry.cached = Some(CachedRoute {
+                    resolved: resolved.clone(),
+                    fetched: now,
+                });
+                entry.last_failure = None;
+                entry.retry_after = now;
+            }
+            Err(error) => {
+                if !error.retains_cached_route() {
+                    entry.cached = None;
+                }
+                entry.last_failure = Some(error.clone());
+                entry.retry_after = now + ROUTE_REFRESH_BACKOFF;
+            }
+        }
+        entry.refresh = None;
+        drop(cache);
+
+        if let Err(error) = &result {
+            if error.retains_cached_route() {
+                tracing::warn!(
+                    hostname,
+                    ?error,
+                    "control-plane route refresh failed; retaining only the signed cached authority"
+                );
+            }
+        }
+        refresh.complete(result);
+    }
+
+    async fn run_refresh(
+        &self,
+        hostname: String,
+        generation: u64,
+        refresh: Arc<RouteRefresh>,
+    ) -> Result<ResolveResponse, ResolveFailure> {
+        let result = self.fetch_route(&hostname).await;
+        self.complete_refresh(&hostname, generation, &refresh, result);
+        refresh.wait().await
+    }
+
+    async fn resolve(&self, hostname: &str, use_cache: bool) -> Result<ResolveResponse, Response> {
+        enum Action {
+            Return(ResolveResponse),
+            ReturnAndRefresh(ResolveResponse, Arc<RouteRefresh>, u64),
+            Wait(Arc<RouteRefresh>),
+            Refresh(Arc<RouteRefresh>, u64),
+            Fail(ResolveFailure),
+        }
+
+        loop {
+            let now = Instant::now();
+            let action = {
+                let mut cache = self.cache.lock().unwrap();
+                if !cache.contains_key(hostname) && cache.len() >= MAX_ROUTE_CACHE_ENTRIES {
+                    let evict = cache.iter().find_map(|(hostname, entry)| {
+                        entry.refresh.is_none().then(|| hostname.clone())
+                    });
+                    if let Some(evict) = evict {
+                        cache.remove(&evict);
+                    } else {
+                        return Err(gw_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "route refresh capacity is exhausted".to_string(),
+                        ));
+                    }
+                }
+                let entry = cache
+                    .entry(hostname.to_string())
+                    .or_insert_with(|| RouteCacheEntry::new(now));
+
+                let usable = use_cache
+                    .then_some(entry.cached.as_ref())
+                    .flatten()
+                    .filter(|cached| route_is_locally_usable(&cached.resolved));
+                if let Some(cached) = usable {
+                    if cached.fetched.elapsed() < Duration::from_millis(self.cfg.cache_ttl_ms) {
+                        Action::Return(cached.resolved.clone())
+                    } else if let Some(stale) = cached_outage_route(Some(cached)) {
+                        if entry.refresh.is_none() && now >= entry.retry_after {
+                            let refresh = Arc::new(RouteRefresh::new());
+                            entry.refresh = Some(refresh.clone());
+                            Action::ReturnAndRefresh(stale, refresh, entry.generation)
+                        } else {
+                            Action::Return(stale)
+                        }
+                    } else if let Some(refresh) = &entry.refresh {
+                        Action::Wait(refresh.clone())
+                    } else if now < entry.retry_after {
+                        Action::Fail(entry.last_failure.clone().unwrap_or_else(|| {
+                            ResolveFailure::response(
+                                StatusCode::BAD_GATEWAY,
+                                "route refresh is backing off",
+                                false,
+                            )
+                        }))
+                    } else {
+                        let refresh = Arc::new(RouteRefresh::new());
+                        entry.refresh = Some(refresh.clone());
+                        Action::Refresh(refresh, entry.generation)
+                    }
+                } else if let Some(refresh) = &entry.refresh {
+                    Action::Wait(refresh.clone())
+                } else if now < entry.retry_after {
+                    Action::Fail(entry.last_failure.clone().unwrap_or_else(|| {
+                        ResolveFailure::response(
+                            StatusCode::BAD_GATEWAY,
+                            "route refresh is backing off",
+                            false,
+                        )
+                    }))
+                } else {
+                    let refresh = Arc::new(RouteRefresh::new());
+                    entry.refresh = Some(refresh.clone());
+                    Action::Refresh(refresh, entry.generation)
+                }
+            };
+
+            match action {
+                Action::Return(resolved) => return Ok(resolved),
+                Action::ReturnAndRefresh(resolved, refresh, generation) => {
+                    let gateway = self.clone();
+                    let hostname = hostname.to_string();
+                    tokio::spawn(async move {
+                        let _ = gateway.run_refresh(hostname, generation, refresh).await;
+                    });
+                    return Ok(resolved);
+                }
+                Action::Wait(refresh) => match refresh.wait().await {
+                    Ok(resolved) => return Ok(resolved),
+                    Err(ResolveFailure::Superseded) => continue,
+                    Err(error) => return Err(error.into_response()),
+                },
+                Action::Refresh(refresh, generation) => {
+                    match self
+                        .run_refresh(hostname.to_string(), generation, refresh)
+                        .await
+                    {
+                        Ok(resolved) => return Ok(resolved),
+                        Err(ResolveFailure::Superseded) => continue,
+                        Err(error) => return Err(error.into_response()),
+                    }
+                }
+                Action::Fail(error) => return Err(error.into_response()),
+            }
+        }
+    }
+
     fn invalidate(&self, hostname: &str) {
-        self.cache.lock().unwrap().remove(hostname);
+        let refresh = {
+            let mut cache = self.cache.lock().unwrap();
+            let entry = cache
+                .entry(hostname.to_string())
+                .or_insert_with(|| RouteCacheEntry::new(Instant::now()));
+            entry.generation = entry.generation.saturating_add(1);
+            entry.cached = None;
+            entry.retry_after = Instant::now();
+            entry.last_failure = None;
+            entry.refresh.take()
+        };
+        if let Some(refresh) = refresh {
+            refresh.complete(Err(ResolveFailure::Superseded));
+        }
     }
 
     async fn wake(&self, hostname: &str) -> Result<(), Response> {
@@ -693,18 +962,56 @@ mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
     use axum::Json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Clone)]
     enum RouteReply {
-        Active,
+        Active(&'static str),
         Status(StatusCode),
         Malformed,
+        Delayed(Duration, Box<RouteReply>),
     }
 
-    async fn route_reply(State(reply): State<Arc<Mutex<RouteReply>>>) -> Response {
-        let reply = reply.lock().unwrap().clone();
+    struct RouteServerState {
+        reply: Mutex<RouteReply>,
+        node_agent_url: Mutex<String>,
+        calls: AtomicUsize,
+        wake_calls: AtomicUsize,
+    }
+
+    impl RouteServerState {
+        fn new(reply: RouteReply) -> Self {
+            Self {
+                reply: Mutex::new(reply),
+                node_agent_url: Mutex::new("http://node-a".to_string()),
+                calls: AtomicUsize::new(0),
+                wake_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn set(&self, reply: RouteReply) {
+            *self.reply.lock().unwrap() = reply;
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn set_node_agent_url(&self, node_agent_url: String) {
+            *self.node_agent_url.lock().unwrap() = node_agent_url;
+        }
+    }
+
+    async fn route_reply(State(state): State<Arc<RouteServerState>>) -> Response {
+        state.calls.fetch_add(1, Ordering::SeqCst);
+        let mut reply = state.reply.lock().unwrap().clone();
+        while let RouteReply::Delayed(delay, next) = reply {
+            tokio::time::sleep(delay).await;
+            reply = *next;
+        }
+        let node_agent_url = state.node_agent_url.lock().unwrap().clone();
         match reply {
-            RouteReply::Active => {
+            RouteReply::Active(route_grant) => {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
@@ -722,25 +1029,33 @@ mod tests {
                     },
                     "state": "active",
                     "observed_state": "running",
-                    "node_agent_url": "http://node-a",
-                    "route_grant": "opaque-signed-token",
+                    "node_agent_url": node_agent_url,
+                    "route_grant": route_grant,
                     "route_grant_expires_at_unix": now + 60
                 }))
                 .into_response()
             }
             RouteReply::Status(status) => status.into_response(),
             RouteReply::Malformed => (StatusCode::OK, "not-json").into_response(),
+            RouteReply::Delayed(_, _) => unreachable!("delays are flattened before response"),
         }
     }
 
+    async fn wake_reply(State(state): State<Arc<RouteServerState>>) -> StatusCode {
+        state.wake_calls.fetch_add(1, Ordering::SeqCst);
+        StatusCode::NO_CONTENT
+    }
+
     async fn route_test_gateway(
-        reply: Arc<Mutex<RouteReply>>,
+        state: Arc<RouteServerState>,
+        cache_ttl_ms: u64,
     ) -> (Gateway, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = Router::new()
             .route("/v1/routes/resolve", get(route_reply))
-            .with_state(reply);
+            .route("/v1/routes/wake", axum::routing::post(wake_reply))
+            .with_state(state);
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -749,12 +1064,72 @@ mod tests {
                 listen: "127.0.0.1:0".to_string(),
                 control_plane_url: format!("http://{addr}"),
                 auth_token: "service-token".to_string(),
-                cache_ttl_ms: 0,
+                cache_ttl_ms,
             }),
             http: reqwest::Client::new(),
             cache: Arc::new(Mutex::new(HashMap::new())),
         };
         (gateway, task)
+    }
+
+    async fn spawn_mock_node() -> (String, tokio::task::JoinHandle<()>) {
+        async fn proxy(Json(request): Json<ProxyHttpRequest>) -> Json<ProxyHttpResponse> {
+            assert_eq!(request.route_grant, "grant-1");
+            Json(ProxyHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"ok".to_vec(),
+            })
+        }
+
+        async fn websocket(ws: WebSocketUpgrade) -> Response {
+            ws.on_upgrade(|mut socket| async move {
+                while let Some(Ok(message)) = socket.recv().await {
+                    if matches!(message, Message::Close(_)) {
+                        break;
+                    }
+                }
+            })
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/cats/{id}/proxy", axum::routing::post(proxy))
+            .route("/v1/cats/{id}/proxy-websocket", get(websocket));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), task)
+    }
+
+    async fn wait_for_calls(state: &RouteServerState, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.calls() < expected {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("control-plane call count reached the expected value");
+    }
+
+    async fn wait_for_idle(gateway: &Gateway, hostname: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let refreshing = gateway
+                    .cache
+                    .lock()
+                    .unwrap()
+                    .get(hostname)
+                    .is_some_and(|entry| entry.refresh.is_some());
+                if !refreshing {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("route refresh became idle");
     }
 
     #[test]
@@ -780,14 +1155,23 @@ mod tests {
 
     #[tokio::test]
     async fn cached_grant_fallback_is_limited_to_transport_or_server_failure() {
-        let reply = Arc::new(Mutex::new(RouteReply::Active));
-        let (gateway, task) = route_test_gateway(reply.clone()).await;
+        let state = Arc::new(RouteServerState::new(RouteReply::Active("grant-1")));
+        let (gateway, task) = route_test_gateway(state.clone(), 10).await;
         gateway.resolve("dev.cats.run", true).await.unwrap();
 
-        *reply.lock().unwrap() = RouteReply::Status(StatusCode::INTERNAL_SERVER_ERROR);
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        state.set(RouteReply::Status(StatusCode::INTERNAL_SERVER_ERROR));
         assert!(gateway.resolve("dev.cats.run", true).await.is_ok());
+        wait_for_calls(&state, 2).await;
+        wait_for_idle(&gateway, "dev.cats.run").await;
 
-        *reply.lock().unwrap() = RouteReply::Status(StatusCode::NOT_FOUND);
+        tokio::time::sleep(ROUTE_REFRESH_BACKOFF).await;
+        state.set(RouteReply::Status(StatusCode::NOT_FOUND));
+        // Stale-while-revalidate may admit this already-authorized request. Once
+        // the explicit revocation is observed, the cache fails closed.
+        assert!(gateway.resolve("dev.cats.run", true).await.is_ok());
+        wait_for_calls(&state, 3).await;
+        wait_for_idle(&gateway, "dev.cats.run").await;
         assert_eq!(
             gateway
                 .resolve("dev.cats.run", true)
@@ -797,7 +1181,8 @@ mod tests {
             StatusCode::NOT_FOUND
         );
 
-        *reply.lock().unwrap() = RouteReply::Malformed;
+        tokio::time::sleep(ROUTE_REFRESH_BACKOFF).await;
+        state.set(RouteReply::Malformed);
         assert_eq!(
             gateway
                 .resolve("dev.cats.run", true)
@@ -807,15 +1192,21 @@ mod tests {
             StatusCode::BAD_GATEWAY
         );
 
+        tokio::time::sleep(ROUTE_REFRESH_BACKOFF).await;
+        state.set(RouteReply::Active("grant-2"));
+        gateway.resolve("dev.cats.run", true).await.unwrap();
         gateway
             .cache
             .lock()
             .unwrap()
             .get_mut("dev.cats.run")
             .unwrap()
+            .cached
+            .as_mut()
+            .unwrap()
             .resolved
             .route_grant_expires_at_unix = Some(1);
-        *reply.lock().unwrap() = RouteReply::Status(StatusCode::SERVICE_UNAVAILABLE);
+        state.set(RouteReply::Status(StatusCode::SERVICE_UNAVAILABLE));
         assert_eq!(
             gateway
                 .resolve("dev.cats.run", true)
@@ -825,5 +1216,244 @@ mod tests {
             StatusCode::BAD_GATEWAY
         );
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_route_refresh_is_singleflight_and_never_stalls_requesters() {
+        let state = Arc::new(RouteServerState::new(RouteReply::Active("grant-1")));
+        let (gateway, task) = route_test_gateway(state.clone(), 10).await;
+        gateway.resolve("dev.cats.run", true).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        state.set(RouteReply::Delayed(
+            Duration::from_millis(500),
+            Box::new(RouteReply::Status(StatusCode::SERVICE_UNAVAILABLE)),
+        ));
+
+        let started = Instant::now();
+        let requests = (0..64).map(|_| {
+            let gateway = gateway.clone();
+            async move { gateway.resolve("dev.cats.run", true).await }
+        });
+        let results = futures_util::future::join_all(requests).await;
+        assert!(results.into_iter().all(|result| result.is_ok()));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "stale authorized requests waited on the two-second control-plane timeout"
+        );
+        wait_for_calls(&state, 2).await;
+        assert_eq!(
+            state.calls(),
+            2,
+            "one priming resolve plus one coalesced refresh is the complete control-plane load"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_misses_share_one_control_plane_resolve() {
+        let state = Arc::new(RouteServerState::new(RouteReply::Delayed(
+            Duration::from_millis(100),
+            Box::new(RouteReply::Active("grant-1")),
+        )));
+        let (gateway, task) = route_test_gateway(state.clone(), 10).await;
+        let requests = (0..32).map(|_| {
+            let gateway = gateway.clone();
+            async move { gateway.resolve("dev.cats.run", true).await }
+        });
+        let results = futures_util::future::join_all(requests).await;
+        assert!(results.into_iter().all(|result| result.is_ok()));
+        assert_eq!(state.calls(), 1, "cold resolve was not singleflight");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_backs_off_then_recovers_without_extending_expiry() {
+        let state = Arc::new(RouteServerState::new(RouteReply::Active("grant-1")));
+        let (gateway, task) = route_test_gateway(state.clone(), 10).await;
+        gateway.resolve("dev.cats.run", true).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        state.set(RouteReply::Status(StatusCode::SERVICE_UNAVAILABLE));
+        gateway.resolve("dev.cats.run", true).await.unwrap();
+        wait_for_idle(&gateway, "dev.cats.run").await;
+
+        let before_backoff = state.calls();
+        for _ in 0..32 {
+            assert!(gateway.resolve("dev.cats.run", true).await.is_ok());
+        }
+        assert_eq!(
+            state.calls(),
+            before_backoff,
+            "outage backoff still sent one resolve per request"
+        );
+
+        tokio::time::sleep(ROUTE_REFRESH_BACKOFF).await;
+        state.set(RouteReply::Active("grant-2"));
+        gateway.resolve("dev.cats.run", true).await.unwrap();
+        wait_for_idle(&gateway, "dev.cats.run").await;
+        assert_eq!(
+            gateway
+                .resolve("dev.cats.run", true)
+                .await
+                .unwrap()
+                .route_grant
+                .as_deref(),
+            Some("grant-2")
+        );
+
+        gateway
+            .cache
+            .lock()
+            .unwrap()
+            .get_mut("dev.cats.run")
+            .unwrap()
+            .cached
+            .as_mut()
+            .unwrap()
+            .resolved
+            .route_grant_expires_at_unix = Some(1);
+        state.set(RouteReply::Status(StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(
+            gateway
+                .resolve("dev.cats.run", true)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::BAD_GATEWAY,
+            "an expired signed authority must never use stale-while-revalidate"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn invalidation_supersedes_an_inflight_stale_refresh() {
+        let state = Arc::new(RouteServerState::new(RouteReply::Active("grant-1")));
+        let (gateway, task) = route_test_gateway(state.clone(), 10).await;
+        gateway.resolve("dev.cats.run", true).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        state.set(RouteReply::Delayed(
+            Duration::from_millis(150),
+            Box::new(RouteReply::Active("obsolete-refresh")),
+        ));
+        gateway.resolve("dev.cats.run", true).await.unwrap();
+        wait_for_calls(&state, 2).await;
+
+        gateway.invalidate("dev.cats.run");
+        state.set(RouteReply::Active("fresh-after-conflict"));
+        assert_eq!(
+            gateway
+                .resolve("dev.cats.run", false)
+                .await
+                .unwrap()
+                .route_grant
+                .as_deref(),
+            Some("fresh-after-conflict")
+        );
+        tokio::time::sleep(Duration::from_millis(175)).await;
+        assert_eq!(
+            gateway
+                .resolve("dev.cats.run", true)
+                .await
+                .unwrap()
+                .route_grant
+                .as_deref(),
+            Some("fresh-after-conflict"),
+            "the invalidated background refresh resurrected a stale route"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn route_cache_evicts_idle_entries_at_its_untrusted_hostname_bound() {
+        let state = Arc::new(RouteServerState::new(RouteReply::Active("grant-1")));
+        let (gateway, task) = route_test_gateway(state, 10).await;
+        {
+            let mut cache = gateway.cache.lock().unwrap();
+            for index in 0..MAX_ROUTE_CACHE_ENTRIES {
+                cache.insert(
+                    format!("unknown-{index}.cats.run"),
+                    RouteCacheEntry::new(Instant::now()),
+                );
+            }
+        }
+
+        gateway.resolve("dev.cats.run", true).await.unwrap();
+        let cache = gateway.cache.lock().unwrap();
+        assert_eq!(cache.len(), MAX_ROUTE_CACHE_ENTRIES);
+        assert!(cache.contains_key("dev.cats.run"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn mixed_http_and_websocket_load_stays_fast_and_coalesced_during_outage() {
+        let (node_agent_url, node_task) = spawn_mock_node().await;
+        let state = Arc::new(RouteServerState::new(RouteReply::Active("grant-1")));
+        state.set_node_agent_url(node_agent_url);
+        let (gateway, control_task) = route_test_gateway(state.clone(), 10).await;
+        let gateway_handle = spawn((*gateway.cfg).clone()).await.unwrap();
+        let http_url = gateway_handle.base_url();
+
+        let client = reqwest::Client::new();
+        let primed = client
+            .get(&http_url)
+            .header(header::HOST, "dev.cats.run")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(primed.status(), StatusCode::OK);
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        state.set(RouteReply::Delayed(
+            Duration::from_secs(1),
+            Box::new(RouteReply::Status(StatusCode::SERVICE_UNAVAILABLE)),
+        ));
+
+        let started = Instant::now();
+        let http_requests = (0..32).map(|_| {
+            let client = client.clone();
+            let http_url = http_url.clone();
+            async move {
+                client
+                    .get(http_url)
+                    .header(header::HOST, "dev.cats.run")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        });
+        let websocket_requests = (0..16).map(|_| {
+            let mut request = http_url
+                .replacen("http://", "ws://", 1)
+                .into_client_request()
+                .unwrap();
+            request
+                .headers_mut()
+                .insert(header::HOST, HeaderValue::from_static("dev.cats.run"));
+            async move {
+                let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+                socket.close(None).await.unwrap();
+            }
+        });
+        let (http_statuses, _) = tokio::join!(
+            futures_util::future::join_all(http_requests),
+            futures_util::future::join_all(websocket_requests),
+        );
+        assert!(http_statuses
+            .into_iter()
+            .all(|status| status == StatusCode::OK));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "mixed data-plane traffic stalled behind the slow control-plane refresh"
+        );
+        wait_for_calls(&state, 2).await;
+        assert_eq!(state.calls(), 2, "mixed traffic multiplied route resolves");
+        assert_eq!(
+            state.wake_calls.load(Ordering::SeqCst),
+            0,
+            "Running traffic must not call the wake control operation"
+        );
+
+        drop(gateway_handle);
+        control_task.abort();
+        node_task.abort();
     }
 }

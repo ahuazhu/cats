@@ -300,7 +300,7 @@ Host control 继续使用现有的 u32 big-endian length + JSON framing over AF_
 | Guest/Node 工作信号过期 | fail-awake，不创建自动 Suspend |
 | lease release 上报丢失 | TTL + 1 秒长轮询刷新修复 |
 | Endpoint activation / exec release 丢失 | 控制面 TTL 自动清理；activation 本来就不续租 |
-| Running Endpoint 期间控制面全部失联 | 已缓存且未过期的 Route Grant 继续准入；Node 本地 guard 阻止 Suspend；新连接在 Grant 过期后 fail-closed |
+| Running Endpoint 期间控制面全部失联 | 已缓存且未过期的 Route Grant 立即继续准入；每个 hostname 仅一个后台 refresh 并在失败后退避；Node 本地 guard 阻止 Suspend；新连接在 Grant 过期后 fail-closed |
 | Guest lease 报告乱序 | 同 epoch 的旧 sequence 忽略 |
 | 旧 Node/旧 generation 上报 | conflict，不能改变当前 Cat |
 | quiesce 中新工作到达 | sequence 变化，Node 返回 ActivityChanged |

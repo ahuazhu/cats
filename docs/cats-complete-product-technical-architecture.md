@@ -684,10 +684,11 @@ Node 验证 Route Grant 的签名、时效、hostname、Cat generation、Node、
 转发到 tap 私网地址；响应字节计入 tenant egress ledger。
 
 **控制面故障契约（[ADR-0033](decisions/0033-short-lived-signed-route-grants.md)）：**
-Gateway 的普通缓存过期后，只有控制面 transport/5xx 故障才可在签名到期前继续使用
-已缓存的 active + Running Route Grant；明确 not-found、其他非成功响应、畸形响应和
-签名到期都 fail closed。HTTP/WS 的生命周期并发由 Node 持有的本地 activity guard
-仲裁，不再逐请求获取 PostgreSQL work lease；Wake 仍必须经过控制面。
+Gateway 的普通缓存过期后，只要 active + Running Route Grant 的签名时效仍有效，就立即
+准入并按 hostname 合并为一个后台 refresh；transport/5xx 失败保留该授权并进入有界退避，
+不会让每个请求等待两秒或放大控制面流量。观察到明确 not-found、其他非成功响应、畸形响应
+后立即失效缓存；签名到期也始终 fail closed。HTTP/WS 的生命周期并发由 Node 持有的本地
+activity guard 仲裁，不再逐请求获取 PostgreSQL work lease；Wake 仍必须经过控制面。
 
 ### 9.2 地址与路由
 

@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cats_api::guest::{GuestRequestBody, GuestResponseBody};
 use cats_api::resources::NodeState;
@@ -556,19 +556,34 @@ async fn running_endpoint_survives_control_plane_outage_with_cached_route_grant(
     assert_eq!(status, 200, "failed to prime route cache: {first}");
 
     cluster.cp.shutdown();
-    tokio::time::sleep(Duration::from_millis(700)).await;
-
-    let (status, during) = cluster.gateway_get(&hostname, "/during-outage").await;
-    assert_eq!(
-        status, 200,
-        "a cached, unexpired Running route must outlive the control plane: {during}"
-    );
-
-    tokio::time::sleep(Duration::from_millis(2_500)).await;
-    let (status, expired) = cluster.gateway_get(&hostname, "/after-grant-expiry").await;
-    assert_eq!(
-        status, 502,
-        "the Gateway must fail closed once the cached authorization expires: {expired}"
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut successful_requests = 0;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the two-second test Route Grant never reached fail-closed expiry"
+        );
+        let started = Instant::now();
+        let (status, body) = cluster.gateway_get(&hostname, "/during-outage").await;
+        let latency = started.elapsed();
+        if status == 200 {
+            successful_requests += 1;
+            assert!(
+                latency < Duration::from_millis(500),
+                "authorized outage traffic stalled on the control-plane timeout: {latency:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            continue;
+        }
+        assert_eq!(
+            status, 502,
+            "the Gateway returned an unexpected status after grant expiry: {body}"
+        );
+        break;
+    }
+    assert!(
+        successful_requests >= 10,
+        "the sustained outage probe did not exercise enough authorized requests"
     );
 }
 

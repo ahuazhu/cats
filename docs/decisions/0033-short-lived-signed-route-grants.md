@@ -35,12 +35,15 @@ would let a compromised Gateway mint arbitrary Cat, Node or port bindings.
 - The signing private key exists only in the control-plane runtime. Nodes
   receive only the public verification key. The Gateway and Guest receive
   neither the private key nor any capability that can derive it.
-- The Gateway treats the signed token as opaque. It may use a cached grant
-  after cache freshness only when a resolve attempt fails at transport level
-  or with a control-plane 5xx response, the cached route was `active` and
-  `Running`, and the advertised grant expiry is still in the future. An
-  explicit not-found, other non-success response, malformed response or local
-  expiry fails closed.
+- The Gateway treats the signed token as opaque. After ordinary cache freshness
+  ends, an `active` + `Running` route whose advertised grant expiry is still in
+  the future is served immediately while one background resolve per hostname
+  refreshes it. Concurrent HTTP requests and WebSocket upgrades share that
+  refresh. A transport or control-plane 5xx failure retains the cached grant and
+  enters a bounded per-host retry backoff; it never extends signed expiry. Once
+  observed, an explicit not-found, other non-success response or malformed
+  response invalidates the cached route and fails closed. Local expiry always
+  fails closed without stale-while-revalidate.
 - The Gateway sends the hostname and token with every Node hop. The Node
   verifies the EdDSA signature, required issuer/audience/time claims, grant
   version, hostname, Cat ID, Cat generation, local Node ID, route epoch and
@@ -69,7 +72,9 @@ Node hop. It authenticates the calling service but does not authorize a route.
 
 - Already Running HTTP Endpoints continue through a bounded control-plane or
   control-database outage until the cached grant expires. No new authorization
-  is invented during the outage.
+  is invented during the outage. Data-plane requests do not wait on the
+  control-plane timeout or multiply resolve load after cache freshness; one
+  coalesced refresh per hostname probes recovery under a bounded backoff.
 - Established WebSockets do not depend on renewal through PostgreSQL and stay
   connected while their Node and Guest remain healthy. Their admission was
   authorized before expiry; the held local guard continues to fence Suspend.
