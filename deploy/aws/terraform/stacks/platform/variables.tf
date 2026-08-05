@@ -249,6 +249,18 @@ variable "metal_worker_instance_count" {
   default     = 1
 }
 
+variable "metal_worker_names" {
+  description = <<-EOT
+    Name tags for the workers, by index; indices past the end of the list fall
+    back to cats-metal-<index+1>. Exists because worker names follow node
+    identity, not slot position: the imported cats-metal-2 occupies index 0
+    after metal-1 was decommissioned, and a positional name would silently
+    relabel it on the next apply.
+  EOT
+  type        = list(string)
+  default     = []
+}
+
 variable "metal_worker_instance_type" {
   description = "Worker instance type. Must be .metal for /dev/kvm, and should carry instance storage: the ChunkStore cache on EBS measures 14-43x lower on 4 KiB random write."
   type        = string
