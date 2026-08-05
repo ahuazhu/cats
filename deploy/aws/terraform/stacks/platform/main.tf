@@ -541,7 +541,7 @@ resource "aws_instance" "metal_worker" {
   }
 
   tags = merge(var.tags, {
-    Name    = "cats-metal-${count.index + 1}"
+    Name    = try(var.metal_worker_names[count.index], "cats-metal-${count.index + 1}")
     Project = "Cats"
   })
 
@@ -549,7 +549,18 @@ resource "aws_instance" "metal_worker" {
     # user_data only runs on first boot, and rewriting it would replace a
     # worker that is serving Cats. The AMI is pinned rather than tracked, for
     # the same reason: a new Canonical publication must not recycle the fleet.
-    ignore_changes = [user_data, user_data_base64, ami]
+    #
+    # root_block_device is ignored because the imported cats-metal-2 was
+    # launched by hand with an unencrypted root, and the only reconciliation
+    # Terraform can offer is replacing the live worker (#111). Remove the
+    # entry once every fleet root is encrypted again, so the config resumes
+    # enforcing it.
+    ignore_changes = [user_data, user_data_base64, ami, root_block_device]
+
+    # A plan that wants to recycle a worker must fail loudly instead of
+    # executing; a worker is destroyed through drain and deliberate
+    # decommission, never as a side effect of an attribute diff.
+    prevent_destroy = true
   }
 }
 
