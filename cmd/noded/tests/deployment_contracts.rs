@@ -64,6 +64,26 @@ fn deployment_units_pin_kvm_clock_too() {
 }
 
 #[test]
+fn node_agent_restarts_preserve_guest_runtime_processes() {
+    for unit in [
+        "deploy/metal/systemd/cats-noded.service",
+        "deploy/aws/metal/cats-worker.service",
+    ] {
+        let text = read_workspace_file(unit);
+        let kill_modes = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("KillMode="))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kill_modes,
+            ["KillMode=process"],
+            "{unit} must stop only cats-noded so its VMM and blockd processes survive for ledger-backed re-adoption"
+        );
+    }
+}
+
+#[test]
 fn production_aws_worker_joins_initially_cordoned() {
     let unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
     assert!(

@@ -4,6 +4,10 @@ After=cats-controld.service
 Wants=cats-controld.service
 
 [Service]
+# Stop or restart only the node agent. Its ledger-backed adoption path proves
+# and re-adopts the surviving VMM and blockd processes (ADR-0028); killing the
+# whole cgroup here would terminate every Cat on this worker at once.
+KillMode=process
 # Single-node defaults; override in /etc/cats/cats.env to join a cluster.
 Environment=CATS_GUEST_NETWORK_CIDR=10.240.0.0/16
 Environment=CATS_NODE_ID=metal-1

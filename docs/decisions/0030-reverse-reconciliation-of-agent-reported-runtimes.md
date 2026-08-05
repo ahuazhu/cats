@@ -3,7 +3,9 @@
 - 状态：Proposed
 - 日期：2026-08-05
 - 范围：心跳中 agent 上报 inventory 的持久化与暴露、孤儿 runtime 的口径、`node drain` 的完成条件、worker 发布闸门的判定来源、以及丢弃不可发布 journal 的权限归属。
-- 不含：agent 端 adoption 与 ledger（ADR-0028 阶段 1–4，已落地）、per-Cat systemd scope 与 `KillMode`（ADR-0028 §6，#86）、adoption 拒绝后 residue 的清理（另行处理）。
+- 不含：agent 端 adoption 与 ledger（ADR-0028 阶段 1–4，已落地）、per-Cat systemd scope
+  （ADR-0028 §6 后续阶段；`KillMode=process` 由 #86 落地）、adoption 拒绝后 residue 的清理
+  （另行处理）。
 
 ## 背景
 
@@ -23,7 +25,7 @@
    `state=cordoned cats=0`」——在缺口 2 下这个条件永远达不到，指示的补救方法不成立
    （太严，无出路）；同时它只走计量 cgroup，看不到未被计量的 `cats-blockd`——Guest
    已死而 blockd 存活持有未发布 journal 时闸门放行，随后 `systemctl stop
-   cats-worker`（单元未设 `KillMode`，默认 control-group）连 journal 持有者一起杀掉
+   cats-worker`（当时单元未设 `KillMode`，默认 control-group）连 journal 持有者一起杀掉
    （太松，丢数据）。在 relaxed 卷 `R < L` 时那份本地 journal 是唯一权威副本。
 
 产生这批孤儿的根因（agent inventory 只在内存，#87）已由 ADR-0028 阶段 1–4（#88）
