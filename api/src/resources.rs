@@ -36,16 +36,6 @@ pub enum ObservedState {
     Unknown,
 }
 
-impl ObservedState {
-    /// Whether a wake request must go through a full cold start.
-    pub fn requires_cold_start(self) -> bool {
-        matches!(
-            self,
-            ObservedState::Cold | ObservedState::Failed | ObservedState::Unknown
-        )
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatSpec {
     pub cpus: u32,
@@ -202,30 +192,6 @@ pub struct MountBinding {
     pub disk_id: String,
     pub cat_id: String,
     pub mount_path: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AttachmentState {
-    Attaching,
-    Attached,
-    Detaching,
-    Detached,
-    /// Fenced by a newer epoch; must never publish writes again.
-    Fenced,
-}
-
-/// Runtime attachment of a disk on a node. Exactly one non-final attachment
-/// may exist per disk (RWO), enforced by the control plane store.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Attachment {
-    pub id: String,
-    pub disk_id: String,
-    pub cat_id: String,
-    pub node_id: String,
-    /// Fencing epoch, monotonic per disk. Stale epochs must fail closed.
-    pub epoch: i64,
-    pub state: AttachmentState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,7 +1,6 @@
 use super::*;
 
 use cats_api::nodejob::job_id;
-use cats_storage::AdapterConfig;
 
 use ledger::CatLedgerRecord;
 
@@ -35,32 +34,7 @@ struct RealCatEnv {
 fn real_cat_env(node_id: &str) -> RealCatEnv {
     let dir = tempfile::tempdir().expect("create test root");
     let root = dir.path().to_path_buf();
-    let cfg = NodeConfig {
-        node_id: node_id.to_string(),
-        state_dir: root.join("node-state"),
-        blockd_bin: crate::testutil::workspace_bin("cats-blockd"),
-        guest_agent_bin: crate::testutil::workspace_bin("cats-guest-agent"),
-        metadata_store: AdapterSelection {
-            name: "sqlite".into(),
-            config: AdapterConfig::from_pairs([(
-                "path",
-                root.join("meta.db").display().to_string(),
-            )])
-            .expect("SQLite adapter config"),
-        },
-        object_store: AdapterSelection {
-            name: "file".into(),
-            config: AdapterConfig::from_pairs([("root", root.join("blob").display().to_string())])
-                .expect("File adapter config"),
-        },
-        blockd_lease_ttl_ms: 1_200,
-        blockd_max_staged_bytes: cats_api::blockd::DEFAULT_MAX_STAGED_BYTES,
-        blockd_max_staged_packs: cats_api::blockd::DEFAULT_MAX_STAGED_PACKS,
-        blockd_max_local_bytes: cats_api::blockd::DEFAULT_MAX_LOCAL_BYTES,
-        metering_cgroup_root: None,
-        vmm: VmmMode::Fake,
-        wake_budget: WakeBudget::default(),
-    };
+    let cfg = real_child_node_config(&root, node_id);
     let runtime = NodeRuntime::new(cfg.clone()).expect("open node runtime");
     RealCatEnv {
         _dir: dir,
@@ -216,25 +190,10 @@ fn warm_retirement_finalizes_then_drops_the_metering_cgroup() {
     let temp = tempfile::tempdir().unwrap();
     let cgroup = temp.path().join("cat-a");
     std::fs::create_dir(&cgroup).unwrap();
-    let adapter = AdapterSelection::new("unused", cats_storage::AdapterConfig::default());
     let finalizer = Arc::new(RecordingUsageFinalizer::default());
-    let runtime = NodeRuntime::new(NodeConfig {
-        node_id: "node-a".to_string(),
-        state_dir: temp.path().to_path_buf(),
-        blockd_bin: PathBuf::from("unused-blockd"),
-        guest_agent_bin: PathBuf::from("unused-guest-agent"),
-        metadata_store: adapter.clone(),
-        object_store: adapter,
-        blockd_lease_ttl_ms: 1_000,
-        blockd_max_staged_bytes: cats_api::blockd::DEFAULT_MAX_STAGED_BYTES,
-        blockd_max_staged_packs: cats_api::blockd::DEFAULT_MAX_STAGED_PACKS,
-        blockd_max_local_bytes: cats_api::blockd::DEFAULT_MAX_LOCAL_BYTES,
-        metering_cgroup_root: None,
-        vmm: VmmMode::Fake,
-        wake_budget: WakeBudget::default(),
-    })
-    .unwrap()
-    .with_usage_finalizer(finalizer.clone());
+    let runtime = NodeRuntime::new(stub_node_config(temp.path(), VmmMode::Fake))
+        .unwrap()
+        .with_usage_finalizer(finalizer.clone());
     runtime.cats.lock().unwrap().insert(
         "cat-a".to_string(),
         test_runtime(ObservedState::Warm, cgroup.clone()),

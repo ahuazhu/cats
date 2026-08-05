@@ -190,13 +190,6 @@ impl Store {
         self.with(|conn| find_account_by_organization(conn, organization_id))
     }
 
-    pub fn account_for_personal_owner(
-        &self,
-        workos_user_id: &str,
-    ) -> Result<Option<AccountRecord>> {
-        self.with(|conn| find_account_by_personal_owner(conn, workos_user_id))
-    }
-
     pub fn account_by_id(&self, account_id: &str) -> Result<AccountRecord> {
         let conn = self.conn.lock().unwrap();
         match conn.query_row(

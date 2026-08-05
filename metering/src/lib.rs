@@ -1010,7 +1010,8 @@ fn validate_credit_account(
     Ok(())
 }
 
-fn validate_checkout_intent(intent: &CheckoutIntent) -> Result<()> {
+/// Validate a checkout intent before an adapter starts a transaction.
+pub fn validate_checkout_intent(intent: &CheckoutIntent) -> Result<()> {
     if intent.intent_id.is_empty()
         || intent.billing_account_id.is_empty()
         || intent.account_id.is_empty()
@@ -1025,7 +1026,8 @@ fn validate_checkout_intent(intent: &CheckoutIntent) -> Result<()> {
     Ok(())
 }
 
-fn validate_checkout_payment(payment: &CheckoutPayment) -> Result<()> {
+/// Validate a Stripe payment event before an adapter starts a transaction.
+pub fn validate_checkout_payment(payment: &CheckoutPayment) -> Result<()> {
     if payment.event_id.is_empty()
         || payment.payload_sha256.len() != 64
         || payment.intent_id.is_empty()
@@ -1043,7 +1045,8 @@ fn validate_checkout_payment(payment: &CheckoutPayment) -> Result<()> {
     Ok(())
 }
 
-fn validate_checkout_refund(refund: &CheckoutRefund) -> Result<()> {
+/// Validate a Stripe refund event before an adapter starts a transaction.
+pub fn validate_checkout_refund(refund: &CheckoutRefund) -> Result<()> {
     if refund.event_id.is_empty()
         || refund.payload_sha256.len() != 64
         || refund.stripe_refund_id.is_empty()

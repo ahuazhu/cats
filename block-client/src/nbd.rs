@@ -1,7 +1,6 @@
 //! Synchronous userspace client for the portable Cats NBD frontend.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
@@ -89,12 +88,6 @@ pub struct NbdClient {
 impl NbdClient {
     pub fn connect_unix(path: &Path) -> NbdResult<Self> {
         let stream = UnixStream::connect(path)?;
-        Self::handshake(Box::new(stream))
-    }
-
-    pub fn connect_tcp(addr: &str) -> NbdResult<Self> {
-        let stream = TcpStream::connect(addr)?;
-        stream.set_nodelay(true).ok();
         Self::handshake(Box::new(stream))
     }
 

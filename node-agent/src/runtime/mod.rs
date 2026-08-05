@@ -107,6 +107,54 @@ pub struct NodeConfig {
     pub wake_budget: WakeBudget,
 }
 
+/// The SQLite + File + FakeVmm configuration used by the in-crate tests that
+/// start real `cats-blockd` and `cats-guest-agent` children.
+///
+/// Equivalent to `cats_test_support::fake_node_config!`, which the integration
+/// tests use; that macro resolves `cats_node_agent::…` paths and so cannot be
+/// invoked from inside this crate.
+#[cfg(test)]
+pub(crate) fn real_child_node_config(root: &Path, node_id: &str) -> NodeConfig {
+    let parts = cats_test_support::NodeConfigBuilder::new(root, node_id).into_parts();
+    NodeConfig {
+        node_id: parts.node_id,
+        state_dir: parts.state_dir,
+        blockd_bin: parts.blockd_bin,
+        guest_agent_bin: parts.guest_agent_bin,
+        metadata_store: parts.metadata_store,
+        object_store: parts.object_store,
+        blockd_lease_ttl_ms: parts.blockd_lease_ttl_ms,
+        blockd_max_staged_bytes: cats_api::blockd::DEFAULT_MAX_STAGED_BYTES,
+        blockd_max_staged_packs: cats_api::blockd::DEFAULT_MAX_STAGED_PACKS,
+        blockd_max_local_bytes: cats_api::blockd::DEFAULT_MAX_LOCAL_BYTES,
+        metering_cgroup_root: None,
+        vmm: VmmMode::Fake,
+        wake_budget: WakeBudget::default(),
+    }
+}
+
+/// A configuration for tests that never spawn a child: the binary paths and
+/// adapter selections exist only to satisfy `NodeConfig`.
+#[cfg(test)]
+pub(crate) fn stub_node_config(state_dir: &Path, vmm: VmmMode) -> NodeConfig {
+    let adapter = AdapterSelection::new("unused", cats_storage::AdapterConfig::default());
+    NodeConfig {
+        node_id: "node-a".to_string(),
+        state_dir: state_dir.to_path_buf(),
+        blockd_bin: PathBuf::from("unused-blockd"),
+        guest_agent_bin: PathBuf::from("unused-guest-agent"),
+        metadata_store: adapter.clone(),
+        object_store: adapter,
+        blockd_lease_ttl_ms: 1_000,
+        blockd_max_staged_bytes: cats_api::blockd::DEFAULT_MAX_STAGED_BYTES,
+        blockd_max_staged_packs: cats_api::blockd::DEFAULT_MAX_STAGED_PACKS,
+        blockd_max_local_bytes: cats_api::blockd::DEFAULT_MAX_LOCAL_BYTES,
+        metering_cgroup_root: None,
+        vmm,
+        wake_budget: WakeBudget::default(),
+    }
+}
+
 struct CatRuntime {
     generation: i64,
     cpus: u32,

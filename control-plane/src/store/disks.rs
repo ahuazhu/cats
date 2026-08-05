@@ -106,24 +106,6 @@ impl Store {
         Ok(out)
     }
 
-    pub fn get_binding(&self, disk_id: &str) -> Result<Option<MountBinding>> {
-        self.with(|c| {
-            c.query_row(
-                "SELECT id, disk_id, cat_id, mount_path FROM mount_bindings WHERE disk_id=?1",
-                params![disk_id],
-                |r| {
-                    Ok(MountBinding {
-                        id: r.get(0)?,
-                        disk_id: r.get(1)?,
-                        cat_id: r.get(2)?,
-                        mount_path: r.get(3)?,
-                    })
-                },
-            )
-            .optional()
-        })
-    }
-
     pub fn bindings_for_cat(&self, cat_id: &str) -> Result<Vec<MountBinding>> {
         self.with(|c| {
             let mut stmt = c.prepare(
@@ -179,16 +161,6 @@ impl Store {
             c.execute(
                 "UPDATE disks SET state='available' WHERE id=?1 AND kind='persistent'",
                 params![disk_id],
-            )
-            .map(|_| ())
-        })
-    }
-
-    pub fn set_disk_state(&self, disk_id: &str, state: DiskState) -> Result<()> {
-        self.with(|c| {
-            c.execute(
-                "UPDATE disks SET state=?2 WHERE id=?1",
-                params![disk_id, disk_state_str(state)],
             )
             .map(|_| ())
         })

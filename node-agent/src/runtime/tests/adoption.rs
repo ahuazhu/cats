@@ -20,6 +20,18 @@ use std::collections::BTreeMap;
 
 use ledger::{CatLedgerRecord, ChRecord};
 
+/// Adopt on a restarted agent, asserting the ledger yielded exactly `CAT` and
+/// left nothing behind. The caller then asserts what is state-specific.
+fn adopt_only_cat(restarted: &NodeRuntime, cat_id: &str) {
+    let outcome = restarted.adopt_from_ledger();
+    assert_eq!(outcome.adopted, [cat_id.to_string()]);
+    assert!(
+        outcome.residue.is_empty(),
+        "unexpected residue: {:?}",
+        outcome.residue
+    );
+}
+
 /// The pids a runtime currently supervises for one Cat: the guest, and one per
 /// disk.
 fn supervised_pids(runtime: &NodeRuntime, cat_id: &str) -> (u32, BTreeMap<String, u32>) {
@@ -156,14 +168,7 @@ fn a_running_cat_is_adopted_by_a_restarted_agent() {
         restarted.snapshot().is_empty(),
         "a fresh runtime knows nothing until it adopts"
     );
-    let outcome = restarted.adopt_from_ledger();
-
-    assert_eq!(outcome.adopted, [CAT.to_string()]);
-    assert!(
-        outcome.residue.is_empty(),
-        "unexpected residue: {:?}",
-        outcome.residue
-    );
+    adopt_only_cat(&restarted, CAT);
     assert_eq!(
         restarted.snapshot(),
         vec![(CAT.to_string(), 3, ObservedState::Running)],
@@ -357,14 +362,7 @@ fn a_suspended_cat_is_adopted_and_left_paused() {
     );
 
     let restarted = env.restarted_agent();
-    let outcome = restarted.adopt_from_ledger();
-
-    assert_eq!(outcome.adopted, [CAT.to_string()]);
-    assert!(
-        outcome.residue.is_empty(),
-        "unexpected residue: {:?}",
-        outcome.residue
-    );
+    adopt_only_cat(&restarted, CAT);
     assert_eq!(
         restarted.snapshot(),
         vec![(CAT.to_string(), 2, ObservedState::Suspended)],
@@ -505,14 +503,7 @@ fn a_warm_cat_is_adopted_with_no_processes_at_all() {
     );
 
     let restarted = env.restarted_agent();
-    let outcome = restarted.adopt_from_ledger();
-
-    assert_eq!(outcome.adopted, [CAT.to_string()]);
-    assert!(
-        outcome.residue.is_empty(),
-        "unexpected residue: {:?}",
-        outcome.residue
-    );
+    adopt_only_cat(&restarted, CAT);
     assert_eq!(
         restarted.snapshot(),
         vec![(CAT.to_string(), 2, ObservedState::Warm)]
@@ -694,14 +685,7 @@ fn a_stopping_cat_is_adopted_with_its_blockds_and_no_guest() {
     env.rewrite_record(&record);
 
     let restarted = env.restarted_agent();
-    let outcome = restarted.adopt_from_ledger();
-
-    assert_eq!(outcome.adopted, [CAT.to_string()]);
-    assert!(
-        outcome.residue.is_empty(),
-        "unexpected residue: {:?}",
-        outcome.residue
-    );
+    adopt_only_cat(&restarted, CAT);
     assert_eq!(
         restarted.snapshot(),
         vec![(CAT.to_string(), 4, ObservedState::Stopping)],
