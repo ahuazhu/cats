@@ -170,9 +170,24 @@ atomically enforce both the PDB and selected Pod UID. All 240 public `/healthz`
 probes start on a fixed 250 ms schedule with bounded concurrency, so a slow
 request cannot hide the following observations. Every attempt retains its
 sub-second start/end time, edge address, HTTP status, DNS/connect/TLS/TTFB/total
-timings, response headers and scheduling lag. The first attempt must establish
-a healthy baseline before Eviction. Pod and EndpointSlice watches plus both
-original Pod logs start before that boundary; snapshots and explicit Eviction,
+timings and scheduling lag. Header evidence follows an explicit safe policy:
+`server` and `via` may be retained with value and size caps, while selected
+edge trace headers are retained only as SHA-256 digests; all other response
+headers and the transient raw curl headers are excluded. The first attempt and
+its safe-header artifact must be complete and healthy before the Pod UID check
+and Eviction. A signal-aware common finalizer reaps every curl child and writes
+a terminal manifest for all configured attempts, distinguishing scheduled,
+started, completed and missing work; interrupted or otherwise incomplete runs
+exit nonzero.
+
+The Pod and EndpointSlice collectors preserve one Kubernetes LIST-to-watch
+stream each, but retain only a projected operational schema in a bounded
+first-and-latest window (2,000 records and 1 MiB per stream). Original Pod logs
+are converted online to timestamp, severity, diagnostic category, byte count
+and SHA-256 records before the same bounded retention; application log text is
+never uploaded. Every background pipeline is terminated recursively from its
+recorded root PID with a fixed TERM/KILL deadline, so cancellation cannot leave
+an orphaned `kubectl`, `jq` or summarizer. Snapshots and explicit Eviction,
 deletion, rollout and takeover markers are uploaded for 30 days even if a later
 gate fails. The workflow finally proves that two node-spread replicas and a new
 reconciler owner are present. It never force-deletes or scales the Deployment.
