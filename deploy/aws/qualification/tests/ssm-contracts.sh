@@ -51,7 +51,9 @@ Q124_MANIFEST_SSM_EVIDENCE_SHA256=$(sha256sum "$TMP/fake-ssm-evidence.sh" | awk 
 export Q124_AWS_CLI_VERSION=2.99.0
 export Q124_AWS_CLI_X86_64_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 export Q124_JQ_VERSION=jq-1.7
-printf '#!/usr/bin/env bash\nexec %q "$@"\n' "$(command -v sha256sum)" >"$TMP/remote/sha256sum"
+export Q124_REAL_SHA256SUM
+Q124_REAL_SHA256SUM=$(command -v sha256sum)
+printf '#!/usr/bin/env bash\nexec %q "$@"\n' "$HERE/fake-stage-sha256sum.sh" >"$TMP/remote/sha256sum"
 chmod 0755 "$TMP/remote/sha256sum"
 export Q124_REGION=us-east-1 Q124_INSTANCE_ID=i-0abc124 Q124_ACCOUNT_ID=111122223333
 export Q124_NODE_ID=q124-fixture Q124_PRIVATE_IP=10.0.1.124 Q124_CONTROL_URL=https://control.example
@@ -67,6 +69,10 @@ export Q124_REMOTE_FAKE_BIN=$TMP/remote Q124_BOOTSTRAP_HELPER=$HERE/fake-bootstr
 export Q124_BOOTSTRAP_COMMAND_PROBE_BIN=$TMP/remote/probe
 export Q124_SSM_REMOTE_PATH="$TMP/remote:/usr/bin:/bin" Q124_BOOTSTRAP_AWS_LOG=$TMP/aws.log
 export Q124_CAPTURED_COMMAND=$TMP/command.sh Q124_SSM_STDOUT=$TMP/stdout Q124_SSM_STDERR=$TMP/stderr Q124_SSM_RC=$TMP/rc
+export Q124_SSM_EXECUTION_COMMAND=$TMP/execution-command.sh Q124_SSM_FIXTURE_STAGE_PARENT=$TMP/staging
+export Q124_SSM_STAGE_ATTACK_BIN=$HERE/fake-ssm-stage-attack.sh Q124_SSM_STAGE_RECORD=$TMP/stage-record
+export Q124_SSM_STAGE_OUTSIDE_FILE=$TMP/outside-sentinel Q124_SSM_STAGE_REPLACED_MARKER=$TMP/archive-replaced
+export Q124_SSM_REPLACEMENT_ARCHIVE=$TMP/replacement.tar.gz
 export Q124_SSM_FAKE_STATE=$TMP/ssm-state.json Q124_SSM_EVIDENCE_JOURNAL=$TMP/ssm-evidence.jsonl
 export Q124_SSM_EVIDENCE_BIN=$TMP/fake-ssm-evidence.sh Q124_BOOTSTRAP_CALL_LOG=$TMP/bootstrap.log
 export Q124_COMMAND_GUARD_DIR=$TMP/guard Q124_SSM_INTENT_NONCE=0124abcd0124abcd0124abcd0124abcd
@@ -75,9 +81,35 @@ export Q124_SSM_CANCEL_TIMEOUT_SECONDS=5 Q124_SSM_POLL_INTERVAL_SECONDS=0
 : >"$Q124_SSM_EVIDENCE_JOURNAL"
 : >"$Q124_SSM_STDOUT"
 : >"$Q124_SSM_STDERR"
+printf 'outside-sentinel\n' >"$Q124_SSM_STAGE_OUTSIDE_FILE"
+printf 'replacement archive\n' >"$Q124_SSM_REPLACEMENT_ARCHIVE"
 
 [[ ! -e $TMP/remote/aws && ! -e $TMP/remote/jq ]]
+
+# Contract paths are fixed only inside an exclusive random stage. Even a
+# fixture with the trusted process uid cannot precreate a symlink there: the
+# no-clobber creation fails before the guard or payload can execute, cleanup is
+# limited to the exact stage, and the symlink target is unchanged.
+for attack in bootstrap provenance guard payload; do
+  : >"$Q124_SSM_EVIDENCE_JOURNAL"
+  rm -f "$Q124_SSM_STAGE_RECORD"
+  export Q124_SSM_STAGE_ATTACK_KIND=$attack
+  if PATH="$TMP/outer:$PATH" "$SSM" "$Q124_INSTANCE_ID" bootstrap >/dev/null 2>&1; then
+    printf 'precreated %s contract symlink unexpectedly executed\n' "$attack" >&2
+    exit 1
+  fi
+  [[ $(<"$Q124_SSM_STAGE_OUTSIDE_FILE") == outside-sentinel ]]
+  [[ -s $Q124_SSM_STAGE_RECORD ]]
+  attacked_stage=$(<"$Q124_SSM_STAGE_RECORD")
+  [[ ! -e $attacked_stage && ! -L $attacked_stage ]]
+  [[ ! -e $TMP/remote/aws && ! -e $TMP/remote/jq ]]
+done
+unset Q124_SSM_STAGE_ATTACK_KIND
+: >"$Q124_SSM_EVIDENCE_JOURNAL"
+
 PATH="$TMP/outer:$PATH" "$SSM" "$Q124_INSTANCE_ID" bootstrap >/dev/null
+positive_stage=$(<"$Q124_SSM_STAGE_RECORD")
+[[ ! -e $positive_stage && ! -L $positive_stage ]]
 [[ -x $TMP/remote/aws && -x $TMP/remote/jq ]]
 grep -q '^CATS_NODE_ID=q124-fixture$' "$Q124_WORKER_ENV"
 grep -q '^AWS_REGION=us-east-1$' "$Q124_WORKER_ENV"
@@ -90,6 +122,48 @@ grep -q "awscli-exe-linux-x86_64-${Q124_AWS_CLI_VERSION}.zip" "$Q124_BOOTSTRAP_C
 grep -q '^timeout --foreground --signal=TERM --kill-after=15 30 bash ' "$Q124_BOOTSTRAP_CALL_LOG"
 [[ ! -e $Q124_COMMAND_GUARD_DIR/active ]]
 jq -se 'length == 2 and (map(.kind) | sort) == ["command","intent"] and all(.[]; .instance_id == "i-0abc124" and .mode == "bootstrap" and .manifest_sha256 == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" and .nonce == "0124abcd0124abcd0124abcd0124abcd")' "$Q124_SSM_EVIDENCE_JOURNAL" >/dev/null
+
+# An injected pre-existing archive is rejected before download, regardless of
+# its apparent owner or bytes. A replacement exactly after the first checksum
+# is caught by the repeated identity/content proof before extraction. Neither
+# case reaches the reviewed remote payload, overwrites the symlink sentinel, or
+# leaves its exact random stage behind.
+saved_source_root=$Q124_REMOTE_SOURCE_ROOT
+saved_marker_dir=$Q124_MARKER_DIR
+for attack in archive replace-after-check; do
+  : >"$Q124_SSM_EVIDENCE_JOURNAL"
+  rm -f "$Q124_SSM_STAGE_RECORD"
+  rm -f "$Q124_SSM_STAGE_REPLACED_MARKER"
+  export Q124_SSM_STAGE_ATTACK_KIND=$attack
+  export Q124_REMOTE_SOURCE_ROOT=$TMP/source-$attack
+  export Q124_MARKER_DIR=$TMP/marker-$attack
+  if PATH="$TMP/outer:$PATH" "$SSM" "$Q124_INSTANCE_ID" bootstrap >/dev/null 2>&1; then
+    printf '%s staged archive attack unexpectedly executed\n' "$attack" >&2
+    exit 1
+  fi
+  [[ ! -e $Q124_MARKER_DIR/instance-id ]]
+  [[ $(<"$Q124_SSM_STAGE_OUTSIDE_FILE") == outside-sentinel ]]
+  [[ -s $Q124_SSM_STAGE_RECORD ]]
+  attacked_stage=$(<"$Q124_SSM_STAGE_RECORD")
+  [[ ! -e $attacked_stage && ! -L $attacked_stage ]]
+  if [[ $attack == replace-after-check ]]; then
+    [[ -f $Q124_SSM_STAGE_REPLACED_MARKER ]]
+  else
+    [[ ! -e $Q124_SSM_STAGE_REPLACED_MARKER ]]
+  fi
+done
+unset Q124_SSM_STAGE_ATTACK_KIND
+Q124_REMOTE_SOURCE_ROOT=$saved_source_root
+Q124_MARKER_DIR=$saved_marker_dir
+export Q124_REMOTE_SOURCE_ROOT Q124_MARKER_DIR
+: >"$Q124_SSM_EVIDENCE_JOURNAL"
+
+# The unmodified command sent to SSM is production-only; the fake runner alters
+# a separate execution copy for its non-root, repository-local stage.
+grep -q '^\[\[ \$run_uid == 0 \]\]$' "$Q124_CAPTURED_COMMAND"
+grep -q '^stage_parent=/run/cats-q124-ssm$' "$Q124_CAPTURED_COMMAND"
+! grep -q "$Q124_SSM_STAGE_ATTACK_BIN" "$Q124_CAPTURED_COMMAND"
+! grep -Eq '/var/tmp/q124-(bootstrap|provenance|guard|payload)|/tmp/q124-source' "$Q124_CAPTURED_COMMAND"
 
 # The production guard must live outside the cache mount at /var/lib/cats.
 saved_guard=$Q124_COMMAND_GUARD_DIR

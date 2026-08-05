@@ -224,26 +224,42 @@ if [[ $mode == bootstrap ]]; then
     || die "bootstrap contract differs from manifest"
   bootstrap_sha=$(sha256sum "$BOOTSTRAP_BIN" | awk '{print $1}')
   bootstrap_encoded=$(base64 <"$BOOTSTRAP_BIN" | tr -d '\n')
+  bootstrap_stage_command="create_staged_file \"\$stage/bootstrap.sh\" '${bootstrap_encoded}' '${bootstrap_sha}'"
   command=$(cat <<EOF
 set -euo pipefail
-bootstrap_contract=/var/tmp/q124-bootstrap-${bootstrap_sha}.sh
-provenance_contract=/var/tmp/q124-provenance-${provenance_sha}.sh
-cleanup_bootstrap_contracts() { rm -f "\$bootstrap_contract" "\$provenance_contract"; }
-trap cleanup_bootstrap_contracts EXIT HUP INT TERM
-printf '%s' '${bootstrap_encoded}' | base64 --decode >"\$bootstrap_contract"
-printf '%s' '${provenance_encoded}' | base64 --decode >"\$provenance_contract"
-printf '%s  %s\n' '${bootstrap_sha}' "\$bootstrap_contract" | sha256sum -c - >/dev/null
-printf '%s  %s\n' '${provenance_sha}' "\$provenance_contract" | sha256sum -c - >/dev/null
-chmod 0700 "\$bootstrap_contract" "\$provenance_contract"
+bootstrap_contract=\${Q124_SSM_STAGE:?}/bootstrap.sh
+provenance_contract=\${Q124_SSM_STAGE:?}/provenance.sh
+assert_staged_file() {
+  local staged=\$1 uid permissions
+  [[ \$staged == "\$Q124_SSM_STAGE/"* && -f \$staged && ! -L \$staged ]] || return 1
+  uid=\$(/usr/bin/stat -c '%u' "\$staged" 2>/dev/null || /usr/bin/stat -f '%u' "\$staged") || return 1
+  permissions=\$(/usr/bin/stat -c '%a' "\$staged" 2>/dev/null || /usr/bin/stat -f '%Lp' "\$staged") || return 1
+  [[ \$uid =~ ^[0-9]+$ && \$uid == "\${Q124_SSM_STAGE_UID:?}" ]] || return 1
+  [[ \$permissions =~ ^[0-7]{3,4}$ ]] && (( (8#\$permissions & 8#022) == 0 ))
+}
 $(quote_env)
+assert_staged_file "\$bootstrap_contract"
+assert_staged_file "\$provenance_contract"
 bash "\$bootstrap_contract"
-rm -f "\$bootstrap_contract"
 bash "\$provenance_contract" --prepare-production-root $remote_source_root_q
 [[ ! -e $remote_source_root_q && ! -L $remote_source_root_q ]]
 install -d -m 0700 $remote_source_root_q
-aws --region '${Q124_REGION}' s3 cp 's3://${Q124_ARTIFACT_BUCKET}/${Q124_ARCHIVE_KEY}' /tmp/q124-source.tar.gz --only-show-errors
-printf '%s  %s\n' '${Q124_ARCHIVE_SHA256}' /tmp/q124-source.tar.gz | sha256sum -c -
-tar -xzf /tmp/q124-source.tar.gz -C $remote_source_root_q --no-same-owner
+archive=\$Q124_SSM_STAGE/source.tar.gz
+[[ ! -e \$archive && ! -L \$archive ]]
+aws --region '${Q124_REGION}' s3 cp 's3://${Q124_ARTIFACT_BUCKET}/${Q124_ARCHIVE_KEY}' "\$archive" --only-show-errors
+[[ -f \$archive && ! -L \$archive ]]
+archive_uid=\$(/usr/bin/stat -c '%u' "\$archive" 2>/dev/null || /usr/bin/stat -f '%u' "\$archive")
+[[ \$archive_uid =~ ^[0-9]+$ && \$archive_uid == "\${Q124_SSM_STAGE_UID:?}" ]]
+chmod go-w "\$archive"
+assert_staged_file "\$archive"
+printf '%s  %s\n' '${Q124_ARCHIVE_SHA256}' "\$archive" | sha256sum -c -
+# The private staging directory prevents unprivileged replacement. Re-proving
+# identity and content immediately before extraction also makes a checksum
+# barrier replacement fail closed in the executable contract.
+assert_staged_file "\$archive"
+printf '%s  %s\n' '${Q124_ARCHIVE_SHA256}' "\$archive" | sha256sum -c - >/dev/null
+assert_staged_file "\$archive"
+tar --no-same-owner -xzf "\$archive" -C $remote_source_root_q
 bash "\$provenance_contract" --production $remote_source_root_q \
   'deploy/aws/qualification/q124-remote.sh=${Q124_MANIFEST_REMOTE_SHA256}' \
   'deploy/aws/qualification/q124-device-proof.sh=${Q124_MANIFEST_DEVICE_PROOF_SHA256}' \
@@ -255,13 +271,15 @@ bash $remote_source_root_q/deploy/aws/qualification/q124-remote.sh prepare
 EOF
 )
 else
+  bootstrap_stage_command=
   command=$(cat <<EOF
 set -euo pipefail
-provenance_contract=/var/tmp/q124-provenance-${provenance_sha}.sh
-trap 'rm -f "\$provenance_contract"' EXIT HUP INT TERM
-printf '%s' '${provenance_encoded}' | base64 --decode >"\$provenance_contract"
-printf '%s  %s\n' '${provenance_sha}' "\$provenance_contract" | sha256sum -c - >/dev/null
-chmod 0700 "\$provenance_contract"
+provenance_contract=\${Q124_SSM_STAGE:?}/provenance.sh
+[[ -f \$provenance_contract && ! -L \$provenance_contract ]]
+provenance_uid=\$(/usr/bin/stat -c '%u' "\$provenance_contract" 2>/dev/null || /usr/bin/stat -f '%u' "\$provenance_contract")
+provenance_mode=\$(/usr/bin/stat -c '%a' "\$provenance_contract" 2>/dev/null || /usr/bin/stat -f '%Lp' "\$provenance_contract")
+[[ \$provenance_uid =~ ^[0-9]+$ && \$provenance_uid == "\${Q124_SSM_STAGE_UID:?}" ]]
+[[ \$provenance_mode =~ ^[0-7]{3,4}$ ]] && (( (8#\$provenance_mode & 8#022) == 0 ))
 $(quote_env)
 export AWS_REGION='${Q124_REGION}' AWS_DEFAULT_REGION='${Q124_REGION}'
 export Q124_SOURCE_ROOT=$remote_source_root_q
@@ -283,15 +301,85 @@ guard_timeout=$((Q124_SSM_EXECUTION_TIMEOUT_SECONDS - 30))
 printf -v command_guard_dir_q %q "$command_guard_dir"
 command=$(cat <<EOF
 set -euo pipefail
-guard_contract=/var/tmp/q124-guard-${intent_nonce}.sh
-payload_contract=/var/tmp/q124-payload-${intent_nonce}.sh
-cleanup_contracts() { rm -f "\$guard_contract" "\$payload_contract"; }
-trap cleanup_contracts EXIT HUP INT TERM
-printf '%s' '${guard_encoded}' | base64 --decode >"\$guard_contract"
-printf '%s' '${payload_encoded}' | base64 --decode >"\$payload_contract"
-printf '%s  %s\n' '${guard_sha}' "\$guard_contract" | sha256sum -c - >/dev/null
-printf '%s  %s\n' '${payload_sha}' "\$payload_contract" | sha256sum -c - >/dev/null
-chmod 0700 "\$guard_contract" "\$payload_contract"
+umask 077
+run_uid=\$(/usr/bin/id -u)
+[[ \$run_uid == 0 ]]
+stage_parent=/run/cats-q124-ssm
+stage=
+cleanup_stage() {
+  local rc=\$?
+  trap - EXIT HUP INT TERM
+  if [[ -n \$stage && \$stage == "\$stage_parent/"* && -d \$stage && ! -L \$stage ]]; then
+    /bin/rm -rf -- "\$stage"
+  fi
+  exit "\$rc"
+}
+trap cleanup_stage EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+stat_uid() { /usr/bin/stat -c '%u' "\$1" 2>/dev/null || /usr/bin/stat -f '%u' "\$1"; }
+stat_mode() { /usr/bin/stat -c '%a' "\$1" 2>/dev/null || /usr/bin/stat -f '%Lp' "\$1"; }
+assert_trusted_directory() {
+  local directory=\$1 exact_owner=\${2:-} uid permissions
+  [[ -d \$directory && ! -L \$directory ]] || return 1
+  uid=\$(stat_uid "\$directory") || return 1
+  permissions=\$(stat_mode "\$directory") || return 1
+  [[ \$uid =~ ^[0-9]+$ && \$permissions =~ ^[0-7]{3,4}$ ]] || return 1
+  if [[ -n \$exact_owner ]]; then
+    [[ \$uid == "\$exact_owner" ]] || return 1
+  else
+    [[ \$uid == 0 || \$uid == "\$run_uid" ]] || return 1
+  fi
+  (( (8#\$permissions & 8#022) == 0 ))
+}
+assert_staged_file() {
+  local staged=\$1 uid permissions
+  [[ \$staged == "\$stage/"* && -f \$staged && ! -L \$staged ]] || return 1
+  uid=\$(stat_uid "\$staged") || return 1
+  permissions=\$(stat_mode "\$staged") || return 1
+  [[ \$uid =~ ^[0-9]+$ && \$uid == "\$run_uid" ]] || return 1
+  [[ \$permissions =~ ^[0-7]{3,4}$ ]] && (( (8#\$permissions & 8#022) == 0 ))
+}
+create_staged_file() {
+  local staged=\$1 encoded=\$2 expected=\$3 actual
+  [[ \$staged == "\$stage/"* && ! -e \$staged && ! -L \$staged ]] || return 1
+  (set -o noclobber; printf '%s' "\$encoded" | base64 --decode >"\$staged") || return 1
+  chmod 0700 "\$staged"
+  assert_staged_file "\$staged" || return 1
+  actual=\$(sha256sum "\$staged" | awk '{print \$1}') || return 1
+  [[ \$actual == "\$expected" ]]
+}
+stage_parent_parent=\${stage_parent%/*}
+canonical_parent=\$(cd -- "\$stage_parent_parent" && pwd -P)
+[[ \$canonical_parent == "\$stage_parent_parent" ]]
+directory=/
+assert_trusted_directory "\$directory"
+remaining=\${stage_parent_parent#/}
+while [[ -n \$remaining ]]; do
+  component=\${remaining%%/*}
+  [[ -n \$component ]]
+  if [[ \$remaining == */* ]]; then remaining=\${remaining#*/}; else remaining=; fi
+  if [[ \$directory == / ]]; then directory=/\$component; else directory=\$directory/\$component; fi
+  assert_trusted_directory "\$directory"
+done
+[[ ! -L \$stage_parent && ( ! -e \$stage_parent || -d \$stage_parent ) ]]
+if [[ ! -e \$stage_parent ]]; then /usr/bin/install -d -m 0700 "\$stage_parent"; fi
+assert_trusted_directory "\$stage_parent" "\$run_uid"
+stage=\$(/usr/bin/mktemp -d "\$stage_parent/${Q124_EXPECTED_MANIFEST_SHA256}.${intent_nonce}.XXXXXX")
+canonical_stage=\$(cd -- "\$stage" && pwd -P)
+[[ \$canonical_stage == "\$stage" && \$stage == "\$stage_parent/"* ]]
+assert_trusted_directory "\$stage" "\$run_uid"
+: q124_stage_ready
+create_staged_file "\$stage/provenance.sh" '${provenance_encoded}' '${provenance_sha}'
+${bootstrap_stage_command}
+create_staged_file "\$stage/guard.sh" '${guard_encoded}' '${guard_sha}'
+create_staged_file "\$stage/payload.sh" '${payload_encoded}' '${payload_sha}'
+guard_contract=\$stage/guard.sh
+payload_contract=\$stage/payload.sh
+assert_staged_file "\$guard_contract"
+assert_staged_file "\$payload_contract"
+export Q124_SSM_STAGE=\$stage Q124_SSM_STAGE_UID=\$run_uid
 export Q124_COMMAND_GUARD_DIR=$command_guard_dir_q
 bash "\$guard_contract" "\$payload_contract" '${Q124_EXPECTED_MANIFEST_SHA256}' '${intent_nonce}' '${mode}' '${intent_not_after}' '${guard_timeout}'
 EOF

@@ -30,8 +30,22 @@ case $action in
     "$Q124_REAL_JQ" -er '.commands[0]' "$parameters" >"$Q124_CAPTURED_COMMAND"
     rc=0
     if [[ ${Q124_SSM_SKIP_EXECUTE:-0} != 1 ]]; then
+      execution_command=$Q124_CAPTURED_COMMAND
+      if [[ -n ${Q124_SSM_FIXTURE_STAGE_PARENT:-} ]]; then
+        execution_command=${Q124_SSM_EXECUTION_COMMAND:?fixture execution command required}
+        printf -v fixture_parent_q %q "$Q124_SSM_FIXTURE_STAGE_PARENT"
+        fixture_uid=$(/usr/bin/id -u)
+        awk -v parent="stage_parent=$fixture_parent_q" \
+          -v owner="[[ \$run_uid == $fixture_uid ]]" \
+          -v hook='"$Q124_SSM_STAGE_ATTACK_BIN" "$stage"' '
+          $0 == "stage_parent=/run/cats-q124-ssm" { print parent; next }
+          $0 == "[[ $run_uid == 0 ]]" { print owner; next }
+          $0 == ": q124_stage_ready" { print hook; next }
+          { print }
+        ' "$Q124_CAPTURED_COMMAND" >"$execution_command"
+      fi
       set +e
-      env PATH="$Q124_SSM_REMOTE_PATH" bash "$Q124_CAPTURED_COMMAND" >"$Q124_SSM_STDOUT" 2>"$Q124_SSM_STDERR"
+      env PATH="$Q124_SSM_REMOTE_PATH" bash "$execution_command" >"$Q124_SSM_STDOUT" 2>"$Q124_SSM_STDERR"
       rc=$?
       set -e
     fi
