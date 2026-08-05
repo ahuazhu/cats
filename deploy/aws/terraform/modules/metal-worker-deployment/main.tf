@@ -82,10 +82,11 @@ locals {
     runtime_secret=""
     runtime_overlay=""
     environment_temp=""
+    seed_temp=""
     cleanup() {
       rm -rf -- "$stage_path"
       rm -f -- "$artifact_path"
-      for temporary_path in "$runtime_secret" "$runtime_overlay" "$environment_temp"; do
+      for temporary_path in "$runtime_secret" "$runtime_overlay" "$environment_temp" "$seed_temp"; do
         if [ -n "$temporary_path" ]; then
           rm -f -- "$temporary_path"
         fi
@@ -172,25 +173,31 @@ CATS_MANAGED_ENVIRONMENT
     # production path ever created the non-secret half of the configuration.
     # Seed it once; an existing file is left alone so operator edits survive.
     if [ ! -f "${var.worker_environment_file}" ]; then
-      mkdir -p "$(dirname "${var.worker_environment_file}")"
-      cat > "${var.worker_environment_file}" <<'CATS_BASE_ENVIRONMENT'
-${local.worker_base_environment}
-CATS_BASE_ENVIRONMENT
-
       # Node identity is per worker, never fleet-shared configuration: a
       # second host seeded from a shared map would register as a duplicate of
       # the first. The name is this association's worker key; the advertise
       # address is the host's own primary private IP from IMDSv2.
+      #
+      # The seed is assembled in a temporary file and only installed at the
+      # final path once every fallible step has succeeded. Writing the final
+      # path first would let an IMDS failure strand a worker.env without
+      # identity that no later run repairs, because seeding only happens when
+      # the file is absent.
       imds_token="$(curl -fsS -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')"
       private_ipv4="$(curl -fsS -H "X-aws-ec2-metadata-token: $imds_token" http://169.254.169.254/latest/meta-data/local-ipv4)"
       test -n "$private_ipv4"
+
+      seed_temp="$(mktemp /var/tmp/cats-worker-seed.XXXXXX)"
+      cat > "$seed_temp" <<'CATS_BASE_ENVIRONMENT'
+${local.worker_base_environment}
+CATS_BASE_ENVIRONMENT
       {
         echo "CATS_NODE_ID=__CATS_WORKER_NAME__"
         echo "CATS_NODE_ADVERTISE_URL=http://$private_ipv4:7301"
-      } >> "${var.worker_environment_file}"
+      } >> "$seed_temp"
 
-      chmod 0600 "${var.worker_environment_file}"
-      chown root:root "${var.worker_environment_file}"
+      mkdir -p "$(dirname "${var.worker_environment_file}")"
+      install -o root -g root -m 0600 "$seed_temp" "${var.worker_environment_file}"
     fi
 
     environment_temp="$(mktemp /var/tmp/cats-worker-env.XXXXXX)"
