@@ -150,6 +150,75 @@ resource "kubernetes_persistent_volume_claim_v1" "control_data" {
   }
 }
 
+# Until the control resource store moves off its single SQLite volume
+# (ahuazhu/cats#103), this volume is the only copy of every account, workspace,
+# balance and route, and nothing else backs it up. Data Lifecycle Manager
+# snapshots it daily by tag: the EKS Auto Mode CSI provisioner stamps each
+# volume with its claim's name, so referencing the claim here keeps the target
+# in sync with a rename. A policy whose target tag matches nothing succeeds
+# silently -- the tag below is verified present on the production volume.
+data "aws_partition" "current" {}
+
+data "aws_iam_policy_document" "dlm_assume" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["dlm.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "control_data_snapshots" {
+  name               = "cats-control-data-snapshots"
+  assume_role_policy = data.aws_iam_policy_document.dlm_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "control_data_snapshots" {
+  role       = aws_iam_role.control_data_snapshots.name
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole"
+}
+
+resource "aws_dlm_lifecycle_policy" "control_data" {
+  description        = "Daily snapshots of the Cats control-plane data volume"
+  execution_role_arn = aws_iam_role.control_data_snapshots.arn
+  state              = "ENABLED"
+
+  policy_details {
+    resource_types = ["VOLUME"]
+
+    target_tags = {
+      "kubernetes.io/created-for/pvc/name" = kubernetes_persistent_volume_claim_v1.control_data.metadata[0].name
+    }
+
+    schedule {
+      name      = "daily"
+      copy_tags = true
+
+      create_rule {
+        interval      = 24
+        interval_unit = "HOURS"
+        times         = ["19:00"]
+      }
+
+      retain_rule {
+        count = var.control_data_snapshot_retention
+      }
+
+      tags_to_add = {
+        "cats.run/snapshot-of" = "control-data"
+      }
+    }
+  }
+
+  # The role reference above only orders this policy after the role itself.
+  # Without this, the initial apply can create the policy before the
+  # attachment that gives the role its snapshot permissions.
+  depends_on = [aws_iam_role_policy_attachment.control_data_snapshots]
+}
+
 resource "kubernetes_service_account_v1" "control_plane" {
   metadata {
     name      = "cats-controld"
