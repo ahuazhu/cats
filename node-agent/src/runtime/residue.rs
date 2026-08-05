@@ -334,7 +334,8 @@ pub(crate) fn allocated_tree_bytes(path: &Path) -> Option<u64> {
     let mut total = metadata.blocks().saturating_mul(512);
     if metadata.file_type().is_dir() {
         for entry in std::fs::read_dir(path).ok()? {
-            total = total.saturating_add(allocated_tree_bytes(&entry.ok()?.path())?);
+            let Ok(entry) = entry else { continue };
+            total = total.saturating_add(allocated_tree_bytes(&entry.path()).unwrap_or(0));
         }
     }
     Some(total)
