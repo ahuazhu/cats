@@ -5,9 +5,12 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
+use axum::http::{header, HeaderMap};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -26,9 +29,18 @@ use workos::helpers::{seal_session, SessionData};
 const COOKIE_PASSWORD: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const TEST_RSA_MODULUS: &str = "yRE6rHuNR0QbHO3H3Kt2pOKGVhQqGZXInOduQNxXzuKlvQTLUTv4l4sggh5_CYYi_cvI-SXVT9kPWSKXxJXBXd_4LkvcPuUakBoAkfh-eiFVMh2VrUyWyj3MFl0HTVF9KwRXLAcwkREiS3npThHRyIxuy0ZMeZfxVL5arMhw1SRELB8HoGfG_AtH89BIE9jDBHZ9dLelK9a184zAf8LwoPLxvJb3Il5nncqPcSfKDDodMFBIMc4lQzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi-yUod-j8MtvIj812dkS4QMiRVN_by2h3ZY8LYVGrqZXZTcgn2ujn8uKjXLZVD5TdQ";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MembershipFault {
+    Healthy,
+    Status500,
+    Disconnect,
+}
+
 #[derive(Clone)]
 struct WorkOsStub {
     exchanges: Arc<AtomicUsize>,
+    membership_requests: Arc<AtomicUsize>,
+    membership_fault: Arc<Mutex<MembershipFault>>,
     revoked_sessions: Arc<Mutex<Vec<String>>>,
     personal_organizations: Arc<Mutex<HashMap<String, String>>>,
     personal_memberships: Arc<Mutex<HashMap<String, String>>>,
@@ -178,7 +190,31 @@ fn test_user(id: &str) -> Value {
 async fn list_memberships(
     State(stub): State<WorkOsStub>,
     Query(query): Query<HashMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
+    stub.membership_requests.fetch_add(1, Ordering::SeqCst);
+    match *stub.membership_fault.lock().unwrap() {
+        MembershipFault::Healthy => {}
+        MembershipFault::Status500 => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "injected WorkOS membership failure",
+            )
+                .into_response();
+        }
+        MembershipFault::Disconnect => {
+            let body = Body::from_stream(futures_util::stream::once(async {
+                Err::<String, std::io::Error>(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "injected WorkOS membership connection reset",
+                ))
+            }));
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .unwrap();
+        }
+    }
     let membership =
         |id: &str, user_id: &str, organization_id: &str, organization_name: &str, role: &str| {
             json!({
@@ -255,6 +291,7 @@ async fn list_memberships(
         "data": data,
         "list_metadata": { "before": null, "after": null }
     }))
+    .into_response()
 }
 
 fn test_invitation(id: &str, email: &str, organization_id: &str, state: &str) -> Value {
@@ -444,6 +481,8 @@ struct Ctx {
     base: String,
     http: reqwest::Client,
     exchanges: Arc<AtomicUsize>,
+    membership_requests: Arc<AtomicUsize>,
+    membership_fault: Arc<Mutex<MembershipFault>>,
     revoked_sessions: Arc<Mutex<Vec<String>>>,
     issuer: String,
 }
@@ -451,6 +490,8 @@ struct Ctx {
 impl Ctx {
     async fn new() -> Self {
         let exchanges = Arc::new(AtomicUsize::new(0));
+        let membership_requests = Arc::new(AtomicUsize::new(0));
+        let membership_fault = Arc::new(Mutex::new(MembershipFault::Healthy));
         let revoked_sessions = Arc::new(Mutex::new(Vec::new()));
         let personal_organizations = Arc::new(Mutex::new(HashMap::new()));
         let personal_memberships = Arc::new(Mutex::new(HashMap::new()));
@@ -458,6 +499,8 @@ impl Ctx {
         let invitation_requests = Arc::new(Mutex::new(HashMap::new()));
         let stub = WorkOsStub {
             exchanges: exchanges.clone(),
+            membership_requests: membership_requests.clone(),
+            membership_fault: membership_fault.clone(),
             revoked_sessions: revoked_sessions.clone(),
             personal_organizations,
             personal_memberships,
@@ -567,6 +610,8 @@ impl Ctx {
                 .build()
                 .unwrap(),
             exchanges,
+            membership_requests,
+            membership_fault,
             revoked_sessions,
             issuer,
         }
@@ -595,6 +640,14 @@ impl Ctx {
             "/v1/workspaces/{}/cats",
             self.workspace_id(locator)
         ))
+    }
+
+    fn set_membership_fault(&self, fault: MembershipFault) {
+        *self.membership_fault.lock().unwrap() = fault;
+    }
+
+    fn membership_request_count(&self) -> usize {
+        self.membership_requests.load(Ordering::SeqCst)
     }
 
     async fn begin_login(&self, site: &str) -> (String, String) {
@@ -718,6 +771,17 @@ fn cookie_pair(response: &reqwest::Response, name: &str) -> String {
         .next()
         .unwrap()
         .to_string()
+}
+
+async fn assert_membership_unavailable(response: reqwest::Response) {
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["code"], "unavailable");
+    assert_eq!(
+        body["message"],
+        "WorkOS membership is temporarily unavailable"
+    );
 }
 
 #[tokio::test]
@@ -879,6 +943,113 @@ async fn cli_jwt_lists_and_enforces_multiple_workspaces() {
         .await
         .unwrap();
     assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn cli_jwt_membership_5xx_fails_closed_and_recovers() {
+    let ctx = Ctx::new().await;
+    let token = ctx.cli_token("org_default");
+
+    // Calibrate both the JWT and the membership path before injecting the
+    // failure. This also loads JWKS so the failure below is specifically the
+    // authorization membership dependency, not signing-key discovery.
+    let healthy = ctx
+        .http
+        .get(ctx.cats_url("default/default"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(healthy.status(), StatusCode::OK);
+    let before_failure = ctx.membership_request_count();
+
+    ctx.set_membership_fault(MembershipFault::Status500);
+    let unavailable = tokio::time::timeout(
+        Duration::from_secs(5),
+        ctx.http
+            .get(ctx.cats_url("default/default"))
+            .bearer_auth(&token)
+            .send(),
+    )
+    .await
+    .expect("membership 5xx must produce a bounded API response")
+    .unwrap();
+    assert_membership_unavailable(unavailable).await;
+    let after_failure = ctx.membership_request_count();
+    assert!(after_failure > before_failure);
+
+    let other_account = ctx
+        .http
+        .get(ctx.cats_url("second/default"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other_account.status(), StatusCode::FORBIDDEN);
+    assert_eq!(ctx.membership_request_count(), after_failure);
+
+    ctx.set_membership_fault(MembershipFault::Healthy);
+    let recovered = ctx
+        .http
+        .get(ctx.cats_url("default/default"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(recovered.status(), StatusCode::OK);
+    assert!(ctx.membership_request_count() > after_failure);
+}
+
+#[tokio::test]
+async fn web_session_membership_disconnect_fails_closed_and_recovers() {
+    let ctx = Ctx::new().await;
+    let user_cookie = ctx.login("user", "user-code").await;
+
+    let healthy = ctx
+        .http
+        .get(ctx.cats_url("default/default"))
+        .header("Cookie", &user_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(healthy.status(), StatusCode::OK);
+    let before_failure = ctx.membership_request_count();
+
+    ctx.set_membership_fault(MembershipFault::Disconnect);
+    let unavailable = tokio::time::timeout(
+        Duration::from_secs(5),
+        ctx.http
+            .get(ctx.cats_url("default/default"))
+            .header("Cookie", &user_cookie)
+            .send(),
+    )
+    .await
+    .expect("membership disconnect must produce a bounded API response")
+    .unwrap();
+    assert_membership_unavailable(unavailable).await;
+    let after_failure = ctx.membership_request_count();
+    assert!(after_failure > before_failure);
+
+    let other_account = ctx
+        .http
+        .get(ctx.cats_url("second/default"))
+        .header("Cookie", &user_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other_account.status(), StatusCode::FORBIDDEN);
+    assert_eq!(ctx.membership_request_count(), after_failure);
+
+    ctx.set_membership_fault(MembershipFault::Healthy);
+    let recovered = ctx
+        .http
+        .get(ctx.cats_url("default/default"))
+        .header("Cookie", &user_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(recovered.status(), StatusCode::OK);
+    assert!(ctx.membership_request_count() > after_failure);
 }
 
 #[tokio::test]
