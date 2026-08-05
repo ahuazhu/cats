@@ -215,7 +215,10 @@ infrastructure stack outputs. All container images must include an immutable
 `@sha256:...` digest. Changes to
 the runtime Secret or RDS CA alter Pod template checksums and therefore trigger
 a zero-unavailable rolling rollout. `cats-controld` runs at least two replicas
-on distinct nodes; singleton loops elect independently through PostgreSQL.
+on distinct nodes. Required hostname anti-affinity keeps the second replica
+Pending until EKS Auto Mode supplies another eligible node, rather than
+silently co-locating both replicas; singleton loops elect independently through
+PostgreSQL.
 
 ### Automatic main deployment
 

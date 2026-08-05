@@ -117,12 +117,28 @@ fn production_control_plane_survives_one_pod_or_node_disruption() {
         "replicas = var.control_plane_replicas",
         "type = \"RollingUpdate\"",
         "max_unavailable = \"0\"",
+        "pod_anti_affinity {",
+        "required_during_scheduling_ignored_during_execution {",
         "topology_key       = \"kubernetes.io/hostname\"",
         "when_unsatisfiable = \"DoNotSchedule\"",
     ] {
         assert!(
             deployment.contains(expected),
             "control-plane Deployment is missing {expected:?}"
+        );
+    }
+    let required_anti_affinity = deployment
+        .split("required_during_scheduling_ignored_during_execution {")
+        .nth(1)
+        .and_then(|rest| rest.split("topology_spread_constraint {").next())
+        .expect("required control-plane hostname anti-affinity block");
+    for expected in [
+        "topology_key = \"kubernetes.io/hostname\"",
+        "\"app.kubernetes.io/name\" = \"cats-controld\"",
+    ] {
+        assert!(
+            required_anti_affinity.contains(expected),
+            "required control-plane anti-affinity is missing {expected:?}"
         );
     }
     assert!(variables.contains("var.control_plane_replicas >= 2"));

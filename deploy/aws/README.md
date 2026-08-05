@@ -120,9 +120,12 @@ replica takes over.
 
 The control resource database lives in managed PostgreSQL. `cats-controld`
 runs at least two API replicas on distinct Kubernetes nodes with a rolling
-strategy and a disruption budget. Reconciler, billing enforcer and usage
-projector roles elect independently through dedicated PostgreSQL session
-advisory locks; losing that session cancels the role before failover.
+strategy and a disruption budget. Required hostname anti-affinity makes a
+second replica stay Pending until EKS Auto Mode supplies another eligible node;
+the scheduler cannot silently co-locate both replicas on one node. Reconciler,
+billing enforcer and usage projector roles elect independently through
+dedicated PostgreSQL session advisory locks; losing that session cancels the
+role before failover.
 
 The database carries a schema version. `cats-controld` migrates only stamped
 versions inside the build's supported range and fails closed on incompatible
