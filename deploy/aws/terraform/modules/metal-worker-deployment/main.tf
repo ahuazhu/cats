@@ -69,7 +69,8 @@ locals {
 
     # jq was already being used below without ever being checked for. It is
     # also what render-postgres-url uses to read the managed secret.
-    for required in aws jq zstd tar sha256sum findmnt; do
+    # curl talks to IMDS when a fresh host derives its advertise address.
+    for required in aws jq zstd tar sha256sum findmnt curl; do
       command -v "$required" >/dev/null 2>&1 || {
         echo "worker deployment needs $required on the host" >&2
         exit 1
@@ -175,6 +176,19 @@ CATS_MANAGED_ENVIRONMENT
       cat > "${var.worker_environment_file}" <<'CATS_BASE_ENVIRONMENT'
 ${local.worker_base_environment}
 CATS_BASE_ENVIRONMENT
+
+      # Node identity is per worker, never fleet-shared configuration: a
+      # second host seeded from a shared map would register as a duplicate of
+      # the first. The name is this association's worker key; the advertise
+      # address is the host's own primary private IP from IMDSv2.
+      imds_token="$(curl -fsS -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')"
+      private_ipv4="$(curl -fsS -H "X-aws-ec2-metadata-token: $imds_token" http://169.254.169.254/latest/meta-data/local-ipv4)"
+      test -n "$private_ipv4"
+      {
+        echo "CATS_NODE_ID=__CATS_WORKER_NAME__"
+        echo "CATS_NODE_ADVERTISE_URL=http://$private_ipv4:7301"
+      } >> "${var.worker_environment_file}"
+
       chmod 0600 "${var.worker_environment_file}"
       chown root:root "${var.worker_environment_file}"
     fi
@@ -430,7 +444,9 @@ resource "aws_ssm_association" "worker_deploy" {
   association_name = "${local.resource_name}-${each.key}-${substr(var.worker_bundle_sha256, 0, 12)}"
 
   parameters = {
-    commands = local.deployment_script
+    # The script is shared across the fleet except for the one line where a
+    # fresh host learns who it is.
+    commands = replace(local.deployment_script, "__CATS_WORKER_NAME__", each.key)
   }
 
   targets {
