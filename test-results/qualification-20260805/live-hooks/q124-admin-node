@@ -11,6 +11,21 @@ TOKEN_FILE="/etc/cats/qualification-124/admin-token"
 
 die() { printf 'error: %s\n' "$*" >&2; exit 2; }
 
+cat_scope_valid() {
+  local cat_id="$1" cat_name="$2"
+  [[ -z "${cat_id}" && -z "${cat_name}" ]] ||
+    [[ "${cat_id}" =~ ^cat_[A-Za-z0-9_-]+$ && "${cat_name}" =~ ^q124-[a-z0-9-]+$ ]]
+}
+
+if [[ "${1:-}" == --validate-scope-fixtures ]]; then
+  cat_scope_valid '' ''
+  cat_scope_valid cat_fixture q124-fixture
+  ! cat_scope_valid '' q124-fixture
+  ! cat_scope_valid cat_fixture ''
+  printf 'adapter_scope_fixture=PASS empty=true paired=true name_only_rejected=true id_only_rejected=true\n'
+  exit 0
+fi
+
 [[ "${EUID}" == 0 ]] || die "q124 admin adapter must run as root"
 [[ "$#" == 2 ]] || die "usage: q124-admin-node get|cats|cordon|uncordon q124-NODE"
 ACTION="$1"
@@ -20,10 +35,7 @@ case "${ACTION}" in get|cats|cordon|uncordon) ;; *) die "unsupported admin actio
 [[ "${CATS_HA_HOOK_WORKSPACE_ID:-}" == "${WORKSPACE_ID}" ]] || die "invalid workspace scope"
 CAT_ID="${CATS_HA_HOOK_CAT_ID:-}"
 CAT_NAME="${CATS_HA_HOOK_CAT_NAME:-}"
-if [[ -n "${CAT_ID}" || -n "${CAT_NAME}" ]]; then
-  [[ "${CAT_ID}" =~ ^cat_[A-Za-z0-9_-]+$ && "${CAT_NAME}" =~ ^q124-[a-z0-9-]+$ ]] ||
-    die "invalid q124 Cat scope"
-fi
+cat_scope_valid "${CAT_ID}" "${CAT_NAME}" || die "invalid q124 Cat scope"
 for command in curl jq stat; do command -v "${command}" >/dev/null || die "missing ${command}"; done
 [[ -f "${TOKEN_FILE}" && ! -L "${TOKEN_FILE}" ]] || die "missing regular admin token file"
 read -r token_uid token_mode < <(stat -c '%u %a' "${TOKEN_FILE}")

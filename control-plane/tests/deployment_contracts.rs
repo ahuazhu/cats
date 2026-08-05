@@ -657,6 +657,7 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
     }
     for expected in [
         "case \"${ACTION}\" in get|cats|cordon|uncordon)",
+        "cat_scope_valid \"${CAT_ID}\" \"${CAT_NAME}\"",
         "Node assignment escaped exact q124 scope",
         "/etc/cats/qualification-124/admin-token",
         "ws_788c5bfc3931",
@@ -666,6 +667,21 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
             "q124 admin adapter is missing {expected:?}"
         );
     }
+    let scope_fixture = Command::new(
+        workspace_root().join("test-results/qualification-20260805/live-hooks/q124-admin-node"),
+    )
+    .arg("--validate-scope-fixtures")
+    .output()
+    .expect("run q124 admin adapter scope fixture");
+    assert!(
+        scope_fixture.status.success(),
+        "adapter scope fixture failed: {}",
+        String::from_utf8_lossy(&scope_fixture.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&scope_fixture.stdout).trim(),
+        "adapter_scope_fixture=PASS empty=true paired=true name_only_rejected=true id_only_rejected=true"
+    );
 }
 
 #[test]

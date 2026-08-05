@@ -255,10 +255,39 @@ iso_to_epoch_ms() {
   ' "$1"
 }
 
+# Before create returns an immutable Cat ID, the adapter scope must be wholly
+# unbound even though the harness has already selected the future q124 name.
+# Once an ID exists, ID and name are always passed as one validated pair.
+admin_cat_scope() {
+  local cat_name="$1" cat_id="$2"
+  if [[ -z "${cat_id}" ]]; then
+    printf '|\n'
+    return 0
+  fi
+  [[ "${cat_id}" =~ ^cat_[A-Za-z0-9_-]+$ && "${cat_name}" =~ ^q124-[a-z0-9-]+$ ]] || return 1
+  printf '%s|%s\n' "${cat_id}" "${cat_name}"
+}
+
+invoke_admin_node_hook() {
+  local hook="$1" action="$2" node_id="$3" cat_name="$4" cat_id="$5"
+  local scope scope_cat_id scope_cat_name
+  scope="$(admin_cat_scope "${cat_name}" "${cat_id}")" || {
+    echo "refusing incomplete current Cat adapter scope" >&2
+    return 2
+  }
+  scope_cat_id="${scope%%|*}"
+  scope_cat_name="${scope#*|}"
+  CATS_HA_HOOK_WORKSPACE_ID="${WORKSPACE_ID}" \
+    CATS_HA_HOOK_CAT_ID="${scope_cat_id}" \
+    CATS_HA_HOOK_CAT_NAME="${scope_cat_name}" \
+    "${hook}" "${action}" "${node_id}"
+}
+
 validate_fixtures() {
   local fixture_root cat_file operation_file stale_file watermark_file log_file handoff_iso handoff_epoch
   local node_empty node_empty_cats node_owned node_owned_cats node_raced_cats
-  local harness_self call_log stub_bin stub_hook scope_log
+  local harness_self call_log stub_bin stub_hook scope_log adapter_file scope scope_hook scope_output
+  local WORKSPACE_ID="ws_788c5bfc3931"
   fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/cats-ha-fixture.XXXXXX")"
   FIXTURE_ROOT="${fixture_root}"
   trap 'rm -rf -- "${FIXTURE_ROOT}"' EXIT
@@ -277,6 +306,31 @@ validate_fixtures() {
   stub_bin="${fixture_root}/bin"
   stub_hook="${fixture_root}/admin-hook"
   scope_log="${fixture_root}/wrong-workspace.log"
+  adapter_file="test-results/qualification-20260805/live-hooks/q124-admin-node"
+  "${adapter_file}" --validate-scope-fixtures
+  scope="$(admin_cat_scope q124-before-create '')"
+  [[ "${scope}" == '|' ]] || {
+    echo "before-create name was not converted to wholly unbound adapter scope" >&2
+    return 1
+  }
+  scope="$(admin_cat_scope q124-created cat_fixture)"
+  [[ "${scope}" == 'cat_fixture|q124-created' ]] || return 1
+  if admin_cat_scope '' cat_fixture >/dev/null; then
+    echo "harness scope builder accepted an ID without a Cat name" >&2
+    return 1
+  fi
+  scope_hook="${fixture_root}/scope-hook"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'printf "%s|%s|%s|%s|%s\n" "${CATS_HA_HOOK_WORKSPACE_ID}" "${CATS_HA_HOOK_CAT_ID}" "${CATS_HA_HOOK_CAT_NAME}" "$1" "$2"' \
+    >"${scope_hook}"
+  chmod 700 "${scope_hook}"
+  scope_output="$(invoke_admin_node_hook "${scope_hook}" get q124-fixture-node q124-before-create '')"
+  [[ "${scope_output}" == 'ws_788c5bfc3931|||get|q124-fixture-node' ]] || {
+    echo "before-create real adapter environment path retained a half-bound Cat scope" >&2
+    return 1
+  }
+  scope_output="$(invoke_admin_node_hook "${scope_hook}" get q124-fixture-node q124-created cat_fixture)"
+  [[ "${scope_output}" == 'ws_788c5bfc3931|cat_fixture|q124-created|get|q124-fixture-node' ]] || return 1
   mkdir -p "${stub_bin}"
   printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\\n" "$(basename "$0") $*" >>"${Q124_CALL_LOG}"' 'exit 99' \
     >"${stub_bin}/cats"
@@ -374,7 +428,7 @@ validate_fixtures() {
   done
   rm -rf -- "${FIXTURE_ROOT}"
   trap - EXIT
-  printf 'fixture_validation=PASS wrong_workspace_zero_calls=true transition_generation=true stale_rejected=true relaxed_backlog=true watermark_node_bound=true node_empty=true node_exact_cat=true user_cat_race_rejected=true workflow_log=true\n'
+  printf 'fixture_validation=PASS adapter_scope_empty=true adapter_scope_paired=true adapter_scope_half_rejected=true before_create_scope_unbound=true wrong_workspace_zero_calls=true transition_generation=true stale_rejected=true relaxed_backlog=true watermark_node_bound=true node_empty=true node_exact_cat=true user_cat_race_rejected=true workflow_log=true\n'
 }
 
 dry_run() {
@@ -501,10 +555,8 @@ admin_node_json() {
   # Re-hash immediately before every adapter call so a replacement never
   # reaches get, cats, cordon or uncordon.
   verify_admin_hook_provenance
-  output="$(CATS_HA_HOOK_WORKSPACE_ID="${WORKSPACE_ID}" \
-    CATS_HA_HOOK_CAT_ID="${CURRENT_CAT_ID}" \
-    CATS_HA_HOOK_CAT_NAME="${CURRENT_CAT}" \
-    "${ADMIN_NODE_HOOK}" "${action}" "${REQUIRED_NODE_ID}")" || return
+  output="$(invoke_admin_node_hook "${ADMIN_NODE_HOOK}" "${action}" "${REQUIRED_NODE_ID}" \
+    "${CURRENT_CAT}" "${CURRENT_CAT_ID}")" || return
   case "${output,,}" in
     *authorization:*|*bearer\ *|*set-cookie:*|*x-amz-security-token*|*aws_access_key*|*aws_secret_access_key*)
       echo "admin-node hook emitted secret-like output; refusing to retain it" >&2

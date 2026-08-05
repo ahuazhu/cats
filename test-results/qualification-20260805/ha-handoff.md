@@ -74,6 +74,9 @@ repository. A wrong workspace therefore has zero create, uncordon, and dispatch
 calls. The adapter must be a regular mode-0700 file owned by the harness user;
 its hash is checked against the exact repository path at `CATS_SUT_RELEASE_SHA`
 both at startup and immediately before every invocation.
+Before create returns an immutable Cat ID, the harness passes both Cat scope
+fields empty; after create it always passes the exact ID/name pair. The adapter
+accepts only those two forms and rejects name-only or ID-only scope.
 
 The committed root-only administrator adapter keeps administrator
 authentication separate from the workspace CLI session. It is invoked only as
