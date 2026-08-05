@@ -265,6 +265,15 @@ impl Controller {
     }
 
     async fn converge_fenced_node(&self, node_id: &str) -> anyhow::Result<()> {
+        // API confirmations and singleton retries can overlap on different
+        // replicas. Snapshot and revoke only while this dedicated per-node
+        // session lock is held, then re-read the terminal node state.
+        let Some(_fence_lease) = self.store.node_fence_lease(node_id)? else {
+            return Ok(());
+        };
+        if self.store.get_node(node_id)?.state != NodeState::Fenced {
+            return Ok(());
+        }
         for cat in self.store.cats_on_node(node_id)? {
             self.fence_cat_volumes(&cat).await?;
             if self.store.converge_fenced_cat(&cat.id, node_id)? {
@@ -276,8 +285,25 @@ impl Controller {
 
     async fn fence_cat_volumes(&self, cat: &Cat) -> anyhow::Result<()> {
         for disk in self.store.list_disks_for_cat(&cat.id)? {
-            match self.storage_meta.revoke_lease(&disk.volume_id) {
-                Ok(()) | Err(MetaError::NotFound(_)) => {}
+            let head = match self.storage_meta.load_head(&disk.volume_id) {
+                Ok(head) => head,
+                Err(MetaError::NotFound(_)) => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let Some(owner) = head.lease_owner else {
+                continue;
+            };
+            match self.storage_meta.revoke_lease_if_matches(
+                &disk.volume_id,
+                &owner,
+                head.lease_epoch,
+            ) {
+                Ok(true) | Err(MetaError::NotFound(_)) => {}
+                Ok(false) => anyhow::bail!(
+                    "volume {} writer changed while fencing Cat {}; retaining placement",
+                    disk.volume_id,
+                    cat.id
+                ),
                 Err(e) => return Err(e.into()),
             }
         }
@@ -420,6 +446,21 @@ impl Controller {
         // before interpreting the newer desired state; otherwise Starting is
         // ambiguous between StartCat, ResumeCat and RestoreCat.
         if let Some(dispatch) = self.store.lifecycle_dispatch(&cat.id)? {
+            if matches!(
+                &dispatch.job.action,
+                NodeJobAction::StopCat {
+                    disposition: StopCatDisposition::Destroy { .. },
+                    ..
+                }
+            ) && cat.desired_state == DesiredState::Deleted
+                && cat.node_id.is_none()
+                && matches!(
+                    cat.observed_state,
+                    ObservedState::Cold | ObservedState::Deleted
+                )
+            {
+                return self.delete_flow_authorized(cat, &dispatch).await;
+            }
             return self.drive_lifecycle_dispatch(cat, &dispatch).await;
         }
         if provenance_writes_enabled
@@ -796,10 +837,17 @@ impl Controller {
             let running_route = (dispatch.target_state == ObservedState::Running)
                 .then_some((node.id.as_str(), node.gateway_url.as_str()));
             let release_placement = matches!(&dispatch.job.action, NodeJobAction::StopCat { .. });
+            let retain_destroy_authority = matches!(
+                &dispatch.job.action,
+                NodeJobAction::StopCat {
+                    disposition: StopCatDisposition::Destroy { .. },
+                    ..
+                }
+            );
             let settled = self.store.settle_lifecycle_dispatch(
                 dispatch,
                 dispatch.target_state,
-                true,
+                !retain_destroy_authority,
                 None,
                 running_route,
                 release_placement,
@@ -934,19 +982,25 @@ impl Controller {
             }
             NodeJobAction::ResumeCat { .. } | NodeJobAction::RestoreCat { .. } => {
                 // ADR-0002: failed wake converges through an explicit clean
-                // Cold fallback.  Do not clear the original marker unless the
-                // node confirms cleanup; an ambiguous cleanup may have left
-                // the old runtime and its local journal intact.
-                let cleanup = NodeJob {
-                    job_id: nodejob::job_id(&cat.id, dispatch.job.cat_generation, "cleanup_cat"),
+                // Cold fallback. StopCat(Cold) first prevents new writes and
+                // then performs the mandatory remote drain; CleanupCat would
+                // discard the only acknowledged Relaxed journal. Do not clear
+                // the original marker unless the drain is confirmed.
+                let fallback = NodeJob {
+                    job_id: nodejob::job_id(
+                        &cat.id,
+                        dispatch.job.cat_generation,
+                        "wake_fallback_stop_cat",
+                    ),
                     cat_generation: dispatch.job.cat_generation,
-                    action: NodeJobAction::CleanupCat {
+                    action: NodeJobAction::StopCat {
                         cat_id: cat.id.clone(),
+                        disposition: StopCatDisposition::Cold,
                     },
                 };
-                match self.dispatch(&node.agent_url, &cleanup).await {
+                match self.dispatch(&node.agent_url, &fallback).await {
                     Ok(cleaned)
-                        if cleaned.job_id == cleanup.job_id
+                        if cleaned.job_id == fallback.job_id
                             && cleaned.phase == JobPhase::Succeeded =>
                     {
                         self.fence_cat_volumes(cat).await?;
@@ -966,8 +1020,8 @@ impl Controller {
                         tracing::warn!(
                             cat = %cat.id,
                             retry_in_ms = retry_in.as_millis(),
-                            cleanup_result = ?other,
-                            "wake failed ({error}); cleanup is unconfirmed, retaining exact dispatch"
+                            fallback_result = ?other,
+                            "wake failed ({error}); durable Cold fallback is unconfirmed, retaining exact dispatch"
                         );
                     }
                 }
@@ -1018,6 +1072,13 @@ impl Controller {
         let result = match self.dispatch(&node.agent_url, &job).await {
             Ok(result) if result.job_id == job.job_id => result,
             Ok(result) => {
+                if matches!(
+                    &job.action,
+                    NodeJobAction::ResumeCat { .. } | NodeJobAction::RestoreCat { .. }
+                ) {
+                    self.store.set_observed(&cat.id, cat.observed_state)?;
+                    self.defer_retry_key(attempt_key(cat));
+                }
                 tracing::warn!(
                     cat = %cat.id,
                     expected_job = %job.job_id,
@@ -1027,6 +1088,17 @@ impl Controller {
                 return Ok(());
             }
             Err(error) => {
+                if matches!(
+                    &job.action,
+                    NodeJobAction::ResumeCat { .. } | NodeJobAction::RestoreCat { .. }
+                ) {
+                    // A phase-A Starting row has no action provenance. Restore
+                    // the known host-bound source before retrying, otherwise a
+                    // later tick would infer cold StartCat and discard the only
+                    // Relaxed journal after an ambiguous wake response.
+                    self.store.set_observed(&cat.id, cat.observed_state)?;
+                    self.defer_retry_key(attempt_key(cat));
+                }
                 tracing::warn!(cat = %cat.id, job = %job.job_id, "phase-A lifecycle result unknown: {error}");
                 return Ok(());
             }
@@ -1097,15 +1169,19 @@ impl Controller {
                 }
             }
             NodeJobAction::ResumeCat { .. } | NodeJobAction::RestoreCat { .. } => {
-                let cleanup = NodeJob {
-                    job_id: nodejob::job_id(&cat.id, job.cat_generation, "cleanup_cat"),
+                let fallback = NodeJob {
+                    job_id: nodejob::job_id(&cat.id, job.cat_generation, "wake_fallback_stop_cat"),
                     cat_generation: job.cat_generation,
-                    action: NodeJobAction::CleanupCat {
+                    action: NodeJobAction::StopCat {
                         cat_id: cat.id.clone(),
+                        disposition: StopCatDisposition::Cold,
                     },
                 };
-                if let Ok(cleaned) = self.dispatch(&node.agent_url, &cleanup).await {
-                    if cleaned.job_id == cleanup.job_id && cleaned.phase == JobPhase::Succeeded {
+                match self.dispatch(&node.agent_url, &fallback).await {
+                    Ok(cleaned)
+                        if cleaned.job_id == fallback.job_id
+                            && cleaned.phase == JobPhase::Succeeded =>
+                    {
                         self.fence_cat_volumes(cat).await?;
                         self.store.unbind_routes(&cat.id)?;
                         self.store.set_placement(&cat.id, None)?;
@@ -1115,6 +1191,16 @@ impl Controller {
                             job.cat_generation,
                         )?;
                         self.notify.notify_one();
+                    }
+                    other => {
+                        self.store.set_observed(&cat.id, cat.observed_state)?;
+                        let retry_in = self.defer_retry_key(attempt_key(cat));
+                        tracing::warn!(
+                            cat = %cat.id,
+                            retry_in_ms = retry_in.as_millis(),
+                            fallback_result = ?other,
+                            "phase-A wake fallback is unconfirmed; restored source state for safe retry"
+                        );
                     }
                 }
             }
@@ -1185,29 +1271,71 @@ impl Controller {
                 },
             )
             .await?;
-            let current = self.store.must_get_cat_by_id(&cat.id)?;
-            if current.node_id.is_some() || current.observed_state != ObservedState::Cold {
-                // Graceful stop (including its mandatory remote drain) has not
-                // completed. Keep every disk and retry the delete flow later.
-                return Ok(());
-            }
+            // Stop success retains its exact Destroy marker. A later reconcile
+            // claims that authority before any destructive metadata call.
+            return Ok(());
         }
+        // A Cat that was already Cold has no node job to prove. Its desired
+        // generation remains terminal, so direct cleanup uses the guarded
+        // cold-row path below.
+        self.delete_flow_cold(cat).await
+    }
+
+    async fn delete_flow_authorized(
+        &self,
+        cat: &Cat,
+        dispatch: &LifecycleDispatch,
+    ) -> anyhow::Result<()> {
+        let Some(_cleanup_lease) = self.store.destroy_cleanup_lease(&cat.id)? else {
+            return Ok(());
+        };
+        if !self.store.claim_destroy_cleanup(dispatch)? {
+            return Ok(());
+        }
+        self.delete_metadata_and_rows(cat, Some(dispatch)).await
+    }
+
+    async fn delete_flow_cold(&self, cat: &Cat) -> anyhow::Result<()> {
+        let Some(_cleanup_lease) = self.store.destroy_cleanup_lease(&cat.id)? else {
+            return Ok(());
+        };
+        if !self
+            .store
+            .claim_cold_delete_cleanup(&cat.id, cat.generation)?
+        {
+            return Ok(());
+        }
+        self.delete_metadata_and_rows(cat, None).await
+    }
+
+    async fn delete_metadata_and_rows(
+        &self,
+        cat: &Cat,
+        dispatch: Option<&LifecycleDispatch>,
+    ) -> anyhow::Result<()> {
         // Root disk dies with the cat; persistent disks return to Available.
         for binding in self.store.bindings_for_cat(&cat.id)? {
             let disk = self.store.get_disk(&cat.workspace_id, &binding.disk_id)?;
             self.store.unbind_disk(&disk.id)?;
-            if disk.kind == DiskKind::Root {
-                match self.storage_meta.delete_volume(&disk.volume_id) {
-                    Ok(()) | Err(MetaError::NotFound(_)) => {}
-                    Err(e) => return Err(e.into()),
-                }
-                self.store.delete_disk_row(&disk.id)?;
+        }
+        // The binding may already have been removed by a crashed prior retry;
+        // root_disk_id remains the authoritative cleanup key until Cat deletion.
+        if let Ok(root) = self.store.get_disk(&cat.workspace_id, &cat.root_disk_id) {
+            match self.storage_meta.delete_volume(&root.volume_id) {
+                Ok(()) | Err(MetaError::NotFound(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+            self.store.delete_disk_row(&root.id)?;
+        }
+        match dispatch {
+            Some(dispatch) => {
+                self.store.delete_cat_if_destroy_authorized(dispatch)?;
+            }
+            None => {
+                self.store
+                    .delete_cat_if_cold_delete_authorized(&cat.id, cat.generation)?;
             }
         }
-        for op in self.store.pending_operations_for(&cat.id)? {
-            self.store.finish_operation(&op.id, None)?;
-        }
-        self.store.delete_cat_row(&cat.id)?;
         Ok(())
     }
 

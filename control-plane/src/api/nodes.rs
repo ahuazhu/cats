@@ -57,27 +57,8 @@ pub(super) async fn heartbeat(
     // exact persisted dispatch; recording that inventory lets the node recover
     // and replay the same job without guessing across a generation split.
     for hb in &req.cats {
-        if let Ok(cat) = state.store.must_get_cat_by_id(&hb.cat_id) {
-            let trusted_generation = if node.state == NodeState::Lost {
-                heartbeat_proves_claim(&state.store, &cat, hb)?
-            } else {
-                cat.generation == hb.generation
-            };
-            if node.state != NodeState::Fenced
-                && trusted_generation
-                && cat.node_id.as_deref() == Some(req.node_id.as_str())
-                && matches!(
-                    hb.state,
-                    ObservedState::Running | ObservedState::Suspended | ObservedState::Warm
-                )
-                && (cat.observed_state != hb.state
-                    || state.store.observed_generation(&cat.id)? != hb.generation)
-            {
-                state
-                    .store
-                    .set_observed_for_generation(&cat.id, hb.state, hb.generation)?;
-                state.notify.notify_one();
-            }
+        if state.store.apply_heartbeat_observation(&req.node_id, hb)? {
+            state.notify.notify_one();
         }
     }
     if node.state == NodeState::Lost {

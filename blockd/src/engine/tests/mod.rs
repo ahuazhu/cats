@@ -651,6 +651,14 @@ impl MetadataStore for LostCasResponseMeta {
     fn revoke_lease(&self, v: &str) -> cats_storage::metadata::Result<()> {
         self.inner.revoke_lease(v)
     }
+    fn revoke_lease_if_matches(
+        &self,
+        v: &str,
+        a: &str,
+        epoch: i64,
+    ) -> cats_storage::metadata::Result<bool> {
+        self.inner.revoke_lease_if_matches(v, a, epoch)
+    }
     #[allow(clippy::too_many_arguments)]
     fn cas_head(
         &self,
@@ -758,6 +766,14 @@ impl MetadataStore for CountingMeta {
     }
     fn revoke_lease(&self, v: &str) -> cats_storage::metadata::Result<()> {
         self.inner.revoke_lease(v)
+    }
+    fn revoke_lease_if_matches(
+        &self,
+        v: &str,
+        a: &str,
+        epoch: i64,
+    ) -> cats_storage::metadata::Result<bool> {
+        self.inner.revoke_lease_if_matches(v, a, epoch)
     }
     #[allow(clippy::too_many_arguments)]
     fn cas_head(

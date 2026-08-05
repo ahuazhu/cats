@@ -267,15 +267,6 @@ CREATE TABLE IF NOT EXISTS cats (
 );
 ALTER TABLE cats ADD COLUMN IF NOT EXISTS lifecycle_dispatch_json TEXT;
 ALTER TABLE cats ADD COLUMN IF NOT EXISTS observed_generation BIGINT NOT NULL DEFAULT 0;
--- Versions before lifecycle provenance did not store an observed generation.
--- A markerless stable row was written only after that generation's physical
--- transition had completed, so it can be backfilled without replaying every
--- production Cat during a rolling upgrade. Transitional rows remain 0 and
--- therefore fail closed under the provenance rule.
-UPDATE cats SET observed_generation=generation
- WHERE observed_generation=0
-   AND lifecycle_dispatch_json IS NULL
-   AND observed_state IN ('running','suspended','warm','cold');
 CREATE TABLE IF NOT EXISTS disks (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
@@ -380,6 +371,34 @@ CREATE TABLE IF NOT EXISTS routes (
     epoch BIGINT NOT NULL,
     state TEXT NOT NULL
 );
+-- Versions before lifecycle provenance did not store an observed generation.
+-- A stable state name alone is insufficient proof: an old writer could commit
+-- it before route/placement publication. Backfill only a complete physical
+-- topology. Everything else stays 0 and is repaired by phase-A reconciliation.
+UPDATE cats c SET observed_generation=c.generation
+ WHERE c.observed_generation=0
+   AND c.lifecycle_dispatch_json IS NULL
+   AND (
+       (
+           c.observed_state IN ('running','suspended','warm')
+           AND c.node_id IS NOT NULL
+           AND EXISTS (SELECT 1 FROM routes r WHERE r.cat_id=c.id)
+           AND NOT EXISTS (
+               SELECT 1 FROM routes r WHERE r.cat_id=c.id
+                 AND (r.state<>'active' OR r.node_id IS DISTINCT FROM c.node_id
+                      OR r.gateway_url IS NULL)
+           )
+       )
+       OR (
+           c.observed_state='cold' AND c.node_id IS NULL
+           AND EXISTS (SELECT 1 FROM routes r WHERE r.cat_id=c.id)
+           AND NOT EXISTS (
+               SELECT 1 FROM routes r WHERE r.cat_id=c.id
+                 AND (r.state<>'unbound' OR r.node_id IS NOT NULL
+                      OR r.gateway_url IS NOT NULL)
+           )
+       )
+   );
 CREATE TABLE IF NOT EXISTS cat_work_sources (
     cat_id TEXT PRIMARY KEY,
     node_id TEXT NOT NULL,

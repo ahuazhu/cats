@@ -94,9 +94,10 @@ pub(super) async fn disk_action(
             if disk.kind == DiskKind::Root {
                 return Err(ApiError::failed_precondition("cannot mount a root disk").into());
             }
-            let binding = state.store.bind_disk(&disk.id, &cat.id, &mount_at)?;
-            // Hot attach when running; cold cats pick the disk up at start.
-            if cat.observed_state == ObservedState::Running {
+            let (binding, mode) = state
+                .store
+                .bind_disk_for_hot_change(&disk.id, &cat.id, &mount_at)?;
+            if mode == crate::store::DiskChangeMode::HotRunning {
                 if let Err(e) = hot_attach(&state, &cat, &disk, &binding.mount_path).await {
                     state.store.unbind_disk(&disk.id)?;
                     return Err(e);
@@ -109,14 +110,34 @@ pub(super) async fn disk_action(
                 return Err(ApiError::failed_precondition("disk is not mounted").into());
             };
             let cat = state.store.must_get_cat_by_id(&bound_cat)?;
-            if cat.observed_state == ObservedState::Running {
-                hot_detach(&state, &cat, &disk).await?;
+            let (binding, mode) = state.store.unbind_disk_for_hot_change(&disk.id, &cat.id)?;
+            if mode == crate::store::DiskChangeMode::HotRunning {
+                if let Err(error) = hot_detach(&state, &cat, &disk).await {
+                    state.store.restore_binding(&binding)?;
+                    return Err(error);
+                }
             }
-            match state.storage_meta.revoke_lease(&disk.volume_id) {
-                Ok(()) | Err(cats_storage::MetaError::NotFound(_)) => {}
-                Err(e) => return Err(ApiError::internal(e.to_string()).into()),
+            let revoke = match state.storage_meta.load_head(&disk.volume_id) {
+                Ok(head) => match head.lease_owner {
+                    Some(owner) => state
+                        .storage_meta
+                        .revoke_lease_if_matches(&disk.volume_id, &owner, head.lease_epoch)
+                        .and_then(|revoked| {
+                            if revoked {
+                                Ok(())
+                            } else {
+                                Err(cats_storage::MetaError::Fenced)
+                            }
+                        }),
+                    None => Ok(()),
+                },
+                Err(cats_storage::MetaError::NotFound(_)) => Ok(()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = revoke {
+                state.store.restore_binding(&binding)?;
+                return Err(ApiError::internal(error.to_string()).into());
             }
-            state.store.unbind_disk(&disk.id)?;
             Ok(StatusCode::NO_CONTENT.into_response())
         }
         "resize" => {

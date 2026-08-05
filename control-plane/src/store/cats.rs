@@ -351,12 +351,6 @@ impl Store {
         self.enter(|client| {
             let client = client?;
             let mut tx = client.transaction().map_err(internal)?;
-            if let Some((key, route)) = idempotency {
-                if let Some(operation) = Self::idempotency_operation_in(&mut tx, key, route)? {
-                    tx.commit().map_err(internal)?;
-                    return Ok(operation);
-                }
-            }
             let current: Option<(i64, String, String, String, Option<String>, i64)> = tx
                 .query_opt(
                     "SELECT generation, workspace_id, desired_state, observed_state,
@@ -384,6 +378,17 @@ impl Store {
                     return Err(ApiError::conflict(format!(
                         "generation mismatch: expected {expected}, current {current}"
                     )));
+                }
+            }
+            if current_desired == "deleted" && desired != DesiredState::Deleted {
+                return Err(ApiError::conflict(
+                    "Cat deletion is terminal and cannot be superseded",
+                ));
+            }
+            if let Some((key, route)) = idempotency {
+                if let Some(operation) = Self::idempotency_operation_in(&mut tx, key, route)? {
+                    tx.commit().map_err(internal)?;
+                    return Ok(operation);
                 }
             }
             if current_desired == desired_str(desired) && observed != "failed" {
@@ -451,6 +456,11 @@ impl Store {
                 .map_err(internal)?;
             let (generation, workspace_id, desired) =
                 current.ok_or_else(|| ApiError::not_found(format!("cat {cat_id}")))?;
+            if desired == "deleted" {
+                return Err(ApiError::conflict(
+                    "Cat deletion is terminal and cannot be superseded by work",
+                ));
+            }
             if desired == "running" {
                 return Ok(None);
             }

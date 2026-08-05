@@ -326,6 +326,40 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(())
     }
 
+    fn revoke_lease_if_matches(
+        &self,
+        volume_id: &str,
+        attachment_id: &str,
+        epoch: i64,
+    ) -> Result<bool> {
+        let conn = self.connection()?;
+        let changed = conn
+            .execute(
+                "UPDATE volumes
+                    SET lease_expires_at_ms = 0, lease_epoch = lease_epoch + 1
+                  WHERE volume_id = ?1 AND lease_owner = ?2 AND lease_epoch = ?3",
+                params![volume_id, attachment_id, epoch],
+            )
+            .map_err(sql_err)?;
+        if changed == 1 {
+            return Ok(true);
+        }
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM volumes WHERE volume_id = ?1",
+                params![volume_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(sql_err)?
+            .is_some();
+        if exists {
+            Ok(false)
+        } else {
+            Err(MetaError::NotFound(volume_id.to_string()))
+        }
+    }
+
     fn cas_head(
         &self,
         volume_id: &str,

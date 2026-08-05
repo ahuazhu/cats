@@ -26,6 +26,7 @@ mod work;
 #[cfg(test)]
 mod tests;
 
+pub use disks::DiskChangeMode;
 pub(crate) use leadership::SingletonSession;
 pub use leadership::{OciDeploymentLease, SingletonRole};
 pub use lifecycle::{LegacyLifecycleBegin, LifecycleDispatch};

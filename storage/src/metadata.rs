@@ -74,6 +74,16 @@ pub trait MetadataStore: Send + Sync {
     /// Expire the current lease immediately and bump the epoch, so the old
     /// holder fails closed and cannot renew back in.
     fn revoke_lease(&self, volume_id: &str) -> Result<()>;
+    /// Revoke only the exact writer identity inspected by a fencing flow.
+    /// Implementations must compare owner + epoch and bump the epoch in one
+    /// atomic statement. `false` means another writer already owns the volume;
+    /// that newer writer must not be disturbed by a delayed fence attempt.
+    fn revoke_lease_if_matches(
+        &self,
+        volume_id: &str,
+        attachment_id: &str,
+        epoch: i64,
+    ) -> Result<bool>;
 
     /// Atomically publish a new root and return the new generation.
     ///

@@ -69,8 +69,34 @@ pub fn metadata_store_contract(make_store: impl FnOnce() -> Arc<dyn MetadataStor
     let store = make_store();
     volume_and_resize_contract(store.as_ref());
     lease_contract(store.as_ref());
+    conditional_revoke_contract(store.as_ref());
     expiry_and_stale_epoch_contract(store.as_ref());
     generation_and_snapshot_contract(store.as_ref());
+}
+
+fn conditional_revoke_contract(store: &dyn MetadataStore) {
+    let volume = unique_id("conditional-revoke");
+    store.create_volume(&volume, 1 << 22).unwrap();
+    let old_epoch = store.acquire_lease(&volume, "old-attachment", 10).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let new_epoch = store
+        .acquire_lease(&volume, "new-attachment", 60_000)
+        .unwrap();
+    assert!(!store
+        .revoke_lease_if_matches(&volume, "old-attachment", old_epoch)
+        .unwrap());
+    let unchanged = store.load_head(&volume).unwrap();
+    assert_eq!(unchanged.lease_owner.as_deref(), Some("new-attachment"));
+    assert_eq!(unchanged.lease_epoch, new_epoch);
+    assert!(store
+        .revoke_lease_if_matches(&volume, "new-attachment", new_epoch)
+        .unwrap());
+    assert_eq!(store.load_head(&volume).unwrap().lease_epoch, new_epoch + 1);
+    assert!(matches!(
+        store.revoke_lease_if_matches(&unique_id("missing"), "nobody", 1),
+        Err(MetaError::NotFound(_))
+    ));
+    store.delete_volume(&volume).unwrap();
 }
 
 fn volume_and_resize_contract(store: &dyn MetadataStore) {

@@ -92,6 +92,22 @@ pub struct OciDeploymentLease {
     client: Option<Client>,
 }
 
+/// Serializes every convergence attempt for one externally fenced node across
+/// all control-plane replicas. The dedicated PostgreSQL session deliberately
+/// stays outside `Store`'s shared client mutex and any SQL transaction while
+/// object/metadata-store calls are awaited by the controller.
+pub(crate) struct NodeFenceLease {
+    client: Option<Client>,
+}
+
+impl Drop for NodeFenceLease {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.take() {
+            off_runtime(move || drop(client));
+        }
+    }
+}
+
 impl Drop for OciDeploymentLease {
     fn drop(&mut self) {
         if let Some(client) = self.client.take() {
@@ -101,6 +117,38 @@ impl Drop for OciDeploymentLease {
 }
 
 impl Store {
+    pub(crate) fn node_fence_lease(&self, node_id: &str) -> Result<Option<NodeFenceLease>> {
+        self.try_scoped_safety_lease("node-fence", node_id)
+    }
+
+    pub(crate) fn destroy_cleanup_lease(&self, cat_id: &str) -> Result<Option<NodeFenceLease>> {
+        self.try_scoped_safety_lease("destroy-cleanup", cat_id)
+    }
+
+    fn try_scoped_safety_lease(&self, scope: &str, id: &str) -> Result<Option<NodeFenceLease>> {
+        let mut client =
+            off_runtime(|| schema::connect_client(&self.dsn, self.ca_file.as_deref()))?;
+        let acquired: bool = off_runtime(|| {
+            client
+                .query_one(
+                    "SELECT pg_try_advisory_lock(
+                        hashtextextended(current_schema() || ':' || $1 || ':' || $2, 0::BIGINT)
+                     )",
+                    &[&scope, &id],
+                )
+                .map_err(internal)
+                .and_then(|row| row.try_get(0).map_err(internal))
+        })?;
+        if acquired {
+            Ok(Some(NodeFenceLease {
+                client: Some(client),
+            }))
+        } else {
+            off_runtime(move || drop(client));
+            Ok(None)
+        }
+    }
+
     pub(crate) fn singleton_session(&self, role: SingletonRole) -> Result<SingletonSession> {
         let mut client =
             off_runtime(|| schema::connect_client(&self.dsn, self.ca_file.as_deref()))?;

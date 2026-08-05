@@ -467,6 +467,125 @@ impl Store {
             Ok(true)
         })
     }
+
+    /// Claim the destructive cleanup phase with the exact persisted Destroy
+    /// dispatch as authority. Desired Deleted is terminal, and callers hold the
+    /// per-Cat cleanup session lock across the following external deletions.
+    pub fn claim_destroy_cleanup(&self, dispatch: &LifecycleDispatch) -> Result<bool> {
+        let expected = serde_json::to_string(dispatch).map_err(internal)?;
+        self.with(|client| {
+            client
+                .execute(
+                    "UPDATE cats
+                        SET observed_state='deleted', observed_state_since_ms=$4,
+                            observed_generation=generation
+                      WHERE id=$1 AND generation=$2 AND desired_state='deleted'
+                        AND node_id IS NULL AND lifecycle_dispatch_json=$3
+                        AND observed_state IN ('cold','deleted')",
+                    &[
+                        &dispatch.job.action.cat_id(),
+                        &dispatch.job.cat_generation,
+                        &expected,
+                        &now_ms(),
+                    ],
+                )
+                .map(|changed| changed == 1)
+        })
+    }
+
+    pub fn claim_cold_delete_cleanup(&self, cat_id: &str, generation: i64) -> Result<bool> {
+        self.with(|client| {
+            client
+                .execute(
+                    "UPDATE cats
+                        SET observed_state='deleted', observed_state_since_ms=$3,
+                            observed_generation=generation
+                      WHERE id=$1 AND generation=$2 AND desired_state='deleted'
+                        AND node_id IS NULL AND lifecycle_dispatch_json IS NULL
+                        AND observed_state IN ('creating','cold','failed','deleted')",
+                    &[&cat_id, &generation, &now_ms()],
+                )
+                .map(|changed| changed == 1)
+        })
+    }
+
+    pub fn delete_cat_if_destroy_authorized(&self, dispatch: &LifecycleDispatch) -> Result<bool> {
+        let expected = serde_json::to_string(dispatch).map_err(internal)?;
+        self.delete_cat_if_authorized(
+            dispatch.job.action.cat_id(),
+            dispatch.job.cat_generation,
+            Some(&expected),
+        )
+    }
+
+    pub fn delete_cat_if_cold_delete_authorized(
+        &self,
+        cat_id: &str,
+        generation: i64,
+    ) -> Result<bool> {
+        self.delete_cat_if_authorized(cat_id, generation, None)
+    }
+
+    fn delete_cat_if_authorized(
+        &self,
+        cat_id: &str,
+        generation: i64,
+        marker: Option<&str>,
+    ) -> Result<bool> {
+        self.enter(|client| {
+            let client = client?;
+            let mut tx = client.transaction().map_err(internal)?;
+            let authorized = tx
+                .query_opt(
+                    "SELECT 1 FROM cats
+                      WHERE id=$1 AND generation=$2 AND desired_state='deleted'
+                        AND observed_state='deleted' AND node_id IS NULL
+                        AND lifecycle_dispatch_json IS NOT DISTINCT FROM $3::TEXT
+                      FOR UPDATE",
+                    &[&cat_id, &generation, &marker],
+                )
+                .map_err(internal)?
+                .is_some();
+            if !authorized {
+                tx.commit().map_err(internal)?;
+                return Ok(false);
+            }
+            for operation in tx
+                .query(
+                    "SELECT id FROM operations
+                      WHERE resource_id=$1 AND phase IN ('pending','running')",
+                    &[&cat_id],
+                )
+                .map_err(internal)?
+            {
+                let operation_id: String = operation.try_get(0).map_err(internal)?;
+                Self::finish_operation_in(&mut tx, &operation_id, None)?;
+            }
+            tx.execute("DELETE FROM cat_work_leases WHERE cat_id=$1", &[&cat_id])
+                .map_err(internal)?;
+            tx.execute("DELETE FROM cat_work_sources WHERE cat_id=$1", &[&cat_id])
+                .map_err(internal)?;
+            tx.execute("DELETE FROM mount_bindings WHERE cat_id=$1", &[&cat_id])
+                .map_err(internal)?;
+            tx.execute("DELETE FROM endpoints WHERE cat_id=$1", &[&cat_id])
+                .map_err(internal)?;
+            tx.execute("DELETE FROM routes WHERE cat_id=$1", &[&cat_id])
+                .map_err(internal)?;
+            tx.execute("DELETE FROM oci_deployments WHERE cat_id=$1", &[&cat_id])
+                .map_err(internal)?;
+            let deleted = tx
+                .execute(
+                    "DELETE FROM cats
+                      WHERE id=$1 AND generation=$2 AND desired_state='deleted'
+                        AND observed_state='deleted' AND node_id IS NULL
+                        AND lifecycle_dispatch_json IS NOT DISTINCT FROM $3::TEXT",
+                    &[&cat_id, &generation, &marker],
+                )
+                .map_err(internal)?;
+            tx.commit().map_err(internal)?;
+            Ok(deleted == 1)
+        })
+    }
 }
 
 fn desired_matches_observed(desired: &str, observed: ObservedState) -> bool {

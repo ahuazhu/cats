@@ -91,6 +91,103 @@ impl Store {
         })?
     }
 
+    /// Apply one reported physical Cat state only while the node and Cat claim
+    /// still match in the same transaction. Locking the node row linearizes a
+    /// delayed heartbeat against explicit fencing; locking the Cat row prevents
+    /// an old assignment from overwriting a replacement placement.
+    pub fn apply_heartbeat_observation(
+        &self,
+        node_id: &str,
+        heartbeat: &HeartbeatCat,
+    ) -> Result<bool> {
+        if !matches!(
+            heartbeat.state,
+            ObservedState::Running | ObservedState::Suspended | ObservedState::Warm
+        ) {
+            return Ok(false);
+        }
+        self.enter(|client| {
+            let client = client?;
+            let mut tx = client.transaction().map_err(internal)?;
+            let node = tx
+                .query_opt(
+                    "SELECT state FROM nodes WHERE id=$1 FOR UPDATE",
+                    &[&node_id],
+                )
+                .map_err(internal)?
+                .ok_or_else(|| ApiError::not_found(format!("node {node_id}")))?;
+            let node_state: String = node.try_get(0).map_err(internal)?;
+            if node_state == "fenced" {
+                tx.commit().map_err(internal)?;
+                return Ok(false);
+            }
+            let Some(cat) = tx
+                .query_opt(
+                    "SELECT generation, observed_generation, node_id,
+                            lifecycle_dispatch_json, observed_state
+                       FROM cats WHERE id=$1 FOR UPDATE",
+                    &[&heartbeat.cat_id],
+                )
+                .map_err(internal)?
+            else {
+                tx.commit().map_err(internal)?;
+                return Ok(false);
+            };
+            let generation: i64 = cat.try_get(0).map_err(internal)?;
+            let observed_generation: i64 = cat.try_get(1).map_err(internal)?;
+            let assigned_node: Option<String> = cat.try_get(2).map_err(internal)?;
+            let marker_json: Option<String> = cat.try_get(3).map_err(internal)?;
+            let current_observed: String = cat.try_get(4).map_err(internal)?;
+            if assigned_node.as_deref() != Some(node_id) {
+                tx.commit().map_err(internal)?;
+                return Ok(false);
+            }
+            let provenance_matches = if node_state == "lost" {
+                match marker_json {
+                    Some(json) => {
+                        let dispatch: LifecycleDispatch =
+                            serde_json::from_str(&json).map_err(internal)?;
+                        (heartbeat.state == dispatch.source_state
+                            || heartbeat.state == dispatch.transitional_state
+                            || heartbeat.state == dispatch.target_state)
+                            && (heartbeat.generation == dispatch.job.cat_generation
+                                || heartbeat.generation == observed_generation)
+                    }
+                    None => {
+                        heartbeat.generation == generation
+                            || heartbeat.generation == observed_generation
+                    }
+                }
+            } else {
+                heartbeat.generation == generation
+            };
+            if !provenance_matches {
+                tx.commit().map_err(internal)?;
+                return Ok(false);
+            }
+            let changed = current_observed != observed_str(heartbeat.state)
+                || observed_generation != heartbeat.generation;
+            if changed {
+                tx.execute(
+                    "UPDATE cats
+                        SET observed_state=$2, observed_state_since_ms=$4,
+                            observed_generation=$3
+                      WHERE id=$1 AND node_id=$5",
+                    &[
+                        &heartbeat.cat_id,
+                        &observed_str(heartbeat.state),
+                        &heartbeat.generation,
+                        &now_ms(),
+                        &node_id,
+                    ],
+                )
+                .map_err(internal)?;
+            }
+            tx.commit().map_err(internal)?;
+            Ok(changed)
+        })
+    }
+
     /// The runtime inventory the agent carried in its most recent heartbeat.
     /// Empty both for "reported nothing" and "never reported".
     pub fn reported_cats(&self, node_id: &str) -> Result<Vec<HeartbeatCat>> {

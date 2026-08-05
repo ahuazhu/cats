@@ -1,6 +1,6 @@
 use super::*;
 use cats_api::guest::GuestWorkLease;
-use cats_api::nodejob::{job_id, NodeJob, NodeJobAction, SuspendWorkFence};
+use cats_api::nodejob::{job_id, NodeJob, NodeJobAction, StopCatDisposition, SuspendWorkFence};
 use cats_api::requests::NodeWorkStatusRequest;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -210,6 +210,7 @@ fn state_survives_a_reconnect() {
 fn schema_v1_upgrades_in_place_with_lifecycle_provenance_and_observed_generation() {
     let url = crate::testsupport::isolated_control_store_url();
     let cat_id;
+    let unproven_cat_id;
     {
         let store = Store::connect(&url, None).unwrap();
         let workspace = bootstrap_workspace(&store, "schema-v1");
@@ -230,6 +231,14 @@ fn schema_v1_upgrades_in_place_with_lifecycle_provenance_and_observed_generation
         store.finish_operation(&create.id, None).unwrap();
         store
             .publish_routes(&cat.id, "legacy-node", "http://gateway")
+            .unwrap();
+        let (unproven, _, _) = create_test_cat(&store, &workspace, "running-before-route").unwrap();
+        unproven_cat_id = unproven.id.clone();
+        store
+            .set_placement(&unproven.id, Some("legacy-node"))
+            .unwrap();
+        store
+            .set_observed(&unproven.id, ObservedState::Running)
             .unwrap();
         store
             .with(|client| {
@@ -261,7 +270,10 @@ fn schema_v1_upgrades_in_place_with_lifecycle_provenance_and_observed_generation
     let marker: Option<String> = upgraded
         .with(|client| {
             client
-                .query_one("SELECT lifecycle_dispatch_json FROM cats", &[])?
+                .query_one(
+                    "SELECT lifecycle_dispatch_json FROM cats WHERE id=$1",
+                    &[&cat_id],
+                )?
                 .try_get(0)
         })
         .unwrap();
@@ -269,11 +281,24 @@ fn schema_v1_upgrades_in_place_with_lifecycle_provenance_and_observed_generation
     let observed_generation: i64 = upgraded
         .with(|client| {
             client
-                .query_one("SELECT observed_generation FROM cats", &[])?
+                .query_one(
+                    "SELECT observed_generation FROM cats WHERE id=$1",
+                    &[&cat_id],
+                )?
                 .try_get(0)
         })
         .unwrap();
     assert_eq!(observed_generation, 1);
+    assert_eq!(
+        upgraded.observed_generation(&unproven_cat_id).unwrap(),
+        0,
+        "a legacy Running write before route publication is not physical proof"
+    );
+    assert!(upgraded
+        .cats_needing_work()
+        .unwrap()
+        .iter()
+        .any(|cat| cat.id == unproven_cat_id));
     assert!(
         upgraded
             .cats_needing_work()
@@ -1931,4 +1956,207 @@ fn automatic_deeper_tiers_use_persisted_state_age_and_respect_work() {
     let cat = store.must_get_cat_by_id(&cat_id).unwrap();
     assert_eq!(cat.desired_state, DesiredState::Cold);
     assert_eq!(cat.observed_state, ObservedState::Warm);
+}
+
+fn place_running_cat(store: &Store, cat: &Cat, node_id: &str) {
+    store
+        .register_node(node_id, "http://node", "http://gateway", 8, 16_384, false)
+        .unwrap();
+    store.set_placement(&cat.id, Some(node_id)).unwrap();
+    store
+        .publish_routes(&cat.id, node_id, "http://gateway")
+        .unwrap();
+    store
+        .set_observed_for_generation(&cat.id, ObservedState::Running, cat.generation)
+        .unwrap();
+}
+
+#[test]
+fn destroy_dispatch_is_terminal_and_authorizes_exact_cleanup_only() {
+    let store = test_store();
+    let workspace = bootstrap_workspace(&store, "destroy-authority");
+    let (cat, disks, _) = create_test_cat(&store, &workspace, "destroy-authority").unwrap();
+    place_running_cat(&store, &cat, "destroy-node");
+    let delete = store
+        .set_desired(&cat.id, DesiredState::Deleted, None, "cat.delete")
+        .unwrap();
+    let dispatch = store
+        .begin_lifecycle_dispatch(
+            &cat.id,
+            "destroy-node",
+            ObservedState::Running,
+            ObservedState::Stopping,
+            ObservedState::Cold,
+            NodeJob {
+                job_id: job_id(&cat.id, delete.resource_generation, "stop_cat"),
+                cat_generation: delete.resource_generation,
+                action: NodeJobAction::StopCat {
+                    cat_id: cat.id.clone(),
+                    disposition: StopCatDisposition::Destroy {
+                        disposable_root_disk_ids: vec![cat.root_disk_id.clone()],
+                        retained_persistent_disk_ids: Vec::new(),
+                    },
+                },
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert!(store
+        .set_desired(&cat.id, DesiredState::Running, None, "cat.start")
+        .is_err());
+    assert!(store.ensure_desired_running(&cat.id).is_err());
+    assert!(store
+        .settle_lifecycle_dispatch(&dispatch, ObservedState::Cold, false, None, None, true,)
+        .unwrap());
+    assert_eq!(
+        store
+            .lifecycle_dispatch(&cat.id)
+            .unwrap()
+            .unwrap()
+            .dispatch_id,
+        dispatch.dispatch_id
+    );
+    let mut stale = dispatch.clone();
+    stale.dispatch_id.push_str("-stale");
+    assert!(!store.claim_destroy_cleanup(&stale).unwrap());
+    assert!(store.claim_destroy_cleanup(&dispatch).unwrap());
+    assert!(!store.delete_cat_if_destroy_authorized(&stale).unwrap());
+    for disk in disks {
+        store.unbind_disk(&disk.id).unwrap();
+        store.delete_disk_row(&disk.id).unwrap();
+    }
+    assert!(store.delete_cat_if_destroy_authorized(&dispatch).unwrap());
+    assert!(store.find_cat_by_id(&cat.id).unwrap().is_none());
+}
+
+#[test]
+fn hot_disk_changes_have_zero_side_effects_under_every_lifecycle_marker() {
+    let store = test_store();
+    let workspace = bootstrap_workspace(&store, "hot-change-marker");
+    for (name, action, transitional, target) in [
+        (
+            "start-marker",
+            NodeJobAction::StartCat {
+                cat_id: String::new(),
+                image: "test".into(),
+                cpus: 1,
+                memory_mib: 256,
+                volumes: Vec::new(),
+            },
+            ObservedState::Starting,
+            ObservedState::Running,
+        ),
+        (
+            "suspend-marker",
+            NodeJobAction::SuspendCat {
+                cat_id: String::new(),
+                work_fence: None,
+            },
+            ObservedState::Suspending,
+            ObservedState::Suspended,
+        ),
+        (
+            "warm-marker",
+            NodeJobAction::WarmCat {
+                cat_id: String::new(),
+            },
+            ObservedState::Warming,
+            ObservedState::Warm,
+        ),
+    ] {
+        let (cat, _, _) = create_test_cat(&store, &workspace, name).unwrap();
+        let node_id = format!("node-{name}");
+        place_running_cat(&store, &cat, &node_id);
+        let disk = store
+            .create_disk(
+                &workspace,
+                &format!("disk-{name}"),
+                1 << 22,
+                DiskDurability::Strict,
+            )
+            .unwrap();
+        let action = match action {
+            NodeJobAction::StartCat {
+                image,
+                cpus,
+                memory_mib,
+                volumes,
+                ..
+            } => NodeJobAction::StartCat {
+                cat_id: cat.id.clone(),
+                image,
+                cpus,
+                memory_mib,
+                volumes,
+            },
+            NodeJobAction::SuspendCat { work_fence, .. } => NodeJobAction::SuspendCat {
+                cat_id: cat.id.clone(),
+                work_fence,
+            },
+            NodeJobAction::WarmCat { .. } => NodeJobAction::WarmCat {
+                cat_id: cat.id.clone(),
+            },
+            _ => unreachable!(),
+        };
+        store
+            .begin_lifecycle_dispatch(
+                &cat.id,
+                &node_id,
+                ObservedState::Running,
+                transitional,
+                target,
+                NodeJob {
+                    job_id: job_id(&cat.id, cat.generation, action.kind()),
+                    cat_generation: cat.generation,
+                    action,
+                },
+            )
+            .unwrap();
+        assert!(store
+            .bind_disk_for_hot_change(&disk.id, &cat.id, "/data")
+            .is_err());
+        assert!(store
+            .get_disk(&workspace.id, &disk.id)
+            .unwrap()
+            .bound_cat_id
+            .is_none());
+    }
+}
+
+#[test]
+fn delayed_heartbeat_cannot_cross_fence_or_reassignment() {
+    let store = test_store();
+    let workspace = bootstrap_workspace(&store, "heartbeat-cas");
+    let (cat, _, _) = create_test_cat(&store, &workspace, "heartbeat-cas").unwrap();
+    place_running_cat(&store, &cat, "old-node");
+    store.set_node_state("old-node", NodeState::Fenced).unwrap();
+    let delayed = HeartbeatCat {
+        cat_id: cat.id.clone(),
+        generation: cat.generation,
+        state: ObservedState::Suspended,
+    };
+    assert!(!store
+        .apply_heartbeat_observation("old-node", &delayed)
+        .unwrap());
+    assert_eq!(
+        store.must_get_cat_by_id(&cat.id).unwrap().observed_state,
+        ObservedState::Running
+    );
+    assert!(store.converge_fenced_cat(&cat.id, "old-node").unwrap());
+    place_running_cat(&store, &cat, "new-node");
+    assert!(!store
+        .apply_heartbeat_observation("old-node", &delayed)
+        .unwrap());
+    let current = store.must_get_cat_by_id(&cat.id).unwrap();
+    assert_eq!(current.node_id.as_deref(), Some("new-node"));
+    assert_eq!(current.observed_state, ObservedState::Running);
+}
+
+#[test]
+fn per_node_fence_session_lock_serializes_independent_replicas() {
+    let (first, second) = test_store_pair();
+    let held = first.node_fence_lease("same-node").unwrap().unwrap();
+    assert!(second.node_fence_lease("same-node").unwrap().is_none());
+    drop(held);
+    assert!(second.node_fence_lease("same-node").unwrap().is_some());
 }

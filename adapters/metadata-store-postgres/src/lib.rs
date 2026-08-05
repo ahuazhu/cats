@@ -632,6 +632,41 @@ impl MetadataStore for PostgresMetadataStore {
         })
     }
 
+    fn revoke_lease_if_matches(
+        &self,
+        volume_id: &str,
+        attachment_id: &str,
+        epoch: i64,
+    ) -> Result<bool> {
+        let volume_id = volume_id.to_string();
+        let attachment_id = attachment_id.to_string();
+        self.dispatch(move |client| {
+            let changed = client
+                .execute(
+                    "UPDATE cats_storage_volumes
+                        SET lease_expires_at_ms = 0, lease_epoch = lease_epoch + 1
+                      WHERE volume_id = $1 AND lease_owner = $2 AND lease_epoch = $3",
+                    &[&volume_id, &attachment_id, &epoch],
+                )
+                .map_err(pg_err)?;
+            if changed == 1 {
+                return Ok(true);
+            }
+            let exists = client
+                .query_opt(
+                    "SELECT 1 FROM cats_storage_volumes WHERE volume_id = $1",
+                    &[&volume_id],
+                )
+                .map_err(pg_err)?
+                .is_some();
+            if exists {
+                Ok(false)
+            } else {
+                Err(MetaError::NotFound(volume_id))
+            }
+        })
+    }
+
     fn cas_head(
         &self,
         volume_id: &str,

@@ -2610,6 +2610,137 @@ async fn failed_warm_drain_keeps_the_host_bound_source_for_retry() {
     ctx.wait_observed("warm-safe", ObservedState::Warm).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_resume_uses_durable_cold_stop_and_retains_marker_until_drain_succeeds() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_wake_fallback").await;
+    let created = ctx.create_cat("wake-fallback", None).await;
+    ctx.wait_observed("wake-fallback", ObservedState::Running)
+        .await;
+    let suspend = ctx.action("wake-fallback", "suspend").await;
+    ctx.wait_operation(&suspend.operation.id).await;
+    let suspended = ctx
+        .wait_observed("wake-fallback", ObservedState::Suspended)
+        .await;
+
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("resume_cat".into(), usize::MAX);
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("stop_cat".into(), 1);
+    node.hold_next_job_response("stop_cat");
+    let resume = ctx.action("wake-fallback", "resume").await;
+    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .expect("failed ResumeCat did not attempt a durable Cold fallback");
+
+    let retained = ctx
+        .cp
+        .state
+        .store
+        .must_get_cat_by_id(&created.cat.id)
+        .unwrap();
+    let marker = ctx
+        .cp
+        .state
+        .store
+        .lifecycle_dispatch(&created.cat.id)
+        .unwrap()
+        .expect("ambiguous fallback cleared the original Resume marker");
+    assert!(matches!(marker.job.action, NodeJobAction::ResumeCat { .. }));
+    assert_eq!(retained.node_id, suspended.node_id);
+    assert_eq!(retained.observed_state, ObservedState::Starting);
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .get_operation(&resume.operation.id)
+            .unwrap()
+            .phase,
+        OperationPhase::Pending
+    );
+
+    node.job_response_release.notify_waiters();
+    let running = wait_for_persisted_transition(
+        &ctx.cp,
+        &created.cat.id,
+        &resume.operation.id,
+        ObservedState::Running,
+        OperationPhase::Succeeded,
+    )
+    .await;
+    assert!(running.node_id.is_some());
+    let payloads = node.job_payloads.lock().unwrap();
+    assert!(payloads.iter().any(|job| {
+        job.cat_generation == resume.operation.resource_generation
+            && matches!(
+                &job.action,
+                NodeJobAction::StopCat {
+                    disposition: StopCatDisposition::Cold,
+                    ..
+                }
+            )
+            && job.job_id.ends_with("_wake_fallback_stop_cat")
+    }));
+    assert!(
+        payloads
+            .iter()
+            .all(|job| !matches!(job.action, NodeJobAction::CleanupCat { .. })),
+        "wake fallback must never discard the only Relaxed journal"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase_a_failed_wake_restores_its_source_instead_of_inferring_start_cat() {
+    let ctx = Ctx::new_with_provenance(Default::default(), 25, 30_000, false).await;
+    let node = start_stub_node(&ctx.cp, "node_phase_a_wake_fallback").await;
+    let created = ctx.create_cat("phase-a-wake-fallback", None).await;
+    ctx.wait_observed("phase-a-wake-fallback", ObservedState::Running)
+        .await;
+    let suspend = ctx.action("phase-a-wake-fallback", "suspend").await;
+    ctx.wait_operation(&suspend.operation.id).await;
+    ctx.wait_observed("phase-a-wake-fallback", ObservedState::Suspended)
+        .await;
+    node.quiesce().await;
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("resume_cat".into(), usize::MAX);
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("stop_cat".into(), 1);
+    node.hold_next_job_response("stop_cat");
+    let resume = ctx.action("phase-a-wake-fallback", "resume").await;
+    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .expect("phase-A Resume failure did not attempt Cold fallback");
+    node.job_response_release.notify_waiters();
+    wait_for_persisted_transition(
+        &ctx.cp,
+        &created.cat.id,
+        &resume.operation.id,
+        ObservedState::Suspended,
+        OperationPhase::Pending,
+    )
+    .await;
+    assert!(node.job_payloads.lock().unwrap().iter().all(|job| {
+        job.cat_generation != resume.operation.resource_generation
+            || !matches!(job.action, NodeJobAction::StartCat { .. })
+    }));
+    wait_for_persisted_transition(
+        &ctx.cp,
+        &created.cat.id,
+        &resume.operation.id,
+        ObservedState::Running,
+        OperationPhase::Succeeded,
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn default_auto_suspend_fires_on_the_last_guest_work_release() {
     let ctx = Ctx::new().await;
@@ -3147,6 +3278,180 @@ async fn node_loss_preserves_claim_until_fencing_is_explicitly_confirmed() {
     ));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn api_api_and_singleton_fence_entries_share_one_node_barrier() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_fence_barrier").await;
+    let created = ctx.create_cat("fence-barrier", None).await;
+    let running = ctx
+        .wait_observed("fence-barrier", ObservedState::Running)
+        .await;
+    node.quiesce().await;
+    let root = ctx
+        .cp
+        .state
+        .store
+        .get_disk(&created.cat.workspace_id, &created.cat.root_disk_id)
+        .unwrap();
+    let old_epoch = ctx
+        .cp
+        .state
+        .storage_meta
+        .acquire_lease(&root.volume_id, "old-node-writer", 60_000)
+        .unwrap();
+    ctx.cp
+        .state
+        .store
+        .set_node_state("node_fence_barrier", NodeState::Lost)
+        .unwrap();
+
+    let dsn = match &ctx.config.control_store_dsn {
+        DsnSource::Literal(dsn) => dsn.clone(),
+        DsnSource::File(_) => panic!("test control store uses a literal DSN"),
+    };
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let barrier = std::thread::spawn(move || {
+        let mut client = postgres::Client::connect(&dsn, postgres::NoTls).unwrap();
+        client
+            .query_one(
+                "SELECT pg_advisory_lock(
+                    hashtextextended(current_schema() || ':' || $1 || ':' || $2, 0::BIGINT)
+                 )",
+                &[&"node-fence", &"node_fence_barrier"],
+            )
+            .unwrap();
+        ready_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        client
+            .query_one(
+                "SELECT pg_advisory_unlock(
+                    hashtextextended(current_schema() || ':' || $1 || ':' || $2, 0::BIGINT)
+                 )",
+                &[&"node-fence", &"node_fence_barrier"],
+            )
+            .unwrap();
+    });
+    tokio::task::block_in_place(|| {
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("test fence barrier was not acquired");
+    });
+
+    let fence_url = ctx.url("/v1/admin/nodes/node_fence_barrier/actions/fence");
+    let first_http = ctx.http.clone();
+    let first_url = fence_url.clone();
+    let first = tokio::spawn(async move {
+        first_http
+            .post(first_url)
+            .bearer_auth("dev-admin-token")
+            .json(&FenceNodeRequest {
+                confirm_host_stopped_or_isolated: true,
+            })
+            .send()
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let second_http = ctx.http.clone();
+    let second = tokio::spawn(async move {
+        second_http
+            .post(fence_url)
+            .bearer_auth("dev-admin-token")
+            .json(&FenceNodeRequest {
+                confirm_host_stopped_or_isolated: true,
+            })
+            .send()
+            .await
+            .unwrap()
+    });
+
+    // Both API calls and the singleton tick are now contenders. None may take
+    // its Cat snapshot or revoke a volume until the common session lock opens.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let dsn = match &ctx.config.control_store_dsn {
+        DsnSource::Literal(dsn) => dsn.clone(),
+        DsnSource::File(_) => unreachable!(),
+    };
+    let cat_id = created.cat.id.clone();
+    let observed = std::thread::spawn(move || {
+        let mut client = postgres::Client::connect(&dsn, postgres::NoTls).unwrap();
+        let node_state: String = client
+            .query_one(
+                "SELECT state FROM nodes WHERE id=$1",
+                &[&"node_fence_barrier"],
+            )
+            .unwrap()
+            .get(0);
+        let cat_node: Option<String> = client
+            .query_one("SELECT node_id FROM cats WHERE id=$1", &[&cat_id])
+            .unwrap()
+            .get(0);
+        (node_state, cat_node)
+    })
+    .join()
+    .unwrap();
+    assert_eq!(observed.0, "fenced");
+    assert_eq!(observed.1, running.node_id);
+    assert_eq!(
+        ctx.cp
+            .state
+            .storage_meta
+            .load_head(&root.volume_id)
+            .unwrap()
+            .lease_epoch,
+        old_epoch
+    );
+    release_tx.send(()).unwrap();
+    tokio::task::block_in_place(|| barrier.join().unwrap());
+    assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+    assert_eq!(second.await.unwrap().status(), StatusCode::OK);
+    ctx.cp.state.notify.notify_one();
+    let fenced = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let cat = ctx
+                .cp
+                .state
+                .store
+                .must_get_cat_by_id(&created.cat.id)
+                .unwrap();
+            if cat.node_id.is_none() {
+                break cat;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("singleton did not resume the fenced-node convergence");
+    assert!(fenced.node_id.is_none());
+    let revoked = ctx
+        .cp
+        .state
+        .storage_meta
+        .load_head(&root.volume_id)
+        .unwrap();
+    assert_eq!(revoked.lease_epoch, old_epoch + 1);
+
+    let replacement_epoch = ctx
+        .cp
+        .state
+        .storage_meta
+        .acquire_lease(&root.volume_id, "replacement-writer", 60_000)
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let replacement = ctx
+        .cp
+        .state
+        .storage_meta
+        .load_head(&root.volume_id)
+        .unwrap();
+    assert_eq!(
+        replacement.lease_owner.as_deref(),
+        Some("replacement-writer")
+    );
+    assert_eq!(replacement.lease_epoch, replacement_epoch);
+}
+
 #[tokio::test]
 async fn control_plane_startup_grace_preserves_a_reconnecting_host_bound_cat() {
     let dir = tempfile::tempdir().unwrap();
@@ -3197,11 +3502,18 @@ async fn control_plane_startup_grace_preserves_a_reconnecting_host_bound_cat() {
             .unwrap();
         cat_id = cat.id.clone();
         store.set_placement(&cat_id, Some("node_a")).unwrap();
-        store
+        let suspend = store
             .set_desired(&cat_id, DesiredState::Suspended, None, "cat.suspend")
             .unwrap();
         store
-            .set_observed(&cat_id, ObservedState::Suspended)
+            .publish_routes(&cat_id, "node_a", "http://127.0.0.1:1")
+            .unwrap();
+        store
+            .set_observed_for_generation(
+                &cat_id,
+                ObservedState::Suspended,
+                suspend.resource_generation,
+            )
             .unwrap();
     }
     // Make the persisted heartbeat older than the configured Node lease
@@ -3528,6 +3840,184 @@ async fn destroy_deletes_root_disk_and_keeps_persistent() {
     };
     assert_eq!(disposable_root_disk_ids.len(), 1);
     assert_eq!(retained_persistent_disk_ids, &[disks.items[0].id.clone()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persisted_destroy_rejects_every_new_lifecycle_authority() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_destroy_terminal").await;
+    let created = ctx.create_cat("destroy-terminal", None).await;
+    ctx.wait_observed("destroy-terminal", ObservedState::Running)
+        .await;
+    node.quiesce().await;
+    node.hold_next_job_response("stop_cat");
+    let deletion = ctx
+        .http
+        .delete(ctx.ws_url("/cats/destroy-terminal"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deletion.status(), StatusCode::ACCEPTED);
+    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .expect("Destroy StopCat was not dispatched");
+    let held = ctx
+        .cp
+        .state
+        .store
+        .must_get_cat_by_id(&created.cat.id)
+        .unwrap();
+    let marker = ctx
+        .cp
+        .state
+        .store
+        .lifecycle_dispatch(&created.cat.id)
+        .unwrap()
+        .expect("Destroy dispatch was not persisted");
+    assert!(matches!(
+        marker.job.action,
+        NodeJobAction::StopCat {
+            disposition: StopCatDisposition::Destroy { .. },
+            ..
+        }
+    ));
+    for verb in ["start", "resume", "suspend", "warm", "stop"] {
+        let response = ctx
+            .http
+            .post(ctx.ws_url(&format!("/cats/destroy-terminal/actions/{verb}")))
+            .bearer_auth("dev-admin-token")
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "{verb} superseded Destroy"
+        );
+    }
+    let still_held = ctx
+        .cp
+        .state
+        .store
+        .must_get_cat_by_id(&created.cat.id)
+        .unwrap();
+    assert_eq!(still_held.generation, held.generation);
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .lifecycle_dispatch(&created.cat.id)
+            .unwrap()
+            .unwrap()
+            .dispatch_id,
+        marker.dispatch_id
+    );
+    assert!(ctx
+        .cp
+        .state
+        .store
+        .auto_tier_candidates(Some(0), Some(0))
+        .unwrap()
+        .iter()
+        .all(|cat_id| cat_id != &created.cat.id));
+    node.job_response_release.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while ctx
+            .cp
+            .state
+            .store
+            .find_cat_by_id(&created.cat.id)
+            .unwrap()
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("authorized Destroy cleanup did not finish");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mount_during_lifecycle_marker_changes_no_binding_epoch_or_node_volume() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_hot_change_guard").await;
+    let created = ctx.create_cat("hot-change-guard", None).await;
+    ctx.wait_observed("hot-change-guard", ObservedState::Running)
+        .await;
+    let disk: Disk = ctx
+        .http
+        .post(ctx.ws_url("/disks"))
+        .bearer_auth("dev-admin-token")
+        .json(&CreateDiskRequest {
+            name: "guarded-disk".into(),
+            size_bytes: 8 << 20,
+            durability: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let before = ctx
+        .cp
+        .state
+        .storage_meta
+        .load_head(&disk.volume_id)
+        .unwrap();
+    node.quiesce().await;
+    node.hold_next_job_response("suspend_cat");
+    let suspend = ctx.action("hot-change-guard", "suspend").await;
+    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .expect("Suspend marker was not held");
+    let attach_jobs_before = node
+        .job_payloads
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|job| matches!(job.action, NodeJobAction::AttachDisk { .. }))
+        .count();
+    let mount = ctx
+        .http
+        .post(ctx.ws_url("/disks/guarded-disk/actions/mount"))
+        .bearer_auth("dev-admin-token")
+        .json(&serde_json::json!({
+            "cat_id": "hot-change-guard",
+            "mount_at": "/data"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mount.status(), StatusCode::CONFLICT);
+    let after_disk = ctx
+        .cp
+        .state
+        .store
+        .get_disk(&created.cat.workspace_id, &disk.id)
+        .unwrap();
+    assert!(after_disk.bound_cat_id.is_none());
+    let after = ctx
+        .cp
+        .state
+        .storage_meta
+        .load_head(&disk.volume_id)
+        .unwrap();
+    assert_eq!(after.lease_owner, before.lease_owner);
+    assert_eq!(after.lease_epoch, before.lease_epoch);
+    assert_eq!(
+        node.job_payloads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|job| matches!(job.action, NodeJobAction::AttachDisk { .. }))
+            .count(),
+        attach_jobs_before
+    );
+    node.job_response_release.notify_waiters();
+    ctx.wait_operation(&suspend.operation.id).await;
 }
 
 #[tokio::test]
