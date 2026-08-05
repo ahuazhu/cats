@@ -248,6 +248,15 @@ only opens stamped versions inside the same range.
 ADR-0031 deliberately cut over without importing the old SQLite rows. The
 application state removes the control-data PVC and its temporary DLM policy;
 the final manual EBS snapshot remains the archive of the pre-cutover database.
+Because Terraform can schedule that orphaned PVC destroy before the in-place
+Deployment update that removes its mount, the production workflow handles this
+one legacy edge explicitly: after saving the complete reviewed plan, it checks
+for `cats-control-data`. If the claim is still mounted only by
+`cats-controld`, the workflow verifies that the saved plan restores the
+PostgreSQL-era Deployment to one replica, scales the old Deployment to zero,
+waits until no Pod consumes the claim, and only then applies the saved plan. It
+never removes the PVC protection finalizer or force-deletes the volume. Once a
+state has crossed the cutover and the PVC is absent, the step is a no-op.
 
 ## Importing the existing Kubernetes deployment
 
