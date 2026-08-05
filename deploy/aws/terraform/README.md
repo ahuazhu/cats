@@ -239,12 +239,15 @@ Terraform inputs. This is a deployment path for an already bootstrapped
 environment; the first application install still needs the explicit secret
 injection described above.
 
-Before planning, the workflow reads only the live SQLite header with Python and
-compares `PRAGMA user_version` with the build's `SCHEMA_VERSION`. `cats-controld`
-does not migrate, so the workflow fails before replacing the live Pod on any
-mismatch. It never copies resource rows or deletes the PVC — recreating the
-database stays an explicit operator action described in the AWS deployment
-runbook.
+Before planning, the workflow extracts both PostgreSQL control-schema bounds
+from the build and queries `control_schema_version` through a one-off in-cluster
+`psql` Pod. A missing version table is the reviewed fresh-schema case; cluster,
+scheduling, authentication and query failures all fail closed. `cats-controld`
+only opens stamped versions inside the same range.
+
+ADR-0031 deliberately cut over without importing the old SQLite rows. The
+application state removes the control-data PVC and its temporary DLM policy;
+the final manual EBS snapshot remains the archive of the pre-cutover database.
 
 ## Importing the existing Kubernetes deployment
 
@@ -252,8 +255,6 @@ Do not run the first application apply while the YAML-created objects are
 outside state. Import every live object at its module address first, including:
 
 - Namespace `cats`;
-- StorageClass `cats-auto-ebs`;
-- PVC `cats/cats-control-data`;
 - ServiceAccount `cats/cats-controld`, Secret `cats/cats-runtime` and ConfigMap
   `cats/cats-rds-ca`;
 - both Deployments and Services;
@@ -263,6 +264,9 @@ Before import, export the live YAML and reconcile intentional differences.
 After import, require a plan with no unexpected replacement or deletion. The
 legacy files under `deploy/aws/k8s/` are migration references only and must not
 be applied again.
+
+The former `cats-auto-ebs` StorageClass and `cats-control-data` PVC are not
+part of the PostgreSQL-era application state and must not be imported.
 
 Terraform will additionally create `cats-gateway-runtime`, which exposes only
 `CATS_AUTH_TOKEN` to the gateway. The gateway must not receive PostgreSQL or
