@@ -122,25 +122,14 @@ jobs:
             --selector app.kubernetes.io/name=cats-controld \
             --output=json)"
           owner_probe="control-ha-owner-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          # The DSN expands inside the probe container, not on this runner.
-          # shellcheck disable=SC2016
+          owner_query="SELECT a.client_addr::text FROM pg_locks AS l JOIN pg_stat_activity AS a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.classid=hashtext(current_schema())::oid AND l.objid=420201 AND l.objsubid=2 AND l.granted"
           leader_ip="$(
-            "${kube[@]}" run "$owner_probe" \
-              --restart=Never --rm --attach --quiet \
-              --image=postgres:16 \
-              --overrides='{
-                "spec": {
-                  "containers": [{
-                    "name": "psql",
-                    "image": "postgres:16",
-                    "command": ["sh", "-ceu",
-                      "psql \"$CATS_POSTGRES_URL\" -v ON_ERROR_STOP=1 -tA -c \"SELECT a.client_addr::text FROM pg_locks AS l JOIN pg_stat_activity AS a ON a.pid=l.pid WHERE l.locktype=\u0027advisory\u0027 AND l.classid=hashtext(current_schema())::oid AND l.objid=420201 AND l.objsubid=2 AND l.granted\""],
-                    "envFrom": [{"secretRef": {"name": "cats-runtime"}}]
-                  }]
-                }
-              }'
+            deploy/aws/run-postgres-probe.sh \
+              "$KUBECONFIG" \
+              cats \
+              "$owner_probe" \
+              "$owner_query"
           )"
-          leader_ip="$(tr -d '[:space:]' <<<"$leader_ip")"
           target="$(jq -r --arg ip "$leader_ip" '
             [.items[] | select(
               .status.podIP == $ip
@@ -242,25 +231,14 @@ jobs:
           fi
 
           probe="control-ha-owner-after-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          # The DSN expands inside the probe container, not on this runner.
-          # shellcheck disable=SC2016
+          owner_query="SELECT a.client_addr::text FROM pg_locks AS l JOIN pg_stat_activity AS a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.classid=hashtext(current_schema())::oid AND l.objid=420201 AND l.objsubid=2 AND l.granted"
           leader_ip="$(
-            "${kube[@]}" run "$probe" \
-              --restart=Never --rm --attach --quiet \
-              --image=postgres:16 \
-              --overrides='{
-                "spec": {
-                  "containers": [{
-                    "name": "psql",
-                    "image": "postgres:16",
-                    "command": ["sh", "-ceu",
-                      "psql \"$CATS_POSTGRES_URL\" -v ON_ERROR_STOP=1 -tA -c \"SELECT a.client_addr::text FROM pg_locks AS l JOIN pg_stat_activity AS a ON a.pid=l.pid WHERE l.locktype=\u0027advisory\u0027 AND l.classid=hashtext(current_schema())::oid AND l.objid=420201 AND l.objsubid=2 AND l.granted\""],
-                    "envFrom": [{"secretRef": {"name": "cats-runtime"}}]
-                  }]
-                }
-              }'
+            deploy/aws/run-postgres-probe.sh \
+              "$KUBECONFIG" \
+              cats \
+              "$probe" \
+              "$owner_query"
           )"
-          leader_ip="$(tr -d '[:space:]' <<<"$leader_ip")"
           new_leader="$(jq -r --arg ip "$leader_ip" '
             [.items[] | select(.status.podIP == $ip) | .metadata.name]
             | if length == 1 then .[0] else empty end

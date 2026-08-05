@@ -306,10 +306,11 @@ jobs:
           probe="control-schema-check-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           set +e
           query_output="$(
-            deploy/aws/run-control-schema-probe.sh \
+            deploy/aws/run-postgres-probe.sh \
               "$RUNNER_TEMP/kubeconfig" \
               cats \
-              "$probe"
+              "$probe" \
+              "SELECT version FROM control_schema_version"
           )"
           query_status=$?
           set -e

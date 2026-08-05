@@ -246,11 +246,12 @@ injection described above.
 Before planning, the workflow extracts both PostgreSQL control-schema bounds
 from the build and queries `control_schema_version` through a one-off in-cluster
 `psql` Pod. It creates the Pod without attaching, waits for a terminal phase,
-then reads its logs exactly once and checks the container exit code; this avoids
-`kubectl` attach fallback replaying a fast command's output. A missing version
-table is the reviewed fresh-schema case; cluster, scheduling, authentication
-and query failures all fail closed. `cats-controld` only opens stamped versions
-inside the same range.
+then reads its logs exactly once and checks the container exit code. The guarded
+HA drill uses the same runner when it maps the PostgreSQL advisory-lock owner to
+a control-plane Pod. This avoids `kubectl` attach fallback replaying a fast
+command's output in either safety gate. A missing version table is the reviewed
+fresh-schema case; cluster, scheduling, authentication and query failures all
+fail closed. `cats-controld` only opens stamped versions inside the same range.
 
 ADR-0031 deliberately cut over without importing the old SQLite rows. The
 application state removes the control-data PVC and its temporary DLM policy;
