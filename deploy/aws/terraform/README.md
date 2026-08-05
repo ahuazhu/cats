@@ -284,17 +284,54 @@ A worker release is a drain boundary. Before applying a new bundle:
 
 1. run `cats admin node drain <node-id>`;
 2. wait until `cats admin node get <node-id>` reports
-   `state=cordoned cats=0`;
+   `state=cordoned cats=0 orphans=0`;
 3. apply the reviewed infrastructure plan and wait for the SSM association to
    succeed;
 4. run `cats admin node uncordon <node-id>`.
 
+A drain acts on both the control plane's assignments and the agent's own
+reported inventory: a Cat the agent runs that the control plane never assigned
+there (an *orphan runtime*, ADR-0030) gets a Cold stop by its reported
+identity, and the node does not reach `cordoned` while any orphan remains. So
+`state=cordoned` genuinely means the node runs nothing.
+
 The association independently refuses to change installed files while any Cat
-PID remains in the worker's metering cgroups. This is a fail-closed guard
-against bypassing the drain runbook; it does not cordon the node itself and
-therefore is not a substitute for step 1. Do not copy production binaries,
-patch the seed, or edit `worker.env` manually; update the bundle digest or
-secret input and apply Terraform.
+PID remains in the worker's metering cgroups **or** any `cats-blockd` /
+`cloud-hypervisor` process is alive on the host. The process-table check
+exists because a blockd is not metered: with the Guests gone the cgroup walk
+reads clean, yet `systemctl stop cats-worker` (default
+`KillMode=control-group`) would kill a surviving blockd together with any
+unpublished journal it holds — on a relaxed volume that journal is the only
+authoritative copy. This is a fail-closed guard against bypassing the drain
+runbook; it does not cordon the node itself and therefore is not a substitute
+for step 1. Do not copy production binaries, patch the seed, or edit
+`worker.env` manually; update the bundle digest or secret input and apply
+Terraform.
+
+### When the drain cannot converge
+
+An orphan whose Cold stop is refused by storage fencing
+(`root CAS conflict: expected generation N`) can never stop cleanly: its root
+was superseded elsewhere, its local journal is stale and must not be
+published. The drain deliberately does not escalate — whether to discard a
+journal is an operator decision, not the control plane's. After confirming
+the refusal is a CAS conflict (not a transient metadata-store error) in the
+controller logs, discard that Cat explicitly through the node agent's job
+API, which kills its processes and deletes its runtime directory **without
+publishing**:
+
+```sh
+# CATS_AUTH_TOKEN as installed in the worker's runtime secret (worker.env).
+curl -sS -X POST "http://<node-agent>/v1/jobs" \
+  -H "Authorization: Bearer $CATS_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"job_id":"manual-cleanup-<cat-id>","cat_generation":<reported-generation>,
+       "action":"cleanup_cat","cat_id":"<cat-id>"}'
+```
+
+Use this only for Cats whose stop was refused by fencing. For any other
+failure (usage spool, transient storage errors) let the drain retry: those
+stops publish once the dependency recovers.
 
 ## PostgreSQL split runbook
 

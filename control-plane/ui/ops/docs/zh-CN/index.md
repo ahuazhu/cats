@@ -42,6 +42,8 @@
 4.  确认 Allocation、Dirty/Pending Commit、Route Binding 与本地 Snapshot 归零。
 5.  完成身份与本地 Cache 清理后，才能删除或替换 Node。
 
+Drain 同时会对*孤儿运行时*执行 Cold Stop：即 Agent 在心跳中上报、但控制面并未分配给该 Node 的 Cat。每个 Node 视图都会显示孤儿计数，计数不归零 Drain 就不会进入 Cordoned。若孤儿的停止被存储 fencing 拒绝（`root CAS conflict`），说明它持有不得发布的 journal，永远无法干净停止；丢弃它必须由操作员对 Node Agent 的 Job API 显式执行，绝不自动发生——参见部署文档中的 Worker Release Runbook。
+
 ## Node 丢失
 
 心跳超时会把 Node 标为 Lost、Cat 标为 Unknown，但特意保留 placement、Route 和磁盘 epoch，也不会启动重复 Guest。只有一次心跳完整报告全部保留 claim、且每个 Cat 的 generation 都匹配时，Node 才恢复 Ready 并原地恢复 claim；仅重新注册或 inventory 不完整时仍保持 Lost，让显式 fence 路径继续可用。

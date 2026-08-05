@@ -1,14 +1,17 @@
 #!/bin/sh
 set -eu
 
-metering_root=${1:?usage: require-idle-worker.sh ABSOLUTE_METERING_CGROUP_ROOT}
-case "$metering_root" in
-  /*) ;;
-  *)
-    echo "metering cgroup root must be absolute: $metering_root" >&2
-    exit 1
-    ;;
-esac
+metering_root=${1:?usage: require-idle-worker.sh ABSOLUTE_METERING_CGROUP_ROOT [RUNTIME_BIN_ROOT]}
+runtime_bin_root=${2:-/opt/cats/bin}
+for required_absolute in "$metering_root" "$runtime_bin_root"; do
+  case "$required_absolute" in
+    /*) ;;
+    *)
+      echo "path must be absolute: $required_absolute" >&2
+      exit 1
+      ;;
+  esac
+done
 
 active_cat_pids=""
 if [ -d "$metering_root" ]; then
@@ -30,5 +33,39 @@ fi
 if [ -n "$active_cat_pids" ]; then
   echo "worker still has active Cat processes:$active_cat_pids" >&2
   echo "drain the node and wait for state=cordoned cats=0 before applying the worker release" >&2
+  exit 1
+fi
+
+# The metering cgroups above hold only metered processes: the Guest and its
+# VMM. A cats-blockd is not metered, so a node whose Guests are gone but whose
+# blockd still holds an unpublished journal would pass that walk -- and the
+# release then runs `systemctl stop cats-worker`, whose default
+# KillMode=control-group kills the journal holder (issue #98). Walk the process
+# table for the installed runtime binaries as well. Match the full argv[0]
+# path, never the process comm: comm is truncated to 15 characters, so
+# "cloud-hypervisor" (16) can never match itself there.
+runtime_pids=""
+process_table=$(ps -A -o pid= -o args=)
+set -f
+while IFS= read -r process_line; do
+  # Word-split deliberately: $1 is the pid, $2 the argv[0] path.
+  # shellcheck disable=SC2086
+  set -- $process_line
+  [ "$#" -ge 2 ] || continue
+  case "$2" in
+    "$runtime_bin_root/cats-blockd"|"$runtime_bin_root/cloud-hypervisor")
+      runtime_pids="$runtime_pids $1(${2##*/})"
+      ;;
+  esac
+done <<PROCESS_TABLE
+$process_table
+PROCESS_TABLE
+set +f
+
+if [ -n "$runtime_pids" ]; then
+  echo "worker still has live Cat runtime processes:$runtime_pids" >&2
+  echo "a live cats-blockd may hold the only copy of unpublished writes; stopping cats-worker would kill it" >&2
+  echo "drain the node and wait for state=cordoned cats=0 orphans=0 before applying the worker release" >&2
+  echo "if the drain cannot converge, follow the worker release runbook in deploy/aws/terraform/README.md" >&2
   exit 1
 fi

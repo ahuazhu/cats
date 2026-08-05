@@ -1214,13 +1214,14 @@ fn run_admin(client: &Client, cli: &Cli, cmd: &AdminCommand) -> Result<()> {
                     overview.cats.failed_or_unknown
                 );
                 println!(
-                    "nodes total={} ready={} cordoned={} draining={} lost={} fenced={}",
+                    "nodes total={} ready={} cordoned={} draining={} lost={} fenced={} orphans={}",
                     overview.nodes.total,
                     overview.nodes.ready,
                     overview.nodes.cordoned,
                     overview.nodes.draining,
                     overview.nodes.lost,
-                    overview.nodes.fenced
+                    overview.nodes.fenced,
+                    overview.orphan_cats
                 );
                 println!(
                     "capacity cpu={}/{} memory={}MiB/{}MiB",
@@ -1310,10 +1311,11 @@ fn run_admin(client: &Client, cli: &Cli, cmd: &AdminCommand) -> Result<()> {
 fn print_node(summary: &NodeSummary) {
     let telemetry = summary.node.telemetry.as_ref();
     println!(
-        "{:<18} state={:<9} cats={} cpu={}/{} memory={}MiB/{}MiB heartbeat={}s load={}",
+        "{:<18} state={:<9} cats={} orphans={} cpu={}/{} memory={}MiB/{}MiB heartbeat={}s load={}",
         summary.node.id,
         format!("{:?}", summary.node.state).to_lowercase(),
         summary.assigned_cats,
+        summary.orphan_cats,
         summary.assigned_cpus,
         summary.node.capacity.cpus,
         summary.assigned_memory_mib,

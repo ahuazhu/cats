@@ -227,7 +227,7 @@ function renderNodes() {
   body.innerHTML = state.nodes.map((summary) => `<tr class="node-row" data-node-detail="${escapeHtml(summary.node.id)}" tabindex="0">
     <td><div class="resource-name"><span class="resource-avatar node-avatar">N</span><span><strong>${escapeHtml(summary.node.id)}</strong><small>${escapeHtml(summary.node.agent_url)}</small></span></div></td>
     <td>${statusBadge(summary.node.state)}</td>
-    <td>${escapeHtml(summary.assigned_cats)} Cats<br><small>${escapeHtml(summary.assigned_cpus)} vCPU · ${escapeHtml(formatMib(summary.assigned_memory_mib))}</small></td>
+    <td>${escapeHtml(summary.assigned_cats)} Cats<br><small>${escapeHtml(summary.assigned_cpus)} vCPU · ${escapeHtml(formatMib(summary.assigned_memory_mib))}</small>${summary.orphan_cats ? `<br><small class="node-orphan-warning">${escapeHtml(t("admin.node.orphanCats", { count: summary.orphan_cats }))}</small>` : ""}</td>
     <td>${escapeHtml(summary.node.capacity.cpus)} vCPU · ${escapeHtml(formatMib(summary.node.capacity.memory_mib))}</td>
     <td>${escapeHtml(t("admin.node.secondsAgo", { seconds: summary.heartbeat_age_seconds }))}<br><small>${formatTime(summary.node.last_heartbeat_unix)}</small></td>
     <td class="host-telemetry-cell">${telemetrySummary(summary.node.telemetry)}</td>
@@ -254,7 +254,7 @@ function renderNodeDetails() {
   if (!summary) return;
   document.querySelector("#node-detail-title").textContent = summary.node.id;
   document.querySelector("#node-detail-summary").innerHTML = `<section class="node-detail-summary">
-    <div class="node-detail-identity"><span class="resource-avatar node-avatar">N</span><span><strong>${escapeHtml(summary.node.id)}</strong><small>${escapeHtml(summary.node.agent_url)}</small><small>${escapeHtml(t("admin.node.heartbeatAgo", { seconds: summary.heartbeat_age_seconds }))}</small></span>${statusBadge(summary.node.state)}</div>
+    <div class="node-detail-identity"><span class="resource-avatar node-avatar">N</span><span><strong>${escapeHtml(summary.node.id)}</strong><small>${escapeHtml(summary.node.agent_url)}</small><small>${escapeHtml(t("admin.node.heartbeatAgo", { seconds: summary.heartbeat_age_seconds }))}</small>${summary.orphan_cats ? `<small class="node-orphan-warning">${escapeHtml(t("admin.node.orphanCats", { count: summary.orphan_cats }))}</small>` : ""}</span>${statusBadge(summary.node.state)}</div>
     ${telemetrySummary(summary.node.telemetry)}
   </section>`;
 

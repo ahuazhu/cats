@@ -382,6 +382,12 @@ pub struct NodeSummary {
     pub assigned_cpus: u32,
     pub assigned_memory_mib: u64,
     pub heartbeat_age_seconds: u64,
+    /// Cats the agent reported in its latest heartbeat that the control plane
+    /// does not have assigned to this node. Non-zero means the node runs
+    /// workloads no operator surface would otherwise show, and a drain will
+    /// not cordon until it reaches zero.
+    #[serde(default)]
+    pub orphan_cats: u64,
 }
 
 /// Administrator-facing Cat row within one worker node.
@@ -492,6 +498,10 @@ pub struct MonitoringOverview {
     pub operations: OperationCounts,
     pub capacity: FleetCapacity,
     pub usage: FleetUsage,
+    /// Fleet-wide total of agent-reported Cats without a matching assignment,
+    /// summed over the latest heartbeat of every node.
+    #[serde(default)]
+    pub orphan_cats: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

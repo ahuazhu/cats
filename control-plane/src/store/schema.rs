@@ -55,6 +55,13 @@ impl Store {
         // upgrades by being opened, and every deployment recorded before v4 is
         // simply absent -- correct, because a Cat's applications are Guest-side
         // state that a fresh deployment re-establishes.
+        if control_plane_schema_exists > 0 && stamped < 5 {
+            // v4 -> v5: the node's last agent-reported runtime inventory
+            // (issue #98). Starts NULL: no node has reported since the
+            // upgrade, which is exactly what the column means.
+            conn.execute_batch("ALTER TABLE nodes ADD COLUMN reported_cats_json TEXT")
+                .map_err(internal)?;
+        }
         conn.execute_batch(SCHEMA).map_err(internal)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(internal)?;
@@ -71,7 +78,7 @@ impl Store {
 /// the live fleet needs and deletes rungs once no deployment is below them.
 /// Deployment automation reads both constants and refuses to replace a live
 /// Pod whose database this build can neither run nor migrate.
-pub(super) const SCHEMA_VERSION: i64 = 4;
+pub(super) const SCHEMA_VERSION: i64 = 5;
 
 /// The oldest stamped version `Store::open` can still upgrade in place.
 const OLDEST_MIGRATABLE_SCHEMA_VERSION: i64 = 1;
@@ -195,7 +202,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     memory_mib INTEGER NOT NULL,
     last_heartbeat_ms INTEGER NOT NULL,
     telemetry_json TEXT,
-    scheduling_disabled INTEGER NOT NULL DEFAULT 0
+    scheduling_disabled INTEGER NOT NULL DEFAULT 0,
+    reported_cats_json TEXT
 );
 CREATE TABLE IF NOT EXISTS operations (
     id TEXT PRIMARY KEY,
