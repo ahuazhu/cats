@@ -566,6 +566,13 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
         ".metadata.deletionTimestamp == null",
         ".status.phase == \"Running\"",
         "https://cats.run/healthz",
+        "deploy/aws/probe-public-endpoint.py",
+        "--interval-ms 250",
+        "--max-in-flight 16",
+        "endpointslices.discovery.k8s.io",
+        "--output-watch-events",
+        "actions/upload-artifact@v4",
+        "if: always() && inputs.mode == 'disrupt'",
         "rollout status deployment/cats-controld",
         "All 240 public health probes succeeded",
         "reconciler leadership did not move",
@@ -610,7 +617,7 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
     assert_eq!(
         workflow.matches("if: inputs.mode == 'disrupt'").count(),
         2,
-        "both destructive and post-disruption steps must require disrupt mode"
+        "destructive and post-disruption steps must require disrupt mode"
     );
     assert_eq!(
         workflow
@@ -621,6 +628,82 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
     );
     assert!(workflow.contains("observed_uid"));
     assert!(workflow.contains("target_uid"));
+    assert!(
+        !workflow.contains("for attempt in $(seq 1 240)"),
+        "a serial curl loop becomes blind for the duration of a slow request"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn production_ha_probe_models_stale_target_drain_ordering() {
+    let probe = read_workspace_file("deploy/aws/probe-public-endpoint.py");
+    for expected in [
+        "asyncio.Semaphore",
+        "scheduled_monotonic",
+        "schedule_lag_ms",
+        "time_namelookup",
+        "time_connect",
+        "time_appconnect",
+        "time_starttransfer",
+        "time_total",
+        "remote_ip",
+        "headers",
+        r#""/dev/null""#,
+    ] {
+        assert!(
+            probe.contains(expected),
+            "fixed-rate HA probe is missing {expected:?}"
+        );
+    }
+
+    let output = Command::new("python3")
+        .arg(workspace_root().join("deploy/aws/probe-public-endpoint-fixture.py"))
+        .arg("--probe")
+        .arg(workspace_root().join("deploy/aws/probe-public-endpoint.py"))
+        .output()
+        .expect("run the retained-stale-target probe fixture");
+    assert!(
+        output.status.success(),
+        "stale-target fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("fixture output is UTF-8");
+    assert!(stdout.contains("unsafe immediate exit: failures observed"));
+    assert!(stdout.contains("drained exit: all probes succeeded"));
+}
+
+#[cfg(unix)]
+#[test]
+fn production_ha_probe_rejects_invalid_scheduling_inputs() {
+    let probe = workspace_root().join("deploy/aws/probe-public-endpoint.py");
+    let fixture = tempfile::tempdir().expect("HA probe argument fixture");
+    let invalid_cases: &[&[&str]] = &[
+        &["--url", "https://user:password@cats.run/healthz"],
+        &["--url", "https://cats.run/healthz", "--count", "0"],
+        &["--url", "https://cats.run/healthz", "--max-in-flight", "1"],
+        &[
+            "--url",
+            "https://cats.run/healthz",
+            "--expected-status",
+            "99",
+        ],
+    ];
+
+    for (index, arguments) in invalid_cases.iter().enumerate() {
+        let output = Command::new("python3")
+            .arg(&probe)
+            .args(*arguments)
+            .arg("--output-dir")
+            .arg(fixture.path().join(index.to_string()))
+            .output()
+            .expect("run HA probe invalid-input case");
+        assert!(
+            !output.status.success(),
+            "invalid HA probe arguments unexpectedly succeeded: {arguments:?}"
+        );
+    }
 }
 
 #[test]

@@ -167,9 +167,15 @@ terminating owner and a same-node replacement fail closed. Zero, duplicate, or
 ambiguous owner mappings fail before disruption. The owner is resolved again
 at the disruption boundary. A policy/v1 Eviction makes the Kubernetes API
 atomically enforce both the PDB and selected Pod UID. All 240 public `/healthz`
-probes must succeed while Kubernetes replaces the Pod, and the workflow finally
-proves that two node-spread replicas and a new reconciler owner are present. It
-never force-deletes or scales the Deployment.
+probes start on a fixed 250 ms schedule with bounded concurrency, so a slow
+request cannot hide the following observations. Every attempt retains its
+sub-second start/end time, edge address, HTTP status, DNS/connect/TLS/TTFB/total
+timings, response headers and scheduling lag. The first attempt must establish
+a healthy baseline before Eviction. Pod and EndpointSlice watches plus both
+original Pod logs start before that boundary; snapshots and explicit Eviction,
+deletion, rollout and takeover markers are uploaded for 30 days even if a later
+gate fails. The workflow finally proves that two node-spread replicas and a new
+reconciler owner are present. It never force-deletes or scales the Deployment.
 
 The usage ledger has the same rule for the same reason. ADR-0018 replaced the V1
 `project` ownership column with `workspace_id` on usage rows and `account_id` on
