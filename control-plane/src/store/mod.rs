@@ -25,6 +25,7 @@ mod work;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use leadership::SingletonSession;
 pub use leadership::{OciDeploymentLease, SingletonRole};
 pub use oci::{OciDeploymentClaim, OCI_DEPLOY_OPERATION_KIND};
 pub use rows::{parse_desired, parse_observed, parse_wake};

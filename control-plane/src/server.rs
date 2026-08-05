@@ -16,14 +16,16 @@ use crate::store::{DsnSource, SingletonRole, Store};
 const SINGLETON_ELECTION_RETRY: Duration = Duration::from_millis(500);
 const SINGLETON_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Tokio detaches a task when its `JoinHandle` is dropped. Singleton work must
-/// instead stop with the election loop so a shutting-down replica cannot keep
-/// mutating state after its PostgreSQL leadership session has been released.
-struct AbortTaskOnDrop<T>(tokio::task::JoinHandle<T>);
+/// Ask an elected-role supervisor to stop if its election task is cancelled.
+/// The supervisor owns the PostgreSQL session, so dropping this guard cannot
+/// release leadership ahead of the role it is fencing.
+struct CancelSingletonOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
 
-impl<T> Drop for AbortTaskOnDrop<T> {
+impl Drop for CancelSingletonOnDrop {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(cancel) = self.0.take() {
+            let _ = cancel.send(());
+        }
     }
 }
 
@@ -166,41 +168,73 @@ where
             }
 
             tracing::info!(role = role.name(), "acquired singleton leadership");
-            let mut task = AbortTaskOnDrop(tokio::spawn(make_task()));
-            loop {
-                tokio::select! {
-                    result = &mut task.0 => {
-                        match result {
-                            Ok(()) => tracing::warn!(
-                                role = role.name(),
-                                "singleton task exited; relinquishing leadership"
-                            ),
-                            Err(error) => tracing::error!(
-                                role = role.name(),
-                                %error,
-                                "singleton task failed; relinquishing leadership"
-                            ),
-                        }
-                        break;
-                    }
-                    _ = tokio::time::sleep(SINGLETON_HEALTH_INTERVAL) => {
-                        if let Err(error) = session.check() {
-                            tracing::warn!(
-                                role = role.name(),
-                                %error,
-                                "singleton leadership connection was lost"
-                            );
-                            task.0.abort();
-                            let _ = (&mut task.0).await;
-                            break;
-                        }
-                    }
-                }
+            let (cancel, cancelled) = tokio::sync::oneshot::channel();
+            let supervisor =
+                tokio::spawn(run_elected_singleton(session, role, make_task(), cancelled));
+            // Declared after the JoinHandle so task cancellation sends the
+            // signal before detaching the supervisor. The supervisor retains
+            // the advisory lock until its role has actually stopped.
+            let cancel_on_drop = CancelSingletonOnDrop(Some(cancel));
+            if let Err(error) = supervisor.await {
+                tracing::error!(
+                    role = role.name(),
+                    %error,
+                    "singleton supervisor failed; relinquishing leadership"
+                );
             }
-            drop(session);
+            drop(cancel_on_drop);
             tokio::time::sleep(SINGLETON_ELECTION_RETRY).await;
         }
     })
+}
+
+async fn run_elected_singleton<Fut>(
+    mut session: crate::store::SingletonSession,
+    role: SingletonRole,
+    task: Fut,
+    mut cancelled: tokio::sync::oneshot::Receiver<()>,
+) where
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let mut task = tokio::spawn(task);
+    loop {
+        tokio::select! {
+            result = &mut task => {
+                match result {
+                    Ok(()) => tracing::warn!(
+                        role = role.name(),
+                        "singleton task exited; relinquishing leadership"
+                    ),
+                    Err(error) => tracing::error!(
+                        role = role.name(),
+                        %error,
+                        "singleton task failed; relinquishing leadership"
+                    ),
+                }
+                break;
+            }
+            _ = &mut cancelled => {
+                task.abort();
+                let _ = (&mut task).await;
+                break;
+            }
+            _ = tokio::time::sleep(SINGLETON_HEALTH_INTERVAL) => {
+                if let Err(error) = session.check() {
+                    tracing::warn!(
+                        role = role.name(),
+                        %error,
+                        "singleton leadership connection was lost"
+                    );
+                    task.abort();
+                    let _ = (&mut task).await;
+                    break;
+                }
+            }
+        }
+    }
+    // `task.await` above proves its future has been dropped before this owner
+    // releases the PostgreSQL session and makes leadership acquirable again.
+    drop(session);
 }
 
 async fn run_reconciler_role(controller: Arc<Controller>, store: Arc<Store>, interval: Duration) {
