@@ -181,6 +181,11 @@ impl NodeRuntime {
         vhost_user_queues: usize,
         seed_image_id: Option<&str>,
     ) -> Result<BlockdProc> {
+        #[cfg(test)]
+        let _serialized_spawn = self
+            .spawn_blockd_test_lock
+            .as_ref()
+            .map(|lock| lock.lock().expect("spawn_blockd test mutex"));
         let socket = short_socket_path(
             &self.cfg.state_dir,
             cat_id,
@@ -283,6 +288,16 @@ impl NodeRuntime {
         };
         self.wait_blockd_ready(&mut proc)
             .with_context(|| format!("blockd for {} never became ready", grant.disk_id))?;
+        #[cfg(test)]
+        if let Some(probe) = &self.launch_overlap_probe {
+            if let Err(error) = probe.arrive() {
+                // The process has started but ownership has not returned to a
+                // CatRuntime yet, so this branch must reap it explicitly.
+                proc.child.kill_and_reap();
+                proc.remove_socket_files(cat_dir);
+                return Err(error);
+            }
+        }
         Ok(proc)
     }
 

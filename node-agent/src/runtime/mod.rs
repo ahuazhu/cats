@@ -346,6 +346,93 @@ fn warm_state_file(cat_dir: &Path) -> PathBuf {
     cat_dir.join("warm-state.json")
 }
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct LaunchProbeState {
+    arrived: usize,
+    failed: bool,
+}
+
+/// A fail-closed rendezvous for launch workers. Every participant reaches it
+/// only after its own blockd is live. If a node-wide lock serializes StartCat,
+/// the first participant opens the gate in the failed state after the generous
+/// liveness guard, so later participants fail immediately instead of hanging.
+#[cfg(test)]
+#[derive(Debug)]
+struct LaunchOverlapProbe {
+    target: usize,
+    timeout: Duration,
+    state: Mutex<LaunchProbeState>,
+    changed: Condvar,
+    timed_out: AtomicUsize,
+}
+
+#[cfg(test)]
+impl LaunchOverlapProbe {
+    fn new(target: usize) -> Self {
+        Self::with_timeout(target, Duration::from_secs(15))
+    }
+
+    fn with_timeout(target: usize, timeout: Duration) -> Self {
+        Self {
+            target,
+            timeout,
+            state: Mutex::new(LaunchProbeState::default()),
+            changed: Condvar::new(),
+            timed_out: AtomicUsize::new(0),
+        }
+    }
+
+    fn arrive(&self) -> Result<()> {
+        let mut state = self.state.lock().expect("launch overlap probe mutex");
+        if state.failed {
+            bail!("launch overlap probe already failed before this Cat arrived");
+        }
+        state.arrived += 1;
+        if state.arrived == self.target {
+            self.changed.notify_all();
+            return Ok(());
+        }
+
+        let deadline = Instant::now() + self.timeout;
+        while state.arrived < self.target && !state.failed {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                state.failed = true;
+                self.timed_out.fetch_add(1, Ordering::SeqCst);
+                self.changed.notify_all();
+                break;
+            }
+            let (next, wait) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .expect("launch overlap probe mutex");
+            state = next;
+            if wait.timed_out() && state.arrived < self.target {
+                state.failed = true;
+                self.timed_out.fetch_add(1, Ordering::SeqCst);
+                self.changed.notify_all();
+            }
+        }
+
+        if state.failed {
+            bail!(
+                "launch overlap probe saw only {} of {} Cat launches",
+                state.arrived,
+                self.target
+            );
+        }
+        Ok(())
+    }
+
+    fn arrived(&self) -> usize {
+        self.state
+            .lock()
+            .expect("launch overlap probe mutex")
+            .arrived
+    }
+}
+
 pub struct NodeRuntime {
     pub cfg: NodeConfig,
     /// Conservative node-wide serialization for lifecycle/hot-plug paths that
@@ -381,6 +468,15 @@ pub struct NodeRuntime {
     /// be refused for the same reason — only counted. Same configured
     /// concurrency, byte ceiling removed.
     launch_admission: WakeAdmission,
+    /// Unit-test rendezvous inside `spawn_blockd`, after its child is ready but
+    /// before the function returns. It proves the block-backend launch stage
+    /// itself overlaps without exposing a production hook.
+    #[cfg(test)]
+    launch_overlap_probe: Option<Arc<LaunchOverlapProbe>>,
+    /// Known-negative injection that serializes only the `spawn_blockd` stage.
+    /// A sound launch-overlap probe must reject this shape.
+    #[cfg(test)]
+    spawn_blockd_test_lock: Option<Arc<Mutex<()>>>,
     /// Remote Stop/Cold drains may run across Cats, but an expiry wave must not
     /// create unbounded S3/PostgreSQL fan-out.
     stop_admission: StopAdmission,
@@ -457,6 +553,10 @@ impl NodeRuntime {
                 commitment_bytes: u64::MAX,
                 ..cfg_wake_budget
             }),
+            #[cfg(test)]
+            launch_overlap_probe: None,
+            #[cfg(test)]
+            spawn_blockd_test_lock: None,
             stop_admission: StopAdmission::new(MAX_CONCURRENT_STOPS),
             residue: Mutex::new(None),
         })

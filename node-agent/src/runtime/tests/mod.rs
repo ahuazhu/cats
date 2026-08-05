@@ -5,6 +5,7 @@ use cats_api::nodejob::job_id;
 use ledger::CatLedgerRecord;
 
 mod adoption;
+mod concurrent_start;
 mod ledger_writes;
 mod residue_sweep;
 mod suspend_concurrency;

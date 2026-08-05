@@ -41,6 +41,8 @@ mod status;
 pub use gc::GcStats;
 use pack::{apply_local_entry, merge_dirty_range, DirtyByteRange, StagedPack, StagedQueue};
 use plan::{commit_workers, copy_planned_pages, plan_commit, ChunkPlan};
+#[cfg(test)]
+use publish::is_background_publisher_context;
 use publish::{CommitterSignal, EAGER_DRAIN_WATERMARK, MAX_UPLOAD_CONCURRENCY};
 use quota::{pack_reservation_upper, punch_hole};
 pub use status::DurabilityMode;
