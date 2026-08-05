@@ -181,6 +181,18 @@ data "aws_iam_policy_document" "github_application_deploy" {
       "arn:${data.aws_partition.current.partition}:route53:::hostedzone/${module.dns.zone_id}",
     ]
   }
+
+  # The deployment composes the control plane's DSNs from the RDS managed
+  # master secret rather than carrying forward whatever password the live
+  # Kubernetes Secret already held. Without this it would keep reproducing a
+  # copy, and a rotation would again be discovered by replacing the Pod.
+  # Scoped to that one secret.
+  statement {
+    sid       = "ReadDatabaseMasterUserSecret"
+    effect    = "Allow"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [module.database.master_user_secret_arn]
+  }
 }
 
 resource "aws_iam_role_policy" "github_application_deploy" {
