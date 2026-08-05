@@ -999,40 +999,142 @@ fn eager_committer_drains_a_burst_without_the_timer() {
     e.detach().unwrap();
 }
 
-/// The regression this branch exists to kill: a store with visible
-/// per-object latency must not turn an fsync burst into multi-second
-/// stalls once the staged queue crosses the backpressure cap.
+struct ThreadRecordingBlob {
+    inner: Arc<dyn BlobStore>,
+    put_calls: Mutex<Vec<(String, bool)>>,
+    put_gate: Option<Arc<PutGate>>,
+}
+
+#[derive(Default)]
+struct PutGate {
+    state: Mutex<(bool, bool)>,
+    changed: Condvar,
+}
+
+impl PutGate {
+    fn block_until_released(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.0 = true;
+        self.changed.notify_all();
+        while !state.1 {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn wait_until_entered(&self) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut state = self.state.lock().unwrap();
+        while !state.0 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the publisher never reached the blocking PUT positive control"
+            );
+            let (next, wait) = self.changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            assert!(
+                !wait.timed_out() || state.0,
+                "the publisher never reached the blocking PUT positive control"
+            );
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.1 = true;
+        self.changed.notify_all();
+    }
+}
+
+impl BlobStore for ThreadRecordingBlob {
+    fn put_immutable(&self, key: &str, data: &[u8]) -> cats_storage::blob::Result<()> {
+        self.put_calls.lock().unwrap().push((
+            std::thread::current()
+                .name()
+                .unwrap_or("<unnamed>")
+                .to_string(),
+            is_background_publisher_context(),
+        ));
+        if let Some(gate) = &self.put_gate {
+            gate.block_until_released();
+        }
+        self.inner.put_immutable(key, data)
+    }
+
+    fn get(&self, key: &str) -> cats_storage::blob::Result<Vec<u8>> {
+        self.inner.get(key)
+    }
+
+    fn exists(&self, key: &str) -> cats_storage::blob::Result<bool> {
+        self.inner.exists(key)
+    }
+
+    fn delete(&self, key: &str) -> cats_storage::blob::Result<()> {
+        self.inner.delete(key)
+    }
+
+    fn list(&self, prefix: &str) -> cats_storage::blob::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+}
+
+/// A slow remote store must stay wholly behind the named publisher while a
+/// burst stages packs under the production-default admission caps. This
+/// records the actual remote-call owner instead of inferring it from FLUSH
+/// latency, which also measured how quickly a shared CI runner scheduled us.
 #[test]
-fn a_slow_store_burst_never_stalls_a_flush_for_long() {
+fn a_slow_store_burst_publishes_only_on_the_background_committer() {
     let dir = tempfile::tempdir().unwrap();
-    let blob: Arc<dyn BlobStore> = Arc::new(
-        SlowBlob::new(Arc::new(
-            FileBlobStore::open(dir.path().join("blob")).unwrap(),
-        ))
-        .with_put_delay(Duration::from_millis(25)),
-    );
+    let blob = Arc::new(ThreadRecordingBlob {
+        inner: Arc::new(
+            SlowBlob::new(Arc::new(
+                FileBlobStore::open(dir.path().join("blob")).unwrap(),
+            ))
+            .with_put_delay(Duration::from_millis(25)),
+        ),
+        put_calls: Mutex::new(Vec::new()),
+        put_gate: None,
+    });
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
     meta.create_volume(VOL, SIZE).unwrap();
     let mut cfg = EngineConfig::new(VOL, dir.path().join("data"), "attA");
     cfg.durability = DurabilityMode::Relaxed {
         drain_interval_ms: 3_600_000,
     };
-    let e = ChunkEngine::attach(cfg, blob, meta).unwrap();
+    assert_eq!(
+        cfg.max_staged_packs, DEFAULT_MAX_STAGED_PACKS,
+        "the burst must exercise the production-default pack cap"
+    );
+    assert_eq!(
+        cfg.max_staged_bytes, DEFAULT_MAX_STAGED_BYTES,
+        "the burst must exercise the production-default byte cap"
+    );
+    let e = ChunkEngine::attach(cfg, blob.clone(), meta).unwrap();
 
-    let mut lat_ms = Vec::new();
     for i in 0..24u32 {
         e.write((i as u64 % 8) * CHUNK_SIZE as u64, &pattern(4096, i as u8))
             .unwrap();
-        let t0 = std::time::Instant::now();
         e.flush().unwrap();
-        lat_ms.push(t0.elapsed().as_millis());
     }
-    println!("slow-store burst flush latencies (ms): {lat_ms:?}");
-    let max = lat_ms.iter().max().copied().unwrap_or(0);
+
+    // Calibrate the recorder on a known-positive background PUT before an
+    // all-threads assertion: an empty recording is not evidence of isolation.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while blob.put_calls.lock().unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the eager committer never produced the recorder's positive control"
+        );
+        std::thread::yield_now();
+    }
+    let calls = blob.put_calls.lock().unwrap().clone();
     assert!(
-        max < 300,
-        "a flush stalled for {max} ms; a flush below the cap must never \
-         touch the publish path"
+        calls.iter().all(|(_, publisher)| *publisher),
+        "remote PUT escaped the background publisher during the burst: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|(name, _)| name == "pack-committer"),
+        "the positive control must include the named committer: {calls:?}"
     );
     e.detach().unwrap();
 }
@@ -1042,39 +1144,12 @@ fn a_slow_store_burst_never_stalls_a_flush_for_long() {
 /// isolation that keeps a transient store error out of the Guest I/O path.
 #[test]
 fn backpressure_waits_for_the_background_publisher() {
-    struct ThreadRecordingBlob {
-        inner: Arc<dyn BlobStore>,
-        put_threads: Mutex<Vec<String>>,
-    }
-    impl BlobStore for ThreadRecordingBlob {
-        fn put_immutable(&self, k: &str, d: &[u8]) -> cats_storage::blob::Result<()> {
-            std::thread::sleep(Duration::from_millis(100));
-            self.put_threads.lock().unwrap().push(
-                std::thread::current()
-                    .name()
-                    .unwrap_or("<unnamed>")
-                    .to_string(),
-            );
-            self.inner.put_immutable(k, d)
-        }
-        fn get(&self, k: &str) -> cats_storage::blob::Result<Vec<u8>> {
-            self.inner.get(k)
-        }
-        fn exists(&self, k: &str) -> cats_storage::blob::Result<bool> {
-            self.inner.exists(k)
-        }
-        fn delete(&self, k: &str) -> cats_storage::blob::Result<()> {
-            self.inner.delete(k)
-        }
-        fn list(&self, p: &str) -> cats_storage::blob::Result<Vec<String>> {
-            self.inner.list(p)
-        }
-    }
-
     let dir = tempfile::tempdir().unwrap();
+    let put_gate = Arc::new(PutGate::default());
     let blob = Arc::new(ThreadRecordingBlob {
         inner: Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap()),
-        put_threads: Mutex::new(Vec::new()),
+        put_calls: Mutex::new(Vec::new()),
+        put_gate: Some(Arc::clone(&put_gate)),
     });
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
     meta.create_volume(VOL, SIZE).unwrap();
@@ -1087,18 +1162,29 @@ fn backpressure_waits_for_the_background_publisher() {
 
     e.write(0, &pattern(4096, 1)).unwrap();
     assert_eq!(e.flush().unwrap(), 1);
+    put_gate.wait_until_entered();
     e.write(CHUNK_SIZE as u64, &pattern(4096, 2)).unwrap();
-    let started = std::time::Instant::now();
-    assert_eq!(e.flush().unwrap(), 2);
+    let flush_engine = Arc::clone(&e);
+    let second_flush = std::thread::spawn(move || flush_engine.flush());
+
+    // Directly observe the staging-space waiter while the sole allowed pack
+    // remains pinned behind the controlled remote call. This preserves the
+    // admission-pressure assertion without measuring how long it waited.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while e.backpressure_waiters.load(Ordering::Relaxed) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the second FLUSH never entered staging backpressure"
+        );
+        std::thread::yield_now();
+    }
+    put_gate.release();
+    assert_eq!(second_flush.join().unwrap().unwrap(), 2);
+    let calls = blob.put_calls.lock().unwrap().clone();
+    assert!(!calls.is_empty());
     assert!(
-        started.elapsed() >= Duration::from_millis(50),
-        "the second FLUSH should have observed local admission pressure"
-    );
-    let threads = blob.put_threads.lock().unwrap().clone();
-    assert!(!threads.is_empty());
-    assert!(
-        threads.iter().all(|name| name == "pack-committer"),
-        "remote PUT escaped the background publisher: {threads:?}"
+        calls.iter().all(|(_, publisher)| *publisher),
+        "remote PUT escaped the background publisher: {calls:?}"
     );
     e.detach().unwrap();
 }

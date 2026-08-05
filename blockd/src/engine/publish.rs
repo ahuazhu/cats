@@ -1,5 +1,41 @@
 use super::*;
 
+#[cfg(test)]
+std::thread_local! {
+    static BACKGROUND_PUBLISHER_CONTEXT: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+/// Test-only causal marker for remote calls. Data PUTs fan out from the named
+/// committer onto scoped upload workers, so a raw thread-name assertion would
+/// mistake those children for Guest callers. The marker is entered only by the
+/// background committer and explicitly inherited by its scoped workers.
+#[cfg(test)]
+struct BackgroundPublisherContext {
+    previous: bool,
+}
+
+#[cfg(test)]
+impl BackgroundPublisherContext {
+    fn enter(enabled: bool) -> Self {
+        let previous = BACKGROUND_PUBLISHER_CONTEXT.replace(enabled);
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for BackgroundPublisherContext {
+    fn drop(&mut self) {
+        BACKGROUND_PUBLISHER_CONTEXT.set(self.previous);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn is_background_publisher_context() -> bool {
+    BACKGROUND_PUBLISHER_CONTEXT.get()
+}
+
 /// Queue depth past which a relaxed stage kicks the committer instead of
 /// letting packs sit until the timer. Above one so the single-pack case (an
 /// idle volume's periodic journal commit) still batches with whatever the
@@ -343,9 +379,14 @@ impl ChunkEngine {
         // fixed slice per worker would leave some idle while others upload bases.
         let next = std::sync::atomic::AtomicUsize::new(0);
         let failure: Mutex<Option<EngineError>> = Mutex::new(None);
+        #[cfg(test)]
+        let background_publisher = is_background_publisher_context();
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 scope.spawn(|| loop {
+                    #[cfg(test)]
+                    let _publisher_context =
+                        BackgroundPublisherContext::enter(background_publisher);
                     if failure.lock().unwrap().is_some() {
                         return;
                     }
@@ -621,6 +662,8 @@ impl ChunkEngine {
                 if engine.is_fenced() {
                     return;
                 }
+                #[cfg(test)]
+                let _publisher_context = BackgroundPublisherContext::enter(true);
                 if let Err(e) = engine.drain_staged() {
                     // Transient store trouble: the queue keeps the packs and
                     // the next tick (or the next kick) retries. Relaxed FLUSH
