@@ -42,6 +42,10 @@ jobs:
       TF_STATE_APPLICATION_KEY: ${{ vars.TF_STATE_APPLICATION_KEY }}
       EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
       PRODUCTION_TFVARS_B64: ${{ vars.PRODUCTION_TFVARS_B64 }}
+      # The platform stack's database_master_user_secret_arn output. Not a
+      # secret -- it is an ARN -- but it is the authority this deployment reads
+      # the database password from, so a missing value fails the run.
+      RDS_MASTER_USER_SECRET_ARN: ${{ vars.RDS_MASTER_USER_SECRET_ARN }}
 
     steps:
       - uses: actions/checkout@v4
@@ -107,7 +111,8 @@ jobs:
             TF_STATE_BUCKET \
             TF_STATE_APPLICATION_KEY \
             EKS_CLUSTER_NAME \
-            PRODUCTION_TFVARS_B64
+            PRODUCTION_TFVARS_B64 \
+            RDS_MASTER_USER_SECRET_ARN
           do
             if [[ -z "${!name:-}" ]]; then
               echo "::error::Missing required repository variable $name"
@@ -171,6 +176,81 @@ jobs:
             --output jsonpath='{.data.rds-ca\.pem}' \
             > "$RUNNER_TEMP/rds-ca.pem"
 
+          # Take the database password from the one place that holds the
+          # current one.
+          #
+          # This step used to carry CATS_POSTGRES_URL straight out of the live
+          # Secret and hand it back to Terraform, so a deployment faithfully
+          # reproduced whatever password was already there. When RDS rotated the
+          # managed master password, that turned a routine deploy into a total
+          # outage: the Pod was replaced, PostgreSQL authenticates on connect,
+          # and the fresh process could not get in. Everything except the
+          # password still comes from the live Secret -- user, host, port,
+          # database, sslmode -- because nothing else rotates.
+          aws secretsmanager get-secret-value \
+            --secret-id "$RDS_MASTER_USER_SECRET_ARN" \
+            --query SecretString \
+            --output text \
+            > "$RUNNER_TEMP/master-user-secret.json"
+          chmod 600 "$RUNNER_TEMP/master-user-secret.json"
+          echo "::add-mask::$(jq -er '.password' "$RUNNER_TEMP/master-user-secret.json")"
+
+          python3 - \
+            "$RUNNER_TEMP/live-secret.json" \
+            "$RUNNER_TEMP/master-user-secret.json" \
+            CATS_POSTGRES_URL \
+            CATS_USAGE_POSTGRES_URL \
+            > "$RUNNER_TEMP/rotated-urls.json" <<'PY'
+          import json
+          import sys
+          import urllib.parse
+
+
+          def swap_password(dsn, password):
+              """Replace only the password. Everything else is preserved."""
+              parts = urllib.parse.urlsplit(dsn)
+              if not parts.hostname:
+                  raise SystemExit("DSN has no host; refusing to rewrite it")
+              if not parts.username:
+                  raise SystemExit("DSN has no user; refusing to rewrite it")
+              host = parts.hostname
+              if ":" in host:
+                  host = f"[{host}]"
+              netloc = "{}:{}@{}".format(
+                  urllib.parse.quote(parts.username, safe=""),
+                  urllib.parse.quote(password, safe=""),
+                  host,
+              )
+              if parts.port:
+                  netloc += f":{parts.port}"
+              return urllib.parse.urlunsplit(
+                  (parts.scheme, netloc, parts.path, parts.query, parts.fragment)
+              )
+
+
+          live = json.load(open(sys.argv[1]))
+          password = json.load(open(sys.argv[2]))["password"]
+          # An empty password would otherwise render a syntactically valid,
+          # passwordless DSN and deploy it.
+          if not password:
+              raise SystemExit("the managed secret holds an empty password")
+          rotated = {}
+          for key in sys.argv[3:]:
+              if key not in live:
+                  raise SystemExit(f"{key} is absent from the live runtime secret")
+              rotated[key] = swap_password(live[key], password)
+          json.dump(rotated, sys.stdout)
+          PY
+          chmod 600 "$RUNNER_TEMP/rotated-urls.json"
+
+          for key in \
+            CATS_POSTGRES_URL \
+            CATS_USAGE_POSTGRES_URL
+          do
+            echo "::add-mask::$(
+              jq -er --arg key "$key" '.[$key]' "$RUNNER_TEMP/rotated-urls.json"
+            )"
+          done
           for key in \
             CATS_POSTGRES_URL \
             CATS_USAGE_POSTGRES_URL \
@@ -192,11 +272,12 @@ jobs:
           jq -n \
             --slurpfile runtime_secret_data "$RUNNER_TEMP/runtime-secret.json" \
             --slurpfile live_secret "$RUNNER_TEMP/live-secret.json" \
+            --slurpfile rotated "$RUNNER_TEMP/rotated-urls.json" \
             --rawfile rds_ca_pem "$RUNNER_TEMP/rds-ca.pem" \
             '{
               runtime_secret_data: $runtime_secret_data[0],
-              storage_postgres_url: $live_secret[0].CATS_POSTGRES_URL,
-              usage_postgres_url: $live_secret[0].CATS_USAGE_POSTGRES_URL,
+              storage_postgres_url: $rotated[0].CATS_POSTGRES_URL,
+              usage_postgres_url: $rotated[0].CATS_USAGE_POSTGRES_URL,
               stripe_secret_key: $live_secret[0].STRIPE_SECRET_KEY,
               stripe_webhook_secret: $live_secret[0].STRIPE_WEBHOOK_SECRET,
               rds_ca_pem: $rds_ca_pem
