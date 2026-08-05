@@ -7,23 +7,7 @@ use crate::runtime::residue::allocated_tree_bytes;
 
 /// A node whose state directory is `state_dir` and which supervises nothing.
 fn swept_node(state_dir: &Path) -> NodeRuntime {
-    let adapter = AdapterSelection::new("unused", cats_storage::AdapterConfig::default());
-    NodeRuntime::new(NodeConfig {
-        node_id: "node-a".to_string(),
-        state_dir: state_dir.to_path_buf(),
-        blockd_bin: PathBuf::from("unused-blockd"),
-        guest_agent_bin: PathBuf::from("unused-guest-agent"),
-        metadata_store: adapter.clone(),
-        object_store: adapter,
-        blockd_lease_ttl_ms: 1_000,
-        blockd_max_staged_bytes: cats_api::blockd::DEFAULT_MAX_STAGED_BYTES,
-        blockd_max_staged_packs: cats_api::blockd::DEFAULT_MAX_STAGED_PACKS,
-        blockd_max_local_bytes: cats_api::blockd::DEFAULT_MAX_LOCAL_BYTES,
-        metering_cgroup_root: None,
-        vmm: VmmMode::Fake,
-        wake_budget: WakeBudget::default(),
-    })
-    .unwrap()
+    NodeRuntime::new(stub_node_config(state_dir, VmmMode::Fake)).unwrap()
 }
 
 /// The shape `start_cat_ch` leaves behind: a Guest memory backing plus one

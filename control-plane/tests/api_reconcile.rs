@@ -439,6 +439,56 @@ impl Ctx {
         )
     }
 
+    /// `GET` as the workspace admin, asserting success before decoding. Used by
+    /// the call sites that treat a non-2xx as a test failure rather than a
+    /// value; tests that assert on a status code build the request themselves.
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: String) -> T {
+        self.http
+            .get(url)
+            .bearer_auth("dev-admin-token")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    /// `POST` a JSON body as the node-agent service identity, asserting success.
+    async fn post_service<B: serde::Serialize>(&self, url: String, body: &B) {
+        self.http
+            .post(url)
+            .bearer_auth(SERVICE_TOKEN)
+            .json(body)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+
+    /// [`Self::post_service`] for the endpoints whose response body is asserted.
+    async fn post_service_json<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        url: String,
+        body: &B,
+    ) -> T {
+        self.http
+            .post(url)
+            .bearer_auth(SERVICE_TOKEN)
+            .json(body)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
     async fn wait_observed(&self, name: &str, want: ObservedState) -> Cat {
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
@@ -929,35 +979,20 @@ async fn default_auto_suspend_fires_on_the_last_guest_work_release() {
         guest_lease_sequence: sequence,
         leases,
     };
-    ctx.http
-        .post(ctx.url("/v1/nodes/work-status"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&report(
+    ctx.post_service(
+        ctx.url("/v1/nodes/work-status"),
+        &report(
             1,
             vec![cats_api::guest::GuestWorkLease {
                 id: "job-1".into(),
                 label: "user-training".into(),
                 remaining_ttl_ms: 30_000,
             }],
-        ))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
+        ),
+    )
+    .await;
 
-    let enabled: AutoSuspendResponse = ctx
-        .http
-        .get(ctx.ws_url("/cats/worker/auto-suspend"))
-        .bearer_auth("dev-admin-token")
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let enabled: AutoSuspendResponse = ctx.get_json(ctx.ws_url("/cats/worker/auto-suspend")).await;
     assert!(enabled.cat.auto_suspend);
     assert_eq!(enabled.work.reason, "active_work");
     assert_eq!(enabled.work.active_work_count, 1);
@@ -972,30 +1007,12 @@ async fn default_auto_suspend_fires_on_the_last_guest_work_release() {
         ObservedState::Running
     );
 
-    ctx.http
-        .post(ctx.url("/v1/nodes/work-status"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&report(2, vec![]))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
+    ctx.post_service(ctx.url("/v1/nodes/work-status"), &report(2, vec![]))
+        .await;
     let suspended = ctx.wait_observed("worker", ObservedState::Suspended).await;
     assert_eq!(suspended.desired_state, DesiredState::Suspended);
 
-    let operations: ListResponse<Operation> = ctx
-        .http
-        .get(ctx.ws_url("/operations"))
-        .bearer_auth("dev-admin-token")
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let operations: ListResponse<Operation> = ctx.get_json(ctx.ws_url("/operations")).await;
     assert!(operations.items.iter().any(|operation| {
         operation.kind == "cat.auto_suspend" && operation.phase == OperationPhase::Succeeded
     }));
@@ -1015,40 +1032,25 @@ async fn automatic_tiers_progress_from_suspended_through_warm_to_cold() {
     ctx.create_cat("tiered", None).await;
     let cat = ctx.wait_observed("tiered", ObservedState::Running).await;
 
-    ctx.http
-        .post(ctx.url("/v1/nodes/work-status"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&NodeWorkStatusRequest {
+    ctx.post_service(
+        ctx.url("/v1/nodes/work-status"),
+        &NodeWorkStatusRequest {
             node_id: "node_a".into(),
             cat_id: cat.id.clone(),
             generation: cat.generation,
             guest_source_epoch: "guest-boot-1".into(),
             guest_lease_sequence: 0,
             leases: vec![],
-        })
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
+        },
+    )
+    .await;
 
     let cold = ctx.wait_observed("tiered", ObservedState::Cold).await;
     assert_eq!(cold.desired_state, DesiredState::Cold);
     assert!(cold.node_id.is_none());
     assert!(cold.observed_state_since_unix_ms > 0);
 
-    let operations: ListResponse<Operation> = ctx
-        .http
-        .get(ctx.ws_url("/operations"))
-        .bearer_auth("dev-admin-token")
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let operations: ListResponse<Operation> = ctx.get_json(ctx.ws_url("/operations")).await;
     for kind in ["cat.auto_suspend", "cat.auto_warm", "cat.auto_cold"] {
         assert!(
             operations
@@ -1336,34 +1338,26 @@ async fn node_loss_preserves_claim_until_fencing_is_explicitly_confirmed() {
     // explicitly fence the Host; silently making it Ready would strand these
     // Unknown Cats outside both recovery paths.
     let registered = ctx.cp.state.store.get_node("node_a").unwrap();
-    ctx.http
-        .post(ctx.url("/v1/nodes/register"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&RegisterNodeRequest {
+    ctx.post_service(
+        ctx.url("/v1/nodes/register"),
+        &RegisterNodeRequest {
             node_id: registered.id.clone(),
             agent_url: registered.agent_url.clone(),
             gateway_url: registered.gateway_url.clone(),
             cpus: registered.capacity.cpus,
             memory_mib: registered.capacity.memory_mib,
-        })
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
-    ctx.http
-        .post(ctx.url("/v1/nodes/heartbeat"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&HeartbeatRequest {
+        },
+    )
+    .await;
+    ctx.post_service(
+        ctx.url("/v1/nodes/heartbeat"),
+        &HeartbeatRequest {
             node_id: "node_a".into(),
             cats: Vec::new(),
             telemetry: None,
-        })
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
+        },
+    )
+    .await;
     assert_eq!(
         ctx.cp.state.store.get_node("node_a").unwrap().state,
         NodeState::Lost
@@ -1383,10 +1377,9 @@ async fn node_loss_preserves_claim_until_fencing_is_explicitly_confirmed() {
     // in place only after its complete, same-generation inventory proves every
     // preserved claim instead of cold-starting another Guest.
     node_a.alive.store(true, Ordering::SeqCst);
-    ctx.http
-        .post(ctx.url("/v1/nodes/heartbeat"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&HeartbeatRequest {
+    ctx.post_service(
+        ctx.url("/v1/nodes/heartbeat"),
+        &HeartbeatRequest {
             node_id: "node_a".into(),
             cats: vec![
                 HeartbeatCat {
@@ -1401,12 +1394,9 @@ async fn node_loss_preserves_claim_until_fencing_is_explicitly_confirmed() {
                 },
             ],
             telemetry: None,
-        })
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
+        },
+    )
+    .await;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let cat = ctx.cp.state.store.must_get_cat_by_id(&cat.id).unwrap();
@@ -1911,34 +1901,14 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
         IngestOutcome::Accepted
     );
     let first: IngestUsageCheckpointsResponse = ctx
-        .http
-        .post(ctx.url("/v1/internal/usage/checkpoints"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&request)
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+        .post_service_json(ctx.url("/v1/internal/usage/checkpoints"), &request)
+        .await;
     assert_eq!(first.accepted, 3);
     assert_eq!(first.duplicates, 1);
 
     let replay: IngestUsageCheckpointsResponse = ctx
-        .http
-        .post(ctx.url("/v1/internal/usage/checkpoints"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&request)
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+        .post_service_json(ctx.url("/v1/internal/usage/checkpoints"), &request)
+        .await;
     assert_eq!(replay.accepted, 0);
     assert_eq!(replay.duplicates, 4);
 
@@ -1969,18 +1939,7 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
     assert_eq!(report.details.len(), 2);
     assert_eq!(report.latest_interval_end_unix_ms, Some(hour_end));
 
-    let balance: BillingBalance = ctx
-        .http
-        .get(ctx.ws_url("/billing/balance"))
-        .bearer_auth("dev-admin-token")
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let balance: BillingBalance = ctx.get_json(ctx.ws_url("/billing/balance")).await;
     assert_eq!(balance.credit_nanos, "10000000000");
     assert_eq!(balance.provisional_usage_nanos, "115000000");
     assert_eq!(balance.available_credit_nanos, "9885000000");
@@ -2055,18 +2014,8 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
         )],
     };
     let accepted_historical: IngestUsageCheckpointsResponse = ctx
-        .http
-        .post(ctx.url("/v1/internal/usage/checkpoints"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&historical)
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+        .post_service_json(ctx.url("/v1/internal/usage/checkpoints"), &historical)
+        .await;
     assert_eq!(accepted_historical.accepted, 1);
 
     let mut future_checkpoint = historical.checkpoints[0].clone();
@@ -2267,18 +2216,7 @@ async fn admin_can_monitor_and_drain_nodes() {
     // Wait for at least one telemetry-bearing heartbeat.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let nodes: ListResponse<NodeSummary> = ctx
-            .http
-            .get(ctx.url("/v1/admin/nodes"))
-            .bearer_auth("dev-admin-token")
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+        let nodes: ListResponse<NodeSummary> = ctx.get_json(ctx.url("/v1/admin/nodes")).await;
         if nodes
             .items
             .iter()
@@ -2291,18 +2229,7 @@ async fn admin_can_monitor_and_drain_nodes() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let overview: MonitoringOverview = ctx
-        .http
-        .get(ctx.url("/v1/admin/monitoring"))
-        .bearer_auth("dev-admin-token")
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let overview: MonitoringOverview = ctx.get_json(ctx.url("/v1/admin/monitoring")).await;
     assert_eq!(overview.nodes.total, 2);
     assert_eq!(overview.cats.running, 1);
     assert_eq!(overview.capacity.total_cpus, 32);
@@ -2323,18 +2250,8 @@ async fn admin_can_monitor_and_drain_nodes() {
     // time on a loaded machine.
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let node_cats: ListResponse<NodeCatSummary> = loop {
-        let listed: ListResponse<NodeCatSummary> = ctx
-            .http
-            .get(ctx.url("/v1/admin/nodes/node_a/cats"))
-            .bearer_auth("dev-admin-token")
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+        let listed: ListResponse<NodeCatSummary> =
+            ctx.get_json(ctx.url("/v1/admin/nodes/node_a/cats")).await;
         if listed
             .items
             .first()
@@ -3002,10 +2919,9 @@ async fn a_deleting_cat_does_not_block_its_lost_node_from_recovering() {
     // include it again -- absence is the delete succeeding, not an anomaly.
     node_a.cats.lock().unwrap().remove(&going.id);
     node_a.alive.store(true, Ordering::SeqCst);
-    ctx.http
-        .post(ctx.url("/v1/nodes/heartbeat"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&HeartbeatRequest {
+    ctx.post_service(
+        ctx.url("/v1/nodes/heartbeat"),
+        &HeartbeatRequest {
             node_id: "node_a".into(),
             cats: vec![HeartbeatCat {
                 cat_id: keeper.id.clone(),
@@ -3013,12 +2929,9 @@ async fn a_deleting_cat_does_not_block_its_lost_node_from_recovering() {
                 state: ObservedState::Running,
             }],
             telemetry: None,
-        })
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
+        },
+    )
+    .await;
 
     assert_eq!(
         ctx.cp.state.store.get_node("node_a").unwrap().state,
@@ -3077,10 +2990,9 @@ async fn a_running_claim_missing_from_the_inventory_still_holds_the_node_lost() 
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    ctx.http
-        .post(ctx.url("/v1/nodes/heartbeat"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&HeartbeatRequest {
+    ctx.post_service(
+        ctx.url("/v1/nodes/heartbeat"),
+        &HeartbeatRequest {
             node_id: "node_a".into(),
             cats: vec![HeartbeatCat {
                 cat_id: reported.id.clone(),
@@ -3088,12 +3000,9 @@ async fn a_running_claim_missing_from_the_inventory_still_holds_the_node_lost() 
                 state: ObservedState::Running,
             }],
             telemetry: None,
-        })
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
+        },
+    )
+    .await;
 
     assert_eq!(
         ctx.cp.state.store.get_node("node_a").unwrap().state,
@@ -3334,18 +3243,7 @@ async fn an_agent_reported_cat_without_an_assignment_is_surfaced_as_an_orphan() 
         "the assigned Cat must not count as an orphan"
     );
 
-    let overview: MonitoringOverview = ctx
-        .http
-        .get(ctx.url("/v1/admin/monitoring"))
-        .bearer_auth("dev-admin-token")
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let overview: MonitoringOverview = ctx.get_json(ctx.url("/v1/admin/monitoring")).await;
     assert_eq!(
         overview.orphan_cats, 1,
         "the fleet overview must expose the orphan count"

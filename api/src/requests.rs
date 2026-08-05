@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 
 use crate::guest::GuestWorkLease;
 use crate::resources::{
-    Cat, CatWorkStatus, Disk, DiskDurability, Endpoint, NodeTelemetry, Operation, WakePolicy,
-    WorkKind, WorkLease,
+    Cat, CatWorkStatus, DiskDurability, Endpoint, NodeTelemetry, Operation, WakePolicy, WorkKind,
+    WorkLease,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,22 +67,6 @@ pub struct CreateDiskRequest {
     pub size_bytes: u64,
     #[serde(default)]
     pub durability: DiskDurability,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MountDiskRequest {
-    pub cat_id: String,
-    pub mount_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UnmountDiskRequest {
-    pub cat_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResizeDiskRequest {
-    pub size_bytes: u64,
 }
 
 /// Explicit authorization for destructive lost-Host fencing.
@@ -268,12 +252,6 @@ pub struct NodeWorkStatusRequest {
 pub struct CatOperationResponse {
     pub operation: Operation,
     pub cat: Cat,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiskOperationResponse {
-    pub operation: Operation,
-    pub disk: Disk,
 }
 
 /// `202 Accepted` body for an OCI deployment that outran the synchronous wait.

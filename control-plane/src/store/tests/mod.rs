@@ -27,6 +27,37 @@ fn default_workspace_for_account_id(store: &Store, account_id: &str) -> Workspac
         .unwrap()
 }
 
+/// The Cat shape these tests use unless the test is itself about a different
+/// spec: 1 vCPU, 256 MiB, a 1 MiB root disk, auto-suspend on, no extra disk,
+/// no expiry, strict durability.
+fn create_test_cat(
+    store: &Store,
+    workspace: &WorkspaceRecord,
+    name: &str,
+) -> Result<(Cat, Vec<Disk>, Operation)> {
+    create_test_cat_expiring(store, workspace, name, None)
+}
+
+fn create_test_cat_expiring(
+    store: &Store,
+    workspace: &WorkspaceRecord,
+    name: &str,
+    expires_at_unix: Option<i64>,
+) -> Result<(Cat, Vec<Disk>, Operation)> {
+    store.create_cat(
+        workspace,
+        name,
+        "test",
+        1,
+        256,
+        1 << 20,
+        true,
+        None,
+        expires_at_unix,
+        DiskDurability::Strict,
+    )
+}
+
 #[test]
 fn workspaces_in_one_account_share_its_billing_account() {
     let dir = tempfile::tempdir().unwrap();
@@ -81,20 +112,7 @@ fn renaming_a_workspace_keeps_resource_ownership() {
         .create_workspace(&default.account_id, "sibling", "Sibling")
         .unwrap();
 
-    let (cat, disks, operation) = store
-        .create_cat(
-            &default,
-            "stable-owner",
-            "test",
-            1,
-            256,
-            1 << 20,
-            true,
-            None,
-            None,
-            DiskDurability::Strict,
-        )
-        .unwrap();
+    let (cat, disks, operation) = create_test_cat(&store, &default, "stable-owner").unwrap();
     let renamed = store
         .update_workspace(&default.id, Some("renamed"), None)
         .unwrap();
@@ -128,48 +146,9 @@ fn the_same_name_is_free_in_a_second_workspace() {
     let sibling = store
         .create_workspace(&default.account_id, "sibling", "Sibling")
         .unwrap();
-    store
-        .create_cat(
-            &default,
-            "shared",
-            "test",
-            1,
-            256,
-            1 << 20,
-            true,
-            None,
-            None,
-            DiskDurability::Strict,
-        )
-        .unwrap();
-    store
-        .create_cat(
-            &sibling,
-            "shared",
-            "test",
-            1,
-            256,
-            1 << 20,
-            true,
-            None,
-            None,
-            DiskDurability::Strict,
-        )
-        .unwrap();
-    assert!(store
-        .create_cat(
-            &default,
-            "shared",
-            "test",
-            1,
-            256,
-            1 << 20,
-            true,
-            None,
-            None,
-            DiskDurability::Strict
-        )
-        .is_err());
+    create_test_cat(&store, &default, "shared").unwrap();
+    create_test_cat(&store, &sibling, "shared").unwrap();
+    assert!(create_test_cat(&store, &default, "shared").is_err());
     assert_eq!(store.list_cats(&default.id).unwrap().len(), 1);
     assert_eq!(store.list_cats(&sibling.id).unwrap().len(), 1);
 }
@@ -181,20 +160,7 @@ fn migrates_a_v1_database_in_place() {
     let cat_id = {
         let store = Store::open(&path).unwrap();
         let workspace = bootstrap_workspace(&store, "acme");
-        let (cat, _, _) = store
-            .create_cat(
-                &workspace,
-                "web",
-                "test",
-                1,
-                256,
-                1 << 20,
-                true,
-                None,
-                None,
-                DiskDurability::Strict,
-            )
-            .unwrap();
+        let (cat, _, _) = create_test_cat(&store, &workspace, "web").unwrap();
         cat.id
     };
     {
@@ -281,20 +247,7 @@ fn heartbeat_reported_inventory_round_trips_and_diffs_orphans() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("control.db")).unwrap();
     let workspace = bootstrap_workspace(&store, "acme");
-    let (cat, _, _) = store
-        .create_cat(
-            &workspace,
-            "assigned",
-            "test",
-            1,
-            256,
-            1 << 20,
-            true,
-            None,
-            None,
-            DiskDurability::Strict,
-        )
-        .unwrap();
+    let (cat, _, _) = create_test_cat(&store, &workspace, "assigned").unwrap();
     store
         .register_node("node_a", "http://node", "http://gateway", 4, 8192)
         .unwrap();
@@ -388,48 +341,11 @@ fn absolute_expiry_selects_only_due_undeleted_cats() {
     let past = now_unix() - 60;
     let future = now_unix() + 3600;
 
-    let (expired, _, _) = store
-        .create_cat(
-            &workspace,
-            "expired",
-            "test",
-            1,
-            256,
-            1 << 20,
-            true,
-            None,
-            Some(past),
-            DiskDurability::Strict,
-        )
-        .unwrap();
-    let (fresh, _, _) = store
-        .create_cat(
-            &workspace,
-            "fresh",
-            "test",
-            1,
-            256,
-            1 << 20,
-            true,
-            None,
-            Some(future),
-            DiskDurability::Strict,
-        )
-        .unwrap();
-    let (forever, _, _) = store
-        .create_cat(
-            &workspace,
-            "forever",
-            "test",
-            1,
-            256,
-            1 << 20,
-            true,
-            None,
-            None,
-            DiskDurability::Strict,
-        )
-        .unwrap();
+    let (expired, _, _) =
+        create_test_cat_expiring(&store, &workspace, "expired", Some(past)).unwrap();
+    let (fresh, _, _) =
+        create_test_cat_expiring(&store, &workspace, "fresh", Some(future)).unwrap();
+    let (forever, _, _) = create_test_cat(&store, &workspace, "forever").unwrap();
     assert_eq!(expired.expires_at_unix, Some(past));
 
     assert_eq!(
@@ -665,20 +581,7 @@ fn last_guest_work_release_is_immediately_suspend_eligible() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("control.db")).unwrap();
     let workspace = bootstrap_workspace(&store, "alpha");
-    let (cat, _, _) = store
-        .create_cat(
-            &workspace,
-            "worker",
-            "test",
-            1,
-            256,
-            1024 * 1024,
-            true,
-            None,
-            None,
-            DiskDurability::Strict,
-        )
-        .unwrap();
+    let (cat, _, _) = create_test_cat(&store, &workspace, "worker").unwrap();
     assert!(cat.auto_suspend);
     let endpoints = store.endpoints_for_cat(&cat.id).unwrap();
     assert_eq!(endpoints.len(), 1);
@@ -808,20 +711,7 @@ fn gateway_work_blocks_auto_suspend_and_wake_is_singleflight() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("control.db")).unwrap();
     let workspace = bootstrap_workspace(&store, "alpha");
-    let (cat, _, _) = store
-        .create_cat(
-            &workspace,
-            "web",
-            "test",
-            1,
-            256,
-            1024 * 1024,
-            true,
-            None,
-            None,
-            DiskDurability::Strict,
-        )
-        .unwrap();
+    let (cat, _, _) = create_test_cat(&store, &workspace, "web").unwrap();
     store
         .register_node("node-1", "http://node", "http://gateway", 4, 8192)
         .unwrap();
@@ -857,20 +747,7 @@ fn guest_work_cancels_an_inflight_suspend_without_generation_drift() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("control.db")).unwrap();
     let workspace = bootstrap_workspace(&store, "alpha");
-    let (cat, _, _) = store
-        .create_cat(
-            &workspace,
-            "racer",
-            "test",
-            1,
-            256,
-            1024 * 1024,
-            true,
-            None,
-            None,
-            DiskDurability::Strict,
-        )
-        .unwrap();
+    let (cat, _, _) = create_test_cat(&store, &workspace, "racer").unwrap();
     store
         .register_node("node-1", "http://node", "http://gateway", 4, 8192)
         .unwrap();
@@ -921,20 +798,7 @@ fn automatic_deeper_tiers_use_persisted_state_age_and_respect_work() {
     {
         let store = Store::open(&path).unwrap();
         let workspace = bootstrap_workspace(&store, "alpha");
-        let (cat, _, _) = store
-            .create_cat(
-                &workspace,
-                "sleeper",
-                "test",
-                1,
-                256,
-                1024 * 1024,
-                true,
-                None,
-                None,
-                DiskDurability::Strict,
-            )
-            .unwrap();
+        let (cat, _, _) = create_test_cat(&store, &workspace, "sleeper").unwrap();
         cat_id = cat.id.clone();
         let suspend = store
             .set_desired(&cat.id, DesiredState::Suspended, None, "cat.suspend")

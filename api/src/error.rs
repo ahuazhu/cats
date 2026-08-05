@@ -89,9 +89,6 @@ impl ApiError {
     pub fn unauthenticated(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Unauthenticated, message)
     }
-    pub fn permission_denied(message: impl Into<String>) -> Self {
-        Self::new(ErrorCode::PermissionDenied, message)
-    }
     pub fn conflict(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Conflict, message)
     }
@@ -106,8 +103,5 @@ impl ApiError {
     }
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Unavailable, message)
-    }
-    pub fn stale_epoch(message: impl Into<String>) -> Self {
-        Self::new(ErrorCode::StaleEpoch, message)
     }
 }
