@@ -495,6 +495,9 @@ fn production_control_plane_survives_one_pod_or_node_disruption() {
         "replicas = var.control_plane_replicas",
         "type = \"RollingUpdate\"",
         "max_unavailable = \"0\"",
+        "termination_grace_period_seconds = local.control_plane_termination_grace_period_seconds",
+        "pre_stop {",
+        "command = [\"/bin/sh\", \"-c\", \"sleep ${local.control_plane_pre_stop_delay_seconds}\"]",
         "pod_anti_affinity {",
         "required_during_scheduling_ignored_during_execution {",
         "topology_key       = \"kubernetes.io/hostname\"",
@@ -517,6 +520,16 @@ fn production_control_plane_survives_one_pod_or_node_disruption() {
         assert!(
             required_anti_affinity.contains(expected),
             "required control-plane anti-affinity is missing {expected:?}"
+        );
+    }
+    for expected in [
+        "control_plane_pre_stop_delay_seconds           = 15",
+        "control_plane_termination_grace_period_seconds = 30",
+        "condition     = local.control_plane_pre_stop_delay_seconds < local.control_plane_termination_grace_period_seconds",
+    ] {
+        assert!(
+            terraform.contains(expected),
+            "control-plane target drain is missing {expected:?}"
         );
     }
     assert!(variables.contains("var.control_plane_replicas >= 2"));

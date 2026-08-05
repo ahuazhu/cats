@@ -1,4 +1,11 @@
 locals {
+  # Kubernetes marks a terminating Pod unready and starts preStop before it
+  # sends SIGTERM. Keep the HTTP server alive while the EndpointSlice and EKS
+  # Auto Mode ALB remove that target; otherwise the ALB can route to a process
+  # that has already exited during the propagation window.
+  control_plane_pre_stop_delay_seconds           = 15
+  control_plane_termination_grace_period_seconds = 30
+
   labels = {
     "app.kubernetes.io/part-of"    = "cats"
     "app.kubernetes.io/managed-by" = "terraform"
@@ -51,6 +58,13 @@ locals {
       service_port = 7400
     }]
   )
+}
+
+check "control_plane_drain_fits_termination_grace" {
+  assert {
+    condition     = local.control_plane_pre_stop_delay_seconds < local.control_plane_termination_grace_period_seconds
+    error_message = "control-plane termination grace must outlast its preStop target-drain delay."
+  }
 }
 
 check "oci_deploy_sync_wait_fits_under_the_edge" {
@@ -190,7 +204,7 @@ resource "kubernetes_deployment_v1" "control_plane" {
         automount_service_account_token  = false
         enable_service_links             = false
         service_account_name             = kubernetes_service_account_v1.control_plane.metadata[0].name
-        termination_grace_period_seconds = 5
+        termination_grace_period_seconds = local.control_plane_termination_grace_period_seconds
 
         node_selector = {
           "kubernetes.io/arch" = "amd64"
@@ -286,6 +300,14 @@ resource "kubernetes_deployment_v1" "control_plane" {
             limits = {
               cpu    = "1"
               memory = "2Gi"
+            }
+          }
+
+          lifecycle {
+            pre_stop {
+              exec {
+                command = ["/bin/sh", "-c", "sleep ${local.control_plane_pre_stop_delay_seconds}"]
+              }
             }
           }
 
