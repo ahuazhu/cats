@@ -127,6 +127,8 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Res
             | NodeJobAction::WarmCat { .. }
             | NodeJobAction::RestoreCat { .. }
             | NodeJobAction::StopCat { .. }
+            | NodeJobAction::AttachDisk { .. }
+            | NodeJobAction::DetachDisk { .. }
     ) {
         if let Some(result) = node
             .applied_lifecycle_jobs
@@ -232,6 +234,8 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Res
                 | NodeJobAction::WarmCat { .. }
                 | NodeJobAction::RestoreCat { .. }
                 | NodeJobAction::StopCat { .. }
+                | NodeJobAction::AttachDisk { .. }
+                | NodeJobAction::DetachDisk { .. }
         ) {
             node.applied_lifecycle_jobs
                 .lock()
@@ -626,7 +630,7 @@ impl Ctx {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "timed out waiting {want:?} for {name}"
+                "timed out waiting {want:?} for {name}; last Cat: {cat:?}"
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -1344,6 +1348,7 @@ async fn lifecycle_provenance_uses_a_two_phase_global_activation_gate() {
             ObservedState::Suspended,
             ObservedState::Starting,
             ObservedState::Running,
+            Vec::new(),
             NodeJob {
                 job_id: cats_api::nodejob::job_id(
                     &created.cat.id,
@@ -1379,6 +1384,11 @@ async fn lifecycle_provenance_uses_a_two_phase_global_activation_gate() {
         .store
         .lifecycle_provenance_writes_enabled()
         .unwrap());
+    ctx.cp
+        .state
+        .store
+        .set_lifecycle_maintenance_frozen(true)
+        .unwrap();
     let mut activating = ctx.config.clone();
     activating.lifecycle_provenance_writes_enabled = true;
     let phase_b = spawn(activating).await.unwrap();
@@ -1388,6 +1398,11 @@ async fn lifecycle_provenance_uses_a_two_phase_global_activation_gate() {
         .store
         .lifecycle_provenance_writes_enabled()
         .unwrap());
+    ctx.cp
+        .state
+        .store
+        .set_lifecycle_maintenance_frozen(false)
+        .unwrap();
     assert!(phase_a_peer
         .state
         .store
@@ -1695,6 +1710,7 @@ async fn lost_node_recovers_from_marker_source_target_and_transitional_inventory
                 case.source,
                 case.transitional,
                 case.target,
+                Vec::new(),
                 NodeJob {
                     job_id: cats_api::nodejob::job_id(
                         &created.cat.id,
@@ -1775,6 +1791,7 @@ async fn imperative_node_jobs_cannot_cross_a_lifecycle_generation_split() {
             ObservedState::Running,
             ObservedState::Warming,
             ObservedState::Warm,
+            Vec::new(),
             NodeJob {
                 job_id: cats_api::nodejob::job_id(
                     &created.cat.id,
@@ -2741,6 +2758,76 @@ async fn phase_a_failed_wake_restores_its_source_instead_of_inferring_start_cat(
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase_a_two_controller_markerless_wake_handoff_never_infers_start_or_discard() {
+    let ctx = Ctx::new_with_provenance(Default::default(), 25, 30_000, false).await;
+    let node = start_stub_node(&ctx.cp, "node_phase_a_ambiguous_wake").await;
+    let created = ctx.create_cat("phase-a-ambiguous-wake", None).await;
+    ctx.wait_observed("phase-a-ambiguous-wake", ObservedState::Running)
+        .await;
+    let suspend = ctx.action("phase-a-ambiguous-wake", "suspend").await;
+    ctx.wait_operation(&suspend.operation.id).await;
+    let suspended = ctx
+        .wait_observed("phase-a-ambiguous-wake", ObservedState::Suspended)
+        .await;
+    node.quiesce().await;
+
+    let resume = ctx
+        .cp
+        .state
+        .store
+        .set_desired(&created.cat.id, DesiredState::Running, None, "cat.resume")
+        .unwrap();
+    ctx.cp
+        .state
+        .store
+        .set_lifecycle_maintenance_frozen(true)
+        .unwrap();
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .begin_legacy_lifecycle(
+                &created.cat.id,
+                suspended.node_id.as_deref().unwrap(),
+                resume.resource_generation,
+                ObservedState::Suspended,
+                ObservedState::Starting,
+            )
+            .unwrap(),
+        cats_control_plane::store::LegacyLifecycleBegin::Begun
+    );
+
+    let second = spawn(ctx.config.clone()).await.unwrap();
+    ctx.cp.state.notify.notify_one();
+    second.state.notify.notify_one();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let retained = ctx
+        .cp
+        .state
+        .store
+        .must_get_cat_by_id(&created.cat.id)
+        .unwrap();
+    assert_eq!(retained.observed_state, ObservedState::Starting);
+    assert_eq!(retained.node_id, suspended.node_id);
+    assert!(node.job_payloads.lock().unwrap().iter().all(|job| {
+        job.cat_generation != resume.resource_generation
+            || !matches!(
+                job.action,
+                NodeJobAction::StartCat { .. } | NodeJobAction::CleanupCat { .. }
+            )
+    }));
+    assert!(ctx
+        .cp
+        .state
+        .store
+        .lifecycle_dispatch(&created.cat.id)
+        .unwrap()
+        .is_none());
+    drop(second);
+}
+
 #[tokio::test]
 async fn default_auto_suspend_fires_on_the_last_guest_work_release() {
     let ctx = Ctx::new().await;
@@ -2926,6 +3013,385 @@ async fn rwo_second_bind_is_rejected() {
         .await
         .unwrap();
     assert_eq!(del.status(), 204);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_unmount_claim_blocks_delete_remount_and_never_revokes_replacement() {
+    let ctx = Ctx::new_with_provenance(Default::default(), 30_000, 30_000, true).await;
+    let _node = start_stub_node(&ctx.cp, "node_topology_cancel").await;
+    let source = ctx.create_cat("topology-source", None).await;
+    let target = ctx.create_cat("topology-target", None).await;
+    ctx.wait_observed("topology-source", ObservedState::Running)
+        .await;
+    ctx.wait_observed("topology-target", ObservedState::Running)
+        .await;
+    let disk: Disk = ctx
+        .http
+        .post(ctx.ws_url("/disks"))
+        .bearer_auth("dev-admin-token")
+        .json(&CreateDiskRequest {
+            name: "topology-cancel-disk".into(),
+            size_bytes: 8 << 20,
+            durability: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mounted = ctx
+        .http
+        .post(ctx.ws_url("/disks/topology-cancel-disk/actions/mount"))
+        .bearer_auth("dev-admin-token")
+        .json(&serde_json::json!({
+            "cat_id": "topology-source",
+            "mount_at": "/data"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(mounted.status().is_success());
+    let old_epoch = ctx
+        .cp
+        .state
+        .storage_meta
+        .acquire_lease(&disk.volume_id, "topology-old-writer", 60_000)
+        .unwrap();
+    let original = cats_control_plane::store::VolumeLeaseAuthority {
+        volume_id: disk.volume_id.clone(),
+        attachment_id: "topology-old-writer".into(),
+        epoch: old_epoch,
+    };
+    let claim = ctx
+        .cp
+        .state
+        .store
+        .begin_unmount_topology_claim(&disk.id, &source.cat.id, Some(original))
+        .unwrap();
+    assert!(ctx
+        .cp
+        .state
+        .store
+        .set_desired(&source.cat.id, DesiredState::Deleted, None, "cat.delete")
+        .is_err());
+    assert!(ctx
+        .cp
+        .state
+        .store
+        .begin_mount_topology_claim(&disk.id, &target.cat.id, "/data")
+        .is_err());
+    drop(claim);
+    let claim = ctx
+        .cp
+        .state
+        .store
+        .topology_claim(&source.cat.id)
+        .unwrap()
+        .expect("request cancellation must leave its durable unmount claim");
+
+    assert!(ctx
+        .cp
+        .state
+        .storage_meta
+        .revoke_lease_if_matches(&disk.volume_id, "topology-old-writer", old_epoch)
+        .unwrap());
+    let replacement_epoch = ctx
+        .cp
+        .state
+        .storage_meta
+        .acquire_lease(&disk.volume_id, "topology-replacement", 60_000)
+        .unwrap();
+    assert!(ctx
+        .cp
+        .state
+        .controller
+        .drive_topology_claim(&claim)
+        .await
+        .is_err());
+    let replacement = ctx
+        .cp
+        .state
+        .storage_meta
+        .load_head(&disk.volume_id)
+        .unwrap();
+    assert_eq!(
+        replacement.lease_owner.as_deref(),
+        Some("topology-replacement")
+    );
+    assert_eq!(replacement.lease_epoch, replacement_epoch);
+    assert!(ctx
+        .cp
+        .state
+        .store
+        .topology_claim(&source.cat.id)
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .get_disk(&source.cat.workspace_id, &disk.id)
+            .unwrap()
+            .bound_cat_id
+            .as_deref(),
+        Some(source.cat.id.as_str())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn definitive_topology_failures_roll_back_mount_and_unmount_claims() {
+    let ctx = Ctx::new_with_provenance(Default::default(), 30_000, 30_000, true).await;
+    let node = start_stub_node(&ctx.cp, "node_topology_rollback").await;
+    let created = ctx.create_cat("topology-rollback", None).await;
+    ctx.wait_observed("topology-rollback", ObservedState::Running)
+        .await;
+    let disk: Disk = ctx
+        .http
+        .post(ctx.ws_url("/disks"))
+        .bearer_auth("dev-admin-token")
+        .json(&CreateDiskRequest {
+            name: "topology-rollback-disk".into(),
+            size_bytes: 8 << 20,
+            durability: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mount_body = serde_json::json!({
+        "cat_id": "topology-rollback",
+        "mount_at": "/data"
+    });
+
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("attach_disk".into(), 1);
+    let failed_mount = ctx
+        .http
+        .post(ctx.ws_url("/disks/topology-rollback-disk/actions/mount"))
+        .bearer_auth("dev-admin-token")
+        .json(&mount_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed_mount.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(ctx
+        .cp
+        .state
+        .store
+        .topology_claim(&created.cat.id)
+        .unwrap()
+        .is_none());
+    assert!(ctx
+        .cp
+        .state
+        .store
+        .get_disk(&created.cat.workspace_id, &disk.id)
+        .unwrap()
+        .bound_cat_id
+        .is_none());
+
+    let mounted = ctx
+        .http
+        .post(ctx.ws_url("/disks/topology-rollback-disk/actions/mount"))
+        .bearer_auth("dev-admin-token")
+        .json(&mount_body)
+        .send()
+        .await
+        .unwrap();
+    assert!(mounted.status().is_success());
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("detach_disk".into(), 1);
+    let failed_unmount = ctx
+        .http
+        .post(ctx.ws_url("/disks/topology-rollback-disk/actions/unmount"))
+        .bearer_auth("dev-admin-token")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed_unmount.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(ctx
+        .cp
+        .state
+        .store
+        .topology_claim(&created.cat.id)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .get_disk(&created.cat.workspace_id, &disk.id)
+            .unwrap()
+            .bound_cat_id
+            .as_deref(),
+        Some(created.cat.id.as_str())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn confirmed_node_fence_resolves_cancelled_mount_and_unmount_claims() {
+    let ctx = Ctx::new_with_provenance(Default::default(), 30_000, 30_000, true).await;
+    let node = start_stub_node(&ctx.cp, "node_topology_fence").await;
+    let mounting = ctx.create_cat("topology-fenced-mount", None).await;
+    let unmounting = ctx.create_cat("topology-fenced-unmount", None).await;
+    ctx.wait_observed("topology-fenced-mount", ObservedState::Running)
+        .await;
+    ctx.wait_observed("topology-fenced-unmount", ObservedState::Running)
+        .await;
+    let create_disk = |name: &str| CreateDiskRequest {
+        name: name.into(),
+        size_bytes: 8 << 20,
+        durability: Default::default(),
+    };
+    let mount_disk: Disk = ctx
+        .http
+        .post(ctx.ws_url("/disks"))
+        .bearer_auth("dev-admin-token")
+        .json(&create_disk("topology-fenced-mount-disk"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let unmount_disk: Disk = ctx
+        .http
+        .post(ctx.ws_url("/disks"))
+        .bearer_auth("dev-admin-token")
+        .json(&create_disk("topology-fenced-unmount-disk"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let mount_claim = ctx
+        .cp
+        .state
+        .store
+        .begin_mount_topology_claim(&mount_disk.id, &mounting.cat.id, "/data")
+        .unwrap();
+    let mount_attachment = format!(
+        "att_{}_{}_{}",
+        mounting.cat.id, mount_disk.id, mount_claim.cat_generation
+    );
+    let mount_epoch = ctx
+        .cp
+        .state
+        .storage_meta
+        .acquire_lease(&mount_disk.volume_id, &mount_attachment, 60_000)
+        .unwrap();
+
+    let mounted = ctx
+        .http
+        .post(ctx.ws_url("/disks/topology-fenced-unmount-disk/actions/mount"))
+        .bearer_auth("dev-admin-token")
+        .json(&serde_json::json!({
+            "cat_id": "topology-fenced-unmount",
+            "mount_at": "/data"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(mounted.status().is_success());
+    let old_epoch = ctx
+        .cp
+        .state
+        .storage_meta
+        .acquire_lease(&unmount_disk.volume_id, "fenced-unmount-old", 60_000)
+        .unwrap();
+    ctx.cp
+        .state
+        .store
+        .begin_unmount_topology_claim(
+            &unmount_disk.id,
+            &unmounting.cat.id,
+            Some(cats_control_plane::store::VolumeLeaseAuthority {
+                volume_id: unmount_disk.volume_id.clone(),
+                attachment_id: "fenced-unmount-old".into(),
+                epoch: old_epoch,
+            }),
+        )
+        .unwrap();
+
+    // Both requests are now cancelled at an ambiguous node boundary. External
+    // fencing is the proof that lets a successor revoke the captured writers,
+    // roll back the provisional mount and complete the unmount.
+    node.quiesce().await;
+    ctx.cp
+        .state
+        .store
+        .set_node_state(&node.id, NodeState::Lost)
+        .unwrap();
+    let fenced = ctx
+        .http
+        .post(ctx.url(&format!("/v1/admin/nodes/{}/actions/fence", node.id)))
+        .bearer_auth("dev-admin-token")
+        .json(&serde_json::json!({"confirm_host_stopped_or_isolated": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fenced.status(), StatusCode::OK);
+
+    for cat in [&mounting.cat, &unmounting.cat] {
+        assert!(ctx
+            .cp
+            .state
+            .store
+            .topology_claim(&cat.id)
+            .unwrap()
+            .is_none());
+        assert!(ctx
+            .cp
+            .state
+            .store
+            .must_get_cat_by_id(&cat.id)
+            .unwrap()
+            .node_id
+            .is_none());
+    }
+    for (disk, old_owner, old_epoch) in [
+        (&mount_disk, mount_attachment.as_str(), mount_epoch),
+        (&unmount_disk, "fenced-unmount-old", old_epoch),
+    ] {
+        assert!(ctx
+            .cp
+            .state
+            .store
+            .get_disk(&mounting.cat.workspace_id, &disk.id)
+            .unwrap()
+            .bound_cat_id
+            .is_none());
+        assert!(
+            ctx.cp
+                .state
+                .storage_meta
+                .renew_lease(&disk.volume_id, old_owner, old_epoch, 60_000)
+                .is_err(),
+            "old writer for disk {} remained renewable after fencing",
+            disk.name
+        );
+        let replacement_epoch = ctx
+            .cp
+            .state
+            .storage_meta
+            .acquire_lease(&disk.volume_id, "post-fence-replacement", 60_000)
+            .unwrap();
+        assert!(
+            replacement_epoch > old_epoch,
+            "replacement writer did not advance the fenced epoch for {}",
+            disk.name
+        );
+    }
 }
 
 #[tokio::test]
@@ -3450,6 +3916,121 @@ async fn api_api_and_singleton_fence_entries_share_one_node_barrier() {
         Some("replacement-writer")
     );
     assert_eq!(replacement.lease_epoch, replacement_epoch);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delayed_stop_revoke_uses_persisted_original_pair_not_replacement_writer() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_stop_original_pair").await;
+    let created = ctx.create_cat("stop-original-pair", None).await;
+    ctx.wait_observed("stop-original-pair", ObservedState::Running)
+        .await;
+    node.quiesce().await;
+    let root = ctx
+        .cp
+        .state
+        .store
+        .get_disk(&created.cat.workspace_id, &created.cat.root_disk_id)
+        .unwrap();
+    let old_epoch = ctx
+        .cp
+        .state
+        .storage_meta
+        .acquire_lease(&root.volume_id, "stop-old-writer", 60_000)
+        .unwrap();
+    node.hold_next_job_response("stop_cat");
+    let stop = ctx.action("stop-original-pair", "stop").await;
+    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .expect("StopCat did not reach its delayed response boundary");
+    let dispatch = ctx
+        .cp
+        .state
+        .store
+        .lifecycle_dispatch(&created.cat.id)
+        .unwrap()
+        .expect("StopCat did not persist authority before dispatch");
+    assert!(dispatch.volume_leases.iter().any(|lease| {
+        lease.volume_id == root.volume_id
+            && lease.attachment_id == "stop-old-writer"
+            && lease.epoch == old_epoch
+    }));
+
+    assert!(ctx
+        .cp
+        .state
+        .storage_meta
+        .revoke_lease_if_matches(&root.volume_id, "stop-old-writer", old_epoch)
+        .unwrap());
+    let replacement_epoch = ctx
+        .cp
+        .state
+        .storage_meta
+        .acquire_lease(&root.volume_id, "stop-replacement-writer", 60_000)
+        .unwrap();
+    let replacement_before_commit = ctx
+        .cp
+        .state
+        .storage_meta
+        .load_head(&root.volume_id)
+        .unwrap();
+    let replacement_generation = replacement_before_commit.generation + 1;
+    ctx.cp
+        .state
+        .storage_meta
+        .cas_head(
+            &root.volume_id,
+            replacement_before_commit.generation,
+            replacement_generation,
+            [0x5a; 32],
+            "stop-replacement-root",
+            "stop-replacement-writer",
+            replacement_epoch,
+        )
+        .unwrap();
+    node.job_response_release.notify_waiters();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let replacement = ctx
+        .cp
+        .state
+        .storage_meta
+        .load_head(&root.volume_id)
+        .unwrap();
+    assert_eq!(
+        replacement.lease_owner.as_deref(),
+        Some("stop-replacement-writer")
+    );
+    assert_eq!(replacement.lease_epoch, replacement_epoch);
+    assert_eq!(replacement.generation, replacement_generation);
+    assert_eq!(replacement.root_hash, Some([0x5a; 32]));
+    assert_eq!(
+        replacement.root_object_id.as_deref(),
+        Some("stop-replacement-root")
+    );
+    let retained = ctx
+        .cp
+        .state
+        .store
+        .must_get_cat_by_id(&created.cat.id)
+        .unwrap();
+    assert!(retained.node_id.is_some());
+    assert!(ctx
+        .cp
+        .state
+        .store
+        .lifecycle_dispatch(&created.cat.id)
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .get_operation(&stop.operation.id)
+            .unwrap()
+            .phase,
+        OperationPhase::Pending
+    );
 }
 
 #[tokio::test]

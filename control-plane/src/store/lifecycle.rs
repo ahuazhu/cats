@@ -17,6 +17,11 @@ pub struct LifecycleDispatch {
     pub transitional_state: ObservedState,
     pub target_state: ObservedState,
     pub operation_ids: Vec<String>,
+    /// Writer pairs observed before the node action. A successful Stop or wake
+    /// fallback may revoke only these identities; a later owner is never
+    /// rediscovered and treated as the old dispatch's writer.
+    #[serde(default)]
+    pub volume_leases: Vec<VolumeLeaseAuthority>,
     pub job: NodeJob,
 }
 
@@ -28,6 +33,35 @@ pub enum LegacyLifecycleBegin {
 }
 
 impl Store {
+    pub fn lifecycle_maintenance_frozen(&self) -> Result<bool> {
+        self.with(|client| {
+            client
+                .query_one(
+                    "SELECT lifecycle_maintenance_frozen
+                       FROM control_schema_version WHERE singleton",
+                    &[],
+                )?
+                .try_get(0)
+        })
+    }
+
+    /// Database-enforced Phase-A maintenance boundary. The PostgreSQL trigger
+    /// also fences replicas from before this build: after this row commits they
+    /// cannot create a Cat or change desired/generation, while their already
+    /// persisted transition is still allowed to settle.
+    pub fn set_lifecycle_maintenance_frozen(&self, frozen: bool) -> Result<()> {
+        self.with(|client| {
+            client
+                .execute(
+                    "UPDATE control_schema_version
+                        SET lifecycle_maintenance_frozen=$1
+                      WHERE singleton",
+                    &[&frozen],
+                )
+                .map(|_| ())
+        })
+    }
+
     pub fn lifecycle_provenance_writes_enabled(&self) -> Result<bool> {
         self.with(|client| {
             client
@@ -47,18 +81,29 @@ impl Store {
         self.enter(|client| {
             let client = client?;
             let mut tx = client.transaction().map_err(internal)?;
-            let enabled: bool = tx
+            let gate = tx
                 .query_one(
-                    "SELECT lifecycle_provenance_writes_enabled
+                    "SELECT lifecycle_provenance_writes_enabled,
+                            lifecycle_maintenance_frozen
                        FROM control_schema_version WHERE singleton FOR UPDATE",
                     &[],
                 )
-                .map_err(internal)?
-                .try_get(0)
                 .map_err(internal)?;
+            let enabled: bool = gate.try_get(0).map_err(internal)?;
             if enabled {
                 tx.commit().map_err(internal)?;
                 return Ok(());
+            }
+            let frozen: bool = gate.try_get(1).map_err(internal)?;
+            let cats: i64 = tx
+                .query_one("SELECT COUNT(*) FROM cats", &[])
+                .map_err(internal)?
+                .try_get(0)
+                .map_err(internal)?;
+            if !frozen && cats != 0 {
+                return Err(ApiError::conflict(
+                    "lifecycle provenance activation requires the database maintenance freeze",
+                ));
             }
             let unsafe_rows: i64 = tx
                 .query_one(
@@ -66,6 +111,7 @@ impl Store {
                       WHERE (c.lifecycle_dispatch_json IS NULL
                              AND c.observed_state IN
                                  ('starting','suspending','warming','stopping'))
+                         OR c.topology_claim_json IS NOT NULL
                          OR NOT (
                              (c.desired_state='running' AND c.observed_state='running')
                           OR (c.desired_state='suspended' AND c.observed_state='suspended')
@@ -141,7 +187,8 @@ impl Store {
                     "UPDATE cats
                         SET observed_state=$5, observed_state_since_ms=$6
                       WHERE id=$1 AND node_id=$2 AND generation=$3
-                        AND observed_state=$4 AND lifecycle_dispatch_json IS NULL",
+                        AND observed_state=$4 AND lifecycle_dispatch_json IS NULL
+                        AND topology_claim_json IS NULL",
                     &[
                         &cat_id,
                         &node_id,
@@ -179,6 +226,112 @@ impl Store {
         })
     }
 
+    /// Persist the writer identities inspected after a failed external action
+    /// but before any revoke. This is needed for Start failure: Start itself
+    /// may have acquired a lease that did not exist when its dispatch marker
+    /// was first committed.
+    pub fn persist_lifecycle_fence_leases(
+        &self,
+        dispatch: &LifecycleDispatch,
+        volume_leases: Vec<VolumeLeaseAuthority>,
+    ) -> Result<Option<LifecycleDispatch>> {
+        let expected = serde_json::to_string(dispatch).map_err(internal)?;
+        let mut updated = dispatch.clone();
+        updated.volume_leases = volume_leases;
+        let replacement = serde_json::to_string(&updated).map_err(internal)?;
+        let changed = self.with(|client| {
+            client
+                .execute(
+                    "UPDATE cats SET lifecycle_dispatch_json=$2
+                      WHERE id=$1 AND lifecycle_dispatch_json=$3
+                        AND node_id=$4 AND topology_claim_json IS NULL",
+                    &[
+                        &dispatch.job.action.cat_id(),
+                        &replacement,
+                        &expected,
+                        &dispatch.node_id,
+                    ],
+                )
+                .map(|changed| changed == 1)
+        })?;
+        Ok(changed.then_some(updated))
+    }
+
+    pub fn lifecycle_dispatch_authority_matches(
+        &self,
+        dispatch: &LifecycleDispatch,
+    ) -> Result<bool> {
+        let expected = serde_json::to_string(dispatch).map_err(internal)?;
+        self.with(|client| {
+            client
+                .query_opt(
+                    "SELECT 1 FROM cats
+                      WHERE id=$1 AND node_id=$2
+                        AND lifecycle_dispatch_json=$3
+                        AND topology_claim_json IS NULL",
+                    &[&dispatch.job.action.cat_id(), &dispatch.node_id, &expected],
+                )
+                .map(|row| row.is_some())
+        })
+    }
+
+    pub fn unclaimed_cat_authority_matches(
+        &self,
+        cat_id: &str,
+        generation: i64,
+        node_id: Option<&str>,
+    ) -> Result<bool> {
+        self.with(|client| {
+            client
+                .query_opt(
+                    "SELECT 1 FROM cats
+                      WHERE id=$1 AND generation=$2
+                        AND node_id IS NOT DISTINCT FROM $3::TEXT
+                        AND lifecycle_dispatch_json IS NULL
+                        AND topology_claim_json IS NULL",
+                    &[&cat_id, &generation, &node_id],
+                )
+                .map(|row| row.is_some())
+        })
+    }
+
+    pub fn fenced_cat_authority_matches(
+        &self,
+        cat_id: &str,
+        node_id: &str,
+        generation: i64,
+    ) -> Result<bool> {
+        self.with(|client| {
+            client
+                .query_opt(
+                    "SELECT 1 FROM cats c JOIN nodes n ON n.id=c.node_id
+                      WHERE c.id=$1 AND c.node_id=$2 AND c.generation=$3
+                        AND c.topology_claim_json IS NULL AND n.state='fenced'",
+                    &[&cat_id, &node_id, &generation],
+                )
+                .map(|row| row.is_some())
+        })
+    }
+
+    pub fn fenced_topology_authority_matches(
+        &self,
+        claim: &TopologyClaim,
+        node_id: &str,
+    ) -> Result<bool> {
+        let expected = serde_json::to_string(claim).map_err(internal)?;
+        self.with(|client| {
+            client
+                .query_opt(
+                    "SELECT 1 FROM cats c JOIN nodes n ON n.id=c.node_id
+                      WHERE c.id=$1 AND c.node_id=$2 AND c.generation=$3
+                        AND c.lifecycle_dispatch_json IS NULL
+                        AND c.topology_claim_json=$4 AND n.state='fenced'",
+                    &[&claim.cat_id, &node_id, &claim.cat_generation, &expected],
+                )
+                .map(|row| row.is_some())
+        })
+    }
+
     /// Atomically publish the transitional state and the exact node job that
     /// may execute after commit.  An existing marker always wins: overwriting
     /// it would make an ambiguous old result impossible to classify safely.
@@ -190,6 +343,7 @@ impl Store {
         source_state: ObservedState,
         transitional_state: ObservedState,
         target_state: ObservedState,
+        volume_leases: Vec<VolumeLeaseAuthority>,
         job: NodeJob,
     ) -> Result<Option<LifecycleDispatch>> {
         self.enter(|client| {
@@ -197,7 +351,8 @@ impl Store {
             let mut tx = client.transaction().map_err(internal)?;
             let row = tx
                 .query_opt(
-                    "SELECT generation, observed_state, node_id, lifecycle_dispatch_json
+                    "SELECT generation, observed_state, node_id, lifecycle_dispatch_json,
+                            topology_claim_json
                        FROM cats WHERE id=$1 FOR UPDATE",
                     &[&cat_id],
                 )
@@ -210,9 +365,11 @@ impl Store {
             let generation: i64 = row.try_get(0).map_err(internal)?;
             let observed: String = row.try_get(1).map_err(internal)?;
             let assigned_node: Option<String> = row.try_get(2).map_err(internal)?;
+            let topology_claim: Option<String> = row.try_get(4).map_err(internal)?;
             if generation != job.cat_generation
                 || observed != observed_str(source_state)
                 || assigned_node.as_deref() != Some(node_id)
+                || topology_claim.is_some()
             {
                 tx.commit().map_err(internal)?;
                 return Ok(None);
@@ -243,6 +400,7 @@ impl Store {
                 transitional_state,
                 target_state,
                 operation_ids,
+                volume_leases,
                 job,
             };
             let json = serde_json::to_string(&dispatch).map_err(internal)?;
@@ -250,7 +408,8 @@ impl Store {
                 "UPDATE cats
                     SET observed_state=$2, observed_state_since_ms=$3,
                         lifecycle_dispatch_json=$4
-                  WHERE id=$1 AND lifecycle_dispatch_json IS NULL",
+                  WHERE id=$1 AND lifecycle_dispatch_json IS NULL
+                    AND topology_claim_json IS NULL",
                 &[&cat_id, &observed_str(transitional_state), &now_ms(), &json],
             )
             .map_err(internal)?;
@@ -369,6 +528,7 @@ impl Store {
                             transitional_state: transitional,
                             target_state: target,
                             operation_ids,
+                            volume_leases: Vec::new(),
                             job,
                         };
                         next_observed = transitional;
@@ -432,7 +592,8 @@ impl Store {
             let mut tx = client.transaction().map_err(internal)?;
             let row = tx
                 .query_opt(
-                    "SELECT generation, node_id FROM cats WHERE id=$1 FOR UPDATE",
+                    "SELECT generation, node_id, topology_claim_json
+                       FROM cats WHERE id=$1 FOR UPDATE",
                     &[&cat_id],
                 )
                 .map_err(internal)?;
@@ -441,7 +602,8 @@ impl Store {
             };
             let generation: i64 = row.try_get(0).map_err(internal)?;
             let assigned_node: Option<String> = row.try_get(1).map_err(internal)?;
-            if assigned_node.as_deref() != Some(node_id) {
+            let topology_claim: Option<String> = row.try_get(2).map_err(internal)?;
+            if assigned_node.as_deref() != Some(node_id) || topology_claim.is_some() {
                 tx.commit().map_err(internal)?;
                 return Ok(false);
             }
@@ -481,6 +643,7 @@ impl Store {
                             observed_generation=generation
                       WHERE id=$1 AND generation=$2 AND desired_state='deleted'
                         AND node_id IS NULL AND lifecycle_dispatch_json=$3
+                        AND topology_claim_json IS NULL
                         AND observed_state IN ('cold','deleted')",
                     &[
                         &dispatch.job.action.cat_id(),
@@ -502,6 +665,7 @@ impl Store {
                             observed_generation=generation
                       WHERE id=$1 AND generation=$2 AND desired_state='deleted'
                         AND node_id IS NULL AND lifecycle_dispatch_json IS NULL
+                        AND topology_claim_json IS NULL
                         AND observed_state IN ('creating','cold','failed','deleted')",
                     &[&cat_id, &generation, &now_ms()],
                 )
@@ -541,6 +705,7 @@ impl Store {
                       WHERE id=$1 AND generation=$2 AND desired_state='deleted'
                         AND observed_state='deleted' AND node_id IS NULL
                         AND lifecycle_dispatch_json IS NOT DISTINCT FROM $3::TEXT
+                        AND topology_claim_json IS NULL
                       FOR UPDATE",
                     &[&cat_id, &generation, &marker],
                 )
@@ -578,7 +743,8 @@ impl Store {
                     "DELETE FROM cats
                       WHERE id=$1 AND generation=$2 AND desired_state='deleted'
                         AND observed_state='deleted' AND node_id IS NULL
-                        AND lifecycle_dispatch_json IS NOT DISTINCT FROM $3::TEXT",
+                        AND lifecycle_dispatch_json IS NOT DISTINCT FROM $3::TEXT
+                        AND topology_claim_json IS NULL",
                     &[&cat_id, &generation, &marker],
                 )
                 .map_err(internal)?;

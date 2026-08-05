@@ -267,6 +267,10 @@ fn schema_v1_upgrades_in_place_with_lifecycle_provenance_and_observed_generation
         })
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
+    assert!(
+        upgraded.lifecycle_maintenance_frozen().unwrap(),
+        "the schema-v4 upgrade must atomically freeze new lifecycle authority"
+    );
     let marker: Option<String> = upgraded
         .with(|client| {
             client
@@ -1502,6 +1506,7 @@ fn late_old_generation_result_cannot_clear_or_complete_the_new_dispatch() {
             ObservedState::Running,
             ObservedState::Suspending,
             ObservedState::Suspended,
+            Vec::new(),
             old_job,
         )
         .unwrap()
@@ -1550,6 +1555,7 @@ fn late_old_generation_result_cannot_clear_or_complete_the_new_dispatch() {
             ObservedState::Suspended,
             ObservedState::Starting,
             ObservedState::Running,
+            Vec::new(),
             new_job,
         )
         .unwrap()
@@ -1634,6 +1640,7 @@ fn confirmed_fence_atomically_clears_every_host_claim() {
             ObservedState::Running,
             ObservedState::Suspending,
             ObservedState::Suspended,
+            Vec::new(),
             NodeJob {
                 job_id: job_id(&cat.id, suspend.resource_generation, "suspend_cat"),
                 cat_generation: suspend.resource_generation,
@@ -1798,6 +1805,7 @@ fn global_provenance_activation_linearizes_against_legacy_begin() {
         .set_observed_for_generation(&cat.id, ObservedState::Running, 1)
         .unwrap();
     legacy_store.finish_operation(&create.id, None).unwrap();
+    legacy_store.set_lifecycle_maintenance_frozen(true).unwrap();
     let barrier = Arc::new(std::sync::Barrier::new(2));
     let cat_id = cat.id.clone();
     let (legacy, activation) = std::thread::scope(|scope| {
@@ -1876,6 +1884,55 @@ fn global_provenance_activation_rejects_active_lifecycle_work() {
         .unwrap();
     assert!(store.activate_lifecycle_provenance_writes().is_err());
     assert!(!store.lifecycle_provenance_writes_enabled().unwrap());
+}
+
+#[test]
+fn maintenance_freeze_blocks_every_new_lifecycle_authority_until_gate_activation() {
+    let store = test_store();
+    let workspace = bootstrap_workspace(&store, "provenance-maintenance-freeze");
+    let (cat, _, create) =
+        create_test_cat(&store, &workspace, "provenance-maintenance-freeze").unwrap();
+    store.finish_operation(&create.id, None).unwrap();
+    let cold = store
+        .set_desired(&cat.id, DesiredState::Cold, None, "cat.stop")
+        .unwrap();
+    store
+        .set_observed_for_generation(&cat.id, ObservedState::Cold, cold.resource_generation)
+        .unwrap();
+    store.finish_operation(&cold.id, None).unwrap();
+    store
+        .register_node(
+            "freeze-node",
+            "http://node",
+            "http://gateway",
+            4,
+            8192,
+            false,
+        )
+        .unwrap();
+    let disk = store
+        .create_disk(&workspace, "freeze-disk", 1 << 22, DiskDurability::Strict)
+        .unwrap();
+
+    store.set_lifecycle_maintenance_frozen(true).unwrap();
+    assert!(store.lifecycle_maintenance_frozen().unwrap());
+    assert!(create_test_cat(&store, &workspace, "blocked-create").is_err());
+    assert!(store
+        .set_desired(&cat.id, DesiredState::Suspended, None, "cat.suspend")
+        .is_err());
+    assert!(store.ensure_desired_running(&cat.id).is_err());
+    assert!(store
+        .set_node_state("freeze-node", NodeState::Draining)
+        .is_err());
+    assert!(store
+        .begin_mount_topology_claim(&disk.id, &cat.id, "/data")
+        .is_err());
+
+    store.activate_lifecycle_provenance_writes().unwrap();
+    assert!(store.lifecycle_provenance_writes_enabled().unwrap());
+    store.set_lifecycle_maintenance_frozen(false).unwrap();
+    assert!(!store.lifecycle_maintenance_frozen().unwrap());
+    assert!(store.ensure_desired_running(&cat.id).unwrap().is_some());
 }
 
 #[test]
@@ -1987,6 +2044,7 @@ fn destroy_dispatch_is_terminal_and_authorizes_exact_cleanup_only() {
             ObservedState::Running,
             ObservedState::Stopping,
             ObservedState::Cold,
+            Vec::new(),
             NodeJob {
                 job_id: job_id(&cat.id, delete.resource_generation, "stop_cat"),
                 cat_generation: delete.resource_generation,
@@ -2105,6 +2163,7 @@ fn hot_disk_changes_have_zero_side_effects_under_every_lifecycle_marker() {
                 ObservedState::Running,
                 transitional,
                 target,
+                Vec::new(),
                 NodeJob {
                     job_id: job_id(&cat.id, cat.generation, action.kind()),
                     cat_generation: cat.generation,
@@ -2121,6 +2180,69 @@ fn hot_disk_changes_have_zero_side_effects_under_every_lifecycle_marker() {
             .bound_cat_id
             .is_none());
     }
+}
+
+#[test]
+fn unmount_claim_must_exclude_delete_until_rollback_finishes() {
+    let store = test_store();
+    let workspace = bootstrap_workspace(&store, "unmount-delete-claim");
+    let (cat, _, _) = create_test_cat(&store, &workspace, "unmount-delete-claim").unwrap();
+    place_running_cat(&store, &cat, "node-unmount-delete");
+    let disk = store
+        .create_disk(
+            &workspace,
+            "unmount-delete-disk",
+            1 << 22,
+            DiskDurability::Strict,
+        )
+        .unwrap();
+    store.bind_disk(&disk.id, &cat.id, "/data").unwrap();
+
+    let (binding, _) = store.unbind_disk_for_hot_change(&disk.id, &cat.id).unwrap();
+    assert!(
+        store
+            .set_desired(&cat.id, DesiredState::Deleted, None, "cat.delete")
+            .is_err(),
+        "Delete must not snapshot topology while an unmount can still roll it back"
+    );
+    store.restore_binding(&binding).unwrap();
+    assert_eq!(
+        store
+            .get_disk(&workspace.id, &disk.id)
+            .unwrap()
+            .bound_cat_id
+            .as_deref(),
+        Some(cat.id.as_str())
+    );
+}
+
+#[test]
+fn unmount_claim_must_block_a_concurrent_remount() {
+    let store = test_store();
+    let workspace = bootstrap_workspace(&store, "unmount-remount-claim");
+    let (first, _, _) = create_test_cat(&store, &workspace, "unmount-source").unwrap();
+    let (second, _, _) = create_test_cat(&store, &workspace, "unmount-target").unwrap();
+    place_running_cat(&store, &first, "node-unmount-source");
+    place_running_cat(&store, &second, "node-unmount-target");
+    let disk = store
+        .create_disk(
+            &workspace,
+            "unmount-remount-disk",
+            1 << 22,
+            DiskDurability::Strict,
+        )
+        .unwrap();
+    store.bind_disk(&disk.id, &first.id, "/data").unwrap();
+
+    let (_binding, _) = store
+        .unbind_disk_for_hot_change(&disk.id, &first.id)
+        .unwrap();
+    assert!(
+        store
+            .bind_disk_for_hot_change(&disk.id, &second.id, "/data")
+            .is_err(),
+        "a disk being detached must remain RWO-claimed until detach and lease revoke settle"
+    );
 }
 
 #[test]
@@ -2159,4 +2281,23 @@ fn per_node_fence_session_lock_serializes_independent_replicas() {
     assert!(second.node_fence_lease("same-node").unwrap().is_none());
     drop(held);
     assert!(second.node_fence_lease("same-node").unwrap().is_some());
+}
+
+#[test]
+fn disconnected_node_fence_session_loses_authority_before_commit() {
+    let (first, second) = test_store_pair();
+    let mut lease = first.node_fence_lease("disconnect-node").unwrap().unwrap();
+    let backend_pid = lease.backend_pid().unwrap();
+    second
+        .with(|client| {
+            client
+                .query_one("SELECT pg_terminate_backend($1)", &[&backend_pid])
+                .map(|_| ())
+        })
+        .unwrap();
+    assert!(lease.check().is_err());
+    assert!(second
+        .node_fence_lease("disconnect-node")
+        .unwrap()
+        .is_some());
 }

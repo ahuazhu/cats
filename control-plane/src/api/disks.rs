@@ -94,50 +94,45 @@ pub(super) async fn disk_action(
             if disk.kind == DiskKind::Root {
                 return Err(ApiError::failed_precondition("cannot mount a root disk").into());
             }
-            let (binding, mode) = state
+            let claim = state
                 .store
-                .bind_disk_for_hot_change(&disk.id, &cat.id, &mount_at)?;
-            if mode == crate::store::DiskChangeMode::HotRunning {
-                if let Err(e) = hot_attach(&state, &cat, &disk, &binding.mount_path).await {
-                    state.store.unbind_disk(&disk.id)?;
-                    return Err(e);
-                }
-            }
-            Ok(Json(binding).into_response())
+                .begin_mount_topology_claim(&disk.id, &cat.id, &mount_at)?;
+            state
+                .controller
+                .drive_topology_claim(&claim)
+                .await
+                .map_err(|error| ApiError::unavailable(error.to_string()))?;
+            Ok(Json(claim.binding().clone()).into_response())
         }
         "unmount" => {
             let Some(bound_cat) = disk.bound_cat_id.clone() else {
                 return Err(ApiError::failed_precondition("disk is not mounted").into());
             };
             let cat = state.store.must_get_cat_by_id(&bound_cat)?;
-            let (binding, mode) = state.store.unbind_disk_for_hot_change(&disk.id, &cat.id)?;
-            if mode == crate::store::DiskChangeMode::HotRunning {
-                if let Err(error) = hot_detach(&state, &cat, &disk).await {
-                    state.store.restore_binding(&binding)?;
-                    return Err(error);
+            // This pair is captured before the node detach and persisted in the
+            // claim. A delayed response can only revoke this writer, never one
+            // acquired by a later mount.
+            let original_lease = match state.storage_meta.load_head(&disk.volume_id) {
+                Ok(head) => {
+                    head.lease_owner
+                        .map(|attachment_id| crate::store::VolumeLeaseAuthority {
+                            volume_id: disk.volume_id.clone(),
+                            attachment_id,
+                            epoch: head.lease_epoch,
+                        })
                 }
-            }
-            let revoke = match state.storage_meta.load_head(&disk.volume_id) {
-                Ok(head) => match head.lease_owner {
-                    Some(owner) => state
-                        .storage_meta
-                        .revoke_lease_if_matches(&disk.volume_id, &owner, head.lease_epoch)
-                        .and_then(|revoked| {
-                            if revoked {
-                                Ok(())
-                            } else {
-                                Err(cats_storage::MetaError::Fenced)
-                            }
-                        }),
-                    None => Ok(()),
-                },
-                Err(cats_storage::MetaError::NotFound(_)) => Ok(()),
-                Err(error) => Err(error),
+                Err(cats_storage::MetaError::NotFound(_)) => None,
+                Err(error) => return Err(ApiError::internal(error.to_string()).into()),
             };
-            if let Err(error) = revoke {
-                state.store.restore_binding(&binding)?;
-                return Err(ApiError::internal(error.to_string()).into());
-            }
+            let claim =
+                state
+                    .store
+                    .begin_unmount_topology_claim(&disk.id, &cat.id, original_lease)?;
+            state
+                .controller
+                .drive_topology_claim(&claim)
+                .await
+                .map_err(|error| ApiError::unavailable(error.to_string()))?;
             Ok(StatusCode::NO_CONTENT.into_response())
         }
         "resize" => {
@@ -163,94 +158,6 @@ pub(super) async fn disk_action(
         }
         _ => Err(ApiError::invalid(format!("unknown disk action {verb}")).into()),
     }
-}
-
-pub(super) async fn hot_attach(
-    state: &AppState,
-    cat: &Cat,
-    disk: &Disk,
-    mount_path: &str,
-) -> ApiResult<()> {
-    let owner = format!("control_{}", uuid::Uuid::new_v4().simple());
-    let lease =
-        state
-            .store
-            .acquire_work(&cat.id, WorkKind::Control, &owner, "disk_attach", 120_000)?;
-    let cat_id = cat.id.clone();
-    let result = async {
-        let cat = ensure_running(state, cat.clone()).await?;
-        let node = state
-            .store
-            .list_nodes()?
-            .into_iter()
-            .find(|n| Some(&n.id) == cat.node_id.as_ref())
-            .ok_or_else(|| ApiError::unavailable("cat node missing"))?;
-        let size = cats_api::chunk::round_up_to_chunk(disk.size_bytes);
-        match state.storage_meta.create_volume(&disk.volume_id, size) {
-            Ok(()) | Err(cats_storage::MetaError::AlreadyExists(_)) => {}
-            Err(e) => return Err(ApiError::internal(e.to_string()).into()),
-        }
-        let job = cats_api::nodejob::NodeJob {
-            job_id: cats_api::nodejob::job_id(
-                &cat.id,
-                cat.generation,
-                &format!("attach_{}", disk.id),
-            ),
-            cat_generation: cat.generation,
-            action: cats_api::nodejob::NodeJobAction::AttachDisk {
-                cat_id: cat.id.clone(),
-                volume: cats_api::nodejob::VolumeGrant {
-                    disk_id: disk.id.clone(),
-                    volume_id: disk.volume_id.clone(),
-                    attachment_id: format!("att_{}_{}_{}", cat.id, disk.id, cat.generation),
-                    epoch: 0,
-                    size_bytes: size,
-                    mount_path: mount_path.to_string(),
-                    durability: disk.durability,
-                },
-            },
-        };
-        dispatch_or_unavailable(state, &node.agent_url, &job).await
-    }
-    .await;
-    let _ = state.store.release_work(&lease.id);
-    let _ = state.controller.maybe_auto_suspend(&cat_id);
-    result
-}
-
-pub(super) async fn hot_detach(state: &AppState, cat: &Cat, disk: &Disk) -> ApiResult<()> {
-    let owner = format!("control_{}", uuid::Uuid::new_v4().simple());
-    let lease =
-        state
-            .store
-            .acquire_work(&cat.id, WorkKind::Control, &owner, "disk_detach", 120_000)?;
-    let cat_id = cat.id.clone();
-    let result = async {
-        let cat = ensure_running(state, cat.clone()).await?;
-        let node = state
-            .store
-            .list_nodes()?
-            .into_iter()
-            .find(|n| Some(&n.id) == cat.node_id.as_ref())
-            .ok_or_else(|| ApiError::unavailable("cat node missing"))?;
-        let job = cats_api::nodejob::NodeJob {
-            job_id: cats_api::nodejob::job_id(
-                &cat.id,
-                cat.generation,
-                &format!("detach_{}", disk.id),
-            ),
-            cat_generation: cat.generation,
-            action: cats_api::nodejob::NodeJobAction::DetachDisk {
-                cat_id: cat.id.clone(),
-                disk_id: disk.id.clone(),
-            },
-        };
-        dispatch_or_unavailable(state, &node.agent_url, &job).await
-    }
-    .await;
-    let _ = state.store.release_work(&lease.id);
-    let _ = state.controller.maybe_auto_suspend(&cat_id);
-    result
 }
 
 /// Force every attached disk of a running cat to a remote durable point (ADR-0022):

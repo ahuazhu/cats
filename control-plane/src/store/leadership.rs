@@ -100,6 +100,35 @@ pub(crate) struct NodeFenceLease {
     client: Option<Client>,
 }
 
+impl NodeFenceLease {
+    /// Prove the advisory-lock session still exists after an awaited external
+    /// call. A disconnected old task must stop before committing Cat state;
+    /// conditional lease CAS still protects any replacement writer meanwhile.
+    pub(crate) fn check(&mut self) -> Result<()> {
+        off_runtime(|| {
+            self.client
+                .as_mut()
+                .expect("node fence session is live until drop")
+                .simple_query("SELECT 1")
+                .map_err(internal)
+                .map(|_| ())
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backend_pid(&mut self) -> Result<i32> {
+        off_runtime(|| {
+            self.client
+                .as_mut()
+                .expect("node fence session is live until drop")
+                .query_one("SELECT pg_backend_pid()", &[])
+                .map_err(internal)?
+                .try_get(0)
+                .map_err(internal)
+        })
+    }
+}
+
 impl Drop for NodeFenceLease {
     fn drop(&mut self) {
         if let Some(client) = self.client.take() {

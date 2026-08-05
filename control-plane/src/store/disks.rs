@@ -1,9 +1,48 @@
 use super::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiskChangeMode {
     HotRunning,
     OfflineCold,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VolumeLeaseAuthority {
+    pub volume_id: String,
+    pub attachment_id: String,
+    pub epoch: i64,
+}
+
+/// Durable ownership of one topology transition. The provisional binding is
+/// also the disk-wide RWO claim: mount inserts it before attach, while unmount
+/// keeps it until detach and exact lease revocation both finish.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TopologyClaim {
+    pub claim_id: String,
+    pub cat_id: String,
+    pub node_id: Option<String>,
+    pub cat_generation: i64,
+    pub mode: DiskChangeMode,
+    pub action: TopologyAction,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum TopologyAction {
+    Mount {
+        binding: MountBinding,
+    },
+    Unmount {
+        binding: MountBinding,
+        original_lease: Option<VolumeLeaseAuthority>,
+    },
+}
+
+impl TopologyClaim {
+    pub fn binding(&self) -> &MountBinding {
+        match &self.action {
+            TopologyAction::Mount { binding } | TopologyAction::Unmount { binding, .. } => binding,
+        }
+    }
 }
 
 impl Store {
@@ -173,26 +212,63 @@ impl Store {
         })
     }
 
-    /// Atomically require a fully converged Running generation before changing
-    /// disk topology. A lifecycle marker owns the node runtime, so mount must
-    /// have zero side effects until that marker settles.
-    pub fn bind_disk_for_hot_change(
+    /// Persist the mount authority and provisional RWO binding in one
+    /// transaction. Lifecycle work cannot begin until the claim is settled.
+    pub fn begin_mount_topology_claim(
         &self,
         disk_id: &str,
         cat_id: &str,
         mount_path: &str,
-    ) -> Result<(MountBinding, DiskChangeMode)> {
+    ) -> Result<TopologyClaim> {
         let id = new_id(ids::MOUNT_PREFIX);
         self.enter(|client| {
             let client = client?;
             let mut tx = client.transaction().map_err(internal)?;
             let mode = ensure_disk_change_safe(&mut tx, cat_id)?;
-            tx.query_one("SELECT 1 FROM disks WHERE id=$1 FOR UPDATE", &[&disk_id])
+            let disk = tx
+                .query_opt("SELECT kind FROM disks WHERE id=$1 FOR UPDATE", &[&disk_id])
+                .map_err(internal)?
+                .ok_or_else(|| ApiError::not_found(format!("disk {disk_id}")))?;
+            let kind: String = disk.try_get(0).map_err(internal)?;
+            if kind != "persistent" {
+                return Err(ApiError::failed_precondition("cannot mount a root disk"));
+            }
+            let node_id: Option<String> = tx
+                .query_one("SELECT node_id FROM cats WHERE id=$1", &[&cat_id])
+                .map_err(internal)?
+                .try_get(0)
                 .map_err(internal)?;
+            let generation: i64 = tx
+                .query_one("SELECT generation FROM cats WHERE id=$1", &[&cat_id])
+                .map_err(internal)?
+                .try_get(0)
+                .map_err(internal)?;
+            let binding = MountBinding {
+                id,
+                disk_id: disk_id.to_string(),
+                cat_id: cat_id.to_string(),
+                mount_path: mount_path.to_string(),
+            };
+            let claim = TopologyClaim {
+                claim_id: new_id("topology_"),
+                cat_id: cat_id.to_string(),
+                node_id,
+                cat_generation: generation,
+                mode,
+                action: TopologyAction::Mount {
+                    binding: binding.clone(),
+                },
+            };
+            let json = serde_json::to_string(&claim).map_err(internal)?;
             tx.execute(
                 "INSERT INTO mount_bindings (id, disk_id, cat_id, mount_path)
                  VALUES ($1,$2,$3,$4)",
-                &[&id, &disk_id, &cat_id, &mount_path],
+                &[
+                    &binding.id,
+                    &binding.disk_id,
+                    &binding.cat_id,
+                    &binding.mount_path,
+                ],
             )
             .map_err(|error| {
                 if is_constraint(&error) {
@@ -203,27 +279,26 @@ impl Store {
             })?;
             tx.execute("UPDATE disks SET state='bound' WHERE id=$1", &[&disk_id])
                 .map_err(internal)?;
+            tx.execute(
+                "UPDATE cats SET topology_claim_json=$2
+                  WHERE id=$1 AND topology_claim_json IS NULL",
+                &[&cat_id, &json],
+            )
+            .map_err(internal)?;
             tx.commit().map_err(internal)?;
-            Ok((
-                MountBinding {
-                    id,
-                    disk_id: disk_id.to_string(),
-                    cat_id: cat_id.to_string(),
-                    mount_path: mount_path.to_string(),
-                },
-                mode,
-            ))
+            Ok(claim)
         })
     }
 
-    /// The unbind itself is the transaction's linearization point. The API
-    /// restores this exact binding if the following idempotent node detach does
-    /// not complete.
-    pub fn unbind_disk_for_hot_change(
+    /// Persist the exact binding and writer inspected before detach. The
+    /// binding remains in place as a disk-wide RWO claim until success, so a
+    /// cancellation or delayed response cannot admit a remount.
+    pub fn begin_unmount_topology_claim(
         &self,
         disk_id: &str,
         cat_id: &str,
-    ) -> Result<(MountBinding, DiskChangeMode)> {
+        original_lease: Option<VolumeLeaseAuthority>,
+    ) -> Result<TopologyClaim> {
         self.enter(|client| {
             let client = client?;
             let mut tx = client.transaction().map_err(internal)?;
@@ -242,37 +317,163 @@ impl Store {
                 cat_id: binding.try_get(2).map_err(internal)?,
                 mount_path: binding.try_get(3).map_err(internal)?,
             };
-            tx.execute("DELETE FROM mount_bindings WHERE disk_id=$1", &[&disk_id])
+            let row = tx
+                .query_one(
+                    "SELECT node_id, generation FROM cats WHERE id=$1",
+                    &[&cat_id],
+                )
                 .map_err(internal)?;
+            let claim = TopologyClaim {
+                claim_id: new_id("topology_"),
+                cat_id: cat_id.to_string(),
+                node_id: row.try_get(0).map_err(internal)?,
+                cat_generation: row.try_get(1).map_err(internal)?,
+                mode,
+                action: TopologyAction::Unmount {
+                    binding,
+                    original_lease,
+                },
+            };
+            let json = serde_json::to_string(&claim).map_err(internal)?;
             tx.execute(
-                "UPDATE disks SET state='available' WHERE id=$1 AND kind='persistent'",
-                &[&disk_id],
+                "UPDATE cats SET topology_claim_json=$2
+                  WHERE id=$1 AND topology_claim_json IS NULL",
+                &[&cat_id, &json],
             )
             .map_err(internal)?;
             tx.commit().map_err(internal)?;
-            Ok((binding, mode))
+            Ok(claim)
         })
     }
 
-    pub fn restore_binding(&self, binding: &MountBinding) -> Result<()> {
+    pub fn topology_claim(&self, cat_id: &str) -> Result<Option<TopologyClaim>> {
+        let json: Option<String> = self
+            .with(|client| {
+                client
+                    .query_opt(
+                        "SELECT topology_claim_json FROM cats WHERE id=$1",
+                        &[&cat_id],
+                    )?
+                    .map(|row| row.try_get::<_, Option<String>>(0))
+                    .transpose()
+            })?
+            .flatten();
+        json.map(|json| serde_json::from_str(&json).map_err(internal))
+            .transpose()
+    }
+
+    pub fn topology_claim_matches(&self, claim: &TopologyClaim) -> Result<bool> {
+        let expected = serde_json::to_string(claim).map_err(internal)?;
         self.with(|client| {
-            client.execute(
-                "INSERT INTO mount_bindings (id, disk_id, cat_id, mount_path)
-                 VALUES ($1,$2,$3,$4) ON CONFLICT (disk_id) DO NOTHING",
+            let row = client.query_opt(
+                "SELECT 1 FROM cats
+                      WHERE id=$1 AND generation=$2
+                        AND node_id IS NOT DISTINCT FROM $3::TEXT
+                        AND lifecycle_dispatch_json IS NULL
+                        AND topology_claim_json=$4",
                 &[
-                    &binding.id,
-                    &binding.disk_id,
-                    &binding.cat_id,
-                    &binding.mount_path,
+                    &claim.cat_id,
+                    &claim.cat_generation,
+                    &claim.node_id,
+                    &expected,
                 ],
             )?;
-            client
-                .execute(
-                    "UPDATE disks SET state='bound' WHERE id=$1",
+            Ok(row.is_some())
+        })
+    }
+
+    pub fn complete_topology_claim(&self, claim: &TopologyClaim) -> Result<bool> {
+        self.settle_topology_claim(claim, true)
+    }
+
+    pub fn rollback_topology_claim(&self, claim: &TopologyClaim) -> Result<bool> {
+        self.settle_topology_claim(claim, false)
+    }
+
+    fn settle_topology_claim(&self, claim: &TopologyClaim, success: bool) -> Result<bool> {
+        let expected = serde_json::to_string(claim).map_err(internal)?;
+        self.enter(|client| {
+            let client = client?;
+            let mut tx = client.transaction().map_err(internal)?;
+            let exact = tx
+                .query_opt(
+                    "SELECT 1 FROM cats
+                      WHERE id=$1 AND generation=$2
+                        AND node_id IS NOT DISTINCT FROM $3::TEXT
+                        AND lifecycle_dispatch_json IS NULL
+                        AND topology_claim_json=$4 FOR UPDATE",
+                    &[
+                        &claim.cat_id,
+                        &claim.cat_generation,
+                        &claim.node_id,
+                        &expected,
+                    ],
+                )
+                .map_err(internal)?
+                .is_some();
+            if !exact {
+                tx.commit().map_err(internal)?;
+                return Ok(false);
+            }
+            let binding = claim.binding();
+            let remove_binding = matches!(&claim.action, TopologyAction::Mount { .. }) && !success
+                || matches!(&claim.action, TopologyAction::Unmount { .. }) && success;
+            if remove_binding {
+                tx.execute(
+                    "DELETE FROM mount_bindings
+                      WHERE id=$1 AND disk_id=$2 AND cat_id=$3",
+                    &[&binding.id, &binding.disk_id, &binding.cat_id],
+                )
+                .map_err(internal)?;
+                tx.execute(
+                    "UPDATE disks SET state='available'
+                      WHERE id=$1 AND kind='persistent'",
                     &[&binding.disk_id],
                 )
-                .map(|_| ())
+                .map_err(internal)?;
+            }
+            tx.execute(
+                "UPDATE cats SET topology_claim_json=NULL
+                  WHERE id=$1 AND topology_claim_json=$2",
+                &[&claim.cat_id, &expected],
+            )
+            .map_err(internal)?;
+            tx.commit().map_err(internal)?;
+            Ok(true)
         })
+    }
+
+    /// Compatibility wrappers kept for store-level callers while topology
+    /// execution moves through the durable claim driver.
+    pub fn bind_disk_for_hot_change(
+        &self,
+        disk_id: &str,
+        cat_id: &str,
+        mount_path: &str,
+    ) -> Result<(MountBinding, DiskChangeMode)> {
+        let claim = self.begin_mount_topology_claim(disk_id, cat_id, mount_path)?;
+        Ok((claim.binding().clone(), claim.mode))
+    }
+
+    pub fn unbind_disk_for_hot_change(
+        &self,
+        disk_id: &str,
+        cat_id: &str,
+    ) -> Result<(MountBinding, DiskChangeMode)> {
+        let claim = self.begin_unmount_topology_claim(disk_id, cat_id, None)?;
+        Ok((claim.binding().clone(), claim.mode))
+    }
+
+    pub fn restore_binding(&self, binding: &MountBinding) -> Result<()> {
+        let Some(claim) = self.topology_claim(&binding.cat_id)? else {
+            return Ok(());
+        };
+        if claim.binding().id != binding.id {
+            return Err(ApiError::conflict(
+                "a different topology claim owns this Cat",
+            ));
+        }
+        self.rollback_topology_claim(&claim).map(|_| ())
     }
 
     pub fn unbind_disk(&self, disk_id: &str) -> Result<()> {
@@ -312,10 +513,24 @@ fn ensure_disk_change_safe(
     tx: &mut postgres::Transaction<'_>,
     cat_id: &str,
 ) -> Result<DiskChangeMode> {
+    let frozen: bool = tx
+        .query_one(
+            "SELECT lifecycle_maintenance_frozen
+               FROM control_schema_version WHERE singleton FOR SHARE",
+            &[],
+        )
+        .map_err(internal)?
+        .try_get(0)
+        .map_err(internal)?;
+    if frozen {
+        return Err(ApiError::conflict(
+            "disk topology is frozen during lifecycle provenance maintenance",
+        ));
+    }
     let cat = tx
         .query_opt(
             "SELECT desired_state, observed_state, generation, observed_generation,
-                    lifecycle_dispatch_json, node_id
+                    lifecycle_dispatch_json, node_id, topology_claim_json
                FROM cats WHERE id=$1 FOR UPDATE",
             &[&cat_id],
         )
@@ -327,9 +542,10 @@ fn ensure_disk_change_safe(
     let observed_generation: i64 = cat.try_get(3).map_err(internal)?;
     let marker: Option<String> = cat.try_get(4).map_err(internal)?;
     let node_id: Option<String> = cat.try_get(5).map_err(internal)?;
-    if observed_generation != generation || marker.is_some() {
+    let topology_claim: Option<String> = cat.try_get(6).map_err(internal)?;
+    if observed_generation != generation || marker.is_some() || topology_claim.is_some() {
         return Err(ApiError::conflict(
-            "disk change requires a markerless, generation-converged Cat",
+            "disk change requires a markerless, generation-converged, topology-idle Cat",
         ));
     }
     match (desired.as_str(), observed.as_str(), node_id) {

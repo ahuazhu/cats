@@ -9,8 +9,10 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+use cats_api::blockd::{BlockdControlCommand, BlockdControlResponse, DurabilityStatus};
 use cats_api::guest::{GuestRequestBody, GuestResponseBody};
-use cats_api::resources::NodeState;
+use cats_api::nodejob::{job_id, NodeJob, NodeJobAction};
+use cats_api::resources::{NodeState, ObservedState};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::SqliteUsageStore;
 use cats_node_agent::guest_client::GuestClient;
@@ -32,19 +34,29 @@ struct Cluster {
     cli_bin: PathBuf,
     /// The bootstrap Account's default Workspace; resource routes key on its ID.
     workspace_id: String,
+    control_store_dsn: cats_control_plane::store::DsnSource,
 }
 
 impl Cluster {
     async fn start(node_ids: &[&str]) -> Cluster {
+        Self::start_with_options(node_ids, true, 150).await
+    }
+
+    async fn start_with_options(
+        node_ids: &[&str],
+        lifecycle_provenance_writes_enabled: bool,
+        reconcile_interval_ms: u64,
+    ) -> Cluster {
         let dir = tempfile::tempdir().unwrap();
         let storage_meta_path = dir.path().join("storage-meta.db");
         let storage_meta: Arc<dyn MetadataStore> =
             Arc::new(SqliteMetadataStore::open(&storage_meta_path).unwrap());
+        let control_store_dsn = cats_control_plane::store::DsnSource::Literal(
+            cats_control_plane::testsupport::isolated_control_store_url(),
+        );
         let cp = cats_control_plane::server::spawn(cats_control_plane::server::Config {
             listen: "127.0.0.1:0".into(),
-            control_store_dsn: cats_control_plane::store::DsnSource::Literal(
-                cats_control_plane::testsupport::isolated_control_store_url(),
-            ),
+            control_store_dsn: control_store_dsn.clone(),
             control_store_ca_file: None,
             usage_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
             credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
@@ -54,9 +66,9 @@ impl Cluster {
             workos: None,
             stripe: None,
             billing_enforcement_enabled: false,
-            lifecycle_provenance_writes_enabled: true,
+            lifecycle_provenance_writes_enabled,
             node_lease_timeout_ms: 3_000,
-            reconcile_interval_ms: 150,
+            reconcile_interval_ms,
             oci_deploy_sync_wait_ms: 5_000,
             auto_tier_policy: Default::default(),
         })
@@ -93,7 +105,41 @@ impl Cluster {
             http: reqwest::Client::new(),
             cli_bin: workspace_bin("cats"),
             workspace_id,
+            control_store_dsn,
         }
+    }
+
+    async fn spawn_control_peer(
+        &self,
+        lifecycle_provenance_writes_enabled: bool,
+        reconcile_interval_ms: u64,
+    ) -> cats_control_plane::server::Handle {
+        let storage_meta: Arc<dyn MetadataStore> =
+            Arc::new(SqliteMetadataStore::open(&self.dir.path().join("storage-meta.db")).unwrap());
+        cats_control_plane::server::spawn(cats_control_plane::server::Config {
+            listen: "127.0.0.1:0".into(),
+            control_store_dsn: self.control_store_dsn.clone(),
+            control_store_ca_file: None,
+            usage_store: Arc::new(
+                SqliteUsageStore::open(&self.dir.path().join("control-peer.db")).unwrap(),
+            ),
+            credit_store: Arc::new(
+                SqliteUsageStore::open(&self.dir.path().join("control-peer.db")).unwrap(),
+            ),
+            storage_meta,
+            auth_token: SERVICE_TOKEN.into(),
+            admin_token: ADMIN_TOKEN.into(),
+            workos: None,
+            stripe: None,
+            billing_enforcement_enabled: false,
+            lifecycle_provenance_writes_enabled,
+            node_lease_timeout_ms: 30_000,
+            reconcile_interval_ms,
+            oci_deploy_sync_wait_ms: 5_000,
+            auto_tier_policy: Default::default(),
+        })
+        .await
+        .unwrap()
     }
 
     async fn start_node(
@@ -306,6 +352,54 @@ impl Cluster {
         }
     }
 
+    fn guest_boot_id(&self, node: &str, cat_id: &str) -> String {
+        GuestClient::connect(&self.guest_ctl(node, cat_id))
+            .unwrap()
+            .health()
+            .unwrap()
+            .0
+    }
+
+    fn durability_status(&self, node: &str, cat_id: &str, disk_id: &str) -> DurabilityStatus {
+        use std::io::{BufRead, BufReader};
+        let socket_link = self
+            .dir
+            .path()
+            .join(format!("node-{node}"))
+            .join("cats")
+            .join(cat_id)
+            .join(format!("ctl-{disk_id}.sock"));
+        let socket = std::fs::read_link(&socket_link).unwrap();
+        let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        writeln!(stream, "{}", BlockdControlCommand::Status).unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        let BlockdControlResponse::Ok(payload) = BlockdControlResponse::parse_wire(&line).unwrap()
+        else {
+            panic!("blockd status failed: {line}");
+        };
+        serde_json::from_str(&payload).unwrap()
+    }
+
+    async fn execute_node_job(&self, node: &str, job: NodeJob) {
+        let runtime = self
+            .nodes
+            .iter()
+            .find(|handle| handle.state.cfg.node.node_id == node)
+            .unwrap()
+            .state
+            .runtime
+            .clone();
+        let result = tokio::task::spawn_blocking(move || runtime.execute(job))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.phase,
+            cats_api::nodejob::JobPhase::Succeeded,
+            "{result:?}"
+        );
+    }
+
     async fn gateway_get(&self, hostname: &str, path: &str) -> (u16, String) {
         let hostname = hostname.strip_prefix("https://").unwrap_or(hostname);
         let resp = self
@@ -359,6 +453,280 @@ fn extract(body: &str, key: &str) -> String {
         .find_map(|tok| tok.strip_prefix(&format!("{key}=")))
         .unwrap_or_default()
         .to_string()
+}
+
+/// Phase-A safety is exercised with the real FakeVmm + cats-blockd path, not a
+/// state-only stub. A Relaxed FLUSH leaves L>R on the suspended Host, an old
+/// controller applies Resume/Restore but disappears before settlement, and two
+/// marker-capable Phase-A readers must leave the ambiguous row untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase_a_two_controller_real_relaxed_resume_restore_handoff_keeps_local_tail() {
+    let cluster = Cluster::start_with_options(&["node-a"], false, 30_000).await;
+    cluster
+        .cli_ok(&[
+            "create",
+            "phase-a-real",
+            "--root-size",
+            "8MiB",
+            "--memory",
+            "256MiB",
+            "--cpus",
+            "1",
+            "--durability",
+            "relaxed",
+            "--no-auto-suspend",
+        ])
+        .await;
+    let running = cluster.wait_cat_state("phase-a-real", "running").await;
+    let cat_id = running["id"].as_str().unwrap().to_string();
+    let root_disk = running["root_disk_id"].as_str().unwrap().to_string();
+    let node_id = running["node_id"].as_str().unwrap().to_string();
+    let boot_id = cluster.guest_boot_id(&node_id, &cat_id);
+    let payload = b"phase-a-relaxed-local-tail";
+    cluster.guest_write(&node_id, &cat_id, &root_disk, 4096, payload);
+    let relaxed = cluster.durability_status(&node_id, &cat_id, &root_disk);
+    assert!(
+        relaxed.local_durable_generation > relaxed.remote_durable_generation,
+        "test must prove a real Relaxed L>R boundary: {relaxed:?}"
+    );
+    assert!(relaxed.unpublished_generations > 0);
+
+    cluster.cli_ok(&["suspend", "phase-a-real"]).await;
+    cluster.wait_cat_state("phase-a-real", "suspended").await;
+    let still_local = cluster.durability_status(&node_id, &cat_id, &root_disk);
+    assert!(still_local.local_durable_generation > still_local.remote_durable_generation);
+    // Stop heartbeats and HTTP dispatch while retaining the real supervised
+    // runtime; the old controller action below is executed directly at the
+    // node-agent boundary and its response is deliberately never settled.
+    cluster.nodes[0].shutdown();
+
+    let resume = cluster
+        .cp
+        .state
+        .store
+        .set_desired(
+            &cat_id,
+            cats_api::resources::DesiredState::Running,
+            None,
+            "cat.resume",
+        )
+        .unwrap();
+    cluster
+        .cp
+        .state
+        .store
+        .set_lifecycle_maintenance_frozen(true)
+        .unwrap();
+    assert_eq!(
+        cluster
+            .cp
+            .state
+            .store
+            .begin_legacy_lifecycle(
+                &cat_id,
+                &node_id,
+                resume.resource_generation,
+                ObservedState::Suspended,
+                ObservedState::Starting,
+            )
+            .unwrap(),
+        cats_control_plane::store::LegacyLifecycleBegin::Begun
+    );
+    cluster
+        .execute_node_job(
+            &node_id,
+            NodeJob {
+                job_id: job_id(&cat_id, resume.resource_generation, "resume_cat"),
+                cat_generation: resume.resource_generation,
+                action: NodeJobAction::ResumeCat {
+                    cat_id: cat_id.clone(),
+                },
+            },
+        )
+        .await;
+    let peer = cluster.spawn_control_peer(false, 30_000).await;
+    cluster.cp.state.notify.notify_one();
+    peer.state.notify.notify_one();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let ambiguous_resume = cluster.cp.state.store.must_get_cat_by_id(&cat_id).unwrap();
+    assert_eq!(ambiguous_resume.observed_state, ObservedState::Starting);
+    assert_eq!(ambiguous_resume.node_id.as_deref(), Some(node_id.as_str()));
+    assert_eq!(
+        cluster.nodes[0].state.runtime.snapshot(),
+        vec![(
+            cat_id.clone(),
+            resume.resource_generation,
+            ObservedState::Running
+        )]
+    );
+    assert_eq!(cluster.guest_boot_id(&node_id, &cat_id), boot_id);
+    assert_eq!(
+        cluster.guest_read(&node_id, &cat_id, &root_disk, 4096, payload.len() as u32),
+        payload
+    );
+    let retained = cluster.durability_status(&node_id, &cat_id, &root_disk);
+    assert!(retained.local_durable_generation > retained.remote_durable_generation);
+
+    // Settle the simulated old response, then create the same handoff from
+    // Warm. Warm's mandatory drain makes L=R, but Restore must still preserve
+    // the VMM identity and must not be reinterpreted as a Cold Start.
+    cluster
+        .cp
+        .state
+        .store
+        .set_observed_for_generation(&cat_id, ObservedState::Running, resume.resource_generation)
+        .unwrap();
+    cluster
+        .cp
+        .state
+        .store
+        .finish_operation(&resume.id, None)
+        .unwrap();
+    cluster
+        .cp
+        .state
+        .store
+        .set_lifecycle_maintenance_frozen(false)
+        .unwrap();
+    let warm = cluster
+        .cp
+        .state
+        .store
+        .set_desired(
+            &cat_id,
+            cats_api::resources::DesiredState::Warm,
+            None,
+            "cat.warm",
+        )
+        .unwrap();
+    assert_eq!(
+        cluster
+            .cp
+            .state
+            .store
+            .begin_legacy_lifecycle(
+                &cat_id,
+                &node_id,
+                warm.resource_generation,
+                ObservedState::Running,
+                ObservedState::Warming,
+            )
+            .unwrap(),
+        cats_control_plane::store::LegacyLifecycleBegin::Begun
+    );
+    cluster
+        .execute_node_job(
+            &node_id,
+            NodeJob {
+                job_id: job_id(&cat_id, warm.resource_generation, "warm_cat"),
+                cat_generation: warm.resource_generation,
+                action: NodeJobAction::WarmCat {
+                    cat_id: cat_id.clone(),
+                },
+            },
+        )
+        .await;
+    cluster
+        .cp
+        .state
+        .store
+        .set_observed_for_generation(&cat_id, ObservedState::Warm, warm.resource_generation)
+        .unwrap();
+    cluster
+        .cp
+        .state
+        .store
+        .finish_operation(&warm.id, None)
+        .unwrap();
+
+    let restore = cluster
+        .cp
+        .state
+        .store
+        .set_desired(
+            &cat_id,
+            cats_api::resources::DesiredState::Running,
+            None,
+            "cat.restore",
+        )
+        .unwrap();
+    cluster
+        .cp
+        .state
+        .store
+        .set_lifecycle_maintenance_frozen(true)
+        .unwrap();
+    assert_eq!(
+        cluster
+            .cp
+            .state
+            .store
+            .begin_legacy_lifecycle(
+                &cat_id,
+                &node_id,
+                restore.resource_generation,
+                ObservedState::Warm,
+                ObservedState::Starting,
+            )
+            .unwrap(),
+        cats_control_plane::store::LegacyLifecycleBegin::Begun
+    );
+    cluster
+        .execute_node_job(
+            &node_id,
+            NodeJob {
+                job_id: job_id(&cat_id, restore.resource_generation, "restore_cat"),
+                cat_generation: restore.resource_generation,
+                action: NodeJobAction::RestoreCat {
+                    cat_id: cat_id.clone(),
+                },
+            },
+        )
+        .await;
+    cluster.cp.state.notify.notify_one();
+    peer.state.notify.notify_one();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        cluster
+            .cp
+            .state
+            .store
+            .must_get_cat_by_id(&cat_id)
+            .unwrap()
+            .observed_state,
+        ObservedState::Starting
+    );
+    assert_eq!(cluster.guest_boot_id(&node_id, &cat_id), boot_id);
+    assert_eq!(
+        cluster.guest_read(&node_id, &cat_id, &root_disk, 4096, payload.len() as u32),
+        payload
+    );
+
+    cluster
+        .cp
+        .state
+        .store
+        .set_observed_for_generation(&cat_id, ObservedState::Running, restore.resource_generation)
+        .unwrap();
+    cluster
+        .cp
+        .state
+        .store
+        .finish_operation(&restore.id, None)
+        .unwrap();
+    cluster
+        .cp
+        .state
+        .store
+        .activate_lifecycle_provenance_writes()
+        .unwrap();
+    cluster
+        .cp
+        .state
+        .store
+        .set_lifecycle_maintenance_frozen(false)
+        .unwrap();
+    drop(peer);
 }
 
 /// Work count 0 drives immediate Suspend; a Gateway request holds work while

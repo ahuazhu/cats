@@ -22,7 +22,10 @@ use cats_api::resources::*;
 use cats_storage::{MetaError, MetadataStore};
 use futures_util::StreamExt;
 
-use crate::store::{now_ms, LegacyLifecycleBegin, LifecycleDispatch, Store};
+use crate::store::{
+    now_ms, DiskChangeMode, LegacyLifecycleBegin, LifecycleDispatch, Store, TopologyAction,
+    TopologyClaim, VolumeLeaseAuthority,
+};
 
 /// How many Cats one reconcile tick drives at once.
 ///
@@ -268,22 +271,47 @@ impl Controller {
         // API confirmations and singleton retries can overlap on different
         // replicas. Snapshot and revoke only while this dedicated per-node
         // session lock is held, then re-read the terminal node state.
-        let Some(_fence_lease) = self.store.node_fence_lease(node_id)? else {
+        let Some(mut fence_lease) = self.store.node_fence_lease(node_id)? else {
             return Ok(());
         };
+        fence_lease.check()?;
         if self.store.get_node(node_id)?.state != NodeState::Fenced {
             return Ok(());
         }
         for cat in self.store.cats_on_node(node_id)? {
-            self.fence_cat_volumes(&cat).await?;
+            let original = self.capture_cat_volume_leases(&cat)?;
+            fence_lease.check()?;
+            if let Some(claim) = self.store.topology_claim(&cat.id)? {
+                anyhow::ensure!(
+                    claim.node_id.as_deref() == Some(node_id)
+                        && claim.cat_generation == cat.generation,
+                    "Cat {} topology authority changed during node fence",
+                    cat.id
+                );
+                self.revoke_fenced_topology_leases(&claim, node_id, &original)?;
+                fence_lease.check()?;
+                match claim.action {
+                    TopologyAction::Mount { .. } => {
+                        self.store.rollback_topology_claim(&claim)?;
+                    }
+                    TopologyAction::Unmount { .. } => {
+                        self.store.complete_topology_claim(&claim)?;
+                    }
+                }
+            } else {
+                self.revoke_fenced_cat_leases(&cat, node_id, &original)?;
+            }
+            fence_lease.check()?;
             if self.store.converge_fenced_cat(&cat.id, node_id)? {
+                fence_lease.check()?;
                 self.complete_ops_if_converged(&cat.id).await?;
             }
         }
         Ok(())
     }
 
-    async fn fence_cat_volumes(&self, cat: &Cat) -> anyhow::Result<()> {
+    fn capture_cat_volume_leases(&self, cat: &Cat) -> anyhow::Result<Vec<VolumeLeaseAuthority>> {
+        let mut leases = Vec::new();
         for disk in self.store.list_disks_for_cat(&cat.id)? {
             let head = match self.storage_meta.load_head(&disk.volume_id) {
                 Ok(head) => head,
@@ -293,21 +321,97 @@ impl Controller {
             let Some(owner) = head.lease_owner else {
                 continue;
             };
+            leases.push(VolumeLeaseAuthority {
+                volume_id: disk.volume_id,
+                attachment_id: owner,
+                epoch: head.lease_epoch,
+            });
+        }
+        Ok(leases)
+    }
+
+    fn revoke_captured_leases(
+        &self,
+        cat_id: &str,
+        leases: &[VolumeLeaseAuthority],
+        mut authority_matches: impl FnMut() -> crate::store::Result<bool>,
+    ) -> anyhow::Result<()> {
+        for lease in leases {
+            anyhow::ensure!(
+                authority_matches()?,
+                "Cat {cat_id} fencing authority changed before lease revoke"
+            );
             match self.storage_meta.revoke_lease_if_matches(
-                &disk.volume_id,
-                &owner,
-                head.lease_epoch,
+                &lease.volume_id,
+                &lease.attachment_id,
+                lease.epoch,
             ) {
                 Ok(true) | Err(MetaError::NotFound(_)) => {}
-                Ok(false) => anyhow::bail!(
-                    "volume {} writer changed while fencing Cat {}; retaining placement",
-                    disk.volume_id,
-                    cat.id
-                ),
-                Err(e) => return Err(e.into()),
+                Ok(false) => {
+                    let head = self.storage_meta.load_head(&lease.volume_id)?;
+                    let already_fenced = head.lease_owner.is_none()
+                        || (head.lease_owner.as_deref() == Some(lease.attachment_id.as_str())
+                            && head.lease_epoch > lease.epoch);
+                    if !already_fenced {
+                        anyhow::bail!(
+                            "volume {} writer changed while fencing Cat {cat_id}; retaining authority",
+                            lease.volume_id
+                        );
+                    }
+                }
+                Err(error) => return Err(error.into()),
             }
         }
+        anyhow::ensure!(
+            authority_matches()?,
+            "Cat {cat_id} fencing authority changed after lease revoke"
+        );
         Ok(())
+    }
+
+    fn revoke_dispatch_leases(&self, dispatch: &LifecycleDispatch) -> anyhow::Result<()> {
+        self.revoke_captured_leases(
+            dispatch.job.action.cat_id(),
+            &dispatch.volume_leases,
+            || self.store.lifecycle_dispatch_authority_matches(dispatch),
+        )
+    }
+
+    fn revoke_unclaimed_cat_leases(
+        &self,
+        cat: &Cat,
+        leases: &[VolumeLeaseAuthority],
+    ) -> anyhow::Result<()> {
+        self.revoke_captured_leases(&cat.id, leases, || {
+            self.store.unclaimed_cat_authority_matches(
+                &cat.id,
+                cat.generation,
+                cat.node_id.as_deref(),
+            )
+        })
+    }
+
+    fn revoke_fenced_cat_leases(
+        &self,
+        cat: &Cat,
+        node_id: &str,
+        leases: &[VolumeLeaseAuthority],
+    ) -> anyhow::Result<()> {
+        self.revoke_captured_leases(&cat.id, leases, || {
+            self.store
+                .fenced_cat_authority_matches(&cat.id, node_id, cat.generation)
+        })
+    }
+
+    fn revoke_fenced_topology_leases(
+        &self,
+        claim: &TopologyClaim,
+        node_id: &str,
+        leases: &[VolumeLeaseAuthority],
+    ) -> anyhow::Result<()> {
+        self.revoke_captured_leases(&claim.cat_id, leases, || {
+            self.store.fenced_topology_authority_matches(claim, node_id)
+        })
     }
 
     /// Evacuate every Cat from nodes explicitly placed in Draining. Desired
@@ -441,6 +545,10 @@ impl Controller {
 
     async fn reconcile_cat(&self, cat: &Cat) -> anyhow::Result<()> {
         let provenance_writes_enabled = self.store.lifecycle_provenance_writes_enabled()?;
+        if let Some(claim) = self.store.topology_claim(&cat.id)? {
+            self.drive_topology_claim(&claim).await?;
+            return Ok(());
+        }
         // A persisted dispatch owns the physical runtime even when a newer API
         // request has changed desired_state/generation.  Settle that exact job
         // before interpreting the newer desired state; otherwise Starting is
@@ -463,21 +571,46 @@ impl Controller {
             }
             return self.drive_lifecycle_dispatch(cat, &dispatch).await;
         }
-        if provenance_writes_enabled
-            && matches!(
-                cat.observed_state,
-                ObservedState::Starting
-                    | ObservedState::Suspending
-                    | ObservedState::Warming
-                    | ObservedState::Stopping
-            )
-        {
+        if matches!(
+            cat.observed_state,
+            ObservedState::Starting
+                | ObservedState::Suspending
+                | ObservedState::Warming
+                | ObservedState::Stopping
+        ) {
+            // A phase-A cold launch has independent durable provenance in its
+            // current-generation operation row. Replaying its deterministic
+            // StartCat is safe and is required after an ambiguous response;
+            // `start_flow` deliberately preserves the live epoch when the row
+            // is already Starting. Resume/Restore also use Starting, so they
+            // may never enter this exception: their operation kind leaves the
+            // row fail-closed for the old owner or an operator to settle.
+            if !provenance_writes_enabled
+                && cat.observed_state == ObservedState::Starting
+                && cat.desired_state == DesiredState::Running
+            {
+                let operations = self.store.pending_lifecycle_operations_for(&cat.id)?;
+                let current = operations
+                    .iter()
+                    .filter(|operation| operation.resource_generation == cat.generation)
+                    .collect::<Vec<_>>();
+                if !current.is_empty()
+                    && current.iter().all(|operation| {
+                        matches!(operation.kind.as_str(), "cat.create" | "cat.start")
+                    })
+                {
+                    return self.start_flow(cat).await;
+                }
+            }
             let legacy_key = format!("legacy-transition:{}@{}", cat.id, cat.generation);
             if self.retry_deferred_key(&legacy_key) {
                 return Ok(());
             }
             let retry_in = self.defer_retry_key(legacy_key);
-            // Upgrade fail-closed rule for a row written by an older replica:
+            // Upgrade fail-closed rule for a row written by an older replica.
+            // This applies in Phase A too: the database maintenance freeze
+            // leaves pre-freeze jobs able to settle, but a replacement reader
+            // cannot infer whether Starting means Start, Resume, or Restore.
             // Starting alone cannot prove whether the physical action was
             // StartCat, ResumeCat or RestoreCat.  Guessing StartCat can discard
             // the only authoritative Relaxed journal.  New writers publish the
@@ -611,6 +744,133 @@ impl Controller {
         Ok(resp.json::<NodeJobResult>().await?)
     }
 
+    /// Replay one durable disk topology claim. API cancellation only drops the
+    /// waiter; this level-triggered driver retains the provisional binding and
+    /// exact node/generation authority until it can commit or roll back.
+    pub async fn drive_topology_claim(&self, claim: &TopologyClaim) -> anyhow::Result<bool> {
+        if !self.store.topology_claim_matches(claim)? {
+            return Ok(false);
+        }
+        if claim.mode == DiskChangeMode::OfflineCold {
+            return self
+                .store
+                .complete_topology_claim(claim)
+                .map_err(Into::into);
+        }
+        let Some(node_id) = claim.node_id.as_deref() else {
+            anyhow::bail!("hot topology claim {} has no node", claim.claim_id);
+        };
+        let node = self.store.get_node(node_id)?;
+        if matches!(node.state, NodeState::Lost | NodeState::Fenced) {
+            return Ok(false);
+        }
+        let cat = self.store.must_get_cat_by_id(&claim.cat_id)?;
+        let binding = claim.binding();
+        let disk = self.store.get_disk(&cat.workspace_id, &binding.disk_id)?;
+        let action = match &claim.action {
+            TopologyAction::Mount { binding } => {
+                let size = cats_api::chunk::round_up_to_chunk(disk.size_bytes);
+                match self.storage_meta.create_volume(&disk.volume_id, size) {
+                    Ok(()) | Err(MetaError::AlreadyExists(_)) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                NodeJobAction::AttachDisk {
+                    cat_id: claim.cat_id.clone(),
+                    volume: VolumeGrant {
+                        disk_id: disk.id.clone(),
+                        volume_id: disk.volume_id.clone(),
+                        attachment_id: format!(
+                            "att_{}_{}_{}",
+                            claim.cat_id, disk.id, claim.cat_generation
+                        ),
+                        epoch: 0,
+                        size_bytes: size,
+                        mount_path: binding.mount_path.clone(),
+                        durability: disk.durability,
+                    },
+                }
+            }
+            TopologyAction::Unmount { .. } => NodeJobAction::DetachDisk {
+                cat_id: claim.cat_id.clone(),
+                disk_id: disk.id.clone(),
+            },
+        };
+        let job = NodeJob {
+            job_id: nodejob::job_id(
+                &claim.cat_id,
+                claim.cat_generation,
+                &format!("topology_{}", claim.claim_id),
+            ),
+            cat_generation: claim.cat_generation,
+            action,
+        };
+        let result = self.dispatch(&node.agent_url, &job).await?;
+        if result.job_id != job.job_id {
+            anyhow::bail!(
+                "topology claim {} received mismatched result {}",
+                claim.claim_id,
+                result.job_id
+            );
+        }
+        if result.phase != JobPhase::Succeeded {
+            self.store.rollback_topology_claim(claim)?;
+            anyhow::bail!(
+                "topology claim {} failed: {}",
+                claim.claim_id,
+                result.error.unwrap_or_else(|| "node job failed".into())
+            );
+        }
+        // The request above is the cancellation/replica-handoff window. Never
+        // let its late response act under a replacement lifecycle/topology
+        // authority.
+        if !self.store.topology_claim_matches(claim)? {
+            return Ok(false);
+        }
+        if let TopologyAction::Unmount {
+            original_lease: Some(original),
+            ..
+        } = &claim.action
+        {
+            self.revoke_original_topology_lease(claim, original)?;
+        }
+        if !self.store.topology_claim_matches(claim)? {
+            return Ok(false);
+        }
+        self.store
+            .complete_topology_claim(claim)
+            .map_err(Into::into)
+    }
+
+    fn revoke_original_topology_lease(
+        &self,
+        claim: &TopologyClaim,
+        original: &VolumeLeaseAuthority,
+    ) -> anyhow::Result<()> {
+        match self.storage_meta.revoke_lease_if_matches(
+            &original.volume_id,
+            &original.attachment_id,
+            original.epoch,
+        ) {
+            Ok(true) | Err(MetaError::NotFound(_)) => Ok(()),
+            Ok(false) => {
+                let head = self.storage_meta.load_head(&original.volume_id)?;
+                if head.lease_owner.is_none()
+                    || (head.lease_owner.as_deref() == Some(original.attachment_id.as_str())
+                        && head.lease_epoch > original.epoch)
+                {
+                    Ok(())
+                } else {
+                    anyhow::bail!(
+                        "volume {} writer changed while topology claim {} was detached; retaining claim",
+                        original.volume_id,
+                        claim.claim_id
+                    )
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     async fn volume_grants(&self, cat: &Cat) -> anyhow::Result<Vec<VolumeGrant>> {
         let mut grants = Vec::new();
         let bindings = self.store.bindings_for_cat(&cat.id)?;
@@ -656,7 +916,8 @@ impl Controller {
             node
         };
 
-        let grants = self.volume_grants(cat).await?;
+        let cat = self.store.must_get_cat_by_id(&cat.id)?;
+        let grants = self.volume_grants(&cat).await?;
         let provenance_writes_enabled = self.store.lifecycle_provenance_writes_enabled()?;
         // Fence stale writers before atomically publishing the exact job and
         // Starting boundary.  After that commit the marker, including these
@@ -668,8 +929,10 @@ impl Controller {
         // did.  Activation cannot race this exception: the global gate refuses
         // to enable while a markerless transitional row exists.
         if provenance_writes_enabled || cat.observed_state != ObservedState::Starting {
-            self.fence_cat_volumes(cat).await?;
+            let original = self.capture_cat_volume_leases(&cat)?;
+            self.revoke_unclaimed_cat_leases(&cat, &original)?;
         }
+        let volume_leases = self.capture_cat_volume_leases(&cat)?;
         let job = NodeJob {
             job_id: nodejob::job_id(&cat.id, cat.generation, "start_cat"),
             cat_generation: cat.generation,
@@ -684,11 +947,12 @@ impl Controller {
         if !provenance_writes_enabled {
             return self
                 .drive_legacy_lifecycle(
-                    cat,
+                    &cat,
                     &node,
                     job,
                     ObservedState::Starting,
                     ObservedState::Running,
+                    volume_leases,
                 )
                 .await;
         }
@@ -698,12 +962,13 @@ impl Controller {
             cat.observed_state,
             ObservedState::Starting,
             ObservedState::Running,
+            volume_leases,
             job,
         )?
         else {
             return Ok(());
         };
-        self.drive_lifecycle_dispatch(cat, &dispatch).await
+        self.drive_lifecycle_dispatch(&cat, &dispatch).await
     }
 
     /// suspend / resume / warm / restore on the current node, with the
@@ -761,9 +1026,10 @@ impl Controller {
             cat_generation: cat.generation,
             action: job_action,
         };
+        let volume_leases = self.capture_cat_volume_leases(cat)?;
         if !self.store.lifecycle_provenance_writes_enabled()? {
             return self
-                .drive_legacy_lifecycle(cat, &node, job, transitional, target)
+                .drive_legacy_lifecycle(cat, &node, job, transitional, target, volume_leases)
                 .await;
         }
         let Some(dispatch) = self.store.begin_lifecycle_dispatch(
@@ -772,6 +1038,7 @@ impl Controller {
             cat.observed_state,
             transitional,
             target,
+            volume_leases,
             job,
         )?
         else {
@@ -832,7 +1099,7 @@ impl Controller {
                 // crash replays the already-successful StopCat, then repeats
                 // the cleanup; it never exposes Cold while a writable lease or
                 // route is still published.
-                self.fence_cat_volumes(cat).await?;
+                self.revoke_dispatch_leases(dispatch)?;
             }
             let running_route = (dispatch.target_state == ObservedState::Running)
                 .then_some((node.id.as_str(), node.gateway_url.as_str()));
@@ -953,9 +1220,16 @@ impl Controller {
                         cats_api::error::ErrorCode::Unavailable,
                         format!("start failed after retries: {error}"),
                     );
-                    self.fence_cat_volumes(cat).await?;
+                    let current_leases = self.capture_cat_volume_leases(cat)?;
+                    let Some(fencing_dispatch) = self
+                        .store
+                        .persist_lifecycle_fence_leases(dispatch, current_leases)?
+                    else {
+                        return Ok(());
+                    };
+                    self.revoke_dispatch_leases(&fencing_dispatch)?;
                     self.store.settle_lifecycle_dispatch(
-                        dispatch,
+                        &fencing_dispatch,
                         ObservedState::Failed,
                         true,
                         Some(&terminal),
@@ -1003,7 +1277,7 @@ impl Controller {
                         if cleaned.job_id == fallback.job_id
                             && cleaned.phase == JobPhase::Succeeded =>
                     {
-                        self.fence_cat_volumes(cat).await?;
+                        self.revoke_dispatch_leases(dispatch)?;
                         self.store.settle_lifecycle_dispatch(
                             dispatch,
                             ObservedState::Cold,
@@ -1044,6 +1318,7 @@ impl Controller {
         job: NodeJob,
         transitional: ObservedState,
         target: ObservedState,
+        original_leases: Vec<VolumeLeaseAuthority>,
     ) -> anyhow::Result<()> {
         match self.store.begin_legacy_lifecycle(
             &cat.id,
@@ -1061,6 +1336,7 @@ impl Controller {
                     cat.observed_state,
                     transitional,
                     target,
+                    original_leases,
                     job,
                 )?
                 else {
@@ -1105,7 +1381,7 @@ impl Controller {
         };
         if result.phase == JobPhase::Succeeded {
             if matches!(&job.action, NodeJobAction::StopCat { .. }) {
-                self.fence_cat_volumes(cat).await?;
+                self.revoke_unclaimed_cat_leases(cat, &original_leases)?;
                 self.store.unbind_routes(&cat.id)?;
                 self.store.set_placement(&cat.id, None)?;
             } else if target == ObservedState::Running {
@@ -1153,7 +1429,8 @@ impl Controller {
                     *count >= 3
                 };
                 if give_up {
-                    self.fence_cat_volumes(cat).await?;
+                    let current_leases = self.capture_cat_volume_leases(cat)?;
+                    self.revoke_unclaimed_cat_leases(cat, &current_leases)?;
                     self.store.unbind_routes(&cat.id)?;
                     self.store.set_placement(&cat.id, None)?;
                     self.store.set_observed(&cat.id, ObservedState::Failed)?;
@@ -1182,7 +1459,7 @@ impl Controller {
                         if cleaned.job_id == fallback.job_id
                             && cleaned.phase == JobPhase::Succeeded =>
                     {
-                        self.fence_cat_volumes(cat).await?;
+                        self.revoke_unclaimed_cat_leases(cat, &original_leases)?;
                         self.store.unbind_routes(&cat.id)?;
                         self.store.set_placement(&cat.id, None)?;
                         self.store.set_observed_for_generation(
@@ -1225,6 +1502,7 @@ impl Controller {
                 disposition,
             },
         };
+        let volume_leases = self.capture_cat_volume_leases(cat)?;
         if !self.store.lifecycle_provenance_writes_enabled()? {
             return self
                 .drive_legacy_lifecycle(
@@ -1233,6 +1511,7 @@ impl Controller {
                     job,
                     ObservedState::Stopping,
                     ObservedState::Cold,
+                    volume_leases,
                 )
                 .await;
         }
@@ -1242,6 +1521,7 @@ impl Controller {
             cat.observed_state,
             ObservedState::Stopping,
             ObservedState::Cold,
+            volume_leases,
             job,
         )?
         else {

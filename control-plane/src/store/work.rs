@@ -1,7 +1,26 @@
 use super::*;
 
-type AutoSuspendCatRow = (String, i64, bool, String, String, i64, Option<String>);
-type AutoTierCatRow = (String, i64, bool, String, String, i64, i64, Option<String>);
+type AutoSuspendCatRow = (
+    String,
+    i64,
+    bool,
+    String,
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+);
+type AutoTierCatRow = (
+    String,
+    i64,
+    bool,
+    String,
+    String,
+    i64,
+    i64,
+    Option<String>,
+    Option<String>,
+);
 
 impl Store {
     pub(super) fn fail_pending_auto_tier(
@@ -390,7 +409,8 @@ impl Store {
                     "SELECT id FROM cats
                      WHERE auto_suspend AND desired_state='running' AND observed_state='running'
                        AND observed_generation=generation
-                       AND lifecycle_dispatch_json IS NULL",
+                       AND lifecycle_dispatch_json IS NULL
+                       AND topology_claim_json IS NULL",
                     &[],
                 )?
                 .iter()
@@ -425,7 +445,7 @@ impl Store {
                 .query_opt(
                     "SELECT workspace_id, generation, auto_suspend,
                         desired_state, observed_state, observed_generation,
-                        lifecycle_dispatch_json
+                        lifecycle_dispatch_json, topology_claim_json
                  FROM cats WHERE id=$1",
                     &[&cat_id],
                 )
@@ -439,6 +459,7 @@ impl Store {
                         row.try_get(4)?,
                         row.try_get(5)?,
                         row.try_get(6)?,
+                        row.try_get(7)?,
                     ))
                 })
                 .transpose()
@@ -451,6 +472,7 @@ impl Store {
                 observed,
                 observed_generation,
                 dispatch,
+                topology_claim,
             )) = cat
             else {
                 return Ok(None);
@@ -460,6 +482,7 @@ impl Store {
                 || observed != "running"
                 || observed_generation != generation
                 || dispatch.is_some()
+                || topology_claim.is_some()
             {
                 return Ok(None);
             }
@@ -496,6 +519,7 @@ impl Store {
                    AND observed_state='running' AND auto_suspend
                    AND observed_generation=generation
                    AND lifecycle_dispatch_json IS NULL
+                   AND topology_claim_json IS NULL
                    AND NOT EXISTS (
                      SELECT 1 FROM cat_work_leases
                      WHERE cat_id=$1 AND expires_at_ms>$4)",
@@ -529,7 +553,8 @@ impl Store {
                     AND desired_state=observed_state
                     AND observed_state IN ('suspended','warm')
                     AND observed_generation=generation
-                    AND lifecycle_dispatch_json IS NULL",
+                    AND lifecycle_dispatch_json IS NULL
+                    AND topology_claim_json IS NULL",
                 &[],
             )?;
             let mut candidates = Vec::new();
@@ -586,7 +611,8 @@ impl Store {
                 .query_opt(
                     "SELECT workspace_id, generation, auto_suspend,
                         desired_state, observed_state, observed_state_since_ms,
-                        observed_generation, lifecycle_dispatch_json
+                        observed_generation, lifecycle_dispatch_json,
+                        topology_claim_json
                    FROM cats WHERE id=$1",
                     &[&cat_id],
                 )
@@ -601,6 +627,7 @@ impl Store {
                         row.try_get(5)?,
                         row.try_get(6)?,
                         row.try_get(7)?,
+                        row.try_get(8)?,
                     ))
                 })
                 .transpose()
@@ -614,6 +641,7 @@ impl Store {
                 since_ms,
                 observed_generation,
                 dispatch,
+                topology_claim,
             )) = cat
             else {
                 return Ok(None);
@@ -622,6 +650,7 @@ impl Store {
                 || desired != observed
                 || observed_generation != generation
                 || dispatch.is_some()
+                || topology_claim.is_some()
             {
                 return Ok(None);
             }
@@ -662,6 +691,7 @@ impl Store {
                     AND observed_state=$5
                     AND observed_generation=generation
                     AND lifecycle_dispatch_json IS NULL
+                    AND topology_claim_json IS NULL
                     AND observed_state_since_ms=$6
                     AND NOT EXISTS (
                         SELECT 1 FROM cat_work_leases

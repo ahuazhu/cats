@@ -159,7 +159,7 @@ fn ensure_schema(client: &mut Client) -> Result<()> {
 /// is not carried over). `connect` upgrades a database stamped inside
 /// `[OLDEST_MIGRATABLE_SCHEMA_VERSION, SCHEMA_VERSION]` in place and refuses
 /// anything else.
-pub(super) const SCHEMA_VERSION: i64 = 3;
+pub(super) const SCHEMA_VERSION: i64 = 4;
 
 /// The oldest stamped version `Store::connect` can still upgrade in place.
 const OLDEST_MIGRATABLE_SCHEMA_VERSION: i64 = 1;
@@ -168,10 +168,21 @@ const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS control_schema_version (
     singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
     version BIGINT NOT NULL,
-    lifecycle_provenance_writes_enabled BOOLEAN NOT NULL DEFAULT FALSE
+    lifecycle_provenance_writes_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    lifecycle_maintenance_frozen BOOLEAN NOT NULL DEFAULT FALSE
 );
 ALTER TABLE control_schema_version
   ADD COLUMN IF NOT EXISTS lifecycle_provenance_writes_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE control_schema_version
+  ADD COLUMN IF NOT EXISTS lifecycle_maintenance_frozen BOOLEAN NOT NULL DEFAULT FALSE;
+-- Schema v4 introduces a database-level rollout fence. Upgrading an existing
+-- fleet turns it on in the same schema batch that installs the triggers, so
+-- there is no interval in which an old control-plane replica can create a new
+-- markerless lifecycle authority. A brand-new database has no version row yet
+-- and therefore retains the normal unfrozen default.
+UPDATE control_schema_version
+   SET lifecycle_maintenance_frozen=TRUE
+ WHERE version < 4;
 CREATE TABLE IF NOT EXISTS accounts (
     id TEXT PRIMARY KEY,
     slug TEXT NOT NULL UNIQUE,
@@ -263,10 +274,12 @@ CREATE TABLE IF NOT EXISTS cats (
     created_at BIGINT NOT NULL,
     expires_at_unix BIGINT,
     lifecycle_dispatch_json TEXT,
+    topology_claim_json TEXT,
     UNIQUE (workspace_id, name)
 );
 ALTER TABLE cats ADD COLUMN IF NOT EXISTS lifecycle_dispatch_json TEXT;
 ALTER TABLE cats ADD COLUMN IF NOT EXISTS observed_generation BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE cats ADD COLUMN IF NOT EXISTS topology_claim_json TEXT;
 CREATE TABLE IF NOT EXISTS disks (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
@@ -297,6 +310,61 @@ CREATE TABLE IF NOT EXISTS nodes (
     scheduling_disabled BOOLEAN NOT NULL DEFAULT FALSE,
     reported_cats_json TEXT
 );
+-- The Phase-A provenance rollout must stop old and new replicas from creating
+-- new lifecycle authority while the fleet changes underneath them.  Keeping
+-- the fence in PostgreSQL is what makes it apply to an older binary that does
+-- not know the new column. Existing work may still update observed state and
+-- settle; only a new Cat or desired/generation authority is rejected.
+CREATE OR REPLACE FUNCTION cats_reject_lifecycle_while_frozen()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE frozen BOOLEAN;
+BEGIN
+    IF TG_OP = 'UPDATE'
+       AND OLD.topology_claim_json IS NOT NULL
+       AND (
+           NEW.desired_state IS DISTINCT FROM OLD.desired_state
+           OR NEW.generation IS DISTINCT FROM OLD.generation
+       ) THEN
+        RAISE EXCEPTION 'Cat disk topology change owns lifecycle authority'
+            USING ERRCODE = '55000';
+    END IF;
+    SELECT lifecycle_maintenance_frozen INTO frozen
+      FROM control_schema_version WHERE singleton FOR SHARE;
+    IF frozen AND TG_OP = 'INSERT' THEN
+        RAISE EXCEPTION 'Cat lifecycle maintenance is frozen'
+            USING ERRCODE = '55000';
+    ELSIF frozen AND (
+        NEW.desired_state IS DISTINCT FROM OLD.desired_state
+        OR NEW.generation IS DISTINCT FROM OLD.generation
+    ) THEN
+        RAISE EXCEPTION 'Cat lifecycle maintenance is frozen'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS cats_lifecycle_maintenance_freeze ON cats;
+CREATE TRIGGER cats_lifecycle_maintenance_freeze
+BEFORE INSERT OR UPDATE ON cats
+FOR EACH ROW EXECUTE FUNCTION cats_reject_lifecycle_while_frozen();
+
+CREATE OR REPLACE FUNCTION cats_reject_drain_while_frozen()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE frozen BOOLEAN;
+BEGIN
+    SELECT lifecycle_maintenance_frozen INTO frozen
+      FROM control_schema_version WHERE singleton FOR SHARE;
+    IF frozen AND NEW.state = 'draining' AND OLD.state IS DISTINCT FROM NEW.state THEN
+        RAISE EXCEPTION 'Cat lifecycle maintenance is frozen'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS nodes_lifecycle_maintenance_freeze ON nodes;
+CREATE TRIGGER nodes_lifecycle_maintenance_freeze
+BEFORE UPDATE ON nodes
+FOR EACH ROW EXECUTE FUNCTION cats_reject_drain_while_frozen();
 CREATE TABLE IF NOT EXISTS operations (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),

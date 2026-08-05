@@ -26,7 +26,7 @@ mod work;
 #[cfg(test)]
 mod tests;
 
-pub use disks::DiskChangeMode;
+pub use disks::{DiskChangeMode, TopologyAction, TopologyClaim, VolumeLeaseAuthority};
 pub(crate) use leadership::SingletonSession;
 pub use leadership::{OciDeploymentLease, SingletonRole};
 pub use lifecycle::{LegacyLifecycleBegin, LifecycleDispatch};
@@ -235,12 +235,14 @@ pub(super) fn internal(e: impl std::fmt::Display) -> ApiError {
     ApiError::internal(e.to_string())
 }
 
-/// Constraint violations (SQLSTATE class 23) and the store's own immutability
-/// triggers (raised as P0001) both surface as conflicts, mirroring what the
-/// SQLite implementation reported for its CHECK/UNIQUE/trigger aborts.
+/// Constraint violations and explicit state-machine trigger rejections surface
+/// as conflicts, mirroring what the SQLite implementation reported for its
+/// CHECK/UNIQUE/trigger aborts.
 pub(super) fn is_constraint(e: &postgres::Error) -> bool {
     e.code().is_some_and(|state| {
-        state.code().starts_with("23") || state == &postgres::error::SqlState::RAISE_EXCEPTION
+        state.code().starts_with("23")
+            || state == &postgres::error::SqlState::RAISE_EXCEPTION
+            || state == &postgres::error::SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE
     })
 }
 

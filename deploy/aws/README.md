@@ -138,15 +138,82 @@ runtime; its final snapshot remains only as an archive.
 
 Lifecycle dispatch provenance has a two-phase rollout because an already
 running old replica can regain the PostgreSQL singleton lock during a rolling
-deployment. First deploy the new image with
-`lifecycle_provenance_writes_enabled=false`. Every new replica can read and
-replay markers but continues writing the legacy transitional boundary, so an
-old replica remains compatible. After the rollout reports every Pod at that
-image digest, set the variable to `true` once. Startup atomically activates a
-one-way database gate; every phase-A replica reads that shared gate before a
-lifecycle write and switches together. Setting the Terraform variable back to
-false does not disable the database gate. Do not activate phase B until the
-phase-A rollout and Pod-image verification are complete.
+deployment. Use this order; do not combine the worker and control-plane
+rollouts:
+
+1. Roll the new node-agent bundle to every worker first, one node at a time,
+   using the drain/`cats=0 orphans=0`/apply/uncordon procedure in
+   [the worker release runbook](terraform/README.md#metal-worker-deployment).
+   This makes Resume and Restore replay-safe before any new control-plane code
+   can dispatch them.
+2. Keep `lifecycle_provenance_writes_enabled=false` and roll the new
+   `cats-controld` image. The first v4 replica installs the database triggers
+   and atomically sets `lifecycle_maintenance_frozen=true` while upgrading an
+   existing schema. During this bounded maintenance window Cat create, wake,
+   sleep, Cold, Delete, disk-topology changes and new node drains return a
+   conflict; already-owned work may settle.
+3. Verify the schema fence and the exact image digest on every replica:
+
+   ```sh
+   psql "$CATS_CONTROL_POSTGRES_URL" -v ON_ERROR_STOP=1 -c \
+     'SELECT version, lifecycle_maintenance_frozen, lifecycle_provenance_writes_enabled FROM control_schema_version WHERE singleton'
+   kubectl -n <namespace> rollout status deployment/cats-controld
+   kubectl -n <namespace> get pods -l app.kubernetes.io/name=cats-controld \
+     -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.containerStatuses[0].imageID}{"\n"}{end}'
+   ```
+
+   The first command must report `version=4`, frozen `true`, and provenance
+   `false`; every Pod must report the reviewed digest.
+4. Wait until this query returns no rows. It is the activation precondition,
+   not an informational health check:
+
+   ```sql
+   SELECT c.id, c.desired_state, c.observed_state, c.generation,
+          c.observed_generation, c.lifecycle_dispatch_json,
+          c.topology_claim_json
+     FROM cats c
+    WHERE (c.lifecycle_dispatch_json IS NULL AND c.observed_state IN
+              ('starting','suspending','warming','stopping'))
+       OR c.topology_claim_json IS NOT NULL
+       OR c.desired_state <> c.observed_state
+       OR c.observed_generation <> c.generation
+       OR EXISTS (
+            SELECT 1 FROM operations o
+             WHERE o.resource_id=c.id AND o.phase IN ('pending','running')
+               AND o.kind IN (
+                 'cat.create','cat.start','cat.resume','cat.suspend','cat.warm',
+                 'cat.stop','cat.delete','cat.auto_suspend','cat.auto_warm',
+                 'cat.auto_cold','cat.work_wake','cat.wake',
+                 'cat.credit_exhausted','cat.expire'));
+   ```
+
+   A markerless transitional row means an old controller crossed the boundary
+   before the freeze. Keep the fleet frozen and let that exact old node job
+   settle; diagnose the node job journal and controller logs if it does not.
+   Never infer Start, discard a runtime, or activate phase B around the row.
+5. Set the Terraform variable to `true` and roll the control plane once more.
+   Startup runs the same idle scan transactionally and activates a one-way
+   database gate. If a row became unsafe, the new Pod refuses to start and the
+   gate remains false. Verify all Pods and then verify the gate directly:
+
+   ```sh
+   psql "$CATS_CONTROL_POSTGRES_URL" -v ON_ERROR_STOP=1 -c \
+     'SELECT lifecycle_maintenance_frozen, lifecycle_provenance_writes_enabled FROM control_schema_version WHERE singleton'
+   ```
+
+6. Only after that reports `true, true`, release maintenance with a guarded
+   update and verify the returned row says `false, true`:
+
+   ```sh
+   psql "$CATS_CONTROL_POSTGRES_URL" -v ON_ERROR_STOP=1 -c \
+     'UPDATE control_schema_version SET lifecycle_maintenance_frozen=FALSE WHERE singleton AND lifecycle_provenance_writes_enabled RETURNING lifecycle_maintenance_frozen, lifecycle_provenance_writes_enabled'
+   ```
+
+Before phase-B activation, rollback means keeping the database frozen and the
+new control-plane image at phase A while diagnosing; do not restore an older
+schema binary. After activation the database gate is deliberately irreversible:
+setting the Terraform variable back to `false` does not disable it. Do not
+unfreeze a partial rollout or one with an unresolved row from step 4.
 
 Inspect the production singleton locks and control-plane network addresses from
 `main` without disrupting a Pod:

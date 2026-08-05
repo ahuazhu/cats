@@ -1,5 +1,34 @@
 use super::*;
 
+type DesiredCatRow = (
+    i64,
+    String,
+    String,
+    String,
+    Option<String>,
+    i64,
+    Option<String>,
+);
+
+fn ensure_lifecycle_authority_unfrozen(tx: &mut postgres::Transaction<'_>) -> Result<()> {
+    let frozen: bool = tx
+        .query_one(
+            "SELECT lifecycle_maintenance_frozen
+               FROM control_schema_version WHERE singleton FOR SHARE",
+            &[],
+        )
+        .map_err(internal)?
+        .try_get(0)
+        .map_err(internal)?;
+    if frozen {
+        Err(ApiError::conflict(
+            "Cat lifecycle authority is frozen for provenance maintenance",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 impl Store {
     // ------------------------------------------------------------------
     // Cats
@@ -105,6 +134,7 @@ impl Store {
                     .map_err(internal)?;
                 }
             }
+            ensure_lifecycle_authority_unfrozen(&mut tx)?;
             let now = now_unix();
             let cat_id = new_id(ids::CAT_PREFIX);
             let root_disk_id = new_id(ids::DISK_PREFIX);
@@ -351,10 +381,11 @@ impl Store {
         self.enter(|client| {
             let client = client?;
             let mut tx = client.transaction().map_err(internal)?;
-            let current: Option<(i64, String, String, String, Option<String>, i64)> = tx
+            let current: Option<DesiredCatRow> = tx
                 .query_opt(
                     "SELECT generation, workspace_id, desired_state, observed_state,
-                            lifecycle_dispatch_json, observed_generation
+                            lifecycle_dispatch_json, observed_generation,
+                            topology_claim_json
                        FROM cats WHERE id=$1 FOR UPDATE",
                     &[&cat_id],
                 )
@@ -367,12 +398,20 @@ impl Store {
                         r.try_get(3)?,
                         r.try_get(4)?,
                         r.try_get(5)?,
+                        r.try_get(6)?,
                     ))
                 })
                 .transpose()
                 .map_err(internal)?;
-            let (current, workspace_id, current_desired, observed, dispatch, observed_generation) =
-                current.ok_or_else(|| ApiError::not_found(format!("cat {cat_id}")))?;
+            let (
+                current,
+                workspace_id,
+                current_desired,
+                observed,
+                dispatch,
+                observed_generation,
+                topology_claim,
+            ) = current.ok_or_else(|| ApiError::not_found(format!("cat {cat_id}")))?;
             if let Some(expected) = expected_generation {
                 if expected != current {
                     return Err(ApiError::conflict(format!(
@@ -391,6 +430,12 @@ impl Store {
                     return Ok(operation);
                 }
             }
+            if topology_claim.is_some() {
+                return Err(ApiError::conflict(
+                    "Cat lifecycle is blocked by a durable disk topology operation",
+                ));
+            }
+            ensure_lifecycle_authority_unfrozen(&mut tx)?;
             if current_desired == desired_str(desired) && observed != "failed" {
                 if let Some(operation) =
                     Self::lifecycle_operation_for_generation_in(&mut tx, cat_id, current)?
@@ -441,20 +486,29 @@ impl Store {
         self.enter(|client| {
             let client = client?;
             let mut tx = client.transaction().map_err(internal)?;
-            let current: Option<(i64, String, String)> = tx
+            let current: Option<(i64, String, String, Option<String>)> = tx
                 .query_opt(
-                    "SELECT generation, workspace_id, desired_state FROM cats WHERE id=$1 FOR UPDATE",
+                    "SELECT generation, workspace_id, desired_state, topology_claim_json
+                       FROM cats WHERE id=$1 FOR UPDATE",
                     &[&cat_id],
                 )
                 .map_err(internal)?
                 .map(
-                    |row| -> std::result::Result<(i64, String, String), postgres::Error> {
-                        Ok((row.try_get(0)?, row.try_get(1)?, row.try_get(2)?))
+                    |row| -> std::result::Result<
+                        (i64, String, String, Option<String>),
+                        postgres::Error,
+                    > {
+                        Ok((
+                            row.try_get(0)?,
+                            row.try_get(1)?,
+                            row.try_get(2)?,
+                            row.try_get(3)?,
+                        ))
                     },
                 )
                 .transpose()
                 .map_err(internal)?;
-            let (generation, workspace_id, desired) =
+            let (generation, workspace_id, desired, topology_claim) =
                 current.ok_or_else(|| ApiError::not_found(format!("cat {cat_id}")))?;
             if desired == "deleted" {
                 return Err(ApiError::conflict(
@@ -464,6 +518,12 @@ impl Store {
             if desired == "running" {
                 return Ok(None);
             }
+            if topology_claim.is_some() {
+                return Err(ApiError::conflict(
+                    "Cat wake is blocked by a durable disk topology operation",
+                ));
+            }
+            ensure_lifecycle_authority_unfrozen(&mut tx)?;
             Self::fail_pending_auto_tier(&mut tx, cat_id, "superseded by active work")?;
             let next = generation + 1;
             Self::fail_active_lifecycle_operations_before(&mut tx, cat_id, next)?;
