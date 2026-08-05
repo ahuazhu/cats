@@ -56,3 +56,45 @@ fn production_deploy_extracts_versions_from_the_current_store_schema() {
         );
     }
 }
+
+#[test]
+fn production_schema_probe_fails_closed() {
+    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
+    let probe = workflow
+        .split("# The control store lives in PostgreSQL.")
+        .nth(1)
+        .and_then(|rest| rest.split("- name: Initialize application state").next())
+        .expect("control schema probe block");
+
+    assert!(probe.contains("query_status=$?"));
+    assert!(probe.contains("-v ON_ERROR_STOP=1"));
+    assert!(probe.contains(r#"relation "control_schema_version" does not exist"#));
+    assert!(
+        !probe.contains("2>/dev/null || true"),
+        "database, cluster and scheduling failures must not look like a fresh schema"
+    );
+    assert!(
+        !probe.contains("[[ -z \"$query_output\""),
+        "an empty probe response is a failure, not an empty database"
+    );
+}
+
+#[test]
+fn production_database_clients_read_the_rotating_secret_files() {
+    let terraform = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    for expected in [
+        "--control-store-url-file",
+        "url-file=/etc/cats/runtime/CATS_POSTGRES_URL",
+        "CATS_USAGE_POSTGRES_URL_FILE",
+        "mount_path = \"/etc/cats/runtime\"",
+    ] {
+        assert!(
+            terraform.contains(expected),
+            "production control-plane deployment is missing {expected:?}"
+        );
+    }
+    assert!(
+        !terraform.contains("sub_path   = \"CATS_POSTGRES_URL\""),
+        "a Secret subPath mount never observes kubelet's atomic updates"
+    );
+}

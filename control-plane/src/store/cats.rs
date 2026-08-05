@@ -19,150 +19,158 @@ impl Store {
         expires_at_unix: Option<i64>,
         durability: DiskDurability,
     ) -> Result<(Cat, Vec<Disk>, Operation)> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction().map_err(internal)?;
-        let now = now_unix();
-        let cat_id = new_id(ids::CAT_PREFIX);
-        let root_disk_id = new_id(ids::DISK_PREFIX);
-        let root_volume = new_id(ids::VOLUME_PREFIX);
+        // The lock covers exactly the transaction; the follow-up reads below
+        // re-enter the store and would deadlock inside it.
+        let (cat_id, op) = self.enter(|client| -> Result<(String, Operation)> {
+            let client = client?;
+            let mut tx = client.transaction().map_err(internal)?;
+            let now = now_unix();
+            let cat_id = new_id(ids::CAT_PREFIX);
+            let root_disk_id = new_id(ids::DISK_PREFIX);
+            let root_volume = new_id(ids::VOLUME_PREFIX);
 
-        let insert_disk = |tx: &rusqlite::Transaction<'_>,
-                           id: &str,
-                           dname: &str,
-                           kind: &str,
-                           size: u64,
-                           vol: &str,
-                           state: &str|
-         -> rusqlite::Result<()> {
-            tx.execute(
-                "INSERT INTO disks (
+            let insert_disk = |tx: &mut postgres::Transaction<'_>,
+                               id: &str,
+                               dname: &str,
+                               kind: &str,
+                               size: u64,
+                               vol: &str,
+                               state: &str|
+             -> std::result::Result<(), postgres::Error> {
+                let size = size as i64;
+                tx.execute(
+                    "INSERT INTO disks (
                     id, workspace_id, name, kind, size_bytes,
                     state, volume_id, created_at, durability
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                params![
-                    id,
-                    workspace.id,
-                    dname,
-                    kind,
-                    size as i64,
-                    state,
-                    vol,
-                    now,
-                    durability.as_str()
-                ],
-            )?;
-            Ok(())
-        };
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+                    &[
+                        &id,
+                        &workspace.id,
+                        &dname,
+                        &kind,
+                        &size,
+                        &state,
+                        &vol,
+                        &now,
+                        &durability.as_str(),
+                    ],
+                )?;
+                Ok(())
+            };
 
-        let result: rusqlite::Result<()> = (|| {
-            tx.execute(
-                "INSERT INTO cats (
+            let result: std::result::Result<(), postgres::Error> = (|| {
+                let cpus_param = cpus as i64;
+                let memory_mib_param = memory_mib as i64;
+                tx.execute(
+                    "INSERT INTO cats (
                     id, workspace_id, name, image, cpus, memory_mib,
                     root_disk_id, desired_state, observed_state, generation,
                     auto_suspend, created_at, observed_state_since_ms, expires_at_unix
                  ) VALUES (
-                    ?1,?2,?3,?4,?5,?6,?7,
-                    'running','creating',1,?8,?9,?10,?11
+                    $1,$2,$3,$4,$5,$6,$7,
+                    'running','creating',1,$8,$9,$10,$11
                  )",
-                params![
-                    cat_id,
-                    workspace.id,
-                    name,
-                    image,
-                    cpus,
-                    memory_mib as i64,
-                    root_disk_id,
-                    i64::from(auto_suspend),
-                    now,
-                    now.saturating_mul(1000),
-                    expires_at_unix
-                ],
-            )?;
-            let default_endpoint_id = new_id(ids::ENDPOINT_PREFIX);
-            let default_hostname = public_endpoint_hostname(
-                &Cat {
-                    id: cat_id.clone(),
-                    workspace_id: workspace.id.clone(),
-                    name: name.to_string(),
-                    image: image.to_string(),
-                    spec: CatSpec { cpus, memory_mib },
-                    root_disk_id: root_disk_id.clone(),
-                    desired_state: DesiredState::Running,
-                    observed_state: ObservedState::Creating,
-                    generation: 1,
-                    auto_suspend,
-                    node_id: None,
-                    created_at_unix: now,
-                    observed_state_since_unix_ms: now.saturating_mul(1000),
-                    expires_at_unix,
-                },
-                DEFAULT_ENDPOINT_NAME,
-            );
-            tx.execute(
-                "INSERT INTO endpoints
-                    (id, cat_id, name, hostname, target_port, protocol, wake_policy)
-                 VALUES (?1,?2,?3,?4,?5,'http','wake_on_request')",
-                params![
-                    default_endpoint_id,
-                    cat_id,
+                    &[
+                        &cat_id,
+                        &workspace.id,
+                        &name,
+                        &image,
+                        &cpus_param,
+                        &memory_mib_param,
+                        &root_disk_id,
+                        &auto_suspend,
+                        &now,
+                        &now.saturating_mul(1000),
+                        &expires_at_unix,
+                    ],
+                )?;
+                let default_endpoint_id = new_id(ids::ENDPOINT_PREFIX);
+                let default_hostname = public_endpoint_hostname(
+                    &Cat {
+                        id: cat_id.clone(),
+                        workspace_id: workspace.id.clone(),
+                        name: name.to_string(),
+                        image: image.to_string(),
+                        spec: CatSpec { cpus, memory_mib },
+                        root_disk_id: root_disk_id.clone(),
+                        desired_state: DesiredState::Running,
+                        observed_state: ObservedState::Creating,
+                        generation: 1,
+                        auto_suspend,
+                        node_id: None,
+                        created_at_unix: now,
+                        observed_state_since_unix_ms: now.saturating_mul(1000),
+                        expires_at_unix,
+                    },
                     DEFAULT_ENDPOINT_NAME,
-                    default_hostname,
-                    DEFAULT_ENDPOINT_PORT
-                ],
-            )?;
-            tx.execute(
-                "INSERT INTO routes
+                );
+                let default_endpoint_port = DEFAULT_ENDPOINT_PORT as i64;
+                tx.execute(
+                    "INSERT INTO endpoints
+                    (id, cat_id, name, hostname, target_port, protocol, wake_policy)
+                 VALUES ($1,$2,$3,$4,$5,'http','wake_on_request')",
+                    &[
+                        &default_endpoint_id,
+                        &cat_id,
+                        &DEFAULT_ENDPOINT_NAME,
+                        &default_hostname,
+                        &default_endpoint_port,
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO routes
                     (hostname, cat_id, node_id, gateway_url, target_port, epoch, state)
-                 VALUES (?1,?2,NULL,NULL,?3,0,'unbound')",
-                params![default_hostname, cat_id, DEFAULT_ENDPOINT_PORT],
-            )?;
-            insert_disk(
-                &tx,
-                &root_disk_id,
-                &format!("{name}-root"),
-                "root",
-                root_disk_size,
-                &root_volume,
-                "bound",
-            )?;
-            tx.execute(
-                "INSERT INTO mount_bindings (id, disk_id, cat_id, mount_path)
-                 VALUES (?1,?2,?3,'/')",
-                params![new_id(ids::MOUNT_PREFIX), root_disk_id, cat_id],
-            )?;
-            if let Some((dname, dsize, dpath)) = extra_disk {
-                let disk_id = new_id(ids::DISK_PREFIX);
+                 VALUES ($1,$2,NULL,NULL,$3,0,'unbound')",
+                    &[&default_hostname, &cat_id, &default_endpoint_port],
+                )?;
                 insert_disk(
-                    &tx,
-                    &disk_id,
-                    dname,
-                    "persistent",
-                    dsize,
-                    &new_id(ids::VOLUME_PREFIX),
+                    &mut tx,
+                    &root_disk_id,
+                    &format!("{name}-root"),
+                    "root",
+                    root_disk_size,
+                    &root_volume,
                     "bound",
                 )?;
                 tx.execute(
                     "INSERT INTO mount_bindings (id, disk_id, cat_id, mount_path)
-                     VALUES (?1,?2,?3,?4)",
-                    params![new_id(ids::MOUNT_PREFIX), disk_id, cat_id, dpath],
+                 VALUES ($1,$2,$3,'/')",
+                    &[&new_id(ids::MOUNT_PREFIX), &root_disk_id, &cat_id],
                 )?;
-            }
-            Ok(())
-        })();
-        result.map_err(|e| {
-            if is_constraint(&e) {
-                ApiError::new(
-                    ErrorCode::AlreadyExists,
-                    format!("cat or disk name in use: {e}"),
-                )
-            } else {
-                internal(e)
-            }
-        })?;
+                if let Some((dname, dsize, dpath)) = extra_disk {
+                    let disk_id = new_id(ids::DISK_PREFIX);
+                    insert_disk(
+                        &mut tx,
+                        &disk_id,
+                        dname,
+                        "persistent",
+                        dsize,
+                        &new_id(ids::VOLUME_PREFIX),
+                        "bound",
+                    )?;
+                    tx.execute(
+                        "INSERT INTO mount_bindings (id, disk_id, cat_id, mount_path)
+                     VALUES ($1,$2,$3,$4)",
+                        &[&new_id(ids::MOUNT_PREFIX), &disk_id, &cat_id, &dpath],
+                    )?;
+                }
+                Ok(())
+            })();
+            result.map_err(|e| {
+                if is_constraint(&e) {
+                    ApiError::new(
+                        ErrorCode::AlreadyExists,
+                        format!("cat or disk name in use: {e}"),
+                    )
+                } else {
+                    internal(e)
+                }
+            })?;
 
-        let op = Self::insert_operation(&tx, &workspace.id, "cat.create", &cat_id, 1)?;
-        tx.commit().map_err(internal)?;
-        drop(conn);
+            let op = Self::insert_operation(&mut tx, &workspace.id, "cat.create", &cat_id, 1)?;
+            tx.commit().map_err(internal)?;
+            Ok((cat_id, op))
+        })?;
 
         let cat = self.must_get_cat_by_id(&cat_id)?;
         let disks = self.list_disks_for_cat(&cat_id)?;
@@ -170,21 +178,24 @@ impl Store {
     }
 
     pub fn get_cat(&self, workspace_id: &str, name_or_id: &str) -> Result<Cat> {
-        self.with(|c| {
-            c.query_row(
-                "SELECT * FROM cats WHERE workspace_id=?1 AND (name=?2 OR id=?2)",
-                params![workspace_id, name_or_id],
-                row_to_cat,
-            )
-            .optional()
+        self.with(|client| {
+            client
+                .query_opt(
+                    "SELECT * FROM cats WHERE workspace_id=$1 AND (name=$2 OR id=$2)",
+                    &[&workspace_id, &name_or_id],
+                )?
+                .map(|row| row_to_cat(&row))
+                .transpose()
         })?
         .ok_or_else(|| ApiError::not_found(format!("cat {name_or_id}")))
     }
 
     pub fn find_cat_by_id(&self, id: &str) -> Result<Option<Cat>> {
-        self.with(|c| {
-            c.query_row("SELECT * FROM cats WHERE id=?1", params![id], row_to_cat)
-                .optional()
+        self.with(|client| {
+            client
+                .query_opt("SELECT * FROM cats WHERE id=$1", &[&id])?
+                .map(|row| row_to_cat(&row))
+                .transpose()
         })
     }
 
@@ -194,19 +205,25 @@ impl Store {
     }
 
     pub fn list_cats(&self, workspace_id: &str) -> Result<Vec<Cat>> {
-        self.with(|c| {
-            let mut stmt =
-                c.prepare("SELECT * FROM cats WHERE workspace_id=?1 ORDER BY created_at")?;
-            let rows = stmt.query_map(params![workspace_id], row_to_cat)?;
-            rows.collect()
+        self.with(|client| {
+            client
+                .query(
+                    "SELECT * FROM cats WHERE workspace_id=$1 ORDER BY created_at",
+                    &[&workspace_id],
+                )?
+                .iter()
+                .map(row_to_cat)
+                .collect::<std::result::Result<Vec<_>, postgres::Error>>()
         })
     }
 
     pub fn list_all_cats(&self) -> Result<Vec<Cat>> {
-        self.with(|c| {
-            let mut stmt = c.prepare("SELECT * FROM cats ORDER BY created_at")?;
-            let rows = stmt.query_map([], row_to_cat)?;
-            rows.collect()
+        self.with(|client| {
+            client
+                .query("SELECT * FROM cats ORDER BY created_at", &[])?
+                .iter()
+                .map(row_to_cat)
+                .collect::<std::result::Result<Vec<_>, postgres::Error>>()
         })
     }
 
@@ -218,83 +235,97 @@ impl Store {
         expected_generation: Option<i64>,
         op_kind: &str,
     ) -> Result<Operation> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction().map_err(internal)?;
-        let current: Option<(i64, String)> = tx
-            .query_row(
-                "SELECT generation, workspace_id FROM cats WHERE id=?1",
-                params![cat_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
-            .map_err(internal)?;
-        let (current, workspace_id) =
-            current.ok_or_else(|| ApiError::not_found(format!("cat {cat_id}")))?;
-        if let Some(expected) = expected_generation {
-            if expected != current {
-                return Err(ApiError::conflict(format!(
-                    "generation mismatch: expected {expected}, current {current}"
-                )));
+        self.enter(|client| {
+            let client = client?;
+            let mut tx = client.transaction().map_err(internal)?;
+            let current: Option<(i64, String)> = tx
+                .query_opt(
+                    "SELECT generation, workspace_id FROM cats WHERE id=$1",
+                    &[&cat_id],
+                )
+                .map_err(internal)?
+                .map(|r| -> std::result::Result<(i64, String), postgres::Error> {
+                    Ok((r.try_get(0)?, r.try_get(1)?))
+                })
+                .transpose()
+                .map_err(internal)?;
+            let (current, workspace_id) =
+                current.ok_or_else(|| ApiError::not_found(format!("cat {cat_id}")))?;
+            if let Some(expected) = expected_generation {
+                if expected != current {
+                    return Err(ApiError::conflict(format!(
+                        "generation mismatch: expected {expected}, current {current}"
+                    )));
+                }
             }
-        }
-        if op_kind != "cat.auto_suspend" {
-            Self::fail_pending_auto_tier(&tx, cat_id, "superseded by a newer Cat action")?;
-        }
-        let new_gen = current + 1;
-        tx.execute(
-            "UPDATE cats SET desired_state=?2, generation=?3 WHERE id=?1",
-            params![cat_id, desired_str(desired), new_gen],
-        )
-        .map_err(internal)?;
-        let op = Self::insert_operation(&tx, &workspace_id, op_kind, cat_id, new_gen)?;
-        tx.commit().map_err(internal)?;
-        Ok(op)
+            if op_kind != "cat.auto_suspend" {
+                Self::fail_pending_auto_tier(&mut tx, cat_id, "superseded by a newer Cat action")?;
+            }
+            let new_gen = current + 1;
+            tx.execute(
+                "UPDATE cats SET desired_state=$2, generation=$3 WHERE id=$1",
+                &[&cat_id, &desired_str(desired), &new_gen],
+            )
+            .map_err(internal)?;
+            let op = Self::insert_operation(&mut tx, &workspace_id, op_kind, cat_id, new_gen)?;
+            tx.commit().map_err(internal)?;
+            Ok(op)
+        })
     }
 
     /// Atomically request Running only if no other caller has already done
     /// so. Gateway and exec can race on the first request after sleep; one
     /// generation and one wake operation is enough for all of them.
     pub fn ensure_desired_running(&self, cat_id: &str) -> Result<Option<Operation>> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction().map_err(internal)?;
-        let current: Option<(i64, String, String)> = tx
-            .query_row(
-                "SELECT generation, workspace_id, desired_state FROM cats WHERE id=?1",
-                params![cat_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        self.enter(|client| {
+            let client = client?;
+            let mut tx = client.transaction().map_err(internal)?;
+            let current: Option<(i64, String, String)> = tx
+                .query_opt(
+                    "SELECT generation, workspace_id, desired_state FROM cats WHERE id=$1",
+                    &[&cat_id],
+                )
+                .map_err(internal)?
+                .map(
+                    |row| -> std::result::Result<(i64, String, String), postgres::Error> {
+                        Ok((row.try_get(0)?, row.try_get(1)?, row.try_get(2)?))
+                    },
+                )
+                .transpose()
+                .map_err(internal)?;
+            let (generation, workspace_id, desired) =
+                current.ok_or_else(|| ApiError::not_found(format!("cat {cat_id}")))?;
+            if desired == "running" {
+                return Ok(None);
+            }
+            Self::fail_pending_auto_tier(&mut tx, cat_id, "superseded by active work")?;
+            let next = generation + 1;
+            tx.execute(
+                "UPDATE cats SET desired_state='running', generation=$2 WHERE id=$1",
+                &[&cat_id, &next],
             )
-            .optional()
             .map_err(internal)?;
-        let (generation, workspace_id, desired) =
-            current.ok_or_else(|| ApiError::not_found(format!("cat {cat_id}")))?;
-        if desired == "running" {
-            return Ok(None);
-        }
-        Self::fail_pending_auto_tier(&tx, cat_id, "superseded by active work")?;
-        let next = generation + 1;
-        tx.execute(
-            "UPDATE cats SET desired_state='running', generation=?2 WHERE id=?1",
-            params![cat_id, next],
-        )
-        .map_err(internal)?;
-        let operation = Self::insert_operation(&tx, &workspace_id, "cat.wake", cat_id, next)?;
-        tx.commit().map_err(internal)?;
-        Ok(Some(operation))
+            let operation =
+                Self::insert_operation(&mut tx, &workspace_id, "cat.wake", cat_id, next)?;
+            tx.commit().map_err(internal)?;
+            Ok(Some(operation))
+        })
     }
 
     pub fn set_observed(&self, cat_id: &str, observed: ObservedState) -> Result<()> {
-        self.with(|c| {
-            c.execute(
-                "UPDATE cats
-                    SET observed_state_since_ms = CASE
-                            WHEN observed_state=?2 THEN observed_state_since_ms
-                            ELSE ?3
-                        END,
-                        observed_state=?2
-                  WHERE id=?1",
-                params![cat_id, observed_str(observed), now_ms()],
-            )
-            .map(|_| ())
+        self.with(|client| {
+            client
+                .execute(
+                    "UPDATE cats
+                        SET observed_state_since_ms = CASE
+                                WHEN observed_state=$2 THEN observed_state_since_ms
+                                ELSE $3
+                            END,
+                            observed_state=$2
+                      WHERE id=$1",
+                    &[&cat_id, &observed_str(observed), &now_ms()],
+                )
+                .map(|_| ())
         })
     }
 
@@ -307,19 +338,20 @@ impl Store {
         transitional: ObservedState,
         target: ObservedState,
     ) -> Result<bool> {
-        self.with(|c| {
-            c.execute(
-                "UPDATE cats
-                    SET observed_state=?3, observed_state_since_ms=?4
-                 WHERE id=?1 AND observed_state=?2",
-                params![
-                    cat_id,
-                    observed_str(transitional),
-                    observed_str(target),
-                    now_ms()
-                ],
-            )
-            .map(|changed| changed == 1)
+        self.with(|client| {
+            client
+                .execute(
+                    "UPDATE cats
+                        SET observed_state=$3, observed_state_since_ms=$4
+                     WHERE id=$1 AND observed_state=$2",
+                    &[
+                        &cat_id,
+                        &observed_str(transitional),
+                        &observed_str(target),
+                        &now_ms(),
+                    ],
+                )
+                .map(|changed| changed == 1)
         })
     }
 
@@ -340,11 +372,12 @@ impl Store {
         node_lease_timeout_ms: i64,
         now_ms: i64,
     ) -> Result<Option<Node>> {
-        self.with(|c| {
-            let mut stmt = c.prepare("SELECT * FROM nodes ORDER BY id")?;
-            let nodes = stmt
-                .query_map([], row_to_node)?
-                .collect::<rusqlite::Result<Vec<Node>>>()?;
+        self.with(|client| {
+            let nodes = client
+                .query("SELECT * FROM nodes ORDER BY id", &[])?
+                .iter()
+                .map(row_to_node)
+                .collect::<std::result::Result<Vec<Node>, postgres::Error>>()?;
             let mut best: Option<(u64, Node)> = None;
             for node in nodes {
                 if node.state != NodeState::Ready {
@@ -355,12 +388,15 @@ impl Store {
                 }
                 // This Cat's own row is excluded so re-placing it does not count
                 // its resources against itself.
-                let (used_cpus, used_mem): (u32, u64) = c.query_row(
-                    "SELECT COALESCE(SUM(cpus), 0), COALESCE(SUM(memory_mib), 0)
-                       FROM cats WHERE node_id = ?1 AND id <> ?2",
-                    params![node.id, cat_id],
-                    |row| Ok((row.get::<_, i64>(0)? as u32, row.get::<_, i64>(1)? as u64)),
+                let usage = client.query_one(
+                    "SELECT COALESCE(SUM(cpus), 0)::BIGINT, COALESCE(SUM(memory_mib), 0)::BIGINT
+                       FROM cats WHERE node_id = $1 AND id <> $2",
+                    &[&node.id, &cat_id],
                 )?;
+                let (used_cpus, used_mem): (u32, u64) = (
+                    usage.try_get::<_, i64>(0)? as u32,
+                    usage.try_get::<_, i64>(1)? as u64,
+                );
                 if used_cpus + cpus <= node.capacity.cpus
                     && used_mem + memory_mib <= node.capacity.memory_mib
                     && best.as_ref().is_none_or(|(mem, _)| used_mem < *mem)
@@ -371,45 +407,35 @@ impl Store {
             let Some((_, node)) = best else {
                 return Ok(None);
             };
-            c.execute(
-                "UPDATE cats SET node_id = ?2 WHERE id = ?1",
-                params![cat_id, node.id],
+            client.execute(
+                "UPDATE cats SET node_id = $2 WHERE id = $1",
+                &[&cat_id, &node.id],
             )?;
             Ok(Some(node))
         })
     }
 
     pub fn set_placement(&self, cat_id: &str, node_id: Option<&str>) -> Result<()> {
-        self.with(|c| {
-            c.execute(
-                "UPDATE cats SET node_id=?2 WHERE id=?1",
-                params![cat_id, node_id],
-            )
-            .map(|_| ())
+        self.with(|client| {
+            client
+                .execute(
+                    "UPDATE cats SET node_id=$2 WHERE id=$1",
+                    &[&cat_id, &node_id],
+                )
+                .map(|_| ())
         })
     }
 
     pub fn delete_cat_row(&self, cat_id: &str) -> Result<()> {
-        self.with(|c| {
-            c.execute(
-                "DELETE FROM cat_work_leases WHERE cat_id=?1",
-                params![cat_id],
-            )?;
-            c.execute(
-                "DELETE FROM cat_work_sources WHERE cat_id=?1",
-                params![cat_id],
-            )?;
-            c.execute(
-                "DELETE FROM mount_bindings WHERE cat_id=?1",
-                params![cat_id],
-            )?;
-            c.execute("DELETE FROM endpoints WHERE cat_id=?1", params![cat_id])?;
-            c.execute("DELETE FROM routes WHERE cat_id=?1", params![cat_id])?;
-            c.execute(
-                "DELETE FROM oci_deployments WHERE cat_id=?1",
-                params![cat_id],
-            )?;
-            c.execute("DELETE FROM cats WHERE id=?1", params![cat_id])
+        self.with(|client| {
+            client.execute("DELETE FROM cat_work_leases WHERE cat_id=$1", &[&cat_id])?;
+            client.execute("DELETE FROM cat_work_sources WHERE cat_id=$1", &[&cat_id])?;
+            client.execute("DELETE FROM mount_bindings WHERE cat_id=$1", &[&cat_id])?;
+            client.execute("DELETE FROM endpoints WHERE cat_id=$1", &[&cat_id])?;
+            client.execute("DELETE FROM routes WHERE cat_id=$1", &[&cat_id])?;
+            client.execute("DELETE FROM oci_deployments WHERE cat_id=$1", &[&cat_id])?;
+            client
+                .execute("DELETE FROM cats WHERE id=$1", &[&cat_id])
                 .map(|_| ())
         })
     }
@@ -419,12 +445,13 @@ impl Store {
     // ------------------------------------------------------------------
 
     pub fn set_auto_suspend(&self, cat_id: &str, enabled: bool) -> Result<Cat> {
-        self.with(|c| {
-            c.execute(
-                "UPDATE cats SET auto_suspend=?2 WHERE id=?1",
-                params![cat_id, i64::from(enabled)],
-            )
-            .map(|_| ())
+        self.with(|client| {
+            client
+                .execute(
+                    "UPDATE cats SET auto_suspend=$2 WHERE id=$1",
+                    &[&cat_id, &enabled],
+                )
+                .map(|_| ())
         })?;
         self.must_get_cat_by_id(cat_id)
     }
@@ -432,12 +459,13 @@ impl Store {
     /// Set or clear the absolute expiry. Does not bump the generation: expiry
     /// is bookkeeping about the future, not a lifecycle mutation.
     pub fn set_expiry(&self, cat_id: &str, expires_at_unix: Option<i64>) -> Result<Cat> {
-        self.with(|c| {
-            c.execute(
-                "UPDATE cats SET expires_at_unix=?2 WHERE id=?1",
-                params![cat_id, expires_at_unix],
-            )
-            .map(|_| ())
+        self.with(|client| {
+            client
+                .execute(
+                    "UPDATE cats SET expires_at_unix=$2 WHERE id=$1",
+                    &[&cat_id, &expires_at_unix],
+                )
+                .map(|_| ())
         })?;
         self.must_get_cat_by_id(cat_id)
     }
@@ -446,15 +474,18 @@ impl Store {
     /// deleted. The controller converges each one to Deleted.
     pub fn expired_cat_candidates(&self) -> Result<Vec<String>> {
         let now = now_unix();
-        self.with(|c| {
-            let mut stmt = c.prepare(
-                "SELECT id FROM cats
-                 WHERE expires_at_unix IS NOT NULL
-                   AND expires_at_unix <= ?1
-                   AND desired_state != 'deleted'",
-            )?;
-            let rows = stmt.query_map(params![now], |row| row.get(0))?;
-            rows.collect()
+        self.with(|client| {
+            client
+                .query(
+                    "SELECT id FROM cats
+                     WHERE expires_at_unix IS NOT NULL
+                       AND expires_at_unix <= $1
+                       AND desired_state != 'deleted'",
+                    &[&now],
+                )?
+                .iter()
+                .map(|row| row.try_get(0))
+                .collect::<std::result::Result<Vec<_>, postgres::Error>>()
         })
     }
 }

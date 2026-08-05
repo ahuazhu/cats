@@ -6,4 +6,6 @@ pub mod billing;
 pub mod controller;
 pub mod server;
 pub mod store;
+#[doc(hidden)]
+pub mod testsupport;
 pub mod ui;

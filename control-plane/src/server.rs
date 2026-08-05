@@ -10,17 +10,21 @@ use cats_metering::{CreditStore, UsageStore};
 use cats_storage::MetadataStore;
 
 use crate::controller::{AutoTierPolicy, Controller};
-use crate::store::Store;
+use crate::store::{DsnSource, Store};
 
 #[derive(Clone)]
 pub struct Config {
     /// `host:port`; use port 0 to pick a free port (tests).
     pub listen: String,
-    /// Control-plane resource database.
-    pub db_path: PathBuf,
+    /// Control-plane resource database. Production uses a mounted Secret file
+    /// so a reconnect observes rotated credentials; tests use a literal URL
+    /// with `options=-csearch_path%3D<schema>`.
+    pub control_store_dsn: DsnSource,
+    /// CA bundle for verifying the control database's TLS certificate (RDS).
+    pub control_store_ca_file: Option<PathBuf>,
     /// Usage ledger is injected independently from control-plane metadata.
-    /// Local development may point a SQLite adapter at `db_path`; production
-    /// uses the PostgreSQL usage adapter.
+    /// Local development may point a SQLite adapter at a local file;
+    /// production uses the PostgreSQL usage adapter.
     pub usage_store: Arc<dyn UsageStore>,
     /// Append-only prepaid credit ledger. It may share the same physical
     /// database as the usage projection while remaining a separate port.
@@ -126,7 +130,12 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         "automatic Cold threshold must be positive"
     );
     let cfg = Arc::new(cfg);
-    let store = Arc::new(Store::open(&cfg.db_path)?);
+    let store = Arc::new(Store::connect_from(
+        &cfg.control_store_dsn,
+        cfg.control_store_ca_file
+            .as_deref()
+            .and_then(|p| p.to_str()),
+    )?);
     if let Some(workos) = &cfg.workos {
         store.ensure_configured_accounts(workos.account_organizations())?;
     } else {

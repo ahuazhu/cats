@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use anyhow::Context;
+use cats_control_plane::store::DsnSource as ControlStoreDsnSource;
 use cats_metadata_store_postgres::PostgresMetadataStoreFactory;
 use cats_metadata_store_sqlite::SqliteMetadataStoreFactory;
 use cats_metering::{CreditStore, SqliteUsageStore, UsageStore};
@@ -14,8 +16,22 @@ use clap::Parser;
 struct Args {
     #[arg(long, default_value = "127.0.0.1:7300")]
     listen: String,
+    /// Local SQLite file for the development-shape usage/credit ledger. The
+    /// control resource store itself is PostgreSQL (`--control-store-url`).
     #[arg(long, default_value = "cats-control.db")]
     db_path: std::path::PathBuf,
+    /// Control resource database. Falls back to CATS_POSTGRES_URL, the same
+    /// DSN the storage metadata adapter uses: one database, disjoint tables.
+    #[arg(long, env = "CATS_CONTROL_POSTGRES_URL")]
+    control_store_url: Option<String>,
+    /// File holding the control resource PostgreSQL URL. It is re-read after
+    /// each disconnect so credential rotation does not require a process
+    /// restart. Takes precedence over URL environment variables.
+    #[arg(long, env = "CATS_CONTROL_POSTGRES_URL_FILE")]
+    control_store_url_file: Option<std::path::PathBuf>,
+    /// CA bundle for the control database's TLS certificate (RDS).
+    #[arg(long, env = "CATS_CONTROL_POSTGRES_CA_FILE")]
+    control_store_ca_file: Option<std::path::PathBuf>,
     /// Usage ledger adapter. SQLite is for local development; production
     /// should use the independent PostgreSQL usage database/schema.
     #[arg(
@@ -426,9 +442,26 @@ async fn main() -> anyhow::Result<()> {
         !args.billing_enforcement_enabled || stripe.is_some(),
         "CATS_BILLING_ENFORCEMENT_ENABLED requires a complete Stripe top-up configuration"
     );
+    let control_store_dsn = match args.control_store_url_file {
+        Some(path) => {
+            if args.control_store_url.is_some() || std::env::var_os("CATS_POSTGRES_URL").is_some() {
+                tracing::warn!(
+                    file = %path.display(),
+                    "control-store PostgreSQL DSN comes from the file; configured URL environment variables are not read"
+                );
+            }
+            ControlStoreDsnSource::File(path)
+        }
+        None => ControlStoreDsnSource::Literal(
+            args.control_store_url
+                .or_else(|| std::env::var("CATS_POSTGRES_URL").ok())
+                .context("the control store needs a PostgreSQL URL: --control-store-url, CATS_CONTROL_POSTGRES_URL, CATS_CONTROL_POSTGRES_URL_FILE or CATS_POSTGRES_URL")?,
+        ),
+    };
     let handle = cats_control_plane::server::spawn(cats_control_plane::server::Config {
         listen: args.listen,
-        db_path: args.db_path,
+        control_store_dsn,
+        control_store_ca_file: args.control_store_ca_file,
         usage_store,
         credit_store,
         storage_meta,

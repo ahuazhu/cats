@@ -6,6 +6,11 @@ The repository contains the full Rust workspace implementation (V1 dev shape) pl
 
 Quality gates for any change: `./scripts/quality.sh full` green. This checks Rust formatting and shared agent-skill contracts; rejects known security advisories, unapproved licenses and dependency sources, new transitive version splits, wildcard or inconsistent workspace dependencies, and unused direct dependencies; builds the workspace before tests; runs Clippy with warnings denied; and runs all workspace tests and rustdoc. Use `./scripts/quality.sh fast` while iterating.
 
+The workspace tests need a disposable PostgreSQL for the control store
+(ADR-0031): `quality.sh` starts one through docker automatically, CI provides
+a service container, and setting `CATS_TEST_POSTGRES_URL` yourself skips the
+docker path. Tests fail loudly rather than skip when neither is available.
+
 The dependency gate uses pinned tool versions:
 
 ```bash

@@ -3,6 +3,11 @@ use cats_api::guest::GuestWorkLease;
 use cats_api::requests::NodeWorkStatusRequest;
 use std::sync::Arc;
 
+/// Fresh store on an isolated schema of the disposable test server.
+fn test_store() -> Store {
+    Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap()
+}
+
 /// Seed one configured Account and return its default Workspace.
 fn bootstrap_workspace(store: &Store, account_slug: &str) -> WorkspaceRecord {
     store
@@ -60,8 +65,7 @@ fn create_test_cat_expiring(
 
 #[test]
 fn workspaces_in_one_account_share_its_billing_account() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("control.db")).unwrap();
+    let store = test_store();
     let mappings = BTreeMap::from([
         ("acme".to_string(), "org_acme".to_string()),
         ("other".to_string(), "org_other".to_string()),
@@ -105,8 +109,7 @@ fn workspaces_in_one_account_share_its_billing_account() {
 }
 #[test]
 fn renaming_a_workspace_keeps_resource_ownership() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("control.db")).unwrap();
+    let store = test_store();
     let default = bootstrap_workspace(&store, "acme");
     let sibling = store
         .create_workspace(&default.account_id, "sibling", "Sibling")
@@ -126,12 +129,13 @@ fn renaming_a_workspace_keeps_resource_ownership() {
     assert_eq!(operation.workspace_id, default.id);
     assert!(
         store
-            .with(|conn| {
-                conn.execute(
-                    "UPDATE cats SET workspace_id=?2 WHERE id=?1",
-                    params![cat.id, sibling.id],
-                )
-                .map(|_| ())
+            .with(|client| {
+                client
+                    .execute(
+                        "UPDATE cats SET workspace_id=$2 WHERE id=$1",
+                        &[&cat.id, &sibling.id],
+                    )
+                    .map(|_| ())
             })
             .is_err(),
         "a Cat must not be movable between workspaces"
@@ -140,8 +144,7 @@ fn renaming_a_workspace_keeps_resource_ownership() {
 
 #[test]
 fn the_same_name_is_free_in_a_second_workspace() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("control.db")).unwrap();
+    let store = test_store();
     let default = bootstrap_workspace(&store, "acme");
     let sibling = store
         .create_workspace(&default.account_id, "sibling", "Sibling")
@@ -154,47 +157,22 @@ fn the_same_name_is_free_in_a_second_workspace() {
 }
 
 #[test]
-fn migrates_a_v1_database_in_place() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("control.db");
+fn state_survives_a_reconnect() {
+    let url = crate::testsupport::isolated_control_store_url();
     let cat_id = {
-        let store = Store::open(&path).unwrap();
+        let store = Store::connect(&url, None).unwrap();
         let workspace = bootstrap_workspace(&store, "acme");
         let (cat, _, _) = create_test_cat(&store, &workspace, "web").unwrap();
         cat.id
     };
-    {
-        // Reshape the file into the v1 schema: no expiry column, no disk
-        // durability column, no reported node inventory, stamp 1.
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("ALTER TABLE cats DROP COLUMN expires_at_unix")
-            .unwrap();
-        conn.execute_batch("ALTER TABLE disks DROP COLUMN durability")
-            .unwrap();
-        conn.execute_batch("ALTER TABLE nodes DROP COLUMN reported_cats_json")
-            .unwrap();
-        conn.pragma_update(None, "user_version", 1_i64).unwrap();
-    }
 
-    let store = Store::open(&path).unwrap();
+    // A second connect is a control-plane restart: everything written before
+    // it must still be there, and the re-run DDL must not disturb it.
+    let store = Store::connect(&url, None).unwrap();
     let cat = store.must_get_cat_by_id(&cat_id).unwrap();
-    assert_eq!(
-        cat.expires_at_unix, None,
-        "v1 rows surface as never-expiring"
-    );
+    assert_eq!(cat.name, "web");
     let disks = store.list_disks_for_cat(&cat_id).unwrap();
-    assert!(
-        disks.iter().all(|d| d.durability == DiskDurability::Strict),
-        "v1 disks keep the semantics they were created under"
-    );
-    {
-        let conn = Connection::open(&path).unwrap();
-        let stamped: i64 = conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(stamped, SCHEMA_VERSION);
-    }
-    // The migrated column is writable like a natively-v2 one.
+    assert!(!disks.is_empty(), "the root disk survives the restart");
     store.set_expiry(&cat_id, Some(12345)).unwrap();
     assert_eq!(
         store.must_get_cat_by_id(&cat_id).unwrap().expires_at_unix,
@@ -203,49 +181,48 @@ fn migrates_a_v1_database_in_place() {
 }
 
 #[test]
-fn migrates_a_v4_database_in_place() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("control.db");
-    {
-        let store = Store::open(&path).unwrap();
-        store
-            .register_node("node_a", "http://node", "http://gateway", 4, 8192)
-            .unwrap();
-    }
-    {
-        // Reshape the file into the v4 schema: no reported inventory, stamp 4.
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("ALTER TABLE nodes DROP COLUMN reported_cats_json")
-            .unwrap();
-        conn.pragma_update(None, "user_version", 4_i64).unwrap();
-    }
+fn reconnect_rereads_a_dsn_file() {
+    let first_url = crate::testsupport::isolated_control_store_url();
+    let second_url = crate::testsupport::isolated_control_store_url();
+    // Prepare both databases before changing the source underneath a Store.
+    // Credential rotation keeps the database fixed, but two schemas make the
+    // source actually used by the reconnect externally visible.
+    drop(Store::connect(&second_url, None).unwrap());
 
-    let store = Store::open(&path).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("control-postgres-url");
+    std::fs::write(&path, format!("{first_url}\n")).unwrap();
+    let store = Store::connect_from(&DsnSource::File(path.clone()), None).unwrap();
+    let workspace = bootstrap_workspace(&store, "first");
+    create_test_cat(&store, &workspace, "only-in-first").unwrap();
+
+    std::fs::write(&path, format!("{second_url}\n")).unwrap();
+    let old_client = store.client.lock().unwrap().take();
+    drop(old_client);
+
     assert!(
-        store.reported_cats("node_a").unwrap().is_empty(),
-        "a pre-v5 node surfaces as never having reported"
+        store.list_cats(&workspace.id).unwrap().is_empty(),
+        "the reconnect must use the newly rendered DSN"
     );
-    {
-        let conn = Connection::open(&path).unwrap();
-        let stamped: i64 = conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(stamped, SCHEMA_VERSION);
-    }
-    // The migrated column is writable like a natively-v5 one.
-    let reported = [HeartbeatCat {
-        cat_id: "cat_orphan1".into(),
-        generation: 7,
-        state: ObservedState::Running,
-    }];
-    store.heartbeat_node("node_a", None, &reported).unwrap();
-    assert_eq!(store.reported_cats("node_a").unwrap().len(), 1);
+}
+
+#[test]
+fn dsn_file_errors_do_not_expose_credential_contents() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing-postgres-url");
+    let error = DsnSource::File(missing.clone()).resolve().unwrap_err();
+    assert!(error.to_string().contains(&missing.display().to_string()));
+
+    let empty = directory.path().join("empty-postgres-url");
+    std::fs::write(&empty, "  \n").unwrap();
+    let error = DsnSource::File(empty.clone()).resolve().unwrap_err();
+    assert!(error.to_string().contains(&empty.display().to_string()));
+    assert!(!error.to_string().contains("postgres://"));
 }
 
 #[test]
 fn heartbeat_reported_inventory_round_trips_and_diffs_orphans() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("control.db")).unwrap();
+    let store = test_store();
     let workspace = bootstrap_workspace(&store, "acme");
     let (cat, _, _) = create_test_cat(&store, &workspace, "assigned").unwrap();
     store
@@ -300,8 +277,7 @@ fn heartbeat_reported_inventory_round_trips_and_diffs_orphans() {
 
 #[test]
 fn an_idempotency_record_outlives_the_cat_it_created() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("control.db")).unwrap();
+    let store = test_store();
     let workspace = bootstrap_workspace(&store, "acme");
 
     let (cat, _, op) = store
@@ -335,8 +311,7 @@ fn an_idempotency_record_outlives_the_cat_it_created() {
 
 #[test]
 fn absolute_expiry_selects_only_due_undeleted_cats() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("control.db")).unwrap();
+    let store = test_store();
     let workspace = bootstrap_workspace(&store, "acme");
     let past = now_unix() - 60;
     let future = now_unix() + 3600;
@@ -373,8 +348,7 @@ fn absolute_expiry_selects_only_due_undeleted_cats() {
 
 #[test]
 fn workspace_tokens_resolve_only_while_active() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(&directory.path().join("control.db")).unwrap();
+    let store = test_store();
     let workspace = bootstrap_workspace(&store, "automation");
     let token = store
         .create_workspace_token(&workspace.id, "CI preview", "sha256-example")
@@ -405,8 +379,7 @@ fn workspace_tokens_resolve_only_while_active() {
 
 #[test]
 fn concurrent_personal_provision_has_one_identity_and_grant_claim() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(Store::open(&dir.path().join("control.db")).unwrap());
+    let store = Arc::new(test_store());
     let mut threads = Vec::new();
     for _ in 0..8 {
         let store = store.clone();
@@ -450,16 +423,19 @@ fn concurrent_personal_provision_has_one_identity_and_grant_claim() {
 
 #[test]
 fn refuses_a_database_stamped_with_another_schema_version() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("control.db");
-    drop(Store::open(&path).unwrap());
+    let url = crate::testsupport::isolated_control_store_url();
+    drop(Store::connect(&url, None).unwrap());
     {
-        let conn = Connection::open(&path).unwrap();
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        admin
+            .execute(
+                "UPDATE control_schema_version SET version = $1",
+                &[&(SCHEMA_VERSION + 1)],
+            )
             .unwrap();
     }
 
-    let Err(error) = Store::open(&path) else {
+    let Err(error) = Store::connect(&url, None) else {
         panic!("a database from another schema version must not open");
     };
     assert_eq!(error.code, ErrorCode::FailedPrecondition);
@@ -469,27 +445,27 @@ fn refuses_a_database_stamped_with_another_schema_version() {
             .contains(&format!("requires {SCHEMA_VERSION}")),
         "the operator needs to see the required schema version, got: {error}"
     );
-    // A database this build wrote itself keeps opening.
-    assert!(Store::open(&dir.path().join("fresh.db")).is_ok());
+    // A schema this build wrote itself keeps opening.
+    assert!(Store::connect(&crate::testsupport::isolated_control_store_url(), None).is_ok());
 
-    // The dev shape points the usage store at the control-plane file. Its
-    // tables must not read as a stale control-plane schema.
-    let shared = dir.path().join("shared.db");
+    // The control database is shared with the storage MetadataStore's tables.
+    // A foreign table alongside is not an old control-plane schema.
+    let shared = crate::testsupport::isolated_control_store_url();
     {
-        let conn = Connection::open(&shared).unwrap();
-        conn.execute_batch("CREATE TABLE usage_checkpoints (event_id TEXT PRIMARY KEY);")
+        let mut admin = postgres::Client::connect(&shared, postgres::NoTls).unwrap();
+        admin
+            .batch_execute("CREATE TABLE usage_checkpoints (event_id TEXT PRIMARY KEY);")
             .unwrap();
     }
     assert!(
-        Store::open(&shared).is_ok(),
-        "a foreign table in the same file is not an old control-plane schema"
+        Store::connect(&shared, None).is_ok(),
+        "a foreign table in the same database is not an old control-plane schema"
     );
 }
 
 #[test]
 fn every_cat_gets_a_default_public_endpoint() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("control.db")).unwrap();
+    let store = test_store();
     let workspace = bootstrap_workspace(&store, "alpha");
     let (cat, _, _) = store
         .create_cat(
@@ -524,8 +500,7 @@ fn every_cat_gets_a_default_public_endpoint() {
 
 #[test]
 fn a_cordoned_node_stays_unschedulable_across_a_lost_recovery_cycle() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("control.db")).unwrap();
+    let store = test_store();
     store
         .register_node("node_a", "http://node", "http://gateway", 4, 8192)
         .unwrap();
@@ -561,8 +536,7 @@ fn a_cordoned_node_stays_unschedulable_across_a_lost_recovery_cycle() {
 
 #[test]
 fn a_fenced_node_identity_cannot_reregister_or_heartbeat_back_to_ready() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("control.db")).unwrap();
+    let store = test_store();
     store
         .register_node("node_a", "http://node", "http://gateway", 4, 8192)
         .unwrap();
@@ -578,8 +552,7 @@ fn a_fenced_node_identity_cannot_reregister_or_heartbeat_back_to_ready() {
 
 #[test]
 fn last_guest_work_release_is_immediately_suspend_eligible() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("control.db")).unwrap();
+    let store = test_store();
     let workspace = bootstrap_workspace(&store, "alpha");
     let (cat, _, _) = create_test_cat(&store, &workspace, "worker").unwrap();
     assert!(cat.auto_suspend);
@@ -652,8 +625,7 @@ fn concurrent_placement_cannot_overcommit_a_node() {
     // separate write, which only holds up while one Cat is placed at a time.
     // The reconcile loop now runs flows concurrently, so this is the property
     // that keeps it honest.
-    let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(Store::open(&dir.path().join("control.db")).unwrap());
+    let store = Arc::new(test_store());
     let workspace = bootstrap_workspace(&store, "alpha");
     // Room for exactly 4 of these Cats: 8 cpus / 8192 MiB, 2 cpus each.
     store
@@ -708,8 +680,7 @@ fn concurrent_placement_cannot_overcommit_a_node() {
 
 #[test]
 fn gateway_work_blocks_auto_suspend_and_wake_is_singleflight() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("control.db")).unwrap();
+    let store = test_store();
     let workspace = bootstrap_workspace(&store, "alpha");
     let (cat, _, _) = create_test_cat(&store, &workspace, "web").unwrap();
     store
@@ -744,8 +715,7 @@ fn gateway_work_blocks_auto_suspend_and_wake_is_singleflight() {
 
 #[test]
 fn guest_work_cancels_an_inflight_suspend_without_generation_drift() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("control.db")).unwrap();
+    let store = test_store();
     let workspace = bootstrap_workspace(&store, "alpha");
     let (cat, _, _) = create_test_cat(&store, &workspace, "racer").unwrap();
     store
@@ -792,11 +762,10 @@ fn guest_work_cancels_an_inflight_suspend_without_generation_drift() {
 
 #[test]
 fn automatic_deeper_tiers_use_persisted_state_age_and_respect_work() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("control.db");
+    let url = crate::testsupport::isolated_control_store_url();
     let cat_id;
     {
-        let store = Store::open(&path).unwrap();
+        let store = Store::connect(&url, None).unwrap();
         let workspace = bootstrap_workspace(&store, "alpha");
         let (cat, _, _) = create_test_cat(&store, &workspace, "sleeper").unwrap();
         cat_id = cat.id.clone();
@@ -808,12 +777,13 @@ fn automatic_deeper_tiers_use_persisted_state_age_and_respect_work() {
             .unwrap();
         store.finish_operation(&suspend.id, None).unwrap();
         store
-            .with(|conn| {
-                conn.execute(
-                    "UPDATE cats SET observed_state_since_ms=?2 WHERE id=?1",
-                    params![cat.id, now_ms() - 2_000],
-                )
-                .map(|_| ())
+            .with(|client| {
+                client
+                    .execute(
+                        "UPDATE cats SET observed_state_since_ms=$2 WHERE id=$1",
+                        &[&cat.id, &(now_ms() - 2_000)],
+                    )
+                    .map(|_| ())
             })
             .unwrap();
 
@@ -833,18 +803,19 @@ fn automatic_deeper_tiers_use_persisted_state_age_and_respect_work() {
         store.set_observed(&cat.id, ObservedState::Warm).unwrap();
         store.finish_operation(&warm.id, None).unwrap();
         store
-            .with(|conn| {
-                conn.execute(
-                    "UPDATE cats SET observed_state_since_ms=?2 WHERE id=?1",
-                    params![cat.id, now_ms() - 2_000],
-                )
-                .map(|_| ())
+            .with(|client| {
+                client
+                    .execute(
+                        "UPDATE cats SET observed_state_since_ms=$2 WHERE id=$1",
+                        &[&cat.id, &(now_ms() - 2_000)],
+                    )
+                    .map(|_| ())
             })
             .unwrap();
     }
 
-    // Reopening the control-plane database must not reset the Warm timer.
-    let store = Store::open(&path).unwrap();
+    // Reconnecting to the control-plane database must not reset the Warm timer.
+    let store = Store::connect(&url, None).unwrap();
     let lease = store
         .acquire_work(&cat_id, WorkKind::Gateway, "request-1", "GET /", 5_000)
         .unwrap();

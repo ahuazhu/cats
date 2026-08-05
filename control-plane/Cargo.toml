@@ -18,7 +18,9 @@ reqwest = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-rusqlite = { workspace = true }
+postgres = { workspace = true }
+postgres-native-tls = { workspace = true }
+native-tls = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 workos = { workspace = true }

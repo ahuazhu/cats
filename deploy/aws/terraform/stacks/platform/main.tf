@@ -118,8 +118,6 @@ module "github_release" {
 # entry rather than an aws-auth ConfigMap.
 data "aws_partition" "current" {}
 
-data "aws_caller_identity" "current" {}
-
 data "aws_iam_policy_document" "github_application_deploy" {
   statement {
     sid       = "ApplicationStateBucket"
@@ -196,63 +194,6 @@ data "aws_iam_policy_document" "github_application_deploy" {
     resources = [module.database.master_user_secret_arn]
   }
 
-  # The application stack manages the control-data snapshot policy and its DLM
-  # execution role. Every apply refreshes them, not only the one that creates
-  # them, so the release role needs their full lifecycle. Scoped to the one
-  # role name the cats-kubernetes module declares and to DLM policies in this
-  # account; the role name must stay in sync with that module.
-  statement {
-    sid    = "ManageControlDataSnapshotRole"
-    effect = "Allow"
-    actions = [
-      "iam:AttachRolePolicy",
-      "iam:CreateRole",
-      "iam:DeleteRole",
-      "iam:DetachRolePolicy",
-      "iam:GetRole",
-      "iam:ListAttachedRolePolicies",
-      "iam:ListInstanceProfilesForRole",
-      "iam:ListRolePolicies",
-      "iam:TagRole",
-      "iam:UntagRole",
-      "iam:UpdateAssumeRolePolicy",
-    ]
-    resources = [
-      "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/cats-control-data-snapshots",
-    ]
-  }
-
-  statement {
-    sid     = "PassControlDataSnapshotRoleToDlm"
-    effect  = "Allow"
-    actions = ["iam:PassRole"]
-    resources = [
-      "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/cats-control-data-snapshots",
-    ]
-
-    condition {
-      test     = "StringEquals"
-      variable = "iam:PassedToService"
-      values   = ["dlm.amazonaws.com"]
-    }
-  }
-
-  statement {
-    sid    = "ManageControlDataSnapshotPolicy"
-    effect = "Allow"
-    actions = [
-      "dlm:CreateLifecyclePolicy",
-      "dlm:DeleteLifecyclePolicy",
-      "dlm:GetLifecyclePolicy",
-      "dlm:ListTagsForResource",
-      "dlm:TagResource",
-      "dlm:UntagResource",
-      "dlm:UpdateLifecyclePolicy",
-    ]
-    resources = [
-      "arn:${data.aws_partition.current.partition}:dlm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:policy/*",
-    ]
-  }
 }
 
 resource "aws_iam_role_policy" "github_application_deploy" {

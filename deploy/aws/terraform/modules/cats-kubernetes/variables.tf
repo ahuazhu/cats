@@ -227,32 +227,6 @@ variable "rds_ca_pem" {
   }
 }
 
-variable "control_data_storage_class" {
-  description = "StorageClass for the control-plane SQLite development-shaped resource database."
-  type        = string
-  default     = "cats-auto-ebs"
-}
-
-variable "control_data_size" {
-  description = "Encrypted EBS PVC size for the single-replica control resource database."
-  type        = string
-  default     = "8Gi"
-}
-
-variable "control_data_snapshot_retention" {
-  description = "Daily EBS snapshots of the control-data volume kept before the oldest expires. Losing the volume costs at most the interval since the newest snapshot."
-  type        = number
-  default     = 7
-
-  validation {
-    condition = (
-      var.control_data_snapshot_retention >= 1 &&
-      floor(var.control_data_snapshot_retention) == var.control_data_snapshot_retention
-    )
-    error_message = "control_data_snapshot_retention must be a positive integer."
-  }
-}
-
 variable "auto_warm_after_seconds" {
   description = "Seconds before an eligible Suspended Cat becomes Warm; zero disables the transition."
   type        = number

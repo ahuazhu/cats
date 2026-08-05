@@ -6,8 +6,7 @@
 # product without affecting the other.
 #
 # Auto Mode is retained from the previous deployment because the application
-# stack's ingress depends on it (IngressClassParams, the managed ALB and the
-# `cats-auto-ebs` StorageClass all come from Auto Mode capabilities).
+# stack's ingress depends on its IngressClassParams and managed ALB.
 
 locals {
   name = var.cluster_name

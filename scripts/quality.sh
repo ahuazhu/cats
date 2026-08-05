@@ -132,9 +132,44 @@ run_clippy() {
   cargo clippy --workspace --all-targets --locked -- -D warnings
 }
 
+# The control store is PostgreSQL-only, and its tests refuse to run without a
+# server rather than silently skipping. CI provides CATS_TEST_POSTGRES_URL via
+# a service container; locally a disposable container covers the test run.
+with_test_postgres() {
+  if [ -n "${CATS_TEST_POSTGRES_URL:-}" ]; then
+    "$@"
+    return
+  fi
+  command -v docker >/dev/null 2>&1 || {
+    echo "tests need PostgreSQL: set CATS_TEST_POSTGRES_URL or install docker" >&2
+    return 1
+  }
+  local name="cats-test-pg-$$"
+  docker run --rm -d --name "$name" \
+    -e POSTGRES_PASSWORD=cats -p 127.0.0.1:0:5432 postgres:16 >/dev/null
+  local status=0
+  local port=""
+  local i
+  for i in $(seq 1 120); do
+    if docker exec "$name" pg_isready -U postgres >/dev/null 2>&1; then
+      port="$(docker port "$name" 5432/tcp | head -1 | awk -F: '{print $NF}')"
+      [ -n "$port" ] && break
+    fi
+    sleep 0.5
+  done
+  if [ -z "$port" ]; then
+    echo "disposable test PostgreSQL never became ready" >&2
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    return 1
+  fi
+  CATS_TEST_POSTGRES_URL="postgres://postgres:cats@127.0.0.1:${port}/postgres" "$@" || status=$?
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  return "$status"
+}
+
 run_test() {
   echo "==> cargo test"
-  cargo test --workspace --locked
+  with_test_postgres cargo test --workspace --locked
 }
 
 run_doc() {
@@ -169,8 +204,19 @@ run_linux() {
   local target_volume="${CATS_LINUX_TARGET_VOLUME:-cats-target-linux}"
   local jobs="${CATS_LINUX_JOBS:-2}"
 
+  # The tests need PostgreSQL and the build container cannot run docker
+  # itself, so the server rides alongside on a private network.
+  local network="cats-linux-net-$$"
+  local pg="cats-linux-pg-$$"
+  docker network create "$network" >/dev/null
+  docker run --rm -d --name "$pg" --network "$network" \
+    -e POSTGRES_PASSWORD=cats postgres:16 >/dev/null
+
+  local status=0
   docker run --rm --platform "$platform" \
     -e CARGO_BUILD_JOBS="$jobs" \
+    -e CATS_TEST_POSTGRES_URL="postgres://postgres:cats@${pg}:5432/postgres" \
+    --network "$network" \
     -v "$REPO_ROOT:/work" -w /work \
     -v cats-cargo-registry:/usr/local/cargo/registry \
     -v "$target_volume:/target" \
@@ -184,7 +230,11 @@ run_linux() {
            cargo build --workspace --locked --target-dir /target &&
            cargo clippy --workspace --all-targets --locked --target-dir /target -- -D warnings &&
            cargo test --workspace --locked --target-dir /target &&
-           RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked --target-dir /target'
+           RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked --target-dir /target' || status=$?
+
+  docker rm -f "$pg" >/dev/null 2>&1 || true
+  docker network rm "$network" >/dev/null 2>&1 || true
+  return "$status"
 }
 
 case "${1:-full}" in

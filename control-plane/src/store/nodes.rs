@@ -14,32 +14,28 @@ impl Store {
         memory_mib: u64,
     ) -> Result<()> {
         let now = now_ms();
-        self.with(|c| {
-            c.execute(
-                "INSERT INTO nodes (id, agent_url, gateway_url, state, cpus, memory_mib,
-                                    last_heartbeat_ms, scheduling_disabled)
-                 VALUES (?1,?2,?3,'ready',?4,?5,?6,0)
-                 ON CONFLICT(id) DO UPDATE SET
-                   agent_url=?2, gateway_url=?3,
-                   state=CASE
-                       WHEN nodes.state='draining' THEN 'draining'
-                       WHEN nodes.state='fenced' THEN 'fenced'
-                       WHEN nodes.state='lost' THEN 'lost'
-                       WHEN nodes.scheduling_disabled=1 THEN 'cordoned'
-                       ELSE 'ready'
-                   END,
-                   cpus=?4, memory_mib=?5, last_heartbeat_ms=?6,
-                   reported_cats_json=NULL",
-                params![
-                    node_id,
-                    agent_url,
-                    gateway_url,
-                    cpus,
-                    memory_mib as i64,
-                    now
-                ],
-            )
-            .map(|_| ())
+        let cpus = cpus as i64;
+        let memory_mib = memory_mib as i64;
+        self.with(|client| {
+            client
+                .execute(
+                    "INSERT INTO nodes (id, agent_url, gateway_url, state, cpus, memory_mib,
+                                        last_heartbeat_ms, scheduling_disabled)
+                     VALUES ($1,$2,$3,'ready',$4,$5,$6,FALSE)
+                     ON CONFLICT(id) DO UPDATE SET
+                       agent_url=$2, gateway_url=$3,
+                       state=CASE
+                           WHEN nodes.state='draining' THEN 'draining'
+                           WHEN nodes.state='fenced' THEN 'fenced'
+                           WHEN nodes.state='lost' THEN 'lost'
+                           WHEN nodes.scheduling_disabled THEN 'cordoned'
+                           ELSE 'ready'
+                       END,
+                       cpus=$4, memory_mib=$5, last_heartbeat_ms=$6,
+                       reported_cats_json=NULL",
+                    &[&node_id, &agent_url, &gateway_url, &cpus, &memory_mib, &now],
+                )
+                .map(|_| ())
         })
     }
 
@@ -61,22 +57,22 @@ impl Store {
         let mut reported: Vec<&HeartbeatCat> = reported.iter().collect();
         reported.sort_by(|a, b| a.cat_id.cmp(&b.cat_id));
         let reported_json = serde_json::to_string(&reported).expect("reported cats must serialize");
-        self.with(|c| {
-            let previous: Option<Option<String>> = c
-                .query_row(
-                    "SELECT reported_cats_json FROM nodes WHERE id=?1",
-                    params![node_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
+        self.with(|client| {
+            let previous: Option<Option<String>> = client
+                .query_opt(
+                    "SELECT reported_cats_json FROM nodes WHERE id=$1",
+                    &[&node_id],
+                )?
+                .map(|row| row.try_get(0))
+                .transpose()?;
             let Some(previous) = previous else {
                 return Ok(Err(ApiError::not_found(format!("node {node_id}"))));
             };
-            c.execute(
-                "UPDATE nodes SET last_heartbeat_ms=?2, telemetry_json=?3,
-                        reported_cats_json=?4
-                 WHERE id=?1",
-                params![node_id, now_ms(), telemetry_json, reported_json],
+            client.execute(
+                "UPDATE nodes SET last_heartbeat_ms=$2, telemetry_json=$3,
+                        reported_cats_json=$4
+                 WHERE id=$1",
+                &[&node_id, &now_ms(), &telemetry_json, &reported_json],
             )?;
             Ok(Ok(previous.as_deref() != Some(reported_json.as_str())))
         })?
@@ -86,13 +82,14 @@ impl Store {
     /// Empty both for "reported nothing" and "never reported".
     pub fn reported_cats(&self, node_id: &str) -> Result<Vec<HeartbeatCat>> {
         let json: Option<String> = self
-            .with(|c| {
-                c.query_row(
-                    "SELECT reported_cats_json FROM nodes WHERE id=?1",
-                    params![node_id],
-                    |row| row.get(0),
-                )
-                .optional()
+            .with(|client| {
+                client
+                    .query_opt(
+                        "SELECT reported_cats_json FROM nodes WHERE id=$1",
+                        &[&node_id],
+                    )?
+                    .map(|row| row.try_get(0))
+                    .transpose()
             })?
             .ok_or_else(|| ApiError::not_found(format!("node {node_id}")))?;
         Ok(json
@@ -124,58 +121,59 @@ impl Store {
     /// proved every preserved Cat claim with a same-generation runtime entry.
     /// The state predicate makes this safe against a concurrent admin fence.
     pub fn recover_lost_node(&self, node_id: &str) -> Result<bool> {
-        self.with(|c| {
-            c.execute(
-                "UPDATE nodes
-                    SET state=CASE
-                            WHEN scheduling_disabled=1 THEN 'cordoned'
-                            ELSE 'ready'
-                        END
-                  WHERE id=?1 AND state='lost'",
-                params![node_id],
-            )
-            .map(|changed| changed == 1)
+        self.with(|client| {
+            client
+                .execute(
+                    "UPDATE nodes
+                        SET state=CASE
+                                WHEN scheduling_disabled THEN 'cordoned'
+                                ELSE 'ready'
+                            END
+                      WHERE id=$1 AND state='lost'",
+                    &[&node_id],
+                )
+                .map(|changed| changed == 1)
         })
     }
 
     pub fn list_nodes(&self) -> Result<Vec<Node>> {
-        self.with(|c| {
-            let mut stmt = c.prepare("SELECT * FROM nodes ORDER BY id")?;
-            let rows = stmt.query_map([], row_to_node)?;
-            rows.collect()
+        self.with(|client| {
+            client
+                .query("SELECT * FROM nodes ORDER BY id", &[])?
+                .iter()
+                .map(row_to_node)
+                .collect::<std::result::Result<Vec<_>, postgres::Error>>()
         })
     }
 
     pub fn get_node(&self, node_id: &str) -> Result<Node> {
-        self.with(|c| {
-            c.query_row(
-                "SELECT * FROM nodes WHERE id=?1",
-                params![node_id],
-                row_to_node,
-            )
-            .optional()
+        self.with(|client| {
+            client
+                .query_opt("SELECT * FROM nodes WHERE id=$1", &[&node_id])?
+                .map(|row| row_to_node(&row))
+                .transpose()
         })?
         .ok_or_else(|| ApiError::not_found(format!("node {node_id}")))
     }
 
     pub fn set_node_state(&self, node_id: &str, state: NodeState) -> Result<()> {
         let state = node_state_str(state);
-        let n = self.with(|c| {
-            c.execute(
+        let n = self.with(|client| {
+            client.execute(
                 "UPDATE nodes
                     SET state=CASE
-                            WHEN state='fenced' AND ?2<>'fenced' THEN state
-                            WHEN ?2='cordoned' AND state='lost' THEN state
-                            ELSE ?2
+                            WHEN state='fenced' AND $2<>'fenced' THEN state
+                            WHEN $2='cordoned' AND state='lost' THEN state
+                            ELSE $2
                         END,
                         scheduling_disabled=CASE
-                            WHEN state='fenced' THEN 1
-                            WHEN ?2='ready' THEN 0
-                            WHEN ?2 IN ('cordoned','draining','fenced') THEN 1
+                            WHEN state='fenced' THEN TRUE
+                            WHEN $2='ready' THEN FALSE
+                            WHEN $2 IN ('cordoned','draining','fenced') THEN TRUE
                             ELSE scheduling_disabled
                         END
-                  WHERE id=?1",
-                params![node_id, state],
+                  WHERE id=$1",
+                &[&node_id, &state],
             )
         })?;
         if n == 0 {
@@ -185,11 +183,15 @@ impl Store {
     }
 
     pub fn cats_on_node(&self, node_id: &str) -> Result<Vec<Cat>> {
-        self.with(|c| {
-            let mut stmt =
-                c.prepare("SELECT * FROM cats WHERE node_id=?1 ORDER BY workspace_id, name")?;
-            let rows = stmt.query_map(params![node_id], row_to_cat)?;
-            rows.collect()
+        self.with(|client| {
+            client
+                .query(
+                    "SELECT * FROM cats WHERE node_id=$1 ORDER BY workspace_id, name",
+                    &[&node_id],
+                )?
+                .iter()
+                .map(row_to_cat)
+                .collect::<std::result::Result<Vec<_>, postgres::Error>>()
         })
     }
 
@@ -241,36 +243,34 @@ impl Store {
     }
 
     pub fn delete_node(&self, node_id: &str) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction().map_err(internal)?;
-        let assigned: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM cats WHERE node_id=?1",
-                params![node_id],
-                |row| row.get(0),
-            )
-            .map_err(internal)?;
-        if assigned != 0 {
-            return Err(ApiError::failed_precondition(
-                "node still owns Cats; drain it before deletion",
-            ));
-        }
-        let state: Option<String> = tx
-            .query_row(
-                "SELECT state FROM nodes WHERE id=?1",
-                params![node_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(internal)?;
-        let state = state.ok_or_else(|| ApiError::not_found(format!("node {node_id}")))?;
-        if state == "ready" || state == "draining" {
-            return Err(ApiError::failed_precondition(
-                "only cordoned, lost, or fenced nodes can be deleted",
-            ));
-        }
-        tx.execute("DELETE FROM nodes WHERE id=?1", params![node_id])
-            .map_err(internal)?;
-        tx.commit().map_err(internal)
+        self.enter(|client| {
+            let client = client?;
+            let mut tx = client.transaction().map_err(internal)?;
+            let assigned: i64 = tx
+                .query_one("SELECT COUNT(*) FROM cats WHERE node_id=$1", &[&node_id])
+                .map_err(internal)?
+                .try_get(0)
+                .map_err(internal)?;
+            if assigned != 0 {
+                return Err(ApiError::failed_precondition(
+                    "node still owns Cats; drain it before deletion",
+                ));
+            }
+            let state: Option<String> = tx
+                .query_opt("SELECT state FROM nodes WHERE id=$1", &[&node_id])
+                .map_err(internal)?
+                .map(|row| row.try_get(0))
+                .transpose()
+                .map_err(internal)?;
+            let state = state.ok_or_else(|| ApiError::not_found(format!("node {node_id}")))?;
+            if state == "ready" || state == "draining" {
+                return Err(ApiError::failed_precondition(
+                    "only cordoned, lost, or fenced nodes can be deleted",
+                ));
+            }
+            tx.execute("DELETE FROM nodes WHERE id=$1", &[&node_id])
+                .map_err(internal)?;
+            tx.commit().map_err(internal)
+        })
     }
 }
