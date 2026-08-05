@@ -15,6 +15,34 @@ fn read_workspace_file(path: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+#[test]
+fn production_deployment_selects_each_control_plane_image_target() {
+    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
+    let control_plane_step = workflow
+        .split_once("      - name: Build and push control-plane image")
+        .and_then(|(_, rest)| rest.split_once("\n      - name:"))
+        .map(|(step, _)| step)
+        .expect("control-plane image build step");
+    assert!(
+        control_plane_step
+            .lines()
+            .any(|line| line.trim() == "target: runtime"),
+        "the control-plane build must select the runtime target explicitly; otherwise Docker builds the final credential-refresher stage"
+    );
+
+    let refresher_step = workflow
+        .split_once("      - name: Build and push credential-refresher image")
+        .and_then(|(_, rest)| rest.split_once("\n      - name:"))
+        .map(|(step, _)| step)
+        .expect("credential-refresher image build step");
+    assert!(
+        refresher_step
+            .lines()
+            .any(|line| line.trim() == "target: credential-refresher"),
+        "the credential-refresher build must select its dedicated target"
+    );
+}
+
 /// The units pass `--ch-cmdline` explicitly, so they override the binary
 /// default rather than inheriting it.
 #[test]
