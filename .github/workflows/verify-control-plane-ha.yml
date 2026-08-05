@@ -94,7 +94,11 @@ jobs:
           ready_pods="$(jq -r '
             .items[]
             | select(
-                ((.status.containerStatuses // []) | length) > 0
+                .metadata.deletionTimestamp == null
+                and .status.phase == "Running"
+                and any(.status.conditions[]?;
+                  .type == "Ready" and .status == "True")
+                and ((.status.containerStatuses // []) | length) > 0
                 and all(.status.containerStatuses[]; .ready == true)
               )
             | [.metadata.name, .metadata.uid, .status.podIP, .spec.nodeName]
@@ -102,7 +106,11 @@ jobs:
           ' <<<"$pods")"
           ready_count="$(jq '
             [.items[] | select(
-              ((.status.containerStatuses // []) | length) > 0
+              .metadata.deletionTimestamp == null
+              and .status.phase == "Running"
+              and any(.status.conditions[]?;
+                .type == "Ready" and .status == "True")
+              and ((.status.containerStatuses // []) | length) > 0
               and all(.status.containerStatuses[]; .ready == true)
             )] | length
           ' <<<"$pods")"
@@ -175,32 +183,52 @@ jobs:
           pods="$("${kube[@]}" get pods \
             --selector app.kubernetes.io/name=cats-controld \
             --output=json)"
+          pods_file="$RUNNER_TEMP/control-ha-pods-before.json"
+          printf '%s\n' "$pods" > "$pods_file"
           owner_probe="control-ha-owner-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          owner_query="SELECT host(a.client_addr) FROM pg_locks AS l JOIN pg_stat_activity AS a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.classid=hashtext(current_schema())::oid AND l.objid=420201 AND l.objsubid=2 AND l.granted"
-          leader_ip="$(
+          owner_query="SELECT COALESCE(host(a.client_addr), '<local>') FROM pg_locks AS l JOIN pg_stat_activity AS a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.classid=hashtext(current_schema())::oid AND l.objid=420201 AND l.objsubid=2 AND l.granted"
+          owner_addresses="$(
             deploy/aws/run-postgres-probe.sh \
               "$KUBECONFIG" \
               cats \
               "$owner_probe" \
               "$owner_query"
           )"
-          target="$(jq -r --arg ip "$leader_ip" '
-            [.items[] | select(
-              .status.podIP == $ip
-              and ((.status.containerStatuses // []) | length) > 0
-              and all(.status.containerStatuses[]; .ready == true)
-            ) | .metadata.name]
-            | if length == 1 then .[0] else empty end
-          ' <<<"$pods")"
-          target_uid="$(jq -r --arg target "$target" '
-            .items[] | select(.metadata.name == $target) | .metadata.uid
-          ' <<<"$pods")"
-          if [[ -z "$leader_ip" || -z "$target" || -z "$target_uid" ]]; then
-            echo "::error::could not map the PostgreSQL reconciler owner to exactly one ready Pod"
+          selection="$(
+            deploy/aws/select-reconciler-owner.sh "$pods_file" \
+              <<<"$owner_addresses"
+          )"
+          target="$(jq -r '.name' <<<"$selection")"
+          target_uid="$(jq -r '.uid' <<<"$selection")"
+          owner_address_kind="$(jq -r '.address_kind' <<<"$selection")"
+          echo "Reconciler leader before disruption: $target ($owner_address_kind source)"
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+
+          # Re-resolve the backend at the last safe boundary. Natural
+          # leadership movement while this queued job was preparing must not
+          # turn the drill into deletion of a standby.
+          confirm_pods_file="$RUNNER_TEMP/control-ha-pods-confirm.json"
+          "${kube[@]}" get pods \
+            --selector app.kubernetes.io/name=cats-controld \
+            --output=json > "$confirm_pods_file"
+          confirm_probe="control-ha-owner-confirm-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          confirm_addresses="$(
+            deploy/aws/run-postgres-probe.sh \
+              "$KUBECONFIG" \
+              cats \
+              "$confirm_probe" \
+              "$owner_query"
+          )"
+          confirm_selection="$(
+            deploy/aws/select-reconciler-owner.sh "$confirm_pods_file" \
+              <<<"$confirm_addresses"
+          )"
+          confirm_target="$(jq -r '.name' <<<"$confirm_selection")"
+          confirm_uid="$(jq -r '.uid' <<<"$confirm_selection")"
+          if [[ "$confirm_target" != "$target" || "$confirm_uid" != "$target_uid" ]]; then
+            echo "::error::reconciler leadership changed before the disruption boundary"
             exit 1
           fi
-          echo "Reconciler leader before disruption: $target ($leader_ip)"
-          echo "target=$target" >> "$GITHUB_OUTPUT"
 
           probe_public_api() {
             for attempt in $(seq 1 240); do
@@ -232,7 +260,7 @@ jobs:
             echo "::error::the selected leader changed before deletion"
             exit 1
           fi
-          "${kube[@]}" delete pod "$target" --wait=false
+          deploy/aws/evict-pod-with-uid.sh cats "$target" "$target_uid"
           "${kube[@]}" wait --for=delete "pod/$target" --timeout=5m
           "${kube[@]}" rollout status deployment/cats-controld --timeout=10m
 
@@ -266,6 +294,8 @@ jobs:
           pods="$("${kube[@]}" get pods \
             --selector app.kubernetes.io/name=cats-controld \
             --output=json)"
+          pods_file="$RUNNER_TEMP/control-ha-pods-after.json"
+          printf '%s\n' "$pods" > "$pods_file"
           if jq -e --arg old "$OLD_TARGET" '
             any(.items[]; .metadata.name == $old)
           ' <<<"$pods" >/dev/null; then
@@ -275,7 +305,11 @@ jobs:
           distinct_nodes="$(jq -r '
             .items[]
             | select(
-                ((.status.containerStatuses // []) | length) > 0
+                .metadata.deletionTimestamp == null
+                and .status.phase == "Running"
+                and any(.status.conditions[]?;
+                  .type == "Ready" and .status == "True")
+                and ((.status.containerStatuses // []) | length) > 0
                 and all(.status.containerStatuses[]; .ready == true)
               )
             | .spec.nodeName
@@ -286,20 +320,22 @@ jobs:
           fi
 
           probe="control-ha-owner-after-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          owner_query="SELECT host(a.client_addr) FROM pg_locks AS l JOIN pg_stat_activity AS a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.classid=hashtext(current_schema())::oid AND l.objid=420201 AND l.objsubid=2 AND l.granted"
-          leader_ip="$(
+          owner_query="SELECT COALESCE(host(a.client_addr), '<local>') FROM pg_locks AS l JOIN pg_stat_activity AS a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.classid=hashtext(current_schema())::oid AND l.objid=420201 AND l.objsubid=2 AND l.granted"
+          owner_addresses="$(
             deploy/aws/run-postgres-probe.sh \
               "$KUBECONFIG" \
               cats \
               "$probe" \
               "$owner_query"
           )"
-          new_leader="$(jq -r --arg ip "$leader_ip" '
-            [.items[] | select(.status.podIP == $ip) | .metadata.name]
-            | if length == 1 then .[0] else empty end
-          ' <<<"$pods")"
+          selection="$(
+            deploy/aws/select-reconciler-owner.sh "$pods_file" \
+              <<<"$owner_addresses"
+          )"
+          new_leader="$(jq -r '.name' <<<"$selection")"
+          owner_address_kind="$(jq -r '.address_kind' <<<"$selection")"
           if [[ -z "$new_leader" || "$new_leader" == "$OLD_TARGET" ]]; then
             echo "::error::reconciler leadership did not move to a live replacement"
             exit 1
           fi
-          echo "Reconciler leader after disruption: $new_leader ($leader_ip)"
+          echo "Reconciler leader after disruption: $new_leader ($owner_address_kind source)"
