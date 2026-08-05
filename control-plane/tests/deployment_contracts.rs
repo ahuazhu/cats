@@ -137,6 +137,33 @@ fn production_control_plane_survives_one_pod_or_node_disruption() {
 }
 
 #[test]
+fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
+    let workflow = read_workspace_file(".github/workflows/verify-control-plane-ha.yml");
+    for expected in [
+        "workflow_dispatch:",
+        "DELETE_ONE_CATS_CONTROLD_LEADER",
+        "github.ref == 'refs/heads/main'",
+        "disruptionsAllowed",
+        "l.classid=hashtext(current_schema())::oid",
+        "l.objid=420201",
+        "l.objsubid=2",
+        "delete pod \"$target\" --wait=false",
+        "https://cats.run/healthz",
+        "rollout status deployment/cats-controld",
+        "All 240 public health probes succeeded",
+        "reconciler leadership did not move",
+    ] {
+        assert!(
+            workflow.contains(expected),
+            "production HA drill is missing {expected:?}"
+        );
+    }
+    assert!(!workflow.contains("--force"));
+    assert!(!workflow.contains("--grace-period=0"));
+    assert!(!workflow.contains("scale deployment"));
+}
+
+#[test]
 fn production_deploy_detaches_the_legacy_control_volume_after_plan_and_before_apply() {
     let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
     let plan = workflow

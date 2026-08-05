@@ -1,0 +1,272 @@
+name: Verify production control-plane HA
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type DELETE_ONE_CATS_CONTROLD_LEADER to run the production drill"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: production-control-plane-ha-drill
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+
+jobs:
+  drill:
+    name: Delete the elected reconciler and prove takeover
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Require the destructive confirmation
+        shell: bash
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          if [[ "$CONFIRMATION" != "DELETE_ONE_CATS_CONTROLD_LEADER" ]]; then
+            echo "::error::confirmation must be DELETE_ONE_CATS_CONTROLD_LEADER"
+            exit 1
+          fi
+
+      - name: Assume production deployment role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure Kubernetes
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig \
+            --name "$EKS_CLUSTER_NAME" \
+            --region "$AWS_REGION" \
+            --kubeconfig "$RUNNER_TEMP/kubeconfig"
+
+      - name: Verify control-plane redundancy
+        shell: bash
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: |
+          set -euo pipefail
+          kube=(kubectl --namespace cats)
+          "${kube[@]}" rollout status deployment/cats-controld --timeout=5m
+
+          deployment="$("${kube[@]}" get deployment cats-controld --output=json)"
+          desired="$(jq -r '.spec.replicas' <<<"$deployment")"
+          ready="$(jq -r '.status.readyReplicas // 0' <<<"$deployment")"
+          available="$(jq -r '.status.availableReplicas // 0' <<<"$deployment")"
+          if (( desired < 2 || ready != desired || available != desired )); then
+            echo "::error::cats-controld is not fully redundant: desired=$desired ready=$ready available=$available"
+            exit 1
+          fi
+
+          pods="$("${kube[@]}" get pods \
+            --selector app.kubernetes.io/name=cats-controld \
+            --output=json)"
+          ready_pods="$(jq -r '
+            .items[]
+            | select(
+                ((.status.containerStatuses // []) | length) > 0
+                and all(.status.containerStatuses[]; .ready == true)
+              )
+            | [.metadata.name, .metadata.uid, .status.podIP, .spec.nodeName]
+            | @tsv
+          ' <<<"$pods")"
+          ready_count="$(jq '
+            [.items[] | select(
+              ((.status.containerStatuses // []) | length) > 0
+              and all(.status.containerStatuses[]; .ready == true)
+            )] | length
+          ' <<<"$pods")"
+          distinct_nodes="$(cut -f4 <<<"$ready_pods" | sed '/^$/d' | sort -u | wc -l | tr -d ' ')"
+          if (( ready_count < 2 || distinct_nodes < 2 )); then
+            echo "::error::ready control-plane Pods are not spread across two nodes"
+            printf '%s\n' "$ready_pods"
+            exit 1
+          fi
+
+          disruptions_allowed="$("${kube[@]}" get poddisruptionbudget cats-controld \
+            --output=jsonpath='{.status.disruptionsAllowed}')"
+          if (( disruptions_allowed < 1 )); then
+            echo "::error::the cats-controld PDB currently allows no disruption"
+            exit 1
+          fi
+
+      - name: Delete the leader while probing the public API
+        id: disrupt
+        shell: bash
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: |
+          set -euo pipefail
+          kube=(kubectl --namespace cats)
+          failures="$RUNNER_TEMP/control-ha-probe-failures"
+          : > "$failures"
+
+          # Resolve the lock owner immediately before the disruption. Keeping
+          # selection and deletion in one step prevents a queued Actions step
+          # from deleting a Pod after leadership has already moved elsewhere.
+          pods="$("${kube[@]}" get pods \
+            --selector app.kubernetes.io/name=cats-controld \
+            --output=json)"
+          owner_probe="control-ha-owner-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          # The DSN expands inside the probe container, not on this runner.
+          # shellcheck disable=SC2016
+          leader_ip="$(
+            "${kube[@]}" run "$owner_probe" \
+              --restart=Never --rm --attach --quiet \
+              --image=postgres:16 \
+              --overrides='{
+                "spec": {
+                  "containers": [{
+                    "name": "psql",
+                    "image": "postgres:16",
+                    "command": ["sh", "-ceu",
+                      "psql \"$CATS_POSTGRES_URL\" -v ON_ERROR_STOP=1 -tA -c \"SELECT a.client_addr::text FROM pg_locks AS l JOIN pg_stat_activity AS a ON a.pid=l.pid WHERE l.locktype=\u0027advisory\u0027 AND l.classid=hashtext(current_schema())::oid AND l.objid=420201 AND l.objsubid=2 AND l.granted\""],
+                    "envFrom": [{"secretRef": {"name": "cats-runtime"}}]
+                  }]
+                }
+              }'
+          )"
+          leader_ip="$(tr -d '[:space:]' <<<"$leader_ip")"
+          target="$(jq -r --arg ip "$leader_ip" '
+            [.items[] | select(
+              .status.podIP == $ip
+              and ((.status.containerStatuses // []) | length) > 0
+              and all(.status.containerStatuses[]; .ready == true)
+            ) | .metadata.name]
+            | if length == 1 then .[0] else empty end
+          ' <<<"$pods")"
+          target_uid="$(jq -r --arg target "$target" '
+            .items[] | select(.metadata.name == $target) | .metadata.uid
+          ' <<<"$pods")"
+          if [[ -z "$leader_ip" || -z "$target" || -z "$target_uid" ]]; then
+            echo "::error::could not map the PostgreSQL reconciler owner to exactly one ready Pod"
+            exit 1
+          fi
+          echo "Reconciler leader before disruption: $target ($leader_ip)"
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+
+          probe_public_api() {
+            for attempt in $(seq 1 240); do
+              if ! curl \
+                --fail --silent --show-error \
+                --connect-timeout 2 --max-time 3 \
+                https://cats.run/healthz >/dev/null
+              then
+                echo "attempt=$attempt time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                  >> "$failures"
+              fi
+              sleep 0.25
+            done
+          }
+
+          probe_public_api &
+          probe_pid=$!
+          cleanup_probe() {
+            if kill -0 "$probe_pid" 2>/dev/null; then
+              kill "$probe_pid" 2>/dev/null || true
+            fi
+            wait "$probe_pid" 2>/dev/null || true
+          }
+          trap cleanup_probe EXIT
+
+          observed_uid="$("${kube[@]}" get pod "$target" \
+            --output=jsonpath='{.metadata.uid}')"
+          if [[ "$observed_uid" != "$target_uid" ]]; then
+            echo "::error::the selected leader changed before deletion"
+            exit 1
+          fi
+          "${kube[@]}" delete pod "$target" --wait=false
+          "${kube[@]}" wait --for=delete "pod/$target" --timeout=5m
+          "${kube[@]}" rollout status deployment/cats-controld --timeout=10m
+
+          wait "$probe_pid"
+          trap - EXIT
+          if [[ -s "$failures" ]]; then
+            echo "::error::the public control-plane health endpoint failed during leader replacement"
+            sed -n '1,40p' "$failures"
+            exit 1
+          fi
+          echo "All 240 public health probes succeeded during leader replacement."
+
+      - name: Verify replacement, node spread and reconciler takeover
+        shell: bash
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+          OLD_TARGET: ${{ steps.disrupt.outputs.target }}
+        run: |
+          set -euo pipefail
+          kube=(kubectl --namespace cats)
+          deployment="$("${kube[@]}" get deployment cats-controld --output=json)"
+          desired="$(jq -r '.spec.replicas' <<<"$deployment")"
+          ready="$(jq -r '.status.readyReplicas // 0' <<<"$deployment")"
+          available="$(jq -r '.status.availableReplicas // 0' <<<"$deployment")"
+          if (( desired < 2 || ready != desired || available != desired )); then
+            echo "::error::cats-controld did not return to full redundancy"
+            exit 1
+          fi
+
+          pods="$("${kube[@]}" get pods \
+            --selector app.kubernetes.io/name=cats-controld \
+            --output=json)"
+          if jq -e --arg old "$OLD_TARGET" '
+            any(.items[]; .metadata.name == $old)
+          ' <<<"$pods" >/dev/null; then
+            echo "::error::the deleted leader Pod still exists"
+            exit 1
+          fi
+          distinct_nodes="$(jq -r '
+            .items[]
+            | select(
+                ((.status.containerStatuses // []) | length) > 0
+                and all(.status.containerStatuses[]; .ready == true)
+              )
+            | .spec.nodeName
+          ' <<<"$pods" | sed '/^$/d' | sort -u | wc -l | tr -d ' ')"
+          if (( distinct_nodes < 2 )); then
+            echo "::error::replacement control-plane Pods are not node-spread"
+            exit 1
+          fi
+
+          probe="control-ha-owner-after-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          # The DSN expands inside the probe container, not on this runner.
+          # shellcheck disable=SC2016
+          leader_ip="$(
+            "${kube[@]}" run "$probe" \
+              --restart=Never --rm --attach --quiet \
+              --image=postgres:16 \
+              --overrides='{
+                "spec": {
+                  "containers": [{
+                    "name": "psql",
+                    "image": "postgres:16",
+                    "command": ["sh", "-ceu",
+                      "psql \"$CATS_POSTGRES_URL\" -v ON_ERROR_STOP=1 -tA -c \"SELECT a.client_addr::text FROM pg_locks AS l JOIN pg_stat_activity AS a ON a.pid=l.pid WHERE l.locktype=\u0027advisory\u0027 AND l.classid=hashtext(current_schema())::oid AND l.objid=420201 AND l.objsubid=2 AND l.granted\""],
+                    "envFrom": [{"secretRef": {"name": "cats-runtime"}}]
+                  }]
+                }
+              }'
+          )"
+          leader_ip="$(tr -d '[:space:]' <<<"$leader_ip")"
+          new_leader="$(jq -r --arg ip "$leader_ip" '
+            [.items[] | select(.status.podIP == $ip) | .metadata.name]
+            | if length == 1 then .[0] else empty end
+          ' <<<"$pods")"
+          if [[ -z "$new_leader" || "$new_leader" == "$OLD_TARGET" ]]; then
+            echo "::error::reconciler leadership did not move to a live replacement"
+            exit 1
+          fi
+          echo "Reconciler leader after disruption: $new_leader ($leader_ip)"
