@@ -304,29 +304,12 @@ jobs:
           # has no version table yet and is always compatible; anything else
           # that prevents reading the version fails the gate closed.
           probe="control-schema-check-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          kubectl \
-            --kubeconfig "$RUNNER_TEMP/kubeconfig" \
-            --namespace cats \
-            delete pod "$probe" --ignore-not-found >/dev/null 2>&1 || true
           set +e
           query_output="$(
-            kubectl \
-              --kubeconfig "$RUNNER_TEMP/kubeconfig" \
-              --namespace cats \
-              run "$probe" \
-              --restart=Never --rm --attach --quiet \
-              --image=postgres:16 \
-              --overrides='{
-                "spec": {
-                  "containers": [{
-                    "name": "psql",
-                    "image": "postgres:16",
-                    "command": ["sh", "-c",
-                      "psql \"$CATS_POSTGRES_URL\" -v ON_ERROR_STOP=1 -tA -c \"SELECT version FROM control_schema_version\" 2>&1"],
-                    "envFrom": [{"secretRef": {"name": "cats-runtime"}}]
-                  }]
-                }
-              }'
+            deploy/aws/run-control-schema-probe.sh \
+              "$RUNNER_TEMP/kubeconfig" \
+              cats \
+              "$probe"
           )"
           query_status=$?
           set -e
