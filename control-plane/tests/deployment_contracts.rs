@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 const SCHEMA_PATH: &str = "control-plane/src/store/schema.rs";
 const SCHEMA_VERSION_PATTERN: &str = r"s/^(pub\(super\)[[:space:]]+)?const[[:space:]]+SCHEMA_VERSION:[[:space:]]+i64[[:space:]]+=[[:space:]]+([0-9]+);$/\2/p";
 const OLDEST_MIGRATABLE_PATTERN: &str = r"s/^(pub\(super\)[[:space:]]+)?const[[:space:]]+OLDEST_MIGRATABLE_SCHEMA_VERSION:[[:space:]]+i64[[:space:]]+=[[:space:]]+([0-9]+);$/\2/p";
@@ -60,6 +63,7 @@ fn production_deploy_extracts_versions_from_the_current_store_schema() {
 #[test]
 fn production_schema_probe_fails_closed() {
     let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
+    let runner = read_workspace_file("deploy/aws/run-control-schema-probe.sh");
     let probe = workflow
         .split("# The control store lives in PostgreSQL.")
         .nth(1)
@@ -67,7 +71,17 @@ fn production_schema_probe_fails_closed() {
         .expect("control schema probe block");
 
     assert!(probe.contains("query_status=$?"));
-    assert!(probe.contains("-v ON_ERROR_STOP=1"));
+    assert!(probe.contains("deploy/aws/run-control-schema-probe.sh"));
+    assert!(runner.contains("-v ON_ERROR_STOP=1"));
+    assert!(runner.contains("logs \"$probe\" --container=psql"));
+    assert!(runner.contains("state.terminated.exitCode"));
+    assert!(
+        !runner
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .any(|line| line.contains("--attach")),
+        "the schema probe must not attach to the short-lived container"
+    );
     assert!(probe.contains(r#"relation "control_schema_version" does not exist"#));
     assert!(
         !probe.contains("2>/dev/null || true"),
@@ -76,6 +90,68 @@ fn production_schema_probe_fails_closed() {
     assert!(
         !probe.contains("[[ -z \"$query_output\""),
         "an empty probe response is a failure, not an empty database"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn production_schema_probe_does_not_duplicate_a_known_positive() {
+    let fixture = tempfile::tempdir().expect("schema probe fixture");
+    let fake_kubectl = fixture.path().join("kubectl");
+    let calls = fixture.path().join("calls");
+    std::fs::write(
+        &fake_kubectl,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$FAKE_KUBECTL_CALLS"
+case " $* " in
+  *" delete pod "*) exit 0 ;;
+  *" run "*)
+    if [[ " $* " == *" --attach "* ]]; then
+      printf '1\n1\n'
+    fi
+    exit 0
+    ;;
+  *" get pod "*".status.phase"*) printf 'Succeeded' ;;
+  *" logs "*) printf '1\n' ;;
+  *" get pod "*"state.terminated.exitCode"*) printf '0' ;;
+  *) echo "unexpected kubectl call: $*" >&2; exit 97 ;;
+esac
+"#,
+    )
+    .expect("write fake kubectl");
+    let mut permissions = std::fs::metadata(&fake_kubectl)
+        .expect("fake kubectl metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_kubectl, permissions).expect("make fake kubectl executable");
+
+    let inherited_path = std::env::var("PATH").expect("PATH");
+    let output = Command::new("bash")
+        .arg(workspace_root().join("deploy/aws/run-control-schema-probe.sh"))
+        .args(["fixture-kubeconfig", "cats", "schema-probe"])
+        .env(
+            "PATH",
+            format!("{}:{inherited_path}", fixture.path().display()),
+        )
+        .env("FAKE_KUBECTL_CALLS", &calls)
+        .output()
+        .expect("run schema probe against known-positive fixture");
+
+    assert!(
+        output.status.success(),
+        "probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"1\n");
+    let calls = std::fs::read_to_string(calls).expect("read fake kubectl calls");
+    assert_eq!(
+        calls.lines().filter(|call| call.contains(" logs ")).count(),
+        1
+    );
+    assert!(
+        !calls.contains("--attach"),
+        "attach fallback can duplicate the known-positive output: {calls}"
     );
 }
 
