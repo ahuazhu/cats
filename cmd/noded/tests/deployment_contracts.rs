@@ -74,6 +74,32 @@ fn production_aws_worker_joins_initially_cordoned() {
 }
 
 #[test]
+fn production_platform_example_keeps_two_workers_in_distinct_subnets() {
+    let variables =
+        read_workspace_file("deploy/aws/terraform/stacks/platform/platform.tfvars.example");
+    let variables = variables.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        variables.contains("metal_worker_instance_count = 2"),
+        "the production example must retain worker capacity after one bare-metal host is lost"
+    );
+    assert!(
+        variables.contains("metal_worker_names = [\"cats-metal-1\", \"cats-metal-2\"]"),
+        "the worker fleet needs stable, distinct node identities"
+    );
+
+    let platform = read_workspace_file("deploy/aws/terraform/stacks/platform/main.tf")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        platform.contains(
+            "subnet_id = module.network.private_subnet_ids[count.index % length(module.network.private_subnet_ids)]"
+        ),
+        "bare-metal workers must be distributed across the configured private subnets"
+    );
+}
+
+#[test]
 fn guest_image_installs_real_systemd_units_with_early_agent_readiness() {
     let builder = read_workspace_file("deploy/metal/build-guest-image.sh");
     for required in [
