@@ -22,7 +22,7 @@ use cats_api::requests::*;
 use cats_api::resources::*;
 use cats_control_plane::controller::AutoTierPolicy;
 use cats_control_plane::server::{spawn, Config, Handle};
-use cats_control_plane::store::Store;
+use cats_control_plane::store::{DsnSource, Store};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::{
     deterministic_event_id, AttributedCheckpoint, IngestOutcome, SqliteUsageStore, UsageAttribution,
@@ -51,6 +51,14 @@ struct StubNode {
     /// models the ambiguous boundary where the Host is already serving the
     /// Guest but the control plane never receives the successful job result.
     lose_start_responses_remaining: Arc<AtomicUsize>,
+    /// Hold selected lifecycle HTTP responses after their result has been
+    /// computed. Successful results are journaled by job id first, matching
+    /// NodeRuntime's ambiguous-success boundary during a reconciler handoff;
+    /// failed results are deliberately not journaled and are re-executed.
+    hold_job_responses_remaining: Arc<Mutex<HashMap<String, usize>>>,
+    job_response_ready: Arc<tokio::sync::Notify>,
+    job_response_release: Arc<tokio::sync::Notify>,
+    applied_lifecycle_jobs: Arc<Mutex<HashMap<String, NodeJobResult>>>,
     started_volume_epochs: Arc<Mutex<Vec<(String, String, i64)>>>,
     storage_meta: Arc<dyn MetadataStore>,
     stop_dispositions: Arc<Mutex<Vec<StopCatDisposition>>>,
@@ -75,6 +83,33 @@ impl StubNode {
         self.alive.store(false, Ordering::SeqCst);
         let _idle = self.heartbeat_gate.write().await;
     }
+
+    fn hold_next_job_response(&self, kind: &str) {
+        self.hold_job_responses_remaining
+            .lock()
+            .unwrap()
+            .insert(kind.to_string(), 1);
+    }
+
+    async fn hold_job_response_if_requested(&self, kind: &str) {
+        let should_hold = self
+            .hold_job_responses_remaining
+            .lock()
+            .unwrap()
+            .get_mut(kind)
+            .is_some_and(|remaining| {
+                if *remaining == 0 {
+                    false
+                } else {
+                    *remaining -= 1;
+                    true
+                }
+            });
+        if should_hold {
+            self.job_response_ready.notify_one();
+            self.job_response_release.notified().await;
+        }
+    }
 }
 
 async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Response {
@@ -83,6 +118,22 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Res
         .lock()
         .unwrap()
         .push(job.action.kind().to_string());
+    if matches!(
+        &job.action,
+        NodeJobAction::SuspendCat { .. }
+            | NodeJobAction::WarmCat { .. }
+            | NodeJobAction::StopCat { .. }
+    ) {
+        if let Some(result) = node
+            .applied_lifecycle_jobs
+            .lock()
+            .unwrap()
+            .get(&job.job_id)
+            .cloned()
+        {
+            return Json(result).into_response();
+        }
+    }
     if let NodeJobAction::StopCat { disposition, .. } = &job.action {
         node.stop_dispositions
             .lock()
@@ -109,13 +160,14 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Res
             .get(job.action.cat_id())
             .copied()
             .unwrap_or(ObservedState::Failed);
-        return Json(NodeJobResult::fail(
+        let result = NodeJobResult::fail(
             job.job_id,
             observed,
             format!("injected {kind} failure"),
             true,
-        ))
-        .into_response();
+        );
+        node.hold_job_response_if_requested(&kind).await;
+        return Json(result).into_response();
     }
     let lose_start_response = matches!(&job.action, NodeJobAction::StartCat { .. })
         && node
@@ -153,11 +205,13 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Res
         NodeJobAction::SyncCat { cat_id } => (cat_id.clone(), ObservedState::Running),
         NodeJobAction::CleanupCat { cat_id } => (cat_id.clone(), ObservedState::Cold),
     };
-    let mut cats = node.cats.lock().unwrap();
-    if observed == ObservedState::Cold {
-        cats.remove(&cat_id);
-    } else {
-        cats.insert(cat_id, observed);
+    {
+        let mut cats = node.cats.lock().unwrap();
+        if observed == ObservedState::Cold {
+            cats.remove(&cat_id);
+        } else {
+            cats.insert(cat_id, observed);
+        }
     }
     if lose_start_response {
         (
@@ -166,7 +220,20 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Res
         )
             .into_response()
     } else {
-        Json(NodeJobResult::ok(job.job_id, observed)).into_response()
+        let result = NodeJobResult::ok(&job.job_id, observed);
+        if matches!(
+            &job.action,
+            NodeJobAction::SuspendCat { .. }
+                | NodeJobAction::WarmCat { .. }
+                | NodeJobAction::StopCat { .. }
+        ) {
+            node.applied_lifecycle_jobs
+                .lock()
+                .unwrap()
+                .insert(job.job_id.clone(), result.clone());
+            node.hold_job_response_if_requested(&kind).await;
+        }
+        Json(result).into_response()
     }
 }
 
@@ -244,6 +311,10 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
         exec_conflicts_remaining: Arc::new(AtomicUsize::new(0)),
         fail_jobs_remaining: Arc::new(Mutex::new(HashMap::new())),
         lose_start_responses_remaining: Arc::new(AtomicUsize::new(0)),
+        hold_job_responses_remaining: Arc::new(Mutex::new(HashMap::new())),
+        job_response_ready: Arc::new(tokio::sync::Notify::new()),
+        job_response_release: Arc::new(tokio::sync::Notify::new()),
+        applied_lifecycle_jobs: Arc::new(Mutex::new(HashMap::new())),
         started_volume_epochs: Arc::new(Mutex::new(Vec::new())),
         storage_meta: cp.state.storage_meta.clone(),
         stop_dispositions: Arc::new(Mutex::new(Vec::new())),
@@ -368,6 +439,7 @@ fn default_workspace_id(cp: &Handle) -> String {
 
 struct Ctx {
     _dir: tempfile::TempDir,
+    config: Config,
     cp: Handle,
     http: reqwest::Client,
     /// The bootstrap Account's default Workspace; resource routes key on its ID.
@@ -379,14 +451,28 @@ impl Ctx {
         Self::new_with_auto_tier(Default::default(), 200).await
     }
 
+    /// Keep tests that deliberately stall lifecycle work isolated from the
+    /// independent short-lease node-loss behavior covered elsewhere.
+    async fn new_with_stable_node_lease() -> Self {
+        Self::new_with_options(Default::default(), 200, 30_000).await
+    }
+
     async fn new_with_auto_tier(
         auto_tier_policy: AutoTierPolicy,
         reconcile_interval_ms: u64,
     ) -> Self {
+        Self::new_with_options(auto_tier_policy, reconcile_interval_ms, 3_000).await
+    }
+
+    async fn new_with_options(
+        auto_tier_policy: AutoTierPolicy,
+        reconcile_interval_ms: u64,
+        node_lease_timeout_ms: i64,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let storage_meta: Arc<dyn MetadataStore> =
             Arc::new(SqliteMetadataStore::open(&dir.path().join("storage-meta.db")).unwrap());
-        let cp = spawn(Config {
+        let config = Config {
             listen: "127.0.0.1:0".into(),
             control_store_dsn: cats_control_plane::store::DsnSource::Literal(
                 cats_control_plane::testsupport::isolated_control_store_url(),
@@ -400,13 +486,12 @@ impl Ctx {
             workos: None,
             stripe: None,
             billing_enforcement_enabled: true,
-            node_lease_timeout_ms: 3_000,
+            node_lease_timeout_ms,
             reconcile_interval_ms,
             oci_deploy_sync_wait_ms: 5_000,
             auto_tier_policy,
-        })
-        .await
-        .unwrap();
+        };
+        let cp = spawn(config.clone()).await.unwrap();
         let workspace_id = default_workspace_id(&cp);
         // These tests run with billing enforcement on. An Organization Account
         // gets no signup grant — only a user's Personal Account does — so the
@@ -429,6 +514,7 @@ impl Ctx {
             .unwrap();
         Self {
             _dir: dir,
+            config,
             cp,
             http: reqwest::Client::new(),
             workspace_id,
@@ -1014,6 +1100,546 @@ async fn two_api_replicas_linearize_create_start_and_delete() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconciler_handoff_replays_persisted_suspending_with_the_same_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let control_store_url = cats_control_plane::testsupport::isolated_control_store_url();
+    let usage: Arc<SqliteUsageStore> =
+        Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap());
+    let storage_meta: Arc<dyn MetadataStore> =
+        Arc::new(SqliteMetadataStore::open(&dir.path().join("storage-meta.db")).unwrap());
+    let config = Config {
+        listen: "127.0.0.1:0".into(),
+        control_store_dsn: cats_control_plane::store::DsnSource::Literal(control_store_url),
+        control_store_ca_file: None,
+        usage_store: usage.clone(),
+        credit_store: usage,
+        storage_meta,
+        auth_token: SERVICE_TOKEN.into(),
+        admin_token: "dev-admin-token".into(),
+        workos: None,
+        stripe: None,
+        billing_enforcement_enabled: false,
+        node_lease_timeout_ms: 30_000,
+        reconcile_interval_ms: 25,
+        oci_deploy_sync_wait_ms: 5_000,
+        auto_tier_policy: Default::default(),
+    };
+    let first = spawn(config.clone()).await.unwrap();
+    let node = start_stub_node(&first, "node_suspend_handoff").await;
+    let workspace_id = default_workspace_id(&first);
+    let http = reqwest::Client::new();
+    let cats_path = format!("/v1/workspaces/{workspace_id}/cats");
+    let created: CatOperationResponse = http
+        .post(format!("{}{cats_path}", first.base_url()))
+        .bearer_auth("dev-admin-token")
+        .json(&serde_json::json!({
+            "name": "handoff-suspend",
+            "image": "ubuntu-24.04",
+            "cpus": 2,
+            "memory_mib": 1024,
+            "root_size_bytes": 8 << 20,
+            "disk": null
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let cat = first
+                .state
+                .store
+                .must_get_cat_by_id(&created.cat.id)
+                .unwrap();
+            if cat.observed_state == ObservedState::Running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("first reconciler should start the Cat");
+
+    // Keep heartbeats from publishing the node's already-applied state. The
+    // database must remain at the exact ambiguous boundary the replacement
+    // reconciler inherits: desired Suspended, observed Suspending.
+    node.quiesce().await;
+    node.hold_next_job_response("suspend_cat");
+    let suspended: CatOperationResponse = http
+        .post(format!(
+            "{}{cats_path}/{}/actions/suspend",
+            first.base_url(),
+            created.cat.id
+        ))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .expect("the first leader never dispatched SuspendCat");
+    let transitional = first
+        .state
+        .store
+        .must_get_cat_by_id(&created.cat.id)
+        .unwrap();
+    assert_eq!(transitional.desired_state, DesiredState::Suspended);
+    assert_eq!(transitional.observed_state, ObservedState::Suspending);
+    assert_eq!(
+        first
+            .state
+            .store
+            .get_operation(&suspended.operation.id)
+            .unwrap()
+            .phase,
+        OperationPhase::Pending
+    );
+
+    // A second replica starts while the old leader is still waiting for the
+    // response, then takes the PostgreSQL singleton lock after that task is
+    // aborted. The node has already journaled success, so replaying the same
+    // deterministic job returns without applying SuspendCat twice.
+    let second = spawn(config).await.unwrap();
+    first.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let cat = second
+                .state
+                .store
+                .must_get_cat_by_id(&created.cat.id)
+                .unwrap();
+            let operation = second
+                .state
+                .store
+                .get_operation(&suspended.operation.id)
+                .unwrap();
+            if cat.observed_state == ObservedState::Suspended
+                && operation.phase == OperationPhase::Succeeded
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("replacement reconciler did not recover persisted Suspending");
+
+    let suspend_jobs: Vec<_> = node
+        .jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|job_id| job_id.contains("_suspend_cat"))
+        .cloned()
+        .collect();
+    assert_eq!(suspend_jobs.len(), 2, "handoff did not replay SuspendCat");
+    assert_eq!(
+        suspend_jobs[0], suspend_jobs[1],
+        "handoff changed the deterministic SuspendCat job id"
+    );
+    assert_eq!(
+        node.applied_lifecycle_jobs.lock().unwrap().len(),
+        1,
+        "the node applied the replayed SuspendCat twice"
+    );
+    node.job_response_release.notify_waiters();
+}
+
+async fn wait_for_persisted_transition(
+    cp: &Handle,
+    cat_id: &str,
+    operation_id: &str,
+    observed: ObservedState,
+    phase: OperationPhase,
+) -> Cat {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let cat = cp.state.store.must_get_cat_by_id(cat_id).unwrap();
+            let operation = cp.state.store.get_operation(operation_id).unwrap();
+            if cat.observed_state == observed && operation.phase == phase {
+                return cat;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("timed out waiting for {cat_id} to reach {observed:?} with operation {phase:?}")
+    })
+}
+
+fn lifecycle_job_ids(node: &StubNode, action: &str) -> Vec<String> {
+    node.jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|job_id| job_id.ends_with(action))
+        .cloned()
+        .collect()
+}
+
+fn assert_one_applied_lifecycle_job(node: &StubNode, action: &str) {
+    assert_eq!(
+        node.applied_lifecycle_jobs
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|job_id| job_id.ends_with(action))
+            .count(),
+        1,
+        "the node applied {action} more than once"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconciler_handoff_replays_persisted_warming_success_once() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_warm_handoff").await;
+    let created = ctx.create_cat("handoff-warm", None).await;
+    ctx.wait_observed("handoff-warm", ObservedState::Running)
+        .await;
+    let suspend = ctx.action("handoff-warm", "suspend").await;
+    ctx.wait_operation(&suspend.operation.id).await;
+    let suspended = ctx
+        .wait_observed("handoff-warm", ObservedState::Suspended)
+        .await;
+
+    node.quiesce().await;
+    node.hold_next_job_response("warm_cat");
+    let warm = ctx.action("handoff-warm", "warm").await;
+    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .expect("the first leader never dispatched WarmCat");
+    let transitional = ctx
+        .cp
+        .state
+        .store
+        .must_get_cat_by_id(&created.cat.id)
+        .unwrap();
+    assert_eq!(transitional.desired_state, DesiredState::Warm);
+    assert_eq!(transitional.observed_state, ObservedState::Warming);
+    assert_eq!(transitional.node_id, suspended.node_id);
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .get_operation(&warm.operation.id)
+            .unwrap()
+            .phase,
+        OperationPhase::Pending
+    );
+
+    let second = spawn(ctx.config.clone()).await.unwrap();
+    ctx.cp.shutdown();
+    let converged = wait_for_persisted_transition(
+        &second,
+        &created.cat.id,
+        &warm.operation.id,
+        ObservedState::Warm,
+        OperationPhase::Succeeded,
+    )
+    .await;
+    assert_eq!(converged.node_id, suspended.node_id);
+
+    let jobs = lifecycle_job_ids(&node, "_warm_cat");
+    assert_eq!(jobs.len(), 2, "handoff did not replay WarmCat");
+    assert!(jobs.iter().all(|job_id| job_id == &jobs[0]));
+    assert_one_applied_lifecycle_job(&node, "_warm_cat");
+    node.job_response_release.notify_waiters();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconciler_handoff_replays_persisted_stopping_success_once() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_stop_handoff").await;
+    let created = ctx.create_cat("handoff-stop", None).await;
+    let running = ctx
+        .wait_observed("handoff-stop", ObservedState::Running)
+        .await;
+
+    node.quiesce().await;
+    node.hold_next_job_response("stop_cat");
+    let stop = ctx.action("handoff-stop", "stop").await;
+    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .expect("the first leader never dispatched StopCat");
+    let transitional = ctx
+        .cp
+        .state
+        .store
+        .must_get_cat_by_id(&created.cat.id)
+        .unwrap();
+    assert_eq!(transitional.desired_state, DesiredState::Cold);
+    assert_eq!(transitional.observed_state, ObservedState::Stopping);
+    assert_eq!(transitional.node_id, running.node_id);
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .get_operation(&stop.operation.id)
+            .unwrap()
+            .phase,
+        OperationPhase::Pending
+    );
+
+    let second = spawn(ctx.config.clone()).await.unwrap();
+    ctx.cp.shutdown();
+    let converged = wait_for_persisted_transition(
+        &second,
+        &created.cat.id,
+        &stop.operation.id,
+        ObservedState::Cold,
+        OperationPhase::Succeeded,
+    )
+    .await;
+    assert!(converged.node_id.is_none());
+
+    let jobs = lifecycle_job_ids(&node, "_stop_cat");
+    assert_eq!(jobs.len(), 2, "handoff did not replay StopCat");
+    assert!(jobs.iter().all(|job_id| job_id == &jobs[0]));
+    assert_one_applied_lifecycle_job(&node, "_stop_cat");
+    node.job_response_release.notify_waiters();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconciler_handoff_failed_warm_replay_restores_suspended_source() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_warm_failure_handoff").await;
+    let created = ctx.create_cat("handoff-warm-failure", None).await;
+    ctx.wait_observed("handoff-warm-failure", ObservedState::Running)
+        .await;
+    let suspend = ctx.action("handoff-warm-failure", "suspend").await;
+    ctx.wait_operation(&suspend.operation.id).await;
+    let suspended = ctx
+        .wait_observed("handoff-warm-failure", ObservedState::Suspended)
+        .await;
+
+    node.quiesce().await;
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("warm_cat".into(), usize::MAX);
+    node.hold_next_job_response("warm_cat");
+    let warm = ctx.action("handoff-warm-failure", "warm").await;
+    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .expect("the first leader never reached the failed WarmCat response");
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .must_get_cat_by_id(&created.cat.id)
+            .unwrap()
+            .observed_state,
+        ObservedState::Warming
+    );
+
+    let second = spawn(ctx.config.clone()).await.unwrap();
+    ctx.cp.shutdown();
+    let retained = wait_for_persisted_transition(
+        &second,
+        &created.cat.id,
+        &warm.operation.id,
+        ObservedState::Suspended,
+        OperationPhase::Pending,
+    )
+    .await;
+    assert_eq!(retained.node_id, suspended.node_id);
+
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("warm_cat".into(), 0);
+    wait_for_persisted_transition(
+        &second,
+        &created.cat.id,
+        &warm.operation.id,
+        ObservedState::Warm,
+        OperationPhase::Succeeded,
+    )
+    .await;
+    let jobs = lifecycle_job_ids(&node, "_warm_cat");
+    assert!(jobs.len() >= 3, "failed handoff did not retry WarmCat");
+    assert!(jobs.iter().all(|job_id| job_id == &jobs[0]));
+    assert_one_applied_lifecycle_job(&node, "_warm_cat");
+    node.job_response_release.notify_waiters();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconciler_handoff_failed_stop_replay_restores_running_source() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_stop_failure_handoff").await;
+    let created = ctx.create_cat("handoff-stop-failure", None).await;
+    let running = ctx
+        .wait_observed("handoff-stop-failure", ObservedState::Running)
+        .await;
+
+    node.quiesce().await;
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("stop_cat".into(), usize::MAX);
+    node.hold_next_job_response("stop_cat");
+    let stop = ctx.action("handoff-stop-failure", "stop").await;
+    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
+        .await
+        .expect("the first leader never reached the failed StopCat response");
+    assert_eq!(
+        ctx.cp
+            .state
+            .store
+            .must_get_cat_by_id(&created.cat.id)
+            .unwrap()
+            .observed_state,
+        ObservedState::Stopping
+    );
+
+    let second = spawn(ctx.config.clone()).await.unwrap();
+    ctx.cp.shutdown();
+    let retained = wait_for_persisted_transition(
+        &second,
+        &created.cat.id,
+        &stop.operation.id,
+        ObservedState::Running,
+        OperationPhase::Pending,
+    )
+    .await;
+    assert_eq!(retained.node_id, running.node_id);
+
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("stop_cat".into(), 0);
+    let cold = wait_for_persisted_transition(
+        &second,
+        &created.cat.id,
+        &stop.operation.id,
+        ObservedState::Cold,
+        OperationPhase::Succeeded,
+    )
+    .await;
+    assert!(cold.node_id.is_none());
+    let jobs = lifecycle_job_ids(&node, "_stop_cat");
+    assert!(jobs.len() >= 3, "failed handoff did not retry StopCat");
+    assert!(jobs.iter().all(|job_id| job_id == &jobs[0]));
+    assert_one_applied_lifecycle_job(&node, "_stop_cat");
+    node.job_response_release.notify_waiters();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconciler_handoff_finishes_a_converged_operation_without_replaying_node_work() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_converged_operation_handoff").await;
+    let created = ctx.create_cat("handoff-converged-operation", None).await;
+    let running = ctx
+        .wait_observed("handoff-converged-operation", ObservedState::Running)
+        .await;
+    ctx.wait_operation(&created.operation.id).await;
+    assert_eq!(running.generation, created.operation.resource_generation);
+
+    // Simulate the exact crash boundary after the stable Cat row committed but
+    // before the matching operation did. Also seed an older operation, a
+    // future-generation operation, and an operation whose Cat row is gone so
+    // the recovery scan's generation and deletion boundaries are explicit.
+    ctx.cp.shutdown();
+    let dsn = match &ctx.config.control_store_dsn {
+        DsnSource::Literal(dsn) => dsn.clone(),
+        DsnSource::File(_) => panic!("the PostgreSQL test harness must use a literal DSN"),
+    };
+    let operation_id = created.operation.id.clone();
+    let cat_id = created.cat.id.clone();
+    let workspace_id = ctx.workspace_id.clone();
+    let generation = running.generation;
+    tokio::task::spawn_blocking(move || {
+        let mut client = postgres::Client::connect(&dsn, postgres::NoTls).unwrap();
+        client
+            .execute(
+                "UPDATE operations SET phase='pending' WHERE id=$1",
+                &[&operation_id],
+            )
+            .unwrap();
+        for (id, resource_id, resource_generation) in [
+            (
+                "op_handoff_historical",
+                cat_id.as_str(),
+                generation.saturating_sub(1),
+            ),
+            ("op_handoff_future", cat_id.as_str(), generation + 1),
+            ("op_handoff_deleted", "cat_handoff_deleted", generation),
+        ] {
+            client
+                .execute(
+                    "INSERT INTO operations (
+                        id, workspace_id, kind, resource_id, resource_generation,
+                        phase, created_at, updated_at
+                     ) VALUES ($1,$2,'cat.start',$3,$4,'pending',0,0)",
+                    &[&id, &workspace_id, &resource_id, &resource_generation],
+                )
+                .unwrap();
+        }
+    })
+    .await
+    .unwrap();
+
+    let jobs_before_handoff = node.jobs.lock().unwrap().clone();
+    let second = spawn(ctx.config.clone()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if second
+                .state
+                .store
+                .get_operation(&created.operation.id)
+                .unwrap()
+                .phase
+                == OperationPhase::Succeeded
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the replacement reconciler left the converged operation pending");
+
+    assert_eq!(
+        node.jobs.lock().unwrap().as_slice(),
+        jobs_before_handoff.as_slice(),
+        "operation recovery repeated already-converged node work"
+    );
+    assert_eq!(
+        second
+            .state
+            .store
+            .get_operation("op_handoff_historical")
+            .unwrap()
+            .phase,
+        OperationPhase::Succeeded,
+        "a superseded historical operation should not remain pending forever"
+    );
+    for operation_id in ["op_handoff_future", "op_handoff_deleted"] {
+        assert_eq!(
+            second
+                .state
+                .store
+                .get_operation(operation_id)
+                .unwrap()
+                .phase,
+            OperationPhase::Pending,
+            "recovery crossed its Cat generation or deletion boundary"
+        );
+    }
+}
+
 #[tokio::test]
 async fn lifecycle_stop_start_suspend_resume() {
     let ctx = Ctx::new().await;
@@ -1043,7 +1669,7 @@ async fn lifecycle_stop_start_suspend_resume() {
 
 #[tokio::test]
 async fn failed_mandatory_stop_drain_retains_source_until_retry_succeeds() {
-    let ctx = Ctx::new().await;
+    let ctx = Ctx::new_with_stable_node_lease().await;
     let node = start_stub_node(&ctx.cp, "node_a").await;
     ctx.create_cat("drain-safe", None).await;
     let running = ctx
@@ -1083,7 +1709,7 @@ async fn failed_mandatory_stop_drain_retains_source_until_retry_succeeds() {
 
 #[tokio::test]
 async fn failed_warm_drain_keeps_the_host_bound_source_for_retry() {
-    let ctx = Ctx::new().await;
+    let ctx = Ctx::new_with_stable_node_lease().await;
     let node = start_stub_node(&ctx.cp, "node_a").await;
     ctx.create_cat("warm-safe", None).await;
     ctx.wait_observed("warm-safe", ObservedState::Running).await;
@@ -1761,6 +2387,109 @@ async fn control_plane_startup_grace_preserves_a_reconnecting_host_bound_cat() {
         cp.state.store.get_node("node_a").unwrap().state,
         NodeState::Ready
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_warm_after_physical_completion_keeps_the_durable_replay_boundary() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_warm_post_completion_failure").await;
+    let created = ctx.create_cat("warm-post-completion-failure", None).await;
+    ctx.wait_observed("warm-post-completion-failure", ObservedState::Running)
+        .await;
+    let suspend = ctx.action("warm-post-completion-failure", "suspend").await;
+    ctx.wait_operation(&suspend.operation.id).await;
+    let suspended = ctx
+        .wait_observed("warm-post-completion-failure", ObservedState::Suspended)
+        .await;
+
+    // Model WarmCat reaching Warm before mandatory final usage retirement
+    // fails. The result cannot safely be treated as either a successful Warm
+    // or a rollback to Suspended.
+    node.cats
+        .lock()
+        .unwrap()
+        .insert(created.cat.id.clone(), ObservedState::Warm);
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("warm_cat".into(), usize::MAX);
+    let warm = ctx.action("warm-post-completion-failure", "warm").await;
+    let retained = wait_for_persisted_transition(
+        &ctx.cp,
+        &created.cat.id,
+        &warm.operation.id,
+        ObservedState::Warming,
+        OperationPhase::Pending,
+    )
+    .await;
+    assert_eq!(retained.node_id, suspended.node_id);
+
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("warm_cat".into(), 0);
+    wait_for_persisted_transition(
+        &ctx.cp,
+        &created.cat.id,
+        &warm.operation.id,
+        ObservedState::Warm,
+        OperationPhase::Succeeded,
+    )
+    .await;
+    let jobs = lifecycle_job_ids(&node, "_warm_cat");
+    assert!(jobs.len() >= 2, "failed WarmCat was not replayed");
+    assert!(jobs.iter().all(|job_id| job_id == &jobs[0]));
+    assert_one_applied_lifecycle_job(&node, "_warm_cat");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_stop_after_physical_completion_keeps_drain_fail_closed() {
+    let ctx = Ctx::new_with_stable_node_lease().await;
+    let node = start_stub_node(&ctx.cp, "node_stop_post_completion_failure").await;
+    let created = ctx.create_cat("stop-post-completion-failure", None).await;
+    let running = ctx
+        .wait_observed("stop-post-completion-failure", ObservedState::Running)
+        .await;
+
+    // Model StopCat reaching Cold before its mandatory remote drain reports a
+    // failure. Placement and fencing must remain fail-closed until a retry
+    // returns success.
+    node.cats
+        .lock()
+        .unwrap()
+        .insert(created.cat.id.clone(), ObservedState::Cold);
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("stop_cat".into(), usize::MAX);
+    let stop = ctx.action("stop-post-completion-failure", "stop").await;
+    let retained = wait_for_persisted_transition(
+        &ctx.cp,
+        &created.cat.id,
+        &stop.operation.id,
+        ObservedState::Stopping,
+        OperationPhase::Pending,
+    )
+    .await;
+    assert_eq!(retained.node_id, running.node_id);
+
+    node.fail_jobs_remaining
+        .lock()
+        .unwrap()
+        .insert("stop_cat".into(), 0);
+    let cold = wait_for_persisted_transition(
+        &ctx.cp,
+        &created.cat.id,
+        &stop.operation.id,
+        ObservedState::Cold,
+        OperationPhase::Succeeded,
+    )
+    .await;
+    assert!(cold.node_id.is_none());
+    let jobs = lifecycle_job_ids(&node, "_stop_cat");
+    assert!(jobs.len() >= 2, "failed StopCat was not replayed");
+    assert!(jobs.iter().all(|job_id| job_id == &jobs[0]));
+    assert_one_applied_lifecycle_job(&node, "_stop_cat");
 }
 
 #[tokio::test]
@@ -3176,7 +3905,7 @@ async fn a_running_claim_missing_from_the_inventory_still_holds_the_node_lost() 
 /// `exec` on an unrelated Cat went from milliseconds to over a minute.
 #[tokio::test]
 async fn a_persistently_failing_stop_backs_off_instead_of_spinning() {
-    let ctx = Ctx::new().await;
+    let ctx = Ctx::new_with_stable_node_lease().await;
     let node = start_stub_node(&ctx.cp, "node_a").await;
     ctx.create_cat("wedged", None).await;
     let cat = ctx.wait_observed("wedged", ObservedState::Running).await;
@@ -3474,7 +4203,7 @@ async fn a_drain_stops_agent_reported_orphans_before_cordoning() {
 /// the injected recovery below stands in for it.
 #[tokio::test]
 async fn a_drain_with_an_unstoppable_orphan_stays_draining_and_backs_off() {
-    let ctx = Ctx::new().await;
+    let ctx = Ctx::new_with_stable_node_lease().await;
     let node = start_stub_node(&ctx.cp, "node_a").await;
     node.fail_jobs_remaining
         .lock()

@@ -693,18 +693,38 @@ impl Store {
         })
     }
 
-    /// Cats whose desired/observed disagree (work for the reconciler).
+    /// Cats whose desired/observed disagree, plus converged Cats whose current
+    /// generation still has an unfinished operation after a leader crash.
     pub fn cats_needing_work(&self) -> Result<Vec<Cat>> {
         self.with(|client| {
             client
                 .query(
-                    "SELECT * FROM cats WHERE
-                       (desired_state='running'   AND observed_state NOT IN ('running'))
-                    OR (desired_state='suspended' AND observed_state NOT IN ('suspended'))
-                    OR (desired_state='warm'      AND observed_state NOT IN ('warm'))
-                    OR (desired_state='cold'      AND observed_state NOT IN ('cold'))
-                    OR (desired_state='deleted'   AND observed_state NOT IN ('deleted'))
-                    ORDER BY created_at",
+                    "SELECT c.* FROM cats c WHERE
+                       (c.desired_state='running'   AND c.observed_state NOT IN ('running'))
+                    OR (c.desired_state='suspended' AND c.observed_state NOT IN ('suspended'))
+                    OR (c.desired_state='warm'      AND c.observed_state NOT IN ('warm'))
+                    OR (c.desired_state='cold'      AND c.observed_state NOT IN ('cold'))
+                    OR (c.desired_state='deleted'   AND c.observed_state NOT IN ('deleted'))
+                    OR (
+                        ((c.desired_state='running' AND c.observed_state='running')
+                         OR (c.desired_state='suspended' AND c.observed_state='suspended')
+                         OR (c.desired_state='warm' AND c.observed_state='warm')
+                         OR (c.desired_state='cold' AND c.observed_state='cold'))
+                        AND EXISTS (
+                            SELECT 1 FROM operations o
+                             WHERE o.resource_id=c.id
+                               AND o.resource_generation=c.generation
+                               AND o.phase IN ('pending','running')
+                               AND o.kind IN (
+                                   'cat.create', 'cat.start', 'cat.resume',
+                                   'cat.suspend', 'cat.warm', 'cat.stop', 'cat.delete',
+                                   'cat.auto_suspend', 'cat.auto_warm', 'cat.auto_cold',
+                                   'cat.work_wake', 'cat.wake',
+                                   'cat.credit_exhausted', 'cat.expire'
+                               )
+                        )
+                    )
+                    ORDER BY c.created_at",
                     &[],
                 )?
                 .iter()

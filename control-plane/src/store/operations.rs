@@ -154,6 +154,33 @@ impl Store {
         })
     }
 
+    /// Unfinished desired-state operations that the lifecycle reconciler owns.
+    ///
+    /// OCI deploy operations also use the Cat id and generation, but their
+    /// worker owns their result and terminal phase. A stable Cat must never
+    /// make such an operation succeed before its deployment result commits.
+    pub fn pending_lifecycle_operations_for(&self, resource_id: &str) -> Result<Vec<Operation>> {
+        self.with(|client| {
+            client
+                .query(
+                    "SELECT * FROM operations
+                      WHERE resource_id=$1
+                        AND phase IN ('pending','running')
+                        AND kind IN (
+                            'cat.create', 'cat.start', 'cat.resume',
+                            'cat.suspend', 'cat.warm', 'cat.stop', 'cat.delete',
+                            'cat.auto_suspend', 'cat.auto_warm', 'cat.auto_cold',
+                            'cat.work_wake', 'cat.wake',
+                            'cat.credit_exhausted', 'cat.expire'
+                        )",
+                    &[&resource_id],
+                )?
+                .iter()
+                .map(row_to_operation)
+                .collect::<std::result::Result<Vec<_>, postgres::Error>>()
+        })
+    }
+
     /// Move a freshly created operation to `Running`.
     ///
     /// Lets a poller tell "accepted, not started" from "in flight", which for a

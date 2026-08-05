@@ -7,6 +7,7 @@ use ledger::CatLedgerRecord;
 mod adoption;
 mod ledger_writes;
 mod residue_sweep;
+mod suspend_concurrency;
 
 // ---------------------------------------------------------------------------
 // Real-Cat harness

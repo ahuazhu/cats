@@ -349,12 +349,13 @@ fn warm_state_file(cat_dir: &Path) -> PathBuf {
 pub struct NodeRuntime {
     pub cfg: NodeConfig,
     /// Conservative node-wide serialization for lifecycle/hot-plug paths that
-    /// have not yet been made concurrent, plus kernel-NBD allocation. Stop and
-    /// Resume are explicitly exempt; every action still holds its per-Cat lock.
+    /// have not yet been made concurrent, plus kernel-NBD allocation. Stop,
+    /// Suspend and Resume are explicitly exempt; every action still holds its
+    /// per-Cat lock.
     ops: Mutex<()>,
-    /// Per-Cat execution locks for the concurrent wake path. Keeps the
+    /// Per-Cat execution locks for concurrent lifecycle paths. Keeps the
     /// existing "one job per Cat at a time" idempotency guarantee while
-    /// dropping the node-wide serialization.
+    /// dropping node-wide serialization where no node-global resource is used.
     cat_ops: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     cats: Mutex<HashMap<String, CatRuntime>>,
     /// On-disk mirror of `cats`, rewritten once per job after the final state

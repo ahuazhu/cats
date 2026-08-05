@@ -301,6 +301,9 @@ CREATE TABLE IF NOT EXISTS operations (
     created_at BIGINT NOT NULL,
     updated_at BIGINT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS operations_active_resource_generation
+ON operations(resource_id, resource_generation)
+WHERE phase IN ('pending','running');
 CREATE TABLE IF NOT EXISTS idempotency (
     key TEXT NOT NULL,
     route TEXT NOT NULL,

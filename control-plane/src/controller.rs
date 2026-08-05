@@ -446,6 +446,14 @@ impl Controller {
     }
 
     async fn reconcile_cat(&self, cat: &Cat) -> anyhow::Result<()> {
+        // Stable state and operation completion are separate transactions.
+        // A leader can disappear between them, so the Store deliberately
+        // returns a converged Cat whose current-generation operation is still
+        // active. Finish that operation without replaying physical node work.
+        if lifecycle_converged(cat) {
+            self.complete_ops_if_converged(&cat.id).await?;
+            return Ok(());
+        }
         // A source-preserving failure leaves the Cat exactly as it was, so the
         // next tick would re-dispatch the identical job. Honour its backoff
         // before doing anything, or a persistent failure spins.
@@ -486,11 +494,16 @@ impl Controller {
             }
             (D::Running, O::Suspended) => self.simple_transition(cat, "resume").await,
             (D::Running, O::Warm) => self.simple_transition(cat, "restore").await,
-            (D::Suspended, O::Running) => self.simple_transition(cat, "suspend").await,
-            (D::Warm, O::Running) => self.simple_transition(cat, "suspend").await,
-            (D::Warm, O::Suspended) => self.simple_transition(cat, "warm").await,
+            (D::Suspended | D::Warm, O::Running | O::Suspending) => {
+                // Suspending is the durable dispatch boundary. A reconciler
+                // leader can disappear after the node applied SuspendCat but
+                // before its response was recorded, so its successor must
+                // replay the same generation-derived job on the same node.
+                self.simple_transition(cat, "suspend").await
+            }
+            (D::Warm, O::Suspended | O::Warming) => self.simple_transition(cat, "warm").await,
             (D::Suspended, O::Warm) => self.simple_transition(cat, "restore").await,
-            (D::Cold, O::Running | O::Suspended | O::Warm | O::Starting) => {
+            (D::Cold, O::Running | O::Suspended | O::Warm | O::Starting | O::Stopping) => {
                 self.stop_flow(cat, StopCatDisposition::Cold).await
             }
             // Unknown clears when the owning node reports a complete,
@@ -691,7 +704,9 @@ impl Controller {
                 ),
                 _ => unreachable!("unknown transition"),
             };
-        self.store.set_observed(&cat.id, transitional)?;
+        if cat.observed_state != transitional {
+            self.store.set_observed(&cat.id, transitional)?;
+        }
         let job = NodeJob {
             job_id: nodejob::job_id(&cat.id, cat.generation, job_action.kind()),
             cat_generation: cat.generation,
@@ -727,21 +742,40 @@ impl Controller {
                 self.notify.notify_one();
                 Ok(())
             }
-            other if action == "warm" => {
-                let err = match other {
-                    Ok(res) => res.error.unwrap_or_default(),
-                    Err(e) => e.to_string(),
-                };
+            Ok(res) if action == "warm" => {
+                let err = res.error.unwrap_or_default();
                 // Warm creation is a source-preserving transition. In
                 // particular, a failed mandatory relaxed drain must keep the
                 // Host-local journal and lease alive for retry; a destructive
                 // Cold fallback here would turn a remote outage into data loss.
-                self.store.set_observed(&cat.id, cat.observed_state)?;
+                // Trust only the legal pre-Warm state reported by the node. A
+                // failure after the VM reached Warm must remain Warming so a
+                // later retry can finish the same generation-derived job.
+                let retained = if res.observed_state == ObservedState::Suspended {
+                    ObservedState::Suspended
+                } else {
+                    transitional
+                };
+                self.store.set_observed(&cat.id, retained)?;
+                let retry_in = self.defer_retry(cat);
+                tracing::warn!(
+                    cat = %cat.id,
+                    ?retained,
+                    retry_in_ms = retry_in.as_millis(),
+                    "warm transition failed: {err}; retaining source state for retry"
+                );
+                Ok(())
+            }
+            Err(e) if action == "warm" => {
+                // The node may have completed Warm before the response was
+                // lost. Preserve the durable dispatch boundary and replay the
+                // same job id; reverting to Suspended would claim more than the
+                // control plane knows.
                 let retry_in = self.defer_retry(cat);
                 tracing::warn!(
                     cat = %cat.id,
                     retry_in_ms = retry_in.as_millis(),
-                    "warm transition failed: {err}; retaining source state for retry"
+                    "warm dispatch failed: {e}; retaining Warming for retry"
                 );
                 Ok(())
             }
@@ -782,7 +816,9 @@ impl Controller {
             .list_nodes()?
             .into_iter()
             .find(|n| &n.id == node_id);
-        self.store.set_observed(&cat.id, ObservedState::Stopping)?;
+        if cat.observed_state != ObservedState::Stopping {
+            self.store.set_observed(&cat.id, ObservedState::Stopping)?;
+        }
         if let Some(node) = node {
             let job = NodeJob {
                 job_id: nodejob::job_id(&cat.id, cat.generation, "stop_cat"),
@@ -795,10 +831,21 @@ impl Controller {
             match self.dispatch(&node.agent_url, &job).await {
                 Ok(res) if res.phase == JobPhase::Succeeded => {}
                 Ok(res) => {
-                    self.store.set_observed(&cat.id, cat.observed_state)?;
+                    // Restore only a stable state that can be the source of a
+                    // StopCat request. Anything else may mean the Host stopped
+                    // the VM before returning a failed result, so retain the
+                    // durable Stopping boundary and retry the same job id.
+                    let retained = match res.observed_state {
+                        ObservedState::Running | ObservedState::Suspended | ObservedState::Warm => {
+                            res.observed_state
+                        }
+                        _ => ObservedState::Stopping,
+                    };
+                    self.store.set_observed(&cat.id, retained)?;
                     let retry_in = self.defer_retry(cat);
                     tracing::warn!(
                         cat = %cat.id,
+                        ?retained,
                         retry_in_ms = retry_in.as_millis(),
                         "stop job failed: {:?}; retaining source state for retry",
                         res.error
@@ -806,12 +853,14 @@ impl Controller {
                     return Ok(());
                 }
                 Err(e) => {
-                    self.store.set_observed(&cat.id, cat.observed_state)?;
+                    // A lost response is ambiguous: the node may have already
+                    // stopped the Cat. Keep Stopping so a successor replays the
+                    // deterministic job instead of asserting the stale source.
                     let retry_in = self.defer_retry(cat);
                     tracing::warn!(
                         cat = %cat.id,
                         retry_in_ms = retry_in.as_millis(),
-                        "stop dispatch failed: {e}; retaining source state for retry"
+                        "stop dispatch failed: {e}; retaining Stopping for retry"
                     );
                     return Ok(());
                 }
@@ -875,15 +924,8 @@ impl Controller {
 
     async fn complete_ops_if_converged(&self, cat_id: &str) -> anyhow::Result<()> {
         let cat = self.store.must_get_cat_by_id(cat_id)?;
-        let converged = matches!(
-            (cat.desired_state, cat.observed_state),
-            (DesiredState::Running, ObservedState::Running)
-                | (DesiredState::Suspended, ObservedState::Suspended)
-                | (DesiredState::Warm, ObservedState::Warm)
-                | (DesiredState::Cold, ObservedState::Cold)
-        );
-        if converged {
-            for op in self.store.pending_operations_for(cat_id)? {
+        if lifecycle_converged(&cat) {
+            for op in self.store.pending_lifecycle_operations_for(cat_id)? {
                 if op.resource_generation <= cat.generation {
                     self.store.finish_operation(&op.id, None)?;
                 }
@@ -891,6 +933,16 @@ impl Controller {
         }
         Ok(())
     }
+}
+
+fn lifecycle_converged(cat: &Cat) -> bool {
+    matches!(
+        (cat.desired_state, cat.observed_state),
+        (DesiredState::Running, ObservedState::Running)
+            | (DesiredState::Suspended, ObservedState::Suspended)
+            | (DesiredState::Warm, ObservedState::Warm)
+            | (DesiredState::Cold, ObservedState::Cold)
+    )
 }
 
 fn attempt_key(cat: &Cat) -> String {
