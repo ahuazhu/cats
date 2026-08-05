@@ -167,7 +167,13 @@ terminating owner and a same-node replacement fail closed. Zero, duplicate, or
 ambiguous owner mappings fail before disruption. The owner is resolved again
 at the disruption boundary. A policy/v1 Eviction makes the Kubernetes API
 atomically enforce both the PDB and selected Pod UID. All 240 public `/healthz`
-probes must succeed while Kubernetes replaces the Pod, and the workflow finally
+probes must succeed while Kubernetes replaces the Pod. They are launched on a
+fixed 250 ms schedule with bounded concurrency, so one request consuming its
+three-second timeout does not hide the following outage window. The retained
+artifact contains only timing/status/remote-address fields and an allowlist of
+edge correlation headers; it never stores a response body or arbitrary header.
+In parallel, strictly namespace- and selector-scoped watches retain bounded,
+sanitized Pod and EndpointSlice transition timelines. The workflow finally
 proves that two node-spread replicas and a new reconciler owner are present. It
 never force-deletes or scales the Deployment.
 

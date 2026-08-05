@@ -107,8 +107,8 @@ fn linux_quality_gate_installs_the_postgres_probe_runtime() {
         .expect("Linux quality-gate function");
 
     assert!(
-        linux_gate.contains("apt-get install -qy --no-install-recommends e2fsprogs jq"),
-        "the Linux gate must install jq before deployment probe fixtures execute"
+        linux_gate.contains("apt-get install -qy --no-install-recommends e2fsprogs jq python3"),
+        "the Linux gate must install jq and Python before deployment probe fixtures execute"
     );
 }
 
@@ -562,12 +562,16 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
         "deploy/aws/run-postgres-probe.sh",
         "deploy/aws/select-reconciler-owner.sh",
         "deploy/aws/evict-pod-with-uid.sh cats \"$target\" \"$target_uid\"",
+        "deploy/aws/capture-control-plane-ha-timeline.sh",
+        "deploy/aws/probe-public-health-fixed-rate.sh",
         "reconciler leadership changed before the disruption boundary",
         ".metadata.deletionTimestamp == null",
         ".status.phase == \"Running\"",
         "https://cats.run/healthz",
         "rollout status deployment/cats-controld",
         "All 240 public health probes succeeded",
+        "actions/upload-artifact@v4",
+        "if: always() && inputs.mode == 'disrupt'",
         "reconciler leadership did not move",
     ] {
         assert!(
@@ -621,6 +625,93 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
     );
     assert!(workflow.contains("observed_uid"));
     assert!(workflow.contains("target_uid"));
+    assert!(workflow.contains("replacement_status"));
+    let wait_for_probe = workflow
+        .find("wait \"$probe_pid\" || probe_status=$?")
+        .expect("the fixed-rate probe is joined on every replacement outcome");
+    let replacement_verdict = workflow
+        .find("if (( replacement_status != 0 ))")
+        .expect("the replacement command status is enforced after evidence collection");
+    assert!(
+        wait_for_probe < replacement_verdict,
+        "replacement failure must not bypass bounded probe evidence finalization"
+    );
+    assert!(workflow.contains("240 250 16 3 70000"));
+    assert!(workflow.contains("kubernetes-pods.ndjson"));
+    assert!(workflow.contains("kubernetes-endpointslices.ndjson"));
+    assert!(workflow.contains("if-no-files-found: warn"));
+    assert!(
+        !workflow.contains("sleep 0.25"),
+        "a serial sleep-after-curl loop recreates the outage-observation blind window"
+    );
+}
+
+#[test]
+fn production_ha_evidence_is_fixed_rate_bounded_and_sanitized() {
+    let probe = read_workspace_file("deploy/aws/probe-public-health-fixed-rate.sh");
+    let timeline = read_workspace_file("deploy/aws/capture-control-plane-ha-timeline.sh");
+
+    for expected in [
+        "https://cats.run/healthz",
+        "python3 -c 'import time; print(time.monotonic_ns() // 1_000_000)'",
+        "max_concurrency",
+        "deadline_ms",
+        "--max-time \"$request_timeout_seconds\"",
+        "--output /dev/null",
+        "public-health.tsv",
+        "http_code",
+        "remote_ip",
+        "time_connect",
+        "time_starttransfer",
+        "time_total",
+        "x-amzn-trace-id",
+        "x-amz-cf-id",
+    ] {
+        assert!(
+            probe.contains(expected),
+            "fixed-rate public probe is missing {expected:?}"
+        );
+    }
+    assert!(
+        !probe.contains("--output -"),
+        "the public probe must never retain a response body"
+    );
+    assert!(
+        !probe.to_ascii_lowercase().contains("set-cookie"),
+        "cookies must not be allowlisted into HA evidence"
+    );
+
+    for expected in [
+        "--namespace cats",
+        "app.kubernetes.io/name=cats-controld",
+        "kubernetes.io/service-name=cats-controld",
+        "--watch-only --output-watch-events",
+        "Kubernetes timeline watcher ended before disruption evidence collection stopped",
+        "(( lines <= 2000 ))",
+        "kubernetes-pods.ndjson",
+        "kubernetes-endpointslices.ndjson",
+    ] {
+        assert!(
+            timeline.contains(expected),
+            "bounded Kubernetes HA timeline is missing {expected:?}"
+        );
+    }
+
+    for fixture in [
+        "deploy/aws/tests/control-plane-ha-probe-fixture.sh",
+        "deploy/aws/tests/control-plane-ha-timeline-fixture.sh",
+    ] {
+        let output = Command::new("bash")
+            .arg(workspace_root().join(fixture))
+            .output()
+            .unwrap_or_else(|error| panic!("run {fixture}: {error}"));
+        assert!(
+            output.status.success(),
+            "{fixture} failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]

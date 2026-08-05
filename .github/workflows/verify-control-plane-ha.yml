@@ -174,8 +174,6 @@ jobs:
         run: |
           set -euo pipefail
           kube=(kubectl --namespace cats)
-          failures="$RUNNER_TEMP/control-ha-probe-failures"
-          : > "$failures"
 
           # Resolve the lock owner immediately before the disruption. Keeping
           # selection and deletion in one step prevents a queued Actions step
@@ -230,48 +228,120 @@ jobs:
             exit 1
           fi
 
-          probe_public_api() {
-            for attempt in $(seq 1 240); do
-              if ! curl \
-                --fail --silent --show-error \
-                --connect-timeout 2 --max-time 3 \
-                https://cats.run/healthz >/dev/null
-              then
-                echo "attempt=$attempt time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-                  >> "$failures"
+          evidence_dir="$RUNNER_TEMP/control-ha-evidence"
+          mkdir -p "$evidence_dir"
+          probe_pid=""
+          timeline_pid=""
+          cleanup_evidence_collectors() {
+            for pid in "$probe_pid" "$timeline_pid"; do
+              if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null || true
               fi
-              sleep 0.25
+            done
+            for pid in "$probe_pid" "$timeline_pid"; do
+              [[ -n "$pid" ]] && wait "$pid" 2>/dev/null || true
             done
           }
-
-          probe_public_api &
-          probe_pid=$!
-          cleanup_probe() {
-            if kill -0 "$probe_pid" 2>/dev/null; then
-              kill "$probe_pid" 2>/dev/null || true
+          deploy/aws/capture-control-plane-ha-timeline.sh \
+            "$KUBECONFIG" "$evidence_dir" 75 &
+          timeline_pid=$!
+          trap cleanup_evidence_collectors EXIT
+          for _ in $(seq 1 100); do
+            [[ -s "$evidence_dir/kubernetes-timeline.ready" ]] && break
+            if ! kill -0 "$timeline_pid" 2>/dev/null; then
+              wait "$timeline_pid" || true
+              echo "::error::Kubernetes evidence collector exited before readiness"
+              exit 1
             fi
-            wait "$probe_pid" 2>/dev/null || true
-          }
-          trap cleanup_probe EXIT
+            sleep 0.1
+          done
+          if [[ ! -s "$evidence_dir/kubernetes-timeline.ready" ]]; then
+            echo "::error::Kubernetes evidence collector did not become ready"
+            exit 1
+          fi
 
+          deploy/aws/probe-public-health-fixed-rate.sh \
+            https://cats.run/healthz 240 250 16 3 70000 "$evidence_dir" &
+          probe_pid=$!
+
+          replacement_status=0
+          replacement_stage="uid-precondition"
+          set +e
           observed_uid="$("${kube[@]}" get pod "$target" \
             --output=jsonpath='{.metadata.uid}')"
-          if [[ "$observed_uid" != "$target_uid" ]]; then
+          observed_status=$?
+          set -e
+          if (( observed_status != 0 )); then
+            replacement_status=$observed_status
+          elif [[ "$observed_uid" != "$target_uid" ]]; then
             echo "::error::the selected leader changed before deletion"
-            exit 1
+            replacement_status=1
+          else
+            replacement_stage="uid-preconditioned-eviction"
+            set +e
+            deploy/aws/evict-pod-with-uid.sh cats "$target" "$target_uid"
+            replacement_status=$?
+            set -e
+            if (( replacement_status == 0 )); then
+              replacement_stage="wait-for-old-uid-deletion"
+              set +e
+              "${kube[@]}" wait --for=delete "pod/$target" --timeout=5m
+              replacement_status=$?
+              set -e
+            fi
+            if (( replacement_status == 0 )); then
+              replacement_stage="replacement-rollout"
+              set +e
+              "${kube[@]}" rollout status deployment/cats-controld --timeout=10m
+              replacement_status=$?
+              set -e
+            fi
           fi
-          deploy/aws/evict-pod-with-uid.sh cats "$target" "$target_uid"
-          "${kube[@]}" wait --for=delete "pod/$target" --timeout=5m
-          "${kube[@]}" rollout status deployment/cats-controld --timeout=10m
 
-          wait "$probe_pid"
+          probe_status=0
+          wait "$probe_pid" || probe_status=$?
+          probe_pid=""
+          kill "$timeline_pid" 2>/dev/null || true
+          timeline_status=0
+          wait "$timeline_pid" || timeline_status=$?
+          timeline_pid=""
           trap - EXIT
-          if [[ -s "$failures" ]]; then
+
+          echo "Public health probe summary:"
+          sed -n '1,40p' "$evidence_dir/public-health-summary.txt"
+          echo "Public health probe evidence (header and first 20 attempts):"
+          sed -n '1,21p' "$evidence_dir/public-health.tsv"
+          echo "Kubernetes Pod timeline (first 40 events):"
+          sed -n '1,40p' "$evidence_dir/kubernetes-pods.ndjson"
+          echo "Kubernetes EndpointSlice timeline (first 40 events):"
+          sed -n '1,40p' "$evidence_dir/kubernetes-endpointslices.ndjson"
+
+          if (( replacement_status != 0 )); then
+            echo "::error::control-plane replacement failed during $replacement_stage"
+            exit "$replacement_status"
+          fi
+          if (( timeline_status != 0 )); then
+            echo "::error::Kubernetes evidence collection failed"
+            exit "$timeline_status"
+          fi
+          if (( probe_status != 0 )); then
             echo "::error::the public control-plane health endpoint failed during leader replacement"
-            sed -n '1,40p' "$failures"
-            exit 1
+            exit "$probe_status"
           fi
           echo "All 240 public health probes succeeded during leader replacement."
+
+      - name: Upload bounded HA disruption evidence
+        if: always() && inputs.mode == 'disrupt'
+        uses: actions/upload-artifact@v4
+        with:
+          name: control-plane-ha-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/control-ha-evidence/public-health.tsv
+            ${{ runner.temp }}/control-ha-evidence/public-health-summary.txt
+            ${{ runner.temp }}/control-ha-evidence/kubernetes-pods.ndjson
+            ${{ runner.temp }}/control-ha-evidence/kubernetes-endpointslices.ndjson
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Verify replacement, node spread and reconciler takeover
         if: inputs.mode == 'disrupt'
