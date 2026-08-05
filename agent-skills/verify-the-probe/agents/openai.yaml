@@ -1,0 +1,4 @@
+interface:
+  display_name: "Verify the Probe"
+  short_description: "Calibrate a diagnostic before believing an empty result"
+  default_prompt: "Use $verify-the-probe before letting this empty or zero result justify a conclusion."

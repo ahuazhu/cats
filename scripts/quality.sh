@@ -11,6 +11,7 @@ SKILLS=(
   rust-smell-audit
   safe-refactor
   rust-pr-review
+  verify-the-probe
 )
 
 usage() {
