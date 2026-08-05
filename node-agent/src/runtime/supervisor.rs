@@ -46,7 +46,7 @@ impl NodeRuntime {
         // Every action is serialized per Cat. Stop/Cold addresses devices
         // already owned by one Cat, and its remote drains are independently
         // bounded by `stop_admission`, so unrelated Cats can stop in parallel.
-        // Resume and vhost-user launches keep their existing lock exemptions;
+        // Suspend, Resume and vhost-user launches keep their lock exemptions;
         // other lifecycle/hot-plug paths remain conservatively node-serialized
         // until they receive their own concurrency coverage.
         // The per-Cat lock is unconditional: it is what keeps "one job per Cat at
@@ -56,14 +56,15 @@ impl NodeRuntime {
         // a thread holding the node-wide lock never waits for a per-Cat lock and
         // the pair cannot deadlock.
         let needs_node_lock = match &job.action {
-            NodeJobAction::ResumeCat { .. } | NodeJobAction::StopCat { .. } => false,
+            NodeJobAction::SuspendCat { .. }
+            | NodeJobAction::ResumeCat { .. }
+            | NodeJobAction::StopCat { .. } => false,
             NodeJobAction::StartCat { .. } | NodeJobAction::RestoreCat { .. } => {
                 self.launch_allocates_node_global_state()
             }
-            // Keep the existing conservative serialization for lifecycle and
-            // hot-plug paths not covered by this Stop concurrency change.
-            NodeJobAction::SuspendCat { .. }
-            | NodeJobAction::WarmCat { .. }
+            // Keep conservative serialization for lifecycle and hot-plug
+            // paths that do not yet have dedicated concurrency coverage.
+            NodeJobAction::WarmCat { .. }
             | NodeJobAction::AttachDisk { .. }
             | NodeJobAction::DetachDisk { .. }
             | NodeJobAction::SyncCat { .. }

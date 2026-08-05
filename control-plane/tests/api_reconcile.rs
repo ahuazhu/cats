@@ -51,6 +51,13 @@ struct StubNode {
     /// models the ambiguous boundary where the Host is already serving the
     /// Guest but the control plane never receives the successful job result.
     lose_start_responses_remaining: Arc<AtomicUsize>,
+    /// Apply one SuspendCat and hold its HTTP response until released. The
+    /// applied result is journaled by job id first, matching NodeRuntime's
+    /// ambiguous-success boundary during a reconciler leadership handoff.
+    hold_suspend_responses_remaining: Arc<AtomicUsize>,
+    suspend_applied: Arc<tokio::sync::Notify>,
+    suspend_response_release: Arc<tokio::sync::Notify>,
+    applied_suspend_jobs: Arc<Mutex<HashMap<String, NodeJobResult>>>,
     started_volume_epochs: Arc<Mutex<Vec<(String, String, i64)>>>,
     storage_meta: Arc<dyn MetadataStore>,
     stop_dispositions: Arc<Mutex<Vec<StopCatDisposition>>>,
@@ -83,6 +90,17 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Res
         .lock()
         .unwrap()
         .push(job.action.kind().to_string());
+    if matches!(&job.action, NodeJobAction::SuspendCat { .. }) {
+        if let Some(result) = node
+            .applied_suspend_jobs
+            .lock()
+            .unwrap()
+            .get(&job.job_id)
+            .cloned()
+        {
+            return Json(result).into_response();
+        }
+    }
     if let NodeJobAction::StopCat { disposition, .. } = &job.action {
         node.stop_dispositions
             .lock()
@@ -153,11 +171,13 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Res
         NodeJobAction::SyncCat { cat_id } => (cat_id.clone(), ObservedState::Running),
         NodeJobAction::CleanupCat { cat_id } => (cat_id.clone(), ObservedState::Cold),
     };
-    let mut cats = node.cats.lock().unwrap();
-    if observed == ObservedState::Cold {
-        cats.remove(&cat_id);
-    } else {
-        cats.insert(cat_id, observed);
+    {
+        let mut cats = node.cats.lock().unwrap();
+        if observed == ObservedState::Cold {
+            cats.remove(&cat_id);
+        } else {
+            cats.insert(cat_id, observed);
+        }
     }
     if lose_start_response {
         (
@@ -166,7 +186,24 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Res
         )
             .into_response()
     } else {
-        Json(NodeJobResult::ok(job.job_id, observed)).into_response()
+        let result = NodeJobResult::ok(&job.job_id, observed);
+        if matches!(&job.action, NodeJobAction::SuspendCat { .. }) {
+            node.applied_suspend_jobs
+                .lock()
+                .unwrap()
+                .insert(job.job_id.clone(), result.clone());
+            if node
+                .hold_suspend_responses_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                node.suspend_applied.notify_one();
+                node.suspend_response_release.notified().await;
+            }
+        }
+        Json(result).into_response()
     }
 }
 
@@ -244,6 +281,10 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
         exec_conflicts_remaining: Arc::new(AtomicUsize::new(0)),
         fail_jobs_remaining: Arc::new(Mutex::new(HashMap::new())),
         lose_start_responses_remaining: Arc::new(AtomicUsize::new(0)),
+        hold_suspend_responses_remaining: Arc::new(AtomicUsize::new(0)),
+        suspend_applied: Arc::new(tokio::sync::Notify::new()),
+        suspend_response_release: Arc::new(tokio::sync::Notify::new()),
+        applied_suspend_jobs: Arc::new(Mutex::new(HashMap::new())),
         started_volume_epochs: Arc::new(Mutex::new(Vec::new())),
         storage_meta: cp.state.storage_meta.clone(),
         stop_dispositions: Arc::new(Mutex::new(Vec::new())),
@@ -1011,6 +1052,162 @@ async fn two_api_replicas_linearize_create_start_and_delete() {
         1,
         "cross-replica replay must not dispatch a duplicate start"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconciler_handoff_replays_persisted_suspending_with_the_same_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let control_store_url = cats_control_plane::testsupport::isolated_control_store_url();
+    let usage: Arc<SqliteUsageStore> =
+        Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap());
+    let storage_meta: Arc<dyn MetadataStore> =
+        Arc::new(SqliteMetadataStore::open(&dir.path().join("storage-meta.db")).unwrap());
+    let config = Config {
+        listen: "127.0.0.1:0".into(),
+        control_store_dsn: cats_control_plane::store::DsnSource::Literal(control_store_url),
+        control_store_ca_file: None,
+        usage_store: usage.clone(),
+        credit_store: usage,
+        storage_meta,
+        auth_token: SERVICE_TOKEN.into(),
+        admin_token: "dev-admin-token".into(),
+        workos: None,
+        stripe: None,
+        billing_enforcement_enabled: false,
+        node_lease_timeout_ms: 30_000,
+        reconcile_interval_ms: 25,
+        oci_deploy_sync_wait_ms: 5_000,
+        auto_tier_policy: Default::default(),
+    };
+    let first = spawn(config.clone()).await.unwrap();
+    let node = start_stub_node(&first, "node_suspend_handoff").await;
+    let workspace_id = default_workspace_id(&first);
+    let http = reqwest::Client::new();
+    let cats_path = format!("/v1/workspaces/{workspace_id}/cats");
+    let created: CatOperationResponse = http
+        .post(format!("{}{cats_path}", first.base_url()))
+        .bearer_auth("dev-admin-token")
+        .json(&serde_json::json!({
+            "name": "handoff-suspend",
+            "image": "ubuntu-24.04",
+            "cpus": 2,
+            "memory_mib": 1024,
+            "root_size_bytes": 8 << 20,
+            "disk": null
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let cat = first
+                .state
+                .store
+                .must_get_cat_by_id(&created.cat.id)
+                .unwrap();
+            if cat.observed_state == ObservedState::Running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("first reconciler should start the Cat");
+
+    // Keep heartbeats from publishing the node's already-applied state. The
+    // database must remain at the exact ambiguous boundary the replacement
+    // reconciler inherits: desired Suspended, observed Suspending.
+    node.quiesce().await;
+    node.hold_suspend_responses_remaining
+        .store(1, Ordering::SeqCst);
+    let suspended: CatOperationResponse = http
+        .post(format!(
+            "{}{cats_path}/{}/actions/suspend",
+            first.base_url(),
+            created.cat.id
+        ))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), node.suspend_applied.notified())
+        .await
+        .expect("the first leader never dispatched SuspendCat");
+    let transitional = first
+        .state
+        .store
+        .must_get_cat_by_id(&created.cat.id)
+        .unwrap();
+    assert_eq!(transitional.desired_state, DesiredState::Suspended);
+    assert_eq!(transitional.observed_state, ObservedState::Suspending);
+    assert_eq!(
+        first
+            .state
+            .store
+            .get_operation(&suspended.operation.id)
+            .unwrap()
+            .phase,
+        OperationPhase::Pending
+    );
+
+    // A second replica starts while the old leader is still waiting for the
+    // response, then takes the PostgreSQL singleton lock after that task is
+    // aborted. The node has already journaled success, so replaying the same
+    // deterministic job returns without applying SuspendCat twice.
+    let second = spawn(config).await.unwrap();
+    first.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let cat = second
+                .state
+                .store
+                .must_get_cat_by_id(&created.cat.id)
+                .unwrap();
+            let operation = second
+                .state
+                .store
+                .get_operation(&suspended.operation.id)
+                .unwrap();
+            if cat.observed_state == ObservedState::Suspended
+                && operation.phase == OperationPhase::Succeeded
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("replacement reconciler did not recover persisted Suspending");
+
+    let suspend_jobs: Vec<_> = node
+        .jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|job_id| job_id.contains("_suspend_cat"))
+        .cloned()
+        .collect();
+    assert_eq!(suspend_jobs.len(), 2, "handoff did not replay SuspendCat");
+    assert_eq!(
+        suspend_jobs[0], suspend_jobs[1],
+        "handoff changed the deterministic SuspendCat job id"
+    );
+    assert_eq!(
+        node.applied_suspend_jobs.lock().unwrap().len(),
+        1,
+        "the node applied the replayed SuspendCat twice"
+    );
+    node.suspend_response_release.notify_waiters();
 }
 
 #[tokio::test]

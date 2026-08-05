@@ -486,8 +486,13 @@ impl Controller {
             }
             (D::Running, O::Suspended) => self.simple_transition(cat, "resume").await,
             (D::Running, O::Warm) => self.simple_transition(cat, "restore").await,
-            (D::Suspended, O::Running) => self.simple_transition(cat, "suspend").await,
-            (D::Warm, O::Running) => self.simple_transition(cat, "suspend").await,
+            (D::Suspended | D::Warm, O::Running | O::Suspending) => {
+                // Suspending is the durable dispatch boundary. A reconciler
+                // leader can disappear after the node applied SuspendCat but
+                // before its response was recorded, so its successor must
+                // replay the same generation-derived job on the same node.
+                self.simple_transition(cat, "suspend").await
+            }
             (D::Warm, O::Suspended) => self.simple_transition(cat, "warm").await,
             (D::Suspended, O::Warm) => self.simple_transition(cat, "restore").await,
             (D::Cold, O::Running | O::Suspended | O::Warm | O::Starting) => {
@@ -691,7 +696,9 @@ impl Controller {
                 ),
                 _ => unreachable!("unknown transition"),
             };
-        self.store.set_observed(&cat.id, transitional)?;
+        if cat.observed_state != transitional {
+            self.store.set_observed(&cat.id, transitional)?;
+        }
         let job = NodeJob {
             job_id: nodejob::job_id(&cat.id, cat.generation, job_action.kind()),
             cat_generation: cat.generation,
