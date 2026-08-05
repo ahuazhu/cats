@@ -255,9 +255,12 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
     let workflow = read_workspace_file(".github/workflows/verify-control-plane-ha.yml");
     for expected in [
         "workflow_dispatch:",
+        "READ_ONLY_CONTROL_PLANE_LEADER_DIAGNOSTIC",
         "DELETE_ONE_CATS_CONTROLD_LEADER",
         "github.ref == 'refs/heads/main'",
         "actions/checkout@v4",
+        "inputs.mode == 'diagnose'",
+        ".status.hostIP",
         "disruptionsAllowed",
         "l.classid=hashtext(current_schema())::oid",
         "l.objid=420201",
@@ -291,8 +294,13 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
     assert!(!workflow.contains("tr -d '[:space:]' <<<\"$leader_ip\""));
     assert_eq!(
         workflow.matches("deploy/aws/run-postgres-probe.sh").count(),
+        3,
+        "diagnostic, pre-disruption and post-disruption probes must avoid attach replay"
+    );
+    assert_eq!(
+        workflow.matches("if: inputs.mode == 'disrupt'").count(),
         2,
-        "both pre-disruption and post-disruption owner probes must avoid attach replay"
+        "both destructive and post-disruption steps must require disrupt mode"
     );
 }
 

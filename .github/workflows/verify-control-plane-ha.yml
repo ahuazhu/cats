@@ -3,8 +3,16 @@ name: Verify production control-plane HA
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "Inspect leader addresses or disrupt the elected leader"
+        required: true
+        default: diagnose
+        type: choice
+        options:
+          - diagnose
+          - disrupt
       confirmation:
-        description: "Type DELETE_ONE_CATS_CONTROLD_LEADER to run the production drill"
+        description: "Type the confirmation required by the selected mode"
         required: true
         type: string
 
@@ -22,22 +30,26 @@ env:
 
 jobs:
   drill:
-    name: Delete the elected reconciler and prove takeover
+    name: Diagnose or disrupt the elected reconciler
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
-      - name: Require the destructive confirmation
+      - name: Require the mode-specific confirmation
         shell: bash
         env:
+          MODE: ${{ inputs.mode }}
           CONFIRMATION: ${{ inputs.confirmation }}
         run: |
           set -euo pipefail
-          if [[ "$CONFIRMATION" != "DELETE_ONE_CATS_CONTROLD_LEADER" ]]; then
-            echo "::error::confirmation must be DELETE_ONE_CATS_CONTROLD_LEADER"
-            exit 1
-          fi
+          case "$MODE:$CONFIRMATION" in
+            diagnose:READ_ONLY_CONTROL_PLANE_LEADER_DIAGNOSTIC|disrupt:DELETE_ONE_CATS_CONTROLD_LEADER) ;;
+            *)
+              echo "::error::confirmation does not match mode $MODE"
+              exit 1
+              ;;
+          esac
 
       - name: Check out repository
         uses: actions/checkout@v4
@@ -61,6 +73,7 @@ jobs:
         shell: bash
         env:
           KUBECONFIG: ${{ runner.temp }}/kubeconfig
+          MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           kube=(kubectl --namespace cats)
@@ -100,14 +113,52 @@ jobs:
             exit 1
           fi
 
-          disruptions_allowed="$("${kube[@]}" get poddisruptionbudget cats-controld \
-            --output=jsonpath='{.status.disruptionsAllowed}')"
-          if (( disruptions_allowed < 1 )); then
-            echo "::error::the cats-controld PDB currently allows no disruption"
-            exit 1
+          if [[ "$MODE" == "disrupt" ]]; then
+            disruptions_allowed="$("${kube[@]}" get poddisruptionbudget cats-controld \
+              --output=jsonpath='{.status.disruptionsAllowed}')"
+            if (( disruptions_allowed < 1 )); then
+              echo "::error::the cats-controld PDB currently allows no disruption"
+              exit 1
+            fi
           fi
 
+      - name: Report singleton lock and Pod addresses
+        if: inputs.mode == 'diagnose'
+        shell: bash
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: |
+          set -euo pipefail
+          kube=(kubectl --namespace cats)
+          pods="$("${kube[@]}" get pods \
+            --selector app.kubernetes.io/name=cats-controld \
+            --output=json)"
+          probe="control-ha-diagnostic-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          lock_query="SELECT json_build_object('schema',current_schema(),'expected_classid',hashtext(current_schema())::oid::text,'locks',COALESCE(json_agg(json_build_object('role_key',l.objid::text,'objsubid',l.objsubid,'classid',l.classid::text,'client_addr',a.client_addr::text,'application_name',a.application_name) ORDER BY l.objid) FILTER (WHERE l.pid IS NOT NULL),'[]'::json))::text FROM pg_locks AS l JOIN pg_stat_activity AS a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.granted AND l.objid IN (420201,420202,420203)"
+          lock_report="$(
+            deploy/aws/run-postgres-probe.sh \
+              "$KUBECONFIG" \
+              cats \
+              "$probe" \
+              "$lock_query"
+          )"
+          echo "Singleton lock report:"
+          jq . <<<"$lock_report"
+          echo "Pod address report (name, pod IP, host IP, node, ready):"
+          jq -r '
+            .items[]
+            | [
+                .metadata.name,
+                (.status.podIP // "<none>"),
+                (.status.hostIP // "<none>"),
+                (.spec.nodeName // "<none>"),
+                (all(.status.containerStatuses[]?; .ready == true) | tostring)
+              ]
+            | @tsv
+          ' <<<"$pods"
+
       - name: Delete the leader while probing the public API
+        if: inputs.mode == 'disrupt'
         id: disrupt
         shell: bash
         env:
@@ -195,6 +246,7 @@ jobs:
           echo "All 240 public health probes succeeded during leader replacement."
 
       - name: Verify replacement, node spread and reconciler takeover
+        if: inputs.mode == 'disrupt'
         shell: bash
         env:
           KUBECONFIG: ${{ runner.temp }}/kubeconfig

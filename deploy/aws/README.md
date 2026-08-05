@@ -132,22 +132,34 @@ versions inside the build's supported range and fails closed on incompatible
 versions. The pre-cutover `cats-control-data` PVC is no longer part of the
 runtime; its final snapshot remains only as an archive.
 
-Run the reproducible production HA drill from `main` after a multi-replica
-rollout:
+Inspect the production singleton locks and control-plane network addresses from
+`main` without disrupting a Pod:
 
 ```sh
 gh workflow run verify-control-plane-ha.yml \
   --ref main \
+  -f mode=diagnose \
+  -f confirmation=READ_ONLY_CONTROL_PLANE_LEADER_DIAGNOSTIC
+```
+
+Run the reproducible production HA disruption after a multi-replica rollout:
+
+```sh
+gh workflow run verify-control-plane-ha.yml \
+  --ref main \
+  -f mode=disrupt \
   -f confirmation=DELETE_ONE_CATS_CONTROLD_LEADER
 ```
 
-The workflow refuses a different confirmation, checks out the dispatched
-`main` revision, verifies two ready Pods on different nodes and an allowed PDB
-disruption, locates the reconciler owner through its PostgreSQL advisory lock,
-then deletes only that Pod. It requires all 240 public `/healthz` probes to
-succeed while Kubernetes replaces the Pod, and finally proves that two
-node-spread replicas and a new reconciler owner are present. It never
-force-deletes or scales the Deployment.
+The workflow refuses a confirmation that does not match the selected mode and
+checks out the dispatched `main` revision. Diagnose mode verifies two ready
+Pods on different nodes, then reports the singleton locks and each Pod's Pod,
+Host and node addresses without deleting anything. Disrupt mode additionally
+requires an allowed PDB disruption, locates the reconciler owner through its
+PostgreSQL advisory lock, then deletes only that Pod. It requires all 240 public
+`/healthz` probes to succeed while Kubernetes replaces the Pod, and finally
+proves that two node-spread replicas and a new reconciler owner are present. It
+never force-deletes or scales the Deployment.
 
 The usage ledger has the same rule for the same reason. ADR-0018 replaced the V1
 `project` ownership column with `workspace_id` on usage rows and `account_id` on
