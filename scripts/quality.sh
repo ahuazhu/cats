@@ -222,7 +222,7 @@ run_linux() {
     -v "$target_volume:/target" \
     rust:1.97.1-bookworm \
     sh -c 'apt-get update -qq &&
-           apt-get install -qy --no-install-recommends e2fsprogs &&
+           apt-get install -qy --no-install-recommends e2fsprogs jq &&
            rustup component add clippy rustfmt &&
            ./scripts/quality.sh skills &&
            cargo fmt --all -- --check &&
