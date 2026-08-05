@@ -547,6 +547,22 @@ pub(super) async fn prometheus_metrics(
                     total
                 );
             }
+            // Per-Cat runtime directories no live Cat owns (issue #99). The
+            // byte gauge is the one to alarm on: the count says how many Cats
+            // left something behind, the bytes say whether that is a rounding
+            // error or most of the local medium.
+            if let Some(dirs) = telemetry.unsupervised_runtime_dirs {
+                metric!(
+                    format!("cats_node_unsupervised_runtime_dirs{{node_id=\"{node_id}\"}}"),
+                    dirs
+                );
+            }
+            if let Some(bytes) = telemetry.unsupervised_runtime_bytes {
+                metric!(
+                    format!("cats_node_unsupervised_runtime_bytes{{node_id=\"{node_id}\"}}"),
+                    bytes
+                );
+            }
             if let Some(logical_cpus) = telemetry.host_logical_cpus {
                 metric!(
                     format!("cats_node_logical_cpus{{node_id=\"{node_id}\"}}"),

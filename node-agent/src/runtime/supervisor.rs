@@ -29,7 +29,7 @@ impl From<StopCatDisposition> for TeardownMode {
 }
 
 impl NodeRuntime {
-    fn cat_lock(&self, cat_id: &str) -> Arc<Mutex<()>> {
+    pub(super) fn cat_lock(&self, cat_id: &str) -> Arc<Mutex<()>> {
         Arc::clone(
             self.cat_ops
                 .lock()
@@ -567,6 +567,13 @@ impl NodeRuntime {
                     // gone while an independently-owned disk journal remains.
                     // Only a root-only Destroy plan is sufficient authority to
                     // discard that residue.
+                    //
+                    // This refusal is not the whole answer to such a directory,
+                    // only the safe half: the `residue` sweep reclaims what is
+                    // provably not durability state and reports what it had to
+                    // leave (issue #99). Once it has emptied a directory this
+                    // arm stops firing for that Cat, because the directory a
+                    // stop would have to discard is no longer there.
                     bail!(
                         "cat runtime directory {} exists but is not supervised; refusing to discard possible persistent durability state",
                         dir.display()
@@ -661,6 +668,18 @@ impl NodeRuntime {
                 None => vmm.kill_and_reap(),
             }
         }
+        // The VMM is down, so its memory backing is Guest RAM nobody can read
+        // again: the only path that turns Guest RAM into restorable state is
+        // `warm_cat`, which never tears down, and every start that is not a
+        // Warm restore calls `prepare_memory_backing` for a fresh file.
+        //
+        // Deliberately here, ahead of the fallible drain below. The steps that
+        // follow fail routinely for reasons that have nothing to do with Guest
+        // RAM -- a fenced volume, an unreachable object store -- and each such
+        // failure keeps the runtime directory on purpose so a retry can finish
+        // the drain. That kept several GiB of dead Guest RAM per Cat with it,
+        // for as long as the directory survived (issue #99).
+        Self::discard_memory_backing(rt);
         if let TeardownMode::Destroy {
             disposable_root_disk_ids,
             ..
@@ -710,6 +729,24 @@ impl NodeRuntime {
         Self::remove_metering_cgroup(rt.metering.as_ref());
         rt.state = ObservedState::Cold;
         Ok(())
+    }
+
+    /// Drop the Guest memory backing of a VMM that is already gone.
+    ///
+    /// FakeVmm has none: its Guest is a host process, and the only file it ever
+    /// saves Guest state to is written by `warm_cat`.
+    fn discard_memory_backing(rt: &mut CatRuntime) {
+        let Some(chrt) = &rt.ch else {
+            return;
+        };
+        let freed = residue::remove_file_bytes(&chrt.memory_file);
+        if freed > 0 {
+            tracing::debug!(
+                path = %chrt.memory_file.display(),
+                freed_bytes = freed,
+                "released the Guest memory backing of a VMM that has exited"
+            );
+        }
     }
 
     /// Detach the kernel-NBD devices of blockds that have already exited.
@@ -830,20 +867,9 @@ mod teardown_tests {
     use cats_storage::AdapterSelection;
     use std::os::unix::fs::PermissionsExt;
 
-    /// A blockd that exited on its own must give its kernel NBD device back,
-    /// even though teardown cannot finish.
-    ///
-    /// The mandatory final drain runs before the detach. A dead blockd can
-    /// never answer it, so teardown returned at the drain and the detach below
-    /// it never ran: every retry took the same path, and the device stayed
-    /// connected to a server that no longer existed until someone found it by
-    /// hand (issue #79). The drain failure is still reported -- it means
-    /// unpublished writes, which is not this fix's to swallow.
-    #[test]
-    fn a_dead_blockd_gives_its_nbd_device_back_even_when_the_drain_fails() {
-        let temp = tempfile::tempdir().unwrap();
-        let calls = temp.path().join("nbd-client-calls");
-        let nbd_client = temp.path().join("nbd-client");
+    /// A node whose kernel-NBD detaches land in `calls` instead of the kernel.
+    fn node_with_recorded_nbd_client(state_dir: &Path, calls: &Path) -> NodeRuntime {
+        let nbd_client = state_dir.join("nbd-client");
         std::fs::write(
             &nbd_client,
             format!(
@@ -855,9 +881,9 @@ mod teardown_tests {
         std::fs::set_permissions(&nbd_client, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let adapter = AdapterSelection::new("unused", cats_storage::AdapterConfig::default());
-        let runtime = NodeRuntime::new(NodeConfig {
+        NodeRuntime::new(NodeConfig {
             node_id: "node-a".to_string(),
-            state_dir: temp.path().to_path_buf(),
+            state_dir: state_dir.to_path_buf(),
             blockd_bin: PathBuf::from("unused-blockd"),
             guest_agent_bin: PathBuf::from("unused-guest-agent"),
             metadata_store: adapter.clone(),
@@ -884,16 +910,19 @@ mod teardown_tests {
             }),
             wake_budget: WakeBudget::default(),
         })
-        .unwrap();
+        .unwrap()
+    }
 
+    /// A Running CH runtime whose only blockd has already exited, so the
+    /// mandatory final drain cannot succeed.
+    fn runtime_with_a_dead_blockd(dir: &Path) -> CatRuntime {
         let mut dead = Command::new("/bin/sh")
             .args(["-c", "exit 0"])
             .spawn()
             .unwrap();
         dead.wait().unwrap();
-        let dir = temp.path().join("cat-a");
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut rt = CatRuntime {
+        std::fs::create_dir_all(dir).unwrap();
+        CatRuntime {
             generation: 1,
             cpus: 1,
             memory_mib: 256,
@@ -923,7 +952,7 @@ mod teardown_tests {
                 },
             )]),
             volumes: Vec::new(),
-            dir: dir.clone(),
+            dir: dir.to_path_buf(),
             ctl_sock: dir.join("ctl"),
             web_sock: dir.join("web"),
             runtime_sock: dir.join("runtime"),
@@ -931,9 +960,27 @@ mod teardown_tests {
             metering: None,
             ch: Some(ChRuntime {
                 nbd: HashMap::from([("dsk_root".to_string(), "/dev/nbd7".to_string())]),
+                memory_file: dir.join(ch::GUEST_MEMORY_FILE),
                 ..ChRuntime::default()
             }),
-        };
+        }
+    }
+
+    /// A blockd that exited on its own must give its kernel NBD device back,
+    /// even though teardown cannot finish.
+    ///
+    /// The mandatory final drain runs before the detach. A dead blockd can
+    /// never answer it, so teardown returned at the drain and the detach below
+    /// it never ran: every retry took the same path, and the device stayed
+    /// connected to a server that no longer existed until someone found it by
+    /// hand (issue #79). The drain failure is still reported -- it means
+    /// unpublished writes, which is not this fix's to swallow.
+    #[test]
+    fn a_dead_blockd_gives_its_nbd_device_back_even_when_the_drain_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let calls = temp.path().join("nbd-client-calls");
+        let runtime = node_with_recorded_nbd_client(temp.path(), &calls);
+        let mut rt = runtime_with_a_dead_blockd(&temp.path().join("cat-a"));
 
         let error = runtime
             .teardown(&mut rt, TeardownMode::Cold)
@@ -946,6 +993,39 @@ mod teardown_tests {
             std::fs::read_to_string(&calls).unwrap_or_default().trim(),
             "-d /dev/nbd7",
             "the device of a blockd that exited on its own must be detached"
+        );
+    }
+
+    /// Guest RAM backing must go back to the medium as soon as the VMM is down,
+    /// not only once the whole teardown succeeds.
+    ///
+    /// A teardown that fails keeps the runtime directory on purpose, so the
+    /// same drain can be retried. Every failure used to keep the Cat's whole
+    /// Guest RAM with it, and a stop the control plane eventually gave up on
+    /// kept it for good: 51 memory backings holding ~53 GiB on one host with 2
+    /// live Cats (issue #99).
+    #[test]
+    fn a_failed_teardown_still_releases_the_guest_memory_backing() {
+        let temp = tempfile::tempdir().unwrap();
+        let calls = temp.path().join("nbd-client-calls");
+        let runtime = node_with_recorded_nbd_client(temp.path(), &calls);
+        let dir = temp.path().join("cat-a");
+        let mut rt = runtime_with_a_dead_blockd(&dir);
+        let memory_file = dir.join(ch::GUEST_MEMORY_FILE);
+        ch::prepare_memory_backing(&memory_file, 64).unwrap();
+        assert!(memory_file.is_file());
+
+        runtime
+            .teardown(&mut rt, TeardownMode::Cold)
+            .expect_err("a dead blockd cannot be drained");
+
+        assert!(
+            !memory_file.exists(),
+            "the memory backing of an exited VMM must not survive a failed teardown"
+        );
+        assert!(
+            dir.is_dir(),
+            "the directory itself stays: its journals are what the retry needs"
         );
     }
 }

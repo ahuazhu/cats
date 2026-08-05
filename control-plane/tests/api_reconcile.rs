@@ -331,6 +331,8 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
                         host_disk_available_bytes: Some(75 * 1024 * 1024 * 1024),
                         leaked_nbd_devices: Some(0),
                         nbd_devices_total: Some(64),
+                        unsupervised_runtime_dirs: Some(0),
+                        unsupervised_runtime_bytes: Some(0),
                     }),
                 })
                 .send()

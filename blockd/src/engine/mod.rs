@@ -19,6 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub use cats_api::blockd::{
     DurabilityStatus, DEFAULT_MAX_LOCAL_BYTES, DEFAULT_MAX_STAGED_BYTES, DEFAULT_MAX_STAGED_PACKS,
 };
+use cats_api::blockd::{PACK_FILE_SUFFIX, PENDING_PACK_DIR};
 use cats_api::chunk::{self, CHUNKS_PER_LEAF, CHUNK_SIZE};
 
 use crate::crashpoint;
@@ -243,7 +244,7 @@ impl ChunkEngine {
 
         let epoch = meta.acquire_lease(&cfg.volume_id, &cfg.attachment_id, cfg.lease_ttl_ms)?;
 
-        fs::create_dir_all(cfg.data_dir.join("pending"))?;
+        fs::create_dir_all(cfg.data_dir.join(PENDING_PACK_DIR))?;
         let cache = OpenOptions::new()
             .read(true)
             .write(true)

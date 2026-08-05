@@ -3,11 +3,27 @@
 //! The control socket remains a line-oriented protocol: one `drain` or
 //! `status` command per connection and one `OK ...` or `ERR ...` response.
 //! The status payload is stable JSON described by [`DurabilityStatus`].
+//!
+//! One piece of blockd's on-disk layout is shared here too: the pending-pack
+//! journal is what tells an outside reader whether a volume directory still
+//! holds acknowledged writes nobody has published (ADR-0021/0022), and the
+//! node agent has to answer that about a directory whose blockd is long gone
+//! before it may reclaim the bytes (issue #99). Two independent spellings of
+//! the same path would make that check silently vacuous the first time one of
+//! them drifted, so there is one.
 
 use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+
+/// Directory under a blockd `--data-dir` holding locally durable, remotely
+/// unpublished packs.
+pub const PENDING_PACK_DIR: &str = "pending";
+
+/// Suffix of a complete pack file in [`PENDING_PACK_DIR`]. A file without it is
+/// a torn write that was never renamed into place.
+pub const PACK_FILE_SUFFIX: &str = ".pack";
 
 /// Default per-volume local replication backlog.
 ///

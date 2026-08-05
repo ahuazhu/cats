@@ -18,96 +18,7 @@ use super::*;
 
 use std::collections::BTreeMap;
 
-use cats_api::nodejob::job_id;
-use cats_storage::AdapterConfig;
-
 use ledger::{CatLedgerRecord, ChRecord};
-
-const VOLUME_SIZE: u64 = 2 * cats_api::chunk::CHUNK_SIZE as u64;
-const CPUS: u32 = 2;
-const MEMORY_MIB: u64 = 512;
-
-struct AdoptEnv {
-    _dir: tempfile::TempDir,
-    root: PathBuf,
-    cfg: NodeConfig,
-    /// The agent that started the Cat and still owns its children.
-    runtime: NodeRuntime,
-}
-
-fn adopt_env(node_id: &str) -> AdoptEnv {
-    let dir = tempfile::tempdir().expect("create test root");
-    let root = dir.path().to_path_buf();
-    let cfg = NodeConfig {
-        node_id: node_id.to_string(),
-        state_dir: root.join("node-state"),
-        blockd_bin: crate::testutil::workspace_bin("cats-blockd"),
-        guest_agent_bin: crate::testutil::workspace_bin("cats-guest-agent"),
-        metadata_store: AdapterSelection {
-            name: "sqlite".into(),
-            config: AdapterConfig::from_pairs([(
-                "path",
-                root.join("meta.db").display().to_string(),
-            )])
-            .expect("SQLite adapter config"),
-        },
-        object_store: AdapterSelection {
-            name: "file".into(),
-            config: AdapterConfig::from_pairs([("root", root.join("blob").display().to_string())])
-                .expect("File adapter config"),
-        },
-        blockd_lease_ttl_ms: 1_200,
-        blockd_max_staged_bytes: cats_api::blockd::DEFAULT_MAX_STAGED_BYTES,
-        blockd_max_staged_packs: cats_api::blockd::DEFAULT_MAX_STAGED_PACKS,
-        blockd_max_local_bytes: cats_api::blockd::DEFAULT_MAX_LOCAL_BYTES,
-        metering_cgroup_root: None,
-        vmm: VmmMode::Fake,
-        wake_budget: WakeBudget::default(),
-    };
-    let runtime = NodeRuntime::new(cfg.clone()).expect("open node runtime");
-    AdoptEnv {
-        _dir: dir,
-        root,
-        cfg,
-        runtime,
-    }
-}
-
-impl AdoptEnv {
-    /// A fresh agent process over the same state directory and the same
-    /// still-running children.
-    fn restarted_agent(&self) -> NodeRuntime {
-        NodeRuntime::new(self.cfg.clone()).expect("open the restarted node runtime")
-    }
-
-    fn run(&self, job: NodeJob) -> NodeJobResult {
-        let result = self.runtime.execute(job);
-        assert_eq!(
-            result.phase,
-            JobPhase::Succeeded,
-            "job failed: {:?}",
-            result.error
-        );
-        result
-    }
-
-    fn record(&self, cat_id: &str) -> CatLedgerRecord {
-        self.runtime
-            .ledger
-            .load_all()
-            .expect("load ledger records")
-            .into_iter()
-            .find(|record| record.cat_id == cat_id)
-            .unwrap_or_else(|| panic!("no runtime ledger record for {cat_id}"))
-    }
-
-    fn rewrite_record(&self, record: &CatLedgerRecord) {
-        self.runtime
-            .ledger
-            .put(record)
-            .expect("rewrite the runtime ledger record");
-    }
-}
 
 /// The pids a runtime currently supervises for one Cat: the guest, and one per
 /// disk.
@@ -213,35 +124,6 @@ fn fake_vm_info(socket: &Path, status: &str, body: &str) -> std::thread::JoinHan
     })
 }
 
-fn grant(cat_id: &str, disk_id: &str, mount_path: &str) -> VolumeGrant {
-    VolumeGrant {
-        disk_id: disk_id.to_string(),
-        volume_id: format!("vol_{cat_id}_{disk_id}"),
-        attachment_id: format!("att_{cat_id}_{disk_id}"),
-        epoch: 0,
-        size_bytes: VOLUME_SIZE,
-        mount_path: mount_path.to_string(),
-        durability: Default::default(),
-    }
-}
-
-fn start_job(cat_id: &str, generation: i64, disks: &[(&str, &str)]) -> NodeJob {
-    NodeJob {
-        job_id: job_id(cat_id, generation, "start_cat"),
-        cat_generation: generation,
-        action: NodeJobAction::StartCat {
-            cat_id: cat_id.to_string(),
-            image: "test".into(),
-            cpus: CPUS,
-            memory_mib: MEMORY_MIB,
-            volumes: disks
-                .iter()
-                .map(|(disk_id, mount_path)| grant(cat_id, disk_id, mount_path))
-                .collect(),
-        },
-    }
-}
-
 fn simple_job(cat_id: &str, generation: i64, kind: &str, action: NodeJobAction) -> NodeJob {
     NodeJob {
         job_id: job_id(cat_id, generation, kind),
@@ -265,7 +147,7 @@ fn stop_job(cat_id: &str, generation: i64) -> NodeJob {
 #[test]
 fn a_running_cat_is_adopted_by_a_restarted_agent() {
     const CAT: &str = "cat_adopt_running";
-    let env = adopt_env("node_adopt_running");
+    let env = real_cat_env("node_adopt_running");
     env.run(start_job(CAT, 3, &[("root", "/"), ("data", "/data")]));
     let before = supervised_pids(&env.runtime, CAT);
 
@@ -320,7 +202,7 @@ fn a_running_cat_is_adopted_by_a_restarted_agent() {
 #[test]
 fn an_unprovable_identity_leaves_the_cat_as_residue() {
     const CAT: &str = "cat_adopt_unproven";
-    let env = adopt_env("node_adopt_unproven");
+    let env = real_cat_env("node_adopt_unproven");
     env.run(start_job(CAT, 1, &[("root", "/")]));
     let proven = env.record(CAT);
 
@@ -408,7 +290,7 @@ fn a_blockd_that_cannot_name_its_volume_is_not_adopted() {
     const LEGACY_STATUS: &str = "{\"mode\":\"strict\",\"local_durable_generation\":1,\"remote_durable_generation\":1,\"unpublished_generations\":0,\"unpublished_bytes\":0,\"oldest_unpublished_age_ms\":0,\"max_unpublished_generations\":4096,\"max_unpublished_bytes\":8589934592,\"local_allocated_bytes\":0,\"max_local_bytes\":17179869184,\"evicted_cache_chunks\":0,\"backpressured\":false,\"fenced\":false,\"last_publish_error\":null}";
 
     const CAT: &str = "cat_adopt_legacy_blockd";
-    let env = adopt_env("node_adopt_legacy_blockd");
+    let env = real_cat_env("node_adopt_legacy_blockd");
     env.run(start_job(CAT, 1, &[("root", "/")]));
 
     let legacy_socket = env.root.join("legacy-blockd-ctl.sock");
@@ -454,7 +336,7 @@ fn a_blockd_that_cannot_name_its_volume_is_not_adopted() {
 #[test]
 fn a_suspended_cat_is_adopted_and_left_paused() {
     const CAT: &str = "cat_adopt_suspended";
-    let env = adopt_env("node_adopt_suspended");
+    let env = real_cat_env("node_adopt_suspended");
     env.run(start_job(CAT, 1, &[("root", "/"), ("data", "/data")]));
     env.run(simple_job(
         CAT,
@@ -510,7 +392,7 @@ fn a_suspended_cat_is_adopted_and_left_paused() {
 #[test]
 fn a_suspended_cat_is_proven_through_the_vmm_not_the_guest() {
     const CAT: &str = "cat_adopt_suspended_ch";
-    let env = adopt_env("node_adopt_suspended_ch");
+    let env = real_cat_env("node_adopt_suspended_ch");
     env.run(start_job(CAT, 1, &[("root", "/")]));
     env.run(simple_job(
         CAT,
@@ -604,7 +486,7 @@ fn a_suspended_cat_is_proven_through_the_vmm_not_the_guest() {
 #[test]
 fn a_warm_cat_is_adopted_with_no_processes_at_all() {
     const CAT: &str = "cat_adopt_warm";
-    let env = adopt_env("node_adopt_warm");
+    let env = real_cat_env("node_adopt_warm");
     env.run(start_job(CAT, 1, &[("root", "/"), ("data", "/data")]));
     env.run(simple_job(
         CAT,
@@ -663,7 +545,7 @@ fn a_warm_cat_is_adopted_with_no_processes_at_all() {
 #[test]
 fn a_warm_cat_survives_a_host_reboot() {
     const CAT: &str = "cat_adopt_warm_reboot";
-    let env = adopt_env("node_adopt_warm_reboot");
+    let env = real_cat_env("node_adopt_warm_reboot");
     env.run(start_job(CAT, 1, &[("root", "/")]));
     env.run(simple_job(
         CAT,
@@ -700,7 +582,7 @@ fn a_warm_cat_survives_a_host_reboot() {
 #[test]
 fn a_warm_record_missing_its_local_state_is_residue() {
     const CAT: &str = "cat_adopt_warm_incomplete";
-    let env = adopt_env("node_adopt_warm_incomplete");
+    let env = real_cat_env("node_adopt_warm_incomplete");
     env.run(start_job(CAT, 1, &[("root", "/")]));
     env.run(simple_job(
         CAT,
@@ -799,7 +681,7 @@ fn a_warm_record_missing_its_local_state_is_residue() {
 #[test]
 fn a_stopping_cat_is_adopted_with_its_blockds_and_no_guest() {
     const CAT: &str = "cat_adopt_stopping";
-    let env = adopt_env("node_adopt_stopping");
+    let env = real_cat_env("node_adopt_stopping");
     env.run(start_job(CAT, 4, &[("root", "/"), ("data", "/data")]));
     let (_, blockd_pids) = supervised_pids(&env.runtime, CAT);
 
@@ -848,7 +730,7 @@ fn a_stopping_cat_is_adopted_with_its_blockds_and_no_guest() {
 #[test]
 fn a_record_naming_a_process_its_state_cannot_have_is_residue() {
     const CAT: &str = "cat_adopt_impossible";
-    let env = adopt_env("node_adopt_impossible");
+    let env = real_cat_env("node_adopt_impossible");
     env.run(start_job(CAT, 1, &[("root", "/")]));
     let running = env.record(CAT);
 
@@ -907,7 +789,7 @@ fn a_record_naming_a_process_its_state_cannot_have_is_residue() {
 #[test]
 fn a_stopping_cat_whose_blockd_serves_another_volume_is_residue() {
     const CAT: &str = "cat_adopt_stopping_mismatch";
-    let env = adopt_env("node_adopt_stopping_mismatch");
+    let env = real_cat_env("node_adopt_stopping_mismatch");
     env.run(start_job(CAT, 1, &[("root", "/")]));
 
     let mut record = env.record(CAT);
@@ -939,7 +821,7 @@ fn a_stopping_cat_whose_blockd_serves_another_volume_is_residue() {
 #[test]
 fn an_unadopted_cat_is_absent_from_the_heartbeat_snapshot() {
     const CAT: &str = "cat_adopt_absent";
-    let env = adopt_env("node_adopt_absent");
+    let env = real_cat_env("node_adopt_absent");
     env.run(start_job(CAT, 5, &[("root", "/")]));
 
     let mut record = env.record(CAT);
@@ -969,7 +851,7 @@ fn an_unadopted_cat_is_absent_from_the_heartbeat_snapshot() {
 #[test]
 fn adoption_leaves_residue_on_disk_untouched() {
     const CAT: &str = "cat_adopt_untouched";
-    let env = adopt_env("node_adopt_untouched");
+    let env = real_cat_env("node_adopt_untouched");
     env.run(start_job(CAT, 1, &[("root", "/")]));
     let before = supervised_pids(&env.runtime, CAT);
 
