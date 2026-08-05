@@ -158,10 +158,15 @@ resource "kubernetes_deployment_v1" "control_plane" {
   }
 
   spec {
-    replicas = 1
+    replicas = var.control_plane_replicas
 
     strategy {
-      type = "Recreate"
+      type = "RollingUpdate"
+
+      rolling_update {
+        max_surge       = "1"
+        max_unavailable = "0"
+      }
     }
 
     selector {
@@ -189,6 +194,18 @@ resource "kubernetes_deployment_v1" "control_plane" {
 
         node_selector = {
           "kubernetes.io/arch" = "amd64"
+        }
+
+        topology_spread_constraint {
+          max_skew           = 1
+          topology_key       = "kubernetes.io/hostname"
+          when_unsatisfiable = "DoNotSchedule"
+
+          label_selector {
+            match_labels = {
+              "app.kubernetes.io/name" = "cats-controld"
+            }
+          }
         }
 
         container {
@@ -330,6 +347,24 @@ resource "kubernetes_deployment_v1" "control_plane" {
   }
 
   wait_for_rollout = true
+}
+
+resource "kubernetes_pod_disruption_budget_v1" "control_plane" {
+  metadata {
+    name      = "cats-controld"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels    = local.labels
+  }
+
+  spec {
+    min_available = "1"
+
+    selector {
+      match_labels = {
+        "app.kubernetes.io/name" = "cats-controld"
+      }
+    }
+  }
 }
 
 resource "kubernetes_service_v1" "control_plane" {

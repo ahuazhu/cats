@@ -62,8 +62,8 @@ migration ladder rather than abstracting over both.
 
 - The control plane no longer needs the EBS PVC, the `Recreate`-forced
   single-replica coupling to a volume, or the DLM snapshot stopgap; RDS
-  backups cover the control tables. Multi-replica still waits on the
-  leader/lease work (#103 stages that remain open).
+  backups cover the control tables. ADR-0032 completes the subsequent
+  multi-replica and singleton-leadership stage.
 - Local development and every workspace test now require docker (or an
   external PostgreSQL). The credential-free single-file dev shape is gone for
   the control store; the usage/credit dev stores keep their SQLite shape.
@@ -79,6 +79,6 @@ migration ladder rather than abstracting over both.
   Deployment update can wait behind the PVC destroy. The production workflow
   saves the complete plan first, then, only when the legacy claim exists and is
   mounted exclusively by `cats-controld`, verifies that the plan restores the
-  PostgreSQL Deployment to one replica and drains the old Pod before applying
-  that saved plan. It does not bypass the PVC finalizer. States that have
+  PostgreSQL Deployment to at least two replicas and drains the old Pod before
+  applying that saved plan. It does not bypass the PVC finalizer. States that have
   already crossed the cutover take no action.

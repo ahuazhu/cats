@@ -17,33 +17,7 @@ pub(super) async fn create_cat(
         return Err(ApiError::invalid("cat name must be non-empty [a-z0-9-]").into());
     }
     let route = format!("POST /cats {workspace}/{}", req.name);
-    if let Some(key) = idem_key(&headers) {
-        if let Some(op_id) = state.store.idempotency_lookup(&key, &route)? {
-            // Replaying means answering with the cat the original request
-            // created. The record outlives that cat, so once it is deleted the
-            // key would answer 404 for good, and a caller recreating a cat
-            // under the same name could never get past its own earlier
-            // success. Such a record is stale, not a conflict: forget it and
-            // create as if the key had never been seen.
-            let replay = match state.store.find_operation(&op_id)? {
-                Some(op) => state
-                    .store
-                    .find_cat_by_id(&op.resource_id)?
-                    .map(|cat| (op, cat)),
-                None => None,
-            };
-            match replay {
-                Some((operation, cat)) => {
-                    return Ok((
-                        StatusCode::ACCEPTED,
-                        Json(CatOperationResponse { operation, cat }),
-                    )
-                        .into_response());
-                }
-                None => state.store.idempotency_forget(&key, &route)?,
-            }
-        }
-    }
+    let idempotency_key = idem_key(&headers);
     if req.expires_at_unix.is_some_and(|at| at <= 0) {
         return Err(ApiError::invalid("expires_at_unix must be a positive unix timestamp").into());
     }
@@ -51,21 +25,34 @@ pub(super) async fn create_cat(
         .disk
         .as_ref()
         .map(|d| (d.name.as_str(), d.size_bytes, d.mount_at.as_str()));
-    let (cat, _disks, op) = state.store.create_cat(
-        &scope.workspace,
-        &req.name,
-        &req.image,
-        req.cpus,
-        req.memory_mib,
-        req.root_size_bytes,
-        req.auto_suspend,
-        extra,
-        req.expires_at_unix,
-        req.durability,
-    )?;
-    if let Some(key) = idem_key(&headers) {
-        state.store.idempotency_store(&key, &route, &op.id)?;
-    }
+    let (cat, _disks, op) = match idempotency_key {
+        Some(key) => state.store.create_cat_idempotent(
+            &scope.workspace,
+            &req.name,
+            &req.image,
+            req.cpus,
+            req.memory_mib,
+            req.root_size_bytes,
+            req.auto_suspend,
+            extra,
+            req.expires_at_unix,
+            req.durability,
+            &key,
+            &route,
+        )?,
+        None => state.store.create_cat(
+            &scope.workspace,
+            &req.name,
+            &req.image,
+            req.cpus,
+            req.memory_mib,
+            req.root_size_bytes,
+            req.auto_suspend,
+            extra,
+            req.expires_at_unix,
+            req.durability,
+        )?,
+    };
     state.notify.notify_one();
     Ok((
         StatusCode::ACCEPTED,
@@ -117,24 +104,20 @@ pub(super) async fn cat_action(
         require_funded(&state, &workspace).await?;
     }
     let route = format!("POST /cats/{}/actions/{verb}", cat.id);
-    if let Some(key) = idem_key(&headers) {
-        if let Some(op_id) = state.store.idempotency_lookup(&key, &route)? {
-            let op = state.store.get_operation(&op_id)?;
-            let cat = state.store.must_get_cat_by_id(&cat.id)?;
-            return Ok((
-                StatusCode::ACCEPTED,
-                Json(CatOperationResponse { operation: op, cat }),
-            )
-                .into_response());
-        }
-    }
-    let op =
-        state
+    let op_kind = format!("cat.{verb}");
+    let op = match idem_key(&headers) {
+        Some(key) => state.store.set_desired_idempotent(
+            &cat.id,
+            desired,
+            if_match(&headers),
+            &op_kind,
+            &key,
+            &route,
+        )?,
+        None => state
             .store
-            .set_desired(&cat.id, desired, if_match(&headers), &format!("cat.{verb}"))?;
-    if let Some(key) = idem_key(&headers) {
-        state.store.idempotency_store(&key, &route, &op.id)?;
-    }
+            .set_desired(&cat.id, desired, if_match(&headers), &op_kind)?,
+    };
     state.notify.notify_one();
     let cat = state.store.must_get_cat_by_id(&cat.id)?;
     Ok((
@@ -151,12 +134,23 @@ pub(super) async fn delete_cat(
 ) -> ApiResult<Response> {
     check_workspace_auth(&state, &headers, &workspace).await?;
     let cat = state.store.get_cat(&workspace, &cat)?;
-    let op = state.store.set_desired(
-        &cat.id,
-        DesiredState::Deleted,
-        if_match(&headers),
-        "cat.delete",
-    )?;
+    let route = format!("DELETE /cats/{}", cat.id);
+    let op = match idem_key(&headers) {
+        Some(key) => state.store.set_desired_idempotent(
+            &cat.id,
+            DesiredState::Deleted,
+            if_match(&headers),
+            "cat.delete",
+            &key,
+            &route,
+        )?,
+        None => state.store.set_desired(
+            &cat.id,
+            DesiredState::Deleted,
+            if_match(&headers),
+            "cat.delete",
+        )?,
+    };
     state.notify.notify_one();
     let cat_snapshot = state.store.must_get_cat_by_id(&cat.id)?;
     Ok((

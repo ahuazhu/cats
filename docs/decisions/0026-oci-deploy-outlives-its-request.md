@@ -97,9 +97,9 @@ Guest Agent 的 vsock 连接，直到写回响应时才失败。
 - 同一 cat + app + digest 的重试不再触发第二次拉取、合并或 `systemctl restart`。
 - 由 4 起，同步与异步两条回复路径会长期共存。这是刻意付出的代价：换来的是不需要
   协调 Cats 与 Paperboy 的发布顺序。窗口下调到 0 即可完成向纯异步的收敛。
-- 由 8 起，`202` 带来一项新义务：控制面许诺过的事不能凭空消失。控制面是 SQLite
-  单副本、Recreate 策略（ADR 无编号，见 `docs/` 与运维记录），重启期间有真空窗口，
-  因此启动收敛是这项义务的兑现方式，而不是可选的清理。
+- 由 8 起，`202` 带来一项新义务：控制面许诺过的事不能凭空消失。ADR-0032 的每次
+  deployment attempt 持有独立 PostgreSQL session lock；周期 reaper 只收敛已经失去
+  owner session 的记录，另一个活动副本不会把仍在执行的 operation 误判为重启遗留。
 - Schema 版本 3 → 4。新表与新部分唯一索引都由无条件的 `CREATE ... IF NOT EXISTS`
   建立，v3 数据库打开即完成升级，无需 guarded ALTER。v4 之前的部署记录一律缺失，
   这是正确的：Cat 的应用是 Guest 侧状态，一次新部署会重新建立它。

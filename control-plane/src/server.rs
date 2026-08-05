@@ -1,6 +1,7 @@
 //! Control-plane assembly: config, shared state, reconciler task and HTTP
 //! server. `spawn` is used by the binary and by every integration/E2E test.
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +11,21 @@ use cats_metering::{CreditStore, UsageStore};
 use cats_storage::MetadataStore;
 
 use crate::controller::{AutoTierPolicy, Controller};
-use crate::store::{DsnSource, Store};
+use crate::store::{DsnSource, SingletonRole, Store};
+
+const SINGLETON_ELECTION_RETRY: Duration = Duration::from_millis(500);
+const SINGLETON_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Tokio detaches a task when its `JoinHandle` is dropped. Singleton work must
+/// instead stop with the election loop so a shutting-down replica cannot keep
+/// mutating state after its PostgreSQL leadership session has been released.
+struct AbortTaskOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortTaskOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 #[derive(Clone)]
 pub struct Config {
@@ -106,6 +121,110 @@ impl Drop for Handle {
     }
 }
 
+/// Run one background role only while this process owns its PostgreSQL
+/// advisory lock. The lock connection is separate from the API Store
+/// connection: a slow handler cannot delay lease health, and losing the
+/// database session aborts the role before another replica takes it over.
+pub fn spawn_singleton_task<F, Fut>(
+    store: Arc<Store>,
+    role: SingletonRole,
+    make_task: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        'election: loop {
+            let mut session = match store.singleton_session(role) {
+                Ok(session) => session,
+                Err(error) => {
+                    tracing::warn!(
+                        role = role.name(),
+                        error = %error,
+                        "opening singleton election session failed"
+                    );
+                    tokio::time::sleep(SINGLETON_ELECTION_RETRY).await;
+                    continue;
+                }
+            };
+
+            loop {
+                match session.try_acquire() {
+                    Ok(true) => break,
+                    Ok(false) => tokio::time::sleep(SINGLETON_ELECTION_RETRY).await,
+                    Err(error) => {
+                        tracing::warn!(
+                            role = role.name(),
+                            error = %error,
+                            "singleton election session failed"
+                        );
+                        tokio::time::sleep(SINGLETON_ELECTION_RETRY).await;
+                        continue 'election;
+                    }
+                }
+            }
+
+            tracing::info!(role = role.name(), "acquired singleton leadership");
+            let mut task = AbortTaskOnDrop(tokio::spawn(make_task()));
+            loop {
+                tokio::select! {
+                    result = &mut task.0 => {
+                        match result {
+                            Ok(()) => tracing::warn!(
+                                role = role.name(),
+                                "singleton task exited; relinquishing leadership"
+                            ),
+                            Err(error) => tracing::error!(
+                                role = role.name(),
+                                %error,
+                                "singleton task failed; relinquishing leadership"
+                            ),
+                        }
+                        break;
+                    }
+                    _ = tokio::time::sleep(SINGLETON_HEALTH_INTERVAL) => {
+                        if let Err(error) = session.check() {
+                            tracing::warn!(
+                                role = role.name(),
+                                %error,
+                                "singleton leadership connection was lost"
+                            );
+                            task.0.abort();
+                            let _ = (&mut task.0).await;
+                            break;
+                        }
+                    }
+                }
+            }
+            drop(session);
+            tokio::time::sleep(SINGLETON_ELECTION_RETRY).await;
+        }
+    })
+}
+
+async fn run_reconciler_role(controller: Arc<Controller>, store: Arc<Store>, interval: Duration) {
+    let reap_interrupted_deploys = async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            match store.fail_interrupted_oci_deployments() {
+                Ok(0) => {}
+                Ok(count) => tracing::warn!(
+                    count,
+                    "failed OCI deployments whose owner sessions disappeared"
+                ),
+                Err(error) => tracing::error!(
+                    %error,
+                    "checking interrupted OCI deployments failed"
+                ),
+            }
+        }
+    };
+    tokio::join!(controller.run(interval), reap_interrupted_deploys);
+}
+
 /// Start the control plane inside the current tokio runtime.
 pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
     anyhow::ensure!(
@@ -194,21 +313,33 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         }
     });
     let interval = Duration::from_millis(cfg.reconcile_interval_ms);
-    let reconciler_task = tokio::spawn(controller.run(interval));
+    let reconciler = controller.clone();
+    let reconciler_store = state.store.clone();
+    let reconciler_task =
+        spawn_singleton_task(state.store.clone(), SingletonRole::Reconciler, move || {
+            run_reconciler_role(reconciler.clone(), reconciler_store.clone(), interval)
+        });
     let billing_enforcer_task = cfg.billing_enforcement_enabled.then(|| {
         let enforcement_state = state.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                interval.tick().await;
-                if let Err(error) =
-                    crate::api::enforce_exhausted_billing_accounts(&enforcement_state).await
-                {
-                    tracing::error!(error = %error.0, "billing credit enforcement failed");
+        spawn_singleton_task(
+            state.store.clone(),
+            SingletonRole::BillingEnforcer,
+            move || {
+                let enforcement_state = enforcement_state.clone();
+                async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(10));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        interval.tick().await;
+                        if let Err(error) =
+                            crate::api::enforce_exhausted_billing_accounts(&enforcement_state).await
+                        {
+                            tracing::error!(error = %error.0, "billing credit enforcement failed");
+                        }
+                    }
                 }
-            }
-        })
+            },
+        )
     });
 
     tracing::info!(%addr, "control plane ready");

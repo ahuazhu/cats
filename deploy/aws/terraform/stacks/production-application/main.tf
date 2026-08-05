@@ -2,6 +2,7 @@ module "cats_kubernetes" {
   source = "../../modules/cats-kubernetes"
 
   control_plane_image    = var.control_plane_image
+  control_plane_replicas = var.control_plane_replicas
   gateway_image          = var.gateway_image
   runtime_secret_data    = var.runtime_secret_data
   storage_postgres_url   = var.storage_postgres_url

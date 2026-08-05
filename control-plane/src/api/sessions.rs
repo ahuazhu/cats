@@ -185,8 +185,16 @@ pub(super) async fn deploy_oci(
         OciDeploymentClaim::Claimed {
             operation,
             record_id,
+            lease,
         } => {
-            spawn_oci_deploy(&state, &cat, request, record_id, operation.id.clone())?;
+            spawn_oci_deploy(
+                &state,
+                &cat,
+                request,
+                record_id,
+                operation.id.clone(),
+                lease,
+            )?;
             operation
         }
     };
@@ -210,6 +218,7 @@ fn spawn_oci_deploy(
     request: DeployOciRequest,
     record_id: String,
     operation_id: String,
+    owner_fence: Box<crate::store::OciDeploymentLease>,
 ) -> ApiResult<()> {
     let owner = format!("deploy_{}", uuid::Uuid::new_v4().simple());
     // Registry transfer + layer extraction can legitimately take minutes.
@@ -228,21 +237,37 @@ fn spawn_oci_deploy(
     tokio::spawn(async move {
         // Bind the lease to this task, not to the request that started it.
         let _lease = lease;
+        // This PostgreSQL session lock is the cross-replica ownership fence.
+        // Losing it lets another replica fail/retry the attempt; the
+        // operation-id predicate below prevents this task from publishing a
+        // late result after that takeover.
+        let _owner_fence = owner_fence;
         let app = request.app.clone();
         let outcome = drive_oci_deploy(&state, cat.clone(), request, ttl_ms).await;
         let recorded = match &outcome {
-            Ok(deployment) => state.store.succeed_oci_deployment(&record_id, deployment),
-            Err(error) => state
-                .store
-                .fail_oci_deployment(&record_id, &ErrorBody::new(error.code, &error.message)),
+            Ok(deployment) => {
+                state
+                    .store
+                    .succeed_oci_deployment(&record_id, &operation_id, deployment)
+            }
+            Err(error) => state.store.fail_oci_deployment(
+                &record_id,
+                &operation_id,
+                &ErrorBody::new(error.code, &error.message),
+            ),
         };
         match (&outcome, recorded) {
-            (Ok(_), Ok(())) => {
+            (Ok(_), Ok(true)) => {
                 tracing::info!(cat = %cat.id, app = %app, "OCI deployment succeeded")
             }
-            (Err(error), Ok(())) => {
+            (Err(error), Ok(true)) => {
                 tracing::warn!(cat = %cat.id, app = %app, "OCI deployment failed: {}", error.message)
             }
+            (_, Ok(false)) => tracing::warn!(
+                cat = %cat.id, app = %app, record = %record_id,
+                operation = %operation_id,
+                "discarded an OCI deployment result after ownership was lost"
+            ),
             // The deploy resolved but its outcome did not reach the store, so
             // the record stays `running` and no poller can ever see the answer.
             // Startup convergence is the backstop; say so loudly meanwhile.

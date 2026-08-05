@@ -60,12 +60,13 @@ Terraform 配置直接覆盖现网。
 自动变成已由 Terraform 管理。它们在精确 import 完成前不得由新 stack 重建或修改。
 旧 `deploy/aws/k8s/*.yaml` 只保留为迁移对照，不再作为生产 apply 源。
 
-usage publisher、projector 与 S3 archive writer 运行在单副本 `cats-controld` 中。
+usage publisher 可运行在所有 `cats-controld` API 副本中；projector 与 S3 archive
+writer 只运行在 PostgreSQL advisory lock 选出的一个 leader 中（ADR-0032）。
 publisher 只在 Kinesis 接受 attributed checkpoint 后确认 Node outbox；projector
 按 50 秒/4 MiB/1000 条上限生成 NDJSON archive，投影 PostgreSQL 后再推进 DynamoDB
 checkpoint。Pod Identity 只绑定 `cats-controld`；两个 gateway 不获得 usage AWS 权限。
-当前 DynamoDB table 只实现 checkpoint，尚未实现多 projector shard lease，因此
-应用保持单副本，扩容前必须先完成条件租约协议。
+当前 DynamoDB table 只实现 checkpoint；若未来并行运行多个 projector，必须先完成
+条件 shard lease 协议。
 
 ## 影响
 

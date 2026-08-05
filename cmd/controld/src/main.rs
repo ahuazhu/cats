@@ -300,6 +300,7 @@ async fn main() -> anyhow::Result<()> {
             }
             _ => unreachable!("clap validates usage_store_adapter"),
         };
+    let mut usage_projector = None;
     let usage_store: Arc<dyn UsageStore> = match args.usage_delivery_adapter.as_str() {
         "direct" => usage_projection.clone(),
         "aws-kinesis" => {
@@ -322,7 +323,7 @@ async fn main() -> anyhow::Result<()> {
                 },
             )
             .await?;
-            stream.spawn_projector();
+            usage_projector = Some(stream.clone());
             stream
         }
         _ => unreachable!("clap validates usage_delivery_adapter"),
@@ -479,11 +480,21 @@ async fn main() -> anyhow::Result<()> {
         oci_deploy_sync_wait_ms: args.oci_deploy_sync_wait_ms,
     })
     .await?;
+    let usage_projector_task = usage_projector.map(|projector| {
+        cats_control_plane::server::spawn_singleton_task(
+            handle.state.store.clone(),
+            cats_control_plane::store::SingletonRole::UsageProjector,
+            move || projector.clone().run_projector(),
+        )
+    });
     println!("READY {}", handle.addr);
     shutdown_signal().await?;
     // cats-controld is PID 1 in the production image. Explicitly handling
     // SIGTERM stops the reconciler as soon as Kubernetes removes the Pod from
     // Service endpoints, so the deployment gap cannot look like Node loss.
+    if let Some(task) = usage_projector_task {
+        task.abort();
+    }
     handle.shutdown();
     println!("SHUTDOWN");
     Ok(())

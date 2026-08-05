@@ -110,26 +110,21 @@ timer runs from the last persisted observed-state change, so a control-plane
 restart does not reset it and does not demote a long-lived but recently
 suspended Cat.
 
-On control-plane startup, automatic Node-loss fencing waits two full Node lease
-intervals for persisted workers to heartbeat. The daemon handles Kubernetes
-`SIGTERM` explicitly, and the Pod termination grace is shorter than one Node
-lease. Together these prevent a `Recreate` deployment gap from being mistaken
-for permanent Host loss; a genuinely lost Node is fenced after the startup
-grace. A Cold fallback on a still-live Node tears down any stale Suspended/Warm
-runtime and removes its VMM sockets before starting a replacement.
+The elected reconciler applies automatic Node-loss fencing only after its
+startup grace. The daemon handles Kubernetes `SIGTERM` explicitly, releases
+its PostgreSQL leadership session, and stops singleton work before another
+replica takes over.
 
-The control resource database remains SQLite on one encrypted RWO EBS volume,
-so `cats-controld` intentionally has one replica and uses `Recreate`. Shared
-storage metadata is PostgreSQL and is safe across the EKS/metal boundary.
+The control resource database lives in managed PostgreSQL. `cats-controld`
+runs at least two API replicas on distinct Kubernetes nodes with a rolling
+strategy and a disruption budget. Reconciler, billing enforcer and usage
+projector roles elect independently through dedicated PostgreSQL session
+advisory locks; losing that session cancels the role before failover.
 
-That database carries a schema version and is never migrated. `cats-controld`
-refuses to start against any other version — `control-plane database ... is at
-schema version N, this build requires M; recreate it` — so an incompatible
-schema is a crashloop, not a degraded start. The EBS volume is designed to
-survive Pod replacement, so restarting or redeploying does not clear it: delete
-the `cats-control-data` PersistentVolumeClaim in the `cats` namespace and let the
-`WaitForFirstConsumer` class bind a fresh one. A deployment that has never run an
-earlier version needs none of this — a first install has no database to refuse.
+The database carries a schema version. `cats-controld` migrates only stamped
+versions inside the build's supported range and fails closed on incompatible
+versions. The pre-cutover `cats-control-data` PVC is no longer part of the
+runtime; its final snapshot remains only as an archive.
 
 The usage ledger has the same rule for the same reason. ADR-0018 replaced the V1
 `project` ownership column with `workspace_id` on usage rows and `account_id` on

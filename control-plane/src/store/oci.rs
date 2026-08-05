@@ -14,12 +14,12 @@ use super::*;
 pub const OCI_DEPLOY_OPERATION_KIND: &str = "cat.oci-deploy";
 
 /// What a caller should do with a deployment request, decided by the record.
-#[derive(Debug, Clone)]
 pub enum OciDeploymentClaim {
     /// This caller owns the deploy and must drive it to a terminal phase.
     Claimed {
         record_id: String,
         operation: Operation,
+        lease: Box<OciDeploymentLease>,
     },
     /// An attempt for this exact identity is already running. The caller must
     /// not start a second one; it waits on or reports the existing operation.
@@ -49,10 +49,19 @@ impl Store {
         self.enter(|client| {
             let client = client?;
             let mut tx = client.transaction().map_err(internal)?;
+            tx.query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended(
+                    current_schema() || ':oci-identity:' || $1 || ':' || $2 || ':' || $3,
+                    0::BIGINT
+                 ))",
+                &[&cat.id, &app, &image_digest],
+            )
+            .map_err(internal)?;
             let existing: Option<(String, String, String)> = tx
                 .query_opt(
                     "SELECT id, phase, operation_id FROM oci_deployments
-                  WHERE cat_id=$1 AND app=$2 AND image_digest=$3",
+                  WHERE cat_id=$1 AND app=$2 AND image_digest=$3
+                  FOR UPDATE",
                     &[&cat.id, &app, &image_digest],
                 )
                 .map_err(internal)?
@@ -62,6 +71,10 @@ impl Store {
                 .transpose()
                 .map_err(internal)?;
             let now = now_unix();
+            // A stale-owner probe holds the old operation's advisory lock until
+            // this transaction commits. A concurrent retry therefore joins
+            // this attempt instead of racing another replacement operation.
+            let mut stale_owner = None;
             let claim = match existing {
                 Some((record_id, phase, operation_id)) if phase == "succeeded" => {
                     let row = tx
@@ -83,13 +96,33 @@ impl Store {
                     }
                 }
                 Some((record_id, phase, operation_id)) if phase == "running" => {
-                    let row = tx
-                        .query_one("SELECT * FROM operations WHERE id=$1", &[&operation_id])
-                        .map_err(internal)?;
-                    let operation = row_to_operation(&row).map_err(internal)?;
-                    OciDeploymentClaim::AlreadyRunning {
-                        record_id,
-                        operation,
+                    match self.try_oci_deployment_lease(&operation_id)? {
+                        None => {
+                            let row = tx
+                                .query_one(
+                                    "SELECT * FROM operations WHERE id=$1",
+                                    &[&operation_id],
+                                )
+                                .map_err(internal)?;
+                            let operation = row_to_operation(&row).map_err(internal)?;
+                            OciDeploymentClaim::AlreadyRunning {
+                                record_id,
+                                operation,
+                            }
+                        }
+                        Some(lease) => {
+                            stale_owner = Some(lease);
+                            let interrupted = ErrorBody::new(
+                                ErrorCode::Unavailable,
+                                "OCI deployment owner disappeared before recording an outcome; retrying the deploy",
+                            );
+                            Self::finish_operation_in(
+                                &mut tx,
+                                &operation_id,
+                                Some(&interrupted),
+                            )?;
+                            Self::replace_oci_attempt(&mut tx, self, cat, &record_id, now)?
+                        }
                     }
                 }
                 // 'failed' or 'superseded': deploy again on the same row. Failed
@@ -98,25 +131,7 @@ impl Store {
                 // work rather than a replay. The operation is replaced so a caller
                 // polling the new one cannot read the previous outcome.
                 Some((record_id, _, _)) => {
-                    let operation = Self::insert_operation(
-                        &mut tx,
-                        &cat.workspace_id,
-                        OCI_DEPLOY_OPERATION_KIND,
-                        &cat.id,
-                        cat.generation,
-                    )?;
-                    tx.execute(
-                        "UPDATE oci_deployments SET
-                        phase='running', operation_id=$2, error_json=NULL,
-                        manifest_digest=NULL, service=NULL, active=FALSE, updated_at=$3
-                      WHERE id=$1",
-                        &[&record_id, &operation.id, &now],
-                    )
-                    .map_err(internal)?;
-                    OciDeploymentClaim::Claimed {
-                        record_id,
-                        operation,
-                    }
+                    Self::replace_oci_attempt(&mut tx, self, cat, &record_id, now)?
                 }
                 None => {
                     let operation = Self::insert_operation(
@@ -127,6 +142,9 @@ impl Store {
                         cat.generation,
                     )?;
                     let record_id = new_id(ids::OCI_DEPLOYMENT_PREFIX);
+                    let lease = self
+                        .try_oci_deployment_lease(&operation.id)?
+                        .ok_or_else(|| ApiError::internal("new OCI operation lock is occupied"))?;
                     tx.execute(
                         "INSERT INTO oci_deployments
                         (id, cat_id, app, image_digest, operation_id,
@@ -145,11 +163,45 @@ impl Store {
                     OciDeploymentClaim::Claimed {
                         record_id,
                         operation,
+                        lease: Box::new(lease),
                     }
                 }
             };
             tx.commit().map_err(internal)?;
+            drop(stale_owner);
             Ok(claim)
+        })
+    }
+
+    fn replace_oci_attempt(
+        tx: &mut postgres::Transaction<'_>,
+        store: &Store,
+        cat: &Cat,
+        record_id: &str,
+        now: i64,
+    ) -> Result<OciDeploymentClaim> {
+        let operation = Self::insert_operation(
+            tx,
+            &cat.workspace_id,
+            OCI_DEPLOY_OPERATION_KIND,
+            &cat.id,
+            cat.generation,
+        )?;
+        let lease = store
+            .try_oci_deployment_lease(&operation.id)?
+            .ok_or_else(|| ApiError::internal("new OCI operation lock is occupied"))?;
+        tx.execute(
+            "UPDATE oci_deployments SET
+                phase='running', operation_id=$2, error_json=NULL,
+                manifest_digest=NULL, service=NULL, active=FALSE, updated_at=$3
+              WHERE id=$1",
+            &[&record_id, &operation.id, &now],
+        )
+        .map_err(internal)?;
+        Ok(OciDeploymentClaim::Claimed {
+            record_id: record_id.to_string(),
+            operation,
+            lease: Box::new(lease),
         })
     }
 
@@ -163,12 +215,17 @@ impl Store {
     pub fn succeed_oci_deployment(
         &self,
         record_id: &str,
+        operation_id: &str,
         deployment: &OciDeployment,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.enter(|client| {
             let client = client?;
             let mut tx = client.transaction().map_err(internal)?;
-            let (cat_id, app, operation_id) = Self::oci_deployment_keys(&mut tx, record_id)?;
+            let Some((cat_id, app)) =
+                Self::owned_oci_deployment_keys(&mut tx, record_id, operation_id)?
+            else {
+                return Ok(false);
+            };
             let now = now_unix();
             tx.execute(
                 "UPDATE oci_deployments SET phase='superseded', active=FALSE, updated_at=$4
@@ -190,8 +247,9 @@ impl Store {
                 ],
             )
             .map_err(internal)?;
-            Self::finish_operation_in(&mut tx, &operation_id, None)?;
-            tx.commit().map_err(internal)
+            Self::finish_operation_in(&mut tx, operation_id, None)?;
+            tx.commit().map_err(internal)?;
+            Ok(true)
         })
     }
 
@@ -202,11 +260,18 @@ impl Store {
     /// operator reading the record alone learns why it failed. A failure leaves
     /// whatever was already activated for the app alone -- it is still what the
     /// Guest runs.
-    pub fn fail_oci_deployment(&self, record_id: &str, error: &ErrorBody) -> Result<()> {
+    pub fn fail_oci_deployment(
+        &self,
+        record_id: &str,
+        operation_id: &str,
+        error: &ErrorBody,
+    ) -> Result<bool> {
         self.enter(|client| {
             let client = client?;
             let mut tx = client.transaction().map_err(internal)?;
-            let (_, _, operation_id) = Self::oci_deployment_keys(&mut tx, record_id)?;
+            if Self::owned_oci_deployment_keys(&mut tx, record_id, operation_id)?.is_none() {
+                return Ok(false);
+            }
             let error_json = serde_json::to_string(error).map_err(internal)?;
             tx.execute(
                 "UPDATE oci_deployments SET phase='failed', error_json=$2, updated_at=$3
@@ -214,26 +279,32 @@ impl Store {
                 &[&record_id, &error_json, &now_unix()],
             )
             .map_err(internal)?;
-            Self::finish_operation_in(&mut tx, &operation_id, Some(error))?;
-            tx.commit().map_err(internal)
+            Self::finish_operation_in(&mut tx, operation_id, Some(error))?;
+            tx.commit().map_err(internal)?;
+            Ok(true)
         })
     }
 
-    fn oci_deployment_keys(
+    fn owned_oci_deployment_keys(
         tx: &mut postgres::Transaction<'_>,
         record_id: &str,
-    ) -> Result<(String, String, String)> {
+        operation_id: &str,
+    ) -> Result<Option<(String, String)>> {
         let row = tx
-            .query_one(
-                "SELECT cat_id, app, operation_id FROM oci_deployments WHERE id=$1",
-                &[&record_id],
+            .query_opt(
+                "SELECT cat_id, app FROM oci_deployments
+                  WHERE id=$1 AND operation_id=$2 AND phase='running'
+                  FOR UPDATE",
+                &[&record_id, &operation_id],
             )
             .map_err(internal)?;
-        Ok((
-            row.try_get(0).map_err(internal)?,
-            row.try_get(1).map_err(internal)?,
-            row.try_get(2).map_err(internal)?,
-        ))
+        row.map(|row| {
+            Ok((
+                row.try_get(0).map_err(internal)?,
+                row.try_get(1).map_err(internal)?,
+            ))
+        })
+        .transpose()
     }
 
     /// The deployment result behind an operation, once it has succeeded.
@@ -276,23 +347,27 @@ impl Store {
 
     /// Fail every deployment still marked `running`, with its operation.
     ///
-    /// Called once at startup. An in-flight deploy is driven by an in-memory
-    /// task holding pull credentials that are deliberately never persisted, so
-    /// a restart cannot resume it. Leaving the row `running` would block that
-    /// identity for good and leave the operation forever unresolved; reporting
-    /// the truth lets the caller retry. Returns how many rows were converged.
+    /// Called periodically by the elected reconciler. An in-flight deploy is
+    /// driven by an in-memory task holding pull credentials that are
+    /// deliberately never persisted, so a dead owner cannot resume it. Rows
+    /// whose owner session lock is still held are skipped; stranded rows are
+    /// failed so the caller can retry. Returns how many rows were converged.
     pub fn fail_interrupted_oci_deployments(&self) -> Result<usize> {
-        let stranded: Vec<(String, String)> = self.with(|client| {
+        let stranded: Vec<(String, String, String)> = self.with(|client| {
             client
                 .query(
-                    "SELECT id, app FROM oci_deployments WHERE phase='running'",
+                    "SELECT id, app, operation_id FROM oci_deployments WHERE phase='running'",
                     &[],
                 )?
                 .iter()
-                .map(|row| Ok((row.try_get(0)?, row.try_get(1)?)))
+                .map(|row| Ok((row.try_get(0)?, row.try_get(1)?, row.try_get(2)?)))
                 .collect::<std::result::Result<Vec<_>, postgres::Error>>()
         })?;
-        for (record_id, app) in &stranded {
+        let mut failed = 0;
+        for (record_id, app, operation_id) in &stranded {
+            let Some(_owner_fence) = self.try_oci_deployment_lease(operation_id)? else {
+                continue;
+            };
             let error = ErrorBody::new(
                 ErrorCode::Unavailable,
                 format!(
@@ -301,8 +376,8 @@ impl Store {
                      persisted; retry the deploy"
                 ),
             );
-            self.fail_oci_deployment(record_id, &error)?;
+            failed += usize::from(self.fail_oci_deployment(record_id, operation_id, &error)?);
         }
-        Ok(stranded.len())
+        Ok(failed)
     }
 }

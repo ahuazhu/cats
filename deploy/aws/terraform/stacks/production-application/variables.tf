@@ -13,6 +13,17 @@ variable "control_plane_image" {
   type        = string
 }
 
+variable "control_plane_replicas" {
+  description = "Active-active cats-controld API replica count."
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.control_plane_replicas >= 2 && floor(var.control_plane_replicas) == var.control_plane_replicas
+    error_message = "control_plane_replicas must be an integer of at least 2."
+  }
+}
+
 variable "gateway_image" {
   description = "Immutable ECR cats-gatewayd image with sha256 digest."
   type        = string
