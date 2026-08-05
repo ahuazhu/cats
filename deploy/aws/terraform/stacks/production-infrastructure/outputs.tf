@@ -45,3 +45,8 @@ output "worker_deployment_association_ids" {
 output "worker_runtime_secret_arn" {
   value = one(module.metal_worker_deployment[*].runtime_secret_arn)
 }
+
+output "credential_refresher_role_arn" {
+  description = "Pod Identity role the in-cluster credential refresher assumes. Null until database_master_user_secret_arn is set."
+  value       = try(aws_iam_role.credential_refresher[0].arn, null)
+}

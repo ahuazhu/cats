@@ -84,18 +84,39 @@ jobs:
           cache-from: type=gha,scope=control-plane
           cache-to: type=gha,mode=max,scope=control-plane
 
+      # Same Dockerfile, same repository, same digest pinning. The refresher only
+      # differs by target, so it cannot drift from the base image the control
+      # plane runs, and it carries the shared DSN composition script rather than
+      # a second copy of it.
+      - name: Build and push credential-refresher image
+        id: build_refresher
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/aws/Dockerfile.control-plane
+          target: credential-refresher
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:refresher-${{ steps.meta.outputs.tag }}
+          provenance: false
+          cache-from: type=gha,scope=credential-refresher
+          cache-to: type=gha,mode=max,scope=credential-refresher
+
       - name: Pin image digest
         id: image
         shell: bash
         env:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          REFRESHER_DIGEST: ${{ steps.build_refresher.outputs.digest }}
           ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
           ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
         run: |
           set -euo pipefail
           [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$REFRESHER_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           image_ref="${ECR_REGISTRY}/${ECR_REPOSITORY}@${IMAGE_DIGEST}"
           echo "ref=$image_ref" >> "$GITHUB_OUTPUT"
+          echo "refresher_ref=${ECR_REGISTRY}/${ECR_REPOSITORY}@${REFRESHER_DIGEST}" >> "$GITHUB_OUTPUT"
 
       - uses: hashicorp/setup-terraform@v3
         with:
@@ -195,52 +216,12 @@ jobs:
           chmod 600 "$RUNNER_TEMP/master-user-secret.json"
           echo "::add-mask::$(jq -er '.password' "$RUNNER_TEMP/master-user-secret.json")"
 
-          python3 - \
+          python3 deploy/aws/swap-dsn-password.py \
             "$RUNNER_TEMP/live-secret.json" \
             "$RUNNER_TEMP/master-user-secret.json" \
             CATS_POSTGRES_URL \
             CATS_USAGE_POSTGRES_URL \
-            > "$RUNNER_TEMP/rotated-urls.json" <<'PY'
-          import json
-          import sys
-          import urllib.parse
-
-
-          def swap_password(dsn, password):
-              """Replace only the password. Everything else is preserved."""
-              parts = urllib.parse.urlsplit(dsn)
-              if not parts.hostname:
-                  raise SystemExit("DSN has no host; refusing to rewrite it")
-              if not parts.username:
-                  raise SystemExit("DSN has no user; refusing to rewrite it")
-              host = parts.hostname
-              if ":" in host:
-                  host = f"[{host}]"
-              netloc = "{}:{}@{}".format(
-                  urllib.parse.quote(parts.username, safe=""),
-                  urllib.parse.quote(password, safe=""),
-                  host,
-              )
-              if parts.port:
-                  netloc += f":{parts.port}"
-              return urllib.parse.urlunsplit(
-                  (parts.scheme, netloc, parts.path, parts.query, parts.fragment)
-              )
-
-
-          live = json.load(open(sys.argv[1]))
-          password = json.load(open(sys.argv[2]))["password"]
-          # An empty password would otherwise render a syntactically valid,
-          # passwordless DSN and deploy it.
-          if not password:
-              raise SystemExit("the managed secret holds an empty password")
-          rotated = {}
-          for key in sys.argv[3:]:
-              if key not in live:
-                  raise SystemExit(f"{key} is absent from the live runtime secret")
-              rotated[key] = swap_password(live[key], password)
-          json.dump(rotated, sys.stdout)
-          PY
+            > "$RUNNER_TEMP/rotated-urls.json"
           chmod 600 "$RUNNER_TEMP/rotated-urls.json"
 
           for key in \
@@ -399,6 +380,7 @@ jobs:
         shell: bash
         env:
           IMAGE_REF: ${{ steps.image.outputs.ref }}
+          REFRESHER_REF: ${{ steps.image.outputs.refresher_ref }}
         run: |
           set -euo pipefail
           terraform \
@@ -412,7 +394,9 @@ jobs:
             -var="kubeconfig_path=$RUNNER_TEMP/kubeconfig" \
             -var="kubeconfig_context=$EKS_CLUSTER_NAME" \
             -var="control_plane_image=$IMAGE_REF" \
-            -var="gateway_image=$IMAGE_REF"
+            -var="gateway_image=$IMAGE_REF" \
+            -var="credential_refresher_image=$REFRESHER_REF" \
+            -var="database_master_user_secret_arn=$RDS_MASTER_USER_SECRET_ARN"
 
       - name: Apply reviewed plan
         shell: bash
