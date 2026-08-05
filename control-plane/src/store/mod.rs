@@ -72,6 +72,22 @@ pub fn new_id(prefix: &str) -> String {
 pub const DEFAULT_ENDPOINT_NAME: &str = "web";
 pub const DEFAULT_ENDPOINT_PORT: u16 = 8080;
 
+/// Serialize every decision that can add a Cat to a schedulable node with
+/// every node-state transition that changes whether scheduling is allowed.
+///
+/// The invariant spans rows (fleet capacity plus node admission), so a row
+/// lock cannot close the read-Ready/cordon/commit race. A transaction advisory
+/// lock gives all control-plane replicas the same linearization point.
+fn lock_placement(tx: &mut postgres::Transaction<'_>) -> std::result::Result<(), postgres::Error> {
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
+            current_schema() || ':placement', 0::BIGINT
+         ))",
+        &[],
+    )?;
+    Ok(())
+}
+
 fn dns_slug(value: &str, max_len: usize) -> String {
     let mut slug = String::with_capacity(value.len().min(max_len));
     for ch in value.chars() {

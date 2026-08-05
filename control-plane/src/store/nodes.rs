@@ -172,7 +172,13 @@ impl Store {
     pub fn set_node_state(&self, node_id: &str, state: NodeState) -> Result<()> {
         let state = node_state_str(state);
         let n = self.with(|client| {
-            client.execute(
+            let mut tx = client.transaction()?;
+            // A placement that already observed Ready must commit before this
+            // transition, while every later placement must observe the new
+            // state. Without the shared lock, cordon could return and an older
+            // placement could still appear on the node afterwards.
+            lock_placement(&mut tx)?;
+            let changed = tx.execute(
                 "UPDATE nodes
                     SET state=CASE
                             WHEN state='fenced' AND $2<>'fenced' THEN state
@@ -187,7 +193,9 @@ impl Store {
                         END
                   WHERE id=$1",
                 &[&node_id, &state],
-            )
+            )?;
+            tx.commit()?;
+            Ok(changed)
         })?;
         if n == 0 {
             return Err(ApiError::not_found(format!("node {node_id}")));
