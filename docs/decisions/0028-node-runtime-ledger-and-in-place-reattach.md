@@ -17,7 +17,7 @@ Node Agent 目前把「这个 Node 上有哪些 Cat 在跑」完全放在内存�
 2. 启动时必须在 30 秒内向控制面注册，否则 `spawn` 直接 `bail`
    （[`node-agent/src/server.rs:1580`](../../node-agent/src/server.rs)）。控制面短时不可用
    会让 Node 进程退出，而不是降级。
-3. 两个生产 systemd unit 都没有设置 `KillMode`
+3. 本决策实施前，两个生产 systemd unit 都没有设置 `KillMode`
    （[`deploy/aws/metal/cats-worker.service`](../../deploy/aws/metal/cats-worker.service)、
    [`deploy/metal/systemd/cats-noded.service`](../../deploy/metal/systemd/cats-noded.service)）。
    systemd 默认 `KillMode=control-group`，因此 `systemctl restart` 会杀掉 unit cgroup 内
@@ -112,16 +112,23 @@ Agent 启动先扫描并接管本地 inventory，再在后台重试向控制面�
 只有携带完整同 generation inventory 的注册才能用于恢复控制面侧的 Lost claim；
 inventory 不完整时该 Node 继续保持 Lost，由控制面决定后续处置。
 
-### 6. 子进程归属：per-Cat systemd scope，且必须晚于重接管能力上线
+### 6. 子进程存活与归属：`KillMode=process`，随后是 per-Cat systemd scope
 
-VMM 与 blockd 移出 Agent 的 unit cgroup，放入 per-Cat transient scope
+§3/§7 覆盖全部常驻状态的重接管能力上线后，两个生产 unit 先设置 `KillMode=process`。
+`systemctl restart` 与 `systemctl stop` 只终止 Agent 主进程，VMM 与 blockd 留在 delegated
+unit cgroup 中，随后由 ledger、PID 身份和协议握手证明并重接管。这样 Agent 升级不再同时
+杀掉 Host 上的全部 Guest 和持有未发布 journal 的 blockd。
+
+随后把 VMM 与 blockd 移出 Agent 的 unit cgroup，放入 per-Cat transient scope
 （`cats-cat-<cat_id>.scope`，置于独立 slice 下）。scope 的存在与其 `cgroup.procs` 成为
-第 3 步中最强的一项归属证据，并且 `systemctl restart` 与 `systemctl stop` 都不再波及
-Guest。
+第 3 步中更强的一项归属证据，也让单只 Cat 的停止边界可由 systemd 明确表达。
 
 排序是本 ADR 的一部分，不是实现细节：**先让 Agent 能证明并重接管，再让子进程在重启后
-存活**。反过来做只会把「重启杀掉 Guest」换成「重启产生无人认领的孤儿进程」。在 scope
-落地前，`KillMode` 保持默认不变。
+存活**。反过来做只会把「重启杀掉 Guest」换成「重启产生无人认领的孤儿进程」。这个前置
+约束针对的是重接管能力：`Running`、`Suspended`、`Warm`、`Stopping` 尚未都能安全重接管
+前，`KillMode` 必须保持默认；该前置完成后可以先用 `KillMode=process` 保留子进程，再独立
+落地 per-Cat scope。NodeJob 结果持久化仍按 §4 独立演进；成功 job 在重启后重复执行是有界的
+幂等工作，不是子进程接管的安全前置。
 
 FakeVmm/开发与 macOS 路径没有 systemd。这些路径不使用 scope，仅依赖 ledger 与 PID
 身份校验；它们本来就不承载生产 workload。
@@ -177,7 +184,7 @@ FakeVmm/开发与 macOS 路径没有 systemd。这些路径不使用 scope，仅
 3. NodeJob journal 持久化与重放。
 4. `Suspended`/`Warm`/`Stopping` 接管与 Cold fallback 收敛。判据是「这个状态下还有没有
    活进程」：有活进程而不能接管，上了阶段 5 就是孤儿。
-5. per-Cat systemd scope 与 `KillMode` 变更，附运维文档更新。
+5. `KillMode=process` 与运维文档更新；随后落地 per-Cat systemd scope。
 
 **阶段 4 是阶段 5 的前提，不是可以并列或跳过的一项。** 今天 Suspended 的 VMM 是活着的、
 暂停着的，Agent 重启时被 systemd 一并杀掉，Cat 因此干净地收敛到 Cold。一旦阶段 5 让子进程

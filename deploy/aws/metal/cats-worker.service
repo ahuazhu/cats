@@ -5,6 +5,10 @@ Wants=network-online.target
 
 [Service]
 Delegate=cpu memory
+# Stop or restart only the node agent. Its ledger-backed adoption path proves
+# and re-adopts the surviving VMM and blockd processes (ADR-0028); killing the
+# whole cgroup here would terminate every Cat on this worker at once.
+KillMode=process
 Environment=CATS_GUEST_NETWORK_CIDR=10.240.0.0/16
 EnvironmentFile=/etc/cats/worker.env
 ExecStartPre=/usr/sbin/modprobe nbd nbds_max=64
