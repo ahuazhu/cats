@@ -1214,7 +1214,6 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
@@ -1232,6 +1231,7 @@ dependencies = [
  "cats-test-support",
  "futures-util",
  "hex",
+ "jsonwebtoken",
  "libc",
  "reqwest",
  "rusqlite",

@@ -150,6 +150,12 @@ pub struct ProxyHttpRequest {
     pub body: Vec<u8>,
     pub target_port: u16,
     pub route_epoch: i64,
+    /// Public hostname whose active binding authorized this hop.
+    #[serde(default)]
+    pub hostname: String,
+    /// Opaque EdDSA JWS issued by the control plane (ADR-0033).
+    #[serde(default)]
+    pub route_grant: String,
 }
 
 /// Guest HTTP response returned by the owning node to the gateway.

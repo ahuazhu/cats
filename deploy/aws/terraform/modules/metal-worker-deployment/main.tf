@@ -1,8 +1,9 @@
 data "aws_partition" "current" {}
 
 locals {
-  resource_name = "${var.name_prefix}-${var.environment}-worker"
-  artifact_key  = "worker/${var.worker_bundle_sha256}/cats-worker.tar.zst"
+  resource_name                 = "${var.name_prefix}-${var.environment}-worker"
+  artifact_key                  = "worker/${var.worker_bundle_sha256}/cats-worker.tar.zst"
+  route_grant_public_key_base64 = base64encode(var.route_grant_public_key_pem)
   tags = merge(var.tags, {
     Component   = "metal-worker-deployment"
     Environment = var.environment
@@ -70,7 +71,7 @@ locals {
     # jq was already being used below without ever being checked for. It is
     # also what render-postgres-url uses to read the managed secret.
     # curl talks to IMDS when a fresh host derives its advertise address.
-    for required in aws jq zstd tar sha256sum findmnt curl; do
+    for required in aws jq zstd tar sha256sum findmnt curl base64 openssl; do
       command -v "$required" >/dev/null 2>&1 || {
         echo "worker deployment needs $required on the host" >&2
         exit 1
@@ -83,10 +84,11 @@ locals {
     runtime_overlay=""
     environment_temp=""
     seed_temp=""
+    route_grant_key_temp=""
     cleanup() {
       rm -rf -- "$stage_path"
       rm -f -- "$artifact_path"
-      for temporary_path in "$runtime_secret" "$runtime_overlay" "$environment_temp" "$seed_temp"; do
+      for temporary_path in "$runtime_secret" "$runtime_overlay" "$environment_temp" "$seed_temp" "$route_grant_key_temp"; do
         if [ -n "$temporary_path" ]; then
           rm -f -- "$temporary_path"
         fi
@@ -126,6 +128,15 @@ locals {
     # target node is already drained and cordoned.
     "$stage_path/require-idle-worker.sh" "$metering_root" "${var.install_root}/bin"
 
+    # Validate verification material before changing any installed binary.
+    # The public half is intentionally separate from worker.env: PEM is
+    # multiline, non-secret, and must never be confused with the shared
+    # service token. Terraform rewrites it on every drained deployment.
+    route_grant_key_temp="$(mktemp /var/tmp/cats-route-grant-public.XXXXXX)"
+    printf '%s' '${local.route_grant_public_key_base64}' | base64 --decode > "$route_grant_key_temp"
+    openssl pkey -pubin -in "$route_grant_key_temp" -text_pub -noout \
+      | grep -q '^ED25519 Public-Key:'
+
     # -D creates the parent directory. Without it a host that has never been
     # touched by install.sh fails here: /opt/cats/bin does not exist yet, and
     # the association only ever ran against hosts that had been set up by hand.
@@ -138,6 +149,8 @@ locals {
     install -m 0644 "$stage_path/cats-worker.service" /etc/systemd/system/cats-worker.service
     install -m 0644 "$stage_path/cats-postgres-url.service" /etc/systemd/system/cats-postgres-url.service
     install -m 0644 "$stage_path/cats-postgres-url.timer" /etc/systemd/system/cats-postgres-url.timer
+
+    install -D -o root -g root -m 0644 "$route_grant_key_temp" /etc/cats/route-grant-public.pem
 
     runtime_secret="$(mktemp /var/tmp/cats-worker-runtime.XXXXXX)"
     runtime_overlay="$(mktemp /var/tmp/cats-worker-overlay.XXXXXX)"

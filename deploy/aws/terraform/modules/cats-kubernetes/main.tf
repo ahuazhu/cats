@@ -150,6 +150,21 @@ resource "kubernetes_secret_v1" "gateway_runtime" {
   data = local.gateway_secret_data
 }
 
+# Separate from runtime and gateway credentials so the signing key is mounted
+# as a file only in cats-controld and can never be inherited by cats-gatewayd.
+resource "kubernetes_secret_v1" "route_grant_signing" {
+  metadata {
+    name      = "cats-route-grant-signing"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels    = local.labels
+  }
+
+  type = "Opaque"
+  data = {
+    "private.pem" = var.route_grant_private_key_pem
+  }
+}
+
 resource "kubernetes_config_map_v1" "rds_ca" {
   metadata {
     name      = "cats-rds-ca"
@@ -195,8 +210,9 @@ resource "kubernetes_deployment_v1" "control_plane" {
           "app.kubernetes.io/name" = "cats-controld"
         })
         annotations = {
-          "cats.run/runtime-secret-sha256" = sha256(jsonencode(local.runtime_secret_data))
-          "cats.run/rds-ca-sha256"         = sha256(local.rds_ca_pem)
+          "cats.run/runtime-secret-sha256"  = sha256(jsonencode(local.runtime_secret_data))
+          "cats.run/route-grant-key-sha256" = sha256(var.route_grant_private_key_pem)
+          "cats.run/rds-ca-sha256"          = sha256(local.rds_ca_pem)
         }
       }
 
@@ -274,6 +290,11 @@ resource "kubernetes_deployment_v1" "control_plane" {
           env {
             name  = "CATS_OCI_DEPLOY_SYNC_WAIT_MS"
             value = tostring(var.oci_deploy_sync_wait_ms)
+          }
+
+          env {
+            name  = "CATS_ROUTE_GRANT_PRIVATE_KEY_FILE"
+            value = "/etc/cats/route-grant/private.pem"
           }
 
           # All PostgreSQL clients verify RDS TLS with this CA. Their DSNs are
@@ -363,6 +384,12 @@ resource "kubernetes_deployment_v1" "control_plane" {
             mount_path = "/etc/cats/runtime"
             read_only  = true
           }
+
+          volume_mount {
+            name       = "route-grant-signing"
+            mount_path = "/etc/cats/route-grant"
+            read_only  = true
+          }
         }
 
         volume {
@@ -378,6 +405,14 @@ resource "kubernetes_deployment_v1" "control_plane" {
 
           secret {
             secret_name = kubernetes_secret_v1.runtime.metadata[0].name
+          }
+        }
+
+        volume {
+          name = "route-grant-signing"
+
+          secret {
+            secret_name = kubernetes_secret_v1.route_grant_signing.metadata[0].name
           }
         }
       }

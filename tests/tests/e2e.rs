@@ -22,6 +22,9 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 const SERVICE_TOKEN: &str = "dev-service-token";
 const ADMIN_TOKEN: &str = "dev-admin-token";
+const ROUTE_GRANT_PRIVATE_KEY: &[u8] =
+    include_bytes!("../fixtures/route_grant_private_ed25519.pem");
+const ROUTE_GRANT_PUBLIC_KEY: &[u8] = include_bytes!("../fixtures/route_grant_public_ed25519.pem");
 
 struct Cluster {
     dir: tempfile::TempDir,
@@ -50,6 +53,13 @@ impl Cluster {
             credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
             storage_meta,
             auth_token: SERVICE_TOKEN.into(),
+            route_grant_signer: Arc::new(
+                cats_control_plane::route_grant::RouteGrantSigner::from_ed25519_pem(
+                    ROUTE_GRANT_PRIVATE_KEY,
+                    2,
+                )
+                .unwrap(),
+            ),
             admin_token: ADMIN_TOKEN.into(),
             workos: None,
             stripe: None,
@@ -121,6 +131,12 @@ impl Cluster {
             listen: "127.0.0.1:0".into(),
             control_plane_url: cp.base_url(),
             auth_token: SERVICE_TOKEN.into(),
+            route_grant_verifier: Arc::new(
+                cats_node_agent::route_grant::RouteGrantVerifier::from_ed25519_pem(
+                    ROUTE_GRANT_PUBLIC_KEY,
+                )
+                .unwrap(),
+            ),
             gateway_url: gateway.base_url(),
             cpus: 16,
             memory_mib: 32_768,
@@ -360,8 +376,8 @@ fn extract(body: &str, key: &str) -> String {
         .to_string()
 }
 
-/// Work count 0 drives immediate Suspend; a Gateway request holds work while
-/// waking/proxying and its final release lets the Cat go straight back down.
+/// Work count 0 drives Suspend; an Endpoint wake leaves a bounded activation
+/// lease, then the Cat goes back down after its TTL and the Node guard clear.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn work_driven_fast_suspend_and_gateway_wake_loop() {
     let cluster = Cluster::start(&["node-a"]).await;
@@ -460,8 +476,11 @@ async fn absolute_expiry_reaps_the_cat_without_any_caller() {
     cluster.cli_ok(&["destroy", "keeper"]).await;
 }
 
+/// Admission is authorized once. The Node holds its local activity guard for
+/// the full stream, so neither control-plane loss nor Grant expiry tears down
+/// an established WebSocket (ADR-0033).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn public_endpoint_proxies_websocket_frames() {
+async fn established_endpoint_websocket_survives_control_plane_outage() {
     let cluster = Cluster::start(&["node-a"]).await;
     cluster
         .cli_ok(&[
@@ -499,8 +518,58 @@ async fn public_endpoint_proxies_websocket_frames() {
         socket.next().await.unwrap().unwrap().into_data(),
         vec![0, 1, 2, 255]
     );
+
+    cluster.cp.shutdown();
+    // The removed control-plane work lease renewed every 30 seconds. Cross
+    // that exact old failure boundary as well as the two-second test Grant.
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    socket.send("after control outage".into()).await.unwrap();
+    assert_eq!(
+        socket.next().await.unwrap().unwrap().into_text().unwrap(),
+        "after control outage"
+    );
     socket.close(None).await.unwrap();
-    cluster.cli_ok(&["destroy", "realtime"]).await;
+}
+
+/// A Running Endpoint is data-plane traffic. Once the Gateway has a bounded
+/// route authorization, losing every control-plane replica must not stop the
+/// healthy Node and Guest before that authorization expires (ADR-0033).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn running_endpoint_survives_control_plane_outage_with_cached_route_grant() {
+    let cluster = Cluster::start(&["node-a"]).await;
+    cluster
+        .cli_ok(&[
+            "create",
+            "independent",
+            "--root-size",
+            "8MiB",
+            "--memory",
+            "256MiB",
+            "--cpus",
+            "1",
+            "--no-auto-suspend",
+        ])
+        .await;
+    let hostname = cluster.endpoint_hostname("independent", "web").await;
+
+    let (status, first) = cluster.gateway_get(&hostname, "/before-outage").await;
+    assert_eq!(status, 200, "failed to prime route cache: {first}");
+
+    cluster.cp.shutdown();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let (status, during) = cluster.gateway_get(&hostname, "/during-outage").await;
+    assert_eq!(
+        status, 200,
+        "a cached, unexpired Running route must outlive the control plane: {during}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    let (status, expired) = cluster.gateway_get(&hostname, "/after-grant-expiry").await;
+    assert_eq!(
+        status, 502,
+        "the Gateway must fail closed once the cached authorization expires: {expired}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -708,6 +777,8 @@ async fn product_loop_end_to_end() {
             body: Vec::new(),
             target_port: 8080,
             route_epoch: 1,
+            hostname: hostname.clone(),
+            route_grant: String::new(),
         })
         .send()
         .await

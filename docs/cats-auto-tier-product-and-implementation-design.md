@@ -26,7 +26,7 @@ Warm 稳定保持 24 小时且仍无工作
 
 “没有租约”的准确含义是“平台和 Guest 用户程序都没有请求继续运行”，不是 Cats 证明 Guest 中所有进程已经完成。Guest 内信号由 Guest 内用户程序设置；Guest Agent 不扫描 `/proc`，不根据 CPU、load、TCP、块 IO 或进程名代替用户判断。
 
-V1 新建 Cat 默认 `auto_suspend=on`。平台入口工作由 Gateway/exec 租约自动保护；需要持续后台运行的 Guest workload 必须接入工作租约，或按 Cat 显式关闭：
+V1 新建 Cat 默认 `auto_suspend=on`。`exec` 和运行时控制操作由控制面租约保护；Running Endpoint 请求由 Node 本地 activity guard 保护，睡眠 Cat 的 Endpoint 唤醒另有一个短时 activation lease。需要持续后台运行的 Guest workload 必须接入工作租约，或按 Cat 显式关闭：
 
 ```text
 cats create worker
@@ -56,7 +56,7 @@ CATS_AUTO_COLD_AFTER_SECONDS=86400   # Warm 稳定 24 小时后转 Cold
 | 自动休眠已开启 | 新建 Cat 默认开启；未接入工作租约且需要持续运行的后台程序应显式关闭 |
 | desired / observed 都是 Running | 不和 start、resume、drain、fencing 或其他生命周期转换并行决策 |
 | Guest 工作摘要新鲜 | 信号链故障时 fail-awake，不把“收不到信号”解释为“没有工作” |
-| 所有未过期租约的并集为空 | Gateway、exec、Guest 用户任务中的任一工作都阻止自动睡眠 |
+| 所有未过期控制面/Guest 租约的并集为空 | activation、exec、Guest 用户任务中的任一工作都阻止自动睡眠 |
 | Node 和 Guest 的最终静默栅栏通过 | 封住控制面判定到 VMM pause 之间的新工作竞态 |
 | durable FLUSH 成功 | 保持“成功 FLUSH 可承受 Host 永久丢失”的存储不变量 |
 
@@ -66,13 +66,13 @@ CATS_AUTO_COLD_AFTER_SECONDS=86400   # Warm 稳定 24 小时后转 Cold
 
 | 来源 | 租约 kind | 生命周期 |
 |---|---|---|
-| Endpoint Gateway 请求 | `gateway` | 准备唤醒/代理前 acquire，响应结束后 release |
+| Endpoint 唤醒 | `gateway` | 控制面创建一次 activation lease 覆盖完整的有界 Wake；观察到 Running 后把同一租约收短为 5 秒，不续租，由 TTL 覆盖到 Node guard 建立的窗口 |
 | `cats exec` | `exec` | 唤醒前 acquire，命令成功或失败后 release |
 | Guest 用户程序 | `guest` | 用户程序通过本机 socket acquire / renew / release |
 | 将来的临时 pin | `pin` | TTL 到期或用户显式释放 |
 | 运行时控制变更 | `control` | V1 的热挂载/卸载；后续覆盖更多运行时 operation |
 
-V1 已接通 Gateway、exec、Guest 用户程序以及磁盘热挂载/卸载。工作租约有 TTL，调用方异常退出或 release 丢失时会自动恢复，不会永久压住 Cat。
+V1 已接通 Endpoint activation、exec、Guest 用户程序以及磁盘热挂载/卸载。工作租约有 TTL，调用方异常退出或 release 丢失时会自动恢复，不会永久压住 Cat。Running HTTP/WS 不为每个请求访问控制面：Gateway 携带短期签名 Route Grant，Node 验证后在整个请求或连接期间持有本地 guard；签发、缓存、过期和 fail-closed 语义见 [ADR-0033](decisions/0033-short-lived-signed-route-grants.md)。
 
 不算工作的项目包括：读取 Cat 元数据、健康探针、CPU 利用率、Guest load、没有连接的监听 socket、普通后台进程的存在。这些信号要么与业务完成无关，要么无法安全地区分“等待中”和“已经完成”。
 
@@ -142,16 +142,16 @@ auto-suspend=on work=1 guest-signal=fresh eligible=false reason=active_work
 
 ### 3.2 唤醒语义
 
-- `WakeOnRequest` Endpoint 和 `exec` 都在唤醒前 acquire 工作租约。
+- `WakeOnRequest` Endpoint 由控制面的 Wake 事务创建一个 activation lease 覆盖有界启动等待；观察到 Running 后把同一租约收短为不续租的 5 秒 handoff；`exec` 仍在唤醒前 acquire 自己的工作租约。
 - 多个并发请求共享一次 desired Running 转换；`ensure_desired_running` 在事务中实现 singleflight，避免每个请求都增加 generation。
 - Gateway 的 `NoWake` 请求在 Cat 睡眠时直接失败，不为了记录工作而唤醒。
-- 请求/exec 完成后 release；如果它是最后一个租约，Cat 可以立刻再次 Suspend。
+- Endpoint 进入 Node 后由本地 activity guard 覆盖整个 HTTP/WS 生命周期；请求结束即释放 guard，activation lease 最迟在 5 秒 TTL 后消失。`exec` 完成后显式 release。
 - Suspend 正在准备时到达的新工作优先：旧 Suspend 被拒绝，或者已 pause 后立即走现有 resume 路径。请求不允许进入一个即将 pause 的 Guest。
 
 因此可形成预期的短周期：
 
 ```text
-Suspended --请求到达--> Running --响应结束且无其他工作--> Suspended
+Suspended --请求到达--> Running --响应结束、activation TTL 到期且无其他工作--> Suspended
 ```
 
 快速启、快速睡不保证某个固定生产延迟；已有 metal 实验只能作为机制证据，不能升级为 SLA。
@@ -212,7 +212,7 @@ cat_work_leases(id, cat_id, kind, owner_id, label,
 
 `work_version` 在 acquire、renew/替换、release、TTL 清理时单调增加。Guest 报告按 `(node_id, generation, source_epoch, lease_sequence)` 去重和拒绝旧源；只有当前 placement 的 Node 能写入。
 
-`try_auto_suspend` 是决策线性化点。它在一个 SQLite 事务中：
+`try_auto_suspend` 是控制面决策线性化点。它在一个 PostgreSQL 事务中：
 
 1. 清理过期 lease；
 2. 重查 policy、desired / observed 和 Guest freshness；
@@ -230,7 +230,7 @@ cat_work_leases(id, cat_id, kind, owner_id, label,
 
 `observed_state_since_ms` 保存在数据库中，只在 observed state 真正变化时更新。控制面重启、重复心跳或无变化的 reconcile 不会重置深层休眠计时。节点执行仍复用手动 Warm/Cold 的幂等 Job、durable generation 门禁与 Cold cleanup。
 
-生产 PostgreSQL adapter 应保持相同 SQL/CAS 形状；不能把 lease 计数放到单个控制器进程内存中。
+生产 PostgreSQL adapter 保持相同 SQL/CAS 形状；lease 计数不在单个控制器进程内存中。控制面看到“无租约”之后仍可能立即到达新的 Running Endpoint 流量，因此这个数据库事务不是最终 pause authority；Node 的本地 activity gate 才是 Suspend 的最后仲裁者，并会把竞态拒绝为 `ActivityChanged`。
 
 ### 4.4 Suspend work fence
 
@@ -243,7 +243,7 @@ SuspendWorkFence {
 }
 ```
 
-Guest sequence 是 Node/Guest 两阶段校验的直接 fence。`control_work_version` 记录控制面决策版本，用于审计和将来 Node 回调校验；V1 平台工作竞态同时由 desired generation、Gateway/exec 的先 acquire 后 wake、以及 Node 最终 proxy/exec gate 封住。
+Guest sequence 是 Node/Guest 两阶段校验的直接 fence。`control_work_version` 记录控制面决策版本，用于审计和将来 Node 回调校验；V1 平台工作竞态同时由 desired generation、Endpoint Wake activation lease / exec 的先 acquire 后 wake，以及 Node 最终 proxy/exec gate 封住。
 
 ## 5. HTTP 与进程协议
 
@@ -268,6 +268,7 @@ POST /v1/nodes/work-status
 ```
 
 这些接口只接受 service/admin token。`kind=guest` 不能从 internal acquire 伪造，只能由当前 Node 的 Guest 工作摘要产生。
+Gateway 的普通 Running HTTP/WS 不调用这些接口；只有控制面的 Endpoint Wake 路径创建短期 `gateway` activation lease。
 
 ### 5.3 Guest 协议
 
@@ -298,7 +299,8 @@ Host control 继续使用现有的 u32 big-endian length + JSON framing over AF_
 |---|---|
 | Guest/Node 工作信号过期 | fail-awake，不创建自动 Suspend |
 | lease release 上报丢失 | TTL + 1 秒长轮询刷新修复 |
-| Gateway/exec release 丢失 | 控制面 TTL 自动清理 |
+| Endpoint activation / exec release 丢失 | 控制面 TTL 自动清理；activation 本来就不续租 |
+| Running Endpoint 期间控制面全部失联 | 已缓存且未过期的 Route Grant 继续准入；Node 本地 guard 阻止 Suspend；新连接在 Grant 过期后 fail-closed |
 | Guest lease 报告乱序 | 同 epoch 的旧 sequence 忽略 |
 | 旧 Node/旧 generation 上报 | conflict，不能改变当前 Cat |
 | quiesce 中新工作到达 | sequence 变化，Node 返回 ActivityChanged |
@@ -316,7 +318,7 @@ V1 已实现：
 - Cat 级 `auto_suspend`，新建 Cat 默认开启且可显式关闭；
 - Guest 本机 `/run/cats/runtime.sock` HTTP 工作租约 API，以及可选的 `cats-guest-work` HTTP 包装器；
 - Node 长轮询上报和 freshness fail-awake；
-- Gateway、exec 工作租约；
+- Endpoint Wake activation lease、exec 工作租约和 Running Endpoint 的 Node 本地 activity guard；
 - 控制面事务判定、singleflight wake、operation 与原因码；
 - Node/Guest 两阶段 quiesce、ActivityChanged 拒绝和竞态恢复；
 - Suspended 的 file-backed Guest RAM `process_madvise(MADV_PAGEOUT)`；
@@ -329,7 +331,7 @@ V1 已实现：
 - 基于 Node 内存、memory backing、snapshot NVMe 水位的压力驱动提前晋级；
 - 按套餐/Workspace/Cat 覆盖全局深层休眠阈值；
 - tap/overlay 数据面。将来流量不再经过 Node proxy 时，必须建立等价的本地 activity gate，不能只依赖控制面 lease。
-- PostgreSQL metadata adapter 和 privilege separation。
+- privilege separation。
 - Web 控制台卡片。V1 API 和 CLI 已具备完整解释数据，UI 仍需接入。
 
 ## 8. 验收标准
@@ -338,7 +340,7 @@ V1 已实现：
 
 1. 自动策略关闭时，工作集合为空也不自动睡。
 2. Guest signal 缺失或过期时不自动睡。
-3. 任一 Gateway、exec 或 Guest lease 存活时不自动睡。
+3. 任一 Endpoint activation、exec 或 Guest lease 存活时不自动睡；任一 Running Endpoint 本地 guard 存活时 Node 拒绝 Suspend。
 4. 通用 HTTP 客户端可通过 Unix socket 完成 create/renew/delete/list；不监听固定 TCP/UDP 端口。
 5. 最后一个 lease release 后无需 idle timer 即创建 auto-suspend operation。
 6. Guest lease 在 PrepareSuspend 前变化时，Node 返回 ActivityChanged，Cat 保持 Running。
@@ -365,8 +367,8 @@ cargo clippy --workspace --all-targets
 
 1. 实现并验证真正 page-out，使 Suspended 同时释放 vCPU 和可回收内存页。
 2. 将 API 状态和原因码接入用户/管理员控制台。
-3. 为长连接 Gateway lease 增加续租；当前简化 HTTP proxy 有 60 秒超时，120 秒 lease 足够，但 WebSocket/SSE 需要持续 renew。
-4. 加入带 TTL 的用户 pin 和控制面变更 lease。
+3. 为 Route Grant 密钥轮换加入公钥重叠窗口，避免当前需要 drain/协调发布的切换步骤。
+4. 加入带 TTL 的用户 pin 和更多控制面变更 lease。
 5. 加入 Node 内存/backing/snapshot 水位驱动的提前 Warm/Cold，以及按套餐与 Workspace 的阈值覆盖。时间只服务于“睡得更深”，不回到“等一段空闲时间才允许 Suspend”的模型。
 
 核心原则保持不变：**工作从 1 变 0 就尝试快速睡；工作从 0 变 1 就快速启；任何不确定性都 fail-awake。**

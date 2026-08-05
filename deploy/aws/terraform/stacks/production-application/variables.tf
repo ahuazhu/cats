@@ -35,6 +35,12 @@ variable "runtime_secret_data" {
   sensitive   = true
 }
 
+variable "route_grant_private_key_pem" {
+  description = "PKCS#8 Ed25519 private key for control-plane Route Grant signing. Supply through an approved secret store."
+  type        = string
+  sensitive   = true
+}
+
 variable "storage_postgres_url" {
   description = "ChunkStore metadata PostgreSQL URL."
   type        = string

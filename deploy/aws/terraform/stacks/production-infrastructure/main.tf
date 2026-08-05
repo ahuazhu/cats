@@ -34,8 +34,9 @@ resource "terraform_data" "metal_worker_inputs" {
         var.worker_bundle_path != "",
         var.worker_bundle_sha256 != "",
         length(var.worker_runtime_secret_data) > 0,
+        length(trimspace(var.route_grant_public_key_pem)) > 0,
       ])
-      error_message = "The metal worker release path needs worker instances, instance role, bundle path, bundle sha256 and runtime secret data. Leave metal_worker_instances empty to skip it until the hardware exists."
+      error_message = "The metal worker release path needs worker instances, instance role, bundle path, bundle sha256, runtime secret data and the Route Grant public key. Leave metal_worker_instances empty to skip it until the hardware exists."
     }
   }
 }
@@ -62,6 +63,7 @@ module "metal_worker_deployment" {
   deploy_instances           = var.metal_worker_deploy_instances
   instance_role_name         = var.metal_worker_instance_role_name
   worker_runtime_secret_data = var.worker_runtime_secret_data
+  route_grant_public_key_pem = var.route_grant_public_key_pem
   worker_base_environment    = var.worker_base_environment
 
   # The worker reads the database password from its authority instead of a copy.

@@ -125,6 +125,7 @@ cluster through an explicit EKS access entry.
 Copy the examples outside source control, replace the bucket name, then:
 
 ```sh
+export TF_VAR_route_grant_public_key_pem="$(cat /approved/path/route-grant-public.pem)"
 cd deploy/aws/terraform/stacks/production-infrastructure
 cp backend.hcl.example backend.hcl
 cp production.tfvars.example production.auto.tfvars
@@ -199,6 +200,7 @@ example:
 
 ```sh
 export TF_VAR_runtime_secret_data='{"CATS_AUTH_TOKEN":"...","CATS_ADMIN_TOKEN":"..."}'
+export TF_VAR_route_grant_private_key_pem="$(cat /approved/secret/path/route-grant-private.pem)"
 export TF_VAR_storage_postgres_url='postgresql://...'
 export TF_VAR_usage_postgres_url='postgresql://...'
 export TF_VAR_rds_ca_pem='-----BEGIN CERTIFICATE-----...'
@@ -216,6 +218,14 @@ terraform apply production.tfplan
 Terraform's `sensitive` flag only redacts normal CLI output. Secret values still
 exist in state and in saved plans, which is why both require the same access
 control as production credentials.
+
+The Route Grant key is asymmetric (ADR-0033). Every control-plane replica gets
+the same private key from the application state; metal workers get only its
+public half from the infrastructure state. Never add the private key to
+`runtime_secret_data`, `worker_runtime_secret_data`, Gateway configuration or a
+Guest image. Generate the pair with `openssl genpkey -algorithm ED25519` and
+`openssl pkey -pubout`, then rotate it only through a coordinated drained
+rollout until multi-key verification exists.
 
 `storage_postgres_url` and `usage_postgres_url` are intentionally independent.
 During the early shared-RDS phase they may point to the same instance/database,

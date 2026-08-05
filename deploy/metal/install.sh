@@ -20,7 +20,7 @@ apt-get update -q
 # libssl-dev is required by the PostgreSQL metadata adapter's native-tls stack.
 apt-get install -qy build-essential curl git nbd-client busybox-static \
   musl-tools e2fsprogs cpio zstd pkg-config libssl-dev debootstrap iptables \
-  util-linux
+  util-linux openssl
 
 echo "==> rust toolchain"
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -145,6 +145,25 @@ if [[ ! -f /etc/cats/cats.env ]]; then
   install -m 0600 "$REPO/deploy/metal/cats.env.example" /etc/cats/cats.env
   echo "    wrote /etc/cats/cats.env (edit for S3; defaults to local file blobstore)"
 fi
+
+# The single-host development shape owns one local signing key. Keep the
+# private half root-only and derive the public half on every install so the
+# files cannot silently drift apart. Production supplies the pair through its
+# separate control-plane and worker deployment states.
+if [[ ! -f /etc/cats/route-grant-private.pem ]]; then
+  route_key_temp=$(mktemp /var/tmp/cats-route-grant-private.XXXXXX)
+  trap 'rm -f -- "$route_key_temp"' EXIT
+  openssl genpkey -algorithm ED25519 -out "$route_key_temp"
+  install -o root -g root -m 0600 "$route_key_temp" /etc/cats/route-grant-private.pem
+  rm -f -- "$route_key_temp"
+  trap - EXIT
+fi
+route_public_temp=$(mktemp /var/tmp/cats-route-grant-public.XXXXXX)
+trap 'rm -f -- "$route_public_temp"' EXIT
+openssl pkey -in /etc/cats/route-grant-private.pem -pubout -out "$route_public_temp"
+install -o root -g root -m 0644 "$route_public_temp" /etc/cats/route-grant-public.pem
+rm -f -- "$route_public_temp"
+trap - EXIT
 
 echo "==> systemd units"
 install -m 0644 "$REPO"/deploy/metal/systemd/*.service /etc/systemd/system/

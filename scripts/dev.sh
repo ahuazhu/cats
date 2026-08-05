@@ -20,6 +20,18 @@ GW=127.0.0.1:7400
 
 up() {
   mkdir -p "$STATE" "$LOGS" "$STATE/blob"
+  command -v openssl >/dev/null 2>&1 || {
+    echo "scripts/dev.sh needs openssl to create the local Route Grant key" >&2
+    exit 1
+  }
+  if [[ ! -f "$STATE/route-grant-private.pem" ]]; then
+    openssl genpkey -algorithm ED25519 -out "$STATE/route-grant-private.pem"
+    chmod 0600 "$STATE/route-grant-private.pem"
+  fi
+  openssl pkey \
+    -in "$STATE/route-grant-private.pem" \
+    -pubout \
+    -out "$STATE/route-grant-public.pem"
   echo "building workspace..."
   (cd "$ROOT" && cargo build --workspace -q)
   BIN="$ROOT/target/debug"
@@ -27,6 +39,7 @@ up() {
   echo "starting control plane on http://$API"
   "$BIN/cats-controld" \
     --listen "$API" \
+    --route-grant-private-key-file "$STATE/route-grant-private.pem" \
     --db-path "$STATE/control.db" \
     --metadata-store-adapter sqlite \
     --metadata-store-option "path=$STATE/storage-meta.db" \
@@ -45,6 +58,7 @@ up() {
   "$BIN/cats-noded" \
     --node-id n1 \
     --control-plane-url "http://$API" \
+    --route-grant-public-key-file "$STATE/route-grant-public.pem" \
     --gateway-url "http://$GW" \
     --state-dir "$STATE/node-n1" \
     --metadata-store-adapter sqlite \

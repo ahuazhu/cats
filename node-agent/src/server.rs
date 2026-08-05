@@ -96,6 +96,8 @@ pub struct ServerConfig {
     pub advertise_url: Option<String>,
     pub control_plane_url: String,
     pub auth_token: String,
+    /// Public-key verifier for control-plane signed Endpoint Route Grants.
+    pub route_grant_verifier: Arc<crate::route_grant::RouteGrantVerifier>,
     pub gateway_url: String,
     pub cpus: u32,
     pub memory_mib: u64,
@@ -607,8 +609,30 @@ async fn handle_proxy(
     if let Err(code) = check_auth(&state.cfg, &headers) {
         return code.into_response();
     }
+    let claims = match state.cfg.route_grant_verifier.verify(
+        &request.route_grant,
+        crate::route_grant::ExpectedRouteGrant {
+            hostname: &request.hostname,
+            cat_id: &cat_id,
+            node_id: &state.cfg.node.node_id,
+            route_epoch: request.route_epoch,
+            target_port: request.target_port,
+        },
+    ) {
+        Ok(claims) => claims,
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                format!("invalid route grant: {error:#}"),
+            )
+                .into_response()
+        }
+    };
     let runtime = state.runtime.clone();
-    let result = tokio::task::spawn_blocking(move || runtime.proxy_http(&cat_id, &request)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        runtime.proxy_http(&cat_id, claims.cat_generation, &request)
+    })
+    .await;
     match result {
         Ok(Ok(response)) => Json(response).into_response(),
         Ok(Err(error)) => {
@@ -627,8 +651,8 @@ async fn handle_proxy(
 #[derive(serde::Deserialize)]
 struct ProxyWebSocketQuery {
     target_port: u16,
-    #[allow(dead_code)]
     route_epoch: i64,
+    hostname: String,
     path: String,
 }
 
@@ -647,14 +671,42 @@ async fn handle_proxy_websocket(
     if let Err(code) = check_auth(&state.cfg, &headers) {
         return code.into_response();
     }
+    let route_grant = match headers
+        .get("x-cats-route-grant")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(route_grant) => route_grant,
+        None => return (StatusCode::CONFLICT, "missing Endpoint Route Grant").into_response(),
+    };
+    let claims = match state.cfg.route_grant_verifier.verify(
+        route_grant,
+        crate::route_grant::ExpectedRouteGrant {
+            hostname: &query.hostname,
+            cat_id: &cat_id,
+            node_id: &state.cfg.node.node_id,
+            route_epoch: query.route_epoch,
+            target_port: query.target_port,
+        },
+    ) {
+        Ok(claims) => claims,
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                format!("invalid route grant: {error:#}"),
+            )
+                .into_response()
+        }
+    };
     let forwarded = match decode_forwarded_headers(&headers) {
         Ok(headers) => headers,
         Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
     };
     let runtime = state.runtime.clone();
     let target_port = query.target_port;
-    let opened =
-        tokio::task::spawn_blocking(move || runtime.open_proxy_target(&cat_id, target_port)).await;
+    let opened = tokio::task::spawn_blocking(move || {
+        runtime.open_proxy_target(&cat_id, claims.cat_generation, target_port)
+    })
+    .await;
     let (target, activity_guard) = match opened {
         Ok(Ok(opened)) => opened,
         Ok(Err(error)) => {

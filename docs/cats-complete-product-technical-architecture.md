@@ -663,7 +663,8 @@ Edge 选择证书、校验 Host/SNI、执行限流和最大请求策略。
 
 **3. Route Lookup**
 
-按 hostname 查只读缓存，得到 workspace/cat/node/port/epoch。
+按 hostname 查只读缓存，得到 workspace/cat/generation/node/port/epoch 和短期 Ed25519
+签名 Route Grant。控制面只对 active + Running 路由签发；Gateway 没有签名私钥。
 
 **4. Activation**
 
@@ -673,13 +674,20 @@ Cat 非 Running 时按 wake policy 唤醒；并发请求 singleflight。
 
 通过区域私网/mTLS 或受控 tunnel 发送到 owning Node gateway。
 
-**6. Epoch Check**
+**6. Grant / Epoch Check**
 
-Node 再校验 route epoch 和 Guest IP，拒绝旧绑定与跨租户端口。
+Node 验证 Route Grant 的签名、时效、hostname、Cat generation、Node、route epoch 和
+目标端口，再校验本地 Cat 仍为 Running，拒绝旧绑定与跨租户端口。
 
 **7. Guest**
 
 转发到 tap 私网地址；响应字节计入 tenant egress ledger。
+
+**控制面故障契约（[ADR-0033](decisions/0033-short-lived-signed-route-grants.md)）：**
+Gateway 的普通缓存过期后，只有控制面 transport/5xx 故障才可在签名到期前继续使用
+已缓存的 active + Running Route Grant；明确 not-found、其他非成功响应、畸形响应和
+签名到期都 fail closed。HTTP/WS 的生命周期并发由 Node 持有的本地 activity guard
+仲裁，不再逐请求获取 PostgreSQL work lease；Wake 仍必须经过控制面。
 
 ### 9.2 地址与路由
 

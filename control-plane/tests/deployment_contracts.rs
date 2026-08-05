@@ -74,6 +74,65 @@ fn production_platform_defaults_to_independent_az_dependencies() {
     }
 }
 
+#[test]
+fn route_grant_private_key_reaches_only_control_plane_and_nodes_get_public_key() {
+    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    let control = kubernetes
+        .split_once("resource \"kubernetes_deployment_v1\" \"control_plane\"")
+        .and_then(|(_, rest)| rest.split_once("resource \"kubernetes_pod_disruption_budget_v1\""))
+        .map(|(section, _)| section)
+        .expect("control-plane Deployment section");
+    let gateway = kubernetes
+        .split_once("resource \"kubernetes_deployment_v1\" \"gateway\"")
+        .map(|(_, section)| section)
+        .expect("Gateway Deployment section");
+    for fragment in [
+        "kubernetes_secret_v1.route_grant_signing",
+        "CATS_ROUTE_GRANT_PRIVATE_KEY_FILE",
+        "/etc/cats/route-grant/private.pem",
+    ] {
+        assert!(
+            control.contains(fragment) || kubernetes.contains(fragment),
+            "control-plane Route Grant delivery lost {fragment:?}"
+        );
+        assert!(
+            !gateway.contains(fragment),
+            "Gateway must never receive Route Grant signing material: {fragment:?}"
+        );
+    }
+
+    let worker =
+        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
+    assert!(worker.contains("base64encode(var.route_grant_public_key_pem)"));
+    assert!(worker.contains("/etc/cats/route-grant-public.pem"));
+    for unit in [
+        "deploy/aws/metal/cats-worker.service",
+        "deploy/metal/systemd/cats-noded.service",
+    ] {
+        assert!(
+            read_workspace_file(unit)
+                .contains("--route-grant-public-key-file /etc/cats/route-grant-public.pem"),
+            "{unit} does not give cats-noded its verification key"
+        );
+    }
+
+    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
+    assert!(workflow.contains(
+        "ROUTE_GRANT_PRIVATE_KEY_PEM_B64: ${{ secrets.ROUTE_GRANT_PRIVATE_KEY_PEM_B64 }}"
+    ));
+    assert!(workflow.contains("route-grant-private.pem"));
+    assert!(workflow.contains("openssl pkey"));
+    assert!(workflow.contains("^ED25519 Private-Key:"));
+    assert!(workflow.contains(
+        "--rawfile route_grant_private_key_pem \"$RUNNER_TEMP/route-grant-private.pem\""
+    ));
+    assert!(workflow.contains("route_grant_private_key_pem: $route_grant_private_key_pem"));
+
+    let dev = read_workspace_file("scripts/dev.sh");
+    assert!(dev.contains("--route-grant-private-key-file"));
+    assert!(dev.contains("--route-grant-public-key-file"));
+}
+
 #[cfg(unix)]
 fn ha_fixture_guard() -> std::sync::MutexGuard<'static, ()> {
     static FIXTURE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();

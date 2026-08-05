@@ -115,6 +115,21 @@ variable "worker_runtime_secret_data" {
   }
 }
 
+variable "route_grant_public_key_pem" {
+  description = "Ed25519 public key installed on every worker for Endpoint Route Grant verification."
+  type        = string
+
+  validation {
+    condition = (
+      var.route_grant_public_key_pem == "" || (
+        startswith(trimspace(var.route_grant_public_key_pem), "-----BEGIN PUBLIC KEY-----") &&
+        endswith(trimspace(var.route_grant_public_key_pem), "-----END PUBLIC KEY-----")
+      )
+    )
+    error_message = "route_grant_public_key_pem must be a PEM public key."
+  }
+}
+
 variable "database_master_user_secret_arn" {
   description = <<-EOT
     ARN of the RDS managed master user secret, the one authority for the

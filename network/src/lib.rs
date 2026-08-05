@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use axum::body::{to_bytes, Body};
@@ -25,11 +25,7 @@ use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-use cats_api::requests::{
-    AcquireWorkRequest, AcquireWorkResponse, ProxyHttpRequest, ProxyHttpResponse,
-    ReleaseWorkRequest,
-};
-use cats_api::resources::WorkKind;
+use cats_api::requests::{ProxyHttpRequest, ProxyHttpResponse};
 use cats_api::resources::{ObservedState, RouteBinding, WakePolicy};
 
 #[derive(Debug, Clone)]
@@ -41,18 +37,44 @@ pub struct GatewayConfig {
     pub cache_ttl_ms: u64,
 }
 
-#[derive(Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 struct ResolveResponse {
     binding: RouteBinding,
     state: String,
     observed_state: ObservedState,
     node_agent_url: String,
+    route_grant: Option<String>,
+    route_grant_expires_at_unix: Option<u64>,
 }
 
 #[derive(Clone)]
 struct CachedRoute {
     resolved: ResolveResponse,
     fetched: Instant,
+}
+
+fn route_is_locally_usable(resolved: &ResolveResponse) -> bool {
+    if resolved.state != "active" || resolved.observed_state != ObservedState::Running {
+        return resolved.route_grant.is_none() && resolved.route_grant_expires_at_unix.is_none();
+    }
+    let Some(grant) = resolved.route_grant.as_deref() else {
+        return false;
+    };
+    let Some(expires_at) = resolved.route_grant_expires_at_unix else {
+        return false;
+    };
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return false;
+    };
+    !grant.is_empty() && expires_at > now.as_secs()
+}
+
+fn cached_outage_route(cached: Option<&CachedRoute>) -> Option<ResolveResponse> {
+    let resolved = &cached?.resolved;
+    (resolved.state == "active"
+        && resolved.observed_state == ObservedState::Running
+        && route_is_locally_usable(resolved))
+    .then(|| resolved.clone())
 }
 
 #[derive(Clone)]
@@ -85,10 +107,16 @@ impl Gateway {
     }
 
     async fn resolve(&self, hostname: &str, use_cache: bool) -> Result<ResolveResponse, Response> {
+        let cached = if use_cache {
+            self.cache.lock().unwrap().get(hostname).cloned()
+        } else {
+            None
+        };
         if use_cache {
-            let cache = self.cache.lock().unwrap();
-            if let Some(hit) = cache.get(hostname) {
-                if hit.fetched.elapsed() < Duration::from_millis(self.cfg.cache_ttl_ms) {
+            if let Some(hit) = &cached {
+                if hit.fetched.elapsed() < Duration::from_millis(self.cfg.cache_ttl_ms)
+                    && route_is_locally_usable(&hit.resolved)
+                {
                     return Ok(hit.resolved.clone());
                 }
             }
@@ -98,14 +126,43 @@ impl Gateway {
             .get(format!("{}/v1/routes/resolve", self.cp()))
             .query(&[("hostname", hostname)])
             .bearer_auth(&self.cfg.auth_token)
+            .timeout(Duration::from_secs(2))
             .send()
-            .await
-            .map_err(|e| gw_error(StatusCode::BAD_GATEWAY, format!("resolve failed: {e}")))?;
+            .await;
+        let resp = match resp {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(fallback) = cached_outage_route(cached.as_ref()) {
+                    tracing::warn!(
+                        hostname,
+                        ?fallback.route_grant_expires_at_unix,
+                        %error,
+                        "control-plane route resolve failed; using bounded cached Route Grant"
+                    );
+                    return Ok(fallback);
+                }
+                return Err(gw_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("resolve failed: {error}"),
+                ));
+            }
+        };
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(gw_error(
                 StatusCode::NOT_FOUND,
                 format!("no route for host {hostname}"),
             ));
+        }
+        if resp.status().is_server_error() {
+            if let Some(fallback) = cached_outage_route(cached.as_ref()) {
+                tracing::warn!(
+                    hostname,
+                    status = %resp.status(),
+                    ?fallback.route_grant_expires_at_unix,
+                    "control-plane route resolve failed; using bounded cached Route Grant"
+                );
+                return Ok(fallback);
+            }
         }
         if !resp.status().is_success() {
             return Err(gw_error(
@@ -117,6 +174,19 @@ impl Gateway {
             .json()
             .await
             .map_err(|e| gw_error(StatusCode::BAD_GATEWAY, format!("bad resolve body: {e}")))?;
+        if resolved.state == "active" && resolved.observed_state == ObservedState::Running {
+            if !route_is_locally_usable(&resolved) {
+                return Err(gw_error(
+                    StatusCode::BAD_GATEWAY,
+                    "active Running route has no unexpired Route Grant".to_string(),
+                ));
+            }
+        } else if resolved.route_grant.is_some() || resolved.route_grant_expires_at_unix.is_some() {
+            return Err(gw_error(
+                StatusCode::BAD_GATEWAY,
+                "inactive route unexpectedly carried a Route Grant".to_string(),
+            ));
+        }
         self.cache.lock().unwrap().insert(
             hostname.to_string(),
             CachedRoute {
@@ -149,60 +219,6 @@ impl Gateway {
         Ok(())
     }
 
-    async fn acquire_request_work(
-        &self,
-        cat_id: &str,
-        owner_id: Option<String>,
-    ) -> Result<(String, String), Response> {
-        let owner_id =
-            owner_id.unwrap_or_else(|| format!("gateway_{}", uuid::Uuid::new_v4().simple()));
-        let response = self
-            .http
-            .post(format!("{}/v1/internal/work/acquire", self.cp()))
-            .bearer_auth(&self.cfg.auth_token)
-            .json(&AcquireWorkRequest {
-                cat_id: cat_id.to_string(),
-                kind: WorkKind::Gateway,
-                owner_id: owner_id.clone(),
-                label: "endpoint_request".to_string(),
-                ttl_ms: 120_000,
-            })
-            .send()
-            .await
-            .map_err(|error| {
-                gw_error(
-                    StatusCode::BAD_GATEWAY,
-                    format!("work acquire failed: {error}"),
-                )
-            })?;
-        if !response.status().is_success() {
-            return Err(gw_error(
-                StatusCode::BAD_GATEWAY,
-                format!("work acquire status {}", response.status()),
-            ));
-        }
-        let acquired: AcquireWorkResponse = response.json().await.map_err(|error| {
-            gw_error(
-                StatusCode::BAD_GATEWAY,
-                format!("bad work acquire body: {error}"),
-            )
-        })?;
-        Ok((acquired.lease.id, owner_id))
-    }
-
-    async fn release_request_work(&self, lease_id: String) {
-        let response = self
-            .http
-            .post(format!("{}/v1/internal/work/release", self.cp()))
-            .bearer_auth(&self.cfg.auth_token)
-            .json(&ReleaseWorkRequest { lease_id })
-            .send()
-            .await;
-        if let Err(error) = response {
-            tracing::warn!(%error, "failed to release gateway work lease; TTL will recover it");
-        }
-    }
-
     /// One proxy attempt through the owning node. Ok(None) = stale route.
     async fn try_proxy(
         &self,
@@ -220,6 +236,13 @@ impl Gateway {
         let mut request = request.clone();
         request.target_port = resolved.binding.target_port;
         request.route_epoch = resolved.binding.epoch;
+        request.hostname = resolved.binding.hostname.clone();
+        request.route_grant = resolved.route_grant.clone().ok_or_else(|| {
+            gw_error(
+                StatusCode::BAD_GATEWAY,
+                "Running route has no Route Grant".to_string(),
+            )
+        })?;
         let resp = self
             .http
             .post(url)
@@ -284,21 +307,8 @@ impl Gateway {
             );
         }
 
-        // Acquire before wake/proxy. The final release is the event that can
-        // immediately drive work_count 1 -> 0 -> Suspended.
-        let work_lease = match self
-            .acquire_request_work(&resolved.binding.cat_id, None)
+        self.handle_resolved(&hostname, &request, &mut resolved)
             .await
-        {
-            Ok((lease, _)) => lease,
-            Err(response) => return response,
-        };
-
-        let response = self
-            .handle_with_work(&hostname, &request, &mut resolved)
-            .await;
-        self.release_request_work(work_lease).await;
-        response
     }
 
     async fn handle_websocket(
@@ -320,25 +330,14 @@ impl Gateway {
                 "endpoint does not wake on request".into(),
             );
         }
-        let (lease_id, owner_id) = match self
-            .acquire_request_work(&resolved.binding.cat_id, None)
-            .await
-        {
-            Ok(lease) => lease,
-            Err(response) => return response,
-        };
         if resolved.observed_state != ObservedState::Running || resolved.state != "active" {
             if let Err(response) = self.wake(&hostname).await {
-                self.release_request_work(lease_id).await;
                 return response;
             }
             self.invalidate(&hostname);
             resolved = match self.resolve(&hostname, false).await {
                 Ok(resolved) => resolved,
-                Err(response) => {
-                    self.release_request_work(lease_id).await;
-                    return response;
-                }
+                Err(response) => return response,
             };
         }
         let mut prepared = self
@@ -361,10 +360,7 @@ impl Gateway {
         }
         let (node, response) = match prepared {
             Ok(prepared) => prepared,
-            Err(response) => {
-                self.release_request_work(lease_id).await;
-                return response;
-            }
+            Err(response) => return response,
         };
         let selected_protocol = response
             .headers()
@@ -376,13 +372,8 @@ impl Gateway {
         } else {
             ws
         };
-        let gateway = self.clone();
-        let cat_id = resolved.binding.cat_id.clone();
         upgrade.on_upgrade(move |client| async move {
-            gateway
-                .bridge_websocket(client, node, &cat_id, &owner_id)
-                .await;
-            gateway.release_request_work(lease_id).await;
+            Self::bridge_websocket(client, node).await;
         })
     }
 
@@ -427,6 +418,7 @@ impl Gateway {
         url.query_pairs_mut()
             .append_pair("target_port", &resolved.binding.target_port.to_string())
             .append_pair("route_epoch", &resolved.binding.epoch.to_string())
+            .append_pair("hostname", hostname)
             .append_pair("path", path);
         let forwarded = forwarded_headers(headers, hostname)
             .map_err(|message| gw_error(StatusCode::BAD_REQUEST, message))?;
@@ -456,6 +448,21 @@ impl Gateway {
                 )
             })?,
         );
+        let route_grant = resolved.route_grant.as_deref().ok_or_else(|| {
+            gw_error(
+                StatusCode::BAD_GATEWAY,
+                "Running route has no Route Grant".to_string(),
+            )
+        })?;
+        request.headers_mut().insert(
+            HeaderName::from_static("x-cats-route-grant"),
+            HeaderValue::from_str(route_grant).map_err(|_| {
+                gw_error(
+                    StatusCode::BAD_GATEWAY,
+                    "Route Grant is not a valid HTTP header".to_string(),
+                )
+            })?,
+        );
         if let Some(protocols) = headers.get(header::SEC_WEBSOCKET_PROTOCOL) {
             request
                 .headers_mut()
@@ -477,19 +484,13 @@ impl Gateway {
     }
 
     async fn bridge_websocket(
-        &self,
         client: WebSocket,
         node: tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
-        cat_id: &str,
-        owner_id: &str,
     ) {
         let (mut client_sender, mut client_receiver) = client.split();
         let (mut node_sender, mut node_receiver) = node.split();
-        let mut renewal = tokio::time::interval(Duration::from_secs(30));
-        renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        renewal.tick().await;
         loop {
             tokio::select! {
                 incoming = client_receiver.next() => {
@@ -519,15 +520,6 @@ impl Gateway {
                         break;
                     }
                 }
-                _ = renewal.tick() => {
-                    if self
-                        .acquire_request_work(cat_id, Some(owner_id.to_string()))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
             }
         }
         let _ = node_sender
@@ -535,7 +527,7 @@ impl Gateway {
             .await;
     }
 
-    async fn handle_with_work(
+    async fn handle_resolved(
         &self,
         hostname: &str,
         request: &ProxyHttpRequest,
@@ -662,6 +654,8 @@ async fn entry(State(gw): State<Gateway>, req: Request<Body>) -> Response {
             // Resolved per attempt so stale-route retry uses the fresh values.
             target_port: 0,
             route_epoch: 0,
+            hostname: String::new(),
+            route_grant: String::new(),
         },
     )
     .await
@@ -696,8 +690,72 @@ pub async fn spawn(cfg: GatewayConfig) -> anyhow::Result<Handle> {
 
 #[cfg(test)]
 mod tests {
-    use super::forwarded_headers;
+    use super::*;
     use axum::http::{HeaderMap, HeaderValue};
+    use axum::Json;
+
+    #[derive(Clone)]
+    enum RouteReply {
+        Active,
+        Status(StatusCode),
+        Malformed,
+    }
+
+    async fn route_reply(State(reply): State<Arc<Mutex<RouteReply>>>) -> Response {
+        let reply = reply.lock().unwrap().clone();
+        match reply {
+            RouteReply::Active => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                Json(serde_json::json!({
+                    "binding": {
+                        "hostname": "dev.cats.run",
+                        "workspace_id": "ws_1",
+                        "cat_id": "cat_1",
+                        "node_id": "node-a",
+                        "gateway_url": "http://gateway",
+                        "target_port": 8080,
+                        "epoch": 7,
+                        "wake_policy": "wake_on_request"
+                    },
+                    "state": "active",
+                    "observed_state": "running",
+                    "node_agent_url": "http://node-a",
+                    "route_grant": "opaque-signed-token",
+                    "route_grant_expires_at_unix": now + 60
+                }))
+                .into_response()
+            }
+            RouteReply::Status(status) => status.into_response(),
+            RouteReply::Malformed => (StatusCode::OK, "not-json").into_response(),
+        }
+    }
+
+    async fn route_test_gateway(
+        reply: Arc<Mutex<RouteReply>>,
+    ) -> (Gateway, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/routes/resolve", get(route_reply))
+            .with_state(reply);
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let gateway = Gateway {
+            cfg: Arc::new(GatewayConfig {
+                listen: "127.0.0.1:0".to_string(),
+                control_plane_url: format!("http://{addr}"),
+                auth_token: "service-token".to_string(),
+                cache_ttl_ms: 0,
+            }),
+            http: reqwest::Client::new(),
+            cache: Arc::new(Mutex::new(HashMap::new())),
+        };
+        (gateway, task)
+    }
 
     #[test]
     fn public_host_replaces_untrusted_forwarded_host() {
@@ -718,5 +776,54 @@ mod tests {
             "preview.cats.run".to_string()
         )));
         assert!(forwarded.contains(&("x-request-id".to_string(), "request-1".to_string())));
+    }
+
+    #[tokio::test]
+    async fn cached_grant_fallback_is_limited_to_transport_or_server_failure() {
+        let reply = Arc::new(Mutex::new(RouteReply::Active));
+        let (gateway, task) = route_test_gateway(reply.clone()).await;
+        gateway.resolve("dev.cats.run", true).await.unwrap();
+
+        *reply.lock().unwrap() = RouteReply::Status(StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(gateway.resolve("dev.cats.run", true).await.is_ok());
+
+        *reply.lock().unwrap() = RouteReply::Status(StatusCode::NOT_FOUND);
+        assert_eq!(
+            gateway
+                .resolve("dev.cats.run", true)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        *reply.lock().unwrap() = RouteReply::Malformed;
+        assert_eq!(
+            gateway
+                .resolve("dev.cats.run", true)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::BAD_GATEWAY
+        );
+
+        gateway
+            .cache
+            .lock()
+            .unwrap()
+            .get_mut("dev.cats.run")
+            .unwrap()
+            .resolved
+            .route_grant_expires_at_unix = Some(1);
+        *reply.lock().unwrap() = RouteReply::Status(StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            gateway
+                .resolve("dev.cats.run", true)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::BAD_GATEWAY
+        );
+        task.abort();
     }
 }

@@ -49,6 +49,10 @@ jobs:
       # Optional staged cutover. Empty preserves the direct-RDS storage DSN and
       # client-side session setup; setting it changes only the storage host.
       RDS_PROXY_ENDPOINT: ${{ vars.RDS_PROXY_ENDPOINT }}
+      # PKCS#8 Ed25519 signing key, base64-encoded so GitHub can carry the PEM
+      # without line-ending changes. Only cats-controld receives the decoded
+      # file; workers get its public half through the infrastructure stack.
+      ROUTE_GRANT_PRIVATE_KEY_PEM_B64: ${{ secrets.ROUTE_GRANT_PRIVATE_KEY_PEM_B64 }}
 
     steps:
       - uses: actions/checkout@v4
@@ -140,16 +144,23 @@ jobs:
             TF_STATE_APPLICATION_KEY \
             EKS_CLUSTER_NAME \
             PRODUCTION_TFVARS_B64 \
-            RDS_MASTER_USER_SECRET_ARN
+            RDS_MASTER_USER_SECRET_ARN \
+            ROUTE_GRANT_PRIVATE_KEY_PEM_B64
           do
             if [[ -z "${!name:-}" ]]; then
-              echo "::error::Missing required repository variable $name"
+              echo "::error::Missing required repository configuration $name"
               exit 1
             fi
           done
 
           printf '%s' "$PRODUCTION_TFVARS_B64" \
             | base64 --decode > "$RUNNER_TEMP/production.tfvars"
+          printf '%s' "$ROUTE_GRANT_PRIVATE_KEY_PEM_B64" \
+            | base64 --decode > "$RUNNER_TEMP/route-grant-private.pem"
+          openssl pkey \
+            -in "$RUNNER_TEMP/route-grant-private.pem" \
+            -text -noout \
+            | grep -q '^ED25519 Private-Key:'
 
           aws eks update-kubeconfig \
             --name "$EKS_CLUSTER_NAME" \
@@ -273,8 +284,10 @@ jobs:
             --slurpfile rotated "$RUNNER_TEMP/rotated-urls.json" \
             --rawfile rds_ca_pem "$RUNNER_TEMP/rds-ca.pem" \
             --arg storage_postgres_session_setup "$storage_postgres_session_setup" \
+            --rawfile route_grant_private_key_pem "$RUNNER_TEMP/route-grant-private.pem" \
             '{
               runtime_secret_data: $runtime_secret_data[0],
+              route_grant_private_key_pem: $route_grant_private_key_pem,
               storage_postgres_url: $rotated[0].CATS_POSTGRES_URL,
               storage_postgres_session_setup: $storage_postgres_session_setup,
               usage_postgres_url: $rotated[0].CATS_USAGE_POSTGRES_URL,
@@ -287,6 +300,7 @@ jobs:
             "$RUNNER_TEMP/live-secret.json" \
             "$RUNNER_TEMP/runtime-secret.json" \
             "$RUNNER_TEMP/rds-ca.pem" \
+            "$RUNNER_TEMP/route-grant-private.pem" \
             "$RUNNER_TEMP/production-secrets.tfvars.json"
 
       - name: Check control database compatibility

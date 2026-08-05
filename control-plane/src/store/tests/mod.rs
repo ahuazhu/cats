@@ -1374,7 +1374,18 @@ fn gateway_work_blocks_auto_suspend_and_wake_is_singleflight() {
         .acquire_work(&cat.id, WorkKind::Gateway, "request-1", "GET /", 5_000)
         .unwrap();
     assert!(store.try_auto_suspend(&cat.id, 5_000).unwrap().is_none());
-    store.release_work(&lease.id).unwrap();
+    let shortened = store
+        .acquire_work(&cat.id, WorkKind::Gateway, "request-1", "handoff", 100)
+        .unwrap();
+    assert_eq!(
+        shortened.id, lease.id,
+        "renewal must not create a lease gap"
+    );
+    assert!(
+        shortened.expires_at_unix_ms <= super::now_ms() + 150,
+        "renewal must be able to shorten a wake lease to its handoff window"
+    );
+    store.release_work(&shortened.id).unwrap();
     store.try_auto_suspend(&cat.id, 5_000).unwrap().unwrap();
 
     let first = store.ensure_desired_running(&cat.id).unwrap();
