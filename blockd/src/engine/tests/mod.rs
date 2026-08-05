@@ -1055,6 +1055,10 @@ impl PutGate {
         self.changed.notify_all();
     }
 
+    fn was_entered(&self) -> bool {
+        self.state.lock().unwrap().0
+    }
+
     fn release_on_drop(self: &Arc<Self>) -> PutGateRelease {
         PutGateRelease {
             gate: Arc::clone(self),
@@ -1096,8 +1100,21 @@ impl ThreadRecordingBlob {
     }
 }
 
+fn wait_for_generation(engine: &ChunkEngine, target: i64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while engine.generation() < target {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background publisher stopped at generation {} before target {target}",
+            engine.generation()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 impl BlobStore for ThreadRecordingBlob {
     fn put_immutable(&self, key: &str, data: &[u8]) -> cats_storage::blob::Result<()> {
+        let publisher = is_background_publisher_context();
         {
             let mut calls = self.put_calls.lock().unwrap();
             calls.push((
@@ -1105,9 +1122,19 @@ impl BlobStore for ThreadRecordingBlob {
                     .name()
                     .unwrap_or("<unnamed>")
                     .to_string(),
-                is_background_publisher_context(),
+                publisher,
             ));
             self.calls_changed.notify_all();
+        }
+        // The controlled gate is exclusively a publisher delay. If a
+        // regression sends a Guest FLUSH down this remote path, return a
+        // bounded diagnostic instead of blocking the controller that owns the
+        // release guard.
+        if !publisher {
+            return Err(cats_storage::blob::BlobError::Backend {
+                key: key.to_string(),
+                message: "test recorder rejected a Guest-context PUT".into(),
+            });
         }
         if let Some(gate) = &self.put_gate {
             gate.block_until_released();
@@ -1209,15 +1236,17 @@ fn a_slow_store_burst_publishes_only_on_the_background_committer() {
         flush_worker.join().unwrap();
     });
 
+    wait_for_generation(&e, 24);
     // After releasing the upload workers, calibrate the full publish path on
     // its named committer. A publisher=false call fails immediately.
     blob.wait_for_named_background_put().unwrap();
     e.detach().unwrap();
 }
 
-/// Known-negative calibration for the causal recorder and the gate's unwind
-/// path. A Guest-side remote PUT must be rejected immediately, and releasing
-/// the guard must let its worker finish instead of leaking a blocked thread.
+/// Known-negative calibration for the causal recorder. A Guest-side remote
+/// PUT must fail without entering the publisher gate; the bounded result
+/// channel, release guard, and scoped join keep this diagnostic deadlock-free
+/// even if the gate discrimination regresses.
 #[test]
 fn guest_side_put_is_detected_and_the_controlled_store_is_released() {
     let dir = tempfile::tempdir().unwrap();
@@ -1229,19 +1258,37 @@ fn guest_side_put_is_detected_and_the_controlled_store_is_released() {
         put_gate: Some(Arc::clone(&put_gate)),
     });
 
-    let guest_blob = Arc::clone(&blob);
-    let guest_put = std::thread::spawn(move || guest_blob.put_immutable("guest-put", b"data"));
-    // Declared after the worker so unwinding releases the gate before the
-    // detached JoinHandle and the BlobStore are dropped.
-    let _release = put_gate.release_on_drop();
-    put_gate.wait_until_entered().unwrap();
-    let error = blob.wait_for_named_background_put().unwrap_err();
-    assert!(
-        error.contains("escaped the background publisher"),
-        "known-negative produced the wrong failure: {error}"
-    );
-    put_gate.release();
-    guest_put.join().unwrap().unwrap();
+    std::thread::scope(|scope| {
+        let _release = put_gate.release_on_drop();
+        let guest_blob = Arc::clone(&blob);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let guest_put = scope.spawn(move || {
+            let _ = result_tx.send(guest_blob.put_immutable("guest-put", b"data"));
+        });
+
+        let put_error = result_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("Guest-context PUT blocked on the publisher gate")
+            .unwrap_err();
+        assert!(
+            put_error
+                .to_string()
+                .contains("test recorder rejected a Guest-context PUT"),
+            "known-negative produced the wrong BlobStore error: {put_error}"
+        );
+        assert!(
+            !put_gate.was_entered(),
+            "a Guest-context PUT must never enter the publisher gate"
+        );
+        let recorder_error = blob.wait_for_named_background_put().unwrap_err();
+        assert!(
+            recorder_error.contains("escaped the background publisher"),
+            "known-negative produced the wrong recorder error: {recorder_error}"
+        );
+
+        put_gate.release();
+        guest_put.join().unwrap();
+    });
 }
 
 /// Once local admission is full, FLUSH may park, but only the named
@@ -1292,6 +1339,7 @@ fn backpressure_waits_for_the_background_publisher() {
     }
     put_gate.release();
     assert_eq!(second_flush.join().unwrap().unwrap(), 2);
+    wait_for_generation(&e, 2);
     let calls = blob.put_calls.lock().unwrap().clone();
     assert!(!calls.is_empty());
     assert!(
