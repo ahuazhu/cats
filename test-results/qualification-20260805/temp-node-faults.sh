@@ -7,6 +7,7 @@ set -euo pipefail
 
 MODE="${CATS_FAULT_MODE:-dry-run}"
 SCENARIO="${CATS_FAULT_SCENARIO:-db}"
+TRIAL="${CATS_FAULT_TRIAL:-}"
 ALLOW_ALL="${CATS_FAULT_ALLOW_ALL:-false}"
 ALLOW_COMBINED="${CATS_FAULT_ALLOW_COMBINED:-false}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
@@ -18,13 +19,18 @@ ISSUE="${CATS_ISSUE:-124}"
 WORKSPACE_ID="${CATS_WORKSPACE_ID:-ws_788c5bfc3931}"
 WORKSPACE="${CATS_WORKSPACE:-default/qual-124-20260805}"
 OWNERSHIP_SNAPSHOT="${CATS_OWNERSHIP_SNAPSHOT:-}"
+PREPARE_TRIAL="${CATS_FAULT_PREPARE_TRIAL:-false}"
+TARGET_CAT_ID="${CATS_FAULT_TARGET_CAT_ID:-}"
+TARGET_CAT_NAME="${CATS_FAULT_TARGET_CAT_NAME:-}"
 PROVISIONING_MANIFEST="${CATS_PROVISIONING_MANIFEST:-}"
 REMOTE_CONFIG="${CATS_REMOTE_FAULT_CONFIG:-/etc/cats/qualification-124/fault-targets.json}"
 REMOTE_HOOK="${CATS_REMOTE_WORKLOAD_HOOK:-/usr/local/libexec/cats/q124-fault-workload}"
+OBSERVER_HOOK="${CATS_FAULT_OBSERVER_HOOK:-$(cd "$(dirname "$0")" && pwd)/live-hooks/q124-fault-workload}"
 RUN_ID="${CATS_FAULT_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$(openssl rand -hex 3)}"
 RESULT_ROOT="${CATS_FAULT_RESULT_ROOT:-test-results/qualification-20260805/raw/temp-node-faults}"
 RUN_DIR="${RESULT_ROOT}/${RUN_ID}"
 SSM_TIMEOUT_SECONDS="${CATS_FAULT_SSM_TIMEOUT_SECONDS:-900}"
+REQUIRE_FRESH_OWNERSHIP="${CATS_FAULT_REQUIRE_FRESH_OWNERSHIP:-false}"
 LIVE_CONFIRM="${CATS_FAULT_CONFIRM:-}"
 HARNESS_SHA256="$(shasum -a 256 "$0" | awk '{print $1}')"
 
@@ -68,34 +74,39 @@ validate_inputs() {
   [[ "${SSM_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] || die "invalid SSM timeout"
   (( SSM_TIMEOUT_SECONDS >= 600 && SSM_TIMEOUT_SECONDS <= 3600 )) ||
     die "SSM timeout must be between 600 and 3600 seconds"
+  [[ "${REQUIRE_FRESH_OWNERSHIP}" == true || "${REQUIRE_FRESH_OWNERSHIP}" == false ]] ||
+    die "CATS_FAULT_REQUIRE_FRESH_OWNERSHIP must be true or false"
   validate_ref CATS_REMOTE_FAULT_CONFIG "${REMOTE_CONFIG}"
   validate_ref CATS_REMOTE_WORKLOAD_HOOK "${REMOTE_HOOK}"
+  validate_ref CATS_FAULT_OBSERVER_HOOK "${OBSERVER_HOOK}"
 
   case "${MODE}" in
     dry-run|fixture|live) ;;
     *) die "CATS_FAULT_MODE must be dry-run, fixture, or live" ;;
   esac
   case "${SCENARIO}" in
-    db|s3|control-plane) SCENARIOS=("${SCENARIO}") ;;
+    db|s3|control-plane) ;;
     db-s3|db-control-plane|s3-control-plane|all-3)
       [[ "${ALLOW_COMBINED}" == "true" ]] ||
         die "simultaneous scenarios require CATS_FAULT_ALLOW_COMBINED=true"
-      SCENARIOS=("${SCENARIO}")
       ;;
-    all)
-      [[ "${ALLOW_ALL}" == "true" ]] ||
-        die "scenario=all requires CATS_FAULT_ALLOW_ALL=true"
-      SCENARIOS=(db s3 control-plane)
-      ;;
-    matrix)
-      [[ "${ALLOW_ALL}" == "true" && "${ALLOW_COMBINED}" == "true" ]] ||
-        die "matrix requires CATS_FAULT_ALLOW_ALL=true and CATS_FAULT_ALLOW_COMBINED=true"
-      SCENARIOS=(db s3 control-plane db-s3 db-control-plane s3-control-plane all-3)
-      ;;
+    all|matrix) die "multi-window runs must use temp-node-fault-matrix.sh; one harness invocation owns one trial" ;;
     *) die "unsupported CATS_FAULT_SCENARIO" ;;
   esac
+  valid_trial "${SCENARIO}" "${TRIAL}" ||
+    die "CATS_FAULT_TRIAL is not an exact trial for scenario ${SCENARIO}"
+  SCENARIOS=("${SCENARIO}")
+  [[ "${PREPARE_TRIAL}" == true || "${PREPARE_TRIAL}" == false ]] ||
+    die "CATS_FAULT_PREPARE_TRIAL must be true or false"
   [[ -n "${OWNERSHIP_SNAPSHOT}" ]] || die "CATS_OWNERSHIP_SNAPSHOT is required"
-  [[ -f "${OWNERSHIP_SNAPSHOT}" ]] || die "ownership snapshot does not exist"
+  if [[ "${MODE}" == live && "${PREPARE_TRIAL}" == true ]]; then
+    [[ ! -e "${OWNERSHIP_SNAPSHOT}" && -d "$(dirname "${OWNERSHIP_SNAPSHOT}")" ]] ||
+      die "prepared ownership output must be a new path in an existing directory"
+    [[ "${TARGET_CAT_ID}" =~ ^cat_[A-Za-z0-9_-]+$ ]] || die "invalid exact target Cat ID"
+    [[ "${TARGET_CAT_NAME}" =~ ^q124-[a-z0-9][a-z0-9-]{0,57}$ ]] || die "invalid exact target Cat name"
+  else
+    [[ -f "${OWNERSHIP_SNAPSHOT}" ]] || die "ownership snapshot does not exist"
+  fi
   [[ -n "${PROVISIONING_MANIFEST}" ]] || die "CATS_PROVISIONING_MANIFEST is required"
   [[ -f "${PROVISIONING_MANIFEST}" ]] || die "provisioning manifest does not exist"
 }
@@ -122,7 +133,7 @@ validate_snapshot() {
       (.test_sha | test("^[0-9a-f]{40}$")) and
       (.dependency_endpoints | keys | sort) == (["db_host","s3_host","control_plane_host","node_listen_ip"] | sort) and
       all(.dependency_endpoints[]; type == "string" and length > 0) and
-      (.assigned_cats | type == "array" and length > 0) and
+      (.assigned_cats | type == "array" and length == 1) and
       all(.assigned_cats[];
         (keys | sort) == (["cat_id","name","workspace_id","node_id","durability"] | sort) and
         (.cat_id | test("^cat_[A-Za-z0-9_-]+$")) and
@@ -132,8 +143,28 @@ validate_snapshot() {
         (.durability == "strict" or .durability == "relaxed")) and
       ([.assigned_cats[].cat_id] | unique | length) == (.assigned_cats | length) and
       ([.assigned_cats[].name] | unique | length) == (.assigned_cats | length)
-    ' "${snapshot}" >/dev/null ||
+    ' "${snapshot}" >/dev/null &&
+    [[ "$(jq -r '.assigned_cats[0].durability' "${snapshot}")" == "$(trial_durability "${TRIAL}")" ]] ||
     die "ownership snapshot is not the strict Cordoned Issue=124 q124-only schema"
+}
+
+valid_trial() {
+  case "$1:$2" in
+    db:db-running|db:db-cold-start|s3:s3-strict|s3:s3-relaxed|\
+    control-plane:control-plane-running|db-s3:db-s3-strict|db-s3:db-s3-relaxed|\
+    db-control-plane:db-control-plane-strict|db-control-plane:db-control-plane-relaxed|\
+    s3-control-plane:s3-control-plane-strict|s3-control-plane:s3-control-plane-relaxed|\
+    all-3:all-3-strict|all-3:all-3-relaxed) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+trial_durability() {
+  case "$1" in
+    s3-relaxed|db-s3-relaxed|db-control-plane-relaxed|s3-control-plane-relaxed|all-3-relaxed)
+      printf relaxed ;;
+    *) printf strict ;;
+  esac
 }
 
 ownership_cat_set() {
@@ -154,14 +185,14 @@ state_matches_ownership() {
 validate_manifest() {
   local manifest="$1"
   jq -e \
-    --arg account "${EXPECTED_ACCOUNT_ID}" --arg region "${AWS_REGION}" \
+    --arg account "${EXPECTED_ACCOUNT_ID}" --arg region "${AWS_REGION}" --arg mode "${MODE}" \
     --arg instance "${TEMP_INSTANCE_ID}" --arg node "${NODE_ID}" '
       (keys | sort) == (["schema_version","issue","account_id","aws_region","temp_instance_id","node_id","instance_name","launch_time","expires_at","test_sha","tags","qualification_assets"] | sort) and
       .schema_version == 1 and .issue == 124 and .account_id == $account and
       .aws_region == $region and .temp_instance_id == $instance and .node_id == $node and
       .instance_name == ("cats-" + $node) and
       (.launch_time | fromdateiso8601) <= now and
-      (.expires_at | fromdateiso8601) > (now + 600) and
+      (if $mode == "live" then (.expires_at | fromdateiso8601) > (now + 600) else true end) and
       ((.expires_at | fromdateiso8601) - (.launch_time | fromdateiso8601)) <= 86400 and
       (.test_sha | test("^[0-9a-f]{40}$")) and
       (.tags | keys | sort) == (["Name","Project","Environment","Purpose","Issue","CatsNodeId","ExpiresAt","ManagedBy"] | sort) and
@@ -175,8 +206,6 @@ validate_manifest() {
       (.qualification_assets.hook_repo_path ==
         "test-results/qualification-20260805/live-hooks/q124-fault-workload")
     ' "${manifest}" >/dev/null || die "provisioning manifest identity/TTL/schema is invalid"
-  [[ "$(jq -r .test_sha "${manifest}")" == "$(jq -r .test_sha "${OWNERSHIP_SNAPSHOT}")" ]] ||
-    die "ownership snapshot TEST_SHA does not match provisioning manifest"
 }
 
 verify_reviewed_hook_provenance() {
@@ -194,6 +223,11 @@ verify_reviewed_hook_provenance() {
   source_sha="$(git show "${test_sha}:${repo_path}" | shasum -a 256 | awk '{print $1}')"
   [[ "${source_sha}" == "${manifest_sha}" ]] ||
     die "manifest hook SHA does not match the version-controlled hook at TEST_SHA"
+  [[ -f "${OBSERVER_HOOK}" && ! -L "${OBSERVER_HOOK}" && -x "${OBSERVER_HOOK}" ]] ||
+    die "external observer hook must be one executable regular file"
+  [[ "$(shasum -a 256 "${OBSERVER_HOOK}" | awk '{print $1}')" == "${manifest_sha}" ]] ||
+    die "external observer hook differs from the reviewed TEST_SHA hook"
+  sudo -n true >/dev/null 2>&1 || die "live external observer requires non-interactive sudo"
 }
 
 make_run_dir() {
@@ -211,6 +245,7 @@ write_run_metadata() {
     --arg run_id "${RUN_ID}" \
     --arg mode "${MODE}" \
     --arg scenario "${SCENARIO}" \
+    --arg trial "${TRIAL}" \
     --arg instance "${TEMP_INSTANCE_ID}" \
     --arg node "${NODE_ID}" \
     --arg issue "${ISSUE}" \
@@ -225,7 +260,7 @@ write_run_metadata() {
     --arg hook_sha256 "$(jq -r .qualification_assets.hook_sha256 "${PROVISIONING_MANIFEST}")" \
     --arg hook_repo_path "$(jq -r .qualification_assets.hook_repo_path "${PROVISIONING_MANIFEST}")" \
     --arg started_at "$(date -u +%FT%TZ)" \
-    '{run_id:$run_id,mode:$mode,scenario:$scenario,temp_instance_id:$instance,
+    '{run_id:$run_id,mode:$mode,scenario:$scenario,trial:$trial,temp_instance_id:$instance,
       node_id:$node,issue:$issue,workspace_id:$workspace_id,workspace:$workspace,
       aws_region:$region,remote_config_ref:$config_ref,remote_hook_ref:$hook_ref,
       harness_sha256:$harness_sha256,test_sha:$test_sha,
@@ -292,7 +327,7 @@ remote_payload() {
 }
 
 build_ssm_command() {
-  local scenario="$1" payload qrun command remote_helper helper_sha test_sha config_sha hook_sha cat_set_sha
+  local scenario="$1" trial="$2" payload qrun command remote_helper helper_sha test_sha config_sha hook_sha cat_set_sha
   payload="$(remote_payload)"
   helper_sha="$(emit_remote_program | shasum -a 256 | awk '{print $1}')"
   test_sha="$(jq -r .test_sha "${PROVISIONING_MANIFEST}")"
@@ -300,11 +335,11 @@ build_ssm_command() {
   hook_sha="$(jq -r .qualification_assets.hook_sha256 "${PROVISIONING_MANIFEST}")"
   cat_set_sha="$(jq -Sc '[.assigned_cats[] | {cat_id,name,workspace_id,node_id,durability}] | sort_by(.cat_id)' \
     "${OWNERSHIP_SNAPSHOT}" | shasum -a 256 | awk '{print $1}')"
-  qrun="${RUN_ID}-${scenario}"
+  qrun="${RUN_ID}-${trial}"
   remote_helper="/run/cats-q124-fault-helper-${qrun}.sh"
   printf -v command \
-    'umask 077; printf %%s %q | openssl base64 -d -A | gzip -d > %q; chmod 0700 %q; sudo env Q124_RUN_ID=%q Q124_SCENARIO=%q Q124_INSTANCE_ID=%q Q124_NODE_ID=%q Q124_WORKSPACE_ID=%q Q124_CONFIG_REF=%q Q124_HOOK_REF=%q Q124_TEST_SHA=%q Q124_CONFIG_SHA256=%q Q124_HOOK_SHA256=%q Q124_HARNESS_SHA256=%q Q124_HELPER_SHA256=%q Q124_CAT_SET_SHA256=%q %q' \
-    "${payload}" "${remote_helper}" "${remote_helper}" "${qrun}" "${scenario}" "${TEMP_INSTANCE_ID}" "${NODE_ID}" \
+    'umask 077; printf %%s %q | openssl base64 -d -A | gzip -d > %q; chmod 0700 %q; sudo env Q124_RUN_ID=%q Q124_SCENARIO=%q Q124_TRIAL=%q Q124_INSTANCE_ID=%q Q124_NODE_ID=%q Q124_WORKSPACE_ID=%q Q124_CONFIG_REF=%q Q124_HOOK_REF=%q Q124_TEST_SHA=%q Q124_CONFIG_SHA256=%q Q124_HOOK_SHA256=%q Q124_HARNESS_SHA256=%q Q124_HELPER_SHA256=%q Q124_CAT_SET_SHA256=%q %q' \
+    "${payload}" "${remote_helper}" "${remote_helper}" "${qrun}" "${scenario}" "${trial}" "${TEMP_INSTANCE_ID}" "${NODE_ID}" \
     "${WORKSPACE_ID}" "${REMOTE_CONFIG}" "${REMOTE_HOOK}" "${test_sha}" "${config_sha}" "${hook_sha}" \
     "${HARNESS_SHA256}" "${helper_sha}" "${cat_set_sha}" "${remote_helper}"
   if grep -Eqi 'bearer|token|password|secret|worker[.]env' <<<"${command}"; then
@@ -321,9 +356,9 @@ write_dry_run() {
       "${TEMP_INSTANCE_ID}" "${NODE_ID}" "${ISSUE}" "${WORKSPACE_ID}"
     printf 'mutation_selector=exact-instance-id-only\n'
     for scenario in "${SCENARIOS[@]}"; do
-      command="$(build_ssm_command "${scenario}")"
-      printf 'scenario=%s command_sha256=%s command_bytes=%s\n' \
-        "${scenario}" \
+      command="$(build_ssm_command "${scenario}" "${TRIAL}")"
+      printf 'scenario=%s trial=%s command_sha256=%s command_bytes=%s\n' \
+        "${scenario}" "${TRIAL}" \
         "$(printf '%s' "${command}" | shasum -a 256 | awk '{print $1}')" \
         "${#command}"
     done
@@ -333,69 +368,54 @@ write_dry_run() {
 }
 
 fixture_state() {
-  local phase="$1" scenario="$2" generation="17" observed="running"
+  local phase="$1" scenario="$2" trial="$3" generation="17" observed="running"
   [[ "${phase}" != "during" ]] || observed="unknown"
-  [[ "${scenario}" != "control-plane" || "${phase}" != "during" ]] || observed="unknown"
   jq -n \
-    --arg phase "${phase}" --arg scenario "${scenario}" \
+    --arg phase "${phase}" --arg scenario "${scenario}" --arg trial "${trial}" \
     --arg workspace_id "${WORKSPACE_ID}" --arg node_id "${NODE_ID}" \
-    --arg observed "${observed}" --argjson generation "${generation}" '
-      def cat($name; $durability; $digest):
-        {cat_id:("cat_" + ($name | gsub("-";"_"))),cat_name:$name,durability:$durability,desired_state:"running",
+    --arg observed "${observed}" --argjson generation "${generation}" \
+    --slurpfile ownership "${OWNERSHIP_SNAPSHOT}" '
+      $ownership[0].assigned_cats[0] as $admitted |
+      def cat:
+        {cat_id:$admitted.cat_id,cat_name:$admitted.name,durability:$admitted.durability,desired_state:"running",
          observed_state:$observed,generation:$generation,node_id:$node_id,
          operation_ids:["op_fixture_124"],
-         watermark:{local:23,remote:23,unpublished:0},disk_epoch:9,digest:$digest};
-      {schema_version:1,captured_at:"2026-08-05T14:00:00Z",phase:$phase,
-       scenario:$scenario,workspace_id:$workspace_id,node_id:$node_id,
+         watermark:{local:23,remote:23,unpublished:0},disk_epoch:9,digest:"sha256:fixture"};
+      {schema_version:2,captured_at:"2026-08-05T14:00:00Z",phase:$phase,
+       scenario:$scenario,trial:$trial,workspace_id:$workspace_id,node_id:$node_id,
        raw_operations:[{operation_id:"op_fixture_124",kind:"fixture_probe",phase:"succeeded",
          started_at:"2026-08-05T14:00:00Z",completed_at:"2026-08-05T14:00:01Z",
          log_ref:"journal://q124/fixture/op_fixture_124"}],
        log_refs:["journal://q124/fixture/state"],
-       cats:[cat("q124-fixture-s3-strict";"strict";"sha256:fixture-strict"),
-         cat("q124-fixture-s3-relaxed";"relaxed";"sha256:fixture-relaxed")]} '
+       cats:[cat]} '
 }
 
 fixture_oracle() {
-  local phase="$1" scenario="$2"
-  case "${scenario}:${phase}" in
-    db:isolated)
-      checks='{"running_exec_observed":true,"metadata_cas_false_success_absent":true,"sync_false_success_absent":true,"cold_false_success_absent":true,"start_retry_or_failure_observed":true,"new_start_retry_or_failure_observed":true,"corruption_absent":true}'
-      ;;
-    db:recovered)
-      checks='{"dependency_reconnected":true,"pending_operations_converged":true,"digest_verified":true}'
-      ;;
-    s3:isolated)
-      checks='{"strict_sync_false_success_absent":true,"strict_cold_false_success_absent":true,"relaxed_local_fsync_observed":true,"relaxed_sync_false_success_absent":true,"relaxed_drain_false_success_absent":true,"local_remote_watermarks_captured":true,"unpublished_captured":true}'
-      ;;
-    s3:recovered)
-      checks='{"strict_sync_succeeded":true,"relaxed_sync_succeeded":true,"local_remote_watermarks_converged":true,"unpublished_zero":true,"strict_cold_restore_digest_verified":true,"relaxed_cold_restore_digest_verified":true}'
-      ;;
-    control-plane:isolated)
-      checks='{"lease_timeout_plus_five_observed":true,"node_lost_observed":true,"claims_preserved":true,"cat_unknown_or_pending":true,"implicit_fence_absent":true,"generation_replacement_absent":true,"epoch_replacement_absent":true,"admin_fence_absent":true}'
-      ;;
-    control-plane:recovered)
-      checks='{"same_node_identity":true,"inventory_complete":true,"placement_preserved":true,"generation_preserved":true,"disk_epoch_preserved":true,"digest_verified":true}'
-      ;;
-    db-s3:isolated)
-      checks='{"simultaneous_window_confirmed":true,"db_false_success_absent":true,"s3_strict_false_success_absent":true,"s3_relaxed_false_success_absent":true,"digests_unchanged":true}' ;;
-    db-s3:recovered)
-      checks='{"recovery_order_exact":true,"db_reconnected":true,"s3_converged":true,"final_digests_verified":true,"generation_preserved":true,"disk_epoch_preserved":true}' ;;
-    db-control-plane:isolated)
-      checks='{"simultaneous_window_confirmed":true,"db_false_success_absent":true,"node_lost_without_fence":true,"generation_replacement_absent":true,"epoch_replacement_absent":true,"digest_unchanged":true}' ;;
-    db-control-plane:recovered)
-      checks='{"recovery_order_exact":true,"control_plane_same_identity":true,"db_reconnected":true,"final_digest_verified":true,"generation_preserved":true,"disk_epoch_preserved":true}' ;;
-    s3-control-plane:isolated)
-      checks='{"simultaneous_window_confirmed":true,"s3_strict_false_success_absent":true,"s3_relaxed_false_success_absent":true,"node_lost_without_fence":true,"generation_replacement_absent":true,"epoch_replacement_absent":true,"digests_unchanged":true}' ;;
-    s3-control-plane:recovered)
-      checks='{"recovery_order_exact":true,"control_plane_same_identity":true,"s3_converged":true,"final_digests_verified":true,"generation_preserved":true,"disk_epoch_preserved":true}' ;;
-    all-3:isolated)
-      checks='{"simultaneous_window_confirmed":true,"db_false_success_absent":true,"s3_strict_false_success_absent":true,"s3_relaxed_false_success_absent":true,"node_lost_without_fence":true,"generation_replacement_absent":true,"epoch_replacement_absent":true,"digests_unchanged":true}' ;;
-    all-3:recovered)
-      checks='{"recovery_order_exact":true,"control_plane_same_identity":true,"db_reconnected":true,"s3_converged":true,"final_digests_verified":true,"generation_preserved":true,"disk_epoch_preserved":true}' ;;
-    *) die "invalid fixture oracle ${scenario}:${phase}" ;;
+  local phase="$1" scenario="$2" trial="$3"
+  case "${trial}:${phase}" in
+    db-running:isolated) checks='{"running_exec_observed":true,"metadata_cas_false_success_absent":true,"sync_false_success_absent":true,"corruption_signal_absent":true}' ;;
+    db-cold-start:isolated) checks='{"cold_false_success_absent":true,"start_retry_or_failure_observed":true,"new_start_retry_or_failure_observed":true,"corruption_signal_absent":true}' ;;
+    *-strict:isolated)
+      if [[ "${scenario}" == *control-plane* || "${scenario}" == all-3 ]]; then
+        checks='{"strict_fsync_false_success_absent":true,"strict_drain_false_success_absent":true,"digest_signal_preserved":true,"lease_timeout_plus_five_observed":true,"guest_io_observed":true,"local_claim_preserved":true,"local_generation_preserved":true,"local_epoch_preserved":true,"admin_fence_not_invoked":true}'
+      else checks='{"strict_sync_false_success_absent":true,"strict_cold_false_success_absent":true,"digest_signal_preserved":true}'; fi ;;
+    *-relaxed:isolated)
+      checks='{"relaxed_local_fsync_observed":true,"relaxed_sync_false_success_absent":true,"relaxed_drain_false_success_absent":true,"local_remote_watermarks_captured":true,"unpublished_captured":true}'
+      if [[ "${scenario}" == *control-plane* || "${scenario}" == all-3 ]]; then
+        checks="$(jq -c '. + {lease_timeout_plus_five_observed:true,guest_io_observed:true,local_claim_preserved:true,local_generation_preserved:true,local_epoch_preserved:true,admin_fence_not_invoked:true}' <<<"${checks}")"
+      fi ;;
+    control-plane-running:isolated) checks='{"lease_timeout_plus_five_observed":true,"guest_io_observed":true,"local_claim_preserved":true,"local_generation_preserved":true,"local_epoch_preserved":true,"admin_fence_not_invoked":true}' ;;
+    db-running:recovered|db-cold-start:recovered) checks='{"dependency_reconnected":true,"pending_operations_converged":true,"digest_verified":true}' ;;
+    s3-strict:recovered|s3-relaxed:recovered) checks='{"dependency_reconnected":true,"watermarks_converged":true,"unpublished_zero":true,"cold_restore_digest_verified":true}' ;;
+    control-plane-running:recovered) checks='{"host_reconnected":true,"local_inventory_complete":true,"digest_verified":true}' ;;
+    db-s3-*:recovered) checks='{"db_reconnected":true,"s3_converged":true,"final_digest_verified":true,"generation_preserved":true,"disk_epoch_preserved":true}' ;;
+    s3-control-plane-*:recovered) checks='{"host_reconnected":true,"s3_converged":true,"final_digest_verified":true,"generation_preserved":true,"disk_epoch_preserved":true}' ;;
+    db-control-plane-*:recovered) checks='{"host_reconnected":true,"db_reconnected":true,"final_digest_verified":true,"generation_preserved":true,"disk_epoch_preserved":true}' ;;
+    all-3-*:recovered) checks='{"host_reconnected":true,"db_reconnected":true,"s3_converged":true,"final_digest_verified":true,"generation_preserved":true,"disk_epoch_preserved":true}' ;;
+    *) die "invalid fixture oracle ${scenario}:${trial}:${phase}" ;;
   esac
-  jq -n --arg scenario "${scenario}" --arg phase "${phase}" --argjson checks "${checks}" \
-    '{schema_version:1,scenario:$scenario,phase:$phase,
+  jq -n --arg scenario "${scenario}" --arg trial "${trial}" --arg phase "${phase}" --argjson checks "${checks}" \
+    '{schema_version:2,scenario:$scenario,trial:$trial,phase:$phase,
       started_at:"2026-08-05T14:00:00Z",completed_at:"2026-08-05T14:00:01Z",
       checks:$checks,
       raw_operations:[{operation_id:"op_fixture_124",kind:"fixture_exercise",phase:"succeeded",
@@ -439,9 +459,9 @@ fixture_combo_evidence() {
     printf '%s.packets_after_probe=2\n%s.packets_after_workload=5\n%s.workload_delta=3\n' \
       "${dep}" "${dep}" "${dep}"
   done >>"${dir}/fault-counters.txt"
-  jq -n --arg scenario "${scenario}" --argjson dependencies "${dependencies}" \
+  jq -n --arg scenario "${scenario}" --arg trial "${TRIAL}" --argjson dependencies "${dependencies}" \
     --argjson injection_order "${dependencies}" --argjson recovery_order "${recovery}" '
-      {schema_version:1,scenario:$scenario,mode:"simultaneous",
+      {schema_version:2,scenario:$scenario,trial:$trial,mode:"simultaneous",
        dependencies:[$dependencies[] | {dependency:.,comment:("cats-q124-fixture-" + .),
          chains:[("C124O_" + .),("C124I_" + .),("C1246O_" + .),("C1246I_" + .)],
          watchdog_unit:("cats-q124-fault-fixture-" + .),watchdog_ttl_seconds:65,
@@ -458,8 +478,8 @@ fixture_combo_evidence() {
     index=$((index + 1))
     remaining="$(jq -c --arg dep "${dep}" '[.[] | select(. != $dep)]' <<<"${dependencies}")"
     dependencies="${remaining}"
-    jq -n --arg scenario "${scenario}" --arg dep "${dep}" --argjson remaining "${remaining}" \
-      --argjson index "${index}" '{schema_version:1,scenario:$scenario,phase:"partial-recovery",
+    jq -n --arg scenario "${scenario}" --arg trial "${TRIAL}" --arg dep "${dep}" --argjson remaining "${remaining}" \
+      --argjson index "${index}" '{schema_version:2,scenario:$scenario,trial:$trial,phase:"partial-recovery",
         restored_dependency:$dep,remaining_dependencies:$remaining,
         started_at:"2026-08-05T14:00:01Z",completed_at:"2026-08-05T14:00:02Z",
         checks:{restored_dependency_positive:true,remaining_dependencies_negative:true,
@@ -480,8 +500,8 @@ fixture_combo_evidence() {
 }
 
 run_fixture_scenario() {
-  local scenario="$1" functional_rc=0 cleanup_rc=0
-  local dir="${RUN_DIR}/${scenario}"
+  local scenario="$1" trial="$2" functional_rc=0 cleanup_rc=0
+  local dir="${RUN_DIR}/${trial}"
   mkdir -p "${dir}"
   printf 'ordinal\tstate\tresult\n' >"${dir}/timeline.tsv"
   local states=(ownership-snapshot positive-tcp positive-real-read injected \
@@ -492,16 +512,37 @@ run_fixture_scenario() {
     ordinal=$((ordinal + 1))
     printf '%s\t%s\tPASS\n' "${ordinal}" "${state}" >>"${dir}/timeline.tsv"
   done
-  fixture_state before "${scenario}" >"${dir}/state-before.json"
-  fixture_state during "${scenario}" >"${dir}/state-during.json"
-  fixture_state after "${scenario}" >"${dir}/state-after.json"
+  fixture_state before "${scenario}" "${trial}" >"${dir}/state-before.json"
+  fixture_state during "${scenario}" "${trial}" >"${dir}/state-during.json"
+  fixture_state after "${scenario}" "${trial}" >"${dir}/state-after.json"
   if [[ "${CATS_FIXTURE_CAT_SET_MISMATCH:-false}" == "true" ]]; then
     jq '.cats[0].cat_id = "cat_schema_valid_but_not_admitted"' \
       "${dir}/state-during.json" >"${dir}/state-during.invalid.json"
     mv "${dir}/state-during.invalid.json" "${dir}/state-during.json"
   fi
-  fixture_oracle isolated "${scenario}" >"${dir}/oracle-isolated.json"
-  fixture_oracle recovered "${scenario}" >"${dir}/oracle-recovered.json"
+  fixture_oracle isolated "${scenario}" "${trial}" >"${dir}/oracle-isolated.json"
+  fixture_oracle recovered "${scenario}" "${trial}" >"${dir}/oracle-recovered.json"
+  if [[ "${scenario}" == *control-plane* || "${scenario}" == all-3 ]]; then
+    jq -n --arg window "${RUN_ID}-${trial}" --arg scenario "${scenario}" --arg trial "${trial}" \
+      --arg node "${NODE_ID}" --arg cat "$(jq -r '.assigned_cats[0].cat_id' "${OWNERSHIP_SNAPSHOT}")" '
+      {schema_version:2,source:"external-control-plane-observer",window_id:$window,
+       scenario:$scenario,trial:$trial,node_id:$node,cat_id:$cat,generation:17,
+       started_at:"2026-08-05T14:00:00Z",completed_at:"2026-08-05T14:00:03Z",
+       lost_observed_at:"2026-08-05T14:00:01Z",recovered_observed_at:"2026-08-05T14:00:02Z",
+       lost_cat_observed_state:"unknown",
+       checks:{node_lost_observed:true,exact_cat_claim_preserved:true,
+         generation_replacement_absent:true,node_recovered_cordoned:true,
+         same_node_identity:true,inventory_complete:true,placement_preserved:true}}' \
+      >"${dir}/external-observer.json"
+    if [[ "${CATS_FIXTURE_OBSERVER_FAIL:-false}" == true ]]; then
+      jq '.checks.node_lost_observed = false' "${dir}/external-observer.json" >"${dir}/external-observer.invalid.json"
+      mv "${dir}/external-observer.invalid.json" "${dir}/external-observer.json"
+    fi
+    if [[ "${CATS_FIXTURE_OBSERVER_MISSING:-false}" == true ]]; then
+      rm -f "${dir}/external-observer.json"
+    fi
+    [[ -s "${dir}/external-observer.json" ]] && write_merged_oracle "${dir}" "${scenario}" "${trial}"
+  fi
   if [[ "${CATS_FIXTURE_ORACLE_FAIL:-false}" == "true" ]]; then
     jq '(.checks | keys_unsorted[0]) as $first | .checks[$first] = false' \
       "${dir}/oracle-isolated.json" >"${dir}/oracle-isolated.invalid.json"
@@ -529,15 +570,19 @@ run_fixture_scenario() {
       mv "${dir}/recovery-steps.invalid.json" "${dir}/recovery-steps.json"
     fi
   fi
-  jq -n --arg run_id "${RUN_ID}" --arg scenario "${scenario}" --arg instance "${TEMP_INSTANCE_ID}" \
+  jq -n --arg run_id "${RUN_ID}-${trial}" --arg scenario "${scenario}" --arg trial "${trial}" --arg instance "${TEMP_INSTANCE_ID}" \
     --arg node "${NODE_ID}" --arg test_sha "$(jq -r .test_sha "${PROVISIONING_MANIFEST}")" \
     --arg harness_sha "${HARNESS_SHA256}" --argjson combo "$(is_combo_scenario "${scenario}" && printf true || printf false)" \
-    '{schema_version:1,run_id:$run_id,scenario:$scenario,
+    '{schema_version:2,run_id:$run_id,scenario:$scenario,trial:$trial,
       temp_instance_id:$instance,node_id:$node,test_sha:$test_sha,harness_sha256:$harness_sha,
       helper_sha256:("4"*64),config_sha256:("2"*64),hook_sha256:("3"*64),
       firewall:(if $combo then {mode:"simultaneous",evidence_ref:"combination-provenance.json"}
         else {comment:("cats-q124-"+$run_id),chains:["C124O_fixture","C124I_fixture","C1246O_fixture","C1246I_fixture"]} end)}' \
     >"${dir}/provenance.json"
+  if [[ "${CATS_FIXTURE_WINDOW_REUSE:-false}" == true ]]; then
+    jq '.run_id = "reused-previous-window"' "${dir}/provenance.json" >"${dir}/provenance.invalid.json"
+    mv "${dir}/provenance.invalid.json" "${dir}/provenance.json"
+  fi
   if [[ "${CATS_FIXTURE_FUNCTIONAL_FAIL:-false}" == "true" ]]; then functional_rc=41; fi
   if [[ "${CATS_FIXTURE_CLEANUP_FAIL:-false}" == "true" ]]; then cleanup_rc=42; fi
   printf 'functional_rc\tcleanup_rc\n%s\t%s\n' \
@@ -573,12 +618,19 @@ decode_remote_evidence() {
 }
 
 validate_scenario_evidence() {
-  local dir="$1" scenario="$2" functional_rc cleanup_rc before_identity after_identity
+  local dir="$1" scenario="$2" trial="$3" functional_rc cleanup_rc before_identity after_identity
   for file in state-before.json state-during.json state-after.json oracle-isolated.json \
     oracle-recovered.json timeline.tsv fault-counters.txt probes.tsv provenance.json \
     cordon-operation.json ownership-before.json ownership-isolated.json ownership-after.json; do
     [[ -s "${dir}/${file}" ]] || return 1
   done
+  if [[ "${scenario}" == *control-plane* || "${scenario}" == all-3 ]]; then
+    validate_external_observer "${dir}/external-observer.json" "${scenario}" "${trial}" \
+      "${dir}/state-before.json" || return 1
+    validate_merged_oracle "${dir}" "${scenario}" "${trial}" || return 1
+  else
+    [[ ! -e "${dir}/external-observer.json" ]] || return 1
+  fi
   for phase in before isolated after; do validate_snapshot "${dir}/ownership-${phase}.json" || return 1; done
   [[ "$(jq -Sc '.assigned_cats | sort_by(.cat_id)' "${dir}/ownership-before.json")" == \
       "$(jq -Sc '.assigned_cats | sort_by(.cat_id)' "${dir}/ownership-isolated.json")" &&
@@ -591,14 +643,14 @@ validate_scenario_evidence() {
     (keys | sort) == (["schema_version","operation_id","kind","phase","node_id","started_at","completed_at","log_ref"] | sort) and
     .schema_version == 1 and .kind == "ensure_node_cordoned" and .phase == "succeeded" and .node_id == $node
   ' "${dir}/cordon-operation.json" >/dev/null || return 1
-  jq -e --arg run_id "${RUN_ID}" --arg scenario "${scenario}" --arg instance "${TEMP_INSTANCE_ID}" --arg node "${NODE_ID}" \
+  jq -e --arg run_id "${RUN_ID}-${trial}" --arg scenario "${scenario}" --arg trial "${trial}" --arg instance "${TEMP_INSTANCE_ID}" --arg node "${NODE_ID}" \
     --arg test_sha "$(jq -r .test_sha "${PROVISIONING_MANIFEST}")" \
     --arg harness_sha "${HARNESS_SHA256}" \
     --arg config_sha "$(jq -r .qualification_assets.config_sha256 "${PROVISIONING_MANIFEST}")" \
     --arg hook_sha "$(jq -r .qualification_assets.hook_sha256 "${PROVISIONING_MANIFEST}")" \
     --argjson combo "$(is_combo_scenario "${scenario}" && printf true || printf false)" '
-    (keys | sort) == (["schema_version","run_id","scenario","temp_instance_id","node_id","test_sha","harness_sha256","helper_sha256","config_sha256","hook_sha256","firewall"] | sort) and
-    .schema_version == 1 and .run_id == $run_id and .scenario == $scenario and
+    (keys | sort) == (["schema_version","run_id","scenario","trial","temp_instance_id","node_id","test_sha","harness_sha256","helper_sha256","config_sha256","hook_sha256","firewall"] | sort) and
+    .schema_version == 2 and .run_id == $run_id and .scenario == $scenario and .trial == $trial and
     .temp_instance_id == $instance and .node_id == $node and
     .test_sha == $test_sha and .harness_sha256 == $harness_sha and
     .config_sha256 == $config_sha and .hook_sha256 == $hook_sha and
@@ -614,12 +666,12 @@ validate_scenario_evidence() {
   awk -F= '$1=="workload_delta" {found=1; if ($2+0 <= 0) bad=1} END {exit (!found || bad)}' \
     "${dir}/fault-counters.txt" || return 1
   for phase in before during after; do
-    jq -e --arg ws "${WORKSPACE_ID}" --arg node "${NODE_ID}" --arg scenario "${scenario}" '
-      (keys | sort) == (["schema_version","captured_at","phase","scenario","workspace_id","node_id","cats","raw_operations","log_refs"] | sort) and
-      .schema_version == 1 and .workspace_id == $ws and .scenario == $scenario and .node_id == $node and
+    jq -e --arg ws "${WORKSPACE_ID}" --arg node "${NODE_ID}" --arg scenario "${scenario}" --arg trial "${trial}" --arg durability "$(trial_durability "${trial}")" '
+      (keys | sort) == (["schema_version","captured_at","phase","scenario","trial","workspace_id","node_id","cats","raw_operations","log_refs"] | sort) and
+      .schema_version == 2 and .workspace_id == $ws and .scenario == $scenario and .trial == $trial and .node_id == $node and
       (.captured_at | type == "string" and length > 0) and
       (.phase == "before" or .phase == "during" or .phase == "after") and
-      (.cats | type == "array" and length > 0) and
+      (.cats | type == "array" and length == 1) and .cats[0].durability == $durability and
       all(.cats[];
         (keys | sort) == (["cat_id","cat_name","durability","desired_state","observed_state","generation","node_id","operation_ids","watermark","disk_epoch","digest"] | sort) and
         (.cat_id | test("^cat_[A-Za-z0-9_-]+$")) and
@@ -638,9 +690,7 @@ validate_scenario_evidence() {
         (keys | sort) == (["operation_id","kind","phase","started_at","completed_at","log_ref"] | sort) and
         (.operation_id | test("^op_[A-Za-z0-9_-]+$")) and
         all([.kind,.phase,.started_at,.completed_at,.log_ref][]; type == "string" and length > 0)) and
-      (.log_refs | type == "array" and length > 0) and all(.log_refs[]; type == "string" and length > 0) and
-      (($scenario | contains("s3") | not) or
-        ([.cats[].durability] | sort) == ["relaxed","strict"])
+      (.log_refs | type == "array" and length > 0) and all(.log_refs[]; type == "string" and length > 0)
     ' "${dir}/state-${phase}.json" >/dev/null || return 1
   done
   before_identity="$(jq -Sc '[.cats[] | {cat_name,digest}] | sort_by(.cat_name)' "${dir}/state-before.json")"
@@ -651,8 +701,8 @@ validate_scenario_evidence() {
     after_identity="$(jq -Sc '[.cats[] | {cat_name,generation,node_id,disk_epoch}] | sort_by(.cat_name)' "${dir}/state-after.json")"
     [[ "${before_identity}" == "${after_identity}" ]] || return 1
   fi
-  validate_oracle_file "${dir}/oracle-isolated.json" "${scenario}" isolated || return 1
-  validate_oracle_file "${dir}/oracle-recovered.json" "${scenario}" recovered || return 1
+  validate_oracle_file "${dir}/oracle-isolated.json" "${scenario}" "${trial}" isolated || return 1
+  validate_oracle_file "${dir}/oracle-recovered.json" "${scenario}" "${trial}" recovered || return 1
   if is_combo_scenario "${scenario}"; then
     validate_combo_evidence "${dir}" "${scenario}" || return 1
   fi
@@ -664,11 +714,59 @@ validate_scenario_evidence() {
   fi
 }
 
+validate_external_observer() {
+  local file="$1" scenario="$2" trial="$3" before="$4"
+  [[ -s "${file}" ]] || return 1
+  jq -e --arg window "${RUN_ID}-${trial}" --arg scenario "${scenario}" --arg trial "${trial}" \
+    --arg node "${NODE_ID}" --arg cat "$(jq -r '.cats[0].cat_id' "${before}")" \
+    --argjson generation "$(jq '.cats[0].generation' "${before}")" '
+    (keys | sort) == (["schema_version","source","window_id","scenario","trial","node_id","cat_id",
+      "generation","started_at","completed_at","lost_observed_at","recovered_observed_at",
+      "lost_cat_observed_state","checks"] | sort) and
+    .schema_version == 2 and .source == "external-control-plane-observer" and .window_id == $window and
+    .scenario == $scenario and .trial == $trial and .node_id == $node and .cat_id == $cat and
+    .generation == $generation and
+    all([.started_at,.completed_at,.lost_observed_at,.recovered_observed_at][];
+      type == "string" and (fromdateiso8601 | type == "number")) and
+    (.started_at|fromdateiso8601) <= (.lost_observed_at|fromdateiso8601) and
+    (.lost_observed_at|fromdateiso8601) <= (.recovered_observed_at|fromdateiso8601) and
+    (.recovered_observed_at|fromdateiso8601) <= (.completed_at|fromdateiso8601) and
+    (.lost_cat_observed_state == "unknown" or .lost_cat_observed_state == "stopping" or
+      .lost_cat_observed_state == "running") and
+    .checks == {node_lost_observed:true,exact_cat_claim_preserved:true,
+      generation_replacement_absent:true,node_recovered_cordoned:true,
+      same_node_identity:true,inventory_complete:true,placement_preserved:true}
+  ' "${file}" >/dev/null
+}
+
+write_merged_oracle() {
+  local dir="$1" scenario="$2" trial="$3"
+  jq -n --arg window "${RUN_ID}-${trial}" --arg scenario "${scenario}" --arg trial "${trial}" \
+    --slurpfile host "${dir}/oracle-isolated.json" --slurpfile external "${dir}/external-observer.json" '
+    {schema_version:2,window_id:$window,scenario:$scenario,trial:$trial,phase:"isolated",
+     sources:{host:"oracle-isolated.json",control_plane:"external-observer.json"},
+     checks:($host[0].checks + $external[0].checks)}' >"${dir}/oracle-isolated-merged.json"
+}
+
+validate_merged_oracle() {
+  local dir="$1" scenario="$2" trial="$3"
+  [[ -s "${dir}/oracle-isolated-merged.json" ]] || return 1
+  jq -e --arg window "${RUN_ID}-${trial}" --arg scenario "${scenario}" --arg trial "${trial}" \
+    --slurpfile host "${dir}/oracle-isolated.json" --slurpfile external "${dir}/external-observer.json" '
+    .schema_version == 2 and .window_id == $window and .scenario == $scenario and .trial == $trial and
+    .phase == "isolated" and
+    .sources == {host:"oracle-isolated.json",control_plane:"external-observer.json"} and
+    .checks == ($host[0].checks + $external[0].checks) and
+    ($host[0].checks | has("node_lost_observed") | not) and
+    $external[0].checks.node_lost_observed == true
+  ' "${dir}/oracle-isolated-merged.json" >/dev/null
+}
+
 validate_combo_step_file() {
   local file="$1" scenario="$2" dep="$3" remaining="$4"
-  jq -e --arg scenario "${scenario}" --arg dep "${dep}" --argjson remaining "${remaining}" '
-    (keys | sort) == (["schema_version","scenario","phase","restored_dependency","remaining_dependencies","started_at","completed_at","checks","raw_operations","log_refs"] | sort) and
-    .schema_version == 1 and .scenario == $scenario and .phase == "partial-recovery" and
+  jq -e --arg scenario "${scenario}" --arg trial "${TRIAL}" --arg dep "${dep}" --argjson remaining "${remaining}" '
+    (keys | sort) == (["schema_version","scenario","trial","phase","restored_dependency","remaining_dependencies","started_at","completed_at","checks","raw_operations","log_refs"] | sort) and
+    .schema_version == 2 and .scenario == $scenario and .trial == $trial and .phase == "partial-recovery" and
     .restored_dependency == $dep and .remaining_dependencies == $remaining and
     all([.started_at,.completed_at][]; type == "string" and length > 0) and
     (.checks | keys | sort) == (["restored_dependency_positive","remaining_dependencies_negative","false_success_absent","digest_preserved","generation_preserved","disk_epoch_preserved"] | sort) and
@@ -697,10 +795,10 @@ validate_combo_evidence() {
         $2 !~ /^(-|db|s3|control-plane)$/ ||
         $3 !~ /^(injected|isolated-verified|restored|recovered-verified)$/) bad=1
   } END {exit (NR < 2 || bad)}' "${dir}/combination-order.tsv" || return 1
-  jq -e --arg scenario "${scenario}" --argjson dependencies "${dependencies}" \
+  jq -e --arg scenario "${scenario}" --arg trial "${TRIAL}" --argjson dependencies "${dependencies}" \
     --argjson injection "${dependencies}" --argjson recovery "${recovery}" '
-      (keys | sort) == (["schema_version","scenario","mode","dependencies","injection_order","recovery_order"] | sort) and
-      .schema_version == 1 and .scenario == $scenario and .mode == "simultaneous" and
+      (keys | sort) == (["schema_version","scenario","trial","mode","dependencies","injection_order","recovery_order"] | sort) and
+      .schema_version == 2 and .scenario == $scenario and .trial == $trial and .mode == "simultaneous" and
       .injection_order == $injection and .recovery_order == $recovery and
       [.dependencies[].dependency] == $dependencies and
       all(.dependencies[];
@@ -744,28 +842,12 @@ validate_combo_evidence() {
 }
 
 validate_oracle_file() {
-  local file="$1" scenario="$2" phase="$3" required
-  case "${scenario}:${phase}" in
-    db:isolated) required='["running_exec_observed","metadata_cas_false_success_absent","sync_false_success_absent","cold_false_success_absent","start_retry_or_failure_observed","new_start_retry_or_failure_observed","corruption_absent"]' ;;
-    db:recovered) required='["dependency_reconnected","pending_operations_converged","digest_verified"]' ;;
-    s3:isolated) required='["strict_sync_false_success_absent","strict_cold_false_success_absent","relaxed_local_fsync_observed","relaxed_sync_false_success_absent","relaxed_drain_false_success_absent","local_remote_watermarks_captured","unpublished_captured"]' ;;
-    s3:recovered) required='["strict_sync_succeeded","relaxed_sync_succeeded","local_remote_watermarks_converged","unpublished_zero","strict_cold_restore_digest_verified","relaxed_cold_restore_digest_verified"]' ;;
-    control-plane:isolated) required='["lease_timeout_plus_five_observed","node_lost_observed","claims_preserved","cat_unknown_or_pending","implicit_fence_absent","generation_replacement_absent","epoch_replacement_absent","admin_fence_absent"]' ;;
-    control-plane:recovered) required='["same_node_identity","inventory_complete","placement_preserved","generation_preserved","disk_epoch_preserved","digest_verified"]' ;;
-    db-s3:isolated) required='["simultaneous_window_confirmed","db_false_success_absent","s3_strict_false_success_absent","s3_relaxed_false_success_absent","digests_unchanged"]' ;;
-    db-s3:recovered) required='["recovery_order_exact","db_reconnected","s3_converged","final_digests_verified","generation_preserved","disk_epoch_preserved"]' ;;
-    db-control-plane:isolated) required='["simultaneous_window_confirmed","db_false_success_absent","node_lost_without_fence","generation_replacement_absent","epoch_replacement_absent","digest_unchanged"]' ;;
-    db-control-plane:recovered) required='["recovery_order_exact","control_plane_same_identity","db_reconnected","final_digest_verified","generation_preserved","disk_epoch_preserved"]' ;;
-    s3-control-plane:isolated) required='["simultaneous_window_confirmed","s3_strict_false_success_absent","s3_relaxed_false_success_absent","node_lost_without_fence","generation_replacement_absent","epoch_replacement_absent","digests_unchanged"]' ;;
-    s3-control-plane:recovered) required='["recovery_order_exact","control_plane_same_identity","s3_converged","final_digests_verified","generation_preserved","disk_epoch_preserved"]' ;;
-    all-3:isolated) required='["simultaneous_window_confirmed","db_false_success_absent","s3_strict_false_success_absent","s3_relaxed_false_success_absent","node_lost_without_fence","generation_replacement_absent","epoch_replacement_absent","digests_unchanged"]' ;;
-    all-3:recovered) required='["recovery_order_exact","control_plane_same_identity","db_reconnected","s3_converged","final_digests_verified","generation_preserved","disk_epoch_preserved"]' ;;
-    *) return 1 ;;
-  esac
-  jq -e --arg scenario "${scenario}" --arg phase "${phase}" --argjson required "${required}" '
+  local file="$1" scenario="$2" trial="$3" phase="$4" required
+  required="$(oracle_required_checks "${scenario}" "${trial}" "${phase}")" || return 1
+  jq -e --arg scenario "${scenario}" --arg trial "${trial}" --arg phase "${phase}" --argjson required "${required}" '
     . as $root |
-    (keys | sort) == (["schema_version","scenario","phase","started_at","completed_at","checks","raw_operations","log_refs"] | sort) and
-    .schema_version == 1 and .scenario == $scenario and .phase == $phase and
+    (keys | sort) == (["schema_version","scenario","trial","phase","started_at","completed_at","checks","raw_operations","log_refs"] | sort) and
+    .schema_version == 2 and .scenario == $scenario and .trial == $trial and .phase == $phase and
     all([.started_at,.completed_at][]; type == "string" and length > 0) and
     (.checks | keys | sort) == ($required | sort) and
     (.raw_operations | type == "array" and length > 0) and
@@ -778,21 +860,127 @@ validate_oracle_file() {
   ' "${file}" >/dev/null
 }
 
-run_live_scenario() {
-  local scenario="$1" command parameters response command_id status rc
-  local dir="${RUN_DIR}/${scenario}"
-  local functional_rc cleanup_rc stdout_content stderr_content secret_rc=0
-  local deadline
-  mkdir -p "${dir}"
-  command="$(build_ssm_command "${scenario}")"
+oracle_required_checks() {
+  local scenario="$1" trial="$2" phase="$3"
+  case "${trial}:${phase}" in
+    db-running:isolated) printf '["running_exec_observed","metadata_cas_false_success_absent","sync_false_success_absent","corruption_signal_absent"]' ;;
+    db-cold-start:isolated) printf '["cold_false_success_absent","start_retry_or_failure_observed","new_start_retry_or_failure_observed","corruption_signal_absent"]' ;;
+    *-strict:isolated)
+      if [[ "${scenario}" == *control-plane* || "${scenario}" == all-3 ]]; then
+        printf '["strict_fsync_false_success_absent","strict_drain_false_success_absent","digest_signal_preserved","lease_timeout_plus_five_observed","guest_io_observed","local_claim_preserved","local_generation_preserved","local_epoch_preserved","admin_fence_not_invoked"]'
+      else printf '["strict_sync_false_success_absent","strict_cold_false_success_absent","digest_signal_preserved"]'; fi ;;
+    *-relaxed:isolated)
+      if [[ "${scenario}" == *control-plane* || "${scenario}" == all-3 ]]; then
+        printf '["relaxed_local_fsync_observed","relaxed_sync_false_success_absent","relaxed_drain_false_success_absent","local_remote_watermarks_captured","unpublished_captured","lease_timeout_plus_five_observed","guest_io_observed","local_claim_preserved","local_generation_preserved","local_epoch_preserved","admin_fence_not_invoked"]'
+      else printf '["relaxed_local_fsync_observed","relaxed_sync_false_success_absent","relaxed_drain_false_success_absent","local_remote_watermarks_captured","unpublished_captured"]'; fi ;;
+    control-plane-running:isolated) printf '["lease_timeout_plus_five_observed","guest_io_observed","local_claim_preserved","local_generation_preserved","local_epoch_preserved","admin_fence_not_invoked"]' ;;
+    db-running:recovered|db-cold-start:recovered) printf '["dependency_reconnected","pending_operations_converged","digest_verified"]' ;;
+    s3-strict:recovered|s3-relaxed:recovered) printf '["dependency_reconnected","watermarks_converged","unpublished_zero","cold_restore_digest_verified"]' ;;
+    control-plane-running:recovered) printf '["host_reconnected","local_inventory_complete","digest_verified"]' ;;
+    db-s3-*:recovered) printf '["db_reconnected","s3_converged","final_digest_verified","generation_preserved","disk_epoch_preserved"]' ;;
+    s3-control-plane-*:recovered) printf '["host_reconnected","s3_converged","final_digest_verified","generation_preserved","disk_epoch_preserved"]' ;;
+    db-control-plane-*:recovered) printf '["host_reconnected","db_reconnected","final_digest_verified","generation_preserved","disk_epoch_preserved"]' ;;
+    all-3-*:recovered) printf '["host_reconnected","db_reconnected","s3_converged","final_digest_verified","generation_preserved","disk_epoch_preserved"]' ;;
+    *) return 1 ;;
+  esac
+}
+
+prepare_live_ownership() {
+  local trial="$1" qrun remote_output remote_gzip command parameters response command_id status deadline
+  local stdout_content stderr_content encoded next
+  qrun="${RUN_ID}-${trial}"
+  remote_output="/run/cats-q124-prepared-${qrun}.json"
+  remote_gzip="${remote_output}.gz"
+  printf -v command \
+    'umask 077; sudo env Q124_RUN_ID=%q Q124_TEST_SHA=%q %q prepare-trial --scenario %q --trial %q --workspace-id %q --node-id %q --cat-id %q --cat-name %q --instance-id %q --output %q >/dev/null; rc=$?; if ((rc != 0)); then exit "$rc"; fi; gzip -9c %q >%q || exit 74; encoded=$(openssl base64 -A <%q) || exit 74; printf "Q124_PREPARED_OWNERSHIP=%%s\\n" "$encoded"; rm -f %q %q' \
+    "${qrun}" "$(jq -r .test_sha "${PROVISIONING_MANIFEST}")" "${REMOTE_HOOK}" \
+    "${SCENARIO}" "${trial}" "${WORKSPACE_ID}" "${NODE_ID}" "${TARGET_CAT_ID}" "${TARGET_CAT_NAME}" \
+    "${TEMP_INSTANCE_ID}" "${remote_output}" "${remote_output}" "${remote_gzip}" "${remote_gzip}" \
+    "${remote_output}" "${remote_gzip}"
+  printf '%s' "${command}" | contains_secret_like && die "secret-like prepare command rejected"
+  (( ${#command} <= 8000 )) || die "prepare command exceeds safe SSM size"
   parameters="$(jq -cn --arg command "${command}" --arg timeout "${SSM_TIMEOUT_SECONDS}" \
     '{commands:[$command],executionTimeout:[$timeout]}')"
-  response="$(aws ssm send-command --region "${AWS_REGION}" \
+  response="$(aws ssm send-command --region "${AWS_REGION}" --document-name AWS-RunShellScript \
+    --instance-ids "${TEMP_INSTANCE_ID}" --timeout-seconds "${SSM_TIMEOUT_SECONDS}" \
+    --comment "Issue 124 prepare ${qrun}" --parameters "${parameters}" --output json)" ||
+    die "prepare-trial SSM dispatch failed"
+  command_id="$(jq -r .Command.CommandId <<<"${response}")"
+  [[ "${command_id}" =~ ^[0-9a-f-]{36}$ ]] || die "invalid prepare-trial SSM command ID"
+  deadline="$(( $(date +%s) + SSM_TIMEOUT_SECONDS + 60 ))"
+  while true; do
+    response="$(aws ssm get-command-invocation --region "${AWS_REGION}" --command-id "${command_id}" \
+      --instance-id "${TEMP_INSTANCE_ID}" --output json 2>/dev/null || true)"
+    status="$(jq -r '.Status // "Pending"' <<<"${response:-{}}")"
+    case "${status}" in
+      Pending|InProgress|Delayed) sleep 2 ;;
+      Success) break ;;
+      Cancelled|TimedOut|Failed|Cancelling) die "prepare-trial SSM ended ${status}" ;;
+      *) die "unexpected prepare-trial SSM status: ${status}" ;;
+    esac
+    (( $(date +%s) < deadline )) || die "prepare-trial SSM poll timed out"
+  done
+  stdout_content="$(jq -r '.StandardOutputContent // ""' <<<"${response}")"
+  stderr_content="$(jq -r '.StandardErrorContent // ""' <<<"${response}")"
+  if printf '%s\n%s' "${stdout_content}" "${stderr_content}" | contains_secret_like; then
+    die "secret-like prepare-trial SSM output rejected"
+  fi
+  [[ -z "${stderr_content}" ]] || die "prepare-trial emitted stderr"
+  [[ "$(grep -c '^Q124_PREPARED_OWNERSHIP=' <<<"${stdout_content}")" == 1 ]] ||
+    die "prepare-trial ownership evidence missing or duplicated"
+  encoded="$(sed -n 's/^Q124_PREPARED_OWNERSHIP=//p' <<<"${stdout_content}")"
+  next="${OWNERSHIP_SNAPSHOT}.next.$$"
+  printf '%s' "${encoded}" | openssl base64 -d -A | gzip -d >"${next}" || {
+    rm -f "${next}"; die "prepare-trial ownership evidence decode failed";
+  }
+  chmod 0600 "${next}"
+  mv "${next}" "${OWNERSHIP_SNAPSHOT}"
+}
+
+run_live_scenario() {
+  local scenario="$1" trial="$2" command parameters response command_id status rc
+  local dir="${RUN_DIR}/${trial}"
+  local functional_rc cleanup_rc stdout_content stderr_content secret_rc=0
+  local deadline observer_pid="" observer_rc=0 observer_output="" observer_ready="" observer_deadline cat_id=""
+  mkdir -p "${dir}"
+  command="$(build_ssm_command "${scenario}" "${trial}")"
+  parameters="$(jq -cn --arg command "${command}" --arg timeout "${SSM_TIMEOUT_SECONDS}" \
+    '{commands:[$command],executionTimeout:[$timeout]}')"
+  if [[ "${scenario}" == *control-plane* || "${scenario}" == all-3 ]]; then
+    cat_id="$(jq -r '.assigned_cats[0].cat_id' "${OWNERSHIP_SNAPSHOT}")"
+    observer_output="/run/cats-q124-observer-${RUN_ID}-${trial}.json"
+    observer_ready="/run/cats-q124-observer-${RUN_ID}-${trial}.ready"
+    sudo -n rm -f "${observer_output}" "${observer_ready}"
+    sudo -n env Q124_RUN_ID="${RUN_ID}-${trial}" "${OBSERVER_HOOK}" observe-window \
+      --scenario "${scenario}" --trial "${trial}" --workspace-id "${WORKSPACE_ID}" \
+      --node-id "${NODE_ID}" --cat-id "${cat_id}" --timeout-seconds "${SSM_TIMEOUT_SECONDS}" \
+      --ready-file "${observer_ready}" --output "${observer_output}" >/dev/null 2>&1 &
+    observer_pid=$!
+    observer_deadline=$((SECONDS + 20))
+    until [[ -s "${observer_ready}" ]]; do
+      kill -0 "${observer_pid}" 2>/dev/null || {
+        wait "${observer_pid}" || true
+        sudo -n rm -f "${observer_output}" "${observer_ready}"
+        die "external observer/API preflight failed before fault injection"
+      }
+      (( SECONDS < observer_deadline )) || {
+        kill "${observer_pid}" 2>/dev/null || true; wait "${observer_pid}" 2>/dev/null || true
+        sudo -n rm -f "${observer_output}" "${observer_ready}"
+        die "external observer readiness timed out before fault injection"
+      }
+      sleep 1
+    done
+  fi
+  if ! response="$(aws ssm send-command --region "${AWS_REGION}" \
     --document-name AWS-RunShellScript \
     --instance-ids "${TEMP_INSTANCE_ID}" \
     --timeout-seconds "${SSM_TIMEOUT_SECONDS}" \
-    --comment "Issue 124 ${RUN_ID} ${scenario}" \
-    --parameters "${parameters}" --output json)"
+    --comment "Issue 124 ${RUN_ID} ${trial}" \
+    --parameters "${parameters}" --output json)"; then
+    [[ -z "${observer_pid}" ]] || { kill "${observer_pid}" 2>/dev/null || true; wait "${observer_pid}" 2>/dev/null || true; }
+    [[ -z "${observer_output}" ]] || sudo -n rm -f "${observer_output}" "${observer_ready}"
+    return 1
+  fi
   command_id="$(jq -r .Command.CommandId <<<"${response}")"
   [[ "${command_id}" =~ ^[0-9a-f-]{36}$ ]] || die "could not parse SSM command ID"
   printf '%s\n' "${command_id}" >"${dir}/ssm-command-id.txt"
@@ -829,9 +1017,21 @@ run_live_scenario() {
   printf 'functional_rc\tcleanup_rc\n%s\t%s\n' \
     "${functional_rc:-missing}" "${cleanup_rc:-missing}" >"${dir}/result.tsv"
   rc=0
+  if [[ -n "${observer_pid}" ]]; then
+    wait "${observer_pid}" || observer_rc=$?
+    if (( observer_rc == 0 )) && sudo -n test -s "${observer_output}"; then
+      sudo -n cat "${observer_output}" >"${dir}/external-observer.json" || observer_rc=1
+      chmod 0600 "${dir}/external-observer.json"
+    else
+      observer_rc=1
+    fi
+    sudo -n rm -f "${observer_output}" "${observer_ready}"
+    if (( observer_rc == 0 )); then write_merged_oracle "${dir}" "${scenario}" "${trial}" || observer_rc=1; fi
+  fi
   [[ "${status}" == "Success" ]] || rc=1
   (( secret_rc == 0 )) || rc=1
-  validate_scenario_evidence "${dir}" "${scenario}" || rc=1
+  (( observer_rc == 0 )) || rc=1
+  validate_scenario_evidence "${dir}" "${scenario}" "${trial}" || rc=1
   return "${rc}"
 }
 
@@ -840,7 +1040,6 @@ main() {
   require_command openssl
   require_command gzip
   validate_inputs
-  validate_snapshot "${OWNERSHIP_SNAPSHOT}"
   validate_manifest "${PROVISIONING_MANIFEST}"
   if [[ -z "${CATS_REMOTE_WORKLOAD_HOOK:-}" ]]; then
     REMOTE_HOOK="/opt/cats/qualification-124/$(jq -r .test_sha "${PROVISIONING_MANIFEST}")/q124-fault-workload"
@@ -849,9 +1048,18 @@ main() {
     require_command git
     require_command shasum
     verify_reviewed_hook_provenance
+    verify_live_identity
+    if [[ "${PREPARE_TRIAL}" == true ]]; then
+      prepare_live_ownership "${TRIAL}"
+    fi
+  fi
+  validate_snapshot "${OWNERSHIP_SNAPSHOT}"
+  [[ "$(jq -r .test_sha "${PROVISIONING_MANIFEST}")" == "$(jq -r .test_sha "${OWNERSHIP_SNAPSHOT}")" ]] ||
+    die "ownership snapshot TEST_SHA does not match provisioning manifest"
+  if [[ "${MODE}" == live || "${REQUIRE_FRESH_OWNERSHIP}" == true ]]; then
     jq -e '(.captured_at | fromdateiso8601) >= (now - 300) and
       (.captured_at | fromdateiso8601) <= (now + 30)' "${OWNERSHIP_SNAPSHOT}" >/dev/null ||
-      die "live ownership snapshot must be fresh within five minutes"
+      die "ownership snapshot must be fresh within five minutes"
   fi
   make_run_dir
   write_run_metadata
@@ -863,11 +1071,11 @@ main() {
     fixture)
       local scenario
       for scenario in "${SCENARIOS[@]}"; do
-        run_fixture_scenario "${scenario}" || {
+        run_fixture_scenario "${scenario}" "${TRIAL}" || {
           printf 'result=FAIL scenario=%s evidence=%s\n' "${scenario}" "${RUN_DIR}" >&2
           return 1
         }
-        validate_scenario_evidence "${RUN_DIR}/${scenario}" "${scenario}" ||
+        validate_scenario_evidence "${RUN_DIR}/${TRIAL}" "${scenario}" "${TRIAL}" ||
           die "fixture evidence validation failed for ${scenario}"
       done
       printf 'result=PASS mode=fixture scenarios=%s evidence=%s\n' \
@@ -878,12 +1086,11 @@ main() {
       expected="RUN_Q124_FAULT_${TEMP_INSTANCE_ID}_${NODE_ID}_${SCENARIO}"
       [[ "${LIVE_CONFIRM}" == "${expected}" ]] ||
         die "live mode requires CATS_FAULT_CONFIRM=${expected}"
-      verify_live_identity
       local scenario
       for scenario in "${SCENARIOS[@]}"; do
         # This loop is intentionally serial. A failed or incomplete cleanup
         # stops the run before another dependency can be isolated.
-        run_live_scenario "${scenario}" || {
+        run_live_scenario "${scenario}" "${TRIAL}" || {
           printf 'result=FAIL scenario=%s evidence=%s\n' "${scenario}" "${RUN_DIR}" >&2
           return 1
         }
@@ -905,6 +1112,7 @@ set -u -o pipefail
 
 RUN_ID="${Q124_RUN_ID:?}"
 SCENARIO="${Q124_SCENARIO:?}"
+TRIAL="${Q124_TRIAL:?}"
 INSTANCE_ID="${Q124_INSTANCE_ID:?}"
 NODE_ID="${Q124_NODE_ID:?}"
 WORKSPACE_ID="${Q124_WORKSPACE_ID:?}"
@@ -984,7 +1192,8 @@ conf_get() {
 }
 
 snapshot_valid() {
-  jq -e --arg instance "${INSTANCE_ID}" --arg node "${NODE_ID}" --arg ws "${WORKSPACE_ID}" --arg test_sha "${TEST_SHA}" '
+  jq -e --arg instance "${INSTANCE_ID}" --arg node "${NODE_ID}" --arg ws "${WORKSPACE_ID}" --arg test_sha "${TEST_SHA}" \
+    --arg durability "$(trial_durability "${TRIAL}")" '
     (keys | sort) == (["schema_version","captured_at","temp_instance_id","node_id","node_state","workspace_id","workspace","tags","orphans","assigned_cats","test_sha","dependency_endpoints"] | sort) and
     .schema_version == 1 and (.captured_at | fromdateiso8601) >= (now - 120) and
     (.captured_at | fromdateiso8601) <= (now + 30) and
@@ -996,7 +1205,7 @@ snapshot_valid() {
     .tags.Purpose == "qualification-124" and .orphans == 0 and
     (.dependency_endpoints | keys | sort) == (["db_host","s3_host","control_plane_host","node_listen_ip"] | sort) and
     all(.dependency_endpoints[]; type == "string" and length > 0) and
-    (.assigned_cats | type == "array" and length > 0) and
+    (.assigned_cats | type == "array" and length == 1) and .assigned_cats[0].durability == $durability and
     all(.assigned_cats[];
       (keys | sort) == (["cat_id","name","workspace_id","node_id","durability"] | sort) and
       (.cat_id | test("^cat_[A-Za-z0-9_-]+$")) and
@@ -1034,6 +1243,7 @@ take_snapshot() {
   local phase="$1"
   local output="${STATE_DIR}/ownership-${phase}.json"
   run_hook snapshot --scenario "${SCENARIO}" --phase "${phase}" \
+    --trial "${TRIAL}" \
     --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" --instance-id "${INSTANCE_ID}" \
     --output "${output}" >/dev/null 2>&1 || return 1
   snapshot_valid "${output}" || { fail "${phase} ownership snapshot schema/freshness is invalid"; return 1; }
@@ -1052,12 +1262,13 @@ cordon_evidence_valid() {
 }
 
 state_valid() {
-  jq -e --arg ws "${WORKSPACE_ID}" --arg node "${NODE_ID}" --arg scenario "${SCENARIO}" '
-    (keys | sort) == (["schema_version","captured_at","phase","scenario","workspace_id","node_id","cats","raw_operations","log_refs"] | sort) and
-    .schema_version == 1 and .workspace_id == $ws and .scenario == $scenario and .node_id == $node and
+  jq -e --arg ws "${WORKSPACE_ID}" --arg node "${NODE_ID}" --arg scenario "${SCENARIO}" \
+    --arg trial "${TRIAL}" --arg durability "$(trial_durability "${TRIAL}")" '
+    (keys | sort) == (["schema_version","captured_at","phase","scenario","trial","workspace_id","node_id","cats","raw_operations","log_refs"] | sort) and
+    .schema_version == 2 and .workspace_id == $ws and .scenario == $scenario and .trial == $trial and .node_id == $node and
     (.captured_at | type == "string" and length > 0) and
     (.phase == "before" or .phase == "during" or .phase == "after") and
-    (.cats | type == "array" and length > 0) and
+    (.cats | type == "array" and length == 1) and .cats[0].durability == $durability and
     all(.cats[];
       (keys | sort) == (["cat_id","cat_name","durability","desired_state","observed_state","generation","node_id","operation_ids","watermark","disk_epoch","digest"] | sort) and
       (.cat_id | test("^cat_[A-Za-z0-9_-]+$")) and
@@ -1076,35 +1287,55 @@ state_valid() {
       (keys | sort) == (["operation_id","kind","phase","started_at","completed_at","log_ref"] | sort) and
       (.operation_id | test("^op_[A-Za-z0-9_-]+$")) and
       all([.kind,.phase,.started_at,.completed_at,.log_ref][]; type == "string" and length > 0)) and
-    (.log_refs | type == "array" and length > 0) and all(.log_refs[]; type == "string" and length > 0) and
-    (($scenario | contains("s3") | not) or
-      ([.cats[].durability] | sort) == ["relaxed","strict"])
+    (.log_refs | type == "array" and length > 0) and all(.log_refs[]; type == "string" and length > 0)
   ' "$1" >/dev/null
+}
+
+valid_trial() {
+  case "$1:$2" in
+    db:db-running|db:db-cold-start|s3:s3-strict|s3:s3-relaxed|\
+    control-plane:control-plane-running|db-s3:db-s3-strict|db-s3:db-s3-relaxed|\
+    db-control-plane:db-control-plane-strict|db-control-plane:db-control-plane-relaxed|\
+    s3-control-plane:s3-control-plane-strict|s3-control-plane:s3-control-plane-relaxed|\
+    all-3:all-3-strict|all-3:all-3-relaxed) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+trial_durability() {
+  case "$1" in
+    s3-relaxed|db-s3-relaxed|db-control-plane-relaxed|s3-control-plane-relaxed|all-3-relaxed) printf relaxed ;;
+    *) printf strict ;;
+  esac
 }
 
 oracle_valid() {
   local file="$1" phase="$2" required
-  case "${SCENARIO}:${phase}" in
-    db:isolated) required='["running_exec_observed","metadata_cas_false_success_absent","sync_false_success_absent","cold_false_success_absent","start_retry_or_failure_observed","new_start_retry_or_failure_observed","corruption_absent"]' ;;
-    db:recovered) required='["dependency_reconnected","pending_operations_converged","digest_verified"]' ;;
-    s3:isolated) required='["strict_sync_false_success_absent","strict_cold_false_success_absent","relaxed_local_fsync_observed","relaxed_sync_false_success_absent","relaxed_drain_false_success_absent","local_remote_watermarks_captured","unpublished_captured"]' ;;
-    s3:recovered) required='["strict_sync_succeeded","relaxed_sync_succeeded","local_remote_watermarks_converged","unpublished_zero","strict_cold_restore_digest_verified","relaxed_cold_restore_digest_verified"]' ;;
-    control-plane:isolated) required='["lease_timeout_plus_five_observed","node_lost_observed","claims_preserved","cat_unknown_or_pending","implicit_fence_absent","generation_replacement_absent","epoch_replacement_absent","admin_fence_absent"]' ;;
-    control-plane:recovered) required='["same_node_identity","inventory_complete","placement_preserved","generation_preserved","disk_epoch_preserved","digest_verified"]' ;;
-    db-s3:isolated) required='["simultaneous_window_confirmed","db_false_success_absent","s3_strict_false_success_absent","s3_relaxed_false_success_absent","digests_unchanged"]' ;;
-    db-s3:recovered) required='["recovery_order_exact","db_reconnected","s3_converged","final_digests_verified","generation_preserved","disk_epoch_preserved"]' ;;
-    db-control-plane:isolated) required='["simultaneous_window_confirmed","db_false_success_absent","node_lost_without_fence","generation_replacement_absent","epoch_replacement_absent","digest_unchanged"]' ;;
-    db-control-plane:recovered) required='["recovery_order_exact","control_plane_same_identity","db_reconnected","final_digest_verified","generation_preserved","disk_epoch_preserved"]' ;;
-    s3-control-plane:isolated) required='["simultaneous_window_confirmed","s3_strict_false_success_absent","s3_relaxed_false_success_absent","node_lost_without_fence","generation_replacement_absent","epoch_replacement_absent","digests_unchanged"]' ;;
-    s3-control-plane:recovered) required='["recovery_order_exact","control_plane_same_identity","s3_converged","final_digests_verified","generation_preserved","disk_epoch_preserved"]' ;;
-    all-3:isolated) required='["simultaneous_window_confirmed","db_false_success_absent","s3_strict_false_success_absent","s3_relaxed_false_success_absent","node_lost_without_fence","generation_replacement_absent","epoch_replacement_absent","digests_unchanged"]' ;;
-    all-3:recovered) required='["recovery_order_exact","control_plane_same_identity","db_reconnected","s3_converged","final_digests_verified","generation_preserved","disk_epoch_preserved"]' ;;
+  case "${TRIAL}:${phase}" in
+    db-running:isolated) required='["running_exec_observed","metadata_cas_false_success_absent","sync_false_success_absent","corruption_signal_absent"]' ;;
+    db-cold-start:isolated) required='["cold_false_success_absent","start_retry_or_failure_observed","new_start_retry_or_failure_observed","corruption_signal_absent"]' ;;
+    *-strict:isolated)
+      if [[ "${SCENARIO}" == *control-plane* || "${SCENARIO}" == all-3 ]]; then
+        required='["strict_fsync_false_success_absent","strict_drain_false_success_absent","digest_signal_preserved","lease_timeout_plus_five_observed","guest_io_observed","local_claim_preserved","local_generation_preserved","local_epoch_preserved","admin_fence_not_invoked"]'
+      else required='["strict_sync_false_success_absent","strict_cold_false_success_absent","digest_signal_preserved"]'; fi ;;
+    *-relaxed:isolated)
+      if [[ "${SCENARIO}" == *control-plane* || "${SCENARIO}" == all-3 ]]; then
+        required='["relaxed_local_fsync_observed","relaxed_sync_false_success_absent","relaxed_drain_false_success_absent","local_remote_watermarks_captured","unpublished_captured","lease_timeout_plus_five_observed","guest_io_observed","local_claim_preserved","local_generation_preserved","local_epoch_preserved","admin_fence_not_invoked"]'
+      else required='["relaxed_local_fsync_observed","relaxed_sync_false_success_absent","relaxed_drain_false_success_absent","local_remote_watermarks_captured","unpublished_captured"]'; fi ;;
+    control-plane-running:isolated) required='["lease_timeout_plus_five_observed","guest_io_observed","local_claim_preserved","local_generation_preserved","local_epoch_preserved","admin_fence_not_invoked"]' ;;
+    db-running:recovered|db-cold-start:recovered) required='["dependency_reconnected","pending_operations_converged","digest_verified"]' ;;
+    s3-strict:recovered|s3-relaxed:recovered) required='["dependency_reconnected","watermarks_converged","unpublished_zero","cold_restore_digest_verified"]' ;;
+    control-plane-running:recovered) required='["host_reconnected","local_inventory_complete","digest_verified"]' ;;
+    db-s3-*:recovered) required='["db_reconnected","s3_converged","final_digest_verified","generation_preserved","disk_epoch_preserved"]' ;;
+    s3-control-plane-*:recovered) required='["host_reconnected","s3_converged","final_digest_verified","generation_preserved","disk_epoch_preserved"]' ;;
+    db-control-plane-*:recovered) required='["host_reconnected","db_reconnected","final_digest_verified","generation_preserved","disk_epoch_preserved"]' ;;
+    all-3-*:recovered) required='["host_reconnected","db_reconnected","s3_converged","final_digest_verified","generation_preserved","disk_epoch_preserved"]' ;;
     *) return 1 ;;
   esac
-  jq -e --arg scenario "${SCENARIO}" --arg phase "${phase}" --argjson required "${required}" '
+  jq -e --arg scenario "${SCENARIO}" --arg trial "${TRIAL}" --arg phase "${phase}" --argjson required "${required}" '
     . as $root |
-    (keys | sort) == (["schema_version","scenario","phase","started_at","completed_at","checks","raw_operations","log_refs"] | sort) and
-    .schema_version == 1 and .scenario == $scenario and .phase == $phase and
+    (keys | sort) == (["schema_version","scenario","trial","phase","started_at","completed_at","checks","raw_operations","log_refs"] | sort) and
+    .schema_version == 2 and .scenario == $scenario and .trial == $trial and .phase == $phase and
     all([.started_at,.completed_at][]; type == "string" and length > 0) and
     (.checks | keys | sort) == ($required | sort) and
     (.raw_operations | type == "array" and length > 0) and
@@ -1132,7 +1363,8 @@ tcp_probe() {
 }
 
 real_probe() {
-  run_hook probe --scenario "${SCENARIO}" --address "$1" --port "$2" >/dev/null 2>&1
+  run_hook probe --scenario "${SCENARIO}" --trial "${TRIAL}" --address "$1" --port "$2" \
+    --node-id "${NODE_ID}" >/dev/null 2>&1
 }
 
 expect_probe() {
@@ -1436,9 +1668,9 @@ write_combo_provenance() {
   done
   injection="$(printf '%s\n' "${COMBO_DEPS[@]}" | jq -Rsc 'split("\n")[:-1]')"
   recovery="$(printf '%s\n' "${COMBO_RECOVERY[@]}" | jq -Rsc 'split("\n")[:-1]')"
-  jq -n --arg scenario "${SCENARIO}" --argjson dependencies "${dependencies}" \
+  jq -n --arg scenario "${SCENARIO}" --arg trial "${TRIAL}" --argjson dependencies "${dependencies}" \
     --argjson injection "${injection}" --argjson recovery "${recovery}" '
-      {schema_version:1,scenario:$scenario,mode:"simultaneous",dependencies:$dependencies,
+      {schema_version:2,scenario:$scenario,trial:$trial,mode:"simultaneous",dependencies:$dependencies,
        injection_order:$injection,recovery_order:$recovery}' \
     >"${STATE_DIR}/combination-provenance.json"
   jq '.firewall = {mode:"simultaneous",evidence_ref:"combination-provenance.json"}' \
@@ -1451,7 +1683,7 @@ combo_probe_dep() {
   while IFS= read -r ip; do
     expect_probe tcp "${phase}-${dep}" "${expected}" "${ip}" "${port}" || return 1
     started="$(date -u +%FT%TZ)"; rc=0
-    run_hook probe --scenario "${SCENARIO}" --dependency "${dep}" --address "${ip}" --port "${port}" >/dev/null 2>&1 || rc=$?
+    run_hook probe --scenario "${SCENARIO}" --trial "${TRIAL}" --dependency "${dep}" --address "${ip}" --port "${port}" --node-id "${NODE_ID}" >/dev/null 2>&1 || rc=$?
     completed="$(date -u +%FT%TZ)"
     printf '%s\t%s\treal-read\t%s-%s\t%s\t%s\t%s\t%s\n' \
       "${started}" "${completed}" "${phase}" "${dep}" "${ip}" "${port}" "${rc}" "${expected}" >>"${PROBES}"
@@ -1461,7 +1693,7 @@ combo_probe_dep() {
     while IFS= read -r ip; do
       expect_probe tcp "${phase}-${dep}" "${expected}" "${ip}" "${port}" || return 1
       started="$(date -u +%FT%TZ)"; rc=0
-      run_hook probe --scenario "${SCENARIO}" --dependency "${dep}" --address "${ip}" --port "${port}" >/dev/null 2>&1 || rc=$?
+      run_hook probe --scenario "${SCENARIO}" --trial "${TRIAL}" --dependency "${dep}" --address "${ip}" --port "${port}" --node-id "${NODE_ID}" >/dev/null 2>&1 || rc=$?
       completed="$(date -u +%FT%TZ)"
       printf '%s\t%s\treal-read\t%s-%s\t%s\t%s\t%s\t%s\n' \
         "${started}" "${completed}" "${phase}" "${dep}" "${ip}" "${port}" "${rc}" "${expected}" >>"${PROBES}"
@@ -1537,9 +1769,9 @@ combo_all_rules_absent() {
 
 combo_step_oracle_valid() {
   local file="$1" dep="$2" remaining_json="$3"
-  jq -e --arg scenario "${SCENARIO}" --arg dep "${dep}" --argjson remaining "${remaining_json}" '
-    (keys | sort) == (["schema_version","scenario","phase","restored_dependency","remaining_dependencies","started_at","completed_at","checks","raw_operations","log_refs"] | sort) and
-    .schema_version == 1 and .scenario == $scenario and .phase == "partial-recovery" and
+  jq -e --arg scenario "${SCENARIO}" --arg trial "${TRIAL}" --arg dep "${dep}" --argjson remaining "${remaining_json}" '
+    (keys | sort) == (["schema_version","scenario","trial","phase","restored_dependency","remaining_dependencies","started_at","completed_at","checks","raw_operations","log_refs"] | sort) and
+    .schema_version == 2 and .scenario == $scenario and .trial == $trial and .phase == "partial-recovery" and
     .restored_dependency == $dep and .remaining_dependencies == $remaining and
     (.checks | keys | sort) == (["restored_dependency_positive","remaining_dependencies_negative","false_success_absent","digest_preserved","generation_preserved","disk_epoch_preserved"] | sort) and
     all([.started_at,.completed_at][]; type == "string" and length > 0) and
@@ -1570,10 +1802,14 @@ setup() {
     db-s3|db-control-plane|s3-control-plane|all-3) combo_init || return 1 ;;
     *) fail "invalid scenario"; return 1 ;;
   esac
+  valid_trial "${SCENARIO}" "${TRIAL}" || { fail "invalid scenario/trial"; return 1; }
   safe_ref "${CONFIG_REF}" && safe_ref "${HOOK_REF}" || return 1
   for command in jq iptables iptables-save systemd-run systemctl getent timeout flock sha256sum openssl gzip; do
     command -v "${command}" >/dev/null || return 1
   done
+  if [[ "${SCENARIO}" == *db* || "${SCENARIO}" == *control-plane* || "${SCENARIO}" == all-3 ]]; then
+    command -v psql >/dev/null || { fail "reviewed PostgreSQL client is not preinstalled"; return 1; }
+  fi
   validate_root_file "${CONFIG_REF}" config || return 1
   validate_root_file "${HOOK_REF}" hook || return 1
   [[ -x "${HOOK_REF}" ]] || return 1
@@ -1601,18 +1837,19 @@ setup() {
   chmod 0700 "${STATE_DIR}"
   printf 'ordinal\tutc\tscenario\tstate\tresult\n' >"${TIMELINE}"
   printf 'started_at\tcompleted_at\tkind\tphase\taddress\tport\trc\texpected\n' >"${PROBES}"
-  jq -n --arg run_id "${RUN_ID}" --arg scenario "${SCENARIO}" \
+  jq -n --arg run_id "${RUN_ID}" --arg scenario "${SCENARIO}" --arg trial "${TRIAL}" \
     --arg instance "${INSTANCE_ID}" --arg node "${NODE_ID}" --arg test_sha "${TEST_SHA}" \
     --arg harness_sha "${HARNESS_SHA256}" --arg helper_sha "${actual_helper_sha}" \
     --arg config_sha "${actual_config_sha}" --arg hook_sha "${actual_hook_sha}" \
     --arg comment "${COMMENT}" --arg chain4o "${CHAIN4O}" --arg chain4i "${CHAIN4I}" \
     --arg chain6o "${CHAIN6O}" --arg chain6i "${CHAIN6I}" \
-    '{schema_version:1,run_id:$run_id,scenario:$scenario,temp_instance_id:$instance,
+    '{schema_version:2,run_id:$run_id,scenario:$scenario,trial:$trial,temp_instance_id:$instance,
       node_id:$node,test_sha:$test_sha,harness_sha256:$harness_sha,
       helper_sha256:$helper_sha,config_sha256:$config_sha,hook_sha256:$hook_sha,
       firewall:{comment:$comment,chains:[$chain4o,$chain4i,$chain6o,$chain6i]}}' >"${PROVENANCE}"
 
-  run_hook ensure-cordoned --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
+  run_hook ensure-cordoned --scenario "${SCENARIO}" --trial "${TRIAL}" \
+    --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
     --output "${STATE_DIR}/cordon-operation.json" >/dev/null 2>&1 || return 1
   cordon_evidence_valid "${STATE_DIR}/cordon-operation.json" || return 1
 
@@ -1696,7 +1933,7 @@ setup() {
 }
 
 pre_injection() {
-  run_hook state --scenario "${SCENARIO}" --phase before \
+  run_hook state --scenario "${SCENARIO}" --trial "${TRIAL}" --phase before \
     --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
     --output "${STATE_DIR}/state-before.json" >/dev/null 2>&1 || return 1
   state_valid "${STATE_DIR}/state-before.json" || return 1
@@ -1738,7 +1975,7 @@ fault_window() {
       printf '%s=%s\n' "${dep}.packets_after_probe" "${before}" >>"${COUNTERS}"
       printf '%s' "${before}" >"$(combo_dep_dir "${dep}")/packets-after-probe"
     done
-    run_hook exercise --scenario "${SCENARIO}" --phase isolated \
+    run_hook exercise --scenario "${SCENARIO}" --trial "${TRIAL}" --phase isolated \
       --dependencies "$(jq -r 'join(",")' <<<"${dependencies_json}")" \
       --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
       --output "${STATE_DIR}/oracle-isolated.json" >/dev/null 2>&1 || return 1
@@ -1753,11 +1990,16 @@ fault_window() {
     done
     printf 'workload_delta=%s\nipv6_routable=%s\n' "${total_delta}" "${IPV6_ROUTABLE}" >>"${COUNTERS}"
     record workload PASS
-    run_hook state --scenario "${SCENARIO}" --phase during \
+    run_hook state --scenario "${SCENARIO}" --trial "${TRIAL}" --phase during \
       --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
       --output "${STATE_DIR}/state-during.json" >/dev/null 2>&1 || return 1
     state_valid "${STATE_DIR}/state-during.json" || return 1
-    take_snapshot isolated || return 1
+    if [[ "${SCENARIO}" == *control-plane* || "${SCENARIO}" == all-3 ]]; then
+      cp "${STATE_DIR}/ownership-before.json" "${STATE_DIR}/ownership-isolated.json" || return 1
+      chmod 0600 "${STATE_DIR}/ownership-isolated.json"
+    else
+      take_snapshot isolated || return 1
+    fi
     state_matches_snapshot "${STATE_DIR}/state-during.json" "${STATE_DIR}/ownership-isolated.json" || return 1
     record ownership-isolated PASS
     record packet-counter PASS
@@ -1787,7 +2029,7 @@ fault_window() {
   record negative-real-read PASS
   packets_after_probe="$(packet_count)" || return 1
   (( packets_after_probe > 0 )) || return 1
-  run_hook exercise --scenario "${SCENARIO}" --phase isolated \
+  run_hook exercise --scenario "${SCENARIO}" --trial "${TRIAL}" --phase isolated \
     --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
     --output "${STATE_DIR}/oracle-isolated.json" >/dev/null 2>&1 || return 1
   oracle_valid "${STATE_DIR}/oracle-isolated.json" isolated || return 1
@@ -1795,11 +2037,16 @@ fault_window() {
   (( packets_after_workload > packets_after_probe )) ||
     { fail "workload produced no firewall counter delta"; return 1; }
   record workload PASS
-  run_hook state --scenario "${SCENARIO}" --phase during \
+  run_hook state --scenario "${SCENARIO}" --trial "${TRIAL}" --phase during \
     --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
     --output "${STATE_DIR}/state-during.json" >/dev/null 2>&1 || return 1
   state_valid "${STATE_DIR}/state-during.json" || return 1
-  take_snapshot isolated || return 1
+  if [[ "${SCENARIO}" == control-plane ]]; then
+    cp "${STATE_DIR}/ownership-before.json" "${STATE_DIR}/ownership-isolated.json" || return 1
+    chmod 0600 "${STATE_DIR}/ownership-isolated.json"
+  else
+    take_snapshot isolated || return 1
+  fi
   state_matches_snapshot "${STATE_DIR}/state-during.json" "${STATE_DIR}/ownership-isolated.json" || return 1
   record ownership-isolated PASS
   printf 'packets_after_probe=%s\npackets_after_workload=%s\nworkload_delta=%s\nipv6_routable=%s\n' \
@@ -1828,7 +2075,7 @@ combo_ordered_recovery() {
       combo_probe_dep "${other}" partial-recovery negative || return 1
     done < <(jq -r '.[]' <<<"${remaining_json}")
     index=$((index + 1)); step_file="${STATE_DIR}/recovery-step-${index}.json"
-    run_hook exercise --scenario "${SCENARIO}" --phase partial-recovery \
+    run_hook exercise --scenario "${SCENARIO}" --trial "${TRIAL}" --phase partial-recovery \
       --restored-dependency "${dep}" --remaining-dependencies "$(jq -r 'join(",")' <<<"${remaining_json}")" \
       --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
       --output "${step_file}" >/dev/null 2>&1 || {
@@ -1860,19 +2107,19 @@ post_recovery() {
     done
     record recovery-tcp PASS
     record recovery-real-read PASS
-    run_hook exercise --scenario "${SCENARIO}" --phase recovered \
+    run_hook exercise --scenario "${SCENARIO}" --trial "${TRIAL}" --phase recovered \
       --recovery-order "$(IFS=,; printf '%s' "${COMBO_RECOVERY[*]}")" \
       --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
       --output "${STATE_DIR}/oracle-recovered.json" >/dev/null 2>&1 || return 1
     oracle_valid "${STATE_DIR}/oracle-recovered.json" recovered || return 1
-    run_hook state --scenario "${SCENARIO}" --phase after \
+    run_hook state --scenario "${SCENARIO}" --trial "${TRIAL}" --phase after \
       --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
       --output "${STATE_DIR}/state-after.json" >/dev/null 2>&1 || return 1
     state_valid "${STATE_DIR}/state-after.json" || return 1
     take_snapshot after || return 1
     state_matches_snapshot "${STATE_DIR}/state-after.json" "${STATE_DIR}/ownership-after.json" || return 1
     record ownership-after PASS
-    run_hook assert --scenario "${SCENARIO}" \
+    run_hook assert --scenario "${SCENARIO}" --trial "${TRIAL}" --node-id "${NODE_ID}" \
       --before "${STATE_DIR}/state-before.json" --during "${STATE_DIR}/state-during.json" \
       --after "${STATE_DIR}/state-after.json" >/dev/null 2>&1 || return 1
     before_identity="$(jq -Sc '[.cats[] | {cat_name,digest}] | sort_by(.cat_name)' "${STATE_DIR}/state-before.json")"
@@ -1895,18 +2142,18 @@ post_recovery() {
   done
   record recovery-tcp PASS
   record recovery-real-read PASS
-  run_hook exercise --scenario "${SCENARIO}" --phase recovered \
+  run_hook exercise --scenario "${SCENARIO}" --trial "${TRIAL}" --phase recovered \
     --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
     --output "${STATE_DIR}/oracle-recovered.json" >/dev/null 2>&1 || return 1
   oracle_valid "${STATE_DIR}/oracle-recovered.json" recovered || return 1
-  run_hook state --scenario "${SCENARIO}" --phase after \
+  run_hook state --scenario "${SCENARIO}" --trial "${TRIAL}" --phase after \
     --workspace-id "${WORKSPACE_ID}" --node-id "${NODE_ID}" \
     --output "${STATE_DIR}/state-after.json" >/dev/null 2>&1 || return 1
   state_valid "${STATE_DIR}/state-after.json" || return 1
   take_snapshot after || return 1
   state_matches_snapshot "${STATE_DIR}/state-after.json" "${STATE_DIR}/ownership-after.json" || return 1
   record ownership-after PASS
-  run_hook assert --scenario "${SCENARIO}" \
+  run_hook assert --scenario "${SCENARIO}" --trial "${TRIAL}" --node-id "${NODE_ID}" \
     --before "${STATE_DIR}/state-before.json" \
     --during "${STATE_DIR}/state-during.json" \
     --after "${STATE_DIR}/state-after.json" >/dev/null 2>&1 || return 1

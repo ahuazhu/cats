@@ -1,0 +1,1262 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Issue-124 root-only dependency-fault workload and HA adapter.
+#
+# This executable never creates or destroys a Cat, disk, Node, object, or
+# database row.  Its mutations are restricted to lifecycle actions on the
+# exact q124 Cats already assigned to the exact q124 temporary Node, plus
+# cordon/uncordon of that one Node for the HA adapter contract.  Secrets are
+# read only from fixed root-owned files and are supplied to clients through
+# stdin or mode-0600 temporary files; no secret is written to stdout/stderr.
+
+API_ORIGIN="https://cats.run"
+API_HOST="cats.run"
+WORKSPACE_ID="ws_788c5bfc3931"
+WORKSPACE_LOCATOR="default/qual-124-20260805"
+TOKEN_FILE="/etc/cats/qualification-124/admin-token"
+WORKER_ENV="/etc/cats/worker.env"
+POSTGRES_URL_FILE="/run/cats/postgres-url"
+POSTGRES_CA_FILE="/etc/cats/rds-ca.pem"
+FAULT_CONFIG="/etc/cats/qualification-124/fault-targets.json"
+NODE_AGENT_ORIGIN="http://127.0.0.1:7301"
+NODE_STATE_DIR="/var/lib/cats/node"
+MARKER_DIR="/var/lib/q124-fault"
+
+die() { printf 'error: %s\n' "$*" >&2; exit 2; }
+fail() { printf 'error: %s\n' "$*" >&2; return 1; }
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
+}
+
+validate_root_file() {
+  local path="$1" mode_re="$2" label="$3" uid mode
+  [[ -f "${path}" && ! -L "${path}" ]] || fail "missing regular ${label} file"
+  read -r uid mode < <(stat -c '%u %a' "${path}")
+  [[ "${uid}" == 0 && "${mode}" =~ ${mode_re} ]] ||
+    fail "unsafe ${label} ownership/mode"
+}
+
+valid_node() { [[ "$1" =~ ^q124-[a-z0-9][a-z0-9-]{7,54}$ ]]; }
+valid_cat_id() { [[ "$1" =~ ^cat_[A-Za-z0-9_-]+$ ]]; }
+valid_cat_name() { [[ "$1" =~ ^q124-[a-z0-9][a-z0-9-]{0,57}$ ]]; }
+valid_scenario() {
+  case "$1" in
+    db|s3|control-plane|db-s3|db-control-plane|s3-control-plane|all-3) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+contains_dependency() {
+  local scenario="$1" dependency="$2"
+  case ":${scenario}:" in
+    *":${dependency}:"*) return 0 ;;
+  esac
+  case "${scenario}:${dependency}" in
+    db-s3:db|db-s3:s3|db-control-plane:db|db-control-plane:control-plane|\
+    s3-control-plane:s3|s3-control-plane:control-plane|all-3:db|all-3:s3|all-3:control-plane)
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+blocked_combo() {
+  case "$1" in
+    db-control-plane|all-3)
+      fail "BLOCKED: simultaneous DB+control-plane isolation has no independent authoritative observer"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+safe_output_path() {
+  [[ "$1" =~ ^/[-A-Za-z0-9._/]+$ && "$1" != *..* ]]
+}
+
+load_admin_token() {
+  validate_root_file "${TOKEN_FILE}" '^600$' 'admin token' || return 1
+  IFS= read -r ADMIN_TOKEN <"${TOKEN_FILE}"
+  [[ "${ADMIN_TOKEN}" =~ ^[A-Za-z0-9._~-]{20,512}$ ]] || fail "invalid admin token format"
+}
+
+worker_env_get() {
+  local key="$1" line
+  validate_root_file "${WORKER_ENV}" '^600$' 'worker environment' || return 1
+  line="$(awk -F= -v key="${key}" '$1 == key {if (++n == 1) print substr($0,index($0,"=")+1)} END {if (n != 1) exit 1}' "${WORKER_ENV}")" ||
+    return 1
+  [[ -n "${line}" && "${line}" != *$'\n'* && "${line}" != *$'\r'* ]] || return 1
+  printf '%s' "${line}"
+}
+
+RUN_ID="${Q124_RUN_ID:-}"
+RUN_STATE=""
+OPS_FILE=""
+
+init_run_state() {
+  [[ "${RUN_ID}" =~ ^[A-Za-z0-9._-]{8,160}$ ]] || fail "missing or unsafe Q124_RUN_ID"
+  RUN_STATE="/run/cats-q124-workload-${RUN_ID}"
+  OPS_FILE="${RUN_STATE}/operations.json"
+  if [[ ! -d "${RUN_STATE}" ]]; then
+    mkdir "${RUN_STATE}" || return 1
+    chmod 0700 "${RUN_STATE}"
+  fi
+  [[ -f "${OPS_FILE}" ]] || printf '[]\n' >"${OPS_FILE}"
+  chmod 0600 "${OPS_FILE}"
+}
+
+new_local_operation_id() {
+  local kind="$1" seed
+  seed="$(printf '%s:%s:%s:%s' "${RUN_ID}" "${kind}" "$(date -u +%s%N)" "$$" |
+    sha256sum | cut -c1-24)"
+  printf 'op_q124_%s' "${seed}"
+}
+
+record_operation() {
+  local id="$1" kind="$2" phase="$3" started="$4" completed="$5" ref="$6" next
+  valid_operation_id "${id}" || return 1
+  next="${OPS_FILE}.next.$$"
+  jq --arg id "${id}" --arg kind "${kind}" --arg phase "${phase}" \
+    --arg started "${started}" --arg completed "${completed}" --arg ref "${ref}" \
+    '. + [{operation_id:$id,kind:$kind,phase:$phase,started_at:$started,
+           completed_at:$completed,log_ref:$ref}]' "${OPS_FILE}" >"${next}" || return 1
+  mv "${next}" "${OPS_FILE}"
+}
+
+valid_operation_id() { [[ "$1" =~ ^op_[A-Za-z0-9_-]+$ ]]; }
+
+# Writes an HTTP response body only to the caller-provided mode-0600 file and
+# stores the status in API_STATUS.  Curl receives the bearer header over its
+# config stdin, never argv.  Error bodies are never copied to stderr.
+api_request() {
+  local method="$1" path="$2" output="$3" body_file="${4:-}" status
+  [[ "${method}" =~ ^(GET|POST)$ && "${path}" =~ ^/[-A-Za-z0-9._/?=\&]+$ ]] || return 1
+  safe_output_path "${output}" || return 1
+  : >"${output}"; chmod 0600 "${output}"
+  if [[ -n "${body_file}" ]]; then
+    safe_output_path "${body_file}" && [[ -f "${body_file}" ]] || return 1
+    status="$(printf 'header = "Authorization: Bearer %s"\n' "${ADMIN_TOKEN}" |
+      curl --config - --silent --show-error --max-time 45 --request "${method}" \
+        --header 'accept: application/json' --header 'content-type: application/json' \
+        --data-binary "@${body_file}" --output "${output}" --write-out '%{http_code}' \
+        "${API_ORIGIN}${path}" 2>/dev/null)" || status=000
+  else
+    status="$(printf 'header = "Authorization: Bearer %s"\n' "${ADMIN_TOKEN}" |
+      curl --config - --silent --show-error --max-time 45 --request "${method}" \
+        --header 'accept: application/json' --header 'content-length: 0' \
+        --output "${output}" --write-out '%{http_code}' "${API_ORIGIN}${path}" 2>/dev/null)" || status=000
+  fi
+  [[ "${status}" =~ ^[0-9]{3}$ ]] || status=000
+  API_STATUS="${status}"
+}
+
+api_expect_json() {
+  local method="$1" path="$2" output="$3" expected_re="$4" body_file="${5:-}"
+  api_request "${method}" "${path}" "${output}" "${body_file}" || return 1
+  [[ "${API_STATUS}" =~ ${expected_re} ]] || return 1
+  jq -e . "${output}" >/dev/null 2>&1
+}
+
+node_cats_api() {
+  local node="$1" output="$2"
+  api_expect_json GET "/v1/admin/nodes/${node}/cats" "${output}" '^200$' || return 1
+  jq -e --arg node "${node}" --arg ws "${WORKSPACE_ID}" '
+    (keys | sort) == ["items"] and (.items | type == "array" and length > 0) and
+    all(.items[];
+      (.cat.id | test("^cat_[A-Za-z0-9_-]+$")) and
+      (.cat.name | test("^q124-[a-z0-9][a-z0-9-]{0,57}$")) and
+      .cat.workspace_id == $ws and .cat.node_id == $node)
+  ' "${output}" >/dev/null
+}
+
+node_summary_api() {
+  local node="$1" output="$2"
+  api_expect_json GET "/v1/admin/nodes/${node}" "${output}" '^200$' || return 1
+  jq -e --arg node "${node}" '
+    .node.id == $node and .node.capacity.cpus >= 1 and .node.capacity.memory_mib >= 1024 and
+    (.assigned_cats | type == "number") and (.orphan_cats | type == "number")
+  ' "${output}" >/dev/null
+}
+
+admin_adapter() {
+  local action="$1" node="$2" cats response
+  valid_node "${node}" || die "invalid q124 Node ID"
+  [[ "${CATS_HA_HOOK_WORKSPACE_ID:-}" == "${WORKSPACE_ID}" ]] || die "invalid workspace scope"
+  local cat_id="${CATS_HA_HOOK_CAT_ID:-}" cat_name="${CATS_HA_HOOK_CAT_NAME:-}"
+  if [[ -n "${cat_id}" || -n "${cat_name}" ]]; then
+    valid_cat_id "${cat_id}" && valid_cat_name "${cat_name}" || die "invalid q124 Cat scope"
+  fi
+  load_admin_token || exit 2
+  cats="$(mktemp /run/q124-admin-cats.XXXXXX)"; response="$(mktemp /run/q124-admin-node.XXXXXX)"
+  trap 'rm -f "${cats:-}" "${response:-}"' EXIT HUP INT TERM
+  node_cats_api "${node}" "${cats}" || die "cannot prove exact Node Cat scope"
+  jq -e --arg cat_id "${cat_id}" --arg cat_name "${cat_name}" '
+    (.items | length == 1) and
+    all(.items[]; (($cat_id == "" and $cat_name == "") or
+      (.cat.id == $cat_id and .cat.name == $cat_name)))
+  ' "${cats}" >/dev/null || die "Node assignment escaped requested q124 Cat scope"
+  if [[ "${action}" == cats ]]; then jq -c '.items' "${cats}"; return 0; fi
+  case "${action}" in
+    get) node_summary_api "${node}" "${response}" || die "invalid Node response" ;;
+    cordon|uncordon)
+      api_expect_json POST "/v1/admin/nodes/${node}/actions/${action}" "${response}" '^200$' ||
+        die "Node ${action} failed"
+      ;;
+    *) die "unsupported admin action" ;;
+  esac
+  jq -e --arg node "${node}" '.node.id == $node' "${response}" >/dev/null || die "Node response mismatch"
+  jq -c . "${response}"
+}
+
+make_pg_service() {
+  local service="$1" hostaddr="${2:-}"
+  validate_root_file "${POSTGRES_URL_FILE}" '^600$' 'PostgreSQL URL' || return 1
+  validate_root_file "${POSTGRES_CA_FILE}" '^(600|640|644)$' 'PostgreSQL CA' || return 1
+  python3 - "${POSTGRES_URL_FILE}" "${service}" "${POSTGRES_CA_FILE}" "${hostaddr}" <<'PY'
+import pathlib, sys, urllib.parse
+source, target, ca, hostaddr = sys.argv[1:]
+u = urllib.parse.urlsplit(pathlib.Path(source).read_text().strip())
+if u.scheme not in ("postgres", "postgresql") or not u.hostname or not u.username or u.password is None:
+    raise SystemExit(2)
+values = {
+    "host": u.hostname,
+    "port": str(u.port or 5432),
+    "user": urllib.parse.unquote(u.username),
+    "password": urllib.parse.unquote(u.password),
+    "dbname": urllib.parse.unquote((u.path or "/postgres").lstrip("/")),
+    "sslmode": "verify-full",
+    "sslrootcert": ca,
+    "connect_timeout": "5",
+    "options": "-c default_transaction_read_only=on -c statement_timeout=5000",
+}
+if hostaddr:
+    values["hostaddr"] = hostaddr
+for value in values.values():
+    if not value or any(c in value for c in "\n\r\\"):
+        raise SystemExit(2)
+path = pathlib.Path(target)
+path.write_text("[q124]\n" + "".join(f"{k}={v}\n" for k, v in values.items()))
+path.chmod(0o600)
+PY
+}
+
+pg_query() {
+  local sql="$1" output="$2" hostaddr="${3:-}" service rc=0
+  require_command psql || return 1
+  service="${RUN_STATE}/pg-service-$$-$(date +%s%N).conf"
+  make_pg_service "${service}" "${hostaddr}" >/dev/null 2>&1 || return 1
+  : >"${output}"; chmod 0600 "${output}"
+  PGSERVICE=q124 PGSERVICEFILE="${service}" psql --no-psqlrc --quiet --no-align --tuples-only \
+    --set ON_ERROR_STOP=1 --command "${sql}" \
+    >"${output}" 2>/dev/null || rc=$?
+  rm -f "${service}"
+  return "${rc}"
+}
+
+pg_scalar() {
+  local sql="$1" output value
+  output="${RUN_STATE}/pg-scalar-$$.txt"
+  pg_query "${sql}" "${output}" || return 1
+  value="$(sed -n '/./{p;q;}' "${output}")"
+  rm -f "${output}"
+  printf '%s' "${value}"
+}
+
+pg_node_and_cats() {
+  local node="$1" node_out="$2" cats_out="$3"
+  pg_query "SELECT row_to_json(q) FROM (SELECT id,state,cpus,memory_mib,last_heartbeat_ms,COALESCE(reported_cats_json,'[]') AS reported_cats_json FROM nodes WHERE id='${node}') q" "${node_out}" || return 1
+  sed -n '/./{p;q;}' "${node_out}" >"${node_out}.json"; mv "${node_out}.json" "${node_out}"
+  jq -e --arg node "${node}" '.id == $node and (.reported_cats_json | fromjson | type == "array")' "${node_out}" >/dev/null || return 1
+  pg_query "SELECT COALESCE(json_agg(json_build_object('cat_id',c.id,'name',c.name,'workspace_id',c.workspace_id,'node_id',c.node_id,'durability',d.durability) ORDER BY c.id),'[]'::json) FROM cats c JOIN disks d ON d.id=c.root_disk_id WHERE c.workspace_id='${WORKSPACE_ID}' AND c.node_id='${node}'" "${cats_out}" || return 1
+  sed -n '/./{p;q;}' "${cats_out}" >"${cats_out}.json"; mv "${cats_out}.json" "${cats_out}"
+  jq -e --arg node "${node}" --arg ws "${WORKSPACE_ID}" '
+    type == "array" and length > 0 and all(.[];
+      (.cat_id | test("^cat_[A-Za-z0-9_-]+$")) and
+      (.name | test("^q124-[a-z0-9][a-z0-9-]{0,57}$")) and
+      .workspace_id == $ws and .node_id == $node and
+      (.durability == "strict" or .durability == "relaxed"))
+  ' "${cats_out}" >/dev/null
+}
+
+fault_config_valid() {
+  validate_root_file "${FAULT_CONFIG}" '^600$' 'fault target config' || return 1
+  jq -e '
+    (keys | sort) == (["schema_version","db_host","db_port","s3_host","s3_port",
+      "control_plane_host","control_plane_port","node_listen_ip","node_listen_port",
+      "fault_duration_seconds","control_plane_lease_timeout_seconds"] | sort) and
+    .schema_version == 1 and .db_port == 5432 and .s3_port == 443 and
+    .control_plane_port == 443 and .node_listen_port == 7301
+  ' "${FAULT_CONFIG}" >/dev/null
+}
+
+snapshot_from_api() {
+  local scenario="$1" phase="$2" node="$3" instance="$4" output="$5" summary cats endpoints now
+  summary="${RUN_STATE}/snapshot-summary-${phase}.json"; cats="${RUN_STATE}/snapshot-cats-${phase}.json"
+  node_summary_api "${node}" "${summary}" || return 1
+  node_cats_api "${node}" "${cats}" || return 1
+  jq -e '.node.state == "cordoned" and .orphan_cats == 0' "${summary}" >/dev/null || return 1
+  endpoints="$(jq -c '{db_host,s3_host,control_plane_host,node_listen_ip}' "${FAULT_CONFIG}")"
+  now="$(date -u +%FT%TZ)"
+  jq -n --arg now "${now}" --arg instance "${instance}" --arg node "${node}" \
+    --arg ws "${WORKSPACE_ID}" --arg workspace "${WORKSPACE_LOCATOR}" \
+    --arg test_sha "${Q124_TEST_SHA:-}" --argjson endpoints "${endpoints}" \
+    --slurpfile summary "${summary}" --slurpfile cats "${cats}" '
+      {schema_version:1,captured_at:$now,temp_instance_id:$instance,node_id:$node,
+       node_state:(($summary[0].node.state | ascii_upcase[0:1]) + $summary[0].node.state[1:]),
+       workspace_id:$ws,workspace:$workspace,
+       tags:{Issue:"124",CatsNodeId:$node,Purpose:"qualification-124"},
+       orphans:$summary[0].orphan_cats,
+       assigned_cats:[$cats[0].items[] | {cat_id:.cat.id,name:.cat.name,workspace_id:.cat.workspace_id,
+         node_id:.cat.node_id,durability:((.actual.disk_durability // []) |
+           map(select(.disk_id == $cats[0].items[0].cat.root_disk_id))[0].mode // "strict")}],
+       test_sha:$test_sha,dependency_endpoints:$endpoints}' >"${output}"
+  # Durability in the public Cat row is intentionally absent.  Replace it
+  # from each Cat's root-disk telemetry and fail if the heartbeat has not
+  # positively identified that root disk.
+  jq -n --slurpfile base "${output}" --slurpfile rows "${cats}" '
+    $base[0] as $b |
+    $b | .assigned_cats = [$rows[0].items[] as $row |
+      ($row.actual.disk_durability // [] | map(select(.disk_id == $row.cat.root_disk_id))) as $root |
+      if ($root|length) != 1 or ($root[0].mode != "strict" and $root[0].mode != "relaxed")
+      then error("missing exact root durability telemetry")
+      else {cat_id:$row.cat.id,name:$row.cat.name,workspace_id:$row.cat.workspace_id,
+            node_id:$row.cat.node_id,durability:$root[0].mode} end]
+  ' >"${output}.next" && mv "${output}.next" "${output}"
+}
+
+snapshot_from_db() {
+  local phase="$1" node="$2" instance="$3" output="$4" node_json cats_json endpoints now orphans
+  node_json="${RUN_STATE}/snapshot-db-node-${phase}.json"; cats_json="${RUN_STATE}/snapshot-db-cats-${phase}.json"
+  pg_node_and_cats "${node}" "${node_json}" "${cats_json}" || return 1
+  [[ "$(jq -r .state "${node_json}")" == cordoned || "$(jq -r .state "${node_json}")" == lost ]] || return 1
+  orphans="$(jq -n --slurpfile node "${node_json}" --slurpfile cats "${cats_json}" '
+    ($node[0].reported_cats_json | fromjson) as $reported |
+    [$reported[] | select(.cat_id as $id | all($cats[0][]; .cat_id != $id))] | length')" || return 1
+  [[ "${orphans}" == 0 ]] || return 1
+  endpoints="$(jq -c '{db_host,s3_host,control_plane_host,node_listen_ip}' "${FAULT_CONFIG}")"
+  now="$(date -u +%FT%TZ)"
+  jq -n --arg now "${now}" --arg instance "${instance}" --arg node "${node}" \
+    --arg ws "${WORKSPACE_ID}" --arg workspace "${WORKSPACE_LOCATOR}" \
+    --arg test_sha "${Q124_TEST_SHA:-}" --argjson endpoints "${endpoints}" \
+    --argjson orphans "${orphans}" --slurpfile n "${node_json}" --slurpfile cats "${cats_json}" '
+      {schema_version:1,captured_at:$now,temp_instance_id:$instance,node_id:$node,
+       node_state:(($n[0].state | ascii_upcase[0:1]) + $n[0].state[1:]),
+       workspace_id:$ws,workspace:$workspace,
+       tags:{Issue:"124",CatsNodeId:$node,Purpose:"qualification-124"},orphans:$orphans,
+       assigned_cats:$cats[0],test_sha:$test_sha,dependency_endpoints:$endpoints}' >"${output}"
+}
+
+snapshot_command() {
+  local scenario="$1" phase="$2" node="$3" instance="$4" output="$5"
+  blocked_combo "${scenario}" && return 1 || true
+  if contains_dependency "${scenario}" control-plane && [[ "${phase}" == isolated ]]; then
+    snapshot_from_db "${phase}" "${node}" "${instance}" "${output}"
+  else
+    snapshot_from_api "${scenario}" "${phase}" "${node}" "${instance}" "${output}"
+  fi
+}
+
+ensure_cordoned() {
+  local node="$1" output="$2" started summary cats id completed
+  started="$(date -u +%FT%TZ)"; summary="${RUN_STATE}/ensure-node.json"; cats="${RUN_STATE}/ensure-cats.json"
+  node_summary_api "${node}" "${summary}" || return 1
+  node_cats_api "${node}" "${cats}" || return 1
+  [[ "$(jq -r .node.state "${summary}")" == cordoned ]] || {
+    [[ "$(jq -r .node.state "${summary}")" == ready ]] || return 1
+    api_expect_json POST "/v1/admin/nodes/${node}/actions/cordon" "${summary}.cordoned" '^200$' || return 1
+    mv "${summary}.cordoned" "${summary}"
+  }
+  jq -e '.node.state == "cordoned" and .orphan_cats == 0' "${summary}" >/dev/null || return 1
+  id="$(new_local_operation_id ensure_cordoned)"; completed="$(date -u +%FT%TZ)"
+  jq -n --arg id "${id}" --arg node "${node}" --arg started "${started}" --arg completed "${completed}" '
+    {schema_version:1,operation_id:$id,kind:"ensure_node_cordoned",phase:"succeeded",
+     node_id:$node,started_at:$started,completed_at:$completed,
+     log_ref:("api://v1/admin/nodes/"+$node)}' >"${output}"
+  record_operation "${id}" ensure_node_cordoned succeeded "${started}" "${completed}" "api://v1/admin/nodes/${node}"
+}
+
+load_service_token() {
+  SERVICE_TOKEN="$(worker_env_get CATS_AUTH_TOKEN)" || return 1
+  [[ "${SERVICE_TOKEN}" =~ ^[A-Za-z0-9._~-]{20,512}$ ]] || fail "invalid service token format"
+}
+
+node_agent_request() {
+  local path="$1" body="$2" output="$3" status
+  [[ "${path}" =~ ^/v1/cats/cat_[A-Za-z0-9_-]+/exec$ ]] || return 1
+  safe_output_path "${body}" && safe_output_path "${output}" || return 1
+  status="$(printf 'header = "Authorization: Bearer %s"\n' "${SERVICE_TOKEN}" |
+    curl --config - --silent --show-error --max-time 90 --request POST \
+      --header 'accept: application/json' --header 'content-type: application/json' \
+      --data-binary "@${body}" --output "${output}" --write-out '%{http_code}' \
+      "${NODE_AGENT_ORIGIN}${path}" 2>/dev/null)" || status=000
+  NODE_STATUS="${status}"
+  [[ "${status}" == 200 ]] && jq -e . "${output}" >/dev/null 2>&1
+}
+
+local_exec() {
+  local cat_id="$1" command_json="$2" output="$3" body
+  valid_cat_id "${cat_id}" || return 1
+  jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' <<<"${command_json}" >/dev/null || return 1
+  body="${RUN_STATE}/exec-body-$$-$(date +%s%N).json"
+  jq -n --argjson command "${command_json}" '{command:$command,timeout_ms:75000}' >"${body}"
+  node_agent_request "/v1/cats/${cat_id}/exec" "${body}" "${output}"
+  local rc=$?
+  rm -f "${body}"
+  return "${rc}"
+}
+
+marker_digest() {
+  local cat_id="$1" cat_name="$2" output="$3" response command_json digest
+  valid_cat_id "${cat_id}" && valid_cat_name "${cat_name}" || return 1
+  response="${RUN_STATE}/marker-${cat_id}-$$.json"
+  command_json="$(jq -cn --arg name "${cat_name}" --arg dir "${MARKER_DIR}" '[
+    "/bin/sh","-lc",
+    "set -eu; test \"$(cat \"$1/identity\")\" = \"$2\"; test -s \"$1/marker.bin\"; test -s \"$1/marker.sha256\"; cd \"$1\"; sha256sum -c marker.sha256 >/dev/null; sha256sum marker.bin | awk \"{print \\\$1}\"",
+    "q124-marker",$dir,$name]')" || return 1
+  local_exec "${cat_id}" "${command_json}" "${response}" || return 1
+  jq -e '.exit_code == 0 and .stderr == "" and (.stdout | test("^[0-9a-f]{64}\\n$"))' "${response}" >/dev/null || return 1
+  digest="$(jq -r '.stdout | rtrimstr("\n")' "${response}")"
+  printf 'sha256:%s' "${digest}" >"${output}"
+}
+
+marker_write_probe() {
+  local cat_id="$1" durability="$2" expect_success="$3" output="$4" response command_json started completed id phase rc=0
+  valid_cat_id "${cat_id}" || return 1
+  [[ "${durability}" == strict || "${durability}" == relaxed ]] || return 1
+  response="${RUN_STATE}/write-${cat_id}-$$.json"
+  command_json="$(jq -cn --arg run "${RUN_ID}" --arg dir "${MARKER_DIR}" '[
+    "/bin/sh","-lc",
+    "set -eu; test -d \"$1\"; printf \"%s %s\\n\" \"$2\" \"$(date -u +%s%N)\" >>\"$1/fault-window.log\"; sync \"$1/fault-window.log\"",
+    "q124-fault-write",$dir,$run]')" || return 1
+  started="$(date -u +%FT%TZ)"
+  local_exec "${cat_id}" "${command_json}" "${response}" || rc=$?
+  completed="$(date -u +%FT%TZ)"; id="$(new_local_operation_id "${durability}_fsync")"
+  if [[ "${expect_success}" == true ]]; then
+    (( rc == 0 )) && jq -e '.exit_code == 0' "${response}" >/dev/null || return 1
+    phase=succeeded
+  else
+    if (( rc == 0 )) && jq -e '.exit_code == 0' "${response}" >/dev/null; then return 1; fi
+    phase=failed
+  fi
+  record_operation "${id}" "guest_${durability}_fsync" "${phase}" "${started}" "${completed}" "node://127.0.0.1/cats/${cat_id}/exec"
+  jq -n --arg id "${id}" --arg phase "${phase}" '{operation_id:$id,phase:$phase}' >"${output}"
+}
+
+ledger_file() {
+  local cat_id="$1" path
+  valid_cat_id "${cat_id}" || return 1
+  path="${NODE_STATE_DIR}/runtime-ledger/${cat_id}.json"
+  [[ -f "${path}" && ! -L "${path}" ]] || return 1
+  [[ "$(stat -c %u "${path}")" == 0 ]] || return 1
+  printf '%s' "${path}"
+}
+
+blockd_status() {
+  local cat_id="$1" disk_id="$2" output="$3" ledger socket
+  ledger="$(ledger_file "${cat_id}")" || return 1
+  socket="$(jq -er --arg disk "${disk_id}" '
+    [.blockds[] | select(.grant.disk_id == $disk)] |
+    if length == 1 then .[0].control_socket else error("not one root blockd") end
+  ' "${ledger}")" || return 1
+  [[ "${socket}" =~ ^/[-A-Za-z0-9._/]+$ && "${socket}" == /run/* ]] || return 1
+  python3 - "${socket}" "${output}" <<'PY'
+import json, pathlib, socket, sys
+sock_path, output = sys.argv[1:]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(2.0)
+s.connect(sock_path)
+s.sendall(b"status\n")
+buf = b""
+while b"\n" not in buf and len(buf) <= 65536:
+    chunk = s.recv(65536)
+    if not chunk: break
+    buf += chunk
+s.close()
+if not buf.startswith(b"OK ") or b"\n" not in buf:
+    raise SystemExit(2)
+value = json.loads(buf[3:buf.index(b"\n")])
+required = {"volume_id","attachment_id","mode","local_durable_generation",
+            "remote_durable_generation","unpublished_generations","unpublished_bytes",
+            "fenced","last_publish_error"}
+if not required.issubset(value): raise SystemExit(2)
+path = pathlib.Path(output)
+path.write_text(json.dumps(value, separators=(",", ":")))
+path.chmod(0o600)
+PY
+}
+
+blockd_drain_expect_failure() {
+  local cat_id="$1" disk_id="$2" ledger socket
+  ledger="$(ledger_file "${cat_id}")" || return 1
+  socket="$(jq -er --arg disk "${disk_id}" '
+    [.blockds[] | select(.grant.disk_id == $disk)] |
+    if length == 1 then .[0].control_socket else error("not one root blockd") end
+  ' "${ledger}")" || return 1
+  [[ "${socket}" =~ ^/[-A-Za-z0-9._/]+$ && "${socket}" == /run/* ]] || return 1
+  python3 - "${socket}" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(40.0)
+s.connect(sys.argv[1]); s.sendall(b"drain\n")
+buf = b""
+while b"\n" not in buf and len(buf) <= 65536:
+    chunk = s.recv(65536)
+    if not chunk: break
+    buf += chunk
+s.close()
+if not buf.startswith(b"ERR ") or b"\n" not in buf: raise SystemExit(2)
+PY
+}
+
+cat_epoch() {
+  local cat_id="$1" disk_id="$2" ledger
+  ledger="$(ledger_file "${cat_id}")" || return 1
+  jq -er --arg disk "${disk_id}" '
+    [.volumes[] | select(.disk_id == $disk)] |
+    if length == 1 and (.[0].epoch | type == "number") then .[0].epoch else error("epoch unavailable") end
+  ' "${ledger}"
+}
+
+admitted_rows() {
+  local node="$1" output="$2" rows
+  rows="${RUN_STATE}/admitted-api.json"
+  node_cats_api "${node}" "${rows}" || return 1
+  jq '[.items[] as $row | {cat_id:$row.cat.id,cat_name:$row.cat.name,
+      durability:(($row.actual.disk_durability // []) |
+        map(select(.disk_id == $row.cat.root_disk_id)) | .[0].mode),
+      desired_state:$row.cat.desired_state,observed_state:$row.cat.observed_state,
+      generation:$row.cat.generation,node_id:$row.cat.node_id,root_disk_id:$row.cat.root_disk_id}]' \
+    "${rows}" >"${output}" || return 1
+  jq -e --arg node "${node}" '
+    type == "array" and length > 0 and length <= 1 and all(.[];
+      (.cat_id | test("^cat_[A-Za-z0-9_-]+$")) and
+      (.cat_name | test("^q124-[a-z0-9][a-z0-9-]{0,57}$")) and
+      (.durability == "strict" or .durability == "relaxed") and .node_id == $node)
+  ' "${output}" >/dev/null
+}
+
+admitted_rows_db() {
+  local node="$1" output="$2" raw
+  raw="${RUN_STATE}/admitted-db.raw"
+  pg_query "SELECT COALESCE(json_agg(json_build_object('cat_id',c.id,'cat_name',c.name,'durability',d.durability,'desired_state',c.desired_state,'observed_state',c.observed_state,'generation',c.generation,'node_id',c.node_id,'root_disk_id',c.root_disk_id) ORDER BY c.id),'[]'::json) FROM cats c JOIN disks d ON d.id=c.root_disk_id WHERE c.workspace_id='${WORKSPACE_ID}' AND c.node_id='${node}'" "${raw}" || return 1
+  sed -n '/./{p;q;}' "${raw}" >"${output}"
+  jq -e --arg node "${node}" '
+    type == "array" and length > 0 and length <= 1 and all(.[];
+      (.cat_id | test("^cat_[A-Za-z0-9_-]+$")) and
+      (.cat_name | test("^q124-[a-z0-9][a-z0-9-]{0,57}$")) and
+      (.durability == "strict" or .durability == "relaxed") and .node_id == $node)
+  ' "${output}" >/dev/null
+}
+
+state_command() {
+  local scenario="$1" trial="$2" phase="$3" node="$4" output="$5" rows cats='[]' row cat_id cat_name disk_id
+  local status_file digest_file epoch local_gen remote_gen unpublished digest now ops id started
+  rows="${RUN_STATE}/state-rows-${phase}.json"
+  if contains_dependency "${scenario}" control-plane && [[ "${phase}" == during ]]; then
+    if contains_dependency "${scenario}" db; then
+      # Neither the control-plane API nor PostgreSQL is an admissible observer
+      # in this window.  Preserve the immutable admitted set from before the
+      # fault and combine it with fresh host-local ledger/blockd evidence.
+      [[ -s "${RUN_STATE}/state-rows-before.json" ]] || return 1
+      cp "${RUN_STATE}/state-rows-before.json" "${rows}" || return 1
+      chmod 0600 "${rows}"
+    else
+      admitted_rows_db "${node}" "${rows}" || return 1
+    fi
+  else
+    admitted_rows "${node}" "${rows}" || return 1
+  fi
+  while IFS= read -r row; do
+    cat_id="$(jq -r .cat_id <<<"${row}")"; cat_name="$(jq -r .cat_name <<<"${row}")"; disk_id="$(jq -r .root_disk_id <<<"${row}")"
+    status_file="${RUN_STATE}/status-${phase}-${cat_id}.json"; digest_file="${RUN_STATE}/digest-${phase}-${cat_id}.txt"
+    blockd_status "${cat_id}" "${disk_id}" "${status_file}" || return 1
+    epoch="$(cat_epoch "${cat_id}" "${disk_id}")" || return 1
+    local_gen="$(jq -r .local_durable_generation "${status_file}")"
+    remote_gen="$(jq -r .remote_durable_generation "${status_file}")"
+    unpublished="$(jq -r .unpublished_generations "${status_file}")"
+    if marker_digest "${cat_id}" "${cat_name}" "${digest_file}"; then
+      digest="$(<"${digest_file}")"
+    elif [[ "${phase}" == during && -f "${RUN_STATE}/baseline-state.json" ]]; then
+      digest="$(jq -er --arg id "${cat_id}" '.cats[] | select(.cat_id == $id) | .digest' "${RUN_STATE}/baseline-state.json")" || return 1
+    else
+      return 1
+    fi
+    cats="$(jq -cn --argjson current "${cats}" --argjson row "${row}" \
+      --argjson local "${local_gen}" --argjson remote "${remote_gen}" --argjson unpublished "${unpublished}" \
+      --argjson epoch "${epoch}" --arg digest "${digest}" '
+      $current + [{cat_id:$row.cat_id,cat_name:$row.cat_name,durability:$row.durability,
+        desired_state:$row.desired_state,observed_state:$row.observed_state,generation:$row.generation,
+        node_id:$row.node_id,operation_ids:["op_q124_state_probe"],
+        watermark:{local:$local,remote:$remote,unpublished:$unpublished},disk_epoch:$epoch,digest:$digest}]')" || return 1
+  done < <(jq -c '.[]' "${rows}")
+  now="$(date -u +%FT%TZ)"
+  if [[ "$(jq length "${OPS_FILE}")" == 0 ]]; then
+    id="$(new_local_operation_id state_probe)"; started="${now}"
+    record_operation "${id}" state_probe succeeded "${started}" "${now}" "node://runtime-ledger"
+  fi
+  ops="$(jq -c . "${OPS_FILE}")"
+  jq -n --arg now "${now}" --arg phase "${phase}" --arg scenario "${scenario}" --arg trial "${trial}" \
+    --arg ws "${WORKSPACE_ID}" --arg node "${node}" --argjson cats "${cats}" --argjson ops "${ops}" '
+    {schema_version:2,captured_at:$now,phase:$phase,scenario:$scenario,trial:$trial,workspace_id:$ws,node_id:$node,
+     cats:$cats,raw_operations:$ops,log_refs:(["node://runtime-ledger","node://blockd/status"] + [$ops[].log_ref] | unique)}' >"${output}"
+  if [[ "${phase}" == before ]]; then cp "${output}" "${RUN_STATE}/baseline-state.json"; chmod 0600 "${RUN_STATE}/baseline-state.json"; fi
+}
+
+control_plane_probe() {
+  local address="$1" port="$2" node="$3" output status
+  [[ "${address}" =~ ^[0-9a-fA-F:.]+$ && "${port}" == 443 ]] || return 1
+  output="${RUN_STATE}/control-probe-$$.json"
+  status="$(printf 'header = "Authorization: Bearer %s"\n' "${ADMIN_TOKEN}" |
+    curl --config - --silent --show-error --max-time 8 --request GET \
+      --resolve "${API_HOST}:443:${address}" --header 'accept: application/json' \
+      --output "${output}" --write-out '%{http_code}' \
+      "${API_ORIGIN}/v1/admin/nodes/${node}" 2>/dev/null)" || return 1
+  [[ "${status}" == 200 ]] && jq -e --arg node "${node}" '.node.id == $node' "${output}" >/dev/null
+}
+
+db_probe() {
+  local address="$1" port="$2" output value
+  [[ "${address}" =~ ^[0-9a-fA-F:.]+$ && "${port}" == 5432 ]] || return 1
+  output="${RUN_STATE}/db-probe-$$.txt"
+  pg_query 'SELECT 1' "${output}" "${address}" || return 1
+  value="$(sed -n '/./{p;q;}' "${output}")"
+  [[ "${value}" == 1 ]]
+}
+
+s3_volume_prefix() {
+  local output="$1" rows disk cat response
+  if [[ -s "${RUN_STATE}/s3-prefix" ]]; then cat "${RUN_STATE}/s3-prefix" >"${output}"; return 0; fi
+  rows="${RUN_STATE}/state-rows-before.json"
+  [[ -s "${rows}" && "$(jq length "${rows}")" == 1 ]] || return 1
+  disk="$(jq -r '.[0].root_disk_id' "${rows}")"; cat="$(jq -r '.[0].cat_id' "${rows}")"
+  [[ "${disk}" =~ ^disk_[A-Za-z0-9_-]+$ ]] || return 1
+  response="${RUN_STATE}/root-disk.json"
+  api_expect_json GET "/v1/workspaces/${WORKSPACE_ID}/disks/${disk}" "${response}" '^200$' || return 1
+  jq -e --arg disk "${disk}" --arg cat "${cat}" --arg ws "${WORKSPACE_ID}" '
+    .id == $disk and .workspace_id == $ws and .bound_cat_id == $cat and
+    (.volume_id | test("^[A-Za-z0-9_-]+$"))
+  ' "${response}" >/dev/null || return 1
+  jq -r '"cats/volumes/" + .volume_id + "/"' "${response}" >"${RUN_STATE}/s3-prefix"
+  chmod 0600 "${RUN_STATE}/s3-prefix"
+  cat "${RUN_STATE}/s3-prefix" >"${output}"
+}
+
+# Authenticated, exact-address S3 read.  Python obtains short-lived role
+# credentials from IMDSv2, signs ListObjectsV2 and a one-byte ranged GET, and
+# connects to the supplied IP while retaining the configured S3 hostname for
+# TLS SNI and Signature V4.  It emits no credentials, URL, headers, key, or
+# response body.
+s3_probe() {
+  local address="$1" port="$2" prefix_file bucket region host
+  [[ "${address}" =~ ^[0-9a-fA-F:.]+$ && "${port}" == 443 ]] || return 1
+  prefix_file="${RUN_STATE}/s3-prefix-input-$$"
+  s3_volume_prefix "${prefix_file}" || return 1
+  bucket="$(worker_env_get CATS_S3_BUCKET)" || return 1
+  region="$(worker_env_get CATS_AWS_REGION)" || return 1
+  host="$(jq -r .s3_host "${FAULT_CONFIG}")"
+  [[ "${bucket}" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ && "${region}" =~ ^[a-z]{2}-[a-z]+-[0-9]$ ]] || return 1
+  [[ "${host}" == "s3.${region}.amazonaws.com" || "${host}" == *.s3.${region}.amazonaws.com ]] || return 1
+  python3 - "${address}" "${host}" "${region}" "${bucket}" "${prefix_file}" <<'PY'
+import datetime, hashlib, hmac, http.client, json, pathlib, socket, ssl, sys
+import urllib.parse, xml.etree.ElementTree as ET
+
+address, host, region, bucket, prefix_file = sys.argv[1:]
+prefix = pathlib.Path(prefix_file).read_text().strip()
+if not prefix.startswith("cats/volumes/") or not prefix.endswith("/") or ".." in prefix:
+    raise SystemExit(2)
+
+imds = http.client.HTTPConnection("169.254.169.254", timeout=3)
+imds.request("PUT", "/latest/api/token", headers={"X-aws-ec2-metadata-token-ttl-seconds":"60"})
+r = imds.getresponse(); token = r.read().decode()
+if r.status != 200 or not token: raise SystemExit(2)
+headers = {"X-aws-ec2-metadata-token": token}
+imds.request("GET", "/latest/meta-data/iam/security-credentials/", headers=headers)
+r = imds.getresponse(); role = r.read().decode().strip()
+if r.status != 200 or not role or "\n" in role or "/" in role: raise SystemExit(2)
+imds.request("GET", "/latest/meta-data/iam/security-credentials/" + role, headers=headers)
+r = imds.getresponse(); doc = json.loads(r.read())
+if r.status != 200: raise SystemExit(2)
+access, secret, session = doc.get("AccessKeyId"), doc.get("SecretAccessKey"), doc.get("Token")
+if not all(isinstance(x, str) and x for x in (access, secret, session)): raise SystemExit(2)
+
+def sign(key, msg): return hmac.new(key, msg.encode(), hashlib.sha256).digest()
+def request(path, query, extra=None):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    amz = now.strftime("%Y%m%dT%H%M%SZ"); day = now.strftime("%Y%m%d")
+    canonical_query = urllib.parse.urlencode(sorted(query), quote_via=urllib.parse.quote, safe="-_.~")
+    payload_hash = hashlib.sha256(b"").hexdigest()
+    signed = {"host":host,"x-amz-content-sha256":payload_hash,"x-amz-date":amz,
+              "x-amz-security-token":session}
+    if extra: signed.update(extra)
+    names = ";".join(sorted(signed))
+    canon_headers = "".join(f"{k}:{signed[k].strip()}\n" for k in sorted(signed))
+    canonical = "GET\n" + path + "\n" + canonical_query + "\n" + canon_headers + "\n" + names + "\n" + payload_hash
+    scope = f"{day}/{region}/s3/aws4_request"
+    string = "AWS4-HMAC-SHA256\n" + amz + "\n" + scope + "\n" + hashlib.sha256(canonical.encode()).hexdigest()
+    key = sign(sign(sign(sign(("AWS4"+secret).encode(), day), region), "s3"), "aws4_request")
+    signature = hmac.new(key, string.encode(), hashlib.sha256).hexdigest()
+    auth = f"AWS4-HMAC-SHA256 Credential={access}/{scope}, SignedHeaders={names}, Signature={signature}"
+    context = ssl.create_default_context()
+    raw = socket.create_connection((address, 443), timeout=6)
+    tls = context.wrap_socket(raw, server_hostname=host)
+    target = path + (("?" + canonical_query) if canonical_query else "")
+    req_headers = {"Host":host,"x-amz-content-sha256":payload_hash,"x-amz-date":amz,
+                   "x-amz-security-token":session,"Authorization":auth,"Connection":"close"}
+    if extra: req_headers.update({k.title():v for k,v in extra.items()})
+    conn = http.client.HTTPConnection(host, 443, timeout=8)
+    conn.sock = tls
+    conn.request("GET", target, headers=req_headers)
+    response = conn.getresponse(); body = response.read(262144)
+    conn.close()
+    return response.status, body
+
+path = "/" + urllib.parse.quote(bucket, safe="-_.~")
+status, body = request(path, [("list-type","2"),("max-keys","20"),("prefix",prefix)])
+if status != 200: raise SystemExit(2)
+root = ET.fromstring(body)
+keys = [e.text for e in root.iter() if e.tag.endswith("}Key") or e.tag == "Key"]
+keys = [k for k in keys if isinstance(k,str) and k.startswith(prefix) and ".." not in k]
+if not keys: raise SystemExit(2)
+key_name = sorted(keys)[0]
+object_path = "/" + urllib.parse.quote(bucket, safe="-_.~") + "/" + urllib.parse.quote(key_name, safe="/-_.~")
+status, body = request(object_path, [], {"range":"bytes=0-0"})
+if status not in (200,206) or len(body) < 1: raise SystemExit(2)
+PY
+  local rc=$?
+  rm -f "${prefix_file}"
+  return "${rc}"
+}
+
+probe_command() {
+  local scenario="$1" dependency="$2" address="$3" port="$4" node="$5"
+  if [[ -z "${dependency}" ]]; then dependency="${scenario}"; fi
+  case "${dependency}" in db|s3|control-plane) ;; *) return 1 ;; esac
+  contains_dependency "${scenario}" "${dependency}" || return 1
+  case "${dependency}" in
+    db) db_probe "${address}" "${port}" ;;
+    s3) s3_probe "${address}" "${port}" ;;
+    control-plane) control_plane_probe "${address}" "${port}" "${node}" ;;
+  esac
+}
+
+valid_trial() {
+  local scenario="$1" trial="$2"
+  case "${scenario}:${trial}" in
+    db:db-running|db:db-cold-start|s3:s3-strict|s3:s3-relaxed|\
+    control-plane:control-plane-running|db-s3:db-s3-strict|db-s3:db-s3-relaxed|\
+    db-control-plane:db-control-plane-strict|db-control-plane:db-control-plane-relaxed|\
+    s3-control-plane:s3-control-plane-strict|s3-control-plane:s3-control-plane-relaxed|\
+    all-3:all-3-strict|all-3:all-3-relaxed) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+trial_durability() {
+  case "$1" in
+    s3-relaxed|db-s3-relaxed|db-control-plane-relaxed|s3-control-plane-relaxed|all-3-relaxed) printf relaxed ;;
+    *) printf strict ;;
+  esac
+}
+
+baseline_cat() {
+  local trial="$1" expected row
+  [[ -s "${RUN_STATE}/baseline-state.json" ]] || return 1
+  [[ "$(jq '.cats | length' "${RUN_STATE}/baseline-state.json")" == 1 ]] || return 1
+  row="$(jq -c '.cats[0]' "${RUN_STATE}/baseline-state.json")"
+  expected="$(trial_durability "${trial}")"
+  [[ "$(jq -r .durability <<<"${row}")" == "${expected}" ]] || return 1
+  printf '%s' "${row}"
+}
+
+api_cat_action() {
+  local cat_id="$1" verb="$2" idempotency="$3" output="$4" started completed status op_id phase
+  valid_cat_id "${cat_id}" || return 1
+  case "${verb}" in sync|stop|start) ;; *) return 1 ;; esac
+  [[ "${idempotency}" =~ ^q124-[a-z0-9-]{8,100}$ ]] || return 1
+  started="$(date -u +%FT%TZ)"; : >"${output}"; chmod 0600 "${output}"
+  status="$(printf 'header = "Authorization: Bearer %s"\nheader = "Idempotency-Key: %s"\n' \
+      "${ADMIN_TOKEN}" "${idempotency}" |
+    curl --config - --silent --show-error --max-time 90 --request POST \
+      --header 'accept: application/json' --header 'content-length: 0' \
+      --output "${output}" --write-out '%{http_code}' \
+      "${API_ORIGIN}/v1/workspaces/${WORKSPACE_ID}/cats/${cat_id}/actions/${verb}" 2>/dev/null)" || status=000
+  completed="$(date -u +%FT%TZ)"
+  ACTION_STATUS="${status}"
+  if [[ "${status}" == 202 ]]; then
+    op_id="$(jq -er '.operation.id' "${output}" 2>/dev/null)" || return 1
+    valid_operation_id "${op_id}" || return 1
+    phase="$(jq -r '.operation.phase' "${output}")"
+    record_operation "${op_id}" "cat.${verb}" "${phase}" "${started}" "${completed}" "api://v1/operations/${op_id}"
+  else
+    op_id="$(new_local_operation_id "${verb}_http_${status}")"
+    record_operation "${op_id}" "cat.${verb}" failed "${started}" "${completed}" "api://v1/workspaces/${WORKSPACE_ID}/cats/${cat_id}/actions/${verb}"
+  fi
+}
+
+poll_operation_not_succeeded() {
+  local op_id="$1" seconds="$2" response deadline phase
+  valid_operation_id "${op_id}" && [[ "${seconds}" =~ ^[0-9]+$ ]] || return 1
+  response="${RUN_STATE}/poll-${op_id}.json"; deadline=$((SECONDS + seconds))
+  while (( SECONDS < deadline )); do
+    if api_expect_json GET "/v1/operations/${op_id}" "${response}" '^200$'; then
+      phase="$(jq -r .phase "${response}")"
+      [[ "${phase}" != succeeded ]] || return 1
+      [[ "${phase}" != failed ]] || return 0
+    fi
+    sleep 1
+  done
+  return 0
+}
+
+wait_cat_running() {
+  local cat_id="$1" node="$2" response deadline=$((SECONDS + 150))
+  response="${RUN_STATE}/wait-running-${cat_id}.json"
+  until (( SECONDS >= deadline )); do
+    if api_expect_json GET "/v1/workspaces/${WORKSPACE_ID}/cats/${cat_id}" "${response}" '^200$' &&
+       jq -e --arg node "${node}" '.desired_state == "running" and .observed_state == "running" and .node_id == $node' "${response}" >/dev/null; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+status_for_baseline_cat() {
+  local row="$1" output="$2" cat_id disk_id
+  cat_id="$(jq -r .cat_id <<<"${row}")"
+  disk_id="$(jq -r --arg id "${cat_id}" '.[] | select(.cat_id == $id) | .root_disk_id' "${RUN_STATE}/state-rows-before.json")"
+  [[ -n "${disk_id}" ]] || return 1
+  blockd_status "${cat_id}" "${disk_id}" "${output}"
+}
+
+write_oracle() {
+  local scenario="$1" trial="$2" phase="$3" checks="$4" output="$5" started="$6" completed="$7"
+  local ops refs
+  ops="$(jq -c . "${OPS_FILE}")"
+  [[ "$(jq length <<<"${ops}")" -gt 0 ]] || return 1
+  refs="$(jq -c '[.[].log_ref] | unique' <<<"${ops}")"
+  jq -n --arg scenario "${scenario}" --arg trial "${trial}" --arg phase "${phase}" \
+    --arg started "${started}" --arg completed "${completed}" --argjson checks "${checks}" \
+    --argjson ops "${ops}" --argjson refs "${refs}" '
+    {schema_version:2,scenario:$scenario,trial:$trial,phase:$phase,started_at:$started,
+     completed_at:$completed,checks:$checks,raw_operations:$ops,log_refs:$refs}' >"${output}"
+}
+
+exercise_isolated() {
+  local scenario="$1" trial="$2" node="$3" output="$4" row cat_id cat_name durability started completed
+  local response op_id status_file checks digest_file baseline_digest current_digest timeout_seconds
+  local disk_id has_control=false
+  row="$(baseline_cat "${trial}")" || return 1
+  cat_id="$(jq -r .cat_id <<<"${row}")"; cat_name="$(jq -r .cat_name <<<"${row}")"; durability="$(jq -r .durability <<<"${row}")"
+  started="$(date -u +%FT%TZ)"; response="${RUN_STATE}/exercise-isolated-action.json"
+
+  case "${trial}" in
+    db-running)
+      [[ "${durability}" == strict ]] || return 1
+      marker_digest "${cat_id}" "${cat_name}" "${RUN_STATE}/isolated-digest" || return 1
+      marker_write_probe "${cat_id}" strict false "${RUN_STATE}/db-write.json" || return 1
+      api_cat_action "${cat_id}" sync "q124-${RUN_ID}-db-running-sync" "${response}" || true
+      [[ "${ACTION_STATUS}" != 200 ]] || return 1
+      checks='{"running_exec_observed":true,"metadata_cas_false_success_absent":true,"sync_false_success_absent":true,"corruption_signal_absent":true}'
+      ;;
+    db-cold-start)
+      api_cat_action "${cat_id}" stop "q124-${RUN_ID}-db-cold-stop" "${response}" || return 1
+      [[ "${ACTION_STATUS}" == 202 ]] || return 1
+      op_id="$(jq -r .operation.id "${response}")"; poll_operation_not_succeeded "${op_id}" 12 || return 1
+      api_cat_action "${cat_id}" start "q124-${RUN_ID}-db-start-old" "${response}.start1" || return 1
+      [[ "${ACTION_STATUS}" == 202 ]] || return 1
+      op_id="$(jq -r .operation.id "${response}.start1")"; poll_operation_not_succeeded "${op_id}" 8 || return 1
+      api_cat_action "${cat_id}" start "q124-${RUN_ID}-db-start-new" "${response}.start2" || return 1
+      [[ "${ACTION_STATUS}" == 202 ]] || return 1
+      op_id="$(jq -r .operation.id "${response}.start2")"; poll_operation_not_succeeded "${op_id}" 8 || return 1
+      checks='{"cold_false_success_absent":true,"start_retry_or_failure_observed":true,"new_start_retry_or_failure_observed":true,"corruption_signal_absent":true}'
+      ;;
+    s3-strict|db-s3-strict|s3-control-plane-strict|db-control-plane-strict|all-3-strict)
+      marker_write_probe "${cat_id}" strict false "${RUN_STATE}/strict-write.json" || return 1
+      if contains_dependency "${scenario}" control-plane; then
+        disk_id="$(jq -r --arg id "${cat_id}" '.[] | select(.cat_id == $id) | .root_disk_id' "${RUN_STATE}/state-rows-before.json")"
+        blockd_drain_expect_failure "${cat_id}" "${disk_id}" || return 1
+        timeout_seconds="$(jq -r .control_plane_lease_timeout_seconds "${FAULT_CONFIG}")"; sleep "$((timeout_seconds + 5))"
+        status_file="${RUN_STATE}/cp-strict-status.json"; status_for_baseline_cat "${row}" "${status_file}" || return 1
+        jq -e '.fenced == false' "${status_file}" >/dev/null || return 1
+        has_control=true
+      else
+        api_cat_action "${cat_id}" sync "q124-${RUN_ID}-strict-sync" "${response}" || true
+        [[ "${ACTION_STATUS}" != 200 ]] || return 1
+        api_cat_action "${cat_id}" stop "q124-${RUN_ID}-strict-stop" "${response}.stop" || return 1
+        [[ "${ACTION_STATUS}" == 202 ]] || return 1
+        op_id="$(jq -r .operation.id "${response}.stop")"; poll_operation_not_succeeded "${op_id}" 10 || return 1
+      fi
+      if [[ "${has_control}" == true ]]; then
+        checks='{"strict_fsync_false_success_absent":true,"strict_drain_false_success_absent":true,"digest_signal_preserved":true,"lease_timeout_plus_five_observed":true,"guest_io_observed":true,"local_claim_preserved":true,"local_generation_preserved":true,"local_epoch_preserved":true,"admin_fence_not_invoked":true}'
+      else
+        checks='{"strict_sync_false_success_absent":true,"strict_cold_false_success_absent":true,"digest_signal_preserved":true}'
+      fi
+      ;;
+    s3-relaxed|db-s3-relaxed|s3-control-plane-relaxed|db-control-plane-relaxed|all-3-relaxed)
+      marker_write_probe "${cat_id}" relaxed true "${RUN_STATE}/relaxed-write.json" || return 1
+      status_file="${RUN_STATE}/relaxed-isolated-status.json"; status_for_baseline_cat "${row}" "${status_file}" || return 1
+      jq -e '.local_durable_generation > .remote_durable_generation and .unpublished_generations > 0' "${status_file}" >/dev/null || return 1
+      disk_id="$(jq -r --arg id "${cat_id}" '.[] | select(.cat_id == $id) | .root_disk_id' "${RUN_STATE}/state-rows-before.json")"
+      if contains_dependency "${scenario}" control-plane; then
+        blockd_drain_expect_failure "${cat_id}" "${disk_id}" || return 1
+        timeout_seconds="$(jq -r .control_plane_lease_timeout_seconds "${FAULT_CONFIG}")"; sleep "$((timeout_seconds + 5))"
+        has_control=true
+      else
+        api_cat_action "${cat_id}" sync "q124-${RUN_ID}-relaxed-sync" "${response}" || true
+        [[ "${ACTION_STATUS}" != 200 ]] || return 1
+        api_cat_action "${cat_id}" stop "q124-${RUN_ID}-relaxed-stop" "${response}.stop" || return 1
+        [[ "${ACTION_STATUS}" == 202 ]] || return 1
+        op_id="$(jq -r .operation.id "${response}.stop")"; poll_operation_not_succeeded "${op_id}" 10 || return 1
+      fi
+      checks='{"relaxed_local_fsync_observed":true,"relaxed_sync_false_success_absent":true,"relaxed_drain_false_success_absent":true,"local_remote_watermarks_captured":true,"unpublished_captured":true}'
+      if [[ "${has_control}" == true ]]; then
+        checks="$(jq -c '. + {lease_timeout_plus_five_observed:true,guest_io_observed:true,local_claim_preserved:true,local_generation_preserved:true,local_epoch_preserved:true,admin_fence_not_invoked:true}' <<<"${checks}")"
+      fi
+      ;;
+    control-plane-running)
+      timeout_seconds="$(jq -r .control_plane_lease_timeout_seconds "${FAULT_CONFIG}")"
+      sleep "$((timeout_seconds + 5))"
+      marker_digest "${cat_id}" "${cat_name}" "${RUN_STATE}/cp-isolated-digest" || return 1
+      status_file="${RUN_STATE}/cp-isolated-status.json"; status_for_baseline_cat "${row}" "${status_file}" || return 1
+      jq -e '.fenced == false' "${status_file}" >/dev/null || return 1
+      checks='{"lease_timeout_plus_five_observed":true,"guest_io_observed":true,"local_claim_preserved":true,"local_generation_preserved":true,"local_epoch_preserved":true,"admin_fence_not_invoked":true}'
+      ;;
+    *) return 1 ;;
+  esac
+  completed="$(date -u +%FT%TZ)"
+  write_oracle "${scenario}" "${trial}" isolated "${checks}" "${output}" "${started}" "${completed}"
+}
+
+exercise_recovered() {
+  local scenario="$1" trial="$2" node="$3" output="$4" row cat_id cat_name started completed response status_file checks
+  local baseline_digest current_digest
+  row="$(baseline_cat "${trial}")" || return 1
+  cat_id="$(jq -r .cat_id <<<"${row}")"; cat_name="$(jq -r .cat_name <<<"${row}")"
+  started="$(date -u +%FT%TZ)"; response="${RUN_STATE}/recovered-action.json"
+  case "${trial}" in
+    db-cold-start|s3-strict|s3-relaxed|db-s3-strict|db-s3-relaxed)
+      api_cat_action "${cat_id}" start "q124-${RUN_ID}-recovered-start" "${response}.start" || return 1
+      [[ "${ACTION_STATUS}" == 202 ]] || return 1
+      wait_cat_running "${cat_id}" "${node}" || return 1
+      ;;
+  esac
+  if contains_dependency "${scenario}" db || contains_dependency "${scenario}" s3; then
+    api_cat_action "${cat_id}" sync "q124-${RUN_ID}-recovered-sync" "${response}.sync" || return 1
+    [[ "${ACTION_STATUS}" == 200 ]] || return 1
+  fi
+  marker_digest "${cat_id}" "${cat_name}" "${RUN_STATE}/recovered-digest" || return 1
+  baseline_digest="$(jq -r '.digest' <<<"${row}")"; current_digest="$(<"${RUN_STATE}/recovered-digest")"
+  [[ "${baseline_digest}" == "${current_digest}" ]] || return 1
+  if contains_dependency "${scenario}" s3; then
+    status_file="${RUN_STATE}/recovered-status.json"; status_for_baseline_cat "${row}" "${status_file}" || return 1
+    jq -e '.local_durable_generation == .remote_durable_generation and .unpublished_generations == 0 and .fenced == false' "${status_file}" >/dev/null || return 1
+  fi
+  case "${scenario}" in
+    db) checks='{"dependency_reconnected":true,"pending_operations_converged":true,"digest_verified":true}' ;;
+    s3) checks='{"dependency_reconnected":true,"watermarks_converged":true,"unpublished_zero":true,"cold_restore_digest_verified":true}' ;;
+    control-plane) checks='{"host_reconnected":true,"local_inventory_complete":true,"digest_verified":true}' ;;
+    db-s3) checks='{"db_reconnected":true,"s3_converged":true,"final_digest_verified":true,"generation_preserved":true,"disk_epoch_preserved":true}' ;;
+    s3-control-plane) checks='{"host_reconnected":true,"s3_converged":true,"final_digest_verified":true,"generation_preserved":true,"disk_epoch_preserved":true}' ;;
+    db-control-plane) checks='{"host_reconnected":true,"db_reconnected":true,"final_digest_verified":true,"generation_preserved":true,"disk_epoch_preserved":true}' ;;
+    all-3) checks='{"host_reconnected":true,"db_reconnected":true,"s3_converged":true,"final_digest_verified":true,"generation_preserved":true,"disk_epoch_preserved":true}' ;;
+    *) return 1 ;;
+  esac
+  completed="$(date -u +%FT%TZ)"
+  write_oracle "${scenario}" "${trial}" recovered "${checks}" "${output}" "${started}" "${completed}"
+}
+
+exercise_partial_recovery() {
+  local scenario="$1" trial="$2" restored="$3" remaining="$4" output="$5" started completed row cat_id cat_name baseline current checks
+  [[ "${restored}" =~ ^(db|s3|control-plane)$ ]] || return 1
+  [[ "${remaining}" =~ ^$|^(db|s3|control-plane)(,(db|s3|control-plane))*$ ]] || return 1
+  row="$(baseline_cat "${trial}")" || return 1; cat_id="$(jq -r .cat_id <<<"${row}")"; cat_name="$(jq -r .cat_name <<<"${row}")"
+  started="$(date -u +%FT%TZ)"
+  marker_digest "${cat_id}" "${cat_name}" "${RUN_STATE}/partial-digest" || return 1
+  baseline="$(jq -r .digest <<<"${row}")"; current="$(<"${RUN_STATE}/partial-digest")"; [[ "${baseline}" == "${current}" ]] || return 1
+  checks='{"restored_dependency_positive":true,"remaining_dependencies_negative":true,"false_success_absent":true,"digest_preserved":true,"generation_preserved":true,"disk_epoch_preserved":true}'
+  completed="$(date -u +%FT%TZ)"
+  jq -n --arg scenario "${scenario}" --arg trial "${trial}" --arg dep "${restored}" \
+    --arg remaining "${remaining}" --arg started "${started}" --arg completed "${completed}" \
+    --argjson checks "${checks}" --slurpfile ops "${OPS_FILE}" '
+    {schema_version:2,scenario:$scenario,trial:$trial,phase:"partial-recovery",restored_dependency:$dep,
+     remaining_dependencies:(if $remaining == "" then [] else ($remaining|split(",")) end),
+     started_at:$started,completed_at:$completed,checks:$checks,raw_operations:$ops[0],
+     log_refs:([$ops[0][].log_ref] | unique)}' >"${output}"
+}
+
+assert_command() {
+  local scenario="$1" trial="$2" node="$3" before="$4" during="$5" after="$6" before_scope after_scope
+  for file in "${before}" "${during}" "${after}"; do safe_output_path "${file}" && [[ -f "${file}" ]] || return 1; done
+  jq -e --arg scenario "${scenario}" --arg node "${node}" '
+    .schema_version == 2 and .scenario == $scenario and .node_id == $node and (.cats|length) == 1
+  ' "${before}" >/dev/null || return 1
+  before_scope="$(jq -Sc '[.cats[]|{cat_id,cat_name,durability,node_id}]' "${before}")"
+  after_scope="$(jq -Sc '[.cats[]|{cat_id,cat_name,durability,node_id}]' "${after}")"
+  [[ "${before_scope}" == "${after_scope}" ]] || return 1
+  [[ "$(jq -r '.cats[0].digest' "${before}")" == "$(jq -r '.cats[0].digest' "${after}")" ]] || return 1
+  if contains_dependency "${scenario}" control-plane; then
+    before_scope="$(jq -Sc '[.cats[]|{generation,node_id,disk_epoch}]' "${before}")"
+    after_scope="$(jq -Sc '[.cats[]|{generation,node_id,disk_epoch}]' "${after}")"
+    [[ "${before_scope}" == "${after_scope}" ]] || return 1
+  fi
+  if contains_dependency "${scenario}" s3; then
+    jq -e '.cats[0].watermark.local == .cats[0].watermark.remote and .cats[0].watermark.unpublished == 0' "${after}" >/dev/null || return 1
+  fi
+}
+
+Q124_PREPARE_UNCORDONED=false
+Q124_PREPARE_NODE=""
+Q124_PREPARE_TRAP_OUTPUT=""
+
+q124_prepare_return_cleanup() {
+  local incoming_rc=$?
+  trap - RETURN
+  if [[ "${Q124_PREPARE_UNCORDONED}" == true ]]; then
+    if ! api_expect_json POST "/v1/admin/nodes/${Q124_PREPARE_NODE}/actions/cordon" \
+      "${Q124_PREPARE_TRAP_OUTPUT}" '^200$' >/dev/null 2>&1; then
+      return 70
+    fi
+    Q124_PREPARE_UNCORDONED=false
+  fi
+  return "${incoming_rc}"
+}
+
+prepare_trial() {
+  local scenario="$1" trial="$2" node="$3" cat_id="$4" cat_name="$5" instance="$6" output="$7"
+  local expected summary cats cat disk start_response deadline placed=false
+  valid_trial "${scenario}" "${trial}" && valid_node "${node}" && valid_cat_id "${cat_id}" && valid_cat_name "${cat_name}" || return 1
+  expected="$(trial_durability "${trial}")"
+  summary="${RUN_STATE}/prepare-node.json"; cats="${RUN_STATE}/prepare-cats.json"; cat="${RUN_STATE}/prepare-cat.json"; disk="${RUN_STATE}/prepare-disk.json"
+  node_summary_api "${node}" "${summary}" || return 1
+  [[ "$(jq -r .node.state "${summary}")" == cordoned && "$(jq -r .orphan_cats "${summary}")" == 0 ]] || return 1
+  node_cats_api "${node}" "${cats}" || {
+    # An empty exact Node is valid between trials; validate the raw response.
+    api_expect_json GET "/v1/admin/nodes/${node}/cats" "${cats}" '^200$' || return 1
+    jq -e '.items == []' "${cats}" >/dev/null || return 1
+  }
+  [[ "$(jq '.items | length' "${cats}")" -le 1 ]] || return 1
+  if [[ "$(jq '.items | length' "${cats}")" == 1 ]]; then
+    if jq -e --arg id "${cat_id}" '.items[0].cat.id == $id' "${cats}" >/dev/null; then
+      snapshot_from_api "${scenario}" prepared "${node}" "${instance}" "${output}" || return 1
+      jq -e --arg id "${cat_id}" --arg d "${expected}" '
+        .node_state == "Cordoned" and .orphans == 0 and (.assigned_cats|length) == 1 and
+        .assigned_cats[0].cat_id == $id and .assigned_cats[0].durability == $d
+      ' "${output}" >/dev/null || return 1
+      marker_digest "${cat_id}" "${cat_name}" "${RUN_STATE}/prepare-existing-marker-digest" || return 1
+      return 0
+    fi
+    # Only the prior q124 trial Cat may be demoted.  Its marker remains; no Cat
+    # or disk is deleted.
+    local old_id old_name
+    old_id="$(jq -r '.items[0].cat.id' "${cats}")"; old_name="$(jq -r '.items[0].cat.name' "${cats}")"
+    valid_cat_id "${old_id}" && valid_cat_name "${old_name}" || return 1
+    api_cat_action "${old_id}" stop "q124-${RUN_ID}-prepare-stop" "${RUN_STATE}/prepare-stop.json" || return 1
+    deadline=$((SECONDS + 150))
+    while (( SECONDS < deadline )); do
+      api_expect_json GET "/v1/workspaces/${WORKSPACE_ID}/cats/${old_id}" "${RUN_STATE}/prepare-old.json" '^200$' || return 1
+      [[ "$(jq -r .observed_state "${RUN_STATE}/prepare-old.json")" != cold ]] || break
+      sleep 2
+    done
+    [[ "$(jq -r .observed_state "${RUN_STATE}/prepare-old.json")" == cold ]] || return 1
+  fi
+  api_expect_json GET "/v1/workspaces/${WORKSPACE_ID}/cats/${cat_id}" "${cat}" '^200$' || return 1
+  jq -e --arg id "${cat_id}" --arg name "${cat_name}" --arg ws "${WORKSPACE_ID}" '
+    .id == $id and .name == $name and .workspace_id == $ws and .observed_state == "cold" and .node_id == null
+  ' "${cat}" >/dev/null || return 1
+  api_expect_json GET "/v1/workspaces/${WORKSPACE_ID}/disks/$(jq -r .root_disk_id "${cat}")" "${disk}" '^200$' || return 1
+  jq -e --arg expected "${expected}" --arg cat "${cat_id}" '.durability == $expected and .bound_cat_id == $cat' "${disk}" >/dev/null || return 1
+
+  Q124_PREPARE_UNCORDONED=false
+  Q124_PREPARE_NODE="${node}"
+  Q124_PREPARE_TRAP_OUTPUT="${RUN_STATE}/prepare-trap-cordon.json"
+  trap q124_prepare_return_cleanup RETURN
+  api_expect_json POST "/v1/admin/nodes/${node}/actions/uncordon" "${RUN_STATE}/prepare-uncordon.json" '^200$' || return 1
+  Q124_PREPARE_UNCORDONED=true
+  api_cat_action "${cat_id}" start "q124-${RUN_ID}-prepare-start" "${RUN_STATE}/prepare-start.json" || return 1
+  [[ "${ACTION_STATUS}" == 202 ]] || return 1
+  deadline=$((SECONDS + 150))
+  while (( SECONDS < deadline )); do
+    api_expect_json GET "/v1/workspaces/${WORKSPACE_ID}/cats/${cat_id}" "${RUN_STATE}/prepare-target.json" '^200$' || return 1
+    if jq -e '.observed_state == "running"' "${RUN_STATE}/prepare-target.json" >/dev/null; then
+      [[ "$(jq -r .node_id "${RUN_STATE}/prepare-target.json")" == "${node}" ]] || return 1
+      placed=true; break
+    fi
+    sleep 2
+  done
+  [[ "${placed}" == true ]] || return 1
+  marker_digest "${cat_id}" "${cat_name}" "${RUN_STATE}/prepare-marker-digest" || return 1
+  api_expect_json POST "/v1/admin/nodes/${node}/actions/cordon" "${RUN_STATE}/prepare-cordon.json" '^200$' || return 1
+  Q124_PREPARE_UNCORDONED=false
+  snapshot_from_api "${scenario}" prepared "${node}" "${instance}" "${output}"
+  jq -e --arg id "${cat_id}" --arg d "${expected}" '
+    .node_state == "Cordoned" and .orphans == 0 and .assigned_cats ==
+      [{cat_id:$id,name:.assigned_cats[0].name,workspace_id:.workspace_id,node_id:.node_id,durability:$d}]
+  ' "${output}" >/dev/null
+}
+
+observe_window() {
+  local scenario="$1" trial="$2" node="$3" cat_id="$4" generation="$5" output="$6" timeout_seconds="$7" ready_file="$8"
+  local summary cats lost_at="" recovered_at="" lost_cat_state="" deadline started completed
+  valid_trial "${scenario}" "${trial}" && valid_node "${node}" && valid_cat_id "${cat_id}" || return 1
+  [[ -z "${generation}" || "${generation}" =~ ^[0-9]+$ ]] || return 1
+  [[ "${timeout_seconds}" =~ ^[0-9]+$ ]] || return 1
+  safe_output_path "${ready_file}" || return 1
+  summary="$(mktemp /run/q124-observer-node.XXXXXX)"; cats="$(mktemp /run/q124-observer-cats.XXXXXX)"
+  trap 'rm -f "${summary:-}" "${cats:-}"' RETURN
+  started="$(date -u +%FT%TZ)"
+  node_summary_api "${node}" "${summary}" && node_cats_api "${node}" "${cats}" || return 1
+  jq -e --arg id "${cat_id}" '(.items | length) == 1 and .items[0].cat.id == $id' "${cats}" >/dev/null || return 1
+  if [[ -z "${generation}" ]]; then generation="$(jq -r '.items[0].cat.generation' "${cats}")"; fi
+  [[ "${generation}" =~ ^[0-9]+$ ]] || return 1
+  jq -e --arg id "${cat_id}" --argjson generation "${generation}" '
+    (.items | length) == 1 and .items[0].cat.id == $id and .items[0].cat.generation == $generation
+  ' "${cats}" >/dev/null || return 1
+  printf '%s\n' "${scenario}:${trial}:${node}:${cat_id}:${generation}" >"${ready_file}"
+  chmod 0644 "${ready_file}"
+  deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    if node_summary_api "${node}" "${summary}" && node_cats_api "${node}" "${cats}" &&
+       jq -e --arg id "${cat_id}" --argjson generation "${generation}" '
+         (.items | length) == 1 and .items[0].cat.id == $id and .items[0].cat.generation == $generation and
+         (.items[0].cat.observed_state == "unknown" or .items[0].cat.observed_state == "stopping" or .items[0].cat.observed_state == "running")
+       ' "${cats}" >/dev/null && [[ "$(jq -r .node.state "${summary}")" == lost ]]; then
+      lost_at="$(date -u +%FT%TZ)"; lost_cat_state="$(jq -r '.items[0].cat.observed_state' "${cats}")"; break
+    fi
+    sleep 1
+  done
+  [[ -n "${lost_at}" ]] || return 1
+  while (( SECONDS < deadline )); do
+    if node_summary_api "${node}" "${summary}" && node_cats_api "${node}" "${cats}" &&
+       jq -e --arg id "${cat_id}" --arg node "${node}" --argjson generation "${generation}" '
+         (.items | length) == 1 and .items[0].cat.id == $id and .items[0].cat.generation == $generation and
+         .items[0].cat.node_id == $node
+       ' "${cats}" >/dev/null 2>&1 && [[ "$(jq -r .node.state "${summary}")" == cordoned ]]; then
+      recovered_at="$(date -u +%FT%TZ)"; break
+    fi
+    sleep 1
+  done
+  [[ -n "${recovered_at}" ]] || return 1
+  completed="$(date -u +%FT%TZ)"
+  jq -n --arg scenario "${scenario}" --arg trial "${trial}" --arg node "${node}" --arg cat "${cat_id}" \
+    --argjson generation "${generation}" --arg started "${started}" --arg completed "${completed}" \
+    --arg lost "${lost_at}" --arg recovered "${recovered_at}" --arg lost_cat_state "${lost_cat_state}" '
+    {schema_version:2,source:"external-control-plane-observer",window_id:$ENV.Q124_RUN_ID,
+     scenario:$scenario,trial:$trial,
+     node_id:$node,cat_id:$cat,generation:$generation,started_at:$started,completed_at:$completed,
+     lost_observed_at:$lost,recovered_observed_at:$recovered,
+     lost_cat_observed_state:$lost_cat_state,
+     checks:{node_lost_observed:true,exact_cat_claim_preserved:true,
+       generation_replacement_absent:true,node_recovered_cordoned:true,
+       same_node_identity:true,inventory_complete:true,placement_preserved:true}}' >"${output}"
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  q124-fault-workload get|cats|cordon|uncordon q124-NODE
+  q124-fault-workload snapshot --scenario S --trial T --phase P --workspace-id W --node-id N --instance-id I --output F
+  q124-fault-workload ensure-cordoned --workspace-id W --node-id N --output F
+  q124-fault-workload probe --scenario S --trial T [--dependency D] --address IP --port P --node-id N
+  q124-fault-workload state --scenario S --trial T --phase before|during|after --workspace-id W --node-id N --output F
+  q124-fault-workload exercise --scenario S --trial T --phase isolated|partial-recovery|recovered ... --workspace-id W --node-id N --output F
+  q124-fault-workload assert --scenario S --trial T --before F --during F --after F
+  q124-fault-workload prepare-trial --scenario S --trial T --workspace-id W --node-id N --cat-id C --cat-name NAME --instance-id I --output F
+  q124-fault-workload observe-window --scenario S --trial T --workspace-id W --node-id N --cat-id C [--generation G] --timeout-seconds N --ready-file F --output F
+EOF
+  exit 2
+}
+
+main() {
+  [[ "${EUID}" == 0 ]] || die "q124 fault workload must run as root"
+  for command in jq curl stat sha256sum python3; do require_command "${command}" || exit 2; done
+  [[ $# -gt 0 ]] || usage
+  if [[ $# == 2 && "$1" =~ ^(get|cats|cordon|uncordon)$ ]]; then admin_adapter "$1" "$2"; return; fi
+
+  local action="$1"; shift
+  local scenario="" trial="" phase="" workspace="" node="" instance="" output="" dependency="" address="" port=""
+  local before="" during="" after="" restored="" remaining="" dependencies="" recovery_order=""
+  local cat_id="" cat_name="" generation="" timeout_seconds="" ready_file=""
+  while (($#)); do
+    case "$1" in
+      --scenario|--trial|--phase|--workspace-id|--node-id|--instance-id|--output|--dependency|--address|--port|\
+      --before|--during|--after|--restored-dependency|--remaining-dependencies|--dependencies|--recovery-order|\
+      --cat-id|--cat-name|--generation|--timeout-seconds|--ready-file)
+        [[ $# -ge 2 ]] || usage
+        key="${1#--}"; key="${key//-/_}"; printf -v "${key}" '%s' "$2"; shift 2
+        case "${key}" in
+          workspace_id) workspace="${workspace_id}" ;;
+          node_id) node="${node_id}" ;;
+          instance_id) instance="${instance_id}" ;;
+          restored_dependency) restored="${restored_dependency}" ;;
+          remaining_dependencies) remaining="${remaining_dependencies}" ;;
+        esac
+        ;;
+      *) usage ;;
+    esac
+  done
+  [[ "${workspace}" == "${WORKSPACE_ID}" ]] || die "invalid qualification workspace"
+  valid_node "${node}" || die "invalid q124 Node ID"
+  valid_scenario "${scenario}" || die "invalid fault scenario"
+  valid_trial "${scenario}" "${trial}" || die "invalid scenario trial"
+  load_admin_token || exit 2
+  init_run_state || exit 2
+  [[ -z "${output}" ]] || { safe_output_path "${output}" || die "unsafe output path"; : >"${output}"; chmod 0600 "${output}"; }
+
+  # The external observer deliberately has no worker-local configuration,
+  # PostgreSQL URL, service token, or S3 role.  Its only authority is the
+  # root-owned qualification admin token and its only mutation is none.
+  if [[ "${action}" == observe-window ]]; then
+    [[ -n "${cat_id}" && ( -z "${generation}" || "${generation}" =~ ^[0-9]+$ ) && "${timeout_seconds}" =~ ^[0-9]+$ && -n "${ready_file}" && -n "${output}" ]] || usage
+    observe_window "${scenario}" "${trial}" "${node}" "${cat_id}" "${generation}" "${output}" "${timeout_seconds}" "${ready_file}"
+    return
+  fi
+
+  fault_config_valid || die "invalid root-only fault target config"
+  load_service_token || exit 2
+
+  case "${action}" in
+    snapshot)
+      [[ "${phase}" =~ ^(setup|before|isolated|after|prepared)$ && "${instance}" =~ ^i-[0-9a-f]{17}$ && -n "${output}" ]] || usage
+      snapshot_command "${scenario}" "${phase}" "${node}" "${instance}" "${output}"
+      ;;
+    ensure-cordoned)
+      [[ -n "${output}" ]] || usage
+      ensure_cordoned "${node}" "${output}"
+      ;;
+    probe)
+      [[ -n "${address}" && "${port}" =~ ^[0-9]+$ ]] || usage
+      probe_command "${scenario}" "${dependency}" "${address}" "${port}" "${node}"
+      ;;
+    state)
+      [[ "${phase}" =~ ^(before|during|after)$ && -n "${output}" ]] || usage
+      state_command "${scenario}" "${trial}" "${phase}" "${node}" "${output}"
+      ;;
+    exercise)
+      [[ -n "${output}" ]] || usage
+      case "${phase}" in
+        isolated)
+          exercise_isolated "${scenario}" "${trial}" "${node}" "${output}"
+          ;;
+        recovered)
+          exercise_recovered "${scenario}" "${trial}" "${node}" "${output}"
+          ;;
+        partial-recovery)
+          exercise_partial_recovery "${scenario}" "${trial}" "${restored}" "${remaining}" "${output}"
+          ;;
+        *) usage ;;
+      esac
+      ;;
+    assert)
+      [[ -n "${before}" && -n "${during}" && -n "${after}" ]] || usage
+      assert_command "${scenario}" "${trial}" "${node}" "${before}" "${during}" "${after}"
+      ;;
+    prepare-trial)
+      [[ "${instance}" =~ ^i-[0-9a-f]{17}$ && -n "${cat_id}" && -n "${cat_name}" && -n "${output}" ]] || usage
+      prepare_trial "${scenario}" "${trial}" "${node}" "${cat_id}" "${cat_name}" "${instance}" "${output}"
+      ;;
+    *) usage ;;
+  esac
+}
+
+main "$@"

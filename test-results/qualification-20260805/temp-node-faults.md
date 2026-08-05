@@ -1,320 +1,165 @@
 # Temporary Node dependency-fault harness
 
-`temp-node-faults.sh` is the executable companion to
-`temp-node-qualification-runbook.md`. It does not provision, drain, fence,
-withdraw, or terminate a Node. It only isolates one dependency or one explicit
-simultaneous dependency combination from one exact temporary instance after the
-runbook's admission and ownership gates have passed.
+`temp-node-faults.sh` runs one dependency-fault trial against one exact Issue
+#124 temporary Node. `temp-node-fault-matrix.sh` is the only supported
+multi-window entrypoint. It runs all 13 trials serially and does not start a
+later window unless the preceding window passed both its functional and
+cleanup gates.
 
-The default is `dry-run`, and the default scenario is only `db`. `all` is
-accepted only with `CATS_FAULT_ALLOW_ALL=true`; it deliberately means the three
-single faults run serially. True simultaneous combinations are `db-s3`,
-`db-control-plane`, `s3-control-plane`, and `all-3`, and require the separate
-`CATS_FAULT_ALLOW_COMBINED=true` gate. `matrix` requires both gates and runs the
-three singles, three pairs, and all-three scenario serially at the SSM-command
-level. The next command is not submitted unless the previous scenario produced
-both `functional_rc=0` and `cleanup_rc=0`, its rules are absent, its original
-probes recover, and its q124 workload converges.
+The harness does not provision, withdraw, terminate, delete, fence, or drain a
+Node. It never deletes a Cat, disk, database row, or S3 object. Its mutations
+are limited to:
 
-## Inputs and safety gates
+- bounded cordon/uncordon of the exact q124 temporary Node while placing the
+  next test Cat;
+- lifecycle actions on the one exact q124 Cat admitted for the current trial;
+- per-window, exact-address iptables rules on the temporary Host, with an
+  independently armed rollback timer.
 
-Required non-secret inputs:
+## Trial matrix
+
+Every harness invocation requires an exact `CATS_FAULT_SCENARIO` and
+`CATS_FAULT_TRIAL`. `all` and `matrix` are rejected by the single-window
+harness so evidence from different windows cannot share a run directory or
+ownership baseline.
+
+| Scenario | Trial | Cat durability |
+|---|---|---|
+| `db` | `db-running` | Strict |
+| `db` | `db-cold-start` | Strict |
+| `s3` | `s3-strict` | Strict |
+| `s3` | `s3-relaxed` | Relaxed |
+| `control-plane` | `control-plane-running` | Strict |
+| `db-s3` | `db-s3-strict`, `db-s3-relaxed` | matching suffix |
+| `db-control-plane` | `db-control-plane-strict`, `db-control-plane-relaxed` | matching suffix |
+| `s3-control-plane` | `s3-control-plane-strict`, `s3-control-plane-relaxed` | matching suffix |
+| `all-3` | `all-3-strict`, `all-3-relaxed` | matching suffix |
+
+The Node capacity contract is one CPU / one GiB and at most one admitted Cat.
+Every ownership and state schema requires exactly one Cat. The former dual-Cat
+S3 contract is a calibrated known-negative and fails closed.
+
+## Live matrix
+
+The matrix requires two pre-created, non-production q124 Cats: one Strict and
+one Relaxed. It may reuse those Cats across serial windows, but every window
+runs `prepare-trial` again and captures a new immutable ownership snapshot.
+Preparation starts from a Cordoned, orphan-free Node, allows one bounded
+uncordon/start placement attempt, requires exact placement and marker identity,
+then immediately re-cordons. Any return after uncordon re-cordons through a
+RETURN cleanup; failure of that cleanup returns 70 and stops the matrix.
+
+Required variables include:
 
 ```sh
 export TEMP_INSTANCE_ID=i-0123456789abcdef0
 export NODE_ID=q124-20260805000000-abcdef
-export CATS_OWNERSHIP_SNAPSHOT=/absolute/path/to/fresh-ownership.json
 export CATS_PROVISIONING_MANIFEST=/absolute/path/to/provisioning-manifest.json
-export CATS_FAULT_SCENARIO=db       # db, s3, control-plane; one by default
+export CATS_FAULT_OWNERSHIP_ROOT=/absolute/path/to/new-ownership-directory
+export CATS_FAULT_RESULT_ROOT=/absolute/path/to/new-result-directory
+export CATS_FAULT_STRICT_CAT_ID=cat_...
+export CATS_FAULT_STRICT_CAT_NAME=q124-...
+export CATS_FAULT_RELAXED_CAT_ID=cat_...
+export CATS_FAULT_RELAXED_CAT_NAME=q124-...
+export CATS_FAULT_MATRIX_CONFIRM="RUN_Q124_MATRIX_${TEMP_INSTANCE_ID}_${NODE_ID}"
+./test-results/qualification-20260805/temp-node-fault-matrix.sh
 ```
 
-The strict ownership JSON must bind the exact instance and Node to Issue 124 and
-`ws_788c5bfc3931`, report `node_state=Cordoned`, zero orphans, the deployed
-`TEST_SHA`, the runtime dependency endpoints, and the exact assigned Cat set.
-Every Cat must be `q124-*`, owned by that workspace, and placed on that Node.
-Live snapshots must be less than five minutes old. The Host hook re-snapshots
-immediately before injection, under isolation, and after recovery; every copy
-must remain Cordoned, have zero orphans, and have the identical Cat-set hash.
+The matrix writes a manifest containing each unique window run ID, exact
+scenario/trial/durability, timestamps, ownership path and SHA-256, and result.
+On the first failure it records that window and exits before starting another.
 
-The strict provisioning manifest binds the instance ID, unique Node ID, account,
-region, Name, launch time, expiry no more than 24 hours after launch, complete
-qualification tags, `TEST_SHA`, and expected SHA-256 values of the Host config
-and hook, plus the hook's exact repository path. At live start the harness
-requires that path to exist at the manifest `TEST_SHA`, hashes the Git blob,
-and accepts only `/opt/cats/qualification-124/<TEST_SHA>/q124-fault-workload`.
-It also requires at least ten minutes of TTL,
-compares EC2 `LaunchTime` and every required tag, and proves that the exact
-temporary instance is the only non-terminated EC2 instance with that Node ID.
-The fixed production source ID is not configurable and cannot equal the target.
+## Identity and tooling gates
 
-Live mode additionally requires the exact confirmation string:
+The provisioning manifest binds the AWS account, region, exact instance and
+Node IDs, launch time, expiry, Issue/Purpose/Node tags, `TEST_SHA`, and SHA-256
+of the fault config and hook. Live mode verifies the fixed source worker as a
+positive control, the exact target instance and tags, unique Node identity, and
+SSM Online state. SSM mutations always use the exact instance ID; tags are
+assertions, never selectors.
+
+The reviewed hook must be installed at
+`/opt/cats/qualification-124/<TEST_SHA>/q124-fault-workload`, root-owned,
+executable, and byte-identical to the Git blob named by the manifest. The
+temporary Host also requires root-only
+`/etc/cats/qualification-124/fault-targets.json`. PostgreSQL `psql` is a
+reviewed, preinstalled temporary-worker dependency for DB observation; neither
+the harness nor hook installs it online, and DB/control-plane trials fail
+before injection if it is absent.
+
+Secrets remain in fixed root-only Host files. They are passed to clients over
+stdin or mode-0600 temporary service files, never argv or evidence. Command
+text, SSM output, and all evidence are scanned for credential-like material.
+
+## Fault and probe contract
+
+Before injection the remote helper positively calibrates both TCP and an
+authenticated minimal read for every dependency address:
+
+- PostgreSQL: read-only `SELECT 1` using TLS verification and exact `hostaddr`;
+- S3: IMDSv2 credentials, signed prefix list and one-byte ranged object read,
+  preserving configured TLS SNI and SigV4 host identity;
+- control plane: authenticated exact-IP admin read preserving `cats.run` TLS
+  identity.
+
+An empty/negative probe is not trusted until that same probe passed its known
+positive. If IPv6 is routable, non-empty AAAA resolution and equivalent IPv6
+rules/probes are mandatory.
+
+Each dependency receives unique IPv4/IPv6 chains, comment, cleanup ledger and
+systemd watchdog. Combination dependencies must not share an address/port
+tuple. The helper proves every dependency negative, runs the trial-specific
+workload, and requires a positive firewall counter delta. Combination recovery
+is ordered and checked after every step: DB→S3; control-plane→DB;
+control-plane→S3; or control-plane→DB→S3.
+
+Cleanup runs on success, error, TERM and ordinary session loss. The independent
+watchdog covers SIGKILL/SSM loss. Cleanup success requires both command success
+and strict absence of the unique comments/chains. A cleanup error remains a
+non-zero `cleanup_rc` even if a later retry removes the rules.
+
+## State and oracle evidence
+
+State and host-oracle schemas are version 2 and include both `scenario` and
+`trial`. They require one exact Cat, durability matching the trial, lifecycle
+state/generation/placement, root-disk epoch, local/remote/unpublished
+watermarks, marker digest, raw operation IDs, and allowlisted log references.
+
+For control-plane windows, the isolated Host cannot authoritatively report its
+own Lost state. A caller-side observer is started first and must write a ready
+handshake before SSM fault injection is dispatched. It observes the exact Node
+transition to Lost and back to Cordoned while preserving the exact Cat claim
+and generation. The host oracle contains only host-local ledger/blockd/marker
+facts and is forbidden from claiming `node_lost_observed`. The caller writes
+`oracle-isolated-merged.json` and validates that the Lost claim comes only from
+`external-observer.json`. Observer/API disconnect, missing evidence, false
+checks, generation mismatch, or stale/reused window provenance all fail closed.
+
+DB+control-plane and all-three windows use the immutable before-fault admitted
+set plus fresh host-local evidence while both authoritative remote stores are
+unreachable. This is not treated as a control-plane Lost observation; only the
+external observer supplies that fact.
+
+## Local contracts
+
+These commands perform no AWS or production calls:
 
 ```sh
-export CATS_FAULT_MODE=live
-export CATS_FAULT_CONFIRM="RUN_Q124_FAULT_${TEMP_INSTANCE_ID}_${NODE_ID}_${CATS_FAULT_SCENARIO}"
-export CATS_REMOTE_WORKLOAD_HOOK="/opt/cats/qualification-124/${TEST_SHA}/q124-fault-workload"
-./test-results/qualification-20260805/temp-node-faults.sh
-```
+./test-results/qualification-20260805/temp-node-faults-contracts.sh
 
-Before `send-command`, the harness checks AWS account `869621413820`, uses the
-fixed known source worker as a positive control, re-reads the exact instance by
-ID, validates it against the provisioning manifest, and
-requires both the control and temporary instances to be SSM Online. The only
-SSM target is `--instance-ids "$TEMP_INSTANCE_ID"`; tags are never selectors.
-
-The harness has no security-group, RDS, S3 policy, DNS, admin-fence, or fleet
-mutation commands. No API token or secret is accepted. The SSM command contains
-only identifiers, a compressed non-secret helper, and references to two
-root-owned files. It rejects references containing `token`, `password`,
-`secret`, or `worker.env`.
-
-## Required Host references
-
-The temporary Host must already contain:
-
-- `/etc/cats/qualification-124/fault-targets.json`, root:root mode 0600. Its
-  top-level keys must be exactly `schema_version`, `db_host`, `db_port`,
-  `s3_host`, `s3_port`, `control_plane_host`, `control_plane_port`,
-  `node_listen_ip`, `node_listen_port`, `fault_duration_seconds`, and
-  `control_plane_lease_timeout_seconds`. Both durations must be integer seconds
-  from 5 through 300. No extra or secret field is accepted;
-- `/opt/cats/qualification-124/<TEST_SHA>/q124-fault-workload`, root-owned,
-  mode 0700 or 0750 and byte-identical to the version-controlled hook at that
-  exact `TEST_SHA`.
-
-Provisioning records both SHA-256 values in the manifest. Before any snapshot or
-network mutation, the helper hashes both files and itself and requires exact
-matches. It rechecks hook ownership, mode and hash immediately before every
-hook invocation, so an installed-hook replacement fails before the requested
-command. It records those values plus the local harness SHA, `TEST_SHA`, run ID,
-firewall comments and chain names in `provenance.json`. A Host-wide nonblocking
-`flock` and never-reused state directory reject concurrent or duplicate runs.
-
-The hook may read the existing Host-local root-only credential file internally.
-It must not print credentials, authorization headers, environment dumps, or
-file contents. Its interface is:
-
-```text
-snapshot --scenario S --workspace-id W --node-id N --instance-id I --output F
-ensure-cordoned --workspace-id W --node-id N --output F
-probe    --scenario S --address IP --port P
-state    --scenario S --phase before|during|after --workspace-id W --node-id N --output F
-exercise --scenario S --phase isolated|recovered --workspace-id W --node-id N --output F
-assert   --scenario S --before F --during F --after F
-```
-
-For a simultaneous scenario, `probe` also receives `--dependency D`.
-`exercise --phase isolated` receives the exact comma-separated
-`--dependencies`; each `exercise --phase partial-recovery` receives one
-`--restored-dependency` and the exact comma-separated
-`--remaining-dependencies`; the final recovered call receives the exact
-`--recovery-order`. The hook must reject unknown or reordered dependency names.
-
-The same root-only executable must also implement the HA adapter contract:
-`get NODE`, `cats NODE`, `cordon NODE`, and `uncordon NODE`. `get`, `cordon`, and
-`uncordon` write only the single administrator `NodeSummary` JSON to stdout;
-`cats` writes only the exact assigned-Cat JSON array. The executable must reject
-all other Node IDs and verbs and must not expose drain, fence, delete, or secret
-output. This lets `ha-handoff.sh` use the identical SHA-pinned adapter without a
-second credential surface. `ensure-cordoned` is its idempotent file-output
-wrapper used here after test Cats have been placed.
-
-For Relaxed Cats, the hook's read-only watermark probe receives the exact Cat,
-workspace, and Node identities and returns only `cat_id`, `node_id`, and
-non-negative integer `local_watermark`/`remote_watermark`. The hook validates
-the identities before copying the two integers into the allowlisted state JSON;
-it never stores the original response or credentials.
-
-`probe` must perform a real minimal dependency read against the exact supplied
-IP while preserving the configured TLS/DNS identity (PostgreSQL `SELECT 1`, a
-small authenticated S3 object read, or a control-plane health/read request).
-`exercise` writes a structured oracle and returns success only when the
-scenario-specific q124 workload observed every required behavior—never merely
-because the dependency call failed. The harness independently requires the
-following boolean evidence:
-
-- DB isolated: ordinary Running exec was observed; metadata/CAS, sync, Cold,
-  retrying old starts, and new starts produced no false success; no corruption.
-  Recovery must reconnect, converge pending operations, and verify the digest.
-- S3 isolated: Strict sync/Cold produced no false success; Relaxed local fsync
-  remained observable while remote sync/drain produced no false durability;
-  local/remote watermarks and unpublished counts were captured. Recovery must
-  sync both Cats, converge watermarks, reach unpublished zero, and Cold-restore
-  both digests.
-- Control-plane isolated: the hook waited lease timeout plus five seconds,
-  observed Lost and Unknown/pending, preserved claims, and proved no implicit or
-  admin fence and no generation/epoch replacement. Recovery must prove the same
-  Node identity, complete inventory, placement, generation, disk epoch, and
-  digest.
-
-Combination oracles must prove the relevant single-dependency false-success
-properties in one shared isolation window. Every pair/all-three isolated oracle
-also proves `simultaneous_window_confirmed`; combinations containing the
-control plane prove Lost without implicit/admin fence or generation/epoch
-replacement. Partial-recovery oracles prove the restored dependency is
-positive while every remaining dependency is still negative, with no false
-success and unchanged digest/generation/disk epoch. The final oracle proves the
-exact recovery order and the union of dependency reconnection, S3 convergence,
-same control-plane identity, and final digest invariants relevant to that
-combination.
-
-`assert` then checks the full before/during/after relationship as a second
-oracle.
-
-Every `state` JSON must preserve these evidence fields. S3 snapshots must have
-exactly one Strict and one Relaxed Cat entry; the other scenarios need at least
-one entry:
-
-```json
-{
-  "schema_version": 1,
-  "captured_at": "...",
-  "workspace_id": "ws_788c5bfc3931",
-  "scenario": "s3",
-  "node_id": "q124-*",
-  "cats": [
-    {
-      "cat_name": "q124-*",
-      "cat_id": "cat_*",
-      "durability": "strict",
-      "desired_state": "running",
-      "observed_state": "running",
-      "generation": 1,
-      "node_id": "q124-*",
-      "operation_ids": [],
-      "watermark": {"local": 1, "remote": 1, "unpublished": 0},
-      "disk_epoch": 1,
-      "digest": "sha256:..."
-    }
-  ],
-  "raw_operations": [
-    {"operation_id":"op_*","kind":"...","phase":"...",
-     "started_at":"...","completed_at":"...","log_ref":"journal://..."}
-  ],
-  "log_refs": ["journal://..."]
-}
-```
-
-## Fault state machine and rollback
-
-The remote helper resolves and freezes the exact A addresses before injection.
-If the Host has a default IPv6 route, it requires a non-empty AAAA set,
-successful `ip -6 route get` for every address, and equivalent `ip6tables`
-rules; an empty IPv6 resolution is a failure, not a skipped probe. It proves the
-same TCP path and the hook's
-real small read are positive, creates per-run chains and comments, then requires
-both probes to become negative. Control-plane isolation also rejects ingress
-TCP 7301 only on the temporary Host.
-
-Each fault has two independent rollback paths:
-
-1. an idempotent cleanup script invoked by the helper on success, failure, or
-   signal;
-2. a transient systemd timer scheduled for the configured fault duration plus
-   30 seconds (lease timeout plus 35 seconds for the control plane), with
-   automatic cleanup retry. The timer must be active before the first rule.
-
-In a simultaneous scenario every dependency has its own unique IPv4/IPv6
-chains and comment, its own cleanup ledger/script, and its own active transient
-timer. Address/port targets may not overlap, because an overlap would make
-per-dependency counters ambiguous. All dependencies are positively calibrated,
-then all independent faults are installed; only after all TCP and real-read
-probes are negative does the helper record `isolated-verified`. For combinations
-that include the control plane, every watchdog TTL covers at least the lease
-timeout plus the safety margin so an earlier DB/S3 timer cannot collapse the
-simultaneous window.
-
-Recovery order is fixed and evidence-checked: DB then S3 for `db-s3`; control
-plane then DB for `db-control-plane`; control plane then S3 for
-`s3-control-plane`; control plane, DB, then S3 for `all-3`. After each exact
-cleanup, the restored dependency must become positive while all remaining
-dependencies stay negative. The helper records exact injection/recovery order,
-per-dependency chain/timer/TTL provenance, every partial-recovery oracle, and a
-positive workload counter delta for every isolated dependency.
-
-After negative probes, the helper records a counter baseline. The controlled
-workload must produce a positive counter delta, proving it traversed the actual
-isolated dependency. Cleanup accumulates every xtables and save failure in a
-ledger, treats command success separately from comment absence, and never stops
-the watchdog until strict IPv4/IPv6 absence succeeds. Any cleanup error remains
-`cleanup_rc != 0` even when a retry eventually removes the rules. The helper
-removes its exact jump and chains, proves its unique comment is absent from both IPv4 and IPv6 rule
-sets, waits for the same TCP and real-read probes to recover, runs the recovery
-workload, and validates digest/convergence. A control-plane recovery additionally
-requires unchanged Cat generation, placement Node, and disk epoch. It never
-invokes admin fence.
-
-Evidence is written under
-`test-results/qualification-20260805/raw/temp-node-faults/<run-id>/`, including
-the local ownership snapshot, exact instance identity, SSM command ID, state
-snapshots, timeline, counters, and separate `functional_rc`/`cleanup_rc`.
-Remote evidence files are individually gzip-compressed before base64 transport
-and decoded before validation. Before emitting anything, the helper calculates
-the complete encoded response size and fails closed if it would exceed the
-conservative 22,000-byte SSM standard-output budget; the all-three Linux mock
-also asserts this bound. This avoids silently validating truncated evidence
-without weakening per-file schemas.
-EC2 evidence is projected to an explicit allowlist. SSM output is scanned
-quietly before persistence. The Host scans every decoded evidence file and
-emits no evidence at all if one resembles credentials, cookies, signed headers,
-access keys, private keys, credentialed URLs, or JWTs; the caller independently
-scans residual stdout/stderr and replaces it with a rejection marker on a hit.
-All JSON evidence rejects unknown fields.
-
-`CATS_FAULT_SCENARIO=all` remains only the serial three-single-fault gate and is
-not evidence for simultaneous dependency failure. Use one of the four explicit
-combination names, or `matrix`, for simultaneous evidence. Combination results
-must include `combination-provenance.json`, `combination-order.tsv`, and
-`recovery-steps.json`; the validator rejects missing, duplicate, reordered, or
-extra dependencies/events.
-
-## Local validation
-
-No AWS call is made by either command:
-
-```sh
-CATS_FAULT_MODE=dry-run \
-TEMP_INSTANCE_ID=i-0123456789abcdef0 \
-NODE_ID=q124-20260805000000-abcdef \
-CATS_OWNERSHIP_SNAPSHOT=test-results/qualification-20260805/temp-node-faults.fixture.json \
-CATS_PROVISIONING_MANIFEST=test-results/qualification-20260805/temp-node-faults.provisioning.fixture.json \
-./test-results/qualification-20260805/temp-node-faults.sh
-
-CATS_FAULT_MODE=fixture CATS_FAULT_SCENARIO=all CATS_FAULT_ALLOW_ALL=true \
-TEMP_INSTANCE_ID=i-0123456789abcdef0 \
-NODE_ID=q124-20260805000000-abcdef \
-CATS_OWNERSHIP_SNAPSHOT=test-results/qualification-20260805/temp-node-faults.fixture.json \
-CATS_PROVISIONING_MANIFEST=test-results/qualification-20260805/temp-node-faults.provisioning.fixture.json \
-./test-results/qualification-20260805/temp-node-faults.sh
-
-CATS_FAULT_MODE=fixture CATS_FAULT_SCENARIO=matrix \
-CATS_FAULT_ALLOW_ALL=true CATS_FAULT_ALLOW_COMBINED=true \
-TEMP_INSTANCE_ID=i-0123456789abcdef0 \
-NODE_ID=q124-20260805000000-abcdef \
-CATS_OWNERSHIP_SNAPSHOT=test-results/qualification-20260805/temp-node-faults.fixture.json \
-CATS_PROVISIONING_MANIFEST=test-results/qualification-20260805/temp-node-faults.provisioning.fixture.json \
-./test-results/qualification-20260805/temp-node-faults.sh
-```
-
-Fixture mode exercises the serial and combination evidence validators without
-claiming that packet filtering or production behavior was tested. Every state
-file's exact `{cat_id,name,workspace_id,node_id,durability}` set must equal its
-same-phase ownership snapshot; a schema-valid but different Cat ID is a
-required known-negative rejection.
-
-The Linux mock additionally executes the embedded remote helper and its cleanup
-script against mock xtables/systemd adapters. It covers successful isolation,
-partial chain creation, xtables-save failure and error ledger, TERM cleanup,
-KILL/SSM interruption with watchdog retry, routable IPv6 with an empty AAAA
-set, duplicate RUN_ID, a secret extra JSON field, all three simultaneous pairs,
-and the simultaneous all-three case. Combination-specific negative cases cover
-partial creation, cleanup-ledger preservation, and SIGKILL/SSM loss with all
-independent watchdogs. A transport-budget case proves oversized but otherwise
-valid evidence fails closed before emission. Cat-set mismatch and installed
-hook-replacement cases prove both failures occur closed. The 18 cases verify distinct
-chains/timers, exact partial recovery, counters, and final cleanup:
-
-```sh
 docker run --rm -v "$PWD:/work:ro" -w /work ubuntu:24.04 \
   bash -lc 'apt-get update -qq && apt-get install -y -qq jq openssl util-linux coreutils gzip >/dev/null && ./test-results/qualification-20260805/temp-node-faults-linux-mock.sh'
+
+docker run --rm -v "$PWD:/work:ro" -w /work ubuntu:24.04 \
+  bash -lc 'apt-get update -qq && apt-get install -y -qq jq python3 coreutils >/dev/null && ./test-results/qualification-20260805/q124-fault-workload-linux-contract.sh'
 ```
+
+The v2 contract covers all 13 positive windows and calibrated negatives for a
+legacy dual-Cat snapshot, trial/durability mismatch, stale ownership, missing
+or false external observer, previous-window provenance reuse, false oracle and
+Cat-scope mismatch. The remote Linux mock covers successful and partial rule
+creation, cleanup/save failures, TERM, SIGKILL/watchdog rollback, IPv6 fail
+closed, duplicate run ID, secret rejection, all combinations, transport budget
+and reviewed-hook replacement. The hook contract executes prepare RETURN
+cleanup (including re-cordon failure) and external-observer positive/API-down
+paths against deterministic adapters.

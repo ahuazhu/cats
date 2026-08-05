@@ -105,6 +105,7 @@ fi
 MOCK
 chmod 0700 "${MOCK_BIN}/xtables-mock"
 for name in iptables iptables-save ip6tables ip6tables-save; do ln -s xtables-mock "${MOCK_BIN}/${name}"; done
+ln -s /bin/true "${MOCK_BIN}/psql"
 
 cat >"${MOCK_BIN}/timeout" <<'MOCK'
 #!/usr/bin/env bash
@@ -185,11 +186,11 @@ cat >"${HOOK}" <<'MOCK'
 set -euo pipefail
 command="$1"; shift
 printf '%s\n' "${command}" >>"${MOCK_ROOT}/hook-calls.log"
-scenario=""; phase=""; output=""; node=""; instance=""; address=""; port=""
+scenario=""; trial=""; phase=""; output=""; node=""; instance=""; address=""; port=""
 restored=""; remaining=""
 while (($#)); do
   case "$1" in
-    --scenario) shift; scenario="$1" ;; --phase) shift; phase="$1" ;;
+    --scenario) shift; scenario="$1" ;; --trial) shift; trial="$1" ;; --phase) shift; phase="$1" ;;
     --output) shift; output="$1" ;; --node-id) shift; node="$1" ;;
     --instance-id) shift; instance="$1" ;;
     --address) shift; address="$1" ;; --port) shift; port="$1" ;;
@@ -207,14 +208,14 @@ case "${command}" in
       completed_at:$now,log_ref:"journal://q124/mock/cordon"}' >"${output}"
     ;;
   snapshot)
+    durability=strict; [[ "${trial}" != *-relaxed ]] || durability=relaxed
     jq -n --arg instance "${instance}" --arg node "${node}" --arg now "${now}" \
-      --arg test_sha "${Q124_TEST_SHA}" --arg scenario "${scenario}" '
+      --arg test_sha "${Q124_TEST_SHA}" --arg scenario "${scenario}" --arg durability "${durability}" '
       {schema_version:1,captured_at:$now,temp_instance_id:$instance,node_id:$node,node_state:"Cordoned",
        workspace_id:"ws_788c5bfc3931",workspace:"default/qual-124-20260805",
        tags:{Issue:"124",CatsNodeId:$node,Purpose:"qualification-124"},orphans:0,
        assigned_cats:
-         [{cat_id:"cat_mock_strict",name:"q124-mock-strict",workspace_id:"ws_788c5bfc3931",node_id:$node,durability:"strict"},
-          {cat_id:"cat_mock_relaxed",name:"q124-mock-relaxed",workspace_id:"ws_788c5bfc3931",node_id:$node,durability:"relaxed"}],
+         [{cat_id:("cat_mock_"+$durability),name:("q124-mock-"+$durability),workspace_id:"ws_788c5bfc3931",node_id:$node,durability:$durability}],
        test_sha:$test_sha,dependency_endpoints:{db_host:"fixture.cluster.us-east-1.rds.amazonaws.com",
          s3_host:"s3.us-east-1.amazonaws.com",control_plane_host:"api.cats.run",node_listen_ip:"10.0.0.124"}}' >"${output}"
     if [[ "${MOCK_SECRET_EXTRA:-false}" == true ]]; then
@@ -237,20 +238,20 @@ case "${command}" in
     ;;
   state)
     digest="sha256:mock"
+    durability=strict; [[ "${trial}" != *-relaxed ]] || durability=relaxed
     if [[ "${MOCK_LARGE_EVIDENCE:-false}" == true ]]; then
       [[ -f "${MOCK_ROOT}/large-digest" ]] || openssl rand -hex 12000 >"${MOCK_ROOT}/large-digest"
       digest="sha256:$(<"${MOCK_ROOT}/large-digest")"
     fi
-    jq -n --arg scenario "${scenario}" --arg phase "${phase}" --arg node "${node}" --arg now "${now}" \
-      --arg digest "${digest}" '
+    jq -n --arg scenario "${scenario}" --arg trial "${trial}" --arg phase "${phase}" --arg node "${node}" --arg now "${now}" \
+      --arg digest "${digest}" --arg durability "${durability}" '
       def cat($id;$name;$durability;$digest):
         {cat_id:$id,cat_name:$name,durability:$durability,desired_state:"running",
          observed_state:(if $phase=="during" then "unknown" else "running" end),generation:7,node_id:$node,
          operation_ids:["op_mock_fault"],watermark:{local:11,remote:11,unpublished:0},disk_epoch:3,digest:$digest};
-      {schema_version:1,captured_at:$now,phase:$phase,scenario:$scenario,
+      {schema_version:2,captured_at:$now,phase:$phase,scenario:$scenario,trial:$trial,
        workspace_id:"ws_788c5bfc3931",node_id:$node,
-       cats:[cat("cat_mock_strict";"q124-mock-strict";"strict";($digest + "-strict")),
-         cat("cat_mock_relaxed";"q124-mock-relaxed";"relaxed";($digest + "-relaxed"))],
+       cats:[cat(("cat_mock_"+$durability);("q124-mock-"+$durability);$durability;($digest + "-"+$durability))],
        raw_operations:[{operation_id:"op_mock_fault",kind:"mock_fault",phase:"succeeded",started_at:$now,completed_at:$now,log_ref:"journal://q124/mock/op"}],
        log_refs:["journal://q124/mock/state"]}' >"${output}"
     if [[ "${MOCK_STATE_CAT_MISMATCH:-false}" == true && "${phase}" == during ]]; then
@@ -271,8 +272,8 @@ case "${command}" in
     [[ "${MOCK_PAUSE_EXERCISE:-false}" != true || "${phase}" != isolated ]] || { touch "${MOCK_ROOT}/exercise-paused"; sleep "${MOCK_PAUSE_SECONDS:-3}"; }
     if [[ "${phase}" == partial-recovery ]]; then
       if [[ -n "${remaining}" ]]; then remaining_json="$(printf '%s' "${remaining}" | jq -R 'split(",")')"; else remaining_json='[]'; fi
-      jq -n --arg scenario "${scenario}" --arg dep "${restored}" --argjson remaining "${remaining_json}" --arg now "${now}" '
-        {schema_version:1,scenario:$scenario,phase:"partial-recovery",restored_dependency:$dep,
+      jq -n --arg scenario "${scenario}" --arg trial "${trial}" --arg dep "${restored}" --argjson remaining "${remaining_json}" --arg now "${now}" '
+        {schema_version:2,scenario:$scenario,trial:$trial,phase:"partial-recovery",restored_dependency:$dep,
          remaining_dependencies:$remaining,started_at:$now,completed_at:$now,
          checks:{restored_dependency_positive:true,remaining_dependencies_negative:true,false_success_absent:true,
            digest_preserved:true,generation_preserved:true,disk_epoch_preserved:true},
@@ -280,20 +281,25 @@ case "${command}" in
            started_at:$now,completed_at:$now,log_ref:"journal://q124/mock/partial-recovery"}],
          log_refs:["journal://q124/mock/partial-recovery"]}' >"${output}"
       exit 0
-    elif [[ "${scenario}" == db && "${phase}" == isolated ]]; then
-      checks='{"running_exec_observed":true,"metadata_cas_false_success_absent":true,"sync_false_success_absent":true,"cold_false_success_absent":true,"start_retry_or_failure_observed":true,"new_start_retry_or_failure_observed":true,"corruption_absent":true}'
+    elif [[ "${trial}:${phase}" == db-running:isolated ]]; then checks='{"running_exec_observed":true,"metadata_cas_false_success_absent":true,"sync_false_success_absent":true,"corruption_signal_absent":true}'
+    elif [[ "${trial}:${phase}" == db-cold-start:isolated ]]; then checks='{"cold_false_success_absent":true,"start_retry_or_failure_observed":true,"new_start_retry_or_failure_observed":true,"corruption_signal_absent":true}'
+    elif [[ "${phase}" == isolated && "${trial}" == *-strict ]]; then
+      if [[ "${scenario}" == *control-plane* || "${scenario}" == all-3 ]]; then checks='{"strict_fsync_false_success_absent":true,"strict_drain_false_success_absent":true,"digest_signal_preserved":true,"lease_timeout_plus_five_observed":true,"guest_io_observed":true,"local_claim_preserved":true,"local_generation_preserved":true,"local_epoch_preserved":true,"admin_fence_not_invoked":true}'
+      else checks='{"strict_sync_false_success_absent":true,"strict_cold_false_success_absent":true,"digest_signal_preserved":true}'; fi
+    elif [[ "${phase}" == isolated && "${trial}" == *-relaxed ]]; then
+      checks='{"relaxed_local_fsync_observed":true,"relaxed_sync_false_success_absent":true,"relaxed_drain_false_success_absent":true,"local_remote_watermarks_captured":true,"unpublished_captured":true}'
+      if [[ "${scenario}" == *control-plane* || "${scenario}" == all-3 ]]; then checks="$(jq -c '. + {lease_timeout_plus_five_observed:true,guest_io_observed:true,local_claim_preserved:true,local_generation_preserved:true,local_epoch_preserved:true,admin_fence_not_invoked:true}' <<<"${checks}")"; fi
+    elif [[ "${trial}:${phase}" == control-plane-running:isolated ]]; then checks='{"lease_timeout_plus_five_observed":true,"guest_io_observed":true,"local_claim_preserved":true,"local_generation_preserved":true,"local_epoch_preserved":true,"admin_fence_not_invoked":true}'
     elif [[ "${scenario}" == db ]]; then checks='{"dependency_reconnected":true,"pending_operations_converged":true,"digest_verified":true}'
-    elif [[ "${scenario}" == db-s3 && "${phase}" == isolated ]]; then checks='{"simultaneous_window_confirmed":true,"db_false_success_absent":true,"s3_strict_false_success_absent":true,"s3_relaxed_false_success_absent":true,"digests_unchanged":true}'
-    elif [[ "${scenario}" == db-s3 ]]; then checks='{"recovery_order_exact":true,"db_reconnected":true,"s3_converged":true,"final_digests_verified":true,"generation_preserved":true,"disk_epoch_preserved":true}'
-    elif [[ "${scenario}" == db-control-plane && "${phase}" == isolated ]]; then checks='{"simultaneous_window_confirmed":true,"db_false_success_absent":true,"node_lost_without_fence":true,"generation_replacement_absent":true,"epoch_replacement_absent":true,"digest_unchanged":true}'
-    elif [[ "${scenario}" == db-control-plane ]]; then checks='{"recovery_order_exact":true,"control_plane_same_identity":true,"db_reconnected":true,"final_digest_verified":true,"generation_preserved":true,"disk_epoch_preserved":true}'
-    elif [[ "${scenario}" == s3-control-plane && "${phase}" == isolated ]]; then checks='{"simultaneous_window_confirmed":true,"s3_strict_false_success_absent":true,"s3_relaxed_false_success_absent":true,"node_lost_without_fence":true,"generation_replacement_absent":true,"epoch_replacement_absent":true,"digests_unchanged":true}'
-    elif [[ "${scenario}" == s3-control-plane ]]; then checks='{"recovery_order_exact":true,"control_plane_same_identity":true,"s3_converged":true,"final_digests_verified":true,"generation_preserved":true,"disk_epoch_preserved":true}'
-    elif [[ "${scenario}" == all-3 && "${phase}" == isolated ]]; then checks='{"simultaneous_window_confirmed":true,"db_false_success_absent":true,"s3_strict_false_success_absent":true,"s3_relaxed_false_success_absent":true,"node_lost_without_fence":true,"generation_replacement_absent":true,"epoch_replacement_absent":true,"digests_unchanged":true}'
-    elif [[ "${scenario}" == all-3 ]]; then checks='{"recovery_order_exact":true,"control_plane_same_identity":true,"db_reconnected":true,"s3_converged":true,"final_digests_verified":true,"generation_preserved":true,"disk_epoch_preserved":true}'
+    elif [[ "${scenario}" == s3 ]]; then checks='{"dependency_reconnected":true,"watermarks_converged":true,"unpublished_zero":true,"cold_restore_digest_verified":true}'
+    elif [[ "${scenario}" == control-plane ]]; then checks='{"host_reconnected":true,"local_inventory_complete":true,"digest_verified":true}'
+    elif [[ "${scenario}" == db-s3 ]]; then checks='{"db_reconnected":true,"s3_converged":true,"final_digest_verified":true,"generation_preserved":true,"disk_epoch_preserved":true}'
+    elif [[ "${scenario}" == s3-control-plane ]]; then checks='{"host_reconnected":true,"s3_converged":true,"final_digest_verified":true,"generation_preserved":true,"disk_epoch_preserved":true}'
+    elif [[ "${scenario}" == db-control-plane ]]; then checks='{"host_reconnected":true,"db_reconnected":true,"final_digest_verified":true,"generation_preserved":true,"disk_epoch_preserved":true}'
+    elif [[ "${scenario}" == all-3 ]]; then checks='{"host_reconnected":true,"db_reconnected":true,"s3_converged":true,"final_digest_verified":true,"generation_preserved":true,"disk_epoch_preserved":true}'
     else exit 2; fi
-    jq -n --arg scenario "${scenario}" --arg phase "${phase}" --arg now "${now}" --argjson checks "${checks}" '
-      {schema_version:1,scenario:$scenario,phase:$phase,started_at:$now,completed_at:$now,checks:$checks,
+    jq -n --arg scenario "${scenario}" --arg trial "${trial}" --arg phase "${phase}" --arg now "${now}" --argjson checks "${checks}" '
+      {schema_version:2,scenario:$scenario,trial:$trial,phase:$phase,started_at:$now,completed_at:$now,checks:$checks,
        raw_operations:[{operation_id:"op_mock_fault",kind:"mock_exercise",phase:"succeeded",started_at:$now,completed_at:$now,log_ref:"journal://q124/mock/exercise"}],
        log_refs:["journal://q124/mock/oracle"]}' >"${output}"
     ;;
@@ -303,15 +309,18 @@ MOCK
 chmod 0700 "${HOOK}"
 
 run_remote() {
-  local run_id="$1" scenario="${2:-db}"
-  shift
-  if (($#)); then shift; fi
+  local run_id="$1" scenario="${2:-db}" trial="${3:-}"
   local -a remote_env
-  local cat_set_sha
-  (($# == 0))
-  cat_set_sha="$(jq -Sc --arg node q124-20260805000000-abcdef -n '
-    [{cat_id:"cat_mock_strict",name:"q124-mock-strict",workspace_id:"ws_788c5bfc3931",node_id:$node,durability:"strict"},
-     {cat_id:"cat_mock_relaxed",name:"q124-mock-relaxed",workspace_id:"ws_788c5bfc3931",node_id:$node,durability:"relaxed"}] |
+  local cat_set_sha durability=strict
+  if [[ -z "${trial}" ]]; then
+    case "${scenario}" in
+      db) trial=db-running ;; s3) trial=s3-strict ;; control-plane) trial=control-plane-running ;;
+      *) trial="${scenario}-strict" ;;
+    esac
+  fi
+  [[ "${trial}" != *-relaxed ]] || durability=relaxed
+  cat_set_sha="$(jq -Sc --arg node q124-20260805000000-abcdef --arg durability "${durability}" -n '
+    [{cat_id:("cat_mock_"+$durability),name:("q124-mock-"+$durability),workspace_id:"ws_788c5bfc3931",node_id:$node,durability:$durability}] |
     sort_by(.cat_id)' | sha256sum | awk '{print $1}')"
   printf '%s' "${cat_set_sha}" >"${MOCK_ROOT}/expected-cat-set-sha"
   remote_env=(env PATH="${MOCK_BIN}:/usr/sbin:/usr/bin:/sbin:/bin" MOCK_ROOT="${MOCK_ROOT}" \
@@ -322,7 +331,7 @@ run_remote() {
     MOCK_STATE_CAT_MISMATCH="${MOCK_STATE_CAT_MISMATCH:-false}" \
     MOCK_LARGE_EVIDENCE="${MOCK_LARGE_EVIDENCE:-false}" \
     MOCK_WATCHDOG_DELAY_SECONDS="${MOCK_WATCHDOG_DELAY_SECONDS:-15}" \
-    Q124_RUN_ID="${run_id}" Q124_SCENARIO="${scenario}" Q124_INSTANCE_ID=i-0123456789abcdef0 \
+    Q124_RUN_ID="${run_id}" Q124_SCENARIO="${scenario}" Q124_TRIAL="${trial}" Q124_INSTANCE_ID=i-0123456789abcdef0 \
     Q124_NODE_ID=q124-20260805000000-abcdef Q124_WORKSPACE_ID=ws_788c5bfc3931 \
     Q124_CONFIG_REF="${CONFIG}" Q124_HOOK_REF="${HOOK}" \
     Q124_TEST_SHA=1111111111111111111111111111111111111111 \
@@ -355,7 +364,7 @@ reset_mock
 run_remote mock-happy >"${TEST_ROOT}/happy.log" 2>&1 || { cat "${TEST_ROOT}/happy.log" >&2; exit 1; }
 assert_rules_absent
 sed -n 's/^Q124_STATE_AFTER=//p' "${TEST_ROOT}/happy.log" | openssl base64 -d -A | gzip -d |
-  jq -e '.schema_version == 1 and .phase == "after"' >/dev/null
+  jq -e '.schema_version == 2 and .trial == "db-running" and .phase == "after" and (.cats|length) == 1' >/dev/null
 case_result happy PASS
 
 reset_mock

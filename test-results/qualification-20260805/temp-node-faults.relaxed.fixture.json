@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-08-05T14:00:00Z",
+  "temp_instance_id": "i-0123456789abcdef0",
+  "node_id": "q124-20260805000000-abcdef",
+  "node_state": "Cordoned",
+  "workspace_id": "ws_788c5bfc3931",
+  "workspace": "default/qual-124-20260805",
+  "tags": {"Issue": "124", "CatsNodeId": "q124-20260805000000-abcdef", "Purpose": "qualification-124"},
+  "orphans": 0,
+  "assigned_cats": [{
+    "cat_id": "cat_q124_fixture_s3_relaxed",
+    "name": "q124-fixture-s3-relaxed",
+    "workspace_id": "ws_788c5bfc3931",
+    "node_id": "q124-20260805000000-abcdef",
+    "durability": "relaxed"
+  }],
+  "test_sha": "1111111111111111111111111111111111111111",
+  "dependency_endpoints": {
+    "db_host": "fixture.cluster.us-east-1.rds.amazonaws.com",
+    "s3_host": "s3.us-east-1.amazonaws.com",
+    "control_plane_host": "api.cats.run",
+    "node_listen_ip": "10.0.0.124"
+  }
+}
