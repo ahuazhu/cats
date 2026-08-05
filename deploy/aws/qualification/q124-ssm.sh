@@ -45,8 +45,6 @@ done
   || die "provenance contract differs from manifest"
 provenance_sha=$Q124_MANIFEST_PROVENANCE_SHA256
 provenance_encoded=$(base64 <"$PROVENANCE_BIN" | tr -d '\n')
-provenance_owner_uid=${Q124_PROVENANCE_OWNER_UID:-0}
-[[ $provenance_owner_uid =~ ^[0-9]+$ ]] || die "invalid provenance owner uid"
 awsq() { aws --region "$Q124_REGION" "$@"; }
 
 quote_env() {
@@ -240,12 +238,13 @@ chmod 0700 "\$bootstrap_contract" "\$provenance_contract"
 $(quote_env)
 bash "\$bootstrap_contract"
 rm -f "\$bootstrap_contract"
+bash "\$provenance_contract" --prepare-production-root $remote_source_root_q
 [[ ! -e $remote_source_root_q && ! -L $remote_source_root_q ]]
 install -d -m 0700 $remote_source_root_q
 aws --region '${Q124_REGION}' s3 cp 's3://${Q124_ARTIFACT_BUCKET}/${Q124_ARCHIVE_KEY}' /tmp/q124-source.tar.gz --only-show-errors
 printf '%s  %s\n' '${Q124_ARCHIVE_SHA256}' /tmp/q124-source.tar.gz | sha256sum -c -
-tar -xzf /tmp/q124-source.tar.gz -C $remote_source_root_q
-Q124_PROVENANCE_OWNER_UID='${provenance_owner_uid}' bash "\$provenance_contract" $remote_source_root_q \
+tar -xzf /tmp/q124-source.tar.gz -C $remote_source_root_q --no-same-owner
+bash "\$provenance_contract" --production $remote_source_root_q \
   'deploy/aws/qualification/q124-remote.sh=${Q124_MANIFEST_REMOTE_SHA256}' \
   'deploy/aws/qualification/q124-device-proof.sh=${Q124_MANIFEST_DEVICE_PROOF_SHA256}' \
   'deploy/aws/metal/install-worker.sh=${Q124_MANIFEST_INSTALL_WORKER_SHA256}' \
@@ -266,7 +265,7 @@ chmod 0700 "\$provenance_contract"
 $(quote_env)
 export AWS_REGION='${Q124_REGION}' AWS_DEFAULT_REGION='${Q124_REGION}'
 export Q124_SOURCE_ROOT=$remote_source_root_q
-Q124_PROVENANCE_OWNER_UID='${provenance_owner_uid}' bash "\$provenance_contract" $remote_source_root_q \
+bash "\$provenance_contract" --production $remote_source_root_q \
   'deploy/aws/qualification/q124-remote.sh=${Q124_MANIFEST_REMOTE_SHA256}' \
   'deploy/aws/qualification/q124-device-proof.sh=${Q124_MANIFEST_DEVICE_PROOF_SHA256}' \
   'deploy/aws/metal/install-worker.sh=${Q124_MANIFEST_INSTALL_WORKER_SHA256}' \

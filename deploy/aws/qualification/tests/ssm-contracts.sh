@@ -3,7 +3,8 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../../.." && pwd)
 SSM=$HERE/../q124-ssm.sh
-TMP=$(mktemp -d)
+TMP=$(mktemp -d "$HERE/.ssm-fixture.XXXXXX")
+TMP=$(cd "$TMP" && pwd -P)
 trap 'printf "q124 SSM contract failed at line %s\n" "$LINENO" >&2' ERR
 cleanup() {
   rc=$?
@@ -16,7 +17,7 @@ cleanup() {
   exit "$rc"
 }
 trap cleanup EXIT
-mkdir -p "$TMP/outer" "$TMP/remote" "$TMP/source" "$TMP/config" "$TMP/marker"
+mkdir -p "$TMP/outer" "$TMP/remote" "$TMP/config" "$TMP/marker"
 printf '#!/usr/bin/env bash\nexec %q "$@"\n' "$HERE/fake-ssm-aws.sh" >"$TMP/outer/aws"
 chmod 0755 "$TMP/outer/aws"
 for kind in apt-get curl unzip systemctl true probe uname flock timeout; do
@@ -39,7 +40,11 @@ Q124_MANIFEST_INSTALL_WORKER_SHA256=$(sha256sum "$ROOT/deploy/aws/metal/install-
 Q124_MANIFEST_REQUIRE_IDLE_SHA256=$(sha256sum "$ROOT/deploy/aws/metal/require-idle-worker.sh" | awk '{print $1}')
 Q124_MANIFEST_BOOTSTRAP_SHA256=$(sha256sum "$ROOT/deploy/aws/qualification/q124-bootstrap-prereqs.sh" | awk '{print $1}')
 Q124_MANIFEST_COMMAND_GUARD_SHA256=$(sha256sum "$ROOT/deploy/aws/qualification/q124-command-guard.sh" | awk '{print $1}')
-Q124_MANIFEST_PROVENANCE_SHA256=$(sha256sum "$ROOT/deploy/aws/qualification/q124-provenance.sh" | awk '{print $1}')
+export Q124_PROVENANCE_BIN=$HERE/fixture-provenance.sh
+export Q124_PROVENANCE_FIXTURE_REAL=$ROOT/deploy/aws/qualification/q124-provenance.sh
+export Q124_PROVENANCE_FIXTURE_UID
+Q124_PROVENANCE_FIXTURE_UID=$(id -u)
+Q124_MANIFEST_PROVENANCE_SHA256=$(sha256sum "$Q124_PROVENANCE_BIN" | awk '{print $1}')
 cp "$HERE/fake-ssm-evidence.sh" "$TMP/fake-ssm-evidence.sh"
 chmod 0755 "$TMP/fake-ssm-evidence.sh"
 Q124_MANIFEST_SSM_EVIDENCE_SHA256=$(sha256sum "$TMP/fake-ssm-evidence.sh" | awk '{print $1}')
@@ -65,8 +70,6 @@ export Q124_CAPTURED_COMMAND=$TMP/command.sh Q124_SSM_STDOUT=$TMP/stdout Q124_SS
 export Q124_SSM_FAKE_STATE=$TMP/ssm-state.json Q124_SSM_EVIDENCE_JOURNAL=$TMP/ssm-evidence.jsonl
 export Q124_SSM_EVIDENCE_BIN=$TMP/fake-ssm-evidence.sh Q124_BOOTSTRAP_CALL_LOG=$TMP/bootstrap.log
 export Q124_COMMAND_GUARD_DIR=$TMP/guard Q124_SSM_INTENT_NONCE=0124abcd0124abcd0124abcd0124abcd
-export Q124_PROVENANCE_OWNER_UID
-Q124_PROVENANCE_OWNER_UID=$(id -u)
 export Q124_SSM_EXECUTION_TIMEOUT_SECONDS=60 Q124_SSM_DELIVERY_TIMEOUT_SECONDS=30 Q124_SSM_POLL_TIMEOUT_SECONDS=60
 export Q124_SSM_CANCEL_TIMEOUT_SECONDS=5 Q124_SSM_POLL_INTERVAL_SECONDS=0
 : >"$Q124_SSM_EVIDENCE_JOURNAL"
