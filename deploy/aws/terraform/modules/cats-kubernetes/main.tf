@@ -212,6 +212,11 @@ resource "aws_dlm_lifecycle_policy" "control_data" {
       }
     }
   }
+
+  # The role reference above only orders this policy after the role itself.
+  # Without this, the initial apply can create the policy before the
+  # attachment that gives the role its snapshot permissions.
+  depends_on = [aws_iam_role_policy_attachment.control_data_snapshots]
 }
 
 resource "kubernetes_service_account_v1" "control_plane" {
