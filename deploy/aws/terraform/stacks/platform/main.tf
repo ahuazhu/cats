@@ -462,7 +462,7 @@ resource "aws_instance" "metal_worker" {
 
   ami                    = var.metal_worker_ami
   instance_type          = var.metal_worker_instance_type
-  subnet_id              = module.network.private_subnet_ids[0]
+  subnet_id              = module.network.private_subnet_ids[count.index % length(module.network.private_subnet_ids)]
   vpc_security_group_ids = [aws_security_group.metal_worker.id]
   iam_instance_profile   = aws_iam_instance_profile.metal_worker.name
 

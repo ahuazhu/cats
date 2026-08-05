@@ -247,6 +247,11 @@ variable "metal_worker_instance_count" {
   description = "Bare-metal workers managed by this stack."
   type        = number
   default     = 1
+
+  validation {
+    condition     = var.metal_worker_instance_count >= 1 && floor(var.metal_worker_instance_count) == var.metal_worker_instance_count
+    error_message = "metal_worker_instance_count must be a positive integer."
+  }
 }
 
 variable "metal_worker_names" {
@@ -259,6 +264,14 @@ variable "metal_worker_names" {
   EOT
   type        = list(string)
   default     = []
+
+  validation {
+    condition = (
+      length(var.metal_worker_names) == length(distinct(var.metal_worker_names)) &&
+      alltrue([for name in var.metal_worker_names : length(trimspace(name)) > 0])
+    )
+    error_message = "metal_worker_names must contain only non-empty, unique names."
+  }
 }
 
 variable "metal_worker_instance_type" {

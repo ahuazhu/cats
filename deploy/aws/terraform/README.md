@@ -11,7 +11,7 @@ No cloud resource is created merely by checking in this directory.
 | Directory | State boundary | Owns |
 |---|---|---|
 | `bootstrap/` | bootstrap state | Versioned, encrypted, private S3 state bucket |
-| `stacks/platform/` | platform state | VPC, EKS cluster, RDS PostgreSQL, Route 53 zone, ACM certificate, ECR repository, bare-metal worker security group, GitHub Actions release role |
+| `stacks/platform/` | platform state | VPC, EKS cluster, RDS PostgreSQL, Route 53 zone, ACM certificate, ECR repository, bare-metal worker capacity and security group, GitHub Actions release role |
 | `stacks/production-infrastructure/` | infrastructure state | Usage stream/archive/checkpoints, Pod Identity, alarms, worker artifacts/secrets/SSM deployment |
 | `stacks/production-payments/` | payments state | Stripe prepaid-credit Product, fixed one-time Prices and signed webhook endpoint |
 | `stacks/production-application/` | application state | Cats Namespace/ServiceAccount, Secret/ConfigMap, EBS PVC, Deployments, Services and public ingress |
@@ -27,9 +27,10 @@ a Terraform data source never stands in for ownership. In an account where they
 already exist by hand, declare them from their exact live configuration and
 import them before Terraform changes anything.
 
-The ChunkStore bucket and the bare-metal instances themselves remain outside
-Terraform. The instances are long-lived capacity referenced by id; the platform
-state owns only the security group that positions them on the network.
+The platform state owns the long-lived bare-metal instances and places adjacent
+workers in different private subnets. The production-infrastructure state
+references those instances by stable name and ID to roll reviewed worker
+bundles across the fleet.
 
 Apply order is `bootstrap` → `platform` → `production-infrastructure` →
 `production-application`. Bootstrap comes first and keeps local state because it
