@@ -17,6 +17,7 @@ ExecStart=/opt/cats/bin/cats-noded \
   --node-id $CATS_NODE_ID \
   --listen 0.0.0.0:7301 \
   --advertise-url $CATS_NODE_ADVERTISE_URL \
+  --initially-cordoned \
   --control-plane-url $CATS_CONTROL_PLANE_URL \
   --gateway-url $CATS_GATEWAY_URL \
   --state-dir /var/lib/cats/node \

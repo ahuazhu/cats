@@ -139,6 +139,7 @@ fn server_config(node: NodeConfig, root: &Path, control_plane_url: String) -> Se
         gateway_url: "http://127.0.0.1:1".into(),
         cpus: 4,
         memory_mib: 4_096,
+        initially_cordoned: false,
         heartbeat_ms: HEARTBEAT_MS,
         node,
         storage_meta,
@@ -340,6 +341,37 @@ async fn the_agent_registers_once_the_control_plane_comes_back() {
         "registration succeeded but heartbeats never followed"
     );
     assert_eq!(healthz(&handle).await, StatusCode::OK);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registration_forwards_the_initially_cordoned_setting() {
+    let root = tempfile::tempdir().expect("test root");
+    let stub = StubControlPlane::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the stub control plane");
+    let address = listener.local_addr().expect("stub address");
+    let server = stub.serve(listener);
+
+    let mut config = server_config(
+        node_config(root.path(), "node_initially_cordoned"),
+        root.path(),
+        format!("http://{address}"),
+    );
+    config.initially_cordoned = true;
+    let handle = spawn(config).await.expect("start the node agent");
+
+    assert!(
+        poll_until(Duration::from_secs(10), || !stub.registrations().is_empty()).await,
+        "the agent never registered"
+    );
+    assert!(
+        stub.registrations()[0].initially_cordoned,
+        "the node agent dropped the fail-closed admission setting"
+    );
+
+    drop(handle);
     server.abort();
 }
 

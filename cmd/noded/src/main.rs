@@ -43,6 +43,10 @@ struct Args {
     /// Schedulable memory in MiB. Defaults to the detected host total.
     #[arg(long, env = "CATS_NODE_MEMORY_MIB")]
     memory_mib: Option<u64>,
+    /// Keep a newly registered node out of placement until an administrator
+    /// explicitly uncordons it. Re-registration never overrides admin state.
+    #[arg(long, default_value_t = false)]
+    initially_cordoned: bool,
     #[arg(long, default_value_t = 1000)]
     heartbeat_ms: u64,
     #[arg(long, default_value_t = 1500)]
@@ -201,6 +205,7 @@ async fn main() -> anyhow::Result<()> {
         gateway_url: args.gateway_url,
         cpus,
         memory_mib,
+        initially_cordoned: args.initially_cordoned,
         heartbeat_ms: args.heartbeat_ms,
         node: NodeConfig {
             node_id: args.node_id,

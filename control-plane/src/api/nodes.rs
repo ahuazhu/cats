@@ -12,6 +12,7 @@ pub(super) async fn register_node(
         &req.gateway_url,
         req.cpus,
         req.memory_mib,
+        req.initially_cordoned,
     )?;
     state.notify.notify_one();
     Ok(StatusCode::NO_CONTENT)

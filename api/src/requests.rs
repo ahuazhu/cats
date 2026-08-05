@@ -194,7 +194,7 @@ pub struct UpdateExpiryRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::CreateCatRequest;
+    use super::{CreateCatRequest, RegisterNodeRequest};
 
     #[test]
     fn create_cat_defaults_to_auto_suspend() {
@@ -204,6 +204,22 @@ mod tests {
         }))
         .unwrap();
         assert!(request.auto_suspend);
+    }
+
+    #[test]
+    fn legacy_node_registration_defaults_to_ready_admission() {
+        let request: RegisterNodeRequest = serde_json::from_str(
+            r#"{
+                "node_id":"node-a",
+                "agent_url":"http://127.0.0.1:7301",
+                "gateway_url":"http://127.0.0.1:7301",
+                "cpus":4,
+                "memory_mib":4096
+            }"#,
+        )
+        .expect("deserialize the legacy registration payload");
+
+        assert!(!request.initially_cordoned);
     }
 }
 
@@ -285,6 +301,11 @@ pub struct RegisterNodeRequest {
     pub gateway_url: String,
     pub cpus: u32,
     pub memory_mib: u64,
+    /// Only controls the scheduling state of a node the control plane has
+    /// never seen. Re-registration preserves the administrator's existing
+    /// cordon decision.
+    #[serde(default)]
+    pub initially_cordoned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

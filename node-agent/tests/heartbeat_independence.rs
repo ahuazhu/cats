@@ -122,6 +122,7 @@ async fn start_agent(
         gateway_url: "http://127.0.0.1:1".into(),
         cpus: 4,
         memory_mib: 4096,
+        initially_cordoned: false,
         heartbeat_ms: HEARTBEAT_MS,
         storage_meta,
         node: fake_node_config!(

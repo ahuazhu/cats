@@ -273,6 +273,7 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
             gateway_url: format!("http://{addr}"),
             cpus: 16,
             memory_mib: 32_768,
+            initially_cordoned: false,
         })
         .send()
         .await
@@ -1504,6 +1505,7 @@ async fn node_loss_preserves_claim_until_fencing_is_explicitly_confirmed() {
             gateway_url: registered.gateway_url.clone(),
             cpus: registered.capacity.cpus,
             memory_mib: registered.capacity.memory_mib,
+            initially_cordoned: false,
         },
     )
     .await;
@@ -1685,6 +1687,7 @@ async fn control_plane_startup_grace_preserves_a_reconnecting_host_bound_cat() {
                 "http://gateway.invalid",
                 16,
                 32_768,
+                false,
             )
             .unwrap();
         let (cat, _, _) = store
@@ -2528,6 +2531,7 @@ async fn admin_can_monitor_and_drain_nodes() {
             gateway_url: "http://gateway.invalid".into(),
             cpus: 8,
             memory_mib: 16_384,
+            initially_cordoned: false,
         })
         .send()
         .await
