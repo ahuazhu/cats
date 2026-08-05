@@ -11,6 +11,11 @@ CATS_CH_VERSION=${CATS_CH_VERSION:-v53.0}
 [[ $(uname -m) == x86_64 ]] || { echo "x86_64 is required" >&2; exit 1; }
 [[ -e /dev/kvm ]] || { echo "/dev/kvm missing: use a bare-metal instance" >&2; exit 1; }
 
+# SSM RunShellScript and cloud-init use non-login root shells where HOME may
+# be absent. rustup and cargo still need a stable home before the guest-image
+# builder runs, so make the root-only install contract explicit.
+export HOME="${HOME:-/root}"
+
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
 apt-get install -qy build-essential curl nbd-client busybox-static musl-tools \
