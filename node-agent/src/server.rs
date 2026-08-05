@@ -99,6 +99,9 @@ pub struct ServerConfig {
     pub gateway_url: String,
     pub cpus: u32,
     pub memory_mib: u64,
+    /// Ask the control plane to keep only a never-before-seen node out of
+    /// placement until an administrator validates and uncordons it.
+    pub initially_cordoned: bool,
     pub heartbeat_ms: u64,
     pub node: NodeConfig,
     pub storage_meta: Arc<dyn MetadataStore>,
@@ -1899,6 +1902,7 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
         gateway_url: cfg.gateway_url.clone(),
         cpus: cfg.cpus,
         memory_mib: cfg.memory_mib,
+        initially_cordoned: cfg.initially_cordoned,
     };
     let cp = cfg.control_plane_url.trim_end_matches('/').to_string();
     let token = cfg.auth_token.clone();

@@ -276,7 +276,7 @@ fn heartbeat_reported_inventory_round_trips_and_diffs_orphans() {
     let workspace = bootstrap_workspace(&store, "acme");
     let (cat, _, _) = create_test_cat(&store, &workspace, "assigned").unwrap();
     store
-        .register_node("node_a", "http://node", "http://gateway", 4, 8192)
+        .register_node("node_a", "http://node", "http://gateway", 4, 8192, false)
         .unwrap();
     store.set_placement(&cat.id, Some("node_a")).unwrap();
 
@@ -315,7 +315,14 @@ fn heartbeat_reported_inventory_round_trips_and_diffs_orphans() {
 
     // Re-registration wipes the report: the fresh agent has said nothing yet.
     store
-        .register_node("node_a", "http://node-new", "http://gateway", 4, 8192)
+        .register_node(
+            "node_a",
+            "http://node-new",
+            "http://gateway",
+            4,
+            8192,
+            false,
+        )
         .unwrap();
     assert!(store.reported_cats("node_a").unwrap().is_empty());
 
@@ -771,13 +778,20 @@ fn every_cat_gets_a_default_public_endpoint() {
 fn a_cordoned_node_stays_unschedulable_across_a_lost_recovery_cycle() {
     let store = test_store();
     store
-        .register_node("node_a", "http://node", "http://gateway", 4, 8192)
+        .register_node("node_a", "http://node", "http://gateway", 4, 8192, false)
         .unwrap();
     store.set_node_state("node_a", NodeState::Cordoned).unwrap();
 
     store.set_node_state("node_a", NodeState::Lost).unwrap();
     store
-        .register_node("node_a", "http://node-new", "http://gateway", 4, 8192)
+        .register_node(
+            "node_a",
+            "http://node-new",
+            "http://gateway",
+            4,
+            8192,
+            false,
+        )
         .unwrap();
     assert_eq!(
         store.get_node("node_a").unwrap().state,
@@ -804,15 +818,117 @@ fn a_cordoned_node_stays_unschedulable_across_a_lost_recovery_cycle() {
 }
 
 #[test]
+fn a_fresh_initially_cordoned_node_is_excluded_from_placement() {
+    let store = test_store();
+    let workspace = bootstrap_workspace(&store, "alpha");
+    let (cat, _, _) = create_test_cat(&store, &workspace, "waiting").unwrap();
+
+    store
+        .register_node("node_a", "http://node", "http://gateway", 4, 8192, true)
+        .unwrap();
+    assert_eq!(store.get_node("node_a").unwrap().state, NodeState::Cordoned);
+    assert!(
+        store
+            .claim_node_for(&cat.id, 1, 256, 60_000, now_ms())
+            .unwrap()
+            .is_none(),
+        "an initially-cordoned node must never enter placement"
+    );
+
+    store.set_node_state("node_a", NodeState::Ready).unwrap();
+    assert_eq!(
+        store
+            .claim_node_for(&cat.id, 1, 256, 60_000, now_ms())
+            .unwrap()
+            .map(|node| node.id),
+        Some("node_a".into()),
+        "explicit administrator admission makes the validated node schedulable"
+    );
+}
+
+#[test]
+fn initially_cordoned_only_applies_to_a_new_node_registration() {
+    let store = test_store();
+
+    store
+        .register_node(
+            "node_ready",
+            "http://node",
+            "http://gateway",
+            4,
+            8192,
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        store.get_node("node_ready").unwrap().state,
+        NodeState::Ready,
+        "an unflagged fresh registration retains the existing behavior"
+    );
+
+    store
+        .register_node(
+            "node_cordoned",
+            "http://node",
+            "http://gateway",
+            4,
+            8192,
+            true,
+        )
+        .unwrap();
+    store
+        .register_node(
+            "node_cordoned",
+            "http://node-new",
+            "http://gateway",
+            4,
+            8192,
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        store.get_node("node_cordoned").unwrap().state,
+        NodeState::Cordoned,
+        "an unflagged re-registration must not undo the control-plane cordon"
+    );
+
+    store
+        .set_node_state("node_cordoned", NodeState::Ready)
+        .unwrap();
+    store
+        .register_node(
+            "node_cordoned",
+            "http://node-newer",
+            "http://gateway",
+            4,
+            8192,
+            true,
+        )
+        .unwrap();
+    assert_eq!(
+        store.get_node("node_cordoned").unwrap().state,
+        NodeState::Ready,
+        "the bootstrap flag must not re-cordon a node an administrator admitted"
+    );
+}
+
+#[test]
 fn a_fenced_node_identity_cannot_reregister_or_heartbeat_back_to_ready() {
     let store = test_store();
     store
-        .register_node("node_a", "http://node", "http://gateway", 4, 8192)
+        .register_node("node_a", "http://node", "http://gateway", 4, 8192, false)
         .unwrap();
     store.set_node_state("node_a", NodeState::Fenced).unwrap();
 
     store
-        .register_node("node_a", "http://node-new", "http://gateway", 4, 8192)
+        .register_node(
+            "node_a",
+            "http://node-new",
+            "http://gateway",
+            4,
+            8192,
+            false,
+        )
         .unwrap();
     store.heartbeat_node("node_a", None, &[]).unwrap();
     store.set_node_state("node_a", NodeState::Ready).unwrap();
@@ -849,7 +965,7 @@ fn last_guest_work_release_is_immediately_suspend_eligible() {
     assert_eq!(route.target_port, 3000);
     assert_eq!(route.epoch, 1);
     store
-        .register_node("node-1", "http://node", "http://gateway", 4, 8192)
+        .register_node("node-1", "http://node", "http://gateway", 4, 8192, false)
         .unwrap();
     store.set_placement(&cat.id, Some("node-1")).unwrap();
     store.set_observed(&cat.id, ObservedState::Running).unwrap();
@@ -899,7 +1015,7 @@ fn concurrent_placement_cannot_overcommit_a_node() {
     let workspace = bootstrap_workspace(&stores[0], "alpha");
     // Room for exactly 4 of these Cats: 8 cpus / 8192 MiB, 2 cpus each.
     stores[0]
-        .register_node("node-1", "http://node", "http://gateway", 8, 8192)
+        .register_node("node-1", "http://node", "http://gateway", 8, 8192, false)
         .unwrap();
     let mut ids = Vec::new();
     for n in 0..10 {
@@ -955,7 +1071,7 @@ fn gateway_work_blocks_auto_suspend_and_wake_is_singleflight() {
     let workspace = bootstrap_workspace(&store, "alpha");
     let (cat, _, _) = create_test_cat(&store, &workspace, "web").unwrap();
     store
-        .register_node("node-1", "http://node", "http://gateway", 4, 8192)
+        .register_node("node-1", "http://node", "http://gateway", 4, 8192, false)
         .unwrap();
     store.set_placement(&cat.id, Some("node-1")).unwrap();
     store.set_observed(&cat.id, ObservedState::Running).unwrap();
@@ -990,7 +1106,7 @@ fn guest_work_cancels_an_inflight_suspend_without_generation_drift() {
     let workspace = bootstrap_workspace(&store, "alpha");
     let (cat, _, _) = create_test_cat(&store, &workspace, "racer").unwrap();
     store
-        .register_node("node-1", "http://node", "http://gateway", 4, 8192)
+        .register_node("node-1", "http://node", "http://gateway", 4, 8192, false)
         .unwrap();
     store.set_placement(&cat.id, Some("node-1")).unwrap();
     store.set_observed(&cat.id, ObservedState::Running).unwrap();

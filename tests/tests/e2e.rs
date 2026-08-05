@@ -124,6 +124,7 @@ impl Cluster {
             gateway_url: gateway.base_url(),
             cpus: 16,
             memory_mib: 32_768,
+            initially_cordoned: false,
             heartbeat_ms: 300,
             storage_meta,
             node: fake_node_config!(NodeConfigBuilder::new(dir.path(), id.to_string())

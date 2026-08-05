@@ -12,6 +12,7 @@ impl Store {
         gateway_url: &str,
         cpus: u32,
         memory_mib: u64,
+        initially_cordoned: bool,
     ) -> Result<()> {
         let now = now_ms();
         let cpus = cpus as i64;
@@ -21,9 +22,13 @@ impl Store {
                 .execute(
                     "INSERT INTO nodes (id, agent_url, gateway_url, state, cpus, memory_mib,
                                         last_heartbeat_ms, scheduling_disabled)
-                     VALUES ($1,$2,$3,'ready',$4,$5,$6,FALSE)
+                     VALUES ($1,$2,$3,
+                             CASE WHEN $7 THEN 'cordoned' ELSE 'ready' END,
+                             $4,$5,$6,$7)
                      ON CONFLICT(id) DO UPDATE SET
                        agent_url=$2, gateway_url=$3,
+                       -- $7 is intentionally insert-only. Once this row exists,
+                       -- scheduling state belongs to the control plane/admin.
                        state=CASE
                            WHEN nodes.state='draining' THEN 'draining'
                            WHEN nodes.state='fenced' THEN 'fenced'
@@ -33,7 +38,15 @@ impl Store {
                        END,
                        cpus=$4, memory_mib=$5, last_heartbeat_ms=$6,
                        reported_cats_json=NULL",
-                    &[&node_id, &agent_url, &gateway_url, &cpus, &memory_mib, &now],
+                    &[
+                        &node_id,
+                        &agent_url,
+                        &gateway_url,
+                        &cpus,
+                        &memory_mib,
+                        &now,
+                        &initially_cordoned,
+                    ],
                 )
                 .map(|_| ())
         })

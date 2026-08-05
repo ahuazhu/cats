@@ -64,6 +64,16 @@ fn deployment_units_pin_kvm_clock_too() {
 }
 
 #[test]
+fn production_aws_worker_joins_initially_cordoned() {
+    let unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
+    assert!(
+        unit.lines()
+            .any(|line| line.trim() == "--initially-cordoned \\"),
+        "a fresh production worker must be unschedulable until an administrator validates and uncordons it"
+    );
+}
+
+#[test]
 fn guest_image_installs_real_systemd_units_with_early_agent_readiness() {
     let builder = read_workspace_file("deploy/metal/build-guest-image.sh");
     for required in [
