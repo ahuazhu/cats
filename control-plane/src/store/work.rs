@@ -149,7 +149,7 @@ impl Store {
             let cat: Option<(String, i64, String, String, Option<String>)> = tx
                 .query_opt(
                     "SELECT workspace_id, generation, desired_state, observed_state, node_id
-                 FROM cats WHERE id=$1",
+                 FROM cats WHERE id=$1 FOR UPDATE",
                     &[&request.cat_id],
                 )
                 .map_err(internal)?

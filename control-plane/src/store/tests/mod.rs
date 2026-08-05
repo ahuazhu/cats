@@ -2,7 +2,7 @@ use super::*;
 use cats_api::guest::GuestWorkLease;
 use cats_api::requests::NodeWorkStatusRequest;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 
 struct ActiveSingletonGuard {
     active: Arc<AtomicUsize>,
@@ -1342,6 +1342,128 @@ fn guest_work_cancels_an_inflight_suspend_without_generation_drift() {
         store.get_operation(&auto.id).unwrap().phase,
         OperationPhase::Failed
     );
+}
+
+#[test]
+fn stale_guest_work_cannot_overwrite_a_concurrent_lifecycle_generation() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let store = Store::connect(&url, None).unwrap();
+    let ingest_url = format!("{url}&application_name=q190_guest_work");
+    let ingest_store = Store::connect(&ingest_url, None).unwrap();
+    let observer = Store::connect(&url, None).unwrap();
+    let workspace = bootstrap_workspace(&store, "guest-work-cas");
+    let (cat, _, create) = create_test_cat(&store, &workspace, "guest-work-cas").unwrap();
+    store
+        .register_node("node-1", "http://node", "http://gateway", 4, 8192, false)
+        .unwrap();
+    store.set_placement(&cat.id, Some("node-1")).unwrap();
+    store.set_observed(&cat.id, ObservedState::Running).unwrap();
+    store.finish_operation(&create.id, None).unwrap();
+    let suspend = store
+        .set_desired(&cat.id, DesiredState::Suspended, None, "cat.suspend")
+        .unwrap();
+    store
+        .set_observed(&cat.id, ObservedState::Suspended)
+        .unwrap();
+    store.finish_operation(&suspend.id, None).unwrap();
+
+    // Hold the Cat authority and the first table Guest work touches after its
+    // Cat read. Without a row-locking read, Guest work observes generation 2,
+    // waits on cat_work_sources, and later overwrites this committed Cold
+    // request with a second, conflicting generation-3 operation. With the
+    // lock, it waits before reading and rejects its generation-2 report after
+    // the newer authority commits.
+    let cat_id = cat.id.clone();
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let lifecycle = std::thread::spawn(move || {
+        store
+            .enter(move |client| {
+                let client = client?;
+                let mut tx = client.transaction().map_err(internal)?;
+                let row = tx
+                    .query_one(
+                        "SELECT workspace_id, generation FROM cats WHERE id=$1 FOR UPDATE",
+                        &[&cat_id],
+                    )
+                    .map_err(internal)?;
+                let workspace_id: String = row.try_get(0).map_err(internal)?;
+                let generation: i64 = row.try_get(1).map_err(internal)?;
+                assert_eq!(generation, 2);
+                let next = generation + 1;
+                tx.execute(
+                    "UPDATE cats SET desired_state='cold', generation=$2 WHERE id=$1",
+                    &[&cat_id, &next],
+                )
+                .map_err(internal)?;
+                let operation =
+                    Store::insert_operation(&mut tx, &workspace_id, "cat.stop", &cat_id, next)?;
+                tx.batch_execute("LOCK TABLE cat_work_sources IN ACCESS EXCLUSIVE MODE")
+                    .map_err(internal)?;
+                locked_tx.send(operation.id).unwrap();
+                release_rx.recv().unwrap();
+                tx.commit().map_err(internal)
+            })
+            .unwrap();
+    });
+    let stop_operation_id = locked_rx.recv().unwrap();
+
+    let report_cat_id = cat.id.clone();
+    let guest = std::thread::spawn(move || {
+        ingest_store.ingest_guest_work(&NodeWorkStatusRequest {
+            node_id: "node-1".into(),
+            cat_id: report_cat_id,
+            generation: 2,
+            guest_source_epoch: "guest-before-cold".into(),
+            guest_lease_sequence: 1,
+            leases: vec![GuestWorkLease {
+                id: "active-request".into(),
+                label: "active-request".into(),
+                remaining_ttl_ms: 5_000,
+            }],
+        })
+    });
+
+    let mut guest_waited_on_the_lifecycle_transaction = false;
+    for _ in 0..200 {
+        guest_waited_on_the_lifecycle_transaction = observer
+            .with(|client| {
+                client
+                    .query_one(
+                        "SELECT EXISTS (
+                            SELECT 1 FROM pg_stat_activity
+                             WHERE application_name='q190_guest_work'
+                               AND state='active' AND wait_event IS NOT NULL
+                         )",
+                        &[],
+                    )?
+                    .try_get(0)
+            })
+            .unwrap();
+        if guest_waited_on_the_lifecycle_transaction {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    release_tx.send(()).unwrap();
+    lifecycle.join().unwrap();
+    assert!(
+        guest_waited_on_the_lifecycle_transaction,
+        "the fixture never established the concurrent Cat-authority window"
+    );
+    assert!(
+        guest.join().unwrap().is_err(),
+        "a generation-2 Guest report must not supersede committed generation 3"
+    );
+
+    let current = observer.must_get_cat_by_id(&cat.id).unwrap();
+    assert_eq!(current.desired_state, DesiredState::Cold);
+    assert_eq!(current.generation, 3);
+    let operations = observer.pending_operations_for(&cat.id).unwrap();
+    assert_eq!(operations.len(), 1, "stale Guest work added an operation");
+    assert_eq!(operations[0].id, stop_operation_id);
+    assert_eq!(operations[0].kind, "cat.stop");
+    assert_eq!(operations[0].resource_generation, 3);
 }
 
 #[test]
