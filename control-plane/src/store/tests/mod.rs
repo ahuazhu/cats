@@ -1618,6 +1618,56 @@ fn late_old_generation_result_cannot_clear_or_complete_the_new_dispatch() {
 }
 
 #[test]
+fn delete_successor_stop_inherits_the_superseded_dispatch_writer_authority() {
+    let store = test_store();
+    let workspace = bootstrap_workspace(&store, "delete-successor-stop-leases");
+    let (cat, _, create) =
+        create_test_cat(&store, &workspace, "delete-successor-stop-leases").unwrap();
+    place_running_cat(&store, &cat, "delete-successor-node");
+    store.finish_operation(&create.id, None).unwrap();
+    let suspend = store
+        .set_desired(&cat.id, DesiredState::Suspended, None, "cat.suspend")
+        .unwrap();
+    let leases = vec![VolumeLeaseAuthority {
+        volume_id: "vol-successor".into(),
+        attachment_id: "att-successor-old".into(),
+        epoch: 41,
+    }];
+    let dispatch = store
+        .begin_lifecycle_dispatch(
+            &cat.id,
+            "delete-successor-node",
+            ObservedState::Running,
+            ObservedState::Suspending,
+            ObservedState::Suspended,
+            leases.clone(),
+            NodeJob {
+                job_id: job_id(&cat.id, suspend.resource_generation, "suspend_cat"),
+                cat_generation: suspend.resource_generation,
+                action: NodeJobAction::SuspendCat {
+                    cat_id: cat.id.clone(),
+                    work_fence: None,
+                },
+            },
+        )
+        .unwrap()
+        .unwrap();
+    let delete = store
+        .set_desired(&cat.id, DesiredState::Deleted, None, "cat.delete")
+        .unwrap();
+    assert!(store
+        .settle_lifecycle_dispatch(&dispatch, ObservedState::Suspended, true, None, None, false,)
+        .unwrap());
+    let successor = store.lifecycle_dispatch(&cat.id).unwrap().unwrap();
+    assert_eq!(successor.job.cat_generation, delete.resource_generation);
+    assert!(matches!(
+        successor.job.action,
+        NodeJobAction::StopCat { .. }
+    ));
+    assert_eq!(successor.volume_leases, leases);
+}
+
+#[test]
 fn confirmed_fence_atomically_clears_every_host_claim() {
     let store = test_store();
     let workspace = bootstrap_workspace(&store, "fenced-cat-atomic");
@@ -1806,6 +1856,9 @@ fn global_provenance_activation_linearizes_against_legacy_begin() {
         .unwrap();
     legacy_store.finish_operation(&create.id, None).unwrap();
     legacy_store.set_lifecycle_maintenance_frozen(true).unwrap();
+    legacy_store
+        .confirm_legacy_topology_handlers_drained()
+        .unwrap();
     let barrier = Arc::new(std::sync::Barrier::new(2));
     let cat_id = cat.id.clone();
     let (legacy, activation) = std::thread::scope(|scope| {
@@ -1928,11 +1981,63 @@ fn maintenance_freeze_blocks_every_new_lifecycle_authority_until_gate_activation
         .begin_mount_topology_claim(&disk.id, &cat.id, "/data")
         .is_err());
 
+    store.confirm_legacy_topology_handlers_drained().unwrap();
     store.activate_lifecycle_provenance_writes().unwrap();
     assert!(store.lifecycle_provenance_writes_enabled().unwrap());
     store.set_lifecycle_maintenance_frozen(false).unwrap();
     assert!(!store.lifecycle_maintenance_frozen().unwrap());
     assert!(store.ensure_desired_running(&cat.id).unwrap().is_some());
+}
+
+#[test]
+fn maintenance_trigger_allows_only_exact_pre_freeze_topology_claim_settlement() {
+    let store = test_store();
+    let workspace = bootstrap_workspace(&store, "pre-freeze-topology-settlement");
+    let (cat, _, create) =
+        create_test_cat(&store, &workspace, "pre-freeze-topology-settlement").unwrap();
+    store.finish_operation(&create.id, None).unwrap();
+    let cold = store
+        .set_desired(&cat.id, DesiredState::Cold, None, "cat.stop")
+        .unwrap();
+    store
+        .set_observed_for_generation(&cat.id, ObservedState::Cold, cold.resource_generation)
+        .unwrap();
+    store.finish_operation(&cold.id, None).unwrap();
+    let disk = store
+        .create_disk(
+            &workspace,
+            "pre-freeze-topology-disk",
+            1 << 22,
+            DiskDurability::Strict,
+        )
+        .unwrap();
+
+    let mount = store
+        .begin_mount_topology_claim(&disk.id, &cat.id, "/data")
+        .unwrap();
+    store.set_lifecycle_maintenance_frozen(true).unwrap();
+    assert!(store.rollback_topology_claim(&mount).unwrap());
+    assert!(store
+        .get_disk(&workspace.id, &disk.id)
+        .unwrap()
+        .bound_cat_id
+        .is_none());
+
+    store.set_lifecycle_maintenance_frozen(false).unwrap();
+    let mount = store
+        .begin_mount_topology_claim(&disk.id, &cat.id, "/data")
+        .unwrap();
+    assert!(store.complete_topology_claim(&mount).unwrap());
+    let unmount = store
+        .begin_unmount_topology_claim(&disk.id, &cat.id, None)
+        .unwrap();
+    store.set_lifecycle_maintenance_frozen(true).unwrap();
+    assert!(store.complete_topology_claim(&unmount).unwrap());
+    assert!(store
+        .get_disk(&workspace.id, &disk.id)
+        .unwrap()
+        .bound_cat_id
+        .is_none());
 }
 
 #[test]

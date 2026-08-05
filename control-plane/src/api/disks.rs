@@ -97,11 +97,17 @@ pub(super) async fn disk_action(
             let claim = state
                 .store
                 .begin_mount_topology_claim(&disk.id, &cat.id, &mount_at)?;
-            state
+            let completed = state
                 .controller
                 .drive_topology_claim(&claim)
                 .await
                 .map_err(|error| ApiError::unavailable(error.to_string()))?;
+            if !completed {
+                return Err(ApiError::conflict(
+                    "disk topology authority changed before mount completed",
+                )
+                .into());
+            }
             Ok(Json(claim.binding().clone()).into_response())
         }
         "unmount" => {
@@ -128,11 +134,17 @@ pub(super) async fn disk_action(
                 state
                     .store
                     .begin_unmount_topology_claim(&disk.id, &cat.id, original_lease)?;
-            state
+            let completed = state
                 .controller
                 .drive_topology_claim(&claim)
                 .await
                 .map_err(|error| ApiError::unavailable(error.to_string()))?;
+            if !completed {
+                return Err(ApiError::conflict(
+                    "disk topology authority changed before unmount completed",
+                )
+                .into());
+            }
             Ok(StatusCode::NO_CONTENT.into_response())
         }
         "resize" => {

@@ -785,7 +785,11 @@ impl Store {
                     OR (c.desired_state='suspended' AND c.observed_state NOT IN ('suspended'))
                     OR (c.desired_state='warm'      AND c.observed_state NOT IN ('warm'))
                     OR (c.desired_state='cold'      AND c.observed_state NOT IN ('cold'))
-                    OR (c.desired_state='deleted'   AND c.observed_state NOT IN ('deleted'))
+                    -- `deleted` is also the durable, level-triggered cleanup
+                    -- boundary. External root-volume deletion can fail after
+                    -- that state commits; keep selecting the Cat until the
+                    -- final row deletion proves cleanup completed.
+                    OR (c.desired_state='deleted')
                     OR (
                         c.desired_state IN ('running','suspended','warm','cold')
                         AND c.desired_state=c.observed_state

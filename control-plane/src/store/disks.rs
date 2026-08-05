@@ -186,6 +186,77 @@ impl Store {
         })
     }
 
+    /// Host-bound persistent bindings that may have been committed by a v3
+    /// handler before the v4 maintenance freeze but not applied to the Host.
+    /// The operator drain acknowledgement prevents the repair dispatch from
+    /// racing the old request that created this ambiguity.
+    pub fn legacy_topology_reconciliation_candidates(&self) -> Result<Vec<(Cat, MountBinding)>> {
+        self.with(|client| {
+            client
+                .query(
+                    "SELECT c.*, b.id AS binding_id,
+                            b.disk_id AS binding_disk_id,
+                            b.cat_id AS binding_cat_id,
+                            b.mount_path AS binding_mount_path
+                       FROM cats c
+                       JOIN mount_bindings b ON b.cat_id=c.id
+                       JOIN disks d ON d.id=b.disk_id AND d.kind='persistent'
+                      WHERE c.desired_state=c.observed_state
+                        AND c.observed_state IN ('running','suspended','warm')
+                        AND c.observed_generation=c.generation
+                        AND c.node_id IS NOT NULL
+                        AND c.lifecycle_dispatch_json IS NULL
+                        AND c.topology_claim_json IS NULL
+                      ORDER BY c.id, b.id",
+                    &[],
+                )?
+                .iter()
+                .map(|row| {
+                    Ok((
+                        row_to_cat(row)?,
+                        MountBinding {
+                            id: row.try_get("binding_id")?,
+                            disk_id: row.try_get("binding_disk_id")?,
+                            cat_id: row.try_get("binding_cat_id")?,
+                            mount_path: row.try_get("binding_mount_path")?,
+                        },
+                    ))
+                })
+                .collect::<std::result::Result<Vec<_>, postgres::Error>>()
+        })
+    }
+
+    pub fn legacy_topology_binding_matches(
+        &self,
+        cat: &Cat,
+        binding: &MountBinding,
+    ) -> Result<bool> {
+        self.with(|client| {
+            Ok(client
+                .query_opt(
+                    "SELECT 1 FROM cats c
+                       JOIN mount_bindings b ON b.cat_id=c.id
+                      WHERE c.id=$1 AND c.generation=$2
+                        AND c.desired_state=c.observed_state
+                        AND c.observed_state IN ('running','suspended','warm')
+                        AND c.observed_generation=c.generation
+                        AND c.node_id IS NOT DISTINCT FROM $3::TEXT
+                        AND c.lifecycle_dispatch_json IS NULL
+                        AND c.topology_claim_json IS NULL
+                        AND b.id=$4 AND b.disk_id=$5 AND b.mount_path=$6",
+                    &[
+                        &cat.id,
+                        &cat.generation,
+                        &cat.node_id,
+                        &binding.id,
+                        &binding.disk_id,
+                        &binding.mount_path,
+                    ],
+                )?
+                .is_some())
+        })
+    }
+
     /// RWO: unique index on mount_bindings.disk_id makes a second bind fail.
     pub fn bind_disk(&self, disk_id: &str, cat_id: &str, mount_path: &str) -> Result<MountBinding> {
         let id = new_id(ids::MOUNT_PREFIX);
@@ -260,6 +331,18 @@ impl Store {
                 },
             };
             let json = serde_json::to_string(&claim).map_err(internal)?;
+            let claimed = tx
+                .execute(
+                    "UPDATE cats SET topology_claim_json=$2
+                      WHERE id=$1 AND topology_claim_json IS NULL",
+                    &[&cat_id, &json],
+                )
+                .map_err(internal)?;
+            if claimed != 1 {
+                return Err(ApiError::conflict(
+                    "a different topology claim owns this Cat",
+                ));
+            }
             tx.execute(
                 "INSERT INTO mount_bindings (id, disk_id, cat_id, mount_path)
                  VALUES ($1,$2,$3,$4)",
@@ -279,12 +362,6 @@ impl Store {
             })?;
             tx.execute("UPDATE disks SET state='bound' WHERE id=$1", &[&disk_id])
                 .map_err(internal)?;
-            tx.execute(
-                "UPDATE cats SET topology_claim_json=$2
-                  WHERE id=$1 AND topology_claim_json IS NULL",
-                &[&cat_id, &json],
-            )
-            .map_err(internal)?;
             tx.commit().map_err(internal)?;
             Ok(claim)
         })

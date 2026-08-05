@@ -121,6 +121,7 @@ impl Controller {
         self.detect_lost_nodes()?;
         self.converge_confirmed_fences().await?;
         self.drain_nodes().await?;
+        self.reconcile_legacy_topology().await?;
         for cat_id in self.store.auto_suspend_candidates()? {
             self.maybe_auto_suspend(&cat_id)?;
         }
@@ -158,6 +159,155 @@ impl Controller {
                 }
             })
             .await;
+        Ok(())
+    }
+
+    /// After every old topology handler is drained, make each Running Host
+    /// match the frozen database binding set. This resolves both legacy crash
+    /// windows: mount committed before AttachDisk, and DetachDisk succeeded
+    /// before legacy unmount removed its binding. A distinct epoch-scoped job
+    /// id ensures the latter really reattaches even if the original mount job
+    /// is already journaled on the node.
+    async fn reconcile_legacy_topology(&self) -> anyhow::Result<()> {
+        let Some(epoch) = self.store.legacy_topology_reconciliation_epoch()? else {
+            return Ok(());
+        };
+        let candidates = self.store.legacy_topology_reconciliation_candidates()?;
+        let mut cursor = 0;
+        while cursor < candidates.len() {
+            let cat = &candidates[cursor].0;
+            let start = cursor;
+            while cursor < candidates.len() && candidates[cursor].0.id == cat.id {
+                cursor += 1;
+            }
+            let bindings = &candidates[start..cursor];
+            for (_, binding) in bindings {
+                if !self.store.legacy_topology_binding_matches(cat, binding)? {
+                    return Ok(());
+                }
+            }
+            let Some(node_id) = cat.node_id.as_deref() else {
+                return Ok(());
+            };
+            let node = self.store.get_node(node_id)?;
+            if matches!(node.state, NodeState::Lost | NodeState::Fenced) {
+                return Ok(());
+            }
+
+            // AttachDisk is a hot operation. Temporarily wake a stable
+            // host-bound sleep state, repair every binding for the Cat, then
+            // restore the exact physical state without changing database
+            // lifecycle authority or publishing a route.
+            let wake_action = match cat.observed_state {
+                ObservedState::Suspended => Some(NodeJobAction::ResumeCat {
+                    cat_id: cat.id.clone(),
+                }),
+                ObservedState::Warm => Some(NodeJobAction::RestoreCat {
+                    cat_id: cat.id.clone(),
+                }),
+                ObservedState::Running => None,
+                _ => unreachable!("legacy topology candidate is host-bound and stable"),
+            };
+            if let Some(action) = wake_action {
+                let job = NodeJob {
+                    job_id: nodejob::job_id(
+                        &cat.id,
+                        cat.generation,
+                        &format!("topology_reconcile_{epoch}_wake"),
+                    ),
+                    cat_generation: cat.generation,
+                    action,
+                };
+                let result = self.dispatch(&node.agent_url, &job).await?;
+                if result.job_id != job.job_id
+                    || result.phase != JobPhase::Succeeded
+                    || result.observed_state != ObservedState::Running
+                {
+                    anyhow::bail!("legacy topology wake failed for {}", cat.id);
+                }
+            }
+
+            for (_, binding) in bindings {
+                let disk = self.store.get_disk(&cat.workspace_id, &binding.disk_id)?;
+                let size = cats_api::chunk::round_up_to_chunk(disk.size_bytes);
+                match self.storage_meta.create_volume(&disk.volume_id, size) {
+                    Ok(()) | Err(MetaError::AlreadyExists(_)) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                let job = NodeJob {
+                    job_id: nodejob::job_id(
+                        &cat.id,
+                        cat.generation,
+                        &format!("topology_reconcile_{epoch}_{}", disk.id),
+                    ),
+                    cat_generation: cat.generation,
+                    action: NodeJobAction::AttachDisk {
+                        cat_id: cat.id.clone(),
+                        volume: VolumeGrant {
+                            disk_id: disk.id.clone(),
+                            volume_id: disk.volume_id.clone(),
+                            attachment_id: format!("att_{}_{}_{}", cat.id, disk.id, cat.generation),
+                            epoch: 0,
+                            size_bytes: size,
+                            mount_path: binding.mount_path.clone(),
+                            durability: disk.durability,
+                        },
+                    },
+                };
+                let result = self.dispatch(&node.agent_url, &job).await?;
+                if result.job_id != job.job_id || result.phase != JobPhase::Succeeded {
+                    anyhow::bail!(
+                        "legacy topology reconciliation {} failed: {}",
+                        binding.id,
+                        result.error.unwrap_or_else(|| "node job failed".into())
+                    );
+                }
+            }
+
+            let sleep_action = match cat.observed_state {
+                ObservedState::Suspended => Some((
+                    NodeJobAction::SuspendCat {
+                        cat_id: cat.id.clone(),
+                        work_fence: Some(self.store.suspend_work_fence(&cat.id)?),
+                    },
+                    ObservedState::Suspended,
+                )),
+                ObservedState::Warm => Some((
+                    NodeJobAction::WarmCat {
+                        cat_id: cat.id.clone(),
+                    },
+                    ObservedState::Warm,
+                )),
+                ObservedState::Running => None,
+                _ => unreachable!("legacy topology candidate is host-bound and stable"),
+            };
+            if let Some((action, expected)) = sleep_action {
+                let job = NodeJob {
+                    job_id: nodejob::job_id(
+                        &cat.id,
+                        cat.generation,
+                        &format!("topology_reconcile_{epoch}_sleep"),
+                    ),
+                    cat_generation: cat.generation,
+                    action,
+                };
+                let result = self.dispatch(&node.agent_url, &job).await?;
+                if result.job_id != job.job_id
+                    || result.phase != JobPhase::Succeeded
+                    || result.observed_state != expected
+                {
+                    anyhow::bail!("legacy topology sleep restore failed for {}", cat.id);
+                }
+            }
+            for (_, binding) in bindings {
+                if !self.store.legacy_topology_binding_matches(cat, binding)? {
+                    return Ok(());
+                }
+            }
+        }
+        if self.store.mark_legacy_topology_reconciled(epoch)? {
+            tracing::info!(epoch, "legacy disk topology reconciliation completed");
+        }
         Ok(())
     }
 
@@ -602,6 +752,44 @@ impl Controller {
                     return self.start_flow(cat).await;
                 }
             }
+            // Phase-A StopCat has one unambiguous transitional state and one
+            // generation-derived job id. An exact current-generation stop or
+            // delete operation therefore supplies enough durable provenance
+            // to replay a lost response after the old controller disappears.
+            // This is deliberately narrower than Starting, which can mean
+            // StartCat, ResumeCat or RestoreCat.
+            if !provenance_writes_enabled && cat.observed_state == ObservedState::Stopping {
+                let operations = self.store.pending_lifecycle_operations_for(&cat.id)?;
+                let current = operations
+                    .iter()
+                    .filter(|operation| operation.resource_generation == cat.generation)
+                    .collect::<Vec<_>>();
+                let authorized = match cat.desired_state {
+                    DesiredState::Cold => {
+                        !current.is_empty()
+                            && current.iter().all(|operation| {
+                                matches!(
+                                    operation.kind.as_str(),
+                                    "cat.stop" | "cat.auto_cold" | "cat.credit_exhausted"
+                                )
+                            })
+                    }
+                    DesiredState::Deleted => {
+                        !current.is_empty()
+                            && current.iter().all(|operation| {
+                                matches!(operation.kind.as_str(), "cat.delete" | "cat.expire")
+                            })
+                    }
+                    _ => false,
+                };
+                if authorized {
+                    return match cat.desired_state {
+                        DesiredState::Cold => self.stop_flow(cat, StopCatDisposition::Cold).await,
+                        DesiredState::Deleted => self.delete_flow(cat).await,
+                        _ => unreachable!("authorized Phase-A StopCat target"),
+                    };
+                }
+            }
             let legacy_key = format!("legacy-transition:{}@{}", cat.id, cat.generation);
             if self.retry_deferred_key(&legacy_key) {
                 return Ok(());
@@ -752,6 +940,27 @@ impl Controller {
             return Ok(false);
         }
         if claim.mode == DiskChangeMode::OfflineCold {
+            // No node detach is needed, but an offline unmount still owns the
+            // exact writer observed when the claim began. Revoke only that
+            // pair; a replacement writer is preserved and does not prevent
+            // the database topology from settling.
+            if let TopologyAction::Unmount {
+                original_lease: Some(original),
+                ..
+            } = &claim.action
+            {
+                match self.storage_meta.revoke_lease_if_matches(
+                    &original.volume_id,
+                    &original.attachment_id,
+                    original.epoch,
+                ) {
+                    Ok(_) | Err(MetaError::NotFound(_)) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                if !self.store.topology_claim_matches(claim)? {
+                    return Ok(false);
+                }
+            }
             return self
                 .store
                 .complete_topology_claim(claim)
@@ -1566,16 +1775,22 @@ impl Controller {
         cat: &Cat,
         dispatch: &LifecycleDispatch,
     ) -> anyhow::Result<()> {
+        if self.retry_deferred(cat) {
+            return Ok(());
+        }
         let Some(_cleanup_lease) = self.store.destroy_cleanup_lease(&cat.id)? else {
             return Ok(());
         };
         if !self.store.claim_destroy_cleanup(dispatch)? {
             return Ok(());
         }
-        self.delete_metadata_and_rows(cat, Some(dispatch)).await
+        self.run_delete_cleanup(cat, Some(dispatch)).await
     }
 
     async fn delete_flow_cold(&self, cat: &Cat) -> anyhow::Result<()> {
+        if self.retry_deferred(cat) {
+            return Ok(());
+        }
         let Some(_cleanup_lease) = self.store.destroy_cleanup_lease(&cat.id)? else {
             return Ok(());
         };
@@ -1585,7 +1800,29 @@ impl Controller {
         {
             return Ok(());
         }
-        self.delete_metadata_and_rows(cat, None).await
+        self.run_delete_cleanup(cat, None).await
+    }
+
+    async fn run_delete_cleanup(
+        &self,
+        cat: &Cat,
+        dispatch: Option<&LifecycleDispatch>,
+    ) -> anyhow::Result<()> {
+        match self.delete_metadata_and_rows(cat, dispatch).await {
+            Ok(()) => {
+                self.clear_retry_backoff_key(&attempt_key(cat));
+                Ok(())
+            }
+            Err(error) => {
+                let retry_in = self.defer_retry_key(attempt_key(cat));
+                tracing::warn!(
+                    cat = %cat.id,
+                    retry_in_ms = retry_in.as_millis(),
+                    "delete cleanup failed after its durable boundary: {error}"
+                );
+                Err(error)
+            }
+        }
     }
 
     async fn delete_metadata_and_rows(

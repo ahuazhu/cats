@@ -54,11 +54,94 @@ impl Store {
             client
                 .execute(
                     "UPDATE control_schema_version
-                        SET lifecycle_maintenance_frozen=$1
+                        SET lifecycle_maintenance_frozen=$1,
+                            lifecycle_maintenance_epoch=CASE
+                                WHEN $1 AND NOT lifecycle_maintenance_frozen
+                                THEN lifecycle_maintenance_epoch+1
+                                ELSE lifecycle_maintenance_epoch
+                            END,
+                            legacy_topology_handlers_drained=CASE
+                                WHEN $1 AND NOT lifecycle_maintenance_frozen THEN FALSE
+                                ELSE legacy_topology_handlers_drained
+                            END,
+                            legacy_topology_reconciled=CASE
+                                WHEN $1 AND NOT lifecycle_maintenance_frozen THEN FALSE
+                                ELSE legacy_topology_reconciled
+                            END
                       WHERE singleton",
                     &[&frozen],
                 )
                 .map(|_| ())
+        })
+    }
+
+    /// Operator acknowledgement that every pre-v4 topology handler has been
+    /// removed and its at-most-60-second node request has drained. The
+    /// reconciler may only repair database/Host ambiguity after this point;
+    /// otherwise it could race an old attach or detach still in flight.
+    pub fn confirm_legacy_topology_handlers_drained(&self) -> Result<()> {
+        let changed = self.with(|client| {
+            client.execute(
+                "UPDATE control_schema_version
+                    SET legacy_topology_handlers_drained=TRUE,
+                        legacy_topology_reconciled=NOT EXISTS (
+                            SELECT 1 FROM mount_bindings b
+                            JOIN disks d ON d.id=b.disk_id AND d.kind='persistent'
+                            JOIN cats c ON c.id=b.cat_id
+                            WHERE c.observed_state IN ('running','suspended','warm')
+                              AND c.desired_state=c.observed_state
+                              AND c.observed_generation=c.generation
+                              AND c.node_id IS NOT NULL
+                        )
+                  WHERE singleton AND lifecycle_maintenance_frozen",
+                &[],
+            )
+        })?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(ApiError::conflict(
+                "legacy topology drain confirmation requires the maintenance freeze",
+            ))
+        }
+    }
+
+    pub fn legacy_topology_reconciliation_epoch(&self) -> Result<Option<i64>> {
+        self.with(|client| {
+            client
+                .query_opt(
+                    "SELECT lifecycle_maintenance_epoch
+                       FROM control_schema_version
+                      WHERE singleton
+                        AND lifecycle_maintenance_frozen
+                        AND legacy_topology_handlers_drained
+                        AND NOT legacy_topology_reconciled
+                        AND NOT lifecycle_provenance_writes_enabled",
+                    &[],
+                )?
+                .map(|row| row.try_get(0))
+                .transpose()
+        })
+    }
+
+    pub fn mark_legacy_topology_reconciled(&self, epoch: i64) -> Result<bool> {
+        self.with(|client| {
+            client
+                .execute(
+                    "UPDATE control_schema_version
+                        SET legacy_topology_reconciled=TRUE
+                      WHERE singleton
+                        AND lifecycle_maintenance_frozen
+                        AND legacy_topology_handlers_drained
+                        AND lifecycle_maintenance_epoch=$1
+                        AND NOT lifecycle_provenance_writes_enabled
+                        AND NOT EXISTS (
+                            SELECT 1 FROM cats
+                             WHERE topology_claim_json IS NOT NULL
+                        )",
+                    &[&epoch],
+                )
+                .map(|changed| changed == 1)
         })
     }
 
@@ -84,7 +167,9 @@ impl Store {
             let gate = tx
                 .query_one(
                     "SELECT lifecycle_provenance_writes_enabled,
-                            lifecycle_maintenance_frozen
+                            lifecycle_maintenance_frozen,
+                            legacy_topology_handlers_drained,
+                            legacy_topology_reconciled
                        FROM control_schema_version WHERE singleton FOR UPDATE",
                     &[],
                 )
@@ -103,6 +188,13 @@ impl Store {
             if !frozen && cats != 0 {
                 return Err(ApiError::conflict(
                     "lifecycle provenance activation requires the database maintenance freeze",
+                ));
+            }
+            let topology_drained: bool = gate.try_get(2).map_err(internal)?;
+            let topology_reconciled: bool = gate.try_get(3).map_err(internal)?;
+            if cats != 0 && (!topology_drained || !topology_reconciled) {
+                return Err(ApiError::conflict(
+                    "lifecycle provenance activation requires drained legacy topology handlers and a completed topology reconciliation",
                 ));
             }
             let unsafe_rows: i64 = tx
@@ -521,6 +613,17 @@ impl Store {
                             .into_iter()
                             .map(|row| row.try_get(0).map_err(internal))
                             .collect::<Result<Vec<String>>>()?;
+                        // A superseding Stop owns the same still-live runtime
+                        // as the action it replaces. Carry the exact writer
+                        // identities forward so Stop success can revoke them;
+                        // rediscovering leases after the handoff could either
+                        // miss the old writer or target a replacement.
+                        let successor_volume_leases =
+                            if matches!(&job.action, NodeJobAction::StopCat { .. }) {
+                                dispatch.volume_leases.clone()
+                            } else {
+                                Vec::new()
+                            };
                         let successor = LifecycleDispatch {
                             dispatch_id: new_id("dispatch_"),
                             node_id: node_id.to_string(),
@@ -528,7 +631,7 @@ impl Store {
                             transitional_state: transitional,
                             target_state: target,
                             operation_ids,
-                            volume_leases: Vec::new(),
+                            volume_leases: successor_volume_leases,
                             job,
                         };
                         next_observed = transitional;

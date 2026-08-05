@@ -169,19 +169,31 @@ CREATE TABLE IF NOT EXISTS control_schema_version (
     singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
     version BIGINT NOT NULL,
     lifecycle_provenance_writes_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-    lifecycle_maintenance_frozen BOOLEAN NOT NULL DEFAULT FALSE
+    lifecycle_maintenance_frozen BOOLEAN NOT NULL DEFAULT FALSE,
+    legacy_topology_handlers_drained BOOLEAN NOT NULL DEFAULT FALSE,
+    legacy_topology_reconciled BOOLEAN NOT NULL DEFAULT FALSE,
+    lifecycle_maintenance_epoch BIGINT NOT NULL DEFAULT 0
 );
 ALTER TABLE control_schema_version
   ADD COLUMN IF NOT EXISTS lifecycle_provenance_writes_enabled BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE control_schema_version
   ADD COLUMN IF NOT EXISTS lifecycle_maintenance_frozen BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE control_schema_version
+  ADD COLUMN IF NOT EXISTS legacy_topology_handlers_drained BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE control_schema_version
+  ADD COLUMN IF NOT EXISTS legacy_topology_reconciled BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE control_schema_version
+  ADD COLUMN IF NOT EXISTS lifecycle_maintenance_epoch BIGINT NOT NULL DEFAULT 0;
 -- Schema v4 introduces a database-level rollout fence. Upgrading an existing
 -- fleet turns it on in the same schema batch that installs the triggers, so
 -- there is no interval in which an old control-plane replica can create a new
 -- markerless lifecycle authority. A brand-new database has no version row yet
 -- and therefore retains the normal unfrozen default.
 UPDATE control_schema_version
-   SET lifecycle_maintenance_frozen=TRUE
+   SET lifecycle_maintenance_frozen=TRUE,
+       legacy_topology_handlers_drained=FALSE,
+       legacy_topology_reconciled=FALSE,
+       lifecycle_maintenance_epoch=lifecycle_maintenance_epoch+1
  WHERE version < 4;
 CREATE TABLE IF NOT EXISTS accounts (
     id TEXT PRIMARY KEY,
@@ -365,6 +377,64 @@ DROP TRIGGER IF EXISTS nodes_lifecycle_maintenance_freeze ON nodes;
 CREATE TRIGGER nodes_lifecycle_maintenance_freeze
 BEFORE UPDATE ON nodes
 FOR EACH ROW EXECUTE FUNCTION cats_reject_drain_while_frozen();
+
+-- Old control-plane binaries mutate mount_bindings directly and know nothing
+-- about topology_claim_json. Once maintenance is frozen, admit only an exact
+-- durable claim settlement (or terminal Cat cleanup). This closes the mixed-
+-- version hole even for direct SQL using the old statement shape.
+CREATE OR REPLACE FUNCTION cats_reject_topology_while_frozen()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    frozen BOOLEAN;
+    claim_json JSONB;
+    cat_desired TEXT;
+    cat_observed TEXT;
+    binding_id TEXT;
+    binding_disk_id TEXT;
+    binding_cat_id TEXT;
+BEGIN
+    SELECT lifecycle_maintenance_frozen INTO frozen
+      FROM control_schema_version WHERE singleton FOR SHARE;
+    IF NOT frozen THEN
+        IF TG_OP = 'DELETE' THEN
+            RETURN OLD;
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    binding_id := CASE WHEN TG_OP = 'DELETE' THEN OLD.id ELSE NEW.id END;
+    binding_disk_id := CASE WHEN TG_OP = 'DELETE' THEN OLD.disk_id ELSE NEW.disk_id END;
+    binding_cat_id := CASE WHEN TG_OP = 'DELETE' THEN OLD.cat_id ELSE NEW.cat_id END;
+    SELECT topology_claim_json::JSONB, desired_state, observed_state
+      INTO claim_json, cat_desired, cat_observed
+      FROM cats WHERE id=binding_cat_id;
+
+    IF TG_OP = 'INSERT'
+       AND claim_json #>> '{action,Mount,binding,id}' = binding_id
+       AND claim_json #>> '{action,Mount,binding,disk_id}' = binding_disk_id
+       AND claim_json #>> '{action,Mount,binding,cat_id}' = binding_cat_id THEN
+        RETURN NEW;
+    ELSIF TG_OP = 'DELETE'
+       AND (
+           (claim_json #>> '{action,Mount,binding,id}' = binding_id
+            AND claim_json #>> '{action,Mount,binding,disk_id}' = binding_disk_id
+            AND claim_json #>> '{action,Mount,binding,cat_id}' = binding_cat_id)
+        OR (claim_json #>> '{action,Unmount,binding,id}' = binding_id
+            AND claim_json #>> '{action,Unmount,binding,disk_id}' = binding_disk_id
+            AND claim_json #>> '{action,Unmount,binding,cat_id}' = binding_cat_id)
+        OR (cat_desired = 'deleted' AND cat_observed = 'deleted')
+       ) THEN
+        RETURN OLD;
+    END IF;
+
+    RAISE EXCEPTION 'Cat disk topology maintenance is frozen'
+        USING ERRCODE = '55000';
+END;
+$$;
+DROP TRIGGER IF EXISTS mount_bindings_maintenance_freeze ON mount_bindings;
+CREATE TRIGGER mount_bindings_maintenance_freeze
+BEFORE INSERT OR UPDATE OR DELETE ON mount_bindings
+FOR EACH ROW EXECUTE FUNCTION cats_reject_topology_while_frozen();
 CREATE TABLE IF NOT EXISTS operations (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),

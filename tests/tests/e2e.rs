@@ -718,6 +718,12 @@ async fn phase_a_two_controller_real_relaxed_resume_restore_handoff_keeps_local_
         .cp
         .state
         .store
+        .confirm_legacy_topology_handlers_drained()
+        .unwrap();
+    cluster
+        .cp
+        .state
+        .store
         .activate_lifecycle_provenance_writes()
         .unwrap();
     cluster

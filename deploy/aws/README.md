@@ -151,20 +151,48 @@ rollouts:
    and atomically sets `lifecycle_maintenance_frozen=true` while upgrading an
    existing schema. During this bounded maintenance window Cat create, wake,
    sleep, Cold, Delete, disk-topology changes and new node drains return a
-   conflict; already-owned work may settle.
+   conflict; already-owned work may settle. The mount-binding trigger also
+   rejects the direct INSERT/DELETE statements issued by a pre-v4 handler.
 3. Verify the schema fence and the exact image digest on every replica:
 
    ```sh
    psql "$CATS_CONTROL_POSTGRES_URL" -v ON_ERROR_STOP=1 -c \
-     'SELECT version, lifecycle_maintenance_frozen, lifecycle_provenance_writes_enabled FROM control_schema_version WHERE singleton'
+     'SELECT version, lifecycle_maintenance_frozen, legacy_topology_handlers_drained, legacy_topology_reconciled, lifecycle_provenance_writes_enabled FROM control_schema_version WHERE singleton'
    kubectl -n <namespace> rollout status deployment/cats-controld
    kubectl -n <namespace> get pods -l app.kubernetes.io/name=cats-controld \
      -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.containerStatuses[0].imageID}{"\n"}{end}'
    ```
 
-   The first command must report `version=4`, frozen `true`, and provenance
-   `false`; every Pod must report the reviewed digest.
-4. Wait until this query returns no rows. It is the activation precondition,
+   The first command must report `version=4`, frozen `true`, both topology
+   fields `false`, and provenance `false`; every Pod must report the reviewed
+   digest.
+4. After the last pre-v4 Pod has disappeared, wait at least 65 seconds (the
+   old controller's node request timeout is 60 seconds). This is the
+   zero-in-flight boundary for a request that had committed a mount before
+   AttachDisk, or detached before deleting its binding. Then acknowledge the
+   drain exactly once:
+
+   ```sh
+   sleep 65
+   psql "$CATS_CONTROL_POSTGRES_URL" -v ON_ERROR_STOP=1 -c \
+     'UPDATE control_schema_version SET legacy_topology_handlers_drained=TRUE WHERE singleton AND lifecycle_maintenance_frozen AND NOT lifecycle_provenance_writes_enabled RETURNING lifecycle_maintenance_epoch, legacy_topology_handlers_drained'
+   ```
+
+   Phase-A controllers now replay an epoch-scoped AttachDisk for every
+   persistent binding of a stable host-bound Cat, making the Host match the
+   frozen database source of truth. Suspended/Warm Cats are temporarily woken,
+   repaired, and returned to the same state without publishing a route; Cold
+   Cats consume the binding on their next StartCat. This intentionally
+   reattaches a disk if an old unmount stopped after physical detach. Do not
+   acknowledge while any old Pod or request is still live: repair must never
+   race the old action. Wait until reconciliation reports `true`:
+
+   ```sh
+   psql "$CATS_CONTROL_POSTGRES_URL" -v ON_ERROR_STOP=1 -c \
+     'SELECT legacy_topology_handlers_drained, legacy_topology_reconciled FROM control_schema_version WHERE singleton'
+   ```
+
+5. Wait until this query returns no rows. It is the activation precondition,
    not an informational health check:
 
    ```sql
@@ -188,21 +216,24 @@ rollouts:
    ```
 
    A markerless transitional row means an old controller crossed the boundary
-   before the freeze. Keep the fleet frozen and let that exact old node job
-   settle; diagnose the node job journal and controller logs if it does not.
-   Never infer Start, discard a runtime, or activate phase B around the row.
-5. Set the Terraform variable to `true` and roll the control plane once more.
+   before the freeze. An exact current-generation Cold/Delete operation makes
+   markerless Stopping replayable with its deterministic StopCat id; the
+   phase-A controller completes it automatically. Starting remains ambiguous
+   among Start/Resume/Restore, so keep the fleet frozen and diagnose its node
+   journal if it does not settle. Never guess Start, discard a runtime, or
+   activate phase B around an unresolved row.
+6. Set the Terraform variable to `true` and roll the control plane once more.
    Startup runs the same idle scan transactionally and activates a one-way
    database gate. If a row became unsafe, the new Pod refuses to start and the
    gate remains false. Verify all Pods and then verify the gate directly:
 
    ```sh
    psql "$CATS_CONTROL_POSTGRES_URL" -v ON_ERROR_STOP=1 -c \
-     'SELECT lifecycle_maintenance_frozen, lifecycle_provenance_writes_enabled FROM control_schema_version WHERE singleton'
+     'SELECT lifecycle_maintenance_frozen, legacy_topology_handlers_drained, legacy_topology_reconciled, lifecycle_provenance_writes_enabled FROM control_schema_version WHERE singleton'
    ```
 
-6. Only after that reports `true, true`, release maintenance with a guarded
-   update and verify the returned row says `false, true`:
+7. Only after that reports `true, true, true, true`, release maintenance with
+   a guarded update and verify the returned row says `false, true`:
 
    ```sh
    psql "$CATS_CONTROL_POSTGRES_URL" -v ON_ERROR_STOP=1 -c \
@@ -213,7 +244,7 @@ Before phase-B activation, rollback means keeping the database frozen and the
 new control-plane image at phase A while diagnosing; do not restore an older
 schema binary. After activation the database gate is deliberately irreversible:
 setting the Terraform variable back to `false` does not disable it. Do not
-unfreeze a partial rollout or one with an unresolved row from step 4.
+unfreeze a partial rollout or one with an unresolved row from step 5.
 
 Inspect the production singleton locks and control-plane network addresses from
 `main` without disrupting a Pod:
