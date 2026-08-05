@@ -159,7 +159,7 @@ def run_case(
                 # load jitter below the deliberately longer stale-target window
                 # without weakening the production workflow's 250 ms limit.
                 "--max-schedule-lag-ms",
-                "500",
+                "2000",
             ]
             process = subprocess.Popen(
                 command,
@@ -168,7 +168,7 @@ def run_case(
                 text=True,
             )
             time.sleep(0.25)
-            propagation_delay = 1.0
+            propagation_delay = 3.0
             state.begin_eviction(propagation_delay)
             if drained:
                 time.sleep(propagation_delay + 0.2)

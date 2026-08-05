@@ -177,6 +177,7 @@ jobs:
           evidence="$RUNNER_TEMP/control-ha-evidence"
           mkdir -p "$evidence"
           evidence_pids=()
+          watch_pids=()
           probe_pid=""
 
           stop_evidence_processes() {
@@ -360,9 +361,13 @@ jobs:
           }
 
           watch_pods "$evidence/pods-timeline.jsonl" &
-          evidence_pids+=("$!")
+          watch_pid=$!
+          evidence_pids+=("$watch_pid")
+          watch_pids+=("$watch_pid")
           watch_endpoint_slices "$evidence/endpointslices-timeline.jsonl" &
-          evidence_pids+=("$!")
+          watch_pid=$!
+          evidence_pids+=("$watch_pid")
+          watch_pids+=("$watch_pid")
           while IFS= read -r pod; do
             stream_pod_log_summaries \
               "$pod" \
@@ -370,18 +375,16 @@ jobs:
             evidence_pids+=("$!")
           done < <(jq -r '.items[].metadata.name' "$pods_file")
 
-          # Give each stream time to emit its known-positive initial state and
-          # fail closed if any watcher exits before the disruption boundary.
-          sleep 1
+          # AWS exec credentials and the Kubernetes watch connection can take
+          # several seconds to start. Cross the destructive boundary only after
+          # both watches emit their actual initial ADDED events. The bounded
+          # waiter also fails immediately if either producer exits early.
+          deploy/aws/wait-for-evidence-streams.sh 30 \
+            "${watch_pids[0]}" "$evidence/pods-timeline.jsonl" \
+            "${watch_pids[1]}" "$evidence/endpointslices-timeline.jsonl"
           for pid in "${evidence_pids[@]}"; do
             if ! kill -0 "$pid" 2>/dev/null; then
               echo "::error::control-plane HA evidence stream exited before deletion"
-              exit 1
-            fi
-          done
-          for timeline in pods-timeline.jsonl endpointslices-timeline.jsonl; do
-            if [[ ! -s "$evidence/$timeline" ]]; then
-              echo "::error::control-plane HA evidence stream $timeline has no calibrated initial event"
               exit 1
             fi
           done

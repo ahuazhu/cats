@@ -840,6 +840,37 @@ fn production_ha_probe_rejects_invalid_scheduling_inputs() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn production_ha_watches_wait_for_known_positive_events() {
+    let workflow = read_workspace_file(".github/workflows/verify-control-plane-ha.yml");
+    assert!(workflow.contains("deploy/aws/wait-for-evidence-streams.sh"));
+    assert!(workflow.contains("watch_pids"));
+    assert!(workflow.contains("pods-timeline.jsonl"));
+    assert!(workflow.contains("endpointslices-timeline.jsonl"));
+    assert!(
+        !workflow.contains("# Give each stream time to emit its known-positive initial state"),
+        "watch readiness must not depend on a fixed sleep"
+    );
+
+    let output = Command::new("bash")
+        .arg(workspace_root().join("deploy/aws/watch-readiness-fixture.sh"))
+        .arg("--waiter")
+        .arg(workspace_root().join("deploy/aws/wait-for-evidence-streams.sh"))
+        .output()
+        .expect("run the delayed watch-readiness fixture");
+    assert!(
+        output.status.success(),
+        "watch-readiness fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("fixture output is UTF-8");
+    assert!(stdout.contains("delayed streams: ready"));
+    assert!(stdout.contains("early watcher exit: rejected"));
+    assert!(stdout.contains("silent watcher timeout: rejected"));
+}
+
 #[test]
 fn noninteractive_worker_bootstrap_defines_root_home_before_toolchain_use() {
     for path in [
