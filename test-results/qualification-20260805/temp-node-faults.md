@@ -7,14 +7,14 @@ later window unless the preceding window passed both its functional and
 cleanup gates.
 
 The harness does not provision, withdraw, terminate, delete, fence, or drain a
-Node. It never deletes a Cat, disk, database row, or S3 object. Its mutations
-are limited to:
+Node. It never deletes a Cat, disk, database row, or S3 object. The reviewed
+worker hook has no control-plane administrator capability. Its mutations are
+limited to per-window, exact-address iptables rules on the temporary Host and
+host-local test I/O, with an independently armed rollback timer.
 
-- bounded cordon/uncordon of the exact q124 temporary Node while placing the
-  next test Cat;
-- lifecycle actions on the one exact q124 Cat admitted for the current trial;
-- per-window, exact-address iptables rules on the temporary Host, with an
-  independently armed rollback timer.
+The future live controller must perform bounded cordon/uncordon and lifecycle
+actions from an independent runner; those actions are intentionally unavailable
+in the worker hook.
 
 ## Trial matrix
 
@@ -41,13 +41,23 @@ S3 contract is a calibrated known-negative and fails closed.
 
 ## Live matrix
 
-The matrix requires two pre-created, non-production q124 Cats: one Strict and
-one Relaxed. It may reuse those Cats across serial windows, but every window
-runs `prepare-trial` again and captures a new immutable ownership snapshot.
-Preparation starts from a Cordoned, orphan-free Node, allows one bounded
-uncordon/start placement attempt, requires exact placement and marker identity,
-then immediately re-cordons. Any return after uncordon re-cordons through a
-RETURN cleanup; failure of that cleanup returns 70 and stops the matrix.
+> **DO NOT RUN LIVE yet.** The safety audit found that the original workload
+> hook expected the control plane's global `CATS_ADMIN_TOKEN` to be persisted
+> on the worker as `/etc/cats/qualification-124/admin-token`. The immutable
+> worker guard rejects that legacy file, and the worker hook source no longer
+> contains an administrator token loader, admin endpoints, Node mutations,
+> lifecycle actions, API snapshots, preparation, or Lost observer. The external
+> re-cordon watchdog is implemented, but an independent runner still must
+> implement every prepare/snapshot/action/observer exchange before live mode can pass. Fixture,
+> matrix, guard, watchdog, and firewall contracts remain runnable.
+
+The planned live matrix requires two pre-created, non-production q124 Cats: one
+Strict and one Relaxed. It may reuse those Cats across serial windows, but every
+window must request independent-runner preparation and a new immutable
+ownership snapshot. Preparation must start from a Cordoned, orphan-free Node,
+allow one bounded uncordon/start placement attempt, require exact placement and
+marker identity, and immediately re-cordon. No part of that sequence may run on
+the temporary worker.
 
 Required variables include:
 
@@ -73,23 +83,31 @@ On the first failure it records that window and exits before starting another.
 
 The provisioning manifest binds the AWS account, region, exact instance and
 Node IDs, launch time, expiry, Issue/Purpose/Node tags, `TEST_SHA`, and SHA-256
-of the fault config and hook. Live mode verifies the fixed source worker as a
+of the fault config, immutable guard, and hook. Live mode verifies the fixed source worker as a
 positive control, the exact target instance and tags, unique Node identity, and
 SSM Online state. SSM mutations always use the exact instance ID; tags are
 assertions, never selectors.
 
-The reviewed hook must be installed at
+The reviewed hook and guard must be installed at
 `/opt/cats/qualification-124/<TEST_SHA>/q124-fault-workload`, root-owned,
-executable, and byte-identical to the Git blob named by the manifest. The
+and `/opt/cats/qualification-124/<TEST_SHA>/q124-fault-guard`, root-owned,
+executable, and byte-identical to the Git blobs named by the manifest. The guard
+checks every ancestor, ownership, mode, and SHA before every hook call. The
 temporary Host also requires root-only
 `/etc/cats/qualification-124/fault-targets.json`. PostgreSQL `psql` is a
 reviewed, preinstalled temporary-worker dependency for DB observation; neither
 the harness nor hook installs it online, and DB/control-plane trials fail
 before injection if it is absent.
 
-Secrets remain in fixed root-only Host files. They are passed to clients over
-stdin or mode-0600 temporary service files, never argv or evidence. Command
-text, SSM output, and all evidence are scanned for credential-like material.
+The global admin token must not exist on the worker. The independent
+`.github/workflows/q124-recordon-watchdog.yml` run obtains it transiently from
+the live Kubernetes Secret through OIDC, stores it only in a runner-temporary
+0600 file, masks and removes it, and passes it to curl over config stdin. The
+token never appears in workflow inputs, manifest, argv, systemd, journal, or
+evidence. Before any future uncordon, the parent must wait for the external run
+to publish a unique Issue-124 `armed` marker bound to the exact Node, workspace,
+workflow run and 128-bit window nonce. The watchdog retries until authoritative
+Cordoned or a hard deadline; it does not depend on parent cancellation.
 
 ## Fault and probe contract
 
@@ -99,8 +117,9 @@ authenticated minimal read for every dependency address:
 - PostgreSQL: read-only `SELECT 1` using TLS verification and exact `hostaddr`;
 - S3: IMDSv2 credentials, signed prefix list and one-byte ranged object read,
   preserving configured TLS SNI and SigV4 host identity;
-- control plane: authenticated exact-IP admin read preserving `cats.run` TLS
-  identity.
+- control plane: unauthenticated exact-IP `/healthz` read preserving `cats.run`
+  TLS identity. Authoritative Node/Cat reads belong only to the independent
+  runner and are not used as the worker's connectivity probe.
 
 An empty/negative probe is not trusted until that same probe passed its known
 positive. If IPv6 is routable, non-empty AAAA resolution and equivalent IPv6
@@ -120,14 +139,17 @@ non-zero `cleanup_rc` even if a later retry removes the rules.
 
 ## State and oracle evidence
 
-State and host-oracle schemas are version 2 and include both `scenario` and
-`trial`. They require one exact Cat, durability matching the trial, lifecycle
+State and host-oracle schemas are version 2 and include `window_id`, a unique
+128-bit `window_nonce`, `scenario`, and `trial`. They require one exact Cat, durability matching the trial, lifecycle
 state/generation/placement, root-disk epoch, local/remote/unpublished
 watermarks, marker digest, raw operation IDs, and allowlisted log references.
 
 For control-plane windows, the isolated Host cannot authoritatively report its
-own Lost state. A caller-side observer is started first and must write a ready
-handshake before SSM fault injection is dispatched. It observes the exact Node
+own Lost state. An independent-runner observer must start first and write a ready
+handshake while the Node is authoritatively Cordoned before SSM fault injection
+is dispatched. The Host emits the same nonce only after the actual rules are
+installed; the caller then writes the observer's armed barrier. The observer
+rejects any Lost transition before that barrier. It observes the exact Node
 transition to Lost and back to Cordoned while preserving the exact Cat claim
 and generation. The host oracle contains only host-local ledger/blockd/marker
 facts and is forbidden from claiming `node_lost_observed`. The caller writes
@@ -146,12 +168,22 @@ These commands perform no AWS or production calls:
 
 ```sh
 ./test-results/qualification-20260805/temp-node-faults-contracts.sh
+./test-results/qualification-20260805/temp-node-fault-matrix-contract.sh
 
 docker run --rm -v "$PWD:/work:ro" -w /work ubuntu:24.04 \
   bash -lc 'apt-get update -qq && apt-get install -y -qq jq openssl util-linux coreutils gzip >/dev/null && ./test-results/qualification-20260805/temp-node-faults-linux-mock.sh'
 
 docker run --rm -v "$PWD:/work:ro" -w /work ubuntu:24.04 \
-  bash -lc 'apt-get update -qq && apt-get install -y -qq jq python3 coreutils >/dev/null && ./test-results/qualification-20260805/q124-fault-workload-linux-contract.sh'
+  bash -lc 'apt-get update -qq && apt-get install -y -qq jq python3 ripgrep coreutils >/dev/null && ./test-results/qualification-20260805/q124-fault-workload-linux-contract.sh'
+
+docker run --rm -v "$PWD:/work:ro" -w /work ubuntu:24.04 \
+  bash -lc 'apt-get update -qq && apt-get install -y -qq jq ripgrep coreutils >/dev/null && ./deploy/aws/qualification/tests/q124-recordon-watchdog-contracts.sh'
+
+docker run --rm -v "$PWD:/work:ro" -w /work ubuntu:24.04 \
+  bash -lc 'apt-get update -qq && apt-get install -y -qq jq ripgrep coreutils >/dev/null && ./deploy/aws/qualification/tests/q124-admin-node-runner-contracts.sh'
+
+Q124_SCAN_BASE_SHA=<review-base-sha> \
+  ./test-results/qualification-20260805/q124-capability-leak-contract.sh
 ```
 
 The v2 contract covers all 13 positive windows and calibrated negatives for a
@@ -160,6 +192,7 @@ or false external observer, previous-window provenance reuse, false oracle and
 Cat-scope mismatch. The remote Linux mock covers successful and partial rule
 creation, cleanup/save failures, TERM, SIGKILL/watchdog rollback, IPv6 fail
 closed, duplicate run ID, secret rejection, all combinations, transport budget
-and reviewed-hook replacement. The hook contract executes prepare RETURN
-cleanup (including re-cordon failure) and external-observer positive/API-down
-paths against deterministic adapters.
+and reviewed-hook replacement. The hook contract proves the worker uses the
+public health probe without either capability, rejects all legacy administrator
+entry points, fails closed on disconnect, pins the Node-agent origin to
+loopback, and contains no global admin endpoint or lifecycle mutation path.

@@ -1,5 +1,11 @@
 # Control-plane leader handoff lifecycle harness
 
+> **DO NOT RUN LIVE yet.** The worker-side global administrator adapter was
+> removed. Control-plane reads and exact Node cordon/uncordon now belong to the
+> independent-runner adapter, but live HA execution remains hard-disabled until
+> every uncordon has its own nonce-bound, durably armed external re-cordon
+> watchdog. Dry-run and fixture validation remain available.
+
 `ha-handoff.sh` gives issue #124 a guarded, traceable drill for each lifecycle
 handoff: Cold Start, Suspended Resume, Warm Restore, Suspend, Warm, and Stop.
 Every durability/scenario/round gets a fresh `q124-ha-*` Cat (three rounds by
@@ -61,8 +67,10 @@ CATS_SUT_DEPLOY_RUN_ID=<successful-deploy-run-id> \
 CATS_SUT_WORKSPACE_ID=ws_788c5bfc3931 \
 CATS_TEST_WORKSPACE=default/qual-124-20260805 \
 CATS_HA_REQUIRED_NODE_ID=q124-<exact-temporary-node> \
-CATS_HA_ADMIN_NODE_HOOK=/absolute/path/to/installed-q124-admin-node \
-CATS_HA_ADMIN_NODE_HOOK_REPO_PATH=test-results/qualification-20260805/live-hooks/q124-admin-node \
+CATS_HA_ADMIN_NODE_HOOK=/absolute/path/to/q124-admin-node-runner.sh \
+CATS_HA_ADMIN_NODE_HOOK_REPO_PATH=deploy/aws/qualification/q124-admin-node-runner.sh \
+CATS_HA_WINDOW_NONCE=<32-lowercase-hex> \
+Q124_RUNNER_ADMIN_TOKEN_FILE="$RUNNER_TEMP/q124-admin-token" \
 CATS_WATERMARK_PROBE_CMD='<reviewed read-only root/SSM probe>' \
   ./test-results/qualification-20260805/ha-handoff.sh
 ```
@@ -78,8 +86,11 @@ Before create returns an immutable Cat ID, the harness passes both Cat scope
 fields empty; after create it always passes the exact ID/name pair. The adapter
 accepts only those two forms and rejects name-only or ID-only scope.
 
-The committed root-only administrator adapter keeps administrator
-authentication separate from the workspace CLI session. It is invoked only as
+The committed independent-runner administrator adapter keeps transient
+administrator authentication separate from both the workspace CLI session and
+every worker. It refuses non-Actions, non-main, or wrong-repository execution;
+requires a 128-bit window nonce; accepts the token only at the exact mode-0600
+`$RUNNER_TEMP/q124-admin-token` path; and cleans response files on exit. It is invoked only as
 `get NODE`, `cats NODE`,
 `cordon NODE`, or `uncordon NODE`. `get`, `cordon`, and `uncordon` return the
 single NodeSummary JSON; `cats` returns the JSON array from

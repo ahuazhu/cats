@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Immutable, root-owned gate for issue-124 fault actions.  The SSM command and
+# its generated helper are deliberately not trust roots: every hook execution
+# is re-authorized from the fixed, root-owned provisioning manifest.
+
+MANIFEST=/etc/cats/qualification-124/provisioning-manifest.json
+
+die() { printf 'error: %s\n' "$*" >&2; exit 2; }
+
+safe_path() {
+  [[ "$1" =~ ^/[A-Za-z0-9._/-]+$ && "$1" != *..* ]]
+}
+
+# Reject a safe-looking leaf below a writable or symlinked ancestor.  This is
+# intentionally stricter than checking only stat(2) on the leaf.
+validate_ancestors() {
+  local path="$1" current=/ component uid mode
+  safe_path "${path}" || return 1
+  IFS=/ read -r -a components <<<"${path#/}"
+  for component in "${components[@]}"; do
+    [[ -n "${component}" ]] || continue
+    current="${current%/}/${component}"
+    [[ ! -L "${current}" ]] || return 1
+    if [[ -d "${current}" ]]; then
+      read -r uid mode < <(stat -c '%u %a' "${current}") || return 1
+      [[ "${uid}" == 0 ]] || return 1
+      (( (8#${mode} & 8#022) == 0 )) || return 1
+    fi
+  done
+}
+
+validate_file() {
+  local path="$1" allowed_modes="$2" uid mode
+  validate_ancestors "${path}" || die "unsafe ancestor or symlink for ${path}"
+  [[ -f "${path}" && ! -L "${path}" ]] || die "not a regular file: ${path}"
+  read -r uid mode < <(stat -c '%u %a' "${path}")
+  [[ "${uid}" == 0 && " ${allowed_modes} " == *" ${mode} "* ]] ||
+    die "unsafe ownership/mode for ${path}"
+}
+
+load_assets() {
+  local actual
+  [[ ! -e /etc/cats/qualification-124/admin-token && ! -L /etc/cats/qualification-124/admin-token ]] ||
+    die 'legacy global admin token must never be present on a worker'
+  validate_file "${MANIFEST}" '600'
+  jq -e '
+    .schema_version == 1 and .issue == 124 and
+    (.test_sha | test("^[0-9a-f]{40}$")) and
+    (.qualification_assets | keys | sort) ==
+      (["config_sha256","guard_repo_path","guard_sha256","hook_repo_path","hook_sha256"] | sort) and
+    all([.qualification_assets.config_sha256,.qualification_assets.guard_sha256,
+         .qualification_assets.hook_sha256][]; test("^[0-9a-f]{64}$")) and
+    .qualification_assets.guard_repo_path ==
+      "test-results/qualification-20260805/live-hooks/q124-fault-guard" and
+    .qualification_assets.hook_repo_path ==
+      "test-results/qualification-20260805/live-hooks/q124-fault-workload"
+  ' "${MANIFEST}" >/dev/null || die 'invalid fixed provisioning manifest'
+  TEST_SHA="$(jq -r .test_sha "${MANIFEST}")"
+  CONFIG=/etc/cats/qualification-124/fault-targets.json
+  GUARD=/opt/cats/qualification-124/${TEST_SHA}/q124-fault-guard
+  HOOK=/opt/cats/qualification-124/${TEST_SHA}/q124-fault-workload
+  [[ "$0" == "${GUARD}" ]] || die 'guard was not invoked through its TEST_SHA-qualified path'
+  validate_file "${CONFIG}" '600'
+  validate_file "${GUARD}" '700 750'
+  validate_file "${HOOK}" '700 750'
+  [[ -x "${GUARD}" && -x "${HOOK}" ]] || die 'guard/hook is not executable'
+  for tuple in \
+    "${CONFIG}:$(jq -r .qualification_assets.config_sha256 "${MANIFEST}")" \
+    "${GUARD}:$(jq -r .qualification_assets.guard_sha256 "${MANIFEST}")" \
+    "${HOOK}:$(jq -r .qualification_assets.hook_sha256 "${MANIFEST}")"; do
+    actual="$(sha256sum "${tuple%%:*}" | awk '{print $1}')"
+    [[ "${actual}" == "${tuple#*:}" ]] || die "qualification asset SHA mismatch: ${tuple%%:*}"
+  done
+}
+
+for command in jq stat sha256sum; do
+  command -v "${command}" >/dev/null || die "missing ${command}"
+done
+[[ "${EUID}" == 0 ]] || die 'q124 fault guard must run as root'
+load_assets
+
+ACTION="${1:-}"; shift || true
+case "${ACTION}" in
+  verify) [[ $# == 0 ]] || die 'verify takes no arguments' ;;
+  exec-hook) [[ $# -gt 0 ]] || die 'missing hook command'; exec "${HOOK}" "$@" ;;
+  *) die 'usage: q124-fault-guard verify|exec-hook' ;;
+esac

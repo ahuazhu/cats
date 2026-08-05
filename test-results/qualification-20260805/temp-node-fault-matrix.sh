@@ -45,6 +45,7 @@ index=0
 while read -r scenario trial durability; do
   index=$((index + 1))
   window_run="${BASE_RUN_ID}-$(printf '%02d' "${index}")"
+  window_nonce="$(openssl rand -hex 16)"
   ownership="${OWNERSHIP_ROOT}/${window_run}-${trial}.json"
   [[ ! -e "${ownership}" ]] || die "ownership output already exists for ${trial}"
   cat_id="${STRICT_CAT_ID}"; cat_name="${STRICT_CAT_NAME}"
@@ -54,6 +55,7 @@ while read -r scenario trial durability; do
   CATS_FAULT_MODE=live CATS_FAULT_SCENARIO="${scenario}" CATS_FAULT_TRIAL="${trial}" \
     CATS_FAULT_PREPARE_TRIAL=true CATS_FAULT_TARGET_CAT_ID="${cat_id}" CATS_FAULT_TARGET_CAT_NAME="${cat_name}" \
     CATS_FAULT_ALLOW_COMBINED=true CATS_FAULT_RUN_ID="${window_run}" \
+    CATS_FAULT_WINDOW_NONCE="${window_nonce}" \
     CATS_FAULT_CONFIRM="RUN_Q124_FAULT_${TEMP_INSTANCE_ID}_${NODE_ID}_${scenario}" \
     CATS_FAULT_RESULT_ROOT="${RESULT_ROOT}" CATS_OWNERSHIP_SNAPSHOT="${ownership}" \
     CATS_PROVISIONING_MANIFEST="${MANIFEST}" TEMP_INSTANCE_ID="${TEMP_INSTANCE_ID}" NODE_ID="${NODE_ID}" \
@@ -63,10 +65,10 @@ while read -r scenario trial durability; do
   completed="$(date -u +%FT%TZ)"
   ownership_sha=""; [[ ! -f "${ownership}" ]] || ownership_sha="$(sha256sum "${ownership}" | awk '{print $1}')"
   jq --arg scenario "${scenario}" --arg trial "${trial}" --arg durability "${durability}" \
-    --arg run "${window_run}" --arg started "${started}" --arg completed "${completed}" \
+    --arg run "${window_run}" --arg nonce "${window_nonce}" --arg started "${started}" --arg completed "${completed}" \
     --arg ownership "${ownership}" --arg sha "${ownership_sha}" --argjson rc "${rc}" \
-    '.windows += [{ordinal:(.windows|length)+1,scenario:$scenario,trial:$trial,durability:$durability,
-      window_run_id:$run,started_at:$started,completed_at:$completed,ownership_snapshot:$ownership,
+    '(.windows|length) as $n | .windows += [{ordinal:($n + 1),scenario:$scenario,trial:$trial,durability:$durability,
+      window_run_id:$run,window_nonce:$nonce,started_at:$started,completed_at:$completed,ownership_snapshot:$ownership,
       ownership_sha256:$sha,result:(if $rc == 0 then "passed" else "failed" end),rc:$rc}]' \
     "${MATRIX_EVIDENCE}" >"${MATRIX_EVIDENCE}.next"
   mv "${MATRIX_EVIDENCE}.next" "${MATRIX_EVIDENCE}"
@@ -88,7 +90,9 @@ all-3 all-3-relaxed relaxed
 MATRIX
 
 jq '.completed_at=(now|todateiso8601) |
-  if (.windows|length) == 13 and all(.windows[]; .result == "passed" and (.ownership_sha256|test("^[0-9a-f]{64}$")))
+  if (.windows|length) == 13 and ([.windows[].ordinal] == [range(1;14)]) and
+     ([.windows[].window_nonce] | unique | length) == 13 and
+     all(.windows[]; .result == "passed" and (.window_nonce|test("^[0-9a-f]{32}$")) and (.ownership_sha256|test("^[0-9a-f]{64}$")))
   then .result="passed" else error("incomplete matrix") end' "${MATRIX_EVIDENCE}" >"${MATRIX_EVIDENCE}.next"
 mv "${MATRIX_EVIDENCE}.next" "${MATRIX_EVIDENCE}"
 printf 'result=PASS matrix_windows=13 evidence=%s\n' "${MATRIX_EVIDENCE}"

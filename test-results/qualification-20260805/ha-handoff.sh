@@ -30,6 +30,7 @@ WATERMARK_PROBE_CMD="${CATS_WATERMARK_PROBE_CMD:-}"
 REQUIRED_NODE_ID="${CATS_HA_REQUIRED_NODE_ID:-}"
 ADMIN_NODE_HOOK="${CATS_HA_ADMIN_NODE_HOOK:-}"
 ADMIN_NODE_HOOK_REPO_PATH="${CATS_HA_ADMIN_NODE_HOOK_REPO_PATH:-}"
+WINDOW_NONCE="${CATS_HA_WINDOW_NONCE:-}"
 
 MODE="live"
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -118,14 +119,14 @@ file_uid_mode() {
 verify_admin_hook_provenance() {
   local expected_sha actual_sha owner mode
   [[ "${ADMIN_NODE_HOOK_REPO_PATH}" == \
-      "test-results/qualification-20260805/live-hooks/q124-admin-node" ]] ||
-    die "CATS_HA_ADMIN_NODE_HOOK_REPO_PATH must name the reviewed q124 adapter"
+      "deploy/aws/qualification/q124-admin-node-runner.sh" ]] ||
+    die "CATS_HA_ADMIN_NODE_HOOK_REPO_PATH must name the reviewed independent-runner adapter"
   [[ "${ADMIN_NODE_HOOK}" =~ ^/[A-Za-z0-9._/-]+$ && "${ADMIN_NODE_HOOK}" != *".."* \
      && -f "${ADMIN_NODE_HOOK}" && ! -L "${ADMIN_NODE_HOOK}" && -x "${ADMIN_NODE_HOOK}" ]] ||
-    die "admin hook must be one absolute executable regular file"
+    die "runner admin hook must be one absolute executable regular file"
   read -r owner mode < <(file_uid_mode "${ADMIN_NODE_HOOK}")
   [[ "${owner}" == "${EUID}" && "${mode}" == "700" ]] ||
-    die "admin hook must be owned by the harness user with mode 0700"
+    die "runner admin hook must be owned by the harness user with mode 0700"
   git cat-file -e "${SUT_RELEASE_SHA}^{commit}" 2>/dev/null ||
     die "SUT release SHA is not locally reviewable"
   git cat-file -e "${SUT_RELEASE_SHA}:${ADMIN_NODE_HOOK_REPO_PATH}" 2>/dev/null ||
@@ -280,13 +281,14 @@ invoke_admin_node_hook() {
   CATS_HA_HOOK_WORKSPACE_ID="${WORKSPACE_ID}" \
     CATS_HA_HOOK_CAT_ID="${scope_cat_id}" \
     CATS_HA_HOOK_CAT_NAME="${scope_cat_name}" \
+    CATS_HA_WINDOW_NONCE="${WINDOW_NONCE}" \
     "${hook}" "${action}" "${node_id}"
 }
 
 validate_fixtures() {
   local fixture_root cat_file operation_file stale_file watermark_file log_file handoff_iso handoff_epoch
   local node_empty node_empty_cats node_owned node_owned_cats node_raced_cats
-  local harness_self call_log stub_bin stub_hook scope_log adapter_file scope scope_hook scope_output
+  local harness_self call_log stub_bin stub_hook scope_log live_block_log adapter_file scope scope_hook scope_output
   local WORKSPACE_ID="ws_788c5bfc3931"
   fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/cats-ha-fixture.XXXXXX")"
   FIXTURE_ROOT="${fixture_root}"
@@ -306,7 +308,7 @@ validate_fixtures() {
   stub_bin="${fixture_root}/bin"
   stub_hook="${fixture_root}/admin-hook"
   scope_log="${fixture_root}/wrong-workspace.log"
-  adapter_file="test-results/qualification-20260805/live-hooks/q124-admin-node"
+  adapter_file="deploy/aws/qualification/q124-admin-node-runner.sh"
   "${adapter_file}" --validate-scope-fixtures
   scope="$(admin_cat_scope q124-before-create '')"
   [[ "${scope}" == '|' ]] || {
@@ -352,6 +354,24 @@ validate_fixtures() {
     return 1
   }
   rg -Fq 'CATS_SUT_WORKSPACE_ID must be exactly ws_788c5bfc3931' "${scope_log}"
+
+  : >"${call_log}"
+  live_block_log="${fixture_root}/live-block.log"
+  if env PATH="${stub_bin}:${PATH}" Q124_CALL_LOG="${call_log}" \
+    CATS_BIN="${stub_bin}/cats" CATS_HA_ADMIN_NODE_HOOK="${stub_hook}" \
+    CATS_HA_EXECUTE=RUN_ISSUE_124_HA_HANDOFF \
+    CATS_SUT_RELEASE_SHA=1111111111111111111111111111111111111111 \
+    CATS_SUT_DEPLOY_RUN_ID=1 CATS_SUT_WORKSPACE_ID=ws_788c5bfc3931 \
+    CATS_TEST_WORKSPACE=default/qual-124-20260805 CATS_HA_REQUIRED_NODE_ID=q124-fixture-node \
+    "${harness_self}" >"${live_block_log}" 2>&1; then
+    echo "incomplete external recovery boundary unexpectedly reached live execution" >&2
+    return 1
+  fi
+  [[ ! -s "${call_log}" ]] || {
+    echo "DO NOT LIVE gate invoked Cats/admin/dispatch: $(<"${call_log}")" >&2
+    return 1
+  }
+  rg -Fq 'DO NOT LIVE: HA control actions require a nonce-bound independent re-cordon watchdog' "${live_block_log}"
 
   printf '%s\n' '{"id":"cat_fixture","desired_state":"running","observed_state":"starting","generation":7}' >"${cat_file}"
   printf '%s\n' '{"id":"op_fixture","resource_id":"cat_fixture","resource_generation":7,"phase":"running"}' >"${operation_file}"
@@ -428,7 +448,7 @@ validate_fixtures() {
   done
   rm -rf -- "${FIXTURE_ROOT}"
   trap - EXIT
-  printf 'fixture_validation=PASS adapter_scope_empty=true adapter_scope_paired=true adapter_scope_half_rejected=true before_create_scope_unbound=true wrong_workspace_zero_calls=true transition_generation=true stale_rejected=true relaxed_backlog=true watermark_node_bound=true node_empty=true node_exact_cat=true user_cat_race_rejected=true workflow_log=true\n'
+  printf 'fixture_validation=PASS adapter_scope_empty=true adapter_scope_paired=true adapter_scope_half_rejected=true before_create_scope_unbound=true wrong_workspace_zero_calls=true incomplete_recovery_boundary_zero_calls=true transition_generation=true stale_rejected=true relaxed_backlog=true watermark_node_bound=true node_empty=true node_exact_cat=true user_cat_race_rejected=true workflow_log=true\n'
 }
 
 dry_run() {
@@ -468,6 +488,7 @@ if [[ "${MODE}" == live ]]; then
   # This pure-shell gate deliberately precedes every command lookup, Cats call,
   # admin-hook call and workflow dispatch.
   validate_live_locator_scope
+  die "DO NOT LIVE: HA control actions require a nonce-bound independent re-cordon watchdog before every uncordon"
 fi
 require_command jq
 require_command perl
@@ -543,7 +564,8 @@ cats_json() {
   "${CATS_BIN}" --workspace "${WORKSPACE}" --json "$@"
 }
 
-# The separately reviewed adapter owns administrator authentication and accepts
+# The separately reviewed independent-runner adapter owns transient
+# administrator authentication and accepts
 # exactly: get NODE, cats NODE, cordon NODE, or uncordon NODE. It must write
 # only the corresponding API JSON to stdout and must never print credentials.
 admin_node_json() {

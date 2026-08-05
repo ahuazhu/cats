@@ -548,7 +548,7 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
     let workflow = read_workspace_file(".github/workflows/verify-control-plane-ha.yml");
     let harness = read_workspace_file("test-results/qualification-20260805/ha-handoff.sh");
     let admin_adapter =
-        read_workspace_file("test-results/qualification-20260805/live-hooks/q124-admin-node");
+        read_workspace_file("deploy/aws/qualification/q124-admin-node-runner.sh");
     for expected in [
         "workflow_dispatch:",
         "READ_ONLY_CONTROL_PLANE_LEADER_DIAGNOSTIC",
@@ -648,6 +648,7 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
         "CATS_SUT_WORKSPACE_ID must be exactly ws_788c5bfc3931",
         "CATS_TEST_WORKSPACE must be exactly default/qual-124-20260805",
         "verify_admin_hook_provenance",
+        "DO NOT LIVE: HA control actions require a nonce-bound independent re-cordon watchdog",
         "-f mode=disrupt",
     ] {
         assert!(
@@ -659,7 +660,9 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
         "case \"${ACTION}\" in get|cats|cordon|uncordon)",
         "cat_scope_valid \"${CAT_ID}\" \"${CAT_NAME}\"",
         "Node assignment escaped exact q124 scope",
-        "/etc/cats/qualification-124/admin-token",
+        "${RUNNER_ROOT}/q124-admin-token",
+        "administrator adapter must run on the independent main-branch Actions runner",
+        "CATS_HA_WINDOW_NONCE",
         "ws_788c5bfc3931",
     ] {
         assert!(
@@ -668,7 +671,7 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
         );
     }
     let scope_fixture = Command::new(
-        workspace_root().join("test-results/qualification-20260805/live-hooks/q124-admin-node"),
+        workspace_root().join("deploy/aws/qualification/q124-admin-node-runner.sh"),
     )
     .arg("--validate-scope-fixtures")
     .output()

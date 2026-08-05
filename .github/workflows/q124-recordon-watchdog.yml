@@ -1,0 +1,91 @@
+name: Q124 exact-Node re-cordon watchdog
+run-name: q124-recordon ${{ inputs.node_id }} ${{ inputs.window_nonce }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      workspace_id:
+        description: Exact qualification workspace
+        required: true
+        type: string
+      node_id:
+        description: Exact temporary q124 Node
+        required: true
+        type: string
+      window_nonce:
+        description: Unique 128-bit fault-window nonce
+        required: true
+        type: string
+      confirmation:
+        description: Exact scoped confirmation
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  issues: write
+
+concurrency:
+  group: q124-recordon-${{ inputs.node_id }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+
+jobs:
+  watchdog:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Validate exact scope
+        shell: bash
+        env:
+          WORKSPACE_ID: ${{ inputs.workspace_id }}
+          NODE_ID: ${{ inputs.node_id }}
+          WINDOW_NONCE: ${{ inputs.window_nonce }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          [[ "$WORKSPACE_ID" == ws_788c5bfc3931 ]]
+          [[ "$NODE_ID" =~ ^q124-[a-z0-9][a-z0-9-]{7,54}$ ]]
+          [[ "$WINDOW_NONCE" =~ ^[0-9a-f]{32}$ ]]
+          [[ "$CONFIRMATION" == "ARM_Q124_RECORDON_${NODE_ID}_${WINDOW_NONCE}" ]]
+
+      - uses: actions/checkout@v4
+
+      - name: Assume production deployment role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Load ephemeral admin capability
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION" \
+            --kubeconfig "$RUNNER_TEMP/kubeconfig"
+          kubectl --kubeconfig "$RUNNER_TEMP/kubeconfig" --namespace cats \
+            get secret cats-runtime --output json |
+            jq -er '.data.CATS_ADMIN_TOKEN | @base64d' >"$RUNNER_TEMP/q124-admin-token"
+          chmod 0600 "$RUNNER_TEMP/q124-admin-token"
+          echo "::add-mask::$(<"$RUNNER_TEMP/q124-admin-token")"
+
+      - name: Arm and enforce exact-Node re-cordon
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          Q124_WATCHDOG_WORKSPACE_ID: ${{ inputs.workspace_id }}
+          Q124_WATCHDOG_NODE_ID: ${{ inputs.node_id }}
+          Q124_WATCHDOG_NONCE: ${{ inputs.window_nonce }}
+          Q124_WATCHDOG_TOKEN_FILE: ${{ runner.temp }}/q124-admin-token
+        run: deploy/aws/qualification/q124-recordon-watchdog.sh
+
+      - name: Remove ephemeral capability
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/q124-admin-token" "$RUNNER_TEMP/kubeconfig"

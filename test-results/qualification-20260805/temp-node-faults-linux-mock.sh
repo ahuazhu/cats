@@ -16,10 +16,11 @@ MOCK_ROOT="${TEST_ROOT}/state"
 REMOTE="${TEST_ROOT}/remote.sh"
 CONFIG="${TEST_ROOT}/fault-targets.json"
 HOOK="/opt/cats/qualification-124/1111111111111111111111111111111111111111/q124-fault-workload"
+GUARD="/opt/cats/qualification-124/1111111111111111111111111111111111111111/q124-fault-guard"
 HOOK_DIR="$(dirname "${HOOK}")"
 mkdir -p "${MOCK_BIN}" "${MOCK_ROOT}"
 mkdir -p "${HOOK_DIR}"
-trap 'rm -rf "${TEST_ROOT}"; rm -f "${HOOK}"; rmdir "${HOOK_DIR}" 2>/dev/null || true' EXIT
+trap 'rm -rf "${TEST_ROOT}"; rm -f "${HOOK}" "${GUARD}"; rmdir "${HOOK_DIR}" 2>/dev/null || true' EXIT
 
 awk '/^  cat <<'"'"'Q124_REMOTE'"'"'$/ {copy=1; next} copy && /^Q124_REMOTE$/ {exit} copy {print}' \
   "${HARNESS}" >"${REMOTE}"
@@ -43,6 +44,7 @@ family=4
 state="${MOCK_ROOT}/rules${family}"
 count_file="${MOCK_ROOT}/xtables-count"
 mkdir -p "${MOCK_ROOT}"; touch "${state}"
+exec 8>"${MOCK_ROOT}/xtables.lock"; flock 8
 
 if [[ "${name}" == *-save ]]; then
   if [[ -f "${MOCK_ROOT}/fail-save-next" ]]; then
@@ -249,7 +251,7 @@ case "${command}" in
         {cat_id:$id,cat_name:$name,durability:$durability,desired_state:"running",
          observed_state:(if $phase=="during" then "unknown" else "running" end),generation:7,node_id:$node,
          operation_ids:["op_mock_fault"],watermark:{local:11,remote:11,unpublished:0},disk_epoch:3,digest:$digest};
-      {schema_version:2,captured_at:$now,phase:$phase,scenario:$scenario,trial:$trial,
+      {schema_version:2,window_id:$ENV.Q124_RUN_ID,window_nonce:$ENV.Q124_WINDOW_NONCE,captured_at:$now,phase:$phase,scenario:$scenario,trial:$trial,
        workspace_id:"ws_788c5bfc3931",node_id:$node,
        cats:[cat(("cat_mock_"+$durability);("q124-mock-"+$durability);$durability;($digest + "-"+$durability))],
        raw_operations:[{operation_id:"op_mock_fault",kind:"mock_fault",phase:"succeeded",started_at:$now,completed_at:$now,log_ref:"journal://q124/mock/op"}],
@@ -273,7 +275,7 @@ case "${command}" in
     if [[ "${phase}" == partial-recovery ]]; then
       if [[ -n "${remaining}" ]]; then remaining_json="$(printf '%s' "${remaining}" | jq -R 'split(",")')"; else remaining_json='[]'; fi
       jq -n --arg scenario "${scenario}" --arg trial "${trial}" --arg dep "${restored}" --argjson remaining "${remaining_json}" --arg now "${now}" '
-        {schema_version:2,scenario:$scenario,trial:$trial,phase:"partial-recovery",restored_dependency:$dep,
+        {schema_version:2,window_id:$ENV.Q124_RUN_ID,window_nonce:$ENV.Q124_WINDOW_NONCE,scenario:$scenario,trial:$trial,phase:"partial-recovery",restored_dependency:$dep,
          remaining_dependencies:$remaining,started_at:$now,completed_at:$now,
          checks:{restored_dependency_positive:true,remaining_dependencies_negative:true,false_success_absent:true,
            digest_preserved:true,generation_preserved:true,disk_epoch_preserved:true},
@@ -299,7 +301,7 @@ case "${command}" in
     elif [[ "${scenario}" == all-3 ]]; then checks='{"host_reconnected":true,"db_reconnected":true,"s3_converged":true,"final_digest_verified":true,"generation_preserved":true,"disk_epoch_preserved":true}'
     else exit 2; fi
     jq -n --arg scenario "${scenario}" --arg trial "${trial}" --arg phase "${phase}" --arg now "${now}" --argjson checks "${checks}" '
-      {schema_version:2,scenario:$scenario,trial:$trial,phase:$phase,started_at:$now,completed_at:$now,checks:$checks,
+      {schema_version:2,window_id:$ENV.Q124_RUN_ID,window_nonce:$ENV.Q124_WINDOW_NONCE,scenario:$scenario,trial:$trial,phase:$phase,started_at:$now,completed_at:$now,checks:$checks,
        raw_operations:[{operation_id:"op_mock_fault",kind:"mock_exercise",phase:"succeeded",started_at:$now,completed_at:$now,log_ref:"journal://q124/mock/exercise"}],
        log_refs:["journal://q124/mock/oracle"]}' >"${output}"
     ;;
@@ -307,6 +309,17 @@ case "${command}" in
 esac
 MOCK
 chmod 0700 "${HOOK}"
+
+cat >"${GUARD}" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$1" in
+  verify) exit 0 ;;
+  exec-hook) shift; exec "${Q124_HOOK_REF}" "$@" ;;
+  *) exit 2 ;;
+esac
+MOCK
+chmod 0700 "${GUARD}"
 
 run_remote() {
   local run_id="$1" scenario="${2:-db}" trial="${3:-}"
@@ -333,10 +346,12 @@ run_remote() {
     MOCK_WATCHDOG_DELAY_SECONDS="${MOCK_WATCHDOG_DELAY_SECONDS:-15}" \
     Q124_RUN_ID="${run_id}" Q124_SCENARIO="${scenario}" Q124_TRIAL="${trial}" Q124_INSTANCE_ID=i-0123456789abcdef0 \
     Q124_NODE_ID=q124-20260805000000-abcdef Q124_WORKSPACE_ID=ws_788c5bfc3931 \
-    Q124_CONFIG_REF="${CONFIG}" Q124_HOOK_REF="${HOOK}" \
+    Q124_CONFIG_REF="${CONFIG}" Q124_HOOK_REF="${HOOK}" Q124_GUARD_REF="${GUARD}" \
+    Q124_WINDOW_NONCE=0123456789abcdef0123456789abcdef \
     Q124_TEST_SHA=1111111111111111111111111111111111111111 \
     Q124_CONFIG_SHA256="$(sha256sum "${CONFIG}" | awk '{print $1}')" \
     Q124_HOOK_SHA256="${MOCK_EXPECTED_HOOK_SHA256:-$(sha256sum "${HOOK}" | awk '{print $1}')}" \
+    Q124_GUARD_SHA256="$(sha256sum "${GUARD}" | awk '{print $1}')" \
     Q124_HARNESS_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
     Q124_HELPER_SHA256="$(sha256sum "${REMOTE}" | awk '{print $1}')" \
     Q124_CAT_SET_SHA256="${cat_set_sha}" \

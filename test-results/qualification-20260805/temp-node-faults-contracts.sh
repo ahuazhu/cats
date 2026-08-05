@@ -68,5 +68,22 @@ expect_reject observer-invalid control-plane control-plane-running "${STRICT}" C
 expect_reject previous-window-evidence-reuse db db-running "${STRICT}" CATS_FIXTURE_WINDOW_REUSE=true
 expect_reject false-oracle db db-running "${STRICT}" CATS_FIXTURE_ORACLE_FAIL=true
 expect_reject state-cat-scope-mismatch db db-running "${STRICT}" CATS_FIXTURE_CAT_SET_MISMATCH=true
+expect_reject state-window-nonce-reuse db db-running "${STRICT}" CATS_FIXTURE_STATE_NONCE_REUSE=true
+expect_reject oracle-window-nonce-reuse db db-running "${STRICT}" CATS_FIXTURE_ORACLE_NONCE_REUSE=true
+expect_reject invalid-phase-order db db-running "${STRICT}" CATS_FIXTURE_TIMESTAMP_ORDER_FAIL=true
+expect_reject preexisting-lost-not-causal control-plane control-plane-running "${STRICT}" CATS_FIXTURE_OBSERVER_PREEXISTING_LOST=true
 
-printf 'result=PASS positive_windows=13 calibrated_negatives=8\n'
+live_root="${ROOT}/live-must-not-exist"
+set +e
+env CATS_FAULT_MODE=live CATS_FAULT_SCENARIO=db CATS_FAULT_TRIAL=db-running \
+  CATS_FAULT_RUN_ID=live-zero-mutation CATS_FAULT_RESULT_ROOT="${live_root}" \
+  TEMP_INSTANCE_ID=i-0123456789abcdef0 NODE_ID=q124-20260805000000-abcdef \
+  CATS_OWNERSHIP_SNAPSHOT="${STRICT}" CATS_PROVISIONING_MANIFEST="${MANIFEST}" \
+  "${HARNESS}" >"${ROOT}/live-zero-mutation.log" 2>&1
+live_rc=$?
+set -e
+[[ "${live_rc}" -ne 0 && ! -e "${live_root}" ]]
+grep -Fq 'DO NOT LIVE: worker admin authority was removed' "${ROOT}/live-zero-mutation.log"
+printf 'incomplete-external-control-zero-mutation\tPASS\n'
+
+printf 'result=PASS positive_windows=13 calibrated_negatives=13\n'

@@ -25,19 +25,43 @@ TARGET_CAT_NAME="${CATS_FAULT_TARGET_CAT_NAME:-}"
 PROVISIONING_MANIFEST="${CATS_PROVISIONING_MANIFEST:-}"
 REMOTE_CONFIG="${CATS_REMOTE_FAULT_CONFIG:-/etc/cats/qualification-124/fault-targets.json}"
 REMOTE_HOOK="${CATS_REMOTE_WORKLOAD_HOOK:-/usr/local/libexec/cats/q124-fault-workload}"
+REMOTE_GUARD="${CATS_REMOTE_FAULT_GUARD:-/usr/local/libexec/cats/q124-fault-guard}"
 OBSERVER_HOOK="${CATS_FAULT_OBSERVER_HOOK:-$(cd "$(dirname "$0")" && pwd)/live-hooks/q124-fault-workload}"
 RUN_ID="${CATS_FAULT_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$(openssl rand -hex 3)}"
+WINDOW_NONCE="${CATS_FAULT_WINDOW_NONCE:-$(openssl rand -hex 16)}"
 RESULT_ROOT="${CATS_FAULT_RESULT_ROOT:-test-results/qualification-20260805/raw/temp-node-faults}"
 RUN_DIR="${RESULT_ROOT}/${RUN_ID}"
 SSM_TIMEOUT_SECONDS="${CATS_FAULT_SSM_TIMEOUT_SECONDS:-900}"
 REQUIRE_FRESH_OWNERSHIP="${CATS_FAULT_REQUIRE_FRESH_OWNERSHIP:-false}"
 LIVE_CONFIRM="${CATS_FAULT_CONFIRM:-}"
 HARNESS_SHA256="$(shasum -a 256 "$0" | awk '{print $1}')"
+OBSERVER_PROCESS_GROUP=""
+OBSERVER_TEMP_FILES=()
 
 die() {
   printf 'error: %s\n' "$*" >&2
   exit 2
 }
+
+cleanup_external_observer() {
+  local path
+  if [[ -n "${OBSERVER_PROCESS_GROUP}" ]]; then
+    kill -TERM -- "-${OBSERVER_PROCESS_GROUP}" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      kill -0 -- "-${OBSERVER_PROCESS_GROUP}" 2>/dev/null || break
+      sleep 0.05
+    done
+    kill -KILL -- "-${OBSERVER_PROCESS_GROUP}" 2>/dev/null || true
+    wait "${OBSERVER_PROCESS_GROUP}" 2>/dev/null || true
+    OBSERVER_PROCESS_GROUP=""
+  fi
+  for path in "${OBSERVER_TEMP_FILES[@]}"; do
+    [[ "${path}" =~ ^/run/cats-q124-observer-[A-Za-z0-9._-]+[.](json|ready|armed)$ ]] || continue
+    sudo -n rm -f "${path}" 2>/dev/null || true
+  done
+  OBSERVER_TEMP_FILES=()
+}
+trap cleanup_external_observer EXIT
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "required command is unavailable: $1"
@@ -78,6 +102,7 @@ validate_inputs() {
     die "CATS_FAULT_REQUIRE_FRESH_OWNERSHIP must be true or false"
   validate_ref CATS_REMOTE_FAULT_CONFIG "${REMOTE_CONFIG}"
   validate_ref CATS_REMOTE_WORKLOAD_HOOK "${REMOTE_HOOK}"
+  validate_ref CATS_REMOTE_FAULT_GUARD "${REMOTE_GUARD}"
   validate_ref CATS_FAULT_OBSERVER_HOOK "${OBSERVER_HOOK}"
 
   case "${MODE}" in
@@ -109,6 +134,7 @@ validate_inputs() {
   fi
   [[ -n "${PROVISIONING_MANIFEST}" ]] || die "CATS_PROVISIONING_MANIFEST is required"
   [[ -f "${PROVISIONING_MANIFEST}" ]] || die "provisioning manifest does not exist"
+  [[ "${WINDOW_NONCE}" =~ ^[0-9a-f]{32}$ ]] || die "CATS_FAULT_WINDOW_NONCE must be 16 random bytes in lowercase hex"
 }
 
 validate_snapshot() {
@@ -200,22 +226,29 @@ validate_manifest() {
       .tags.Environment == "production" and .tags.Purpose == "qualification-124" and
       .tags.Issue == "124" and .tags.CatsNodeId == $node and
       .tags.ExpiresAt == .expires_at and .tags.ManagedBy == "manual-q124" and
-      (.qualification_assets | keys | sort) == (["config_sha256","hook_sha256","hook_repo_path"] | sort) and
-      all([.qualification_assets.config_sha256,.qualification_assets.hook_sha256][];
+      (.qualification_assets | keys | sort) == (["config_sha256","guard_sha256","guard_repo_path","hook_sha256","hook_repo_path"] | sort) and
+      all([.qualification_assets.config_sha256,.qualification_assets.guard_sha256,.qualification_assets.hook_sha256][];
         type == "string" and test("^[0-9a-f]{64}$")) and
+      (.qualification_assets.guard_repo_path ==
+        "test-results/qualification-20260805/live-hooks/q124-fault-guard") and
       (.qualification_assets.hook_repo_path ==
         "test-results/qualification-20260805/live-hooks/q124-fault-workload")
     ' "${manifest}" >/dev/null || die "provisioning manifest identity/TTL/schema is invalid"
 }
 
 verify_reviewed_hook_provenance() {
-  local test_sha repo_path expected_path source_sha manifest_sha
+  local test_sha repo_path guard_repo_path expected_path expected_guard_path source_sha manifest_sha guard_source_sha guard_manifest_sha
   test_sha="$(jq -r .test_sha "${PROVISIONING_MANIFEST}")"
   repo_path="$(jq -r .qualification_assets.hook_repo_path "${PROVISIONING_MANIFEST}")"
   manifest_sha="$(jq -r .qualification_assets.hook_sha256 "${PROVISIONING_MANIFEST}")"
+  guard_repo_path="$(jq -r .qualification_assets.guard_repo_path "${PROVISIONING_MANIFEST}")"
+  guard_manifest_sha="$(jq -r .qualification_assets.guard_sha256 "${PROVISIONING_MANIFEST}")"
   expected_path="/opt/cats/qualification-124/${test_sha}/q124-fault-workload"
+  expected_guard_path="/opt/cats/qualification-124/${test_sha}/q124-fault-guard"
   [[ "${REMOTE_HOOK}" == "${expected_path}" ]] ||
     die "live hook must be installed at the exact TEST_SHA-qualified path: ${expected_path}"
+  [[ "${REMOTE_GUARD}" == "${expected_guard_path}" ]] ||
+    die "live guard must be installed at the exact TEST_SHA-qualified path: ${expected_guard_path}"
   git cat-file -e "${test_sha}^{commit}" 2>/dev/null ||
     die "manifest TEST_SHA is not a locally reviewable commit"
   git cat-file -e "${test_sha}:${repo_path}" 2>/dev/null ||
@@ -223,6 +256,11 @@ verify_reviewed_hook_provenance() {
   source_sha="$(git show "${test_sha}:${repo_path}" | shasum -a 256 | awk '{print $1}')"
   [[ "${source_sha}" == "${manifest_sha}" ]] ||
     die "manifest hook SHA does not match the version-controlled hook at TEST_SHA"
+  git cat-file -e "${test_sha}:${guard_repo_path}" 2>/dev/null ||
+    die "reviewed guard is absent from the exact manifest TEST_SHA"
+  guard_source_sha="$(git show "${test_sha}:${guard_repo_path}" | shasum -a 256 | awk '{print $1}')"
+  [[ "${guard_source_sha}" == "${guard_manifest_sha}" ]] ||
+    die "manifest guard SHA does not match the version-controlled guard at TEST_SHA"
   [[ -f "${OBSERVER_HOOK}" && ! -L "${OBSERVER_HOOK}" && -x "${OBSERVER_HOOK}" ]] ||
     die "external observer hook must be one executable regular file"
   [[ "$(shasum -a 256 "${OBSERVER_HOOK}" | awk '{print $1}')" == "${manifest_sha}" ]] ||
@@ -236,6 +274,10 @@ make_run_dir() {
   chmod 700 "${RUN_DIR}"
   cp "${OWNERSHIP_SNAPSHOT}" "${RUN_DIR}/ownership-snapshot.json"
   cp "${PROVISIONING_MANIFEST}" "${RUN_DIR}/provisioning-manifest.json"
+  if [[ -f "${OWNERSHIP_SNAPSHOT}.recordon-watchdog.json" ]]; then
+    cp "${OWNERSHIP_SNAPSHOT}.recordon-watchdog.json" "${RUN_DIR}/recordon-watchdog.json"
+    chmod 600 "${RUN_DIR}/recordon-watchdog.json"
+  fi
   chmod 600 "${RUN_DIR}/ownership-snapshot.json"
   chmod 600 "${RUN_DIR}/provisioning-manifest.json"
 }
@@ -254,6 +296,8 @@ write_run_metadata() {
     --arg region "${AWS_REGION}" \
     --arg config_ref "${REMOTE_CONFIG}" \
     --arg hook_ref "${REMOTE_HOOK}" \
+    --arg guard_ref "${REMOTE_GUARD}" \
+    --arg window_nonce "${WINDOW_NONCE}" \
     --arg harness_sha256 "${HARNESS_SHA256}" \
     --arg test_sha "$(jq -r .test_sha "${PROVISIONING_MANIFEST}")" \
     --arg config_sha256 "$(jq -r .qualification_assets.config_sha256 "${PROVISIONING_MANIFEST}")" \
@@ -263,6 +307,7 @@ write_run_metadata() {
     '{run_id:$run_id,mode:$mode,scenario:$scenario,trial:$trial,temp_instance_id:$instance,
       node_id:$node,issue:$issue,workspace_id:$workspace_id,workspace:$workspace,
       aws_region:$region,remote_config_ref:$config_ref,remote_hook_ref:$hook_ref,
+      remote_guard_ref:$guard_ref,window_nonce:$window_nonce,
       harness_sha256:$harness_sha256,test_sha:$test_sha,
       expected_config_sha256:$config_sha256,expected_hook_sha256:$hook_sha256,
       reviewed_hook_repo_path:$hook_repo_path,
@@ -327,20 +372,21 @@ remote_payload() {
 }
 
 build_ssm_command() {
-  local scenario="$1" trial="$2" payload qrun command remote_helper helper_sha test_sha config_sha hook_sha cat_set_sha
+  local scenario="$1" trial="$2" payload qrun command remote_helper helper_sha test_sha config_sha hook_sha guard_sha cat_set_sha
   payload="$(remote_payload)"
   helper_sha="$(emit_remote_program | shasum -a 256 | awk '{print $1}')"
   test_sha="$(jq -r .test_sha "${PROVISIONING_MANIFEST}")"
   config_sha="$(jq -r .qualification_assets.config_sha256 "${PROVISIONING_MANIFEST}")"
   hook_sha="$(jq -r .qualification_assets.hook_sha256 "${PROVISIONING_MANIFEST}")"
+  guard_sha="$(jq -r .qualification_assets.guard_sha256 "${PROVISIONING_MANIFEST}")"
   cat_set_sha="$(jq -Sc '[.assigned_cats[] | {cat_id,name,workspace_id,node_id,durability}] | sort_by(.cat_id)' \
     "${OWNERSHIP_SNAPSHOT}" | shasum -a 256 | awk '{print $1}')"
   qrun="${RUN_ID}-${trial}"
   remote_helper="/run/cats-q124-fault-helper-${qrun}.sh"
   printf -v command \
-    'umask 077; printf %%s %q | openssl base64 -d -A | gzip -d > %q; chmod 0700 %q; sudo env Q124_RUN_ID=%q Q124_SCENARIO=%q Q124_TRIAL=%q Q124_INSTANCE_ID=%q Q124_NODE_ID=%q Q124_WORKSPACE_ID=%q Q124_CONFIG_REF=%q Q124_HOOK_REF=%q Q124_TEST_SHA=%q Q124_CONFIG_SHA256=%q Q124_HOOK_SHA256=%q Q124_HARNESS_SHA256=%q Q124_HELPER_SHA256=%q Q124_CAT_SET_SHA256=%q %q' \
-    "${payload}" "${remote_helper}" "${remote_helper}" "${qrun}" "${scenario}" "${trial}" "${TEMP_INSTANCE_ID}" "${NODE_ID}" \
-    "${WORKSPACE_ID}" "${REMOTE_CONFIG}" "${REMOTE_HOOK}" "${test_sha}" "${config_sha}" "${hook_sha}" \
+    'umask 077; printf %%s %q | openssl base64 -d -A | gzip -d > %q; chmod 0700 %q; sudo env Q124_RUN_ID=%q Q124_WINDOW_NONCE=%q Q124_SCENARIO=%q Q124_TRIAL=%q Q124_INSTANCE_ID=%q Q124_NODE_ID=%q Q124_WORKSPACE_ID=%q Q124_CONFIG_REF=%q Q124_HOOK_REF=%q Q124_GUARD_REF=%q Q124_TEST_SHA=%q Q124_CONFIG_SHA256=%q Q124_HOOK_SHA256=%q Q124_GUARD_SHA256=%q Q124_HARNESS_SHA256=%q Q124_HELPER_SHA256=%q Q124_CAT_SET_SHA256=%q %q' \
+    "${payload}" "${remote_helper}" "${remote_helper}" "${qrun}" "${WINDOW_NONCE}" "${scenario}" "${trial}" "${TEMP_INSTANCE_ID}" "${NODE_ID}" \
+    "${WORKSPACE_ID}" "${REMOTE_CONFIG}" "${REMOTE_HOOK}" "${REMOTE_GUARD}" "${test_sha}" "${config_sha}" "${hook_sha}" "${guard_sha}" \
     "${HARNESS_SHA256}" "${helper_sha}" "${cat_set_sha}" "${remote_helper}"
   if grep -Eqi 'bearer|token|password|secret|worker[.]env' <<<"${command}"; then
     die "refusing to put a secret-like value or worker.env in SSM command text"
@@ -368,10 +414,12 @@ write_dry_run() {
 }
 
 fixture_state() {
-  local phase="$1" scenario="$2" trial="$3" generation="17" observed="running"
+  local phase="$1" scenario="$2" trial="$3" generation="17" observed="running" captured
   [[ "${phase}" != "during" ]] || observed="unknown"
+  case "${phase}" in before) captured=2026-08-05T14:00:00Z ;; during) captured=2026-08-05T14:00:03Z ;; after) captured=2026-08-05T14:00:06Z ;; esac
   jq -n \
     --arg phase "${phase}" --arg scenario "${scenario}" --arg trial "${trial}" \
+    --arg window "${RUN_ID}-${trial}" --arg nonce "${WINDOW_NONCE}" --arg captured "${captured}" \
     --arg workspace_id "${WORKSPACE_ID}" --arg node_id "${NODE_ID}" \
     --arg observed "${observed}" --argjson generation "${generation}" \
     --slurpfile ownership "${OWNERSHIP_SNAPSHOT}" '
@@ -381,7 +429,7 @@ fixture_state() {
          observed_state:$observed,generation:$generation,node_id:$node_id,
          operation_ids:["op_fixture_124"],
          watermark:{local:23,remote:23,unpublished:0},disk_epoch:9,digest:"sha256:fixture"};
-      {schema_version:2,captured_at:"2026-08-05T14:00:00Z",phase:$phase,
+      {schema_version:2,window_id:$window,window_nonce:$nonce,captured_at:$captured,phase:$phase,
        scenario:$scenario,trial:$trial,workspace_id:$workspace_id,node_id:$node_id,
        raw_operations:[{operation_id:"op_fixture_124",kind:"fixture_probe",phase:"succeeded",
          started_at:"2026-08-05T14:00:00Z",completed_at:"2026-08-05T14:00:01Z",
@@ -391,7 +439,9 @@ fixture_state() {
 }
 
 fixture_oracle() {
-  local phase="$1" scenario="$2" trial="$3"
+  local phase="$1" scenario="$2" trial="$3" started completed
+  if [[ "${phase}" == isolated ]]; then started=2026-08-05T14:00:01Z; completed=2026-08-05T14:00:02Z
+  else started=2026-08-05T14:00:04Z; completed=2026-08-05T14:00:05Z; fi
   case "${trial}:${phase}" in
     db-running:isolated) checks='{"running_exec_observed":true,"metadata_cas_false_success_absent":true,"sync_false_success_absent":true,"corruption_signal_absent":true}' ;;
     db-cold-start:isolated) checks='{"cold_false_success_absent":true,"start_retry_or_failure_observed":true,"new_start_retry_or_failure_observed":true,"corruption_signal_absent":true}' ;;
@@ -415,8 +465,9 @@ fixture_oracle() {
     *) die "invalid fixture oracle ${scenario}:${trial}:${phase}" ;;
   esac
   jq -n --arg scenario "${scenario}" --arg trial "${trial}" --arg phase "${phase}" --argjson checks "${checks}" \
-    '{schema_version:2,scenario:$scenario,trial:$trial,phase:$phase,
-      started_at:"2026-08-05T14:00:00Z",completed_at:"2026-08-05T14:00:01Z",
+    --arg window "${RUN_ID}-${trial}" --arg nonce "${WINDOW_NONCE}" --arg started "${started}" --arg completed "${completed}" \
+    '{schema_version:2,window_id:$window,window_nonce:$nonce,scenario:$scenario,trial:$trial,phase:$phase,
+      started_at:$started,completed_at:$completed,
       checks:$checks,
       raw_operations:[{operation_id:"op_fixture_124",kind:"fixture_exercise",phase:"succeeded",
         started_at:"2026-08-05T14:00:00Z",completed_at:"2026-08-05T14:00:01Z",
@@ -479,15 +530,16 @@ fixture_combo_evidence() {
     remaining="$(jq -c --arg dep "${dep}" '[.[] | select(. != $dep)]' <<<"${dependencies}")"
     dependencies="${remaining}"
     jq -n --arg scenario "${scenario}" --arg trial "${TRIAL}" --arg dep "${dep}" --argjson remaining "${remaining}" \
-      --argjson index "${index}" '{schema_version:2,scenario:$scenario,trial:$trial,phase:"partial-recovery",
+      --arg window "${RUN_ID}-${TRIAL}" --arg nonce "${WINDOW_NONCE}" \
+      --argjson index "${index}" '{schema_version:2,window_id:$window,window_nonce:$nonce,scenario:$scenario,trial:$trial,phase:"partial-recovery",
         restored_dependency:$dep,remaining_dependencies:$remaining,
-        started_at:"2026-08-05T14:00:01Z",completed_at:"2026-08-05T14:00:02Z",
+        started_at:"2026-08-05T14:00:03Z",completed_at:"2026-08-05T14:00:03Z",
         checks:{restored_dependency_positive:true,remaining_dependencies_negative:true,
           false_success_absent:true,digest_preserved:true,generation_preserved:true,
           disk_epoch_preserved:true},
         raw_operations:[{operation_id:("op_fixture_recovery_" + ($index|tostring)),
           kind:"fixture_partial_recovery",phase:"succeeded",
-          started_at:"2026-08-05T14:00:01Z",completed_at:"2026-08-05T14:00:02Z",
+          started_at:"2026-08-05T14:00:03Z",completed_at:"2026-08-05T14:00:03Z",
           log_ref:("journal://q124/fixture/recovery/" + ($index|tostring))}],
         log_refs:[("journal://q124/fixture/recovery/" + ($index|tostring))]}' \
       >"${dir}/recovery-step-${index}.json"
@@ -520,15 +572,29 @@ run_fixture_scenario() {
       "${dir}/state-during.json" >"${dir}/state-during.invalid.json"
     mv "${dir}/state-during.invalid.json" "${dir}/state-during.json"
   fi
+  if [[ "${CATS_FIXTURE_STATE_NONCE_REUSE:-false}" == true ]]; then
+    jq '.window_nonce = "ffffffffffffffffffffffffffffffff"' "${dir}/state-during.json" >"${dir}/state-during.invalid.json"
+    mv "${dir}/state-during.invalid.json" "${dir}/state-during.json"
+  fi
   fixture_oracle isolated "${scenario}" "${trial}" >"${dir}/oracle-isolated.json"
   fixture_oracle recovered "${scenario}" "${trial}" >"${dir}/oracle-recovered.json"
+  if [[ "${CATS_FIXTURE_ORACLE_NONCE_REUSE:-false}" == true ]]; then
+    jq '.window_nonce = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"' "${dir}/oracle-isolated.json" >"${dir}/oracle-isolated.invalid.json"
+    mv "${dir}/oracle-isolated.invalid.json" "${dir}/oracle-isolated.json"
+  fi
+  if [[ "${CATS_FIXTURE_TIMESTAMP_ORDER_FAIL:-false}" == true ]]; then
+    jq '.started_at = "2026-08-05T14:00:05Z" | .completed_at = "2026-08-05T14:00:05Z"' \
+      "${dir}/oracle-isolated.json" >"${dir}/oracle-isolated.invalid.json"
+    mv "${dir}/oracle-isolated.invalid.json" "${dir}/oracle-isolated.json"
+  fi
   if [[ "${scenario}" == *control-plane* || "${scenario}" == all-3 ]]; then
     jq -n --arg window "${RUN_ID}-${trial}" --arg scenario "${scenario}" --arg trial "${trial}" \
-      --arg node "${NODE_ID}" --arg cat "$(jq -r '.assigned_cats[0].cat_id' "${OWNERSHIP_SNAPSHOT}")" '
-      {schema_version:2,source:"external-control-plane-observer",window_id:$window,
+      --arg node "${NODE_ID}" --arg cat "$(jq -r '.assigned_cats[0].cat_id' "${OWNERSHIP_SNAPSHOT}")" --arg nonce "${WINDOW_NONCE}" '
+      {schema_version:2,source:"external-control-plane-observer",window_id:$window,window_nonce:$nonce,
        scenario:$scenario,trial:$trial,node_id:$node,cat_id:$cat,generation:17,
-       started_at:"2026-08-05T14:00:00Z",completed_at:"2026-08-05T14:00:03Z",
-       lost_observed_at:"2026-08-05T14:00:01Z",recovered_observed_at:"2026-08-05T14:00:02Z",
+       started_at:"2026-08-05T14:00:00Z",completed_at:"2026-08-05T14:00:06Z",
+       injection_observed_at:"2026-08-05T14:00:01Z",observer_armed_at:"2026-08-05T14:00:01Z",
+       lost_observed_at:"2026-08-05T14:00:02Z",recovered_observed_at:"2026-08-05T14:00:05Z",
        lost_cat_observed_state:"unknown",
        checks:{node_lost_observed:true,exact_cat_claim_preserved:true,
          generation_replacement_absent:true,node_recovered_cordoned:true,
@@ -536,6 +602,11 @@ run_fixture_scenario() {
       >"${dir}/external-observer.json"
     if [[ "${CATS_FIXTURE_OBSERVER_FAIL:-false}" == true ]]; then
       jq '.checks.node_lost_observed = false' "${dir}/external-observer.json" >"${dir}/external-observer.invalid.json"
+      mv "${dir}/external-observer.invalid.json" "${dir}/external-observer.json"
+    fi
+    if [[ "${CATS_FIXTURE_OBSERVER_PREEXISTING_LOST:-false}" == true ]]; then
+      jq '.injection_observed_at = "2026-08-05T14:00:03Z" | .observer_armed_at = "2026-08-05T14:00:03Z"' \
+        "${dir}/external-observer.json" >"${dir}/external-observer.invalid.json"
       mv "${dir}/external-observer.invalid.json" "${dir}/external-observer.json"
     fi
     if [[ "${CATS_FIXTURE_OBSERVER_MISSING:-false}" == true ]]; then
@@ -571,11 +642,13 @@ run_fixture_scenario() {
     fi
   fi
   jq -n --arg run_id "${RUN_ID}-${trial}" --arg scenario "${scenario}" --arg trial "${trial}" --arg instance "${TEMP_INSTANCE_ID}" \
+    --arg nonce "${WINDOW_NONCE}" \
     --arg node "${NODE_ID}" --arg test_sha "$(jq -r .test_sha "${PROVISIONING_MANIFEST}")" \
     --arg harness_sha "${HARNESS_SHA256}" --argjson combo "$(is_combo_scenario "${scenario}" && printf true || printf false)" \
-    '{schema_version:2,run_id:$run_id,scenario:$scenario,trial:$trial,
+    '{schema_version:2,run_id:$run_id,window_nonce:$nonce,scenario:$scenario,trial:$trial,
       temp_instance_id:$instance,node_id:$node,test_sha:$test_sha,harness_sha256:$harness_sha,
-      helper_sha256:("4"*64),config_sha256:("2"*64),hook_sha256:("3"*64),
+      helper_sha256:("4"*64),config_sha256:("2"*64),hook_sha256:("3"*64),guard_sha256:("4"*64),
+      injection_barrier:{window_nonce:$nonce,injected_at:"2026-08-05T14:00:01Z"},
       firewall:(if $combo then {mode:"simultaneous",evidence_ref:"combination-provenance.json"}
         else {comment:("cats-q124-"+$run_id),chains:["C124O_fixture","C124I_fixture","C1246O_fixture","C1246I_fixture"]} end)}' \
     >"${dir}/provenance.json"
@@ -643,17 +716,20 @@ validate_scenario_evidence() {
     (keys | sort) == (["schema_version","operation_id","kind","phase","node_id","started_at","completed_at","log_ref"] | sort) and
     .schema_version == 1 and .kind == "ensure_node_cordoned" and .phase == "succeeded" and .node_id == $node
   ' "${dir}/cordon-operation.json" >/dev/null || return 1
-  jq -e --arg run_id "${RUN_ID}-${trial}" --arg scenario "${scenario}" --arg trial "${trial}" --arg instance "${TEMP_INSTANCE_ID}" --arg node "${NODE_ID}" \
+  jq -e --arg run_id "${RUN_ID}-${trial}" --arg nonce "${WINDOW_NONCE}" --arg scenario "${scenario}" --arg trial "${trial}" --arg instance "${TEMP_INSTANCE_ID}" --arg node "${NODE_ID}" \
     --arg test_sha "$(jq -r .test_sha "${PROVISIONING_MANIFEST}")" \
     --arg harness_sha "${HARNESS_SHA256}" \
     --arg config_sha "$(jq -r .qualification_assets.config_sha256 "${PROVISIONING_MANIFEST}")" \
     --arg hook_sha "$(jq -r .qualification_assets.hook_sha256 "${PROVISIONING_MANIFEST}")" \
+    --arg guard_sha "$(jq -r .qualification_assets.guard_sha256 "${PROVISIONING_MANIFEST}")" \
     --argjson combo "$(is_combo_scenario "${scenario}" && printf true || printf false)" '
-    (keys | sort) == (["schema_version","run_id","scenario","trial","temp_instance_id","node_id","test_sha","harness_sha256","helper_sha256","config_sha256","hook_sha256","firewall"] | sort) and
-    .schema_version == 2 and .run_id == $run_id and .scenario == $scenario and .trial == $trial and
+    (keys | sort) == (["schema_version","run_id","window_nonce","scenario","trial","temp_instance_id","node_id","test_sha","harness_sha256","helper_sha256","config_sha256","hook_sha256","guard_sha256","injection_barrier","firewall"] | sort) and
+    .schema_version == 2 and .run_id == $run_id and .window_nonce == $nonce and .scenario == $scenario and .trial == $trial and
     .temp_instance_id == $instance and .node_id == $node and
     .test_sha == $test_sha and .harness_sha256 == $harness_sha and
-    .config_sha256 == $config_sha and .hook_sha256 == $hook_sha and
+    .config_sha256 == $config_sha and .hook_sha256 == $hook_sha and .guard_sha256 == $guard_sha and
+    .injection_barrier.window_nonce == $nonce and
+    (.injection_barrier.injected_at|fromdateiso8601|type == "number") and
     (.helper_sha256 | test("^[0-9a-f]{64}$")) and
     (if $combo then
       .firewall == {mode:"simultaneous",evidence_ref:"combination-provenance.json"}
@@ -666,9 +742,10 @@ validate_scenario_evidence() {
   awk -F= '$1=="workload_delta" {found=1; if ($2+0 <= 0) bad=1} END {exit (!found || bad)}' \
     "${dir}/fault-counters.txt" || return 1
   for phase in before during after; do
-    jq -e --arg ws "${WORKSPACE_ID}" --arg node "${NODE_ID}" --arg scenario "${scenario}" --arg trial "${trial}" --arg durability "$(trial_durability "${trial}")" '
-      (keys | sort) == (["schema_version","captured_at","phase","scenario","trial","workspace_id","node_id","cats","raw_operations","log_refs"] | sort) and
-      .schema_version == 2 and .workspace_id == $ws and .scenario == $scenario and .trial == $trial and .node_id == $node and
+    jq -e --arg ws "${WORKSPACE_ID}" --arg node "${NODE_ID}" --arg scenario "${scenario}" --arg trial "${trial}" --arg durability "$(trial_durability "${trial}")" \
+      --arg window "${RUN_ID}-${trial}" --arg nonce "${WINDOW_NONCE}" '
+      (keys | sort) == (["schema_version","window_id","window_nonce","captured_at","phase","scenario","trial","workspace_id","node_id","cats","raw_operations","log_refs"] | sort) and
+      .schema_version == 2 and .window_id == $window and .window_nonce == $nonce and .workspace_id == $ws and .scenario == $scenario and .trial == $trial and .node_id == $node and
       (.captured_at | type == "string" and length > 0) and
       (.phase == "before" or .phase == "during" or .phase == "after") and
       (.cats | type == "array" and length == 1) and .cats[0].durability == $durability and
@@ -703,6 +780,21 @@ validate_scenario_evidence() {
   fi
   validate_oracle_file "${dir}/oracle-isolated.json" "${scenario}" "${trial}" isolated || return 1
   validate_oracle_file "${dir}/oracle-recovered.json" "${scenario}" "${trial}" recovered || return 1
+  jq -se '
+    .[0].captured_at as $before | .[1].started_at as $isolated_start |
+    .[1].completed_at as $isolated_end | .[2].captured_at as $during |
+    .[3].started_at as $recovered_start | .[3].completed_at as $recovered_end |
+    .[4].captured_at as $after |
+    all([$before,$isolated_start,$isolated_end,$during,$recovered_start,$recovered_end,$after][];
+      fromdateiso8601 | type == "number") and
+    ($before|fromdateiso8601) <= ($isolated_start|fromdateiso8601) and
+    ($isolated_start|fromdateiso8601) <= ($isolated_end|fromdateiso8601) and
+    ($isolated_end|fromdateiso8601) <= ($during|fromdateiso8601) and
+    ($during|fromdateiso8601) <= ($recovered_start|fromdateiso8601) and
+    ($recovered_start|fromdateiso8601) <= ($recovered_end|fromdateiso8601) and
+    ($recovered_end|fromdateiso8601) <= ($after|fromdateiso8601)
+  ' "${dir}/state-before.json" "${dir}/oracle-isolated.json" "${dir}/state-during.json" \
+    "${dir}/oracle-recovered.json" "${dir}/state-after.json" >/dev/null || return 1
   if is_combo_scenario "${scenario}"; then
     validate_combo_evidence "${dir}" "${scenario}" || return 1
   fi
@@ -717,18 +809,20 @@ validate_scenario_evidence() {
 validate_external_observer() {
   local file="$1" scenario="$2" trial="$3" before="$4"
   [[ -s "${file}" ]] || return 1
-  jq -e --arg window "${RUN_ID}-${trial}" --arg scenario "${scenario}" --arg trial "${trial}" \
+  jq -e --arg window "${RUN_ID}-${trial}" --arg nonce "${WINDOW_NONCE}" --arg scenario "${scenario}" --arg trial "${trial}" \
     --arg node "${NODE_ID}" --arg cat "$(jq -r '.cats[0].cat_id' "${before}")" \
     --argjson generation "$(jq '.cats[0].generation' "${before}")" '
-    (keys | sort) == (["schema_version","source","window_id","scenario","trial","node_id","cat_id",
-      "generation","started_at","completed_at","lost_observed_at","recovered_observed_at",
+    (keys | sort) == (["schema_version","source","window_id","window_nonce","scenario","trial","node_id","cat_id",
+      "generation","started_at","completed_at","injection_observed_at","observer_armed_at","lost_observed_at","recovered_observed_at",
       "lost_cat_observed_state","checks"] | sort) and
-    .schema_version == 2 and .source == "external-control-plane-observer" and .window_id == $window and
+    .schema_version == 2 and .source == "external-control-plane-observer" and .window_id == $window and .window_nonce == $nonce and
     .scenario == $scenario and .trial == $trial and .node_id == $node and .cat_id == $cat and
     .generation == $generation and
-    all([.started_at,.completed_at,.lost_observed_at,.recovered_observed_at][];
+    all([.started_at,.completed_at,.injection_observed_at,.observer_armed_at,.lost_observed_at,.recovered_observed_at][];
       type == "string" and (fromdateiso8601 | type == "number")) and
-    (.started_at|fromdateiso8601) <= (.lost_observed_at|fromdateiso8601) and
+    (.started_at|fromdateiso8601) <= (.injection_observed_at|fromdateiso8601) and
+    (.injection_observed_at|fromdateiso8601) <= (.observer_armed_at|fromdateiso8601) and
+    (.observer_armed_at|fromdateiso8601) <= (.lost_observed_at|fromdateiso8601) and
     (.lost_observed_at|fromdateiso8601) <= (.recovered_observed_at|fromdateiso8601) and
     (.recovered_observed_at|fromdateiso8601) <= (.completed_at|fromdateiso8601) and
     (.lost_cat_observed_state == "unknown" or .lost_cat_observed_state == "stopping" or
@@ -741,9 +835,9 @@ validate_external_observer() {
 
 write_merged_oracle() {
   local dir="$1" scenario="$2" trial="$3"
-  jq -n --arg window "${RUN_ID}-${trial}" --arg scenario "${scenario}" --arg trial "${trial}" \
+  jq -n --arg window "${RUN_ID}-${trial}" --arg nonce "${WINDOW_NONCE}" --arg scenario "${scenario}" --arg trial "${trial}" \
     --slurpfile host "${dir}/oracle-isolated.json" --slurpfile external "${dir}/external-observer.json" '
-    {schema_version:2,window_id:$window,scenario:$scenario,trial:$trial,phase:"isolated",
+    {schema_version:2,window_id:$window,window_nonce:$nonce,scenario:$scenario,trial:$trial,phase:"isolated",
      sources:{host:"oracle-isolated.json",control_plane:"external-observer.json"},
      checks:($host[0].checks + $external[0].checks)}' >"${dir}/oracle-isolated-merged.json"
 }
@@ -751,9 +845,9 @@ write_merged_oracle() {
 validate_merged_oracle() {
   local dir="$1" scenario="$2" trial="$3"
   [[ -s "${dir}/oracle-isolated-merged.json" ]] || return 1
-  jq -e --arg window "${RUN_ID}-${trial}" --arg scenario "${scenario}" --arg trial "${trial}" \
+  jq -e --arg window "${RUN_ID}-${trial}" --arg nonce "${WINDOW_NONCE}" --arg scenario "${scenario}" --arg trial "${trial}" \
     --slurpfile host "${dir}/oracle-isolated.json" --slurpfile external "${dir}/external-observer.json" '
-    .schema_version == 2 and .window_id == $window and .scenario == $scenario and .trial == $trial and
+    .schema_version == 2 and .window_id == $window and .window_nonce == $nonce and .scenario == $scenario and .trial == $trial and
     .phase == "isolated" and
     .sources == {host:"oracle-isolated.json",control_plane:"external-observer.json"} and
     .checks == ($host[0].checks + $external[0].checks) and
@@ -764,11 +858,13 @@ validate_merged_oracle() {
 
 validate_combo_step_file() {
   local file="$1" scenario="$2" dep="$3" remaining="$4"
-  jq -e --arg scenario "${scenario}" --arg trial "${TRIAL}" --arg dep "${dep}" --argjson remaining "${remaining}" '
-    (keys | sort) == (["schema_version","scenario","trial","phase","restored_dependency","remaining_dependencies","started_at","completed_at","checks","raw_operations","log_refs"] | sort) and
-    .schema_version == 2 and .scenario == $scenario and .trial == $trial and .phase == "partial-recovery" and
+  jq -e --arg scenario "${scenario}" --arg trial "${TRIAL}" --arg dep "${dep}" --argjson remaining "${remaining}" \
+    --arg window "${RUN_ID}-${TRIAL}" --arg nonce "${WINDOW_NONCE}" '
+    (keys | sort) == (["schema_version","window_id","window_nonce","scenario","trial","phase","restored_dependency","remaining_dependencies","started_at","completed_at","checks","raw_operations","log_refs"] | sort) and
+    .schema_version == 2 and .window_id == $window and .window_nonce == $nonce and .scenario == $scenario and .trial == $trial and .phase == "partial-recovery" and
     .restored_dependency == $dep and .remaining_dependencies == $remaining and
-    all([.started_at,.completed_at][]; type == "string" and length > 0) and
+    all([.started_at,.completed_at][]; type == "string" and (fromdateiso8601 | type == "number")) and
+    (.started_at|fromdateiso8601) <= (.completed_at|fromdateiso8601) and
     (.checks | keys | sort) == (["restored_dependency_positive","remaining_dependencies_negative","false_success_absent","digest_preserved","generation_preserved","disk_epoch_preserved"] | sort) and
     all(.checks[]; . == true) and
     (.raw_operations | type == "array" and length > 0) and
@@ -839,16 +935,29 @@ validate_combo_evidence() {
     }
   done < <(jq -r '.[]' <<<"${recovery}")
   rm -f "${dir}/.validate-recovery-step.json"
+  jq -e --slurpfile during "${dir}/state-during.json" --slurpfile recovered "${dir}/oracle-recovered.json" '
+    . as $steps |
+    all($steps[]; (.started_at|fromdateiso8601|type == "number") and
+      (.completed_at|fromdateiso8601|type == "number") and
+      (.started_at|fromdateiso8601) <= (.completed_at|fromdateiso8601)) and
+    (($steps|length) == 0 or
+      (($steps[0].started_at|fromdateiso8601) >= ($during[0].captured_at|fromdateiso8601) and
+       ($steps[-1].completed_at|fromdateiso8601) <= ($recovered[0].started_at|fromdateiso8601))) and
+    all(range(1; ($steps|length)); . as $i |
+      ($steps[$i-1].completed_at|fromdateiso8601) <= ($steps[$i].started_at|fromdateiso8601))
+  ' "${dir}/recovery-steps.json" >/dev/null || return 1
 }
 
 validate_oracle_file() {
   local file="$1" scenario="$2" trial="$3" phase="$4" required
   required="$(oracle_required_checks "${scenario}" "${trial}" "${phase}")" || return 1
-  jq -e --arg scenario "${scenario}" --arg trial "${trial}" --arg phase "${phase}" --argjson required "${required}" '
+  jq -e --arg scenario "${scenario}" --arg trial "${trial}" --arg phase "${phase}" --argjson required "${required}" \
+    --arg window "${RUN_ID}-${trial}" --arg nonce "${WINDOW_NONCE}" '
     . as $root |
-    (keys | sort) == (["schema_version","scenario","trial","phase","started_at","completed_at","checks","raw_operations","log_refs"] | sort) and
-    .schema_version == 2 and .scenario == $scenario and .trial == $trial and .phase == $phase and
-    all([.started_at,.completed_at][]; type == "string" and length > 0) and
+    (keys | sort) == (["schema_version","window_id","window_nonce","scenario","trial","phase","started_at","completed_at","checks","raw_operations","log_refs"] | sort) and
+    .schema_version == 2 and .window_id == $window and .window_nonce == $nonce and .scenario == $scenario and .trial == $trial and .phase == $phase and
+    all([.started_at,.completed_at][]; type == "string" and (fromdateiso8601 | type == "number")) and
+    (.started_at|fromdateiso8601) <= (.completed_at|fromdateiso8601) and
     (.checks | keys | sort) == ($required | sort) and
     (.raw_operations | type == "array" and length > 0) and
     all(.raw_operations[];
@@ -889,11 +998,12 @@ prepare_live_ownership() {
   local trial="$1" qrun remote_output remote_gzip command parameters response command_id status deadline
   local stdout_content stderr_content encoded next
   qrun="${RUN_ID}-${trial}"
+  arm_external_recordon_watchdog "${trial}"
   remote_output="/run/cats-q124-prepared-${qrun}.json"
   remote_gzip="${remote_output}.gz"
   printf -v command \
-    'umask 077; sudo env Q124_RUN_ID=%q Q124_TEST_SHA=%q %q prepare-trial --scenario %q --trial %q --workspace-id %q --node-id %q --cat-id %q --cat-name %q --instance-id %q --output %q >/dev/null; rc=$?; if ((rc != 0)); then exit "$rc"; fi; gzip -9c %q >%q || exit 74; encoded=$(openssl base64 -A <%q) || exit 74; printf "Q124_PREPARED_OWNERSHIP=%%s\\n" "$encoded"; rm -f %q %q' \
-    "${qrun}" "$(jq -r .test_sha "${PROVISIONING_MANIFEST}")" "${REMOTE_HOOK}" \
+    'umask 077; sudo env Q124_RUN_ID=%q Q124_WINDOW_NONCE=%q Q124_TEST_SHA=%q %q exec-hook prepare-trial --scenario %q --trial %q --workspace-id %q --node-id %q --cat-id %q --cat-name %q --instance-id %q --output %q >/dev/null; rc=$?; if ((rc != 0)); then exit "$rc"; fi; gzip -9c %q >%q || exit 74; encoded=$(openssl base64 -A <%q) || exit 74; printf "Q124_PREPARED_OWNERSHIP=%%s\\n" "$encoded"; rm -f %q %q' \
+    "${qrun}" "${WINDOW_NONCE}" "$(jq -r .test_sha "${PROVISIONING_MANIFEST}")" "${REMOTE_GUARD}" \
     "${SCENARIO}" "${trial}" "${WORKSPACE_ID}" "${NODE_ID}" "${TARGET_CAT_ID}" "${TARGET_CAT_NAME}" \
     "${TEMP_INSTANCE_ID}" "${remote_output}" "${remote_output}" "${remote_gzip}" "${remote_gzip}" \
     "${remote_output}" "${remote_gzip}"
@@ -937,11 +1047,58 @@ prepare_live_ownership() {
   mv "${next}" "${OWNERSHIP_SNAPSHOT}"
 }
 
+arm_external_recordon_watchdog() {
+  local trial="$1" repo marker confirmation comments match run_id run evidence deadline
+  require_command gh
+  repo="$(gh repo view --json nameWithOwner --jq .nameWithOwner)" || die "cannot resolve GitHub repository"
+  [[ "${repo}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "unsafe GitHub repository identity"
+  marker="<!-- cats-q124-recordon:${WINDOW_NONCE}:armed -->"
+  confirmation="ARM_Q124_RECORDON_${NODE_ID}_${WINDOW_NONCE}"
+  evidence="${OWNERSHIP_SNAPSHOT}.recordon-watchdog.json"
+  [[ ! -e "${evidence}" ]] || die "watchdog arm evidence already exists"
+  gh workflow run q124-recordon-watchdog.yml --repo "${repo}" --ref main \
+    -f workspace_id="${WORKSPACE_ID}" -f node_id="${NODE_ID}" \
+    -f window_nonce="${WINDOW_NONCE}" -f confirmation="${confirmation}" >/dev/null ||
+    die "independent re-cordon watchdog dispatch failed"
+  deadline=$((SECONDS + 180))
+  while (( SECONDS < deadline )); do
+    comments="$(gh api --paginate "repos/${repo}/issues/124/comments" | jq -sc 'add')" ||
+      die "cannot read watchdog armed markers"
+    match="$(jq -c --arg marker "${marker}" --arg node "${NODE_ID}" --arg ws "${WORKSPACE_ID}" '
+      [.[] | select((.body // "") | contains($marker)) |
+        select((.body // "") | contains("status=armed node=" + $node + " workspace=" + $ws + " run_id="))] |
+      if length == 1 then .[0] else empty end
+    ' <<<"${comments}")"
+    if [[ -n "${match}" ]]; then
+      run_id="$(jq -r --arg marker "${marker}" '
+        .body | capture("run_id=(?<id>[0-9]+)").id
+      ' <<<"${match}")"
+      [[ "${run_id}" =~ ^[0-9]+$ ]] || die "watchdog armed marker has invalid run ID"
+      run="$(gh api "repos/${repo}/actions/runs/${run_id}")" || die "cannot verify watchdog run"
+      jq -e --arg title "q124-recordon ${NODE_ID} ${WINDOW_NONCE}" \
+        --arg sha "$(jq -r .test_sha "${PROVISIONING_MANIFEST}")" '
+        .name == "Q124 exact-Node re-cordon watchdog" and .display_title == $title and
+        .event == "workflow_dispatch" and .head_branch == "main" and .head_sha == $sha and
+        (.status == "queued" or .status == "in_progress")
+      ' <<<"${run}" >/dev/null || die "armed marker is not bound to the expected live watchdog run"
+      jq -n --arg nonce "${WINDOW_NONCE}" --arg node "${NODE_ID}" --arg ws "${WORKSPACE_ID}" \
+        --arg repo "${repo}" --argjson run_id "${run_id}" --arg trial "${trial}" \
+        --arg armed_at "$(date -u +%FT%TZ)" \
+        '{schema_version:1,window_nonce:$nonce,node_id:$node,workspace_id:$ws,repository:$repo,
+          workflow_run_id:$run_id,trial:$trial,status:"armed",armed_at:$armed_at}' >"${evidence}"
+      chmod 0600 "${evidence}"
+      return 0
+    fi
+    sleep 2
+  done
+  die "independent re-cordon watchdog did not publish its exact armed state"
+}
+
 run_live_scenario() {
   local scenario="$1" trial="$2" command parameters response command_id status rc
   local dir="${RUN_DIR}/${trial}"
   local functional_rc cleanup_rc stdout_content stderr_content secret_rc=0
-  local deadline observer_pid="" observer_rc=0 observer_output="" observer_ready="" observer_deadline cat_id=""
+  local deadline observer_pid="" observer_rc=0 observer_output="" observer_ready="" observer_armed="" observer_deadline cat_id="" current_stdout injected_at
   mkdir -p "${dir}"
   command="$(build_ssm_command "${scenario}" "${trial}")"
   parameters="$(jq -cn --arg command "${command}" --arg timeout "${SSM_TIMEOUT_SECONDS}" \
@@ -950,26 +1107,33 @@ run_live_scenario() {
     cat_id="$(jq -r '.assigned_cats[0].cat_id' "${OWNERSHIP_SNAPSHOT}")"
     observer_output="/run/cats-q124-observer-${RUN_ID}-${trial}.json"
     observer_ready="/run/cats-q124-observer-${RUN_ID}-${trial}.ready"
-    sudo -n rm -f "${observer_output}" "${observer_ready}"
-    sudo -n env Q124_RUN_ID="${RUN_ID}-${trial}" "${OBSERVER_HOOK}" observe-window \
+    observer_armed="/run/cats-q124-observer-${RUN_ID}-${trial}.armed"
+    OBSERVER_TEMP_FILES=("${observer_output}" "${observer_ready}" "${observer_armed}")
+    sudo -n rm -f "${OBSERVER_TEMP_FILES[@]}"
+    python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1],sys.argv[1:])' \
+      sudo -n env Q124_RUN_ID="${RUN_ID}-${trial}" Q124_WINDOW_NONCE="${WINDOW_NONCE}" \
+      "${OBSERVER_HOOK}" observe-window \
       --scenario "${scenario}" --trial "${trial}" --workspace-id "${WORKSPACE_ID}" \
       --node-id "${NODE_ID}" --cat-id "${cat_id}" --timeout-seconds "${SSM_TIMEOUT_SECONDS}" \
-      --ready-file "${observer_ready}" --output "${observer_output}" >/dev/null 2>&1 &
+      --ready-file "${observer_ready}" --armed-file "${observer_armed}" --output "${observer_output}" >/dev/null 2>&1 &
     observer_pid=$!
+    OBSERVER_PROCESS_GROUP="${observer_pid}"
     observer_deadline=$((SECONDS + 20))
     until [[ -s "${observer_ready}" ]]; do
       kill -0 "${observer_pid}" 2>/dev/null || {
-        wait "${observer_pid}" || true
-        sudo -n rm -f "${observer_output}" "${observer_ready}"
+        cleanup_external_observer
         die "external observer/API preflight failed before fault injection"
       }
       (( SECONDS < observer_deadline )) || {
-        kill "${observer_pid}" 2>/dev/null || true; wait "${observer_pid}" 2>/dev/null || true
-        sudo -n rm -f "${observer_output}" "${observer_ready}"
+        cleanup_external_observer
         die "external observer readiness timed out before fault injection"
       }
       sleep 1
     done
+    jq -e --arg window "${RUN_ID}-${trial}" --arg nonce "${WINDOW_NONCE}" \
+      '.schema_version == 1 and .window_id == $window and .window_nonce == $nonce and
+       .baseline_node_state == "cordoned" and (.observer_ready_at|fromdateiso8601|type == "number")' \
+      "${observer_ready}" >/dev/null || die "external observer readiness identity is invalid"
   fi
   if ! response="$(aws ssm send-command --region "${AWS_REGION}" \
     --document-name AWS-RunShellScript \
@@ -977,8 +1141,7 @@ run_live_scenario() {
     --timeout-seconds "${SSM_TIMEOUT_SECONDS}" \
     --comment "Issue 124 ${RUN_ID} ${trial}" \
     --parameters "${parameters}" --output json)"; then
-    [[ -z "${observer_pid}" ]] || { kill "${observer_pid}" 2>/dev/null || true; wait "${observer_pid}" 2>/dev/null || true; }
-    [[ -z "${observer_output}" ]] || sudo -n rm -f "${observer_output}" "${observer_ready}"
+    cleanup_external_observer
     return 1
   fi
   command_id="$(jq -r .Command.CommandId <<<"${response}")"
@@ -990,6 +1153,16 @@ run_live_scenario() {
     response="$(aws ssm get-command-invocation --region "${AWS_REGION}" \
       --command-id "${command_id}" --instance-id "${TEMP_INSTANCE_ID}" --output json 2>/dev/null || true)"
     status="$(jq -r '.Status // "Pending"' <<<"${response:-{}}")"
+    if [[ -n "${observer_pid}" && ! -e "${observer_armed}" ]]; then
+      current_stdout="$(jq -r '.StandardOutputContent // ""' <<<"${response:-{}}")"
+      injected_at="$(sed -n "s/^Q124_INJECTION_BARRIER nonce=${WINDOW_NONCE} injected_at=\\([^[:space:]]*\\)$/\\1/p" <<<"${current_stdout}" | tail -1)"
+      if [[ -n "${injected_at}" ]] && jq -en --arg at "${injected_at}" '$at|fromdateiso8601|type == "number"' >/dev/null; then
+        jq -n --arg window "${RUN_ID}-${trial}" --arg nonce "${WINDOW_NONCE}" --arg at "${injected_at}" \
+          '{schema_version:1,window_id:$window,window_nonce:$nonce,injected_at:$at}' |
+          sudo -n tee "${observer_armed}" >/dev/null
+        sudo -n chmod 0644 "${observer_armed}"
+      fi
+    fi
     case "${status}" in
       Pending|InProgress|Delayed) sleep 2 ;;
       Success|Cancelled|TimedOut|Failed|Cancelling) break ;;
@@ -1019,13 +1192,15 @@ run_live_scenario() {
   rc=0
   if [[ -n "${observer_pid}" ]]; then
     wait "${observer_pid}" || observer_rc=$?
+    OBSERVER_PROCESS_GROUP=""
     if (( observer_rc == 0 )) && sudo -n test -s "${observer_output}"; then
       sudo -n cat "${observer_output}" >"${dir}/external-observer.json" || observer_rc=1
       chmod 0600 "${dir}/external-observer.json"
     else
       observer_rc=1
     fi
-    sudo -n rm -f "${observer_output}" "${observer_ready}"
+    sudo -n rm -f "${observer_output}" "${observer_ready}" "${observer_armed}"
+    OBSERVER_TEMP_FILES=()
     if (( observer_rc == 0 )); then write_merged_oracle "${dir}" "${scenario}" "${trial}" || observer_rc=1; fi
   fi
   [[ "${status}" == "Success" ]] || rc=1
@@ -1040,6 +1215,11 @@ main() {
   require_command openssl
   require_command gzip
   validate_inputs
+  if [[ "${MODE}" == live ]]; then
+    # This gate precedes provenance checks, directory creation, AWS/SSM/GitHub
+    # calls, watchdog dispatch, preparation, and every worker invocation.
+    die "DO NOT LIVE: worker admin authority was removed; independent-runner prepare/snapshot/action/observer control is incomplete"
+  fi
   validate_manifest "${PROVISIONING_MANIFEST}"
   if [[ -z "${CATS_REMOTE_WORKLOAD_HOOK:-}" ]]; then
     REMOTE_HOOK="/opt/cats/qualification-124/$(jq -r .test_sha "${PROVISIONING_MANIFEST}")/q124-fault-workload"
@@ -1118,9 +1298,12 @@ NODE_ID="${Q124_NODE_ID:?}"
 WORKSPACE_ID="${Q124_WORKSPACE_ID:?}"
 CONFIG_REF="${Q124_CONFIG_REF:?}"
 HOOK_REF="${Q124_HOOK_REF:?}"
+GUARD_REF="${Q124_GUARD_REF:?}"
 TEST_SHA="${Q124_TEST_SHA:?}"
 EXPECTED_CONFIG_SHA256="${Q124_CONFIG_SHA256:?}"
 EXPECTED_HOOK_SHA256="${Q124_HOOK_SHA256:?}"
+EXPECTED_GUARD_SHA256="${Q124_GUARD_SHA256:?}"
+WINDOW_NONCE="${Q124_WINDOW_NONCE:?}"
 HARNESS_SHA256="${Q124_HARNESS_SHA256:?}"
 EXPECTED_HELPER_SHA256="${Q124_HELPER_SHA256:?}"
 EXPECTED_CAT_SET_SHA256="${Q124_CAT_SET_SHA256:?}"
@@ -1154,6 +1337,16 @@ record() {
   printf '%s\t%s\t%s\t%s\t%s\n' "${ORDINAL}" "$(date -u +%FT%TZ)" "${SCENARIO}" "$1" "$2" >>"${TIMELINE}"
 }
 
+signal_injection_barrier() {
+  local injected_at next
+  injected_at="$(date -u +%FT%TZ)"
+  next="${PROVENANCE}.next"
+  jq --arg nonce "${WINDOW_NONCE}" --arg at "${injected_at}" \
+    '.injection_barrier={window_nonce:$nonce,injected_at:$at}' "${PROVENANCE}" >"${next}" || return 1
+  mv "${next}" "${PROVENANCE}"
+  printf 'Q124_INJECTION_BARRIER nonce=%s injected_at=%s\n' "${WINDOW_NONCE}" "${injected_at}"
+}
+
 fail() {
   printf 'Q124_ERROR %s\n' "$*" >&2
   return 1
@@ -1177,14 +1370,9 @@ validate_root_file() {
 }
 
 run_hook() {
-  local actual_sha
-  validate_root_file "${HOOK_REF}" hook || return 1
-  [[ -x "${HOOK_REF}" ]] || { fail "hook is not executable"; return 1; }
-  actual_sha="$(sha256sum "${HOOK_REF}" | awk '{print $1}')"
-  [[ "${actual_sha}" == "${EXPECTED_HOOK_SHA256}" ]] || {
-    fail "hook SHA changed before invocation; refusing command $1"; return 1;
-  }
-  "${HOOK_REF}" "$@"
+  # The root-owned guard re-reads the fixed provisioning manifest and validates
+  # itself, the hook, config, and every ancestor immediately before each call.
+  "${GUARD_REF}" exec-hook "$@"
 }
 
 conf_get() {
@@ -1263,10 +1451,11 @@ cordon_evidence_valid() {
 
 state_valid() {
   jq -e --arg ws "${WORKSPACE_ID}" --arg node "${NODE_ID}" --arg scenario "${SCENARIO}" \
-    --arg trial "${TRIAL}" --arg durability "$(trial_durability "${TRIAL}")" '
-    (keys | sort) == (["schema_version","captured_at","phase","scenario","trial","workspace_id","node_id","cats","raw_operations","log_refs"] | sort) and
-    .schema_version == 2 and .workspace_id == $ws and .scenario == $scenario and .trial == $trial and .node_id == $node and
-    (.captured_at | type == "string" and length > 0) and
+    --arg trial "${TRIAL}" --arg durability "$(trial_durability "${TRIAL}")" \
+    --arg window "${RUN_ID}" --arg nonce "${WINDOW_NONCE}" '
+    (keys | sort) == (["schema_version","window_id","window_nonce","captured_at","phase","scenario","trial","workspace_id","node_id","cats","raw_operations","log_refs"] | sort) and
+    .schema_version == 2 and .window_id == $window and .window_nonce == $nonce and .workspace_id == $ws and .scenario == $scenario and .trial == $trial and .node_id == $node and
+    (.captured_at | fromdateiso8601 | type == "number") and
     (.phase == "before" or .phase == "during" or .phase == "after") and
     (.cats | type == "array" and length == 1) and .cats[0].durability == $durability and
     all(.cats[];
@@ -1332,11 +1521,13 @@ oracle_valid() {
     all-3-*:recovered) required='["host_reconnected","db_reconnected","s3_converged","final_digest_verified","generation_preserved","disk_epoch_preserved"]' ;;
     *) return 1 ;;
   esac
-  jq -e --arg scenario "${SCENARIO}" --arg trial "${TRIAL}" --arg phase "${phase}" --argjson required "${required}" '
+  jq -e --arg scenario "${SCENARIO}" --arg trial "${TRIAL}" --arg phase "${phase}" --argjson required "${required}" \
+    --arg window "${RUN_ID}" --arg nonce "${WINDOW_NONCE}" '
     . as $root |
-    (keys | sort) == (["schema_version","scenario","trial","phase","started_at","completed_at","checks","raw_operations","log_refs"] | sort) and
-    .schema_version == 2 and .scenario == $scenario and .trial == $trial and .phase == $phase and
-    all([.started_at,.completed_at][]; type == "string" and length > 0) and
+    (keys | sort) == (["schema_version","window_id","window_nonce","scenario","trial","phase","started_at","completed_at","checks","raw_operations","log_refs"] | sort) and
+    .schema_version == 2 and .window_id == $window and .window_nonce == $nonce and .scenario == $scenario and .trial == $trial and .phase == $phase and
+    all([.started_at,.completed_at][]; type == "string" and (fromdateiso8601 | type == "number")) and
+    (.started_at|fromdateiso8601) <= (.completed_at|fromdateiso8601) and
     (.checks | keys | sort) == ($required | sort) and
     (.raw_operations | type == "array" and length > 0) and
     all(.raw_operations[];
@@ -1769,12 +1960,14 @@ combo_all_rules_absent() {
 
 combo_step_oracle_valid() {
   local file="$1" dep="$2" remaining_json="$3"
-  jq -e --arg scenario "${SCENARIO}" --arg trial "${TRIAL}" --arg dep "${dep}" --argjson remaining "${remaining_json}" '
-    (keys | sort) == (["schema_version","scenario","trial","phase","restored_dependency","remaining_dependencies","started_at","completed_at","checks","raw_operations","log_refs"] | sort) and
-    .schema_version == 2 and .scenario == $scenario and .trial == $trial and .phase == "partial-recovery" and
+  jq -e --arg scenario "${SCENARIO}" --arg trial "${TRIAL}" --arg dep "${dep}" --argjson remaining "${remaining_json}" \
+    --arg window "${RUN_ID}" --arg nonce "${WINDOW_NONCE}" '
+    (keys | sort) == (["schema_version","window_id","window_nonce","scenario","trial","phase","restored_dependency","remaining_dependencies","started_at","completed_at","checks","raw_operations","log_refs"] | sort) and
+    .schema_version == 2 and .window_id == $window and .window_nonce == $nonce and .scenario == $scenario and .trial == $trial and .phase == "partial-recovery" and
     .restored_dependency == $dep and .remaining_dependencies == $remaining and
     (.checks | keys | sort) == (["restored_dependency_positive","remaining_dependencies_negative","false_success_absent","digest_preserved","generation_preserved","disk_epoch_preserved"] | sort) and
-    all([.started_at,.completed_at][]; type == "string" and length > 0) and
+    all([.started_at,.completed_at][]; type == "string" and (fromdateiso8601 | type == "number")) and
+    (.started_at|fromdateiso8601) <= (.completed_at|fromdateiso8601) and
     all(.checks[]; . == true) and (.raw_operations | type == "array" and length > 0) and
     all(.raw_operations[];
       (keys | sort) == (["operation_id","kind","phase","started_at","completed_at","log_ref"] | sort) and
@@ -1786,7 +1979,7 @@ combo_step_oracle_valid() {
 }
 
 setup() {
-  local actual_config_sha actual_hook_sha actual_helper_sha address dep dep_dir port tuple
+  local actual_config_sha actual_hook_sha actual_guard_sha actual_helper_sha address dep dep_dir port tuple
   local -A seen_targets=()
   [[ "${EUID}" == 0 ]] || fail "remote helper must run as root"
   [[ "${INSTANCE_ID}" =~ ^i-[0-9a-f]{17}$ ]] || fail "invalid exact instance ID"
@@ -1797,22 +1990,29 @@ setup() {
   [[ "${HOOK_REF}" == "/opt/cats/qualification-124/${TEST_SHA}/q124-fault-workload" ]] || {
     fail "hook is not installed at the exact TEST_SHA-qualified path"; return 1;
   }
+  [[ "${GUARD_REF}" == "/opt/cats/qualification-124/${TEST_SHA}/q124-fault-guard" ]] || {
+    fail "guard is not installed at the exact TEST_SHA-qualified path"; return 1;
+  }
+  [[ "${WINDOW_NONCE}" =~ ^[0-9a-f]{32}$ ]] || { fail "invalid window nonce"; return 1; }
   case "${SCENARIO}" in
     db|s3|control-plane) ;;
     db-s3|db-control-plane|s3-control-plane|all-3) combo_init || return 1 ;;
     *) fail "invalid scenario"; return 1 ;;
   esac
   valid_trial "${SCENARIO}" "${TRIAL}" || { fail "invalid scenario/trial"; return 1; }
-  safe_ref "${CONFIG_REF}" && safe_ref "${HOOK_REF}" || return 1
+  safe_ref "${CONFIG_REF}" && safe_ref "${HOOK_REF}" && safe_ref "${GUARD_REF}" || return 1
   for command in jq iptables iptables-save systemd-run systemctl getent timeout flock sha256sum openssl gzip; do
     command -v "${command}" >/dev/null || return 1
   done
   if [[ "${SCENARIO}" == *db* || "${SCENARIO}" == *control-plane* || "${SCENARIO}" == all-3 ]]; then
     command -v psql >/dev/null || { fail "reviewed PostgreSQL client is not preinstalled"; return 1; }
   fi
+  # This immutable gate precedes the first prepare/fault/rollback-side action.
+  "${GUARD_REF}" verify || { fail "immutable asset gate rejected remote execution"; return 1; }
   validate_root_file "${CONFIG_REF}" config || return 1
   validate_root_file "${HOOK_REF}" hook || return 1
-  [[ -x "${HOOK_REF}" ]] || return 1
+  validate_root_file "${GUARD_REF}" hook || return 1
+  [[ -x "${HOOK_REF}" && -x "${GUARD_REF}" ]] || return 1
   jq -e '
     (keys | sort) == (["schema_version","db_host","db_port","s3_host","s3_port","control_plane_host","control_plane_port","node_listen_ip","node_listen_port","fault_duration_seconds","control_plane_lease_timeout_seconds"] | sort) and
     .schema_version == 1 and
@@ -1824,9 +2024,11 @@ setup() {
   ' "${CONFIG_REF}" >/dev/null || { fail "fault target config schema is not the exact allowlist"; return 1; }
   actual_config_sha="$(sha256sum "${CONFIG_REF}" | awk '{print $1}')"
   actual_hook_sha="$(sha256sum "${HOOK_REF}" | awk '{print $1}')"
+  actual_guard_sha="$(sha256sum "${GUARD_REF}" | awk '{print $1}')"
   actual_helper_sha="$(sha256sum "$0" | awk '{print $1}')"
   [[ "${actual_config_sha}" == "${EXPECTED_CONFIG_SHA256}" &&
      "${actual_hook_sha}" == "${EXPECTED_HOOK_SHA256}" &&
+     "${actual_guard_sha}" == "${EXPECTED_GUARD_SHA256}" &&
      "${actual_helper_sha}" == "${EXPECTED_HELPER_SHA256}" ]] ||
     { fail "qualification asset SHA mismatch"; return 1; }
 
@@ -1840,12 +2042,13 @@ setup() {
   jq -n --arg run_id "${RUN_ID}" --arg scenario "${SCENARIO}" --arg trial "${TRIAL}" \
     --arg instance "${INSTANCE_ID}" --arg node "${NODE_ID}" --arg test_sha "${TEST_SHA}" \
     --arg harness_sha "${HARNESS_SHA256}" --arg helper_sha "${actual_helper_sha}" \
-    --arg config_sha "${actual_config_sha}" --arg hook_sha "${actual_hook_sha}" \
+    --arg config_sha "${actual_config_sha}" --arg hook_sha "${actual_hook_sha}" --arg guard_sha "${actual_guard_sha}" \
+    --arg window_nonce "${WINDOW_NONCE}" \
     --arg comment "${COMMENT}" --arg chain4o "${CHAIN4O}" --arg chain4i "${CHAIN4I}" \
     --arg chain6o "${CHAIN6O}" --arg chain6i "${CHAIN6I}" \
     '{schema_version:2,run_id:$run_id,scenario:$scenario,trial:$trial,temp_instance_id:$instance,
       node_id:$node,test_sha:$test_sha,harness_sha256:$harness_sha,
-      helper_sha256:$helper_sha,config_sha256:$config_sha,hook_sha256:$hook_sha,
+      window_nonce:$window_nonce,helper_sha256:$helper_sha,config_sha256:$config_sha,hook_sha256:$hook_sha,guard_sha256:$guard_sha,
       firewall:{comment:$comment,chains:[$chain4o,$chain4i,$chain6o,$chain6i]}}' >"${PROVENANCE}"
 
   run_hook ensure-cordoned --scenario "${SCENARIO}" --trial "${TRIAL}" \
@@ -1964,6 +2167,7 @@ fault_window() {
       combo_arm_and_inject_dep "${dep}" || return 1
       record "injected-${dep}" PASS
     done
+    signal_injection_barrier || return 1
     for dep in "${COMBO_DEPS[@]}"; do combo_probe_dep "${dep}" isolated negative || return 1; done
     printf '%s\t-\tisolated-verified\n' "$(date -u +%FT%TZ)" >>"${STATE_DIR}/combination-order.tsv"
     record negative-tcp PASS
@@ -2024,6 +2228,7 @@ fault_window() {
   record watchdog-active PASS
   inject_rules || return 1
   record injected PASS
+  signal_injection_barrier || return 1
   all_probes_negative isolated || return 1
   record negative-tcp PASS
   record negative-real-read PASS

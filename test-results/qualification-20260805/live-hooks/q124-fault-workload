@@ -1,20 +1,18 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Issue-124 root-only dependency-fault workload and HA adapter.
+# Issue-124 root-only dependency-fault worker workload.
 #
-# This executable never creates or destroys a Cat, disk, Node, object, or
-# database row.  Its mutations are restricted to lifecycle actions on the
-# exact q124 Cats already assigned to the exact q124 temporary Node, plus
-# cordon/uncordon of that one Node for the HA adapter contract.  Secrets are
-# read only from fixed root-owned files and are supplied to clients through
-# stdin or mode-0600 temporary files; no secret is written to stdout/stderr.
+# This executable has no control-plane administrator capability.  It never
+# creates, destroys, places, starts, stops, syncs, cordons, or uncordons a Cats
+# resource.  It is limited to host-local observation/workload, read-only DB/S3
+# probes, and the public control-plane health endpoint.  Control-plane reads
+# and mutations belong to the independent recovery runner.
 
 API_ORIGIN="https://cats.run"
 API_HOST="cats.run"
 WORKSPACE_ID="ws_788c5bfc3931"
 WORKSPACE_LOCATOR="default/qual-124-20260805"
-TOKEN_FILE="/etc/cats/qualification-124/admin-token"
 WORKER_ENV="/etc/cats/worker.env"
 POSTGRES_URL_FILE="/run/cats/postgres-url"
 POSTGRES_CA_FILE="/etc/cats/rds-ca.pem"
@@ -74,12 +72,6 @@ safe_output_path() {
   [[ "$1" =~ ^/[-A-Za-z0-9._/]+$ && "$1" != *..* ]]
 }
 
-load_admin_token() {
-  validate_root_file "${TOKEN_FILE}" '^600$' 'admin token' || return 1
-  IFS= read -r ADMIN_TOKEN <"${TOKEN_FILE}"
-  [[ "${ADMIN_TOKEN}" =~ ^[A-Za-z0-9._~-]{20,512}$ ]] || fail "invalid admin token format"
-}
-
 worker_env_get() {
   local key="$1" line
   validate_root_file "${WORKER_ENV}" '^600$' 'worker environment' || return 1
@@ -90,11 +82,13 @@ worker_env_get() {
 }
 
 RUN_ID="${Q124_RUN_ID:-}"
+WINDOW_NONCE="${Q124_WINDOW_NONCE:-}"
 RUN_STATE=""
 OPS_FILE=""
 
 init_run_state() {
   [[ "${RUN_ID}" =~ ^[A-Za-z0-9._-]{8,160}$ ]] || fail "missing or unsafe Q124_RUN_ID"
+  [[ "${WINDOW_NONCE}" =~ ^[0-9a-f]{32}$ ]] || fail "missing or unsafe Q124_WINDOW_NONCE"
   RUN_STATE="/run/cats-q124-workload-${RUN_ID}"
   OPS_FILE="${RUN_STATE}/operations.json"
   if [[ ! -d "${RUN_STATE}" ]]; then
@@ -124,89 +118,6 @@ record_operation() {
 }
 
 valid_operation_id() { [[ "$1" =~ ^op_[A-Za-z0-9_-]+$ ]]; }
-
-# Writes an HTTP response body only to the caller-provided mode-0600 file and
-# stores the status in API_STATUS.  Curl receives the bearer header over its
-# config stdin, never argv.  Error bodies are never copied to stderr.
-api_request() {
-  local method="$1" path="$2" output="$3" body_file="${4:-}" status
-  [[ "${method}" =~ ^(GET|POST)$ && "${path}" =~ ^/[-A-Za-z0-9._/?=\&]+$ ]] || return 1
-  safe_output_path "${output}" || return 1
-  : >"${output}"; chmod 0600 "${output}"
-  if [[ -n "${body_file}" ]]; then
-    safe_output_path "${body_file}" && [[ -f "${body_file}" ]] || return 1
-    status="$(printf 'header = "Authorization: Bearer %s"\n' "${ADMIN_TOKEN}" |
-      curl --config - --silent --show-error --max-time 45 --request "${method}" \
-        --header 'accept: application/json' --header 'content-type: application/json' \
-        --data-binary "@${body_file}" --output "${output}" --write-out '%{http_code}' \
-        "${API_ORIGIN}${path}" 2>/dev/null)" || status=000
-  else
-    status="$(printf 'header = "Authorization: Bearer %s"\n' "${ADMIN_TOKEN}" |
-      curl --config - --silent --show-error --max-time 45 --request "${method}" \
-        --header 'accept: application/json' --header 'content-length: 0' \
-        --output "${output}" --write-out '%{http_code}' "${API_ORIGIN}${path}" 2>/dev/null)" || status=000
-  fi
-  [[ "${status}" =~ ^[0-9]{3}$ ]] || status=000
-  API_STATUS="${status}"
-}
-
-api_expect_json() {
-  local method="$1" path="$2" output="$3" expected_re="$4" body_file="${5:-}"
-  api_request "${method}" "${path}" "${output}" "${body_file}" || return 1
-  [[ "${API_STATUS}" =~ ${expected_re} ]] || return 1
-  jq -e . "${output}" >/dev/null 2>&1
-}
-
-node_cats_api() {
-  local node="$1" output="$2"
-  api_expect_json GET "/v1/admin/nodes/${node}/cats" "${output}" '^200$' || return 1
-  jq -e --arg node "${node}" --arg ws "${WORKSPACE_ID}" '
-    (keys | sort) == ["items"] and (.items | type == "array" and length > 0) and
-    all(.items[];
-      (.cat.id | test("^cat_[A-Za-z0-9_-]+$")) and
-      (.cat.name | test("^q124-[a-z0-9][a-z0-9-]{0,57}$")) and
-      .cat.workspace_id == $ws and .cat.node_id == $node)
-  ' "${output}" >/dev/null
-}
-
-node_summary_api() {
-  local node="$1" output="$2"
-  api_expect_json GET "/v1/admin/nodes/${node}" "${output}" '^200$' || return 1
-  jq -e --arg node "${node}" '
-    .node.id == $node and .node.capacity.cpus >= 1 and .node.capacity.memory_mib >= 1024 and
-    (.assigned_cats | type == "number") and (.orphan_cats | type == "number")
-  ' "${output}" >/dev/null
-}
-
-admin_adapter() {
-  local action="$1" node="$2" cats response
-  valid_node "${node}" || die "invalid q124 Node ID"
-  [[ "${CATS_HA_HOOK_WORKSPACE_ID:-}" == "${WORKSPACE_ID}" ]] || die "invalid workspace scope"
-  local cat_id="${CATS_HA_HOOK_CAT_ID:-}" cat_name="${CATS_HA_HOOK_CAT_NAME:-}"
-  if [[ -n "${cat_id}" || -n "${cat_name}" ]]; then
-    valid_cat_id "${cat_id}" && valid_cat_name "${cat_name}" || die "invalid q124 Cat scope"
-  fi
-  load_admin_token || exit 2
-  cats="$(mktemp /run/q124-admin-cats.XXXXXX)"; response="$(mktemp /run/q124-admin-node.XXXXXX)"
-  trap 'rm -f "${cats:-}" "${response:-}"' EXIT HUP INT TERM
-  node_cats_api "${node}" "${cats}" || die "cannot prove exact Node Cat scope"
-  jq -e --arg cat_id "${cat_id}" --arg cat_name "${cat_name}" '
-    (.items | length == 1) and
-    all(.items[]; (($cat_id == "" and $cat_name == "") or
-      (.cat.id == $cat_id and .cat.name == $cat_name)))
-  ' "${cats}" >/dev/null || die "Node assignment escaped requested q124 Cat scope"
-  if [[ "${action}" == cats ]]; then jq -c '.items' "${cats}"; return 0; fi
-  case "${action}" in
-    get) node_summary_api "${node}" "${response}" || die "invalid Node response" ;;
-    cordon|uncordon)
-      api_expect_json POST "/v1/admin/nodes/${node}/actions/${action}" "${response}" '^200$' ||
-        die "Node ${action} failed"
-      ;;
-    *) die "unsupported admin action" ;;
-  esac
-  jq -e --arg node "${node}" '.node.id == $node' "${response}" >/dev/null || die "Node response mismatch"
-  jq -c . "${response}"
-}
 
 make_pg_service() {
   local service="$1" hostaddr="${2:-}"
@@ -289,41 +200,6 @@ fault_config_valid() {
   ' "${FAULT_CONFIG}" >/dev/null
 }
 
-snapshot_from_api() {
-  local scenario="$1" phase="$2" node="$3" instance="$4" output="$5" summary cats endpoints now
-  summary="${RUN_STATE}/snapshot-summary-${phase}.json"; cats="${RUN_STATE}/snapshot-cats-${phase}.json"
-  node_summary_api "${node}" "${summary}" || return 1
-  node_cats_api "${node}" "${cats}" || return 1
-  jq -e '.node.state == "cordoned" and .orphan_cats == 0' "${summary}" >/dev/null || return 1
-  endpoints="$(jq -c '{db_host,s3_host,control_plane_host,node_listen_ip}' "${FAULT_CONFIG}")"
-  now="$(date -u +%FT%TZ)"
-  jq -n --arg now "${now}" --arg instance "${instance}" --arg node "${node}" \
-    --arg ws "${WORKSPACE_ID}" --arg workspace "${WORKSPACE_LOCATOR}" \
-    --arg test_sha "${Q124_TEST_SHA:-}" --argjson endpoints "${endpoints}" \
-    --slurpfile summary "${summary}" --slurpfile cats "${cats}" '
-      {schema_version:1,captured_at:$now,temp_instance_id:$instance,node_id:$node,
-       node_state:(($summary[0].node.state | ascii_upcase[0:1]) + $summary[0].node.state[1:]),
-       workspace_id:$ws,workspace:$workspace,
-       tags:{Issue:"124",CatsNodeId:$node,Purpose:"qualification-124"},
-       orphans:$summary[0].orphan_cats,
-       assigned_cats:[$cats[0].items[] | {cat_id:.cat.id,name:.cat.name,workspace_id:.cat.workspace_id,
-         node_id:.cat.node_id,durability:((.actual.disk_durability // []) |
-           map(select(.disk_id == $cats[0].items[0].cat.root_disk_id))[0].mode // "strict")}],
-       test_sha:$test_sha,dependency_endpoints:$endpoints}' >"${output}"
-  # Durability in the public Cat row is intentionally absent.  Replace it
-  # from each Cat's root-disk telemetry and fail if the heartbeat has not
-  # positively identified that root disk.
-  jq -n --slurpfile base "${output}" --slurpfile rows "${cats}" '
-    $base[0] as $b |
-    $b | .assigned_cats = [$rows[0].items[] as $row |
-      ($row.actual.disk_durability // [] | map(select(.disk_id == $row.cat.root_disk_id))) as $root |
-      if ($root|length) != 1 or ($root[0].mode != "strict" and $root[0].mode != "relaxed")
-      then error("missing exact root durability telemetry")
-      else {cat_id:$row.cat.id,name:$row.cat.name,workspace_id:$row.cat.workspace_id,
-            node_id:$row.cat.node_id,durability:$root[0].mode} end]
-  ' >"${output}.next" && mv "${output}.next" "${output}"
-}
-
 snapshot_from_db() {
   local phase="$1" node="$2" instance="$3" output="$4" node_json cats_json endpoints now orphans
   node_json="${RUN_STATE}/snapshot-db-node-${phase}.json"; cats_json="${RUN_STATE}/snapshot-db-cats-${phase}.json"
@@ -349,30 +225,11 @@ snapshot_from_db() {
 snapshot_command() {
   local scenario="$1" phase="$2" node="$3" instance="$4" output="$5"
   blocked_combo "${scenario}" && return 1 || true
-  if contains_dependency "${scenario}" control-plane && [[ "${phase}" == isolated ]]; then
-    snapshot_from_db "${phase}" "${node}" "${instance}" "${output}"
-  else
-    snapshot_from_api "${scenario}" "${phase}" "${node}" "${instance}" "${output}"
-  fi
-}
-
-ensure_cordoned() {
-  local node="$1" output="$2" started summary cats id completed
-  started="$(date -u +%FT%TZ)"; summary="${RUN_STATE}/ensure-node.json"; cats="${RUN_STATE}/ensure-cats.json"
-  node_summary_api "${node}" "${summary}" || return 1
-  node_cats_api "${node}" "${cats}" || return 1
-  [[ "$(jq -r .node.state "${summary}")" == cordoned ]] || {
-    [[ "$(jq -r .node.state "${summary}")" == ready ]] || return 1
-    api_expect_json POST "/v1/admin/nodes/${node}/actions/cordon" "${summary}.cordoned" '^200$' || return 1
-    mv "${summary}.cordoned" "${summary}"
-  }
-  jq -e '.node.state == "cordoned" and .orphan_cats == 0' "${summary}" >/dev/null || return 1
-  id="$(new_local_operation_id ensure_cordoned)"; completed="$(date -u +%FT%TZ)"
-  jq -n --arg id "${id}" --arg node "${node}" --arg started "${started}" --arg completed "${completed}" '
-    {schema_version:1,operation_id:$id,kind:"ensure_node_cordoned",phase:"succeeded",
-     node_id:$node,started_at:$started,completed_at:$completed,
-     log_ref:("api://v1/admin/nodes/"+$node)}' >"${output}"
-  record_operation "${id}" ensure_node_cordoned succeeded "${started}" "${completed}" "api://v1/admin/nodes/${node}"
+  # This is a read-only PostgreSQL observation.  It cannot be used while DB is
+  # intentionally isolated; the independent runner must supply those control
+  # snapshots before live mode can be enabled.
+  contains_dependency "${scenario}" db && [[ "${phase}" == isolated ]] && return 69
+  snapshot_from_db "${phase}" "${node}" "${instance}" "${output}"
 }
 
 load_service_token() {
@@ -517,24 +374,6 @@ cat_epoch() {
   ' "${ledger}"
 }
 
-admitted_rows() {
-  local node="$1" output="$2" rows
-  rows="${RUN_STATE}/admitted-api.json"
-  node_cats_api "${node}" "${rows}" || return 1
-  jq '[.items[] as $row | {cat_id:$row.cat.id,cat_name:$row.cat.name,
-      durability:(($row.actual.disk_durability // []) |
-        map(select(.disk_id == $row.cat.root_disk_id)) | .[0].mode),
-      desired_state:$row.cat.desired_state,observed_state:$row.cat.observed_state,
-      generation:$row.cat.generation,node_id:$row.cat.node_id,root_disk_id:$row.cat.root_disk_id}]' \
-    "${rows}" >"${output}" || return 1
-  jq -e --arg node "${node}" '
-    type == "array" and length > 0 and length <= 1 and all(.[];
-      (.cat_id | test("^cat_[A-Za-z0-9_-]+$")) and
-      (.cat_name | test("^q124-[a-z0-9][a-z0-9-]{0,57}$")) and
-      (.durability == "strict" or .durability == "relaxed") and .node_id == $node)
-  ' "${output}" >/dev/null
-}
-
 admitted_rows_db() {
   local node="$1" output="$2" raw
   raw="${RUN_STATE}/admitted-db.raw"
@@ -552,19 +391,16 @@ state_command() {
   local scenario="$1" trial="$2" phase="$3" node="$4" output="$5" rows cats='[]' row cat_id cat_name disk_id
   local status_file digest_file epoch local_gen remote_gen unpublished digest now ops id started
   rows="${RUN_STATE}/state-rows-${phase}.json"
-  if contains_dependency "${scenario}" control-plane && [[ "${phase}" == during ]]; then
-    if contains_dependency "${scenario}" db; then
-      # Neither the control-plane API nor PostgreSQL is an admissible observer
-      # in this window.  Preserve the immutable admitted set from before the
-      # fault and combine it with fresh host-local ledger/blockd evidence.
-      [[ -s "${RUN_STATE}/state-rows-before.json" ]] || return 1
-      cp "${RUN_STATE}/state-rows-before.json" "${rows}" || return 1
-      chmod 0600 "${rows}"
-    else
-      admitted_rows_db "${node}" "${rows}" || return 1
-    fi
+  if [[ "${phase}" == during ]]; then
+    # Freeze only the identity/scope admitted before injection; every mutable
+    # storage and guest signal below is freshly read from the local Host.  This
+    # avoids granting the worker any control-plane read capability and also
+    # remains available when DB is one of the isolated dependencies.
+    [[ -s "${RUN_STATE}/state-rows-before.json" ]] || return 1
+    cp "${RUN_STATE}/state-rows-before.json" "${rows}" || return 1
+    chmod 0600 "${rows}"
   else
-    admitted_rows "${node}" "${rows}" || return 1
+    admitted_rows_db "${node}" "${rows}" || return 1
   fi
   while IFS= read -r row; do
     cat_id="$(jq -r .cat_id <<<"${row}")"; cat_name="$(jq -r .cat_name <<<"${row}")"; disk_id="$(jq -r .root_disk_id <<<"${row}")"
@@ -596,8 +432,9 @@ state_command() {
   fi
   ops="$(jq -c . "${OPS_FILE}")"
   jq -n --arg now "${now}" --arg phase "${phase}" --arg scenario "${scenario}" --arg trial "${trial}" \
+    --arg window "${RUN_ID}" --arg nonce "${WINDOW_NONCE}" \
     --arg ws "${WORKSPACE_ID}" --arg node "${node}" --argjson cats "${cats}" --argjson ops "${ops}" '
-    {schema_version:2,captured_at:$now,phase:$phase,scenario:$scenario,trial:$trial,workspace_id:$ws,node_id:$node,
+    {schema_version:2,window_id:$window,window_nonce:$nonce,captured_at:$now,phase:$phase,scenario:$scenario,trial:$trial,workspace_id:$ws,node_id:$node,
      cats:$cats,raw_operations:$ops,log_refs:(["node://runtime-ledger","node://blockd/status"] + [$ops[].log_ref] | unique)}' >"${output}"
   if [[ "${phase}" == before ]]; then cp "${output}" "${RUN_STATE}/baseline-state.json"; chmod 0600 "${RUN_STATE}/baseline-state.json"; fi
 }
@@ -605,13 +442,13 @@ state_command() {
 control_plane_probe() {
   local address="$1" port="$2" node="$3" output status
   [[ "${address}" =~ ^[0-9a-fA-F:.]+$ && "${port}" == 443 ]] || return 1
-  output="${RUN_STATE}/control-probe-$$.json"
-  status="$(printf 'header = "Authorization: Bearer %s"\n' "${ADMIN_TOKEN}" |
-    curl --config - --silent --show-error --max-time 8 --request GET \
-      --resolve "${API_HOST}:443:${address}" --header 'accept: application/json' \
+  valid_node "${node}" || return 1
+  output="${RUN_STATE}/control-health-$$.txt"
+  status="$(curl --silent --show-error --max-time 8 --request GET \
+      --resolve "${API_HOST}:443:${address}" --header 'accept: text/plain' \
       --output "${output}" --write-out '%{http_code}' \
-      "${API_ORIGIN}/v1/admin/nodes/${node}" 2>/dev/null)" || return 1
-  [[ "${status}" == 200 ]] && jq -e --arg node "${node}" '.node.id == $node' "${output}" >/dev/null
+      "${API_ORIGIN}/healthz" 2>/dev/null)" || return 1
+  [[ "${status}" == 200 && "$(<"${output}")" == ok ]]
 }
 
 db_probe() {
@@ -624,19 +461,16 @@ db_probe() {
 }
 
 s3_volume_prefix() {
-  local output="$1" rows disk cat response
+  local output="$1" rows disk cat status volume_id
   if [[ -s "${RUN_STATE}/s3-prefix" ]]; then cat "${RUN_STATE}/s3-prefix" >"${output}"; return 0; fi
   rows="${RUN_STATE}/state-rows-before.json"
   [[ -s "${rows}" && "$(jq length "${rows}")" == 1 ]] || return 1
   disk="$(jq -r '.[0].root_disk_id' "${rows}")"; cat="$(jq -r '.[0].cat_id' "${rows}")"
-  [[ "${disk}" =~ ^disk_[A-Za-z0-9_-]+$ ]] || return 1
-  response="${RUN_STATE}/root-disk.json"
-  api_expect_json GET "/v1/workspaces/${WORKSPACE_ID}/disks/${disk}" "${response}" '^200$' || return 1
-  jq -e --arg disk "${disk}" --arg cat "${cat}" --arg ws "${WORKSPACE_ID}" '
-    .id == $disk and .workspace_id == $ws and .bound_cat_id == $cat and
-    (.volume_id | test("^[A-Za-z0-9_-]+$"))
-  ' "${response}" >/dev/null || return 1
-  jq -r '"cats/volumes/" + .volume_id + "/"' "${response}" >"${RUN_STATE}/s3-prefix"
+  [[ "${disk}" =~ ^disk_[A-Za-z0-9_-]+$ && "${cat}" =~ ^cat_[A-Za-z0-9_-]+$ ]] || return 1
+  status="${RUN_STATE}/s3-prefix-blockd.json"
+  blockd_status "${cat}" "${disk}" "${status}" || return 1
+  volume_id="$(jq -er '.volume_id | select(test("^[A-Za-z0-9_-]+$"))' "${status}")" || return 1
+  printf 'cats/volumes/%s/\n' "${volume_id}" >"${RUN_STATE}/s3-prefix"
   chmod 0600 "${RUN_STATE}/s3-prefix"
   cat "${RUN_STATE}/s3-prefix" >"${output}"
 }
@@ -768,59 +602,6 @@ baseline_cat() {
   printf '%s' "${row}"
 }
 
-api_cat_action() {
-  local cat_id="$1" verb="$2" idempotency="$3" output="$4" started completed status op_id phase
-  valid_cat_id "${cat_id}" || return 1
-  case "${verb}" in sync|stop|start) ;; *) return 1 ;; esac
-  [[ "${idempotency}" =~ ^q124-[a-z0-9-]{8,100}$ ]] || return 1
-  started="$(date -u +%FT%TZ)"; : >"${output}"; chmod 0600 "${output}"
-  status="$(printf 'header = "Authorization: Bearer %s"\nheader = "Idempotency-Key: %s"\n' \
-      "${ADMIN_TOKEN}" "${idempotency}" |
-    curl --config - --silent --show-error --max-time 90 --request POST \
-      --header 'accept: application/json' --header 'content-length: 0' \
-      --output "${output}" --write-out '%{http_code}' \
-      "${API_ORIGIN}/v1/workspaces/${WORKSPACE_ID}/cats/${cat_id}/actions/${verb}" 2>/dev/null)" || status=000
-  completed="$(date -u +%FT%TZ)"
-  ACTION_STATUS="${status}"
-  if [[ "${status}" == 202 ]]; then
-    op_id="$(jq -er '.operation.id' "${output}" 2>/dev/null)" || return 1
-    valid_operation_id "${op_id}" || return 1
-    phase="$(jq -r '.operation.phase' "${output}")"
-    record_operation "${op_id}" "cat.${verb}" "${phase}" "${started}" "${completed}" "api://v1/operations/${op_id}"
-  else
-    op_id="$(new_local_operation_id "${verb}_http_${status}")"
-    record_operation "${op_id}" "cat.${verb}" failed "${started}" "${completed}" "api://v1/workspaces/${WORKSPACE_ID}/cats/${cat_id}/actions/${verb}"
-  fi
-}
-
-poll_operation_not_succeeded() {
-  local op_id="$1" seconds="$2" response deadline phase
-  valid_operation_id "${op_id}" && [[ "${seconds}" =~ ^[0-9]+$ ]] || return 1
-  response="${RUN_STATE}/poll-${op_id}.json"; deadline=$((SECONDS + seconds))
-  while (( SECONDS < deadline )); do
-    if api_expect_json GET "/v1/operations/${op_id}" "${response}" '^200$'; then
-      phase="$(jq -r .phase "${response}")"
-      [[ "${phase}" != succeeded ]] || return 1
-      [[ "${phase}" != failed ]] || return 0
-    fi
-    sleep 1
-  done
-  return 0
-}
-
-wait_cat_running() {
-  local cat_id="$1" node="$2" response deadline=$((SECONDS + 150))
-  response="${RUN_STATE}/wait-running-${cat_id}.json"
-  until (( SECONDS >= deadline )); do
-    if api_expect_json GET "/v1/workspaces/${WORKSPACE_ID}/cats/${cat_id}" "${response}" '^200$' &&
-       jq -e --arg node "${node}" '.desired_state == "running" and .observed_state == "running" and .node_id == $node' "${response}" >/dev/null; then
-      return 0
-    fi
-    sleep 2
-  done
-  return 1
-}
-
 status_for_baseline_cat() {
   local row="$1" output="$2" cat_id disk_id
   cat_id="$(jq -r .cat_id <<<"${row}")"
@@ -836,40 +617,29 @@ write_oracle() {
   [[ "$(jq length <<<"${ops}")" -gt 0 ]] || return 1
   refs="$(jq -c '[.[].log_ref] | unique' <<<"${ops}")"
   jq -n --arg scenario "${scenario}" --arg trial "${trial}" --arg phase "${phase}" \
+    --arg window "${RUN_ID}" --arg nonce "${WINDOW_NONCE}" \
     --arg started "${started}" --arg completed "${completed}" --argjson checks "${checks}" \
     --argjson ops "${ops}" --argjson refs "${refs}" '
-    {schema_version:2,scenario:$scenario,trial:$trial,phase:$phase,started_at:$started,
+    {schema_version:2,window_id:$window,window_nonce:$nonce,scenario:$scenario,trial:$trial,phase:$phase,started_at:$started,
      completed_at:$completed,checks:$checks,raw_operations:$ops,log_refs:$refs}' >"${output}"
 }
 
 exercise_isolated() {
   local scenario="$1" trial="$2" node="$3" output="$4" row cat_id cat_name durability started completed
-  local response op_id status_file checks digest_file baseline_digest current_digest timeout_seconds
+  local status_file checks timeout_seconds
   local disk_id has_control=false
   row="$(baseline_cat "${trial}")" || return 1
   cat_id="$(jq -r .cat_id <<<"${row}")"; cat_name="$(jq -r .cat_name <<<"${row}")"; durability="$(jq -r .durability <<<"${row}")"
-  started="$(date -u +%FT%TZ)"; response="${RUN_STATE}/exercise-isolated-action.json"
+  started="$(date -u +%FT%TZ)"
 
   case "${trial}" in
     db-running)
-      [[ "${durability}" == strict ]] || return 1
-      marker_digest "${cat_id}" "${cat_name}" "${RUN_STATE}/isolated-digest" || return 1
-      marker_write_probe "${cat_id}" strict false "${RUN_STATE}/db-write.json" || return 1
-      api_cat_action "${cat_id}" sync "q124-${RUN_ID}-db-running-sync" "${response}" || true
-      [[ "${ACTION_STATUS}" != 200 ]] || return 1
-      checks='{"running_exec_observed":true,"metadata_cas_false_success_absent":true,"sync_false_success_absent":true,"corruption_signal_absent":true}'
+      # The required sync action must be issued and observed by the independent
+      # control runner.  The worker must not manufacture that oracle locally.
+      return 69
       ;;
     db-cold-start)
-      api_cat_action "${cat_id}" stop "q124-${RUN_ID}-db-cold-stop" "${response}" || return 1
-      [[ "${ACTION_STATUS}" == 202 ]] || return 1
-      op_id="$(jq -r .operation.id "${response}")"; poll_operation_not_succeeded "${op_id}" 12 || return 1
-      api_cat_action "${cat_id}" start "q124-${RUN_ID}-db-start-old" "${response}.start1" || return 1
-      [[ "${ACTION_STATUS}" == 202 ]] || return 1
-      op_id="$(jq -r .operation.id "${response}.start1")"; poll_operation_not_succeeded "${op_id}" 8 || return 1
-      api_cat_action "${cat_id}" start "q124-${RUN_ID}-db-start-new" "${response}.start2" || return 1
-      [[ "${ACTION_STATUS}" == 202 ]] || return 1
-      op_id="$(jq -r .operation.id "${response}.start2")"; poll_operation_not_succeeded "${op_id}" 8 || return 1
-      checks='{"cold_false_success_absent":true,"start_retry_or_failure_observed":true,"new_start_retry_or_failure_observed":true,"corruption_signal_absent":true}'
+      return 69
       ;;
     s3-strict|db-s3-strict|s3-control-plane-strict|db-control-plane-strict|all-3-strict)
       marker_write_probe "${cat_id}" strict false "${RUN_STATE}/strict-write.json" || return 1
@@ -881,11 +651,7 @@ exercise_isolated() {
         jq -e '.fenced == false' "${status_file}" >/dev/null || return 1
         has_control=true
       else
-        api_cat_action "${cat_id}" sync "q124-${RUN_ID}-strict-sync" "${response}" || true
-        [[ "${ACTION_STATUS}" != 200 ]] || return 1
-        api_cat_action "${cat_id}" stop "q124-${RUN_ID}-strict-stop" "${response}.stop" || return 1
-        [[ "${ACTION_STATUS}" == 202 ]] || return 1
-        op_id="$(jq -r .operation.id "${response}.stop")"; poll_operation_not_succeeded "${op_id}" 10 || return 1
+        return 69
       fi
       if [[ "${has_control}" == true ]]; then
         checks='{"strict_fsync_false_success_absent":true,"strict_drain_false_success_absent":true,"digest_signal_preserved":true,"lease_timeout_plus_five_observed":true,"guest_io_observed":true,"local_claim_preserved":true,"local_generation_preserved":true,"local_epoch_preserved":true,"admin_fence_not_invoked":true}'
@@ -903,11 +669,7 @@ exercise_isolated() {
         timeout_seconds="$(jq -r .control_plane_lease_timeout_seconds "${FAULT_CONFIG}")"; sleep "$((timeout_seconds + 5))"
         has_control=true
       else
-        api_cat_action "${cat_id}" sync "q124-${RUN_ID}-relaxed-sync" "${response}" || true
-        [[ "${ACTION_STATUS}" != 200 ]] || return 1
-        api_cat_action "${cat_id}" stop "q124-${RUN_ID}-relaxed-stop" "${response}.stop" || return 1
-        [[ "${ACTION_STATUS}" == 202 ]] || return 1
-        op_id="$(jq -r .operation.id "${response}.stop")"; poll_operation_not_succeeded "${op_id}" 10 || return 1
+        return 69
       fi
       checks='{"relaxed_local_fsync_observed":true,"relaxed_sync_false_success_absent":true,"relaxed_drain_false_success_absent":true,"local_remote_watermarks_captured":true,"unpublished_captured":true}'
       if [[ "${has_control}" == true ]]; then
@@ -929,21 +691,15 @@ exercise_isolated() {
 }
 
 exercise_recovered() {
-  local scenario="$1" trial="$2" node="$3" output="$4" row cat_id cat_name started completed response status_file checks
+  local scenario="$1" trial="$2" node="$3" output="$4" row cat_id cat_name started completed status_file checks
   local baseline_digest current_digest
   row="$(baseline_cat "${trial}")" || return 1
   cat_id="$(jq -r .cat_id <<<"${row}")"; cat_name="$(jq -r .cat_name <<<"${row}")"
-  started="$(date -u +%FT%TZ)"; response="${RUN_STATE}/recovered-action.json"
-  case "${trial}" in
-    db-cold-start|s3-strict|s3-relaxed|db-s3-strict|db-s3-relaxed)
-      api_cat_action "${cat_id}" start "q124-${RUN_ID}-recovered-start" "${response}.start" || return 1
-      [[ "${ACTION_STATUS}" == 202 ]] || return 1
-      wait_cat_running "${cat_id}" "${node}" || return 1
-      ;;
-  esac
+  started="$(date -u +%FT%TZ)"
   if contains_dependency "${scenario}" db || contains_dependency "${scenario}" s3; then
-    api_cat_action "${cat_id}" sync "q124-${RUN_ID}-recovered-sync" "${response}.sync" || return 1
-    [[ "${ACTION_STATUS}" == 200 ]] || return 1
+    # Start/sync/convergence belongs to the independent control runner.  A
+    # local worker-only oracle would be incomplete and therefore fails closed.
+    return 69
   fi
   marker_digest "${cat_id}" "${cat_name}" "${RUN_STATE}/recovered-digest" || return 1
   baseline_digest="$(jq -r '.digest' <<<"${row}")"; current_digest="$(<"${RUN_STATE}/recovered-digest")"
@@ -977,9 +733,10 @@ exercise_partial_recovery() {
   checks='{"restored_dependency_positive":true,"remaining_dependencies_negative":true,"false_success_absent":true,"digest_preserved":true,"generation_preserved":true,"disk_epoch_preserved":true}'
   completed="$(date -u +%FT%TZ)"
   jq -n --arg scenario "${scenario}" --arg trial "${trial}" --arg dep "${restored}" \
+    --arg window "${RUN_ID}" --arg nonce "${WINDOW_NONCE}" \
     --arg remaining "${remaining}" --arg started "${started}" --arg completed "${completed}" \
     --argjson checks "${checks}" --slurpfile ops "${OPS_FILE}" '
-    {schema_version:2,scenario:$scenario,trial:$trial,phase:"partial-recovery",restored_dependency:$dep,
+    {schema_version:2,window_id:$window,window_nonce:$nonce,scenario:$scenario,trial:$trial,phase:"partial-recovery",restored_dependency:$dep,
      remaining_dependencies:(if $remaining == "" then [] else ($remaining|split(",")) end),
      started_at:$started,completed_at:$completed,checks:$checks,raw_operations:$ops[0],
      log_refs:([$ops[0][].log_ref] | unique)}' >"${output}"
@@ -1005,164 +762,14 @@ assert_command() {
   fi
 }
 
-Q124_PREPARE_UNCORDONED=false
-Q124_PREPARE_NODE=""
-Q124_PREPARE_TRAP_OUTPUT=""
-
-q124_prepare_return_cleanup() {
-  local incoming_rc=$?
-  trap - RETURN
-  if [[ "${Q124_PREPARE_UNCORDONED}" == true ]]; then
-    if ! api_expect_json POST "/v1/admin/nodes/${Q124_PREPARE_NODE}/actions/cordon" \
-      "${Q124_PREPARE_TRAP_OUTPUT}" '^200$' >/dev/null 2>&1; then
-      return 70
-    fi
-    Q124_PREPARE_UNCORDONED=false
-  fi
-  return "${incoming_rc}"
-}
-
-prepare_trial() {
-  local scenario="$1" trial="$2" node="$3" cat_id="$4" cat_name="$5" instance="$6" output="$7"
-  local expected summary cats cat disk start_response deadline placed=false
-  valid_trial "${scenario}" "${trial}" && valid_node "${node}" && valid_cat_id "${cat_id}" && valid_cat_name "${cat_name}" || return 1
-  expected="$(trial_durability "${trial}")"
-  summary="${RUN_STATE}/prepare-node.json"; cats="${RUN_STATE}/prepare-cats.json"; cat="${RUN_STATE}/prepare-cat.json"; disk="${RUN_STATE}/prepare-disk.json"
-  node_summary_api "${node}" "${summary}" || return 1
-  [[ "$(jq -r .node.state "${summary}")" == cordoned && "$(jq -r .orphan_cats "${summary}")" == 0 ]] || return 1
-  node_cats_api "${node}" "${cats}" || {
-    # An empty exact Node is valid between trials; validate the raw response.
-    api_expect_json GET "/v1/admin/nodes/${node}/cats" "${cats}" '^200$' || return 1
-    jq -e '.items == []' "${cats}" >/dev/null || return 1
-  }
-  [[ "$(jq '.items | length' "${cats}")" -le 1 ]] || return 1
-  if [[ "$(jq '.items | length' "${cats}")" == 1 ]]; then
-    if jq -e --arg id "${cat_id}" '.items[0].cat.id == $id' "${cats}" >/dev/null; then
-      snapshot_from_api "${scenario}" prepared "${node}" "${instance}" "${output}" || return 1
-      jq -e --arg id "${cat_id}" --arg d "${expected}" '
-        .node_state == "Cordoned" and .orphans == 0 and (.assigned_cats|length) == 1 and
-        .assigned_cats[0].cat_id == $id and .assigned_cats[0].durability == $d
-      ' "${output}" >/dev/null || return 1
-      marker_digest "${cat_id}" "${cat_name}" "${RUN_STATE}/prepare-existing-marker-digest" || return 1
-      return 0
-    fi
-    # Only the prior q124 trial Cat may be demoted.  Its marker remains; no Cat
-    # or disk is deleted.
-    local old_id old_name
-    old_id="$(jq -r '.items[0].cat.id' "${cats}")"; old_name="$(jq -r '.items[0].cat.name' "${cats}")"
-    valid_cat_id "${old_id}" && valid_cat_name "${old_name}" || return 1
-    api_cat_action "${old_id}" stop "q124-${RUN_ID}-prepare-stop" "${RUN_STATE}/prepare-stop.json" || return 1
-    deadline=$((SECONDS + 150))
-    while (( SECONDS < deadline )); do
-      api_expect_json GET "/v1/workspaces/${WORKSPACE_ID}/cats/${old_id}" "${RUN_STATE}/prepare-old.json" '^200$' || return 1
-      [[ "$(jq -r .observed_state "${RUN_STATE}/prepare-old.json")" != cold ]] || break
-      sleep 2
-    done
-    [[ "$(jq -r .observed_state "${RUN_STATE}/prepare-old.json")" == cold ]] || return 1
-  fi
-  api_expect_json GET "/v1/workspaces/${WORKSPACE_ID}/cats/${cat_id}" "${cat}" '^200$' || return 1
-  jq -e --arg id "${cat_id}" --arg name "${cat_name}" --arg ws "${WORKSPACE_ID}" '
-    .id == $id and .name == $name and .workspace_id == $ws and .observed_state == "cold" and .node_id == null
-  ' "${cat}" >/dev/null || return 1
-  api_expect_json GET "/v1/workspaces/${WORKSPACE_ID}/disks/$(jq -r .root_disk_id "${cat}")" "${disk}" '^200$' || return 1
-  jq -e --arg expected "${expected}" --arg cat "${cat_id}" '.durability == $expected and .bound_cat_id == $cat' "${disk}" >/dev/null || return 1
-
-  Q124_PREPARE_UNCORDONED=false
-  Q124_PREPARE_NODE="${node}"
-  Q124_PREPARE_TRAP_OUTPUT="${RUN_STATE}/prepare-trap-cordon.json"
-  trap q124_prepare_return_cleanup RETURN
-  api_expect_json POST "/v1/admin/nodes/${node}/actions/uncordon" "${RUN_STATE}/prepare-uncordon.json" '^200$' || return 1
-  Q124_PREPARE_UNCORDONED=true
-  api_cat_action "${cat_id}" start "q124-${RUN_ID}-prepare-start" "${RUN_STATE}/prepare-start.json" || return 1
-  [[ "${ACTION_STATUS}" == 202 ]] || return 1
-  deadline=$((SECONDS + 150))
-  while (( SECONDS < deadline )); do
-    api_expect_json GET "/v1/workspaces/${WORKSPACE_ID}/cats/${cat_id}" "${RUN_STATE}/prepare-target.json" '^200$' || return 1
-    if jq -e '.observed_state == "running"' "${RUN_STATE}/prepare-target.json" >/dev/null; then
-      [[ "$(jq -r .node_id "${RUN_STATE}/prepare-target.json")" == "${node}" ]] || return 1
-      placed=true; break
-    fi
-    sleep 2
-  done
-  [[ "${placed}" == true ]] || return 1
-  marker_digest "${cat_id}" "${cat_name}" "${RUN_STATE}/prepare-marker-digest" || return 1
-  api_expect_json POST "/v1/admin/nodes/${node}/actions/cordon" "${RUN_STATE}/prepare-cordon.json" '^200$' || return 1
-  Q124_PREPARE_UNCORDONED=false
-  snapshot_from_api "${scenario}" prepared "${node}" "${instance}" "${output}"
-  jq -e --arg id "${cat_id}" --arg d "${expected}" '
-    .node_state == "Cordoned" and .orphans == 0 and .assigned_cats ==
-      [{cat_id:$id,name:.assigned_cats[0].name,workspace_id:.workspace_id,node_id:.node_id,durability:$d}]
-  ' "${output}" >/dev/null
-}
-
-observe_window() {
-  local scenario="$1" trial="$2" node="$3" cat_id="$4" generation="$5" output="$6" timeout_seconds="$7" ready_file="$8"
-  local summary cats lost_at="" recovered_at="" lost_cat_state="" deadline started completed
-  valid_trial "${scenario}" "${trial}" && valid_node "${node}" && valid_cat_id "${cat_id}" || return 1
-  [[ -z "${generation}" || "${generation}" =~ ^[0-9]+$ ]] || return 1
-  [[ "${timeout_seconds}" =~ ^[0-9]+$ ]] || return 1
-  safe_output_path "${ready_file}" || return 1
-  summary="$(mktemp /run/q124-observer-node.XXXXXX)"; cats="$(mktemp /run/q124-observer-cats.XXXXXX)"
-  trap 'rm -f "${summary:-}" "${cats:-}"' RETURN
-  started="$(date -u +%FT%TZ)"
-  node_summary_api "${node}" "${summary}" && node_cats_api "${node}" "${cats}" || return 1
-  jq -e --arg id "${cat_id}" '(.items | length) == 1 and .items[0].cat.id == $id' "${cats}" >/dev/null || return 1
-  if [[ -z "${generation}" ]]; then generation="$(jq -r '.items[0].cat.generation' "${cats}")"; fi
-  [[ "${generation}" =~ ^[0-9]+$ ]] || return 1
-  jq -e --arg id "${cat_id}" --argjson generation "${generation}" '
-    (.items | length) == 1 and .items[0].cat.id == $id and .items[0].cat.generation == $generation
-  ' "${cats}" >/dev/null || return 1
-  printf '%s\n' "${scenario}:${trial}:${node}:${cat_id}:${generation}" >"${ready_file}"
-  chmod 0644 "${ready_file}"
-  deadline=$((SECONDS + timeout_seconds))
-  while (( SECONDS < deadline )); do
-    if node_summary_api "${node}" "${summary}" && node_cats_api "${node}" "${cats}" &&
-       jq -e --arg id "${cat_id}" --argjson generation "${generation}" '
-         (.items | length) == 1 and .items[0].cat.id == $id and .items[0].cat.generation == $generation and
-         (.items[0].cat.observed_state == "unknown" or .items[0].cat.observed_state == "stopping" or .items[0].cat.observed_state == "running")
-       ' "${cats}" >/dev/null && [[ "$(jq -r .node.state "${summary}")" == lost ]]; then
-      lost_at="$(date -u +%FT%TZ)"; lost_cat_state="$(jq -r '.items[0].cat.observed_state' "${cats}")"; break
-    fi
-    sleep 1
-  done
-  [[ -n "${lost_at}" ]] || return 1
-  while (( SECONDS < deadline )); do
-    if node_summary_api "${node}" "${summary}" && node_cats_api "${node}" "${cats}" &&
-       jq -e --arg id "${cat_id}" --arg node "${node}" --argjson generation "${generation}" '
-         (.items | length) == 1 and .items[0].cat.id == $id and .items[0].cat.generation == $generation and
-         .items[0].cat.node_id == $node
-       ' "${cats}" >/dev/null 2>&1 && [[ "$(jq -r .node.state "${summary}")" == cordoned ]]; then
-      recovered_at="$(date -u +%FT%TZ)"; break
-    fi
-    sleep 1
-  done
-  [[ -n "${recovered_at}" ]] || return 1
-  completed="$(date -u +%FT%TZ)"
-  jq -n --arg scenario "${scenario}" --arg trial "${trial}" --arg node "${node}" --arg cat "${cat_id}" \
-    --argjson generation "${generation}" --arg started "${started}" --arg completed "${completed}" \
-    --arg lost "${lost_at}" --arg recovered "${recovered_at}" --arg lost_cat_state "${lost_cat_state}" '
-    {schema_version:2,source:"external-control-plane-observer",window_id:$ENV.Q124_RUN_ID,
-     scenario:$scenario,trial:$trial,
-     node_id:$node,cat_id:$cat,generation:$generation,started_at:$started,completed_at:$completed,
-     lost_observed_at:$lost,recovered_observed_at:$recovered,
-     lost_cat_observed_state:$lost_cat_state,
-     checks:{node_lost_observed:true,exact_cat_claim_preserved:true,
-       generation_replacement_absent:true,node_recovered_cordoned:true,
-       same_node_identity:true,inventory_complete:true,placement_preserved:true}}' >"${output}"
-}
-
 usage() {
   cat >&2 <<'EOF'
 usage:
-  q124-fault-workload get|cats|cordon|uncordon q124-NODE
   q124-fault-workload snapshot --scenario S --trial T --phase P --workspace-id W --node-id N --instance-id I --output F
-  q124-fault-workload ensure-cordoned --workspace-id W --node-id N --output F
   q124-fault-workload probe --scenario S --trial T [--dependency D] --address IP --port P --node-id N
   q124-fault-workload state --scenario S --trial T --phase before|during|after --workspace-id W --node-id N --output F
   q124-fault-workload exercise --scenario S --trial T --phase isolated|partial-recovery|recovered ... --workspace-id W --node-id N --output F
   q124-fault-workload assert --scenario S --trial T --before F --during F --after F
-  q124-fault-workload prepare-trial --scenario S --trial T --workspace-id W --node-id N --cat-id C --cat-name NAME --instance-id I --output F
-  q124-fault-workload observe-window --scenario S --trial T --workspace-id W --node-id N --cat-id C [--generation G] --timeout-seconds N --ready-file F --output F
 EOF
   exit 2
 }
@@ -1171,17 +778,16 @@ main() {
   [[ "${EUID}" == 0 ]] || die "q124 fault workload must run as root"
   for command in jq curl stat sha256sum python3; do require_command "${command}" || exit 2; done
   [[ $# -gt 0 ]] || usage
-  if [[ $# == 2 && "$1" =~ ^(get|cats|cordon|uncordon)$ ]]; then admin_adapter "$1" "$2"; return; fi
 
   local action="$1"; shift
   local scenario="" trial="" phase="" workspace="" node="" instance="" output="" dependency="" address="" port=""
   local before="" during="" after="" restored="" remaining="" dependencies="" recovery_order=""
-  local cat_id="" cat_name="" generation="" timeout_seconds="" ready_file=""
+  local cat_id="" cat_name="" generation="" timeout_seconds="" ready_file="" armed_file=""
   while (($#)); do
     case "$1" in
       --scenario|--trial|--phase|--workspace-id|--node-id|--instance-id|--output|--dependency|--address|--port|\
       --before|--during|--after|--restored-dependency|--remaining-dependencies|--dependencies|--recovery-order|\
-      --cat-id|--cat-name|--generation|--timeout-seconds|--ready-file)
+      --cat-id|--cat-name|--generation|--timeout-seconds|--ready-file|--armed-file)
         [[ $# -ge 2 ]] || usage
         key="${1#--}"; key="${key//-/_}"; printf -v "${key}" '%s' "$2"; shift 2
         case "${key}" in
@@ -1199,30 +805,18 @@ main() {
   valid_node "${node}" || die "invalid q124 Node ID"
   valid_scenario "${scenario}" || die "invalid fault scenario"
   valid_trial "${scenario}" "${trial}" || die "invalid scenario trial"
-  load_admin_token || exit 2
   init_run_state || exit 2
   [[ -z "${output}" ]] || { safe_output_path "${output}" || die "unsafe output path"; : >"${output}"; chmod 0600 "${output}"; }
 
-  # The external observer deliberately has no worker-local configuration,
-  # PostgreSQL URL, service token, or S3 role.  Its only authority is the
-  # root-owned qualification admin token and its only mutation is none.
-  if [[ "${action}" == observe-window ]]; then
-    [[ -n "${cat_id}" && ( -z "${generation}" || "${generation}" =~ ^[0-9]+$ ) && "${timeout_seconds}" =~ ^[0-9]+$ && -n "${ready_file}" && -n "${output}" ]] || usage
-    observe_window "${scenario}" "${trial}" "${node}" "${cat_id}" "${generation}" "${output}" "${timeout_seconds}" "${ready_file}"
-    return
-  fi
-
   fault_config_valid || die "invalid root-only fault target config"
-  load_service_token || exit 2
+  case "${action}" in
+    state|exercise) load_service_token || exit 2 ;;
+  esac
 
   case "${action}" in
     snapshot)
       [[ "${phase}" =~ ^(setup|before|isolated|after|prepared)$ && "${instance}" =~ ^i-[0-9a-f]{17}$ && -n "${output}" ]] || usage
       snapshot_command "${scenario}" "${phase}" "${node}" "${instance}" "${output}"
-      ;;
-    ensure-cordoned)
-      [[ -n "${output}" ]] || usage
-      ensure_cordoned "${node}" "${output}"
       ;;
     probe)
       [[ -n "${address}" && "${port}" =~ ^[0-9]+$ ]] || usage
@@ -1250,10 +844,6 @@ main() {
     assert)
       [[ -n "${before}" && -n "${during}" && -n "${after}" ]] || usage
       assert_command "${scenario}" "${trial}" "${node}" "${before}" "${during}" "${after}"
-      ;;
-    prepare-trial)
-      [[ "${instance}" =~ ^i-[0-9a-f]{17}$ && -n "${cat_id}" && -n "${cat_name}" && -n "${output}" ]] || usage
-      prepare_trial "${scenario}" "${trial}" "${node}" "${cat_id}" "${cat_name}" "${instance}" "${output}"
       ;;
     *) usage ;;
   esac
