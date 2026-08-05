@@ -252,6 +252,9 @@ a control-plane Pod. This avoids `kubectl` attach fallback replaying a fast
 command's output in either safety gate. A missing version table is the reviewed
 fresh-schema case; cluster, scheduling, authentication and query failures all
 fail closed. `cats-controld` only opens stamped versions inside the same range.
+The disruptive drill separately uploads fixed-rate public-probe results and
+Pod/EndpointSlice transition evidence; those artifacts contain no Secret
+values or response bodies and are retained for 30 days for failure correlation.
 
 ADR-0031 deliberately cut over without importing the old SQLite rows. The
 application state removes the control-data PVC and its temporary DLM policy;
