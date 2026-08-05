@@ -39,7 +39,7 @@ variable "availability_zone_count" {
 variable "one_nat_gateway_per_az" {
   type        = bool
   description = "Provision a NAT gateway per zone instead of one shared gateway. Costs roughly $32/month per extra gateway."
-  default     = false
+  default     = true
 }
 
 variable "tags" {

@@ -25,6 +25,55 @@ fn read_workspace_file(path: &str) -> String {
     })
 }
 
+#[test]
+fn production_platform_defaults_to_independent_az_dependencies() {
+    let variables = read_workspace_file("deploy/aws/terraform/stacks/platform/variables.tf");
+    let example =
+        read_workspace_file("deploy/aws/terraform/stacks/platform/platform.tfvars.example");
+
+    let assert_true_default = |source: &str, name: &str| {
+        let declaration = format!("variable \"{name}\"");
+        let block = source
+            .split_once(&declaration)
+            .and_then(|(_, rest)| rest.split_once("\n}"))
+            .map(|(block, _)| block)
+            .unwrap_or_else(|| panic!("missing Terraform variable {name}"));
+        assert!(
+            block
+                .lines()
+                .any(|line| line.trim() == "default     = true"),
+            "{name} must fail over across availability zones by default"
+        );
+    };
+
+    for (name, module_path, module_name) in [
+        (
+            "one_nat_gateway_per_az",
+            "deploy/aws/terraform/modules/platform-network/variables.tf",
+            "one_nat_gateway_per_az",
+        ),
+        (
+            "database_multi_az",
+            "deploy/aws/terraform/modules/platform-database/variables.tf",
+            "multi_az",
+        ),
+    ] {
+        assert_true_default(&variables, name);
+        let module = read_workspace_file(module_path);
+        assert_true_default(&module, module_name);
+
+        let assignment = example.lines().find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == name).then(|| value.trim())
+        });
+        assert_eq!(
+            assignment,
+            Some("true"),
+            "the production example must enable {name}"
+        );
+    }
+}
+
 #[cfg(unix)]
 fn ha_fixture_guard() -> std::sync::MutexGuard<'static, ()> {
     static FIXTURE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();

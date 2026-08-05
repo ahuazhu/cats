@@ -8,10 +8,10 @@
 #   public  - the EKS Auto Mode ALB and the NAT gateway
 #   private - EKS nodes, bare-metal workers and RDS
 #
-# Egress defaults to a single NAT gateway. That is a deliberate cost/HA choice:
-# one gateway is ~$32/month versus one per zone, and losing a zone degrades
-# egress rather than the control plane. Set `one_nat_gateway_per_az` when the
-# fleet justifies it.
+# Egress defaults to one NAT gateway per zone so losing one availability zone
+# does not strand otherwise healthy private-subnet workers or EKS nodes. A
+# single shared gateway is an explicit cost-saving override, not a production
+# high-availability shape.
 
 data "aws_availability_zones" "available" {
   state = "available"
