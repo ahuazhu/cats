@@ -653,6 +653,19 @@ impl Ctx {
         cookie_pair(&callback, &format!("cats_{site}_session"))
     }
 
+    /// The `/auth/session` document a user-site session cookie resolves to.
+    async fn user_session(&self, cookie: &str) -> Value {
+        self.http
+            .get(self.url("/auth/session?site=user"))
+            .header("Cookie", cookie)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
     fn cli_token(&self, organization_id: &str) -> String {
         self.cli_token_with_permissions(organization_id, &[])
     }
@@ -729,16 +742,7 @@ async fn workos_user_and_admin_sessions_enforce_their_scopes() {
     assert!(!public_config.to_string().contains("sk_test_secret"));
 
     let user_cookie = ctx.login("user", "user-code").await;
-    let user_session: Value = ctx
-        .http
-        .get(ctx.url("/auth/session?site=user"))
-        .header("Cookie", &user_cookie)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let user_session: Value = ctx.user_session(&user_cookie).await;
     assert_eq!(user_session["authenticated"], true);
     assert_eq!(
         user_session["active_workspace_id"],
@@ -948,16 +952,7 @@ async fn organizationless_workos_user_receives_an_isolated_personal_account() {
     let ctx = Ctx::new().await;
     let user_cookie = ctx.login("user", "new-user-code").await;
 
-    let session: Value = ctx
-        .http
-        .get(ctx.url("/auth/session?site=user"))
-        .header("Cookie", &user_cookie)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let session: Value = ctx.user_session(&user_cookie).await;
     assert_eq!(session["authenticated"], true);
     let personal_workspace_id = session["active_workspace_id"].as_str().unwrap().to_string();
     let active = session["workspaces"]
@@ -1036,16 +1031,7 @@ async fn user_login_switches_from_admin_org_to_the_only_mapped_workspace() {
     let ctx = Ctx::new().await;
     let user_cookie = ctx.login("user", "admin-user-code").await;
 
-    let session: Value = ctx
-        .http
-        .get(ctx.url("/auth/session?site=user"))
-        .header("Cookie", &user_cookie)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let session: Value = ctx.user_session(&user_cookie).await;
     assert_eq!(session["authenticated"], true);
     assert_eq!(
         session["active_workspace_id"],
@@ -1330,16 +1316,7 @@ async fn web_switches_workspaces_locally_and_serializes_cross_account_refresh() 
     let ctx = Ctx::new().await;
     let user_cookie = ctx.login("user", "user-code").await;
     assert_eq!(ctx.exchanges.load(Ordering::SeqCst), 1);
-    let session: Value = ctx
-        .http
-        .get(ctx.url("/auth/session?site=user"))
-        .header("Cookie", &user_cookie)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let session: Value = ctx.user_session(&user_cookie).await;
     let workspace_id = |locator: &str| {
         session["workspaces"]
             .as_array()

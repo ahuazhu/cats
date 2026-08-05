@@ -166,8 +166,6 @@ pub enum FormatError {
     Malformed(&'static str),
     #[error("unsupported {0} version {1}")]
     Version(&'static str, u16),
-    #[error("hash mismatch for {0} node")]
-    HashMismatch(&'static str),
 }
 
 fn take<'a>(buf: &mut &'a [u8], n: usize, what: &'static str) -> Result<&'a [u8], FormatError> {

@@ -862,9 +862,7 @@ impl NodeRuntime {
 #[cfg(test)]
 mod teardown_tests {
     use super::*;
-    use crate::admission::WakeBudget;
     use cats_api::resources::DiskDurability;
-    use cats_storage::AdapterSelection;
     use std::os::unix::fs::PermissionsExt;
 
     /// A node whose kernel-NBD detaches land in `calls` instead of the kernel.
@@ -880,20 +878,9 @@ mod teardown_tests {
         .unwrap();
         std::fs::set_permissions(&nbd_client, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let adapter = AdapterSelection::new("unused", cats_storage::AdapterConfig::default());
-        NodeRuntime::new(NodeConfig {
-            node_id: "node-a".to_string(),
-            state_dir: state_dir.to_path_buf(),
-            blockd_bin: PathBuf::from("unused-blockd"),
-            guest_agent_bin: PathBuf::from("unused-guest-agent"),
-            metadata_store: adapter.clone(),
-            object_store: adapter,
-            blockd_lease_ttl_ms: 1_000,
-            blockd_max_staged_bytes: cats_api::blockd::DEFAULT_MAX_STAGED_BYTES,
-            blockd_max_staged_packs: cats_api::blockd::DEFAULT_MAX_STAGED_PACKS,
-            blockd_max_local_bytes: cats_api::blockd::DEFAULT_MAX_LOCAL_BYTES,
-            metering_cgroup_root: None,
-            vmm: VmmMode::CloudHypervisor(ChConfig {
+        NodeRuntime::new(stub_node_config(
+            state_dir,
+            VmmMode::CloudHypervisor(ChConfig {
                 block_direct: false,
                 ch_bin: PathBuf::from("unused-ch"),
                 kernel: PathBuf::from("unused-kernel"),
@@ -908,8 +895,7 @@ mod teardown_tests {
                 network_cidr: None,
                 ip_bin: PathBuf::from("unused-ip"),
             }),
-            wake_budget: WakeBudget::default(),
-        })
+        ))
         .unwrap()
     }
 

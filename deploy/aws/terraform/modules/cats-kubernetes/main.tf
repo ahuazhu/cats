@@ -560,3 +560,203 @@ resource "kubernetes_ingress_v1" "public" {
     kubernetes_deployment_v1.gateway,
   ]
 }
+
+# In-cluster reconciliation of the database credential (ADR-0029, #77).
+#
+# The deployment composes the DSNs from the RDS managed master secret, so a
+# deploy can no longer carry a stale password forward. This closes the window
+# the deploy cannot: RDS rotates on a schedule, and a Pod that restarts for any
+# other reason before the next deploy -- OOM, eviction, node drain -- would read
+# a Secret nobody refreshed and crash-loop.
+#
+# The AWS identity is a Pod Identity association created in the infrastructure
+# state, deliberately not here: the automated deployment's IAM permissions are
+# scoped tightly and should not grow the ability to mint roles.
+#
+# Set credential_refresher_image to enable it. Left null, none of this exists.
+
+resource "kubernetes_service_account_v1" "credential_refresher" {
+  count = var.credential_refresher_image == null ? 0 : 1
+
+  metadata {
+    name      = var.credential_refresher_service_account
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-credential-refresher"
+    })
+  }
+}
+
+# get and patch, on one Secret, by name. It cannot list Secrets, cannot reach
+# another namespace, and cannot create or delete anything.
+resource "kubernetes_role_v1" "credential_refresher" {
+  count = var.credential_refresher_image == null ? 0 : 1
+
+  metadata {
+    name      = "cats-credential-refresher"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels    = local.labels
+  }
+
+  rule {
+    api_groups     = [""]
+    resources      = ["secrets"]
+    resource_names = [kubernetes_secret_v1.runtime.metadata[0].name]
+    verbs          = ["get", "patch"]
+  }
+}
+
+resource "kubernetes_role_binding_v1" "credential_refresher" {
+  count = var.credential_refresher_image == null ? 0 : 1
+
+  metadata {
+    name      = "cats-credential-refresher"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels    = local.labels
+  }
+
+  role_ref {
+    api_group = "rbac.authorization.k8s.io"
+    kind      = "Role"
+    name      = kubernetes_role_v1.credential_refresher[0].metadata[0].name
+  }
+
+  subject {
+    kind      = "ServiceAccount"
+    name      = kubernetes_service_account_v1.credential_refresher[0].metadata[0].name
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+  }
+}
+
+resource "kubernetes_cron_job_v1" "credential_refresher" {
+  count = var.credential_refresher_image == null ? 0 : 1
+
+  metadata {
+    name      = "cats-credential-refresher"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels    = local.labels
+  }
+
+  spec {
+    schedule                      = var.credential_refresher_schedule
+    concurrency_policy            = "Forbid"
+    starting_deadline_seconds     = 300
+    successful_jobs_history_limit = 3
+    failed_jobs_history_limit     = 3
+
+    job_template {
+      metadata {
+        labels = local.labels
+      }
+
+      spec {
+        backoff_limit = 2
+        # Bounded so a hung run cannot block the next window forever.
+        active_deadline_seconds = 240
+
+        template {
+          metadata {
+            labels = merge(local.labels, {
+              "app.kubernetes.io/name" = "cats-credential-refresher"
+            })
+            annotations = {
+              "cats.run/rds-ca-sha256" = sha256(local.rds_ca_pem)
+            }
+          }
+
+          spec {
+            restart_policy = "Never"
+            # Unlike the control plane, this Pod needs its token: the Secret
+            # patch goes through the Kubernetes API, authenticated as this
+            # ServiceAccount. AWS credentials arrive out of band, through the
+            # Pod Identity agent.
+            service_account_name = kubernetes_service_account_v1.credential_refresher[0].metadata[0].name
+            enable_service_links = false
+
+            node_selector = {
+              "kubernetes.io/arch" = "amd64"
+            }
+
+            container {
+              name              = "refresher"
+              image             = var.credential_refresher_image
+              image_pull_policy = "IfNotPresent"
+
+              env {
+                name  = "CATS_POSTGRES_SECRET_ARN"
+                value = var.database_master_user_secret_arn
+              }
+
+              env {
+                name  = "CATS_RUNTIME_SECRET_NAME"
+                value = kubernetes_secret_v1.runtime.metadata[0].name
+              }
+
+              # `report` verifies everything and writes nothing. Prove it judges
+              # correctly against the real instance before granting it the write
+              # (ADR-0029 staging); then flip this to `patch`.
+              env {
+                name  = "CATS_REFRESH_MODE"
+                value = var.credential_refresher_mode
+              }
+
+              env {
+                name  = "AWS_REGION"
+                value = var.usage_aws_region
+              }
+
+              env {
+                name  = "CATS_POSTGRES_CA_FILE"
+                value = "/etc/cats/rds-ca.pem"
+              }
+
+              volume_mount {
+                name       = "rds-ca"
+                mount_path = "/etc/cats/rds-ca.pem"
+                sub_path   = "rds-ca.pem"
+                read_only  = true
+              }
+
+              resources {
+                requests = {
+                  cpu    = "50m"
+                  memory = "128Mi"
+                }
+                limits = {
+                  memory = "256Mi"
+                }
+              }
+
+              security_context {
+                allow_privilege_escalation = false
+                read_only_root_filesystem  = false
+                capabilities {
+                  drop = ["ALL"]
+                }
+              }
+            }
+
+            volume {
+              name = "rds-ca"
+              config_map {
+                name = kubernetes_config_map_v1.rds_ca.metadata[0].name
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# An image without the secret it reconciles against would deploy a CronJob that
+# fails on every run. Refuse at plan time instead.
+check "the_refresher_knows_its_authority" {
+  assert {
+    condition = (
+      var.credential_refresher_image == null ||
+      var.database_master_user_secret_arn != null
+    )
+    error_message = "credential_refresher_image is set but database_master_user_secret_arn is not; the refresher would have nothing to reconcile against."
+  }
+}

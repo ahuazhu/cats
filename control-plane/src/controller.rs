@@ -891,42 +891,6 @@ impl Controller {
         }
         Ok(())
     }
-
-    // ------------------------------------------------------------------
-    // Scheduler: filter + least-loaded score (arch doc §13.2, minimal)
-    // ------------------------------------------------------------------
-
-    /// Which node *would* take this Cat, without claiming anything. Placement
-    /// itself goes through `Store::claim_node_for`, which decides and claims in
-    /// one step; this is for callers that only want to look.
-    pub fn schedule(&self, cat: &Cat) -> crate::store::Result<Option<Node>> {
-        let now = now_ms();
-        let mut candidates = Vec::new();
-        for node in self.store.list_nodes()? {
-            if node.state != NodeState::Ready {
-                continue;
-            }
-            if now - node.last_heartbeat_unix * 1000 > self.node_lease_timeout_ms {
-                continue;
-            }
-            let mut used_cpus = 0u32;
-            let mut used_mem = 0u64;
-            for c in self.store.cats_on_node(&node.id)? {
-                if c.id == cat.id {
-                    continue;
-                }
-                used_cpus += c.spec.cpus;
-                used_mem += c.spec.memory_mib;
-            }
-            if used_cpus + cat.spec.cpus <= node.capacity.cpus
-                && used_mem + cat.spec.memory_mib <= node.capacity.memory_mib
-            {
-                candidates.push((used_mem, node));
-            }
-        }
-        candidates.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.id.cmp(&b.1.id)));
-        Ok(candidates.into_iter().next().map(|(_, n)| n))
-    }
 }
 
 fn attempt_key(cat: &Cat) -> String {

@@ -259,11 +259,10 @@ impl BlobStore for ConcurrencyProbe {
     }
 }
 
-/// Runtime-switchable read/write outage used to assert cold-cache boundaries.
+/// Runtime-switchable read outage used to assert cold-cache boundaries.
 pub struct SwitchableFailureBlob {
     inner: Arc<dyn BlobStore>,
     fail_gets: AtomicBool,
-    fail_puts: AtomicBool,
     gets: AtomicU64,
 }
 
@@ -272,17 +271,12 @@ impl SwitchableFailureBlob {
         Self {
             inner,
             fail_gets: AtomicBool::new(false),
-            fail_puts: AtomicBool::new(false),
             gets: AtomicU64::new(0),
         }
     }
 
     pub fn set_fail_gets(&self, fail: bool) {
         self.fail_gets.store(fail, Ordering::SeqCst);
-    }
-
-    pub fn set_fail_puts(&self, fail: bool) {
-        self.fail_puts.store(fail, Ordering::SeqCst);
     }
 
     pub fn get_count(&self) -> u64 {
@@ -292,12 +286,6 @@ impl SwitchableFailureBlob {
 
 impl BlobStore for SwitchableFailureBlob {
     fn put_immutable(&self, key: &str, data: &[u8]) -> cats_storage::blob::Result<()> {
-        if self.fail_puts.load(Ordering::SeqCst) {
-            return Err(BlobError::Backend {
-                key: key.to_string(),
-                message: "injected PUT outage".into(),
-            });
-        }
         self.inner.put_immutable(key, data)
     }
 

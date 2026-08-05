@@ -206,13 +206,6 @@ impl Store {
         self.with(|client| find_account_by_organization(client, organization_id))
     }
 
-    pub fn account_for_personal_owner(
-        &self,
-        workos_user_id: &str,
-    ) -> Result<Option<AccountRecord>> {
-        self.with(|client| find_account_by_personal_owner(client, workos_user_id))
-    }
-
     pub fn account_by_id(&self, account_id: &str) -> Result<AccountRecord> {
         self.enter(|client| {
             let client = client?;

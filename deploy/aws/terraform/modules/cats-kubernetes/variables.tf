@@ -349,3 +349,57 @@ variable "endpoint_wildcard_host" {
     error_message = "endpoint_wildcard_host must begin with '*.'."
   }
 }
+
+variable "credential_refresher_image" {
+  description = <<-EOT
+    Digest-pinned image running the in-cluster credential refresher, built from
+    Dockerfile.control-plane's `credential-refresher` target. Null disables the
+    refresher entirely, which leaves the window described in ADR-0029 open: a
+    rotation followed by an unplanned Pod restart before the next deploy.
+  EOT
+  type        = string
+  default     = null
+}
+
+variable "credential_refresher_mode" {
+  description = <<-EOT
+    `report` reads the authority, composes the DSNs and proves they authenticate,
+    then logs what it would change and writes nothing. `patch` additionally
+    writes. Run in `report` until it has judged correctly against the real
+    instance for several cycles (ADR-0029 staging): the failure this guards
+    against is writing a wrong password that only surfaces at the next restart.
+  EOT
+  type        = string
+  default     = "report"
+
+  validation {
+    condition     = contains(["report", "patch"], var.credential_refresher_mode)
+    error_message = "credential_refresher_mode must be report or patch."
+  }
+}
+
+variable "credential_refresher_schedule" {
+  description = "Cron schedule bounding how long a rotated password can sit unreconciled."
+  type        = string
+  default     = "*/15 * * * *"
+}
+
+variable "credential_refresher_service_account" {
+  description = "ServiceAccount name. Must match the infrastructure stack's Pod Identity association."
+  type        = string
+  default     = "cats-credential-refresher"
+}
+
+variable "database_master_user_secret_arn" {
+  description = "RDS managed master user secret the refresher reconciles against. Required when credential_refresher_image is set."
+  type        = string
+  default     = null
+
+  validation {
+    condition = (
+      var.database_master_user_secret_arn == null ||
+      can(regex("^arn:[^:]+:secretsmanager:", var.database_master_user_secret_arn))
+    )
+    error_message = "database_master_user_secret_arn must be a Secrets Manager ARN."
+  }
+}

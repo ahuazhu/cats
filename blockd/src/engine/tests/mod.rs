@@ -879,6 +879,22 @@ fn committed_cas_with_a_lost_response_is_reconciled_without_fencing() {
     restored.detach().unwrap();
 }
 
+/// An engine over a `LostCasResponseMeta` primed with `fault`, with one page
+/// already written so the next `flush` has something to publish. Each caller
+/// passes its own `byte` so a failure names the test that wrote the data.
+fn dirty_engine_with_fault(dir: &tempfile::TempDir, fault: CasFault, byte: u8) -> Arc<ChunkEngine> {
+    let blob: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let meta = fault_meta(dir, fault);
+    let engine = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        blob,
+        meta,
+    )
+    .unwrap();
+    engine.write(0, &pattern(4096, byte)).unwrap();
+    engine
+}
+
 fn fault_meta(dir: &tempfile::TempDir, fault: CasFault) -> Arc<LostCasResponseMeta> {
     let inner: Arc<dyn MetadataStore> =
         Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
@@ -893,15 +909,7 @@ fn fault_meta(dir: &tempfile::TempDir, fault: CasFault) -> Arc<LostCasResponseMe
 #[test]
 fn a_lost_cas_response_can_be_reconciled_by_the_next_conflict() {
     let dir = tempfile::tempdir().unwrap();
-    let blob: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
-    let meta = fault_meta(&dir, CasFault::ResponseLostAndFirstReconciliationFails);
-    let e = ChunkEngine::attach(
-        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
-        blob,
-        meta,
-    )
-    .unwrap();
-    e.write(0, &pattern(4096, 74)).unwrap();
+    let e = dirty_engine_with_fault(&dir, CasFault::ResponseLostAndFirstReconciliationFails, 74);
 
     assert!(matches!(
         e.flush(),
@@ -920,15 +928,7 @@ fn a_lost_cas_response_can_be_reconciled_by_the_next_conflict() {
 #[test]
 fn a_matching_root_under_a_revoked_lease_still_fences() {
     let dir = tempfile::tempdir().unwrap();
-    let blob: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
-    let meta = fault_meta(&dir, CasFault::ResponseLostThenLeaseRevoked);
-    let e = ChunkEngine::attach(
-        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
-        blob,
-        meta,
-    )
-    .unwrap();
-    e.write(0, &pattern(4096, 75)).unwrap();
+    let e = dirty_engine_with_fault(&dir, CasFault::ResponseLostThenLeaseRevoked, 75);
 
     assert!(matches!(
         e.flush(),
@@ -940,15 +940,7 @@ fn a_matching_root_under_a_revoked_lease_still_fences() {
 #[test]
 fn an_authoritative_generation_beyond_the_target_fences() {
     let dir = tempfile::tempdir().unwrap();
-    let blob: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
-    let meta = fault_meta(&dir, CasFault::ResponseLostThenGenerationAdvanced);
-    let e = ChunkEngine::attach(
-        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
-        blob,
-        meta,
-    )
-    .unwrap();
-    e.write(0, &pattern(4096, 76)).unwrap();
+    let e = dirty_engine_with_fault(&dir, CasFault::ResponseLostThenGenerationAdvanced, 76);
 
     assert!(matches!(
         e.flush(),
@@ -960,15 +952,7 @@ fn an_authoritative_generation_beyond_the_target_fences() {
 #[test]
 fn an_unrelated_root_at_the_target_generation_fences() {
     let dir = tempfile::tempdir().unwrap();
-    let blob: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
-    let meta = fault_meta(&dir, CasFault::UnrelatedRootPublished);
-    let e = ChunkEngine::attach(
-        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
-        blob,
-        meta,
-    )
-    .unwrap();
-    e.write(0, &pattern(4096, 78)).unwrap();
+    let e = dirty_engine_with_fault(&dir, CasFault::UnrelatedRootPublished, 78);
 
     assert!(matches!(
         e.flush(),
@@ -980,15 +964,7 @@ fn an_unrelated_root_at_the_target_generation_fences() {
 #[test]
 fn an_explicit_fenced_error_is_never_rewritten_as_success() {
     let dir = tempfile::tempdir().unwrap();
-    let blob: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
-    let meta = fault_meta(&dir, CasFault::ExplicitFenced);
-    let e = ChunkEngine::attach(
-        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
-        blob,
-        meta,
-    )
-    .unwrap();
-    e.write(0, &pattern(4096, 77)).unwrap();
+    let e = dirty_engine_with_fault(&dir, CasFault::ExplicitFenced, 77);
 
     assert!(matches!(
         e.flush(),

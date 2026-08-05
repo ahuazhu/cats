@@ -41,3 +41,29 @@ USER 10001:10001
 WORKDIR /var/lib/cats
 EXPOSE 7300 7400
 ENTRYPOINT ["/usr/local/bin/cats-controld"]
+
+# The in-cluster credential refresher (ADR-0029). A separate target rather than
+# a separate Dockerfile so it inherits this image's base, CA bundle and non-root
+# user, and so the deployment builds and digest-pins both the same way.
+#
+# It needs three things the control plane does not: the AWS CLI to read the
+# managed secret, psql to prove the composed DSN authenticates before anything
+# is written, and curl to patch the Kubernetes Secret through the API. kubectl
+# is deliberately absent -- one PATCH against one Secret does not justify
+# shipping a cluster binary, and the ServiceAccount token plus curl is a
+# narrower tool for the job.
+FROM runtime AS credential-refresher
+
+USER 0:0
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         awscli curl postgresql-client python3-minimal \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY deploy/aws/swap-dsn-password.py /usr/local/bin/swap-dsn-password.py
+COPY deploy/aws/refresh-database-credential.sh /usr/local/bin/refresh-database-credential
+RUN chmod 0755 /usr/local/bin/swap-dsn-password.py \
+                /usr/local/bin/refresh-database-credential
+
+USER 10001:10001
+ENTRYPOINT ["/usr/local/bin/refresh-database-credential"]

@@ -29,9 +29,9 @@ pub use rows::{parse_desired, parse_observed, parse_wake};
 pub use work::WorkLeaseGuard;
 
 use rows::{
-    desired_str, disk_state_str, node_state_str, observed_str, row_to_account, row_to_cat,
-    row_to_disk, row_to_endpoint, row_to_node, row_to_oci_deployment, row_to_operation,
-    row_to_work_lease, row_to_workspace, summarize_node, wake_str, work_kind_str,
+    desired_str, node_state_str, observed_str, row_to_account, row_to_cat, row_to_disk,
+    row_to_endpoint, row_to_node, row_to_oci_deployment, row_to_operation, row_to_work_lease,
+    row_to_workspace, summarize_node, wake_str, work_kind_str,
 };
 
 #[cfg(test)]

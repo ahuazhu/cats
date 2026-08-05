@@ -64,16 +64,6 @@ pub fn parse_observed(s: &str) -> ObservedState {
     }
 }
 
-pub(super) fn disk_state_str(s: DiskState) -> &'static str {
-    match s {
-        DiskState::Creating => "creating",
-        DiskState::Available => "available",
-        DiskState::Bound => "bound",
-        DiskState::Deleting => "deleting",
-        DiskState::Deleted => "deleted",
-    }
-}
-
 pub(super) fn node_state_str(s: NodeState) -> &'static str {
     match s {
         NodeState::Ready => "ready",

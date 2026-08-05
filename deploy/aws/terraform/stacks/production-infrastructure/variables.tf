@@ -138,3 +138,15 @@ variable "worker_base_environment" {
   type        = map(string)
   default     = {}
 }
+
+variable "credential_refresher_namespace" {
+  description = "Namespace of the ServiceAccount the credential refresher runs as. Must match the application stack."
+  type        = string
+  default     = "cats"
+}
+
+variable "credential_refresher_service_account" {
+  description = "ServiceAccount the credential refresher runs as. Must match the application stack."
+  type        = string
+  default     = "cats-credential-refresher"
+}

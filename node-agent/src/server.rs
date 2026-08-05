@@ -1675,24 +1675,18 @@ fn residue_summary(residue: &[(String, String)]) -> String {
         .join("; ")
 }
 
-/// Register until the control plane accepts, retrying indefinitely.
+/// One registration attempt. `None` means the control plane accepted it; `Some`
+/// carries how long the caller should wait before trying again.
 ///
-/// ADR-0028 §5: a control-plane outage must not end the node agent process.
-/// This also runs before every heartbeat run, not only at startup, because the
-/// control plane's heartbeat handler looks the node up and rejects an unknown
-/// one — a control plane that lost this node re-learns it here instead of
-/// needing an agent restart.
-/// One registration attempt. Returns whether the control plane accepted it.
-///
-/// Used at startup so that `spawn` still means "registered" whenever the
-/// control plane is reachable, without ever blocking on one that is not.
+/// Used directly at startup so that `spawn` still means "registered" whenever
+/// the control plane is reachable, without ever blocking on one that is not.
 async fn try_register_once(
     client: &reqwest::Client,
     control_plane_url: &str,
     auth_token: &str,
     request: &RegisterNodeRequest,
     link: &mut ControlPlaneLink,
-) -> bool {
+) -> Option<Duration> {
     match client
         .post(format!("{control_plane_url}/v1/nodes/register"))
         .bearer_auth(auth_token)
@@ -1707,19 +1701,22 @@ async fn try_register_once(
                 agent_url = %request.agent_url,
                 "node agent registered"
             );
-            true
+            None
         }
         Ok(response) => {
-            link.record_failure(&format!("registration returned {}", response.status()));
-            false
+            Some(link.record_failure(&format!("registration returned {}", response.status())))
         }
-        Err(error) => {
-            link.record_failure(&format!("registration request failed: {error}"));
-            false
-        }
+        Err(error) => Some(link.record_failure(&format!("registration request failed: {error}"))),
     }
 }
 
+/// Register until the control plane accepts, retrying indefinitely.
+///
+/// ADR-0028 §5: a control-plane outage must not end the node agent process.
+/// This also runs before every heartbeat run, not only at startup, because the
+/// control plane's heartbeat handler looks the node up and rejects an unknown
+/// one — a control plane that lost this node re-learns it here instead of
+/// needing an agent restart.
 async fn register_until_accepted(
     client: &reqwest::Client,
     control_plane_url: &str,
@@ -1727,27 +1724,10 @@ async fn register_until_accepted(
     request: &RegisterNodeRequest,
     link: &mut ControlPlaneLink,
 ) {
-    loop {
-        let reason = match client
-            .post(format!("{control_plane_url}/v1/nodes/register"))
-            .bearer_auth(auth_token)
-            .json(request)
-            .send()
-            .await
-        {
-            Ok(response) if response.status().is_success() => {
-                link.record_success();
-                tracing::info!(
-                    node = %request.node_id,
-                    agent_url = %request.agent_url,
-                    "node agent registered"
-                );
-                return;
-            }
-            Ok(response) => format!("registration returned {}", response.status()),
-            Err(error) => format!("registration request failed: {error}"),
-        };
-        tokio::time::sleep(link.record_failure(&reason)).await;
+    while let Some(backoff) =
+        try_register_once(client, control_plane_url, auth_token, request, link).await
+    {
+        tokio::time::sleep(backoff).await;
     }
 }
 
@@ -1935,7 +1915,9 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
     // keep the guarantee whenever the control plane is up, and hand an
     // unreachable one to the retry loop instead of dying on it.
     let mut link = ControlPlaneLink::new(cfg.node.node_id.clone(), cp.clone());
-    let registered = try_register_once(&client, &cp, &token, &register, &mut link).await;
+    let registered = try_register_once(&client, &cp, &token, &register, &mut link)
+        .await
+        .is_none();
     if !registered {
         tracing::warn!(
             node = %cfg.node.node_id,

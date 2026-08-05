@@ -7,7 +7,6 @@
 use super::*;
 
 use cats_api::nodejob::job_id;
-use cats_storage::AdapterConfig;
 
 const VOLUME_SIZE: u64 = 2 * cats_api::chunk::CHUNK_SIZE as u64;
 const CPUS: u32 = 2;
@@ -23,33 +22,8 @@ fn ledger_env(node_id: &str) -> LedgerEnv {
     let dir = tempfile::tempdir().expect("create test root");
     let root = dir.path().to_path_buf();
     let state_dir = root.join("node-state");
-    let runtime = NodeRuntime::new(NodeConfig {
-        node_id: node_id.to_string(),
-        state_dir: state_dir.clone(),
-        blockd_bin: crate::testutil::workspace_bin("cats-blockd"),
-        guest_agent_bin: crate::testutil::workspace_bin("cats-guest-agent"),
-        metadata_store: AdapterSelection {
-            name: "sqlite".into(),
-            config: AdapterConfig::from_pairs([(
-                "path",
-                root.join("meta.db").display().to_string(),
-            )])
-            .expect("SQLite adapter config"),
-        },
-        object_store: AdapterSelection {
-            name: "file".into(),
-            config: AdapterConfig::from_pairs([("root", root.join("blob").display().to_string())])
-                .expect("File adapter config"),
-        },
-        blockd_lease_ttl_ms: 1_200,
-        blockd_max_staged_bytes: cats_api::blockd::DEFAULT_MAX_STAGED_BYTES,
-        blockd_max_staged_packs: cats_api::blockd::DEFAULT_MAX_STAGED_PACKS,
-        blockd_max_local_bytes: cats_api::blockd::DEFAULT_MAX_LOCAL_BYTES,
-        metering_cgroup_root: None,
-        vmm: VmmMode::Fake,
-        wake_budget: WakeBudget::default(),
-    })
-    .expect("open node runtime");
+    let runtime =
+        NodeRuntime::new(real_child_node_config(&root, node_id)).expect("open node runtime");
     LedgerEnv {
         _dir: dir,
         state_dir,

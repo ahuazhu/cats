@@ -160,3 +160,21 @@ variable "route53_zone_id" {
   type        = string
   default     = null
 }
+
+variable "credential_refresher_image" {
+  description = "Digest-pinned credential-refresher image. Supplied by the deployment; null disables the refresher."
+  type        = string
+  default     = null
+}
+
+variable "credential_refresher_mode" {
+  description = "`report` verifies and writes nothing; `patch` also writes. Start in report (ADR-0029 staging)."
+  type        = string
+  default     = "report"
+}
+
+variable "database_master_user_secret_arn" {
+  description = "RDS managed master user secret the refresher reconciles the runtime Secret against."
+  type        = string
+  default     = null
+}

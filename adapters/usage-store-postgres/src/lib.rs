@@ -12,7 +12,8 @@ use std::sync::mpsc;
 
 use cats_api::metering::UsageMetric;
 use cats_metering::{
-    metric_from_slug, usage_view_from_intervals, validate_checkpoint, validate_usage_query,
+    metric_from_slug, usage_view_from_intervals, validate_checkout_intent,
+    validate_checkout_payment, validate_checkout_refund, validate_checkpoint, validate_usage_query,
     AttributedCheckpoint, CheckoutIntent, CheckoutPayment, CheckoutRefund, CreditApplyOutcome,
     CreditStore, CreditStoreFuture, CreditSummary, IngestOutcome, MeteringError, Result,
     UsageAggregate, UsageAttribution, UsageInterval, UsageQuery, UsageStore, UsageStoreFuture,
@@ -306,21 +307,6 @@ fn validate_credit_account(
     Ok(())
 }
 
-fn validate_checkout_intent(intent: &CheckoutIntent) -> Result<()> {
-    if intent.intent_id.is_empty()
-        || intent.billing_account_id.is_empty()
-        || intent.account_id.is_empty()
-        || intent.amount_cents <= 0
-        || intent.currency != "USD"
-        || intent.created_at_unix_ms < 0
-    {
-        return Err(MeteringError::Invalid(
-            "invalid checkout intent".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 fn pg_ensure_credit_account(
     client: &mut Client,
     schema: &str,
@@ -566,20 +552,7 @@ fn pg_apply_checkout_payment(
     schema: &str,
     payment: &CheckoutPayment,
 ) -> Result<CreditApplyOutcome> {
-    if payment.event_id.is_empty()
-        || payment.payload_sha256.len() != 64
-        || payment.intent_id.is_empty()
-        || payment.billing_account_id.is_empty()
-        || payment.stripe_session_id.is_empty()
-        || payment.stripe_payment_intent_id.is_empty()
-        || payment.amount_cents <= 0
-        || payment.currency != "USD"
-        || payment.processed_at_unix_ms < 0
-    {
-        return Err(MeteringError::Invalid(
-            "invalid Stripe checkout payment".to_string(),
-        ));
-    }
+    validate_checkout_payment(payment)?;
     let mut transaction = client
         .transaction()
         .map_err(|error| pg_error("start Stripe event transaction", error))?;
@@ -690,18 +663,7 @@ fn pg_apply_checkout_refund(
     schema: &str,
     refund: &CheckoutRefund,
 ) -> Result<CreditApplyOutcome> {
-    if refund.event_id.is_empty()
-        || refund.payload_sha256.len() != 64
-        || refund.stripe_refund_id.is_empty()
-        || refund.stripe_payment_intent_id.is_empty()
-        || refund.amount_cents <= 0
-        || refund.currency != "USD"
-        || refund.processed_at_unix_ms < 0
-    {
-        return Err(MeteringError::Invalid(
-            "invalid Stripe checkout refund".to_string(),
-        ));
-    }
+    validate_checkout_refund(refund)?;
     let mut transaction = client
         .transaction()
         .map_err(|error| pg_error("start Stripe refund transaction", error))?;
