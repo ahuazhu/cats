@@ -500,13 +500,7 @@ impl Store {
             // Capacity is a fleet-wide invariant, not a per-row one. The
             // transaction lock serializes the read-sum-claim sequence across
             // Store instances without blocking node heartbeat row updates.
-            tx.query_one(
-                "SELECT pg_advisory_xact_lock(hashtextextended(
-                    current_schema() || ':placement', 0::BIGINT
-                 ))",
-                &[],
-            )
-            .map_err(internal)?;
+            lock_placement(&mut tx).map_err(internal)?;
             let nodes = tx
                 .query("SELECT * FROM nodes ORDER BY id", &[])
                 .map_err(internal)?

@@ -1066,6 +1066,203 @@ fn concurrent_placement_cannot_overcommit_a_node() {
 }
 
 #[test]
+fn cordon_linearizes_after_a_placement_that_already_observed_ready() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let placement = Store::connect(&url, None).unwrap();
+    let cordoner = Store::connect(&url, None).unwrap();
+    let observer = Store::connect(&url, None).unwrap();
+    let workspace = bootstrap_workspace(&placement, "linearize-cordon");
+    placement
+        .register_node("node-1", "http://node", "http://gateway", 4, 8192, false)
+        .unwrap();
+    let (cat, _, _) = create_test_cat(&placement, &workspace, "waiter").unwrap();
+
+    placement
+        .with(|client| {
+            client.batch_execute("SET statement_timeout='15s'; SET lock_timeout='15s'")?;
+            client.query_one(
+                "SELECT set_config('application_name', $1, false)",
+                &[&"q150-placement-waiter"],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    cordoner
+        .with(|client| {
+            client.batch_execute("SET statement_timeout='15s'; SET lock_timeout='15s'")?;
+            client.query_one(
+                "SELECT set_config('application_name', $1, false)",
+                &[&"q150-cordon-waiter"],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    // Pause the production claim at its real UPDATE, after it selected this
+    // Ready node. pg_stat_activity's PgSleep wait is the positive oracle that
+    // the claim reached that point; the timeout below is only a deadlock guard.
+    observer
+        .with(|client| {
+            client.batch_execute(
+                "CREATE FUNCTION q150_pause_real_claim() RETURNS trigger
+                   LANGUAGE plpgsql AS $$
+                   BEGIN
+                     IF OLD.node_id IS NULL AND NEW.node_id = 'node-1' THEN
+                       PERFORM pg_sleep(5);
+                     END IF;
+                     RETURN NEW;
+                   END
+                   $$;
+                 CREATE TRIGGER q150_pause_real_claim
+                   BEFORE UPDATE OF node_id ON cats
+                   FOR EACH ROW EXECUTE FUNCTION q150_pause_real_claim();",
+            )
+        })
+        .unwrap();
+
+    let (placement_result_tx, placement_result_rx) = std::sync::mpsc::channel();
+    let (cordon_result_tx, cordon_result_rx) = std::sync::mpsc::channel();
+    let mut placement_sleep_seen = false;
+    let mut cordon_wait_seen = false;
+    let mut probe_error = None;
+    let mut early_placement_result = None;
+    let mut early_cordon_result = None;
+
+    std::thread::scope(|scope| {
+        let cat_id = cat.id.clone();
+        let placement_store = &placement;
+        let placement_worker = scope.spawn(move || {
+            placement_result_tx
+                .send(placement_store.claim_node_for(&cat_id, 1, 256, 60_000, now_ms()))
+                .unwrap();
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            if let Ok(result) = placement_result_rx.try_recv() {
+                early_placement_result = Some(result);
+                break;
+            }
+            match observer.with(|client| {
+                client
+                    .query_one(
+                        "SELECT COUNT(*)
+                           FROM pg_stat_activity
+                          WHERE application_name=$1
+                            AND wait_event_type='Timeout'
+                            AND wait_event='PgSleep'",
+                        &[&"q150-placement-waiter"],
+                    )
+                    .and_then(|row| row.try_get::<_, i64>(0))
+            }) {
+                Ok(1) => {
+                    placement_sleep_seen = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    probe_error = Some(format!("placement probe failed: {error}"));
+                    break;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let cordon_worker = scope.spawn(|| {
+            cordon_result_tx
+                .send(cordoner.set_node_state("node-1", NodeState::Cordoned))
+                .unwrap();
+        });
+
+        // This is a positive synchronization oracle, not a scheduling-delay
+        // assertion: PostgreSQL must show the exact cordoner session queued on
+        // an advisory lock before the older placement is allowed to commit.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            if let Ok(result) = cordon_result_rx.try_recv() {
+                early_cordon_result = Some(result);
+                break;
+            }
+            match observer.with(|client| {
+                client
+                    .query_one(
+                        "SELECT COUNT(*)
+                           FROM pg_locks AS locks
+                           JOIN pg_stat_activity AS activity
+                             ON activity.pid=locks.pid
+                          WHERE activity.application_name=$1
+                            AND locks.locktype='advisory'
+                            AND NOT locks.granted",
+                        &[&"q150-cordon-waiter"],
+                    )
+                    .and_then(|row| row.try_get::<_, i64>(0))
+            }) {
+                Ok(1) => {
+                    cordon_wait_seen = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    probe_error = Some(format!("cordon probe failed: {error}"));
+                    break;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        placement_worker.join().unwrap();
+        cordon_worker.join().unwrap();
+    });
+
+    observer
+        .with(|client| {
+            client.batch_execute(
+                "DROP TRIGGER IF EXISTS q150_pause_real_claim ON cats;
+                 DROP FUNCTION IF EXISTS q150_pause_real_claim();",
+            )
+        })
+        .unwrap();
+
+    assert!(probe_error.is_none(), "{}", probe_error.unwrap_or_default());
+    assert!(
+        placement_sleep_seen,
+        "the real claim never reached its guarded node_id update"
+    );
+    assert!(
+        cordon_wait_seen,
+        "cordon returned without waiting for an older Ready placement"
+    );
+    let placed = match early_placement_result {
+        Some(result) => result,
+        None => placement_result_rx.recv().unwrap(),
+    }
+    .unwrap();
+    let cordoned = match early_cordon_result {
+        Some(result) => result,
+        None => cordon_result_rx.recv().unwrap(),
+    };
+    cordoned.unwrap();
+    assert_eq!(placed.unwrap().id, "node-1");
+
+    assert_eq!(
+        placement.must_get_cat_by_id(&cat.id).unwrap().node_id,
+        Some("node-1".into()),
+        "the placement that linearized first remains visible to drain"
+    );
+    assert_eq!(
+        placement.get_node("node-1").unwrap().state,
+        NodeState::Cordoned,
+        "cordon linearizes after the already-authorized placement"
+    );
+}
+
+#[test]
 fn gateway_work_blocks_auto_suspend_and_wake_is_singleflight() {
     let store = test_store();
     let workspace = bootstrap_workspace(&store, "alpha");
