@@ -187,3 +187,45 @@ Resume 找不到它，Cold fallback 又会因为无监督 residue 的 fail-close
 
 每阶段独立 PR，先补 characterization test。第 2 与第 5 阶段触及 Linux-only 路径，必须
 额外运行 `./scripts/quality.sh linux`。
+
+## residue 的另一半：只 fail closed 是不够的（2026-08-05 补记）
+
+§7 写的「无法证明归属的 residue：维持现有 fail-closed 行为不变」只说对了一半。fail
+closed 规则本身是对的，必须保留；缺的是它的对侧——**没有任何东西回来处置这些目录，也
+没有任何指标报告它们存在**。
+
+2026-08-05 `metal-1` 上的形状（issue #99）：节点监督 2 只 Cat，`/var/lib/cats/node/cats`
+下有 51 个 per-Cat runtime 目录，占 104 GiB。其中 `guest-memory.bin` 51 个（348 GiB
+apparent / 约 53 GiB 实占，稀疏），`vol-*` journal 约 51 GiB，Warm `snapshot/` 为 0。
+管理台读到的 195 GiB 已用里，绝大部分是垃圾，而 49 个废弃目录和 2 个在用目录在所有运维
+视图里完全无法区分。
+
+来源不是单一 bug，而是「teardown 只要没有全程成功，整个目录就永久留下」：8 只 Cat 死在
+`root CAS conflict`（已被 fencing，journal 本就不许发布），5 只死在计费投递退避（该项已
+由 usage 上传独立通道修复），其余是 #87/#88 之前的孤儿（#98）。
+
+因此本 ADR 补充一条规则：**节点必须周期性回收无监督 runtime 目录中可判定为非持久化状态
+的部分，并把剩下的报出来**。可判定仅限两项，其余一律保持原样：
+
+1. `guest-memory.bin` 是 Guest RAM 后备。只有 Warm restore 会读回它，而 Warm restore
+   需要旁边的 `snapshot/`（FakeVmm 则是 warm state 文件）；没有快照时 Cold start 会重新
+   生成。**有快照的目录整体不动。**
+2. `pending/` 里没有 pack 的 `vol-<disk>` 目录。已确认但未发布的写入按 ADR-0021/0022 一定
+   在 pending pack 里；没有 pack 时剩下的只有 `cache.data` 与 `dirty.bitmap`，即不变量
+   所说的"可删除缓存"。**有 pack 的目录整体保留并计入遥测。**
+
+有 pack 时"这条 lineage 是否已被取代"是可判定的，但判据是卷的 head generation，只有
+blockd 能向 MetadataStore 提问（ADR-0005）；node agent 不持有该客户端，也不应为此持有。
+所以这一半留在 fail closed 一侧，只是不再隐形。
+
+安全前提同样只有两条，都不依赖 ledger（失败的启动会在留下目录的同时删掉记录）：目录不属于
+任何已监督的 Cat，且它的控制 socket 无人应答。socket 路径由 `(state_dir, cat_id, kind)`
+推导而非记忆，所以对一个没有任何记录的目录同样可以重建；AF_UNIX 恰好精确回答这个问题
+（有服务端则 accept，崩溃留下的陈旧 socket 文件则 ECONNREFUSED），任何其他错误按"仍在服务"
+处理。扫描按 Cat 取执行锁，取不到就跳过，因此不会和 in-flight 的 `start_cat` 抢同一个目录。
+
+遥测新增 `unsupervised_runtime_dirs` / `unsupervised_runtime_bytes`（实占字节，不是 apparent
+——稀疏文件会把 53 GiB 报成 348 GiB），与 #79 的 `leaked_nbd_devices` 并列导出。
+
+不变的部分：`stop_cat` 对无监督目录的 fail-closed 拒绝保留原样；Warm 的本地证据不动；
+`R < L` 的 pending pack 仍是唯一权威副本，任何情况下不因为"目录看起来没人要"被删除。

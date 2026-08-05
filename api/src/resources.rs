@@ -328,6 +328,21 @@ pub struct NodeTelemetry {
     pub leaked_nbd_devices: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nbd_devices_total: Option<u64>,
+    /// Per-Cat runtime directories on the node's local medium that no
+    /// supervised Cat owns, and the bytes they actually occupy. Absent until
+    /// the node's first sweep, so "not measured yet" stays distinguishable from
+    /// "nothing abandoned".
+    ///
+    /// A teardown that fails for a reason unrelated to the disk — a fenced
+    /// drain, an unreachable object store — leaves its directory behind, and
+    /// until this existed the result was indistinguishable from working set in
+    /// every operator view: one host held 49 abandoned directories and 2 live
+    /// Cats behind a single disk-usage number (issue #99). The bytes are
+    /// allocated, not apparent, because the Guest memory backing is sparse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsupervised_runtime_dirs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsupervised_runtime_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_logical_cpus: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

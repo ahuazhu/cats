@@ -2,7 +2,7 @@ use super::*;
 
 impl ChunkEngine {
     pub(super) fn recover_pending_packs(&self) -> Result<()> {
-        let dir = self.cfg.data_dir.join("pending");
+        let dir = self.cfg.data_dir.join(PENDING_PACK_DIR);
         let mut packs = Vec::new();
         for entry in fs::read_dir(&dir)? {
             let path = entry?.path();
@@ -11,7 +11,7 @@ impl ChunkEngine {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            if name.ends_with(".pack") {
+            if name.ends_with(PACK_FILE_SUFFIX) {
                 packs.push(path);
             } else if name.starts_with(".tmp-") {
                 // Torn pack write: never renamed, safe to drop.

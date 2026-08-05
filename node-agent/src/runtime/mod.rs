@@ -26,6 +26,7 @@ mod ledger;
 mod lifecycle;
 mod metering;
 mod proxy;
+mod residue;
 mod supervisor;
 
 #[cfg(test)]
@@ -58,6 +59,9 @@ use blockd_control::{blockd_log_path, BlockdProc};
 use ledger::Ledger;
 use metering::RuntimeMetering;
 use proxy::{ActivityChanged, RuntimeActivity};
+use residue::RuntimeResidue;
+
+pub(crate) use residue::allocated_tree_bytes;
 
 #[cfg(test)]
 use blockd_control::BLOCKD_STATUS_TIMEOUT;
@@ -331,6 +335,14 @@ pub struct NodeRuntime {
     /// Remote Stop/Cold drains may run across Cats, but an expiry wave must not
     /// create unbounded S3/PostgreSQL fan-out.
     stop_admission: StopAdmission,
+    /// What the last runtime-directory sweep left behind (issue #99).
+    ///
+    /// Held rather than measured per heartbeat: the answer needs a walk of the
+    /// whole state directory and a Unix-socket probe per abandoned Cat, and
+    /// billing telemetry must not start paying for that every few seconds.
+    /// `None` until the first sweep lands, so "not measured yet" stays
+    /// distinguishable from "nothing to reclaim".
+    residue: Mutex<Option<RuntimeResidue>>,
 }
 
 const MAX_CONCURRENT_STOPS: usize = 4;
@@ -397,6 +409,7 @@ impl NodeRuntime {
                 ..cfg_wake_budget
             }),
             stop_admission: StopAdmission::new(MAX_CONCURRENT_STOPS),
+            residue: Mutex::new(None),
         })
     }
 
@@ -483,10 +496,13 @@ impl NodeRuntime {
             ),
             VmmMode::Fake => (None, None),
         };
+        let residue = self.last_runtime_residue();
         let cats = self.cats.lock().unwrap();
         NodeTelemetry {
             leaked_nbd_devices,
             nbd_devices_total,
+            unsupervised_runtime_dirs: residue.map(|residue| residue.dirs),
+            unsupervised_runtime_bytes: residue.map(|residue| residue.bytes),
             observed_cats: cats.len() as u64,
             allocated_cpus: cats.values().map(|runtime| runtime.cpus).sum(),
             allocated_memory_mib: cats.values().map(|runtime| runtime.memory_mib).sum(),

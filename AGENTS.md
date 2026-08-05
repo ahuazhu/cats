@@ -25,6 +25,23 @@ The script keeps the target directory in a Docker volume, not in the bind-mounte
 
 ## Working agreement
 
+### Workspace isolation
+
+Every independent feature or bug fix gets its own git worktree at
+`.worktrees/<issue-id>`, on its own branch. Do not develop in the primary
+checkout: the quality gate and the storage/lifecycle tests spawn real processes
+and rewrite state directories, and the primary checkout is where the user's own
+uncommitted work and untracked notes live.
+
+```bash
+git worktree add -b fix/<short-slug> .worktrees/99
+```
+
+Without an issue, name the directory after the branch slug. Never `git stash` in
+the primary checkout to free it for another task — that is exactly what a second
+worktree is for. Remove the worktree once its branch has merged
+(`git worktree remove .worktrees/<issue-id>`).
+
 ### Verification
 
 - Run `./scripts/quality.sh fast` while iterating and `./scripts/quality.sh full` before handoff.

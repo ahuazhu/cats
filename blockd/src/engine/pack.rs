@@ -195,14 +195,14 @@ impl ChunkEngine {
     pub(super) fn pack_path(&self, base_generation: i64, txn: &str) -> PathBuf {
         self.cfg
             .data_dir
-            .join("pending")
-            .join(format!("{base_generation:020}-{txn}.pack"))
+            .join(PENDING_PACK_DIR)
+            .join(format!("{base_generation:020}-{txn}{PACK_FILE_SUFFIX}"))
     }
 
     pub(super) fn write_pack_file(&self, header: &PackHeader, payload: &[u8]) -> Result<u64> {
         let encoded = format::encode_pack(header, payload);
         let encoded_bytes = encoded.len() as u64;
-        let dir = self.cfg.data_dir.join("pending");
+        let dir = self.cfg.data_dir.join(PENDING_PACK_DIR);
         let tmp = dir.join(format!(".tmp-{}", header.txn));
         {
             let mut f = File::create(&tmp)?;

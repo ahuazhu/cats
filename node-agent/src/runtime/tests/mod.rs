@@ -1,7 +1,139 @@
 use super::*;
 
+use cats_api::nodejob::job_id;
+use cats_storage::AdapterConfig;
+
+use ledger::CatLedgerRecord;
+
 mod adoption;
 mod ledger_writes;
+mod residue_sweep;
+
+// ---------------------------------------------------------------------------
+// Real-Cat harness
+//
+// Shared by the sibling test modules that need an actual Cat rather than a
+// hand-built `CatRuntime`: a real `cats-blockd` per disk and a real
+// `cats-guest-agent`, started by one `NodeRuntime` over a tempdir state
+// directory. `restarted_agent` builds a second `NodeRuntime` over the same
+// directory and the same still-running processes, which is what an agent
+// restart actually looks like.
+// ---------------------------------------------------------------------------
+
+const VOLUME_SIZE: u64 = 2 * cats_api::chunk::CHUNK_SIZE as u64;
+const CPUS: u32 = 2;
+const MEMORY_MIB: u64 = 512;
+
+struct RealCatEnv {
+    _dir: tempfile::TempDir,
+    root: PathBuf,
+    cfg: NodeConfig,
+    /// The agent that started the Cat and still owns its children.
+    runtime: NodeRuntime,
+}
+
+fn real_cat_env(node_id: &str) -> RealCatEnv {
+    let dir = tempfile::tempdir().expect("create test root");
+    let root = dir.path().to_path_buf();
+    let cfg = NodeConfig {
+        node_id: node_id.to_string(),
+        state_dir: root.join("node-state"),
+        blockd_bin: crate::testutil::workspace_bin("cats-blockd"),
+        guest_agent_bin: crate::testutil::workspace_bin("cats-guest-agent"),
+        metadata_store: AdapterSelection {
+            name: "sqlite".into(),
+            config: AdapterConfig::from_pairs([(
+                "path",
+                root.join("meta.db").display().to_string(),
+            )])
+            .expect("SQLite adapter config"),
+        },
+        object_store: AdapterSelection {
+            name: "file".into(),
+            config: AdapterConfig::from_pairs([("root", root.join("blob").display().to_string())])
+                .expect("File adapter config"),
+        },
+        blockd_lease_ttl_ms: 1_200,
+        blockd_max_staged_bytes: cats_api::blockd::DEFAULT_MAX_STAGED_BYTES,
+        blockd_max_staged_packs: cats_api::blockd::DEFAULT_MAX_STAGED_PACKS,
+        blockd_max_local_bytes: cats_api::blockd::DEFAULT_MAX_LOCAL_BYTES,
+        metering_cgroup_root: None,
+        vmm: VmmMode::Fake,
+        wake_budget: WakeBudget::default(),
+    };
+    let runtime = NodeRuntime::new(cfg.clone()).expect("open node runtime");
+    RealCatEnv {
+        _dir: dir,
+        root,
+        cfg,
+        runtime,
+    }
+}
+
+impl RealCatEnv {
+    /// A fresh agent process over the same state directory and the same
+    /// still-running children.
+    fn restarted_agent(&self) -> NodeRuntime {
+        NodeRuntime::new(self.cfg.clone()).expect("open the restarted node runtime")
+    }
+
+    fn run(&self, job: NodeJob) -> NodeJobResult {
+        let result = self.runtime.execute(job);
+        assert_eq!(
+            result.phase,
+            JobPhase::Succeeded,
+            "job failed: {:?}",
+            result.error
+        );
+        result
+    }
+
+    fn record(&self, cat_id: &str) -> CatLedgerRecord {
+        self.runtime
+            .ledger
+            .load_all()
+            .expect("load ledger records")
+            .into_iter()
+            .find(|record| record.cat_id == cat_id)
+            .unwrap_or_else(|| panic!("no runtime ledger record for {cat_id}"))
+    }
+
+    fn rewrite_record(&self, record: &CatLedgerRecord) {
+        self.runtime
+            .ledger
+            .put(record)
+            .expect("rewrite the runtime ledger record");
+    }
+}
+
+fn grant(cat_id: &str, disk_id: &str, mount_path: &str) -> VolumeGrant {
+    VolumeGrant {
+        disk_id: disk_id.to_string(),
+        volume_id: format!("vol_{cat_id}_{disk_id}"),
+        attachment_id: format!("att_{cat_id}_{disk_id}"),
+        epoch: 0,
+        size_bytes: VOLUME_SIZE,
+        mount_path: mount_path.to_string(),
+        durability: Default::default(),
+    }
+}
+
+fn start_job(cat_id: &str, generation: i64, disks: &[(&str, &str)]) -> NodeJob {
+    NodeJob {
+        job_id: job_id(cat_id, generation, "start_cat"),
+        cat_generation: generation,
+        action: NodeJobAction::StartCat {
+            cat_id: cat_id.to_string(),
+            image: "test".into(),
+            cpus: CPUS,
+            memory_mib: MEMORY_MIB,
+            volumes: disks
+                .iter()
+                .map(|(disk_id, mount_path)| grant(cat_id, disk_id, mount_path))
+                .collect(),
+        },
+    }
+}
 
 #[derive(Default)]
 struct RecordingUsageFinalizer {

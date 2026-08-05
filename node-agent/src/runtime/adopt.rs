@@ -18,7 +18,8 @@
 //! stage 5 on the processes outlive the agent (per-Cat systemd scope). A state
 //! this proof refuses would then be an unclaimed orphan: nothing supervises it,
 //! `Resume`/`Stop` cannot find it, and the fail-closed unsupervised-residue rule
-//! in `stop_cat` will not clean it up either. What is alive differs per state:
+//! in `stop_cat` will not clean it up either — the `residue` sweep reclaims only
+//! what a live process is provably not using. What is alive differs per state:
 //!
 //! - `Running`: VMM and blockds up, Guest answering. The full proof.
 //! - `Suspended`: same processes, but the Guest is paused and cannot answer, so
@@ -33,8 +34,10 @@
 //!
 //! Anything less is residue: reported, logged, and otherwise left exactly as
 //! found. Adoption never kills, drains, or deletes — a Cat this node cannot
-//! prove it owns may still be owned by a live process holding a lease, and the
-//! existing fail-closed handling in `stop_cat` is what deals with it.
+//! prove it owns may still be owned by a live process holding a lease. What
+//! becomes of that residue is decided elsewhere: `stop_cat` fails closed on it,
+//! and the sweep in `residue` reclaims the part of it that is provably not
+//! durability state and reports the rest (issue #99).
 //!
 //! Residue must also stay out of [`NodeRuntime::snapshot`], which is what the
 //! heartbeat reports. Omitting a Cat leaves the node Lost, which is recoverable;

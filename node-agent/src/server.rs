@@ -4,7 +4,6 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -39,8 +38,8 @@ use cats_storage::MetadataStore;
 
 use crate::guest_client::GuestShell;
 use crate::runtime::{
-    CatTelemetryTarget, GuestConn, NodeConfig, NodeRuntime, ProxyTarget, RuntimeActivityGuard,
-    UsageFinalizer,
+    allocated_tree_bytes, CatTelemetryTarget, GuestConn, NodeConfig, NodeRuntime, ProxyTarget,
+    RuntimeActivityGuard, UsageFinalizer,
 };
 use crate::usage_spool::UsageSpool;
 
@@ -177,6 +176,14 @@ const USAGE_DELIVERY_MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// the control plane's structured message, short enough that remote input
 /// cannot flood the journal.
 const MAX_INGEST_ERROR_DETAIL_CHARS: usize = 512;
+
+/// How often abandoned per-Cat runtime directories are reclaimed and recounted.
+///
+/// Slow on purpose. Every pass walks the state directory and probes a Unix
+/// socket per abandoned Cat, and what it is chasing accumulates over days: the
+/// host that motivated it had collected 49 directories, the oldest five over
+/// five days old (issue #99). A tighter cadence would buy nothing but I/O.
+const RUNTIME_RESIDUE_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 
 /// How often the uploader drains the spool when nothing nudges it.
 ///
@@ -1187,17 +1194,6 @@ fn process_usage(process_ids: &[u32]) -> (Option<u64>, Option<u64>) {
     (Some(cpu_ticks), Some(rss_bytes))
 }
 
-fn allocated_tree_bytes(path: &FsPath) -> Option<u64> {
-    let metadata = std::fs::symlink_metadata(path).ok()?;
-    let mut total = metadata.blocks().saturating_mul(512);
-    if metadata.file_type().is_dir() {
-        for entry in std::fs::read_dir(path).ok()? {
-            total = total.saturating_add(allocated_tree_bytes(&entry.ok()?.path())?);
-        }
-    }
-    Some(total)
-}
-
 fn parse_cgroup_cpu_usage_usec(contents: &str) -> Option<u64> {
     contents.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
@@ -1879,6 +1875,16 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
         .await
         .context("sweep leaked kernel NBD devices")?;
 
+    // Same shape for the per-Cat runtime directories, and for the same reason:
+    // nothing reclaimed them, so the local medium only filled (issue #99). Also
+    // after adoption -- what this node still supervises is decided there, and
+    // the sweep must never be in a position to delete state belonging to a Cat
+    // just proven alive.
+    let residue_sweeping = runtime.clone();
+    tokio::task::spawn_blocking(move || residue_sweeping.sweep_runtime_residue())
+        .await
+        .context("sweep abandoned per-Cat runtime directories")?;
+
     let state = NodeState {
         runtime: runtime.clone(),
         cfg: cfg.clone(),
@@ -1988,6 +1994,28 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
         }
     });
 
+    // Runtime-directory residue: reclaim, then report what had to stay. A
+    // teardown fails while the agent is up, not only across a restart, so a
+    // boot-only sweep would hold those bytes until someone restarted the agent
+    // -- and the telemetry behind it would age into fiction meanwhile.
+    let residue_state = state.clone();
+    let residue_sweeper = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(RUNTIME_RESIDUE_SWEEP_INTERVAL).await;
+            let runtime = residue_state.runtime.clone();
+            // Walks the state directory and probes Unix sockets, so it stays
+            // off the async executor like every other filesystem pass here.
+            if let Err(error) =
+                tokio::task::spawn_blocking(move || runtime.sweep_runtime_residue()).await
+            {
+                tracing::warn!(
+                    error = format!("{error:#}"),
+                    "runtime-directory sweep did not run"
+                );
+            }
+        }
+    });
+
     // One long-poll watcher per Running Cat. Lease changes are pushed to the
     // control plane immediately; the 1s timeout refreshes source freshness
     // and repairs a lost event without high-rate polling.
@@ -2033,17 +2061,22 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
     Ok(Handle {
         addr,
         state,
-        tasks: vec![server, connection, usage_uploader, activity_watchers],
+        tasks: vec![
+            server,
+            connection,
+            usage_uploader,
+            residue_sweeper,
+            activity_watchers,
+        ],
     })
 }
 
 #[cfg(test)]
 mod telemetry_tests {
     use super::{
-        allocated_tree_bytes, compact_pending_checkpoints, cpu_usage_percent, filesystem_capacity,
-        now_unix_ms, parse_cgroup_cpu_usage_usec, parse_cpu_times, parse_memory_mib,
-        parse_process_cpu_ticks, parse_process_rss_bytes, process_cpu_usage_cores,
-        read_cgroup_usage, HostTelemetrySampler,
+        compact_pending_checkpoints, cpu_usage_percent, filesystem_capacity, now_unix_ms,
+        parse_cgroup_cpu_usage_usec, parse_cpu_times, parse_memory_mib, parse_process_cpu_ticks,
+        parse_process_rss_bytes, process_cpu_usage_cores, read_cgroup_usage, HostTelemetrySampler,
     };
     use crate::runtime::{CatMeteringTarget, CatTelemetryTarget};
     use cats_api::metering::{CatUsageCheckpoint, UsageMetric};
@@ -2090,21 +2123,6 @@ mod telemetry_tests {
             parse_process_rss_bytes("Name:\tcloud-hypervisor\nVmRSS:\t  1234 kB\n"),
             Some(1_263_616)
         );
-    }
-
-    #[test]
-    fn measures_allocated_runtime_tree_without_following_symlinks() {
-        use std::io::Write;
-
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(temp.path().join("cache")).unwrap();
-        let mut file = std::fs::File::create(temp.path().join("cache/chunk")).unwrap();
-        file.write_all(&vec![1_u8; 8192]).unwrap();
-        std::os::unix::fs::symlink(temp.path().join("cache"), temp.path().join("cache-link"))
-            .unwrap();
-        let used = allocated_tree_bytes(temp.path()).unwrap();
-        assert!(used >= 8192);
-        assert!(used < 32 * 1024 * 1024);
     }
 
     #[test]
