@@ -5,10 +5,9 @@ Wants=network-online.target
 
 [Service]
 Delegate=cpu memory
-# Stop or restart only the node agent. Its ledger-backed adoption path proves
-# and re-adopts the surviving VMM and blockd processes (ADR-0028); killing the
-# whole cgroup here would terminate every Cat on this worker at once.
-KillMode=process
+# Keep systemd's default KillMode=control-group until #186 makes ledger
+# persistence and every in-flight lifecycle crash window safely re-adoptable.
+# A controlled worker release must drain to cats=0/orphans=0 before stopping.
 Environment=CATS_GUEST_NETWORK_CIDR=10.240.0.0/16
 # Direct RDS remains the compatible default. A managed worker environment can
 # override this after the proxy exists and has passed its connectivity check.

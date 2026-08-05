@@ -64,7 +64,7 @@ fn deployment_units_pin_kvm_clock_too() {
 }
 
 #[test]
-fn node_agent_restarts_preserve_guest_runtime_processes() {
+fn node_agent_does_not_orphan_runtimes_without_a_crash_safe_ledger() {
     for unit in [
         "deploy/metal/systemd/cats-noded.service",
         "deploy/aws/metal/cats-worker.service",
@@ -75,10 +75,9 @@ fn node_agent_restarts_preserve_guest_runtime_processes() {
             .map(str::trim)
             .filter(|line| line.starts_with("KillMode="))
             .collect::<Vec<_>>();
-        assert_eq!(
-            kill_modes,
-            ["KillMode=process"],
-            "{unit} must stop only cats-noded so its VMM and blockd processes survive for ledger-backed re-adoption"
+        assert!(
+            kill_modes.is_empty(),
+            "{unit} must retain systemd's control-group default until #186 makes every lifecycle crash window and ledger failure re-adoptable; found {kill_modes:?}"
         );
     }
 }

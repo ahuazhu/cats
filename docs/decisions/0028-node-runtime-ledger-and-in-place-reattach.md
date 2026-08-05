@@ -112,23 +112,19 @@ Agent 启动先扫描并接管本地 inventory，再在后台重试向控制面�
 只有携带完整同 generation inventory 的注册才能用于恢复控制面侧的 Lost claim；
 inventory 不完整时该 Node 继续保持 Lost，由控制面决定后续处置。
 
-### 6. 子进程存活与归属：`KillMode=process`，随后是 per-Cat systemd scope
+### 6. 子进程归属：per-Cat systemd scope，且必须晚于 crash-safe 重接管能力上线
 
-§3/§7 覆盖全部常驻状态的重接管能力上线后，两个生产 unit 先设置 `KillMode=process`。
-`systemctl restart` 与 `systemctl stop` 只终止 Agent 主进程，VMM 与 blockd 留在 delegated
-unit cgroup 中，随后由 ledger、PID 身份和协议握手证明并重接管。这样 Agent 升级不再同时
-杀掉 Host 上的全部 Guest 和持有未发布 journal 的 blockd。
-
-随后把 VMM 与 blockd 移出 Agent 的 unit cgroup，放入 per-Cat transient scope
+VMM 与 blockd 移出 Agent 的 unit cgroup，放入 per-Cat transient scope
 （`cats-cat-<cat_id>.scope`，置于独立 slice 下）。scope 的存在与其 `cgroup.procs` 成为
-第 3 步中更强的一项归属证据，也让单只 Cat 的停止边界可由 systemd 明确表达。
+第 3 步中最强的一项归属证据，并且 `systemctl restart` 与 `systemctl stop` 都不再波及
+Guest。
 
 排序是本 ADR 的一部分，不是实现细节：**先让 Agent 能证明并重接管，再让子进程在重启后
 存活**。反过来做只会把「重启杀掉 Guest」换成「重启产生无人认领的孤儿进程」。这个前置
-约束针对的是重接管能力：`Running`、`Suspended`、`Warm`、`Stopping` 尚未都能安全重接管
-前，`KillMode` 必须保持默认；该前置完成后可以先用 `KillMode=process` 保留子进程，再独立
-落地 per-Cat scope。NodeJob 结果持久化仍按 §4 独立演进；成功 job 在重启后重复执行是有界的
-幂等工作，不是子进程接管的安全前置。
+约束不仅针对 settled state：ledger 写失败，以及 `run_action` 已改变进程/状态但最终 ledger
+尚未 fsync 的 crash window，也必须能恢复。#186 完成这些 crash-safe 前置之前，`KillMode`
+保持默认；不能只用正常路径的 adoption 测试证明它安全。NodeJob 结果持久化仍按 §4 独立
+演进；成功 job 在重启后重复执行是有界的幂等工作，不是子进程接管的数据安全前置。
 
 FakeVmm/开发与 macOS 路径没有 systemd。这些路径不使用 scope，仅依赖 ledger 与 PID
 身份校验；它们本来就不承载生产 workload。
@@ -184,7 +180,7 @@ FakeVmm/开发与 macOS 路径没有 systemd。这些路径不使用 scope，仅
 3. NodeJob journal 持久化与重放。
 4. `Suspended`/`Warm`/`Stopping` 接管与 Cold fallback 收敛。判据是「这个状态下还有没有
    活进程」：有活进程而不能接管，上了阶段 5 就是孤儿。
-5. `KillMode=process` 与运维文档更新；随后落地 per-Cat systemd scope。
+5. crash-safe in-flight ledger/recovery、per-Cat systemd scope 与 `KillMode` 变更，附运维文档更新。
 
 **阶段 4 是阶段 5 的前提，不是可以并列或跳过的一项。** 今天 Suspended 的 VMM 是活着的、
 暂停着的，Agent 重启时被 systemd 一并杀掉，Cat 因此干净地收敛到 Cold。一旦阶段 5 让子进程

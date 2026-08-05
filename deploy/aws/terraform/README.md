@@ -372,19 +372,19 @@ The association independently refuses to change installed files while any Cat
 PID remains in the worker's metering cgroups **or** any `cats-blockd` /
 `cloud-hypervisor` process is alive on the host. The process-table check
 exists because a blockd is not metered: with the Guests gone the cgroup walk
-reads clean, yet the blockd may still hold an unpublished journal — on a
-relaxed volume that journal is the only authoritative copy. `cats-worker` uses
-`KillMode=process`, so stopping or restarting the agent deliberately leaves
-those runtimes alive for ledger-backed re-adoption; it does not make replacing
-the worker binaries or Guest seed underneath them safe. This fail-closed guard
-prevents bypassing the drain runbook; it does not cordon the node itself and
-therefore is not a substitute for step 1. Do not copy production binaries,
-patch the seed, or edit `worker.env` manually; update the bundle digest or
-secret input and apply Terraform.
+reads clean, yet `systemctl stop cats-worker` (default
+`KillMode=control-group`) would kill a surviving blockd together with any
+unpublished journal it holds — on a relaxed volume that journal is the only
+authoritative copy. This is a fail-closed guard against bypassing the drain
+runbook; it does not cordon the node itself and therefore is not a substitute
+for step 1. Do not copy production binaries, patch the seed, or edit
+`worker.env` manually; update the bundle digest or secret input and apply
+Terraform.
 
-`systemctl stop cats-worker` now stops only the node agent. It does **not** stop
-the Cats on that worker. Use the drain flow above when the operational intent
-is to empty or decommission a node; stopping the service is not a drain.
+Do not stop or restart a worker that still has Cats. Issue #186 keeps the
+control-group default until ledger persistence and every in-flight lifecycle
+crash window are safely re-adoptable; issue #86 remains the no-downtime restart
+work item. A controlled release must first reach `cats=0 orphans=0`.
 
 ### When the drain cannot converge
 
