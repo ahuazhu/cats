@@ -18,7 +18,8 @@ case ${1:-} in
     [[ $mode =~ ^(bootstrap|start|set-capacity|validate|snapshot|assert-idle|stop)$ ]] || die "invalid SSM mode"
     [[ $manifest_sha =~ ^[0-9a-f]{64}$ ]] || die "invalid manifest digest"
     [[ $delivery_deadline =~ ^[1-9][0-9]{9}$ && $not_after =~ ^[1-9][0-9]{9}$ ]] \
-      && (( not_after > delivery_deadline )) || die "invalid intent time bounds"
+      && (( not_after - delivery_deadline >= 90 && not_after - delivery_deadline <= 4230 )) \
+      || die "invalid intent time bounds"
     record=$(jq -cn --arg instance "$instance" --arg nonce "$nonce" --arg mode "$mode" --arg manifest "$manifest_sha" \
       --argjson delivery "$delivery_deadline" --argjson not_after "$not_after" \
       '{schema:1,issue:124,kind:"intent",instance_id:$instance,nonce:$nonce,mode:$mode,manifest_sha256:$manifest,delivery_deadline_epoch:$delivery,not_after_epoch:$not_after}')
@@ -68,7 +69,9 @@ case ${1:-} in
         (.nonce | test("^[0-9a-f]{32}$")) and
         (.mode | test("^(bootstrap|start|set-capacity|validate|snapshot|assert-idle|stop)$")) and
         ((.kind == "intent" and (.delivery_deadline_epoch | type == "number") and
-          (.not_after_epoch | type == "number") and .not_after_epoch > .delivery_deadline_epoch) or
+          (.not_after_epoch | type == "number") and
+          (.not_after_epoch - .delivery_deadline_epoch) >= 90 and
+          (.not_after_epoch - .delivery_deadline_epoch) <= 4230) or
          (.kind == "command" and (.command_id | test("^[0-9a-f-]+$"))))
       )' <<<"$decoded" || die "invalid command evidence record"
     done

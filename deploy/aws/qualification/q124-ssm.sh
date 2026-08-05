@@ -8,6 +8,7 @@ die() { printf 'q124-ssm: %s\n' "$*" >&2; exit 1; }
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 BOOTSTRAP_BIN=${Q124_BOOTSTRAP_BIN:-$ROOT/deploy/aws/qualification/q124-bootstrap-prereqs.sh}
 GUARD_BIN=${Q124_COMMAND_GUARD_BIN:-$ROOT/deploy/aws/qualification/q124-command-guard.sh}
+PROVENANCE_BIN=${Q124_PROVENANCE_BIN:-$ROOT/deploy/aws/qualification/q124-provenance.sh}
 EVIDENCE_BIN=${Q124_SSM_EVIDENCE_BIN:-$ROOT/deploy/aws/qualification/q124-ssm-command-evidence.sh}
 [[ -n ${Q124_REGION:-} ]] || die "missing Q124_REGION"
 [[ $Q124_REGION =~ ^[a-z]{2}(-gov)?-[a-z]+-[0-9]$ ]] || die "invalid Q124_REGION"
@@ -26,11 +27,26 @@ Q124_SSM_POLL_INTERVAL_SECONDS=${Q124_SSM_POLL_INTERVAL_SECONDS:-2}
 [[ $Q124_SSM_POLL_TIMEOUT_SECONDS =~ ^[1-9][0-9]{0,3}$ ]] && (( Q124_SSM_POLL_TIMEOUT_SECONDS <= 4500 )) || die "invalid SSM poll timeout"
 [[ $Q124_SSM_CANCEL_TIMEOUT_SECONDS =~ ^[1-9][0-9]{0,2}$ ]] && (( Q124_SSM_CANCEL_TIMEOUT_SECONDS <= 300 )) || die "invalid SSM cancel timeout"
 [[ $Q124_SSM_POLL_INTERVAL_SECONDS =~ ^[0-9]$ ]] || die "invalid SSM poll interval"
-remote_source_root=${Q124_REMOTE_SOURCE_ROOT:-/opt/cats/q124/source}
+remote_source_root=${Q124_REMOTE_SOURCE_ROOT:-/opt/cats/q124/bundles/$Q124_EXPECTED_MANIFEST_SHA256}
 [[ $remote_source_root =~ ^/[A-Za-z0-9_./-]+$ && $remote_source_root != *..* ]] || die "invalid remote source root"
-command_guard_dir=${Q124_COMMAND_GUARD_DIR:-/var/lib/cats/q124-command}
+command_guard_dir=${Q124_COMMAND_GUARD_DIR:-/run/lock/cats-q124-command}
 [[ $command_guard_dir =~ ^/[A-Za-z0-9_./-]+$ && $command_guard_dir != *..* ]] || die "invalid command guard directory"
 printf -v remote_source_root_q %q "$remote_source_root"
+for name in Q124_MANIFEST_REMOTE_SHA256 Q124_MANIFEST_DEVICE_PROOF_SHA256 Q124_MANIFEST_INSTALL_WORKER_SHA256 \
+  Q124_MANIFEST_REQUIRE_IDLE_SHA256 Q124_MANIFEST_BOOTSTRAP_SHA256 Q124_MANIFEST_COMMAND_GUARD_SHA256 \
+  Q124_MANIFEST_PROVENANCE_SHA256 Q124_MANIFEST_SSM_EVIDENCE_SHA256; do
+  [[ ${!name:-} =~ ^[0-9a-f]{64}$ ]] || die "missing/invalid $name"
+done
+[[ -f $EVIDENCE_BIN && ! -L $EVIDENCE_BIN ]] || die "SSM evidence contract must be a regular non-symlink"
+[[ $(sha256sum "$EVIDENCE_BIN" | awk '{print $1}') == "$Q124_MANIFEST_SSM_EVIDENCE_SHA256" ]] \
+  || die "SSM evidence contract differs from manifest"
+[[ -f $PROVENANCE_BIN && ! -L $PROVENANCE_BIN ]] || die "provenance contract must be a regular non-symlink"
+[[ $(sha256sum "$PROVENANCE_BIN" | awk '{print $1}') == "$Q124_MANIFEST_PROVENANCE_SHA256" ]] \
+  || die "provenance contract differs from manifest"
+provenance_sha=$Q124_MANIFEST_PROVENANCE_SHA256
+provenance_encoded=$(base64 <"$PROVENANCE_BIN" | tr -d '\n')
+provenance_owner_uid=${Q124_PROVENANCE_OWNER_UID:-0}
+[[ $provenance_owner_uid =~ ^[0-9]+$ ]] || die "invalid provenance owner uid"
 awsq() { aws --region "$Q124_REGION" "$@"; }
 
 quote_env() {
@@ -94,9 +110,13 @@ cancel_exact_command() {
 
 probe_guard_absent() {
   local nonce=$1 delivery_deadline=$2 not_after=$3 now wait_seconds parameters probe_command probe_id terminal status output
+  (( not_after >= delivery_deadline )) || return 1
   now=$(date -u +%s)
-  while (( now < delivery_deadline )); do
-    wait_seconds=$((delivery_deadline - now))
+  # Once this upper bound passes, an accepted-but-delayed original command can
+  # no longer enter its guard. A delivery-deadline-only probe has a race where
+  # the original starts after an apparently empty lock check.
+  while (( now < not_after )); do
+    wait_seconds=$((not_after - now))
     (( wait_seconds > 5 )) && wait_seconds=5
     sleep "$wait_seconds"
     now=$(date -u +%s)
@@ -106,6 +126,8 @@ probe_guard_absent() {
   probe_command=$(cat <<EOF
 set -euo pipefail
 guard_dir=$guard_dir_q
+now=$(date -u +%s)
+(( now >= $not_after )) || exit 74
 install -d -m 0700 "\$guard_dir"
 exec 9>"\$guard_dir/active.lock"
 if flock -n 9; then
@@ -130,7 +152,7 @@ EOF
 }
 
 recover_durable_commands() {
-  local records intents commands record nonce command_id command_count status result probe_rc error_file delivery_deadline not_after
+  local records intents commands record nonce intent_mode command_id command_mode command_count status result probe_rc error_file delivery_deadline not_after
   records=$(mktemp)
   intents=$(mktemp)
   commands=$(mktemp)
@@ -153,7 +175,10 @@ recover_durable_commands() {
       continue
     fi
     [[ $command_count == 1 ]] || return 1
+    intent_mode=$(jq -er '.mode' <<<"$record") || return 1
     command_id=$(jq -sr --arg nonce "$nonce" '.[] | select(.nonce == $nonce) | .command_id' "$commands") || return 1
+    command_mode=$(jq -sr --arg nonce "$nonce" '.[] | select(.nonce == $nonce) | .mode' "$commands") || return 1
+    [[ $command_mode == "$intent_mode" ]] || return 1
     set +e
     result=$(command_result "$command_id" "$instance" "$error_file")
     probe_rc=$?
@@ -182,6 +207,8 @@ fi
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
 [[ -f $GUARD_BIN && ! -L $GUARD_BIN ]] || die "command guard must be a regular non-symlink"
+[[ $(sha256sum "$GUARD_BIN" | awk '{print $1}') == "$Q124_MANIFEST_COMMAND_GUARD_SHA256" ]] \
+  || die "command guard differs from manifest"
 intent_nonce=${Q124_SSM_INTENT_NONCE:-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')}
 [[ $intent_nonce =~ ^[0-9a-f]{32}$ ]] || die "invalid SSM intent nonce"
 issued_epoch=$(date -u +%s)
@@ -195,21 +222,34 @@ if [[ $mode == bootstrap ]]; then
   [[ $Q124_ARCHIVE_KEY =~ ^worker/qualification-124/[A-Za-z0-9._/-]+\.tar\.gz$ && $Q124_ARCHIVE_KEY != *..* ]] || die "invalid archive key"
   [[ $Q124_ARCHIVE_SHA256 =~ ^[0-9a-f]{64}$ ]] || die "invalid archive digest"
   [[ -f $BOOTSTRAP_BIN && ! -L $BOOTSTRAP_BIN ]] || die "bootstrap contract must be a regular non-symlink"
+  [[ $(sha256sum "$BOOTSTRAP_BIN" | awk '{print $1}') == "$Q124_MANIFEST_BOOTSTRAP_SHA256" ]] \
+    || die "bootstrap contract differs from manifest"
   bootstrap_sha=$(sha256sum "$BOOTSTRAP_BIN" | awk '{print $1}')
   bootstrap_encoded=$(base64 <"$BOOTSTRAP_BIN" | tr -d '\n')
   command=$(cat <<EOF
 set -euo pipefail
 bootstrap_contract=/var/tmp/q124-bootstrap-${bootstrap_sha}.sh
+provenance_contract=/var/tmp/q124-provenance-${provenance_sha}.sh
+cleanup_bootstrap_contracts() { rm -f "\$bootstrap_contract" "\$provenance_contract"; }
+trap cleanup_bootstrap_contracts EXIT HUP INT TERM
 printf '%s' '${bootstrap_encoded}' | base64 --decode >"\$bootstrap_contract"
+printf '%s' '${provenance_encoded}' | base64 --decode >"\$provenance_contract"
 printf '%s  %s\n' '${bootstrap_sha}' "\$bootstrap_contract" | sha256sum -c - >/dev/null
-chmod 0700 "\$bootstrap_contract"
+printf '%s  %s\n' '${provenance_sha}' "\$provenance_contract" | sha256sum -c - >/dev/null
+chmod 0700 "\$bootstrap_contract" "\$provenance_contract"
 $(quote_env)
 bash "\$bootstrap_contract"
 rm -f "\$bootstrap_contract"
+[[ ! -e $remote_source_root_q && ! -L $remote_source_root_q ]]
 install -d -m 0700 $remote_source_root_q
 aws --region '${Q124_REGION}' s3 cp 's3://${Q124_ARTIFACT_BUCKET}/${Q124_ARCHIVE_KEY}' /tmp/q124-source.tar.gz --only-show-errors
 printf '%s  %s\n' '${Q124_ARCHIVE_SHA256}' /tmp/q124-source.tar.gz | sha256sum -c -
 tar -xzf /tmp/q124-source.tar.gz -C $remote_source_root_q
+Q124_PROVENANCE_OWNER_UID='${provenance_owner_uid}' bash "\$provenance_contract" $remote_source_root_q \
+  'deploy/aws/qualification/q124-remote.sh=${Q124_MANIFEST_REMOTE_SHA256}' \
+  'deploy/aws/qualification/q124-device-proof.sh=${Q124_MANIFEST_DEVICE_PROOF_SHA256}' \
+  'deploy/aws/metal/install-worker.sh=${Q124_MANIFEST_INSTALL_WORKER_SHA256}' \
+  'deploy/aws/metal/require-idle-worker.sh=${Q124_MANIFEST_REQUIRE_IDLE_SHA256}'
 export AWS_REGION='${Q124_REGION}' AWS_DEFAULT_REGION='${Q124_REGION}'
 export Q124_SOURCE_ROOT=$remote_source_root_q
 bash $remote_source_root_q/deploy/aws/qualification/q124-remote.sh prepare
@@ -218,9 +258,19 @@ EOF
 else
   command=$(cat <<EOF
 set -euo pipefail
+provenance_contract=/var/tmp/q124-provenance-${provenance_sha}.sh
+trap 'rm -f "\$provenance_contract"' EXIT HUP INT TERM
+printf '%s' '${provenance_encoded}' | base64 --decode >"\$provenance_contract"
+printf '%s  %s\n' '${provenance_sha}' "\$provenance_contract" | sha256sum -c - >/dev/null
+chmod 0700 "\$provenance_contract"
 $(quote_env)
 export AWS_REGION='${Q124_REGION}' AWS_DEFAULT_REGION='${Q124_REGION}'
 export Q124_SOURCE_ROOT=$remote_source_root_q
+Q124_PROVENANCE_OWNER_UID='${provenance_owner_uid}' bash "\$provenance_contract" $remote_source_root_q \
+  'deploy/aws/qualification/q124-remote.sh=${Q124_MANIFEST_REMOTE_SHA256}' \
+  'deploy/aws/qualification/q124-device-proof.sh=${Q124_MANIFEST_DEVICE_PROOF_SHA256}' \
+  'deploy/aws/metal/install-worker.sh=${Q124_MANIFEST_INSTALL_WORKER_SHA256}' \
+  'deploy/aws/metal/require-idle-worker.sh=${Q124_MANIFEST_REQUIRE_IDLE_SHA256}'
 bash $remote_source_root_q/deploy/aws/qualification/q124-remote.sh '${mode}'
 EOF
 )

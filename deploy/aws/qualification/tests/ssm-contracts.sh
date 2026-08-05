@@ -4,6 +4,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../../.." && pwd)
 SSM=$HERE/../q124-ssm.sh
 TMP=$(mktemp -d)
+trap 'printf "q124 SSM contract failed at line %s\n" "$LINENO" >&2' ERR
 cleanup() {
   rc=$?
   if (( rc != 0 )); then
@@ -22,10 +23,26 @@ for kind in apt-get curl unzip systemctl true probe uname flock timeout; do
   printf '#!/usr/bin/env bash\nexec %q %q "$@"\n' "$HERE/fake-bootstrap-command.sh" "$kind" >"$TMP/remote/$kind"
   chmod 0755 "$TMP/remote/$kind"
 done
-tar -czf "$TMP/source.tar.gz" -C "$ROOT" deploy/aws/qualification/q124-remote.sh
+tar -czf "$TMP/source.tar.gz" -C "$ROOT" \
+  deploy/aws/qualification/q124-remote.sh \
+  deploy/aws/qualification/q124-device-proof.sh \
+  deploy/aws/metal/install-worker.sh \
+  deploy/aws/metal/require-idle-worker.sh
 export Q124_REAL_JQ
 Q124_REAL_JQ=$(command -v jq)
 export Q124_EXPECTED_MANIFEST_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+export Q124_MANIFEST_REMOTE_SHA256 Q124_MANIFEST_DEVICE_PROOF_SHA256 Q124_MANIFEST_INSTALL_WORKER_SHA256 Q124_MANIFEST_REQUIRE_IDLE_SHA256
+export Q124_MANIFEST_BOOTSTRAP_SHA256 Q124_MANIFEST_COMMAND_GUARD_SHA256 Q124_MANIFEST_PROVENANCE_SHA256 Q124_MANIFEST_SSM_EVIDENCE_SHA256
+Q124_MANIFEST_REMOTE_SHA256=$(sha256sum "$ROOT/deploy/aws/qualification/q124-remote.sh" | awk '{print $1}')
+Q124_MANIFEST_DEVICE_PROOF_SHA256=$(sha256sum "$ROOT/deploy/aws/qualification/q124-device-proof.sh" | awk '{print $1}')
+Q124_MANIFEST_INSTALL_WORKER_SHA256=$(sha256sum "$ROOT/deploy/aws/metal/install-worker.sh" | awk '{print $1}')
+Q124_MANIFEST_REQUIRE_IDLE_SHA256=$(sha256sum "$ROOT/deploy/aws/metal/require-idle-worker.sh" | awk '{print $1}')
+Q124_MANIFEST_BOOTSTRAP_SHA256=$(sha256sum "$ROOT/deploy/aws/qualification/q124-bootstrap-prereqs.sh" | awk '{print $1}')
+Q124_MANIFEST_COMMAND_GUARD_SHA256=$(sha256sum "$ROOT/deploy/aws/qualification/q124-command-guard.sh" | awk '{print $1}')
+Q124_MANIFEST_PROVENANCE_SHA256=$(sha256sum "$ROOT/deploy/aws/qualification/q124-provenance.sh" | awk '{print $1}')
+cp "$HERE/fake-ssm-evidence.sh" "$TMP/fake-ssm-evidence.sh"
+chmod 0755 "$TMP/fake-ssm-evidence.sh"
+Q124_MANIFEST_SSM_EVIDENCE_SHA256=$(sha256sum "$TMP/fake-ssm-evidence.sh" | awk '{print $1}')
 export Q124_AWS_CLI_VERSION=2.99.0
 export Q124_AWS_CLI_X86_64_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 export Q124_JQ_VERSION=jq-1.7
@@ -46,8 +63,10 @@ export Q124_BOOTSTRAP_COMMAND_PROBE_BIN=$TMP/remote/probe
 export Q124_SSM_REMOTE_PATH="$TMP/remote:/usr/bin:/bin" Q124_BOOTSTRAP_AWS_LOG=$TMP/aws.log
 export Q124_CAPTURED_COMMAND=$TMP/command.sh Q124_SSM_STDOUT=$TMP/stdout Q124_SSM_STDERR=$TMP/stderr Q124_SSM_RC=$TMP/rc
 export Q124_SSM_FAKE_STATE=$TMP/ssm-state.json Q124_SSM_EVIDENCE_JOURNAL=$TMP/ssm-evidence.jsonl
-export Q124_SSM_EVIDENCE_BIN=$HERE/fake-ssm-evidence.sh Q124_BOOTSTRAP_CALL_LOG=$TMP/bootstrap.log
+export Q124_SSM_EVIDENCE_BIN=$TMP/fake-ssm-evidence.sh Q124_BOOTSTRAP_CALL_LOG=$TMP/bootstrap.log
 export Q124_COMMAND_GUARD_DIR=$TMP/guard Q124_SSM_INTENT_NONCE=0124abcd0124abcd0124abcd0124abcd
+export Q124_PROVENANCE_OWNER_UID
+Q124_PROVENANCE_OWNER_UID=$(id -u)
 export Q124_SSM_EXECUTION_TIMEOUT_SECONDS=60 Q124_SSM_DELIVERY_TIMEOUT_SECONDS=30 Q124_SSM_POLL_TIMEOUT_SECONDS=60
 export Q124_SSM_CANCEL_TIMEOUT_SECONDS=5 Q124_SSM_POLL_INTERVAL_SECONDS=0
 : >"$Q124_SSM_EVIDENCE_JOURNAL"
@@ -68,6 +87,38 @@ grep -q "awscli-exe-linux-x86_64-${Q124_AWS_CLI_VERSION}.zip" "$Q124_BOOTSTRAP_C
 grep -q '^timeout --foreground --signal=TERM --kill-after=15 30 bash ' "$Q124_BOOTSTRAP_CALL_LOG"
 [[ ! -e $Q124_COMMAND_GUARD_DIR/active ]]
 jq -se 'length == 2 and (map(.kind) | sort) == ["command","intent"] and all(.[]; .instance_id == "i-0abc124" and .mode == "bootstrap" and .manifest_sha256 == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" and .nonce == "0124abcd0124abcd0124abcd0124abcd")' "$Q124_SSM_EVIDENCE_JOURNAL" >/dev/null
+
+# The production guard must live outside the cache mount at /var/lib/cats.
+saved_guard=$Q124_COMMAND_GUARD_DIR
+unset Q124_COMMAND_GUARD_DIR
+export Q124_SSM_SKIP_EXECUTE=1 Q124_SSM_STATUS_SEQUENCE=Success
+PATH="$TMP/outer:$PATH" "$SSM" "$Q124_INSTANCE_ID" validate >/dev/null
+grep -q 'Q124_COMMAND_GUARD_DIR=/run/lock/cats-q124-command' "$Q124_CAPTURED_COMMAND"
+! grep -q 'Q124_COMMAND_GUARD_DIR=/var/lib/cats' "$Q124_CAPTURED_COMMAND"
+Q124_COMMAND_GUARD_DIR=$saved_guard
+export Q124_COMMAND_GUARD_DIR
+unset Q124_SSM_SKIP_EXECUTE
+
+# Host actions are bound to the manifest hashes, not merely to a pathname.
+cp "$TMP/source/deploy/aws/qualification/q124-remote.sh" "$TMP/original-remote.sh"
+printf '#!/usr/bin/env bash\ntouch %q\n' "$TMP/tampered-executed" >"$TMP/source/deploy/aws/qualification/q124-remote.sh"
+chmod 0755 "$TMP/source/deploy/aws/qualification/q124-remote.sh"
+if PATH="$TMP/outer:$PATH" "$SSM" "$Q124_INSTANCE_ID" validate >/dev/null 2>&1; then
+  printf 'tampered remote source unexpectedly executed\n' >&2
+  exit 1
+fi
+[[ ! -e $TMP/tampered-executed ]]
+mv "$TMP/original-remote.sh" "$TMP/source/deploy/aws/qualification/q124-remote.sh"
+
+# The durable command journal implementation is also immutable manifest input.
+cp "$Q124_SSM_EVIDENCE_BIN" "$TMP/original-ssm-evidence.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$Q124_SSM_EVIDENCE_BIN"
+chmod 0755 "$Q124_SSM_EVIDENCE_BIN"
+if PATH="$TMP/outer:$PATH" "$SSM" "$Q124_INSTANCE_ID" validate >/dev/null 2>&1; then
+  printf 'tampered SSM evidence helper unexpectedly executed\n' >&2
+  exit 1
+fi
+mv "$TMP/original-ssm-evidence.sh" "$Q124_SSM_EVIDENCE_BIN"
 before=$(wc -l <"$Q124_BOOTSTRAP_AWS_LOG")
 if Q124_REGION=bad-region PATH="$TMP/outer:$PATH" "$SSM" "$Q124_INSTANCE_ID" validate >/dev/null 2>&1; then
   printf 'invalid region unexpectedly reached SSM\n' >&2
@@ -115,14 +166,17 @@ jq -se 'length == 1 and .[0].kind == "intent" and .[0].nonce == "0124abcd0124abc
 unset Q124_SSM_COMMAND_EVIDENCE_FAIL Q124_ALLOW_UNJOURNALED_COMMAND
 
 # The same intent-only journal models runner loss in the Send response/comment
-# gap. After the durable delivery deadline, an exact read-only lock probe is
-# required before fresh cleanup may continue.
+# gap. Only after the durable not_after bound has passed may an exact read-only
+# lock probe permit fresh cleanup to continue.
 delivery=$(( $(date -u +%s) - 1 ))
-not_after=$(( delivery + 4230 ))
+not_after=$(( $(date -u +%s) + 2 ))
 printf '%s\n' "{\"kind\":\"intent\",\"instance_id\":\"i-0abc124\",\"nonce\":\"0124abcd0124abcd0124abcd0124abcd\",\"mode\":\"validate\",\"manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"delivery_deadline_epoch\":$delivery,\"not_after_epoch\":$not_after}" >"$Q124_SSM_EVIDENCE_JOURNAL"
 unset Q124_SSM_SKIP_EXECUTE
 export Q124_SSM_STATUS_SEQUENCE=Success Q124_SSM_EXECUTION_TIMEOUT_SECONDS=60 Q124_SSM_POLL_TIMEOUT_SECONDS=60
+started=$(date -u +%s)
 PATH="$TMP/outer:$PATH" "$SSM" "$Q124_INSTANCE_ID" recover-active >/dev/null
+finished=$(date -u +%s)
+(( finished >= not_after && finished - started >= 1 )) || { printf 'intent-only recovery did not wait through not_after\n' >&2; exit 1; }
 grep -q 'guard=absent nonce=0124abcd0124abcd0124abcd0124abcd manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' "$Q124_SSM_STDOUT"
 
 # Busy/mismatched guard proof is ambiguous and must preserve the host.

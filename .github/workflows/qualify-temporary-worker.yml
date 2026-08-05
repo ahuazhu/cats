@@ -130,12 +130,12 @@ jobs:
           aws-region: ${{ env.Q124_REGION }}
           role-duration-seconds: 7200
 
-      - name: Reserve a fresh-session cleanup window
+      - name: Reserve an absolute operation deadline
         shell: bash
         run: |
           set -euo pipefail
           now=$(date -u +%s)
-          printf 'Q124_OPERATION_DEADLINE_EPOCH=%s\n' "$((now + 4800))" >>"$GITHUB_ENV"
+          printf 'Q124_OPERATION_DEADLINE_EPOCH=%s\n' "$((now + 6900))" >>"$GITHUB_ENV"
 
       - name: Package exact reviewed source
         if: inputs.mode == 'provision'
@@ -165,33 +165,15 @@ jobs:
         run: |
           set -euo pipefail
           chmod 0755 deploy/aws/qualification/*.sh
-          output=$(deploy/aws/qualification/q124-temp-worker.sh)
+          if [[ "$Q124_MODE" == provision ]]; then
+            output=$(deploy/aws/qualification/q124-temp-worker.sh)
+          else
+            output=$(deploy/aws/qualification/q124-bundle-exec.sh)
+          fi
           printf '%s\n' "$output"
           manifest_sha=$(sed -n 's/^manifest-sha256=//p' <<<"$output")
           [[ -z "$manifest_sha" || "$manifest_sha" =~ ^[0-9a-f]{64}$ ]]
           echo "manifest_sha=$manifest_sha" >>"$GITHUB_OUTPUT"
-
-      - name: Refresh qualification identity for bounded cleanup
-        if: always() && inputs.mode == 'provision'
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.Q124_AWS_ROLE_ARN }}
-          aws-region: ${{ env.Q124_REGION }}
-          role-duration-seconds: 1800
-
-      - name: Recover a failed provision with the fresh session
-        if: failure() && inputs.mode == 'provision'
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -f "$Q124_MANIFEST_OUT" && ! -L "$Q124_MANIFEST_OUT" && -f "$Q124_EVIDENCE_OUT" && ! -L "$Q124_EVIDENCE_OUT" ]]; then
-            Q124_EXPECTED_MANIFEST_SHA256=$(jq -S -c . "$Q124_MANIFEST_OUT" | sha256sum | awk '{print $1}')
-            export Q124_EXPECTED_MANIFEST_SHA256
-            export Q124_MANIFEST=$Q124_MANIFEST_OUT
-            export Q124_MODE=recover-provision
-            export Q124_CONFIRMATION="RECOVER_Q124_${Q124_EXPECTED_MANIFEST_SHA256:0:12}"
-            deploy/aws/qualification/q124-temp-worker.sh
-          fi
 
       - name: Record bounded provisioning failure evidence
         if: failure() && inputs.mode == 'provision'
@@ -225,6 +207,103 @@ jobs:
             "$RUNNER_TEMP/q124-failure-evidence.json" \
             "$RUNNER_TEMP/kubeconfig"
           do
+            [[ "$path" == "$RUNNER_TEMP"/* ]]
+            if [[ -f "$path" && ! -L "$path" ]]; then
+              chmod 600 "$path"
+              truncate -s 0 "$path"
+              unlink "$path"
+            fi
+          done
+
+  # This job has its own runner, OIDC session and two-hour timeout. It still
+  # runs after the qualification runner is cancelled, killed or times out.
+  cleanup_failed_provision:
+    needs: qualify
+    if: always() && inputs.mode == 'provision' && needs.qualify.result != 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      Q124_ACCOUNT_ID: ${{ vars.Q124_ACCOUNT_ID }}
+      Q124_REGION: ${{ vars.AWS_REGION }}
+      Q124_CLUSTER: ${{ vars.EKS_CLUSTER_NAME }}
+      Q124_WORKSPACE_ID: ${{ vars.Q124_WORKSPACE_ID }}
+      Q124_SOURCE_INSTANCE_ID: ${{ vars.Q124_SOURCE_INSTANCE_ID }}
+      Q124_SOURCE_NODE_ID: ${{ vars.Q124_SOURCE_NODE_ID }}
+      Q124_AMI_ID: ${{ vars.Q124_WORKER_AMI_ID }}
+      Q124_AMI_OWNER_ID: ${{ vars.Q124_WORKER_AMI_OWNER_ID }}
+      Q124_AMI_SNAPSHOT_IDS_JSON: ${{ vars.Q124_WORKER_AMI_SNAPSHOT_IDS_JSON }}
+      Q124_INSTANCE_TYPE: ${{ vars.Q124_WORKER_INSTANCE_TYPE }}
+      Q124_SUBNET_ID: ${{ vars.Q124_WORKER_SUBNET_ID }}
+      Q124_SECURITY_GROUP_ID: ${{ vars.Q124_WORKER_SECURITY_GROUP_ID }}
+      Q124_INSTANCE_PROFILE_NAME: ${{ vars.Q124_WORKER_INSTANCE_PROFILE }}
+      Q124_CACHE_DEVICE: ${{ vars.Q124_WORKER_CACHE_DEVICE }}
+      Q124_CONTROL_URL: ${{ vars.Q124_CONTROL_URL }}
+      Q124_CONTROL_AUTHORITY: ${{ vars.Q124_CONTROL_AUTHORITY }}
+      Q124_AWS_ROLE_ARN: ${{ vars.Q124_AWS_ROLE_ARN }}
+      Q124_SSM_MAX_EXECUTION_TIMEOUT_SECONDS: "4200"
+      Q124_CLEANUP_RESERVE_SECONDS: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Initialize independent cleanup paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          printf 'Q124_MANIFEST=%s/q124-manifest.json\n' "$RUNNER_TEMP" >>"$GITHUB_ENV"
+          printf 'Q124_ADMIN_TOKEN_FILE=%s/q124-admin-token\n' "$RUNNER_TEMP" >>"$GITHUB_ENV"
+          printf 'Q124_EVIDENCE_OUT=%s/q124-independent-cleanup.json\n' "$RUNNER_TEMP" >>"$GITHUB_ENV"
+
+      - name: Read administrator token with release identity
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.Q124_REGION }}
+
+      - name: Fetch independently scoped administrator token
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --name "$Q124_CLUSTER" --region "$Q124_REGION" --kubeconfig "$RUNNER_TEMP/kubeconfig"
+          kubectl --kubeconfig "$RUNNER_TEMP/kubeconfig" -n cats get secret cats-runtime \
+            -o jsonpath='{.data.CATS_ADMIN_TOKEN}' | base64 --decode >"$Q124_ADMIN_TOKEN_FILE"
+          [[ -s "$Q124_ADMIN_TOKEN_FILE" ]]
+          chmod 600 "$Q124_ADMIN_TOKEN_FILE"
+          echo "::add-mask::$(<"$Q124_ADMIN_TOKEN_FILE")"
+
+      - name: Assume fresh cleanup identity
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.Q124_AWS_ROLE_ARN }}
+          aws-region: ${{ env.Q124_REGION }}
+          role-duration-seconds: 7200
+
+      - name: Bound the independent cleanup session
+        shell: bash
+        run: |
+          set -euo pipefail
+          now=$(date -u +%s)
+          printf 'Q124_OPERATION_DEADLINE_EPOCH=%s\n' "$((now + 6900))" >>"$GITHUB_ENV"
+
+      - name: Recover failed provision independently
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod 0755 deploy/aws/qualification/*.sh
+          export Q124_MODE=recover-provision-independent
+          export Q124_CONFIRMATION="RECOVER_Q124_RUN_${GITHUB_RUN_ID}"
+          deploy/aws/qualification/q124-temp-worker.sh
+
+      - name: Remove independent cleanup credentials
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          for path in "$RUNNER_TEMP/q124-admin-token" "$RUNNER_TEMP/q124-manifest.json" "$RUNNER_TEMP/q124-independent-cleanup.json" "$RUNNER_TEMP/kubeconfig"; do
             [[ "$path" == "$RUNNER_TEMP"/* ]]
             if [[ -f "$path" && ! -L "$path" ]]; then
               chmod 600 "$path"

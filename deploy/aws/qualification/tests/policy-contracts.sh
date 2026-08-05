@@ -12,7 +12,7 @@ common_vars=(
   -var worker_role_arn=arn:aws:iam::111122223333:role/cats-worker
   -var artifact_bucket_arn=arn:aws:s3:::cats-artifacts
 )
-valid_snapshots='["arn:aws:ec2:us-east-1::snapshot/snap-0124aaa","arn:aws:ec2:us-east-1::snapshot/snap-0124bbb"]'
+valid_snapshots='["arn:aws:ec2:us-east-1::snapshot/snap-0124aaa"]'
 encoded=$(terraform -chdir="$MODULE" console "${common_vars[@]}" \
   -var "snapshot_arns=$valid_snapshots" <<<'local.policy_json')
 policy=$(jq -er . <<<"$encoded")
@@ -27,6 +27,7 @@ expect_invalid_snapshots() {
 }
 
 expect_invalid_snapshots '[]'
+expect_invalid_snapshots '["arn:aws:ec2:us-east-1::snapshot/snap-0124aaa","arn:aws:ec2:us-east-1::snapshot/snap-0124bbb"]'
 expect_invalid_snapshots '["arn:aws:ec2:us-west-2::snapshot/snap-0124aaa"]'
 expect_invalid_snapshots '["arn:aws:ec2:us-east-1:111122223333:snapshot/snap-0124aaa"]'
 expect_invalid_snapshots '["arn:aws:ec2:us-east-1::snapshot/*"]'
@@ -40,8 +41,7 @@ jq -e '
       "arn:aws:ec2:us-east-1::image/ami-0124",
       "arn:aws:ec2:us-east-1:111122223333:security-group/sg-0124",
       "arn:aws:ec2:us-east-1:111122223333:subnet/subnet-0124",
-      "arn:aws:ec2:us-east-1::snapshot/snap-0124aaa",
-      "arn:aws:ec2:us-east-1::snapshot/snap-0124bbb"
+      "arn:aws:ec2:us-east-1::snapshot/snap-0124aaa"
     ] | sort)) and
   ([.. | strings | select(test("snapshot/\\*"))] | length) == 0 and
   ([.Statement[] | select(.Sid == "ReadRegionalEc2AndSsmInventory")][0] as $s |
@@ -82,8 +82,7 @@ jq -e '
     $s.Condition.NumericEquals["ec2:VolumeSize"] == "200" and
     $s.Condition.StringEquals["ec2:VolumeType"] == "gp3" and
     ($s.Condition.ArnEquals["ec2:ParentSnapshot"] | sort) == ([
-      "arn:aws:ec2:us-east-1::snapshot/snap-0124aaa",
-      "arn:aws:ec2:us-east-1::snapshot/snap-0124bbb"
+      "arn:aws:ec2:us-east-1::snapshot/snap-0124aaa"
     ] | sort) and
     $s.Condition.StringEquals["aws:RequestTag/CatsIssue"] == "124") and
   ([.Statement[] | select(.Sid == "PassOnlyWorkerRoleToEc2")][0] as $s |

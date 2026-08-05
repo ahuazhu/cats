@@ -63,9 +63,19 @@ def instance(s, source=False):
         "InstanceInitiatedShutdownBehavior": "stop",
         "PrivateIpAddress": "10.0.1.124",
         "Placement": {"AvailabilityZone": "us-east-1a"},
-        "BlockDeviceMappings": [{"DeviceName": s.get("root_device", "/dev/sda1"), "Ebs": {
-            "VolumeId": s.get("root_volume_id", "vol-q124"), "DeleteOnTermination": s.get("root_delete_on_termination", True)
-        }}],
+        "BlockDeviceMappings": [
+            {
+                "DeviceName": mapping[0],
+                "Ebs": {
+                    "VolumeId": mapping[1],
+                    "DeleteOnTermination": mapping[2],
+                },
+            }
+            for mapping in s.get(
+                "instance_mappings",
+                [[s.get("root_device", "/dev/sda1"), s.get("root_volume_id", "vol-q124"), s.get("root_delete_on_termination", True)]],
+            )
+        ],
         "Tags": [{"Key": k, "Value": v} for k, v in tags.items()],
     }
     if source:
@@ -128,8 +138,18 @@ def fake_aws(args):
             "VirtualizationType": s["ami_virtualization_type"],
             "EnaSupport": s["ami_ena_support"],
             "BlockDeviceMappings": [
-                {"DeviceName": device, "Ebs": {"SnapshotId": snapshot}}
-                for device, snapshot in s["ami_mappings"]
+                {
+                    "DeviceName": mapping[0],
+                    "Ebs": {
+                        "SnapshotId": mapping[1],
+                        "DeleteOnTermination": (
+                            mapping[2]
+                            if len(mapping) > 2
+                            else s.get("ami_delete_on_termination", True)
+                        ),
+                    },
+                }
+                for mapping in s["ami_mappings"]
             ],
         }
         images = [] if s.get("ami_zero") else [image]
@@ -158,6 +178,7 @@ def fake_aws(args):
         present = s["instance_state"] not in ("absent", "terminated")
         volume = {
             "VolumeId": s.get("root_volume_id", "vol-q124"),
+            "SnapshotId": s.get("root_snapshot_id", "snap-0124aaa"),
             "Encrypted": s.get("root_encrypted", True),
             "Size": s.get("root_size", 200),
             "VolumeType": s.get("root_type", "gp3"),
@@ -271,6 +292,12 @@ def fake_remote(args):
     ident, action = args[:2]
     record(s, "remote " + " ".join(args))
     s = load()
+    s.setdefault("remote_budgets", []).append({
+        "action": action,
+        "execution": os.environ.get("Q124_SSM_EXECUTION_TIMEOUT_SECONDS"),
+        "poll": os.environ.get("Q124_SSM_POLL_TIMEOUT_SECONDS"),
+    })
+    save(s)
     if ident != s["instance"]:
         return 1
     if action == "bootstrap":
@@ -325,6 +352,9 @@ def fake_remote(args):
         if not s["prepared"] or s.get("fail_assert_idle") or s["ledger_cats"] or s["attachments"] or s["pending_packs"]:
             return 1
         s["worker_running"] = False
+        if s.get("reregister_after_stop"):
+            s["control_present"] = True
+            s["control_state"] = "cordoned"
         save(s)
     elif action == "recover-active":
         if s.get("recover_active_fail"):
@@ -344,13 +374,15 @@ def init():
         "cats": [], "ledger_cats": [], "attachments": [], "pending_packs": 0, "orphans": 0,
         "prepared": False, "worker_running": False, "memory_mib": 0,
         "root_device": "/dev/sda1", "root_volume_id": "vol-q124",
+        "root_snapshot_id": "snap-0124aaa",
         "root_delete_on_termination": True, "root_encrypted": True,
         "root_size": 200, "root_type": "gp3",
         "ami_owner": "111122223333", "ami_public": True, "ami_state": "available",
         "ami_architecture": "x86_64", "ami_root_device_type": "ebs",
         "ami_root_device": "/dev/sda1", "ami_virtualization_type": "hvm",
-        "ami_ena_support": True, "ami_mappings": [["/dev/sda1", "snap-0124aaa"]],
-        "published_manifests": 0, "log": []
+        "ami_ena_support": True, "ami_delete_on_termination": True,
+        "ami_mappings": [["/dev/sda1", "snap-0124aaa"]],
+        "published_manifests": 0, "remote_budgets": [], "log": []
     })
 
 

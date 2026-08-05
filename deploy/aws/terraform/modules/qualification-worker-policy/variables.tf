@@ -7,13 +7,13 @@ variable "snapshot_arns" {
   type        = set(string)
 
   validation {
-    condition = length(var.snapshot_arns) > 0 && alltrue([
+    condition = length(var.snapshot_arns) == 1 && alltrue([
       for arn in var.snapshot_arns : can(regex(
         "^arn:${var.partition}:ec2:${var.region}::snapshot/snap-[0-9a-f]+$",
         arn,
       ))
     ])
-    error_message = "snapshot_arns must be a non-empty set of exact snapshot ARNs in partition/region, with the EC2-defined empty account segment."
+    error_message = "snapshot_arns must contain exactly the fixed AMI root snapshot ARN in partition/region, with the EC2-defined empty account segment."
   }
 }
 variable "subnet_id" { type = string }

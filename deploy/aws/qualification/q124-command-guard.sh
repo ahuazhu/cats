@@ -16,7 +16,9 @@ hard_timeout=${6:?hard timeout required}
 [[ $mode =~ ^(bootstrap|start|set-capacity|validate|snapshot|assert-idle|stop)$ ]] || die "invalid mode"
 [[ $not_after =~ ^[1-9][0-9]{9}$ ]] || die "invalid intent upper bound"
 [[ $hard_timeout =~ ^[1-9][0-9]{1,3}$ ]] && (( hard_timeout <= 4170 )) || die "invalid hard timeout"
-guard_dir=${Q124_COMMAND_GUARD_DIR:-/var/lib/cats/q124-command}
+now=$(date -u +%s)
+(( now < not_after )) || die "intent upper bound has expired"
+guard_dir=${Q124_COMMAND_GUARD_DIR:-/run/lock/cats-q124-command}
 [[ $guard_dir =~ ^/[A-Za-z0-9_./-]+$ && $guard_dir != *..* ]] || die "invalid guard directory"
 command -v flock >/dev/null 2>&1 || die "flock is required"
 command -v timeout >/dev/null 2>&1 || die "timeout is required"

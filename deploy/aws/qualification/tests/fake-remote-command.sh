@@ -23,7 +23,10 @@ case $kind in
     ;;
   findmnt)
     [[ ${Q124_REMOTE_SCENARIO:-idle} != mount-error ]] || exit 5
-    if [[ ${Q124_REMOTE_SCENARIO:-idle} == overmount ]]; then
+    if [[ " $* " != *' --list '* ]]; then
+      printf '{"filesystems":[{"target":"/","source":"/dev/root","children":[{"target":"/var/lib/cats","source":"%s"}]}]}\n' \
+        "${Q124_FAKE_MOUNT_SOURCE:?fake mount source required}"
+    elif [[ ${Q124_REMOTE_SCENARIO:-idle} == overmount ]]; then
       printf '{"filesystems":[{"target":"/var/lib/cats","source":"%s"},{"target":"/var/lib/cats","source":"%s"}]}\n' \
         "$Q124_FAKE_MOUNT_SOURCE" "$Q124_FAKE_MOUNT_SOURCE"
     else

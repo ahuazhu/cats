@@ -176,7 +176,9 @@ assert_cache_mount() {
   local mount_source expected_source actual_source mount_table
   mount_table=$(mktemp)
   trap 'rm -f "$mount_table"' RETURN
-  "$FINDMNT_BIN" --json --output TARGET,SOURCE >"$mount_table" \
+  # --json is a tree by default; --list is required so every mount appears in
+  # the top-level array inspected below, including /var/lib/cats under /.
+  "$FINDMNT_BIN" --json --list --output TARGET,SOURCE >"$mount_table" \
     || die "cache mount table probe failed"
   mount_source=$(jq -er '
     [.filesystems[] | select(.target == "/var/lib/cats")] |

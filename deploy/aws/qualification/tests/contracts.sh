@@ -12,10 +12,14 @@ trap 'rm -rf "$TMP"' EXIT
 "$HERE/remote-contracts.sh"
 "$HERE/control-contracts.sh"
 "$HERE/bootstrap-contracts.sh"
+"$HERE/command-guard-contracts.sh"
+"$HERE/provenance-contracts.sh"
+"$HERE/bundle-contracts.sh"
 "$HERE/ssm-contracts.sh"
 "$HERE/ssm-evidence-contracts.sh"
 "$HERE/manifest-recovery-contracts.sh"
 "$HERE/manifest-publish-contracts.sh"
+"$HERE/launch-evidence-contracts.sh"
 "$HERE/policy-contracts.sh"
 ruby "$HERE/workflow-contracts.rb" "$ROOT/.github/workflows/qualify-temporary-worker.yml"
 
@@ -47,6 +51,7 @@ reset_case() {
   export Q124_CONTROL_BIN=$HERE/fake-control.sh
   export Q124_REMOTE_BIN=$HERE/fake-remote.sh
   export Q124_MANIFEST_PUBLISH_BIN=$HERE/fake-publish.sh
+  export Q124_LAUNCH_EVIDENCE_BIN=$HERE/fake-launch-recovery.sh
   export Q124_ACCOUNT_ID=111122223333 Q124_REGION=us-east-1 Q124_CLUSTER=cats-production
   export Q124_WORKSPACE_ID=ws-q124 Q124_SOURCE_INSTANCE_ID=i-a00124 Q124_SOURCE_NODE_ID=metal-source
   export Q124_AMI_ID=ami-0124 Q124_INSTANCE_TYPE=c5d.metal Q124_SUBNET_ID=subnet-0124
@@ -69,8 +74,12 @@ reset_case() {
   unset Q124_MANIFEST_SOURCE_SHA Q124_MANIFEST_RUN_ID Q124_EXPECTED_AMI Q124_EXPECTED_INSTANCE_TYPE
   unset Q124_EXPECTED_SUBNET Q124_EXPECTED_SECURITY_GROUP Q124_EXPECTED_INSTANCE_PROFILE Q124_EXPECTED_CACHE_DEVICE
   unset Q124_EXPECTED_AMI_OWNER Q124_EXPECTED_AMI_SNAPSHOTS Q124_EXPECTED_ROOT_DEVICE Q124_EXPECTED_ROOT_VOLUME_ID
-  unset Q124_EXPECTED_ROOT_DELETE_ON_TERMINATION Q124_EXPECTED_ROOT_ENCRYPTED Q124_EXPECTED_ROOT_VOLUME_TYPE Q124_EXPECTED_ROOT_VOLUME_SIZE_GIB
+  unset Q124_EXPECTED_ROOT_SNAPSHOT_ID Q124_EXPECTED_ROOT_DELETE_ON_TERMINATION Q124_EXPECTED_ROOT_ENCRYPTED Q124_EXPECTED_ROOT_VOLUME_TYPE Q124_EXPECTED_ROOT_VOLUME_SIZE_GIB
   unset Q124_MANIFEST_AWS_CLI_VERSION Q124_MANIFEST_AWS_CLI_SHA256 Q124_MANIFEST_JQ_VERSION
+  unset Q124_MANIFEST_ORCHESTRATOR_SHA256 Q124_MANIFEST_REMOTE_SHA256 Q124_MANIFEST_SSM_SHA256
+  unset Q124_MANIFEST_BOOTSTRAP_SHA256 Q124_MANIFEST_COMMAND_GUARD_SHA256
+  unset Q124_SSM_EXECUTION_TIMEOUT_SECONDS Q124_SSM_DELIVERY_TIMEOUT_SECONDS Q124_SSM_POLL_TIMEOUT_SECONDS Q124_SSM_CANCEL_TIMEOUT_SECONDS
+  unset Q124_LAUNCH_RECOVERY_JSON
 }
 
 provision_ok() {
@@ -123,6 +132,14 @@ expect_ami_rejected ami-ambiguous '.ami_ambiguous = true'
 expect_ami_rejected ami-architecture '.ami_architecture = "arm64"'
 expect_ami_rejected ami-root-mapping '.ami_root_device = "/dev/xvda"'
 expect_ami_rejected ami-snapshot-drift '.ami_mappings = [["/dev/sda1","snap-deadbeef"]]'
+expect_ami_rejected ami-root-not-deletable '.ami_delete_on_termination = false'
+
+reset_case ami-extra-mapping
+state_set '.ami_mappings += [["/dev/sdb","snap-0extra124"]]'
+export Q124_AMI_SNAPSHOT_IDS_JSON='["snap-0124aaa","snap-0extra124"]'
+export Q124_MODE=provision Q124_CONFIRMATION=PROVISION_Q124_TEMP_WORKER
+expect_fail "$TOOL"
+assert_state '[.log[] | select(contains("run-instances") or contains("terminate-instances"))] == []'
 
 reset_case initial-ready
 state_set '.start_ready = true'
@@ -173,6 +190,40 @@ set -e
 assert_state '.instance_state == "terminated" and ([.log[] | select(contains("terminate-instances"))] | length == 1)'
 jq -e '.status == "cleanup-terminated" and .instance_id == "i-0abc124"' "$Q124_EVIDENCE_OUT" >/dev/null
 
+reset_case independent-response-loss
+state_set '.instance_state="running" | .node="q124-124001-0124abc" | .source_sha="0124abc0124abc0124abc0124abc0124abc0124a" | .run_id="124001"'
+export Q124_LAUNCH_RECOVERY_JSON='{"launch_armed":true,"instance_id":"i-0abc124","manifest_sha256":null,"worker_start_attempted":false}'
+export Q124_MODE=recover-provision-independent Q124_CONFIRMATION=RECOVER_Q124_RUN_124001
+"$TOOL" >/dev/null
+assert_state '.instance_state == "terminated" and ([.log[] | select(contains("terminate-instances"))] | length == 1)'
+
+reset_case independent-discovery-deadline
+export Q124_LAUNCH_RECOVERY_JSON='{"launch_armed":true,"instance_id":null,"manifest_sha256":null,"worker_start_attempted":false}'
+export Q124_OPERATION_DEADLINE_EPOCH=$(( $(date -u +%s) + 2 )) Q124_CLEANUP_RESERVE_SECONDS=0 Q124_DISCOVERY_TIMEOUT_SECONDS=60
+export Q124_MODE=recover-provision-independent Q124_CONFIRMATION=RECOVER_Q124_RUN_124001
+started=$(date -u +%s)
+expect_fail "$TOOL"
+finished=$(date -u +%s)
+(( finished - started <= 4 )) || fail "independent discovery exceeded the absolute operation deadline"
+assert_state '.instance_state == "absent" and ([.log[] | select(contains("terminate-instances"))] | length == 0)'
+
+reset_case independent-start-ambiguous
+state_set '.instance_state="running" | .node="q124-124001-0124abc" | .source_sha="0124abc0124abc0124abc0124abc0124abc0124a" | .run_id="124001"'
+export Q124_LAUNCH_RECOVERY_JSON='{"launch_armed":true,"instance_id":"i-0abc124","manifest_sha256":null,"worker_start_attempted":true}'
+export Q124_MODE=recover-provision-independent Q124_CONFIRMATION=RECOVER_Q124_RUN_124001
+expect_fail "$TOOL"
+assert_state '.instance_state == "running" and ([.log[] | select(contains("terminate-instances"))] | length == 0)'
+
+reset_case independent-start-with-manifest
+provision_ok
+state_set '.control_present = false'
+export Q124_LAUNCH_RECOVERY_JSON
+Q124_LAUNCH_RECOVERY_JSON=$(jq -cn --arg manifest "$Q124_EXPECTED_MANIFEST_SHA256" \
+  '{launch_armed:true,instance_id:"i-0abc124",manifest_sha256:$manifest,worker_start_attempted:true}')
+export Q124_MODE=recover-provision-independent Q124_CONFIRMATION=RECOVER_Q124_RUN_124001
+"$TOOL" >/dev/null
+assert_state '.instance_state == "terminated" and .control_present == false and .worker_running == false and ([.log[] | select(contains("terminate-instances"))] | length == 1)'
+
 reset_case bad-hash
 provision_ok
 export Q124_MODE=validate Q124_EXPECTED_MANIFEST_SHA256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb Q124_CONFIRMATION=VALIDATE_Q124_bbbbbbbbbbbb
@@ -207,6 +258,15 @@ export Q124_MODE=validate Q124_CONFIRMATION="VALIDATE_Q124_${Q124_EXPECTED_MANIF
 expect_fail "$TOOL"
 assert_state '[.log[] | select(contains("terminate-instances"))] == []'
 
+reset_case manifest-script-provenance
+provision_ok
+jq '.bundle.remote_sha256="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' "$Q124_MANIFEST" >"$Q124_MANIFEST.next" && mv "$Q124_MANIFEST.next" "$Q124_MANIFEST"
+Q124_EXPECTED_MANIFEST_SHA256=$(jq -S -c . "$Q124_MANIFEST" | sha256sum | awk '{print $1}')
+export Q124_EXPECTED_MANIFEST_SHA256 Q124_MODE=validate Q124_CONFIRMATION="VALIDATE_Q124_${Q124_EXPECTED_MANIFEST_SHA256:0:12}"
+before=$(jq '.log|length' "$Q124_FAKE_STATE")
+expect_fail "$TOOL"
+assert_state ".log[$before:] | any(startswith(\"remote \")) | not"
+
 reset_case validate-policy-drift
 provision_ok
 export Q124_AMI_ID=ami-dead Q124_MODE=validate Q124_CONFIRMATION="VALIDATE_Q124_${Q124_EXPECTED_MANIFEST_SHA256:0:12}"
@@ -219,6 +279,29 @@ state_set '.root_encrypted = false'
 export Q124_MODE=validate Q124_CONFIRMATION="VALIDATE_Q124_${Q124_EXPECTED_MANIFEST_SHA256:0:12}"
 expect_fail "$TOOL"
 assert_state '.instance_state == "running" and ([.log[] | select(contains("terminate-instances"))] | length == 0)'
+
+reset_case validate-root-snapshot-drift
+provision_ok
+state_set '.root_snapshot_id = "snap-deadbeef"'
+export Q124_MODE=validate Q124_CONFIRMATION="VALIDATE_Q124_${Q124_EXPECTED_MANIFEST_SHA256:0:12}"
+before=$(jq '.log|length' "$Q124_FAKE_STATE")
+expect_fail "$TOOL"
+assert_state ".log[$before:] | any(startswith(\"remote \")) | not"
+
+reset_case validate-extra-instance-mapping
+provision_ok
+state_set '.instance_mappings = [["/dev/sda1","vol-q124",true],["/dev/sdb","vol-extra",false]]'
+export Q124_MODE=validate Q124_CONFIRMATION="VALIDATE_Q124_${Q124_EXPECTED_MANIFEST_SHA256:0:12}"
+before=$(jq '.log|length' "$Q124_FAKE_STATE")
+expect_fail "$TOOL"
+assert_state ".log[$before:] | any(startswith(\"remote \")) | not"
+
+reset_case lifecycle-deadline-budget
+provision_ok
+export Q124_OPERATION_DEADLINE_EPOCH=$(( $(date -u +%s) + 2200 )) Q124_CLEANUP_RESERVE_SECONDS=1800
+export Q124_MODE=validate Q124_CONFIRMATION="VALIDATE_Q124_${Q124_EXPECTED_MANIFEST_SHA256:0:12}"
+"$TOOL" >/dev/null
+assert_state '[.remote_budgets[] | select(.action == "validate")][-1] as $budget | ($budget.execution | tonumber) <= 130 and ($budget.poll | tonumber) <= 250'
 
 reset_case drain-root-drift
 provision_ok
@@ -396,6 +479,22 @@ expect_fail "$TOOL" # purged exact id does not hide a conflicting active identit
 state_set '.conflicting_identity = false'
 assert_state '.instance_state == "terminated" and .control_present == false'
 assert_state '[.log[] | select(contains("terminate-instances"))] | length == 1'
+
+reset_case return-reregistration
+provision_ok
+export Q124_MODE=drain Q124_CONFIRMATION="DRAIN_Q124_${Q124_EXPECTED_MANIFEST_SHA256:0:12}"
+"$TOOL" >/dev/null
+export Q124_MODE=withdraw Q124_CONFIRMATION="WITHDRAW_Q124_${Q124_EXPECTED_MANIFEST_SHA256:0:12}"
+"$TOOL" >/dev/null
+state_set '.reregister_after_stop = true'
+export Q124_MODE=return Q124_CONFIRMATION=RETURN_Q124_i-0abc124_q124-124001-0124abc
+"$TOOL" >/dev/null
+jq -e '
+  .log as $log |
+  ([range(0; $log|length) | select($log[.] == "control delete q124-124001-0124abc metal-source ws-q124 q124-")] | last) as $delete |
+  ([range(0; $log|length) | select($log[.] | contains("terminate-instances"))] | last) as $terminate |
+  $delete < $terminate
+' "$Q124_FAKE_STATE" >/dev/null || fail "return terminated before deleting a re-registered empty node"
 
 reset_case delete-response-lost
 provision_ok

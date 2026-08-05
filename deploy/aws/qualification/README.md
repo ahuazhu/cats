@@ -72,7 +72,9 @@ single concurrency group prevents overlapping lifecycle transitions.
    architectures fail closed. Every host and SSM AWS call has the manifest
    region explicitly set. Before handoff, the sole root mapping must still
    report the manifest's exact device/volume, `DeleteOnTermination=true`,
-   encryption, gp3 type and 200-GiB size.
+   encryption, gp3 type and 200-GiB size. The AMI itself must expose exactly
+   one EBS root mapping, with an explicit `DeleteOnTermination=true`, whose
+   single snapshot equals the reviewed Terraform policy snapshot.
 2. `validate`: confirmation `VALIDATE_Q124_<first-12-manifest-hash>`.
 3. `drain`: confirmation `DRAIN_Q124_<first-12-manifest-hash>`. Every assigned
    Cat must belong to the fixed workspace and have a `q124-` name. The control
@@ -101,11 +103,15 @@ boundaries, requires exactly one matching object and one bounded standard-base64
 line, then decodes and verifies the canonical hash before publishing the local
 manifest file.
 
-The manifest also freezes the public AMI owner and exact snapshot set, root
+The manifest also freezes the public AMI owner and exact root snapshot, root
 device/volume/deletion/encryption/type/size tuple, pinned bootstrap toolchain,
-and the hashes of the SSM, bootstrap and command-guard scripts. Every lifecycle
-mode re-reads the exact AMI and root binding. Cleanup repeats those checks
-immediately before termination; any drift preserves the instance.
+and every executable qualification script's hash, including the orchestrator,
+SSM evidence journal, launch evidence, bootstrap, command guard and host
+actions. Later lifecycle transitions download the manifest's exact immutable
+source archive and verify both archive and orchestrator hashes before execution;
+they do not trust the runner's mutable checkout. Every lifecycle mode re-reads
+the exact AMI and root binding. Cleanup repeats those checks immediately before
+termination; any drift preserves the instance.
 
 Provisioning keeps its failure-cleanup trap armed until the no-secret canonical
 manifest has been accepted by the issue API. A publication failure therefore
@@ -119,19 +125,28 @@ records the exact command id bound to that nonce before the first status poll.
 The host runs the payload under a manifest/nonce-bound singleton lock and
 active marker plus both the SSM document execution timeout and a shorter local
 hard timeout. A 70-minute execution ceiling accommodates the reviewed release
-build; the provision phase has an 80-minute deadline inside the 120-minute job.
+build. Both the qualification job and its independent cleanup job have fresh
+two-hour sessions and an absolute 115-minute operation deadline.
 Polling handles every documented nonterminal/terminal status itself. Timeout
 or runner signal cancels only the exact command and requires an authoritative
 terminal observation.
 
 If the runner disappears after `SendCommand` but before command-id publication,
-fresh cleanup uses the durable intent. After its delivery deadline it sends an
-exact-instance, read-only guard-lock probe; only an authoritatively absent lock
-permits cleanup. A busy lock, response loss, mismatched or malformed evidence,
-or any other ambiguity preserves the worker. Passing the durable hard upper
-bound never substitutes for that live guard proof. The workflow obtains a new
-qualification OIDC session in an `always()` step before failed-provision
-recovery, so expired initial credentials cannot silently skip cleanup.
+fresh cleanup uses the durable intent. It waits through the command's durable
+`not_after` upper bound and then sends an exact-instance, read-only guard-lock
+probe; only an authoritatively absent lock permits cleanup. The lock lives under
+`/run/lock`, outside the replaceable `/var/lib/cats` cache mount. A busy lock,
+response loss, mismatched or malformed evidence, or any other ambiguity
+preserves the worker.
+
+Before `RunInstances`, provisioning also publishes immutable no-secret launch
+evidence, then adds the exact instance id, manifest digest and worker-start
+attempt as those facts become durable. A separate `cleanup_failed_provision`
+job, with its own runner, administrator token and qualification OIDC session,
+recovers those records even when the original job is killed or times out. With
+no manifest, any possible worker start remains fail-closed. With an exact
+manifest, terminal SSM recovery plus host idle/stop proofs and calibrated
+control-plane absence permit exact-instance termination.
 
 The manifest's 1–24 hour interval is parsed and checked. `validate` refuses an
 expired worker; drain/withdraw/return deliberately remain available after
@@ -162,11 +177,12 @@ a lifecycle mutation.
 
 The trap is armed before `RunInstances`, not after its response. If AWS accepts
 the request but the CLI loses its output or receives TERM, cleanup performs a
-bounded discovery using the exact issue, purpose, node, run-id and source-SHA
-tags. Exactly one result is converted to an instance-id mutation only after the
-same empty/absent gates; zero, multiple or failed discovery preserves every
-resource and writes no-secret failure evidence to issue #124. It never sends a
-tag selector to a mutation API.
+bounded discovery, capped by the same absolute operation deadline, using the
+exact issue, purpose, node, run-id and source-SHA tags. Exactly one result is
+converted to an instance-id mutation only after the same empty/absent gates;
+zero, multiple or failed discovery preserves every resource and writes
+no-secret failure evidence to issue #124. It never sends a tag selector to a
+mutation API.
 
 Before the sole intentional format, the cache proof requires an EC2 Instance
 Storage device of `TYPE=disk` that is not the root or root parent, has no
@@ -192,7 +208,8 @@ change, Cordoned/Lost DELETE retries, manifest-publication failure, root mapping
 deletion policy, cache-mount/traversal failures, tag mismatch and exact positive
 termination, public-AMI owner/visibility/architecture/root/snapshot failures,
 root-binding drift in every lifecycle/cleanup path, cordon and reassignment
-races, fresh-credential recovery, and SendCommand response/comment loss. One
+races, independent-runner response-loss recovery, manifest-bound script
+tampering, fresh-credential recovery, and SendCommand response/comment loss. One
 fixture executes the actual SSM wrapper, bootstraps an
 initially absent AWS CLI/`jq`, and reaches the actual remote `prepare`
 entrypoint. A pure Terraform module also renders the actual IAM JSON for

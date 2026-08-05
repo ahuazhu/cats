@@ -83,6 +83,21 @@ data "aws_ami" "qualification_worker" {
     name   = "state"
     values = ["available"]
   }
+
+  lifecycle {
+    postcondition {
+      condition = (
+        length(self.block_device_mappings) == 1 &&
+        alltrue([
+          for mapping in self.block_device_mappings :
+          mapping.device_name == self.root_device_name &&
+          try(mapping.ebs.snapshot_id, "") != "" &&
+          try(mapping.ebs.delete_on_termination == true, false)
+        ])
+      )
+      error_message = "The qualification AMI must have exactly one EBS root mapping with DeleteOnTermination enabled."
+    }
+  }
 }
 
 module "github_qualification_worker_policy" {
@@ -94,10 +109,7 @@ module "github_qualification_worker_policy" {
   account_id = data.aws_caller_identity.current.account_id
   ami_id     = var.metal_worker_ami
   snapshot_arns = toset([
-    for snapshot_id in compact([
-      for mapping in data.aws_ami.qualification_worker[0].block_device_mappings :
-      try(mapping.ebs.snapshot_id, "")
-    ]) : "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}::snapshot/${snapshot_id}"
+    "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}::snapshot/${one([for mapping in data.aws_ami.qualification_worker[0].block_device_mappings : mapping.ebs.snapshot_id])}"
   ])
   subnet_id            = module.network.private_subnet_ids[0]
   security_group_id    = aws_security_group.metal_worker.id
