@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "issue": 124,
+  "account_id": "869621413820",
+  "aws_region": "us-east-1",
+  "temp_instance_id": "i-0123456789abcdef0",
+  "node_id": "q124-20260805000000-abcdef",
+  "instance_name": "cats-q124-20260805000000-abcdef",
+  "launch_time": "2026-08-05T12:00:00Z",
+  "expires_at": "2026-08-06T12:00:00Z",
+  "test_sha": "1111111111111111111111111111111111111111",
+  "tags": {
+    "Name": "cats-q124-20260805000000-abcdef",
+    "Project": "Cats",
+    "Environment": "production",
+    "Purpose": "qualification-124",
+    "Issue": "124",
+    "CatsNodeId": "q124-20260805000000-abcdef",
+    "ExpiresAt": "2026-08-06T12:00:00Z",
+    "ManagedBy": "manual-q124"
+  },
+  "qualification_assets": {
+    "config_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+    "hook_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+  }
+}
