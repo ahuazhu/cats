@@ -28,10 +28,12 @@ migration ladder rather than abstracting over both.
 
 - **Same database as the storage MetadataStore.** The control tables share
   the managed PostgreSQL instance and database that already holds the
-  `cats_storage_*` tables; names are disjoint. The DSN comes from
+  `cats_storage_*` tables; names are disjoint. A literal DSN may come from
   `--control-store-url` / `CATS_CONTROL_POSTGRES_URL`, falling back to
-  `CATS_POSTGRES_URL` — production needs no new secret. The CA file comes
-  from `CATS_CONTROL_POSTGRES_CA_FILE`.
+  `CATS_POSTGRES_URL`. Production mounts that same runtime Secret and uses
+  `--control-store-url-file`; the file is re-read on every connect so a
+  reconnect observes password rotation (ADR-0029). No new secret is needed.
+  The CA file comes from `CATS_CONTROL_POSTGRES_CA_FILE`.
 - **A fresh schema ladder.** PostgreSQL schema version 1 is the final SQLite
   layout (v5) re-expressed natively (BOOLEAN columns, plpgsql immutability
   triggers, a `control_schema_version` row instead of `PRAGMA user_version`).

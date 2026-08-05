@@ -21,7 +21,7 @@ pub fn base_url() -> String {
 }
 
 /// Create a fresh schema on the test server and return a DSN scoped to it via
-/// `search_path`, suitable for `Store::connect` or `Config.control_store_url`.
+/// `search_path`, suitable for `Store::connect` or a literal `Config` DSN.
 pub fn isolated_control_store_url() -> String {
     let base = base_url();
     let schema = format!("t_{}", uuid::Uuid::new_v4().simple());

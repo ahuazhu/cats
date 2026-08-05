@@ -38,6 +38,8 @@ use rows::{
 use schema::SCHEMA_VERSION;
 
 use std::collections::{BTreeMap, HashMap};
+use std::fs;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -113,8 +115,43 @@ pub struct Store {
     /// it. Option only so `Drop` can move the client onto a non-runtime
     /// thread — it is `Some` for the store's whole life.
     pub(super) client: Mutex<Option<Client>>,
-    url: String,
+    dsn: DsnSource,
     ca_file: Option<String>,
+}
+
+/// Where the control store obtains its PostgreSQL DSN on each connect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DsnSource {
+    /// A fixed development credential.
+    Literal(String),
+    /// A file kept current by the platform and re-read after a disconnect.
+    File(PathBuf),
+}
+
+impl DsnSource {
+    /// Resolve without ever including the credential-bearing contents in an
+    /// error message.
+    fn resolve(&self) -> Result<String> {
+        match self {
+            Self::Literal(url) => Ok(url.clone()),
+            Self::File(path) => {
+                let contents = fs::read_to_string(path).map_err(|error| {
+                    internal(format!(
+                        "read control-store PostgreSQL DSN from {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                let url = contents.trim();
+                if url.is_empty() {
+                    return Err(internal(format!(
+                        "control-store PostgreSQL DSN file {} is empty",
+                        path.display()
+                    )));
+                }
+                Ok(url.to_string())
+            }
+        }
+    }
 }
 
 /// Tearing down the client blocks on its internal runtime, which panics on a
@@ -218,7 +255,7 @@ impl Store {
         let client: &mut Option<Client> = &mut guard;
         off_runtime(move || {
             if client.as_ref().is_none_or(Client::is_closed) {
-                match schema::connect_client(&self.url, self.ca_file.as_deref()) {
+                match schema::connect_client(&self.dsn, self.ca_file.as_deref()) {
                     Ok(fresh) => *client = Some(fresh),
                     Err(error) => return f(Err(error)),
                 }

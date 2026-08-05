@@ -7,17 +7,18 @@ locals {
   runtime_secret_data = merge(
     var.runtime_secret_data,
     {
-      CATS_POSTGRES_URL           = var.storage_postgres_url
-      CATS_USAGE_STORE_ADAPTER    = "postgres"
-      CATS_USAGE_POSTGRES_URL     = var.usage_postgres_url
-      CATS_USAGE_POSTGRES_SCHEMA  = var.usage_postgres_schema
-      CATS_USAGE_POSTGRES_WORKERS = tostring(var.usage_postgres_workers)
-      CATS_USAGE_POSTGRES_CA_FILE = "/etc/cats/rds-ca.pem"
-      CATS_USAGE_DELIVERY_ADAPTER = var.usage_delivery_adapter
-      CATS_USAGE_AWS_REGION       = var.usage_aws_region
-      CATS_USAGE_KINESIS_STREAM   = var.usage_kinesis_stream
-      CATS_USAGE_ARCHIVE_BUCKET   = var.usage_archive_bucket
-      CATS_USAGE_CHECKPOINT_TABLE = var.usage_checkpoint_table
+      CATS_POSTGRES_URL            = var.storage_postgres_url
+      CATS_USAGE_STORE_ADAPTER     = "postgres"
+      CATS_USAGE_POSTGRES_URL      = var.usage_postgres_url
+      CATS_USAGE_POSTGRES_URL_FILE = "/etc/cats/runtime/CATS_USAGE_POSTGRES_URL"
+      CATS_USAGE_POSTGRES_SCHEMA   = var.usage_postgres_schema
+      CATS_USAGE_POSTGRES_WORKERS  = tostring(var.usage_postgres_workers)
+      CATS_USAGE_POSTGRES_CA_FILE  = "/etc/cats/rds-ca.pem"
+      CATS_USAGE_DELIVERY_ADAPTER  = var.usage_delivery_adapter
+      CATS_USAGE_AWS_REGION        = var.usage_aws_region
+      CATS_USAGE_KINESIS_STREAM    = var.usage_kinesis_stream
+      CATS_USAGE_ARCHIVE_BUCKET    = var.usage_archive_bucket
+      CATS_USAGE_CHECKPOINT_TABLE  = var.usage_checkpoint_table
     },
     var.stripe_enabled ? {
       STRIPE_SECRET_KEY                = coalesce(var.stripe_secret_key, "")
@@ -198,10 +199,14 @@ resource "kubernetes_deployment_v1" "control_plane" {
           args = [
             "--listen",
             "0.0.0.0:7300",
+            "--control-store-url-file",
+            "/etc/cats/runtime/CATS_POSTGRES_URL",
             "--metadata-store-adapter",
             "postgres",
             "--metadata-store-option",
             "ca-file=/etc/cats/rds-ca.pem",
+            "--metadata-store-option",
+            "url-file=/etc/cats/runtime/CATS_POSTGRES_URL",
           ]
 
           env {
@@ -219,8 +224,8 @@ resource "kubernetes_deployment_v1" "control_plane" {
             value = tostring(var.oci_deploy_sync_wait_ms)
           }
 
-          # The control store reads its DSN from CATS_POSTGRES_URL (delivered
-          # by the runtime Secret below) and verifies RDS TLS with this CA.
+          # All PostgreSQL clients verify RDS TLS with this CA. Their DSNs are
+          # mounted as files below so reconnects observe credential rotation.
           env {
             name  = "CATS_CONTROL_POSTGRES_CA_FILE"
             value = "/etc/cats/rds-ca.pem"
@@ -290,6 +295,14 @@ resource "kubernetes_deployment_v1" "control_plane" {
             sub_path   = "rds-ca.pem"
             read_only  = true
           }
+
+          # Mount the whole Secret, never a subPath: kubelet updates projected
+          # Secret files in place, while a subPath mount remains frozen.
+          volume_mount {
+            name       = "runtime-secret"
+            mount_path = "/etc/cats/runtime"
+            read_only  = true
+          }
         }
 
         volume {
@@ -297,6 +310,14 @@ resource "kubernetes_deployment_v1" "control_plane" {
 
           config_map {
             name = kubernetes_config_map_v1.rds_ca.metadata[0].name
+          }
+        }
+
+        volume {
+          name = "runtime-secret"
+
+          secret {
+            secret_name = kubernetes_secret_v1.runtime.metadata[0].name
           }
         }
       }

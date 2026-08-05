@@ -21,7 +21,9 @@
 //! passes vacuously, so a green run without that variable is not evidence.
 
 use cats_api::metering::{CatUsageCheckpoint, UsageMetric};
-use cats_metering::{AttributedCheckpoint, UsageAttribution, UsageQuery, UsageStore};
+use cats_metering::{
+    deterministic_event_id, AttributedCheckpoint, UsageAttribution, UsageQuery, UsageStore,
+};
 use cats_usage_store_postgres::PostgresUsageStore;
 
 const ACCOUNT: &str = "ba-query-totals-equivalence";
@@ -41,6 +43,18 @@ fn checkpoint(
     cumulative_quantity: u128,
     metric: UsageMetric,
 ) -> AttributedCheckpoint {
+    let mut checkpoint = CatUsageCheckpoint {
+        event_id: String::new(),
+        source_id: "node/node-a/cat/cat-a".to_string(),
+        source_epoch: "epoch-a".to_string(),
+        sequence,
+        observed_at_unix_ms,
+        cat_id: "cat-a".to_string(),
+        cat_generation: 1,
+        metric,
+        cumulative_quantity,
+    };
+    checkpoint.event_id = deterministic_event_id(&checkpoint);
     AttributedCheckpoint {
         attribution: UsageAttribution {
             billing_account_id: ACCOUNT.to_string(),
@@ -49,17 +63,7 @@ fn checkpoint(
             resource_id: "cat-a".to_string(),
             attributed_cat_id: Some("cat-a".to_string()),
         },
-        checkpoint: CatUsageCheckpoint {
-            event_id: format!("evt-{metric:?}-{sequence:03}"),
-            source_id: "node/node-a/cat/cat-a".to_string(),
-            source_epoch: "epoch-a".to_string(),
-            sequence,
-            observed_at_unix_ms,
-            cat_id: "cat-a".to_string(),
-            cat_generation: 1,
-            metric,
-            cumulative_quantity,
-        },
+        checkpoint,
     }
 }
 

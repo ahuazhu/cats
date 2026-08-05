@@ -42,7 +42,9 @@ impl Cluster {
             Arc::new(SqliteMetadataStore::open(&storage_meta_path).unwrap());
         let cp = cats_control_plane::server::spawn(cats_control_plane::server::Config {
             listen: "127.0.0.1:0".into(),
-            control_store_url: cats_control_plane::testsupport::isolated_control_store_url(),
+            control_store_dsn: cats_control_plane::store::DsnSource::Literal(
+                cats_control_plane::testsupport::isolated_control_store_url(),
+            ),
             control_store_ca_file: None,
             usage_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
             credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),

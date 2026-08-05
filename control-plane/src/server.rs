@@ -10,15 +10,16 @@ use cats_metering::{CreditStore, UsageStore};
 use cats_storage::MetadataStore;
 
 use crate::controller::{AutoTierPolicy, Controller};
-use crate::store::Store;
+use crate::store::{DsnSource, Store};
 
 #[derive(Clone)]
 pub struct Config {
     /// `host:port`; use port 0 to pick a free port (tests).
     pub listen: String,
-    /// Control-plane resource database: a PostgreSQL URL. Tests isolate by
-    /// appending `options=-csearch_path%3D<schema>`.
-    pub control_store_url: String,
+    /// Control-plane resource database. Production uses a mounted Secret file
+    /// so a reconnect observes rotated credentials; tests use a literal URL
+    /// with `options=-csearch_path%3D<schema>`.
+    pub control_store_dsn: DsnSource,
     /// CA bundle for verifying the control database's TLS certificate (RDS).
     pub control_store_ca_file: Option<PathBuf>,
     /// Usage ledger is injected independently from control-plane metadata.
@@ -129,8 +130,8 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         "automatic Cold threshold must be positive"
     );
     let cfg = Arc::new(cfg);
-    let store = Arc::new(Store::connect(
-        &cfg.control_store_url,
+    let store = Arc::new(Store::connect_from(
+        &cfg.control_store_dsn,
         cfg.control_store_ca_file
             .as_deref()
             .and_then(|p| p.to_str()),

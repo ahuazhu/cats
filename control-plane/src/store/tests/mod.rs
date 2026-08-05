@@ -181,6 +181,46 @@ fn state_survives_a_reconnect() {
 }
 
 #[test]
+fn reconnect_rereads_a_dsn_file() {
+    let first_url = crate::testsupport::isolated_control_store_url();
+    let second_url = crate::testsupport::isolated_control_store_url();
+    // Prepare both databases before changing the source underneath a Store.
+    // Credential rotation keeps the database fixed, but two schemas make the
+    // source actually used by the reconnect externally visible.
+    drop(Store::connect(&second_url, None).unwrap());
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("control-postgres-url");
+    std::fs::write(&path, format!("{first_url}\n")).unwrap();
+    let store = Store::connect_from(&DsnSource::File(path.clone()), None).unwrap();
+    let workspace = bootstrap_workspace(&store, "first");
+    create_test_cat(&store, &workspace, "only-in-first").unwrap();
+
+    std::fs::write(&path, format!("{second_url}\n")).unwrap();
+    let old_client = store.client.lock().unwrap().take();
+    drop(old_client);
+
+    assert!(
+        store.list_cats(&workspace.id).unwrap().is_empty(),
+        "the reconnect must use the newly rendered DSN"
+    );
+}
+
+#[test]
+fn dsn_file_errors_do_not_expose_credential_contents() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing-postgres-url");
+    let error = DsnSource::File(missing.clone()).resolve().unwrap_err();
+    assert!(error.to_string().contains(&missing.display().to_string()));
+
+    let empty = directory.path().join("empty-postgres-url");
+    std::fs::write(&empty, "  \n").unwrap();
+    let error = DsnSource::File(empty.clone()).resolve().unwrap_err();
+    assert!(error.to_string().contains(&empty.display().to_string()));
+    assert!(!error.to_string().contains("postgres://"));
+}
+
+#[test]
 fn heartbeat_reported_inventory_round_trips_and_diffs_orphans() {
     let store = test_store();
     let workspace = bootstrap_workspace(&store, "acme");

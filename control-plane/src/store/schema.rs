@@ -10,20 +10,25 @@ impl Store {
     /// isolate in a per-test schema; reconnects preserve it because they
     /// re-parse the same URL.
     pub fn connect(url: &str, ca_file: Option<&str>) -> Result<Self> {
+        Self::connect_from(&DsnSource::Literal(url.to_string()), ca_file)
+    }
+
+    /// Connect from a source that is consulted again after every disconnect.
+    pub fn connect_from(dsn: &DsnSource, ca_file: Option<&str>) -> Result<Self> {
         let client = off_runtime(|| {
-            let mut client = connect_client(url, ca_file)?;
+            let mut client = connect_client(dsn, ca_file)?;
             ensure_schema(&mut client)?;
             Ok::<_, ApiError>(client)
         })?;
         Ok(Self {
             client: Mutex::new(Some(client)),
-            url: url.to_string(),
+            dsn: dsn.clone(),
             ca_file: ca_file.map(str::to_string),
         })
     }
 }
 
-pub(super) fn connect_client(url: &str, ca_file: Option<&str>) -> Result<Client> {
+pub(super) fn connect_client(dsn: &DsnSource, ca_file: Option<&str>) -> Result<Client> {
     let mut builder = TlsConnector::builder();
     if let Some(path) = ca_file {
         let pem = std::fs::read(path)
@@ -41,6 +46,7 @@ pub(super) fn connect_client(url: &str, ca_file: Option<&str>) -> Result<Client>
     let connector = builder
         .build()
         .map_err(|error| internal(format!("build control-store TLS client: {error}")))?;
+    let url = dsn.resolve()?;
     let mut config: postgres::Config = url
         .parse()
         .map_err(|error| internal(format!("parse control-store URL: {error}")))?;

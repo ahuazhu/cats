@@ -381,7 +381,9 @@ impl Ctx {
             Arc::new(SqliteMetadataStore::open(&dir.path().join("storage-meta.db")).unwrap());
         let cp = spawn(Config {
             listen: "127.0.0.1:0".into(),
-            control_store_url: cats_control_plane::testsupport::isolated_control_store_url(),
+            control_store_dsn: cats_control_plane::store::DsnSource::Literal(
+                cats_control_plane::testsupport::isolated_control_store_url(),
+            ),
             control_store_ca_file: None,
             usage_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
             credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
@@ -1563,7 +1565,7 @@ async fn control_plane_startup_grace_preserves_a_reconnecting_host_bound_cat() {
         listen: "127.0.0.1:0".into(),
         usage_store: Arc::new(SqliteUsageStore::open(&db_path).unwrap()),
         credit_store: Arc::new(SqliteUsageStore::open(&db_path).unwrap()),
-        control_store_url,
+        control_store_dsn: cats_control_plane::store::DsnSource::Literal(control_store_url),
         control_store_ca_file: None,
         storage_meta,
         auth_token: SERVICE_TOKEN.into(),
@@ -1782,7 +1784,9 @@ async fn static_user_tokens_are_not_accepted() {
         Arc::new(SqliteMetadataStore::open(&dir.path().join("storage-meta.db")).unwrap());
     let cfg = Config {
         listen: "127.0.0.1:0".into(),
-        control_store_url: cats_control_plane::testsupport::isolated_control_store_url(),
+        control_store_dsn: cats_control_plane::store::DsnSource::Literal(
+            cats_control_plane::testsupport::isolated_control_store_url(),
+        ),
         control_store_ca_file: None,
         usage_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
         credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),

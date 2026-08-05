@@ -304,6 +304,7 @@ jobs:
             --kubeconfig "$RUNNER_TEMP/kubeconfig" \
             --namespace cats \
             delete pod "$probe" --ignore-not-found >/dev/null 2>&1 || true
+          set +e
           query_output="$(
             kubectl \
               --kubeconfig "$RUNNER_TEMP/kubeconfig" \
@@ -317,23 +318,25 @@ jobs:
                     "name": "psql",
                     "image": "postgres:16",
                     "command": ["sh", "-c",
-                      "psql \"$CATS_POSTGRES_URL\" -tA -c \"SELECT version FROM control_schema_version\" 2>&1"],
+                      "psql \"$CATS_POSTGRES_URL\" -v ON_ERROR_STOP=1 -tA -c \"SELECT version FROM control_schema_version\" 2>&1"],
                     "envFrom": [{"secretRef": {"name": "cats-runtime"}}]
                   }]
                 }
-              }' 2>/dev/null || true
+              }'
           )"
+          query_status=$?
+          set -e
 
-          if [[ "$query_output" =~ ^[0-9]+$ ]]; then
+          if (( query_status == 0 )) && [[ "$query_output" =~ ^[0-9]+$ ]]; then
             actual_schema="$query_output"
             if (( actual_schema < oldest_migratable || actual_schema > required_schema )); then
               echo "::error::Control database schema $actual_schema is incompatible with build schema $required_schema (migratable from $oldest_migratable). cats-controld only migrates stamped versions inside that range; recreate the database with the reviewed runbook before retrying. The deployment will not replace the live Pod or delete production data automatically."
               exit 1
             fi
-          elif [[ -z "$query_output" || "$query_output" == *"does not exist"* ]]; then
+          elif (( query_status != 0 )) && [[ "$query_output" == *'relation "control_schema_version" does not exist'* ]]; then
             echo "Control database has no stamped schema yet; the new Pod creates version $required_schema."
           else
-            echo "::error::Could not read the control database schema version: $query_output"
+            echo "::error::Could not read the control database schema version (probe exit $query_status): $query_output"
             exit 1
           fi
 
