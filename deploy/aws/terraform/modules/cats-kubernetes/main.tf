@@ -563,6 +563,14 @@ resource "kubernetes_deployment_v1" "gateway" {
   }
 
   wait_for_rollout = true
+
+  # Route Grants are additive in the control-plane response, so old Gateways
+  # tolerate a new control plane. The reverse is not true: a new Gateway fails
+  # closed when an old replica returns an active Running route without a grant.
+  # Terraform may otherwise update independent Deployments concurrently. Wait
+  # for every control-plane replica to finish its rollout before replacing the
+  # first Gateway Pod.
+  depends_on = [kubernetes_deployment_v1.control_plane]
 }
 
 resource "kubernetes_service_v1" "gateway" {

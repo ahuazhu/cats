@@ -81,5 +81,12 @@ Node hop. It authenticates the calling service but does not authorize a route.
   and every Node in the rollout must have the matching public key before it
   receives traffic. Rotation needs an overlap mechanism before two keys can be
   live simultaneously; V1 uses a coordinated, drained rollout.
+- The additive first rollout updates every control-plane replica before any
+  Gateway, then drains and updates Nodes one at a time. Old Gateways ignore the
+  additional resolve fields and old Nodes ignore the forwarded grant. The
+  reverse order is incompatible: a new Gateway rejects an old control-plane
+  response without a grant, and a new Node rejects an old Gateway request
+  without one. Terraform encodes the control-plane-before-Gateway dependency;
+  the worker drain boundary remains operator-controlled.
 - Grant expiry is an authorization bound, not a promise that a backend will
   remain Running. Node loss still breaks connections and clients still retry.

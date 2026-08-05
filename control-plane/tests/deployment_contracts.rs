@@ -133,6 +133,34 @@ fn route_grant_private_key_reaches_only_control_plane_and_nodes_get_public_key()
     assert!(dev.contains("--route-grant-public-key-file"));
 }
 
+#[test]
+fn route_grant_application_rolls_control_plane_before_gateway() {
+    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    let control = kubernetes
+        .split_once("resource \"kubernetes_deployment_v1\" \"control_plane\"")
+        .and_then(|(_, rest)| rest.split_once("resource \"kubernetes_pod_disruption_budget_v1\""))
+        .map(|(section, _)| section)
+        .expect("control-plane Deployment section");
+    let gateway = kubernetes
+        .split_once("resource \"kubernetes_deployment_v1\" \"gateway\"")
+        .and_then(|(_, rest)| rest.split_once("resource \"kubernetes_service_v1\" \"gateway\""))
+        .map(|(section, _)| section)
+        .expect("Gateway Deployment section");
+
+    assert!(
+        control.contains("wait_for_rollout = true"),
+        "the Gateway dependency is safe only if Terraform waits for the complete control-plane rollout"
+    );
+    assert!(
+        gateway.contains("wait_for_rollout = true"),
+        "Terraform must wait for the Gateway rollout too"
+    );
+    assert!(
+        gateway.contains("depends_on = [kubernetes_deployment_v1.control_plane]"),
+        "a new Gateway must not start until every control-plane replica issues Route Grants"
+    );
+}
+
 #[cfg(unix)]
 fn ha_fixture_guard() -> std::sync::MutexGuard<'static, ()> {
     static FIXTURE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();

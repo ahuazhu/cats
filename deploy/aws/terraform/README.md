@@ -227,6 +227,24 @@ Guest image. Generate the pair with `openssl genpkey -algorithm ED25519` and
 `openssl pkey -pubout`, then rotate it only through a coordinated drained
 rollout until multi-key verification exists.
 
+The first Route Grant release has a strict compatibility order:
+
+1. configure the application private-key input and the matching infrastructure
+   public-key input, but do not deploy the new worker bundle yet;
+2. deploy the application first. Terraform waits for the complete control-plane
+   rollout before it starts the Gateway rollout. Old Gateways ignore the new
+   response fields, and old Nodes ignore the grant forwarded by a new Gateway;
+3. drain, deploy and uncordon one worker at a time using the worker procedure
+   below. Never uncordon a Node that requires Route Grants while the old Gateway
+   is still live: the Node deliberately rejects its unsigned requests;
+4. if the application must be rolled back after any worker has been upgraded,
+   first drain those workers and restore the compatible old worker bundle. An
+   old Gateway cannot serve a Node that requires a Route Grant.
+
+This additive first release is not the key-rotation procedure. With one accepted
+public key, rotation still needs the coordinated drained boundary described
+above; do not swap either half independently.
+
 `storage_postgres_url` and `usage_postgres_url` are intentionally independent.
 During the early shared-RDS phase they may point to the same instance/database,
 while usage uses the separate `cats_usage` schema and preferably a dedicated
