@@ -156,8 +156,14 @@ checks out the dispatched `main` revision. Diagnose mode verifies two ready
 Pods on different nodes, then reports the singleton locks and each Pod's Pod,
 Host and node addresses without deleting anything. Disrupt mode additionally
 requires an allowed PDB disruption, locates the reconciler owner through its
-PostgreSQL advisory lock, then deletes only that Pod. It requires all 240 public
-`/healthz` probes to succeed while Kubernetes replaces the Pod, and finally
+PostgreSQL advisory lock, and maps that database source to exactly one strictly
+Ready, Running, non-terminating Pod through either its Pod IP or its EKS
+node/host IP. Candidate uniqueness is checked before readiness, so a
+terminating owner and a same-node replacement fail closed. Zero, duplicate, or
+ambiguous owner mappings fail before disruption. The owner is resolved again
+at the disruption boundary. A policy/v1 Eviction makes the Kubernetes API
+atomically enforce both the PDB and selected Pod UID. All 240 public `/healthz`
+probes must succeed while Kubernetes replaces the Pod, and the workflow finally
 proves that two node-spread replicas and a new reconciler owner are present. It
 never force-deletes or scales the Deployment.
 

@@ -1,5 +1,8 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+
+#[cfg(unix)]
+use std::io::Write;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -177,6 +180,283 @@ esac
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn reconciler_owner_selection_accepts_exact_pod_or_host_addresses_and_rejects_ambiguity() {
+    let fixture = tempfile::tempdir().expect("owner selection fixture");
+    let pods_path = fixture.path().join("pods.json");
+    let pods = serde_json::json!({
+        "items": [
+            {
+                "metadata": {"name": "controld-a", "uid": "uid-a"},
+                "status": {
+                    "phase": "Running",
+                    "podIP": "10.0.0.11",
+                    "hostIP": "192.0.2.11",
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "containerStatuses": [{"ready": true}]
+                }
+            },
+            {
+                "metadata": {"name": "controld-b", "uid": "uid-b"},
+                "status": {
+                    "phase": "Running",
+                    "podIP": "10.0.0.12",
+                    "hostIP": "192.0.2.12",
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "containerStatuses": [{"ready": true}]
+                }
+            },
+            {
+                "metadata": {"name": "controld-not-ready", "uid": "uid-c"},
+                "status": {
+                    "phase": "Running",
+                    "podIP": "10.0.0.13",
+                    "hostIP": "192.0.2.13",
+                    "conditions": [{"type": "Ready", "status": "False"}],
+                    "containerStatuses": [{"ready": false}]
+                }
+            }
+        ]
+    });
+    std::fs::write(&pods_path, serde_json::to_vec(&pods).unwrap()).unwrap();
+
+    let run = |owner_rows: &str, path: &Path| {
+        let mut child = Command::new("bash")
+            .arg(workspace_root().join("deploy/aws/select-reconciler-owner.sh"))
+            .arg(path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run reconciler owner selector");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(owner_rows.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    for (owner, name, uid, kind) in [
+        ("10.0.0.11\n", "controld-a", "uid-a", "pod-ip"),
+        ("192.0.2.12\n", "controld-b", "uid-b", "host-ip"),
+    ] {
+        let output = run(owner, &pods_path);
+        assert!(
+            output.status.success(),
+            "selector rejected {kind}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let selection: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(selection["name"], name);
+        assert_eq!(selection["uid"], uid);
+        assert_eq!(selection["address_kind"], kind);
+    }
+
+    for (owner_rows, diagnostic) in [
+        ("", "owner_rows=0"),
+        ("10.0.0.11\n10.0.0.11\n", "owner_rows=2"),
+        ("10.0.0.13\n", "ready_union_matches=0"),
+        ("203.0.113.99\n", "ready_union_matches=0"),
+    ] {
+        let output = run(owner_rows, &pods_path);
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(diagnostic),
+            "missing {diagnostic:?} in {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+    }
+
+    let mut ambiguous = pods.clone();
+    ambiguous["items"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "metadata": {"name": "controld-same-node", "uid": "uid-d"},
+            "status": {
+                "phase": "Running",
+                "podIP": "10.0.0.14",
+                "hostIP": "192.0.2.11",
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [{"ready": true}]
+            }
+        }));
+    let ambiguous_path = fixture.path().join("ambiguous.json");
+    std::fs::write(&ambiguous_path, serde_json::to_vec(&ambiguous).unwrap()).unwrap();
+    let output = run("192.0.2.11\n", &ambiguous_path);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("host_ip_matches=2"), "{stderr}");
+    assert!(stderr.contains("address_union_matches=2"), "{stderr}");
+    assert!(stderr.contains("ready_union_matches=2"), "{stderr}");
+
+    let mut conflicting = pods.clone();
+    conflicting["items"][1]["status"]["hostIP"] = serde_json::json!("10.0.0.11");
+    let conflicting_path = fixture.path().join("conflicting.json");
+    std::fs::write(&conflicting_path, serde_json::to_vec(&conflicting).unwrap()).unwrap();
+    let output = run("10.0.0.11\n", &conflicting_path);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("pod_ip_matches=1"), "{stderr}");
+    assert!(stderr.contains("host_ip_matches=1"), "{stderr}");
+    assert!(stderr.contains("address_union_matches=2"), "{stderr}");
+    assert!(stderr.contains("ready_union_matches=2"), "{stderr}");
+
+    let strict_base = pods["items"][0].clone();
+    let mut deleting_but_container_ready = strict_base.clone();
+    deleting_but_container_ready["metadata"]["deletionTimestamp"] =
+        serde_json::json!("2026-08-05T16:00:00Z");
+    let mut pending_but_container_ready = strict_base.clone();
+    pending_but_container_ready["status"]["phase"] = serde_json::json!("Pending");
+    let mut pod_not_ready_but_container_ready = strict_base;
+    pod_not_ready_but_container_ready["status"]["conditions"][0]["status"] =
+        serde_json::json!("False");
+    for (label, pod) in [
+        ("deleting", deleting_but_container_ready),
+        ("pending", pending_but_container_ready),
+        ("pod-not-ready", pod_not_ready_but_container_ready),
+    ] {
+        let path = fixture.path().join(format!("strict-{label}.json"));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"items": [pod]})).unwrap(),
+        )
+        .unwrap();
+        let output = run("10.0.0.11\n", &path);
+        assert!(!output.status.success(), "{label} Pod was selected");
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("address_union_matches=1"), "{stderr}");
+        assert!(stderr.contains("ready_union_matches=0"), "{stderr}");
+    }
+
+    let mut terminating = serde_json::json!({
+        "items": [
+            {
+                "metadata": {
+                    "name": "controld-old-owner",
+                    "uid": "uid-old",
+                    "deletionTimestamp": "2026-08-05T16:00:00Z"
+                },
+                "status": {
+                    "phase": "Running",
+                    "podIP": "10.0.0.21",
+                    "hostIP": "192.0.2.21",
+                    "conditions": [{"type": "Ready", "status": "False"}],
+                    "containerStatuses": [{"ready": true}]
+                }
+            },
+            {
+                "metadata": {"name": "controld-ready-replacement", "uid": "uid-new"},
+                "status": {
+                    "phase": "Running",
+                    "podIP": "10.0.0.22",
+                    "hostIP": "192.0.2.21",
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "containerStatuses": [{"ready": true}]
+                }
+            }
+        ]
+    });
+    let terminating_path = fixture.path().join("terminating.json");
+    std::fs::write(&terminating_path, serde_json::to_vec(&terminating).unwrap()).unwrap();
+    let output = run("192.0.2.21\n", &terminating_path);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("host_ip_matches=2"), "{stderr}");
+    assert!(stderr.contains("address_union_matches=2"), "{stderr}");
+    assert!(stderr.contains("ready_union_matches=1"), "{stderr}");
+
+    terminating["items"].as_array_mut().unwrap().truncate(1);
+    let terminating_only_path = fixture.path().join("terminating-only.json");
+    std::fs::write(
+        &terminating_only_path,
+        serde_json::to_vec(&terminating).unwrap(),
+    )
+    .unwrap();
+    let output = run("10.0.0.21\n", &terminating_only_path);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("address_union_matches=1"), "{stderr}");
+    assert!(stderr.contains("ready_union_matches=0"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn pod_eviction_carries_pdb_and_uid_preconditions_and_rejects_a_replacement() {
+    let fixture = tempfile::tempdir().expect("UID eviction fixture");
+    let fake_bin = fixture.path().join("bin");
+    std::fs::create_dir(&fake_bin).unwrap();
+    let fake_kubectl = fake_bin.join("kubectl");
+    let request_path = fixture.path().join("delete-options.json");
+    let delete_log = fixture.path().join("deleted");
+    std::fs::write(
+        &fake_kubectl,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+[[ "$*" == "--namespace cats create --raw /api/v1/namespaces/cats/pods/controld-a/eviction --filename -" ]]
+cat >"$CATS_TEST_REQUEST"
+jq -e --arg current "$CATS_TEST_CURRENT_UID" \
+  '.kind == "Eviction" and .apiVersion == "policy/v1" and .deleteOptions.preconditions.uid == $current' \
+  "$CATS_TEST_REQUEST" >/dev/null
+touch "$CATS_TEST_DELETE_LOG"
+"#,
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&fake_kubectl).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_kubectl, permissions).unwrap();
+
+    let old_uid = "11111111-1111-4111-8111-111111111111";
+    let new_uid = "22222222-2222-4222-8222-222222222222";
+    let run = |current_uid: &str| {
+        Command::new(workspace_root().join("deploy/aws/evict-pod-with-uid.sh"))
+            .args(["cats", "controld-a", old_uid])
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    fake_bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("CATS_TEST_CURRENT_UID", current_uid)
+            .env("CATS_TEST_REQUEST", &request_path)
+            .env("CATS_TEST_DELETE_LOG", &delete_log)
+            .output()
+            .unwrap()
+    };
+
+    let stale = run(new_uid);
+    assert!(!stale.status.success());
+    assert!(
+        !delete_log.exists(),
+        "a same-name replacement must not be deleted"
+    );
+    let request: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&request_path).unwrap()).unwrap();
+    assert_eq!(request["kind"], "Eviction");
+    assert_eq!(request["apiVersion"], "policy/v1");
+    assert_eq!(request["metadata"]["namespace"], "cats");
+    assert_eq!(request["metadata"]["name"], "controld-a");
+    assert_eq!(request["deleteOptions"]["preconditions"]["uid"], old_uid);
+    assert_eq!(request["deleteOptions"]["propagationPolicy"], "Background");
+
+    let exact = run(old_uid);
+    assert!(
+        exact.status.success(),
+        "exact UID was rejected: {}",
+        String::from_utf8_lossy(&exact.stderr)
+    );
+    assert!(delete_log.exists());
+}
+
 #[test]
 fn production_database_clients_read_the_rotating_secret_files() {
     let terraform = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
@@ -265,8 +545,13 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
         "l.classid=hashtext(current_schema())::oid",
         "l.objid=420201",
         "l.objsubid=2",
+        "COALESCE(host(a.client_addr), '<local>')",
         "deploy/aws/run-postgres-probe.sh",
-        "delete pod \"$target\" --wait=false",
+        "deploy/aws/select-reconciler-owner.sh",
+        "deploy/aws/evict-pod-with-uid.sh cats \"$target\" \"$target_uid\"",
+        "reconciler leadership changed before the disruption boundary",
+        ".metadata.deletionTimestamp == null",
+        ".status.phase == \"Running\"",
         "https://cats.run/healthz",
         "rollout status deployment/cats-controld",
         "All 240 public health probes succeeded",
@@ -293,21 +578,36 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
     assert!(!workflow.contains("--attach"));
     assert!(!workflow.contains("tr -d '[:space:]' <<<\"$leader_ip\""));
     assert_eq!(
-        workflow.matches("deploy/aws/run-postgres-probe.sh").count(),
-        3,
-        "diagnostic, pre-disruption and post-disruption probes must avoid attach replay"
+        workflow
+            .matches("COALESCE(host(a.client_addr), '<local>')")
+            .count(),
+        2,
+        "both destructive owner queries must normalize PostgreSQL inet values without guessing at CIDR text"
     );
     assert_eq!(
-        workflow.matches("SELECT host(a.client_addr)").count(),
-        2,
-        "both owner probes must remove the PostgreSQL inet mask before matching a Pod IP"
+        workflow.matches("a.client_addr::text").count(),
+        1,
+        "CIDR text is diagnostic evidence only and must not feed Pod identity selection"
     );
-    assert!(!workflow.contains("SELECT a.client_addr::text FROM pg_locks"));
+    assert_eq!(
+        workflow.matches("deploy/aws/run-postgres-probe.sh").count(),
+        4,
+        "diagnostic, initial, boundary-confirmation, and post-disruption probes must avoid attach replay"
+    );
     assert_eq!(
         workflow.matches("if: inputs.mode == 'disrupt'").count(),
         2,
         "both destructive and post-disruption steps must require disrupt mode"
     );
+    assert_eq!(
+        workflow
+            .matches("deploy/aws/select-reconciler-owner.sh")
+            .count(),
+        3,
+        "all owner probes must use the same exact Pod-or-host selector"
+    );
+    assert!(workflow.contains("observed_uid"));
+    assert!(workflow.contains("target_uid"));
 }
 
 #[test]
