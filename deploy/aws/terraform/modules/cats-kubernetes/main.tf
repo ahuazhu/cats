@@ -196,6 +196,20 @@ resource "kubernetes_deployment_v1" "control_plane" {
           "kubernetes.io/arch" = "amd64"
         }
 
+        affinity {
+          pod_anti_affinity {
+            required_during_scheduling_ignored_during_execution {
+              topology_key = "kubernetes.io/hostname"
+
+              label_selector {
+                match_labels = {
+                  "app.kubernetes.io/name" = "cats-controld"
+                }
+              }
+            }
+          }
+        }
+
         topology_spread_constraint {
           max_skew           = 1
           topology_key       = "kubernetes.io/hostname"
