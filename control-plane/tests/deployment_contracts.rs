@@ -164,6 +164,36 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
 }
 
 #[test]
+fn noninteractive_worker_bootstrap_defines_root_home_before_toolchain_use() {
+    for path in [
+        "deploy/aws/metal/install-worker.sh",
+        "deploy/metal/build-guest-image.sh",
+    ] {
+        let script = read_workspace_file(path);
+        let lines: Vec<_> = script.lines().collect();
+        let root_guard = lines
+            .iter()
+            .position(|line| line.contains("[[ $EUID -eq 0 ]]"))
+            .expect("root guard");
+        let home_default = lines
+            .iter()
+            .position(|line| line.contains(r#"export HOME="${HOME:-/root}""#))
+            .unwrap_or_else(|| panic!("{path} does not define HOME for a non-login root shell"));
+        let toolchain = lines
+            .iter()
+            .position(|line| {
+                let line = line.trim_start();
+                !line.starts_with('#') && (line.contains("cargo ") || line.contains("rustup "))
+            })
+            .unwrap_or_else(|| panic!("{path} does not invoke the Rust toolchain"));
+        assert!(
+            root_guard < home_default && home_default < toolchain,
+            "{path} must validate root, default HOME, then invoke rustup/cargo"
+        );
+    }
+}
+
+#[test]
 fn production_deploy_detaches_the_legacy_control_volume_after_plan_and_before_apply() {
     let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
     let plan = workflow

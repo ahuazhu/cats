@@ -56,6 +56,12 @@ trap 'exit 143' TERM
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 [[ $(uname -m) == x86_64 ]] || { echo "x86_64 is required" >&2; exit 1; }
 command -v debootstrap >/dev/null || { echo "debootstrap is required" >&2; exit 1; }
+
+# The production installer invokes this through non-login SSM/cloud-init
+# shells, which are allowed to omit HOME. This builder is root-only, and both
+# rustup and cargo require a stable home before any toolchain command runs.
+export HOME="${HOME:-/root}"
+
 case "$GUEST_INIT_MODE" in
   systemd)
     PRIMARY_INIT=/sbin/init
