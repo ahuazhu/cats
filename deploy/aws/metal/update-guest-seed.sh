@@ -79,6 +79,14 @@ for unit in "${units[@]}"; do
     0100644
 done
 
+# Older seeds were built from a shell that could inherit umask 077. APT drops
+# resolver work to `_apt`, so a 0600 resolv.conf makes package installation look
+# like a transient DNS outage even though the Guest network is healthy. Repair
+# the installed seed on every worker release as well as fixing future builds.
+debugfs -w \
+  -R "set_inode_field /etc/resolv.conf mode 0100644" \
+  "$staged_seed" >/dev/null
+
 mount_unit=/etc/systemd/system/sysinit.target.wants/cats-mount-propagation.service
 debugfs -w -R "rm $mount_unit" "$staged_seed" >/dev/null 2>&1 || true
 debugfs -w \

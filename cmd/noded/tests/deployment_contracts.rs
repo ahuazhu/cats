@@ -68,6 +68,7 @@ fn guest_image_installs_real_systemd_units_with_early_agent_readiness() {
     let builder = read_workspace_file("deploy/metal/build-guest-image.sh");
     for required in [
         "GUEST_INIT_MODE=${GUEST_INIT_MODE:-systemd}",
+        "umask 022",
         "PRIMARY_INIT=/sbin/init",
         "FALLBACK_INIT=/usr/bin/cats-init",
         "mount --make-rprivate /",
@@ -152,6 +153,45 @@ fn guest_image_installs_real_systemd_units_with_early_agent_readiness() {
             );
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn guest_image_resolver_is_readable_under_a_restrictive_caller_umask() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let builder = read_workspace_file("deploy/metal/build-guest-image.sh");
+    let resolver_section = builder
+        .split_once("# Keep DNS independent")
+        .and_then(|(_, rest)| rest.split_once("# Keep generic Ubuntu background work"))
+        .map(|(section, _)| section)
+        .expect("Guest resolver build section");
+
+    let temp = tempfile::tempdir().expect("temporary Guest root fixture");
+    std::fs::create_dir_all(temp.path().join("etc")).expect("create Guest etc directory");
+    let output = std::process::Command::new("sh")
+        .args(["-eu", "-c"])
+        .arg(format!(
+            "umask 077\n# Keep DNS independent{resolver_section}"
+        ))
+        .env("RF", temp.path())
+        .output()
+        .expect("run Guest resolver build section");
+    assert!(
+        output.status.success(),
+        "Guest resolver build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mode = std::fs::metadata(temp.path().join("etc/resolv.conf"))
+        .expect("stat Guest resolver")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o644,
+        "unprivileged Guest programs such as APT's _apt worker must be able to read resolv.conf"
+    );
 }
 
 #[test]
@@ -392,6 +432,14 @@ fn worker_release_atomically_updates_the_cloud_hypervisor_guest_seed() {
     }
     std::fs::write(old_root.join("usr/bin/cats-guest-agent"), b"old-agent")
         .expect("write old guest agent");
+    std::fs::write(old_root.join("etc/resolv.conf"), b"nameserver 1.1.1.1\n")
+        .expect("write restrictive Guest resolver");
+    let mut resolver_permissions = std::fs::metadata(old_root.join("etc/resolv.conf"))
+        .expect("read Guest resolver metadata")
+        .permissions();
+    resolver_permissions.set_mode(0o600);
+    std::fs::set_permissions(old_root.join("etc/resolv.conf"), resolver_permissions)
+        .expect("make Guest resolver restrictive");
 
     let seed = temp.path().join("rootfs.ext4");
     let seed_file = std::fs::File::create(&seed).expect("create seed image");
@@ -446,6 +494,18 @@ fn worker_release_atomically_updates_the_cloud_hypervisor_guest_seed() {
     assert_eq!(
         std::fs::read(&dumped_agent).expect("read dumped guest agent"),
         b"new-agent"
+    );
+
+    let resolver_stat = Command::new("debugfs")
+        .args(["-R", "stat /etc/resolv.conf"])
+        .arg(&seed)
+        .output()
+        .expect("stat updated Guest resolver");
+    let resolver_stat_output = String::from_utf8_lossy(&resolver_stat.stdout);
+    assert!(
+        resolver_stat.status.success() && resolver_stat_output.contains("Mode:  0644"),
+        "Guest resolver mode is wrong: stdout={resolver_stat_output:?}, stderr={:?}",
+        String::from_utf8_lossy(&resolver_stat.stderr)
     );
 
     let stat = Command::new("debugfs")
