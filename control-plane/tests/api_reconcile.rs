@@ -450,7 +450,9 @@ impl Ctx {
         Self::new_with_auto_tier(Default::default(), 200).await
     }
 
-    async fn new_for_handoff() -> Self {
+    /// Keep tests that deliberately stall lifecycle work isolated from the
+    /// independent short-lease node-loss behavior covered elsewhere.
+    async fn new_with_stable_node_lease() -> Self {
         Self::new_with_options(Default::default(), 200, 30_000).await
     }
 
@@ -1300,7 +1302,7 @@ fn assert_one_applied_lifecycle_job(node: &StubNode, action: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconciler_handoff_replays_persisted_warming_success_once() {
-    let ctx = Ctx::new_for_handoff().await;
+    let ctx = Ctx::new_with_stable_node_lease().await;
     let node = start_stub_node(&ctx.cp, "node_warm_handoff").await;
     let created = ctx.create_cat("handoff-warm", None).await;
     ctx.wait_observed("handoff-warm", ObservedState::Running)
@@ -1357,7 +1359,7 @@ async fn reconciler_handoff_replays_persisted_warming_success_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconciler_handoff_replays_persisted_stopping_success_once() {
-    let ctx = Ctx::new_for_handoff().await;
+    let ctx = Ctx::new_with_stable_node_lease().await;
     let node = start_stub_node(&ctx.cp, "node_stop_handoff").await;
     let created = ctx.create_cat("handoff-stop", None).await;
     let running = ctx
@@ -1410,7 +1412,7 @@ async fn reconciler_handoff_replays_persisted_stopping_success_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconciler_handoff_failed_warm_replay_restores_suspended_source() {
-    let ctx = Ctx::new_for_handoff().await;
+    let ctx = Ctx::new_with_stable_node_lease().await;
     let node = start_stub_node(&ctx.cp, "node_warm_failure_handoff").await;
     let created = ctx.create_cat("handoff-warm-failure", None).await;
     ctx.wait_observed("handoff-warm-failure", ObservedState::Running)
@@ -1474,7 +1476,7 @@ async fn reconciler_handoff_failed_warm_replay_restores_suspended_source() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconciler_handoff_failed_stop_replay_restores_running_source() {
-    let ctx = Ctx::new_for_handoff().await;
+    let ctx = Ctx::new_with_stable_node_lease().await;
     let node = start_stub_node(&ctx.cp, "node_stop_failure_handoff").await;
     let created = ctx.create_cat("handoff-stop-failure", None).await;
     let running = ctx
@@ -1535,7 +1537,7 @@ async fn reconciler_handoff_failed_stop_replay_restores_running_source() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconciler_handoff_finishes_a_converged_operation_without_replaying_node_work() {
-    let ctx = Ctx::new_for_handoff().await;
+    let ctx = Ctx::new_with_stable_node_lease().await;
     let node = start_stub_node(&ctx.cp, "node_converged_operation_handoff").await;
     let created = ctx.create_cat("handoff-converged-operation", None).await;
     let running = ctx
@@ -1666,7 +1668,7 @@ async fn lifecycle_stop_start_suspend_resume() {
 
 #[tokio::test]
 async fn failed_mandatory_stop_drain_retains_source_until_retry_succeeds() {
-    let ctx = Ctx::new().await;
+    let ctx = Ctx::new_with_stable_node_lease().await;
     let node = start_stub_node(&ctx.cp, "node_a").await;
     ctx.create_cat("drain-safe", None).await;
     let running = ctx
@@ -1706,7 +1708,7 @@ async fn failed_mandatory_stop_drain_retains_source_until_retry_succeeds() {
 
 #[tokio::test]
 async fn failed_warm_drain_keeps_the_host_bound_source_for_retry() {
-    let ctx = Ctx::new().await;
+    let ctx = Ctx::new_with_stable_node_lease().await;
     let node = start_stub_node(&ctx.cp, "node_a").await;
     ctx.create_cat("warm-safe", None).await;
     ctx.wait_observed("warm-safe", ObservedState::Running).await;
@@ -2386,7 +2388,7 @@ async fn control_plane_startup_grace_preserves_a_reconnecting_host_bound_cat() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_warm_after_physical_completion_keeps_the_durable_replay_boundary() {
-    let ctx = Ctx::new().await;
+    let ctx = Ctx::new_with_stable_node_lease().await;
     let node = start_stub_node(&ctx.cp, "node_warm_post_completion_failure").await;
     let created = ctx.create_cat("warm-post-completion-failure", None).await;
     ctx.wait_observed("warm-post-completion-failure", ObservedState::Running)
@@ -2439,7 +2441,7 @@ async fn failed_warm_after_physical_completion_keeps_the_durable_replay_boundary
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_stop_after_physical_completion_keeps_drain_fail_closed() {
-    let ctx = Ctx::new().await;
+    let ctx = Ctx::new_with_stable_node_lease().await;
     let node = start_stub_node(&ctx.cp, "node_stop_post_completion_failure").await;
     let created = ctx.create_cat("stop-post-completion-failure", None).await;
     let running = ctx
@@ -3899,7 +3901,7 @@ async fn a_running_claim_missing_from_the_inventory_still_holds_the_node_lost() 
 /// `exec` on an unrelated Cat went from milliseconds to over a minute.
 #[tokio::test]
 async fn a_persistently_failing_stop_backs_off_instead_of_spinning() {
-    let ctx = Ctx::new().await;
+    let ctx = Ctx::new_with_stable_node_lease().await;
     let node = start_stub_node(&ctx.cp, "node_a").await;
     ctx.create_cat("wedged", None).await;
     let cat = ctx.wait_observed("wedged", ObservedState::Running).await;
@@ -4197,7 +4199,7 @@ async fn a_drain_stops_agent_reported_orphans_before_cordoning() {
 /// the injected recovery below stands in for it.
 #[tokio::test]
 async fn a_drain_with_an_unstoppable_orphan_stays_draining_and_backs_off() {
-    let ctx = Ctx::new().await;
+    let ctx = Ctx::new_with_stable_node_lease().await;
     let node = start_stub_node(&ctx.cp, "node_a").await;
     node.fail_jobs_remaining
         .lock()
