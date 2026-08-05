@@ -365,6 +365,67 @@ fn worker_release_refuses_active_cat_cgroups() {
 #[cfg(unix)]
 #[test]
 fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
+    struct RuntimeChildren(Vec<std::process::Child>);
+
+    impl Drop for RuntimeChildren {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    fn wait_until_process_table_has(expected: &[(u32, &Path)]) -> std::result::Result<(), String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let output = std::process::Command::new("ps")
+                .args(["-A", "-o", "pid=", "-o", "args="])
+                .output()
+                .map_err(|error| format!("snapshot process table: {error}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "ps failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            let process_table = String::from_utf8_lossy(&output.stdout).into_owned();
+            let all_visible = expected.iter().all(|(expected_pid, expected_argv0)| {
+                process_table.lines().any(|line| {
+                    let mut fields = line.split_whitespace();
+                    let pid = fields.next().and_then(|value| value.parse::<u32>().ok());
+                    let argv0 = fields.next();
+                    pid == Some(*expected_pid) && argv0 == expected_argv0.to_str()
+                })
+            });
+            if all_visible {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                let visibility = expected
+                    .iter()
+                    .map(|(pid, argv0)| {
+                        let matching_line = process_table.lines().find(|line| {
+                            line.split_whitespace()
+                                .next()
+                                .and_then(|value| value.parse::<u32>().ok())
+                                == Some(*pid)
+                        });
+                        format!(
+                            "pid={pid} argv0={} observed={matching_line:?}",
+                            argv0.display()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(format!(
+                    "runtime fixtures did not become observable before the deadline: {visibility}"
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     let temp = tempfile::tempdir().expect("temporary runtime fixture");
     let metering_root = temp.path().join("metering");
     std::fs::create_dir_all(&metering_root).expect("create empty metering fixture");
@@ -377,16 +438,25 @@ fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
     // The guard must catch both by their full argv[0] path (issue #98).
     let blockd_bin = bin_root.join("cats-blockd");
     let vmm_bin = bin_root.join("cloud-hypervisor");
-    std::fs::copy("/bin/sleep", &blockd_bin).expect("stage fake blockd");
-    std::fs::copy("/bin/sleep", &vmm_bin).expect("stage fake vmm");
-    let mut blockd = std::process::Command::new(&blockd_bin)
-        .arg("300")
-        .spawn()
-        .expect("spawn fake blockd");
-    let mut vmm = std::process::Command::new(&vmm_bin)
-        .arg("300")
-        .spawn()
-        .expect("spawn fake vmm");
+    std::os::unix::fs::symlink("/bin/sleep", &blockd_bin).expect("stage fake blockd");
+    std::os::unix::fs::symlink("/bin/sleep", &vmm_bin).expect("stage fake vmm");
+    let mut children = RuntimeChildren(Vec::new());
+    children.0.push(
+        std::process::Command::new(&blockd_bin)
+            .arg("300")
+            .spawn()
+            .expect("spawn fake blockd"),
+    );
+    children.0.push(
+        std::process::Command::new(&vmm_bin)
+            .arg("300")
+            .spawn()
+            .expect("spawn fake vmm"),
+    );
+    let blockd_pid = children.0[0].id();
+    let vmm_pid = children.0[1].id();
+    wait_until_process_table_has(&[(blockd_pid, &blockd_bin), (vmm_pid, &vmm_bin)])
+        .expect("runtime fixtures must be visible before exercising the guard");
 
     let guard = workspace_root().join("deploy/aws/metal/require-idle-worker.sh");
     let refused = std::process::Command::new(&guard)
@@ -394,13 +464,6 @@ fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
         .arg(&bin_root)
         .output()
         .expect("run guard against live runtime binaries");
-
-    let blockd_pid = blockd.id();
-    let vmm_pid = vmm.id();
-    let _ = blockd.kill();
-    let _ = blockd.wait();
-    let _ = vmm.kill();
-    let _ = vmm.wait();
 
     assert!(
         !refused.status.success(),
@@ -413,6 +476,8 @@ fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
             && stderr.contains("unpublished writes"),
         "guard must name both runtime pids and the journal hazard: {stderr}"
     );
+
+    drop(children);
 
     let idle = std::process::Command::new(&guard)
         .arg(&metering_root)
