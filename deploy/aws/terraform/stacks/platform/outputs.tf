@@ -82,6 +82,11 @@ output "github_release_role_arn" {
   value       = module.github_release.release_role_arn
 }
 
+output "github_qualification_worker_role_arn" {
+  description = "Set as Q124_AWS_ROLE_ARN only for the bounded issue #124 qualification window."
+  value       = one(aws_iam_role.github_qualification_worker[*].arn)
+}
+
 output "chunkstore_bucket_name" {
   value = aws_s3_bucket.chunkstore.id
 }

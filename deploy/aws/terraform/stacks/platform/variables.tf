@@ -295,3 +295,20 @@ variable "metal_worker_root_volume_gib" {
   type        = number
   default     = 200
 }
+
+variable "github_qualification_worker_enabled" {
+  description = "Opt in to the main-only issue #124 temporary worker role. Keep false outside the bounded qualification window."
+  type        = bool
+  default     = false
+}
+
+variable "github_qualification_artifact_bucket_arn" {
+  description = "Existing worker artifact bucket ARN. Required when github_qualification_worker_enabled is true; the role receives only worker/qualification-124/*."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = !var.github_qualification_worker_enabled || can(regex("^arn:[^:]+:s3:::[a-z0-9][a-z0-9.-]+$", var.github_qualification_artifact_bucket_arn))
+    error_message = "Enablement requires an S3 bucket ARN for the worker artifact bucket."
+  }
+}
