@@ -77,6 +77,10 @@ jobs:
         with:
           context: .
           file: deploy/aws/Dockerfile.control-plane
+          # The Dockerfile's last stage is the credential refresher, and buildx
+          # builds the last stage when no target is named. Without this line the
+          # "control-plane" image ships the refresher ENTRYPOINT (issue #117).
+          target: runtime
           platforms: linux/amd64
           push: true
           tags: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}

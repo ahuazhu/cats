@@ -196,6 +196,11 @@ resource "kubernetes_deployment_v1" "control_plane" {
           image             = var.control_plane_image
           image_pull_policy = "IfNotPresent"
 
+          # Pin the binary rather than trusting the image ENTRYPOINT, exactly as
+          # the gatewayd container below does: a mis-targeted image build must
+          # not get to choose what runs as the control plane (issue #117).
+          command = ["/usr/local/bin/cats-controld"]
+
           args = [
             "--listen",
             "0.0.0.0:7300",
