@@ -15,10 +15,66 @@ on:
         description: "Type the confirmation required by the selected mode"
         required: true
         type: string
+      coordination_mode:
+        description: "Optional issue-124 lifecycle lock mode; leave disabled for the ordinary HA drill"
+        required: false
+        default: "disabled"
+        type: string
+      coordination_issue:
+        description: "Must be 124 when lifecycle coordination is enabled"
+        required: false
+        default: ""
+        type: string
+      coordination_token:
+        description: "Unique non-secret q124 handoff token"
+        required: false
+        default: ""
+        type: string
+      coordination_workspace_id:
+        description: "Exact qualification workspace ID"
+        required: false
+        default: ""
+        type: string
+      coordination_cat_id:
+        description: "Exact qualification Cat ID"
+        required: false
+        default: ""
+        type: string
+      coordination_cat_name:
+        description: "Exact q124 qualification Cat name"
+        required: false
+        default: ""
+        type: string
+      coordination_generation:
+        description: "Exact lifecycle resource generation"
+        required: false
+        default: ""
+        type: string
+      coordination_operation_kind:
+        description: "Exact lifecycle Operation kind"
+        required: false
+        default: ""
+        type: string
+      coordination_desired_state:
+        description: "Expected desired state at the handoff"
+        required: false
+        default: ""
+        type: string
+      coordination_transitional_state:
+        description: "Expected persisted transitional state"
+        required: false
+        default: ""
+        type: string
+      coordination_final_state:
+        description: "Expected final state after takeover"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
   id-token: write
+  issues: write
 
 concurrency:
   group: production-control-plane-ha-drill
@@ -41,12 +97,57 @@ jobs:
         env:
           MODE: ${{ inputs.mode }}
           CONFIRMATION: ${{ inputs.confirmation }}
+          COORDINATION_MODE: ${{ inputs.coordination_mode }}
+          COORDINATION_ISSUE: ${{ inputs.coordination_issue }}
+          COORDINATION_TOKEN: ${{ inputs.coordination_token }}
+          COORDINATION_WORKSPACE_ID: ${{ inputs.coordination_workspace_id }}
+          COORDINATION_CAT_ID: ${{ inputs.coordination_cat_id }}
+          COORDINATION_CAT_NAME: ${{ inputs.coordination_cat_name }}
+          COORDINATION_GENERATION: ${{ inputs.coordination_generation }}
+          COORDINATION_OPERATION_KIND: ${{ inputs.coordination_operation_kind }}
+          COORDINATION_DESIRED_STATE: ${{ inputs.coordination_desired_state }}
+          COORDINATION_TRANSITIONAL_STATE: ${{ inputs.coordination_transitional_state }}
+          COORDINATION_FINAL_STATE: ${{ inputs.coordination_final_state }}
         run: |
           set -euo pipefail
           case "$MODE:$CONFIRMATION" in
             diagnose:READ_ONLY_CONTROL_PLANE_LEADER_DIAGNOSTIC|disrupt:DELETE_ONE_CATS_CONTROLD_LEADER) ;;
             *)
               echo "::error::confirmation does not match mode $MODE"
+              exit 1
+              ;;
+          esac
+          if [[ "$COORDINATION_MODE" == "disabled" ]]; then
+            if [[ -n "$COORDINATION_ISSUE$COORDINATION_TOKEN$COORDINATION_WORKSPACE_ID$COORDINATION_CAT_ID$COORDINATION_CAT_NAME$COORDINATION_GENERATION$COORDINATION_OPERATION_KIND$COORDINATION_DESIRED_STATE$COORDINATION_TRANSITIONAL_STATE$COORDINATION_FINAL_STATE" ]]; then
+              echo "::error::lifecycle coordination fields must be empty when coordination_mode=disabled"
+              exit 1
+            fi
+            exit 0
+          fi
+          if [[ "$MODE" != "disrupt" ]]; then
+            echo "::error::lifecycle coordination is available only in disrupt mode"
+            exit 1
+          fi
+          if [[ "$COORDINATION_MODE" != "LOCK_Q124_LIFECYCLE" ]]; then
+            echo "::error::coordination_mode must be disabled or LOCK_Q124_LIFECYCLE"
+            exit 1
+          fi
+          [[ "$COORDINATION_ISSUE" == "124" ]] || {
+            echo "::error::lifecycle coordination is restricted to issue 124"
+            exit 1
+          }
+          [[ "$COORDINATION_WORKSPACE_ID" == "ws_788c5bfc3931" ]] || {
+            echo "::error::lifecycle coordination is restricted to the qualification workspace"
+            exit 1
+          }
+          [[ "$COORDINATION_TOKEN" =~ ^q124-[a-z0-9-]{8,75}$ ]]
+          [[ "$COORDINATION_CAT_ID" =~ ^cat_[a-f0-9]{12}$ ]]
+          [[ "$COORDINATION_CAT_NAME" =~ ^q124-ha-[a-z0-9-]+$ ]]
+          [[ "$COORDINATION_GENERATION" =~ ^[1-9][0-9]*$ ]]
+          case "$COORDINATION_OPERATION_KIND:$COORDINATION_DESIRED_STATE:$COORDINATION_TRANSITIONAL_STATE:$COORDINATION_FINAL_STATE" in
+            cat.start:running:starting:running|cat.resume:running:starting:running|cat.suspend:suspended:suspending:suspended|cat.warm:warm:warming:warm|cat.stop:cold:stopping:cold) ;;
+            *)
+              echo "::error::invalid lifecycle coordination transition tuple"
               exit 1
               ;;
           esac
@@ -171,11 +272,76 @@ jobs:
         shell: bash
         env:
           KUBECONFIG: ${{ runner.temp }}/kubeconfig
+          GH_TOKEN: ${{ github.token }}
+          COORDINATION_MODE: ${{ inputs.coordination_mode }}
+          COORDINATION_ISSUE: ${{ inputs.coordination_issue }}
+          COORDINATION_TOKEN: ${{ inputs.coordination_token }}
+          COORDINATION_WORKSPACE_ID: ${{ inputs.coordination_workspace_id }}
+          COORDINATION_CAT_ID: ${{ inputs.coordination_cat_id }}
+          COORDINATION_CAT_NAME: ${{ inputs.coordination_cat_name }}
+          COORDINATION_GENERATION: ${{ inputs.coordination_generation }}
+          COORDINATION_OPERATION_KIND: ${{ inputs.coordination_operation_kind }}
+          COORDINATION_DESIRED_STATE: ${{ inputs.coordination_desired_state }}
+          COORDINATION_TRANSITIONAL_STATE: ${{ inputs.coordination_transitional_state }}
+          COORDINATION_FINAL_STATE: ${{ inputs.coordination_final_state }}
         run: |
           set -euo pipefail
           kube=(kubectl --namespace cats)
           failures="$RUNNER_TEMP/control-ha-probe-failures"
           : > "$failures"
+          probe_pid=""
+          coordinator=""
+          coordinator_uid=""
+          locked_operation=""
+          locked_at=""
+          deletion_at=""
+
+          cleanup_probe() {
+            if [[ -n "$probe_pid" ]] && kill -0 "$probe_pid" 2>/dev/null; then
+              kill "$probe_pid" 2>/dev/null || true
+            fi
+            if [[ -n "$probe_pid" ]]; then
+              wait "$probe_pid" 2>/dev/null || true
+              probe_pid=""
+            fi
+          }
+
+          cleanup_coordinator() {
+            [[ -n "$coordinator" ]] || return 0
+            set +e
+            observed_uid="$("${kube[@]}" get pod "$coordinator" --output=jsonpath='{.metadata.uid}' 2>&1)"
+            get_status=$?
+            set -e
+            if (( get_status != 0 )); then
+              if [[ "$observed_uid" == *"NotFound"* || "$observed_uid" == *"not found"* ]]; then
+                coordinator=""
+                return 0
+              fi
+              printf '%s\n' "$observed_uid" >&2
+              return "$get_status"
+            fi
+            if [[ -z "$coordinator_uid" || "$observed_uid" != "$coordinator_uid" ]]; then
+              echo "::error::refusing to delete lifecycle coordinator with an unverified UID"
+              return 1
+            fi
+            "${kube[@]}" delete pod "$coordinator" --wait=true --timeout=2m >/dev/null
+            coordinator=""
+          }
+
+          cleanup() {
+            rc=$?
+            trap - EXIT
+            set +e
+            cleanup_probe
+            cleanup_coordinator
+            cleanup_status=$?
+            set -e
+            if (( rc == 0 && cleanup_status != 0 )); then
+              rc=$cleanup_status
+            fi
+            exit "$rc"
+          }
+          trap cleanup EXIT
 
           # Resolve the lock owner immediately before the disruption. Keeping
           # selection and deletion in one step prevents a queued Actions step
@@ -204,9 +370,182 @@ jobs:
           echo "Reconciler leader before disruption: $target ($owner_address_kind source)"
           echo "target=$target" >> "$GITHUB_OUTPUT"
 
-          # Re-resolve the backend at the last safe boundary. Natural
-          # leadership movement while this queued job was preparing must not
-          # turn the drill into deletion of a standby.
+          if [[ "$COORDINATION_MODE" == "LOCK_Q124_LIFECYCLE" ]]; then
+            coordinator="control-ha-lifecycle-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            if existing="$("${kube[@]}" get pod "$coordinator" --output=name 2>&1)"; then
+              echo "::error::refusing to reuse existing lifecycle coordinator $existing"
+              exit 1
+            elif [[ "$existing" != *"NotFound"* && "$existing" != *"not found"* ]]; then
+              printf '%s\n' "$existing"
+              exit 1
+            fi
+
+            # The coordinator starts polling before READY is published. Once it
+            # sees exactly one matching active Operation and the persisted Cat
+            # transition, SELECT ... FOR UPDATE holds the Cat row for a bounded
+            # 90 seconds. The old reconciler can finish physical node work, but
+            # cannot settle the lifecycle marker before its Pod is deleted.
+            coordinator_command="$(cat <<'COORDINATOR'
+            case "$CATS_HA_TOKEN" in q124-*) ;; *) exit 64 ;; esac
+            case "$CATS_HA_CAT_ID" in cat_*) ;; *) exit 64 ;; esac
+            deadline=$(( $(date +%s) + 60 ))
+            locked=false
+            while (( $(date +%s) < deadline )); do
+              sql="$(cat <<SQL
+            DO \$cats_ha\$
+            DECLARE locked_operation TEXT;
+            BEGIN
+              SELECT o.id INTO STRICT locked_operation
+                FROM cats AS c
+                JOIN operations AS o
+                  ON o.resource_id = c.id
+                 AND o.resource_generation = c.generation
+               WHERE c.workspace_id = '${CATS_HA_WORKSPACE_ID}'
+                 AND c.id = '${CATS_HA_CAT_ID}'
+                 AND c.name = '${CATS_HA_CAT_NAME}'
+                 AND c.generation = ${CATS_HA_GENERATION}
+                 AND c.desired_state = '${CATS_HA_DESIRED_STATE}'
+                 AND c.observed_state = '${CATS_HA_TRANSITIONAL_STATE}'
+                 AND o.kind = '${CATS_HA_OPERATION_KIND}'
+                 AND o.phase IN ('pending', 'running')
+                 FOR UPDATE OF c;
+              RAISE NOTICE 'CATS_HA_LIFECYCLE_LOCKED token=${CATS_HA_TOKEN} cat=${CATS_HA_CAT_ID} generation=${CATS_HA_GENERATION} operation=% locked_at=%',
+                locked_operation,
+                to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"');
+              PERFORM pg_sleep(90);
+            END
+            \$cats_ha\$;
+          SQL
+            )"
+              if psql "$CATS_POSTGRES_URL" -v ON_ERROR_STOP=1 -q -c "$sql"; then
+                locked=true
+                break
+              fi
+              sleep 0.2
+            done
+            if [[ "$locked" != true ]]; then
+              echo "CATS_HA_LIFECYCLE_LOCK_TIMEOUT token=$CATS_HA_TOKEN" >&2
+              exit 124
+            fi
+            locked_operation="$(psql "$CATS_POSTGRES_URL" -v ON_ERROR_STOP=1 -tA -c "
+              SELECT o.id
+                FROM cats AS c
+                JOIN operations AS o
+                  ON o.resource_id = c.id
+                 AND o.resource_generation = c.generation
+               WHERE c.workspace_id = '${CATS_HA_WORKSPACE_ID}'
+                 AND c.id = '${CATS_HA_CAT_ID}'
+                 AND c.name = '${CATS_HA_CAT_NAME}'
+                 AND c.generation = ${CATS_HA_GENERATION}
+                 AND o.kind = '${CATS_HA_OPERATION_KIND}'")"
+            case "$locked_operation" in op_*) ;; *) exit 1 ;; esac
+            released_at="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+            echo "CATS_HA_LIFECYCLE_LOCK_RELEASED token=$CATS_HA_TOKEN operation=$locked_operation released_at=$released_at"
+            converge_deadline=$(( $(date +%s) + 120 ))
+            while (( $(date +%s) < converge_deadline )); do
+              converged="$(psql "$CATS_POSTGRES_URL" -v ON_ERROR_STOP=1 -tA -c "
+                SELECT o.id
+                  FROM cats AS c
+                  JOIN operations AS o
+                    ON o.resource_id = c.id
+                   AND o.resource_generation = c.generation
+                 WHERE c.workspace_id = '${CATS_HA_WORKSPACE_ID}'
+                   AND c.id = '${CATS_HA_CAT_ID}'
+                   AND c.name = '${CATS_HA_CAT_NAME}'
+                   AND c.generation = ${CATS_HA_GENERATION}
+                   AND c.desired_state = '${CATS_HA_FINAL_STATE}'
+                   AND c.observed_state = '${CATS_HA_FINAL_STATE}'
+                   AND o.id = '${locked_operation}'
+                   AND o.kind = '${CATS_HA_OPERATION_KIND}'
+                   AND o.phase = 'succeeded'")"
+              if [[ "$converged" == "$locked_operation" ]]; then
+                echo "CATS_HA_EXACT_OPERATION_CONVERGED token=$CATS_HA_TOKEN operation=$locked_operation generation=$CATS_HA_GENERATION final_state=$CATS_HA_FINAL_STATE"
+                exit 0
+              fi
+              sleep 0.25
+            done
+            echo "CATS_HA_EXACT_OPERATION_CONVERGENCE_TIMEOUT token=$CATS_HA_TOKEN operation=$locked_operation" >&2
+            exit 124
+          COORDINATOR
+            )"
+            overrides="$(
+              jq -cn \
+                --arg command "$coordinator_command" \
+                --arg token "$COORDINATION_TOKEN" \
+                --arg workspace "$COORDINATION_WORKSPACE_ID" \
+                --arg cat_id "$COORDINATION_CAT_ID" \
+                --arg cat_name "$COORDINATION_CAT_NAME" \
+                --arg generation "$COORDINATION_GENERATION" \
+                --arg operation_kind "$COORDINATION_OPERATION_KIND" \
+                --arg desired "$COORDINATION_DESIRED_STATE" \
+                --arg transitional "$COORDINATION_TRANSITIONAL_STATE" \
+                --arg final "$COORDINATION_FINAL_STATE" '
+                {
+                  spec: {
+                    activeDeadlineSeconds: 300,
+                    terminationGracePeriodSeconds: 5,
+                    restartPolicy: "Never",
+                    containers: [{
+                      name: "psql",
+                      image: "postgres:16",
+                      command: ["sh", "-ceu", $command],
+                      env: [
+                        {name:"CATS_HA_TOKEN",value:$token},
+                        {name:"CATS_HA_WORKSPACE_ID",value:$workspace},
+                        {name:"CATS_HA_CAT_ID",value:$cat_id},
+                        {name:"CATS_HA_CAT_NAME",value:$cat_name},
+                        {name:"CATS_HA_GENERATION",value:$generation},
+                        {name:"CATS_HA_OPERATION_KIND",value:$operation_kind},
+                        {name:"CATS_HA_DESIRED_STATE",value:$desired},
+                        {name:"CATS_HA_TRANSITIONAL_STATE",value:$transitional},
+                        {name:"CATS_HA_FINAL_STATE",value:$final}
+                      ],
+                      envFrom: [{secretRef:{name:"cats-runtime"}}]
+                    }]
+                  }
+                }
+              '
+            )"
+            "${kube[@]}" run "$coordinator" \
+              --restart=Never \
+              --image=postgres:16 \
+              --overrides="$overrides" >/dev/null
+            coordinator_uid="$("${kube[@]}" get pod "$coordinator" --output=jsonpath='{.metadata.uid}')"
+            [[ -n "$coordinator_uid" ]]
+            "${kube[@]}" wait --for=condition=Ready "pod/$coordinator" --timeout=2m >/dev/null
+            ready_body="CATS_HA_COORD_READY token=$COORDINATION_TOKEN run_id=$GITHUB_RUN_ID cat=$COORDINATION_CAT_ID generation=$COORDINATION_GENERATION"
+            gh api "repos/$GITHUB_REPOSITORY/issues/$COORDINATION_ISSUE/comments" \
+              --method POST \
+              --field body="$ready_body" >/dev/null
+            echo "$ready_body"
+
+            lock_deadline=$((SECONDS + 150))
+            while :; do
+              coordinator_logs="$("${kube[@]}" logs "$coordinator" --container=psql 2>&1 || true)"
+              locked_line="$(awk -v token="$COORDINATION_TOKEN" '
+                index($0,"CATS_HA_LIFECYCLE_LOCKED token=" token " ") {line=$0; count++}
+                END {if (count == 1) print line}
+              ' <<<"$coordinator_logs")"
+              if [[ -n "$locked_line" ]]; then
+                break
+              fi
+              phase="$("${kube[@]}" get pod "$coordinator" --output=jsonpath='{.status.phase}')"
+              if [[ "$phase" == "Failed" || "$phase" == "Succeeded" || SECONDS -ge lock_deadline ]]; then
+                printf '%s\n' "$coordinator_logs"
+                echo "::error::lifecycle coordinator failed before acquiring the exact transition lock"
+                exit 1
+              fi
+              sleep 0.25
+            done
+            locked_operation="$(sed -nE 's/.* operation=(op_[a-f0-9]+) locked_at=.*/\1/p' <<<"$locked_line")"
+            locked_at="$(sed -nE 's/.* locked_at=([^ ]+).*/\1/p' <<<"$locked_line")"
+            [[ "$locked_operation" =~ ^op_[a-f0-9]{12}$ && -n "$locked_at" ]]
+            echo "Lifecycle coordinator locked token=$COORDINATION_TOKEN operation=$locked_operation locked_at=$locked_at"
+          fi
+
+          # Re-resolve the backend only after the optional lifecycle lock is
+          # held. Natural leadership movement while coordination was waiting
+          # must not turn the drill into eviction of a standby.
           confirm_pods_file="$RUNNER_TEMP/control-ha-pods-confirm.json"
           "${kube[@]}" get pods \
             --selector app.kubernetes.io/name=cats-controld \
@@ -246,13 +585,6 @@ jobs:
 
           probe_public_api &
           probe_pid=$!
-          cleanup_probe() {
-            if kill -0 "$probe_pid" 2>/dev/null; then
-              kill "$probe_pid" 2>/dev/null || true
-            fi
-            wait "$probe_pid" 2>/dev/null || true
-          }
-          trap cleanup_probe EXIT
 
           observed_uid="$("${kube[@]}" get pod "$target" \
             --output=jsonpath='{.metadata.uid}')"
@@ -260,18 +592,78 @@ jobs:
             echo "::error::the selected leader changed before deletion"
             exit 1
           fi
+          if [[ "$COORDINATION_MODE" == "LOCK_Q124_LIFECYCLE" ]]; then
+            observed_coordinator_uid="$("${kube[@]}" get pod "$coordinator" \
+              --output=jsonpath='{.metadata.uid}')"
+            coordinator_phase="$("${kube[@]}" get pod "$coordinator" \
+              --output=jsonpath='{.status.phase}')"
+            if [[ "$observed_coordinator_uid" != "$coordinator_uid" || "$coordinator_phase" != "Running" ]]; then
+              echo "::error::lifecycle coordinator lost its exact UID or lock-holding process before deletion"
+              exit 1
+            fi
+            deletion_at="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+            echo "Deleting lifecycle-locked leader: $target uid=$target_uid operation=$locked_operation deletion_at=$deletion_at"
+          fi
           deploy/aws/evict-pod-with-uid.sh cats "$target" "$target_uid"
           "${kube[@]}" wait --for=delete "pod/$target" --timeout=5m
           "${kube[@]}" rollout status deployment/cats-controld --timeout=10m
 
           wait "$probe_pid"
-          trap - EXIT
+          probe_pid=""
           if [[ -s "$failures" ]]; then
             echo "::error::the public control-plane health endpoint failed during leader replacement"
             sed -n '1,40p' "$failures"
             exit 1
           fi
           echo "All 240 public health probes succeeded during leader replacement."
+
+          if [[ "$COORDINATION_MODE" == "LOCK_Q124_LIFECYCLE" ]]; then
+            converge_deadline=$((SECONDS + 150))
+            while :; do
+              coordinator_phase="$("${kube[@]}" get pod "$coordinator" \
+                --output=jsonpath='{.status.phase}')"
+              case "$coordinator_phase" in
+                Succeeded) break ;;
+                Failed)
+                  "${kube[@]}" logs "$coordinator" --container=psql
+                  echo "::error::lifecycle coordinator failed before exact Operation convergence"
+                  exit 1
+                  ;;
+              esac
+              if (( SECONDS >= converge_deadline )); then
+                echo "::error::lifecycle coordinator did not finish within its bounded convergence wait"
+                exit 1
+              fi
+              sleep 1
+            done
+            coordinator_logs="$("${kube[@]}" logs "$coordinator" --container=psql 2>&1)"
+            release_line="$(awk -v token="$COORDINATION_TOKEN" '
+              index($0,"CATS_HA_LIFECYCLE_LOCK_RELEASED token=" token " ") {line=$0; count++}
+              END {if (count == 1) print line}
+            ' <<<"$coordinator_logs")"
+            converged_line="$(awk -v token="$COORDINATION_TOKEN" '
+              index($0,"CATS_HA_EXACT_OPERATION_CONVERGED token=" token " ") {line=$0; count++}
+              END {if (count == 1) print line}
+            ' <<<"$coordinator_logs")"
+            released_at="$(sed -nE 's/.* released_at=([^ ]+).*/\1/p' <<<"$release_line")"
+            released_operation="$(sed -nE 's/.* operation=(op_[a-f0-9]+) .*/\1/p' <<<"$release_line")"
+            converged_operation="$(sed -nE 's/.* operation=(op_[a-f0-9]+) .*/\1/p' <<<"$converged_line")"
+            if [[ -z "$released_at" || "$released_operation" != "$locked_operation" || "$converged_operation" != "$locked_operation" ]]; then
+              printf '%s\n' "$coordinator_logs"
+              echo "::error::lifecycle coordinator did not prove one exact locked and converged Operation"
+              exit 1
+            fi
+            locked_epoch="$(date --date="$locked_at" +%s%3N)"
+            deletion_epoch="$(date --date="$deletion_at" +%s%3N)"
+            released_epoch="$(date --date="$released_at" +%s%3N)"
+            if (( locked_epoch > deletion_epoch || deletion_epoch > released_epoch )); then
+              echo "::error::leader deletion was not enclosed by the lifecycle row-lock interval"
+              exit 1
+            fi
+            echo "Lifecycle coordinator released token=$COORDINATION_TOKEN operation=$locked_operation released_at=$released_at"
+            echo "Lifecycle exact operation converged token=$COORDINATION_TOKEN operation=$locked_operation generation=$COORDINATION_GENERATION final_state=$COORDINATION_FINAL_STATE"
+            cleanup_coordinator
+          fi
 
       - name: Verify replacement, node spread and reconciler takeover
         if: inputs.mode == 'disrupt'
