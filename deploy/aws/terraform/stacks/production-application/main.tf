@@ -4,7 +4,10 @@ module "cats_kubernetes" {
   control_plane_image            = var.control_plane_image
   control_plane_replicas         = var.control_plane_replicas
   gateway_image                  = var.gateway_image
+  shared_route_cache_table       = var.shared_route_cache_table
   runtime_secret_data            = var.runtime_secret_data
+  route_grant_private_key_pem    = var.route_grant_private_key_pem
+  route_grant_public_key_pem     = var.route_grant_public_key_pem
   storage_postgres_url           = var.storage_postgres_url
   storage_postgres_session_setup = var.storage_postgres_session_setup
   usage_postgres_url             = var.usage_postgres_url

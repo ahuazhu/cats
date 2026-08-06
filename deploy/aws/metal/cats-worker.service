@@ -26,6 +26,7 @@ ExecStart=/opt/cats/bin/cats-noded \
   --advertise-url $CATS_NODE_ADVERTISE_URL \
   --initially-cordoned \
   --control-plane-url $CATS_CONTROL_PLANE_URL \
+  --route-grant-public-key-file /etc/cats/route-grant-public.pem \
   --gateway-url $CATS_GATEWAY_URL \
   --state-dir /var/lib/cats/node \
   --blockd-bin /opt/cats/bin/cats-blockd \

@@ -81,6 +81,33 @@ variable "runtime_secret_data" {
   }
 }
 
+variable "route_grant_private_key_pem" {
+  description = "PKCS#8 Ed25519 private key mounted only into cats-controld for Endpoint Route Grant signing."
+  type        = string
+  sensitive   = true
+
+  validation {
+    condition = (
+      startswith(trimspace(var.route_grant_private_key_pem), "-----BEGIN PRIVATE KEY-----") &&
+      endswith(trimspace(var.route_grant_private_key_pem), "-----END PRIVATE KEY-----")
+    )
+    error_message = "route_grant_private_key_pem must be a PKCS#8 PEM private key."
+  }
+}
+
+variable "route_grant_public_key_pem" {
+  description = "Ed25519 public key derived from route_grant_private_key_pem and mounted into cats-controld for startup pair verification."
+  type        = string
+
+  validation {
+    condition = (
+      startswith(trimspace(var.route_grant_public_key_pem), "-----BEGIN PUBLIC KEY-----") &&
+      endswith(trimspace(var.route_grant_public_key_pem), "-----END PUBLIC KEY-----")
+    )
+    error_message = "route_grant_public_key_pem must be a PEM public key."
+  }
+}
+
 variable "storage_postgres_url" {
   description = "PostgreSQL URL used for ChunkStore roots, leases, and fencing."
   type        = string
@@ -279,6 +306,21 @@ variable "gateway_replicas" {
   validation {
     condition     = var.gateway_replicas >= 2 && floor(var.gateway_replicas) == var.gateway_replicas
     error_message = "gateway_replicas must be an integer of at least 2."
+  }
+}
+
+variable "shared_route_cache_table" {
+  description = "DynamoDB table that replicates short-lived signed Route Grants across Gateway replicas. Null disables it outside production."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = (
+      var.shared_route_cache_table == null ||
+      can(regex("^[A-Za-z0-9_.-]{3,255}$", var.shared_route_cache_table))
+    )
+    error_message = "shared_route_cache_table must be null or a valid DynamoDB table name."
   }
 }
 

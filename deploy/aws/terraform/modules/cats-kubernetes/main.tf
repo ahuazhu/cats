@@ -150,6 +150,35 @@ resource "kubernetes_secret_v1" "gateway_runtime" {
   data = local.gateway_secret_data
 }
 
+resource "kubernetes_service_account_v1" "gateway" {
+  metadata {
+    name      = "cats-gatewayd"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-gatewayd"
+    })
+  }
+
+  automount_service_account_token = false
+}
+
+# Separate from runtime and gateway credentials so the signing key is mounted
+# as a file only in cats-controld and can never be inherited by cats-gatewayd.
+# The matching public half lets every replica prove the pair before Ready.
+resource "kubernetes_secret_v1" "route_grant_signing" {
+  metadata {
+    name      = "cats-route-grant-signing"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels    = local.labels
+  }
+
+  type = "Opaque"
+  data = {
+    "private.pem" = var.route_grant_private_key_pem
+    "public.pem"  = var.route_grant_public_key_pem
+  }
+}
+
 resource "kubernetes_config_map_v1" "rds_ca" {
   metadata {
     name      = "cats-rds-ca"
@@ -195,8 +224,9 @@ resource "kubernetes_deployment_v1" "control_plane" {
           "app.kubernetes.io/name" = "cats-controld"
         })
         annotations = {
-          "cats.run/runtime-secret-sha256" = sha256(jsonencode(local.runtime_secret_data))
-          "cats.run/rds-ca-sha256"         = sha256(local.rds_ca_pem)
+          "cats.run/runtime-secret-sha256"  = sha256(jsonencode(local.runtime_secret_data))
+          "cats.run/route-grant-key-sha256" = sha256("${var.route_grant_private_key_pem}\n${var.route_grant_public_key_pem}")
+          "cats.run/rds-ca-sha256"          = sha256(local.rds_ca_pem)
         }
       }
 
@@ -274,6 +304,16 @@ resource "kubernetes_deployment_v1" "control_plane" {
           env {
             name  = "CATS_OCI_DEPLOY_SYNC_WAIT_MS"
             value = tostring(var.oci_deploy_sync_wait_ms)
+          }
+
+          env {
+            name  = "CATS_ROUTE_GRANT_PRIVATE_KEY_FILE"
+            value = "/etc/cats/route-grant/private.pem"
+          }
+
+          env {
+            name  = "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE"
+            value = "/etc/cats/route-grant/public.pem"
           }
 
           # All PostgreSQL clients verify RDS TLS with this CA. Their DSNs are
@@ -363,6 +403,12 @@ resource "kubernetes_deployment_v1" "control_plane" {
             mount_path = "/etc/cats/runtime"
             read_only  = true
           }
+
+          volume_mount {
+            name       = "route-grant-signing"
+            mount_path = "/etc/cats/route-grant"
+            read_only  = true
+          }
         }
 
         volume {
@@ -378,6 +424,14 @@ resource "kubernetes_deployment_v1" "control_plane" {
 
           secret {
             secret_name = kubernetes_secret_v1.runtime.metadata[0].name
+          }
+        }
+
+        volume {
+          name = "route-grant-signing"
+
+          secret {
+            secret_name = kubernetes_secret_v1.route_grant_signing.metadata[0].name
           }
         }
       }
@@ -456,6 +510,7 @@ resource "kubernetes_deployment_v1" "gateway" {
       spec {
         automount_service_account_token = false
         enable_service_links            = false
+        service_account_name            = kubernetes_service_account_v1.gateway.metadata[0].name
 
         node_selector = {
           "kubernetes.io/arch" = "amd64"
@@ -477,6 +532,24 @@ resource "kubernetes_deployment_v1" "gateway" {
           env_from {
             secret_ref {
               name = kubernetes_secret_v1.gateway_runtime.metadata[0].name
+            }
+          }
+
+          dynamic "env" {
+            for_each = var.shared_route_cache_table == null ? [] : [var.shared_route_cache_table]
+
+            content {
+              name  = "CATS_SHARED_ROUTE_CACHE_TABLE"
+              value = env.value
+            }
+          }
+
+          dynamic "env" {
+            for_each = var.shared_route_cache_table == null ? [] : [var.usage_aws_region]
+
+            content {
+              name  = "AWS_REGION"
+              value = env.value
             }
           }
 
@@ -528,6 +601,14 @@ resource "kubernetes_deployment_v1" "gateway" {
   }
 
   wait_for_rollout = true
+
+  # Route Grants are additive in the control-plane response, so old Gateways
+  # tolerate a new control plane. The reverse is not true: a new Gateway fails
+  # closed when an old replica returns an active Running route without a grant.
+  # Terraform may otherwise update independent Deployments concurrently. Wait
+  # for every control-plane replica to finish its rollout before replacing the
+  # first Gateway Pod.
+  depends_on = [kubernetes_deployment_v1.control_plane]
 }
 
 resource "kubernetes_service_v1" "gateway" {

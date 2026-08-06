@@ -177,6 +177,7 @@ pub(super) fn row_to_node(r: &postgres::Row) -> RowResult<Node> {
         id: r.try_get("id")?,
         agent_url: r.try_get("agent_url")?,
         gateway_url: r.try_get("gateway_url")?,
+        route_grant_public_key_sha256: r.try_get("route_grant_public_key_sha256")?,
         state: match state.as_str() {
             "cordoned" => NodeState::Cordoned,
             "draining" => NodeState::Draining,

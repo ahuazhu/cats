@@ -30,6 +30,21 @@ output "usage_pod_identity_association_id" {
   value = module.usage_infrastructure.pod_identity_association_id
 }
 
+output "route_cache_table_name" {
+  description = "Regional shared cache for already-signed Endpoint Route Grants."
+  value       = module.route_cache_infrastructure.table_name
+}
+
+output "route_cache_gateway_role_arn" {
+  description = "Pod Identity role used by cats-gatewayd for the shared Route Grant cache."
+  value       = module.route_cache_infrastructure.gateway_role_arn
+}
+
+output "route_cache_pod_identity_association_id" {
+  description = "Gateway Pod Identity association ID."
+  value       = module.route_cache_infrastructure.pod_identity_association_id
+}
+
 output "worker_artifact_bucket_name" {
   value = one(module.metal_worker_deployment[*].artifact_bucket_name)
 }

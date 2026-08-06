@@ -21,6 +21,9 @@ struct Args {
     control_plane_url: String,
     #[arg(long, env = "CATS_AUTH_TOKEN", default_value = "dev-service-token")]
     auth_token: String,
+    /// Ed25519 public key used to verify control-plane signed Route Grants.
+    #[arg(long, env = "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE")]
+    route_grant_public_key_file: PathBuf,
     #[arg(long, default_value = "")]
     gateway_url: String,
     #[arg(long)]
@@ -197,11 +200,24 @@ async fn main() -> anyhow::Result<()> {
         }),
         other => anyhow::bail!("unknown --vmm {other} (expected fake|ch)"),
     };
+    let route_grant_public_key =
+        std::fs::read(&args.route_grant_public_key_file).with_context(|| {
+            format!(
+                "read route grant public key {}",
+                args.route_grant_public_key_file.display()
+            )
+        })?;
+    let route_grant_verifier = std::sync::Arc::new(
+        cats_node_agent::route_grant::RouteGrantVerifier::from_ed25519_pem(
+            &route_grant_public_key,
+        )?,
+    );
     let handle = spawn(ServerConfig {
         listen: args.listen,
         advertise_url: args.advertise_url,
         control_plane_url: args.control_plane_url,
         auth_token: args.auth_token,
+        route_grant_verifier,
         gateway_url: args.gateway_url,
         cpus,
         memory_mib,

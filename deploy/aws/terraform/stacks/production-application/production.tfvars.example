@@ -3,6 +3,7 @@ kubeconfig_context = "REPLACE_WITH_PRODUCTION_EKS_CONTEXT"
 
 control_plane_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats-control-plane@sha256:REPLACE_WITH_64_HEX_CHARACTERS"
 gateway_image       = "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats-control-plane@sha256:REPLACE_WITH_64_HEX_CHARACTERS"
+shared_route_cache_table = "cats-production-route-grants"
 
 usage_delivery_adapter = "aws-kinesis"
 usage_aws_region        = "us-east-1"
@@ -25,6 +26,7 @@ public_subnet_ids = [
   "subnet-REPLACE_B",
 ]
 
-# Do not put runtime_secret_data, storage_postgres_url, usage_postgres_url,
-# stripe_secret_key, stripe_webhook_secret, or rds_ca_pem in this file. Supply
-# them through TF_VAR_* or the CI secret store.
+# Do not put runtime_secret_data, route_grant_private_key_pem or its CI-derived
+# route_grant_public_key_pem, storage_postgres_url, usage_postgres_url, stripe_secret_key,
+# stripe_webhook_secret, or rds_ca_pem in this file. Supply them through
+# TF_VAR_* or the CI secret store.
