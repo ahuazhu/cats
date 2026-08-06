@@ -327,14 +327,16 @@ impl ResolveFailure {
 }
 
 struct RouteRefresh {
+    shared_lookup: SharedLookup,
     result: OnceLock<Result<ResolveResponse, ResolveFailure>>,
     ready: tokio::sync::watch::Sender<bool>,
 }
 
 impl RouteRefresh {
-    fn new() -> Self {
+    fn new(shared_lookup: SharedLookup) -> Self {
         let (ready, _) = tokio::sync::watch::channel(false);
         Self {
+            shared_lookup,
             result: OnceLock::new(),
             ready,
         }
@@ -422,6 +424,7 @@ struct RouteCacheEntry {
     refresh: Option<Arc<RouteRefresh>>,
     retry_after: Instant,
     last_failure: Option<ResolveFailure>,
+    last_failure_lookup: Option<SharedLookup>,
     /// A control-plane negative or non-expiry Node conflict is authoritative
     /// for this replica. Preserve that fact for the longest interval in which
     /// a Grant issued before the rejection could still pass time validation.
@@ -500,6 +503,7 @@ impl RouteCacheEntry {
             refresh: None,
             retry_after: now,
             last_failure: None,
+            last_failure_lookup: None,
             shared_lookup_barrier: None,
             shared_lookup_floor: None,
             latest_node_rejection: None,
@@ -843,6 +847,7 @@ impl Gateway {
                     fetched: now,
                 });
                 entry.last_failure = None;
+                entry.last_failure_lookup = None;
                 entry.retry_after = now;
                 entry.latest_node_rejection = None;
                 if resolved.state == "active" && resolved.observed_state == ObservedState::Running {
@@ -857,6 +862,7 @@ impl Gateway {
                     entry.block_shared_lookup(now);
                 }
                 entry.last_failure = Some(error.clone());
+                entry.last_failure_lookup = Some(refresh.shared_lookup);
                 entry.retry_after = now + ROUTE_REFRESH_BACKOFF;
             }
         }
@@ -899,7 +905,12 @@ impl Gateway {
             Return(ResolveResponse),
             ReturnAndRefresh(ResolveResponse, Arc<RouteRefresh>, u64),
             Wait(Arc<RouteRefresh>),
-            Refresh(Arc<RouteRefresh>, u64, SharedLookup),
+            Refresh(
+                Arc<RouteRefresh>,
+                u64,
+                SharedLookup,
+                Option<Arc<RouteRefresh>>,
+            ),
             Fail(ResolveFailure),
         }
 
@@ -936,7 +947,7 @@ impl Gateway {
                         Action::Return(cached.resolved.clone())
                     } else if let Some(stale) = cached_outage_route(Some(cached)) {
                         if entry.refresh.is_none() && now >= entry.retry_after {
-                            let refresh = Arc::new(RouteRefresh::new());
+                            let refresh = Arc::new(RouteRefresh::new(SharedLookup::Blocked));
                             entry.refresh = Some(refresh.clone());
                             Action::ReturnAndRefresh(stale, refresh, entry.generation)
                         } else {
@@ -953,40 +964,64 @@ impl Gateway {
                             )
                         }))
                     } else {
-                        let refresh = Arc::new(RouteRefresh::new());
-                        entry.refresh = Some(refresh.clone());
-                        Action::Refresh(
-                            refresh,
-                            entry.generation,
-                            if use_cache {
-                                entry.shared_lookup(now)
-                            } else {
-                                SharedLookup::Blocked
-                            },
-                        )
-                    }
-                } else if let Some(refresh) = &entry.refresh {
-                    Action::Wait(refresh.clone())
-                } else if now < entry.retry_after {
-                    Action::Fail(entry.last_failure.clone().unwrap_or_else(|| {
-                        ResolveFailure::response(
-                            StatusCode::BAD_GATEWAY,
-                            "route refresh is backing off",
-                            false,
-                        )
-                    }))
-                } else {
-                    let refresh = Arc::new(RouteRefresh::new());
-                    entry.refresh = Some(refresh.clone());
-                    Action::Refresh(
-                        refresh,
-                        entry.generation,
-                        if use_cache {
+                        let shared_lookup = if use_cache {
                             entry.shared_lookup(now)
                         } else {
                             SharedLookup::Blocked
-                        },
-                    )
+                        };
+                        let refresh = Arc::new(RouteRefresh::new(shared_lookup));
+                        entry.refresh = Some(refresh.clone());
+                        Action::Refresh(refresh, entry.generation, shared_lookup, None)
+                    }
+                } else if let Some(refresh) = &entry.refresh {
+                    let shared_lookup = if use_cache {
+                        entry.shared_lookup(now)
+                    } else {
+                        SharedLookup::Blocked
+                    };
+                    if entry.cached.is_some()
+                        && refresh.shared_lookup == SharedLookup::Blocked
+                        && shared_lookup != SharedLookup::Blocked
+                    {
+                        let superseded = refresh.clone();
+                        entry.generation = entry.generation.saturating_add(1);
+                        let refresh = Arc::new(RouteRefresh::new(shared_lookup));
+                        entry.refresh = Some(refresh.clone());
+                        Action::Refresh(refresh, entry.generation, shared_lookup, Some(superseded))
+                    } else {
+                        Action::Wait(refresh.clone())
+                    }
+                } else if now < entry.retry_after {
+                    let shared_lookup = if use_cache {
+                        entry.shared_lookup(now)
+                    } else {
+                        SharedLookup::Blocked
+                    };
+                    if entry.cached.is_some()
+                        && entry.last_failure_lookup == Some(SharedLookup::Blocked)
+                        && shared_lookup != SharedLookup::Blocked
+                    {
+                        let refresh = Arc::new(RouteRefresh::new(shared_lookup));
+                        entry.refresh = Some(refresh.clone());
+                        Action::Refresh(refresh, entry.generation, shared_lookup, None)
+                    } else {
+                        Action::Fail(entry.last_failure.clone().unwrap_or_else(|| {
+                            ResolveFailure::response(
+                                StatusCode::BAD_GATEWAY,
+                                "route refresh is backing off",
+                                false,
+                            )
+                        }))
+                    }
+                } else {
+                    let shared_lookup = if use_cache {
+                        entry.shared_lookup(now)
+                    } else {
+                        SharedLookup::Blocked
+                    };
+                    let refresh = Arc::new(RouteRefresh::new(shared_lookup));
+                    entry.refresh = Some(refresh.clone());
+                    Action::Refresh(refresh, entry.generation, shared_lookup, None)
                 }
             };
 
@@ -1006,7 +1041,10 @@ impl Gateway {
                     Err(ResolveFailure::Superseded) => continue,
                     Err(error) => return Err(error.into_response()),
                 },
-                Action::Refresh(refresh, generation, shared_lookup) => {
+                Action::Refresh(refresh, generation, shared_lookup, superseded) => {
+                    if let Some(superseded) = superseded {
+                        superseded.complete(Err(ResolveFailure::Superseded));
+                    }
                     self.start_refresh(
                         hostname.to_string(),
                         generation,
@@ -1035,6 +1073,7 @@ impl Gateway {
             let now = Instant::now();
             entry.retry_after = now;
             entry.last_failure = None;
+            entry.last_failure_lookup = None;
             entry.block_shared_lookup(now);
             entry.latest_node_rejection = None;
             entry.refresh.take()
@@ -1079,6 +1118,7 @@ impl Gateway {
             let now = Instant::now();
             entry.retry_after = now;
             entry.last_failure = None;
+            entry.last_failure_lookup = None;
             if rejection.may_use_newer_shared_grant() {
                 entry.allow_only_newer_shared_lookup(rejected, now);
             } else {
@@ -1995,6 +2035,7 @@ mod tests {
                 refresh: None,
                 retry_after: Instant::now(),
                 last_failure: None,
+                last_failure_lookup: None,
                 shared_lookup_barrier: None,
                 shared_lookup_floor: None,
                 latest_node_rejection: None,
@@ -2007,7 +2048,9 @@ mod tests {
             &rejected,
             NodeRouteRejection::ExpiredGrant,
         );
-        let refresh = Arc::new(RouteRefresh::new());
+        let refresh = Arc::new(RouteRefresh::new(SharedLookup::NewerThan(
+            RouteGrantOrder::from_resolved(&rejected).unwrap(),
+        )));
         let generation = {
             let mut cache = gateway.cache.lock().unwrap();
             let entry = cache.get_mut("dev.cats.run").unwrap();
@@ -2063,6 +2106,7 @@ mod tests {
                 refresh: None,
                 retry_after: Instant::now(),
                 last_failure: None,
+                last_failure_lookup: None,
                 shared_lookup_barrier: None,
                 shared_lookup_floor: None,
                 latest_node_rejection: None,
@@ -2091,6 +2135,91 @@ mod tests {
                 .and_then(|cached| cached.resolved.route_grant.as_deref()),
             Some("grant-2")
         );
+        control_task.abort();
+    }
+
+    #[tokio::test]
+    async fn expired_grant_upgrades_control_plane_only_refresh_and_backoff() {
+        let state = Arc::new(RouteServerState::new(RouteReply::Status(
+            StatusCode::SERVICE_UNAVAILABLE,
+        )));
+        let shared_cache = SharedRouteCache::memory();
+        let (gateway, control_task) =
+            route_test_gateway_with_shared_cache(state.clone(), 10, shared_cache.clone()).await;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let expired = active_resolved_route(
+            "dev.cats.run".to_string(),
+            "http://node-a".to_string(),
+            "grant-1",
+            now.saturating_sub(120),
+            now,
+        );
+        let newer = active_resolved_route(
+            "dev.cats.run".to_string(),
+            "http://node-a".to_string(),
+            "grant-2",
+            now,
+            now + 60,
+        );
+        shared_cache.publish("dev.cats.run", &newer).await.unwrap();
+        let background_refresh = Arc::new(RouteRefresh::new(SharedLookup::Blocked));
+        gateway.cache.lock().unwrap().insert(
+            "dev.cats.run".to_string(),
+            RouteCacheEntry {
+                cached: Some(CachedRoute {
+                    resolved: expired.clone(),
+                    fetched: Instant::now(),
+                }),
+                refresh: Some(background_refresh.clone()),
+                retry_after: Instant::now(),
+                last_failure: None,
+                last_failure_lookup: None,
+                shared_lookup_barrier: None,
+                shared_lookup_floor: None,
+                latest_node_rejection: None,
+                generation: 0,
+            },
+        );
+
+        let resolved = tokio::time::timeout(
+            Duration::from_millis(200),
+            gateway.resolve("dev.cats.run", true),
+        )
+        .await
+        .expect("expired authority must not wait for a control-plane-only background refresh")
+        .unwrap();
+
+        assert_eq!(resolved.route_grant.as_deref(), Some("grant-2"));
+        assert!(matches!(
+            background_refresh.result.get(),
+            Some(Err(ResolveFailure::Superseded))
+        ));
+        assert_eq!(state.calls(), 0);
+
+        {
+            let mut cache = gateway.cache.lock().unwrap();
+            let entry = cache.get_mut("dev.cats.run").unwrap();
+            entry.cached = Some(CachedRoute {
+                resolved: expired,
+                fetched: Instant::now(),
+            });
+            entry.refresh = None;
+            entry.retry_after = Instant::now() + Duration::from_secs(60);
+            entry.last_failure = Some(ResolveFailure::response(
+                StatusCode::BAD_GATEWAY,
+                "control plane is unavailable".to_string(),
+                true,
+            ));
+            entry.last_failure_lookup = Some(SharedLookup::Blocked);
+            entry.allow_shared_lookup();
+        }
+
+        let resolved = gateway.resolve("dev.cats.run", true).await.unwrap();
+        assert_eq!(resolved.route_grant.as_deref(), Some("grant-2"));
+        assert_eq!(state.calls(), 0);
         control_task.abort();
     }
 
@@ -2450,6 +2579,7 @@ mod tests {
                 refresh: None,
                 retry_after: Instant::now(),
                 last_failure: None,
+                last_failure_lookup: None,
                 shared_lookup_barrier: None,
                 shared_lookup_floor: None,
                 latest_node_rejection: None,
@@ -2702,6 +2832,7 @@ mod tests {
                         refresh: None,
                         retry_after: Instant::now(),
                         last_failure: None,
+                        last_failure_lookup: None,
                         shared_lookup_barrier: None,
                         shared_lookup_floor: None,
                         latest_node_rejection: None,
@@ -3152,6 +3283,7 @@ mod tests {
                         refresh: None,
                         retry_after: Instant::now(),
                         last_failure: None,
+                        last_failure_lookup: None,
                         shared_lookup_barrier: None,
                         shared_lookup_floor: None,
                         latest_node_rejection: None,
@@ -3208,6 +3340,7 @@ mod tests {
                         refresh: None,
                         retry_after: now,
                         last_failure: None,
+                        last_failure_lookup: None,
                         shared_lookup_barrier: None,
                         shared_lookup_floor: None,
                         latest_node_rejection: None,
