@@ -2,7 +2,7 @@ use super::*;
 use cats_api::guest::GuestWorkLease;
 use cats_api::requests::NodeWorkStatusRequest;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 
 struct ActiveSingletonGuard {
     active: Arc<AtomicUsize>,
@@ -21,6 +21,89 @@ impl Drop for ActiveSingletonGuard {
 /// Fresh store on an isolated schema of the disposable test server.
 fn test_store() -> Store {
     Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap()
+}
+
+/// Serialize only tests that intentionally leave one PostgreSQL session
+/// waiting on another. Their internal worker threads still run concurrently;
+/// this gate prevents unrelated structural-lock fixtures from consuming each
+/// other's test-only lock timeout under the default parallel test runner.
+/// Recovering a poisoned guard lets every later test report its own result.
+fn serialize_structural_postgres_lock_test() -> std::sync::MutexGuard<'static, ()> {
+    static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    match GATE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn concurrency_store(url: &str) -> Store {
+    let store = Store::connect(url, None).unwrap();
+    store
+        .with(|client| client.batch_execute("SET statement_timeout='15s'; SET lock_timeout='15s'"))
+        .unwrap();
+    store
+}
+
+fn backend_pid(store: &Store) -> i32 {
+    store
+        .with(|client| client.query_one("SELECT pg_backend_pid()", &[])?.try_get(0))
+        .unwrap()
+}
+
+fn wait_until_blocked_by(observer: &Store, waiter_pid: i32, blocker_pid: i32) -> bool {
+    for _ in 0..500 {
+        let blocked = observer
+            .with(|client| {
+                client
+                    .query_one(
+                        "SELECT $2::INTEGER = ANY(pg_blocking_pids($1::INTEGER))",
+                        &[&waiter_pid, &blocker_pid],
+                    )?
+                    .try_get(0)
+            })
+            .unwrap();
+        if blocked {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    false
+}
+
+fn hold_work_sources_table(store: Store) -> (std::thread::JoinHandle<()>, mpsc::Sender<()>, i32) {
+    let blocker_pid = backend_pid(&store);
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let blocker = std::thread::spawn(move || {
+        store
+            .enter(move |client| {
+                let client = client?;
+                let mut tx = client.transaction().map_err(internal)?;
+                tx.batch_execute("LOCK TABLE cat_work_sources IN ACCESS EXCLUSIVE MODE")
+                    .map_err(internal)?;
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                tx.commit().map_err(internal)
+            })
+            .unwrap();
+    });
+    locked_rx.recv().unwrap();
+    (blocker, release_tx, blocker_pid)
+}
+
+fn seed_expired_guest_lease(store: &Store, cat_id: &str) {
+    store
+        .with(|client| {
+            client
+                .execute(
+                    "INSERT INTO cat_work_leases
+                     (id, cat_id, kind, owner_id, label, expires_at_ms, source_epoch)
+                     VALUES ($1,$2,'guest','expired-owner','expired',$3,'guest-boot-1')",
+                    &[&format!("expired-{cat_id}"), &cat_id, &(now_ms() - 1)],
+                )
+                .map(|_| ())
+        })
+        .unwrap();
 }
 
 /// Two process-shaped stores sharing one schema. Unlike cloning an `Arc<Store>`,
@@ -1006,11 +1089,14 @@ fn last_guest_work_release_is_immediately_suspend_eligible() {
 
 #[test]
 fn concurrent_placement_cannot_overcommit_a_node() {
+    let _serial = serialize_structural_postgres_lock_test();
     // Placement used to be a read of the node's free capacity followed by a
     // separate write, which only holds up while one Cat is placed at a time.
     // The reconcile loop now runs flows concurrently, so this is the property
     // that keeps it honest.
-    let (first, second) = test_store_pair();
+    let url = crate::testsupport::isolated_control_store_url();
+    let first = concurrency_store(&url);
+    let second = concurrency_store(&url);
     let stores = [Arc::new(first), Arc::new(second)];
     let workspace = bootstrap_workspace(&stores[0], "alpha");
     // Room for exactly 4 of these Cats: 8 cpus / 8192 MiB, 2 cpus each.
@@ -1067,6 +1153,7 @@ fn concurrent_placement_cannot_overcommit_a_node() {
 
 #[test]
 fn cordon_linearizes_after_a_placement_that_already_observed_ready() {
+    let _serial = serialize_structural_postgres_lock_test();
     let url = crate::testsupport::isolated_control_store_url();
     let placement = Store::connect(&url, None).unwrap();
     let cordoner = Store::connect(&url, None).unwrap();
@@ -1342,6 +1429,717 @@ fn guest_work_cancels_an_inflight_suspend_without_generation_drift() {
         store.get_operation(&auto.id).unwrap().phase,
         OperationPhase::Failed
     );
+}
+
+#[test]
+fn guest_work_from_the_retained_runtime_survives_cancel_first_ordering() {
+    let store = test_store();
+    let workspace = bootstrap_workspace(&store, "cancel-first-guest-work");
+    let (cat, _, create) = create_test_cat(&store, &workspace, "cancel-first-guest-work").unwrap();
+    store
+        .register_node("node-1", "http://node", "http://gateway", 4, 8192, false)
+        .unwrap();
+    store.set_placement(&cat.id, Some("node-1")).unwrap();
+    store.set_observed(&cat.id, ObservedState::Running).unwrap();
+    store.finish_operation(&create.id, None).unwrap();
+    assert!(!store
+        .ingest_guest_work(&NodeWorkStatusRequest {
+            node_id: "node-1".into(),
+            cat_id: cat.id.clone(),
+            generation: 1,
+            guest_source_epoch: "guest-boot-1".into(),
+            guest_lease_sequence: 0,
+            leases: vec![],
+        })
+        .unwrap());
+    let auto = store
+        .try_auto_suspend(&cat.id, 60_000)
+        .unwrap()
+        .expect("fresh empty work should begin auto-suspend");
+    store
+        .set_observed(&cat.id, ObservedState::Suspending)
+        .unwrap();
+
+    // The Node can return ActivityChanged before its work watcher publishes
+    // the sequence that caused the rejection. The runtime was never replaced,
+    // so its generation-1 report remains the authoritative Guest source.
+    store
+        .cancel_rejected_suspend(&cat.id, auto.resource_generation)
+        .unwrap();
+    assert!(!store
+        .ingest_guest_work(&NodeWorkStatusRequest {
+            node_id: "node-1".into(),
+            cat_id: cat.id.clone(),
+            generation: 1,
+            guest_source_epoch: "guest-boot-1".into(),
+            guest_lease_sequence: 1,
+            leases: vec![GuestWorkLease {
+                id: "late-job".into(),
+                label: "late-job".into(),
+                remaining_ttl_ms: 30_000,
+            }],
+        })
+        .unwrap());
+
+    let running = store.must_get_cat_by_id(&cat.id).unwrap();
+    assert_eq!(running.desired_state, DesiredState::Running);
+    assert_eq!(running.observed_state, ObservedState::Running);
+    assert_eq!(running.generation, 2);
+    assert_eq!(
+        store.get_operation(&auto.id).unwrap().phase,
+        OperationPhase::Failed
+    );
+    assert_eq!(
+        store
+            .work_status(&cat.id, 60_000)
+            .unwrap()
+            .active_work_count,
+        1
+    );
+
+    // A failed auto-suspend from an older generation is not a blanket waiver
+    // for later stale reports. Only the current generation's failed operation
+    // proves that its immediately preceding runtime was retained.
+    let newer = store
+        .set_desired(&cat.id, DesiredState::Running, None, "cat.start")
+        .unwrap();
+    assert_eq!(newer.resource_generation, 3);
+    let stale = store
+        .ingest_guest_work(&NodeWorkStatusRequest {
+            node_id: "node-1".into(),
+            cat_id: cat.id.clone(),
+            generation: 2,
+            guest_source_epoch: "guest-boot-1".into(),
+            guest_lease_sequence: 2,
+            leases: vec![],
+        })
+        .expect_err("an older failed auto-suspend must not authorize generation 2 at generation 3");
+    assert_eq!(stale.code, ErrorCode::Conflict);
+    assert_eq!(stale.message, "work status generation is stale");
+}
+
+fn assert_stale_guest_work_cannot_overwrite_lifecycle(
+    newer_desired: DesiredState,
+    operation_kind: &'static str,
+) {
+    let _serial = serialize_structural_postgres_lock_test();
+    let url = crate::testsupport::isolated_control_store_url();
+    let store = concurrency_store(&url);
+    let ingest_store = concurrency_store(&url);
+    let observer = concurrency_store(&url);
+    let lifecycle_pid = backend_pid(&store);
+    let guest_pid = backend_pid(&ingest_store);
+    let workspace = bootstrap_workspace(&store, "guest-work-cas");
+    let (cat, _, create) = create_test_cat(&store, &workspace, "guest-work-cas").unwrap();
+    store
+        .register_node("node-1", "http://node", "http://gateway", 4, 8192, false)
+        .unwrap();
+    store.set_placement(&cat.id, Some("node-1")).unwrap();
+    store.set_observed(&cat.id, ObservedState::Running).unwrap();
+    store.finish_operation(&create.id, None).unwrap();
+    let suspend = store
+        .set_desired(&cat.id, DesiredState::Suspended, None, "cat.suspend")
+        .unwrap();
+    store
+        .set_observed(&cat.id, ObservedState::Suspended)
+        .unwrap();
+    store.finish_operation(&suspend.id, None).unwrap();
+
+    // Hold both the Cat authority and the first table Guest work touches after
+    // its Cat read. The table lock makes the old non-locking implementation
+    // pause after its stale read; pg_blocking_pids below proves that the fixed
+    // implementation instead pauses on this exact lifecycle transaction.
+    let cat_id = cat.id.clone();
+    let desired = desired_str(newer_desired).to_string();
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let lifecycle = std::thread::spawn(move || {
+        store
+            .enter(move |client| {
+                let client = client?;
+                let mut tx = client.transaction().map_err(internal)?;
+                let row = tx
+                    .query_one(
+                        "SELECT workspace_id, generation FROM cats WHERE id=$1 FOR UPDATE",
+                        &[&cat_id],
+                    )
+                    .map_err(internal)?;
+                let workspace_id: String = row.try_get(0).map_err(internal)?;
+                let generation: i64 = row.try_get(1).map_err(internal)?;
+                assert_eq!(generation, 2);
+                let next = generation + 1;
+                tx.execute(
+                    "UPDATE cats SET desired_state=$2, generation=$3 WHERE id=$1",
+                    &[&cat_id, &desired, &next],
+                )
+                .map_err(internal)?;
+                let operation =
+                    Store::insert_operation(&mut tx, &workspace_id, operation_kind, &cat_id, next)?;
+                tx.batch_execute("LOCK TABLE cat_work_sources IN ACCESS EXCLUSIVE MODE")
+                    .map_err(internal)?;
+                locked_tx.send(operation.id).unwrap();
+                release_rx.recv().unwrap();
+                tx.commit().map_err(internal)
+            })
+            .unwrap();
+    });
+    let stop_operation_id = locked_rx.recv().unwrap();
+
+    let report_cat_id = cat.id.clone();
+    let guest = std::thread::spawn(move || {
+        ingest_store.ingest_guest_work(&NodeWorkStatusRequest {
+            node_id: "node-1".into(),
+            cat_id: report_cat_id,
+            generation: 2,
+            guest_source_epoch: "guest-before-cold".into(),
+            guest_lease_sequence: 1,
+            leases: vec![GuestWorkLease {
+                id: "active-request".into(),
+                label: "active-request".into(),
+                remaining_ttl_ms: 5_000,
+            }],
+        })
+    });
+
+    let guest_waited_on_the_lifecycle_transaction =
+        wait_until_blocked_by(&observer, guest_pid, lifecycle_pid);
+    release_tx.send(()).unwrap();
+    lifecycle.join().unwrap();
+    assert!(
+        guest_waited_on_the_lifecycle_transaction,
+        "the fixture never established the concurrent Cat-authority window"
+    );
+    let error = guest
+        .join()
+        .unwrap()
+        .expect_err("a generation-2 Guest report must not supersede committed generation 3");
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert_eq!(error.message, "work status generation is stale");
+
+    let current = observer.must_get_cat_by_id(&cat.id).unwrap();
+    assert_eq!(current.desired_state, newer_desired);
+    assert_eq!(current.generation, 3);
+    let operations = observer.pending_operations_for(&cat.id).unwrap();
+    assert_eq!(operations.len(), 1, "stale Guest work added an operation");
+    assert_eq!(operations[0].id, stop_operation_id);
+    assert_eq!(operations[0].kind, operation_kind);
+    assert_eq!(operations[0].resource_generation, 3);
+    let work_source_count: i64 = observer
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT COUNT(*) FROM cat_work_sources WHERE cat_id=$1",
+                    &[&cat.id],
+                )?
+                .try_get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        work_source_count, 0,
+        "the rejected stale report must roll back its work source"
+    );
+}
+
+#[test]
+fn stale_guest_work_cannot_overwrite_a_concurrent_cold_generation() {
+    assert_stale_guest_work_cannot_overwrite_lifecycle(DesiredState::Cold, "cat.stop");
+}
+
+#[test]
+fn stale_guest_work_cannot_overwrite_a_concurrent_delete_generation() {
+    assert_stale_guest_work_cannot_overwrite_lifecycle(DesiredState::Deleted, "cat.delete");
+}
+
+#[test]
+fn stale_guest_work_cannot_cancel_a_newer_cold_during_inflight_suspend() {
+    let _serial = serialize_structural_postgres_lock_test();
+    let url = crate::testsupport::isolated_control_store_url();
+    let lifecycle_store = concurrency_store(&url);
+    let ingest_store = concurrency_store(&url);
+    let observer = concurrency_store(&url);
+    let lifecycle_pid = backend_pid(&lifecycle_store);
+    let guest_pid = backend_pid(&ingest_store);
+    let workspace = bootstrap_workspace(&lifecycle_store, "guest-inflight-cas");
+    let (cat, _, create) =
+        create_test_cat(&lifecycle_store, &workspace, "guest-inflight-cas").unwrap();
+    lifecycle_store
+        .register_node("node-1", "http://node", "http://gateway", 4, 8192, false)
+        .unwrap();
+    lifecycle_store
+        .set_placement(&cat.id, Some("node-1"))
+        .unwrap();
+    lifecycle_store
+        .set_observed(&cat.id, ObservedState::Running)
+        .unwrap();
+    lifecycle_store.finish_operation(&create.id, None).unwrap();
+    assert!(!lifecycle_store
+        .ingest_guest_work(&NodeWorkStatusRequest {
+            node_id: "node-1".into(),
+            cat_id: cat.id.clone(),
+            generation: 1,
+            guest_source_epoch: "guest-boot-1".into(),
+            guest_lease_sequence: 0,
+            leases: vec![],
+        })
+        .unwrap());
+    let auto = lifecycle_store
+        .try_auto_suspend(&cat.id, 60_000)
+        .unwrap()
+        .expect("fresh empty work should begin auto-suspend");
+    assert_eq!(auto.resource_generation, 2);
+    lifecycle_store
+        .set_observed(&cat.id, ObservedState::Suspending)
+        .unwrap();
+
+    // The newer lifecycle transaction wins Cat authority, then holds the work
+    // source table solely to make the old stale-read implementation observable.
+    let cat_id = cat.id.clone();
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let lifecycle = std::thread::spawn(move || {
+        lifecycle_store
+            .enter(move |client| {
+                let client = client?;
+                let mut tx = client.transaction().map_err(internal)?;
+                let row = tx
+                    .query_one(
+                        "SELECT workspace_id, generation FROM cats WHERE id=$1 FOR UPDATE",
+                        &[&cat_id],
+                    )
+                    .map_err(internal)?;
+                let workspace_id: String = row.try_get(0).map_err(internal)?;
+                let generation: i64 = row.try_get(1).map_err(internal)?;
+                assert_eq!(generation, 2);
+                Store::fail_pending_auto_tier(
+                    &mut tx,
+                    &cat_id,
+                    "superseded by a newer Cat action",
+                )?;
+                let next = generation + 1;
+                tx.execute(
+                    "UPDATE cats SET desired_state='cold', generation=$2 WHERE id=$1",
+                    &[&cat_id, &next],
+                )
+                .map_err(internal)?;
+                let stop =
+                    Store::insert_operation(&mut tx, &workspace_id, "cat.stop", &cat_id, next)?;
+                tx.batch_execute("LOCK TABLE cat_work_sources IN ACCESS EXCLUSIVE MODE")
+                    .map_err(internal)?;
+                locked_tx.send(stop.id).unwrap();
+                release_rx.recv().unwrap();
+                tx.commit().map_err(internal)
+            })
+            .unwrap();
+    });
+    let stop_operation_id = locked_rx.recv().unwrap();
+
+    let report_cat_id = cat.id.clone();
+    let guest = std::thread::spawn(move || {
+        ingest_store.ingest_guest_work(&NodeWorkStatusRequest {
+            node_id: "node-1".into(),
+            cat_id: report_cat_id,
+            // The physical runtime never left generation 1 while generation 2
+            // was only an in-flight auto-suspend attempt.
+            generation: 1,
+            guest_source_epoch: "guest-boot-1".into(),
+            guest_lease_sequence: 1,
+            leases: vec![GuestWorkLease {
+                id: "late-job".into(),
+                label: "late-job".into(),
+                remaining_ttl_ms: 30_000,
+            }],
+        })
+    });
+
+    let blocked = wait_until_blocked_by(&observer, guest_pid, lifecycle_pid);
+    release_tx.send(()).unwrap();
+    lifecycle.join().unwrap();
+    assert!(blocked, "Guest work never waited on newer Cat authority");
+    let error = guest
+        .join()
+        .unwrap()
+        .expect_err("generation-1 Guest work must not cancel committed generation 3");
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert_eq!(error.message, "work status generation is stale");
+
+    let current = observer.must_get_cat_by_id(&cat.id).unwrap();
+    assert_eq!(current.desired_state, DesiredState::Cold);
+    assert_eq!(current.observed_state, ObservedState::Suspending);
+    assert_eq!(current.generation, 3);
+    assert_eq!(
+        observer.get_operation(&auto.id).unwrap().phase,
+        OperationPhase::Failed
+    );
+    let pending = observer.pending_operations_for(&cat.id).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, stop_operation_id);
+    assert_eq!(pending[0].kind, "cat.stop");
+    assert_eq!(pending[0].resource_generation, 3);
+    let work = observer.work_status(&cat.id, 60_000).unwrap();
+    assert_eq!(work.active_work_count, 0);
+    assert!(work.guest_signal_age_ms.is_some());
+}
+
+#[test]
+fn old_node_guest_work_cannot_cross_a_concurrent_placement_claim() {
+    let _serial = serialize_structural_postgres_lock_test();
+    let url = crate::testsupport::isolated_control_store_url();
+    let placement_store = concurrency_store(&url);
+    let ingest_store = concurrency_store(&url);
+    let observer = concurrency_store(&url);
+    let placement_pid = backend_pid(&placement_store);
+    let guest_pid = backend_pid(&ingest_store);
+    let workspace = bootstrap_workspace(&placement_store, "guest-work-placement");
+    let (cat, _, create) =
+        create_test_cat(&placement_store, &workspace, "guest-work-placement").unwrap();
+    for node_id in ["node-1", "node-2"] {
+        placement_store
+            .register_node(node_id, "http://node", "http://gateway", 4, 8192, false)
+            .unwrap();
+    }
+    placement_store
+        .set_placement(&cat.id, Some("node-1"))
+        .unwrap();
+    placement_store
+        .set_observed(&cat.id, ObservedState::Running)
+        .unwrap();
+    placement_store.finish_operation(&create.id, None).unwrap();
+
+    let cat_id = cat.id.clone();
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let placement = std::thread::spawn(move || {
+        placement_store
+            .enter(move |client| {
+                let client = client?;
+                let mut tx = client.transaction().map_err(internal)?;
+                lock_placement(&mut tx).map_err(internal)?;
+                let changed = tx
+                    .execute("UPDATE cats SET node_id='node-2' WHERE id=$1", &[&cat_id])
+                    .map_err(internal)?;
+                assert_eq!(changed, 1);
+                tx.batch_execute("LOCK TABLE cat_work_sources IN ACCESS EXCLUSIVE MODE")
+                    .map_err(internal)?;
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                tx.commit().map_err(internal)
+            })
+            .unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    let report_cat_id = cat.id.clone();
+    let guest = std::thread::spawn(move || {
+        ingest_store.ingest_guest_work(&NodeWorkStatusRequest {
+            node_id: "node-1".into(),
+            cat_id: report_cat_id,
+            generation: 1,
+            guest_source_epoch: "guest-before-placement".into(),
+            guest_lease_sequence: 1,
+            leases: vec![GuestWorkLease {
+                id: "active-request".into(),
+                label: "active-request".into(),
+                remaining_ttl_ms: 5_000,
+            }],
+        })
+    });
+
+    let blocked = wait_until_blocked_by(&observer, guest_pid, placement_pid);
+    release_tx.send(()).unwrap();
+    placement.join().unwrap();
+    assert!(blocked, "Guest report never waited on the placement claim");
+    let error = guest
+        .join()
+        .unwrap()
+        .expect_err("the old owning Node must lose after placement changes");
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert_eq!(error.message, "work status came from a non-owning node");
+    assert_eq!(
+        observer.must_get_cat_by_id(&cat.id).unwrap().node_id,
+        Some("node-2".into())
+    );
+    let work_source_count: i64 = observer
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT COUNT(*) FROM cat_work_sources WHERE cat_id=$1",
+                    &[&cat.id],
+                )?
+                .try_get(0)
+        })
+        .unwrap();
+    assert_eq!(work_source_count, 0);
+}
+
+#[test]
+fn guest_work_and_rejected_suspend_cancellation_share_cat_first_lock_order() {
+    let _serial = serialize_structural_postgres_lock_test();
+    let url = crate::testsupport::isolated_control_store_url();
+    let setup = concurrency_store(&url);
+    let ingest_store = concurrency_store(&url);
+    let cancel_store = concurrency_store(&url);
+    let blocker_store = concurrency_store(&url);
+    let observer = concurrency_store(&url);
+    let guest_pid = backend_pid(&ingest_store);
+    let cancel_pid = backend_pid(&cancel_store);
+    let workspace = bootstrap_workspace(&setup, "guest-cancel-lock-order");
+    let (cat, _, create) = create_test_cat(&setup, &workspace, "guest-cancel-lock-order").unwrap();
+    setup
+        .register_node("node-1", "http://node", "http://gateway", 4, 8192, false)
+        .unwrap();
+    setup.set_placement(&cat.id, Some("node-1")).unwrap();
+    setup.set_observed(&cat.id, ObservedState::Running).unwrap();
+    setup.finish_operation(&create.id, None).unwrap();
+    assert!(!setup
+        .ingest_guest_work(&NodeWorkStatusRequest {
+            node_id: "node-1".into(),
+            cat_id: cat.id.clone(),
+            generation: 1,
+            guest_source_epoch: "guest-boot-1".into(),
+            guest_lease_sequence: 0,
+            leases: vec![],
+        })
+        .unwrap());
+    let auto = setup
+        .try_auto_suspend(&cat.id, 60_000)
+        .unwrap()
+        .expect("fresh empty work should begin auto-suspend");
+    assert_eq!(auto.resource_generation, 2);
+    setup
+        .set_observed(&cat.id, ObservedState::Suspending)
+        .unwrap();
+    let auto_generation = auto.resource_generation;
+
+    let (blocker, release_blocker, blocker_pid) = hold_work_sources_table(blocker_store);
+    let report_cat_id = cat.id.clone();
+    let guest = std::thread::spawn(move || {
+        ingest_store.ingest_guest_work(&NodeWorkStatusRequest {
+            node_id: "node-1".into(),
+            cat_id: report_cat_id,
+            // The runtime still belongs to the generation before auto-suspend.
+            generation: 1,
+            guest_source_epoch: "guest-boot-1".into(),
+            guest_lease_sequence: 1,
+            leases: vec![GuestWorkLease {
+                id: "late-job".into(),
+                label: "late-job".into(),
+                remaining_ttl_ms: 30_000,
+            }],
+        })
+    });
+    assert!(
+        wait_until_blocked_by(&observer, guest_pid, blocker_pid),
+        "Guest work never acquired the Cat before reaching its source row"
+    );
+
+    let cancel_cat_id = cat.id.clone();
+    let cancel = std::thread::spawn(move || {
+        cancel_store.cancel_rejected_suspend(&cancel_cat_id, auto_generation)
+    });
+    let cancel_waited_on_guest = wait_until_blocked_by(&observer, cancel_pid, guest_pid);
+    release_blocker.send(()).unwrap();
+    blocker.join().unwrap();
+    assert!(
+        cancel_waited_on_guest,
+        "Suspend cancellation never queued behind Guest Cat authority"
+    );
+    assert!(guest.join().unwrap().unwrap());
+    cancel.join().unwrap().unwrap();
+
+    let current = observer.must_get_cat_by_id(&cat.id).unwrap();
+    assert_eq!(current.desired_state, DesiredState::Running);
+    assert_eq!(current.observed_state, ObservedState::Running);
+    assert_eq!(current.generation, 2);
+    assert_eq!(
+        observer.get_operation(&auto.id).unwrap().phase,
+        OperationPhase::Failed
+    );
+    assert_eq!(
+        observer
+            .work_status(&cat.id, 60_000)
+            .unwrap()
+            .active_work_count,
+        1
+    );
+}
+
+#[test]
+fn guest_work_and_auto_suspend_share_cat_first_lock_order() {
+    let _serial = serialize_structural_postgres_lock_test();
+    let url = crate::testsupport::isolated_control_store_url();
+    let setup = concurrency_store(&url);
+    let ingest_store = concurrency_store(&url);
+    let auto_store = concurrency_store(&url);
+    let blocker_store = concurrency_store(&url);
+    let observer = concurrency_store(&url);
+    let guest_pid = backend_pid(&ingest_store);
+    let auto_pid = backend_pid(&auto_store);
+    let workspace = bootstrap_workspace(&setup, "guest-auto-suspend-lock-order");
+    let (cat, _, create) =
+        create_test_cat(&setup, &workspace, "guest-auto-suspend-lock-order").unwrap();
+    setup
+        .register_node("node-1", "http://node", "http://gateway", 4, 8192, false)
+        .unwrap();
+    setup.set_placement(&cat.id, Some("node-1")).unwrap();
+    setup.set_observed(&cat.id, ObservedState::Running).unwrap();
+    setup.finish_operation(&create.id, None).unwrap();
+    assert!(!setup
+        .ingest_guest_work(&NodeWorkStatusRequest {
+            node_id: "node-1".into(),
+            cat_id: cat.id.clone(),
+            generation: 1,
+            guest_source_epoch: "guest-boot-1".into(),
+            guest_lease_sequence: 0,
+            leases: vec![],
+        })
+        .unwrap());
+    seed_expired_guest_lease(&setup, &cat.id);
+
+    let (blocker, release_blocker, blocker_pid) = hold_work_sources_table(blocker_store);
+    let report_cat_id = cat.id.clone();
+    let guest = std::thread::spawn(move || {
+        ingest_store.ingest_guest_work(&NodeWorkStatusRequest {
+            node_id: "node-1".into(),
+            cat_id: report_cat_id,
+            generation: 1,
+            guest_source_epoch: "guest-boot-1".into(),
+            guest_lease_sequence: 1,
+            leases: vec![GuestWorkLease {
+                id: "active-request".into(),
+                label: "active-request".into(),
+                remaining_ttl_ms: 30_000,
+            }],
+        })
+    });
+    assert!(
+        wait_until_blocked_by(&observer, guest_pid, blocker_pid),
+        "Guest work never acquired the Cat before reaching its source row"
+    );
+
+    let auto_cat_id = cat.id.clone();
+    let auto = std::thread::spawn(move || auto_store.try_auto_suspend(&auto_cat_id, 60_000));
+    let auto_waited_on_guest = wait_until_blocked_by(&observer, auto_pid, guest_pid);
+    release_blocker.send(()).unwrap();
+    blocker.join().unwrap();
+    assert!(
+        auto_waited_on_guest,
+        "auto-suspend never queued behind Guest Cat authority"
+    );
+    assert!(!guest.join().unwrap().unwrap());
+    assert!(auto.join().unwrap().unwrap().is_none());
+
+    let current = observer.must_get_cat_by_id(&cat.id).unwrap();
+    assert_eq!(current.desired_state, DesiredState::Running);
+    assert_eq!(current.observed_state, ObservedState::Running);
+    assert_eq!(current.generation, 1);
+    assert_eq!(
+        observer
+            .work_status(&cat.id, 60_000)
+            .unwrap()
+            .active_work_count,
+        1
+    );
+}
+
+#[test]
+fn guest_work_and_auto_tier_share_cat_first_lock_order() {
+    let _serial = serialize_structural_postgres_lock_test();
+    let url = crate::testsupport::isolated_control_store_url();
+    let setup = concurrency_store(&url);
+    let ingest_store = concurrency_store(&url);
+    let auto_store = concurrency_store(&url);
+    let blocker_store = concurrency_store(&url);
+    let observer = concurrency_store(&url);
+    let guest_pid = backend_pid(&ingest_store);
+    let auto_pid = backend_pid(&auto_store);
+    let workspace = bootstrap_workspace(&setup, "guest-auto-tier-lock-order");
+    let (cat, _, create) =
+        create_test_cat(&setup, &workspace, "guest-auto-tier-lock-order").unwrap();
+    setup
+        .register_node("node-1", "http://node", "http://gateway", 4, 8192, false)
+        .unwrap();
+    setup.set_placement(&cat.id, Some("node-1")).unwrap();
+    setup.set_observed(&cat.id, ObservedState::Running).unwrap();
+    setup.finish_operation(&create.id, None).unwrap();
+    let suspend = setup
+        .set_desired(&cat.id, DesiredState::Suspended, None, "cat.suspend")
+        .unwrap();
+    setup
+        .set_observed(&cat.id, ObservedState::Suspended)
+        .unwrap();
+    setup.finish_operation(&suspend.id, None).unwrap();
+    setup
+        .with(|client| {
+            client
+                .execute(
+                    "UPDATE cats SET observed_state_since_ms=$2 WHERE id=$1",
+                    &[&cat.id, &(now_ms() - 2_000)],
+                )
+                .map(|_| ())
+        })
+        .unwrap();
+    assert!(!setup
+        .ingest_guest_work(&NodeWorkStatusRequest {
+            node_id: "node-1".into(),
+            cat_id: cat.id.clone(),
+            generation: 2,
+            guest_source_epoch: "guest-boot-1".into(),
+            guest_lease_sequence: 0,
+            leases: vec![],
+        })
+        .unwrap());
+    seed_expired_guest_lease(&setup, &cat.id);
+
+    let (blocker, release_blocker, blocker_pid) = hold_work_sources_table(blocker_store);
+    let report_cat_id = cat.id.clone();
+    let guest = std::thread::spawn(move || {
+        ingest_store.ingest_guest_work(&NodeWorkStatusRequest {
+            node_id: "node-1".into(),
+            cat_id: report_cat_id,
+            generation: 2,
+            guest_source_epoch: "guest-boot-1".into(),
+            guest_lease_sequence: 1,
+            leases: vec![GuestWorkLease {
+                id: "wake-request".into(),
+                label: "wake-request".into(),
+                remaining_ttl_ms: 30_000,
+            }],
+        })
+    });
+    assert!(
+        wait_until_blocked_by(&observer, guest_pid, blocker_pid),
+        "Guest work never acquired the Cat before reaching its source row"
+    );
+
+    let auto_cat_id = cat.id.clone();
+    let auto = std::thread::spawn(move || {
+        auto_store.try_auto_tier(&auto_cat_id, Some(1_000), Some(1_000))
+    });
+    let auto_waited_on_guest = wait_until_blocked_by(&observer, auto_pid, guest_pid);
+    release_blocker.send(()).unwrap();
+    blocker.join().unwrap();
+    assert!(
+        auto_waited_on_guest,
+        "auto-tier never queued behind Guest Cat authority"
+    );
+    assert!(guest.join().unwrap().unwrap());
+    assert!(auto.join().unwrap().unwrap().is_none());
+
+    let current = observer.must_get_cat_by_id(&cat.id).unwrap();
+    assert_eq!(current.desired_state, DesiredState::Running);
+    assert_eq!(current.observed_state, ObservedState::Suspended);
+    assert_eq!(current.generation, 3);
+    assert_eq!(
+        observer
+            .work_status(&cat.id, 60_000)
+            .unwrap()
+            .active_work_count,
+        1
+    );
+    let operations = observer.pending_operations_for(&cat.id).unwrap();
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].kind, "cat.work_wake");
+    assert_eq!(operations[0].resource_generation, 3);
 }
 
 #[test]

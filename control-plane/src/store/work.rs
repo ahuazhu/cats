@@ -39,7 +39,10 @@ impl Store {
             let client = client?;
             let mut tx = client.transaction().map_err(internal)?;
             let cat_exists: Option<String> = tx
-                .query_opt("SELECT workspace_id FROM cats WHERE id=$1", &[&cat_id])
+                .query_opt(
+                    "SELECT workspace_id FROM cats WHERE id=$1 FOR UPDATE",
+                    &[&cat_id],
+                )
                 .map_err(internal)?
                 .map(|row| row.try_get(0))
                 .transpose()
@@ -104,6 +107,12 @@ impl Store {
                 .transpose()
                 .map_err(internal)?;
             if let Some(cat_id) = &cat_id {
+                // Every transaction that mutates both a Cat and its work rows
+                // takes the Cat authority first. In particular, Guest work
+                // ingestion already holds this row before replacing leases.
+                // Taking it here prevents a lease -> Cat / Cat -> lease cycle.
+                tx.query_opt("SELECT 1 FROM cats WHERE id=$1 FOR UPDATE", &[&cat_id])
+                    .map_err(internal)?;
                 tx.execute("DELETE FROM cat_work_leases WHERE id=$1", &[&lease_id])
                     .map_err(internal)?;
                 tx.execute(
@@ -149,7 +158,7 @@ impl Store {
             let cat: Option<(String, i64, String, String, Option<String>)> = tx
                 .query_opt(
                     "SELECT workspace_id, generation, desired_state, observed_state, node_id
-                 FROM cats WHERE id=$1",
+                 FROM cats WHERE id=$1 FOR UPDATE",
                     &[&request.cat_id],
                 )
                 .map_err(internal)?
@@ -171,10 +180,37 @@ impl Store {
                     "work status came from a non-owning node",
                 ));
             }
+            let immediately_previous_generation =
+                request.generation.checked_add(1) == Some(generation);
+            let in_flight_auto_suspend = immediately_previous_generation
+                && desired == "suspended"
+                && matches!(observed.as_str(), "running" | "suspending");
+            // A rejected auto-suspend does not replace the physical runtime,
+            // so its Guest watcher continues to report the prior generation.
+            // Accept that source after cancellation only when the current
+            // generation's failed auto-suspend operation proves why the Cat is
+            // already back at Running. An ordinary stale generation still
+            // fails closed.
+            let cancelled_auto_suspend =
+                if immediately_previous_generation && desired == "running" && observed == "running"
+                {
+                    tx.query_one(
+                        "SELECT EXISTS (
+                        SELECT 1 FROM operations
+                         WHERE resource_id=$1 AND resource_generation=$2
+                           AND kind='cat.auto_suspend' AND phase='failed'
+                     )",
+                        &[&request.cat_id, &generation],
+                    )
+                    .map_err(internal)?
+                    .try_get(0)
+                    .map_err(internal)?
+                } else {
+                    false
+                };
             let current_or_auto_transition = request.generation == generation
-                || (request.generation + 1 == generation
-                    && desired == "suspended"
-                    && matches!(observed.as_str(), "running" | "suspending"));
+                || in_flight_auto_suspend
+                || cancelled_auto_suspend;
             if !current_or_auto_transition {
                 return Err(ApiError::conflict("work status generation is stale"));
             }
@@ -398,24 +434,11 @@ impl Store {
             let client = client?;
             let mut tx = client.transaction().map_err(internal)?;
             let now = now_ms();
-            let expired = tx
-                .execute(
-                    "DELETE FROM cat_work_leases WHERE cat_id=$1 AND expires_at_ms<=$2",
-                    &[&cat_id, &now],
-                )
-                .map_err(internal)?;
-            if expired > 0 {
-                tx.execute(
-                    "UPDATE cats SET work_version=work_version+1 WHERE id=$1",
-                    &[&cat_id],
-                )
-                .map_err(internal)?;
-            }
             let cat: Option<(String, i64, bool, String, String)> = tx
                 .query_opt(
                     "SELECT workspace_id, generation, auto_suspend,
                         desired_state, observed_state
-                 FROM cats WHERE id=$1",
+                 FROM cats WHERE id=$1 FOR UPDATE",
                     &[&cat_id],
                 )
                 .map_err(internal)?
@@ -433,6 +456,19 @@ impl Store {
             let Some((workspace_id, generation, auto_suspend, desired, observed)) = cat else {
                 return Ok(None);
             };
+            let expired = tx
+                .execute(
+                    "DELETE FROM cat_work_leases WHERE cat_id=$1 AND expires_at_ms<=$2",
+                    &[&cat_id, &now],
+                )
+                .map_err(internal)?;
+            if expired > 0 {
+                tx.execute(
+                    "UPDATE cats SET work_version=work_version+1 WHERE id=$1",
+                    &[&cat_id],
+                )
+                .map_err(internal)?;
+            }
             if !auto_suspend || desired != "running" || observed != "running" {
                 return Ok(None);
             }
@@ -536,25 +572,11 @@ impl Store {
             let client = client?;
             let mut tx = client.transaction().map_err(internal)?;
             let now = now_ms();
-            let expired = tx
-                .execute(
-                    "DELETE FROM cat_work_leases WHERE cat_id=$1 AND expires_at_ms<=$2",
-                    &[&cat_id, &now],
-                )
-                .map_err(internal)?;
-            if expired > 0 {
-                tx.execute(
-                    "UPDATE cats SET work_version=work_version+1 WHERE id=$1",
-                    &[&cat_id],
-                )
-                .map_err(internal)?;
-            }
-
             let cat: Option<(String, i64, bool, String, String, i64)> = tx
                 .query_opt(
                     "SELECT workspace_id, generation, auto_suspend,
                         desired_state, observed_state, observed_state_since_ms
-                   FROM cats WHERE id=$1",
+                   FROM cats WHERE id=$1 FOR UPDATE",
                     &[&cat_id],
                 )
                 .map_err(internal)?
@@ -574,6 +596,19 @@ impl Store {
             else {
                 return Ok(None);
             };
+            let expired = tx
+                .execute(
+                    "DELETE FROM cat_work_leases WHERE cat_id=$1 AND expires_at_ms<=$2",
+                    &[&cat_id, &now],
+                )
+                .map_err(internal)?;
+            if expired > 0 {
+                tx.execute(
+                    "UPDATE cats SET work_version=work_version+1 WHERE id=$1",
+                    &[&cat_id],
+                )
+                .map_err(internal)?;
+            }
             if !auto_suspend || desired != observed {
                 return Ok(None);
             }
@@ -648,7 +683,8 @@ impl Store {
             let mut tx = client.transaction().map_err(internal)?;
             let current: Option<(i64, String, String)> = tx
                 .query_opt(
-                    "SELECT generation, desired_state, observed_state FROM cats WHERE id=$1",
+                    "SELECT generation, desired_state, observed_state
+                     FROM cats WHERE id=$1 FOR UPDATE",
                     &[&cat_id],
                 )
                 .map_err(internal)?
