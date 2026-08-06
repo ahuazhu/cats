@@ -14,8 +14,8 @@ QUALIFICATION_DIR = Path(__file__).resolve().parents[1]
 BUILD_HOST_DIR = QUALIFICATION_DIR / "build-host"
 BOOTSTRAP_DIR = BUILD_HOST_DIR / "bootstrap"
 CONTRACT_PATH = QUALIFICATION_DIR / "contracts" / "h2-build-host-create-v1.json"
-MAINTENANCE_CONTRACT_PATH = (
-    QUALIFICATION_DIR / "contracts" / "h2-build-host-maintenance-v1.json"
+PREPARATION_CONTRACT_PATH = (
+    QUALIFICATION_DIR / "contracts" / "h2-build-host-preparation-v1.json"
 )
 
 
@@ -139,7 +139,7 @@ class BuildHostBoundaryTests(unittest.TestCase):
         payload = json.dumps(
             observed, sort_keys=True, separators=(",", ":")
         ).encode()
-        for path in (CONTRACT_PATH, MAINTENANCE_CONTRACT_PATH):
+        for path in (CONTRACT_PATH, PREPARATION_CONTRACT_PATH):
             contract = json.loads(path.read_text(encoding="utf-8"))
             expected = contract["manifest"]["expected"]["bootstrap"]
             self.assertEqual(expected["components_sha256"], observed)
@@ -148,7 +148,7 @@ class BuildHostBoundaryTests(unittest.TestCase):
             )
 
     def test_contract_requires_privileged_plan_values_to_be_known(self) -> None:
-        expected = {
+        common_expected = {
             "aws_iam_policy.build_boundary": ["policy"],
             "aws_iam_policy.deployer_boundary": ["policy"],
             "aws_iam_role.build": ["assume_role_policy"],
@@ -163,13 +163,26 @@ class BuildHostBoundaryTests(unittest.TestCase):
             "aws_s3_bucket_policy.source": ["policy"],
             "aws_vpc_endpoint.build_storage": ["policy"],
         }
-        for path in (CONTRACT_PATH, MAINTENANCE_CONTRACT_PATH):
-            contract = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(contract["required_known_change_paths"], expected)
+        create_contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(
+            create_contract["required_known_change_paths"], common_expected
+        )
+        preparation_contract = json.loads(
+            PREPARATION_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        preparation_expected = dict(common_expected)
+        preparation_expected["aws_instance.build"] = [
+            "force_destroy",
+            "user_data_base64",
+        ]
+        self.assertEqual(
+            preparation_contract["required_known_change_paths"],
+            preparation_expected,
+        )
 
-    def test_maintenance_contract_freezes_the_complete_live_transition(self) -> None:
+    def test_preparation_contract_freezes_the_complete_safe_transition(self) -> None:
         contract = json.loads(
-            MAINTENANCE_CONTRACT_PATH.read_text(encoding="utf-8")
+            PREPARATION_CONTRACT_PATH.read_text(encoding="utf-8")
         )
         self.assertEqual(contract["mode"], "maintenance")
         self.assertRegex(contract["expected_managed_changes_sha256"], r"^[0-9a-f]{64}$")
@@ -177,7 +190,16 @@ class BuildHostBoundaryTests(unittest.TestCase):
         self.assertEqual(len(contract["required_change_actions"]), 41)
         self.assertEqual(
             contract["required_change_actions"]["aws_instance.build"],
-            ["delete", "create"],
+            ["update"],
+        )
+        self.assertEqual(
+            contract["required_before_identity_templates"]["aws_instance.build"],
+            {"disable_api_termination": True, "force_destroy": False},
+        )
+        self.assertTrue(
+            contract["required_identity_templates"]["aws_instance.build"][
+                "force_destroy"
+            ]
         )
 
     def test_cloud_init_privileged_entrypoints_are_root_only(self) -> None:
