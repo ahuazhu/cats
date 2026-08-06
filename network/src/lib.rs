@@ -278,6 +278,8 @@ const SHARED_ROUTE_CACHE_IO_TIMEOUT: Duration = Duration::from_millis(100);
 #[cfg(test)]
 const SHARED_ROUTE_CACHE_IO_TIMEOUT: Duration = Duration::from_millis(20);
 const MAX_ROUTE_CACHE_ENTRIES: usize = 4_096;
+const SHARED_LOOKUP_BARRIER_LIFETIME: Duration =
+    Duration::from_secs(MAX_ROUTE_GRANT_TTL_SECONDS + MAX_ROUTE_GRANT_CLOCK_SKEW_SECONDS);
 
 #[derive(Debug, Clone)]
 enum ResolveFailure {
@@ -362,15 +364,32 @@ impl RouteRefresh {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SharedLookupBarrier {
+    expires_at: Instant,
+}
+
+impl SharedLookupBarrier {
+    fn after_authoritative_rejection(now: Instant) -> Self {
+        Self {
+            expires_at: now + SHARED_LOOKUP_BARRIER_LIFETIME,
+        }
+    }
+
+    fn is_active(self, now: Instant) -> bool {
+        now < self.expires_at
+    }
+}
+
 struct RouteCacheEntry {
     cached: Option<CachedRoute>,
     refresh: Option<Arc<RouteRefresh>>,
     retry_after: Instant,
     last_failure: Option<ResolveFailure>,
     /// A control-plane negative or Node conflict is authoritative for this
-    /// replica. Do not re-import a still-signed shared capability until a
-    /// direct control-plane resolve publishes active + Running again.
-    shared_lookup_allowed: bool,
+    /// replica. Preserve that fact for the longest interval in which a Grant
+    /// issued before the rejection could still pass signature-time checks.
+    shared_lookup_barrier: Option<SharedLookupBarrier>,
     generation: u64,
 }
 
@@ -381,9 +400,28 @@ impl RouteCacheEntry {
             refresh: None,
             retry_after: now,
             last_failure: None,
-            shared_lookup_allowed: true,
+            shared_lookup_barrier: None,
             generation: 0,
         }
+    }
+
+    fn block_shared_lookup(&mut self, now: Instant) {
+        self.shared_lookup_barrier = Some(SharedLookupBarrier::after_authoritative_rejection(now));
+    }
+
+    fn allow_shared_lookup(&mut self) {
+        self.shared_lookup_barrier = None;
+    }
+
+    fn shared_lookup_allowed(&self, now: Instant) -> bool {
+        !self
+            .shared_lookup_barrier
+            .is_some_and(|barrier| barrier.is_active(now))
+    }
+
+    fn has_active_shared_lookup_barrier(&self, now: Instant) -> bool {
+        self.shared_lookup_barrier
+            .is_some_and(|barrier| barrier.is_active(now))
     }
 }
 
@@ -673,13 +711,16 @@ impl Gateway {
                 });
                 entry.last_failure = None;
                 entry.retry_after = now;
-                entry.shared_lookup_allowed =
-                    resolved.state == "active" && resolved.observed_state == ObservedState::Running;
+                if resolved.state == "active" && resolved.observed_state == ObservedState::Running {
+                    entry.allow_shared_lookup();
+                } else {
+                    entry.block_shared_lookup(now);
+                }
             }
             Err(error) => {
                 if !error.retains_cached_route() {
                     entry.cached = None;
-                    entry.shared_lookup_allowed = false;
+                    entry.block_shared_lookup(now);
                 }
                 entry.last_failure = Some(error.clone());
                 entry.retry_after = now + ROUTE_REFRESH_BACKOFF;
@@ -735,7 +776,8 @@ impl Gateway {
                 if !cache.contains_key(hostname) && cache.len() >= MAX_ROUTE_CACHE_ENTRIES {
                     let evict = cache.iter().find_map(|(hostname, entry)| {
                         (entry.refresh.is_none()
-                            && cached_outage_route(entry.cached.as_ref()).is_none())
+                            && cached_outage_route(entry.cached.as_ref()).is_none()
+                            && !entry.has_active_shared_lookup_barrier(now))
                         .then(|| hostname.clone())
                     });
                     if let Some(evict) = evict {
@@ -782,7 +824,7 @@ impl Gateway {
                         Action::Refresh(
                             refresh,
                             entry.generation,
-                            use_cache && entry.shared_lookup_allowed,
+                            use_cache && entry.shared_lookup_allowed(now),
                         )
                     }
                 } else if let Some(refresh) = &entry.refresh {
@@ -801,7 +843,7 @@ impl Gateway {
                     Action::Refresh(
                         refresh,
                         entry.generation,
-                        use_cache && entry.shared_lookup_allowed,
+                        use_cache && entry.shared_lookup_allowed(now),
                     )
                 }
             };
@@ -843,9 +885,10 @@ impl Gateway {
                 .or_insert_with(|| RouteCacheEntry::new(Instant::now()));
             entry.generation = entry.generation.saturating_add(1);
             entry.cached = None;
-            entry.retry_after = Instant::now();
+            let now = Instant::now();
+            entry.retry_after = now;
             entry.last_failure = None;
-            entry.shared_lookup_allowed = false;
+            entry.block_shared_lookup(now);
             entry.refresh.take()
         };
         if let Some(refresh) = refresh {
@@ -2089,6 +2132,16 @@ mod tests {
         let (gateway, control_task) =
             route_test_gateway_with_shared_cache(state.clone(), 0, shared_cache.clone()).await;
         gateway.resolve("dev.cats.run", true).await.unwrap();
+        let protected = gateway
+            .cache
+            .lock()
+            .unwrap()
+            .get("dev.cats.run")
+            .unwrap()
+            .cached
+            .as_ref()
+            .unwrap()
+            .clone();
 
         state.set(RouteReply::Status(StatusCode::NOT_FOUND));
         assert_eq!(
@@ -2103,6 +2156,47 @@ mod tests {
         );
         wait_for_calls(&state, 2).await;
         wait_for_idle(&gateway, "dev.cats.run").await;
+
+        {
+            let mut cache = gateway.cache.lock().unwrap();
+            for index in 1..MAX_ROUTE_CACHE_ENTRIES {
+                cache.insert(
+                    format!("protected-{index}.cats.run"),
+                    RouteCacheEntry {
+                        cached: Some(protected.clone()),
+                        refresh: None,
+                        retry_after: Instant::now(),
+                        last_failure: None,
+                        shared_lookup_barrier: None,
+                        generation: 0,
+                    },
+                );
+            }
+        }
+        assert_eq!(
+            gateway
+                .resolve("capacity-probe.example", true)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a full cache must reject a new hostname instead of evicting a rejection barrier"
+        );
+        assert!(
+            gateway
+                .cache
+                .lock()
+                .unwrap()
+                .get("dev.cats.run")
+                .unwrap()
+                .has_active_shared_lookup_barrier(Instant::now()),
+            "capacity pressure evicted the local rejection barrier"
+        );
+        assert_eq!(
+            state.calls(),
+            2,
+            "capacity rejection must happen before contacting the control plane"
+        );
 
         gateway
             .cache
@@ -2156,9 +2250,54 @@ mod tests {
                 .unwrap()
                 .get("dev.cats.run")
                 .unwrap()
-                .shared_lookup_allowed,
+                .shared_lookup_allowed(Instant::now()),
             "a direct active + Running resolve clears the local barrier"
         );
+
+        control_task.abort();
+    }
+
+    #[tokio::test]
+    async fn expired_negative_barrier_accepts_a_newer_shared_grant() {
+        let state = Arc::new(RouteServerState::new(RouteReply::Active("grant-1")));
+        let shared_cache = SharedRouteCache::memory();
+        let (gateway, control_task) =
+            route_test_gateway_with_shared_cache(state.clone(), 10, shared_cache.clone()).await;
+        gateway.resolve("dev.cats.run", true).await.unwrap();
+        gateway.invalidate("dev.cats.run");
+
+        let mut peer_grant = shared_cache.load("dev.cats.run").await.unwrap().unwrap();
+        peer_grant.binding.epoch += 1;
+        peer_grant.route_grant = Some("grant-2".to_string());
+        shared_cache
+            .publish("dev.cats.run", &peer_grant)
+            .await
+            .unwrap();
+        gateway
+            .cache
+            .lock()
+            .unwrap()
+            .get_mut("dev.cats.run")
+            .unwrap()
+            .shared_lookup_barrier = Some(SharedLookupBarrier {
+            expires_at: Instant::now(),
+        });
+        state.set(RouteReply::Status(StatusCode::NOT_FOUND));
+
+        let resolved = gateway.resolve("dev.cats.run", true).await.unwrap();
+        assert_eq!(resolved.route_grant.as_deref(), Some("grant-2"));
+        assert_eq!(
+            state.calls(),
+            1,
+            "an expired safety barrier may use a newer peer-primed Grant without waiting for control-plane recovery"
+        );
+        assert!(gateway
+            .cache
+            .lock()
+            .unwrap()
+            .get("dev.cats.run")
+            .unwrap()
+            .shared_lookup_allowed(Instant::now()));
 
         control_task.abort();
     }
@@ -2476,7 +2615,7 @@ mod tests {
                         refresh: None,
                         retry_after: Instant::now(),
                         last_failure: None,
-                        shared_lookup_allowed: true,
+                        shared_lookup_barrier: None,
                         generation: 0,
                     },
                 );
@@ -2497,6 +2636,52 @@ mod tests {
             "capacity rejection must happen before contacting the control plane"
         );
         assert!(gateway.cache.lock().unwrap().contains_key("dev.cats.run"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn expired_rejection_barrier_releases_cache_capacity() {
+        let state = Arc::new(RouteServerState::new(RouteReply::Active("grant-1")));
+        let (gateway, task) = route_test_gateway(state.clone(), 10).await;
+        gateway.resolve("dev.cats.run", true).await.unwrap();
+        let protected = gateway
+            .cache
+            .lock()
+            .unwrap()
+            .get("dev.cats.run")
+            .unwrap()
+            .cached
+            .as_ref()
+            .unwrap()
+            .clone();
+        {
+            let mut cache = gateway.cache.lock().unwrap();
+            cache.clear();
+            let now = Instant::now();
+            let mut expired = RouteCacheEntry::new(now);
+            expired.shared_lookup_barrier = Some(SharedLookupBarrier { expires_at: now });
+            cache.insert("expired-barrier.cats.run".to_string(), expired);
+            for index in 1..MAX_ROUTE_CACHE_ENTRIES {
+                cache.insert(
+                    format!("protected-{index}.cats.run"),
+                    RouteCacheEntry {
+                        cached: Some(protected.clone()),
+                        refresh: None,
+                        retry_after: now,
+                        last_failure: None,
+                        shared_lookup_barrier: None,
+                        generation: 0,
+                    },
+                );
+            }
+        }
+
+        gateway.resolve("dev.cats.run", true).await.unwrap();
+        let cache = gateway.cache.lock().unwrap();
+        assert_eq!(cache.len(), MAX_ROUTE_CACHE_ENTRIES);
+        assert!(!cache.contains_key("expired-barrier.cats.run"));
+        assert!(cache.contains_key("dev.cats.run"));
+        assert_eq!(state.calls(), 2);
         task.abort();
     }
 
