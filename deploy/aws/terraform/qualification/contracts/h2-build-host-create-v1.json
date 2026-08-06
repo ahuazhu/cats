@@ -126,13 +126,13 @@
         "checkout": "060f6eb1327aa3de6dd938b0d33889f62d2643979eb4e24b3757d5da472eeb3b",
         "imds_guard": "55ae2e94b3bbe350b20c29d2aaa6248bbb4552518591b82140add94ef4002dda",
         "immutable_receipt": "c70f6eacb73ba2bea4530dca743c4f7e38eb328af6d1644406a24dd8a85adf54",
-          "publish": "9317a8b260b883ab7513ad3fbad7e378478e1d7220fa58b8bfda2dc7806ecf7c",
+          "publish": "9d2b96f35166281a56ae579126a397dd171afd0d5645d801450d36746817293d",
           "readiness": "a5a004ddeba055a2f4fcbc828b7cacddb9c1231919ea5731d5f302284fa65ada",
           "run_build": "78ef233e9afdc841d1087efc85c25f781d8e2c06d24f2be7ca6c727716164c91",
         "stage_output": "13aee4e5a106072cd2ef4cf43ea3f3e95d57d93d4140024ca40a93f52ed60a7a",
           "toolchain_lock": "5884719764338b75cb42012ad97c48df9a035435b0f5de706af9be4058fd220c"
         },
-        "payload_sha256": "0e105ba5dd814c95689ab63a30b563c789b4c095a9fbe1b3c2f9259121506b69",
+        "payload_sha256": "dcded6f20b170f2c50509fc1e49b1d50969b58c50897a9b618f18d9f03be802e",
         "apt_snapshot_id": "20260801T000000Z"
       },
       "source_policy": {
@@ -470,7 +470,7 @@
     }
   },
   "expected_configuration_root_sha256": "f2fe4d1d6b539f7533f200be06f8e13da76b54c09cbb3cf820ae19dce688d2d4",
-  "expected_managed_changes_sha256": "ce8a194f59535ca67fea7cc0e27f72570ded128051112c9f8d15154b79c01102",
+  "expected_managed_changes_sha256": "c3ca27d33649a52b20a675187132050260011646d09e03197011529c7f5d24cf",
   "required_configuration_references": {
     "aws_instance.build": {
       "root_block_device[0].kms_key_id.references": [

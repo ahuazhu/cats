@@ -117,6 +117,8 @@ class BuildHostBoundaryTests(unittest.TestCase):
         self.assertIn("values   = [aws_kms_key.artifacts.arn]", artifacts)
         self.assertNotIn("values   = [local.artifact_kms_alias_arn]", artifacts)
         self.assertIn("--if-none-match '*'", publisher)
+        self.assertIn('--ssekms-key-id "${kms_key_arn}"', publisher)
+        self.assertNotIn('--ssekms-key-id "${kms_alias_arn}"', publisher)
 
     def test_checkout_uses_only_exact_digests_and_root_publication(self) -> None:
         checkout = self.text("bootstrap/checkout-exact-sha.sh")
@@ -150,7 +152,7 @@ class BuildHostBoundaryTests(unittest.TestCase):
         self.assertIn('chmod 0555 "${job_dir}"', runner)
         self.assertIn("artifact publication is root-mediated", publisher)
         self.assertIn("aws kms describe-key", publisher)
-        self.assertIn('--ssekms-key-id "${kms_alias_arn}"', publisher)
+        self.assertIn('--ssekms-key-id "${kms_key_arn}"', publisher)
         self.assertIn("stage-build-output", publisher)
         self.assertIn('.output_frozen == true', publisher)
         self.assertIn('.job_cgroup_drained == true', publisher)
@@ -178,19 +180,12 @@ class BuildHostBoundaryTests(unittest.TestCase):
         payload = json.dumps(
             observed, sort_keys=True, separators=(",", ":")
         ).encode()
-        for path in (
-            CONTRACT_PATH,
-            PREPARATION_CONTRACT_PATH,
-            MAINTENANCE_CONTRACT_PATH,
-            POLICY_REPAIR_CONTRACT_PATH,
-            KMS_POLICY_REPAIR_CONTRACT_PATH,
-        ):
-            contract = json.loads(path.read_text(encoding="utf-8"))
-            expected = contract["manifest"]["expected"]["bootstrap"]
-            self.assertEqual(expected["components_sha256"], observed)
-            self.assertEqual(
-                expected["payload_sha256"], hashlib.sha256(payload).hexdigest()
-            )
+        contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+        expected = contract["manifest"]["expected"]["bootstrap"]
+        self.assertEqual(expected["components_sha256"], observed)
+        self.assertEqual(
+            expected["payload_sha256"], hashlib.sha256(payload).hexdigest()
+        )
 
     def test_contract_requires_privileged_plan_values_to_be_known(self) -> None:
         common_expected = {

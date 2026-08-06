@@ -92,7 +92,7 @@ readonly response="$(aws s3api put-object \
   --if-none-match '*' \
   --metadata "sha256=${digest}" \
   --server-side-encryption aws:kms \
-  --ssekms-key-id "${kms_alias_arn}")"
+  --ssekms-key-id "${kms_key_arn}")"
 
 jq -e \
   --arg checksum "${checksum_sha256}" \
