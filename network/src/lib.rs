@@ -335,15 +335,17 @@ impl Gateway {
         refresh.complete(result);
     }
 
-    async fn run_refresh(
-        &self,
-        hostname: String,
-        generation: u64,
-        refresh: Arc<RouteRefresh>,
-    ) -> Result<ResolveResponse, ResolveFailure> {
-        let result = self.fetch_route(&hostname).await;
-        self.complete_refresh(&hostname, generation, &refresh, result);
-        refresh.wait().await
+    fn start_refresh(&self, hostname: String, generation: u64, refresh: Arc<RouteRefresh>) {
+        // Refresh ownership must not belong to whichever request happened to
+        // publish the singleflight state. That request may be cancelled at any
+        // await point (client disconnect, timeout, task abort). A Gateway-owned
+        // task always completes or supersedes the shared refresh so followers
+        // cannot wait forever and abandoned hosts cannot consume the cache.
+        let gateway = self.clone();
+        tokio::spawn(async move {
+            let result = gateway.fetch_route(&hostname).await;
+            gateway.complete_refresh(&hostname, generation, &refresh, result);
+        });
     }
 
     async fn resolve(&self, hostname: &str, use_cache: bool) -> Result<ResolveResponse, Response> {
@@ -361,7 +363,9 @@ impl Gateway {
                 let mut cache = self.cache.lock().unwrap();
                 if !cache.contains_key(hostname) && cache.len() >= MAX_ROUTE_CACHE_ENTRIES {
                     let evict = cache.iter().find_map(|(hostname, entry)| {
-                        entry.refresh.is_none().then(|| hostname.clone())
+                        (entry.refresh.is_none()
+                            && cached_outage_route(entry.cached.as_ref()).is_none())
+                        .then(|| hostname.clone())
                     });
                     if let Some(evict) = evict {
                         cache.remove(&evict);
@@ -426,11 +430,7 @@ impl Gateway {
             match action {
                 Action::Return(resolved) => return Ok(resolved),
                 Action::ReturnAndRefresh(resolved, refresh, generation) => {
-                    let gateway = self.clone();
-                    let hostname = hostname.to_string();
-                    tokio::spawn(async move {
-                        let _ = gateway.run_refresh(hostname, generation, refresh).await;
-                    });
+                    self.start_refresh(hostname.to_string(), generation, refresh);
                     return Ok(resolved);
                 }
                 Action::Wait(refresh) => match refresh.wait().await {
@@ -439,10 +439,8 @@ impl Gateway {
                     Err(error) => return Err(error.into_response()),
                 },
                 Action::Refresh(refresh, generation) => {
-                    match self
-                        .run_refresh(hostname.to_string(), generation, refresh)
-                        .await
-                    {
+                    self.start_refresh(hostname.to_string(), generation, refresh.clone());
+                    match refresh.wait().await {
                         Ok(resolved) => return Ok(resolved),
                         Err(ResolveFailure::Superseded) => continue,
                         Err(error) => return Err(error.into_response()),
@@ -1267,6 +1265,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_cold_miss_leader_does_not_strand_followers() {
+        let state = Arc::new(RouteServerState::new(RouteReply::Delayed(
+            Duration::from_millis(100),
+            Box::new(RouteReply::Active("grant-1")),
+        )));
+        let (gateway, task) = route_test_gateway(state.clone(), 10).await;
+        let leader_gateway = gateway.clone();
+        let leader =
+            tokio::spawn(async move { leader_gateway.resolve("dev.cats.run", true).await });
+        wait_for_calls(&state, 1).await;
+        leader.abort();
+
+        let follower = tokio::time::timeout(
+            Duration::from_secs(1),
+            gateway.resolve("dev.cats.run", true),
+        )
+        .await
+        .expect("a cancelled leader must not leave the shared refresh pending")
+        .expect("the managed refresh still returns the resolved route");
+        assert_eq!(follower.route_grant.as_deref(), Some("grant-1"));
+        assert_eq!(
+            state.calls(),
+            1,
+            "the follower must join the managed refresh instead of starting another"
+        );
+        wait_for_idle(&gateway, "dev.cats.run").await;
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn failed_refresh_backs_off_then_recovers_without_extending_expiry() {
         let state = Arc::new(RouteServerState::new(RouteReply::Active("grant-1")));
         let (gateway, task) = route_test_gateway(state.clone(), 10).await;
@@ -1380,6 +1408,99 @@ mod tests {
         let cache = gateway.cache.lock().unwrap();
         assert_eq!(cache.len(), MAX_ROUTE_CACHE_ENTRIES);
         assert!(cache.contains_key("dev.cats.run"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn unknown_host_flood_cannot_evict_an_unexpired_outage_grant() {
+        let state = Arc::new(RouteServerState::new(RouteReply::Active("grant-1")));
+        let (gateway, task) = route_test_gateway(state.clone(), 10).await;
+        gateway.resolve("dev.cats.run", true).await.unwrap();
+        {
+            let mut cache = gateway.cache.lock().unwrap();
+            for index in 0..(MAX_ROUTE_CACHE_ENTRIES - 1) {
+                cache.insert(
+                    format!("unresolved-{index}.cats.run"),
+                    RouteCacheEntry::new(Instant::now()),
+                );
+            }
+        }
+
+        state.set(RouteReply::Status(StatusCode::NOT_FOUND));
+        for index in 0..128 {
+            assert_eq!(
+                gateway
+                    .resolve(&format!("attacker-{index}.example"), true)
+                    .await
+                    .unwrap_err()
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+        }
+        assert!(
+            gateway.cache.lock().unwrap().contains_key("dev.cats.run"),
+            "negative cache churn evicted a still-authorized endpoint"
+        );
+
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        state.set(RouteReply::Status(StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(
+            gateway
+                .resolve("dev.cats.run", true)
+                .await
+                .unwrap()
+                .route_grant
+                .as_deref(),
+            Some("grant-1"),
+            "the real endpoint lost its outage authority before signed expiry"
+        );
+        wait_for_idle(&gateway, "dev.cats.run").await;
+        assert_eq!(gateway.cache.lock().unwrap().len(), MAX_ROUTE_CACHE_ENTRIES);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn full_cache_of_unexpired_grants_rejects_an_unknown_host() {
+        let state = Arc::new(RouteServerState::new(RouteReply::Active("grant-1")));
+        let (gateway, task) = route_test_gateway(state.clone(), 10).await;
+        gateway.resolve("dev.cats.run", true).await.unwrap();
+        {
+            let mut cache = gateway.cache.lock().unwrap();
+            let protected = cache
+                .get("dev.cats.run")
+                .unwrap()
+                .cached
+                .as_ref()
+                .unwrap()
+                .clone();
+            for index in 1..MAX_ROUTE_CACHE_ENTRIES {
+                cache.insert(
+                    format!("protected-{index}.cats.run"),
+                    RouteCacheEntry {
+                        cached: Some(protected.clone()),
+                        refresh: None,
+                        retry_after: Instant::now(),
+                        last_failure: None,
+                        generation: 0,
+                    },
+                );
+            }
+        }
+
+        assert_eq!(
+            gateway
+                .resolve("unknown.example", true)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            state.calls(),
+            1,
+            "capacity rejection must happen before contacting the control plane"
+        );
+        assert!(gateway.cache.lock().unwrap().contains_key("dev.cats.run"));
         task.abort();
     }
 
