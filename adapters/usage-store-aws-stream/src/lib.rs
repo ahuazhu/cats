@@ -28,6 +28,20 @@ const ARCHIVE_BATCH_MAX_RECORDS: usize = 1_000;
 // Node checkpoints target ten seconds. A fifty-second archive window keeps
 // end-to-end provisional-billing freshness within the sixty-second target.
 const ARCHIVE_BATCH_MAX_AGE: Duration = Duration::from_secs(50);
+// Kinesis permits five GetRecords calls per second per shard, but AWS
+// recommends a full second between calls: an exact 200 ms loop has no margin
+// for scheduling jitter, while the old non-empty-response path had no delay at
+// all. One read can return far more than a shard can ingest in one second, so
+// this remains sufficient to keep up without continuously throttling.
+const KINESIS_READ_INTERVAL: Duration = Duration::from_secs(1);
+
+fn kinesis_read_pacer() -> tokio::time::Interval {
+    let mut pacer = tokio::time::interval(KINESIS_READ_INTERVAL);
+    // A delayed projection/archive operation must not be followed by a burst
+    // of nominally missed reads that immediately violates the shard limit.
+    pacer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    pacer
+}
 
 struct PendingRecord {
     sequence_number: String,
@@ -167,8 +181,12 @@ impl AwsUsageStreamStore {
         let mut pending = Vec::<PendingRecord>::new();
         let mut pending_bytes = 0_usize;
         let mut pending_since = None;
+        let mut read_pacer = kinesis_read_pacer();
 
         while let Some(current_iterator) = iterator {
+            // The first tick is immediate. Every later GetRecords request is
+            // paced regardless of whether the preceding response was empty.
+            read_pacer.tick().await;
             let output = self
                 .kinesis
                 .get_records()
@@ -205,9 +223,6 @@ impl AwsUsageStreamStore {
                 pending_since = None;
             }
             iterator = output.next_shard_iterator().map(ToString::to_string);
-            if output.records().is_empty() {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
         }
         if let Some(sequence) = self.project_batch(shard_id, &pending).await? {
             self.save_checkpoint(shard_id, &sequence).await?;
@@ -679,6 +694,26 @@ mod tests {
     #[test]
     fn empty_archive_batch_is_a_noop() {
         assert!(encode_archive_batch("shard", &[]).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn shard_reads_use_the_non_bursting_one_second_pacer() {
+        let mut pacer = kinesis_read_pacer();
+        assert_eq!(
+            pacer.missed_tick_behavior(),
+            tokio::time::MissedTickBehavior::Delay
+        );
+
+        // Tokio intervals make their first tick immediately available. The
+        // second proves that every loop iteration pays the interval, without
+        // depending on whether a Kinesis response carried records.
+        let first = pacer.tick().await;
+        let second = pacer.tick().await;
+        assert_eq!(
+            second.duration_since(first),
+            KINESIS_READ_INTERVAL,
+            "the pacer did not schedule consecutive Kinesis reads one second apart"
+        );
     }
 
     struct RecordingProjection {
