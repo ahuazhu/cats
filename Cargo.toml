@@ -20,6 +20,7 @@ members = [
     "cmd/blockd",
     "cmd/controld",
     "cmd/noded",
+    "tools/rc-source-chain",
     "tests/support",
     "tests",
 ]

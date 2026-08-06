@@ -1,0 +1,29 @@
+{
+  "schema": "cats.rc-source-chain.v1",
+  "repository": "ahuazhu/cats",
+  "controller_sha": "__CONTROLLER__",
+  "push": {
+    "event_name": "push",
+    "git_ref": "refs/heads/rc/architecture-v2",
+    "before_sha": "__PREVIOUS__",
+    "after_sha": "__CANDIDATE__",
+    "forced": false,
+    "workflow_run_id": 24507,
+    "workflow_run_attempt": 1
+  },
+  "integration": {
+    "kind": "emergency_main_sync",
+    "issue_number": 204,
+    "reason": "Restore the RC branch to the exact reviewed main head after an emergency main fix.",
+    "initiated_by": "release-operator",
+    "main_sha": "__CANDIDATE__",
+    "approved_by": ["independent-reviewer"],
+    "required_checks": [
+      {
+        "name": "CI",
+        "head_sha": "__CANDIDATE__",
+        "conclusion": "success"
+      }
+    ]
+  }
+}

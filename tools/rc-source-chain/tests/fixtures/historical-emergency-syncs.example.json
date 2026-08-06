@@ -1,0 +1,16 @@
+{
+  "schema": "cats.rc-emergency-sync-history.example.v1",
+  "qualification_evidence": false,
+  "edges": [
+    {
+      "project_sync": "001",
+      "before_sha": "08bf2439e6d7b1928334c18d61d3e99da7deef3e",
+      "after_sha": "4711b49a4d82099db82fbf6351e4054f60cf7913"
+    },
+    {
+      "project_sync": "002",
+      "before_sha": "4711b49a4d82099db82fbf6351e4054f60cf7913",
+      "after_sha": "d0658064764ee5d77430662fdc8f4c7fda120189"
+    }
+  ]
+}

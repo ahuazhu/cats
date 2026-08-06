@@ -1,0 +1,36 @@
+{
+  "schema": "cats.rc-source-chain.v1",
+  "repository": "ahuazhu/cats",
+  "controller_sha": "__CONTROLLER__",
+  "push": {
+    "event_name": "push",
+    "git_ref": "refs/heads/rc/architecture-v2",
+    "before_sha": "__PREVIOUS__",
+    "after_sha": "__WRONG_HEAD__",
+    "forced": false,
+    "workflow_run_id": 24503,
+    "workflow_run_attempt": 1
+  },
+  "integration": {
+    "kind": "reviewed_pull_request",
+    "pull_request_number": 245,
+    "base_ref": "rc/architecture-v2",
+    "author_login": "implementation-agent",
+    "reviewed_head_sha": "__WRONG_HEAD__",
+    "integrated_sha": "__WRONG_HEAD__",
+    "approvals": [
+      {
+        "reviewer_login": "independent-reviewer",
+        "reviewed_head_sha": "__WRONG_HEAD__",
+        "state": "approved"
+      }
+    ],
+    "required_checks": [
+      {
+        "name": "CI",
+        "head_sha": "__WRONG_HEAD__",
+        "conclusion": "success"
+      }
+    ]
+  }
+}
