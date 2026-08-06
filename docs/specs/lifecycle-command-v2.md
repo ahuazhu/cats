@@ -41,12 +41,41 @@ Normative words `MUST`, `MUST NOT`, `SHOULD` and `MAY` are used as in RFC 2119.
 | `runtime_id` | Node-ledger identity of one physical Cat runtime lineage | Survives Agent restart/adoption; changes on a fresh runtime lineage. |
 | `effect_id` | One conditional MetadataStore mutation | Exact replay returns the original receipt. |
 | `grant_id` | One volume authority offered to one dispatch/Node/volume | Invalidated monotonically; never rebound. |
-| `route_retirement_id` | One prerequisite revocation/drain for an exact Running authority | Exact replay returns the B/C receipt; it is never rebound to another epoch/runtime. |
-| `route_publication_intent_id` | One immutable A-to-B bind/unbind handoff | Exact replay returns B's receipt; obsolete work terminates stale. |
+| `retirement_id` | One prerequisite revocation/drain for an exact Running authority | Exact replay returns the B/C receipt; it is never rebound to another scope, epoch or runtime. |
+| `retirement_token` | Random immutable exact identity of one retirement receipt | Never reused; a predecessor token is compared at its exact structural path. |
+| `route_intent_id` | One immutable A-to-B bind/unbind handoff | The same ID continues into the materialized Route and Node ACK; obsolete work terminates stale. |
+| `compensation_intent_id` | One immutable fresh-epoch recovery of a policy-retired Running route | Never rebound to another proposal, receipt, lineage or Route snapshot. |
 
 All IDs are opaque, globally unique strings with their normal Cats type prefix.
 No receiver parses identity or ordering from an ID. Ordering comes from the
 explicit sequence/generation fields and exact foreign-key relationships.
+
+### 2.1 Shared settled lifecycle lineage
+
+A, B and C use the same closed value object:
+
+```text
+SettledLifecycleLineageV1 {
+  command_id + command_seq
+  dispatch_id + dispatch_seq + request_body_sha256
+  target_node_id
+  node_claim_id
+  result_id
+  runtime_identity {
+    runtime_id + runtime_generation
+    host_boot_id? + guest_boot_id?
+  }
+}
+```
+
+Every field is mandatory except the two explicitly optional boot IDs.
+`cat_runtime_state` stores `intent_generation` and this complete lineage.
+Evidence-only settlement and policy compensation preserve the originating
+physical lineage byte-for-byte while storing the current authorizing
+`intent_generation` and `intent_resolution_id` separately. They MUST NOT clear
+or replace command, dispatch, claim, result, target Node or runtime identity.
+An optional audit digest is additional data only and cannot authorize or
+replace structural equality.
 
 ## 3. LifecycleCommand record contract
 
@@ -200,11 +229,12 @@ PolicyTransitionProposalV2 {
   expected_cat_generation
   expected_current_intent_id?
   expected_desired_state = running
-  runtime_id + runtime_authority_revision + node_id
-  expected_route_id + expected_route_epoch + expected_route_authority_revision
+  old_install_id + old_route_intent_id + old_route_epoch
+  old_settled_lineage: SettledLifecycleLineageV1
+  expected_route_authority_revision
   control_work_version
   guest_source_epoch + guest_lease_sequence + guest_signal_freshness_deadline
-  snapshot_provenance_digest
+  work_fence_digest
   phase = proposed | checking_idle | busy | retired | promoted
         | stale_adopted | stale | compensated
 }
@@ -215,9 +245,10 @@ RouteRetirement with `mode=require_idle`. Under C's per-Cat admission lock,
 active/unknown guards or a changed work fence return an exact busy/stale proof
 without route revocation, transport cancellation or any lifecycle-authority
 change. At exact zero, C closes admission and durably records a
-proposal-and-epoch-bound prepared token under the lock, then releases it. B
-conditionally revokes the named route epoch using that token and B/C finalize a
-queryable applied receipt. Recovery of a prepared token queries both sides and
+proposal-and-epoch-bound `retirement_prepare_id` under the lock, then releases
+it. B conditionally revokes the named route epoch using that prepare identity
+and B/C finalize a queryable applied receipt with its own immutable
+`retirement_token`. Recovery of a prepare identity queries both sides and
 either completes the same revocation or reopens admission only while the same
 route/runtime authority is still current; no runtime or PostgreSQL lock spans
 the call.
@@ -231,13 +262,14 @@ generation, `cat.auto_suspend` Operation, Suspended intent, Suspend command and:
 PolicyRetirementPromotionV2 {
   policy_promotion_id
   policy_proposal_id
-  route_retirement_receipt_id
+  route_retirement_receipt_id + route_retirement_token
   cat_id
   intent_id + intent_generation
   operation_id
   command_id
-  runtime_id + runtime_authority_revision
-  retired_route_epoch + work_fence_digest
+  old_install_id + old_route_intent_id + retired_route_epoch
+  old_settled_lineage: SettledLifecycleLineageV1
+  work_fence_digest
 }
 ```
 
@@ -344,47 +376,68 @@ applied retirement. The retirement itself is scoped to one command or one
 pre-authority policy proposal:
 
 ```text
-route_retirement {
-  route_retirement_id
+RouteRetirementV1 {
+  retirement_id
   request_digest
   cat_id
-  scope = command(intent_generation + command_id)
-        | policy(policy_proposal_id + expected_cat_generation)
+  scope = route_intent(route_intent_id)
+        | lifecycle_command(intent_generation + command_id)
+        | policy_proposal(policy_proposal_id + expected_cat_generation)
   mode = cancel_and_drain | require_idle
-  runtime_id
-  retired_route_epoch
-  retired_authority_revision
-  expected_predecessor = active_route
-                       | retired_by_policy(policy_receipt_id + prepared_token_id)
+  old_install_id + old_route_intent_id + old_route_epoch
+  old_settled_lineage: SettledLifecycleLineageV1
+  expected_predecessor = active_authority(old_install_id, old_route_epoch,
+                                          old_settled_lineage)
+                       | retired_by_policy(policy_proposal_id,
+                                           retirement_token)
   expected_work_fence?          # required for require_idle
   phase = planned | prepared | applying | applied | busy | blocked
-  prepared_token_id?
+  retirement_prepare_id?        # internal B/C recovery identity, never a receipt token
   proof_or_receipt_id?
 }
 
 RouteRetirementBusyProofV1 {
   busy_proof_id
-  route_retirement_id + request_digest
+  retirement_id + request_digest
   policy_proposal_id
-  runtime_id + node_id + route_epoch
+  old_install_id + old_route_intent_id + old_route_epoch
+  old_settled_lineage: SettledLifecycleLineageV1
   work_fence_digest + guard_registry_revision
   active_guard_count?           # null means unknown/fail-awake
+  authority_state = active
 }
 
-RouteRetirementAppliedReceiptV1 {
-  receipt_id
-  route_retirement_id + request_digest
-  exact scope + mode
-  outcome = revoked | adopted_retired_predecessor
-  runtime_id + node_id
-  retired_route_epoch
-  retired_authority_revision
-  prepared_token_id?
-  predecessor_policy_receipt_id? # required only for adopted predecessor
-  zero_active_guard_proof_digest
-  node_ack_or_external_fence_receipt_id
+RouteRetirementReceiptV1 {
+  retirement_id
+  mode = cancel_and_drain | require_idle
+  scope = route_intent | lifecycle_command | policy_proposal
+  retirement_token              # random immutable exact receipt identity
+  predecessor = active_authority(old_install_id, old_route_epoch,
+                                 old_settled_lineage)
+              | retired_by_policy(policy_proposal_id, retirement_token)
+  outcome = retired | adopted_retired_predecessor
+  reason_route_intent_id?
+  reason_lifecycle_intent_generation?
+  reason_lifecycle_command_id?
+  reason_policy_proposal_id?
+  old_install_id + old_route_intent_id
+  old_route_epoch
+  old_settled_lineage: SettledLifecycleLineageV1
+  guard_registry_revision
+  cancelled_guard_set_digest?   # cancel_and_drain required; require_idle absent
+  remaining_active_guard_count = 0
+  admission_state = revoked
+  durable_sequence + completed_at
 }
 ```
+
+The receipt scope and reason family are an immutable one-of. For a command
+adoption receipt, the outer `RouteRetirementReceiptV1.retirement_token` is the
+new receipt's identity, while
+`RouteRetirementReceiptV1.predecessor.retirement_token` is byte-for-byte the
+existing policy receipt P's token. `retirement_prepare_id` is local
+prepare/recovery scheduling identity only and MUST NOT appear in, or satisfy,
+the `retired_by_policy` predecessor.
 
 For `cancel_and_drain`, B/C issues the receipt only after exact-epoch admission
 revoke, cancellation and drain of every matching HTTP/WebSocket/stream guard to
@@ -396,8 +449,9 @@ Auto-suspend uses `require_idle`. C compares the work fence and active guards
 under its per-Cat admission lock before B revokes. A nonzero/unknown count or
 changed fence returns an immutable busy/stale proof and MUST NOT revoke the
 route, cancel a guard or change lifecycle authority. Only exact zero closes
-admission and persists a prepared token under the lock. B then conditionally
-revokes with that token and B/C finalizes the receipt; prepared recovery is
+admission and persists a `retirement_prepare_id` under the lock. B then
+conditionally revokes with that prepare identity and B/C finalizes the receipt
+with a new immutable `retirement_token`; prepare recovery is
 queryable/idempotent. An unreachable Node fails awake.
 
 TTL/cache/heartbeat is not a receipt. Suspend, Cold/Destroy from Running and
@@ -409,27 +463,68 @@ before physical lifecycle effects.
 If a manual leaving-Running command commits after a policy receipt retired the
 route but before policy promotion, the changed current intent/generation makes
 policy promotion stale. The manual command creates a new command-scoped
-`cancel_and_drain` request whose expected predecessor is that exact policy
-receipt/token. B serializes it with proposal compensation. C verifies the same
-runtime/route authority and closed admission gate, then rechecks zero guards or
-uses the manual command's authority to cancel/drain any local guard that
-appeared. B/C returns a distinct command-scoped
-`adopted_retired_predecessor` receipt referencing the policy receipt. It does
-not allocate an epoch, mutate either request scope or reactivate the old epoch.
+`cancel_and_drain` request whose expected predecessor is exactly
+`retired_by_policy(P, P.retirement_token)`. B serializes it with proposal
+compensation. C verifies the same install, route epoch, complete settled
+lineage and closed admission gate, then rechecks zero guards or uses the manual
+command's authority to cancel/drain any local guard that appeared. B/C returns
+a distinct command-scoped receipt with
+`predecessor=retired_by_policy(P, P.retirement_token)` and
+`outcome=adopted_retired_predecessor`. It does not allocate an epoch, mutate
+either request scope or reactivate the old epoch.
 
 The proposal becomes `stale_adopted` and compensation is suppressed only if
 that adoption receipt belongs to the exact current command/generation and the
 command still requires the route retired. In an earlier ordering where the
 manual route CAS wins before the policy CAS, the proposal becomes stale behind
-the command's ordinary `revoked` receipt. If
+the command's ordinary `outcome=retired` receipt. If
 the command is superseded, keeps Running, or adoption cannot be proven,
 recovery conditionally publishes a fresh epoch for unchanged Running authority.
 
-Adoption and compensation serialize on B's route row. If compensation wins,
-the immutable adoption request terminates stale and the command creates a new
-command-scoped retirement request against the freshly published epoch. If
-adoption wins, `stale_adopted` prevents compensation. Neither branch mutates a
-request predecessor or reuses an epoch.
+Node receipt creation is serialized by C's per-Cat lock. Control-plane receipt
+ingestion and compensation apply use the Cat-first route-materialization lock
+order and lock the same materialized Route row. The exact row state is:
+
+```text
+pending_policy_retirement(P, retirement_token, old_epoch, old_install,
+                          old_lineage)
+  -> adopted_by_command(command_id, receipt_id)
+   | compensated_by_route(compensation_intent_id, fresh_epoch)
+```
+
+Here `P = policy_proposal_id`; every other predecessor member is read exactly
+from P's receipt and the pending Route row. `receipt_id` is the immutable
+`route_retirement_receipt_id` of the winning command-scoped receipt;
+`fresh_epoch` is B's greater route epoch for the winning compensation. Exactly
+one conditional update may win. P alone is not a predecessor: token, old
+epoch, install and complete lineage all compare. A mismatch is a typed
+stale/conflict result with no mutation. The loser rolls back its whole
+transaction, reloads a fresh Cat/Route snapshot and replans; it MUST NOT replay
+only the old receipt. If compensation wins, the immutable adoption request
+terminates stale and the command creates a new immutable command-scoped
+retirement against the freshly published epoch. If adoption wins,
+`stale_adopted` prevents compensation. Neither branch mutates a request
+predecessor or reuses an epoch.
+
+The compensation owner is:
+
+```text
+RouteRetirementCompensationIntentV1 {
+  compensation_intent_id
+  policy_proposal_id
+  policy_retirement_receipt_id + policy_retirement_token
+  originating_route_intent_id
+  old_install_id + old_route_epoch
+  old_settled_lineage: SettledLifecycleLineageV1
+  expected_cat_intent_generation
+  expected_endpoint_and_route_snapshot
+  phase = planned | applying | applied | stale | blocked
+}
+```
+
+Discovery/creation and apply are separated by this durable row. Compensation
+always installs/publishes the same settled Running lineage at a fresh epoch;
+it never edits the old receipt, epoch or local authority back to active.
 
 ### 4.5 Volume grant
 
@@ -770,19 +865,13 @@ After exact reduction, A may persist one immutable handoff:
 
 ```text
 RoutePublicationIntentV1 {
-  route_publication_intent_id
+  route_intent_id
   cat_id
   intent_generation
   intent_resolution_id
-  command_id?
-  dispatch_id?
-  node_claim_id?
-  result_id?
+  settled_lineage: SettledLifecycleLineageV1
   policy_proposal_id?
   policy_retirement_receipt_id?
-  runtime_id
-  runtime_authority_revision
-  node_id
   action = bind | unbind
   endpoint_ids
   protocol
@@ -790,13 +879,45 @@ RoutePublicationIntentV1 {
   expected_route_id?
   expected_route_epoch?
   expected_route_authority_revision
-  lifecycle_provenance_digest
 }
 ```
 
+B0's `route_intent_id` is the canonical identity of this A-to-B row; there is
+no second publication-intent ID or mapping. Every bind, unbind and compensation
+handoff carries the complete originating physical lineage. Evidence-only
+settlement and compensation retain that lineage byte-for-byte and put the
+current authorizing `intent_generation`/`intent_resolution_id` beside it; they
+MUST NOT omit the originating command, dispatch, claim or result. Policy fields
+are additionally required for policy compensation, not substitutes for
+lineage.
+
+Conditional materialization and issuer eligibility require:
+
+```text
+Cat.intent_generation
+  == cat_runtime_state.intent_generation
+  == RoutePublicationIntentV1.intent_generation
+  == materialized_route.intent_generation
+  == runtime_route_authority_ack.intent_generation
+  == RuntimeRouteAuthorityV1.intent_generation
+
+cat_runtime_state.settled_lineage
+  == RoutePublicationIntentV1.settled_lineage
+  == materialized_route.settled_lineage
+  == runtime_route_authority_ack.settled_lineage
+  == RuntimeRouteAuthorityV1.settled_lineage
+```
+
+The second equality compares every member and optional-field presence.
+`settled_lineage.target_node_id` also equals Cat assignment, materialized Route
+target and ACK/local-authority Node. The handoff, materialized Route and Node
+ACK carry the same `route_intent_id`. A digest may be stored only as additional
+audit data; digest equality alone is not authorization.
+
 B alone allocates `route_epoch`. It applies under Cat -> current intent ->
-current command (if any) -> exact runtime -> sorted Endpoints -> sorted Routes
--> route intent, conditionally comparing every predecessor/provenance field.
+current command (if any) -> exact runtime -> sorted work rows -> sorted
+Endpoints -> sorted materialized Routes -> route intent/compensation intent,
+conditionally comparing every predecessor/provenance field.
 Exact replay returns the same receipt; delayed or out-of-order work becomes
 terminal `stale` and cannot publish. A consumes the receipt but never writes a
 route row/epoch. A controller scheduling claim must be released before the
