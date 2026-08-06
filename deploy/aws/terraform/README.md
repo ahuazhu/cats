@@ -201,6 +201,7 @@ example:
 ```sh
 export TF_VAR_runtime_secret_data='{"CATS_AUTH_TOKEN":"...","CATS_ADMIN_TOKEN":"..."}'
 export TF_VAR_route_grant_private_key_pem="$(cat /approved/secret/path/route-grant-private.pem)"
+export TF_VAR_route_grant_public_key_pem="$(openssl pkey -in /approved/secret/path/route-grant-private.pem -pubout)"
 export TF_VAR_storage_postgres_url='postgresql://...'
 export TF_VAR_usage_postgres_url='postgresql://...'
 export TF_VAR_rds_ca_pem='-----BEGIN CERTIFICATE-----...'
@@ -220,8 +221,10 @@ exist in state and in saved plans, which is why both require the same access
 control as production credentials.
 
 The Route Grant key is asymmetric (ADR-0033). Every control-plane replica gets
-the same private key from the application state; metal workers get only its
-public half from the infrastructure state. Never add the private key to
+the same private key from the application state and the application public half
+must be derived from that exact input; startup signs and verifies a proof before
+readiness. Metal workers get only the public half from the infrastructure state.
+Never add the private key to
 `runtime_secret_data`, `worker_runtime_secret_data`, Gateway configuration or a
 Guest image. Generate the pair with `openssl genpkey -algorithm ED25519` and
 `openssl pkey -pubout`, then rotate it only through a coordinated drained
@@ -230,20 +233,26 @@ rollout until multi-key verification exists.
 The first Route Grant release has a strict compatibility order:
 
 1. configure the application private-key input and the matching infrastructure
-   public-key input, but do not deploy the new worker bundle yet;
+   public-key input, but do not deploy the new worker bundle yet. CI derives
+   the application public half from its exact private secret instead of
+   accepting a second independently editable key input;
 2. deploy the application first. Terraform waits for the complete control-plane
    rollout before it starts the Gateway rollout. Old Gateways ignore the new
    response fields, and old Nodes ignore the grant forwarded by a new Gateway;
 3. drain, deploy and uncordon one worker at a time using the worker procedure
-   below. Never uncordon a Node that requires Route Grants while the old Gateway
-   is still live: the Node deliberately rejects its unsigned requests;
+   below. The association verifies the installed public-key fingerprint; the
+   Node reports it at registration, and the control plane refuses uncordon
+   unless it matches the active signer. Never uncordon a Node that requires
+   Route Grants while the old Gateway is still live: the Node deliberately
+   rejects its unsigned requests;
 4. if the application must be rolled back after any worker has been upgraded,
    first drain those workers and restore the compatible old worker bundle. An
    old Gateway cannot serve a Node that requires a Route Grant.
 
 This additive first release is not the key-rotation procedure. With one accepted
 public key, rotation still needs the coordinated drained boundary described
-above; do not swap either half independently.
+above; do not swap either half independently. The application workflow fails
+before Terraform plan if any enforcing Ready Node reports a different key.
 
 `storage_postgres_url` and `usage_postgres_url` are intentionally independent.
 During the early shared-RDS phase they may point to the same instance/database,

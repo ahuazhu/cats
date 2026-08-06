@@ -58,6 +58,46 @@ use cats_api::resources::*;
 
 pub type Result<T> = std::result::Result<T, ApiError>;
 
+/// Scheduling admission carried by one Node registration.
+///
+/// Keeping the verifier identity and its compatibility decision together
+/// prevents callers from accidentally persisting one fingerprint while
+/// applying the admission result for another.
+pub(crate) struct NodeAdmission<'a> {
+    initially_cordoned: bool,
+    route_grant_public_key_sha256: Option<&'a str>,
+    force_cordoned: bool,
+}
+
+impl<'a> NodeAdmission<'a> {
+    pub(crate) fn legacy(initially_cordoned: bool) -> Self {
+        Self {
+            initially_cordoned,
+            route_grant_public_key_sha256: None,
+            force_cordoned: false,
+        }
+    }
+
+    pub(crate) fn for_route_grant(
+        initially_cordoned: bool,
+        actual: Option<&'a str>,
+        expected: &str,
+    ) -> Self {
+        Self {
+            // Missing identity is compatible only with a row that already
+            // existed before Route Grants. This flag is insert-only in the
+            // upsert, so an existing Ready legacy Node stays live during the
+            // additive rollout while a brand-new legacy Node cannot bypass
+            // administrator admission.
+            initially_cordoned: initially_cordoned || actual.is_none(),
+            route_grant_public_key_sha256: actual,
+            // `None` is the explicit legacy compatibility case for the first
+            // additive rollout. Any Node that enforces grants reports `Some`.
+            force_cordoned: actual.is_some_and(|actual| actual != expected),
+        }
+    }
+}
+
 pub fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

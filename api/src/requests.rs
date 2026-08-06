@@ -226,6 +226,7 @@ mod tests {
         .expect("deserialize the legacy registration payload");
 
         assert!(!request.initially_cordoned);
+        assert!(request.route_grant_public_key_sha256.is_none());
     }
 }
 
@@ -307,6 +308,10 @@ pub struct RegisterNodeRequest {
     pub gateway_url: String,
     pub cpus: u32,
     pub memory_mib: u64,
+    /// Stable identity of the Ed25519 verifier key this Node actually loaded.
+    /// Absent only for pre-Route-Grant Nodes during the additive rollout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_grant_public_key_sha256: Option<String>,
     /// Only controls the scheduling state of a node the control plane has
     /// never seen. Re-registration preserves the administrator's existing
     /// cordon decision.

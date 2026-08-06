@@ -5,6 +5,10 @@ impl Store {
     // Nodes
     // ------------------------------------------------------------------
 
+    /// Legacy-compatible registration used by callers that predate signed
+    /// Route Grants. Production HTTP registration uses the admission-aware
+    /// path below; keeping this wrapper preserves the Store's existing public
+    /// API without exposing control-plane signer policy through it.
     pub fn register_node(
         &self,
         node_id: &str,
@@ -14,30 +18,60 @@ impl Store {
         memory_mib: u64,
         initially_cordoned: bool,
     ) -> Result<()> {
+        self.register_node_with_admission(
+            node_id,
+            agent_url,
+            gateway_url,
+            cpus,
+            memory_mib,
+            NodeAdmission::legacy(initially_cordoned),
+        )
+    }
+
+    pub(crate) fn register_node_with_admission(
+        &self,
+        node_id: &str,
+        agent_url: &str,
+        gateway_url: &str,
+        cpus: u32,
+        memory_mib: u64,
+        admission: NodeAdmission<'_>,
+    ) -> Result<()> {
         let now = now_ms();
         let cpus = cpus as i64;
         let memory_mib = memory_mib as i64;
+        let NodeAdmission {
+            initially_cordoned,
+            route_grant_public_key_sha256,
+            force_cordoned,
+        } = admission;
         self.with(|client| {
             client
                 .execute(
                     "INSERT INTO nodes (id, agent_url, gateway_url, state, cpus, memory_mib,
-                                        last_heartbeat_ms, scheduling_disabled)
+                                        last_heartbeat_ms, scheduling_disabled,
+                                        route_grant_public_key_sha256)
                      VALUES ($1,$2,$3,
-                             CASE WHEN $7 THEN 'cordoned' ELSE 'ready' END,
-                             $4,$5,$6,$7)
+                             CASE WHEN $7 OR $9 THEN 'cordoned' ELSE 'ready' END,
+                             $4,$5,$6,$7 OR $9,$8)
                      ON CONFLICT(id) DO UPDATE SET
                        agent_url=$2, gateway_url=$3,
                        -- $7 is intentionally insert-only. Once this row exists,
                        -- scheduling state belongs to the control plane/admin.
+                       -- $9 is the exception: an incompatible verifier must
+                       -- fail closed even when this identity was Ready before.
                        state=CASE
-                           WHEN nodes.state='draining' THEN 'draining'
                            WHEN nodes.state='fenced' THEN 'fenced'
                            WHEN nodes.state='lost' THEN 'lost'
+                           WHEN nodes.state='draining' THEN 'draining'
+                           WHEN $9 THEN 'cordoned'
                            WHEN nodes.scheduling_disabled THEN 'cordoned'
                            ELSE 'ready'
                        END,
                        cpus=$4, memory_mib=$5, last_heartbeat_ms=$6,
-                       reported_cats_json=NULL",
+                       reported_cats_json=NULL,
+                       route_grant_public_key_sha256=$8,
+                       scheduling_disabled=nodes.scheduling_disabled OR $9",
                     &[
                         &node_id,
                         &agent_url,
@@ -46,6 +80,8 @@ impl Store {
                         &memory_mib,
                         &now,
                         &initially_cordoned,
+                        &route_grant_public_key_sha256,
+                        &force_cordoned,
                     ],
                 )
                 .map(|_| ())

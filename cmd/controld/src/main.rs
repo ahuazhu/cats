@@ -105,6 +105,10 @@ struct Args {
     /// short-lived Endpoint Route Grants (ADR-0033).
     #[arg(long, env = "CATS_ROUTE_GRANT_PRIVATE_KEY_FILE")]
     route_grant_private_key_file: std::path::PathBuf,
+    /// Matching Ed25519 public key. Startup signs and verifies a challenge so a
+    /// deployment cannot become Ready with independently mismatched key halves.
+    #[arg(long, env = "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE")]
+    route_grant_public_key_file: std::path::PathBuf,
     #[arg(
         long,
         env = "CATS_ROUTE_GRANT_TTL_SECONDS",
@@ -476,9 +480,17 @@ async fn main() -> anyhow::Result<()> {
                 args.route_grant_private_key_file.display()
             )
         })?;
+    let route_grant_public_key =
+        std::fs::read(&args.route_grant_public_key_file).with_context(|| {
+            format!(
+                "read route grant public key {}",
+                args.route_grant_public_key_file.display()
+            )
+        })?;
     let route_grant_signer = Arc::new(
         cats_control_plane::route_grant::RouteGrantSigner::from_ed25519_pem(
             &route_grant_private_key,
+            &route_grant_public_key,
             args.route_grant_ttl_seconds,
         )?,
     );

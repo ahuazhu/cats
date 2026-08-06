@@ -6,13 +6,19 @@ pub(super) async fn register_node(
     Json(req): Json<RegisterNodeRequest>,
 ) -> ApiResult<StatusCode> {
     check_service_auth(&state, &headers).await?;
-    state.store.register_node(
+    let expected_fingerprint = state.cfg.route_grant_signer.public_key_sha256();
+    let admission = crate::store::NodeAdmission::for_route_grant(
+        req.initially_cordoned,
+        req.route_grant_public_key_sha256.as_deref(),
+        expected_fingerprint,
+    );
+    state.store.register_node_with_admission(
         &req.node_id,
         &req.agent_url,
         &req.gateway_url,
         req.cpus,
         req.memory_mib,
-        req.initially_cordoned,
+        admission,
     )?;
     state.notify.notify_one();
     Ok(StatusCode::NO_CONTENT)
@@ -266,6 +272,14 @@ pub(super) async fn admin_node_action(
                 return Err(ApiError::failed_precondition(
                     "lost node must heartbeat before uncordon; a fenced node identity cannot be reused",
                 )
+                .into());
+            }
+            let expected = state.cfg.route_grant_signer.public_key_sha256();
+            if node.route_grant_public_key_sha256.as_deref() != Some(expected) {
+                return Err(ApiError::failed_precondition(format!(
+                    "node Route Grant verifier key is not the active control-plane key; expected {expected}, observed {}",
+                    node.route_grant_public_key_sha256.as_deref().unwrap_or("legacy/unreported")
+                ))
                 .into());
             }
             state.store.set_node_state(&id, NodeState::Ready)?;

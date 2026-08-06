@@ -100,11 +100,23 @@ fn route_grant_private_key_reaches_only_control_plane_and_nodes_get_public_key()
             "Gateway must never receive Route Grant signing material: {fragment:?}"
         );
     }
+    for fragment in [
+        "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE",
+        "/etc/cats/route-grant/public.pem",
+        "\"public.pem\"  = var.route_grant_public_key_pem",
+    ] {
+        assert!(
+            control.contains(fragment) || kubernetes.contains(fragment),
+            "control-plane startup pair verification lost {fragment:?}"
+        );
+    }
 
     let worker =
         read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
     assert!(worker.contains("base64encode(var.route_grant_public_key_pem)"));
     assert!(worker.contains("/etc/cats/route-grant-public.pem"));
+    assert!(worker.contains("installed_route_grant_key_fingerprint"));
+    assert!(worker.contains("-outform DER"));
     for unit in [
         "deploy/aws/metal/cats-worker.service",
         "deploy/metal/systemd/cats-noded.service",
@@ -123,14 +135,53 @@ fn route_grant_private_key_reaches_only_control_plane_and_nodes_get_public_key()
     assert!(workflow.contains("route-grant-private.pem"));
     assert!(workflow.contains("openssl pkey"));
     assert!(workflow.contains("^ED25519 Private-Key:"));
+    assert!(workflow.contains("-pubout"));
+    assert!(workflow.contains("route-grant-public.sha256"));
+    assert!(workflow.contains("-outform DER"));
     assert!(workflow.contains(
         "--rawfile route_grant_private_key_pem \"$RUNNER_TEMP/route-grant-private.pem\""
     ));
     assert!(workflow.contains("route_grant_private_key_pem: $route_grant_private_key_pem"));
+    assert!(workflow
+        .contains("--rawfile route_grant_public_key_pem \"$RUNNER_TEMP/route-grant-public.pem\""));
+    assert!(workflow.contains("route_grant_public_key_pem: $route_grant_public_key_pem"));
 
     let dev = read_workspace_file("scripts/dev.sh");
     assert!(dev.contains("--route-grant-private-key-file"));
     assert!(dev.contains("--route-grant-public-key-file"));
+}
+
+#[test]
+fn route_grant_rotation_checks_ready_nodes_before_planning_a_rollout() {
+    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
+    let preflight = workflow
+        .find("- name: Check Route Grant verifier compatibility")
+        .expect("Route Grant compatibility preflight");
+    let plan = workflow
+        .find("- name: Plan production deployment")
+        .expect("production plan step");
+    let apply = workflow
+        .find("- name: Apply reviewed plan")
+        .expect("production apply step");
+    assert!(
+        preflight < plan && plan < apply,
+        "a verifier mismatch must fail before Terraform can mutate the application"
+    );
+
+    let gate = &workflow[preflight..plan];
+    for fragment in [
+        "port-forward service/cats-controld 17300:7300",
+        "/v1/admin/nodes",
+        ".node.state == \"ready\"",
+        ".node.route_grant_public_key_sha256",
+        "route-grant-public.sha256",
+        "Ready Nodes verify a different Route Grant key",
+    ] {
+        assert!(
+            gate.contains(fragment),
+            "Route Grant preflight lost {fragment:?}"
+        );
+    }
 }
 
 #[test]
@@ -215,7 +266,10 @@ fn production_schema_probe_fails_closed() {
     let probe = workflow
         .split("# The control store lives in PostgreSQL.")
         .nth(1)
-        .and_then(|rest| rest.split("- name: Initialize application state").next())
+        .and_then(|rest| {
+            rest.split("- name: Check Route Grant verifier compatibility")
+                .next()
+        })
         .expect("control schema probe block");
 
     assert!(probe.contains("query_status=$?"));

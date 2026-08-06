@@ -95,6 +95,19 @@ variable "route_grant_private_key_pem" {
   }
 }
 
+variable "route_grant_public_key_pem" {
+  description = "Ed25519 public key derived from route_grant_private_key_pem and mounted into cats-controld for startup pair verification."
+  type        = string
+
+  validation {
+    condition = (
+      startswith(trimspace(var.route_grant_public_key_pem), "-----BEGIN PUBLIC KEY-----") &&
+      endswith(trimspace(var.route_grant_public_key_pem), "-----END PUBLIC KEY-----")
+    )
+    error_message = "route_grant_public_key_pem must be a PEM public key."
+  }
+}
+
 variable "storage_postgres_url" {
   description = "PostgreSQL URL used for ChunkStore roots, leases, and fencing."
   type        = string

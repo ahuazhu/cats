@@ -6,14 +6,15 @@ use anyhow::Context;
 use cats_api::resources::RouteBinding;
 pub use cats_api::route_grant::DEFAULT_ROUTE_GRANT_TTL_SECONDS;
 use cats_api::route_grant::{
-    RouteGrantClaims, MAX_ROUTE_GRANT_TTL_SECONDS, ROUTE_GRANT_AUDIENCE, ROUTE_GRANT_ISSUER,
-    ROUTE_GRANT_VERSION,
+    route_grant_public_key_sha256, RouteGrantClaims, MAX_ROUTE_GRANT_TTL_SECONDS,
+    ROUTE_GRANT_AUDIENCE, ROUTE_GRANT_ISSUER, ROUTE_GRANT_VERSION,
 };
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 
 #[derive(Clone)]
 pub struct RouteGrantSigner {
     key: EncodingKey,
+    public_key_sha256: String,
     ttl_seconds: u64,
 }
 
@@ -24,7 +25,11 @@ pub struct IssuedRouteGrant {
 }
 
 impl RouteGrantSigner {
-    pub fn from_ed25519_pem(private_key_pem: &[u8], ttl_seconds: u64) -> anyhow::Result<Self> {
+    pub fn from_ed25519_pem(
+        private_key_pem: &[u8],
+        public_key_pem: &[u8],
+        ttl_seconds: u64,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(ttl_seconds > 0, "route grant TTL must be positive");
         anyhow::ensure!(
             ttl_seconds <= MAX_ROUTE_GRANT_TTL_SECONDS,
@@ -32,7 +37,39 @@ impl RouteGrantSigner {
         );
         let key = EncodingKey::from_ed_pem(private_key_pem)
             .context("parse route grant Ed25519 private key")?;
-        Ok(Self { key, ttl_seconds })
+        let public_key = DecodingKey::from_ed_pem(public_key_pem)
+            .context("parse route grant Ed25519 public key")?;
+        let public_key_sha256 = route_grant_public_key_sha256(public_key_pem)
+            .context("fingerprint Route Grant public key")?;
+
+        // Parsing both halves proves only that they are Ed25519 keys. Sign and
+        // verify one fixed, non-secret challenge so a mismatched but valid pair
+        // fails before the control-plane process can become Ready.
+        let mut proof_header = Header::new(Algorithm::EdDSA);
+        proof_header.typ = Some("JWT".to_string());
+        proof_header.kid = Some(public_key_sha256.clone());
+        let proof = jsonwebtoken::encode(
+            &proof_header,
+            &serde_json::json!({"route_grant_key_pair_proof": 1}),
+            &key,
+        )
+        .context("sign Route Grant key-pair proof")?;
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.required_spec_claims.clear();
+        validation.validate_exp = false;
+        validation.validate_aud = false;
+        jsonwebtoken::decode::<serde_json::Value>(&proof, &public_key, &validation)
+            .context("Route Grant public key does not match the private signing key")?;
+
+        Ok(Self {
+            key,
+            public_key_sha256,
+            ttl_seconds,
+        })
+    }
+
+    pub fn public_key_sha256(&self) -> &str {
+        &self.public_key_sha256
     }
 
     pub fn issue(
@@ -82,6 +119,7 @@ impl RouteGrantSigner {
         };
         let mut header = Header::new(Algorithm::EdDSA);
         header.typ = Some("JWT".to_string());
+        header.kid = Some(self.public_key_sha256.clone());
         let token = jsonwebtoken::encode(&header, &claims, &self.key)
             .context("sign Endpoint Route Grant")?;
         Ok(IssuedRouteGrant {
@@ -94,6 +132,7 @@ impl RouteGrantSigner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jsonwebtoken::decode_header;
     use jsonwebtoken::{DecodingKey, Validation};
 
     const PRIVATE_KEY: &[u8] =
@@ -115,8 +154,12 @@ mod tests {
 
     #[test]
     fn signs_every_route_authority_field() {
-        let signer = RouteGrantSigner::from_ed25519_pem(PRIVATE_KEY, 120).unwrap();
+        let signer = RouteGrantSigner::from_ed25519_pem(PRIVATE_KEY, PUBLIC_KEY, 120).unwrap();
         let grant = signer.issue_at(&binding(), 7, 1_000).unwrap();
+        assert_eq!(
+            decode_header(&grant.token).unwrap().kid.as_deref(),
+            Some(signer.public_key_sha256())
+        );
         let mut validation = Validation::new(Algorithm::EdDSA);
         validation.validate_exp = false;
         validation.set_audience(&[ROUTE_GRANT_AUDIENCE]);
@@ -149,9 +192,26 @@ mod tests {
 
     #[test]
     fn refuses_unbounded_lifetime() {
+        assert!(RouteGrantSigner::from_ed25519_pem(
+            PRIVATE_KEY,
+            PUBLIC_KEY,
+            MAX_ROUTE_GRANT_TTL_SECONDS + 1
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn refuses_a_valid_but_mismatched_public_key() {
+        let other_public =
+            include_bytes!("../../tests/fixtures/route_grant_other_public_ed25519.pem");
+        let error = RouteGrantSigner::from_ed25519_pem(PRIVATE_KEY, other_public, 120)
+            .err()
+            .expect("mismatched key halves must stop control-plane startup");
         assert!(
-            RouteGrantSigner::from_ed25519_pem(PRIVATE_KEY, MAX_ROUTE_GRANT_TTL_SECONDS + 1)
-                .is_err()
+            error
+                .to_string()
+                .contains("does not match the private signing key"),
+            "unexpected error: {error:#}"
         );
     }
 }

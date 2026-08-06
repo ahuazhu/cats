@@ -41,6 +41,11 @@ variable "route_grant_private_key_pem" {
   sensitive   = true
 }
 
+variable "route_grant_public_key_pem" {
+  description = "Ed25519 public key derived by CI from route_grant_private_key_pem for startup key-pair verification."
+  type        = string
+}
+
 variable "storage_postgres_url" {
   description = "ChunkStore metadata PostgreSQL URL."
   type        = string

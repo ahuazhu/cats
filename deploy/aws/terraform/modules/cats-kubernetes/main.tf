@@ -152,6 +152,7 @@ resource "kubernetes_secret_v1" "gateway_runtime" {
 
 # Separate from runtime and gateway credentials so the signing key is mounted
 # as a file only in cats-controld and can never be inherited by cats-gatewayd.
+# The matching public half lets every replica prove the pair before Ready.
 resource "kubernetes_secret_v1" "route_grant_signing" {
   metadata {
     name      = "cats-route-grant-signing"
@@ -162,6 +163,7 @@ resource "kubernetes_secret_v1" "route_grant_signing" {
   type = "Opaque"
   data = {
     "private.pem" = var.route_grant_private_key_pem
+    "public.pem"  = var.route_grant_public_key_pem
   }
 }
 
@@ -211,7 +213,7 @@ resource "kubernetes_deployment_v1" "control_plane" {
         })
         annotations = {
           "cats.run/runtime-secret-sha256"  = sha256(jsonencode(local.runtime_secret_data))
-          "cats.run/route-grant-key-sha256" = sha256(var.route_grant_private_key_pem)
+          "cats.run/route-grant-key-sha256" = sha256("${var.route_grant_private_key_pem}\n${var.route_grant_public_key_pem}")
           "cats.run/rds-ca-sha256"          = sha256(local.rds_ca_pem)
         }
       }
@@ -295,6 +297,11 @@ resource "kubernetes_deployment_v1" "control_plane" {
           env {
             name  = "CATS_ROUTE_GRANT_PRIVATE_KEY_FILE"
             value = "/etc/cats/route-grant/private.pem"
+          }
+
+          env {
+            name  = "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE"
+            value = "/etc/cats/route-grant/public.pem"
           }
 
           # All PostgreSQL clients verify RDS TLS with this CA. Their DSNs are

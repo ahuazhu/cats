@@ -823,6 +823,52 @@ fn refuses_a_database_stamped_with_another_schema_version() {
 }
 
 #[test]
+fn migrates_v1_nodes_to_persist_route_grant_verifier_identity() {
+    let url = crate::testsupport::isolated_control_store_url();
+    drop(Store::connect(&url, None).unwrap());
+    {
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        admin
+            .batch_execute(
+                "ALTER TABLE nodes DROP COLUMN route_grant_public_key_sha256;
+                 UPDATE control_schema_version SET version = 1;",
+            )
+            .unwrap();
+    }
+
+    let store = Store::connect(&url, None).expect("upgrade the stamped v1 schema");
+    store
+        .register_node_with_admission(
+            "node-keyed",
+            "http://node",
+            "http://gateway",
+            4,
+            8192,
+            NodeAdmission::for_route_grant(false, Some("abc123"), "abc123"),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .get_node("node-keyed")
+            .unwrap()
+            .route_grant_public_key_sha256
+            .as_deref(),
+        Some("abc123")
+    );
+    let stamped = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT version FROM control_schema_version WHERE singleton",
+                    &[],
+                )
+                .map(|row| row.get::<_, i64>(0))
+        })
+        .unwrap();
+    assert_eq!(stamped, SCHEMA_VERSION);
+}
+
+#[test]
 fn every_cat_gets_a_default_public_endpoint() {
     let store = test_store();
     let workspace = bootstrap_workspace(&store, "alpha");

@@ -4,14 +4,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use cats_api::route_grant::{
-    RouteGrantClaims, MAX_ROUTE_GRANT_TTL_SECONDS, ROUTE_GRANT_AUDIENCE, ROUTE_GRANT_ISSUER,
-    ROUTE_GRANT_VERSION,
+    route_grant_public_key_sha256, RouteGrantClaims, MAX_ROUTE_GRANT_TTL_SECONDS,
+    ROUTE_GRANT_AUDIENCE, ROUTE_GRANT_ISSUER, ROUTE_GRANT_VERSION,
 };
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 
 #[derive(Clone)]
 pub struct RouteGrantVerifier {
     key: DecodingKey,
+    public_key_sha256: String,
 }
 
 pub struct ExpectedRouteGrant<'a> {
@@ -26,7 +27,16 @@ impl RouteGrantVerifier {
     pub fn from_ed25519_pem(public_key_pem: &[u8]) -> anyhow::Result<Self> {
         let key = DecodingKey::from_ed_pem(public_key_pem)
             .context("parse route grant Ed25519 public key")?;
-        Ok(Self { key })
+        let public_key_sha256 = route_grant_public_key_sha256(public_key_pem)
+            .context("fingerprint Route Grant public key")?;
+        Ok(Self {
+            key,
+            public_key_sha256,
+        })
+    }
+
+    pub fn public_key_sha256(&self) -> &str {
+        &self.public_key_sha256
     }
 
     pub fn verify(
@@ -43,6 +53,10 @@ impl RouteGrantVerifier {
         anyhow::ensure!(
             header.typ.as_deref() == Some("JWT"),
             "Route Grant type is not JWT"
+        );
+        anyhow::ensure!(
+            header.kid.as_deref() == Some(self.public_key_sha256.as_str()),
+            "Route Grant key fingerprint mismatch"
         );
 
         let mut validation = Validation::new(Algorithm::EdDSA);
@@ -137,6 +151,19 @@ mod tests {
     fn sign(claims: &RouteGrantClaims) -> String {
         let mut header = Header::new(Algorithm::EdDSA);
         header.typ = Some("JWT".to_string());
+        header.kid = Some(route_grant_public_key_sha256(PUBLIC_KEY).unwrap());
+        jsonwebtoken::encode(
+            &header,
+            claims,
+            &EncodingKey::from_ed_pem(PRIVATE_KEY).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn sign_with_wrong_key_id(claims: &RouteGrantClaims) -> String {
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.typ = Some("JWT".to_string());
+        header.kid = Some("0".repeat(64));
         jsonwebtoken::encode(
             &header,
             claims,
@@ -189,6 +216,14 @@ mod tests {
         for mismatch in mismatches {
             assert!(verifier.verify(&token, mismatch).is_err());
         }
+        assert!(
+            verifier
+                .verify(&sign_with_wrong_key_id(&claims()), expected())
+                .unwrap_err()
+                .to_string()
+                .contains("fingerprint mismatch"),
+            "a valid signature must still identify the verifier key it targets"
+        );
     }
 
     #[test]

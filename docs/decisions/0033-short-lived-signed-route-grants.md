@@ -35,6 +35,16 @@ would let a compromised Gateway mint arbitrary Cat, Node or port bindings.
 - The signing private key exists only in the control-plane runtime. Nodes
   receive only the public verification key. The Gateway and Guest receive
   neither the private key nor any capability that can derive it.
+- Every control-plane replica also receives the public half derived from that
+  deployment's exact private input. Startup signs and verifies a fixed proof,
+  and refuses readiness when two independently valid key halves do not match.
+  Grants carry a `kid` equal to the SHA-256 of the public SubjectPublicKeyInfo
+  DER. A Node requires that `kid` and reports the same non-secret fingerprint
+  in registration. A mismatched registration is atomically cordoned; an
+  administrator cannot uncordon a Node until its reported verifier fingerprint
+  equals the active signer fingerprint. A missing fingerprint is accepted only
+  for an already-Ready legacy Node during the additive first rollout; after it
+  is cordoned, it must be upgraded before admission.
 - The Gateway treats the signed token as opaque. After ordinary cache freshness
   ends, an `active` + `Running` route whose advertised grant expiry is still in
   the future is served immediately while one background resolve per hostname
@@ -86,6 +96,14 @@ Node hop. It authenticates the calling service but does not authorize a route.
   and every Node in the rollout must have the matching public key before it
   receives traffic. Rotation needs an overlap mechanism before two keys can be
   live simultaneously; V1 uses a coordinated, drained rollout.
+- Production CI derives the application public half from the exact private
+  secret, compares its DER fingerprint with every enforcing Ready Node before
+  planning any mutation, and then rolls the control plane before the Gateway.
+  The drained worker association validates and fingerprints the key after
+  installation; registration plus the uncordon gate proves that the installed
+  verifier matches the serving signer. An interrupted or mismatched worker
+  rollout therefore remains unschedulable instead of becoming a partial
+  Endpoint outage.
 - The additive first rollout updates every control-plane replica before any
   Gateway, then drains and updates Nodes one at a time. Old Gateways ignore the
   additional resolve fields and old Nodes ignore the forwarded grant. The

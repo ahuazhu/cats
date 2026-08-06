@@ -6,6 +6,7 @@ module "cats_kubernetes" {
   gateway_image                  = var.gateway_image
   runtime_secret_data            = var.runtime_secret_data
   route_grant_private_key_pem    = var.route_grant_private_key_pem
+  route_grant_public_key_pem     = var.route_grant_public_key_pem
   storage_postgres_url           = var.storage_postgres_url
   storage_postgres_session_setup = var.storage_postgres_session_setup
   usage_postgres_url             = var.usage_postgres_url

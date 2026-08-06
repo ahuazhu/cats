@@ -159,7 +159,7 @@ fn ensure_schema(client: &mut Client) -> Result<()> {
 /// is not carried over). `connect` upgrades a database stamped inside
 /// `[OLDEST_MIGRATABLE_SCHEMA_VERSION, SCHEMA_VERSION]` in place and refuses
 /// anything else.
-pub(super) const SCHEMA_VERSION: i64 = 1;
+pub(super) const SCHEMA_VERSION: i64 = 2;
 
 /// The oldest stamped version `Store::connect` can still upgrade in place.
 const OLDEST_MIGRATABLE_SCHEMA_VERSION: i64 = 1;
@@ -288,8 +288,11 @@ CREATE TABLE IF NOT EXISTS nodes (
     last_heartbeat_ms BIGINT NOT NULL,
     telemetry_json TEXT,
     scheduling_disabled BOOLEAN NOT NULL DEFAULT FALSE,
-    reported_cats_json TEXT
+    reported_cats_json TEXT,
+    route_grant_public_key_sha256 TEXT
 );
+ALTER TABLE nodes
+    ADD COLUMN IF NOT EXISTS route_grant_public_key_sha256 TEXT;
 CREATE TABLE IF NOT EXISTS operations (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),

@@ -56,6 +56,7 @@ impl Cluster {
             route_grant_signer: Arc::new(
                 cats_control_plane::route_grant::RouteGrantSigner::from_ed25519_pem(
                     ROUTE_GRANT_PRIVATE_KEY,
+                    ROUTE_GRANT_PUBLIC_KEY,
                     2,
                 )
                 .unwrap(),

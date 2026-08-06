@@ -85,6 +85,7 @@ locals {
     environment_temp=""
     seed_temp=""
     route_grant_key_temp=""
+    route_grant_key_fingerprint=""
     cleanup() {
       rm -rf -- "$stage_path"
       rm -f -- "$artifact_path"
@@ -136,6 +137,12 @@ locals {
     printf '%s' '${local.route_grant_public_key_base64}' | base64 --decode > "$route_grant_key_temp"
     openssl pkey -pubin -in "$route_grant_key_temp" -text_pub -noout \
       | grep -q '^ED25519 Public-Key:'
+    route_grant_key_fingerprint="$(
+      openssl pkey -pubin -in "$route_grant_key_temp" -outform DER \
+        | sha256sum \
+        | awk '{print $1}'
+    )"
+    printf '%s' "$route_grant_key_fingerprint" | grep -Eq '^[0-9a-f]{64}$'
 
     # -D creates the parent directory. Without it a host that has never been
     # touched by install.sh fails here: /opt/cats/bin does not exist yet, and
@@ -151,6 +158,12 @@ locals {
     install -m 0644 "$stage_path/cats-postgres-url.timer" /etc/systemd/system/cats-postgres-url.timer
 
     install -D -o root -g root -m 0644 "$route_grant_key_temp" /etc/cats/route-grant-public.pem
+    installed_route_grant_key_fingerprint="$(
+      openssl pkey -pubin -in /etc/cats/route-grant-public.pem -outform DER \
+        | sha256sum \
+        | awk '{print $1}'
+    )"
+    test "$installed_route_grant_key_fingerprint" = "$route_grant_key_fingerprint"
 
     runtime_secret="$(mktemp /var/tmp/cats-worker-runtime.XXXXXX)"
     runtime_overlay="$(mktemp /var/tmp/cats-worker-overlay.XXXXXX)"
@@ -269,6 +282,7 @@ CATS_BASE_ENVIRONMENT
     systemctl stop cats-worker
     systemctl start cats-worker
     systemctl is-active --quiet cats-worker
+    echo "Route Grant verifier key: $installed_route_grant_key_fingerprint"
     "${var.install_root}/bin/cats-noded" --help | grep -q -- "--metering-cgroup-root"
     # Secret version ${aws_secretsmanager_secret_version.worker_runtime.version_id}
   SCRIPT

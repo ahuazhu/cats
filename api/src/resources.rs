@@ -332,6 +332,10 @@ pub struct Node {
     pub agent_url: String,
     /// Base URL of the node gateway for guest traffic.
     pub gateway_url: String,
+    /// Ed25519 Route Grant verifier key loaded by the currently registered
+    /// Node process. Missing only for a legacy Node during rollout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_grant_public_key_sha256: Option<String>,
     pub state: NodeState,
     pub capacity: NodeCapacity,
     pub last_heartbeat_unix: i64,

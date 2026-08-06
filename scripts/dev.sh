@@ -40,6 +40,7 @@ up() {
   "$BIN/cats-controld" \
     --listen "$API" \
     --route-grant-private-key-file "$STATE/route-grant-private.pem" \
+    --route-grant-public-key-file "$STATE/route-grant-public.pem" \
     --db-path "$STATE/control.db" \
     --metadata-store-adapter sqlite \
     --metadata-store-option "path=$STATE/storage-meta.db" \

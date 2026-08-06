@@ -341,6 +341,16 @@ async fn the_agent_registers_once_the_control_plane_comes_back() {
     let registrations = stub.registrations();
     assert_eq!(registrations[0].node_id, "node_reconnect");
     assert_eq!(registrations[0].cpus, 4);
+    assert_eq!(
+        registrations[0].route_grant_public_key_sha256.as_deref(),
+        Some(
+            cats_node_agent::route_grant::RouteGrantVerifier::from_ed25519_pem(include_bytes!(
+                "../../tests/fixtures/route_grant_public_ed25519.pem"
+            ))
+            .unwrap()
+            .public_key_sha256()
+        )
+    );
 
     assert!(
         poll_until(Duration::from_secs(10), || !stub.heartbeats().is_empty()).await,

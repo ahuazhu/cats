@@ -1954,6 +1954,9 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
         gateway_url: cfg.gateway_url.clone(),
         cpus: cfg.cpus,
         memory_mib: cfg.memory_mib,
+        route_grant_public_key_sha256: Some(
+            cfg.route_grant_verifier.public_key_sha256().to_string(),
+        ),
         initially_cordoned: cfg.initially_cordoned,
     };
     let cp = cfg.control_plane_url.trim_end_matches('/').to_string();
