@@ -4,8 +4,8 @@
 - 日期：2026-08-06
 - 关联：ADR-0002（生命周期四态）、ADR-0010（默认 HTTP Endpoint）、
   ADR-0018（Workspace 是唯一资源所有者）、ADR-0028（Node runtime ledger）、
-  ADR-0031/0032（PostgreSQL 控制权威与多副本）；Architecture V2 #204、Epic B #206、
-  B0 #216
+  ADR-0031/0032（PostgreSQL 控制权威与多副本）、ADR-0035（A0 LifecycleCommand V2）；
+  Architecture V2 #204、Epic B #206、B0 #216
 
 ## 背景
 
@@ -59,20 +59,29 @@ identity。
 
 ### 3. 所有 claims 必须来自一个 PostgreSQL 原子快照
 
-B1 的唯一发行入口读取一个 `RouteAuthorizationSnapshot`。所有会改变 route/generation 的
-事务与 issuer 使用同一锁顺序：
+B1 的唯一发行入口读取一个 `RouteAuthorizationSnapshot`。V2 issuer 只消费 A0 reducer 已结算
+的 relational runtime authority。所有会改变 route/generation 的事务与 issuer 使用同一锁族
+顺序：
 
 1. Cat row；
-2. Endpoint row（稳定 endpoint id 顺序）；
-3. Route row（canonical hostname 顺序）。
+2. current LifecycleCommand（若有）和 exact `cat_runtime_state`；
+3. Endpoint row（稳定 endpoint id 顺序）；
+4. Route row（canonical hostname 顺序）。
 
 同一事务必须证明：
 
 - Endpoint、Route 和 Cat 的 Workspace/Cat 外键闭合；
-- Cat `observed_state = Running`；
+- `cat_runtime_state` 是 exact reducer 已结算的 `running`，并携带与当前 Cat intent generation
+  一致的 command/dispatch/Node claim/terminal result/runtime identity provenance；
+- 没有能 invalidate 该 Running authority 的 current nonterminal LifecycleCommand，route
+  publication intent 与 materialized active Route 均引用上述 exact settled provenance；
 - Cat assignment、Route target Node 和要签发的 `node_id` 完全一致；
 - Route `state = active`，endpoint id/hostname/protocol/port 与 route 一致；
 - Cat generation 与 route epoch 均为正数。
+
+`cats.observed_state` 在 V2 中只是迁移期 API compatibility projection，heartbeat 只写 normalized
+observation；二者都不得参与 V2 issuer 判断。pre-activation V1 若仍按 `observed_state` 工作，也
+只能留在隔离的 legacy cohort，不能 mint Route Grant v1 或发布 V2 Route。
 
 `iat` 取该事务的整秒时间，`exp` 由它计算；事务结果复制为不可变 snapshot 后才允许编码和
 签名。签名完成时若 snapshot 已到期则丢弃，不得延长。签名期间 route 可能继续前进，这只会
@@ -102,23 +111,31 @@ rename + directory fsync 成功门禁；当前 generic runtime ledger 的 best-e
 
 这消除“检查 Running 后、获取 guard 前开始 Suspend”的 TOCTOU。锁内不做网络或异步 I/O，
 不得持有 mutex guard 跨 `.await`。HTTP request 和 WebSocket 都只在建立时准入；expiry 是新
-admission 的硬边界，已经持有 guard 的请求/连接不会因 grant 随后到期被强制中断。
+admission 的硬边界。普通时间流逝不会强制中断已经持有 guard 的请求/连接，但显式 epoch
+revoke、lifecycle quiesce 或 authority transfer 必须按下一节取消并 drain 它们。
 
 ### 5. Route publication、revoke 和迁移有明确顺序
 
 正常 activate 顺序是：创建更大 route epoch → Node durable install/ACK → 控制面发布 active
-route → issuer 可见。正常 unbind/rebind/revoke 先让旧 Node durable advance/revoke local
-authority，再发布控制面变化。
+route → issuer 可见。每个 activity guard 必须登记 exact
+`(cat_id, generation, route_epoch, runtime_identity)` 和 cancellation handle。
+
+reachable unbind/rebind/revoke 的顺序是：在 per-Cat admission lock 内 durable advance/revoke
+旧 local authority 并阻止旧 epoch 新 guard → 标记该 authority 的 active guards cancelled →
+锁外关闭 Node↔Guest HTTP/WebSocket/streaming transport 并有界 drain → 重新证明旧 authority
+active guard count 为零 → 持久 ACK → 控制面才可发布变化或把 authority 交给新 runtime。
+drain 超时不是成功；必须保持 transfer blocked，或强制停止/隔离旧 runtime 后取得 fence proof。
 
 若旧 Node 不可达，控制面不能假装已立即撤销离线 capability。必须选择其一：
 
-- 先通过外部 fencing/网络隔离证明旧 Node 无法再接收数据面流量；或
-- 等待最后可能签发的 grant 达到 `MAX_LIFETIME + MAX_CLOCK_SKEW`，再把同一 Endpoint/Cat
-  authority 交给新 runtime。
+- 通过云 API、BMC、电源或网络隔离等外部 fence proof，证明旧 Node/runtime 不可能继续服务；或
+- 在等待最后 grant 的 `MAX_LIFETIME + MAX_CLOCK_SKEW` 之外，再取得独立可信的“旧 authority
+  active session 为零且 runtime 已不可服务”证明。
 
-因此普通控制面 revoke 的最坏传播时间是 grant 剩余寿命加受控时钟偏差。需要立即 revoke
-时必须更新旧 Node 本地 epoch/key ring，或隔离旧 Node；不能靠 Gateway cache purge 冒充
-Node 侧撤销。
+单纯等待 125 秒只耗尽**新 admission**，不能结束一条已经建立、可能恶意或卡死且仍持有 guard
+的 WebSocket/streaming HTTP；它绝不是 authority transfer proof。heartbeat 缺报、Gateway cache
+purge 或控制面计时器也都不能证明旧数据面静默。需要 revoke/transfer 时必须完成 reachable
+cancel-and-drain 或外部 fence；否则保持 blocked。
 
 ### 6. 时间窗口有界，时钟不健康时停止新准入
 
@@ -126,9 +143,10 @@ v1 默认签发 60 秒，最大寿命 120 秒；`nbf == iat`。允许 Node 相�
 not-before 偏差，但 expiry 没有额外宽限：`now >= exp` 的新 admission 必须失败。
 
 部署必须持续校准 Node 时钟。Node 无法证明 wall clock 可用或偏差不超过 5 秒时，停止新的
-Route Grant admission 并暴露 condition；已有连接不被强制切断。以真实时间计，最坏普通
-撤销窗口因此不超过 125 秒。更长 TTL 会改善长控制面故障的 cache hit，却同比扩大 replay、
-权限撤销和 key compromise 窗口；v1 选择短窗口并把长故障后的新连接明确降级为 503。
+Route Grant admission 并暴露 condition；已有连接不因时钟异常自动切断。以真实时间计，旧
+grant 的最坏**新准入/replay**窗口不超过 125 秒。active-session revoke latency 由 §5 的
+cancel-and-drain/fence 决定，不由 TTL 保证。更长 TTL 会改善长控制面故障的 cache hit，却同比
+扩大新准入 replay 和 key compromise 窗口；v1 选择短窗口并把长故障后的新连接明确降级为 503。
 
 ### 7. Gateway 使用一个有界 cache/outage 状态机
 
@@ -160,7 +178,9 @@ Node 只持有版本化 verifier key ring。
 5. 再 retire/remove 旧 verifier。
 
 rollback 只能切回仍在所有目标 Node ring 中的 signer。key compromise 时停止签发并分发 revoke
-ring；无法收到新 ring 的 Node 必须隔离，不能声明已立即撤销。
+ring；ring removal 只阻止新 admission，不会终止 active guard。incident 若要求撤销已有会话，
+还必须执行 epoch-aware cancel-and-drain；无法收到新 ring/revoke 的 Node 必须隔离，不能声明
+已立即撤销。
 
 ### 9. mixed-version 只存在于隔离的 V2 cohort migration boundary
 
@@ -185,16 +205,16 @@ qualification 通过，随后删除 migration adapter 与所有旧路径。
 
 | 威胁 | v1 防线 | 剩余边界 |
 |---|---|---|
-| Gateway 被攻陷 | 不能签发/改写；Node 校验全部 claims 与 local truth | 可在所持未过期 grant 范围内发请求，最长 125 秒 |
+| Gateway 被攻陷 | 不能签发/改写；Node 校验全部 claims 与 local truth | 所持 grant 可在最多 125 秒内发起新 admission；已建连接需显式 revoke/drain |
 | token replay | short TTL；Node generation/epoch/runtime match | 同一有效 grant 内不做 per-request nonce DB；这是刻意的离线权衡 |
-| stale route / Node migration | route epoch、node id、generation；旧 Node revoke/fence/wait | 已建立连接不迁移，客户端重连 |
+| stale route / Node migration | route epoch、node id、generation；旧 Node cancel-and-drain 或外部 fence | TTL wait 单独不能证明 active stream 静默；客户端在旧连接被关闭后重连 |
 | 跨 Workspace/Cat/port | signed Workspace/Endpoint/Cat/port；Node exact match | 无通配 grant |
 | hostname ambiguity | 唯一 canonical ASCII hostname；严格 authority parser | V1 不接受 Unicode/IP/trailing-dot 等别名 |
 | algorithm confusion | exact `alg=EdDSA`、`typ`、version、kid；unknown header fails | 不支持算法协商 |
 | malformed/duplicate claims | size/depth/type/duplicate/unknown/canonical checks先于使用 | parser 错误对 Gateway 统一，不暴露 verifier oracle |
 | signature malleability | 64-byte Ed25519 strict verify，拒绝 non-canonical S | 依赖 B0 向量校准所选 crypto backend |
 | clock skew/rollback | 5 秒上限、hard expiry、clock-unhealthy condition | 时钟健康证据属于 G/B4 qualification |
-| signing-key compromise | key ring revoke、Node local truth、短 TTL、隔离失联 Node | 攻击者仍可在本地 truth 范围内 mint，需 incident rotation |
+| signing-key compromise | key ring revoke、Node local truth、短 TTL、active-guard revoke、隔离失联 Node | 攻击者仍可在本地 truth 范围内 mint，需 incident rotation/fencing |
 | 控制面/DB outage | 未过期 cache 可继续；shared backoff | cache miss/expiry/wake 明确不可用；不承诺无限离线 |
 
 grant、完整 compact token、signature、private key、用户 header 和 Cookie 不进入日志、metrics、
@@ -222,9 +242,9 @@ Running Endpoint 的新请求在未过期授权窗口内不再逐请求依赖控
 重试被限制在 per-host singleflight 与 fleet-shared backoff。Node 获得一个可审计、可独立
 验证、与 runtime truth 闭合的最终准入边界。
 
-代价是控制面撤销不再天然即时：离线 capability 的 availability 与 revoke latency 是同一个
-TTL。Node 必须有可信时钟、durable route authority 与版本化 key ring；部署顺序也成为安全
-协议的一部分。
+代价是新 admission 的离线 availability 与 replay window 由同一个 TTL 决定，而已建立 stream
+有独立的撤销协议。Node 必须有可信时钟、durable route authority、epoch-aware active-guard
+registry 与版本化 key ring；部署和 cancel/drain/fence 顺序都成为安全协议的一部分。
 
 ## 被拒绝的替代方案
 
@@ -246,5 +266,9 @@ TTL。Node 必须有可信时钟、durable route authority 与版本化 key ring
   signature 全部 deterministic fail closed。
 - 真正停止 control plane 与数据库时，缓存窗口内 Running HTTP 和新 WebSocket 可建立；到期
   后新 admission 失败，已有 WebSocket 保持。
+- reachable route revoke 必须取消旧 epoch active WebSocket/streaming HTTP、drain guard 至零后
+  才允许新 authority；drain 超时保持 blocked。
+- unreachable Node 即使经过 125 秒，只要没有外部 fence 或独立的 zero-session + non-serving
+  proof，authority transfer 仍必须失败；取得 fence proof 后才能继续。
 - migration、key rotation、clock skew、Agent replacement、Suspend race 和 route rebind 必须
   在 V2 cohort 两条 block path 上留下 authoritative evidence。

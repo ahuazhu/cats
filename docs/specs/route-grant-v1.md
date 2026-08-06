@@ -18,15 +18,16 @@
 | `AUDIENCE` | `cats-node-agent` | claims 的 `aud` |
 | `DEFAULT_LIFETIME_SECONDS` | `60` | issuer 默认值 |
 | `MAX_LIFETIME_SECONDS` | `120` | `exp - iat` 的硬上限 |
-| `MAX_CLOCK_SKEW_SECONDS` | `5` | 只用于 not-before 下界与真实 revoke 上界 |
+| `MAX_CLOCK_SKEW_SECONDS` | `5` | 只用于 not-before 下界与真实新-admission replay 上界 |
 | `MAX_COMPACT_BYTES` | `4096` | ASCII compact token 总长度 |
 | `MAX_HEADER_BYTES` | `512` | protected header 解码后上限 |
 | `MAX_CLAIMS_BYTES` | `2048` | claims 解码后上限 |
 | `SIGNATURE_BYTES` | `64` | Ed25519 signature 长度 |
 | `NEGATIVE_CACHE_SECONDS` | `5` | Gateway 仅对权威 404/410 缓存 |
 
-以真实时间计，一张最大寿命 grant 在最坏 Node 时钟负偏差下可准入最多 125 秒。因此旧 Node
-不可达且未被外部隔离时，authority 转移至少等待 125 秒，不能只等待 token 的名义 120 秒。
+以真实时间计，一张最大寿命 grant 在最坏 Node 时钟负偏差下可准入最多 125 秒。这只界定新的
+admission/replay；已建立的 stream 可以继续持有 guard，因此 125 秒等待本身不构成旧 Node
+authority transfer proof。
 
 ## 2. Compact envelope 与 canonical encoding
 
@@ -128,14 +129,22 @@ IP/socket 从 Node local runtime truth 派生。
 
 ```text
 Cat row
-  -> Endpoint rows by stable endpoint_id
-    -> Route rows by canonical hostname
+  -> current LifecycleCommand (if present) + exact cat_runtime_state
+    -> Endpoint rows by stable endpoint_id
+      -> Route rows by canonical hostname
 ```
 
-snapshot 必须同时证明 active Route、Running Cat、Workspace/Cat/Endpoint 外键闭合、assignment
-与 route target Node 相同，以及 claim 的 hostname/protocol/port/generation/epoch 全部相同。
-`iat` 取 transaction 的整秒数据库时间；编码/签名不得再次读取或补写某个 claim。签名结束时若
-`now >= exp`，丢弃结果。
+snapshot 必须同时证明 active Route、Workspace/Cat/Endpoint 外键闭合、assignment 与 route
+target Node 相同，以及 claim 的 hostname/protocol/port/generation/epoch 全部相同。Running
+authority 只来自 A0 exact reducer 已结算的 `cat_runtime_state`：它必须是 `running`，携带与当前
+intent generation 相同的 command/dispatch/Node claim/terminal result/runtime identity provenance，
+没有能 invalidate 它的 current nonterminal command，并且 route publication intent/materialized
+Route 引用同一 settled provenance。
+
+V2 issuer 禁止读取 `cats.observed_state` 或 heartbeat observation 作为授权；前者只是迁移期 API
+projection，后者只是 observation。pre-activation V1 只能留在 legacy cohort，不能 mint v1
+grant。`iat` 取 transaction 的整秒数据库时间；编码/签名不得再次读取或补写某个 claim。签名
+结束时若 `now >= exp`，丢弃结果。
 
 Control Plane 给 Gateway 的 V2 接口冻结为：
 
@@ -197,7 +206,8 @@ Gateway 可以 strict parse header/claims 来建立 cache key 和时间边界，
   resolve 一张新 token 重试一次；绝不重放同一 token。
 
 Running HTTP 不再逐请求 acquire/release 控制面 work lease；WebSocket 不续控制面 lease。
-WebSocket 在 Upgrade 时用同一 grant 准入，随后只依赖 Node activity guard。
+WebSocket 在 Upgrade 时用同一 grant 准入，随后只依赖 Node activity guard。普通 token expiry
+不切断已有 guard；显式 route revoke、quiesce 或 transfer 必须按 §10 取消并 drain。
 
 ## 8. Gateway → Node internal wire
 
@@ -254,8 +264,9 @@ Node 不在 response 暴露 `unknown_key`、signature、expiry 或哪个 claim m
 6. 在无 runtime lock 状态完成以上工作后，获取 per-Cat admission lock；
 7. 锁内逐字段比对 Node identity 和 durable `RuntimeRouteAuthorityV1`，证明 runtime Running；
 8. 同一临界区获取 `RuntimeActivityGuard`；若 quiesce 已开始则失败；释放 lock；
-9. 仅从 local authority 派生 Guest address/port，建立连接。guard 持有到 HTTP response 完成或
-   WebSocket/transport 关闭。
+9. 仅从 local authority 派生 Guest address/port，建立连接。guard 登记 exact
+   `(cat_id, generation, route_epoch, runtime_identity)` 和 cancellation handle，持有到 HTTP
+   response 完成、WebSocket/transport 关闭，或显式 revoke 取消它。
 
 per-Cat admission lock 与 lifecycle quiesce、route authority install/revoke 共用。锁内不得网络
 I/O、磁盘 I/O 或 `.await`。验证在锁外、最终 compare-and-guard 在锁内，既限制恶意 token 的
@@ -295,9 +306,19 @@ allocate greater route epoch
   -> issuer may mint
 ```
 
-generic ledger 的 best-effort persistence 不能作为 ACK 成功门。reachable revoke/rebind 先让旧 Node
-durable revoke/advance，再改变控制面 publication。旧 Node 不可达时，先外部 isolate/fence，或从
-最后可能签发时刻等待至少 125 秒后才能把 authority 交给新 runtime。
+generic ledger 的 best-effort persistence 不能作为 ACK 成功门。reachable revoke/rebind 的顺序
+不可交换：
+
+1. per-Cat admission lock 内 durable revoke/advance old local authority，阻止旧 epoch 新 guard，
+   并标记其 active guards cancelled；
+2. 锁外关闭 Node↔Guest HTTP/WebSocket/streaming transport 并有界 drain；不持锁等待 I/O；
+3. 再次证明旧 authority active guard count 为零并持久 ACK；
+4. Control Plane 才可发布 route 变化或把 authority 交给新 runtime。
+
+drain timeout 保持 transfer blocked，除非强制停止/隔离旧 runtime 并取得外部 fence proof。旧 Node
+不可达时必须先用云 API、BMC、电源或网络隔离证明它不能继续服务；唯一例外是等待至少 125 秒
+后，另有独立可信的 zero-active-session 且 runtime-non-serving proof。TTL wait、heartbeat 缺报、
+Gateway cache purge 都不能单独满足 transfer gate。
 
 ## 11. Verification key ring
 
@@ -309,8 +330,9 @@ sorted-key digest 与每个 fingerprint。Gateway 没有 key ring，Control Plan
 signer/KMS 边界。
 
 轮换必须 verifier-first：staged verifier 覆盖全部目标 V2 Node并有证据 → signer switch → 双 key
-overlap 至少从最后一次旧 key 签发后 125 秒 → retire。rollback 只能切到仍部署的 key；无法收到
-compromise revoke 的 Node 必须隔离。
+overlap 至少从最后一次旧 key 签发后 125 秒 → retire。rollback 只能切到仍部署的 key；ring
+removal 只停止新 admission。incident 若要终止已有会话还必须 epoch-aware cancel-and-drain；
+无法收到 compromise revoke 的 Node 必须隔离。
 
 ## 12. V2 cohort 与旧路径删除
 
@@ -318,8 +340,8 @@ compromise revoke 的 Node 必须隔离。
 |---|---|---|
 | unsigned `RouteBinding` authority | compact signed grant + Node local truth | B1–B3 contract tests green |
 | Gateway `target_port`/`route_epoch` 字段 | signed claims；Node local-derived target | V2 Node/Gateway qualification |
-| WebSocket route query fields | `Cats-Route-Grant` header | Upgrade/expiry/rebind evidence |
-| HTTP per-request work acquire/release | Node activity guard | lifecycle race tests |
+| WebSocket route query fields | `Cats-Route-Grant` header | Upgrade/expiry/active-revoke evidence |
+| HTTP per-request work acquire/release | epoch-aware Node activity guard | lifecycle/revoke/drain race tests |
 | WebSocket control-plane renewal | connection-lifetime Node guard | long WS outage test |
 | Node `cat_id + Running` admission | strict verifier + atomic compare-and-guard | negative vectors + race tests |
 | single verifier/unsigned fallback | durable versioned key ring | rotation/rollback evidence |

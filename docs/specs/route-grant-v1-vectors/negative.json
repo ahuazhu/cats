@@ -200,5 +200,119 @@
       "context_override": { "quiesce_started": true },
       "expected_class": "runtime_unavailable"
     }
+  ],
+  "issuer_snapshot_cases": [
+    {
+      "name": "observed-running-but-settled-suspended",
+      "snapshot_override": {
+        "cats.observed_state": "Running",
+        "cat_runtime_state.state": "suspended"
+      },
+      "expected": "issuer_rejects_non_authoritative_projection"
+    },
+    {
+      "name": "heartbeat-running-without-settled-runtime",
+      "snapshot_override": {
+        "heartbeat.reported_state": "Running",
+        "cat_runtime_state": null
+      },
+      "expected": "issuer_rejects_observation_without_settlement"
+    },
+    {
+      "name": "settled-running-with-current-suspend-command",
+      "snapshot_override": {
+        "cat_runtime_state.state": "running",
+        "current_command.kind": "Suspend",
+        "current_command.phase": "dispatchable"
+      },
+      "expected": "issuer_rejects_nonterminal_invalidating_command"
+    },
+    {
+      "name": "route-publication-provenance-mismatch",
+      "snapshot_override": {
+        "cat_runtime_state.result_id": "result_current",
+        "route_publication.result_id": "result_stale"
+      },
+      "expected": "issuer_rejects_stale_route_publication"
+    }
+  ],
+  "session_transition_cases": [
+    {
+      "name": "reachable-revoke-cancels-active-streams-before-transfer",
+      "input": {
+        "node_reachable": true,
+        "old_authority": { "cat_generation": 7, "route_epoch": 42 },
+        "active_guards": [
+          { "kind": "websocket", "cat_generation": 7, "route_epoch": 42 },
+          { "kind": "streaming_http", "cat_generation": 7, "route_epoch": 42 }
+        ],
+        "revoke_to_route_epoch": 43,
+        "drain_result": "all_guards_zero"
+      },
+      "expected": {
+        "old_epoch_new_admission": "rejected",
+        "old_epoch_transports": "cancelled_and_closed",
+        "control_plane_publication_order": "after_zero_guard_durable_ack",
+        "authority_transfer": "allowed"
+      }
+    },
+    {
+      "name": "reachable-revoke-drain-timeout-blocks-transfer",
+      "input": {
+        "node_reachable": true,
+        "old_authority": { "cat_generation": 7, "route_epoch": 42 },
+        "active_guards": [
+          { "kind": "websocket", "cat_generation": 7, "route_epoch": 42 }
+        ],
+        "revoke_to_route_epoch": 43,
+        "drain_result": "timeout_one_guard_remaining",
+        "external_fence_proof": null
+      },
+      "expected": {
+        "control_plane_publication": "blocked",
+        "authority_transfer": "forbidden"
+      }
+    },
+    {
+      "name": "unreachable-node-ttl-only-does-not-prove-silence",
+      "input": {
+        "node_reachable": false,
+        "seconds_since_last_possible_issue": 125,
+        "active_guard_state": "unknown",
+        "runtime_serving_state": "unknown",
+        "external_fence_proof": null
+      },
+      "expected": {
+        "old_grant_new_admission": "exhausted",
+        "authority_transfer": "forbidden"
+      }
+    },
+    {
+      "name": "unreachable-node-external-fence-allows-transfer",
+      "input": {
+        "node_reachable": false,
+        "seconds_since_last_possible_issue": 0,
+        "external_fence_proof": "persisted_cloud_power_off_receipt"
+      },
+      "expected": {
+        "old_runtime_serving": "impossible",
+        "authority_transfer": "allowed_after_fence_receipt"
+      }
+    },
+    {
+      "name": "ttl-plus-independent-zero-session-nonserving-proof-allows-transfer",
+      "input": {
+        "node_reachable": false,
+        "seconds_since_last_possible_issue": 125,
+        "independent_proof": {
+          "active_guard_count": 0,
+          "runtime_state": "durably_stopped",
+          "source": "authenticated_pre_disconnect_retirement_receipt"
+        }
+      },
+      "expected": {
+        "authority_transfer": "allowed_after_proof_validation"
+      }
+    }
   ]
 }
