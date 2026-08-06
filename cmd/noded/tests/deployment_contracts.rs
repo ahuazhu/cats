@@ -98,7 +98,7 @@ fn production_aws_worker_can_cut_over_to_proxy_without_client_set_pinning() {
     let unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
     for expected in [
         "Environment=CATS_POSTGRES_SESSION_SETUP=client",
-        "--metadata-store-option session-setup=$CATS_POSTGRES_SESSION_SETUP",
+        "--metadata-store-option session-setup=${CATS_POSTGRES_SESSION_SETUP}",
     ] {
         assert!(
             unit.contains(expected),
@@ -109,6 +109,10 @@ fn production_aws_worker_can_cut_over_to_proxy_without_client_set_pinning() {
         unit.find("Environment=CATS_POSTGRES_SESSION_SETUP=client")
             < unit.find("EnvironmentFile=/etc/cats/worker.env"),
         "worker.env must be able to override the backward-compatible client default"
+    );
+    assert!(
+        !unit.contains("session-setup=$CATS_POSTGRES_SESSION_SETUP"),
+        "systemd does not expand an unbraced variable embedded in an argument; the worker would receive the literal variable name and restart forever"
     );
 }
 
@@ -122,8 +126,8 @@ fn production_platform_example_keeps_two_workers_in_distinct_subnets() {
         "the production example must retain worker capacity after one bare-metal host is lost"
     );
     assert!(
-        variables.contains("metal_worker_names = [\"cats-metal-1\", \"cats-metal-2\"]"),
-        "the worker fleet needs stable, distinct node identities"
+        variables.contains("metal_worker_names = [\"cats-metal-2\", \"cats-metal-1\"]"),
+        "the imported cats-metal-2 must stay at index 0 while the second stable identity is appended"
     );
 
     let platform = read_workspace_file("deploy/aws/terraform/stacks/platform/main.tf")
@@ -135,6 +139,71 @@ fn production_platform_example_keeps_two_workers_in_distinct_subnets() {
             "subnet_id = module.network.private_subnet_ids[count.index % length(module.network.private_subnet_ids)]"
         ),
         "bare-metal workers must be distributed across the configured private subnets"
+    );
+
+    let deployment = read_workspace_file(
+        "deploy/aws/terraform/stacks/production-infrastructure/production.tfvars.example",
+    );
+    for node_id in ["\"metal-2\" =", "\"metal-1\" ="] {
+        assert!(
+            deployment.contains(node_id),
+            "the worker deployment example must manage both stable node identities: {node_id}"
+        );
+    }
+}
+
+#[test]
+fn manual_worker_bootstrap_refuses_the_example_identity() {
+    let example = read_workspace_file("deploy/aws/metal/worker.env.example");
+    assert!(
+        example.contains("CATS_NODE_ID=REPLACE_WITH_UNIQUE_NODE_ID"),
+        "the manual bootstrap example must never claim a real fleet identity"
+    );
+    assert!(
+        !example.lines().any(|line| line == "CATS_NODE_ID=metal-1"),
+        "a second manual worker must not register as metal-1 by default"
+    );
+
+    let installer = read_workspace_file("deploy/aws/metal/install-worker.sh");
+    for expected in [
+        "worker_node_id=$(awk",
+        "$worker_node_id == REPLACE_WITH_UNIQUE_NODE_ID",
+        "$worker_advertise_url == *PRIVATE_IPV4*",
+    ] {
+        assert!(
+            installer.contains(expected),
+            "the installer must reject an unresolved identity before starting systemd: {expected:?}"
+        );
+    }
+    assert!(
+        installer.find("$worker_node_id == REPLACE_WITH_UNIQUE_NODE_ID")
+            < installer.find("apt-get update -q"),
+        "identity validation must happen before the expensive bootstrap starts"
+    );
+}
+
+#[test]
+fn guest_builder_installs_musl_target_for_the_pinned_toolchain() {
+    let builder = read_workspace_file("deploy/metal/build-guest-image.sh");
+    let static_agent_build = builder
+        .split_once("# 0. Static guest agent (musl)")
+        .and_then(|(_, rest)| rest.split_once("# 1. Kernel"))
+        .map(|(section, _)| section)
+        .expect("static Guest Agent build section");
+
+    let enter_repository = static_agent_build
+        .find("cd \"$REPO\"")
+        .expect("Guest build must enter the repository");
+    let install_target = static_agent_build
+        .find("rustup target add x86_64-unknown-linux-musl")
+        .expect("Guest build must install the musl Rust target");
+    let build_agent = static_agent_build
+        .find("cargo build --release -p cats-guest-agent --target x86_64-unknown-linux-musl")
+        .expect("Guest build must compile a static Guest Agent");
+
+    assert!(
+        enter_repository < install_target && install_target < build_agent,
+        "rustup must resolve the musl target after entering the repository so it installs into rust-toolchain.toml's pinned toolchain"
     );
 }
 

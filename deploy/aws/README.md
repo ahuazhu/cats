@@ -87,7 +87,11 @@ example, run `sudo CATS_ROUTE_GRANT_PUBLIC_KEY_FILE=/secure/path/public.pem
 deploy/aws/metal/install-worker.sh`. The helper validates and stages that key,
 then installs it as root-owned mode `0644` at
 `/etc/cats/route-grant-public.pem` before enabling `cats-worker`, whether or not
-`worker.env` already exists. Cloud Hypervisor stays under `/opt/cats/bin` so it does not replace a
+`worker.env` already exists. Its environment example deliberately contains
+`REPLACE_WITH_UNIQUE_NODE_ID` and `PRIVATE_IPV4`; fill both before rerunning the
+helper. An existing file with either placeholder is rejected before package
+installation or compilation so a second host cannot claim another worker's
+identity. Cloud Hypervisor stays under `/opt/cats/bin` so it does not replace a
 host-wide binary used by another workload. The S3 adapter uses the EC2
 instance role and refreshes its temporary credentials; no long-lived AWS key is
 stored in `worker.env`.

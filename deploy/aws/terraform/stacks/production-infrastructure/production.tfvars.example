@@ -16,7 +16,10 @@ worker_artifact_bucket_name    = "REPLACE_WITH_GLOBALLY_UNIQUE_CATS_WORKER_ARTIF
 worker_bundle_path             = "/absolute/path/to/dist/worker/cats-worker.tar.zst"
 worker_bundle_sha256           = "REPLACE_WITH_64_HEX_CHARACTERS"
 metal_worker_instances = {
-  "metal-1" = "i-REPLACE"
+  # Keep the logical node ids aligned with the platform worker Name tags. The
+  # imported worker remains metal-2; the newly appended worker is metal-1.
+  "metal-2" = "i-REPLACE_WITH_EXISTING_CATS_METAL_2"
+  "metal-1" = "i-REPLACE_WITH_NEW_CATS_METAL_1"
 }
 metal_worker_instance_role_name = "REPLACE_WITH_INSTANCE_ROLE_NAME"
 

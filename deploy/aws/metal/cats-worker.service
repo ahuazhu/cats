@@ -34,7 +34,7 @@ ExecStart=/opt/cats/bin/cats-noded \
   --metadata-store-adapter postgres \
   --metadata-store-option url-file=/run/cats/postgres-url \
   --metadata-store-option ca-file=/etc/cats/rds-ca.pem \
-  --metadata-store-option session-setup=$CATS_POSTGRES_SESSION_SETUP \
+  --metadata-store-option session-setup=${CATS_POSTGRES_SESSION_SETUP} \
   --object-store-adapter aws-s3 \
   --object-store-option bucket=${CATS_S3_BUCKET} \
   --object-store-option region=${CATS_AWS_REGION} \
