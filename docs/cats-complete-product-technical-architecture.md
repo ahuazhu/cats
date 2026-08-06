@@ -699,8 +699,10 @@ Gateway 的普通缓存过期后，只要 active + Running Route Grant 的签名
 授权仍可能有效时重新导入自己刚拒绝的授权，控制面直接返回新的 active + Running 是唯一
 能提前解除屏障的路径。Node 用机器可读的冲突元数据单独标识自然过期；过期不是撤销信号，
 所以控制面不可用时，Gateway 只可从共享镜像导入按 route epoch、再按签名签发时间严格更新
-的有效 Grant，相同或更旧的 Grant 仍被拒绝。HTTP/WS 使用同一规则，Node 仍执行最终签名、
-绑定和运行态校验。完整窗口到期后，Gateway 可以再次接受其他副本写入的当前有效控制面
+的有效 Grant，相同或更旧的 Grant 仍被拒绝。并发或迟到的同一/更旧 Grant 拒绝会合并到
+已有刷新，不能取消该刷新或清掉已经安装的更新 Grant；同一 Grant 的非过期冲突强于自然
+过期并保留保守屏障。HTTP/WS 使用同一规则，Node 仍执行最终签名、绑定和运行态校验。
+完整窗口到期后，Gateway 可以再次接受其他副本写入的当前有效控制面
 签名 Grant。已签发并复制的其他副本仍以签名到期为授权上界；单个 Grant 到期始终 fail
 closed。HTTP/WS 的生命周期并发由 Node 持有的本地
 activity guard 仲裁，不再逐请求获取 PostgreSQL work lease；Wake 仍必须经过控制面。

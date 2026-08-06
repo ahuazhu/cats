@@ -117,8 +117,12 @@ would let a compromised Gateway mint arbitrary Cat, Node or port bindings.
   unavailable, the Gateway may bypass the long barrier only to import a
   currently valid shared grant that is strictly newer than the rejected grant,
   ordered by route epoch and then signed issue time. The same or an older grant
-  remains blocked, and the Node still performs the final verification. HTTP and
-  WebSocket retries use the same rule.
+  remains blocked, and the Node still performs the final verification.
+  Concurrent or delayed rejections use that same ordering: a rejection already
+  being handled is coalesced with its in-flight refresh, and a rejection for an
+  older grant cannot cancel that refresh or remove a newer cached grant. For the
+  same grant, a non-expiry conflict is stronger than natural expiry and retains
+  the conservative barrier. HTTP and WebSocket retries use the same rule.
 
 The service bearer credential remains as defense in depth for the Gateway-to-
 Node hop. It authenticates the calling service but does not authorize a route.
