@@ -141,7 +141,8 @@ variable "worker_managed_environment" {
     deployment, unlike worker_base_environment which only seeds a host that has
     no file yet. Use it for values that must reach an existing host --
     CATS_POSTGRES_HOST, CATS_POSTGRES_PORT, CATS_POSTGRES_DATABASE,
-    CATS_POSTGRES_SSLMODE. CATS_POSTGRES_SECRET_ARN is added automatically from
+    CATS_POSTGRES_SSLMODE, CATS_POSTGRES_SESSION_SETUP.
+    CATS_POSTGRES_SECRET_ARN is added automatically from
     database_master_user_secret_arn.
   EOT
   type        = map(string)

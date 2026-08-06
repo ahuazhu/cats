@@ -15,6 +15,15 @@ output "port" {
   value = aws_db_instance.this.port
 }
 
+output "proxy_endpoint" {
+  description = "TLS-only RDS Proxy hostname for the storage/control DSN. Usage and rollback clients retain the direct instance endpoint."
+  value       = aws_db_proxy.this.endpoint
+}
+
+output "proxy_security_group_id" {
+  value = aws_security_group.proxy.id
+}
+
 output "database_name" {
   value = aws_db_instance.this.db_name
 }
@@ -41,4 +50,16 @@ output "postgresql_log_group_name" {
 
 output "password_authentication_alarm_name" {
   value = aws_cloudwatch_metric_alarm.password_authentication_failed.alarm_name
+}
+
+output "proxy_connection_setup_alarm_name" {
+  value = aws_cloudwatch_metric_alarm.proxy_connection_setup_failed.alarm_name
+}
+
+output "proxy_client_authentication_alarm_name" {
+  value = aws_cloudwatch_metric_alarm.proxy_client_authentication_failed.alarm_name
+}
+
+output "proxy_pool_saturation_alarm_name" {
+  value = aws_cloudwatch_metric_alarm.proxy_pool_saturation.alarm_name
 }

@@ -106,6 +106,48 @@ variable "performance_insights_enabled" {
   default     = false
 }
 
+variable "proxy_connection_borrow_timeout_seconds" {
+  type        = number
+  description = "How long an RDS Proxy client waits for a backend connection. Must remain below the adapter's seven-second operation deadline."
+  default     = 5
+
+  validation {
+    condition = (
+      var.proxy_connection_borrow_timeout_seconds >= 1 &&
+      var.proxy_connection_borrow_timeout_seconds < 7
+    )
+    error_message = "proxy_connection_borrow_timeout_seconds must be between 1 and 6 seconds."
+  }
+}
+
+variable "proxy_max_connections_percent" {
+  type        = number
+  description = "Maximum percentage of PostgreSQL max_connections RDS Proxy may consume, leaving capacity for bounded direct clients and operations."
+  default     = 80
+
+  validation {
+    condition = (
+      var.proxy_max_connections_percent >= 30 &&
+      var.proxy_max_connections_percent <= 90
+    )
+    error_message = "proxy_max_connections_percent must be between 30 and 90."
+  }
+}
+
+variable "proxy_max_idle_connections_percent" {
+  type        = number
+  description = "Maximum idle backend connections as a percentage of the proxy's connection limit."
+  default     = 50
+
+  validation {
+    condition = (
+      var.proxy_max_idle_connections_percent >= 0 &&
+      var.proxy_max_idle_connections_percent <= var.proxy_max_connections_percent
+    )
+    error_message = "proxy_max_idle_connections_percent must be between 0 and proxy_max_connections_percent."
+  }
+}
+
 variable "log_retention_days" {
   type        = number
   description = "Retention for the exported PostgreSQL error log. Long enough to reconstruct an incident, short enough not to accumulate cost."

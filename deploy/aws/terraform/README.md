@@ -90,6 +90,16 @@ change either, keep them disjoint.
 Secrets Manager. Read `database_master_user_secret_arn` to assemble
 `storage_postgres_url` and `usage_postgres_url` for the application stack.
 
+**The database proxy is provisioned before it is selected.** The platform
+stack creates a TLS-only RDS Proxy and exports `database_proxy_endpoint`, but
+the production workflow retains the direct storage URL until the optional
+`RDS_PROXY_ENDPOINT` repository variable is set. Wait for the proxy target to
+be `AVAILABLE` and verify its initialization timeouts before setting the
+variable. Usage clients remain direct. Metal workers switch separately, one
+drained node at a time, by setting `CATS_POSTGRES_HOST` to that output and
+`CATS_POSTGRES_SESSION_SETUP=server-verified`. See ADR-0034 for the complete
+cutover, rollback and metric acceptance contract.
+
 **Production dependencies span availability zones by default.** The RDS
 instance keeps a synchronous Multi-AZ standby, and each private subnet routes
 through a NAT gateway in its own zone. Disabling either setting is an explicit

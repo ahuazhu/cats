@@ -48,6 +48,17 @@ and without a restart. Leaving the ARN unset keeps the old behaviour — a stati
 invalidates: established connections keep serving while every new one fails,
 so the fleet looks healthy and only new Cats break.
 
+The platform stack also creates the TLS-only, multi-AZ RDS Proxy selected by
+ADR-0034. Applying that stack alone does not cut traffic over. After its target
+is `AVAILABLE`, set the `RDS_PROXY_ENDPOINT` GitHub repository variable to the
+`database_proxy_endpoint` output; the application workflow then changes only
+the storage/control DSN and enables server-verified session defaults. The usage
+DSN remains direct. For workers, set `CATS_POSTGRES_HOST` to the same endpoint
+and `CATS_POSTGRES_SESSION_SETUP=server-verified` in
+`worker_managed_environment`, then use the existing one-worker cordon/drain
+release sequence. Removing those two settings restores the direct endpoint and
+`client` mode without changing credentials.
+
 Production worker releases use the Terraform-managed artifact bucket,
 Secrets Manager secret and SSM State Manager association. The bundle digest is
 verified before installing `cats-noded`, `cats-blockd`, `cats-guest-agent`,

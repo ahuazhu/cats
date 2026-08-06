@@ -10,6 +10,9 @@ Delegate=cpu memory
 # whole cgroup here would terminate every Cat on this worker at once.
 KillMode=process
 Environment=CATS_GUEST_NETWORK_CIDR=10.240.0.0/16
+# Direct RDS remains the compatible default. A managed worker environment can
+# override this after the proxy exists and has passed its connectivity check.
+Environment=CATS_POSTGRES_SESSION_SETUP=client
 EnvironmentFile=/etc/cats/worker.env
 ExecStartPre=/usr/sbin/modprobe nbd nbds_max=64
 ExecStartPre=/opt/cats/bin/setup-guest-network
@@ -30,6 +33,7 @@ ExecStart=/opt/cats/bin/cats-noded \
   --metadata-store-adapter postgres \
   --metadata-store-option url-file=/run/cats/postgres-url \
   --metadata-store-option ca-file=/etc/cats/rds-ca.pem \
+  --metadata-store-option session-setup=$CATS_POSTGRES_SESSION_SETUP \
   --object-store-adapter aws-s3 \
   --object-store-option bucket=${CATS_S3_BUCKET} \
   --object-store-option region=${CATS_AWS_REGION} \

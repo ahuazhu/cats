@@ -46,6 +46,9 @@ jobs:
       # secret -- it is an ARN -- but it is the authority this deployment reads
       # the database password from, so a missing value fails the run.
       RDS_MASTER_USER_SECRET_ARN: ${{ vars.RDS_MASTER_USER_SECRET_ARN }}
+      # Optional staged cutover. Empty preserves the direct-RDS storage DSN and
+      # client-side session setup; setting it changes only the storage host.
+      RDS_PROXY_ENDPOINT: ${{ vars.RDS_PROXY_ENDPOINT }}
 
     steps:
       - uses: actions/checkout@v4
@@ -220,9 +223,19 @@ jobs:
           chmod 600 "$RUNNER_TEMP/master-user-secret.json"
           echo "::add-mask::$(jq -er '.password' "$RUNNER_TEMP/master-user-secret.json")"
 
+          postgres_host_args=()
+          storage_postgres_session_setup=client
+          if [[ -n "${RDS_PROXY_ENDPOINT:-}" ]]; then
+            postgres_host_args+=(
+              --host "CATS_POSTGRES_URL=$RDS_PROXY_ENDPOINT"
+            )
+            storage_postgres_session_setup=server-verified
+          fi
+
           python3 deploy/aws/swap-dsn-password.py \
             "$RUNNER_TEMP/live-secret.json" \
             "$RUNNER_TEMP/master-user-secret.json" \
+            "${postgres_host_args[@]}" \
             CATS_POSTGRES_URL \
             CATS_USAGE_POSTGRES_URL \
             > "$RUNNER_TEMP/rotated-urls.json"
@@ -259,9 +272,11 @@ jobs:
             --slurpfile live_secret "$RUNNER_TEMP/live-secret.json" \
             --slurpfile rotated "$RUNNER_TEMP/rotated-urls.json" \
             --rawfile rds_ca_pem "$RUNNER_TEMP/rds-ca.pem" \
+            --arg storage_postgres_session_setup "$storage_postgres_session_setup" \
             '{
               runtime_secret_data: $runtime_secret_data[0],
               storage_postgres_url: $rotated[0].CATS_POSTGRES_URL,
+              storage_postgres_session_setup: $storage_postgres_session_setup,
               usage_postgres_url: $rotated[0].CATS_USAGE_POSTGRES_URL,
               stripe_secret_key: $live_secret[0].STRIPE_SECRET_KEY,
               stripe_webhook_secret: $live_secret[0].STRIPE_WEBHOOK_SECRET,

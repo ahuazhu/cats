@@ -29,6 +29,18 @@ metal_worker_instance_role_name = "REPLACE_WITH_INSTANCE_ROLE_NAME"
 # Supply worker_runtime_secret_data through TF_VAR_worker_runtime_secret_data
 # or the approved CI secret store; do not put it in this file.
 
+# After the platform RDS Proxy target is AVAILABLE, supply these through an
+# approved non-secret tfvars source and roll one drained worker at a time:
+# worker_managed_environment = {
+#   CATS_POSTGRES_HOST          = "REPLACE_WITH_DATABASE_PROXY_ENDPOINT"
+#   CATS_POSTGRES_PORT          = "5432"
+#   CATS_POSTGRES_DATABASE      = "cats"
+#   CATS_POSTGRES_SSLMODE       = "verify-full"
+#   CATS_POSTGRES_SESSION_SETUP = "server-verified"
+# }
+# Keep database_master_user_secret_arn set from the platform output. Restoring
+# the direct database host and "client" mode is the rollback path.
+
 tags = {
   Owner = "platform"
 }

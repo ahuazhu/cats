@@ -114,7 +114,7 @@ variable "worker_managed_environment" {
     Non-secret worker.env entries Terraform rewrites on every deployment, so
     they reach a host that already has the file. Carries the non-secret half of
     the DSN: CATS_POSTGRES_HOST, CATS_POSTGRES_PORT, CATS_POSTGRES_DATABASE,
-    CATS_POSTGRES_SSLMODE.
+    CATS_POSTGRES_SSLMODE, CATS_POSTGRES_SESSION_SETUP.
   EOT
   type        = map(string)
   default     = {}

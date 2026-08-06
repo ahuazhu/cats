@@ -31,6 +31,11 @@ output "database_endpoint" {
   value = module.database.endpoint
 }
 
+output "database_proxy_endpoint" {
+  description = "Set this hostname as the RDS_PROXY_ENDPOINT repository variable only after the proxy target is AVAILABLE."
+  value       = module.database.proxy_endpoint
+}
+
 output "database_name" {
   value = module.database.database_name
 }
@@ -48,6 +53,18 @@ output "database_master_user_secret_arn" {
 output "database_postgresql_log_group_name" {
   description = "Read this before diagnosing a connection failure: the server states the reason here, and nowhere the client can see."
   value       = module.database.postgresql_log_group_name
+}
+
+output "database_proxy_connection_setup_alarm_name" {
+  value = module.database.proxy_connection_setup_alarm_name
+}
+
+output "database_proxy_client_authentication_alarm_name" {
+  value = module.database.proxy_client_authentication_alarm_name
+}
+
+output "database_proxy_pool_saturation_alarm_name" {
+  value = module.database.proxy_pool_saturation_alarm_name
 }
 
 output "alert_sns_topic_arn" {
