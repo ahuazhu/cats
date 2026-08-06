@@ -16,6 +16,7 @@ use anyhow::Context;
 use axum::body::{to_bytes, Body};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequestParts, State};
+use axum::http::uri::Authority;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
@@ -262,6 +263,23 @@ impl Gateway {
                 false,
             )
         })?;
+        let binding_hostname =
+            normalize_public_hostname(&resolved.binding.hostname).map_err(|message| {
+                ResolveFailure::response(
+                    StatusCode::BAD_GATEWAY,
+                    format!("invalid hostname in resolved Route binding: {message}"),
+                    false,
+                )
+            })?;
+        if binding_hostname != hostname {
+            return Err(ResolveFailure::response(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "resolved Route binding hostname {binding_hostname} does not match requested host {hostname}"
+                ),
+                false,
+            ));
+        }
         if resolved.state == "active" && resolved.observed_state == ObservedState::Running {
             if !route_is_locally_usable(&resolved) {
                 return Err(ResolveFailure::response(
@@ -491,6 +509,7 @@ impl Gateway {
         &self,
         resolved: &ResolveResponse,
         request: &ProxyHttpRequest,
+        hostname: &str,
     ) -> Result<Option<Response>, Response> {
         if resolved.node_agent_url.is_empty() {
             return Ok(None);
@@ -503,7 +522,9 @@ impl Gateway {
         let mut request = request.clone();
         request.target_port = resolved.binding.target_port;
         request.route_epoch = resolved.binding.epoch;
-        request.hostname = resolved.binding.hostname.clone();
+        // The public Host selected the cache key and Route binding. Never let a
+        // control-plane response substitute another Host at the Node boundary.
+        request.hostname = hostname.to_string();
         request.route_grant = resolved.route_grant.clone().ok_or_else(|| {
             gw_error(
                 StatusCode::BAD_GATEWAY,
@@ -813,7 +834,7 @@ impl Gateway {
         }
 
         // Proxy; on a stale route re-resolve once and retry.
-        match self.try_proxy(resolved, request).await {
+        match self.try_proxy(resolved, request, hostname).await {
             Ok(Some(resp)) => resp,
             Err(resp) => resp,
             Ok(None) => {
@@ -834,7 +855,7 @@ impl Gateway {
                     Ok(r) => r,
                     Err(resp) => return resp,
                 };
-                match self.try_proxy(&retry, request).await {
+                match self.try_proxy(&retry, request, hostname).await {
                     Ok(Some(resp)) => resp,
                     Ok(None) => gw_error(
                         StatusCode::CONFLICT,
@@ -849,6 +870,17 @@ impl Gateway {
 
 fn gw_error(status: StatusCode, message: String) -> Response {
     (status, message).into_response()
+}
+
+fn normalize_public_hostname(authority: &str) -> Result<String, String> {
+    let authority = authority
+        .parse::<Authority>()
+        .map_err(|_| "invalid Host authority".to_string())?;
+    let hostname = authority.host().trim_end_matches('.');
+    if hostname.is_empty() {
+        return Err("hostname is empty".to_string());
+    }
+    Ok(hostname.to_ascii_lowercase())
 }
 
 fn forwarded_headers(headers: &HeaderMap, hostname: &str) -> Result<Vec<(String, String)>, String> {
@@ -877,9 +909,12 @@ async fn entry(State(gw): State<Gateway>, req: Request<Body>) -> Response {
     let Some(host) = headers
         .get("host")
         .and_then(|v| v.to_str().ok())
-        .map(|h| h.split(':').next().unwrap_or(h).to_string())
+        .and_then(|value| normalize_public_hostname(value).ok())
     else {
-        return gw_error(StatusCode::BAD_REQUEST, "missing Host header".into());
+        return gw_error(
+            StatusCode::BAD_REQUEST,
+            "missing or invalid Host header".into(),
+        );
     };
     let path = parts
         .uri
@@ -973,6 +1008,7 @@ mod tests {
     struct RouteServerState {
         reply: Mutex<RouteReply>,
         node_agent_url: Mutex<String>,
+        binding_hostname: Mutex<String>,
         calls: AtomicUsize,
         wake_calls: AtomicUsize,
     }
@@ -982,6 +1018,7 @@ mod tests {
             Self {
                 reply: Mutex::new(reply),
                 node_agent_url: Mutex::new("http://node-a".to_string()),
+                binding_hostname: Mutex::new("dev.cats.run".to_string()),
                 calls: AtomicUsize::new(0),
                 wake_calls: AtomicUsize::new(0),
             }
@@ -998,6 +1035,10 @@ mod tests {
         fn set_node_agent_url(&self, node_agent_url: String) {
             *self.node_agent_url.lock().unwrap() = node_agent_url;
         }
+
+        fn set_binding_hostname(&self, hostname: &str) {
+            *self.binding_hostname.lock().unwrap() = hostname.to_string();
+        }
     }
 
     async fn route_reply(State(state): State<Arc<RouteServerState>>) -> Response {
@@ -1008,6 +1049,7 @@ mod tests {
             reply = *next;
         }
         let node_agent_url = state.node_agent_url.lock().unwrap().clone();
+        let binding_hostname = state.binding_hostname.lock().unwrap().clone();
         match reply {
             RouteReply::Active(route_grant) => {
                 let now = SystemTime::now()
@@ -1016,7 +1058,7 @@ mod tests {
                     .as_secs();
                 Json(serde_json::json!({
                     "binding": {
-                        "hostname": "dev.cats.run",
+                        "hostname": binding_hostname,
                         "workspace_id": "ws_1",
                         "cat_id": "cat_1",
                         "node_id": "node-a",
@@ -1073,6 +1115,7 @@ mod tests {
     async fn spawn_mock_node() -> (String, tokio::task::JoinHandle<()>) {
         async fn proxy(Json(request): Json<ProxyHttpRequest>) -> Json<ProxyHttpResponse> {
             assert_eq!(request.route_grant, "grant-1");
+            assert_eq!(request.hostname, "dev.cats.run");
             Json(ProxyHttpResponse {
                 status: 200,
                 headers: Vec::new(),
@@ -1149,6 +1192,106 @@ mod tests {
             "preview.cats.run".to_string()
         )));
         assert!(forwarded.contains(&("x-request-id".to_string(), "request-1".to_string())));
+    }
+
+    #[test]
+    fn public_hostname_normalization_is_shared_by_cache_and_node_hops() {
+        assert_eq!(
+            normalize_public_hostname("DEV.CATS.RUN.:8443").unwrap(),
+            "dev.cats.run"
+        );
+        assert_eq!(
+            normalize_public_hostname("dev.cats.run").unwrap(),
+            "dev.cats.run"
+        );
+        assert!(normalize_public_hostname("").is_err());
+        assert!(normalize_public_hostname("not a host").is_err());
+    }
+
+    #[tokio::test]
+    async fn wrong_hostname_binding_fails_before_node_contact_or_route_cache() {
+        #[derive(Clone)]
+        struct NodeState {
+            calls: Arc<AtomicUsize>,
+        }
+
+        async fn proxy(State(state): State<NodeState>) -> StatusCode {
+            state.calls.fetch_add(1, Ordering::SeqCst);
+            StatusCode::OK
+        }
+
+        let node_calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node_addr = listener.local_addr().unwrap();
+        let node_app = Router::new()
+            .route("/v1/cats/{id}/proxy", axum::routing::post(proxy))
+            .with_state(NodeState {
+                calls: node_calls.clone(),
+            });
+        let node_task = tokio::spawn(async move {
+            axum::serve(listener, node_app).await.unwrap();
+        });
+
+        let state = Arc::new(RouteServerState::new(RouteReply::Active("grant-for-b")));
+        state.set_binding_hostname("b.cats.run");
+        state.set_node_agent_url(format!("http://{node_addr}"));
+        let (gateway, control_task) = route_test_gateway(state, 10).await;
+        let response = gateway
+            .handle(
+                "a.cats.run".to_string(),
+                ProxyHttpRequest {
+                    method: "GET".to_string(),
+                    path: "/".to_string(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                    target_port: 0,
+                    route_epoch: 0,
+                    hostname: String::new(),
+                    route_grant: String::new(),
+                },
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            node_calls.load(Ordering::SeqCst),
+            0,
+            "a valid grant for B must not route public Host A to B's Node"
+        );
+        assert!(
+            gateway
+                .cache
+                .lock()
+                .unwrap()
+                .get("a.cats.run")
+                .is_some_and(|entry| entry.cached.is_none()),
+            "the mismatched binding entered A's authorized route cache"
+        );
+        control_task.abort();
+        node_task.abort();
+    }
+
+    #[tokio::test]
+    async fn mismatched_background_refresh_cannot_replace_the_requested_host() {
+        let state = Arc::new(RouteServerState::new(RouteReply::Active("grant-for-a")));
+        let (gateway, task) = route_test_gateway(state.clone(), 10).await;
+        gateway.resolve("dev.cats.run", true).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        state.set_binding_hostname("b.cats.run");
+        state.set(RouteReply::Active("grant-for-b"));
+        assert!(gateway.resolve("dev.cats.run", true).await.is_ok());
+        wait_for_calls(&state, 2).await;
+        wait_for_idle(&gateway, "dev.cats.run").await;
+
+        let cache = gateway.cache.lock().unwrap();
+        assert!(
+            cache
+                .get("dev.cats.run")
+                .is_some_and(|entry| entry.cached.is_none()),
+            "background refresh poisoned A with B's binding"
+        );
+        task.abort();
     }
 
     #[tokio::test]
