@@ -22,6 +22,7 @@ members = [
     "cmd/noded",
     "tests/support",
     "tests",
+    "qualification/protocol",
 ]
 
 [workspace.package]

@@ -1,0 +1,12 @@
+{
+  "schema": "cats.qualification.negative-fixtures/v1",
+  "base": "../positive/functional-zero-of-104.coverage.json",
+  "cases": [
+    {"name":"functional-ledger-mislabeled-final","operation":"set","pointer":"/phase","value":"release_required","expected_error":"expected_total=113"},
+    {"name":"missing-functional-case","operation":"remove","pointer":"/entries/103","expected_error":"coverage ledger must contain exactly 104 entries"},
+    {"name":"duplicate-functional-case","operation":"set","pointer":"/entries/1/case_id","value":"STO-STRICT-001","expected_error":"duplicate coverage entry"},
+    {"name":"p2-cost-inside-functional","operation":"set","pointer":"/entries/103/case_id","value":"PERF-COST-001","expected_error":"unexpected case for phase"},
+    {"name":"catalog-substitution","operation":"set","pointer":"/binding/catalog_sha256","value":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","expected_error":"catalog digest does not match the catalog bytes"},
+    {"name":"invented-pass-without-trial","operation":"set","pointer":"/entries/0/outcome","value":"pass","expected_error":"unplanned case must be explicit UNOBSERVED"}
+  ]
+}

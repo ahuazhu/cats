@@ -1,0 +1,357 @@
+{
+  "schema": "cats.qualification.trial/v1",
+  "binding": {
+    "run_id": "run-20260806-001",
+    "candidate_commit_sha": "d0658064764ee5d77430662fdc8f4c7fda120189",
+    "source_chain_verdict_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "artifact_manifest_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+    "environment_id": "qualification-cell-001",
+    "environment_manifest_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+    "environment_is_production": false,
+    "protocol_version": 1,
+    "catalog_sha256": "0e496d3b18202e1c9b4daf9047cfcc9633d66a321cafa86fd0a28e68faf96a2d",
+    "trial_plan_sha256": "5296172e2a20f8ecd2b2acfe83e10cda2f5df71d70a1647127de23fb0b090703",
+    "controller_commit_sha": "d0658064764ee5d77430662fdc8f4c7fda120189"
+  },
+  "window_id": "window-001",
+  "trial_id": "trial-sto-strict-004-001",
+  "case_id": "STO-STRICT-004",
+  "identities": [
+    {
+      "identity_id": "identity-controller",
+      "role": "controller",
+      "principal": "qualification-controller-role",
+      "session_id": "session-controller",
+      "credential_fingerprint_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "allowed_actions": [
+        "bind_run",
+        "schedule_trial"
+      ]
+    },
+    {
+      "identity_id": "identity-fault",
+      "role": "fault_actor",
+      "principal": "qualification-fault-role",
+      "session_id": "session-fault",
+      "credential_fingerprint_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "allowed_actions": [
+        "apply_fault",
+        "end_fault"
+      ]
+    },
+    {
+      "identity_id": "identity-recovery",
+      "role": "recovery_actor",
+      "principal": "qualification-recovery-role",
+      "session_id": "session-recovery",
+      "credential_fingerprint_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "allowed_actions": [
+        "arm_recovery",
+        "execute_recovery",
+        "record_cleanup"
+      ]
+    },
+    {
+      "identity_id": "identity-observer",
+      "role": "observer",
+      "principal": "qualification-observer-role",
+      "session_id": "session-observer",
+      "credential_fingerprint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "allowed_actions": [
+        "capture_calibration",
+        "capture_observation",
+        "seal_evidence"
+      ]
+    },
+    {
+      "identity_id": "identity-verifier",
+      "role": "verifier",
+      "principal": "qualification-verifier-role",
+      "session_id": "session-verifier",
+      "credential_fingerprint_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "allowed_actions": [
+        "verify_evidence",
+        "issue_terminal"
+      ]
+    }
+  ],
+  "events": [
+    {
+      "ledger_sequence": 1,
+      "event_id": "event-run-bound",
+      "run_id": "run-20260806-001",
+      "window_id": "window-001",
+      "trial_id": "trial-sto-strict-004-001",
+      "kind": "run_bound",
+      "actor_identity_id": "identity-controller",
+      "occurred_at": "2026-08-06T00:00:00Z",
+      "immutable_record_sha256": "018b2d5d8de538b412c591d91409e6d3ac326e1f305b6759c367fbb1c7d46351",
+      "subject_id": "run-20260806-001",
+      "subject_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+    },
+    {
+      "ledger_sequence": 2,
+      "event_id": "event-trial-scheduled",
+      "run_id": "run-20260806-001",
+      "window_id": "window-001",
+      "trial_id": "trial-sto-strict-004-001",
+      "kind": "trial_scheduled",
+      "actor_identity_id": "identity-controller",
+      "occurred_at": "2026-08-06T00:00:01Z",
+      "immutable_record_sha256": "691004036599d4a701af55301c66b21d0c66ce41c256ffd9550da38a42b196bb",
+      "subject_id": "trial-sto-strict-004-001",
+      "subject_sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+    },
+    {
+      "ledger_sequence": 3,
+      "event_id": "event-recovery-intent",
+      "run_id": "run-20260806-001",
+      "window_id": "window-001",
+      "trial_id": "trial-sto-strict-004-001",
+      "kind": "recovery_intent_armed",
+      "actor_identity_id": "identity-recovery",
+      "occurred_at": "2026-08-06T00:00:02Z",
+      "immutable_record_sha256": "6fe5f71a98ef82539c9d3eca98d8a590299a470fcc62834816ca69c87f62a879",
+      "subject_id": "recovery-plan-001",
+      "subject_sha256": "5555555555555555555555555555555555555555555555555555555555555555"
+    },
+    {
+      "ledger_sequence": 4,
+      "event_id": "event-mutation-started",
+      "run_id": "run-20260806-001",
+      "window_id": "window-001",
+      "trial_id": "trial-sto-strict-004-001",
+      "kind": "mutation_started",
+      "actor_identity_id": "identity-fault",
+      "occurred_at": "2026-08-06T00:00:03Z",
+      "immutable_record_sha256": "c8c491e19c958dd2c0b7539cee122a810dd940caba132b8d84a7f4b010bc16de",
+      "subject_id": "fault-operation-001",
+      "subject_sha256": "6666666666666666666666666666666666666666666666666666666666666666"
+    },
+    {
+      "ledger_sequence": 5,
+      "event_id": "event-observation",
+      "run_id": "run-20260806-001",
+      "window_id": "window-001",
+      "trial_id": "trial-sto-strict-004-001",
+      "kind": "observation_captured",
+      "actor_identity_id": "identity-observer",
+      "occurred_at": "2026-08-06T00:00:04Z",
+      "immutable_record_sha256": "edc40eacd8bb22dd1e8c7d0ecdb5c7498e73b2125aec35147985eaad30652f8d",
+      "subject_id": "observation-001",
+      "subject_sha256": "becd7fb53b7537aec413079c635922ff5f46890d8e8a85306c4a2d00513a311a"
+    },
+    {
+      "ledger_sequence": 6,
+      "event_id": "event-fault-ended",
+      "run_id": "run-20260806-001",
+      "window_id": "window-001",
+      "trial_id": "trial-sto-strict-004-001",
+      "kind": "fault_application_ended",
+      "actor_identity_id": "identity-fault",
+      "occurred_at": "2026-08-06T00:00:05Z",
+      "immutable_record_sha256": "1f98999a0e01ec2495cfa924b3cd90058536ec4578b7da0153d11d0e7c9fa722",
+      "subject_id": "fault-operation-001",
+      "subject_sha256": "8888888888888888888888888888888888888888888888888888888888888888"
+    },
+    {
+      "ledger_sequence": 7,
+      "event_id": "event-recovery-recorded",
+      "run_id": "run-20260806-001",
+      "window_id": "window-001",
+      "trial_id": "trial-sto-strict-004-001",
+      "kind": "recovery_execution_recorded",
+      "actor_identity_id": "identity-recovery",
+      "occurred_at": "2026-08-06T00:00:06Z",
+      "immutable_record_sha256": "c302f85a803f30a0c3d973df2a1d5869e917bf5be243fe8c8da9b21a0d7dfe0c",
+      "subject_id": "recovery-result-001",
+      "subject_sha256": "9999999999999999999999999999999999999999999999999999999999999999"
+    },
+    {
+      "ledger_sequence": 8,
+      "event_id": "event-cleanup-recorded",
+      "run_id": "run-20260806-001",
+      "window_id": "window-001",
+      "trial_id": "trial-sto-strict-004-001",
+      "kind": "cleanup_recorded",
+      "actor_identity_id": "identity-recovery",
+      "occurred_at": "2026-08-06T00:00:07Z",
+      "immutable_record_sha256": "320b982a8c5a70313086ad97d605c061e919f7c740333022163a164299d75a0c",
+      "subject_id": "cleanup-result-001",
+      "subject_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "ledger_sequence": 9,
+      "event_id": "event-seal-timeline",
+      "run_id": "run-20260806-001",
+      "window_id": "window-001",
+      "trial_id": "trial-sto-strict-004-001",
+      "kind": "evidence_sealed",
+      "actor_identity_id": "identity-observer",
+      "occurred_at": "2026-08-06T00:00:08Z",
+      "immutable_record_sha256": "8c0827f57e0089e1b5e8f40ef211f884b9aa11081a34ce681507f1dcf51e81f5",
+      "subject_id": "evidence-timeline",
+      "subject_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "ledger_sequence": 10,
+      "event_id": "event-seal-oracle",
+      "run_id": "run-20260806-001",
+      "window_id": "window-001",
+      "trial_id": "trial-sto-strict-004-001",
+      "kind": "evidence_sealed",
+      "actor_identity_id": "identity-observer",
+      "occurred_at": "2026-08-06T00:00:09Z",
+      "immutable_record_sha256": "efec4b8d571b6edabc0bfb134de9459fcb11fdf40917f38be961fd03fb126dda",
+      "subject_id": "evidence-oracle",
+      "subject_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    {
+      "ledger_sequence": 11,
+      "event_id": "event-seal-storage",
+      "run_id": "run-20260806-001",
+      "window_id": "window-001",
+      "trial_id": "trial-sto-strict-004-001",
+      "kind": "evidence_sealed",
+      "actor_identity_id": "identity-observer",
+      "occurred_at": "2026-08-06T00:00:10Z",
+      "immutable_record_sha256": "612f4b0c7b2466a00dd60bfcf84a0d1dcdcd56be81fe63ac092352b4c8184a3b",
+      "subject_id": "evidence-storage",
+      "subject_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    {
+      "ledger_sequence": 12,
+      "event_id": "event-verify-timeline",
+      "run_id": "run-20260806-001",
+      "window_id": "window-001",
+      "trial_id": "trial-sto-strict-004-001",
+      "kind": "evidence_verified",
+      "actor_identity_id": "identity-verifier",
+      "occurred_at": "2026-08-06T00:00:11Z",
+      "immutable_record_sha256": "a79bd5cbdaa51a764a1a9392a3980db43445605634d641ee985c2de533ffa21f",
+      "subject_id": "evidence-timeline",
+      "subject_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "ledger_sequence": 13,
+      "event_id": "event-verify-oracle",
+      "run_id": "run-20260806-001",
+      "window_id": "window-001",
+      "trial_id": "trial-sto-strict-004-001",
+      "kind": "evidence_verified",
+      "actor_identity_id": "identity-verifier",
+      "occurred_at": "2026-08-06T00:00:12Z",
+      "immutable_record_sha256": "9835ad7a275e420719bcb278982b038d51000577459ad28e7ee88e513161bd58",
+      "subject_id": "evidence-oracle",
+      "subject_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    {
+      "ledger_sequence": 14,
+      "event_id": "event-verify-storage",
+      "run_id": "run-20260806-001",
+      "window_id": "window-001",
+      "trial_id": "trial-sto-strict-004-001",
+      "kind": "evidence_verified",
+      "actor_identity_id": "identity-verifier",
+      "occurred_at": "2026-08-06T00:00:13Z",
+      "immutable_record_sha256": "09295916d44e9852f5a83344bdfa6ef785096accad690539200c6701b4fdad41",
+      "subject_id": "evidence-storage",
+      "subject_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    {
+      "ledger_sequence": 15,
+      "event_id": "event-terminal",
+      "run_id": "run-20260806-001",
+      "window_id": "window-001",
+      "trial_id": "trial-sto-strict-004-001",
+      "kind": "terminal_issued",
+      "actor_identity_id": "identity-verifier",
+      "occurred_at": "2026-08-06T00:00:14Z",
+      "immutable_record_sha256": "7cd3bc672c1249666efd3103414c6dd9749f8faf78760fa7c434213b651fdfc1",
+      "subject_id": "terminal-001",
+      "subject_sha256": "b0bbb202c38d130cd4594d7ff58d36e17ba0e419c46d6c96966dbfc79a750c12"
+    }
+  ],
+  "evidence": [
+    {
+      "evidence_id": "evidence-timeline",
+      "run_id": "run-20260806-001",
+      "window_id": "window-001",
+      "trial_id": "trial-sto-strict-004-001",
+      "producer_identity_id": "identity-observer",
+      "kind": "normalized_event_timeline",
+      "media_type": "application/json",
+      "immutable_locator": "urn:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "size_bytes": 4096,
+      "declared_max_bytes": 1048576,
+      "redaction_policy_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "secret_scan": "passed",
+      "first_event_sequence": 1,
+      "last_event_sequence": 8,
+      "sealed_event_id": "event-seal-timeline",
+      "verified_event_id": "event-verify-timeline"
+    },
+    {
+      "evidence_id": "evidence-oracle",
+      "run_id": "run-20260806-001",
+      "window_id": "window-001",
+      "trial_id": "trial-sto-strict-004-001",
+      "producer_identity_id": "identity-observer",
+      "kind": "independent_oracle_output",
+      "media_type": "application/json",
+      "immutable_locator": "urn:sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "size_bytes": 2048,
+      "declared_max_bytes": 1048576,
+      "redaction_policy_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "secret_scan": "passed",
+      "first_event_sequence": 3,
+      "last_event_sequence": 8,
+      "sealed_event_id": "event-seal-oracle",
+      "verified_event_id": "event-verify-oracle"
+    },
+    {
+      "evidence_id": "evidence-storage",
+      "run_id": "run-20260806-001",
+      "window_id": "window-001",
+      "trial_id": "trial-sto-strict-004-001",
+      "producer_identity_id": "identity-observer",
+      "kind": "storage_state_manifest",
+      "media_type": "application/json",
+      "immutable_locator": "urn:sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "size_bytes": 8192,
+      "declared_max_bytes": 1048576,
+      "redaction_policy_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "secret_scan": "passed",
+      "first_event_sequence": 3,
+      "last_event_sequence": 8,
+      "sealed_event_id": "event-seal-storage",
+      "verified_event_id": "event-verify-storage"
+    }
+  ],
+  "observation": {
+    "observation_id": "observation-001",
+    "state": "observed_present",
+    "expectation": "presence",
+    "calibration_event_id": null,
+    "known_positive_event_id": null,
+    "captured_event_id": "event-observation",
+    "record_sha256": "becd7fb53b7537aec413079c635922ff5f46890d8e8a85306c4a2d00513a311a"
+  },
+  "terminal": {
+    "terminal_id": "terminal-001",
+    "outcome": "pass",
+    "summary": "Independent storage oracle matched the acknowledged boundary after recovery.",
+    "verifier_identity_id": "identity-verifier",
+    "evidence_ids": [
+      "evidence-timeline",
+      "evidence-oracle",
+      "evidence-storage"
+    ],
+    "blocker": null,
+    "issued_event_id": "event-terminal",
+    "record_sha256": "b0bbb202c38d130cd4594d7ff58d36e17ba0e419c46d6c96966dbfc79a750c12"
+  }
+}
