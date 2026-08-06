@@ -316,6 +316,7 @@
       "associate_public_ip_address": false,
       "disable_api_termination": true,
       "ebs_optimized": true,
+      "force_destroy": false,
       "iam_instance_profile": "cats-qualification-v2-build-host",
       "instance_type": "c7i.12xlarge",
       "metadata_options[0].http_endpoint": "enabled",
@@ -496,6 +497,7 @@
       "policy"
     ],
     "aws_instance.build": [
+      "force_destroy",
       "user_data_base64"
     ],
     "aws_kms_key.artifacts": [
@@ -517,7 +519,7 @@
       "policy"
     ]
   },
-  "expected_managed_changes_sha256": "f81d3dfae5efa2eee1b39d4d336b6a6f32dc525d6f4650680630d0d28332eb1b",
+  "expected_managed_changes_sha256": "69f382ce4de97dac09160fe9a0db69878b9c0faffee592402685f7eee5dab0d7",
   "expected_resource_drift_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
   "required_change_actions": {
     "aws_eip.nat": [
@@ -527,22 +529,22 @@
       "no-op"
     ],
     "aws_iam_policy.build_boundary": [
-      "update"
+      "no-op"
     ],
     "aws_iam_policy.deployer_boundary": [
-      "update"
+      "no-op"
     ],
     "aws_iam_role.build": [
       "no-op"
     ],
     "aws_iam_role.deployer": [
-      "update"
+      "no-op"
     ],
     "aws_iam_role_policy.build": [
-      "update"
+      "no-op"
     ],
     "aws_iam_role_policy.deployer": [
-      "update"
+      "no-op"
     ],
     "aws_instance.build": [
       "delete",
@@ -558,7 +560,7 @@
       "no-op"
     ],
     "aws_kms_alias.source": [
-      "create"
+      "no-op"
     ],
     "aws_kms_key.artifacts": [
       "no-op"
@@ -567,7 +569,7 @@
       "no-op"
     ],
     "aws_kms_key.source": [
-      "create"
+      "no-op"
     ],
     "aws_nat_gateway.build": [
       "no-op"
@@ -588,37 +590,37 @@
       "no-op"
     ],
     "aws_s3_bucket.source": [
-      "create"
+      "no-op"
     ],
     "aws_s3_bucket_ownership_controls.artifacts": [
       "no-op"
     ],
     "aws_s3_bucket_ownership_controls.source": [
-      "create"
+      "no-op"
     ],
     "aws_s3_bucket_policy.artifacts": [
-      "update"
+      "no-op"
     ],
     "aws_s3_bucket_policy.source": [
-      "create"
+      "no-op"
     ],
     "aws_s3_bucket_public_access_block.artifacts": [
       "no-op"
     ],
     "aws_s3_bucket_public_access_block.source": [
-      "create"
+      "no-op"
     ],
     "aws_s3_bucket_server_side_encryption_configuration.artifacts": [
-      "update"
+      "no-op"
     ],
     "aws_s3_bucket_server_side_encryption_configuration.source": [
-      "create"
+      "no-op"
     ],
     "aws_s3_bucket_versioning.artifacts": [
       "no-op"
     ],
     "aws_s3_bucket_versioning.source": [
-      "create"
+      "no-op"
     ],
     "aws_security_group.build_host": [
       "no-op"
@@ -636,7 +638,7 @@
       "no-op"
     ],
     "aws_vpc_endpoint.build_storage": [
-      "update"
+      "no-op"
     ],
     "aws_vpc_endpoint.ssm[\"ssm\"]": [
       "no-op"
@@ -645,5 +647,10 @@
       "no-op"
     ]
   },
-  "required_before_identity_templates": {}
+  "required_before_identity_templates": {
+    "aws_instance.build": {
+      "disable_api_termination": true,
+      "force_destroy": true
+    }
+  }
 }

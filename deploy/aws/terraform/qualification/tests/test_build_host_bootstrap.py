@@ -17,6 +17,9 @@ CONTRACT_PATH = QUALIFICATION_DIR / "contracts" / "h2-build-host-create-v1.json"
 PREPARATION_CONTRACT_PATH = (
     QUALIFICATION_DIR / "contracts" / "h2-build-host-preparation-v1.json"
 )
+MAINTENANCE_CONTRACT_PATH = (
+    QUALIFICATION_DIR / "contracts" / "h2-build-host-maintenance-v1.json"
+)
 
 
 class BuildHostBoundaryTests(unittest.TestCase):
@@ -139,7 +142,11 @@ class BuildHostBoundaryTests(unittest.TestCase):
         payload = json.dumps(
             observed, sort_keys=True, separators=(",", ":")
         ).encode()
-        for path in (CONTRACT_PATH, PREPARATION_CONTRACT_PATH):
+        for path in (
+            CONTRACT_PATH,
+            PREPARATION_CONTRACT_PATH,
+            MAINTENANCE_CONTRACT_PATH,
+        ):
             contract = json.loads(path.read_text(encoding="utf-8"))
             expected = contract["manifest"]["expected"]["bootstrap"]
             self.assertEqual(expected["components_sha256"], observed)
@@ -179,6 +186,13 @@ class BuildHostBoundaryTests(unittest.TestCase):
             preparation_contract["required_known_change_paths"],
             preparation_expected,
         )
+        maintenance_contract = json.loads(
+            MAINTENANCE_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            maintenance_contract["required_known_change_paths"],
+            preparation_expected,
+        )
 
     def test_preparation_contract_freezes_the_complete_safe_transition(self) -> None:
         contract = json.loads(
@@ -197,6 +211,26 @@ class BuildHostBoundaryTests(unittest.TestCase):
             {"disable_api_termination": True, "force_destroy": False},
         )
         self.assertTrue(
+            contract["required_identity_templates"]["aws_instance.build"][
+                "force_destroy"
+            ]
+        )
+
+    def test_maintenance_contract_freezes_the_final_replacement(self) -> None:
+        contract = json.loads(
+            MAINTENANCE_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        self.assertEqual(contract["mode"], "maintenance")
+        self.assertEqual(len(contract["required_change_actions"]), 41)
+        self.assertEqual(
+            contract["required_change_actions"]["aws_instance.build"],
+            ["delete", "create"],
+        )
+        self.assertEqual(
+            contract["required_before_identity_templates"]["aws_instance.build"],
+            {"disable_api_termination": True, "force_destroy": True},
+        )
+        self.assertFalse(
             contract["required_identity_templates"]["aws_instance.build"][
                 "force_destroy"
             ]

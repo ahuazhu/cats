@@ -98,7 +98,7 @@ resource "aws_instance" "build" {
   iam_instance_profile                 = aws_iam_instance_profile.build.name
   associate_public_ip_address          = false
   disable_api_termination              = true
-  force_destroy                        = true
+  force_destroy                        = false
   instance_initiated_shutdown_behavior = "stop"
   ebs_optimized                        = true
   monitoring                           = true
@@ -146,16 +146,6 @@ resource "aws_instance" "build" {
     aws_kms_alias.source,
     aws_vpc_endpoint.ssm,
   ]
-
-  # One independently reviewed preparation apply records force_destroy=true in
-  # provider state before the termination-protected instance is replaced. The
-  # final configuration removes this temporary ignore block.
-  lifecycle {
-    ignore_changes = [
-      user_data_base64,
-      root_block_device[0].kms_key_id,
-    ]
-  }
 }
 
 check "canonical_ami_contract" {
