@@ -1000,6 +1000,7 @@ mod tests {
     #[derive(Clone)]
     enum RouteReply {
         Active(&'static str),
+        ActiveUntil(&'static str, u64),
         Status(StatusCode),
         Malformed,
         Delayed(Duration, Box<RouteReply>),
@@ -1041,6 +1042,32 @@ mod tests {
         }
     }
 
+    fn active_route_response(
+        binding_hostname: String,
+        node_agent_url: String,
+        route_grant: &str,
+        expires_at: u64,
+    ) -> Response {
+        Json(serde_json::json!({
+            "binding": {
+                "hostname": binding_hostname,
+                "workspace_id": "ws_1",
+                "cat_id": "cat_1",
+                "node_id": "node-a",
+                "gateway_url": "http://gateway",
+                "target_port": 8080,
+                "epoch": 7,
+                "wake_policy": "wake_on_request"
+            },
+            "state": "active",
+            "observed_state": "running",
+            "node_agent_url": node_agent_url,
+            "route_grant": route_grant,
+            "route_grant_expires_at_unix": expires_at
+        }))
+        .into_response()
+    }
+
     async fn route_reply(State(state): State<Arc<RouteServerState>>) -> Response {
         state.calls.fetch_add(1, Ordering::SeqCst);
         let mut reply = state.reply.lock().unwrap().clone();
@@ -1056,24 +1083,10 @@ mod tests {
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_secs();
-                Json(serde_json::json!({
-                    "binding": {
-                        "hostname": binding_hostname,
-                        "workspace_id": "ws_1",
-                        "cat_id": "cat_1",
-                        "node_id": "node-a",
-                        "gateway_url": "http://gateway",
-                        "target_port": 8080,
-                        "epoch": 7,
-                        "wake_policy": "wake_on_request"
-                    },
-                    "state": "active",
-                    "observed_state": "running",
-                    "node_agent_url": node_agent_url,
-                    "route_grant": route_grant,
-                    "route_grant_expires_at_unix": now + 60
-                }))
-                .into_response()
+                active_route_response(binding_hostname, node_agent_url, route_grant, now + 60)
+            }
+            RouteReply::ActiveUntil(route_grant, expires_at) => {
+                active_route_response(binding_hostname, node_agent_url, route_grant, expires_at)
             }
             RouteReply::Status(status) => status.into_response(),
             RouteReply::Malformed => (StatusCode::OK, "not-json").into_response(),
@@ -1112,10 +1125,21 @@ mod tests {
         (gateway, task)
     }
 
-    async fn spawn_mock_node() -> (String, tokio::task::JoinHandle<()>) {
-        async fn proxy(Json(request): Json<ProxyHttpRequest>) -> Json<ProxyHttpResponse> {
-            assert_eq!(request.route_grant, "grant-1");
+    struct MockNodeState {
+        grants: Mutex<Vec<String>>,
+    }
+
+    async fn spawn_mock_node() -> (String, Arc<MockNodeState>, tokio::task::JoinHandle<()>) {
+        async fn proxy(
+            State(state): State<Arc<MockNodeState>>,
+            Json(request): Json<ProxyHttpRequest>,
+        ) -> Json<ProxyHttpResponse> {
+            assert!(matches!(
+                request.route_grant.as_str(),
+                "grant-1" | "grant-2"
+            ));
             assert_eq!(request.hostname, "dev.cats.run");
+            state.grants.lock().unwrap().push(request.route_grant);
             Json(ProxyHttpResponse {
                 status: 200,
                 headers: Vec::new(),
@@ -1135,13 +1159,17 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let state = Arc::new(MockNodeState {
+            grants: Mutex::new(Vec::new()),
+        });
         let app = Router::new()
             .route("/v1/cats/{id}/proxy", axum::routing::post(proxy))
-            .route("/v1/cats/{id}/proxy-websocket", get(websocket));
+            .route("/v1/cats/{id}/proxy-websocket", get(websocket))
+            .with_state(state.clone());
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        (format!("http://{addr}"), task)
+        (format!("http://{addr}"), state, task)
     }
 
     async fn wait_for_calls(state: &RouteServerState, expected: usize) {
@@ -1647,9 +1675,268 @@ mod tests {
         task.abort();
     }
 
+    async fn mixed_gateway_batch(
+        client: &reqwest::Client,
+        http_url: &str,
+        http_count: usize,
+        websocket_count: usize,
+    ) -> (Vec<StatusCode>, Vec<Result<(), StatusCode>>, Duration) {
+        let started = Instant::now();
+        let http_requests = (0..http_count).map(|_| {
+            let client = client.clone();
+            let http_url = http_url.to_string();
+            async move {
+                client
+                    .get(http_url)
+                    .header(header::HOST, "dev.cats.run")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        });
+        let websocket_requests = (0..websocket_count).map(|_| {
+            let mut request = http_url
+                .replacen("http://", "ws://", 1)
+                .into_client_request()
+                .unwrap();
+            request
+                .headers_mut()
+                .insert(header::HOST, HeaderValue::from_static("dev.cats.run"));
+            async move {
+                match tokio_tungstenite::connect_async(request).await {
+                    Ok((mut socket, _)) => {
+                        socket.close(None).await.unwrap();
+                        Ok(())
+                    }
+                    Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                        Err(response.status())
+                    }
+                    Err(error) => panic!("unexpected WebSocket failure: {error}"),
+                }
+            }
+        });
+        let (http, websocket) = tokio::join!(
+            futures_util::future::join_all(http_requests),
+            futures_util::future::join_all(websocket_requests),
+        );
+        (http, websocket, started.elapsed())
+    }
+
+    #[tokio::test]
+    async fn concurrent_explicit_failures_revoke_stale_authority_after_one_refresh() {
+        for (reply, expected_status) in [
+            (
+                RouteReply::Status(StatusCode::NOT_FOUND),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                RouteReply::Status(StatusCode::UNAUTHORIZED),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (RouteReply::Malformed, StatusCode::BAD_GATEWAY),
+        ] {
+            let state = Arc::new(RouteServerState::new(RouteReply::Active("grant-1")));
+            let (gateway, task) = route_test_gateway(state.clone(), 10).await;
+            gateway.resolve("dev.cats.run", true).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            state.set(RouteReply::Delayed(
+                Duration::from_millis(100),
+                Box::new(reply),
+            ));
+
+            let started = Instant::now();
+            let requests = (0..64).map(|_| {
+                let gateway = gateway.clone();
+                async move { gateway.resolve("dev.cats.run", true).await }
+            });
+            let admitted = futures_util::future::join_all(requests).await;
+            assert!(admitted.into_iter().all(|result| result.is_ok()));
+            assert!(started.elapsed() < Duration::from_millis(250));
+            wait_for_calls(&state, 2).await;
+            wait_for_idle(&gateway, "dev.cats.run").await;
+
+            let calls = state.calls();
+            let requests = (0..64).map(|_| {
+                let gateway = gateway.clone();
+                async move { gateway.resolve("dev.cats.run", true).await }
+            });
+            let rejected = futures_util::future::join_all(requests).await;
+            assert!(rejected.into_iter().all(|result| {
+                result
+                    .expect_err("explicit control-plane response must revoke stale authority")
+                    .status()
+                    == expected_status
+            }));
+            assert_eq!(
+                state.calls(),
+                calls,
+                "revoked requests bypassed the per-host failure backoff"
+            );
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_transport_failure_retains_only_unexpired_authority() {
+        let state = Arc::new(RouteServerState::new(RouteReply::Active("grant-1")));
+        let (gateway, control_task) = route_test_gateway(state.clone(), 10).await;
+        gateway.resolve("dev.cats.run", true).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        control_task.abort();
+
+        let started = Instant::now();
+        let requests = (0..64).map(|_| {
+            let gateway = gateway.clone();
+            async move { gateway.resolve("dev.cats.run", true).await }
+        });
+        assert!(futures_util::future::join_all(requests)
+            .await
+            .into_iter()
+            .all(|result| result.is_ok()));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        wait_for_idle(&gateway, "dev.cats.run").await;
+
+        gateway
+            .cache
+            .lock()
+            .unwrap()
+            .get_mut("dev.cats.run")
+            .unwrap()
+            .cached
+            .as_mut()
+            .unwrap()
+            .resolved
+            .route_grant_expires_at_unix = Some(1);
+        let requests = (0..64).map(|_| {
+            let gateway = gateway.clone();
+            async move { gateway.resolve("dev.cats.run", true).await }
+        });
+        assert!(futures_util::future::join_all(requests)
+            .await
+            .into_iter()
+            .all(|result| result
+                .expect_err("expired authority survived a transport outage")
+                .status()
+                == StatusCode::BAD_GATEWAY));
+        assert_eq!(
+            state.calls(),
+            1,
+            "a dead control plane received phantom calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_http_and_websocket_load_spans_outage_recovery_and_exact_grant_expiry() {
+        let (node_agent_url, node_state, node_task) = spawn_mock_node().await;
+        let expires_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3;
+        let deadline = UNIX_EPOCH + Duration::from_secs(expires_at);
+        let state = Arc::new(RouteServerState::new(RouteReply::ActiveUntil(
+            "grant-1", expires_at,
+        )));
+        state.set_node_agent_url(node_agent_url);
+        let (gateway, control_task) = route_test_gateway(state.clone(), 10).await;
+        let gateway_handle = spawn((*gateway.cfg).clone()).await.unwrap();
+        let http_url = gateway_handle.base_url();
+        let client = reqwest::Client::new();
+
+        let primed = client
+            .get(&http_url)
+            .header(header::HOST, "dev.cats.run")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(primed.status(), StatusCode::OK);
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        state.set(RouteReply::Delayed(
+            Duration::from_millis(300),
+            Box::new(RouteReply::Status(StatusCode::SERVICE_UNAVAILABLE)),
+        ));
+
+        for _ in 0..2 {
+            let (http, websocket, elapsed) = mixed_gateway_batch(&client, &http_url, 32, 16).await;
+            assert!(http.into_iter().all(|status| status == StatusCode::OK));
+            assert!(websocket.into_iter().all(|result| result.is_ok()));
+            assert!(
+                elapsed < Duration::from_millis(250),
+                "slow control-plane refresh stalled authorized data-plane traffic"
+            );
+        }
+        wait_for_calls(&state, 2).await;
+        assert_eq!(state.calls(), 2, "one stale refresh was not singleflight");
+
+        tokio::time::sleep(Duration::from_millis(375)).await;
+        state.set(RouteReply::ActiveUntil("grant-2", expires_at));
+        let (http, websocket, _) = mixed_gateway_batch(&client, &http_url, 32, 16).await;
+        assert!(http.into_iter().all(|status| status == StatusCode::OK));
+        assert!(websocket.into_iter().all(|result| result.is_ok()));
+        wait_for_calls(&state, 3).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let (http, websocket, _) = mixed_gateway_batch(&client, &http_url, 16, 8).await;
+        assert!(http.into_iter().all(|status| status == StatusCode::OK));
+        assert!(websocket.into_iter().all(|result| result.is_ok()));
+        assert!(
+            node_state
+                .grants
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|grant| grant == "grant-2"),
+            "recovered control-plane authority never replaced the outage grant"
+        );
+
+        state.set(RouteReply::Delayed(
+            Duration::from_millis(150),
+            Box::new(RouteReply::Status(StatusCode::SERVICE_UNAVAILABLE)),
+        ));
+        while let Ok(remaining) = deadline.duration_since(SystemTime::now()) {
+            if remaining <= Duration::from_millis(300) {
+                break;
+            }
+            let (http, websocket, elapsed) = mixed_gateway_batch(&client, &http_url, 16, 8).await;
+            assert!(http.into_iter().all(|status| status == StatusCode::OK));
+            assert!(websocket.into_iter().all(|result| result.is_ok()));
+            assert!(elapsed < Duration::from_millis(250));
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+
+        state.set(RouteReply::Status(StatusCode::SERVICE_UNAVAILABLE));
+        if let Ok(remaining) = deadline.duration_since(SystemTime::now()) {
+            tokio::time::sleep(remaining + Duration::from_millis(175)).await;
+        }
+        let (http, websocket, elapsed) = mixed_gateway_batch(&client, &http_url, 32, 16).await;
+        assert!(
+            http.into_iter()
+                .all(|status| status == StatusCode::BAD_GATEWAY),
+            "HTTP admitted traffic after the advertised grant expiry"
+        );
+        assert!(websocket.into_iter().all(|result| {
+            result.expect_err("WebSocket admitted after grant expiry") == StatusCode::BAD_GATEWAY
+        }));
+        assert!(elapsed < Duration::from_millis(500));
+        assert!(
+            state.calls() <= 20,
+            "sustained mixed load amplified into {} control-plane calls",
+            state.calls()
+        );
+        assert_eq!(
+            state.wake_calls.load(Ordering::SeqCst),
+            0,
+            "Running traffic must not create wake operations"
+        );
+
+        drop(gateway_handle);
+        control_task.abort();
+        node_task.abort();
+    }
+
     #[tokio::test]
     async fn mixed_http_and_websocket_load_stays_fast_and_coalesced_during_outage() {
-        let (node_agent_url, node_task) = spawn_mock_node().await;
+        let (node_agent_url, _node_state, node_task) = spawn_mock_node().await;
         let state = Arc::new(RouteServerState::new(RouteReply::Active("grant-1")));
         state.set_node_agent_url(node_agent_url);
         let (gateway, control_task) = route_test_gateway(state.clone(), 10).await;
