@@ -1,4 +1,4 @@
-# ADR-0033: Bound PostgreSQL backend connections with managed RDS Proxy
+# ADR-0034: Bound PostgreSQL backend connections with managed RDS Proxy
 
 - Status: Accepted
 - Date: 2026-08-06

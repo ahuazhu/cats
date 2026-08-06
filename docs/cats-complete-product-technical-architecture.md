@@ -340,7 +340,7 @@ Terraform 管理的生产目标通过托管、跨 AZ 的 RDS Proxy 连接 Postgr
 metadata/lease 客户端 session，但代理把随 Cat 数增长的客户端 session 复用到有上限的
 数据库后端连接池。代理初始化查询统一设置 SQL/锁超时，metadata adapter 在不执行会导致
 pin 的 client `SET` 前提下逐连接校验这些值；控制面选主所需的少量 session advisory lock
-允许有界 pin（ADR-0033）。
+允许有界 pin（ADR-0034）。
 
 Edge
 

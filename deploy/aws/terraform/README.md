@@ -97,7 +97,7 @@ the production workflow retains the direct storage URL until the optional
 be `AVAILABLE` and verify its initialization timeouts before setting the
 variable. Usage clients remain direct. Metal workers switch separately, one
 drained node at a time, by setting `CATS_POSTGRES_HOST` to that output and
-`CATS_POSTGRES_SESSION_SETUP=server-verified`. See ADR-0033 for the complete
+`CATS_POSTGRES_SESSION_SETUP=server-verified`. See ADR-0034 for the complete
 cutover, rollback and metric acceptance contract.
 
 **Production dependencies span availability zones by default.** The RDS

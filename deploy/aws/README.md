@@ -49,7 +49,7 @@ invalidates: established connections keep serving while every new one fails,
 so the fleet looks healthy and only new Cats break.
 
 The platform stack also creates the TLS-only, multi-AZ RDS Proxy selected by
-ADR-0033. Applying that stack alone does not cut traffic over. After its target
+ADR-0034. Applying that stack alone does not cut traffic over. After its target
 is `AVAILABLE`, set the `RDS_PROXY_ENDPOINT` GitHub repository variable to the
 `database_proxy_endpoint` output; the application workflow then changes only
 the storage/control DSN and enables server-verified session defaults. The usage
