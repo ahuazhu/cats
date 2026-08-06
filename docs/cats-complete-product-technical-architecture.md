@@ -695,8 +695,11 @@ activity guard 仲裁，不再逐请求获取 PostgreSQL work lease；Wake 仍�
 **密钥一致性门禁：** 每个控制面副本启动前用私钥签名、用同次部署从该私钥派生的公钥
 验证固定 proof；Grant 的 `kid` 和 Node 注册均携带公钥 SPKI DER 的 SHA-256。Node 报告的
 指纹不匹配时，注册事务会把它保持为 Cordoned，管理 API 也拒绝 uncordon。生产发布在
-Terraform plan 前比较所有已启用校验的 Ready Node，金属机部署在安装后再次计算指纹；
-因此独立错配的密钥半部或中断的 worker 发布不能把不兼容 Node 放入流量路径。
+Terraform plan 前比较所有可调度或仍承载 assigned/orphan Cat 的 Node；全 legacy cohort 只
+用于第一次 additive rollout，legacy/enforcing 混合 cohort 作为中断发布拒绝。注册、placement
+和 uncordon 共享事务线性化点；数据库中的一次性 legacy phase 在所有 serving Node 报告
+verifier 后永久关闭。金属机部署在安装后再次计算指纹，因此独立错配、降级或中断发布不能
+把不兼容 Node 放入流量路径。
 
 ### 9.2 地址与路由
 

@@ -598,7 +598,7 @@ COMMIT;
 
       <div class="callout green"><strong>控制面故障契约（ADR-0033）：</strong>普通缓存过期后，只要 active + Running Route Grant 的签名时效仍有效，就立即准入并按 hostname 合并为一个后台 refresh；transport/5xx 失败保留该授权并进入有界退避，不会让每个请求等待两秒或放大控制面流量。观察到明确 not-found、其他非成功响应、畸形响应后立即失效缓存；签名到期也始终 fail closed。HTTP/WS 的生命周期并发由 Node 本地 activity guard 仲裁，不再逐请求获取 PostgreSQL work lease；Wake 仍经过控制面。</div>
 
-      <div class="callout"><strong>密钥一致性门禁：</strong>每个控制面副本启动前用私钥签名、用同次部署从该私钥派生的公钥验证固定 proof；Grant 的 <code>kid</code> 和 Node 注册均携带公钥 SPKI DER 的 SHA-256。指纹不匹配的 Node 会在注册事务中保持 Cordoned，管理 API 也拒绝 uncordon。生产发布在 Terraform plan 前比较所有已启用校验的 Ready Node，金属机部署在安装后再次计算指纹，因此独立错配的密钥半部或中断的 worker 发布不能把不兼容 Node 放入流量路径。</div>
+      <div class="callout"><strong>密钥一致性门禁：</strong>每个控制面副本启动前用私钥签名、用同次部署从该私钥派生的公钥验证固定 proof；Grant 的 <code>kid</code> 和 Node 注册均携带公钥 SPKI DER 的 SHA-256。注册、placement 与 uncordon 共享事务线性化点，持久化的一次性 legacy phase 在所有可调度或仍承载 assigned/orphan Cat 的 Node 报告 verifier 后永久关闭。生产 plan 前检查全部这类 Node：只允许全 legacy 的第一次 additive rollout 或全部匹配当前 key，拒绝 legacy/enforcing 混合 cohort、错配和降级。</div>
 
       <h3 style="margin-top:28px">9.2 地址与路由</h3>
       <div class="table-wrap">
