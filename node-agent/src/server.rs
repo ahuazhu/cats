@@ -197,6 +197,11 @@ const USAGE_DELIVERY_INTERVAL: Duration = Duration::from_secs(1);
 #[derive(Debug)]
 struct UsageDeliveryState {
     request_budget_bytes: usize,
+    /// A response timeout is a soft capacity signal, so it lowers this AIMD
+    /// window without changing the hard serialized-byte budget. Keeping the
+    /// two dimensions separate guarantees that a later, larger checkpoint can
+    /// still be sent by itself.
+    max_checkpoints_per_request: usize,
     consecutive_failures: u32,
     retry_not_before: Option<Instant>,
 }
@@ -205,6 +210,7 @@ impl Default for UsageDeliveryState {
     fn default() -> Self {
         Self {
             request_budget_bytes: USAGE_REQUEST_TARGET_BYTES,
+            max_checkpoints_per_request: MAX_USAGE_CHECKPOINTS_PER_REQUEST,
             consecutive_failures: 0,
             retry_not_before: None,
         }
@@ -217,9 +223,24 @@ impl UsageDeliveryState {
             .and_then(|deadline| deadline.checked_duration_since(now))
     }
 
-    fn record_success(&mut self) {
+    fn record_idle(&mut self) {
         self.consecutive_failures = 0;
         self.retry_not_before = None;
+    }
+
+    fn record_success(&mut self) {
+        self.record_idle();
+        if self.max_checkpoints_per_request < MAX_USAGE_CHECKPOINTS_PER_REQUEST {
+            // Additive recovery avoids permanently pinning throughput to one
+            // tiny request after a transient slow response. It also avoids
+            // immediately returning to the exact oversized batch that just
+            // timed out.
+            let growth = (self.max_checkpoints_per_request / 8).max(1);
+            self.max_checkpoints_per_request = self
+                .max_checkpoints_per_request
+                .saturating_add(growth)
+                .min(MAX_USAGE_CHECKPOINTS_PER_REQUEST);
+        }
     }
 
     fn record_failure(&mut self, now: Instant) -> Duration {
@@ -250,10 +271,18 @@ impl UsageDeliveryState {
         let smaller_bytes = serde_json::to_vec(&smaller)?.len();
         anyhow::ensure!(
             smaller_bytes < self.request_budget_bytes,
-            "payload-too-large retry did not reduce the usage request budget"
+            "usage request split did not reduce the request budget"
         );
         self.request_budget_bytes = smaller_bytes;
         Ok(())
+    }
+
+    fn shrink_after_timeout(&mut self, rejected: &[CatUsageCheckpoint]) -> bool {
+        if rejected.len() <= 1 {
+            return false;
+        }
+        self.max_checkpoints_per_request = (rejected.len() / 2).max(1);
+        true
     }
 }
 
@@ -265,12 +294,13 @@ async fn deliver_usage_batches(
     spool: &UsageSpool,
     delivery: &tokio::sync::Mutex<UsageDeliveryState>,
 ) -> anyhow::Result<()> {
-    // Heartbeats and lifecycle finalization share one ordered delivery lane.
-    // Holding an async mutex across the request is intentional; a std mutex is
-    // not held across await, and later batches cannot overtake earlier ones.
+    // Every periodic or lifecycle-triggered uploader wakeup shares one ordered
+    // delivery lane. Holding an async mutex across the request is intentional;
+    // a std mutex is not held across await, and later batches cannot overtake
+    // earlier ones.
     let mut delivery = delivery.lock().await;
     if spool.is_empty()? {
-        delivery.record_success();
+        delivery.record_idle();
         return Ok(());
     }
     if let Some(delay) = delivery.retry_delay(Instant::now()) {
@@ -283,7 +313,7 @@ async fn deliver_usage_batches(
     loop {
         let pending_checkpoints = match spool.peek_request_batch(
             node_id,
-            MAX_USAGE_CHECKPOINTS_PER_REQUEST,
+            delivery.max_checkpoints_per_request,
             delivery.request_budget_bytes,
         ) {
             Ok(checkpoints) => checkpoints,
@@ -296,7 +326,7 @@ async fn deliver_usage_batches(
             }
         };
         if pending_checkpoints.is_empty() {
-            delivery.record_success();
+            delivery.record_idle();
             return Ok(());
         }
         let request = IngestUsageCheckpointsRequest {
@@ -320,10 +350,29 @@ async fn deliver_usage_batches(
         {
             Ok(response) => response,
             Err(error) => {
+                // A response timeout after connecting is often a batch-size
+                // signal: the server accepted the request but could not durably
+                // ingest it inside our deadline. Retain the whole prefix and
+                // halve only the next wire request. Connect timeouts instead
+                // describe reachability and cannot be improved by splitting.
+                // The response can be lost after a successful commit, so this
+                // retry remains safe only because ingestion deduplicates the
+                // stable checkpoint event IDs.
+                let shrunk = error.is_timeout()
+                    && !error.is_connect()
+                    && delivery.shrink_after_timeout(&pending_checkpoints);
                 let delay = delivery.record_failure(Instant::now());
+                let capacity_detail = if shrunk {
+                    format!(
+                        "; reduced the next batch to at most {} checkpoints",
+                        delivery.max_checkpoints_per_request
+                    )
+                } else {
+                    String::new()
+                };
                 return Err(error).context(format!(
-                    "send durable usage checkpoints; retrying after {} ms",
-                    delay.as_millis()
+                    "send durable usage checkpoints{capacity_detail}; retrying after {} ms",
+                    delay.as_millis(),
                 ));
             }
         };
@@ -340,6 +389,10 @@ async fn deliver_usage_batches(
         }
         if !response.status().is_success() {
             let status = response.status();
+            let shrunk = matches!(
+                status,
+                StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT
+            ) && delivery.shrink_after_timeout(&pending_checkpoints);
             // Carry the control plane's reason. It names the offending
             // checkpoint and what is wrong with it, which is the difference
             // between "the batch is rejected" and knowing that one specific Cat
@@ -349,14 +402,22 @@ async fn deliver_usage_batches(
             let detail = detail.trim();
             let detail: String = detail.chars().take(MAX_INGEST_ERROR_DETAIL_CHARS).collect();
             let delay = delivery.record_failure(Instant::now());
+            let capacity_detail = if shrunk {
+                format!(
+                    "; reduced the next batch to at most {} checkpoints",
+                    delivery.max_checkpoints_per_request
+                )
+            } else {
+                String::new()
+            };
             if detail.is_empty() {
                 anyhow::bail!(
-                    "usage ingestion returned {status}; retrying after {} ms",
+                    "usage ingestion returned {status}{capacity_detail}; retrying after {} ms",
                     delay.as_millis()
                 );
             }
             anyhow::bail!(
-                "usage ingestion returned {status}: {detail}; retrying after {} ms",
+                "usage ingestion returned {status}: {detail}{capacity_detail}; retrying after {} ms",
                 delay.as_millis()
             );
         }
@@ -860,6 +921,13 @@ mod usage_delivery_tests {
         requests: Arc<Mutex<Vec<Vec<String>>>>,
     }
 
+    #[derive(Clone)]
+    struct TimeoutSensitiveIngestion {
+        max_checkpoints: usize,
+        requests: Arc<Mutex<Vec<Vec<String>>>>,
+        accepted: Arc<Mutex<Vec<String>>>,
+    }
+
     async fn ingest(State(state): State<MockIngestion>, body: Bytes) -> StatusCode {
         let request: IngestUsageCheckpointsRequest = serde_json::from_slice(&body).unwrap();
         state.requests.lock().unwrap().push(
@@ -875,6 +943,25 @@ mod usage_delivery_tests {
             .unwrap()
             .pop_front()
             .unwrap_or(StatusCode::OK)
+    }
+
+    async fn ingest_with_size_dependent_timeout(
+        State(state): State<TimeoutSensitiveIngestion>,
+        body: Bytes,
+    ) -> StatusCode {
+        let request: IngestUsageCheckpointsRequest = serde_json::from_slice(&body).unwrap();
+        let event_ids = request
+            .checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.event_id.clone())
+            .collect::<Vec<_>>();
+        state.requests.lock().unwrap().push(event_ids.clone());
+        if event_ids.len() > state.max_checkpoints {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        } else {
+            state.accepted.lock().unwrap().extend(event_ids);
+        }
+        StatusCode::OK
     }
 
     /// Answers every request with one status and one body, for asserting what
@@ -897,6 +984,27 @@ mod usage_delivery_tests {
         state.responses.lock().unwrap().extend(responses);
         let app = Router::new()
             .route("/", post(ingest))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}/"), state, server)
+    }
+
+    async fn spawn_timeout_sensitive_mock(
+        max_checkpoints: usize,
+    ) -> (
+        String,
+        TimeoutSensitiveIngestion,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let state = TimeoutSensitiveIngestion {
+            max_checkpoints,
+            requests: Arc::new(Mutex::new(Vec::new())),
+            accepted: Arc::new(Mutex::new(Vec::new())),
+        };
+        let app = Router::new()
+            .route("/", post(ingest_with_size_dependent_timeout))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -960,6 +1068,89 @@ mod usage_delivery_tests {
                 .map(|c| c.event_id.clone())
                 .collect::<Vec<_>>()
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn request_timeout_shrinks_batches_until_the_ordered_spool_recovers() {
+        let checkpoints = (0..8).map(checkpoint).collect::<Vec<_>>();
+        let expected = checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.event_id.clone())
+            .collect::<Vec<_>>();
+        let (_directory, spool) = spool_with(&checkpoints);
+        let (endpoint, mock, server) = spawn_timeout_sensitive_mock(2).await;
+        let delivery = tokio::sync::Mutex::new(UsageDeliveryState::default());
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap();
+
+        for _ in 0..12 {
+            let _ = deliver_usage_batches(&client, &endpoint, "token", "node-a", &spool, &delivery)
+                .await;
+            if spool.is_empty().unwrap() {
+                break;
+            }
+            delivery.lock().await.retry_not_before = Some(Instant::now());
+        }
+
+        assert!(
+            spool.is_empty().unwrap(),
+            "a size-dependent timeout must not wedge the queue head"
+        );
+        assert_eq!(
+            *mock.accepted.lock().unwrap(),
+            expected,
+            "only accepted consecutive prefixes may be acknowledged"
+        );
+        let request_sizes = mock
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(Vec::len)
+            .collect::<Vec<_>>();
+        assert_eq!(request_sizes.first(), Some(&8));
+        assert!(
+            request_sizes.windows(2).any(|sizes| sizes[1] < sizes[0]),
+            "a timeout must reduce a later request: {request_sizes:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gateway_timeout_shrinks_the_next_batch_without_acknowledging_the_failed_one() {
+        let checkpoints = (0..4).map(checkpoint).collect::<Vec<_>>();
+        let (_directory, spool) = spool_with(&checkpoints);
+        let (endpoint, mock, server) =
+            spawn_mock([StatusCode::GATEWAY_TIMEOUT, StatusCode::OK, StatusCode::OK]).await;
+        let delivery = tokio::sync::Mutex::new(UsageDeliveryState::default());
+        let client = reqwest::Client::new();
+
+        let error = deliver_usage_batches(&client, &endpoint, "token", "node-a", &spool, &delivery)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("504 Gateway Timeout"));
+        assert_eq!(spool.len().unwrap(), 4);
+        delivery.lock().await.retry_not_before = Some(Instant::now());
+
+        deliver_usage_batches(&client, &endpoint, "token", "node-a", &spool, &delivery)
+            .await
+            .unwrap();
+
+        assert!(spool.is_empty().unwrap());
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.iter().map(Vec::len).collect::<Vec<_>>(), [4, 2, 2]);
+        assert_eq!(
+            requests[0],
+            checkpoints
+                .iter()
+                .map(|c| c.event_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(requests[1], requests[0][..2]);
+        assert_eq!(requests[2], requests[0][2..]);
         server.abort();
     }
 
