@@ -547,8 +547,7 @@ fn production_control_plane_survives_one_pod_or_node_disruption() {
 fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
     let workflow = read_workspace_file(".github/workflows/verify-control-plane-ha.yml");
     let harness = read_workspace_file("test-results/qualification-20260805/ha-handoff.sh");
-    let admin_adapter =
-        read_workspace_file("deploy/aws/qualification/q124-admin-node-runner.sh");
+    let admin_adapter = read_workspace_file("deploy/aws/qualification/q124-admin-node-runner.sh");
     for expected in [
         "workflow_dispatch:",
         "READ_ONLY_CONTROL_PLANE_LEADER_DIAGNOSTIC",
@@ -659,7 +658,9 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
     for expected in [
         "case \"${ACTION}\" in get|cats|cordon|uncordon)",
         "cat_scope_valid \"${CAT_ID}\" \"${CAT_NAME}\"",
-        "Node assignment escaped exact q124 scope",
+        "CATS_HA_HOOK_ASSIGNMENT_EXPECTATION",
+        "Node assignment changed across ${ACTION}",
+        "recover_uncordon",
         "${RUNNER_ROOT}/q124-admin-token",
         "administrator adapter must run on the independent main-branch Actions runner",
         "CATS_HA_WINDOW_NONCE",
@@ -670,12 +671,11 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
             "q124 admin adapter is missing {expected:?}"
         );
     }
-    let scope_fixture = Command::new(
-        workspace_root().join("deploy/aws/qualification/q124-admin-node-runner.sh"),
-    )
-    .arg("--validate-scope-fixtures")
-    .output()
-    .expect("run q124 admin adapter scope fixture");
+    let scope_fixture =
+        Command::new(workspace_root().join("deploy/aws/qualification/q124-admin-node-runner.sh"))
+            .arg("--validate-scope-fixtures")
+            .output()
+            .expect("run q124 admin adapter scope fixture");
     assert!(
         scope_fixture.status.success(),
         "adapter scope fixture failed: {}",
@@ -683,7 +683,7 @@ fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
     );
     assert_eq!(
         String::from_utf8_lossy(&scope_fixture.stdout).trim(),
-        "adapter_scope_fixture=PASS empty=true paired=true name_only_rejected=true id_only_rejected=true"
+        "adapter_scope_fixture=PASS empty=true paired=true name_only_rejected=true id_only_rejected=true expectations=true"
     );
 }
 

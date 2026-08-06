@@ -270,7 +270,7 @@ admin_cat_scope() {
 }
 
 invoke_admin_node_hook() {
-  local hook="$1" action="$2" node_id="$3" cat_name="$4" cat_id="$5"
+  local hook="$1" action="$2" node_id="$3" cat_name="$4" cat_id="$5" expectation="$6"
   local scope scope_cat_id scope_cat_name
   scope="$(admin_cat_scope "${cat_name}" "${cat_id}")" || {
     echo "refusing incomplete current Cat adapter scope" >&2
@@ -281,6 +281,7 @@ invoke_admin_node_hook() {
   CATS_HA_HOOK_WORKSPACE_ID="${WORKSPACE_ID}" \
     CATS_HA_HOOK_CAT_ID="${scope_cat_id}" \
     CATS_HA_HOOK_CAT_NAME="${scope_cat_name}" \
+    CATS_HA_HOOK_ASSIGNMENT_EXPECTATION="${expectation}" \
     CATS_HA_WINDOW_NONCE="${WINDOW_NONCE}" \
     "${hook}" "${action}" "${node_id}"
 }
@@ -323,16 +324,16 @@ validate_fixtures() {
   fi
   scope_hook="${fixture_root}/scope-hook"
   printf '%s\n' '#!/usr/bin/env bash' \
-    'printf "%s|%s|%s|%s|%s\n" "${CATS_HA_HOOK_WORKSPACE_ID}" "${CATS_HA_HOOK_CAT_ID}" "${CATS_HA_HOOK_CAT_NAME}" "$1" "$2"' \
+    'printf "%s|%s|%s|%s|%s|%s\n" "${CATS_HA_HOOK_WORKSPACE_ID}" "${CATS_HA_HOOK_CAT_ID}" "${CATS_HA_HOOK_CAT_NAME}" "${CATS_HA_HOOK_ASSIGNMENT_EXPECTATION}" "$1" "$2"' \
     >"${scope_hook}"
   chmod 700 "${scope_hook}"
-  scope_output="$(invoke_admin_node_hook "${scope_hook}" get q124-fixture-node q124-before-create '')"
-  [[ "${scope_output}" == 'ws_788c5bfc3931|||get|q124-fixture-node' ]] || {
+  scope_output="$(invoke_admin_node_hook "${scope_hook}" get q124-fixture-node q124-before-create '' empty)"
+  [[ "${scope_output}" == 'ws_788c5bfc3931|||empty|get|q124-fixture-node' ]] || {
     echo "before-create real adapter environment path retained a half-bound Cat scope" >&2
     return 1
   }
-  scope_output="$(invoke_admin_node_hook "${scope_hook}" get q124-fixture-node q124-created cat_fixture)"
-  [[ "${scope_output}" == 'ws_788c5bfc3931|cat_fixture|q124-created|get|q124-fixture-node' ]] || return 1
+  scope_output="$(invoke_admin_node_hook "${scope_hook}" get q124-fixture-node q124-created cat_fixture exact-one)"
+  [[ "${scope_output}" == 'ws_788c5bfc3931|cat_fixture|q124-created|exact-one|get|q124-fixture-node' ]] || return 1
   mkdir -p "${stub_bin}"
   printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\\n" "$(basename "$0") $*" >>"${Q124_CALL_LOG}"' 'exit 99' \
     >"${stub_bin}/cats"
@@ -569,7 +570,7 @@ cats_json() {
 # exactly: get NODE, cats NODE, cordon NODE, or uncordon NODE. It must write
 # only the corresponding API JSON to stdout and must never print credentials.
 admin_node_json() {
-  local action="$1" output
+  local action="$1" expectation="$2" output
   case "${action}" in
     get|cats|cordon|uncordon) ;;
     *) echo "refusing unsupported admin-node hook action: ${action}" >&2; return 2 ;;
@@ -578,7 +579,7 @@ admin_node_json() {
   # reaches get, cats, cordon or uncordon.
   verify_admin_hook_provenance
   output="$(invoke_admin_node_hook "${ADMIN_NODE_HOOK}" "${action}" "${REQUIRED_NODE_ID}" \
-    "${CURRENT_CAT}" "${CURRENT_CAT_ID}")" || return
+    "${CURRENT_CAT}" "${CURRENT_CAT_ID}" "${expectation}")" || return
   case "${output,,}" in
     *authorization:*|*bearer\ *|*set-cookie:*|*x-amz-security-token*|*aws_access_key*|*aws_secret_access_key*)
       echo "admin-node hook emitted secret-like output; refusing to retain it" >&2
@@ -604,8 +605,8 @@ capture_node_empty_cordoned() {
   local label="$1" evidence_dir="${2:-${CURRENT_CASE_DIR}}" summary_file cats_file
   summary_file="${evidence_dir}/node-${label}.json"
   cats_file="${evidence_dir}/node-${label}-cats.json"
-  admin_node_json get >"${summary_file}"
-  admin_node_json cats >"${cats_file}"
+  admin_node_json get empty >"${summary_file}"
+  admin_node_json cats empty >"${cats_file}"
   node_summary_is_empty_cordoned "${summary_file}" "${REQUIRED_NODE_ID}" || {
     echo "required Node is not exact Cordoned/empty/zero-orphan 1 CPU/1 GiB: ${REQUIRED_NODE_ID}" >&2
     return 1
@@ -621,8 +622,8 @@ capture_node_has_current_cat() {
   local label="$1" evidence_dir="${2:-${CURRENT_CASE_DIR}}" summary_file cats_file
   summary_file="${evidence_dir}/node-${label}.json"
   cats_file="${evidence_dir}/node-${label}-cats.json"
-  admin_node_json get >"${summary_file}"
-  admin_node_json cats >"${cats_file}"
+  admin_node_json get exact-one >"${summary_file}"
+  admin_node_json cats exact-one >"${cats_file}"
   node_summary_has_only_cat "${summary_file}" "${cats_file}" "${REQUIRED_NODE_ID}" \
     "${CURRENT_CAT_ID}" "${CURRENT_CAT}" "${WORKSPACE_ID}" || {
     echo "required Node assignment is not the one exact current q124 Cat; possible user placement race; leaving it Cordoned" >&2
@@ -654,7 +655,7 @@ uncordon_required_node() {
   # accepted the uncordon, so every exit path must conservatively re-cordon.
   NODE_UNCORDONED=true
   evidence="${CURRENT_CASE_DIR}/node-${label}-uncordon.json"
-  admin_node_json uncordon >"${evidence}"
+  admin_node_json uncordon empty >"${evidence}"
   validate_node_summary_identity "${evidence}" ready
   printf 'required_node_uncordoned=PASS node=%s label=%s\n' "${REQUIRED_NODE_ID}" "${label}"
 }
@@ -662,7 +663,7 @@ uncordon_required_node() {
 cordon_required_node() {
   local label="$1" evidence
   evidence="${CURRENT_CASE_DIR:-${RUN_DIR}}/node-${label}-cordon.json"
-  if admin_node_json cordon >"${evidence}" && validate_node_summary_identity "${evidence}" cordoned; then
+  if admin_node_json cordon empty-or-exact >"${evidence}" && validate_node_summary_identity "${evidence}" cordoned; then
     NODE_UNCORDONED=false
     printf 'required_node_cordoned=PASS node=%s label=%s\n' "${REQUIRED_NODE_ID}" "${label}"
     return 0

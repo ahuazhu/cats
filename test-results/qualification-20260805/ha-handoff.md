@@ -85,6 +85,13 @@ both at startup and immediately before every invocation.
 Before create returns an immutable Cat ID, the harness passes both Cat scope
 fields empty; after create it always passes the exact ID/name pair. The adapter
 accepts only those two forms and rejects name-only or ID-only scope.
+Every invocation also carries an explicit assignment expectation: `empty`,
+`exact-one`, or the cleanup-only `empty-or-exact`. Empty Cat scope therefore
+means exactly zero assignments, never one arbitrary `q124-*` Cat. The adapter
+checks the authoritative assignment set before and after every Node mutation.
+An uncordon response loss, invalid response, or post-check race triggers an
+exact re-cordon attempt and a failed harness step; it is never accepted as an
+ambiguous success.
 
 The committed independent-runner administrator adapter keeps transient
 administrator authentication separate from both the workspace CLI session and
