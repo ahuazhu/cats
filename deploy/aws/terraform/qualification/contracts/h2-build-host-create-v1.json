@@ -127,12 +127,12 @@
         "imds_guard": "55ae2e94b3bbe350b20c29d2aaa6248bbb4552518591b82140add94ef4002dda",
         "immutable_receipt": "c70f6eacb73ba2bea4530dca743c4f7e38eb328af6d1644406a24dd8a85adf54",
           "publish": "9d2b96f35166281a56ae579126a397dd171afd0d5645d801450d36746817293d",
-          "readiness": "12b99be7a940e231d8804463f78433873a382d40896a5cb7cae457b879789e07",
+          "readiness": "1c0a7c220e32891213366b7b174cdb966530937603ed21619cfe4adff8ea77d7",
           "run_build": "78ef233e9afdc841d1087efc85c25f781d8e2c06d24f2be7ca6c727716164c91",
         "stage_output": "13aee4e5a106072cd2ef4cf43ea3f3e95d57d93d4140024ca40a93f52ed60a7a",
           "toolchain_lock": "5884719764338b75cb42012ad97c48df9a035435b0f5de706af9be4058fd220c"
         },
-        "payload_sha256": "3bf1fb8996c5f1a0e5014633dcd9698dc14c8f4f2a34129e48b663ea7058ef67",
+        "payload_sha256": "32b2cd3627ba4e27ba125a8b17c90dd721f965205b6a6d021239978f45f0d811",
         "apt_snapshot_id": "20260801T000000Z"
       },
       "source_policy": {
@@ -470,7 +470,7 @@
     }
   },
   "expected_configuration_root_sha256": "69747704d4d61a9e3a7d134508163f47cc9f8221d4cfae7d9d540bd67fe27626",
-  "expected_managed_changes_sha256": "29fb29178809d77912545c55c65e06a7ca18002bc77b42283ecc6ce8df1db89f",
+  "expected_managed_changes_sha256": "e73e9cb56776c6d85a9420a66410685f3db5694049940ddcbd2c97e966ba8f0d",
   "required_configuration_references": {
     "aws_instance.build": {
       "root_block_device[0].kms_key_id.references": [

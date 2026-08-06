@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-
 import json
 import hashlib
 import pathlib
@@ -37,6 +35,11 @@ def root_owned_mode(path: pathlib.Path, mode: int) -> None:
     file_stat = path.stat()
     if file_stat.st_uid != 0 or stat.S_IMODE(file_stat.st_mode) != mode:
         fail(f"unsafe ownership or mode: {path}")
+
+
+def buildkit_worker_uses_cni(workers: str) -> bool:
+    label = "org.mobyproject.buildkit.worker.network:"
+    return [line.split()[1:] for line in workers.splitlines() if line.split()[:1] == [label]] == [["cni"]]
 
 
 def main() -> int:
@@ -144,8 +147,8 @@ def main() -> int:
         "workers",
         "--verbose",
     ).stdout
-    if "org.mobyproject.buildkit.worker.network: cni" not in workers:
-        fail("BuildKit worker is not pinned to isolated bridge networking")
+    if not buildkit_worker_uses_cni(workers):
+        fail("BuildKit worker network is not cni")
     if run(
         "runuser",
         "-u",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import runpy
 import shlex
 import stat
 import subprocess
@@ -47,7 +48,7 @@ class BuildHostBoundaryTests(unittest.TestCase):
         self.assertIn("--group=root", bootstrap)
         self.assertIn("--group root --oci-worker-net=bridge", bootstrap)
         self.assertNotIn("security.insecure", bootstrap)
-        self.assertIn('org.mobyproject.buildkit.worker.network: cni', readiness)
+        self.assertIn("buildkit_worker_uses_cni(workers)", readiness)
         self.assertIn('"--verbose"', readiness)
         self.assertIn('"Dockerfile.positive"', readiness)
         self.assertIn('"Dockerfile.negative"', readiness)
@@ -55,6 +56,47 @@ class BuildHostBoundaryTests(unittest.TestCase):
         self.assertIn("--uid-owner", guard)
         self.assertIn("FORWARD", guard)
         self.assertIn("169.254.169.254/32", guard)
+
+    def test_readiness_accepts_only_the_verbose_cni_worker_label(self) -> None:
+        namespace = runpy.run_path(str(BOOTSTRAP_DIR / "verify-readiness.py"))
+        worker_uses_cni = namespace["buildkit_worker_uses_cni"]
+        self.assertTrue(
+            worker_uses_cni(
+                "Labels:\n"
+                "\torg.mobyproject.buildkit.worker.executor:\t\toci\n"
+                "\torg.mobyproject.buildkit.worker.network:\t\tcni\n"
+                "\torg.mobyproject.buildkit.worker.snapshotter:\t\toverlayfs\n"
+            )
+        )
+        self.assertTrue(
+            worker_uses_cni(
+                "org.mobyproject.buildkit.worker.network: cni\n"
+            )
+        )
+        self.assertFalse(
+            worker_uses_cni(
+                "Labels:\n"
+                "\torg.mobyproject.buildkit.worker.network:\t\thost\n"
+            )
+        )
+        self.assertFalse(
+            worker_uses_cni(
+                "org.mobyproject.buildkit.worker.network.mode:\t\tcni\n"
+            )
+        )
+        self.assertFalse(worker_uses_cni("Labels:\n"))
+        self.assertFalse(
+            worker_uses_cni(
+                "org.mobyproject.buildkit.worker.network:\t\tcni\n"
+                "org.mobyproject.buildkit.worker.network:\t\tcni\n"
+            )
+        )
+        self.assertFalse(
+            worker_uses_cni(
+                "org.mobyproject.buildkit.worker.network:\t\tcni\n"
+                "org.mobyproject.buildkit.worker.network:\t\thost\n"
+            )
+        )
 
     def test_bootstrap_refreezes_toolchain_after_success_and_failure(self) -> None:
         bootstrap = self.text("bootstrap/bootstrap.sh")
