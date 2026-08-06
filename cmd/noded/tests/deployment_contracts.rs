@@ -94,6 +94,25 @@ fn production_aws_worker_joins_initially_cordoned() {
 }
 
 #[test]
+fn production_aws_worker_can_cut_over_to_proxy_without_client_set_pinning() {
+    let unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
+    for expected in [
+        "Environment=CATS_POSTGRES_SESSION_SETUP=client",
+        "--metadata-store-option session-setup=$CATS_POSTGRES_SESSION_SETUP",
+    ] {
+        assert!(
+            unit.contains(expected),
+            "production worker is missing PostgreSQL proxy contract {expected:?}"
+        );
+    }
+    assert!(
+        unit.find("Environment=CATS_POSTGRES_SESSION_SETUP=client")
+            < unit.find("EnvironmentFile=/etc/cats/worker.env"),
+        "worker.env must be able to override the backward-compatible client default"
+    );
+}
+
+#[test]
 fn production_platform_example_keeps_two_workers_in_distinct_subnets() {
     let variables =
         read_workspace_file("deploy/aws/terraform/stacks/platform/platform.tfvars.example");

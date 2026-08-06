@@ -523,6 +523,7 @@ fn production_database_clients_read_the_rotating_secret_files() {
         "url-file=/etc/cats/runtime/CATS_POSTGRES_URL",
         "CATS_USAGE_POSTGRES_URL_FILE",
         "mount_path = \"/etc/cats/runtime\"",
+        "session-setup=${var.storage_postgres_session_setup}",
     ] {
         assert!(
             terraform.contains(expected),
@@ -533,6 +534,119 @@ fn production_database_clients_read_the_rotating_secret_files() {
         !terraform.contains("sub_path   = \"CATS_POSTGRES_URL\""),
         "a Secret subPath mount never observes kubelet's atomic updates"
     );
+}
+
+#[test]
+fn staged_proxy_cutover_rewrites_only_the_storage_database_host() {
+    let directory = tempfile::tempdir().unwrap();
+    let live = directory.path().join("live.json");
+    let secret = directory.path().join("secret.json");
+    std::fs::write(
+        &live,
+        r#"{
+          "CATS_POSTGRES_URL": "postgresql://cats:old@direct.example:5432/cats?sslmode=verify-full",
+          "CATS_USAGE_POSTGRES_URL": "postgresql://cats:old@direct.example:5432/cats?sslmode=verify-full"
+        }"#,
+    )
+    .unwrap();
+    std::fs::write(&secret, r#"{"password":"n@w:p/ss"}"#).unwrap();
+
+    let output = Command::new("python3")
+        .arg(workspace_root().join("deploy/aws/swap-dsn-password.py"))
+        .args([&live, &secret])
+        .args([
+            "--host",
+            "CATS_POSTGRES_URL=cats-production-proxy.proxy.example",
+            "CATS_POSTGRES_URL",
+            "CATS_USAGE_POSTGRES_URL",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "DSN rewrite failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rewritten: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        rewritten["CATS_POSTGRES_URL"],
+        "postgresql://cats:n%40w%3Ap%2Fss@cats-production-proxy.proxy.example:5432/cats?sslmode=verify-full"
+    );
+    assert_eq!(
+        rewritten["CATS_USAGE_POSTGRES_URL"],
+        "postgresql://cats:n%40w%3Ap%2Fss@direct.example:5432/cats?sslmode=verify-full"
+    );
+
+    let invalid = Command::new("python3")
+        .arg(workspace_root().join("deploy/aws/swap-dsn-password.py"))
+        .args([&live, &secret])
+        .args([
+            "--host",
+            "CATS_POSTGRES_URL=https://attacker.example",
+            "CATS_POSTGRES_URL",
+        ])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("invalid host override"));
+}
+
+#[test]
+fn production_proxy_cutover_is_optional_and_fail_closed() {
+    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
+    for expected in [
+        "RDS_PROXY_ENDPOINT: ${{ vars.RDS_PROXY_ENDPOINT }}",
+        "--host \"CATS_POSTGRES_URL=$RDS_PROXY_ENDPOINT\"",
+        "storage_postgres_session_setup=server-verified",
+        "storage_postgres_session_setup: $storage_postgres_session_setup",
+    ] {
+        assert!(
+            workflow.contains(expected),
+            "production workflow is missing proxy cutover contract {expected:?}"
+        );
+    }
+    assert!(
+        !workflow.contains("--host \"CATS_USAGE_POSTGRES_URL=$RDS_PROXY_ENDPOINT\""),
+        "the bounded usage-store clients must retain the direct-RDS rollback path"
+    );
+}
+
+#[test]
+fn platform_bounds_postgres_connections_without_a_node_local_broker() {
+    let database = read_workspace_file("deploy/aws/terraform/modules/platform-database/main.tf");
+    for expected in [
+        "resource \"aws_db_proxy\" \"this\"",
+        "require_tls            = true",
+        "resource \"aws_db_proxy_default_target_group\" \"this\"",
+        "connection_borrow_timeout    = var.proxy_connection_borrow_timeout_seconds",
+        "max_connections_percent      = var.proxy_max_connections_percent",
+        "init_query                   = \"SET statement_timeout = '5s'; SET lock_timeout = '2s'\"",
+        "resource \"aws_vpc_security_group_ingress_rule\" \"database_from_proxy\"",
+        "actions   = [\"secretsmanager:GetSecretValue\"]",
+        "actions   = [\"kms:Decrypt\"]",
+        "variable = \"kms:ViaService\"",
+        "DatabaseConnectionsCurrentlyBorrowed",
+        "MaxDatabaseConnectionsAllowed",
+        "ClientConnectionsSetupFailedAuth",
+        "length(local.proxy_subnet_ids) >= 2",
+    ] {
+        assert!(
+            database.contains(expected),
+            "platform database is missing bounded-proxy contract {expected:?}"
+        );
+    }
+
+    let adapter = read_workspace_file("adapters/metadata-store-postgres/src/lib.rs");
+    for expected in [
+        "SessionSetup::ServerVerified",
+        "validate_server_session_settings(&settings)",
+        "session-setup must be client or server-verified",
+    ] {
+        assert!(
+            adapter.contains(expected),
+            "metadata adapter is missing non-pinning proxy contract {expected:?}"
+        );
+    }
 }
 
 #[test]

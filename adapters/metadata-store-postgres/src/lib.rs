@@ -93,6 +93,22 @@ impl Job {
 
 const WORK_QUEUE_DEPTH: usize = 64;
 const OPERATION_DEADLINE: Duration = Duration::from_secs(7);
+const STATEMENT_TIMEOUT_MS: &str = "5000";
+const LOCK_TIMEOUT_MS: &str = "2000";
+
+/// How PostgreSQL session defaults reach each adapter connection.
+///
+/// RDS Proxy pins a PostgreSQL client to one backend connection after a client
+/// issues `SET`. That would preserve the adapter's current two-backend-
+/// connections-per-Cat scaling problem behind a proxy. In proxy deployments,
+/// the proxy initialization query owns the settings and the client only proves
+/// they are present before it performs any metadata operation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SessionSetup {
+    #[default]
+    Client,
+    ServerVerified,
+}
 
 /// Where a worker obtains its DSN, consulted afresh for every connect.
 ///
@@ -144,8 +160,21 @@ impl PostgresMetadataStore {
     }
 
     pub fn connect_from(dsn: &DsnSource, ca_file: Option<&str>) -> Result<Self> {
-        let jobs = spawn_worker("cats-postgres-metadata", dsn.clone(), ca_file)?;
-        let lease_jobs = spawn_worker("cats-postgres-lease", dsn.clone(), ca_file)?;
+        Self::connect_from_with_session_setup(dsn, ca_file, SessionSetup::Client)
+    }
+
+    fn connect_from_with_session_setup(
+        dsn: &DsnSource,
+        ca_file: Option<&str>,
+        session_setup: SessionSetup,
+    ) -> Result<Self> {
+        let jobs = spawn_worker(
+            "cats-postgres-metadata",
+            dsn.clone(),
+            ca_file,
+            session_setup,
+        )?;
+        let lease_jobs = spawn_worker("cats-postgres-lease", dsn.clone(), ca_file, session_setup)?;
         Ok(Self { jobs, lease_jobs })
     }
 
@@ -175,6 +204,7 @@ fn spawn_worker(
     name: &str,
     dsn: DsnSource,
     ca_file: Option<&str>,
+    session_setup: SessionSetup,
 ) -> Result<mpsc::SyncSender<Job>> {
     let ca_file = ca_file.map(str::to_string);
     let (jobs, receiver) = mpsc::sync_channel::<Job>(WORK_QUEUE_DEPTH);
@@ -182,7 +212,7 @@ fn spawn_worker(
     std::thread::Builder::new()
         .name(name.to_string())
         .spawn(move || {
-            let mut client = match connect_resolved(&dsn, ca_file.as_deref()) {
+            let mut client = match connect_resolved(&dsn, ca_file.as_deref(), session_setup) {
                 Ok(client) => {
                     let _ = ready_tx.send(Ok(()));
                     client
@@ -197,7 +227,7 @@ fn spawn_worker(
                     // Resolve again rather than reuse the DSN this worker
                     // started with: the credential in it may have been rotated
                     // since, and reconnecting with the old one fails forever.
-                    match connect_resolved(&dsn, ca_file.as_deref()) {
+                    match connect_resolved(&dsn, ca_file.as_deref(), session_setup) {
                         Ok(reconnected) => client = reconnected,
                         Err(error) => {
                             job.run(Err(error));
@@ -219,8 +249,12 @@ fn spawn_worker(
 
 /// The one place a connection is established, so the DSN is resolved on every
 /// attempt -- first connect and every reconnect alike.
-fn connect_resolved(dsn: &DsnSource, ca_file: Option<&str>) -> Result<Client> {
-    connect_client(&dsn.resolve()?, ca_file)
+fn connect_resolved(
+    dsn: &DsnSource,
+    ca_file: Option<&str>,
+    session_setup: SessionSetup,
+) -> Result<Client> {
+    connect_client(&dsn.resolve()?, ca_file, session_setup)
 }
 
 fn dispatch_on<T>(
@@ -299,7 +333,7 @@ where
     }
 }
 
-fn connect_client(url: &str, ca_file: Option<&str>) -> Result<Client> {
+fn connect_client(url: &str, ca_file: Option<&str>, session_setup: SessionSetup) -> Result<Client> {
     let mut builder = TlsConnector::builder();
     if let Some(path) = ca_file {
         let pem = fs::read(path)
@@ -324,11 +358,48 @@ fn connect_client(url: &str, ca_file: Option<&str>) -> Result<Client> {
     let mut client = config
         .connect(MakeTlsConnector::new(connector))
         .map_err(|error| MetaError::Backend(connect_failure(error)))?;
-    client
-        .batch_execute("SET statement_timeout = '5s'; SET lock_timeout = '2s'")
-        .map_err(pg_err)?;
+    configure_session(&mut client, session_setup)?;
     client.batch_execute(SCHEMA).map_err(pg_err)?;
     Ok(client)
+}
+
+fn configure_session(client: &mut Client, session_setup: SessionSetup) -> Result<()> {
+    match session_setup {
+        SessionSetup::Client => client
+            .batch_execute("SET statement_timeout = '5s'; SET lock_timeout = '2s'")
+            .map_err(pg_err),
+        SessionSetup::ServerVerified => {
+            let settings = client
+                .query(
+                    "SELECT name, setting FROM pg_settings
+                       WHERE name IN ('statement_timeout', 'lock_timeout')",
+                    &[],
+                )
+                .map_err(pg_err)?
+                .into_iter()
+                .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+                .collect::<Vec<_>>();
+            validate_server_session_settings(&settings)
+        }
+    }
+}
+
+fn validate_server_session_settings(settings: &[(String, String)]) -> Result<()> {
+    for (name, expected) in [
+        ("statement_timeout", STATEMENT_TIMEOUT_MS),
+        ("lock_timeout", LOCK_TIMEOUT_MS),
+    ] {
+        let actual = settings
+            .iter()
+            .find_map(|(setting_name, value)| (setting_name == name).then_some(value.as_str()));
+        if actual != Some(expected) {
+            return Err(MetaError::Backend(format!(
+                "PostgreSQL server session setup is unsafe: {name} must be {expected} ms, got {}",
+                actual.unwrap_or("missing")
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn pem_certificates(pem: &[u8]) -> Result<Vec<Certificate>> {
@@ -751,6 +822,17 @@ fn dsn_source(config: &AdapterConfig) -> std::result::Result<DsnSource, AdapterE
     }
 }
 
+fn session_setup(config: &AdapterConfig) -> std::result::Result<SessionSetup, AdapterError> {
+    match config.optional("session-setup").unwrap_or("client") {
+        "client" => Ok(SessionSetup::Client),
+        "server-verified" => Ok(SessionSetup::ServerVerified),
+        value => Err(AdapterError::InvalidConfig {
+            adapter: ADAPTER_NAME,
+            message: format!("session-setup must be client or server-verified, got {value:?}"),
+        }),
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PostgresMetadataStoreFactory;
 
@@ -763,14 +845,22 @@ impl MetadataStoreFactory for PostgresMetadataStoreFactory {
         &self,
         config: &AdapterConfig,
     ) -> std::result::Result<std::sync::Arc<dyn MetadataStore>, AdapterError> {
-        config.ensure_only(ADAPTER_NAME, &["url-env", "url-file", "ca-file"])?;
+        config.ensure_only(
+            ADAPTER_NAME,
+            &["url-env", "url-file", "ca-file", "session-setup"],
+        )?;
+        let session_setup = session_setup(config)?;
         let dsn = dsn_source(config)?;
-        PostgresMetadataStore::connect_from(&dsn, config.optional("ca-file"))
-            .map(|store| std::sync::Arc::new(store) as std::sync::Arc<dyn MetadataStore>)
-            .map_err(|error| AdapterError::Open {
-                adapter: ADAPTER_NAME,
-                message: error.to_string(),
-            })
+        PostgresMetadataStore::connect_from_with_session_setup(
+            &dsn,
+            config.optional("ca-file"),
+            session_setup,
+        )
+        .map(|store| std::sync::Arc::new(store) as std::sync::Arc<dyn MetadataStore>)
+        .map_err(|error| AdapterError::Open {
+            adapter: ADAPTER_NAME,
+            message: error.to_string(),
+        })
     }
 }
 
@@ -936,6 +1026,67 @@ mod tests {
             dsn_source(&config).unwrap(),
             DsnSource::File(PathBuf::from("/run/cats/postgres-url"))
         );
+    }
+
+    #[test]
+    fn client_session_setup_remains_the_compatible_default() {
+        let config = AdapterConfig::default();
+        assert_eq!(session_setup(&config).unwrap(), SessionSetup::Client);
+
+        let config = AdapterConfig::from_pairs([("session-setup", "client")]).unwrap();
+        assert_eq!(session_setup(&config).unwrap(), SessionSetup::Client);
+    }
+
+    #[test]
+    fn proxy_session_setup_is_explicit_and_invalid_values_fail_before_connect() {
+        let config = AdapterConfig::from_pairs([("session-setup", "server-verified")]).unwrap();
+        assert_eq!(
+            session_setup(&config).unwrap(),
+            SessionSetup::ServerVerified
+        );
+
+        let config = AdapterConfig::from_pairs([("session-setup", "trust-server")]).unwrap();
+        let error = session_setup(&config).unwrap_err();
+        assert!(
+            error.to_string().contains("client or server-verified"),
+            "an invalid mode must state the closed set: {error}"
+        );
+
+        let error = match PostgresMetadataStoreFactory.open(&config) {
+            Err(error) => error,
+            Ok(_) => panic!("factory accepted an invalid session setup"),
+        };
+        assert!(
+            matches!(error, AdapterError::InvalidConfig { .. }),
+            "factory must reject the mode before resolving a DSN or connecting: {error}"
+        );
+    }
+
+    #[test]
+    fn proxy_session_setup_fails_closed_unless_both_timeouts_are_exact() {
+        let safe = vec![
+            ("lock_timeout".to_string(), "2000".to_string()),
+            ("statement_timeout".to_string(), "5000".to_string()),
+        ];
+        validate_server_session_settings(&safe).unwrap();
+
+        for unsafe_settings in [
+            vec![("statement_timeout".to_string(), "5000".to_string())],
+            vec![
+                ("lock_timeout".to_string(), "0".to_string()),
+                ("statement_timeout".to_string(), "5000".to_string()),
+            ],
+            vec![
+                ("lock_timeout".to_string(), "2000".to_string()),
+                ("statement_timeout".to_string(), "0".to_string()),
+            ],
+        ] {
+            let error = validate_server_session_settings(&unsafe_settings).unwrap_err();
+            assert!(
+                error.to_string().contains("server session setup is unsafe"),
+                "unsafe proxy defaults were not diagnosed: {error}"
+            );
+        }
     }
 
     #[test]

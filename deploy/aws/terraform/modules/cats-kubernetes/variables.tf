@@ -99,6 +99,17 @@ variable "storage_postgres_url" {
   }
 }
 
+variable "storage_postgres_session_setup" {
+  description = "Where ChunkStore PostgreSQL session timeouts are established. server-verified avoids client SET statements that pin RDS Proxy sessions."
+  type        = string
+  default     = "client"
+
+  validation {
+    condition     = contains(["client", "server-verified"], var.storage_postgres_session_setup)
+    error_message = "storage_postgres_session_setup must be client or server-verified."
+  }
+}
+
 variable "usage_postgres_url" {
   description = "PostgreSQL URL used for the usage ledger. It may initially point to the shared RDS instance."
   type        = string

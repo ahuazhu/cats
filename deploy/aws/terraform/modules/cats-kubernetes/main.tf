@@ -257,6 +257,8 @@ resource "kubernetes_deployment_v1" "control_plane" {
             "ca-file=/etc/cats/rds-ca.pem",
             "--metadata-store-option",
             "url-file=/etc/cats/runtime/CATS_POSTGRES_URL",
+            "--metadata-store-option",
+            "session-setup=${var.storage_postgres_session_setup}",
           ]
 
           env {

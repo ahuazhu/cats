@@ -335,6 +335,13 @@ flowchart LR
 PostgreSQL session advisory lock 选主。单 Pod 或单 Kubernetes Node 故障由 Service
 切流，旧主的数据库 session 消失后备用副本接管单例循环（ADR-0032）。
 
+Terraform 管理的生产目标通过托管、跨 AZ 的 RDS Proxy 连接 PostgreSQL；实际切换在代理
+建成并验证后分 control-plane 与逐 Node 灰度执行。每个 `cats-blockd` 仍保留彼此隔离的
+metadata/lease 客户端 session，但代理把随 Cat 数增长的客户端 session 复用到有上限的
+数据库后端连接池。代理初始化查询统一设置 SQL/锁超时，metadata adapter 在不执行会导致
+pin 的 client `SET` 前提下逐连接校验这些值；控制面选主所需的少量 session advisory lock
+允许有界 pin（ADR-0033）。
+
 Edge
 
 ### API Gateway

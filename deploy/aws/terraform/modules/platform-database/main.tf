@@ -9,10 +9,27 @@
 # so a subnet renumbering cannot silently widen it.
 
 locals {
-  name             = "${var.name_prefix}-${var.environment}"
-  metric_namespace = "Cats/Database"
+  name                       = "${var.name_prefix}-${var.environment}"
+  metric_namespace           = "Cats/Database"
+  unsupported_proxy_zone_ids = toset(["use1-az3", "usw1-az2"])
+  proxy_subnet_ids = [
+    for subnet in data.aws_subnet.private : subnet.id
+    if !contains(local.unsupported_proxy_zone_ids, subnet.availability_zone_id)
+  ]
 }
 
+data "aws_partition" "current" {}
+
+data "aws_region" "current" {}
+
+data "aws_kms_key" "secrets_manager" {
+  key_id = "alias/aws/secretsmanager"
+}
+
+data "aws_subnet" "private" {
+  count = length(var.private_subnet_ids)
+  id    = var.private_subnet_ids[count.index]
+}
 
 resource "aws_db_subnet_group" "this" {
   name       = local.name
@@ -33,6 +50,18 @@ resource "aws_security_group" "this" {
   }
 }
 
+resource "aws_security_group" "proxy" {
+  name        = "${local.name}-postgres-proxy"
+  description = "Cats shared-storage RDS Proxy"
+  vpc_id      = var.vpc_id
+
+  tags = merge(var.tags, { Name = "${local.name}-postgres-proxy" })
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
 resource "aws_vpc_security_group_ingress_rule" "from_source_groups" {
   for_each = var.allowed_security_group_ids
 
@@ -42,6 +71,35 @@ resource "aws_vpc_security_group_ingress_rule" "from_source_groups" {
   to_port                      = 5432
   ip_protocol                  = "tcp"
   description                  = "PostgreSQL from ${each.key}"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "proxy_from_source_groups" {
+  for_each = var.allowed_security_group_ids
+
+  security_group_id            = aws_security_group.proxy.id
+  referenced_security_group_id = each.value
+  from_port                    = 5432
+  to_port                      = 5432
+  ip_protocol                  = "tcp"
+  description                  = "PostgreSQL proxy from ${each.key}"
+}
+
+resource "aws_vpc_security_group_egress_rule" "proxy_to_database" {
+  security_group_id            = aws_security_group.proxy.id
+  referenced_security_group_id = aws_security_group.this.id
+  from_port                    = 5432
+  to_port                      = 5432
+  ip_protocol                  = "tcp"
+  description                  = "RDS Proxy to PostgreSQL"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "database_from_proxy" {
+  security_group_id            = aws_security_group.this.id
+  referenced_security_group_id = aws_security_group.proxy.id
+  from_port                    = 5432
+  to_port                      = 5432
+  ip_protocol                  = "tcp"
+  description                  = "PostgreSQL from RDS Proxy"
 }
 
 resource "aws_db_instance" "this" {
@@ -90,6 +148,202 @@ resource "aws_db_instance" "this" {
   # retention. Owning it here sets a retention and makes the export's
   # destination explicit; the instance must not race Terraform to create it.
   depends_on = [aws_cloudwatch_log_group.postgresql]
+}
+
+# Each blockd deliberately keeps separate metadata and lease sessions so a
+# commit cannot starve lease renewal. RDS Proxy preserves those client-facing
+# sessions while bounding the backend connections consumed on this small RDS
+# instance. It is AWS-managed and spans two supported AZs; no Cats process is a
+# new connection authority or a dependency of a running blockd.
+
+data "aws_iam_policy_document" "proxy_assume" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["rds.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "proxy" {
+  name               = "${local.name}-rds-proxy"
+  assume_role_policy = data.aws_iam_policy_document.proxy_assume.json
+
+  tags = merge(var.tags, { Name = "${local.name}-rds-proxy" })
+}
+
+data "aws_iam_policy_document" "proxy_secret" {
+  statement {
+    effect    = "Allow"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_db_instance.this.master_user_secret[0].secret_arn]
+  }
+
+  statement {
+    effect    = "Allow"
+    actions   = ["kms:Decrypt"]
+    resources = [data.aws_kms_key.secrets_manager.arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values = [
+        "secretsmanager.${data.aws_region.current.region}.${data.aws_partition.current.dns_suffix}",
+      ]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "proxy_secret" {
+  name   = "${local.name}-rds-proxy-secret"
+  role   = aws_iam_role.proxy.id
+  policy = data.aws_iam_policy_document.proxy_secret.json
+}
+
+resource "aws_db_proxy" "this" {
+  name                   = "${local.name}-postgres"
+  engine_family          = "POSTGRESQL"
+  idle_client_timeout    = 1800
+  require_tls            = true
+  role_arn               = aws_iam_role.proxy.arn
+  vpc_security_group_ids = [aws_security_group.proxy.id]
+  vpc_subnet_ids         = local.proxy_subnet_ids
+
+  auth {
+    auth_scheme = "SECRETS"
+    iam_auth    = "DISABLED"
+    secret_arn  = aws_db_instance.this.master_user_secret[0].secret_arn
+  }
+
+  tags = merge(var.tags, { Name = "${local.name}-postgres" })
+
+  depends_on = [aws_iam_role_policy.proxy_secret]
+
+  lifecycle {
+    precondition {
+      condition     = length(local.proxy_subnet_ids) >= 2
+      error_message = "RDS Proxy needs private subnets in at least two supported AZs. use1-az3 and usw1-az2 are excluded by AWS."
+    }
+  }
+}
+
+resource "aws_db_proxy_default_target_group" "this" {
+  db_proxy_name = aws_db_proxy.this.name
+
+  connection_pool_config {
+    connection_borrow_timeout    = var.proxy_connection_borrow_timeout_seconds
+    init_query                   = "SET statement_timeout = '5s'; SET lock_timeout = '2s'"
+    max_connections_percent      = var.proxy_max_connections_percent
+    max_idle_connections_percent = var.proxy_max_idle_connections_percent
+  }
+}
+
+resource "aws_db_proxy_target" "this" {
+  db_instance_identifier = aws_db_instance.this.identifier
+  db_proxy_name          = aws_db_proxy.this.name
+  target_group_name      = aws_db_proxy_default_target_group.this.name
+}
+
+resource "aws_cloudwatch_metric_alarm" "proxy_connection_setup_failed" {
+  alarm_name        = "${local.name}-postgres-proxy-connection-setup-failed"
+  alarm_description = "RDS Proxy could not establish a backend PostgreSQL connection."
+
+  namespace   = "AWS/RDS"
+  metric_name = "DatabaseConnectionsSetupFailed"
+  statistic   = "Sum"
+  dimensions = {
+    ProxyName = aws_db_proxy.this.name
+  }
+
+  period              = 60
+  evaluation_periods  = 1
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = var.alarm_action_arns
+  ok_actions    = var.alarm_action_arns
+
+  tags = merge(var.tags, { Name = "${local.name}-postgres-proxy-connection-setup-failed" })
+}
+
+resource "aws_cloudwatch_metric_alarm" "proxy_client_authentication_failed" {
+  alarm_name        = "${local.name}-postgres-proxy-client-authentication-failed"
+  alarm_description = "RDS Proxy rejected a client authentication attempt. The client may hold a password that no longer matches the managed secret."
+
+  namespace   = "AWS/RDS"
+  metric_name = "ClientConnectionsSetupFailedAuth"
+  statistic   = "Sum"
+  dimensions = {
+    ProxyName = aws_db_proxy.this.name
+  }
+
+  period              = 60
+  evaluation_periods  = 1
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = var.alarm_action_arns
+  ok_actions    = var.alarm_action_arns
+
+  tags = merge(var.tags, { Name = "${local.name}-postgres-proxy-client-authentication-failed" })
+}
+
+resource "aws_cloudwatch_metric_alarm" "proxy_pool_saturation" {
+  alarm_name        = "${local.name}-postgres-proxy-pool-saturation"
+  alarm_description = "RDS Proxy borrowed backend connections exceeded 80% of its allowed pool for three minutes. This is an operational headroom threshold, not a product SLA."
+
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 80
+  evaluation_periods  = 3
+  datapoints_to_alarm = 3
+  treat_missing_data  = "notBreaching"
+
+  metric_query {
+    id          = "borrowed"
+    return_data = false
+
+    metric {
+      namespace   = "AWS/RDS"
+      metric_name = "DatabaseConnectionsCurrentlyBorrowed"
+      dimensions = {
+        ProxyName = aws_db_proxy.this.name
+      }
+      period = 60
+      stat   = "Sum"
+    }
+  }
+
+  metric_query {
+    id          = "allowed"
+    return_data = false
+
+    metric {
+      namespace   = "AWS/RDS"
+      metric_name = "MaxDatabaseConnectionsAllowed"
+      dimensions = {
+        ProxyName = aws_db_proxy.this.name
+      }
+      period = 60
+      stat   = "Sum"
+    }
+  }
+
+  metric_query {
+    id          = "utilization"
+    expression  = "IF(allowed > 0, 100 * borrowed / allowed, 0)"
+    label       = "RDS Proxy backend pool utilization percent"
+    return_data = true
+  }
+
+  alarm_actions = var.alarm_action_arns
+  ok_actions    = var.alarm_action_arns
+
+  tags = merge(var.tags, { Name = "${local.name}-postgres-proxy-pool-saturation" })
 }
 
 # Why this alarm exists.
