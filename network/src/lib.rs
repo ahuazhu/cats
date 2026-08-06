@@ -2548,8 +2548,12 @@ mod tests {
         )));
         state.set_node_agent_url(node_agent_url.clone());
         let shared_cache = SharedRouteCache::memory();
+        // Keep the seeded route fresh until the mock Node rejects it. A tiny
+        // cache TTL can expire under full-suite scheduler load and start an
+        // unrelated background control-plane refresh before this test reaches
+        // the Node-expiry recovery path that it is meant to isolate.
         let (gateway, control_task) =
-            route_test_gateway_with_shared_cache(state.clone(), 10, shared_cache.clone()).await;
+            route_test_gateway_with_shared_cache(state.clone(), 60_000, shared_cache.clone()).await;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
