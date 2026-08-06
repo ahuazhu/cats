@@ -25,8 +25,12 @@ Normative words `MUST`, `MUST NOT`, `SHOULD` and `MAY` are used as in RFC 2119.
 | Field | Meaning | Reuse rule |
 | --- | --- | --- |
 | `cat_id` | Stable Cat identity | Never identifies an execution by itself. |
+| `request_receipt_id` | Immutable acceptance/replay outcome | Exact request-key/digest replay keeps it; semantic no-op binds it one-to-one to a terminal Operation but creates no intent generation or command. |
+| `policy_proposal_id` | Non-authoritative exact auto-suspend eligibility snapshot | Never becomes intent authority by itself; retry after busy/stale uses a fresh snapshot. |
+| `policy_promotion_id` | Immutable promotion of an applied proposal retirement to one intent/command | Never reused or rebound to another proposal, generation or command. |
 | `intent_generation` | Generation allocated by accepted desired intent | A command chain may share it; it never replaces `command_id`. |
-| `operation_id` | Exact user/policy Operation | One Operation may span several commands and FallbackCold. |
+| `intent_resolution_id` | Exact evidence adoption/wait/settlement under an intent | Never reused; it binds predecessor result/fence/runtime evidence before command selection. |
+| `operation_id` | Exact user/policy Operation | Authority root is exactly one accepted intent or already-satisfied receipt; an intent-rooted Operation may span several commands and FallbackCold. |
 | `command_id` | One immutable lifecycle command | Never reused, including the next leg of the same intent. |
 | `command_seq` | Monotonic command order within an intent generation | Unique with Cat and generation. |
 | `dispatch_id` | One immutable physical Node action envelope | Transport replay keeps it; a semantic retry creates a new one. |
@@ -37,6 +41,8 @@ Normative words `MUST`, `MUST NOT`, `SHOULD` and `MAY` are used as in RFC 2119.
 | `runtime_id` | Node-ledger identity of one physical Cat runtime lineage | Survives Agent restart/adoption; changes on a fresh runtime lineage. |
 | `effect_id` | One conditional MetadataStore mutation | Exact replay returns the original receipt. |
 | `grant_id` | One volume authority offered to one dispatch/Node/volume | Invalidated monotonically; never rebound. |
+| `route_retirement_id` | One prerequisite revocation/drain for an exact Running authority | Exact replay returns the B/C receipt; it is never rebound to another epoch/runtime. |
+| `route_publication_intent_id` | One immutable A-to-B bind/unbind handoff | Exact replay returns B's receipt; obsolete work terminates stale. |
 
 All IDs are opaque, globally unique strings with their normal Cats type prefix.
 No receiver parses identity or ordering from an ID. Ordering comes from the
@@ -62,6 +68,7 @@ LifecycleCommandV2 {
   predecessor_command_id?
   superseded_by_command_id?
   blocked_by_dispatch_id?
+  source_evidence_id
   created_at
   updated_at
 }
@@ -91,6 +98,163 @@ or `stopping`; those are UI projections of the command phase.
 The command is persisted before any volume, Node, route or Guest effect. Only
 one command for a Cat can have `authority=current`. A superseded command keeps
 all dispatches/results for evidence but cannot settle authority.
+
+The command is not the accepted desired intent. PostgreSQL may contain one
+current `LifecycleIntentV2` in `waiting_predecessor` with no current executable
+command. A command is inserted only after an immutable source-evidence record
+exists:
+
+```text
+IntentResolutionV2 {
+  intent_resolution_id
+  cat_id
+  intent_generation
+  phase = waiting_predecessor | source_proven | satisfied_by_evidence | blocked
+  source_evidence_kind = settled_runtime | predecessor_result | fence | absence
+  source_result_id?
+  source_fence_receipt_id?
+  source_runtime_id?
+  source_runtime_revision?
+  source_provenance_digest
+}
+```
+
+For a superseded in-flight Suspend followed by a Running intent, no Resume is
+created at acceptance. Suspend success proves Suspended and permits an immutable
+Resume bound to that result; source-preserved failure may satisfy Running by
+evidence; indeterminate outcome leaves the intent waiting for query/fence or a
+later FallbackCold decision. No action field is mutated after insertion.
+
+### 3.1 Acceptance receipt and semantic no-op
+
+The request idempotency identity is the exact
+`(workspace_id, canonical route/action, idempotency_key)`. Its digest covers the
+method/route, Workspace/Cat, requested desired state, original precondition and
+exact body bytes. Lookup occurs before reevaluating `If-Match`.
+
+After taking the Cat lock but before allocating an intent generation or
+command, acceptance checks whether the exact settled stable state already
+equals the request and no current intent, nonterminal/retiring command,
+unresolved predecessor/effect/grant, live PolicyTransitionProposal or
+uncompensated RouteRetirement can change it. If so it atomically persists:
+
+```text
+LifecycleRequestReceiptV2 {
+  request_receipt_id
+  idempotency identity
+  request_digest
+  outcome = already_satisfied
+  cat_id
+  existing_intent_generation
+  settled_runtime_revision
+  settled_runtime_provenance_digest
+  operation_id
+  exact_response_bytes
+  response_sha256
+}
+
+OperationV2 {
+  operation_id
+  phase = succeeded
+  outcome = already_satisfied
+  resource_generation = existing Cat generation
+  intent_id = null
+  already_satisfied_receipt_id
+  completion_runtime_revision
+  completion_provenance_digest
+}
+```
+
+The Operation and receipt are one-to-one. The Operation authority root obeys
+`intent_id XOR already_satisfied_receipt_id`; this variant has no intent or
+command and cannot later acquire one. A real-change Operation instead binds its
+accepted intent immediately, remains valid/queryable while that intent waits
+without a command, and on terminal completion binds the exact
+`intent_resolution_id` plus command/result/fence evidence when applicable. It
+preserves the current public contract: `202 Accepted` with
+`CatOperationResponse { operation, cat }`. It allocates no
+new intent generation or command, emits no wakeup or route work, and does not
+change route authority. Exact replay returns the same receipt, Operation and
+byte-identical response even if later requests changed the Cat. A fresh
+idempotency key may create a fresh terminal already-satisfied Operation while
+leaving all lifecycle and route authority unchanged. Same identity with another
+digest conflicts. Neither the receipt nor Operation is a synthetic Node result.
+
+A real intent change allocates one generation and Operation plus a current
+intent. It may create the first command in that transaction only when exact
+source evidence is already present; otherwise the intent durably waits without
+a placeholder command.
+
+### 3.2 PolicyTransitionProposal and require-idle promotion
+
+Auto-suspend MUST preserve `LIFE-AUTO-001`: active work prevents the transition
+and is not cancelled to make the policy eligible. Before any generation,
+Operation, intent or command exists, policy evaluation persists:
+
+```text
+PolicyTransitionProposalV2 {
+  policy_proposal_id
+  cat_id
+  target_state = suspended
+  policy_kind + policy_version
+  expected_cat_generation
+  expected_current_intent_id?
+  expected_desired_state = running
+  runtime_id + runtime_authority_revision + node_id
+  expected_route_id + expected_route_epoch + expected_route_authority_revision
+  control_work_version
+  guest_source_epoch + guest_lease_sequence + guest_signal_freshness_deadline
+  snapshot_provenance_digest
+  phase = proposed | checking_idle | busy | retired | promoted
+        | stale_adopted | stale | compensated
+}
+```
+
+This row is scheduling/evidence only. B/C executes a proposal-scoped
+RouteRetirement with `mode=require_idle`. Under C's per-Cat admission lock,
+active/unknown guards or a changed work fence return an exact busy/stale proof
+without route revocation, transport cancellation or any lifecycle-authority
+change. At exact zero, C closes admission and durably records a
+proposal-and-epoch-bound prepared token under the lock, then releases it. B
+conditionally revokes the named route epoch using that token and B/C finalize a
+queryable applied receipt. Recovery of a prepared token queries both sides and
+either completes the same revocation or reopens admission only while the same
+route/runtime authority is still current; no runtime or PostgreSQL lock spans
+the call.
+
+After the applied B/C receipt, A4 runs a fresh Cat-first transaction and
+revalidates every proposal field, policy enablement, live control/Guest work
+and route-retirement provenance. Only an exact match atomically creates the new
+generation, `cat.auto_suspend` Operation, Suspended intent, Suspend command and:
+
+```text
+PolicyRetirementPromotionV2 {
+  policy_promotion_id
+  policy_proposal_id
+  route_retirement_receipt_id
+  cat_id
+  intent_id + intent_generation
+  operation_id
+  command_id
+  runtime_id + runtime_authority_revision
+  retired_route_epoch + work_fence_digest
+}
+```
+
+The Suspend dispatch carries both the proposal-scoped receipt and promotion
+record, which together bind the exact command/generation. A crash after route
+revocation but before promotion is recovered by conditional promotion, the
+exact command-scoped predecessor-adoption protocol in section 4.4, or a
+conditional fresh bind of the unchanged settled Running authority. A generic
+compatible state never suppresses compensation. A stale proposal never leaves
+Running silently unpublished and never reuses the retired epoch.
+
+Proposal creation follows Cat -> current intent -> current command if any ->
+exact runtime -> sorted work rows -> sorted Endpoints -> sorted Routes ->
+proposal. Promotion follows Cat -> current intent -> current command if any ->
+exact runtime -> sorted work rows -> proposal/retirement -> Operation. Executor
+claims are released first, and no PostgreSQL lock is held while B/C checks or
+drains guards.
 
 ## 4. NodeJob V2 transport
 
@@ -133,9 +297,11 @@ side effect.
   "operation_id": "op_...",
   "cat_id": "cat_...",
   "target_node_id": "node_...",
+  "source_evidence_id": "ires_...",
   "not_before_unix_ms": 0,
   "deadline_unix_ms": 1786000000000,
   "expected_runtime": { "mode": "absent", "fence_receipt_id": "mfx_..." },
+  "route_retirement": null,
   "volume_grants": [],
   "action": { "type": "start", "spec": {} }
 }
@@ -155,7 +321,7 @@ absent {
 }
 
 exact {
-  runtime_id
+  runtime_id + node_id
   runtime_generation
   node_claim_id
   host_boot_id?
@@ -167,9 +333,105 @@ exact {
 `absent` means the command is authorized to create a fresh runtime only after
 the referenced fencing/absence proof is valid. It is not permission to delete
 an unknown residue. `exact` prevents an old Resume/Suspend/Warm/Cold action
-from operating on a replacement runtime with the same Cat ID.
+from operating on a replacement runtime with the same Cat ID. The source
+evidence record is persisted before this envelope and its digest is included in
+the exact body; the Node does not infer source state from the action name.
 
-### 4.4 Volume grant
+### 4.4 Route retirement receipt
+
+A command that can take a Running runtime away from Running includes an exact
+applied retirement. The retirement itself is scoped to one command or one
+pre-authority policy proposal:
+
+```text
+route_retirement {
+  route_retirement_id
+  request_digest
+  cat_id
+  scope = command(intent_generation + command_id)
+        | policy(policy_proposal_id + expected_cat_generation)
+  mode = cancel_and_drain | require_idle
+  runtime_id
+  retired_route_epoch
+  retired_authority_revision
+  expected_predecessor = active_route
+                       | retired_by_policy(policy_receipt_id + prepared_token_id)
+  expected_work_fence?          # required for require_idle
+  phase = planned | prepared | applying | applied | busy | blocked
+  prepared_token_id?
+  proof_or_receipt_id?
+}
+
+RouteRetirementBusyProofV1 {
+  busy_proof_id
+  route_retirement_id + request_digest
+  policy_proposal_id
+  runtime_id + node_id + route_epoch
+  work_fence_digest + guard_registry_revision
+  active_guard_count?           # null means unknown/fail-awake
+}
+
+RouteRetirementAppliedReceiptV1 {
+  receipt_id
+  route_retirement_id + request_digest
+  exact scope + mode
+  outcome = revoked | adopted_retired_predecessor
+  runtime_id + node_id
+  retired_route_epoch
+  retired_authority_revision
+  prepared_token_id?
+  predecessor_policy_receipt_id? # required only for adopted predecessor
+  zero_active_guard_proof_digest
+  node_ack_or_external_fence_receipt_id
+}
+```
+
+For `cancel_and_drain`, B/C issues the receipt only after exact-epoch admission
+revoke, cancellation and drain of every matching HTTP/WebSocket/stream guard to
+zero, or after external isolation proves an unreachable runtime cannot serve.
+Explicit lifecycle, fleet drain, Destroy/expiry and fencing recovery use this
+mode.
+
+Auto-suspend uses `require_idle`. C compares the work fence and active guards
+under its per-Cat admission lock before B revokes. A nonzero/unknown count or
+changed fence returns an immutable busy/stale proof and MUST NOT revoke the
+route, cancel a guard or change lifecycle authority. Only exact zero closes
+admission and persists a prepared token under the lock. B then conditionally
+revokes with that token and B/C finalizes the receipt; prepared recovery is
+queryable/idempotent. An unreachable Node fails awake.
+
+TTL/cache/heartbeat is not a receipt. Suspend, Cold/Destroy from Running and
+any recovery action that may tear down Running MUST carry a command-scoped
+receipt or the exact policy receipt plus PolicyRetirementPromotion. Rebinding a
+receipt to another command, generation, proposal, runtime or epoch is rejected
+before physical lifecycle effects.
+
+If a manual leaving-Running command commits after a policy receipt retired the
+route but before policy promotion, the changed current intent/generation makes
+policy promotion stale. The manual command creates a new command-scoped
+`cancel_and_drain` request whose expected predecessor is that exact policy
+receipt/token. B serializes it with proposal compensation. C verifies the same
+runtime/route authority and closed admission gate, then rechecks zero guards or
+uses the manual command's authority to cancel/drain any local guard that
+appeared. B/C returns a distinct command-scoped
+`adopted_retired_predecessor` receipt referencing the policy receipt. It does
+not allocate an epoch, mutate either request scope or reactivate the old epoch.
+
+The proposal becomes `stale_adopted` and compensation is suppressed only if
+that adoption receipt belongs to the exact current command/generation and the
+command still requires the route retired. In an earlier ordering where the
+manual route CAS wins before the policy CAS, the proposal becomes stale behind
+the command's ordinary `revoked` receipt. If
+the command is superseded, keeps Running, or adoption cannot be proven,
+recovery conditionally publishes a fresh epoch for unchanged Running authority.
+
+Adoption and compensation serialize on B's route row. If compensation wins,
+the immutable adoption request terminates stale and the command creates a new
+command-scoped retirement request against the freshly published epoch. If
+adoption wins, `stale_adopted` prevents compensation. Neither branch mutates a
+request predecessor or reuses an epoch.
+
+### 4.5 Volume grant
 
 ```json
 {
@@ -203,7 +465,7 @@ cannot acquire after the grant has been invalidated. Same-grant acquisition is
 idempotent and returns the same epoch; different predecessor state is a
 conditional rejection. These MetadataStore semantics are owned by A7 and D.
 
-### 4.5 Closed action payloads
+### 4.6 Closed action payloads
 
 The action `type` is bound to `command_kind`. There is no generic shell command
 or Cleanup action.
@@ -263,9 +525,10 @@ suspend {
 }
 ```
 
-Precondition: exact Running runtime. Success: Guest quiesce/local durability
-barrier and VMM pause completed, and the exact runtime is durably recorded as
-Suspended. Work-fence change is Rejected with source preserved.
+Precondition: exact Running runtime and exact applied RouteRetirement. Success:
+route guards are still zero, Guest quiesce/local durability barrier and VMM
+pause completed, and the exact runtime is durably recorded as Suspended.
+Work-fence change is Rejected with source preserved.
 
 #### Warm
 
@@ -293,10 +556,11 @@ cold {
 }
 ```
 
-Success requires new Guest work stopped, retained volumes at `R == L`, VMM and
-backend teardown, and a durable absence/Cold record. Failure that leaves a
-local-ahead journal returns source preserved or indeterminate and MUST NOT
-delete it.
+When the source is Running, precondition includes exact applied
+RouteRetirement. Success requires new Guest/route work stopped, retained
+volumes at `R == L`, VMM and backend teardown, and a durable absence/Cold
+record. Failure that leaves a local-ahead journal returns source preserved or
+indeterminate and MUST NOT delete it.
 
 #### Destroy
 
@@ -313,7 +577,8 @@ The two disk lists are disjoint and cover every known runtime volume. Success
 may discard local tails only for listed RootDisks. Every retained
 PersistentDisk must drain and be released conditionally. Unknown volume or
 residue fails closed. Control-plane MetadataStore deletion/tombstoning remains
-a recorded post-Node effect under the same Destroy command.
+a recorded post-Node effect under the same Destroy command. Destroy of a
+Running source also requires exact applied RouteRetirement.
 
 #### FallbackCold
 
@@ -329,7 +594,8 @@ fallback_cold {
 
 It has Cold's durability postconditions and additionally binds the failure
 evidence that authorized fallback. It cannot infer disposable volumes or use a
-generic residue cleanup path.
+generic residue cleanup path. If the retained source can still serve Running,
+it also carries exact applied RouteRetirement.
 
 ## 5. Node acceptance and execution
 
@@ -338,8 +604,9 @@ Before the first physical side effect, the Node performs, in order:
 1. authenticate the caller and exact target Node;
 2. verify body SHA-256 and protocol version;
 3. look up `dispatch_id` in the durable Node job journal;
-4. for a new dispatch, validate command/action identities, expected runtime,
-   authority freshness and grant prerequisites;
+4. for a new dispatch, validate command/action/source-evidence identities,
+   expected runtime, authority freshness, any required exact RouteRetirement
+   and PolicyRetirementPromotion, and grant prerequisites;
 5. atomically choose a fresh `node_claim_id` and persist either Accepted or a
    terminal Rejected result with the request digest and exact payload;
 6. fsync/commit that record; and only for Accepted
@@ -357,7 +624,10 @@ Agent restart reconstructs the accepted/running job from C's durable job and
 runtime ledgers. A successful Start/Resume/Restore result is written only after
 the runtime ledger can be reopened and prove adoption. A successful
 Cold/Destroy result is written only after the ledger proves the stated absence
-and retained-volume postconditions.
+and retained-volume postconditions. For a Running-source transition, the Node
+revalidates under the per-Cat admission lock that the retired authority still
+has zero guards before Guest/VMM/blockd effects. A mismatch is terminal
+Rejected/source-preserved, not a second implicit retirement.
 
 ## 6. Response and result shape
 
@@ -462,13 +732,16 @@ The result can settle only if all of these match the current authority:
 
 ```text
 cat_id
-intent_generation
-command_id + command_seq + authority_revision/current status
+current intent_generation
+command_id + command_seq + authority_revision and its exact supersession status
 dispatch_id + dispatch_seq + exact request digest
 target_node_id
 node_claim_id
 action kind
+source_evidence_id
 expected runtime identity
+required RouteRetirement identity/receipt
+required PolicyRetirementPromotion for a proposal-scoped retirement
 all required grant/effect identities
 ```
 
@@ -476,6 +749,73 @@ Any mismatch is stale/conflicting evidence. It remains queryable but does not
 mutate settled runtime, placement, Operation, routes or grants. A duplicate
 exact result is a no-op. Same identity with different content is an invariant
 violation and pages an operator.
+
+A result from a superseded command cannot directly settle current authority.
+The current-intent reducer may create an immutable `IntentResolutionV2` that
+adopts that exact physical evidence and then materialize a command, settle as
+`satisfied_by_evidence`, or wait/fence. The resulting `cat_runtime_state` keeps
+both the originating command/result provenance and the current authorizing
+intent/resolution.
+
+### 7.1 Route retirement and publication handoff
+
+Before dispatch of any command that can leave Running, its exact
+RouteRetirement must be terminal applied. A `cancel_and_drain` timeout/unknown
+guard count is `blocked`; an unreachable serving runtime needs external
+isolation/fence. A `require_idle` busy/unknown result changes no lifecycle or
+route authority and cannot be promoted. Neither grant TTL nor route cache
+expiry qualifies.
+
+After exact reduction, A may persist one immutable handoff:
+
+```text
+RoutePublicationIntentV1 {
+  route_publication_intent_id
+  cat_id
+  intent_generation
+  intent_resolution_id
+  command_id?
+  dispatch_id?
+  node_claim_id?
+  result_id?
+  policy_proposal_id?
+  policy_retirement_receipt_id?
+  runtime_id
+  runtime_authority_revision
+  node_id
+  action = bind | unbind
+  endpoint_ids
+  protocol
+  cohort
+  expected_route_id?
+  expected_route_epoch?
+  expected_route_authority_revision
+  lifecycle_provenance_digest
+}
+```
+
+B alone allocates `route_epoch`. It applies under Cat -> current intent ->
+current command (if any) -> exact runtime -> sorted Endpoints -> sorted Routes
+-> route intent, conditionally comparing every predecessor/provenance field.
+Exact replay returns the same receipt; delayed or out-of-order work becomes
+terminal `stale` and cannot publish. A consumes the receipt but never writes a
+route row/epoch. A controller scheduling claim must be released before the
+materialization transaction and no database lock is held across Node/Gateway
+I/O.
+
+If a proposal-scoped `require_idle` revocation becomes stale before promotion,
+recovery uses this same conditional handoff to bind a fresh epoch to the exact
+unchanged settled Running runtime. It carries the existing authorizing intent
+resolution and the stale proposal/retirement receipt. The compensation is
+unnecessary only when the exact current leaving-Running command has its own
+command-scoped `adopted_retired_predecessor` receipt referencing that policy
+receipt. Desired state, a missing route or a proposal-scoped receipt alone is
+not enough. Running is never left silently unpublished.
+
+If a failed transition preserves Running after its epoch was retired, neither
+A nor B reactivates that epoch. An exact evidence settlement may request a new
+conditional bind; B compares the retired predecessor and allocates a fresh
+epoch.
 
 ## 8. Lost response and recovery examples
 
@@ -516,11 +856,15 @@ Node returns 409 payload_mismatch before side effects
 
 ```text
 Suspend command S dispatches D1
-new wake intent creates current command W and supersedes S
+new wake intent I becomes current, supersedes S and waits without a command
 Node later returns Succeeded(D1, Suspended)
-result is stored but cannot settle W or its Operation
-planner uses the proven Suspended runtime and proposes Resume under W
+result is stored and adopted by exact resolution E under I
+planner materializes immutable Resume W bound to E/result D1
 ```
+
+If D1 instead fails with exact source-preserved Running evidence, E can settle
+I as `satisfied_by_evidence` without a Node command. If D1 is indeterminate, I
+remains waiting/blocked; it does not guess Start/Resume/FallbackCold.
 
 ### Stale generation after ABA
 
@@ -551,10 +895,19 @@ unchanged; in particular, its generation/action Job ID and legacy result are
 not upgraded by adding optional V2 fields. V2 dispatch is capability-gated per
 Node.
 
-During Freeze no V1 lifecycle job may remain in flight. Activate switches the
-database authority version to V2 and prevents old writers. Contract removes V1
-lifecycle decode/execute/journaling only after the ADR-0035 deletion conditions
-and the characterization matrix pass.
+During Freeze no V1 lifecycle job may remain in flight or in any Node
+journal/retry/replay residue. Known-positive inventory must prove every Node
+owning/reporting Running, Suspended or Warm runtime or runtime ledger residue is
+lifecycle-V2 capable. A V1-only runtime is upgraded and exactly re-adopted,
+cold-moved before cutover, or externally fenced/quarantined; stable state does
+not exempt it. Stale/missing capability evidence blocks Activate.
+
+Lifecycle-V2 capability is independent of the signed Route Grant cohort. A
+lifecycle-V2 Node may remain explicitly route-legacy during B rollout, but a
+route-V2 Node cannot remain lifecycle-V1. Activate switches the database
+authority version to V2 and prevents old writers. Contract removes V1 lifecycle
+decode/execute/journaling only after the ADR-0035 deletion conditions and the
+characterization matrix pass.
 
 There is no permanent translation adapter and no fallback that maps a V2
 dispatch to V1 `CleanupCat`, epoch zero or a generation-derived Job ID.
