@@ -252,7 +252,20 @@ The first Route Grant release has a strict compatibility order:
 This additive first release is not the key-rotation procedure. With one accepted
 public key, rotation still needs the coordinated drained boundary described
 above; do not swap either half independently. The application workflow fails
-before Terraform plan if any enforcing Ready Node reports a different key.
+before Terraform plan if any schedulable or still-serving Node reports a
+different key. It permits an all-legacy serving cohort only for the additive
+first application rollout and rejects a mixed legacy/enforcing cohort as an
+interrupted worker rollout. The control database persists a one-way legacy
+admission phase: it closes after every schedulable or serving Node reports a
+verifier, never reopens, and a Node that downgrades from a reported key to no
+key is cordoned.
+
+The Route Grant Node column and rollout-phase table are an expand-only schema
+change and deliberately retain control schema stamp 1. The previous
+application ignores both additions, so a failed partial control-plane rollout
+can still start the old image. Do not bump the stamp for an additive nullable
+column/table; reserve a new stamp for the later contract phase after rollback
+compatibility is no longer required.
 
 `storage_postgres_url` and `usage_postgres_url` are intentionally independent.
 During the early shared-RDS phase they may point to the same instance/database,

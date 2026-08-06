@@ -268,21 +268,8 @@ pub(super) async fn admin_node_action(
             StatusCode::OK
         }
         "uncordon" => {
-            if matches!(node.state, NodeState::Lost | NodeState::Fenced) {
-                return Err(ApiError::failed_precondition(
-                    "lost node must heartbeat before uncordon; a fenced node identity cannot be reused",
-                )
-                .into());
-            }
             let expected = state.cfg.route_grant_signer.public_key_sha256();
-            if node.route_grant_public_key_sha256.as_deref() != Some(expected) {
-                return Err(ApiError::failed_precondition(format!(
-                    "node Route Grant verifier key is not the active control-plane key; expected {expected}, observed {}",
-                    node.route_grant_public_key_sha256.as_deref().unwrap_or("legacy/unreported")
-                ))
-                .into());
-            }
-            state.store.set_node_state(&id, NodeState::Ready)?;
+            state.store.uncordon_node_with_route_grant(&id, expected)?;
             state.notify.notify_one();
             StatusCode::OK
         }

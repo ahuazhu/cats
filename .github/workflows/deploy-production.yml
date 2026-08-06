@@ -430,20 +430,9 @@ jobs:
             > "$RUNNER_TEMP/route-grant-nodes.json"
           jq -e '.items | type == "array"' \
             "$RUNNER_TEMP/route-grant-nodes.json" >/dev/null
-          incompatible="$(
-            jq -r --arg expected "$expected_fingerprint" '
-              .items[]
-              | select(.node.state == "ready")
-              | select((.node.route_grant_public_key_sha256 // "") != "")
-              | select(.node.route_grant_public_key_sha256 != $expected)
-              | .node.id
-            ' "$RUNNER_TEMP/route-grant-nodes.json"
-          )"
-          if [[ -n "$incompatible" ]]; then
-            echo "::error::Ready Nodes verify a different Route Grant key: $incompatible. Drain and upgrade those Nodes before rotating the application key."
-            exit 1
-          fi
-          echo "Every enforcing Ready Node accepts Route Grant key $expected_fingerprint."
+          deploy/aws/check-route-grant-nodes.sh \
+            "$expected_fingerprint" \
+            "$RUNNER_TEMP/route-grant-nodes.json"
 
       - name: Initialize application state
         shell: bash

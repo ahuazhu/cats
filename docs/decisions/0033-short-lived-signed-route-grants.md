@@ -44,7 +44,12 @@ would let a compromised Gateway mint arbitrary Cat, Node or port bindings.
   administrator cannot uncordon a Node until its reported verifier fingerprint
   equals the active signer fingerprint. A missing fingerprint is accepted only
   for an already-Ready legacy Node during the additive first rollout; after it
-  is cordoned, it must be upgraded before admission.
+  is cordoned, it must be upgraded before admission. That exception is backed
+  by a durable, one-way database phase rather than inferred forever from a
+  nullable fingerprint. Registration, placement and uncordon share one
+  transaction linearization point. Once every schedulable or still-serving
+  Node reports a verifier identity, the phase closes and cannot reopen; a
+  keyed Node reporting no identity is always cordoned as a downgrade.
 - The Gateway treats the signed token as opaque. After ordinary cache freshness
   ends, an `active` + `Running` route whose advertised grant expiry is still in
   the future is served immediately while one background resolve per hostname
@@ -97,8 +102,11 @@ Node hop. It authenticates the calling service but does not authorize a route.
   receives traffic. Rotation needs an overlap mechanism before two keys can be
   live simultaneously; V1 uses a coordinated, drained rollout.
 - Production CI derives the application public half from the exact private
-  secret, compares its DER fingerprint with every enforcing Ready Node before
-  planning any mutation, and then rolls the control plane before the Gateway.
+  secret, compares its DER fingerprint with every schedulable Node and every
+  Node still serving assigned or orphan Cats before planning any mutation, and
+  then rolls the control plane before the Gateway. An all-legacy cohort is the
+  safe additive first release; a mixed legacy/enforcing cohort is an
+  interrupted worker rollout and fails the preflight.
   The drained worker association validates and fingerprints the key after
   installation; registration plus the uncordon gate proves that the installed
   verifier matches the serving signer. An interrupted or mismatched worker

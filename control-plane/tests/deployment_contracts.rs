@@ -152,8 +152,9 @@ fn route_grant_private_key_reaches_only_control_plane_and_nodes_get_public_key()
 }
 
 #[test]
-fn route_grant_rotation_checks_ready_nodes_before_planning_a_rollout() {
+fn route_grant_rotation_checks_schedulable_and_serving_nodes_before_a_rollout() {
     let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
+    let verifier = read_workspace_file("deploy/aws/check-route-grant-nodes.sh");
     let preflight = workflow
         .find("- name: Check Route Grant verifier compatibility")
         .expect("Route Grant compatibility preflight");
@@ -172,16 +173,99 @@ fn route_grant_rotation_checks_ready_nodes_before_planning_a_rollout() {
     for fragment in [
         "port-forward service/cats-controld 17300:7300",
         "/v1/admin/nodes",
-        ".node.state == \"ready\"",
-        ".node.route_grant_public_key_sha256",
         "route-grant-public.sha256",
-        "Ready Nodes verify a different Route Grant key",
+        "deploy/aws/check-route-grant-nodes.sh",
     ] {
         assert!(
             gate.contains(fragment),
             "Route Grant preflight lost {fragment:?}"
         );
     }
+    for fragment in [
+        ".node.state == \"ready\"",
+        "(.assigned_cats // 0) > 0",
+        "(.orphan_cats // 0) > 0",
+        ".node.route_grant_public_key_sha256",
+        "Interrupted Route Grant worker rollout",
+        "Schedulable or serving Nodes verify a different Route Grant key",
+    ] {
+        assert!(
+            verifier.contains(fragment),
+            "Route Grant Node verifier lost {fragment:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn route_grant_node_preflight_exercises_safe_and_interrupted_rollout_cohorts() {
+    let fixture = tempfile::tempdir().expect("Route Grant preflight fixture");
+    let expected = "a".repeat(64);
+    let run = |name: &str, items: serde_json::Value| {
+        let path = fixture.path().join(format!("{name}.json"));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({ "items": items })).unwrap(),
+        )
+        .unwrap();
+        Command::new("bash")
+            .arg(workspace_root().join("deploy/aws/check-route-grant-nodes.sh"))
+            .arg(&expected)
+            .arg(path)
+            .output()
+            .unwrap()
+    };
+    let node =
+        |id: &str, state: &str, fingerprint: Option<&str>, assigned_cats: u64, orphan_cats: u64| {
+            serde_json::json!({
+                "node": {
+                    "id": id,
+                    "state": state,
+                    "route_grant_public_key_sha256": fingerprint,
+                },
+                "assigned_cats": assigned_cats,
+                "orphan_cats": orphan_cats,
+            })
+        };
+
+    let all_legacy = run(
+        "all-legacy",
+        serde_json::json!([
+            node("legacy-ready", "ready", None, 0, 0),
+            node("legacy-serving", "cordoned", None, 1, 0),
+        ]),
+    );
+    assert!(all_legacy.status.success());
+    assert!(String::from_utf8_lossy(&all_legacy.stdout).contains("Additive first rollout"));
+
+    let all_enforcing = run(
+        "all-enforcing",
+        serde_json::json!([
+            node("ready", "ready", Some(&expected), 0, 0),
+            node("empty-legacy", "cordoned", None, 0, 0),
+        ]),
+    );
+    assert!(all_enforcing.status.success());
+
+    let interrupted = run(
+        "interrupted",
+        serde_json::json!([
+            node("ready", "ready", Some(&expected), 0, 0),
+            node("legacy-serving", "draining", None, 2, 0),
+        ]),
+    );
+    assert!(!interrupted.status.success());
+    assert!(String::from_utf8_lossy(&interrupted.stderr)
+        .contains("Interrupted Route Grant worker rollout"));
+
+    let mismatch = "b".repeat(64);
+    let wrong_orphan = run(
+        "wrong-orphan",
+        serde_json::json!([node("wrong-orphan", "cordoned", Some(&mismatch), 0, 1,)]),
+    );
+    assert!(!wrong_orphan.status.success());
+    assert!(String::from_utf8_lossy(&wrong_orphan.stderr)
+        .contains("verify a different Route Grant key"));
 }
 
 #[test]

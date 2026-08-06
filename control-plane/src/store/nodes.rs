@@ -43,12 +43,48 @@ impl Store {
         let NodeAdmission {
             initially_cordoned,
             route_grant_public_key_sha256,
-            force_cordoned,
+            expected_route_grant_public_key_sha256,
         } = admission;
         self.with(|client| {
-            client
-                .execute(
-                    "INSERT INTO nodes (id, agent_url, gateway_url, state, cpus, memory_mib,
+            let mut tx = client.transaction()?;
+            // Registration can make a previously Ready Node ineligible. It
+            // must linearize with a placement that already observed Ready and
+            // with an administrator trying to uncordon the same identity.
+            lock_placement(&mut tx)?;
+            let existing = tx.query_opt(
+                "SELECT state, scheduling_disabled, route_grant_public_key_sha256
+                   FROM nodes WHERE id=$1",
+                &[&node_id],
+            )?;
+            let legacy_phase_open = if expected_route_grant_public_key_sha256.is_some() {
+                tx.query_one(
+                    "SELECT legacy_admission_open
+                       FROM route_grant_rollout_state
+                      WHERE singleton",
+                    &[],
+                )?
+                .try_get::<_, bool>(0)?
+            } else {
+                false
+            };
+            let existing_legacy_ready = existing.as_ref().is_some_and(|row| {
+                row.get::<_, &str>(0) == "ready"
+                    && !row.get::<_, bool>(1)
+                    && row.get::<_, Option<String>>(2).is_none()
+            });
+            let legacy_ready_exception = expected_route_grant_public_key_sha256.is_some()
+                && route_grant_public_key_sha256.is_none()
+                && legacy_phase_open
+                && existing_legacy_ready;
+            let force_cordoned = expected_route_grant_public_key_sha256.is_some_and(|expected| {
+                route_grant_public_key_sha256 != Some(expected) && !legacy_ready_exception
+            });
+            let initially_cordoned = initially_cordoned
+                || (expected_route_grant_public_key_sha256.is_some()
+                    && route_grant_public_key_sha256.is_none());
+
+            tx.execute(
+                "INSERT INTO nodes (id, agent_url, gateway_url, state, cpus, memory_mib,
                                         last_heartbeat_ms, scheduling_disabled,
                                         route_grant_public_key_sha256)
                      VALUES ($1,$2,$3,
@@ -72,19 +108,44 @@ impl Store {
                        reported_cats_json=NULL,
                        route_grant_public_key_sha256=$8,
                        scheduling_disabled=nodes.scheduling_disabled OR $9",
-                    &[
-                        &node_id,
-                        &agent_url,
-                        &gateway_url,
-                        &cpus,
-                        &memory_mib,
-                        &now,
-                        &initially_cordoned,
-                        &route_grant_public_key_sha256,
-                        &force_cordoned,
-                    ],
-                )
-                .map(|_| ())
+                &[
+                    &node_id,
+                    &agent_url,
+                    &gateway_url,
+                    &cpus,
+                    &memory_mib,
+                    &now,
+                    &initially_cordoned,
+                    &route_grant_public_key_sha256,
+                    &force_cordoned,
+                ],
+            )?;
+
+            if legacy_phase_open {
+                // Close the additive exception exactly once after every Node
+                // that can receive placements or still serves a Cat has
+                // reported some verifier identity. Empty cordoned Nodes do not
+                // hold the phase open: their uncordon path still requires the
+                // exact current fingerprint.
+                tx.execute(
+                    "UPDATE route_grant_rollout_state
+                        SET legacy_admission_open=FALSE
+                      WHERE singleton
+                        AND legacy_admission_open
+                        AND NOT EXISTS (
+                            SELECT 1
+                              FROM nodes AS n
+                             WHERE n.route_grant_public_key_sha256 IS NULL
+                               AND (
+                                    n.state='ready'
+                                    OR EXISTS (SELECT 1 FROM cats AS c WHERE c.node_id=n.id)
+                                    OR COALESCE(n.reported_cats_json, '[]') <> '[]'
+                               )
+                        )",
+                    &[],
+                )?;
+            }
+            tx.commit()
         })
     }
 
@@ -237,6 +298,70 @@ impl Store {
             return Err(ApiError::not_found(format!("node {node_id}")));
         }
         Ok(())
+    }
+
+    /// Atomically prove verifier compatibility and make a Node schedulable.
+    ///
+    /// Reading the fingerprint in the API handler and later calling
+    /// `set_node_state` allows a concurrent wrong-key registration to cordon
+    /// the Node between those operations, after which the stale uncordon would
+    /// restore Ready. This method holds the placement lock across both checks
+    /// and the state transition.
+    pub(crate) fn uncordon_node_with_route_grant(
+        &self,
+        node_id: &str,
+        expected_fingerprint: &str,
+    ) -> Result<()> {
+        enum Outcome {
+            Updated,
+            Missing,
+            InvalidState,
+            WrongFingerprint(Option<String>),
+        }
+
+        let outcome = self.with(|client| {
+            let mut tx = client.transaction()?;
+            lock_placement(&mut tx)?;
+            let row = tx.query_opt(
+                "SELECT state, route_grant_public_key_sha256
+                   FROM nodes WHERE id=$1 FOR UPDATE",
+                &[&node_id],
+            )?;
+            let outcome = match row {
+                None => Outcome::Missing,
+                Some(row) => {
+                    let state: String = row.try_get(0)?;
+                    let fingerprint: Option<String> = row.try_get(1)?;
+                    if matches!(state.as_str(), "lost" | "fenced") {
+                        Outcome::InvalidState
+                    } else if fingerprint.as_deref() != Some(expected_fingerprint) {
+                        Outcome::WrongFingerprint(fingerprint)
+                    } else {
+                        tx.execute(
+                            "UPDATE nodes
+                                SET state='ready', scheduling_disabled=FALSE
+                              WHERE id=$1",
+                            &[&node_id],
+                        )?;
+                        Outcome::Updated
+                    }
+                }
+            };
+            tx.commit()?;
+            Ok(outcome)
+        })?;
+
+        match outcome {
+            Outcome::Updated => Ok(()),
+            Outcome::Missing => Err(ApiError::not_found(format!("node {node_id}"))),
+            Outcome::InvalidState => Err(ApiError::failed_precondition(
+                "lost node must heartbeat before uncordon; a fenced node identity cannot be reused",
+            )),
+            Outcome::WrongFingerprint(observed) => Err(ApiError::failed_precondition(format!(
+                "node Route Grant verifier key is not the active control-plane key; expected {expected_fingerprint}, observed {}",
+                observed.as_deref().unwrap_or("legacy/unreported")
+            ))),
+        }
     }
 
     pub fn cats_on_node(&self, node_id: &str) -> Result<Vec<Cat>> {

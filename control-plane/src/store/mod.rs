@@ -66,7 +66,7 @@ pub type Result<T> = std::result::Result<T, ApiError>;
 pub(crate) struct NodeAdmission<'a> {
     initially_cordoned: bool,
     route_grant_public_key_sha256: Option<&'a str>,
-    force_cordoned: bool,
+    expected_route_grant_public_key_sha256: Option<&'a str>,
 }
 
 impl<'a> NodeAdmission<'a> {
@@ -74,26 +74,19 @@ impl<'a> NodeAdmission<'a> {
         Self {
             initially_cordoned,
             route_grant_public_key_sha256: None,
-            force_cordoned: false,
+            expected_route_grant_public_key_sha256: None,
         }
     }
 
     pub(crate) fn for_route_grant(
         initially_cordoned: bool,
         actual: Option<&'a str>,
-        expected: &str,
+        expected: &'a str,
     ) -> Self {
         Self {
-            // Missing identity is compatible only with a row that already
-            // existed before Route Grants. This flag is insert-only in the
-            // upsert, so an existing Ready legacy Node stays live during the
-            // additive rollout while a brand-new legacy Node cannot bypass
-            // administrator admission.
-            initially_cordoned: initially_cordoned || actual.is_none(),
+            initially_cordoned,
             route_grant_public_key_sha256: actual,
-            // `None` is the explicit legacy compatibility case for the first
-            // additive rollout. Any Node that enforces grants reports `Some`.
-            force_cordoned: actual.is_some_and(|actual| actual != expected),
+            expected_route_grant_public_key_sha256: Some(expected),
         }
     }
 }
