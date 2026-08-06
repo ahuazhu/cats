@@ -98,7 +98,7 @@ fn production_aws_worker_can_cut_over_to_proxy_without_client_set_pinning() {
     let unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
     for expected in [
         "Environment=CATS_POSTGRES_SESSION_SETUP=client",
-        "--metadata-store-option session-setup=$CATS_POSTGRES_SESSION_SETUP",
+        "--metadata-store-option session-setup=${CATS_POSTGRES_SESSION_SETUP}",
     ] {
         assert!(
             unit.contains(expected),
@@ -109,6 +109,10 @@ fn production_aws_worker_can_cut_over_to_proxy_without_client_set_pinning() {
         unit.find("Environment=CATS_POSTGRES_SESSION_SETUP=client")
             < unit.find("EnvironmentFile=/etc/cats/worker.env"),
         "worker.env must be able to override the backward-compatible client default"
+    );
+    assert!(
+        !unit.contains("session-setup=$CATS_POSTGRES_SESSION_SETUP"),
+        "systemd does not expand an unbraced variable embedded in an argument; the worker would receive the literal variable name and restart forever"
     );
 }
 
@@ -175,6 +179,31 @@ fn manual_worker_bootstrap_refuses_the_example_identity() {
         installer.find("$worker_node_id == REPLACE_WITH_UNIQUE_NODE_ID")
             < installer.find("apt-get update -q"),
         "identity validation must happen before the expensive bootstrap starts"
+    );
+}
+
+#[test]
+fn guest_builder_installs_musl_target_for_the_pinned_toolchain() {
+    let builder = read_workspace_file("deploy/metal/build-guest-image.sh");
+    let static_agent_build = builder
+        .split_once("# 0. Static guest agent (musl)")
+        .and_then(|(_, rest)| rest.split_once("# 1. Kernel"))
+        .map(|(section, _)| section)
+        .expect("static Guest Agent build section");
+
+    let enter_repository = static_agent_build
+        .find("cd \"$REPO\"")
+        .expect("Guest build must enter the repository");
+    let install_target = static_agent_build
+        .find("rustup target add x86_64-unknown-linux-musl")
+        .expect("Guest build must install the musl Rust target");
+    let build_agent = static_agent_build
+        .find("cargo build --release -p cats-guest-agent --target x86_64-unknown-linux-musl")
+        .expect("Guest build must compile a static Guest Agent");
+
+    assert!(
+        enter_repository < install_target && install_target < build_agent,
+        "rustup must resolve the musl target after entering the repository so it installs into rust-toolchain.toml's pinned toolchain"
     );
 }
 
