@@ -155,7 +155,7 @@
     {
       "name": "generation-local-truth-mismatch",
       "token": "$positive.compact",
-      "context_override": { "local_authority.cat_generation": 8 },
+      "context_override": { "local_authority.intent_generation": 8 },
       "expected_class": "authority_mismatch"
     },
     {
@@ -189,6 +189,18 @@
       "expected_class": "authority_mismatch"
     },
     {
+      "name": "local-authority-retiring-rejects-admission",
+      "token": "$positive.compact",
+      "context_override": { "local_authority.admission_state": "retiring" },
+      "expected_class": "runtime_unavailable"
+    },
+    {
+      "name": "local-authority-revoked-rejects-admission",
+      "token": "$positive.compact",
+      "context_override": { "local_authority.admission_state": "revoked" },
+      "expected_class": "runtime_unavailable"
+    },
+    {
       "name": "runtime-not-running",
       "token": "$positive.compact",
       "context_override": { "runtime_state": "Suspended" },
@@ -219,32 +231,526 @@
       "expected": "issuer_rejects_observation_without_settlement"
     },
     {
-      "name": "settled-running-with-current-suspend-command",
+      "name": "settled-running-with-current-command",
       "snapshot_override": {
-        "cat_runtime_state.state": "running",
-        "current_command.kind": "Suspend",
-        "current_command.phase": "dispatchable"
+        "current_lifecycle_command": {
+          "authority": "current",
+          "kind": "suspend",
+          "phase": "dispatchable"
+        }
       },
-      "expected": "issuer_rejects_nonterminal_invalidating_command"
+      "expected": "issuer_rejects_any_current_nonterminal_command"
     },
     {
-      "name": "route-publication-provenance-mismatch",
+      "name": "route-publication-result-provenance-mismatch",
       "snapshot_override": {
-        "cat_runtime_state.result_id": "result_current",
-        "route_publication.result_id": "result_stale"
+        "reducer_route_intent.settled_lineage.result_id": "nres_stale"
       },
       "expected": "issuer_rejects_stale_route_publication"
+    },
+    {
+      "name": "route-admission-revoked-after-idle-receipt",
+      "snapshot_override": {
+        "materialized_route.admission_state": "revoked",
+        "materialized_route.retirement_receipt_id": "rret_0123456789abcdef0123456789abcdef"
+      },
+      "expected": "issuer_rejects_retired_route"
+    },
+    {
+      "name": "retirement-receipt-present-on-active-route-is-invariant-error",
+      "snapshot_override": {
+        "materialized_route.retirement_receipt_id": "rret_0123456789abcdef0123456789abcdef"
+      },
+      "expected": "issuer_rejects_inconsistent_retirement_snapshot"
+    }
+  ],
+  "issuer_generation_mutation_matrix": {
+    "base_snapshot": "$positive.issuer_snapshot",
+    "single_point_paths": [
+      "cat.intent_generation",
+      "cat_runtime_state.intent_generation",
+      "reducer_route_intent.intent_generation",
+      "materialized_route.intent_generation",
+      "runtime_route_authority_ack.intent_generation"
+    ],
+    "mutation_value": 8,
+    "expected_cases": 5,
+    "expected": "issuer_rejects_generation_mismatch"
+  },
+  "issuer_lineage_mutation_matrix": {
+    "base_snapshot": "$positive.issuer_snapshot",
+    "layers": [
+      "cat_runtime_state.settled_lineage",
+      "reducer_route_intent.settled_lineage",
+      "materialized_route.settled_lineage",
+      "runtime_route_authority_ack.settled_lineage"
+    ],
+    "single_point_relative_paths": [
+      "command_id",
+      "command_seq",
+      "dispatch_id",
+      "dispatch_seq",
+      "request_body_sha256",
+      "target_node_id",
+      "node_claim_id",
+      "result_id",
+      "runtime_identity.runtime_id",
+      "runtime_identity.runtime_generation",
+      "runtime_identity.host_boot_id",
+      "runtime_identity.guest_boot_id"
+    ],
+    "mutation_rule": "replace_exact_value_with_same_type_distinct_value_in_one_layer_only",
+    "expected_cases": 48,
+    "expected": "issuer_rejects_lineage_mismatch"
+  },
+  "issuer_route_identity_mutation_matrix": {
+    "base_snapshot": "$positive.issuer_snapshot",
+    "single_point_paths": [
+      "materialized_route.route_intent_id",
+      "materialized_route.route_epoch",
+      "materialized_route.workspace_id",
+      "materialized_route.endpoint_id",
+      "materialized_route.cat_id",
+      "materialized_route.hostname",
+      "materialized_route.protocol",
+      "materialized_route.target_port",
+      "materialized_route.target_node_id",
+      "runtime_route_authority_ack.install_id",
+      "runtime_route_authority_ack.route_intent_id",
+      "runtime_route_authority_ack.route_epoch",
+      "runtime_route_authority_ack.workspace_id",
+      "runtime_route_authority_ack.endpoint_id",
+      "runtime_route_authority_ack.cat_id",
+      "runtime_route_authority_ack.hostname",
+      "runtime_route_authority_ack.protocol",
+      "runtime_route_authority_ack.target_port",
+      "runtime_route_authority_ack.node_id",
+      "runtime_route_authority_ack.admission_state"
+    ],
+    "mutation_rule": "replace_exact_value_with_same_type_distinct_value",
+    "expected_cases": 20,
+    "expected": "issuer_rejects_route_authority_mismatch"
+  },
+  "current_nonterminal_command_matrix": {
+    "base_snapshot": "$positive.issuer_snapshot",
+    "kinds": [
+      "start",
+      "resume",
+      "restore",
+      "suspend",
+      "warm",
+      "cold",
+      "destroy",
+      "fallback_cold"
+    ],
+    "phases": [
+      "planned",
+      "preparing",
+      "dispatchable",
+      "dispatched",
+      "accepted",
+      "settling",
+      "blocked"
+    ],
+    "mutation": {
+      "current_lifecycle_command": {
+        "authority": "current",
+        "kind": "$kind",
+        "phase": "$phase"
+      }
+    },
+    "expected_cases": 56,
+    "expected": "issuer_rejects_any_current_nonterminal_command",
+    "excluded_non_authority_record": "PolicyTransitionProposal"
+  },
+  "retirement_mode_matrix": {
+    "cancel_and_drain_reasons": [
+      "manual_stop_or_suspend",
+      "node_drain",
+      "destroy",
+      "operator_fence",
+      "route_unbind_or_rebind"
+    ],
+    "require_idle_reasons": [
+      "auto_suspend_policy"
+    ],
+    "invalid_combinations": [
+      "auto_suspend_policy+cancel_and_drain",
+      "manual_or_drain_or_destroy+require_idle"
+    ],
+    "expected": "closed_enum_mapping_enforced"
+  },
+  "policy_proposal_cases": [
+    {
+      "name": "proposal-before-promotion-is-not-current-command",
+      "snapshot": "$positive.issuer_snapshot",
+      "snapshot_override": {
+        "policy_transition_proposal": {
+          "proposal_id": "ptp_0123456789abcdef0123456789abcdef",
+          "mode": "require_idle",
+          "expected_intent_generation": 7,
+          "expected_route_epoch": 42,
+          "phase": "probing_idle"
+        }
+      },
+      "expected": "issuer_accepts_current_running_snapshot"
+    },
+    {
+      "name": "busy-proof-does-not-promote-or-revoke",
+      "input": {
+        "proposal_id": "ptp_0123456789abcdef0123456789abcdef",
+        "mode": "require_idle",
+        "active_guard_count": 1,
+        "guard_registry_revision": 12
+      },
+      "expected": {
+        "cat_intent_generation": "unchanged",
+        "current_lifecycle_command": null,
+        "route_epoch": "unchanged",
+        "local_authority": "active_unchanged",
+        "policy_result": "busy_backoff"
+      }
+    }
+  ],
+  "node_lineage_mutation_matrix": {
+    "base_context": "$positive.verification_context",
+    "runtime_ledger_lineage": "$positive.issuer_snapshot.cat_runtime_state.settled_lineage",
+    "single_point_local_authority_paths": [
+      "intent_generation",
+      "route_intent_id",
+      "settled_lineage.command_id",
+      "settled_lineage.command_seq",
+      "settled_lineage.dispatch_id",
+      "settled_lineage.dispatch_seq",
+      "settled_lineage.request_body_sha256",
+      "settled_lineage.target_node_id",
+      "settled_lineage.node_claim_id",
+      "settled_lineage.result_id",
+      "settled_lineage.runtime_identity.runtime_id",
+      "settled_lineage.runtime_identity.runtime_generation",
+      "settled_lineage.runtime_identity.host_boot_id",
+      "settled_lineage.runtime_identity.guest_boot_id"
+    ],
+    "mutation_rule": "replace_exact_value_with_same_type_distinct_value",
+    "expected_cases": 14,
+    "expected": "runtime_lineage_mismatch"
+  },
+  "route_install_cases": [
+    {
+      "name": "exact-install-replay-returns-identical-ack",
+      "current": "$positive.verification_context.local_authority",
+      "request": "$positive.verification_context.local_authority",
+      "expected": "same_durable_ack_no_write"
+    },
+    {
+      "name": "older-epoch-install-rejected",
+      "current_route_epoch": 42,
+      "request_route_epoch": 41,
+      "expected": "stale_install"
+    },
+    {
+      "name": "expected-predecessor-mismatch-rejected",
+      "current_predecessor": {
+        "route_epoch": 42,
+        "install_id": "rinst_0123456789abcdef0123456789abcdef",
+        "route_intent_id": "rti_0123456789abcdef0123456789abcdef",
+        "settled_lineage": "$positive.verification_context.local_authority.settled_lineage"
+      },
+      "request_expected_predecessor": "$case.current_predecessor",
+      "request_expected_predecessor_override": { "settled_lineage.result_id": "nres_other" },
+      "expected": "stale_install"
+    },
+    {
+      "name": "same-epoch-different-lineage-rejected",
+      "current_route_epoch": 42,
+      "request_route_epoch": 42,
+      "request_override": { "settled_lineage.result_id": "nres_other" },
+      "expected": "install_conflict"
+    },
+    {
+      "name": "restart-ledger-lineage-mismatch-stops-admission",
+      "durable_authority": "$positive.verification_context.local_authority",
+      "runtime_ledger_override": { "result_id": "nres_other" },
+      "expected": "runtime_lineage_mismatch_and_admission_disabled"
+    }
+  ],
+  "retirement_adoption_cases": [
+    {
+      "name": "manual-command-adopts-exact-policy-retired-predecessor",
+      "input": {
+        "policy_receipt": {
+          "retirement_id": "rret_policy_0123456789abcdef01234567",
+          "retirement_token": "rtok_0123456789abcdef0123456789abcdef",
+          "scope": "policy_proposal",
+          "mode": "require_idle",
+          "reason_policy_proposal_id": "ptp_0123456789abcdef0123456789abcdef",
+          "predecessor": {
+            "kind": "active_authority",
+            "install_id": "rinst_0123456789abcdef0123456789abcdef",
+            "route_epoch": 42,
+            "settled_lineage": "$positive.verification_context.local_authority.settled_lineage"
+          },
+          "outcome": "retired",
+          "old_install_id": "rinst_0123456789abcdef0123456789abcdef",
+          "old_route_epoch": 42,
+          "old_settled_lineage": "$positive.verification_context.local_authority.settled_lineage",
+          "remaining_active_guard_count": 0,
+          "admission_state": "revoked"
+        },
+        "node_local_authority": {
+          "state": "revoked",
+          "install_id": "rinst_0123456789abcdef0123456789abcdef",
+          "route_epoch": 42,
+          "settled_lineage": "$positive.verification_context.local_authority.settled_lineage"
+        },
+        "current_command": {
+          "command_id": "lcmd_manual_0123456789abcdef01234567",
+          "intent_generation": 8,
+          "mode": "cancel_and_drain",
+          "route_retirement_predecessor": {
+            "kind": "retired_by_policy",
+            "policy_proposal_id": "ptp_0123456789abcdef0123456789abcdef",
+            "retirement_token": "rtok_0123456789abcdef0123456789abcdef"
+          },
+          "dispatch_id": "dsp_manual_0123456789abcdef012345678",
+          "node_claim_id": "nclaim_manual_0123456789abcdef012345"
+        },
+        "active_guard_count": 0
+      },
+      "expected_receipt": {
+        "retirement_token": "rtok_command_0123456789abcdef012345678",
+        "scope": "lifecycle_command",
+        "mode": "cancel_and_drain",
+        "reason_lifecycle_intent_generation": 8,
+        "reason_lifecycle_command_id": "lcmd_manual_0123456789abcdef01234567",
+        "predecessor": {
+          "kind": "retired_by_policy",
+          "policy_proposal_id": "ptp_0123456789abcdef0123456789abcdef",
+          "retirement_token": "rtok_0123456789abcdef0123456789abcdef"
+        },
+        "outcome": "adopted_retired_predecessor",
+        "admission_state": "revoked"
+      },
+      "expected": "distinct_command_receipt_without_old_epoch_reactivation"
+    },
+    {
+      "name": "promoted-auto-command-also-needs-distinct-command-receipt",
+      "input": {
+        "policy_receipt_id": "rret_policy_0123456789abcdef01234567",
+        "retirement_token": "rtok_0123456789abcdef0123456789abcdef",
+        "policy_proposal_id": "ptp_0123456789abcdef0123456789abcdef",
+        "promoted_command_id": "lcmd_auto_0123456789abcdef012345678",
+        "command_mode": "require_idle",
+        "node_local_authority": "same_exact_policy_revoked_predecessor"
+      },
+      "expected": {
+        "proposal_receipt_authorizes_command": false,
+        "new_receipt_scope": "lifecycle_command",
+        "new_receipt_token": "distinct_from_policy_retirement_token",
+        "new_receipt_predecessor": "retired_by_policy(P, retirement_token)",
+        "new_receipt_outcome": "adopted_retired_predecessor",
+        "old_epoch_reactivated": false
+      }
+    },
+    {
+      "name": "adoption-mismatch-fails-closed",
+      "input": {
+        "policy_proposal_id": "ptp_0123456789abcdef0123456789abcdef",
+        "retirement_token": "rtok_0123456789abcdef0123456789abcdef",
+        "old_route_epoch": 42,
+        "request_override": {
+          "predecessor.retirement_token": "rtok_wrong_0123456789abcdef0123456789ab",
+          "old_settled_lineage.result_id": "nres_other"
+        }
+      },
+      "expected": {
+        "result": "retirement_adoption_mismatch",
+        "command": "blocked",
+        "local_authority": "revoked_unchanged",
+        "receipt_created": false
+      }
+    },
+    {
+      "name": "exact-adoption-replay-is-idempotent",
+      "input": {
+        "existing_command_receipt": {
+          "retirement_token": "rtok_command_0123456789abcdef012345678",
+          "scope": "lifecycle_command",
+          "predecessor": "retired_by_policy(P, retirement_token)",
+          "outcome": "adopted_retired_predecessor"
+        },
+        "replay": "same_command_dispatch_claim_policy_token_epoch_install_lineage"
+      },
+      "expected": "same_durable_command_receipt_no_mutation"
+    }
+  ],
+  "retirement_compensation_cases": [
+    {
+      "name": "command-adoption-wins-route-row-cas",
+      "route_row_predecessor": "pending_policy_retirement(P, retirement_token, epoch42, install, lineage)",
+      "session_a": "ingest_command_adoption_receipt",
+      "session_b": "apply_route_compensation",
+      "winner_write": "adopted_by_command(command_id, receipt_id)",
+      "expected": {
+        "compensation": "terminal_stale",
+        "command": "may_continue_after_command_receipt",
+        "old_epoch_reactivated": false
+      }
+    },
+    {
+      "name": "route-compensation-wins-route-row-cas",
+      "route_row_predecessor": "pending_policy_retirement(P, retirement_token, epoch42, install, lineage)",
+      "session_a": "ingest_command_adoption_receipt",
+      "session_b": "apply_route_compensation",
+      "winner_write": "compensated_by_route(compensation_intent_id, epoch43)",
+      "expected": {
+        "adoption": "terminal_stale",
+        "manual_command": "retry_from_fresh_epoch_authority",
+        "published_route_epoch": 43,
+        "epoch_42_reactivated": false
+      }
+    },
+    {
+      "name": "eligible-policy-proposal-owns-retry-not-route-controller",
+      "input": {
+        "current_command": null,
+        "policy_proposal": "eligible",
+        "route_row": "pending_policy_retirement(P, retirement_token, epoch42, install, lineage)"
+      },
+      "expected": {
+        "owner": "policy_controller_promotion_retry",
+        "route_compensation_intent": "forbidden"
+      }
+    },
+    {
+      "name": "terminal-policy-same-running-lineage-allows-fresh-epoch-compensation",
+      "input": {
+        "current_command": null,
+        "policy_proposal": "terminal_abandoned",
+        "cat_runtime_state": "$positive.issuer_snapshot.cat_runtime_state",
+        "original_reducer_route_intent": "$positive.issuer_snapshot.reducer_route_intent",
+        "old_route_epoch": 42
+      },
+      "expected": {
+        "owner": "route_controller_compensation",
+        "new_route_epoch": 43,
+        "new_install": "required",
+        "old_epoch_reactivated": false
+      }
     }
   ],
   "session_transition_cases": [
     {
-      "name": "reachable-revoke-cancels-active-streams-before-transfer",
+      "name": "auto-require-idle-active-http-returns-busy-without-revoke",
+      "input": {
+        "mode": "require_idle",
+        "lock_winner": "existing_streaming_http_guard",
+        "active_guards": [
+          { "kind": "streaming_http", "intent_generation": 7, "route_epoch": 42 }
+        ],
+        "guard_registry_revision": 12
+      },
+      "expected": {
+        "result": "busy_proof",
+        "local_authority": "active_unchanged",
+        "guard": "not_cancelled",
+        "cat_generation_or_command": "unchanged",
+        "issuer": "may_sign_current_running_snapshot"
+      }
+    },
+    {
+      "name": "auto-require-idle-active-websocket-returns-busy-without-revoke",
+      "input": {
+        "mode": "require_idle",
+        "lock_winner": "existing_websocket_guard",
+        "active_guards": [
+          { "kind": "websocket", "intent_generation": 7, "route_epoch": 42 }
+        ],
+        "guard_registry_revision": 13
+      },
+      "expected": {
+        "result": "busy_proof",
+        "local_authority": "active_unchanged",
+        "guard": "not_cancelled",
+        "cat_generation_or_command": "unchanged",
+        "issuer": "may_sign_current_running_snapshot"
+      }
+    },
+    {
+      "name": "auto-require-idle-wins-lock-then-blocks-http-and-websocket",
+      "input": {
+        "mode": "require_idle",
+        "active_guard_count_at_lock": 0,
+        "concurrent_new_admissions": ["streaming_http", "websocket"]
+      },
+      "expected": {
+        "local_authority": "retiring_then_durably_revoked",
+        "new_admissions": "rejected_without_guard",
+        "cancelled_existing_guards": 0,
+        "route_retirement_receipt": "require_idle_zero_guard",
+        "guest_quiesce": "only_after_receipt"
+      }
+    },
+    {
+      "name": "auto-require-idle-node-crash-after-revoke-recovers-fail-closed",
+      "input": {
+        "mode": "require_idle",
+        "active_guard_count_at_lock": 0,
+        "crash_boundary": "after_durable_authority_revoke_before_receipt_response",
+        "durable_retirement_work": true
+      },
+      "expected": {
+        "restart_admission": "disabled_until_reconciliation",
+        "old_token": "rejected",
+        "recovery": "same_retirement_id_revision_and_zero_guard_receipt",
+        "local_authority": "never_silently_reactivated"
+      }
+    },
+    {
+      "name": "auto-require-idle-control-crash-after-receipt-recovers-promotion-cas",
+      "input": {
+        "mode": "require_idle",
+        "crash_boundary": "after_node_receipt_before_control_promotion_commit",
+        "node_local_authority": "revoked",
+        "control_route_snapshot": "still_active_until_result_ingestion"
+      },
+      "expected": {
+        "old_token_at_node": "rejected",
+        "recovery": "ingest_exact_receipt_and_retry_whole_cat_first_promotion_transaction",
+        "promotion": "only_if_proposal_cat_lineage_route_epoch_install_still_match",
+        "old_authority": "never_reactivated_in_place"
+      }
+    },
+    {
+      "name": "manual-command-commits-after-policy-local-revoke-before-promotion",
+      "input": {
+        "event_order": [
+          "policy_require_idle_receipt_durably_revokes_epoch_42",
+          "eligible_route_compensation_intent_may_be_durably_discovered",
+          "manual_intent_and_current_command_commit",
+          "command_adoption_and_route_compensation_race_on_same_route_row"
+        ],
+        "policy_predecessor": "pending_policy_retirement(P, retirement_token, epoch42, install, lineage)",
+        "manual_command_mode": "cancel_and_drain"
+      },
+      "expected": {
+        "proposal_receipt_authorizes_manual_command": false,
+        "adoption_if_winner": "distinct_command_scoped_cancel_and_drain_and_receipt_with_retired_by_policy_predecessor_and_adopted_retired_predecessor_outcome",
+        "compensation_if_winner": "manual_retries_from_fresh_epoch_authority",
+        "serialization": "single_route_row_conditional_update",
+        "old_epoch_reactivated": false
+      }
+    },
+    {
+      "name": "reachable-lifecycle-revoke-cancels-http-and-websocket-before-quiesce",
       "input": {
         "node_reachable": true,
-        "old_authority": { "cat_generation": 7, "route_epoch": 42 },
+        "mode": "cancel_and_drain",
+        "lifecycle_action": { "source": "running", "target": "suspended" },
+        "old_authority": { "intent_generation": 7, "route_epoch": 42, "runtime_id": "rt_0123456789abcdef0123456789abcdef" },
         "active_guards": [
-          { "kind": "websocket", "cat_generation": 7, "route_epoch": 42 },
-          { "kind": "streaming_http", "cat_generation": 7, "route_epoch": 42 }
+          { "kind": "websocket", "intent_generation": 7, "route_epoch": 42, "runtime_id": "rt_0123456789abcdef0123456789abcdef" },
+          { "kind": "streaming_http", "intent_generation": 7, "route_epoch": 42, "runtime_id": "rt_0123456789abcdef0123456789abcdef" }
         ],
         "revoke_to_route_epoch": 43,
         "drain_result": "all_guards_zero"
@@ -252,17 +758,49 @@
       "expected": {
         "old_epoch_new_admission": "rejected",
         "old_epoch_transports": "cancelled_and_closed",
-        "control_plane_publication_order": "after_zero_guard_durable_ack",
-        "authority_transfer": "allowed"
+        "route_retirement_receipt": "durable_before_guest_quiesce",
+        "guest_quiesce_vmm_blockd_order": "after_zero_guard_durable_ack",
+        "lifecycle_success_result": "allowed_after_quiesce_and_action_postconditions"
       }
     },
     {
-      "name": "reachable-revoke-drain-timeout-blocks-transfer",
+      "name": "http-admission-wins-lock-then-lifecycle-cancels-and-drains-it",
+      "input": {
+        "mode": "cancel_and_drain",
+        "request_kind": "streaming_http",
+        "lock_winner": "admission",
+        "guard_identity": { "intent_generation": 7, "route_epoch": 42, "runtime_id": "rt_0123456789abcdef0123456789abcdef" },
+        "lifecycle_waits_for_same_per_cat_lock": true
+      },
+      "expected": {
+        "guard_created": true,
+        "lifecycle_after_lock": "durable_revoke_cancel_close_and_drain_guard",
+        "guest_quiesce": "after_guard_count_zero"
+      }
+    },
+    {
+      "name": "websocket-lifecycle-wins-lock-and-blocks-new-guard",
+      "input": {
+        "mode": "cancel_and_drain",
+        "request_kind": "websocket",
+        "lock_winner": "lifecycle_revoke",
+        "authority": { "intent_generation": 7, "route_epoch": 42, "runtime_id": "rt_0123456789abcdef0123456789abcdef" }
+      },
+      "expected": {
+        "new_guard": "rejected",
+        "guest_connection": "not_started",
+        "lifecycle_drain": "continues_without_new_guard"
+      }
+    },
+    {
+      "name": "reachable-lifecycle-revoke-drain-timeout-preserves-running-source",
       "input": {
         "node_reachable": true,
-        "old_authority": { "cat_generation": 7, "route_epoch": 42 },
+        "mode": "cancel_and_drain",
+        "lifecycle_action": { "source": "running", "target": "cold" },
+        "old_authority": { "intent_generation": 7, "route_epoch": 42 },
         "active_guards": [
-          { "kind": "websocket", "cat_generation": 7, "route_epoch": 42 }
+          { "kind": "websocket", "intent_generation": 7, "route_epoch": 42 }
         ],
         "revoke_to_route_epoch": 43,
         "drain_result": "timeout_one_guard_remaining",
@@ -270,7 +808,10 @@
       },
       "expected": {
         "control_plane_publication": "blocked",
-        "authority_transfer": "forbidden"
+        "authority_transfer": "forbidden",
+        "lifecycle_command": "blocked",
+        "source_disposition": "running_preserved",
+        "guest_vmm_blockd_writer": "not_quiesced_or_torn_down"
       }
     },
     {
@@ -284,23 +825,27 @@
       },
       "expected": {
         "old_grant_new_admission": "exhausted",
-        "authority_transfer": "forbidden"
+        "route_admission_retirement": "unproven",
+        "new_route_publication": "forbidden"
       }
     },
     {
-      "name": "unreachable-node-external-fence-allows-transfer",
+      "name": "unreachable-node-serving-and-writer-fence-still-needs-durability",
       "input": {
         "node_reachable": false,
         "seconds_since_last_possible_issue": 0,
-        "external_fence_proof": "persisted_cloud_power_off_receipt"
+        "external_fence_proof": "persisted_cloud_power_off_receipt_proves_nonserving_and_writer_fenced",
+        "retained_volume_durability_receipt": null
       },
       "expected": {
         "old_runtime_serving": "impossible",
-        "authority_transfer": "allowed_after_fence_receipt"
+        "old_writer": "fenced",
+        "route_admission_retirement": "proven",
+        "new_route_publication": "blocked_pending_durability_receipt"
       }
     },
     {
-      "name": "ttl-plus-independent-zero-session-nonserving-proof-allows-transfer",
+      "name": "ttl-plus-zero-session-nonserving-only-closes-route-admission-gate",
       "input": {
         "node_reachable": false,
         "seconds_since_last_possible_issue": 125,
@@ -308,11 +853,118 @@
           "active_guard_count": 0,
           "runtime_state": "durably_stopped",
           "source": "authenticated_pre_disconnect_retirement_receipt"
-        }
+        },
+        "writer_fence_or_grant_invalidation_receipt": null
       },
       "expected": {
-        "authority_transfer": "allowed_after_proof_validation"
+        "route_admission_retirement": "proven",
+        "writer_transfer": "unproven",
+        "new_route_publication": "forbidden"
       }
+    },
+    {
+      "name": "new-publication-with-exact-route-writer-and-durability-proofs",
+      "input": {
+        "route_admission_retirement_receipt": "rret_0123456789abcdef0123456789abcdef",
+        "exact_reducer_route_intent": "$positive.issuer_snapshot.reducer_route_intent",
+        "old_volume_grant_receipt": "conditional_invalidation_exact_predecessor",
+        "writer_fence_receipt": "old_writer_cannot_reacquire",
+        "durability_receipt": { "local_generation": 108, "remote_generation": 108 },
+        "new_runtime_install_ack": "$positive.issuer_snapshot.runtime_route_authority_ack"
+      },
+      "expected": {
+        "route_admission_retirement": "proven",
+        "writer_transfer": "proven",
+        "durability": "remote_current",
+        "new_route_publication": "allowed_by_conditional_apply"
+      }
+    },
+    {
+      "name": "writer-state-unknown-blocks-new-publication",
+      "input": {
+        "route_admission_retirement": "proven",
+        "writer_state": "unknown",
+        "exact_reducer_route_intent": "$positive.issuer_snapshot.reducer_route_intent"
+      },
+      "expected": {
+        "new_route_publication": "forbidden",
+        "lifecycle_or_transfer": "blocked"
+      }
+    },
+    {
+      "name": "old-volume-grant-still-acquired-blocks-new-publication",
+      "input": {
+        "route_admission_retirement": "proven",
+        "old_volume_grant_state": "acquired",
+        "grant_invalidation_receipt": null
+      },
+      "expected": {
+        "new_route_publication": "forbidden",
+        "writer_transfer": "unproven"
+      }
+    },
+    {
+      "name": "local-generation-ahead-of-remote-blocks-new-publication",
+      "input": {
+        "route_admission_retirement": "proven",
+        "writer_fence": "proven",
+        "durability": { "local_generation": 109, "remote_generation": 108 }
+      },
+      "expected": {
+        "new_route_publication": "forbidden",
+        "durability_gate": "blocked_local_ahead"
+      }
+    }
+  ],
+  "postgres_concurrency_cases": [
+    {
+      "id": "PG-ISSUER-INTENT",
+      "database": "real_postgresql",
+      "sessions": 2,
+      "race": "issuer_snapshot_vs_intent_acceptance_and_current_command",
+      "expected": "old_complete_snapshot_or_reject_after_current_command_never_mixed_generation"
+    },
+    {
+      "id": "PG-ISSUER-REDUCER",
+      "database": "real_postgresql",
+      "sessions": 2,
+      "race": "issuer_snapshot_vs_exact_reducer_runtime_and_route_intent",
+      "expected": "old_complete_snapshot_or_new_complete_snapshot_never_mixed_lineage"
+    },
+    {
+      "id": "PG-ISSUER-REBIND",
+      "database": "real_postgresql",
+      "sessions": 2,
+      "race": "issuer_snapshot_vs_endpoint_rebind",
+      "expected": "pre_or_post_rebind_exact_fields_with_strictly_new_epoch"
+    },
+    {
+      "id": "PG-ROUTE-APPLY",
+      "database": "real_postgresql",
+      "sessions": 2,
+      "race": "route_controller_apply_vs_reducer_or_issuer",
+      "required_lock_rule": "never_hold_route_intent_then_acquire_cat",
+      "retry_rule": "rollback_and_retry_entire_transaction_from_fresh_snapshot",
+      "expected": "no_deadlock_no_stale_route_resurrection"
+    },
+    {
+      "id": "PG-POLICY-PROMOTE",
+      "database": "real_postgresql",
+      "sessions": 2,
+      "race": "require_idle_receipt_promotion_vs_issuer_or_manual_intent",
+      "required_lock_rule": "cat_first_compare_proposal_current_command_lineage_endpoint_route_and_receipt",
+      "expected": "issuer_sees_old_active_snapshot_or_rejects_post_receipt_and_stale_proposal_never_supersedes_manual_intent"
+    },
+    {
+      "id": "PG-POLICY-MANUAL",
+      "database": "real_postgresql",
+      "sessions": 2,
+      "race": "manual_command_adoption_vs_policy_promotion_or_route_compensation_after_local_revoke",
+      "required_lock_rule": "cat_first_then_same_materialized_route_row_exact_pending_policy_retirement_cas",
+      "winner_a": "adopted_by_command(command_id, receipt_id)_and_compensation_terminal_stale",
+      "winner_b": "compensated_by_route(compensation_intent_id, fresh_epoch)_and_manual_retries_fresh_authority",
+      "retry_rule": "loser_rolls_back_and_replans_entire_transaction_from_fresh_cat_and_route_snapshot",
+      "expected": "one_resolution_owner_no_proposal_receipt_rebinding_no_old_epoch_reactivation"
     }
   ]
 }

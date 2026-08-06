@@ -33,7 +33,7 @@ Workspace、Cat generation、Endpoint、hostname、target Node、route epoch 和
 控制面为一个已发布且 Running 的 Endpoint 签发短期 `Route Grant v1`。它精确绑定：
 
 - normalized hostname、Workspace、Endpoint、Cat；
-- Cat generation、target Node、route epoch；
+- Cat generation（wire 名称；语义上就是 A0 `intent_generation`）、target Node、route epoch；
 - HTTP protocol 与 target port；
 - issuer、audience、grant id、issued-at/not-before/expiry；
 - wire version、Ed25519 algorithm 和 verification-key `kid`。
@@ -68,13 +68,30 @@ B1 的唯一发行入口读取一个 `RouteAuthorizationSnapshot`。V2 issuer �
 3. Endpoint row（稳定 endpoint id 顺序）；
 4. Route row（canonical hostname 顺序）。
 
+`cat_generation` 不是 B 自己的计数器，也不是 runtime ledger 的
+`runtime_generation`；它是 A0 当前 Cat intent 的 `intent_generation` 在 wire 上的冻结名称。
 同一事务必须证明：
 
 - Endpoint、Route 和 Cat 的 Workspace/Cat 外键闭合；
-- `cat_runtime_state` 是 exact reducer 已结算的 `running`，并携带与当前 Cat intent generation
-  一致的 command/dispatch/Node claim/terminal result/runtime identity provenance；
-- 没有能 invalidate 该 Running authority 的 current nonterminal LifecycleCommand，route
-  publication intent 与 materialized active Route 均引用上述 exact settled provenance；
+- `Cat.intent_generation == cat_runtime_state.intent_generation ==
+  reducer_route_intent.intent_generation == materialized_route.intent_generation ==
+  RuntimeRouteAuthorityV1.intent_generation`，并且该值就是 grant 的 `cat_generation`；
+- `cat_runtime_state` 是 exact reducer 已结算的 `running`，且下列 lineage 在
+  `cat_runtime_state`、exact reducer route intent、materialized active Route、Node install ACK 和
+  durable `RuntimeRouteAuthorityV1` 间逐字段相同：`command_id + command_seq`、
+  `dispatch_id + dispatch_seq + request_body_sha256`、`target_node_id`、`node_claim_id`、
+  `result_id`，以及 C 定义的 exact runtime identity（至少 `runtime_id + runtime_generation`，存在时还包括
+  `host_boot_id + guest_boot_id`）；
+- **不存在任何** `authority=current` 的 nonterminal LifecycleCommand；拒签范围是全部 action
+  `start|resume|restore|suspend|warm|cold|destroy|fallback_cold` 与全部 nonterminal phase
+  `planned|preparing|dispatchable|dispatched|accepted|settling|blocked` 的笛卡尔积，而不是只拒绝
+  看起来会 invalidate Running 的 action；
+- auto-suspend 的 `PolicyTransitionProposal` 在 promotion 前不是 Cat intent、LifecycleCommand 或
+  route authority，因此不触发上述 current-command 拒签；issuer 仍可为当前 Running snapshot
+  签发。Node 返回 successful idle-retirement receipt 后，控制面必须在 Cat-first transaction 中
+  ingestion receipt、关闭 exact route admission 并 promotion，之后 issuer 不得再签旧 snapshot；
+- exact reducer route intent、materialized active Route 与 Node ACK 引用同一个 `route_intent_id`
+  和上述 settled lineage；旧 intent 即使创建时有效，也不能在 Cat authority 前进后恢复发布；
 - Cat assignment、Route target Node 和要签发的 `node_id` 完全一致；
 - Route `state = active`，endpoint id/hostname/protocol/port 与 route 一致；
 - Cat generation 与 route epoch 均为正数。
@@ -88,7 +105,10 @@ observation；二者都不得参与 V2 issuer 判断。pre-activation V1 若仍�
 产生一张被 Node 新本地 epoch 拒绝的旧 grant，不能扩大权限。
 
 所有 route mutation 也必须走 Cat-first 锁，不允许保留绕过该边界的直接 `UPDATE routes`。
-A #205 拥有 Cat generation 的递增语义；B 不自行递增或推断 generation。B 拥有 endpoint
+Route Controller 不得先 `FOR UPDATE`/claim route-intent row 再反向获取 Cat；work discovery 与
+apply transaction 必须用 durable 边界拆开，apply 从 fresh authoritative snapshot 按 Cat-first
+顺序重试整个事务。A #205 拥有 intent generation 的递增语义；B 只把它复制为 wire
+`cat_generation`，不自行递增或推断。B 拥有 endpoint
 route epoch，任何 bind、unbind、target port、target Node、generation 或 runtime publication
 变化都必须产生更大的 epoch。
 
@@ -96,16 +116,27 @@ route epoch，任何 bind、unbind、target port、target Node、generation 或 
 
 控制面只有在目标 Node 已 durable 安装相同的 `RuntimeRouteAuthority v1` 并返回带完整 identity
 的 ACK 后，才能把 route 发布为 `active` 并签发 grant。该本地记录至少包含 grant 中所有
-资源绑定字段以及本地 runtime identity。写入必须经过 C #207 的 atomic write + fsync +
+资源绑定字段、`route_intent_id`、完整 settled lineage 和本地 runtime identity；ACK 逐字段回显
+该 lineage，不能只回显 epoch 或一个未定义 canonical bytes 的 digest。写入必须经过 C #207 的
+atomic write + fsync +
 rename + directory fsync 成功门禁；当前 generic runtime ledger 的 best-effort “记日志后继续”
 语义不能用于 route authority。
+
+install 是 exact CAS：请求带 `install_id`、新 epoch/完整 lineage，以及包含旧
+`route_epoch + install_id + route_intent_id + lineage` 的 expected predecessor；空 authority 用显式
+`absent` predecessor。同一 `install_id` 与相同 bytes 可重放并返回同一 ACK；旧 epoch、
+predecessor mismatch、同 epoch 不同 lineage、
+或 lineage 与 C runtime ledger 不同都必须拒绝且不改本地 authority。Agent 重启后必须先从
+durable ledger 重建并逐字段复核；缺失/损坏/mismatch 时停止 admission，不能按 Cat id 或 epoch
+猜测恢复。
 
 每次 Node admission 固定为：
 
 1. 在持有任何 runtime lock 前完成有界 envelope/JSON/签名/时间解析；
 2. 获取与 lifecycle、route-authority update 共用的 per-Cat admission lock；
-3. 在锁内证明本 Node id、Workspace、Endpoint、hostname、Cat、generation、route epoch、
-   protocol、port 与 durable local truth 逐字节一致，并证明 runtime 仍为 `Running`；
+3. 在锁内证明本 Node id、Workspace、Endpoint、hostname、Cat、wire `cat_generation`、route
+   epoch、protocol、port 与 durable local truth 逐字节一致，并证明 local authority 的完整
+   settled lineage 仍与 C runtime ledger 相同、runtime 仍为 `Running`；
 4. 在同一临界区获取 `RuntimeActivityGuard`；quiesce 已开始则拒绝；
 5. 释放锁，目标 Guest IP/socket/port 只从已证明的本地 runtime authority 派生，再建立连接。
 
@@ -116,26 +147,93 @@ revoke、lifecycle quiesce 或 authority transfer 必须按下一节取消并 dr
 
 ### 5. Route publication、revoke 和迁移有明确顺序
 
-正常 activate 顺序是：创建更大 route epoch → Node durable install/ACK → 控制面发布 active
-route → issuer 可见。每个 activity guard 必须登记 exact
-`(cat_id, generation, route_epoch, runtime_identity)` 和 cancellation handle。
+正常 activate 顺序是：消费 A0 exact reducer route intent → 证明旧 volume grant 已 conditional
+invalidate/release 或 writer 已被 A0/A7 fence → 证明 retained volume durability receipt 满足该
+lifecycle action（包括 `R == L`）→ 创建更大 route epoch → Node lineage-CAS durable install/ACK →
+控制面 conditional 发布 active route → issuer 可见。每个 activity guard 必须登记 exact
+`(cat_id, intent_generation, route_epoch, runtime_identity)` 和 cancellation handle。
 
-reachable unbind/rebind/revoke 的顺序是：在 per-Cat admission lock 内 durable advance/revoke
-旧 local authority 并阻止旧 epoch 新 guard → 标记该 authority 的 active guards cancelled →
-锁外关闭 Node↔Guest HTTP/WebSocket/streaming transport 并有界 drain → 重新证明旧 authority
-active guard count 为零 → 持久 ACK → 控制面才可发布变化或把 authority 交给新 runtime。
+reachable unbind/rebind/revoke 使用同一个 per-Cat admission serialization protocol：先 durable
+记录 exact retirement work；锁内把 active authority 置为 `retiring`、阻止旧 epoch 新 guard 并
+冻结 authority revision；锁外以该 revision 持久 CAS revoke；再次锁内确认同一 retirement/revision、
+置为 `revoked` 并标记该 authority 的全部 active guards cancelled；再锁外关闭 Node↔Guest
+HTTP/WebSocket/streaming transport 并有界 drain → 重新证明旧 authority active guard count 为零 →
+持久 ACK → 控制面才可发布变化或把 authority 交给新 runtime。
 drain 超时不是成功；必须保持 transfer blocked，或强制停止/隔离旧 runtime 后取得 fence proof。
 
-若旧 Node 不可达，控制面不能假装已立即撤销离线 capability。必须选择其一：
+离开 Running 的 retirement mode 是 closed enum，不能由调用点随意选择：
+
+- manual Stop/Suspend、Node drain、Destroy 和 operator fence 使用 `cancel_and_drain`：A0 current
+  intent/command 先使 issuer 拒签，再执行上述 revoke/cancel/drain；
+- auto policy 使用 `require_idle`：promotion 前只有非权威、可丢弃/重算的
+  `PolicyTransitionProposal`，issuer 仍可签当前 Running。Node 在同一 per-Cat admission lock 内若
+  `active_guard_count > 0`，必须返回绑定 exact lineage/registry revision 的 busy proof，不 revoke、
+  不 cancel、也不改变 local authority；只有 count 为零时才进入 durable revoke 并产生 receipt。
+
+两种模式都必须在 Guest quiesce、VMM pause/exit、blockd teardown 或写入 lifecycle success result
+**之前**完成其允许的 route retirement。`cancel_and_drain` 会 cancel exact lineage 的全部
+HTTP/WebSocket/streaming guards 再锁外 close/drain 到零；`require_idle` 不得取消用户 work。不得
+持有 mutex guard 跨 await 或在 async executor 上做 fsync；`retiring` 期间 admission fail closed，
+重启也必须先从 durable retirement/NodeJob work 恢复该门再开放 admission。drain timeout 必须保留 Running source
+和 runtime/blockd/writer，lifecycle command 保持 `blocked`；不能先 pause/teardown 再声称
+source-preserved。若后续 lifecycle action 失败而 exact result 证明 Running 被保留，重新发布也要
+走一个新 reducer route intent、新 epoch 和完整 install CAS。
+
+`require_idle` receipt 的 ingestion/promotion transaction 必须比较 proposal、Cat intent、无 current
+command、settled lineage、Endpoint/Route epoch/install id 全部仍是 expected snapshot，然后原子记录
+receipt、把旧 route 标为不再 admission，并交给 A0 acceptance 创建新的 intent/Operation/command。
+若任何字段已前进则 proposal/receipt terminal stale，不得影响新 authority；被 revoke 的旧 local
+authority 只能通过新 epoch/install 恢复。控制面或 Node 在 local revoke 后崩溃时，durable proposal/
+retirement work/result 必须在 issuer/policy recovery 中收敛，不能把旧 authority 静默改回 active。
+
+retirement receipt 的 scope 是 immutable one-of `route_intent | lifecycle_command |
+policy_proposal`，不能转绑。proposal receipt 还生成一个不可猜测、不可复用的 `retirement_token`。
+尤其是：proposal-scoped `require_idle` 已 revoke exact local authority，
+但在控制面 ingestion/promotion 前 manual lifecycle intent/command 先提交时，该 proposal receipt
+只能成为 physical evidence，绝不能直接授权 manual command quiesce。新 command 的 NodeJob 必须在
+A0 authority 中创建 distinct command-scoped `cancel_and_drain` route-retirement work，固定
+`predecessor=retired_by_policy(P, retirement_token)`；Node 再在同一 per-Cat serialization boundary
+创建 command-scoped adoption receipt：逐字段比较已 revoke 的
+old install/route epoch/settled lineage、proposal receipt、current command/dispatch authority 和零
+guard，保持 local authority 为 revoked、不恢复旧 epoch，再持久化 exact
+`predecessor=retired_by_policy(P, retirement_token)` 与
+`outcome=adopted_retired_predecessor`。auto proposal 成功 promotion 后生成的 command 也适用；没有
+自己的 command-scoped receipt，任何 command 都不能 Guest quiesce 或成功 settle。
+
+compensation ownership 采用唯一 CAS，避免两个控制器抢着“修复”。Node 上 receipt creation 仍由
+per-Cat serialization boundary 串行；控制面 ingestion 时，command adoption 与 Route compensation
+必须在 Cat-first transaction 中锁定同一 materialized Route row，并对
+`pending_policy_retirement(P, retirement_token, old_epoch, old_install, old_lineage)` 做条件更新：adoption
+写 `adopted_by_command(command_id, receipt_id)`，compensation 写
+`compensated_by_route(compensation_intent_id, new_epoch)`。只有一个能成功。adoption 赢时由 A0
+lifecycle 独占后续；无 current command 且 proposal 仍可 promotion 时由 policy controller 独占重试；
+proposal 已 terminal 且 Cat 仍是 exact same Running lineage 时才由 B Route Controller 持久
+`RouteRetirementCompensationIntent`，引用原 reducer route intent/receipt，以更大 route epoch 重新
+install/publish。compensation intent 的 eligible discovery/creation 与 apply 是 durable boundary，
+所以它可能在随后 manual command acceptance 后才与 adoption 争用 Route-row CAS。compensation 先赢
+时，任何针对 retired predecessor 的 manual adoption 都 terminal
+stale，manual command 必须从 fresh epoch/authority 重规划并重试；若 Cat/route 已前进则当前 authority
+owner 胜出，旧 revoked record 只可清理。任何路径都禁止把旧 epoch/local record 原地改回 active。
+
+若旧 Node 不可达，必须分开证明两个不同的门：
+
+1. **route-admission retirement gate**：控制面不能假装已立即撤销离线 capability，必须选择其一：
 
 - 通过云 API、BMC、电源或网络隔离等外部 fence proof，证明旧 Node/runtime 不可能继续服务；或
 - 在等待最后 grant 的 `MAX_LIFETIME + MAX_CLOCK_SKEW` 之外，再取得独立可信的“旧 authority
   active session 为零且 runtime 已不可服务”证明。
 
 单纯等待 125 秒只耗尽**新 admission**，不能结束一条已经建立、可能恶意或卡死且仍持有 guard
-的 WebSocket/streaming HTTP；它绝不是 authority transfer proof。heartbeat 缺报、Gateway cache
-purge 或控制面计时器也都不能证明旧数据面静默。需要 revoke/transfer 时必须完成 reachable
-cancel-and-drain 或外部 fence；否则保持 blocked。
+的 WebSocket/streaming HTTP；它绝不是 route retirement proof。heartbeat 缺报、Gateway cache
+purge 或控制面计时器也都不能证明旧数据面静默。
+
+2. **writer/new-publication gate**：即使 route-admission gate 已由“TTL + 独立 zero-session +
+   non-serving”关闭，它也绝不替代 A0/A7 的 volume grant invalidation、writer/Host fence 和
+   durability proof。发布任何新 runtime/route 仍必须同时持有 exact reducer route intent、旧 grant
+   的 conditional invalidation/release receipt 或外部 writer fence receipt，以及所需 remote
+   durability receipt；writer state unknown、旧 grant 仍 acquired、或 retained volume `L > R` 时
+   一律保持 blocked。只有能够同时证明 runtime 不再服务和旧 writer 不再写入的外部 fence，才可
+   作为两个门的共同证据。
 
 ### 6. 时间窗口有界，时钟不健康时停止新准入
 
@@ -225,7 +323,7 @@ expiry bucket，但不得记录可重放 token。
 
 | 边界 | Owner | B 的依赖/承诺 |
 |---|---|---|
-| Cat generation 与 lifecycle supersession | A #205 | 只读取并精确绑定，不自行递增 |
+| A0 intent generation 与 lifecycle supersession | A #205 | wire `cat_generation` 逐值等于 `intent_generation`；只读取并精确绑定，不自行递增 |
 | Atomic route snapshot、epoch、issuer | B1 #217 | 实现本文 Cat-first 事务与 signer |
 | Durable Node runtime/route truth、admission lock | C #207 + B2 #218 | C 提供 durability/identity container；B 拥有 route 字段和比对语义 |
 | Gateway cache/outage/HTTP/WS | B3 #219 | 一个状态机，不叠加零散 fallback |
@@ -261,14 +359,33 @@ registry 与版本化 key ring；部署和 cancel/drain/fence 顺序都成为安
 
 - B0 固定向量必须被 issuer、Gateway parser 和 Node verifier 的实现共同消费，且由独立实现
   验证签名和 canonical bytes。
+- positive issuer snapshot 必须逐字段闭合 Cat intent、settled runtime、exact reducer route intent、
+  materialized Route、Node install ACK/local authority 的 generation 与完整
+  command/dispatch/claim/result/runtime lineage；任一字段单点 mutation 都拒签/拒绝 admission。
+- 任意 kind/任意 nonterminal phase（含 `blocked`）的 current LifecycleCommand 都使 issuer 拒签；
+  8×7 矩阵必须完整展开执行。
 - wrong host/Workspace/Endpoint/Cat/generation/Node/epoch/protocol/port、expiry/skew、unknown
   version/alg/kid/claim、duplicate claim、malformed base64/JSON、tamper 与 non-canonical Ed25519
   signature 全部 deterministic fail closed。
 - 真正停止 control plane 与数据库时，缓存窗口内 Running HTTP 和新 WebSocket 可建立；到期
   后新 admission 失败，已有 WebSocket 保持。
-- reachable route revoke 必须取消旧 epoch active WebSocket/streaming HTTP、drain guard 至零后
-  才允许新 authority；drain 超时保持 blocked。
+- manual/Drain/Destroy 等 `cancel_and_drain` action 必须取消旧 epoch active
+  HTTP/WebSocket/streaming guard、drain 至零并持久 receipt 后，才能 Guest quiesce/VMM/blockd
+  teardown/写 success result；drain 超时保留 Running source 和 writer，command 保持 blocked。
+- auto policy 必须用 `require_idle`：active HTTP/WS 返回 busy
+  proof 且不 cancel、不 revoke、不创建 generation/command，零 guard 才 durable revoke/receipt 并按
+  exact snapshot promotion。Node/控制面在 revoke/receipt/promotion 边界崩溃必须 fail closed recovery。
+- policy local revoke 后、promotion 前提交 manual command 的竞态必须生成 distinct command-scoped
+  `cancel_and_drain` work 与 receipt，其 exact predecessor/outcome 为
+  `retired_by_policy(P, retirement_token)` /
+  `adopted_retired_predecessor`；command adoption 与 Route compensation 在同一 Route row 做唯一
+  CAS。compensation 先赢时 manual 必须从 fresh epoch/authority 重规划，任何路径都不得原地恢复旧
+  epoch。
 - unreachable Node 即使经过 125 秒，只要没有外部 fence 或独立的 zero-session + non-serving
-  proof，authority transfer 仍必须失败；取得 fence proof 后才能继续。
+  proof，route-admission retirement 仍必须失败；即使该门已满足，没有 exact reducer route intent、
+  旧 grant invalidation/writer fence 和 durability receipt 也不得发布新 route。
+- 真实 PostgreSQL 两 session 必须覆盖 issuer vs intent/current command、reducer route intent、
+  endpoint rebind、Route Controller apply 与 policy-retirement adoption vs compensation；禁止
+  route-intent-first 反向锁 Cat，serialization/deadlock 必须从 fresh snapshot 重试整个事务。
 - migration、key rotation、clock skew、Agent replacement、Suspend race 和 route rebind 必须
   在 V2 cohort 两条 block path 上留下 authoritative evidence。
