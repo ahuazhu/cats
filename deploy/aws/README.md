@@ -81,7 +81,13 @@ debootstrapped Ubuntu filesystem. Changes to those parts of
 `OUT=/opt/cats/guest metal/build-guest-image.sh`, followed by a worker restart;
 the Guest kernel is the Host's own, which is why the complete boot artifact is
 not built in CI. `metal/install-worker.sh` remains a bootstrap/development
-helper. Cloud Hypervisor stays under `/opt/cats/bin` so it does not replace a
+helper. It requires `CATS_ROUTE_GRANT_PUBLIC_KEY_FILE` to point at the reviewed
+Ed25519 public key before it changes packages, installed files or services; for
+example, run `sudo CATS_ROUTE_GRANT_PUBLIC_KEY_FILE=/secure/path/public.pem
+deploy/aws/metal/install-worker.sh`. The helper validates and stages that key,
+then installs it as root-owned mode `0644` at
+`/etc/cats/route-grant-public.pem` before enabling `cats-worker`, whether or not
+`worker.env` already exists. Cloud Hypervisor stays under `/opt/cats/bin` so it does not replace a
 host-wide binary used by another workload. The S3 adapter uses the EC2
 instance role and refreshes its temporary credentials; no long-lived AWS key is
 stored in `worker.env`.

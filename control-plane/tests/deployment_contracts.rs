@@ -1289,6 +1289,53 @@ fn noninteractive_worker_bootstrap_defines_root_home_before_toolchain_use() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn worker_bootstrap_validates_and_installs_its_route_grant_key_before_mutation() {
+    let script = read_workspace_file("deploy/aws/metal/install-worker.sh");
+    let required = script
+        .find("CATS_ROUTE_GRANT_PUBLIC_KEY_FILE is required")
+        .expect("required Route Grant key input");
+    let validator = script
+        .find("validate-route-grant-public-key.sh")
+        .expect("cryptographic Route Grant key validator");
+    let first_package_mutation = script.find("apt-get update -q").expect("package mutation");
+    let key_install = script
+        .find("install -o root -g root -m 0644 \"$ROUTE_GRANT_PUBLIC_KEY_STAGE\"")
+        .expect("root-owned Route Grant key install");
+    let key_destination = script
+        .find("/etc/cats/route-grant-public.pem")
+        .expect("service Route Grant key path");
+    let environment_branch = script
+        .find("if [[ -f /etc/cats/worker.env ]]")
+        .expect("existing worker.env branch");
+    assert!(
+        required < validator
+            && validator < first_package_mutation
+            && key_install <= key_destination
+            && key_destination < environment_branch,
+        "missing/malformed key input must fail before package/file/service mutation, and a valid key must be installed before either worker.env branch"
+    );
+    assert!(script.contains("trap cleanup_route_grant_key EXIT"));
+
+    let validator = workspace_root().join("deploy/aws/metal/validate-route-grant-public-key.sh");
+    let valid = Command::new(&validator)
+        .arg(workspace_root().join("tests/fixtures/route_grant_public_ed25519.pem"))
+        .output()
+        .expect("validate Ed25519 public fixture");
+    assert!(valid.status.success());
+    for invalid in [
+        "tests/fixtures/route_grant_private_ed25519.pem",
+        "Cargo.toml",
+    ] {
+        let output = Command::new(&validator)
+            .arg(workspace_root().join(invalid))
+            .output()
+            .unwrap_or_else(|error| panic!("validate {invalid}: {error}"));
+        assert!(!output.status.success(), "accepted invalid key {invalid}");
+    }
+}
+
 #[test]
 fn production_deploy_detaches_the_legacy_control_volume_after_plan_and_before_apply() {
     let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
