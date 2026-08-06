@@ -1,0 +1,33 @@
+{
+  "schema": "cats.qualification.append-receipts/v1",
+  "run_id": "run-20260806-001",
+  "window_id": "window-001",
+  "trial_id": "trial-sto-strict-004-001",
+  "ledger_authority_key_id": "qualification-append-ledger-v1",
+  "receipts": [
+    {"ledger_sequence":1,"event_id":"event-run-bound","event_record_sha256":"018b2d5d8de538b412c591d91409e6d3ac326e1f305b6759c367fbb1c7d46351","actor_identity_id":"identity-controller","actor_session_id":"session-controller","actor_credential_fingerprint_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    {"ledger_sequence":2,"event_id":"event-trial-scheduled","event_record_sha256":"691004036599d4a701af55301c66b21d0c66ce41c256ffd9550da38a42b196bb","actor_identity_id":"identity-controller","actor_session_id":"session-controller","actor_credential_fingerprint_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    {"ledger_sequence":3,"event_id":"event-recovery-intent","event_record_sha256":"6fe5f71a98ef82539c9d3eca98d8a590299a470fcc62834816ca69c87f62a879","actor_identity_id":"identity-recovery","actor_session_id":"session-recovery","actor_credential_fingerprint_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+    {"ledger_sequence":4,"event_id":"event-mutation-started","event_record_sha256":"c8c491e19c958dd2c0b7539cee122a810dd940caba132b8d84a7f4b010bc16de","actor_identity_id":"identity-fault","actor_session_id":"session-fault","actor_credential_fingerprint_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+    {"ledger_sequence":5,"event_id":"event-observation","event_record_sha256":"dda131ab35777b8447a81066944273adc6affba4345f0b341c38ea88df98f448","actor_identity_id":"identity-observer","actor_session_id":"session-observer","actor_credential_fingerprint_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
+    {"ledger_sequence":6,"event_id":"event-fault-ended","event_record_sha256":"1f98999a0e01ec2495cfa924b3cd90058536ec4578b7da0153d11d0e7c9fa722","actor_identity_id":"identity-fault","actor_session_id":"session-fault","actor_credential_fingerprint_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+    {"ledger_sequence":7,"event_id":"event-recovery-recorded","event_record_sha256":"c302f85a803f30a0c3d973df2a1d5869e917bf5be243fe8c8da9b21a0d7dfe0c","actor_identity_id":"identity-recovery","actor_session_id":"session-recovery","actor_credential_fingerprint_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+    {"ledger_sequence":8,"event_id":"event-cleanup-recorded","event_record_sha256":"320b982a8c5a70313086ad97d605c061e919f7c740333022163a164299d75a0c","actor_identity_id":"identity-recovery","actor_session_id":"session-recovery","actor_credential_fingerprint_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+    {"ledger_sequence":9,"event_id":"event-seal-timeline","event_record_sha256":"8c0827f57e0089e1b5e8f40ef211f884b9aa11081a34ce681507f1dcf51e81f5","actor_identity_id":"identity-observer","actor_session_id":"session-observer","actor_credential_fingerprint_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
+    {"ledger_sequence":10,"event_id":"event-seal-oracle","event_record_sha256":"efec4b8d571b6edabc0bfb134de9459fcb11fdf40917f38be961fd03fb126dda","actor_identity_id":"identity-observer","actor_session_id":"session-observer","actor_credential_fingerprint_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
+    {"ledger_sequence":11,"event_id":"event-seal-storage","event_record_sha256":"612f4b0c7b2466a00dd60bfcf84a0d1dcdcd56be81fe63ac092352b4c8184a3b","actor_identity_id":"identity-observer","actor_session_id":"session-observer","actor_credential_fingerprint_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
+    {"ledger_sequence":12,"event_id":"event-verify-timeline","event_record_sha256":"a79bd5cbdaa51a764a1a9392a3980db43445605634d641ee985c2de533ffa21f","actor_identity_id":"identity-verifier","actor_session_id":"session-verifier","actor_credential_fingerprint_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},
+    {"ledger_sequence":13,"event_id":"event-verify-oracle","event_record_sha256":"9835ad7a275e420719bcb278982b038d51000577459ad28e7ee88e513161bd58","actor_identity_id":"identity-verifier","actor_session_id":"session-verifier","actor_credential_fingerprint_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},
+    {"ledger_sequence":14,"event_id":"event-verify-storage","event_record_sha256":"09295916d44e9852f5a83344bdfa6ef785096accad690539200c6701b4fdad41","actor_identity_id":"identity-verifier","actor_session_id":"session-verifier","actor_credential_fingerprint_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},
+    {"ledger_sequence":15,"event_id":"event-terminal","event_record_sha256":"7cd3bc672c1249666efd3103414c6dd9749f8faf78760fa7c434213b651fdfc1","actor_identity_id":"identity-verifier","actor_session_id":"session-verifier","actor_credential_fingerprint_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}
+  ],
+  "checkpoint": {
+    "event_count": 15,
+    "first_ledger_sequence": 1,
+    "last_ledger_sequence": 15,
+    "ledger_root_sha256": "b9c900b25940a5f76addea8244386d5366d12ae7370fd7ca565fa9cedbe78e69",
+    "previous_checkpoint_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "signed_at": "2026-08-06T00:00:15Z",
+    "signature_ed25519": "2621e36c3e053f53fc8a22fef27853693a44825db38e9d50b12cd2d2a34a432f3dc14a47e66cdd7cdc1d8559a6934faf7268c7b606ca564d935869db5c12b709"
+  }
+}

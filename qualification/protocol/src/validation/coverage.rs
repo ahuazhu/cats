@@ -1,18 +1,23 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    CasePhase, CoverageEntry, CoverageLedger, CoveragePhase, PhaseOutcome, PlannedTrial,
-    TerminalOutcome, TrialPlan, TrialRecord, COVERAGE_SCHEMA, TRIAL_PLAN_SCHEMA,
+    AuthorityTrustAnchors, CasePhase, CoverageEntry, CoverageLedger, CoveragePhase, PhaseOutcome,
+    PlannedTrial, TerminalOutcome, TrialDocument, TrialPlan, TrialRecord, COVERAGE_SCHEMA,
+    TRIAL_PLAN_SCHEMA,
 };
 
 use super::{
+    authority::validate_actor_authority,
     catalog::validate_catalog,
+    environment::validate_execution_environment,
     primitive::{
-        document_sha256, is_scoped_id, require, require_digest, validate_binding, ValidationError,
+        document_sha256, is_scoped_id, parse_bounded_json, require, require_digest,
+        validate_binding, ValidationError,
     },
     trial::validate_trial_record,
     AWS_PERFORMANCE_CASE_COUNT, COST_OBSERVATION_CASE_COUNT, FUNCTIONAL_CASE_COUNT,
-    RELEASE_REQUIRED_CASE_COUNT,
+    MAX_EVIDENCE_PER_TRIAL, MAX_TRIAL_DOCUMENTS, MAX_TRIAL_DOCUMENT_BYTES,
+    MAX_TRIAL_PLAN_DOCUMENT_BYTES,
 };
 
 pub fn validate_coverage_ledger(
@@ -20,7 +25,9 @@ pub fn validate_coverage_ledger(
     catalog: &crate::Catalog,
     catalog_digest: &str,
     trial_plan_bytes: &[u8],
-    trial_documents: &[&[u8]],
+    trial_documents: &[TrialDocument<'_>],
+    actor_authority_manifest_bytes: &[u8],
+    trust: &AuthorityTrustAnchors<'_>,
 ) -> Result<(), ValidationError> {
     validate_catalog(catalog)?;
     require_digest(catalog_digest, "actual catalog sha256")?;
@@ -32,6 +39,11 @@ pub fn validate_coverage_ledger(
     require(
         ledger.binding.catalog_sha256 == catalog_digest,
         "coverage ledger catalog digest does not match the catalog bytes",
+    )?;
+    validate_actor_authority(actor_authority_manifest_bytes, &ledger.binding, trust)?;
+    require(
+        trial_documents.len() <= MAX_TRIAL_DOCUMENTS,
+        "trial document count exceeds the protocol cap",
     )?;
 
     let expected_total = phase_total(ledger.phase);
@@ -54,21 +66,24 @@ pub fn validate_coverage_ledger(
         .map(|case| case.id.as_str())
         .collect();
     let plan = validate_trial_plan(ledger, catalog, catalog_digest, trial_plan_bytes)?;
-    let relevant_plan: Vec<&PlannedTrial> = plan
-        .planned_trials
-        .iter()
-        .filter(|planned| expected_ids.contains(planned.case_id.as_str()))
-        .collect();
     require(
-        trial_documents.len() == relevant_plan.len(),
+        plan.planned_trials
+            .iter()
+            .all(|planned| expected_ids.contains(planned.case_id.as_str())),
+        "phase trial plan contains a case from another phase",
+    )?;
+    require(
+        trial_documents.len() == plan.planned_trials.len(),
         "trial bundle must contain every and only phase-relevant planned trial",
     )?;
     let resolved = resolve_trials(
         ledger,
         catalog,
         catalog_digest,
-        &relevant_plan,
+        &plan.planned_trials,
         trial_documents,
+        actor_authority_manifest_bytes,
+        trust,
     )?;
 
     let mut seen = HashSet::new();
@@ -121,8 +136,7 @@ fn validate_trial_plan(
         document_sha256(bytes) == ledger.binding.trial_plan_sha256,
         "trial plan bytes do not match the run binding",
     )?;
-    let plan: TrialPlan = serde_json::from_slice(bytes)
-        .map_err(|error| ValidationError::new(format!("invalid trial plan JSON: {error}")))?;
+    let plan: TrialPlan = parse_bounded_json(bytes, MAX_TRIAL_PLAN_DOCUMENT_BYTES, "trial plan")?;
     require(
         plan.schema == TRIAL_PLAN_SCHEMA,
         "unsupported trial-plan schema",
@@ -135,7 +149,15 @@ fn validate_trial_plan(
         plan.catalog_sha256 == catalog_digest,
         "trial plan catalog digest mismatch",
     )?;
-    let catalog_ids: HashSet<&str> = catalog.cases.iter().map(|case| case.id.as_str()).collect();
+    require(
+        plan.planned_trials.len() <= MAX_TRIAL_DOCUMENTS,
+        "trial plan exceeds the protocol case cap",
+    )?;
+    let cases: HashMap<&str, &crate::CaseContract> = catalog
+        .cases
+        .iter()
+        .map(|case| (case.id.as_str(), case))
+        .collect();
     let mut trial_ids = HashSet::new();
     let mut case_ids = HashSet::new();
     for (index, planned) in plan.planned_trials.iter().enumerate() {
@@ -148,39 +170,58 @@ fn validate_trial_plan(
             trial_ids.insert(planned.trial_id.as_str()),
             "duplicate trial_id in trial plan",
         )?;
-        require(
-            catalog_ids.contains(planned.case_id.as_str()),
-            "trial plan contains a case outside the bound catalog",
-        )?;
+        let case = cases
+            .get(planned.case_id.as_str())
+            .copied()
+            .ok_or_else(|| ValidationError::new("trial plan contains a case outside catalog"))?;
         require(
             case_ids.insert(planned.case_id.as_str()),
             "V1 permits exactly one authoritative trial per case",
         )?;
+        validate_execution_environment(&planned.environment, case)?;
     }
     Ok(plan)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_trials(
     ledger: &CoverageLedger,
     catalog: &crate::Catalog,
     catalog_digest: &str,
-    planned: &[&PlannedTrial],
-    documents: &[&[u8]],
+    planned: &[PlannedTrial],
+    documents: &[TrialDocument<'_>],
+    actor_authority_manifest_bytes: &[u8],
+    trust: &AuthorityTrustAnchors<'_>,
 ) -> Result<HashMap<String, (String, TrialRecord)>, ValidationError> {
     let mut resolved = HashMap::new();
-    for (planned, bytes) in planned.iter().zip(documents) {
-        let record: TrialRecord = serde_json::from_slice(bytes)
-            .map_err(|error| ValidationError::new(format!("invalid trial record JSON: {error}")))?;
-        validate_trial_record(&record, catalog, catalog_digest)?;
+    for (planned, document) in planned.iter().zip(documents) {
+        let record: TrialRecord = parse_bounded_json(
+            document.trial_bytes,
+            MAX_TRIAL_DOCUMENT_BYTES,
+            "trial record",
+        )?;
+        validate_trial_record(
+            &record,
+            catalog,
+            catalog_digest,
+            actor_authority_manifest_bytes,
+            document.append_receipts_bytes,
+            trust,
+        )?;
         require(
             record.binding == ledger.binding,
             "trial and coverage RunBinding differ",
         )?;
         require(
-            record.trial_id == planned.trial_id && record.case_id == planned.case_id,
-            "trial document order/identity differs from authoritative trial plan",
+            record.trial_id == planned.trial_id
+                && record.case_id == planned.case_id
+                && record.environment == planned.environment,
+            "trial document order/identity/environment differs from authoritative trial plan",
         )?;
-        let previous = resolved.insert(record.case_id.clone(), (document_sha256(bytes), record));
+        let previous = resolved.insert(
+            record.case_id.clone(),
+            (document_sha256(document.trial_bytes), record),
+        );
         require(previous.is_none(), "duplicate trial document for case")?;
     }
     Ok(resolved)
@@ -191,8 +232,9 @@ fn validate_entry(
     resolved: Option<&(String, TrialRecord)>,
 ) -> Result<(), ValidationError> {
     require(
-        entry.evidence_ids.iter().all(|id| is_scoped_id(id)),
-        "coverage entry contains invalid evidence id",
+        entry.evidence_ids.len() <= MAX_EVIDENCE_PER_TRIAL
+            && entry.evidence_ids.iter().all(|id| is_scoped_id(id)),
+        "coverage entry contains invalid or excessive evidence ids",
     )?;
     let Some((digest, trial)) = resolved else {
         return require(
@@ -232,7 +274,6 @@ fn phase_total(phase: CoveragePhase) -> usize {
     match phase {
         CoveragePhase::Functional => FUNCTIONAL_CASE_COUNT,
         CoveragePhase::AwsPerformance => AWS_PERFORMANCE_CASE_COUNT,
-        CoveragePhase::ReleaseRequired => RELEASE_REQUIRED_CASE_COUNT,
         CoveragePhase::CostObservation => COST_OBSERVATION_CASE_COUNT,
     }
 }
@@ -241,9 +282,6 @@ fn belongs(case: CasePhase, phase: CoveragePhase) -> bool {
     match phase {
         CoveragePhase::Functional => case == CasePhase::Functional,
         CoveragePhase::AwsPerformance => case == CasePhase::AwsPerformance,
-        CoveragePhase::ReleaseRequired => {
-            matches!(case, CasePhase::Functional | CasePhase::AwsPerformance)
-        }
         CoveragePhase::CostObservation => case == CasePhase::CostObservation,
     }
 }

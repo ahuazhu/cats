@@ -3,7 +3,10 @@ use std::collections::HashSet;
 use crate::{CasePhase, Catalog, EnvironmentProfile, Priority, CATALOG_SCHEMA};
 
 use super::{
-    primitive::{is_case_id, is_lower_hex, require, require_digest, ValidationError},
+    environment::selected_profile,
+    primitive::{
+        is_case_id, is_lower_hex, require, require_bounded_text, require_digest, ValidationError,
+    },
     AWS_PERFORMANCE_CASE_COUNT, COST_OBSERVATION_CASE_COUNT, FUNCTIONAL_CASE_COUNT,
     RELEASE_REQUIRED_CASE_COUNT, TOTAL_CASE_COUNT,
 };
@@ -47,6 +50,7 @@ pub fn validate_catalog(catalog: &Catalog) -> Result<(), ValidationError> {
         !catalog.forbidden_oracle.trim().is_empty(),
         "catalog must define its forbidden oracle",
     )?;
+    require_bounded_text(&catalog.forbidden_oracle, "catalog forbidden oracle")?;
     require(
         catalog.cases.len() == TOTAL_CASE_COUNT,
         "catalog must contain exactly 114 cases",
@@ -70,26 +74,44 @@ pub fn validate_catalog(catalog: &Catalog) -> Result<(), ValidationError> {
             !case.title.trim().is_empty(),
             format!("{} has no title", case.id),
         )?;
+        require_bounded_text(&case.title, "catalog case title")?;
         require(
             !case.suite.trim().is_empty(),
             format!("{} has no suite", case.id),
         )?;
+        require_bounded_text(&case.suite, "catalog case suite")?;
         require(
             !case.environment_profiles.is_empty(),
             format!("{} has no environment profile", case.id),
         )?;
         require(
-            !case.sources.is_empty(),
-            format!("{} has no source", case.id),
+            !case.sources.is_empty() && case.sources.len() <= 16,
+            format!("{} has no source or too many sources", case.id),
         )?;
+        for source in &case.sources {
+            require_bounded_text(source, "catalog case source")?;
+        }
         require(
             !case.oracle_owner.trim().is_empty(),
             format!("{} has no oracle owner", case.id),
         )?;
+        require_bounded_text(&case.oracle_owner, "catalog oracle owner")?;
         require(
             !case.independent_oracle.trim().is_empty(),
             format!("{} has no independent oracle", case.id),
         )?;
+        require_bounded_text(&case.independent_oracle, "catalog independent oracle")?;
+        require(
+            case.environment_profiles.len() <= 4,
+            format!("{} has too many environment profiles", case.id),
+        )?;
+        require(
+            case.required_evidence_kinds.len() <= 32,
+            format!("{} has too many required evidence kinds", case.id),
+        )?;
+        for kind in &case.required_evidence_kinds {
+            require_bounded_text(kind, "catalog evidence kind")?;
+        }
         let evidence: HashSet<&str> = case
             .required_evidence_kinds
             .iter()
@@ -148,6 +170,7 @@ pub fn validate_catalog(catalog: &Catalog) -> Result<(), ValidationError> {
                 cost_observation += 1;
             }
         }
+        selected_profile(case)?;
     }
     require(
         functional == FUNCTIONAL_CASE_COUNT,
@@ -165,6 +188,25 @@ pub fn validate_catalog(catalog: &Catalog) -> Result<(), ValidationError> {
 
 fn validate_provenance(catalog: &Catalog) -> Result<(), ValidationError> {
     let provenance = &catalog.migration_provenance;
+    require_bounded_text(&provenance.source_ref, "catalog migration source ref")?;
+    require_bounded_text(
+        &provenance.functional_selection_policy,
+        "catalog functional selection policy",
+    )?;
+    require(
+        provenance.aws_performance_case_ids.len() == AWS_PERFORMANCE_CASE_COUNT,
+        "catalog migration AWS-P id count changed",
+    )?;
+    for case_id in &provenance.aws_performance_case_ids {
+        require(
+            is_case_id(case_id),
+            "catalog migration contains an invalid AWS-P case id",
+        )?;
+    }
+    require(
+        is_case_id(&provenance.cost_observation_case_id),
+        "catalog migration cost case id is invalid",
+    )?;
     require(
         provenance.source_ref == SOURCE_REF,
         "catalog migration source ref changed",

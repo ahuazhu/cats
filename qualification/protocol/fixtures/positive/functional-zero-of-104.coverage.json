@@ -1,6 +1,6 @@
 {
   "schema": "cats.qualification.coverage-ledger/v1",
-  "binding": {"run_id":"run-20260806-zero","candidate_commit_sha":"d0658064764ee5d77430662fdc8f4c7fda120189","source_chain_verdict_sha256":"1111111111111111111111111111111111111111111111111111111111111111","artifact_manifest_sha256":"2222222222222222222222222222222222222222222222222222222222222222","environment_id":"qualification-cell-001","environment_manifest_sha256":"3333333333333333333333333333333333333333333333333333333333333333","environment_is_production":false,"protocol_version":1,"catalog_sha256":"0e496d3b18202e1c9b4daf9047cfcc9633d66a321cafa86fd0a28e68faf96a2d","controller_commit_sha":"d0658064764ee5d77430662fdc8f4c7fda120189","trial_plan_sha256":"5cdeda14f05f672e1714c8f63564cbf7ed90eef6c4fe3744b6a03d4cbabde5e0"},
+  "binding": {"run_id":"run-20260806-001","candidate_commit_sha":"d0658064764ee5d77430662fdc8f4c7fda120189","source_chain_verdict_sha256":"1111111111111111111111111111111111111111111111111111111111111111","artifact_manifest_sha256":"2222222222222222222222222222222222222222222222222222222222222222","protocol_version":1,"catalog_sha256":"0e496d3b18202e1c9b4daf9047cfcc9633d66a321cafa86fd0a28e68faf96a2d","controller_commit_sha":"d0658064764ee5d77430662fdc8f4c7fda120189","trial_plan_sha256":"e856b1ab759a386844cdfc58dcbc45c2de3d7208f758f12de7084c78505f2b44","actor_authority_manifest_sha256":"535b801f034c742d5eaa2589ab9b8d0b13e95321b3c7158243594c161e3bb72b"},
   "phase": "functional",
   "expected_total": 104,
   "entries": [
@@ -111,4 +111,3 @@
   ],
   "phase_outcome": "incomplete"
 }
-

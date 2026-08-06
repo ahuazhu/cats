@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{ActorRole, EventKind, SecretScanStatus, TrialEvent, TrialRecord};
+use crate::{ActorIdentity, ActorRole, EventKind, SecretScanStatus, TrialEvent, TrialRecord};
 
-use super::{
-    super::primitive::{is_scoped_id, require, require_digest, ValidationError},
-    events::identity_for_role,
+use super::super::{
+    authority::identity_for_role,
+    primitive::{is_scoped_id, require, require_bounded_text, require_digest, ValidationError},
 };
 
 const MAX_EVIDENCE_BYTES: u64 = 1_073_741_824;
@@ -12,8 +12,13 @@ const MAX_EVIDENCE_BYTES: u64 = 1_073_741_824;
 pub(super) fn validate_evidence(
     record: &TrialRecord,
     required_kinds: &[String],
+    actors: &[ActorIdentity],
 ) -> Result<(), ValidationError> {
     require(!record.evidence.is_empty(), "trial has no sealed evidence")?;
+    require(
+        record.evidence.len() <= super::super::MAX_EVIDENCE_PER_TRIAL,
+        "trial evidence count exceeds its protocol cap",
+    )?;
     let events: HashMap<&str, &TrialEvent> = record
         .events
         .iter()
@@ -24,8 +29,8 @@ pub(super) fn validate_evidence(
         .iter()
         .map(|event| event.ledger_sequence)
         .collect();
-    let observer_id = identity_for_role(record, ActorRole::Observer)?;
-    let verifier_id = identity_for_role(record, ActorRole::Verifier)?;
+    let observer_id = identity_for_role(actors, ActorRole::Observer)?;
+    let verifier_id = identity_for_role(actors, ActorRole::Verifier)?;
     let terminal_sequence = record
         .events
         .last()
@@ -67,11 +72,8 @@ pub(super) fn validate_evidence(
             evidence.producer_identity_id == observer_id,
             "raw evidence must be produced by observer",
         )?;
-        require(!evidence.kind.trim().is_empty(), "evidence kind is empty")?;
-        require(
-            !evidence.media_type.trim().is_empty(),
-            "evidence media_type is empty",
-        )?;
+        require_bounded_text(&evidence.kind, "evidence kind")?;
+        require_bounded_text(&evidence.media_type, "evidence media_type")?;
         require_digest(&evidence.sha256, "evidence sha256")?;
         require(
             evidence.immutable_locator == format!("urn:sha256:{}", evidence.sha256),

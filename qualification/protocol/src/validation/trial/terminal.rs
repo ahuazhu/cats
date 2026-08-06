@@ -1,16 +1,16 @@
 use std::collections::HashSet;
 
 use crate::{
-    ActorRole, EventKind, ObservationExpectation, ObservationState, TerminalOutcome, TrialEvent,
-    TrialRecord,
+    ActorIdentity, ActorRole, EventKind, EvidenceObject, ObservationExpectation, ObservationState,
+    TerminalOutcome, TrialEvent, TrialRecord,
 };
 
 use super::{
+    super::authority::identity_for_role,
     super::primitive::{
-        is_scoped_id, observation_record_sha256, require, require_digest, terminal_record_sha256,
-        validate_blocker, ValidationError,
+        is_scoped_id, observation_record_sha256, require, require_bounded_text, require_digest,
+        terminal_record_sha256, validate_blocker, ValidationError,
     },
-    events::identity_for_role,
 };
 
 pub(super) fn validate_observation(record: &TrialRecord) -> Result<(), ValidationError> {
@@ -52,8 +52,10 @@ pub(super) fn validate_observation(record: &TrialRecord) -> Result<(), Validatio
         _ => {
             require(
                 observation.calibration_event_id.is_none()
-                    && observation.known_positive_event_id.is_none(),
-                "only observed-empty may reference calibration events",
+                    && observation.known_positive_event_id.is_none()
+                    && observation.calibration_evidence_id.is_none()
+                    && observation.known_positive_evidence_id.is_none(),
+                "only observed-empty may reference calibration events/evidence",
             )?;
             require(
                 record.events.iter().all(|event| {
@@ -68,17 +70,17 @@ pub(super) fn validate_observation(record: &TrialRecord) -> Result<(), Validatio
     }
 }
 
-pub(super) fn validate_terminal(record: &TrialRecord) -> Result<(), ValidationError> {
+pub(super) fn validate_terminal(
+    record: &TrialRecord,
+    actors: &[ActorIdentity],
+) -> Result<(), ValidationError> {
     require(
         is_scoped_id(&record.terminal.terminal_id),
         "invalid terminal_id",
     )?;
-    require(
-        !record.terminal.summary.trim().is_empty(),
-        "terminal summary is empty",
-    )?;
+    require_bounded_text(&record.terminal.summary, "terminal summary")?;
     require_digest(&record.terminal.record_sha256, "terminal record sha256")?;
-    let verifier_id = identity_for_role(record, ActorRole::Verifier)?;
+    let verifier_id = identity_for_role(actors, ActorRole::Verifier)?;
     require(
         record.terminal.verifier_identity_id == verifier_id,
         "terminal has wrong verifier identity",
@@ -174,6 +176,16 @@ fn validate_empty_calibration(
         .known_positive_event_id
         .as_deref()
         .ok_or_else(|| ValidationError::new("observed-empty needs a known-positive probe"))?;
+    let calibration_evidence_id = record
+        .observation
+        .calibration_evidence_id
+        .as_deref()
+        .ok_or_else(|| ValidationError::new("observed-empty needs calibration evidence"))?;
+    let positive_evidence_id = record
+        .observation
+        .known_positive_evidence_id
+        .as_deref()
+        .ok_or_else(|| ValidationError::new("observed-empty needs known-positive evidence"))?;
     let calibration_events: Vec<&TrialEvent> = record
         .events
         .iter()
@@ -193,14 +205,48 @@ fn validate_empty_calibration(
     )?;
     let calibration_event = calibration_events[0];
     let positive_event = positive_events[0];
+    let calibration_evidence = evidence(record, calibration_evidence_id)?;
+    let positive_evidence = evidence(record, positive_evidence_id)?;
     require(
-        positive_event.subject_id != calibration_event.subject_id
-            && positive_event.subject_sha256 != calibration_event.subject_sha256,
-        "known-positive and calibration events need distinct explicit subjects",
+        positive_evidence.evidence_id != calibration_evidence.evidence_id
+            && positive_evidence.sha256 != calibration_evidence.sha256,
+        "known-positive and calibration evidence must be distinct",
+    )?;
+    require(
+        positive_evidence.kind == "known_positive_probe_output"
+            && calibration_evidence.kind == "calibration_record",
+        "observed-empty references the wrong calibration evidence kinds",
+    )?;
+    require(
+        positive_event.subject_id.as_deref() == Some(positive_evidence.evidence_id.as_str())
+            && positive_event.subject_sha256.as_deref() == Some(positive_evidence.sha256.as_str())
+            && calibration_event.subject_id.as_deref()
+                == Some(calibration_evidence.evidence_id.as_str())
+            && calibration_event.subject_sha256.as_deref()
+                == Some(calibration_evidence.sha256.as_str()),
+        "calibration events do not exactly bind their sealed evidence",
+    )?;
+    require(
+        positive_evidence.first_event_sequence <= positive_event.ledger_sequence
+            && positive_event.ledger_sequence <= positive_evidence.last_event_sequence
+            && calibration_evidence.first_event_sequence <= calibration_event.ledger_sequence
+            && calibration_event.ledger_sequence <= calibration_evidence.last_event_sequence,
+        "calibration evidence ranges do not cover their source events",
     )?;
     require(
         positive_event.ledger_sequence < calibration_event.ledger_sequence
             && calibration_event.ledger_sequence < capture.ledger_sequence,
         "known-positive must precede calibration, which must precede observation",
     )
+}
+
+fn evidence<'a>(
+    record: &'a TrialRecord,
+    evidence_id: &str,
+) -> Result<&'a EvidenceObject, ValidationError> {
+    record
+        .evidence
+        .iter()
+        .find(|evidence| evidence.evidence_id == evidence_id)
+        .ok_or_else(|| ValidationError::new("calibration evidence object is missing"))
 }

@@ -1,59 +1,20 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{ActorAction, ActorRole, EventKind, TrialEvent, TrialRecord};
+use crate::{ActorAction, ActorIdentity, ActorRole, EventKind, TrialEvent, TrialRecord};
 
 use super::super::primitive::{
     event_record_sha256, is_scoped_id, parse_canonical_utc, require, require_digest,
     ValidationError,
 };
 
-pub(super) fn validate_identities(record: &TrialRecord) -> Result<(), ValidationError> {
+pub(super) fn validate_events(
+    record: &TrialRecord,
+    actors: &[ActorIdentity],
+) -> Result<(), ValidationError> {
     require(
-        record.identities.len() == 5,
-        "trial must bind exactly five role identities",
+        record.events.len() >= 5 && record.events.len() <= super::super::MAX_EVENTS_PER_TRIAL,
+        "trial event ledger is incomplete or exceeds its protocol cap",
     )?;
-    let mut roles = HashSet::new();
-    let mut identity_ids = HashSet::new();
-    let mut principals = HashSet::new();
-    let mut sessions = HashSet::new();
-    let mut fingerprints = HashSet::new();
-    for identity in &record.identities {
-        require(is_scoped_id(&identity.identity_id), "invalid identity_id")?;
-        require(roles.insert(identity.role), "duplicate actor role")?;
-        require(
-            identity_ids.insert(identity.identity_id.as_str()),
-            "duplicate identity_id",
-        )?;
-        require(!identity.principal.trim().is_empty(), "empty principal")?;
-        require(
-            principals.insert(identity.principal.as_str()),
-            "roles must use distinct principals",
-        )?;
-        require(is_scoped_id(&identity.session_id), "invalid session_id")?;
-        require(
-            sessions.insert(identity.session_id.as_str()),
-            "roles must use distinct sessions",
-        )?;
-        require_digest(
-            &identity.credential_fingerprint_sha256,
-            "credential_fingerprint_sha256",
-        )?;
-        require(
-            fingerprints.insert(identity.credential_fingerprint_sha256.as_str()),
-            "roles must use distinct credential fingerprints",
-        )?;
-        let actions: HashSet<ActorAction> = identity.allowed_actions.iter().copied().collect();
-        let expected: HashSet<ActorAction> = role_actions(identity.role).iter().copied().collect();
-        require(
-            actions.len() == identity.allowed_actions.len() && actions == expected,
-            format!("{:?} has an invalid capability set", identity.role),
-        )?;
-    }
-    require(roles.len() == 5, "missing actor role")
-}
-
-pub(super) fn validate_events(record: &TrialRecord) -> Result<(), ValidationError> {
-    require(record.events.len() >= 5, "trial event ledger is incomplete")?;
     require(
         record.events[0].kind == EventKind::RunBound,
         "first event must bind the run",
@@ -62,8 +23,7 @@ pub(super) fn validate_events(record: &TrialRecord) -> Result<(), ValidationErro
         record.events[1].kind == EventKind::TrialScheduled,
         "second event must schedule the trial",
     )?;
-    let identities: HashMap<&str, ActorRole> = record
-        .identities
+    let identities: HashMap<&str, ActorRole> = actors
         .iter()
         .map(|identity| (identity.identity_id.as_str(), identity.role))
         .collect();
@@ -109,8 +69,7 @@ pub(super) fn validate_events(record: &TrialRecord) -> Result<(), ValidationErro
             role == expected_role,
             format!("{:?} emitted by wrong role", event.kind),
         )?;
-        let identity = record
-            .identities
+        let identity = actors
             .iter()
             .find(|identity| identity.identity_id == event.actor_identity_id)
             .ok_or_else(|| ValidationError::new("event actor disappeared"))?;
@@ -225,18 +184,6 @@ fn require_single(
     Ok(sequences[0])
 }
 
-pub(super) fn identity_for_role(
-    record: &TrialRecord,
-    role: ActorRole,
-) -> Result<&str, ValidationError> {
-    record
-        .identities
-        .iter()
-        .find(|identity| identity.role == role)
-        .map(|identity| identity.identity_id.as_str())
-        .ok_or_else(|| ValidationError::new(format!("missing {role:?} identity")))
-}
-
 fn event_authority(kind: EventKind) -> (ActorRole, ActorAction) {
     match kind {
         EventKind::RunBound => (ActorRole::Controller, ActorAction::BindRun),
@@ -255,23 +202,5 @@ fn event_authority(kind: EventKind) -> (ActorRole, ActorAction) {
         EventKind::EvidenceSealed => (ActorRole::Observer, ActorAction::SealEvidence),
         EventKind::EvidenceVerified => (ActorRole::Verifier, ActorAction::VerifyEvidence),
         EventKind::TerminalIssued => (ActorRole::Verifier, ActorAction::IssueTerminal),
-    }
-}
-
-fn role_actions(role: ActorRole) -> &'static [ActorAction] {
-    match role {
-        ActorRole::Controller => &[ActorAction::BindRun, ActorAction::ScheduleTrial],
-        ActorRole::FaultActor => &[ActorAction::ApplyFault, ActorAction::EndFault],
-        ActorRole::RecoveryActor => &[
-            ActorAction::ArmRecovery,
-            ActorAction::ExecuteRecovery,
-            ActorAction::RecordCleanup,
-        ],
-        ActorRole::Observer => &[
-            ActorAction::CaptureCalibration,
-            ActorAction::CaptureObservation,
-            ActorAction::SealEvidence,
-        ],
-        ActorRole::Verifier => &[ActorAction::VerifyEvidence, ActorAction::IssueTerminal],
     }
 }

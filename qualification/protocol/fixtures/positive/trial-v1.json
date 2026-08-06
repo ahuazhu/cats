@@ -5,76 +5,22 @@
     "candidate_commit_sha": "d0658064764ee5d77430662fdc8f4c7fda120189",
     "source_chain_verdict_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
     "artifact_manifest_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
-    "environment_id": "qualification-cell-001",
-    "environment_manifest_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
-    "environment_is_production": false,
     "protocol_version": 1,
     "catalog_sha256": "0e496d3b18202e1c9b4daf9047cfcc9633d66a321cafa86fd0a28e68faf96a2d",
-    "trial_plan_sha256": "5296172e2a20f8ecd2b2acfe83e10cda2f5df71d70a1647127de23fb0b090703",
-    "controller_commit_sha": "d0658064764ee5d77430662fdc8f4c7fda120189"
+    "trial_plan_sha256": "d03f855ccec48ebc29be4303be9caf043cd439c1b37973d31fb95c9bba661b5d",
+    "controller_commit_sha": "d0658064764ee5d77430662fdc8f4c7fda120189",
+    "actor_authority_manifest_sha256": "535b801f034c742d5eaa2589ab9b8d0b13e95321b3c7158243594c161e3bb72b"
+  },
+  "environment": {
+    "profile": "aws_f",
+    "environment_id": "qcell-use1-v1-aws-f",
+    "environment_manifest_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+    "environment_is_production": false
   },
   "window_id": "window-001",
   "trial_id": "trial-sto-strict-004-001",
   "case_id": "STO-STRICT-004",
-  "identities": [
-    {
-      "identity_id": "identity-controller",
-      "role": "controller",
-      "principal": "qualification-controller-role",
-      "session_id": "session-controller",
-      "credential_fingerprint_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "allowed_actions": [
-        "bind_run",
-        "schedule_trial"
-      ]
-    },
-    {
-      "identity_id": "identity-fault",
-      "role": "fault_actor",
-      "principal": "qualification-fault-role",
-      "session_id": "session-fault",
-      "credential_fingerprint_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      "allowed_actions": [
-        "apply_fault",
-        "end_fault"
-      ]
-    },
-    {
-      "identity_id": "identity-recovery",
-      "role": "recovery_actor",
-      "principal": "qualification-recovery-role",
-      "session_id": "session-recovery",
-      "credential_fingerprint_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-      "allowed_actions": [
-        "arm_recovery",
-        "execute_recovery",
-        "record_cleanup"
-      ]
-    },
-    {
-      "identity_id": "identity-observer",
-      "role": "observer",
-      "principal": "qualification-observer-role",
-      "session_id": "session-observer",
-      "credential_fingerprint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-      "allowed_actions": [
-        "capture_calibration",
-        "capture_observation",
-        "seal_evidence"
-      ]
-    },
-    {
-      "identity_id": "identity-verifier",
-      "role": "verifier",
-      "principal": "qualification-verifier-role",
-      "session_id": "session-verifier",
-      "credential_fingerprint_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-      "allowed_actions": [
-        "verify_evidence",
-        "issue_terminal"
-      ]
-    }
-  ],
+  "append_receipts_sha256": "eeec9b0bc02da1154eae1ca01dbffeba8533e6850edaaad555e98ce926a11be2",
   "events": [
     {
       "ledger_sequence": 1,
@@ -137,9 +83,9 @@
       "kind": "observation_captured",
       "actor_identity_id": "identity-observer",
       "occurred_at": "2026-08-06T00:00:04Z",
-      "immutable_record_sha256": "edc40eacd8bb22dd1e8c7d0ecdb5c7498e73b2125aec35147985eaad30652f8d",
+      "immutable_record_sha256": "dda131ab35777b8447a81066944273adc6affba4345f0b341c38ea88df98f448",
       "subject_id": "observation-001",
-      "subject_sha256": "becd7fb53b7537aec413079c635922ff5f46890d8e8a85306c4a2d00513a311a"
+      "subject_sha256": "d4decfc966ad5757b469eec80bae25e4f72adfcf63b069126e7bf82f7cb92c77"
     },
     {
       "ledger_sequence": 6,
@@ -337,8 +283,10 @@
     "expectation": "presence",
     "calibration_event_id": null,
     "known_positive_event_id": null,
+    "calibration_evidence_id": null,
+    "known_positive_evidence_id": null,
     "captured_event_id": "event-observation",
-    "record_sha256": "becd7fb53b7537aec413079c635922ff5f46890d8e8a85306c4a2d00513a311a"
+    "record_sha256": "d4decfc966ad5757b469eec80bae25e4f72adfcf63b069126e7bf82f7cb92c77"
   },
   "terminal": {
     "terminal_id": "terminal-001",

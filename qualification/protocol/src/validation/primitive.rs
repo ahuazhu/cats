@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -47,6 +47,8 @@ pub fn observation_record_sha256(observation: &Observation) -> Result<String, Va
         expectation: observation.expectation,
         calibration_event_id: observation.calibration_event_id.as_deref(),
         known_positive_event_id: observation.known_positive_event_id.as_deref(),
+        calibration_evidence_id: observation.calibration_evidence_id.as_deref(),
+        known_positive_evidence_id: observation.known_positive_evidence_id.as_deref(),
         captured_event_id: &observation.captured_event_id,
     })
 }
@@ -63,11 +65,19 @@ pub fn terminal_record_sha256(terminal: &TerminalRecord) -> Result<String, Valid
     })
 }
 
-fn canonical_sha256(value: &impl Serialize) -> Result<String, ValidationError> {
-    let bytes = serde_json::to_vec(value).map_err(|error| {
-        ValidationError::new(format!("canonical JSON serialization failed: {error}"))
-    })?;
+pub(super) fn canonical_sha256(
+    value: &(impl Serialize + ?Sized),
+) -> Result<String, ValidationError> {
+    let bytes = canonical_json(value)?;
     Ok(document_sha256(&bytes))
+}
+
+pub(super) fn canonical_json(
+    value: &(impl Serialize + ?Sized),
+) -> Result<Vec<u8>, ValidationError> {
+    serde_json::to_vec(value).map_err(|error| {
+        ValidationError::new(format!("canonical JSON serialization failed: {error}"))
+    })
 }
 
 #[derive(Serialize)]
@@ -91,6 +101,8 @@ struct ObservationPreimage<'a> {
     expectation: ObservationExpectation,
     calibration_event_id: Option<&'a str>,
     known_positive_event_id: Option<&'a str>,
+    calibration_evidence_id: Option<&'a str>,
+    known_positive_evidence_id: Option<&'a str>,
     captured_event_id: &'a str,
 }
 
@@ -120,18 +132,6 @@ pub(super) fn validate_binding(binding: &RunBinding) -> Result<(), ValidationErr
         "artifact_manifest_sha256",
     )?;
     require(
-        is_scoped_id(&binding.environment_id),
-        "invalid environment_id",
-    )?;
-    require_digest(
-        &binding.environment_manifest_sha256,
-        "environment_manifest_sha256",
-    )?;
-    require(
-        !binding.environment_is_production,
-        "qualification environment must be explicitly non-production",
-    )?;
-    require(
         binding.protocol_version == PROTOCOL_VERSION,
         "unsupported qualification protocol version",
     )?;
@@ -141,16 +141,21 @@ pub(super) fn validate_binding(binding: &RunBinding) -> Result<(), ValidationErr
         is_lower_hex(&binding.controller_commit_sha, 40),
         "controller_commit_sha must be a full lowercase 40-hex Git SHA",
     )?;
+    require_digest(
+        &binding.actor_authority_manifest_sha256,
+        "actor_authority_manifest_sha256",
+    )?;
     Ok(())
 }
 
 pub(super) fn validate_blocker(blocker: Option<&Blocker>) -> Result<(), ValidationError> {
     let blocker =
         blocker.ok_or_else(|| ValidationError::new("BLOCKED needs an owner and exit condition"))?;
-    require(!blocker.owner.trim().is_empty(), "blocker owner is empty")?;
+    require_bounded_text(&blocker.owner, "blocker owner")?;
     require(
-        !blocker.exit_condition.trim().is_empty(),
-        "blocker exit condition is empty",
+        !blocker.exit_condition.trim().is_empty()
+            && blocker.exit_condition.len() <= super::MAX_TEXT_BYTES,
+        "blocker exit condition is empty or too long",
     )
 }
 
@@ -174,6 +179,34 @@ pub(super) fn is_scoped_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+pub(super) fn require_bounded_text(value: &str, name: &str) -> Result<(), ValidationError> {
+    require(
+        !value.trim().is_empty() && value.len() <= super::MAX_TEXT_BYTES,
+        format!("{name} is empty or exceeds {} bytes", super::MAX_TEXT_BYTES),
+    )
+}
+
+pub(super) fn require_document_size(
+    bytes: &[u8],
+    max_bytes: u64,
+    name: &str,
+) -> Result<(), ValidationError> {
+    require(
+        bytes.len() as u64 <= max_bytes,
+        format!("{name} exceeds {max_bytes} bytes"),
+    )
+}
+
+pub(super) fn parse_bounded_json<T: DeserializeOwned>(
+    bytes: &[u8],
+    max_bytes: u64,
+    name: &str,
+) -> Result<T, ValidationError> {
+    require_document_size(bytes, max_bytes, name)?;
+    serde_json::from_slice(bytes)
+        .map_err(|error| ValidationError::new(format!("invalid {name} JSON: {error}")))
 }
 
 pub(super) fn is_case_id(value: &str) -> bool {

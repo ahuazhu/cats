@@ -1,0 +1,8 @@
+{
+  "schema": "cats.qualification.negative-fixtures/v1",
+  "base": "../positive/actor-authority-v1.json",
+  "cases": [
+    {"name":"fabricated-five-principals","operation":"set","pointer":"/actors/0/principal","value":"fabricated-controller","expected_error":"actor authority signature authentication failed"},
+    {"name":"authority-key-substitution","operation":"set","pointer":"/authority_key_id","value":"attacker-key","expected_error":"not the configured trust anchor"}
+  ]
+}

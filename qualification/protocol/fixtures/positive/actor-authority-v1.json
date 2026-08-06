@@ -1,0 +1,16 @@
+{
+  "schema": "cats.qualification.actor-authority/v1",
+  "run_id": "run-20260806-001",
+  "issuer": "qualification-identity-broker",
+  "authority_key_id": "qualification-actor-authority-v1",
+  "issued_at": "2026-08-05T23:59:59Z",
+  "expires_at": "2026-08-06T01:00:00Z",
+  "actors": [
+    {"identity_id":"identity-controller","role":"controller","principal":"qualification-controller-role","session_id":"session-controller","credential_fingerprint_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","allowed_actions":["bind_run","schedule_trial"]},
+    {"identity_id":"identity-fault","role":"fault_actor","principal":"qualification-fault-role","session_id":"session-fault","credential_fingerprint_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","allowed_actions":["apply_fault","end_fault"]},
+    {"identity_id":"identity-recovery","role":"recovery_actor","principal":"qualification-recovery-role","session_id":"session-recovery","credential_fingerprint_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","allowed_actions":["arm_recovery","execute_recovery","record_cleanup"]},
+    {"identity_id":"identity-observer","role":"observer","principal":"qualification-observer-role","session_id":"session-observer","credential_fingerprint_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","allowed_actions":["capture_calibration","capture_observation","seal_evidence"]},
+    {"identity_id":"identity-verifier","role":"verifier","principal":"qualification-verifier-role","session_id":"session-verifier","credential_fingerprint_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","allowed_actions":["verify_evidence","issue_terminal"]}
+  ],
+  "signature_ed25519": "baefb1a2213333e3e23bf842df097e6d1c6cc015bbd9b51d539fdb2fe59e7be70c0eb928430c3ea8a8d99d5831d27df0fdcdba4a54d08778168d893815e43e0d"
+}

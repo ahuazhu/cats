@@ -13,9 +13,12 @@ mutate infrastructure.
 | Document | Schema discriminator | Purpose |
 |---|---|---|
 | Case catalog | `cats.qualification.catalog/v1` | Stable case, phase, oracle and evidence contract |
-| Trial plan | `cats.qualification.trial-plan/v1` | Ordered authoritative trial/case schedule |
-| Trial record | `cats.qualification.trial/v1` | One case attempt with identities, events, evidence and terminal |
+| Trial plan | `cats.qualification.trial-plan/v1` | Ordered authoritative trial/case/environment schedule |
+| Actor authority | `cats.qualification.actor-authority/v1` | Ed25519-authenticated actor sessions and capabilities |
+| Append receipts | `cats.qualification.append-receipts/v1` | Ed25519-authenticated event receipts and ledger checkpoint |
+| Trial record | `cats.qualification.trial/v1` | One case attempt with environment, events, evidence and terminal |
 | Coverage ledger | `cats.qualification.coverage-ledger/v1` | Complete phase projection for one exact run binding |
+| Final qualification | `cats.qualification.final/v1` | Digest composition of validated functional and AWS-P ledgers |
 | Negative fixtures | `cats.qualification.negative-fixtures/v1` | JSON-pointer mutations that a V1 validator MUST reject |
 
 All JSON objects reject unknown fields. An incompatible field, enum or semantic
@@ -43,13 +46,11 @@ Every `TrialRecord` and `CoverageLedger` contains the same `RunBinding` shape:
 | `candidate_commit_sha` | 40 lowercase hex | Full candidate Git SHA; abbreviation forbidden |
 | `source_chain_verdict_sha256` | 64 lowercase hex | Exact H0 source-chain verdict |
 | `artifact_manifest_sha256` | 64 lowercase hex | Build-once candidate artifact manifest |
-| `environment_id` | scoped ID | Isolated qualification environment instance |
-| `environment_manifest_sha256` | 64 lowercase hex | Exact topology/configuration/inventory manifest |
-| `environment_is_production` | exactly `false` | Destructive qualification MUST NOT target production |
 | `protocol_version` | `1` | This protocol version |
 | `catalog_sha256` | 64 lowercase hex | Exact catalog bytes used for scheduling and coverage |
 | `trial_plan_sha256` | 64 lowercase hex | Exact ordered TrialPlan bytes fixed before execution |
 | `controller_commit_sha` | 40 lowercase hex | Full controller implementation Git SHA |
+| `actor_authority_manifest_sha256` | 64 lowercase hex | Exact authenticated actor-authority bytes |
 
 Changing any field creates a different binding. Trials from different bindings
 MUST NOT be merged, and prior PASS entries MUST NOT be carried into the new
@@ -57,16 +58,39 @@ coverage ledger.
 
 The TrialPlan is compact JSON with schema, `run_id`, `catalog_sha256` and an
 ordered `planned_trials` array. Each item has a contiguous sequence beginning at
-1, unique trial ID and unique case ID. V1 permits at most one planned trial per
-case. Its exact file digest is in every downstream RunBinding. The plan is
-sealed before `run_bound`; scheduling a rerun requires a future signed
-supersession protocol and a new binding, not insertion/reordering in V1.
+1, unique trial ID, unique case ID and exact `ExecutionEnvironment`:
 
-## 3. Identity, action and event closure
+| Environment field | Rule |
+|---|---|
+| `profile` | Catalog-selected `aws_f`, `aws_p`, `ci` or `linux` |
+| `environment_id` | Scoped isolated execution-instance ID |
+| `environment_manifest_sha256` | Exact topology/configuration/inventory bytes |
+| `environment_is_production` | Exactly `false` |
 
-A trial MUST bind exactly five identities. `principal`, `session_id` and
-credential fingerprint MUST be distinct across roles. Credentials and tokens
-MUST NOT appear in the record; only their SHA-256 fingerprint is retained.
+The TrialRecord repeats this object byte-for-byte. Functional cases select
+`aws_f` whenever the catalog declares it; otherwise they MUST declare exactly
+one of `ci`/`linux`, which is selected. AWS performance and cost cases select
+`aws_p`. V1 permits at most one planned trial per case. The plan is sealed
+before `run_bound`; a rerun requires a future signed supersession protocol.
+
+The G0 `cats-qualification-v2` cell is a new qualification resource lineage.
+Its AWS account may also contain production, but the cell and all derived
+AWS-F/AWS-P execution manifests remain `environment_is_production=false`.
+Account identity MUST NOT be used to infer execution-environment identity.
+
+## 3. Authenticated identity, action and event closure
+
+The TrialRecord does not declare its own identities. Its RunBinding digest
+resolves exact `ActorAuthorityManifest` bytes. The manifest binds run ID,
+issuer, validity interval, five actors and an `authority_key_id`, and carries an
+Ed25519 signature over the canonical manifest fields excluding the signature.
+The Verifier MUST receive the expected key ID and 32-byte public key from a
+separately pinned trust configuration; a key embedded by the producer is not a
+trust anchor. The private key MUST NOT be available to the Verifier.
+
+The authenticated manifest MUST bind exactly five identities. `principal`,
+`session_id` and credential fingerprint are distinct across roles. Credentials
+and tokens do not appear; only their SHA-256 fingerprint is retained.
 
 | Role | Exact actions | Events it may emit |
 |---|---|---|
@@ -80,6 +104,13 @@ The action list is exact: missing, duplicate or additional capabilities are
 invalid. No role may emit another role's event. The Observer is the only raw
 evidence producer. The Verifier MUST be independent of the Observer and is the
 only role that verifies evidence or issues a terminal result.
+
+Every event also has a corresponding `AppendReceipt` containing its sequence,
+event ID/digest and the exact authenticated actor identity/session/fingerprint.
+The receipt array is covered by a separate Ed25519-signed append checkpoint.
+The append-ledger public key and key ID are pinned independently from the actor
+authority. Replaying an event under another valid-looking session, fabricating
+five identities, substituting a trust key or omitting a receipt is invalid.
 
 ## 4. Event ledger and recovery ordering
 
@@ -133,15 +164,25 @@ event: ledger_sequence,event_id,run_id,window_id,trial_id,kind,
        actor_identity_id,occurred_at,subject_id,subject_sha256
 
 observation: observation_id,state,expectation,calibration_event_id,
-             known_positive_event_id,captured_event_id
+             known_positive_event_id,calibration_evidence_id,
+             known_positive_evidence_id,captured_event_id
 
 terminal: terminal_id,outcome,summary,verifier_identity_id,evidence_ids,
           blocker,issued_event_id
 ```
 
 The validator recomputes all three SHA-256 values. These hashes protect record
-content; the external append ledger receipt and sequence prove durability and
-ordering. A random well-formed digest is not an acceptable receipt.
+content; they are not authentication. The raw append-receipt bundle is bound by
+`TrialRecord.append_receipts_sha256`. Its signed checkpoint covers schema and
+scope, every ordered receipt, event count/range, SHA-256 over canonical receipt
+array, previous-checkpoint digest and signing time. A random well-formed digest
+or producer-local sequence is not an acceptable durable receipt.
+
+The observation preimage additionally includes
+`calibration_evidence_id,known_positive_evidence_id` after the two calibration
+event IDs. Actor-authority and append-checkpoint Ed25519 preimages use the
+ordered fields represented by their Rust model types, excluding their
+`signature_ed25519` fields.
 
 ## 5. Evidence contract
 
@@ -192,11 +233,15 @@ canonical `record_sha256`. Exactly one `observation_captured` event MUST bind
 that observation ID/digest, and it MUST precede every evidence seal.
 
 Any `observed_empty` state MUST reference exactly one
-`known_positive_probe_passed` event and one `calibration_recorded` event from
-the Observer. Their explicit subject IDs and digests MUST be distinct, and
-ledger order is `known_positive < calibration < observation`. Other states
-MUST NOT carry either the references or dangling calibration events. This is
-the known-positive calibration required before believing an empty probe.
+`known_positive_probe_passed` event, one `calibration_recorded` event and two
+distinct EvidenceObjects. The event subjects bind the exact evidence IDs and
+digests. Evidence kinds are respectively `known_positive_probe_output` and
+`calibration_record`; their source ranges cover the corresponding events; both
+objects are subsequently sealed by the Observer, verified by the Verifier and
+included in the terminal. Ledger order is
+`known_positive < calibration < observation < seal < verify < terminal`.
+Opaque arbitrary subjects are never calibration proof. Other observation
+states MUST NOT carry these references or dangling calibration events.
 
 Every terminal result has a terminal ID, non-empty summary, Verifier identity,
 all evidence IDs, optional blocker, issued-event ID and recomputed canonical
@@ -247,7 +292,6 @@ A ledger phase is one of:
 |---|---:|---|
 | `functional` | 104 | functional cases |
 | `aws_performance` | 9 | AWS performance cases |
-| `release_required` | 113 | union of functional and AWS performance |
 | `cost_observation` | 1 | P2 cost observation only |
 
 The ledger MUST contain exactly one entry for every member and no other entry.
@@ -260,13 +304,13 @@ references and no Verifier. A planned entry names exactly one trial ID and one
 SHA-256 over the exact raw trial-record bytes, plus evidence IDs and a Verifier
 identity. `blocked` also names its owner and exit condition.
 
-Validation requires the exact TrialPlan bytes and the raw trial documents in
-filtered plan order. It recomputes each trial digest, runs the full TrialRecord
-validator and requires trial/ledger RunBinding equality plus exact case,
-terminal outcome, Verifier, evidence-list and blocker equality. Every
-phase-relevant planned trial MUST have one record; extra, missing, duplicate or
-reordered records are invalid. Thus a producer cannot omit a failed attempt,
-invent trial references or relabel its terminal as PASS.
+Validation requires exact TrialPlan bytes, authenticated actor-authority bytes,
+and paired raw trial/append-receipt documents in plan order. It recomputes each
+digest, authenticates every actor and append checkpoint, runs the full
+TrialRecord validator and requires trial/ledger RunBinding equality plus exact
+selected environment, case, terminal outcome, Verifier, evidence list and
+blocker equality. Every planned trial has one record/receipt pair; extra,
+missing, duplicate or reordered inputs are invalid.
 
 `phase_outcome` is derived:
 
@@ -281,13 +325,38 @@ ledger binding byte-for-byte, and checks that the referenced evidence objects
 are the verified objects in the trial. A coverage ledger is a projection, never
 an authority that can replace its trial records.
 
-Final release logic MUST consume a passing `release_required` ledger with
-113/113 PASS. A functional 104/104 ledger and AWS-P 9/9 ledger are separately
-useful phase gates, but only their exact-binding 113-case union is the final
-release-required coverage. `PERF-COST-001` is reported independently and MUST
-NOT affect the release-required denominator.
+There is no third `release_required` CoverageLedger. A FinalQualification
+record binds the exact SHA-256 of one fully validated 104-case functional
+ledger and one fully validated 9-case AWS-P ledger. It requires the two ledgers
+to share candidate commit, source-chain verdict, artifact manifest, catalog,
+protocol and controller identity. Phase run IDs, TrialPlans, actor manifests
+and execution-environment manifests may differ. The final outcome is derived as
+INVALID if either phase is invalid, otherwise FAIL if either fails, PASS only
+for PASS + PASS, otherwise INCOMPLETE. `required_case_count` is exactly 113.
+`PERF-COST-001` remains independent.
 
-## 9. Validator and fixtures
+## 9. Input bounds
+
+The CLI checks metadata and performs a capped read before JSON allocation. It
+rejects more than 114 trial paths or unequal trial/receipt path counts before
+opening those files. Validators enforce the same raw-document and model limits:
+
+| Input | V1 cap |
+|---|---:|
+| catalog, trial, coverage ledger | 1 MiB each |
+| TrialPlan | 256 KiB |
+| actor-authority manifest, final qualification | 64 KiB each |
+| append-receipt bundle | 512 KiB |
+| planned/trial documents | 114 |
+| events per trial | 256 |
+| evidence objects per trial | 64 |
+| free-form protocol text | 4096 bytes per field |
+
+Evidence object payloads retain the separately declared maximum and 1 GiB hard
+cap. The operational Verifier MUST cap reads before buffering. An oversize
+producer document is invalid input, not an invitation to allocate it.
+
+## 10. Validator and fixtures
 
 From the repository root:
 
@@ -297,12 +366,19 @@ cargo run -p cats-qualification-protocol -- \
 
 cargo run -p cats-qualification-protocol -- \
   trial qualification/protocol/catalog/case-catalog-v1.json \
-  qualification/protocol/fixtures/positive/trial-v1.json
+  qualification/protocol/fixtures/positive/trial-v1.json \
+  --actor-authority qualification/protocol/fixtures/positive/actor-authority-v1.json \
+  --append-receipts qualification/protocol/fixtures/positive/append-receipts-v1.json \
+  --actor-authority-public-key <PINNED-RAW-ED25519-PUBLIC-KEY> \
+  --append-ledger-public-key <PINNED-RAW-ED25519-PUBLIC-KEY>
 
 cargo run -p cats-qualification-protocol -- \
   coverage qualification/protocol/catalog/case-catalog-v1.json \
   qualification/protocol/fixtures/positive/trial-plan-empty-v1.json \
-  qualification/protocol/fixtures/positive/functional-zero-of-104.coverage.json
+  qualification/protocol/fixtures/positive/functional-zero-of-104.coverage.json \
+  --actor-authority qualification/protocol/fixtures/positive/actor-authority-v1.json \
+  --actor-authority-public-key <PINNED-RAW-ED25519-PUBLIC-KEY> \
+  --append-ledger-public-key <PINNED-RAW-ED25519-PUBLIC-KEY>
 ```
 
 `catalog-digest` prints the digest over exact catalog bytes. The positive trial
@@ -312,16 +388,20 @@ case is explicitly unobserved, so its phase result is incomplete.
 
 `fixtures/negative/trial-validation-cases-v1.json` is executable test data. It
 declares JSON-pointer set/remove mutations and the required rejection reason,
-including production targeting, abbreviated candidate SHA, identity collapse,
-mutation without prior recovery intent, non-monotonic and malformed time,
-unauthorized evidence production, secret-scan failure, seal/terminal
-substitution, contradictory outcomes and missing cleanup.
+including production targeting, abbreviated candidate SHA, wrong selected
+profile, mutation without prior recovery intent, non-monotonic and malformed
+time, unauthorized evidence production, secret-scan failure, seal/terminal
+substitution, contradictory outcomes and missing cleanup. Separate authority
+vectors cover fabricated role manifests, trust-key substitution and signed
+event replay under another session.
 
-For a non-empty plan, append one `--trial <path>` per phase-relevant planned
-trial in authoritative plan order. Omitting, adding or reordering these files
-fails validation.
+For a non-empty plan, append one `--trial <path>` and one
+`--append-receipts <path>` per planned trial in authoritative plan order.
+Omitting, adding or reordering either list fails validation. The `final`
+subcommand accepts corresponding functional and AWS-P phase bundles and runs
+both phase validators before validating their digest composition.
 
-## 10. Explicit non-goals
+## 11. Explicit non-goals
 
 V1 does not provide a workflow controller, infrastructure provisioning,
 scenario adapters, AWS clients, mutable in-memory ledger, object archive,
