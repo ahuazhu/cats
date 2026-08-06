@@ -694,12 +694,15 @@ Node 验证 Route Grant 的签名、时效、hostname、Cat generation、Node、
 Gateway 的普通缓存过期后，只要 active + Running Route Grant 的签名时效仍有效，就立即
 准入并按 hostname 合并为一个后台 refresh；transport/5xx 失败保留该授权并进入有界退避，
 不会让每个请求等待两秒或放大控制面流量。观察到明确 not-found、其他非成功响应、畸形响应
-或 Node 409 后，该 Gateway 立即失效本地缓存，并在“最大 Grant TTL + 验证器允许的时钟
-偏差”这一完整窗口内绕过共享镜像；因此它不会在旧授权仍可能有效时重新导入自己刚拒绝的
-授权。控制面直接返回新的 active + Running 是唯一能提前解除该屏障的路径；完整窗口到期
-后，Gateway 可以再次接受其他副本写入的、当前仍有效的控制面签名 Grant，Node 仍执行最终
-签名、绑定和运行态校验。已签发并复制的其他副本仍以签名到期为授权上界。签名到期始终
-fail closed。HTTP/WS 的生命周期并发由 Node 持有的本地
+或 Node 409 后，该 Gateway 立即失效被拒绝的本地 Grant。除自然签名过期外，这些拒绝都会
+在“最大 Grant TTL + 验证器允许的时钟偏差”这一完整窗口内绕过共享镜像；因此它不会在旧
+授权仍可能有效时重新导入自己刚拒绝的授权，控制面直接返回新的 active + Running 是唯一
+能提前解除屏障的路径。Node 用机器可读的冲突元数据单独标识自然过期；过期不是撤销信号，
+所以控制面不可用时，Gateway 只可从共享镜像导入按 route epoch、再按签名签发时间严格更新
+的有效 Grant，相同或更旧的 Grant 仍被拒绝。HTTP/WS 使用同一规则，Node 仍执行最终签名、
+绑定和运行态校验。完整窗口到期后，Gateway 可以再次接受其他副本写入的当前有效控制面
+签名 Grant。已签发并复制的其他副本仍以签名到期为授权上界；单个 Grant 到期始终 fail
+closed。HTTP/WS 的生命周期并发由 Node 持有的本地
 activity guard 仲裁，不再逐请求获取 PostgreSQL work lease；Wake 仍必须经过控制面。
 共享缓存故障时回退到健康控制面，控制面故障时回退到有效的共享/本地 Grant；Gateway
 启动和 Ready 不依赖 DynamoDB。运行时共享缓存 I/O 有 100 ms 硬截止时间；低 epoch 或同

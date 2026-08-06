@@ -14,6 +14,11 @@ pub const ROUTE_GRANT_AUDIENCE: &str = "cats-node-agent";
 pub const DEFAULT_ROUTE_GRANT_TTL_SECONDS: u64 = 120;
 pub const MAX_ROUTE_GRANT_TTL_SECONDS: u64 = 300;
 pub const MAX_ROUTE_GRANT_CLOCK_SKEW_SECONDS: u64 = 5;
+/// Node-to-Gateway rejection detail. A natural expiry is distinct from a
+/// still-valid binding/runtime rejection because only the former may consult
+/// the shared mirror for a strictly newer signed Grant.
+pub const ROUTE_GRANT_REJECTION_HEADER: &str = "x-cats-route-grant-rejection";
+pub const ROUTE_GRANT_REJECTION_EXPIRED: &str = "expired";
 
 #[derive(Debug, thiserror::Error)]
 pub enum RouteGrantPublicKeyError {

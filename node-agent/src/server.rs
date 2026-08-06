@@ -33,6 +33,7 @@ use cats_api::requests::{
     MAX_SHELL_MESSAGE_BYTES,
 };
 use cats_api::resources::{CatResourceTelemetry, NodeTelemetry};
+use cats_api::route_grant::{ROUTE_GRANT_REJECTION_EXPIRED, ROUTE_GRANT_REJECTION_HEADER};
 use cats_metering::RuntimeMeterAccumulator;
 use cats_storage::MetadataStore;
 
@@ -661,6 +662,24 @@ async fn bridge_shell(socket: WebSocket, guest: GuestShell, _activity_guard: Run
 
 /// Gateway hop. 409 means the Cat is not active on this node (stale route:
 /// the gateway must re-resolve); guest network/service failures are 502.
+fn route_grant_rejection_response(
+    error: crate::route_grant::RouteGrantVerificationError,
+) -> Response {
+    if error.is_expired() {
+        return (
+            StatusCode::CONFLICT,
+            [(ROUTE_GRANT_REJECTION_HEADER, ROUTE_GRANT_REJECTION_EXPIRED)],
+            format!("invalid route grant: {error:#}"),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::CONFLICT,
+        format!("invalid route grant: {error:#}"),
+    )
+        .into_response()
+}
+
 async fn handle_proxy(
     State(state): State<NodeState>,
     Path(cat_id): Path<String>,
@@ -681,13 +700,7 @@ async fn handle_proxy(
         },
     ) {
         Ok(claims) => claims,
-        Err(error) => {
-            return (
-                StatusCode::CONFLICT,
-                format!("invalid route grant: {error:#}"),
-            )
-                .into_response()
-        }
+        Err(error) => return route_grant_rejection_response(error),
     };
     let runtime = state.runtime.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -750,13 +763,7 @@ async fn handle_proxy_websocket(
         },
     ) {
         Ok(claims) => claims,
-        Err(error) => {
-            return (
-                StatusCode::CONFLICT,
-                format!("invalid route grant: {error:#}"),
-            )
-                .into_response()
-        }
+        Err(error) => return route_grant_rejection_response(error),
     };
     let forwarded = match decode_forwarded_headers(&headers) {
         Ok(headers) => headers,
@@ -2301,6 +2308,34 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
             activity_watchers,
         ],
     })
+}
+
+#[cfg(test)]
+mod route_grant_rejection_tests {
+    use super::*;
+
+    #[test]
+    fn natural_expiry_is_machine_readable_but_other_rejections_are_not() {
+        let expired = route_grant_rejection_response(
+            crate::route_grant::RouteGrantVerificationError::Expired,
+        );
+        assert_eq!(expired.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            expired.headers().get(ROUTE_GRANT_REJECTION_HEADER).unwrap(),
+            ROUTE_GRANT_REJECTION_EXPIRED
+        );
+
+        let invalid = route_grant_rejection_response(
+            crate::route_grant::RouteGrantVerificationError::Invalid(anyhow::anyhow!(
+                "signature mismatch"
+            )),
+        );
+        assert_eq!(invalid.status(), StatusCode::CONFLICT);
+        assert!(invalid
+            .headers()
+            .get(ROUTE_GRANT_REJECTION_HEADER)
+            .is_none());
+    }
 }
 
 #[cfg(test)]

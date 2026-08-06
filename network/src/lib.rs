@@ -29,7 +29,10 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use cats_api::requests::{ProxyHttpRequest, ProxyHttpResponse};
 use cats_api::resources::{ObservedState, RouteBinding, WakePolicy};
-use cats_api::route_grant::{MAX_ROUTE_GRANT_CLOCK_SKEW_SECONDS, MAX_ROUTE_GRANT_TTL_SECONDS};
+use cats_api::route_grant::{
+    MAX_ROUTE_GRANT_CLOCK_SKEW_SECONDS, MAX_ROUTE_GRANT_TTL_SECONDS, ROUTE_GRANT_REJECTION_EXPIRED,
+    ROUTE_GRANT_REJECTION_HEADER,
+};
 
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
@@ -369,6 +372,39 @@ struct SharedLookupBarrier {
     expires_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RouteGrantOrder {
+    route_epoch: i64,
+    issued_at_unix: u64,
+}
+
+impl RouteGrantOrder {
+    fn from_resolved(resolved: &ResolveResponse) -> Option<Self> {
+        Some(Self {
+            route_epoch: resolved.binding.epoch,
+            issued_at_unix: resolved.route_grant_issued_at_unix?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SharedLookup {
+    Blocked,
+    Any,
+    NewerThan(RouteGrantOrder),
+}
+
+impl SharedLookup {
+    fn accepts(self, resolved: &ResolveResponse) -> bool {
+        match self {
+            Self::Blocked => false,
+            Self::Any => true,
+            Self::NewerThan(rejected) => RouteGrantOrder::from_resolved(resolved)
+                .is_some_and(|candidate| candidate > rejected),
+        }
+    }
+}
+
 impl SharedLookupBarrier {
     fn after_authoritative_rejection(now: Instant) -> Self {
         Self {
@@ -386,11 +422,43 @@ struct RouteCacheEntry {
     refresh: Option<Arc<RouteRefresh>>,
     retry_after: Instant,
     last_failure: Option<ResolveFailure>,
-    /// A control-plane negative or Node conflict is authoritative for this
-    /// replica. Preserve that fact for the longest interval in which a Grant
-    /// issued before the rejection could still pass signature-time checks.
+    /// A control-plane negative or non-expiry Node conflict is authoritative
+    /// for this replica. Preserve that fact for the longest interval in which
+    /// a Grant issued before the rejection could still pass time validation.
     shared_lookup_barrier: Option<SharedLookupBarrier>,
+    /// Natural expiry is not a revocation, but the rejected capability must
+    /// not be imported again. Only a strictly newer epoch/issue time may pass.
+    shared_lookup_floor: Option<RouteGrantOrder>,
     generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NodeRouteRejection {
+    StaleRoute,
+    ExpiredGrant,
+}
+
+impl NodeRouteRejection {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        if headers
+            .get(ROUTE_GRANT_REJECTION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            == Some(ROUTE_GRANT_REJECTION_EXPIRED)
+        {
+            Self::ExpiredGrant
+        } else {
+            Self::StaleRoute
+        }
+    }
+
+    fn may_use_newer_shared_grant(self) -> bool {
+        self == Self::ExpiredGrant
+    }
+}
+
+enum ProxyAttempt {
+    Response(Response),
+    Rejected(NodeRouteRejection),
 }
 
 impl RouteCacheEntry {
@@ -401,18 +469,34 @@ impl RouteCacheEntry {
             retry_after: now,
             last_failure: None,
             shared_lookup_barrier: None,
+            shared_lookup_floor: None,
             generation: 0,
         }
     }
 
     fn block_shared_lookup(&mut self, now: Instant) {
         self.shared_lookup_barrier = Some(SharedLookupBarrier::after_authoritative_rejection(now));
+        self.shared_lookup_floor = None;
     }
 
     fn allow_shared_lookup(&mut self) {
         self.shared_lookup_barrier = None;
+        self.shared_lookup_floor = None;
     }
 
+    fn allow_only_newer_shared_lookup(&mut self, rejected: &ResolveResponse, now: Instant) {
+        if let Some(floor) = RouteGrantOrder::from_resolved(rejected) {
+            self.shared_lookup_barrier = None;
+            self.shared_lookup_floor = Some(floor);
+        } else {
+            // Missing signed ordering metadata cannot prove that a peer Grant
+            // is newer than the rejected capability, so retain fail-closed
+            // behavior even when the Node classified the token as expired.
+            self.block_shared_lookup(now);
+        }
+    }
+
+    #[cfg(test)]
     fn shared_lookup_allowed(&self, now: Instant) -> bool {
         !self
             .shared_lookup_barrier
@@ -422,6 +506,16 @@ impl RouteCacheEntry {
     fn has_active_shared_lookup_barrier(&self, now: Instant) -> bool {
         self.shared_lookup_barrier
             .is_some_and(|barrier| barrier.is_active(now))
+    }
+
+    fn shared_lookup(&self, now: Instant) -> SharedLookup {
+        if self.has_active_shared_lookup_barrier(now) {
+            SharedLookup::Blocked
+        } else if let Some(floor) = self.shared_lookup_floor {
+            SharedLookup::NewerThan(floor)
+        } else {
+            SharedLookup::Any
+        }
     }
 }
 
@@ -558,20 +652,26 @@ impl Gateway {
     async fn fetch_route(
         &self,
         hostname: &str,
-        allow_shared: bool,
+        shared_lookup: SharedLookup,
     ) -> Result<ResolveResponse, ResolveFailure> {
-        if allow_shared {
+        if shared_lookup != SharedLookup::Blocked {
             match self.load_shared_route(hostname).await {
                 Ok(Some(resolved)) => {
                     let active_running = resolved.state == "active"
                         && resolved.observed_state == ObservedState::Running;
                     match validate_resolved_route(hostname, &resolved) {
-                        Ok(()) if active_running => {
+                        Ok(()) if active_running && shared_lookup.accepts(&resolved) => {
                             tracing::debug!(
                                 hostname,
                                 "loaded peer-primed signed Route Grant from shared cache"
                             );
                             return Ok(resolved);
+                        }
+                        Ok(()) if active_running => {
+                            tracing::debug!(
+                                hostname,
+                                "ignoring a shared signed Route Grant that is not newer than the Node-rejected Grant"
+                            );
                         }
                         Ok(()) => {
                             tracing::warn!(
@@ -746,7 +846,7 @@ impl Gateway {
         hostname: String,
         generation: u64,
         refresh: Arc<RouteRefresh>,
-        allow_shared: bool,
+        shared_lookup: SharedLookup,
     ) {
         // Refresh ownership must not belong to whichever request happened to
         // publish the singleflight state. That request may be cancelled at any
@@ -755,7 +855,7 @@ impl Gateway {
         // cannot wait forever and abandoned hosts cannot consume the cache.
         let gateway = self.clone();
         tokio::spawn(async move {
-            let result = gateway.fetch_route(&hostname, allow_shared).await;
+            let result = gateway.fetch_route(&hostname, shared_lookup).await;
             gateway.complete_refresh(&hostname, generation, &refresh, result);
         });
     }
@@ -765,7 +865,7 @@ impl Gateway {
             Return(ResolveResponse),
             ReturnAndRefresh(ResolveResponse, Arc<RouteRefresh>, u64),
             Wait(Arc<RouteRefresh>),
-            Refresh(Arc<RouteRefresh>, u64, bool),
+            Refresh(Arc<RouteRefresh>, u64, SharedLookup),
             Fail(ResolveFailure),
         }
 
@@ -824,7 +924,11 @@ impl Gateway {
                         Action::Refresh(
                             refresh,
                             entry.generation,
-                            use_cache && entry.shared_lookup_allowed(now),
+                            if use_cache {
+                                entry.shared_lookup(now)
+                            } else {
+                                SharedLookup::Blocked
+                            },
                         )
                     }
                 } else if let Some(refresh) = &entry.refresh {
@@ -843,7 +947,11 @@ impl Gateway {
                     Action::Refresh(
                         refresh,
                         entry.generation,
-                        use_cache && entry.shared_lookup_allowed(now),
+                        if use_cache {
+                            entry.shared_lookup(now)
+                        } else {
+                            SharedLookup::Blocked
+                        },
                     )
                 }
             };
@@ -851,7 +959,12 @@ impl Gateway {
             match action {
                 Action::Return(resolved) => return Ok(resolved),
                 Action::ReturnAndRefresh(resolved, refresh, generation) => {
-                    self.start_refresh(hostname.to_string(), generation, refresh, false);
+                    self.start_refresh(
+                        hostname.to_string(),
+                        generation,
+                        refresh,
+                        SharedLookup::Blocked,
+                    );
                     return Ok(resolved);
                 }
                 Action::Wait(refresh) => match refresh.wait().await {
@@ -859,12 +972,12 @@ impl Gateway {
                     Err(ResolveFailure::Superseded) => continue,
                     Err(error) => return Err(error.into_response()),
                 },
-                Action::Refresh(refresh, generation, allow_shared) => {
+                Action::Refresh(refresh, generation, shared_lookup) => {
                     self.start_refresh(
                         hostname.to_string(),
                         generation,
                         refresh.clone(),
-                        allow_shared,
+                        shared_lookup,
                     );
                     match refresh.wait().await {
                         Ok(resolved) => return Ok(resolved),
@@ -896,6 +1009,34 @@ impl Gateway {
         }
     }
 
+    fn invalidate_after_node_rejection(
+        &self,
+        hostname: &str,
+        rejected: &ResolveResponse,
+        rejection: NodeRouteRejection,
+    ) {
+        let refresh = {
+            let mut cache = self.cache.lock().unwrap();
+            let entry = cache
+                .entry(hostname.to_string())
+                .or_insert_with(|| RouteCacheEntry::new(Instant::now()));
+            entry.generation = entry.generation.saturating_add(1);
+            entry.cached = None;
+            let now = Instant::now();
+            entry.retry_after = now;
+            entry.last_failure = None;
+            if rejection.may_use_newer_shared_grant() {
+                entry.allow_only_newer_shared_lookup(rejected, now);
+            } else {
+                entry.block_shared_lookup(now);
+            }
+            entry.refresh.take()
+        };
+        if let Some(refresh) = refresh {
+            refresh.complete(Err(ResolveFailure::Superseded));
+        }
+    }
+
     async fn wake(&self, hostname: &str) -> Result<(), Response> {
         let resp = self
             .http
@@ -914,15 +1055,15 @@ impl Gateway {
         Ok(())
     }
 
-    /// One proxy attempt through the owning node. Ok(None) = stale route.
+    /// One proxy attempt through the owning node.
     async fn try_proxy(
         &self,
         resolved: &ResolveResponse,
         request: &ProxyHttpRequest,
         hostname: &str,
-    ) -> Result<Option<Response>, Response> {
+    ) -> Result<ProxyAttempt, Response> {
         if resolved.node_agent_url.is_empty() {
-            return Ok(None);
+            return Ok(ProxyAttempt::Rejected(NodeRouteRejection::StaleRoute));
         }
         let url = format!(
             "{}/v1/cats/{}/proxy",
@@ -978,10 +1119,12 @@ impl Gateway {
                     HeaderValue::from_str(&resolved.binding.epoch.to_string())
                         .expect("integer is a header value"),
                 );
-                Ok(Some(response))
+                Ok(ProxyAttempt::Response(response))
             }
             // Stale route: the cat is not active on that node any more.
-            reqwest::StatusCode::CONFLICT => Ok(None),
+            reqwest::StatusCode::CONFLICT => Ok(ProxyAttempt::Rejected(
+                NodeRouteRejection::from_headers(resp.headers()),
+            )),
             other => Err(gw_error(
                 StatusCode::BAD_GATEWAY,
                 format!("node hop status {other}"),
@@ -1041,12 +1184,16 @@ impl Gateway {
         let mut prepared = self
             .connect_node_websocket(&resolved, &path, &headers, &hostname)
             .await;
-        if prepared
-            .as_ref()
-            .is_err_and(|response| response.status() == StatusCode::CONFLICT)
-        {
-            self.invalidate(&hostname);
-            match self.resolve(&hostname, false).await {
+        let rejection = prepared.as_ref().err().and_then(|response| {
+            (response.status() == StatusCode::CONFLICT)
+                .then(|| NodeRouteRejection::from_headers(response.headers()))
+        });
+        if let Some(rejection) = rejection {
+            self.invalidate_after_node_rejection(&hostname, &resolved, rejection);
+            match self
+                .resolve(&hostname, rejection.may_use_newer_shared_grant())
+                .await
+            {
                 Ok(fresh) => {
                     resolved = fresh;
                     prepared = self
@@ -1172,7 +1319,16 @@ impl Gateway {
                 tokio_tungstenite::tungstenite::Error::Http(response)
                     if response.status() == StatusCode::CONFLICT =>
                 {
-                    gw_error(StatusCode::CONFLICT, "stale endpoint route".into())
+                    let rejection = NodeRouteRejection::from_headers(response.headers());
+                    let mut gateway_response =
+                        gw_error(StatusCode::CONFLICT, "stale endpoint route".into());
+                    if rejection == NodeRouteRejection::ExpiredGrant {
+                        gateway_response.headers_mut().insert(
+                            HeaderName::from_static(ROUTE_GRANT_REJECTION_HEADER),
+                            HeaderValue::from_static(ROUTE_GRANT_REJECTION_EXPIRED),
+                        );
+                    }
+                    gateway_response
                 }
                 other => gw_error(
                     StatusCode::BAD_GATEWAY,
@@ -1245,29 +1401,33 @@ impl Gateway {
 
         // Proxy; on a stale route re-resolve once and retry.
         match self.try_proxy(resolved, request, hostname).await {
-            Ok(Some(resp)) => resp,
+            Ok(ProxyAttempt::Response(resp)) => resp,
             Err(resp) => resp,
-            Ok(None) => {
-                self.invalidate(hostname);
-                let fresh = match self.resolve(hostname, false).await {
+            Ok(ProxyAttempt::Rejected(rejection)) => {
+                self.invalidate_after_node_rejection(hostname, resolved, rejection);
+                let mut retry = match self
+                    .resolve(hostname, rejection.may_use_newer_shared_grant())
+                    .await
+                {
                     Ok(r) => r,
                     Err(resp) => return resp,
                 };
-                if fresh.observed_state != ObservedState::Running {
-                    if fresh.binding.wake_policy == WakePolicy::NoWake {
+                if retry.observed_state != ObservedState::Running || retry.state != "active" {
+                    if retry.binding.wake_policy == WakePolicy::NoWake {
                         return gw_error(StatusCode::SERVICE_UNAVAILABLE, "endpoint asleep".into());
                     }
                     if let Err(resp) = self.wake(hostname).await {
                         return resp;
                     }
+                    self.invalidate(hostname);
+                    retry = match self.resolve(hostname, false).await {
+                        Ok(r) => r,
+                        Err(resp) => return resp,
+                    };
                 }
-                let retry = match self.resolve(hostname, false).await {
-                    Ok(r) => r,
-                    Err(resp) => return resp,
-                };
                 match self.try_proxy(&retry, request, hostname).await {
-                    Ok(Some(resp)) => resp,
-                    Ok(None) => gw_error(
+                    Ok(ProxyAttempt::Response(resp)) => resp,
+                    Ok(ProxyAttempt::Rejected(_)) => gw_error(
                         StatusCode::CONFLICT,
                         "route kept pointing at a node that does not own the cat".into(),
                     ),
@@ -1704,6 +1864,38 @@ mod tests {
     }
 
     #[test]
+    fn expired_rejection_floor_accepts_only_strictly_newer_shared_authority() {
+        let route = |epoch, issued_at| {
+            let mut resolved = active_resolved_route(
+                "dev.cats.run".to_string(),
+                "http://node-a".to_string(),
+                "grant",
+                issued_at,
+                issued_at + 60,
+            );
+            resolved.binding.epoch = epoch;
+            resolved
+        };
+        let lookup = SharedLookup::NewerThan(RouteGrantOrder {
+            route_epoch: 7,
+            issued_at_unix: 100,
+        });
+
+        assert!(!lookup.accepts(&route(7, 100)));
+        assert!(!lookup.accepts(&route(7, 99)));
+        assert!(!lookup.accepts(&route(6, 10_000)));
+        assert!(lookup.accepts(&route(7, 101)));
+        assert!(lookup.accepts(&route(8, 1)));
+
+        let mut missing_signed_order = route(7, 100);
+        missing_signed_order.route_grant_issued_at_unix = None;
+        let now = Instant::now();
+        let mut entry = RouteCacheEntry::new(now);
+        entry.allow_only_newer_shared_lookup(&missing_signed_order, now);
+        assert_eq!(entry.shared_lookup(now), SharedLookup::Blocked);
+    }
+
+    #[test]
     fn shared_route_record_rejects_malformed_or_inconsistent_metadata() {
         let resolved = active_resolved_route(
             "dev.cats.run".to_string(),
@@ -1975,6 +2167,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_node_rejection_uses_strictly_newer_shared_grant_during_control_outage() {
+        async fn proxy(
+            State(state): State<Arc<MockNodeState>>,
+            Json(request): Json<ProxyHttpRequest>,
+        ) -> Response {
+            state
+                .grants
+                .lock()
+                .unwrap()
+                .push(request.route_grant.clone());
+            if request.route_grant == "grant-1" {
+                return (
+                    StatusCode::CONFLICT,
+                    [(ROUTE_GRANT_REJECTION_HEADER, ROUTE_GRANT_REJECTION_EXPIRED)],
+                    "Endpoint Route Grant has expired",
+                )
+                    .into_response();
+            }
+            Json(ProxyHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"ok".to_vec(),
+            })
+            .into_response()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node_addr = listener.local_addr().unwrap();
+        let node_state = Arc::new(MockNodeState {
+            grants: Mutex::new(Vec::new()),
+        });
+        let node_app = Router::new()
+            .route("/v1/cats/{id}/proxy", axum::routing::post(proxy))
+            .with_state(node_state.clone());
+        let node_task = tokio::spawn(async move {
+            axum::serve(listener, node_app).await.unwrap();
+        });
+        let node_agent_url = format!("http://{node_addr}");
+
+        let state = Arc::new(RouteServerState::new(RouteReply::Status(
+            StatusCode::SERVICE_UNAVAILABLE,
+        )));
+        state.set_node_agent_url(node_agent_url.clone());
+        let shared_cache = SharedRouteCache::memory();
+        let (gateway, control_task) =
+            route_test_gateway_with_shared_cache(state.clone(), 10, shared_cache.clone()).await;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let old = active_resolved_route(
+            "dev.cats.run".to_string(),
+            node_agent_url.clone(),
+            "grant-1",
+            now.saturating_sub(1),
+            now + 59,
+        );
+        let newer = active_resolved_route(
+            "dev.cats.run".to_string(),
+            node_agent_url,
+            "grant-2",
+            now,
+            now + 60,
+        );
+        shared_cache.publish("dev.cats.run", &newer).await.unwrap();
+        gateway.cache.lock().unwrap().insert(
+            "dev.cats.run".to_string(),
+            RouteCacheEntry {
+                cached: Some(CachedRoute {
+                    resolved: old,
+                    fetched: Instant::now(),
+                }),
+                refresh: None,
+                retry_after: Instant::now(),
+                last_failure: None,
+                shared_lookup_barrier: None,
+                shared_lookup_floor: None,
+                generation: 0,
+            },
+        );
+
+        let response = gateway
+            .handle(
+                "dev.cats.run".to_string(),
+                ProxyHttpRequest {
+                    method: "GET".to_string(),
+                    path: "/".to_string(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                    target_port: 0,
+                    route_epoch: 0,
+                    hostname: String::new(),
+                    route_grant: String::new(),
+                },
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            node_state.grants.lock().unwrap().as_slice(),
+            ["grant-1", "grant-2"]
+        );
+        assert_eq!(
+            state.calls(),
+            0,
+            "natural expiry should not require the unavailable control plane when a newer peer Grant exists"
+        );
+
+        control_task.abort();
+        node_task.abort();
+    }
+
+    #[tokio::test]
     async fn shared_route_never_extends_the_signed_grant_expiry() {
         let state = Arc::new(RouteServerState::new(RouteReply::Active("grant-1")));
         let shared_cache = SharedRouteCache::memory();
@@ -2168,6 +2473,7 @@ mod tests {
                         retry_after: Instant::now(),
                         last_failure: None,
                         shared_lookup_barrier: None,
+                        shared_lookup_floor: None,
                         generation: 0,
                     },
                 );
@@ -2616,6 +2922,7 @@ mod tests {
                         retry_after: Instant::now(),
                         last_failure: None,
                         shared_lookup_barrier: None,
+                        shared_lookup_floor: None,
                         generation: 0,
                     },
                 );
@@ -2670,6 +2977,7 @@ mod tests {
                         retry_after: now,
                         last_failure: None,
                         shared_lookup_barrier: None,
+                        shared_lookup_floor: None,
                         generation: 0,
                     },
                 );
