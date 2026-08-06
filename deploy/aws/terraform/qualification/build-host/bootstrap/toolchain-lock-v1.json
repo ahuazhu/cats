@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "architecture": "x86_64",
+  "apt_snapshot": {
+    "snapshot_id": "20260801T000000Z",
+    "archive_url": "https://archive.ubuntu.com/ubuntu/",
+    "security_url": "https://security.ubuntu.com/ubuntu/",
+    "index_sha256": {
+      "noble/InRelease": "cdb2f31d809f589719a53c6ad15f255b27569c4059542ada282aaa21b8e164b0",
+      "noble/main/binary-amd64/Packages.gz": "e0d7e4cbb09d2aa7f9e104a1488817417bc9d85f3e5d9a21156a52ec641ae531",
+      "noble/universe/binary-amd64/Packages.gz": "ce57756edcce0a5f7993ceb89057e1510148e04e3b85a066d780e4bc00485c8a",
+      "noble-updates/InRelease": "6444f7ea0b9fe0955db568c8076a06827c0a1efb276c6519aa455c8667f9eccb",
+      "noble-updates/main/binary-amd64/Packages.gz": "f5272e19da9bf902d3e6ccb9878261086bad3cfbb4937f060984cfdc33b71b22",
+      "noble-updates/universe/binary-amd64/Packages.gz": "1d5bad2b4f1531056826cf5b0813e330cf6e4375bf432dbd1c402b32a7df0d18",
+      "noble-security/InRelease": "ebc0fb5c39e050be717154247bbd1f2acf5ad22bf047ff16ae60a3255ad1c3ec",
+      "noble-security/main/binary-amd64/Packages.gz": "58fc78efae0f6bd047e9842cbb24fb5192b52b508ee0d86984e6adb5d06c9f10",
+      "noble-security/universe/binary-amd64/Packages.gz": "b53e42b4740f608f699c49d482ac7a519f18a2602db6bf3503ea77996f968901"
+    },
+    "packages": {
+      "build-essential": "12.10ubuntu1",
+      "ca-certificates": "20260601~24.04.1",
+      "clang": "1:18.0-59~exp2",
+      "cmake": "3.28.3-1build7",
+      "chrony": "4.5-1ubuntu4.2",
+      "curl": "8.5.0-2ubuntu10.11",
+      "git": "1:2.43.0-1ubuntu7.3",
+      "iptables": "1.8.10-3ubuntu2",
+      "jq": "1.7.1-3ubuntu0.24.04.2",
+      "libssl-dev": "3.0.13-0ubuntu3.12",
+      "lld": "1:18.0-59~exp2",
+      "pkg-config": "1.8.1-2build1",
+      "protobuf-compiler": "3.21.12-8.2ubuntu0.3",
+      "uidmap": "1:4.13+dfsg1-4ubuntu3.2",
+      "unzip": "6.0-28ubuntu4.1",
+      "xz-utils": "5.6.1+really5.4.5-1ubuntu0.3",
+      "zstd": "1.5.5+dfsg2-2build1.1"
+    }
+  },
+  "downloads": {
+    "aws_cli": {
+      "install_version": "2.36.17",
+      "sha256": "7e3b004e49c4550729fddbdc7f199b07b2288fe73a41ac0fcc8f5b873c938f7b",
+      "url": "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.36.17.zip"
+    },
+    "buildkit": {
+      "install_version": "v0.32.2",
+      "sha256": "2975d0f651ad96ba8b80b9992ae1f9a964f4408569af5b6dc36544165c3926af",
+      "url": "https://github.com/moby/buildkit/releases/download/v0.32.2/buildkit-v0.32.2.linux-amd64.tar.gz"
+    },
+    "docker": {
+      "install_version": "29.7.1",
+      "sha256": "0fcea2a8b4d1b54ccc9010e3451b78504a369d414f37eb3bb79300e1b5c22ce6",
+      "url": "https://download.docker.com/linux/static/stable/x86_64/docker-29.7.1.tgz"
+    },
+    "rustup_init": {
+      "install_version": "1.28.2",
+      "sha256": "20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c",
+      "url": "https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init"
+    }
+  },
+  "container_images": {
+    "postgres_16_linux_amd64": "postgres@sha256:670391653713782e51974845b217c56fed4dd8729142299c43c919a8d3e15e00",
+    "rust_1_97_1_bookworm_linux_amd64": "rust@sha256:e544a8ee0b93bb2ddc8c67a80606f040998eff3847e4deed988d0874559f52a8"
+  },
+  "rust": {
+    "cargo_deny": "0.19.4",
+    "cargo_machete": "0.9.2",
+    "components": [
+      "clippy",
+      "rustfmt"
+    ],
+    "toolchain": "1.97.1"
+  }
+}

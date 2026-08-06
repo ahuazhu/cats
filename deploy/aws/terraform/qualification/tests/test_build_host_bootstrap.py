@@ -1,0 +1,295 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+QUALIFICATION_DIR = Path(__file__).resolve().parents[1]
+BUILD_HOST_DIR = QUALIFICATION_DIR / "build-host"
+BOOTSTRAP_DIR = BUILD_HOST_DIR / "bootstrap"
+CONTRACT_PATH = QUALIFICATION_DIR / "contracts" / "h2-build-host-create-v1.json"
+MAINTENANCE_CONTRACT_PATH = (
+    QUALIFICATION_DIR / "contracts" / "h2-build-host-maintenance-v1.json"
+)
+
+
+class BuildHostBoundaryTests(unittest.TestCase):
+    def text(self, relative: str) -> str:
+        return (BUILD_HOST_DIR / relative).read_text(encoding="utf-8")
+
+    def test_candidate_has_no_daemon_or_instance_role_path(self) -> None:
+        bootstrap = self.text("bootstrap/bootstrap.sh")
+        readiness = self.text("bootstrap/verify-readiness.py")
+        guard = self.text("bootstrap/imds-guard.sh")
+        self.assertNotIn("usermod --append --groups docker cats-build", bootstrap)
+        self.assertIn("--group=root", bootstrap)
+        self.assertIn("--group root --oci-worker-net=bridge", bootstrap)
+        self.assertNotIn("security.insecure", bootstrap)
+        self.assertIn('org.mobyproject.buildkit.worker.network: cni', readiness)
+        self.assertIn('"Dockerfile.positive"', readiness)
+        self.assertIn('"Dockerfile.negative"', readiness)
+        self.assertIn("--uid-owner", guard)
+        self.assertIn("FORWARD", guard)
+        self.assertIn("169.254.169.254/32", guard)
+
+    def test_source_delivery_has_no_github_credential_route(self) -> None:
+        corpus = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in BUILD_HOST_DIR.rglob("*")
+            if path.is_file()
+            and ".terraform" not in path.parts
+            and path.suffix in {".tf", ".json", ".md", ".sh", ".py", ".tftpl"}
+            and not path.name.endswith(".plan.json")
+        )
+        for forbidden in (
+            "secretsmanager:",
+            "aws_secretsmanager",
+            "github-deploy-key",
+            "ssh.github.com",
+            "known_hosts",
+        ):
+            self.assertNotIn(forbidden, corpus.lower())
+
+    def test_source_iam_is_read_only_and_prefix_scoped(self) -> None:
+        iam = self.text("iam.tf")
+        self.assertIn('"s3:GetObject"', iam)
+        self.assertIn('"s3:GetObjectVersion"', iam)
+        self.assertIn("/source/bundles/sha256/*", iam)
+        self.assertIn("/source/manifests/sha256/*", iam)
+        self.assertIn('variable = "kms:ViaService"', iam)
+        self.assertIn('variable = "kms:EncryptionContext:aws:s3:arn"', iam)
+        source_read = iam[iam.index('sid = "ReadControllerPublishedSource"') :]
+        source_read = source_read[: source_read.index("resource \"aws_iam_policy\"")]
+        self.assertNotIn("s3:PutObject", source_read)
+        self.assertNotIn("s3:DeleteObject", source_read)
+        self.assertNotIn("s3:ListBucket", source_read)
+
+    def test_source_bucket_is_append_only_and_dedicated(self) -> None:
+        source = self.text("source-delivery.tf")
+        self.assertIn('resource "aws_s3_bucket" "source"', source)
+        self.assertIn('resource "aws_kms_key" "source"', source)
+        self.assertIn('bucket_key_enabled = false', source)
+        self.assertIn('"s3:DeleteObjectVersion"', source)
+        self.assertIn('variable = "s3:if-none-match"', source)
+        self.assertIn('values   = ["*"]', source)
+
+    def test_checkout_uses_only_exact_digests_and_root_publication(self) -> None:
+        checkout = self.text("bootstrap/checkout-exact-sha.sh")
+        self.assertIn("cats-checkout-exact-sha must run as root", checkout)
+        self.assertIn("<40hex-commit> <64hex-manifest-sha256> <64hex-bundle-sha256>", checkout)
+        self.assertIn('manifest_key="source/manifests/sha256/', checkout)
+        self.assertIn('bundle_key="source/bundles/sha256/', checkout)
+        self.assertIn("GIT_CONFIG_NOSYSTEM=1", checkout)
+        self.assertIn("core.hooksPath=/dev/null", checkout)
+        self.assertLess(checkout.index('mv -- "${stage_repo}" "${source_dir}"'), checkout.index("write_immutable_receipt"))
+        self.assertIn("cats-active-delivery-v1.json", checkout)
+        self.assertNotIn("runuser", checkout)
+
+    def test_build_and_publication_are_per_job_root_mediated(self) -> None:
+        runner = self.text("bootstrap/run-build.sh")
+        publisher = self.text("bootstrap/publish-content-addressed.sh")
+        stager = self.text("bootstrap/stage-build-output.py")
+        self.assertIn("manifest_sha256", runner)
+        self.assertIn("cats-active-delivery-v1.json", runner)
+        self.assertIn('"${job_dir}/home"', runner)
+        self.assertIn("env -i", runner)
+        self.assertIn("--uid=cats-build", runner)
+        self.assertIn("--gid=cats-build", runner)
+        self.assertIn("--property=ProtectHome=true", runner)
+        self.assertIn("--property=PrivateTmp=true", runner)
+        self.assertIn("--property=PrivateIPC=true", runner)
+        self.assertIn("--property=NoNewPrivileges=true", runner)
+        self.assertNotIn("/usr/sbin/runuser", runner)
+        self.assertIn("bootstrap_payload_sha256", runner)
+        self.assertIn('chown root:root "${job_dir}"', runner)
+        self.assertIn('chmod 0555 "${job_dir}"', runner)
+        self.assertIn("artifact publication is root-mediated", publisher)
+        self.assertIn("aws kms describe-key", publisher)
+        self.assertIn('--ssekms-key-id "${kms_alias_arn}"', publisher)
+        self.assertIn("stage-build-output", publisher)
+        self.assertIn('.output_frozen == true', publisher)
+        self.assertIn('.job_cgroup_drained == true', publisher)
+        self.assertIn('.output_dir == ("/srv/cats-build/target/"', publisher)
+        self.assertIn("os.O_NOFOLLOW", stager)
+        self.assertIn("source_stat.st_uid != 0", stager)
+        self.assertIn("MAX_BYTES", stager)
+
+    def test_contract_freezes_the_exact_bootstrap_payload(self) -> None:
+        component_files = {
+            "bootstrap": "bootstrap.sh",
+            "checkout": "checkout-exact-sha.sh",
+            "imds_guard": "imds-guard.sh",
+            "immutable_receipt": "immutable-receipt.sh",
+            "publish": "publish-content-addressed.sh",
+            "readiness": "verify-readiness.py",
+            "run_build": "run-build.sh",
+            "stage_output": "stage-build-output.py",
+            "toolchain_lock": "toolchain-lock-v1.json",
+        }
+        observed = {
+            name: hashlib.sha256((BOOTSTRAP_DIR / filename).read_bytes()).hexdigest()
+            for name, filename in component_files.items()
+        }
+        payload = json.dumps(
+            observed, sort_keys=True, separators=(",", ":")
+        ).encode()
+        for path in (CONTRACT_PATH, MAINTENANCE_CONTRACT_PATH):
+            contract = json.loads(path.read_text(encoding="utf-8"))
+            expected = contract["manifest"]["expected"]["bootstrap"]
+            self.assertEqual(expected["components_sha256"], observed)
+            self.assertEqual(
+                expected["payload_sha256"], hashlib.sha256(payload).hexdigest()
+            )
+
+    def test_contract_requires_privileged_plan_values_to_be_known(self) -> None:
+        expected = {
+            "aws_iam_policy.build_boundary": ["policy"],
+            "aws_iam_policy.deployer_boundary": ["policy"],
+            "aws_iam_role.build": ["assume_role_policy"],
+            "aws_iam_role.deployer": ["assume_role_policy"],
+            "aws_iam_role_policy.build": ["policy"],
+            "aws_iam_role_policy.deployer": ["policy"],
+            "aws_instance.build": ["user_data_base64"],
+            "aws_kms_key.artifacts": ["policy"],
+            "aws_kms_key.build_volume": ["policy"],
+            "aws_kms_key.source": ["policy"],
+            "aws_s3_bucket_policy.artifacts": ["policy"],
+            "aws_s3_bucket_policy.source": ["policy"],
+            "aws_vpc_endpoint.build_storage": ["policy"],
+        }
+        for path in (CONTRACT_PATH, MAINTENANCE_CONTRACT_PATH):
+            contract = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(contract["required_known_change_paths"], expected)
+
+    def test_maintenance_contract_freezes_the_complete_live_transition(self) -> None:
+        contract = json.loads(
+            MAINTENANCE_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        self.assertEqual(contract["mode"], "maintenance")
+        self.assertRegex(contract["expected_managed_changes_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(contract["expected_resource_drift_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(len(contract["required_change_actions"]), 41)
+        self.assertEqual(
+            contract["required_change_actions"]["aws_instance.build"],
+            ["delete", "create"],
+        )
+
+    def test_cloud_init_privileged_entrypoints_are_root_only(self) -> None:
+        template = self.text("bootstrap/cloud-init.yaml.tftpl")
+        for path in (
+            "/usr/local/bin/cats-publish-content-addressed",
+            "/usr/local/sbin/cats-run-build",
+            "/usr/local/libexec/cats-build/stage-build-output",
+        ):
+            block = template[template.index(f"path: {path}") :]
+            self.assertIn("permissions: '0700'", block[:300])
+
+    def test_shell_scripts_parse_and_receipt_smoke(self) -> None:
+        scripts = [
+            *BOOTSTRAP_DIR.glob("*.sh"),
+            *BUILD_HOST_DIR.joinpath("tools").glob("*.sh"),
+            *BUILD_HOST_DIR.joinpath("tests").glob("*.sh"),
+        ]
+        for script in scripts:
+            subprocess.run(["bash", "-n", str(script)], check=True)
+        subprocess.run(
+            ["bash", str(BUILD_HOST_DIR / "tests" / "immutable-receipt-smoke.sh")],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def test_controller_source_publication_is_exact_and_idempotent(self) -> None:
+        account_id = "123456789012"
+        kms_key_arn = f"arn:aws:kms:us-east-1:{account_id}:key/01234567-89ab-cdef-0123-456789abcdef"
+        kms_alias_arn = f"arn:aws:kms:us-east-1:{account_id}:alias/cats-qualification-v2-build-source"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repository"
+            repository.mkdir()
+            subprocess.run(["git", "init", "--initial-branch=main", repository], check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "-C", repository, "config", "user.name", "Cats Test"], check=True)
+            subprocess.run(["git", "-C", repository, "config", "user.email", "cats@example.invalid"], check=True)
+            subprocess.run(["git", "-C", repository, "remote", "add", "origin", "https://github.com/ahuazhu/cats.git"], check=True)
+            (repository / "README").write_text("exact source\n", encoding="utf-8")
+            subprocess.run(["git", "-C", repository, "add", "README"], check=True)
+            subprocess.run(["git", "-C", repository, "commit", "-m", "fixture"], check=True, stdout=subprocess.DEVNULL)
+            source_sha = subprocess.run(
+                ["git", "-C", repository, "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_aws = fake_bin / "aws"
+            fake_aws.write_text(
+                f"#!{sys.executable}\nexec(compile(open({str(BUILD_HOST_DIR / 'tests' / 'fake-aws.py')!r}).read(), {str(BUILD_HOST_DIR / 'tests' / 'fake-aws.py')!r}, 'exec'))\n",
+                encoding="utf-8",
+            )
+            fake_aws.chmod(0o755)
+            store = root / "store"
+            work = root / "work"
+            evidence = root / "evidence"
+            for directory in (store, work, evidence):
+                directory.mkdir()
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "FAKE_AWS_ACCOUNT_ID": account_id,
+                "FAKE_AWS_KMS_KEY_ARN": kms_key_arn,
+                "FAKE_AWS_STORE": str(store),
+            }
+            command = [
+                "bash",
+                str(BUILD_HOST_DIR / "tools" / "publish-source-bundle.sh"),
+                account_id,
+                str(repository),
+                source_sha,
+                f"cats-qualification-v2-build-source-{account_id}-us-east-1",
+                kms_alias_arn,
+                str(work),
+            ]
+            first_evidence = evidence / "first.json"
+            subprocess.run([*command, str(first_evidence)], check=True, env=environment, stdout=subprocess.DEVNULL)
+            first = json.loads(first_evidence.read_text(encoding="utf-8"))
+            self.assertEqual(first["source_sha"], source_sha)
+            self.assertFalse(first["github_credential_on_build_host"])
+            self.assertTrue(first["conditional_create"])
+
+            second_evidence = evidence / "second.json"
+            subprocess.run([*command, str(second_evidence)], check=True, env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            second = json.loads(second_evidence.read_text(encoding="utf-8"))
+            self.assertEqual(first["manifest_sha256"], second["manifest_sha256"])
+            self.assertEqual(first["bundle_sha256"], second["bundle_sha256"])
+
+            wrong_sha = "0" * 40
+            wrong = subprocess.run(
+                [*command[:4], wrong_sha, *command[5:], str(evidence / "wrong.json")],
+                env=environment,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(wrong.returncode, 0)
+            self.assertIn("HEAD is not the requested exact commit", wrong.stderr)
+
+            (repository / "untracked").write_text("dirty\n", encoding="utf-8")
+            dirty = subprocess.run(
+                [*command, str(evidence / "dirty.json")],
+                env=environment,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(dirty.returncode, 0)
+            self.assertIn("controller repository must be clean", dirty.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()
