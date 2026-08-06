@@ -26,6 +26,11 @@ POLICY_REPAIR_CONTRACT_PATH = (
 KMS_POLICY_REPAIR_CONTRACT_PATH = (
     QUALIFICATION_DIR / "contracts" / "h2-bucket-kms-policy-repair-v2.json"
 )
+ARTIFACT_KMS_CONTEXT_REPAIR_CONTRACT_PATH = (
+    QUALIFICATION_DIR
+    / "contracts"
+    / "h2-artifact-kms-context-repair-v3.json"
+)
 
 
 class BuildHostBoundaryTests(unittest.TestCase):
@@ -119,6 +124,18 @@ class BuildHostBoundaryTests(unittest.TestCase):
         self.assertIn("--if-none-match '*'", publisher)
         self.assertIn('--ssekms-key-id "${kms_key_arn}"', publisher)
         self.assertNotIn('--ssekms-key-id "${kms_alias_arn}"', publisher)
+
+    def test_artifact_kms_context_matches_s3_bucket_keys(self) -> None:
+        iam = self.text("iam.tf")
+        artifacts = self.text("artifacts.tf")
+        encryption = iam[iam.index('sid = "EncryptPublishedObjects"') :]
+        encryption = encryption[: encryption.index("DescribePublishedArtifactsKey")]
+
+        self.assertIn("bucket_key_enabled = true", artifacts)
+        self.assertIn('test     = "StringEquals"', encryption)
+        self.assertIn('variable = "kms:EncryptionContext:aws:s3:arn"', encryption)
+        self.assertIn("values   = [local.artifact_bucket_arn]", encryption)
+        self.assertNotIn('arn:aws:s3:::${local.artifact_bucket_name}/*', encryption)
 
     def test_checkout_uses_only_exact_digests_and_root_publication(self) -> None:
         checkout = self.text("bootstrap/checkout-exact-sha.sh")
@@ -243,6 +260,13 @@ class BuildHostBoundaryTests(unittest.TestCase):
             kms_policy_contract["required_known_change_paths"],
             preparation_expected,
         )
+        artifact_kms_context_contract = json.loads(
+            ARTIFACT_KMS_CONTEXT_REPAIR_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            artifact_kms_context_contract["required_known_change_paths"],
+            preparation_expected,
+        )
 
     def test_create_contract_binds_unknown_kms_configuration_references(self) -> None:
         contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
@@ -339,6 +363,27 @@ class BuildHostBoundaryTests(unittest.TestCase):
                     "aws_s3_bucket_policy.source": ["update"],
                 },
             )
+
+    def test_artifact_kms_context_contract_allows_only_two_iam_updates(self) -> None:
+        contract = json.loads(
+            ARTIFACT_KMS_CONTEXT_REPAIR_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        non_noop = {
+            address: actions
+            for address, actions in contract["required_change_actions"].items()
+            if actions != ["no-op"]
+        }
+        self.assertEqual(
+            non_noop,
+            {
+                "aws_iam_policy.build_boundary": ["update"],
+                "aws_iam_role_policy.build": ["update"],
+            },
+        )
+        self.assertEqual(
+            contract["expected_resource_drift_sha256"],
+            "c816b433995ee36a15513bcb7521bb07008c4dd1b7f23d91374291705b021a70",
+        )
 
     def test_cloud_init_privileged_entrypoints_are_root_only(self) -> None:
         template = self.text("bootstrap/cloud-init.yaml.tftpl")

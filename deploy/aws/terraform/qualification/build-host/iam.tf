@@ -63,9 +63,12 @@ data "aws_iam_policy_document" "build_permissions" {
     }
 
     condition {
-      test     = "StringLike"
+      # S3 Bucket Keys deliberately use the bucket ARN, rather than the
+      # individual object ARN, as their KMS encryption context. Object-prefix
+      # authority remains constrained by PublishContentAddressedObjects.
+      test     = "StringEquals"
       variable = "kms:EncryptionContext:aws:s3:arn"
-      values   = ["arn:aws:s3:::${local.artifact_bucket_name}/*"]
+      values   = [local.artifact_bucket_arn]
     }
   }
 
