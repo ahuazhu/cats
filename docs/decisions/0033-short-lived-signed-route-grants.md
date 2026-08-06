@@ -122,7 +122,11 @@ would let a compromised Gateway mint arbitrary Cat, Node or port bindings.
   being handled is coalesced with its in-flight refresh, and a rejection for an
   older grant cannot cancel that refresh or remove a newer cached grant. For the
   same grant, a non-expiry conflict is stronger than natural expiry and retains
-  the conservative barrier. HTTP and WebSocket retries use the same rule.
+  the conservative barrier. When a locally cached grant reaches expiry, an
+  earlier control-plane-only background refresh or its retry backoff is upgraded
+  to the shared-capable singleflight if the rejection policy permits shared
+  lookup; expiry-boundary requests do not wait on a refresh that cannot use the
+  continuity path. HTTP and WebSocket retries use the same rule.
 
 The service bearer credential remains as defense in depth for the Gateway-to-
 Node hop. It authenticates the calling service but does not authorize a route.
