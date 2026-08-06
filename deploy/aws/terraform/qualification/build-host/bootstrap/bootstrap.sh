@@ -12,6 +12,7 @@ readonly -a toolchain_paths=(
 
 thaw_toolchain() {
   toolchain_needs_refreeze=true
+  install -d -m 0755 "${toolchain_paths[@]}"
   chown -R cats-build:cats-build "${toolchain_paths[@]}"
   chmod -R u+rwX,go+rX,go-w "${toolchain_paths[@]}"
 }
@@ -167,8 +168,6 @@ if getent passwd 2000 >/dev/null && [[ "$(getent passwd 2000 | cut -d: -f1)" != 
   exit 1
 fi
 id cats-build >/dev/null 2>&1 || useradd --create-home --uid 2000 --shell /bin/bash cats-build
-install -d -m 0755 -o cats-build -g cats-build \
-  /opt/cats-build/cargo /opt/cats-build/rustup
 install -d -m 0755 -o root -g root \
   /srv/cats-build /srv/cats-build/target \
   /var/lib/cats-build /var/lib/cats-build/source-receipts

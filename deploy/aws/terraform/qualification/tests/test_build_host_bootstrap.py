@@ -119,6 +119,19 @@ false
             self.assertEqual(stat.S_IMODE((rustup / "probe").stat().st_mode), 0o444)
             self.assertEqual(stat.S_IMODE(rustup.stat().st_mode), 0o555)
 
+            prepare_failure = run_case(
+                "prepare-failure-work",
+                """
+install() { command install "$@"; return 23; }
+thaw_toolchain
+""",
+            )
+            self.assertEqual(prepare_failure.returncode, 23)
+            self.assertFalse((root / "prepare-failure-work").exists())
+            for path in (cargo, rustup):
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o555)
+                self.assertEqual(stat.S_IMODE((path / "probe").stat().st_mode), 0o444)
+
     def test_source_delivery_has_no_github_credential_route(self) -> None:
         corpus = "\n".join(
             path.read_text(encoding="utf-8")

@@ -119,10 +119,10 @@
         "mode": "asynchronous-systemd",
         "management_ready_gate": "ssm-online",
         "build_ready_path": "/var/lib/cats-build/readiness-v1.json",
-        "bootstrap_sha256": "3b451b916bb1d794d2e482337e22680d2b1f5c85e0f237887993ff6b2f799f04",
+        "bootstrap_sha256": "17920e1226be766bcb187c1fab898a90d24dd25bc1add797bdda0666cfb2c45a",
         "toolchain_lock_sha256": "5884719764338b75cb42012ad97c48df9a035435b0f5de706af9be4058fd220c",
         "components_sha256": {
-          "bootstrap": "3b451b916bb1d794d2e482337e22680d2b1f5c85e0f237887993ff6b2f799f04",
+          "bootstrap": "17920e1226be766bcb187c1fab898a90d24dd25bc1add797bdda0666cfb2c45a",
         "checkout": "060f6eb1327aa3de6dd938b0d33889f62d2643979eb4e24b3757d5da472eeb3b",
         "imds_guard": "55ae2e94b3bbe350b20c29d2aaa6248bbb4552518591b82140add94ef4002dda",
         "immutable_receipt": "c70f6eacb73ba2bea4530dca743c4f7e38eb328af6d1644406a24dd8a85adf54",
@@ -132,7 +132,7 @@
         "stage_output": "13aee4e5a106072cd2ef4cf43ea3f3e95d57d93d4140024ca40a93f52ed60a7a",
           "toolchain_lock": "5884719764338b75cb42012ad97c48df9a035435b0f5de706af9be4058fd220c"
         },
-        "payload_sha256": "0d233ccb2421265236e1440151c74a311c726cad357c764ca9202d9608f40cda",
+        "payload_sha256": "3bf1fb8996c5f1a0e5014633dcd9698dc14c8f4f2a34129e48b663ea7058ef67",
         "apt_snapshot_id": "20260801T000000Z"
       },
       "source_policy": {
@@ -470,7 +470,7 @@
     }
   },
   "expected_configuration_root_sha256": "69747704d4d61a9e3a7d134508163f47cc9f8221d4cfae7d9d540bd67fe27626",
-  "expected_managed_changes_sha256": "92ac5f5b4db00377d321c2a4f5a7c4455b404b90d5250e0d39e1046988a25a7c",
+  "expected_managed_changes_sha256": "29fb29178809d77912545c55c65e06a7ca18002bc77b42283ecc6ce8df1db89f",
   "required_configuration_references": {
     "aws_instance.build": {
       "root_block_device[0].kms_key_id.references": [
