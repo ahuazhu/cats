@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -46,11 +48,76 @@ class BuildHostBoundaryTests(unittest.TestCase):
         self.assertIn("--group root --oci-worker-net=bridge", bootstrap)
         self.assertNotIn("security.insecure", bootstrap)
         self.assertIn('org.mobyproject.buildkit.worker.network: cni', readiness)
+        self.assertIn('"--verbose"', readiness)
         self.assertIn('"Dockerfile.positive"', readiness)
         self.assertIn('"Dockerfile.negative"', readiness)
+        self.assertNotIn('"type=cacheonly"', readiness)
         self.assertIn("--uid-owner", guard)
         self.assertIn("FORWARD", guard)
         self.assertIn("169.254.169.254/32", guard)
+
+    def test_bootstrap_refreezes_toolchain_after_success_and_failure(self) -> None:
+        bootstrap = self.text("bootstrap/bootstrap.sh")
+        start = "toolchain_needs_refreeze=false"
+        end = "trap cleanup EXIT"
+        lifecycle = start + bootstrap.split(start, 1)[1].split(end, 1)[0] + end
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cargo = root / "cargo"
+            rustup = root / "rustup"
+            for path in (cargo, rustup):
+                path.mkdir()
+                (path / "probe").write_text("frozen", encoding="utf-8")
+                (path / "probe").chmod(0o444)
+                path.chmod(0o555)
+
+            lifecycle = lifecycle.replace(
+                "/opt/cats-build/cargo", shlex.quote(str(cargo))
+            ).replace("/opt/cats-build/rustup", shlex.quote(str(rustup)))
+
+            def run_case(name: str, body: str) -> subprocess.CompletedProcess[str]:
+                work = root / name
+                work.mkdir()
+                script = f"""
+set -euo pipefail
+readonly work_dir={shlex.quote(str(work))}
+chown() {{ return 0; }}
+{lifecycle}
+{body}
+"""
+                return subprocess.run(
+                    ["bash", "-c", script],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+
+            success = run_case(
+                "success-work",
+                f"""
+thaw_toolchain
+printf updated >{shlex.quote(str(cargo / 'probe'))}
+freeze_toolchain
+""",
+            )
+            self.assertEqual(success.returncode, 0, success.stderr)
+            self.assertFalse((root / "success-work").exists())
+            self.assertEqual(stat.S_IMODE((cargo / "probe").stat().st_mode), 0o444)
+            self.assertEqual(stat.S_IMODE(cargo.stat().st_mode), 0o555)
+
+            failure = run_case(
+                "failure-work",
+                f"""
+thaw_toolchain
+printf interrupted >{shlex.quote(str(rustup / 'probe'))}
+false
+""",
+            )
+            self.assertNotEqual(failure.returncode, 0)
+            self.assertFalse((root / "failure-work").exists())
+            self.assertEqual(stat.S_IMODE((rustup / "probe").stat().st_mode), 0o444)
+            self.assertEqual(stat.S_IMODE(rustup.stat().st_mode), 0o555)
 
     def test_source_delivery_has_no_github_credential_route(self) -> None:
         corpus = "\n".join(

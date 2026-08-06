@@ -4,7 +4,35 @@ set -euo pipefail
 readonly lock_file="/opt/cats-build/toolchain-lock-v1.json"
 readonly identity_file="/etc/cats-build/identity.json"
 readonly work_dir="$(mktemp -d /var/tmp/cats-build-bootstrap.XXXXXX)"
-trap 'rm -rf -- "${work_dir}"' EXIT
+toolchain_needs_refreeze=false
+readonly -a toolchain_paths=(
+  /opt/cats-build/cargo
+  /opt/cats-build/rustup
+)
+
+thaw_toolchain() {
+  toolchain_needs_refreeze=true
+  chown -R cats-build:cats-build "${toolchain_paths[@]}"
+  chmod -R u+rwX,go+rX,go-w "${toolchain_paths[@]}"
+}
+
+freeze_toolchain() {
+  chown -R root:root "${toolchain_paths[@]}"
+  chmod -R a-w "${toolchain_paths[@]}"
+  toolchain_needs_refreeze=false
+}
+
+cleanup() {
+  local status=$?
+  trap - EXIT
+  if [[ "${toolchain_needs_refreeze}" == "true" ]]; then
+    chown -R root:root "${toolchain_paths[@]}" || status=$?
+    chmod -R a-w "${toolchain_paths[@]}" || status=$?
+  fi
+  rm -rf -- "${work_dir}" || status=$?
+  exit "${status}"
+}
+trap cleanup EXIT
 chmod 0755 "${work_dir}"
 
 if [[ "$(uname -m)" != "x86_64" ]]; then
@@ -148,6 +176,7 @@ install -d -m 0755 -o root -g root \
 download_verified rustup_init "${work_dir}/rustup-init"
 chmod 0755 "${work_dir}/rustup-init"
 readonly rust_toolchain="$(jq -er '.rust.toolchain' "${lock_file}")"
+thaw_toolchain
 runuser -u cats-build -- env \
   HOME=/home/cats-build \
   CARGO_HOME=/opt/cats-build/cargo \
@@ -174,8 +203,7 @@ for cargo_tool in cargo_deny cargo_machete; do
     /opt/cats-build/cargo/bin/cargo install --locked \
       --version "${crate_version}" "${crate_name}"
 done
-chown -R root:root /opt/cats-build/cargo /opt/cats-build/rustup
-chmod -R a-w /opt/cats-build/cargo /opt/cats-build/rustup
+freeze_toolchain
 install -m 0644 /dev/stdin /etc/profile.d/cats-build.sh <<'EOF'
 export RUSTUP_HOME=/opt/cats-build/rustup
 export PATH=/opt/cats-build/cargo/bin:/usr/local/bin:$PATH

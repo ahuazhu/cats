@@ -142,6 +142,7 @@ def main() -> int:
         "unix:///run/buildkit/buildkitd.sock",
         "debug",
         "workers",
+        "--verbose",
     ).stdout
     if "org.mobyproject.buildkit.worker.network: cni" not in workers:
         fail("BuildKit worker is not pinned to isolated bridge networking")
@@ -195,8 +196,6 @@ def main() -> int:
             f"context={probe_dir}",
             "--local",
             f"dockerfile={probe_dir}",
-            "--output",
-            "type=cacheonly",
         )
         run(*common, "--opt", "filename=Dockerfile.positive")
         if run(
