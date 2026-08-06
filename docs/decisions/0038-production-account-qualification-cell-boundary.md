@@ -74,6 +74,14 @@ in an approved encrypted operator vault. Every later qualification state uses
 the dedicated bucket, KMS key and S3 native `use_lockfile`; it never shares the
 production Terraform bucket, key or state prefix.
 
+After apply, an operator stores a recovery copy at
+`architecture-v2/bootstrap-snapshots/<state-sha256>.tfstate` in the
+qualification state bucket. That immutable, content-addressed, versioned and
+KMS-encrypted object is a disaster-recovery snapshot only. It is not an active
+Terraform backend, backend migration, lock participant or `terraform_remote_state`
+interface. The local bootstrap state remains authoritative unless a later ADR
+defines and validates an explicit migration.
+
 ### H2 build authority is qualification-only
 
 H2 may provision a dedicated native x86 build host after G0 is approved and
@@ -93,8 +101,14 @@ operational input rather than part of this trust contract.
 
 ### A saved plan is accepted only through the machine contract
 
-The checked-in validator consumes `terraform show -json` output. For the G0
-create plan it requires all of the following:
+The checked-in contract-driven create-only validator consumes the JSON output
+of `terraform show -json`. It contains no G0 or H2 resource list: each stack
+owns a versioned contract instance declaring its plan variables, manifest
+output and expected JSON template, exact external ARNs, full-string owned ARN
+globs, exact approved external resource identifiers, resource label, checks,
+data reads, creates, tags and identities. A namespace appearing in the middle
+of an unrelated ARN is never proof of ownership. For the G0 create plan it
+requires all of the following:
 
 1. the exact account, region, namespace, cell id and required tag set;
 2. the deterministic manifest seed emitted by Terraform, byte-for-byte after

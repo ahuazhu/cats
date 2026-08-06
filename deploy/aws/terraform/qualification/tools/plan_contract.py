@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from fnmatch import fnmatchcase
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -22,9 +23,17 @@ class ContractInputError(ValueError):
 
 @dataclass(frozen=True)
 class Contract:
-    expected_region: str
-    expected_namespace: str
-    expected_cell_id: str
+    contract_id: str
+    resource_label: str
+    required_template_values: frozenset[str]
+    required_variables: Mapping[str, Any]
+    manifest_output: str
+    expected_manifest: Mapping[str, Any]
+    inventory_account_id: str
+    inventory_region: str
+    allowed_external_arns: tuple[str, ...]
+    owned_arn_globs: tuple[str, ...]
+    approved_external_identifiers: tuple[str, ...]
     required_tags: Mapping[str, str]
     required_check_addresses: frozenset[str]
     allowed_data_addresses: frozenset[str]
@@ -36,12 +45,29 @@ class Contract:
     def load(cls, raw: Mapping[str, Any]) -> "Contract":
         if raw.get("schema_version") != 1:
             raise ContractInputError("contract schema_version must be 1")
-        if raw.get("mode") != "bootstrap-create":
-            raise ContractInputError("only bootstrap-create mode is supported")
+        if raw.get("mode") != "create-only":
+            raise ContractInputError("only create-only mode is supported")
+        manifest = _required_object(raw, "manifest")
+        inventory = _required_object(raw, "forbidden_inventory")
+        identity = _required_object(raw, "identity")
         return cls(
-            expected_region=_required_string(raw, "expected_region"),
-            expected_namespace=_required_string(raw, "expected_namespace"),
-            expected_cell_id=_required_string(raw, "expected_cell_id"),
+            contract_id=_required_string(raw, "contract_id"),
+            resource_label=_required_string(raw, "resource_label"),
+            required_template_values=frozenset(
+                _string_list(raw, "required_template_values")
+            ),
+            required_variables=_required_object(raw, "required_variables"),
+            manifest_output=_required_string(manifest, "output"),
+            expected_manifest=_required_object(manifest, "expected"),
+            inventory_account_id=_required_string(inventory, "account_id"),
+            inventory_region=_required_string(inventory, "region"),
+            allowed_external_arns=tuple(
+                _string_list(identity, "allowed_external_arns")
+            ),
+            owned_arn_globs=tuple(_string_list(identity, "owned_arn_globs")),
+            approved_external_identifiers=tuple(
+                _string_list(identity, "approved_external_identifiers")
+            ),
             required_tags=_string_map(raw, "required_tags"),
             required_check_addresses=frozenset(
                 _string_list(raw, "required_check_addresses")
@@ -62,19 +88,19 @@ class Contract:
 
 
 @dataclass(frozen=True)
-class ProductionInventory:
+class ForbiddenInventory:
     observed_account_id: str
     observed_region: str
     identifiers: tuple[str, ...]
 
     @classmethod
-    def load(cls, raw: Mapping[str, Any]) -> "ProductionInventory":
+    def load(cls, raw: Mapping[str, Any]) -> "ForbiddenInventory":
         if raw.get("schema_version") != 1:
             raise ContractInputError("inventory schema_version must be 1")
         identifiers = tuple(_string_list(raw, "identifiers"))
         if not identifiers:
             raise ContractInputError(
-                "production inventory must contain at least one identifier"
+                "forbidden inventory must contain at least one identifier"
             )
         return cls(
             observed_account_id=_required_string(raw, "observed_account_id"),
@@ -85,43 +111,60 @@ class ProductionInventory:
 
 @dataclass(frozen=True)
 class ValidationContext:
-    account_id: str
-    bootstrap_principal_arn: str
+    template_values: Mapping[str, str]
     contract: Contract
-    inventory: ProductionInventory
+    inventory: ForbiddenInventory
+
+    def __post_init__(self) -> None:
+        missing = self.contract.required_template_values - self.template_values.keys()
+        extra = self.template_values.keys() - self.contract.required_template_values
+        if missing:
+            raise ContractInputError(
+                f"missing template values: {', '.join(sorted(missing))}"
+            )
+        if extra:
+            raise ContractInputError(
+                f"undeclared template values: {', '.join(sorted(extra))}"
+            )
+        for arn in self.rendered_external_arns:
+            if any(token in arn for token in "*?[") or AWS_ARN.fullmatch(arn) is None:
+                raise ContractInputError(
+                    f"allowed external ARN must be exact and valid: {arn!r}"
+                )
+        for pattern in self.rendered_owned_arn_globs:
+            if not pattern.startswith("arn:"):
+                raise ContractInputError(
+                    f"owned ARN glob must be anchored at arn:: {pattern!r}"
+                )
+        for identifier in self.rendered_external_identifiers:
+            if AWS_RESOURCE_ID.fullmatch(identifier) is None:
+                raise ContractInputError(
+                    f"approved external identifier must be one exact AWS ID: {identifier!r}"
+                )
+
+    def render(self, value: Any) -> Any:
+        return _render_value(value, self.template_values)
 
     @property
-    def expected_manifest(self) -> Mapping[str, Any]:
-        namespace = self.contract.expected_namespace
-        region = self.contract.expected_region
-        return {
-            "schema_version": 1,
-            "environment": "qualification",
-            "environment_is_production": False,
-            "account_id": self.account_id,
-            "region": region,
-            "namespace": namespace,
-            "cell_id": self.contract.expected_cell_id,
-            "required_tags": dict(self.contract.required_tags),
-            "terraform_state": {
-                "bucket": f"{namespace}-tfstate-{self.account_id}-{region}",
-                "kms_alias": f"alias/{namespace}-terraform-state",
-                "key_prefix": "architecture-v2",
-                "use_lockfile": True,
-                "state_role_arn": (
-                    f"arn:aws:iam::{self.account_id}:role/"
-                    f"{namespace}-terraform-state"
-                ),
-            },
-        }
+    def rendered_manifest(self) -> Mapping[str, Any]:
+        rendered = self.render(self.contract.expected_manifest)
+        if not isinstance(rendered, dict):
+            raise ContractInputError("rendered manifest must be an object")
+        return rendered
 
     @property
-    def allowed_external_arns(self) -> frozenset[str]:
+    def rendered_external_arns(self) -> frozenset[str]:
+        return frozenset(self.render(value) for value in self.contract.allowed_external_arns)
+
+    @property
+    def rendered_owned_arn_globs(self) -> tuple[str, ...]:
+        return tuple(self.render(value) for value in self.contract.owned_arn_globs)
+
+    @property
+    def rendered_external_identifiers(self) -> frozenset[str]:
         return frozenset(
-            {
-                self.bootstrap_principal_arn,
-                f"arn:aws:iam::{self.account_id}:root",
-            }
+            self.render(value)
+            for value in self.contract.approved_external_identifiers
         )
 
 
@@ -165,17 +208,19 @@ def validate_plan(
 
 def _validate_observation(context: ValidationContext, errors: list[str]) -> None:
     inventory = context.inventory
-    if inventory.observed_account_id != context.account_id:
+    expected_account_id = context.render(context.contract.inventory_account_id)
+    expected_region = context.render(context.contract.inventory_region)
+    if inventory.observed_account_id != expected_account_id:
         errors.append(
-            "production inventory account does not match the expected account"
+            "forbidden inventory account does not match the contract"
         )
-    if inventory.observed_region != context.contract.expected_region:
+    if inventory.observed_region != expected_region:
         errors.append(
-            "production inventory region does not match the expected region"
+            "forbidden inventory region does not match the contract"
         )
-    if context.account_id in inventory.identifiers:
+    if expected_account_id in inventory.identifiers:
         errors.append(
-            "production inventory must list resource identifiers, not the bare account ID"
+            "forbidden inventory must list resource identifiers, not its bare account ID"
         )
 
 
@@ -187,13 +232,9 @@ def _validate_plan_identity(
         errors.append("plan has no variables object")
         return
 
-    expected = {
-        "expected_account_id": context.account_id,
-        "aws_region": context.contract.expected_region,
-        "qualification_namespace": context.contract.expected_namespace,
-        "qualification_cell_id": context.contract.expected_cell_id,
-        "bootstrap_principal_arn": context.bootstrap_principal_arn,
-    }
+    expected = context.render(context.contract.required_variables)
+    if not isinstance(expected, dict):
+        raise ContractInputError("rendered required_variables must be an object")
     for key, wanted in expected.items():
         entry = variables.get(key)
         value = entry.get("value") if isinstance(entry, dict) else None
@@ -204,7 +245,7 @@ def _validate_plan_identity(
         errors.append("Terraform marked the saved plan as errored")
     drift = plan.get("resource_drift", [])
     if drift:
-        errors.append("bootstrap-create plan contains resource drift")
+        errors.append(f"{context.contract.resource_label} plan contains resource drift")
 
 
 def _validate_plan_status(
@@ -264,8 +305,9 @@ def _validate_empty_managed_state(
                 errors.append("saved plan prior state has a malformed resource")
                 continue
             if resource.get("mode", "managed") == "managed":
+                address = resource.get("address", "<unknown>")
                 errors.append(
-                    f"{resource.get('address', '<unknown>')}: bootstrap prior state contains a managed resource"
+                    f"{address}: create-only prior state contains a managed resource"
                 )
 
 
@@ -274,13 +316,14 @@ def _validate_manifest(
 ) -> Mapping[str, Any] | None:
     planned = plan.get("planned_values")
     outputs = planned.get("outputs") if isinstance(planned, dict) else None
-    entry = outputs.get("qualification_manifest_seed") if isinstance(outputs, dict) else None
+    output_name = context.contract.manifest_output
+    entry = outputs.get(output_name) if isinstance(outputs, dict) else None
     manifest = entry.get("value") if isinstance(entry, dict) else None
     if not isinstance(manifest, dict):
-        errors.append("qualification_manifest_seed is missing or unknown")
+        errors.append(f"{output_name} is missing or unknown")
         return None
-    if _canonical_json(manifest) != _canonical_json(context.expected_manifest):
-        errors.append("qualification_manifest_seed does not match the exact contract")
+    if _canonical_json(manifest) != _canonical_json(context.rendered_manifest):
+        errors.append(f"{output_name} does not match the exact contract")
     return manifest
 
 
@@ -302,6 +345,7 @@ def _validate_changes(
         if not isinstance(address, str):
             errors.append("resource change has no address")
             continue
+        label = context.contract.resource_label
         mode = raw.get("mode", "managed")
         change = raw.get("change")
         actions = change.get("actions") if isinstance(change, dict) else None
@@ -323,10 +367,12 @@ def _validate_changes(
             continue
 
         if address not in context.contract.required_create_addresses:
-            errors.append(f"{address}: resource address is outside the G0 contract")
+            errors.append(
+                f"{address}: resource address is outside the {label} contract"
+            )
         if actions != ["create"]:
             errors.append(
-                f"{address}: bootstrap contract permits create only, got {actions}"
+                f"{address}: {label} contract permits create only, got {actions}"
             )
         else:
             seen_creates.add(address)
@@ -346,7 +392,9 @@ def _validate_changes(
 
     missing = context.contract.required_create_addresses - seen_creates
     for address in sorted(missing):
-        errors.append(f"{address}: required bootstrap create is missing")
+        errors.append(
+            f"{address}: required {context.contract.resource_label} create is missing"
+        )
     return create_count
 
 
@@ -362,17 +410,21 @@ def _scan_forbidden_values(
                 errors.append(
                     f"{address}.{path}: contains existing production identifier {identifier!r}"
                 )
-        match = AWS_RESOURCE_ID.search(string)
-        if match:
-            errors.append(
-                f"{address}.{path}: contains concrete existing AWS resource ID {match.group(0)!r}"
-            )
-        for arn in AWS_ARN.findall(string):
-            if arn in context.allowed_external_arns:
-                continue
-            if context.contract.expected_namespace not in arn:
+        for match in AWS_RESOURCE_ID.finditer(string):
+            identifier = match.group(0)
+            if identifier not in context.rendered_external_identifiers:
                 errors.append(
-                    f"{address}.{path}: ARN is outside the qualification namespace: {arn!r}"
+                    f"{address}.{path}: contains concrete existing AWS resource ID {identifier!r}"
+                )
+        for arn in AWS_ARN.findall(string):
+            if arn in context.rendered_external_arns:
+                continue
+            if not any(
+                fnmatchcase(arn, pattern)
+                for pattern in context.rendered_owned_arn_globs
+            ):
+                errors.append(
+                    f"{address}.{path}: ARN is outside the contract ownership boundary: {arn!r}"
                 )
 
 
@@ -383,14 +435,8 @@ def _validate_identity_templates(
     errors: list[str],
 ) -> None:
     templates = context.contract.required_identity_templates.get(address, {})
-    values = {
-        "namespace": context.contract.expected_namespace,
-        "account_id": context.account_id,
-        "region": context.contract.expected_region,
-        "cell_id": context.contract.expected_cell_id,
-    }
     for path, template in templates.items():
-        expected = template.format_map(values)
+        expected = context.render(template)
         actual = _lookup_path(after, path)
         if actual != expected:
             errors.append(
@@ -450,10 +496,39 @@ def _canonical_json(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+TEMPLATE_TOKEN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _render_value(value: Any, template_values: Mapping[str, str]) -> Any:
+    if isinstance(value, str):
+        def replace(match: re.Match[str]) -> str:
+            name = match.group(1)
+            if name not in template_values:
+                raise ContractInputError(f"template references undeclared value {name!r}")
+            return template_values[name]
+
+        return TEMPLATE_TOKEN.sub(replace, value)
+    if isinstance(value, dict):
+        return {
+            key: _render_value(child, template_values)
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [_render_value(child, template_values) for child in value]
+    return value
+
+
 def _required_string(raw: Mapping[str, Any], key: str) -> str:
     value = raw.get(key)
     if not isinstance(value, str) or not value:
         raise ContractInputError(f"{key} must be a non-empty string")
+    return value
+
+
+def _required_object(raw: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+    value = raw.get(key)
+    if not isinstance(value, dict) or not value:
+        raise ContractInputError(f"{key} must be a non-empty object")
     return value
 
 

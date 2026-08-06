@@ -14,6 +14,13 @@ The bootstrap configuration intentionally has local state because it creates
 the qualification backend. Keep that state in an approved encrypted operator
 vault.
 
+After a reviewed apply, copy the state to
+`architecture-v2/bootstrap-snapshots/<state-sha256>.tfstate` as an immutable
+recovery snapshot in the versioned, KMS-encrypted qualification bucket. This
+object is not an active backend or migration target, takes no Terraform lock,
+and must not be consumed through `terraform_remote_state`. Local bootstrap
+state remains authoritative.
+
 ```sh
 cd deploy/aws/terraform/qualification/bootstrap
 cp bootstrap.tfvars.example bootstrap.auto.tfvars
@@ -26,13 +33,33 @@ python3 ../tools/validate_saved_plan.py \
   --plan-json qualification-bootstrap.plan.json \
   --contract ../contracts/bootstrap-create-v1.json \
   --forbidden-inventory /approved/path/production-resource-denylist.json \
-  --expected-account-id "$QUALIFICATION_AWS_ACCOUNT_ID" \
-  --bootstrap-principal-arn "$QUALIFICATION_BOOTSTRAP_PRINCIPAL_ARN"
+  --template-value "account_id=$QUALIFICATION_AWS_ACCOUNT_ID" \
+  --template-value "bootstrap_principal_arn=$QUALIFICATION_BOOTSTRAP_PRINCIPAL_ARN"
 ```
 
 The two environment variables above are shell conveniences in this example,
 not implicit inputs to Terraform or the validator. The values must also be
 present explicitly in the reviewed `bootstrap.auto.tfvars` and command.
+
+## Shared create-only gate
+
+`tools/validate_saved_plan.py` contains no G0 or H2 resource semantics. Each
+stack supplies a versioned JSON contract declaring its human-readable resource
+label, exact plan variables, manifest output and expected JSON template,
+forbidden-inventory account/region, exact external ARNs, full-string owned ARN
+globs, exact approved external resource identifiers, checks, data reads, create
+addresses, tags and identity templates. Runtime values are explicit
+`--template-value NAME=VALUE` arguments, and the contract declares the complete
+allowed name set. ARN globs are matched against the entire ARN; a namespace
+substring in an unrelated production ARN grants no authority. Concrete AWS IDs
+remain denied unless the contract lists the exact token, such as H2's reviewed
+Canonical AMI.
+
+Later stacks, including H2, must add a new contract instance and reuse this
+gate. They must not copy the validator or widen the G0 contract. Create-only
+means an applyable and complete plan with all declared checks passing, no
+managed prior state or drift, and exactly the declared creates; update,
+replace, delete, no-op managed resources and undeclared data reads fail closed.
 
 Do not apply while #241 is awaiting saved-plan review. After approval, apply
 the exact file that was reviewed:

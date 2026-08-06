@@ -13,7 +13,7 @@ sys.path.insert(0, str(QUALIFICATION_DIR / "tools"))
 from plan_contract import (  # noqa: E402
     Contract,
     ContractInputError,
-    ProductionInventory,
+    ForbiddenInventory,
     ValidationContext,
     load_json_object,
     validate_plan,
@@ -32,7 +32,7 @@ class SavedPlanContractTests(unittest.TestCase):
                 QUALIFICATION_DIR / "contracts" / "bootstrap-create-v1.json"
             )
         )
-        cls.inventory = ProductionInventory.load(
+        cls.inventory = ForbiddenInventory.load(
             {
                 "schema_version": 1,
                 "observed_account_id": ACCOUNT_ID,
@@ -47,8 +47,10 @@ class SavedPlanContractTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.context = ValidationContext(
-            account_id=ACCOUNT_ID,
-            bootstrap_principal_arn=PRINCIPAL_ARN,
+            template_values={
+                "account_id": ACCOUNT_ID,
+                "bootstrap_principal_arn": PRINCIPAL_ARN,
+            },
             contract=self.contract,
             inventory=self.inventory,
         )
@@ -137,7 +139,7 @@ class SavedPlanContractTests(unittest.TestCase):
                 )
             }
         )
-        self.assert_rejected("ARN is outside the qualification namespace")
+        self.assert_rejected("ARN is outside the contract ownership boundary")
 
     def test_rejects_missing_identity_tag(self) -> None:
         change = find_change(self.plan, "aws_kms_key.state")
@@ -162,7 +164,7 @@ class SavedPlanContractTests(unittest.TestCase):
                 },
             }
         )
-        self.assert_rejected("outside the G0 contract")
+        self.assert_rejected("outside the qualification bootstrap contract")
 
     def test_rejects_unapproved_data_source(self) -> None:
         self.plan["resource_changes"].append(
@@ -205,7 +207,7 @@ class SavedPlanContractTests(unittest.TestCase):
                 },
             }
         )
-        self.assert_rejected("outside the G0 contract")
+        self.assert_rejected("outside the qualification bootstrap contract")
 
     def test_rejects_existing_managed_prior_state(self) -> None:
         self.plan["prior_state"]["values"]["root_module"]["resources"] = [
@@ -222,10 +224,12 @@ class SavedPlanContractTests(unittest.TestCase):
 
     def test_rejects_inventory_from_another_account(self) -> None:
         context = ValidationContext(
-            account_id=ACCOUNT_ID,
-            bootstrap_principal_arn=PRINCIPAL_ARN,
+            template_values={
+                "account_id": ACCOUNT_ID,
+                "bootstrap_principal_arn": PRINCIPAL_ARN,
+            },
             contract=self.contract,
-            inventory=ProductionInventory(
+            inventory=ForbiddenInventory(
                 observed_account_id="999999999999",
                 observed_region="us-east-1",
                 identifiers=("cats-production",),
@@ -234,19 +238,146 @@ class SavedPlanContractTests(unittest.TestCase):
         result = validate_plan(self.plan, context)
         self.assertFalse(result.accepted)
         self.assertIn(
-            "production inventory account does not match the expected account",
+            "forbidden inventory account does not match the contract",
             result.errors,
         )
 
     def test_empty_inventory_cannot_issue_a_verdict(self) -> None:
         with self.assertRaisesRegex(ContractInputError, "at least one identifier"):
-            ProductionInventory.load(
+            ForbiddenInventory.load(
                 {
                     "schema_version": 1,
                     "observed_account_id": ACCOUNT_ID,
                     "observed_region": "us-east-1",
                     "identifiers": [],
                 }
+            )
+
+
+class ContractDrivenGateTests(unittest.TestCase):
+    def test_a_second_stack_supplies_semantics_without_copying_the_gate(self) -> None:
+        contract = Contract.load(
+            {
+                "schema_version": 1,
+                "mode": "create-only",
+                "contract_id": "example-build-create-v1",
+                "resource_label": "example build host",
+                "required_template_values": ["source_sha"],
+                "required_variables": {"source_sha": "{source_sha}"},
+                "manifest": {
+                    "output": "build_manifest",
+                    "expected": {
+                        "schema_version": 1,
+                        "source_sha": "{source_sha}",
+                    },
+                },
+                "forbidden_inventory": {
+                    "account_id": ACCOUNT_ID,
+                    "region": "us-east-1",
+                },
+                "identity": {
+                    "allowed_external_arns": [],
+                    "owned_arn_globs": [
+                        "arn:aws:s3:::cats-qualification-v2-*"
+                    ],
+                    "approved_external_identifiers": [
+                        "ami-052355af2a014bd2c"
+                    ],
+                },
+                "required_tags": {"Environment": "qualification"},
+                "required_check_addresses": ["check.build_identity"],
+                "allowed_data_addresses": [],
+                "required_create_addresses": ["aws_instance.build_host"],
+                "tagged_resource_addresses": ["aws_instance.build_host"],
+                "required_identity_templates": {
+                    "aws_instance.build_host": {
+                        "ami": "ami-052355af2a014bd2c",
+                        "instance_type": "c7i.12xlarge",
+                    }
+                },
+            }
+        )
+        context = ValidationContext(
+            template_values={"source_sha": "abc123"},
+            contract=contract,
+            inventory=ForbiddenInventory(
+                observed_account_id=ACCOUNT_ID,
+                observed_region="us-east-1",
+                identifiers=("cats-production",),
+            ),
+        )
+        plan = {
+            "errored": False,
+            "applyable": True,
+            "complete": True,
+            "variables": {"source_sha": {"value": "abc123"}},
+            "planned_values": {
+                "outputs": {
+                    "build_manifest": {
+                        "value": {"schema_version": 1, "source_sha": "abc123"}
+                    }
+                }
+            },
+            "resource_changes": [
+                {
+                    "address": "aws_instance.build_host",
+                    "mode": "managed",
+                    "change": {
+                        "actions": ["create"],
+                        "before": None,
+                        "after": {
+                            "ami": "ami-052355af2a014bd2c",
+                            "instance_type": "c7i.12xlarge",
+                            "tags_all": {"Environment": "qualification"},
+                        },
+                    },
+                }
+            ],
+            "resource_drift": [],
+            "prior_state": {
+                "values": {"root_module": {"resources": []}}
+            },
+            "checks": [
+                {
+                    "address": {"to_display": "check.build_identity"},
+                    "status": "pass",
+                    "instances": [{"status": "pass"}],
+                }
+            ],
+        }
+
+        result = validate_plan(plan, context)
+
+        self.assertTrue(result.accepted, result.errors)
+        self.assertEqual(result.managed_create_count, 1)
+
+        near_miss = copy.deepcopy(plan)
+        near_miss["resource_changes"][0]["change"]["after"]["ami"] = (
+            "ami-052355af2a014bd2d"
+        )
+        rejected = validate_plan(near_miss, context)
+        self.assertFalse(rejected.accepted)
+        self.assertTrue(
+            any("concrete existing AWS resource ID" in error for error in rejected.errors),
+            rejected.errors,
+        )
+
+        middle_marker = copy.deepcopy(plan)
+        middle_marker["resource_changes"][0]["change"]["after"]["policy"] = (
+            f"arn:aws:secretsmanager:us-east-1:{ACCOUNT_ID}:"
+            "secret:prod-secret/cats-qualification-v2-decoy"
+        )
+        rejected = validate_plan(middle_marker, context)
+        self.assertFalse(rejected.accepted)
+        self.assertTrue(
+            any("outside the contract ownership boundary" in error for error in rejected.errors),
+            rejected.errors,
+        )
+        with self.assertRaisesRegex(ContractInputError, "missing template values"):
+            ValidationContext(
+                template_values={},
+                contract=contract,
+                inventory=context.inventory,
             )
 
 
@@ -304,9 +435,9 @@ def make_valid_plan(context: ValidationContext) -> dict:
         },
         "planned_values": {
             "outputs": {
-                "qualification_manifest_seed": {
+                context.contract.manifest_output: {
                     "sensitive": False,
-                    "value": copy.deepcopy(context.expected_manifest),
+                    "value": copy.deepcopy(context.rendered_manifest),
                 }
             }
         },
