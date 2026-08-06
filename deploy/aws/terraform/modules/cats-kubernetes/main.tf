@@ -3,8 +3,8 @@ locals {
   # sends SIGTERM. Keep the HTTP server alive while the EndpointSlice and EKS
   # Auto Mode ALB remove that target; otherwise the ALB can route to a process
   # that has already exited during the propagation window.
-  control_plane_pre_stop_delay_seconds           = 15
-  control_plane_termination_grace_period_seconds = 30
+  public_target_pre_stop_delay_seconds           = 15
+  public_target_termination_grace_period_seconds = 30
 
   labels = {
     "app.kubernetes.io/part-of"    = "cats"
@@ -60,10 +60,10 @@ locals {
   )
 }
 
-check "control_plane_drain_fits_termination_grace" {
+check "public_target_drain_fits_termination_grace" {
   assert {
-    condition     = local.control_plane_pre_stop_delay_seconds < local.control_plane_termination_grace_period_seconds
-    error_message = "control-plane termination grace must outlast its preStop target-drain delay."
+    condition     = local.public_target_pre_stop_delay_seconds < local.public_target_termination_grace_period_seconds
+    error_message = "public target termination grace must outlast its preStop target-drain delay."
   }
 }
 
@@ -234,7 +234,7 @@ resource "kubernetes_deployment_v1" "control_plane" {
         automount_service_account_token  = false
         enable_service_links             = false
         service_account_name             = kubernetes_service_account_v1.control_plane.metadata[0].name
-        termination_grace_period_seconds = local.control_plane_termination_grace_period_seconds
+        termination_grace_period_seconds = local.public_target_termination_grace_period_seconds
 
         node_selector = {
           "kubernetes.io/arch" = "amd64"
@@ -348,7 +348,7 @@ resource "kubernetes_deployment_v1" "control_plane" {
           lifecycle {
             pre_stop {
               exec {
-                command = ["/bin/sh", "-c", "sleep ${local.control_plane_pre_stop_delay_seconds}"]
+                command = ["/bin/sh", "-c", "sleep ${local.public_target_pre_stop_delay_seconds}"]
               }
             }
           }
@@ -491,6 +491,15 @@ resource "kubernetes_deployment_v1" "gateway" {
   spec {
     replicas = var.gateway_replicas
 
+    strategy {
+      type = "RollingUpdate"
+
+      rolling_update {
+        max_surge       = "1"
+        max_unavailable = "0"
+      }
+    }
+
     selector {
       match_labels = {
         "app.kubernetes.io/name" = "cats-gatewayd"
@@ -508,12 +517,39 @@ resource "kubernetes_deployment_v1" "gateway" {
       }
 
       spec {
-        automount_service_account_token = false
-        enable_service_links            = false
-        service_account_name            = kubernetes_service_account_v1.gateway.metadata[0].name
+        automount_service_account_token  = false
+        enable_service_links             = false
+        service_account_name             = kubernetes_service_account_v1.gateway.metadata[0].name
+        termination_grace_period_seconds = local.public_target_termination_grace_period_seconds
 
         node_selector = {
           "kubernetes.io/arch" = "amd64"
+        }
+
+        affinity {
+          pod_anti_affinity {
+            required_during_scheduling_ignored_during_execution {
+              topology_key = "kubernetes.io/hostname"
+
+              label_selector {
+                match_labels = {
+                  "app.kubernetes.io/name" = "cats-gatewayd"
+                }
+              }
+            }
+          }
+        }
+
+        topology_spread_constraint {
+          max_skew           = 1
+          topology_key       = "kubernetes.io/hostname"
+          when_unsatisfiable = "DoNotSchedule"
+
+          label_selector {
+            match_labels = {
+              "app.kubernetes.io/name" = "cats-gatewayd"
+            }
+          }
         }
 
         container {
@@ -569,6 +605,14 @@ resource "kubernetes_deployment_v1" "gateway" {
             }
           }
 
+          lifecycle {
+            pre_stop {
+              exec {
+                command = ["/bin/sh", "-c", "sleep ${local.public_target_pre_stop_delay_seconds}"]
+              }
+            }
+          }
+
           readiness_probe {
             http_get {
               path = "/healthz"
@@ -609,6 +653,24 @@ resource "kubernetes_deployment_v1" "gateway" {
   # for every control-plane replica to finish its rollout before replacing the
   # first Gateway Pod.
   depends_on = [kubernetes_deployment_v1.control_plane]
+}
+
+resource "kubernetes_pod_disruption_budget_v1" "gateway" {
+  metadata {
+    name      = "cats-gatewayd"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels    = local.labels
+  }
+
+  spec {
+    min_available = "1"
+
+    selector {
+      match_labels = {
+        "app.kubernetes.io/name" = "cats-gatewayd"
+      }
+    }
+  }
 }
 
 resource "kubernetes_service_v1" "gateway" {
