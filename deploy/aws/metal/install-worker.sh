@@ -11,6 +11,27 @@ CATS_CH_VERSION=${CATS_CH_VERSION:-v53.0}
 [[ $(uname -m) == x86_64 ]] || { echo "x86_64 is required" >&2; exit 1; }
 [[ -e /dev/kvm ]] || { echo "/dev/kvm missing: use a bare-metal instance" >&2; exit 1; }
 
+validate_worker_identity() {
+  local worker_node_id worker_advertise_url
+
+  # Read the last assignment, matching systemd EnvironmentFile semantics,
+  # without sourcing operator-controlled shell text.
+  worker_node_id=$(awk -F= '$1 == "CATS_NODE_ID" { value = substr($0, index($0, "=") + 1) } END { print value }' /etc/cats/worker.env)
+  worker_advertise_url=$(awk -F= '$1 == "CATS_NODE_ADVERTISE_URL" { value = substr($0, index($0, "=") + 1) } END { print value }' /etc/cats/worker.env)
+  if [[ -z $worker_node_id || $worker_node_id == REPLACE_WITH_UNIQUE_NODE_ID ]]; then
+    echo "/etc/cats/worker.env needs a unique CATS_NODE_ID before the worker can start" >&2
+    exit 1
+  fi
+  if [[ -z $worker_advertise_url || $worker_advertise_url == *PRIVATE_IPV4* ]]; then
+    echo "/etc/cats/worker.env needs this host's CATS_NODE_ADVERTISE_URL before the worker can start" >&2
+    exit 1
+  fi
+}
+
+# Refuse a copied example before downloading packages or building binaries: a
+# duplicate node identity sends this host's jobs to a different worker.
+[[ ! -f /etc/cats/worker.env ]] || validate_worker_identity
+
 # SSM RunShellScript and cloud-init use non-login root shells where HOME may
 # be absent. rustup and cargo still need a stable home before the guest-image
 # builder runs, so make the root-only install contract explicit.

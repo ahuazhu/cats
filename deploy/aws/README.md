@@ -70,8 +70,12 @@ debootstrapped Ubuntu filesystem. Changes to those parts of
 `OUT=/opt/cats/guest metal/build-guest-image.sh`, followed by a worker restart;
 the Guest kernel is the Host's own, which is why the complete boot artifact is
 not built in CI. `metal/install-worker.sh` remains a bootstrap/development
-helper. Cloud Hypervisor stays under `/opt/cats/bin` so it does not replace a
-host-wide binary used by another workload. The S3 adapter uses the EC2
+helper. Its example deliberately contains `REPLACE_WITH_UNIQUE_NODE_ID` and
+`PRIVATE_IPV4`; fill both before rerunning the helper. An existing file with
+either placeholder is rejected before package installation or compilation so
+a second host cannot claim another worker's identity. Cloud Hypervisor stays
+under `/opt/cats/bin` so it does not replace a host-wide binary used by another
+workload. The S3 adapter uses the EC2
 instance role and refreshes its temporary credentials; no long-lived AWS key is
 stored in `worker.env`.
 
