@@ -589,7 +589,7 @@ COMMIT;
       <div class="flow">
         <div class="step"><b>1. DNS</b><p><code>dev-&lt;opaque-cat-suffix&gt;.cats.run</code> 指向区域 Edge；不指向某台裸金属 Node。</p></div>
         <div class="step"><b>2. TLS / WAF</b><p>Edge 选择证书、校验 Host/SNI、执行限流和最大请求策略。</p></div>
-        <div class="step"><b>3. Route Lookup</b><p>按 hostname 查只读缓存，得到 workspace/cat/generation/node/port/epoch 和控制面签发的短期 Ed25519 Route Grant；Gateway 没有签名私钥。</p></div>
+        <div class="step"><b>3. Route Lookup</b><p>按规范化公网 Host 查只读缓存，得到 workspace/cat/generation/node/port/epoch 和控制面签发的短期 Ed25519 Route Grant；写缓存前要求返回 binding 的规范化 hostname 完全相同，HTTP/WS 都把这个原始授权 Host 发送给 Node。Gateway 没有签名私钥。</p></div>
         <div class="step"><b>4. Activation</b><p>Cat 非 Running 时按 wake policy 唤醒；并发请求 singleflight。</p></div>
         <div class="step"><b>5. Node Hop</b><p>通过区域私网/mTLS 或受控 tunnel 发送到 owning Node gateway。</p></div>
         <div class="step"><b>6. Grant / Epoch Check</b><p>Node 验证签名、时效、hostname、Cat generation、Node、route epoch 和目标端口，再确认本地 Cat 仍为 Running。</p></div>

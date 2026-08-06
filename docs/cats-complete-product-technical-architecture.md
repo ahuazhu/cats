@@ -664,7 +664,9 @@ Edge 选择证书、校验 Host/SNI、执行限流和最大请求策略。
 **3. Route Lookup**
 
 按 hostname 查只读缓存，得到 workspace/cat/generation/node/port/epoch 和短期 Ed25519
-签名 Route Grant。控制面只对 active + Running 路由签发；Gateway 没有签名私钥。
+签名 Route Grant。Gateway 只规范化一次公网 Host，并在写缓存前要求返回 binding 的规范化
+hostname 完全相同；HTTP 与 WebSocket 都把这个原始授权 Host 发送给 Node。控制面只对
+active + Running 路由签发；Gateway 没有签名私钥。
 
 **4. Activation**
 
