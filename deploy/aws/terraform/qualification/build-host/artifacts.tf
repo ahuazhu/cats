@@ -189,43 +189,6 @@ data "aws_iam_policy_document" "artifact_bucket" {
     }
   }
 
-  statement {
-    sid    = "DenyMissingConditionalCreate"
-    effect = "Deny"
-
-    principals {
-      type        = "*"
-      identifiers = ["*"]
-    }
-
-    actions   = ["s3:PutObject"]
-    resources = ["${local.artifact_bucket_arn}/*"]
-
-    condition {
-      test     = "Null"
-      variable = "s3:if-none-match"
-      values   = ["true"]
-    }
-  }
-
-  statement {
-    sid    = "DenyWrongConditionalCreate"
-    effect = "Deny"
-
-    principals {
-      type        = "*"
-      identifiers = ["*"]
-    }
-
-    actions   = ["s3:PutObject"]
-    resources = ["${local.artifact_bucket_arn}/*"]
-
-    condition {
-      test     = "StringNotEquals"
-      variable = "s3:if-none-match"
-      values   = ["*"]
-    }
-  }
 }
 
 resource "aws_s3_bucket_policy" "artifacts" {

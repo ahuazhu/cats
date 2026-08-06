@@ -20,6 +20,9 @@ PREPARATION_CONTRACT_PATH = (
 MAINTENANCE_CONTRACT_PATH = (
     QUALIFICATION_DIR / "contracts" / "h2-build-host-maintenance-v1.json"
 )
+POLICY_REPAIR_CONTRACT_PATH = (
+    QUALIFICATION_DIR / "contracts" / "h2-bucket-policy-repair-v1.json"
+)
 
 
 class BuildHostBoundaryTests(unittest.TestCase):
@@ -59,6 +62,21 @@ class BuildHostBoundaryTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, corpus.lower())
 
+    def test_instance_uses_the_provider_canonical_kms_key_arn(self) -> None:
+        instance = self.text("instance.tf")
+        self.assertIn(
+            "kms_key_id            = aws_kms_key.build_volume.arn", instance
+        )
+        self.assertNotIn(
+            "kms_key_id            = local.volume_kms_alias_arn", instance
+        )
+
+        create_contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+        self.assertNotIn(
+            "root_block_device[0].kms_key_id",
+            create_contract["required_known_change_paths"]["aws_instance.build"],
+        )
+
     def test_source_iam_is_read_only_and_prefix_scoped(self) -> None:
         iam = self.text("iam.tf")
         self.assertIn('"s3:GetObject"', iam)
@@ -75,12 +93,21 @@ class BuildHostBoundaryTests(unittest.TestCase):
 
     def test_source_bucket_is_append_only_and_dedicated(self) -> None:
         source = self.text("source-delivery.tf")
+        publisher = self.text("tools/publish-source-bundle.sh")
         self.assertIn('resource "aws_s3_bucket" "source"', source)
         self.assertIn('resource "aws_kms_key" "source"', source)
         self.assertIn('bucket_key_enabled = false', source)
         self.assertIn('"s3:DeleteObjectVersion"', source)
-        self.assertIn('variable = "s3:if-none-match"', source)
-        self.assertIn('values   = ["*"]', source)
+        self.assertNotIn('variable = "s3:if-none-match"', source)
+        self.assertIn("--if-none-match '*'", publisher)
+        self.assertIn("same-digest publication", publisher)
+
+    def test_artifact_bucket_does_not_use_unsupported_header_conditions(self) -> None:
+        artifacts = self.text("artifacts.tf")
+        publisher = self.text("bootstrap/publish-content-addressed.sh")
+        self.assertIn('"s3:DeleteObjectVersion"', artifacts)
+        self.assertNotIn('variable = "s3:if-none-match"', artifacts)
+        self.assertIn("--if-none-match '*'", publisher)
 
     def test_checkout_uses_only_exact_digests_and_root_publication(self) -> None:
         checkout = self.text("bootstrap/checkout-exact-sha.sh")
@@ -146,6 +173,7 @@ class BuildHostBoundaryTests(unittest.TestCase):
             CONTRACT_PATH,
             PREPARATION_CONTRACT_PATH,
             MAINTENANCE_CONTRACT_PATH,
+            POLICY_REPAIR_CONTRACT_PATH,
         ):
             contract = json.loads(path.read_text(encoding="utf-8"))
             expected = contract["manifest"]["expected"]["bootstrap"]
@@ -193,6 +221,13 @@ class BuildHostBoundaryTests(unittest.TestCase):
             maintenance_contract["required_known_change_paths"],
             preparation_expected,
         )
+        policy_contract = json.loads(
+            POLICY_REPAIR_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            policy_contract["required_known_change_paths"],
+            preparation_expected,
+        )
 
     def test_preparation_contract_freezes_the_complete_safe_transition(self) -> None:
         contract = json.loads(
@@ -234,6 +269,23 @@ class BuildHostBoundaryTests(unittest.TestCase):
             contract["required_identity_templates"]["aws_instance.build"][
                 "force_destroy"
             ]
+        )
+
+    def test_policy_repair_contract_allows_only_two_bucket_policy_updates(self) -> None:
+        contract = json.loads(
+            POLICY_REPAIR_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        non_noop = {
+            address: actions
+            for address, actions in contract["required_change_actions"].items()
+            if actions != ["no-op"]
+        }
+        self.assertEqual(
+            non_noop,
+            {
+                "aws_s3_bucket_policy.artifacts": ["update"],
+                "aws_s3_bucket_policy.source": ["update"],
+            },
         )
 
     def test_cloud_init_privileged_entrypoints_are_root_only(self) -> None:

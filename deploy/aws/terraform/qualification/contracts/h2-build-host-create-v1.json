@@ -469,7 +469,7 @@
       "vpc_endpoint_type": "Interface"
     }
   },
-  "expected_managed_changes_sha256": "0e59a4deca995a5af4c0946f8c722ec444bbe7e362f71db210e5bda1a75e8e3d",
+  "expected_managed_changes_sha256": "48f2c009bfc3f8111f066e29e44a844974904396d1a7c47f10ea2f3b8ca7ba45",
   "required_known_change_paths": {
     "aws_iam_policy.build_boundary": [
       "policy"

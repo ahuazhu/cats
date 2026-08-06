@@ -120,7 +120,7 @@ resource "aws_instance" "build" {
   root_block_device {
     delete_on_termination = true
     encrypted             = true
-    kms_key_id            = local.volume_kms_alias_arn
+    kms_key_id            = aws_kms_key.build_volume.arn
     volume_size           = local.root_volume.size_gib
     volume_type           = local.root_volume.type
     iops                  = local.root_volume.iops
