@@ -132,7 +132,7 @@ put_content_addressed() {
     --if-none-match '*' \
     --checksum-algorithm SHA256 \
     --server-side-encryption aws:kms \
-    --ssekms-key-id "${source_kms_alias_arn}" \
+    --ssekms-key-id "${source_kms_key_arn}" \
     --no-cli-pager >"${put_response}"; then
     : # A prior same-digest publication is accepted only after exact HEAD proof.
   fi

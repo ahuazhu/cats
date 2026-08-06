@@ -35,6 +35,12 @@ def managed_changes_digest(changes: list[dict[str, object]]) -> str:
     ).hexdigest()
 
 
+def configuration_digest(root: dict[str, object]) -> str:
+    return hashlib.sha256(
+        json.dumps(root, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
 EMPTY_DRIFT_SHA256 = hashlib.sha256(b"[]").hexdigest()
 JQ_EMPTY_DRIFT_SHA256 = hashlib.sha256(b"[]\n").hexdigest()
 
@@ -107,6 +113,17 @@ class SavedPlanContractTests(unittest.TestCase):
         with self.assertRaisesRegex(
             ContractInputError,
             "requires expected_managed_changes_sha256",
+        ):
+            Contract.load(raw)
+
+    def test_configuration_references_require_full_configuration_digest(self) -> None:
+        raw = load_json_object(
+            QUALIFICATION_DIR / "contracts" / "h2-build-host-create-v1.json"
+        )
+        raw.pop("expected_configuration_root_sha256")
+        with self.assertRaisesRegex(
+            ContractInputError,
+            "requires expected_configuration_root_sha256",
         ):
             Contract.load(raw)
 
@@ -688,6 +705,15 @@ class ContractDrivenGateTests(unittest.TestCase):
                 "required_absent_configuration_paths": {
                     "aws_instance.build_host": ["key_name"],
                 },
+                "required_configuration_references": {
+                    "aws_instance.build_host": {
+                        "root_block_device[0].kms_key_id.references": [
+                            "aws_kms_key.build_volume.arn",
+                            "aws_kms_key.build_volume",
+                        ]
+                    }
+                },
+                "expected_configuration_root_sha256": "0" * 64,
                 "required_known_change_paths": {
                     "aws_instance.build_host": ["user_data"]
                 },
@@ -721,7 +747,18 @@ class ContractDrivenGateTests(unittest.TestCase):
                     "resources": [
                         {
                             "address": "aws_instance.build_host",
-                            "expressions": {},
+                            "expressions": {
+                                "root_block_device": [
+                                    {
+                                        "kms_key_id": {
+                                            "references": [
+                                                "aws_kms_key.build_volume.arn",
+                                                "aws_kms_key.build_volume",
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
                         }
                     ]
                 }
@@ -763,6 +800,9 @@ class ContractDrivenGateTests(unittest.TestCase):
         }
         contract = replace(
             contract,
+            expected_configuration_root_sha256=configuration_digest(
+                plan["configuration"]["root_module"]
+            ),
             expected_managed_changes_sha256=managed_changes_digest(
                 plan["resource_changes"]
             ),
@@ -777,6 +817,57 @@ class ContractDrivenGateTests(unittest.TestCase):
 
         self.assertTrue(result.accepted, result.errors)
         self.assertEqual(result.managed_create_count, 1)
+
+        wrong_key_reference = copy.deepcopy(plan)
+        wrong_key_reference["configuration"]["root_module"]["resources"][0][
+            "expressions"
+        ]["root_block_device"][0]["kms_key_id"]["references"] = [
+            "aws_kms_key.source.arn",
+            "aws_kms_key.source",
+        ]
+        rejected = validate_plan(wrong_key_reference, context)
+        self.assertFalse(rejected.accepted)
+        self.assertTrue(
+            any("configuration references differ" in error for error in rejected.errors),
+            rejected.errors,
+        )
+
+        same_reference_semantic_inversion = copy.deepcopy(plan)
+        same_reference_semantic_inversion["configuration"]["root_module"][
+            "resources"
+        ][0]["expressions"]["root_block_device"][0]["kms_key_id"][
+            "function"
+        ] = "wrong_key_transform"
+        rejected = validate_plan(same_reference_semantic_inversion, context)
+        self.assertFalse(rejected.accepted)
+        self.assertTrue(
+            any("configuration root differs" in error for error in rejected.errors),
+            rejected.errors,
+        )
+
+        extra_key_reference = copy.deepcopy(plan)
+        extra_key_reference["configuration"]["root_module"]["resources"][0][
+            "expressions"
+        ]["root_block_device"][0]["kms_key_id"]["references"].append(
+            "aws_kms_key.source"
+        )
+        rejected = validate_plan(extra_key_reference, context)
+        self.assertFalse(rejected.accepted)
+        self.assertTrue(
+            any("configuration references differ" in error for error in rejected.errors),
+            rejected.errors,
+        )
+
+        missing_key_reference = copy.deepcopy(plan)
+        del missing_key_reference["configuration"]["root_module"]["resources"][0][
+            "expressions"
+        ]["root_block_device"][0]["kms_key_id"]
+        rejected = validate_plan(missing_key_reference, context)
+        self.assertFalse(rejected.accepted)
+        self.assertTrue(
+            any("configuration references differ" in error for error in rejected.errors),
+            rejected.errors,
+        )
 
         changed_bootstrap = copy.deepcopy(plan)
         changed_bootstrap["resource_changes"][0]["change"]["after"][

@@ -23,6 +23,9 @@ MAINTENANCE_CONTRACT_PATH = (
 POLICY_REPAIR_CONTRACT_PATH = (
     QUALIFICATION_DIR / "contracts" / "h2-bucket-policy-repair-v1.json"
 )
+KMS_POLICY_REPAIR_CONTRACT_PATH = (
+    QUALIFICATION_DIR / "contracts" / "h2-bucket-kms-policy-repair-v2.json"
+)
 
 
 class BuildHostBoundaryTests(unittest.TestCase):
@@ -99,7 +102,11 @@ class BuildHostBoundaryTests(unittest.TestCase):
         self.assertIn('bucket_key_enabled = false', source)
         self.assertIn('"s3:DeleteObjectVersion"', source)
         self.assertNotIn('variable = "s3:if-none-match"', source)
+        self.assertIn("values   = [aws_kms_key.source.arn]", source)
+        self.assertNotIn("values   = [local.source_kms_alias_arn]", source)
         self.assertIn("--if-none-match '*'", publisher)
+        self.assertIn('--ssekms-key-id "${source_kms_key_arn}"', publisher)
+        self.assertNotIn('--ssekms-key-id "${source_kms_alias_arn}"', publisher)
         self.assertIn("same-digest publication", publisher)
 
     def test_artifact_bucket_does_not_use_unsupported_header_conditions(self) -> None:
@@ -107,6 +114,8 @@ class BuildHostBoundaryTests(unittest.TestCase):
         publisher = self.text("bootstrap/publish-content-addressed.sh")
         self.assertIn('"s3:DeleteObjectVersion"', artifacts)
         self.assertNotIn('variable = "s3:if-none-match"', artifacts)
+        self.assertIn("values   = [aws_kms_key.artifacts.arn]", artifacts)
+        self.assertNotIn("values   = [local.artifact_kms_alias_arn]", artifacts)
         self.assertIn("--if-none-match '*'", publisher)
 
     def test_checkout_uses_only_exact_digests_and_root_publication(self) -> None:
@@ -174,6 +183,7 @@ class BuildHostBoundaryTests(unittest.TestCase):
             PREPARATION_CONTRACT_PATH,
             MAINTENANCE_CONTRACT_PATH,
             POLICY_REPAIR_CONTRACT_PATH,
+            KMS_POLICY_REPAIR_CONTRACT_PATH,
         ):
             contract = json.loads(path.read_text(encoding="utf-8"))
             expected = contract["manifest"]["expected"]["bootstrap"]
@@ -199,8 +209,11 @@ class BuildHostBoundaryTests(unittest.TestCase):
             "aws_vpc_endpoint.build_storage": ["policy"],
         }
         create_contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+        create_expected = dict(common_expected)
+        create_expected.pop("aws_s3_bucket_policy.artifacts")
+        create_expected.pop("aws_s3_bucket_policy.source")
         self.assertEqual(
-            create_contract["required_known_change_paths"], common_expected
+            create_contract["required_known_change_paths"], create_expected
         )
         preparation_contract = json.loads(
             PREPARATION_CONTRACT_PATH.read_text(encoding="utf-8")
@@ -227,6 +240,51 @@ class BuildHostBoundaryTests(unittest.TestCase):
         self.assertEqual(
             policy_contract["required_known_change_paths"],
             preparation_expected,
+        )
+        kms_policy_contract = json.loads(
+            KMS_POLICY_REPAIR_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            kms_policy_contract["required_known_change_paths"],
+            preparation_expected,
+        )
+
+    def test_create_contract_binds_unknown_kms_configuration_references(self) -> None:
+        contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(
+            contract["required_configuration_references"],
+            {
+                "aws_instance.build": {
+                    "root_block_device[0].kms_key_id.references": [
+                        "aws_kms_key.build_volume.arn",
+                        "aws_kms_key.build_volume",
+                    ]
+                },
+                "aws_s3_bucket_policy.artifacts": {
+                    "policy.references": [
+                        "data.aws_iam_policy_document.artifact_bucket.json",
+                        "data.aws_iam_policy_document.artifact_bucket",
+                    ]
+                },
+                "aws_s3_bucket_policy.source": {
+                    "policy.references": [
+                        "data.aws_iam_policy_document.source_bucket.json",
+                        "data.aws_iam_policy_document.source_bucket",
+                    ]
+                },
+                "data.aws_iam_policy_document.artifact_bucket": {
+                    "statement[4].condition[0].values.references": [
+                        "aws_kms_key.artifacts.arn",
+                        "aws_kms_key.artifacts",
+                    ]
+                },
+                "data.aws_iam_policy_document.source_bucket": {
+                    "statement[4].condition[0].values.references": [
+                        "aws_kms_key.source.arn",
+                        "aws_kms_key.source",
+                    ]
+                },
+            },
         )
 
     def test_preparation_contract_freezes_the_complete_safe_transition(self) -> None:
@@ -272,21 +330,20 @@ class BuildHostBoundaryTests(unittest.TestCase):
         )
 
     def test_policy_repair_contract_allows_only_two_bucket_policy_updates(self) -> None:
-        contract = json.loads(
-            POLICY_REPAIR_CONTRACT_PATH.read_text(encoding="utf-8")
-        )
-        non_noop = {
-            address: actions
-            for address, actions in contract["required_change_actions"].items()
-            if actions != ["no-op"]
-        }
-        self.assertEqual(
-            non_noop,
-            {
-                "aws_s3_bucket_policy.artifacts": ["update"],
-                "aws_s3_bucket_policy.source": ["update"],
-            },
-        )
+        for path in (POLICY_REPAIR_CONTRACT_PATH, KMS_POLICY_REPAIR_CONTRACT_PATH):
+            contract = json.loads(path.read_text(encoding="utf-8"))
+            non_noop = {
+                address: actions
+                for address, actions in contract["required_change_actions"].items()
+                if actions != ["no-op"]
+            }
+            self.assertEqual(
+                non_noop,
+                {
+                    "aws_s3_bucket_policy.artifacts": ["update"],
+                    "aws_s3_bucket_policy.source": ["update"],
+                },
+            )
 
     def test_cloud_init_privileged_entrypoints_are_root_only(self) -> None:
         template = self.text("bootstrap/cloud-init.yaml.tftpl")

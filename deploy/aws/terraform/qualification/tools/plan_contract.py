@@ -45,7 +45,9 @@ class Contract:
     required_identity_templates: Mapping[str, Mapping[str, Any]]
     required_before_identity_templates: Mapping[str, Mapping[str, Any]]
     required_absent_configuration_paths: Mapping[str, tuple[str, ...]]
+    required_configuration_references: Mapping[str, Mapping[str, tuple[str, ...]]]
     required_known_change_paths: Mapping[str, tuple[str, ...]]
+    expected_configuration_root_sha256: str | None
     expected_managed_changes_sha256: str | None
     expected_resource_drift_sha256: str | None
 
@@ -114,10 +116,20 @@ class Contract:
             required_absent_configuration_paths=_nested_string_lists(
                 raw, "required_absent_configuration_paths"
             ),
+            required_configuration_references=(
+                _nested_reference_lists(raw, "required_configuration_references")
+                if "required_configuration_references" in raw
+                else {}
+            ),
             required_known_change_paths=(
                 _nested_string_lists(raw, "required_known_change_paths")
                 if "required_known_change_paths" in raw
                 else {}
+            ),
+            expected_configuration_root_sha256=(
+                _required_string(raw, "expected_configuration_root_sha256")
+                if "expected_configuration_root_sha256" in raw
+                else None
             ),
             expected_managed_changes_sha256=(
                 _required_string(raw, "expected_managed_changes_sha256")
@@ -131,6 +143,10 @@ class Contract:
             ),
         )
         for field, digest in (
+            (
+                "expected_configuration_root_sha256",
+                contract.expected_configuration_root_sha256,
+            ),
             ("expected_managed_changes_sha256", contract.expected_managed_changes_sha256),
             ("expected_resource_drift_sha256", contract.expected_resource_drift_sha256),
         ):
@@ -155,6 +171,22 @@ class Contract:
             if mode == "create-only"
             else contract.required_change_actions.keys()
         )
+        if (
+            contract.required_configuration_references
+            and contract.expected_configuration_root_sha256 is None
+        ):
+            raise ContractInputError(
+                "required_configuration_references requires expected_configuration_root_sha256"
+            )
+        unknown_configuration_addresses = (
+            contract.required_configuration_references.keys()
+            - (managed_addresses | contract.allowed_data_addresses)
+        )
+        if unknown_configuration_addresses:
+            raise ContractInputError(
+                "required_configuration_references references undeclared addresses: "
+                + ", ".join(sorted(unknown_configuration_addresses))
+            )
         if mode == "create-only" and not contract.required_known_change_paths:
             raise ContractInputError(
                 "create-only contract requires required_known_change_paths"
@@ -305,6 +337,8 @@ def validate_plan(
     _validate_prior_state(plan, context, errors)
     _validate_planned_data_sources(plan, context, errors)
     _validate_configuration_absences(plan, context, errors)
+    _validate_configuration_references(plan, context, errors)
+    _validate_configuration_digest(plan, context, errors)
     manifest = _validate_manifest(plan, context, errors)
     create_count = _validate_changes(plan, context, errors)
 
@@ -499,6 +533,59 @@ def _validate_configuration_absences(
                 errors.append(
                     f"{address}.{path}: forbidden configuration path must be absent"
                 )
+
+
+def _validate_configuration_references(
+    plan: Mapping[str, Any], context: ValidationContext, errors: list[str]
+) -> None:
+    required = context.contract.required_configuration_references
+    if not required:
+        return
+    configuration = plan.get("configuration")
+    root = configuration.get("root_module") if isinstance(configuration, dict) else None
+    if not isinstance(root, dict):
+        errors.append("saved plan has no inspectable configuration root module")
+        return
+    resources = root.get("resources")
+    if not isinstance(resources, list):
+        errors.append("saved plan has malformed configuration resources")
+        return
+    by_address = {
+        resource.get("address"): resource
+        for resource in resources
+        if isinstance(resource, dict) and isinstance(resource.get("address"), str)
+    }
+    for address, paths in required.items():
+        resource = by_address.get(address)
+        if not isinstance(resource, dict):
+            errors.append(f"{address}: configuration resource is missing")
+            continue
+        expressions = resource.get("expressions")
+        if not isinstance(expressions, dict):
+            errors.append(f"{address}: configuration expressions are missing")
+            continue
+        for path, expected in paths.items():
+            observed = _lookup_path(expressions, path)
+            if observed != list(expected):
+                errors.append(
+                    f"{address}.{path}: configuration references differ from the exact contract"
+                )
+
+
+def _validate_configuration_digest(
+    plan: Mapping[str, Any], context: ValidationContext, errors: list[str]
+) -> None:
+    expected = context.contract.expected_configuration_root_sha256
+    if expected is None:
+        return
+    configuration = plan.get("configuration")
+    root = configuration.get("root_module") if isinstance(configuration, dict) else None
+    if not isinstance(root, dict):
+        errors.append("saved plan has no inspectable configuration root module")
+        return
+    observed = hashlib.sha256(_canonical_json(root)).hexdigest()
+    if observed != expected:
+        errors.append("configuration root differs from the exact reviewed contract")
 
 
 def _validate_manifest(
@@ -949,6 +1036,36 @@ def _nested_string_lists(
         for path in paths:
             _path_segments(path)
         result[address] = tuple(paths)
+    return result
+
+
+def _nested_reference_lists(
+    raw: Mapping[str, Any], key: str
+) -> Mapping[str, Mapping[str, tuple[str, ...]]]:
+    value = raw.get(key)
+    if not isinstance(value, dict) or not value:
+        raise ContractInputError(f"{key} must be a non-empty object")
+    result: dict[str, Mapping[str, tuple[str, ...]]] = {}
+    for address, paths in value.items():
+        if not isinstance(address, str) or not address or not isinstance(paths, dict):
+            raise ContractInputError(f"{key} must map addresses to path maps")
+        parsed_paths: dict[str, tuple[str, ...]] = {}
+        for path, references in paths.items():
+            if not isinstance(path, str) or not path:
+                raise ContractInputError(f"{key}.{address} must use non-empty paths")
+            _path_segments(path)
+            if (
+                not isinstance(references, list)
+                or not references
+                or not all(isinstance(reference, str) and reference for reference in references)
+            ):
+                raise ContractInputError(
+                    f"{key}.{address}.{path} must be a non-empty string array"
+                )
+            parsed_paths[path] = tuple(references)
+        if not parsed_paths:
+            raise ContractInputError(f"{key}.{address} must be a non-empty path map")
+        result[address] = parsed_paths
     return result
 
 

@@ -186,7 +186,7 @@ data "aws_iam_policy_document" "source_bucket" {
     condition {
       test     = "StringNotEquals"
       variable = "s3:x-amz-server-side-encryption-aws-kms-key-id"
-      values   = [local.source_kms_alias_arn]
+      values   = [aws_kms_key.source.arn]
     }
   }
 

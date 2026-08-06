@@ -469,7 +469,40 @@
       "vpc_endpoint_type": "Interface"
     }
   },
-  "expected_managed_changes_sha256": "48f2c009bfc3f8111f066e29e44a844974904396d1a7c47f10ea2f3b8ca7ba45",
+  "expected_configuration_root_sha256": "f2fe4d1d6b539f7533f200be06f8e13da76b54c09cbb3cf820ae19dce688d2d4",
+  "expected_managed_changes_sha256": "ce8a194f59535ca67fea7cc0e27f72570ded128051112c9f8d15154b79c01102",
+  "required_configuration_references": {
+    "aws_instance.build": {
+      "root_block_device[0].kms_key_id.references": [
+        "aws_kms_key.build_volume.arn",
+        "aws_kms_key.build_volume"
+      ]
+    },
+    "aws_s3_bucket_policy.artifacts": {
+      "policy.references": [
+        "data.aws_iam_policy_document.artifact_bucket.json",
+        "data.aws_iam_policy_document.artifact_bucket"
+      ]
+    },
+    "aws_s3_bucket_policy.source": {
+      "policy.references": [
+        "data.aws_iam_policy_document.source_bucket.json",
+        "data.aws_iam_policy_document.source_bucket"
+      ]
+    },
+    "data.aws_iam_policy_document.artifact_bucket": {
+      "statement[4].condition[0].values.references": [
+        "aws_kms_key.artifacts.arn",
+        "aws_kms_key.artifacts"
+      ]
+    },
+    "data.aws_iam_policy_document.source_bucket": {
+      "statement[4].condition[0].values.references": [
+        "aws_kms_key.source.arn",
+        "aws_kms_key.source"
+      ]
+    }
+  },
   "required_known_change_paths": {
     "aws_iam_policy.build_boundary": [
       "policy"
@@ -499,12 +532,6 @@
       "policy"
     ],
     "aws_kms_key.source": [
-      "policy"
-    ],
-    "aws_s3_bucket_policy.artifacts": [
-      "policy"
-    ],
-    "aws_s3_bucket_policy.source": [
       "policy"
     ],
     "aws_vpc_endpoint.build_storage": [
