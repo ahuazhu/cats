@@ -1,0 +1,691 @@
+{
+  "schema_version": 1,
+  "mode": "maintenance",
+  "contract_id": "qualification-h2-artifact-kms-context-repair-v3",
+  "resource_label": "qualification H2 artifact Bucket Key KMS context repair",
+  "required_template_values": [
+    "account_id",
+    "formation_principal_arn",
+    "terraform_principal_arn"
+  ],
+  "required_variables": {
+    "aws_region": "us-east-1",
+    "expected_account_id": "{account_id}",
+    "formation_mode": "true",
+    "formation_principal_arn": "{formation_principal_arn}",
+    "qualification_cell_id": "qcell-use1-v1",
+    "qualification_manifest_seed": {
+      "schema_version": 1,
+      "environment": "qualification",
+      "environment_is_production": false,
+      "account_id": "{account_id}",
+      "region": "us-east-1",
+      "namespace": "cats-qualification-v2",
+      "cell_id": "qcell-use1-v1",
+      "required_tags": {
+        "Project": "Cats",
+        "Environment": "qualification",
+        "QualificationNamespace": "cats-qualification-v2",
+        "QualificationCell": "qcell-use1-v1",
+        "ManagedBy": "terraform"
+      },
+      "terraform_state": {
+        "bucket": "cats-qualification-v2-tfstate-{account_id}-us-east-1",
+        "kms_alias": "alias/cats-qualification-v2-terraform-state",
+        "key_prefix": "architecture-v2",
+        "use_lockfile": true,
+        "state_role_arn": "arn:aws:iam::{account_id}:role/cats-qualification-v2-terraform-state"
+      }
+    },
+    "qualification_namespace": "cats-qualification-v2"
+  },
+  "manifest": {
+    "output": "qualification_build_host_manifest",
+    "expected": {
+      "schema_version": 1,
+      "contract_id": "qualification-h2-build-host-create-v1",
+      "environment": "qualification",
+      "environment_is_production": false,
+      "account_id": "{account_id}",
+      "region": "us-east-1",
+      "namespace": "cats-qualification-v2",
+      "cell_id": "qcell-use1-v1",
+      "required_tags": {
+        "Project": "Cats",
+        "Environment": "qualification",
+        "QualificationNamespace": "cats-qualification-v2",
+        "QualificationCell": "qcell-use1-v1",
+        "ManagedBy": "terraform"
+      },
+      "state_key": "architecture-v2/h2-build-host/terraform.tfstate",
+      "authority": {
+        "formation_mode": true,
+        "formation_principal_arn": "{formation_principal_arn}",
+        "reconcile_role_arn": "arn:aws:iam::{account_id}:role/cats-qualification-v2-h2-deployer",
+        "reconcile_boundary_arn": "arn:aws:iam::{account_id}:policy/cats-qualification-v2-h2-deployer-boundary",
+        "post_apply_gate": "assumed-role-no-op-plan",
+        "privilege_policy_changes": "formation-review-required"
+      },
+      "canonical_ami": {
+        "architecture": "x86_64",
+        "creation_date": "2026-07-14T11:54:50.000Z",
+        "image_id": "ami-052355af2a014bd2c",
+        "name": "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-20260714",
+        "owner_id": "099720109477",
+        "platform_details": "Linux/UNIX",
+        "root_device_name": "/dev/sda1",
+        "source_snapshot_id": "snap-0b0be23c49c254dd6",
+        "virtualization_type": "hvm"
+      },
+      "host": {
+        "instance_type": "c7i.12xlarge",
+        "availability_zone_id": "use1-az1",
+        "public_ip_allowed": false,
+        "inbound_allowed": false,
+        "administration": "ssm-only",
+        "imdsv2_required": true,
+        "termination_protection": true,
+        "root_volume": {
+          "size_gib": 500,
+          "type": "gp3",
+          "iops": 6000,
+          "throughput": 500
+        },
+        "root_volume_kms_alias": "alias/cats-qualification-v2-build-volume"
+      },
+      "network": {
+        "ownership": "qualification-only",
+        "production_vpc_reuse": false,
+        "vpc_cidr": "10.77.0.0/20",
+        "public_subnet_cidr": "10.77.0.0/24",
+        "private_subnet_cidr": "10.77.1.0/24",
+        "internet_egress": "nat-tls-only",
+        "time_sync": "169.254.169.123/32 udp/123"
+      },
+      "artifacts": {
+        "bucket": "cats-qualification-v2-build-artifacts-{account_id}-us-east-1",
+        "kms_alias": "alias/cats-qualification-v2-build-artifacts",
+        "prefixes": [
+          "artifacts/sha256/",
+          "evidence/sha256/"
+        ],
+        "append_only": true,
+        "encryption": "aws:kms",
+        "read_allowed": false,
+        "maximum_object_bytes": 5368709120,
+        "publication_receipt_v1": true
+      },
+      "bootstrap": {
+        "mode": "asynchronous-systemd",
+        "management_ready_gate": "ssm-online",
+        "build_ready_path": "/var/lib/cats-build/readiness-v1.json",
+        "bootstrap_sha256": "a11d101d85e8f14dca902632a123af116942355d77f1f92c1ebfe06025a8cfe6",
+        "toolchain_lock_sha256": "5884719764338b75cb42012ad97c48df9a035435b0f5de706af9be4058fd220c",
+        "components_sha256": {
+          "bootstrap": "a11d101d85e8f14dca902632a123af116942355d77f1f92c1ebfe06025a8cfe6",
+          "checkout": "060f6eb1327aa3de6dd938b0d33889f62d2643979eb4e24b3757d5da472eeb3b",
+          "imds_guard": "55ae2e94b3bbe350b20c29d2aaa6248bbb4552518591b82140add94ef4002dda",
+          "immutable_receipt": "c70f6eacb73ba2bea4530dca743c4f7e38eb328af6d1644406a24dd8a85adf54",
+          "publish": "9317a8b260b883ab7513ad3fbad7e378478e1d7220fa58b8bfda2dc7806ecf7c",
+          "readiness": "a5a004ddeba055a2f4fcbc828b7cacddb9c1231919ea5731d5f302284fa65ada",
+          "run_build": "78ef233e9afdc841d1087efc85c25f781d8e2c06d24f2be7ca6c727716164c91",
+          "stage_output": "13aee4e5a106072cd2ef4cf43ea3f3e95d57d93d4140024ca40a93f52ed60a7a",
+          "toolchain_lock": "5884719764338b75cb42012ad97c48df9a035435b0f5de706af9be4058fd220c"
+        },
+        "payload_sha256": "0e105ba5dd814c95689ab63a30b563c789b4c095a9fbe1b3c2f9259121506b69",
+        "apt_snapshot_id": "20260801T000000Z"
+      },
+      "source_policy": {
+        "repository_identity": "https://github.com/ahuazhu/cats.git",
+        "delivery_mode": "controller-content-addressed-git-bundle-v1",
+        "source_bucket": "cats-qualification-v2-build-source-{account_id}-us-east-1",
+        "source_kms_alias": "alias/cats-qualification-v2-build-source",
+        "manifest_prefix": "source/manifests/sha256/",
+        "bundle_prefix": "source/bundles/sha256/",
+        "exact_commit_sha_required": true,
+        "manifest_digest_required": true,
+        "bundle_digest_required": true,
+        "branch_or_tag_allowed": false,
+        "dirty_worktree_allowed": false,
+        "build_host_github_credential": false,
+        "build_host_source_write": false,
+        "submodules_allowed": false,
+        "gitlinks_allowed": false,
+        "git_lfs_allowed": false,
+        "source_owner": "root",
+        "build_target_owner": "cats-build-per-job"
+      }
+    }
+  },
+  "forbidden_inventory": {
+    "account_id": "{account_id}",
+    "region": "us-east-1"
+  },
+  "identity": {
+    "allowed_external_arns": [
+      "arn:aws:ec2:us-east-1::image/ami-052355af2a014bd2c",
+      "arn:aws:iam::{account_id}:root",
+      "arn:aws:iam::{account_id}:role/cats-qualification-v2-terraform-state",
+      "{formation_principal_arn}",
+      "{terraform_principal_arn}"
+    ],
+    "owned_arn_globs": [
+      "arn:aws:ec2:us-east-1:{account_id}:instance/*",
+      "arn:aws:ec2:us-east-1:{account_id}:elastic-ip/*",
+      "arn:aws:ec2:us-east-1:{account_id}:internet-gateway/*",
+      "arn:aws:ec2:us-east-1:{account_id}:natgateway/*",
+      "arn:aws:ec2:us-east-1:{account_id}:network-interface/*",
+      "arn:aws:ec2:us-east-1:{account_id}:route-table/*",
+      "arn:aws:ec2:us-east-1:{account_id}:security-group/*",
+      "arn:aws:ec2:us-east-1:{account_id}:subnet/*",
+      "arn:aws:ec2:us-east-1:{account_id}:volume/*",
+      "arn:aws:ec2:us-east-1:{account_id}:vpc/*",
+      "arn:aws:ec2:us-east-1:{account_id}:vpc-endpoint/*",
+      "arn:aws:iam::{account_id}:instance-profile/cats-qualification-v2-build-host",
+      "arn:aws:iam::{account_id}:role/cats-qualification-v2-build-host",
+      "arn:aws:iam::{account_id}:role/cats-qualification-v2-h2-deployer",
+      "arn:aws:iam::{account_id}:policy/cats-qualification-v2-build-boundary",
+      "arn:aws:iam::{account_id}:policy/cats-qualification-v2-h2-deployer-boundary",
+      "arn:aws:s3:::cats-qualification-v2-build-artifacts-{account_id}-us-east-1",
+      "arn:aws:s3:::cats-qualification-v2-build-artifacts-{account_id}-us-east-1/*",
+      "arn:aws:s3:::cats-qualification-v2-build-source-{account_id}-us-east-1",
+      "arn:aws:s3:::cats-qualification-v2-build-source-{account_id}-us-east-1/*",
+      "arn:aws:kms:us-east-1:{account_id}:alias/cats-qualification-v2-build-artifacts",
+      "arn:aws:kms:us-east-1:{account_id}:alias/cats-qualification-v2-build-volume",
+      "arn:aws:kms:us-east-1:{account_id}:alias/cats-qualification-v2-build-source",
+      "arn:aws:kms:us-east-1:{account_id}:key/*",
+      "arn:aws:kms:us-east-1:{account_id}:key/08b80b48-f9ad-486e-ab41-5daad603f3b5",
+      "arn:aws:kms:us-east-1:{account_id}:key/5bf7fb39-b49f-47f3-b64a-7061e450e83a"
+    ],
+    "approved_external_identifiers": [
+      "ami-052355af2a014bd2c",
+      "snap-0b0be23c49c254dd6"
+    ],
+    "owned_identifiers": [
+      "acl-03c9928040397ca08",
+      "eipalloc-000ebb93f9538f974",
+      "eni-02be3a23f54ac9711",
+      "eni-05e6dbed31ca3a640",
+      "eni-0634f66f03de3c49a",
+      "eni-06e5f812106af756d",
+      "eni-0aad51a9214b22baa",
+      "i-027c1d97ea3febc06",
+      "i-07eff70e8b958f7cb",
+      "igw-045b1258a091e4766",
+      "nat-0deaa434e763ee6f0",
+      "rtb-0060e2a46e6784934",
+      "rtb-040a417baaba5343a",
+      "rtb-08e006ac1dcf144f8",
+      "sg-083144ed3eb082322",
+      "sg-0b3f86e9421a203fc",
+      "sg-0cc195eededadc805",
+      "subnet-0917ee1af665c6a06",
+      "subnet-0fd937b1b95d20dca",
+      "vol-00c8ee81283819f2d",
+      "vol-0b710c8f8e453a560",
+      "vpc-076d856c6565901db",
+      "vpce-0246053ebd77c97f8",
+      "vpce-074dd89f25ba26d9d",
+      "vpce-080fed06b1678bcfc"
+    ]
+  },
+  "required_tags": {
+    "Project": "Cats",
+    "Environment": "qualification",
+    "QualificationNamespace": "cats-qualification-v2",
+    "QualificationCell": "qcell-use1-v1",
+    "ManagedBy": "terraform"
+  },
+  "required_check_addresses": [
+    "check.canonical_ami_contract",
+    "check.deployer_boundary_policy_size",
+    "check.ec2_user_data_size",
+    "check.frozen_host_shape",
+    "check.qualification_boundary",
+    "var.aws_region",
+    "var.expected_account_id",
+    "var.formation_principal_arn",
+    "var.qualification_cell_id",
+    "var.qualification_namespace"
+  ],
+  "allowed_data_addresses": [
+    "data.aws_iam_policy_document.artifact_bucket",
+    "data.aws_iam_policy_document.build_storage_endpoint",
+    "data.aws_iam_policy_document.artifact_key",
+    "data.aws_iam_policy_document.build_assume_role",
+    "data.aws_iam_policy_document.build_permissions",
+    "data.aws_iam_policy_document.deployer_assume_role",
+    "data.aws_iam_policy_document.deployer_permissions",
+    "data.aws_iam_policy_document.source_bucket",
+    "data.aws_iam_policy_document.source_key",
+    "data.aws_iam_policy_document.volume_key",
+    "data.aws_caller_identity.current",
+    "data.aws_partition.current",
+    "data.aws_region.current"
+  ],
+  "tagged_resource_addresses": [
+    "aws_eip.nat",
+    "aws_iam_instance_profile.build",
+    "aws_iam_policy.build_boundary",
+    "aws_iam_policy.deployer_boundary",
+    "aws_iam_role.build",
+    "aws_iam_role.deployer",
+    "aws_instance.build",
+    "aws_internet_gateway.build",
+    "aws_kms_key.artifacts",
+    "aws_kms_key.build_volume",
+    "aws_kms_key.source",
+    "aws_nat_gateway.build",
+    "aws_route_table.private_build",
+    "aws_route_table.public_egress",
+    "aws_s3_bucket.artifacts",
+    "aws_s3_bucket.source",
+    "aws_security_group.build_host",
+    "aws_security_group.ssm_endpoints",
+    "aws_subnet.private_build",
+    "aws_subnet.public_egress",
+    "aws_vpc.build",
+    "aws_vpc_endpoint.build_storage",
+    "aws_vpc_endpoint.ssm[\"ssm\"]",
+    "aws_vpc_endpoint.ssm[\"ssmmessages\"]"
+  ],
+  "required_identity_templates": {
+    "aws_iam_instance_profile.build": {
+      "name": "cats-qualification-v2-build-host",
+      "role": "cats-qualification-v2-build-host"
+    },
+    "aws_iam_policy.build_boundary": {
+      "name": "cats-qualification-v2-build-boundary"
+    },
+    "aws_iam_policy.deployer_boundary": {
+      "name": "cats-qualification-v2-h2-deployer-boundary"
+    },
+    "aws_iam_role.build": {
+      "name": "cats-qualification-v2-build-host",
+      "permissions_boundary": "arn:aws:iam::{account_id}:policy/cats-qualification-v2-build-boundary"
+    },
+    "aws_iam_role.deployer": {
+      "name": "cats-qualification-v2-h2-deployer",
+      "permissions_boundary": "arn:aws:iam::{account_id}:policy/cats-qualification-v2-h2-deployer-boundary"
+    },
+    "aws_iam_role_policy.build": {
+      "name": "cats-qualification-v2-build-minimum"
+    },
+    "aws_iam_role_policy.deployer": {
+      "name": "cats-qualification-v2-h2-deployer-reconcile"
+    },
+    "aws_instance.build": {
+      "ami": "ami-052355af2a014bd2c",
+      "associate_public_ip_address": false,
+      "disable_api_termination": true,
+      "ebs_optimized": true,
+      "force_destroy": false,
+      "iam_instance_profile": "cats-qualification-v2-build-host",
+      "instance_type": "c7i.12xlarge",
+      "metadata_options[0].http_endpoint": "enabled",
+      "metadata_options[0].http_protocol_ipv6": "disabled",
+      "metadata_options[0].http_put_response_hop_limit": 1,
+      "metadata_options[0].http_tokens": "required",
+      "metadata_options[0].instance_metadata_tags": "enabled",
+      "monitoring": true,
+      "root_block_device[0].delete_on_termination": true,
+      "root_block_device[0].encrypted": true,
+      "root_block_device[0].iops": 6000,
+      "root_block_device[0].throughput": 500,
+      "root_block_device[0].volume_size": 500,
+      "root_block_device[0].volume_type": "gp3"
+    },
+    "aws_kms_alias.artifacts": {
+      "name": "alias/cats-qualification-v2-build-artifacts"
+    },
+    "aws_kms_alias.build_volume": {
+      "name": "alias/cats-qualification-v2-build-volume"
+    },
+    "aws_kms_alias.source": {
+      "name": "alias/cats-qualification-v2-build-source"
+    },
+    "aws_s3_bucket.artifacts": {
+      "bucket": "cats-qualification-v2-build-artifacts-{account_id}-us-east-1",
+      "force_destroy": false
+    },
+    "aws_s3_bucket_ownership_controls.artifacts": {
+      "rule[0].object_ownership": "BucketOwnerEnforced"
+    },
+    "aws_s3_bucket_public_access_block.artifacts": {
+      "block_public_acls": true,
+      "block_public_policy": true,
+      "ignore_public_acls": true,
+      "restrict_public_buckets": true
+    },
+    "aws_s3_bucket_server_side_encryption_configuration.artifacts": {
+      "rule[0].apply_server_side_encryption_by_default[0].sse_algorithm": "aws:kms",
+      "rule[0].bucket_key_enabled": true
+    },
+    "aws_s3_bucket_versioning.artifacts": {
+      "versioning_configuration[0].status": "Enabled"
+    },
+    "aws_s3_bucket.source": {
+      "bucket": "cats-qualification-v2-build-source-{account_id}-us-east-1",
+      "force_destroy": false
+    },
+    "aws_s3_bucket_ownership_controls.source": {
+      "rule[0].object_ownership": "BucketOwnerEnforced"
+    },
+    "aws_s3_bucket_public_access_block.source": {
+      "block_public_acls": true,
+      "block_public_policy": true,
+      "ignore_public_acls": true,
+      "restrict_public_buckets": true
+    },
+    "aws_s3_bucket_server_side_encryption_configuration.source": {
+      "rule[0].apply_server_side_encryption_by_default[0].sse_algorithm": "aws:kms",
+      "rule[0].bucket_key_enabled": false
+    },
+    "aws_s3_bucket_versioning.source": {
+      "versioning_configuration[0].status": "Enabled"
+    },
+    "aws_security_group.build_host": {
+      "name": "cats-qualification-v2-build-host",
+      "egress": [
+        {
+          "cidr_blocks": [
+            "0.0.0.0/0"
+          ],
+          "description": "TLS package, source, and AWS API access",
+          "from_port": 443,
+          "ipv6_cidr_blocks": [],
+          "prefix_list_ids": [],
+          "protocol": "tcp",
+          "security_groups": [],
+          "self": false,
+          "to_port": 443
+        },
+        {
+          "cidr_blocks": [
+            "10.77.0.2/32"
+          ],
+          "description": "DNS over TCP to the VPC resolver",
+          "from_port": 53,
+          "ipv6_cidr_blocks": [],
+          "prefix_list_ids": [],
+          "protocol": "tcp",
+          "security_groups": [],
+          "self": false,
+          "to_port": 53
+        },
+        {
+          "cidr_blocks": [
+            "10.77.0.2/32"
+          ],
+          "description": "DNS over UDP to the VPC resolver",
+          "from_port": 53,
+          "ipv6_cidr_blocks": [],
+          "prefix_list_ids": [],
+          "protocol": "udp",
+          "security_groups": [],
+          "self": false,
+          "to_port": 53
+        },
+        {
+          "cidr_blocks": [
+            "169.254.169.123/32"
+          ],
+          "description": "AWS Time Sync Service",
+          "from_port": 123,
+          "ipv6_cidr_blocks": [],
+          "prefix_list_ids": [],
+          "protocol": "udp",
+          "security_groups": [],
+          "self": false,
+          "to_port": 123
+        }
+      ]
+    },
+    "aws_security_group.ssm_endpoints": {
+      "name": "cats-qualification-v2-build-ssm-endpoints"
+    },
+    "aws_subnet.private_build": {
+      "availability_zone_id": "use1-az1",
+      "cidr_block": "10.77.1.0/24",
+      "map_public_ip_on_launch": false
+    },
+    "aws_subnet.public_egress": {
+      "availability_zone_id": "use1-az1",
+      "cidr_block": "10.77.0.0/24",
+      "map_public_ip_on_launch": false
+    },
+    "aws_vpc.build": {
+      "cidr_block": "10.77.0.0/20"
+    },
+    "aws_vpc_endpoint.build_storage": {
+      "service_name": "com.amazonaws.us-east-1.s3",
+      "vpc_endpoint_type": "Gateway"
+    },
+    "aws_vpc_endpoint.ssm[\"ssm\"]": {
+      "private_dns_enabled": true,
+      "service_name": "com.amazonaws.us-east-1.ssm",
+      "vpc_endpoint_type": "Interface"
+    },
+    "aws_vpc_endpoint.ssm[\"ssmmessages\"]": {
+      "private_dns_enabled": true,
+      "service_name": "com.amazonaws.us-east-1.ssmmessages",
+      "vpc_endpoint_type": "Interface"
+    }
+  },
+  "required_absent_configuration_paths": {
+    "aws_instance.build": [
+      "key_name"
+    ],
+    "aws_security_group.build_host": [
+      "ingress"
+    ]
+  },
+  "required_known_change_paths": {
+    "aws_iam_policy.build_boundary": [
+      "policy"
+    ],
+    "aws_iam_policy.deployer_boundary": [
+      "policy"
+    ],
+    "aws_iam_role.build": [
+      "assume_role_policy"
+    ],
+    "aws_iam_role.deployer": [
+      "assume_role_policy"
+    ],
+    "aws_iam_role_policy.build": [
+      "policy"
+    ],
+    "aws_iam_role_policy.deployer": [
+      "policy"
+    ],
+    "aws_instance.build": [
+      "force_destroy",
+      "user_data_base64"
+    ],
+    "aws_kms_key.artifacts": [
+      "policy"
+    ],
+    "aws_kms_key.build_volume": [
+      "policy"
+    ],
+    "aws_kms_key.source": [
+      "policy"
+    ],
+    "aws_s3_bucket_policy.artifacts": [
+      "policy"
+    ],
+    "aws_s3_bucket_policy.source": [
+      "policy"
+    ],
+    "aws_vpc_endpoint.build_storage": [
+      "policy"
+    ]
+  },
+  "expected_configuration_root_sha256": "69747704d4d61a9e3a7d134508163f47cc9f8221d4cfae7d9d540bd67fe27626",
+  "expected_managed_changes_sha256": "389aa5e4cbf457066fb4bc5a591c57803ae7ba18e5617881fb5186723bc5cbf1",
+  "expected_resource_drift_sha256": "c816b433995ee36a15513bcb7521bb07008c4dd1b7f23d91374291705b021a70",
+  "required_change_actions": {
+    "aws_eip.nat": [
+      "no-op"
+    ],
+    "aws_iam_instance_profile.build": [
+      "no-op"
+    ],
+    "aws_iam_policy.build_boundary": [
+      "update"
+    ],
+    "aws_iam_policy.deployer_boundary": [
+      "no-op"
+    ],
+    "aws_iam_role.build": [
+      "no-op"
+    ],
+    "aws_iam_role.deployer": [
+      "no-op"
+    ],
+    "aws_iam_role_policy.build": [
+      "update"
+    ],
+    "aws_iam_role_policy.deployer": [
+      "no-op"
+    ],
+    "aws_instance.build": [
+      "no-op"
+    ],
+    "aws_internet_gateway.build": [
+      "no-op"
+    ],
+    "aws_kms_alias.artifacts": [
+      "no-op"
+    ],
+    "aws_kms_alias.build_volume": [
+      "no-op"
+    ],
+    "aws_kms_alias.source": [
+      "no-op"
+    ],
+    "aws_kms_key.artifacts": [
+      "no-op"
+    ],
+    "aws_kms_key.build_volume": [
+      "no-op"
+    ],
+    "aws_kms_key.source": [
+      "no-op"
+    ],
+    "aws_nat_gateway.build": [
+      "no-op"
+    ],
+    "aws_route_table.private_build": [
+      "no-op"
+    ],
+    "aws_route_table.public_egress": [
+      "no-op"
+    ],
+    "aws_route_table_association.private_build": [
+      "no-op"
+    ],
+    "aws_route_table_association.public_egress": [
+      "no-op"
+    ],
+    "aws_s3_bucket.artifacts": [
+      "no-op"
+    ],
+    "aws_s3_bucket.source": [
+      "no-op"
+    ],
+    "aws_s3_bucket_ownership_controls.artifacts": [
+      "no-op"
+    ],
+    "aws_s3_bucket_ownership_controls.source": [
+      "no-op"
+    ],
+    "aws_s3_bucket_policy.artifacts": [
+      "no-op"
+    ],
+    "aws_s3_bucket_policy.source": [
+      "no-op"
+    ],
+    "aws_s3_bucket_public_access_block.artifacts": [
+      "no-op"
+    ],
+    "aws_s3_bucket_public_access_block.source": [
+      "no-op"
+    ],
+    "aws_s3_bucket_server_side_encryption_configuration.artifacts": [
+      "no-op"
+    ],
+    "aws_s3_bucket_server_side_encryption_configuration.source": [
+      "no-op"
+    ],
+    "aws_s3_bucket_versioning.artifacts": [
+      "no-op"
+    ],
+    "aws_s3_bucket_versioning.source": [
+      "no-op"
+    ],
+    "aws_security_group.build_host": [
+      "no-op"
+    ],
+    "aws_security_group.ssm_endpoints": [
+      "no-op"
+    ],
+    "aws_subnet.private_build": [
+      "no-op"
+    ],
+    "aws_subnet.public_egress": [
+      "no-op"
+    ],
+    "aws_vpc.build": [
+      "no-op"
+    ],
+    "aws_vpc_endpoint.build_storage": [
+      "no-op"
+    ],
+    "aws_vpc_endpoint.ssm[\"ssm\"]": [
+      "no-op"
+    ],
+    "aws_vpc_endpoint.ssm[\"ssmmessages\"]": [
+      "no-op"
+    ]
+  },
+  "required_before_identity_templates": {
+    "aws_instance.build": {
+      "disable_api_termination": true,
+      "force_destroy": false
+    }
+  },
+  "required_configuration_references": {
+    "aws_instance.build": {
+      "root_block_device[0].kms_key_id.references": [
+        "aws_kms_key.build_volume.arn",
+        "aws_kms_key.build_volume"
+      ]
+    },
+    "aws_s3_bucket_policy.artifacts": {
+      "policy.references": [
+        "data.aws_iam_policy_document.artifact_bucket.json",
+        "data.aws_iam_policy_document.artifact_bucket"
+      ]
+    },
+    "aws_s3_bucket_policy.source": {
+      "policy.references": [
+        "data.aws_iam_policy_document.source_bucket.json",
+        "data.aws_iam_policy_document.source_bucket"
+      ]
+    },
+    "data.aws_iam_policy_document.artifact_bucket": {
+      "statement[4].condition[0].values.references": [
+        "aws_kms_key.artifacts.arn",
+        "aws_kms_key.artifacts"
+      ]
+    },
+    "data.aws_iam_policy_document.source_bucket": {
+      "statement[4].condition[0].values.references": [
+        "aws_kms_key.source.arn",
+        "aws_kms_key.source"
+      ]
+    }
+  }
+}

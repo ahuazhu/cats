@@ -66,7 +66,7 @@ def main() -> int:
             {
                 "verdict": "accepted",
                 "contract_id": contract.contract_id,
-                "contract_mode": "create-only",
+                "contract_mode": contract.mode,
                 "managed_create_count": result.managed_create_count,
                 "manifest_sha256": result.manifest_sha256,
             },

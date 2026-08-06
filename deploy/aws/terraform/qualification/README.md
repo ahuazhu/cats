@@ -41,25 +41,28 @@ The two environment variables above are shell conveniences in this example,
 not implicit inputs to Terraform or the validator. The values must also be
 present explicitly in the reviewed `bootstrap.auto.tfvars` and command.
 
-## Shared create-only gate
+## Shared saved-plan gate
 
 `tools/validate_saved_plan.py` contains no G0 or H2 resource semantics. Each
 stack supplies a versioned JSON contract declaring its human-readable resource
 label, exact plan variables, manifest output and expected JSON template,
 forbidden-inventory account/region, exact external ARNs, full-string owned ARN
-globs, exact approved external resource identifiers, checks, data reads, create
-addresses, tags and identity templates. Runtime values are explicit
+globs, exact approved external resource identifiers, checks, data reads,
+actions, tags and identity templates. Runtime values are explicit
 `--template-value NAME=VALUE` arguments, and the contract declares the complete
 allowed name set. ARN globs are matched against the entire ARN; a namespace
 substring in an unrelated production ARN grants no authority. Concrete AWS IDs
 remain denied unless the contract lists the exact token, such as H2's reviewed
 Canonical AMI.
 
-Later stacks, including H2, must add a new contract instance and reuse this
+Later stacks, including H2, add a versioned contract instance and reuse this
 gate. They must not copy the validator or widen the G0 contract. Create-only
 means an applyable and complete plan with all declared checks passing, no
-managed prior state or drift, and exactly the declared creates; update,
-replace, delete, no-op managed resources and undeclared data reads fail closed.
+managed prior state or drift, and exactly the declared creates. Maintenance
+contracts freeze every managed action plus canonical SHA-256 digests of the
+complete managed transition and any explicitly reviewed drift. A policy,
+user-data byte, before/after value, action, or drift change therefore requires
+a new reviewed contract and saved plan.
 
 Do not apply while #241 is awaiting saved-plan review. After approval, apply
 the exact file that was reviewed:

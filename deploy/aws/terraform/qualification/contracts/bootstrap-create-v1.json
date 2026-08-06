@@ -97,6 +97,7 @@
     "aws_kms_key.state",
     "aws_s3_bucket.state"
   ],
+  "expected_managed_changes_sha256": "9d8ed20bf0ffc00ef3399382b842dec882b7600fe008332dda2116604d997d78",
   "required_identity_templates": {
     "aws_iam_role.state": {
       "name": "cats-qualification-v2-terraform-state"
@@ -110,5 +111,19 @@
     "aws_s3_bucket.state": {
       "bucket": "cats-qualification-v2-tfstate-{account_id}-us-east-1"
     }
+  },
+  "required_known_change_paths": {
+    "aws_iam_role.state": [
+      "assume_role_policy"
+    ],
+    "aws_iam_role_policy.state": [
+      "policy"
+    ],
+    "aws_kms_key.state": [
+      "policy"
+    ],
+    "aws_s3_bucket_policy.state": [
+      "policy"
+    ]
   }
 }
