@@ -1,0 +1,204 @@
+{
+  "vector_version": 1,
+  "base_vector": "positive.json",
+  "assembly": "For a case with token_parts, replace each $positive value with the same named field from positive.json, then join header_base64url, claims_base64url and signature_base64url with ASCII dots.",
+  "cases": [
+    {
+      "name": "too-many-segments",
+      "compact": "a.b.c.d",
+      "expected_class": "malformed_envelope"
+    },
+    {
+      "name": "padding-forbidden",
+      "token_parts": {
+        "header_base64url": "$positive.header_base64url=",
+        "claims_base64url": "$positive.claims_base64url",
+        "signature_base64url": "$positive.signature_base64url"
+      },
+      "expected_class": "malformed_envelope"
+    },
+    {
+      "name": "invalid-base64url-character",
+      "token_parts": {
+        "header_base64url": "$positive.header_base64url",
+        "claims_base64url": "$positive.claims_base64url",
+        "signature_base64url": "*"
+      },
+      "expected_class": "malformed_envelope"
+    },
+    {
+      "name": "signed-unknown-header",
+      "token_parts": {
+        "header_base64url": "eyJhbGciOiJFZERTQSIsImtpZCI6IjIxZmUzMWRmYTE1NGEyNjE2MjZiZjg1NDA0NmZkMjI3MWI3YmVkNGI2YWJlNDVhYTU4ODc3ZWY0N2Y5NzIxYjkiLCJ0eXAiOiJjYXRzLXJvdXRlLWdyYW50K2p3dCIsInYiOjEsIngiOjF9",
+        "claims_base64url": "$positive.claims_base64url",
+        "signature_base64url": "y0wS7j7_TSiw6hwj5KfiHOagTPupkUJ-1xcoS4wRHlJGtWZJRN1Z-7LaVF1Us_GLvoVtYyNqqsVRkhk_GLE9Dg"
+      },
+      "expected_class": "noncanonical_encoding"
+    },
+    {
+      "name": "signed-version-two",
+      "token_parts": {
+        "header_base64url": "eyJhbGciOiJFZERTQSIsImtpZCI6IjIxZmUzMWRmYTE1NGEyNjE2MjZiZjg1NDA0NmZkMjI3MWI3YmVkNGI2YWJlNDVhYTU4ODc3ZWY0N2Y5NzIxYjkiLCJ0eXAiOiJjYXRzLXJvdXRlLWdyYW50K2p3dCIsInYiOjJ9",
+        "claims_base64url": "$positive.claims_base64url",
+        "signature_base64url": "YkHRlSCNsLVocZT9I8hdzsJkCpEw4cbWn1YOa1gpTWWCVWIMVOnV08ccBb13Q1KpjNqNWPeuM4IU0XMfaMe4Cw"
+      },
+      "expected_class": "unsupported_version"
+    },
+    {
+      "name": "signed-wrong-algorithm",
+      "token_parts": {
+        "header_base64url": "eyJhbGciOiJFUzI1NiIsImtpZCI6IjIxZmUzMWRmYTE1NGEyNjE2MjZiZjg1NDA0NmZkMjI3MWI3YmVkNGI2YWJlNDVhYTU4ODc3ZWY0N2Y5NzIxYjkiLCJ0eXAiOiJjYXRzLXJvdXRlLWdyYW50K2p3dCIsInYiOjF9",
+        "claims_base64url": "$positive.claims_base64url",
+        "signature_base64url": "ckgUGJhRlw8qfQvSmisV6RhdnV_eWfehDGk036_2Y_e72Y0pn89wlM55KGk9bAdL9Huwnm0OmAdXJDLTFtZTAg"
+      },
+      "expected_class": "unsupported_algorithm"
+    },
+    {
+      "name": "signed-unknown-kid",
+      "token_parts": {
+        "header_base64url": "eyJhbGciOiJFZERTQSIsImtpZCI6IjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAiLCJ0eXAiOiJjYXRzLXJvdXRlLWdyYW50K2p3dCIsInYiOjF9",
+        "claims_base64url": "$positive.claims_base64url",
+        "signature_base64url": "HHCbODGSoqSl9yIszj31H1ItAlFOS59vEfQZnGUbH1cI6khPIajKembxNBtuclULwbnx0n1Y3YkN06KXiRz8BQ"
+      },
+      "expected_class": "unknown_key"
+    },
+    {
+      "name": "tampered-target-port",
+      "token_parts": {
+        "header_base64url": "$positive.header_base64url",
+        "claims_base64url": "eyJhdWQiOiJjYXRzLW5vZGUtYWdlbnQiLCJjYXRfZ2VuZXJhdGlvbiI6NywiY2F0X2lkIjoiY2F0XzAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwiZW5kcG9pbnRfaWQiOiJlcF8wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImV4cCI6MTgwMDAwMDA2MCwiZ3JhbnRfaWQiOiJyZ18wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImhvc3RuYW1lIjoicHJldmlldy0wMTIzNDU2Nzg5YWIuY2F0cy5ydW4iLCJpYXQiOjE4MDAwMDAwMDAsImlzcyI6ImNhdHMtY29udHJvbC1wbGFuZSIsIm5iZiI6MTgwMDAwMDAwMCwibm9kZV9pZCI6Im5vZGVfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCJwcm90b2NvbCI6Imh0dHAiLCJyb3V0ZV9lcG9jaCI6NDIsInRhcmdldF9wb3J0Ijo4MDgxLCJ3b3Jrc3BhY2VfaWQiOiJ3c18wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiJ9",
+        "signature_base64url": "$positive.signature_base64url"
+      },
+      "expected_class": "invalid_signature"
+    },
+    {
+      "name": "noncanonical-ed25519-s-plus-group-order",
+      "token_parts": {
+        "header_base64url": "$positive.header_base64url",
+        "claims_base64url": "$positive.claims_base64url",
+        "signature_base64url": "DG5Ofbp8D6Bgw5Rfx1s4370wjJJwT2D15d80D2BnBVzlC5DrlYYU_Xjtk8T-1U92RPhHeyiPOTayVUmi982XFQ"
+      },
+      "expected_class": "noncanonical_encoding"
+    },
+    {
+      "name": "signed-unknown-claim",
+      "token_parts": {
+        "header_base64url": "$positive.header_base64url",
+        "claims_base64url": "eyJhdWQiOiJjYXRzLW5vZGUtYWdlbnQiLCJjYXRfZ2VuZXJhdGlvbiI6NywiY2F0X2lkIjoiY2F0XzAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwiZW5kcG9pbnRfaWQiOiJlcF8wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImV4cCI6MTgwMDAwMDA2MCwiZ3JhbnRfaWQiOiJyZ18wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImhvc3RuYW1lIjoicHJldmlldy0wMTIzNDU2Nzg5YWIuY2F0cy5ydW4iLCJpYXQiOjE4MDAwMDAwMDAsImlzcyI6ImNhdHMtY29udHJvbC1wbGFuZSIsIm5iZiI6MTgwMDAwMDAwMCwibm9kZV9pZCI6Im5vZGVfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCJwcm90b2NvbCI6Imh0dHAiLCJyb3V0ZV9lcG9jaCI6NDIsInNjb3BlIjoiKiIsInRhcmdldF9wb3J0Ijo4MDgwLCJ3b3Jrc3BhY2VfaWQiOiJ3c18wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiJ9",
+        "signature_base64url": "xrzxiaiL9J0kq1uoOyqdvyCMlctH4tw5arZFh_2pkvGibT5DCDWRfBtnGGNkoWS_z2-osDlHSU_3dyqKN0ejAg"
+      },
+      "expected_class": "invalid_claims"
+    },
+    {
+      "name": "signed-duplicate-target-port",
+      "token_parts": {
+        "header_base64url": "$positive.header_base64url",
+        "claims_base64url": "eyJhdWQiOiJjYXRzLW5vZGUtYWdlbnQiLCJjYXRfZ2VuZXJhdGlvbiI6NywiY2F0X2lkIjoiY2F0XzAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwiZW5kcG9pbnRfaWQiOiJlcF8wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImV4cCI6MTgwMDAwMDA2MCwiZ3JhbnRfaWQiOiJyZ18wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImhvc3RuYW1lIjoicHJldmlldy0wMTIzNDU2Nzg5YWIuY2F0cy5ydW4iLCJpYXQiOjE4MDAwMDAwMDAsImlzcyI6ImNhdHMtY29udHJvbC1wbGFuZSIsIm5iZiI6MTgwMDAwMDAwMCwibm9kZV9pZCI6Im5vZGVfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCJwcm90b2NvbCI6Imh0dHAiLCJyb3V0ZV9lcG9jaCI6NDIsInRhcmdldF9wb3J0Ijo4MDgwLCJ0YXJnZXRfcG9ydCI6OTA5MCwid29ya3NwYWNlX2lkIjoid3NfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYifQ",
+        "signature_base64url": "A6idnNURAyxYjtsaz1Q6egcYOIrbnPmElrH4jCYIXMqxY-vTmyZlkTyTMADpuIY04FfyuWTOKCywckXT0VOUDA"
+      },
+      "expected_class": "noncanonical_encoding"
+    },
+    {
+      "name": "signed-noncanonical-claims-order-and-whitespace",
+      "token_parts": {
+        "header_base64url": "$positive.header_base64url",
+        "claims_base64url": "eyAid29ya3NwYWNlX2lkIjogIndzXzAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwgInRhcmdldF9wb3J0IjogODA4MCwgInJvdXRlX2Vwb2NoIjogNDIsICJwcm90b2NvbCI6ICJodHRwIiwgIm5vZGVfaWQiOiAibm9kZV8wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsICJuYmYiOiAxODAwMDAwMDAwLCAiaXNzIjogImNhdHMtY29udHJvbC1wbGFuZSIsICJpYXQiOiAxODAwMDAwMDAwLCAiaG9zdG5hbWUiOiAicHJldmlldy0wMTIzNDU2Nzg5YWIuY2F0cy5ydW4iLCAiZ3JhbnRfaWQiOiAicmdfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCAiZXhwIjogMTgwMDAwMDA2MCwgImVuZHBvaW50X2lkIjogImVwXzAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwgImNhdF9pZCI6ICJjYXRfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCAiY2F0X2dlbmVyYXRpb24iOiA3LCAiYXVkIjogImNhdHMtbm9kZS1hZ2VudCIgfQ",
+        "signature_base64url": "WvIXqY6CeRKlnCQN6QDYjMSOEP5k0YYp4_GNHy4bhHki0gSFYJs18MYGJcyQ2rnd2sLfT98yVKc6WmzueysHDg"
+      },
+      "expected_class": "noncanonical_encoding"
+    },
+    {
+      "name": "signed-lifetime-121-seconds",
+      "token_parts": {
+        "header_base64url": "$positive.header_base64url",
+        "claims_base64url": "eyJhdWQiOiJjYXRzLW5vZGUtYWdlbnQiLCJjYXRfZ2VuZXJhdGlvbiI6NywiY2F0X2lkIjoiY2F0XzAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwiZW5kcG9pbnRfaWQiOiJlcF8wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImV4cCI6MTgwMDAwMDEyMSwiZ3JhbnRfaWQiOiJyZ18wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImhvc3RuYW1lIjoicHJldmlldy0wMTIzNDU2Nzg5YWIuY2F0cy5ydW4iLCJpYXQiOjE4MDAwMDAwMDAsImlzcyI6ImNhdHMtY29udHJvbC1wbGFuZSIsIm5iZiI6MTgwMDAwMDAwMCwibm9kZV9pZCI6Im5vZGVfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCJwcm90b2NvbCI6Imh0dHAiLCJyb3V0ZV9lcG9jaCI6NDIsInRhcmdldF9wb3J0Ijo4MDgwLCJ3b3Jrc3BhY2VfaWQiOiJ3c18wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiJ9",
+        "signature_base64url": "jteIk7vtRk7Jc5vjDxpfEEFR9pE4P4lcOFphpm5or5q0jeeMbfNbvb42haQpNaD7G3Ddn8ThIDdhH3JtUxv9CQ"
+      },
+      "expected_class": "lifetime_exceeded"
+    },
+    {
+      "name": "not-before-beyond-skew",
+      "token": "$positive.compact",
+      "context_override": { "now": 1799999994 },
+      "expected_class": "not_yet_valid"
+    },
+    {
+      "name": "expiry-is-hard-boundary",
+      "token": "$positive.compact",
+      "context_override": { "now": 1800000060 },
+      "expected_class": "expired"
+    },
+    {
+      "name": "clock-health-gate",
+      "token": "$positive.compact",
+      "context_override": { "clock_healthy": false },
+      "expected_class": "clock_unhealthy"
+    },
+    {
+      "name": "workspace-local-truth-mismatch",
+      "token": "$positive.compact",
+      "context_override": { "local_authority.workspace_id": "ws_other" },
+      "expected_class": "authority_mismatch"
+    },
+    {
+      "name": "endpoint-local-truth-mismatch",
+      "token": "$positive.compact",
+      "context_override": { "local_authority.endpoint_id": "ep_other" },
+      "expected_class": "authority_mismatch"
+    },
+    {
+      "name": "cat-local-truth-mismatch",
+      "token": "$positive.compact",
+      "context_override": { "local_authority.cat_id": "cat_other" },
+      "expected_class": "authority_mismatch"
+    },
+    {
+      "name": "generation-local-truth-mismatch",
+      "token": "$positive.compact",
+      "context_override": { "local_authority.cat_generation": 8 },
+      "expected_class": "authority_mismatch"
+    },
+    {
+      "name": "hostname-local-truth-mismatch",
+      "token": "$positive.compact",
+      "context_override": { "local_authority.hostname": "other.cats.run" },
+      "expected_class": "authority_mismatch"
+    },
+    {
+      "name": "node-local-truth-mismatch",
+      "token": "$positive.compact",
+      "context_override": { "local_authority.node_id": "node_other" },
+      "expected_class": "authority_mismatch"
+    },
+    {
+      "name": "epoch-local-truth-mismatch",
+      "token": "$positive.compact",
+      "context_override": { "local_authority.route_epoch": 43 },
+      "expected_class": "authority_mismatch"
+    },
+    {
+      "name": "protocol-local-truth-mismatch",
+      "token": "$positive.compact",
+      "context_override": { "local_authority.protocol": "https" },
+      "expected_class": "authority_mismatch"
+    },
+    {
+      "name": "port-local-truth-mismatch",
+      "token": "$positive.compact",
+      "context_override": { "local_authority.target_port": 9090 },
+      "expected_class": "authority_mismatch"
+    },
+    {
+      "name": "runtime-not-running",
+      "token": "$positive.compact",
+      "context_override": { "runtime_state": "Suspended" },
+      "expected_class": "runtime_unavailable"
+    },
+    {
+      "name": "quiesce-won-admission-race",
+      "token": "$positive.compact",
+      "context_override": { "quiesce_started": true },
+      "expected_class": "runtime_unavailable"
+    }
+  ]
+}
