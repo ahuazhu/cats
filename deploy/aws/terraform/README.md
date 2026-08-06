@@ -337,38 +337,6 @@ The disruptive drill separately uploads fixed-rate public-probe results and
 Pod/EndpointSlice transition evidence; those artifacts contain no Secret
 values or response bodies and are retained for 30 days for failure correlation.
 
-ADR-0031 deliberately cut over without importing the old SQLite rows. The
-application state removes the control-data PVC and its temporary DLM policy;
-the final manual EBS snapshot remains the archive of the pre-cutover database.
-Because Terraform can schedule that orphaned PVC destroy before the in-place
-Deployment update that removes its mount, the production workflow handles this
-one legacy edge explicitly: after saving the complete reviewed plan, it checks
-for `cats-control-data`. If the claim is still mounted only by
-`cats-controld`, the workflow verifies that the saved plan restores the
-PostgreSQL-era Deployment to at least two replicas, scales the old Deployment
-to zero, waits until no Pod consumes the claim, and only then applies the saved plan. It
-never removes the PVC protection finalizer or force-deletes the volume. Once a
-state has crossed the cutover and the PVC is absent, the step is a no-op.
-
-## Importing the existing Kubernetes deployment
-
-Do not run the first application apply while the YAML-created objects are
-outside state. Import every live object at its module address first, including:
-
-- Namespace `cats`;
-- ServiceAccount `cats/cats-controld`, Secret `cats/cats-runtime` and ConfigMap
-  `cats/cats-rds-ca`;
-- both Deployments and Services;
-- IngressClassParams, IngressClass and Ingress.
-
-Before import, export the live YAML and reconcile intentional differences.
-After import, require a plan with no unexpected replacement or deletion. The
-legacy files under `deploy/aws/k8s/` are migration references only and must not
-be applied again.
-
-The former `cats-auto-ebs` StorageClass and `cats-control-data` PVC are not
-part of the PostgreSQL-era application state and must not be imported.
-
 Terraform will additionally create `cats-gateway-runtime`, which exposes only
 `CATS_AUTH_TOKEN` to the gateway, plus the non-secret Route cache table name and
 AWS region. The gateway must not receive PostgreSQL or WorkOS credentials.
