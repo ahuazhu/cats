@@ -58,9 +58,16 @@ would let a compromised Gateway mint arbitrary Cat, Node or port bindings.
   enters a bounded per-host retry backoff; it never extends signed expiry. Once
   observed, an explicit not-found, other non-success response or malformed
   response invalidates that Gateway's local cached route and fails closed.
-  That replica then bypasses the shared mirror until a direct control-plane
-  resolve returns active + Running, so it cannot re-import the capability it
-  just rejected. Local expiry always fails closed without stale-while-revalidate.
+  That replica then bypasses the shared mirror for the longest interval in
+  which any Grant issued before the rejection could still pass time validation:
+  the maximum Grant TTL plus the verifier's accepted clock skew. It therefore
+  cannot re-import the capability it just rejected while that capability could
+  still be valid. A direct control-plane resolve returning active + Running is
+  the only way to clear this safety barrier early. After the complete window
+  elapses, the entry may again accept a currently valid, control-plane-signed
+  Grant published by another replica; the Node still performs the final
+  signature, binding and runtime checks. Local expiry always fails closed
+  without stale-while-revalidate.
 - The local cache is a fast path, not the replica-consistency boundary. Before
   returning a newly resolved active + Running grant, a production Gateway also
   attempts to publish the complete response to a regional DynamoDB table whose
