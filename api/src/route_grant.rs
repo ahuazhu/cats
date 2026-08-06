@@ -13,6 +13,7 @@ pub const ROUTE_GRANT_ISSUER: &str = "cats-control-plane";
 pub const ROUTE_GRANT_AUDIENCE: &str = "cats-node-agent";
 pub const DEFAULT_ROUTE_GRANT_TTL_SECONDS: u64 = 120;
 pub const MAX_ROUTE_GRANT_TTL_SECONDS: u64 = 300;
+pub const MAX_ROUTE_GRANT_CLOCK_SKEW_SECONDS: u64 = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RouteGrantPublicKeyError {

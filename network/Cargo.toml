@@ -23,6 +23,8 @@ clap = { workspace = true }
 futures-util = { workspace = true }
 tokio-tungstenite = { workspace = true }
 base64 = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-dynamodb = { workspace = true }
 
 [lints]
 workspace = true

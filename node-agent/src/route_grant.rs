@@ -4,8 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use cats_api::route_grant::{
-    route_grant_public_key_sha256, RouteGrantClaims, MAX_ROUTE_GRANT_TTL_SECONDS,
-    ROUTE_GRANT_AUDIENCE, ROUTE_GRANT_ISSUER, ROUTE_GRANT_VERSION,
+    route_grant_public_key_sha256, RouteGrantClaims, MAX_ROUTE_GRANT_CLOCK_SKEW_SECONDS,
+    MAX_ROUTE_GRANT_TTL_SECONDS, ROUTE_GRANT_AUDIENCE, ROUTE_GRANT_ISSUER, ROUTE_GRANT_VERSION,
 };
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 
@@ -77,7 +77,7 @@ impl RouteGrantVerifier {
             "unsupported Route Grant version"
         );
         anyhow::ensure!(
-            claims.iat <= now.saturating_add(5),
+            claims.iat <= now.saturating_add(MAX_ROUTE_GRANT_CLOCK_SKEW_SECONDS),
             "Route Grant was issued in the future"
         );
         anyhow::ensure!(claims.exp > now, "Endpoint Route Grant has expired");

@@ -20,6 +20,8 @@ pub(super) struct ResolveResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     route_grant: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    route_grant_issued_at_unix: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     route_grant_expires_at_unix: Option<u64>,
 }
 
@@ -55,6 +57,7 @@ pub(super) async fn resolve_route(
         observed_state: cat.observed_state,
         node_agent_url,
         route_grant: grant.as_ref().map(|grant| grant.token.clone()),
+        route_grant_issued_at_unix: grant.as_ref().map(|grant| grant.issued_at_unix),
         route_grant_expires_at_unix: grant.map(|grant| grant.expires_at_unix),
     }))
 }

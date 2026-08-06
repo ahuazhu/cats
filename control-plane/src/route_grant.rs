@@ -21,6 +21,7 @@ pub struct RouteGrantSigner {
 #[derive(Debug, Clone)]
 pub struct IssuedRouteGrant {
     pub token: String,
+    pub issued_at_unix: u64,
     pub expires_at_unix: u64,
 }
 
@@ -124,6 +125,7 @@ impl RouteGrantSigner {
             .context("sign Endpoint Route Grant")?;
         Ok(IssuedRouteGrant {
             token,
+            issued_at_unix: issued_at,
             expires_at_unix,
         })
     }
@@ -187,6 +189,7 @@ mod tests {
                 exp: 1_120,
             }
         );
+        assert_eq!(grant.issued_at_unix, 1_000);
         assert_eq!(grant.expires_at_unix, 1_120);
     }
 

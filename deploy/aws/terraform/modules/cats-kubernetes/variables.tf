@@ -309,6 +309,21 @@ variable "gateway_replicas" {
   }
 }
 
+variable "shared_route_cache_table" {
+  description = "DynamoDB table that replicates short-lived signed Route Grants across Gateway replicas. Null disables it outside production."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = (
+      var.shared_route_cache_table == null ||
+      can(regex("^[A-Za-z0-9_.-]{3,255}$", var.shared_route_cache_table))
+    )
+    error_message = "shared_route_cache_table must be null or a valid DynamoDB table name."
+  }
+}
+
 variable "enable_public_ingress" {
   description = "Create the EKS Auto Mode ALB ingress resources."
   type        = bool

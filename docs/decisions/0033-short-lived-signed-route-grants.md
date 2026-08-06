@@ -57,8 +57,33 @@ would let a compromised Gateway mint arbitrary Cat, Node or port bindings.
   refresh. A transport or control-plane 5xx failure retains the cached grant and
   enters a bounded per-host retry backoff; it never extends signed expiry. Once
   observed, an explicit not-found, other non-success response or malformed
-  response invalidates the cached route and fails closed. Local expiry always
-  fails closed without stale-while-revalidate.
+  response invalidates that Gateway's local cached route and fails closed.
+  That replica then bypasses the shared mirror until a direct control-plane
+  resolve returns active + Running, so it cannot re-import the capability it
+  just rejected. Local expiry always fails closed without stale-while-revalidate.
+- The local cache is a fast path, not the replica-consistency boundary. Before
+  returning a newly resolved active + Running grant, a production Gateway also
+  attempts to publish the complete response to a regional DynamoDB table whose
+  lifetime is bounded by the signed expiry. A cold Gateway replica checks that
+  strongly consistent shared cache before consulting the control plane. Every
+  loaded response repeats the same hostname, state and advertised lifetime
+  validation; the Gateway still treats the token as opaque and the Node remains
+  the authorization verifier. The table contains only positive capabilities
+  signed by the control plane. Its conditional write ordering uses the
+  PostgreSQL `routes.epoch` carried in that signed response, then signed issue
+  time only to order renewals within one epoch. A Gateway never turns a 404,
+  inactive response or its wall clock into shared route authority or a global
+  revocation. An older signed capability may therefore remain reusable until
+  its signed expiry; this is the same bounded revocation window as any other
+  already-issued Route Grant, not an immediate-revocation mechanism.
+- The shared cache is independent of PostgreSQL and any Gateway Pod or EKS
+  node. Gateway Pod Identity grants only `GetItem` and `PutItem` on that one
+  table. DynamoDB is deliberately not a Gateway startup/readiness dependency.
+  Shared-cache failure falls back to a healthy control plane; control-plane
+  failure falls back to a valid shared or local grant. Thus either dependency
+  may fail alone without becoming the new data-plane SPOF. Runtime shared-cache
+  reads and writes have a 100 ms hard deadline so a slow DynamoDB request cannot
+  hold a healthy control-plane response hostage.
 - The Gateway sends the hostname and token with every Node hop. The Node
   verifies the EdDSA signature, required issuer/audience/time claims, grant
   version, hostname, Cat ID, Cat generation, local Node ID, route epoch and
@@ -77,8 +102,8 @@ would let a compromised Gateway mint arbitrary Cat, Node or port bindings.
   the Cat cannot auto-suspend before the Node activity guard is acquired.
   Normal Running traffic never creates or releases that lease.
 - A Node stale-route conflict still invalidates the Gateway cache and forces
-  one fresh resolve. A rejected grant is never used as the fallback for that
-  retry.
+  one fresh control-plane resolve and activates the same local shared-mirror
+  barrier. A rejected grant is never used as the fallback for that retry.
 
 The service bearer credential remains as defense in depth for the Gateway-to-
 Node hop. It authenticates the calling service but does not authorize a route.
@@ -90,6 +115,9 @@ Node hop. It authenticates the calling service but does not authorize a route.
   is invented during the outage. Data-plane requests do not wait on the
   control-plane timeout or multiply resolve load after cache freshness; one
   coalesced refresh per hostname probes recovery under a bounded backoff.
+- A grant resolved by any healthy Gateway replica is reusable by another
+  replica during that bounded outage. Losing the original Pod, its EKS node or
+  load-balancer affinity no longer loses the only cached authorization.
 - Established WebSockets do not depend on renewal through PostgreSQL and stay
   connected while their Node and Guest remain healthy. Their admission was
   authorized before expiry; the held local guard continues to fence Suspend.

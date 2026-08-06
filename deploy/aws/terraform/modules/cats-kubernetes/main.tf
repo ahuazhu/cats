@@ -150,6 +150,18 @@ resource "kubernetes_secret_v1" "gateway_runtime" {
   data = local.gateway_secret_data
 }
 
+resource "kubernetes_service_account_v1" "gateway" {
+  metadata {
+    name      = "cats-gatewayd"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-gatewayd"
+    })
+  }
+
+  automount_service_account_token = false
+}
+
 # Separate from runtime and gateway credentials so the signing key is mounted
 # as a file only in cats-controld and can never be inherited by cats-gatewayd.
 # The matching public half lets every replica prove the pair before Ready.
@@ -498,6 +510,7 @@ resource "kubernetes_deployment_v1" "gateway" {
       spec {
         automount_service_account_token = false
         enable_service_links            = false
+        service_account_name            = kubernetes_service_account_v1.gateway.metadata[0].name
 
         node_selector = {
           "kubernetes.io/arch" = "amd64"
@@ -519,6 +532,24 @@ resource "kubernetes_deployment_v1" "gateway" {
           env_from {
             secret_ref {
               name = kubernetes_secret_v1.gateway_runtime.metadata[0].name
+            }
+          }
+
+          dynamic "env" {
+            for_each = var.shared_route_cache_table == null ? [] : [var.shared_route_cache_table]
+
+            content {
+              name  = "CATS_SHARED_ROUTE_CACHE_TABLE"
+              value = env.value
+            }
+          }
+
+          dynamic "env" {
+            for_each = var.shared_route_cache_table == null ? [] : [var.usage_aws_region]
+
+            content {
+              name  = "AWS_REGION"
+              value = env.value
             }
           }
 

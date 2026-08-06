@@ -152,6 +152,68 @@ fn route_grant_private_key_reaches_only_control_plane_and_nodes_get_public_key()
 }
 
 #[test]
+fn gateway_replicas_share_only_already_signed_route_grants_outside_postgres() {
+    let infrastructure =
+        read_workspace_file("deploy/aws/terraform/modules/route-cache-infrastructure/main.tf");
+    for expected in [
+        "resource \"aws_dynamodb_table\" \"route_grants\"",
+        "billing_mode = \"PAY_PER_REQUEST\"",
+        "hash_key     = \"hostname\"",
+        "attribute_name = \"expires_at_unix\"",
+        "point_in_time_recovery",
+        "server_side_encryption",
+        "\"dynamodb:GetItem\"",
+        "\"dynamodb:PutItem\"",
+        "resource \"aws_eks_pod_identity_association\" \"gateway\"",
+        "service_account = var.gateway_service_account_name",
+    ] {
+        assert!(
+            infrastructure.contains(expected),
+            "shared Route cache infrastructure lost {expected:?}"
+        );
+    }
+    for forbidden in [
+        "dynamodb:Scan",
+        "dynamodb:Query",
+        "dynamodb:DeleteTable",
+        "dynamodb:CreateTable",
+    ] {
+        assert!(
+            !infrastructure.contains(forbidden),
+            "Gateway Route cache identity gained unnecessary permission {forbidden:?}"
+        );
+    }
+
+    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    let gateway = kubernetes
+        .split_once("resource \"kubernetes_deployment_v1\" \"gateway\"")
+        .map(|(_, section)| section)
+        .expect("Gateway Deployment section");
+    for expected in [
+        "resource \"kubernetes_service_account_v1\" \"gateway\"",
+        "service_account_name            = kubernetes_service_account_v1.gateway.metadata[0].name",
+        "CATS_SHARED_ROUTE_CACHE_TABLE",
+        "AWS_REGION",
+    ] {
+        assert!(
+            kubernetes.contains(expected) || gateway.contains(expected),
+            "Gateway deployment lost shared Route cache wiring {expected:?}"
+        );
+    }
+
+    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
+    for expected in [
+        "ROUTE_CACHE_TABLE_NAME: ${{ vars.ROUTE_CACHE_TABLE_NAME }}",
+        "-var=\"shared_route_cache_table=$ROUTE_CACHE_TABLE_NAME\"",
+    ] {
+        assert!(
+            workflow.contains(expected),
+            "production deployment lost shared Route cache input {expected:?}"
+        );
+    }
+}
+
+#[test]
 fn route_grant_rotation_checks_schedulable_and_serving_nodes_before_a_rollout() {
     let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
     let verifier = read_workspace_file("deploy/aws/check-route-grant-nodes.sh");

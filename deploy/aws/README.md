@@ -16,6 +16,9 @@ Production-shaped split:
   assets. It is not an EKS node.
 - RDS PostgreSQL: authoritative ChunkStore roots, leases and fencing epochs.
 - S3: immutable durable ChunkStore objects.
+- Endpoint continuity: a regional DynamoDB table replicates only short-lived,
+  already-signed Route Grants across `cats-gatewayd` replicas; Nodes remain the
+  authorization verifier.
 - Usage billing: `cats-controld` publishes attributed cumulative checkpoints to
   Kinesis; its projector writes 50-second/4-MiB/1000-record NDJSON batches to a
   seven-year Object Lock S3 archive, updates the PostgreSQL `cats_usage`
@@ -28,13 +31,13 @@ Production-shaped split:
 - One EKS Auto Mode ALB: the user site at `cats.run`, the operator site at
   `ops.cats.run`, legacy-host redirects and the endpoint wildcard.
 
-The Terraform application stack creates the `cats-controld` ServiceAccount,
-`cats-runtime` and `cats-rds-ca`;
+The Terraform application stack creates the `cats-controld` and
+`cats-gatewayd` ServiceAccounts, `cats-runtime` and `cats-rds-ca`;
 secrets are injected by CI and remain protected in remote state. It also
 renders the target ACM ARN and every public subnet into EKS Auto Mode ingress.
 EKS Pod Identity grants the control plane only the Kinesis/S3/DynamoDB usage
-permissions; gateway Pods receive none. Do not create or patch these objects
-manually.
+permissions. A separate least-privilege Gateway identity may read and write
+only the signed Route Grant table. Do not create or patch these objects manually.
 
 The worker does not hold a copy of the database password. Set
 `database_master_user_secret_arn` and the non-secret half of the DSN in

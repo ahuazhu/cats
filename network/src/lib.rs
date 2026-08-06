@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
+use aws_sdk_dynamodb::types::AttributeValue;
 use axum::body::{to_bytes, Body};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequestParts, State};
@@ -28,6 +29,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use cats_api::requests::{ProxyHttpRequest, ProxyHttpResponse};
 use cats_api::resources::{ObservedState, RouteBinding, WakePolicy};
+use cats_api::route_grant::{MAX_ROUTE_GRANT_CLOCK_SKEW_SECONDS, MAX_ROUTE_GRANT_TTL_SECONDS};
 
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
@@ -36,16 +38,229 @@ pub struct GatewayConfig {
     pub auth_token: String,
     /// Route cache TTL; kept tiny so rebinding propagates fast in dev.
     pub cache_ttl_ms: u64,
+    /// Optional regional shared cache for signed Route Grants. Production
+    /// supplies a DynamoDB table so any Gateway replica can survive a
+    /// control-plane outage after another replica resolved the route.
+    pub shared_route_cache_table: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct ResolveResponse {
     binding: RouteBinding,
     state: String,
     observed_state: ObservedState,
     node_agent_url: String,
     route_grant: Option<String>,
+    route_grant_issued_at_unix: Option<u64>,
     route_grant_expires_at_unix: Option<u64>,
+}
+
+#[derive(Clone)]
+enum SharedRouteCache {
+    Disabled,
+    DynamoDb {
+        client: aws_sdk_dynamodb::Client,
+        table: String,
+    },
+    #[cfg(test)]
+    Memory(Arc<Mutex<HashMap<String, ResolveResponse>>>),
+    #[cfg(test)]
+    Hanging,
+}
+
+impl SharedRouteCache {
+    async fn from_config(cfg: &GatewayConfig) -> anyhow::Result<Self> {
+        let Some(table) = cfg.shared_route_cache_table.as_deref() else {
+            return Ok(Self::Disabled);
+        };
+        let table = table.trim();
+        anyhow::ensure!(!table.is_empty(), "shared Route cache table is empty");
+        let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let client = aws_sdk_dynamodb::Client::new(&sdk_config);
+        // Do not probe DynamoDB here. The shared mirror is an independent
+        // continuity path, not a Gateway readiness dependency; every runtime
+        // operation is bounded and falls through to a healthy control plane.
+        Ok(Self::DynamoDb {
+            client,
+            table: table.to_string(),
+        })
+    }
+
+    #[cfg(test)]
+    fn memory() -> Self {
+        Self::Memory(Arc::new(Mutex::new(HashMap::new())))
+    }
+
+    async fn load(&self, hostname: &str) -> anyhow::Result<Option<ResolveResponse>> {
+        match self {
+            Self::Disabled => Ok(None),
+            Self::DynamoDb { client, table } => {
+                let output = client
+                    .get_item()
+                    .table_name(table)
+                    .key("hostname", AttributeValue::S(hostname.to_string()))
+                    .consistent_read(true)
+                    .send()
+                    .await
+                    .context("load shared signed Route Grant")?;
+                let Some(item) = output.item() else {
+                    return Ok(None);
+                };
+                decode_shared_route_record(item).map(Some)
+            }
+            #[cfg(test)]
+            Self::Memory(records) => Ok(records.lock().unwrap().get(hostname).cloned()),
+            #[cfg(test)]
+            Self::Hanging => std::future::pending().await,
+        }
+    }
+
+    async fn publish(&self, hostname: &str, resolved: &ResolveResponse) -> anyhow::Result<()> {
+        let issued_at = resolved
+            .route_grant_issued_at_unix
+            .context("shared Route Grant has no issue time")?;
+        let expires_at = resolved
+            .route_grant_expires_at_unix
+            .context("shared Route Grant has no expiry")?;
+        match self {
+            Self::Disabled => Ok(()),
+            Self::DynamoDb { client, table } => {
+                let payload = serde_json::to_string(resolved)
+                    .context("serialize shared signed Route Grant")?;
+                let result = client
+                    .put_item()
+                    .table_name(table)
+                    .item("hostname", AttributeValue::S(hostname.to_string()))
+                    .item("payload", AttributeValue::S(payload))
+                    .item(
+                        "route_epoch",
+                        AttributeValue::N(resolved.binding.epoch.to_string()),
+                    )
+                    .item("issued_at_unix", AttributeValue::N(issued_at.to_string()))
+                    .item("expires_at_unix", AttributeValue::N(expires_at.to_string()))
+                    .condition_expression(
+                        "attribute_not_exists(#hostname) \
+                         OR #epoch < :epoch \
+                         OR (#epoch = :epoch AND #issued < :issued)",
+                    )
+                    .expression_attribute_names("#hostname", "hostname")
+                    .expression_attribute_names("#epoch", "route_epoch")
+                    .expression_attribute_names("#issued", "issued_at_unix")
+                    .expression_attribute_values(
+                        ":epoch",
+                        AttributeValue::N(resolved.binding.epoch.to_string()),
+                    )
+                    .expression_attribute_values(
+                        ":issued",
+                        AttributeValue::N(issued_at.to_string()),
+                    )
+                    .send()
+                    .await;
+                match result {
+                    Ok(_) => Ok(()),
+                    Err(error)
+                        if error.as_service_error().is_some_and(|service| {
+                            service.is_conditional_check_failed_exception()
+                        }) =>
+                    {
+                        // A higher PostgreSQL route epoch, or a later renewal
+                        // of the same epoch, already won. The caller may still
+                        // use this locally signed response; the shared mirror
+                        // must never move route authority backwards.
+                        Ok(())
+                    }
+                    Err(error) => Err(error).context("publish shared signed Route Grant"),
+                }
+            }
+            #[cfg(test)]
+            Self::Memory(records) => {
+                let mut records = records.lock().unwrap();
+                let replace = match records.get(hostname) {
+                    None => true,
+                    Some(current) => {
+                        current.binding.epoch < resolved.binding.epoch
+                            || (current.binding.epoch == resolved.binding.epoch
+                                && current.route_grant_issued_at_unix.unwrap_or(0) < issued_at)
+                    }
+                };
+                if replace {
+                    records.insert(hostname.to_string(), resolved.clone());
+                }
+                Ok(())
+            }
+            #[cfg(test)]
+            Self::Hanging => std::future::pending().await,
+        }
+    }
+}
+
+fn decode_shared_route_record(
+    item: &HashMap<String, AttributeValue>,
+) -> anyhow::Result<ResolveResponse> {
+    let payload = dynamodb_string(item, "payload")?;
+    let resolved: ResolveResponse =
+        serde_json::from_str(payload).context("decode shared signed Route Grant")?;
+    anyhow::ensure!(
+        dynamodb_i64(item, "route_epoch")? == resolved.binding.epoch,
+        "shared Route epoch metadata does not match its payload"
+    );
+    anyhow::ensure!(
+        dynamodb_u64(item, "issued_at_unix")?
+            == resolved
+                .route_grant_issued_at_unix
+                .context("shared Route payload has no issue time")?,
+        "shared Route issue-time metadata does not match its payload"
+    );
+    anyhow::ensure!(
+        dynamodb_u64(item, "expires_at_unix")?
+            == resolved
+                .route_grant_expires_at_unix
+                .context("shared Route payload has no expiry")?,
+        "shared Route expiry metadata does not match its payload"
+    );
+    Ok(resolved)
+}
+
+fn dynamodb_string<'a>(
+    item: &'a HashMap<String, AttributeValue>,
+    name: &str,
+) -> anyhow::Result<&'a str> {
+    item.get(name)
+        .with_context(|| format!("shared Route record has no {name}"))?
+        .as_s()
+        .map(String::as_str)
+        .map_err(|_| anyhow::anyhow!("shared Route record {name} is not a string"))
+}
+
+fn dynamodb_u64(item: &HashMap<String, AttributeValue>, name: &str) -> anyhow::Result<u64> {
+    dynamodb_string_number(item, name)?
+        .parse()
+        .with_context(|| format!("shared Route record {name} is not an unsigned integer"))
+}
+
+fn dynamodb_i64(item: &HashMap<String, AttributeValue>, name: &str) -> anyhow::Result<i64> {
+    dynamodb_string_number(item, name)?
+        .parse()
+        .with_context(|| format!("shared Route record {name} is not an integer"))
+}
+
+fn dynamodb_string_number<'a>(
+    item: &'a HashMap<String, AttributeValue>,
+    name: &str,
+) -> anyhow::Result<&'a str> {
+    item.get(name)
+        .with_context(|| format!("shared Route record has no {name}"))?
+        .as_n()
+        .map(String::as_str)
+        .map_err(|_| anyhow::anyhow!("shared Route record {name} is not a number"))
+}
+
+#[cfg(test)]
+fn unix_now() -> anyhow::Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs())
 }
 
 #[derive(Clone)]
@@ -58,6 +273,10 @@ struct CachedRoute {
 const ROUTE_REFRESH_BACKOFF: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const ROUTE_REFRESH_BACKOFF: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const SHARED_ROUTE_CACHE_IO_TIMEOUT: Duration = Duration::from_millis(100);
+#[cfg(test)]
+const SHARED_ROUTE_CACHE_IO_TIMEOUT: Duration = Duration::from_millis(20);
 const MAX_ROUTE_CACHE_ENTRIES: usize = 4_096;
 
 #[derive(Debug, Clone)]
@@ -148,6 +367,10 @@ struct RouteCacheEntry {
     refresh: Option<Arc<RouteRefresh>>,
     retry_after: Instant,
     last_failure: Option<ResolveFailure>,
+    /// A control-plane negative or Node conflict is authoritative for this
+    /// replica. Do not re-import a still-signed shared capability until a
+    /// direct control-plane resolve publishes active + Running again.
+    shared_lookup_allowed: bool,
     generation: u64,
 }
 
@@ -158,6 +381,7 @@ impl RouteCacheEntry {
             refresh: None,
             retry_after: now,
             last_failure: None,
+            shared_lookup_allowed: true,
             generation: 0,
         }
     }
@@ -165,9 +389,14 @@ impl RouteCacheEntry {
 
 fn route_is_locally_usable(resolved: &ResolveResponse) -> bool {
     if resolved.state != "active" || resolved.observed_state != ObservedState::Running {
-        return resolved.route_grant.is_none() && resolved.route_grant_expires_at_unix.is_none();
+        return resolved.route_grant.is_none()
+            && resolved.route_grant_issued_at_unix.is_none()
+            && resolved.route_grant_expires_at_unix.is_none();
     }
     let Some(grant) = resolved.route_grant.as_deref() else {
+        return false;
+    };
+    let Some(issued_at) = resolved.route_grant_issued_at_unix else {
         return false;
     };
     let Some(expires_at) = resolved.route_grant_expires_at_unix else {
@@ -176,7 +405,14 @@ fn route_is_locally_usable(resolved: &ResolveResponse) -> bool {
     let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
         return false;
     };
-    !grant.is_empty() && expires_at > now.as_secs()
+    !grant.is_empty()
+        && issued_at
+            <= now
+                .as_secs()
+                .saturating_add(MAX_ROUTE_GRANT_CLOCK_SKEW_SECONDS)
+        && expires_at > now.as_secs()
+        && expires_at > issued_at
+        && expires_at - issued_at <= MAX_ROUTE_GRANT_TTL_SECONDS
 }
 
 fn cached_outage_route(cached: Option<&CachedRoute>) -> Option<ResolveResponse> {
@@ -187,11 +423,54 @@ fn cached_outage_route(cached: Option<&CachedRoute>) -> Option<ResolveResponse> 
     .then(|| resolved.clone())
 }
 
+fn validate_resolved_route(
+    hostname: &str,
+    resolved: &ResolveResponse,
+) -> Result<(), ResolveFailure> {
+    let binding_hostname =
+        normalize_public_hostname(&resolved.binding.hostname).map_err(|message| {
+            ResolveFailure::response(
+                StatusCode::BAD_GATEWAY,
+                format!("invalid hostname in resolved Route binding: {message}"),
+                false,
+            )
+        })?;
+    if binding_hostname != hostname {
+        return Err(ResolveFailure::response(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "resolved Route binding hostname {binding_hostname} does not match requested host {hostname}"
+            ),
+            false,
+        ));
+    }
+    if resolved.state == "active" && resolved.observed_state == ObservedState::Running {
+        if !route_is_locally_usable(resolved) {
+            return Err(ResolveFailure::response(
+                StatusCode::BAD_GATEWAY,
+                "active Running route has no unexpired Route Grant".to_string(),
+                false,
+            ));
+        }
+    } else if resolved.route_grant.is_some()
+        || resolved.route_grant_issued_at_unix.is_some()
+        || resolved.route_grant_expires_at_unix.is_some()
+    {
+        return Err(ResolveFailure::response(
+            StatusCode::BAD_GATEWAY,
+            "inactive route unexpectedly carried a Route Grant".to_string(),
+            false,
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Gateway {
     cfg: Arc<GatewayConfig>,
     http: reqwest::Client,
     cache: Arc<Mutex<HashMap<String, RouteCacheEntry>>>,
+    shared_cache: SharedRouteCache,
 }
 
 pub struct Handle {
@@ -216,7 +495,103 @@ impl Gateway {
         self.cfg.control_plane_url.trim_end_matches('/').to_string()
     }
 
-    async fn fetch_route(&self, hostname: &str) -> Result<ResolveResponse, ResolveFailure> {
+    async fn load_shared_route(&self, hostname: &str) -> anyhow::Result<Option<ResolveResponse>> {
+        tokio::time::timeout(
+            SHARED_ROUTE_CACHE_IO_TIMEOUT,
+            self.shared_cache.load(hostname),
+        )
+        .await
+        .context("shared Route cache lookup timed out")?
+    }
+
+    async fn publish_shared_route(
+        &self,
+        hostname: &str,
+        resolved: &ResolveResponse,
+    ) -> anyhow::Result<()> {
+        tokio::time::timeout(
+            SHARED_ROUTE_CACHE_IO_TIMEOUT,
+            self.shared_cache.publish(hostname, resolved),
+        )
+        .await
+        .context("shared Route cache publication timed out")?
+    }
+
+    async fn fetch_route(
+        &self,
+        hostname: &str,
+        allow_shared: bool,
+    ) -> Result<ResolveResponse, ResolveFailure> {
+        if allow_shared {
+            match self.load_shared_route(hostname).await {
+                Ok(Some(resolved)) => {
+                    let active_running = resolved.state == "active"
+                        && resolved.observed_state == ObservedState::Running;
+                    match validate_resolved_route(hostname, &resolved) {
+                        Ok(()) if active_running => {
+                            tracing::debug!(
+                                hostname,
+                                "loaded peer-primed signed Route Grant from shared cache"
+                            );
+                            return Ok(resolved);
+                        }
+                        Ok(()) => {
+                            tracing::warn!(
+                                hostname,
+                                "ignoring a non-Running response in the shared signed-Grant mirror"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                hostname,
+                                ?error,
+                                "ignoring an unusable response in the shared signed-Grant mirror"
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    // DynamoDB is a second, independent continuity path. A
+                    // failure there must not break a healthy control-plane
+                    // resolve; losing both paths is a multi-failure event.
+                    tracing::warn!(
+                        hostname,
+                        %error,
+                        "shared Route cache lookup failed; resolving through the control plane"
+                    );
+                }
+            }
+        }
+
+        let result = self.fetch_control_plane_route(hostname).await;
+        match &result {
+            Ok(resolved)
+                if resolved.state == "active"
+                    && resolved.observed_state == ObservedState::Running =>
+            {
+                if let Err(error) = self.publish_shared_route(hostname, resolved).await {
+                    // Serve the locally authorized response: control plane is
+                    // healthy, so another replica can independently resolve.
+                    // The shared mirror preserves a signed capability; it
+                    // never manufactures route authority or revocation on
+                    // behalf of PostgreSQL.
+                    tracing::warn!(
+                        hostname,
+                        %error,
+                        "failed to replicate signed Route Grant to the shared cache"
+                    );
+                }
+            }
+            _ => {}
+        }
+        result
+    }
+
+    async fn fetch_control_plane_route(
+        &self,
+        hostname: &str,
+    ) -> Result<ResolveResponse, ResolveFailure> {
         let resp = self
             .http
             .get(format!("{}/v1/routes/resolve", self.cp()))
@@ -263,38 +638,7 @@ impl Gateway {
                 false,
             )
         })?;
-        let binding_hostname =
-            normalize_public_hostname(&resolved.binding.hostname).map_err(|message| {
-                ResolveFailure::response(
-                    StatusCode::BAD_GATEWAY,
-                    format!("invalid hostname in resolved Route binding: {message}"),
-                    false,
-                )
-            })?;
-        if binding_hostname != hostname {
-            return Err(ResolveFailure::response(
-                StatusCode::BAD_GATEWAY,
-                format!(
-                    "resolved Route binding hostname {binding_hostname} does not match requested host {hostname}"
-                ),
-                false,
-            ));
-        }
-        if resolved.state == "active" && resolved.observed_state == ObservedState::Running {
-            if !route_is_locally_usable(&resolved) {
-                return Err(ResolveFailure::response(
-                    StatusCode::BAD_GATEWAY,
-                    "active Running route has no unexpired Route Grant".to_string(),
-                    false,
-                ));
-            }
-        } else if resolved.route_grant.is_some() || resolved.route_grant_expires_at_unix.is_some() {
-            return Err(ResolveFailure::response(
-                StatusCode::BAD_GATEWAY,
-                "inactive route unexpectedly carried a Route Grant".to_string(),
-                false,
-            ));
-        }
+        validate_resolved_route(hostname, &resolved)?;
         Ok(resolved)
     }
 
@@ -329,10 +673,13 @@ impl Gateway {
                 });
                 entry.last_failure = None;
                 entry.retry_after = now;
+                entry.shared_lookup_allowed =
+                    resolved.state == "active" && resolved.observed_state == ObservedState::Running;
             }
             Err(error) => {
                 if !error.retains_cached_route() {
                     entry.cached = None;
+                    entry.shared_lookup_allowed = false;
                 }
                 entry.last_failure = Some(error.clone());
                 entry.retry_after = now + ROUTE_REFRESH_BACKOFF;
@@ -353,7 +700,13 @@ impl Gateway {
         refresh.complete(result);
     }
 
-    fn start_refresh(&self, hostname: String, generation: u64, refresh: Arc<RouteRefresh>) {
+    fn start_refresh(
+        &self,
+        hostname: String,
+        generation: u64,
+        refresh: Arc<RouteRefresh>,
+        allow_shared: bool,
+    ) {
         // Refresh ownership must not belong to whichever request happened to
         // publish the singleflight state. That request may be cancelled at any
         // await point (client disconnect, timeout, task abort). A Gateway-owned
@@ -361,7 +714,7 @@ impl Gateway {
         // cannot wait forever and abandoned hosts cannot consume the cache.
         let gateway = self.clone();
         tokio::spawn(async move {
-            let result = gateway.fetch_route(&hostname).await;
+            let result = gateway.fetch_route(&hostname, allow_shared).await;
             gateway.complete_refresh(&hostname, generation, &refresh, result);
         });
     }
@@ -371,7 +724,7 @@ impl Gateway {
             Return(ResolveResponse),
             ReturnAndRefresh(ResolveResponse, Arc<RouteRefresh>, u64),
             Wait(Arc<RouteRefresh>),
-            Refresh(Arc<RouteRefresh>, u64),
+            Refresh(Arc<RouteRefresh>, u64, bool),
             Fail(ResolveFailure),
         }
 
@@ -426,7 +779,11 @@ impl Gateway {
                     } else {
                         let refresh = Arc::new(RouteRefresh::new());
                         entry.refresh = Some(refresh.clone());
-                        Action::Refresh(refresh, entry.generation)
+                        Action::Refresh(
+                            refresh,
+                            entry.generation,
+                            use_cache && entry.shared_lookup_allowed,
+                        )
                     }
                 } else if let Some(refresh) = &entry.refresh {
                     Action::Wait(refresh.clone())
@@ -441,14 +798,18 @@ impl Gateway {
                 } else {
                     let refresh = Arc::new(RouteRefresh::new());
                     entry.refresh = Some(refresh.clone());
-                    Action::Refresh(refresh, entry.generation)
+                    Action::Refresh(
+                        refresh,
+                        entry.generation,
+                        use_cache && entry.shared_lookup_allowed,
+                    )
                 }
             };
 
             match action {
                 Action::Return(resolved) => return Ok(resolved),
                 Action::ReturnAndRefresh(resolved, refresh, generation) => {
-                    self.start_refresh(hostname.to_string(), generation, refresh);
+                    self.start_refresh(hostname.to_string(), generation, refresh, false);
                     return Ok(resolved);
                 }
                 Action::Wait(refresh) => match refresh.wait().await {
@@ -456,8 +817,13 @@ impl Gateway {
                     Err(ResolveFailure::Superseded) => continue,
                     Err(error) => return Err(error.into_response()),
                 },
-                Action::Refresh(refresh, generation) => {
-                    self.start_refresh(hostname.to_string(), generation, refresh.clone());
+                Action::Refresh(refresh, generation, allow_shared) => {
+                    self.start_refresh(
+                        hostname.to_string(),
+                        generation,
+                        refresh.clone(),
+                        allow_shared,
+                    );
                     match refresh.wait().await {
                         Ok(resolved) => return Ok(resolved),
                         Err(ResolveFailure::Superseded) => continue,
@@ -479,6 +845,7 @@ impl Gateway {
             entry.cached = None;
             entry.retry_after = Instant::now();
             entry.last_failure = None;
+            entry.shared_lookup_allowed = false;
             entry.refresh.take()
         };
         if let Some(refresh) = refresh {
@@ -966,12 +1333,14 @@ async fn entry(State(gw): State<Gateway>, req: Request<Body>) -> Response {
 const MAX_PROXY_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
 pub async fn spawn(cfg: GatewayConfig) -> anyhow::Result<Handle> {
+    let shared_cache = SharedRouteCache::from_config(&cfg).await?;
     let gw = Gateway {
         cfg: Arc::new(cfg),
         http: reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
             .build()?,
         cache: Arc::new(Mutex::new(HashMap::new())),
+        shared_cache,
     };
     let listener = tokio::net::TcpListener::bind(&gw.cfg.listen)
         .await
@@ -1048,24 +1417,41 @@ mod tests {
         route_grant: &str,
         expires_at: u64,
     ) -> Response {
-        Json(serde_json::json!({
-            "binding": {
-                "hostname": binding_hostname,
-                "workspace_id": "ws_1",
-                "cat_id": "cat_1",
-                "node_id": "node-a",
-                "gateway_url": "http://gateway",
-                "target_port": 8080,
-                "epoch": 7,
-                "wake_policy": "wake_on_request"
-            },
-            "state": "active",
-            "observed_state": "running",
-            "node_agent_url": node_agent_url,
-            "route_grant": route_grant,
-            "route_grant_expires_at_unix": expires_at
-        }))
+        Json(active_resolved_route(
+            binding_hostname,
+            node_agent_url,
+            route_grant,
+            expires_at.saturating_sub(60),
+            expires_at,
+        ))
         .into_response()
+    }
+
+    fn active_resolved_route(
+        binding_hostname: String,
+        node_agent_url: String,
+        route_grant: &str,
+        issued_at: u64,
+        expires_at: u64,
+    ) -> ResolveResponse {
+        ResolveResponse {
+            binding: RouteBinding {
+                hostname: binding_hostname,
+                workspace_id: "ws_1".to_string(),
+                cat_id: "cat_1".to_string(),
+                node_id: "node-a".to_string(),
+                gateway_url: "http://gateway".to_string(),
+                target_port: 8080,
+                epoch: 7,
+                wake_policy: WakePolicy::WakeOnRequest,
+            },
+            state: "active".to_string(),
+            observed_state: ObservedState::Running,
+            node_agent_url,
+            route_grant: Some(route_grant.to_string()),
+            route_grant_issued_at_unix: Some(issued_at),
+            route_grant_expires_at_unix: Some(expires_at),
+        }
     }
 
     async fn route_reply(State(state): State<Arc<RouteServerState>>) -> Response {
@@ -1103,6 +1489,14 @@ mod tests {
         state: Arc<RouteServerState>,
         cache_ttl_ms: u64,
     ) -> (Gateway, tokio::task::JoinHandle<()>) {
+        route_test_gateway_with_shared_cache(state, cache_ttl_ms, SharedRouteCache::Disabled).await
+    }
+
+    async fn route_test_gateway_with_shared_cache(
+        state: Arc<RouteServerState>,
+        cache_ttl_ms: u64,
+        shared_cache: SharedRouteCache,
+    ) -> (Gateway, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = Router::new()
@@ -1118,9 +1512,11 @@ mod tests {
                 control_plane_url: format!("http://{addr}"),
                 auth_token: "service-token".to_string(),
                 cache_ttl_ms,
+                shared_route_cache_table: None,
             }),
             http: reqwest::Client::new(),
             cache: Arc::new(Mutex::new(HashMap::new())),
+            shared_cache,
         };
         (gateway, task)
     }
@@ -1234,6 +1630,117 @@ mod tests {
         );
         assert!(normalize_public_hostname("").is_err());
         assert!(normalize_public_hostname("not a host").is_err());
+    }
+
+    #[test]
+    fn advertised_grant_lifetime_matches_the_node_verifier_bounds() {
+        let now = unix_now().unwrap();
+        let route = |issued_at, expires_at| {
+            active_resolved_route(
+                "dev.cats.run".to_string(),
+                "http://node-a".to_string(),
+                "grant-1",
+                issued_at,
+                expires_at,
+            )
+        };
+
+        assert!(route_is_locally_usable(&route(
+            now + MAX_ROUTE_GRANT_CLOCK_SKEW_SECONDS,
+            now + 60,
+        )));
+        assert!(!route_is_locally_usable(&route(
+            now + MAX_ROUTE_GRANT_CLOCK_SKEW_SECONDS + 1,
+            now + 60,
+        )));
+        assert!(!route_is_locally_usable(&route(now + 1, now + 1)));
+        assert!(!route_is_locally_usable(&route(
+            now,
+            now + MAX_ROUTE_GRANT_TTL_SECONDS + 1,
+        )));
+    }
+
+    #[test]
+    fn shared_route_record_rejects_malformed_or_inconsistent_metadata() {
+        let resolved = active_resolved_route(
+            "dev.cats.run".to_string(),
+            "http://node-a".to_string(),
+            "grant-1",
+            100,
+            160,
+        );
+        let valid = HashMap::from([
+            (
+                "hostname".to_string(),
+                AttributeValue::S("dev.cats.run".to_string()),
+            ),
+            (
+                "payload".to_string(),
+                AttributeValue::S(serde_json::to_string(&resolved).unwrap()),
+            ),
+            (
+                "route_epoch".to_string(),
+                AttributeValue::N("7".to_string()),
+            ),
+            (
+                "issued_at_unix".to_string(),
+                AttributeValue::N("100".to_string()),
+            ),
+            (
+                "expires_at_unix".to_string(),
+                AttributeValue::N("160".to_string()),
+            ),
+        ]);
+
+        let decoded = decode_shared_route_record(&valid).unwrap();
+        assert_eq!(decoded.binding.epoch, 7);
+        assert_eq!(decoded.route_grant.as_deref(), Some("grant-1"));
+
+        for (field, value, expected) in [
+            (
+                "route_epoch",
+                AttributeValue::N("8".to_string()),
+                "epoch metadata does not match",
+            ),
+            (
+                "issued_at_unix",
+                AttributeValue::N("101".to_string()),
+                "issue-time metadata does not match",
+            ),
+            (
+                "expires_at_unix",
+                AttributeValue::N("161".to_string()),
+                "expiry metadata does not match",
+            ),
+            (
+                "issued_at_unix",
+                AttributeValue::N("-1".to_string()),
+                "not an unsigned integer",
+            ),
+            (
+                "expires_at_unix",
+                AttributeValue::S("160".to_string()),
+                "is not a number",
+            ),
+        ] {
+            let mut item = valid.clone();
+            item.insert(field.to_string(), value);
+            let error = decode_shared_route_record(&item).unwrap_err().to_string();
+            assert!(
+                error.contains(expected),
+                "unexpected {field} error: {error}"
+            );
+        }
+
+        let mut malformed_payload = valid;
+        malformed_payload.insert(
+            "payload".to_string(),
+            AttributeValue::S("not-json".to_string()),
+        );
+        assert!(decode_shared_route_record(&malformed_payload)
+            .unwrap_err()
+            .to_string()
+            .contains("decode shared signed Route Grant"));
     }
 
     #[tokio::test]
@@ -1385,6 +1892,323 @@ mod tests {
             StatusCode::BAD_GATEWAY
         );
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn cold_gateway_replica_uses_peer_primed_route_during_control_plane_outage() {
+        let state = Arc::new(RouteServerState::new(RouteReply::Active("grant-1")));
+        let (node_url, node_state, node_task) = spawn_mock_node().await;
+        state.set_node_agent_url(node_url);
+        let shared_cache = SharedRouteCache::memory();
+        let (gateway_a, control_task_a) =
+            route_test_gateway_with_shared_cache(state.clone(), 10, shared_cache.clone()).await;
+        let (gateway_b, control_task_b) =
+            route_test_gateway_with_shared_cache(state.clone(), 10, shared_cache).await;
+
+        gateway_a.resolve("dev.cats.run", true).await.unwrap();
+        state.set(RouteReply::Status(StatusCode::INTERNAL_SERVER_ERROR));
+
+        let response = gateway_b
+            .handle(
+                "dev.cats.run".to_string(),
+                ProxyHttpRequest {
+                    method: "GET".to_string(),
+                    path: "/".to_string(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                    target_port: 0,
+                    route_epoch: 0,
+                    hostname: String::new(),
+                    route_grant: String::new(),
+                },
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(node_state.grants.lock().unwrap().as_slice(), ["grant-1"]);
+
+        control_task_a.abort();
+        control_task_b.abort();
+        node_task.abort();
+    }
+
+    #[tokio::test]
+    async fn shared_route_never_extends_the_signed_grant_expiry() {
+        let state = Arc::new(RouteServerState::new(RouteReply::Active("grant-1")));
+        let shared_cache = SharedRouteCache::memory();
+        let (gateway_a, control_task_a) =
+            route_test_gateway_with_shared_cache(state.clone(), 10, shared_cache.clone()).await;
+        let (gateway_b, control_task_b) =
+            route_test_gateway_with_shared_cache(state.clone(), 10, shared_cache.clone()).await;
+        gateway_a.resolve("dev.cats.run", true).await.unwrap();
+
+        let SharedRouteCache::Memory(records) = &shared_cache else {
+            unreachable!("test uses the in-memory shared cache")
+        };
+        {
+            let mut records = records.lock().unwrap();
+            let resolved = records.get_mut("dev.cats.run").unwrap();
+            resolved.route_grant_expires_at_unix = Some(1);
+        }
+
+        state.set(RouteReply::Status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(
+            gateway_b
+                .resolve("dev.cats.run", true)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::BAD_GATEWAY
+        );
+
+        control_task_a.abort();
+        control_task_b.abort();
+    }
+
+    #[tokio::test]
+    async fn shared_route_order_is_epoch_then_signed_issue_time() {
+        let shared_cache = SharedRouteCache::memory();
+        let hostname = "dev.cats.run";
+
+        let mut newer_epoch = active_resolved_route(
+            hostname.to_string(),
+            "http://node-a".to_string(),
+            "grant-epoch-8",
+            100,
+            160,
+        );
+        newer_epoch.binding.epoch = 8;
+        shared_cache.publish(hostname, &newer_epoch).await.unwrap();
+
+        let mut delayed_old_epoch = active_resolved_route(
+            hostname.to_string(),
+            "http://node-old".to_string(),
+            "grant-epoch-7-late",
+            10_000,
+            10_060,
+        );
+        delayed_old_epoch.binding.epoch = 7;
+        shared_cache
+            .publish(hostname, &delayed_old_epoch)
+            .await
+            .unwrap();
+
+        let loaded = shared_cache.load(hostname).await.unwrap().unwrap();
+        assert_eq!(loaded.binding.epoch, 8);
+        assert_eq!(loaded.route_grant.as_deref(), Some("grant-epoch-8"));
+
+        let mut renewed_same_epoch = active_resolved_route(
+            hostname.to_string(),
+            "http://node-a".to_string(),
+            "grant-epoch-8-renewed",
+            101,
+            161,
+        );
+        renewed_same_epoch.binding.epoch = 8;
+        shared_cache
+            .publish(hostname, &renewed_same_epoch)
+            .await
+            .unwrap();
+
+        let mut delayed_same_epoch = active_resolved_route(
+            hostname.to_string(),
+            "http://node-a".to_string(),
+            "grant-epoch-8-delayed",
+            100,
+            160,
+        );
+        delayed_same_epoch.binding.epoch = 8;
+        shared_cache
+            .publish(hostname, &delayed_same_epoch)
+            .await
+            .unwrap();
+
+        let mut conflicting_same_issue_time = active_resolved_route(
+            hostname.to_string(),
+            "http://node-a".to_string(),
+            "grant-epoch-8-conflict",
+            101,
+            161,
+        );
+        conflicting_same_issue_time.binding.epoch = 8;
+        shared_cache
+            .publish(hostname, &conflicting_same_issue_time)
+            .await
+            .unwrap();
+
+        let loaded = shared_cache.load(hostname).await.unwrap().unwrap();
+        assert_eq!(loaded.binding.epoch, 8);
+        assert_eq!(loaded.route_grant.as_deref(), Some("grant-epoch-8-renewed"));
+    }
+
+    #[tokio::test]
+    async fn stalled_shared_cache_cannot_block_a_healthy_control_plane() {
+        let state = Arc::new(RouteServerState::new(RouteReply::Active("grant-1")));
+        let (gateway, control_task) =
+            route_test_gateway_with_shared_cache(state.clone(), 10, SharedRouteCache::Hanging)
+                .await;
+
+        let resolved = tokio::time::timeout(
+            Duration::from_millis(250),
+            gateway.resolve("dev.cats.run", true),
+        )
+        .await
+        .expect("shared cache I/O has a hard deadline")
+        .unwrap();
+        assert_eq!(resolved.route_grant.as_deref(), Some("grant-1"));
+        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+
+        control_task.abort();
+    }
+
+    #[tokio::test]
+    async fn control_plane_negative_does_not_create_shared_route_authority() {
+        let state = Arc::new(RouteServerState::new(RouteReply::Status(
+            StatusCode::NOT_FOUND,
+        )));
+        let shared_cache = SharedRouteCache::memory();
+        let (gateway, control_task) =
+            route_test_gateway_with_shared_cache(state, 10, shared_cache.clone()).await;
+
+        assert_eq!(
+            gateway
+                .resolve("dev.cats.run", true)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert!(shared_cache.load("dev.cats.run").await.unwrap().is_none());
+
+        control_task.abort();
+    }
+
+    #[tokio::test]
+    async fn local_negative_barrier_prevents_shared_grant_reimport() {
+        let state = Arc::new(RouteServerState::new(RouteReply::Active("grant-1")));
+        let shared_cache = SharedRouteCache::memory();
+        let (gateway, control_task) =
+            route_test_gateway_with_shared_cache(state.clone(), 0, shared_cache.clone()).await;
+        gateway.resolve("dev.cats.run", true).await.unwrap();
+
+        state.set(RouteReply::Status(StatusCode::NOT_FOUND));
+        assert_eq!(
+            gateway
+                .resolve("dev.cats.run", true)
+                .await
+                .unwrap()
+                .route_grant
+                .as_deref(),
+            Some("grant-1"),
+            "the already-authorized request may use stale-while-revalidate"
+        );
+        wait_for_calls(&state, 2).await;
+        wait_for_idle(&gateway, "dev.cats.run").await;
+
+        gateway
+            .cache
+            .lock()
+            .unwrap()
+            .get_mut("dev.cats.run")
+            .unwrap()
+            .retry_after = Instant::now();
+        assert_eq!(
+            gateway
+                .resolve("dev.cats.run", true)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(state.calls(), 3, "the retry must consult the control plane");
+        assert_eq!(
+            shared_cache
+                .load("dev.cats.run")
+                .await
+                .unwrap()
+                .unwrap()
+                .route_grant
+                .as_deref(),
+            Some("grant-1"),
+            "a local negative must not manufacture a global shared tombstone"
+        );
+
+        state.set(RouteReply::Active("grant-2"));
+        gateway
+            .cache
+            .lock()
+            .unwrap()
+            .get_mut("dev.cats.run")
+            .unwrap()
+            .retry_after = Instant::now();
+        assert_eq!(
+            gateway
+                .resolve("dev.cats.run", true)
+                .await
+                .unwrap()
+                .route_grant
+                .as_deref(),
+            Some("grant-2")
+        );
+        assert!(
+            gateway
+                .cache
+                .lock()
+                .unwrap()
+                .get("dev.cats.run")
+                .unwrap()
+                .shared_lookup_allowed,
+            "a direct active + Running resolve clears the local barrier"
+        );
+
+        control_task.abort();
+    }
+
+    #[tokio::test]
+    async fn peer_primed_replica_refreshes_from_control_plane_after_recovery() {
+        let state = Arc::new(RouteServerState::new(RouteReply::Active("grant-1")));
+        let shared_cache = SharedRouteCache::memory();
+        let (gateway_a, control_task_a) =
+            route_test_gateway_with_shared_cache(state.clone(), 10, shared_cache.clone()).await;
+        let (gateway_b, control_task_b) =
+            route_test_gateway_with_shared_cache(state.clone(), 10, shared_cache).await;
+        gateway_a.resolve("dev.cats.run", true).await.unwrap();
+
+        state.set(RouteReply::Status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(
+            gateway_b
+                .resolve("dev.cats.run", true)
+                .await
+                .unwrap()
+                .route_grant
+                .as_deref(),
+            Some("grant-1")
+        );
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        state.set(RouteReply::Active("grant-2"));
+        assert_eq!(
+            gateway_b
+                .resolve("dev.cats.run", true)
+                .await
+                .unwrap()
+                .route_grant
+                .as_deref(),
+            Some("grant-1")
+        );
+        wait_for_calls(&state, 2).await;
+        wait_for_idle(&gateway_b, "dev.cats.run").await;
+        assert_eq!(
+            gateway_b
+                .resolve("dev.cats.run", true)
+                .await
+                .unwrap()
+                .route_grant
+                .as_deref(),
+            Some("grant-2")
+        );
+
+        control_task_a.abort();
+        control_task_b.abort();
     }
 
     #[tokio::test]
@@ -1652,6 +2476,7 @@ mod tests {
                         refresh: None,
                         retry_after: Instant::now(),
                         last_failure: None,
+                        shared_lookup_allowed: true,
                         generation: 0,
                     },
                 );

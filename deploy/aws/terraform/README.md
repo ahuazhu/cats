@@ -12,7 +12,7 @@ No cloud resource is created merely by checking in this directory.
 |---|---|---|
 | `bootstrap/` | bootstrap state | Versioned, encrypted, private S3 state bucket |
 | `stacks/platform/` | platform state | VPC, EKS cluster, RDS PostgreSQL, Route 53 zone, ACM certificate, ECR repository, bare-metal worker capacity and security group, GitHub Actions release role |
-| `stacks/production-infrastructure/` | infrastructure state | Usage stream/archive/checkpoints, Pod Identity, alarms, worker artifacts/secrets/SSM deployment |
+| `stacks/production-infrastructure/` | infrastructure state | Usage stream/archive/checkpoints, shared signed-Route cache, Pod Identity, alarms, worker artifacts/secrets/SSM deployment |
 | `stacks/production-payments/` | payments state | Stripe prepaid-credit Product, fixed one-time Prices and signed webhook endpoint |
 | `stacks/production-application/` | application state | Cats Namespace/ServiceAccount, Secret/ConfigMap, EBS PVC, Deployments, Services and public ingress |
 | `modules/` | none | Reusable implementation called by stacks |
@@ -140,6 +140,7 @@ Defaults are deliberately cost-conscious:
 - one dedicated S3 bucket, batched-object lifecycle to Standard-IA after
   30 days and Deep Archive after 365 days;
 - one on-demand DynamoDB projector checkpoint table;
+- one on-demand DynamoDB table for short-lived, already-signed Route Grants;
 - AWS-managed Kinesis encryption and SSE-S3 for the archive;
 - seven-year S3 Object Lock in GOVERNANCE mode.
 
@@ -150,7 +151,8 @@ replacement. The archive must never be reused for ChunkStore blocks.
 
 The usage module attaches the producer and consumer policies to one EKS Pod
 Identity role, associated only with the `cats-controld` ServiceAccount. The
-gateway uses the namespace default ServiceAccount and receives no usage AWS
+gateway uses its own `cats-gatewayd` ServiceAccount and receives only
+`GetItem`/`PutItem` on the Route Grant table; it receives no usage AWS
 permissions. The replay policy remains unattached and is reserved for
 controlled reconciliation jobs:
 
@@ -229,6 +231,17 @@ Never add the private key to
 Guest image. Generate the pair with `openssl genpkey -algorithm ED25519` and
 `openssl pkey -pubout`, then rotate it only through a coordinated drained
 rollout until multi-key verification exists.
+
+The infrastructure state also creates `route_cache_table_name` and the
+Gateway-only Pod Identity before the application rollout. Set the GitHub
+repository variable `ROUTE_CACHE_TABLE_NAME` to that output. Each successful
+active + Running resolve attempts to copy its signed response into this regional
+table under a 100-ms runtime I/O deadline; another Gateway Pod can then serve the
+signed grant if PostgreSQL or the control plane is unavailable. The table cannot
+mint authority, entries are bounded by the signed expiry, and conditional writes
+order them by PostgreSQL route epoch and then signed issue time. It is deliberately
+not a Gateway startup or readiness dependency; bounded runtime failures fall
+through to the healthy control plane.
 
 The first Route Grant release has a strict compatibility order:
 
@@ -357,8 +370,8 @@ The former `cats-auto-ebs` StorageClass and `cats-control-data` PVC are not
 part of the PostgreSQL-era application state and must not be imported.
 
 Terraform will additionally create `cats-gateway-runtime`, which exposes only
-`CATS_AUTH_TOKEN` to the gateway. The gateway must not receive PostgreSQL or
-WorkOS credentials.
+`CATS_AUTH_TOKEN` to the gateway, plus the non-secret Route cache table name and
+AWS region. The gateway must not receive PostgreSQL or WorkOS credentials.
 
 ## Metal worker deployment
 

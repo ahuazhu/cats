@@ -667,6 +667,11 @@ Edge 选择证书、校验 Host/SNI、执行限流和最大请求策略。
 签名 Route Grant。Gateway 只规范化一次公网 Host，并在写缓存前要求返回 binding 的规范化
 hostname 完全相同；HTTP 与 WebSocket 都把这个原始授权 Host 发送给 Node。控制面只对
 active + Running 路由签发；Gateway 没有签名私钥。
+每个生产 Gateway 在返回新授权前还会尝试把完整签名响应写入独立于 PostgreSQL 的区域
+DynamoDB 短寿命缓存；任一冷 Gateway 副本先强一致读取它，因此授权不再绑定于最初命中的
+Pod。共享层只复制控制面签发的正授权，并按 PostgreSQL `routes.epoch`（同 epoch 内再按签名
+签发时间）条件更新；Gateway 不用本地墙钟制造共享撤销。表内值仍不是权限源，签名过期不
+延长，最终必须通过 Node 验签。
 
 **4. Activation**
 
@@ -689,8 +694,13 @@ Node 验证 Route Grant 的签名、时效、hostname、Cat generation、Node、
 Gateway 的普通缓存过期后，只要 active + Running Route Grant 的签名时效仍有效，就立即
 准入并按 hostname 合并为一个后台 refresh；transport/5xx 失败保留该授权并进入有界退避，
 不会让每个请求等待两秒或放大控制面流量。观察到明确 not-found、其他非成功响应、畸形响应
-后立即失效缓存；签名到期也始终 fail closed。HTTP/WS 的生命周期并发由 Node 持有的本地
+或 Node 409 后，该 Gateway 立即失效本地缓存并绕过共享镜像，直到控制面直接返回新的
+active + Running；它不会重新导入自己刚拒绝的授权。已签发并复制的其他副本仍以签名到期
+为授权上界。签名到期始终 fail closed。HTTP/WS 的生命周期并发由 Node 持有的本地
 activity guard 仲裁，不再逐请求获取 PostgreSQL work lease；Wake 仍必须经过控制面。
+共享缓存故障时回退到健康控制面，控制面故障时回退到有效的共享/本地 Grant；Gateway
+启动和 Ready 不依赖 DynamoDB。运行时共享缓存 I/O 有 100 ms 硬截止时间；低 epoch 或同
+epoch 的较早签发写不能覆盖更新授权，因此缓存变慢或写响应乱序不会劫持健康控制面路径。
 
 **密钥一致性门禁：** 每个控制面副本启动前用私钥签名、用同次部署从该私钥派生的公钥
 验证固定 proof；Grant 的 `kid` 和 Node 注册均携带公钥 SPKI DER 的 SHA-256。Node 报告的
