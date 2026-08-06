@@ -1,11 +1,10 @@
 # AWS deployment
 
 Terraform under [`terraform/`](terraform/) is now the authoritative source for
-new AWS usage resources and the Kubernetes production deployment. The YAML
-files under `k8s/` are retained only as import/migration references; do not
-apply them after Terraform takeover. Existing EKS, RDS, VPC, ACM, ECR,
-ChunkStore and bare-metal resources must be represented from their exact live
-configuration and imported before Terraform changes them. See
+new AWS usage resources and the Kubernetes production deployment. Existing
+EKS, RDS, VPC, ACM, ECR, ChunkStore and bare-metal resources must be represented
+from their exact live configuration and imported before Terraform changes
+them. See
 [`terraform/README.md`](terraform/README.md) and ADR-0012.
 
 Production-shaped split:
