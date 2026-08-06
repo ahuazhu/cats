@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "mode": "bootstrap-create",
+  "expected_region": "us-east-1",
+  "expected_namespace": "cats-qualification-v2",
+  "expected_cell_id": "qcell-use1-v1",
+  "required_tags": {
+    "Project": "Cats",
+    "Environment": "qualification",
+    "QualificationNamespace": "cats-qualification-v2",
+    "QualificationCell": "qcell-use1-v1",
+    "ManagedBy": "terraform"
+  },
+  "required_check_addresses": [
+    "check.qualification_identity",
+    "var.aws_region",
+    "var.bootstrap_principal_arn",
+    "var.expected_account_id",
+    "var.qualification_cell_id",
+    "var.qualification_namespace"
+  ],
+  "allowed_data_addresses": [
+    "data.aws_caller_identity.current",
+    "data.aws_partition.current",
+    "data.aws_region.current",
+    "data.aws_iam_policy_document.state_access",
+    "data.aws_iam_policy_document.state_bucket",
+    "data.aws_iam_policy_document.state_key",
+    "data.aws_iam_policy_document.state_role_trust"
+  ],
+  "required_create_addresses": [
+    "aws_iam_role.state",
+    "aws_iam_role_policy.state",
+    "aws_kms_alias.state",
+    "aws_kms_key.state",
+    "aws_s3_bucket.state",
+    "aws_s3_bucket_ownership_controls.state",
+    "aws_s3_bucket_policy.state",
+    "aws_s3_bucket_public_access_block.state",
+    "aws_s3_bucket_server_side_encryption_configuration.state",
+    "aws_s3_bucket_versioning.state"
+  ],
+  "tagged_resource_addresses": [
+    "aws_iam_role.state",
+    "aws_kms_key.state",
+    "aws_s3_bucket.state"
+  ],
+  "required_identity_templates": {
+    "aws_iam_role.state": {
+      "name": "{namespace}-terraform-state"
+    },
+    "aws_iam_role_policy.state": {
+      "name": "{namespace}-terraform-state-access"
+    },
+    "aws_kms_alias.state": {
+      "name": "alias/{namespace}-terraform-state"
+    },
+    "aws_s3_bucket.state": {
+      "bucket": "{namespace}-tfstate-{account_id}-{region}"
+    }
+  }
+}
