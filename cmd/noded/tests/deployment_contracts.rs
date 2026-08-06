@@ -122,8 +122,8 @@ fn production_platform_example_keeps_two_workers_in_distinct_subnets() {
         "the production example must retain worker capacity after one bare-metal host is lost"
     );
     assert!(
-        variables.contains("metal_worker_names = [\"cats-metal-1\", \"cats-metal-2\"]"),
-        "the worker fleet needs stable, distinct node identities"
+        variables.contains("metal_worker_names = [\"cats-metal-2\", \"cats-metal-1\"]"),
+        "the imported cats-metal-2 must stay at index 0 while the second stable identity is appended"
     );
 
     let platform = read_workspace_file("deploy/aws/terraform/stacks/platform/main.tf")
@@ -135,6 +135,46 @@ fn production_platform_example_keeps_two_workers_in_distinct_subnets() {
             "subnet_id = module.network.private_subnet_ids[count.index % length(module.network.private_subnet_ids)]"
         ),
         "bare-metal workers must be distributed across the configured private subnets"
+    );
+
+    let deployment = read_workspace_file(
+        "deploy/aws/terraform/stacks/production-infrastructure/production.tfvars.example",
+    );
+    for node_id in ["\"metal-2\" =", "\"metal-1\" ="] {
+        assert!(
+            deployment.contains(node_id),
+            "the worker deployment example must manage both stable node identities: {node_id}"
+        );
+    }
+}
+
+#[test]
+fn manual_worker_bootstrap_refuses_the_example_identity() {
+    let example = read_workspace_file("deploy/aws/metal/worker.env.example");
+    assert!(
+        example.contains("CATS_NODE_ID=REPLACE_WITH_UNIQUE_NODE_ID"),
+        "the manual bootstrap example must never claim a real fleet identity"
+    );
+    assert!(
+        !example.lines().any(|line| line == "CATS_NODE_ID=metal-1"),
+        "a second manual worker must not register as metal-1 by default"
+    );
+
+    let installer = read_workspace_file("deploy/aws/metal/install-worker.sh");
+    for expected in [
+        "worker_node_id=$(awk",
+        "$worker_node_id == REPLACE_WITH_UNIQUE_NODE_ID",
+        "$worker_advertise_url == *PRIVATE_IPV4*",
+    ] {
+        assert!(
+            installer.contains(expected),
+            "the installer must reject an unresolved identity before starting systemd: {expected:?}"
+        );
+    }
+    assert!(
+        installer.find("$worker_node_id == REPLACE_WITH_UNIQUE_NODE_ID")
+            < installer.find("apt-get update -q"),
+        "identity validation must happen before the expensive bootstrap starts"
     );
 }
 
