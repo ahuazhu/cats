@@ -9,6 +9,30 @@ use cats_api::route_grant::{
 };
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 
+#[derive(Debug, thiserror::Error)]
+pub enum RouteGrantVerificationError {
+    #[error("Endpoint Route Grant has expired")]
+    Expired,
+    #[error(transparent)]
+    Invalid(#[from] anyhow::Error),
+}
+
+impl RouteGrantVerificationError {
+    pub fn is_expired(&self) -> bool {
+        matches!(self, Self::Expired)
+    }
+}
+
+macro_rules! ensure_valid_grant {
+    ($condition:expr, $message:literal) => {
+        if !$condition {
+            return Err(RouteGrantVerificationError::Invalid(anyhow::anyhow!(
+                $message
+            )));
+        }
+    };
+}
+
 #[derive(Clone)]
 pub struct RouteGrantVerifier {
     key: DecodingKey,
@@ -43,24 +67,28 @@ impl RouteGrantVerifier {
         &self,
         token: &str,
         expected: ExpectedRouteGrant<'_>,
-    ) -> anyhow::Result<RouteGrantClaims> {
-        anyhow::ensure!(!token.is_empty(), "missing Endpoint Route Grant");
+    ) -> Result<RouteGrantClaims, RouteGrantVerificationError> {
+        ensure_valid_grant!(!token.is_empty(), "missing Endpoint Route Grant");
         let header = jsonwebtoken::decode_header(token).context("decode Route Grant header")?;
-        anyhow::ensure!(
+        ensure_valid_grant!(
             header.alg == Algorithm::EdDSA,
             "Route Grant algorithm is not EdDSA"
         );
-        anyhow::ensure!(
+        ensure_valid_grant!(
             header.typ.as_deref() == Some("JWT"),
             "Route Grant type is not JWT"
         );
-        anyhow::ensure!(
+        ensure_valid_grant!(
             header.kid.as_deref() == Some(self.public_key_sha256.as_str()),
             "Route Grant key fingerprint mismatch"
         );
 
         let mut validation = Validation::new(Algorithm::EdDSA);
         validation.leeway = 0;
+        // Classify expiry only after every signature, issuer, audience and
+        // binding check below succeeds. An otherwise-invalid token must not
+        // receive the narrower natural-expiry rejection classification.
+        validation.validate_exp = false;
         validation.set_required_spec_claims(&["exp", "iss", "aud"]);
         validation.set_issuer(&[ROUTE_GRANT_ISSUER]);
         validation.set_audience(&[ROUTE_GRANT_AUDIENCE]);
@@ -72,48 +100,50 @@ impl RouteGrantVerifier {
             .duration_since(UNIX_EPOCH)
             .context("system clock is before the Unix epoch")?
             .as_secs();
-        anyhow::ensure!(
+        ensure_valid_grant!(
             claims.version == ROUTE_GRANT_VERSION,
             "unsupported Route Grant version"
         );
-        anyhow::ensure!(
+        ensure_valid_grant!(
             claims.iat <= now.saturating_add(MAX_ROUTE_GRANT_CLOCK_SKEW_SECONDS),
             "Route Grant was issued in the future"
         );
-        anyhow::ensure!(claims.exp > now, "Endpoint Route Grant has expired");
-        anyhow::ensure!(
+        ensure_valid_grant!(
             claims.exp > claims.iat,
             "Route Grant expiry precedes issue time"
         );
-        anyhow::ensure!(
+        ensure_valid_grant!(
             claims.exp - claims.iat <= MAX_ROUTE_GRANT_TTL_SECONDS,
             "Route Grant lifetime exceeds the authorization bound"
         );
-        anyhow::ensure!(
+        ensure_valid_grant!(
             !claims.workspace_id.is_empty(),
             "Route Grant workspace is empty"
         );
-        anyhow::ensure!(
+        ensure_valid_grant!(
             claims.hostname == expected.hostname,
             "Route Grant hostname mismatch"
         );
-        anyhow::ensure!(claims.cat_id == expected.cat_id, "Route Grant Cat mismatch");
-        anyhow::ensure!(
+        ensure_valid_grant!(claims.cat_id == expected.cat_id, "Route Grant Cat mismatch");
+        ensure_valid_grant!(
             claims.cat_generation > 0,
             "Route Grant Cat generation is invalid"
         );
-        anyhow::ensure!(
+        ensure_valid_grant!(
             claims.node_id == expected.node_id,
             "Route Grant Node mismatch"
         );
-        anyhow::ensure!(
+        ensure_valid_grant!(
             claims.route_epoch == expected.route_epoch && claims.route_epoch > 0,
             "Route Grant epoch mismatch"
         );
-        anyhow::ensure!(
+        ensure_valid_grant!(
             claims.target_port == expected.target_port && claims.target_port > 0,
             "Route Grant target port mismatch"
         );
+        if claims.exp <= now {
+            return Err(RouteGrantVerificationError::Expired);
+        }
         Ok(claims)
     }
 }
@@ -239,6 +269,23 @@ mod tests {
             ..claims()
         };
         assert!(verifier.verify(&sign(&expired), expected()).is_err());
+        assert!(verifier
+            .verify(&sign(&expired), expected())
+            .unwrap_err()
+            .is_expired());
+        let expired_binding_mismatch = verifier
+            .verify(
+                &sign(&expired),
+                ExpectedRouteGrant {
+                    hostname: "other.cats.run",
+                    ..expected()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            !expired_binding_mismatch.is_expired(),
+            "an otherwise-invalid token must not be classified as natural expiry"
+        );
 
         let mut token = sign(&claims()).into_bytes();
         let last = token.last_mut().unwrap();
