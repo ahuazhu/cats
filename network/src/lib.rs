@@ -429,6 +429,10 @@ struct RouteCacheEntry {
     /// Natural expiry is not a revocation, but the rejected capability must
     /// not be imported again. Only a strictly newer epoch/issue time may pass.
     shared_lookup_floor: Option<RouteGrantOrder>,
+    /// Coalesce concurrent Node rejections for the same signed authority. A
+    /// late rejection must neither cancel its refresh nor roll back a newer
+    /// Route Grant that another request has already installed.
+    latest_node_rejection: Option<HandledNodeRejection>,
     generation: u64,
 }
 
@@ -436,6 +440,34 @@ struct RouteCacheEntry {
 enum NodeRouteRejection {
     StaleRoute,
     ExpiredGrant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HandledNodeRejection {
+    order: RouteGrantOrder,
+    rejection: NodeRouteRejection,
+}
+
+impl HandledNodeRejection {
+    fn covers(self, order: RouteGrantOrder, rejection: NodeRouteRejection) -> bool {
+        self.order > order
+            || (self.order == order
+                && (self.rejection == NodeRouteRejection::StaleRoute
+                    || rejection == NodeRouteRejection::ExpiredGrant))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NodeRejectionDisposition {
+    Applied,
+    AlreadyHandled,
+    SupersededByNewerGrant,
+}
+
+impl NodeRejectionDisposition {
+    fn may_use_cache(self, rejection: NodeRouteRejection) -> bool {
+        self == Self::SupersededByNewerGrant || rejection.may_use_newer_shared_grant()
+    }
 }
 
 impl NodeRouteRejection {
@@ -470,6 +502,7 @@ impl RouteCacheEntry {
             last_failure: None,
             shared_lookup_barrier: None,
             shared_lookup_floor: None,
+            latest_node_rejection: None,
             generation: 0,
         }
     }
@@ -811,6 +844,7 @@ impl Gateway {
                 });
                 entry.last_failure = None;
                 entry.retry_after = now;
+                entry.latest_node_rejection = None;
                 if resolved.state == "active" && resolved.observed_state == ObservedState::Running {
                     entry.allow_shared_lookup();
                 } else {
@@ -1002,6 +1036,7 @@ impl Gateway {
             entry.retry_after = now;
             entry.last_failure = None;
             entry.block_shared_lookup(now);
+            entry.latest_node_rejection = None;
             entry.refresh.take()
         };
         if let Some(refresh) = refresh {
@@ -1014,12 +1049,31 @@ impl Gateway {
         hostname: &str,
         rejected: &ResolveResponse,
         rejection: NodeRouteRejection,
-    ) {
-        let refresh = {
+    ) -> NodeRejectionDisposition {
+        let (disposition, refresh) = {
             let mut cache = self.cache.lock().unwrap();
             let entry = cache
                 .entry(hostname.to_string())
                 .or_insert_with(|| RouteCacheEntry::new(Instant::now()));
+            let rejected_order = RouteGrantOrder::from_resolved(rejected);
+            let cached_is_newer = rejected_order.is_some_and(|rejected_order| {
+                entry
+                    .cached
+                    .as_ref()
+                    .and_then(|cached| RouteGrantOrder::from_resolved(&cached.resolved))
+                    .is_some_and(|cached_order| cached_order > rejected_order)
+            });
+            if cached_is_newer {
+                return NodeRejectionDisposition::SupersededByNewerGrant;
+            }
+            if rejected_order.is_some_and(|rejected_order| {
+                entry
+                    .latest_node_rejection
+                    .is_some_and(|handled| handled.covers(rejected_order, rejection))
+            }) {
+                return NodeRejectionDisposition::AlreadyHandled;
+            }
+
             entry.generation = entry.generation.saturating_add(1);
             entry.cached = None;
             let now = Instant::now();
@@ -1030,11 +1084,14 @@ impl Gateway {
             } else {
                 entry.block_shared_lookup(now);
             }
-            entry.refresh.take()
+            entry.latest_node_rejection =
+                rejected_order.map(|order| HandledNodeRejection { order, rejection });
+            (NodeRejectionDisposition::Applied, entry.refresh.take())
         };
         if let Some(refresh) = refresh {
             refresh.complete(Err(ResolveFailure::Superseded));
         }
+        disposition
     }
 
     async fn wake(&self, hostname: &str) -> Result<(), Response> {
@@ -1189,9 +1246,9 @@ impl Gateway {
                 .then(|| NodeRouteRejection::from_headers(response.headers()))
         });
         if let Some(rejection) = rejection {
-            self.invalidate_after_node_rejection(&hostname, &resolved, rejection);
+            let disposition = self.invalidate_after_node_rejection(&hostname, &resolved, rejection);
             match self
-                .resolve(&hostname, rejection.may_use_newer_shared_grant())
+                .resolve(&hostname, disposition.may_use_cache(rejection))
                 .await
             {
                 Ok(fresh) => {
@@ -1404,9 +1461,10 @@ impl Gateway {
             Ok(ProxyAttempt::Response(resp)) => resp,
             Err(resp) => resp,
             Ok(ProxyAttempt::Rejected(rejection)) => {
-                self.invalidate_after_node_rejection(hostname, resolved, rejection);
+                let disposition =
+                    self.invalidate_after_node_rejection(hostname, resolved, rejection);
                 let mut retry = match self
-                    .resolve(hostname, rejection.may_use_newer_shared_grant())
+                    .resolve(hostname, disposition.may_use_cache(rejection))
                     .await
                 {
                     Ok(r) => r,
@@ -1896,6 +1954,147 @@ mod tests {
     }
 
     #[test]
+    fn stale_rejection_dominates_expiry_for_the_same_grant() {
+        let order = RouteGrantOrder {
+            route_epoch: 7,
+            issued_at_unix: 100,
+        };
+        let expired = HandledNodeRejection {
+            order,
+            rejection: NodeRouteRejection::ExpiredGrant,
+        };
+        let stale = HandledNodeRejection {
+            order,
+            rejection: NodeRouteRejection::StaleRoute,
+        };
+
+        assert!(!expired.covers(order, NodeRouteRejection::StaleRoute));
+        assert!(stale.covers(order, NodeRouteRejection::ExpiredGrant));
+    }
+
+    #[tokio::test]
+    async fn repeated_node_rejection_does_not_supersede_the_existing_refresh() {
+        let state = Arc::new(RouteServerState::new(RouteReply::Status(
+            StatusCode::SERVICE_UNAVAILABLE,
+        )));
+        let (gateway, control_task) = route_test_gateway(state, 10).await;
+        let rejected = active_resolved_route(
+            "dev.cats.run".to_string(),
+            "http://node-a".to_string(),
+            "grant-1",
+            100,
+            160,
+        );
+        gateway.cache.lock().unwrap().insert(
+            "dev.cats.run".to_string(),
+            RouteCacheEntry {
+                cached: Some(CachedRoute {
+                    resolved: rejected.clone(),
+                    fetched: Instant::now(),
+                }),
+                refresh: None,
+                retry_after: Instant::now(),
+                last_failure: None,
+                shared_lookup_barrier: None,
+                shared_lookup_floor: None,
+                latest_node_rejection: None,
+                generation: 0,
+            },
+        );
+
+        gateway.invalidate_after_node_rejection(
+            "dev.cats.run",
+            &rejected,
+            NodeRouteRejection::ExpiredGrant,
+        );
+        let refresh = Arc::new(RouteRefresh::new());
+        let generation = {
+            let mut cache = gateway.cache.lock().unwrap();
+            let entry = cache.get_mut("dev.cats.run").unwrap();
+            entry.refresh = Some(refresh.clone());
+            entry.generation
+        };
+
+        let disposition = gateway.invalidate_after_node_rejection(
+            "dev.cats.run",
+            &rejected,
+            NodeRouteRejection::ExpiredGrant,
+        );
+
+        let cache = gateway.cache.lock().unwrap();
+        assert_eq!(disposition, NodeRejectionDisposition::AlreadyHandled);
+        let entry = cache.get("dev.cats.run").unwrap();
+        assert_eq!(entry.generation, generation);
+        assert!(entry
+            .refresh
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &refresh)));
+        assert!(refresh.result.get().is_none());
+        control_task.abort();
+    }
+
+    #[tokio::test]
+    async fn delayed_old_rejection_does_not_invalidate_a_newer_cached_grant() {
+        let state = Arc::new(RouteServerState::new(RouteReply::Status(
+            StatusCode::SERVICE_UNAVAILABLE,
+        )));
+        let (gateway, control_task) = route_test_gateway(state, 10).await;
+        let rejected = active_resolved_route(
+            "dev.cats.run".to_string(),
+            "http://node-a".to_string(),
+            "grant-1",
+            100,
+            160,
+        );
+        let newer = active_resolved_route(
+            "dev.cats.run".to_string(),
+            "http://node-a".to_string(),
+            "grant-2",
+            101,
+            161,
+        );
+        gateway.cache.lock().unwrap().insert(
+            "dev.cats.run".to_string(),
+            RouteCacheEntry {
+                cached: Some(CachedRoute {
+                    resolved: newer,
+                    fetched: Instant::now(),
+                }),
+                refresh: None,
+                retry_after: Instant::now(),
+                last_failure: None,
+                shared_lookup_barrier: None,
+                shared_lookup_floor: None,
+                latest_node_rejection: None,
+                generation: 0,
+            },
+        );
+
+        let disposition = gateway.invalidate_after_node_rejection(
+            "dev.cats.run",
+            &rejected,
+            NodeRouteRejection::StaleRoute,
+        );
+
+        let cache = gateway.cache.lock().unwrap();
+        assert_eq!(
+            disposition,
+            NodeRejectionDisposition::SupersededByNewerGrant
+        );
+        assert!(disposition.may_use_cache(NodeRouteRejection::StaleRoute));
+        let entry = cache.get("dev.cats.run").unwrap();
+        assert_eq!(entry.generation, 0);
+        assert_eq!(
+            entry
+                .cached
+                .as_ref()
+                .and_then(|cached| cached.resolved.route_grant.as_deref()),
+            Some("grant-2")
+        );
+        control_task.abort();
+    }
+
+    #[test]
     fn shared_route_record_rejects_malformed_or_inconsistent_metadata() {
         let resolved = active_resolved_route(
             "dev.cats.run".to_string(),
@@ -2168,8 +2367,15 @@ mod tests {
 
     #[tokio::test]
     async fn expired_node_rejection_uses_strictly_newer_shared_grant_during_control_outage() {
+        const CONCURRENT_REQUESTS: usize = 32;
+
+        struct ExpiringNodeState {
+            grants: Mutex<Vec<String>>,
+            old_grant_barrier: tokio::sync::Barrier,
+        }
+
         async fn proxy(
-            State(state): State<Arc<MockNodeState>>,
+            State(state): State<Arc<ExpiringNodeState>>,
             Json(request): Json<ProxyHttpRequest>,
         ) -> Response {
             state
@@ -2178,6 +2384,7 @@ mod tests {
                 .unwrap()
                 .push(request.route_grant.clone());
             if request.route_grant == "grant-1" {
+                state.old_grant_barrier.wait().await;
                 return (
                     StatusCode::CONFLICT,
                     [(ROUTE_GRANT_REJECTION_HEADER, ROUTE_GRANT_REJECTION_EXPIRED)],
@@ -2195,8 +2402,9 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let node_addr = listener.local_addr().unwrap();
-        let node_state = Arc::new(MockNodeState {
+        let node_state = Arc::new(ExpiringNodeState {
             grants: Mutex::new(Vec::new()),
+            old_grant_barrier: tokio::sync::Barrier::new(CONCURRENT_REQUESTS),
         });
         let node_app = Router::new()
             .route("/v1/cats/{id}/proxy", axum::routing::post(proxy))
@@ -2244,30 +2452,52 @@ mod tests {
                 last_failure: None,
                 shared_lookup_barrier: None,
                 shared_lookup_floor: None,
+                latest_node_rejection: None,
                 generation: 0,
             },
         );
 
-        let response = gateway
-            .handle(
-                "dev.cats.run".to_string(),
-                ProxyHttpRequest {
-                    method: "GET".to_string(),
-                    path: "/".to_string(),
-                    headers: Vec::new(),
-                    body: Vec::new(),
-                    target_port: 0,
-                    route_epoch: 0,
-                    hostname: String::new(),
-                    route_grant: String::new(),
-                },
-            )
-            .await;
+        let mut requests = tokio::task::JoinSet::new();
+        for _ in 0..CONCURRENT_REQUESTS {
+            let gateway = gateway.clone();
+            requests.spawn(async move {
+                gateway
+                    .handle(
+                        "dev.cats.run".to_string(),
+                        ProxyHttpRequest {
+                            method: "GET".to_string(),
+                            path: "/".to_string(),
+                            headers: Vec::new(),
+                            body: Vec::new(),
+                            target_port: 0,
+                            route_epoch: 0,
+                            hostname: String::new(),
+                            route_grant: String::new(),
+                        },
+                    )
+                    .await
+                    .status()
+            });
+        }
+        while let Some(result) = requests.join_next().await {
+            assert_eq!(result.unwrap(), StatusCode::OK);
+        }
 
-        assert_eq!(response.status(), StatusCode::OK);
+        let grants = node_state.grants.lock().unwrap();
+        assert_eq!(grants.len(), CONCURRENT_REQUESTS * 2);
         assert_eq!(
-            node_state.grants.lock().unwrap().as_slice(),
-            ["grant-1", "grant-2"]
+            grants
+                .iter()
+                .filter(|grant| grant.as_str() == "grant-1")
+                .count(),
+            CONCURRENT_REQUESTS
+        );
+        assert_eq!(
+            grants
+                .iter()
+                .filter(|grant| grant.as_str() == "grant-2")
+                .count(),
+            CONCURRENT_REQUESTS
         );
         assert_eq!(
             state.calls(),
@@ -2474,6 +2704,7 @@ mod tests {
                         last_failure: None,
                         shared_lookup_barrier: None,
                         shared_lookup_floor: None,
+                        latest_node_rejection: None,
                         generation: 0,
                     },
                 );
@@ -2923,6 +3154,7 @@ mod tests {
                         last_failure: None,
                         shared_lookup_barrier: None,
                         shared_lookup_floor: None,
+                        latest_node_rejection: None,
                         generation: 0,
                     },
                 );
@@ -2978,6 +3210,7 @@ mod tests {
                         last_failure: None,
                         shared_lookup_barrier: None,
                         shared_lookup_floor: None,
+                        latest_node_rejection: None,
                         generation: 0,
                     },
                 );
