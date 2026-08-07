@@ -72,7 +72,7 @@ CATS_AUTO_COLD_AFTER_SECONDS=86400   # Warm 稳定 24 小时后转 Cold
 | 将来的临时 pin | `pin` | TTL 到期或用户显式释放 |
 | 运行时控制变更 | `control` | V1 的热挂载/卸载；后续覆盖更多运行时 operation |
 
-V1 已接通 Endpoint activation、exec、Guest 用户程序以及磁盘热挂载/卸载。工作租约有 TTL，调用方异常退出或 release 丢失时会自动恢复，不会永久压住 Cat。Running HTTP/WS 不为每个请求访问控制面：Gateway 携带短期签名 Route Grant，Node 验证后在整个请求或连接期间持有本地 guard；签发、缓存、过期和 fail-closed 语义见 [ADR-0033](decisions/0033-short-lived-signed-route-grants.md)。
+V1 已接通 Endpoint activation、exec、Guest 用户程序以及磁盘热挂载/卸载。工作租约有 TTL，调用方异常退出或 release 丢失时会自动恢复，不会永久压住 Cat。Running HTTP/WS 不为每个请求访问控制面：Gateway 携带短期签名 Route Grant，Node 验证后在整个请求或连接期间持有本地 guard；Architecture V2 的终态签发、缓存、过期和 fail-closed 语义见 [ADR-0039](decisions/0039-architecture-v2-route-grant-contract.md)。ADR-0033 的早期 wire 会在一次破坏式切换中整体删除，不保留兼容 cohort。
 
 不算工作的项目包括：读取 Cat 元数据、健康探针、CPU 利用率、Guest load、没有连接的监听 socket、普通后台进程的存在。这些信号要么与业务完成无关，要么无法安全地区分“等待中”和“已经完成”。
 

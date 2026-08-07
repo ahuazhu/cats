@@ -1,9 +1,15 @@
 # ADR-0033: Short-lived signed grants keep Running Endpoint traffic off the control-plane hot path
 
-- Status: Accepted
+- Status: Superseded by ADR-0039
 - Date: 2026-08-06
 - Relates to: ADR-0002 (lifecycle states), ADR-0018 (Workspace ownership),
   ADR-0031 (PostgreSQL control store), ADR-0032 (control-plane replicas); issue #187
+
+ADR-0033 records the first pre-release implementation. Architecture V2 replaces
+its wire, issuer authority, Node truth and rollout model outright with
+[ADR-0039](0039-architecture-v2-route-grant-contract.md). No supported deployment
+may retain this protocol as a compatibility cohort or fallback after the
+ADR-0039 cutover.
 
 ## Context
 

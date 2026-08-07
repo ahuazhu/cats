@@ -1,0 +1,164 @@
+{
+  "vector_version": 2,
+  "name": "route-grant-v2-positive-rfc8032-key",
+  "test_key": {
+    "public_test_seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+    "raw_public_key_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+    "kid": "21fe31dfa154a261626bf854046fd2271b7bed4b6abe45aa58877ef47f9721b9"
+  },
+  "header_json": "{\"alg\":\"EdDSA\",\"kid\":\"21fe31dfa154a261626bf854046fd2271b7bed4b6abe45aa58877ef47f9721b9\",\"typ\":\"cats-route-grant+jwt\",\"v\":2}",
+  "claims_json": "{\"aud\":\"cats-node-agent\",\"cat_generation\":7,\"cat_id\":\"cat_0123456789abcdef0123456789abcdef\",\"endpoint_id\":\"ep_0123456789abcdef0123456789abcdef\",\"exp\":1800000060,\"grant_id\":\"rg_0123456789abcdef0123456789abcdef\",\"hostname\":\"preview-0123456789ab.cats.run\",\"iat\":1800000000,\"iss\":\"cats-control-plane\",\"nbf\":1800000000,\"node_id\":\"node_0123456789abcdef0123456789abcdef\",\"protocol\":\"http\",\"route_epoch\":42,\"target_port\":8080,\"workspace_id\":\"ws_0123456789abcdef0123456789abcdef\"}",
+  "header_base64url": "eyJhbGciOiJFZERTQSIsImtpZCI6IjIxZmUzMWRmYTE1NGEyNjE2MjZiZjg1NDA0NmZkMjI3MWI3YmVkNGI2YWJlNDVhYTU4ODc3ZWY0N2Y5NzIxYjkiLCJ0eXAiOiJjYXRzLXJvdXRlLWdyYW50K2p3dCIsInYiOjJ9",
+  "claims_base64url": "eyJhdWQiOiJjYXRzLW5vZGUtYWdlbnQiLCJjYXRfZ2VuZXJhdGlvbiI6NywiY2F0X2lkIjoiY2F0XzAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwiZW5kcG9pbnRfaWQiOiJlcF8wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImV4cCI6MTgwMDAwMDA2MCwiZ3JhbnRfaWQiOiJyZ18wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImhvc3RuYW1lIjoicHJldmlldy0wMTIzNDU2Nzg5YWIuY2F0cy5ydW4iLCJpYXQiOjE4MDAwMDAwMDAsImlzcyI6ImNhdHMtY29udHJvbC1wbGFuZSIsIm5iZiI6MTgwMDAwMDAwMCwibm9kZV9pZCI6Im5vZGVfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCJwcm90b2NvbCI6Imh0dHAiLCJyb3V0ZV9lcG9jaCI6NDIsInRhcmdldF9wb3J0Ijo4MDgwLCJ3b3Jrc3BhY2VfaWQiOiJ3c18wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiJ9",
+  "signature_base64url": "YkHRlSCNsLVocZT9I8hdzsJkCpEw4cbWn1YOa1gpTWWCVWIMVOnV08ccBb13Q1KpjNqNWPeuM4IU0XMfaMe4Cw",
+  "compact": "eyJhbGciOiJFZERTQSIsImtpZCI6IjIxZmUzMWRmYTE1NGEyNjE2MjZiZjg1NDA0NmZkMjI3MWI3YmVkNGI2YWJlNDVhYTU4ODc3ZWY0N2Y5NzIxYjkiLCJ0eXAiOiJjYXRzLXJvdXRlLWdyYW50K2p3dCIsInYiOjJ9.eyJhdWQiOiJjYXRzLW5vZGUtYWdlbnQiLCJjYXRfZ2VuZXJhdGlvbiI6NywiY2F0X2lkIjoiY2F0XzAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwiZW5kcG9pbnRfaWQiOiJlcF8wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImV4cCI6MTgwMDAwMDA2MCwiZ3JhbnRfaWQiOiJyZ18wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImhvc3RuYW1lIjoicHJldmlldy0wMTIzNDU2Nzg5YWIuY2F0cy5ydW4iLCJpYXQiOjE4MDAwMDAwMDAsImlzcyI6ImNhdHMtY29udHJvbC1wbGFuZSIsIm5iZiI6MTgwMDAwMDAwMCwibm9kZV9pZCI6Im5vZGVfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCJwcm90b2NvbCI6Imh0dHAiLCJyb3V0ZV9lcG9jaCI6NDIsInRhcmdldF9wb3J0Ijo4MDgwLCJ3b3Jrc3BhY2VfaWQiOiJ3c18wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiJ9.YkHRlSCNsLVocZT9I8hdzsJkCpEw4cbWn1YOa1gpTWWCVWIMVOnV08ccBb13Q1KpjNqNWPeuM4IU0XMfaMe4Cw",
+  "issuer_snapshot": {
+    "cat": {
+      "intent_generation": 7,
+      "assignment_node_id": "node_0123456789abcdef0123456789abcdef"
+    },
+    "current_lifecycle_command": null,
+    "policy_transition_proposal": null,
+    "cat_runtime_state": {
+      "state": "running",
+      "intent_generation": 7,
+      "settled_lineage": {
+        "command_id": "lcmd_0123456789abcdef0123456789abcdef",
+        "command_seq": 1,
+        "dispatch_id": "dsp_0123456789abcdef0123456789abcdef",
+        "dispatch_seq": 1,
+        "request_body_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "target_node_id": "node_0123456789abcdef0123456789abcdef",
+        "node_claim_id": "nclaim_0123456789abcdef0123456789abcdef",
+        "result_id": "nres_0123456789abcdef0123456789abcdef",
+        "runtime_identity": {
+          "runtime_id": "rt_0123456789abcdef0123456789abcdef",
+          "runtime_generation": 9,
+          "host_boot_id": "hostboot_0123456789abcdef0123456789abcdef",
+          "guest_boot_id": "guestboot_0123456789abcdef0123456789abcdef"
+        }
+      }
+    },
+    "reducer_route_intent": {
+      "route_intent_id": "rti_0123456789abcdef0123456789abcdef",
+      "action": "publish",
+      "intent_generation": 7,
+      "settled_lineage": {
+        "command_id": "lcmd_0123456789abcdef0123456789abcdef",
+        "command_seq": 1,
+        "dispatch_id": "dsp_0123456789abcdef0123456789abcdef",
+        "dispatch_seq": 1,
+        "request_body_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "target_node_id": "node_0123456789abcdef0123456789abcdef",
+        "node_claim_id": "nclaim_0123456789abcdef0123456789abcdef",
+        "result_id": "nres_0123456789abcdef0123456789abcdef",
+        "runtime_identity": {
+          "runtime_id": "rt_0123456789abcdef0123456789abcdef",
+          "runtime_generation": 9,
+          "host_boot_id": "hostboot_0123456789abcdef0123456789abcdef",
+          "guest_boot_id": "guestboot_0123456789abcdef0123456789abcdef"
+        }
+      }
+    },
+    "materialized_route": {
+      "route_intent_id": "rti_0123456789abcdef0123456789abcdef",
+      "route_epoch": 42,
+      "workspace_id": "ws_0123456789abcdef0123456789abcdef",
+      "endpoint_id": "ep_0123456789abcdef0123456789abcdef",
+      "cat_id": "cat_0123456789abcdef0123456789abcdef",
+      "hostname": "preview-0123456789ab.cats.run",
+      "protocol": "http",
+      "target_port": 8080,
+      "target_node_id": "node_0123456789abcdef0123456789abcdef",
+      "admission_state": "active",
+      "retirement_receipt_id": null,
+      "intent_generation": 7,
+      "settled_lineage": {
+        "command_id": "lcmd_0123456789abcdef0123456789abcdef",
+        "command_seq": 1,
+        "dispatch_id": "dsp_0123456789abcdef0123456789abcdef",
+        "dispatch_seq": 1,
+        "request_body_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "target_node_id": "node_0123456789abcdef0123456789abcdef",
+        "node_claim_id": "nclaim_0123456789abcdef0123456789abcdef",
+        "result_id": "nres_0123456789abcdef0123456789abcdef",
+        "runtime_identity": {
+          "runtime_id": "rt_0123456789abcdef0123456789abcdef",
+          "runtime_generation": 9,
+          "host_boot_id": "hostboot_0123456789abcdef0123456789abcdef",
+          "guest_boot_id": "guestboot_0123456789abcdef0123456789abcdef"
+        }
+      }
+    },
+    "runtime_route_authority_ack": {
+      "install_id": "rinst_0123456789abcdef0123456789abcdef",
+      "route_intent_id": "rti_0123456789abcdef0123456789abcdef",
+      "route_epoch": 42,
+      "workspace_id": "ws_0123456789abcdef0123456789abcdef",
+      "endpoint_id": "ep_0123456789abcdef0123456789abcdef",
+      "cat_id": "cat_0123456789abcdef0123456789abcdef",
+      "hostname": "preview-0123456789ab.cats.run",
+      "protocol": "http",
+      "target_port": 8080,
+      "node_id": "node_0123456789abcdef0123456789abcdef",
+      "admission_state": "active",
+      "intent_generation": 7,
+      "settled_lineage": {
+        "command_id": "lcmd_0123456789abcdef0123456789abcdef",
+        "command_seq": 1,
+        "dispatch_id": "dsp_0123456789abcdef0123456789abcdef",
+        "dispatch_seq": 1,
+        "request_body_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "target_node_id": "node_0123456789abcdef0123456789abcdef",
+        "node_claim_id": "nclaim_0123456789abcdef0123456789abcdef",
+        "result_id": "nres_0123456789abcdef0123456789abcdef",
+        "runtime_identity": {
+          "runtime_id": "rt_0123456789abcdef0123456789abcdef",
+          "runtime_generation": 9,
+          "host_boot_id": "hostboot_0123456789abcdef0123456789abcdef",
+          "guest_boot_id": "guestboot_0123456789abcdef0123456789abcdef"
+        }
+      }
+    }
+  },
+  "verification_context": {
+    "now": 1800000000,
+    "clock_healthy": true,
+    "runtime_state": "Running",
+    "local_authority": {
+      "workspace_id": "ws_0123456789abcdef0123456789abcdef",
+      "endpoint_id": "ep_0123456789abcdef0123456789abcdef",
+      "cat_id": "cat_0123456789abcdef0123456789abcdef",
+      "intent_generation": 7,
+      "hostname": "preview-0123456789ab.cats.run",
+      "node_id": "node_0123456789abcdef0123456789abcdef",
+      "route_epoch": 42,
+      "protocol": "http",
+      "target_port": 8080,
+      "admission_state": "active",
+      "install_id": "rinst_0123456789abcdef0123456789abcdef",
+      "route_intent_id": "rti_0123456789abcdef0123456789abcdef",
+      "settled_lineage": {
+        "command_id": "lcmd_0123456789abcdef0123456789abcdef",
+        "command_seq": 1,
+        "dispatch_id": "dsp_0123456789abcdef0123456789abcdef",
+        "dispatch_seq": 1,
+        "request_body_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "target_node_id": "node_0123456789abcdef0123456789abcdef",
+        "node_claim_id": "nclaim_0123456789abcdef0123456789abcdef",
+        "result_id": "nres_0123456789abcdef0123456789abcdef",
+        "runtime_identity": {
+          "runtime_id": "rt_0123456789abcdef0123456789abcdef",
+          "runtime_generation": 9,
+          "host_boot_id": "hostboot_0123456789abcdef0123456789abcdef",
+          "guest_boot_id": "guestboot_0123456789abcdef0123456789abcdef"
+        }
+      }
+    }
+  },
+  "expected": {
+    "result": "accept",
+    "activity_guard": "acquired",
+    "target_source": "local_authority"
+  }
+}
