@@ -7,10 +7,12 @@
 //! This module persists those facts under `<state_dir>/runtime-ledger/`, one
 //! JSON record per Cat.
 //!
-//! The ledger is *local fact only* (ADR-0040 §1 local-authority boundary). It answers "what did this
-//! node last start"; it never grants, extends or revives a storage write right,
-//! and it carries no object-store or metadata-store credentials. Regaining
-//! write access still goes through the MetadataStore lease/epoch CAS.
+//! This V1 ledger is *local fact only*. It answers "what did this node last
+//! start"; it never grants, extends or revives a storage write right, and it
+//! carries no object-store or metadata-store credentials. Regaining write
+//! access still goes through the MetadataStore lease/epoch CAS. ADR-0040
+//! replaces this best-effort path with terminal fail-closed authority files;
+//! CH-01/CH-02 keep the old behavior explicit until C5 deletes it.
 //!
 //! Every record carries [`LEDGER_VERSION`]. A reader must accept only the
 //! version it understands: guessing the meaning of an unknown layout is exactly
@@ -303,11 +305,9 @@ impl NodeRuntime {
             self.ledger_record(cat_id, runtime)
         };
         if let Err(error) = self.ledger.put(&record) {
-            // A failed write must not fail the job. The ledger is a local
-            // recovery aid and explicitly not a source of authority
-            // (ADR-0040 §1 local-authority boundary), so tearing down a healthy running Cat because a
-            // JSON file could not be written would be strictly worse than
-            // losing the ability to re-adopt it later.
+            // V1 behavior only: a failed best-effort write does not fail the
+            // job. Characterization CH-02 freezes this unsafe gap until C1/C5
+            // replace it with ADR-0040's fail-closed authority commit.
             tracing::error!(cat = %cat_id, "writing the node runtime ledger record failed: {error:#}");
         }
     }

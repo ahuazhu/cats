@@ -213,9 +213,10 @@ fn only_the_settled_state_of_each_job_is_recorded() {
     env.run(stop_job(CAT, 4));
 }
 
-/// The legacy ledger is a local recovery aid, not authority (ADR-0040 §1). A
-/// node that cannot write it has lost the ability to re-adopt the Cat later; it has not
-/// lost the Cat, and must not fail the job that started it.
+/// Characterization CH-02: the legacy ledger is a best-effort recovery aid. A
+/// node that cannot write it currently loses the ability to re-adopt the Cat
+/// later without failing the job that started it. ADR-0040 intentionally
+/// replaces this assertion with fail-closed authority commits in C1/C5.
 #[test]
 fn an_unwritable_ledger_does_not_fail_the_job() {
     const CAT: &str = "cat_ledger_unwritable";
