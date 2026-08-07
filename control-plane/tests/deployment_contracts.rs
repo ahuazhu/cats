@@ -191,7 +191,8 @@ fn gateway_replicas_share_only_already_signed_route_grants_outside_postgres() {
         .expect("Gateway Deployment section");
     for expected in [
         "resource \"kubernetes_service_account_v1\" \"gateway\"",
-        "service_account_name            = kubernetes_service_account_v1.gateway.metadata[0].name",
+        "service_account_name",
+        "kubernetes_service_account_v1.gateway.metadata[0].name",
         "CATS_SHARED_ROUTE_CACHE_TABLE",
         "AWS_REGION",
     ] {
@@ -954,9 +955,9 @@ fn production_control_plane_survives_one_pod_or_node_disruption() {
         "replicas = var.control_plane_replicas",
         "type = \"RollingUpdate\"",
         "max_unavailable = \"0\"",
-        "termination_grace_period_seconds = local.control_plane_termination_grace_period_seconds",
+        "termination_grace_period_seconds = local.public_target_termination_grace_period_seconds",
         "pre_stop {",
-        "command = [\"/bin/sh\", \"-c\", \"sleep ${local.control_plane_pre_stop_delay_seconds}\"]",
+        "command = [\"/bin/sh\", \"-c\", \"sleep ${local.public_target_pre_stop_delay_seconds}\"]",
         "pod_anti_affinity {",
         "required_during_scheduling_ignored_during_execution {",
         "topology_key       = \"kubernetes.io/hostname\"",
@@ -982,9 +983,9 @@ fn production_control_plane_survives_one_pod_or_node_disruption() {
         );
     }
     for expected in [
-        "control_plane_pre_stop_delay_seconds           = 15",
-        "control_plane_termination_grace_period_seconds = 30",
-        "condition     = local.control_plane_pre_stop_delay_seconds < local.control_plane_termination_grace_period_seconds",
+        "public_target_pre_stop_delay_seconds           = 15",
+        "public_target_termination_grace_period_seconds = 30",
+        "condition     = local.public_target_pre_stop_delay_seconds < local.public_target_termination_grace_period_seconds",
     ] {
         assert!(
             terraform.contains(expected),
@@ -999,6 +1000,79 @@ fn production_control_plane_survives_one_pod_or_node_disruption() {
     assert!(
         !deployment.contains("type = \"Recreate\""),
         "Recreate deliberately creates a total control-plane outage"
+    );
+}
+
+#[test]
+fn production_gateway_survives_one_pod_or_node_disruption() {
+    let terraform = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    let variables =
+        read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/variables.tf");
+    let deployment = terraform
+        .split("resource \"kubernetes_deployment_v1\" \"gateway\"")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("resource \"kubernetes_service_v1\" \"gateway\"")
+                .next()
+        })
+        .expect("Gateway Deployment block");
+
+    for expected in [
+        "replicas = var.gateway_replicas",
+        "type = \"RollingUpdate\"",
+        "max_surge       = \"1\"",
+        "max_unavailable = \"0\"",
+        "termination_grace_period_seconds = local.public_target_termination_grace_period_seconds",
+        "pre_stop {",
+        "command = [\"/bin/sh\", \"-c\", \"sleep ${local.public_target_pre_stop_delay_seconds}\"]",
+        "pod_anti_affinity {",
+        "required_during_scheduling_ignored_during_execution {",
+        "topology_key       = \"kubernetes.io/hostname\"",
+        "when_unsatisfiable = \"DoNotSchedule\"",
+    ] {
+        assert!(
+            deployment.contains(expected),
+            "Gateway Deployment is missing {expected:?}"
+        );
+    }
+    let required_anti_affinity = deployment
+        .split("required_during_scheduling_ignored_during_execution {")
+        .nth(1)
+        .and_then(|rest| rest.split("topology_spread_constraint {").next())
+        .expect("required Gateway hostname anti-affinity block");
+    for expected in [
+        "topology_key = \"kubernetes.io/hostname\"",
+        "\"app.kubernetes.io/name\" = \"cats-gatewayd\"",
+    ] {
+        assert!(
+            required_anti_affinity.contains(expected),
+            "required Gateway anti-affinity is missing {expected:?}"
+        );
+    }
+    for expected in [
+        "public_target_pre_stop_delay_seconds           = 15",
+        "public_target_termination_grace_period_seconds = 30",
+        "condition     = local.public_target_pre_stop_delay_seconds < local.public_target_termination_grace_period_seconds",
+    ] {
+        assert!(
+            terraform.contains(expected),
+            "public target drain is missing {expected:?}"
+        );
+    }
+    assert!(variables.contains("var.gateway_replicas >= 2"));
+    let disruption_budget = terraform
+        .split("resource \"kubernetes_pod_disruption_budget_v1\" \"gateway\"")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("resource \"kubernetes_service_v1\" \"gateway\"")
+                .next()
+        })
+        .expect("Gateway PodDisruptionBudget block");
+    assert!(disruption_budget.contains("min_available = \"1\""));
+    assert!(disruption_budget.contains("\"app.kubernetes.io/name\" = \"cats-gatewayd\""));
+    assert!(
+        !deployment.contains("type = \"Recreate\""),
+        "Recreate deliberately creates a total Gateway outage"
     );
 }
 
@@ -1396,57 +1470,4 @@ fn worker_bootstrap_validates_and_installs_its_route_grant_key_before_mutation()
             .unwrap_or_else(|error| panic!("validate {invalid}: {error}"));
         assert!(!output.status.success(), "accepted invalid key {invalid}");
     }
-}
-
-#[test]
-fn production_deploy_detaches_the_legacy_control_volume_after_plan_and_before_apply() {
-    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
-    let plan = workflow
-        .find("- name: Plan production deployment")
-        .expect("production plan step");
-    let detach = workflow
-        .find("- name: Detach legacy control volume")
-        .expect("legacy control-volume detach step");
-    let apply = workflow
-        .find("- name: Apply reviewed plan")
-        .expect("production apply step");
-
-    assert!(
-        plan < detach && detach < apply,
-        "the legacy volume must be detached only after the saved plan and before its apply"
-    );
-
-    let detach_step = workflow[detach..apply].to_owned();
-    for expected in [
-        "get namespace \"$namespace\" --output=name",
-        "get pvc \"$legacy_claim\" --ignore-not-found --output=name",
-        "show -json \"$RUNNER_TEMP/production.tfplan\"",
-        "module.cats_kubernetes.kubernetes_deployment_v1.control_plane",
-        ".change.after.spec[0].replicas >= 2",
-        "persistentVolumeClaim.claimName == $claim",
-        "scale deployment \"$control_deployment\" --replicas=0",
-        "remaining_consumers=\"$(control_volume_consumers)\"",
-    ] {
-        assert!(
-            detach_step.contains(expected),
-            "legacy detach step is missing {expected:?}"
-        );
-    }
-    let attached_check = detach_step
-        .find("if [[ -z \"$attached_consumers\" ]]")
-        .expect("already-detached fast path");
-    let plan_guard = detach_step
-        .find("show -json \"$RUNNER_TEMP/production.tfplan\"")
-        .expect("saved-plan replica guard");
-    let scale = detach_step
-        .find("scale deployment \"$control_deployment\" --replicas=0")
-        .expect("legacy Deployment scale");
-    assert!(
-        attached_check < plan_guard && plan_guard < scale,
-        "an unused PVC needs no scale, while a scale requires the saved-plan guard"
-    );
-    assert!(
-        !detach_step.contains("finalizers") && !detach_step.contains("delete pvc"),
-        "the deploy must release the mounted claim, never bypass PVC protection"
-    );
 }

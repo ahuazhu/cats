@@ -108,9 +108,25 @@ would let a compromised Gateway mint arbitrary Cat, Node or port bindings.
   the same lease is shortened to a non-renewed five-second handoff window so
   the Cat cannot auto-suspend before the Node activity guard is acquired.
   Normal Running traffic never creates or releases that lease.
-- A Node stale-route conflict still invalidates the Gateway cache and forces
-  one fresh control-plane resolve and activates the same local shared-mirror
-  barrier. A rejected grant is never used as the fallback for that retry.
+- A Node conflict still invalidates the rejected local grant and forces one
+  fresh control-plane resolve. Every rejection other than natural signed expiry
+  activates the same local shared-mirror barrier, and a rejected grant is never
+  used as the fallback for that retry. The Node distinguishes natural expiry
+  from other verification and runtime conflicts with machine-readable response
+  metadata. Expiry is not a revocation signal: while the control plane is
+  unavailable, the Gateway may bypass the long barrier only to import a
+  currently valid shared grant that is strictly newer than the rejected grant,
+  ordered by route epoch and then signed issue time. The same or an older grant
+  remains blocked, and the Node still performs the final verification.
+  Concurrent or delayed rejections use that same ordering: a rejection already
+  being handled is coalesced with its in-flight refresh, and a rejection for an
+  older grant cannot cancel that refresh or remove a newer cached grant. For the
+  same grant, a non-expiry conflict is stronger than natural expiry and retains
+  the conservative barrier. When a locally cached grant reaches expiry, an
+  earlier control-plane-only background refresh or its retry backoff is upgraded
+  to the shared-capable singleflight if the rejection policy permits shared
+  lookup; expiry-boundary requests do not wait on a refresh that cannot use the
+  continuity path. HTTP and WebSocket retries use the same rule.
 
 The service bearer credential remains as defense in depth for the Gateway-to-
 Node hop. It authenticates the calling service but does not authorize a route.
@@ -154,5 +170,10 @@ Node hop. It authenticates the calling service but does not authorize a route.
   response without a grant, and a new Node rejects an old Gateway request
   without one. Terraform encodes the control-plane-before-Gateway dependency;
   the worker drain boundary remains operator-controlled.
+- The natural-expiry rejection detail is an additive Node response field. An
+  old Gateway safely ignores it, while a new Gateway paired with an old Node
+  retains the conservative full barrier. Nodes therefore roll before Gateways
+  when this continuity behavior is introduced; either mixed version remains
+  fail closed.
 - Grant expiry is an authorization bound, not a promise that a backend will
   remain Running. Node loss still breaks connections and clients still retry.
