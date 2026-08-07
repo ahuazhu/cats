@@ -53,7 +53,7 @@ locals {
       mode                  = "asynchronous-systemd"
       management_ready_gate = "ssm-online"
       build_ready_path      = "/var/lib/cats-build/readiness-v1.json"
-      bootstrap_sha256      = local.bootstrap_identity.bootstrap_sha256
+      bootstrap_sha256      = local.bootstrap_components_sha256.bootstrap
       toolchain_lock_sha256 = local.bootstrap_identity.toolchain_lock_sha256
       components_sha256     = local.bootstrap_components_sha256
       payload_sha256        = local.bootstrap_identity.bootstrap_payload_sha256

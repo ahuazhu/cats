@@ -30,7 +30,6 @@ locals {
     source_bucket              = local.source_bucket_name
     source_kms_alias_arn       = local.source_kms_alias_arn
     apt_snapshot_id            = jsondecode(file("${path.module}/bootstrap/toolchain-lock-v1.json")).apt_snapshot.snapshot_id
-    bootstrap_sha256           = filesha256("${path.module}/bootstrap/bootstrap.sh")
     toolchain_lock_sha256      = filesha256("${path.module}/bootstrap/toolchain-lock-v1.json")
     bootstrap_payload_sha256   = sha256(jsonencode(local.bootstrap_components_sha256))
   }

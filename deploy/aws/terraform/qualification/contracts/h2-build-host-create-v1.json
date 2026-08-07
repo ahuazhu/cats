@@ -119,20 +119,20 @@
         "mode": "asynchronous-systemd",
         "management_ready_gate": "ssm-online",
         "build_ready_path": "/var/lib/cats-build/readiness-v1.json",
-        "bootstrap_sha256": "17920e1226be766bcb187c1fab898a90d24dd25bc1add797bdda0666cfb2c45a",
+        "bootstrap_sha256": "7f1d08980e68ee961e56e7ae52c271e48dafb8e60ed33fbf6f3079b5e9a3f575",
         "toolchain_lock_sha256": "5884719764338b75cb42012ad97c48df9a035435b0f5de706af9be4058fd220c",
         "components_sha256": {
-          "bootstrap": "17920e1226be766bcb187c1fab898a90d24dd25bc1add797bdda0666cfb2c45a",
+          "bootstrap": "7f1d08980e68ee961e56e7ae52c271e48dafb8e60ed33fbf6f3079b5e9a3f575",
         "checkout": "060f6eb1327aa3de6dd938b0d33889f62d2643979eb4e24b3757d5da472eeb3b",
         "imds_guard": "55ae2e94b3bbe350b20c29d2aaa6248bbb4552518591b82140add94ef4002dda",
         "immutable_receipt": "c70f6eacb73ba2bea4530dca743c4f7e38eb328af6d1644406a24dd8a85adf54",
           "publish": "9d2b96f35166281a56ae579126a397dd171afd0d5645d801450d36746817293d",
-          "readiness": "1c0a7c220e32891213366b7b174cdb966530937603ed21619cfe4adff8ea77d7",
+          "readiness": "350f58e7da88dbd4765f6eb1d40e60e39f1e49356cc9a5d16b2ce6143bcf3800",
           "run_build": "36536f656fbbb83639cd991d3cc8e0999d880694a88b5f874aa43301dd0eef20",
         "stage_output": "13aee4e5a106072cd2ef4cf43ea3f3e95d57d93d4140024ca40a93f52ed60a7a",
           "toolchain_lock": "5884719764338b75cb42012ad97c48df9a035435b0f5de706af9be4058fd220c"
         },
-        "payload_sha256": "c7822adb3bd17120a75619b30f65eef185c7739fe4159b034e2fbc585e23930d",
+        "payload_sha256": "9dbfe6a85a560c6d1b09c45ab619688816d6970543022f3e87ce28922637a846",
         "apt_snapshot_id": "20260801T000000Z"
       },
       "source_policy": {
@@ -470,7 +470,7 @@
     }
   },
   "expected_configuration_root_sha256": "69747704d4d61a9e3a7d134508163f47cc9f8221d4cfae7d9d540bd67fe27626",
-  "expected_managed_changes_sha256": "40d8bbd47ad50327ddeed50ef5f3f3cf77a75056ea8a778a77866000c38d46bc",
+  "expected_managed_changes_sha256": "b0775f05cfeb59819a7994a887100e99fe5901ced591945a554355a350907030",
   "required_configuration_references": {
     "aws_instance.build": {
       "root_block_device[0].kms_key_id.references": [

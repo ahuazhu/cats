@@ -78,7 +78,7 @@ def main() -> int:
     if readiness.get("source_policy") != expected_source_policy:
         fail("source delivery policy differs from the controller-bundle contract")
 
-    for field in ("bootstrap_sha256", "toolchain_lock_sha256"):
+    for field in ("toolchain_lock_sha256",):
         if not SHA256.fullmatch(readiness.get("bootstrap", {}).get(field, "")):
             fail(f"invalid bootstrap digest: {field}")
     installed_components = {
