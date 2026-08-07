@@ -1,5 +1,5 @@
 {
-  "vector_version": 1,
+  "vector_version": 2,
   "base_vector": "positive.json",
   "assembly": "For a case with token_parts, replace each $positive value with the same named field from positive.json, then join header_base64url, claims_base64url and signature_base64url with ASCII dots.",
   "cases": [
@@ -20,7 +20,7 @@
     {
       "name": "invalid-base64url-character",
       "token_parts": {
-        "header_base64url": "$positive.header_base64url",
+        "header_base64url": "eyJhbGciOiJFZERTQSIsImtpZCI6IjIxZmUzMWRmYTE1NGEyNjE2MjZiZjg1NDA0NmZkMjI3MWI3YmVkNGI2YWJlNDVhYTU4ODc3ZWY0N2Y5NzIxYjkiLCJ0eXAiOiJjYXRzLXJvdXRlLWdyYW50K2p3dCIsInYiOjJ9",
         "claims_base64url": "$positive.claims_base64url",
         "signature_base64url": "*"
       },
@@ -29,43 +29,48 @@
     {
       "name": "signed-unknown-header",
       "token_parts": {
-        "header_base64url": "eyJhbGciOiJFZERTQSIsImtpZCI6IjIxZmUzMWRmYTE1NGEyNjE2MjZiZjg1NDA0NmZkMjI3MWI3YmVkNGI2YWJlNDVhYTU4ODc3ZWY0N2Y5NzIxYjkiLCJ0eXAiOiJjYXRzLXJvdXRlLWdyYW50K2p3dCIsInYiOjEsIngiOjF9",
+        "header_base64url": "eyJhbGciOiJFZERTQSIsImtpZCI6IjIxZmUzMWRmYTE1NGEyNjE2MjZiZjg1NDA0NmZkMjI3MWI3YmVkNGI2YWJlNDVhYTU4ODc3ZWY0N2Y5NzIxYjkiLCJ0eXAiOiJjYXRzLXJvdXRlLWdyYW50K2p3dCIsInYiOjIsIngiOjF9",
         "claims_base64url": "$positive.claims_base64url",
-        "signature_base64url": "y0wS7j7_TSiw6hwj5KfiHOagTPupkUJ-1xcoS4wRHlJGtWZJRN1Z-7LaVF1Us_GLvoVtYyNqqsVRkhk_GLE9Dg"
+        "signature_base64url": "4FB1K2IGL8ciHq8G7-WDHLYn17iX72cc6ocYiOG_QToSA2hRd79VDgIqQaGKq86qWGh1MBaXn3W6_PKVu8k1BQ"
       },
       "expected_class": "noncanonical_encoding"
     },
     {
-      "name": "signed-version-two",
+      "name": "signed-legacy-version-one",
       "token_parts": {
-        "header_base64url": "eyJhbGciOiJFZERTQSIsImtpZCI6IjIxZmUzMWRmYTE1NGEyNjE2MjZiZjg1NDA0NmZkMjI3MWI3YmVkNGI2YWJlNDVhYTU4ODc3ZWY0N2Y5NzIxYjkiLCJ0eXAiOiJjYXRzLXJvdXRlLWdyYW50K2p3dCIsInYiOjJ9",
+        "header_base64url": "eyJhbGciOiJFZERTQSIsImtpZCI6IjIxZmUzMWRmYTE1NGEyNjE2MjZiZjg1NDA0NmZkMjI3MWI3YmVkNGI2YWJlNDVhYTU4ODc3ZWY0N2Y5NzIxYjkiLCJ0eXAiOiJjYXRzLXJvdXRlLWdyYW50K2p3dCIsInYiOjF9",
         "claims_base64url": "$positive.claims_base64url",
-        "signature_base64url": "YkHRlSCNsLVocZT9I8hdzsJkCpEw4cbWn1YOa1gpTWWCVWIMVOnV08ccBb13Q1KpjNqNWPeuM4IU0XMfaMe4Cw"
+        "signature_base64url": "DG5Ofbp8D6Bgw5Rfx1s4370wjJJwT2D15d80D2BnBVz4N5qOeyMCpaJQnCEg3HBhRPhHeyiPOTayVUmi982XBQ"
       },
       "expected_class": "unsupported_version"
     },
     {
+      "name": "deployed-adr-0033-v1-shape",
+      "compact": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSIsImtpZCI6IjA2ZTNmZDhmZGEyOWJiNjBhYjU5NTU3ZGU2MWVkYjBhZWNkYjIzMTEzNGJlMzBlNzViNDU1ZjhlMWI3OTJmYTkifQ.eyJ2ZXJzaW9uIjoxLCJpc3MiOiJjYXRzLWNvbnRyb2wtcGxhbmUiLCJhdWQiOiJjYXRzLW5vZGUtYWdlbnQiLCJob3N0bmFtZSI6InByZXZpZXctMDEyMzQ1Njc4OWFiLmNhdHMucnVuIiwid29ya3NwYWNlX2lkIjoid3NfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCJjYXRfaWQiOiJjYXRfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCJjYXRfZ2VuZXJhdGlvbiI6Nywibm9kZV9pZCI6Im5vZGVfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCJyb3V0ZV9lcG9jaCI6NDIsInRhcmdldF9wb3J0Ijo4MDgwLCJpYXQiOjE4MDAwMDAwMDAsImV4cCI6MTgwMDAwMDEyMH0.dYEkN4qlWqFgNzYS7pUVNAYI7O5QNPBKk1-05ky21Os5utI85zTwh19gFGtK9czZER3VnbLyYgF1mG5svgSEBg",
+      "expected_class": "noncanonical_encoding"
+    },
+    {
       "name": "signed-wrong-algorithm",
       "token_parts": {
-        "header_base64url": "eyJhbGciOiJFUzI1NiIsImtpZCI6IjIxZmUzMWRmYTE1NGEyNjE2MjZiZjg1NDA0NmZkMjI3MWI3YmVkNGI2YWJlNDVhYTU4ODc3ZWY0N2Y5NzIxYjkiLCJ0eXAiOiJjYXRzLXJvdXRlLWdyYW50K2p3dCIsInYiOjF9",
+        "header_base64url": "eyJhbGciOiJFUzI1NiIsImtpZCI6IjIxZmUzMWRmYTE1NGEyNjE2MjZiZjg1NDA0NmZkMjI3MWI3YmVkNGI2YWJlNDVhYTU4ODc3ZWY0N2Y5NzIxYjkiLCJ0eXAiOiJjYXRzLXJvdXRlLWdyYW50K2p3dCIsInYiOjJ9",
         "claims_base64url": "$positive.claims_base64url",
-        "signature_base64url": "ckgUGJhRlw8qfQvSmisV6RhdnV_eWfehDGk036_2Y_e72Y0pn89wlM55KGk9bAdL9Huwnm0OmAdXJDLTFtZTAg"
+        "signature_base64url": "Jp0rcNmYOVmCqsG9_JThXBlg9zANga6hchNWW3WycMoHL_focshz6NhOB_P31ZHdBfqhd34pk2y_aDxXbSMVDQ"
       },
       "expected_class": "unsupported_algorithm"
     },
     {
       "name": "signed-unknown-kid",
       "token_parts": {
-        "header_base64url": "eyJhbGciOiJFZERTQSIsImtpZCI6IjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAiLCJ0eXAiOiJjYXRzLXJvdXRlLWdyYW50K2p3dCIsInYiOjF9",
+        "header_base64url": "eyJhbGciOiJFZERTQSIsImtpZCI6IjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAiLCJ0eXAiOiJjYXRzLXJvdXRlLWdyYW50K2p3dCIsInYiOjJ9",
         "claims_base64url": "$positive.claims_base64url",
-        "signature_base64url": "HHCbODGSoqSl9yIszj31H1ItAlFOS59vEfQZnGUbH1cI6khPIajKembxNBtuclULwbnx0n1Y3YkN06KXiRz8BQ"
+        "signature_base64url": "a3qSXdWeG5YnO3MsJcsn78J9IceDoCXPp2cjROFNi3ZLD-lTPtKcIvaW_9vNwHhuk9oqoFqTNqLBZSWhbdktAA"
       },
       "expected_class": "unknown_key"
     },
     {
       "name": "tampered-target-port",
       "token_parts": {
-        "header_base64url": "$positive.header_base64url",
+        "header_base64url": "eyJhbGciOiJFZERTQSIsImtpZCI6IjIxZmUzMWRmYTE1NGEyNjE2MjZiZjg1NDA0NmZkMjI3MWI3YmVkNGI2YWJlNDVhYTU4ODc3ZWY0N2Y5NzIxYjkiLCJ0eXAiOiJjYXRzLXJvdXRlLWdyYW50K2p3dCIsInYiOjJ9",
         "claims_base64url": "eyJhdWQiOiJjYXRzLW5vZGUtYWdlbnQiLCJjYXRfZ2VuZXJhdGlvbiI6NywiY2F0X2lkIjoiY2F0XzAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwiZW5kcG9pbnRfaWQiOiJlcF8wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImV4cCI6MTgwMDAwMDA2MCwiZ3JhbnRfaWQiOiJyZ18wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImhvc3RuYW1lIjoicHJldmlldy0wMTIzNDU2Nzg5YWIuY2F0cy5ydW4iLCJpYXQiOjE4MDAwMDAwMDAsImlzcyI6ImNhdHMtY29udHJvbC1wbGFuZSIsIm5iZiI6MTgwMDAwMDAwMCwibm9kZV9pZCI6Im5vZGVfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCJwcm90b2NvbCI6Imh0dHAiLCJyb3V0ZV9lcG9jaCI6NDIsInRhcmdldF9wb3J0Ijo4MDgxLCJ3b3Jrc3BhY2VfaWQiOiJ3c18wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiJ9",
         "signature_base64url": "$positive.signature_base64url"
       },
@@ -74,18 +79,18 @@
     {
       "name": "noncanonical-ed25519-s-plus-group-order",
       "token_parts": {
-        "header_base64url": "$positive.header_base64url",
+        "header_base64url": "eyJhbGciOiJFZERTQSIsImtpZCI6IjIxZmUzMWRmYTE1NGEyNjE2MjZiZjg1NDA0NmZkMjI3MWI3YmVkNGI2YWJlNDVhYTU4ODc3ZWY0N2Y5NzIxYjkiLCJ0eXAiOiJjYXRzLXJvdXRlLWdyYW50K2p3dCIsInYiOjJ9",
         "claims_base64url": "$positive.claims_base64url",
-        "signature_base64url": "DG5Ofbp8D6Bgw5Rfx1s4370wjJJwT2D15d80D2BnBVzlC5DrlYYU_Xjtk8T-1U92RPhHeyiPOTayVUmi982XFQ"
+        "signature_base64url": "YkHRlSCNsLVocZT9I8hdzsJkCpEw4cbWn1YOa1gpTWVvKVhpbkzoK565_F9WPTG-jNqNWPeuM4IU0XMfaMe4Gw"
       },
       "expected_class": "noncanonical_encoding"
     },
     {
       "name": "signed-unknown-claim",
       "token_parts": {
-        "header_base64url": "$positive.header_base64url",
+        "header_base64url": "eyJhbGciOiJFZERTQSIsImtpZCI6IjIxZmUzMWRmYTE1NGEyNjE2MjZiZjg1NDA0NmZkMjI3MWI3YmVkNGI2YWJlNDVhYTU4ODc3ZWY0N2Y5NzIxYjkiLCJ0eXAiOiJjYXRzLXJvdXRlLWdyYW50K2p3dCIsInYiOjJ9",
         "claims_base64url": "eyJhdWQiOiJjYXRzLW5vZGUtYWdlbnQiLCJjYXRfZ2VuZXJhdGlvbiI6NywiY2F0X2lkIjoiY2F0XzAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwiZW5kcG9pbnRfaWQiOiJlcF8wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImV4cCI6MTgwMDAwMDA2MCwiZ3JhbnRfaWQiOiJyZ18wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImhvc3RuYW1lIjoicHJldmlldy0wMTIzNDU2Nzg5YWIuY2F0cy5ydW4iLCJpYXQiOjE4MDAwMDAwMDAsImlzcyI6ImNhdHMtY29udHJvbC1wbGFuZSIsIm5iZiI6MTgwMDAwMDAwMCwibm9kZV9pZCI6Im5vZGVfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCJwcm90b2NvbCI6Imh0dHAiLCJyb3V0ZV9lcG9jaCI6NDIsInNjb3BlIjoiKiIsInRhcmdldF9wb3J0Ijo4MDgwLCJ3b3Jrc3BhY2VfaWQiOiJ3c18wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiJ9",
-        "signature_base64url": "xrzxiaiL9J0kq1uoOyqdvyCMlctH4tw5arZFh_2pkvGibT5DCDWRfBtnGGNkoWS_z2-osDlHSU_3dyqKN0ejAg"
+        "signature_base64url": "ao4dlIAbsgtvZwEz7fCwpv8Y-r35NXTYeqMBNn0jsQ-ipZNnnAgwjTleJW-7AYr5xICm2GVN886n8jAa0WDhCQ"
       },
       "expected_class": "invalid_claims"
     },
@@ -94,7 +99,7 @@
       "token_parts": {
         "header_base64url": "$positive.header_base64url",
         "claims_base64url": "eyJhdWQiOiJjYXRzLW5vZGUtYWdlbnQiLCJjYXRfZ2VuZXJhdGlvbiI6NywiY2F0X2lkIjoiY2F0XzAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwiZW5kcG9pbnRfaWQiOiJlcF8wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImV4cCI6MTgwMDAwMDA2MCwiZ3JhbnRfaWQiOiJyZ18wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImhvc3RuYW1lIjoicHJldmlldy0wMTIzNDU2Nzg5YWIuY2F0cy5ydW4iLCJpYXQiOjE4MDAwMDAwMDAsImlzcyI6ImNhdHMtY29udHJvbC1wbGFuZSIsIm5iZiI6MTgwMDAwMDAwMCwibm9kZV9pZCI6Im5vZGVfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCJwcm90b2NvbCI6Imh0dHAiLCJyb3V0ZV9lcG9jaCI6NDIsInRhcmdldF9wb3J0Ijo4MDgwLCJ0YXJnZXRfcG9ydCI6OTA5MCwid29ya3NwYWNlX2lkIjoid3NfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYifQ",
-        "signature_base64url": "A6idnNURAyxYjtsaz1Q6egcYOIrbnPmElrH4jCYIXMqxY-vTmyZlkTyTMADpuIY04FfyuWTOKCywckXT0VOUDA"
+        "signature_base64url": "tb3u3KdVaPdHoOF7LmG57gwutkT8GeqD7du55BvXfDbRdvr3CFdwxq6qKwm7WwVvim1K57Gfvt0gU0ra32V8BA"
       },
       "expected_class": "noncanonical_encoding"
     },
@@ -103,7 +108,7 @@
       "token_parts": {
         "header_base64url": "$positive.header_base64url",
         "claims_base64url": "eyAid29ya3NwYWNlX2lkIjogIndzXzAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwgInRhcmdldF9wb3J0IjogODA4MCwgInJvdXRlX2Vwb2NoIjogNDIsICJwcm90b2NvbCI6ICJodHRwIiwgIm5vZGVfaWQiOiAibm9kZV8wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsICJuYmYiOiAxODAwMDAwMDAwLCAiaXNzIjogImNhdHMtY29udHJvbC1wbGFuZSIsICJpYXQiOiAxODAwMDAwMDAwLCAiaG9zdG5hbWUiOiAicHJldmlldy0wMTIzNDU2Nzg5YWIuY2F0cy5ydW4iLCAiZ3JhbnRfaWQiOiAicmdfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCAiZXhwIjogMTgwMDAwMDA2MCwgImVuZHBvaW50X2lkIjogImVwXzAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwgImNhdF9pZCI6ICJjYXRfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCAiY2F0X2dlbmVyYXRpb24iOiA3LCAiYXVkIjogImNhdHMtbm9kZS1hZ2VudCIgfQ",
-        "signature_base64url": "WvIXqY6CeRKlnCQN6QDYjMSOEP5k0YYp4_GNHy4bhHki0gSFYJs18MYGJcyQ2rnd2sLfT98yVKc6WmzueysHDg"
+        "signature_base64url": "LG0NJ8P7VWsZOnoagBPTo8O2HgUOLzVJgMXR7-sqbf5RoSvWW6_VJTpFR0mD4DUJM6Wzbri7xG4aTZ5c-0POAQ"
       },
       "expected_class": "noncanonical_encoding"
     },
@@ -112,7 +117,7 @@
       "token_parts": {
         "header_base64url": "$positive.header_base64url",
         "claims_base64url": "eyJhdWQiOiJjYXRzLW5vZGUtYWdlbnQiLCJjYXRfZ2VuZXJhdGlvbiI6NywiY2F0X2lkIjoiY2F0XzAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwiZW5kcG9pbnRfaWQiOiJlcF8wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImV4cCI6MTgwMDAwMDEyMSwiZ3JhbnRfaWQiOiJyZ18wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImhvc3RuYW1lIjoicHJldmlldy0wMTIzNDU2Nzg5YWIuY2F0cy5ydW4iLCJpYXQiOjE4MDAwMDAwMDAsImlzcyI6ImNhdHMtY29udHJvbC1wbGFuZSIsIm5iZiI6MTgwMDAwMDAwMCwibm9kZV9pZCI6Im5vZGVfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCJwcm90b2NvbCI6Imh0dHAiLCJyb3V0ZV9lcG9jaCI6NDIsInRhcmdldF9wb3J0Ijo4MDgwLCJ3b3Jrc3BhY2VfaWQiOiJ3c18wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiJ9",
-        "signature_base64url": "jteIk7vtRk7Jc5vjDxpfEEFR9pE4P4lcOFphpm5or5q0jeeMbfNbvb42haQpNaD7G3Ddn8ThIDdhH3JtUxv9CQ"
+        "signature_base64url": "Ct-QJ_6TdiJIJoe1RW6Cv95id0mosYUOeb7cOA_D2F8gAu3aOt9-Hc1cqSe1jGRSq2fG8T7YhjCDVr7qZ3gyAQ"
       },
       "expected_class": "lifetime_exceeded"
     },
@@ -301,7 +306,17 @@
     ],
     "mutation_rule": "replace_exact_value_with_same_type_distinct_value_in_one_layer_only",
     "expected_cases": 48,
-    "expected": "issuer_rejects_lineage_mismatch"
+    "expected": "issuer_rejects_lineage_mismatch",
+    "optional_presence_matrix": {
+      "relative_paths": [
+        "runtime_identity.host_boot_id",
+        "runtime_identity.guest_boot_id"
+      ],
+      "present_base_mutation": "remove_exact_field_from_one_layer_only",
+      "absent_base_mutation": "remove_exact_field_from_every_layer_then_add_distinct_value_to_one_layer_only",
+      "expected_cases": 16,
+      "expected": "issuer_rejects_optional_lineage_presence_mismatch"
+    }
   },
   "issuer_route_identity_mutation_matrix": {
     "base_snapshot": "$positive.issuer_snapshot",
@@ -433,7 +448,23 @@
     ],
     "mutation_rule": "replace_exact_value_with_same_type_distinct_value",
     "expected_cases": 14,
-    "expected": "runtime_lineage_mismatch"
+    "expected": "runtime_lineage_mismatch",
+    "optional_presence_matrix": {
+      "field_pairs": [
+        {
+          "local_authority_path": "settled_lineage.runtime_identity.host_boot_id",
+          "runtime_ledger_path": "runtime_identity.host_boot_id"
+        },
+        {
+          "local_authority_path": "settled_lineage.runtime_identity.guest_boot_id",
+          "runtime_ledger_path": "runtime_identity.guest_boot_id"
+        }
+      ],
+      "present_base_mutation": "remove_exact_field_from_local_authority_only",
+      "absent_base_mutation": "remove_exact_field_from_local_authority_and_runtime_ledger_then_add_distinct_value_to_local_authority_only",
+      "expected_cases": 4,
+      "expected": "runtime_lineage_optional_presence_mismatch"
+    }
   },
   "route_install_cases": [
     {
@@ -534,32 +565,125 @@
       "expected": "distinct_command_receipt_without_old_epoch_reactivation"
     },
     {
-      "name": "promoted-auto-command-also-needs-distinct-command-receipt",
+      "name": "promoted-auto-command-uses-policy-receipt-plus-exact-promotion",
       "input": {
         "policy_receipt_id": "rret_policy_0123456789abcdef01234567",
         "retirement_token": "rtok_0123456789abcdef0123456789abcdef",
         "policy_proposal_id": "ptp_0123456789abcdef0123456789abcdef",
         "promoted_command_id": "lcmd_auto_0123456789abcdef012345678",
         "command_mode": "require_idle",
+        "policy_retirement_promotion": {
+          "policy_promotion_id": "pprom_0123456789abcdef0123456789abc",
+          "policy_proposal_id": "ptp_0123456789abcdef0123456789abcdef",
+          "route_retirement_receipt_id": "rret_policy_0123456789abcdef01234567",
+          "route_retirement_token": "rtok_0123456789abcdef0123456789abcdef",
+          "cat_id": "cat_0123456789abcdef0123456789abcdef",
+          "intent_id": "lintent_auto_0123456789abcdef0123456",
+          "intent_generation": 8,
+          "operation_id": "op_auto_0123456789abcdef0123456789ab",
+          "command_id": "lcmd_auto_0123456789abcdef012345678",
+          "old_install_id": "rinst_0123456789abcdef0123456789abcdef",
+          "old_route_intent_id": "rti_0123456789abcdef0123456789abcdef",
+          "retired_route_epoch": 42,
+          "old_settled_lineage": "$positive.verification_context.local_authority.settled_lineage",
+          "work_fence_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
         "node_local_authority": "same_exact_policy_revoked_predecessor"
       },
       "expected": {
-        "proposal_receipt_authorizes_command": false,
-        "new_receipt_scope": "lifecycle_command",
-        "new_receipt_token": "distinct_from_policy_retirement_token",
-        "new_receipt_predecessor": "retired_by_policy(P, retirement_token)",
-        "new_receipt_outcome": "adopted_retired_predecessor",
+        "proposal_receipt_alone_authorizes_command": false,
+        "proposal_receipt_plus_exact_promotion_authorizes_command": true,
+        "new_command_scoped_receipt_created": false,
+        "concurrent_manual_command_authorized": false,
         "old_epoch_reactivated": false
+      },
+      "single_field_promotion_mismatch_matrix": {
+        "paths": [
+          "policy_proposal_id",
+          "route_retirement_receipt_id",
+          "route_retirement_token",
+          "cat_id",
+          "intent_id",
+          "intent_generation",
+          "operation_id",
+          "command_id",
+          "old_install_id",
+          "old_route_intent_id",
+          "retired_route_epoch",
+          "old_settled_lineage.result_id",
+          "work_fence_digest"
+        ],
+        "mutation_rule": "change_exactly_one_field_and_keep_policy_receipt_command_and_every_other_promotion_field_identical",
+        "expected_cases": 13,
+        "expected": "auto_command_dispatch_rejected_without_new_receipt_or_epoch_reactivation"
       }
     },
     {
-      "name": "adoption-mismatch-fails-closed",
+      "name": "adoption-token-only-mismatch-fails-closed",
       "input": {
         "policy_proposal_id": "ptp_0123456789abcdef0123456789abcdef",
         "retirement_token": "rtok_0123456789abcdef0123456789abcdef",
+        "old_install_id": "rinst_0123456789abcdef0123456789abcdef",
         "old_route_epoch": 42,
+        "old_settled_lineage": "$positive.verification_context.local_authority.settled_lineage",
         "request_override": {
-          "predecessor.retirement_token": "rtok_wrong_0123456789abcdef0123456789ab",
+          "predecessor.retirement_token": "rtok_wrong_0123456789abcdef0123456789ab"
+        }
+      },
+      "expected": {
+        "result": "retirement_adoption_mismatch",
+        "command": "blocked",
+        "local_authority": "revoked_unchanged",
+        "receipt_created": false
+      }
+    },
+    {
+      "name": "adoption-install-only-mismatch-fails-closed",
+      "input": {
+        "policy_proposal_id": "ptp_0123456789abcdef0123456789abcdef",
+        "retirement_token": "rtok_0123456789abcdef0123456789abcdef",
+        "old_install_id": "rinst_0123456789abcdef0123456789abcdef",
+        "old_route_epoch": 42,
+        "old_settled_lineage": "$positive.verification_context.local_authority.settled_lineage",
+        "request_override": {
+          "old_install_id": "rinst_other_0123456789abcdef0123456789abc"
+        }
+      },
+      "expected": {
+        "result": "retirement_adoption_mismatch",
+        "command": "blocked",
+        "local_authority": "revoked_unchanged",
+        "receipt_created": false
+      }
+    },
+    {
+      "name": "adoption-epoch-only-mismatch-fails-closed",
+      "input": {
+        "policy_proposal_id": "ptp_0123456789abcdef0123456789abcdef",
+        "retirement_token": "rtok_0123456789abcdef0123456789abcdef",
+        "old_install_id": "rinst_0123456789abcdef0123456789abcdef",
+        "old_route_epoch": 42,
+        "old_settled_lineage": "$positive.verification_context.local_authority.settled_lineage",
+        "request_override": {
+          "old_route_epoch": 43
+        }
+      },
+      "expected": {
+        "result": "retirement_adoption_mismatch",
+        "command": "blocked",
+        "local_authority": "revoked_unchanged",
+        "receipt_created": false
+      }
+    },
+    {
+      "name": "adoption-lineage-only-mismatch-fails-closed",
+      "input": {
+        "policy_proposal_id": "ptp_0123456789abcdef0123456789abcdef",
+        "retirement_token": "rtok_0123456789abcdef0123456789abcdef",
+        "old_install_id": "rinst_0123456789abcdef0123456789abcdef",
+        "old_route_epoch": 42,
+        "old_settled_lineage": "$positive.verification_context.local_authority.settled_lineage",
+        "request_override": {
           "old_settled_lineage.result_id": "nres_other"
         }
       },
@@ -964,6 +1088,18 @@
       "winner_a": "adopted_by_command(command_id, receipt_id)_and_compensation_terminal_stale",
       "winner_b": "compensated_by_route(compensation_intent_id, fresh_epoch)_and_manual_retries_fresh_authority",
       "retry_rule": "loser_rolls_back_and_replans_entire_transaction_from_fresh_cat_and_route_snapshot",
+      "single_field_mismatch_replay_matrix": {
+        "paths": [
+          "retirement_token",
+          "old_install_id",
+          "old_route_epoch",
+          "old_settled_lineage.result_id"
+        ],
+        "mutation_rule": "change_exactly_one_predecessor_field_and_keep_every_other_field_identical",
+        "sessions": 2,
+        "expected_cases": 4,
+        "expected": "neither_adoption_nor_compensation_mutates_route_or_creates_receipt_then_fresh_snapshot_replan"
+      },
       "expected": "one_resolution_owner_no_proposal_receipt_rebinding_no_old_epoch_reactivation"
     }
   ]

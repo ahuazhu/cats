@@ -1,4 +1,4 @@
-# Route Grant V1 fixed vectors
+# Route Grant V2 fixed vectors
 
 这些文件是 B1 issuer、B3 Gateway strict parser、B2/B4 Node verifier 的共同契约输入，不是生产
 密钥或示例配置。
@@ -33,14 +33,18 @@ dot-path。token segment case 唯一允许在 reference 后追加 literal `=`，
 
 1. issuer 从公开 test seed 构造 test-only signer，产生与 `positive.json` 逐字节相同的三个 segment；
 2. 独立 OpenSSL 或另一 Ed25519 backend 验证 positive signature；
-3. Gateway parser 与 Node verifier 消费所有 `cases`，得到 exact `expected_class`；
+3. Gateway parser 与 Node verifier 消费所有 `cases`，得到 exact `expected_class`；其中
+   `deployed-adr-0033-v1-shape` 是现有 SPKI-`kid`/claims-version V1 wire，V2 必须明确拒绝；
 4. issuer 消费 `issuer_snapshot_cases`、`issuer_generation_mutation_matrix`、
    `issuer_lineage_mutation_matrix`、`issuer_route_identity_mutation_matrix` 和
-   `current_nonterminal_command_matrix`；后者必须展开为 8 kinds × 7 phases = 56 个拒签 case；
+   `current_nonterminal_command_matrix`；lineage matrix 必须同时展开 optional boot identity 的
+   value replacement、present→absent 和 absent→present 单层 mutation；current-command matrix 必须
+   展开为 8 kinds × 7 phases = 56 个拒签 case；
 5. Node 消费 `node_lineage_mutation_matrix`、`route_install_cases` 与
    `retirement_adoption_cases`，证明 old/same-epoch mismatch、predecessor mismatch、restart lineage
-   mismatch 均 fail closed，并证明 manual/auto command 只能用 distinct command-scoped
-   route-retirement work/receipt（manual 固定 `cancel_and_drain`）与
+   mismatch（包括 optional boot identity presence）均 fail closed，并证明 auto-generated Suspend 只由 exact policy receipt +
+   `PolicyRetirementPromotionV2` 授权，而 receipt/promotion race 中的 manual command 必须用 distinct
+   command-scoped route-retirement work/receipt（manual 固定 `cancel_and_drain`）与
    `predecessor=retired_by_policy(P, retirement_token)`、
    `outcome=adopted_retired_predecessor` 接管 exact policy-revoked lineage；
 6. Node/Route Controller/A0 lifecycle 消费 `retirement_mode_matrix`、`policy_proposal_cases` 与
@@ -50,7 +54,8 @@ dot-path。token segment case 唯一允许在 reference 后追加 literal `=`，
    adoption/compensation 在同一 Route row 唯一 CAS、compensation winner 迫使 manual 从 fresh epoch
    重规划，且 route-admission retirement 与 writer/durability transfer 是两个门；
 7. B1 在真实 PostgreSQL 两个独立 session 上消费 `postgres_concurrency_cases`，使用显式 barrier
-   验证 Cat-first lock order、fresh-snapshot whole-transaction retry 与 stale-intent CAS；mock/in-memory
-   Store 不满足此门禁；
+   验证 Cat-first lock order、fresh-snapshot whole-transaction retry 与 stale-intent CAS；
+   `PG-POLICY-MANUAL.single_field_mismatch_replay_matrix` 必须逐个只改变 token、install、epoch 或
+   lineage，证明无 receipt/Route mutation；mock/in-memory Store 不满足此门禁；
 8. Control Plane、Gateway、Node 对 `hostname.json` 得到相同 canonical 结果；
 9. 测试输出不得打印完整 compact token 或 seed。

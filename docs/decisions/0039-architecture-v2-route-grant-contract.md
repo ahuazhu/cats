@@ -1,36 +1,38 @@
-# ADR-0033：短期签名 Route Grant 与控制面离线数据面授权
+# ADR-0039：Architecture V2 Route Grant 合同
 
 - 状态：Accepted
-- 日期：2026-08-06
+- 日期：2026-08-07
 - 关联：ADR-0002（生命周期四态）、ADR-0010（默认 HTTP Endpoint）、
   ADR-0018（Workspace 是唯一资源所有者）、ADR-0028（Node runtime ledger）、
-  ADR-0031/0032（PostgreSQL 控制权威与多副本）、ADR-0035（A0 LifecycleCommand V2）；
+  ADR-0031/0032（PostgreSQL 控制权威与多副本）、
+  ADR-0033（已部署的 legacy Route Grant V1）、ADR-0035（A0 LifecycleCommand V2）；
   Architecture V2 #204、Epic B #206、B0 #216
 
 ## 背景
 
-当前 Endpoint 热路径把 unsigned `RouteBinding` 缓存在 Gateway，再为每个 HTTP 请求获取、
-释放控制面 work lease；WebSocket 还要周期续租。Gateway 把 `target_port` 与 `route_epoch`
-作为普通请求字段传给 Node。Node 最终只证明 Cat id 在本进程内存在且为 `Running`，没有把
-Workspace、Cat generation、Endpoint、hostname、target Node、route epoch 和 port 绑定为
-一个不可伪造的授权决定。
+当前 workspace 已按 ADR-0033 部署 legacy Route Grant V1：Running HTTP/WebSocket 不再逐请求
+获取控制面 work lease，Gateway 搬运 Ed25519 token，Node 也校验 Cat generation、route epoch、
+target Node/port 和本地 Running。该实现解决了最初的控制面热路径问题，但它先于 Architecture V2
+authority model：issuer 仍以兼容期 `observed_state`/materialized binding 为主，wire 不绑定
+Endpoint、protocol、`nbf` 或 exact reducer/command/dispatch/claim/result/runtime lineage；Node 没有
+durable exact route-authority CAS，key identity 也仍是 SPKI DER digest 与单 verifier/drained rotation。
 
 这带来两个结构性问题：
 
-1. 控制面或 PostgreSQL 短暂不可用，会直接扩大为已经 Running 的 Endpoint 中断；每个请求
-   的 acquire/release 还会把一次公共故障放大成控制面请求风暴。
-2. Gateway 一旦被攻陷，或缓存里存在来自迁移前的旧 binding，它可以自由改写端口/epoch，
-   而 Node 没有足够的本地权威证明来拒绝跨 Workspace、旧 generation 或旧 Guest 的请求。
+1. V1 signer 可能认证一个没有与 A0 current intent、settled runtime 和 Node ACK 原子闭合的
+   compatibility snapshot；仅凭 `observed_state=Running` 不能证明新 authority model 的 Running。
+2. Gateway 一旦被攻陷，或缓存里存在迁移前的旧 V1 grant，Node 缺少 Endpoint 和 complete settled
+   lineage 的 durable local truth，不能证明 token 仍对应 exact Guest execution。
 
-仅给现有 JSON 加一个签名不能解决第二个问题。签名输入如果来自互不相关的多次数据库读取，
-会认证一个从未原子成立过的状态；Node 如果只验签、不与持久本地 runtime truth 比较，迁移、
-重启和 route epoch 变化后仍会接受过期授权。
+因此 Architecture V2 不能原地扩写已部署的 V1 token。它必须升 wire version、使用独立 cohort
+capability，并把 atomic issuer snapshot、durable Node truth、retirement 和 key-ring migration 一起
+纳入合同；否则同一个“Route Grant V1”名称会出现两套互不兼容的解释。
 
 ## 决定
 
 ### 1. Route Grant 是窄化的 capability，不是通用 JWT
 
-控制面为一个已发布且 Running 的 Endpoint 签发短期 `Route Grant v1`。它精确绑定：
+控制面为一个已发布且 Running 的 Endpoint 签发短期 `Route Grant v2`。它精确绑定：
 
 - normalized hostname、Workspace、Endpoint、Cat；
 - Cat generation（wire 名称；语义上就是 A0 `intent_generation`）、target Node、route epoch；
@@ -39,8 +41,8 @@ Workspace、Cat generation、Endpoint、hostname、target Node、route epoch 和
 - wire version、Ed25519 algorithm 和 verification-key `kid`。
 
 wire 采用一个严格、确定性的 compact JWS profile；完整字节规范、字段限制、错误码和固定
-向量见 [`docs/specs/route-grant-v1.md`](../specs/route-grant-v1.md)。这不是引入泛用 JWT/JWS
-框架：v1 只接受一组固定 header/claim、一个算法和一套 canonical JSON 表示。未知字段、重复
+向量见 [`docs/specs/route-grant-v2.md`](../specs/route-grant-v2.md)。这不是引入泛用 JWT/JWS
+框架：v2 只接受一组固定 header/claim、一个算法和一套 canonical JSON 表示。未知字段、重复
 字段、未知版本/算法/key、非 canonical base64url/JSON 一律 fail closed。
 
 ### 2. 信任边界固定为 Control Plane 签发、Gateway 搬运、Node 最终裁决
@@ -97,8 +99,8 @@ B1 的唯一发行入口读取一个 `RouteAuthorizationSnapshot`。V2 issuer �
 - Cat generation 与 route epoch 均为正数。
 
 `cats.observed_state` 在 V2 中只是迁移期 API compatibility projection，heartbeat 只写 normalized
-observation；二者都不得参与 V2 issuer 判断。pre-activation V1 若仍按 `observed_state` 工作，也
-只能留在隔离的 legacy cohort，不能 mint Route Grant v1 或发布 V2 Route。
+observation；二者都不得参与 V2 issuer 判断。ADR-0033 Route Grant V1 若仍按 `observed_state`
+工作，也只能留在隔离的 legacy cohort，不能 mint Route Grant v2 或发布 V2 Route。
 
 `iat` 取该事务的整秒时间，`exp` 由它计算；事务结果复制为不可变 snapshot 后才允许编码和
 签名。签名完成时若 snapshot 已到期则丢弃，不得延长。签名期间 route 可能继续前进，这只会
@@ -114,7 +116,7 @@ route epoch，任何 bind、unbind、target port、target Node、generation 或 
 
 ### 4. Node 的持久本地 truth 是签名之外的第二道门
 
-控制面只有在目标 Node 已 durable 安装相同的 `RuntimeRouteAuthority v1` 并返回带完整 identity
+控制面只有在目标 Node 已 durable 安装相同的 `RuntimeRouteAuthorityV1` 并返回带完整 identity
 的 ACK 后，才能把 route 发布为 `active` 并签发 grant。该本地记录至少包含 grant 中所有
 资源绑定字段、`route_intent_id`、完整 settled lineage 和本地 runtime identity；ACK 逐字段回显
 该 lineage，不能只回显 epoch 或一个未定义 canonical bytes 的 digest。写入必须经过 C #207 的
@@ -188,27 +190,30 @@ retirement work/result 必须在 issuer/policy recovery 中收敛，不能把旧
 
 retirement receipt 的 scope 是 immutable one-of `route_intent | lifecycle_command |
 policy_proposal`，不能转绑。proposal receipt 还生成一个不可猜测、不可复用的 `retirement_token`。
-尤其是：proposal-scoped `require_idle` 已 revoke exact local authority，
-但在控制面 ingestion/promotion 前 manual lifecycle intent/command 先提交时，该 proposal receipt
-只能成为 physical evidence，绝不能直接授权 manual command quiesce。新 command 的 NodeJob 必须在
+proposal receipt 本身只能授权 exact proposal 的 promotion；A0 在同一个 Cat-first transaction
+创建的 exact `PolicyRetirementPromotionV2` 再把它绑定到 auto-generated Suspend command，二者合在
+一起才足以让该 command dispatch。这个 auto command 不再制造第二张 command-scoped receipt。
+
+但是，在控制面 ingestion/promotion 前 manual lifecycle intent/command 先提交时，proposal receipt
+只能成为 physical evidence，绝不能直接授权 manual command quiesce。manual command 的 NodeJob 必须在
 A0 authority 中创建 distinct command-scoped `cancel_and_drain` route-retirement work，固定
 `predecessor=retired_by_policy(P, retirement_token)`；Node 再在同一 per-Cat serialization boundary
 创建 command-scoped adoption receipt：逐字段比较已 revoke 的
 old install/route epoch/settled lineage、proposal receipt、current command/dispatch authority 和零
 guard，保持 local authority 为 revoked、不恢复旧 epoch，再持久化 exact
 `predecessor=retired_by_policy(P, retirement_token)` 与
-`outcome=adopted_retired_predecessor`。auto proposal 成功 promotion 后生成的 command 也适用；没有
-自己的 command-scoped receipt，任何 command 都不能 Guest quiesce 或成功 settle。
+`outcome=adopted_retired_predecessor`。没有自己的 command-scoped receipt，manual command 不能 Guest
+quiesce 或成功 settle；auto-generated command 则必须携带 exact proposal receipt 与 promotion。
 
 compensation ownership 采用唯一 CAS，避免两个控制器抢着“修复”。Node 上 receipt creation 仍由
 per-Cat serialization boundary 串行；控制面 ingestion 时，command adoption 与 Route compensation
 必须在 Cat-first transaction 中锁定同一 materialized Route row，并对
 `pending_policy_retirement(P, retirement_token, old_epoch, old_install, old_lineage)` 做条件更新：adoption
 写 `adopted_by_command(command_id, receipt_id)`，compensation 写
-`compensated_by_route(compensation_intent_id, new_epoch)`。只有一个能成功。adoption 赢时由 A0
+`compensated_by_route(compensation_intent_id, fresh_epoch)`。只有一个能成功。adoption 赢时由 A0
 lifecycle 独占后续；无 current command 且 proposal 仍可 promotion 时由 policy controller 独占重试；
 proposal 已 terminal 且 Cat 仍是 exact same Running lineage 时才由 B Route Controller 持久
-`RouteRetirementCompensationIntent`，引用原 reducer route intent/receipt，以更大 route epoch 重新
+`RouteRetirementCompensationIntentV1`，引用原 reducer route intent/receipt，以更大 route epoch 重新
 install/publish。compensation intent 的 eligible discovery/creation 与 apply 是 durable boundary，
 所以它可能在随后 manual command acceptance 后才与 adoption 争用 Route-row CAS。compensation 先赢
 时，任何针对 retired predecessor 的 manual adoption 都 terminal
@@ -237,14 +242,14 @@ purge 或控制面计时器也都不能证明旧数据面静默。
 
 ### 6. 时间窗口有界，时钟不健康时停止新准入
 
-v1 默认签发 60 秒，最大寿命 120 秒；`nbf == iat`。允许 Node 相对 issuer 最多 5 秒的
+v2 默认签发 60 秒，最大寿命 120 秒；`nbf == iat`。允许 Node 相对 issuer 最多 5 秒的
 not-before 偏差，但 expiry 没有额外宽限：`now >= exp` 的新 admission 必须失败。
 
 部署必须持续校准 Node 时钟。Node 无法证明 wall clock 可用或偏差不超过 5 秒时，停止新的
 Route Grant admission 并暴露 condition；已有连接不因时钟异常自动切断。以真实时间计，旧
 grant 的最坏**新准入/replay**窗口不超过 125 秒。active-session revoke latency 由 §5 的
 cancel-and-drain/fence 决定，不由 TTL 保证。更长 TTL 会改善长控制面故障的 cache hit，却同比
-扩大新准入 replay 和 key compromise 窗口；v1 选择短窗口并把长故障后的新连接明确降级为 503。
+扩大新准入 replay 和 key compromise 窗口；v2 选择短窗口并把长故障后的新连接明确降级为 503。
 
 ### 7. Gateway 使用一个有界 cache/outage 状态机
 
@@ -263,9 +268,13 @@ cache miss、expired grant、Cold/Suspended/Warm wake、route rebind 和新 Endp
 
 ### 8. Ed25519 key ring 使用 verifier-first 轮换
 
-v1 只允许 Ed25519。`kid` 是 32-byte raw Ed25519 public key 的 SHA-256 lowercase hex。
+v2 只允许 Ed25519。`kid` 是 32-byte raw Ed25519 public key 的 SHA-256 lowercase hex。
 Control Plane 只持 signer reference/private material；Gateway 不持任何 signing material；
 Node 只持有版本化 verifier key ring。
+
+ADR-0033 V1 的 `kid` 是 SPKI DER digest；V2 raw-key digest 是不同 namespace，即使来自同一把
+Ed25519 key 也不是同一个字符串。所有 capability、registration/ACK 和部署 evidence 必须同时标明
+wire version 与 key-identity scheme，禁止把无标签的 V1 fingerprint 当作 V2 ring coverage。
 
 轮换顺序不可交换：
 
@@ -282,9 +291,14 @@ ring；ring removal 只阻止新 admission，不会终止 active guard。inciden
 
 ### 9. mixed-version 只存在于隔离的 V2 cohort migration boundary
 
-V2 Node 从首次 admission 起只接受 Route Grant v1，不支持 unsigned fallback。Legacy Node
-继续由隔离的 legacy Gateway/cohort 服务；路由选择通过显式 Node capability 完成，而不是在
+V2 Node 从首次 admission 起只接受 Route Grant v2，不接受 ADR-0033 V1 或 unsigned fallback。
+Legacy Node 继续由隔离的 legacy Gateway/cohort 服务；路由选择通过显式 Node capability 完成，而不是在
 领域代码里散落 `v1/v2` 分支。Cat 以 Cold activation 和新 generation/route epoch 迁入 V2。
+
+V2 的 125 秒窗口不能证明 legacy V1 已耗尽：当前 V1 wire 允许最大 300 秒 TTL 与 5 秒 skew。
+删除 legacy cohort/verifier 前，必须先完成 old-route cancel/drain 或外部 fence，并从最后一次 V1
+签发起等待其实际配置上限（硬上限 305 秒），或取得等价的独立 zero-admission/non-serving evidence。
+无论等待多久，都不能替代 old runtime/writer fence。
 
 任何进入 V2 cohort 的 Endpoint 不得因签名、key、控制面故障静默 downgrade。回滚需要显式
 drain/Cold move 回 legacy cohort。完成条件是全部 Cat/Endpoint 离开 legacy cohort、完整
@@ -292,7 +306,7 @@ qualification 通过，随后删除 migration adapter 与所有旧路径。
 
 必须删除的旧路径包括：
 
-- unsigned RouteBinding 作为 Node authority；
+- ADR-0033 Route Grant V1 或 unsigned RouteBinding 作为 V2 Node authority；
 - Gateway 可传的 `target_port`/`route_epoch` proxy 字段或 WebSocket query；
 - Running HTTP 每请求控制面 work acquire/release；
 - WebSocket 控制面 lease renewal；
@@ -301,13 +315,13 @@ qualification 通过，随后删除 migration adapter 与所有旧路径。
 
 ## 威胁模型与处置
 
-| 威胁 | v1 防线 | 剩余边界 |
+| 威胁 | v2 防线 | 剩余边界 |
 |---|---|---|
 | Gateway 被攻陷 | 不能签发/改写；Node 校验全部 claims 与 local truth | 所持 grant 可在最多 125 秒内发起新 admission；已建连接需显式 revoke/drain |
 | token replay | short TTL；Node generation/epoch/runtime match | 同一有效 grant 内不做 per-request nonce DB；这是刻意的离线权衡 |
 | stale route / Node migration | route epoch、node id、generation；旧 Node cancel-and-drain 或外部 fence | TTL wait 单独不能证明 active stream 静默；客户端在旧连接被关闭后重连 |
 | 跨 Workspace/Cat/port | signed Workspace/Endpoint/Cat/port；Node exact match | 无通配 grant |
-| hostname ambiguity | 唯一 canonical ASCII hostname；严格 authority parser | V1 不接受 Unicode/IP/trailing-dot 等别名 |
+| hostname ambiguity | 唯一 canonical ASCII hostname；严格 authority parser | V2 不接受 Unicode/IP/trailing-dot 等别名 |
 | algorithm confusion | exact `alg=EdDSA`、`typ`、version、kid；unknown header fails | 不支持算法协商 |
 | malformed/duplicate claims | size/depth/type/duplicate/unknown/canonical checks先于使用 | parser 错误对 Gateway 统一，不暴露 verifier oracle |
 | signature malleability | 64-byte Ed25519 strict verify，拒绝 non-canonical S | 依赖 B0 向量校准所选 crypto backend |
@@ -374,7 +388,9 @@ registry 与版本化 key ring；部署和 cancel/drain/fence 顺序都成为安
   teardown/写 success result；drain 超时保留 Running source 和 writer，command 保持 blocked。
 - auto policy 必须用 `require_idle`：active HTTP/WS 返回 busy
   proof 且不 cancel、不 revoke、不创建 generation/command，零 guard 才 durable revoke/receipt 并按
-  exact snapshot promotion。Node/控制面在 revoke/receipt/promotion 边界崩溃必须 fail closed recovery。
+  exact snapshot promotion；该 receipt 只有与同一 Cat-first transaction 创建的 exact
+  `PolicyRetirementPromotionV2` 合在一起才授权 auto-generated Suspend，不另造 command receipt。
+  Node/控制面在 revoke/receipt/promotion 边界崩溃必须 fail closed recovery。
 - policy local revoke 后、promotion 前提交 manual command 的竞态必须生成 distinct command-scoped
   `cancel_and_drain` work 与 receipt，其 exact predecessor/outcome 为
   `retired_by_policy(P, retirement_token)` /

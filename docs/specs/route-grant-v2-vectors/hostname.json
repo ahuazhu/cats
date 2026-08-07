@@ -1,5 +1,5 @@
 {
-  "vector_version": 1,
+  "vector_version": 2,
   "cases": [
     { "input": "preview-0123456789ab.cats.run", "canonical": "preview-0123456789ab.cats.run" },
     { "input": "PREVIEW-0123456789AB.CATS.RUN", "canonical": "preview-0123456789ab.cats.run" },

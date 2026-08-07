@@ -1,17 +1,18 @@
-# Route Grant V1 wire protocol（冻结）
+# Route Grant V2 wire protocol（冻结）
 
-- 状态：Frozen v1（2026-08-06）；B0 只冻结契约，生产实现由 B1–B5 完成
-- 决策依据：[ADR-0033](../decisions/0033-short-lived-signed-route-grants.md)
-- 共同测试输入：[固定向量](route-grant-v1-vectors/README.md)
+- 状态：Frozen v2（2026-08-07）；B0 只冻结契约，生产实现由 B1–B5 完成
+- 决策依据：[ADR-0039](../decisions/0039-architecture-v2-route-grant-contract.md)
+- 共同测试输入：[固定向量](route-grant-v2-vectors/README.md)
 
 改变 compact bytes、字段、验签/时间语义、Node admission、cache 状态或 key 轮换顺序，必须先
-更新 ADR 并升 wire version。不得为了兼容旧 unsigned route 在 v1 parser 中增加可选分支。
+更新 ADR 并升 wire version。不得为了兼容 ADR-0033 Route Grant V1 或旧 unsigned route，在 v2
+parser 中增加可选分支。
 
 ## 1. 常量
 
 | 名称 | 值 | 说明 |
 |---|---:|---|
-| `WIRE_VERSION` | `1` | protected header 的整数 `v` |
+| `WIRE_VERSION` | `2` | protected header 的整数 `v`；已部署 ADR-0033 V1 必须拒绝 |
 | `ALGORITHM` | `EdDSA` | 仅 Ed25519；不做算法协商 |
 | `TYPE` | `cats-route-grant+jwt` | 防止与其他 JWS/JWT 混用 |
 | `ISSUER` | `cats-control-plane` | claims 的 `iss` |
@@ -49,11 +50,11 @@ BASE64URL(PROTECTED_HEADER) "." BASE64URL(CLAIMS) "." BASE64URL(SIGNATURE)
 
 ### 2.2 JSON profile
 
-Header 与 claims 都是 UTF-8 JSON object，但 v1 只允许下表列出的 member：
+Header 与 claims 都是 UTF-8 JSON object，但 v2 只允许下表列出的 member：
 
 - member 必须按本文表格给出的顺序出现；无 member 前后空白、冒号/逗号旁无空白；
 - 禁止重复、未知、缺失 member；禁止 BOM、浮点数、负数、指数、`null`、array、嵌套 object；
-- integer 使用最短十进制表示；所有 v1 string 限制为 ASCII，禁止 JSON escape；
+- integer 使用最短十进制表示；所有 v2 string 限制为 ASCII，禁止 JSON escape；
 - parser 必须在反序列化为 map/struct 前侦测 duplicate member，并将原始 bytes 与按本 profile
   重编码的 bytes 做 constant-content equality；不接受“语义等价”JSON。
 
@@ -68,12 +69,12 @@ exact member order 和约束如下：
 | 1 | `alg` | string | `EdDSA` |
 | 2 | `kid` | string | 64 lowercase hex；SHA-256(raw 32-byte Ed25519 public key) |
 | 3 | `typ` | string | `cats-route-grant+jwt` |
-| 4 | `v` | integer | `1` |
+| 4 | `v` | integer | `2` |
 
 canonical 示例：
 
 ```json
-{"alg":"EdDSA","kid":"21fe31dfa154a261626bf854046fd2271b7bed4b6abe45aa58877ef47f9721b9","typ":"cats-route-grant+jwt","v":1}
+{"alg":"EdDSA","kid":"21fe31dfa154a261626bf854046fd2271b7bed4b6abe45aa58877ef47f9721b9","typ":"cats-route-grant+jwt","v":2}
 ```
 
 `alg=none`、其他 EdDSA curve、embedded JWK、`crit`、`b64=false` 和未知 `kid` 均 fail closed。
@@ -96,12 +97,12 @@ exact member order 和 owner 如下。资源 id 必须是 1–128 bytes ASCII，
 | 9 | `iss` | string | exact `cats-control-plane` |
 | 10 | `nbf` | integer | 必须等于 `iat` |
 | 11 | `node_id` | string | C/G；目标 Node identity |
-| 12 | `protocol` | string | v1 exact `http`；WebSocket 是 HTTP Upgrade |
+| 12 | `protocol` | string | v2 exact `http`；WebSocket 是 HTTP Upgrade |
 | 13 | `route_epoch` | integer | B；`1..=2^63-1`，每次 authority 变化严格递增 |
 | 14 | `target_port` | integer | B/C；`1..=65535` |
 | 15 | `workspace_id` | string | ADR-0018 resource owner；opaque resource id |
 
-canonical claims 示例和完整 token 见 `positive.json`。v1 不包含 Guest IP、Node URL、用户 headers、
+canonical claims 示例和完整 token 见 `positive.json`。v2 不包含 Guest IP、Node URL、用户 headers、
 Cookie、wake policy 或任意通配 scope。Node URL 是 Gateway 的传输 hint，不是授权 claim；Guest
 IP/socket 从 Node local runtime truth 派生。
 
@@ -213,7 +214,7 @@ generation/lineage 不闭合或 current command 至少一项而拒签。Node loc
 之间即使 issuer 尚不可见，Node 也已经 fail closed 拒绝旧 token；recovery 必须收敛该短暂可用性缺口。
 
 V2 issuer 禁止读取 `cats.observed_state` 或 heartbeat observation 作为授权；前者只是迁移期 API
-projection，后者只是 observation。pre-activation V1 只能留在 legacy cohort，不能 mint v1
+projection，后者只是 observation。ADR-0033 Route Grant V1 只能留在 legacy cohort，不能 mint v2
 grant。`iat` 取 transaction 的整秒数据库时间；编码/签名不得再次读取或补写某个 claim。签名
 结束时若 `now >= exp`，丢弃结果。
 
@@ -487,9 +488,12 @@ lineage、Endpoint、Route epoch/install id/admission state，然后原子持久
 失败则 proposal/receipt terminal stale，绝不能 supersede 已前进 authority；恢复旧 Running 服务也
 必须用 fresh reducer route intent、更大 epoch 和 install CAS，不能把旧 local record 改回 active。
 
-proposal-scoped receipt 只授权该 proposal 的 promotion，不授权随后生成的 lifecycle command，更
-不授权并发 manual command。任何 current command 在 Guest quiesce 前都需要自己的 command-scoped
-receipt。若 Node 已有 proposal-scoped revoked authority，A0 manual command/NodeJob 必须先创建
+proposal-scoped receipt 本身只授权该 proposal 的 promotion，不直接授权任何 lifecycle command。
+A0 在同一个 Cat-first transaction 创建的 exact `PolicyRetirementPromotionV2` 将该 receipt 绑定到
+auto-generated Suspend command；receipt + promotion 合在一起是该 auto command 的 dispatch
+prerequisite，不需要也不得伪造第二张 command-scoped receipt。它们不授权并发 manual command。
+
+若 Node 已有 proposal-scoped revoked authority，A0 manual command/NodeJob 必须先创建
 distinct command-scoped `cancel_and_drain` route-retirement work，固定
 `predecessor=retired_by_policy(P, retirement_token)`；不得把 proposal work 改 owner 或只换 reason id。
 该 command retirement work 再执行 exact adoption CAS：
@@ -504,15 +508,16 @@ distinct command-scoped `cancel_and_drain` route-retirement work，固定
 4. exact replay 返回同一 adoption receipt；wrong command/lineage/epoch/scope 返回
    `retirement_adoption_mismatch` 并保持 command blocked。
 
-auto promotion 产生的 command 和在 receipt/promotion race 中先提交的 manual command 都必须走该
-协议。proposal receipt 如果因 manual command 而 terminal stale，仍可作为“old physical route 已
-revoke”的 immutable evidence，但不能完成 manual Operation/result。
+只有在 receipt/promotion race 中先提交的 manual command 走该 adoption 协议。auto promotion 产生的
+command 携带 exact policy receipt + `PolicyRetirementPromotionV2`；proposal receipt 如果因 manual
+command 而 terminal stale，仍可作为“old physical route 已 revoke”的 immutable evidence，但不能完成
+manual Operation/result。
 
 Node 上的 receipt creation 由 per-Cat lock 串行；控制面 receipt ingestion 与 compensation apply 则在
 Cat-first transaction 中锁定同一 materialized Route row，并以
 `pending_policy_retirement(P, retirement_token, old_epoch, old_install, old_lineage)` 为 exact predecessor
 做唯一 CAS。command adoption 将其改成 `adopted_by_command(command_id, receipt_id)`；compensation 将其
-改成 `compensated_by_route(compensation_intent_id, new_epoch)`。loser 必须回滚整个 transaction，从
+改成 `compensated_by_route(compensation_intent_id, fresh_epoch)`。loser 必须回滚整个 transaction，从
 fresh Cat/Route snapshot 重试，不得只重放旧 receipt。
 
 无 command 时的补偿 owner 冻结为：proposal 仍 eligible 则 policy controller 重试 promotion；
@@ -572,6 +577,10 @@ Node ring 是版本化、持久化的 `{kid -> raw Ed25519 public key, state}` �
 sorted-key digest 与每个 fingerprint。Gateway 没有 key ring，Control Plane private key 不离开
 signer/KMS 边界。
 
+ADR-0033 V1 对 SPKI DER 求 `kid`，V2 对 raw 32-byte key 求 `kid`；两者是带 scheme/version 标签的
+不同 identity namespace。相同 public key 的两个 digest 不能直接比较，V1 registration fingerprint
+也不能充当 V2 verifier-ring coverage evidence。
+
 轮换必须 verifier-first：staged verifier 覆盖全部目标 V2 Node并有证据 → signer switch → 双 key
 overlap 至少从最后一次旧 key 签发后 125 秒 → retire。rollback 只能切到仍部署的 key；ring
 removal 只停止新 admission。incident 若要终止已有会话还必须 epoch-aware cancel-and-drain；
@@ -581,7 +590,7 @@ removal 只停止新 admission。incident 若要终止已有会话还必须 epoc
 
 | 旧路径 | V2 replacement | 删除门禁 |
 |---|---|---|
-| unsigned `RouteBinding` authority | compact signed grant + Node local truth | B1–B3 contract tests green |
+| ADR-0033 Route Grant V1 / unsigned `RouteBinding` authority | V2 compact grant + Node local truth | B1–B3 contract tests green |
 | Gateway `target_port`/`route_epoch` 字段 | signed claims；Node local-derived target | V2 Node/Gateway qualification |
 | WebSocket route query fields | `Cats-Route-Grant` header | Upgrade/expiry/active-revoke evidence |
 | HTTP per-request work acquire/release | epoch-aware Node activity guard | lifecycle/revoke/drain race tests |
@@ -591,8 +600,10 @@ removal 只停止新 admission。incident 若要终止已有会话还必须 epoc
 
 迁移期间 legacy 与 V2 由显式 Node capability 和独立 Gateway cohort 隔离。Cat 只以 Cold move、new
 generation/new epoch 进入 V2；V2 失败绝不 request-level downgrade。全部目标完成 qualification 后
-删除 migration adapter，不保留永久兼容层。Multi-AZ 继续是 #179 的 deferred scope，本协议不把
-短期离线窗口宣称为 Multi-AZ HA。
+删除 migration adapter，不保留永久兼容层。V2 的 125 秒窗口不适用于 ADR-0033 V1：legacy wire
+允许最大 300 秒 TTL 与 5 秒 skew，删除 legacy verifier/cohort 前必须完成 old-route drain/fence，
+并等待最后一次 V1 签发后的实际配置上限（硬上限 305 秒）或取得独立等价 evidence。Multi-AZ
+继续是 #179 的 deferred scope，本协议不把短期离线窗口宣称为 Multi-AZ HA。
 
 ## 14. Observability 与敏感信息
 
