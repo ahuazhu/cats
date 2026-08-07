@@ -153,7 +153,7 @@ impl NodeRuntime {
         };
         // The final state is settled here — `run_action` returned and the
         // generation/metering step has run — so this is the one place the
-        // runtime ledger is written (ADR-0028 §1). Doing it here rather than at
+        // runtime ledger is written (legacy-ledger characterization CH-01/CH-02). Doing it here rather than at
         // the individual `cats` mutation sites is what keeps intermediate states
         // (the Running -> Suspended -> Running bounce inside `suspend_cat`, for
         // example) out of the record. Failed jobs are recorded too: a failure

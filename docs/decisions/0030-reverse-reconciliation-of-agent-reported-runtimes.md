@@ -3,8 +3,8 @@
 - 状态：Proposed
 - 日期：2026-08-05
 - 范围：心跳中 agent 上报 inventory 的持久化与暴露、孤儿 runtime 的口径、`node drain` 的完成条件、worker 发布闸门的判定来源、以及丢弃不可发布 journal 的权限归属。
-- 不含：agent 端 adoption 与 ledger（ADR-0028 阶段 1–4，已落地）、per-Cat systemd scope 与
-  `KillMode`（ADR-0028 §6，#86/#186）、adoption 拒绝后 residue 的清理（另行处理）。
+- 不含：agent 端现有 adoption/legacy ledger、per-Cat systemd scope 与终态事务边界
+  （ADR-0040、#86/#186）、adoption 拒绝后 residue 的清理（另行处理）。
 
 > Architecture V2 关系：`reported_cats_json` 是 V1 的 observation 投影，不是生命周期
 > authority。A8 按 ADR-0035 以归一化 observation 取代它；heartbeat 不得结算 command、
@@ -32,9 +32,10 @@
    cats-worker`（当时单元未设 `KillMode`，默认 control-group）连 journal 持有者一起杀掉
    （太松，丢数据）。在 relaxed 卷 `R < L` 时那份本地 journal 是唯一权威副本。
 
-产生这批孤儿的根因（agent inventory 只在内存，#87）已由 ADR-0028 阶段 1–4（#88）
-修复：重启的 agent 重新 adopt 可证明的 runtime 并在心跳中上报。但上报之后控制面
-仍然丢弃——本 ADR 补上这半边。
+产生这批孤儿的根因（agent inventory 只在内存，#87）已由现有 ledger/adoption 实现
+（#88）修复：重启的 agent 重新 adopt 可证明的 runtime 并在心跳中上报。但上报之后
+控制面仍然丢弃——本 ADR 补上这半边。该 legacy ledger 的终态替换与删除由 ADR-0040
+和 #207 定义，不在本文恢复第二套权威。
 
 逐个停止 13 个孤儿的结果对设计有直接约束：8 个被 fencing 拒绝
 （`root CAS conflict`，root 已被更高 generation 取代，本地 journal 过期、不得发布），
@@ -108,5 +109,5 @@ drain 不会把 fencing 拒绝升级为丢弃。`root CAS conflict` 证明该 jo
   不是缺陷：卡住且可见，好过 cordon 谎报干净。
 - 闸门变严：任何存活 blockd（包括合法的 publish-image）都会挡住发布。发布本来就
   要求空闲节点，误伤面可接受。
-- ADR-0028 §6 落地（进程移入 per-Cat scope）后，计量 cgroup 走查在满载节点上会读
+- ADR-0040 §4 落地（进程移入 per-Cat scope）后，计量 cgroup 走查在满载节点上会读
   空，进程表扫描成为闸门的主要判定，本 ADR 的第 5 条先行铺好了这一步。

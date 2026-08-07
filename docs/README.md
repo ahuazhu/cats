@@ -69,5 +69,6 @@ Fleet 管理员指南不属于官网用户文档。其双语源文件位于
 - [ADR-0009：交互式 Shell 使用受鉴权的 WebSocket PTY 流](decisions/0009-interactive-shell-over-authenticated-websocket.md)
 - [ADR-0010：每个 Cat 默认获得稳定 HTTP Endpoint](decisions/0010-default-http-endpoint-per-cat.md)
 - [ADR-0024：按 digest 固定的 OCI Bundle Deploy，不引入 Docker/OverlayFS](decisions/0024-digest-pinned-oci-bundle-deploy.md)
+- [ADR-0040：Node runtime ownership 的终态事务边界](decisions/0040-terminal-durable-runtime-ownership.md)
 
 后续发生会改变数据格式、公开 API、故障语义或组件边界的决定时，应新增 ADR，而不是直接覆盖实验结论。

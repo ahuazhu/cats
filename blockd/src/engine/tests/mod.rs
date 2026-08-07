@@ -74,8 +74,8 @@ fn write_read_roundtrip_and_holes() {
     e.detach().unwrap();
 }
 
-/// ADR-0028 §3: a restarted node agent may only re-adopt a live `cats-blockd`
-/// if the process self-reports, over the control protocol, the volume and
+/// The ADR-0040 §6 adoption proof requires a restarted node agent to re-adopt a
+/// live `cats-blockd` only if the process self-reports the volume and
 /// attachment the agent started it for. `status` serializes exactly this
 /// payload, so the identity has to survive the wire encoding.
 #[test]

@@ -1,5 +1,5 @@
 //! Re-adopting the processes this node started, after the agent restarts
-//! (ADR-0028 §3).
+//! (ADR-0040 §6 adoption proof).
 //!
 //! The ledger says what this node last started. It is not, by itself, evidence
 //! that those processes are still there: pids are recycled, hosts reboot, and a
@@ -30,7 +30,7 @@
 //!   relaxed volume those journals are the only authoritative copy of the
 //!   unpublished writes (ADR-0021/0022).
 //! - `Warm`: nothing is alive at all and the facts are files, so the proof is
-//!   made entirely on disk — and the boot-id gate does not apply (ADR-0028 §3).
+//!   made entirely on disk — and the boot-id gate does not apply (ADR-0040 §6 adoption proof).
 //!
 //! Anything less is residue: reported, logged, and otherwise left exactly as
 //! found. Adoption never kills, drains, or deletes — a Cat this node cannot
@@ -42,7 +42,7 @@
 //! Residue must also stay out of [`NodeRuntime::snapshot`], which is what the
 //! heartbeat reports. Omitting a Cat leaves the node Lost, which is recoverable;
 //! reporting it as `Cold` would tell the control plane the disk was released
-//! while a blockd may still hold its lease (ADR-0028 §7).
+//! while a blockd may still hold its lease (ADR-0040 §6 fail-closed rule).
 
 use super::ledger::{BlockdRecord, CatLedgerRecord, ChRecord};
 use super::*;
@@ -52,7 +52,7 @@ use crate::proc::{host_boot_id, ProcIdentity};
 /// What one [`NodeRuntime::adopt_from_ledger`] pass concluded.
 ///
 /// Summarised into the startup log by `server::spawn`, which is where an
-/// operator recovering a node reads which Cat is blocking it (ADR-0028 §5).
+/// operator recovering a node reads which Cat is blocking it (ADR-0040 §6).
 pub(crate) struct AdoptionOutcome {
     /// Cat ids now present in `NodeRuntime::cats`.
     pub adopted: Vec<String>,
@@ -132,7 +132,7 @@ impl NodeRuntime {
         Ok(())
     }
 
-    /// The ADR-0028 §3 proof, dispatched on the recorded state. `Ok` means
+    /// The ADR-0040 §6 adoption proof, dispatched on the recorded state. `Ok` means
     /// every step that applies to that state passed and the returned runtime
     /// describes exactly what this node left behind.
     fn proven_runtime(
@@ -262,7 +262,7 @@ fn proven_resident_runtime(
 /// the ledger record is written only after the job settles, so a Warm record has
 /// no Guest and an empty blockd list. Everything left to prove is on local disk.
 ///
-/// The boot-id gate deliberately does not apply here (ADR-0028 §3). It exists to
+/// The boot-id gate deliberately does not apply here (ADR-0040 §6 adoption proof). It exists to
 /// reject recorded pids after a reboot, and Warm records none: its snapshot,
 /// memory backing and journals are files, which a reboot does not invalidate.
 /// Gating Warm on the boot id would discard every restorable Warm Cat the first
@@ -377,7 +377,7 @@ fn ch_runtime(record: &ChRecord) -> ChRuntime {
     }
 }
 
-/// ADR-0028 §3 step 3 for the Guest half, which is the one part of the proof
+/// The ADR-0040 §6 adoption proof step 3 for the Guest half, which is the one part of the proof
 /// that depends on the recorded state.
 fn proven_guest_identity(record: &CatLedgerRecord, ch: Option<&ChRuntime>) -> Result<()> {
     match record.state {
@@ -411,7 +411,7 @@ fn proven_guest_identity(record: &CatLedgerRecord, ch: Option<&ChRuntime>) -> Re
             // guest-agent process itself, and a stopped process answers nothing
             // on any channel — there is no second party here that could speak
             // for it. Process identity plus the blockd handshakes are the whole
-            // of the available evidence. ADR-0028 §6 already accepts the weaker
+            // of the available evidence. ADR-0040 §4 accepts the weaker
             // identity on this path; it never carries production workload.
             None => Ok(()),
         },
@@ -424,7 +424,7 @@ fn proven_guest_identity(record: &CatLedgerRecord, ch: Option<&ChRuntime>) -> Re
     }
 }
 
-/// ADR-0028 §3 step 3 for a Suspended VMM: one `vm.info` shows both that the
+/// The ADR-0040 §6 adoption proof step 3 for a Suspended VMM: one `vm.info` shows both that the
 /// recorded VMM process is serving the recorded API socket and that it holds the
 /// VM in the state the record claims.
 fn proven_paused_vm(api_sock: &Path) -> Result<()> {
@@ -451,7 +451,7 @@ fn proven_paused_vm(api_sock: &Path) -> Result<()> {
     Ok(())
 }
 
-/// ADR-0028 §3 step 2: the pid must still name the exact process recorded.
+/// The ADR-0040 §6 adoption proof step 2: the pid must still name the exact process recorded.
 fn proven_process(recorded: &ProcIdentity) -> Result<ProcHandle> {
     let live = ProcIdentity::sample(recorded.pid);
     anyhow::ensure!(
@@ -482,11 +482,11 @@ fn proven_process(recorded: &ProcIdentity) -> Result<ProcHandle> {
     Ok(handle)
 }
 
-/// ADR-0028 §3 step 3 for one blockd: it has to name the volume it holds.
+/// The ADR-0040 §6 adoption proof step 3 for one blockd: it has to name the volume it holds.
 fn proven_blockd_identity(record: &BlockdRecord) -> Result<()> {
     let status = BlockdProc::status_at(&record.control_socket, &record.grant.disk_id)
         .context("read the blockd control status")?;
-    // A `cats-blockd` older than ADR-0028 leaves both fields empty. It may well
+    // A `cats-blockd` older than the volume-identity handshake leaves both fields empty. It may well
     // be ours, but it cannot show that it is, and binding a live blockd to a
     // volume on a pid match alone is exactly the mistake this proof exists to
     // prevent. Refusing is the safe default.

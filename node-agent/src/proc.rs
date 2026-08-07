@@ -3,7 +3,7 @@
 //!
 //! A process this agent forked is a `std::process::Child`: it can be waited on
 //! and reaped. A process the agent *adopts* — recovered by pid after an agent
-//! restart (ADR-0028 §3) — is not a child of this process, so `waitpid` would
+//! restart (ADR-0040 §6 adoption proof) — is not a child of this process, so `waitpid` would
 //! fail with `ECHILD` and its exit has to be observed by probing the pid
 //! instead. Both kinds appear on the same supervision paths (guest/VMM and
 //! `cats-blockd`), so they share one type rather than splitting every call site.
@@ -35,7 +35,7 @@ pub(crate) enum ProcHandle {
     /// does not.
     ///
     /// The start ticks recorded at adoption travel with the pid on purpose
-    /// (ADR-0028 §3). Adoption and teardown can be hours apart; an adopted
+    /// (ADR-0040 §6 adoption proof). Adoption and teardown can be hours apart; an adopted
     /// process is not this agent's child, so the moment it exits the kernel may
     /// hand its pid to something unrelated. Signalling on the pid alone would
     /// then kill a stranger's process, so every signal is re-proved against
@@ -149,7 +149,7 @@ fn signal_pid(pid: u32, sig: i32) {
 ///
 /// Off Linux, and for a record written without start ticks, both sides are
 /// `None` and this is a no-op — the dev path has no `/proc` to sample
-/// (ADR-0028 §6). Anywhere the sample fails while a value was recorded, the
+/// (ADR-0040 §4). Anywhere the sample fails while a value was recorded, the
 /// answer is "not the same process", which is the fail-closed side: the caller
 /// then refuses to signal rather than risk a recycled pid.
 fn is_recorded_process(pid: u32, start_ticks: Option<u64>) -> bool {
@@ -217,7 +217,7 @@ fn sample_start_ticks(pid: u32) -> Option<u64> {
 }
 
 /// Dev and macOS hosts have no `/proc`, so process identity is weaker there.
-/// ADR-0028 §6 accepts that: those paths never carry production workload.
+/// ADR-0040 §4 accepts that: those paths never carry production workload.
 #[cfg(not(target_os = "linux"))]
 fn sample_start_ticks(_pid: u32) -> Option<u64> {
     None
@@ -250,7 +250,7 @@ fn parse_start_ticks(stat: &str) -> Option<u64> {
 }
 
 /// Identity of the current host boot. Used to reject every recorded pid at once
-/// after a host reboot (ADR-0028 §3 step 1).
+/// after a host reboot (ADR-0040 §6 adoption proof step 1).
 pub(crate) fn host_boot_id() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
@@ -277,7 +277,7 @@ mod tests {
             .expect("spawn test process")
     }
 
-    /// Adopt a live process the way the ADR-0028 §3 proof does: with the start
+    /// Adopt a live process using the ADR-0040 §6 proof: with the start
     /// ticks sampled from the pid itself.
     fn adopt(pid: u32) -> ProcHandle {
         ProcHandle::Adopted {
@@ -360,7 +360,7 @@ mod tests {
         wait_until_exited(&mut adopted);
     }
 
-    /// ADR-0028 §3: an adopted process can exit long after adoption and the
+    /// The ADR-0040 §6 adoption proof: an adopted process can exit long after adoption and the
     /// kernel can hand its pid to something unrelated. Neither `signal` nor
     /// `kill_and_reap` may touch a pid whose start ticks have moved.
     #[test]

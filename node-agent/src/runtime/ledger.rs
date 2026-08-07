@@ -1,4 +1,4 @@
-//! Crash-safe, versioned record of what this node last started (ADR-0028 §1).
+//! Crash-safe, versioned record of what this node last started (legacy-ledger characterization CH-01/CH-02).
 //!
 //! `NodeRuntime.cats` is process-local, so an agent restart loses every fact
 //! needed to re-adopt the Cloud Hypervisor and `cats-blockd` processes that are
@@ -7,7 +7,7 @@
 //! This module persists those facts under `<state_dir>/runtime-ledger/`, one
 //! JSON record per Cat.
 //!
-//! The ledger is *local fact only* (ADR-0028 §2). It answers "what did this
+//! The ledger is *local fact only* (ADR-0040 §1 local-authority boundary). It answers "what did this
 //! node last start"; it never grants, extends or revives a storage write right,
 //! and it carries no object-store or metadata-store credentials. Regaining
 //! write access still goes through the MetadataStore lease/epoch CAS.
@@ -273,7 +273,8 @@ fn ledger_file_stem(cat_id: &str) -> Result<&str> {
 
 /// Wall-clock milliseconds for `updated_at_ms`.
 ///
-/// Diagnostic only: none of the ADR-0028 §3 identity checks depend on it, so an
+/// Diagnostic only: none of the identity checks in the ADR-0040 §6 adoption
+/// proof depend on it, so an
 /// unreadable clock is recorded as 0 rather than failing an otherwise good
 /// write.
 fn now_unix_ms() -> i64 {
@@ -304,7 +305,7 @@ impl NodeRuntime {
         if let Err(error) = self.ledger.put(&record) {
             // A failed write must not fail the job. The ledger is a local
             // recovery aid and explicitly not a source of authority
-            // (ADR-0028 §2), so tearing down a healthy running Cat because a
+            // (ADR-0040 §1 local-authority boundary), so tearing down a healthy running Cat because a
             // JSON file could not be written would be strictly worse than
             // losing the ability to re-adopt it later.
             tracing::error!(cat = %cat_id, "writing the node runtime ledger record failed: {error:#}");

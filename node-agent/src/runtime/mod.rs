@@ -17,7 +17,7 @@
 //! is itself idempotent at the process level.
 
 /// Crate-visible, unlike its sibling modules: the startup path that scans the
-/// local inventory before registering with the control plane (ADR-0028 §5)
+/// local inventory before registering with the control plane (ADR-0040 §6)
 /// lives outside `runtime`.
 pub(crate) mod adopt;
 mod blockd_control;
@@ -330,7 +330,7 @@ const VOLUME_DIR_PREFIX: &str = "vol-";
 ///
 /// Spawn, teardown, the runtime ledger and re-adoption all name this directory,
 /// and re-adoption only accepts a record whose recorded `data_dir` still exists
-/// (ADR-0028 §3 step 4). Four independent spellings of the same `format!` would
+/// (ADR-0040 §6 adoption proof step 4). Four independent spellings of the same `format!` would
 /// make that check silently vacuous the first time one of them drifted, so
 /// there is exactly one.
 fn volume_data_dir(cat_dir: &Path, disk_id: &str) -> PathBuf {
@@ -340,7 +340,7 @@ fn volume_data_dir(cat_dir: &Path, disk_id: &str) -> PathBuf {
 /// Where a FakeVmm Cat's Guest state is saved when it goes Warm.
 ///
 /// Written by `warm_cat`, required by `restore_cat` before it will restore, and
-/// checked by re-adoption's Warm proof (ADR-0028 §3) — one spelling, for the
+/// checked by re-adoption's Warm proof (ADR-0040 §6 adoption proof) — one spelling, for the
 /// same reason [`volume_data_dir`] has one.
 fn warm_state_file(cat_dir: &Path) -> PathBuf {
     cat_dir.join("warm-state.json")
@@ -446,7 +446,7 @@ pub struct NodeRuntime {
     cat_ops: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     cats: Mutex<HashMap<String, CatRuntime>>,
     /// On-disk mirror of `cats`, rewritten once per job after the final state
-    /// has settled (ADR-0028 §1). Local recovery aid only: it never grants a
+    /// has settled (legacy-ledger characterization CH-01/CH-02). Local recovery aid only: it never grants a
     /// storage write right and is never consulted for authority.
     ledger: Ledger,
     journal: Mutex<HashMap<String, NodeJobResult>>,

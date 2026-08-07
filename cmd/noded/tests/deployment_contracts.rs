@@ -81,22 +81,6 @@ fn node_agent_does_not_orphan_runtimes_without_a_crash_safe_ledger() {
         );
     }
 
-    let adr =
-        read_workspace_file("docs/decisions/0028-node-runtime-ledger-and-in-place-reattach.md");
-    for stale_claim in [
-        "- Agent 升级与重启不再杀掉 Guest",
-        "- `systemctl stop cats-noded` 不再停止 Guest",
-    ] {
-        assert!(
-            !adr.contains(stale_claim),
-            "ADR-0028 must not claim runtime survival while the units retain control-group kill semantics: {stale_claim}"
-        );
-    }
-    assert!(
-        adr.contains("`KillMode=control-group`") && adr.contains("cats=0 orphans=0"),
-        "ADR-0028 must describe the current stop semantics and idle prerequisite"
-    );
-
     let metal_readme = read_workspace_file("deploy/metal/README.md");
     let first_install = metal_readme
         .find("仅限首次安装、尚未创建任何 Cat")
