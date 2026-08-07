@@ -3,9 +3,8 @@
 - 状态：Proposed
 - 日期：2026-08-05
 - 范围：心跳中 agent 上报 inventory 的持久化与暴露、孤儿 runtime 的口径、`node drain` 的完成条件、worker 发布闸门的判定来源、以及丢弃不可发布 journal 的权限归属。
-- 不含：agent 端 adoption 与 ledger（ADR-0028 阶段 1–4，已落地）、per-Cat systemd scope
-  （ADR-0028 §6 后续阶段；`KillMode=process` 由 #86 落地）、adoption 拒绝后 residue 的清理
-  （另行处理）。
+- 不含：agent 端 adoption 与 ledger（ADR-0028 阶段 1–4，已落地）、per-Cat systemd scope 与
+  `KillMode`（ADR-0028 §6，#86/#186）、adoption 拒绝后 residue 的清理（另行处理）。
 
 ## 背景
 
