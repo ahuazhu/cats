@@ -105,6 +105,7 @@ class BuildHostBoundaryTests(unittest.TestCase):
 
         runner = self.text("bootstrap/run-build.sh")
         self.assertIn(f"PATH={build_path}", runner)
+        self.assertIn("RUST_TEST_THREADS=4", runner)
 
     def test_bootstrap_refreezes_toolchain_after_success_and_failure(self) -> None:
         bootstrap = self.text("bootstrap/bootstrap.sh")

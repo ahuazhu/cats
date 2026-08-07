@@ -131,6 +131,7 @@ build_environment=(
   USER=cats-build
   LOGNAME=cats-build
   PATH=/opt/cats-build/cargo/bin:/usr/local/bin:/usr/bin:/usr/sbin
+  RUST_TEST_THREADS=4
   CARGO_HOME="${job_dir}/cargo-home"
   RUSTUP_HOME=/opt/cats-build/rustup
   CARGO_TARGET_DIR="${job_dir}/cargo-target"
