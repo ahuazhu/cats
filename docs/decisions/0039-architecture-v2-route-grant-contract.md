@@ -3,9 +3,9 @@
 - 状态：Accepted
 - 日期：2026-08-07
 - 关联：ADR-0002（生命周期四态）、ADR-0010（默认 HTTP Endpoint）、
-  ADR-0018（Workspace 是唯一资源所有者）、ADR-0028（Node runtime ledger）、
-  ADR-0031/0032（PostgreSQL 控制权威与多副本）、
-  ADR-0033（被本文取代的早期 Route Grant 实现）、ADR-0035（A0 LifecycleCommand V2）；
+  ADR-0018（Workspace 是唯一资源所有者）、ADR-0031/0032（PostgreSQL 控制权威与多副本）、
+  ADR-0033（被本文取代的早期 Route Grant 实现）、ADR-0035（A0 LifecycleCommand V2）、
+  ADR-0040（终态 Node runtime ownership）；
   Architecture V2 #204、Epic B #206、B0 #216
 
 ## 背景

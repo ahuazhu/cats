@@ -3,9 +3,9 @@
 - Status: Accepted
 - Date: 2026-08-06
 - Relates to: ADR-0002 (lifecycle states), ADR-0022/0025 (durability and
-  destroy), ADR-0028 (Node runtime ledger), ADR-0030 (reported runtime
-  reconciliation), ADR-0032 (multi-replica control plane), ADR-0034 (bounded
-  PostgreSQL connections); issue #223
+  destroy), ADR-0030 (reported runtime reconciliation), ADR-0032
+  (multi-replica control plane), ADR-0034 (bounded PostgreSQL connections),
+  ADR-0040 (terminal durable Node runtime ownership); issue #223
 - Protocol: [`Lifecycle command and NodeJob V2`](../specs/lifecycle-command-v2.md)
 - Qualification: [`Lifecycle authority characterization matrix`](../lifecycle-authority-characterization-test-matrix.md)
 
