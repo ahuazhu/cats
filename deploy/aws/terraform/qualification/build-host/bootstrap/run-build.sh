@@ -155,6 +155,7 @@ systemd-run --quiet --wait --collect --pipe \
   --property=PrivateTmp=true \
   --property=PrivateIPC=true \
   --property=NoNewPrivileges=true \
+  --property=LimitNOFILE=65536 \
   /usr/bin/env -i "${build_environment[@]}" \
   bash -c 'cd /srv/cats-build/source && exec "$@"' cats-run-build "$@" || status=$?
 

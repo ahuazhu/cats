@@ -293,6 +293,7 @@ thaw_toolchain
         self.assertIn("--property=PrivateTmp=true", runner)
         self.assertIn("--property=PrivateIPC=true", runner)
         self.assertIn("--property=NoNewPrivileges=true", runner)
+        self.assertIn("--property=LimitNOFILE=65536", runner)
         self.assertNotIn("/usr/sbin/runuser", runner)
         self.assertIn("bootstrap_payload_sha256", runner)
         self.assertIn('chown root:root "${job_dir}"', runner)

@@ -128,11 +128,11 @@
         "immutable_receipt": "c70f6eacb73ba2bea4530dca743c4f7e38eb328af6d1644406a24dd8a85adf54",
           "publish": "9d2b96f35166281a56ae579126a397dd171afd0d5645d801450d36746817293d",
           "readiness": "1c0a7c220e32891213366b7b174cdb966530937603ed21619cfe4adff8ea77d7",
-          "run_build": "c7c69a0d216b5718b390c040374ac82fd90cc24874a475f50fbdb871ee2d9547",
+          "run_build": "36536f656fbbb83639cd991d3cc8e0999d880694a88b5f874aa43301dd0eef20",
         "stage_output": "13aee4e5a106072cd2ef4cf43ea3f3e95d57d93d4140024ca40a93f52ed60a7a",
           "toolchain_lock": "5884719764338b75cb42012ad97c48df9a035435b0f5de706af9be4058fd220c"
         },
-        "payload_sha256": "3d8fea7733d278d432b15e25c67271e12a53fff83f5504f0835b7d386f9764c2",
+        "payload_sha256": "c7822adb3bd17120a75619b30f65eef185c7739fe4159b034e2fbc585e23930d",
         "apt_snapshot_id": "20260801T000000Z"
       },
       "source_policy": {
