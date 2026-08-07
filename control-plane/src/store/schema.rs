@@ -153,12 +153,16 @@ fn ensure_schema(client: &mut Client) -> Result<()> {
     Ok(())
 }
 
-/// Bumped on every schema change. The PostgreSQL store starts its own ladder:
+/// Bumped on every incompatible schema change. The PostgreSQL store starts its own ladder:
 /// version 1 is the v5 SQLite layout re-expressed in PostgreSQL, and there is
 /// deliberately no SQLite import path (decided with #103: the pre-cutover data
 /// is not carried over). `connect` upgrades a database stamped inside
 /// `[OLDEST_MIGRATABLE_SCHEMA_VERSION, SCHEMA_VERSION]` in place and refuses
 /// anything else.
+// Route Grant rollout metadata is an expand-only addition: the v1 binary
+// ignores the nullable Node column and the new table, so retaining stamp 1 is
+// what keeps an application rollback startable during the mixed-version
+// rollout. A future contract migration must bump this value.
 pub(super) const SCHEMA_VERSION: i64 = 1;
 
 /// The oldest stamped version `Store::connect` can still upgrade in place.
@@ -169,6 +173,13 @@ CREATE TABLE IF NOT EXISTS control_schema_version (
     singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
     version BIGINT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS route_grant_rollout_state (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    legacy_admission_open BOOLEAN NOT NULL
+);
+INSERT INTO route_grant_rollout_state (singleton, legacy_admission_open)
+VALUES (TRUE, TRUE)
+ON CONFLICT (singleton) DO NOTHING;
 CREATE TABLE IF NOT EXISTS accounts (
     id TEXT PRIMARY KEY,
     slug TEXT NOT NULL UNIQUE,
@@ -288,8 +299,11 @@ CREATE TABLE IF NOT EXISTS nodes (
     last_heartbeat_ms BIGINT NOT NULL,
     telemetry_json TEXT,
     scheduling_disabled BOOLEAN NOT NULL DEFAULT FALSE,
-    reported_cats_json TEXT
+    reported_cats_json TEXT,
+    route_grant_public_key_sha256 TEXT
 );
+ALTER TABLE nodes
+    ADD COLUMN IF NOT EXISTS route_grant_public_key_sha256 TEXT;
 CREATE TABLE IF NOT EXISTS operations (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),

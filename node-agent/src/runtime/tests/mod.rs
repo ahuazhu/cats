@@ -233,6 +233,8 @@ fn proxy_request_preserves_method_path_headers_and_body() {
         body: br#"{"name":"cat"}"#.to_vec(),
         target_port: 8080,
         route_epoch: 7,
+        hostname: "dev.cats.run".to_string(),
+        route_grant: "opaque".to_string(),
     };
     let raw = build_guest_http_request(&request).unwrap();
     let text = String::from_utf8(raw).unwrap();
@@ -242,6 +244,58 @@ fn proxy_request_preserves_method_path_headers_and_body() {
     assert!(text.contains("x-cats-route-epoch: 7\r\n"));
     assert!(!text.contains("keep-alive"));
     assert!(text.ends_with(r#"{"name":"cat"}"#));
+}
+
+#[test]
+fn proxy_rejects_a_signed_generation_that_is_not_the_local_runtime() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = NodeRuntime::new(stub_node_config(temp.path(), VmmMode::Fake)).unwrap();
+    runtime.cats.lock().unwrap().insert(
+        "cat-a".to_string(),
+        test_runtime(ObservedState::Running, temp.path().join("metering")),
+    );
+    let request = ProxyHttpRequest {
+        method: "GET".to_string(),
+        path: "/".to_string(),
+        headers: Vec::new(),
+        body: Vec::new(),
+        target_port: 8080,
+        route_epoch: 7,
+        hostname: "dev.cats.run".to_string(),
+        route_grant: "verified-by-server".to_string(),
+    };
+
+    let error = runtime.proxy_http("cat-a", 2, &request).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("local generation 1"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn an_admitted_endpoint_request_fences_suspend_until_its_guard_drops() {
+    let activity = Arc::new(RuntimeActivity::default());
+    let guard = activity.acquire().unwrap();
+    assert!(
+        is_activity_changed(&activity.prepare().unwrap_err()),
+        "Suspend must reject while a request or WebSocket owns the local guard"
+    );
+
+    drop(guard);
+    let sequence = activity.prepare().unwrap();
+    let Err(error) = activity.acquire() else {
+        panic!("a request bypassed the quiescing gate")
+    };
+    assert!(
+        is_activity_changed(&error),
+        "a request arriving after quiesce begins must not bypass Suspend"
+    );
+    assert!(
+        !activity.unchanged_since(sequence),
+        "the rejected arrival must change the sequence so Suspend rechecks and aborts"
+    );
+    activity.open();
+    drop(activity.acquire().unwrap());
 }
 
 #[test]

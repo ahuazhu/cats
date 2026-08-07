@@ -823,6 +823,193 @@ fn refuses_a_database_stamped_with_another_schema_version() {
 }
 
 #[test]
+fn expands_v1_route_grant_metadata_without_breaking_the_rollback_stamp() {
+    let url = crate::testsupport::isolated_control_store_url();
+    drop(Store::connect(&url, None).unwrap());
+    {
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        admin
+            .batch_execute(
+                "ALTER TABLE nodes DROP COLUMN route_grant_public_key_sha256;
+                 DROP TABLE route_grant_rollout_state;
+                 UPDATE control_schema_version SET version = 1;",
+            )
+            .unwrap();
+    }
+
+    let store = Store::connect(&url, None).expect("upgrade the stamped v1 schema");
+    store
+        .register_node_with_admission(
+            "node-keyed",
+            "http://node",
+            "http://gateway",
+            4,
+            8192,
+            NodeAdmission::for_route_grant(false, Some("abc123"), "abc123"),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .get_node("node-keyed")
+            .unwrap()
+            .route_grant_public_key_sha256
+            .as_deref(),
+        Some("abc123")
+    );
+    let stamped = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT version FROM control_schema_version WHERE singleton",
+                    &[],
+                )
+                .map(|row| row.get::<_, i64>(0))
+        })
+        .unwrap();
+    assert_eq!(stamped, SCHEMA_VERSION);
+    assert_eq!(
+        stamped, 1,
+        "the expand-only Route Grant metadata must remain startable by the v1 application"
+    );
+}
+
+#[test]
+fn route_grant_legacy_admission_phase_closes_once_and_rejects_downgrades() {
+    let store = test_store();
+    let expected = "a".repeat(64);
+    store
+        .register_node(
+            "legacy-existing",
+            "http://node",
+            "http://gateway",
+            4,
+            8192,
+            false,
+        )
+        .unwrap();
+    store
+        .register_node_with_admission(
+            "legacy-existing",
+            "http://node",
+            "http://gateway",
+            4,
+            8192,
+            NodeAdmission::for_route_grant(false, None, &expected),
+        )
+        .unwrap();
+    assert_eq!(
+        store.get_node("legacy-existing").unwrap().state,
+        NodeState::Ready,
+        "the one-time additive rollout must preserve an already-Ready legacy Node"
+    );
+
+    store
+        .register_node_with_admission(
+            "fresh-legacy",
+            "http://node",
+            "http://gateway",
+            4,
+            8192,
+            NodeAdmission::for_route_grant(false, None, &expected),
+        )
+        .unwrap();
+    assert_eq!(
+        store.get_node("fresh-legacy").unwrap().state,
+        NodeState::Cordoned
+    );
+
+    store
+        .register_node_with_admission(
+            "keyed",
+            "http://node",
+            "http://gateway",
+            4,
+            8192,
+            NodeAdmission::for_route_grant(false, Some(&expected), &expected),
+        )
+        .unwrap();
+    store
+        .register_node_with_admission(
+            "keyed",
+            "http://node",
+            "http://gateway",
+            4,
+            8192,
+            NodeAdmission::for_route_grant(false, None, &expected),
+        )
+        .unwrap();
+    assert_eq!(
+        store.get_node("keyed").unwrap().state,
+        NodeState::Cordoned,
+        "a keyed Node must never downgrade through the legacy exception"
+    );
+
+    store
+        .register_node_with_admission(
+            "legacy-existing",
+            "http://node",
+            "http://gateway",
+            4,
+            8192,
+            NodeAdmission::for_route_grant(false, Some(&expected), &expected),
+        )
+        .unwrap();
+    let phase_open: bool = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT legacy_admission_open FROM route_grant_rollout_state WHERE singleton",
+                    &[],
+                )?
+                .try_get(0)
+        })
+        .unwrap();
+    assert!(
+        !phase_open,
+        "the completed legacy phase did not close durably"
+    );
+
+    // Simulate an old binary recreating a Ready row after the phase closed.
+    // Its next admission-aware registration must fail closed, and no later
+    // registration is allowed to reopen the persisted phase.
+    store
+        .register_node(
+            "late-legacy",
+            "http://node",
+            "http://gateway",
+            4,
+            8192,
+            false,
+        )
+        .unwrap();
+    store
+        .register_node_with_admission(
+            "late-legacy",
+            "http://node",
+            "http://gateway",
+            4,
+            8192,
+            NodeAdmission::for_route_grant(false, None, &expected),
+        )
+        .unwrap();
+    assert_eq!(
+        store.get_node("late-legacy").unwrap().state,
+        NodeState::Cordoned
+    );
+    let still_closed: bool = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT NOT legacy_admission_open FROM route_grant_rollout_state WHERE singleton",
+                    &[],
+                )?
+                .try_get(0)
+        })
+        .unwrap();
+    assert!(still_closed);
+}
+
+#[test]
 fn every_cat_gets_a_default_public_endpoint() {
     let store = test_store();
     let workspace = bootstrap_workspace(&store, "alpha");
@@ -1350,6 +1537,140 @@ fn cordon_linearizes_after_a_placement_that_already_observed_ready() {
 }
 
 #[test]
+fn wrong_key_registration_linearizes_after_an_authorized_placement() {
+    let _serial = serialize_structural_postgres_lock_test();
+    let url = crate::testsupport::isolated_control_store_url();
+    let placement = concurrency_store(&url);
+    let registrar = concurrency_store(&url);
+    let observer = concurrency_store(&url);
+    let placement_pid = backend_pid(&placement);
+    let registrar_pid = backend_pid(&registrar);
+    let workspace = bootstrap_workspace(&placement, "registration-placement");
+    placement
+        .register_node("node-1", "http://node", "http://gateway", 4, 8192, false)
+        .unwrap();
+    let (cat, _, _) = create_test_cat(&placement, &workspace, "placed-before-cordon").unwrap();
+
+    let cat_id = cat.id.clone();
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let placement_worker = std::thread::spawn(move || {
+        placement
+            .enter(move |client| {
+                let client = client?;
+                let mut tx = client.transaction().map_err(internal)?;
+                lock_placement(&mut tx).map_err(internal)?;
+                let state: String = tx
+                    .query_one("SELECT state FROM nodes WHERE id='node-1'", &[])
+                    .map_err(internal)?
+                    .try_get(0)
+                    .map_err(internal)?;
+                assert_eq!(state, "ready");
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                tx.execute("UPDATE cats SET node_id='node-1' WHERE id=$1", &[&cat_id])
+                    .map_err(internal)?;
+                tx.commit().map_err(internal)
+            })
+            .unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    let registration_worker = std::thread::spawn(move || {
+        registrar.register_node_with_admission(
+            "node-1",
+            "http://node",
+            "http://gateway",
+            4,
+            8192,
+            NodeAdmission::for_route_grant(false, Some("wrong"), "expected"),
+        )
+    });
+    let blocked = wait_until_blocked_by(&observer, registrar_pid, placement_pid);
+    release_tx.send(()).unwrap();
+    placement_worker.join().unwrap();
+    registration_worker.join().unwrap().unwrap();
+
+    assert!(
+        blocked,
+        "wrong-key registration did not wait for the placement linearization point"
+    );
+    assert_eq!(
+        observer.must_get_cat_by_id(&cat.id).unwrap().node_id,
+        Some("node-1".into())
+    );
+    assert_eq!(
+        observer.get_node("node-1").unwrap().state,
+        NodeState::Cordoned,
+        "the registration that linearized second failed to close scheduling"
+    );
+}
+
+#[test]
+fn uncordon_rechecks_the_fingerprint_after_a_concurrent_key_change() {
+    let _serial = serialize_structural_postgres_lock_test();
+    let url = crate::testsupport::isolated_control_store_url();
+    let key_changer = concurrency_store(&url);
+    let uncordoner = concurrency_store(&url);
+    let observer = concurrency_store(&url);
+    key_changer
+        .register_node_with_admission(
+            "node-1",
+            "http://node",
+            "http://gateway",
+            4,
+            8192,
+            NodeAdmission::for_route_grant(false, Some("expected"), "expected"),
+        )
+        .unwrap();
+    key_changer
+        .set_node_state("node-1", NodeState::Cordoned)
+        .unwrap();
+    let key_changer_pid = backend_pid(&key_changer);
+    let uncordoner_pid = backend_pid(&uncordoner);
+
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let key_change = std::thread::spawn(move || {
+        key_changer
+            .enter(move |client| {
+                let client = client?;
+                let mut tx = client.transaction().map_err(internal)?;
+                lock_placement(&mut tx).map_err(internal)?;
+                tx.execute(
+                    "UPDATE nodes
+                        SET state='cordoned', scheduling_disabled=TRUE,
+                            route_grant_public_key_sha256='wrong'
+                      WHERE id='node-1'",
+                    &[],
+                )
+                .map_err(internal)?;
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                tx.commit().map_err(internal)
+            })
+            .unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    let uncordon =
+        std::thread::spawn(move || uncordoner.uncordon_node_with_route_grant("node-1", "expected"));
+    let blocked = wait_until_blocked_by(&observer, uncordoner_pid, key_changer_pid);
+    release_tx.send(()).unwrap();
+    key_change.join().unwrap();
+    let error = uncordon
+        .join()
+        .unwrap()
+        .expect_err("stale uncordon must not overwrite the new verifier identity");
+
+    assert!(blocked, "uncordon did not wait for the verifier transition");
+    assert_eq!(error.code, ErrorCode::FailedPrecondition);
+    let node = observer.get_node("node-1").unwrap();
+    assert_eq!(node.state, NodeState::Cordoned);
+    assert_eq!(node.route_grant_public_key_sha256.as_deref(), Some("wrong"));
+}
+
+#[test]
 fn gateway_work_blocks_auto_suspend_and_wake_is_singleflight() {
     let store = test_store();
     let workspace = bootstrap_workspace(&store, "alpha");
@@ -1374,7 +1695,18 @@ fn gateway_work_blocks_auto_suspend_and_wake_is_singleflight() {
         .acquire_work(&cat.id, WorkKind::Gateway, "request-1", "GET /", 5_000)
         .unwrap();
     assert!(store.try_auto_suspend(&cat.id, 5_000).unwrap().is_none());
-    store.release_work(&lease.id).unwrap();
+    let shortened = store
+        .acquire_work(&cat.id, WorkKind::Gateway, "request-1", "handoff", 100)
+        .unwrap();
+    assert_eq!(
+        shortened.id, lease.id,
+        "renewal must not create a lease gap"
+    );
+    assert!(
+        shortened.expires_at_unix_ms <= super::now_ms() + 150,
+        "renewal must be able to shorten a wake lease to its handoff window"
+    );
+    store.release_work(&shortened.id).unwrap();
     store.try_auto_suspend(&cat.id, 5_000).unwrap().unwrap();
 
     let first = store.ensure_desired_running(&cat.id).unwrap();

@@ -12,7 +12,7 @@ No cloud resource is created merely by checking in this directory.
 |---|---|---|
 | `bootstrap/` | bootstrap state | Versioned, encrypted, private S3 state bucket |
 | `stacks/platform/` | platform state | VPC, EKS cluster, RDS PostgreSQL, Route 53 zone, ACM certificate, ECR repository, bare-metal worker capacity and security group, GitHub Actions release role |
-| `stacks/production-infrastructure/` | infrastructure state | Usage stream/archive/checkpoints, Pod Identity, alarms, worker artifacts/secrets/SSM deployment |
+| `stacks/production-infrastructure/` | infrastructure state | Usage stream/archive/checkpoints, shared signed-Route cache, Pod Identity, alarms, worker artifacts/secrets/SSM deployment |
 | `stacks/production-payments/` | payments state | Stripe prepaid-credit Product, fixed one-time Prices and signed webhook endpoint |
 | `stacks/production-application/` | application state | Cats Namespace/ServiceAccount, Secret/ConfigMap, EBS PVC, Deployments, Services and public ingress |
 | `modules/` | none | Reusable implementation called by stacks |
@@ -125,6 +125,7 @@ cluster through an explicit EKS access entry.
 Copy the examples outside source control, replace the bucket name, then:
 
 ```sh
+export TF_VAR_route_grant_public_key_pem="$(cat /approved/path/route-grant-public.pem)"
 cd deploy/aws/terraform/stacks/production-infrastructure
 cp backend.hcl.example backend.hcl
 cp production.tfvars.example production.auto.tfvars
@@ -139,6 +140,7 @@ Defaults are deliberately cost-conscious:
 - one dedicated S3 bucket, batched-object lifecycle to Standard-IA after
   30 days and Deep Archive after 365 days;
 - one on-demand DynamoDB projector checkpoint table;
+- one on-demand DynamoDB table for short-lived, already-signed Route Grants;
 - AWS-managed Kinesis encryption and SSE-S3 for the archive;
 - seven-year S3 Object Lock in GOVERNANCE mode.
 
@@ -149,7 +151,8 @@ replacement. The archive must never be reused for ChunkStore blocks.
 
 The usage module attaches the producer and consumer policies to one EKS Pod
 Identity role, associated only with the `cats-controld` ServiceAccount. The
-gateway uses the namespace default ServiceAccount and receives no usage AWS
+gateway uses its own `cats-gatewayd` ServiceAccount and receives only
+`GetItem`/`PutItem` on the Route Grant table; it receives no usage AWS
 permissions. The replay policy remains unattached and is reserved for
 controlled reconciliation jobs:
 
@@ -199,6 +202,8 @@ example:
 
 ```sh
 export TF_VAR_runtime_secret_data='{"CATS_AUTH_TOKEN":"...","CATS_ADMIN_TOKEN":"..."}'
+export TF_VAR_route_grant_private_key_pem="$(cat /approved/secret/path/route-grant-private.pem)"
+export TF_VAR_route_grant_public_key_pem="$(openssl pkey -in /approved/secret/path/route-grant-private.pem -pubout)"
 export TF_VAR_storage_postgres_url='postgresql://...'
 export TF_VAR_usage_postgres_url='postgresql://...'
 export TF_VAR_rds_ca_pem='-----BEGIN CERTIFICATE-----...'
@@ -216,6 +221,64 @@ terraform apply production.tfplan
 Terraform's `sensitive` flag only redacts normal CLI output. Secret values still
 exist in state and in saved plans, which is why both require the same access
 control as production credentials.
+
+The Route Grant key is asymmetric (ADR-0033). Every control-plane replica gets
+the same private key from the application state and the application public half
+must be derived from that exact input; startup signs and verifies a proof before
+readiness. Metal workers get only the public half from the infrastructure state.
+Never add the private key to
+`runtime_secret_data`, `worker_runtime_secret_data`, Gateway configuration or a
+Guest image. Generate the pair with `openssl genpkey -algorithm ED25519` and
+`openssl pkey -pubout`, then rotate it only through a coordinated drained
+rollout until multi-key verification exists.
+
+The infrastructure state also creates `route_cache_table_name` and the
+Gateway-only Pod Identity before the application rollout. Set the GitHub
+repository variable `ROUTE_CACHE_TABLE_NAME` to that output. Each successful
+active + Running resolve attempts to copy its signed response into this regional
+table under a 100-ms runtime I/O deadline; another Gateway Pod can then serve the
+signed grant if PostgreSQL or the control plane is unavailable. The table cannot
+mint authority, entries are bounded by the signed expiry, and conditional writes
+order them by PostgreSQL route epoch and then signed issue time. It is deliberately
+not a Gateway startup or readiness dependency; bounded runtime failures fall
+through to the healthy control plane.
+
+The first Route Grant release has a strict compatibility order:
+
+1. configure the application private-key input and the matching infrastructure
+   public-key input, but do not deploy the new worker bundle yet. CI derives
+   the application public half from its exact private secret instead of
+   accepting a second independently editable key input;
+2. deploy the application first. Terraform waits for the complete control-plane
+   rollout before it starts the Gateway rollout. Old Gateways ignore the new
+   response fields, and old Nodes ignore the grant forwarded by a new Gateway;
+3. drain, deploy and uncordon one worker at a time using the worker procedure
+   below. The association verifies the installed public-key fingerprint; the
+   Node reports it at registration, and the control plane refuses uncordon
+   unless it matches the active signer. Never uncordon a Node that requires
+   Route Grants while the old Gateway is still live: the Node deliberately
+   rejects its unsigned requests;
+4. if the application must be rolled back after any worker has been upgraded,
+   first drain those workers and restore the compatible old worker bundle. An
+   old Gateway cannot serve a Node that requires a Route Grant.
+
+This additive first release is not the key-rotation procedure. With one accepted
+public key, rotation still needs the coordinated drained boundary described
+above; do not swap either half independently. The application workflow fails
+before Terraform plan if any schedulable or still-serving Node reports a
+different key. It permits an all-legacy serving cohort only for the additive
+first application rollout and rejects a mixed legacy/enforcing cohort as an
+interrupted worker rollout. The control database persists a one-way legacy
+admission phase: it closes after every schedulable or serving Node reports a
+verifier, never reopens, and a Node that downgrades from a reported key to no
+key is cordoned.
+
+The Route Grant Node column and rollout-phase table are an expand-only schema
+change and deliberately retain control schema stamp 1. The previous
+application ignores both additions, so a failed partial control-plane rollout
+can still start the old image. Do not bump the stamp for an additive nullable
+column/table; reserve a new stamp for the later contract phase after rollback
+compatibility is no longer required.
 
 `storage_postgres_url` and `usage_postgres_url` are intentionally independent.
 During the early shared-RDS phase they may point to the same instance/database,
@@ -274,41 +337,9 @@ The disruptive drill separately uploads fixed-rate public-probe results and
 Pod/EndpointSlice transition evidence; those artifacts contain no Secret
 values or response bodies and are retained for 30 days for failure correlation.
 
-ADR-0031 deliberately cut over without importing the old SQLite rows. The
-application state removes the control-data PVC and its temporary DLM policy;
-the final manual EBS snapshot remains the archive of the pre-cutover database.
-Because Terraform can schedule that orphaned PVC destroy before the in-place
-Deployment update that removes its mount, the production workflow handles this
-one legacy edge explicitly: after saving the complete reviewed plan, it checks
-for `cats-control-data`. If the claim is still mounted only by
-`cats-controld`, the workflow verifies that the saved plan restores the
-PostgreSQL-era Deployment to at least two replicas, scales the old Deployment
-to zero, waits until no Pod consumes the claim, and only then applies the saved plan. It
-never removes the PVC protection finalizer or force-deletes the volume. Once a
-state has crossed the cutover and the PVC is absent, the step is a no-op.
-
-## Importing the existing Kubernetes deployment
-
-Do not run the first application apply while the YAML-created objects are
-outside state. Import every live object at its module address first, including:
-
-- Namespace `cats`;
-- ServiceAccount `cats/cats-controld`, Secret `cats/cats-runtime` and ConfigMap
-  `cats/cats-rds-ca`;
-- both Deployments and Services;
-- IngressClassParams, IngressClass and Ingress.
-
-Before import, export the live YAML and reconcile intentional differences.
-After import, require a plan with no unexpected replacement or deletion. The
-legacy files under `deploy/aws/k8s/` are migration references only and must not
-be applied again.
-
-The former `cats-auto-ebs` StorageClass and `cats-control-data` PVC are not
-part of the PostgreSQL-era application state and must not be imported.
-
 Terraform will additionally create `cats-gateway-runtime`, which exposes only
-`CATS_AUTH_TOKEN` to the gateway. The gateway must not receive PostgreSQL or
-WorkOS credentials.
+`CATS_AUTH_TOKEN` to the gateway, plus the non-secret Route cache table name and
+AWS region. The gateway must not receive PostgreSQL or WorkOS credentials.
 
 ## Metal worker deployment
 
@@ -341,19 +372,19 @@ The association independently refuses to change installed files while any Cat
 PID remains in the worker's metering cgroups **or** any `cats-blockd` /
 `cloud-hypervisor` process is alive on the host. The process-table check
 exists because a blockd is not metered: with the Guests gone the cgroup walk
-reads clean, yet the blockd may still hold an unpublished journal — on a
-relaxed volume that journal is the only authoritative copy. `cats-worker` uses
-`KillMode=process`, so stopping or restarting the agent deliberately leaves
-those runtimes alive for ledger-backed re-adoption; it does not make replacing
-the worker binaries or Guest seed underneath them safe. This fail-closed guard
-prevents bypassing the drain runbook; it does not cordon the node itself and
-therefore is not a substitute for step 1. Do not copy production binaries,
-patch the seed, or edit `worker.env` manually; update the bundle digest or
-secret input and apply Terraform.
+reads clean, yet `systemctl stop cats-worker` (default
+`KillMode=control-group`) would kill a surviving blockd together with any
+unpublished journal it holds — on a relaxed volume that journal is the only
+authoritative copy. This is a fail-closed guard against bypassing the drain
+runbook; it does not cordon the node itself and therefore is not a substitute
+for step 1. Do not copy production binaries, patch the seed, or edit
+`worker.env` manually; update the bundle digest or secret input and apply
+Terraform.
 
-`systemctl stop cats-worker` now stops only the node agent. It does **not** stop
-the Cats on that worker. Use the drain flow above when the operational intent
-is to empty or decommission a node; stopping the service is not a drain.
+Do not stop or restart a worker that still has Cats. Issue #186 keeps the
+control-group default until ledger persistence and every in-flight lifecycle
+crash window are safely re-adoptable; issue #86 remains the no-downtime restart
+work item. A controlled release must first reach `cats=0 orphans=0`.
 
 ### When the drain cannot converge
 

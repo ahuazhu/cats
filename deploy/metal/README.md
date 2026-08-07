@@ -59,8 +59,15 @@ ssh ubuntu@<ip>
 git clone <this-repo> cats && cd cats     # 或 rsync 本地检出
 sudo deploy/metal/install.sh              # 依赖+编译+CH+guest镜像+systemd
 sudoedit /etc/cats/cats.env               # 配 S3（可选）后:
+# 仅限首次安装、尚未创建任何 Cat：
 sudo systemctl restart cats-noded
 ```
+
+上面的重启命令只适用于首次安装后、节点上还没有 Cat 的情形。复用已有节点时，先执行
+`cats admin node drain <node-id>`，并确认管理接口报告 `state=cordoned cats=0 orphans=0`，
+再停止或重启 `cats-noded`。#186 完成 crash-safe ledger 和 per-Cat scope 前，systemd 的默认
+`KillMode=control-group` 会终止同一 cgroup 中的 VMM 与 blockd；后者可能持有尚未发布的
+Relaxed journal，因此不能在活跃节点上直接执行该命令。
 
 `install.sh` 做的事：apt 依赖、rustup、`cargo build --release`、下载
 cloud-hypervisor 静态二进制（`CH_VERSION` 可覆盖，默认 v53.0，与实验一致）、

@@ -88,8 +88,15 @@ if [[ -n ${GUEST_AGENT_BIN:-} ]]; then
   AGENT=$GUEST_AGENT_BIN
 else
   export PATH="$HOME/.cargo/bin:$PATH"
-  rustup target add x86_64-unknown-linux-musl >/dev/null
-  (cd "$REPO" && cargo build --release -p cats-guest-agent --target x86_64-unknown-linux-musl)
+  (
+    cd "$REPO"
+    # Resolve the target through the repository's pinned toolchain. Running
+    # rustup from the caller's directory installs it on the default toolchain,
+    # while Cargo switches to rust-toolchain.toml after cd and then cannot find
+    # core/std for musl on a fresh host.
+    rustup target add x86_64-unknown-linux-musl >/dev/null
+    cargo build --release -p cats-guest-agent --target x86_64-unknown-linux-musl
+  )
   AGENT="$REPO/target/x86_64-unknown-linux-musl/release/cats-guest-agent"
 fi
 [[ -x $AGENT ]] || { echo "Guest Agent is not executable: $AGENT" >&2; exit 1; }

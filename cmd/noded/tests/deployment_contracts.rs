@@ -64,7 +64,7 @@ fn deployment_units_pin_kvm_clock_too() {
 }
 
 #[test]
-fn node_agent_restarts_preserve_guest_runtime_processes() {
+fn node_agent_does_not_orphan_runtimes_without_a_crash_safe_ledger() {
     for unit in [
         "deploy/metal/systemd/cats-noded.service",
         "deploy/aws/metal/cats-worker.service",
@@ -75,12 +75,42 @@ fn node_agent_restarts_preserve_guest_runtime_processes() {
             .map(str::trim)
             .filter(|line| line.starts_with("KillMode="))
             .collect::<Vec<_>>();
-        assert_eq!(
-            kill_modes,
-            ["KillMode=process"],
-            "{unit} must stop only cats-noded so its VMM and blockd processes survive for ledger-backed re-adoption"
+        assert!(
+            kill_modes.is_empty(),
+            "{unit} must retain systemd's control-group default until #186 makes every lifecycle crash window and ledger failure re-adoptable; found {kill_modes:?}"
         );
     }
+
+    let adr =
+        read_workspace_file("docs/decisions/0028-node-runtime-ledger-and-in-place-reattach.md");
+    for stale_claim in [
+        "- Agent 升级与重启不再杀掉 Guest",
+        "- `systemctl stop cats-noded` 不再停止 Guest",
+    ] {
+        assert!(
+            !adr.contains(stale_claim),
+            "ADR-0028 must not claim runtime survival while the units retain control-group kill semantics: {stale_claim}"
+        );
+    }
+    assert!(
+        adr.contains("`KillMode=control-group`") && adr.contains("cats=0 orphans=0"),
+        "ADR-0028 must describe the current stop semantics and idle prerequisite"
+    );
+
+    let metal_readme = read_workspace_file("deploy/metal/README.md");
+    let first_install = metal_readme
+        .find("仅限首次安装、尚未创建任何 Cat")
+        .expect("metal install restart is explicitly limited to a fresh empty node");
+    let restart = metal_readme
+        .find("systemctl restart cats-noded")
+        .expect("metal installation documents its required configuration restart");
+    let later_restart_guard = metal_readme
+        .find("state=cordoned cats=0 orphans=0")
+        .expect("metal restart instructions require an idle drained node");
+    assert!(
+        first_install < restart && restart < later_restart_guard,
+        "metal restart instructions must limit the direct command to first install and then document the drain/idle guard"
+    );
 }
 
 #[test]
@@ -98,7 +128,7 @@ fn production_aws_worker_can_cut_over_to_proxy_without_client_set_pinning() {
     let unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
     for expected in [
         "Environment=CATS_POSTGRES_SESSION_SETUP=client",
-        "--metadata-store-option session-setup=$CATS_POSTGRES_SESSION_SETUP",
+        "--metadata-store-option session-setup=${CATS_POSTGRES_SESSION_SETUP}",
     ] {
         assert!(
             unit.contains(expected),
@@ -109,6 +139,10 @@ fn production_aws_worker_can_cut_over_to_proxy_without_client_set_pinning() {
         unit.find("Environment=CATS_POSTGRES_SESSION_SETUP=client")
             < unit.find("EnvironmentFile=/etc/cats/worker.env"),
         "worker.env must be able to override the backward-compatible client default"
+    );
+    assert!(
+        !unit.contains("session-setup=$CATS_POSTGRES_SESSION_SETUP"),
+        "systemd does not expand an unbraced variable embedded in an argument; the worker would receive the literal variable name and restart forever"
     );
 }
 
@@ -175,6 +209,31 @@ fn manual_worker_bootstrap_refuses_the_example_identity() {
         installer.find("$worker_node_id == REPLACE_WITH_UNIQUE_NODE_ID")
             < installer.find("apt-get update -q"),
         "identity validation must happen before the expensive bootstrap starts"
+    );
+}
+
+#[test]
+fn guest_builder_installs_musl_target_for_the_pinned_toolchain() {
+    let builder = read_workspace_file("deploy/metal/build-guest-image.sh");
+    let static_agent_build = builder
+        .split_once("# 0. Static guest agent (musl)")
+        .and_then(|(_, rest)| rest.split_once("# 1. Kernel"))
+        .map(|(section, _)| section)
+        .expect("static Guest Agent build section");
+
+    let enter_repository = static_agent_build
+        .find("cd \"$REPO\"")
+        .expect("Guest build must enter the repository");
+    let install_target = static_agent_build
+        .find("rustup target add x86_64-unknown-linux-musl")
+        .expect("Guest build must install the musl Rust target");
+    let build_agent = static_agent_build
+        .find("cargo build --release -p cats-guest-agent --target x86_64-unknown-linux-musl")
+        .expect("Guest build must compile a static Guest Agent");
+
+    assert!(
+        enter_repository < install_target && install_target < build_agent,
+        "rustup must resolve the musl target after entering the repository so it installs into rust-toolchain.toml's pinned toolchain"
     );
 }
 

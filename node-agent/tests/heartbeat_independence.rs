@@ -119,6 +119,12 @@ async fn start_agent(
         listen: "127.0.0.1:0".into(),
         control_plane_url,
         auth_token: "dev-service-token".into(),
+        route_grant_verifier: Arc::new(
+            cats_node_agent::route_grant::RouteGrantVerifier::from_ed25519_pem(include_bytes!(
+                "../../tests/fixtures/route_grant_public_ed25519.pem"
+            ))
+            .unwrap(),
+        ),
         gateway_url: "http://127.0.0.1:1".into(),
         cpus: 4,
         memory_mib: 4096,

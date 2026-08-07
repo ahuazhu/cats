@@ -50,7 +50,7 @@ Terraform 配置直接覆盖现网。
 - usage projector 的 DynamoDB checkpoint table；
 - producer、consumer、replay 最小权限 IAM policy、Kinesis throttling/lag 告警；
 - `cats-controld` 专用 EKS ServiceAccount、Pod Identity role 与 association；
-- Cats Namespace、EKS Auto Mode EBS StorageClass/PVC、runtime Secret、RDS CA ConfigMap；
+- Cats Namespace、runtime Secret、RDS CA ConfigMap；
 - `cats-controld` / `cats-gatewayd` Deployment 与 Service；
 - EKS Auto Mode IngressClassParams、IngressClass 和 ALB Ingress；
 - metal worker artifact bucket、校验 digest 的 bundle、Secrets Manager runtime secret、
@@ -58,7 +58,8 @@ Terraform 配置直接覆盖现网。
 
 现有 EKS/RDS/VPC/ACM/ECR/ChunkStore bucket/裸金属 worker 仍是迁移输入，不因本 ADR
 自动变成已由 Terraform 管理。它们在精确 import 完成前不得由新 stack 重建或修改。
-旧 `deploy/aws/k8s/*.yaml` 只保留为迁移对照，不再作为生产 apply 源。
+Terraform 完成接管后，旧 `deploy/aws/k8s/*.yaml` 迁移对照已删除，避免被误用为生产
+apply 源。
 
 usage publisher 可运行在所有 `cats-controld` API 副本中；projector 与 S3 archive
 writer 只运行在 PostgreSQL advisory lock 选出的一个 leader 中（ADR-0032）。

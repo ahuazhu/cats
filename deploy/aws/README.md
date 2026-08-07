@@ -1,11 +1,10 @@
 # AWS deployment
 
 Terraform under [`terraform/`](terraform/) is now the authoritative source for
-new AWS usage resources and the Kubernetes production deployment. The YAML
-files under `k8s/` are retained only as import/migration references; do not
-apply them after Terraform takeover. Existing EKS, RDS, VPC, ACM, ECR,
-ChunkStore and bare-metal resources must be represented from their exact live
-configuration and imported before Terraform changes them. See
+new AWS usage resources and the Kubernetes production deployment. Existing
+EKS, RDS, VPC, ACM, ECR, ChunkStore and bare-metal resources must be represented
+from their exact live configuration and imported before Terraform changes
+them. See
 [`terraform/README.md`](terraform/README.md) and ADR-0012.
 
 Production-shaped split:
@@ -16,6 +15,9 @@ Production-shaped split:
   assets. It is not an EKS node.
 - RDS PostgreSQL: authoritative ChunkStore roots, leases and fencing epochs.
 - S3: immutable durable ChunkStore objects.
+- Endpoint continuity: a regional DynamoDB table replicates only short-lived,
+  already-signed Route Grants across `cats-gatewayd` replicas; Nodes remain the
+  authorization verifier.
 - Usage billing: `cats-controld` publishes attributed cumulative checkpoints to
   Kinesis; its projector writes 50-second/4-MiB/1000-record NDJSON batches to a
   seven-year Object Lock S3 archive, updates the PostgreSQL `cats_usage`
@@ -28,13 +30,13 @@ Production-shaped split:
 - One EKS Auto Mode ALB: the user site at `cats.run`, the operator site at
   `ops.cats.run`, legacy-host redirects and the endpoint wildcard.
 
-The Terraform application stack creates the `cats-controld` ServiceAccount,
-`cats-runtime` and `cats-rds-ca`;
+The Terraform application stack creates the `cats-controld` and
+`cats-gatewayd` ServiceAccounts, `cats-runtime` and `cats-rds-ca`;
 secrets are injected by CI and remain protected in remote state. It also
 renders the target ACM ARN and every public subnet into EKS Auto Mode ingress.
 EKS Pod Identity grants the control plane only the Kinesis/S3/DynamoDB usage
-permissions; gateway Pods receive none. Do not create or patch these objects
-manually.
+permissions. A separate least-privilege Gateway identity may read and write
+only the signed Route Grant table. Do not create or patch these objects manually.
 
 The worker does not hold a copy of the database password. Set
 `database_master_user_secret_arn` and the non-secret half of the DSN in
@@ -81,12 +83,18 @@ debootstrapped Ubuntu filesystem. Changes to those parts of
 `OUT=/opt/cats/guest metal/build-guest-image.sh`, followed by a worker restart;
 the Guest kernel is the Host's own, which is why the complete boot artifact is
 not built in CI. `metal/install-worker.sh` remains a bootstrap/development
-helper. Its example deliberately contains `REPLACE_WITH_UNIQUE_NODE_ID` and
-`PRIVATE_IPV4`; fill both before rerunning the helper. An existing file with
-either placeholder is rejected before package installation or compilation so
-a second host cannot claim another worker's identity. Cloud Hypervisor stays
-under `/opt/cats/bin` so it does not replace a host-wide binary used by another
-workload. The S3 adapter uses the EC2
+helper. It requires `CATS_ROUTE_GRANT_PUBLIC_KEY_FILE` to point at the reviewed
+Ed25519 public key before it changes packages, installed files or services; for
+example, run `sudo CATS_ROUTE_GRANT_PUBLIC_KEY_FILE=/secure/path/public.pem
+deploy/aws/metal/install-worker.sh`. The helper validates and stages that key,
+then installs it as root-owned mode `0644` at
+`/etc/cats/route-grant-public.pem` before enabling `cats-worker`, whether or not
+`worker.env` already exists. Its environment example deliberately contains
+`REPLACE_WITH_UNIQUE_NODE_ID` and `PRIVATE_IPV4`; fill both before rerunning the
+helper. An existing file with either placeholder is rejected before package
+installation or compilation so a second host cannot claim another worker's
+identity. Cloud Hypervisor stays under `/opt/cats/bin` so it does not replace a
+host-wide binary used by another workload. The S3 adapter uses the EC2
 instance role and refreshes its temporary credentials; no long-lived AWS key is
 stored in `worker.env`.
 

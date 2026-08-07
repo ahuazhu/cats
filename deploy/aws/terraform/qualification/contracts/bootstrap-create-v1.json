@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "mode": "create-only",
+  "contract_id": "qualification-bootstrap-create-v1",
+  "resource_label": "qualification bootstrap",
+  "required_template_values": [
+    "account_id",
+    "bootstrap_principal_arn"
+  ],
+  "required_variables": {
+    "expected_account_id": "{account_id}",
+    "aws_region": "us-east-1",
+    "qualification_namespace": "cats-qualification-v2",
+    "qualification_cell_id": "qcell-use1-v1",
+    "bootstrap_principal_arn": "{bootstrap_principal_arn}"
+  },
+  "manifest": {
+    "output": "qualification_manifest_seed",
+    "expected": {
+      "schema_version": 1,
+      "environment": "qualification",
+      "environment_is_production": false,
+      "account_id": "{account_id}",
+      "region": "us-east-1",
+      "namespace": "cats-qualification-v2",
+      "cell_id": "qcell-use1-v1",
+      "required_tags": {
+        "Project": "Cats",
+        "Environment": "qualification",
+        "QualificationNamespace": "cats-qualification-v2",
+        "QualificationCell": "qcell-use1-v1",
+        "ManagedBy": "terraform"
+      },
+      "terraform_state": {
+        "bucket": "cats-qualification-v2-tfstate-{account_id}-us-east-1",
+        "kms_alias": "alias/cats-qualification-v2-terraform-state",
+        "key_prefix": "architecture-v2",
+        "use_lockfile": true,
+        "state_role_arn": "arn:aws:iam::{account_id}:role/cats-qualification-v2-terraform-state"
+      }
+    }
+  },
+  "forbidden_inventory": {
+    "account_id": "{account_id}",
+    "region": "us-east-1"
+  },
+  "identity": {
+    "allowed_external_arns": [
+      "{bootstrap_principal_arn}",
+      "arn:aws:iam::{account_id}:root"
+    ],
+    "owned_arn_globs": [
+      "arn:aws:iam::{account_id}:role/cats-qualification-v2-terraform-state",
+      "arn:aws:s3:::cats-qualification-v2-tfstate-{account_id}-us-east-1",
+      "arn:aws:s3:::cats-qualification-v2-tfstate-{account_id}-us-east-1/*"
+    ],
+    "approved_external_identifiers": []
+  },
+  "required_tags": {
+    "Project": "Cats",
+    "Environment": "qualification",
+    "QualificationNamespace": "cats-qualification-v2",
+    "QualificationCell": "qcell-use1-v1",
+    "ManagedBy": "terraform"
+  },
+  "required_check_addresses": [
+    "check.qualification_identity",
+    "var.aws_region",
+    "var.bootstrap_principal_arn",
+    "var.expected_account_id",
+    "var.qualification_cell_id",
+    "var.qualification_namespace"
+  ],
+  "allowed_data_addresses": [
+    "data.aws_caller_identity.current",
+    "data.aws_partition.current",
+    "data.aws_region.current",
+    "data.aws_iam_policy_document.state_access",
+    "data.aws_iam_policy_document.state_bucket",
+    "data.aws_iam_policy_document.state_key",
+    "data.aws_iam_policy_document.state_role_trust"
+  ],
+  "required_create_addresses": [
+    "aws_iam_role.state",
+    "aws_iam_role_policy.state",
+    "aws_kms_alias.state",
+    "aws_kms_key.state",
+    "aws_s3_bucket.state",
+    "aws_s3_bucket_ownership_controls.state",
+    "aws_s3_bucket_policy.state",
+    "aws_s3_bucket_public_access_block.state",
+    "aws_s3_bucket_server_side_encryption_configuration.state",
+    "aws_s3_bucket_versioning.state"
+  ],
+  "tagged_resource_addresses": [
+    "aws_iam_role.state",
+    "aws_kms_key.state",
+    "aws_s3_bucket.state"
+  ],
+  "expected_managed_changes_sha256": "9d8ed20bf0ffc00ef3399382b842dec882b7600fe008332dda2116604d997d78",
+  "required_identity_templates": {
+    "aws_iam_role.state": {
+      "name": "cats-qualification-v2-terraform-state"
+    },
+    "aws_iam_role_policy.state": {
+      "name": "cats-qualification-v2-terraform-state-access"
+    },
+    "aws_kms_alias.state": {
+      "name": "alias/cats-qualification-v2-terraform-state"
+    },
+    "aws_s3_bucket.state": {
+      "bucket": "cats-qualification-v2-tfstate-{account_id}-us-east-1"
+    }
+  },
+  "required_known_change_paths": {
+    "aws_iam_role.state": [
+      "assume_role_policy"
+    ],
+    "aws_iam_role_policy.state": [
+      "policy"
+    ],
+    "aws_kms_key.state": [
+      "policy"
+    ],
+    "aws_s3_bucket_policy.state": [
+      "policy"
+    ]
+  }
+}

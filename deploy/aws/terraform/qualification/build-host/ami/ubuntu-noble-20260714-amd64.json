@@ -1,0 +1,11 @@
+{
+  "architecture": "x86_64",
+  "creation_date": "2026-07-14T11:54:50.000Z",
+  "image_id": "ami-052355af2a014bd2c",
+  "name": "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-20260714",
+  "owner_id": "099720109477",
+  "platform_details": "Linux/UNIX",
+  "root_device_name": "/dev/sda1",
+  "source_snapshot_id": "snap-0b0be23c49c254dd6",
+  "virtualization_type": "hvm"
+}

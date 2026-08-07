@@ -1,0 +1,9 @@
+# Exact values are deliberate review inputs. Do not copy a production stack's
+# resource IDs, bucket names, roles or state backend into this file.
+expected_account_id    = "REPLACE_WITH_APPROVED_12_DIGIT_ACCOUNT_ID"
+bootstrap_principal_arn = "arn:aws:iam::REPLACE_WITH_APPROVED_12_DIGIT_ACCOUNT_ID:user/REPLACE_WITH_REVIEWED_BOOTSTRAP_USER"
+
+# These defaults are pinned by validation and are shown for review clarity.
+aws_region              = "us-east-1"
+qualification_namespace = "cats-qualification-v2"
+qualification_cell_id   = "qcell-use1-v1"

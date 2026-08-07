@@ -101,6 +101,20 @@ struct Args {
     metadata_store_options: Vec<String>,
     #[arg(long, env = "CATS_AUTH_TOKEN", default_value = "dev-service-token")]
     auth_token: String,
+    /// PKCS#8 Ed25519 private key used only by the control plane to issue
+    /// short-lived Endpoint Route Grants (ADR-0033).
+    #[arg(long, env = "CATS_ROUTE_GRANT_PRIVATE_KEY_FILE")]
+    route_grant_private_key_file: std::path::PathBuf,
+    /// Matching Ed25519 public key. Startup signs and verifies a challenge so a
+    /// deployment cannot become Ready with independently mismatched key halves.
+    #[arg(long, env = "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE")]
+    route_grant_public_key_file: std::path::PathBuf,
+    #[arg(
+        long,
+        env = "CATS_ROUTE_GRANT_TTL_SECONDS",
+        default_value_t = cats_control_plane::route_grant::DEFAULT_ROUTE_GRANT_TTL_SECONDS
+    )]
+    route_grant_ttl_seconds: u64,
     #[arg(long, env = "CATS_ADMIN_TOKEN", default_value = "dev-admin-token")]
     admin_token: String,
     /// WorkOS AuthKit application client ID. Setting any WorkOS option
@@ -459,6 +473,27 @@ async fn main() -> anyhow::Result<()> {
                 .context("the control store needs a PostgreSQL URL: --control-store-url, CATS_CONTROL_POSTGRES_URL, CATS_CONTROL_POSTGRES_URL_FILE or CATS_POSTGRES_URL")?,
         ),
     };
+    let route_grant_private_key =
+        std::fs::read(&args.route_grant_private_key_file).with_context(|| {
+            format!(
+                "read route grant private key {}",
+                args.route_grant_private_key_file.display()
+            )
+        })?;
+    let route_grant_public_key =
+        std::fs::read(&args.route_grant_public_key_file).with_context(|| {
+            format!(
+                "read route grant public key {}",
+                args.route_grant_public_key_file.display()
+            )
+        })?;
+    let route_grant_signer = Arc::new(
+        cats_control_plane::route_grant::RouteGrantSigner::from_ed25519_pem(
+            &route_grant_private_key,
+            &route_grant_public_key,
+            args.route_grant_ttl_seconds,
+        )?,
+    );
     let handle = cats_control_plane::server::spawn(cats_control_plane::server::Config {
         listen: args.listen,
         control_store_dsn,
@@ -467,6 +502,7 @@ async fn main() -> anyhow::Result<()> {
         credit_store,
         storage_meta,
         auth_token: args.auth_token,
+        route_grant_signer,
         admin_token: args.admin_token,
         workos,
         stripe,

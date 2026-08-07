@@ -127,6 +127,22 @@ variable "worker_runtime_secret_data" {
   default     = {}
 }
 
+variable "route_grant_public_key_pem" {
+  description = "Ed25519 public key deployed to every metal worker for Route Grant verification."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = (
+      var.route_grant_public_key_pem == "" || (
+        startswith(trimspace(var.route_grant_public_key_pem), "-----BEGIN PUBLIC KEY-----") &&
+        endswith(trimspace(var.route_grant_public_key_pem), "-----END PUBLIC KEY-----")
+      )
+    )
+    error_message = "route_grant_public_key_pem must be empty or a PEM public key."
+  }
+}
+
 variable "tags" {
   description = "Additional resource tags."
   type        = map(string)

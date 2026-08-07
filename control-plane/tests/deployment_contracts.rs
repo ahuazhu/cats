@@ -74,6 +74,291 @@ fn production_platform_defaults_to_independent_az_dependencies() {
     }
 }
 
+#[test]
+fn route_grant_private_key_reaches_only_control_plane_and_nodes_get_public_key() {
+    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    let control = kubernetes
+        .split_once("resource \"kubernetes_deployment_v1\" \"control_plane\"")
+        .and_then(|(_, rest)| rest.split_once("resource \"kubernetes_pod_disruption_budget_v1\""))
+        .map(|(section, _)| section)
+        .expect("control-plane Deployment section");
+    let gateway = kubernetes
+        .split_once("resource \"kubernetes_deployment_v1\" \"gateway\"")
+        .map(|(_, section)| section)
+        .expect("Gateway Deployment section");
+    for fragment in [
+        "kubernetes_secret_v1.route_grant_signing",
+        "CATS_ROUTE_GRANT_PRIVATE_KEY_FILE",
+        "/etc/cats/route-grant/private.pem",
+    ] {
+        assert!(
+            control.contains(fragment) || kubernetes.contains(fragment),
+            "control-plane Route Grant delivery lost {fragment:?}"
+        );
+        assert!(
+            !gateway.contains(fragment),
+            "Gateway must never receive Route Grant signing material: {fragment:?}"
+        );
+    }
+    for fragment in [
+        "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE",
+        "/etc/cats/route-grant/public.pem",
+        "\"public.pem\"  = var.route_grant_public_key_pem",
+    ] {
+        assert!(
+            control.contains(fragment) || kubernetes.contains(fragment),
+            "control-plane startup pair verification lost {fragment:?}"
+        );
+    }
+
+    let worker =
+        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
+    assert!(worker.contains("base64encode(var.route_grant_public_key_pem)"));
+    assert!(worker.contains("/etc/cats/route-grant-public.pem"));
+    assert!(worker.contains("installed_route_grant_key_fingerprint"));
+    assert!(worker.contains("-outform DER"));
+    for unit in [
+        "deploy/aws/metal/cats-worker.service",
+        "deploy/metal/systemd/cats-noded.service",
+    ] {
+        assert!(
+            read_workspace_file(unit)
+                .contains("--route-grant-public-key-file /etc/cats/route-grant-public.pem"),
+            "{unit} does not give cats-noded its verification key"
+        );
+    }
+
+    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
+    assert!(workflow.contains(
+        "ROUTE_GRANT_PRIVATE_KEY_PEM_B64: ${{ secrets.ROUTE_GRANT_PRIVATE_KEY_PEM_B64 }}"
+    ));
+    assert!(workflow.contains("route-grant-private.pem"));
+    assert!(workflow.contains("openssl pkey"));
+    assert!(workflow.contains("^ED25519 Private-Key:"));
+    assert!(workflow.contains("-pubout"));
+    assert!(workflow.contains("route-grant-public.sha256"));
+    assert!(workflow.contains("-outform DER"));
+    assert!(workflow.contains(
+        "--rawfile route_grant_private_key_pem \"$RUNNER_TEMP/route-grant-private.pem\""
+    ));
+    assert!(workflow.contains("route_grant_private_key_pem: $route_grant_private_key_pem"));
+    assert!(workflow
+        .contains("--rawfile route_grant_public_key_pem \"$RUNNER_TEMP/route-grant-public.pem\""));
+    assert!(workflow.contains("route_grant_public_key_pem: $route_grant_public_key_pem"));
+
+    let dev = read_workspace_file("scripts/dev.sh");
+    assert!(dev.contains("--route-grant-private-key-file"));
+    assert!(dev.contains("--route-grant-public-key-file"));
+}
+
+#[test]
+fn gateway_replicas_share_only_already_signed_route_grants_outside_postgres() {
+    let infrastructure =
+        read_workspace_file("deploy/aws/terraform/modules/route-cache-infrastructure/main.tf");
+    for expected in [
+        "resource \"aws_dynamodb_table\" \"route_grants\"",
+        "billing_mode = \"PAY_PER_REQUEST\"",
+        "hash_key     = \"hostname\"",
+        "attribute_name = \"expires_at_unix\"",
+        "point_in_time_recovery",
+        "server_side_encryption",
+        "\"dynamodb:GetItem\"",
+        "\"dynamodb:PutItem\"",
+        "resource \"aws_eks_pod_identity_association\" \"gateway\"",
+        "service_account = var.gateway_service_account_name",
+    ] {
+        assert!(
+            infrastructure.contains(expected),
+            "shared Route cache infrastructure lost {expected:?}"
+        );
+    }
+    for forbidden in [
+        "dynamodb:Scan",
+        "dynamodb:Query",
+        "dynamodb:DeleteTable",
+        "dynamodb:CreateTable",
+    ] {
+        assert!(
+            !infrastructure.contains(forbidden),
+            "Gateway Route cache identity gained unnecessary permission {forbidden:?}"
+        );
+    }
+
+    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    let gateway = kubernetes
+        .split_once("resource \"kubernetes_deployment_v1\" \"gateway\"")
+        .map(|(_, section)| section)
+        .expect("Gateway Deployment section");
+    for expected in [
+        "resource \"kubernetes_service_account_v1\" \"gateway\"",
+        "service_account_name",
+        "kubernetes_service_account_v1.gateway.metadata[0].name",
+        "CATS_SHARED_ROUTE_CACHE_TABLE",
+        "AWS_REGION",
+    ] {
+        assert!(
+            kubernetes.contains(expected) || gateway.contains(expected),
+            "Gateway deployment lost shared Route cache wiring {expected:?}"
+        );
+    }
+
+    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
+    for expected in [
+        "ROUTE_CACHE_TABLE_NAME: ${{ vars.ROUTE_CACHE_TABLE_NAME }}",
+        "-var=\"shared_route_cache_table=$ROUTE_CACHE_TABLE_NAME\"",
+    ] {
+        assert!(
+            workflow.contains(expected),
+            "production deployment lost shared Route cache input {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn route_grant_rotation_checks_schedulable_and_serving_nodes_before_a_rollout() {
+    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
+    let verifier = read_workspace_file("deploy/aws/check-route-grant-nodes.sh");
+    let preflight = workflow
+        .find("- name: Check Route Grant verifier compatibility")
+        .expect("Route Grant compatibility preflight");
+    let plan = workflow
+        .find("- name: Plan production deployment")
+        .expect("production plan step");
+    let apply = workflow
+        .find("- name: Apply reviewed plan")
+        .expect("production apply step");
+    assert!(
+        preflight < plan && plan < apply,
+        "a verifier mismatch must fail before Terraform can mutate the application"
+    );
+
+    let gate = &workflow[preflight..plan];
+    for fragment in [
+        "port-forward service/cats-controld 17300:7300",
+        "/v1/admin/nodes",
+        "route-grant-public.sha256",
+        "deploy/aws/check-route-grant-nodes.sh",
+    ] {
+        assert!(
+            gate.contains(fragment),
+            "Route Grant preflight lost {fragment:?}"
+        );
+    }
+    for fragment in [
+        ".node.state == \"ready\"",
+        "(.assigned_cats // 0) > 0",
+        "(.orphan_cats // 0) > 0",
+        ".node.route_grant_public_key_sha256",
+        "Interrupted Route Grant worker rollout",
+        "Schedulable or serving Nodes verify a different Route Grant key",
+    ] {
+        assert!(
+            verifier.contains(fragment),
+            "Route Grant Node verifier lost {fragment:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn route_grant_node_preflight_exercises_safe_and_interrupted_rollout_cohorts() {
+    let fixture = tempfile::tempdir().expect("Route Grant preflight fixture");
+    let expected = "a".repeat(64);
+    let run = |name: &str, items: serde_json::Value| {
+        let path = fixture.path().join(format!("{name}.json"));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({ "items": items })).unwrap(),
+        )
+        .unwrap();
+        Command::new("bash")
+            .arg(workspace_root().join("deploy/aws/check-route-grant-nodes.sh"))
+            .arg(&expected)
+            .arg(path)
+            .output()
+            .unwrap()
+    };
+    let node =
+        |id: &str, state: &str, fingerprint: Option<&str>, assigned_cats: u64, orphan_cats: u64| {
+            serde_json::json!({
+                "node": {
+                    "id": id,
+                    "state": state,
+                    "route_grant_public_key_sha256": fingerprint,
+                },
+                "assigned_cats": assigned_cats,
+                "orphan_cats": orphan_cats,
+            })
+        };
+
+    let all_legacy = run(
+        "all-legacy",
+        serde_json::json!([
+            node("legacy-ready", "ready", None, 0, 0),
+            node("legacy-serving", "cordoned", None, 1, 0),
+        ]),
+    );
+    assert!(all_legacy.status.success());
+    assert!(String::from_utf8_lossy(&all_legacy.stdout).contains("Additive first rollout"));
+
+    let all_enforcing = run(
+        "all-enforcing",
+        serde_json::json!([
+            node("ready", "ready", Some(&expected), 0, 0),
+            node("empty-legacy", "cordoned", None, 0, 0),
+        ]),
+    );
+    assert!(all_enforcing.status.success());
+
+    let interrupted = run(
+        "interrupted",
+        serde_json::json!([
+            node("ready", "ready", Some(&expected), 0, 0),
+            node("legacy-serving", "draining", None, 2, 0),
+        ]),
+    );
+    assert!(!interrupted.status.success());
+    assert!(String::from_utf8_lossy(&interrupted.stderr)
+        .contains("Interrupted Route Grant worker rollout"));
+
+    let mismatch = "b".repeat(64);
+    let wrong_orphan = run(
+        "wrong-orphan",
+        serde_json::json!([node("wrong-orphan", "cordoned", Some(&mismatch), 0, 1,)]),
+    );
+    assert!(!wrong_orphan.status.success());
+    assert!(String::from_utf8_lossy(&wrong_orphan.stderr)
+        .contains("verify a different Route Grant key"));
+}
+
+#[test]
+fn route_grant_application_rolls_control_plane_before_gateway() {
+    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    let control = kubernetes
+        .split_once("resource \"kubernetes_deployment_v1\" \"control_plane\"")
+        .and_then(|(_, rest)| rest.split_once("resource \"kubernetes_pod_disruption_budget_v1\""))
+        .map(|(section, _)| section)
+        .expect("control-plane Deployment section");
+    let gateway = kubernetes
+        .split_once("resource \"kubernetes_deployment_v1\" \"gateway\"")
+        .and_then(|(_, rest)| rest.split_once("resource \"kubernetes_service_v1\" \"gateway\""))
+        .map(|(section, _)| section)
+        .expect("Gateway Deployment section");
+
+    assert!(
+        control.contains("wait_for_rollout = true"),
+        "the Gateway dependency is safe only if Terraform waits for the complete control-plane rollout"
+    );
+    assert!(
+        gateway.contains("wait_for_rollout = true"),
+        "Terraform must wait for the Gateway rollout too"
+    );
+    assert!(
+        gateway.contains("depends_on = [kubernetes_deployment_v1.control_plane]"),
+        "a new Gateway must not start until every control-plane replica issues Route Grants"
+    );
+}
+
 #[cfg(unix)]
 fn ha_fixture_guard() -> std::sync::MutexGuard<'static, ()> {
     static FIXTURE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -128,7 +413,10 @@ fn production_schema_probe_fails_closed() {
     let probe = workflow
         .split("# The control store lives in PostgreSQL.")
         .nth(1)
-        .and_then(|rest| rest.split("- name: Initialize application state").next())
+        .and_then(|rest| {
+            rest.split("- name: Check Route Grant verifier compatibility")
+                .next()
+        })
         .expect("control schema probe block");
 
     assert!(probe.contains("query_status=$?"));
@@ -667,9 +955,9 @@ fn production_control_plane_survives_one_pod_or_node_disruption() {
         "replicas = var.control_plane_replicas",
         "type = \"RollingUpdate\"",
         "max_unavailable = \"0\"",
-        "termination_grace_period_seconds = local.control_plane_termination_grace_period_seconds",
+        "termination_grace_period_seconds = local.public_target_termination_grace_period_seconds",
         "pre_stop {",
-        "command = [\"/bin/sh\", \"-c\", \"sleep ${local.control_plane_pre_stop_delay_seconds}\"]",
+        "command = [\"/bin/sh\", \"-c\", \"sleep ${local.public_target_pre_stop_delay_seconds}\"]",
         "pod_anti_affinity {",
         "required_during_scheduling_ignored_during_execution {",
         "topology_key       = \"kubernetes.io/hostname\"",
@@ -695,9 +983,9 @@ fn production_control_plane_survives_one_pod_or_node_disruption() {
         );
     }
     for expected in [
-        "control_plane_pre_stop_delay_seconds           = 15",
-        "control_plane_termination_grace_period_seconds = 30",
-        "condition     = local.control_plane_pre_stop_delay_seconds < local.control_plane_termination_grace_period_seconds",
+        "public_target_pre_stop_delay_seconds           = 15",
+        "public_target_termination_grace_period_seconds = 30",
+        "condition     = local.public_target_pre_stop_delay_seconds < local.public_target_termination_grace_period_seconds",
     ] {
         assert!(
             terraform.contains(expected),
@@ -712,6 +1000,79 @@ fn production_control_plane_survives_one_pod_or_node_disruption() {
     assert!(
         !deployment.contains("type = \"Recreate\""),
         "Recreate deliberately creates a total control-plane outage"
+    );
+}
+
+#[test]
+fn production_gateway_survives_one_pod_or_node_disruption() {
+    let terraform = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    let variables =
+        read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/variables.tf");
+    let deployment = terraform
+        .split("resource \"kubernetes_deployment_v1\" \"gateway\"")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("resource \"kubernetes_service_v1\" \"gateway\"")
+                .next()
+        })
+        .expect("Gateway Deployment block");
+
+    for expected in [
+        "replicas = var.gateway_replicas",
+        "type = \"RollingUpdate\"",
+        "max_surge       = \"1\"",
+        "max_unavailable = \"0\"",
+        "termination_grace_period_seconds = local.public_target_termination_grace_period_seconds",
+        "pre_stop {",
+        "command = [\"/bin/sh\", \"-c\", \"sleep ${local.public_target_pre_stop_delay_seconds}\"]",
+        "pod_anti_affinity {",
+        "required_during_scheduling_ignored_during_execution {",
+        "topology_key       = \"kubernetes.io/hostname\"",
+        "when_unsatisfiable = \"DoNotSchedule\"",
+    ] {
+        assert!(
+            deployment.contains(expected),
+            "Gateway Deployment is missing {expected:?}"
+        );
+    }
+    let required_anti_affinity = deployment
+        .split("required_during_scheduling_ignored_during_execution {")
+        .nth(1)
+        .and_then(|rest| rest.split("topology_spread_constraint {").next())
+        .expect("required Gateway hostname anti-affinity block");
+    for expected in [
+        "topology_key = \"kubernetes.io/hostname\"",
+        "\"app.kubernetes.io/name\" = \"cats-gatewayd\"",
+    ] {
+        assert!(
+            required_anti_affinity.contains(expected),
+            "required Gateway anti-affinity is missing {expected:?}"
+        );
+    }
+    for expected in [
+        "public_target_pre_stop_delay_seconds           = 15",
+        "public_target_termination_grace_period_seconds = 30",
+        "condition     = local.public_target_pre_stop_delay_seconds < local.public_target_termination_grace_period_seconds",
+    ] {
+        assert!(
+            terraform.contains(expected),
+            "public target drain is missing {expected:?}"
+        );
+    }
+    assert!(variables.contains("var.gateway_replicas >= 2"));
+    let disruption_budget = terraform
+        .split("resource \"kubernetes_pod_disruption_budget_v1\" \"gateway\"")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("resource \"kubernetes_service_v1\" \"gateway\"")
+                .next()
+        })
+        .expect("Gateway PodDisruptionBudget block");
+    assert!(disruption_budget.contains("min_available = \"1\""));
+    assert!(disruption_budget.contains("\"app.kubernetes.io/name\" = \"cats-gatewayd\""));
+    assert!(
+        !deployment.contains("type = \"Recreate\""),
+        "Recreate deliberately creates a total Gateway outage"
     );
 }
 
@@ -1064,55 +1425,49 @@ fn noninteractive_worker_bootstrap_defines_root_home_before_toolchain_use() {
     }
 }
 
+#[cfg(unix)]
 #[test]
-fn production_deploy_detaches_the_legacy_control_volume_after_plan_and_before_apply() {
-    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
-    let plan = workflow
-        .find("- name: Plan production deployment")
-        .expect("production plan step");
-    let detach = workflow
-        .find("- name: Detach legacy control volume")
-        .expect("legacy control-volume detach step");
-    let apply = workflow
-        .find("- name: Apply reviewed plan")
-        .expect("production apply step");
-
+fn worker_bootstrap_validates_and_installs_its_route_grant_key_before_mutation() {
+    let script = read_workspace_file("deploy/aws/metal/install-worker.sh");
+    let required = script
+        .find("CATS_ROUTE_GRANT_PUBLIC_KEY_FILE is required")
+        .expect("required Route Grant key input");
+    let validator = script
+        .find("validate-route-grant-public-key.sh")
+        .expect("cryptographic Route Grant key validator");
+    let first_package_mutation = script.find("apt-get update -q").expect("package mutation");
+    let key_install = script
+        .find("install -o root -g root -m 0644 \"$ROUTE_GRANT_PUBLIC_KEY_STAGE\"")
+        .expect("root-owned Route Grant key install");
+    let key_destination = script
+        .find("/etc/cats/route-grant-public.pem")
+        .expect("service Route Grant key path");
+    let environment_branch = script
+        .find("if [[ -f /etc/cats/worker.env ]]")
+        .expect("existing worker.env branch");
     assert!(
-        plan < detach && detach < apply,
-        "the legacy volume must be detached only after the saved plan and before its apply"
+        required < validator
+            && validator < first_package_mutation
+            && key_install <= key_destination
+            && key_destination < environment_branch,
+        "missing/malformed key input must fail before package/file/service mutation, and a valid key must be installed before either worker.env branch"
     );
+    assert!(script.contains("trap cleanup_route_grant_key EXIT"));
 
-    let detach_step = workflow[detach..apply].to_owned();
-    for expected in [
-        "get namespace \"$namespace\" --output=name",
-        "get pvc \"$legacy_claim\" --ignore-not-found --output=name",
-        "show -json \"$RUNNER_TEMP/production.tfplan\"",
-        "module.cats_kubernetes.kubernetes_deployment_v1.control_plane",
-        ".change.after.spec[0].replicas >= 2",
-        "persistentVolumeClaim.claimName == $claim",
-        "scale deployment \"$control_deployment\" --replicas=0",
-        "remaining_consumers=\"$(control_volume_consumers)\"",
+    let validator = workspace_root().join("deploy/aws/metal/validate-route-grant-public-key.sh");
+    let valid = Command::new(&validator)
+        .arg(workspace_root().join("tests/fixtures/route_grant_public_ed25519.pem"))
+        .output()
+        .expect("validate Ed25519 public fixture");
+    assert!(valid.status.success());
+    for invalid in [
+        "tests/fixtures/route_grant_private_ed25519.pem",
+        "Cargo.toml",
     ] {
-        assert!(
-            detach_step.contains(expected),
-            "legacy detach step is missing {expected:?}"
-        );
+        let output = Command::new(&validator)
+            .arg(workspace_root().join(invalid))
+            .output()
+            .unwrap_or_else(|error| panic!("validate {invalid}: {error}"));
+        assert!(!output.status.success(), "accepted invalid key {invalid}");
     }
-    let attached_check = detach_step
-        .find("if [[ -z \"$attached_consumers\" ]]")
-        .expect("already-detached fast path");
-    let plan_guard = detach_step
-        .find("show -json \"$RUNNER_TEMP/production.tfplan\"")
-        .expect("saved-plan replica guard");
-    let scale = detach_step
-        .find("scale deployment \"$control_deployment\" --replicas=0")
-        .expect("legacy Deployment scale");
-    assert!(
-        attached_check < plan_guard && plan_guard < scale,
-        "an unused PVC needs no scale, while a scale requires the saved-plan guard"
-    );
-    assert!(
-        !detach_step.contains("finalizers") && !detach_step.contains("delete pvc"),
-        "the deploy must release the mounted claim, never bypass PVC protection"
-    );
 }

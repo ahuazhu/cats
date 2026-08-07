@@ -28,5 +28,10 @@ override.tf.json
 *_override.tf
 *_override.tf.json
 
+# Qualification plans and live production observations are review evidence and
+# may expose infrastructure inventory. Keep them outside source control.
+deploy/aws/terraform/qualification/**/*.plan.json
+deploy/aws/terraform/qualification/**/*.inventory.json
+
 # Scratch binaries from local builds/experiments (a .tmp-blockd once slipped in).
 .tmp-*
