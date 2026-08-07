@@ -130,7 +130,8 @@ build_environment=(
   HOME="${job_dir}/home"
   USER=cats-build
   LOGNAME=cats-build
-  PATH=/opt/cats-build/cargo/bin:/usr/local/bin:/usr/bin:/bin
+  PATH=/opt/cats-build/cargo/bin:/usr/local/bin:/usr/bin:/usr/sbin
+  RUST_TEST_THREADS=4
   CARGO_HOME="${job_dir}/cargo-home"
   RUSTUP_HOME=/opt/cats-build/rustup
   CARGO_TARGET_DIR="${job_dir}/cargo-target"
@@ -155,6 +156,7 @@ systemd-run --quiet --wait --collect --pipe \
   --property=PrivateTmp=true \
   --property=PrivateIPC=true \
   --property=NoNewPrivileges=true \
+  --property=LimitNOFILE=65536 \
   /usr/bin/env -i "${build_environment[@]}" \
   bash -c 'cd /srv/cats-build/source && exec "$@"' cats-run-build "$@" || status=$?
 

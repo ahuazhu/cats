@@ -98,6 +98,15 @@ class BuildHostBoundaryTests(unittest.TestCase):
             )
         )
 
+    def test_isolated_build_path_exposes_native_system_tools(self) -> None:
+        build_path = "/opt/cats-build/cargo/bin:/usr/local/bin:/usr/bin:/usr/sbin"
+        self.assertEqual(build_path.split(":")[-1], "/usr/sbin")
+        self.assertEqual(len(build_path.split(":")), len(set(build_path.split(":"))))
+
+        runner = self.text("bootstrap/run-build.sh")
+        self.assertIn(f"PATH={build_path}", runner)
+        self.assertIn("RUST_TEST_THREADS=4", runner)
+
     def test_bootstrap_refreezes_toolchain_after_success_and_failure(self) -> None:
         bootstrap = self.text("bootstrap/bootstrap.sh")
         start = "toolchain_needs_refreeze=false"
@@ -285,6 +294,7 @@ thaw_toolchain
         self.assertIn("--property=PrivateTmp=true", runner)
         self.assertIn("--property=PrivateIPC=true", runner)
         self.assertIn("--property=NoNewPrivileges=true", runner)
+        self.assertIn("--property=LimitNOFILE=65536", runner)
         self.assertNotIn("/usr/sbin/runuser", runner)
         self.assertIn("bootstrap_payload_sha256", runner)
         self.assertIn('chown root:root "${job_dir}"', runner)

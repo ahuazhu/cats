@@ -330,7 +330,6 @@ jq -n -S \
       administration: "ssm-only"
     },
     bootstrap: {
-      bootstrap_sha256: $identity.bootstrap_sha256,
       toolchain_lock_sha256: $identity.toolchain_lock_sha256,
       payload_sha256: $identity.bootstrap_payload_sha256,
       apt_snapshot_id: $identity.apt_snapshot_id,
