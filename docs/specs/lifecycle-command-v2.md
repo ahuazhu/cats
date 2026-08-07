@@ -1023,12 +1023,15 @@ lifecycle-V2 capable. A V1-only runtime is upgraded and exactly re-adopted,
 cold-moved before cutover, or externally fenced/quarantined; stable state does
 not exempt it. Stale/missing capability evidence blocks Activate.
 
-Lifecycle-V2 capability is independent of the signed Route Grant cohort. A
-lifecycle-V2 Node may remain explicitly route-legacy during B rollout, but a
-route-V2 Node cannot remain lifecycle-V1. Activate switches the database
-authority version to V2 and prevents old writers. Contract removes V1 lifecycle
-decode/execute/journaling only after the ADR-0035 deletion conditions and the
-characterization matrix pass.
+Lifecycle-V2 and terminal Route Grant V2 are independently proven capabilities
+but one breaking serving-fleet gate. A route-V2 Node cannot remain lifecycle-V1,
+and a lifecycle-V2 Node without terminal Route Grant V2 stays unready/cordoned;
+neither combination is a compatibility cohort. Activate may switch the database
+authority version while public admission remains frozen, but traffic reopens
+only after every serving Node proves both capabilities and known-positive
+inventory finds no old Route Grant signer/parser/verifier/admission path.
+Contract removes V1 lifecycle decode/execute/journaling only after the ADR-0035
+deletion conditions and the characterization matrix pass.
 
 There is no permanent translation adapter and no fallback that maps a V2
 dispatch to V1 `CleanupCat`, epoch zero or a generation-derived Job ID.

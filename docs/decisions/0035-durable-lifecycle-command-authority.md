@@ -928,11 +928,15 @@ The rollout is **Expand -> Shadow -> Freeze -> Activate -> Contract**.
 - Unfreeze API/policy work only after the V2 recovery scan accounts for every
   current intent, waiting predecessor and nonterminal command.
 
-Lifecycle-V2 capability and B's signed Route Grant cohort are orthogonal. A
-Node may remain in an explicitly represented route-legacy cohort only after it
-is lifecycle-V2 capable; that does not let it execute V1 lifecycle work or mint
-V2 grants. Conversely, route-V2 capability never satisfies this lifecycle
-activation gate.
+Lifecycle-V2 and B0's terminal Route Grant V2 are independent capabilities but
+one breaking serving-fleet gate. Route capability never satisfies this
+lifecycle activation gate, and lifecycle capability never authorizes an old
+Route Grant path. Lifecycle authority may be activated while public admission
+remains frozen, but traffic cannot reopen until every serving Node proves both
+capabilities and known-positive inventory proves the old Route Grant
+signer/parser/verifier/admission paths absent. There is no lifecycle-V2/
+route-legacy or lifecycle-V1/route-V2 compatibility cohort; a partially updated
+fleet remains unready/cordoned.
 
 Activation is a one-way authority cutover. After any V2 dispatch, "rollback"
 means roll back to a V2-compatible binary that continues to honor the same
@@ -950,6 +954,8 @@ following:
 
 - the Activate lifecycle-capability proof remains true, and no V1 lifecycle job
   exists anywhere in a Node journal, retry queue or operational replay window;
+- the B0 breaking serving-fleet gate proves terminal Route Grant V2 on every
+  serving Node and zero old Route Grant signer/parser/verifier/admission path;
 - no deployed binary can write V1 lifecycle authority;
 - every Cat has normalized command/runtime provenance or an explicit repaired
   stable state;
