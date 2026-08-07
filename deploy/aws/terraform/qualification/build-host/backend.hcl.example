@@ -1,0 +1,10 @@
+bucket       = "cats-qualification-v2-tfstate-ACCOUNT-us-east-1"
+key          = "architecture-v2/h2-build-host/terraform.tfstate"
+region       = "us-east-1"
+encrypt      = true
+kms_key_id   = "arn:aws:kms:us-east-1:ACCOUNT:key/KEY-ID"
+use_lockfile = true
+
+assume_role = {
+  role_arn = "arn:aws:iam::ACCOUNT:role/cats-qualification-v2-terraform-state"
+}

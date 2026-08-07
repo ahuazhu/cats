@@ -663,7 +663,15 @@ Edge 选择证书、校验 Host/SNI、执行限流和最大请求策略。
 
 **3. Route Lookup**
 
-按 hostname 查只读缓存，得到 workspace/cat/node/port/epoch。
+按 hostname 查只读缓存，得到 workspace/cat/generation/node/port/epoch 和短期 Ed25519
+签名 Route Grant。Gateway 只规范化一次公网 Host，并在写缓存前要求返回 binding 的规范化
+hostname 完全相同；HTTP 与 WebSocket 都把这个原始授权 Host 发送给 Node。控制面只对
+active + Running 路由签发；Gateway 没有签名私钥。
+每个生产 Gateway 在返回新授权前还会尝试把完整签名响应写入独立于 PostgreSQL 的区域
+DynamoDB 短寿命缓存；任一冷 Gateway 副本先强一致读取它，因此授权不再绑定于最初命中的
+Pod。共享层只复制控制面签发的正授权，并按 PostgreSQL `routes.epoch`（同 epoch 内再按签名
+签发时间）条件更新；Gateway 不用本地墙钟制造共享撤销。表内值仍不是权限源，签名过期不
+延长，最终必须通过 Node 验签。
 
 **4. Activation**
 
@@ -673,13 +681,46 @@ Cat 非 Running 时按 wake policy 唤醒；并发请求 singleflight。
 
 通过区域私网/mTLS 或受控 tunnel 发送到 owning Node gateway。
 
-**6. Epoch Check**
+**6. Grant / Epoch Check**
 
-Node 再校验 route epoch 和 Guest IP，拒绝旧绑定与跨租户端口。
+Node 验证 Route Grant 的签名、时效、hostname、Cat generation、Node、route epoch 和
+目标端口，再校验本地 Cat 仍为 Running，拒绝旧绑定与跨租户端口。
 
 **7. Guest**
 
 转发到 tap 私网地址；响应字节计入 tenant egress ledger。
+
+**控制面故障契约（[ADR-0033](decisions/0033-short-lived-signed-route-grants.md)）：**
+Gateway 的普通缓存过期后，只要 active + Running Route Grant 的签名时效仍有效，就立即
+准入并按 hostname 合并为一个后台 refresh；transport/5xx 失败保留该授权并进入有界退避，
+不会让每个请求等待两秒或放大控制面流量。观察到明确 not-found、其他非成功响应、畸形响应
+或 Node 409 后，该 Gateway 立即失效被拒绝的本地 Grant。除自然签名过期外，这些拒绝都会
+在“最大 Grant TTL + 验证器允许的时钟偏差”这一完整窗口内绕过共享镜像；因此它不会在旧
+授权仍可能有效时重新导入自己刚拒绝的授权，控制面直接返回新的 active + Running 是唯一
+能提前解除屏障的路径。Node 用机器可读的冲突元数据单独标识自然过期；过期不是撤销信号，
+所以控制面不可用时，Gateway 只可从共享镜像导入按 route epoch、再按签名签发时间严格更新
+的有效 Grant，相同或更旧的 Grant 仍被拒绝。并发或迟到的同一/更旧 Grant 拒绝会合并到
+已有刷新，不能取消该刷新或清掉已经安装的更新 Grant；同一 Grant 的非过期冲突强于自然
+过期并保留保守屏障。本地 Grant 到期时，如果更早启动的后台刷新或退避只能访问控制面，
+且当前拒绝策略允许读取共享缓存，Gateway 会把它原子升级为可读共享缓存的 singleflight，
+边界请求不会等待一条用不了连续性路径的刷新。HTTP/WS 使用同一规则，Node 仍执行最终
+签名、绑定和运行态校验。
+完整窗口到期后，Gateway 可以再次接受其他副本写入的当前有效控制面
+签名 Grant。已签发并复制的其他副本仍以签名到期为授权上界；单个 Grant 到期始终 fail
+closed。HTTP/WS 的生命周期并发由 Node 持有的本地
+activity guard 仲裁，不再逐请求获取 PostgreSQL work lease；Wake 仍必须经过控制面。
+共享缓存故障时回退到健康控制面，控制面故障时回退到有效的共享/本地 Grant；Gateway
+启动和 Ready 不依赖 DynamoDB。运行时共享缓存 I/O 有 100 ms 硬截止时间；低 epoch 或同
+epoch 的较早签发写不能覆盖更新授权，因此缓存变慢或写响应乱序不会劫持健康控制面路径。
+
+**密钥一致性门禁：** 每个控制面副本启动前用私钥签名、用同次部署从该私钥派生的公钥
+验证固定 proof；Grant 的 `kid` 和 Node 注册均携带公钥 SPKI DER 的 SHA-256。Node 报告的
+指纹不匹配时，注册事务会把它保持为 Cordoned，管理 API 也拒绝 uncordon。生产发布在
+Terraform plan 前比较所有可调度或仍承载 assigned/orphan Cat 的 Node；全 legacy cohort 只
+用于第一次 additive rollout，legacy/enforcing 混合 cohort 作为中断发布拒绝。注册、placement
+和 uncordon 共享事务线性化点；数据库中的一次性 legacy phase 在所有 serving Node 报告
+verifier 后永久关闭。金属机部署在安装后再次计算指纹，因此独立错配、降级或中断发布不能
+把不兼容 Node 放入流量路径。
 
 ### 9.2 地址与路由
 

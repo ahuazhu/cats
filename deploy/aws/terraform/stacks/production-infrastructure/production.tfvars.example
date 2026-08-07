@@ -29,8 +29,9 @@ metal_worker_instance_role_name = "REPLACE_WITH_INSTANCE_ROLE_NAME"
 # keeps the old token and drops off the control plane when the new one lands.
 # metal_worker_deploy_instances = ["metal-1"]
 
-# Supply worker_runtime_secret_data through TF_VAR_worker_runtime_secret_data
-# or the approved CI secret store; do not put it in this file.
+# Supply worker_runtime_secret_data through TF_VAR_worker_runtime_secret_data.
+# Supply the matching public half through TF_VAR_route_grant_public_key_pem;
+# do not put either value in this file.
 
 # After the platform RDS Proxy target is AVAILABLE, supply these through an
 # approved non-secret tfvars source and roll one drained worker at a time:

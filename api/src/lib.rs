@@ -24,3 +24,4 @@ pub mod nodejob;
 pub mod oci;
 pub mod requests;
 pub mod resources;
+pub mod route_grant;

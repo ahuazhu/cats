@@ -5,7 +5,20 @@
 //! reinventing the DSN handling. The server named by `CATS_TEST_POSTGRES_URL`
 //! is treated as disposable; schemas are created and never dropped.
 
+use std::sync::Arc;
+
 use postgres::NoTls;
+
+pub fn route_grant_signer() -> Arc<crate::route_grant::RouteGrantSigner> {
+    Arc::new(
+        crate::route_grant::RouteGrantSigner::from_ed25519_pem(
+            include_bytes!("../../tests/fixtures/route_grant_private_ed25519.pem"),
+            include_bytes!("../../tests/fixtures/route_grant_public_ed25519.pem"),
+            120,
+        )
+        .expect("test Route Grant key is valid"),
+    )
+}
 
 /// Base DSN of the disposable test server.
 ///

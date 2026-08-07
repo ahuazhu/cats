@@ -58,6 +58,39 @@ use cats_api::resources::*;
 
 pub type Result<T> = std::result::Result<T, ApiError>;
 
+/// Scheduling admission carried by one Node registration.
+///
+/// Keeping the verifier identity and its compatibility decision together
+/// prevents callers from accidentally persisting one fingerprint while
+/// applying the admission result for another.
+pub(crate) struct NodeAdmission<'a> {
+    initially_cordoned: bool,
+    route_grant_public_key_sha256: Option<&'a str>,
+    expected_route_grant_public_key_sha256: Option<&'a str>,
+}
+
+impl<'a> NodeAdmission<'a> {
+    pub(crate) fn legacy(initially_cordoned: bool) -> Self {
+        Self {
+            initially_cordoned,
+            route_grant_public_key_sha256: None,
+            expected_route_grant_public_key_sha256: None,
+        }
+    }
+
+    pub(crate) fn for_route_grant(
+        initially_cordoned: bool,
+        actual: Option<&'a str>,
+        expected: &'a str,
+    ) -> Self {
+        Self {
+            initially_cordoned,
+            route_grant_public_key_sha256: actual,
+            expected_route_grant_public_key_sha256: Some(expected),
+        }
+    }
+}
+
 pub fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

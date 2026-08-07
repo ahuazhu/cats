@@ -976,8 +976,11 @@ dependencies = [
 name = "cats-api"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "hex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.19",
 ]
 
@@ -1202,6 +1205,8 @@ name = "cats-network"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aws-config",
+ "aws-sdk-dynamodb",
  "axum",
  "base64",
  "cats-api",
@@ -1214,7 +1219,6 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
@@ -1232,6 +1236,7 @@ dependencies = [
  "cats-test-support",
  "futures-util",
  "hex",
+ "jsonwebtoken",
  "libc",
  "reqwest",
  "rusqlite",

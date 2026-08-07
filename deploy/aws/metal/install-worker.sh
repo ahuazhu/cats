@@ -11,6 +11,27 @@ CATS_CH_VERSION=${CATS_CH_VERSION:-v53.0}
 [[ $(uname -m) == x86_64 ]] || { echo "x86_64 is required" >&2; exit 1; }
 [[ -e /dev/kvm ]] || { echo "/dev/kvm missing: use a bare-metal instance" >&2; exit 1; }
 
+# Validate every required operator input before apt, build, installed-file or
+# systemd mutation. Staging closes the validate/use race if the supplied path
+# is replaced while this long-running bootstrap builds the Guest image.
+ROUTE_GRANT_PUBLIC_KEY_SOURCE=${CATS_ROUTE_GRANT_PUBLIC_KEY_FILE:-}
+[[ -n $ROUTE_GRANT_PUBLIC_KEY_SOURCE ]] || {
+  echo "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE is required" >&2
+  exit 1
+}
+[[ -f $ROUTE_GRANT_PUBLIC_KEY_SOURCE ]] || {
+  echo "Route Grant public key is not a regular file: $ROUTE_GRANT_PUBLIC_KEY_SOURCE" >&2
+  exit 1
+}
+ROUTE_GRANT_PUBLIC_KEY_STAGE=$(mktemp)
+cleanup_route_grant_key() {
+  rm -f -- "$ROUTE_GRANT_PUBLIC_KEY_STAGE"
+}
+trap cleanup_route_grant_key EXIT
+install -m 0600 "$ROUTE_GRANT_PUBLIC_KEY_SOURCE" "$ROUTE_GRANT_PUBLIC_KEY_STAGE"
+"$CATS_REPO/deploy/aws/metal/validate-route-grant-public-key.sh" \
+  "$ROUTE_GRANT_PUBLIC_KEY_STAGE"
+
 validate_worker_identity() {
   local worker_node_id worker_advertise_url
 
@@ -107,6 +128,8 @@ else
 fi
 
 install -d "$CATS_PREFIX/bin" "$CATS_PREFIX/guest" /var/lib/cats/node /etc/cats
+install -o root -g root -m 0644 "$ROUTE_GRANT_PUBLIC_KEY_STAGE" \
+  /etc/cats/route-grant-public.pem
 install -m 0755 "$CATS_REPO/target/release/cats-noded" "$CATS_PREFIX/bin/cats-noded"
 install -m 0755 "$CATS_REPO/target/release/cats-blockd" "$CATS_PREFIX/bin/cats-blockd"
 install -m 0755 "$CATS_REPO/target/release/cats-guest-agent" "$CATS_PREFIX/bin/cats-guest-agent"

@@ -11,6 +11,8 @@ struct Args {
     auth_token: String,
     #[arg(long, default_value_t = 1000)]
     cache_ttl_ms: u64,
+    #[arg(long, env = "CATS_SHARED_ROUTE_CACHE_TABLE")]
+    shared_route_cache_table: Option<String>,
 }
 
 #[tokio::main]
@@ -26,6 +28,7 @@ async fn main() -> anyhow::Result<()> {
         control_plane_url: args.control_plane_url,
         auth_token: args.auth_token,
         cache_ttl_ms: args.cache_ttl_ms,
+        shared_route_cache_table: args.shared_route_cache_table,
     })
     .await?;
     println!("READY {}", handle.addr);

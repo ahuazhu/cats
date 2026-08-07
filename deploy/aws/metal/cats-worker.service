@@ -5,10 +5,9 @@ Wants=network-online.target
 
 [Service]
 Delegate=cpu memory
-# Stop or restart only the node agent. Its ledger-backed adoption path proves
-# and re-adopts the surviving VMM and blockd processes (ADR-0028); killing the
-# whole cgroup here would terminate every Cat on this worker at once.
-KillMode=process
+# Keep systemd's default KillMode=control-group until #186 makes ledger
+# persistence and every in-flight lifecycle crash window safely re-adoptable.
+# A controlled worker release must drain to cats=0/orphans=0 before stopping.
 Environment=CATS_GUEST_NETWORK_CIDR=10.240.0.0/16
 # Direct RDS remains the compatible default. A managed worker environment can
 # override this after the proxy exists and has passed its connectivity check.
@@ -26,6 +25,7 @@ ExecStart=/opt/cats/bin/cats-noded \
   --advertise-url $CATS_NODE_ADVERTISE_URL \
   --initially-cordoned \
   --control-plane-url $CATS_CONTROL_PLANE_URL \
+  --route-grant-public-key-file /etc/cats/route-grant-public.pem \
   --gateway-url $CATS_GATEWAY_URL \
   --state-dir /var/lib/cats/node \
   --blockd-bin /opt/cats/bin/cats-blockd \
@@ -33,7 +33,7 @@ ExecStart=/opt/cats/bin/cats-noded \
   --metadata-store-adapter postgres \
   --metadata-store-option url-file=/run/cats/postgres-url \
   --metadata-store-option ca-file=/etc/cats/rds-ca.pem \
-  --metadata-store-option session-setup=$CATS_POSTGRES_SESSION_SETUP \
+  --metadata-store-option session-setup=${CATS_POSTGRES_SESSION_SETUP} \
   --object-store-adapter aws-s3 \
   --object-store-option bucket=${CATS_S3_BUCKET} \
   --object-store-option region=${CATS_AWS_REGION} \

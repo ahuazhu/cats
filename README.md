@@ -102,6 +102,10 @@ cargo clippy --workspace --all-targets   # 零警告
 单机手动体验（四个终端或后台）：
 
 ```bash
+openssl genpkey -algorithm ED25519 -out /tmp/cats-route-grant-private.pem
+openssl pkey -in /tmp/cats-route-grant-private.pem -pubout -out /tmp/cats-route-grant-public.pem
+export CATS_ROUTE_GRANT_PRIVATE_KEY_FILE=/tmp/cats-route-grant-private.pem
+export CATS_ROUTE_GRANT_PUBLIC_KEY_FILE=/tmp/cats-route-grant-public.pem
 cargo run -p cats-control-plane-daemon --bin cats-controld -- --listen 127.0.0.1:7300
 cargo run -p cats-node-agent-daemon --bin cats-noded -- \
   --node-id n1 --control-plane-url http://127.0.0.1:7300 \

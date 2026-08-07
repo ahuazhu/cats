@@ -4,10 +4,9 @@ After=cats-controld.service
 Wants=cats-controld.service
 
 [Service]
-# Stop or restart only the node agent. Its ledger-backed adoption path proves
-# and re-adopts the surviving VMM and blockd processes (ADR-0028); killing the
-# whole cgroup here would terminate every Cat on this worker at once.
-KillMode=process
+# Keep systemd's default KillMode=control-group until #186 makes ledger
+# persistence and every in-flight lifecycle crash window safely re-adoptable.
+# Drain to cats=0/orphans=0 before a controlled stop or restart.
 # Single-node defaults; override in /etc/cats/cats.env to join a cluster.
 Environment=CATS_GUEST_NETWORK_CIDR=10.240.0.0/16
 Environment=CATS_NODE_ID=metal-1
@@ -27,6 +26,7 @@ ExecStart=/opt/cats/bin/cats-noded \
   --listen ${CATS_NODE_LISTEN} \
   --advertise-url ${CATS_NODE_ADVERTISE_URL} \
   --control-plane-url ${CATS_CONTROL_PLANE_URL} \
+  --route-grant-public-key-file /etc/cats/route-grant-public.pem \
   --gateway-url ${CATS_GATEWAY_URL} \
   --state-dir /var/lib/cats/node \
   --blockd-bin /opt/cats/bin/cats-blockd \

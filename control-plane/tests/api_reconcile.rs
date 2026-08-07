@@ -344,6 +344,13 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
             gateway_url: format!("http://{addr}"),
             cpus: 16,
             memory_mib: 32_768,
+            route_grant_public_key_sha256: Some(
+                cp.state
+                    .cfg
+                    .route_grant_signer
+                    .public_key_sha256()
+                    .to_string(),
+            ),
             initially_cordoned: false,
         })
         .send()
@@ -482,6 +489,7 @@ impl Ctx {
             credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
             storage_meta,
             auth_token: SERVICE_TOKEN.into(),
+            route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
             admin_token: "dev-admin-token".into(),
             workos: None,
             stripe: None,
@@ -967,6 +975,7 @@ async fn two_api_replicas_linearize_create_start_and_delete() {
         credit_store: usage,
         storage_meta,
         auth_token: SERVICE_TOKEN.into(),
+        route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "dev-admin-token".into(),
         workos: None,
         stripe: None,
@@ -1116,6 +1125,7 @@ async fn reconciler_handoff_replays_persisted_suspending_with_the_same_job() {
         credit_store: usage,
         storage_meta,
         auth_token: SERVICE_TOKEN.into(),
+        route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "dev-admin-token".into(),
         workos: None,
         stripe: None,
@@ -2131,6 +2141,7 @@ async fn node_loss_preserves_claim_until_fencing_is_explicitly_confirmed() {
             gateway_url: registered.gateway_url.clone(),
             cpus: registered.capacity.cpus,
             memory_mib: registered.capacity.memory_mib,
+            route_grant_public_key_sha256: registered.route_grant_public_key_sha256.clone(),
             initially_cordoned: false,
         },
     )
@@ -2353,6 +2364,7 @@ async fn control_plane_startup_grace_preserves_a_reconnecting_host_bound_cat() {
         control_store_ca_file: None,
         storage_meta,
         auth_token: SERVICE_TOKEN.into(),
+        route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "dev-admin-token".into(),
         workos: None,
         stripe: None,
@@ -2679,6 +2691,7 @@ async fn static_user_tokens_are_not_accepted() {
         credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
         storage_meta,
         auth_token: SERVICE_TOKEN.into(),
+        route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "token-admin".into(),
         workos: None,
         stripe: None,
@@ -3082,6 +3095,143 @@ async fn exhausted_prepaid_balance_blocks_new_or_waking_compute() {
 }
 
 #[tokio::test]
+async fn route_grant_verifier_admission_is_rollout_compatible_and_fails_closed() {
+    let ctx = Ctx::new().await;
+    let register = |fingerprint: String| RegisterNodeRequest {
+        node_id: "node-key-mismatch".into(),
+        agent_url: "http://127.0.0.1:7301".into(),
+        gateway_url: "http://127.0.0.1:7301".into(),
+        cpus: 4,
+        memory_mib: 4096,
+        route_grant_public_key_sha256: Some(fingerprint),
+        initially_cordoned: false,
+    };
+
+    let legacy = RegisterNodeRequest {
+        node_id: "node-legacy-new".into(),
+        agent_url: "http://127.0.0.1:7302".into(),
+        gateway_url: "http://127.0.0.1:7302".into(),
+        cpus: 4,
+        memory_mib: 4096,
+        route_grant_public_key_sha256: None,
+        initially_cordoned: false,
+    };
+    ctx.cp
+        .state
+        .store
+        .register_node(
+            "node-legacy-existing",
+            "http://127.0.0.1:7303",
+            "http://127.0.0.1:7303",
+            4,
+            4096,
+            false,
+        )
+        .unwrap();
+    let existing_legacy = RegisterNodeRequest {
+        node_id: "node-legacy-existing".into(),
+        agent_url: "http://127.0.0.1:7303".into(),
+        gateway_url: "http://127.0.0.1:7303".into(),
+        ..legacy.clone()
+    };
+    let response = ctx
+        .http
+        .post(ctx.url("/v1/nodes/register"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&existing_legacy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let summary: NodeSummary = ctx
+        .get_json(ctx.url("/v1/admin/nodes/node-legacy-existing"))
+        .await;
+    assert_eq!(summary.node.state, NodeState::Ready);
+
+    let response = ctx
+        .http
+        .post(ctx.url("/v1/nodes/register"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&legacy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let summary: NodeSummary = ctx
+        .get_json(ctx.url("/v1/admin/nodes/node-legacy-new"))
+        .await;
+    assert_eq!(summary.node.state, NodeState::Cordoned);
+    let refused = ctx
+        .http
+        .post(ctx.url("/v1/admin/nodes/node-legacy-new/actions/uncordon"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::PRECONDITION_FAILED);
+
+    let mismatch = "0".repeat(64);
+    let response = ctx
+        .http
+        .post(ctx.url("/v1/nodes/register"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&register(mismatch.clone()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let summary: NodeSummary = ctx
+        .get_json(ctx.url("/v1/admin/nodes/node-key-mismatch"))
+        .await;
+    assert_eq!(summary.node.state, NodeState::Cordoned);
+    assert_eq!(
+        summary.node.route_grant_public_key_sha256.as_deref(),
+        Some(mismatch.as_str())
+    );
+
+    let refused = ctx
+        .http
+        .post(ctx.url("/v1/admin/nodes/node-key-mismatch/actions/uncordon"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::PRECONDITION_FAILED);
+    let body: cats_api::error::ErrorBody = refused.json().await.unwrap();
+    assert_eq!(body.code, cats_api::error::ErrorCode::FailedPrecondition);
+
+    let expected = ctx
+        .cp
+        .state
+        .cfg
+        .route_grant_signer
+        .public_key_sha256()
+        .to_string();
+    let response = ctx
+        .http
+        .post(ctx.url("/v1/nodes/register"))
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&register(expected))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let admitted = ctx
+        .http
+        .post(ctx.url("/v1/admin/nodes/node-key-mismatch/actions/uncordon"))
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admitted.status(), StatusCode::OK);
+    assert_eq!(
+        admitted.json::<NodeSummary>().await.unwrap().node.state,
+        NodeState::Ready
+    );
+}
+
+#[tokio::test]
 async fn admin_can_monitor_and_drain_nodes() {
     let ctx = Ctx::new().await;
     let node_a = start_stub_node(&ctx.cp, "node_a").await;
@@ -3260,6 +3410,14 @@ async fn admin_can_monitor_and_drain_nodes() {
             gateway_url: "http://gateway.invalid".into(),
             cpus: 8,
             memory_mib: 16_384,
+            route_grant_public_key_sha256: Some(
+                ctx.cp
+                    .state
+                    .cfg
+                    .route_grant_signer
+                    .public_key_sha256()
+                    .to_string(),
+            ),
             initially_cordoned: false,
         })
         .send()

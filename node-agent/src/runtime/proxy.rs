@@ -150,6 +150,7 @@ impl NodeRuntime {
     pub fn proxy_http(
         &self,
         cat_id: &str,
+        cat_generation: i64,
         request: &ProxyHttpRequest,
     ) -> Result<ProxyHttpResponse> {
         use std::io::{Read, Write};
@@ -160,6 +161,12 @@ impl NodeRuntime {
         let (target, activity) = {
             let cats = self.cats.lock().unwrap();
             let rt = cats.get(cat_id).context("cat is not active on this node")?;
+            if rt.generation != cat_generation {
+                bail!(
+                    "cat is not active on this node at generation {cat_generation} (local generation {})",
+                    rt.generation
+                );
+            }
             if rt.state != ObservedState::Running {
                 bail!("cat is not active on this node (state {:?})", rt.state);
             }
@@ -216,12 +223,19 @@ impl NodeRuntime {
     pub(crate) fn open_proxy_target(
         &self,
         cat_id: &str,
+        cat_generation: i64,
         target_port: u16,
     ) -> Result<(ProxyTarget, RuntimeActivityGuard)> {
         anyhow::ensure!(target_port > 0, "endpoint target port must be non-zero");
         let (target, activity) = {
             let cats = self.cats.lock().unwrap();
             let runtime = cats.get(cat_id).context("cat is not active on this node")?;
+            if runtime.generation != cat_generation {
+                bail!(
+                    "cat is not active on this node at generation {cat_generation} (local generation {})",
+                    runtime.generation
+                );
+            }
             if runtime.state != ObservedState::Running {
                 bail!("cat is not active on this node (state {:?})", runtime.state);
             }

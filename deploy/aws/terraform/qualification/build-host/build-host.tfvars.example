@@ -1,0 +1,29 @@
+expected_account_id = "ACCOUNT"
+formation_mode         = true
+formation_principal_arn = "arn:aws:iam::ACCOUNT:user/EXACT-BOOTSTRAP-PRINCIPAL"
+
+# Copy this object byte-for-byte from the reviewed G0
+# `terraform output -json qualification_manifest_seed` evidence.
+qualification_manifest_seed = {
+  schema_version            = 1
+  environment               = "qualification"
+  environment_is_production = false
+  account_id                = "ACCOUNT"
+  region                    = "us-east-1"
+  namespace                 = "cats-qualification-v2"
+  cell_id                   = "qcell-use1-v1"
+  required_tags = {
+    Project                = "Cats"
+    Environment            = "qualification"
+    QualificationNamespace = "cats-qualification-v2"
+    QualificationCell      = "qcell-use1-v1"
+    ManagedBy              = "terraform"
+  }
+  terraform_state = {
+    bucket         = "cats-qualification-v2-tfstate-ACCOUNT-us-east-1"
+    kms_alias      = "alias/cats-qualification-v2-terraform-state"
+    key_prefix     = "architecture-v2"
+    use_lockfile   = true
+    state_role_arn = "arn:aws:iam::ACCOUNT:role/cats-qualification-v2-terraform-state"
+  }
+}

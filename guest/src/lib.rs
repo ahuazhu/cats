@@ -1153,6 +1153,14 @@ impl GuestAgent {
                     .to_ascii_lowercase()
                     .contains("\r\nupgrade: websocket\r\n")
             {
+                // The short timeout only bounds the initial HTTP request. A
+                // WebSocket may legitimately remain idle for much longer;
+                // carrying it through the upgrade resets every idle stream
+                // after two seconds and makes the data plane appear tied to
+                // an unrelated control-plane timeout.
+                if stream.set_read_timeout(None).is_err() {
+                    continue;
+                }
                 std::thread::spawn(move || {
                     let Ok(mut socket) = tungstenite::accept(stream) else {
                         return;
