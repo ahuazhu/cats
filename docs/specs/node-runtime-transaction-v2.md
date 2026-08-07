@@ -17,50 +17,72 @@ The production path is:
 ```text
 <state_dir>/authority/                 mode 0700, Cats service owner
   node-runtime-v2.lock                 mode 0600, exclusive process lock
-  node-runtime-v2.sqlite3              mode 0600
-  node-runtime-v2.sqlite3-wal          SQLite managed
-  node-runtime-v2.sqlite3-shm          SQLite managed
+  node-runtime-v2-meta.json            mode 0600, canonical Node/session root
+  cats/                                mode 0700
+    <sha256(canonical-cat-id)>.json     mode 0600, canonical Cat authority
 ```
 
-The Agent MUST reject symlinks and non-regular database/lock files, verify
-directory ownership/mode without following links, and hold an exclusive
+The Agent MUST open the authority directory and `cats/` through verified
+directory file descriptors, reject symlinks and non-regular lock/document
+files, verify ownership/mode without following links, and hold an exclusive
 nonblocking OS lock on `node-runtime-v2.lock` for its full lifetime before it
-opens SQLite or touches a runtime. A second Agent performs no recovery,
+reads authority or touches a runtime. A second Agent performs no recovery,
 NodeJob, admission or process mutation. Network filesystems are unsupported.
 
-Every connection applies and verifies:
+Every document uses the exact canonical JSON profile frozen by this protocol.
+It contains schema version, schema digest and protocol version; higher, lower,
+unknown, noncanonical or partially written content is not migrated during
+Agent start. File names are the full lowercase SHA-256 of the canonical Cat ID,
+and the decoded `cat_id` MUST hash back to the name.
 
-```sql
-PRAGMA foreign_keys = ON;
-PRAGMA journal_mode = WAL;       -- returned value must be "wal"
-PRAGMA synchronous = FULL;       -- returned value must be 2
-PRAGMA trusted_schema = OFF;
-PRAGMA busy_timeout = <bounded nonzero value>;
-```
+Before a Cat mutation, the Agent reserves the Cat's next revision under the
+admission cell and records a fresh mutation token. While that token is pending,
+no second authority mutation for the Cat may start. The reservation releases
+the cell mutex before encoding, filesystem work or any await. Completion
+publishes the revision only when the same token still owns the reservation.
 
-Production builds MUST use SQLite defensive configuration, disable extension
-loading, use bound parameters and accept only migrations compiled into the
-binary. `application_id`, `user_version`, a schema content digest and the
-terminal protocol version are checked before recovery. A higher, lower,
-unknown or partially applied version is not auto-migrated during Agent start.
+One reserved Cat mutation is one complete document replacement:
 
-Initial creation or an offline schema upgrade MUST fsync the database and its
-parent directory before the version is eligible for activation. A committed
-WAL transaction under `synchronous=FULL` is authoritative even before a
-checkpoint. Checkpoint failure is a health condition, not permission to delete
-the WAL. Shutdown performs a bounded `wal_checkpoint(FULL)` after admission and
-job execution stop; failure preserves the files and fails the shutdown gate.
+1. compare the loaded `authority_revision` and transition identity;
+2. encode and re-validate the complete next document in memory;
+3. create a random same-directory temporary regular file with
+   `O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600;
+4. write all bytes, sync the file and verify its type/owner/mode through the
+   held descriptor;
+5. atomically rename it over the exact Cat path using directory-relative
+   operations; and
+6. sync the `cats/` directory before publishing the new revision or response.
 
-All SQLite work executes on a bounded blocking authority worker, never directly
-on an async executor. No authority transaction spans a systemd, `/proc`, socket,
-VMM, blockd, cloud, metadata-store or network call.
+A failed write, file sync, rename or directory sync publishes no success. On
+restart the old or new complete document is authoritative; a stray temporary
+file is never decoded as authority. Initial creation or offline schema upgrade
+also syncs every created directory before activation. Cleanup is confined to
+proven temporary files in the held authority directory.
+
+A Cat document may be deleted only after an exact revision proves that it is a
+settled tombstone with no current runtime, active/prepared work, unsettled
+result, quarantine evidence or referenced receipt. Deletion unlinks that exact
+regular file through the held `cats/` directory descriptor and syncs the
+directory before reporting completion. Either the settled tombstone or absence
+is safe after a crash; absence never authorizes reconstruction from residue.
+
+`node-runtime-v2-meta.json` is replaced by the same protocol before listeners
+open when a fresh Agent session is allocated. Cat mutations never require an
+atomic write spanning two Cat documents or the root document. Startup rebuilds
+a global immutable-ID index from all Cat documents; duplicate dispatch, claim,
+result, runtime, install or retirement IDs are corruption and keep gates closed.
+
+No authority document replacement spans a systemd, `/proc`, socket, VMM,
+blockd, cloud, metadata-store or network call. Encoding and filesystem I/O run
+outside async-executor and admission-mutex critical sections.
 
 ## 2. Closed types and canonical bytes
 
 Opaque IDs are nonempty canonical ASCII values bounded by the producing
 protocol. Sequence and generation fields are positive signed 64-bit integers.
-Digests are raw 32-byte SHA-256 values in SQLite and lowercase hexadecimal on
-diagnostic surfaces. Timestamps are audit fields and never order authority.
+Digests are exact lowercase 64-character SHA-256 hexadecimal strings in the
+canonical documents and on diagnostic surfaces. Timestamps are audit fields
+and never order authority.
 
 Closed enums are represented by constrained integers, not unconstrained text:
 
@@ -78,31 +100,31 @@ work_phase          = prepared | draining | applied | busy | blocked | compensat
 ```
 
 NodeJob V2 request and response bytes use the canonical profile frozen by
-`lifecycle-command-v2.md`. The database retains the exact request body, its
-SHA-256 digest, the exact terminal response body and its digest. Decoding into
-rows does not replace exact bytes. Re-encoding equivalence cannot authorize a
-duplicate dispatch whose original bytes differ.
+`lifecycle-command-v2.md`. The Cat authority document retains the exact request
+body, its SHA-256 digest, the exact terminal response body and its digest.
+Decoding structural fields does not replace exact bytes. Re-encoding
+equivalence cannot authorize a duplicate dispatch whose original bytes differ.
 
-## 3. Normative logical schema
+## 3. Normative logical document schema
 
-Implementations MAY split indexes or audit-only columns, but MUST preserve the
-following entities, relationships and constraints. Authority fields may not be
-stored only inside JSON.
+The canonical root and Cat document schemas MUST preserve the following nested
+entities, relationships and constraints. Authority fields are explicit typed
+members; an opaque compatibility payload or digest is not a substitute.
 
 ### 3.1 Store and Cat authority
 
-`store_meta` is a singleton containing:
+`store_meta` is the root document containing:
 
 ```text
 schema_version, schema_digest, protocol_version,
-node_id, database_id, created_host_boot_id, created_at
+node_id, store_id, created_host_boot_id, created_at
 ```
 
-`database_id` is random and immutable. Changing `node_id`, schema digest or
+`store_id` is random and immutable. Changing `node_id`, schema digest or
 protocol version in place is corruption.
 
 `agent_session` records one fresh opaque session ID, Host boot ID and start
-transaction per successful exclusive-lock acquisition. Exactly one session is
+commit per successful exclusive-lock acquisition. Exactly one session is
 marked current. A new session is committed before listeners open; it does not
 claim that a runtime was adopted.
 
@@ -117,10 +139,10 @@ command_id?, command_seq?, dispatch_id?, dispatch_seq?, request_body_sha256?,
 target_node_id?, node_claim_id?, result_id?,
 host_boot_id?, guest_boot_id?,
 gate_state, current_route_install_id?,
-quarantine_code?, updated_transaction_id
+quarantine_code?, updated_commit_id
 ```
 
-Its lineage columns are all-null only when no settled local runtime exists; for
+Its lineage fields are all-null only when no settled local runtime exists; for
 a current runtime they are a complete `SettledLifecycleLineageV1`. Partial
 lineage is forbidden. `target_node_id` MUST equal `store_meta.node_id`.
 `runtime_generation` strictly increases for a Cat whenever a fresh physical
@@ -132,7 +154,7 @@ Wall clock is not an alternative CAS.
 
 ### 3.2 Runtime instances, scopes and members
 
-`runtime_instance` contains one row per historical physical lineage:
+`runtime_instance` contains one element per retained historical physical lineage:
 
 ```text
 runtime_id PK, cat_id FK, runtime_generation,
@@ -140,12 +162,13 @@ created_by_dispatch_id, phase, stable_state,
 host_boot_id?, guest_boot_id?,
 scope_unit?, systemd_invocation_id?, cgroup_path?,
 runtime_dir, snapshot_identity?, memory_backing_identity?,
-created_transaction_id, retired_transaction_id?
+created_commit_id, retired_commit_id?
 ```
 
-`UNIQUE(cat_id, runtime_generation)` holds. At most one row per Cat has
-`phase IN (preparing,current,retiring,quarantined)`. A Warm row may have null
-live-scope fields; Running and Suspended production rows may not.
+`UNIQUE(cat_id, runtime_generation)` holds within the canonical document. At
+most one element per Cat has
+`phase IN (preparing,current,retiring,quarantined)`. A Warm element may have
+null live-scope fields; Running and Suspended production elements may not.
 
 `runtime_member` contains:
 
@@ -192,26 +215,27 @@ dispatch_id PK, command_id, command_seq, dispatch_seq,
 cat_id, workspace_id, intent_generation, target_node_id,
 operation_id, source_evidence_id, command_kind, action_kind,
 not_before_unix_ms, deadline_unix_ms,
-request_body BLOB, request_body_sha256,
+request_body_bytes, request_body_sha256,
 node_claim_id UNIQUE, phase,
-accepted_transaction_id, terminal_result_id?,
+accepted_commit_id, terminal_result_id?,
 UNIQUE(command_id, dispatch_seq)
 ```
 
-The request identity columns and bytes are immutable. `node_claim_id` is
-allocated in the first transaction for a recognized request, whether accepted
-or rejected. A rejected request is inserted directly with `phase=terminal` and
-one rejected result; an accepted request has `phase=accepted` before effects.
+The request identity fields and bytes are immutable. `node_claim_id` is
+allocated in the first atomic document replacement for a recognized request,
+whether accepted or rejected. A rejected request is inserted directly with
+`phase=terminal` and one rejected result; an accepted request has
+`phase=accepted` before effects.
 
-`dispatch_runtime_precondition` has exactly one row per dispatch. Its mode is
+`dispatch_runtime_precondition` has exactly one object per dispatch. Its mode is
 `absent` with an optional required fence receipt, or `exact` with
 `runtime_id + node_id + runtime_generation + node_claim_id` and optional
 Host-boot/Warm-snapshot fields as frozen by A0. `dispatch_volume_grant` stores
-each exact grant/attachment/epoch/durability prerequisite in queryable columns.
+each exact grant/attachment/epoch/durability prerequisite in structural fields.
 `dispatch_route_retirement` stores the exact retirement request/receipt or
 policy-promotion prerequisite. Closed action-specific fields use typed child
-tables keyed by `dispatch_id`; no authority precondition exists only inside
-the request BLOB.
+objects keyed by `dispatch_id`; no authority precondition exists only inside
+the request bytes.
 
 `recovery_step` contains:
 
@@ -234,13 +258,13 @@ effect.
 
 ```text
 result_id PK, dispatch_id UNIQUE FK, node_claim_id UNIQUE,
-phase, response_body BLOB, response_body_sha256,
+phase, response_body_bytes, response_body_sha256,
 runtime_id?, runtime_generation?, runtime_state?, runtime_revision?,
 source_disposition, error_class?,
-committed_transaction_id
+committed_commit_id
 ```
 
-A result row and every referenced byte/identity are immutable. Its runtime
+A result entry and every referenced byte/identity are immutable. Its runtime
 identity and lineage MUST equal the `cat_local_authority` postcondition in the
 same commit for `succeeded`. A failed action that proves preserved,
 transitioned or absent state commits that local postcondition with its failed
@@ -263,11 +287,11 @@ runtime_id, runtime_generation, host_boot_id?, guest_boot_id?,
 state, authority_revision,
 install_request_body, install_request_sha256,
 ack_body?, ack_sha256?,
-installed_transaction_id, retired_transaction_id?,
+installed_commit_id, retired_commit_id?,
 UNIQUE(cat_id, route_epoch), UNIQUE(route_intent_id)
 ```
 
-Every identifying field is immutable. Only state/revision and transaction
+Every identifying field is immutable. Only state/revision and commit
 references change. `active` requires exact equality with the complete current
 `cat_local_authority` lineage and Running runtime. At most one install per Cat
 is `installing|active|retiring`. The exact install request and ACK are retained
@@ -282,25 +306,33 @@ scope_kind, reason_route_intent_id?,
 reason_lifecycle_intent_generation?, reason_lifecycle_command_id?,
 reason_policy_proposal_id?, expected_policy_cat_generation?, mode,
 cat_id, install_id, old_route_intent_id, route_epoch,
-old_lineage columns, expected_predecessor_kind,
+old_lineage fields, expected_predecessor_kind,
 predecessor_policy_proposal_id?, predecessor_retirement_token?,
 expected_authority_revision, expected_work_fence?, guard_registry_revision?,
 retirement_prepare_id UNIQUE,
 phase, predecessor_retirement_id?, retirement_token?,
 receipt_id?, receipt_body?, receipt_sha256?,
-created_transaction_id, completed_transaction_id?
+created_commit_id, completed_commit_id?
 ```
 
 Scope and the corresponding reason family are exactly one of `route_intent`,
-`lifecycle_command` or `policy_proposal`; all other reason columns are null. A
+`lifecycle_command` or `policy_proposal`; all other reason fields are null. A
 receipt cannot be rebound. `require_idle` with a nonzero or unknown exact guard
 count commits `busy` without changing route authority.
 `cancel_and_drain` can complete only after its selected guards are terminated
 or an exact serving fence is recorded.
 
-`authority_transaction` gives each committed local change an opaque ID and
-monotonic database sequence for audit/recovery. It does not replace row-level
-foreign keys or revisions.
+The current `authority_commit` envelope gives each committed Cat document
+revision an opaque ID, the prior and next `authority_revision`, and a document
+digest for audit/recovery. The digest is computed over the canonical document
+with the digest member omitted, avoiding a self-reference. The envelope does
+not replace structural references or revisions.
+
+Terminal dispatches and exact result bytes remain in the Cat document until an
+exact control-plane settlement receipt proves that dispatch can never be
+redelivered. History compaction is itself one ordinary authority revision; it
+cannot remove the current runtime lineage, active/prepared work, an unsettled
+result, quarantine evidence or any receipt referenced by current authority.
 
 An applied receipt is stored both as exact canonical bytes and these
 structural fields:
@@ -344,21 +376,21 @@ guard-registry revision, `active_guard_count > 0` or unknown, and
 lifecycle or runtime authority.
 
 `quarantine_condition` records entity kind/identity, stable machine code,
-evidence digest, first/last transaction and explicit resolution receipt. It is
+evidence digest, first/last commit and explicit resolution receipt. It is
 append-preserving; resolution does not erase the original evidence.
 
-## 4. NodeJob transactions
+## 4. NodeJob durable mutations
 
 ### 4.1 Parse and recognition
 
-Before SQLite, the Node checks transport authentication, endpoint version,
-length bounds, canonical bytes, request digest, target Node, closed action and
-required fields. An unparseable or unauthenticated message is not a recognized
-dispatch and authorizes no row or effect.
+Before touching the authority store, the Node checks transport authentication,
+endpoint version, length bounds, canonical bytes, request digest, target Node,
+closed action and required fields. An unparseable or unauthenticated message is
+not a recognized dispatch and authorizes no document mutation or effect.
 
 A canonical request becomes recognized only after the pre-recognition checks
-above and when its IDs are sufficient to bind a Node claim. In one immediate
-transaction the Agent:
+above and when its IDs are sufficient to bind a Node claim. In one atomic Cat
+document replacement the Agent:
 
 1. checks an existing `dispatch_id` byte-for-byte;
 2. checks Cat, generation, command sequence and prerequisite identities;
@@ -392,9 +424,10 @@ another attempt creates a new `dispatch_id` under ADR-0035.
 
 For each step:
 
-1. transactionally insert `prepared` with exact input/current revision;
-2. perform or query the effect outside SQLite and outside the admission mutex;
-3. transactionally store the observation only if the prepared identity is
+1. commit `prepared` with exact input/current revision;
+2. perform or query the effect outside authority-file I/O and outside the
+   admission mutex;
+3. commit the observation only if the prepared identity is
    still current;
 4. independently verify the closed postcondition; and
 5. mark `verified`, or persist `quarantined/blocked` evidence.
@@ -403,7 +436,7 @@ An ambiguous timeout is a possible effect. Recovery queries by exact external
 identity and does not repeat a non-idempotent operation merely because step 3
 is absent.
 
-The final success transaction MUST:
+The final success document replacement MUST:
 
 - compare dispatch, claim, current authority and all verified prerequisites;
 - create/update the complete runtime postcondition;
@@ -425,7 +458,7 @@ only then releases the payload exec.
 
 If the Agent dies before release, the blocked launcher/child MUST terminate
 without executing the payload. If it dies after possible exec, startup union
-reconciliation finds the scope/process even when SQLite has only a prepared
+reconciliation finds the scope/process even when the authority document has only a prepared
 step. A payload which executed outside the intended scope is quarantined.
 
 Adoption re-samples:
@@ -447,7 +480,8 @@ successful check. It never signals a stale recorded PID.
 ### 6.1 Reconstruction
 
 All cells begin `closed`. After union reconciliation, the Agent loads an
-immutable database snapshot per Cat. It may publish `active` in memory only if:
+immutable authority-document snapshot per Cat. It may publish `active` in
+memory only if:
 
 - runtime state is Running and complete process/protocol proof is adopted;
 - exactly one route install is active;
@@ -455,8 +489,8 @@ immutable database snapshot per Cat. It may publish `active` in memory only if:
 - no nonterminal recovery or retirement work can close admission; and
 - the clock-health condition required by Route Grant V2 is true.
 
-Database rows are never read on the request fast path. They are reflected into
-the cell only by successful authority transactions plus revision checks.
+Authority documents are never read on the request fast path. They are reflected
+into the cell only by successful atomic replacements plus revision checks.
 
 ### 6.2 Grant compare-and-guard
 
@@ -486,12 +520,12 @@ revision from another session is never compared as newer or older.
 ### 6.3 Install and reopen
 
 An install request first closes the volatile gate under the mutex and captures
-the current revision. Outside the lock a SQLite transaction structurally
-validates the full A0 lineage/runtime and inserts the `installing` authority.
-After any external endpoint proof, another transaction marks it active. Under
-the mutex the Agent publishes the exact committed revision only if the runtime
-and transition token still match. A stale install terminates stale; it never
-overwrites a newer route.
+the current revision. Outside the lock an atomic document replacement
+structurally validates the full A0 lineage/runtime and inserts the `installing`
+authority. After any external endpoint proof, another replacement marks it
+active. Under the mutex the Agent publishes the exact committed revision only
+if the runtime and transition token still match. A stale install terminates
+stale; it never overwrites a newer route.
 
 Restart may reopen an active install only through §6.1. A revoke is never
 reversed in place; re-publication uses a fresh route epoch and install ID.
@@ -527,12 +561,13 @@ The ordering is fixed:
 6. publish the committed revoked revision under the mutex. Lifecycle physical
    quiesce may begin only after its exact command-scoped receipt is durable.
 
-If SQLite prepare in step 3 fails, the in-memory gate can reopen only after an
-outside-lock database query proves the old revision is still current and the
-same transition token then wins the mutex comparison. If planned work committed
-but the Agent died before step 2, restart evaluates it behind the global closed
-recovery gate. If step 3 commits, restart sees prepared work and remains
-closed. Stale cleanup can never reopen a newer revision.
+If the durable prepare in step 3 fails, the in-memory gate can reopen only after
+an outside-lock authority-document read proves the old revision is still
+current and the same transition token then wins the mutex comparison. If
+planned work committed but the Agent died before step 2, restart evaluates it
+behind the global closed recovery gate. If step 3 commits, restart sees
+prepared work and remains closed. Stale cleanup can never reopen a newer
+revision.
 
 A proposal-scoped `require_idle` receipt cannot be rebound to a lifecycle
 command. Auto promotion requires that exact policy receipt plus A0's immutable
@@ -557,7 +592,8 @@ receipt but never decides this global owner or changes an epoch in place.
 Startup does not listen on the NodeJob or proxy endpoints until the global
 recovery gate is installed. It then enumerates these independently:
 
-- all current/quarantined runtime and nonterminal work rows;
+- all current/quarantined runtime and nonterminal work in Cat authority
+  documents;
 - all systemd units with the exact Cats scope metadata/prefix;
 - all processes in their cgroups and every expected PID;
 - all runtime directories and known socket namespaces; and
@@ -570,13 +606,13 @@ The reducer operates over the union keyed by exact Cat/runtime/scope identity.
 
 | Evidence | Outcome |
 | --- | --- |
-| Complete DB + exact scope/process/protocol/resource proof | Adopt current runtime and resume closed work |
-| Complete Warm DB + exact snapshot/memory/disk proof and no live members | Adopt Warm local evidence |
-| Prepared step + exact observed postcondition | Record observation, verify, continue transaction |
+| Complete authority document + exact scope/process/protocol/resource proof | Adopt current runtime and resume closed work |
+| Complete Warm document + exact snapshot/memory/disk proof and no live members | Adopt Warm local evidence |
+| Prepared step + exact observed postcondition | Record observation, verify, continue the durable mutation |
 | Prepared step + proven no effect and retry-safe operation | Retry the same step identity |
-| Unknown/malformed DB or failed enumeration | Cordon Node; quarantine affected/all Cats |
-| Scope/process/socket/resource without complete DB binding | Quarantine; do not signal/delete/report Cold |
-| DB expects member but member absent | Recover only through action-specific proof; otherwise quarantine |
+| Unknown/malformed authority document or failed enumeration | Cordon Node; quarantine affected/all Cats |
+| Scope/process/socket/resource without complete document binding | Quarantine; do not signal/delete/report Cold |
+| Authority document expects member but member absent | Recover only through action-specific proof; otherwise quarantine |
 | Identity or lineage mismatch | Quarantine and deny jobs/admission |
 
 `proven_absent` requires an action-specific closed proof, not merely the lack of
@@ -599,16 +635,16 @@ quarantined runtime is never emitted as a Cold observation.
 | Scope created, before child exec | Prepared scope/member | Remove only with exact empty-scope proof or continue |
 | Child may have exec'd, before observation | Prepared + possible process | Union reconcile and handshake; never blind respawn/kill |
 | VMM/blockd handshake passed, before runtime commit | Verified steps, no success | Reverify all postconditions, then atomic runtime/result commit |
-| Runtime/result transaction commit, response lost | Terminal result + postcondition | Return exact bytes, no effect |
+| Runtime/result document commit, response lost | Terminal result + postcondition | Return exact bytes, no effect |
 | Pause/snapshot initiated, result absent | Prepared/observed transition | Query exact VMM/snapshot and retain source or quarantine |
 | VMM exits, blockd/journal remains | Recovery steps + disk watermarks | Preserve publisher/journal; finish drain or block |
 | Route volatile gate closed, prepare not committed | Old durable route | Restart can revalidate/reopen old exact route |
 | Retirement prepare committed, before drain | Prepared + durable closing intent | Restart closed; resume exact drain |
 | Guards drained, revoke not committed | Prepared/draining | Restart closed; reverify zero/fence then commit |
 | Revoke/receipt committed, response lost | Revoked + immutable receipt | Return exact receipt; never reopen epoch |
-| Install committed, volatile publish absent | Active DB install, closed memory | Startup/full recheck may publish exact install |
-| SQLite full/I/O/sync/corrupt/unknown schema | Authority unavailable/uncertain | Close gates, stop new work, preserve processes/data, cordon |
-| Agent killed with Relaxed `R < L` | DB/process/journal may be partial | Adopt exact publisher or quarantine; never delete/release |
+| Install committed, volatile publish absent | Active durable install, closed memory | Startup/full recheck may publish exact install |
+| File full/I/O/sync/malformed/unknown schema | Authority unavailable/uncertain | Close gates, stop new work, preserve processes/data, cordon |
+| Agent killed with Relaxed `R < L` | Document/process/journal may be partial | Adopt exact publisher or quarantine; never delete/release |
 | Host reboot | Old live-process identity invalid | Warm disk proof may survive; all live-member states require fence/fallback |
 
 ## 9. Action postconditions
@@ -617,14 +653,14 @@ Each action implementation refines these minimums:
 
 | Action | Success requires |
 | --- | --- |
-| Start | Fresh runtime generation; exact scope/members/frontends/Guest proof; all grants valid; Running row + terminal result in one commit |
-| Resume | Exact Suspended source and runtime lineage; VMM running proof; route still closed until a fresh install; Running result transaction |
-| Restore | Exact Warm snapshot/runtime lineage; new live-member proof as defined by A0; Running result transaction |
-| Suspend | Exact command-scoped route retirement; paused VMM proof; blockd/journal ownership; Suspended result transaction |
-| Warm | Exact retired route; snapshot and memory identity; VMM/blockd exit and durability disposition; Warm result transaction |
-| Cold | Exact retired route; writer/grant/durability proof; no owned live members; retained/discarded local data receipt; Cold result transaction |
-| Destroy | Exact route/writer/grant proof and ADR-0025 disk disposition; no runtime authority; terminal result transaction |
-| FallbackCold | Exact failed Resume/Restore source disposition plus fence/durability prerequisites; Cold result transaction |
+| Start | Fresh runtime generation; exact scope/members/frontends/Guest proof; all grants valid; Running postcondition + terminal result in one commit |
+| Resume | Exact Suspended source and runtime lineage; VMM running proof; route still closed until a fresh install; Running result commit |
+| Restore | Exact Warm snapshot/runtime lineage; new live-member proof as defined by A0; Running result commit |
+| Suspend | Exact command-scoped route retirement; paused VMM proof; blockd/journal ownership; Suspended result commit |
+| Warm | Exact retired route; snapshot and memory identity; VMM/blockd exit and durability disposition; Warm result commit |
+| Cold | Exact retired route; writer/grant/durability proof; no owned live members; retained/discarded local data receipt; Cold result commit |
+| Destroy | Exact route/writer/grant proof and ADR-0025 disk disposition; no runtime authority; terminal result commit |
+| FallbackCold | Exact failed Resume/Restore source disposition plus fence/durability prerequisites; Cold result commit |
 
 No action treats an error string, child exit or socket refusal as the complete
 postcondition.
@@ -642,7 +678,7 @@ old_live_runtimes = 0 or externally fenced and retained
 old_relaxed_journals_R_lt_L = 0 or retained behind an explicit block
 ```
 
-The activation build creates an empty V2 database. It does not read
+The activation build creates an empty V2 authority directory. It does not read
 `runtime-ledger/*.json`. The following production paths are deleted in the same
 terminal release:
 
@@ -660,7 +696,7 @@ drain/fence manifest; it cannot mount a V1 reader alongside V2.
 ## 11. Observability without authority leakage
 
 The Agent exports counts and stable condition codes for recovery backlog,
-quarantined Cats, unexpected scopes/members, database/WAL/checkpoint health,
+quarantined Cats, unexpected scopes/members, authority-file/sync health,
 closed admission gates, active guards, stuck retirements and Relaxed
 `R < L`. Metrics and logs contain opaque IDs/digests, not credentials, exact
 grant tokens or request bodies. They can alert and diagnose; they cannot settle

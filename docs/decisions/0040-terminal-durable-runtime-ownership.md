@@ -39,11 +39,12 @@ breaking activation instead of preserving the old ledger or NodeJob protocol.
 
 ## Decision
 
-### 1. One local authority store
+### 1. One file-backed local authority store
 
-Each production Node has one local SQLite database at
-`<state_dir>/authority/node-runtime-v2.sqlite3`. It is the only durable
-Node-local authority for:
+Each production Node has one V2 authority directory at
+`<state_dir>/authority/`. A root document freezes Node identity and schema; one
+canonical document per Cat contains every Cat-local authority fact. These V2
+documents are the only durable Node-local authority for:
 
 - current and historical runtime identity and local stable postcondition;
 - per-Cat systemd scope and process membership proof;
@@ -53,17 +54,31 @@ Node-local authority for:
   receipts; and
 - quarantine/cordon reasons and recovery progress.
 
-The database uses `journal_mode=WAL`, `synchronous=FULL`, foreign keys and
-strict schema checks. Database and WAL durability, not a later JSON write,
-define the commit boundary. A successful lifecycle action updates the runtime
-postcondition and inserts the immutable exact result in one transaction before
-the response is made visible.
+The Agent is the only process writer. It holds one exclusive lifetime lock. A
+short per-Cat mutation reservation admits at most one authority replacement at
+a time without holding the admission mutex across filesystem I/O or an await.
+A commit writes one complete canonical V2 document to a fresh same-directory
+file opened with exclusive, no-follow semantics, syncs the file, atomically
+renames it over the prior revision and syncs the parent directory. The old or
+new complete document is therefore visible after a crash; a later best-effort
+write is never the durability boundary. A successful lifecycle action
+publishes the runtime postcondition and immutable exact result bytes in that
+one replacement before the response is made visible.
 
-SQLite is local evidence, not storage or placement authority. It cannot grant
-a volume lease, advance a fencing epoch, publish a Root, assign a Cat to this
-Node or settle control-plane state. Those remain with their ADR-defined
-authorities. Loss or corruption of the local database fails closed and
-requires external fencing or a proven Cold reconstruction.
+No cross-Cat transaction is required: NodeJob, runtime, route and recovery
+authority all name exactly one Cat, and Node-global identity changes only at
+offline activation or Agent-session start before listeners open. Duplicate
+global IDs across Cat documents are corruption detected while rebuilding the
+startup index. A removed or Cold Cat retains a tombstone authority document
+until the control plane durably acknowledges every result it can redeliver.
+Only then may the Agent delete the tombstone with an exact revision check,
+unlink and parent-directory sync.
+
+The file store is local evidence, not storage or placement authority. It
+cannot grant a volume lease, advance a fencing epoch, publish a Root, assign a
+Cat to this Node or settle control-plane state. Those remain with their
+ADR-defined authorities. Loss or corruption of the local authority store fails
+closed and requires external fencing or a proven Cold reconstruction.
 
 ### 2. Closed identities, not opaque compatibility blobs
 
@@ -94,10 +109,10 @@ SettledLifecycleLineageV1 {
 }
 ```
 
-Node rows store these fields in queryable columns and compare every field.
-Neither a digest-only value nor `cat_id + generation` is sufficient authority.
-Opaque request/result bytes are retained in addition so an exact replay can
-return the original response.
+The canonical document stores these fields structurally and compares every
+field. Neither a digest-only value nor `cat_id + generation` is sufficient
+authority. Opaque request/result bytes are retained in addition so an exact
+replay can return the original response.
 
 A process is identified by the closed tuple:
 
@@ -132,17 +147,18 @@ succeeded | rejected | failed
 A semantic retry therefore uses a fresh dispatch. It never deletes a failed
 result and never reopens a terminal claim.
 
-External effects cannot be atomically committed with SQLite. Before each
-effect, the Agent commits a closed recovery step with its expected inputs and
-postcondition. After the effect it records independently verifiable evidence.
-Recovery re-queries the physical subsystem using that identity; it never
-assumes that a returned error means the effect did not happen.
+External effects cannot be atomically committed with a file replacement.
+Before each effect, the Agent commits a closed recovery step with its expected
+inputs and postcondition. After the effect it records independently verifiable
+evidence. Recovery re-queries the physical subsystem using that identity; it
+never assumes that a returned error means the effect did not happen.
 
-`Start`, `Resume` and `Restore` can succeed only when the same transaction can
-install a complete, reopenable runtime row and exact terminal result. Actions
-leaving Running can succeed only after route retirement, runtime disposition,
-block frontend disposition and Relaxed watermarks are proved. A response lost
-after commit is an ordinary exact replay.
+`Start`, `Resume` and `Restore` can succeed only when the same atomic document
+replacement can install a complete, reopenable runtime postcondition and exact
+terminal result. Actions leaving Running can succeed only after route
+retirement, runtime disposition, block frontend disposition and Relaxed
+watermarks are proved. A response lost after commit is an ordinary exact
+replay.
 
 ### 4. Per-Cat systemd ownership
 
@@ -153,9 +169,9 @@ cats-cat-<sha256(canonical cat_id)>.scope
 ```
 
 under the Cats runtime slice. The full digest is used; the original Cat ID is
-stored in SQLite and scope metadata rather than interpolated into a unit name.
-The scope's systemd `InvocationID` and exact cgroup path are part of runtime
-identity.
+stored in the authority document and scope metadata rather than interpolated
+into a unit name. The scope's systemd `InvocationID` and exact cgroup path are
+part of runtime identity.
 
 No VMM or blockd payload may execute before its stopped child has been attached
 to the scope and membership has been verified. Subsequent signals use a fresh
@@ -184,9 +200,9 @@ The cell's mutex serializes:
 - route-authority install, revoke and retirement transitions; and
 - lifecycle quiesce or any runtime transition away from Running.
 
-Signature parsing, database transactions, fsync, systemd calls, protocol I/O,
-transport cancellation and waiting happen outside the mutex. The transition
-protocol is deliberately staged:
+Signature parsing, authority-file replacement, fsync, systemd calls, protocol
+I/O, transport cancellation and waiting happen outside the mutex. The
+transition protocol is deliberately staged:
 
 1. outside the mutex, durably recognize exact work and its expected authority
    revision; startup treats this work as a recovery prerequisite before it
@@ -202,8 +218,8 @@ protocol is deliberately staged:
 If step 1 commits and the process dies, restart evaluates the work with a
 closed recovery gate before serving traffic. If step 3 does not commit while
 the process remains alive, the old durable authority may be reopened only
-after a fresh outside-lock database check and exact transition-token compare.
-A stale completion may never reopen or replace a newer gate revision.
+after a fresh outside-lock authority-document check and exact transition-token
+compare. A stale completion may never reopen or replace a newer gate revision.
 
 Grant admission performs all crypto and time work first, then under this one
 mutex compares the grant to the complete current durable mirror and acquires
@@ -215,8 +231,9 @@ new guard.
 
 Before either NodeJob execution or Route Grant admission, the Agent:
 
-1. validates database permissions, schema, integrity and Node identity;
-2. closes every admission cell and enumerates the union of database rows,
+1. validates authority-directory permissions, root/Cat document schemas,
+   canonical encoding, revision integrity and Node identity;
+2. closes every admission cell and enumerates the union of authority documents,
    Cats systemd scopes, processes in those scopes, runtime directories,
    control sockets and incomplete recovery work;
 3. verifies Host boot, scope invocation, process tuples and role-specific
@@ -229,13 +246,13 @@ Before either NodeJob execution or Route Grant admission, the Agent:
 An empty query result is not proof of absence unless enumeration itself is
 calibrated and all required namespaces were successfully inspected. Missing
 heartbeat, missing PID, connection refusal, a stale socket file, a scope with
-no database row or a database row with no scope is not inferred Cold.
+no authority document or a document with no scope is not inferred Cold.
 
-Unknown schema, malformed rows, an unexpected scope/process, identity mismatch
-or incomplete proof quarantines the Cat and cordons the Node for new placement.
-The Agent does not PID-kill, delete a directory, discard a journal or publish a
-Cold observation from such evidence. An operator or a receipt-authorized
-recovery action must resolve it.
+Unknown schema, malformed documents, an unexpected scope/process, identity
+mismatch or incomplete proof quarantines the Cat and cordons the Node for new
+placement. The Agent does not PID-kill, delete a directory, discard a journal
+or publish a Cold observation from such evidence. An operator or a
+receipt-authorized recovery action must resolve it.
 
 Warm has no live-process requirement, but its exact snapshot, memory backing,
 disk journal and originating runtime lineage must be proven. Suspended requires
@@ -244,11 +261,12 @@ runtime. In-flight actions resume only from their durable recovery steps.
 
 ### 7. Data-safety rules survive Agent replacement
 
-The database records the local and remote durability watermarks for each
-attached disk as evidence, but it never advances them itself. `R <= L` remains
-mandatory. When `R < L`, pending Relaxed packs and the blockd/publisher able to
-drain them may be the only authoritative copy. C recovery does not delete that
-journal, declare the disk released or kill an unproven blockd.
+The Cat authority document records the local and remote durability watermarks
+for each attached disk as evidence, but it never advances them itself. `R <= L`
+remains mandatory. When `R < L`, pending Relaxed packs and the
+blockd/publisher able to drain them may be the only authoritative copy. C
+recovery does not delete that journal, declare the disk released or kill an
+unproven blockd.
 
 Kernel NBD and vhost-user-blk have different member/resource evidence but the
 same ownership state machine. Kernel NBD additionally records the exact NBD
@@ -269,10 +287,10 @@ The protocol's crash table is normative. The key rule is:
 - at every route retirement point after durable prepare: restart admission
   remains closed until the same work is completed or explicitly compensated.
 
-Database full, I/O error, `SQLITE_CORRUPT`, failed `FULL` sync or an unknown
-schema version is an authority failure, not a warning. The Agent stops new
-jobs/admission, preserves processes and local data, exports a condition and
-cordons the Node.
+Authority-volume full, short write, I/O or sync failure, malformed document or
+an unknown schema version is an authority failure, not a warning. The Agent
+stops new jobs/admission, preserves processes and local data, exports a
+condition and cordons the Node.
 
 ### 9. Breaking activation
 
@@ -287,8 +305,8 @@ Activation is a fleet safety operation:
 3. drain Relaxed journals, invalidate/release writers and move every old
    runtime to proven Cold, or externally fence and retain its residue;
 4. prove no old job, route authority, scope or live runtime can act;
-5. install the V2 binary and empty V2 database, activate the V2 endpoint and
-   schema, and delete the old JSON/in-memory/PID-only paths; then
+5. install the V2 binary and empty V2 authority directory, activate the V2
+   endpoint and schema, and delete the old JSON/in-memory/PID-only paths; then
 6. restore traffic only after exact A/B/C reciprocal checks pass.
 
 Rollback uses the same full drain/fence boundary. It is not a request-level or
@@ -303,7 +321,7 @@ Node-level compatibility mode.
 | ADR-0035 settled lineage | Return the exact dispatch, claim, result and runtime identity committed locally. |
 | ADR-0035 Start/Resume/Restore | Report success only with an adoptable runtime postcondition. |
 | ADR-0035 leaving Running | Require exact route-retirement and writer/durability prerequisites before quiesce. |
-| ADR-0039 local route truth | Store full `RuntimeRouteAuthorityV1` in the same database and compare every field. |
+| ADR-0039 local route truth | Store full `RuntimeRouteAuthorityV1` in the same Cat authority document and compare every field. |
 | ADR-0039 admission | Compare durable mirror and acquire the guard atomically under one per-Cat mutex. |
 | ADR-0039 revoke/idle | Persist prepared work, close restart admission, drain/check guards, then issue an exact receipt. |
 | ADR-0030 heartbeat | Report only adopted facts; quarantine/absence is not Cold or authority. |
@@ -312,11 +330,10 @@ Node-level compatibility mode.
 
 - Agent replacement can preserve a proven runtime without making its process
   inventory or route authority process-local.
-- The design adds a local transactional subsystem and explicit recovery state;
-  this is justified because the current three independently persisted maps
-  already form an unsafe implicit transaction.
-- SQLite remains a Host-bound component. Losing the Host does not make its
-  rows globally available; global fencing and Cold recovery remain necessary.
+- The design makes the existing per-Cat file boundary authoritative and adds
+  explicit recovery state without introducing a second local database.
+- Authority documents remain Host-bound. Losing the Host does not make them
+  globally available; global fencing and Cold recovery remain necessary.
 - Conservative quarantine may reduce availability, but it cannot silently
   turn uncertain local state into a second writer or serving route.
 - The breaking cutover is operationally heavier once, but removes indefinite
@@ -324,48 +341,46 @@ Node-level compatibility mode.
 
 ## Alternatives considered
 
-### Keep one atomic JSON file per Cat
+### Use SQLite for Node runtime ownership
 
-Rejected. Rename can atomically replace one snapshot, but accepted work,
-physical recovery steps, immutable result bytes and route retirement have
-independent lifetimes and indexes. Folding them into an ever-rewritten Cat blob
-still needs a transaction log for ambiguous external effects, cross-record
-uniqueness, corruption detection and recovery. It also leaves Node-global
-session/schema/quarantine state outside the commit.
+Rejected. Runtime, NodeJob, route and recovery mutations are already serialized
+per Cat and never require an atomic write spanning Cats. A relational store
+would add schema migrations, WAL/checkpoint operation, a blocking worker and a
+second production authority substrate without closing any cross-Cat invariant.
+Structural validation and a startup duplicate-ID index provide the constraints
+this boundary actually needs.
 
 ### Build an append-only log and snapshots in Cats
 
-Rejected. Checksummed records, torn-tail handling, compaction, schema upgrade,
-multi-index reconstruction, concurrent Cat writers and fsync/checkpoint rules
-would be a new storage engine on the data-safety boundary. That is more code and
-longer-lived debt than the existing workspace embedded-SQLite stack. No SQLite
-daemon or network service is introduced.
+Rejected. Checksummed records, torn-tail handling, compaction, schema upgrade
+and replay would be a new storage engine on the data-safety boundary. Complete
+same-directory document replacement already gives the required per-Cat atomic
+boundary without a log.
 
 ### Put Node runtime ownership in PostgreSQL
 
 Rejected. PostgreSQL owns global lifecycle orchestration, but Host process,
 scope and incomplete-effect evidence must be recoverable while the control
 plane/network is unavailable. A remote commit also cannot prove that a local
-WAL/process mutation reached this Host. PostgreSQL consumes immutable Node
-results; it does not replace local physical ownership proof.
+authority-file/process mutation reached this Host. PostgreSQL consumes
+immutable Node results; it does not replace local physical ownership proof.
 
 ### Use an embedded key/value store
 
-Rejected. It adds another production storage dependency while leaving foreign
-keys, exact one-of constraints, multi-row commits and queryable recovery indexes
-to application code. The current boundary is relational and transactional,
-not a cache lookup.
+Rejected. It adds another production storage dependency while leaving exact
+one-of constraints, canonical validation and recovery indexes to application
+code. The current boundary is one durable Cat transaction, not a cache lookup.
 
 ## Implementation decomposition
 
 | Slice | Scope | Required exit gate |
 | --- | --- | --- |
-| C1 #279 | SQLite schema, authority worker, canonical codecs, durability and corruption behavior | Transaction/fault tests, exact schema manifest, no best-effort writes |
+| C1 #279 | V2 authority documents, canonical codecs, atomic replacement, durability and corruption behavior | Filesystem/crash tests, exact schema manifest, no best-effort writes |
 | C2 #186 | Per-Cat scopes, pre-exec attachment, member identity, startup union reconciliation | Real systemd Agent replacement on both block paths |
 | C3 #90 | NodeJob V2 acceptance, recovery steps, immutable results and exact replay | A0 vectors plus crash injection at every effect boundary |
 | C4 #276 | Route authority store, one admission cell, install/revoke/idle/drain | B0 vectors plus TOCTOU, restart and active-stream races |
 | C5 #278 | Breaking activation and deletion of JSON/in-memory/V1 paths | Inventory proves no compatibility path or old live authority |
-| C6 #275 | Bare-metal qualification and independent data-safety/concurrency review | Both block paths, Relaxed `R < L`, Agent/process/DB fault matrix |
+| C6 #275 | Bare-metal qualification and independent data-safety/concurrency review | Both block paths, Relaxed `R < L`, Agent/process/file fault matrix |
 
 C1-C4 may prepare code in isolated branches, but C5 activates only the complete
 A/B/C terminal boundary. C0 removes the legacy ADR and its source/test references;

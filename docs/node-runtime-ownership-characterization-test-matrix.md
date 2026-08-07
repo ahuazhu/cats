@@ -12,14 +12,14 @@ final qualification rows require a native Linux/systemd Host.
 
 Every negative or empty discovery result must first be calibrated against a
 known positive in the same namespace, credentials, mount namespace and unit
-context. An uncalibrated empty scope/process/socket/database query is `unknown`,
+context. An uncalibrated empty scope/process/socket/authority query is `unknown`,
 not absence.
 
 ## 1. Existing behavior to characterize before replacement
 
 | ID | Current observable behavior | Characterization oracle | Terminal disposition |
 | --- | --- | --- | --- |
-| CH-01 | Per-Cat ledger uses atomic temp/fsync/rename/directory-fsync for an individual JSON file | Crash around each filesystem call; old or new complete JSON only | Replaced by one SQLite authority transaction |
+| CH-01 | Per-Cat ledger uses atomic temp/fsync/rename/directory-fsync for an individual JSON file | Crash around each filesystem call; old or new complete JSON only | Reused as the V2 commit primitive; schema and fail-closed semantics break |
 | CH-02 | `persist_cat`/`forget_cat` failures are logged and execution can still succeed | Inject unwritable/full ledger path and observe returned job result | Must fail closed; no success before authority/result commit |
 | CH-03 | NodeJob journal is process memory | Execute terminal job, restart Agent, replay | Replaced; every terminal outcome survives |
 | CH-04 | Failed jobs are intentionally replayed as execution | Fail after a physical boundary, retry same job ID | Deleted; V2 returns immutable failed result |
@@ -37,24 +37,26 @@ lands. Where the terminal behavior intentionally breaks, the test first proves
 the old behavior and then changes its assertion in the deletion slice; it is
 not silently removed.
 
-## 2. Store and schema gates (C1)
+## 2. Authority-file and schema gates (C1)
 
 | ID | Scenario/fault | Required oracle |
 | --- | --- | --- |
-| DB-01 | First create on empty state directory | Exact owner/mode, application ID, version/digest, WAL and FULL verified; parent fsynced |
-| DB-02 | Concurrent second Agent for same database | One writer wins; loser performs no job/admission/process mutation |
-| DB-03 | Unknown lower/higher schema or protocol version | Global gate closed, Node cordoned, no automatic migration |
-| DB-04 | Malformed row, FK/check violation or partial lineage | Integrity/recovery fails closed; affected authority never loaded |
-| DB-05 | Database symlink, wrong owner/mode or network filesystem | Refused before opening or mutating target |
-| DB-06 | Disk full before acceptance commit | No claim/effect; retry can be recognized after repair |
-| DB-07 | Disk full after accepted claim, before step prepare | Claim remains replayable; no unrecorded effect |
-| DB-08 | I/O/sync failure during final runtime/result commit | No success response; physical state re-queried on recovery |
-| DB-09 | Commit succeeds, checkpoint fails | Exact replay works from WAL; files retained; health degraded |
-| DB-10 | WAL truncated/corrupt or database corrupt | No best-effort rows; preserve processes/data, cordon/quarantine |
-| DB-11 | Authority worker saturated or SQLite busy | Bounded backpressure; no async-executor blocking or unlocked fallback |
-| DB-12 | Migration crash in an offline implementation test | Old complete or new complete schema only; activation manifest not advanced early |
-| DB-13 | Exact lineage field null/mismatch mutation | Constraint or startup quarantine; digest equality cannot mask it |
-| DB-14 | `remote_watermark > local_watermark` or unknown at teardown | Invariant error/block; no writer release or journal deletion |
+| FS-01 | First create on empty state directory | Exact owner/mode, canonical root/Cat schemas and digests; every created directory synced |
+| FS-02 | Concurrent second Agent for the same authority directory | One lifetime lock wins; loser performs no job/admission/process mutation |
+| FS-03 | Unknown lower/higher schema or protocol version | Global gate closed, Node cordoned, no automatic migration |
+| FS-04 | Noncanonical/malformed document, duplicate global ID or partial lineage | Integrity/recovery fails closed; affected authority never loaded |
+| FS-05 | Authority path symlink, wrong type/owner/mode or network filesystem | Refused through held directory descriptors before mutation |
+| FS-06 | Disk full before acceptance commit | No claim/effect; retry can be recognized after repair |
+| FS-07 | Disk full after accepted claim, before step prepare | Claim remains replayable; no unrecorded effect |
+| FS-08 | Short write or file-sync failure during final runtime/result commit | No success response; physical state re-queried on recovery |
+| FS-09 | Rename succeeds, directory sync fails | No success; restart accepts only a complete canonical old/new revision and rechecks physical state |
+| FS-10 | Truncated final document or attacker-created temporary/symlink file | No best-effort decode; preserve processes/data, cordon/quarantine |
+| FS-11 | Many Cat writers or slow filesystem | Per-Cat serialization and bounded backpressure; no async-executor blocking or unlocked fallback |
+| FS-12 | Offline schema activation crash | Old complete or new complete authority tree only; activation manifest not advanced early |
+| FS-13 | Exact lineage field null/mismatch mutation | Schema validation or startup quarantine; digest equality cannot mask it |
+| FS-14 | `remote_watermark > local_watermark` or unknown at teardown | Invariant error/block; no writer release or journal deletion |
+| FS-15 | Two mutations race on one Cat | One mutation token owns the next revision; no overlapping replacement or lost update |
+| FS-16 | Settled tombstone deletion crashes before/after unlink or directory sync | Only the settled tombstone or absence remains; no authority is reconstructed from residue |
 
 ## 3. NodeJob and recovery gates (C3)
 
@@ -77,7 +79,7 @@ transaction, after that commit and after response write.
 | NJ-10 | Prepared process step with matching live process | Adopt/verify it; do not spawn a duplicate |
 | NJ-11 | Prepared process step with mismatched live process | Quarantine; do not signal or replace by PID |
 | NJ-12 | Runtime ready, before success transaction | Reverify and commit runtime/result atomically |
-| NJ-13 | Success transaction with one lineage field wrong | Entire transaction rejected; no partial result/runtime row |
+| NJ-13 | Success commit with one lineage field wrong | Entire replacement rejected; no partial result/runtime postcondition |
 | NJ-14 | Superseded/late control-plane delivery | Store/return exact local outcome but do not infer current global authority |
 | NJ-15 | Two dispatches race for incompatible Cat action | Exact revision/claim serialization; at most one effect owner |
 | NJ-16 | Cancellation at each async boundary | Prepared work remains recoverable or exact failed disposition commits |
@@ -105,14 +107,14 @@ Action-specific matrix:
 | --- | --- | --- |
 | PR-01 | Payload child before scope attachment | Payload executable has not run |
 | PR-02 | Agent dies while child is held pre-exec | Child exits or is found as exact prepared work; payload did not escape |
-| PR-03 | Agent dies immediately after releasing exec | Scope enumeration finds member even without observation row |
+| PR-03 | Agent dies immediately after releasing exec | Scope enumeration finds member even without an observation record |
 | PR-04 | Scope unit name/metadata hash collision attempt | Full digest + stored Cat metadata reject aliasing |
 | PR-05 | Same PID, different start ticks | No adoption and no signal |
 | PR-06 | Same PID/start ticks, different executable inode/path | No adoption and no signal |
 | PR-07 | Process moved to another cgroup/invocation | No adoption and no signal |
 | PR-08 | Expected members plus one unexpected member | Quarantine complete Cat scope |
-| PR-09 | DB row without scope/process | Action-specific recovery or quarantine; not Cold |
-| PR-10 | Scope/process without DB row | Quarantine/cordon; no PID kill or directory cleanup |
+| PR-09 | Authority document without scope/process | Action-specific recovery or quarantine; not Cold |
+| PR-10 | Scope/process without authority document | Quarantine/cordon; no PID kill or directory cleanup |
 | PR-11 | Socket path reused by another process | Peer/protocol identity mismatch fails adoption |
 | PR-12 | VMM/Guest boot ID mismatch | Quarantine; no Running/Suspended report |
 | PR-13 | blockd disk/volume/attachment/epoch mismatch | Quarantine and preserve journal; no grant resurrection |
@@ -142,14 +144,14 @@ Startup union calibration:
 | RT-03 | Crypto succeeds while lifecycle closes gate before mutex | Final compare denies; no TOCTOU |
 | RT-04 | Admission wins mutex immediately before retirement | Guard is counted in retirement fence and drained/busy |
 | RT-05 | Retirement wins mutex immediately before admission | New guard denied |
-| RT-06 | SQLite prepare fails after volatile close | Old revision may reopen only after exact DB recheck/token compare |
+| RT-06 | Authority-file prepare fails after volatile close | Old revision may reopen only after exact document recheck/token compare |
 | RT-07 | Crash after durable retirement prepare | Restart gate closed before proxy listener serves |
 | RT-08 | Crash while cancelling active stream | Restart completes exact work or remains blocked; no receipt early |
 | RT-09 | Drain timeout | Running source and route-retirement work retained blocked; lifecycle not quiesced |
 | RT-10 | `require_idle` sees nonzero guard | Immutable busy proof; no cancel/revoke/authority mutation |
 | RT-11 | `require_idle` zero then concurrent admission | Closed mutex gate prevents new guard; exact receipt can commit |
 | RT-12 | Stale completion after fresh route install | Revision/token CAS denies; old epoch never reopens |
-| RT-13 | Active route row committed, Agent crashes before memory publish | Startup complete recheck can open exact authority |
+| RT-13 | Active route authority committed, Agent crashes before memory publish | Startup complete recheck can open exact authority |
 | RT-14 | Local route/runtime mismatch on restart | Quarantine/closed; Cat ID or epoch cannot repair it |
 | RT-15 | Clock unhealthy | No new guards; existing stream is not silently killed |
 | RT-16 | Grant expires after an active stream starts | Stream retains guard until normal close or explicit exact retirement |
@@ -172,7 +174,7 @@ vhost-user-blk. At minimum:
 | ST-07 | Blockd dies while VMM survives | No successful Running adoption; exact containment/fallback proof required |
 | ST-08 | VMM dies while blockd holds pending packs | Journal/publisher retained; no blind full-scope kill |
 | ST-09 | Old fencing epoch process returns | Metadata CAS and local identity both fail closed |
-| ST-10 | Local database permanently lost | External fence + proven Cold rebuild only; no scan-to-authority reconstruction |
+| ST-10 | Local authority documents permanently lost | External fence + proven Cold rebuild only; no scan-to-authority reconstruction |
 
 ## 7. Breaking activation and deletion gates (C5)
 
@@ -181,8 +183,8 @@ vhost-user-blk. At minimum:
 | CU-01 | Public admission stopped | Gateway/Node request probes plus listener/config inventory |
 | CU-02 | Old active sessions retired | Per-epoch zero-guard receipts or external serving fences |
 | CU-03 | Old writers/runtimes safe | Volume invalidation/release, `R/L`, scope/process and fence receipts |
-| CU-04 | Empty V2 database activation | Schema/database manifest; no imported JSON row |
-| CU-05 | Old ledger path deleted | Source/symbol/filesystem tests fail if JSON reader/writer returns |
+| CU-04 | Empty V2 authority activation | Root/schema manifest; no imported V1 document |
+| CU-05 | Old ledger path deleted | Source/symbol/filesystem tests fail if the legacy `runtime-ledger` reader/writer returns |
 | CU-06 | Old job journal/endpoint deleted | V1 requests rejected before recognition; source inventory zero |
 | CU-07 | Old Route Grant path deleted | No signer/parser/verifier/admission fallback or mixed cohort |
 | CU-08 | PID/path-only teardown deleted | Negative identity tests cannot reach a signal/delete call |
@@ -204,7 +206,7 @@ Host. GitHub-hosted CI availability or account billing is not a substitute for
 the native gate and is not itself a technical blocker.
 
 Native runs must record immutable source/tree/bundle/manifest digests, Host
-image and boot identity, database schema digest, systemd version, kernel,
+image and boot identity, authority schema digest, systemd version, kernel,
 Cloud Hypervisor/blockd digests, block path, PostgreSQL/S3 endpoints by opaque
 environment identity, command transcript and exit code. They must not retain
 AWS credentials or a reusable HOME.
@@ -218,8 +220,8 @@ Required end-to-end sequences for both block paths:
 4. Running -> Cold with Strict and Relaxed volumes, including `R < L`.
 5. Active HTTP and WebSocket -> cancel-and-drain -> lifecycle quiesce.
 6. Auto-suspend `require_idle` busy/zero and manual-command race.
-7. Database/WAL fault while VMM/blockd remain live -> fail-closed quarantine,
-   repair, exact recovery.
+7. Authority-file write/sync/corruption fault while VMM/blockd remain live ->
+   fail-closed quarantine, repair, exact recovery.
 8. Unexpected scope/process/PID reuse -> no signal, deletion, admission or Cold
    report.
 9. Response loss for each terminal result -> byte-identical replay.
