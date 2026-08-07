@@ -36,18 +36,13 @@
       "expected_class": "noncanonical_encoding"
     },
     {
-      "name": "signed-legacy-version-one",
+      "name": "signed-wrong-wire-version-one",
       "token_parts": {
         "header_base64url": "eyJhbGciOiJFZERTQSIsImtpZCI6IjIxZmUzMWRmYTE1NGEyNjE2MjZiZjg1NDA0NmZkMjI3MWI3YmVkNGI2YWJlNDVhYTU4ODc3ZWY0N2Y5NzIxYjkiLCJ0eXAiOiJjYXRzLXJvdXRlLWdyYW50K2p3dCIsInYiOjF9",
         "claims_base64url": "$positive.claims_base64url",
         "signature_base64url": "DG5Ofbp8D6Bgw5Rfx1s4370wjJJwT2D15d80D2BnBVz4N5qOeyMCpaJQnCEg3HBhRPhHeyiPOTayVUmi982XBQ"
       },
       "expected_class": "unsupported_version"
-    },
-    {
-      "name": "deployed-adr-0033-v1-shape",
-      "compact": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSIsImtpZCI6IjA2ZTNmZDhmZGEyOWJiNjBhYjU5NTU3ZGU2MWVkYjBhZWNkYjIzMTEzNGJlMzBlNzViNDU1ZjhlMWI3OTJmYTkifQ.eyJ2ZXJzaW9uIjoxLCJpc3MiOiJjYXRzLWNvbnRyb2wtcGxhbmUiLCJhdWQiOiJjYXRzLW5vZGUtYWdlbnQiLCJob3N0bmFtZSI6InByZXZpZXctMDEyMzQ1Njc4OWFiLmNhdHMucnVuIiwid29ya3NwYWNlX2lkIjoid3NfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCJjYXRfaWQiOiJjYXRfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCJjYXRfZ2VuZXJhdGlvbiI6Nywibm9kZV9pZCI6Im5vZGVfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCJyb3V0ZV9lcG9jaCI6NDIsInRhcmdldF9wb3J0Ijo4MDgwLCJpYXQiOjE4MDAwMDAwMDAsImV4cCI6MTgwMDAwMDEyMH0.dYEkN4qlWqFgNzYS7pUVNAYI7O5QNPBKk1-05ky21Os5utI85zTwh19gFGtK9czZER3VnbLyYgF1mG5svgSEBg",
-      "expected_class": "noncanonical_encoding"
     },
     {
       "name": "signed-wrong-algorithm",

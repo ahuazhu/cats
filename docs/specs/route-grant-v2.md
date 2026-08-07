@@ -5,14 +5,14 @@
 - 共同测试输入：[固定向量](route-grant-v2-vectors/README.md)
 
 改变 compact bytes、字段、验签/时间语义、Node admission、cache 状态或 key 轮换顺序，必须先
-更新 ADR 并升 wire version。不得为了兼容 ADR-0033 Route Grant V1 或旧 unsigned route，在 v2
-parser 中增加可选分支。
+更新 ADR 并升 wire version。v2 是终态唯一协议；不得为了兼容 ADR-0033 或旧 unsigned route，
+增加第二套 parser、issuer、Node admission、cohort 或请求级 fallback。
 
 ## 1. 常量
 
 | 名称 | 值 | 说明 |
 |---|---:|---|
-| `WIRE_VERSION` | `2` | protected header 的整数 `v`；已部署 ADR-0033 V1 必须拒绝 |
+| `WIRE_VERSION` | `2` | protected header 的整数 `v`；任何其他版本必须拒绝 |
 | `ALGORITHM` | `EdDSA` | 仅 Ed25519；不做算法协商 |
 | `TYPE` | `cats-route-grant+jwt` | 防止与其他 JWS/JWT 混用 |
 | `ISSUER` | `cats-control-plane` | claims 的 `iss` |
@@ -213,9 +213,9 @@ binding、intent、epoch 或 lineage 只在一层不同，都拒签，不能以�
 generation/lineage 不闭合或 current command 至少一项而拒签。Node local revoke 到 receipt ingestion
 之间即使 issuer 尚不可见，Node 也已经 fail closed 拒绝旧 token；recovery 必须收敛该短暂可用性缺口。
 
-V2 issuer 禁止读取 `cats.observed_state` 或 heartbeat observation 作为授权；前者只是迁移期 API
-projection，后者只是 observation。ADR-0033 Route Grant V1 只能留在 legacy cohort，不能 mint v2
-grant。`iat` 取 transaction 的整秒数据库时间；编码/签名不得再次读取或补写某个 claim。签名
+V2 issuer 禁止读取 `cats.observed_state` 或 heartbeat observation 作为授权；前者只是 API
+projection，后者只是 observation。ADR-0033 的 signer/admission 路径必须在启用 V2 前删除，不能
+与 V2 共存。`iat` 取 transaction 的整秒数据库时间；编码/签名不得再次读取或补写某个 claim。签名
 结束时若 `now >= exp`，丢弃结果。
 
 Route Controller discovery 不得用持锁的 route-intent claim 跨进 apply transaction。apply 必须从
@@ -577,20 +577,19 @@ Node ring 是版本化、持久化的 `{kid -> raw Ed25519 public key, state}` �
 sorted-key digest 与每个 fingerprint。Gateway 没有 key ring，Control Plane private key 不离开
 signer/KMS 边界。
 
-ADR-0033 V1 对 SPKI DER 求 `kid`，V2 对 raw 32-byte key 求 `kid`；两者是带 scheme/version 标签的
-不同 identity namespace。相同 public key 的两个 digest 不能直接比较，V1 registration fingerprint
-也不能充当 V2 verifier-ring coverage evidence。
+终态 `kid` 只对 raw 32-byte key 求 digest。早期实现的 SPKI fingerprint 不能充当 verifier-ring
+coverage evidence；breaking cutover 必须建立新的 ring version/digest 与逐 Node ACK。
 
 轮换必须 verifier-first：staged verifier 覆盖全部目标 V2 Node并有证据 → signer switch → 双 key
 overlap 至少从最后一次旧 key 签发后 125 秒 → retire。rollback 只能切到仍部署的 key；ring
 removal 只停止新 admission。incident 若要终止已有会话还必须 epoch-aware cancel-and-drain；
 无法收到 compromise revoke 的 Node 必须隔离。
 
-## 13. V2 cohort 与旧路径删除
+## 13. 破坏式终态切换与旧路径删除
 
 | 旧路径 | V2 replacement | 删除门禁 |
 |---|---|---|
-| ADR-0033 Route Grant V1 / unsigned `RouteBinding` authority | V2 compact grant + Node local truth | B1–B3 contract tests green |
+| ADR-0033 Route Grant / unsigned `RouteBinding` authority | V2 compact grant + Node local truth | 恢复流量前删除；B1–B3 contract tests green |
 | Gateway `target_port`/`route_epoch` 字段 | signed claims；Node local-derived target | V2 Node/Gateway qualification |
 | WebSocket route query fields | `Cats-Route-Grant` header | Upgrade/expiry/active-revoke evidence |
 | HTTP per-request work acquire/release | epoch-aware Node activity guard | lifecycle/revoke/drain race tests |
@@ -598,12 +597,12 @@ removal 只停止新 admission。incident 若要终止已有会话还必须 epoc
 | Node `cat_id + Running` admission | strict verifier + atomic compare-and-guard | negative vectors + race tests |
 | single verifier/unsigned fallback | durable versioned key ring | rotation/rollback evidence |
 
-迁移期间 legacy 与 V2 由显式 Node capability 和独立 Gateway cohort 隔离。Cat 只以 Cold move、new
-generation/new epoch 进入 V2；V2 失败绝不 request-level downgrade。全部目标完成 qualification 后
-删除 migration adapter，不保留永久兼容层。V2 的 125 秒窗口不适用于 ADR-0033 V1：legacy wire
-允许最大 300 秒 TTL 与 5 秒 skew，删除 legacy verifier/cohort 前必须完成 old-route drain/fence，
-并等待最后一次 V1 签发后的实际配置上限（硬上限 305 秒）或取得独立等价 evidence。Multi-AZ
-继续是 #179 的 deferred scope，本协议不把短期离线窗口宣称为 Multi-AZ HA。
+不实现 legacy/V2 cohort、migration adapter、双 parser/verifier、请求级 downgrade 或回滚兼容。
+切换必须先停止旧 issuer 与公网 admission，对旧 runtime 完成 cancel-and-drain 或外部 fence，并
+独立完成 writer/durability gate；随后轮换 trust root，丢弃旧 route-authority/cache/local-ledger
+状态，整体部署终态组件并 qualification。部分更新的 fleet 保持 unready/cordoned。只有证明旧
+runtime 不再服务、旧 writer 不再写入且 V1 admission 路径已删除后，才恢复流量。Multi-AZ 继续是
+#179 的 deferred scope，本协议不把短期离线窗口宣称为 Multi-AZ HA。
 
 ## 14. Observability 与敏感信息
 

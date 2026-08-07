@@ -5,12 +5,12 @@
 - 关联：ADR-0002（生命周期四态）、ADR-0010（默认 HTTP Endpoint）、
   ADR-0018（Workspace 是唯一资源所有者）、ADR-0028（Node runtime ledger）、
   ADR-0031/0032（PostgreSQL 控制权威与多副本）、
-  ADR-0033（已部署的 legacy Route Grant V1）、ADR-0035（A0 LifecycleCommand V2）；
+  ADR-0033（被本文取代的早期 Route Grant 实现）、ADR-0035（A0 LifecycleCommand V2）；
   Architecture V2 #204、Epic B #206、B0 #216
 
 ## 背景
 
-当前 workspace 已按 ADR-0033 部署 legacy Route Grant V1：Running HTTP/WebSocket 不再逐请求
+当前 workspace 有一套按 ADR-0033 实现的早期 Route Grant：Running HTTP/WebSocket 不再逐请求
 获取控制面 work lease，Gateway 搬运 Ed25519 token，Node 也校验 Cat generation、route epoch、
 target Node/port 和本地 Running。该实现解决了最初的控制面热路径问题，但它先于 Architecture V2
 authority model：issuer 仍以兼容期 `observed_state`/materialized binding 为主，wire 不绑定
@@ -24,9 +24,11 @@ durable exact route-authority CAS，key identity 也仍是 SPKI DER digest 与�
 2. Gateway 一旦被攻陷，或缓存里存在迁移前的旧 V1 grant，Node 缺少 Endpoint 和 complete settled
    lineage 的 durable local truth，不能证明 token 仍对应 exact Guest execution。
 
-因此 Architecture V2 不能原地扩写已部署的 V1 token。它必须升 wire version、使用独立 cohort
-capability，并把 atomic issuer snapshot、durable Node truth、retirement 和 key-ring migration 一起
-纳入合同；否则同一个“Route Grant V1”名称会出现两套互不兼容的解释。
+Cats 尚未向外部客户承诺该早期 wire 或在线升级兼容性。Architecture V2 直接用本文终态取代
+ADR-0033：升 wire version，并把 atomic issuer snapshot、durable Node truth、retirement 和 key ring
+一起纳入合同。切换允许中断服务和丢弃早期 route-authority 状态，但不允许降低 fencing、drain
+或数据安全门禁。最终产品只实现一套 Route Grant，不保留 V1 cohort、兼容 parser、请求级 fallback
+或回滚路径。
 
 ## 决定
 
@@ -98,9 +100,9 @@ B1 的唯一发行入口读取一个 `RouteAuthorizationSnapshot`。V2 issuer �
 - Route `state = active`，endpoint id/hostname/protocol/port 与 route 一致；
 - Cat generation 与 route epoch 均为正数。
 
-`cats.observed_state` 在 V2 中只是迁移期 API compatibility projection，heartbeat 只写 normalized
-observation；二者都不得参与 V2 issuer 判断。ADR-0033 Route Grant V1 若仍按 `observed_state`
-工作，也只能留在隔离的 legacy cohort，不能 mint Route Grant v2 或发布 V2 Route。
+`cats.observed_state` 只是 API projection，heartbeat 只写 normalized observation；二者都不得参与
+Route Grant issuer 判断。ADR-0033 中按 `observed_state` 签发或仅靠 materialized binding 准入的
+路径必须在终态开放流量前删除，不能 mint Route Grant v2 或发布 Route。
 
 `iat` 取该事务的整秒时间，`exp` 由它计算；事务结果复制为不可变 snapshot 后才允许编码和
 签名。签名完成时若 snapshot 已到期则丢弃，不得延长。签名期间 route 可能继续前进，这只会
@@ -147,7 +149,7 @@ durable ledger 重建并逐字段复核；缺失/损坏/mismatch 时停止 admis
 admission 的硬边界。普通时间流逝不会强制中断已经持有 guard 的请求/连接，但显式 epoch
 revoke、lifecycle quiesce 或 authority transfer 必须按下一节取消并 drain 它们。
 
-### 5. Route publication、revoke 和迁移有明确顺序
+### 5. Route publication、revoke 和 authority transfer 有明确顺序
 
 正常 activate 顺序是：消费 A0 exact reducer route intent → 证明旧 volume grant 已 conditional
 invalidate/release 或 writer 已被 A0/A7 fence → 证明 retained volume durability receipt 满足该
@@ -272,9 +274,9 @@ v2 只允许 Ed25519。`kid` 是 32-byte raw Ed25519 public key 的 SHA-256 lowe
 Control Plane 只持 signer reference/private material；Gateway 不持任何 signing material；
 Node 只持有版本化 verifier key ring。
 
-ADR-0033 V1 的 `kid` 是 SPKI DER digest；V2 raw-key digest 是不同 namespace，即使来自同一把
-Ed25519 key 也不是同一个字符串。所有 capability、registration/ACK 和部署 evidence 必须同时标明
-wire version 与 key-identity scheme，禁止把无标签的 V1 fingerprint 当作 V2 ring coverage。
+终态唯一 key identity 是 raw Ed25519 public key digest。早期实现的 SPKI fingerprint 不是 ring
+coverage evidence；破坏式切换必须建立新的 versioned ring evidence，不能复用无 scheme/version
+标签的 registration fingerprint 猜测覆盖。
 
 轮换顺序不可交换：
 
@@ -289,22 +291,23 @@ ring；ring removal 只阻止新 admission，不会终止 active guard。inciden
 还必须执行 epoch-aware cancel-and-drain；无法收到新 ring/revoke 的 Node 必须隔离，不能声明
 已立即撤销。
 
-### 9. mixed-version 只存在于隔离的 V2 cohort migration boundary
+### 9. 破坏式切换到唯一终态，不支持 mixed-version
 
-V2 Node 从首次 admission 起只接受 Route Grant v2，不接受 ADR-0033 V1 或 unsigned fallback。
-Legacy Node 继续由隔离的 legacy Gateway/cohort 服务；路由选择通过显式 Node capability 完成，而不是在
-领域代码里散落 `v1/v2` 分支。Cat 以 Cold activation 和新 generation/route epoch 迁入 V2。
+终态 Node 只接受 Route Grant v2，不接受 ADR-0033 token 或 unsigned fallback。控制面、Gateway、
+Node 和 route-authority state 必须作为一个不兼容 release 切换；不得建设 legacy Gateway、Node
+capability cohort、migration adapter、双 issuer/verifier 或按请求选择 v1/v2 的领域分支。
 
-V2 的 125 秒窗口不能证明 legacy V1 已耗尽：当前 V1 wire 允许最大 300 秒 TTL 与 5 秒 skew。
-删除 legacy cohort/verifier 前，必须先完成 old-route cancel/drain 或外部 fence，并从最后一次 V1
-签发起等待其实际配置上限（硬上限 305 秒），或取得等价的独立 zero-admission/non-serving evidence。
-无论等待多久，都不能替代 old runtime/writer fence。
+切换顺序固定为：停止公网 admission 与旧 issuer → 对每条旧 route 完成 cancel-and-drain 并证明
+session 为零，或外部 fence 旧 Node/runtime → 关闭旧 writer 并取得 A0/A7 所需 fence/durability
+proof → 轮换到新的 signer/verifier trust root → 丢弃并重建旧 route-authority/cache/local-ledger
+状态 → 整体部署 B1–B4 终态实现并完成 qualification → 恢复流量。无法证明旧 runtime 不再服务或
+旧 writer 不再写入时，切换保持 blocked；接受 breaking availability 不等于接受安全降级。
 
-任何进入 V2 cohort 的 Endpoint 不得因签名、key、控制面故障静默 downgrade。回滚需要显式
-drain/Cold move 回 legacy cohort。完成条件是全部 Cat/Endpoint 离开 legacy cohort、完整
-qualification 通过，随后删除 migration adapter 与所有旧路径。
+不支持在线 mixed-version rollout，也不支持回滚到 ADR-0033。部分更新的 fleet 必须保持
+unready/cordoned，不能继续提供旧协议。由于旧 Node/runtime 在恢复流量前必须完成 drain/fence，
+终态无需实现旧协议 TTL 兼容窗口、legacy verifier overlap 或 Cold-move cohort migration。
 
-必须删除的旧路径包括：
+恢复终态流量前必须删除的旧路径包括：
 
 - ADR-0033 Route Grant V1 或 unsigned RouteBinding 作为 V2 Node authority；
 - Gateway 可传的 `target_port`/`route_epoch` proxy 字段或 WebSocket query；
@@ -342,7 +345,7 @@ expiry bucket，但不得记录可重放 token。
 | Durable Node runtime/route truth、admission lock | C #207 + B2 #218 | C 提供 durability/identity container；B 拥有 route 字段和比对语义 |
 | Gateway cache/outage/HTTP/WS | B3 #219 | 一个状态机，不叠加零散 fallback |
 | Key delivery、Node capability/admission | G #211 + B4 #220 | verifier-first、digest/fingerprint evidence |
-| Cohort migration、legacy deletion、release | H #212 + B5 #221 | 不保留永久双路径 |
+| Breaking cutover、旧路径删除、release | H #212 + B5 #221 | 整体停机切换，不实现双协议或回滚兼容 |
 | Fault actor 与 authoritative evidence | F #210 + B6 #222 | 真停控制面/DB、rotation/skew/tamper qualification |
 
 Multi-AZ 不由本 ADR 实现。RDS Multi-AZ、per-AZ NAT 与跨 AZ 数据面仍是 #179 的 accepted/
@@ -367,7 +370,7 @@ registry 与版本化 key ring；部署和 cancel/drain/fence 顺序都成为安
 - **长寿命或可续期离线 token：**扩大 replay/revoke/key compromise 窗口，并把 Gateway 变成
   隐式授权服务器。
 - **Node 离线向控制面回查：**重新引入要消除的故障依赖。
-- **永久 legacy fallback：**签名失败时会降级为旧不安全路径，违反 Architecture V2 删除条件。
+- **临时或永久 legacy cohort/fallback：**都会制造双协议、迁移和回滚债务；早期产品直接整体切换。
 
 ## 验收
 
@@ -403,5 +406,5 @@ registry 与版本化 key ring；部署和 cancel/drain/fence 顺序都成为安
 - 真实 PostgreSQL 两 session 必须覆盖 issuer vs intent/current command、reducer route intent、
   endpoint rebind、Route Controller apply 与 policy-retirement adoption vs compensation；禁止
   route-intent-first 反向锁 Cat，serialization/deadlock 必须从 fresh snapshot 重试整个事务。
-- migration、key rotation、clock skew、Agent replacement、Suspend race 和 route rebind 必须
-  在 V2 cohort 两条 block path 上留下 authoritative evidence。
+- breaking cutover、key rotation、clock skew、Agent replacement、Suspend race 和 route rebind 必须
+  在终态两条 block path 上留下 authoritative evidence；qualification 必须证明不存在 V1 admission。

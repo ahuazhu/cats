@@ -33,8 +33,8 @@ dot-path。token segment case 唯一允许在 reference 后追加 literal `=`，
 
 1. issuer 从公开 test seed 构造 test-only signer，产生与 `positive.json` 逐字节相同的三个 segment；
 2. 独立 OpenSSL 或另一 Ed25519 backend 验证 positive signature；
-3. Gateway parser 与 Node verifier 消费所有 `cases`，得到 exact `expected_class`；其中
-   `deployed-adr-0033-v1-shape` 是现有 SPKI-`kid`/claims-version V1 wire，V2 必须明确拒绝；
+3. Gateway parser 与 Node verifier 消费所有 `cases`，得到 exact `expected_class`；非 v2 version
+   必须按 `unsupported_version` 拒绝，不加载第二套 parser；
 4. issuer 消费 `issuer_snapshot_cases`、`issuer_generation_mutation_matrix`、
    `issuer_lineage_mutation_matrix`、`issuer_route_identity_mutation_matrix` 和
    `current_nonterminal_command_matrix`；lineage matrix 必须同时展开 optional boot identity 的

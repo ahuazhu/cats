@@ -690,7 +690,7 @@ Node 验证 Route Grant 的签名、时效、hostname、Cat generation、Node、
 
 转发到 tap 私网地址；响应字节计入 tenant egress ledger。
 
-**控制面故障契约（[ADR-0033](decisions/0033-short-lived-signed-route-grants.md)）：**
+**控制面故障契约（终态以 [ADR-0039](decisions/0039-architecture-v2-route-grant-contract.md) 为准）：**
 Gateway 的普通缓存过期后，只要 active + Running Route Grant 的签名时效仍有效，就立即
 准入并按 hostname 合并为一个后台 refresh；transport/5xx 失败保留该授权并进入有界退避，
 不会让每个请求等待两秒或放大控制面流量。观察到明确 not-found、其他非成功响应、畸形响应
@@ -714,13 +714,12 @@ activity guard 仲裁，不再逐请求获取 PostgreSQL work lease；Wake 仍�
 epoch 的较早签发写不能覆盖更新授权，因此缓存变慢或写响应乱序不会劫持健康控制面路径。
 
 **密钥一致性门禁：** 每个控制面副本启动前用私钥签名、用同次部署从该私钥派生的公钥
-验证固定 proof；Grant 的 `kid` 和 Node 注册均携带公钥 SPKI DER 的 SHA-256。Node 报告的
-指纹不匹配时，注册事务会把它保持为 Cordoned，管理 API 也拒绝 uncordon。生产发布在
-Terraform plan 前比较所有可调度或仍承载 assigned/orphan Cat 的 Node；全 legacy cohort 只
-用于第一次 additive rollout，legacy/enforcing 混合 cohort 作为中断发布拒绝。注册、placement
-和 uncordon 共享事务线性化点；数据库中的一次性 legacy phase 在所有 serving Node 报告
-verifier 后永久关闭。金属机部署在安装后再次计算指纹，因此独立错配、降级或中断发布不能
-把不兼容 Node 放入流量路径。
+验证固定 proof；终态 Grant 的 `kid` 是 raw Ed25519 public key 的 SHA-256，Node 注册回显
+versioned verifier-ring digest 与逐 key fingerprint。指纹或 ring version 不匹配时，注册事务会
+把 Node 保持为 Cordoned，管理 API 也拒绝 uncordon。ADR-0033 的 SPKI 指纹不能充当终态覆盖
+证据。Architecture V2 采用停发、全量 drain/fence、轮换 trust root、整体替换和重新 qualification
+的破坏式切换；不建立 legacy/enforcing cohort、兼容 verifier 或回滚路径。部分更新的 fleet
+保持 unready/cordoned，不能进入 placement 或流量路径。
 
 ### 9.2 地址与路由
 
