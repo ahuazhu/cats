@@ -5,6 +5,10 @@
 - 范围：Node Agent 的运行时清单持久化、NodeJob journal、启动顺序、子进程归属与重接管的身份证明。
 - 不含：控制面资源库迁移（P0-A）、Route Grant（P0-B）、跨 Host handoff、自动 Host fencing。
 
+> Architecture V2 关系：ADR-0035 在 V2 激活后取代本 ADR §4 的
+> generation/action 派生 Job 身份与 Failed 结果不持久化策略。Node ledger 仍是本地物理
+> 事实而非控制权威；heartbeat 只写 observation。在 A8 激活前，当前 V1 协议保持不变。
+
 ## 背景
 
 Node Agent 目前把「这个 Node 上有哪些 Cat 在跑」完全放在内存里，而真正承载数据的
@@ -140,13 +144,15 @@ FakeVmm/开发与 macOS 路径没有 systemd。这些路径不使用 scope，仅
   所以这是三种非 Running 状态里唯一有真实数据风险的一种。接管后等控制面重试同一 job。
 - 无法证明归属的 residue：维持现有 fail-closed 行为不变。
 
-心跳只上报已证明归属的 Cat。无法证明的 Cat 必须**完全不出现在心跳里**，不得上报为
+当前 V1 中，心跳只上报已证明归属的 Cat。无法证明的 Cat 必须**完全不出现在心跳里**，不得上报为
 `Cold`。原因是控制面的心跳同时承担两件事
 （[`control-plane/src/api/nodes.rs:31`](../../control-plane/src/api/nodes.rs)）：同 generation
 下它信任 Node 上报的状态并写入 `observed_state`；以及只有当心跳覆盖全部非删除 claim
 时才恢复 Lost node。把无法证明的 Cat 上报成 `Cold`，会让控制面认为它已经释放，从而
 在旧 blockd 可能仍持有 lease 的情况下推进后续流程；省略它则只是让该 Node 继续 Lost，
-这是安全的一侧。控制面侧无需为本 ADR 修改。
+这是安全的一侧。控制面侧无需为本 ADR 的 V1 实施修改。V2 激活后，ADR-0035 要求归一化
+heartbeat 不得直接写生命周期状态；adoption 必须通过 command-bound durable result 或其
+独立恢复决策进入 reducer。
 
 ## 不变的契约
 

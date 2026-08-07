@@ -6,6 +6,11 @@
 - 不含：agent 端 adoption 与 ledger（ADR-0028 阶段 1–4，已落地）、per-Cat systemd scope 与
   `KillMode`（ADR-0028 §6，#86/#186）、adoption 拒绝后 residue 的清理（另行处理）。
 
+> Architecture V2 关系：`reported_cats_json` 是 V1 的 observation 投影，不是生命周期
+> authority。A8 按 ADR-0035 以归一化 observation 取代它；heartbeat 不得结算 command、
+> observed/runtime、Operation 或 route。本文的 orphan/drain 安全语义保留，由独立 controller
+> 对账执行。
+
 ## 背景
 
 2026-08-05 在 `metal-1` 部署 #79/#88 时发现（#98）：节点实际运行 13 个 Cat runtime
@@ -38,11 +43,13 @@
 
 ## 决定
 
-### 1. 心跳上报的 inventory 是持久化事实
+### 1. 心跳上报的 inventory 是持久化事实（V1 投影）
 
 `HeartbeatRequest.cats`（cat_id、generation、observed state）按 node 原样持久化
 （`nodes.reported_cats_json`，schema v5）。存的是事实（agent 最近一次说了什么），
-判断（哪些是孤儿）在读取时进行。重新注册清空该列：新 agent 尚未上报。
+判断（哪些是孤儿）在读取时进行。重新注册清空该列：新 agent 尚未上报。V2 迁移后相同
+事实写入版本化、归一化 observation rows，不通过该 JSON 或 heartbeat handler 推进 Cat
+生命周期权威。
 
 ### 2. 孤儿的口径
 
