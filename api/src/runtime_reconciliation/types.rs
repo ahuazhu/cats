@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
@@ -227,11 +226,15 @@ impl Sha256Digest {
         &self.wire
     }
 
-    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self {
             wire: format!("sha256:{}", hex::encode(bytes)),
             bytes,
         }
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.bytes
     }
 }
 
@@ -263,18 +266,6 @@ impl PartialEq for Sha256Digest {
 }
 
 impl Eq for Sha256Digest {}
-
-impl PartialOrd for Sha256Digest {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Sha256Digest {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.bytes.cmp(&other.bytes)
-    }
-}
 
 impl Hash for Sha256Digest {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -980,6 +971,7 @@ pub enum ObservedDevice {
 pub struct ObservedMount {
     pub volume_id: Id,
     pub guest_device: GuestDeviceIdentity,
+    pub source_path: HostPath,
     pub filesystem_uuid: RandomId128,
     pub mount_path: HostPath,
     pub access: MountAccess,

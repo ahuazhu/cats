@@ -9,16 +9,16 @@ use super::canonical::{
 };
 use super::types::*;
 
-const NODE_IDENTITY_BYTES: usize = 16_384;
-const AGENT_REGISTRATION_ATTEMPT_BYTES: usize = 16_384;
-const AGENT_SESSION_BYTES: usize = 16_384;
-const ADMISSION_INVENTORY_ATTESTATION_BYTES: usize = 16_384;
-const DESIRED_RUNTIME_SPEC_BYTES: usize = 1_048_576;
-const RUNTIME_CHECKPOINT_BYTES: usize = 4_194_304;
-const NODE_CLEANUP_CHECKPOINT_BYTES: usize = 65_536;
-const NODE_OBSERVATION_BYTES: usize = 8_388_608;
-const OPERATION_BYTES: usize = 65_536;
-const CONTRACT_ERROR_BYTES: usize = 16_384;
+pub const NODE_IDENTITY_MAX_WIRE_BYTES: usize = 16_384;
+pub const AGENT_REGISTRATION_ATTEMPT_MAX_WIRE_BYTES: usize = 16_384;
+pub const AGENT_SESSION_MAX_WIRE_BYTES: usize = 16_384;
+pub const ADMISSION_INVENTORY_ATTESTATION_MAX_WIRE_BYTES: usize = 16_384;
+pub const DESIRED_RUNTIME_SPEC_MAX_WIRE_BYTES: usize = 1_048_576;
+pub const RUNTIME_CHECKPOINT_MAX_WIRE_BYTES: usize = 4_194_304;
+pub const NODE_CLEANUP_CHECKPOINT_MAX_WIRE_BYTES: usize = 65_536;
+pub const NODE_OBSERVATION_MAX_WIRE_BYTES: usize = 8_388_608;
+pub const OPERATION_MAX_WIRE_BYTES: usize = 65_536;
+pub const CONTRACT_ERROR_MAX_WIRE_BYTES: usize = 16_384;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PathSegment {
@@ -2222,6 +2222,7 @@ fn observed_mount_schema() -> Schema {
     object(vec![
         field("volume_id", id()),
         field("guest_device", guest_device_schema()),
+        field("source_path", string(StringRule::HostPath)),
         field("filesystem_uuid", random_id()),
         field("mount_path", string(StringRule::HostPath)),
         field("access", closed(&["read_write", "read_only"])),
@@ -3311,7 +3312,7 @@ pub fn decode_node_identity(bytes: &[u8]) -> Result<NodeIdentity, ContractError>
     decode(
         bytes,
         ContractName::NodeIdentity,
-        NODE_IDENTITY_BYTES,
+        NODE_IDENTITY_MAX_WIRE_BYTES,
         &NODE_IDENTITY_SCHEMA,
         |_| Ok(()),
     )
@@ -3323,7 +3324,7 @@ pub fn decode_agent_registration_attempt(
     decode(
         bytes,
         ContractName::AgentRegistrationAttempt,
-        AGENT_REGISTRATION_ATTEMPT_BYTES,
+        AGENT_REGISTRATION_ATTEMPT_MAX_WIRE_BYTES,
         &AGENT_REGISTRATION_ATTEMPT_SCHEMA,
         |_| Ok(()),
     )
@@ -3333,7 +3334,7 @@ pub fn decode_agent_session(bytes: &[u8]) -> Result<AgentSession, ContractError>
     decode(
         bytes,
         ContractName::AgentSession,
-        AGENT_SESSION_BYTES,
+        AGENT_SESSION_MAX_WIRE_BYTES,
         &AGENT_SESSION_SCHEMA,
         |_| Ok(()),
     )
@@ -3345,7 +3346,7 @@ pub fn decode_admission_inventory_attestation(
     decode(
         bytes,
         ContractName::AdmissionInventoryAttestation,
-        ADMISSION_INVENTORY_ATTESTATION_BYTES,
+        ADMISSION_INVENTORY_ATTESTATION_MAX_WIRE_BYTES,
         &ADMISSION_ATTESTATION_SCHEMA,
         |_| Ok(()),
     )
@@ -3355,7 +3356,7 @@ pub fn decode_desired_runtime_spec(bytes: &[u8]) -> Result<DesiredRuntimeSpec, C
     decode(
         bytes,
         ContractName::DesiredRuntimeSpec,
-        DESIRED_RUNTIME_SPEC_BYTES,
+        DESIRED_RUNTIME_SPEC_MAX_WIRE_BYTES,
         &DESIRED_RUNTIME_SPEC_SCHEMA,
         |value| validate_desired_runtime_spec(value, true),
     )
@@ -3365,7 +3366,7 @@ pub fn decode_runtime_checkpoint(bytes: &[u8]) -> Result<RuntimeCheckpoint, Cont
     decode(
         bytes,
         ContractName::RuntimeCheckpoint,
-        RUNTIME_CHECKPOINT_BYTES,
+        RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
         &RUNTIME_CHECKPOINT_SCHEMA,
         validate_runtime_checkpoint,
     )
@@ -3377,7 +3378,7 @@ pub fn decode_node_cleanup_checkpoint(
     decode(
         bytes,
         ContractName::NodeCleanupCheckpoint,
-        NODE_CLEANUP_CHECKPOINT_BYTES,
+        NODE_CLEANUP_CHECKPOINT_MAX_WIRE_BYTES,
         &NODE_CLEANUP_CHECKPOINT_SCHEMA,
         validate_node_cleanup_checkpoint,
     )
@@ -3387,7 +3388,7 @@ pub fn decode_node_observation(bytes: &[u8]) -> Result<NodeObservation, Contract
     decode(
         bytes,
         ContractName::NodeObservation,
-        NODE_OBSERVATION_BYTES,
+        NODE_OBSERVATION_MAX_WIRE_BYTES,
         &NODE_OBSERVATION_SCHEMA,
         |value| validate_node_observation(value, true),
     )
@@ -3397,7 +3398,7 @@ pub fn decode_operation(bytes: &[u8]) -> Result<Operation, ContractError> {
     decode(
         bytes,
         ContractName::Operation,
-        OPERATION_BYTES,
+        OPERATION_MAX_WIRE_BYTES,
         &OPERATION_SCHEMA,
         validate_operation,
     )
@@ -3407,7 +3408,7 @@ pub fn decode_contract_error(bytes: &[u8]) -> Result<ContractError, ContractErro
     decode(
         bytes,
         ContractName::ContractError,
-        CONTRACT_ERROR_BYTES,
+        CONTRACT_ERROR_MAX_WIRE_BYTES,
         &CONTRACT_ERROR_SCHEMA,
         validate_contract_error,
     )
@@ -3702,7 +3703,6 @@ fn validate_node_observation(
     );
     if has_duplicate(observation.residue.iter().filter_map(|residue| {
         let NodeResidue::Mount {
-            volume_id_hint,
             source_path,
             mount_path,
             ..
@@ -3710,11 +3710,7 @@ fn validate_node_observation(
         else {
             return None;
         };
-        Some((
-            volume_id_hint.as_ref().map(Id::as_str),
-            source_path.as_str(),
-            mount_path.as_str(),
-        ))
+        Some((mount_path.as_str(), source_path.as_str()))
     })) || has_duplicate(observation.residue.iter().filter_map(|residue| {
         let NodeResidue::RouteGate {
             binding,
@@ -3741,6 +3737,7 @@ fn validate_node_observation(
             MalformedProblem::DuplicateIdentity,
         ));
     }
+    collect_inventory_collisions(observation, &mut arrays);
     if let Some(candidate) = choose(arrays) {
         return Err(malformed(contract, candidate));
     }
@@ -3781,7 +3778,6 @@ fn validate_node_observation(
         );
     }
     collect_residue_cross(&observation.residue, &path(&["residue"]), &mut cross);
-    collect_inventory_collisions(observation, &mut cross);
     if let Some(candidate) = choose(cross) {
         return Err(malformed(contract, candidate));
     }
@@ -4481,6 +4477,7 @@ fn collect_runtime_arrays(
             vec![
                 bytes(mount.volume_id.as_str()),
                 bytes(mount.mount_path.as_str()),
+                bytes(mount.source_path.as_str()),
                 bytes(mount.guest_device.serial.as_str()),
                 SortPart::Number(u64::from(mount.guest_device.slot)),
                 SortPart::Number(match mount.access {
@@ -4492,19 +4489,12 @@ fn collect_runtime_arrays(
         },
         output,
     );
-    if has_duplicate(runtime.mounts.iter().map(|mount| {
-        (
-            mount.volume_id.as_str(),
-            mount.guest_device.serial.as_str(),
-            mount.guest_device.slot,
-            mount.filesystem_uuid.as_str(),
-            mount.mount_path.as_str(),
-            match mount.access {
-                MountAccess::ReadWrite => 0,
-                MountAccess::ReadOnly => 1,
-            },
-        )
-    })) {
+    if has_duplicate(
+        runtime
+            .mounts
+            .iter()
+            .map(|mount| (mount.mount_path.as_str(), mount.source_path.as_str())),
+    ) {
         output.push(Candidate::at(
             &child(path, "mounts"),
             MalformedProblem::DuplicateIdentity,
@@ -4699,6 +4689,7 @@ fn collect_checkpoint_arrays(checkpoint: &RuntimeCheckpoint) -> Vec<Candidate> {
             vec![
                 bytes(mount.volume_id.as_str()),
                 bytes(mount.mount_path.as_str()),
+                bytes(mount.source_path.as_str()),
                 bytes(mount.guest_device.serial.as_str()),
                 SortPart::Number(u64::from(mount.guest_device.slot)),
                 SortPart::Number(match mount.access {
@@ -4710,19 +4701,12 @@ fn collect_checkpoint_arrays(checkpoint: &RuntimeCheckpoint) -> Vec<Candidate> {
         },
         &mut output,
     );
-    if has_duplicate(checkpoint.mounts.iter().map(|mount| {
-        (
-            mount.volume_id.as_str(),
-            mount.guest_device.serial.as_str(),
-            mount.guest_device.slot,
-            mount.filesystem_uuid.as_str(),
-            mount.mount_path.as_str(),
-            match mount.access {
-                MountAccess::ReadWrite => 0,
-                MountAccess::ReadOnly => 1,
-            },
-        )
-    })) {
+    if has_duplicate(
+        checkpoint
+            .mounts
+            .iter()
+            .map(|mount| (mount.mount_path.as_str(), mount.source_path.as_str())),
+    ) {
         output.push(Candidate::at(
             &path(&["mounts"]),
             MalformedProblem::DuplicateIdentity,
@@ -5278,12 +5262,37 @@ fn collect_inventory_collisions(observation: &NodeObservation, output: &mut Vec<
                 );
             }
         }
+        for (mount_index, mount) in runtime.mounts.iter().enumerate() {
+            add_identity(
+                &mut identities,
+                "mount",
+                mount_identity(&mount.mount_path, &mount.source_path),
+                &indexed(&child(&runtime_path, "mounts"), mount_index),
+            );
+        }
         for (network_index, network) in runtime.networks.iter().enumerate() {
             add_identity(
                 &mut identities,
                 "network_tap",
                 network.tap_name.as_str().to_owned(),
                 &indexed(&child(&runtime_path, "networks"), network_index),
+            );
+        }
+        if let WarmSnapshotEvidence::Present { path, .. } = &runtime.warm_snapshot {
+            add_identity(
+                &mut identities,
+                "warm_snapshot",
+                path.as_str().to_owned(),
+                &child(&runtime_path, "warm_snapshot"),
+            );
+        }
+        for (route_index, route) in runtime.routes.iter().enumerate() {
+            add_identity(
+                &mut identities,
+                "route_gate",
+                String::from_utf8(canonical_item(&route.binding))
+                    .expect("canonical JSON is valid UTF-8"),
+                &indexed(&child(&runtime_path, "routes"), route_index),
             );
         }
         let checkpoint_path = match &runtime.checkpoint {
@@ -5359,7 +5368,32 @@ fn collect_inventory_collisions(observation: &NodeObservation, output: &mut Vec<
                 data_directory.as_str().to_owned(),
                 &residue_path,
             ),
-            _ => {}
+            NodeResidue::Mount {
+                source_path,
+                mount_path,
+                ..
+            } => add_identity(
+                &mut identities,
+                "mount",
+                mount_identity(mount_path, source_path),
+                &residue_path,
+            ),
+            NodeResidue::WarmSnapshot { path, .. } => add_identity(
+                &mut identities,
+                "warm_snapshot",
+                path.as_str().to_owned(),
+                &residue_path,
+            ),
+            NodeResidue::RouteGate {
+                binding: RouteBindingEvidence::Valid { binding },
+                ..
+            } => add_identity(
+                &mut identities,
+                "route_gate",
+                String::from_utf8(canonical_item(binding)).expect("canonical JSON is valid UTF-8"),
+                &residue_path,
+            ),
+            NodeResidue::RouteGate { .. } => {}
         }
     }
     for paths in identities.into_values().filter(|paths| paths.len() > 1) {
@@ -5368,6 +5402,11 @@ fn collect_inventory_collisions(observation: &NodeObservation, output: &mut Vec<
             MalformedProblem::DuplicateIdentity,
         ));
     }
+}
+
+fn mount_identity(mount_path: &HostPath, source_path: &HostPath) -> String {
+    // HostPath excludes NUL, so this tuple encoding cannot alias two path pairs.
+    format!("{}\0{}", mount_path.as_str(), source_path.as_str())
 }
 
 fn add_identity(

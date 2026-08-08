@@ -24,4 +24,9 @@ pub use wire::{
     encode_agent_registration_attempt, encode_agent_session, encode_contract_error,
     encode_desired_runtime_spec, encode_node_cleanup_checkpoint, encode_node_identity,
     encode_node_observation, encode_operation, encode_runtime_checkpoint,
+    ADMISSION_INVENTORY_ATTESTATION_MAX_WIRE_BYTES, AGENT_REGISTRATION_ATTEMPT_MAX_WIRE_BYTES,
+    AGENT_SESSION_MAX_WIRE_BYTES, CONTRACT_ERROR_MAX_WIRE_BYTES,
+    DESIRED_RUNTIME_SPEC_MAX_WIRE_BYTES, NODE_CLEANUP_CHECKPOINT_MAX_WIRE_BYTES,
+    NODE_IDENTITY_MAX_WIRE_BYTES, NODE_OBSERVATION_MAX_WIRE_BYTES, OPERATION_MAX_WIRE_BYTES,
+    RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
 };

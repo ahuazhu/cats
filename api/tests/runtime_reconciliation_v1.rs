@@ -15,7 +15,7 @@ const EMPTY_INVENTORY_INPUT: &str = r#"{"agent_instance_id":"4444444444444444444
 
 const UNEXPECTED_INVENTORY_INPUT: &str = r#"{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"inventory_epoch":5,"inventory_read_position":13,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","residue":[{"kind":"control_socket","ownership_token":{"kind":"valid","ownership_token":"abababababababababababababababab"},"role_hint":null,"socket_path":"/run/cats/orphan/valid.sock"},{"checkpoint_path":"/var/lib/cats/checkpoints/cat_01.json","evidence":{"cat_id":"cat_01","content_digest":"sha256:602bd0f3a0f1a29f269fa2946fa1a52ea154ba1623b5ca2de18e657cad3753fb","desired_revision":7,"kind":"valid","node_id":"node_a","placement_epoch":3,"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","version":1},"kind":"checkpoint_file"}],"runtimes":[],"version":1}"#;
 
-const NONEMPTY_INVENTORY_INPUT: &str = r#"{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"inventory_epoch":4,"inventory_read_position":12,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","residue":[{"cgroup_path":"/sys/fs/cgroup/system.slice/cats-orphan.scope","kind":"systemd_scope","ownership_token":{"kind":"valid","ownership_token":"dddddddddddddddddddddddddddddddd"},"scope_id":"cats-orphan.scope"},{"kind":"control_socket","ownership_token":{"kind":"missing"},"role_hint":null,"socket_path":"/run/cats/orphan/control.sock"},{"checkpoint_path":"/var/lib/cats/checkpoints/orphan.json","evidence":{"kind":"corrupt","raw_content_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"kind":"checkpoint_file"},{"data_directory":"/var/lib/cats/orphan-vol","kind":"data_directory","lineage":{"attachment_epoch_hint":4,"attachment_id_hint":"att_orphan","fenced":false,"kind":"readable","local_durable_generation":6,"pending_pack_count":2,"remote_durable_generation":5},"ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"volume_id_hint":null}],"runtimes":[{"applied_desired":{"desired_revision":7,"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","target":"running"},"cat_id":"cat_01","checkpoint":{"cat_id":"cat_01","checkpoint_path":"/var/lib/cats/checkpoints/cat_01.json","content_digest":"sha256:602bd0f3a0f1a29f269fa2946fa1a52ea154ba1623b5ca2de18e657cad3753fb","desired_revision":7,"kind":"valid","node_id":"node_a","placement_epoch":3,"require_idle":{"kind":"not_applicable"},"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"updated_at_unix_ms":1720000000000,"version":1},"guest_transport":{"guest_agent_protocol_version":1,"guest_boot_id":"cccccccccccccccccccccccccccccccc","guest_cid":3,"guest_port":5000,"kind":"vsock_ready","runtime_incarnation":"55555555555555555555555555555555"},"lifecycle_admission":"closed","mounts":[{"access":"read_write","filesystem_uuid":"99999999999999999999999999999999","guest_device":{"serial":"cats-root","slot":0},"instance_count":1,"mount_path":"/","volume_id":"vol_root"}],"networks":[{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"valid","ownership_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"prefix_length":30,"tap_name":"tap0"},{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"prefix_length":30,"tap_name":"tap1"}],"platform_guards":0,"processes":[{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/vmm.sock","executable_path":"/usr/bin/cloud-hypervisor","observed_vm_shape":{"boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","guest_config_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","memory_bytes":2147483648,"vcpus":2},"ownership_token":{"kind":"valid","ownership_token":"66666666666666666666666666666666"},"process_id":1001,"process_start_time_ticks":9001,"role":{"kind":"vmm","runtime_incarnation":"55555555555555555555555555555555"},"scope_id":"cats-cat_01","state":"running"},{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/blockd-root.sock","executable_path":"/usr/bin/cats-blockd","observed_vm_shape":null,"ownership_token":{"kind":"valid","ownership_token":"77777777777777777777777777777777"},"process_id":1002,"process_start_time_ticks":9002,"role":{"attachment_epoch":8,"attachment_id":"att_01","kind":"blockd","volume_id":"vol_root"},"scope_id":"cats-cat_01","state":"running"}],"routes":[{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":9,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"gate":"closed","instance_count":2},{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":10,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"gate":"closed","instance_count":1}],"runtime_incarnation":"55555555555555555555555555555555","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"volumes":[{"authority":{"attachment_epoch":8,"attachment_id":"att_01","generation":4,"kind":"owned","remote_root":"sha256:2222222222222222222222222222222222222222222222222222222222222222"},"devices":[{"device_path":"/dev/nbd0","guest_device":{"serial":"cats-root","slot":0},"kind":"kernel_nbd","ownership_token":{"kind":"valid","ownership_token":"88888888888888888888888888888888"}},{"guest_device":{"serial":"cats-root","slot":0},"kind":"vhost_user_blk","ownership_token":{"kind":"missing"},"socket_path":"/run/cats/cat_01/root.sock"}],"disk_id":"disk_root","disk_kind":"root","durability":"strict","local_lineages":[{"acquire_transition_id":"tx_01","attachment_epoch":8,"attachment_id":"att_01","data_directory":"/var/lib/cats/vol_root","fenced":false,"local_durable_generation":5,"node_id":"node_a","pending_pack_count":1,"placement_epoch":3,"remote_durable_generation":4,"state":"active"}],"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"warm_snapshot":{"kind":"absent"}}],"version":1}"#;
+const NONEMPTY_INVENTORY_INPUT: &str = r#"{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"inventory_epoch":4,"inventory_read_position":12,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","residue":[{"cgroup_path":"/sys/fs/cgroup/system.slice/cats-orphan.scope","kind":"systemd_scope","ownership_token":{"kind":"valid","ownership_token":"dddddddddddddddddddddddddddddddd"},"scope_id":"cats-orphan.scope"},{"kind":"control_socket","ownership_token":{"kind":"missing"},"role_hint":null,"socket_path":"/run/cats/orphan/control.sock"},{"checkpoint_path":"/var/lib/cats/checkpoints/orphan.json","evidence":{"kind":"corrupt","raw_content_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"kind":"checkpoint_file"},{"data_directory":"/var/lib/cats/orphan-vol","kind":"data_directory","lineage":{"attachment_epoch_hint":4,"attachment_id_hint":"att_orphan","fenced":false,"kind":"readable","local_durable_generation":6,"pending_pack_count":2,"remote_durable_generation":5},"ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"volume_id_hint":null}],"runtimes":[{"applied_desired":{"desired_revision":7,"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","target":"running"},"cat_id":"cat_01","checkpoint":{"cat_id":"cat_01","checkpoint_path":"/var/lib/cats/checkpoints/cat_01.json","content_digest":"sha256:602bd0f3a0f1a29f269fa2946fa1a52ea154ba1623b5ca2de18e657cad3753fb","desired_revision":7,"kind":"valid","node_id":"node_a","placement_epoch":3,"require_idle":{"kind":"not_applicable"},"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"updated_at_unix_ms":1720000000000,"version":1},"guest_transport":{"guest_agent_protocol_version":1,"guest_boot_id":"cccccccccccccccccccccccccccccccc","guest_cid":3,"guest_port":5000,"kind":"vsock_ready","runtime_incarnation":"55555555555555555555555555555555"},"lifecycle_admission":"closed","mounts":[{"access":"read_write","filesystem_uuid":"99999999999999999999999999999999","guest_device":{"serial":"cats-root","slot":0},"instance_count":1,"mount_path":"/","source_path":"/dev/nbd0","volume_id":"vol_root"}],"networks":[{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"valid","ownership_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"prefix_length":30,"tap_name":"tap0"},{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"prefix_length":30,"tap_name":"tap1"}],"platform_guards":0,"processes":[{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/vmm.sock","executable_path":"/usr/bin/cloud-hypervisor","observed_vm_shape":{"boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","guest_config_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","memory_bytes":2147483648,"vcpus":2},"ownership_token":{"kind":"valid","ownership_token":"66666666666666666666666666666666"},"process_id":1001,"process_start_time_ticks":9001,"role":{"kind":"vmm","runtime_incarnation":"55555555555555555555555555555555"},"scope_id":"cats-cat_01","state":"running"},{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/blockd-root.sock","executable_path":"/usr/bin/cats-blockd","observed_vm_shape":null,"ownership_token":{"kind":"valid","ownership_token":"77777777777777777777777777777777"},"process_id":1002,"process_start_time_ticks":9002,"role":{"attachment_epoch":8,"attachment_id":"att_01","kind":"blockd","volume_id":"vol_root"},"scope_id":"cats-cat_01","state":"running"}],"routes":[{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":9,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"gate":"closed","instance_count":2},{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":10,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"gate":"closed","instance_count":1}],"runtime_incarnation":"55555555555555555555555555555555","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"volumes":[{"authority":{"attachment_epoch":8,"attachment_id":"att_01","generation":4,"kind":"owned","remote_root":"sha256:2222222222222222222222222222222222222222222222222222222222222222"},"devices":[{"device_path":"/dev/nbd0","guest_device":{"serial":"cats-root","slot":0},"kind":"kernel_nbd","ownership_token":{"kind":"valid","ownership_token":"88888888888888888888888888888888"}},{"guest_device":{"serial":"cats-root","slot":0},"kind":"vhost_user_blk","ownership_token":{"kind":"missing"},"socket_path":"/run/cats/cat_01/root.sock"}],"disk_id":"disk_root","disk_kind":"root","durability":"strict","local_lineages":[{"acquire_transition_id":"tx_01","attachment_epoch":8,"attachment_id":"att_01","data_directory":"/var/lib/cats/vol_root","fenced":false,"local_durable_generation":5,"node_id":"node_a","pending_pack_count":1,"placement_epoch":3,"remote_durable_generation":4,"state":"active"}],"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"warm_snapshot":{"kind":"absent"}}],"version":1}"#;
 
 const NODE_CLEANUP_WIRE: &str = r#"{"cleanup":{"desired_read_position":15,"inventory_epoch":4,"inventory_read_position":12,"inventory_session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"target":{"cat_id":"cat_01","checkpoint_path":"/var/lib/cats/checkpoints/cat_01.json","content_digest":"sha256:602bd0f3a0f1a29f269fa2946fa1a52ea154ba1623b5ca2de18e657cad3753fb","desired_revision":7,"kind":"checkpoint_file","node_id":"node_a","placement_epoch":3},"volume_release":null},"node_id":"node_a","version":1}"#;
 
@@ -154,6 +154,43 @@ fn complete_observation_wire(projection: &str, claim: &str) -> Vec<u8> {
     serde_json::to_vec(&value).unwrap()
 }
 
+fn nonempty_observation_value() -> serde_json::Value {
+    serde_json::from_slice(&complete_observation_wire(
+        NONEMPTY_INVENTORY_INPUT,
+        "sha256:b198645acb2f5c1cd48e3cab10fccc6eb236ffd8addb5c9972c03cc350a4f832",
+    ))
+    .unwrap()
+}
+
+fn refresh_inventory_digest(value: &mut serde_json::Value) {
+    let observation: NodeObservation = serde_json::from_value(value.clone()).unwrap();
+    let digest = inventory_digest(&observation).unwrap();
+    value["inventory_digest"] = digest.as_str().into();
+}
+
+fn minimal_runtime(cat_id: &str, checkpoint_path: &str) -> serde_json::Value {
+    let mut runtime: serde_json::Value =
+        serde_json::from_str::<serde_json::Value>(NONEMPTY_INVENTORY_INPUT).unwrap()["runtimes"][0]
+            .clone();
+    runtime["cat_id"] = cat_id.into();
+    runtime["applied_desired"]["target"] = "cold".into();
+    runtime["runtime_incarnation"] = serde_json::Value::Null;
+    runtime["stable_state"] = serde_json::Value::Null;
+    runtime["checkpoint"]["cat_id"] = cat_id.into();
+    runtime["checkpoint"]["checkpoint_path"] = checkpoint_path.into();
+    runtime["checkpoint"]["runtime_incarnation"] = serde_json::Value::Null;
+    runtime["checkpoint"]["stable_state"] = serde_json::Value::Null;
+    runtime["processes"] = serde_json::json!([]);
+    runtime["volumes"] = serde_json::json!([]);
+    runtime["mounts"] = serde_json::json!([]);
+    runtime["networks"] = serde_json::json!([]);
+    runtime["guest_transport"] = serde_json::json!({"kind": "unavailable"});
+    runtime["warm_snapshot"] = serde_json::json!({"kind": "absent"});
+    runtime["routes"] = serde_json::json!([]);
+    runtime["conditions"] = serde_json::json!([]);
+    runtime
+}
+
 fn malformed(error: &ContractError) -> (&JsonPointer, MalformedProblem) {
     match error.error.as_ref() {
         ContractErrorDetail::MalformedPayload {
@@ -163,6 +200,17 @@ fn malformed(error: &ContractError) -> (&JsonPointer, MalformedProblem) {
         } => (json_pointer, *problem),
         detail => panic!("expected malformed_payload, got {detail:?}"),
     }
+}
+
+fn assert_inventory_collision(value: &serde_json::Value, pointer: &str) {
+    let error = decode_node_observation(&serde_json::to_vec(value).unwrap()).unwrap_err();
+    assert_eq!(malformed(&error).0.as_str(), pointer);
+    assert_eq!(malformed(&error).1, MalformedProblem::DuplicateIdentity);
+}
+
+fn assert_valid_inventory(mut value: serde_json::Value) {
+    refresh_inventory_digest(&mut value);
+    decode_node_observation(&serde_json::to_vec(&value).unwrap()).unwrap();
 }
 
 fn canonical_json<T: serde::Serialize>(value: &T) -> Vec<u8> {
@@ -331,6 +379,28 @@ fn fixed_key_ring_digests_match() {
 }
 
 #[test]
+fn sha256_digest_round_trips_the_public_byte_boundary() {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let bytes = std::array::from_fn(|index| index as u8);
+    let from_bytes = Sha256Digest::from_bytes(bytes);
+    assert_eq!(from_bytes.as_bytes(), &bytes);
+
+    let wire = serde_json::to_vec(&from_bytes).unwrap();
+    let parsed: Sha256Digest = serde_json::from_slice(&wire).unwrap();
+    assert_eq!(parsed.as_bytes(), &bytes);
+    assert_eq!(parsed, from_bytes);
+
+    let hash = |value: &Sha256Digest| {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    };
+    assert_eq!(hash(&parsed), hash(&from_bytes));
+}
+
+#[test]
 fn fixed_empty_inventory_digest_matches() {
     let expected = "sha256:12c19ac927b853c8f66f6dac52d448d6f2e797925527a0c606c7692b6f714e05";
     let observation =
@@ -360,7 +430,7 @@ fn fixed_unexpected_inventory_digest_matches() {
 
 #[test]
 fn fixed_nonempty_inventory_digest_matches() {
-    let expected = "sha256:1c99560e8c7235dae90c36f5298874ccba84fcd042f89412237d88810274f26d";
+    let expected = "sha256:b198645acb2f5c1cd48e3cab10fccc6eb236ffd8addb5c9972c03cc350a4f832";
     let observation = decode_node_observation(&complete_observation_wire(
         NONEMPTY_INVENTORY_INPUT,
         expected,
@@ -557,7 +627,7 @@ fn canonical_digests_ignore_member_order_and_bind_exact_projections() {
         checkpoint_content_digest(&changed_checkpoint).unwrap()
     );
 
-    let claim = "sha256:1c99560e8c7235dae90c36f5298874ccba84fcd042f89412237d88810274f26d";
+    let claim = "sha256:b198645acb2f5c1cd48e3cab10fccc6eb236ffd8addb5c9972c03cc350a4f832";
     let observation =
         decode_node_observation(&complete_observation_wire(NONEMPTY_INVENTORY_INPUT, claim))
             .unwrap();
@@ -884,29 +954,106 @@ fn observation_inventory_and_key_ring_nullability_is_closed() {
 }
 
 #[test]
-fn wire_byte_boundary_and_shared_schema_initialization_are_safe() {
-    let node = serde_json::to_vec(&node_identity_value()).unwrap();
-    let mut exact = node.clone();
-    exact.resize(16_384, b' ');
-    decode_node_identity(&exact).unwrap();
+fn all_wire_byte_boundaries_and_shared_schema_initialization_are_safe() {
+    type Decode = fn(&[u8]) -> Result<(), ContractError>;
 
-    let mut over = exact;
-    over.push(b'{');
-    let error = decode_node_identity(&over).unwrap_err();
-    match error.error.as_ref() {
-        ContractErrorDetail::LimitExceeded {
-            json_pointer,
-            limit,
-            maximum,
-            observed_at_least,
-            ..
-        } => {
-            assert_eq!(json_pointer.as_str(), "");
-            assert_eq!(*limit, LimitKind::WireBytes);
-            assert_eq!(maximum.get(), 16_384);
-            assert_eq!(observed_at_least.get(), 16_385);
+    let node = serde_json::to_vec(&node_identity_value()).unwrap();
+    let registration = br#"{"version":1,"node_id":"node_a","immutable_host_id":"host_a","node_boot_id":"11111111111111111111111111111111","agent_instance_id":"22222222222222222222222222222222","registration_attempt_id":"33333333333333333333333333333333","expected_agent_session_epoch":null}"#.to_vec();
+    let session = br#"{"version":1,"node_id":"node_a","immutable_host_id":"host_a","node_boot_id":"11111111111111111111111111111111","agent_instance_id":"22222222222222222222222222222222","agent_session_epoch":1,"registration_attempt_id":"33333333333333333333333333333333","lease_deadline_unix_ms":1}"#.to_vec();
+    let attestation = format!(
+        r#"{{"version":1,"node_id":"node_a","agent_session_epoch":1,"inventory_epoch":1,"inventory_digest":"{ZERO_DIGEST}","inventory_read_position":1,"accepted_at_unix_ms":1}}"#
+    )
+    .into_bytes();
+    let observation = complete_observation_wire(
+        EMPTY_INVENTORY_INPUT,
+        "sha256:12c19ac927b853c8f66f6dac52d448d6f2e797925527a0c606c7692b6f714e05",
+    );
+    let cases: Vec<(ContractName, usize, Vec<u8>, Decode)> = vec![
+        (
+            ContractName::NodeIdentity,
+            NODE_IDENTITY_MAX_WIRE_BYTES,
+            node.clone(),
+            |bytes| decode_node_identity(bytes).map(|_| ()),
+        ),
+        (
+            ContractName::AgentRegistrationAttempt,
+            AGENT_REGISTRATION_ATTEMPT_MAX_WIRE_BYTES,
+            registration,
+            |bytes| decode_agent_registration_attempt(bytes).map(|_| ()),
+        ),
+        (
+            ContractName::AgentSession,
+            AGENT_SESSION_MAX_WIRE_BYTES,
+            session,
+            |bytes| decode_agent_session(bytes).map(|_| ()),
+        ),
+        (
+            ContractName::AdmissionInventoryAttestation,
+            ADMISSION_INVENTORY_ATTESTATION_MAX_WIRE_BYTES,
+            attestation,
+            |bytes| decode_admission_inventory_attestation(bytes).map(|_| ()),
+        ),
+        (
+            ContractName::DesiredRuntimeSpec,
+            DESIRED_RUNTIME_SPEC_MAX_WIRE_BYTES,
+            desired_wire(SPEC_DIGEST),
+            |bytes| decode_desired_runtime_spec(bytes).map(|_| ()),
+        ),
+        (
+            ContractName::RuntimeCheckpoint,
+            RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
+            CHECKPOINT_WIRE.as_bytes().to_vec(),
+            |bytes| decode_runtime_checkpoint(bytes).map(|_| ()),
+        ),
+        (
+            ContractName::NodeCleanupCheckpoint,
+            NODE_CLEANUP_CHECKPOINT_MAX_WIRE_BYTES,
+            NODE_CLEANUP_WIRE.as_bytes().to_vec(),
+            |bytes| decode_node_cleanup_checkpoint(bytes).map(|_| ()),
+        ),
+        (
+            ContractName::NodeObservation,
+            NODE_OBSERVATION_MAX_WIRE_BYTES,
+            observation,
+            |bytes| decode_node_observation(bytes).map(|_| ()),
+        ),
+        (
+            ContractName::Operation,
+            OPERATION_MAX_WIRE_BYTES,
+            serde_json::to_vec(&operation_value()).unwrap(),
+            |bytes| decode_operation(bytes).map(|_| ()),
+        ),
+        (
+            ContractName::ContractError,
+            CONTRACT_ERROR_MAX_WIRE_BYTES,
+            CONTRACT_ERROR_WIRE.as_bytes().to_vec(),
+            |bytes| decode_contract_error(bytes).map(|_| ()),
+        ),
+    ];
+
+    for (expected_contract, maximum_bytes, mut wire, decode) in cases {
+        assert!(wire.len() <= maximum_bytes, "{expected_contract:?}");
+        wire.resize(maximum_bytes, b' ');
+        decode(&wire).unwrap_or_else(|error| panic!("{expected_contract:?}: {error:?}"));
+
+        wire.push(b' ');
+        let error = decode(&wire).unwrap_err();
+        match error.error.as_ref() {
+            ContractErrorDetail::LimitExceeded {
+                contract,
+                json_pointer,
+                limit,
+                maximum,
+                observed_at_least,
+            } => {
+                assert_eq!(*contract, expected_contract);
+                assert_eq!(json_pointer.as_str(), "");
+                assert_eq!(*limit, LimitKind::WireBytes);
+                assert_eq!(maximum.get(), maximum_bytes as u64);
+                assert_eq!(observed_at_least.get(), maximum_bytes as u64 + 1);
+            }
+            detail => panic!("expected wire byte limit for {expected_contract:?}, got {detail:?}"),
         }
-        detail => panic!("expected wire byte limit, got {detail:?}"),
     }
 
     let node = std::sync::Arc::new(node);
@@ -1060,7 +1207,7 @@ fn cleanup_release_intrinsic_constraints_are_bidirectional() {
 
 #[test]
 fn partial_observation_requires_applied_desired_for_every_reported_runtime() {
-    let claim = "sha256:1c99560e8c7235dae90c36f5298874ccba84fcd042f89412237d88810274f26d";
+    let claim = "sha256:b198645acb2f5c1cd48e3cab10fccc6eb236ffd8addb5c9972c03cc350a4f832";
     let mut observation: serde_json::Value =
         serde_json::from_slice(&complete_observation_wire(NONEMPTY_INVENTORY_INPUT, claim))
             .unwrap();
@@ -1091,7 +1238,7 @@ fn every_reconcile_step_host_reuses_the_same_cross_field_validator() {
     let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
     checkpoint["step"] = invalid_step.clone();
 
-    let claim = "sha256:1c99560e8c7235dae90c36f5298874ccba84fcd042f89412237d88810274f26d";
+    let claim = "sha256:b198645acb2f5c1cd48e3cab10fccc6eb236ffd8addb5c9972c03cc350a4f832";
     let observation: serde_json::Value =
         serde_json::from_slice(&complete_observation_wire(NONEMPTY_INVENTORY_INPUT, claim))
             .unwrap();
@@ -1157,7 +1304,7 @@ fn every_readable_residue_lineage_host_reuses_the_same_validator() {
     reversed_generations["lineage"]["remote_durable_generation"] = 5.into();
     invalid_lineages.push(("reversed_generations", reversed_generations));
 
-    let claim = "sha256:1c99560e8c7235dae90c36f5298874ccba84fcd042f89412237d88810274f26d";
+    let claim = "sha256:b198645acb2f5c1cd48e3cab10fccc6eb236ffd8addb5c9972c03cc350a4f832";
     for (invariant, residue) in invalid_lineages {
         let observation: serde_json::Value =
             serde_json::from_slice(&complete_observation_wire(NONEMPTY_INVENTORY_INPUT, claim))
@@ -1262,7 +1409,7 @@ fn runtime_condition_fact_conflicts_point_to_the_runtime_common_object() {
         }),
     ];
 
-    let claim = "sha256:1c99560e8c7235dae90c36f5298874ccba84fcd042f89412237d88810274f26d";
+    let claim = "sha256:b198645acb2f5c1cd48e3cab10fccc6eb236ffd8addb5c9972c03cc350a4f832";
     for condition in reasons {
         let mut observation: serde_json::Value =
             serde_json::from_slice(&complete_observation_wire(NONEMPTY_INVENTORY_INPUT, claim))
@@ -1479,7 +1626,7 @@ fn array_identity_order_and_numeric_indices_are_deterministic() {
 
 #[test]
 fn multiplicity_facts_cannot_be_split_across_duplicate_items() {
-    let claim = "sha256:1c99560e8c7235dae90c36f5298874ccba84fcd042f89412237d88810274f26d";
+    let claim = "sha256:b198645acb2f5c1cd48e3cab10fccc6eb236ffd8addb5c9972c03cc350a4f832";
     let base: serde_json::Value =
         serde_json::from_slice(&complete_observation_wire(NONEMPTY_INVENTORY_INPUT, claim))
             .unwrap();
@@ -1505,6 +1652,291 @@ fn multiplicity_facts_cannot_be_split_across_duplicate_items() {
     let error = decode_node_observation(&serde_json::to_vec(&split_route).unwrap()).unwrap_err();
     assert_eq!(malformed(&error).0.as_str(), "/runtimes/0/routes");
     assert_eq!(malformed(&error).1, MalformedProblem::DuplicateIdentity);
+}
+
+#[test]
+fn complete_inventory_indexes_mount_snapshot_and_valid_route_identities() {
+    let mut mount_collision = nonempty_observation_value();
+    mount_collision["residue"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "kind": "mount",
+            "volume_id_hint": "vol_root",
+            "source_path": "/dev/nbd0",
+            "mount_path": "/",
+            "instance_count": 1,
+        }));
+    assert_inventory_collision(&mount_collision, "");
+
+    let mut different_mount = mount_collision.clone();
+    different_mount["residue"]
+        .as_array_mut()
+        .unwrap()
+        .last_mut()
+        .unwrap()["source_path"] = "/dev/nbd9".into();
+    assert_valid_inventory(different_mount);
+
+    // The fixed vector has two frontends for the same guest device; the
+    // collision above still comes directly from the scanned source_path.
+
+    let snapshot = serde_json::json!({
+        "kind": "present",
+        "snapshot_id": "snap_01",
+        "runtime_incarnation": "55555555555555555555555555555555",
+        "path": "/var/lib/cats/snapshots/snap_01",
+        "file_size_bytes": 4096,
+        "file_digest": ZERO_DIGEST,
+        "source_heads": [],
+        "durable_rename_complete": true,
+    });
+    let mut snapshot_collision = nonempty_observation_value();
+    snapshot_collision["runtimes"][0]["warm_snapshot"] = snapshot;
+    snapshot_collision["residue"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "kind": "warm_snapshot",
+            "snapshot_id_hint": "snap_01",
+            "path": "/var/lib/cats/snapshots/snap_01",
+            "file_size_bytes": 4096,
+            "file_digest": ZERO_DIGEST,
+        }));
+    assert_inventory_collision(&snapshot_collision, "");
+
+    let mut different_snapshot = snapshot_collision;
+    different_snapshot["residue"]
+        .as_array_mut()
+        .unwrap()
+        .last_mut()
+        .unwrap()["path"] = "/var/lib/cats/snapshots/other".into();
+    assert_valid_inventory(different_snapshot);
+
+    let mut route_collision = nonempty_observation_value();
+    let binding = route_collision["runtimes"][0]["routes"][0]["binding"].clone();
+    route_collision["residue"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "kind": "route_gate",
+            "binding": {"kind": "valid", "binding": binding},
+            "gate": "closed",
+            "active_guards": 0,
+            "cancellation_pending": false,
+            "instance_count": 1,
+        }));
+    assert_inventory_collision(&route_collision, "");
+
+    let mut different_route = route_collision.clone();
+    different_route["residue"]
+        .as_array_mut()
+        .unwrap()
+        .last_mut()
+        .unwrap()["binding"]["binding"]["route_epoch"] = 11.into();
+    assert_valid_inventory(different_route);
+
+    let mut unproven_route = route_collision;
+    unproven_route["residue"]
+        .as_array_mut()
+        .unwrap()
+        .last_mut()
+        .unwrap()["binding"] = serde_json::json!({"kind": "missing"});
+    assert_valid_inventory(unproven_route);
+}
+
+#[test]
+fn mount_collision_pointers_cover_each_inventory_scope() {
+    let mount = |volume_id: &str, source_path: &str, filesystem_uuid: &str| {
+        serde_json::json!({
+            "volume_id": volume_id,
+            "guest_device": {"serial": "cats-root", "slot": 0},
+            "source_path": source_path,
+            "filesystem_uuid": filesystem_uuid,
+            "mount_path": "/",
+            "access": "read_write",
+            "instance_count": 1,
+        })
+    };
+
+    let mut first_runtime = minimal_runtime("cat_01", "/checkpoints/cat_01.json");
+    first_runtime["mounts"] = serde_json::json!([mount(
+        "vol_a",
+        "/dev/shared",
+        "11111111111111111111111111111111"
+    )]);
+    let mut second_runtime = minimal_runtime("cat_02", "/checkpoints/cat_02.json");
+    second_runtime["mounts"] = serde_json::json!([mount(
+        "vol_b",
+        "/dev/shared",
+        "22222222222222222222222222222222"
+    )]);
+    let mut across_runtimes = nonempty_observation_value();
+    across_runtimes["runtimes"] = serde_json::json!([first_runtime, second_runtime]);
+    across_runtimes["residue"] = serde_json::json!([]);
+    assert_inventory_collision(&across_runtimes, "/runtimes");
+
+    let mut distinct_runtimes = across_runtimes;
+    distinct_runtimes["runtimes"][1]["mounts"][0]["source_path"] = "/dev/different".into();
+    assert_valid_inventory(distinct_runtimes);
+
+    let mut one_runtime = minimal_runtime("cat_01", "/checkpoints/cat_01.json");
+    one_runtime["mounts"] = serde_json::json!([
+        mount("vol_a", "/dev/shared", "11111111111111111111111111111111"),
+        mount("vol_a", "/dev/shared", "99999999999999999999999999999999"),
+    ]);
+    let mut within_runtime = nonempty_observation_value();
+    within_runtime["runtimes"] = serde_json::json!([one_runtime]);
+    within_runtime["residue"] = serde_json::json!([]);
+    assert_inventory_collision(&within_runtime, "/runtimes/0/mounts");
+
+    let empty_claim = "sha256:12c19ac927b853c8f66f6dac52d448d6f2e797925527a0c606c7692b6f714e05";
+    let mut within_residue: serde_json::Value = serde_json::from_slice(&complete_observation_wire(
+        EMPTY_INVENTORY_INPUT,
+        empty_claim,
+    ))
+    .unwrap();
+    within_residue["residue"] = serde_json::json!([
+        {
+            "kind": "mount",
+            "volume_id_hint": "vol_a",
+            "source_path": "/dev/shared",
+            "mount_path": "/",
+            "instance_count": 1,
+        },
+        {
+            "kind": "mount",
+            "volume_id_hint": "vol_b",
+            "source_path": "/dev/shared",
+            "mount_path": "/",
+            "instance_count": 1,
+        },
+    ]);
+    assert_inventory_collision(&within_residue, "/residue");
+}
+
+#[test]
+fn inventory_collisions_share_the_array_identity_substage() {
+    let mut runtime_and_residue = nonempty_observation_value();
+    let mut second_mount = runtime_and_residue["runtimes"][0]["mounts"][0].clone();
+    second_mount["filesystem_uuid"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+    runtime_and_residue["runtimes"][0]["mounts"]
+        .as_array_mut()
+        .unwrap()
+        .push(second_mount);
+    runtime_and_residue["residue"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "kind": "mount",
+            "volume_id_hint": null,
+            "source_path": "/dev/nbd0",
+            "mount_path": "/",
+            "instance_count": 1,
+        }));
+    assert_inventory_collision(&runtime_and_residue, "");
+
+    let mount = serde_json::json!({
+        "volume_id": "vol_a",
+        "guest_device": {"serial": "cats-root", "slot": 0},
+        "source_path": "/dev/shared",
+        "filesystem_uuid": "11111111111111111111111111111111",
+        "mount_path": "/",
+        "access": "read_write",
+        "instance_count": 1,
+    });
+    let mut later_runtime = minimal_runtime("cat_02", "/checkpoints/cat_02.json");
+    later_runtime["mounts"] = serde_json::json!([mount.clone()]);
+    let mut earlier_runtime = minimal_runtime("cat_01", "/checkpoints/cat_01.json");
+    earlier_runtime["mounts"] = serde_json::json!([mount]);
+    let mut reversed_runtimes = nonempty_observation_value();
+    reversed_runtimes["runtimes"] = serde_json::json!([later_runtime, earlier_runtime]);
+    reversed_runtimes["residue"] = serde_json::json!([]);
+    assert_inventory_collision(&reversed_runtimes, "/runtimes");
+}
+
+#[test]
+fn complete_inventory_collision_pointers_use_the_lowest_common_object() {
+    let snapshot = serde_json::json!({
+        "kind": "present",
+        "snapshot_id": "snap_shared",
+        "runtime_incarnation": "55555555555555555555555555555555",
+        "path": "/var/lib/cats/snapshots/shared",
+        "file_size_bytes": 4096,
+        "file_digest": ZERO_DIGEST,
+        "source_heads": [],
+        "durable_rename_complete": true,
+    });
+    let mut first_runtime = minimal_runtime("cat_01", "/checkpoints/cat_01.json");
+    first_runtime["warm_snapshot"] = snapshot.clone();
+    let mut second_runtime = minimal_runtime("cat_02", "/checkpoints/cat_02.json");
+    second_runtime["warm_snapshot"] = snapshot;
+    let mut across_runtimes = nonempty_observation_value();
+    across_runtimes["runtimes"] = serde_json::json!([first_runtime, second_runtime]);
+    across_runtimes["residue"] = serde_json::json!([]);
+    assert_inventory_collision(&across_runtimes, "/runtimes");
+
+    let mut distinct_runtimes = across_runtimes;
+    distinct_runtimes["runtimes"][1]["warm_snapshot"]["path"] =
+        "/var/lib/cats/snapshots/other".into();
+    assert_valid_inventory(distinct_runtimes);
+
+    let source: serde_json::Value = serde_json::from_str(NONEMPTY_INVENTORY_INPUT).unwrap();
+    let mut first_volume = source["runtimes"][0]["volumes"][0].clone();
+    first_volume["volume_id"] = "vol_a".into();
+    first_volume["volume_intent_id"] = "vint_a".into();
+    first_volume["disk_id"] = "disk_a".into();
+    first_volume["local_lineages"] = serde_json::json!([]);
+    let mut kernel = first_volume["devices"][0].clone();
+    kernel["device_path"] = "/shared/block-path".into();
+    first_volume["devices"] = serde_json::json!([kernel]);
+
+    let mut second_volume = source["runtimes"][0]["volumes"][0].clone();
+    second_volume["volume_id"] = "vol_b".into();
+    second_volume["volume_intent_id"] = "vint_b".into();
+    second_volume["disk_id"] = "disk_b".into();
+    second_volume["local_lineages"] = serde_json::json!([]);
+    let mut vhost = second_volume["devices"][1].clone();
+    vhost["socket_path"] = "/shared/block-path".into();
+    second_volume["devices"] = serde_json::json!([vhost]);
+
+    let mut runtime = minimal_runtime("cat_01", "/checkpoints/cat_01.json");
+    runtime["volumes"] = serde_json::json!([first_volume, second_volume]);
+    let mut across_nested_arrays = nonempty_observation_value();
+    across_nested_arrays["runtimes"] = serde_json::json!([runtime]);
+    across_nested_arrays["residue"] = serde_json::json!([]);
+    assert_inventory_collision(&across_nested_arrays, "/runtimes/0/volumes");
+
+    let mut distinct_nested_arrays = across_nested_arrays;
+    distinct_nested_arrays["runtimes"][0]["volumes"][1]["devices"][0]["socket_path"] =
+        "/different/block-path".into();
+    assert_valid_inventory(distinct_nested_arrays);
+
+    let empty_claim = "sha256:12c19ac927b853c8f66f6dac52d448d6f2e797925527a0c606c7692b6f714e05";
+    let mut across_residue_variants: serde_json::Value = serde_json::from_slice(
+        &complete_observation_wire(EMPTY_INVENTORY_INPUT, empty_claim),
+    )
+    .unwrap();
+    across_residue_variants["residue"] = serde_json::json!([
+        {
+            "kind": "kernel_nbd",
+            "volume_id_hint": null,
+            "guest_device": null,
+            "device_path": "/shared/residue-path",
+            "ownership_token": {"kind": "missing"},
+        },
+        {
+            "kind": "vhost_user_blk",
+            "volume_id_hint": null,
+            "guest_device": null,
+            "socket_path": "/shared/residue-path",
+            "ownership_token": {"kind": "missing"},
+        },
+    ]);
+    assert_inventory_collision(&across_residue_variants, "/residue");
+
+    let mut distinct_residue_variants = across_residue_variants;
+    distinct_residue_variants["residue"][1]["socket_path"] = "/different/residue-path".into();
+    assert_valid_inventory(distinct_residue_variants);
 }
 
 #[test]
@@ -1609,7 +2041,7 @@ fn operation_terminal_bindings_and_removed_tag_fail_closed() {
 
 #[test]
 fn removed_contract_error_condition_tag_is_not_a_compatibility_surface() {
-    let claim = "sha256:1c99560e8c7235dae90c36f5298874ccba84fcd042f89412237d88810274f26d";
+    let claim = "sha256:b198645acb2f5c1cd48e3cab10fccc6eb236ffd8addb5c9972c03cc350a4f832";
     let mut observation: serde_json::Value =
         serde_json::from_slice(&complete_observation_wire(NONEMPTY_INVENTORY_INPUT, claim))
             .unwrap();
