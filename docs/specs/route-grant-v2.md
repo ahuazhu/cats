@@ -49,7 +49,7 @@ claims 的逻辑形态：
 | identities | 非空且长度有界；必须与本地期望逐字节相等 |
 | `hostname` | Runtime Reconciliation v1 `Hostname`；小写ASCII DNS名，无端口、路径或尾点 |
 | `runtime_incarnation` | Runtime Reconciliation v1 `RandomId128`（32个小写十六进制字符），精确匹配当前 VMM |
-| `route_epoch` | 正整数，精确匹配Endpoint serving gate；close后重开必须更大 |
+| `route_epoch` | Runtime Reconciliation v1 `Epoch`（`1..=9223372036854775807`），精确匹配Endpoint serving gate；close后重开必须更大 |
 | `protocol` | v2 只允许 `http`；WebSocket 是该 HTTP route 的 upgrade |
 | `target_port` | `1..=65535`，精确匹配 gate；请求不能覆盖 |
 | `iat`/`nbf`/`exp` | Unix seconds；`iat <= nbf < exp` |
