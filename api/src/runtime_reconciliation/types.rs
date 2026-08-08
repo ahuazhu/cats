@@ -516,8 +516,7 @@ pub enum FilesystemInitialization {
     Existing,
     Initialize {
         initialization_token: RandomId128,
-        expected_blank_root: Option<Sha256Digest>,
-        expected_blank_generation: Generation,
+        expected_blank_head: RemoteHead,
     },
 }
 
@@ -643,10 +642,12 @@ pub enum ReconcileStep {
     CloseAdmission {
         require_idle_attempt_id: Option<RandomId128>,
     },
+    CloseGate {
+        endpoint_id: Id,
+        route_epoch: Epoch,
+    },
     AcquireVolume {
-        volume_id: Id,
-        attachment_id: Id,
-        acquire: VolumeAcquire,
+        request: VolumeAcquireRequest,
     },
     PrepareDevice {
         volume_id: Id,
@@ -658,8 +659,7 @@ pub enum ReconcileStep {
         attachment_id: Id,
         filesystem_uuid: RandomId128,
         initialization_token: RandomId128,
-        expected_blank_root: Option<Sha256Digest>,
-        expected_blank_generation: Generation,
+        expected_blank_head: RemoteHead,
     },
     DrainInitialization {
         volume_id: Id,
@@ -670,10 +670,8 @@ pub enum ReconcileStep {
     CommitInitialized {
         volume_id: Id,
         initialization_token: RandomId128,
-        expected_blank_root: Option<Sha256Digest>,
-        expected_blank_generation: Generation,
-        new_remote_root: Sha256Digest,
-        new_remote_generation: Generation,
+        expected_blank_head: RemoteHead,
+        new_remote_head: RemoteHead,
     },
     MountFilesystem {
         volume_id: Id,
@@ -712,18 +710,29 @@ pub enum ReconcileStep {
     },
     DeleteDisposableRoot {
         authorization_id: Id,
-        delete_id: Id,
-        volume_id: Id,
-        attachment_id: Id,
-        attachment_epoch: FenceEpoch,
-        expected_generation: Generation,
-        expected_root: Option<Sha256Digest>,
     },
     InstallGate {
         endpoint_id: Id,
         route_epoch: Epoch,
     },
     Quarantined,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VolumeAcquireRequest {
+    Normal {
+        volume_id: Id,
+        transition_id: RandomId128,
+        attachment_id: Id,
+        expected_unowned_epoch: FenceEpoch,
+        desired_revision: Revision,
+        placement_epoch: Epoch,
+        lease_duration_ms: u64,
+    },
+    Takeover {
+        authorization_id: Id,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -792,8 +801,15 @@ pub enum CleanupTarget {
 pub struct VolumeHeadEvidence {
     pub volume_id: Id,
     pub attachment_epoch: FenceEpoch,
+    pub head: RemoteHead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteHead {
     pub generation: Generation,
-    pub root: Option<Sha256Digest>,
+    pub root_hash: Option<Sha256Digest>,
+    pub root_object_id: Option<AsciiText>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -910,20 +926,17 @@ pub enum VolumeAuthorityEvidence {
     Absent,
     Unowned {
         attachment_epoch: FenceEpoch,
-        generation: Generation,
-        remote_root: Option<Sha256Digest>,
+        head: RemoteHead,
     },
     Owned {
         attachment_id: Id,
         attachment_epoch: FenceEpoch,
-        generation: Generation,
-        remote_root: Option<Sha256Digest>,
+        head: RemoteHead,
     },
     Deleting {
         delete_id: Id,
         attachment_epoch: FenceEpoch,
-        generation: Generation,
-        remote_root: Option<Sha256Digest>,
+        head: RemoteHead,
     },
 }
 
@@ -932,7 +945,7 @@ pub enum VolumeAuthorityEvidence {
 pub struct LocalVolumeLineage {
     pub attachment_id: Id,
     pub attachment_epoch: FenceEpoch,
-    pub acquire_transition_id: Id,
+    pub acquire_origin: AcquireOrigin,
     pub node_id: Id,
     pub placement_epoch: Epoch,
     pub local_durable_generation: Generation,
@@ -941,6 +954,13 @@ pub struct LocalVolumeLineage {
     pub pending_pack_count: WireU64,
     pub fenced: bool,
     pub state: LocalLineageState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AcquireOrigin {
+    Normal { transition_id: RandomId128 },
+    Takeover { authorization_id: Id },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

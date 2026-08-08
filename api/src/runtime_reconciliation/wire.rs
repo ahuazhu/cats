@@ -1655,6 +1655,27 @@ fn volume_acquire_schema() -> Schema {
     )
 }
 
+fn volume_acquire_request_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant(
+                "normal",
+                vec![
+                    field("volume_id", id()),
+                    field("transition_id", random_id()),
+                    field("attachment_id", id()),
+                    field("expected_unowned_epoch", wire_u64()),
+                    field("desired_revision", revision()),
+                    field("placement_epoch", epoch()),
+                    field("lease_duration_ms", number(1, MAX_WIRE_INTEGER)),
+                ],
+            ),
+            variant("takeover", vec![field("authorization_id", id())]),
+        ],
+    )
+}
+
 fn volume_disposition_schema() -> Schema {
     union(
         "kind",
@@ -1675,8 +1696,7 @@ fn filesystem_initialization_schema() -> Schema {
                 "initialize",
                 vec![
                     field("initialization_token", random_id()),
-                    field("expected_blank_root", nullable(digest())),
-                    field("expected_blank_generation", wire_u64()),
+                    field("expected_blank_head", remote_head_schema()),
                 ],
             ),
         ],
@@ -1908,8 +1928,15 @@ fn volume_head_schema() -> Schema {
     object(vec![
         field("volume_id", id()),
         field("attachment_epoch", wire_u64()),
+        field("head", remote_head_schema()),
+    ])
+}
+
+fn remote_head_schema() -> Schema {
+    object(vec![
         field("generation", wire_u64()),
-        field("root", nullable(digest())),
+        field("root_hash", nullable(digest())),
+        field("root_object_id", nullable(string(StringRule::AsciiText))),
     ])
 }
 
@@ -1924,12 +1951,12 @@ fn reconcile_step_schema() -> Schema {
                 vec![field("require_idle_attempt_id", nullable(random_id()))],
             ),
             variant(
+                "close_gate",
+                vec![field("endpoint_id", id()), field("route_epoch", epoch())],
+            ),
+            variant(
                 "acquire_volume",
-                vec![
-                    field("volume_id", id()),
-                    field("attachment_id", id()),
-                    field("acquire", volume_acquire_schema()),
-                ],
+                vec![field("request", volume_acquire_request_schema())],
             ),
             variant(
                 "prepare_device",
@@ -1946,8 +1973,7 @@ fn reconcile_step_schema() -> Schema {
                     field("attachment_id", id()),
                     field("filesystem_uuid", random_id()),
                     field("initialization_token", random_id()),
-                    field("expected_blank_root", nullable(digest())),
-                    field("expected_blank_generation", wire_u64()),
+                    field("expected_blank_head", remote_head_schema()),
                 ],
             ),
             variant(
@@ -1964,10 +1990,8 @@ fn reconcile_step_schema() -> Schema {
                 vec![
                     field("volume_id", id()),
                     field("initialization_token", random_id()),
-                    field("expected_blank_root", nullable(digest())),
-                    field("expected_blank_generation", wire_u64()),
-                    field("new_remote_root", digest()),
-                    field("new_remote_generation", wire_u64()),
+                    field("expected_blank_head", remote_head_schema()),
+                    field("new_remote_head", remote_head_schema()),
                 ],
             ),
             variant(
@@ -2026,15 +2050,7 @@ fn reconcile_step_schema() -> Schema {
             ),
             variant(
                 "delete_disposable_root",
-                vec![
-                    field("authorization_id", id()),
-                    field("delete_id", id()),
-                    field("volume_id", id()),
-                    field("attachment_id", id()),
-                    field("attachment_epoch", wire_u64()),
-                    field("expected_generation", wire_u64()),
-                    field("expected_root", nullable(digest())),
-                ],
+                vec![field("authorization_id", id())],
             ),
             variant(
                 "install_gate",
@@ -2138,8 +2154,7 @@ fn volume_authority_schema() -> Schema {
                 "unowned",
                 vec![
                     field("attachment_epoch", wire_u64()),
-                    field("generation", wire_u64()),
-                    field("remote_root", nullable(digest())),
+                    field("head", remote_head_schema()),
                 ],
             ),
             variant(
@@ -2147,8 +2162,7 @@ fn volume_authority_schema() -> Schema {
                 vec![
                     field("attachment_id", id()),
                     field("attachment_epoch", wire_u64()),
-                    field("generation", wire_u64()),
-                    field("remote_root", nullable(digest())),
+                    field("head", remote_head_schema()),
                 ],
             ),
             variant(
@@ -2156,8 +2170,7 @@ fn volume_authority_schema() -> Schema {
                 vec![
                     field("delete_id", id()),
                     field("attachment_epoch", wire_u64()),
-                    field("generation", wire_u64()),
-                    field("remote_root", nullable(digest())),
+                    field("head", remote_head_schema()),
                 ],
             ),
         ],
@@ -2168,7 +2181,7 @@ fn local_lineage_schema() -> Schema {
     object(vec![
         field("attachment_id", id()),
         field("attachment_epoch", wire_u64()),
-        field("acquire_transition_id", id()),
+        field("acquire_origin", acquire_origin_schema()),
         field("node_id", id()),
         field("placement_epoch", epoch()),
         field("local_durable_generation", wire_u64()),
@@ -2178,6 +2191,16 @@ fn local_lineage_schema() -> Schema {
         field("fenced", Schema::Bool),
         field("state", closed(&["active", "released", "quarantined"])),
     ])
+}
+
+fn acquire_origin_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant("normal", vec![field("transition_id", random_id())]),
+            variant("takeover", vec![field("authorization_id", id())]),
+        ],
+    )
 }
 
 fn observed_device_schema() -> Schema {
@@ -3615,6 +3638,24 @@ fn validate_desired_runtime_spec(
                 MalformedProblem::InvalidValue,
             ));
         }
+        if let Some(Ext4MountIntent {
+            initialization:
+                FilesystemInitialization::Initialize {
+                    expected_blank_head,
+                    ..
+                },
+            ..
+        }) = &volume.mount
+        {
+            collect_remote_head_cross(
+                expected_blank_head,
+                &child(
+                    &child(&child(&volume_path, "mount"), "initialization"),
+                    "expected_blank_head",
+                ),
+                &mut cross,
+            );
+        }
     }
     if let RuntimeTransition::RequireIdle {
         source_revision, ..
@@ -3645,6 +3686,12 @@ fn validate_runtime_checkpoint(checkpoint: &RuntimeCheckpoint) -> Result<(), Con
     let mut cross = Vec::new();
     collect_physical_cross(&checkpoint.processes, &checkpoint.volumes, &[], &mut cross);
     collect_reconcile_step_cross(&checkpoint.step, &path(&["step"]), false, &mut cross);
+    collect_close_gate_checkpoint_cross(checkpoint, &mut cross);
+    collect_warm_snapshot_cross(
+        &checkpoint.warm_snapshot,
+        &path(&["warm_snapshot"]),
+        &mut cross,
+    );
     if !incarnation_matches_state(
         checkpoint.stable_state,
         checkpoint.runtime_incarnation.as_ref(),
@@ -3655,6 +3702,29 @@ fn validate_runtime_checkpoint(checkpoint: &RuntimeCheckpoint) -> Result<(), Con
         return Err(malformed(ContractName::RuntimeCheckpoint, candidate));
     }
     Ok(())
+}
+
+fn collect_close_gate_checkpoint_cross(
+    checkpoint: &RuntimeCheckpoint,
+    output: &mut Vec<Candidate>,
+) {
+    let ReconcileStep::CloseGate {
+        endpoint_id,
+        route_epoch,
+    } = &checkpoint.step
+    else {
+        return;
+    };
+    let matching_entries = checkpoint
+        .route_gates
+        .iter()
+        .filter(|entry| {
+            entry.binding.endpoint_id == *endpoint_id && entry.binding.route_epoch == *route_epoch
+        })
+        .count();
+    if matching_entries != 1 {
+        output.push(Candidate::at(&[], MalformedProblem::InvalidValue));
+    }
 }
 
 fn validate_node_cleanup_checkpoint(
@@ -4784,6 +4854,29 @@ fn collect_reconcile_step_cross(
     output: &mut Vec<Candidate>,
 ) {
     match step {
+        ReconcileStep::FormatFilesystem {
+            expected_blank_head,
+            ..
+        } => collect_remote_head_cross(
+            expected_blank_head,
+            &child(path, "expected_blank_head"),
+            output,
+        ),
+        ReconcileStep::CommitInitialized {
+            expected_blank_head,
+            new_remote_head,
+            ..
+        } => {
+            collect_remote_head_cross(
+                expected_blank_head,
+                &child(path, "expected_blank_head"),
+                output,
+            );
+            collect_remote_head_cross(new_remote_head, &child(path, "new_remote_head"), output);
+        }
+        ReconcileStep::SnapshotWarmRuntime { source_heads, .. } => {
+            collect_volume_heads_cross(source_heads, &child(path, "source_heads"), output);
+        }
         ReconcileStep::CleanupRelease { cleanup } => {
             collect_cleanup_cross(
                 cleanup,
@@ -4805,6 +4898,43 @@ fn collect_reconcile_step_cross(
             output.push(Candidate::at(path, MalformedProblem::InvalidValue));
         }
         _ => {}
+    }
+}
+
+fn collect_volume_heads_cross(
+    heads: &[VolumeHeadEvidence],
+    path: &[PathSegment],
+    output: &mut Vec<Candidate>,
+) {
+    for (index, evidence) in heads.iter().enumerate() {
+        collect_remote_head_cross(
+            &evidence.head,
+            &child(&indexed(path, index), "head"),
+            output,
+        );
+    }
+}
+
+fn collect_remote_head_cross(head: &RemoteHead, path: &[PathSegment], output: &mut Vec<Candidate>) {
+    let has_hash = head.root_hash.is_some();
+    let has_object_id = head.root_object_id.is_some();
+    let valid = if head.generation.get() == 0 {
+        !has_hash && !has_object_id
+    } else {
+        has_hash && has_object_id
+    };
+    if !valid {
+        output.push(Candidate::at(path, MalformedProblem::InvalidValue));
+    }
+}
+
+fn collect_warm_snapshot_cross(
+    snapshot: &WarmSnapshotEvidence,
+    path: &[PathSegment],
+    output: &mut Vec<Candidate>,
+) {
+    if let WarmSnapshotEvidence::Present { source_heads, .. } = snapshot {
+        collect_volume_heads_cross(source_heads, &child(path, "source_heads"), output);
     }
 }
 
@@ -4862,6 +4992,18 @@ fn collect_physical_cross(
         };
         if !identities_valid {
             output.push(Candidate::at(&volume_path, MalformedProblem::InvalidValue));
+        }
+        match &volume.authority {
+            VolumeAuthorityEvidence::Unowned { head, .. }
+            | VolumeAuthorityEvidence::Owned { head, .. }
+            | VolumeAuthorityEvidence::Deleting { head, .. } => {
+                collect_remote_head_cross(
+                    head,
+                    &child(&child(&volume_path, "authority"), "head"),
+                    output,
+                );
+            }
+            VolumeAuthorityEvidence::Unavailable | VolumeAuthorityEvidence::Absent => {}
         }
         for (lineage_index, lineage) in volume.local_lineages.iter().enumerate() {
             if lineage.local_durable_generation.get() < lineage.remote_durable_generation.get() {
@@ -4997,6 +5139,11 @@ fn collect_runtime_cross(
 ) {
     collect_reconcile_step_cross(&runtime.step, &child(path, "step"), false, output);
     collect_physical_cross(&runtime.processes, &runtime.volumes, path, output);
+    collect_warm_snapshot_cross(
+        &runtime.warm_snapshot,
+        &child(path, "warm_snapshot"),
+        output,
+    );
     if !incarnation_matches_state(runtime.stable_state, runtime.runtime_incarnation.as_ref()) {
         output.push(Candidate::at(path, MalformedProblem::InvalidValue));
     }
