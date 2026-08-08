@@ -316,8 +316,7 @@ FilesystemInitialization =
 | {
     kind: "initialize",
     initialization_token: RandomId128,
-    expected_blank_root: Sha256Digest | null,
-    expected_blank_generation: Generation
+    expected_blank_head: RemoteHead
   }
 ```
 
@@ -638,11 +637,11 @@ unit。Inspect、Verify 和 Quarantine 本身不产生外部 effect。
 | planner step | 副作用前必须持久化 | 可执行条件与晚到结果 |
 |---|---|---|
 | CloseAdmission | desired/cell revision、原gate集合、RequireIdle attempt state | cell内compare-and-close；Armed模糊结果按Busy且Closed结算，fresh Running只以更高route epochs重开 |
-| AcquireVolume | volume、attachment、transition id + expected unowned epoch，或 authorization id | MetadataStore 精确 CAS；authorization首次消费还要求Active event并原子写`AuthorizationConsumedReceipt`；只有同 transition/authorization 可 adopt，或在 `R == L` 后精确 release |
+| AcquireVolume | normal时完整`VolumeAcquireRequest`（含positive lease duration），takeover时只有authorization id | MetadataStore 精确 CAS；authorization首次消费还要求Active event并原子写`AuthorizationConsumedReceipt`；只有完整typed request或同authorization可adopt，或在 `R == L` 后精确release |
 | PrepareDevices | NBD/tap/socket slot、ownership token | 完整 inventory 后 create-if-absent；晚到资源只按 token adopt 或删除 |
 | FormatFilesystem | attachment、device、filesystem UUID、initialization token、blank predecessor | Guest Agent 只按精确 predecessor 格式化；晚到结果按 UUID probe/adopt，冲突立即 quarantine |
 | DrainInitialization | attachment epoch、local/remote root generation | device flush 后只向精确 owner/epoch publish，直到 `R == L` |
-| CommitInitialized | token、blank predecessor、UUID、新 remote head | Control Store 精确 CAS；相同结果幂等，冲突 quarantine |
+| CommitInitialized | token、blank predecessor exact RemoteHead、UUID、新exact RemoteHead | Control Store 精确 CAS；相同结果幂等，冲突 quarantine |
 | MountFilesystem | attachment、device、UUID、mount path | 只 mount 精确 device/UUID；晚到 mount 不产生 route authority，stale 时按精确 identity unmount |
 | StartRuntime | runtime incarnation、scope/socket 名、process identity token | create-if-absent 后握手；晚到进程不开放 route，当前 spec 不再需要时按精确身份停止 |
 | DrainPublish | attachment epoch、local/remote root generation | 只向精确 owner/epoch CAS publish；晚到成功可安全 adopt，旧 epoch 不能写新 root |
@@ -650,7 +649,7 @@ unit。Inspect、Verify 和 Quarantine 本身不产生外部 effect。
 | SnapshotWarmRuntime | runtime incarnation、snapshot temp id、source root/epoch | 验证VMM postcondition与durable rename；晚到文件不覆盖其他WarmRuntimeSnapshot |
 | StopRuntime | runtime incarnation、process start time、scope id | 只 stop 该 incarnation；晚到 stop 可发生，当前 revision 负责重建 |
 | CleanupRelease | 完整`CleanupRelease`：物理target、inventory session/epoch/read position、Desired/tombstone read position，volume还有release transition/generation/disposition | 只删匹配资源、只 release 精确 owner/epoch；`orphan_scope`重读token/cgroup并证明无live PID/process，`control_socket`重读token并证明无live owner，`checkpoint_file`只由Node单槽重读并重算digest/完整identity且由当前Deleted tombstone证明不再需要；重建或身份变化后的stale cleanup必须拒绝 |
-| DeleteDisposableRoot | delete authorization、精确lineage、owner/epoch/head | 无live DiskSnapshotRecord且Guest/VMM/blockd已停后，按event/auth/volume/control锁序原子写Consumed receipt及两边Deleting；成功后才删该`R < L`lineage |
+| DeleteDisposableRoot | authorization ID；payload与direct result只读服务器端AuthorizationRecord | 无live DiskSnapshotRecord且Guest/VMM/blockd已停后，按event/auth/volume/control锁序原子写Consumed receipt及两边Deleting；Node从closed receipt取得精确lineage，成功后才删该`R < L`lineage |
 | InstallGate | desired checkpoint、spec digest、placement、runtime incarnation、endpoint/route epoch | cell只接受一个serving epoch；任何已close gate必须由更大epoch重开 |
 
 每步都可被 kill。重启后只能确认 postcondition、重试同一 token、继续或 quarantine，不能先
@@ -669,8 +668,9 @@ release request；`generation`和`disposition`是Runtime的决策/前置绑定�
 MetadataStore authority。若release已提交但响应丢失，重启只能：
 
 1. 逐字段重放同一request/同一`release_transition_id`，并接受原`UnownedGrant`；或
-2. 读取VolumeRecord，仅当`last_transition`ID及原request tuple全匹配、owner已为空、
-   resulting epoch精确等于`target.attachment_epoch + 1`且generation未变时adopt成功。
+2. 读取VolumeRecord，仅当`last_transition.kind="release"`中的完整typed request/result逐字段匹配、
+   owner/expiry已为空、resulting epoch精确等于`target.attachment_epoch + 1`、resulting exact
+   `RemoteHead`等于当前head且其generation等于cleanup绑定值时adopt成功。
 
 上述加一必须使用checked arithmetic；epoch已为`i64::MAX`时不存在可执行release。
 其他owner、epoch、transition payload或generation一律不得当作成功；身份冲突进入
@@ -681,7 +681,7 @@ Quarantine，暂时无法读取则Blocked。Control Plane在该release结果确�
 
 - Volume normal acquire：只允许精确 `expected_unowned_epoch` 的 Unowned -> this attachment；只有
   重放同一 `transition_id` 才返回原 LeaseGrant。
-- Volume publish/release：publish携带expected owner/epoch/root；release携带已持久的唯一
+- Volume publish/release：publish携带expected owner/epoch/exact RemoteHead；release携带已持久的唯一
   `release_transition_id`和expected owner/epoch，并按§7解析重放；PersistentDisk release前`R == L`。
 - VMM/blockd/systemd：名称含 Cat/incarnation，使用 process start time 和 socket handshake。
 - NBD slot、tap 等共享资源：完整 inventory 后分配，checkpoint 先写 ownership token。
@@ -738,13 +738,15 @@ Plane 对旧 placement 中每个需要恢复的卷分别创建：
 ```text
 VolumeTakeoverAuthorization {
   authorization_id, host_fence_event_id,
-  volume_id, expected_owner, expected_epoch,
+  volume_id, expected_attachment_id, expected_epoch,
   new_attachment_id, desired_revision, new_placement_epoch,
-  not_after, issuer_proof
+  lease_duration_ms, not_after
 }
 ```
 
-首次消费按固定锁序`HostFenceEvent -> authorization -> VolumeRecord`，要求event仍为Active和数据库
+该row由唯一Control Store writer在同一PostgreSQL trust/transaction域写入；Node只携
+`authorization_id`，不提交payload或第二套签名。首次消费按固定锁序
+`HostFenceEvent -> authorization -> VolumeRecord`，要求event仍为Active和数据库
 时间未超过`not_after`，在同一PostgreSQL事务完成精确逐卷CAS并写不可变
 `AuthorizationConsumedReceipt`。相同authorization只读取receipt并返回同一LeaseGrant，不再次改变
 volume；换卷、换旧owner、换attachment、换placement、过期或Rejoined后的首次消费都失败。运行时
@@ -897,7 +899,7 @@ ReconcileStep =
   { kind: "inspect_inventory", inventory_epoch: Epoch }
 | { kind: "stable", state: "running" | "suspended" | "warm" | "cold" | "deleted" }
 | { kind: "close_admission", require_idle_attempt_id: RandomId128 | null }
-| { kind: "acquire_volume", volume_id: Id, attachment_id: Id, acquire: VolumeAcquire }
+| { kind: "acquire_volume", request: VolumeAcquireRequest }
 | {
     kind: "prepare_device",
     volume_id: Id,
@@ -910,8 +912,7 @@ ReconcileStep =
     attachment_id: Id,
     filesystem_uuid: RandomId128,
     initialization_token: RandomId128,
-    expected_blank_root: Sha256Digest | null,
-    expected_blank_generation: Generation
+    expected_blank_head: RemoteHead
   }
 | {
     kind: "drain_initialization",
@@ -924,10 +925,8 @@ ReconcileStep =
     kind: "commit_initialized",
     volume_id: Id,
     initialization_token: RandomId128,
-    expected_blank_root: Sha256Digest | null,
-    expected_blank_generation: Generation,
-    new_remote_root: Sha256Digest,
-    new_remote_generation: Generation
+    expected_blank_head: RemoteHead,
+    new_remote_head: RemoteHead
   }
 | {
     kind: "mount_filesystem",
@@ -964,18 +963,22 @@ ReconcileStep =
     scope_id: Id
   }
 | { kind: "cleanup_release", cleanup: CleanupRelease }
-| {
-    kind: "delete_disposable_root",
-    authorization_id: Id,
-    delete_id: Id,
-    volume_id: Id,
-    attachment_id: Id,
-    attachment_epoch: FenceEpoch,
-    expected_generation: Generation,
-    expected_root: Sha256Digest | null
-  }
+| { kind: "delete_disposable_root", authorization_id: Id }
 | { kind: "install_gate", endpoint_id: Id, route_epoch: Epoch }
 | { kind: "quarantined" }
+
+VolumeAcquireRequest =
+  {
+    kind: "normal",
+    volume_id: Id,
+    transition_id: RandomId128,
+    attachment_id: Id,
+    expected_unowned_epoch: FenceEpoch,
+    desired_revision: Revision,
+    placement_epoch: Epoch,
+    lease_duration_ms: integer 1..=9223372036854775807
+  }
+| { kind: "takeover", authorization_id: Id }
 
 CleanupRelease {
   target: CleanupTarget,
@@ -1022,8 +1025,13 @@ CleanupTarget =
 VolumeHeadEvidence {
   volume_id: Id,
   attachment_epoch: FenceEpoch,
+  head: RemoteHead
+}
+
+RemoteHead {
   generation: Generation,
-  root: Sha256Digest | null
+  root_hash: Sha256Digest | null,
+  root_object_id: AsciiText | null
 }
 ```
 
@@ -1170,22 +1178,19 @@ VolumeAuthorityEvidence =
 | {
     kind: "unowned",
     attachment_epoch: FenceEpoch,
-    generation: Generation,
-    remote_root: Sha256Digest | null
+    head: RemoteHead
   }
 | {
     kind: "owned",
     attachment_id: Id,
     attachment_epoch: FenceEpoch,
-    generation: Generation,
-    remote_root: Sha256Digest | null
+    head: RemoteHead
   }
 | {
     kind: "deleting",
     delete_id: Id,
     attachment_epoch: FenceEpoch,
-    generation: Generation,
-    remote_root: Sha256Digest | null
+    head: RemoteHead
   }
 
 LocalVolumeLineage {
@@ -1385,6 +1390,9 @@ ResidueCheckpointFileEvidence =
 `volume_intent_id`和`disk_id`都必须为`null`；其他kind时两者都必须非null。`size_bytes`和`durability`
 是从blockd/attachment物理配置取得的observed值，不得从Desired复制来冒充证据；无法读取时为`null`，
 任何稳定态要求的卷都必须非null且等于Desired。
+
+`RemoteHead`与[Volume Authority](volume-authority.md)是同一tuple：generation为0当且仅当hash/object ID
+都为null，generation大于0当且仅当两者都非null；比较时三个字段不可拆分。
 
 同一`ProcessRole`可以出现多个不同process identity；同一`volume_id`可以出现多个device；同一
 `network_id`可以出现多个tap；同一`endpoint_id`可以出现多个route record。完全相同的route binding/
@@ -1918,8 +1926,9 @@ Rejoined；`host_destroyed`永不Rejoined，因此在没有tombstone、其他Hos
 | scan与cleanup之间资源被重建 | token、digest、cgroup或process identity任一不匹配时旧cleanup拒绝，新资源保留 |
 | standalone scope/socket token missing或corrupt | 不生成CleanupTarget，不删除，进入Quarantined/人工处理 |
 | standalone checkpoint corrupt | 不生成`checkpoint_file` target，不自动删除，进入Quarantined/人工处理 |
-| normal acquire 遇到旧 owner | Blocked，不 revoke；只有精确逐卷 takeover authorization 可 CAS |
-| volume release提交后响应丢失 | 同一`release_transition_id`重放返回原UnownedGrant，或精确`last_transition` postcondition被adopt；epoch只增加1 |
+| RemoteHead/nullability | authority/checkpoint中的head只接受`0/null/null`或`>0/non-null/non-null`；generation/hash/object ID任一错配都拒绝，fixed inventory覆盖non-null tuple |
+| normal acquire 遇到旧 owner | Blocked，不 revoke；positive lease duration和DB absolute expiry不授予抢占，只有服务器端精确逐卷 takeover authorization 可 CAS |
+| volume release提交后响应丢失 | 同一`release_transition_id`及完整typed request重放返回原UnownedGrant，或精确`last_transition.release` request/result postcondition被adopt；epoch只增加1 |
 | release N / reacquire N+1 / 旧release N重放 | attachment/expected epoch/transition不匹配，旧N不能释放N+1 writer，不能以当前Unowned猜测成功 |
 | 新物理实例遇到旧token | 每个新create attempt使用新token；名称/path已有不同token时Quarantine，不覆写/adopt/删除 |
 | Running 改盘/shape | 请求先 PreconditionFailed(MustBeCold)；Cold 成功后的新请求才改完整 spec |
@@ -1931,8 +1940,8 @@ Rejoined；`host_destroyed`永不Rejoined，因此在没有tombstone、其他Hos
 | Node A observation结算Node B Operation | 顶层Node、Operation/applied/current placement Node不全等时返回`wrong_placement`；不接受observation、不推进sequence/freshness且不结算任何Operation |
 | identity conflict | gates Closed，Quarantined，当前 Pending Operation Failed |
 | Host fence 与多个卷 | 一个 HostFenceEvent 派生多个独立逐卷授权；错 tuple 全部拒绝 |
-| authorization consume 与Rejoined并发 | 两者锁同一event；只能consume先提交并留下receipt，或Rejoined先提交且epoch不变 |
-| consumed授权后继 | takeover→release与delete→sweep后均可凭单调状态/精确DeleteCompletionReceipt完成rejoin；错receipt保持Blocked |
+| authorization consume 与Rejoined并发 | Node只传ID且AuthorizationRecord为payload/receipt唯一权威；两者锁同一event，只能consume先提交并留下closed receipt，或Rejoined先提交且epoch不变 |
+| consumed授权后继 | Volume只存authorization ID marker；takeover→release与delete→sweep按closed状态/epoch/head及精确DeleteCompletionReceipt完成rejoin，不复制中间链；错receipt保持Blocked |
 | normal acquire与begin-delete并发 | 同一VolumeRecord串行且只能一方提交；Control Disk与Volume不会出现单边Deleting |
 | disposable Root `R < L` | event/auth/volume/control同事务写receipt和两边Deleting后才删lineage；PersistentDisk拒绝 |
 | Snapshot create crash/响应丢失 | exact record与成功result同时提交或都不存在；重放只读result，不从record缺席推断可重建 |
@@ -2081,11 +2090,11 @@ route multiplicity、VMM shape/Guest Ready、volume size/durability、missing/co
 中保留`R < L` lineage，所以不是Ready postcondition：
 
 ```json
-{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"inventory_epoch":4,"inventory_read_position":12,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","residue":[{"cgroup_path":"/sys/fs/cgroup/system.slice/cats-orphan.scope","kind":"systemd_scope","ownership_token":{"kind":"valid","ownership_token":"dddddddddddddddddddddddddddddddd"},"scope_id":"cats-orphan.scope"},{"kind":"control_socket","ownership_token":{"kind":"missing"},"role_hint":null,"socket_path":"/run/cats/orphan/control.sock"},{"checkpoint_path":"/var/lib/cats/checkpoints/orphan.json","evidence":{"kind":"corrupt","raw_content_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"kind":"checkpoint_file"},{"data_directory":"/var/lib/cats/orphan-vol","kind":"data_directory","lineage":{"attachment_epoch_hint":4,"attachment_id_hint":"att_orphan","fenced":false,"kind":"readable","local_durable_generation":6,"pending_pack_count":2,"remote_durable_generation":5},"ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"volume_id_hint":null}],"runtimes":[{"applied_desired":{"desired_revision":7,"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","target":"running"},"cat_id":"cat_01","checkpoint":{"cat_id":"cat_01","checkpoint_path":"/var/lib/cats/checkpoints/cat_01.json","content_digest":"sha256:602bd0f3a0f1a29f269fa2946fa1a52ea154ba1623b5ca2de18e657cad3753fb","desired_revision":7,"kind":"valid","node_id":"node_a","placement_epoch":3,"require_idle":{"kind":"not_applicable"},"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"updated_at_unix_ms":1720000000000,"version":1},"guest_transport":{"guest_agent_protocol_version":1,"guest_boot_id":"cccccccccccccccccccccccccccccccc","guest_cid":3,"guest_port":5000,"kind":"vsock_ready","runtime_incarnation":"55555555555555555555555555555555"},"lifecycle_admission":"closed","mounts":[{"access":"read_write","filesystem_uuid":"99999999999999999999999999999999","guest_device":{"serial":"cats-root","slot":0},"instance_count":1,"mount_path":"/","source_path":"/dev/nbd0","volume_id":"vol_root"}],"networks":[{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"valid","ownership_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"prefix_length":30,"tap_name":"tap0"},{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"prefix_length":30,"tap_name":"tap1"}],"platform_guards":0,"processes":[{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/vmm.sock","executable_path":"/usr/bin/cloud-hypervisor","observed_vm_shape":{"boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","guest_config_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","memory_bytes":2147483648,"vcpus":2},"ownership_token":{"kind":"valid","ownership_token":"66666666666666666666666666666666"},"process_id":1001,"process_start_time_ticks":9001,"role":{"kind":"vmm","runtime_incarnation":"55555555555555555555555555555555"},"scope_id":"cats-cat_01","state":"running"},{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/blockd-root.sock","executable_path":"/usr/bin/cats-blockd","observed_vm_shape":null,"ownership_token":{"kind":"valid","ownership_token":"77777777777777777777777777777777"},"process_id":1002,"process_start_time_ticks":9002,"role":{"attachment_epoch":8,"attachment_id":"att_01","kind":"blockd","volume_id":"vol_root"},"scope_id":"cats-cat_01","state":"running"}],"routes":[{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":9,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"gate":"closed","instance_count":2},{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":10,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"gate":"closed","instance_count":1}],"runtime_incarnation":"55555555555555555555555555555555","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"volumes":[{"authority":{"attachment_epoch":8,"attachment_id":"att_01","generation":4,"kind":"owned","remote_root":"sha256:2222222222222222222222222222222222222222222222222222222222222222"},"devices":[{"device_path":"/dev/nbd0","guest_device":{"serial":"cats-root","slot":0},"kind":"kernel_nbd","ownership_token":{"kind":"valid","ownership_token":"88888888888888888888888888888888"}},{"guest_device":{"serial":"cats-root","slot":0},"kind":"vhost_user_blk","ownership_token":{"kind":"missing"},"socket_path":"/run/cats/cat_01/root.sock"}],"disk_id":"disk_root","disk_kind":"root","durability":"strict","local_lineages":[{"acquire_transition_id":"tx_01","attachment_epoch":8,"attachment_id":"att_01","data_directory":"/var/lib/cats/vol_root","fenced":false,"local_durable_generation":5,"node_id":"node_a","pending_pack_count":1,"placement_epoch":3,"remote_durable_generation":4,"state":"active"}],"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"warm_snapshot":{"kind":"absent"}}],"version":1}
+{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"inventory_epoch":4,"inventory_read_position":12,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","residue":[{"cgroup_path":"/sys/fs/cgroup/system.slice/cats-orphan.scope","kind":"systemd_scope","ownership_token":{"kind":"valid","ownership_token":"dddddddddddddddddddddddddddddddd"},"scope_id":"cats-orphan.scope"},{"kind":"control_socket","ownership_token":{"kind":"missing"},"role_hint":null,"socket_path":"/run/cats/orphan/control.sock"},{"checkpoint_path":"/var/lib/cats/checkpoints/orphan.json","evidence":{"kind":"corrupt","raw_content_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"kind":"checkpoint_file"},{"data_directory":"/var/lib/cats/orphan-vol","kind":"data_directory","lineage":{"attachment_epoch_hint":4,"attachment_id_hint":"att_orphan","fenced":false,"kind":"readable","local_durable_generation":6,"pending_pack_count":2,"remote_durable_generation":5},"ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"volume_id_hint":null}],"runtimes":[{"applied_desired":{"desired_revision":7,"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","target":"running"},"cat_id":"cat_01","checkpoint":{"cat_id":"cat_01","checkpoint_path":"/var/lib/cats/checkpoints/cat_01.json","content_digest":"sha256:602bd0f3a0f1a29f269fa2946fa1a52ea154ba1623b5ca2de18e657cad3753fb","desired_revision":7,"kind":"valid","node_id":"node_a","placement_epoch":3,"require_idle":{"kind":"not_applicable"},"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"updated_at_unix_ms":1720000000000,"version":1},"guest_transport":{"guest_agent_protocol_version":1,"guest_boot_id":"cccccccccccccccccccccccccccccccc","guest_cid":3,"guest_port":5000,"kind":"vsock_ready","runtime_incarnation":"55555555555555555555555555555555"},"lifecycle_admission":"closed","mounts":[{"access":"read_write","filesystem_uuid":"99999999999999999999999999999999","guest_device":{"serial":"cats-root","slot":0},"instance_count":1,"mount_path":"/","source_path":"/dev/nbd0","volume_id":"vol_root"}],"networks":[{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"valid","ownership_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"prefix_length":30,"tap_name":"tap0"},{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"prefix_length":30,"tap_name":"tap1"}],"platform_guards":0,"processes":[{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/vmm.sock","executable_path":"/usr/bin/cloud-hypervisor","observed_vm_shape":{"boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","guest_config_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","memory_bytes":2147483648,"vcpus":2},"ownership_token":{"kind":"valid","ownership_token":"66666666666666666666666666666666"},"process_id":1001,"process_start_time_ticks":9001,"role":{"kind":"vmm","runtime_incarnation":"55555555555555555555555555555555"},"scope_id":"cats-cat_01","state":"running"},{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/blockd-root.sock","executable_path":"/usr/bin/cats-blockd","observed_vm_shape":null,"ownership_token":{"kind":"valid","ownership_token":"77777777777777777777777777777777"},"process_id":1002,"process_start_time_ticks":9002,"role":{"attachment_epoch":8,"attachment_id":"att_01","kind":"blockd","volume_id":"vol_root"},"scope_id":"cats-cat_01","state":"running"}],"routes":[{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":9,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"gate":"closed","instance_count":2},{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":10,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"gate":"closed","instance_count":1}],"runtime_incarnation":"55555555555555555555555555555555","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"volumes":[{"authority":{"attachment_epoch":8,"attachment_id":"att_01","head":{"generation":4,"root_hash":"sha256:2222222222222222222222222222222222222222222222222222222222222222","root_object_id":"volumes/vol_root/roots/4"},"kind":"owned"},"devices":[{"device_path":"/dev/nbd0","guest_device":{"serial":"cats-root","slot":0},"kind":"kernel_nbd","ownership_token":{"kind":"valid","ownership_token":"88888888888888888888888888888888"}},{"guest_device":{"serial":"cats-root","slot":0},"kind":"vhost_user_blk","ownership_token":{"kind":"missing"},"socket_path":"/run/cats/cat_01/root.sock"}],"disk_id":"disk_root","disk_kind":"root","durability":"strict","local_lineages":[{"acquire_transition_id":"tx_01","attachment_epoch":8,"attachment_id":"att_01","data_directory":"/var/lib/cats/vol_root","fenced":false,"local_durable_generation":5,"node_id":"node_a","pending_pack_count":1,"placement_epoch":3,"remote_durable_generation":4,"state":"active"}],"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"warm_snapshot":{"kind":"absent"}}],"version":1}
 ```
 
 ```text
-inventory_digest = sha256:b198645acb2f5c1cd48e3cab10fccc6eb236ffd8addb5c9972c03cc350a4f832
+inventory_digest = sha256:acfa3a47d5a3a8cec76e7ca78b080df9f296ef04fb4f1f11770c6a2df6f2b284
 ```
 
 **Valid unexpected standalone socket/checkpoint inventory vector**使用inventory domain。它与上面的

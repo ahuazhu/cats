@@ -138,6 +138,13 @@ result，即使目标资源已删除也不先查资源；同key异payload在资�
 ownership并取得domain locks；跨Workspace miss回滚reservation且零持久副作用。V1已提交result不随
 resource或Operation删除而GC。
 
+Volume domain不复用HTTP request fingerprint：normal acquire/release分别用`RandomId128` transition，
+takeover/disposable delete只提交唯一Control Store writer已持久化的authorization ID，delete使用自己的ID；
+row内closed `last_transition`只为没有独立row的normal variants保存完整typed request/direct result；
+authorization variants只存ID marker并从唯一AuthorizationRecord逐字段replay。lease request携positive
+duration，由同一PG事务用DB time checked-add为absolute expiry；expiry只影响liveness。Remote head及安全
+receipt始终保存generation、root hash和root object ID的exact tuple，不拆字段验证，也不增加第二套签名。
+
 ## 5. 产品资源
 
 - **Workspace** 是唯一资源 owner；Account/Organization 只参与身份、成员关系和计费。
@@ -326,8 +333,10 @@ AWS自动Node failover使用一个窄、可审计的EC2/BMC Host-fence adapter�
 writer。Control Plane以一个事务失败旧Operation并创建新完整Desired/Operation/placement及全部
 逐卷授权；每卷CAS后才恢复。旧Host网络持续隔离，rejoin把旧`R < L`lineage quarantine并核对全部
 派生授权/current owner。授权派生、首次consume和`Active -> Rejoined`都锁同一event行；首次consume
-在同一PostgreSQL事务完成Volume CAS并写不可变receipt。rejoin验证receipt以及当前卷是其直接结果或
-合法单调后继，VolumeRecord已删除时验证精确`DeleteCompletionReceipt`；未消费授权必须已过期。
+只从服务器端immutable authorization row读取payload，在同一PostgreSQL事务完成Volume CAS并写closed、
+不可变receipt。rejoin验证receipt以及当前卷是其直接结果或合法单调后继；VolumeRecord已删除时，精确
+`DeleteCompletionReceipt`还必须证明normal exact `BeginDeleteRequest`或同一disposable authorization的begin identity、
+deleting epoch/head、object sweep和两边row原子删除。未消费授权必须已过期。
 HostRejoinProof把event持久转为Rejoined后才恢复网络，此后未消费授权不能首次生效。
 
 数据库调用在有界blocking executor/连接池中执行，不能让同步driver占住Tokio worker。

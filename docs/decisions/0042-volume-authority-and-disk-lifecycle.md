@@ -30,23 +30,34 @@ authority、Node本地数据和Guest filesystem的磁盘状态机。
 
 ### 2. 所有 ownership 变化使用条件 transition
 
-normal acquire、release和takeover都携带全局唯一`transition_id`与expected epoch。当前相同
-transition重试返回原结果；被后续转换取代的旧重试返回Stale且无副作用。不同或晚到的transition
-不能越过已经前进的epoch。所有ownership变化增加epoch。
+normal acquire和release各携带`RandomId128 transition_id`，takeover只携服务器端authorization row的
+`Id authorization_id`，delete保留`Id delete_id`；不造可混用的统一ID。VolumeRecord `last_transition`
+的normal acquire/release/begin-delete variants保存完整typed request/direct result；takeover/disposable variants
+只保存authorization ID marker，payload/receipt唯一保存在AuthorizationRecord，不保存Volume-domain request hash。
+当前last-transition的同ID逐字段exact replay返回原结果，同ID异payload为Stale；被后续转换取代的旧重试
+按当前state/expected epoch拒绝且无副作用，不增加第二份历史ledger。
+所有ownership变化增加epoch。
 
 TTL只用于健康判断。普通acquire永远不能因为另一个owner过期而抢占。takeover必须消费从可信
 HostFenceEvent派生的逐卷授权；计划handoff使用release后normal acquire。删除无条件
 `revoke_lease`。
 
-HostFenceEvent的授权派生、首次消费与Rejoined转换都先锁同一个PostgreSQL event行。首次消费还锁
-authorization和VolumeRecord，在同一事务完成卷CAS并写不可变`AuthorizationConsumedReceipt`；
+lease请求只接受positive `lease_duration_ms`。唯一PostgreSQL事务owner用本事务DB time做checked-add并
+在row中保存absolute expiry；过期只影响liveness/renew scheduling，不授予takeover或revoke。Remote head
+始终是`generation + nullable root hash + nullable root object ID`的exact tuple：generation为0时后两者都
+null，非0时后两者都non-null。
+
+HostFenceEvent的授权派生、首次消费与Rejoined转换都先锁同一个PostgreSQL event行。authorization由唯一
+Control Store writer在同一PG trust/transaction域写完整immutable payload；Node只携ID，不再增加第二套
+签名。首次消费还锁authorization和VolumeRecord，在同一事务完成卷CAS并写closed、不可变
+`AuthorizationConsumedReceipt`；
 Rejoined先提交后，未消费授权不能首次生效。rejoin校验receipt以及当前卷是其直接结果或合法的
 单调后继；卷已删除时改验精确`DeleteCompletionReceipt`。这些安全回执保留到相关event Rejoined，
 随后按审计策略GC。
 
 ### 3. Node取得grant，blockd只采用grant
 
-Node在RuntimeCheckpoint记录acquire/takeover/release transition，调用MetadataStore并解析
+Node在RuntimeCheckpoint记录normal acquire/release的typed request或takeover authorization ID，调用MetadataStore并解析
 模糊结果，然后把精确attachment/epoch交给blockd。release checkpoint还绑定完整物理
 target、full-inventory/Desired读取位置、唯一transition ID、generation和disposition；响应丢失
 只能重放同一request或采用精确的last-transition postcondition，不得从“当前是Unowned”
@@ -93,6 +104,9 @@ Snapshot mutation同步完成，不创建Operation；产品row只表示当前资
 改为同一`Deleting(delete_id)`；normal acquire与它只能一方提交。sweeper在该提交之后断言没有live
 `DiskSnapshotRecord`，
 幂等删除volume对象，最后写`DeleteCompletionReceipt`并同时删除两边metadata。
+completion receipt保存disk/volume/delete、normal exact `BeginDeleteRequest`或disposable authorization/prior
+attachment的closed begin variant、deleting epoch和exact head。owner已清、object sweep完成及两边row已删除
+是该receipt的固定语义，不存bool；因此Host rejoin在row删除后仍能验证同authorization的合法后继。
 
 ADR-0025的disposable Root例外使用唯一的第二个入口：Control Plane根据当前Deleted Desired与
 精确stop observation或Active HostFenceEvent签发

@@ -80,24 +80,18 @@ tag==1 时: [leaf_hash 32B] [object_id_len u16] [object_id bytes]
 
 ## 4. 权威元数据（MetadataStore）
 
-每卷一行（SQLite 开发实现 / PostgreSQL 生产实现遵守同一事务合同）：
+权威`VolumeRecord`、closed transition与receipt schema唯一见
+[Volume Authority §3](volume-authority.md#3-postgresql-authority-模型)。Control Store是唯一PostgreSQL DDL和
+cross-row事务owner；本协议不复制第二份Volume SQL schema。SQLite只可作为blockd数据面projection/CAS及
+pure-domain fixture，不实现Control事务或形成第二个authority。
 
-```text
-volumes(volume_id PK, size_bytes, generation, root_hash, root_object_id,
-        admin_state, delete_id,
-        lease_owner, lease_epoch, lease_expires_at_unix_ms,
-        last_transition_id, last_transition_kind, last_transition_request_fingerprint,
-        last_transition_attachment,
-        last_transition_result_epoch)
-disk_snapshots(snapshot_id PK, disk_id, volume_id, size_bytes, generation,
-               root_hash, root_object_id, created_at)
-```
+blockd adapter只读取当前`volume_id`、不可变`size_bytes`、`admin_state`、exact `RemoteHead`、
+`lease_owner`、`lease_epoch`和absolute `lease_expires_at` projection，以精确owner/epoch renew，并执行下面的
+head CAS。它不建权威表，不执行acquire、release、takeover、revoke、resize、delete或snapshot mutation。
 
-每条`disk_snapshots` row就是一条`DiskSnapshotRecord`，同时承担产品资源和GC live-root；没有第二份
-物化记录。
-
-- `generation` 单调递增；`generation=0` 表示空卷（全洞，无 Root 对象）。
-- Root CAS（提交唯一入口）必须在一条原子语句内完成：
+`RemoteHead`的generation/hash/object ID nullability和exact compare沿用Volume Authority；generation只通过
+下述数据面CAS或该规格允许的Control transition前进。Root CAS（blockd提交唯一入口）必须在一条原子语句
+内完成：
 
 ```sql
 UPDATE volumes
@@ -116,19 +110,16 @@ UPDATE volumes
 
 ### 4.1 Lease / Fencing
 
-- normal acquire必须携带`transition_id + attachment_id + expected_unowned_epoch`，并且只允许
-  精确`Unowned -> Owned`。当前相同transition重试返回原grant，不再次增加epoch；已被后续转换
-  取代的旧重试返回`StaleTransition`且无副作用。
-- 其他owner即使TTL已过也不能被normal acquire抢占；受保护takeover必须消费从Active
-  `HostFenceEvent`派生的精确逐卷授权。release同样携带transition和精确owner/epoch，响应丢失可
-  幂等重试，任何不匹配显式失败。
-- `renew_lease` 必须携带当前 epoch；不匹配即失败，blockd 进入 **fenced**：拒绝新 WRITE/FLUSH（返回错误），在飞提交一律作废。
+- Node先按Volume Authority取得精确grant，再把volume、attachment、epoch及既有acquire transition identity
+  交给blockd；blockd只adopt该grant，不能创建或改变ownership。
+- `renew_lease`必须携带当前owner/epoch和positive duration；唯一PG authority按本事务DB-now checked-add写
+  absolute expiry。owner/epoch不匹配即失败，blockd进入 **fenced**：拒绝新WRITE/FLUSH（返回错误），
+  在飞提交一律作废。
 - 旧 epoch 的任何 Root CAS 必然 0 行受影响 —— 这是双写防护的最后一道闸，与租约到期判断相互独立。
 - expiry只用于健康判断，不打开竞争acquire。短暂renewal lapse不得自我fence；只有精确release或
   授权takeover原子增加epoch后，旧Writer的renew/CAS才fail closed。
-- Node先取得精确`LeaseGrant { attachment_id, epoch, transition_id }`再启动blockd。blockd只验证、
-  renew和使用该grant，绝不调用acquire/takeover或自行增加epoch。完整状态机见
-  [Volume Authority](volume-authority.md#4-lease-接口和状态机)。
+- 完整ownership/admin状态机、typed replay和错误闭集唯一见
+  [Volume Authority](volume-authority.md#4-lease-接口和状态机)。blockd绝不自行增加epoch。
 
 ## 5. 本地状态（Cache + Relaxed 权威暂存）
 
