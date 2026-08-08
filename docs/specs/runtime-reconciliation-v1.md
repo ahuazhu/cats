@@ -2196,8 +2196,10 @@ Operation source，并用mock断言不读取/比较后一source。presented revi
 `contract_error`移除测试必须把旧OperationFailure tag送入standalone decoder，断言
 `malformed_payload {problem:"invalid_value", json_pointer:"/terminal/error/kind"}`；在NodeObservation
 Condition伪造同名tag也必须按closed union拒绝且整份observation零副作用。重建的current完整Desired正常通过
-F0时Operation保持Pending，不能采用Node自报error；完整row缺失、无法canonical encode或重放失败时按既有
-corruption安全规则Quarantine且不写terminal。顶层`ContractError`的既有serde/version/error vectors继续通过。
+F0时Operation保持Pending，不能采用Node自报error；完整row缺失、无法canonical encode或重放失败时必须断言
+当前事务abort、Operation row原状态不变、observation未接受/未结算，Control Plane进入内部fatal/unready且停止
+签发新的Desired/placement/Grant；不得生成quarantined/blocked Condition、Operation terminal或Node自报error。
+顶层`ContractError`的既有serde/version/error vectors继续通过。
 
 decoder/validator contract tests必须直接覆盖§16.4的统一pipeline：
 
@@ -2467,9 +2469,11 @@ revision/spec的digest mismatch都不能伪造`revision_digest_conflict`payload�
 `content_digest`只能由Node读取完整文件后验证，不是self-digest规则。
 
 Control Store中的完整Desired在与Operation同一事务提交前已经通过§16.4.1。若后来无法从该current完整row
-重建等价canonical wire，或重建后不再通过同一decoder，这是Control Store corruption：保持Operation
-Pending、关闭相关gates并按既有规则Quarantine，不能落盘Node自报的`contract_error` terminal，也不新增raw
-Desired ledger、error receipt或旁路证明。
+重建等价canonical wire，或重建后不再通过同一decoder，这是Control Store invariant failure：当前事务整体
+abort，既有Operation row保持进入事务时的原状态（通常为Pending），该observation不接受也不结算；Control
+Plane进入内部fatal/unready并停止签发新的Desired、placement和Grant，直到operator恢复可信数据库状态。这不是
+`Condition.kind=quarantined`或`Condition.kind=blocked`，因此不触发Operation terminal，也不能落盘Node自报的
+`contract_error`。不得新增raw Desired ledger、error receipt或旁路证明。
 
 非Observation边界的`wrong_placement.expected/presented`就是该边界实际比较的两份完整
 `AssignedPlacement`，不能为填充错误payload构造虚假placement。
