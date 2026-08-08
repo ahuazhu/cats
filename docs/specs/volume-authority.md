@@ -108,9 +108,38 @@ LastVolumeTransition =
 DiskRecord {
   disk_id: Id,
   workspace_id: Id,
+  name: Id,
   volume_id: Id,
-  state: { kind: "active" } | { kind: "deleting", delete_id: Id }
+  size_bytes: integer 1..=9223372036854775807,
+  durability: "strict" | "relaxed",
+  created_at: UnixMillis,
+  admin_state: DiskAdminState,
+  role: DiskRole
 }
+
+DiskAdminState =
+  { kind: "active" }
+| { kind: "deleting", delete_id: Id }
+
+DiskRole =
+  { kind: "root", cat_id: Id }
+| { kind: "persistent", initialization: PersistentDiskInitialization }
+
+PersistentDiskInitialization =
+  {
+    kind: "uninitialized",
+    initialization_token: RandomId128,
+    filesystem_uuid: RandomId128,
+    expected_blank_head: RemoteHead
+  }
+| {
+    kind: "initialized",
+    initialization_token: RandomId128,
+    filesystem_uuid: RandomId128,
+    expected_blank_head: RemoteHead,
+    initialized_head: RemoteHead,
+    initialized_at: UnixMillis
+  }
 
 DiskSnapshotRecord {
   snapshot_id: Id,
@@ -122,13 +151,14 @@ DiskSnapshotRecord {
 }
 
 ApiIdempotencyResult {
-  authenticated_workspace_id,
-  canonical_route,
-  idempotency_key,
-  request_fingerprint,
-  outcome: Succeeded { http_status, response }
-         | Failed { http_status, typed_error },
-  created_at
+  authenticated_workspace_id: Id,
+  canonical_route: AsciiText,
+  idempotency_key: AsciiText,
+  request_fingerprint: Sha256Digest,
+  http_status: integer 200..=599,
+  content_type: "application/json" | null,
+  response_body: bytes 0..=1048576,
+  created_at: UnixMillis
 }
 
 AuthorizationRecord {
@@ -192,6 +222,15 @@ DeleteCompletionReceipt =
 本文的“head generation非倒退”固定表示：更小generation拒绝；相同generation时hash和object ID也必须
 逐字段相同；只有更大generation才进入对应的数据面CAS或closed successor验证。
 
+`DiskRecord`的disk/workspace/name/volume identity、size、durability和created_at创建后不可修改，且
+size/durability必须与同一`VolumeRecord`逐字段相同。`(workspace_id, name)`唯一。`DiskRole.kind`和
+Root的`cat_id`不可修改；Persistent role唯一允许的变化是保留同一token/UUID/blank head，从
+Uninitialized一次性变为Initialized。Root只保存`root {cat_id}`，没有假的NotApplicable initialization字段；
+Persistent只保存上述两态initialization。Available/Bound不是
+Disk row状态：是否属于某个Cat只从当前完整`DesiredRuntimeSpec`的VolumeIntent集合推导，多个current
+Desired同时引用同一RWO Disk是Control Store invariant failure并fail closed。产品删除完成后不保留
+`Deleted` Disk row；可观察的产品状态只有Active、Deleting和row不存在。
+
 `lease_owner == null`当且仅当`lease_expires_at == null`；owner非null时Volume必须为Active，owner即
 当前`attachment_id`。Deleting Volume必须owner/expiry都为null。`last_transition`是closed enum：每个
 没有独立row的normal acquire/release/begin delete保存完整typed request和首次direct result；takeover和
@@ -199,14 +238,19 @@ begin-disposable-delete只保存`authorization_id` foreign-key marker，payload/
 `AuthorizationRecord`读取，不能在Volume row复制第二份。same-disk restore由`ApiIdempotencyResult`幂等化，提交
 新head/epoch时把`last_transition`清为null，使任何更早domain transition重放都成为`StaleTransition`。
 
-`ApiIdempotencyResult`的主键是`(authenticated_workspace_id, canonical_route, idempotency_key)`。
-`request_fingerprint`覆盖规范化route参数和请求body；同key同fingerprint只返回不可变`outcome`，同key
-不同fingerprint在读取任何资源锁前返回`IdempotencyConflict`。首次请求在reservation下执行一次资源
-事务，并在同一commit写最终result；业务成功或确定性业务失败可以结算，serialization、连接中断或
-无法提交事务不写result。V1的已提交result不因对应resource或Operation删除而GC，也不通过resource是否
-仍存在决定是否重放；它是API重试权威，不是Snapshot产品查询或GC authority。异步接口把
-`operation_id`放在不可变HTTP response中，但不复制Operation的phase或status；Snapshot create、delete
-和restore是同步事务，不创建Operation。
+`ApiIdempotencyResult`的主键是`(authenticated_workspace_id, canonical_route, idempotency_key)`，唯一
+fingerprint算法见§3.3。同key同fingerprint逐字节重放`http_status + content_type + response_body`；同key
+不同fingerprint在读取任何资源锁前返回`IdempotencyConflict`。首次请求在reservation下执行一次资源事务，
+并在同一commit写最终result；业务成功或确定性业务失败可以结算。serialization/连接错误或已知未提交
+事务不写result；commit acknowledgement或HTTP response transport不明不得另写一个失败result，最终PG
+状态只能是“业务变化+result同时存在”或“两者都不存在”，重试按key读取判定。V1已提交result不因对应
+resource或Operation删除而GC，也不通过
+resource是否仍存在决定是否重放；它是API重试权威，不是Snapshot产品查询或GC authority。row不另存
+`operation_id`、Operation phase/status或结构化业务response；异步接口的operation ID若存在，只是当时
+`response_body`中的bytes。动态request ID等非语义response header可在每次重放时不同，不属于result。
+`created_at`取首次写result事务的PostgreSQL DB now且之后不可修改，重放不刷新。超过1MiB的response不能提交
+业务变化或result。Snapshot create/delete/restore以及PersistentDisk
+create/delete都不创建自己的Operation。
 
 `AuthorizationRecord`由同一PostgreSQL trust/transaction域内的唯一Control Store writer创建；Node只提交
 `authorization_id`。consumer按ID锁row并读取服务器端不可变`authorization`，不存在客户端可替换的payload，
@@ -268,6 +312,43 @@ ownership/state、`DiskSnapshotRecord`为空、RuntimeStopped observation和prov
 测试责任也分两层：pure domain table tests穷举每个Volume/Event/Authorization当前状态、exact replay、
 同ID异payload、epoch与RemoteHead边界；唯一PostgreSQL Control adapter的integration tests逐项改变跨row字段并
 覆盖固定锁序、并发提交与每个crash点。SQLite可复用前一层，但domain fixture中的伪上下文不能替代PG验收。
+
+### 3.3 唯一 API idempotency fingerprint
+
+所有HTTP mutation共用一个byte-level算法，不再为route各写一套canonical JSON或参数归一化。定义
+`frame(b) = u64-BE(len(b)) || b`，其中length是后续payload的octet数；`if_match` payload在header缺席时
+固定为单byte `0x00`，存在时固定为`0x01 || u64-BE(parsed_generation)`。最终：
+
+```text
+request_fingerprint = SHA-256(
+  ASCII("cats.api-idempotency.v1") || 0x00 ||
+  frame(UTF8(authenticated_workspace_id)) ||
+  frame(ASCII(canonical_route)) ||
+  frame(raw_path_and_query_bytes) ||
+  frame(if_match_payload) ||
+  frame(raw_body_bytes)
+)
+```
+
+`canonical_route`固定为大写HTTP method、一个ASCII space和router匹配到的route template，例如
+`POST /v1/workspaces/{workspace}/disks`；不是raw path。`raw_path_and_query_bytes`是server收到的原始path及存在时的`?query`，
+保留percent encoding、query顺序和重复参数。`raw_body_bytes`是移除HTTP transfer framing后、JSON解析前的
+完整body。mutation只接受缺席或`identity` Content-Encoding，并在hash前执行route固定body byte cap；超限、
+重复/非法`If-Match`或无法解析为`Generation`的header直接拒绝且不reserve/write result。`If-Match`合法文本的
+不同写法只要解析为同一Generation就使用相同9-byte payload。
+
+`Idempotency-Key`只在row主键中，不进入hash；Authorization、Cookie、request ID、User-Agent和其他不影响
+mutation语义的header也不进入hash。除`If-Match`外，将来任何会改变mutation的header必须先发布新的
+fingerprint domain/version并整体切换，不能在单个route偷偷追加frame。JSON whitespace/key order不同，或
+path/query percent spelling、顺序不同，即使业务解析后等价，也会得到不同fingerprint并安全返回
+`IdempotencyConflict`；server不做语义归一化。
+
+以下fixed vectors中字符串均为所示ASCII/UTF-8 bytes，`if_match_payload`以hex表示：
+
+| vector | workspace | canonical route | raw path-and-query | if_match payload | raw body bytes | expected fingerprint |
+|---|---|---|---|---|---|---|
+| absent If-Match | `ws_01` | `POST /v1/workspaces/{workspace}/disks` | `/v1/workspaces/ws_01/disks` | `00` | `{"durability":"strict","name":"data","size_bytes":1073741824}` | `sha256:5069be7db8918e6a363d4d842224d9437a9eba202965ccc372838579b3b4ecbe` |
+| generation 7 | `ws_01` | `POST /v1/workspaces/{workspace}/disks/{disk}/actions/{verb}` | `/v1/workspaces/ws_01/disks/disk_01/actions/mount?note=a%2Fb` | `010000000000000007` | hex `7b0a2020226361745f6964223a20226361745f3031222c0a2020226d6f756e745f6174223a20222f64617461220a7d` | `sha256:d07a08a0b37fbf5b6ee2022a6561f9441a186d516fd4316c5cce9068401bd6b7` |
 
 ## 4. Lease 接口和状态机
 
@@ -555,15 +636,24 @@ clean-slate cutover 不解析缺少这些字段的旧 pack，也不接受旧裸`
 
 ## 8. ext4 初始化与 mount readiness
 
-PersistentDisk 创建时，Control Store 一次写入：
+### 8.1 PersistentDisk create
 
-```text
-Uninitialized {
-  initialization_token: RandomId128,
-  filesystem_uuid: RandomId128,
-  expected_blank_head: RemoteHead
-}
-```
+PersistentDisk create是同步资源事务，不走Runtime Operation。认证、当前membership/route permission和§3.3
+key reservation通过后，result miss的唯一PostgreSQL事务由server分配永不复用的`disk_id`、`volume_id`、
+`initialization_token`和`filesystem_uuid`，并使用同一次DB now原子写：
+
+- Active + Unowned `VolumeRecord`：请求的immutable size/durability、`lease_epoch=0`、owner/expiry和
+  `last_transition`为null，exact blank `RemoteHead = {generation:0, root_hash:null, root_object_id:null}`；
+- Active `DiskRecord`：相同size/durability/volume、请求name、created_at和
+  `persistent {initialization: uninitialized {token, uuid, expected_blank_head}}`，其中blank head逐字段等于
+  新Volume head；
+- `201 application/json`的exact resource response bytes及同一created_at写入`ApiIdempotencyResult`。
+
+三者全部commit或全部不存在；连接/commit结果不明不能留下无result的单边Disk/Volume。同key重放只返回
+原201 bytes，不读resource；同key异fingerprint冲突。该路径不创建Operation、initialization job或transition
+ledger。RootDisk随Cat create事务写`root {cat_id}`，不伪造Persistent initialization字段。
+
+### 8.2 Initialization CAS
 
 首次 Cold -> Running 在 route admission 打开前执行：
 
@@ -576,13 +666,20 @@ Uninitialized {
    其他结果quarantine。`Initialized`之后永不进入mkfs路径。
 5. 磁盘尚未 mount，没有业务写入。Guest Agent执行设备 flush，Node要求 blockd drain到
    `R == L`，并记录新的exact RemoteHead。
-6. Control Store 以 token、blank predecessor exact head、期望 UUID和新exact RemoteHead做 CAS，转为
-   `Initialized`。相同 token/UUID 重试幂等。
+6. Control Store按`VolumeRecord -> DiskRecord -> current Desired/accepted evidence`固定顺序在一个PG事务
+   锁定并逐字段重验：Persistent role仍为同一Uninitialized token/UUID/blank head，Disk/Volume的immutable
+   size/durability一致，current Desired仍引用同disk/volume、相同size/durability及initialize tuple，accepted evidence绑定当前
+   revision/placement/attachment并证明probe UUID匹配、current Volume head逐字段等于要提交的
+   `initialized_head`，且local/remote generation都等于该head generation（`R == L`）。全部通过后以本事务
+   DB now原子改为`Initialized {same token, uuid, blank head, initialized_head, initialized_at}`；不接受调用方
+   boolean/opaque proof。
 7. Guest Agent mount并回报 device identity、UUID、mount path、read/write状态。只有全部匹配后
    Running 才 Ready并打开 route admission。
 
 初始化阶段即使是 Relaxed volume也必须先达到 `R == L`。否则 Host 丢失后 Control Store 会记得
-UUID，而远端盘仍是空白。
+UUID，而远端盘仍是空白。第6步响应不明时，已是Initialized且token、UUID、blank head和initialized head
+全部相同就返回原`initialized_at`且不改row；任一字段不同、单边状态或不匹配evidence都fail closed并保留
+现状。没有另一条initialization transition记录。
 
 ## 9. 容量不可变
 
@@ -603,7 +700,7 @@ Workspace ownership仍由`DiskRecord`权威持有；产品查询以record的`dis
 
 create、delete和restore都要求非空`Idempotency-Key`。API先验证调用者身份、当前Workspace membership
 和route permission，但不以目标Disk或Snapshot是否仍存在决定重放；随后取得§3的key reservation。
-已有相同fingerprint的result时只返回其不可变outcome，绝不再读或修改Snapshot/Volume；不同
+已有相同fingerprint的result时只返回其不可变status/content-type/body，绝不再读或修改Snapshot/Volume；不同
 fingerprint立即冲突。只有尚无result的首次请求才继续按`VolumeRecord -> DiskRecord(owner Workspace)/
 Cat/Desired -> DiskSnapshotRecord`锁序重验认证Workspace拥有Disk、Disk/volume绑定及各操作前置，并在
 同一commit写业务变化与最终result。跨Workspace miss回滚reservation且不写Operation、result或资源。
@@ -713,10 +810,18 @@ BeginDeleteResult {
 
 - `Control Disk Active -> Deleting(delete_id)`；
 - `VolumeRecord Active + Unowned -> Deleting(delete_id, epoch + 1)`，owner/expiry保持null、head不变；
-- 把完整request/direct result写为`last_transition.begin_delete`。
+- 把完整request/direct result写为`last_transition.begin_delete`；
+- 对显式Disk delete API，把`202 application/json`的exact `BeginDeleteResult` response bytes写入同一
+  `ApiIdempotencyResult`。
 
 `BeginDeleteResult`固定表示Control Disk和Volume都已进入同一`Deleting(request.delete_id)`且Volume
 owner/expiry为null，不重复镜像两个state对象。
+
+显式Disk delete在§3.3 key reservation miss后由server只分配一次`delete_id`并执行上述事务；commit后同步
+返回202，不创建Operation。此后GET Disk在row存在时返回Deleting，completion删除row后返回404；无论对象
+sweep是否已完成、产品GET是否已404，同key同fingerprint都永久重放首次202 bytes，绝不把重试变成404或
+创建第二个Operation。RootDisk删除由其现有Cat lifecycle Operation驱动同一Deleting state，不创建Disk
+Operation。
 
 pure domain要求request的volume/epoch/head与row逐字段相同；它不复制更早release链。当前Active+Unowned
 只能由本规格closed state machine产生，后继验证使用epoch单调、RemoteHead generation非倒退和当前
@@ -791,12 +896,18 @@ event转为Rejoined，使rejoin仍能核对所有派生结果。
 
 ### 11.3 共同清理
 
-1. 只有§11.1或§11.2事务已经证明Control Disk与VolumeRecord都为同一`Deleting(delete_id)`后才进入
-   sweep；此后不能进入新DesiredRuntimeSpec或normal acquire。
-2. Node完整inventory证明所有可达本地资源已按授权处理；失联Host residue由Active event跟踪。
-3. sweeper断言`DiskSnapshotRecord`仍为空，再幂等删除`volumes/<volume-id>/`下的data/maps/commits；
-   它不负责删除Snapshot。
-4. 对象前缀确认为空后，一个PostgreSQL事务再次逐字段比较两边delete ID、Volume
+1. sweeper只按稳定ID分页扫描Control Disk/Volume双方同一`Deleting(delete_id)`的level-triggered状态；
+   不创建job、claim、lease或第二个Operation。§11.1 begin已证明blockd stopped、精确release和`R == L`；
+   §11.2 begin已消费stop/HostFence授权并fence旧epoch。Deleting禁止进入新Desired或normal acquire，
+   因而begin后不存在可合法创建新Root的writer。
+2. Node完整inventory证明所有可达本地资源已按授权处理；失联Host residue由Active event跟踪。sweeper重验
+   `DiskSnapshotRecord`仍为空，再以object adapter的有界分页/list/delete幂等删除
+   `volumes/<volume-id>/`下的data/maps/commits；它不负责删除Snapshot。
+3. 删除请求全部返回后必须重新从prefix起点列举并确认empty；仅“本轮delete成功”、缓存计数、目录缺席或
+   调用方传入的`sweep_complete=true`都不是完成证据。由于writer已在begin事务中关闭且Deleting没有写后继，
+   这个权威prefix-empty reread就是对象面的完成边界。
+4. prefix确认empty后，一个PostgreSQL completion事务按固定锁序重新锁定并逐字段比较两边delete ID、
+   Disk role/admin state/volume binding、zero snapshots、Volume
    `last_transition`、deleting epoch和exact head。normal begin把
    `last_transition.begin_delete.request`复制进`DeleteCompletionReceipt.normal`；disposable begin按Volume中的
    authorization ID marker锁定唯一AuthorizationRecord，并从其
@@ -810,6 +921,11 @@ event转为Rejoined，使rejoin仍能核对所有派生结果。
 已经完整结束、Control Disk和Volume rows已在写receipt的同一commit删除；不增加`owner_cleared`、
 `sweep_complete`或`rows_deleted` bool。相同delete ID只有完整begin request逐字段一致才可在row删除后返回
 原result，同ID异payload返回`StaleTransition`。
+
+任一步失败都保留Deleting供下一轮重试。多个sweeper可以安全地重复同一object delete和empty reread；
+completion只允许一个exact compare/CAS事务提交，后到者看到rows已删除及同一receipt就停止。这里没有
+跨PostgreSQL/object store的两阶段事务：PG Deleting始终是唯一待清理authority，对象操作可重放，最终receipt
+只在empty reread之后的单个PG commit产生。
 
 Host rejoin在rows已删除时，必须把Consumed authorization逐字段匹配receipt：disposable路径要求
 `DeleteCompletionReceipt.disposable_root`的authorization ID和prior attachment等于同一
@@ -848,8 +964,9 @@ tombstone；但只要某个Active HostFenceEvent的Consumed authorization引用�
 3. 一次替换 pack header、data-dir identity、blockd启动参数和status；删除旧 pack parser。
 4. 接入 RuntimeCheckpoint、VolumeIntent/Observation和Node lease executor。
 5. 接入 Guest Agent probe/format/mount和Cold-only API前置条件。
-6. 实现通用`ApiIdempotencyResult`与单一`DiskSnapshotRecord`的原子create/delete、snapshot-aware GC、
-   same-disk restore、Control/Volume原子begin-delete和后置fail-closed sweeper。
+6. 实现唯一byte-level fingerprint与通用`ApiIdempotencyResult`、exact `DiskRecord`、单一
+   `DiskSnapshotRecord`、Persistent create/initialization CAS、snapshot-aware GC、same-disk restore、
+   Control/Volume原子begin-delete和level-triggered fail-closed sweeper。
 7. 接入 HostFenceEvent/takeover与两 revision Cold migration。
 8. 同一发布删除旧 acquire/revoke、hot disk mutation、resize API和无条件 delete路径。
 
@@ -858,6 +975,11 @@ tombstone；但只要某个Active HostFenceEvent的Consumed authorization引用�
 | 场景 | Oracle |
 |---|---|
 | RemoteHead边界 | 只接受`0/null/null`或`>0/non-null/non-null`；hash、object ID、generation任一改变都会使exact compare失败；result/receipt逐字段复制tuple |
+| API fingerprint fixed vectors | 独立实现按五个u64-BE frame重算§3.3两个hash；body key order/whitespace、raw percent spelling/query order或If-Match Generation任一改变都会冲突，Idempotency-Key/auth/cookie/request ID/User-Agent变化不改hash |
+| API result exact replay | hit不读resource并逐字节重放status/content-type/body；动态request ID可变化；request超过route body cap或非identity Content-Encoding在reservation前拒绝，response body超过1MiB则业务/result都不能commit；transport/commit unknown本身不结算失败row，最终只可能业务+result全有或全无 |
+| DiskRecord closed role | Root只含不可变cat ID，Persistent只含两态initialization且仅允许同lineage的一次Uninitialized→Initialized；size/durability/created_at不可变；Available/Bound只从current complete Desired推导，完成删除后row缺席 |
+| Persistent create crash/重放 | Disk + empty exact Volume + 201 result同一PG commit或全无；相同key只返回原201且无Operation，异fingerprint不读resource |
+| initialization CAS/重放 | Volume→Disk→Desired/evidence锁序逐字段验证token/UUID/blank+initialized head/size/R==L；exact Initialized tuple幂等保留首次time，任一冲突零副作用且无ledger |
 | normal acquire响应丢失/异payload | 相同RandomId128且完整request相同返回原result/absolute expiry；同ID异任一字段Stale，不使用domain request hash、不产生第二次fence |
 | lease duration/DB time | 0、非canonical number、DB-now checked-add溢出均零副作用；acquire、renew与takeover都把该次唯一DB-now加duration所得值写为absolute expiry；expiry lapse仍不授予takeover/revoke |
 | expired other owner | normal acquire始终OtherWriter；精确owner/epoch可继续renew |
@@ -874,7 +996,8 @@ tombstone；但只要某个Active HostFenceEvent的Consumed authorization引用�
 | 相同lineage blockd crash | identity、全部pending pack、runtime evidence与当前grant的服务器端acquire marker逐字段绑定同一完整`AcquireOrigin`后，才从pack恢复L并按序publish；任一冲突quarantine |
 | resize请求 | API不存在；`size_bytes` 在Volume/Root/Snapshot中始终一致 |
 | normal acquire与begin-delete并发 | 两者锁同一VolumeRecord且只能一方提交；不存在Control Deleting但Volume仍可acquire的窗口 |
-| delete各步骤crash | begin-delete两边原子进入Deleting；completion只保存exact normal request或disposable authorization/prior attachment及deleting epoch/head；receipt固定表示sweep完成和两row同事务删除，不存bool |
+| Disk delete 202/GET/replay | 首次begin事务原子写双方Deleting及exact 202 result且不建Operation；GET先见Deleting、completion后404，同key始终重放原202 |
+| delete各步骤crash/并发sweeper | 任一失败保留Deleting；多实例只分页扫描level state并幂等delete/re-list empty，只有一个exact completion CAS提交；receipt保存closed begin identity及epoch/head并固定表示两row同事务删除，不存job/claim/opaque bool |
 | disposable Root `R < L` | 固定event/auth/volume/control锁序；closed receipt与两边Deleting原子提交后才删lineage；Volume只存authorization ID marker，PersistentDisk拒绝 |
 | mkfs各步骤crash | 只adopt期望UUID或quarantine；Initialized前R==L |
 | Running磁盘变更 | API拒绝，先Cold；不存在hotplug竞态 |

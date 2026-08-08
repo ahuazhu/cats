@@ -64,11 +64,16 @@ acquire deadline、connect/query/lock/transaction timeout、单批rows/bytes和c
 API mutation先完成调用者认证、当前Workspace membership和route permission检查，再取得
 `(authenticated workspace, canonical route, Idempotency-Key)`的transaction-scoped reservation。
 全局锁DAG是`API key -> HostFenceEvent -> authorization -> VolumeRecord -> Disk/Desired ->
-DiskSnapshotRecord`，不涉及的节点直接跳过，同类多行按稳定ID排序。相同canonical request fingerprint
-只读不可变`ApiIdempotencyResult`，即使目标资源后来已删除也不先查询它；不同fingerprint在资源锁前
+DiskSnapshotRecord`，不涉及的节点直接跳过，同类多行按稳定ID排序。fingerprint唯一使用
+[Volume Authority §3.3](specs/volume-authority.md#33-唯一-api-idempotency-fingerprint)的domain-separated、
+u64-BE length-framed workspace/route/raw path-query/If-Match/raw body bytes；不允许route-local JSON或参数
+归一化。相同fingerprint只读status/content-type/exact response bytes，即使目标资源后来已删除也不先查询它；
+不同fingerprint在资源锁前
 失败。只有result miss才检查当前资源ownership并取得domain locks；跨Workspace miss回滚reservation，
 零持久副作用。首次业务变化与成功/确定性失败result同一commit且不落持久Pending。V1已提交result
-不随resource或Operation删除而GC。
+不随resource或Operation删除而GC。request超过route body cap、非identity Content-Encoding和非法
+If-Match在reservation前拒绝；transport/commit结果不明本身不写失败result，最终事务只允许业务+result
+全有或全无，重试按key判定。
 
 数据库慢或pool饱和时，readiness、队列拒绝和延迟指标必须先于全局超时告警；Running数据面不因
 controller retry而停止。
@@ -96,7 +101,12 @@ heartbeat缺失、AgentSession过期、EC2状态查询或Gateway不可达都只�
 
 HostFenceEvent来源的disposable Root删除在上述锁序后继续锁Control rows；同一事务写Consumed receipt，
 把VolumeRecord和Control Disk改为同一Deleting。对象sweep只能在该提交后执行。普通begin-delete也在
-一个PostgreSQL事务同时改变两边；它与normal acquire锁同一VolumeRecord，只能一方提交。
+一个PostgreSQL事务同时改变两边；显式Disk delete API在该事务持久化exact 202 result且不创建Operation，
+Root继续由现有Cat Operation驱动。begin与normal acquire锁同一VolumeRecord，只能一方提交。
+Deleting rows就是level-triggered工作：sweeper只分页扫描
+current rows，不持久job/claim；它幂等delete并从prefix起点re-list到empty，再以一个事务重验exact
+Disk/Volume/delete/head/epoch/last-transition和zero snapshots，写completion receipt并删除两row。失败保持
+Deleting，多实例只有一个compare/CAS可提交；object store与PG之间没有两阶段事务或第二authority。
 
 旧Host即使恢复供电也持续隔离。它只能以新boot/session进入cordoned rejoin：完成union inventory，
 停止旧VMM/blockd/tap/socket/gate/guard，把旧epoch的`R < L`lineage移入quarantine；随后核对该event
@@ -117,13 +127,15 @@ event行；rejoin取得该锁后再按稳定顺序锁全部授权，所以不会
 必须覆盖：
 
 - Control Plane：PG pool/queue saturation、acquire/query/lock timeout、transaction retry、scan lag、
-  desired-to-observation lag、stale observation拒签、AgentSession conflict、signer active kid；
+  desired-to-observation lag、stale observation拒签、AgentSession conflict、API fingerprint conflict/result replay、
+  signer active kid；
 - Gateway：每replica LRU size/bytes/eviction、hit/miss/expiry、negative/backoff、in-flight keys、
   singleflight waiters/reject、resolve latency/error、typed pre-admission reason、UpstreamUnavailable；
 - Node：Host lock/session、inventory attestation epoch/freshness、checkpoint rebuild、gate Active/Closed、active guards、
   close/drain time、Blocked reason、runtime incarnation、ring version/digest/loaded kids；
 - Storage/lifecycle：逐卷owner/epoch、`R/L` gap、Strict FLUSH、object-store error、Cold fallback、
-  `DataLossPossible`、orphan/quarantine；
+  `DataLossPossible`、orphan/quarantine、Deleting row age、sweeper scan/delete/re-list-empty failure和completion
+  CAS contention；
 - HA：replica/failure-domain count、public probe、fence attempt age/result、replacement/rejoin phase。
 
 告警阈值必须来自部署容量和经验证基线，不能把单次实验数字写成SLA。每个page指向一个按
@@ -138,10 +150,12 @@ runbook；禁止以“重启看看”跳过fence或durability proof。
    AdmissionCell/close race、RequireIdle one-shot、Gateway LRU/singleflight/backoff和PostgreSQL双session
    transaction tests。FakeVmm integration注入慢DB、响应丢失、restart/cancel和HTTP/WS transport歧义。
    [Volume Authority §14](specs/volume-authority.md#14-最小验收矩阵)是同一上线门，必须覆盖acquire/
-   release模糊响应、旧lineage、mkfs crash、snapshot create/result原子提交及lost response、
+   release模糊响应、旧lineage、API fingerprint fixed vectors与raw-byte差异、PersistentDisk
+   create/201原子提交、exact Disk role/init、mkfs/Initialized CAS crash、snapshot create/result原子提交及lost response、
    create→delete→旧create replay不复活、跨Workspace零副作用、`DiskSnapshotRecord`/GC、显式snapshot
-   delete与`SnapshotInUse`、同盘restore只前进一次、普通begin-delete与acquire
-   竞争，以及disposable Root两边Deleting的每个crash点；还要用PostgreSQL双session覆盖authorization
+   delete与`SnapshotInUse`、同盘restore只前进一次、Disk delete 202/Deleting/404/replay、普通begin-delete
+   与acquire竞争、双sweeper/prefix-empty/completion CAS，以及disposable Root两边Deleting的每个crash点；
+   还要用PostgreSQL双session覆盖authorization
    首次consume与Rejoined竞争以及合法后继receipt校验。
 2. **独立native x86_64 Linux build host**：使用现有
    [qualification build host](../deploy/aws/terraform/qualification/build-host/README.md)；controller发布

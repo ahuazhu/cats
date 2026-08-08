@@ -63,8 +63,9 @@ target、full-inventory/Desired读取位置、唯一transition ID、generation�
 只能重放同一request或采用精确的last-transition postcondition，不得从“当前是Unowned”
 猜测成功。blockd验证、renew和publish，但不自行acquire、takeover或增加epoch。
 
-data-dir和pending pack绑定volume、attachment、epoch和acquire transition。相同lineage可以恢复；
-失效或不同lineage只能quarantine。
+data-dir和pending pack绑定volume、attachment、epoch和closed
+`AcquireOrigin = normal {transition_id} | takeover {authorization_id}`。即使ID文本相同，variant不同也不是
+同一lineage；只有identity/pack/runtime evidence逐字段相同才可恢复，其他情况只能quarantine。
 
 ### 4. 磁盘管理先保持Cold-only
 
@@ -75,15 +76,24 @@ hot detach或Running Snapshot。volume 容量创建后不可变，删除现有 r
 
 ### 5. 文件系统初始化必须先远端持久
 
-PersistentDisk UUID在Control Store预定。Guest Agent执行唯一一次mkfs并probe结果；Node在
-Control Store写Initialized前必须使blockd达到`R == L`。正确UUID可以幂等adopt；其他UUID、部分
-格式或模糊且无法证明未执行的状态进入quarantine。
+`DiskRecord`固定保存immutable disk/workspace/name/volume/size/durability/created-at、Active/Deleting与closed
+role：Root只含cat ID，Persistent只含`Uninitialized`或`Initialized`的token/UUID/blank-head lineage。
+Available/Bound只从current complete Desired推导，Deleted由row缺席表示，不再复制产品状态。
+
+Persistent create在一个PG事务原子写empty exact Volume、Uninitialized Disk和201
+`ApiIdempotencyResult`，同步完成且不创建Operation。Guest Agent执行唯一一次mkfs并probe结果；Node在
+Control Store写Initialized前必须使blockd达到`R == L`。初始化事务按Volume→Disk→current
+Desired/accepted evidence锁序逐字段验证token、blank/initialized head、UUID和immutable size后只更新
+Disk的closed initialization variant；完整tuple重试幂等，冲突fail closed，不增加transition ledger。
 
 ### 6. Snapshot产品row就是GC live-root
 
-DiskSnapshot只在Cold/unowned时创建。create、delete和same-disk restore统一使用PostgreSQL
-`ApiIdempotencyResult`：主键是认证Workspace、canonical route和`Idempotency-Key`，绑定canonical请求
-fingerprint与不可变成功/失败结果；同key异payload fail closed。调用者身份、当前Workspace membership
+DiskSnapshot只在Cold/unowned时创建。全部HTTP mutation统一使用PostgreSQL
+`ApiIdempotencyResult`：主键是认证Workspace、canonical route和`Idempotency-Key`；fingerprint固定为
+`SHA-256("cats.api-idempotency.v1" || 0x00 || u64-BE length-framed workspace/route/raw path-query/
+If-Match marker+Generation/raw body)`，不做JSON、path或query语义归一化。row只保存status、可选
+`application/json`、不超过1MiB的exact response bytes和created-at，不另存Operation状态。同key异payload
+fail closed。调用者身份、当前Workspace membership
 和route permission通过后，API先取得该key的transaction-scoped reservation；精确result命中直接返回，
 不依赖目标资源仍存在。只有miss才按`VolumeRecord -> Disk(owner Workspace)/Desired ->
 DiskSnapshotRecord`锁序重验精确disk/volume/snapshot tuple，并在同一事务写业务变化和result。
@@ -101,9 +111,15 @@ Snapshot mutation同步完成，不创建Operation；产品row只表示当前资
 
 普通删除只接受已经`R == L`并精确release且没有live `DiskSnapshotRecord`的Unowned卷。`begin_delete`
 锁VolumeRecord后在同一PostgreSQL事务重验全部前置，并同时把Control Disk和VolumeRecord从Active
-改为同一`Deleting(delete_id)`；normal acquire与它只能一方提交。sweeper在该提交之后断言没有live
-`DiskSnapshotRecord`，
-幂等删除volume对象，最后写`DeleteCompletionReceipt`并同时删除两边metadata。
+改为同一`Deleting(delete_id)`。显式Disk delete API还把exact 202 JSON `BeginDeleteResult`写入通用result
+并同步返回；它不创建Disk Operation。GET在row存在时观察Deleting，完成后404，但key重放始终返回原202。
+Root删除只使用现有Cat lifecycle Operation，不创建第二个Operation。normal acquire与begin只能一方提交。
+
+Deleting rows本身就是level-triggered work。sweeper不建job/claim/opaque proof，只分页扫描Deleting，
+重验snapshot为空，幂等删除volume objects并从prefix起点重新列举到empty；begin已关闭writer，故empty
+是唯一对象完成边界。最后一个PG事务重新锁定并比较exact Disk/Volume/delete/head/epoch/last-transition，
+写`DeleteCompletionReceipt`并同时删除两边metadata。失败保留Deleting，多sweeper只允许一个exact CAS
+提交；这不是跨PG/object的两阶段事务或第二authority。
 completion receipt保存disk/volume/delete、normal exact `BeginDeleteRequest`或disposable authorization/prior
 attachment的closed begin variant、deleting epoch和exact head。owner已清、object sweep完成及两边row已删除
 是该receipt的固定语义，不存bool；因此Host rejoin在row删除后仍能验证同authorization的合法后继。

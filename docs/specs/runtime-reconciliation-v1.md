@@ -433,21 +433,27 @@ Suspended都使用`cancel_and_drain`。不接受缺省transition、boolean `requ
 
 ```text
 ApiIdempotencyResult {
-  authenticated_workspace_id, canonical_route, idempotency_key,
-  request_fingerprint,
-  outcome: Succeeded {http_status, response} | Failed {http_status, typed_error},
-  created_at
+  authenticated_workspace_id: Id,
+  canonical_route: AsciiText,
+  idempotency_key: AsciiText,
+  request_fingerprint: Sha256Digest,
+  http_status: integer 200..=599,
+  content_type: "application/json" | null,
+  response_body: bytes 0..=1048576,
+  created_at: UnixMillis
 }
 ```
 
 `ApiIdempotencyResult`是Control Store逻辑原子性合同，不是Control Plane -> Node共享wire，也不属于本
-规格的Rust F0 codegen集合；其中HTTP response的精确public API schema由对应route定义。本节只冻结其
-replay key、fingerprint、不可变outcome和事务边界，§16.4冻结双方共用的`idempotency_conflict`错误。
+规格的Rust F0 codegen集合；其中`response_body`是对应route当时public API response的exact bytes，不复制
+结构化response或Operation phase/status。本节冻结其replay key、不可变status/content-type/body和事务边界；
+fingerprint唯一使用[Volume Authority §3.3](volume-authority.md#33-唯一-api-idempotency-fingerprint)的
+domain-separated byte-level算法，§16.4冻结双方共用的`idempotency_conflict`错误。
 
 主键是`(authenticated_workspace_id, canonical_route, idempotency_key)`。事务必须先取得该key的
 transaction-scoped reservation并读取result，再取得任何domain资源锁；此前只验证调用者身份、当前
-Workspace membership和route permission，不查询目标资源是否仍存在。同fingerprint重放只返回不可变
-outcome，同key异fingerprint返回`IdempotencyConflict`。只有result miss才检查resource ownership和
+Workspace membership和route permission，不查询目标资源是否仍存在。同fingerprint逐字节重放不可变
+status/content-type/body，同key异fingerprint返回`IdempotencyConflict`。只有result miss才检查resource ownership和
 tuple；跨Workspace miss回滚reservation且零持久副作用。首次执行的业务变化和最终result同一commit，
 不保留持久Pending；无法提交事务时二者都不存在。V1已提交result不因resource或Operation删除而GC。
 
