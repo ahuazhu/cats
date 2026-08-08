@@ -10,7 +10,9 @@ use thiserror::Error;
 use super::admission_port::{
     AdmissionGatePort, AdmissionSnapshot, GatePortError, IdleCloseResult, SnapshotError,
 };
-use super::checkpoint::{CheckpointStoreError, FileCheckpointStore, StoredCheckpoint};
+use super::checkpoint::{
+    CheckpointStoreError, FileCheckpointStore, InstallContinuityStatus, StoredCheckpoint,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PersistTimes {
@@ -161,6 +163,12 @@ pub enum GateReconcileError {
     RouteEpochNotAdvanced(Id),
     #[error("the live AdmissionCell cannot be an exact predecessor of this Endpoint effect")]
     EndpointCellMismatch,
+    #[error("Endpoint {0} already has a different in-session install capability")]
+    InstallContinuityConflict(Id),
+    #[error(
+        "Endpoint {0} lost its in-session install capability; a fresh Desired with a higher route epoch is required"
+    )]
+    FreshRouteEpochRequired(Id),
 }
 
 /// Constructs observation evidence only after the complete checkpoint and the
@@ -345,6 +353,8 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
                 endpoint_id: endpoint_id.clone(),
                 route_epoch: endpoint.route_epoch,
             };
+            let replacement = active_install_snapshot(&prepared, endpoint_id)?;
+            self.arm_install_continuity(&expected, &replacement, endpoint_id)?;
             prepared_storage = self.store.replace(current, &prepared)?;
             &prepared_storage
         };
@@ -357,22 +367,30 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
             endpoint_id: endpoint_id.clone(),
             route_epoch: endpoint.route_epoch,
         };
+        let replacement = AdmissionSnapshot::from_checkpoint(&active_checkpoint)?;
+        let live = self.port.snapshot();
+        if live != replacement {
+            match self
+                .store
+                .install_continuity_status(&live, &replacement, endpoint_id)?
+            {
+                InstallContinuityStatus::Exact => {}
+                InstallContinuityStatus::Missing => {
+                    return Err(GateReconcileError::FreshRouteEpochRequired(
+                        endpoint_id.clone(),
+                    ))
+                }
+                InstallContinuityStatus::Mismatch => {
+                    return Err(GateReconcileError::EndpointCellMismatch)
+                }
+            }
+        }
         let active_storage = if active_checkpoint == *prepared.checkpoint() {
             prepared.clone()
         } else {
             self.store.replace(prepared, &active_checkpoint)?
         };
-        let replacement = AdmissionSnapshot::from_checkpoint(active_storage.checkpoint())?;
-        let live = self.port.snapshot();
         if live != replacement {
-            if !valid_install_predecessor(
-                &live,
-                active_storage.checkpoint(),
-                &replacement,
-                endpoint_id,
-            ) {
-                return Err(GateReconcileError::EndpointCellMismatch);
-            }
             let result = self.port.install_gate(&live, &replacement, endpoint_id);
             let after = self.port.snapshot();
             match result {
@@ -389,7 +407,10 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         let mut completed = active_storage.checkpoint().clone();
         completed.updated_at_unix_ms = times.after_effect;
         advance_endpoint_checkpoint(&mut completed, desired)?;
+        self.arm_next_install_if_any(&replacement, &completed)?;
         let completed = self.store.replace(&active_storage, &completed)?;
+        self.store
+            .clear_install_continuity(&replacement, endpoint_id)?;
         Ok(GateTransitionResult::Installed {
             checkpoint: completed,
         })
@@ -477,7 +498,8 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         let EndpointAction::PrepareChanged { new_binding, .. } = action else {
             return Err(GateReconcileError::WrongEndpointAction(endpoint_id.clone()));
         };
-        if self.port.snapshot() != AdmissionSnapshot::from_checkpoint(closed.checkpoint())? {
+        let predecessor = self.port.snapshot();
+        if predecessor != AdmissionSnapshot::from_checkpoint(closed.checkpoint())? {
             return Err(GateReconcileError::EndpointCellMismatch);
         }
 
@@ -491,6 +513,8 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
             route_epoch: new_binding.route_epoch,
         };
         prepared.updated_at_unix_ms = updated_at;
+        let replacement = active_install_snapshot(&prepared, endpoint_id)?;
+        self.arm_install_continuity(&predecessor, &replacement, endpoint_id)?;
         let prepared = self.store.replace(closed, &prepared)?;
         Ok(GateTransitionResult::EndpointPrepared {
             checkpoint: prepared,
@@ -548,6 +572,7 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
 
         absent_checkpoint.updated_at_unix_ms = updated_at;
         advance_endpoint_checkpoint(&mut absent_checkpoint, desired)?;
+        self.arm_next_install_if_any(&absent, &absent_checkpoint)?;
         let completed = self.store.replace(closed, &absent_checkpoint)?;
         Ok(GateTransitionResult::EndpointRemoved {
             checkpoint: completed,
@@ -836,6 +861,35 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
             gate_closed: true,
             port_error: original_error.or(close_error),
         })
+    }
+
+    fn arm_install_continuity(
+        &self,
+        predecessor: &AdmissionSnapshot,
+        replacement: &AdmissionSnapshot,
+        endpoint_id: &Id,
+    ) -> Result<(), GateReconcileError> {
+        if !self
+            .store
+            .arm_install_continuity(predecessor, replacement, endpoint_id)?
+        {
+            return Err(GateReconcileError::InstallContinuityConflict(
+                endpoint_id.clone(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn arm_next_install_if_any(
+        &self,
+        predecessor: &AdmissionSnapshot,
+        checkpoint: &RuntimeCheckpoint,
+    ) -> Result<(), GateReconcileError> {
+        let ReconcileStep::InstallGate { endpoint_id, .. } = &checkpoint.step else {
+            return Ok(());
+        };
+        let replacement = active_install_snapshot(checkpoint, endpoint_id)?;
+        self.arm_install_continuity(predecessor, &replacement, endpoint_id)
     }
 
     fn expected_transition_snapshot(
@@ -1208,6 +1262,26 @@ fn activate_install_entry(
     Ok(())
 }
 
+fn active_install_snapshot(
+    checkpoint: &RuntimeCheckpoint,
+    endpoint_id: &Id,
+) -> Result<AdmissionSnapshot, GateReconcileError> {
+    let binding = route_entry(checkpoint, endpoint_id)?.binding.clone();
+    if !matches!(
+        &checkpoint.step,
+        ReconcileStep::InstallGate {
+            endpoint_id: saved_endpoint,
+            route_epoch,
+        } if saved_endpoint == endpoint_id && route_epoch == &binding.route_epoch
+    ) {
+        return Err(GateReconcileError::WrongEndpointAction(endpoint_id.clone()));
+    }
+    let mut active = checkpoint.clone();
+    activate_install_entry(&mut active, &binding)?;
+    active.lifecycle_admission = LifecycleAdmission::Open;
+    AdmissionSnapshot::from_checkpoint(&active).map_err(Into::into)
+}
+
 fn valid_close_gate_predecessor(
     live: &AdmissionSnapshot,
     checkpoint: &RuntimeCheckpoint,
@@ -1235,62 +1309,6 @@ fn valid_close_gate_predecessor(
                 live_route == durable_route
             }
         })
-}
-
-fn valid_install_predecessor(
-    live: &AdmissionSnapshot,
-    active_checkpoint: &RuntimeCheckpoint,
-    replacement: &AdmissionSnapshot,
-    endpoint_id: &Id,
-) -> bool {
-    if live.applied_desired_revision() > replacement.applied_desired_revision()
-        || (live.applied_desired_revision() == replacement.applied_desired_revision()
-            && live.spec_digest() != replacement.spec_digest())
-        || live.placement() != replacement.placement()
-        || live.runtime_incarnation() != replacement.runtime_incarnation()
-    {
-        return false;
-    }
-
-    let Some(new_route) = active_checkpoint
-        .route_gates
-        .iter()
-        .find(|route| &route.binding.endpoint_id == endpoint_id)
-    else {
-        return false;
-    };
-    let mut live_index = 0;
-    for durable in &active_checkpoint.route_gates {
-        if &durable.binding.endpoint_id == endpoint_id {
-            if let Some(candidate) = live.endpoints().get(live_index) {
-                if &candidate.binding.endpoint_id == endpoint_id {
-                    let exact_active = candidate == new_route;
-                    let valid_closed_predecessor = candidate.gate == RouteGateState::Closed
-                        && candidate.binding.workspace_id == new_route.binding.workspace_id
-                        && candidate.binding.endpoint_id == new_route.binding.endpoint_id
-                        && candidate.binding.cat_id == new_route.binding.cat_id
-                        && candidate.binding.node_id == new_route.binding.node_id
-                        && candidate.binding.runtime_incarnation
-                            == new_route.binding.runtime_incarnation
-                        && (candidate.binding.route_epoch < new_route.binding.route_epoch
-                            || candidate.binding == new_route.binding);
-                    if !exact_active && !valid_closed_predecessor {
-                        return false;
-                    }
-                    live_index += 1;
-                }
-            }
-            continue;
-        }
-        let Some(candidate) = live.endpoints().get(live_index) else {
-            return false;
-        };
-        if candidate != durable {
-            return false;
-        }
-        live_index += 1;
-    }
-    live_index == live.endpoints().len()
 }
 
 fn advance_endpoint_checkpoint(

@@ -1,8 +1,11 @@
 use std::collections::VecDeque;
+use std::ffi::CString;
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
 
 use cats_api::runtime_reconciliation::{
     decode_runtime_checkpoint, encode_runtime_checkpoint, spec_digest, AppliedDesiredEvidence,
@@ -107,6 +110,93 @@ fn checkpoint_reader_is_bounded_and_fails_closed_on_corruption() {
 }
 
 #[test]
+fn checkpoint_target_fifo_is_rejected_before_open_can_block() {
+    run_checkpoint_open_probe("regular");
+    run_checkpoint_open_probe("fifo");
+    run_checkpoint_open_probe("lock_fifo");
+    run_checkpoint_open_probe("temp_fifo");
+}
+
+#[test]
+fn checkpoint_open_probe_child() {
+    let Ok(root) = std::env::var("CATS_CHECKPOINT_OPEN_PROBE_ROOT") else {
+        return;
+    };
+    let mode = std::env::var("CATS_CHECKPOINT_OPEN_PROBE_MODE").expect("probe mode");
+    let opened = FileCheckpointStore::open(Path::new(&root), &id("cat_01"));
+    if mode == "lock_fifo" {
+        assert!(matches!(
+            opened,
+            Err(CheckpointStoreError::UnsafeEntry { .. })
+        ));
+        return;
+    }
+    let store = opened.expect("open checkpoint store in probe");
+    match mode.as_str() {
+        "regular" | "temp_fifo" => {
+            assert!(store.load().expect("load regular target").is_some())
+        }
+        "fifo" => assert!(matches!(
+            store.load().expect_err("FIFO target must fail closed"),
+            CheckpointStoreError::UnsafeEntry { .. }
+        )),
+        other => panic!("unknown checkpoint open probe mode {other}"),
+    }
+}
+
+fn run_checkpoint_open_probe(mode: &str) {
+    let root = TempDir::new().expect("probe tempdir");
+    let target = root.path().join("cat-cat_01.checkpoint.json");
+    if matches!(mode, "fifo" | "lock_fifo" | "temp_fifo") {
+        let fifo_path = match mode {
+            "fifo" => target.clone(),
+            "lock_fifo" => root.path().join("cat-cat_01.checkpoint.lock"),
+            "temp_fifo" => root.path().join(".cat-cat_01.checkpoint.tmp"),
+            _ => unreachable!("matched FIFO probe mode"),
+        };
+        let target = CString::new(fifo_path.as_os_str().as_encoded_bytes()).expect("FIFO path");
+        // SAFETY: `target` is a live NUL-terminated path for the duration of
+        // the call. `mkfifo` retains no pointer.
+        assert_eq!(unsafe { libc::mkfifo(target.as_ptr(), 0o600) }, 0);
+    }
+    if mode != "fifo" {
+        let desired = desired(
+            1,
+            RuntimeTarget::Running,
+            1,
+            RuntimeTransition::CancelAndDrain,
+        );
+        fs::write(
+            &target,
+            encode_runtime_checkpoint(&running_checkpoint(&desired, 10)).expect("checkpoint wire"),
+        )
+        .expect("write regular checkpoint");
+    }
+
+    let mut child = Command::new(std::env::current_exe().expect("current test binary"))
+        .arg("--exact")
+        .arg("runtime::reconciliation::tests::checkpoint_open_probe_child")
+        .arg("--nocapture")
+        .env("CATS_CHECKPOINT_OPEN_PROBE_ROOT", root.path())
+        .env("CATS_CHECKPOINT_OPEN_PROBE_MODE", mode)
+        .spawn()
+        .expect("spawn checkpoint open probe");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(status) = child.try_wait().expect("poll checkpoint open probe") {
+            assert!(status.success(), "{mode} checkpoint open probe failed");
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill blocked checkpoint open probe");
+            child.wait().expect("reap blocked checkpoint open probe");
+            panic!("{mode} checkpoint open probe exceeded hard deadline");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
 fn every_checkpoint_publish_crash_point_has_a_conservative_visible_state() {
     for stage in [
         WriteStage::TempWritten,
@@ -135,7 +225,7 @@ fn every_checkpoint_publish_crash_point_has_a_conservative_visible_state() {
 
         let visible = store.load().expect("load after crash").expect("target");
         match stage {
-            WriteStage::TempWritten | WriteStage::FileSynced => {
+            WriteStage::Write | WriteStage::TempWritten | WriteStage::FileSynced => {
                 assert_eq!(visible.checkpoint(), original.checkpoint());
             }
             WriteStage::Renamed | WriteStage::DirectorySynced => {
@@ -187,7 +277,7 @@ fn close_effect_is_not_called_when_the_checkpoint_publish_crashes() {
 
         let visible = store.load().expect("load visible target").expect("target");
         match stage {
-            WriteStage::TempWritten | WriteStage::FileSynced => {
+            WriteStage::Write | WriteStage::TempWritten | WriteStage::FileSynced => {
                 assert_eq!(visible.checkpoint(), &source_checkpoint);
             }
             WriteStage::Renamed | WriteStage::DirectorySynced => {
@@ -295,6 +385,99 @@ fn stale_temp_is_never_adopted_and_semantic_target_aba_is_rejected() {
         store.load().expect("load").expect("target").checkpoint(),
         &checkpoint
     );
+}
+
+#[test]
+fn checkpoint_temp_space_is_bounded_across_failures_and_restart() {
+    let root = TempDir::new().expect("tempdir");
+    let desired = desired(
+        1,
+        RuntimeTarget::Running,
+        1,
+        RuntimeTransition::CancelAndDrain,
+    );
+    let checkpoint = running_checkpoint(&desired, 10);
+    let store = store(&root, &desired.cat_id);
+    let mut expected = store.create(&checkpoint).expect("initial checkpoint");
+    let mut replacement = checkpoint.clone();
+    replacement.updated_at_unix_ms = unix_ms(11);
+
+    for stage in [
+        WriteStage::Write,
+        WriteStage::TempWritten,
+        WriteStage::FileSynced,
+    ] {
+        for _ in 0..4 {
+            store.inject_crash_once(stage);
+            assert!(matches!(
+                store
+                    .replace(&expected, &replacement)
+                    .expect_err("injected pre-rename failure"),
+                CheckpointStoreError::InjectedCrash
+            ));
+            assert_checkpoint_temp_bound(root.path());
+        }
+    }
+
+    for _ in 0..4 {
+        let original_wire = encode_runtime_checkpoint(expected.checkpoint()).expect("wire");
+        store.before_publish_once(move |target| {
+            let replacement = target.with_extension("second-cas");
+            fs::write(&replacement, &original_wire).expect("write CAS replacement");
+            fs::rename(replacement, target).expect("replace target before second CAS");
+        });
+        assert!(matches!(
+            store
+                .replace(&expected, &replacement)
+                .expect_err("second CAS must reject target replacement"),
+            CheckpointStoreError::ConcurrentUpdate { .. }
+        ));
+        assert_checkpoint_temp_bound(root.path());
+        expected = store.load().expect("reload target").expect("checkpoint");
+    }
+
+    let deterministic_temp = root.path().join(".cat-cat_01.checkpoint.tmp");
+    fs::write(&deterministic_temp, vec![b'x'; 4096]).expect("write crashed deterministic temp");
+    drop(store);
+    let restarted =
+        FileCheckpointStore::open(root.path(), &desired.cat_id).expect("restart checkpoint store");
+    assert!(
+        !deterministic_temp.exists(),
+        "a new writer session must remove only its exact stale temp basename"
+    );
+    expected = restarted
+        .load()
+        .expect("load after restart")
+        .expect("checkpoint");
+    restarted
+        .replace(&expected, &replacement)
+        .expect("eventual successful replacement");
+    assert_eq!(checkpoint_temp_stats(root.path()), (0, 0));
+}
+
+fn assert_checkpoint_temp_bound(root: &Path) {
+    let (count, bytes) = checkpoint_temp_stats(root);
+    assert!(count <= 1, "checkpoint temp count grew to {count}");
+    assert!(
+        bytes <= RUNTIME_CHECKPOINT_MAX_WIRE_BYTES as u64,
+        "checkpoint temp bytes grew to {bytes}"
+    );
+}
+
+fn checkpoint_temp_stats(root: &Path) -> (usize, u64) {
+    fs::read_dir(root)
+        .expect("read checkpoint directory")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".cat-cat_01.checkpoint.tmp")
+        })
+        .fold((0, 0), |(count, bytes), entry| {
+            let len = entry.metadata().map_or(0, |metadata| metadata.len());
+            (count + 1, bytes.saturating_add(len))
+        })
 }
 
 #[test]
@@ -1755,7 +1938,7 @@ fn endpoint_close_token_publish_crashes_never_reach_the_cell() {
 
         let visible = store.load().expect("load visible").expect("checkpoint");
         match stage {
-            WriteStage::TempWritten | WriteStage::FileSynced => {
+            WriteStage::Write | WriteStage::TempWritten | WriteStage::FileSynced => {
                 assert_eq!(visible.checkpoint().desired_revision, revision(1));
             }
             WriteStage::Renamed | WriteStage::DirectorySynced => {
@@ -1977,6 +2160,324 @@ fn removed_entry_publish_crashes_adopt_only_exact_cell_absence() {
             1
         );
     }
+}
+
+#[test]
+fn restart_cannot_reopen_a_durable_install_step_from_an_all_closed_cell() {
+    let root = TempDir::new().expect("tempdir");
+    let source_desired =
+        running_desired_with_endpoints(1, vec![endpoint("ep_a", "a.example.test", 1, 8080)]);
+    let desired =
+        running_desired_with_endpoints(2, vec![endpoint("ep_a", "a.example.test", 2, 9090)]);
+    let checkpoint = running_checkpoint(&source_desired, 10);
+    let store = store(&root, &source_desired.cat_id);
+    let source = store.create(&checkpoint).expect("source checkpoint");
+    let mut port = FakePort::new(
+        AdmissionSnapshot::from_checkpoint(&checkpoint).expect("snapshot"),
+        store.path(),
+    );
+    port.expected_disk.push_back(DiskMarker::EndpointClosing {
+        revision: revision(2),
+        endpoint_id: id("ep_a"),
+        route_epoch: epoch(1),
+    });
+    let closed = GateSequencer::new(&store, &mut port)
+        .close_gate(&source, &desired, &id("ep_a"), times(20, 21))
+        .expect("close old A");
+    let prepared = GateSequencer::new(&store, &mut port)
+        .prepare_changed_gate(closed.checkpoint(), &desired, &id("ep_a"), unix_ms(22))
+        .expect("prepare new A");
+    let closed_restart_cell =
+        AdmissionSnapshot::from_checkpoint(prepared.checkpoint().checkpoint())
+            .expect("prepared snapshot")
+            .fail_closed();
+    let old_predecessor_restart_cell = port.current.clone().fail_closed();
+
+    drop(port);
+    drop(store);
+
+    let restarted_store = FileCheckpointStore::open(root.path(), &source_desired.cat_id)
+        .expect("restart checkpoint store");
+    let install_step = restarted_store
+        .load()
+        .expect("load after restart")
+        .expect("install checkpoint");
+    let mut restarted_port = FakePort::new(closed_restart_cell.clone(), restarted_store.path());
+    restarted_port
+        .expected_disk
+        .push_back(DiskMarker::Installed {
+            revision: revision(2),
+            endpoint_id: id("ep_a"),
+            route_epoch: epoch(2),
+        });
+    assert!(matches!(
+        GateSequencer::new(&restarted_store, &mut restarted_port)
+            .install_gate(&install_step, &desired, &id("ep_a"), times(23, 24))
+            .expect_err("disk state alone must not authorize InstallGate after restart"),
+        GateReconcileError::FreshRouteEpochRequired(endpoint_id)
+            if endpoint_id == id("ep_a")
+    ));
+    assert_eq!(restarted_port.current, closed_restart_cell);
+    assert!(restarted_port.calls.is_empty());
+    let still_prepared = restarted_store
+        .load()
+        .expect("reload after refused restart install")
+        .expect("prepared checkpoint");
+    assert_eq!(
+        route(still_prepared.checkpoint(), "ep_a").gate,
+        RouteGateState::Closed,
+        "lost continuity must be rejected before the durable gate is marked Active"
+    );
+
+    let mut old_predecessor_port =
+        FakePort::new(old_predecessor_restart_cell.clone(), restarted_store.path());
+    let old_predecessor_error = GateSequencer::new(&restarted_store, &mut old_predecessor_port)
+        .install_gate(&install_step, &desired, &id("ep_a"), times(25, 26))
+        .expect_err("the old Closed predecessor also lost continuity");
+    assert!(
+        matches!(
+            old_predecessor_error,
+            GateReconcileError::FreshRouteEpochRequired(ref endpoint_id)
+                if endpoint_id == &id("ep_a")
+        ),
+        "unexpected old-predecessor error: {old_predecessor_error:?}"
+    );
+    assert_eq!(old_predecessor_port.current, old_predecessor_restart_cell);
+    assert!(old_predecessor_port.calls.is_empty());
+}
+
+#[test]
+fn restart_confirms_an_exact_active_install_postcondition_without_reinstalling() {
+    let root = TempDir::new().expect("tempdir");
+    let source_desired =
+        running_desired_with_endpoints(1, vec![endpoint("ep_a", "a.example.test", 1, 8080)]);
+    let desired =
+        running_desired_with_endpoints(2, vec![endpoint("ep_a", "a.example.test", 2, 9090)]);
+    let checkpoint = running_checkpoint(&source_desired, 10);
+    let store = store(&root, &source_desired.cat_id);
+    let source = store.create(&checkpoint).expect("source checkpoint");
+    let mut port = FakePort::new(
+        AdmissionSnapshot::from_checkpoint(&checkpoint).expect("snapshot"),
+        store.path(),
+    );
+    port.expected_disk.push_back(DiskMarker::EndpointClosing {
+        revision: revision(2),
+        endpoint_id: id("ep_a"),
+        route_epoch: epoch(1),
+    });
+    let closed = GateSequencer::new(&store, &mut port)
+        .close_gate(&source, &desired, &id("ep_a"), times(20, 21))
+        .expect("close old A");
+    let prepared = GateSequencer::new(&store, &mut port)
+        .prepare_changed_gate(closed.checkpoint(), &desired, &id("ep_a"), unix_ms(22))
+        .expect("prepare new A");
+
+    store.inject_crash_once(WriteStage::Renamed);
+    assert!(matches!(
+        GateSequencer::new(&store, &mut port)
+            .install_gate(prepared.checkpoint(), &desired, &id("ep_a"), times(23, 24))
+            .expect_err("leave the durable Active InstallGate postcondition"),
+        GateReconcileError::Checkpoint(CheckpointStoreError::InjectedCrash)
+    ));
+    assert_eq!(
+        port.calls,
+        vec![PortCall::CloseGate(id("ep_a"))],
+        "the injected pre-effect crash must not reach InstallGate"
+    );
+    let active_install = store
+        .load()
+        .expect("load active token")
+        .expect("checkpoint");
+    let active_cell = AdmissionSnapshot::from_checkpoint(active_install.checkpoint())
+        .expect("active install snapshot");
+    assert_eq!(
+        snapshot_route(&active_cell, "ep_a").gate,
+        RouteGateState::Active
+    );
+
+    drop(port);
+    drop(store);
+
+    let restarted_store = FileCheckpointStore::open(root.path(), &source_desired.cat_id)
+        .expect("restart checkpoint store");
+    let active_install = restarted_store
+        .load()
+        .expect("load after restart")
+        .expect("active install checkpoint");
+    let mut restarted_port = FakePort::new(active_cell, restarted_store.path());
+    let installed = GateSequencer::new(&restarted_store, &mut restarted_port)
+        .install_gate(&active_install, &desired, &id("ep_a"), times(25, 26))
+        .expect("confirm exact Active postcondition");
+    assert!(matches!(
+        installed.checkpoint().checkpoint().step,
+        ReconcileStep::Stable {
+            state: StableState::Running
+        }
+    ));
+    assert!(restarted_port.calls.is_empty());
+}
+
+#[test]
+fn same_session_install_retry_requires_the_exact_predecessor() {
+    let root = TempDir::new().expect("tempdir");
+    let source_desired =
+        running_desired_with_endpoints(1, vec![endpoint("ep_a", "a.example.test", 1, 8080)]);
+    let desired =
+        running_desired_with_endpoints(2, vec![endpoint("ep_a", "a.example.test", 2, 9090)]);
+    let checkpoint = running_checkpoint(&source_desired, 10);
+    let store = store(&root, &source_desired.cat_id);
+    let source = store.create(&checkpoint).expect("source checkpoint");
+    let mut port = FakePort::new(
+        AdmissionSnapshot::from_checkpoint(&checkpoint).expect("snapshot"),
+        store.path(),
+    );
+    port.expected_disk.push_back(DiskMarker::EndpointClosing {
+        revision: revision(2),
+        endpoint_id: id("ep_a"),
+        route_epoch: epoch(1),
+    });
+    let closed = GateSequencer::new(&store, &mut port)
+        .close_gate(&source, &desired, &id("ep_a"), times(20, 21))
+        .expect("close old A");
+    let prepared = GateSequencer::new(&store, &mut port)
+        .prepare_changed_gate(closed.checkpoint(), &desired, &id("ep_a"), unix_ms(22))
+        .expect("prepare new A");
+    let exact_predecessor = port.current.clone();
+    port.endpoint_results
+        .push_back(EndpointPortResult::ErrorBefore(GatePortError::Unavailable));
+    port.expected_disk.push_back(DiskMarker::Installed {
+        revision: revision(2),
+        endpoint_id: id("ep_a"),
+        route_epoch: epoch(2),
+    });
+    assert!(matches!(
+        GateSequencer::new(&store, &mut port)
+            .install_gate(prepared.checkpoint(), &desired, &id("ep_a"), times(23, 24))
+            .expect_err("pre-effect error remains retryable in this session"),
+        GateReconcileError::Port(GatePortError::Unavailable)
+    ));
+    let install_step = store
+        .load()
+        .expect("load install token")
+        .expect("checkpoint");
+    assert_eq!(
+        port.calls
+            .iter()
+            .filter(|call| matches!(call, PortCall::Install))
+            .count(),
+        1
+    );
+
+    port.current = AdmissionSnapshot::new(
+        revision(1),
+        digest('a'),
+        exact_predecessor.placement().clone(),
+        exact_predecessor.runtime_incarnation().cloned(),
+        exact_predecessor.lifecycle_admission(),
+        exact_predecessor.endpoints().to_vec(),
+    );
+    assert!(matches!(
+        GateSequencer::new(&store, &mut port)
+            .install_gate(&install_step, &desired, &id("ep_a"), times(25, 26))
+            .expect_err("a lower revision with an arbitrary digest is not the predecessor"),
+        GateReconcileError::EndpointCellMismatch
+    ));
+    assert_eq!(
+        port.calls
+            .iter()
+            .filter(|call| matches!(call, PortCall::Install))
+            .count(),
+        1
+    );
+
+    port.current = exact_predecessor;
+    port.expected_disk.push_back(DiskMarker::Installed {
+        revision: revision(2),
+        endpoint_id: id("ep_a"),
+        route_epoch: epoch(2),
+    });
+    GateSequencer::new(&store, &mut port)
+        .install_gate(&install_step, &desired, &id("ep_a"), times(27, 28))
+        .expect("exact same-session predecessor can retry");
+    assert_eq!(
+        port.calls
+            .iter()
+            .filter(|call| matches!(call, PortCall::Install))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn ambiguous_install_response_is_confirmed_but_restart_cannot_replay_it_closed() {
+    let root = TempDir::new().expect("tempdir");
+    let source_desired =
+        running_desired_with_endpoints(1, vec![endpoint("ep_a", "a.example.test", 1, 8080)]);
+    let desired =
+        running_desired_with_endpoints(2, vec![endpoint("ep_a", "a.example.test", 2, 9090)]);
+    let checkpoint = running_checkpoint(&source_desired, 10);
+    let store = store(&root, &source_desired.cat_id);
+    let source = store.create(&checkpoint).expect("source checkpoint");
+    let mut port = FakePort::new(
+        AdmissionSnapshot::from_checkpoint(&checkpoint).expect("snapshot"),
+        store.path(),
+    );
+    port.expected_disk.push_back(DiskMarker::EndpointClosing {
+        revision: revision(2),
+        endpoint_id: id("ep_a"),
+        route_epoch: epoch(1),
+    });
+    let closed = GateSequencer::new(&store, &mut port)
+        .close_gate(&source, &desired, &id("ep_a"), times(20, 21))
+        .expect("close old A");
+    let prepared = GateSequencer::new(&store, &mut port)
+        .prepare_changed_gate(closed.checkpoint(), &desired, &id("ep_a"), unix_ms(22))
+        .expect("prepare new A");
+    port.endpoint_results
+        .push_back(EndpointPortResult::ErrorAfter(GatePortError::Unavailable));
+    port.expected_disk.push_back(DiskMarker::Installed {
+        revision: revision(2),
+        endpoint_id: id("ep_a"),
+        route_epoch: epoch(2),
+    });
+    store.inject_crash_on_nth(WriteStage::TempWritten, 2);
+    assert!(matches!(
+        GateSequencer::new(&store, &mut port)
+            .install_gate(prepared.checkpoint(), &desired, &id("ep_a"), times(23, 24))
+            .expect_err("crash after ambiguous effect confirmation"),
+        GateReconcileError::Checkpoint(CheckpointStoreError::InjectedCrash)
+    ));
+    assert_eq!(
+        snapshot_route(&port.current, "ep_a").gate,
+        RouteGateState::Active
+    );
+    let active_install = store
+        .load()
+        .expect("load active token")
+        .expect("checkpoint");
+    let restarted_closed = AdmissionSnapshot::from_checkpoint(active_install.checkpoint())
+        .expect("active snapshot")
+        .fail_closed();
+
+    drop(port);
+    drop(store);
+
+    let restarted_store = FileCheckpointStore::open(root.path(), &source_desired.cat_id)
+        .expect("restart checkpoint store");
+    let active_install = restarted_store
+        .load()
+        .expect("load after restart")
+        .expect("active install checkpoint");
+    let mut restarted_port = FakePort::new(restarted_closed.clone(), restarted_store.path());
+    assert!(matches!(
+        GateSequencer::new(&restarted_store, &mut restarted_port)
+            .install_gate(&active_install, &desired, &id("ep_a"), times(25, 26))
+            .expect_err("ambiguous old effect cannot be retried from disk after restart"),
+        GateReconcileError::FreshRouteEpochRequired(endpoint_id)
+            if endpoint_id == id("ep_a")
+    ));
+    assert_eq!(restarted_port.current, restarted_closed);
+    assert!(restarted_port.calls.is_empty());
 }
 
 #[test]

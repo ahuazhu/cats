@@ -4,9 +4,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use cats_api::runtime_reconciliation::{
     checkpoint_content_digest, decode_runtime_checkpoint, encode_runtime_checkpoint, Id,
@@ -14,7 +12,7 @@ use cats_api::runtime_reconciliation::{
 };
 use thiserror::Error;
 
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+use super::admission_port::AdmissionSnapshot;
 
 /// A decoded checkpoint together with the exact filesystem identity that was
 /// observed while reading it.
@@ -60,6 +58,8 @@ pub enum CheckpointStoreError {
     WriterAlreadyActive { path: PathBuf },
     #[error("checkpoint writer serialization lock is poisoned: {path}")]
     WriterSerializationPoisoned { path: PathBuf },
+    #[error("checkpoint session continuity lock is poisoned: {path}")]
+    SessionContinuityPoisoned { path: PathBuf },
     #[cfg(test)]
     #[error("injected checkpoint publication crash")]
     InjectedCrash,
@@ -78,8 +78,13 @@ pub struct FileCheckpointStore {
     directory_path: PathBuf,
     target_name: CString,
     target_path: PathBuf,
+    temporary_name: CString,
+    temporary_path: PathBuf,
     cat_id: Id,
     writer_serialization: Mutex<()>,
+    // Deliberately process-memory-only. Every `open` starts empty, so a disk
+    // checkpoint can never reconstruct authority to reopen an Endpoint gate.
+    install_continuity: Mutex<Vec<InstallContinuity>>,
     #[cfg(test)]
     faults: Mutex<TestFaults>,
 }
@@ -93,9 +98,9 @@ impl FileCheckpointStore {
             .map_err(|source| io_error("create checkpoint directory", directory, source))?;
 
         let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.read(true).custom_flags(
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        );
         let directory_file = options
             .open(directory)
             .map_err(|source| io_error("open checkpoint directory", directory, source))?;
@@ -112,13 +117,16 @@ impl FileCheckpointStore {
 
         let target_file_name = format!("cat-{}.checkpoint.json", cat_id.as_str());
         let lock_file_name = format!("cat-{}.checkpoint.lock", cat_id.as_str());
+        let temporary_file_name = format!(".cat-{}.checkpoint.tmp", cat_id.as_str());
         let target_name = c_string(&target_file_name, directory)?;
         let lock_name = c_string(&lock_file_name, directory)?;
+        let temporary_name = c_string(&temporary_file_name, directory)?;
         let lock_path = directory.join(&lock_file_name);
+        let temporary_path = directory.join(&temporary_file_name);
         let writer_lock = open_at(
             &directory_file,
             &lock_name,
-            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
             0o600,
         )
         .map_err(|source| map_open_error("open checkpoint writer lock", &lock_path, source))?;
@@ -143,14 +151,24 @@ impl FileCheckpointStore {
             return Err(io_error("lock checkpoint writer", &lock_path, source));
         }
 
+        // The held per-Cat lock makes this exact deterministic basename ours.
+        // A crashed predecessor is never opened, inspected, scanned for, or
+        // adopted; unlinkat removes only this one directory-relative entry.
+        unlink_at_if_exists(&directory_file, &temporary_name).map_err(|source| {
+            io_error("remove stale checkpoint temp file", &temporary_path, source)
+        })?;
+
         Ok(Self {
             directory: directory_file,
             _writer_lock: writer_lock,
             directory_path: directory.to_path_buf(),
             target_name,
             target_path: directory.join(target_file_name),
+            temporary_name,
+            temporary_path,
             cat_id: cat_id.clone(),
             writer_serialization: Mutex::new(()),
+            install_continuity: Mutex::new(Vec::new()),
             #[cfg(test)]
             faults: Mutex::new(TestFaults::default()),
         })
@@ -158,6 +176,79 @@ impl FileCheckpointStore {
 
     pub fn path(&self) -> &Path {
         &self.target_path
+    }
+
+    pub(super) fn arm_install_continuity(
+        &self,
+        predecessor: &AdmissionSnapshot,
+        replacement: &AdmissionSnapshot,
+        endpoint_id: &Id,
+    ) -> Result<bool, CheckpointStoreError> {
+        let mut capabilities = self.install_continuity.lock().map_err(|_| {
+            CheckpointStoreError::SessionContinuityPoisoned {
+                path: self.target_path.clone(),
+            }
+        })?;
+        let candidate = InstallContinuity {
+            predecessor: predecessor.clone(),
+            replacement: replacement.clone(),
+            endpoint_id: endpoint_id.clone(),
+        };
+        if capabilities.iter().any(|present| present == &candidate) {
+            return Ok(true);
+        }
+        if capabilities
+            .iter()
+            .any(|present| present.endpoint_id == *endpoint_id)
+            || capabilities.len() >= 256
+        {
+            return Ok(false);
+        }
+        capabilities.push(candidate);
+        Ok(true)
+    }
+
+    pub(super) fn install_continuity_status(
+        &self,
+        predecessor: &AdmissionSnapshot,
+        replacement: &AdmissionSnapshot,
+        endpoint_id: &Id,
+    ) -> Result<InstallContinuityStatus, CheckpointStoreError> {
+        let capabilities = self.install_continuity.lock().map_err(|_| {
+            CheckpointStoreError::SessionContinuityPoisoned {
+                path: self.target_path.clone(),
+            }
+        })?;
+        if capabilities.iter().any(|present| {
+            present.endpoint_id == *endpoint_id
+                && present.predecessor == *predecessor
+                && present.replacement == *replacement
+        }) {
+            Ok(InstallContinuityStatus::Exact)
+        } else if capabilities
+            .iter()
+            .any(|present| present.endpoint_id == *endpoint_id)
+        {
+            Ok(InstallContinuityStatus::Mismatch)
+        } else {
+            Ok(InstallContinuityStatus::Missing)
+        }
+    }
+
+    pub(super) fn clear_install_continuity(
+        &self,
+        replacement: &AdmissionSnapshot,
+        endpoint_id: &Id,
+    ) -> Result<(), CheckpointStoreError> {
+        let mut capabilities = self.install_continuity.lock().map_err(|_| {
+            CheckpointStoreError::SessionContinuityPoisoned {
+                path: self.target_path.clone(),
+            }
+        })?;
+        capabilities.retain(|present| {
+            present.endpoint_id != *endpoint_id || present.replacement != *replacement
+        });
+        Ok(())
     }
 
     /// Reads at most the public wire cap plus one byte before invoking the
@@ -204,14 +295,15 @@ impl FileCheckpointStore {
         let expected_digest = checkpoint_content_digest(checkpoint)?;
 
         self.verify_expected(expected)?;
-        let (temporary_name, temporary_path, mut temporary_file) = self.create_temporary()?;
-        temporary_file
-            .write_all(&bytes)
-            .map_err(|source| io_error("write checkpoint temp file", &temporary_path, source))?;
+        let mut temporary = self.create_temporary()?;
+        self.maybe_crash(WriteStage::Write)?;
+        temporary.file.write_all(&bytes).map_err(|source| {
+            io_error("write checkpoint temp file", &self.temporary_path, source)
+        })?;
         self.maybe_crash(WriteStage::TempWritten)?;
-        temporary_file
-            .sync_all()
-            .map_err(|source| io_error("sync checkpoint temp file", &temporary_path, source))?;
+        temporary.file.sync_all().map_err(|source| {
+            io_error("sync checkpoint temp file", &self.temporary_path, source)
+        })?;
         self.maybe_crash(WriteStage::FileSynced)?;
 
         self.run_before_publish_hook();
@@ -220,11 +312,15 @@ impl FileCheckpointStore {
         self.verify_expected(expected)?;
         rename_at(
             &self.directory,
-            &temporary_name,
+            &self.temporary_name,
             &self.directory,
             &self.target_name,
         )
         .map_err(|source| io_error("publish runtime checkpoint", &self.target_path, source))?;
+        // The temp basename no longer exists as soon as rename succeeds.
+        // Disarm before any later injected or real error so Drop cannot unlink
+        // a subsequent writer's basename.
+        temporary.disarm();
         self.maybe_crash(WriteStage::Renamed)?;
         self.directory.sync_all().map_err(|source| {
             io_error("sync checkpoint directory", &self.directory_path, source)
@@ -265,7 +361,7 @@ impl FileCheckpointStore {
         let file = match open_at(
             &self.directory,
             &self.target_name,
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
             0,
         ) {
             Ok(file) => file,
@@ -323,40 +419,36 @@ impl FileCheckpointStore {
         }))
     }
 
-    fn create_temporary(&self) -> Result<(CString, PathBuf, File), CheckpointStoreError> {
-        let process_id = std::process::id();
-        let clock_nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_nanos());
-        // The name is only a collision reducer; O_EXCL is the authority. A
-        // reused PID or a non-monotonic wall clock can therefore only make a
-        // candidate fail, never overwrite an existing or crashed temp file.
-        for _ in 0..32 {
-            let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let name = format!(
-                ".cat-{}.checkpoint.tmp.{process_id}.{clock_nonce}.{sequence}",
-                self.cat_id.as_str(),
-            );
-            let path = self.directory_path.join(&name);
-            let name = c_string(&name, &self.directory_path)?;
-            match open_at(
-                &self.directory,
-                &name,
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            ) {
-                Ok(file) => return Ok((name, path, file)),
-                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(source) => {
-                    return Err(map_open_error("create checkpoint temp file", &path, source))
-                }
-            }
-        }
-        Err(io_error(
-            "create checkpoint temp file",
-            &self.directory_path,
-            io::Error::new(io::ErrorKind::AlreadyExists, "temporary-name collisions"),
-        ))
+    fn create_temporary(&self) -> Result<TemporaryCheckpoint<'_>, CheckpointStoreError> {
+        unlink_at_if_exists(&self.directory, &self.temporary_name).map_err(|source| {
+            io_error(
+                "remove stale checkpoint temp file",
+                &self.temporary_path,
+                source,
+            )
+        })?;
+        let file = open_at(
+            &self.directory,
+            &self.temporary_name,
+            libc::O_WRONLY
+                | libc::O_CREAT
+                | libc::O_EXCL
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK,
+            0o600,
+        )
+        .map_err(|source| {
+            map_open_error("create checkpoint temp file", &self.temporary_path, source)
+        })?;
+        let temporary = TemporaryCheckpoint {
+            directory: &self.directory,
+            name: &self.temporary_name,
+            file,
+            armed: true,
+        };
+        verify_regular_single_link(&temporary.file, &self.temporary_path)?;
+        Ok(temporary)
     }
 
     #[cfg(not(test))]
@@ -421,8 +513,50 @@ enum ExpectedTarget<'a> {
     Exact(&'a StoredCheckpoint),
 }
 
+/// Exact in-session proof captured from the live AdmissionCell before the
+/// corresponding InstallGate checkpoint is published. This private type has
+/// no wire or persistence representation.
+#[derive(Debug, PartialEq, Eq)]
+struct InstallContinuity {
+    predecessor: AdmissionSnapshot,
+    replacement: AdmissionSnapshot,
+    endpoint_id: Id,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum InstallContinuityStatus {
+    Exact,
+    Missing,
+    Mismatch,
+}
+
+struct TemporaryCheckpoint<'a> {
+    directory: &'a File,
+    name: &'a CStr,
+    file: File,
+    armed: bool,
+}
+
+impl TemporaryCheckpoint<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TemporaryCheckpoint<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // Cleanup is deliberately best-effort in Drop: the deterministic
+            // basename keeps space bounded even if the filesystem itself is
+            // failing, and the next persist/restart retries this exact unlink.
+            let _ = unlink_at_if_exists(self.directory, self.name);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WriteStage {
+    Write,
     TempWritten,
     FileSynced,
     Renamed,
@@ -542,6 +676,24 @@ fn rename_at(
             return Ok(());
         }
         let source = io::Error::last_os_error();
+        if source.kind() != io::ErrorKind::Interrupted {
+            return Err(source);
+        }
+    }
+}
+
+fn unlink_at_if_exists(directory: &File, name: &CStr) -> io::Result<()> {
+    loop {
+        // SAFETY: `directory` and `name` remain live for the call. The name is
+        // directory-relative and NUL-terminated; unlinkat retains no pointer.
+        let result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+        if result == 0 {
+            return Ok(());
+        }
+        let source = io::Error::last_os_error();
+        if source.kind() == io::ErrorKind::NotFound {
+            return Ok(());
+        }
         if source.kind() != io::ErrorKind::Interrupted {
             return Err(source);
         }
