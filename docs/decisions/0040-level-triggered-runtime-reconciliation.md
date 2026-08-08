@@ -40,7 +40,9 @@ DesiredRuntimeSpec(revision, placement)
 1. PostgreSQL 是 DesiredRuntimeSpec、placement、Operation 和`ApiIdempotencyResult`的权威。
 2. MetadataStore 的 owner/epoch/root CAS 是 RWO writer 与 remote durability 的权威。
 3. 带强身份的物理枚举和协议握手决定进程、socket、snapshot、journal 是否存在。
-4. Node checkpoint 只保存 crash recovery 所需的当前步骤和身份，不能推翻物理事实。
+4. 强归属Cat/tombstone的cleanup只由该Cat的RuntimeCheckpoint保存crash recovery所需的
+   当前步骤和身份；无法唯一归属的residue只Quarantine。checkpoint文件自删使用规格中
+   唯一、单槽的NodeCleanupCheckpoint；两种checkpoint都不能推翻物理事实或自行授权cleanup。
 5. Route admission 使用 [ADR-0041](0041-node-verified-route-admission.md) 的本地 gate/guard。
 
 Volume 的精确状态机由 [Volume Authority](../specs/volume-authority.md) 定义；Runtime 只编排
@@ -122,7 +124,9 @@ placement authority；晚到的本地结果绑定精确 incarnation，由下一�
 
 实现不增加通用 effect workflow。各边界只使用自己的最窄条件：
 
-- volume acquire/publish/release 使用 owner/epoch/root CAS；
+- volume acquire/publish/release 使用 owner/epoch/root CAS；release在RuntimeCheckpoint先持久
+  唯一transition ID、generation、disposition与full-inventory/Desired读取绑定，响应丢失只重放
+  同request或核对精确transition postcondition；
 - process/scope/socket 使用 runtime incarnation、start time 和 handshake；
 - NBD/tap 使用完整 inventory 与 checkpoint ownership token；
 - WarmRuntimeSnapshot使用temp identity、文件metadata和VMM postcondition；DiskSnapshot走Volume
@@ -131,6 +135,11 @@ placement authority；晚到的本地结果绑定精确 incarnation，由下一�
   desired revision仍用于reconcile和signer snapshot，不进入Grant serving binding。
 
 planner 的逐步 token、条件和晚到结果处理以 Runtime Reconciliation spec 的表格为准。
+
+standalone scope/socket只在token/path唯一匹配某个Cat checkpoint且当前Desired/tombstone
+仍证实该归属时，才进入该Cat的cleanup step。删除checkpoint文件自身不能由该文件
+充当journal，只能在Deleted tombstone已允许GC后使用Node单槽。单槽只是crash journal，
+不是新authority、queue或per-dispatch本地数据库。
 
 ## Inventory 与稳定服务
 
@@ -141,6 +150,11 @@ heartbeat引用该epoch，只upsert具体Cat，缺项不代表不存在，也不
 同时检查fresh attestation和fresh per-Cat observation，不要求每次heartbeat全量扫描。稳定Running
 用独立、低频、有硬deadline的periodic full scan刷新attestation；失败先Degraded，过期后停止新
 Grant签发而不猜测Quarantine。
+
+Control Plane对当前AgentSession按heartbeat sequence接受observation：大于已接受最高值的新payload
+在一个事务中原子应用；等于且完整payload相同是零新副作用的exact replay；等于但
+payload不同是typed conflict；更小是stale。conflict/stale都不更新observation、freshness、
+attestation或Operation。
 
 全量扫描不完整时 Blocked，不做 cleanup。已经验证并稳定 Running 后，PostgreSQL、
 MetadataStore 或某个 inventory source 的短暂故障是 Degraded：保留当前 VMM 和已验证 admission，
@@ -190,7 +204,8 @@ PersistentDisk不能使用。
 模块依赖如下，开发可以并行，生产启用必须是一次完整 vertical cutover：
 
 1. Control schema：NodeIdentity/AgentSession、完整 Desired/placement、Operation、observation。
-2. Node 基础：Host lock、强进程身份、checkpoint、完整 inventory。
+2. Node 基础：Host lock、强进程身份、per-Cat checkpoint、checkpoint自删的唯一Node单槽、
+   完整 inventory。
 3. Volume Authority：normal acquire 与 HostFenceEvent 派生的逐卷 takeover CAS。
 4. Runtime planner：有界 steps、四态 postconditions、AdmissionCell；Route 实现同时按 ADR-0041
    切换。
@@ -200,6 +215,8 @@ PersistentDisk不能使用。
 [Operations and HA §8](../operations-ha.md#8-首次终态部署)执行一次 clean-slate vertical cutover；
 切换后只有空的新 schema 和一套协议版本，组件版本不匹配直接启动失败。ChunkStore 格式与 Guest
 ABI 可以继续使用，但切换不依赖任何旧数据。
+所有Runtime V1顶层合同都使用同名必填`version: 1`字段和同一严格decoder规则，不保留
+`format_version`或为error/checkpoint定制的版本入口。
 
 ## 后果
 

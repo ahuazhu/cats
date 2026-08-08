@@ -46,8 +46,11 @@ Rejoined先提交后，未消费授权不能首次生效。rejoin校验receipt�
 
 ### 3. Node取得grant，blockd只采用grant
 
-Node在RuntimeCheckpoint记录transition，调用MetadataStore并解析模糊结果，然后把精确
-attachment/epoch交给blockd。blockd验证、renew和publish，但不自行acquire、takeover或增加epoch。
+Node在RuntimeCheckpoint记录acquire/takeover/release transition，调用MetadataStore并解析
+模糊结果，然后把精确attachment/epoch交给blockd。release checkpoint还绑定完整物理
+target、full-inventory/Desired读取位置、唯一transition ID、generation和disposition；响应丢失
+只能重放同一request或采用精确的last-transition postcondition，不得从“当前是Unowned”
+猜测成功。blockd验证、renew和publish，但不自行acquire、takeover或增加epoch。
 
 data-dir和pending pack绑定volume、attachment、epoch和acquire transition。相同lineage可以恢复；
 失效或不同lineage只能quarantine。
