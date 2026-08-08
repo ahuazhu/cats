@@ -136,7 +136,7 @@ planner 的逐步 token、条件和晚到结果处理以 Runtime Reconciliation 
 
 Agent 启动、Host rejoin、adoption、orphan 判断、破坏性 cleanup 和不确定恢复必须先完成全量
 union inventory，期间gate保持Closed。full scan在当前AgentSession下建立单调inventory epoch、
-digest、read position与PostgreSQL accepted_at组成的`AdmissionInventoryAttestation`。普通增量
+digest、read position与PostgreSQL `accepted_at_unix_ms`组成的`AdmissionInventoryAttestation`。普通增量
 heartbeat引用该epoch，只upsert具体Cat，缺项不代表不存在，也不能覆盖attestation。Route signer
 同时检查fresh attestation和fresh per-Cat observation，不要求每次heartbeat全量扫描。稳定Running
 用独立、低频、有硬deadline的periodic full scan刷新attestation；失败先Degraded，过期后停止新

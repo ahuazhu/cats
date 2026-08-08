@@ -9,6 +9,14 @@ heartbeat、long-poll 或普通 GET；正确性不得依赖通知必达、连接
 
 文中的 MUST/MUST NOT 是上线条件。
 
+本文中的schema冻结逻辑domain/wire事实、验证和digest；它不规定SQL表/索引、repository分层、Rust私有
+字段布局或日志格式。V1没有兼容tag、feature flag、任意extension map或未来variant占位。
+
+本规格的共享合同集合是§2的身份/session/attestation、§3的Desired及全部嵌套类型、§5/§10的
+checkpoint/observation/condition物理证据、§12的Operation以及§16的digest/error类型。§3.3的
+`ApiIdempotencyResult`和§9的HostFence/authorization只说明跨authority事务关系；它们分别由public API
+和[Volume Authority](volume-authority.md)冻结，不属于本共享合同集合。
+
 ## 1. 身份与顺序
 
 - `desired_revision`：每 Cat 单调递增、永不复用的 64-bit 正整数。
@@ -24,6 +32,38 @@ heartbeat、long-poll 或普通 GET；正确性不得依赖通知必达、连接
 这些值分别阻止不同的 ABA，不得互相替代。新 revision 不证明旧 Host 已停止；Agent
 restart 不改变 placement；Route TTL 不改变 attachment epoch。
 
+### 1.1 V1 wire 基础类型
+
+本规格中的共享对象都使用 UTF-8 JSON。下表和后文 schema 是 V1 的完整逻辑 wire 合同；数据库可以
+拆表，Rust 可以使用 newtype，但不能改变 wire 值：
+
+| 逻辑类型 | JSON wire 与验证 |
+|---|---|
+| `ContractVersion` | JSON integer；本规格只接受 `1` |
+| `Id` | JSON string；1..=128 个 ASCII bytes，只允许 `[A-Za-z0-9._:-]`，区分大小写，不做 Unicode 归一化 |
+| `AsciiText` | JSON string；1..=512 个 printable ASCII bytes（`0x20..=0x7e`） |
+| `JsonPointer` | 0..=512 个 printable ASCII bytes；必须是空string（根）或合法RFC 6901 pointer |
+| `RandomId128` | 32 个小写十六进制字符，表示非全零16 bytes；不带连字符或`0x` |
+| `NodeBootId` | 把 Host boot UUID 解析为 16 bytes 后按 `RandomId128` 编码 |
+| `Revision` / `Epoch` / `Sequence` | JSON integer `1..=18446744073709551615`；禁止 `0`、负数、浮点数和 JSON string |
+| `U64` | JSON integer `0..=18446744073709551615` |
+| `Generation` | `U64`；只用于volume/local/remote generation |
+| `FenceEpoch` | `U64`；只用于可能从0开始的MetadataStore attachment/lease epoch |
+| `UnixMillis` | JSON integer `0..=9223372036854775807`，从 Unix epoch 起的毫秒；Control Plane freshness 只使用 PostgreSQL 写入的值 |
+| `Sha256Digest` | JSON string `sha256:` 加 64 个小写十六进制字符 |
+| `KeyId` | 64 个小写十六进制字符；等于Ed25519 SubjectPublicKeyInfo DER的SHA-256，不带`sha256:`前缀，以保持Route Grant v2 `kid` wire |
+| `HostPath` | 1..=4096 bytes 的绝对 UTF-8 路径；禁止C0/DEL、`.`/`..` path component和尾随`/`（根目录`/`除外） |
+| `Hostname` | 1..=253 bytes的小写ASCII DNS名；每个label 1..=63且只含`[a-z0-9-]`、首尾为`[a-z0-9]`；禁止端口、路径和尾点 |
+| `Ipv4Address` | 无前导零的 canonical dotted-decimal IPv4，例如 `10.240.0.6` |
+| `MacAddress` | 六组小写十六进制 octet，例如 `02:ca:0a:f0:00:06` |
+
+所有 object 字段都必填；后文写为 `T | null` 的字段也必须出现，并显式编码为 JSON `null`。所有 object
+拒绝未知字段和重复 key。结构化 one-of 使用内部 tag `"kind"`；唯一例外是§16.4
+`ContractErrorDetail`，其`"code"`同时是稳定错误码和union tag。简单无 payload 枚举使用下文列出的
+snake_case JSON string。数组保留 wire 顺序，并按各 schema 指定的稳定 key 严格升序；重复 key、漏排或
+逆序都是`malformed_payload`，接收方不能替调用方重排后接受。字符串不得包含控制字符；除`HostPath`
+和人读`message`允许非ASCII外，共享合同字符串都必须是ASCII。
+
 ## 2. 可信 Node 与 AgentSession
 
 Node 不能用注册请求中的 `node_id` 自证身份。Node 上线前，IaC 或管理员必须先在 Control
@@ -31,14 +71,24 @@ Store 建立：
 
 ```text
 NodeIdentity {
-  node_id,
-  immutable_host_id,
-  credential_id,
-  credential_public_key_hash | provider_principal,
-  state_path_id,
-  state: Provisioned | Retired
+  version: 1,
+  node_id: Id,
+  immutable_host_id: Id,
+  credential_id: Id,
+  credential_binding: CredentialBinding,
+  state_path_id: Id,
+  state: "provisioned" | "retired"
 }
+
+CredentialBinding =
+  { kind: "public_key", public_key_spki_sha256: Sha256Digest }
+| { kind: "provider_principal", provider: Id, principal: AsciiText }
 ```
+
+`credential_binding`是严格one-of；两个variant的字段不能同时出现。`public_key_spki_sha256`覆盖
+SubjectPublicKeyInfo DER，而不是PEM文本。`provider`是adapter的稳定名字，`principal`是该provider
+已经认证的不可变principal ID。`state_path_id`只是provisioner绑定的逻辑ID，不暴露或允许注册请求
+覆盖Host路径。
 
 每个 Node 使用独立 credential。注册端同时验证 credential、`node_id` 和
 `immutable_host_id` 的预置绑定；共享 fleet token、调用方任意指定 `node_id`、仅凭
@@ -51,32 +101,57 @@ Host 级 kernel 排他锁，并核对本地 root-owned identity。命令行更�
 控制面每个 Node 只保存一个当前 session：
 
 ```text
+AgentRegistrationAttempt {
+  version: 1,
+  node_id: Id,
+  immutable_host_id: Id,
+  node_boot_id: NodeBootId,
+  agent_instance_id: RandomId128,
+  registration_attempt_id: RandomId128,
+  expected_agent_session_epoch: Epoch | null
+}
+
 AgentSession {
-  node_id, immutable_host_id, node_boot_id,
-  agent_instance_id, agent_session_epoch,
-  registration_attempt_id, lease_deadline
+  version: 1,
+  node_id: Id,
+  immutable_host_id: Id,
+  node_boot_id: NodeBootId,
+  agent_instance_id: RandomId128,
+  agent_session_epoch: Epoch,
+  registration_attempt_id: RandomId128,
+  lease_deadline_unix_ms: UnixMillis
 }
 ```
+
+首次注册的`expected_agent_session_epoch`必须为`null`；replacement必须是当前精确epoch。同一
+`(node_id, registration_attempt_id)`只能对应一个完整`AgentSession`，payload任一其他字段不同都返回
+`wrong_session`，不能把它当作新attempt。`agent_session_epoch`和`lease_deadline_unix_ms`由Control
+Plane按PostgreSQL时间分配；Agent请求不能提供或延长deadline。
 
 一次成功的全量inventory还为当前session建立独立的签发证明：
 
 ```text
 AdmissionInventoryAttestation {
-  node_id, agent_session_epoch, inventory_epoch,
-  inventory_digest, inventory_read_position, accepted_at
+  version: 1,
+  node_id: Id,
+  agent_session_epoch: Epoch,
+  inventory_epoch: Epoch,
+  inventory_digest: Sha256Digest,
+  inventory_read_position: Sequence,
+  accepted_at_unix_ms: UnixMillis
 }
 ```
 
-`inventory_epoch`在同一session内单调递增，`accepted_at`由PostgreSQL写入。后续partial heartbeat只
-引用该epoch并upsert具体Cat，不能覆盖这条attestation。Route signer同时检查fresh attestation与
-fresh per-Cat observation；不要求每次heartbeat重新做全量scan。
+`inventory_epoch`在同一session内从1单调递增。`inventory_read_position`是该bounded scan开始时
+Control Plane完整assigned-spec读取返回的不可复用服务端位置；full scan必须再读同一位置仍覆盖完整
+集合后才能提交，不能用Node本地时间或目录游标代替。`accepted_at_unix_ms`由PostgreSQL写入。后续
+partial heartbeat只引用该epoch并upsert具体Cat，不能覆盖这条attestation。Route signer同时检查fresh
+attestation与fresh per-Cat observation；不要求每次heartbeat重新做全量scan。
 
 注册步骤如下：
 
-1. Agent 先在 Host lock 下 fsync
-   `AgentRegistrationAttempt {attempt_id, agent_instance_id, node_boot_id,
-   expected_agent_session_epoch?}`，再发 RPC。
-2. `(node_id, attempt_id)` 唯一；同一 attempt 的重复请求返回同一个 session，不重复提高
+1. Agent 先在 Host lock 下 fsync上述完整`AgentRegistrationAttempt`，再发 RPC。
+2. `(node_id, registration_attempt_id)` 唯一；同一 attempt 的重复请求返回同一个 session，不重复提高
    epoch。
 3. 同一 Host 上的新进程先重试本地遗留 attempt，解析上次模糊结果；随后可用精确
    `expected_agent_session_epoch` 和新 attempt 做 CAS replacement。Host lock 证明旧本地进程已退出。
@@ -90,26 +165,59 @@ fresh per-Cat observation；不要求每次heartbeat重新做全量scan。
 ```text
 DesiredRuntimeSpec {
   version: 1,
-  workspace_id,
-  cat_id,
-  desired_revision,
-  target: Running | Suspended | Warm | Cold | Deleted,
-  placement: Assigned {node_id, placement_epoch},
-  runtime: {
-    vcpus, memory_bytes, boot_image_digest,
-    guest_config_digest, network_config
-  },
+  workspace_id: Id,
+  cat_id: Id,
+  desired_revision: Revision,
+  target: "running" | "suspended" | "warm" | "cold" | "deleted",
+  placement: AssignedPlacement,
+  runtime: RuntimeConfig,
   volumes: [VolumeIntent],
   endpoints: [EndpointIntent],
-  transition: CancelAndDrain | RequireIdle {
-    attempt_id, source_revision, source_runtime_incarnation
-  },
-  spec_digest
+  transition: RuntimeTransition,
+  spec_digest: Sha256Digest
 }
+
+AssignedPlacement {
+  kind: "assigned",
+  node_id: Id,
+  placement_epoch: Epoch
+}
+
+RuntimeConfig {
+  vcpus: integer 1..=4294967295,
+  memory_bytes: integer 1..=18446744073709551615,
+  boot_image_digest: Sha256Digest,
+  guest_config_digest: Sha256Digest,
+  network_config: NetworkConfig
+}
+
+NetworkConfig {
+  kind: "isolated_ipv4",
+  network_id: Id,
+  guest_mac: MacAddress,
+  guest_ipv4: Ipv4Address,
+  prefix_length: 30,
+  gateway_ipv4: Ipv4Address
+}
+
+RuntimeTransition =
+  { kind: "cancel_and_drain" }
+| {
+    kind: "require_idle",
+    attempt_id: RandomId128,
+    source_revision: Revision,
+    source_runtime_incarnation: RandomId128
+  }
 ```
 
+V1每Cat使用一个`/30`，`guest_ipv4`与`gateway_ipv4`必须属于同一子网、互不相同且都不是network或
+broadcast address。`guest_mac`必须是locally administered unicast MAC。Host tap名字和ownership token
+是物理inventory事实，不进入Desired；它们由Node分配并通过§10.2 observation闭合。`network_id`是
+该Guest-facing配置的稳定identity，创建后不复用；地址/MAC变化必须使用新`network_id`和新revision。
+
 一个 revision 是完整快照，不读取旧 revision 也能解释。数组按稳定 identity 排序且不能重复；
-`spec_digest` 覆盖除自身外的全部规范化字段。同 revision 不同 digest 是
+`volumes`按`volume_intent_id`、`endpoints`按`endpoint_id`严格升序。`spec_digest`覆盖除自身外的
+全部规范化字段，精确算法见§16。同 revision 不同 digest 是
 `Quarantined(SpecDigestConflict)`。
 
 `placement` 始终存在，并标识负责本 revision 收敛的 Node。Cold 仍保留逻辑 owner，但 Cold
@@ -118,13 +226,54 @@ postcondition 不得依赖该 Host 的运行资源。Deleted 保留最后负责�
 
 ### 3.1 VolumeIntent
 
-`VolumeIntent` 至少包含稳定intent id、`attachment_id`、volume id、不可变`size_bytes`、
-Root/Persistent disposition、RWO access、Strict/Relaxed durability、Guest device identity、
-device slot和：
-
 ```text
-acquire: Normal {transition_id, expected_unowned_epoch}
-       | Takeover {authorization_id}
+VolumeIntent {
+  volume_intent_id: Id,
+  disk_id: Id,
+  volume_id: Id,
+  attachment_id: Id,
+  size_bytes: integer 1..=18446744073709551615,
+  disk_kind: "root" | "persistent",
+  access: "read_write_once",
+  durability: "strict" | "relaxed",
+  guest_device: GuestDeviceIdentity,
+  acquire: VolumeAcquire,
+  disposition: VolumeDisposition,
+  mount: Ext4MountIntent | null
+}
+
+GuestDeviceIdentity {
+  serial: Id,
+  slot: integer 0..=65535
+}
+
+VolumeAcquire =
+  {
+    kind: "normal",
+    transition_id: RandomId128,
+    expected_unowned_epoch: FenceEpoch
+  }
+| { kind: "takeover", authorization_id: Id }
+
+VolumeDisposition =
+  { kind: "retain" }
+| { kind: "detach_retained" }
+| { kind: "delete_disposable_root", delete_id: Id }
+
+Ext4MountIntent {
+  filesystem_uuid: RandomId128,
+  mount_path: HostPath,
+  initialization: FilesystemInitialization
+}
+
+FilesystemInitialization =
+  { kind: "existing" }
+| {
+    kind: "initialize",
+    initialization_token: RandomId128,
+    expected_blank_root: Sha256Digest | null,
+    expected_blank_generation: Generation
+  }
 ```
 
 `Normal` 不能 revoke 其他 owner；同一 transition 的重试返回同一 LeaseGrant。`Takeover` 只
@@ -133,24 +282,16 @@ acquire: Normal {transition_id, expected_unowned_epoch}
 事件本身不授予卷写权限。HostFenceEvent来源的首次消费必须在同一PostgreSQL事务锁event、
 authorization和VolumeRecord，完成卷CAS并写不可变`AuthorizationConsumedReceipt`。
 
-Deleted Desired还为每卷显式声明`DetachRetained`或`DeleteDisposableRoot {delete_id}`。后一种只允许
+`target != "deleted"`时所有volume的disposition必须是`retain`。Deleted Desired为每卷显式声明
+`detach_retained`或`delete_disposable_root`。后一种只允许
 Control Store权威分类的RootDisk；Node停止runtime/blockd并报告精确observation后，Control Plane才
 建立同revision的`DisposableRootDeleteAuthorization`供reconciler查询和消费。PersistentDisk、未知
 分类或stale revision一律不能使用。
 
-需要 Guest mount 的 PersistentDisk 还包含：
-
-```text
-Ext4MountIntent {
-  filesystem_uuid,
-  mount_path,
-  initialization: Existing | Initialize {
-    initialization_token,
-    expected_blank_root,
-    expected_blank_generation
-  }
-}
-```
+RootDisk的`mount`必须为`null`；PersistentDisk的`mount`必须是`Ext4MountIntent`。同一spec内
+`disk_id`、`volume_id`、`attachment_id`、Guest `serial`和`slot`也分别唯一。`filesystem_uuid`在wire
+上使用无连字符的canonical 128-bit文本；`mount_path`不能是`/`。`volume_intent_id`标识该Cat磁盘集合中
+一次逻辑成员关系，创建后不复用；detach后再次加入必须使用新intent和新attachment ID。
 
 `filesystem_uuid` 在 Disk 创建时预定。`Initialize` 只能来自 Control Store 中持久的
 `Uninitialized(token, blank_root, generation)`，不得现场猜测空盘。Guest Agent 只有在 Node
@@ -173,7 +314,17 @@ volume容量创建后不可变；Control Plane、MetadataStore、blockd与Guest�
 
 ### 3.2 Endpoint 与 transition
 
-`EndpointIntent` 至少包含endpoint id、hostname、route epoch、protocol和target port。route epoch
+```text
+EndpointIntent {
+  endpoint_id: Id,
+  hostname: Hostname,
+  route_epoch: Epoch,
+  protocol: "http",
+  target_port: integer 1..=65535
+}
+```
+
+同一spec内`endpoint_id`和`hostname`分别唯一。route epoch
 由Control Store在完整Desired事务中分配；目标非Running时它表达需要关闭的gate。
 
 `RequireIdle` 只用于自动 Running -> Suspended。它就是一个已提交的普通 Desired revision：
@@ -196,6 +347,10 @@ volume容量创建后不可变；Control Plane、MetadataStore、blockd与Guest�
 用户 stop、Node drain、destroy 使用 `CancelAndDrain`：关闭 gate、取消并有界等待 guards；
 超时保留源并报告 Blocked。
 
+`require_idle`只允许`target="suspended"`，且`source_revision < desired_revision`；Control Plane提交时还
+必须compare source revision对应Running和同一`source_runtime_incarnation`。其他transition以及手动
+Suspended都使用`cancel_and_drain`。不接受缺省transition、boolean `require_idle`或额外policy字段。
+
 ### 3.3 提交、placement 与 Operation
 
 所有API mutation共用PostgreSQL：
@@ -208,6 +363,10 @@ ApiIdempotencyResult {
   created_at
 }
 ```
+
+`ApiIdempotencyResult`是Control Store逻辑原子性合同，不是Control Plane -> Node共享wire，也不属于本
+规格的Rust F0 codegen集合；其中HTTP response的精确public API schema由对应route定义。本节只冻结其
+replay key、fingerprint、不可变outcome和事务边界，§16.4冻结双方共用的`idempotency_conflict`错误。
 
 主键是`(authenticated_workspace_id, canonical_route, idempotency_key)`。事务必须先取得该key的
 transaction-scoped reservation并读取result，再取得任何domain资源锁；此前只验证调用者身份、当前
@@ -248,12 +407,18 @@ Node 处理规则：
 
 ```text
 AdmissionCell {
-  applied_desired_revision, spec_digest, placement_epoch, runtime_incarnation?,
+  applied_desired_revision: Revision,
+  spec_digest: Sha256Digest,
+  placement_epoch: Epoch,
+  runtime_incarnation: RandomId128 | null,
   lifecycle_admission: Open | Closed,
   endpoints: Map<endpoint_id, InstalledGate>,
   guards: Map<guard_id, Endpoint(endpoint_id) | Platform>
 }
 ```
+
+这段只定义线性化点必须持有的逻辑事实，不是wire、持久格式或Rust私有容器布局；`InstalledGate`的共享
+binding精确等于§10.2的`RouteGateBinding`。
 
 HTTP/WebSocket和exec/deploy/control都在同一个cell内检查admission并原子取得guard。收到更新的
 非条件desired后，reconciler在cell内推进`applied_desired_revision`。Endpoint-only revision只
@@ -272,17 +437,63 @@ route epochs的系统Desired revision；checkpoint中的旧epoch只能用于识�
 
 ```text
 RuntimeCheckpoint {
-  format_version,
-  cat_id, node_id, placement_epoch,
-  desired_revision, spec_digest,
-  runtime_incarnation?, stable_state?, step,
-  processes_and_scopes,
-  volumes_and_local_paths,
-  snapshot_identity?, route_gates,
-  require_idle_attempt?,
-  current_effect_token?, updated_at
+  format_version: 1,
+  cat_id: Id,
+  node_id: Id,
+  placement_epoch: Epoch,
+  desired_revision: Revision,
+  spec_digest: Sha256Digest,
+  runtime_incarnation: RandomId128 | null,
+  stable_state: "running" | "suspended" | "warm" | "cold" | "deleted" | null,
+  step: ReconcileStep,
+  processes: [ProcessEvidence],
+  volumes: [ObservedVolume],
+  mounts: [ObservedMount],
+  network: ObservedNetwork,
+  warm_snapshot: WarmSnapshotEvidence,
+  lifecycle_admission: "open" | "closed",
+  route_gates: [CheckpointRouteGate],
+  require_idle: RequireIdleCheckpoint,
+  updated_at_unix_ms: UnixMillis
 }
+
+CheckpointRouteGate {
+  endpoint_id: Id,
+  binding: RouteGateBinding,
+  gate: "active" | "closed"
+}
+
+RequireIdleCheckpoint =
+  { kind: "not_applicable" }
+| {
+    kind: "armed",
+    attempt_id: RandomId128,
+    source_revision: Revision,
+    source_runtime_incarnation: RandomId128
+  }
+| {
+    kind: "busy",
+    attempt_id: RandomId128,
+    source_revision: Revision,
+    source_runtime_incarnation: RandomId128,
+    gate_closed: boolean,
+    platform_guards: integer 0..=4294967295,
+    endpoint_guards: [EndpointGuardCount]
+  }
+| {
+    kind: "closed",
+    attempt_id: RandomId128,
+    source_revision: Revision,
+    source_runtime_incarnation: RandomId128
+  }
 ```
+
+数组使用§10的相同排序/唯一性规则；`route_gates`按`endpoint_id`排序。`step`本身携带当前窄effect
+token，不存在另一个任意payload的`current_effect_token`。非`require_idle`Desired必须使用
+`not_applicable`；同一attempt只能从`armed`一次性进入`busy`或`closed`，不得回退或复用。
+直接观察到guard Busy写`busy {gate_closed:false}`；close后的watcher/quiesce失败和restart遇到结果不明
+的`armed`都写`busy {gate_closed:true}`并保持Closed。只有`gate_closed:false`的Busy允许fresh Running
+保留原route epochs。
 
 要求：
 
@@ -443,24 +654,520 @@ receipt含Disk postcondition时Control Disk也必须匹配同一Deleting；两�
 
 ```text
 NodeObservation {
-  node_id, node_boot_id, agent_instance_id, agent_session_epoch,
-  heartbeat_sequence, observed_at,
-  complete_inventory, inventory_epoch, inventory_digest?, inventory_read_position?,
-  key_ring_version, key_ring_digest, loaded_kids,
+  version: 1,
+  observation_id: RandomId128,
+  node_id: Id,
+  node_boot_id: NodeBootId,
+  agent_instance_id: RandomId128,
+  agent_session_epoch: Epoch,
+  heartbeat_sequence: Sequence,
+  observed_at_unix_ms: UnixMillis,
+  complete_inventory: boolean,
+  inventory_epoch: Epoch,
+  inventory_digest: Sha256Digest | null,
+  inventory_read_position: Sequence | null,
+  key_ring_version: Epoch,
+  key_ring_digest: Sha256Digest,
+  loaded_kids: [KeyId],
   runtimes: [ObservedRuntimeStatus]
+}
+
+ObservedRuntimeStatus {
+  cat_id: Id,
+  applied_desired: AppliedDesiredEvidence | null,
+  runtime_incarnation: RandomId128 | null,
+  stable_state: "running" | "suspended" | "warm" | "cold" | "deleted" | null,
+  step: ReconcileStep,
+  checkpoint: CheckpointEvidence,
+  processes: [ProcessEvidence],
+  volumes: [ObservedVolume],
+  mounts: [ObservedMount],
+  network: ObservedNetwork,
+  warm_snapshot: WarmSnapshotEvidence,
+  lifecycle_admission: "open" | "closed",
+  routes: [ObservedRouteGate],
+  platform_guards: integer 0..=4294967295,
+  conditions: [Condition]
+}
+
+AppliedDesiredEvidence {
+  desired_revision: Revision,
+  spec_digest: Sha256Digest,
+  placement: AssignedPlacement,
+  target: "running" | "suspended" | "warm" | "cold" | "deleted"
 }
 ```
 
-runtime status至少包含desired revision/digest、placement epoch、runtime incarnation、稳定状态/
-step、Conditions、进程证据、逐卷owner/epoch/`R/L`、mount与routes/guards。Control Plane只接受
-当前session/instance的递增sequence；Node的`observed_at`不用于排序或freshness。
-`complete_inventory=false`时只upsert报告中列出的Cat，不能按缺项删除，并且不得覆盖当前
-AdmissionInventoryAttestation；true时才可按读取位置和inventory digest对完整集合做residue
-对账并建立新attestation。所有freshness使用PostgreSQL `accepted_at`。
+`applied_desired=null`只允许full inventory发现了无法关联到有效checkpoint/Desired的orphan；它不能
+携带`Ready`，也不能结算Operation。Running/Suspended必须有`runtime_incarnation`；Warm/Cold/Deleted
+必须为`null`。只有§11完整postcondition成立时`stable_state`才非null。
 
-Condition type 是闭集：`Ready`、`Progressing`、`Blocked`、`PreconditionFailed`、`Degraded`、
-`Quarantined`、`DataLossPossible`。Conditions是可并存的集合；reason和evidence使用有类型字段，
-不能按message文本分支。
+Control Plane只接受当前session/instance的递增sequence；Node的`observed_at_unix_ms`不用于排序或
+freshness。`loaded_kids`按`KeyId`升序且无重复，`runtimes`按`cat_id`升序且无重复。
+`complete_inventory=false`时只upsert报告中列出的Cat，不能按缺项删除，并且不得覆盖当前
+AdmissionInventoryAttestation；此时`inventory_digest`和`inventory_read_position`必须都是`null`，
+`inventory_epoch`引用当前已接受attestation。`complete_inventory=true`时两者必须非null，且digest必须
+按§16重算成功，才能按读取位置对完整集合做residue对账并建立新attestation。所有freshness使用
+PostgreSQL `accepted_at_unix_ms`。partial只表示Node级Cat集合不完整；数组中每个
+`ObservedRuntimeStatus`仍是该Cat的完整替换快照，不存在field-level patch语义。
+
+### 10.1 checkpoint 与 step
+
+```text
+CheckpointEvidence =
+  { kind: "missing" }
+| { kind: "corrupt", content_digest: Sha256Digest }
+| {
+    kind: "valid",
+    format_version: ContractVersion,
+    cat_id: Id,
+    node_id: Id,
+    desired_revision: Revision,
+    spec_digest: Sha256Digest,
+    placement_epoch: Epoch,
+    runtime_incarnation: RandomId128 | null,
+    stable_state: "running" | "suspended" | "warm" | "cold" | "deleted" | null,
+    step: ReconcileStep,
+    require_idle: RequireIdleCheckpoint,
+    updated_at_unix_ms: UnixMillis
+  }
+
+ReconcileStep =
+  { kind: "inspect_inventory", inventory_epoch: Epoch }
+| { kind: "stable", state: "running" | "suspended" | "warm" | "cold" | "deleted" }
+| { kind: "close_admission", require_idle_attempt_id: RandomId128 | null }
+| { kind: "acquire_volume", volume_id: Id, attachment_id: Id, acquire: VolumeAcquire }
+| {
+    kind: "prepare_device",
+    volume_id: Id,
+    guest_device: GuestDeviceIdentity,
+    ownership_token: RandomId128
+  }
+| {
+    kind: "format_filesystem",
+    volume_id: Id,
+    attachment_id: Id,
+    filesystem_uuid: RandomId128,
+    initialization_token: RandomId128,
+    expected_blank_root: Sha256Digest | null,
+    expected_blank_generation: Generation
+  }
+| {
+    kind: "drain_initialization",
+    volume_id: Id,
+    attachment_epoch: FenceEpoch,
+    local_generation: Generation,
+    remote_generation: Generation
+  }
+| {
+    kind: "commit_initialized",
+    volume_id: Id,
+    initialization_token: RandomId128,
+    expected_blank_root: Sha256Digest | null,
+    expected_blank_generation: Generation,
+    new_remote_root: Sha256Digest,
+    new_remote_generation: Generation
+  }
+| {
+    kind: "mount_filesystem",
+    volume_id: Id,
+    guest_device: GuestDeviceIdentity,
+    filesystem_uuid: RandomId128,
+    mount_path: HostPath
+  }
+| {
+    kind: "start_runtime",
+    runtime_incarnation: RandomId128,
+    scope_id: Id,
+    process_identity_token: RandomId128
+  }
+| {
+    kind: "drain_publish",
+    volume_id: Id,
+    attachment_epoch: FenceEpoch,
+    local_generation: Generation,
+    remote_generation: Generation
+  }
+| { kind: "pause_runtime", runtime_incarnation: RandomId128, process_start_time_ticks: U64 }
+| {
+    kind: "snapshot_warm_runtime",
+    runtime_incarnation: RandomId128,
+    snapshot_id: Id,
+    temporary_path: HostPath,
+    source_heads: [VolumeHeadEvidence]
+  }
+| {
+    kind: "stop_runtime",
+    runtime_incarnation: RandomId128,
+    process_start_time_ticks: U64,
+    scope_id: Id
+  }
+| { kind: "cleanup_release", target: CleanupTarget }
+| {
+    kind: "delete_disposable_root",
+    authorization_id: Id,
+    delete_id: Id,
+    volume_id: Id,
+    attachment_id: Id,
+    attachment_epoch: FenceEpoch,
+    expected_generation: Generation,
+    expected_root: Sha256Digest | null
+  }
+| { kind: "install_gate", endpoint_id: Id, route_epoch: Epoch }
+| { kind: "quarantined" }
+
+CleanupTarget =
+  { kind: "volume", volume_id: Id, attachment_id: Id, attachment_epoch: FenceEpoch }
+| { kind: "device", volume_id: Id, ownership_token: RandomId128 }
+| { kind: "network", network_id: Id, ownership_token: RandomId128 }
+| { kind: "warm_snapshot", snapshot_id: Id }
+| { kind: "scope", scope_id: Id, process_start_time_ticks: U64 }
+
+VolumeHeadEvidence {
+  volume_id: Id,
+  attachment_epoch: FenceEpoch,
+  generation: Generation,
+  root: Sha256Digest | null
+}
+```
+
+`source_heads`按`volume_id`升序且无重复。`ObservedRuntimeStatus.step`与valid checkpoint中的`step`必须
+逐字段相同；missing/corrupt checkpoint只能处于`inspect_inventory`或`quarantined`。这里的step闭集
+就是§7 planner当前允许的窄effect，不是可扩展workflow或通用command envelope。
+
+### 10.2 物理证据
+
+```text
+ProcessEvidence {
+  role: ProcessRole,
+  process_id: integer 1..=4294967295,
+  process_start_time_ticks: U64,
+  executable_path: HostPath,
+  scope_id: Id,
+  control_socket_path: HostPath,
+  state: "running" | "paused"
+}
+
+ProcessRole =
+  { kind: "vmm", runtime_incarnation: RandomId128 }
+| {
+    kind: "blockd",
+    volume_id: Id,
+    attachment_id: Id,
+    attachment_epoch: FenceEpoch
+  }
+
+ObservedVolume {
+  volume_intent_id: Id | null,
+  disk_id: Id | null,
+  volume_id: Id,
+  disk_kind: "root" | "persistent" | "unknown",
+  authority: VolumeAuthorityEvidence,
+  local_lineages: [LocalVolumeLineage],
+  device: ObservedDevice
+}
+
+VolumeAuthorityEvidence =
+  { kind: "unavailable" }
+| { kind: "absent" }
+| {
+    kind: "unowned",
+    attachment_epoch: FenceEpoch,
+    generation: Generation,
+    remote_root: Sha256Digest | null
+  }
+| {
+    kind: "owned",
+    attachment_id: Id,
+    attachment_epoch: FenceEpoch,
+    generation: Generation,
+    remote_root: Sha256Digest | null
+  }
+| {
+    kind: "deleting",
+    delete_id: Id,
+    attachment_epoch: FenceEpoch,
+    generation: Generation,
+    remote_root: Sha256Digest | null
+  }
+
+LocalVolumeLineage {
+  attachment_id: Id,
+  attachment_epoch: FenceEpoch,
+  acquire_transition_id: Id,
+  node_id: Id,
+  placement_epoch: Epoch,
+  local_durable_generation: Generation,
+  remote_durable_generation: Generation,
+  data_directory: HostPath,
+  pending_pack_count: U64,
+  fenced: boolean,
+  state: "active" | "released" | "quarantined"
+}
+
+ObservedDevice =
+  { kind: "absent" }
+| {
+    kind: "kernel_nbd",
+    guest_device: GuestDeviceIdentity,
+    device_path: HostPath,
+    ownership_token: RandomId128
+  }
+| {
+    kind: "vhost_user_blk",
+    guest_device: GuestDeviceIdentity,
+    socket_path: HostPath,
+    ownership_token: RandomId128
+  }
+
+ObservedMount {
+  volume_id: Id,
+  guest_device: GuestDeviceIdentity,
+  filesystem_uuid: RandomId128,
+  mount_path: HostPath,
+  access: "read_write" | "read_only"
+}
+
+ObservedNetwork =
+  { kind: "absent" }
+| {
+    kind: "isolated_ipv4",
+    network_id: Id,
+    guest_mac: MacAddress,
+    guest_ipv4: Ipv4Address,
+    prefix_length: 30,
+    gateway_ipv4: Ipv4Address,
+    tap_name: Id,
+    ownership_token: RandomId128
+  }
+
+WarmSnapshotEvidence =
+  { kind: "absent" }
+| {
+    kind: "present",
+    snapshot_id: Id,
+    runtime_incarnation: RandomId128,
+    path: HostPath,
+    file_size_bytes: U64,
+    file_digest: Sha256Digest,
+    source_heads: [VolumeHeadEvidence],
+    durable_rename_complete: boolean
+  }
+
+ObservedRouteGate {
+  endpoint_id: Id,
+  binding: RouteGateBinding,
+  gate: "active" | "closed",
+  active_guards: integer 0..=4294967295,
+  cancellation_pending: boolean
+}
+
+RouteGateBinding {
+  workspace_id: Id,
+  endpoint_id: Id,
+  hostname: Hostname,
+  cat_id: Id,
+  node_id: Id,
+  runtime_incarnation: RandomId128,
+  route_epoch: Epoch,
+  protocol: "http",
+  target_port: integer 1..=65535
+}
+```
+
+`processes`按`(role.kind, role中的稳定ID, process_id)`、`volumes`按`volume_id`、每卷
+`local_lineages`按`(attachment_epoch, attachment_id)`、`mounts`按`(volume_id, mount_path)`、`routes`
+按`endpoint_id`严格升序且各自无重复。`local_durable_generation >= remote_durable_generation`。
+`disk_kind="unknown"`时`volume_intent_id`和`disk_id`都必须为`null`，否则两者都必须非null。process
+只有在scope、start time和control-socket handshake都已验证并与`role`精确一致时才能进入数组；仅看到
+PID或文件名不构成`ProcessEvidence`。
+
+### 10.3 Condition 闭集
+
+```text
+Condition =
+  { kind: "ready", reason: ReadyReason }
+| { kind: "progressing", reason: ProgressingReason }
+| { kind: "blocked", reason: BlockedReason }
+| { kind: "precondition_failed", reason: PreconditionFailureReason }
+| { kind: "degraded", reason: DegradedReason }
+| { kind: "quarantined", reason: QuarantineReason }
+| { kind: "data_loss_possible", reason: DataLossReason }
+
+ReadyReason =
+  {
+    kind: "postcondition_satisfied",
+    target: "running" | "suspended" | "warm" | "cold" | "deleted"
+  }
+
+ProgressingReason = { kind: "reconcile_step", step: ReconcileStep }
+
+InventorySource = "checkpoint" | "systemd" | "process" | "control_socket"
+                | "block_frontend" | "network" | "data_directory"
+                | "pending_pack" | "warm_snapshot" | "metadata_store" | "guest_mount"
+
+BlockedReason =
+  { kind: "incomplete_inventory", unavailable_sources: [InventorySource] }
+| {
+    kind: "superseded_by_another_node",
+    volume_id: Id,
+    owner_node_id: Id,
+    attachment_id: Id,
+    attachment_epoch: FenceEpoch
+  }
+| {
+    kind: "active_guards",
+    platform_guards: integer 0..=4294967295,
+    endpoint_guards: [EndpointGuardCount]
+  }
+| { kind: "volume_authority_unavailable", volume_ids: [Id] }
+| {
+    kind: "remote_durability_lag",
+    volume_id: Id,
+    attachment_epoch: FenceEpoch,
+    local_generation: Generation,
+    remote_generation: Generation
+  }
+| { kind: "authorization_unavailable", volume_id: Id, authorization_id: Id }
+| { kind: "host_rejoin_pending", host_fence_event_id: Id }
+| { kind: "control_plane_unavailable", last_desired_revision: Revision | null }
+| {
+    kind: "key_ring_unavailable",
+    expected_version: Epoch,
+    expected_digest: Sha256Digest,
+    loaded_version: Epoch | null,
+    loaded_digest: Sha256Digest | null
+  }
+
+EndpointGuardCount { endpoint_id: Id, active_guards: integer 1..=4294967295 }
+
+PreconditionFailureReason =
+  {
+    kind: "busy",
+    attempt_id: RandomId128,
+    gate_closed: boolean,
+    platform_guards: integer 0..=4294967295,
+    endpoint_guards: [EndpointGuardCount]
+  }
+| {
+    kind: "must_be_cold",
+    observed_state: "running" | "suspended" | "warm" | "cold" | "deleted" | null
+  }
+| {
+    kind: "placement_rejected",
+    node_id: Id,
+    placement_epoch: Epoch,
+    reason: "insufficient_vcpus" | "insufficient_memory" | "unsupported_block_path"
+          | "unsupported_network" | "unsupported_guest_capability"
+  }
+
+DegradedSource = "control_store" | "metadata_store" | "checkpoint" | "systemd"
+               | "process" | "control_socket" | "block_frontend" | "network"
+               | "data_directory" | "pending_pack" | "warm_snapshot" | "guest_mount"
+
+DegradedReason =
+  {
+    kind: "source_unavailable",
+    sources: [DegradedSource],
+    since_unix_ms: UnixMillis
+  }
+| {
+    kind: "attestation_refresh_failed",
+    inventory_epoch: Epoch,
+    since_unix_ms: UnixMillis
+  }
+
+QuarantineReason =
+  {
+    kind: "spec_digest_conflict",
+    desired_revision: Revision,
+    expected_digest: Sha256Digest,
+    observed_digest: Sha256Digest
+  }
+| { kind: "checkpoint_corrupt", content_digest: Sha256Digest }
+| {
+    kind: "runtime_identity_conflict",
+    expected_incarnation: RandomId128,
+    observed_incarnations: [RandomId128]
+  }
+| { kind: "duplicate_runtime", observed_incarnations: [RandomId128] }
+| {
+    kind: "process_identity_conflict",
+    role: ProcessRole,
+    process_ids: [integer 1..=4294967295]
+  }
+| {
+    kind: "volume_identity_conflict",
+    volume_id: Id,
+    expected_attachment_id: Id,
+    expected_attachment_epoch: FenceEpoch,
+    observed_attachment_id: Id,
+    observed_attachment_epoch: FenceEpoch
+  }
+| {
+    kind: "local_lineage_conflict",
+    volume_id: Id,
+    data_directory: HostPath,
+    expected_attachment_id: Id,
+    observed_attachment_id: Id | null
+  }
+| {
+    kind: "local_lineage_corrupt",
+    volume_id: Id,
+    data_directory: HostPath,
+    problem: "identity_missing" | "pending_pack_gap" | "pending_pack_corrupt"
+  }
+| {
+    kind: "duplicate_writer",
+    volume_id: Id,
+    observed_attachments: [AttachmentIdentity]
+  }
+| {
+    kind: "filesystem_identity_conflict",
+    volume_id: Id,
+    expected_filesystem_uuid: RandomId128,
+    observed_filesystem_uuid: RandomId128 | null
+  }
+| { kind: "unknown_persistent_disk", volume_id: Id, data_directory: HostPath | null }
+| {
+    kind: "warm_snapshot_conflict",
+    snapshot_id: Id,
+    expected_digest: Sha256Digest,
+    observed_digest: Sha256Digest | null
+  }
+| {
+    kind: "route_gate_conflict",
+    endpoint_id: Id,
+    expected_binding: RouteGateBinding,
+    observed_binding: RouteGateBinding
+  }
+
+AttachmentIdentity {
+  attachment_id: Id,
+  attachment_epoch: FenceEpoch
+}
+
+DataLossReason =
+  {
+    kind: "remote_tail_unavailable",
+    volume_id: Id,
+    attachment_id: Id,
+    attachment_epoch: FenceEpoch,
+    local_generation: Generation,
+    remote_generation: Generation,
+    host_fence_event_id: Id
+  }
+```
+
+`InventorySource`、source列表、ID列表、guard列表、incarnation列表和PID列表都按wire值升序且无重复；
+`observed_attachments`按`(attachment_epoch, attachment_id)`升序，长度必须`>= 2`且identity互不相同。
+`unavailable_sources`、`sources`、`volume_ids`、`duplicate_runtime.observed_incarnations`和
+`process_identity_conflict.process_ids`都非空，后两者至少两个元素。所有
+`remote_durability_lag`/`remote_tail_unavailable`必须满足`local_generation > remote_generation`；
+`active_guards`必须至少有一个非零platform或Endpoint guard。
+Conditions可并存，但`kind="ready"`每个runtime至多一个，其他Condition按
+`(kind, reason.kind, canonical evidence bytes)`升序且不允许逐字节重复。V1不得增加string-only reason、
+任意JSON evidence或按message文本分支；新物理故障语义需要先修改本闭集。
 
 - Blocked 是可重试前置条件，Operation 保持 Pending。
 - PreconditionFailed 是该 revision 的终态；例如 RequireIdle Busy 使 Operation Failed。
@@ -489,10 +1196,73 @@ Condition type 是闭集：`Ready`、`Progressing`、`Blocked`、`PreconditionFa
 
 ## 12. Operation 与 placement 闭环
 
-Operation phase：Pending、Succeeded、Failed、Superseded。
+Operation是用户可见的revision结算记录，不是Node step journal。V1完整逻辑schema是：
+
+```text
+Operation {
+  version: 1,
+  operation_id: Id,
+  workspace_id: Id,
+  cat_id: Id,
+  desired_revision: Revision,
+  desired_spec_digest: Sha256Digest,
+  placement: AssignedPlacement,
+  target: "running" | "suspended" | "warm" | "cold" | "deleted",
+  phase: "pending" | "succeeded" | "failed" | "superseded",
+  terminal: OperationTerminal | null,
+  created_at_unix_ms: UnixMillis,
+  updated_at_unix_ms: UnixMillis
+}
+
+OperationTerminal =
+  {
+    kind: "succeeded",
+    result: OperationSuccess,
+    completed_at_unix_ms: UnixMillis
+  }
+| {
+    kind: "failed",
+    error: OperationFailure,
+    completed_at_unix_ms: UnixMillis
+  }
+| {
+    kind: "superseded",
+    superseded_by_revision: Revision,
+    superseded_by_operation_id: Id,
+    completed_at_unix_ms: UnixMillis
+  }
+
+OperationSuccess {
+  observation_id: RandomId128,
+  node_id: Id,
+  agent_session_epoch: Epoch,
+  heartbeat_sequence: Sequence,
+  observed_target: "running" | "suspended" | "warm" | "cold" | "deleted",
+  runtime_incarnation: RandomId128 | null
+}
+
+OperationFailure =
+  { kind: "precondition_failed", reason: PreconditionFailureReason }
+| {
+    kind: "host_lost",
+    node_id: Id,
+    agent_session_epoch: Epoch,
+    host_fence_event_id: Id
+  }
+| { kind: "quarantined", reason: QuarantineReason }
+| { kind: "contract_error", error: ContractErrorDetail }
+```
+
+`phase="pending"`时`terminal`必须为`null`；其他phase必须携带同名`kind`的terminal。Succeeded的
+`observed_target`必须等于Operation `target`；Running/Suspended result的`runtime_incarnation`必须非null，
+Warm/Cold/Deleted必须为null。Superseded的revision必须更大，且不能引用自身Operation。时间只能单调
+前进：`updated_at_unix_ms >= created_at_unix_ms`，terminal completion等于`updated_at_unix_ms`。
+`contract_error`只允许当前已提交Desired自身的`unsupported_version`或`malformed_payload`；stale/wrong
+session、revision、digest或placement只拒绝那次输入，绝不能终结当前Operation。
 
 - 只有 `operation.desired_revision == observation.desired_revision == current desired`，并同时
-  匹配 placement 与完整 postcondition，才能 Succeeded。
+  匹配`desired_spec_digest`、完整`AssignedPlacement`与postcondition，才能 Succeeded；result保存实际
+  结算的observation/session/sequence，不复制可变observation内容。
 - 新 revision 在同一事务把旧 Pending Operation 变为 Superseded。
 - PreconditionFailed、永久请求错误、HostLost 或 Quarantined 使当前 Pending Operation Failed。
 - Progressing、Blocked、Degraded 和暂时离线保持 Pending。
@@ -553,3 +1323,200 @@ HostFenceEvent上的隔离lineage由event/rejoin记录继续跟踪，关联的au
 目标 schema 只包含本合同的 NodeIdentity、AgentSession、Desired、Operation、observation 与
 attestation；exact release 不含 NodeJob、heartbeat overwrite 或旧 ledger 恢复入口；空 fleet 的
 Node 必须先完成 session 注册和 complete empty inventory，才允许任何 Running Desired。
+
+## 16. Canonical encoding、digest 与跨组件错误
+
+### 16.1 Cats Canonical JSON v1
+
+三个V1 digest都使用同一确定性编码，不依赖Rust struct声明顺序或`serde_json::Map`实现：
+
+1. 先按本规格完成全部类型、范围、one-of、排序和唯一性验证；无效对象没有digest。
+2. object key按其UTF-8 bytes无符号字典序升序；array保持schema要求的已验证顺序。
+3. 不输出空白。输出固定token `null`、`true`、`false`；integer用最短十进制文本，零只编码为`0`，
+   禁止`-0`、指数、浮点和前导零。
+4. string以`"`包围；`"`和`\`分别编码为`\"`和`\\`，U+0008/U+000C/U+000A/U+000D/U+0009分别
+   使用`\b`/`\f`/`\n`/`\r`/`\t`，其他U+0000..U+001F使用小写`\u00xx`；其余Unicode scalar直接
+   输出UTF-8，不转义`/`，不做Unicode归一化。
+5. digest bytes是`ASCII(domain_separator) || 0x00 || UTF8(canonical_json)`；算法固定SHA-256。
+   wire使用`Sha256Digest`格式。比较digest使用解码后的32 bytes常量时间比较。
+
+任何实现即使使用普通serde类型，也必须显式执行以上canonical writer；不能把默认JSON object顺序、
+pretty JSON或数据库JSONB导出直接拿来hash。
+
+### 16.2 三个 digest 输入
+
+| digest | domain separator | canonical JSON输入 |
+|---|---|---|
+| `spec_digest` | `cats.runtime.desired-spec.v1` | 完整`DesiredRuntimeSpec`删除且仅删除顶层`spec_digest`字段；`version`保留 |
+| `inventory_digest` | `cats.runtime.inventory.v1` | 下述`InventoryDigestInput` |
+| `key_ring_digest` | `cats.runtime.key-ring.v1` | 下述`KeyRingDigestInput` |
+
+```text
+InventoryDigestInput {
+  version: 1,
+  node_id: Id,
+  node_boot_id: NodeBootId,
+  agent_instance_id: RandomId128,
+  agent_session_epoch: Epoch,
+  inventory_epoch: Epoch,
+  inventory_read_position: Sequence,
+  runtimes: [InventoryRuntimeEvidence]
+}
+
+InventoryRuntimeEvidence {
+  cat_id: Id,
+  applied_desired: AppliedDesiredEvidence | null,
+  runtime_incarnation: RandomId128 | null,
+  stable_state: "running" | "suspended" | "warm" | "cold" | "deleted" | null,
+  step: ReconcileStep,
+  checkpoint: CheckpointEvidence,
+  processes: [ProcessEvidence],
+  volumes: [ObservedVolume],
+  mounts: [ObservedMount],
+  network: ObservedNetwork,
+  warm_snapshot: WarmSnapshotEvidence,
+  lifecycle_admission: "open" | "closed",
+  routes: [ObservedRouteGate],
+  platform_guards: integer 0..=4294967295
+}
+
+KeyRingDigestInput {
+  version: 1,
+  key_ring_version: Epoch,
+  loaded_kids: [KeyId]
+}
+```
+
+`InventoryRuntimeEvidence`是`ObservedRuntimeStatus`删除且仅删除`conditions`后的逐字段投影；排序规则
+不变。`NodeObservation`的observation ID、heartbeat sequence、Node时间、`complete_inventory`、key ring
+字段不进入inventory digest。`KeyRingDigestInput.loaded_kids`与observation中的数组逐字节相同。这样
+诊断Condition或heartbeat重发不会伪造新的物理inventory，而session、epoch、read position或任一物理
+事实变化都会改变digest。
+
+### 16.3 fixed vectors
+
+以下code block内每个canonical JSON都是一行ASCII bytes，末尾没有newline。
+
+**Desired spec vector**的hash输入domain为`cats.runtime.desired-spec.v1`：
+
+```json
+{"cat_id":"cat_01","desired_revision":7,"endpoints":[{"endpoint_id":"ep_01","hostname":"app.example.test","protocol":"http","route_epoch":9,"target_port":8080}],"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"runtime":{"boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","guest_config_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","memory_bytes":2147483648,"network_config":{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","prefix_length":30},"vcpus":2},"target":"cold","transition":{"kind":"cancel_and_drain"},"version":1,"volumes":[{"access":"read_write_once","acquire":{"expected_unowned_epoch":0,"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_id":"att_01","disk_id":"disk_root","disk_kind":"root","disposition":{"kind":"retain"},"durability":"strict","guest_device":{"serial":"cats-root","slot":0},"mount":null,"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"workspace_id":"ws_01"}
+```
+
+```text
+spec_digest = sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409
+```
+
+**Empty full inventory vector**的hash输入domain为`cats.runtime.inventory.v1`：
+
+```json
+{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"inventory_epoch":4,"inventory_read_position":12,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","runtimes":[],"version":1}
+```
+
+```text
+inventory_digest = sha256:81105374fe1984eb2eb5180c9cc58e9367f6d537098f77f51d66ee56192a0b7e
+```
+
+**Two-key ring vector**的hash输入domain为`cats.runtime.key-ring.v1`：
+
+```json
+{"key_ring_version":5,"loaded_kids":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"version":1}
+```
+
+```text
+key_ring_digest = sha256:7881e60fd2e5dfa2fda716f560d6f124a7defd6c06b9d23c1038c42471cc8000
+```
+
+实现测试必须逐字节断言canonical JSON和digest，另测object输入key顺序变化不改变结果、数组逆序/重复
+被拒绝、`spec_digest`自身变化不进入其输入，以及任一被覆盖字段变化都会改变digest。
+
+### 16.4 跨组件 typed errors
+
+所有runtime contract边界使用同一错误对象：
+
+```text
+ContractError {
+  error: ContractErrorDetail,
+  message: string 0..=1024 UTF-8 bytes
+}
+
+SessionBinding {
+  node_id: Id,
+  node_boot_id: NodeBootId,
+  agent_instance_id: RandomId128,
+  agent_session_epoch: Epoch
+}
+
+ContractErrorDetail =
+  {
+    code: "stale_session",
+    node_id: Id,
+    presented_agent_session_epoch: Epoch,
+    current_agent_session_epoch: Epoch
+  }
+| {
+    code: "wrong_session",
+    expected: SessionBinding,
+    presented: SessionBinding
+  }
+| {
+    code: "stale_revision",
+    cat_id: Id,
+    presented_revision: Revision,
+    current_revision: Revision
+  }
+| {
+    code: "wrong_revision",
+    cat_id: Id,
+    expected_revision: Revision,
+    presented_revision: Revision
+  }
+| {
+    code: "revision_digest_conflict",
+    cat_id: Id,
+    desired_revision: Revision,
+    expected_digest: Sha256Digest,
+    presented_digest: Sha256Digest
+  }
+| {
+    code: "wrong_placement",
+    cat_id: Id,
+    desired_revision: Revision,
+    expected: AssignedPlacement,
+    presented: AssignedPlacement
+  }
+| {
+    code: "unsupported_version",
+    contract: ContractName,
+    supported_version: 1,
+    presented_version: integer 0..=18446744073709551615
+  }
+| {
+    code: "malformed_payload",
+    contract: ContractName,
+    json_pointer: JsonPointer,
+    problem: "missing_field" | "unknown_field" | "duplicate_field" | "invalid_type"
+           | "invalid_value" | "duplicate_identity" | "non_canonical_order"
+  }
+| {
+    code: "idempotency_conflict",
+    authenticated_workspace_id: Id,
+    canonical_route: AsciiText,
+    idempotency_key: AsciiText,
+    expected_request_fingerprint: Sha256Digest,
+    presented_request_fingerprint: Sha256Digest
+  }
+
+ContractName = "node_identity" | "agent_registration_attempt" | "agent_session"
+             | "admission_inventory_attestation" | "desired_runtime_spec"
+             | "node_observation" | "operation"
+```
+
+`message`只供人读，接收方只能按`error.code`及typed payload分支。`json_pointer`使用RFC 6901文本，根
+对象是空string。解析/验证优先级固定为：JSON语法/重复key/大小上限 -> object字段与primitive类型 ->
+`version` -> 字段值和数组排序/唯一性 -> session -> revision -> digest -> placement。presented session
+epoch小于current返回`stale_session`；epoch相同但boot/instance不匹配，或presented epoch更大，返回
+`wrong_session`。Desired delivery中revision小于current返回`stale_revision`；精确结算要求不相等时
+返回`wrong_revision`；revision相同而digest不同返回`revision_digest_conflict`。node ID或placement
+epoch任一不匹配都返回`wrong_placement`。这些错误都不得推进checkpoint、结算Operation或产生物理
+副作用。

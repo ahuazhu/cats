@@ -41,7 +41,7 @@ Signer在一个PostgreSQL transaction snapshot中重新闭合Endpoint binding、
 placement和current AgentSession。该session必须有fresh `AdmissionInventoryAttestation`；最新
 per-Cat accepted observation引用同一inventory epoch，并报告applied revision、runtime incarnation、
 platform Ready、installed Endpoint gate，且active signer `kid`属于`loaded_kids`。两类freshness都使用
-PostgreSQL `accepted_at`。partial heartbeat不能覆盖full attestation。任一事实不成立就不签发；
+PostgreSQL `accepted_at_unix_ms`。partial heartbeat不能覆盖full attestation。任一事实不成立就不签发；
 Node自报时间、旧observation、未来revision和lookup index单独读取都不能授权。
 
 Endpoint A的mutation创建新desired revision时，只提高A的route epoch并关闭/drain A；binding和

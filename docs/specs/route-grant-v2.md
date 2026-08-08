@@ -47,8 +47,8 @@ claims 的逻辑形态：
 | `iss` | 精确为 `cats-control-plane` |
 | `aud` | 精确为 `cats-node-agent`，不接受额外 audience |
 | identities | 非空且长度有界；必须与本地期望逐字节相等 |
-| `hostname` | 共享规范化函数产生的小写 ASCII hostname；无端口、路径或尾点 |
-| `runtime_incarnation` | 128-bit identity 的规范文本，精确匹配当前 VMM |
+| `hostname` | Runtime Reconciliation v1 `Hostname`；小写ASCII DNS名，无端口、路径或尾点 |
+| `runtime_incarnation` | Runtime Reconciliation v1 `RandomId128`（32个小写十六进制字符），精确匹配当前 VMM |
 | `route_epoch` | 正整数，精确匹配Endpoint serving gate；close后重开必须更大 |
 | `protocol` | v2 只允许 `http`；WebSocket 是该 HTTP route 的 upgrade |
 | `target_port` | `1..=65535`，精确匹配 gate；请求不能覆盖 |
@@ -102,9 +102,11 @@ revision，必须走全局close-and-drain；之后重开全部受影响Endpoint�
 3. 当前`AgentSession`精确属于该node、Host/boot/agent instance；
 4. 该session有fresh `AdmissionInventoryAttestation {inventory_epoch, inventory_digest,
    inventory_read_position,
-   accepted_at}`；它来自accepted full scan，后续partial heartbeat不能覆盖；
+   accepted_at_unix_ms}`；它来自accepted full scan，完整schema与digest算法以
+   [Runtime Reconciliation v1](runtime-reconciliation-v1.md) §2/§16为准，
+   后续partial heartbeat不能覆盖；
 5. 最新per-Cat accepted observation属于该session、引用同一inventory epoch，且其PostgreSQL
-   `accepted_at`足够新；freshness只使用数据库时间，不信Node上报时钟；
+   `accepted_at_unix_ms`足够新；freshness只使用数据库时间，不信Node上报时钟；
 6. observation 的 applied revision、placement、runtime incarnation、Running/Ready condition 与
    desired 完全一致；
 7. observation 报告同Endpoint gate Active、同route epoch/protocol/port；
@@ -261,7 +263,9 @@ Node-to-Gateway 内部结果是闭集；公开响应不得泄漏 identity：
 
 Signer 每一时刻只使用一个 active private key；Node 使用有界、版本化 public-key ring。ring 更新
 必须完整验证后原子 swap；加载失败的 Node 不 Ready并保持 admission Closed。heartbeat/
-observation 报告 AgentSession、ring version、sorted digest 和 `loaded_kids`。
+observation 报告AgentSession、ring version、按
+[Runtime Reconciliation v1 §16](runtime-reconciliation-v1.md)计算的`key_ring_digest`和已排序
+`loaded_kids`。
 
 普通 rotation 顺序固定：
 
