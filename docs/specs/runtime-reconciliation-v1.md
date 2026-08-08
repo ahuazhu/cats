@@ -1766,7 +1766,6 @@ OperationFailure =
     host_fence_event_id: Id
   }
 | { kind: "quarantined", reason: QuarantineReason }
-| { kind: "contract_error", error: ContractErrorDetail }
 ```
 
 `phase="pending"`时`terminal`必须为`null`；其他phase必须携带同名`kind`的terminal。Succeeded的
@@ -1781,9 +1780,11 @@ standalone `Operation` decode/validation还必须逐字段要求
 `/terminal/error/node_id`、`/terminal/error/reason/node_id`或
 `/terminal/error/reason/placement_epoch`的
 `malformed_payload {problem:"invalid_value"}`，不能等到observation settlement才发现。
-standalone decoder只允许`contract_error.error.code`为`unsupported_version`或`malformed_payload`；它是否
-确实来自当前已提交Desired，要在§16.4.3通过revision/digest/placement后验证。stale/wrong session、
-stale/conflicting observation sequence、revision、stored digest或placement只拒绝那次输入，绝不能终结
+`contract_error`不是`OperationFailure` variant。完整Desired在与Operation同事务提交前已经通过同一
+§16.4.1 decoder；Node或任意row不能用自报ContractError把Operation变为Failed。standalone Operation若携带
+该旧tag，按closed union的unknown discriminator返回指向`/terminal/error/kind`的`invalid_value`且零副作用。
+顶层`ContractError`合同继续用于边界请求拒绝，不是Operation terminal。stale/wrong session、
+stale/conflicting observation sequence、revision、stored digest或placement也只拒绝那次输入，绝不能终结
 当前Operation。
 
 - 结算时必须先从`NodeObservation.runtimes`选出唯一
@@ -1812,7 +1813,7 @@ stale/conflicting observation sequence、revision、stored digest或placement只
   中的十进制数值位置。多个condition候选按§16.4逻辑path选择；同一reason两字段都不等时选择`node_id`。
   该拒绝作用于整份observation且零副作用，不能写入一个与Operation placement不一致的terminal reason。
 - 新 revision 在同一事务把旧 Pending Operation 变为 Superseded。
-- PreconditionFailed、永久请求错误、HostLost 或 Quarantined 使当前 Pending Operation Failed。
+- PreconditionFailed、HostLost 或 Quarantined 使当前 Pending Operation Failed。
 - Progressing、Blocked、Degraded 和暂时离线保持 Pending。
 
 N+2 达到同名状态不能结算 N。observation 不写 Desired；所有用户和系统 placement 变更都走
@@ -2186,6 +2187,18 @@ PreconditionFailed PlacementRejected reason的`node_id`、`placement_epoch`和�
 必须接受。stale session与placement_rejected mismatch并存时必须先返回session error，且不读取或结算
 Operation。
 
+Context-bound conflict selector tests必须覆盖：两个Cat同时revision或digest冲突时，即使Store反向返回rows，
+也固定选择较小`cat_id`；同一Cat的Operation和applied revision同时冲突、digest同时冲突时都固定选择
+Operation source，并用mock断言不读取/比较后一source。presented revision小于current返回stale、大于current
+返回wrong；revision与digest、digest与placement同时冲突时分别只报告更早stage。交换任意JSON member顺序不
+改变typed payload；placement仍按Operation、applied、顶层Node的既有顺序，并在首错后停止后续Cat/Store读取。
+
+`contract_error`移除测试必须把旧OperationFailure tag送入standalone decoder，断言
+`malformed_payload {problem:"invalid_value", json_pointer:"/terminal/error/kind"}`；在NodeObservation
+Condition伪造同名tag也必须按closed union拒绝且整份observation零副作用。重建的current完整Desired正常通过
+F0时Operation保持Pending，不能采用Node自报error；完整row缺失、无法canonical encode或重放失败时按既有
+corruption安全规则Quarantine且不写terminal。顶层`ContractError`的既有serde/version/error vectors继续通过。
+
 decoder/validator contract tests必须直接覆盖§16.4的统一pipeline：
 
 - Transport：invalid UTF-8和invalid JSON都返回根pointer；超限array在第`maximum + 1`项之后仍放置非法
@@ -2453,22 +2466,42 @@ revision/spec的digest mismatch都不能伪造`revision_digest_conflict`payload�
 特别地，`CheckpointEvidence.valid`只携带checkpoint projection，不携带完整`RuntimeCheckpoint`，所以其
 `content_digest`只能由Node读取完整文件后验证，不是self-digest规则。
 
+Control Store中的完整Desired在与Operation同一事务提交前已经通过§16.4.1。若后来无法从该current完整row
+重建等价canonical wire，或重建后不再通过同一decoder，这是Control Store corruption：保持Operation
+Pending、关闭相关gates并按既有规则Quarantine，不能落盘Node自报的`contract_error` terminal，也不新增raw
+Desired ledger、error receipt或旁路证明。
+
 非Observation边界的`wrong_placement.expected/presented`就是该边界实际比较的两份完整
 `AssignedPlacement`，不能为填充错误payload构造虚假placement。
 
-Observation settlement中，`expected`固定为current Desired的完整`AssignedPlacement`；在前述
-session/sequence/revision/stored digest检查通过后，对有current Pending Operation的runtime按
-`runtimes.cat_id`升序选择第一个placement冲突。错误的`cat_id`和`desired_revision`取该runtime对应的
-current Desired；`presented`使用下列specific priority构造：
+NodeObservation settlement的revision、stored spec digest和placement三个stage共用同一外层选择：只遍历
+`runtime.applied_desired != null`且该Cat有current Pending Operation的runtime；每个stage都独立从
+`runtimes.cat_id`最小项开始扫描，整个revision stage无冲突后才能重新从最小Cat进入digest，整个digest
+stage无冲突后才能进入placement。没有current Pending Operation的Cat不参与settlement选择；对于settlement
+index标记为有Pending Operation的Cat，对应current Desired或Operation row缺失是Control Store invariant
+破坏，必须fail closed且不伪造下列typed error。每个runtime内先比较current Desired与Operation binding，再比较
+current Desired与`runtime.applied_desired`；一旦选中候选，不得读取、比较或报告同runtime的后一来源、后续
+Cat或后续stage。
 
-1. `Operation.placement != expected`：取完整`Operation.placement`；
-2. 否则`runtime.applied_desired.placement != expected`：取完整applied placement；
-3. 否则顶层`NodeObservation.node_id != expected.node_id`：取
-   `{kind:"assigned", node_id: NodeObservation.node_id, placement_epoch: expected.placement_epoch}`。
+- **revision**：`expected_revision = current Desired.desired_revision`。先取
+  `Operation.desired_revision`，不等即为`presented_revision`；只有相等时才读取并比较
+  `runtime.applied_desired.desired_revision`。首个candidate小于expected返回`stale_revision`，大于expected
+  返回`wrong_revision`；error的`cat_id`和current/expected revision均来自该Cat current Desired。
+- **stored spec digest**：只有全部revision binding通过后才执行。
+  `expected_digest = current Desired.spec_digest`；先比较`Operation.desired_spec_digest`，相等后才比较
+  `runtime.applied_desired.spec_digest`。首个不等返回
+  `revision_digest_conflict {cat_id, desired_revision:current Desired.desired_revision, expected_digest,
+  presented_digest:selected source}`。
+- **placement**：只有全部digest binding通过后才执行，`expected = current Desired.placement`。依次选择
+  `Operation.placement`、`runtime.applied_desired.placement`，最后比较顶层`NodeObservation.node_id`；前两者
+  使用完整不等placement，顶层Node不等时构造
+  `{kind:"assigned", node_id:NodeObservation.node_id, placement_epoch:expected.placement_epoch}`作为
+  `presented`。首个不等返回该Cat/current revision的`wrong_placement`。
 
-任一上述错误都拒绝整个NodeObservation，不得推进checkpoint、接受observation/attestation、更新freshness、
-结算任何Operation或产生物理副作用。placement通过后才执行§12的PlacementRejected settlement binding；其
-specific pointer保持不变。stale session与该reason mismatch并存时先返回session error且不读取Operation。
+Store查询返回顺序和JSON object member输入顺序都不参与选择。任一上述错误都拒绝整个NodeObservation，
+不得推进checkpoint、接受observation/attestation、更新freshness、结算任何Operation或产生物理副作用。
+placement通过后才执行§12的PlacementRejected settlement binding；其specific pointer保持不变。stale
+session与该reason mismatch并存时先返回session error且不读取Operation。
 
 `AgentRegistrationAttempt`没有可先验证的current session，因此保留§2的端点specific replay顺序：先按
 `(node_id, registration_attempt_id)`查找已提交attempt；命中且binding不同返回
