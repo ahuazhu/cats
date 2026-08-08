@@ -58,6 +58,10 @@ restart 不改变 placement；Route TTL 不改变 attachment epoch。
 | `Ipv4Address` | 无前导零的 canonical dotted-decimal IPv4，例如 `10.240.0.6` |
 | `MacAddress` | 六组小写十六进制 octet，例如 `02:ca:0a:f0:00:06` |
 
+所有上述逻辑integer及schema内直接写出的非负integer范围都只接受raw JSON number token
+`0|[1-9][0-9]*`，再检查各自逻辑域；decoder必须保留或等价检查原始number lexeme，不能让JSON库先把
+`1.0`、`1e0`或`-0`归一化为integer。完整错误分类和stage见§16.4。
+
 所有 object 字段都必填；后文写为 `T | null` 的字段也必须出现，并显式编码为 JSON `null`。所有 object
 拒绝未知字段和重复 key。结构化 one-of 使用内部 tag `"kind"`；唯一例外是§16.4
 `ContractErrorDetail`，其`"code"`同时是稳定错误码和union tag。简单无 payload 枚举使用下文列出的
@@ -80,6 +84,7 @@ V1的值只能是`1`；顶层不存在`format_version`或按合同名变化的ve
 
 接收方必须在分配或解析完整JSON前执行顶层wire byte上限。byte数是收到的完整UTF-8 JSON octet数，
 不含HTTP framing；恰好等于上限合法。超过上限返回§16.4 `limit_exceeded {limit:"wire_bytes"}`。
+该错误的`json_pointer`固定为根空string，`observed_at_least`固定为`maximum + 1`。
 
 | 顶层合同 | 最大wire bytes |
 |---|---:|
@@ -1776,9 +1781,10 @@ standalone `Operation` decode/validation还必须逐字段要求
 `/terminal/error/node_id`、`/terminal/error/reason/node_id`或
 `/terminal/error/reason/placement_epoch`的
 `malformed_payload {problem:"invalid_value"}`，不能等到observation settlement才发现。
-`contract_error`只允许当前已提交Desired自身的`unsupported_version`或`malformed_payload`；stale/wrong
-session、stale/conflicting observation sequence、revision、digest或placement只拒绝那次输入，
-绝不能终结当前Operation。
+standalone decoder只允许`contract_error.error.code`为`unsupported_version`或`malformed_payload`；它是否
+确实来自当前已提交Desired，要在§16.4.3通过revision/digest/placement后验证。stale/wrong session、
+stale/conflicting observation sequence、revision、stored digest或placement只拒绝那次输入，绝不能终结
+当前Operation。
 
 - 结算时必须先从`NodeObservation.runtimes`选出唯一
   `runtime.cat_id == Operation.cat_id`的`ObservedRuntimeStatus`，且`runtime.applied_desired`非`null`。
@@ -1951,6 +1957,8 @@ Node 必须先完成 session 注册和 complete empty inventory，才允许任�
 
 任何实现即使使用普通serde类型，也必须显式执行以上canonical writer；不能把默认JSON object顺序、
 pretty JSON或数据库JSONB导出直接拿来hash。
+canonical writer不能替decoder“修正”非canonical number；任何`1.0`、`1e0`、`-0`或负数必须先按§16.4
+拒绝，不能归一化后参与digest。
 
 ### 16.2 Digest 输入
 
@@ -1960,6 +1968,14 @@ pretty JSON或数据库JSONB导出直接拿来hash。
 | `CheckpointEvidence.valid.content_digest` | `cats.runtime.checkpoint-content.v1` | 完整`RuntimeCheckpoint`，不删除任何字段 |
 | `inventory_digest` | `cats.runtime.inventory.v1` | 下述`InventoryDigestInput` |
 | `key_ring_digest` | `cats.runtime.key-ring.v1` | 下述`KeyRingDigestInput` |
+
+这四种digest中，同一顶层payload同时携带完整projection和claim的self-digest只有第1/3/4行，即
+`DesiredRuntimeSpec.spec_digest`、complete `NodeObservation.inventory_digest`和non-null
+`NodeObservation.key_ring_digest`；它们在context-free decoder内重算。`RuntimeCheckpoint`本身只产生
+checkpoint content digest而不携带claim；`CheckpointEvidence.valid.content_digest`、
+`AdmissionInventoryAttestation.inventory_digest`、`RuntimeCheckpoint.spec_digest`、
+`AppliedDesiredEvidence.spec_digest`和`Operation.desired_spec_digest`都缺少同payload完整projection，必须在
+§16.4.3与文件或stored context验证。
 
 ```text
 InventoryDigestInput {
@@ -2170,16 +2186,34 @@ PreconditionFailed PlacementRejected reason的`node_id`、`placement_epoch`和�
 必须接受。stale session与placement_rejected mismatch并存时必须先返回session error，且不读取或结算
 Operation。
 
-negative tests还必须覆盖route gate外层`endpoint_id`作为unknown field被拒绝、
-`runtime_identity_conflict`单个different identity合法、只有expected identity非法、`duplicate_runtime`少于
-两个different identity非法，以及invalid UTF-8、invalid JSON、duplicate field、invalid type/value按§16.4
-优先级返回且前两者pointer为空。pointer边界测试必须覆盖unknown key、member中的`~`/`/`分别转义为
-`~0`/`~1`、转义后恰好512 bytes仍返回精确pointer，以及原key未超限但转义后超过512 bytes时固定返回
-根空string且绝不截断。decoder确定性还必须覆盖：交换object member输入顺序不改变所选错误；同一payload
-各自包含多个unknown、duplicate、missing或type错误时选择固定逻辑path；array index 2和10同时错误时选择
-数值较小的2；超限array在第`maximum + 1`项之后的非法JSON、duplicate key、unknown field或invalid type仍按
-更高阶段返回，而不是提前返回`array_items`；多个长escaped pointer候选先按未转义逻辑path选择，再测试
-恰好512和超过512时的精确pointer/root fallback。
+decoder/validator contract tests必须直接覆盖§16.4的统一pipeline：
+
+- Transport：invalid UTF-8和invalid JSON都返回根pointer；超限array在第`maximum + 1`项之后仍放置非法
+  JSON、duplicate key、unknown/missing field、invalid type和unknown discriminator，验证所有更早stage先于
+  `array_items`且decoder不保留无界items。同一payload放多个duplicate key并交换member顺序，必须固定选择
+  logical path最小的`duplicate_field`。
+- Union schema：在schema-reachable nested union放unknown tag，并分别在payload其他位置放duplicate key、
+  non-union missing和union-field-set外unknown key，依次验证duplicate/schema错误先于tag；unknown tag与同一
+  union的variant-specific missing/type并存时固定返回tag `invalid_value`且不猜variant；valid outer variant的
+  missing与其可达nested unknown tag并存时也由更早tag substage获胜。交换所有object member顺序不改变
+  code/problem/pointer。
+- Scalar：每类unsigned integer至少测试非number、`1.0`、`1e0`、`-0`、负数、逻辑域边界及十进制overflow；
+  前者为`invalid_type`，其余无效number为精确field `invalid_value`。另保留route gate外层`endpoint_id`
+  unknown；`runtime_identity_conflict`单个different identity合法、只有expected identity非法，
+  `duplicate_runtime`少于两个different identity非法；并覆盖Id/HostPath/closed literal边界。超限array尾部若
+  只有`1.0`或非法Id这类Intrinsic错误，必须先返回更早的`array_items`；尾部unknown discriminator则因Schema
+  更早而返回tag `invalid_value`。
+- Array/identity：同一array duplicate与逆序分别返回指向array的`duplicate_identity`和
+  `non_canonical_order`；跨array/variant collision指向参与字段的最小共同object。两个item在index 2和10同时
+  失败时按数值选择2。
+- Pointer确定性：同一stage放多个missing/unknown/type/value候选并交换member顺序；unknown key包含`~`和
+  `/`，验证`~0`/`~1`；escape后恰好512 bytes保留精确pointer，超过512固定根空string。多个长pointer先按
+  未转义logical path选择，禁止先fallback或截断。
+- Digest/context：修改`DesiredRuntimeSpec.spec_digest`、complete inventory digest和有效key-ring digest的
+  claim必须由context-free decoder返回指向claim的`malformed_payload invalid_value`；重新生成自洽claim后，
+  再令同revision的stored digest不同，context-bound validator才返回`revision_digest_conflict`。standalone
+  decode必须用mock证明不读取Store/filesystem/provider；intrinsically valid但与accepted inventory/Desired、
+  attestation、checkpoint file或current Operation不匹配的对象先通过decoder，再由对应context stage拒绝。
 
 ### 16.4 跨组件 typed errors
 
@@ -2303,74 +2337,148 @@ ContractName = "node_identity" | "agent_registration_attempt" | "agent_session"
              | "operation" | "contract_error"
 ```
 
-`message`只供人读，接收方只能按`error.code`及typed payload分支。`json_pointer`使用RFC 6901文本，根
-对象是空string。decoder先按未转义的逻辑JSON path选择错误，之后才渲染pointer：每个object member
-segment先把`~`编码为`~0`、`/`编码为`~1`，再用`/`连接array index。若完整RFC 6901 pointer不是§1.1
-合法`JsonPointer`，特别是转义后的UTF-8编码超过512 bytes，则`json_pointer`固定回退为空string；禁止
-截断、截取尾部或返回中间ancestor。
+`message`只供人读，接收方只能按`error.code`及typed payload分支。所有顶层合同共用下面唯一的
+validation pipeline；实现不得为某个合同类型另排优先级或在serde首次报错处提前返回。
 
-`limit_exceeded.observed_at_least`必须大于`maximum`。只有顶层wire bytes可在读到
-`maximum + 1` byte后停止并报告该下界。对已经通过顶层byte上限的payload，decoder必须消费全部bounded
-bytes并完成以下固定优先级：UTF-8 decode -> JSON grammar -> duplicate object key -> required/unknown
-object字段与primitive类型 -> `version` -> array item上限 -> 字段值和数组排序/唯一性 -> session ->
-observation sequence -> revision -> digest -> placement。实现可以在array第`maximum + 1`项后停止保存domain
-item并把`observed_at_least`固定为该值，但仍须以受该合同顶层wire上限（至多8 MiB）约束的streaming
-prepass扫描完整余下grammar及全部嵌套key/required field/primitive type；不得因array已超限停止读取或
-跳过尾部。因此尾部
-invalid JSON、duplicate key、missing/unknown field或invalid type都按上述更高阶段返回，而不是
-`array_items`，且不要求为超限array分配无界内存。
+#### 16.4.1 Context-free decoder（F0）
 
-上述早期“字段值”只指不读取Control Store即可判断的wire-intrinsic value/cross-field规则。需要current
-Operation的observation settlement cross-field validation是placement之后的独立阶段；前置session等检查
-未通过时不得读取或结算Operation，因此stale session与`placement_rejected` mismatch并存时先返回session
-error。
+F0只实现不读取Control Store、filesystem、provider或其他合同对象的context-free decoder。每个stage都要
+先扫描完整bounded payload、收集该stage的全部候选并按§16.4.2选出唯一错误；只有当前stage没有候选才进入
+下一stage。固定顺序如下：
 
-UTF-8 decode失败返回`invalid_utf8`，UTF-8合法但JSON grammar不完整/非法返回`invalid_json`；两者取
-最早input byte位置且`json_pointer`固定为空string。只有完整JSON grammar成功后才检测
-`duplicate_field`，其pointer指向重复member；`invalid_type`/`invalid_value`再晚于object字段检查。
-在每个validation阶段，必须先对完整bounded payload收集该阶段全部候选，再选择唯一错误，不能由object
-member输入顺序、hash-map遍历顺序或发现顺序决定。候选按逻辑path segments排序：共同prefix相同时短path
-先于child；object key按decoded UTF-8 bytes无符号字典序；array index按数值排序，所以2先于10。同一逻辑
-path再按problem rank
+1. **Transport**
+   - 顶层wire byte cap最先执行；读到`maximum + 1` byte即可停止，返回
+     `limit_exceeded {json_pointer:"", limit:"wire_bytes", maximum, observed_at_least:maximum + 1}`。
+   - 未超byte cap时必须消费全部payload，依次完成UTF-8、完整JSON grammar和全payload duplicate-key
+     prepass，包括unknown-field subtree中的object。UTF-8/grammar各取最早input byte错误并返回根pointer；
+     只有完整grammar成功后才收集所有`duplicate_field`候选，pointer指向重复member。不能让尾部错误被
+     前面的schema或array错误遮蔽。
+2. **Schema**。该stage再分为三个全payload substage，顺序不可交换：
+   1. 对non-union object检查全部required/unknown field和primitive JSON kind；对discriminated union
+      object只检查discriminator（通常`kind`，`ContractErrorDetail`为`code`）required/type，并检查每个key
+      是否属于所有variant字段名的并集。此时不得要求某一variant的其他字段，也不得检查其类型。
+   2. 对全部string-typed discriminator检查closed literal；未知tag返回指向tag field的
+      `malformed_payload {problem:"invalid_value"}`。
+   3. 只对已选定的variant检查该variant的required/unknown field和primitive JSON kind；属于另一variant的
+      field在这里是`unknown_field`。unknown tag不选择或猜测variant，因此同一union里的variant-specific
+      missing/type错误不产生候选。
+
+   “全payload union”只包括从顶层schema可达的union occurrence。valid discriminator可以用于发现其selected
+   variant中的嵌套schema；即使外层还有variant-specific missing/unknown候选，也必须继续收集嵌套union更早
+   substage的候选。outer discriminator无效时不得臆测其variant-specific subtree中的nested union schema。
+   实现必须在报告任何后一个substage前完成所有可达对象的前一个substage；object member输入顺序或递归遍历
+   顺序不能改变结果。这里的primitive kind只区分object/array/string/number/boolean/null；number的
+   canonical integer lexeme和范围在Intrinsic stage检查。
+3. **Version 与 array item limit**
+   - Schema通过后先验证顶层`/version`。number token不满足canonical unsigned integer或超出
+     `0..=9223372036854775807`返回`invalid_value`；有效范围内但不等于1才返回
+     `unsupported_version`。`unsupported_version`只由正在decode的顶层`version`产生；嵌套projection的
+     `version`在Intrinsic stage按closed scalar literal验证，不创建第二个version空间。
+   - Version通过后检查§10.4全部array item上限。多个超限array按§16.4.2选取，pointer固定指向array；
+     `observed_at_least`固定为`maximum + 1`。实现可在该项后停止保存domain item或精确计数，但Transport和
+     Schema仍必须先扫描全部payload；不得因array超限跳过尾部grammar、duplicate、required、unknown、type
+     或discriminator错误，也不得为超限array分配无界内存。
+4. **Intrinsic**。只验证payload自身足以证明的事实，并按以下substage顺序执行：
+   1. 所有scalar value：每个unsigned numeric字段只接受JSON number token
+      `0|[1-9][0-9]*`，再按其`ContractVersion`/`Revision`/`Epoch`/`Sequence`/`U64`等逻辑域检查范围。
+      非number已在Schema返回`invalid_type`；`-0`、负数、fraction、exponent和超出逻辑域或
+      `9223372036854775807`的值均为`invalid_value`。实现必须按十进制token判定overflow，不能先溢出机器
+      integer。随后验证Id、HostPath、其他string格式及所有非discriminator closed scalar literal。
+   2. 所有array的strict order和identity约束。
+   3. 只引用同一payload字段的wire cross-field invariant。
+   4. payload同时携带完整digest projection与claimed digest时，按§16.1/§16.2重算并比较。V1具体是
+      `DesiredRuntimeSpec.spec_digest`、complete `NodeObservation.inventory_digest`及non-null
+      `NodeObservation.key_ring_digest`；不完整projection不能冒充self-digest input。重算不等返回
+      `malformed_payload {problem:"invalid_value"}`并精确指向claimed digest字段。
+
+standalone `Operation`的phase/terminal规则及§12明确列出的result、HostLost和PlacementRejected placement
+binding都属于Intrinsic wire cross-field；§12的精确field pointer是§16.4.2通则的specific override，必须
+保留。context-free decoder通过只表示该单一payload自洽，不表示其session、revision、digest、placement、
+cleanup target或物理事实已经获得外部授权。
+
+#### 16.4.2 唯一 error 定位与 tie-break
+
+`json_pointer`使用RFC 6901文本，根对象是空string。每个stage/substage先按未转义的逻辑JSON path选择错误：共同
+prefix相同时短path先于child；object key按decoded UTF-8 bytes无符号字典序；array index按数值排序，所以
+2先于10。同一逻辑path再按problem rank
 `missing_field < unknown_field < duplicate_field < invalid_type < invalid_value < duplicate_identity < non_canonical_order`
-选择；不同阶段仍以本段固定阶段优先级为准。`array_items`阶段有多个超限array时也按相同逻辑path规则选取。
-完成选择后才做RFC 6901 escape和512-byte fallback；禁止按escaped pointer排序或先回退root再tie-break。
-presented session
-epoch小于current返回`stale_session`；epoch相同但boot/instance不匹配，或presented epoch更大，返回
-`wrong_session`。session通过后，NodeObservation再按§10的规则返回
-`stale_observation_sequence`或`observation_sequence_conflict`。Desired delivery中revision小于
-current返回`stale_revision`；精确结算要求不相等时
-返回`wrong_revision`；revision相同而digest不同返回`revision_digest_conflict`。node ID或placement
-epoch任一不匹配都返回`wrong_placement`。非Observation边界的`expected`和`presented`就是该边界
-实际比较的两份完整`AssignedPlacement`。
+选择。不同stage永远按§16.4.1的stage顺序，不能由输入member顺序、hash-map顺序或发现顺序改变。
+
+通用定位规则覆盖全部schema，不再逐字段枚举：
+
+- missing/unknown/type错误指向精确field或array item；缺失field也使用本应出现的完整逻辑path。
+- 单一numeric range、Id、HostPath、string格式或非discriminator closed literal失败返回`invalid_value`并指向
+  精确field/item；数字的`1.0`、`1e0`、`-0`、负数和overflow都遵守此规则。JSON grammar本身禁止的前导零
+  仍在Transport返回根`invalid_json`。
+- 同一array内identity重复返回`duplicate_identity`、pointer为该array；非duplicate但不严格递增返回
+  `non_canonical_order`、pointer也为该array。
+- 跨array或variant的identity collision返回`duplicate_identity`，pointer为包含全部参与字段的最小共同
+  object。未被更具体规则覆盖的multi-field intrinsic invariant返回`invalid_value`，pointer同样是全部参与
+  字段的最小共同object。§12等已明确更具体field pointer的规则优先于这个fallback。
+- self-digest mismatch固定指向同payload中的claimed digest字段；它不使用
+  `revision_digest_conflict`。
+
+选出候选后才渲染pointer：object segment把`~`编码为`~0`、`/`编码为`~1`，array segment使用十进制index，
+再以`/`连接。若完整RFC 6901 pointer不是§1.1合法`JsonPointer`，特别是转义后超过512 UTF-8 bytes，则固定
+回退根空string；禁止截断、返回ancestor、按escaped pointer排序或先fallback再tie-break。
+
+#### 16.4.3 Context-bound validator（Store / Node）
+
+context-free decoder通过后，需要外部状态的边界才进入context-bound validator；这不属于F0 decoder。
+适用的stage按下列固定顺序执行，不适用的stage直接跳过。前一stage失败时不得读取、执行或产生后一stage的
+任何副作用：
+
+1. **session**：presented epoch小于current返回`stale_session`；epoch相同但boot/instance不匹配，或
+   presented epoch更大，返回`wrong_session`。
+2. **observation sequence**：session通过后才执行§10唯一接收状态机。小于最高值返回
+   `stale_observation_sequence`；等于但decoded payload不同返回`observation_sequence_conflict`；exact replay
+   只读首次成功结果。
+3. **revision**：此时才读取current Desired/Operation的revision字段，按边界语义返回`stale_revision`或
+   `wrong_revision`，不能用后来revision结算旧Operation。
+4. **stored/context digest**：revision通过后才读取对应stored digest并比较。只有同Cat、同revision的
+   current Desired/Operation spec digest不等才返回`revision_digest_conflict`；该code绝不表示§16.4.1
+   self-digest重算失败，也不用于file content、inventory attestation或其他context digest。其他context
+   digest mismatch按其既有domain语义拒绝，不构造虚假的revision字段。
+5. **placement**：digest通过后才读取对应stored/current Operation的placement字段；node ID或placement
+   epoch不匹配返回`wrong_placement`。
+6. **Operation settlement / postcondition / external facts**：最后才结算Operation、验证目标完整postcondition
+   或读取/执行Node物理事实。stale session等前层错误不得读取Operation、filesystem或provider事实。
+
+外部checkpoint文件的content digest，Cleanup与accepted inventory/Desired的绑定，
+`AdmissionInventoryAttestation`与已接受inventory的绑定，Operation与current Desired的绑定，以及runtime、
+volume、route、provider等事实都不属于单对象decoder。Admission attestation与accepted inventory的digest
+在第4 stage验证；Operation/current Desired的revision、digest和placement绑定分别在第3/4/5 stage验证；
+external file、Cleanup binding、terminal settlement和物理postcondition只在第6 stage执行。任何非stored
+revision/spec的digest mismatch都不能伪造`revision_digest_conflict`payload。
+特别地，`CheckpointEvidence.valid`只携带checkpoint projection，不携带完整`RuntimeCheckpoint`，所以其
+`content_digest`只能由Node读取完整文件后验证，不是self-digest规则。
+
+非Observation边界的`wrong_placement.expected/presented`就是该边界实际比较的两份完整
+`AssignedPlacement`，不能为填充错误payload构造虚假placement。
 
 Observation settlement中，`expected`固定为current Desired的完整`AssignedPlacement`；在前述
-session/sequence/revision/digest检查通过后，对有current Pending Operation的runtime按
-`runtimes.cat_id`升序选择第一个冲突。错误的`cat_id`和`desired_revision`取该runtime对应的
-current Desired；`presented`使用下列固定优先级构造：
+session/sequence/revision/stored digest检查通过后，对有current Pending Operation的runtime按
+`runtimes.cat_id`升序选择第一个placement冲突。错误的`cat_id`和`desired_revision`取该runtime对应的
+current Desired；`presented`使用下列specific priority构造：
 
 1. `Operation.placement != expected`：取完整`Operation.placement`；
 2. 否则`runtime.applied_desired.placement != expected`：取完整applied placement；
 3. 否则顶层`NodeObservation.node_id != expected.node_id`：取
    `{kind:"assigned", node_id: NodeObservation.node_id, placement_epoch: expected.placement_epoch}`。
 
-任一上述错误都拒绝整个NodeObservation，不得推进checkpoint、接受observation/attestation、
-更新freshness、结算任何Operation或产生物理副作用。
+任一上述错误都拒绝整个NodeObservation，不得推进checkpoint、接受observation/attestation、更新freshness、
+结算任何Operation或产生物理副作用。placement通过后才执行§12的PlacementRejected settlement binding；其
+specific pointer保持不变。stale session与该reason mismatch并存时先返回session error且不读取Operation。
 
-`version`不是JSON integer或超出`0..=9223372036854775807`时返回
-`malformed_payload {json_pointer:"/version", problem:"invalid_type"|"invalid_value"}`；范围内但不等于1
-才返回`unsupported_version`。该code只对正在decode的顶层合同`/version`生成；
-`CheckpointEvidence.valid.version`或`ResidueCheckpointFileEvidence.valid.version`等嵌套投影不等于1时，
-返回顶层合同对应pointer的`malformed_payload {problem:"invalid_value"}`，不伪装成另一次
-top-level decode。因此unsupported error自身始终能无损进入PostgreSQL BIGINT。
-
-registration replay在当前session检查前先按`(node_id, registration_attempt_id)`查找已提交attempt；命中
-且binding不同返回`registration_attempt_conflict`。`expected`是首次提交的四字段binding，`presented`
-是本次请求，不包含服务端分配的session epoch/deadline，也不构造两个虚假的`SessionBinding`。
+`AgentRegistrationAttempt`没有可先验证的current session，因此保留§2的端点specific replay顺序：先按
+`(node_id, registration_attempt_id)`查找已提交attempt；命中且binding不同返回
+`registration_attempt_conflict`。`expected`是首次提交的四字段binding，`presented`是本次请求，不包含
+服务端分配的session epoch/deadline，也不构造两个虚假的`SessionBinding`。这不是F0 decoder规则，也不改变
+其他session-bound边界的stage顺序。通用API idempotency仍按§4在domain mutation前处理，不属于单对象decoder。
 
 `stale_observation_sequence`必须满足`presented_heartbeat_sequence <
 last_accepted_heartbeat_sequence`。`observation_sequence_conflict.heartbeat_sequence`必须等于已接受和
 本次payload共用的sequence；`accepted_observation_id`来自首次已提交payload，
 `presented_observation_id`来自本次payload，两者允许相同，因为conflict也可能发生在其他字段。
-两类错误都不得写observation/最高sequence、更新attestation/freshness、结算Operation或产生
-任何其他Control Plane/Node物理副作用。
+两类错误都不得写observation/最高sequence、更新attestation/freshness、结算Operation或产生任何其他
+Control Plane/Node物理副作用。
