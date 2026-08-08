@@ -349,9 +349,10 @@ pub fn validate_volume_record(record: &VolumeRecord) -> Result<()> {
         &record.lease_owner,
         &record.lease_expires_at,
     ) {
-        (VolumeAdminState::Active, None, None)
-        | (VolumeAdminState::Active, Some(_), Some(_))
-        | (VolumeAdminState::Deleting { .. }, None, None) => {}
+        (VolumeAdminState::Active, None, None) => {}
+        (VolumeAdminState::Active, Some(_), Some(expires_at))
+            if record.lease_epoch.get() > 0 && expires_at.get() > 0 => {}
+        (VolumeAdminState::Deleting { .. }, None, None) if record.lease_epoch.get() > 0 => {}
         _ => return Err(AuthorityError::BackendUnknown),
     }
 
@@ -969,6 +970,9 @@ fn validate_begin_delete_pair(
 }
 
 fn validate_takeover_authorization(authorization: &VolumeTakeoverAuthorization) -> Result<()> {
+    if authorization.new_attachment_id == authorization.expected_attachment_id {
+        return Err(AuthorityError::InvalidAuthorization);
+    }
     if !valid_duration(authorization.lease_duration_ms) {
         return Err(AuthorityError::InvalidLeaseDuration);
     }

@@ -225,6 +225,104 @@ fn volume_record_rejects_impossible_owner_and_admin_combinations() {
     }
 }
 
+fn assert_owned_row_is_rejected_before_renew_or_release(record: &VolumeRecord) {
+    let before = record.clone();
+    let renew = RenewLeaseRequest {
+        volume_id: record.volume_id.clone(),
+        attachment_id: record.lease_owner.clone().unwrap(),
+        expected_epoch: record.lease_epoch,
+        lease_duration_ms: 1,
+    };
+    assert_eq!(
+        renew_lease(record, &renew, time(20_000)),
+        Err(AuthorityError::BackendUnknown)
+    );
+    let release_request = ReleaseRequest {
+        volume_id: record.volume_id.clone(),
+        transition_id: random_id(31),
+        attachment_id: record.lease_owner.clone().unwrap(),
+        expected_epoch: record.lease_epoch,
+    };
+    assert_eq!(
+        release(record, &release_request),
+        Err(AuthorityError::BackendUnknown)
+    );
+    assert_eq!(record, &before);
+}
+
+#[test]
+fn acquired_and_takeover_rows_fail_closed_on_zero_expiry_or_epoch() {
+    let mut acquired = acquired_volume();
+    acquired.lease_expires_at = Some(time(0));
+    assert_eq!(
+        validate_volume_record(&acquired),
+        Err(AuthorityError::BackendUnknown)
+    );
+    assert_owned_row_is_rejected_before_renew_or_release(&acquired);
+
+    let old_owner = acquired_volume();
+    let event = host_fence_event(HostFenceEventState::Active);
+    let authorization = takeover_authorization(&old_owner);
+    let taken_over = consume_takeover(
+        &old_owner,
+        &event,
+        &authorization,
+        &id("takeover-auth-1"),
+        time(20_000),
+    )
+    .unwrap()
+    .0;
+
+    let mut zero_expiry = taken_over.clone();
+    zero_expiry.lease_expires_at = Some(time(0));
+    assert_eq!(
+        validate_volume_record(&zero_expiry),
+        Err(AuthorityError::BackendUnknown)
+    );
+    assert_owned_row_is_rejected_before_renew_or_release(&zero_expiry);
+
+    let mut zero_epoch = taken_over;
+    zero_epoch.lease_epoch = fence_epoch(0);
+    assert_eq!(
+        validate_volume_record(&zero_epoch),
+        Err(AuthorityError::BackendUnknown)
+    );
+    assert_owned_row_is_rejected_before_renew_or_release(&zero_epoch);
+}
+
+#[test]
+fn disposable_deleting_epoch_zero_fails_before_completion() {
+    let owned = acquired_volume();
+    let event = host_fence_event(HostFenceEventState::Active);
+    let authorization = disposable_authorization(
+        &owned,
+        DisposableDeleteIsolationBasis::HostFenceEvent {
+            event_id: event.event_id.clone(),
+        },
+    );
+    let (mut deleting, consumed, _) = consume_disposable_root_delete(
+        &owned,
+        Some(&event),
+        &authorization,
+        &id("delete-auth-1"),
+        time(20_000),
+    )
+    .unwrap();
+    deleting.lease_epoch = fence_epoch(0);
+    let before_volume = deleting.clone();
+    let before_authorization = consumed.clone();
+    assert_eq!(
+        validate_volume_record(&deleting),
+        Err(AuthorityError::BackendUnknown)
+    );
+    assert_eq!(
+        complete_disposable_root_delete(&deleting, &consumed, time(40_000)),
+        Err(AuthorityError::BackendUnknown)
+    );
+    assert_eq!(deleting, before_volume);
+    assert_eq!(consumed, before_authorization);
+}
+
 #[test]
 fn normal_acquire_replays_the_original_absolute_expiry() {
     let base = unowned_volume();
@@ -506,6 +604,38 @@ fn takeover_invalid_duration_is_typed_and_zero_side_effect() {
         authorization.state,
         AuthorizationState::Unconsumed
     ));
+}
+
+#[test]
+fn takeover_cannot_replace_an_attachment_with_itself() {
+    let owned = acquired_volume();
+    let event = host_fence_event(HostFenceEventState::Active);
+    let mut authorization = takeover_authorization(&owned);
+    let VolumeAuthorization::Takeover(payload) = &mut authorization.authorization else {
+        unreachable!()
+    };
+    payload.new_attachment_id = payload.expected_attachment_id.clone();
+
+    let before_volume = owned.clone();
+    let before_event = event.clone();
+    let before_authorization = authorization.clone();
+    assert_eq!(
+        validate_authorization_record(&authorization),
+        Err(AuthorityError::InvalidAuthorization)
+    );
+    assert_eq!(
+        consume_takeover(
+            &owned,
+            &event,
+            &authorization,
+            &id("takeover-auth-1"),
+            time(20_000),
+        ),
+        Err(AuthorityError::InvalidAuthorization)
+    );
+    assert_eq!(owned, before_volume);
+    assert_eq!(event, before_event);
+    assert_eq!(authorization, before_authorization);
 }
 
 #[test]
