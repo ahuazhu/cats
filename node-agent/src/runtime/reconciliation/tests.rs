@@ -19,7 +19,9 @@ use cats_api::runtime_reconciliation::{
 use tempfile::TempDir;
 
 use super::admission_port::{AdmissionGatePort, AdmissionSnapshot, GatePortError, IdleCloseResult};
-use super::checkpoint::{CheckpointStoreError, FileCheckpointStore, WriteStage};
+use super::checkpoint::{
+    CheckpointStoreError, FileCheckpointStore, WriteStage, TEST_PROCESS_EXIT_CODE,
+};
 use super::gate_planner::{
     applied_desired_evidence, AppliedDesiredError, GateReconcileError, GateSequencer,
     GateTransitionResult, PersistTimes,
@@ -124,6 +126,13 @@ fn checkpoint_open_probe_child() {
     };
     let mode = std::env::var("CATS_CHECKPOINT_OPEN_PROBE_MODE").expect("probe mode");
     let opened = FileCheckpointStore::open(Path::new(&root), &id("cat_01"));
+    if mode == "lock_contended" {
+        assert!(matches!(
+            opened,
+            Err(CheckpointStoreError::WriterAlreadyActive { .. })
+        ));
+        return;
+    }
     if mode == "lock_fifo" {
         assert!(matches!(
             opened,
@@ -140,6 +149,28 @@ fn checkpoint_open_probe_child() {
             store.load().expect_err("FIFO target must fail closed"),
             CheckpointStoreError::UnsafeEntry { .. }
         )),
+        "file_synced_exit" => {
+            let current = store
+                .load()
+                .expect("load checkpoint before process exit")
+                .expect("checkpoint before process exit");
+            let mut replacement = current.checkpoint().clone();
+            replacement.updated_at_unix_ms = unix_ms(11);
+            store.inject_process_exit_once(WriteStage::FileSynced);
+            let _ = store.replace(&current, &replacement);
+            panic!("FileSynced process-exit fault returned");
+        }
+        "recover_file_synced_exit" => {
+            assert!(
+                !Path::new(&root).join(".cat-cat_01.checkpoint.tmp").exists(),
+                "new writer process must remove the exact crashed temp"
+            );
+            let current = store
+                .load()
+                .expect("load checkpoint after process exit")
+                .expect("checkpoint after process exit");
+            assert_eq!(current.checkpoint().updated_at_unix_ms, unix_ms(10));
+        }
         other => panic!("unknown checkpoint open probe mode {other}"),
     }
 }
@@ -173,19 +204,23 @@ fn run_checkpoint_open_probe(mode: &str) {
         .expect("write regular checkpoint");
     }
 
+    let status = run_checkpoint_process_probe(root.path(), mode);
+    assert!(status.success(), "{mode} checkpoint open probe failed");
+}
+
+fn run_checkpoint_process_probe(root: &Path, mode: &str) -> std::process::ExitStatus {
     let mut child = Command::new(std::env::current_exe().expect("current test binary"))
         .arg("--exact")
         .arg("runtime::reconciliation::tests::checkpoint_open_probe_child")
         .arg("--nocapture")
-        .env("CATS_CHECKPOINT_OPEN_PROBE_ROOT", root.path())
+        .env("CATS_CHECKPOINT_OPEN_PROBE_ROOT", root)
         .env("CATS_CHECKPOINT_OPEN_PROBE_MODE", mode)
         .spawn()
         .expect("spawn checkpoint open probe");
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         if let Some(status) = child.try_wait().expect("poll checkpoint open probe") {
-            assert!(status.success(), "{mode} checkpoint open probe failed");
-            break;
+            return status;
         }
         if Instant::now() >= deadline {
             child.kill().expect("kill blocked checkpoint open probe");
@@ -194,6 +229,55 @@ fn run_checkpoint_open_probe(mode: &str) {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn checkpoint_writer_flock_excludes_a_real_second_process() {
+    let root = TempDir::new().expect("tempdir");
+    let owner = store(&root, &id("cat_01"));
+
+    let status = run_checkpoint_process_probe(root.path(), "lock_contended");
+    assert!(
+        status.success(),
+        "second process did not observe held flock"
+    );
+    drop(owner);
+}
+
+#[test]
+fn filesynced_process_exit_leaves_one_temp_for_a_new_process_to_clean() {
+    let root = TempDir::new().expect("tempdir");
+    let desired = desired(
+        1,
+        RuntimeTarget::Running,
+        1,
+        RuntimeTransition::CancelAndDrain,
+    );
+    let checkpoint = running_checkpoint(&desired, 10);
+    let checkpoint_store = store(&root, &desired.cat_id);
+    checkpoint_store
+        .create(&checkpoint)
+        .expect("initial checkpoint");
+    drop(checkpoint_store);
+
+    let crashed = run_checkpoint_process_probe(root.path(), "file_synced_exit");
+    assert_eq!(crashed.code(), Some(TEST_PROCESS_EXIT_CODE));
+    assert_eq!(checkpoint_temp_stats(root.path()).0, 1);
+    assert!(root.path().join(".cat-cat_01.checkpoint.tmp").exists());
+
+    let recovered = run_checkpoint_process_probe(root.path(), "recover_file_synced_exit");
+    assert!(recovered.success(), "new writer process failed recovery");
+    assert_eq!(checkpoint_temp_stats(root.path()), (0, 0));
+
+    let reopened = store(&root, &desired.cat_id);
+    assert_eq!(
+        reopened
+            .load()
+            .expect("load after process recovery")
+            .expect("checkpoint after process recovery")
+            .checkpoint(),
+        &checkpoint
+    );
 }
 
 #[test]
@@ -1669,6 +1753,205 @@ fn ambiguous_endpoint_close_is_confirmed_but_pre_effect_error_is_retried() {
 }
 
 #[test]
+fn same_session_close_retry_requires_the_exact_predecessor_edge() {
+    let root = TempDir::new().expect("tempdir");
+    let source_desired = running_desired_with_endpoints(
+        2,
+        vec![
+            endpoint("ep_a", "a.example.test", 1, 8080),
+            endpoint("ep_b", "b.example.test", 7, 8081),
+        ],
+    );
+    let desired = running_desired_with_endpoints(
+        3,
+        vec![
+            endpoint("ep_a", "a.example.test", 2, 9090),
+            endpoint("ep_b", "b.example.test", 7, 8081),
+        ],
+    );
+    let checkpoint = running_checkpoint(&source_desired, 10);
+    let store = store(&root, &source_desired.cat_id);
+    let source = store.create(&checkpoint).expect("source checkpoint");
+    let mut port = FakePort::new(
+        AdmissionSnapshot::from_checkpoint(&checkpoint).expect("source snapshot"),
+        store.path(),
+    );
+    let exact_predecessor = port.current.clone();
+    port.endpoint_results
+        .push_back(EndpointPortResult::ErrorBefore(GatePortError::Unavailable));
+    port.expected_disk.push_back(DiskMarker::EndpointClosing {
+        revision: revision(3),
+        endpoint_id: id("ep_a"),
+        route_epoch: epoch(1),
+    });
+    assert!(matches!(
+        GateSequencer::new(&store, &mut port)
+            .close_gate(&source, &desired, &id("ep_a"), times(20, 21))
+            .expect_err("leave durable close token before effect"),
+        GateReconcileError::Port(GatePortError::Unavailable)
+    ));
+    let close_step = store
+        .load()
+        .expect("load close token")
+        .expect("close token");
+    assert_eq!(port.calls, vec![PortCall::CloseGate(id("ep_a"))]);
+
+    // Keep one checkpoint-first oracle queued for the eventual exact retry.
+    // A mismatched tuple must not consume it or call the port.
+    port.expected_disk.push_back(DiskMarker::EndpointClosing {
+        revision: revision(3),
+        endpoint_id: id("ep_a"),
+        route_epoch: epoch(1),
+    });
+    let mut wrong_placement = exact_predecessor.placement().clone();
+    wrong_placement.placement_epoch = epoch(99);
+    let mut wrong_routes = exact_predecessor.endpoints().to_vec();
+    wrong_routes[1].gate = RouteGateState::Closed;
+    let mismatches = [
+        (
+            "lower revision",
+            AdmissionSnapshot::new(
+                revision(1),
+                exact_predecessor.spec_digest().clone(),
+                exact_predecessor.placement().clone(),
+                exact_predecessor.runtime_incarnation().cloned(),
+                exact_predecessor.lifecycle_admission(),
+                exact_predecessor.endpoints().to_vec(),
+            ),
+        ),
+        (
+            "wrong digest",
+            AdmissionSnapshot::new(
+                exact_predecessor.applied_desired_revision(),
+                digest('a'),
+                exact_predecessor.placement().clone(),
+                exact_predecessor.runtime_incarnation().cloned(),
+                exact_predecessor.lifecycle_admission(),
+                exact_predecessor.endpoints().to_vec(),
+            ),
+        ),
+        (
+            "wrong placement",
+            AdmissionSnapshot::new(
+                exact_predecessor.applied_desired_revision(),
+                exact_predecessor.spec_digest().clone(),
+                wrong_placement,
+                exact_predecessor.runtime_incarnation().cloned(),
+                exact_predecessor.lifecycle_admission(),
+                exact_predecessor.endpoints().to_vec(),
+            ),
+        ),
+        (
+            "wrong runtime incarnation",
+            AdmissionSnapshot::new(
+                exact_predecessor.applied_desired_revision(),
+                exact_predecessor.spec_digest().clone(),
+                exact_predecessor.placement().clone(),
+                Some(random('6')),
+                exact_predecessor.lifecycle_admission(),
+                exact_predecessor.endpoints().to_vec(),
+            ),
+        ),
+        (
+            "wrong lifecycle admission",
+            AdmissionSnapshot::new(
+                exact_predecessor.applied_desired_revision(),
+                exact_predecessor.spec_digest().clone(),
+                exact_predecessor.placement().clone(),
+                exact_predecessor.runtime_incarnation().cloned(),
+                LifecycleAdmission::Closed,
+                exact_predecessor.endpoints().to_vec(),
+            ),
+        ),
+        (
+            "wrong routes",
+            AdmissionSnapshot::new(
+                exact_predecessor.applied_desired_revision(),
+                exact_predecessor.spec_digest().clone(),
+                exact_predecessor.placement().clone(),
+                exact_predecessor.runtime_incarnation().cloned(),
+                exact_predecessor.lifecycle_admission(),
+                wrong_routes,
+            ),
+        ),
+    ];
+    for (reason, mismatch) in mismatches {
+        port.current = mismatch;
+        assert!(
+            matches!(
+                GateSequencer::new(&store, &mut port)
+                    .close_gate(&close_step, &desired, &id("ep_a"), times(22, 23))
+                    .expect_err(reason),
+                GateReconcileError::EndpointCellMismatch
+            ),
+            "unexpected result for {reason}"
+        );
+        assert_eq!(port.calls, vec![PortCall::CloseGate(id("ep_a"))]);
+    }
+
+    port.current = exact_predecessor;
+    GateSequencer::new(&store, &mut port)
+        .close_gate(&close_step, &desired, &id("ep_a"), times(26, 27))
+        .expect("exact same-session predecessor retries close");
+    assert_eq!(
+        port.calls,
+        vec![
+            PortCall::CloseGate(id("ep_a")),
+            PortCall::CloseGate(id("ep_a")),
+        ]
+    );
+}
+
+#[test]
+fn restart_cannot_replay_close_from_the_predecessor_without_its_edge() {
+    let root = TempDir::new().expect("tempdir");
+    let (source_desired, desired) = endpoint_change_desireds();
+    let checkpoint = running_checkpoint(&source_desired, 10);
+    let store = store(&root, &source_desired.cat_id);
+    let source = store.create(&checkpoint).expect("source checkpoint");
+    let exact_predecessor =
+        AdmissionSnapshot::from_checkpoint(&checkpoint).expect("source snapshot");
+    let mut port = FakePort::new(exact_predecessor.clone(), store.path());
+    port.endpoint_results
+        .push_back(EndpointPortResult::ErrorBefore(GatePortError::Unavailable));
+    port.expected_disk.push_back(DiskMarker::EndpointClosing {
+        revision: revision(2),
+        endpoint_id: id("ep_a"),
+        route_epoch: epoch(1),
+    });
+    GateSequencer::new(&store, &mut port)
+        .close_gate(&source, &desired, &id("ep_a"), times(20, 21))
+        .expect_err("leave durable close token");
+    drop(port);
+    drop(store);
+
+    let restarted_store = FileCheckpointStore::open(root.path(), &source_desired.cat_id)
+        .expect("restart checkpoint store");
+    let close_step = restarted_store
+        .load()
+        .expect("load after restart")
+        .expect("close token after restart");
+    let mut restarted_port = FakePort::new(exact_predecessor.clone(), restarted_store.path());
+    // This marker makes the old heuristic observable without weakening the
+    // fixed zero-side-effect assertion.
+    restarted_port
+        .expected_disk
+        .push_back(DiskMarker::EndpointClosing {
+            revision: revision(2),
+            endpoint_id: id("ep_a"),
+            route_epoch: epoch(1),
+        });
+    assert!(matches!(
+        GateSequencer::new(&restarted_store, &mut restarted_port)
+            .close_gate(&close_step, &desired, &id("ep_a"), times(22, 23))
+            .expect_err("disk token cannot reconstruct the process-local edge"),
+        GateReconcileError::EndpointCellMismatch
+    ));
+    assert_eq!(restarted_port.current, exact_predecessor);
+    assert!(restarted_port.calls.is_empty());
+}
+
+#[test]
 fn stale_endpoint_tokens_and_restart_state_have_zero_endpoint_side_effects() {
     let root = TempDir::new().expect("tempdir");
     let source_desired = running_desired_with_endpoints(
@@ -2623,6 +2906,200 @@ fn install_post_effect_publish_crashes_confirm_active_without_a_second_effect() 
             1
         );
     }
+}
+
+#[test]
+fn late_install_completion_error_releases_the_edge_for_a_higher_epoch() {
+    let root = TempDir::new().expect("tempdir");
+    let (source_desired, desired) = endpoint_change_desireds();
+    let checkpoint = running_checkpoint(&source_desired, 10);
+    let b_before = route(&checkpoint, "ep_b").clone();
+    let store = store(&root, &source_desired.cat_id);
+    let source = store.create(&checkpoint).expect("source checkpoint");
+    let mut port = FakePort::new(
+        AdmissionSnapshot::from_checkpoint(&checkpoint).expect("source snapshot"),
+        store.path(),
+    );
+    port.expected_disk.push_back(DiskMarker::EndpointClosing {
+        revision: revision(2),
+        endpoint_id: id("ep_a"),
+        route_epoch: epoch(1),
+    });
+    let closed = GateSequencer::new(&store, &mut port)
+        .close_gate(&source, &desired, &id("ep_a"), times(20, 21))
+        .expect("close A at epoch 1");
+    let prepared = GateSequencer::new(&store, &mut port)
+        .prepare_changed_gate(closed.checkpoint(), &desired, &id("ep_a"), unix_ms(22))
+        .expect("prepare A at epoch 2");
+    port.expected_disk.push_back(DiskMarker::Installed {
+        revision: revision(2),
+        endpoint_id: id("ep_a"),
+        route_epoch: epoch(2),
+    });
+    // InstallGate publishes the Active token first and the final Stable
+    // checkpoint second. The second rename is already visible when this late
+    // injected error is returned.
+    store.inject_crash_on_nth(WriteStage::DirectorySynced, 2);
+    assert!(matches!(
+        GateSequencer::new(&store, &mut port)
+            .install_gate(prepared.checkpoint(), &desired, &id("ep_a"), times(23, 24))
+            .expect_err("late completion acknowledgement is lost"),
+        GateReconcileError::Checkpoint(CheckpointStoreError::InjectedCrash)
+    ));
+    assert_eq!(snapshot_route(&port.current, "ep_b"), &b_before);
+    let stable_epoch_two = store
+        .load()
+        .expect("load visible final checkpoint")
+        .expect("visible final checkpoint");
+    assert!(matches!(
+        stable_epoch_two.checkpoint().step,
+        ReconcileStep::Stable {
+            state: StableState::Running
+        }
+    ));
+    assert_eq!(route(stable_epoch_two.checkpoint(), "ep_b"), &b_before);
+
+    let desired_epoch_three = running_desired_with_endpoints(
+        3,
+        vec![
+            endpoint("ep_a", "a.example.test", 3, 10000),
+            endpoint("ep_b", "b.example.test", 7, 8081),
+        ],
+    );
+    port.expected_disk.push_back(DiskMarker::EndpointClosing {
+        revision: revision(3),
+        endpoint_id: id("ep_a"),
+        route_epoch: epoch(2),
+    });
+    let closed = GateSequencer::new(&store, &mut port)
+        .close_gate(
+            &stable_epoch_two,
+            &desired_epoch_three,
+            &id("ep_a"),
+            times(25, 26),
+        )
+        .expect("close A at epoch 2");
+    assert_eq!(route(closed.checkpoint().checkpoint(), "ep_b"), &b_before);
+    assert_eq!(snapshot_route(&port.current, "ep_b"), &b_before);
+    let prepared = GateSequencer::new(&store, &mut port)
+        .prepare_changed_gate(
+            closed.checkpoint(),
+            &desired_epoch_three,
+            &id("ep_a"),
+            unix_ms(27),
+        )
+        .expect("prepare A at epoch 3 after late prior error");
+    assert_eq!(route(prepared.checkpoint().checkpoint(), "ep_b"), &b_before);
+    port.expected_disk.push_back(DiskMarker::Installed {
+        revision: revision(3),
+        endpoint_id: id("ep_a"),
+        route_epoch: epoch(3),
+    });
+    let installed = GateSequencer::new(&store, &mut port)
+        .install_gate(
+            prepared.checkpoint(),
+            &desired_epoch_three,
+            &id("ep_a"),
+            times(28, 29),
+        )
+        .expect("install A at epoch 3");
+    assert_eq!(
+        route(installed.checkpoint().checkpoint(), "ep_b"),
+        &b_before
+    );
+    assert_eq!(snapshot_route(&port.current, "ep_b"), &b_before);
+}
+
+#[test]
+fn failed_final_publish_does_not_leave_an_unpublished_next_edge() {
+    let root = TempDir::new().expect("tempdir");
+    let source_desired = running_desired_with_endpoints(
+        1,
+        vec![
+            endpoint("ep_a", "a.example.test", 1, 8080),
+            endpoint("ep_b", "b.example.test", 1, 8081),
+        ],
+    );
+    let desired = running_desired_with_endpoints(
+        2,
+        vec![
+            endpoint("ep_a", "a.example.test", 2, 9090),
+            endpoint("ep_b", "b.example.test", 2, 9091),
+        ],
+    );
+    let checkpoint = running_checkpoint(&source_desired, 10);
+    let store = store(&root, &source_desired.cat_id);
+    let source = store.create(&checkpoint).expect("source checkpoint");
+    let mut port = FakePort::new(
+        AdmissionSnapshot::from_checkpoint(&checkpoint).expect("source snapshot"),
+        store.path(),
+    );
+    port.expected_disk.push_back(DiskMarker::EndpointClosing {
+        revision: revision(2),
+        endpoint_id: id("ep_a"),
+        route_epoch: epoch(1),
+    });
+    let closed = GateSequencer::new(&store, &mut port)
+        .close_gate(&source, &desired, &id("ep_a"), times(20, 21))
+        .expect("close A");
+    let prepared = GateSequencer::new(&store, &mut port)
+        .prepare_changed_gate(closed.checkpoint(), &desired, &id("ep_a"), unix_ms(22))
+        .expect("prepare A");
+    port.expected_disk.push_back(DiskMarker::Installed {
+        revision: revision(2),
+        endpoint_id: id("ep_a"),
+        route_epoch: epoch(2),
+    });
+    // The final checkpoint would publish B's CloseGate token. Fail before
+    // that rename after A's exact effect has already completed.
+    store.inject_crash_on_nth(WriteStage::FileSynced, 2);
+    assert!(matches!(
+        GateSequencer::new(&store, &mut port)
+            .install_gate(prepared.checkpoint(), &desired, &id("ep_a"), times(23, 24))
+            .expect_err("final checkpoint remains the active A token"),
+        GateReconcileError::Checkpoint(CheckpointStoreError::InjectedCrash)
+    ));
+    let active_a = store
+        .load()
+        .expect("load active A token")
+        .expect("active A token");
+    assert!(matches!(
+        active_a.checkpoint().step,
+        ReconcileStep::InstallGate {
+            ref endpoint_id,
+            route_epoch,
+        } if endpoint_id == &id("ep_a") && route_epoch == epoch(2)
+    ));
+
+    // A fresher Desired may legitimately supersede the unpublished B edge.
+    // It must not collide with process-local state from the failed replace.
+    let fresher = running_desired_with_endpoints(
+        3,
+        vec![
+            endpoint("ep_a", "a.example.test", 2, 9090),
+            endpoint("ep_b", "b.example.test", 3, 10001),
+        ],
+    );
+    port.expected_disk.push_back(DiskMarker::EndpointClosing {
+        revision: revision(3),
+        endpoint_id: id("ep_b"),
+        route_epoch: epoch(1),
+    });
+    GateSequencer::new(&store, &mut port)
+        .close_gate(&active_a, &fresher, &id("ep_b"), times(25, 26))
+        .expect("fresher B edge supersedes the unpublished one");
+    assert_eq!(
+        snapshot_route(&port.current, "ep_a").gate,
+        RouteGateState::Active
+    );
+    assert_eq!(
+        snapshot_route(&port.current, "ep_a").binding.route_epoch,
+        epoch(2)
+    );
+    assert_eq!(
+        snapshot_route(&port.current, "ep_b").gate,
+        RouteGateState::Closed
+    );
 }
 
 fn endpoint_change_desireds() -> (DesiredRuntimeSpec, DesiredRuntimeSpec) {

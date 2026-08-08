@@ -83,8 +83,9 @@ pub struct FileCheckpointStore {
     cat_id: Id,
     writer_serialization: Mutex<()>,
     // Deliberately process-memory-only. Every `open` starts empty, so a disk
-    // checkpoint can never reconstruct authority to reopen an Endpoint gate.
-    install_continuity: Mutex<Vec<InstallContinuity>>,
+    // checkpoint can never reconstruct authority to execute an Endpoint
+    // effect from its predecessor.
+    endpoint_effect_edges: Mutex<Vec<EndpointEffectEdge>>,
     #[cfg(test)]
     faults: Mutex<TestFaults>,
 }
@@ -168,7 +169,7 @@ impl FileCheckpointStore {
             temporary_path,
             cat_id: cat_id.clone(),
             writer_serialization: Mutex::new(()),
-            install_continuity: Mutex::new(Vec::new()),
+            endpoint_effect_edges: Mutex::new(Vec::new()),
             #[cfg(test)]
             faults: Mutex::new(TestFaults::default()),
         })
@@ -178,76 +179,106 @@ impl FileCheckpointStore {
         &self.target_path
     }
 
-    pub(super) fn arm_install_continuity(
+    pub(super) fn arm_endpoint_effect_edge(
         &self,
-        predecessor: &AdmissionSnapshot,
-        replacement: &AdmissionSnapshot,
-        endpoint_id: &Id,
+        candidate: &EndpointEffectEdge,
     ) -> Result<bool, CheckpointStoreError> {
-        let mut capabilities = self.install_continuity.lock().map_err(|_| {
+        let mut edges = self.endpoint_effect_edges.lock().map_err(|_| {
             CheckpointStoreError::SessionContinuityPoisoned {
                 path: self.target_path.clone(),
             }
         })?;
-        let candidate = InstallContinuity {
-            predecessor: predecessor.clone(),
-            replacement: replacement.clone(),
-            endpoint_id: endpoint_id.clone(),
-        };
-        if capabilities.iter().any(|present| present == &candidate) {
+        if edges.iter().any(|present| present == candidate) {
             return Ok(true);
         }
-        if capabilities
+        if edges
             .iter()
-            .any(|present| present.endpoint_id == *endpoint_id)
-            || capabilities.len() >= 256
+            .any(|present| present.endpoint_id == candidate.endpoint_id)
+            || edges.len() >= 256
         {
             return Ok(false);
         }
-        capabilities.push(candidate);
+        edges.push(candidate.clone());
         Ok(true)
     }
 
-    pub(super) fn install_continuity_status(
+    pub(super) fn endpoint_effect_edge_status(
         &self,
-        predecessor: &AdmissionSnapshot,
-        replacement: &AdmissionSnapshot,
-        endpoint_id: &Id,
-    ) -> Result<InstallContinuityStatus, CheckpointStoreError> {
-        let capabilities = self.install_continuity.lock().map_err(|_| {
+        candidate: &EndpointEffectEdge,
+    ) -> Result<EndpointEffectEdgeStatus, CheckpointStoreError> {
+        let edges = self.endpoint_effect_edges.lock().map_err(|_| {
             CheckpointStoreError::SessionContinuityPoisoned {
                 path: self.target_path.clone(),
             }
         })?;
-        if capabilities.iter().any(|present| {
-            present.endpoint_id == *endpoint_id
-                && present.predecessor == *predecessor
-                && present.replacement == *replacement
-        }) {
-            Ok(InstallContinuityStatus::Exact)
-        } else if capabilities
+        if edges.iter().any(|present| present == candidate) {
+            Ok(EndpointEffectEdgeStatus::Exact)
+        } else if edges
             .iter()
-            .any(|present| present.endpoint_id == *endpoint_id)
+            .any(|present| present.endpoint_id == candidate.endpoint_id)
         {
-            Ok(InstallContinuityStatus::Mismatch)
+            Ok(EndpointEffectEdgeStatus::Mismatch)
         } else {
-            Ok(InstallContinuityStatus::Missing)
+            Ok(EndpointEffectEdgeStatus::Missing)
         }
     }
 
-    pub(super) fn clear_install_continuity(
+    /// Consumes the process-local edge whose exact replacement was observed
+    /// and optionally installs the next exact Endpoint edge atomically. A
+    /// missing current edge is accepted because an exact live postcondition
+    /// is independently sufficient after restart. A conflicting current or
+    /// next edge leaves the set unchanged.
+    pub(super) fn transition_confirmed_endpoint_effect(
         &self,
         replacement: &AdmissionSnapshot,
         endpoint_id: &Id,
-    ) -> Result<(), CheckpointStoreError> {
-        let mut capabilities = self.install_continuity.lock().map_err(|_| {
+        next: Option<&EndpointEffectEdge>,
+    ) -> Result<bool, CheckpointStoreError> {
+        let mut edges = self.endpoint_effect_edges.lock().map_err(|_| {
             CheckpointStoreError::SessionContinuityPoisoned {
                 path: self.target_path.clone(),
             }
         })?;
-        capabilities.retain(|present| {
-            present.endpoint_id != *endpoint_id || present.replacement != *replacement
-        });
+        let mut updated = edges.clone();
+        match updated
+            .iter()
+            .position(|present| present.endpoint_id == *endpoint_id)
+        {
+            Some(index) if updated[index].replacement == *replacement => {
+                updated.remove(index);
+            }
+            Some(_) => return Ok(false),
+            None => {}
+        }
+        if let Some(next) = next {
+            if next.predecessor != *replacement {
+                return Ok(false);
+            }
+            if !updated.iter().any(|present| present == next) {
+                if updated
+                    .iter()
+                    .any(|present| present.endpoint_id == next.endpoint_id)
+                    || updated.len() >= 256
+                {
+                    return Ok(false);
+                }
+                updated.push(next.clone());
+            }
+        }
+        *edges = updated;
+        Ok(true)
+    }
+
+    pub(super) fn clear_endpoint_effect_edge(
+        &self,
+        candidate: &EndpointEffectEdge,
+    ) -> Result<(), CheckpointStoreError> {
+        let mut edges = self.endpoint_effect_edges.lock().map_err(|_| {
+            CheckpointStoreError::SessionContinuityPoisoned {
+                path: self.target_path.clone(),
+            }
+        })?;
+        edges.retain(|present| present != candidate);
         Ok(())
     }
 
@@ -273,6 +304,21 @@ impl FileCheckpointStore {
         checkpoint: &RuntimeCheckpoint,
     ) -> Result<StoredCheckpoint, CheckpointStoreError> {
         self.persist(ExpectedTarget::Exact(expected), checkpoint)
+    }
+
+    /// Re-establishes the directory durability barrier after a caller lost a
+    /// publication acknowledgement, then confirms the exact visible value.
+    /// This never adopts a temp file or treats visibility alone as durable.
+    pub(super) fn confirm_durable_checkpoint(
+        &self,
+        checkpoint: &RuntimeCheckpoint,
+    ) -> Result<bool, CheckpointStoreError> {
+        self.directory.sync_all().map_err(|source| {
+            io_error("sync checkpoint directory", &self.directory_path, source)
+        })?;
+        Ok(self
+            .load_target()?
+            .is_some_and(|stored| stored.checkpoint == *checkpoint))
     }
 
     fn persist(
@@ -459,6 +505,17 @@ impl FileCheckpointStore {
     #[cfg(test)]
     fn maybe_crash(&self, stage: WriteStage) -> Result<(), CheckpointStoreError> {
         let mut faults = self.faults.lock().expect("test fault lock");
+        if let Some(exit) = &mut faults.exit_once {
+            if exit.stage == stage {
+                exit.remaining -= 1;
+                if exit.remaining == 0 {
+                    // SAFETY: this test-only fault deliberately models an
+                    // abrupt process death without running Rust destructors.
+                    // `_exit` never returns and retains no Rust pointers.
+                    unsafe { libc::_exit(TEST_PROCESS_EXIT_CODE) };
+                }
+            }
+        }
         if let Some(crash) = &mut faults.crash_once {
             if crash.stage == stage {
                 crash.remaining -= 1;
@@ -502,6 +559,14 @@ impl FileCheckpointStore {
     }
 
     #[cfg(test)]
+    pub(super) fn inject_process_exit_once(&self, stage: WriteStage) {
+        self.faults.lock().expect("test fault lock").exit_once = Some(TestCrash {
+            stage,
+            remaining: 1,
+        });
+    }
+
+    #[cfg(test)]
     pub(super) fn before_publish_once(&self, hook: impl FnOnce(&Path) + Send + 'static) {
         self.faults.lock().expect("test fault lock").before_publish = Some(Box::new(hook));
     }
@@ -513,18 +578,36 @@ enum ExpectedTarget<'a> {
     Exact(&'a StoredCheckpoint),
 }
 
-/// Exact in-session proof captured from the live AdmissionCell before the
-/// corresponding InstallGate checkpoint is published. This private type has
-/// no wire or persistence representation.
-#[derive(Debug, PartialEq, Eq)]
-struct InstallContinuity {
+/// Exact in-session proof captured from the live AdmissionCell before a
+/// corresponding Endpoint-scoped effect token is published. It is shared by
+/// CloseGate and InstallGate and has no wire or persistence representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct EndpointEffectEdge {
     predecessor: AdmissionSnapshot,
     replacement: AdmissionSnapshot,
     endpoint_id: Id,
 }
 
+impl EndpointEffectEdge {
+    pub(super) fn new(
+        predecessor: AdmissionSnapshot,
+        replacement: AdmissionSnapshot,
+        endpoint_id: Id,
+    ) -> Self {
+        Self {
+            predecessor,
+            replacement,
+            endpoint_id,
+        }
+    }
+
+    pub(super) fn endpoint_id(&self) -> &Id {
+        &self.endpoint_id
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum InstallContinuityStatus {
+pub(super) enum EndpointEffectEdgeStatus {
     Exact,
     Missing,
     Mismatch,
@@ -564,9 +647,13 @@ pub(super) enum WriteStage {
 }
 
 #[cfg(test)]
+pub(super) const TEST_PROCESS_EXIT_CODE: i32 = 86;
+
+#[cfg(test)]
 #[derive(Default)]
 struct TestFaults {
     crash_once: Option<TestCrash>,
+    exit_once: Option<TestCrash>,
     before_publish: Option<BeforePublishHook>,
 }
 
