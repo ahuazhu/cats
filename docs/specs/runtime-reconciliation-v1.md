@@ -371,6 +371,38 @@ EndpointIntent {
 同一spec内`endpoint_id`和`hostname`分别唯一。route epoch
 由Control Store在完整Desired事务中分配；目标非Running时它表达需要关闭的gate。
 
+Endpoint-only revision只允许Endpoint集合/binding变化；placement、runtime identity、lifecycle target、
+volume、mount、network和platform事实必须逐字段不变。对每个changed/removed Endpoint，planner先把新
+Desired的top-level revision/spec digest/placement/incarnation写入RuntimeCheckpoint，同时保留
+`route_gates`中当前实际安装的old binding，并持久化
+`close_gate {endpoint_id, route_epoch: old_binding.route_epoch}`。top-level描述正在应用的新Desired，
+`route_gates`描述当前物理gate，所以close完成前两者可以分别是new revision与old binding；step不复制
+full binding。
+
+执行`CloseGate`前必须重读checkpoint与current Desired：checkpoint top-level tuple必须仍逐字段绑定该
+Desired，step必须在`route_gates`唯一选中同endpoint/old epoch的entry；首次执行时entry为Active，重试时
+只允许它是同一次close写下的Closed。随后在AdmissionCell内以该entry的完整binding做
+`Active -> Closed` compare-and-close，完全相同binding已经Closed是唯一幂等postcondition。任一
+revision/spec/placement/incarnation、entry、binding或epoch不匹配，以及Active/Closed之外的gate变化，都
+零副作用并由current revision重新plan；确定的identity冲突进入Quarantined，绝不能关闭后来revision的
+gate。compare-and-close成功或已经是同binding Closed时把该entry fsync为Closed；结果不明时必须以同
+binding重试compare，或在restart默认Closed后确认postcondition，不能在Active仍可能服务时只写Closed。
+旧epoch永久不得重开。
+
+Endpoint-only顺序固定为：changed/removed A先`CloseGate(A, old_epoch)`，只compare-and-close A并立即
+fsync A Closed，再endpoint-scope cancel/drain A；changed A随后在一次checkpoint replace中把entry替换为
+new binding Closed并把step改为`InstallGate(A, new_epoch)`；removed A在checkpoint仍保留old Closed entry时，
+先在cell内compare exact old binding/Closed并删除该entry，确认absent后才以一次checkpoint replace删除entry
+并推进到下一step，不install。in-process重试可把该exact absence作为remove postcondition，但仍须重做A的
+endpoint-scoped drain；不能把其他missing/mismatch当成功。全新的Endpoint直接从new binding Closed进入
+`InstallGate`。完整binding未变的B，
+其checkpoint entry、内存gate、guards和cancellation都不修改。一个Cat的removed/changed/new Endpoint
+delta按`endpoint_id`稳定升序，每个Endpoint的完整序列完成后才处理下一个，不建立batch token。
+
+`CloseAdmission`只用于lifecycle/placement/runtime identity/volume/mount/network/platform变化以及RequireIdle的
+全局close；Endpoint-only revision不得调用它。Agent restart或任何全局实际/不明close仍要求fresh完整
+Desired提高所有原Active Endpoint的route epoch，不能用`CloseGate`恢复旧epoch。
+
 `RequireIdle` 只用于自动 Running -> Suspended。它就是一个已提交的普通 Desired revision：
 
 1. Control Plane 以当前 Running revision/incarnation 为 compare condition，提交带唯一
@@ -466,7 +498,8 @@ binding精确等于§10.2的`RouteGateBinding`。
 
 HTTP/WebSocket和exec/deploy/control都在同一个cell内检查admission并原子取得guard。收到更新的
 非条件desired后，reconciler在cell内推进`applied_desired_revision`。Endpoint-only revision只
-替换变化Endpoint的serving gate；未变Endpoint的route epoch/gate/guards保持不动。离开Running时
+按§3.2的durable `CloseGate`逐个替换变化Endpoint的serving gate；未变Endpoint的route
+epoch/gate/guards保持不动。离开Running时
 同时关闭全部gate。`RequireIdle`遇Busy时cell完全不变；一旦close，旧epoch永不重开。网络、
 数据库、VMM、枚举和fsync都在cell外。
 
@@ -538,6 +571,12 @@ token，不存在另一个任意payload的`current_effect_token`。非`require_i
 直接观察到guard Busy写`busy {gate_closed:false}`；close后的watcher/quiesce失败和restart遇到结果不明
 的`armed`都写`busy {gate_closed:true}`并保持Closed。只有`gate_closed:false`的Busy允许fresh Running
 保留原route epochs。
+
+`close_gate`的两个字段只选择`route_gates`中的一个old entry；完整expected tuple唯一来自副作用前重读的
+checkpoint top-level与该entry。成功或模糊close经确认后先把同entry持久化为Closed，再以一次atomic
+checkpoint replace把changed entry/InstallGate一起提交；removed则先用仍持久的old Closed binding从cell
+compare-remove，确认absent后再atomic删除checkpoint entry并推进next step。stale step不得
+按endpoint名称猜测、重建binding或操作不匹配的cell entry。
 
 要求：
 
@@ -636,7 +675,8 @@ unit。Inspect、Verify 和 Quarantine 本身不产生外部 effect。
 
 | planner step | 副作用前必须持久化 | 可执行条件与晚到结果 |
 |---|---|---|
-| CloseAdmission | desired/cell revision、原gate集合、RequireIdle attempt state | cell内compare-and-close；Armed模糊结果按Busy且Closed结算，fresh Running只以更高route epochs重开 |
+| CloseAdmission | desired/cell revision、原gate集合、RequireIdle attempt state | 只用于全局lifecycle/placement/runtime/volume/mount/network/platform变化或RequireIdle；cell内compare-and-close全部gate，Armed模糊结果按Busy且Closed结算，fresh Running只以更高route epochs重开；Endpoint-only禁止使用 |
+| CloseGate | `close_gate {endpoint_id, old route_epoch}`及checkpoint top-level、所选old `route_gates`完整entry | 只compare-and-close该Endpoint；revision或完整binding不匹配零副作用，exact same binding Closed是close postcondition；成功/结果不明后确认Closed才fsync且旧epoch不重开。changed以更高epoch另走InstallGate；removed drain后以old Closed binding compare-remove cell entry，确认absent才删除checkpoint entry/推进step，不install |
 | AcquireVolume | normal时完整`VolumeAcquireRequest`（含positive lease duration），takeover时只有authorization id | MetadataStore 精确 CAS；authorization首次消费还要求Active event并原子写`AuthorizationConsumedReceipt`；只有完整typed request或同authorization可adopt，或在 `R == L` 后精确release |
 | PrepareDevices | NBD/tap/socket slot、ownership token | 完整 inventory 后 create-if-absent；晚到资源只按 token adopt 或删除 |
 | FormatFilesystem | attachment、device、filesystem UUID、initialization token、blank predecessor | Guest Agent 只按精确 predecessor 格式化；晚到结果按 UUID probe/adopt，冲突立即 quarantine |
@@ -899,6 +939,7 @@ ReconcileStep =
   { kind: "inspect_inventory", inventory_epoch: Epoch }
 | { kind: "stable", state: "running" | "suspended" | "warm" | "cold" | "deleted" }
 | { kind: "close_admission", require_idle_attempt_id: RandomId128 | null }
+| { kind: "close_gate", endpoint_id: Id, route_epoch: Epoch }
 | { kind: "acquire_volume", request: VolumeAcquireRequest }
 | {
     kind: "prepare_device",
@@ -1935,6 +1976,12 @@ Rejoined；`host_destroyed`永不Rejoined，因此在没有tombstone、其他Hos
 | `R < L` + remote down | Suspend 可完成；Warm/Cold/detach/migrate 阻塞且唯一数据保留 |
 | startup/inventory source down | gates 保持 Closed，Blocked；稳定 Running 的短暂故障为 Degraded |
 | RequireIdle Busy/crash | attempt 只评估一次，Suspended Operation Failed，系统创建新 Running revision |
+| Endpoint-only changed A / unchanged B | A先持久化old binding的`CloseGate`并只关闭A，再fsync A Closed、drain A，以更大epoch持久化new binding Closed并Install；B的entry/gate/guards/cancellation逐字段不变，既有stream与Grant继续 |
+| Endpoint-only remove A | A的old binding compare-and-close并fsync Closed；drain后用仍持久的old Closed entry从cell compare-remove，确认absent才atomic删除checkpoint entry/推进step且无InstallGate；in-process失败可重试A，其他Endpoint不变 |
+| CloseGate effect/fsync失败或模糊结果 | Agent进程仍存活时只重试/确认A，B不修改；A一旦实际或不明close就保持Closed且旧epoch不重开，changed只以fresh更大epoch安装，removed不恢复entry |
+| stale CloseGate遇到new revision/gate | current Desired、checkpoint top-level或cell完整binding/gate任一不匹配即零副作用并重plan/Quarantine；不能关闭新revision gate |
+| 同Cat多Endpoint变化 | planner把removed/changed/new delta按endpoint_id稳定升序，每个Endpoint完整序列完成后才处理下一个，不产生batch token；无进程重启的失败/重试只操作当前entry |
+| Agent进程crash/restart或global close | 内存gate全部实际Closed，全部原Active Endpoint必须由fresh完整Desired提高route epochs；不能声称只恢复当前A，也不能把endpoint-only CloseGate当作旧epoch恢复凭据 |
 | Observation接受响应丢失 | 相同session/sequence/完整payload重放返回原成功，不刷新freshness或重复结算Operation |
 | Observation same-sequence ABA | 同sequence改`observation_id`或任一嵌套字段返回`observation_sequence_conflict`且零副作用；更小sequence返回stale |
 | Node A observation结算Node B Operation | 顶层Node、Operation/applied/current placement Node不全等时返回`wrong_placement`；不接受observation、不推进sequence/freshness且不结算任何Operation |

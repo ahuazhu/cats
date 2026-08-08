@@ -85,17 +85,18 @@ signer单独读取。`desired_revision`仍是协调与签发snapshot条件，但
 不明，重开前也必须通过新的完整Desired递增。Node任意时刻只安装一个epoch，不保留双epoch窗口。
 只检查到RequireIdle Busy且cell从未close时可以保留原epoch。
 
-Node 应用仅含 Endpoint 变化的 revision 时，按 Endpoint scope执行，每次gate变化都在
-`AdmissionCell`内线性化：
+Node应用仅含Endpoint变化的revision时使用[Runtime Reconciliation v1](runtime-reconciliation-v1.md)
+定义的durable `CloseGate`，不得调用全局`CloseAdmission`。每次gate变化都在`AdmissionCell`内线性化：
 
-- changed/removed Endpoint先变为Closed，只取消并drain它自己的guards；若以后重开必须使用更大
-  route epoch；
+- changed/removed Endpoint先持久化只含endpoint ID/old route epoch的`CloseGate`，以checkpoint中同一
+  old entry的完整binding compare-and-close，立即fsync Closed，再只取消并drain它自己的guards；若以后
+  重开必须使用更大route epoch；
 - binding、route epoch、runtime incarnation和platform target都未变化的其他Endpoint不修改
   serving gate，不关闭、不重绑，也不取消已有guards；
 - new/changed Endpoint 在其 platform target Ready 且 checkpoint 已持久化后才发布 Active。
 
 因此Endpoint A的变化不会中断Endpoint B的active stream或新请求，B的既有Grant继续有效。若
-revision还改变placement、runtime identity、磁盘、mount或lifecycle target，它不是Endpoint-only
+revision还改变placement、runtime identity、volume、mount、network、platform或lifecycle target，它不是Endpoint-only
 revision，必须走全局close-and-drain；之后重开全部受影响Endpoint时提高各自route epoch。
 
 ## 3. Signer snapshot
@@ -220,8 +221,31 @@ reconciler先fsync包含current desired依据的checkpoint，再短暂进入`Adm
 关闭，因此新AgentSession建立后，Control Plane必须提交提高所有原Active Endpoint route epochs的
 系统Desired revision；Node不能直接把checkpoint中的旧epoch重新发布Active。
 
-离开 Running、runtime replacement、Node drain 或 placement change，在 cell 内同时关闭全局
-lifecycle admission 和全部 Endpoint gates。`CancelAndDrain` 在 cell 外持久化 close、取消对应
+Endpoint-only changed/removed A的durable close顺序固定为：
+
+1. checkpoint top-level先绑定new current Desired的revision/spec/placement/incarnation；
+   `route_gates[A]`仍保存当前实际安装的old完整binding/Active，step写
+   `close_gate {endpoint_id:A, route_epoch:old_epoch}`并fsync。step不复制binding。
+2. effect前重读checkpoint和current Desired，逐字段重验top-level tuple，并由step唯一选择A的old entry；
+   在cell内只允许相同完整binding的`Active -> Closed`，相同binding已Closed是唯一幂等postcondition。
+   任一revision或binding不匹配都零副作用，交给current revision重plan；identity冲突Quarantine。
+3. close成功后立即把A entry fsync为Closed，再只cancel/drain A。响应/进程结果不明时必须以同binding
+   重新compare，或依赖restart默认Closed确认postcondition后持久化；绝不能在Active仍可能服务时只写Closed。
+   一旦实际或不明close，old epoch永久不得重开。
+4. changed A在drain后以一次checkpoint replace把entry替换为new完整binding/Closed并把step改为
+   `InstallGate(A,new_epoch)`，只安装更大epoch；removed A在checkpoint仍保留old Closed binding时，先在
+   cell内compare exact old binding/Closed并删除entry，确认absent后才以一次replace删除checkpoint entry、
+   推进next step且不install。in-process retry可接受该exact absence，但仍重做A的drain；其他missing或
+   binding mismatch不能adopt。new Endpoint没有old entry，直接从new binding/Closed进入InstallGate。
+
+完整binding不变的B，其checkpoint entry、cell gate、guards和cancellation handles都不得修改；已有stream和
+缓存Grant继续。一个Cat的removed/changed/new Endpoint delta按endpoint ID稳定升序，每个Endpoint完整序列
+完成后才处理下一个，不引入batch close token。
+stale CloseGate遇到new revision或new binding只能零副作用，不能按endpoint ID误关新gate。
+
+`CloseAdmission`只用于离开Running、runtime replacement、Node drain、placement、volume、mount、network、
+platform变化以及下面的RequireIdle；它在cell内同时关闭全局lifecycle admission和全部Endpoint gates，
+Endpoint-only revision不得使用。`CancelAndDrain`在cell外持久化close、取消对应
 transport 并有界等待 guards 归零；超时就保持 runtime 和 writer，报告 Blocked，不能继续 pause、
 snapshot、detach 或 teardown。active WebSocket 不因 token TTL 中断，只由显式 cancellation/drain、
 连接端点或 Agent 进程故障结束。
@@ -316,8 +340,18 @@ observation revision，不能把desired revision塞回Grant vector。
 - 四个`Id` claims使用Runtime边界；time claims在0与`i64::MAX`边界解析一致，所有TTL/skew/retention
   checked arithmetic的overflow/underflow都fail closed；
 - admission 与 close 并发时，close 线性化点后没有新 guard；panic/cancel/timeout 不泄漏 guard；
-- unbind A只取消A；B的active WebSocket与新admission不中断，serving gate/epoch不变；
+- changed A先以durable CloseGate关闭/fsync old binding，再以更大epoch安装new binding；remove A关闭/drain
+  后先从cell compare-remove exact old Closed entry，确认absent才删checkpoint entry/advance且不install；
+  unbind A只取消A，B的checkpoint entry、gate、guards、active WebSocket与新
+  admission不中断，serving epoch不变；
+- CloseGate在cell close前、close后fsync前、Closed后替换/删除前分别注入不终止Agent的effect/fsync
+  失败；重试只操作A并确认同binding Closed，old epoch不重开；stale token遇new revision/binding零副作用
+  且不能关闭new gate；
+- 同Cat removed/changed/new delta按endpoint ID稳定逐个执行；不生成batch close；无进程重启的失败/重试
+  当前A不修改B；
 - `RequireIdle` guard Busy不改变cell/epoch；任何实际或不明close后旧epoch不能重开；
+- 在上述每个边界另行kill Agent；restart使全部内存gate实际Closed，必须提高全部原Active Endpoint epochs，
+  不能声称只恢复A，也不把CloseGate当作旧epoch恢复依据；
 - app port未监听产生 `UpstreamUnavailable`，不把 platform gate误报为未Ready，不刷新 route；
 - pre-admission stale rejection与新resolve竞争时，旧 digest不能删除新entry；当前POST和WebSocket
   upgrade都不重放；

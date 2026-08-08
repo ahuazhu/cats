@@ -44,10 +44,20 @@ platform Ready、installed Endpoint gate，且active signer `kid`属于`loaded_k
 PostgreSQL `accepted_at_unix_ms`。partial heartbeat不能覆盖full attestation。任一事实不成立就不签发；
 Node自报时间、旧observation、未来revision和lookup index单独读取都不能授权。
 
-Endpoint A的mutation创建新desired revision时，只提高A的route epoch并关闭/drain A；binding和
-route epoch完全未变的Endpoint B不修改serving gate，已有stream和旧Grant继续有效。若revision
-同时改变runtime/placement/lifecycle，则关闭全局gate和全部Endpoint；任何实际close后的reopen都
-先通过新完整Desired提高相应Endpoint route epochs。Node任意时刻只接受一个epoch。
+Endpoint A的mutation创建新desired revision时，只提高A的route epoch，并先用checkpoint中的durable
+`CloseGate {endpoint_id, old route_epoch}`精确关闭/fsync old binding，再drain A；changed A才持久化new
+binding Closed并InstallGate；removed A在checkpoint仍保留old Closed binding时先从cell compare-remove，
+确认absent后才删除checkpoint entry/推进step且不install。changed entry/InstallGate和removed deletion/next
+step各自使用一次checkpoint replace。step不复制full binding，expected tuple来自
+checkpoint top-level revision/spec/placement/incarnation与同一old entry。任一revision/binding不匹配都
+零副作用，不能关闭后来revision的gate。binding和route epoch完全未变的Endpoint B不修改checkpoint
+entry、serving gate、guards或cancellation，已有stream和旧Grant继续有效。同Cat的removed/changed/new
+Endpoint delta按endpoint ID稳定，每个完整序列一次一个，不建立batch token。
+
+若revision同时改变runtime/placement/lifecycle/volume/mount/network/platform，则使用全局`CloseAdmission`关闭
+全部Endpoint；Endpoint-only不得使用它。任何实际或不明close后的reopen都先通过新完整Desired提高相应
+Endpoint route epochs。Agent restart/global close仍提高全部原Active Endpoint epochs，不能靠CloseGate
+恢复旧epoch。Node任意时刻只接受一个epoch。
 
 platform Ready 指 VMM、network、完整 disks/mounts 和 Guest transport Ready，不要求用户应用已经
 监听 target port。应用 health是独立产品策略。
@@ -59,7 +69,10 @@ platform Ready 指 VMM、network、完整 disks/mounts 和 Guest transport Ready
 cancellation handles。token验证后的binding compare、gate check和guard increment在其中线性化；
 它不执行网络、数据库、VMM、文件或fsync I/O，也不持锁跨`.await`。
 
-gate先写入并fsync RuntimeCheckpoint，再发布到内存；observation只能随后报告Active。Agent启动/
+gate先写入并fsync RuntimeCheckpoint，再发布到内存；observation只能随后报告Active。Endpoint-only
+close先fsync只含Endpoint/old epoch的CloseGate token，在cell内compare-and-close同entry完整old binding，
+再fsync该entry Closed；相同binding已Closed是幂等postcondition，结果不明必须以同binding重试，或在
+restart默认Closed后确认，确认前不能只写Closed。旧epoch永不重开，new binding必须使用更大epoch。Agent启动/
 重启先结合current desired、checkpoint和complete physical inventory重建，证明闭合前全部Closed。
 
 离开Running、runtime replacement、Node drain或placement change先关闭全部admission，再在cell外
@@ -120,7 +133,9 @@ Running热路径不依赖Control Plane，撤销不必等待TTL；代价是Node�
 管理guards和key ring，Gateway必须接受per-replica warm-cache的明确可用性边界。
 
 上线前至少证明：signer拒绝stale desired/observation revision，Node拒绝错误runtime incarnation/
-route epoch；close竞态后无新guard；A变更不取消B；
+route epoch；close竞态后无新guard；changed/removed A在close、fsync、replace/delete各边界的in-process
+失败/重试只操作A，stale CloseGate不关闭new binding，A变更不修改或取消B；若Agent进程crash则全部
+内存gate实际Closed并提高所有原Active Endpoint epochs，不能声称只恢复A；
 RequireIdle guard Busy且cell从未close时不关闭route；任何实际或不明close后旧epoch不得重开，且
 attempt始终不复用；active HTTP/WS正确drain；app port failure不刷新；当前request不重放；cache/DB
 慢路径有硬界；rotation全过程fail closed；Control Plane outage的warm/cold Gateway边界与Host
