@@ -597,7 +597,7 @@ unit。Inspect、Verify 和 Quarantine 本身不产生外部 effect。
 | PauseRuntime | runtime incarnation、process start time | 只 pause 该 incarnation；晚到 pause 可发生，当前 revision 负责 resume 或重建 |
 | SnapshotWarmRuntime | runtime incarnation、snapshot temp id、source root/epoch | 验证VMM postcondition与durable rename；晚到文件不覆盖其他WarmRuntimeSnapshot |
 | StopRuntime | runtime incarnation、process start time、scope id | 只 stop 该 incarnation；晚到 stop 可发生，当前 revision 负责重建 |
-| CleanupRelease | 全部物理 identity、`R == L`/disposition、当前 desired 读取位置 | 只删匹配资源、只 release 精确 owner/epoch；stale cleanup 不得按可重算名称删除新资源 |
+| CleanupRelease | 完整`CleanupTarget`、full-scan inventory epoch、`R == L`/disposition、当前 desired 读取位置 | 只删匹配资源、只 release 精确 owner/epoch；`orphan_scope`重读token/cgroup并证明无live PID/process，`control_socket`重读token并证明无live owner，`checkpoint_file`重读并重算digest/完整identity且由当前Desired/tombstone证明不再需要；重建或身份变化后的stale cleanup必须拒绝 |
 | DeleteDisposableRoot | delete authorization、精确lineage、owner/epoch/head | 无live DiskSnapshotRecord且Guest/VMM/blockd已停后，按event/auth/volume/control锁序原子写Consumed receipt及两边Deleting；成功后才删该`R < L`lineage |
 | InstallGate | desired checkpoint、spec digest、placement、runtime incarnation、endpoint/route epoch | cell只接受一个serving epoch；任何已close gate必须由更大epoch重开 |
 
@@ -858,6 +858,26 @@ CleanupTarget =
 | { kind: "network", network_id: Id, ownership_token: RandomId128 }
 | { kind: "warm_snapshot", snapshot_id: Id }
 | { kind: "scope", scope_id: Id, process_start_time_ticks: U64 }
+| {
+    kind: "orphan_scope",
+    scope_id: Id,
+    cgroup_path: HostPath,
+    ownership_token: RandomId128
+  }
+| {
+    kind: "control_socket",
+    socket_path: HostPath,
+    ownership_token: RandomId128
+  }
+| {
+    kind: "checkpoint_file",
+    checkpoint_path: HostPath,
+    content_digest: Sha256Digest,
+    cat_id: Id,
+    node_id: Id,
+    placement_epoch: Epoch,
+    desired_revision: Revision
+  }
 
 VolumeHeadEvidence {
   volume_id: Id,
@@ -870,6 +890,21 @@ VolumeHeadEvidence {
 `source_heads`按`volume_id`升序且无重复。`ObservedRuntimeStatus.step`与valid checkpoint中的`step`必须
 逐字段相同；missing/corrupt checkpoint只能处于`inspect_inventory`或`quarantined`。这里的step闭集
 就是§7 planner当前允许的窄effect，不是可扩展workflow或通用command envelope。
+
+`scope`是仍有精确process identity的进程绑定cleanup；已无进程的scope只能从
+`NodeResidue.systemd_scope`产生`orphan_scope`。只有`ownership_token.kind="valid"`的
+`systemd_scope`或`control_socket` residue才能分别产生对应target，并逐字段复制
+scope/cgroup/path/token；missing/corrupt token不得产生target。执行`orphan_scope`前必须
+重读token并确认逐字节相同、cgroup仍是同一个，且没有live PID或matching
+`ProcessEvidence`；执行`control_socket`前必须重读相同token，且没有live process
+拥有该socket。
+
+`checkpoint_file`只能从`ResidueCheckpointFileEvidence.valid`产生，且target必须逐字段
+复制path/content digest/Cat/Node/placement/revision。删除前必须重读文件，按§16.2
+重算并核对content digest及完整identity，还必须由Control Plane当前Desired或
+tombstone证明该checkpoint已不需要。`ResidueCheckpointFileEvidence.corrupt`不得产生
+target，只能Quarantine/人工处理。scan后任一资源被重建，token、cgroup或
+digest/identity发生变化时，旧cleanup必须拒绝，不得按可重算名称或path删除。
 
 `CheckpointEvidence.valid.content_digest`必须等于§16.2对完整`RuntimeCheckpoint`（包括process、volume、
 device、mount、network、Guest transport、snapshot、route gate和RequireIdle事实）计算的digest；valid
@@ -1589,7 +1624,10 @@ HostFenceEvent上的隔离lineage由event/rejoin记录继续跟踪，关联的au
 | N/N+1/N+2 ABA | 旧结果不能结算/授权 N+2；已线性化的本地 effect 可被下一轮安全修复 |
 | 双 Agent / register 响应丢失 | Host lock 排他；同 attempt 返回同 session；旧 session 永久拒绝 |
 | 各 planner step kill | restart 后确认、重试、继续或 quarantine；无重复 writer/误删 |
-| 进程已死但scope/socket/checkpoint仍存在 | full inventory分别报告standalone scope/cgroup、无live process socket和无法归属checkpoint；digest覆盖，token/content不可信时禁止按名字清理 |
+| 进程崩溃，scope/socket/checkpoint仍存在 | full inventory报告三类standalone residue；valid evidence产生精确CleanupRelease，cleanup后的full rescan报告residue为空，Running可重新满足Ready |
+| scan与cleanup之间资源被重建 | token、digest、cgroup或process identity任一不匹配时旧cleanup拒绝，新资源保留 |
+| standalone scope/socket token missing或corrupt | 不生成CleanupTarget，不删除，进入Quarantined/人工处理 |
+| standalone checkpoint corrupt | 不生成`checkpoint_file` target，不自动删除，进入Quarantined/人工处理 |
 | normal acquire 遇到旧 owner | Blocked，不 revoke；只有精确逐卷 takeover authorization 可 CAS |
 | Running 改盘/shape | 请求先 PreconditionFailed(MustBeCold)；Cold 成功后的新请求才改完整 spec |
 | `R < L` + remote down | Suspend 可完成；Warm/Cold/detach/migrate 阻塞且唯一数据保留 |
