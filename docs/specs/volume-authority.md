@@ -315,8 +315,10 @@ Host 上每个需要恢复的 volume 派生独立 `VolumeTakeoverAuthorization`�
 event。
 
 `host_destroyed`复用同一event行，只能来自provider adapter验证过的HostDestroyed receipt。receipt必须
-逐字段绑定event及provisioned `NodeIdentity.state_path_id`，并证明承载该state path的
-provider storage永久销毁；network isolation、power state或普通`isolated`不能升级推断出这个事实。
+把provider、immutable Host、node及expected boot/session逐字段绑定event，并把immutable Host、node和
+state path绑定该event创建时锁定的`NodeIdentity` immutable lineage（该row此后可以retired）；provider
+adapter还必须证明承载该state path的storage永久销毁。network isolation、power state或普通`isolated`
+不能升级推断出这个事实。
 Active event可以直接以`host_destroyed`建立，或从`isolated`单调更新；receipt一经提交不可变，相同
 receipt重放只读原结果，任一字段不同都拒绝。`host_destroyed`不会转为Rejoined；替换Host必须使用新的
 provisioned identity。
@@ -326,7 +328,12 @@ authorization、receipt或disposition闭环。
 旧 Host 恢复时先进入隔离rejoin流程：提高AgentSession epoch，枚举并停止全部旧VMM/blockd，按
 `VolumeLocalIdentity`把所有失效epoch目录移入quarantine，并证明旧route、socket和进程均不可用。
 
-授权派生、授权首次消费和`Active -> Rejoined`都先锁同一个event行。rejoin事务取得该锁后，按
+从`isolated`升级时先锁同一event行，并用`state=Active`、`isolation_state={kind:"isolated"}`及未改变的
+完整event tuple（`event_id`、provider、immutable host、node、expected boot/session、fence attempt和
+`observed_at`）做exact CAS。`isolated -> host_destroyed`、授权派生、授权首次消费、
+`Active -> Rejoined`和使用HostDestroyed proof的Runtime tombstone GC都持有该行锁到事务提交并重验各自
+要求的state、isolation variant和event tuple；竞争事务只能按锁取得顺序提交，后一方不得沿用旧读取。
+rejoin事务取得该锁后，按
 `authorization_id`稳定顺序锁定该event的全部授权，因此不存在已经开始但尚未被它观察的首次消费。
 它逐项验证：
 

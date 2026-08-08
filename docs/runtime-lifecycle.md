@@ -117,7 +117,8 @@ HostFenceEvent仍Active，该receipt保留到Rejoined。
 Deleted Desired 作为 tombstone 保留，直到无可服务runtime/route、卷 disposition完成，且GC absence
 proof严格二选一：负责Node当前session接受的complete inventory精确证明
 checkpoint absent，或现有`HostFenceEvent`中的provider HostDestroyed receipt绑定旧Host/state path并
-证明其storage永久销毁，同时由该Cat保留的tombstone/placement/session index匹配event。后者不伪造
+证明其storage永久销毁，同时由该Cat保留的tombstone/placement及immutable Host/state-path lineage匹配
+event；index最新boot/session不必等于event的fence session。后者不伪造
 AgentSession/inventory；一个Host event可验证多个Cat，network/power isolation不够，且两条路径都不能
 跳过逐卷authorization、receipt和disposition闭环。
 

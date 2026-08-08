@@ -122,7 +122,10 @@ CredentialBinding =
 `credential_binding`是严格one-of；两个variant的字段不能同时出现。`public_key_spki_sha256`覆盖
 SubjectPublicKeyInfo DER，而不是PEM文本。`provider`是adapter的稳定名字，`principal`是该provider
 已经认证的不可变principal ID。`state_path_id`只是provisioner绑定的逻辑ID，不暴露或允许注册请求
-覆盖Host路径。
+覆盖Host路径。`(node_id, immutable_host_id, state_path_id)`在provision时一次写定，此后不可修改或
+复用；其中Host/state-path pair也不能重新绑定到另一NodeIdentity。retire只改变`state`并保留这组lineage。
+替换Host、替换state path或重新provision都必须取得新的`node_id`和未使用过的Host/state-path lineage，
+不能复活retired identity或把旧`node_id`绑定到另一组Host/state path。
 
 每个 Node 使用独立 credential。注册端同时验证 credential、`node_id` 和
 `immutable_host_id` 的预置绑定；共享 fleet token、调用方任意指定 `node_id`、仅凭
@@ -744,20 +747,27 @@ Desired的`attachment_id`、revision、placement必须与authorization一致，�
 必须引用该authorization。精确schema/CAS以[Volume Authority](volume-authority.md)为准。
 
 普通provider isolation receipt只建立`isolated`的Active HostFenceEvent。`host_destroyed`只能来自
-provider adapter验证过的HostDestroyed receipt；receipt各identity必须逐字段等于event、provisioned
-`NodeIdentity.state_path_id`，且adapter必须证明承载该state path的provider storage已
+provider adapter验证过的HostDestroyed receipt；receipt的provider、immutable Host、node及expected
+boot/session必须逐字段等于event，receipt的immutable Host、node和state path还必须等于该event创建时
+锁定的`NodeIdentity` immutable lineage（该row此后可以retired）。adapter必须证明承载该state path的
+provider storage已
 永久销毁，不能仅把实例状态、网络隔离或断电翻译为该variant。Active event可以直接以
-`host_destroyed`建立，或把`isolated`单调更新为`host_destroyed`；receipt一经提交不可变，相同receipt重放
-只读原结果，任何字段不同的重放都拒绝。`host_destroyed`不会转为Rejoined；替换Host必须使用新的
-provisioned identity。两种receipt都不直接授予placement或writer。Control Plane先把旧
+`host_destroyed`建立，或把`isolated`单调更新为`host_destroyed`。后一种更新先锁该
+`HostFenceEvent`行，并用`state=Active`、`isolation_state={kind:"isolated"}`及未改变的完整event tuple
+（`event_id`、provider、immutable host、node、expected boot/session、fence attempt和`observed_at`）做
+exact CAS；receipt一经提交不可变，相同receipt重放只读原结果，任何字段不同的重放都拒绝。
+`host_destroyed`不会转为Rejoined；替换Host必须使用新的provisioned identity。两种receipt都不直接授予
+placement或writer。Control Plane先把旧
 Pending Operation置为`Failed(HostLost)`，再在一个事务中创建新完整Desired/Operation、placement、
 全部新attachments和每卷VolumeTakeoverAuthorization；新Desired逐卷引用授权。目标Node消费所有
 MetadataStore CAS后才能Ready，不存在另一种writer-proof fallback。
 
 session失效或提高attachment epoch不是解除旧Host隔离的条件。旧Host重用前必须在隔离网络内以
 新boot/session完成完整inventory，保持gates Closed，停止旧runtime/transport/socket/tap/guards，
-并把旧epoch的`R < L` lineage移入quarantine而非删除。授权派生、首次消费和
-`Active -> Rejoined`都先锁同一event行；rejoin再按稳定顺序锁定该event的全部授权，所以不会漏掉
+并把旧epoch的`R < L` lineage移入quarantine而非删除。`isolated -> host_destroyed`、授权派生、首次消费、
+`Active -> Rejoined`和使用HostDestroyed proof的tombstone GC都先锁同一event行并持有到事务提交，再重验
+各自要求的state、isolation variant和完整event tuple；竞争事务只能按锁取得顺序提交，后一方必须基于
+前一方已提交的状态重新判定，不能用旧读取继续。rejoin再按稳定顺序锁定该event的全部授权，所以不会漏掉
 in-flight首次消费。Control Plane核对每个Unconsumed授权都已过`not_after`，每个Consumed授权都有
 匹配payload的不可变receipt；当前VolumeRecord必须是receipt直接结果或更大epoch的合法状态机后继，
 receipt含Disk postcondition时Control Disk也必须匹配同一Deleting；两边记录已删除时必须有精确
@@ -1760,8 +1770,11 @@ Warm/Cold/Deleted必须为null。Superseded的revision必须更大，且不能�
 前进：`updated_at_unix_ms >= created_at_unix_ms`，terminal completion等于`updated_at_unix_ms`。
 standalone `Operation` decode/validation还必须逐字段要求
 `terminal.succeeded.result.node_id == Operation.placement.node_id`，以及
-`terminal.failed.error.host_lost.node_id == Operation.placement.node_id`；不等分别返回指向
-`/terminal/result/node_id`或`/terminal/error/node_id`的
+`terminal.failed.error.host_lost.node_id == Operation.placement.node_id`。若failed precondition reason是
+`placement_rejected`，还必须要求其`node_id`和`placement_epoch`分别等于
+`Operation.placement.node_id/placement_epoch`。不等分别返回指向`/terminal/result/node_id`、
+`/terminal/error/node_id`、`/terminal/error/reason/node_id`或
+`/terminal/error/reason/placement_epoch`的
 `malformed_payload {problem:"invalid_value"}`，不能等到observation settlement才发现。
 `contract_error`只允许当前已提交Desired自身的`unsupported_version`或`malformed_payload`；stale/wrong
 session、stale/conflicting observation sequence、revision、digest或placement只拒绝那次输入，
@@ -1784,6 +1797,14 @@ session、stale/conflicting observation sequence、revision、digest或placement
   引用，不复制可变observation内容。
 - 上述四处Node不全等时，整个NodeObservation按§16.4的固定优先级返回`wrong_placement`。
   该拒绝不得推进最高heartbeat sequence、写observation/attestation/freshness或结算任何Operation。
+- observation通过§16.4既有session/sequence/revision/digest/placement检查、开始用
+  `precondition_failed` Condition结算当前Operation时，任何
+  `reason.kind="placement_rejected"`都必须先逐字段匹配该Operation的完整placement。Node或epoch不等时返回
+  `malformed_payload {problem:"invalid_value"}`，pointer分别固定为
+  `/runtimes/{runtime_index}/conditions/{condition_index}/reason/node_id`或
+  `/runtimes/{runtime_index}/conditions/{condition_index}/reason/placement_epoch`；index是输入canonical array
+  中的十进制数值位置。多个condition候选按§16.4逻辑path选择；同一reason两字段都不等时选择`node_id`。
+  该拒绝作用于整份observation且零副作用，不能写入一个与Operation placement不一致的terminal reason。
 - 新 revision 在同一事务把旧 Pending Operation 变为 Superseded。
 - PreconditionFailed、永久请求错误、HostLost 或 Quarantined 使当前 Pending Operation Failed。
 - Progressing、Blocked、Degraded 和暂时离线保持 Pending。
@@ -1813,9 +1834,13 @@ Operation Succeeded、NodeCleanupCheckpoint已写槽或某次partial observation
 
 这里的关联observation index不是新wire合同或authority，而是Control Plane对已接受
 `NodeObservation`保留的最小投影：`cat_id`、完整`AssignedPlacement`、`node_boot_id`、
-`agent_session_epoch`、最后一次full evidence的`checkpoint_path`，以及若曾接受valid checkpoint时的逻辑
-identity和`content_digest`。这些字段分别直接来自同一个已接受的顶层observation/runtime evidence；GC前
-不能被partial observation覆盖或丢弃。
+`agent_session_epoch`、`immutable_host_id`、`state_path_id`、最后一次full evidence的`checkpoint_path`，
+以及若曾接受valid checkpoint时的逻辑identity和`content_digest`。接受observation并写入或替换该index的
+同一事务必须锁定当时仍为provisioned的`NodeIdentity`，从中复制不可变的
+`immutable_host_id/state_path_id`；其余字段直接来自同一个已接受的顶层observation/runtime evidence。
+这两个服务端字段不进入`NodeObservation` wire或inventory digest。同一index已有不同Host/state-path
+lineage时拒绝该observation，不能覆盖。retire后只要仍有index、tombstone或HostFenceEvent引用，就保留
+同一NodeIdentity row供验证；GC前index不能被partial observation覆盖或丢弃。
 
 1. **Node inventory**：原placement Node仍存在或已重连。当前AgentSession的
    `complete_inventory=true` observation已接受且digest验证成功；其
@@ -1828,9 +1853,13 @@ identity和`content_digest`。这些字段分别直接来自同一个已接受�
    corrupt或other-Cat文件是冲突，不是absence，必须保留文件并拒绝GC。
 2. **HostDestroyed**：负责旧placement的Host无法再提供inventory。Control Plane锁定现有
    `HostFenceEvent`，验证其中§9 `HostDestroyedReceipt`的provider、immutable host、node、expected boot、
-   expected session epoch和`state_path_id`逐字段绑定provisioned NodeIdentity及event。GC事务还必须重读
-   该Cat现有Deleted tombstone和保留的placement/session index：tombstone完整`AssignedPlacement`必须等于
-   index中该Cat的旧placement，二者的`node_id`等于event，index的boot/session epoch等于event expected值。
+   expected session epoch逐字段等于event；event/receipt的`node_id`和`immutable_host_id`、以及receipt的
+   `state_path_id`还必须逐字段等于该event创建时锁定、现为provisioned或retired的同一NodeIdentity
+   immutable lineage。GC事务还必须重读该Cat现有Deleted tombstone和保留index：tombstone完整
+   `AssignedPlacement`必须等于index中该Cat的旧placement，二者的`node_id`等于event，index的
+   `immutable_host_id`等于event、receipt及该NodeIdentity，`state_path_id`等于receipt及该NodeIdentity。
+   index中最近接受的boot/session可以晚于event的expected boot/session，不能参与此GC匹配；event的expected tuple仍只绑定
+   原fence/rejoin序列，不能被新session改写。
    receipt的`state_storage_disposition="permanently_destroyed"`必须已由provider adapter证明承载Host state
    path的storage永久销毁。一个Host级event可用同一Host tuple分别验证多个Cat，各Cat仍只使用自己的
    tombstone/index绑定，不在event中复制Cat列表或placement。此分支不要求、也不得伪造AgentSession、
@@ -2112,27 +2141,45 @@ cleanup、无法归属及missing/corrupt evidence都不得产生cleanup。
 
 GC tests必须分别覆盖Node inventory和HostDestroyed两个分支：Node分支要求当前session、complete inventory、
 tombstone读取位置和精确path missing；HostDestroyed分支逐字段改变provider、immutable host、node、boot、
-session epoch、state path、storage disposition，以及该Cat retained placement/session index中的placement
-epoch或boot/session，都必须拒绝，network isolation/断电也必须拒绝，且不得创建AgentSession/inventory
-占位。同一Host两个Cat使用不同placement epoch时必须能各自匹配同一HostDestroyed event。两个分支都要在
+session epoch、state path、storage disposition，以及该Cat retained index中的placement epoch、immutable
+host或state path，都必须拒绝，network isolation/断电也必须拒绝，且不得创建AgentSession/inventory
+占位。必须接受`S0 isolated -> S1 cordoned complete inventory -> 同一Active event HostDestroyed -> GC`，
+此时index可以保存S1 boot/session而event继续保存S0 expected tuple；也必须接受S1首次complete inventory前
+即HostDestroyed，此时index仍保留S0 boot/session。同一Host两个Cat即使index分别来自S0/S1且placement epoch不同，也必须能各自匹配
+同一HostDestroyed event。以相同`node_id`换immutable Host或state path的reprovision/ABA必须拒绝。两个分支都要在
 每个volume authorization/receipt/disposition未闭合时拒绝；在proof校验或GC事务任一点crash后，tombstone
 与index必须全有或全无。HostDestroyed逐卷恢复记录的GC还必须测试最后一个tombstone/recovery引用消失前
 拒绝、全部authorization terminal且disposition闭合后允许、事务crash全有或全无；compact event若仍被
 Operation引用则保留。
 
+HostFenceEvent concurrency tests必须覆盖`isolated -> host_destroyed`与authorization派生/首次消费、
+`Active -> Rejoined`及HostDestroyed tombstone GC并发：所有事务都先取得同一event行锁再重验。upgrade与
+rejoin只能由先提交者决定终态，后一方的exact CAS必须拒绝；GC先取得锁时因尚无HostDestroyed proof拒绝，
+upgrade先提交时GC只能看到完整不可变receipt；derive/consume与upgrade可以依锁序先后完成，但不能基于旧
+`isolated`读取越过已提交状态。每个锁取得顺序和事务crash点都不得出现半个receipt、漏authorization或
+proof与tombstone/index非原子。
+
 Operation settlement negative tests必须分别改变顶层`NodeObservation.node_id`、Operation/applied/current
 三处placement Node和applied/Operation/current/stable/result五处target中的每一处。Node A observation不得
 结算Node B Operation；每个Node不匹配都按§16.4固定优先级返回`wrong_placement`，且不接受observation、
 不推进最高sequence或freshness、不写terminal result。其他placement或target不等也不得结算Operation。
-另以standalone Operation decoder分别改变Succeeded result和Failed HostLost error的`node_id`，必须在
-持久化前按上述精确pointer拒绝；匹配placement的正例必须接受。
+另以standalone Operation decoder分别改变Succeeded result、Failed HostLost error的`node_id`，以及Failed
+PreconditionFailed PlacementRejected reason的`node_id`、`placement_epoch`和两者，必须在持久化前按上述
+精确pointer拒绝；两者同时错误时固定选择`node_id`。observation settlement也要分别覆盖条件中Node、epoch
+和两者不匹配，pointer指向该condition的精确reason字段且整份observation零副作用；匹配placement的正例
+必须接受。stale session与placement_rejected mismatch并存时必须先返回session error，且不读取或结算
+Operation。
 
 negative tests还必须覆盖route gate外层`endpoint_id`作为unknown field被拒绝、
 `runtime_identity_conflict`单个different identity合法、只有expected identity非法、`duplicate_runtime`少于
 两个different identity非法，以及invalid UTF-8、invalid JSON、duplicate field、invalid type/value按§16.4
 优先级返回且前两者pointer为空。pointer边界测试必须覆盖unknown key、member中的`~`/`/`分别转义为
 `~0`/`~1`、转义后恰好512 bytes仍返回精确pointer，以及原key未超限但转义后超过512 bytes时固定返回
-根空string且绝不截断。
+根空string且绝不截断。decoder确定性还必须覆盖：交换object member输入顺序不改变所选错误；同一payload
+各自包含多个unknown、duplicate、missing或type错误时选择固定逻辑path；array index 2和10同时错误时选择
+数值较小的2；超限array在第`maximum + 1`项之后的非法JSON、duplicate key、unknown field或invalid type仍按
+更高阶段返回，而不是提前返回`array_items`；多个长escaped pointer候选先按未转义逻辑path选择，再测试
+恰好512和超过512时的精确pointer/root fallback。
 
 ### 16.4 跨组件 typed errors
 
@@ -2257,17 +2304,37 @@ ContractName = "node_identity" | "agent_registration_attempt" | "agent_session"
 ```
 
 `message`只供人读，接收方只能按`error.code`及typed payload分支。`json_pointer`使用RFC 6901文本，根
-对象是空string。`malformed_payload`必须从已decode的object member/array index构造精确pointer：每个
-member segment先把`~`编码为`~0`、`/`编码为`~1`，再用`/`连接。若完整RFC 6901 pointer不是§1.1合法
-`JsonPointer`，特别是转义后的UTF-8编码超过512 bytes，则`json_pointer`固定回退为空string；禁止截断、
-截取尾部或返回中间ancestor。`limit_exceeded.observed_at_least`必须大于`maximum`；decoder在读到
-`maximum + 1`个byte/item时即可停止并报告该值，不需要继续接收攻击者控制的剩余payload。解析/验证
-优先级固定为：顶层wire byte上限 -> UTF-8 decode -> JSON grammar -> duplicate object key -> object字段与
-primitive类型 -> `version` -> array item上限 -> 字段值和数组排序/唯一性 -> session ->
-observation sequence -> revision -> digest -> placement。UTF-8 decode失败返回`invalid_utf8`，UTF-8合法
-但JSON grammar不完整/非法返回
-`invalid_json`；二者的`json_pointer`固定为空string。只有完整JSON grammar成功后才检测
+对象是空string。decoder先按未转义的逻辑JSON path选择错误，之后才渲染pointer：每个object member
+segment先把`~`编码为`~0`、`/`编码为`~1`，再用`/`连接array index。若完整RFC 6901 pointer不是§1.1
+合法`JsonPointer`，特别是转义后的UTF-8编码超过512 bytes，则`json_pointer`固定回退为空string；禁止
+截断、截取尾部或返回中间ancestor。
+
+`limit_exceeded.observed_at_least`必须大于`maximum`。只有顶层wire bytes可在读到
+`maximum + 1` byte后停止并报告该下界。对已经通过顶层byte上限的payload，decoder必须消费全部bounded
+bytes并完成以下固定优先级：UTF-8 decode -> JSON grammar -> duplicate object key -> required/unknown
+object字段与primitive类型 -> `version` -> array item上限 -> 字段值和数组排序/唯一性 -> session ->
+observation sequence -> revision -> digest -> placement。实现可以在array第`maximum + 1`项后停止保存domain
+item并把`observed_at_least`固定为该值，但仍须以受该合同顶层wire上限（至多8 MiB）约束的streaming
+prepass扫描完整余下grammar及全部嵌套key/required field/primitive type；不得因array已超限停止读取或
+跳过尾部。因此尾部
+invalid JSON、duplicate key、missing/unknown field或invalid type都按上述更高阶段返回，而不是
+`array_items`，且不要求为超限array分配无界内存。
+
+上述早期“字段值”只指不读取Control Store即可判断的wire-intrinsic value/cross-field规则。需要current
+Operation的observation settlement cross-field validation是placement之后的独立阶段；前置session等检查
+未通过时不得读取或结算Operation，因此stale session与`placement_rejected` mismatch并存时先返回session
+error。
+
+UTF-8 decode失败返回`invalid_utf8`，UTF-8合法但JSON grammar不完整/非法返回`invalid_json`；两者取
+最早input byte位置且`json_pointer`固定为空string。只有完整JSON grammar成功后才检测
 `duplicate_field`，其pointer指向重复member；`invalid_type`/`invalid_value`再晚于object字段检查。
+在每个validation阶段，必须先对完整bounded payload收集该阶段全部候选，再选择唯一错误，不能由object
+member输入顺序、hash-map遍历顺序或发现顺序决定。候选按逻辑path segments排序：共同prefix相同时短path
+先于child；object key按decoded UTF-8 bytes无符号字典序；array index按数值排序，所以2先于10。同一逻辑
+path再按problem rank
+`missing_field < unknown_field < duplicate_field < invalid_type < invalid_value < duplicate_identity < non_canonical_order`
+选择；不同阶段仍以本段固定阶段优先级为准。`array_items`阶段有多个超限array时也按相同逻辑path规则选取。
+完成选择后才做RFC 6901 escape和512-byte fallback；禁止按escaped pointer排序或先回退root再tie-break。
 presented session
 epoch小于current返回`stale_session`；epoch相同但boot/instance不匹配，或presented epoch更大，返回
 `wrong_session`。session通过后，NodeObservation再按§10的规则返回

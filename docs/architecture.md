@@ -202,7 +202,8 @@ incarnation；Suspended 的原进程 resume 可以保持 incarnation。已经在
 provisioner先把`node_id`、provider验证的不可变Host identity和每Node credential绑定在
 PostgreSQL；注册不接受Agent自报identity或fleet共享credential。Agent在请求前持久化
 registration attempt，同一attempt重试返回同一session epoch；同Host新session使旧session永久
-失效，不同Host使用新的Node identity或先完成显式fence/reprovision。heartbeat envelope包含
+失效。不同Host不得接管同一`node_id`；旧identity先显式fence/retire，随后以新的NodeIdentity和
+新`node_id` provision。heartbeat envelope包含
 session epoch、agent instance、该instance内单调sequence和本次inventory是否完整。full scan在
 current session下建立独立`AdmissionInventoryAttestation`；partial heartbeat引用其epoch而不覆盖。
 每个Cat status包含
@@ -214,8 +215,9 @@ Operation只有在同revision、同placement、满足目标postcondition时成�
 Operation `Superseded`，placement丢失则当前Operation明确`Failed`，系统恢复使用新的system
 revision。Quarantined同样使当前Operation失败，人工处理通过新revision表达。Deleted desired
 保留到精确complete inventory证明checkpoint absent，或provider HostDestroyed receipt证明旧Host state
-storage永久销毁且该Cat保留的placement/session index匹配event，并且逐卷处置全部闭合后再GC；普通隔离
-fence不够。N+2的同名状态不能完成N。
+storage永久销毁且该Cat保留的placement与immutable Host/state-path lineage匹配event，并且逐卷处置全部
+闭合后再GC；该检查不要求index最新boot/session等于event的fence session，普通隔离fence不够。N+2的同名
+状态不能完成N。
 
 详细合同见 [Runtime Reconciliation v1](specs/runtime-reconciliation-v1.md) 和
 [ADR-0040](decisions/0040-level-triggered-runtime-reconciliation.md)。

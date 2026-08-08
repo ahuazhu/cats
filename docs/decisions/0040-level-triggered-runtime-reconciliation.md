@@ -60,13 +60,14 @@ observation/checkpoint 的 step，不是控制面的稳定状态或新 authority
 
 Node 必须先由 IaC/管理员 provision。Control Store 保存 `node_id`、不可变 Host identity 和
 per-node credential/public-key 或 provider principal 的绑定。注册服务验证该绑定，不接受
-调用方自报身份，也不使用共享 fleet credential。
+调用方自报身份，也不使用共享 fleet credential。Node、immutable Host和state path的provisioning
+lineage一次写定且跨retire不可复用；换Host、换state path或重新provision必须使用新Node identity。
 
 Agent 必须先取得固定 Host state path 的 kernel 排他锁。它在注册 RPC 前持久化随机
 `agent_instance_id` 和 `registration_attempt_id`。同一 attempt 的重试返回同一 session；新进程
 先解析遗留 attempt，再用精确 expected session epoch 做 CAS replacement。新 session 建立后，
-旧 session 的 heartbeat、desired read 和 observation 永久拒绝。不同 Host 接管同一 node_id
-必须先显式 fence/retire 并重新 provision。
+旧 session 的 heartbeat、desired read 和 observation 永久拒绝。不同 Host 不得接管同一`node_id`；
+旧identity先显式fence/retire，替换Host随后用新的`NodeIdentity`和新`node_id` provision。
 
 这两个边界分工明确：Host lock 排除同机双进程，AgentSession 排除延迟包和跨 boot/session
 复用，provisioned credential 排除另一台机器自称同一 Node。
@@ -94,7 +95,9 @@ Deleted 是保留到物理 runtime、route 和 volume disposition 全部完成�
 删行。Operation闭环后仍保留tombstone和关联observation index；只有Control Plane接受来自负责
 Node当前session的complete inventory、精确确认该tombstone绑定的RuntimeCheckpoint不存在，或验证
 现有HostFenceEvent中逐字段绑定旧Host且证明Host state storage永久销毁的provider HostDestroyed
-receipt，并在GC事务用该Cat保留的tombstone/placement/session index精确匹配event，才能GC。一个
+receipt，并在GC事务用该Cat保留的tombstone/placement与immutable Host/state-path lineage精确匹配event，
+才能GC。event的expected boot/session继续绑定fence/rejoin序列，但不要求等于该Cat index最近接受的
+session。一个
 Host级event可分别验证多个Cat，不复制Cat列表。两条absence路径严格二选一；HostDestroyed路径不伪造
 AgentSession/inventory，普通network/power isolation不够。两条路径都不授予placement/writer，全部
 volume authorization、receipt和disposition仍须逐卷闭合。
@@ -177,8 +180,10 @@ MetadataStore 或某个 inventory source 的短暂故障是 Degraded：保留当
 heartbeat timeout只产生怀疑，不能触发跨Node writer。provider/BMC receipt只可建立持久
 `HostFenceEvent`，绑定不可变Host identity、Node、expected node boot、旧session epoch、fence
 attempt和隔离状态。若同一event携带HostDestroyed receipt，还必须绑定provisioned state path，并由
-provider adapter证明其storage永久销毁；不得从断电或网络隔离推断。每个Cat的旧placement只由现有
-tombstone/placement/session index在GC事务匹配该Host event，不复制到event。
+provider adapter证明其storage永久销毁；这里绑定的是event创建时锁定且此后可retired、不可复用的
+NodeIdentity lineage，不要求GC时仍为provisioned。不得从断电或网络隔离推断。每个Cat的旧placement只由现有
+tombstone/placement及接受observation时从锁定NodeIdentity复制的immutable Host/state-path lineage在GC
+事务匹配该Host event，不复制到event，也不依赖index最近的boot/session。
 它是 Host 级事实，不是 volume 写权限。
 
 HostDestroyed永不Rejoined。没有tombstone/recovery引用且全部authorization已terminal、逐卷disposition
@@ -195,7 +200,9 @@ revision 和新 placement。MetadataStore 按 tuple CAS、提高 epoch；同一 
 
 旧Host仍保持workload网络隔离。新boot/session下完成全量inventory，把旧epoch的`R < L` lineage
 移入quarantine，并核对该event派生的全部takeover/delete authorization与每卷current owner/epoch。
-授权派生、首次consume和`Active -> Rejoined`都锁同一event行；首次consume在同一PostgreSQL事务
+`isolated -> host_destroyed`用`state=Active + isolation_state=isolated + 完整event tuple`做exact CAS。
+该更新、授权派生、首次consume、`Active -> Rejoined`和HostDestroyed tombstone GC都锁同一event行到
+事务提交并在取得锁后重验；竞争只有一个顺序能提交。首次consume在同一PostgreSQL事务
 完成Volume CAS并写不可变receipt。rejoin验证receipt以及当前卷是其直接结果或合法单调后继；
 VolumeRecord已删除时验证精确`DeleteCompletionReceipt`。未消费授权必须已过`not_after`；Control
 Plane接受HostRejoinProof并把event持久转为Rejoined后才恢复网络，此后未消费授权不能首次生效，
