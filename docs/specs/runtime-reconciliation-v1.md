@@ -557,15 +557,21 @@ NodeCleanupCheckpoint {
 `NodeCleanupCheckpoint.cleanup.target.kind`必须是`checkpoint_file`，`volume_release`必须为
 `null`，`target.node_id`、`cleanup.inventory_session.node_id`和顶层`node_id`必须逐字段相同。
 空槽由该文件不存在表示；不允许`null`、array、queue或历史记录。槽只能在当前
-Deleted tombstone已达到§13的checkpoint GC前置、full inventory中的valid checkpoint
-evidence与该tombstone强匹配，且除该文件外已无该Cat物理residue时写入。它使用与
+Deleted tombstone仍保留、§11的Deleted物理postcondition已满足、full inventory中的valid
+checkpoint evidence与该tombstone强匹配，且除该文件外已无该Cat物理residue时写入。它使用与
 `RuntimeCheckpoint`相同的temp write/file fsync/atomic rename/parent directory fsync，但物理位置
 必须在per-Cat checkpoint文件之外的受保护Node state path。
 
-执行时仍必须按`CleanupRelease`重做full scan、session、Desired/tombstone与content digest
-复核；该槽只是crash journal，不授予cleanup authority。删除target后crash而槽尚未清除时，
-新full scan确认精确target不存在即可原子清槽；target仍存在时只能在全部绑定仍匹配后
-重试。槽已占用时不得被不同target覆盖；必须先完成/清槽，冲突则Quarantine。
+该槽只是crash journal，不授予cleanup authority。target仍存在时，执行删除前必须按
+`CleanupRelease`重做full scan、session、Deleted tombstone与content digest复核；无tombstone、
+任一绑定变化或读取不完整都必须拒绝，不删target也不清槽。
+
+唯一例外是已经满足删除postcondition：当前session的新full scan直接证明
+`target.checkpoint_path`上没有filesystem entry，且全部checkpoint inventory中也没有该精确
+target时，Node可原子清槽，即使Control Plane已经GC Desired/tombstone。这条规则只能
+清除已完成的Node journal，不得在path仍存在时被用作无tombstone删除权。删除target后
+crash而槽尚未清除就走此路径。槽已占用时不得被不同target覆盖；必须先完成/清槽，
+冲突则Quarantine。
 不建立per-dispatch数据库、通用workflow或第二cleanup authority。
 
 ## 6. Inventory 与可用性
@@ -1000,6 +1006,9 @@ Desired/tombstone，然后才能fsync替换`inventory_session`、`inventory_epoc
 `target`与`volume_release`（包括原`release_transition_id`）；若新scan不再证实同一
 物理identity/前置，则不得rebind或生成新transition来猜测旧effect。target已精确不存在，
 或volume已满足§7的原transition postcondition时，按已完成处理；其他冲突Quarantine。
+上述rebind只适用于仍有物理effect需要执行的cleanup。`NodeCleanupCheckpoint`的target若由
+§5要求的当前session新full scan证明已精确不存在，Node直接原子清槽，不需要已GC的
+Desired/tombstone，也不需要把已完成effect rebind到新session；target仍存在时不得使用这条例外。
 
 `target.kind="volume"`当且仅当`volume_release`非`null`。其`disposition`只能是
 `retain`或`detach_retained`；`delete_disposable_root`只走独立的`delete_disposable_root` step。
@@ -1719,12 +1728,18 @@ session、stale/conflicting observation sequence、revision、digest或placement
   只有Operation、`runtime.applied_desired`和`current_desired`三者的`desired_revision`相等，
   三者的`spec_digest`相等（Operation字段名为`desired_spec_digest`），以及
   `Operation.placement == runtime.applied_desired.placement == current_desired.placement`逐字段
-  同时成立，并且`runtime.stable_state == Operation.target`、§11完整postcondition成立时，才能
-  Succeeded。`observation.desired_revision`不是合法字段路径，实现不得从顶层猜测或复制它。
+  同时成立，并且顶层`NodeObservation.node_id`、`Operation.placement.node_id`、
+  `runtime.applied_desired.placement.node_id`和`current_desired.placement.node_id`四者相等，
+  以及`runtime.applied_desired.target`、`Operation.target`、`current_desired.target`、
+  `runtime.stable_state`和待写入的`OperationSuccess.observed_target`五者相等时，才进入§11
+  完整postcondition判定并可能Succeeded。任一Node或target绑定不等都不得Succeeded。
+  `observation.desired_revision`不是合法字段路径，实现不得从顶层猜测或复制它。
   `OperationSuccess.observation_id/node_id/agent_session_epoch/heartbeat_sequence`必须分别等于
   顶层`NodeObservation`的同名字段，`observed_target`等于`runtime.stable_state`，
   `runtime_incarnation`等于`runtime.runtime_incarnation`。result只保存这些实际结算的不可变
   引用，不复制可变observation内容。
+- 上述四处Node不全等时，整个NodeObservation按§16.4的固定优先级返回`wrong_placement`。
+  该拒绝不得推进最高heartbeat sequence、写observation/attestation/freshness或结算任何Operation。
 - 新 revision 在同一事务把旧 Pending Operation 变为 Superseded。
 - PreconditionFailed、永久请求错误、HostLost 或 Quarantined 使当前 Pending Operation Failed。
 - Progressing、Blocked、Degraded 和暂时离线保持 Pending。
@@ -1748,9 +1763,29 @@ postcondition满足时成功。若负责 Node 永久丢失，需要 provider 的
 rejoin 后的空 inventory，才能证明物理 runtime 已不存在；仅网络隔离足以阻止服务，不足以
 声称 residue 已清空。
 
-Operation 结算、volume disposition 完成且不存在 fence/rejoin 待办后，才可 GC 当前 Desired、
-observation 和 checkpoint 索引。审计按独立产品策略保留。Node 删除 checkpoint 前还必须证明
-无runtime、无未跟踪volume residue和无route gate。授权丢弃的Root lineage必须已删除；Active
+Deleted Operation成功后仍必须保留当前Desired/tombstone和关联observation index，不得把
+Operation Succeeded、NodeCleanupCheckpoint已写槽或某次partial observation的缺项当作checkpoint
+已不存在。即使volume disposition已完成且没有fence/rejoin待办，Control Plane也必须继续
+保留它们，直到它接受一个同时满足下列条件的`complete_inventory=true` NodeObservation：
+
+1. observation来自该tombstone `placement.node_id`的当前AgentSession，inventory digest验证成功；
+2. `inventory_read_position`对应的完整assigned-spec读取仍包含该Deleted tombstone，且Control Plane
+   在接受inventory时重读同一tombstone；
+3. 完整checkpoint inventory证明由保留tombstone和observation index共同绑定的精确
+   `RuntimeCheckpoint`不存在：逻辑identity是
+   `(cat_id, node_id, placement_epoch, desired_revision, spec_digest)`，物理identity是保留的
+   `(checkpoint_path, content_digest)`；没有该Cat的valid/corrupt
+   `ObservedRuntimeStatus.checkpoint`，且没有该`checkpoint_path`上的
+   `NodeResidue.checkpoint_file`。任一identity字段不同表示冲突或重建，不是旧checkpoint缺席证明。
+
+只有在接受这个absence proof后，Control Plane才可GC当前Desired/tombstone和关联
+observation index。absence proof校验与GC在同一Control Plane事务中完成；不得先用新
+observation覆盖/删除保留index，再把身份已丢失后的“缺项”解释为精确absence。审计按独立
+产品策略保留。验证不完整、wrong/stale session、wrong Node、
+仍看到checkpoint或尚未接受complete inventory时的GC attempt必须拒绝且零持久副作用。
+Control Plane已GC后，本地NodeCleanupCheckpoint可按§5的“target已精确不存在”规则在无
+tombstone时清槽。Node删除checkpoint前还必须证明无runtime、无未跟踪volume residue和
+无route gate。授权丢弃的Root lineage必须已删除；Active
 HostFenceEvent上的隔离lineage由event/rejoin记录继续跟踪，关联的authorization与
 `DeleteCompletionReceipt`必须保留到Rejoined，不能因VolumeRecord或本地目录缺席猜测消失。
 
@@ -1763,7 +1798,10 @@ HostFenceEvent上的隔离lineage由event/rejoin记录继续跟踪，关联的au
 | 各 planner step kill | restart 后确认、重试、继续或 quarantine；无重复 writer/误删 |
 | 进程崩溃，scope/socket/checkpoint仍存在 | full inventory报告三类standalone residue；valid evidence产生精确CleanupRelease，cleanup后的full rescan报告residue为空，Running可重新满足Ready |
 | standalone residue归属冲突 | 只有唯一Cat/tombstone强匹配才写该Cat RuntimeCheckpoint；无/多匹配保留Node residue并Quarantine，不自动删除 |
-| checkpoint文件删除crash recovery | 被删checkpoint不记录自删step；单槽NodeCleanupCheckpoint先fsync，删除后crash由full rescan确认absent并清槽 |
+| NodeCleanup写槽前crash | target未删除且没有持久Node槽；保留tombstone，restart以新full scan重新规划，不从未落盘的cleanup猜测成功 |
+| NodeCleanup写槽后、删除前crash | 单槽和tombstone均保留；restart只在当前session full scan、完整绑定和content digest复核通过后删除精确target |
+| checkpoint删除后、清槽前crash | 新full scan证明精确target已不存在后原子清槽；即使tombstone随后已GC也无需rebind，且不得据此删除同path重建的文件 |
+| Control Plane提前GC | Operation成功、槽已写入、partial或未接受的full inventory都不足；未接受含tombstone读取位置并证明精确checkpoint缺席的complete inventory时，GC拒绝且零持久副作用 |
 | scan与cleanup之间资源被重建 | token、digest、cgroup或process identity任一不匹配时旧cleanup拒绝，新资源保留 |
 | standalone scope/socket token missing或corrupt | 不生成CleanupTarget，不删除，进入Quarantined/人工处理 |
 | standalone checkpoint corrupt | 不生成`checkpoint_file` target，不自动删除，进入Quarantined/人工处理 |
@@ -1777,6 +1815,7 @@ HostFenceEvent上的隔离lineage由event/rejoin记录继续跟踪，关联的au
 | RequireIdle Busy/crash | attempt 只评估一次，Suspended Operation Failed，系统创建新 Running revision |
 | Observation接受响应丢失 | 相同session/sequence/完整payload重放返回原成功，不刷新freshness或重复结算Operation |
 | Observation same-sequence ABA | 同sequence改`observation_id`或任一嵌套字段返回`observation_sequence_conflict`且零副作用；更小sequence返回stale |
+| Node A observation结算Node B Operation | 顶层Node、Operation/applied/current placement Node不全等时返回`wrong_placement`；不接受observation、不推进sequence/freshness且不结算任何Operation |
 | identity conflict | gates Closed，Quarantined，当前 Pending Operation Failed |
 | Host fence 与多个卷 | 一个 HostFenceEvent 派生多个独立逐卷授权；错 tuple 全部拒绝 |
 | authorization consume 与Rejoined并发 | 两者锁同一event；只能consume先提交并留下receipt，或Rejoined先提交且epoch不变 |
@@ -1996,8 +2035,15 @@ release commit后响应丢失/Agent crash必须用同一transition得到原Unown
 新session rebind只替换session/read positions并保留target/原transition；同transition异payload、
 release N后reacquire N+1再重放N，以及scan后token/digest变化都必须拒绝且不误删。
 standalone socket只能在唯一Cat checkpoint强匹配后写该Cat的cleanup step；valid checkpoint自删除必须使用
-单槽NodeCleanupCheckpoint，测试target删除前/后各crash一次、旧槽与重建文件冲突、被删checkpoint试图
-记录自身cleanup被拒绝，以及无法归属、missing/corrupt evidence永不产生cleanup。
+单槽NodeCleanupCheckpoint，并分别测试写槽前crash、写槽后删除前crash、删除后清槽前crash，以及
+Control Plane在接受精确absence proof前GC被拒绝。还必须测试tombstone已GC但target确实absent时清槽、
+tombstone已GC但target仍存在时拒绝删除、旧槽与重建文件冲突、被删checkpoint试图记录自身cleanup被拒绝，
+以及无法归属、missing/corrupt evidence永不产生cleanup。
+
+Operation settlement negative tests必须分别改变顶层`NodeObservation.node_id`、Operation/applied/current
+三处placement Node和applied/Operation/current/stable/result五处target中的每一处。Node A observation不得
+结算Node B Operation；每个Node不匹配都按§16.4固定优先级返回`wrong_placement`，且不接受observation、
+不推进最高sequence或freshness、不写terminal result。其他placement或target不等也不得结算Operation。
 
 negative tests还必须覆盖route gate外层`endpoint_id`作为unknown field被拒绝、
 `runtime_identity_conflict`单个different identity合法、只有expected identity非法、`duplicate_runtime`少于
@@ -2141,8 +2187,21 @@ epoch小于current返回`stale_session`；epoch相同但boot/instance不匹配�
 `stale_observation_sequence`或`observation_sequence_conflict`。Desired delivery中revision小于
 current返回`stale_revision`；精确结算要求不相等时
 返回`wrong_revision`；revision相同而digest不同返回`revision_digest_conflict`。node ID或placement
-epoch任一不匹配都返回`wrong_placement`。这些错误都不得推进checkpoint、结算Operation或产生物理
-副作用。
+epoch任一不匹配都返回`wrong_placement`。非Observation边界的`expected`和`presented`就是该边界
+实际比较的两份完整`AssignedPlacement`。
+
+Observation settlement中，`expected`固定为current Desired的完整`AssignedPlacement`；在前述
+session/sequence/revision/digest检查通过后，对有current Pending Operation的runtime按
+`runtimes.cat_id`升序选择第一个冲突。错误的`cat_id`和`desired_revision`取该runtime对应的
+current Desired；`presented`使用下列固定优先级构造：
+
+1. `Operation.placement != expected`：取完整`Operation.placement`；
+2. 否则`runtime.applied_desired.placement != expected`：取完整applied placement；
+3. 否则顶层`NodeObservation.node_id != expected.node_id`：取
+   `{kind:"assigned", node_id: NodeObservation.node_id, placement_epoch: expected.placement_epoch}`。
+
+任一上述错误都拒绝整个NodeObservation，不得推进checkpoint、接受observation/attestation、
+更新freshness、结算任何Operation或产生物理副作用。
 
 `version`不是JSON integer或超出`0..=9223372036854775807`时返回
 `malformed_payload {json_pointer:"/version", problem:"invalid_type"|"invalid_value"}`；范围内但不等于1

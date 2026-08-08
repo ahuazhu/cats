@@ -84,12 +84,16 @@ Pending Operation。已选 Node 若明确拒绝不可满足的容量/能力，�
 只能创建提高 placement epoch 的新系统 revision。
 
 Operation 只有在 current desired、observation revision、placement 和完整 postcondition 全部
-匹配时才成功。Blocked/Degraded 保持 Pending；PreconditionFailed、Quarantined 和 HostLost 使
-当前 Pending Operation Failed，处置使用新 revision。已经完成的历史 Operation 不因后续健康
-变化重写。
+匹配时才成功；顶层observation Node、Operation placement、applied desired placement和current
+desired placement必须绑定同一Node，applied/Operation/current desired与实际结算target也必须
+相同。错Node返回`wrong_placement`，既不接受observation也不结算Operation。Blocked/Degraded保持
+Pending；PreconditionFailed、Quarantined 和 HostLost 使当前 Pending Operation Failed，处置使用
+新 revision。已经完成的历史 Operation 不因后续健康变化重写。
 
 Deleted 是保留到物理 runtime、route 和 volume disposition 全部完成的 tombstone，不是立即
-删行。只有 Operation 闭环且没有 fence/rejoin 待办后才能 GC。
+删行。Operation闭环后仍保留tombstone和关联observation index；只有Control Plane接受来自负责
+Node当前session的complete inventory，并在同一事务确认该tombstone精确绑定的RuntimeCheckpoint
+已经不存在且没有fence/rejoin待办后，才能GC。
 
 ## 生命周期与变更
 
@@ -138,8 +142,10 @@ planner 的逐步 token、条件和晚到结果处理以 Runtime Reconciliation 
 
 standalone scope/socket只在token/path唯一匹配某个Cat checkpoint且当前Desired/tombstone
 仍证实该归属时，才进入该Cat的cleanup step。删除checkpoint文件自身不能由该文件
-充当journal，只能在Deleted tombstone已允许GC后使用Node单槽。单槽只是crash journal，
-不是新authority、queue或per-dispatch本地数据库。
+充当journal；只能在Deleted tombstone仍保留且其他Deleted物理postcondition已满足后使用Node
+单槽。单槽只是crash journal，不是新authority、queue或per-dispatch本地数据库。target仍存在时
+必须重验tombstone；若当前session的新full scan已证明精确target不存在，则只清除已完成的Node
+单槽不再需要tombstone。
 
 ## Inventory 与稳定服务
 
