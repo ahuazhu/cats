@@ -114,9 +114,12 @@ Consumed receipt、把Volume从Owned转为Deleting并提高epoch、把Control Di
 只能一方提交。Volume对象清空后写`DeleteCompletionReceipt`并同时删除两边row；若相关
 HostFenceEvent仍Active，该receipt保留到Rejoined。
 
-Deleted Desired 作为 tombstone 保留，直到无 runtime/route、卷 disposition 完成且 inventory
-无 residue。负责 Host 丢失时，仅 network isolation 不足以声称物理 residue 已清除；需要
-`HostFenceEvent` 中 provider 对 HostDestroyed 的证据，或 rejoin 后的空 inventory。
+Deleted Desired 作为 tombstone 保留，直到无可服务runtime/route、卷 disposition完成，且GC absence
+proof严格二选一：负责Node当前session接受的complete inventory精确证明
+checkpoint absent，或现有`HostFenceEvent`中的provider HostDestroyed receipt绑定旧Host/state path并
+证明其storage永久销毁，同时由该Cat保留的tombstone/placement/session index匹配event。后者不伪造
+AgentSession/inventory；一个Host event可验证多个Cat，network/power isolation不够，且两条路径都不能
+跳过逐卷authorization、receipt和disposition闭环。
 
 ## 4. Work、route 与 RequireIdle
 

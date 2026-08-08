@@ -92,8 +92,12 @@ Pending；PreconditionFailed、Quarantined 和 HostLost 使当前 Pending Operat
 
 Deleted 是保留到物理 runtime、route 和 volume disposition 全部完成的 tombstone，不是立即
 删行。Operation闭环后仍保留tombstone和关联observation index；只有Control Plane接受来自负责
-Node当前session的complete inventory，并在同一事务确认该tombstone精确绑定的RuntimeCheckpoint
-已经不存在且没有fence/rejoin待办后，才能GC。
+Node当前session的complete inventory、精确确认该tombstone绑定的RuntimeCheckpoint不存在，或验证
+现有HostFenceEvent中逐字段绑定旧Host且证明Host state storage永久销毁的provider HostDestroyed
+receipt，并在GC事务用该Cat保留的tombstone/placement/session index精确匹配event，才能GC。一个
+Host级event可分别验证多个Cat，不复制Cat列表。两条absence路径严格二选一；HostDestroyed路径不伪造
+AgentSession/inventory，普通network/power isolation不够。两条路径都不授予placement/writer，全部
+volume authorization、receipt和disposition仍须逐卷闭合。
 
 ## 生命周期与变更
 
@@ -145,7 +149,8 @@ standalone scope/socket只在token/path唯一匹配某个Cat checkpoint且当前
 充当journal；只能在Deleted tombstone仍保留且其他Deleted物理postcondition已满足后使用Node
 单槽。单槽只是crash journal，不是新authority、queue或per-dispatch本地数据库。target仍存在时
 必须重验tombstone；若当前session的新full scan已证明精确target不存在，则只清除已完成的Node
-单槽不再需要tombstone。
+单槽不再需要tombstone。checkpoint path是inventory evidence而非checkpoint content；同path重建的
+different-valid、corrupt或other-Cat文件必须保留，并拒绝旧cleanup/GC。
 
 ## Inventory 与稳定服务
 
@@ -171,8 +176,13 @@ MetadataStore 或某个 inventory source 的短暂故障是 Degraded：保留当
 
 heartbeat timeout只产生怀疑，不能触发跨Node writer。provider/BMC receipt只可建立持久
 `HostFenceEvent`，绑定不可变Host identity、Node、expected node boot、旧session epoch、fence
-attempt和隔离状态。
+attempt和隔离状态。若同一event携带HostDestroyed receipt，还必须绑定provisioned state path，并由
+provider adapter证明其storage永久销毁；不得从断电或网络隔离推断。每个Cat的旧placement只由现有
+tombstone/placement/session index在GC事务匹配该Host event，不复制到event。
 它是 Host 级事实，不是 volume 写权限。
+
+HostDestroyed永不Rejoined。没有tombstone/recovery引用且全部authorization已terminal、逐卷disposition
+闭合后，可按审计策略回收逐卷恢复记录；compact event/receipt仍按现有Operation/审计引用保留。
 
 Control Plane先把旧Pending Operation置为HostLost，再在一个事务中创建新完整Desired/Operation、
 placement、全部新attachments，并从该event和旧attachment facts为每个卷创建独立

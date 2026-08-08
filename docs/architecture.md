@@ -213,7 +213,9 @@ Condition、逐卷 owner/epoch 与 `R/L`、route gate 和 active guard 数。
 Operation只有在同revision、同placement、满足目标postcondition时成功；新的用户intent使旧
 Operation `Superseded`，placement丢失则当前Operation明确`Failed`，系统恢复使用新的system
 revision。Quarantined同样使当前Operation失败，人工处理通过新revision表达。Deleted desired
-保留到精确Deleted observation或fence证明完成，再按保留策略GC。N+2的同名状态不能完成N。
+保留到精确complete inventory证明checkpoint absent，或provider HostDestroyed receipt证明旧Host state
+storage永久销毁且该Cat保留的placement/session index匹配event，并且逐卷处置全部闭合后再GC；普通隔离
+fence不够。N+2的同名状态不能完成N。
 
 详细合同见 [Runtime Reconciliation v1](specs/runtime-reconciliation-v1.md) 和
 [ADR-0040](decisions/0040-level-triggered-runtime-reconciliation.md)。

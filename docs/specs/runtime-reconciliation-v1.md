@@ -557,8 +557,9 @@ NodeCleanupCheckpoint {
 `NodeCleanupCheckpoint.cleanup.target.kind`必须是`checkpoint_file`，`volume_release`必须为
 `null`，`target.node_id`、`cleanup.inventory_session.node_id`和顶层`node_id`必须逐字段相同。
 空槽由该文件不存在表示；不允许`null`、array、queue或历史记录。槽只能在当前
-Deleted tombstone仍保留、§11的Deleted物理postcondition已满足、full inventory中的valid
-checkpoint evidence与该tombstone强匹配，且除该文件外已无该Cat物理residue时写入。它使用与
+Deleted tombstone仍保留、§11的Deleted物理postcondition已满足、full inventory中的
+`ObservedRuntimeStatus.checkpoint=CheckpointEvidence.valid`与该tombstone强匹配，且除该文件外已无该Cat
+物理residue时写入。它使用与
 `RuntimeCheckpoint`相同的temp write/file fsync/atomic rename/parent directory fsync，但物理位置
 必须在per-Cat checkpoint文件之外的受保护Node state path。
 
@@ -570,8 +571,9 @@ checkpoint evidence与该tombstone强匹配，且除该文件外已无该Cat物�
 `target.checkpoint_path`上没有filesystem entry，且全部checkpoint inventory中也没有该精确
 target时，Node可原子清槽，即使Control Plane已经GC Desired/tombstone。这条规则只能
 清除已完成的Node journal，不得在path仍存在时被用作无tombstone删除权。删除target后
-crash而槽尚未清除就走此路径。槽已占用时不得被不同target覆盖；必须先完成/清槽，
-冲突则Quarantine。
+crash而槽尚未清除就走此路径。同path若重建为different-valid、corrupt或other-Cat文件，target
+并未满足“没有filesystem entry”，Node必须保留新文件、拒绝旧cleanup且不得清槽。槽已占用时不得被
+不同target覆盖；必须先完成/清槽，冲突则Quarantine。
 不建立per-dispatch数据库、通用workflow或第二cleanup authority。
 
 ## 6. Inventory 与可用性
@@ -702,8 +704,23 @@ heartbeat timeout 只产生 `NodeSuspected`，不能提高 placement 或 attachm
 HostFenceEvent {
   event_id, provider, immutable_host_id, node_id, expected_node_boot_id,
   expected_agent_session_epoch, fence_attempt_id,
-  isolation_state, observed_at,
+  isolation_state: HostIsolationState, observed_at,
   state: Active | Rejoined
+}
+
+HostIsolationState =
+  { kind: "isolated" }
+| { kind: "host_destroyed", receipt: HostDestroyedReceipt }
+
+HostDestroyedReceipt {
+  provider: Id,
+  immutable_host_id: Id,
+  node_id: Id,
+  expected_node_boot_id: NodeBootId,
+  expected_agent_session_epoch: Epoch,
+  state_path_id: Id,
+  state_storage_disposition: "permanently_destroyed",
+  destroyed_at_unix_ms: UnixMillis
 }
 ```
 
@@ -726,7 +743,13 @@ volume；换卷、换旧owner、换attachment、换placement、过期或Rejoined
 Desired的`attachment_id`、revision、placement必须与authorization一致，对应`VolumeIntent.acquire`
 必须引用该authorization。精确schema/CAS以[Volume Authority](volume-authority.md)为准。
 
-provider receipt只建立Active HostFenceEvent，不直接授予placement或writer。Control Plane先把旧
+普通provider isolation receipt只建立`isolated`的Active HostFenceEvent。`host_destroyed`只能来自
+provider adapter验证过的HostDestroyed receipt；receipt各identity必须逐字段等于event、provisioned
+`NodeIdentity.state_path_id`，且adapter必须证明承载该state path的provider storage已
+永久销毁，不能仅把实例状态、网络隔离或断电翻译为该variant。Active event可以直接以
+`host_destroyed`建立，或把`isolated`单调更新为`host_destroyed`；receipt一经提交不可变，相同receipt重放
+只读原结果，任何字段不同的重放都拒绝。`host_destroyed`不会转为Rejoined；替换Host必须使用新的
+provisioned identity。两种receipt都不直接授予placement或writer。Control Plane先把旧
 Pending Operation置为`Failed(HostLost)`，再在一个事务中创建新完整Desired/Operation、placement、
 全部新attachments和每卷VolumeTakeoverAuthorization；新Desired逐卷引用授权。目标Node消费所有
 MetadataStore CAS后才能Ready，不存在另一种writer-proof fallback。
@@ -832,10 +855,15 @@ PostgreSQL `accepted_at_unix_ms`。partial只表示Node级Cat集合不完整；�
 
 ```text
 CheckpointEvidence =
-  { kind: "missing" }
-| { kind: "corrupt", raw_content_digest: Sha256Digest }
+  { kind: "missing", checkpoint_path: HostPath }
+| {
+    kind: "corrupt",
+    checkpoint_path: HostPath,
+    raw_content_digest: Sha256Digest
+  }
 | {
     kind: "valid",
+    checkpoint_path: HostPath,
     content_digest: Sha256Digest,
     version: ContractVersion,
     cat_id: Id,
@@ -1017,13 +1045,13 @@ Desired/tombstone，也不需要把已完成effect rebind到新session；target�
 `volume_release`必须为`null`。同一`release_transition_id`只能绑定一个完整
 `(target, generation, disposition)`；任一字段冲突都进入Quarantine，不得以新payload重放该ID。
 
-standalone residue的cleanup owner只有下表三种结果：
+standalone residue和最后一个attributed checkpoint的cleanup owner只有下表三种结果：
 
 | full-scan归属结果 | 唯一持久owner | 允许的结果 |
 |---|---|---|
-| token/path/identity只匹配一个Cat checkpoint，且当前Desired或保留tombstone逐字段证实该Cat/placement/revision | 该Cat的`RuntimeCheckpoint` | 持久一个`cleanup_release`；不得并行交给Node槽 |
-| 该Cat的Deleted tombstone已允许最后删除checkpoint文件自身 | 唯一`NodeCleanupCheckpoint`槽 | 只能持久`checkpoint_file`、删除后清槽 |
-| 无匹配、多个匹配、归属字段冲突或evidence missing/corrupt | 无cleanup owner | 保留在`NodeObservation.residue`作为Node quarantine证据，关闭gates且等待人工处理 |
+| standalone scope/socket的token/path/identity只匹配一个Cat checkpoint，且当前Desired或保留tombstone逐字段证实该Cat/placement/revision | 该Cat的`RuntimeCheckpoint` | 持久一个`cleanup_release`；不得并行交给Node槽 |
+| attributed `CheckpointEvidence.valid`逐字段匹配该Cat的Deleted tombstone，且已允许最后删除checkpoint文件自身 | 唯一`NodeCleanupCheckpoint`槽 | 只能持久`checkpoint_file`、删除后清槽 |
+| 无匹配、多个匹配、归属字段冲突、unexpected/unassigned checkpoint或evidence missing/corrupt | 无cleanup owner | 保留物理证据并Quarantine，关闭gates且等待人工处理 |
 
 “只匹配一个Cat checkpoint”对`systemd_scope`要求valid token和`scope_id`同时等于该
 checkpoint保留的process/scope identity；对`control_socket`要求valid token和`socket_path`
@@ -1034,19 +1062,26 @@ checkpoint保留的process/scope identity；对`control_socket`要求valid token
 live PID或matching `ProcessEvidence`；执行`control_socket`前还必须确认没有live process
 拥有该socket。
 
-`checkpoint_file`只能从`ResidueCheckpointFileEvidence.valid`产生，且target必须逐字段
-复制path/content digest/Cat/Node/placement/revision。任何`RuntimeCheckpoint.step`都不得持有
+正常归属assigned Cat的checkpoint文件必须进入该Cat的`CheckpointEvidence`；只有unexpected或
+不能关联assigned Cat的checkpoint才进入`NodeResidue.checkpoint_file`。`checkpoint_file` target只能从
+当前Deleted Cat的`CheckpointEvidence.valid`产生，且target必须逐字段复制
+checkpoint path/content digest/Cat/Node/placement/revision。任何`RuntimeCheckpoint.step`都不得持有
 `checkpoint_file` target；它只能在§5的`NodeCleanupCheckpoint`中持久，因此既不会自删
 journal，也不会让一个Cat的checkpoint删除另一个Cat的checkpoint。删除前必须重读
 文件，按§16.2重算并核对content digest及完整identity，还必须由Control Plane
-当前Deleted tombstone证明该checkpoint已不需要。corrupt evidence不得产生target。
-scan后任一资源被重建，token、cgroup或digest/identity发生变化时，旧cleanup必须
-拒绝并Quarantine，不得按可重算名称或path删除。
+当前Deleted tombstone证明该checkpoint已不需要。`CheckpointEvidence.missing`/`corrupt`和任何
+`NodeResidue.checkpoint_file`都不得产生target。scan后任一资源被重建，token、cgroup或
+checkpoint path/digest/identity发生变化时，旧cleanup必须拒绝并Quarantine，不得按可重算名称或
+path删除；尤其旧文件删除后同path出现different-valid、corrupt或other-Cat文件时必须保留新文件，
+不得把它解释为旧target已不存在。
 
 `CheckpointEvidence.valid.content_digest`必须等于§16.2对完整`RuntimeCheckpoint`（包括process、volume、
 device、mount、network、Guest transport、snapshot、route gate和RequireIdle事实）计算的digest；valid
-projection中的其余字段必须与该checkpoint逐字段相同。`corrupt.raw_content_digest`只是损坏文件原始bytes
-的普通SHA-256（不加domain separator），用于关联诊断，不能伪装成valid checkpoint content digest。
+projection中除`checkpoint_path`外的其余字段必须与该checkpoint逐字段相同。三个variant的
+`checkpoint_path`都是full scan读取的inventory-layer物理证据，进入`NodeObservation`及
+`inventory_digest`，不属于`RuntimeCheckpoint`内容，也不进入其content digest。
+`corrupt.raw_content_digest`只是损坏文件原始bytes的普通SHA-256（不加domain separator），用于关联诊断，
+不能伪装成valid checkpoint content digest。
 
 ### 10.2 物理证据
 
@@ -1350,7 +1385,9 @@ separator；它们只关联不可解析证据，不能当作成功handshake或ow
 full scan发现的每个约定资源必须恰好进入某个`ObservedRuntimeStatus`，或在不能可靠归属Cat/Volume时
 进入顶层`NodeObservation.residue`。`*_hint`和`role_hint`只记录不可信线索，不能据此cleanup。
 没有live matching process的systemd scope/cgroup与control socket分别进入`systemd_scope`和
-`control_socket`；仍存在但不能关联assigned Cat的checkpoint进入`checkpoint_file`。scope/socket只有
+`control_socket`；assigned Cat预期path缺席、损坏或存在valid checkpoint分别进入该Cat的
+`CheckpointEvidence.missing`/`corrupt`/`valid`，unexpected或不能关联assigned Cat的checkpoint才进入
+`NodeResidue.checkpoint_file`。scope/socket只有
 ownership token为valid且与持久化cleanup identity精确匹配时才可清理。valid checkpoint evidence的
 content digest按§16.2绑定完整文件，所列字段必须与文件逐字段相同；corrupt evidence只保留path和raw
 digest并禁止自动清理。不能因为进程已死就按可重算scope/socket/checkpoint名字删除。
@@ -1631,7 +1668,9 @@ Conditions可并存，但`kind="ready"`每个runtime至多一个，其他Conditi
 control socket的`socket_path`、checkpoint file的`checkpoint_path`、kernel NBD的`device_path`、vhost-user的
 `socket_path`、network tap的`tap_name`、data directory的`data_directory`、mount的
 `(mount_path, source_path)`、warm snapshot的`path`、route gate的`CJ(binding)`。同一物理path/PID/tap
-以及同一scope/control socket/checkpoint file不得在runtime evidence与`residue`重复出现。任何array超过
+以及同一scope/control socket/checkpoint file不得在runtime evidence与`residue`重复出现。
+`CheckpointEvidence.checkpoint_path`与`NodeResidue.checkpoint_file.checkpoint_path`在完整inventory中
+全局唯一；同一path出现两次是`duplicate_identity`，不能靠Cat归属或variant不同绕过。任何array超过
 表中上限都使整个顶层合同失败，不能把
 `complete_inventory`降为false后截断发送。
 
@@ -1719,6 +1758,11 @@ OperationFailure =
 `observed_target`必须等于Operation `target`；Running/Suspended result的`runtime_incarnation`必须非null，
 Warm/Cold/Deleted必须为null。Superseded的revision必须更大，且不能引用自身Operation。时间只能单调
 前进：`updated_at_unix_ms >= created_at_unix_ms`，terminal completion等于`updated_at_unix_ms`。
+standalone `Operation` decode/validation还必须逐字段要求
+`terminal.succeeded.result.node_id == Operation.placement.node_id`，以及
+`terminal.failed.error.host_lost.node_id == Operation.placement.node_id`；不等分别返回指向
+`/terminal/result/node_id`或`/terminal/error/node_id`的
+`malformed_payload {problem:"invalid_value"}`，不能等到observation settlement才发现。
 `contract_error`只允许当前已提交Desired自身的`unsupported_version`或`malformed_payload`；stale/wrong
 session、stale/conflicting observation sequence、revision、digest或placement只拒绝那次输入，
 绝不能终结当前Operation。
@@ -1759,35 +1803,55 @@ N+2 达到同名状态不能结算 N。observation 不写 Desired；所有用户
 ## 13. Deleted 与保留
 
 Deleted Desired 是 tombstone，不能在提交后立即删行。其 Operation 只有在第 11 节 Deleted
-postcondition满足时成功。若负责 Node 永久丢失，需要 provider 的 Host 已销毁证据，或该 Host
-rejoin 后的空 inventory，才能证明物理 runtime 已不存在；仅网络隔离足以阻止服务，不足以
-声称 residue 已清空。
+postcondition满足时成功。仅网络隔离、断电、heartbeat timeout或普通Active HostFenceEvent足以阻止
+服务但不能证明Host state path已经消失，不能据此声称residue已清空。
 
 Deleted Operation成功后仍必须保留当前Desired/tombstone和关联observation index，不得把
 Operation Succeeded、NodeCleanupCheckpoint已写槽或某次partial observation的缺项当作checkpoint
-已不存在。即使volume disposition已完成且没有fence/rejoin待办，Control Plane也必须继续
-保留它们，直到它接受一个同时满足下列条件的`complete_inventory=true` NodeObservation：
+已不存在。Control Plane只允许以下严格二选一的GC absence proof；一次GC attempt选择其中一个分支，
+不得混合字段或从一个分支伪造另一个分支：
 
-1. observation来自该tombstone `placement.node_id`的当前AgentSession，inventory digest验证成功；
-2. `inventory_read_position`对应的完整assigned-spec读取仍包含该Deleted tombstone，且Control Plane
-   在接受inventory时重读同一tombstone；
-3. 完整checkpoint inventory证明由保留tombstone和observation index共同绑定的精确
-   `RuntimeCheckpoint`不存在：逻辑identity是
-   `(cat_id, node_id, placement_epoch, desired_revision, spec_digest)`，物理identity是保留的
-   `(checkpoint_path, content_digest)`；没有该Cat的valid/corrupt
-   `ObservedRuntimeStatus.checkpoint`，且没有该`checkpoint_path`上的
-   `NodeResidue.checkpoint_file`。任一identity字段不同表示冲突或重建，不是旧checkpoint缺席证明。
+这里的关联observation index不是新wire合同或authority，而是Control Plane对已接受
+`NodeObservation`保留的最小投影：`cat_id`、完整`AssignedPlacement`、`node_boot_id`、
+`agent_session_epoch`、最后一次full evidence的`checkpoint_path`，以及若曾接受valid checkpoint时的逻辑
+identity和`content_digest`。这些字段分别直接来自同一个已接受的顶层observation/runtime evidence；GC前
+不能被partial observation覆盖或丢弃。
 
-只有在接受这个absence proof后，Control Plane才可GC当前Desired/tombstone和关联
-observation index。absence proof校验与GC在同一Control Plane事务中完成；不得先用新
-observation覆盖/删除保留index，再把身份已丢失后的“缺项”解释为精确absence。审计按独立
-产品策略保留。验证不完整、wrong/stale session、wrong Node、
-仍看到checkpoint或尚未接受complete inventory时的GC attempt必须拒绝且零持久副作用。
+1. **Node inventory**：原placement Node仍存在或已重连。当前AgentSession的
+   `complete_inventory=true` observation已接受且digest验证成功；其
+   `inventory_read_position`对应的完整assigned-spec读取仍包含该Deleted tombstone，Control Plane在
+   接受inventory时重读同一tombstone。由保留tombstone和observation index绑定的
+   `checkpoint_path`必须有精确absence：该Cat的`CheckpointEvidence`必须是同一path的`missing`，且该path
+   没有`NodeResidue.checkpoint_file`。若index保留了旧valid checkpoint，还必须证明其逻辑identity
+   `(cat_id, node_id, placement_epoch, desired_revision, spec_digest)`及物理identity
+   `(checkpoint_path, content_digest)`没有出现在全部checkpoint inventory。同path的different-valid、
+   corrupt或other-Cat文件是冲突，不是absence，必须保留文件并拒绝GC。
+2. **HostDestroyed**：负责旧placement的Host无法再提供inventory。Control Plane锁定现有
+   `HostFenceEvent`，验证其中§9 `HostDestroyedReceipt`的provider、immutable host、node、expected boot、
+   expected session epoch和`state_path_id`逐字段绑定provisioned NodeIdentity及event。GC事务还必须重读
+   该Cat现有Deleted tombstone和保留的placement/session index：tombstone完整`AssignedPlacement`必须等于
+   index中该Cat的旧placement，二者的`node_id`等于event，index的boot/session epoch等于event expected值。
+   receipt的`state_storage_disposition="permanently_destroyed"`必须已由provider adapter证明承载Host state
+   path的storage永久销毁。一个Host级event可用同一Host tuple分别验证多个Cat，各Cat仍只使用自己的
+   tombstone/index绑定，不在event中复制Cat列表或placement。此分支不要求、也不得伪造AgentSession、
+   heartbeat或inventory；普通network isolation、power state或未带该receipt的HostFenceEvent不能使用。
+
+两个分支都不授予新placement或writer，也不替代volume authority。该Cat全部volume的authorization、
+不可变receipt和Deleted disposition仍须按§9/§11逐卷闭合；任何所需授权未消费、未失效，receipt缺失/
+冲突或volume disposition未完成都拒绝GC。只有验证所选absence proof和这些逐卷条件后，Control Plane
+才可GC当前Desired/tombstone和关联observation index。proof校验与GC在同一Control Plane事务中完成；
+不得先用新observation覆盖/删除保留index，再把身份已丢失后的“缺项”解释为精确absence。审计按独立
+产品策略保留。Node分支验证不完整、wrong/stale session、wrong Node、仍看到任意冲突checkpoint或尚未
+接受complete inventory，以及HostDestroyed分支receipt任一绑定错误，都必须拒绝且零持久副作用。
 Control Plane已GC后，本地NodeCleanupCheckpoint可按§5的“target已精确不存在”规则在无
 tombstone时清槽。Node删除checkpoint前还必须证明无runtime、无未跟踪volume residue和
 无route gate。授权丢弃的Root lineage必须已删除；Active
 HostFenceEvent上的隔离lineage由event/rejoin记录继续跟踪，关联的authorization与
-`DeleteCompletionReceipt`必须保留到Rejoined，不能因VolumeRecord或本地目录缺席猜测消失。
+`DeleteCompletionReceipt`不能因VolumeRecord或本地目录缺席猜测消失。普通`isolated` event至少保留到
+Rejoined；`host_destroyed`永不Rejoined，因此在没有tombstone、其他HostFenceEvent或live recovery引用、
+全部authorization已Consumed并验证receipt或已过`not_after`且不能首次消费、且逐卷disposition闭合后，
+相关逐卷恢复记录可按审计策略GC，不等待Rejoined。compact HostFenceEvent/HostDestroyed receipt仍按
+现有Operation及审计引用保留；只有所有引用都不存在时才可GC。
 
 ## 14. 最小验收矩阵
 
@@ -1796,12 +1860,14 @@ HostFenceEvent上的隔离lineage由event/rejoin记录继续跟踪，关联的au
 | N/N+1/N+2 ABA | 旧结果不能结算/授权 N+2；已线性化的本地 effect 可被下一轮安全修复 |
 | 双 Agent / register 响应丢失 | Host lock 排他；同 attempt 返回同 session；旧 session 永久拒绝 |
 | 各 planner step kill | restart 后确认、重试、继续或 quarantine；无重复 writer/误删 |
-| 进程崩溃，scope/socket/checkpoint仍存在 | full inventory报告三类standalone residue；valid evidence产生精确CleanupRelease，cleanup后的full rescan报告residue为空，Running可重新满足Ready |
-| standalone residue归属冲突 | 只有唯一Cat/tombstone强匹配才写该Cat RuntimeCheckpoint；无/多匹配保留Node residue并Quarantine，不自动删除 |
+| 进程崩溃，scope/socket/checkpoint仍存在 | full inventory报告scope/socket standalone residue及attributed checkpoint evidence；scope/socket强归属后产生Cat CleanupRelease，Deleted checkpoint只从`CheckpointEvidence.valid`产生Node单槽target；rescan后才可Ready/GC |
+| standalone residue归属冲突 | 只有scope/socket唯一Cat/tombstone强匹配才写该Cat RuntimeCheckpoint；unexpected/unassigned checkpoint及无/多匹配都保留证据并Quarantine，不自动删除 |
 | NodeCleanup写槽前crash | target未删除且没有持久Node槽；保留tombstone，restart以新full scan重新规划，不从未落盘的cleanup猜测成功 |
 | NodeCleanup写槽后、删除前crash | 单槽和tombstone均保留；restart只在当前session full scan、完整绑定和content digest复核通过后删除精确target |
-| checkpoint删除后、清槽前crash | 新full scan证明精确target已不存在后原子清槽；即使tombstone随后已GC也无需rebind，且不得据此删除同path重建的文件 |
-| Control Plane提前GC | Operation成功、槽已写入、partial或未接受的full inventory都不足；未接受含tombstone读取位置并证明精确checkpoint缺席的complete inventory时，GC拒绝且零持久副作用 |
+| checkpoint删除后、清槽前crash | 新full scan证明path没有filesystem entry后原子清槽；即使tombstone随后已GC也无需rebind；同path重建为different-valid/corrupt/other-Cat时保留新文件并拒绝旧cleanup/GC |
+| Control Plane提前GC | Operation成功、槽已写入、partial或未接受的full inventory都不足；Node分支必须有精确missing evidence，HostDestroyed分支必须有完整绑定和永久storage销毁receipt，否则GC拒绝且零持久副作用 |
+| HostDestroyed receipt/GC crash | proof验证与tombstone/index GC同事务，要么全部保留要么全部删除；不创建伪AgentSession/inventory，event和逐卷receipt按各自保留规则继续存在 |
+| HostDestroyed但volume未闭合 | receipt不授予writer/disposition；任一逐卷authorization仍可首次消费、receipt冲突或Deleted disposition未完成时GC拒绝 |
 | scan与cleanup之间资源被重建 | token、digest、cgroup或process identity任一不匹配时旧cleanup拒绝，新资源保留 |
 | standalone scope/socket token missing或corrupt | 不生成CleanupTarget，不删除，进入Quarantined/人工处理 |
 | standalone checkpoint corrupt | 不生成`checkpoint_file` target，不自动删除，进入Quarantined/人工处理 |
@@ -1958,16 +2024,16 @@ route multiplicity、VMM shape/Guest Ready、volume size/durability、missing/co
 中保留`R < L` lineage，所以不是Ready postcondition：
 
 ```json
-{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"inventory_epoch":4,"inventory_read_position":12,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","residue":[{"cgroup_path":"/sys/fs/cgroup/system.slice/cats-orphan.scope","kind":"systemd_scope","ownership_token":{"kind":"valid","ownership_token":"dddddddddddddddddddddddddddddddd"},"scope_id":"cats-orphan.scope"},{"kind":"control_socket","ownership_token":{"kind":"missing"},"role_hint":null,"socket_path":"/run/cats/orphan/control.sock"},{"checkpoint_path":"/var/lib/cats/checkpoints/orphan.json","evidence":{"kind":"corrupt","raw_content_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"kind":"checkpoint_file"},{"data_directory":"/var/lib/cats/orphan-vol","kind":"data_directory","lineage":{"attachment_epoch_hint":4,"attachment_id_hint":"att_orphan","fenced":false,"kind":"readable","local_durable_generation":6,"pending_pack_count":2,"remote_durable_generation":5},"ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"volume_id_hint":null}],"runtimes":[{"applied_desired":{"desired_revision":7,"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","target":"running"},"cat_id":"cat_01","checkpoint":{"cat_id":"cat_01","content_digest":"sha256:602bd0f3a0f1a29f269fa2946fa1a52ea154ba1623b5ca2de18e657cad3753fb","desired_revision":7,"kind":"valid","node_id":"node_a","placement_epoch":3,"require_idle":{"kind":"not_applicable"},"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"updated_at_unix_ms":1720000000000,"version":1},"guest_transport":{"guest_agent_protocol_version":1,"guest_boot_id":"cccccccccccccccccccccccccccccccc","guest_cid":3,"guest_port":5000,"kind":"vsock_ready","runtime_incarnation":"55555555555555555555555555555555"},"lifecycle_admission":"closed","mounts":[{"access":"read_write","filesystem_uuid":"99999999999999999999999999999999","guest_device":{"serial":"cats-root","slot":0},"instance_count":1,"mount_path":"/","volume_id":"vol_root"}],"networks":[{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"valid","ownership_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"prefix_length":30,"tap_name":"tap0"},{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"prefix_length":30,"tap_name":"tap1"}],"platform_guards":0,"processes":[{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/vmm.sock","executable_path":"/usr/bin/cloud-hypervisor","observed_vm_shape":{"boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","guest_config_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","memory_bytes":2147483648,"vcpus":2},"ownership_token":{"kind":"valid","ownership_token":"66666666666666666666666666666666"},"process_id":1001,"process_start_time_ticks":9001,"role":{"kind":"vmm","runtime_incarnation":"55555555555555555555555555555555"},"scope_id":"cats-cat_01","state":"running"},{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/blockd-root.sock","executable_path":"/usr/bin/cats-blockd","observed_vm_shape":null,"ownership_token":{"kind":"valid","ownership_token":"77777777777777777777777777777777"},"process_id":1002,"process_start_time_ticks":9002,"role":{"attachment_epoch":8,"attachment_id":"att_01","kind":"blockd","volume_id":"vol_root"},"scope_id":"cats-cat_01","state":"running"}],"routes":[{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":9,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"gate":"closed","instance_count":2},{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":10,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"gate":"closed","instance_count":1}],"runtime_incarnation":"55555555555555555555555555555555","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"volumes":[{"authority":{"attachment_epoch":8,"attachment_id":"att_01","generation":4,"kind":"owned","remote_root":"sha256:2222222222222222222222222222222222222222222222222222222222222222"},"devices":[{"device_path":"/dev/nbd0","guest_device":{"serial":"cats-root","slot":0},"kind":"kernel_nbd","ownership_token":{"kind":"valid","ownership_token":"88888888888888888888888888888888"}},{"guest_device":{"serial":"cats-root","slot":0},"kind":"vhost_user_blk","ownership_token":{"kind":"missing"},"socket_path":"/run/cats/cat_01/root.sock"}],"disk_id":"disk_root","disk_kind":"root","durability":"strict","local_lineages":[{"acquire_transition_id":"tx_01","attachment_epoch":8,"attachment_id":"att_01","data_directory":"/var/lib/cats/vol_root","fenced":false,"local_durable_generation":5,"node_id":"node_a","pending_pack_count":1,"placement_epoch":3,"remote_durable_generation":4,"state":"active"}],"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"warm_snapshot":{"kind":"absent"}}],"version":1}
+{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"inventory_epoch":4,"inventory_read_position":12,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","residue":[{"cgroup_path":"/sys/fs/cgroup/system.slice/cats-orphan.scope","kind":"systemd_scope","ownership_token":{"kind":"valid","ownership_token":"dddddddddddddddddddddddddddddddd"},"scope_id":"cats-orphan.scope"},{"kind":"control_socket","ownership_token":{"kind":"missing"},"role_hint":null,"socket_path":"/run/cats/orphan/control.sock"},{"checkpoint_path":"/var/lib/cats/checkpoints/orphan.json","evidence":{"kind":"corrupt","raw_content_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"kind":"checkpoint_file"},{"data_directory":"/var/lib/cats/orphan-vol","kind":"data_directory","lineage":{"attachment_epoch_hint":4,"attachment_id_hint":"att_orphan","fenced":false,"kind":"readable","local_durable_generation":6,"pending_pack_count":2,"remote_durable_generation":5},"ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"volume_id_hint":null}],"runtimes":[{"applied_desired":{"desired_revision":7,"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","target":"running"},"cat_id":"cat_01","checkpoint":{"cat_id":"cat_01","checkpoint_path":"/var/lib/cats/checkpoints/cat_01.json","content_digest":"sha256:602bd0f3a0f1a29f269fa2946fa1a52ea154ba1623b5ca2de18e657cad3753fb","desired_revision":7,"kind":"valid","node_id":"node_a","placement_epoch":3,"require_idle":{"kind":"not_applicable"},"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"updated_at_unix_ms":1720000000000,"version":1},"guest_transport":{"guest_agent_protocol_version":1,"guest_boot_id":"cccccccccccccccccccccccccccccccc","guest_cid":3,"guest_port":5000,"kind":"vsock_ready","runtime_incarnation":"55555555555555555555555555555555"},"lifecycle_admission":"closed","mounts":[{"access":"read_write","filesystem_uuid":"99999999999999999999999999999999","guest_device":{"serial":"cats-root","slot":0},"instance_count":1,"mount_path":"/","volume_id":"vol_root"}],"networks":[{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"valid","ownership_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"prefix_length":30,"tap_name":"tap0"},{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"prefix_length":30,"tap_name":"tap1"}],"platform_guards":0,"processes":[{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/vmm.sock","executable_path":"/usr/bin/cloud-hypervisor","observed_vm_shape":{"boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","guest_config_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","memory_bytes":2147483648,"vcpus":2},"ownership_token":{"kind":"valid","ownership_token":"66666666666666666666666666666666"},"process_id":1001,"process_start_time_ticks":9001,"role":{"kind":"vmm","runtime_incarnation":"55555555555555555555555555555555"},"scope_id":"cats-cat_01","state":"running"},{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/blockd-root.sock","executable_path":"/usr/bin/cats-blockd","observed_vm_shape":null,"ownership_token":{"kind":"valid","ownership_token":"77777777777777777777777777777777"},"process_id":1002,"process_start_time_ticks":9002,"role":{"attachment_epoch":8,"attachment_id":"att_01","kind":"blockd","volume_id":"vol_root"},"scope_id":"cats-cat_01","state":"running"}],"routes":[{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":9,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"gate":"closed","instance_count":2},{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":10,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"gate":"closed","instance_count":1}],"runtime_incarnation":"55555555555555555555555555555555","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"volumes":[{"authority":{"attachment_epoch":8,"attachment_id":"att_01","generation":4,"kind":"owned","remote_root":"sha256:2222222222222222222222222222222222222222222222222222222222222222"},"devices":[{"device_path":"/dev/nbd0","guest_device":{"serial":"cats-root","slot":0},"kind":"kernel_nbd","ownership_token":{"kind":"valid","ownership_token":"88888888888888888888888888888888"}},{"guest_device":{"serial":"cats-root","slot":0},"kind":"vhost_user_blk","ownership_token":{"kind":"missing"},"socket_path":"/run/cats/cat_01/root.sock"}],"disk_id":"disk_root","disk_kind":"root","durability":"strict","local_lineages":[{"acquire_transition_id":"tx_01","attachment_epoch":8,"attachment_id":"att_01","data_directory":"/var/lib/cats/vol_root","fenced":false,"local_durable_generation":5,"node_id":"node_a","pending_pack_count":1,"placement_epoch":3,"remote_durable_generation":4,"state":"active"}],"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"warm_snapshot":{"kind":"absent"}}],"version":1}
 ```
 
 ```text
-inventory_digest = sha256:c5d8e01b39e2b0284af5bec7d7bb72500384284c640bfec35b994ab545486934
+inventory_digest = sha256:1c99560e8c7235dae90c36f5298874ccba84fcd042f89412237d88810274f26d
 ```
 
-**Valid standalone socket/checkpoint inventory vector**使用inventory domain。它与上面的checkpoint
-vector交叉绑定，证明valid ownership token和valid checkpoint evidence的wire；是否允许cleanup仍必须
-另外满足§10.1的唯一Cat/tombstone归属：
+**Valid unexpected standalone socket/checkpoint inventory vector**使用inventory domain。它与上面的
+checkpoint vector交叉绑定，证明valid ownership token和unexpected valid checkpoint residue的wire；
+因为checkpoint未归属`ObservedRuntimeStatus`，它只能Quarantine，不能产生checkpoint cleanup target：
 
 ```json
 {"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"inventory_epoch":5,"inventory_read_position":13,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","residue":[{"kind":"control_socket","ownership_token":{"kind":"valid","ownership_token":"abababababababababababababababab"},"role_hint":null,"socket_path":"/run/cats/orphan/valid.sock"},{"checkpoint_path":"/var/lib/cats/checkpoints/cat_01.json","evidence":{"cat_id":"cat_01","content_digest":"sha256:602bd0f3a0f1a29f269fa2946fa1a52ea154ba1623b5ca2de18e657cad3753fb","desired_revision":7,"kind":"valid","node_id":"node_a","placement_epoch":3,"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","version":1},"kind":"checkpoint_file"}],"runtimes":[],"version":1}
@@ -2005,10 +2071,11 @@ key_ring_digest = sha256:7881e60fd2e5dfa2fda716f560d6f124a7defd6c06b9d23c1038c42
 {"desired_read_position":15,"inventory_epoch":5,"inventory_read_position":13,"inventory_session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"target":{"attachment_epoch":8,"attachment_id":"att_01","kind":"volume","volume_id":"vol_root"},"volume_release":{"disposition":{"kind":"detach_retained"},"generation":5,"release_transition_id":"acacacacacacacacacacacacacacacac"}}
 ```
 
-**NodeCleanupCheckpoint wire vector**（只能持有checkpoint自删除）：
+**NodeCleanupCheckpoint wire vector**（target path/digest/identity与Non-empty full inventory的attributed
+valid checkpoint交叉校验；这里只固定wire，不表示该Running observation已满足Deleted cleanup授权）：
 
 ```json
-{"cleanup":{"desired_read_position":15,"inventory_epoch":5,"inventory_read_position":13,"inventory_session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"target":{"cat_id":"cat_01","checkpoint_path":"/var/lib/cats/checkpoints/cat_01.json","content_digest":"sha256:602bd0f3a0f1a29f269fa2946fa1a52ea154ba1623b5ca2de18e657cad3753fb","desired_revision":7,"kind":"checkpoint_file","node_id":"node_a","placement_epoch":3},"volume_release":null},"node_id":"node_a","version":1}
+{"cleanup":{"desired_read_position":15,"inventory_epoch":4,"inventory_read_position":12,"inventory_session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"target":{"cat_id":"cat_01","checkpoint_path":"/var/lib/cats/checkpoints/cat_01.json","content_digest":"sha256:602bd0f3a0f1a29f269fa2946fa1a52ea154ba1623b5ca2de18e657cad3753fb","desired_revision":7,"kind":"checkpoint_file","node_id":"node_a","placement_epoch":3},"volume_release":null},"node_id":"node_a","version":1}
 ```
 
 **Observation sequence conflict ContractError wire vector**：
@@ -2035,20 +2102,37 @@ release commit后响应丢失/Agent crash必须用同一transition得到原Unown
 新session rebind只替换session/read positions并保留target/原transition；同transition异payload、
 release N后reacquire N+1再重放N，以及scan后token/digest变化都必须拒绝且不误删。
 standalone socket只能在唯一Cat checkpoint强匹配后写该Cat的cleanup step；valid checkpoint自删除必须使用
-单槽NodeCleanupCheckpoint，并分别测试写槽前crash、写槽后删除前crash、删除后清槽前crash，以及
-Control Plane在接受精确absence proof前GC被拒绝。还必须测试tombstone已GC但target确实absent时清槽、
-tombstone已GC但target仍存在时拒绝删除、旧槽与重建文件冲突、被删checkpoint试图记录自身cleanup被拒绝，
-以及无法归属、missing/corrupt evidence永不产生cleanup。
+单槽NodeCleanupCheckpoint且只从attributed Deleted `CheckpointEvidence.valid`构造；三个CheckpointEvidence
+variant的path都必须进入inventory digest但不改变RuntimeCheckpoint content digest，unexpected/unassigned
+checkpoint即使valid也只进NodeResidue且不产生cleanup。分别测试写槽前crash、写槽后删除前crash、删除后
+清槽前crash，以及Control Plane在接受精确absence proof前GC被拒绝。还必须测试tombstone已GC但target
+确实absent时清槽、tombstone已GC但target仍存在时拒绝删除，以及旧文件删除后同path重建为
+different-valid、corrupt、other-Cat三种情况都保留新文件并拒绝旧cleanup/GC。被删checkpoint试图记录自身
+cleanup、无法归属及missing/corrupt evidence都不得产生cleanup。
+
+GC tests必须分别覆盖Node inventory和HostDestroyed两个分支：Node分支要求当前session、complete inventory、
+tombstone读取位置和精确path missing；HostDestroyed分支逐字段改变provider、immutable host、node、boot、
+session epoch、state path、storage disposition，以及该Cat retained placement/session index中的placement
+epoch或boot/session，都必须拒绝，network isolation/断电也必须拒绝，且不得创建AgentSession/inventory
+占位。同一Host两个Cat使用不同placement epoch时必须能各自匹配同一HostDestroyed event。两个分支都要在
+每个volume authorization/receipt/disposition未闭合时拒绝；在proof校验或GC事务任一点crash后，tombstone
+与index必须全有或全无。HostDestroyed逐卷恢复记录的GC还必须测试最后一个tombstone/recovery引用消失前
+拒绝、全部authorization terminal且disposition闭合后允许、事务crash全有或全无；compact event若仍被
+Operation引用则保留。
 
 Operation settlement negative tests必须分别改变顶层`NodeObservation.node_id`、Operation/applied/current
 三处placement Node和applied/Operation/current/stable/result五处target中的每一处。Node A observation不得
 结算Node B Operation；每个Node不匹配都按§16.4固定优先级返回`wrong_placement`，且不接受observation、
 不推进最高sequence或freshness、不写terminal result。其他placement或target不等也不得结算Operation。
+另以standalone Operation decoder分别改变Succeeded result和Failed HostLost error的`node_id`，必须在
+持久化前按上述精确pointer拒绝；匹配placement的正例必须接受。
 
 negative tests还必须覆盖route gate外层`endpoint_id`作为unknown field被拒绝、
 `runtime_identity_conflict`单个different identity合法、只有expected identity非法、`duplicate_runtime`少于
 两个different identity非法，以及invalid UTF-8、invalid JSON、duplicate field、invalid type/value按§16.4
-优先级返回且前两者pointer为空。
+优先级返回且前两者pointer为空。pointer边界测试必须覆盖unknown key、member中的`~`/`/`分别转义为
+`~0`/`~1`、转义后恰好512 bytes仍返回精确pointer，以及原key未超限但转义后超过512 bytes时固定返回
+根空string且绝不截断。
 
 ### 16.4 跨组件 typed errors
 
@@ -2173,7 +2257,10 @@ ContractName = "node_identity" | "agent_registration_attempt" | "agent_session"
 ```
 
 `message`只供人读，接收方只能按`error.code`及typed payload分支。`json_pointer`使用RFC 6901文本，根
-对象是空string。`limit_exceeded.observed_at_least`必须大于`maximum`；decoder在读到
+对象是空string。`malformed_payload`必须从已decode的object member/array index构造精确pointer：每个
+member segment先把`~`编码为`~0`、`/`编码为`~1`，再用`/`连接。若完整RFC 6901 pointer不是§1.1合法
+`JsonPointer`，特别是转义后的UTF-8编码超过512 bytes，则`json_pointer`固定回退为空string；禁止截断、
+截取尾部或返回中间ancestor。`limit_exceeded.observed_at_least`必须大于`maximum`；decoder在读到
 `maximum + 1`个byte/item时即可停止并报告该值，不需要继续接收攻击者控制的剩余payload。解析/验证
 优先级固定为：顶层wire byte上限 -> UTF-8 decode -> JSON grammar -> duplicate object key -> object字段与
 primitive类型 -> `version` -> array item上限 -> 字段值和数组排序/唯一性 -> session ->

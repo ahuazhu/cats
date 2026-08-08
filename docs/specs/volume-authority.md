@@ -288,9 +288,24 @@ HostFenceEvent {
   expected_node_boot_id,
   expected_agent_session_epoch,
   fence_attempt_id,
-  isolation_state,
+  isolation_state: HostIsolationState,
   observed_at,
   state: Active | Rejoined
+}
+
+HostIsolationState =
+  { kind: "isolated" }
+| { kind: "host_destroyed", receipt: HostDestroyedReceipt }
+
+HostDestroyedReceipt {
+  provider: Id,
+  immutable_host_id: Id,
+  node_id: Id,
+  expected_node_boot_id: NodeBootId,
+  expected_agent_session_epoch: Epoch,
+  state_path_id: Id,
+  state_storage_disposition: "permanently_destroyed",
+  destroyed_at_unix_ms: UnixMillis
 }
 ```
 
@@ -298,6 +313,15 @@ Control Plane 只在 provider/BMC 证明旧 Host 已隔离且隔离仍被维持�
 Host 上每个需要恢复的 volume 派生独立 `VolumeTakeoverAuthorization`。一个 Host event 可以派生
 多份授权；每份授权只能消费一次。heartbeat timeout、route TTL、AgentSession 失效都不能建立
 event。
+
+`host_destroyed`复用同一event行，只能来自provider adapter验证过的HostDestroyed receipt。receipt必须
+逐字段绑定event及provisioned `NodeIdentity.state_path_id`，并证明承载该state path的
+provider storage永久销毁；network isolation、power state或普通`isolated`不能升级推断出这个事实。
+Active event可以直接以`host_destroyed`建立，或从`isolated`单调更新；receipt一经提交不可变，相同
+receipt重放只读原结果，任一字段不同都拒绝。`host_destroyed`不会转为Rejoined；替换Host必须使用新的
+provisioned identity。
+该receipt只可作为Runtime tombstone GC的Host缺席证据，不授予placement/writer，也不跳过本规格的逐卷
+authorization、receipt或disposition闭环。
 
 旧 Host 恢复时先进入隔离rejoin流程：提高AgentSession epoch，枚举并停止全部旧VMM/blockd，按
 `VolumeLocalIdentity`把所有失效epoch目录移入quarantine，并证明旧route、socket和进程均不可用。
@@ -318,6 +342,13 @@ event。
 Rejoined event不能再派生授权；Unconsumed授权因首次消费必须检查Active event而永久不能生效；
 Consumed授权仍可幂等读取receipt。相关authorization与`DeleteCompletionReceipt`至少保留到event
 Rejoined，之后才可按审计策略GC。旧epoch的`R < L`目录保留作人工恢复证据，永不参与新Root。
+
+`host_destroyed`不等待永远不会发生的Rejoined。没有Runtime tombstone、其他HostFenceEvent或live
+recovery引用相关逐卷记录，所有Unconsumed authorization都已过`not_after`、所有Consumed authorization
+的receipt及最终volume disposition都已验证后，相关逐卷authorization/receipt/
+`DeleteCompletionReceipt`可在一个事务中按审计策略GC；任一引用、仍可首次消费的authorization或未闭合
+disposition都拒绝且零副作用。compact
+HostFenceEvent/HostDestroyed receipt继续按现有Operation/审计引用保留，只有全部引用消失后才可GC。
 
 ## 5. blockd 采用 grant，不改变 ownership
 
