@@ -6,20 +6,25 @@ pub(super) async fn register_node(
     Json(req): Json<RegisterNodeRequest>,
 ) -> ApiResult<StatusCode> {
     check_service_auth(&state, &headers).await?;
-    let expected_fingerprint = state.cfg.route_grant_signer.public_key_sha256();
-    let admission = crate::store::NodeAdmission::for_route_grant(
-        req.initially_cordoned,
-        req.route_grant_public_key_sha256.as_deref(),
-        expected_fingerprint,
-    );
-    state.store.register_node_with_admission(
-        &req.node_id,
-        &req.agent_url,
-        &req.gateway_url,
-        req.cpus,
-        req.memory_mib,
-        admission,
-    )?;
+    let expected_fingerprint = state.cfg.route_grant_signer.public_key_sha256().to_string();
+    state
+        .store
+        .execute(move |store| {
+            let admission = crate::store::NodeAdmission::for_route_grant(
+                req.initially_cordoned,
+                req.route_grant_public_key_sha256.as_deref(),
+                &expected_fingerprint,
+            );
+            store.register_node_with_admission(
+                &req.node_id,
+                &req.agent_url,
+                &req.gateway_url,
+                req.cpus,
+                req.memory_mib,
+                admission,
+            )
+        })
+        .await?;
     state.notify.notify_one();
     Ok(StatusCode::NO_CONTENT)
 }
@@ -30,118 +35,125 @@ pub(super) async fn heartbeat(
     Json(req): Json<HeartbeatRequest>,
 ) -> ApiResult<StatusCode> {
     check_service_auth(&state, &headers).await?;
-    let inventory_changed =
-        state
-            .store
-            .heartbeat_node(&req.node_id, req.telemetry.as_ref(), &req.cats)?;
-    if inventory_changed {
-        // Reverse reconciliation (issue #98): a Cat the agent runs that the
-        // control plane has not assigned here must not stay invisible. It is
-        // surfaced on NodeSummary/monitoring/metrics; the log line fires only
-        // when the reported inventory changes, not on every beat.
-        let orphans = state.store.orphan_reported_cats(&req.node_id)?;
-        if !orphans.is_empty() {
-            let detail = orphans
-                .iter()
-                .map(|hb| format!("{} generation {} {:?}", hb.cat_id, hb.generation, hb.state))
-                .collect::<Vec<_>>()
-                .join(", ");
-            tracing::warn!(
-                node = %req.node_id,
-                orphans = orphans.len(),
-                reported = req.cats.len(),
-                detail = %detail,
-                "node reports cats the control plane has not assigned to it"
-            );
-        }
-    }
-    // Drift detection: trust node reports for steady states at the same
-    // generation; the reconciler drives any resulting divergence.
-    for hb in &req.cats {
-        if let Ok(cat) = state.store.must_get_cat_by_id(&hb.cat_id) {
-            if cat.generation == hb.generation
-                && cat.node_id.as_deref() == Some(req.node_id.as_str())
-                && cat.observed_state != hb.state
-                && matches!(
-                    cat.observed_state,
-                    ObservedState::Running
-                        | ObservedState::Suspended
-                        | ObservedState::Warm
-                        | ObservedState::Unknown
-                )
-            {
-                state.store.set_observed(&cat.id, hb.state)?;
-                state.notify.notify_one();
-            }
-        }
-    }
-    let node = state.store.get_node(&req.node_id)?;
-    if node.state == NodeState::Lost {
-        // Recovery requires the Host to still hold everything the control plane
-        // believes it holds -- otherwise a Cat may have moved on and recovering
-        // would resurrect a stale claim.
-        //
-        // A Cat being deleted is exempt, because for it absence *is* the
-        // expected end state: the Host reporting it would be the anomaly. Left
-        // in the requirement it deadlocks the pair, since `reconcile_cat`
-        // declines to run any flow -- including the delete -- while the node is
-        // Lost, so the claim can never be settled and the node can never
-        // recover.
-        let claims = state.store.cats_on_node(&req.node_id)?;
-        let required: Vec<&Cat> = claims
-            .iter()
-            .filter(|cat| cat.desired_state != DesiredState::Deleted)
-            .collect();
-        let missing: Vec<&Cat> = required
-            .iter()
-            .copied()
-            .filter(|cat| {
-                !req.cats
-                    .iter()
-                    .any(|hb| hb.cat_id == cat.id && hb.generation == cat.generation)
-            })
-            .collect();
-        if missing.is_empty() {
-            if state.store.recover_lost_node(&req.node_id)? {
-                tracing::info!(
-                    node = %req.node_id,
-                    claims = required.len(),
-                    deleting = claims.len() - required.len(),
-                    "complete same-generation inventory recovered lost node claims"
-                );
-                state.notify.notify_one();
-            }
-        } else {
-            // Name what is missing and why. Recovering a fleet needs to know
-            // which claim blocks it, and whether the Host omitted the Cat
-            // entirely or reported a different generation.
-            let detail = missing
-                .iter()
-                .map(|cat| {
-                    let reported_generation = req
-                        .cats
+    let notify = state.notify.clone();
+    state
+        .store
+        .execute(move |store| {
+            let inventory_changed =
+                store.heartbeat_node(&req.node_id, req.telemetry.as_ref(), &req.cats)?;
+            if inventory_changed {
+                // Reverse reconciliation (issue #98): a Cat the agent runs that the
+                // control plane has not assigned here must not stay invisible. It is
+                // surfaced on NodeSummary/monitoring/metrics; the log line fires only
+                // when the reported inventory changes, not on every beat.
+                let orphans = store.orphan_reported_cats(&req.node_id)?;
+                if !orphans.is_empty() {
+                    let detail = orphans
                         .iter()
-                        .find(|hb| hb.cat_id == cat.id)
-                        .map(|hb| hb.generation);
-                    match reported_generation {
-                        Some(generation) => format!(
-                            "{} ({}) generation {} != claimed {}",
-                            cat.id, cat.name, generation, cat.generation
-                        ),
-                        None => format!("{} ({}) not reported", cat.id, cat.name),
+                        .map(|hb| {
+                            format!("{} generation {} {:?}", hb.cat_id, hb.generation, hb.state)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    tracing::warn!(
+                        node = %req.node_id,
+                        orphans = orphans.len(),
+                        reported = req.cats.len(),
+                        detail = %detail,
+                        "node reports cats the control plane has not assigned to it"
+                    );
+                }
+            }
+            // Drift detection: trust node reports for steady states at the same
+            // generation; the reconciler drives any resulting divergence.
+            for hb in &req.cats {
+                if let Ok(cat) = store.must_get_cat_by_id(&hb.cat_id) {
+                    if cat.generation == hb.generation
+                        && cat.node_id.as_deref() == Some(req.node_id.as_str())
+                        && cat.observed_state != hb.state
+                        && matches!(
+                            cat.observed_state,
+                            ObservedState::Running
+                                | ObservedState::Suspended
+                                | ObservedState::Warm
+                                | ObservedState::Unknown
+                        )
+                    {
+                        store.set_observed(&cat.id, hb.state)?;
+                        notify.notify_one();
                     }
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            tracing::warn!(
-                node = %req.node_id,
-                claims = required.len(),
-                reported = req.cats.len(),
-                blocked_by = %detail,
-                "lost node heartbeat omitted a preserved claim; keeping node lost"
-            );
-        }
-    }
+                }
+            }
+            let node = store.get_node(&req.node_id)?;
+            if node.state == NodeState::Lost {
+                // Recovery requires the Host to still hold everything the control plane
+                // believes it holds -- otherwise a Cat may have moved on and recovering
+                // would resurrect a stale claim.
+                //
+                // A Cat being deleted is exempt, because for it absence *is* the
+                // expected end state: the Host reporting it would be the anomaly. Left
+                // in the requirement it deadlocks the pair, since `reconcile_cat`
+                // declines to run any flow -- including the delete -- while the node is
+                // Lost, so the claim can never be settled and the node can never
+                // recover.
+                let claims = store.cats_on_node(&req.node_id)?;
+                let required: Vec<&Cat> = claims
+                    .iter()
+                    .filter(|cat| cat.desired_state != DesiredState::Deleted)
+                    .collect();
+                let missing: Vec<&Cat> = required
+                    .iter()
+                    .copied()
+                    .filter(|cat| {
+                        !req.cats
+                            .iter()
+                            .any(|hb| hb.cat_id == cat.id && hb.generation == cat.generation)
+                    })
+                    .collect();
+                if missing.is_empty() {
+                    if store.recover_lost_node(&req.node_id)? {
+                        tracing::info!(
+                            node = %req.node_id,
+                            claims = required.len(),
+                            deleting = claims.len() - required.len(),
+                            "complete same-generation inventory recovered lost node claims"
+                        );
+                        notify.notify_one();
+                    }
+                } else {
+                    // Name what is missing and why. Recovering a fleet needs to know
+                    // which claim blocks it, and whether the Host omitted the Cat
+                    // entirely or reported a different generation.
+                    let detail = missing
+                        .iter()
+                        .map(|cat| {
+                            let reported_generation = req
+                                .cats
+                                .iter()
+                                .find(|hb| hb.cat_id == cat.id)
+                                .map(|hb| hb.generation);
+                            match reported_generation {
+                                Some(generation) => format!(
+                                    "{} ({}) generation {} != claimed {}",
+                                    cat.id, cat.name, generation, cat.generation
+                                ),
+                                None => format!("{} ({}) not reported", cat.id, cat.name),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    tracing::warn!(
+                        node = %req.node_id,
+                        claims = required.len(),
+                        reported = req.cats.len(),
+                        blocked_by = %detail,
+                        "lost node heartbeat omitted a preserved claim; keeping node lost"
+                    );
+                }
+            }
+            Ok(())
+        })
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -151,11 +163,15 @@ pub(super) async fn node_work_status(
     Json(request): Json<NodeWorkStatusRequest>,
 ) -> ApiResult<StatusCode> {
     check_service_auth(&state, &headers).await?;
-    let should_wake = state.store.ingest_guest_work(&request)?;
+    let request_cat_id = request.cat_id.clone();
+    let should_wake = state
+        .store
+        .execute(move |store| store.ingest_guest_work(&request))
+        .await?;
     if should_wake {
         state.notify.notify_one();
     } else {
-        state.controller.maybe_auto_suspend(&request.cat_id)?;
+        state.controller.maybe_auto_suspend(&request_cat_id).await?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -169,13 +185,18 @@ pub(super) async fn acquire_work(
     if request.kind == WorkKind::Guest {
         return Err(ApiError::invalid("guest work must come through the owning node").into());
     }
-    let lease = state.store.acquire_work(
-        &request.cat_id,
-        request.kind,
-        &request.owner_id,
-        &request.label,
-        request.ttl_ms,
-    )?;
+    let lease = state
+        .store
+        .execute(move |store| {
+            store.acquire_work(
+                &request.cat_id,
+                request.kind,
+                &request.owner_id,
+                &request.label,
+                request.ttl_ms,
+            )
+        })
+        .await?;
     Ok(Json(AcquireWorkResponse { lease }))
 }
 
@@ -185,8 +206,12 @@ pub(super) async fn release_work(
     Json(request): Json<ReleaseWorkRequest>,
 ) -> ApiResult<StatusCode> {
     check_service_auth(&state, &headers).await?;
-    if let Some(cat_id) = state.store.release_work(&request.lease_id)? {
-        state.controller.maybe_auto_suspend(&cat_id)?;
+    let cat_id = state
+        .store
+        .execute(move |store| store.release_work(&request.lease_id))
+        .await?;
+    if let Some(cat_id) = cat_id {
+        state.controller.maybe_auto_suspend(&cat_id).await?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -197,7 +222,7 @@ pub(super) async fn cordon_node(
     headers: HeaderMap,
 ) -> ApiResult<StatusCode> {
     check_admin_auth(&state, &headers).await?;
-    cordon_registered_node(&state, &id)?;
+    cordon_registered_node(&state, &id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -206,9 +231,8 @@ pub(super) async fn list_nodes(
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<Node>>> {
     check_admin_auth(&state, &headers).await?;
-    Ok(Json(ListResponse {
-        items: state.store.list_nodes()?,
-    }))
+    let items = state.store.execute(|store| store.list_nodes()).await?;
+    Ok(Json(ListResponse { items }))
 }
 
 pub(super) async fn admin_list_nodes(
@@ -216,9 +240,11 @@ pub(super) async fn admin_list_nodes(
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<NodeSummary>>> {
     check_admin_auth(&state, &headers).await?;
-    Ok(Json(ListResponse {
-        items: state.store.list_node_summaries()?,
-    }))
+    let items = state
+        .store
+        .execute(|store| store.list_node_summaries())
+        .await?;
+    Ok(Json(ListResponse { items }))
 }
 
 /// Resource routes key on the immutable workspace ID, so a machine token — which
@@ -229,9 +255,11 @@ pub(super) async fn admin_list_workspaces(
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<cats_api::auth::Workspace>>> {
     check_admin_auth(&state, &headers).await?;
-    Ok(Json(ListResponse {
-        items: state.store.list_all_workspace_views()?,
-    }))
+    let items = state
+        .store
+        .execute(|store| store.list_all_workspace_views())
+        .await?;
+    Ok(Json(ListResponse { items }))
 }
 
 pub(super) async fn admin_get_node(
@@ -240,7 +268,11 @@ pub(super) async fn admin_get_node(
     headers: HeaderMap,
 ) -> ApiResult<Json<NodeSummary>> {
     check_admin_auth(&state, &headers).await?;
-    Ok(Json(state.store.node_summary(&id)?))
+    let summary = state
+        .store
+        .execute(move |store| store.node_summary(&id))
+        .await?;
+    Ok(Json(summary))
 }
 
 pub(super) async fn admin_node_cats(
@@ -249,9 +281,11 @@ pub(super) async fn admin_node_cats(
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<NodeCatSummary>>> {
     check_admin_auth(&state, &headers).await?;
-    Ok(Json(ListResponse {
-        items: state.store.node_cat_summaries(&id)?,
-    }))
+    let items = state
+        .store
+        .execute(move |store| store.node_cat_summaries(&id))
+        .await?;
+    Ok(Json(ListResponse { items }))
 }
 
 pub(super) async fn admin_node_action(
@@ -261,15 +295,24 @@ pub(super) async fn admin_node_action(
     body: Bytes,
 ) -> ApiResult<Response> {
     check_admin_auth(&state, &headers).await?;
-    let node = state.store.get_node(&id)?;
+    let query_id = id.clone();
+    let node = state
+        .store
+        .execute(move |store| store.get_node(&query_id))
+        .await?;
     let status = match verb.as_str() {
         "cordon" => {
-            cordon_registered_node(&state, &id)?;
+            cordon_registered_node(&state, &id).await?;
             StatusCode::OK
         }
         "uncordon" => {
             let expected = state.cfg.route_grant_signer.public_key_sha256();
-            state.store.uncordon_node_with_route_grant(&id, expected)?;
+            let id = id.clone();
+            let expected = expected.to_string();
+            state
+                .store
+                .execute(move |store| store.uncordon_node_with_route_grant(&id, &expected))
+                .await?;
             state.notify.notify_one();
             StatusCode::OK
         }
@@ -280,7 +323,11 @@ pub(super) async fn admin_node_action(
                 )
                 .into());
             }
-            state.store.set_node_state(&id, NodeState::Draining)?;
+            let id = id.clone();
+            state
+                .store
+                .execute(move |store| store.set_node_state(&id, NodeState::Draining))
+                .await?;
             state.notify.notify_one();
             StatusCode::ACCEPTED
         }
@@ -307,7 +354,11 @@ pub(super) async fn admin_node_action(
         }
         _ => return Err(ApiError::invalid(format!("unknown node action {verb}")).into()),
     };
-    Ok((status, Json(state.store.node_summary(&id)?)).into_response())
+    let summary = state
+        .store
+        .execute(move |store| store.node_summary(&id))
+        .await?;
+    Ok((status, Json(summary)).into_response())
 }
 
 pub(super) async fn admin_delete_node(
@@ -316,13 +367,16 @@ pub(super) async fn admin_delete_node(
     headers: HeaderMap,
 ) -> ApiResult<StatusCode> {
     check_admin_auth(&state, &headers).await?;
-    state.store.delete_node(&id)?;
+    state
+        .store
+        .execute(move |store| store.delete_node(&id))
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn monitoring_snapshot(state: &AppState) -> crate::store::Result<MonitoringOverview> {
+fn monitoring_snapshot(store: &crate::store::Store) -> crate::store::Result<MonitoringOverview> {
     let mut cat_counts = CatStateCounts::default();
-    for cat in state.store.list_all_cats()? {
+    for cat in store.list_all_cats()? {
         cat_counts.total += 1;
         match cat.observed_state {
             ObservedState::Running => cat_counts.running += 1,
@@ -334,7 +388,7 @@ fn monitoring_snapshot(state: &AppState) -> crate::store::Result<MonitoringOverv
         }
     }
 
-    let summaries = state.store.list_node_summaries()?;
+    let summaries = store.list_node_summaries()?;
     let mut node_counts = NodeStateCounts::default();
     let mut orphan_cats = 0_u64;
     let mut capacity = FleetCapacity::default();
@@ -422,7 +476,7 @@ fn monitoring_snapshot(state: &AppState) -> crate::store::Result<MonitoringOverv
         generated_at_unix: crate::store::now_unix(),
         cats: cat_counts,
         nodes: node_counts,
-        operations: state.store.operation_counts()?,
+        operations: store.operation_counts()?,
         capacity,
         usage,
         orphan_cats,
@@ -434,7 +488,11 @@ pub(super) async fn admin_monitoring(
     headers: HeaderMap,
 ) -> ApiResult<Json<MonitoringOverview>> {
     check_admin_auth(&state, &headers).await?;
-    Ok(Json(monitoring_snapshot(&state)?))
+    let snapshot = state
+        .store
+        .execute(|store| monitoring_snapshot(store))
+        .await?;
+    Ok(Json(snapshot))
 }
 
 pub(super) async fn prometheus_metrics(
@@ -442,7 +500,10 @@ pub(super) async fn prometheus_metrics(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     check_admin_auth(&state, &headers).await?;
-    let overview = monitoring_snapshot(&state)?;
+    let overview = state
+        .store
+        .execute(|store| monitoring_snapshot(store))
+        .await?;
     let mut body = String::new();
     macro_rules! metric {
         ($name:expr, $value:expr) => {
@@ -517,7 +578,11 @@ pub(super) async fn prometheus_metrics(
     if let Some(used) = overview.usage.disk_used_bytes {
         metric!("cats_control_plane_host_disk_used_bytes", used);
     }
-    for summary in state.store.list_node_summaries()? {
+    let summaries = state
+        .store
+        .execute(|store| store.list_node_summaries())
+        .await?;
+    for summary in summaries {
         let node_id = summary
             .node
             .id

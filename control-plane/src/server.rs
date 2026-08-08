@@ -141,7 +141,12 @@ where
 {
     tokio::spawn(async move {
         'election: loop {
-            let mut session = match store.singleton_session(role) {
+            let session_store = store.clone();
+            let mut session = match crate::store::execute_leadership(move || {
+                session_store.singleton_session(role)
+            })
+            .await
+            {
                 Ok(session) => session,
                 Err(error) => {
                     tracing::warn!(
@@ -155,9 +160,15 @@ where
             };
 
             loop {
-                match session.try_acquire() {
-                    Ok(true) => break,
-                    Ok(false) => tokio::time::sleep(SINGLETON_ELECTION_RETRY).await,
+                match singleton_try_acquire(session).await {
+                    Ok((returned, true)) => {
+                        session = returned;
+                        break;
+                    }
+                    Ok((returned, false)) => {
+                        session = returned;
+                        tokio::time::sleep(SINGLETON_ELECTION_RETRY).await;
+                    }
                     Err(error) => {
                         tracing::warn!(
                             role = role.name(),
@@ -192,13 +203,14 @@ where
 }
 
 async fn run_elected_singleton<Fut>(
-    mut session: crate::store::SingletonSession,
+    session: crate::store::SingletonSession,
     role: SingletonRole,
     task: Fut,
     mut cancelled: tokio::sync::oneshot::Receiver<()>,
 ) where
     Fut: Future<Output = ()> + Send + 'static,
 {
+    let mut session = Some(session);
     let mut task = tokio::spawn(task);
     loop {
         tokio::select! {
@@ -222,22 +234,52 @@ async fn run_elected_singleton<Fut>(
                 break;
             }
             _ = tokio::time::sleep(SINGLETON_HEALTH_INTERVAL) => {
-                if let Err(error) = session.check() {
-                    tracing::warn!(
-                        role = role.name(),
-                        %error,
-                        "singleton leadership connection was lost"
-                    );
-                    task.abort();
-                    let _ = (&mut task).await;
-                    break;
+                let current = session.take().expect("singleton session is present between checks");
+                match singleton_check(current).await {
+                    Ok(returned) => session = Some(returned),
+                    Err(error) => {
+                        tracing::warn!(
+                            role = role.name(),
+                            %error,
+                            "singleton leadership connection was lost"
+                        );
+                        task.abort();
+                        let _ = (&mut task).await;
+                        break;
+                    }
                 }
             }
         }
     }
     // `task.await` above proves its future has been dropped before this owner
     // releases the PostgreSQL session and makes leadership acquirable again.
-    drop(session);
+    if let Some(session) = session {
+        let _ = crate::store::execute_leadership(move || {
+            drop(session);
+            Ok(())
+        })
+        .await;
+    }
+}
+
+async fn singleton_try_acquire(
+    mut session: crate::store::SingletonSession,
+) -> crate::store::Result<(crate::store::SingletonSession, bool)> {
+    crate::store::execute_leadership(move || {
+        let acquired = session.try_acquire()?;
+        Ok((session, acquired))
+    })
+    .await
+}
+
+async fn singleton_check(
+    mut session: crate::store::SingletonSession,
+) -> crate::store::Result<crate::store::SingletonSession> {
+    crate::store::execute_leadership(move || {
+        session.check()?;
+        Ok(session)
+    })
+    .await
 }
 
 async fn run_reconciler_role(controller: Arc<Controller>, store: Arc<Store>, interval: Duration) {
@@ -246,7 +288,10 @@ async fn run_reconciler_role(controller: Arc<Controller>, store: Arc<Store>, int
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            match store.fail_interrupted_oci_deployments() {
+            match store
+                .execute(|store| store.fail_interrupted_oci_deployments())
+                .await
+            {
                 Ok(0) => {}
                 Ok(count) => tracing::warn!(
                     count,
@@ -286,29 +331,39 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         "automatic Cold threshold must be positive"
     );
     let cfg = Arc::new(cfg);
-    let store = Arc::new(Store::connect_from(
-        &cfg.control_store_dsn,
-        cfg.control_store_ca_file
-            .as_deref()
-            .and_then(|p| p.to_str()),
-    )?);
+    let ca_file = cfg
+        .control_store_ca_file
+        .as_deref()
+        .and_then(|path| path.to_str())
+        .map(str::to_string);
+    let store = Arc::new(Store::connect_from_async(cfg.control_store_dsn.clone(), ca_file).await?);
     if let Some(workos) = &cfg.workos {
-        store.ensure_configured_accounts(workos.account_organizations())?;
+        let organizations = workos.account_organizations().clone();
+        store
+            .execute(move |store| store.ensure_configured_accounts(&organizations))
+            .await?;
     } else {
         // The credential-free development shape has one explicit bootstrap
         // account. Production WorkOS deployments provision Accounts through
         // AuthKit onboarding or the configured mapping instead.
-        store.ensure_configured_accounts(&std::collections::BTreeMap::from([(
-            "default".to_string(),
-            "local-development".to_string(),
-        )]))?;
+        store
+            .execute(|store| {
+                store.ensure_configured_accounts(&std::collections::BTreeMap::from([(
+                    "default".to_string(),
+                    "local-development".to_string(),
+                )]))
+            })
+            .await?;
     }
     // An OCI deploy is driven by an in-memory task holding one-pull registry
     // credentials that are never persisted, so a deploy in flight when this
     // process died cannot be resumed. Report it as failed instead of leaving
     // its operation unresolved and its (cat, app, digest) identity blocked --
     // a caller polling that operation would otherwise wait forever.
-    match store.fail_interrupted_oci_deployments() {
+    match store
+        .execute(|store| store.fail_interrupted_oci_deployments())
+        .await
+    {
         Ok(0) => {}
         Ok(count) => {
             tracing::warn!("failed {count} OCI deployment(s) interrupted by a restart")

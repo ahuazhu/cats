@@ -8,7 +8,10 @@ pub(super) async fn get_operation(
     // Authenticate before looking up an opaque ID so unauthenticated callers
     // cannot use status differences to enumerate operations.
     check_authenticated(&state, &headers).await?;
-    let operation = state.store.get_operation(&id)?;
+    let operation = state
+        .store
+        .execute(move |store| store.get_operation(&id))
+        .await?;
     let scope = check_workspace_auth(&state, &headers, &operation.workspace_id).await?;
     if scope.workspace.id != operation.workspace_id {
         return Err(ApiError::internal("operation workspace ownership is inconsistent").into());
@@ -22,7 +25,9 @@ pub(super) async fn list_operations(
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<Operation>>> {
     check_workspace_auth(&state, &headers, &workspace).await?;
-    Ok(Json(ListResponse {
-        items: state.store.list_operations(&workspace)?,
-    }))
+    let items = state
+        .store
+        .execute(move |store| store.list_operations(&workspace))
+        .await?;
+    Ok(Json(ListResponse { items }))
 }

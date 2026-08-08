@@ -473,7 +473,7 @@ impl WorkOsConfig {
 
     pub async fn me(
         &self,
-        store: &crate::store::Store,
+        store: &Arc<crate::store::Store>,
         identity: &AccessIdentity,
     ) -> Result<MeResponse, ApiError> {
         let user = self
@@ -506,7 +506,7 @@ impl WorkOsConfig {
 
     pub async fn workspaces_for(
         &self,
-        store: &crate::store::Store,
+        store: &Arc<crate::store::Store>,
         identity: &AccessIdentity,
     ) -> Result<Vec<Workspace>, ApiError> {
         self.accounts_and_workspaces_for(store, identity)
@@ -516,7 +516,7 @@ impl WorkOsConfig {
 
     pub async fn accounts_and_workspaces_for(
         &self,
-        store: &crate::store::Store,
+        store: &Arc<crate::store::Store>,
         identity: &AccessIdentity,
     ) -> Result<(Vec<Account>, Vec<Workspace>), ApiError> {
         let mut accounts = Vec::new();
@@ -539,43 +539,57 @@ impl WorkOsConfig {
                         "WorkOS workspace memberships are temporarily unavailable",
                     )
                 })?;
-            for membership in page.data {
-                if membership.status != UserOrganizationMembershipStatus::Active {
-                    continue;
-                }
-                if membership.user_id != identity.user_id {
-                    tracing::warn!(
-                        expected_user_id = identity.user_id,
-                        actual_user_id = membership.user_id,
-                        "WorkOS membership list returned another user"
-                    );
-                    continue;
-                }
-                let permissions = if identity.organization_id.as_deref()
-                    == Some(membership.organization_id.as_str())
-                {
-                    identity.permissions.as_slice()
-                } else {
-                    &[]
-                };
-                let Some((account, mut account_workspaces)) = store.account_and_workspace_views(
-                    &membership.organization_id,
-                    Some(&membership.role.slug),
-                    permissions,
-                )?
-                else {
-                    continue;
-                };
-                store.upsert_membership_shadow(
-                    &membership.id,
-                    &account.id,
-                    &membership.user_id,
-                    &membership.role.slug,
-                    "active",
-                )?;
-                accounts.push(account);
-                workspaces.append(&mut account_workspaces);
-            }
+            let memberships = page.data;
+            let expected_user_id = identity.user_id.clone();
+            let scoped_organization_id = identity.organization_id.clone();
+            let scoped_permissions = identity.permissions.clone();
+            let (mut page_accounts, mut page_workspaces) = store
+                .execute(move |store| {
+                    let mut accounts = Vec::new();
+                    let mut workspaces = Vec::new();
+                    for membership in memberships {
+                        if membership.status != UserOrganizationMembershipStatus::Active {
+                            continue;
+                        }
+                        if membership.user_id != expected_user_id {
+                            tracing::warn!(
+                                expected_user_id,
+                                actual_user_id = membership.user_id,
+                                "WorkOS membership list returned another user"
+                            );
+                            continue;
+                        }
+                        let permissions = if scoped_organization_id.as_deref()
+                            == Some(membership.organization_id.as_str())
+                        {
+                            scoped_permissions.as_slice()
+                        } else {
+                            &[]
+                        };
+                        let Some((account, mut account_workspaces)) = store
+                            .account_and_workspace_views(
+                                &membership.organization_id,
+                                Some(&membership.role.slug),
+                                permissions,
+                            )?
+                        else {
+                            continue;
+                        };
+                        store.upsert_membership_shadow(
+                            &membership.id,
+                            &account.id,
+                            &membership.user_id,
+                            &membership.role.slug,
+                            "active",
+                        )?;
+                        accounts.push(account);
+                        workspaces.append(&mut account_workspaces);
+                    }
+                    Ok((accounts, workspaces))
+                })
+                .await?;
+            accounts.append(&mut page_accounts);
+            workspaces.append(&mut page_workspaces);
             after = page.list_metadata.after;
             if after.is_none() {
                 break;
@@ -590,7 +604,7 @@ impl WorkOsConfig {
 
     pub(super) async fn single_mapped_workspace_for_user(
         &self,
-        store: &crate::store::Store,
+        store: &Arc<crate::store::Store>,
         user_id: &str,
     ) -> Result<Option<(String, String)>, ApiError> {
         let mut candidates = BTreeMap::new();
@@ -612,29 +626,38 @@ impl WorkOsConfig {
                         "WorkOS workspace memberships are temporarily unavailable",
                     )
                 })?;
-            for membership in page.data {
-                if membership.status != UserOrganizationMembershipStatus::Active {
-                    continue;
-                }
-                if membership.user_id != user_id {
-                    continue;
-                }
-                let Some(account) = store.account_for_organization(&membership.organization_id)?
-                else {
-                    continue;
-                };
-                if account.status != "active" {
-                    continue;
-                }
-                let Some(workspace) = store
-                    .workspaces_for_account(&account.id)?
-                    .into_iter()
-                    .find(|workspace| workspace.is_default)
-                else {
-                    continue;
-                };
-                candidates.insert(workspace.id, membership.organization_id);
-            }
+            let memberships = page.data;
+            let expected_user_id = user_id.to_string();
+            let page_candidates = store
+                .execute(move |store| {
+                    let mut candidates = Vec::new();
+                    for membership in memberships {
+                        if membership.status != UserOrganizationMembershipStatus::Active
+                            || membership.user_id != expected_user_id
+                        {
+                            continue;
+                        }
+                        let Some(account) =
+                            store.account_for_organization(&membership.organization_id)?
+                        else {
+                            continue;
+                        };
+                        if account.status != "active" {
+                            continue;
+                        }
+                        let Some(workspace) = store
+                            .workspaces_for_account(&account.id)?
+                            .into_iter()
+                            .find(|workspace| workspace.is_default)
+                        else {
+                            continue;
+                        };
+                        candidates.push((workspace.id, membership.organization_id));
+                    }
+                    Ok(candidates)
+                })
+                .await?;
+            candidates.extend(page_candidates);
             after = page.list_metadata.after;
             if after.is_none() {
                 break;

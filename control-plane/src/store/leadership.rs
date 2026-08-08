@@ -36,6 +36,7 @@ impl SingletonRole {
 /// connection on every election poll.
 pub(crate) struct SingletonSession {
     client: Option<Client>,
+    _connection_budget: ConnectionBudgetPermit,
     role: SingletonRole,
     acquired: bool,
 }
@@ -90,6 +91,7 @@ impl Drop for SingletonSession {
 /// process-local registry or a persisted wall-clock lease.
 pub struct OciDeploymentLease {
     client: Option<Client>,
+    _connection_budget: ConnectionBudgetPermit,
 }
 
 impl Drop for OciDeploymentLease {
@@ -102,6 +104,7 @@ impl Drop for OciDeploymentLease {
 
 impl Store {
     pub(crate) fn singleton_session(&self, role: SingletonRole) -> Result<SingletonSession> {
+        let connection_budget = acquire_singleton_connection_budget()?;
         let mut client =
             off_runtime(|| schema::connect_client(&self.dsn, self.ca_file.as_deref()))?;
         off_runtime(|| {
@@ -111,6 +114,7 @@ impl Store {
         })?;
         Ok(SingletonSession {
             client: Some(client),
+            _connection_budget: connection_budget,
             role,
             acquired: false,
         })
@@ -120,8 +124,10 @@ impl Store {
         &self,
         operation_id: &str,
     ) -> Result<Option<OciDeploymentLease>> {
+        let connection_budget = acquire_oci_connection_budget()?;
         let mut client =
             off_runtime(|| schema::connect_client(&self.dsn, self.ca_file.as_deref()))?;
+        off_runtime(|| configure_session(&mut client))?;
         let acquired = off_runtime(|| {
             client
                 .query_one(
@@ -137,6 +143,7 @@ impl Store {
         if acquired {
             Ok(Some(OciDeploymentLease {
                 client: Some(client),
+                _connection_budget: connection_budget,
             }))
         } else {
             off_runtime(move || drop(client));

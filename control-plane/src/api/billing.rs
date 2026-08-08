@@ -19,7 +19,11 @@ fn unix_millis() -> Result<i64, Failure> {
 
 async fn billing_projection(state: &AppState, workspace: &str) -> ApiResult<BillingProjection> {
     let now_ms = unix_millis()?;
-    let ledger = state.store.billing_ledger_for_workspace(workspace)?;
+    let workspace_id = workspace.to_string();
+    let ledger = state
+        .store
+        .execute(move |store| store.billing_ledger_for_workspace(&workspace_id))
+        .await?;
     let rate_card = RateCard::sprites_compute_v1();
     let credit = state
         .credits
@@ -92,14 +96,18 @@ pub(super) async fn require_funded(state: &AppState, workspace: &str) -> ApiResu
 pub(crate) async fn enforce_exhausted_billing_accounts(state: &AppState) -> ApiResult<()> {
     let active_cats = state
         .store
-        .list_all_cats()?
-        .into_iter()
-        .filter(|cat| cat.desired_state == DesiredState::Running)
-        .map(|cat| {
-            let account_id = state.store.workspace_by_id(&cat.workspace_id)?.account_id;
-            Ok((cat, account_id))
+        .execute(|store| {
+            store
+                .list_all_cats()?
+                .into_iter()
+                .filter(|cat| cat.desired_state == DesiredState::Running)
+                .map(|cat| {
+                    let account_id = store.workspace_by_id(&cat.workspace_id)?.account_id;
+                    Ok((cat, account_id))
+                })
+                .collect::<Result<Vec<_>, ApiError>>()
         })
-        .collect::<Result<Vec<_>, ApiError>>()?;
+        .await?;
     let accounts = active_cats
         .iter()
         .map(|(cat, account_id)| (account_id.clone(), cat.workspace_id.clone()))
@@ -114,14 +122,19 @@ pub(crate) async fn enforce_exhausted_billing_accounts(state: &AppState) -> ApiR
             .iter()
             .filter(|(_, cat_account_id)| cat_account_id == &account_id)
         {
+            let billing_account = billing_account_id_for_workspace(state, &workspace).await?;
+            let cat_id = cat.id.clone();
             match state
                 .store
-                .set_desired(&cat.id, DesiredState::Cold, None, "cat.credit_exhausted")
+                .execute(move |store| {
+                    store.set_desired(&cat_id, DesiredState::Cold, None, "cat.credit_exhausted")
+                })
+                .await
             {
                 Ok(_) => {
                     changed = true;
                     tracing::warn!(
-                        billing_account = %billing_account_id_for_workspace(state, &workspace)?,
+                        billing_account = %billing_account,
                         cat_id = %cat.id,
                         "prepaid balance exhausted; converging Cat to Cold"
                     );
@@ -157,7 +170,7 @@ pub(super) async fn workspace_billing_balance(
         .map(|stripe| stripe.topup_options_cents())
         .unwrap_or_default();
     let balance = BillingBalance {
-        billing_account_id: billing_account_id_for_workspace(&state, &workspace)?,
+        billing_account_id: billing_account_id_for_workspace(&state, &workspace).await?,
         workspace_id: workspace.clone(),
         currency: "USD".to_string(),
         status: if projection.available_nanos > 0 {
@@ -199,7 +212,11 @@ pub(super) async fn create_billing_checkout(
     let idempotency_key = idem_key(&headers)
         .filter(|value| !value.trim().is_empty() && value.len() <= 200)
         .ok_or_else(|| ApiError::invalid("Idempotency-Key is required for Checkout"))?;
-    let scope = state.store.workspace_scope(&workspace)?;
+    let query_workspace = workspace.clone();
+    let scope = state
+        .store
+        .execute(move |store| store.workspace_scope(&query_workspace))
+        .await?;
     let billing_account_id = scope.account.billing_account_id.clone();
     let projection = billing_projection(&state, &workspace).await?;
     let mut hasher = Sha256::new();

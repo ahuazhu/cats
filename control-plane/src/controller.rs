@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cats_api::error::ErrorBody;
+use cats_api::error::{ApiError, ErrorBody};
 use cats_api::nodejob::{
     self, JobPhase, NodeJob, NodeJobAction, NodeJobResult, StopCatDisposition, VolumeGrant,
 };
@@ -115,24 +115,39 @@ impl Controller {
     }
 
     pub async fn tick(&self) -> anyhow::Result<()> {
-        self.detect_lost_nodes()?;
+        self.detect_lost_nodes().await?;
         self.converge_confirmed_fences().await?;
         self.drain_nodes().await?;
-        for cat_id in self.store.auto_suspend_candidates()? {
-            self.maybe_auto_suspend(&cat_id)?;
+        let auto_suspend_candidates = self
+            .store
+            .execute(|store| store.auto_suspend_candidates())
+            .await?;
+        for cat_id in auto_suspend_candidates {
+            self.maybe_auto_suspend(&cat_id).await?;
         }
-        for cat_id in self.store.auto_tier_candidates(
-            self.auto_tier_policy.warm_after_ms,
-            self.auto_tier_policy.cold_after_ms,
-        )? {
-            self.maybe_auto_tier(&cat_id)?;
+        let warm_after_ms = self.auto_tier_policy.warm_after_ms;
+        let cold_after_ms = self.auto_tier_policy.cold_after_ms;
+        let auto_tier_candidates = self
+            .store
+            .execute(move |store| store.auto_tier_candidates(warm_after_ms, cold_after_ms))
+            .await?;
+        for cat_id in auto_tier_candidates {
+            self.maybe_auto_tier(&cat_id).await?;
         }
         // Absolute expiry: converge each expired Cat to Deleted exactly as an
         // API delete would. One failure must not starve the other candidates.
-        for cat_id in self.store.expired_cat_candidates()? {
-            if let Err(e) =
-                self.store
-                    .set_desired(&cat_id, DesiredState::Deleted, None, "cat.expire")
+        let expired_cat_candidates = self
+            .store
+            .execute(|store| store.expired_cat_candidates())
+            .await?;
+        for cat_id in expired_cat_candidates {
+            let expire_cat_id = cat_id.clone();
+            if let Err(e) = self
+                .store
+                .execute(move |store| {
+                    store.set_desired(&expire_cat_id, DesiredState::Deleted, None, "cat.expire")
+                })
+                .await
             {
                 tracing::warn!(cat_id, "expiry delete failed: {e}");
             }
@@ -147,7 +162,10 @@ impl Controller {
         // Cat, the node agent already serializes per Cat, and placement is an
         // atomic claim (`Store::claim_node_for`), so concurrent flows cannot
         // overcommit a node between deciding and recording.
-        let cats = self.store.cats_needing_work()?;
+        let cats = self
+            .store
+            .execute(|store| store.cats_needing_work())
+            .await?;
         futures_util::stream::iter(cats)
             .for_each_concurrent(MAX_CONCURRENT_RECONCILES, |cat| async move {
                 if let Err(e) = self.reconcile_cat(&cat).await {
@@ -160,10 +178,13 @@ impl Controller {
 
     /// Event/tick entry for the work-driven policy. The Store transaction is
     /// the linearization point for `work_count == 0 -> desired Suspended`.
-    pub fn maybe_auto_suspend(&self, cat_id: &str) -> crate::store::Result<bool> {
+    pub async fn maybe_auto_suspend(&self, cat_id: &str) -> crate::store::Result<bool> {
+        let cat_id = cat_id.to_string();
+        let node_lease_timeout_ms = self.node_lease_timeout_ms;
         let operation = self
             .store
-            .try_auto_suspend(cat_id, self.node_lease_timeout_ms)?;
+            .execute(move |store| store.try_auto_suspend(&cat_id, node_lease_timeout_ms))
+            .await?;
         if operation.is_some() {
             self.notify.notify_one();
             Ok(true)
@@ -175,12 +196,15 @@ impl Controller {
     /// Event/tick entry for time-based Suspended -> Warm -> Cold demotion.
     /// The Store transaction rechecks the persisted state age and live work
     /// leases before changing desired state.
-    pub fn maybe_auto_tier(&self, cat_id: &str) -> crate::store::Result<bool> {
-        let operation = self.store.try_auto_tier(
-            cat_id,
-            self.auto_tier_policy.warm_after_ms,
-            self.auto_tier_policy.cold_after_ms,
-        )?;
+    pub async fn maybe_auto_tier(&self, cat_id: &str) -> crate::store::Result<bool> {
+        let cat_id = cat_id.to_string();
+        let query_cat_id = cat_id.clone();
+        let warm_after_ms = self.auto_tier_policy.warm_after_ms;
+        let cold_after_ms = self.auto_tier_policy.cold_after_ms;
+        let operation = self
+            .store
+            .execute(move |store| store.try_auto_tier(&query_cat_id, warm_after_ms, cold_after_ms))
+            .await?;
         if let Some(operation) = operation {
             tracing::info!(
                 cat = cat_id,
@@ -199,31 +223,34 @@ impl Controller {
     // Node loss detection / explicit fencing
     // ------------------------------------------------------------------
 
-    fn detect_lost_nodes(&self) -> anyhow::Result<()> {
+    async fn detect_lost_nodes(&self) -> anyhow::Result<()> {
         let now = now_ms();
         if now < self.node_fencing_starts_at_ms {
             return Ok(());
         }
-        for node in self.store.list_nodes()? {
-            let fresh = now - node.last_heartbeat_unix * 1000 <= self.node_lease_timeout_ms;
-            if node.state == NodeState::Lost || fresh {
-                continue;
-            }
-            if node.state == NodeState::Fenced {
-                continue;
-            }
-            tracing::warn!(
-                node = %node.id,
-                "node heartbeat expired; preserving claims until explicit fencing"
-            );
-            self.store.set_node_state(&node.id, NodeState::Lost)?;
-            for cat in self.store.cats_on_node(&node.id)? {
-                // Lost means unreachable, not dead. Keep placement, routes,
-                // and storage epochs so a transient partition cannot turn a
-                // healthy Guest's root disk read-only.
-                self.store.set_observed(&cat.id, ObservedState::Unknown)?;
-            }
-        }
+        let node_lease_timeout_ms = self.node_lease_timeout_ms;
+        self.store
+            .execute(move |store| {
+                for node in store.list_nodes()? {
+                    let fresh = now - node.last_heartbeat_unix * 1000 <= node_lease_timeout_ms;
+                    if matches!(node.state, NodeState::Lost | NodeState::Fenced) || fresh {
+                        continue;
+                    }
+                    tracing::warn!(
+                        node = %node.id,
+                        "node heartbeat expired; preserving claims until explicit fencing"
+                    );
+                    store.set_node_state(&node.id, NodeState::Lost)?;
+                    for cat in store.cats_on_node(&node.id)? {
+                        // Lost means unreachable, not dead. Keep placement, routes,
+                        // and storage epochs so a transient partition cannot turn a
+                        // healthy Guest's root disk read-only.
+                        store.set_observed(&cat.id, ObservedState::Unknown)?;
+                    }
+                }
+                Ok(())
+            })
+            .await?;
         Ok(())
     }
 
@@ -231,21 +258,27 @@ impl Controller {
     /// the old Host is stopped or isolated. The API owns that explicit safety
     /// confirmation; this method performs the idempotent state transition.
     pub(crate) async fn confirm_node_fenced(&self, node_id: &str) -> anyhow::Result<()> {
-        let node = self.store.get_node(node_id)?;
-        anyhow::ensure!(
-            matches!(node.state, NodeState::Lost | NodeState::Fenced),
-            "node {node_id} is neither Lost nor an idempotent Fenced retry"
-        );
-
-        // Persist the terminal, unschedulable identity before revoking any
-        // Cat. If a later volume operation fails, retrying the same action can
-        // finish the remaining Cats without reviving this Host identity.
-        self.store.set_node_state(node_id, NodeState::Fenced)?;
+        let node_id = node_id.to_string();
+        let converge_node_id = node_id.clone();
+        self.store
+            .execute(move |store| {
+                let node = store.get_node(&node_id)?;
+                if !matches!(node.state, NodeState::Lost | NodeState::Fenced) {
+                    return Err(ApiError::failed_precondition(format!(
+                        "node {node_id} is neither Lost nor an idempotent Fenced retry"
+                    )));
+                }
+                // Persist the terminal, unschedulable identity before revoking any
+                // Cat. If a later volume operation fails, retrying the same action can
+                // finish the remaining Cats without reviving this Host identity.
+                store.set_node_state(&node_id, NodeState::Fenced)
+            })
+            .await?;
         tracing::warn!(
-            node = node_id,
+            node = converge_node_id,
             "external Host fencing confirmed; revoking Cat claims"
         );
-        self.converge_fenced_node(node_id).await?;
+        self.converge_fenced_node(&converge_node_id).await?;
         self.notify.notify_one();
         Ok(())
     }
@@ -253,9 +286,8 @@ impl Controller {
     /// Resume any handoff whose external fencing confirmation was persisted
     /// before a controller crash or metadata outage interrupted convergence.
     async fn converge_confirmed_fences(&self) -> anyhow::Result<()> {
-        for node in self
-            .store
-            .list_nodes()?
+        let nodes = self.store.execute(|store| store.list_nodes()).await?;
+        for node in nodes
             .into_iter()
             .filter(|node| node.state == NodeState::Fenced)
         {
@@ -265,18 +297,36 @@ impl Controller {
     }
 
     async fn converge_fenced_node(&self, node_id: &str) -> anyhow::Result<()> {
-        for cat in self.store.cats_on_node(node_id)? {
-            self.store.set_observed(&cat.id, ObservedState::Unknown)?;
+        let node_id = node_id.to_string();
+        let cats = self
+            .store
+            .execute(move |store| store.cats_on_node(&node_id))
+            .await?;
+        for cat in cats {
+            let cat_id = cat.id.clone();
+            self.store
+                .execute(move |store| store.set_observed(&cat_id, ObservedState::Unknown))
+                .await?;
             self.fence_cat_volumes(&cat).await?;
-            self.store.unbind_routes(&cat.id)?;
-            self.store.set_placement(&cat.id, None)?;
-            self.store.set_observed(&cat.id, ObservedState::Cold)?;
+            let cat_id = cat.id;
+            self.store
+                .execute(move |store| {
+                    store.unbind_routes(&cat_id)?;
+                    store.set_placement(&cat_id, None)?;
+                    store.set_observed(&cat_id, ObservedState::Cold)
+                })
+                .await?;
         }
         Ok(())
     }
 
     async fn fence_cat_volumes(&self, cat: &Cat) -> anyhow::Result<()> {
-        for disk in self.store.list_disks_for_cat(&cat.id)? {
+        let cat_id = cat.id.clone();
+        let disks = self
+            .store
+            .execute(move |store| store.list_disks_for_cat(&cat_id))
+            .await?;
+        for disk in disks {
             match self.storage_meta.revoke_lease(&disk.volume_id) {
                 Ok(()) | Err(MetaError::NotFound(_)) => {}
                 Err(e) => return Err(e.into()),
@@ -298,13 +348,17 @@ impl Controller {
     /// report carries no orphans, so "cordoned, cats=0" again means what the
     /// deploy runbook needs it to mean.
     async fn drain_nodes(&self) -> anyhow::Result<()> {
-        for node in self
-            .store
-            .list_nodes()?
+        let nodes = self.store.execute(|store| store.list_nodes()).await?;
+        for node in nodes
             .into_iter()
             .filter(|node| node.state == NodeState::Draining)
         {
-            for cat in self.store.cats_on_node(&node.id)? {
+            let node_id = node.id.clone();
+            let cats = self
+                .store
+                .execute(move |store| store.cats_on_node(&node_id))
+                .await?;
+            for cat in cats {
                 let job = NodeJob {
                     job_id: nodejob::job_id(&cat.id, cat.generation, "drain_stop_cat"),
                     cat_generation: cat.generation,
@@ -315,10 +369,18 @@ impl Controller {
                 };
                 match self.dispatch(&node.agent_url, &job).await {
                     Ok(result) if result.phase == JobPhase::Succeeded => {
-                        self.store.unbind_routes(&cat.id)?;
+                        let cat_id = cat.id.clone();
+                        self.store
+                            .execute(move |store| store.unbind_routes(&cat_id))
+                            .await?;
                         self.fence_cat_volumes(&cat).await?;
-                        self.store.set_placement(&cat.id, None)?;
-                        self.store.set_observed(&cat.id, ObservedState::Cold)?;
+                        let cat_id = cat.id;
+                        self.store
+                            .execute(move |store| {
+                                store.set_placement(&cat_id, None)?;
+                                store.set_observed(&cat_id, ObservedState::Cold)
+                            })
+                            .await?;
                     }
                     Ok(result) => tracing::warn!(
                         node = %node.id,
@@ -334,7 +396,12 @@ impl Controller {
                     ),
                 }
             }
-            for orphan in self.store.orphan_reported_cats(&node.id)? {
+            let node_id = node.id.clone();
+            let orphans = self
+                .store
+                .execute(move |store| store.orphan_reported_cats(&node_id))
+                .await?;
+            for orphan in orphans {
                 let key = format!("{}@{}", orphan.cat_id, orphan.generation);
                 if self.retry_deferred_key(&key) {
                     continue;
@@ -390,11 +457,17 @@ impl Controller {
                     }
                 }
             }
-            if self.store.cats_on_node(&node.id)?.is_empty()
-                && self.store.orphan_reported_cats(&node.id)?.is_empty()
-            {
-                self.store.set_node_state(&node.id, NodeState::Cordoned)?;
-            }
+            let node_id = node.id;
+            self.store
+                .execute(move |store| {
+                    if store.cats_on_node(&node_id)?.is_empty()
+                        && store.orphan_reported_cats(&node_id)?.is_empty()
+                    {
+                        store.set_node_state(&node_id, NodeState::Cordoned)?;
+                    }
+                    Ok(())
+                })
+                .await?;
         }
         Ok(())
     }
@@ -461,7 +534,11 @@ impl Controller {
             return Ok(());
         }
         if let Some(node_id) = &cat.node_id {
-            let node = self.store.get_node(node_id)?;
+            let node_id = node_id.clone();
+            let node = self
+                .store
+                .execute(move |store| store.get_node(&node_id))
+                .await?;
             if matches!(node.state, NodeState::Lost | NodeState::Fenced) {
                 // The owner remains authoritative while merely Lost. A
                 // confirmed fence clears placement itself; until then no
@@ -481,9 +558,11 @@ impl Controller {
                 // Failed is a stable terminal result for this generation.
                 // A user action creates a new-generation pending Operation,
                 // which explicitly authorizes a retry.
+                let cat_id = cat.id.clone();
                 let retry_requested = self
                     .store
-                    .pending_operations_for(&cat.id)?
+                    .execute(move |store| store.pending_operations_for(&cat_id))
+                    .await?
                     .into_iter()
                     .any(|operation| operation.resource_generation == cat.generation);
                 if retry_requested {
@@ -532,10 +611,23 @@ impl Controller {
     }
 
     async fn volume_grants(&self, cat: &Cat) -> anyhow::Result<Vec<VolumeGrant>> {
-        let mut grants = Vec::new();
-        let bindings = self.store.bindings_for_cat(&cat.id)?;
-        for b in &bindings {
-            let disk = self.store.get_disk(&cat.workspace_id, &b.disk_id)?;
+        let cat_id = cat.id.clone();
+        let workspace_id = cat.workspace_id.clone();
+        let bindings = self
+            .store
+            .execute(move |store| {
+                store
+                    .bindings_for_cat(&cat_id)?
+                    .into_iter()
+                    .map(|binding| {
+                        let disk = store.get_disk(&workspace_id, &binding.disk_id)?;
+                        Ok((binding, disk))
+                    })
+                    .collect::<crate::store::Result<Vec<_>>>()
+            })
+            .await?;
+        let mut grants = Vec::with_capacity(bindings.len());
+        for (binding, disk) in bindings {
             let size = cats_api::chunk::round_up_to_chunk(disk.size_bytes);
             match self.storage_meta.create_volume(&disk.volume_id, size) {
                 Ok(()) | Err(MetaError::AlreadyExists(_)) => {}
@@ -547,7 +639,7 @@ impl Controller {
                 attachment_id: format!("att_{}_{}_{}", cat.id, disk.id, cat.generation),
                 epoch: 0,
                 size_bytes: size,
-                mount_path: b.mount_path.clone(),
+                mount_path: binding.mount_path,
                 durability: disk.durability,
             });
         }
@@ -564,17 +656,23 @@ impl Controller {
         let replaying_dispatch =
             cat.observed_state == ObservedState::Starting && cat.node_id.is_some();
         let node = if let Some(node_id) = &cat.node_id {
-            self.store.get_node(node_id)?
+            let node_id = node_id.clone();
+            self.store
+                .execute(move |store| store.get_node(&node_id))
+                .await?
         } else {
             // Choosing a node and claiming its capacity is one step, so several
             // start flows can run at once without overcommitting one node.
-            let Some(node) = self.store.claim_node_for(
-                &cat.id,
-                cat.spec.cpus,
-                cat.spec.memory_mib,
-                self.node_lease_timeout_ms,
-                now_ms(),
-            )?
+            let cat_id = cat.id.clone();
+            let cpus = cat.spec.cpus;
+            let memory_mib = cat.spec.memory_mib;
+            let node_lease_timeout_ms = self.node_lease_timeout_ms;
+            let Some(node) = self
+                .store
+                .execute(move |store| {
+                    store.claim_node_for(&cat_id, cpus, memory_mib, node_lease_timeout_ms, now_ms())
+                })
+                .await?
             else {
                 tracing::info!(cat = %cat.id, "no schedulable node; will retry");
                 return Ok(());
@@ -588,7 +686,10 @@ impl Controller {
             // boundary. A crash before `Starting` can safely repeat this step;
             // a crash after it must preserve the epoch a live blockd may hold.
             self.fence_cat_volumes(cat).await?;
-            self.store.set_observed(&cat.id, ObservedState::Starting)?;
+            let cat_id = cat.id.clone();
+            self.store
+                .execute(move |store| store.set_observed(&cat_id, ObservedState::Starting))
+                .await?;
         }
 
         let job = NodeJob {
@@ -604,9 +705,15 @@ impl Controller {
         };
         match self.dispatch(&node.agent_url, &job).await {
             Ok(res) if res.phase == JobPhase::Succeeded => {
-                self.store.set_observed(&cat.id, ObservedState::Running)?;
+                let cat_id = cat.id.clone();
+                let node_id = node.id;
+                let gateway_url = node.gateway_url;
                 self.store
-                    .publish_routes(&cat.id, &node.id, &node.gateway_url)?;
+                    .execute(move |store| {
+                        store.set_observed(&cat_id, ObservedState::Running)?;
+                        store.publish_routes(&cat_id, &node_id, &gateway_url)
+                    })
+                    .await?;
                 self.attempts.lock().unwrap().remove(&attempt_key(cat));
                 self.clear_retry_backoff(cat);
                 self.complete_ops_if_converged(&cat.id).await?;
@@ -631,25 +738,34 @@ impl Controller {
 
     async fn start_failed(&self, cat: &Cat, error: String) -> anyhow::Result<()> {
         tracing::warn!(cat = %cat.id, "start failed: {error}");
-        let mut attempts = self.attempts.lock().unwrap();
-        let n = attempts.entry(attempt_key(cat)).or_insert(0);
-        *n += 1;
-        let give_up = *n >= 3;
-        drop(attempts);
-        self.store.set_placement(&cat.id, None)?;
-        if give_up {
-            self.store.set_observed(&cat.id, ObservedState::Failed)?;
-            for op in self.store.pending_operations_for(&cat.id)? {
-                self.store.finish_operation(
-                    &op.id,
-                    Some(&ErrorBody::new(
-                        cats_api::error::ErrorCode::Unavailable,
-                        format!("start failed after retries: {error}"),
-                    )),
-                )?;
-            }
-        } else {
-            self.store.set_observed(&cat.id, ObservedState::Cold)?;
+        let give_up = {
+            let mut attempts = self.attempts.lock().unwrap();
+            let n = attempts.entry(attempt_key(cat)).or_insert(0);
+            *n += 1;
+            *n >= 3
+        };
+        let cat_id = cat.id.clone();
+        self.store
+            .execute(move |store| {
+                store.set_placement(&cat_id, None)?;
+                if give_up {
+                    store.set_observed(&cat_id, ObservedState::Failed)?;
+                    for operation in store.pending_operations_for(&cat_id)? {
+                        store.finish_operation(
+                            &operation.id,
+                            Some(&ErrorBody::new(
+                                cats_api::error::ErrorCode::Unavailable,
+                                format!("start failed after retries: {error}"),
+                            )),
+                        )?;
+                    }
+                } else {
+                    store.set_observed(&cat_id, ObservedState::Cold)?;
+                }
+                Ok(())
+            })
+            .await?;
+        if !give_up {
             self.notify.notify_one();
         }
         Ok(())
@@ -661,22 +777,37 @@ impl Controller {
         let transition_started = std::time::Instant::now();
         let Some(node_id) = &cat.node_id else {
             // Placement lost (e.g. host fenced) - converge through Cold.
-            self.store.set_observed(&cat.id, ObservedState::Cold)?;
+            let cat_id = cat.id.clone();
+            self.store
+                .execute(move |store| store.set_observed(&cat_id, ObservedState::Cold))
+                .await?;
             return Ok(());
         };
+        let query_node_id = node_id.clone();
+        let query_cat_id = cat.id.clone();
+        let needs_work_fence = action == "suspend";
         let node = self
             .store
-            .list_nodes()?
-            .into_iter()
-            .find(|n| &n.id == node_id)
-            .ok_or_else(|| anyhow::anyhow!("node {node_id} missing"))?;
+            .execute(move |store| {
+                let node = store
+                    .list_nodes()?
+                    .into_iter()
+                    .find(|node| node.id == query_node_id)
+                    .ok_or_else(|| ApiError::not_found(format!("node {query_node_id}")))?;
+                let work_fence = needs_work_fence
+                    .then(|| store.suspend_work_fence(&query_cat_id))
+                    .transpose()?;
+                Ok((node, work_fence))
+            })
+            .await?;
+        let (node, work_fence) = node;
 
         let (job_action, transitional, target): (NodeJobAction, ObservedState, ObservedState) =
             match action {
                 "suspend" => (
                     NodeJobAction::SuspendCat {
                         cat_id: cat.id.clone(),
-                        work_fence: Some(self.store.suspend_work_fence(&cat.id)?),
+                        work_fence,
                     },
                     ObservedState::Suspending,
                     ObservedState::Suspended,
@@ -705,7 +836,10 @@ impl Controller {
                 _ => unreachable!("unknown transition"),
             };
         if cat.observed_state != transitional {
-            self.store.set_observed(&cat.id, transitional)?;
+            let cat_id = cat.id.clone();
+            self.store
+                .execute(move |store| store.set_observed(&cat_id, transitional))
+                .await?;
         }
         let job = NodeJob {
             job_id: nodejob::job_id(&cat.id, cat.generation, job_action.kind()),
@@ -723,13 +857,18 @@ impl Controller {
         );
         match dispatched {
             Ok(res) if res.phase == JobPhase::Succeeded => {
-                let recorded = self
-                    .store
-                    .finish_transition(&cat.id, transitional, target)?;
-                if recorded && target == ObservedState::Running {
-                    self.store
-                        .publish_routes(&cat.id, &node.id, &node.gateway_url)?;
-                }
+                let cat_id = cat.id.clone();
+                let node_id = node.id.clone();
+                let gateway_url = node.gateway_url.clone();
+                self.store
+                    .execute(move |store| {
+                        let recorded = store.finish_transition(&cat_id, transitional, target)?;
+                        if recorded && target == ObservedState::Running {
+                            store.publish_routes(&cat_id, &node_id, &gateway_url)?;
+                        }
+                        Ok(())
+                    })
+                    .await?;
                 self.clear_retry_backoff(cat);
                 self.complete_ops_if_converged(&cat.id).await?;
                 self.notify.notify_one();
@@ -737,8 +876,11 @@ impl Controller {
             }
             Ok(res) if res.phase == JobPhase::Rejected && action == "suspend" => {
                 tracing::info!(cat = %cat.id, "suspend cancelled because work changed");
+                let cat_id = cat.id.clone();
+                let generation = cat.generation;
                 self.store
-                    .cancel_rejected_suspend(&cat.id, cat.generation)?;
+                    .execute(move |store| store.cancel_rejected_suspend(&cat_id, generation))
+                    .await?;
                 self.notify.notify_one();
                 Ok(())
             }
@@ -756,7 +898,10 @@ impl Controller {
                 } else {
                     transitional
                 };
-                self.store.set_observed(&cat.id, retained)?;
+                let cat_id = cat.id.clone();
+                self.store
+                    .execute(move |store| store.set_observed(&cat_id, retained))
+                    .await?;
                 let retry_in = self.defer_retry(cat);
                 tracing::warn!(
                     cat = %cat.id,
@@ -795,9 +940,14 @@ impl Controller {
                 };
                 let _ = self.dispatch(&node.agent_url, &cleanup).await;
                 self.fence_cat_volumes(cat).await?;
-                self.store.unbind_routes(&cat.id)?;
-                self.store.set_placement(&cat.id, None)?;
-                self.store.set_observed(&cat.id, ObservedState::Cold)?;
+                let cat_id = cat.id.clone();
+                self.store
+                    .execute(move |store| {
+                        store.unbind_routes(&cat_id)?;
+                        store.set_placement(&cat_id, None)?;
+                        store.set_observed(&cat_id, ObservedState::Cold)
+                    })
+                    .await?;
                 self.clear_retry_backoff(cat);
                 self.notify.notify_one();
                 Ok(())
@@ -807,17 +957,28 @@ impl Controller {
 
     async fn stop_flow(&self, cat: &Cat, disposition: StopCatDisposition) -> anyhow::Result<()> {
         let Some(node_id) = &cat.node_id else {
-            self.store.set_observed(&cat.id, ObservedState::Cold)?;
+            let cat_id = cat.id.clone();
+            self.store
+                .execute(move |store| store.set_observed(&cat_id, ObservedState::Cold))
+                .await?;
             self.complete_ops_if_converged(&cat.id).await?;
             return Ok(());
         };
+        let query_node_id = node_id.clone();
         let node = self
             .store
-            .list_nodes()?
-            .into_iter()
-            .find(|n| &n.id == node_id);
+            .execute(move |store| {
+                Ok(store
+                    .list_nodes()?
+                    .into_iter()
+                    .find(|node| node.id == query_node_id))
+            })
+            .await?;
         if cat.observed_state != ObservedState::Stopping {
-            self.store.set_observed(&cat.id, ObservedState::Stopping)?;
+            let cat_id = cat.id.clone();
+            self.store
+                .execute(move |store| store.set_observed(&cat_id, ObservedState::Stopping))
+                .await?;
         }
         if let Some(node) = node {
             let job = NodeJob {
@@ -841,7 +1002,10 @@ impl Controller {
                         }
                         _ => ObservedState::Stopping,
                     };
-                    self.store.set_observed(&cat.id, retained)?;
+                    let cat_id = cat.id.clone();
+                    self.store
+                        .execute(move |store| store.set_observed(&cat_id, retained))
+                        .await?;
                     let retry_in = self.defer_retry(cat);
                     tracing::warn!(
                         cat = %cat.id,
@@ -866,10 +1030,18 @@ impl Controller {
                 }
             }
         }
-        self.store.unbind_routes(&cat.id)?;
+        let cat_id = cat.id.clone();
+        self.store
+            .execute(move |store| store.unbind_routes(&cat_id))
+            .await?;
         self.fence_cat_volumes(cat).await?;
-        self.store.set_placement(&cat.id, None)?;
-        self.store.set_observed(&cat.id, ObservedState::Cold)?;
+        let cat_id = cat.id.clone();
+        self.store
+            .execute(move |store| {
+                store.set_placement(&cat_id, None)?;
+                store.set_observed(&cat_id, ObservedState::Cold)
+            })
+            .await?;
         self.clear_retry_backoff(cat);
         self.complete_ops_if_converged(&cat.id).await?;
         Ok(())
@@ -882,7 +1054,12 @@ impl Controller {
             // PersistentDisks still cross the mandatory remote-drain boundary.
             let mut disposable_root_disk_ids = Vec::new();
             let mut retained_persistent_disk_ids = Vec::new();
-            for disk in self.store.list_disks_for_cat(&cat.id)? {
+            let cat_id = cat.id.clone();
+            let disks = self
+                .store
+                .execute(move |store| store.list_disks_for_cat(&cat_id))
+                .await?;
+            for disk in disks {
                 match disk.kind {
                     DiskKind::Root => disposable_root_disk_ids.push(disk.id),
                     DiskKind::Persistent => retained_persistent_disk_ids.push(disk.id),
@@ -896,7 +1073,11 @@ impl Controller {
                 },
             )
             .await?;
-            let current = self.store.must_get_cat_by_id(&cat.id)?;
+            let cat_id = cat.id.clone();
+            let current = self
+                .store
+                .execute(move |store| store.must_get_cat_by_id(&cat_id))
+                .await?;
             if current.node_id.is_some() || current.observed_state != ObservedState::Cold {
                 // Graceful stop (including its mandatory remote drain) has not
                 // completed. Keep every disk and retry the delete flow later.
@@ -904,33 +1085,61 @@ impl Controller {
             }
         }
         // Root disk dies with the cat; persistent disks return to Available.
-        for binding in self.store.bindings_for_cat(&cat.id)? {
-            let disk = self.store.get_disk(&cat.workspace_id, &binding.disk_id)?;
-            self.store.unbind_disk(&disk.id)?;
+        let cat_id = cat.id.clone();
+        let workspace_id = cat.workspace_id.clone();
+        let disks = self
+            .store
+            .execute(move |store| {
+                store
+                    .bindings_for_cat(&cat_id)?
+                    .into_iter()
+                    .map(|binding| {
+                        let disk = store.get_disk(&workspace_id, &binding.disk_id)?;
+                        store.unbind_disk(&disk.id)?;
+                        Ok(disk)
+                    })
+                    .collect::<crate::store::Result<Vec<_>>>()
+            })
+            .await?;
+        for disk in disks {
             if disk.kind == DiskKind::Root {
                 match self.storage_meta.delete_volume(&disk.volume_id) {
                     Ok(()) | Err(MetaError::NotFound(_)) => {}
                     Err(e) => return Err(e.into()),
                 }
-                self.store.delete_disk_row(&disk.id)?;
+                let disk_id = disk.id;
+                self.store
+                    .execute(move |store| store.delete_disk_row(&disk_id))
+                    .await?;
             }
         }
-        for op in self.store.pending_operations_for(&cat.id)? {
-            self.store.finish_operation(&op.id, None)?;
-        }
-        self.store.delete_cat_row(&cat.id)?;
+        let cat_id = cat.id.clone();
+        self.store
+            .execute(move |store| {
+                for operation in store.pending_operations_for(&cat_id)? {
+                    store.finish_operation(&operation.id, None)?;
+                }
+                store.delete_cat_row(&cat_id)
+            })
+            .await?;
         Ok(())
     }
 
     async fn complete_ops_if_converged(&self, cat_id: &str) -> anyhow::Result<()> {
-        let cat = self.store.must_get_cat_by_id(cat_id)?;
-        if lifecycle_converged(&cat) {
-            for op in self.store.pending_lifecycle_operations_for(cat_id)? {
-                if op.resource_generation <= cat.generation {
-                    self.store.finish_operation(&op.id, None)?;
+        let cat_id = cat_id.to_string();
+        self.store
+            .execute(move |store| {
+                let cat = store.must_get_cat_by_id(&cat_id)?;
+                if lifecycle_converged(&cat) {
+                    for operation in store.pending_lifecycle_operations_for(&cat_id)? {
+                        if operation.resource_generation <= cat.generation {
+                            store.finish_operation(&operation.id, None)?;
+                        }
+                    }
                 }
-            }
-        }
+                Ok(())
+            })
+            .await?;
         Ok(())
     }
 }

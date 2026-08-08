@@ -142,8 +142,15 @@ pub async fn switch_workspace(
         .map(|user| user.id.clone())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::unauthenticated("WorkOS session has no user identity"))?;
-    let workspace = state.store.workspace_by_id(&request.workspace_id)?;
-    let account = state.store.account_by_id(&workspace.account_id)?;
+    let workspace_id = request.workspace_id;
+    let (workspace, account) = state
+        .store
+        .execute(move |store| {
+            let workspace = store.workspace_by_id(&workspace_id)?;
+            let account = store.account_by_id(&workspace.account_id)?;
+            Ok((workspace, account))
+        })
+        .await?;
     if account.status != "active"
         || !config
             .user_has_active_membership(&requested_user_id, &account.workos_organization_id)
@@ -243,7 +250,16 @@ async fn session_response(
     session: &SessionState,
     headers: &HeaderMap,
 ) -> Result<(SessionResponse, Option<String>), Failure> {
-    let identity = validate_session_identity(config, &state.store, site, session)?;
+    let session = session.clone();
+    let validation_session = session.clone();
+    let validation_config = config.clone();
+    let identity = state
+        .store
+        .execute(move |store| {
+            validate_session_identity(&validation_config, store, site, &validation_session)
+                .map_err(|failure| failure.0)
+        })
+        .await?;
     let user = session
         .user
         .clone()
@@ -503,15 +519,25 @@ fn validate_session_identity(
     }
 }
 
-fn identity_from_cookie(state: &AppState, headers: &HeaderMap, site: Site) -> Option<WebIdentity> {
-    let config = state.cfg.workos.as_ref()?;
+async fn identity_from_cookie(
+    state: &AppState,
+    headers: &HeaderMap,
+    site: Site,
+) -> Option<WebIdentity> {
+    let config = state.cfg.workos.clone()?;
     let sealed = cookie_value(headers, site.session_cookie())?;
     let session = SessionManager::new(None, sealed, &config.cookie_password).authenticate();
-    validate_session_identity(config, &state.store, site, &session).ok()
+    state
+        .store
+        .execute(move |store| {
+            validate_session_identity(&config, store, site, &session).map_err(|failure| failure.0)
+        })
+        .await
+        .ok()
 }
 
-pub fn web_user_identity(state: &AppState, headers: &HeaderMap) -> Option<WebIdentity> {
-    identity_from_cookie(state, headers, Site::User)
+pub async fn web_user_identity(state: &AppState, headers: &HeaderMap) -> Option<WebIdentity> {
+    identity_from_cookie(state, headers, Site::User).await
 }
 
 pub async fn web_session_allows_workspace(
@@ -520,11 +546,12 @@ pub async fn web_session_allows_workspace(
     workspace_id: &str,
 ) -> Result<bool, ApiError> {
     if identity_from_cookie(state, headers, Site::Admin)
+        .await
         .is_some_and(|identity| identity.administrator)
     {
         return Ok(true);
     }
-    let Some(identity) = identity_from_cookie(state, headers, Site::User) else {
+    let Some(identity) = identity_from_cookie(state, headers, Site::User).await else {
         return Ok(false);
     };
     let (Some(user_id), Some(organization_id)) = (
@@ -533,9 +560,14 @@ pub async fn web_session_allows_workspace(
     ) else {
         return Ok(false);
     };
+    let workspace_id = workspace_id.to_string();
+    let organization_id_for_store = organization_id.to_string();
     if !state
         .store
-        .workspace_belongs_to_organization(workspace_id, organization_id)?
+        .execute(move |store| {
+            store.workspace_belongs_to_organization(&workspace_id, &organization_id_for_store)
+        })
+        .await?
     {
         return Ok(false);
     }
@@ -547,11 +579,17 @@ pub async fn web_session_allows_workspace(
         .await
 }
 
-pub fn web_session_is_admin(state: &AppState, headers: &HeaderMap) -> bool {
-    identity_from_cookie(state, headers, Site::Admin).is_some_and(|identity| identity.administrator)
+pub async fn web_session_is_admin(state: &AppState, headers: &HeaderMap) -> bool {
+    identity_from_cookie(state, headers, Site::Admin)
+        .await
+        .is_some_and(|identity| identity.administrator)
 }
 
-pub fn has_any_web_session(state: &AppState, headers: &HeaderMap) -> bool {
-    identity_from_cookie(state, headers, Site::User).is_some()
-        || identity_from_cookie(state, headers, Site::Admin).is_some()
+pub async fn has_any_web_session(state: &AppState, headers: &HeaderMap) -> bool {
+    identity_from_cookie(state, headers, Site::User)
+        .await
+        .is_some()
+        || identity_from_cookie(state, headers, Site::Admin)
+            .await
+            .is_some()
 }

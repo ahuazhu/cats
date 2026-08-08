@@ -14,6 +14,7 @@ mod accounts;
 mod cats;
 mod disks;
 mod endpoints;
+mod executor;
 mod leadership;
 mod nodes;
 mod oci;
@@ -24,6 +25,9 @@ mod work;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod responsiveness_tests;
 
 pub(crate) use leadership::SingletonSession;
 pub use leadership::{OciDeploymentLease, SingletonRole};
@@ -43,7 +47,8 @@ use schema::SCHEMA_VERSION;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use postgres::Client;
@@ -171,6 +176,139 @@ pub struct Store {
     ca_file: Option<String>,
 }
 
+/// Each Store retains the V1 single-connection ordering. Four fixed workers
+/// let independent Store instances (notably replicas exercised in one test
+/// process) progress without creating a thread per operation.
+pub const CONTROL_STORE_BLOCKING_WORKERS: usize = 4;
+pub const CONTROL_STORE_CONNECTIONS: usize = 1;
+pub const CONTROL_STORE_QUEUE_CAPACITY: usize = 64;
+pub const CONTROL_STORE_LEADERSHIP_WORKERS: usize = 3;
+pub const CONTROL_STORE_LEADERSHIP_QUEUE_CAPACITY: usize = 8;
+// A production process starts at most one session for each role. The larger
+// hard ceiling also supports several in-process replicas in contract tests
+// without making the persistent session count unbounded.
+pub const CONTROL_STORE_SINGLETON_CONNECTIONS: usize = 16;
+pub const CONTROL_STORE_OCI_CONNECTIONS: usize = 8;
+
+static CONTROL_STORE_SINGLETON_CONNECTIONS_IN_USE: AtomicUsize = AtomicUsize::new(0);
+static CONTROL_STORE_OCI_CONNECTIONS_IN_USE: AtomicUsize = AtomicUsize::new(0);
+
+/// Permit for a PostgreSQL session that intentionally outlives one executor
+/// job. Ordinary Store work has one connection; singleton and OCI advisory
+/// locks have separate process-wide budgets so persistent sessions cannot
+/// silently make the connection/FD count unbounded.
+pub(super) struct ConnectionBudgetPermit {
+    in_use: &'static AtomicUsize,
+}
+
+impl Drop for ConnectionBudgetPermit {
+    fn drop(&mut self) {
+        self.in_use.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn acquire_connection_budget(
+    in_use: &'static AtomicUsize,
+    limit: usize,
+    kind: &str,
+) -> Result<ConnectionBudgetPermit> {
+    in_use
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < limit).then_some(current + 1)
+        })
+        .map(|_| ConnectionBudgetPermit { in_use })
+        .map_err(|current| {
+            ApiError::unavailable(format!(
+                "control-store {kind} connection limit reached ({current}/{limit})"
+            ))
+        })
+}
+
+pub(super) fn acquire_singleton_connection_budget() -> Result<ConnectionBudgetPermit> {
+    acquire_connection_budget(
+        &CONTROL_STORE_SINGLETON_CONNECTIONS_IN_USE,
+        CONTROL_STORE_SINGLETON_CONNECTIONS,
+        "singleton",
+    )
+}
+
+pub(super) fn acquire_oci_connection_budget() -> Result<ConnectionBudgetPermit> {
+    acquire_connection_budget(
+        &CONTROL_STORE_OCI_CONNECTIONS_IN_USE,
+        CONTROL_STORE_OCI_CONNECTIONS,
+        "OCI ownership",
+    )
+}
+
+const CONTROL_STORE_EXECUTOR_LIMITS: executor::Limits = executor::Limits {
+    workers: CONTROL_STORE_BLOCKING_WORKERS,
+    queue_capacity: CONTROL_STORE_QUEUE_CAPACITY,
+};
+
+static CONTROL_STORE_EXECUTOR: OnceLock<std::result::Result<executor::BlockingExecutor, String>> =
+    OnceLock::new();
+static CONTROL_STORE_LEADERSHIP_EXECUTOR: OnceLock<
+    std::result::Result<executor::BlockingExecutor, String>,
+> = OnceLock::new();
+static CONTROL_STORE_ADMISSION: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+static CONTROL_STORE_LANES: OnceLock<Mutex<HashMap<usize, Weak<tokio::sync::Semaphore>>>> =
+    OnceLock::new();
+
+fn control_store_admission() -> Arc<tokio::sync::Semaphore> {
+    Arc::clone(CONTROL_STORE_ADMISSION.get_or_init(|| {
+        Arc::new(tokio::sync::Semaphore::new(
+            CONTROL_STORE_BLOCKING_WORKERS + CONTROL_STORE_QUEUE_CAPACITY,
+        ))
+    }))
+}
+
+fn try_admit_control_store_work() -> Result<tokio::sync::OwnedSemaphorePermit> {
+    control_store_admission().try_acquire_owned().map_err(|_| {
+        ApiError::unavailable(format!(
+            "control-store queue is full (capacity {CONTROL_STORE_QUEUE_CAPACITY})"
+        ))
+    })
+}
+
+fn control_store_lane(store: &Arc<Store>) -> Arc<tokio::sync::Semaphore> {
+    let key = Arc::as_ptr(store) as usize;
+    let lanes = CONTROL_STORE_LANES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut lanes = match lanes.lock() {
+        Ok(lanes) => lanes,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(lane) = lanes.get(&key).and_then(Weak::upgrade) {
+        return lane;
+    }
+    let lane = Arc::new(tokio::sync::Semaphore::new(CONTROL_STORE_CONNECTIONS));
+    lanes.insert(key, Arc::downgrade(&lane));
+    lane
+}
+
+fn control_store_executor() -> Result<&'static executor::BlockingExecutor> {
+    match CONTROL_STORE_EXECUTOR.get_or_init(|| {
+        executor::BlockingExecutor::new("cats-control-pg", CONTROL_STORE_EXECUTOR_LIMITS)
+            .map_err(|error| format!("start control-store blocking executor: {error}"))
+    }) {
+        Ok(executor) => Ok(executor),
+        Err(error) => Err(ApiError::unavailable(error.clone())),
+    }
+}
+
+fn control_store_leadership_executor() -> Result<&'static executor::BlockingExecutor> {
+    let limits = executor::Limits {
+        workers: CONTROL_STORE_LEADERSHIP_WORKERS,
+        queue_capacity: CONTROL_STORE_LEADERSHIP_QUEUE_CAPACITY,
+    };
+    match CONTROL_STORE_LEADERSHIP_EXECUTOR.get_or_init(|| {
+        executor::BlockingExecutor::new("cats-control-pg-leader", limits)
+            .map_err(|error| format!("start control-store leadership executor: {error}"))
+    }) {
+        Ok(executor) => Ok(executor),
+        Err(error) => Err(ApiError::unavailable(error.clone())),
+    }
+}
+
 /// Where the control store obtains its PostgreSQL DSN on each connect.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DsnSource {
@@ -210,6 +348,17 @@ impl DsnSource {
 /// tokio worker thread just like queries do.
 impl Drop for Store {
     fn drop(&mut self) {
+        if let Some(lanes) = CONTROL_STORE_LANES.get() {
+            let key = self as *const Store as usize;
+            match lanes.lock() {
+                Ok(mut lanes) => {
+                    lanes.remove(&key);
+                }
+                Err(poisoned) => {
+                    poisoned.into_inner().remove(&key);
+                }
+            }
+        }
         if let Ok(guard) = self.client.get_mut() {
             if let Some(client) = guard.take() {
                 off_runtime(move || drop(client));
@@ -273,28 +422,140 @@ pub(super) fn is_constraint(e: &postgres::Error) -> bool {
     })
 }
 
-/// Run `f` on a thread that is not driving an async runtime.
+/// Run `f` on a thread that is allowed to block.
 ///
 /// The sync `postgres` client owns an internal runtime and panics when used
-/// on a tokio worker thread ("cannot start a runtime from within a runtime").
-/// The store is called from both plain threads (tests) and async handlers, so
-/// database work hops to a scoped helper thread exactly when an ambient
-/// runtime exists. The caller blocks for the duration either way — the same
-/// serialization the SQLite implementation had behind its connection mutex.
+/// directly on a Tokio worker thread. Production async callers use
+/// `Store::execute`, below, and only await its result. This compatibility seam
+/// remains for startup and synchronous tests: a multi-thread runtime marks the
+/// call as blocking so another Tokio worker can take its place; a current-thread
+/// test has no worker to preserve and uses a scoped helper.
 pub(crate) fn off_runtime<T: Send>(f: impl FnOnce() -> T + Send) -> T {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::scope(|scope| {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        Ok(_) => std::thread::scope(|scope| {
             scope
                 .spawn(f)
                 .join()
                 .expect("control-store operation panicked")
-        })
-    } else {
-        f()
+        }),
+        Err(_) => f(),
     }
 }
 
 impl Store {
+    /// Open and migrate the initial connection without occupying a Tokio
+    /// worker. Startup awaits the same bounded executor used by requests.
+    pub async fn connect_from_async(dsn: DsnSource, ca_file: Option<String>) -> Result<Self> {
+        execute_on(
+            control_store_executor()?,
+            CONTROL_STORE_QUEUE_CAPACITY,
+            move || Store::connect_from(&dsn, ca_file.as_deref()),
+        )
+        .await
+    }
+
+    /// Execute one complete synchronous Store operation on the fixed worker.
+    ///
+    /// The closure must own its request inputs because it may wait in the
+    /// bounded queue after its caller yields. Dropping this future while it is
+    /// queued removes the closure, so an abandoned mutation cannot run later.
+    pub async fn execute<T: Send + 'static>(
+        self: &Arc<Self>,
+        operation: impl FnOnce(&Arc<Store>) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        // Admission precedes the async lane wait, so the executor queue plus
+        // all per-connection waiters has one process-wide hard bound.
+        let admission = try_admit_control_store_work()?;
+        let lane = control_store_lane(self);
+        let lane_permit = lane
+            .acquire_owned()
+            .await
+            .map_err(|_| ApiError::unavailable("control-store connection lane is shutting down"))?;
+        let store = Arc::clone(self);
+        execute_on(
+            control_store_executor()?,
+            CONTROL_STORE_QUEUE_CAPACITY,
+            move || {
+                let _admission = admission;
+                let _lane = lane_permit;
+                operation(&store)
+            },
+        )
+        .await
+    }
+
+    /// Admit cancellation cleanup without blocking the thread running Drop.
+    ///
+    /// Unlike an ordinary `Execution`, this deliberately detaches after
+    /// successful admission: cleanup exists because its parent future is
+    /// already gone. A full queue rejects it explicitly and the caller can
+    /// rely on its TTL fallback.
+    pub(crate) fn execute_detached(
+        self: &Arc<Self>,
+        operation: impl FnOnce(&Arc<Store>) + Send + 'static,
+    ) -> Result<()> {
+        let admission = try_admit_control_store_work()?;
+        let store = Arc::clone(self);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let lane = control_store_lane(&store);
+                    let Ok(lane_permit) = lane.acquire_owned().await else {
+                        return;
+                    };
+                    let result = execute_on(
+                        match control_store_executor() {
+                            Ok(executor) => executor,
+                            Err(error) => {
+                                tracing::warn!(
+                                    "control-store cleanup executor unavailable: {error}"
+                                );
+                                return;
+                            }
+                        },
+                        CONTROL_STORE_QUEUE_CAPACITY,
+                        move || {
+                            let _admission = admission;
+                            let _lane = lane_permit;
+                            operation(&store);
+                            Ok(())
+                        },
+                    )
+                    .await;
+                    if let Err(error) = result {
+                        tracing::warn!("control-store cancellation cleanup failed: {error}");
+                    }
+                });
+                Ok(())
+            }
+            Err(_) => {
+                let execution = control_store_executor()?
+                    .try_execute(move || {
+                        let _admission = admission;
+                        operation(&store);
+                    })
+                    .map_err(|error| match error {
+                        executor::SubmitError::Full => ApiError::unavailable(format!(
+                            "control-store queue is full (capacity {CONTROL_STORE_QUEUE_CAPACITY})"
+                        )),
+                        executor::SubmitError::Shutdown => {
+                            ApiError::unavailable("control-store executor is shutting down")
+                        }
+                    })?;
+                execution.detach();
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn executor_snapshot() -> Result<executor::Snapshot> {
+        Ok(control_store_executor()?.snapshot())
+    }
+
     /// Lock the connection and run `f` off-runtime. The server closing the
     /// connection (restart, failover, idle timeout) must cost one reconnect,
     /// not a wedged store, so `f` receives the reconnect outcome instead of a
@@ -308,7 +569,12 @@ impl Store {
         off_runtime(move || {
             if client.as_ref().is_none_or(Client::is_closed) {
                 match schema::connect_client(&self.dsn, self.ca_file.as_deref()) {
-                    Ok(fresh) => *client = Some(fresh),
+                    Ok(mut fresh) => {
+                        if let Err(error) = configure_session(&mut fresh) {
+                            return f(Err(error));
+                        }
+                        *client = Some(fresh);
+                    }
                     Err(error) => return f(Err(error)),
                 }
             }
@@ -330,6 +596,65 @@ impl Store {
             })
         })
     }
+}
+
+pub(crate) async fn execute_leadership<T: Send + 'static>(
+    operation: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    execute_on(
+        control_store_leadership_executor()?,
+        CONTROL_STORE_LEADERSHIP_QUEUE_CAPACITY,
+        operation,
+    )
+    .await
+}
+
+async fn execute_on<T: Send + 'static>(
+    executor: &'static executor::BlockingExecutor,
+    queue_capacity: usize,
+    operation: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let execution = match executor.try_execute(operation) {
+        Ok(execution) => execution,
+        Err(executor::SubmitError::Full) => {
+            let snapshot = executor.snapshot();
+            tracing::warn!(
+                active = snapshot.active,
+                queued = snapshot.queued,
+                workers = snapshot.limits.workers,
+                queue_capacity = snapshot.limits.queue_capacity,
+                peak_active = snapshot.peak_active,
+                "control-store blocking queue rejected work"
+            );
+            return Err(ApiError::unavailable(format!(
+                "control-store queue is full (capacity {queue_capacity})"
+            )));
+        }
+        Err(executor::SubmitError::Shutdown) => {
+            return Err(ApiError::unavailable(
+                "control-store executor is shutting down",
+            ));
+        }
+    };
+    execution.await.map_err(|error| match error {
+        executor::ExecutionError::Panicked => internal("control-store executor job panicked"),
+        executor::ExecutionError::Shutdown => {
+            ApiError::unavailable("control-store executor stopped before completing work")
+        }
+    })?
+}
+
+/// Every ordinary connection, including a lazy reconnect, gets the same
+/// bounded SQL settings. `connect_timeout` is applied while opening the socket
+/// in `schema::connect_client`; these server-side settings cover statements
+/// and lock waits after authentication succeeds.
+fn configure_session(client: &mut Client) -> Result<()> {
+    client
+        .batch_execute(
+            "SET statement_timeout = '5s'; \
+             SET lock_timeout = '2s'",
+        )
+        .map_err(internal)
 }
 
 pub fn now_ms() -> i64 {

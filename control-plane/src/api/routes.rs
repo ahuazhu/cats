@@ -31,15 +31,20 @@ pub(super) async fn resolve_route(
     headers: HeaderMap,
 ) -> ApiResult<Json<ResolveResponse>> {
     check_service_auth(&state, &headers).await?;
-    let (binding, route_state) = state.store.resolve_route(&q.hostname)?;
-    let cat = state.store.must_get_cat_by_id(&binding.cat_id)?;
-    let node_agent_url = state
+    let (binding, route_state, cat, node_agent_url) = state
         .store
-        .list_nodes()?
-        .into_iter()
-        .find(|n| n.id == binding.node_id)
-        .map(|n| n.agent_url)
-        .unwrap_or_default();
+        .execute(move |store| {
+            let (binding, route_state) = store.resolve_route(&q.hostname)?;
+            let cat = store.must_get_cat_by_id(&binding.cat_id)?;
+            let node_agent_url = store
+                .list_nodes()?
+                .into_iter()
+                .find(|node| node.id == binding.node_id)
+                .map(|node| node.agent_url)
+                .unwrap_or_default();
+            Ok((binding, route_state, cat, node_agent_url))
+        })
+        .await?;
     let grant = if route_state == "active" && cat.observed_state == ObservedState::Running {
         Some(
             state
@@ -64,8 +69,15 @@ pub(super) async fn resolve_route(
 
 /// Gateway wake entry: waits until the cat backing `hostname` is running.
 pub(super) async fn wake_route(state: &AppState, hostname: &str) -> ApiResult<()> {
-    let (binding, _) = state.store.resolve_route(hostname)?;
-    let cat = state.store.must_get_cat_by_id(&binding.cat_id)?;
+    let hostname = hostname.to_string();
+    let (binding, cat) = state
+        .store
+        .execute(move |store| {
+            let (binding, _) = store.resolve_route(&hostname)?;
+            let cat = store.must_get_cat_by_id(&binding.cat_id)?;
+            Ok((binding, cat))
+        })
+        .await?;
     if binding.wake_policy == WakePolicy::NoWake && cat.observed_state != ObservedState::Running {
         return Err(ApiError::unavailable("endpoint does not wake on request").into());
     }
@@ -75,26 +87,42 @@ pub(super) async fn wake_route(state: &AppState, hostname: &str) -> ApiResult<()
     // Running -> Node activity-guard handoff window. Normal traffic for an
     // already Running route never calls this endpoint.
     let owner = format!("route_wake_{}", uuid::Uuid::new_v4().simple());
-    let activation = state.store.acquire_work(
-        &cat.id,
-        WorkKind::Gateway,
-        &owner,
-        "endpoint_activation",
-        WAKE_ACTIVATION_LEASE_TTL_MS,
-    )?;
+    let activation_cat_id = cat.id.clone();
+    let activation_owner = owner.clone();
+    let activation = state
+        .store
+        .execute(move |store| {
+            store.acquire_work(
+                &activation_cat_id,
+                WorkKind::Gateway,
+                &activation_owner,
+                "endpoint_activation",
+                WAKE_ACTIVATION_LEASE_TTL_MS,
+            )
+        })
+        .await?;
     match ensure_running(state, cat).await {
         Ok(_) => {
-            state.store.acquire_work(
-                &activation.cat_id,
-                WorkKind::Gateway,
-                &owner,
-                "endpoint_activation",
-                RUNNING_HANDOFF_LEASE_TTL_MS,
-            )?;
+            state
+                .store
+                .execute(move |store| {
+                    store.acquire_work(
+                        &activation.cat_id,
+                        WorkKind::Gateway,
+                        &owner,
+                        "endpoint_activation",
+                        RUNNING_HANDOFF_LEASE_TTL_MS,
+                    )
+                })
+                .await?;
             Ok(())
         }
         Err(error) => {
-            let _ = state.store.release_work(&activation.id);
+            let activation_id = activation.id;
+            let _ = state
+                .store
+                .execute(move |store| store.release_work(&activation_id))
+                .await;
             Err(error)
         }
     }

@@ -121,9 +121,11 @@ async fn bearer_principal(state: &AppState, headers: &HeaderMap) -> ApiResult<Op
     if token == state.cfg.admin_token {
         return Ok(Some(Principal::Administrator));
     }
+    let token_hash = workspace_token_hash(token);
     if let Some(workspace_id) = state
         .store
-        .active_workspace_for_token_hash(&workspace_token_hash(token))?
+        .execute(move |store| store.active_workspace_for_token_hash(&token_hash))
+        .await?
     {
         return Ok(Some(Principal::WorkspaceAutomation { workspace_id }));
     }
@@ -154,7 +156,7 @@ fn auth_failure(authenticated: bool) -> Failure {
 
 async fn check_authenticated(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
     if bearer_principal(state, headers).await?.is_some()
-        || crate::auth::has_any_web_session(state, headers)
+        || crate::auth::has_any_web_session(state, headers).await
     {
         return Ok(());
     }
@@ -174,7 +176,11 @@ async fn check_workspace_auth(
             let Some(organization_id) = identity.organization_id.as_deref() else {
                 return Err(auth_failure(true));
             };
-            let scope = state.store.workspace_scope(workspace)?;
+            let workspace_id = workspace.to_string();
+            let scope = state
+                .store
+                .execute(move |store| store.workspace_scope(&workspace_id))
+                .await?;
             let allowed = scope.account.status == "active"
                 && scope.account.workos_organization_id == organization_id
                 && state
@@ -193,13 +199,18 @@ async fn check_workspace_auth(
     if bearer_allowed
         || crate::auth::web_session_allows_workspace(state, headers, workspace).await?
     {
-        return resolved_scope
-            .map(Ok)
-            .unwrap_or_else(|| state.store.workspace_scope(workspace))
+        if let Some(scope) = resolved_scope {
+            return Ok(scope);
+        }
+        let workspace = workspace.to_string();
+        return state
+            .store
+            .execute(move |store| store.workspace_scope(&workspace))
+            .await
             .map_err(Into::into);
     }
     Err(auth_failure(
-        principal.is_some() || crate::auth::has_any_web_session(state, headers),
+        principal.is_some() || crate::auth::has_any_web_session(state, headers).await,
     ))
 }
 
@@ -227,11 +238,11 @@ async fn check_admin_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()
             .is_some_and(|workos| workos.is_fleet_administrator(identity)),
         Some(Principal::Service | Principal::WorkspaceAutomation { .. }) | None => false,
     };
-    if bearer_allowed || crate::auth::web_session_is_admin(state, headers) {
+    if bearer_allowed || crate::auth::web_session_is_admin(state, headers).await {
         return Ok(());
     }
     Err(auth_failure(
-        principal.is_some() || crate::auth::has_any_web_session(state, headers),
+        principal.is_some() || crate::auth::has_any_web_session(state, headers).await,
     ))
 }
 
@@ -276,13 +287,17 @@ async fn require_account_manager(
             identity.organization_id,
             identity.permissions,
         )
-    } else if let Some(identity) = crate::auth::web_user_identity(state, headers) {
+    } else if let Some(identity) = crate::auth::web_user_identity(state, headers).await {
         let user_id = identity.user_id.ok_or_else(|| auth_failure(true))?;
         (user_id, identity.organization_id, identity.permissions)
     } else {
         return Err(auth_failure(false));
     };
-    let account = state.store.account_by_id(account_id)?;
+    let account_id = account_id.to_string();
+    let account = state
+        .store
+        .execute(move |store| store.account_by_id(&account_id))
+        .await?;
     if user_id.is_empty()
         || organization_id.as_deref() != Some(account.workos_organization_id.as_str())
         || !permissions
@@ -305,15 +320,20 @@ async fn require_account_manager(
     Ok((account, user_id))
 }
 
-fn cordon_registered_node(state: &AppState, id: &str) -> ApiResult<()> {
-    let node = state.store.get_node(id)?;
-    if node.state == NodeState::Draining && !state.store.cats_on_node(id)?.is_empty() {
-        return Err(ApiError::failed_precondition(
-            "node drain is still in progress; use uncordon to cancel it",
-        )
-        .into());
-    }
-    state.store.set_node_state(id, NodeState::Cordoned)?;
+async fn cordon_registered_node(state: &AppState, id: &str) -> ApiResult<()> {
+    let id = id.to_string();
+    state
+        .store
+        .execute(move |store| {
+            let node = store.get_node(&id)?;
+            if node.state == NodeState::Draining && !store.cats_on_node(&id)?.is_empty() {
+                return Err(ApiError::failed_precondition(
+                    "node drain is still in progress; use uncordon to cancel it",
+                ));
+            }
+            store.set_node_state(&id, NodeState::Cordoned)
+        })
+        .await?;
     Ok(())
 }
 
@@ -332,8 +352,15 @@ fn if_match(headers: &HeaderMap) -> Option<i64> {
         .and_then(|s| s.parse().ok())
 }
 
-fn billing_account_id_for_workspace(state: &AppState, workspace: &str) -> Result<String, ApiError> {
-    state.store.billing_account_id_for_workspace(workspace)
+async fn billing_account_id_for_workspace(
+    state: &AppState,
+    workspace: &str,
+) -> Result<String, ApiError> {
+    let workspace = workspace.to_string();
+    state
+        .store
+        .execute(move |store| store.billing_account_id_for_workspace(&workspace))
+        .await
 }
 
 fn metering_failure(error: cats_metering::MeteringError) -> Failure {

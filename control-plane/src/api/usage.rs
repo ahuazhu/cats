@@ -16,7 +16,11 @@ pub(super) async fn ingest_usage_checkpoints(
     }
     // A missing/lost node cannot invent a producer identity. Registration is
     // also what lets operations fence a replaced node before accepting data.
-    state.store.get_node(&req.node_id)?;
+    let node_id = req.node_id.clone();
+    state
+        .store
+        .execute(move |store| store.get_node(&node_id).map(|_| ()))
+        .await?;
 
     let mut accepted = 0_u64;
     let mut duplicates = 0_u64;
@@ -34,7 +38,12 @@ pub(super) async fn ingest_usage_checkpoints(
             .source_epoch_attribution(&checkpoint.source_id, &checkpoint.source_epoch)
             .await
             .map_err(metering_failure)?;
-        let attribution = match state.store.must_get_cat_by_id(&checkpoint.cat_id) {
+        let checkpoint_cat_id = checkpoint.cat_id.clone();
+        let cat = state
+            .store
+            .execute(move |store| store.must_get_cat_by_id(&checkpoint_cat_id))
+            .await;
+        let attribution = match cat {
             Ok(cat) => {
                 if cat.node_id.as_deref() != Some(req.node_id.as_str()) {
                     return Err(ApiError::conflict(format!(
@@ -62,7 +71,8 @@ pub(super) async fn ingest_usage_checkpoints(
                         billing_account_id: billing_account_id_for_workspace(
                             &state,
                             &cat.workspace_id,
-                        )?,
+                        )
+                        .await?,
                         workspace_id: cat.workspace_id,
                         resource_type: "cat".to_string(),
                         resource_id: checkpoint.cat_id.clone(),
@@ -317,7 +327,11 @@ pub(super) async fn workspace_usage_view(
     interval_start_unix_ms: i64,
     interval_end_unix_ms: i64,
 ) -> ApiResult<(String, UsageView)> {
-    let ledger = state.store.billing_ledger_for_workspace(workspace)?;
+    let workspace_id = workspace.to_string();
+    let ledger = state
+        .store
+        .execute(move |store| store.billing_ledger_for_workspace(&workspace_id))
+        .await?;
     let view = state
         .usage
         .query(&MeterUsageQuery {
@@ -380,11 +394,17 @@ pub(super) async fn workspace_usage(
         }
         Some(cat_id)
     } else {
-        query
-            .cat
-            .as_deref()
-            .map(|cat| state.store.get_cat(&workspace, cat).map(|cat| cat.id))
-            .transpose()?
+        if let Some(cat) = query.cat {
+            let workspace = workspace.clone();
+            Some(
+                state
+                    .store
+                    .execute(move |store| store.get_cat(&workspace, &cat).map(|cat| cat.id))
+                    .await?,
+            )
+        } else {
+            None
+        }
     };
     let (billing_account_id, view) =
         workspace_usage_view(&state, &workspace, cat_id, query.from_ms, query.to_ms).await?;
