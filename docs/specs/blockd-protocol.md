@@ -110,7 +110,7 @@ UPDATE volumes
 
 ### 4.1 Lease / Fencing
 
-- Node先按Volume Authority取得精确grant，再把volume、attachment、epoch及既有acquire transition identity
+- Node先按Volume Authority取得精确grant，再把volume、attachment、epoch及既有closed acquire origin
   交给blockd；blockd只adopt该grant，不能创建或改变ownership。
 - `renew_lease`必须携带当前owner/epoch和positive duration；唯一PG authority按本事务DB-now checked-add写
   absolute expiry。owner/epoch不匹配即失败，blockd进入 **fenced**：拒绝新WRITE/FLUSH（返回错误），
@@ -130,8 +130,10 @@ UPDATE volumes
 <data-dir>/pending/<txn>.pack          # 冻结的 Pending Commit Pack
 ```
 
-`identity.json`包含`volume_id + attachment_id + attachment_epoch + acquire_transition_id + node_id +
-placement_epoch`。data-dir属于这一次attachment，不能仅按volume id被下一个attachment复用。
+`identity.json`包含`volume_id + attachment_id + attachment_epoch + acquire_origin + node_id +
+placement_epoch`。`acquire_origin`严格使用[Volume Authority §6](volume-authority.md#6-本地-attachment-lineage)
+的closed object：`normal {transition_id: RandomId128}`或`takeover {authorization_id: Id}`。data-dir属于
+这一次attachment，不能仅按volume id被下一个attachment复用，也不能从裸ID猜测acquire namespace。
 
 - **Strict 写路径**：WRITE → 若目标 chunk 已有已提交 Base 且 cache 未水化，先整
   chunk 水化；写 cache；记录 dirty page/range。
@@ -167,7 +169,7 @@ header JSON：
   "volume_id": "…",
   "attachment_id": "…",
   "attachment_epoch": E,
-  "acquire_transition_id": "…",
+  "acquire_origin": {"kind": "normal", "transition_id": "0123456789abcdef0123456789abcdef"},
   "base_generation": N,
   "entries": [
     {
@@ -184,7 +186,8 @@ header JSON：
 
 写入顺序：写临时文件 → fdatasync → rename 为 `<txn>.pack` → fdatasync 目录。
 以上lineage字段、`page_mask`和`byte_ranges`都必须存在并通过校验。目标实现只接受version 2；旧
-pack不转换、不回放，clean-slate切换前直接删除。
+pack不转换、不回放，clean-slate切换前直接删除。缺失/unknown `acquire_origin`及旧裸
+`acquire_transition_id`同样严格拒绝，不提供兼容解析。
 
 ## 6. FLUSH 提交协议（双持久化水位）
 
@@ -199,8 +202,8 @@ pack不转换、不回放，clean-slate切换前直接删除。
 1. 捕获屏障：冻结当前 dirty set（清 volatile 位图对应位，新写进入下一集合）。
 2. 生成并落盘 Pending Pack（§5.2）；完成 fsync/rename/directory fsync 后 `L`
    前进。Relaxed 此时向 Guest ACK；Strict 继续等待。
-3. 后台 publisher 按 generation 读取 pack。验证pack与启动时采用的精确LeaseGrant、data-dir
-   identity完全相同；再按`byte_ranges`读取远端 base
+3. 后台 publisher 按 generation 读取 pack。验证pack、data-dir identity及Node随精确LeaseGrant传入的
+   closed `acquire_origin`整个variant逐字段相同；再按`byte_ranges`读取远端 base
    并按序叠加，构造完整 page/base；PUT `data/<txn>-c<idx>`（幂等，重试同键）。
 4. 构造新 Leaf/Root，PUT `maps/…`；PUT `commits/<gen+1>-<txn>.json`。
 5. Root CAS（§4）。恰好 1 行 → `R` 前进；Strict 此时向 Guest ACK。
@@ -222,8 +225,9 @@ admission 必须把“当前 dirty set 的未来 pack”作为 accounted reserva
 启动时扫描 `pending/*.pack`，先重建 `L` 和本地有序队列，不在 Relaxed attach
 恢复阶段执行远端写；后台 publisher 随后对每个 pack：
 
-- 先验证pack、data-dir identity和当前LeaseGrant的volume、attachment、epoch、acquire transition
-  完全相同，且MetadataStore仍认可该owner/epoch。缺失、损坏、已fence或不匹配时整个目录
+- 先验证pack、data-dir identity和Node随当前精确LeaseGrant传入的完整`acquire_origin`逐字段相同，
+  并验证三者的volume、attachment、epoch一致且MetadataStore仍认可该owner/epoch。normal/takeover即使
+  ID文本相同也不相等；缺失、unknown variant、损坏、已fence或不匹配时整个目录
   quarantine；不能删除pack，也不能交给新attachment发布。
 - 再读MetadataStore当前generation：
   - `generation > base_generation` 且 `commits/<base+1>-<txn>` 存在 → **CAS 已发生**：只清位图/删 pack，不得重复提交；
@@ -340,6 +344,9 @@ socket，两者服务同一个 engine 与同一个 attachment lease。
 7. Stop/Cold、Warm、`cats sync`和计划迁移必须drain到`R == L`；失败保留pending、lease与源
    runtime，重试成功前不得越过生命周期边界。磁盘成员关系与DiskSnapshot只允许Cold/unowned；
    volume容量创建后不可变。
+8. blockd restart只有在data-dir identity、全部pending pack、Runtime inventory evidence和Node从服务器端
+   acquisition marker投影并随精确grant传入的完整`AcquireOrigin`逐字段相同时才adopt；同文本不同variant、
+   missing/unknown origin或旧裸字段都quarantine且不发布Root。
 
 ### 8.1 控制命令与可观测性
 

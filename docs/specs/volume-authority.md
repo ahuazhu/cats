@@ -491,7 +491,7 @@ Node 是 lease transition 的执行者。顺序固定：
 2. 调用 MetadataStore，并对模糊结果读取精确 transition postcondition。
 3. 把 `LeaseGrant` 原子写回 checkpoint。
 4. 创建 attachment 专属 data-dir identity。
-5. 启动 blockd，传入 volume、attachment、epoch 和既有acquire transition identity。
+5. 启动 blockd，传入 volume、attachment、epoch 和既有的closed acquire origin。
 6. blockd 从 MetadataStore 验证精确 owner/epoch后开始 renew和服务。
 
 blockd 启动不得调用 acquire、takeover或增加 epoch。它只可以 renew、以精确 owner/epoch发布 Root，
@@ -502,18 +502,31 @@ blockd 启动不得调用 acquire、takeover或增加 epoch。它只可以 renew
 每个 data directory 属于一次 attachment，而不是只按 Disk ID 复用：
 
 ```text
+AcquireOrigin =
+  { kind: "normal", transition_id: RandomId128 }
+| { kind: "takeover", authorization_id: Id }
+
 VolumeLocalIdentity {
   volume_id: Id,
   attachment_id: Id,
   attachment_epoch: FenceEpoch,
-  acquire_transition_id: Id,
+  acquire_origin: AcquireOrigin,
   node_id: Id,
   placement_epoch: Epoch
 }
 ```
 
 identity 在创建任何 cache/pack 前完成 file fsync、rename 和 parent directory fsync。每个 pending
-pack 重复记录 `volume_id + attachment_id + attachment_epoch + acquire_transition_id`。
+pack 重复记录 `volume_id + attachment_id + attachment_epoch + acquire_origin`。normal acquire从锁定的
+`last_transition.normal_acquire`复制`normal {transition_id}`，takeover从锁定的`AuthorizationRecord`复制
+`takeover {authorization_id}`；不能从ID文本猜测namespace。
+
+active lineage的`identity.json`、每个pending pack、Runtime checkpoint/inventory与生成当前精确grant的
+服务器端acquire marker必须逐字段绑定同一个完整`AcquireOrigin` variant，之后才可adopt或publish。精确
+release覆盖`last_transition`后，cleanup改为逐字段匹配release前已持久化的checkpoint、当前full inventory、
+identity和全部pack，不重建已被覆盖的acquire marker。即使`transition_id`与`authorization_id`文本相同，
+`normal`和`takeover`也不是同一identity；variant缺失、unknown `kind`、旧裸`acquire_transition_id`或任一
+字段冲突都不得adopt、publish或cleanup该目录，只能保留完整证据并quarantine。
 
 恢复规则：
 
@@ -525,7 +538,7 @@ pack 重复记录 `volume_id + attachment_id + attachment_epoch + acquire_transi
 - disposable Root 的唯一例外：§11 的 Owned -> Deleting CAS 已成功后，才能删除授权中精确
   attachment lineage 的 `R < L` tail；该例外不能用于其他目录或其他卷。
 
-clean-slate cutover 不解析缺少这些字段的旧 pack。
+clean-slate cutover 不解析缺少这些字段的旧 pack，也不接受旧裸`acquire_transition_id`的identity或pack。
 
 ## 7. Cold-only 磁盘成员关系
 
@@ -856,8 +869,9 @@ tombstone；但只要某个Active HostFenceEvent的Consumed authorization引用�
 | Host rejoin遇到未消费授权 | 未过`not_after`时保持Active/Blocked；过期后才可Rejoined，且不能首次消费 |
 | consumed授权的后继 | direct takeover/disposable state缺失或写错对应authorization marker必须Blocked；更大epoch的takeover→release/restore/delete按closed状态机、epoch单调和head generation非倒退验证；delete→sweep以精确DeleteCompletionReceipt重连；缺失/错receipt保持Blocked，不复制中间链 |
 | pure D / cross-row split | pure-domain table只输入Volume/Event/Authorization rows且可复用于SQLite fixture；唯一PG integration逐项改变Cold、R==L、blockd stop、Desired、Disk、Snapshot、stop observation并断言同事务拒绝；不存在bool/VerifiedContext旁路 |
+| acquire origin namespace | normal/takeover即使携带相同文本ID也不是同一lineage并进入quarantine；缺失/unknown variant和旧裸字段严格拒绝，不能猜namespace |
 | 旧pending目录遇到新attachment | quarantine，remote Root不改变 |
-| 相同lineage blockd crash | 从pack恢复L并按序publish |
+| 相同lineage blockd crash | identity、全部pending pack、runtime evidence与当前grant的服务器端acquire marker逐字段绑定同一完整`AcquireOrigin`后，才从pack恢复L并按序publish；任一冲突quarantine |
 | resize请求 | API不存在；`size_bytes` 在Volume/Root/Snapshot中始终一致 |
 | normal acquire与begin-delete并发 | 两者锁同一VolumeRecord且只能一方提交；不存在Control Deleting但Volume仍可acquire的窗口 |
 | delete各步骤crash | begin-delete两边原子进入Deleting；completion只保存exact normal request或disposable authorization/prior attachment及deleting epoch/head；receipt固定表示sweep完成和两row同事务删除，不存bool |
