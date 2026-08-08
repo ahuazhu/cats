@@ -18,6 +18,17 @@ usage() {
   echo "usage: $0 {provenance|fmt|skills|deps|check|build|clippy|test|doc|fast|full|linux}" >&2
 }
 
+prepare_native_test_process() {
+  local hard_nofile
+
+  hard_nofile="$(ulimit -Hn)" || return 1
+  ulimit -Sn "$hard_nofile" || {
+    echo "cannot raise the test process open-file limit to $hard_nofile" >&2
+    return 1
+  }
+  echo "==> test process limits (threads=4 nofile=$(ulimit -Sn))"
+}
+
 source_git() {
   GIT_OPTIONAL_LOCKS=0 git \
     -c safe.directory="$REPO_ROOT" \
@@ -252,8 +263,9 @@ with_test_postgres() {
 }
 
 run_test() {
+  prepare_native_test_process || return 1
   echo "==> cargo test"
-  with_test_postgres cargo test --workspace --locked
+  with_test_postgres cargo test --workspace --locked -- --test-threads=4
 }
 
 run_doc() {
@@ -298,6 +310,7 @@ run_linux() {
 
   local status=0
   docker run --rm --platform "$platform" \
+    --ulimit nofile=65536:65536 \
     -e CARGO_BUILD_JOBS="$jobs" \
     -e CATS_TEST_POSTGRES_URL="postgres://postgres:cats@${pg}:5432/postgres" \
     -e CATS_SOURCE_PROVENANCE_ROOT="$SOURCE_PROVENANCE_ROOT" \
@@ -317,7 +330,7 @@ run_linux() {
            cargo check --workspace --all-targets --locked --target-dir /target &&
            cargo build --workspace --locked --target-dir /target &&
            cargo clippy --workspace --all-targets --locked --target-dir /target -- -D warnings &&
-           cargo test --workspace --locked --target-dir /target &&
+           cargo test --workspace --locked --target-dir /target -- --test-threads=4 &&
            RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked --target-dir /target' || status=$?
 
   docker rm -f "$pg" >/dev/null 2>&1 || true

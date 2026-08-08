@@ -77,6 +77,13 @@ The job environment grants Git trust only to the exact frozen
 repository ownership, persists a global/system Git setting or uses a wildcard
 `safe.directory`; filesystem permissions remain the write-authority boundary.
 
+`quality.sh test/full` removes a low inherited soft open-file cap by raising it
+to the job's existing hard limit, and defaults Rust's test harness to four
+threads. The isolated runner retains the job hard ceiling; the Docker Linux
+gate makes the same no-soft-cap and bounded-thread contract explicit. This
+keeps high-core qualification Hosts deterministic without changing Host-wide
+limits or hiding the setting in an operator shell.
+
 The candidate uid 2000 may write a regular file only inside its per-job `output/` directory. After
 the job exits, the root orchestrator freezes that output as root-owned and non-writable and records
 the Host-local immutable receipt. `cats-run-build` does not publish it. To retain a selected frozen

@@ -464,6 +464,65 @@ fn linux_quality_gate_installs_the_postgres_probe_runtime() {
             "the Linux gate must inherit the host's complete source provenance"
         );
     }
+    assert!(linux_gate.contains("--ulimit nofile=65536:65536"));
+    assert!(linux_gate
+        .contains("cargo test --workspace --locked --target-dir /target -- --test-threads=4"));
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_gate_removes_the_native_test_soft_nofile_cap_and_bounds_threads() {
+    let root = workspace_root();
+    let fixture = tempfile::tempdir().expect("quality process-limit fixture");
+    let fake_cargo = fixture.path().join("cargo");
+    let capture = fixture.path().join("capture");
+    std::fs::write(
+        &fake_cargo,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf 'soft=%s\n' "$(ulimit -Sn)" > "$CATS_QUALITY_CAPTURE"
+printf 'hard=%s\n' "$(ulimit -Hn)" >> "$CATS_QUALITY_CAPTURE"
+printf 'args=%s\n' "$*" >> "$CATS_QUALITY_CAPTURE"
+"#,
+    )
+    .expect("write fake cargo");
+    let mut permissions = std::fs::metadata(&fake_cargo)
+        .expect("fake cargo metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_cargo, permissions).expect("make fake cargo executable");
+
+    let inherited_path = std::env::var("PATH").expect("PATH");
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg("ulimit -Sn 1024\nexec \"$QUALITY_SCRIPT\" test")
+        .env("QUALITY_SCRIPT", root.join("scripts/quality.sh"))
+        .env("CATS_QUALITY_CAPTURE", &capture)
+        .env("CATS_TEST_POSTGRES_URL", "postgres://unused")
+        .env(
+            "PATH",
+            format!("{}:{inherited_path}", fixture.path().display()),
+        )
+        .output()
+        .expect("run quality test process-limit probe");
+    assert!(
+        output.status.success(),
+        "quality probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let captured = std::fs::read_to_string(capture).expect("read process-limit capture");
+    let soft = captured
+        .lines()
+        .find_map(|line| line.strip_prefix("soft="))
+        .expect("soft nofile capture");
+    let hard = captured
+        .lines()
+        .find_map(|line| line.strip_prefix("hard="))
+        .expect("hard nofile capture");
+    assert_eq!(soft, hard);
+    assert_ne!(soft, "1024");
+    assert!(captured.contains("args=test --workspace --locked -- --test-threads=4\n"));
 }
 
 #[test]
