@@ -246,6 +246,33 @@ async fn check_admin_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()
     ))
 }
 
+/// Authenticate the observability endpoint without consulting PostgreSQL.
+/// Static scrape credentials, WorkOS administrator JWTs, and the sealed admin
+/// browser session preserve the existing administrator surface while a stuck
+/// control-store lane remains diagnosable.
+async fn check_metrics_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+    if let Some(token) = bearer_token(headers) {
+        if token == state.cfg.admin_token {
+            return Ok(());
+        }
+        if token == state.cfg.auth_token {
+            return Err(auth_failure(true));
+        }
+        let Some(workos) = state.cfg.workos.as_ref() else {
+            return Err(auth_failure(false));
+        };
+        let identity = workos.verify_access_token(token).await?;
+        if workos.is_fleet_administrator(&identity) {
+            return Ok(());
+        }
+        return Err(auth_failure(true));
+    }
+    if crate::auth::web_session_is_admin_without_store(state, headers) {
+        return Ok(());
+    }
+    Err(auth_failure(false))
+}
+
 async fn check_service_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
     let principal = bearer_principal(state, headers).await?;
     if matches!(

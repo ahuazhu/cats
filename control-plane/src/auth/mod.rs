@@ -62,7 +62,8 @@ mod workos_client;
 pub use provisioning::provision_personal_account;
 pub use session::{
     has_any_web_session, logout, session, switch_workspace, web_session_allows_workspace,
-    web_session_is_admin, web_user_identity, SiteQuery, SwitchWorkspaceRequest, WebIdentity,
+    web_session_is_admin, web_session_is_admin_without_store, web_user_identity, SiteQuery,
+    SwitchWorkspaceRequest, WebIdentity,
 };
 pub use token::AccessIdentity;
 pub use web_flow::{callback, config, login, CallbackQuery, LoginQuery};

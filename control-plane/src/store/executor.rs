@@ -20,6 +20,7 @@ use tokio::sync::oneshot;
 pub(super) struct Limits {
     pub(super) workers: usize,
     pub(super) queue_capacity: usize,
+    pub(super) cleanup_capacity: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +28,7 @@ pub(super) struct Snapshot {
     pub(super) limits: Limits,
     pub(super) active: usize,
     pub(super) queued: usize,
+    pub(super) cleanup_queued: usize,
     pub(super) peak_active: usize,
 }
 
@@ -34,6 +36,11 @@ pub(super) struct Snapshot {
 pub(super) enum SubmitError {
     Full,
     Shutdown,
+}
+
+pub(super) enum CleanupSubmitError<F> {
+    Full(F),
+    Shutdown(F),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +59,7 @@ struct Job {
 #[derive(Default)]
 struct QueueState {
     jobs: VecDeque<Job>,
+    cleanups: VecDeque<JobFn>,
     shutdown: bool,
 }
 
@@ -86,6 +94,12 @@ impl BlockingExecutor {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "blocking queue must have positive bounded capacity",
+            ));
+        }
+        if limits.cleanup_capacity == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "blocking cleanup queue must have positive bounded capacity",
             ));
         }
 
@@ -153,12 +167,62 @@ impl BlockingExecutor {
         })
     }
 
+    /// Admit non-cancellable cleanup into capacity reserved from request work.
+    ///
+    /// The caller retains the closure on rejection, so a synchronous client's
+    /// unique owner is never captured by a cancelable retry task. Workers give
+    /// this queue priority to release connection permits and advisory locks.
+    pub(super) fn try_execute_cleanup<F>(&self, operation: F) -> Result<(), CleanupSubmitError<F>>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let mut state = lock_unpoisoned(&self.inner.queue);
+        if state.shutdown {
+            return Err(CleanupSubmitError::Shutdown(operation));
+        }
+        if state.cleanups.len() >= self.inner.limits.cleanup_capacity {
+            return Err(CleanupSubmitError::Full(operation));
+        }
+        state.cleanups.push_back(Box::new(move || {
+            let _ = panic::catch_unwind(AssertUnwindSafe(operation));
+        }));
+        drop(state);
+        self.inner.available.notify_one();
+        Ok(())
+    }
+
+    /// Wait for reserved cleanup capacity without running the destructor on
+    /// the caller. Production connection budgets make this wait unnecessary;
+    /// it is the fail-closed admission path if that invariant is ever broken.
+    pub(super) fn execute_cleanup<F>(&self, operation: F) -> Result<(), CleanupSubmitError<F>>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let mut state = lock_unpoisoned(&self.inner.queue);
+        while state.cleanups.len() >= self.inner.limits.cleanup_capacity && !state.shutdown {
+            state = match self.inner.available.wait(state) {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+        if state.shutdown {
+            return Err(CleanupSubmitError::Shutdown(operation));
+        }
+        state.cleanups.push_back(Box::new(move || {
+            let _ = panic::catch_unwind(AssertUnwindSafe(operation));
+        }));
+        drop(state);
+        self.inner.available.notify_one();
+        Ok(())
+    }
+
     pub(super) fn snapshot(&self) -> Snapshot {
-        let queued = lock_unpoisoned(&self.inner.queue).jobs.len();
+        let state = lock_unpoisoned(&self.inner.queue);
         Snapshot {
             limits: self.inner.limits,
             active: self.inner.active.load(Ordering::Acquire),
-            queued,
+            queued: state.jobs.len(),
+            cleanup_queued: state.cleanups.len(),
             peak_active: self.inner.peak_active.load(Ordering::Acquire),
         }
     }
@@ -174,18 +238,26 @@ impl Drop for BlockingExecutor {
 }
 
 fn shutdown(inner: &Inner) {
-    let mut state = lock_unpoisoned(&inner.queue);
-    state.shutdown = true;
-    state.jobs.clear();
-    drop(state);
+    let (abandoned, abandoned_cleanups) = {
+        let mut state = lock_unpoisoned(&inner.queue);
+        state.shutdown = true;
+        (
+            std::mem::take(&mut state.jobs),
+            std::mem::take(&mut state.cleanups),
+        )
+    };
     inner.available.notify_all();
+    // A captured request may own an arbitrarily slow destructor. Workers and
+    // submitters must be able to observe shutdown while those closures drop.
+    drop(abandoned);
+    drop(abandoned_cleanups);
 }
 
 fn worker_loop(inner: &Inner) {
     loop {
         let job = {
             let mut state = lock_unpoisoned(&inner.queue);
-            while state.jobs.is_empty() && !state.shutdown {
+            while state.jobs.is_empty() && state.cleanups.is_empty() && !state.shutdown {
                 state = match inner.available.wait(state) {
                     Ok(state) => state,
                     Err(poisoned) => poisoned.into_inner(),
@@ -194,8 +266,15 @@ fn worker_loop(inner: &Inner) {
             if state.shutdown {
                 return;
             }
-            state.jobs.pop_front()
+            state
+                .cleanups
+                .pop_front()
+                .map(|run| Job { id: 0, run })
+                .or_else(|| state.jobs.pop_front())
         };
+        // Cleanup admission may be waiting for the reserved queue slot that
+        // was just claimed. Notify only after releasing the queue mutex.
+        inner.available.notify_all();
         let Some(job) = job else {
             continue;
         };
@@ -277,10 +356,17 @@ impl<T> Drop for Execution<T> {
         let Some(executor) = self.executor.upgrade() else {
             return;
         };
-        let mut state = lock_unpoisoned(&executor.queue);
-        if let Some(position) = state.jobs.iter().position(|job| job.id == id) {
-            state.jobs.remove(position);
-        }
+        let abandoned = {
+            let mut state = lock_unpoisoned(&executor.queue);
+            state
+                .jobs
+                .iter()
+                .position(|job| job.id == id)
+                .and_then(|position| state.jobs.remove(position))
+        };
+        // Dropping the closure while holding `queue` would let a request's
+        // destructor stop every submitter and worker in this executor.
+        drop(abandoned);
     }
 }
 

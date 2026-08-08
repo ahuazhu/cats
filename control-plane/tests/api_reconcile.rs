@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::State;
@@ -4286,6 +4286,84 @@ async fn an_agent_reported_cat_without_an_assignment_is_surfaced_as_an_orphan() 
         prometheus.contains("cats_node_orphan_cats{node_id=\"node_a\"} 1"),
         "metrics must carry the per-node orphan gauge"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metrics_reports_executor_saturation_without_waiting_for_the_database_lane() {
+    let ctx = Ctx::new().await;
+    let dsn = match &ctx.config.control_store_dsn {
+        DsnSource::Literal(dsn) => dsn.clone(),
+        DsnSource::File(_) => panic!("the integration harness uses a literal test DSN"),
+    };
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let database_lock = std::thread::spawn(move || {
+        let mut client = postgres::Client::connect(&dsn, postgres::NoTls).unwrap();
+        client
+            .batch_execute("BEGIN; LOCK TABLE cats IN ACCESS EXCLUSIVE MODE")
+            .unwrap();
+        let _ = locked_tx.send(());
+        release_rx.recv().unwrap();
+        client.batch_execute("ROLLBACK").unwrap();
+    });
+    locked_rx.await.unwrap();
+
+    let store = Arc::clone(&ctx.cp.state.store);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let blocked = tokio::spawn(async move {
+        store
+            .execute(move |store| {
+                let _ = started_tx.send(());
+                store.list_all_cats()
+            })
+            .await
+    });
+    started_rx.await.unwrap();
+
+    let unauthorized = tokio::time::timeout(
+        Duration::from_secs(1),
+        ctx.http
+            .get(ctx.url("/metrics"))
+            .bearer_auth("invalid-non-database-metrics-credential")
+            .send(),
+    )
+    .await
+    .expect("metrics authentication must not probe workspace tokens through the DB lane")
+    .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let started = std::time::Instant::now();
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        ctx.http
+            .get(ctx.url("/metrics"))
+            .bearer_auth("dev-admin-token")
+            .send(),
+    )
+    .await
+    .expect("metrics must not wait for the occupied PostgreSQL lane")
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+    let body = response.text().await.unwrap();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(body.contains("cats_control_store_blocking_jobs_active{executor=\"normal\"}"));
+    assert!(body.contains("cats_control_store_blocking_cleanup_queue_depth{executor=\"normal\"}"));
+    assert!(body
+        .contains("cats_control_store_blocking_cleanup_queue_capacity{executor=\"leadership\"}"));
+    assert!(body.contains("cats_control_store_admission_depth"));
+    assert!(body.contains("cats_control_store_rejections_total{boundary=\"admission\"}"));
+    assert!(body.contains("cats_control_store_rejections_total{boundary=\"normal_cleanup\"}"));
+    assert!(body.contains("cats_control_store_timeouts_total{kind=\"lane_acquire\"}"));
+    assert!(body.contains("cats_control_store_request_latency_seconds_count{executor=\"normal\"}"));
+    assert!(body.contains("cats_control_store_connections{kind=\"normal\"}"));
+    assert!(body.contains("cats_control_store_connections{kind=\"singleton\"}"));
+    assert!(body.contains("cats_control_store_connections{kind=\"oci\"}"));
+    assert!(body.contains("cats_control_plane_metrics_database_snapshot_available 0"));
+
+    release_tx.send(()).unwrap();
+    let _ = blocked.await.unwrap();
+    database_lock.join().unwrap();
 }
 
 /// Issue #98: the drain went draining -> cordoned in a minute and left all 13

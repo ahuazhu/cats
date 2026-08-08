@@ -495,12 +495,7 @@ fn validate_session_identity(
             })
         }
         Site::Admin => {
-            if session.organization_id != config.admin_organization_id
-                || !session
-                    .permissions
-                    .iter()
-                    .any(|permission| permission == &config.admin_permission)
-            {
+            if !session_is_admin(config, session) {
                 return Err(ApiError::new(
                     cats_api::error::ErrorCode::PermissionDenied,
                     "WorkOS session lacks fleet administrator permission",
@@ -517,6 +512,29 @@ fn validate_session_identity(
             })
         }
     }
+}
+
+fn session_is_admin(config: &WorkOsConfig, session: &SessionState) -> bool {
+    session.authenticated
+        && session.organization_id == config.admin_organization_id
+        && session
+            .permissions
+            .iter()
+            .any(|permission| permission == &config.admin_permission)
+}
+
+/// Validate the sealed administrator cookie without entering the control
+/// store. The normal admin identity path has the same predicate; its Store
+/// closure is only needed to share machinery with workspace-scoped sessions.
+pub fn web_session_is_admin_without_store(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(config) = state.cfg.workos.as_ref() else {
+        return false;
+    };
+    let Some(sealed) = cookie_value(headers, Site::Admin.session_cookie()) else {
+        return false;
+    };
+    let session = SessionManager::new(None, sealed, &config.cookie_password).authenticate();
+    session_is_admin(config, &session)
 }
 
 async fn identity_from_cookie(

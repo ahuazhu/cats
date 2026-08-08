@@ -16,6 +16,7 @@ mod disks;
 mod endpoints;
 mod executor;
 mod leadership;
+mod metrics;
 mod nodes;
 mod oci;
 mod operations;
@@ -44,12 +45,13 @@ use rows::{
 #[cfg(test)]
 use schema::SCHEMA_VERSION;
 
+use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use postgres::Client;
 use uuid::Uuid;
@@ -169,8 +171,8 @@ pub fn public_endpoint_hostname(cat: &Cat, endpoint_name: &str) -> String {
 pub struct Store {
     /// One serialized connection, the same concurrency shape the SQLite
     /// implementation had. `with` reconnects lazily after the server drops
-    /// it. Option only so `Drop` can move the client onto a non-runtime
-    /// thread — it is `Some` for the store's whole life.
+    /// it. Option lets reconnect retire a dead FD before dialing and lets
+    /// `Drop` move the live client onto a non-runtime thread.
     pub(super) client: Mutex<Option<Client>>,
     dsn: DsnSource,
     ca_file: Option<String>,
@@ -182,6 +184,7 @@ pub struct Store {
 pub const CONTROL_STORE_BLOCKING_WORKERS: usize = 4;
 pub const CONTROL_STORE_CONNECTIONS: usize = 1;
 pub const CONTROL_STORE_QUEUE_CAPACITY: usize = 64;
+pub const CONTROL_STORE_CLEANUP_QUEUE_CAPACITY: usize = 64;
 pub const CONTROL_STORE_LEADERSHIP_WORKERS: usize = 3;
 pub const CONTROL_STORE_LEADERSHIP_QUEUE_CAPACITY: usize = 8;
 // A production process starts at most one session for each role. The larger
@@ -189,6 +192,21 @@ pub const CONTROL_STORE_LEADERSHIP_QUEUE_CAPACITY: usize = 8;
 // without making the persistent session count unbounded.
 pub const CONTROL_STORE_SINGLETON_CONNECTIONS: usize = 16;
 pub const CONTROL_STORE_OCI_CONNECTIONS: usize = 8;
+pub const CONTROL_STORE_LEADERSHIP_CLEANUP_QUEUE_CAPACITY: usize =
+    CONTROL_STORE_SINGLETON_CONNECTIONS + CONTROL_STORE_OCI_CONNECTIONS;
+
+/// Client-side connection deadlines complement PostgreSQL's server-side
+/// statement and lock timeouts. `TCP_USER_TIMEOUT` bounds unacknowledged data;
+/// keepalive probes bound an otherwise silent half-open established socket.
+pub const CONTROL_STORE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const CONTROL_STORE_TCP_USER_TIMEOUT: Duration = Duration::from_secs(5);
+pub const CONTROL_STORE_KEEPALIVE_IDLE: Duration = Duration::from_secs(2);
+pub const CONTROL_STORE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+pub const CONTROL_STORE_KEEPALIVE_RETRIES: u32 = 3;
+/// Conservative Linux bound from the last acknowledged packet: wait for the
+/// first keepalive probe, then allow at most `TCP_USER_TIMEOUT` without an ACK.
+pub const CONTROL_STORE_ESTABLISHED_IO_FAILURE_BOUND: Duration = Duration::from_secs(7);
+pub const CONTROL_STORE_LANE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
 static CONTROL_STORE_SINGLETON_CONNECTIONS_IN_USE: AtomicUsize = AtomicUsize::new(0);
 static CONTROL_STORE_OCI_CONNECTIONS_IN_USE: AtomicUsize = AtomicUsize::new(0);
@@ -211,6 +229,7 @@ fn acquire_connection_budget(
     in_use: &'static AtomicUsize,
     limit: usize,
     kind: &str,
+    rejection: metrics::RejectionKind,
 ) -> Result<ConnectionBudgetPermit> {
     in_use
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -218,6 +237,7 @@ fn acquire_connection_budget(
         })
         .map(|_| ConnectionBudgetPermit { in_use })
         .map_err(|current| {
+            metrics::record_rejection(rejection);
             ApiError::unavailable(format!(
                 "control-store {kind} connection limit reached ({current}/{limit})"
             ))
@@ -229,6 +249,7 @@ pub(super) fn acquire_singleton_connection_budget() -> Result<ConnectionBudgetPe
         &CONTROL_STORE_SINGLETON_CONNECTIONS_IN_USE,
         CONTROL_STORE_SINGLETON_CONNECTIONS,
         "singleton",
+        metrics::RejectionKind::SingletonConnection,
     )
 }
 
@@ -237,12 +258,19 @@ pub(super) fn acquire_oci_connection_budget() -> Result<ConnectionBudgetPermit> 
         &CONTROL_STORE_OCI_CONNECTIONS_IN_USE,
         CONTROL_STORE_OCI_CONNECTIONS,
         "OCI ownership",
+        metrics::RejectionKind::OciConnection,
     )
 }
 
 const CONTROL_STORE_EXECUTOR_LIMITS: executor::Limits = executor::Limits {
     workers: CONTROL_STORE_BLOCKING_WORKERS,
     queue_capacity: CONTROL_STORE_QUEUE_CAPACITY,
+    cleanup_capacity: CONTROL_STORE_CLEANUP_QUEUE_CAPACITY,
+};
+const CONTROL_STORE_LEADERSHIP_EXECUTOR_LIMITS: executor::Limits = executor::Limits {
+    workers: CONTROL_STORE_LEADERSHIP_WORKERS,
+    queue_capacity: CONTROL_STORE_LEADERSHIP_QUEUE_CAPACITY,
+    cleanup_capacity: CONTROL_STORE_LEADERSHIP_CLEANUP_QUEUE_CAPACITY,
 };
 
 static CONTROL_STORE_EXECUTOR: OnceLock<std::result::Result<executor::BlockingExecutor, String>> =
@@ -264,6 +292,7 @@ fn control_store_admission() -> Arc<tokio::sync::Semaphore> {
 
 fn try_admit_control_store_work() -> Result<tokio::sync::OwnedSemaphorePermit> {
     control_store_admission().try_acquire_owned().map_err(|_| {
+        metrics::record_rejection(metrics::RejectionKind::Admission);
         ApiError::unavailable(format!(
             "control-store queue is full (capacity {CONTROL_STORE_QUEUE_CAPACITY})"
         ))
@@ -296,17 +325,71 @@ fn control_store_executor() -> Result<&'static executor::BlockingExecutor> {
 }
 
 fn control_store_leadership_executor() -> Result<&'static executor::BlockingExecutor> {
-    let limits = executor::Limits {
-        workers: CONTROL_STORE_LEADERSHIP_WORKERS,
-        queue_capacity: CONTROL_STORE_LEADERSHIP_QUEUE_CAPACITY,
-    };
     match CONTROL_STORE_LEADERSHIP_EXECUTOR.get_or_init(|| {
-        executor::BlockingExecutor::new("cats-control-pg-leader", limits)
-            .map_err(|error| format!("start control-store leadership executor: {error}"))
+        executor::BlockingExecutor::new(
+            "cats-control-pg-leader",
+            CONTROL_STORE_LEADERSHIP_EXECUTOR_LIMITS,
+        )
+        .map_err(|error| format!("start control-store leadership executor: {error}"))
     }) {
         Ok(executor) => Ok(executor),
         Err(error) => Err(ApiError::unavailable(error.clone())),
     }
+}
+
+fn drop_on_executor<T: Send + 'static>(
+    value: T,
+    executor_provider: fn() -> Result<&'static executor::BlockingExecutor>,
+    kind: metrics::ExecutorKind,
+) {
+    if tokio::runtime::Handle::try_current().is_err() {
+        // Calls already running on a Cats blocking worker have no Tokio
+        // context and may destroy the synchronous client directly.
+        drop(value);
+        return;
+    }
+
+    // DsnSource::resolve initializes both static executors before any Client
+    // can be created. Static OnceLock values are never shut down, so every
+    // live Client has a permanently available cleanup destination.
+    let executor = executor_provider()
+        .expect("a live control-store Client has an initialized blocking executor");
+    type DropJob = Box<dyn FnOnce() + Send + 'static>;
+    let operation: DropJob = Box::new(move || drop(value));
+    let operation = match executor.try_execute_cleanup(operation) {
+        Ok(()) => return,
+        Err(executor::CleanupSubmitError::Full(operation)) => {
+            metrics::record_rejection(match kind {
+                metrics::ExecutorKind::Normal => metrics::RejectionKind::NormalCleanup,
+                metrics::ExecutorKind::Leadership => metrics::RejectionKind::LeadershipCleanup,
+            });
+            operation
+        }
+        Err(executor::CleanupSubmitError::Shutdown(_)) => {
+            unreachable!("static control-store executor cannot shut down")
+        }
+    };
+    match executor.execute_cleanup(operation) {
+        Ok(()) => {}
+        Err(executor::CleanupSubmitError::Full(_)) => {
+            unreachable!("blocking cleanup admission does not reject a full queue")
+        }
+        Err(executor::CleanupSubmitError::Shutdown(_)) => {
+            unreachable!("static control-store executor cannot shut down")
+        }
+    }
+}
+
+fn drop_on_normal_executor(value: Client) {
+    drop_on_executor(value, control_store_executor, metrics::ExecutorKind::Normal);
+}
+
+pub(super) fn drop_on_leadership_executor<T: Send + 'static>(value: T) {
+    drop_on_executor(
+        value,
+        control_store_leadership_executor,
+        metrics::ExecutorKind::Leadership,
+    );
 }
 
 /// Where the control store obtains its PostgreSQL DSN on each connect.
@@ -322,7 +405,13 @@ impl DsnSource {
     /// Resolve without ever including the credential-bearing contents in an
     /// error message.
     fn resolve(&self) -> Result<String> {
-        match self {
+        // A live synchronous Client must always have a bounded place to run
+        // and to be destroyed. Initializing both fixed executors before any
+        // dial makes a permanently cached executor startup failure fail the
+        // connect itself instead of stranding an advisory-lock owner later.
+        control_store_executor()?;
+        control_store_leadership_executor()?;
+        let url = match self {
             Self::Literal(url) => Ok(url.clone()),
             Self::File(path) => {
                 let contents = fs::read_to_string(path).map_err(|error| {
@@ -340,12 +429,44 @@ impl DsnSource {
                 }
                 Ok(url.to_string())
             }
-        }
+        }?;
+        Ok(dsn_with_client_failure_bounds(&url))
     }
 }
 
-/// Tearing down the client blocks on its internal runtime, which panics on a
-/// tokio worker thread just like queries do.
+fn dsn_with_client_failure_bounds(dsn: &str) -> String {
+    let settings = format!(
+        "connect_timeout={}\
+         &tcp_user_timeout={}\
+         &keepalives=1\
+         &keepalives_idle={}\
+         &keepalives_interval={}\
+         &keepalives_retries={}",
+        CONTROL_STORE_CONNECT_TIMEOUT.as_secs(),
+        CONTROL_STORE_TCP_USER_TIMEOUT.as_secs(),
+        CONTROL_STORE_KEEPALIVE_IDLE.as_secs(),
+        CONTROL_STORE_KEEPALIVE_INTERVAL.as_secs(),
+        CONTROL_STORE_KEEPALIVE_RETRIES,
+    );
+    if dsn.starts_with("postgres://") || dsn.starts_with("postgresql://") {
+        let separator = if dsn.contains('?') { '&' } else { '?' };
+        format!("{dsn}{separator}{settings}")
+    } else {
+        format!(
+            "{dsn} connect_timeout={} tcp_user_timeout={} keepalives=1 \
+             keepalives_idle={} keepalives_interval={} keepalives_retries={}",
+            CONTROL_STORE_CONNECT_TIMEOUT.as_secs(),
+            CONTROL_STORE_TCP_USER_TIMEOUT.as_secs(),
+            CONTROL_STORE_KEEPALIVE_IDLE.as_secs(),
+            CONTROL_STORE_KEEPALIVE_INTERVAL.as_secs(),
+            CONTROL_STORE_KEEPALIVE_RETRIES,
+        )
+    }
+}
+
+/// Client destruction uses the same bounded worker set as queries. This Drop
+/// only schedules that work when it runs on Tokio; it never joins a new OS
+/// thread or blocks a runtime worker on the synchronous driver's runtime.
 impl Drop for Store {
     fn drop(&mut self) {
         if let Some(lanes) = CONTROL_STORE_LANES.get() {
@@ -359,10 +480,12 @@ impl Drop for Store {
                 }
             }
         }
-        if let Ok(guard) = self.client.get_mut() {
-            if let Some(client) = guard.take() {
-                off_runtime(move || drop(client));
-            }
+        let guard = match self.client.get_mut() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(client) = guard.take() {
+            drop_on_normal_executor(client);
         }
     }
 }
@@ -409,8 +532,11 @@ pub enum SignupGrantState {
     Applied,
 }
 
-pub(super) fn internal(e: impl std::fmt::Display) -> ApiError {
-    ApiError::internal(e.to_string())
+pub(super) fn internal(error: impl std::fmt::Display + 'static) -> ApiError {
+    if let Some(postgres) = (&error as &dyn Any).downcast_ref::<postgres::Error>() {
+        metrics::record_postgres_error(postgres);
+    }
+    ApiError::internal(error.to_string())
 }
 
 /// Constraint violations (SQLSTATE class 23) and the store's own immutability
@@ -449,9 +575,11 @@ impl Store {
     /// Open and migrate the initial connection without occupying a Tokio
     /// worker. Startup awaits the same bounded executor used by requests.
     pub async fn connect_from_async(dsn: DsnSource, ca_file: Option<String>) -> Result<Self> {
+        let _latency = metrics::RequestTimer::new(metrics::ExecutorKind::Normal);
         execute_on(
             control_store_executor()?,
             CONTROL_STORE_QUEUE_CAPACITY,
+            metrics::ExecutorKind::Normal,
             move || Store::connect_from(&dsn, ca_file.as_deref()),
         )
         .await
@@ -466,18 +594,34 @@ impl Store {
         self: &Arc<Self>,
         operation: impl FnOnce(&Arc<Store>) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        let _latency = metrics::RequestTimer::new(metrics::ExecutorKind::Normal);
         // Admission precedes the async lane wait, so the executor queue plus
         // all per-connection waiters has one process-wide hard bound.
         let admission = try_admit_control_store_work()?;
         let lane = control_store_lane(self);
-        let lane_permit = lane
-            .acquire_owned()
-            .await
-            .map_err(|_| ApiError::unavailable("control-store connection lane is shutting down"))?;
+        let lane_permit =
+            match tokio::time::timeout(CONTROL_STORE_LANE_ACQUIRE_TIMEOUT, lane.acquire_owned())
+                .await
+            {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) => {
+                    return Err(ApiError::unavailable(
+                        "control-store connection lane is shutting down",
+                    ));
+                }
+                Err(_) => {
+                    metrics::record_lane_acquire_timeout();
+                    return Err(ApiError::unavailable(format!(
+                        "control-store connection lane was unavailable for {} seconds",
+                        CONTROL_STORE_LANE_ACQUIRE_TIMEOUT.as_secs()
+                    )));
+                }
+            };
         let store = Arc::clone(self);
         execute_on(
             control_store_executor()?,
             CONTROL_STORE_QUEUE_CAPACITY,
+            metrics::ExecutorKind::Normal,
             move || {
                 let _admission = admission;
                 let _lane = lane_permit;
@@ -502,9 +646,24 @@ impl Store {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
+                    let _latency = metrics::RequestTimer::new(metrics::ExecutorKind::Normal);
                     let lane = control_store_lane(&store);
-                    let Ok(lane_permit) = lane.acquire_owned().await else {
-                        return;
+                    let lane_permit = match tokio::time::timeout(
+                        CONTROL_STORE_LANE_ACQUIRE_TIMEOUT,
+                        lane.acquire_owned(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(permit)) => permit,
+                        Ok(Err(_)) => return,
+                        Err(_) => {
+                            metrics::record_lane_acquire_timeout();
+                            tracing::warn!(
+                                timeout_seconds = CONTROL_STORE_LANE_ACQUIRE_TIMEOUT.as_secs(),
+                                "control-store cancellation cleanup timed out acquiring its lane"
+                            );
+                            return;
+                        }
                     };
                     let result = execute_on(
                         match control_store_executor() {
@@ -517,6 +676,7 @@ impl Store {
                             }
                         },
                         CONTROL_STORE_QUEUE_CAPACITY,
+                        metrics::ExecutorKind::Normal,
                         move || {
                             let _admission = admission;
                             let _lane = lane_permit;
@@ -538,9 +698,12 @@ impl Store {
                         operation(&store);
                     })
                     .map_err(|error| match error {
-                        executor::SubmitError::Full => ApiError::unavailable(format!(
-                            "control-store queue is full (capacity {CONTROL_STORE_QUEUE_CAPACITY})"
-                        )),
+                        executor::SubmitError::Full => {
+                            metrics::record_rejection(metrics::RejectionKind::NormalQueue);
+                            ApiError::unavailable(format!(
+                                "control-store queue is full (capacity {CONTROL_STORE_QUEUE_CAPACITY})"
+                            ))
+                        }
                         executor::SubmitError::Shutdown => {
                             ApiError::unavailable("control-store executor is shutting down")
                         }
@@ -567,7 +730,10 @@ impl Store {
         let mut guard = self.client.lock().unwrap();
         let client: &mut Option<Client> = &mut guard;
         off_runtime(move || {
-            if client.as_ref().is_none_or(Client::is_closed) {
+            if client.as_ref().is_none_or(|client| client.is_closed()) {
+                // Retire the dead socket before opening its replacement so
+                // the one-connection lane never transiently owns two FDs.
+                drop(client.take());
                 match schema::connect_client(&self.dsn, self.ca_file.as_deref()) {
                     Ok(mut fresh) => {
                         if let Err(error) = configure_session(&mut fresh) {
@@ -598,12 +764,18 @@ impl Store {
     }
 }
 
+pub(crate) fn metrics_snapshot(store: &Store) -> metrics::StoreMetricsSnapshot {
+    metrics::snapshot(store)
+}
+
 pub(crate) async fn execute_leadership<T: Send + 'static>(
     operation: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
+    let _latency = metrics::RequestTimer::new(metrics::ExecutorKind::Leadership);
     execute_on(
         control_store_leadership_executor()?,
         CONTROL_STORE_LEADERSHIP_QUEUE_CAPACITY,
+        metrics::ExecutorKind::Leadership,
         operation,
     )
     .await
@@ -612,11 +784,16 @@ pub(crate) async fn execute_leadership<T: Send + 'static>(
 async fn execute_on<T: Send + 'static>(
     executor: &'static executor::BlockingExecutor,
     queue_capacity: usize,
+    kind: metrics::ExecutorKind,
     operation: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
     let execution = match executor.try_execute(operation) {
         Ok(execution) => execution,
         Err(executor::SubmitError::Full) => {
+            metrics::record_rejection(match kind {
+                metrics::ExecutorKind::Normal => metrics::RejectionKind::NormalQueue,
+                metrics::ExecutorKind::Leadership => metrics::RejectionKind::LeadershipQueue,
+            });
             let snapshot = executor.snapshot();
             tracing::warn!(
                 active = snapshot.active,

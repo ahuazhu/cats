@@ -36,7 +36,7 @@ impl SingletonRole {
 /// connection on every election poll.
 pub(crate) struct SingletonSession {
     client: Option<Client>,
-    _connection_budget: ConnectionBudgetPermit,
+    connection_budget: Option<ConnectionBudgetPermit>,
     role: SingletonRole,
     acquired: bool,
 }
@@ -77,8 +77,14 @@ impl SingletonSession {
 
 impl Drop for SingletonSession {
     fn drop(&mut self) {
-        if let Some(client) = self.client.take() {
-            off_runtime(move || drop(client));
+        match (self.client.take(), self.connection_budget.take()) {
+            (Some(client), Some(connection_budget)) => {
+                drop_on_leadership_executor((client, connection_budget));
+            }
+            (client, connection_budget) => {
+                drop(client);
+                drop(connection_budget);
+            }
         }
     }
 }
@@ -91,13 +97,19 @@ impl Drop for SingletonSession {
 /// process-local registry or a persisted wall-clock lease.
 pub struct OciDeploymentLease {
     client: Option<Client>,
-    _connection_budget: ConnectionBudgetPermit,
+    connection_budget: Option<ConnectionBudgetPermit>,
 }
 
 impl Drop for OciDeploymentLease {
     fn drop(&mut self) {
-        if let Some(client) = self.client.take() {
-            off_runtime(move || drop(client));
+        match (self.client.take(), self.connection_budget.take()) {
+            (Some(client), Some(connection_budget)) => {
+                drop_on_leadership_executor((client, connection_budget));
+            }
+            (client, connection_budget) => {
+                drop(client);
+                drop(connection_budget);
+            }
         }
     }
 }
@@ -107,14 +119,10 @@ impl Store {
         let connection_budget = acquire_singleton_connection_budget()?;
         let mut client =
             off_runtime(|| schema::connect_client(&self.dsn, self.ca_file.as_deref()))?;
-        off_runtime(|| {
-            client
-                .batch_execute("SET statement_timeout = '5s'; SET lock_timeout = '2s'")
-                .map_err(internal)
-        })?;
+        off_runtime(|| configure_session(&mut client))?;
         Ok(SingletonSession {
             client: Some(client),
-            _connection_budget: connection_budget,
+            connection_budget: Some(connection_budget),
             role,
             acquired: false,
         })
@@ -143,7 +151,7 @@ impl Store {
         if acquired {
             Ok(Some(OciDeploymentLease {
                 client: Some(client),
-                _connection_budget: connection_budget,
+                connection_budget: Some(connection_budget),
             }))
         } else {
             off_runtime(move || drop(client));

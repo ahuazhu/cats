@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::Arc;
 
 pub(super) async fn register_node(
     State(state): State<AppState>,
@@ -499,17 +500,44 @@ pub(super) async fn prometheus_metrics(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    check_admin_auth(&state, &headers).await?;
-    let overview = state
-        .store
-        .execute(|store| monitoring_snapshot(store))
-        .await?;
+    check_metrics_auth(&state, &headers).await?;
+    let store_metrics = crate::store::metrics_snapshot(&state.store);
     let mut body = String::new();
+    store_metrics.append_prometheus(&mut body);
     macro_rules! metric {
         ($name:expr, $value:expr) => {
             body.push_str(&format!("{} {}\n", $name, $value));
         };
     }
+    // The executor gauges above are captured before touching PostgreSQL and
+    // are the primary diagnostic when it is unhealthy. Retain the existing
+    // fleet metrics when the lane is healthy, but make them optional behind a
+    // short scrape-only deadline. Cancelling a queued Store future removes
+    // its closure; a call already started keeps its lane until the configured
+    // physical/statement deadline closes it.
+    let database_snapshot = tokio::time::timeout(Duration::from_millis(250), {
+        let store = Arc::clone(&state.store);
+        async move {
+            store
+                .execute(|store| Ok((monitoring_snapshot(store)?, store.list_node_summaries()?)))
+                .await
+        }
+    })
+    .await
+    .ok()
+    .and_then(|result| result.ok());
+    let Some((overview, summaries)) = database_snapshot else {
+        metric!("cats_control_plane_metrics_database_snapshot_available", 0);
+        return Ok((
+            [(
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
+            body,
+        )
+            .into_response());
+    };
+    metric!("cats_control_plane_metrics_database_snapshot_available", 1);
     metric!("cats_control_plane_cats_total", overview.cats.total);
     metric!("cats_control_plane_cats_running", overview.cats.running);
     metric!("cats_control_plane_cats_suspended", overview.cats.suspended);
@@ -578,10 +606,6 @@ pub(super) async fn prometheus_metrics(
     if let Some(used) = overview.usage.disk_used_bytes {
         metric!("cats_control_plane_host_disk_used_bytes", used);
     }
-    let summaries = state
-        .store
-        .execute(|store| store.list_node_summaries())
-        .await?;
     for summary in summaries {
         let node_id = summary
             .node
