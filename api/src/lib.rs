@@ -4,13 +4,14 @@
 //! - resource wire types served by the control plane (`resources`, `requests`)
 //! - lifecycle states per ADR-0002 (`resources::CatState` and friends)
 //! - control-plane -> node-agent job protocol (`nodejob`)
+//! - target runtime reconciliation protocol (`runtime_reconciliation`)
 //! - guest agent protocol frames (`guest`)
 //! - blockd host-control protocol and observability DTOs (`blockd`)
 //! - ChunkStore protocol constants per ADR-0003 (`chunk`)
 //! - error codes shared across HTTP surfaces (`error`)
 //!
-//! It must stay dependency-light; encoding/hashing implementations live in
-//! `cats-blockd`.
+//! It must stay dependency-light. Encoding and hashing live here only when
+//! they are themselves part of a shared wire contract.
 
 pub mod auth;
 pub mod billing;
@@ -25,3 +26,4 @@ pub mod oci;
 pub mod requests;
 pub mod resources;
 pub mod route_grant;
+pub mod runtime_reconciliation;
