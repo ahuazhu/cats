@@ -103,6 +103,14 @@ class BuildHostBoundaryTests(unittest.TestCase):
         self.assertEqual(build_path.split(":")[-1], "/usr/sbin")
         self.assertEqual(len(build_path.split(":")), len(set(build_path.split(":"))))
 
+        toolchain_lock = json.loads(
+            self.text("bootstrap/toolchain-lock-v1.json")
+        )
+        self.assertEqual(
+            toolchain_lock["apt_snapshot"]["packages"]["e2fsprogs"],
+            "1.47.0-2.4~exp1ubuntu4.1",
+        )
+
         runner = self.text("bootstrap/run-build.sh")
         self.assertIn(f"PATH={build_path}", runner)
         self.assertIn("RUST_TEST_THREADS=4", runner)

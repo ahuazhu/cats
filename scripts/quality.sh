@@ -20,6 +20,20 @@ usage() {
 
 prepare_native_test_process() {
   local hard_nofile
+  local native_tool
+
+  if [[ "$(uname -s)" == Linux ]]; then
+    case ":$PATH:" in
+      *:/usr/sbin:*) ;;
+      *) export PATH="$PATH:/usr/sbin" ;;
+    esac
+    for native_tool in mkfs.ext4 debugfs e2fsck; do
+      command -v "$native_tool" >/dev/null 2>&1 || {
+        echo "Linux native tests need e2fsprogs: $native_tool is not in PATH" >&2
+        return 1
+      }
+    done
+  fi
 
   hard_nofile="$(ulimit -Hn)" || return 1
   ulimit -Sn "$hard_nofile" || {

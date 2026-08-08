@@ -120,7 +120,7 @@
         "management_ready_gate": "ssm-online",
         "build_ready_path": "/var/lib/cats-build/readiness-v1.json",
         "bootstrap_sha256": "7f1d08980e68ee961e56e7ae52c271e48dafb8e60ed33fbf6f3079b5e9a3f575",
-        "toolchain_lock_sha256": "5884719764338b75cb42012ad97c48df9a035435b0f5de706af9be4058fd220c",
+        "toolchain_lock_sha256": "4e4e702f79598e1cff72d6304127287f979088fa0c25c7d770fbca4f85582a9f",
         "components_sha256": {
           "bootstrap": "7f1d08980e68ee961e56e7ae52c271e48dafb8e60ed33fbf6f3079b5e9a3f575",
         "checkout": "060f6eb1327aa3de6dd938b0d33889f62d2643979eb4e24b3757d5da472eeb3b",
@@ -130,9 +130,9 @@
           "readiness": "350f58e7da88dbd4765f6eb1d40e60e39f1e49356cc9a5d16b2ce6143bcf3800",
           "run_build": "7b4d425e2fd19608c17d62661924ec71e78198eb3fc05b6407a72aaae61417a1",
         "stage_output": "13aee4e5a106072cd2ef4cf43ea3f3e95d57d93d4140024ca40a93f52ed60a7a",
-          "toolchain_lock": "5884719764338b75cb42012ad97c48df9a035435b0f5de706af9be4058fd220c"
+          "toolchain_lock": "4e4e702f79598e1cff72d6304127287f979088fa0c25c7d770fbca4f85582a9f"
         },
-        "payload_sha256": "a3eaaf9111f4922fd8af5161a5f6180cc4ce8cca8896513e0ad3232497371832",
+        "payload_sha256": "8bf764e568d390a1f80fb5c4487f204c5295979e3cfb37033c95ddbe8544a602",
         "apt_snapshot_id": "20260801T000000Z"
       },
       "source_policy": {

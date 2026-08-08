@@ -471,7 +471,7 @@ fn linux_quality_gate_installs_the_postgres_probe_runtime() {
 
 #[cfg(unix)]
 #[test]
-fn quality_gate_removes_the_native_test_soft_nofile_cap_and_bounds_threads() {
+fn quality_gate_declares_native_linux_test_resources() {
     let root = workspace_root();
     let fixture = tempfile::tempdir().expect("quality process-limit fixture");
     let fake_cargo = fixture.path().join("cargo");
@@ -482,6 +482,7 @@ fn quality_gate_removes_the_native_test_soft_nofile_cap_and_bounds_threads() {
 set -euo pipefail
 printf 'soft=%s\n' "$(ulimit -Sn)" > "$CATS_QUALITY_CAPTURE"
 printf 'hard=%s\n' "$(ulimit -Hn)" >> "$CATS_QUALITY_CAPTURE"
+printf 'path=%s\n' "$PATH" >> "$CATS_QUALITY_CAPTURE"
 printf 'args=%s\n' "$*" >> "$CATS_QUALITY_CAPTURE"
 "#,
     )
@@ -491,6 +492,20 @@ printf 'args=%s\n' "$*" >> "$CATS_QUALITY_CAPTURE"
         .permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&fake_cargo, permissions).expect("make fake cargo executable");
+    for (name, body) in [
+        ("uname", "#!/bin/sh\nprintf 'Linux\\n'\n"),
+        ("mkfs.ext4", "#!/bin/sh\nexit 0\n"),
+        ("debugfs", "#!/bin/sh\nexit 0\n"),
+        ("e2fsck", "#!/bin/sh\nexit 0\n"),
+    ] {
+        let path = fixture.path().join(name);
+        std::fs::write(&path, body).expect("write native-tool fixture");
+        let mut permissions = std::fs::metadata(&path)
+            .expect("native-tool fixture metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("make native-tool fixture executable");
+    }
 
     let inherited_path = std::env::var("PATH").expect("PATH");
     let output = Command::new("bash")
@@ -522,6 +537,11 @@ printf 'args=%s\n' "$*" >> "$CATS_QUALITY_CAPTURE"
         .expect("hard nofile capture");
     assert_eq!(soft, hard);
     assert_ne!(soft, "1024");
+    let path = captured
+        .lines()
+        .find_map(|line| line.strip_prefix("path="))
+        .expect("PATH capture");
+    assert!(path.split(':').any(|entry| entry == "/usr/sbin"));
     assert!(captured.contains("args=test --workspace --locked -- --test-threads=4\n"));
 }
 

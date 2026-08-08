@@ -77,12 +77,13 @@ The job environment grants Git trust only to the exact frozen
 repository ownership, persists a global/system Git setting or uses a wildcard
 `safe.directory`; filesystem permissions remain the write-authority boundary.
 
-`quality.sh test/full` removes a low inherited soft open-file cap by raising it
-to the job's existing hard limit, and defaults Rust's test harness to four
-threads. The isolated runner retains the job hard ceiling; the Docker Linux
-gate makes the same no-soft-cap and bounded-thread contract explicit. This
-keeps high-core qualification Hosts deterministic without changing Host-wide
-limits or hiding the setting in an operator shell.
+`quality.sh test/full` owns the native test-process contract. It removes a low inherited soft
+open-file cap by raising it to the job's existing hard limit and fixes Rust's test harness at four
+threads. On Linux it also adds the standard `/usr/sbin` lookup path without changing the inherited
+tool priority, then requires the `mkfs.ext4`, `debugfs` and `e2fsck` tools supplied by the pinned
+`e2fsprogs` package. The isolated runner retains the job hard ceiling; the Docker Linux gate makes
+the same resource and package contract explicit. This keeps high-core qualification Hosts
+deterministic without changing Host-wide limits or hiding settings in an operator shell.
 
 The candidate uid 2000 may write a regular file only inside its per-job `output/` directory. After
 the job exits, the root orchestrator freezes that output as root-owned and non-writable and records
@@ -113,3 +114,8 @@ Poll that command with `get-command-invocation` until a service terminal state. 
 `aws ssm wait command-executed` window is shorter than a normal full build. A local polling timeout,
 expired login or failed readiness probe retains the command ID and stops the run; it never submits a
 second build or starts/replaces infrastructure.
+
+`AWS-RunShellScript` starts commands with `/bin/sh`. A diagnostic that needs Bash semantics must
+enter `/bin/bash` explicitly; a failure before the calibrated positive control says nothing about
+the Host state. Controller-side orchestration also uses an explicit Bash shell so zsh reserved names
+cannot change command behavior.
