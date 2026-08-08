@@ -72,6 +72,11 @@ workstations and would require handing the candidate build a daemon socket.
 The trusted bootstrap/readiness container probes use bridge networking, and
 the host FORWARD policy denies IMDS.
 
+The job environment grants Git trust only to the exact frozen
+`/srv/cats-build/source` path and disables optional Git locks. It never changes
+repository ownership, persists a global/system Git setting or uses a wildcard
+`safe.directory`; filesystem permissions remain the write-authority boundary.
+
 The candidate uid 2000 may write a regular file only inside its per-job `output/` directory. After
 the job exits, the root orchestrator freezes that output as root-owned and non-writable and records
 the Host-local immutable receipt. `cats-run-build` does not publish it. To retain a selected frozen

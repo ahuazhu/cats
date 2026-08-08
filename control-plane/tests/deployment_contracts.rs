@@ -466,6 +466,36 @@ fn linux_quality_gate_installs_the_postgres_probe_runtime() {
     }
 }
 
+#[test]
+fn quality_gate_trusts_only_the_exact_source_root_for_git_provenance() {
+    let quality = read_workspace_file("scripts/quality.sh");
+
+    for boundary in [
+        "GIT_OPTIONAL_LOCKS=0 git",
+        r#"-c safe.directory="$REPO_ROOT""#,
+        r#"-c core.hooksPath=/dev/null"#,
+        r#"-c core.fsmonitor=false"#,
+        r#"-C "$REPO_ROOT""#,
+    ] {
+        assert!(quality.contains(boundary));
+    }
+    for command in [
+        "source_git rev-parse --show-toplevel",
+        "source_git rev-parse HEAD",
+        "source_git status --porcelain=v1 --untracked-files=all",
+        "source_git diff --binary HEAD --",
+        "source_git ls-files --others --exclude-standard -z",
+        "source_git hash-object --stdin",
+    ] {
+        assert!(
+            quality.contains(command),
+            "source provenance must execute {command} through the exact-root Git wrapper"
+        );
+    }
+    assert!(!quality.contains("safe.directory=*"));
+    assert!(!quality.contains("git config --global"));
+}
+
 #[cfg(unix)]
 #[test]
 fn quality_gate_accepts_complete_inherited_provenance_from_any_cwd() {

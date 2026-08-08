@@ -18,21 +18,30 @@ usage() {
   echo "usage: $0 {provenance|fmt|skills|deps|check|build|clippy|test|doc|fast|full|linux}" >&2
 }
 
+source_git() {
+  GIT_OPTIONAL_LOCKS=0 git \
+    -c safe.directory="$REPO_ROOT" \
+    -c core.hooksPath=/dev/null \
+    -c core.fsmonitor=false \
+    -C "$REPO_ROOT" \
+    "$@"
+}
+
 source_fingerprint() {
   local head
   local tracked
   local untracked
 
-  head="$(git rev-parse HEAD)" || return 1
-  tracked="$(git diff --binary HEAD -- | git hash-object --stdin)" || return 1
+  head="$(source_git rev-parse HEAD)" || return 1
+  tracked="$(source_git diff --binary HEAD -- | source_git hash-object --stdin)" || return 1
   untracked="$({
-    git ls-files --others --exclude-standard -z
+    source_git ls-files --others --exclude-standard -z
   } | while IFS= read -r -d '' path; do
     printf 'untracked\0%s\0' "$path"
-    git hash-object -- "$path" || exit 1
-  done | git hash-object --stdin)" || return 1
+    source_git hash-object -- "$path" || exit 1
+  done | source_git hash-object --stdin)" || return 1
 
-  printf '%s\0%s\0%s\n' "$head" "$tracked" "$untracked" | git hash-object --stdin
+  printf '%s\0%s\0%s\n' "$head" "$tracked" "$untracked" | source_git hash-object --stdin
 }
 
 validate_source_provenance() {
@@ -74,9 +83,9 @@ load_source_provenance() {
   fi
 
   local status
-  SOURCE_PROVENANCE_ROOT="$(git rev-parse --show-toplevel)" || return 1
-  SOURCE_PROVENANCE_HEAD="$(git rev-parse HEAD)" || return 1
-  status="$(git status --porcelain=v1 --untracked-files=all)" || return 1
+  SOURCE_PROVENANCE_ROOT="$(source_git rev-parse --show-toplevel)" || return 1
+  SOURCE_PROVENANCE_HEAD="$(source_git rev-parse HEAD)" || return 1
+  status="$(source_git status --porcelain=v1 --untracked-files=all)" || return 1
   SOURCE_PROVENANCE_DIRTY=false
   if [[ -n "$status" ]]; then
     SOURCE_PROVENANCE_DIRTY=true
