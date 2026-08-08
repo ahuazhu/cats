@@ -5,6 +5,7 @@
 //! in adapter crates and are selected only by process composition roots.
 
 pub mod adapter;
+pub mod authority;
 pub mod blob;
 pub mod metadata;
 
