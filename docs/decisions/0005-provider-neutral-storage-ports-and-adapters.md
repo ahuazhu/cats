@@ -37,6 +37,13 @@ AWS S3 实现都位于 `cats-blockd` crate；控制面为了使用元数据契�
 6. 所有 adapter 必须满足同一语义契约，尤其是 immutable put、幂等 delete、
    durable FLUSH、generation/owner/epoch/expiry 原子 CAS 和 stale epoch fail-closed。
    换 adapter 不得改变 Guest 的 virtio block/ext4 接口、磁盘格式或生命周期语义。
+7. `BlobStore`的destructive prefix enumeration是完成边界，不是best-effort inventory：一次从prefix
+   起点开始的完整LIST若在相关PUT/DELETE成功返回后才开始，必须线性地包含这些已完成PUT并排除这些
+   已完成DELETE。在调用方已阻止新writer且等待所有in-flight PUT完成或永久失败后，完整LIST返回empty
+   才能证明prefix为空。可能返回stale-empty或漏掉已完成PUT的adapter不符合port，不能用于volume delete。
+   同一可复用adapter contract suite必须先成功PUT已知key作为正样本，再覆盖delayed visibility、分页、
+   并发完成点和empty-after-delete；注入stale-empty的fake必须在这个suite中被判定不合格。`list()`成功返回的
+   `[]`本身不携带freshness proof，上层不能区分真实empty与违规adapter的stale-empty，也不得声称运行时可识别。
 
 ## 与既有决定的关系
 
@@ -52,6 +59,8 @@ AWS S3 实现都位于 `cats-blockd` crate；控制面为了使用元数据契�
 
 - 新增 provider 时，只需新增 adapter crate、契约测试和 composition-root 注册；
   不修改 `ChunkEngine`、控制器、NodeJob 或 Guest 协议。
+- provider声称PUT/DELETE成功却不能满足上述后继LIST可见性时，adapter必须等待、重验或明确失败；核心
+  不接受“最终会一致”作为成功语义，也不新增provider-specific sweep proof。
 - 通用 CLI 参数不再出现 bucket、region、endpoint、SQLite path 等产品字段；这些
   字段仅作为选中 adapter 的 opaque options。
 - 静态注册意味着新增 adapter 需要重新构建二进制。这是 V1 有意选择的更小攻击

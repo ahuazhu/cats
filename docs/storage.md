@@ -4,6 +4,7 @@
 - 精确协议：[cats-blockd 协议规格](specs/blockd-protocol.md)、
   [Volume Authority 与磁盘生命周期](specs/volume-authority.md)
 - 关键决定：[ADR-0003](decisions/0003-direct-s3-chunkstore-backend.md)、
+  [ADR-0005](decisions/0005-provider-neutral-storage-ports-and-adapters.md)、
   [ADR-0016](decisions/0016-delta-pack-page-granular-commits.md)、
   [ADR-0017](decisions/0017-golden-root-shared-base-images.md)、
   [ADR-0022](decisions/0022-relaxed-local-first-dual-watermark.md)、
@@ -34,6 +35,9 @@ cats-blockd
 - Guest 不知道 Chunk、对象存储或 PostgreSQL，也不持有这些系统的凭证。
 - NBD 与 vhost-user-blk 只改变 Host 到 VMM 的传输，不改变 FLUSH、格式或 fencing 语义。
 - `cats-storage` 定义 provider-neutral 的 `BlobStore` 和 `MetadataStore` 契约。AWS S3 与 PostgreSQL 是集群形态；file 与 SQLite 适配器用于开发、测试和单机实验，不能组成跨节点持久层。
+- `BlobStore` destructive LIST必须对已完成PUT/DELETE线性可见。volume delete只有在阻止新writer、等待
+  所有in-flight PUT完成或永久失败，并从prefix起点完整LIST到empty后才能提交completion；stale-empty
+  adapter不合格。精确定义与adapter contract tests见[ADR-0005](decisions/0005-provider-neutral-storage-ports-and-adapters.md)。
 - 系统不是 Guest 可见的分布式文件系统，也不会为一次小写上传整块虚拟盘。
 
 ## 数据模型
@@ -114,8 +118,13 @@ Metadata fencing只阻止旧写者发布Root，不能证明旧VMM已停止。跨
 ## RootDisk、PersistentDisk 与 Golden Root
 
 - RootDisk与Cat同生命周期；PersistentDisk独立存在。PersistentDisk创建时预定ext4 UUID和一次性
-  initialization token。Guest Agent格式化后必须先让blockd达到`R == L`，Control Store才可写
-  `Initialized`；正确UUID和mount path都Ready后，Cat才可Running。
+  initialization token。Disk与Volume全局一对一，Root与同Workspace Cat一对一，PersistentDisk同时
+  最多被一个current完整Desired引用；product path只用immutable disk ID。Guest Agent格式化后必须再次
+  probe exact UUID并让blockd达到`R == L`；Control Store先锁current AgentSession/highest accepted head，
+  再逐字段匹配observation/checkpoint/owner/epoch/head后才写`Initialized`。正确UUID和mount path都Ready后，
+  Cat才可Running；session replacement或新observation与初始化竞争同一锁前缀。
+- Cat create在一个PG commit写Cat、current完整Desired、runtime Operation、唯一Root Disk、generation-zero/
+  Unowned Volume和exact API result。Root没有Persistent initialization状态或第二个Disk Operation。
 - PersistentDisk只能在Cat稳定Cold时加入或移出完整磁盘集合。DiskSnapshot和restore也只在
   Cold/unowned时执行。volume容量创建后不可变；需要其他容量时新建Disk并在Guest内复制数据。
 - 普通Stop/Cold、Warm和迁移对两类保留盘执行相同final drain。
@@ -153,8 +162,17 @@ DiskSnapshot只在Cold/unowned时创建一条精确包含disk/volume/size/genera
 一个新的、单调递增generation；不支持clone或跨volume COW。
 
 Volume删除先进入`Deleting(delete_id)`并提高epoch，再清对象。普通卷要求Cold、`R == L`且owner
-为空；disposable Root可以消费精确删除授权从Owned直接进入Deleting。lease TTL、控制面缺行或
+为空；Root normal begin只允许同一delete ID的current-only路径：stable Cold Destroy同事务写
+Deleted/Operation/begin/API result，或current Deleted observation证明exact release、Unowned和`R == L`。
+直接Root Disk DELETE和live Cold direct delete均拒绝。disposable `R < L` Root可以消费精确删除
+授权从Owned直接进入Deleting；Active HostFence下任何仍Owned Root（最后R==L或L未知也包括）同样可授权，
+因为Node已无法release。release与derive用VolumeRecord锁后重验保证只有一条分支提交。lease TTL、控制面缺行或
 本地目录缺失都不是删除证明。
+
+normal begin前必须停止blockd并join upload workers；HostFenceEvent必须由provider cutoff阻止旧Host发起新
+PUT，并等待已接受PUT成功可见或永久失败。sweeper幂等delete后用符合ADR-0005强一致合同的完整prefix LIST确认
+empty，再执行exact PG completion CAS；weak/stale LIST或暂停的late PUT都会保持Deleting。receipt提交后
+再次LIST仍须empty。这不是object store与PG的两阶段事务，也不需要job/claim/proof row。
 
 卷GC和volume删除永不进入`images/`。Golden Image第一版不自动或人工回收。
 

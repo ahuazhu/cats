@@ -48,10 +48,11 @@ DesiredRuntimeSpec(revision, placement)
 Volume 的精确状态机由 [Volume Authority](../specs/volume-authority.md) 定义；Runtime 只编排
 它的窄acquire/publish/release/takeover/delete接口。
 
-API mutation的通用幂等主键是`(authenticated workspace, canonical route, Idempotency-Key)`，并绑定
-canonical request fingerprint和不可变成功/失败结果。同key异payload在资源锁前失败；同key同payload
-只读原result。首次事务先取得key reservation，再按各domain的固定锁序执行并在同一commit写result，
-不落持久Pending。V1已提交result不随resource或Operation删除而GC。
+只有能把业务rows与结果在唯一Control PostgreSQL事务中原子提交的Workspace product mutation使用
+`ApiIdempotencyResult`；精确scope、request envelope、fingerprint和重放合同以
+[Volume Authority §3.3](../specs/volume-authority.md#33-workspace-product-api-idempotency)为权威。
+Account/WorkOS、Billing/Stripe、fleet/admin、Node/internal、webhook和external-first route只使用已有
+domain identity，不伪造system workspace或双重幂等。router gate要求每条mutation恰好归入其中一类。
 
 heartbeat 只追加 observation，不写 Desired。Starting、Suspending、Warming、Stopping 是
 observation/checkpoint 的 step，不是控制面的稳定状态或新 authority。
@@ -78,11 +79,15 @@ Agent 必须先取得固定 Host state path 的 kernel 排他锁。它在注册 
 完整 VM shape、磁盘、Endpoint 和 transition policy。revision、placement epoch、runtime
 incarnation、attachment epoch 和 route epoch 各自防止对应 ABA。
 
-一次 mutation 在同一 PostgreSQL 事务写完整 spec、精确绑定它的 Operation和通用幂等result。提交前必须完成
+一次covered product mutation在同一 PostgreSQL 事务写完整 spec、精确绑定它的 Operation和幂等result。提交前必须完成
 合法性、Cold-only 与 placement/capacity 检查；没有 placement 时不创建 revision。每次 placement
 改变也是一个新 revision 和 Operation，没有旁路调度权威。新 revision 原子 Supersede 旧的
 Pending Operation。已选 Node 若明确拒绝不可满足的容量/能力，当前 Operation Failed；重新调度
 只能创建提高 placement epoch 的新系统 revision。
+
+Cat create把Cat、current完整Desired、runtime Operation、generation-zero且Unowned的唯一Root
+Disk/Volume和exact API result放在同一PG commit；不留下半套identity。Root没有Persistent
+initialization状态或第二个Disk Operation。
 
 Operation 只有在 current desired、observation revision、placement 和完整 postcondition 全部
 匹配时才成功；顶层observation Node、Operation placement、applied desired placement和current
@@ -118,7 +123,7 @@ volume authorization、receipt和disposition仍须逐卷闭合。
   `PreconditionFailed(MustBeCold)`；调用方先提交普通 Cold revision，成功后再以新请求提交完整
   配置。volume容量创建后不可变，不提供resize；DiskSnapshot只在stable Cold/unowned时创建，
   单一`DiskSnapshotRecord`同时是产品资源和GC live-root，只支持同盘restore。Disk delete遇到live
-  record时返回`SnapshotInUse`。Snapshot create/delete/restore使用通用`ApiIdempotencyResult`与
+  record时返回`SnapshotInUse`。Snapshot create/delete/restore使用covered `ApiIdempotencyResult`与
   Volume Authority变化同事务结算；重放只读result，Disk delete不隐式cascade。
 - 计划跨 Node 迁移同样只有两个普通 revision：源 placement 收敛到 Cold；成功后新 revision
   提高 placement epoch 并在目标 Node 恢复；整个过程始终只有当前 Desired 是 authority。
@@ -186,6 +191,11 @@ tombstone/placement及接受observation时从锁定NodeIdentity复制的immutabl
 事务匹配该Host event，不复制到event，也不依赖index最近的boot/session。
 它是 Host 级事实，不是 volume 写权限。
 
+`isolated`和`host_destroyed`还共享同一个provider fence success语义：旧Host principal不能再发起新的
+BlobStore PUT，且cutoff前已被接受的PUT已经成功并对后继强一致LIST可见，或已永久失败。adapter返回前
+必须跨过这个可验证barrier；单独power/network隔离、异步IAM revoke或进程消失不够。不支持者保持Blocked，
+Deleting中的对象清理也不得写completion receipt；这不增加event字段或第二个proof authority。
+
 HostDestroyed永不Rejoined。没有tombstone/recovery引用且全部authorization已terminal、逐卷disposition
 闭合后，可按审计策略回收逐卷恢复记录；compact event/receipt仍按现有Operation/审计引用保留。
 
@@ -208,10 +218,17 @@ VolumeRecord已删除时验证精确`DeleteCompletionReceipt`。未消费授权�
 Plane接受HostRejoinProof并把event持久转为Rejoined后才恢复网络，此后未消费授权不能首次生效，
 已消费授权仍可幂等读取原receipt。
 
+Root direct Disk DELETE始终拒绝。对current stable Cold且Root已`R == L`、Unowned的Cat，covered Destroy
+事务可原子验证current session/observation并写Deleted Desired/Pending Operation、normal BeginDelete与API
+result；否则Node在current Deleted revision下以同一delete ID完成exact `R == L` cleanup/release，Control
+Plane只凭新的current Unowned observation normal begin。两条normal路径都不保留历史Cold evidence。
+
 disposable Root放弃`R < L`tail也不绕过volume authority。Control Plane只为当前Deleted Desired
 和精确stop observation或Active HostFenceEvent建立`DisposableRootDeleteAuthorization`；
 MetadataStore把精确Owned卷直接CAS到Deleting、清owner并提高epoch。成功后才可删除授权lineage，
-PersistentDisk不能使用。
+PersistentDisk不能使用。可达Host的`R == L`先release，`R < L`才授权；Active HostFenceEvent下任何仍Owned
+Root都可授权，包括最后`R == L`或L未知，不能等待已不可达Node release。release与derive以VolumeRecord
+串行并在锁后重验，先release则derive回滚，先derive则release拒绝。
 
 ## 控制面运行方式
 

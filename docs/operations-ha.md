@@ -61,11 +61,12 @@ acquire deadline、connect/query/lock/transaction timeout、单批rows/bytes和c
 3. controller只分页扫描current state，按稳定key排序，每轮有work/time budget；notify只负责提前
    唤醒。没有无界in-memory backlog，也不靠历史command重建意图。
 
-API mutation先完成调用者认证、当前Workspace membership和route permission检查，再取得
+只有能与业务rows在唯一Control PostgreSQL事务原子提交的Workspace product mutation使用以下result；
+它先完成调用者认证、当前Workspace membership和route permission检查，再取得
 `(authenticated workspace, canonical route, Idempotency-Key)`的transaction-scoped reservation。
 全局锁DAG是`API key -> HostFenceEvent -> authorization -> VolumeRecord -> Disk/Desired ->
 DiskSnapshotRecord`，不涉及的节点直接跳过，同类多行按稳定ID排序。fingerprint唯一使用
-[Volume Authority §3.3](specs/volume-authority.md#33-唯一-api-idempotency-fingerprint)的domain-separated、
+[Volume Authority §3.3](specs/volume-authority.md#33-workspace-product-api-idempotency)的domain-separated、
 u64-BE length-framed workspace/route/raw path-query/If-Match/raw body bytes；不允许route-local JSON或参数
 归一化。相同fingerprint只读status/content-type/exact response bytes，即使目标资源后来已删除也不先查询它；
 不同fingerprint在资源锁前
@@ -74,6 +75,12 @@ u64-BE length-framed workspace/route/raw path-query/If-Match/raw body bytes；�
 不随resource或Operation删除而GC。request超过route body cap、非identity Content-Encoding和非法
 If-Match在reservation前拒绝；transport/commit结果不明本身不写失败result，最终事务只允许业务+result
 全有或全无，重试按key判定。
+
+router build/startup gate枚举全部mutation：每条恰好归入上述PG result或已有domain协议；Account/WorkOS、
+Billing/Stripe、fleet/admin、Node/internal、webhook与external-first route不使用本row，不伪造system
+workspace或双重幂等。covered route还要求恰好一个1..=512 printable-ASCII key、唯一media type和
+identity/no Content-Encoding；错误envelope在reservation前拒绝。需要精确重放的语义必须由保存的status/
+content-type/body表达，不能依赖未保存的ETag、Location等header。
 
 数据库慢或pool饱和时，readiness、队列拒绝和延迟指标必须先于全局超时告警；Running数据面不因
 controller retry而停止。
@@ -102,11 +109,19 @@ heartbeat缺失、AgentSession过期、EC2状态查询或Gateway不可达都只�
 HostFenceEvent来源的disposable Root删除在上述锁序后继续锁Control rows；同一事务写Consumed receipt，
 把VolumeRecord和Control Disk改为同一Deleting。对象sweep只能在该提交后执行。普通begin-delete也在
 一个PostgreSQL事务同时改变两边；显式Disk delete API在该事务持久化exact 202 result且不创建Operation，
-Root继续由现有Cat Operation驱动。begin与normal acquire锁同一VolumeRecord，只能一方提交。
+Root继续由现有Cat Operation驱动：direct Root Disk DELETE与live Cold拒绝，`R == L` normal begin必须绑定
+同一delete ID；stable Cold fast path同一PG commit写Deleted/Operation/begin/API result，deferred path只在
+current Deleted observation证明exact release、Unowned和`R == L`后begin。`R < L`仍只走authorization。
+Active HostFenceEvent下任何仍Owned Root都可authorization，包括最后`R == L`或L未知；release和derive
+取得同一VolumeRecord锁后fresh重验，不能提交`Unowned + authorization`。
+begin与normal acquire锁同一VolumeRecord，只能一方提交。
 Deleting rows就是level-triggered工作：sweeper只分页扫描
 current rows，不持久job/claim；它幂等delete并从prefix起点re-list到empty，再以一个事务重验exact
 Disk/Volume/delete/head/epoch/last-transition和zero snapshots，写completion receipt并删除两row。失败保持
-Deleting，多实例只有一个compare/CAS可提交；object store与PG之间没有两阶段事务或第二authority。
+Deleting，多实例只有一个compare/CAS可提交；object store与PG之间没有两阶段事务或第二authority。用于
+completion的BlobStore LIST必须对已完成PUT/DELETE线性可见；normal stop先join upload workers，HostFence
+adapter必须在返回/提交event前以provider cutoff阻止新PUT，并等待已经接受的PUT成功可见或永久失败。
+不能完成barrier时保持Deleting；empty之后仍能落地late PUT的adapter/路径不得提交receipt。
 
 旧Host即使恢复供电也持续隔离。它只能以新boot/session进入cordoned rejoin：完成union inventory，
 停止旧VMM/blockd/tap/socket/gate/guard，把旧epoch的`R < L`lineage移入quarantine；随后核对该event
@@ -150,11 +165,16 @@ runbook；禁止以“重启看看”跳过fence或durability proof。
    AdmissionCell/close race、RequireIdle one-shot、Gateway LRU/singleflight/backoff和PostgreSQL双session
    transaction tests。FakeVmm integration注入慢DB、响应丢失、restart/cancel和HTTP/WS transport歧义。
    [Volume Authority §14](specs/volume-authority.md#14-最小验收矩阵)是同一上线门，必须覆盖acquire/
-   release模糊响应、旧lineage、API fingerprint fixed vectors与raw-byte差异、PersistentDisk
-   create/201原子提交、exact Disk role/init、mkfs/Initialized CAS crash、snapshot create/result原子提交及lost response、
+   release模糊响应、旧lineage、API fingerprint fixed vectors与raw-byte差异、mutation分类/key/envelope gate、
+   Root create/Operation/result全有或全无、PersistentDisk create/201原子提交、Disk/Volume和Root/Cat唯一性、
+   exact Disk role/init、AgentSession replacement/observation advance与Initialized CAS双session竞争、snapshot create/result原子提交及lost response、
    create→delete→旧create replay不复活、跨Workspace零副作用、`DiskSnapshotRecord`/GC、显式snapshot
    delete与`SnapshotInUse`、同盘restore只前进一次、Disk delete 202/Deleting/404/replay、普通begin-delete
-   与acquire竞争、双sweeper/prefix-empty/completion CAS，以及disposable Root两边Deleting的每个crash点；
+   与并发attach/acquire竞争、Root Cold fast全有或全无、Deleted cleanup/release后只凭current observation
+   normal begin、direct/live-Cold/旧revision拒绝、release/auth derive双提交顺序、R==L后release前Host loss、
+   双sweeper/adapter contract positive PUT/
+   strong prefix-empty/provider fence paused accepted PUT barrier/completion CAS、receipt后再次empty，
+   以及disposable Root两边Deleting的每个crash点；
    还要用PostgreSQL双session覆盖authorization
    首次consume与Rejoined竞争以及合法后继receipt校验。
 2. **独立native x86_64 Linux build host**：使用现有
