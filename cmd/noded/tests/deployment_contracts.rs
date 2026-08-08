@@ -64,7 +64,7 @@ fn deployment_units_pin_kvm_clock_too() {
 }
 
 #[test]
-fn node_agent_does_not_orphan_runtimes_without_a_crash_safe_ledger() {
+fn node_agent_restart_requires_a_drained_idle_node() {
     for unit in [
         "deploy/metal/systemd/cats-noded.service",
         "deploy/aws/metal/cats-worker.service",
@@ -77,25 +77,13 @@ fn node_agent_does_not_orphan_runtimes_without_a_crash_safe_ledger() {
             .collect::<Vec<_>>();
         assert!(
             kill_modes.is_empty(),
-            "{unit} must retain systemd's control-group default until #186 makes every lifecycle crash window and ledger failure re-adoptable; found {kill_modes:?}"
+            "{unit} must retain systemd's control-group default while V1 cannot safely preserve and re-adopt every child runtime across an agent stop; found {kill_modes:?}"
         );
-    }
-
-    let adr =
-        read_workspace_file("docs/decisions/0028-node-runtime-ledger-and-in-place-reattach.md");
-    for stale_claim in [
-        "- Agent 升级与重启不再杀掉 Guest",
-        "- `systemctl stop cats-noded` 不再停止 Guest",
-    ] {
         assert!(
-            !adr.contains(stale_claim),
-            "ADR-0028 must not claim runtime survival while the units retain control-group kill semantics: {stale_claim}"
+            text.contains("cats=0/orphans=0"),
+            "{unit} must require a drained, empty node before a controlled stop or restart"
         );
     }
-    assert!(
-        adr.contains("`KillMode=control-group`") && adr.contains("cats=0 orphans=0"),
-        "ADR-0028 must describe the current stop semantics and idle prerequisite"
-    );
 
     let metal_readme = read_workspace_file("deploy/metal/README.md");
     let first_install = metal_readme

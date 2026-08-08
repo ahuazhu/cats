@@ -1,139 +1,64 @@
-# ADR-0016：提交按 64 KiB 页粒度发布(Delta Pack),不再整块发布 4 MiB Chunk
+# ADR-0016: Publish dirty 64 KiB pages as bounded delta layers
 
-- 状态：Accepted
-- 日期：2026-07-26
+- Status: Accepted
+- Date: 2026-07-26
 
-## 背景
+## Context
 
-V1 的提交协议把每个 dirty chunk 按**整块 4 MiB** 发布([blockd 协议 §6](../specs/blockd-protocol.md))。
-ADR-0003 的风险节把这件事标成过渡态:「V1 Full Chunk 只用于正确性阶段;Delta Pack 与
-Compaction 是 P4 必做项」,[Direct-S3 架构](../direct-s3-chunkstore-architecture.md)也已经写明
-远端数据对象形态是「4 MiB Base Chunk;后续增加 64 KiB 粒度的 Delta Record」。
+The cache tracks dirty data in 64 KiB pages inside each 4 MiB chunk. Publishing
+the whole chunk after a small Guest write discarded that precision and created
+large write amplification. A commit needs a point-in-time copy of the bytes it
+publishes; it does not need to republish unchanged bytes that are already held
+in immutable objects.
 
-2026-07-26 的真机测量把代价量化了([实验报告](../../experiments/vhost-user-blk-frontend-20260726/README.md)):
+## Decision
 
-- Guest 4 KiB 随机写会脏掉整个 4 MiB chunk,一次提交要拷贝、哈希并写下约 **200 MiB**;
-  进对象存储的**写放大约 100×**。
-- 两条块前端(内核 NBD 与 vhost-user)在这种负载下**都是 flush-bound**:20 秒窗口几乎全部
-  花在 FLUSH 停顿里,每次 flush 停顿 324–772 ms。
-- 引擎其实**已经**按 64 KiB 页记 dirty 位(`DIRTY_PAGE_SIZE`、`PAGES_PER_CHUNK = 64`),
-  只是 `flush()` 只用它判断「这个 chunk 脏不脏」,随后把页级精度丢掉。
+1. A commit publishes one delta object per dirty chunk containing exactly the
+   dirty 64 KiB pages in page order. Its `page_mask` identifies the included
+   pages. A full mask represents a 4 MiB base object.
+2. A map entry is a `Layered` chunk reference with an optional base and an
+   ordered list of deltas. Later deltas replace earlier bytes for overlapping
+   pages; no base means an all-zero chunk.
+3. The exclusive FLUSH barrier captures the dirty page plan and copies exactly
+   those pages with `copy_planned_pages`. Copying and hashing remain parallel;
+   writes after the barrier belong to the next commit.
+4. A chunk has at most `MAX_DELTA_LAYERS` layers, currently four. The next
+   commit publishes a fresh full base and clears the chain when the chain is
+   full or the new commit dirties more than half the chunk.
+5. Hydration fetches the base and deltas, verifies every referenced length and
+   SHA-256, applies layers in order, and writes one complete cache chunk.
+6. GC treats every object referenced by the current Root as live. Superseded
+   layers become collectible through the normal Root reachability rule.
+7. Persisted formats remain explicit and fail closed:
+   - maps without layered chunks retain the previous encoding;
+   - layered maps use the next version;
+   - old pending packs decode as full-chunk entries;
+   - an older binary rejects a newer map version rather than misreading it.
 
-## 关键洞察
+The bounded chain supplies the correctness and read-amplification guarantee, so
+no background compactor is required. A future compactor is an optimization and
+must preserve the same Root and fencing semantics.
 
-只发布脏页**不会**破坏点时刻一致性:一次提交没有携带的那些页,自上次提交以来未被修改,
-因此它们的内容**已经作为不可变对象存在于对象存储里**。所以
+## Invariants
 
-```
-chunk 当前内容 = base 对象 + 历史 delta + 本次提交的脏页
-```
+- A successful Strict FLUSH has published every page in its barrier plan before
+  the Root CAS succeeds.
+- Relaxed durability changes when remote publication occurs, not which pages a
+  commit represents.
+- A stale attachment epoch cannot publish either a delta or a base.
+- Recovery can replay an old pending pack idempotently.
+- A cold read fetches at most five data objects per chunk with the current
+  layer bound.
 
-三部分都不受屏障之后的新写影响。这也纠正了本仓库先前的一个判断("屏障必须拷贝它将要上传的
-整块内容"):必须成立的约束是**屏障拷贝的就是本次要发布的**,而不是"发布必须是整块"。
+## Evidence and consequences
 
-## 决定
+The retained benchmarks and raw logs are under
+[`vhost-user-blk-frontend-20260726`](../../experiments/vhost-user-blk-frontend-20260726/README.md).
+They show the measured environment, sample counts, bytes uploaded, PUT count,
+and latency. Those measurements are evidence for this decision, not an SLA.
 
-1. 一次提交对每个 dirty chunk 发布**一个对象**,内容是该 chunk 的脏 64 KiB 页按页序拼接。
-   `PackEntry` 增加 `page_mask` 字段说明携带了哪些页;`page_mask == u64::MAX` 表示整块 base。
-2. Map 的 `ChunkRef` 增加 `Layered { base: Option<BaseRef>, deltas: Vec<DeltaRef> }`。
-   `base` 为 `None` 表示底座是空洞(全零)。后写的 delta 在重叠页上覆盖先写的。
-3. **何时改回整块**:出现下列任一情况,本次提交对该 chunk 发布一个新的整块 base 并清空链:
-   - 该 chunk 的 delta 链长度已达 `MAX_DELTA_LAYERS`(当前 **4**);
-   - 本次脏页数超过半块(> 32 页)——再用 delta 省不了多少,而重置链更值。
-
-   这让系统**自压缩**:不需要后台 Compactor 来保证正确性或有界性,冷读放大有硬上限
-   (≤ 5 个对象/chunk)。后台 Compactor 仍然是可选优化,可以把这个上限放宽。
-4. **屏障内只拷脏页**,相邻脏页合并成连续 pread;拷贝与哈希继续并行(见 PR #8)。
-5. **格式兼容**:leaf 编码只在实际包含 `Layered` 时才写版本 2,所以从未产生过 delta 的卷
-   map node 逐字节不变(对象 id 也不变);解码同时接受版本 1 和 2。`PackEntry.page_mask`
-   有 serde 默认值,**旧版本写下的 pending pack 仍可被重放**为整块提交。
-6. **读路径**在 hydration 处解析层:base(或全零)+ 按序应用 delta,一次性整块写入本地
-   cache,所以 cache 文件里不可能残留上一代的字节。每个对象都按其引用里的 len 与 sha256 校验。
-
-## 实测结果
-
-`blockd/tests/commit_cost.rs`(release,aarch64 Linux 容器,median of 3)。48 个 dirty chunk、
-每 chunk 一个脏页,即 4 KiB 随机写的形态:
-
-| | 整块发布(旧行为) | Delta Pack |
-|---|---|---|
-| 发布字节 | 192 MiB | **3 MiB(64× 少)** |
-| FLUSH 延迟 | 412 ms | **109 ms(3.8×)** |
-| 8 个 dirty chunk | 83 ms | **30.5 ms** |
-| 32 个 dirty chunk | 301 ms | **85.9 ms** |
-
-密集写(整块脏)一列**故意不变**:192 MiB / 412 ms,与设计一致。
-
-延迟没有跟着字节数降 64×,是因为成本结构翻转了——残余是**每对象固定开销**(48 个对象各要
-一次 create + `sync_data` + hard_link;在 S3 上是 48 次 PUT 往返),约 2.3 ms/对象。
-
-当时据此提出的下一步是「把多个 chunk 的 delta 打包成一个对象」。**后来没有这么做**,理由见
-下面「关于打包成一个对象」一节:真正的瓶颈是上传串行,不是对象个数。
-
-2026-07-27 在真实 S3 上复测证实了这一点,而且方向和当初的猜测相反
-([原始数据](../../experiments/vhost-user-blk-frontend-20260726/raw/metal-delta-pack-s3.log)):
-
-| dirty chunks | 真实 S3(dense → sparse) | 同机本地文件存储 |
-|---|---|---|
-| 8 | 858.9 → 374.0 ms = **2.3×** | 166.4 → 43.8 ms = 3.8× |
-| 32 | 3031.5 → 1149.4 ms = **2.6×** | 1974.0 → 140.2 ms = 14.1× |
-| 48 | 4913.5 → 1669.3 ms = **2.9×** | 2974.7 → 312.6 ms = 9.5× |
-
-**S3 上的收益比本地小**:字节降 64×,但对象数一个没少,而 S3 上一个对象就是一次 PUT 往返。
-sparse 行的 556 ms/发布 MiB 对 dense 的 25.6 ms/发布 MiB,说明 sparse 提交付的是往返而不是字节。
-
-**但这只是一半原因。**同一天查出来提交路径的上传是个**串行 `for` 循环**——一个对象一次阻塞往返。
-改成有界并发(16)之后,同一台机器同一个桶:
-
-| 48 chunk,dense → sparse | |
-|---|---|
-| 串行上传 | 4913.5 → 1669.3 ms(**2.9×**) |
-| 并发上传 | 1429.9 → **243.5 ms**(**5.9×**) |
-
-也就是说「delta pack 在远端存储上不划算」这个结论**是串行上传造成的假象**:每个对象都要一次往返、
-往返又不重叠时,字节少 64× 显不出来;把往返摊平,字节数的降幅就回来了。发布字节降 64× 是算术,
-在哪都成立;能换回多少 flush 时间取决于**往返能不能重叠**。
-
-## 关于"把多个 chunk 的 delta 打包成一个对象"——评估后不做
-
-这一项曾经是本 ADR 点名的下一步。**上传改成并发之后它不再值得做**,记录判断依据:
-
-- **收益**:16 路并发下,48 个对象是 3 波往返(约 100 ms);打包成 1 个对象是 1 波(约 33 ms)。
-  在一次 243 ms 的提交里省约 70 ms,整体约 1.4×。剩下的 100 ms 里有 leaf → root → commit record
-  三次**有真实依赖**的往返,打包省不掉。
-- **代价一:空间放大需要 Compactor。**一个打包对象只要还有任意一个 chunk 引用它就必须留着,
-  于是一个绝大部分内容已失效的对象会长期占着空间。这正是 ADR-0016 第 3 条**特意用自压缩避开**
-  的那类问题,现在会从后门回来。
-- **代价二:读放大,除非给 BlobStore 加 range read。**为了拿一个 chunk 的 delta 而下载整个打包
-  对象,等于把写的往返换成了读的字节。要避免就得给 `BlobStore` 加带范围的 GET,那是要落到每个
-  适配器上的接口改动。
-- **代价三:格式与不变量。**`DeltaRef` 要带对象内偏移,"一次提交对一个 chunk 最多一个对象"这条
-  让恢复与幂等变简单的不变量也没了。
-
-用 1.4× 换一个 Compactor、一个新的存储接口和一条不变量,不划算。如果以后测出往返次数重新成为
-瓶颈(例如提交的 chunk 数远大于并发度),这个判断要重做。
-
-## 代价与风险
-
-- **冷读放大**:一个满链 chunk 的冷读要取 5 个对象而不是 1 个。**2026-07-27 在真机 + 真实 S3
-  上量过了,代价比预期小得多**:一次读完 64 MiB,0 层 155.4 ms、4 层 171.9 ms,**只贵约 11%**
-  (原始数据 [`raw/metal-cold-read-and-chains.log`](../../experiments/vhost-user-blk-frontend-20260726/raw/metal-cold-read-and-chains.log))。
-  前提是读路径把一个 chunk 的各层一起取——这一点在同一轮里补上了。`MAX_DELTA_LAYERS = 4`
-  作为硬上限继续保留,但它不再是下一个该动的地方。
-- **GC 必须把 base 与全部 delta 都视为存活**:存活判据仍然是"被当前 Root 引用",只是一个
-  chunk 现在可能引用多个对象。已实现(见[协议 §9](../specs/blockd-protocol.md)),遍历的正是
-  `ChunkRef::object_ids()`;回归测试 `gc_keeps_every_layer_of_a_live_chain_and_drops_superseded_objects`
-  就是在防"只留每个 chunk 最新那个对象"这种写法。
-- 被后来的 delta **完全覆盖**的旧 delta 不会进入 Map:`with_delta` 追加时就丢掉它。它在
-  hydration 里本来就会被逐字节覆盖,留着只会让链更长、冷读更贵、GC 还得当它活着。反复写同一个
-  热页是最常见的形态,这条让那种形态的链长保持在 1。
-- **对象数量增加**:同样的写入量会产生更多、更小的对象。S3 的 PUT 次数按 ADR-0003 的要求
-  仍然要记入基准四元组(`guest_bytes_written`、`remote_bytes_uploaded`、PUT 数、Compaction bytes)。
-- **前向兼容**:写过 delta 的卷,其 map node 是版本 2,旧版二进制读到会明确报错(不会静默误读)。
-
-## 取代关系
-
-- 取代 [blockd 协议 §6](../specs/blockd-protocol.md) 中"提交整个 chunk"的部分,该节已相应修订并
-  新增 §6.2。
-- 落实 ADR-0003 风险节列为 P4 的 Delta Pack 项的第一步;Compaction 仍未实现(靠上面第 3 条的
-  自压缩替代其正确性职责)。
+Delta layers reduce sparse-commit bytes and preserve page-level sharing with a
+golden root. The tradeoffs are more small objects and bounded cold-read
+amplification. Upload concurrency and object-store request counts therefore
+remain observable, while multi-chunk object packing stays outside this design
+until measurements justify its additional range-read and GC complexity.

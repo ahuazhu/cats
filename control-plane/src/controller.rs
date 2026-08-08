@@ -366,9 +366,9 @@ impl Controller {
                     Ok(result) => {
                         // A fencing refusal (root CAS conflict) never succeeds
                         // on retry; back off instead of hammering the metadata
-                        // store every tick. Whether a stale journal may be
-                        // discarded is an explicit operator decision
-                        // (ADR-0030), never made here.
+                        // store every tick. Whether a stale local durability
+                        // journal may be discarded is an explicit operator
+                        // decision, never made by V1 reconciliation.
                         let delay = self.defer_retry_key(key);
                         tracing::warn!(
                             node = %node.id,

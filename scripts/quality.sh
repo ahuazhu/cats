@@ -15,7 +15,82 @@ SKILLS=(
 )
 
 usage() {
-  echo "usage: $0 {fmt|skills|deps|check|build|clippy|test|doc|fast|full|linux}" >&2
+  echo "usage: $0 {provenance|fmt|skills|deps|check|build|clippy|test|doc|fast|full|linux}" >&2
+}
+
+source_fingerprint() {
+  local head
+  local tracked
+  local untracked
+
+  head="$(git rev-parse HEAD)" || return 1
+  tracked="$(git diff --binary HEAD -- | git hash-object --stdin)" || return 1
+  untracked="$({
+    git ls-files --others --exclude-standard -z
+  } | while IFS= read -r -d '' path; do
+    printf 'untracked\0%s\0' "$path"
+    git hash-object -- "$path" || exit 1
+  done | git hash-object --stdin)" || return 1
+
+  printf '%s\0%s\0%s\n' "$head" "$tracked" "$untracked" | git hash-object --stdin
+}
+
+validate_source_provenance() {
+  [[ "$SOURCE_PROVENANCE_ROOT" == /* && "$SOURCE_PROVENANCE_ROOT" != *$'\n'* ]] || {
+    echo "source provenance root must be a non-empty absolute path" >&2
+    return 1
+  }
+  [[ "$SOURCE_PROVENANCE_HEAD" =~ ^[0-9a-f]{40}$ || "$SOURCE_PROVENANCE_HEAD" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "source provenance head must be a lowercase Git object ID" >&2
+    return 1
+  }
+  [[ "$SOURCE_PROVENANCE_DIRTY" == true || "$SOURCE_PROVENANCE_DIRTY" == false ]] || {
+    echo "source provenance dirty flag must be true or false" >&2
+    return 1
+  }
+  [[ "$SOURCE_PROVENANCE_FINGERPRINT" =~ ^[0-9a-f]{40}$ || "$SOURCE_PROVENANCE_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "source provenance fingerprint must be a lowercase Git object ID" >&2
+    return 1
+  }
+}
+
+load_source_provenance() {
+  local root_set="${CATS_SOURCE_PROVENANCE_ROOT+x}"
+  local head_set="${CATS_SOURCE_PROVENANCE_HEAD+x}"
+  local dirty_set="${CATS_SOURCE_PROVENANCE_DIRTY+x}"
+  local fingerprint_set="${CATS_SOURCE_PROVENANCE_FINGERPRINT+x}"
+
+  if [[ -n "$root_set$head_set$dirty_set$fingerprint_set" ]]; then
+    [[ "$root_set" == x && "$head_set" == x && "$dirty_set" == x && "$fingerprint_set" == x ]] || {
+      echo "source provenance overrides must set root, head, dirty and fingerprint together" >&2
+      return 1
+    }
+    SOURCE_PROVENANCE_ROOT="$CATS_SOURCE_PROVENANCE_ROOT"
+    SOURCE_PROVENANCE_HEAD="$CATS_SOURCE_PROVENANCE_HEAD"
+    SOURCE_PROVENANCE_DIRTY="$CATS_SOURCE_PROVENANCE_DIRTY"
+    SOURCE_PROVENANCE_FINGERPRINT="$CATS_SOURCE_PROVENANCE_FINGERPRINT"
+    validate_source_provenance
+    return
+  fi
+
+  local status
+  SOURCE_PROVENANCE_ROOT="$(git rev-parse --show-toplevel)" || return 1
+  SOURCE_PROVENANCE_HEAD="$(git rev-parse HEAD)" || return 1
+  status="$(git status --porcelain=v1 --untracked-files=all)" || return 1
+  SOURCE_PROVENANCE_DIRTY=false
+  if [[ -n "$status" ]]; then
+    SOURCE_PROVENANCE_DIRTY=true
+  fi
+  SOURCE_PROVENANCE_FINGERPRINT="$(source_fingerprint)" || return 1
+  validate_source_provenance
+}
+
+print_source_provenance() {
+  echo "==> source provenance"
+  printf 'source.root=%s\n' "$SOURCE_PROVENANCE_ROOT"
+  printf 'source.head=%s\n' "$SOURCE_PROVENANCE_HEAD"
+  printf 'source.dirty=%s\n' "$SOURCE_PROVENANCE_DIRTY"
+  printf 'source.fingerprint=%s\n' "$SOURCE_PROVENANCE_FINGERPRINT"
 }
 
 run_fmt() {
@@ -216,6 +291,10 @@ run_linux() {
   docker run --rm --platform "$platform" \
     -e CARGO_BUILD_JOBS="$jobs" \
     -e CATS_TEST_POSTGRES_URL="postgres://postgres:cats@${pg}:5432/postgres" \
+    -e CATS_SOURCE_PROVENANCE_ROOT="$SOURCE_PROVENANCE_ROOT" \
+    -e CATS_SOURCE_PROVENANCE_HEAD="$SOURCE_PROVENANCE_HEAD" \
+    -e CATS_SOURCE_PROVENANCE_DIRTY="$SOURCE_PROVENANCE_DIRTY" \
+    -e CATS_SOURCE_PROVENANCE_FINGERPRINT="$SOURCE_PROVENANCE_FINGERPRINT" \
     --network "$network" \
     -v "$REPO_ROOT:/work" -w /work \
     -v cats-cargo-registry:/usr/local/cargo/registry \
@@ -237,7 +316,11 @@ run_linux() {
   return "$status"
 }
 
+load_source_provenance
+print_source_provenance
+
 case "${1:-full}" in
+  provenance) ;;
   fmt) run_fmt ;;
   skills) run_skills ;;
   deps) run_deps ;;

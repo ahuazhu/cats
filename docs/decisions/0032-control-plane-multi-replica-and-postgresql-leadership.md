@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-08-05
 - Relates to: ADR-0011 (usage projector), ADR-0026 (detached OCI deploy),
-  ADR-0031 (PostgreSQL control store); issue #103
+  ADR-0031 (PostgreSQL control store), ADR-0040 (runtime reconciliation)
 
 ## Context
 
@@ -28,6 +28,9 @@ control authority and managed failover boundary.
   a one-second health check. Connection loss or election-task cancellation
   aborts the role before its handle is dropped; a dropped Tokio handle must not
   detach old leader work.
+- The elected runtime reconciler scans current `DesiredRuntimeSpec` rows. It
+  does not own a replica-local command history; a replacement leader resumes
+  from PostgreSQL desired state and revision-bound observations.
 - Linearize idempotent create/action requests with transaction advisory locks
   scoped by schema, route and idempotency key. The resource mutation, operation
   and idempotency row commit in one transaction.

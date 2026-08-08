@@ -66,7 +66,7 @@ impl BlockdProc {
         .map(|_| ())
     }
 
-    /// The raw `Status` payload, including the volume identity that ADR-0028 §3
+    /// The raw `Status` payload, including the volume identity that V1
     /// re-adoption proves a blockd with. Heartbeat telemetry drops those two
     /// fields, so it cannot be reused for the proof.
     pub(super) fn status_at(control_socket: &Path, disk_id: &str) -> Result<DurabilityStatus> {

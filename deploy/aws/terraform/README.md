@@ -222,68 +222,46 @@ Terraform's `sensitive` flag only redacts normal CLI output. Secret values still
 exist in state and in saved plans, which is why both require the same access
 control as production credentials.
 
-The Route Grant key is asymmetric (ADR-0033). Every control-plane replica gets
-the same private key from the application state and the application public half
-must be derived from that exact input; startup signs and verifies a proof before
-readiness. Metal workers get only the public half from the infrastructure state.
-Never add the private key to
-`runtime_secret_data`, `worker_runtime_secret_data`, Gateway configuration or a
-Guest image. Generate the pair with `openssl genpkey -algorithm ED25519` and
-`openssl pkey -pubout`, then rotate it only through a coordinated drained
-rollout until multi-key verification exists.
+### Route admission
 
-The infrastructure state also creates `route_cache_table_name` and the
-Gateway-only Pod Identity before the application rollout. Set the GitHub
-repository variable `ROUTE_CACHE_TABLE_NAME` to that output. Each successful
-active + Running resolve attempts to copy its signed response into this regional
-table under a 100-ms runtime I/O deadline; another Gateway Pod can then serve the
-signed grant if PostgreSQL or the control plane is unavailable. The table cannot
-mint authority, entries are bounded by the signed expiry, and conditional writes
-order them by PostgreSQL route epoch and then signed issue time. It is deliberately
-not a Gateway startup or readiness dependency; bounded runtime failures fall
-through to the healthy control plane.
+The deployed V1 contract uses one Ed25519 key pair. Every control-plane replica
+receives the same private key from application state; CI derives the public key
+from that exact input and startup verifies the pair. Metal workers receive only
+the public key. Because the current module accepts the private PEM as a Terraform
+variable, the saved plan and state contain it and must be protected as credentials.
+Keep it out of workers, Gateway configuration, Guest images and logs. Generate it with
+`openssl genpkey -algorithm ED25519` and derive the public half with
+`openssl pkey -pubout`.
 
-The first Route Grant release has a strict compatibility order:
+The target route module removes the private-key Terraform variable. Terraform manages
+only a secret reference, workload access policy and public verifier ring; a separate
+secret channel writes key bytes. The clean-slate deployment rotates the key so every
+private value retained in historical Terraform state is cryptographically obsolete. The
+versioned Terraform state remains restricted infrastructure evidence; it is not imported
+as product data and is not deleted by the cutover.
 
-1. configure the application private-key input and the matching infrastructure
-   public-key input, but do not deploy the new worker bundle yet. CI derives
-   the application public half from its exact private secret instead of
-   accepting a second independently editable key input;
-2. deploy the application first. Terraform waits for the complete control-plane
-   rollout before it starts the Gateway rollout. Old Gateways ignore the new
-   response fields, and old Nodes ignore the grant forwarded by a new Gateway;
-3. drain, deploy and uncordon one worker at a time using the worker procedure
-   below. The association verifies the installed public-key fingerprint; the
-   Node reports it at registration, and the control plane refuses uncordon
-   unless it matches the active signer. Never uncordon a Node that requires
-   Route Grants while the old Gateway is still live: the Node deliberately
-   rejects its unsigned requests;
-4. if the application must be rolled back after any worker has been upgraded,
-   first drain those workers and restore the compatible old worker bundle. An
-   old Gateway cannot serve a Node that requires a Route Grant.
+The current infrastructure state also owns a regional Route Grant cache and a
+Gateway-only Pod Identity. Set `ROUTE_CACHE_TABLE_NAME` from the infrastructure
+output. The table is only a bounded-expiry availability cache for already
+signed V1 grants; PostgreSQL route state and the signer remain authoritative.
+Keep this table and its IAM boundary unchanged until the ADR-0041 cutover.
 
-This additive first release is not the key-rotation procedure. With one accepted
-public key, rotation still needs the coordinated drained boundary described
-above; do not swap either half independently. The application workflow fails
-before Terraform plan if any schedulable or still-serving Node reports a
-different key. It permits an all-legacy serving cohort only for the additive
-first application rollout and rejects a mixed legacy/enforcing cohort as an
-interrupted worker rollout. The control database persists a one-way legacy
-admission phase: it closes after every schedulable or serving Node reports a
-verifier, never reopens, and a Node that downgrades from a reported key to no
-key is cordoned.
+Ordinary V1 releases preserve one compatible key and wire contract across the
+control plane, Gateway, and workers. Deploy workers one at a time through the
+drain procedure below and verify the installed public-key fingerprint before
+uncordon. Rotate the single V1 key only in a coordinated drained maintenance
+window that installs one matching pair everywhere before reopening admission.
 
-The Route Grant Node column and rollout-phase table are an expand-only schema
-change and deliberately retain control schema stamp 1. The previous
-application ignores both additions, so a failed partial control-plane rollout
-can still start the old image. Do not bump the stamp for an additive nullable
-column/table; reserve a new stamp for the later contract phase after rollback
-compatibility is no longer required.
+The first ADR-0040/0041 deployment follows the single ordered runbook in
+[Operations and HA §8](../../../docs/operations-ha.md#8-首次终态部署). The Terraform plan used there
+must already have removed the V1 route-cache/parser inputs and private-key value, retain only the
+new secret reference/public ring policy, and rotate the affected service and per-Node credentials.
+Historical Terraform state remains restricted evidence and is never imported as product data.
 
-`storage_postgres_url` and `usage_postgres_url` are intentionally independent.
-During the early shared-RDS phase they may point to the same instance/database,
-while usage uses the separate `cats_usage` schema and preferably a dedicated
-database role. Moving usage later only changes the usage DSN.
+`storage_postgres_url` and `usage_postgres_url` are independent. They may point
+to the same PostgreSQL instance and database, but usage keeps its own
+`cats_usage` schema and database role. Moving usage to another database changes
+only the usage DSN.
 
 Set `stripe_enabled=true` and copy the non-secret `topup_price_ids` output into
 `stripe_topup_price_ids`. Cats never credits a Checkout success redirect: only
@@ -364,9 +342,9 @@ A worker release is a drain boundary. Before applying a new bundle:
 
 A drain acts on both the control plane's assignments and the agent's own
 reported inventory: a Cat the agent runs that the control plane never assigned
-there (an *orphan runtime*, ADR-0030) gets a Cold stop by its reported
-identity, and the node does not reach `cordoned` while any orphan remains. So
-`state=cordoned` genuinely means the node runs nothing.
+there (an *orphan runtime*) gets a Cold stop by its reported identity, and the
+node does not reach `cordoned` while any orphan remains. So `state=cordoned`
+genuinely means the node runs nothing.
 
 The association independently refuses to change installed files while any Cat
 PID remains in the worker's metering cgroups **or** any `cats-blockd` /
@@ -381,10 +359,11 @@ for step 1. Do not copy production binaries, patch the seed, or edit
 `worker.env` manually; update the bundle digest or secret input and apply
 Terraform.
 
-Do not stop or restart a worker that still has Cats. Issue #186 keeps the
-control-group default until ledger persistence and every in-flight lifecycle
-crash window are safely re-adoptable; issue #86 remains the no-downtime restart
-work item. A controlled release must first reach `cats=0 orphans=0`.
+Do not stop or restart a worker that still has Cats. Current V1 runtime-ledger
+adoption does not make an Agent restart safe; ADR-0040 requires the Host lock,
+per-Cat scopes, bounded checkpoint and union inventory to land together before
+that contract can change. A controlled release must first reach
+`cats=0 orphans=0`.
 
 ### When the drain cannot converge
 

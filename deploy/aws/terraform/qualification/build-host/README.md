@@ -1,5 +1,9 @@
 # Qualification build host
 
+Status: registered independent qualification asset. Verify live identity/readiness before each run,
+then use it for exact-SHA native Linux build/test and retain its immutable receipts; it is evidence
+infrastructure, not a production authority.
+
 This stack owns an isolated, production-account qualification build cell. The
 build host has no GitHub credential. A trusted controller outside the host
 turns one clean exact Cats commit into a content-addressed Git bundle and
@@ -8,18 +12,18 @@ bucket under its dedicated KMS key.
 
 ## Publish exact source from the controller
 
-The source bucket and key are Terraform outputs. Use pre-existing private work
-and evidence directories; the helper does not change their modes. The caller
-account, bucket account and KMS-key account must all equal the explicit
-reviewed account argument.
+Resolve the source bucket and key from recovered, reviewed Terraform outputs or the approved
+qualification inventory. Do not run `terraform output`, plan or apply from an empty state directory.
+Use pre-existing private work and evidence directories; the helper does not change their modes. The
+caller account, bucket account and KMS-key account must all equal the explicit reviewed account.
 
 ```sh
-./tools/publish-source-bundle.sh \
+bash deploy/aws/terraform/qualification/build-host/tools/publish-source-bundle.sh \
   "$QUALIFICATION_AWS_ACCOUNT_ID" \
   /trusted/clean/cats \
   "$EXACT_40_HEX_COMMIT" \
-  "$(terraform output -raw source_bucket_name)" \
-  "$(terraform output -raw source_kms_alias_arn)" \
+  "$SOURCE_BUCKET_NAME" \
+  "$SOURCE_KMS_ALIAS_ARN" \
   /approved/private-work \
   /approved/evidence/source-bundle.json
 ```
@@ -68,9 +72,32 @@ workstations and would require handing the candidate build a daemon socket.
 The trusted bootstrap/readiness container probes use bridge networking, and
 the host FORWARD policy denies IMDS.
 
-The candidate uid 2000 may write a regular file only inside its per-job
-`output/` directory. After the job exits, the root orchestrator freezes that
-output as root-owned and non-writable; the publisher accepts only this frozen
-form. It opens every path component with `O_NOFOLLOW`, copies from the held file
-descriptor into root-only staging, and then uploads to the append-only artifact
-bucket.
+The candidate uid 2000 may write a regular file only inside its per-job `output/` directory. After
+the job exits, the root orchestrator freezes that output as root-owned and non-writable and records
+the Host-local immutable receipt. `cats-run-build` does not publish it. To retain a selected frozen
+log in the append-only evidence bucket, a trusted root operator separately runs:
+
+```sh
+cats-publish-content-addressed evidence <frozen-output-file>
+```
+
+The publisher accepts only the frozen form. It opens every path component with `O_NOFOLLOW`, copies
+from the held file descriptor into root-only staging, and uploads one content-addressed object.
+
+## Reuse preflight and retry boundary
+
+Run one fail-fast preflight for the whole build:
+
+1. authenticate once, then verify the reviewed AWS account and `us-east-1`; an expired session means
+   inventory is unknown, not absent;
+2. require a clean 40-hex commit and `quality.sh provenance` with the same HEAD and `dirty=false`;
+3. resolve exactly one running Host by the full qualification tags, require SSM Online, versioned
+   source bucket and enabled KMS key;
+4. send `cats-verify-build-host-readiness` once and require its account/region/namespace/cell/x86_64
+   identity to match;
+5. publish one source bundle, then submit checkout and build as one SSM command.
+
+Poll that command with `get-command-invocation` until a service terminal state. The stock
+`aws ssm wait command-executed` window is shorter than a normal full build. A local polling timeout,
+expired login or failed readiness probe retains the command ID and stops the run; it never submits a
+second build or starts/replaces infrastructure.

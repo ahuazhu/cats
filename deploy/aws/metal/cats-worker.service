@@ -5,8 +5,9 @@ Wants=network-online.target
 
 [Service]
 Delegate=cpu memory
-# Keep systemd's default KillMode=control-group until #186 makes ledger
-# persistence and every in-flight lifecycle crash window safely re-adoptable.
+# V1 runtime-ledger adoption does not make an Agent stop/restart safe. Keep
+# systemd's default KillMode=control-group until ADR-0040's Host lock, per-Cat
+# scopes, bounded checkpoint and union inventory have landed together.
 # A controlled worker release must drain to cats=0/orphans=0 before stopping.
 Environment=CATS_GUEST_NETWORK_CIDR=10.240.0.0/16
 # Direct RDS remains the compatible default. A managed worker environment can

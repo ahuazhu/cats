@@ -4216,7 +4216,7 @@ async fn an_unattributable_checkpoint_is_rejected_without_failing_its_batch() {
 }
 
 // ---------------------------------------------------------------------------
-// Reverse reconciliation of agent-reported runtimes (issue #98, ADR-0030)
+// V1 reverse reconciliation of agent-reported runtimes
 // ---------------------------------------------------------------------------
 
 async fn admin_node_summary(ctx: &Ctx, node_id: &str) -> NodeSummary {
@@ -4357,8 +4357,8 @@ async fn a_drain_stops_agent_reported_orphans_before_cordoning() {
 /// (`root CAS conflict`) and can never stop cleanly. The drain must stay
 /// visibly open rather than cordon a node that still runs them, and must back
 /// off instead of re-dispatching the doomed stop every reconcile tick.
-/// Discarding the stale journal is an explicit operator action (ADR-0030);
-/// the injected recovery below stands in for it.
+/// Discarding the stale journal is an explicit operator action; the injected
+/// recovery below stands in for it.
 #[tokio::test]
 async fn a_drain_with_an_unstoppable_orphan_stays_draining_and_backs_off() {
     let ctx = Ctx::new_with_stable_node_lease().await;

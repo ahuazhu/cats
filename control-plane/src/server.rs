@@ -50,8 +50,8 @@ pub struct Config {
     pub storage_meta: Arc<dyn MetadataStore>,
     /// Service credential used by node agents, gateways and controller jobs.
     pub auth_token: String,
-    /// Private-key authority for short-lived Endpoint Route Grants. It is
-    /// intentionally absent from Gateway and Node configuration (ADR-0033).
+    /// Private-key authority for short-lived V1 Endpoint Route Grants. It is
+    /// intentionally absent from Gateway and Node configuration.
     pub route_grant_signer: Arc<crate::route_grant::RouteGrantSigner>,
     /// Administrator credential for fleet management and monitoring APIs.
     pub admin_token: String,

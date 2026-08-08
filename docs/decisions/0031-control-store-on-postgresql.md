@@ -1,81 +1,46 @@
-# ADR-0031: The control store lives in managed PostgreSQL, with no SQLite era to carry
+# ADR-0031：Managed PostgreSQL 是控制面存储
 
-- Status: Accepted
-- Date: 2026-08-05
-- Relates to: ADR-0003 (Direct-S3 backend), ADR-0004 (dev stack), ADR-0029 (database password authority); issue #103
+- 状态：Accepted
+- 日期：2026-08-05
+- 关联：ADR-0003、ADR-0029、ADR-0032、ADR-0034、ADR-0040
 
-## Context
+## 决策
 
-The control plane's resource authority — accounts, workspaces, the billing
-ledger, cats, disks, mount bindings, nodes, operations, routes, work leases —
-lived in a single SQLite file on a single EBS volume behind a single-replica
-`Recreate` Deployment. That stack of single points was #103: any pod or
-volume event was a full control-plane outage, losing the volume erased the
-business, and the store could never scale past one replica.
+Accounts、Workspaces、billing ledger、Cats、Disks、bindings、Nodes、Operations、Routes和
+work leases统一保存在managed PostgreSQL。控制表与ChunkStore MetadataStore共享实例和
+database，但使用互不冲突的schema/table namespace。
 
-The dev-shape SQLite implementation had no port abstraction and 247 call
-sites. A trait-based dual-backend migration (contract suite over both stores,
-export/import tooling, rehearsed cutover) was designed and then deliberately
-rejected by the operator: production data at this stage is not worth carrying
-(two accounts, re-creatable), and compatibility machinery is not worth
-building for a backend we are deleting.
+连接配置为：
 
-## Decision
+- `--control-store-url` / `CATS_CONTROL_POSTGRES_URL`，缺省回退到`CATS_POSTGRES_URL`；
+- 生产通过`--control-store-url-file`读取runtime Secret，每次新连接重读文件以接受密码轮换；
+- CA由`CATS_CONTROL_POSTGRES_CA_FILE`提供；密码authority遵循ADR-0029；
+- 连接总量、RDS Proxy和多副本边界遵循ADR-0034。
 
-Rewrite the store in place on the sync `postgres` client, keeping every
-method signature and its semantics; delete the SQLite implementation and its
-migration ladder rather than abstracting over both.
+## Schema与并发
 
-- **Same database as the storage MetadataStore.** The control tables share
-  the managed PostgreSQL instance and database that already holds the
-  `cats_storage_*` tables; names are disjoint. A literal DSN may come from
-  `--control-store-url` / `CATS_CONTROL_POSTGRES_URL`, falling back to
-  `CATS_POSTGRES_URL`. Production mounts that same runtime Secret and uses
-  `--control-store-url-file`; the file is re-read on every connect so a
-  reconnect observes password rotation (ADR-0029). No new secret is needed.
-  The CA file comes from `CATS_CONTROL_POSTGRES_CA_FILE`.
-- **A fresh schema ladder.** PostgreSQL schema version 1 is the final SQLite
-  layout (v5) re-expressed natively (BOOLEAN columns, plpgsql immutability
-  triggers, a `control_schema_version` row instead of `PRAGMA user_version`).
-  `Store::connect` upgrades in place inside
-  `[OLDEST_MIGRATABLE_SCHEMA_VERSION, SCHEMA_VERSION]` and refuses anything
-  else, exactly as `open` did; the production deploy gate now reads the
-  stamped version through a one-off in-cluster `psql` pod instead of the
-  SQLite file header.
-- **No data migration.** The pre-cutover SQLite contents are abandoned; the
-  first PostgreSQL boot starts empty and the WorkOS mapping re-provisions
-  accounts. The final manual EBS snapshot remains as an archive.
-- **The sync client hops off async runtimes.** The `postgres` crate owns an
-  internal runtime; using or dropping it on a tokio worker panics. Every
-  database operation funnels through `off_runtime`, which runs the closure on
-  a scoped helper thread when an ambient runtime exists. Callers block either
-  way — the same serialization the SQLite mutex imposed, preserved
-  deliberately: the async-native rework is its own decision for the
-  multi-replica stage of #103.
-- **Tests require a real PostgreSQL and refuse to skip.** Each test isolates
-  in a fresh schema via `options=-csearch_path%3D…`; CI provides a service
-  container, `quality.sh` runs a disposable docker container, and an unset
-  `CATS_TEST_POSTGRES_URL` fails loudly. Schema DDL takes a per-schema
-  advisory lock so parallel tests do not queue on one global lock.
+`control_schema_version`记录schema版本。`Store::connect`只在
+`[OLDEST_MIGRATABLE_SCHEMA_VERSION, SCHEMA_VERSION]`内按顺序迁移，范围外拒绝启动并报告
+版本。DDL在transaction内取得per-schema advisory lock，避免并发副本重复迁移。
 
-## Consequences
+当前`postgres`客户端是同步接口。所有调用经统一的`off_runtime`边界执行，避免在Tokio worker
+中创建或drop客户端内部runtime。多副本写入的唯一性、placement和singleton工作使用数据库
+约束、事务与有界advisory leadership；生命周期网络I/O不持有数据库事务或leader lease。
 
-- The control plane no longer needs the EBS PVC, the `Recreate`-forced
-  single-replica coupling to a volume, or the DLM snapshot stopgap; RDS
-  backups cover the control tables. ADR-0032 completes the subsequent
-  multi-replica and singleton-leadership stage.
-- Local development and every workspace test now require docker (or an
-  external PostgreSQL). The credential-free single-file dev shape is gone for
-  the control store; the usage/credit dev stores keep their SQLite shape.
-- Merging the change is the cutover: the next production deploy boots on an
-  empty control database. Running Cats surface as agent-reported orphans and
-  are re-adopted through reverse reconciliation (ADR-0030); accounts
-  re-provision through WorkOS on first login.
-- A future backend change repeats this playbook (rewrite + fresh ladder)
-  unless multiple backends must coexist, at which point the port abstraction
-  this ADR declined becomes the right tool.
-- The one-time production cutover detached the mounted SQLite PVC before the
-  saved Terraform apply, because Kubernetes PVC protection otherwise waited on
-  the old Pod. After the claim and its Terraform state were gone, that cutover
-  branch and its migration-only manifests were removed from the normal deploy
-  path.
+## 测试与运维
+
+workspace测试必须连接真实PostgreSQL并使用独立schema。CI提供service container；
+`quality.sh`启动一次性Docker PostgreSQL；显式`CATS_TEST_POSTGRES_URL`可复用外部实例。没有
+可用PostgreSQL时测试失败，不跳过。
+
+生产备份、恢复、Multi-AZ failover和连接代理由managed PostgreSQL承担。控制面副本从数据库
+恢复desired work；Node restart/adoption由ADR-0040处理。上线验收必须覆盖双Controller
+takeover和真实RDS failover，不能用单元测试替代。
+
+## 后果
+
+- PostgreSQL是控制面唯一持久authority，API/Controller副本无本地业务数据库；
+- 数据库暂时不可用时，已Running的数据面继续，但新mutation和需要MetadataStore的durability
+  操作有界失败或阻塞；
+- 本地开发与完整测试需要Docker或外部PostgreSQL；
+- backend或schema兼容范围变化必须通过新ADR、显式迁移链和生产副本演练。

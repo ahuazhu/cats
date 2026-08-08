@@ -1,149 +1,128 @@
-# 在 AWS 裸金属上部署真 microVM
+# Run Cats on Linux bare metal
 
-Phase A 形态（正确性优先）：Cloud Hypervisor 直接内核启动真 Guest；磁盘链路
-`guest virtio-blk → CH raw disk → /dev/nbdN（内核 NBD client）→ cats-blockd →
-BlobStore port → AWS S3/File adapter`；Guest Agent 走 vsock；Suspended=vm.pause，Warm=vm.snapshot
-+ 全进程退出，Restore=--restore。每个 Cat 有独立 tap `/30` 和 Host SNAT 出站；
-公网 HTTP Endpoint 经 owning Node 进入 Guest tap。跨节点 overlay 与 WebSocket 入站仍是
-后续里程碑，不改变提交协议。
+This directory is the direct-host development and acceptance path for real KVM
+and Cloud Hypervisor. Production AWS resources and long-lived workers are owned
+through [Terraform](../aws/terraform/README.md); this runbook does not replace
+their state, IAM, network, drain, or decommission procedures.
 
-原生 vhost-user-blk 路径已实现并在本机型上验收（ADR-0015）：在 `/etc/cats/cats.env` 里设
-`CATS_BLOCK_PATH_ARGS=--ch-block-path vhost-user --ch-vhost-user-queues 4`，磁盘链路变成
-`guest virtio-blk → CH vhost-user-blk client → cats-blockd`，不再需要 `nbd` 内核模块或
-`/dev/nbdN`（队列数会自动夹到每个 Cat 的 vCPU 数，CH 拒绝 `num_queues > vCPU`）。
-两条路径在 i4i.metal 上跑同一套 `e2e.sh` 都是 22/23，含 Warm snapshot/restore；
-vhost-user 的 Warm restore 快 1.8×、随机读 p50 更低，但按当前形态（CH 带缓冲打开
-`/dev/nbdN`）NBD 的写吞吐更高，所以**默认仍是内核 NBD**。数据与根因见
-`experiments/vhost-user-blk-frontend-20260726/README.md`。
+## Runtime shape
 
-多节点：每台跑一次 `install.sh`，然后在 `cats.env` 里给每台唯一的 `CATS_NODE_ID`、
-`CATS_NODE_LISTEN`、`CATS_NODE_ADVERTISE_URL`，并让所有节点指向同一个
-`CATS_CONTROL_PLANE_URL` 以及**同一套共享 storage-meta 与 object store**（PostgreSQL + S3；
-SQLite 和 file adapter 是每台主机私有的，跨节点迁移不可能成立）。双节点验收见
-`experiments/metal-cluster-20260726/README.md`。
+- Cloud Hypervisor boots the Cats Guest kernel and RootDisk directly.
+- The Guest agent uses vsock; systemd is Guest PID 1.
+- Both block paths use the same `cats-blockd` engine and persisted format:
+  - `kernel-nbd` is the current default;
+  - `vhost-user` is the Linux-native alternative selected with
+    `--ch-block-path vhost-user`.
+- Each Cat has a tap and Host SNAT for egress. The Rust development path has
+  owning-Node HTTP and WebSocket ingress. Cross-Node Guest overlay and real
+  production WebSocket qualification are separate gaps.
 
-## 1. 开机器
+The current block-path decision and default-flip gate are in
+[ADR-0015](../../docs/decisions/0015-vhost-user-blk-production-block-frontend.md).
 
-- **实例**：x86_64 裸金属，如 `c5.metal`（≈$4.08/h）或 `i4i.metal`（本地
-  NVMe，≈$10.9/h）。必须 metal（需要 /dev/kvm）。
-- **AMI**：Ubuntu 22.04/24.04 LTS x86_64。
-- **安全组**：只开 22 端口（SSH）。所有 Cats 服务默认只听 127.0.0.1（网关
-  0.0.0.0:7400，若不需要外网 Endpoint 也可改回本地）。
-- **磁盘**：根卷 ≥100 GiB gp3（编译 + 缓存）。
+## Host prerequisites
+
+- x86_64 Linux with `/dev/kvm`; use a bare-metal instance for Cloud Hypervisor.
+- Ubuntu 22.04 or 24.04 LTS and enough root storage for the Rust build, Guest
+  image, runtime state, and evidence.
+- Local NVMe for the intended cache/Relaxed path when validating that behavior.
+- Least-privilege network rules and an instance role or other short-lived AWS
+  identity for the selected S3/PostgreSQL adapters. Guest images never receive
+  these credentials.
+
+## Install
+
+Use an exact reviewed repository revision:
 
 ```bash
-aws ec2 run-instances \
-  --image-id $(aws ssm get-parameter --name \
-      /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
-      --query Parameter.Value --output text) \
-  --instance-type c5.metal \
-  --key-name YOUR_KEY \
-  --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=100,VolumeType=gp3}' \
-  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=cats-metal}]'
+git clone <this-repo> cats
+cd cats
+sudo deploy/metal/install.sh
+sudoedit /etc/cats/cats.env
 ```
 
-## 2. S3 durable 层（推荐）
+`install.sh` installs build/runtime dependencies, builds release binaries,
+installs the pinned Cloud Hypervisor, constructs the Guest kernel/initramfs/root
+image, and installs the systemd units. It configures the kernel NBD pool for the
+default path; vhost-user does not consume `/dev/nbdN`.
+
+仅限首次安装、尚未创建任何 Cat 的空节点，配置后可以直接启动或重启服务。
 
 ```bash
-aws s3 mb s3://YOUR_BUCKET
-# 建一个只有该桶权限的 IAM 用户，生成 Access Key，填进 /etc/cats/cats.env
-```
-
-不配 S3 时默认本地文件 BlobStore（`/var/lib/cats/blob`）——功能完整但不具备
-跨 Host 持久性。
-
-## 3. 安装
-
-```bash
-ssh ubuntu@<ip>
-git clone <this-repo> cats && cd cats     # 或 rsync 本地检出
-sudo deploy/metal/install.sh              # 依赖+编译+CH+guest镜像+systemd
-sudoedit /etc/cats/cats.env               # 配 S3（可选）后:
-# 仅限首次安装、尚未创建任何 Cat：
 sudo systemctl restart cats-noded
 ```
 
-上面的重启命令只适用于首次安装后、节点上还没有 Cat 的情形。复用已有节点时，先执行
-`cats admin node drain <node-id>`，并确认管理接口报告 `state=cordoned cats=0 orphans=0`，
-再停止或重启 `cats-noded`。#186 完成 crash-safe ledger 和 per-Cat scope 前，systemd 的默认
-`KillMode=control-group` 会终止同一 cgroup 中的 VMM 与 blockd；后者可能持有尚未发布的
-Relaxed journal，因此不能在活跃节点上直接执行该命令。
+其他节点先执行：
 
-`install.sh` 做的事：apt 依赖、rustup、`cargo build --release`、下载
-cloud-hypervisor 静态二进制（`CH_VERSION` 可覆盖，默认 v53.0，与实验一致）、
-`modprobe nbd nbds_max=64`、构建 Guest 三件套（宿主内核 vmlinuz + 最小
-initramfs + Ubuntu 24.04 minbase/guest-agent golden rootfs）、装 systemd 单元并启动。
+```bash
+cats admin node drain <node-id>
+```
 
-Guest 的 BusyBox 只存在于 initramfs，用来加载 virtio/ext4/vsock 并
-`switch_root`。用户进入的是完整 Ubuntu root，默认包含 `apt`、`curl`、`git`、
-`wget`、`iproute2`、`ping`、`procps`、`nano` 和 OpenSSH client。`cats shell`
-默认启动 login Bash，启用 256 色 prompt、Readline 路径补全和
-`bash-completion`（后续安装的 `gh` 等软件可直接注册自己的补全）。systemd 是默认
-PID 1，普通 enabled service 会在 `multi-user.target` 正常启动；根盘扩容、确定性的
-tap `/30` 配置和 Guest Agent 是 `sysinit.target` 之前的早期 unit，所以 Agent
-readiness 不等待完整 multi-user transaction。未使用的 serial getty、wait-online 和
-apt timer 已 mask。golden root 默认 512 MiB，首次启动会把 ext4 在线扩到用户请求的
-RootDisk 大小；因此生产创建建议至少 1 GiB。`GUEST_INIT_MODE=direct` 仅用于复现
-历史实验，不是默认产品形态。Guest unit 的源码位于 `guest-systemd/`，镜像构建脚本
-只负责把它们安装到 rootfs。
+Proceed only when the admin view reports `state=cordoned cats=0 orphans=0`.
+Current production units use systemd `KillMode=control-group`; stopping the
+agent also stops its VMM/blockd children and can strand unpublished Relaxed
+state. Agent-surviving per-Cat scopes become safe only with the complete
+ADR-0040 Host-lock/checkpoint/inventory cutover.
 
-systemd 作为 Host manager 启动时会把 Guest 根挂载递归改成 shared。Cats 的
-`cats-mount-propagation.service` 在其他平台 early unit 和普通用户 service 之前执行
-`mount --make-rprivate /`。因此 `/`、`/dev` 和 `/dev/shm` 的发布契约都是 private，
-`/dev/shm` 仍是 root 拥有、mode 1777 的 tmpfs；用户工作负载在 chroot/container
-中递归 bind 和卸载 `/dev`，不能反向卸载 Guest 或另一个 peer tree 的 `/dev/shm`。
-direct 诊断 init 也显式建立同一契约。
+## Cluster configuration
 
-`cats-noded` 启动时默认探测 Host 的逻辑 CPU 与内存总量作为可调度容量；管理员页面
-同时展示 Host CPU、内存和节点状态目录所在文件系统的实时使用量。若需要给 Host
-保留资源，可在环境文件中设置 `CATS_NODE_CPUS` / `CATS_NODE_MEMORY_MIB` 降低调度上限。
+Every Host needs a unique `CATS_NODE_ID`, listen address, and advertised URL.
+All Hosts in one fleet point to the same control plane, PostgreSQL metadata
+store, and durable object store. File and SQLite adapters are local development
+adapters and cannot provide cross-Host restore.
 
-## 4. 验收
+Select vhost-user in `/etc/cats/cats.env` when required:
+
+```text
+CATS_BLOCK_PATH_ARGS=--ch-block-path vhost-user --ch-vhost-user-queues 4
+```
+
+Queue count is bounded by Guest vCPU count. Host CPU and memory are detected by
+default; lower the scheduling limits with `CATS_NODE_CPUS` and
+`CATS_NODE_MEMORY_MIB` to preserve Host headroom.
+
+The default Guest is an ordinary Ubuntu root with systemd services. The golden
+RootDisk expands online at first boot; provision at least 1 GiB for normal use.
+`GUEST_INIT_MODE=direct` exists only for historical experiment reproduction.
+
+## Verification
+
+Run the real-KVM lifecycle acceptance:
 
 ```bash
 sudo deploy/metal/e2e.sh
 ```
 
-断言（全部基于**真实内核 boot_id**）：create→Running、systemd PID 1、
-Guest Agent unit active、guest 内核版本=直接启动的内核、DNS/HTTPS 出站、写文件+sync、
-普通 enabled service 在 Suspend/Warm 不重启、Cold 后恰好再启动一次、warm 后无常驻
-VMM、restore 同 boot 且文件在、stop/start 换 boot 且数据从 durable 层恢复、destroy。
+It checks create, Guest/systemd readiness, networking, durable writes,
+Suspend/Resume, Warm snapshot/restore, Cold boot, and destroy using physical
+Guest boot identities. Raw environment-specific evidence is retained under
+[`metal-e2e-20260721`](../../experiments/metal-e2e-20260721/README.md),
+[`vhost-user-blk-frontend-20260726`](../../experiments/vhost-user-blk-frontend-20260726/README.md),
+and [`metal-cluster-20260726`](../../experiments/metal-cluster-20260726/README.md).
+Those runs are correctness evidence for their exact revisions, not an SLA.
 
-2026-07-21 的 AWS i4i.metal + 真实 S3 验收结果与失败诊断记录保存在
-[`experiments/metal-e2e-20260721/`](../../experiments/metal-e2e-20260721/README.md)：
-最终 `17 passed, 0 failed`。这是单次正确性验收，不是性能样本或生产 SLA。
-
-手动玩法与本地 CLI 相同（`cats create/exec/suspend/warm/...`）。
-
-挂载传播与 PostgreSQL 17 有单独的真实 Guest 验收。它只创建带自动过期时间的
-`metal-mount-propagation-e2e` Cat，安装真实 PostgreSQL 17，构造两个真实 chroot，
-执行 `/dev` recursive bind 和 deepest-first lazy unmount，再验证 Guest 与 replacement
-root 的 `/dev/shm`、uid 70 POSIX shared memory 和 PostgreSQL restart：
+The mount-propagation fixture is isolated acceptance work, not a production
+deployment step:
 
 ```bash
 sudo deploy/metal/mount-propagation-e2e.sh
 ```
 
-该脚本应只在隔离的 metal acceptance stack 上运行；它不是生产部署步骤。
+## Operational boundaries
 
-发布这个契约变更需要重建 golden root。NodeRuntime 会缓存已发布的 image id，因此
-节点应先 drain，再受控重启 `cats-noded`；不需要重建 Host OS 或重启整台 worker。
-已经基于旧 golden 创建的 RootDisk 不会自动 rebase，需要单独安装/enable 同一 early
-unit 后 Cold boot，或显式重建 Cat。不要在未授权时用 worker restart 或批量修改现有
-Cat 代替迁移。
+- Drain to an empty, residue-free Node before an agent release or Guest-image
+  change.
+- Rebuilding a golden image does not rebase existing RootDisks. Migrate or
+  rebuild those Cats explicitly.
+- Cloud Hypervisor disk changes currently take effect through a stopped/cold
+  transition rather than online hot-plug.
+- The Node agent currently runs with Host privileges needed by KVM, networking,
+  and kernel NBD; privilege separation remains unimplemented.
+- Cross-Node overlay, automatic Host fencing, and the ADR-0040/0041 coordination
+  cutover remain target work. Current HTTP/WebSocket bridges do not prove their
+  production Cloud Hypervisor boundary.
 
-## 5. 已知边界（Phase A）
-
-- Guest 已有单节点 tap + SNAT 出站和公网 HTTP Endpoint → tap 入站；跨节点私网
-  overlay 和 WebSocket 入站尚未实现。Guest 默认不能访问 Host、VPC 私网或云
-  metadata；exec/健康仍走 vsock。
-- 磁盘热插拔在 CH 模式暂不支持（停机挂载生效）。
-- 单节点单元（`metal-1`）；多金属节点 = 每台跑 install.sh + 唯一 --node-id，
-  指向同一 control plane 与 S3（storage-meta 需共享→生产 PostgreSQL 项）。
-- noded 以 root 运行（KVM/NBD 需要）；特权拆分是加固里程碑。
-
-## 6. 回收
-
-```bash
-aws ec2 terminate-instances --instance-ids i-xxxx
-```
+Decommission a Terraform-owned Host through its exact state and reviewed plan.
+For a disposable manually created acceptance Host, first preserve required
+evidence, verify it owns no runtime or durable-only local state, and then delete
+that exact instance through the provider API.

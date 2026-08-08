@@ -1,27 +1,42 @@
-# ADR-0004：实现技术栈与开发测试环境
+# ADR-0004: Use one Rust workspace and layered verification environments
 
-- 状态：Accepted
-- 日期：2026-07-21
+- Status: Accepted
+- Date: 2026-07-21
 
-## 背景
+## Context
 
-数据面 `cats-blockd` 已定为 Rust（ADR-0003）。控制面与 CLI 的语言（完整架构 §19.2 原为“Go 或 Rust”）以及日常开发/集成测试环境此前未定。
+Cats has shared protocols and correctness invariants across the control plane,
+Node agent, Guest agent, block service, adapters, and CLI. Maintaining those
+contracts in multiple production languages would duplicate wire types, error
+semantics, and test infrastructure. Linux/KVM behavior also cannot be proven by
+macOS unit tests alone.
 
-## 决定
+## Decision
 
-1. **生产组件统一 Rust**，单一 cargo workspace：
-   - `cmd/cats`：CLI（clap）。
-   - `control-plane`：Resource API、Operation、Controller（axum + sqlx + tokio）。
-   - `node-agent`、`blockd`：数据面（vhost-user-backend 等 rust-vmm 生态）。
-   - `api`/协议类型作为共享 crate，避免跨语言维护两份定义。
-   - Python 只作为规格 oracle 与实验工具（lazy-ext4 oracle、实验脚本），不进入生产路径。
-2. **开发与测试环境分两层**：
-   - 日常开发与正确性测试：macOS 本地 Docker privileged 容器（Linux NBD + ext4 + crash 注入，lazy-ext4 同款环境，零额外成本）；CI 使用同一容器镜像。
-   - Cloud Hypervisor/KVM/vhost-user 集成与性能基准：按需开 AWS 裸金属（i4i.metal / c5.metal），跑完即销毁；正式 CSV/日志按既有惯例回收进 `experiments/`。
-3. **S3 集成测试**默认使用 MinIO 等 S3 兼容容器；里程碑验收必须在真实 S3 上重跑。
+1. All production components live in one Rust Cargo workspace.
+   - `cmd/` contains executable composition roots and the CLI.
+   - domain and protocol crates own provider-neutral contracts.
+   - `control-plane`, `node-agent`, `guest-agent`, and `blockd` own their
+     respective runtime behavior.
+   - provider products remain in adapters and deployment code.
+2. Shared wire and persisted types have one Rust definition where component
+   boundaries permit it. Compatibility is still tested at serialized and
+   process boundaries rather than assumed from shared source.
+3. Python and shell are limited to experiments, operational probes, fixtures,
+   and correctness oracles. They do not become a second production runtime.
+4. Verification has three layers:
+   - portable workspace tests and local adapters for fast correctness work;
+   - Linux containers for NBD, vhost-user, systemd-facing contracts, and code
+     compiled out on macOS;
+   - on-demand real KVM, S3, PostgreSQL, and multi-node environments for the
+     acceptance boundaries that containers cannot prove.
+5. Raw experiment inputs and results record environment, sample count, and
+   correctness oracle under `experiments/`. Prototype numbers are not SLAs.
 
-## 影响
+## Consequences
 
-- 完整架构 §19.2 技术选型由“Go 或 Rust”改为 Rust。
-- 根 README 的目标代码结构按 cargo workspace 理解（目录名不变）。
-- 招聘/协作假设：一人 + AI Agent 开发，单工具链优先于生态多样性；若未来团队扩大需要 Go 控制面，另立 ADR 评估。
+- One toolchain and type system cover the production path.
+- Linux-only changes require the Linux quality gate, and Host/VMM claims require
+  real-environment evidence proportional to their risk.
+- A future language split requires a concrete isolation boundary and a new ADR;
+  team size or temporary staffing is not an architectural reason by itself.

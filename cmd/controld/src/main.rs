@@ -102,7 +102,7 @@ struct Args {
     #[arg(long, env = "CATS_AUTH_TOKEN", default_value = "dev-service-token")]
     auth_token: String,
     /// PKCS#8 Ed25519 private key used only by the control plane to issue
-    /// short-lived Endpoint Route Grants (ADR-0033).
+    /// short-lived V1 Endpoint Route Grants.
     #[arg(long, env = "CATS_ROUTE_GRANT_PRIVATE_KEY_FILE")]
     route_grant_private_key_file: std::path::PathBuf,
     /// Matching Ed25519 public key. Startup signs and verifies a challenge so a

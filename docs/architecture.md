@@ -1,0 +1,401 @@
+# Cats 技术架构
+
+- 状态：目标架构；ADR-0040/0041/0042 已接受，Rust 实现尚未完成切换
+- 更新：2026-08-08
+- 适用范围：产品资源、控制面、Node、网络入口、microVM 与块存储
+
+## 1. 大目标
+
+Cats 提供可休眠、可恢复、可迁移的 Linux microVM。用户看到普通 Linux、
+virtio block device、ext4、稳定 HTTPS Endpoint 和标准 CLI/API；对象存储、
+本地 NVMe、VMM、fencing 与路由权限都留在平台内部。
+
+架构首先保证三件事：
+
+1. **正确**：不丢不该丢的数据，不出现双写者，不让旧任务或旧路由复活。
+2. **稳定**：组件重启、重复请求、响应丢失和部分失败都能从当前事实收敛。
+3. **高可用**：单个控制面进程或 Node Agent 退出不应停止已经 Running 的工作负载；
+   Node 永久丢失后，在可信外部隔离完成时从远端 durable state 恢复。
+
+## 2. 结论
+
+不推翻已验证的技术底座：
+
+- KVM + Cloud Hypervisor、标准 virtio-blk/ext4；
+- Direct-OS ChunkStore、S3 immutable objects、PostgreSQL root/lease CAS；
+- Strict/Relaxed durability、RWO attachment 与 fencing epoch；
+- Running / Suspended / Warm / Cold 四态；
+- PostgreSQL 控制面、多 API 副本与有界 singleton leadership；
+- 短期 Ed25519 Route Grant 和 Node 作为最终 admission verifier；
+- systemd Guest PID 1、Guest Runtime HTTP/Unix socket、Workspace ownership。
+
+控制面到 Node 的协调模型整体切到以下闭环。每个边界只保留一份当前 authority，Node 的
+恢复状态与当前 Cat 数量成正比：
+
+```text
+PostgreSQL DesiredRuntimeSpec(revision)
+                 |
+                 | level-triggered delivery / pull
+                 v
+       Node per-Cat reconciler -------- MetadataStore owner/epoch CAS
+                 |
+                 | inspect + converge
+                 v
+ physical runtime + one bounded RuntimeCheckpoint
+                 |
+                 | complete ObservedRuntimeStatus
+                 v
+        PostgreSQL read model / exact Operation settlement
+```
+
+通知、队列和缓存只能加速这个循环；丢失它们不能改变正确性。
+
+## 3. 结构性问题
+
+现有故障不是一串互不相关的 bug，而是六个系统边界没有闭合：
+
+| 结构性问题 | 当前表现 | 终态规则 |
+|---|---|---|
+| 生命周期权威分裂 | Cat 行、Controller transitional state、NodeJob、heartbeat 和内存结果都能影响状态 | PostgreSQL只写完整desired；Node只执行并报告observation |
+| 物理所有权不可恢复 | Agent重启会杀子进程，副作用后才写ledger，资源按hash猜名字 | Host lock、per-Cat scope、effect前checkpoint和完整物理inventory |
+| 卷接管与Guest可用混在一起 | 过期lease可被普通Start抢占，block attach被当成mount Ready | normal acquire与proof-bound takeover分离；ext4 UUID/mount是Ready条件 |
+| 路由能力与runtime事实脱节 | token有效期、共享mirror和Node generation共同充当route状态 | Grant只传递能力；Node本地gate/guard是最终admission authority |
+| 怀疑被当成隔离证明 | heartbeat超时可能推动跨Node恢复 | timeout只产生suspicion；HostFenceEvent后仍需新Desired和逐卷授权CAS |
+| 运行面缺少有界故障合同 | 同步PG阻塞async worker，故障域、告警和真实资格测试分散 | 有界DB执行、明确故障域、同一套可重复的Linux/metal故障矩阵 |
+
+这些问题只能通过一次协调面重建共同解决。单独修NodeJob、延长TTL、增加重试或再建一份
+状态表都会保留原来的多权威结构。
+
+### 3.1 当前实现事实
+
+仓库当前是完整的 V1 开发实现，不是上述目标协议：
+
+| 范围 | 当前事实 | 目标差距 |
+|---|---|---|
+| ChunkStore | Rust engine、delta pack、golden root、NBD/vhost-user-blk、fencing 与 crash tests 已存在 | 保持格式和语义；补齐组合故障验收 |
+| 控制面 | PostgreSQL 同时保存 desired、observed、generation；Controller 派生 `NodeJob` | 切到完整 DesiredSpec 和纯 observation read model |
+| Node | 动作结果只在内存 journal；动作结束后才写完整 JSON ledger | 副作用前写一个有界 checkpoint，并以物理枚举重建 |
+| heartbeat | 只有 Node/Cat generation/state，会直接覆盖 Cat observed | 加 agent instance、sequence、完整 inventory；只写 observation |
+| route | 已签名并在 Node 验证，Gateway另有DynamoDB mirror，但没有独立的本地 installed/retired gate | 精确绑定incarnation/per-Endpoint route epoch并原子guard；删除shared mirror |
+| Node restart | 测试能重新打开部分子进程，但生产 unit 仍会随 Agent cgroup 杀进程，且无 Host 排他锁 | per-Cat scope、union enumeration、Host lock 后才宣称可接管 |
+| HA | 多副本/RDS/RDS Proxy结构已存在；双节点Cold迁移有真机证据；当前Store会同步串行慢DB调用 | 异步有界DB执行；真实control-plane takeover、RDS failover和自动Host fence验收 |
+| PersistentDisk | 当前只把raw virtio设备和`mount_path`送到Node，没有filesystem identity或Guest mount结果 | ext4 UUID、一次性format authority和mounted observation |
+| Guest network | per-Cat tap、owning-node HTTP/WebSocket bridge与dev E2E已存在 | 真实CH/生产WebSocket资格证据与跨Node overlay仍缺失 |
+
+### 3.2 组件职责
+
+| 组件 | 只负责 | 不负责 |
+|---|---|---|
+| Control Plane | WorkOS/Workspace授权、资源API、DesiredSpec、Operation、placement、Grant签发、fleet策略 | Running块I/O、逐请求Guest代理、物理状态猜测 |
+| Gateway | hostname解析、用户入口、wake触发、缓存并转发不透明Grant | route authority、token重签、生命周期副作用 |
+| Node Agent | Host资源、per-Cat reconcile、物理inventory、VMM/blockd/route gate | 用户资源authority、跨Host自行抢占 |
+| Cloud Hypervisor/Guest Agent | microVM执行、pause/snapshot/restore、vsock控制、Guest-local Runtime API | S3/PostgreSQL凭据和平台调度 |
+| cats-blockd | 标准块协议、cache/pending、commit、lease/fencing | Cat placement和用户身份 |
+| PostgreSQL | 控制资源事务、Operation、usage projection、volume root/lease CAS | VMM是否实际存在 |
+| Object Store | immutable data/map/commit/archive objects | 当前writer和current root选择 |
+| Metering | Node累计计数器、durable delivery、可重建projection/rating | 用desired allocation猜实际消耗 |
+
+具体云产品只出现在 composition root和`adapters/`；domain/storage contracts不依赖AWS类型。
+
+### 3.3 关键数据路径
+
+- **Create/Wake/Stop**：API事务写新 DesiredSpec/Operation，Node拉取并收敛，observation精确
+  结算Operation。Controller重启只重扫当前desired，不重放历史命令。
+- **Running HTTP/WebSocket**：Gateway取得短Grant后直达owning Node；Node本地gate验证并
+  guard，Control Plane不在每请求热路径。
+- **Guest block I/O**：Guest -> virtio -> NBD/vhost-user -> blockd；FLUSH的唯一持久性
+  边界是本地`L`和远端`R`，与lifecycle消息无关。
+- **Usage**：Node从Cat专属cgroup读取单调累计量，经durable spool/delivery进入projection；
+  支付提供商和展示缓存都不是ledger authority。
+- **Admin/fleet**：cordon/drain只产生受版本保护的desired变化；跨Node恢复仍受route drain、
+  `R == L`、lease release或HostFenceEvent约束。
+
+## 4. 简单的权威边界
+
+不存在一份包办所有事实的“全局真相”。每类事实只有一个写入权威：
+
+| 事实 | 唯一权威 | 其他副本的地位 |
+|---|---|---|
+| 用户意图、完整 runtime spec、目标状态、placement | PostgreSQL `DesiredRuntimeSpec` | Node 只缓存当前 revision |
+| API 幂等、Operation 与审计 | PostgreSQL | 日志不是恢复依据 |
+| VMM/blockd/Guest/snapshot 是否真实存在 | Node 新鲜物理枚举和协议握手 | PostgreSQL 只保存 observation |
+| 当前恢复步骤 | 每 Cat 一个原子替换的 `RuntimeCheckpoint` | 只是一条有界恢复线索，不覆盖物理事实 |
+| volume writer、attachment epoch、remote root | MetadataStore CAS | desired attachment 是请求，不是写权限 |
+| Relaxed 尚未远端发布的数据 | 原 Node 的 pending pack/journal，直到 `R == L` | 这部分不是可删除 cache |
+| Endpoint 配置和 route epoch | PostgreSQL | Gateway 只缓存 |
+| 当前 Node admission | Node 本地 route gate + active guards | 签名 Grant 是 capability，不是物理状态 |
+| Node 存活/库存 | 带 instance/sequence 的 observation | timeout 只是 suspicion，不是 Host fence |
+
+本地 checkpoint 缺失、损坏或与物理事实冲突时，Node 必须报告
+`Blocked`/`Quarantined`；“没在文件里看到”不能推断 Cat 已 Cold。
+
+## 5. 产品资源
+
+- **Workspace** 是唯一资源 owner；Account/Organization 只参与身份、成员关系和计费。
+- **Cat** 持有 runtime spec、RootDisk、稳定 Endpoint 和四态目标。
+- **RootDisk** 跟随 Cat 生命周期；只有显式 disposable-root Destroy 可以放弃未远端
+  发布的 tail。
+- **PersistentDisk** 独立存在且为 RWO；任何未知分类或残留 attachment 都要 fail closed。
+- **Snapshot** 是远端 durable root 的不可变引用，不能引用仅存在本地的 `R < L`。
+- **Operation** 精确绑定一个 `desired_revision`，是用户 mutation 的结果，不是 Node 工作流。
+
+## 6. 生命周期协调
+
+### 6.1 DesiredRuntimeSpec
+
+每次有效 mutation 在一个 PostgreSQL 事务内写完整 spec，并递增单调
+`desired_revision`。它至少包含：Cat/Workspace、稳定目标态、placement node 和 epoch、
+CPU/内存/boot image、完整磁盘 attachment 集、网络/Endpoint epoch，以及离开 Running 时
+使用 `require_idle` 还是 `cancel_and_drain`。需要Guest挂载的PersistentDisk还声明稳定
+device identity、ext4 UUID、mount path和仅对空白新盘有效的一次性format authority。首版只在
+Cold修改VM shape和磁盘集合，并且只在Cold创建DiskSnapshot；卷容量创建后不可变，Running
+attach/detach不引入hotplug状态机。
+
+Endpoint mutation与新的完整desired revision、`route_epoch`和hostname lookup index在同一
+PostgreSQL事务提交。`route_epoch`是per-Endpoint serving lineage：binding变化递增；任何gate实际
+close后重开也必须由fresh Desired递增。未变Endpoint不因其他Endpoint mutation重绑或中断。
+lookup只定位current revision，不成为另一份Endpoint authority。Running请求
+只有先选定placement才能提交；无容量时API直接返回容量不足，不留下半个desired。
+
+相同 idempotency key 返回原 Operation。已经处于同一目标且 spec 未变时不制造新 revision。
+一个 revision 是完整期望，不依赖读取旧命令才能解释。
+
+### 6.2 Node reconcile
+
+每个Node进程先取得Host级排他锁，每个Cat由一个常驻reconciler worker串行修改checkpoint
+和物理资源。每Cat另有一个短`AdmissionCell`，其中保存per-Endpoint gates、全局lifecycle
+admission以及Endpoint/Platform guards；reconcile的枚举、数据库、VMM和fsync不持有该cell。
+一次reconcile：
+
+1. 读取最新 spec，拒绝旧 revision、错误 node 或 placement epoch。
+2. 合并 checkpoint、systemd scopes、进程 start time、控制 socket、blockd status、
+   data directory、snapshot 和 MetadataStore owner/epoch，形成完整现况。
+3. 身份不足或冲突时 quarantine；绝不猜测、抢租约或删除未知目录。
+4. 在第一个副作用前原子写当前 checkpoint；外部副作用使用当前 revision、incarnation或
+   transition identity的最窄条件合同。
+5. 只执行下一个安全、幂等步骤；安装或关闭route时只在内存线性化点短暂进入AdmissionCell；
+   每步后更新同一checkpoint。
+6. 达到稳定目标后发布完整 observation；checkpoint 收敛为稳定快照，而非追加历史。
+
+tap/subnet、kernel-NBD slot和vhost-user socket按Host inventory在Host resource lock下分配，
+exact identity先写checkpoint。容量耗尽是明确placement failure；cleanup只删除ownership token与
+物理identity同时匹配的资源，不按Cat hash重算名字后先删。
+
+新 VMM 进程创建前生成 `runtime_incarnation`。Warm restore 创建新 VMM，因此也产生新
+incarnation；Suspended 的原进程 resume 可以保持 incarnation。已经在线性化的旧pause/stop
+可能完成，但只能作用于它记录的incarnation，不能取得新存储authority、打开新route、发布
+新observation或结算新Operation；最新revision随后按物理postcondition继续修复。
+
+### 6.3 Observation 与 Operation
+
+provisioner先把`node_id`、provider验证的不可变Host identity和每Node credential绑定在
+PostgreSQL；注册不接受Agent自报identity或fleet共享credential。Agent在请求前持久化
+registration attempt，同一attempt重试返回同一session epoch；同Host新session使旧session永久
+失效，不同Host使用新的Node identity或先完成显式fence/reprovision。heartbeat envelope包含
+session epoch、agent instance、该instance内单调sequence和本次inventory是否完整。full scan在
+current session下建立独立`AdmissionInventoryAttestation`；partial heartbeat引用其epoch而不覆盖。
+每个Cat status包含
+applied revision/spec digest、placement epoch、runtime incarnation、物理状态、结构化
+Condition、逐卷 owner/epoch 与 `R/L`、route gate 和 active guard 数。
+
+控制面只接受当前注册Agent的递增sequence。observation可以更新read model，但不得改desired。
+Operation只有在同revision、同placement、满足目标postcondition时成功；新的用户intent使旧
+Operation `Superseded`，placement丢失则当前Operation明确`Failed`，系统恢复使用新的system
+revision。Quarantined同样使当前Operation失败，人工处理通过新revision表达。Deleted desired
+保留到精确Deleted observation或fence证明完成，再按保留策略GC。N+2的同名状态不能完成N。
+
+详细合同见 [Runtime Reconciliation v1](specs/runtime-reconciliation-v1.md) 和
+[ADR-0040](decisions/0040-level-triggered-runtime-reconciliation.md)。
+
+## 7. 四态和数据屏障
+
+四态定义与资源账本见 [runtime-lifecycle.md](runtime-lifecycle.md)。核心边界不变：
+
+`WarmRuntimeSnapshot`指Host本地的VMM memory/device快照；`DiskSnapshot`指MetadataStore中
+远端durable Root的产品资源。两者生命周期、GC和上线门独立。
+
+- Suspended = VMM pause + page-out，Host-bound；允许 Relaxed `R < L`，但必须完成 Guest
+  本地 durability barrier，并保留 Host、blockd、lease 和 journal。
+- Warm = memory/device snapshot + VMM exit，Host-bound；进入前所有保留卷必须 `R == L`。
+- Cold = 无 VMM/Guest 内存状态；所有保留卷必须 `R == L`。
+- Warm restore 或 Suspended resume 失败，先保护本地唯一数据，再收敛到可证明的 Cold。
+
+普通Start遇到另一个writer时，即使其lease TTL已过，也必须返回
+`Blocked(SupersededByAnotherNode)`。normal acquire只允许精确的unowned epoch；只有重放同一个
+transition才返回原grant。计划handoff先由源release，再由目标normal acquire；非计划Host loss
+才使用精确绑定旧owner/epoch、新attachment/placement与`HostFenceEvent`的逐卷takeover
+authorization。一个Host fence可以派生多个逐卷授权，但每份授权只能CAS一个卷。
+heartbeat timeout、Route Grant TTL和“Node看起来不健康”都不是fence。
+
+## 8. 存储
+
+Guest 只看到标准块设备。`cats-blockd` 把稀疏本地 cache、64 KiB dirty page、delta/base
+objects、Merkle Map 和 PostgreSQL root/lease CAS 组合成一个卷。详细当前合同见
+[storage.md](storage.md) 与 [blockd protocol](specs/blockd-protocol.md)。
+
+Strict 的成功 FLUSH 保证远端 root 已 CAS；Relaxed 的成功 FLUSH 只保证 `L`，可能仍有
+`R < L` 的唯一数据。因此本地 NVMe 只有在 `R == L` 时才完全是可删除 cache。Warm、Cold、
+snapshot、detach、计划迁移和 PersistentDisk destroy 前必须 drain 到 `R == L`。
+
+磁盘集合在Cold desired中修改。RPC响应丢失时不回滚binding；控制面等待Node observation
+收敛。volume删除先阻止新attachment，再证明没有desired、lease、pending和inventory residue，
+进入Deleting状态后幂等清对象，不能只相信控制面的一列状态。唯一disposable Root例外必须先消费
+绑定Deleted revision、delete ID、attachment、owner/epoch/head与stop/fence证据的精确授权，把
+Owned卷直接CAS到Deleting并提高epoch，随后才删除该`R < L`lineage；PersistentDisk不能使用。
+
+block attach只证明virtio设备存在。声明了ext4 mount的PersistentDisk只有在Guest按稳定device
+identity找到设备、验证期望UUID并报告目标path已mount后才算Ready。新盘创建时在Control Store
+预定UUID和一次性initialization token；匹配UUID可幂等adopt，其他UUID或部分格式化痕迹进入
+quarantine，不再格式化。初始化必须在device flush并把卷推进到`R == L`后才消费token并标记
+Initialized，随后mount和Mounted observation是独立的Ready条件。
+
+DiskSnapshot首版只允许Cold且unowned的卷：以精确generation/root原子pin，GC同时标记当前Root
+和全部retained snapshot roots；只支持恢复到同一Disk。clone与Golden Image自动GC不在本轮范围。
+详细状态机见[Volume Authority and Disk Lifecycle](specs/volume-authority.md)。
+
+## 9. 路由
+
+Endpoint 的 Running 数据路径不逐请求访问控制面：
+
+1. 公网请求只按canonical hostname查Endpoint；Workspace身份用于管理API，不强加给用户应用。
+2. 控制面只为 `Ready/Running` 的精确observation签发短期Route Grant；Ready证明Guest网络、
+   runtime和磁盘mount，不要求应用端口已监听。
+3. Gateway把Grant连同Control Plane验证过的Node transport target放入有界per-replica cache；
+   Grant保持不透明，Gateway到Control Plane和Node使用认证且加密的机器连接。
+4. Node验证签名、时间、Workspace/Endpoint/Cat/Node、runtime incarnation、per-Endpoint route
+   epoch、hostname、协议和端口。desired revision留在signer current-state snapshot，不进入Grant。
+5. Node在短`AdmissionCell`内比较当前installed gate并取得active guard；比较与guard取得
+   不可分割，且该cell不执行任何外部I/O。
+
+离开 Running 时，Node 先关闭 gate，拒绝新 admission，再按策略确认 idle 或取消/排空
+现有 HTTP/WebSocket guards，最后才 pause、snapshot、detach 或 teardown。TTL 限制新
+admission，不能撤销已存在的流，也不能替代本地 gate。
+
+Endpoint A变化只提高A的route epoch；未变B的gate与既有Grant不受影响。任何gate一旦实际close
+或结果不明，重开前都必须由fresh Desired提高该Endpoint epoch；Agent重启也遵守这条规则，不能
+从checkpoint复活旧token。Node任意时刻只接受一个epoch。
+
+只有Node在取得guard、连接Guest和发送任何upstream byte之前返回的typed stale rejection，
+Gateway才compare-and-delete精确cache并singleflight刷新。当前HTTP/WebSocket请求不自动重放；
+刷新只服务后续请求。Guest连接失败、部分响应或transport歧义不清route，也不触发业务重放。
+
+每个Gateway cache有固定容量、resolve并发上限、per-host singleflight和短negative backoff。
+控制面全断时只有已经预热该entry的replica能在token expiry前接新连接；不宣称fleet-wide冷cache HA。
+
+Route正确性只依赖签名Grant、当前Node gate和原子guard。详见
+[Route Grant v2](specs/route-grant-v2.md) 和
+[ADR-0041](decisions/0041-node-verified-route-admission.md)。
+
+## 10. 高可用故障合同
+
+| 故障 | 保证 | 明确不保证 |
+|---|---|---|
+| 单个 API/Controller 退出 | 其他副本继续；新 leader 从 PG desired 扫描 | 内存队列不恢复，也不需要恢复 |
+| 控制面全断 | 已Running的VMM/blockd和现有流继续；预热该entry的Gateway replica可在Grant过期前接新流 | 新mutation、唤醒、Grant续期和冷Gateway cache |
+| PostgreSQL/MetadataStore 暂时不可用 | Running 计算继续；Relaxed 可在本地配额内推进 `L` | Strict FLUSH、远端 publish 和 lifecycle drain 必须成功 |
+| Object Store 暂时不可用 | cache hit 读和 Relaxed 本地提交可有界继续 | cache miss、Strict commit、Warm/Cold 转换 |
+| Node Agent 退出 | 目标形态下VMM/blockd scopes继续；systemd重启Agent，取Host lock后重建 | 代理中的连接可中断、新admission短暂不可用；当前V1尚未满足 |
+| Node 网络分区 | 保留源，不在另一 Node 自动启动 writer | heartbeat timeout 不等于失效转移 |
+| Host 永久丢失 | HostFenceEvent、新Desired和逐卷CAS后从remote `R` Cold恢复；旧epoch永久失败 | Relaxed `R < L` 的tail可能丢失，报告`DataLossPossible` |
+| Warm/Suspended 局部损坏 | 保留卷安全后 Cold fallback | Host-bound 快路径本身不是 HA 副本 |
+| Gateway 退出 | 其他 Gateway 可从控制面取新 route | 无共享镜像时，冷 Gateway 不在 CP 全断期间接新流量 |
+
+AWS自动Node failover使用一个窄、可审计的EC2/BMC Host-fence adapter。provider receipt只建立
+绑定不可变Host/boot、旧session和fence attempt的Active HostFenceEvent，不直接创建placement或
+writer。Control Plane以一个事务失败旧Operation并创建新完整Desired/Operation/placement及全部
+逐卷授权；每卷CAS后才恢复。旧Host网络持续隔离，rejoin把旧`R < L`lineage quarantine并核对全部
+派生授权/current owner；HostRejoinProof把event持久转为Rejoined后才恢复网络。Rejoined event
+不能再派生授权；转换前所有已消费授权必须匹配postcondition，未消费授权必须已过期，转换后
+不得首次生效。
+
+数据库调用在有界blocking executor/连接池中执行，不能让同步driver占住Tokio worker。
+拓扑、故障检测、告警和测试机资格合同见[Operations and HA](operations-ha.md)。
+
+## 11. 安全和运维边界
+
+- Guest 不持有 S3、MetadataStore、WorkOS 或 Node 管理凭据。
+- 用户身份、机器身份和 fleet break-glass 身份分离；所有资源按 Workspace 授权。
+- Route Grant 私钥只在控制面 signer；Node 持有 key ring，Gateway 不解读或重签。
+- blockd/VMM/Guest 最终应运行在 per-Cat systemd scope；Node Agent 本身另有 Host lock。
+- privilege separation 与跨 Node overlay 尚未实现，继续保持为后续工作。
+- 审计事件可以追加、轮转和外送，但删除审计历史不影响恢复。
+
+## 12. 模块和实施依赖
+
+只拆五个有真实边界的模块；每个副作用使用所属边界的窄条件合同：
+
+| 模块 | 负责 | 核心模型或算法 | 依赖 |
+|---|---|---|---|
+| A. Control truth | DesiredSpec、Operation、Endpoint revision、NodeIdentity、AgentSession、observation | PostgreSQL事务、revision CAS、周期扫描 | 共享身份/错误闭集 |
+| B. Node convergence | Host lock、per-Cat reconciler、checkpoint、scope、inventory、Host资源分配 | inspect -> plan one step -> persist -> act -> verify | A的revision/session |
+| C. Volume and disk | RWO lease、逐卷takeover、pack lineage、ext4、snapshot、delete | transition-id CAS、`R/L`屏障、Cold-only磁盘变化 | A的disk intent、B的checkpoint |
+| D. Route and work admission | Endpoint lookup、Grant、Gateway cache、Node gate/guard、RequireIdle | signer一致快照、pre-admission verify、AdmissionCell线性化 | A、B，且C mount Ready |
+| E. Operations and HA | 有界DB执行、控制面/Gateway副本、Host fence/rejoin、告警、资格测试 | suspicion -> proof -> recovery，固定故障oracle | A-D全部稳定 |
+
+依赖顺序是 `A -> B -> C -> D -> E`，但A的schema、B的Host基础和C的MetadataStore合同可在
+接口冻结后并行实现。D只能在revision、incarnation和mount readiness已经可用后接入；E中的
+Host恢复必须同时调用AgentSession、逐卷takeover和route close，不能先上线半条链。
+
+严重程度也只有三层：
+
+1. **阻止数据损坏或双写**：revision/session、normal acquire/takeover、pack lineage、checkpoint、
+   `R/L`屏障、ext4初始化和route close。
+2. **阻止单点故障进入用户面**：有界DB、Agent restart、控制面/Gateway副本、Host fence/rejoin。
+3. **不阻塞本轮的能力**：跨Host Warm/live migration、hotplug、Disk clone、Golden Image自动GC、
+   overlay、privilege separation和新billing形态。
+
+### 12.1 开发与验证顺序
+
+1. 先把每个已知失败写成外部行为oracle：ABA、响应丢失、逐步kill、双Agent、过期owner、
+   `R < L`、错误UUID、旧Grant、active WebSocket和慢数据库。
+2. 在同一开发分支实现A-C并删除旧NodeJob、lease接管和本地ledger路径；测试与部署artifact只
+   包含终态接口。
+3. 接入D并删除DynamoDB route mirror、旧claims/parser、旧IAM和Terraform输入。
+4. 接入E，完成两种block path、真实Cloud Hypervisor、控制面/RDS/Gateway/Agent/Host故障矩阵。
+5. 独立native x86_64 Linux测试机运行exact clean commit的`quality.sh full`并保存不可变receipt；
+   满足隔离、空闲和exact-artifact前置的metal Host再运行同一`runtime-cutover-e2e.sh` oracle的
+   kernel-NBD和vhost-user两次结果。没有合格Host时真实KVM上线门保持Blocked。
+
+### 12.2 Clean-slate 部署
+
+现阶段产品数据可删除，因此首次部署不迁移旧 runtime/data，也不做在线 authority 切换。完整、
+有序的 reset、credential rotation、NodeIdentity bootstrap、qualification 与最后回滚点只由
+[Operations and HA §8](operations-ha.md#8-首次终态部署)定义。继续使用 Chunk/Map/Delta 格式、
+virtio/ext4 和四态，是因为它们是已验证且合适的终态设计，不是兼容要求。
+
+## 13. 上线门
+
+目标只能在以下 oracle 全部通过后称为“正确、稳定、高可用”：
+
+- 旧revision/observation不能结算新revision；晚到物理effect只作用于原incarnation，不能取得
+  新authority或打开新route，最新planner能按postcondition修复；
+- 同一Host只有一个持锁Agent；per-Node credential和已登记Host identity阻止另一Host自报node_id，
+  幂等registration attempt解决响应丢失；
+- 普通Start在过期的其他owner上仍Blocked，只有精确handoff/fence takeover可提高epoch；
+- pending pack与attachment lineage绑定；新attachment不能发布旧epoch本地写；
+- crash后只能adopt、继续或quarantine，无孤儿删除、重复writer和lease抢占；
+- PersistentDisk格式化后必须先`R == L`再标记Initialized，正确UUID mount前不能Running/Ready；
+- snapshot pin保护GC mark set，Deleting状态阻止新attach并完成对象清理；
+- disposable Root `R < L`只有精确Owned->Deleting授权CAS后可删，且不能扩展到PersistentDisk；
+- `R < L` 时 Warm/Cold/detach/migrate 被阻止，远端恢复后能 drain；
+- Host 未 fence 时不跨 Node 启动；takeover后旧epoch永久fail closed，旧Host通过rejoin清场
+  前不恢复workload网络；
+- route先在AdmissionCell停止admission并drain guards，再触碰runtime；慢reconcile I/O不阻塞
+  已Active gate；
+- 未变Endpoint不因其他Endpoint mutation失效；任何实际close后的gate只以更高route epoch重开；
+- stale route只更新cache供后续请求，任何可能已到Guest的请求都不自动重放；
+- 双控制面与真实 RDS failover 不重复副作用；
+- kernel-NBD 与 vhost-user-blk 运行相同安全矩阵。
+
+实验数字只按原始环境、样本和 correctness oracle 引用，不转换成生产 SLA。
+
+## 14. 文档边界
+
+- 本文：组件、权威和故障边界。
+- [runtime-lifecycle.md](runtime-lifecycle.md)：四态、资源屏障和降级。
+- [storage.md](storage.md)：当前 ChunkStore 数据正确性。
+- [Volume Authority and Disk Lifecycle](specs/volume-authority.md)：卷所有权、磁盘状态机和GC。
+- [Operations and HA](operations-ha.md)：运行拓扑、故障恢复和分层验证。
+- `docs/specs/`：可实现、可测试的 wire/state 合同。
+- `docs/decisions/`：为什么选择这些边界。
+- `experiments/` 与实验报告：证据，不是规范。

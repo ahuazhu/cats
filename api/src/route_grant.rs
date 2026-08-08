@@ -2,7 +2,7 @@
 //!
 //! This crate owns only the wire shape. Private-key signing belongs to the
 //! control plane and public-key verification belongs to the Node agent; the
-//! Gateway deliberately treats the compact JWS as opaque (ADR-0033).
+//! The Gateway deliberately treats the V1 compact JWS as opaque.
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};

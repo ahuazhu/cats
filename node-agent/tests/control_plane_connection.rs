@@ -1,4 +1,4 @@
-//! Startup ordering and the control-plane connection loop (ADR-0028 §5).
+//! V1 startup ordering and the control-plane connection loop.
 //!
 //! Two properties are under test here, and they are the two halves of "a node
 //! agent survives its own restart":
@@ -11,7 +11,7 @@
 //!    very first heartbeat carries every Cat it re-adopted at the generation it
 //!    recorded. That complete same-generation inventory is the only thing that
 //!    recovers a `Lost` node. A Cat adoption refused must stay out of the
-//!    heartbeat entirely (ADR-0028 §7), never reported as `Cold`.
+//!    heartbeat entirely, never reported as `Cold`.
 //!
 //! The stub control plane below implements only `/v1/nodes/register` and
 //! `/v1/nodes/heartbeat` and records what it received; the real handlers are
@@ -214,7 +214,7 @@ async fn agent_with_a_running_cat(root: &Path, node_id: &str, cat_id: &str) -> A
 }
 
 /// Rewrite the on-disk ledger record so its Guest boot id no longer matches the
-/// live Guest. Step 3 of the ADR-0028 §3 proof then fails and the Cat is
+/// live Guest. The V1 Guest-identity proof then fails and the Cat is
 /// residue — the agent's own ledger API is crate-private, so this edits the
 /// published JSON the way a stale record on a real host would read.
 fn break_recorded_boot_id(state_dir: &Path, cat_id: &str) {
@@ -278,7 +278,7 @@ async fn spawn_serves_when_the_control_plane_is_not_listening() {
     )
     .await
     .expect("spawn must not wait out a registration deadline")
-    .expect("an unreachable control plane must not end the node agent (ADR-0028 §5)");
+    .expect("an unreachable control plane must not end the V1 node agent");
     // The old code could only return after a successful registration, so it
     // could never have returned at all against a dead port.
     assert!(
@@ -438,8 +438,8 @@ async fn the_first_heartbeat_after_a_restart_carries_the_adopted_cat() {
     run_job(&previous, stop_job(CAT, 8)).await;
 }
 
-/// The safety half of ADR-0028 §7. A Cat this node cannot prove it owns is
-/// absent from every heartbeat, never reported as `Cold`: the same handler
+/// A Cat this V1 agent cannot prove it owns is absent from every heartbeat,
+/// never reported as `Cold`: the same handler
 /// trusts node-reported state at a matching generation, so `Cold` would say the
 /// disk was released while an old blockd may still hold its lease. Omitting it
 /// only keeps the node `Lost`, which is recoverable.

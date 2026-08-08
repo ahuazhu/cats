@@ -40,8 +40,8 @@ fi
 # VMM. A cats-blockd is not metered, so a node whose Guests are gone but whose
 # blockd still holds an unpublished journal would pass that walk -- and the
 # release then runs `systemctl stop cats-worker`, whose default
-# KillMode=control-group kills the journal holder (issue #98). Walk the process
-# table for the installed runtime binaries as well. Match the full argv[0]
+# KillMode=control-group kills the journal holder. Walk the process table for
+# the installed runtime binaries as well. Match the full argv[0]
 # path, never the process comm: comm is truncated to 15 characters, so
 # "cloud-hypervisor" (16) can never match itself there.
 runtime_pids=""

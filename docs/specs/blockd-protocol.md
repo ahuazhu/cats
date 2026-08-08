@@ -1,16 +1,19 @@
-# cats-blockd 协议规格（P0 冻结）
+# cats-blockd 目标协议
 
-- 状态：Frozen v1（2026-07-21）；对应实现 `blockd/`，常量的唯一代码出处是 `api/src/chunk.rs`
-- 依据：[ADR-0003](../decisions/0003-direct-s3-chunkstore-backend.md)、[Direct-S3 ChunkStore 详细设计](../direct-s3-chunkstore-architecture.md)
+- 状态：目标合同；Chunk/Map/FLUSH 数据面已实现，Volume Authority 切换尚未实现
+- 依据：[ADR-0003](../decisions/0003-direct-s3-chunkstore-backend.md)、
+  [ADR-0042](../decisions/0042-volume-authority-and-disk-lifecycle.md)、
+  [Cats 存储架构](../storage.md)、[Volume Authority](volume-authority.md)
 
-改变本文任何一项（常量、编码、提交顺序、fencing 规则）都必须新增 ADR，并提供迁移或版本协商方案。
+本次开发期切换会删除旧 volume 和本地状态，不读取旧 pending pack，也不提供双协议。切换完成后，
+改变常量、编码、提交顺序或 fencing 规则必须新增 ADR；届时再按实际持久数据决定迁移或版本策略。
 
 ## 1. 常量
 
 | 名称 | 值 | 说明 |
 |---|---|---|
 | `LOGICAL_BLOCK_SIZE` | 512 B | 前端向 Guest 暴露的逻辑扇区 |
-| `CHUNK_SIZE` | 4 MiB | 远端对象与 Map 的单位（V1 full-chunk 提交） |
+| `CHUNK_SIZE` | 4 MiB | Map寻址与完整Base的单位；稀疏提交使用64 KiB page Delta |
 | `DIRTY_PAGE_SIZE` | 64 KiB | Dirty bitmap 粒度；每 chunk 64 页 = 一个 u64 位图字 |
 | `CHUNKS_PER_LEAF` | 256 | 每个 Map Leaf 覆盖 1 GiB 逻辑空间 |
 | `MAX_VOLUME_BYTES` | 1 TiB | 两级 Map 的 V1 上限 |
@@ -77,12 +80,17 @@ tag==1 时: [leaf_hash 32B] [object_id_len u16] [object_id bytes]
 
 ## 4. 权威元数据（MetadataStore）
 
-每卷一行（SQLite 开发实现 / PostgreSQL 生产实现，同一 SQL 形状）：
+每卷一行（SQLite 开发实现 / PostgreSQL 生产实现遵守同一事务合同）：
 
 ```text
 volumes(volume_id PK, size_bytes, generation, root_hash, root_object_id,
-        lease_owner, lease_epoch, lease_expires_at_unix_ms)
-snapshots(snapshot_id PK, volume_id, generation, root_hash, root_object_id, created_at)
+        admin_state, delete_id,
+        lease_owner, lease_epoch, lease_expires_at_unix_ms,
+        last_transition_id, last_transition_kind, last_transition_request_fingerprint,
+        last_transition_attachment,
+        last_transition_result_epoch)
+snapshot_pins(snapshot_id PK, volume_id, size_bytes, generation,
+              root_hash, root_object_id, created_at)
 ```
 
 - `generation` 单调递增；`generation=0` 表示空卷（全洞，无 Root 对象）。
@@ -92,28 +100,44 @@ snapshots(snapshot_id PK, volume_id, generation, root_hash, root_object_id, crea
 UPDATE volumes
    SET root_hash = :new_root, root_object_id = :new_obj, generation = generation + 1
  WHERE volume_id = :vol
+   AND admin_state = 'Active'
+   AND size_bytes = :expected_size
    AND generation = :expected_generation
    AND lease_owner = :attachment_id
    AND lease_epoch = :epoch;
 -- 受影响行数必须恰好为 1，否则本次远端发布失败
 ```
 
+`size_bytes`创建后不可变；blockd还必须验证新Root编码的`volume_size`与grant对应的VolumeRecord
+一致。协议不提供resize入口。
+
 ### 4.1 Lease / Fencing
 
-- `acquire_lease(volume, attachment, ttl)`：仅当无有效租约（过期或空）时成功；成功即 `lease_epoch += 1` 并返回新 epoch。
+- normal acquire必须携带`transition_id + attachment_id + expected_unowned_epoch`，并且只允许
+  精确`Unowned -> Owned`。当前相同transition重试返回原grant，不再次增加epoch；已被后续转换
+  取代的旧重试返回`StaleTransition`且无副作用。
+- 其他owner即使TTL已过也不能被normal acquire抢占；受保护takeover必须消费从Active
+  `HostFenceEvent`派生的精确逐卷授权。release同样携带transition和精确owner/epoch，响应丢失可
+  幂等重试，任何不匹配显式失败。
 - `renew_lease` 必须携带当前 epoch；不匹配即失败，blockd 进入 **fenced**：拒绝新 WRITE/FLUSH（返回错误），在飞提交一律作废。
 - 旧 epoch 的任何 Root CAS 必然 0 行受影响 —— 这是双写防护的最后一道闸，与租约到期判断相互独立。
-- expiry 只打开竞争 acquire 的窗口，不参与相同 owner/epoch 的 Root CAS。短暂
-  renewal lapse 不得自我 fence；竞争 acquire 或显式 revoke 必须原子增加 epoch，
-  之后旧 Writer 的 renew/CAS 才 fail closed。
+- expiry只用于健康判断，不打开竞争acquire。短暂renewal lapse不得自我fence；只有精确release或
+  授权takeover原子增加epoch后，旧Writer的renew/CAS才fail closed。
+- Node先取得精确`LeaseGrant { attachment_id, epoch, transition_id }`再启动blockd。blockd只验证、
+  renew和使用该grant，绝不调用acquire/takeover或自行增加epoch。完整状态机见
+  [Volume Authority](volume-authority.md#4-lease-接口和状态机)。
 
 ## 5. 本地状态（Cache + Relaxed 权威暂存）
 
 ```text
+<data-dir>/identity.json               # attachment lineage；创建其他文件前原子持久化
 <data-dir>/cache.data                  # 单个稀疏 cache 文件，offset = 逻辑偏移
 <data-dir>/dirty.bitmap                # 持久 dirty 位图（见 §5.1）
 <data-dir>/pending/<txn>.pack          # 冻结的 Pending Commit Pack
 ```
+
+`identity.json`包含`volume_id + attachment_id + attachment_epoch + acquire_transition_id + node_id +
+placement_epoch`。data-dir属于这一次attachment，不能仅按volume id被下一个attachment复用。
 
 - **Strict 写路径**：WRITE → 若目标 chunk 已有已提交 Base 且 cache 未水化，先整
   chunk 水化；写 cache；记录 dirty page/range。
@@ -131,12 +155,12 @@ UPDATE volumes
 chunk_count × u64（小端；bit i = 页 i dirty）
 ```
 
-### 5.2 Pending Commit Pack（V1：内嵌冻结数据）
+### 5.2 Pending Commit Pack（目标格式：内嵌冻结数据）
 
 FLUSH 冻结时把每个 dirty chunk 本次要发布的内容拷入 pack——默认是它的脏 64 KiB 页，整块重写时是完整 chunk（§6.2）。屏障后的新写继续进 cache，不影响已冻结输入：
 
 ```text
-[magic "CATSPACK"] [version u16 = 1]
+[magic "CATSPACK"] [version u16 = 2]
 [header_len u32] [header JSON]
 [payload bytes…]
 ```
@@ -147,8 +171,10 @@ header JSON：
 {
   "txn": "<txn-id>",
   "volume_id": "…",
+  "attachment_id": "…",
+  "attachment_epoch": E,
+  "acquire_transition_id": "…",
   "base_generation": N,
-  "lease_epoch": E,
   "entries": [
     {
       "chunk_idx": i,
@@ -163,18 +189,24 @@ header JSON：
 ```
 
 写入顺序：写临时文件 → fdatasync → rename 为 `<txn>.pack` → fdatasync 目录。
-`byte_ranges` 缺失/为空表示旧 pack，继续按 `page_mask`/整块格式重放。
+以上lineage字段、`page_mask`和`byte_ranges`都必须存在并通过校验。目标实现只接受version 2；旧
+pack不转换、不回放，clean-slate切换前直接删除。
 
 ## 6. FLUSH 提交协议（双持久化水位）
 
 每卷维护 `L = local_durable_generation` 和
 `R = remote_durable_generation`，始终 `R <= L`。顺序固定，不可交换
-（Direct-S3 设计 §7、[ADR-0022](../decisions/0022-relaxed-local-first-dual-watermark.md)）：
+（架构边界见 [Cats 存储架构](../storage.md#flush-与双持久化水位)，完整决定见
+[ADR-0022](../decisions/0022-relaxed-local-first-dual-watermark.md)）：
+
+`L`是最高连续durable generation：`generation <= R`已远端持久，每个`R < generation <= L`都
+必须存在完整、已同步的pending pack；它不表示Guest已经收到ACK。
 
 1. 捕获屏障：冻结当前 dirty set（清 volatile 位图对应位，新写进入下一集合）。
 2. 生成并落盘 Pending Pack（§5.2）；完成 fsync/rename/directory fsync 后 `L`
    前进。Relaxed 此时向 Guest ACK；Strict 继续等待。
-3. 后台 publisher 按 generation 读取 pack。若有 `byte_ranges`，读取远端 base
+3. 后台 publisher 按 generation 读取 pack。验证pack与启动时采用的精确LeaseGrant、data-dir
+   identity完全相同；再按`byte_ranges`读取远端 base
    并按序叠加，构造完整 page/base；PUT `data/<txn>-c<idx>`（幂等，重试同键）。
 4. 构造新 Leaf/Root，PUT `maps/…`；PUT `commits/<gen+1>-<txn>.json`。
 5. Root CAS（§4）。恰好 1 行 → `R` 前进；Strict 此时向 Guest ACK。
@@ -196,11 +228,14 @@ admission 必须把“当前 dirty set 的未来 pack”作为 accounted reserva
 启动时扫描 `pending/*.pack`，先重建 `L` 和本地有序队列，不在 Relaxed attach
 恢复阶段执行远端写；后台 publisher 随后对每个 pack：
 
-- 读 MetadataStore 当前 generation：
+- 先验证pack、data-dir identity和当前LeaseGrant的volume、attachment、epoch、acquire transition
+  完全相同，且MetadataStore仍认可该owner/epoch。缺失、损坏、已fence或不匹配时整个目录
+  quarantine；不能删除pack，也不能交给新attachment发布。
+- 再读MetadataStore当前generation：
   - `generation > base_generation` 且 `commits/<base+1>-<txn>` 存在 → **CAS 已发生**：只清位图/删 pack，不得重复提交；
   - 否则 → 从 pack 幂等重放步骤 3–6（对象 PUT 键不变）。
-- 重放前必须验证租约 epoch 仍属于本 attachment；已被 fence 则保持 pack 并
-  fail closed，不能把唯一的本地 ACK 数据当 cache 丢弃。
+- 每卷publisher在同一grant内严格按generation串行，前一pack结果未判定前不能提交后一pack；因此
+  在grant仍精确有效时，上述generation前进只能包含队首txn。该不变量必须由并发测试覆盖。
 - CAS 前崩溃产生的无 Root 引用对象成为 Orphan，由 GC 按 grace period 清理；恢复流程不负责删除。
 
 ### 6.2 发布粒度：Delta Pack（[ADR-0016](../decisions/0016-delta-pack-page-granular-commits.md)）
@@ -210,7 +245,7 @@ admission 必须把“当前 dirty set 的未来 pack”作为 accounted reserva
 一致性——屏障必须拷贝的是**本次要发布的内容**，而不是必须是整块。
 
 - `PackEntry` 的 `page_mask` 说明携带哪些页；`page_mask == u64::MAX`（且 `len == CHUNK_SIZE`）
-  表示整块 base。该字段有 serde 默认值，旧版本写下的 pending pack 仍按整块重放。
+  表示整块 base。该字段是必填项；缺失即拒绝整个pack。
 - Map 的 `ChunkRef` 增加 `Layered { base: Option<BaseRef>, deltas: [DeltaRef] }`；`base` 为
   `None` 表示底座是空洞。后写的 delta 在重叠页上覆盖先写的。
 - 对象键：base 为 `data/<txn>-c<idx>`，delta 为 `data/<txn>-c<idx>-d`。一次提交对一个 chunk
@@ -239,8 +274,8 @@ admission 必须把“当前 dirty set 的未来 pack”作为 accounted reserva
   只允许在 `generation == 0` 且无未提交脏页的卷上执行。
 - **写入不整块私有化**：Guest 写一页就发布一页 delta（§6.2），镜像对象继续做 base。只有写满
   半块或链达到 `MAX_DELTA_LAYERS` 才改写成私有整块 base。
-- **GC**：镜像对象属于镜像而不属于卷，存活判据**不是**「某个卷的 Root 引用它」。V1 规则是镜像
-  对象不自动回收，由运营方在确认没有卷引用该 image-id 后显式删除。
+- **GC**：镜像对象属于镜像而不属于卷，存活判据**不是**「某个卷的 Root 引用它」。第一版既不
+  自动删除，也不提供人工删除入口；Golden Image GC不在本协议范围内。
 
 ## 7. NBD 前端（开发/测试/恢复通道）
 
@@ -297,36 +332,43 @@ socket，两者服务同一个 engine 与同一个 attachment lease。
 
 1. Strict：任意时刻 kill -9/删除 Host 后，已 ACK FLUSH 从远端可恢复；
    Relaxed：同 Host blockd 重启从 pack 恢复全部 ACK 数据，Host 永久丢失只承诺
-   `R` 并准确报告故障时 `L-R`。
-2. 仅在 `R == L` 后删除全部本地状态，空缓存懒读全卷 digest 与删除前一致。
-3. 竞争 acquire/revoke 增加 epoch 后，旧 blockd 无法完成任何 Root CAS 或继续
-   ACK 写；单纯 expiry lapse 不自我 fence。
+   `R`；`L-R`、bytes和oldest age只能报告最后一次Node observation，不得声称是故障瞬间的
+   精确损失量。
+2. 仅在 `R == L` 且release完成后删除普通本地状态，空缓存懒读全卷digest与删除前一致。唯一例外
+   是disposable Root：精确Owned->Deleting删除授权CAS已成功、旧epoch已fence后，才删除该
+   attachment lineage的`R < L`tail。
+3. normal acquire不能越过任何owner；逐卷授权takeover增加epoch后，旧blockd无法完成任何Root
+   CAS或继续ACK写；单纯expiry lapse不自我fence。
 4. 同一 txn 重放不产生第二个 generation。
 5. Hole 读取恒为零且不产生远端 GET。
 6. Relaxed 冷 cache 局部 WRITE/FLUSH 不产生远端 GET；publisher 合并后 fresh-host
    byte digest 一致。
-7. Stop/Warm/Snapshot/Detach/计划迁移必须 drain 到 `R == L`；失败保留
-   pending、lease 与源 runtime，重试成功前不得越过生命周期边界。
+7. Stop/Cold、Warm、`cats sync`和计划迁移必须drain到`R == L`；失败保留pending、lease与源
+   runtime，重试成功前不得越过生命周期边界。磁盘成员关系与DiskSnapshot只允许Cold/unowned；
+   volume容量创建后不可变。
 
 ### 8.1 控制命令与可观测性
 
 - `status` 返回 durability mode、local/remote generation、unpublished
   generations/bytes/oldest age、max staged/local bytes、allocated/accounted
-  bytes、eviction、backpressure、fenced 和 last publish error。
-- `drain`/final detach 只在 `R == L` 后成功并释放 lease。失败必须可重试，
-  不能清理 journal。
+  bytes、eviction、backpressure、fenced、last publish error以及精确attachment lineage。
+- `drain`只在`R == L`后成功；它不释放lease。Node停止blockd后调用MetadataStore的幂等release。
+  任一步失败必须可重试，不能清理journal。
+- blockd不执行volume delete。disposable Root必须先停止blockd，再由Node消费
+  [Volume Authority §11](volume-authority.md#11-delete)的精确删除授权；只有MetadataStore已返回
+  Deleting/新epoch，Node才可删除授权中的本地lineage。
 - 上述 quota 当前是每卷隔离；不是跨 blockd 进程的 Host 总容量证明。
 
 ## 9. GC（对象回收）
 
-存活判据是**从卷当前 Root 可达**:root 节点、它命名的 leaf 节点,以及每个 `ChunkRef` 命名的每个
-对象——delta pack 之后这意味着 **base 加上它的全部 delta**,而不是"每个 chunk 最新的那个对象"。
-删掉一个 chunk 的 base 只留最新 delta,会直接损坏该 chunk。
+存活判据是**从卷当前 Root和全部SnapshotPin Root可达**:root节点、它命名的leaf节点,以及每个
+`ChunkRef`命名的每个对象——delta pack之后这意味着**base加上它的全部delta**,而不是"每个
+chunk最新的那个对象"。删掉一个chunk的base只留最新delta,会直接损坏该chunk。任一pin无法
+读取或校验时，本轮GC fail closed，不删除任何对象。
 
 - **绝不碰 `images/`。**镜像对象属于镜像、被所有从它 provision 的卷共享,删一个卷不能删掉全队列
-  的 rootfs(§6.3)。GC 只列举和删除本卷前缀下的对象;`ChunkRef` 里带 image origin 的 base 根本
-  不算本卷的对象。这也意味着**镜像的回收是另一件事**:V1 不自动回收,由运营方在确认无卷引用
-  该 image-id 后显式删除。
+  的 rootfs(§6.3)。GC只列举和删除本卷前缀下的对象;`ChunkRef`里带image origin的base根本
+  不算本卷的对象。第一版不提供Golden Image删除或GC。
 - **必须持有卷租约运行**,这样没有别的写者会在发布 Root 尚未命名的对象。本写者自己的 pending
   pack 无所谓:恢复会从 pack 文件重放并重新上传被删掉的对象。
 - **commit record 不删**:它是审计线索、体积极小,清理它属于保留策略而不是垃圾回收。

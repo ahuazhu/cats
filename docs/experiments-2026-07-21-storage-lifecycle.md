@@ -4,7 +4,7 @@
 
 报告中的 AWS 性能数据均在 2026-07-21 采集。Lazy ext4 的正式基线还引用了 2026-07-17 和 2026-07-20 已保存的验证结果，并补充了本轮重新运行的 4 GiB / 10,000 文件结果。所有性能数字都从仓库内 CSV 重新计算；样本数较小时，表中的 P95 实际等于观测最大值，不能当成生产 P95。
 
-## 1. 最终结论
+## 1. 本轮结论
 
 这轮实验回答了六个核心问题。
 
@@ -13,26 +13,10 @@
 3. **Warm 有两种可用机制。** `pause + page-out` 唤醒约 0.21–0.23 秒，暂停态物理内存约 6.9–17.3 MiB，但 VMM 仍存在；`snapshot + VMM exit` 在本地 NVMe 上唤醒约 0.38–0.40 秒，暂停态 VMM/后端进程和专属 RSS 均为 0。
 4. **远端存储介质决定并发 Warm 的上限。** 10 个 512 MiB Cat 同时从 EBS 恢复时，首次健康响应 P50 为 19.05 秒；从 i4i 本地 NVMe 恢复时为 0.53 秒。两者的 VMM restore API 都约 25–26 ms，因此主要瓶颈是内存页回读，不是 Cloud Hypervisor。
 5. **原始 20–21 秒 Cold 主要慢在 Ubuntu 启动策略。** `systemd-networkd-wait-online` 单项占 13.406 秒。通过直接内核启动、精简 initramfs、提前配置网络和提前启动 Agent，完整新内核、新进程的 Cold-to-health P50 降到 1.755 秒。
-6. **Direct-S3 原型证明了语义，但性能不能直接用于生产。** 当前单线程 Python/boto3 后端 Cold P50 为 39.87 秒，其中累计 S3 GET 时间约 18.91 秒。生产版必须实现并行请求、合并读取、预取、热 Chunk 固定、可靠提交和本地缓存。
+6. **Direct-S3 原型证明了语义，但性能不能直接用于生产。** 本轮单线程 Python/boto3 后端 Cold P50 为 39.87 秒，其中累计 S3 GET 时间约 18.91 秒。它只定位了并行、合并读取、预取、可靠提交和本地缓存等原型瓶颈。
 
-因此，当前推荐的产品组合是：
-
-```text
-Running
-  ├── 短时间休眠：pause + page-out
-  │     优点：最快唤醒；约 6.9–17.3 MiB/Cat 暂停态物理内存
-  │
-  ├── 更深 Warm：snapshot + VMM/backend exit
-  │     优点：无常驻 VMM；进程状态保留；本地 NVMe 唤醒约 0.4 秒
-  │
-  └── Cold：新内核 + 新 Agent/用户进程
-        优点：不依赖内存快照兼容性；目标约 1–2 秒
-
-系统盘/持久盘
-  Guest ext4 -> virtio-blk -> vhost-user-blk -> cats-blockd
-      -> 本地 NVMe 稀疏 Cache
-      -> Manifest + immutable chunks -> S3/JuiceFS durable store
-```
+这些是2026-07-21实验结论，不是当前技术路线。当前实现、选定后端、四态名称和块前端选择
+分别以[`docs/README.md`](README.md)、accepted ADR和Rust代码为准。
 
 ## 2. 实验范围与术语
 
@@ -405,7 +389,7 @@ RAM/working set 增加 4 倍，但 Cold 基本不变，说明应用内存不是�
 - virtio block 和 virtio network。
 - Python Agent 进程和真实 128 MiB 内存初始化。
 
-因此这不是 BusyBox-only 的假操作系统，也不是内存 snapshot restore。它可以继续运行正常 Agent 服务。但当前脚本硬编码了 root 设备和静态 IP，只能视为启动路径原型；生产需要 Rust PID 1/Guest Agent、配置注入、失败恢复、安全模块、度量启动和兼容性管理。
+因此这不是 BusyBox-only 的假操作系统，也不是内存 snapshot restore。它可以继续运行正常 Agent 服务。但本轮脚本硬编码了 root 设备和静态 IP，只能视为启动路径原型；本实验没有验证生产配置注入、失败恢复、安全模块、启动度量或兼容性管理。
 
 ## 11. 实验七：Direct-S3 ChunkStore
 
@@ -471,7 +455,7 @@ dirty chunks > 0
 ### 11.4 结论
 
 - Direct-S3 可把普通 ext4 建立在 Manifest + immutable objects 上，读写和远端提交语义成立。
-- 当前性能差是实现形态造成的：所有 NBD 请求被单线程串行化，每次 miss 下载完整 4 MiB，缺少并行 GET、request coalescing、read-ahead 和 hot-set。
+- 本轮原型性能差来自实现形态：所有 NBD 请求被单线程串行化，每次 miss 下载完整 4 MiB，缺少并行 GET、request coalescing、read-ahead 和 hot-set。
 - 39.87 秒不能作为架构的最终性能，也不能当作生产版本结果；它是一个正确性/瓶颈定位原型。
 
 详细结果见 [`i4i lifecycle 报告`](../experiments/warm-snapshot-benchmark/results/i4i-lifecycle-modes-20260721/README.md)。
@@ -487,74 +471,12 @@ dirty chunks > 0
 | Snapshot + VMM exit | EBS | 原进程继续 | 1.090 s | VMM/backend 退出；snapshot 在 EBS | 较高，但并发页回读慢 |
 | 优化 Cold | i4i Local NVMe | 新内核、新进程 | 1.755 s | 无 VM RAM/VMM | 高，前提是 root 热 Chunk 可快速获得 |
 | Stock Cold | i4i Local NVMe | 新内核、新进程 | 21.064 s | 无 VM RAM/VMM | 高，但启动策略不可接受 |
-| Direct-S3 原型 Cold | S3，无初始 Cache | 新内核、新进程 | 39.868 s | 无本地 durable 依赖 | 高；当前实现仅验证语义 |
+| Direct-S3 原型 Cold | S3，无初始 Cache | 新内核、新进程 | 39.868 s | 无本地 durable 依赖 | 高；本轮原型仅验证语义 |
 
-## 13. 对 Cats 完整架构的建议
+## 13. 本轮没有验证的事项
 
-### 13.1 存储层
-
-实现一个通用的 `cats-blockd`，对上提供 vhost-user-blk，对下提供：
-
-```text
-                 logical block requests
-Guest ext4 -> virtio-blk -> cats-blockd
-                              ├── NVMe clean cache
-                              ├── NVMe dirty/WAL or equivalent durable journal
-                              ├── chunk map + immutable generation manifest
-                              ├── uploader / downloader / prefetcher
-                              └── S3/JuiceFS durable object store
-```
-
-关键要求：
-
-- Guest 只看到普通 block device，JuiceFS/S3 对用户完全不可见。
-- 以逻辑 Chunk 追踪 dirty，不扫描/上传整块虚拟盘。
-- immutable object + 原子 Manifest/HEAD publication。
-- 明确 FLUSH/FUA 的 durable acknowledgement 边界。
-- 单写者 RWO lease、fencing token 和故障接管；外挂持久盘同一时间只挂一个 Cat。
-- 并行、合并和取消读取；优先 demand read，限速 background prefetch。
-- 本地 Cache 可全部删除，空 Host 能仅凭远端 metadata/object 恢复。
-- 热目录、boot Chunk、Agent binary 和必要 ext4 metadata 可形成预取 Manifest。
-
-JuiceFS 仍可作为已有的对象/元数据能力底座；Direct-S3 则能减少一层文件系统抽象。最终选择不能只看这轮原型速度，要比较 crash consistency、metadata/lease、运维复杂度、S3 请求放大和二次开发成本。
-
-### 13.2 生命周期层
-
-建议三层状态机：
-
-```text
-ACTIVE
-  │ idle 短
-  ▼
-WARM_PAGEOUT        VMM 存在，内存页大部分回收，~0.2 s wake
-  │ idle 更久/Host 压力
-  ▼
-WARM_SNAPSHOT       VMM 退出，进程状态在 snapshot，~0.4 s local-NVMe wake
-  │ snapshot 不兼容/迁移/更久 idle
-  ▼
-COLD                新内核、新 Agent/用户进程，目标 1–2 s
-```
-
-并且分别发布四个 readiness：
-
-1. VMM API ready。
-2. Guest Agent ready。
-3. `cats exec` ready。
-4. 用户 Service ready。
-
-任何 Warm restore 失败都必须回退到 Cold，而不是让 Cat 卡在不可恢复状态。
-
-### 13.3 唤醒调度
-
-- 每 Host 根据 NVMe/S3 实测带宽限制同时 page-in 的 Cat 数。
-- demand fault 高优先级；full-RAM background prefault 低优先级。
-- 先加载 Guest Agent、网络栈、页表和应用热页，再 resume vCPU。
-- 对象存储 Cold 使用并发 GET、合并相邻读、适应性 read-ahead 和 Host 共享 Cache。
-- 记录 wake 的分阶段时间，不能只上报一个总时延。
-
-## 14. 本轮没有验证的事项
-
-以下内容仍不能基于本轮实验作生产承诺：
+以下内容截至2026-07-21实验结束时未被本轮验证，不能由本报告推出生产承诺。后续是否已实现
+或验证请查[`docs/README.md`](README.md)：
 
 - 在另一台空 NVMe Host 上从对象存储恢复优化 Cold 的 1–2 秒结果。
 - VM memory snapshot 上传对象存储、跨 Host 兼容和增量快照。
@@ -566,21 +488,9 @@ COLD                新内核、新 Agent/用户进程，目标 1–2 s
 - 长时间随机读写、ext4 journal 压力、TRIM/discard、在线扩容和 fsck。
 - 真实 Agent/代码仓库 workload 的 P50/P95/P99；当前服务是 Python + 固定内存 working set。
 
-## 15. 下一轮建议
+## 14. 复现实验
 
-按优先级建议：
-
-1. 用 Rust 实现最小 `cats-blockd`，保留同一套 NBD/vhost-user correctness oracle，增加并行 GET、singleflight、range/read-ahead 和可配置 Chunk size。
-2. 在第二台 i4i.metal 或清空当前 NVMe 的隔离目录中测试“远端只有 S3，Host Cache 为空”的优化 Cold，分离 Agent-ready 与用户 Service-ready。
-3. 对 10/50/100 个 Cat 测 page-out、Snapshot Warm 和 optimized Cold，同步记录 NVMe queue、CPU、major fault、S3 请求与流量。
-4. 实现 hot-Chunk Manifest：先预取 kernel/init/root metadata/Agent，验证是否能把远端 Cold 控制在 2 秒附近。
-5. 为 FLUSH/commit 做 kill -9、断网、失败 PUT、HEAD 并发更新和重启恢复测试。
-6. 加入单写者 lease/fencing，完成可选持久盘的 attach/detach/reattach E2E。
-7. 换成实际 Agent workload：git clone、10 万小文件、grep/build、服务端口恢复和持久写入。
-
-## 16. 复现实验
-
-### 16.1 Lazy ext4
+### 14.1 Lazy ext4
 
 ```bash
 cd experiments/lazy-ext4-demo
@@ -592,7 +502,7 @@ make production-demo
 
 需要 Docker `--privileged`，因为容器要使用 Linux NBD 和 ext4 kernel driver。
 
-### 16.2 Snapshot Warm
+### 14.2 Snapshot Warm
 
 ```bash
 sudo ./experiments/warm-snapshot-benchmark/benchmark.sh prepare
@@ -602,7 +512,7 @@ sudo WORK_DIR=/mnt/local/cats-warm-bench \
   ./experiments/warm-snapshot-benchmark/benchmark.sh run
 ```
 
-### 16.3 同时唤醒
+### 14.3 同时唤醒
 
 ```bash
 sudo ASSET_DIR=/mnt/local/cats-warm-bench \
@@ -611,7 +521,7 @@ sudo ASSET_DIR=/mnt/local/cats-warm-bench \
   ./experiments/warm-snapshot-benchmark/concurrent.sh
 ```
 
-### 16.4 Cold 和 page-out
+### 14.4 Cold 和 page-out
 
 ```bash
 sudo WORK_DIR=/mnt/local/cats-cold \
@@ -623,7 +533,7 @@ sudo WORK_DIR=/mnt/local/cats-pageout \
   ./experiments/warm-snapshot-benchmark/lifecycle_modes.sh pageout
 ```
 
-### 16.5 Minimal initramfs
+### 14.5 Minimal initramfs
 
 ```bash
 sudo apt-get install -y busybox-static cpio zstd
@@ -632,7 +542,7 @@ sudo ./experiments/warm-snapshot-benchmark/build_minimal_initramfs.sh \
   /path/to/cats-minimal-initrd.img
 ```
 
-### 16.6 Direct-S3
+### 14.6 Direct-S3
 
 ```bash
 sudo WORK_DIR=/mnt/local/cats-direct-s3 \
@@ -647,7 +557,7 @@ sudo WORK_DIR=/mnt/local/cats-direct-s3 \
 
 这些 VM 实验必须在 Linux x86_64、root、`/dev/kvm` 可用的 Host 上运行；macOS Docker Desktop 不能替代 KVM 真机。
 
-## 17. 原始结果索引
+## 15. 原始结果索引
 
 - Lazy ext4 方法、历史观测和限制：[`experiments/lazy-ext4-demo/README.md`](../experiments/lazy-ext4-demo/README.md)
 - c5.metal EBS 正式基线：[`results/c5-metal-ebs-20260721/`](../experiments/warm-snapshot-benchmark/results/c5-metal-ebs-20260721/)

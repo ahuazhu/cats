@@ -1,80 +1,52 @@
-# ADR-0012：AWS 资源与生产部署统一由 Terraform 管理
+# ADR-0012：AWS资源与生产部署由Terraform管理
 
 - 状态：Accepted
 - 日期：2026-07-24
 
-## 背景
+## 决策
 
-Cats 已有一套通过 YAML、shell 和 AWS 控制台组合部署的 production-shaped 环境。计量
-与计费又引入 Kinesis、独立 S3 usage archive、消费协调、IAM 和告警。如果继续依赖
-手工创建资源或 `kubectl apply`，将无法可靠审查变更、重建环境、识别 drift，也容易让
-敏感配置和计费证据处于无人负责的状态。
+AWS生产资源和Kubernetes生产部署的创建、变更与删除统一通过reviewed Terraform
+plan/apply。紧急控制台或CLI操作必须随后导入配置，并以无意外drift的plan收敛。
 
-同时，现有 EKS、RDS、ChunkStore bucket、ACM、网络和裸金属 worker 已包含环境特定
-配置。仅凭仓库文档重新声明这些资源可能触发破坏性替换，因此不能用一份猜测的
-Terraform 配置直接覆盖现网。
+State按失效域与权限边界拆分：
 
-## 决定
+- `bootstrap`：远端state基础；
+- `platform`：VPC、EKS、RDS、ACM、ECR、ChunkStore和metal workers；
+- `production-infrastructure`：usage stream/archive/checkpoint及其IAM；
+- `production-payments`：Stripe产品、价格和Webhook入口；
+- `production-application`：Cats Kubernetes workloads、service、ingress和runtime config。
 
-1. 从本 ADR 起，AWS 生产资源和 Kubernetes 生产部署的创建、变更与删除统一通过
-   Terraform review + plan + apply 流程。AWS Console、`aws ... create/update/delete`、
-   `kubectl apply/edit/delete` 不再是正常变更入口；紧急操作必须事后导入或回写配置，
-   并通过无 drift 的 plan 收敛。
-2. Terraform state 按失效域拆分：
-   - `bootstrap`：远端 state S3 bucket；
-   - `production-infrastructure`：不依赖 Kubernetes API 的 usage 基础设施；
-   - `production-application`：依赖已有 EKS API 的 Cats Kubernetes 对象；
-   - 现有 VPC/EKS/RDS/ACM/ECR/ChunkStore/metal worker 在完成精确盘点后进入独立
-     platform state，不能混入 application state。
-3. 已有资源在第一次受 Terraform 管理前必须：
-   - 从 live API 导出实际配置；
-   - 写出匹配配置并审查 replacement 属性；
-   - `terraform import` 到目标 state；
-   - 达到无意外 create/destroy、无破坏性 drift 的 plan。
-   `data` source 只能读取资源，不能算 Terraform 已接管。
-4. 远端 S3 backend 启用 versioning、默认加密、public-access block、TLS-only policy 和
-   S3 native lockfile。state 和保存的 plan 都视为 secret，因为 Kubernetes Secret 与
-   PostgreSQL DSN 即使标记为 `sensitive` 仍会进入 state。
-5. Provider 使用 dependency lock file；生产镜像必须用 OCI `sha256` digest，不使用
-   可漂移 tag。基础设施与应用使用独立 plan/apply，不能用 `-target` 作为正常发布方式。
-6. Terraform 负责基础资源、IAM、部署描述和 secret delivery；它不负责构建容器镜像，
-   也不替代应用启动时向前兼容的数据库 schema migration。禁止 Terraform provisioner
-   通过远程 shell 修改数据库或节点来隐藏不可声明的变更。
+共享资源进入Terraform管理前必须从live API盘点，写出精确配置，审查replacement属性，
+import到目标state并取得无意外create/destroy的plan。`data` source只表示读取，不表示管理权。
 
-## 当前落地范围
+## State与发布安全
 
-本次新增的 Terraform 已管理：
+- 远端S3 backend启用versioning、默认加密、public-access block、TLS-only policy和native
+  lockfile。
+- State和saved plan按secret处理；Kubernetes Secret与DSN即使标记`sensitive`仍可能进入state。
+- Provider使用dependency lock；生产镜像和worker bundle使用不可变digest。
+- Platform与application分别plan/apply；`-target`不作为正常发布流程。
+- Destructive plan必须列出精确resource address和replacement原因，并由独立review确认目标
+  account、region和environment。
 
-- usage Kinesis provisioned stream；
-- 开启 versioning、Object Lock、生命周期分层和 destroy protection 的独立 S3 archive；
-- usage projector 的 DynamoDB checkpoint table；
-- producer、consumer、replay 最小权限 IAM policy、Kinesis throttling/lag 告警；
-- `cats-controld` 专用 EKS ServiceAccount、Pod Identity role 与 association；
-- Cats Namespace、runtime Secret、RDS CA ConfigMap；
-- `cats-controld` / `cats-gatewayd` Deployment 与 Service；
-- EKS Auto Mode IngressClassParams、IngressClass 和 ALB Ingress；
-- metal worker artifact bucket、校验 digest 的 bundle、Secrets Manager runtime secret、
-  最小权限 instance-role policy 和 SSM State Manager deployment association。
+Terraform负责资源、IAM、部署描述和secret delivery。镜像构建、数据库schema migration、
+runtime reconciliation与故障恢复由各自组件合同负责；Terraform不使用provisioner或远程shell
+隐藏这些操作。
 
-现有 EKS/RDS/VPC/ACM/ECR/ChunkStore bucket/裸金属 worker 仍是迁移输入，不因本 ADR
-自动变成已由 Terraform 管理。它们在精确 import 完成前不得由新 stack 重建或修改。
-Terraform 完成接管后，旧 `deploy/aws/k8s/*.yaml` 迁移对照已删除，避免被误用为生产
-apply 源。
+## Authority边界
 
-usage publisher 可运行在所有 `cats-controld` API 副本中；projector 与 S3 archive
-writer 只运行在 PostgreSQL advisory lock 选出的一个 leader 中（ADR-0032）。
-publisher 只在 Kinesis 接受 attributed checkpoint 后确认 Node outbox；projector
-按 50 秒/4 MiB/1000 条上限生成 NDJSON archive，投影 PostgreSQL 后再推进 DynamoDB
-checkpoint。Pod Identity 只绑定 `cats-controld`；两个 gateway 不获得 usage AWS 权限。
-当前 DynamoDB table 只实现 checkpoint；若未来并行运行多个 projector，必须先完成
-条件 shard lease 协议。
+- 每份secret只有一个生成/轮换authority；Terraform只传递引用或受控值。
+- Workload identity遵循least privilege；Gateway不获得storage/usage写权限，Guest不获得平台
+  凭据。
+- Production、qualification和developer环境使用不同identity、namespace、state与data。
+- Object Lock、KMS deletion window、RDS replacement和worker销毁等不可逆/高风险参数在首次
+  apply前显式审批。
 
-## 影响
+## 验收
 
-- 初期 usage PostgreSQL 可以与现有 RDS 实例和 database 共用，但使用独立
-  `cats_usage` schema、独立 DSN 变量和最小权限账号；这不新增 RDS 固定成本。
-- 未来拆到独立 PostgreSQL 时，停止单写者、迁移并核对 ledger watermark，然后只修改
-  `usage_postgres_url` 再由 Terraform 发布；storage DSN 和 Kubernetes 资源结构不变。
-- S3 Object Lock 一旦启用不能对该 bucket 关闭。默认七年 GOVERNANCE retention 是
-  财务证据的保守值，第一次 apply 前必须由财务/合规确认；COMPLIANCE mode 需要另立
-  变更审查。
+- fresh environment可由reviewed configuration重建；重复apply无drift；
+- import前后的plan不意外替换live资源；
+- state locking、backup/version recovery与credential rotation演练通过；
+- production artifacts可追溯到source SHA和digest；
+- application、platform和qualification权限不能越过各自边界；
+- decommission先drain/保护数据，再由精确saved plan删除已确认资源。

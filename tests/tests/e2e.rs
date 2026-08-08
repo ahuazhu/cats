@@ -479,8 +479,8 @@ async fn absolute_expiry_reaps_the_cat_without_any_caller() {
 }
 
 /// Admission is authorized once. The Node holds its local activity guard for
-/// the full stream, so neither control-plane loss nor Grant expiry tears down
-/// an established WebSocket (ADR-0033).
+/// the full stream, so neither control-plane loss nor V1 Grant expiry tears
+/// down an established WebSocket.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn established_endpoint_websocket_survives_control_plane_outage() {
     let cluster = Cluster::start(&["node-a"]).await;
@@ -533,9 +533,9 @@ async fn established_endpoint_websocket_survives_control_plane_outage() {
     socket.close(None).await.unwrap();
 }
 
-/// A Running Endpoint is data-plane traffic. Once the Gateway has a bounded
+/// A Running Endpoint is data-plane traffic. Once the Gateway has a bounded V1
 /// route authorization, losing every control-plane replica must not stop the
-/// healthy Node and Guest before that authorization expires (ADR-0033).
+/// healthy Node and Guest before that authorization expires.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn running_endpoint_survives_control_plane_outage_with_cached_route_grant() {
     let cluster = Cluster::start(&["node-a"]).await;

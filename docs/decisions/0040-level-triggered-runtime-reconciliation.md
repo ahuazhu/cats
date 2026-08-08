@@ -1,0 +1,199 @@
+# ADR-0040：电平触发的 Runtime Reconciliation
+
+- 状态：Accepted
+- 日期：2026-08-08
+- 取代：ADR-0027、ADR-0028、ADR-0030、ADR-0035，以及 ADR-0002 中的旧协调合同
+- 规格：[Runtime Reconciliation v1](../specs/runtime-reconciliation-v1.md)
+
+## 背景
+
+当前实现把 `desired_state`、`observed_state` 和 `generation` 放在同一 Cat 行。Controller 先写
+Starting/Suspending 等中间状态，再下发一次性 NodeJob；Node 的持久 ledger 又晚于物理动作。
+heartbeat 最后把 Node 报告覆盖回 Cat 行。
+
+因此意图、执行过程和物理事实没有清楚边界：旧动作可能作用于新 runtime，旧 observation
+可能结算新 Operation；attach 响应丢失会形成控制面与物理挂载分叉；普通 Start 可能 revoke
+其他 writer；Agent crash 后也缺少足以安全 adopt 的强身份。
+
+这些不是在 NodeJob 上增加重试或状态字段能解决的问题。需要一次替换整条协调链路。
+
+## 决策
+
+Runtime 改为电平触发闭环：PostgreSQL 保存完整且单调版本的期望，Node 反复枚举物理状态并
+收敛，每 Cat 只保留一份当前 checkpoint，Control Plane 用精确 observation 结算精确 revision
+的 Operation。
+
+```text
+DesiredRuntimeSpec(revision, placement)
+             |
+             v
+      per-Cat reconciler ----> physical runtime
+             |                         |
+             +-> RuntimeCheckpoint <---+
+             +-> ObservedRuntimeStatus
+```
+
+审计不参与恢复，可以独立轮转。
+
+## 权威边界
+
+1. PostgreSQL 是 DesiredRuntimeSpec、placement、Operation 和 API idempotency 的权威。
+2. MetadataStore 的 owner/epoch/root CAS 是 RWO writer 与 remote durability 的权威。
+3. 带强身份的物理枚举和协议握手决定进程、socket、snapshot、journal 是否存在。
+4. Node checkpoint 只保存 crash recovery 所需的当前步骤和身份，不能推翻物理事实。
+5. Route admission 使用 [ADR-0041](0041-node-verified-route-admission.md) 的本地 gate/guard。
+
+Volume 的精确状态机由 [Volume Authority](../specs/volume-authority.md) 定义；Runtime 只编排
+它的窄acquire/publish/release/takeover/delete接口。
+
+heartbeat 只追加 observation，不写 Desired。Starting、Suspending、Warming、Stopping 是
+observation/checkpoint 的 step，不是控制面的稳定状态或新 authority。
+
+## NodeIdentity 与 AgentSession
+
+Node 必须先由 IaC/管理员 provision。Control Store 保存 `node_id`、不可变 Host identity 和
+per-node credential/public-key 或 provider principal 的绑定。注册服务验证该绑定，不接受
+调用方自报身份，也不使用共享 fleet credential。
+
+Agent 必须先取得固定 Host state path 的 kernel 排他锁。它在注册 RPC 前持久化随机
+`agent_instance_id` 和 `registration_attempt_id`。同一 attempt 的重试返回同一 session；新进程
+先解析遗留 attempt，再用精确 expected session epoch 做 CAS replacement。新 session 建立后，
+旧 session 的 heartbeat、desired read 和 observation 永久拒绝。不同 Host 接管同一 node_id
+必须先显式 fence/retire 并重新 provision。
+
+这两个边界分工明确：Host lock 排除同机双进程，AgentSession 排除延迟包和跨 boot/session
+复用，provisioned credential 排除另一台机器自称同一 Node。
+
+## Desired、placement 与 Operation
+
+每个 Desired revision 是可独立解释的完整快照，包含目标四态或 Deleted、Assigned placement、
+完整 VM shape、磁盘、Endpoint 和 transition policy。revision、placement epoch、runtime
+incarnation、attachment epoch 和 route epoch 各自防止对应 ABA。
+
+一次 mutation 在同一 PostgreSQL 事务写完整 spec 和精确绑定它的 Operation。提交前必须完成
+合法性、Cold-only 与 placement/capacity 检查；没有 placement 时不创建 revision。每次 placement
+改变也是一个新 revision 和 Operation，没有旁路调度权威。新 revision 原子 Supersede 旧的
+Pending Operation。已选 Node 若明确拒绝不可满足的容量/能力，当前 Operation Failed；重新调度
+只能创建提高 placement epoch 的新系统 revision。
+
+Operation 只有在 current desired、observation revision、placement 和完整 postcondition 全部
+匹配时才成功。Blocked/Degraded 保持 Pending；PreconditionFailed、Quarantined 和 HostLost 使
+当前 Pending Operation Failed，处置使用新 revision。已经完成的历史 Operation 不因后续健康
+变化重写。
+
+Deleted 是保留到物理 runtime、route 和 volume disposition 全部完成的 tombstone，不是立即
+删行。只有 Operation 闭环且没有 fence/rejoin 待办后才能 GC。
+
+## 生命周期与变更
+
+产品稳定态仍只有 Running、Suspended、Warm、Cold；Deleted 是资源终态。完整屏障见
+[Runtime 生命周期](../runtime-lifecycle.md)。
+
+- `RequireIdle {attempt_id, source_revision, source_runtime_incarnation}` 是一个普通的 Running ->
+  Suspended Desired revision。Node 在 checkpoint fsync Armed 后只评估一次：guards 为零时原子
+  关闭AdmissionCell并继续；一旦close就不恢复旧serving epoch。Busy时cell/runtime不变、该Operation以
+  `PreconditionFailed(Busy)` Failed。Control Plane 随后创建新的完整 Running revision。同一
+  attempt不因后来空闲而重试；restart遇到结果不明的Armed也保守结算Busy并保持Closed。fresh
+  Running revision只在gate确实从未close时复用route epoch，否则提高所有可能关闭的Endpoint epochs。
+- 用户 stop/drain/destroy 使用 `CancelAndDrain`，先关 admission，再取消并等待 guards。
+- V1 的 VM shape 和磁盘集合只在 Cold 改变。非 Cold 变更请求直接返回
+  `PreconditionFailed(MustBeCold)`；调用方先提交普通 Cold revision，成功后再以新请求提交完整
+  配置。volume容量创建后不可变，不提供resize；DiskSnapshot只在stable Cold/unowned时创建，
+  只支持同盘restore。
+- 计划跨 Node 迁移同样只有两个普通 revision：源 placement 收敛到 Cold；成功后新 revision
+  提高 placement epoch 并在目标 Node 恢复；整个过程始终只有当前 Desired 是 authority。
+
+## Node 收敛
+
+每个 Cat 只有一个 reconciler worker。每轮读取最新完整 Desired、当前 checkpoint 与所需物理
+inventory，只执行一个有界、带 postcondition 的步骤。副作用前先持久化 revision、placement、
+精确物理 identity 和窄 effect token；模糊响应后查询 postcondition，而不是回滚 Desired。
+
+旧 effect 已经在 VMM/systemd 等本地边界线性化时，可能在新 revision 提交后才完成。合同不
+假装消除这个竞态，而是保证：旧结果不能结算或授权新 revision，不能取得新的 writer/route/
+placement authority；晚到的本地结果绑定精确 incarnation，由下一轮 adopt、停止或重建。
+
+实现不增加通用 effect workflow。各边界只使用自己的最窄条件：
+
+- volume acquire/publish/release 使用 owner/epoch/root CAS；
+- process/scope/socket 使用 runtime incarnation、start time 和 handshake；
+- NBD/tap 使用完整 inventory 与 checkpoint ownership token；
+- WarmRuntimeSnapshot使用temp identity、文件metadata和VMM postcondition；DiskSnapshot走Volume
+  Authority的Root pin；
+- route使用AdmissionCell中的runtime incarnation/per-Endpoint route epoch compare-and-guard；全局
+  desired revision仍用于reconcile和signer snapshot，不进入Grant serving binding。
+
+planner 的逐步 token、条件和晚到结果处理以 Runtime Reconciliation spec 的表格为准。
+
+## Inventory 与稳定服务
+
+Agent 启动、Host rejoin、adoption、orphan 判断、破坏性 cleanup 和不确定恢复必须先完成全量
+union inventory，期间gate保持Closed。full scan在当前AgentSession下建立单调inventory epoch、
+digest、read position与PostgreSQL accepted_at组成的`AdmissionInventoryAttestation`。普通增量
+heartbeat引用该epoch，只upsert具体Cat，缺项不代表不存在，也不能覆盖attestation。Route signer
+同时检查fresh attestation和fresh per-Cat observation，不要求每次heartbeat全量扫描。稳定Running
+用独立、低频、有硬deadline的periodic full scan刷新attestation；失败先Degraded，过期后停止新
+Grant签发而不猜测Quarantine。
+
+全量扫描不完整时 Blocked，不做 cleanup。已经验证并稳定 Running 后，PostgreSQL、
+MetadataStore 或某个 inventory source 的短暂故障是 Degraded：保留当前 VMM 和已验证 admission，
+冻结新生命周期/破坏性动作。发现确定的重复 VMM/writer 或 identity/epoch 冲突则立即关 gate
+并 Quarantine。
+
+## Host fencing 与 Volume takeover
+
+heartbeat timeout只产生怀疑，不能触发跨Node writer。provider/BMC receipt只可建立持久
+`HostFenceEvent`，绑定不可变Host identity、Node、expected node boot、旧session epoch、fence
+attempt和隔离状态。
+它是 Host 级事实，不是 volume 写权限。
+
+Control Plane先把旧Pending Operation置为HostLost，再在一个事务中创建新完整Desired/Operation、
+placement、全部新attachments，并从该event和旧attachment facts为每个卷创建独立
+`VolumeTakeoverAuthorization`，精确绑定 volume、旧 owner/epoch、新 attachment、Desired
+revision 和新 placement。MetadataStore 按 tuple CAS、提高 epoch；同一 authorization 幂等，
+任何绑定变化都需新授权。DesiredRuntimeSpec 只引用授权 id。
+
+逐卷授权的 schema、CAS 和状态机由 [Volume Authority](../specs/volume-authority.md) 定义。它与
+本 ADR 是 Runtime Host-loss 路径的硬依赖；Node reconciler 不另设 lease revoke 路径。
+
+旧Host仍保持workload网络隔离。新boot/session下完成全量inventory，把旧epoch的`R < L` lineage
+移入quarantine，并核对该event派生的全部takeover/delete authorization与每卷current owner/epoch。
+授权派生与Rejoined CAS串行；已消费授权必须匹配postcondition，未消费授权必须已过`not_after`。
+Control Plane接受HostRejoinProof并把event持久转为Rejoined后才恢复网络；此后未消费授权不能首次
+生效，已消费授权仍可幂等读取原结果。
+
+disposable Root放弃`R < L`tail也不绕过volume authority。Control Plane只为当前Deleted Desired
+和精确stop observation或Active HostFenceEvent建立`DisposableRootDeleteAuthorization`；
+MetadataStore把精确Owned卷直接CAS到Deleting、清owner并提高epoch。成功后才可删除授权lineage，
+PersistentDisk不能使用。
+
+## 控制面运行方式
+
+多个无状态 API/Controller 副本共享 PostgreSQL。周期扫描提供 correctness；LISTEN/NOTIFY 或
+内存队列只降低延迟。数据库事务和 advisory lock 不跨外部 I/O。
+
+已验证 Running 的数据面不依赖 Controller 心跳继续运行。控制面失联时不接受新 mutation，也
+不启动新生命周期转换；Node 依据最后接受的 Desired 保持稳定服务或在已开始的安全步骤上
+停住。
+
+## 实施依赖与切换
+
+模块依赖如下，开发可以并行，生产启用必须是一次完整 vertical cutover：
+
+1. Control schema：NodeIdentity/AgentSession、完整 Desired/placement、Operation、observation。
+2. Node 基础：Host lock、强进程身份、checkpoint、完整 inventory。
+3. Volume Authority：normal acquire 与 HostFenceEvent 派生的逐卷 takeover CAS。
+4. Runtime planner：有界 steps、四态 postconditions、AdmissionCell；Route 实现同时按 ADR-0041
+   切换。
+5. crash/ABA/double-Agent/Host-loss/Deleted 验收矩阵全部通过后，才允许部署。
+
+当前开发数据可删除，因此不做 V1 row 或 runtime 迁移。首次部署按
+[Operations and HA §8](../operations-ha.md#8-首次终态部署)执行一次 clean-slate vertical cutover；
+切换后只有空的新 schema 和一套协议版本，组件版本不匹配直接启动失败。ChunkStore 格式与 Guest
+ABI 可以继续使用，但切换不依赖任何旧数据。
+
+## 后果
+
+收益是 authority 少而明确，恢复状态只随当前资源增长，重复 delivery 天然安全，故障测试能
+直接验证物理 postcondition。代价是 Node identity、完整 inventory、强资源身份和逐卷 fencing
+必须在启用前真正实现；只替换 Controller 或 Node 的一半不成立。

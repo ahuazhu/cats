@@ -1,98 +1,52 @@
-# ADR-0021：按盘可选的 relaxed 持久性档位
+# ADR-0021：按盘选择 Strict 或 Relaxed 持久性
 
 - 状态：Accepted
 - 日期：2026-07-29
-- 后续修订：2026-07-30 的
-  [ADR-0022](0022-relaxed-local-first-dual-watermark.md) 取代本文关于
-  “固定 ≤5 秒窗口”、满队列/10 秒后内联 publish、detach 失败仍释放 lease
-  以及 Snapshot 不强制 sync 的设计。本文保留按盘选择与 strict/relaxed
-  产品分层的原始决策；实现语义以 ADR-0022 为准。
+- 机制：[ADR-0022](0022-relaxed-local-first-dual-watermark.md)、[Storage](../storage.md)
 
-## 背景
+## 决策
 
-严格 FLUSH 把对象存储往返放在每个 fsync 的关键路径上（Standard ~109 ms，
-Express One Zone ~67 ms，ADR-0020）。大量 cat 负载（CI、构建缓存、agent
-沙箱）本质可重建，愿意用一个有界的丢失窗口换本地级 fsync。市场先例是
-Fly Sprites——实测其 fsync ~4 ms、本地 ack + 异步上传、崩溃丢弃已 ack
-数据（2026-07-29 sysrq panic 实验），但**没有文档披露窗口**；Modal 则把
-同一形态做成显式 `commit()` API。我们选择：可以宽松，但必须显式、可选、
-写明窗口。
+持久性是卷的不可变属性，创建时选择 `strict|relaxed`，默认 `strict`。RootDisk和
+PersistentDisk使用同一语义；改变档位必须创建新卷并显式迁移数据。
 
-## 决定
+- **Strict**：FLUSH/FUA只有在对象上传和MetadataStore root CAS成功后返回。成功FLUSH必须
+  在Host永久丢失后从远端恢复。
+- **Relaxed**：FLUSH/FUA在dirty pack本地fsync并推进`L`后返回；后台publisher随后推进远端
+  水位`R`。保持`R <= L`，`R < L`的pending pack是唯一数据，不是cache。
 
-持久性是**盘的属性**，默认 strict，创建时选定后不可变（改变它会改变
-guest 已收到的 ack 的含义）：
+Node在线时按卷暴露`L`、`R`、pending bytes和oldest pending age。Host永久丢失后从`R`
+恢复并报告`DataLossPossible`；最后一次observation只能描述当时的backlog，不能证明故障瞬间
+的精确损失量。
 
-- `cats create --durability strict|relaxed`（作用于本命令创建的根盘与
-  `--disk`）；`cats disk create --durability ...`；`disks` 表新列
-  （schema v3，走 ADR-0019 的 user_version 梯子原地迁移，旧盘一律
-  strict）；经 `VolumeGrant.durability` 到 blockd argv。
-- **引擎实现（stage/publish 拆分）**：`flush()` 拆为 stage（冻结屏障 +
-  本地 pack fsync）与 publish（对象上传 + 元数据 CAS）。strict 的 ack
-  在 publish 后（行为不变）；relaxed 的 ack 在 stage 后，只有有界后台
-  publisher 执行远端 I/O。`drain_interval_ms` 是空闲尾部目标，不是 RPO
-  上限；积压到 staged/local 物理水位时先淘汰 clean cache，只剩 pin 数据后
-  在 condvar 背压，不允许 Guest 线程退化为内联 S3/DB 调用。
-- **pack 链**：staged pack 以 `next_base` 单调计数器链式分配
-  base_generation，文件名以其为前缀使字典序 = 世代序；崩溃后
-  `recover_pending_packs` 按序重放整条链。同机重启（blockd 崩溃、进程
-  被杀）**零丢失**——ack 的最低背书是本地 pack 落盘。
-- **锁纪律**：publish 走独立的 `publish_lock`，让 relaxed 的 stage/ack
-  不被慢 publish 阻塞；GC 与 provision 同时持有 `flush_lock` +
-  `publish_lock`（否则 GC 会把「已上传、未 CAS」的对象扫成垃圾）。
+## 生命周期屏障
 
-## 契约（用户可见文案）
+以下操作在成功前必须把所有保留卷推进到`R == L`：
 
-relaxed 盘上：fsync 在本地提交后返回；后台尽快推进对象存储水位。宿主机
-非计划死亡时，可能丢失故障时 `local_generation - remote_generation` 的
-数据；真实窗口必须以 generations、bytes、oldest age 暴露，不能用固定秒数
-替代。
-以下点位强制全量 publish，完成前不返回：
+- Warm、Cold，以及Cold/unowned的DiskSnapshot；
+- Cold-only detach、计划迁移和Node drain；
+- `cats sync`等显式durability barrier。
 
-- 生命周期：stop/teardown（VMM 退出后 drain，杜绝末尾窗口）、warm
-  （pause 之后）、hot detach、Snapshot、计划迁移/Node drain。suspend
-  只要求本地水位，因为 VMM 与 pending 都驻留同机。
-- `cats sync <name>`：随时买一个 strict 时刻（guest syncfs → 每个
-  blockd 经控制 socket `drain`）。脚本在对外承诺之前调它。
-- fencing 时旧 epoch 禁止发布，但本地 pack 必须保留供审计/恢复；不能因为
-  lease 转移就把已 ACK 的唯一副本当 cache 删除。
+Suspended保留原Host、blockd、attachment lease和pending journal，可以保持`R < L`。旧epoch
+失去发布权后仍保留本地pending evidence，直到有明确的恢复、隔离或删除决定。Cat Destroy
+仅可按ADR-0025丢弃明确列出的disposable RootDisk tail；PersistentDisk和未知卷fail closed。
 
-## 后果
+## 实现合同
 
-- blockd 新增 `--durability`、`--drain-interval-ms`、staged/local quota、
-  `--listen-control`（`drain` 与 `status`）；node-agent 在所有 Host
-  所有权边界强制 drain。
-- relaxed 合批天然降低 S3 PUT 次数与请求费。
-- Snapshot 已在创建元数据前对 Running/Suspended Cat 执行 sync/drain；
-  失败时不创建快照。
-- 跨多个 staged pack 反复写同一 chunk 时，delta 链可能暂超
-  `MAX_DELTA_LAYERS`（plan 以已提交 map 为准），上限受队列长度约束，
-  只影响冷读 GET 数，不影响正确性。
+blockd把commit分为本地stage与远端publish：
 
-## 历史修订（2026-07-29，同日，泄压策略已由 ADR-0022 取代）
+1. stage冻结一致写集、持久化pending pack并原子推进`L`；
+2. publisher按generation顺序上传对象并用expected owner/epoch/root做CAS；
+3. crash recovery按顺序重放pending chain；
+4. local quota优先回收clean cache，唯一pending data耗尽配额时施加背压；
+5. GC、publish与provision遵守同一锁和root可达性边界。
 
-首日生产暴露了 v1 泄压设计的车队病理：持续 fsync 负载下队列贴着
-16-pack 上限运行，每个撞限的 FLUSH 排队等 `publish_lock` 并亲自串行
-publish 整个积压——fsync 地板升到一整轮 publish（实测 min 672ms、
-p90 4.6s），relaxed 反而比旁边的 strict 卷更慢。修订如下：
+具体pack链、批量publish、quota和恢复算法由ADR-0022及blockd协议维护。
 
-- **合批 publish**：一次 drain 把整个队列作为一批——所有 pack 的对象
-  合成一个并发上传波、按链序套用 map、单次 CAS 让 head 一次跳 N 代
-  （`MetadataStore::cas_head` 增加显式 `new_generation`，比较仍在
-  expected 上，fencing 语义不变）。批内存驻留以 256 MiB 为界分段。
-- **commit record 按批留档**：只写批尾一条（中间 record 不能预写——
-  CAS 前崩溃的逐 pack 重放会以真实 root 重写同名 key，撞
-  `put_immutable` 的不可变检查）。审计轨迹的 generation 序列因此有
-  空洞。
-- **恢复路径不变**：CAS 前崩溃逐 pack 重放如旧；CAS 后残留 pack 落入
-  既有 superseded 清理（内容已在已提交 map 中）。
-- **eager committer**：队列超过 2 个即被踢醒并持续 drain；
-  `drain_interval_ms` 降级为空闲兜底（0 = 不起后台线程，测试确定性
-  模式）。
-- **停车式背压**：撞限的 FLUSH 在 condvar 上等 committer 每批 pop 的
-  唤醒（约一轮 publish 的停顿），不再亲自 drain；10 秒无空位退回内联
-  drain，对象存储瘫痪不得无限扣押 guest FLUSH。committer 批间释放
-  `publish_lock`。上限 16 → 64（合批后单轮 drain 成本与 pack 数无关）。
+## 验收
 
-复验：100ms/PUT 的存储上 80 连发 fsync，单次最大 88ms（修订前同形态
-负载为 0.7–4.6s）。
+- 两个档位的FLUSH返回点与故障恢复oracle分别可测；
+- blockd/Agent重启保留Relaxed已确认的本地数据；
+- `R < L`时所有远离Host的生命周期操作保持Blocked并保留源；
+- remote恢复后自动drain到`R == L`并继续原操作；
+- attachment epoch变化后旧writer永久无法publish；
+- kernel-NBD与vhost-user-blk运行相同durability矩阵。

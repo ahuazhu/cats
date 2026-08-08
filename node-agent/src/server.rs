@@ -1852,17 +1852,17 @@ fn compact_pending_checkpoints(checkpoints: Vec<CatUsageCheckpoint>) -> Vec<CatU
 
 /// Retry cadence for control-plane exchanges.
 ///
-/// ADR-0028 §5 keeps the agent alive and serving its local runtime through a
-/// control-plane outage, so the retry has to be patient rather than fast: an
-/// outage lasting hours must not become a 200 ms spin. The ceiling only bounds
+/// The V1 agent keeps serving its local runtime through a control-plane outage,
+/// so the retry has to be patient rather than fast: an outage lasting hours
+/// must not become a 200 ms spin. The ceiling only bounds
 /// how long a recovered control plane waits to hear from this node again.
 const CONTROL_PLANE_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
 const CONTROL_PLANE_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Reachability of the control plane, as this agent last observed it.
 ///
-/// ADR-0028 §5 names the unreachable side the `ControlPlaneDisconnected`
-/// condition. The Conditions API is a later work package, so this stays
+/// The target reconciliation model calls the unreachable side the
+/// `ControlPlaneDisconnected` condition. V1 has no Conditions API, so this stays
 /// internal state driving one log line per transition — it is deliberately not
 /// exposed over HTTP, and in particular not through `/healthz`, which means
 /// process liveness and nothing else.
@@ -1965,11 +1965,11 @@ async fn try_register_once(
 
 /// Register until the control plane accepts, retrying indefinitely.
 ///
-/// ADR-0028 §5: a control-plane outage must not end the node agent process.
-/// This also runs before every heartbeat run, not only at startup, because the
-/// control plane's heartbeat handler looks the node up and rejects an unknown
-/// one — a control plane that lost this node re-learns it here instead of
-/// needing an agent restart.
+/// A control-plane outage must not end the V1 node-agent process. This also
+/// runs before every heartbeat run, not only at startup, because the control
+/// plane's heartbeat handler looks the node up and rejects an unknown one — a
+/// control plane that lost this node re-learns it here instead of needing an
+/// agent restart.
 async fn register_until_accepted(
     client: &reqwest::Client,
     control_plane_url: &str,
@@ -1987,9 +1987,9 @@ async fn register_until_accepted(
 /// Heartbeat on the configured interval until one fails, then return so the
 /// caller can register again.
 ///
-/// The reported inventory is exactly [`NodeRuntime::snapshot`]: a Cat adoption
-/// refused is absent from it and must stay absent (ADR-0028 §7). Reporting it
-/// as `Cold` would tell the control plane the disk was released while an old
+/// The reported inventory is exactly [`NodeRuntime::snapshot`]: a Cat whose V1
+/// adoption proof was refused is absent from it and must stay absent. Reporting
+/// it as `Cold` would tell the control plane the disk was released while an old
 /// blockd may still hold its lease; omitting it only keeps the node Lost.
 async fn heartbeat_until_failure(
     state: &NodeState,
@@ -2056,8 +2056,8 @@ async fn heartbeat_until_failure(
 /// background registration + heartbeat loop.
 ///
 /// Returns once the agent is serving. Reaching the control plane is not a
-/// precondition (ADR-0028 §5): a control plane that is down at startup leaves
-/// this node disconnected but running, not dead.
+/// precondition: a control plane that is down at startup leaves this node
+/// disconnected but running, not dead.
 pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
     anyhow::ensure!(cfg.heartbeat_ms > 0, "heartbeat interval must be positive");
     anyhow::ensure!(
@@ -2077,8 +2077,8 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
     let runtime =
         Arc::new(NodeRuntime::new(cfg.node.clone())?.with_usage_finalizer(usage_pipeline.clone()));
 
-    // ADR-0028 §5: rebuild the local inventory before serving anything and
-    // before announcing this node. The control plane recovers a Lost node only
+    // Rebuild the V1 local inventory before serving anything and before
+    // announcing this node. The control plane recovers a Lost node only
     // from a heartbeat carrying every non-deleting claim at its claimed
     // generation, so the first heartbeat has to already know what this node is
     // running. Adoption probes /proc, Unix sockets and directories, so it runs
@@ -2167,9 +2167,9 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
     // addresses it by id -- the e2e cluster harness cordoning a node it just
     // started, an operator scripting against `READY` -- would now race.
     //
-    // ADR-0028 §5 only requires that an unreachable control plane must not end
-    // the process, not that startup must stop announcing itself. So: try once,
-    // keep the guarantee whenever the control plane is up, and hand an
+    // An unreachable control plane must not end the process, but that does not
+    // mean startup should skip its synchronous best-effort announcement. Try
+    // once, keep the guarantee whenever the control plane is up, and hand an
     // unreachable one to the retry loop instead of dying on it.
     let mut link = ControlPlaneLink::new(cfg.node.node_id.clone(), cp.clone());
     let registered = try_register_once(&client, &cp, &token, &register, &mut link)

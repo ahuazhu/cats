@@ -456,6 +456,72 @@ fn linux_quality_gate_installs_the_postgres_probe_runtime() {
         linux_gate.contains("apt-get install -qy --no-install-recommends e2fsprogs jq"),
         "the Linux gate must install jq before deployment probe fixtures execute"
     );
+    for field in ["ROOT", "HEAD", "DIRTY", "FINGERPRINT"] {
+        assert!(
+            linux_gate.contains(&format!(
+                "-e CATS_SOURCE_PROVENANCE_{field}=\"$SOURCE_PROVENANCE_{field}\""
+            )),
+            "the Linux gate must inherit the host's complete source provenance"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_gate_accepts_complete_inherited_provenance_from_any_cwd() {
+    let root = workspace_root();
+    let fixture = tempfile::tempdir().expect("provenance caller directory");
+    let expected_head = "a".repeat(40);
+    let expected_fingerprint = "b".repeat(40);
+    let output = Command::new(root.join("scripts/quality.sh"))
+        .arg("provenance")
+        .current_dir(fixture.path())
+        .env("CATS_SOURCE_PROVENANCE_ROOT", "/host/exact-worktree")
+        .env("CATS_SOURCE_PROVENANCE_HEAD", &expected_head)
+        .env("CATS_SOURCE_PROVENANCE_DIRTY", "true")
+        .env("CATS_SOURCE_PROVENANCE_FINGERPRINT", &expected_fingerprint)
+        .output()
+        .expect("run provenance probe");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 provenance output");
+    assert!(stdout.contains("source.root=/host/exact-worktree\n"));
+    assert!(stdout.contains(&format!("source.head={expected_head}\n")));
+    assert!(stdout.contains("source.dirty=true\n"));
+    assert!(stdout.contains(&format!("source.fingerprint={expected_fingerprint}\n")));
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_gate_rejects_partial_or_unresolvable_provenance() {
+    let root = workspace_root();
+    let partial = Command::new(root.join("scripts/quality.sh"))
+        .arg("provenance")
+        .env("CATS_SOURCE_PROVENANCE_ROOT", "/host/exact-worktree")
+        .env_remove("CATS_SOURCE_PROVENANCE_HEAD")
+        .env_remove("CATS_SOURCE_PROVENANCE_DIRTY")
+        .env_remove("CATS_SOURCE_PROVENANCE_FINGERPRINT")
+        .output()
+        .expect("run partial provenance probe");
+    assert!(!partial.status.success());
+    assert!(String::from_utf8_lossy(&partial.stderr)
+        .contains("overrides must set root, head, dirty and fingerprint together"));
+
+    let fixture = tempfile::tempdir().expect("non-Git provenance fixture");
+    let scripts = fixture.path().join("scripts");
+    std::fs::create_dir(&scripts).expect("create scripts fixture");
+    let copied = scripts.join("quality.sh");
+    std::fs::copy(root.join("scripts/quality.sh"), &copied).expect("copy quality script");
+    let unresolved = Command::new("bash")
+        .arg(copied)
+        .arg("provenance")
+        .env_remove("CATS_SOURCE_PROVENANCE_ROOT")
+        .env_remove("CATS_SOURCE_PROVENANCE_HEAD")
+        .env_remove("CATS_SOURCE_PROVENANCE_DIRTY")
+        .env_remove("CATS_SOURCE_PROVENANCE_FINGERPRINT")
+        .output()
+        .expect("run provenance outside Git");
+    assert!(!unresolved.status.success());
 }
 
 #[cfg(unix)]
