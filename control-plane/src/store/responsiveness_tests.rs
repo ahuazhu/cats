@@ -11,6 +11,114 @@ fn test_store() -> Arc<Store> {
     Arc::new(Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap())
 }
 
+fn dsn_with_application_name(dsn: &str, application_name: &str) -> String {
+    let mut url = reqwest::Url::parse(dsn).unwrap();
+    url.query_pairs_mut()
+        .append_pair("application_name", application_name);
+    url.to_string()
+}
+
+async fn wait_for_postgres_activity(
+    dsn: &str,
+    application_name: &str,
+    query_pattern: &str,
+    require_active_transaction: bool,
+    require_waiting_advisory_lock: bool,
+) {
+    let dsn = dsn.to_string();
+    let application_name = application_name.to_string();
+    let expected_application_name = application_name.clone();
+    let query_pattern = query_pattern.to_string();
+    let expected_query_pattern = query_pattern.clone();
+    let found = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || {
+            let mut observer = postgres::Client::connect(&dsn, postgres::NoTls).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let found: bool = observer
+                    .query_one(
+                        "SELECT EXISTS(
+                           SELECT 1
+                           FROM pg_stat_activity AS activity
+                           WHERE activity.pid <> pg_backend_pid()
+                             AND activity.application_name = $1
+                             AND activity.query LIKE $2
+                             AND (NOT $3 OR (
+                                 activity.state = 'active'
+                                 AND activity.xact_start IS NOT NULL
+                             ))
+                             AND (NOT $4 OR EXISTS(
+                                 SELECT 1 FROM pg_locks AS lock
+                                 WHERE lock.pid = activity.pid
+                                   AND lock.locktype = 'advisory'
+                                   AND NOT lock.granted
+                             ))
+                         )",
+                        &[
+                            &application_name,
+                            &query_pattern,
+                            &require_active_transaction,
+                            &require_waiting_advisory_lock,
+                        ],
+                    )
+                    .unwrap()
+                    .get(0);
+                if found {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }),
+    )
+    .await
+    .expect("the bounded PostgreSQL activity observer must finish")
+    .unwrap();
+    assert!(
+        found,
+        "expected PostgreSQL activity for application {expected_application_name} and query \
+         {expected_query_pattern}"
+    );
+}
+
+struct ActiveRoleGuard {
+    label: &'static str,
+    active: Arc<AtomicUsize>,
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl Drop for ActiveRoleGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("{}:stop", self.label));
+    }
+}
+
+async fn run_pending_test_role(
+    label: &'static str,
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+    starts: Arc<AtomicUsize>,
+    events: Arc<Mutex<Vec<String>>>,
+) {
+    events.lock().unwrap().push(format!("{label}:start"));
+    starts.fetch_add(1, Ordering::SeqCst);
+    let active_now = active.fetch_add(1, Ordering::SeqCst) + 1;
+    max_active.fetch_max(active_now, Ordering::SeqCst);
+    let _active = ActiveRoleGuard {
+        label,
+        active,
+        events,
+    };
+    std::future::pending::<()>().await;
+}
+
 #[derive(Default)]
 struct FaultProxyState {
     rejecting: bool,
@@ -618,6 +726,155 @@ async fn idempotent_transaction_lock_timeout_is_observable() {
     blocker.join().unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_a_started_idempotent_mutation_settles_once_on_retry() {
+    const APPLICATION_NAME: &str = "cats-issue-283-started-idempotency-cancel";
+    const IDEMPOTENCY_KEY: &str = "started-cancel-create-key";
+    const ROUTE: &str = "POST /cats started-cancel/one";
+
+    let direct_dsn = crate::testsupport::isolated_control_store_url();
+    let store_dsn = dsn_with_application_name(&direct_dsn, APPLICATION_NAME);
+    let first = Arc::new(
+        Store::connect_from_async(DsnSource::Literal(store_dsn.clone()), None)
+            .await
+            .unwrap(),
+    );
+    let second = Arc::new(
+        Store::connect_from_async(DsnSource::Literal(store_dsn), None)
+            .await
+            .unwrap(),
+    );
+    let workspace = first
+        .execute(|store| {
+            store.ensure_configured_accounts(&std::collections::BTreeMap::from([(
+                "started-cancel".to_string(),
+                "org_started_cancel".to_string(),
+            )]))?;
+            let account = store
+                .account_for_organization("org_started_cancel")?
+                .expect("bootstrap account exists");
+            Ok(store
+                .workspaces_for_account(&account.id)?
+                .into_iter()
+                .find(|workspace| workspace.is_default)
+                .expect("bootstrap workspace exists"))
+        })
+        .await
+        .unwrap();
+
+    let blocker_dsn = direct_dsn.clone();
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let blocker = std::thread::spawn(move || {
+        let mut client = postgres::Client::connect(&blocker_dsn, postgres::NoTls).unwrap();
+        let mut transaction = client.transaction().unwrap();
+        transaction
+            .query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended(
+                    current_schema() || ':idempotency:' || $1 || ':' || $2,
+                    0::BIGINT
+                 ))",
+                &[&IDEMPOTENCY_KEY, &ROUTE],
+            )
+            .unwrap();
+        locked_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        transaction.rollback().unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    let first_store = Arc::clone(&first);
+    let first_workspace = workspace.clone();
+    let first_caller = tokio::spawn(async move {
+        first_store
+            .execute(move |store| {
+                store.create_cat_idempotent(
+                    &first_workspace,
+                    "one",
+                    "test",
+                    1,
+                    256,
+                    1 << 20,
+                    true,
+                    None,
+                    None,
+                    DiskDurability::Strict,
+                    IDEMPOTENCY_KEY,
+                    ROUTE,
+                )
+            })
+            .await
+    });
+    wait_for_postgres_activity(
+        &direct_dsn,
+        APPLICATION_NAME,
+        "%pg_advisory_xact_lock%",
+        true,
+        true,
+    )
+    .await;
+
+    first_caller.abort();
+    assert!(
+        first_caller.await.unwrap_err().is_cancelled(),
+        "the Tokio caller, not the already-started transaction, is cancelled"
+    );
+    release_tx.send(()).unwrap();
+
+    let retried = second
+        .execute({
+            let workspace = workspace.clone();
+            move |store| {
+                store.create_cat_idempotent(
+                    &workspace,
+                    "one",
+                    "test",
+                    1,
+                    256,
+                    1 << 20,
+                    true,
+                    None,
+                    None,
+                    DiskDurability::Strict,
+                    IDEMPOTENCY_KEY,
+                    ROUTE,
+                )
+            }
+        })
+        .await
+        .unwrap();
+    blocker.join().unwrap();
+
+    let (cats, operations) = second
+        .execute({
+            let workspace_id = workspace.id.clone();
+            move |store| {
+                Ok((
+                    store.list_cats(&workspace_id)?,
+                    store.list_operations(&workspace_id)?,
+                ))
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        cats.len(),
+        1,
+        "the cancelled caller must not duplicate the Cat"
+    );
+    assert_eq!(
+        operations.len(),
+        1,
+        "the initial completion and retry must share one Operation"
+    );
+    assert_eq!(cats[0].id, retried.0.id);
+    assert_eq!(operations[0].id, retried.2.id);
+    assert_eq!(
+        cats[0].generation, 1,
+        "the idempotent create generation advances exactly once"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_oci_session_drop_releases_ownership_through_the_bounded_executor() {
     let url = crate::testsupport::isolated_control_store_url();
@@ -1154,4 +1411,139 @@ async fn two_replicas_recover_after_established_connections_are_severed() {
     assert!(snapshot.normal.active <= CONTROL_STORE_BLOCKING_WORKERS);
     assert!(snapshot.normal.queued <= CONTROL_STORE_QUEUE_CAPACITY);
     assert!(snapshot.admission_depth <= snapshot.admission_capacity);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn faulted_singleton_session_stops_the_old_role_before_standby_starts() {
+    const LEADER_APPLICATION: &str = "cats-issue-283-singleton-fault-leader";
+    const STANDBY_APPLICATION: &str = "cats-issue-283-singleton-fault-standby";
+
+    let direct_dsn = crate::testsupport::isolated_control_store_url();
+    drop(Store::connect(&direct_dsn, None).unwrap());
+    let proxy = FaultProxy::start(&direct_dsn).await;
+    let leader_dsn = dsn_with_application_name(&proxy.proxied_dsn(&direct_dsn), LEADER_APPLICATION);
+    let standby_dsn = dsn_with_application_name(&direct_dsn, STANDBY_APPLICATION);
+    let leader_store = Arc::new(
+        Store::connect_from_async(DsnSource::Literal(leader_dsn), None)
+            .await
+            .unwrap(),
+    );
+    let standby_store = Arc::new(
+        Store::connect_from_async(DsnSource::Literal(standby_dsn), None)
+            .await
+            .unwrap(),
+    );
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let starts = Arc::new(AtomicUsize::new(0));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let leader_task =
+        crate::server::spawn_singleton_task(leader_store, SingletonRole::UsageProjector, {
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            let starts = Arc::clone(&starts);
+            let events = Arc::clone(&events);
+            move || {
+                run_pending_test_role(
+                    "leader",
+                    Arc::clone(&active),
+                    Arc::clone(&max_active),
+                    Arc::clone(&starts),
+                    Arc::clone(&events),
+                )
+            }
+        });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while starts.load(Ordering::SeqCst) != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the proxy-backed replica must acquire leadership");
+    proxy.wait_for_connections(2).await;
+
+    // Observe a completed health check, then phase the standby's first failed
+    // election attempt so the next leader check precedes its retry. The event
+    // log and max_active assertion remain the correctness oracle.
+    wait_for_postgres_activity(&direct_dsn, LEADER_APPLICATION, "SELECT 1", false, false).await;
+    let health_observed = Instant::now();
+    tokio::time::sleep(Duration::from_millis(650)).await;
+
+    let standby_task =
+        crate::server::spawn_singleton_task(standby_store, SingletonRole::UsageProjector, {
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            let starts = Arc::clone(&starts);
+            let events = Arc::clone(&events);
+            move || {
+                run_pending_test_role(
+                    "standby",
+                    Arc::clone(&active),
+                    Arc::clone(&max_active),
+                    Arc::clone(&starts),
+                    Arc::clone(&events),
+                )
+            }
+        });
+    wait_for_postgres_activity(
+        &direct_dsn,
+        STANDBY_APPLICATION,
+        "%pg_try_advisory_lock%",
+        false,
+        false,
+    )
+    .await;
+    assert!(
+        health_observed.elapsed() < Duration::from_millis(900),
+        "the fault phase must be calibrated before the leader's next health check"
+    );
+    assert_eq!(starts.load(Ordering::SeqCst), 1, "the standby is waiting");
+
+    proxy.sever_and_reject();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let events = events.lock().unwrap().clone();
+            if events.iter().any(|event| event == "leader:stop")
+                && events.iter().any(|event| event == "standby:start")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the standby must take over after the faulted leader stops");
+
+    let events = events.lock().unwrap().clone();
+    let leader_stop = events
+        .iter()
+        .position(|event| event == "leader:stop")
+        .unwrap();
+    let standby_start = events
+        .iter()
+        .position(|event| event == "standby:start")
+        .unwrap();
+    assert!(
+        leader_stop < standby_start,
+        "old role must stop before standby starts: {events:?}"
+    );
+    assert_eq!(active.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        max_active.load(Ordering::SeqCst),
+        1,
+        "singleton role executions must never overlap"
+    );
+
+    leader_task.abort();
+    standby_task.abort();
+    let _ = leader_task.await;
+    let _ = standby_task.await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while active.load(Ordering::SeqCst) != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("singleton role cleanup must finish");
 }
