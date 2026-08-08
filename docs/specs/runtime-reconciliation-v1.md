@@ -1782,7 +1782,9 @@ standalone `Operation` decode/validation还必须逐字段要求
 `malformed_payload {problem:"invalid_value"}`，不能等到observation settlement才发现。
 `contract_error`不是`OperationFailure` variant。完整Desired在与Operation同事务提交前已经通过同一
 §16.4.1 decoder；Node或任意row不能用自报ContractError把Operation变为Failed。standalone Operation若携带
-该旧tag，按closed union的unknown discriminator返回指向`/terminal/error/kind`的`invalid_value`且零副作用。
+该旧tag且其他字段都属于当前union-wide字段集合，按Schema substage 2返回指向
+`/terminal/error/kind`的`invalid_value`；若还携带已删除variant的`error`等字段，则Schema substage 1更早
+返回指向该字段的`unknown_field`。这里没有specific override，也不得把已删除字段加入union-wide集合做兼容。
 顶层`ContractError`合同继续用于边界请求拒绝，不是Operation terminal。stale/wrong session、
 stale/conflicting observation sequence、revision、stored digest或placement也只拒绝那次输入，绝不能终结
 当前Operation。
@@ -2193,9 +2195,12 @@ Operation source，并用mock断言不读取/比较后一source。presented revi
 返回wrong；revision与digest、digest与placement同时冲突时分别只报告更早stage。交换任意JSON member顺序不
 改变typed payload；placement仍按Operation、applied、顶层Node的既有顺序，并在首错后停止后续Cat/Store读取。
 
-`contract_error`移除测试必须把旧OperationFailure tag送入standalone decoder，断言
-`malformed_payload {problem:"invalid_value", json_pointer:"/terminal/error/kind"}`；在NodeObservation
-Condition伪造同名tag也必须按closed union拒绝且整份observation零副作用。重建的current完整Desired正常通过
+`contract_error`移除测试必须把只有当前union-wide字段的旧OperationFailure tag送入standalone decoder，断言
+`malformed_payload {problem:"invalid_value", json_pointer:"/terminal/error/kind"}`；另把已删除variant的
+`error`字段与旧tag同时送入，断言按Schema substage 1先返回
+`malformed_payload {problem:"unknown_field", json_pointer:"/terminal/error/error"}`。不得为这两例添加specific
+override或把`error`加入union-wide字段集合做兼容。在NodeObservation Condition伪造同名tag也必须按closed
+union拒绝且整份observation零副作用。重建的current完整Desired正常通过
 F0时Operation保持Pending，不能采用Node自报error；完整row缺失、无法canonical encode或重放失败时必须断言
 当前事务abort、Operation row原状态不变、observation未接受/未结算，Control Plane进入内部fatal/unready且停止
 签发新的Desired/placement/Grant；不得生成quarantined/blocked Condition、Operation terminal或Node自报error。
