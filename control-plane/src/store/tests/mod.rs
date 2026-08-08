@@ -580,10 +580,20 @@ fn singleton_roles_elect_independently_and_release_on_session_drop() {
     );
 
     drop(first_reconciler);
-    assert!(
-        second_reconciler.try_acquire().unwrap(),
-        "PostgreSQL must release leadership with the owner session"
-    );
+    // Client destruction closes the session, but PostgreSQL may observe the
+    // standby query before it processes that close. Poll the lock authority
+    // instead of treating Rust Drop completion as synchronous server state.
+    let release_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if second_reconciler.try_acquire().unwrap() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < release_deadline,
+            "PostgreSQL must release leadership within the session cleanup bound"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
