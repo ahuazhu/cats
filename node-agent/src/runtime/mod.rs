@@ -26,6 +26,7 @@ mod ledger;
 mod lifecycle;
 mod metering;
 mod proxy;
+pub mod reconciliation;
 mod residue;
 mod supervisor;
 
