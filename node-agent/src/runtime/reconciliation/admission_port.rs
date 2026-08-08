@@ -122,16 +122,13 @@ pub enum GatePortError {
 /// section and perform no file, network, database, VMM, or async work. Every
 /// method is an exact compare-and-apply operation:
 ///
-/// - current == `expected`: perform the named transition to `replacement`;
-/// - current == `replacement`: return success as an exact replay;
-/// - any other current state: adopt the verified replacement revision tuple
-///   with lifecycle and every Endpoint gate Closed, then return
-///   [`GatePortError::StateMismatch`]. A `close_all` replacement is already
-///   in exactly that form.
-///
-/// Consequently, every error return is fail-closed. This is what lets an
-/// `Armed` RequireIdle result or a process crash remain conservative without a
-/// second local authority.
+/// Global operations (`close_all` and `try_close_all_if_idle`) fail closed on
+/// an ambiguous result. Endpoint operations have a deliberately different
+/// contract: they may mutate only the named Endpoint and the applied Desired
+/// tuple. A compare mismatch has zero side effects, while `Unavailable` may
+/// mean that the named effect happened; the caller confirms the complete
+/// snapshot before changing the durable checkpoint. This distinction is what
+/// keeps an Endpoint-A cutover from closing Endpoint B.
 pub trait AdmissionGatePort {
     /// Returns one complete point-in-time copy of the local cell state.
     ///
@@ -143,6 +140,26 @@ pub trait AdmissionGatePort {
     fn snapshot(&self) -> AdmissionSnapshot;
 
     fn install_gate(
+        &mut self,
+        expected: &AdmissionSnapshot,
+        replacement: &AdmissionSnapshot,
+        endpoint_id: &cats_api::runtime_reconciliation::Id,
+    ) -> Result<(), GatePortError>;
+
+    /// Atomically advances the applied Desired tuple and compare-closes only
+    /// `endpoint_id`. `expected` and `replacement` must be identical for every
+    /// other Endpoint and for lifecycle admission.
+    fn close_gate(
+        &mut self,
+        expected: &AdmissionSnapshot,
+        replacement: &AdmissionSnapshot,
+        endpoint_id: &cats_api::runtime_reconciliation::Id,
+    ) -> Result<(), GatePortError>;
+
+    /// Compare-removes one exact, already-Closed Endpoint entry. Existing
+    /// guards are drained by the caller before invoking this method; no other
+    /// Endpoint entry, guard, or cancellation handle may change.
+    fn remove_closed_gate(
         &mut self,
         expected: &AdmissionSnapshot,
         replacement: &AdmissionSnapshot,

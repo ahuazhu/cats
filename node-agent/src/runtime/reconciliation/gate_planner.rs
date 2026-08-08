@@ -26,6 +26,21 @@ pub enum GateTransitionResult {
     Closed {
         checkpoint: StoredCheckpoint,
     },
+    EndpointClosed {
+        checkpoint: StoredCheckpoint,
+        /// Retained only for diagnostics when an ambiguous local return was
+        /// resolved by reading the exact closed postcondition.
+        port_error: Option<GatePortError>,
+    },
+    EndpointPrepared {
+        checkpoint: StoredCheckpoint,
+    },
+    EndpointRemoved {
+        checkpoint: StoredCheckpoint,
+        /// Retained only for diagnostics when exact absence confirmed an
+        /// otherwise ambiguous compare-remove result.
+        port_error: Option<GatePortError>,
+    },
     RequireIdleBusy {
         checkpoint: StoredCheckpoint,
         gate_closed: bool,
@@ -44,6 +59,9 @@ impl GateTransitionResult {
         match self {
             Self::Installed { checkpoint }
             | Self::Closed { checkpoint }
+            | Self::EndpointClosed { checkpoint, .. }
+            | Self::EndpointPrepared { checkpoint }
+            | Self::EndpointRemoved { checkpoint, .. }
             | Self::RequireIdleBusy { checkpoint, .. }
             | Self::RequireIdleClosed { checkpoint } => checkpoint,
         }
@@ -129,6 +147,20 @@ pub enum GateReconcileError {
     ActiveRouteChanged(Id),
     #[error("active gates cannot survive a placement epoch change")]
     ActiveGatesAcrossPlacement,
+    #[error("Endpoint-only gate convergence requires a Running, non-RequireIdle Desired")]
+    EndpointOnlyRequiresRunning,
+    #[error("Endpoint {0} is not the next deterministic Endpoint delta")]
+    EndpointOutOfOrder(Id),
+    #[error("Endpoint {0} does not require the requested gate action")]
+    WrongEndpointAction(Id),
+    #[error("checkpoint does not contain the exact durable CloseGate token for Endpoint {0}")]
+    WrongCloseGateCheckpoint(Id),
+    #[error("Endpoint {0} must have a durable Closed old binding")]
+    EndpointNotClosed(Id),
+    #[error("Endpoint {0} changed without increasing its route epoch")]
+    RouteEpochNotAdvanced(Id),
+    #[error("the live AdmissionCell cannot be an exact predecessor of this Endpoint effect")]
+    EndpointCellMismatch,
 }
 
 /// Constructs observation evidence only after the complete checkpoint and the
@@ -243,8 +275,6 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         if desired.target != RuntimeTarget::Running {
             return Err(GateReconcileError::RuntimeNotInstallable);
         }
-        let expected_snapshot = self.expected_transition_snapshot(current, desired)?;
-        let mut staged = stage_desired(current.checkpoint(), desired, times.before_effect)?;
         if desired.placement.placement_epoch != current.checkpoint().placement_epoch
             && current
                 .checkpoint()
@@ -254,43 +284,324 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
         {
             return Err(GateReconcileError::ActiveGatesAcrossPlacement);
         }
-        let incarnation = staged
+        encode_desired_runtime_spec(desired).map_err(AppliedDesiredError::from)?;
+        let incarnation = current
+            .checkpoint()
             .runtime_incarnation
-            .clone()
+            .as_ref()
             .ok_or(GateReconcileError::RuntimeNotInstallable)?;
         let endpoint = desired
             .endpoints
             .iter()
             .find(|endpoint| &endpoint.endpoint_id == endpoint_id)
             .ok_or_else(|| GateReconcileError::EndpointNotFound(endpoint_id.clone()))?;
-        let binding = RouteGateBinding {
-            workspace_id: desired.workspace_id.clone(),
-            endpoint_id: endpoint.endpoint_id.clone(),
-            hostname: endpoint.hostname.clone(),
-            cat_id: desired.cat_id.clone(),
-            node_id: desired.placement.node_id.clone(),
-            runtime_incarnation: incarnation,
-            route_epoch: endpoint.route_epoch,
-            protocol: endpoint.protocol,
-            target_port: endpoint.target_port,
+        let binding = route_binding(desired, endpoint, Some(incarnation))
+            .ok_or(GateReconcileError::RuntimeNotInstallable)?;
+
+        let already_prepared = install_step_matches(current.checkpoint(), desired, endpoint_id)?;
+        let open_busy_reuse = matches!(
+            current.checkpoint().require_idle,
+            RequireIdleCheckpoint::Busy {
+                gate_closed: false,
+                ..
+            }
+        ) && current
+            .checkpoint()
+            .route_gates
+            .iter()
+            .any(|route| route.binding == binding && route.gate == RouteGateState::Active)
+            && desired.desired_revision > current.checkpoint().desired_revision;
+
+        let prepared_storage: StoredCheckpoint;
+        let prepared = if already_prepared {
+            current
+        } else {
+            if !open_busy_reuse {
+                let action = first_endpoint_action(current.checkpoint(), desired)?
+                    .ok_or_else(|| GateReconcileError::WrongEndpointAction(endpoint_id.clone()))?;
+                if action.endpoint_id() != endpoint_id {
+                    return Err(GateReconcileError::EndpointOutOfOrder(endpoint_id.clone()));
+                }
+                let EndpointAction::Install { new_binding, .. } = action else {
+                    return Err(GateReconcileError::WrongEndpointAction(endpoint_id.clone()));
+                };
+                if current.checkpoint().route_gates.iter().any(|route| {
+                    route.binding == new_binding && route.gate == RouteGateState::Closed
+                }) {
+                    return Err(GateReconcileError::ClosedEpochReuse(endpoint_id.clone()));
+                }
+            }
+            let expected = self.expected_transition_snapshot(current, desired)?;
+            if self.port.snapshot() != expected {
+                return Err(GateReconcileError::EndpointCellMismatch);
+            }
+            let mut prepared = stage_desired(current.checkpoint(), desired, times.before_effect)?;
+            prepared.stable_state = None;
+            prepared.require_idle = RequireIdleCheckpoint::NotApplicable;
+            if !open_busy_reuse {
+                prepare_install_entry(&mut prepared, binding.clone())?;
+            }
+            prepared.step = ReconcileStep::InstallGate {
+                endpoint_id: endpoint_id.clone(),
+                route_epoch: endpoint.route_epoch,
+            };
+            prepared_storage = self.store.replace(current, &prepared)?;
+            &prepared_storage
         };
-        validate_unchanged_active_routes(&staged, desired, Some(endpoint_id))?;
-        install_route_in_checkpoint(&mut staged, binding)?;
-        staged.lifecycle_admission = LifecycleAdmission::Open;
-        staged.step = ReconcileStep::InstallGate {
+
+        let mut active_checkpoint = prepared.checkpoint().clone();
+        activate_install_entry(&mut active_checkpoint, &binding)?;
+        active_checkpoint.lifecycle_admission = LifecycleAdmission::Open;
+        active_checkpoint.stable_state = None;
+        active_checkpoint.step = ReconcileStep::InstallGate {
             endpoint_id: endpoint_id.clone(),
             route_epoch: endpoint.route_epoch,
         };
-        let replacement_snapshot = AdmissionSnapshot::from_checkpoint(&staged)?;
-        let staged = self.store.replace(current, &staged)?;
-        self.port
-            .install_gate(&expected_snapshot, &replacement_snapshot, endpoint_id)?;
+        let active_storage = if active_checkpoint == *prepared.checkpoint() {
+            prepared.clone()
+        } else {
+            self.store.replace(prepared, &active_checkpoint)?
+        };
+        let replacement = AdmissionSnapshot::from_checkpoint(active_storage.checkpoint())?;
+        let live = self.port.snapshot();
+        if live != replacement {
+            if !valid_install_predecessor(
+                &live,
+                active_storage.checkpoint(),
+                &replacement,
+                endpoint_id,
+            ) {
+                return Err(GateReconcileError::EndpointCellMismatch);
+            }
+            let result = self.port.install_gate(&live, &replacement, endpoint_id);
+            let after = self.port.snapshot();
+            match result {
+                Ok(()) if after != replacement => {
+                    return Err(GateReconcileError::EndpointCellMismatch)
+                }
+                Err(_) if after == replacement => {}
+                Err(error) if after == live => return Err(error.into()),
+                Err(_) => return Err(GateReconcileError::EndpointCellMismatch),
+                Ok(()) => {}
+            }
+        }
 
-        let mut completed = staged.checkpoint().clone();
+        let mut completed = active_storage.checkpoint().clone();
         completed.updated_at_unix_ms = times.after_effect;
-        let completed = self.store.replace(&staged, &completed)?;
+        advance_endpoint_checkpoint(&mut completed, desired)?;
+        let completed = self.store.replace(&active_storage, &completed)?;
         Ok(GateTransitionResult::Installed {
             checkpoint: completed,
+        })
+    }
+
+    /// Applies one deterministic Endpoint-only close. The first publication
+    /// binds the checkpoint top level to the new Desired while retaining the
+    /// exact old installed binding and an Active gate. Only after that token
+    /// is durable may the in-memory cell compare-close the named Endpoint.
+    pub fn close_gate(
+        &mut self,
+        current: &StoredCheckpoint,
+        desired: &DesiredRuntimeSpec,
+        endpoint_id: &Id,
+        times: PersistTimes,
+    ) -> Result<GateTransitionResult, GateReconcileError> {
+        validate_times(times)?;
+        validate_endpoint_desired(desired)?;
+
+        let staged_storage: StoredCheckpoint;
+        let close_checkpoint = if matches!(
+            &current.checkpoint().step,
+            ReconcileStep::CloseGate {
+                endpoint_id: saved_endpoint,
+                ..
+            } if saved_endpoint == endpoint_id
+        ) {
+            validate_close_gate_checkpoint(current.checkpoint(), desired, endpoint_id)?;
+            current
+        } else {
+            let action = first_endpoint_action(current.checkpoint(), desired)?
+                .ok_or_else(|| GateReconcileError::WrongEndpointAction(endpoint_id.clone()))?;
+            if action.endpoint_id() != endpoint_id {
+                return Err(GateReconcileError::EndpointOutOfOrder(endpoint_id.clone()));
+            }
+            if !matches!(action, EndpointAction::Close { .. }) {
+                return Err(GateReconcileError::WrongEndpointAction(endpoint_id.clone()));
+            }
+            if self.port.snapshot() != AdmissionSnapshot::from_checkpoint(current.checkpoint())? {
+                return Err(GateReconcileError::EndpointCellMismatch);
+            }
+
+            let mut staged = stage_desired(current.checkpoint(), desired, times.before_effect)?;
+            let route_epoch = route_entry(&staged, endpoint_id)?.binding.route_epoch;
+            staged.stable_state = None;
+            staged.require_idle = RequireIdleCheckpoint::NotApplicable;
+            staged.step = ReconcileStep::CloseGate {
+                endpoint_id: endpoint_id.clone(),
+                route_epoch,
+            };
+            staged_storage = self.store.replace(current, &staged)?;
+            &staged_storage
+        };
+
+        self.execute_close_gate(close_checkpoint, desired, endpoint_id, times.after_effect)
+    }
+
+    /// After Endpoint-scoped guards have drained, atomically replaces one
+    /// changed old Closed binding with the higher-epoch new Closed binding and
+    /// the matching InstallGate token. This method deliberately performs no
+    /// AdmissionCell mutation.
+    pub fn prepare_changed_gate(
+        &mut self,
+        closed: &StoredCheckpoint,
+        desired: &DesiredRuntimeSpec,
+        endpoint_id: &Id,
+        updated_at: UnixMillis,
+    ) -> Result<GateTransitionResult, GateReconcileError> {
+        validate_endpoint_desired(desired)?;
+        if prepared_install_matches(closed.checkpoint(), desired, endpoint_id)? {
+            return Ok(GateTransitionResult::EndpointPrepared {
+                checkpoint: closed.clone(),
+            });
+        }
+        let route_index =
+            validate_close_gate_checkpoint(closed.checkpoint(), desired, endpoint_id)?;
+        if closed.checkpoint().route_gates[route_index].gate != RouteGateState::Closed {
+            return Err(GateReconcileError::EndpointNotClosed(endpoint_id.clone()));
+        }
+        let action = first_endpoint_action(closed.checkpoint(), desired)?
+            .ok_or_else(|| GateReconcileError::WrongEndpointAction(endpoint_id.clone()))?;
+        if action.endpoint_id() != endpoint_id {
+            return Err(GateReconcileError::EndpointOutOfOrder(endpoint_id.clone()));
+        }
+        let EndpointAction::PrepareChanged { new_binding, .. } = action else {
+            return Err(GateReconcileError::WrongEndpointAction(endpoint_id.clone()));
+        };
+        if self.port.snapshot() != AdmissionSnapshot::from_checkpoint(closed.checkpoint())? {
+            return Err(GateReconcileError::EndpointCellMismatch);
+        }
+
+        let mut prepared = closed.checkpoint().clone();
+        prepared.route_gates[route_index] = CheckpointRouteGate {
+            binding: new_binding.clone(),
+            gate: RouteGateState::Closed,
+        };
+        prepared.step = ReconcileStep::InstallGate {
+            endpoint_id: endpoint_id.clone(),
+            route_epoch: new_binding.route_epoch,
+        };
+        prepared.updated_at_unix_ms = updated_at;
+        let prepared = self.store.replace(closed, &prepared)?;
+        Ok(GateTransitionResult::EndpointPrepared {
+            checkpoint: prepared,
+        })
+    }
+
+    /// After Endpoint-scoped guards have drained, compare-removes one exact
+    /// old Closed entry from the AdmissionCell. Exact absence is the only
+    /// replay postcondition; only then is the checkpoint entry removed and the
+    /// next deterministic Endpoint step published.
+    pub fn remove_closed_gate(
+        &mut self,
+        closed: &StoredCheckpoint,
+        desired: &DesiredRuntimeSpec,
+        endpoint_id: &Id,
+        updated_at: UnixMillis,
+    ) -> Result<GateTransitionResult, GateReconcileError> {
+        validate_endpoint_desired(desired)?;
+        let route_index =
+            validate_close_gate_checkpoint(closed.checkpoint(), desired, endpoint_id)?;
+        if closed.checkpoint().route_gates[route_index].gate != RouteGateState::Closed {
+            return Err(GateReconcileError::EndpointNotClosed(endpoint_id.clone()));
+        }
+        let action = first_endpoint_action(closed.checkpoint(), desired)?
+            .ok_or_else(|| GateReconcileError::WrongEndpointAction(endpoint_id.clone()))?;
+        if action.endpoint_id() != endpoint_id {
+            return Err(GateReconcileError::EndpointOutOfOrder(endpoint_id.clone()));
+        }
+        if !matches!(action, EndpointAction::Remove { .. }) {
+            return Err(GateReconcileError::WrongEndpointAction(endpoint_id.clone()));
+        }
+
+        let expected = AdmissionSnapshot::from_checkpoint(closed.checkpoint())?;
+        let mut absent_checkpoint = closed.checkpoint().clone();
+        absent_checkpoint.route_gates.remove(route_index);
+        let absent = AdmissionSnapshot::from_checkpoint(&absent_checkpoint)?;
+        let live = self.port.snapshot();
+        let mut port_error = None;
+        if live != absent {
+            if live != expected {
+                return Err(GateReconcileError::EndpointCellMismatch);
+            }
+            let result = self
+                .port
+                .remove_closed_gate(&expected, &absent, endpoint_id);
+            let after = self.port.snapshot();
+            match result {
+                Ok(()) if after != absent => return Err(GateReconcileError::EndpointCellMismatch),
+                Err(error) if after == absent => port_error = Some(error),
+                Err(error) if after == expected => return Err(error.into()),
+                Err(_) => return Err(GateReconcileError::EndpointCellMismatch),
+                Ok(()) => {}
+            }
+        }
+
+        absent_checkpoint.updated_at_unix_ms = updated_at;
+        advance_endpoint_checkpoint(&mut absent_checkpoint, desired)?;
+        let completed = self.store.replace(closed, &absent_checkpoint)?;
+        Ok(GateTransitionResult::EndpointRemoved {
+            checkpoint: completed,
+            port_error,
+        })
+    }
+
+    fn execute_close_gate(
+        &mut self,
+        close_checkpoint: &StoredCheckpoint,
+        desired: &DesiredRuntimeSpec,
+        endpoint_id: &Id,
+        updated_at: UnixMillis,
+    ) -> Result<GateTransitionResult, GateReconcileError> {
+        let route_index =
+            validate_close_gate_checkpoint(close_checkpoint.checkpoint(), desired, endpoint_id)?;
+        let mut closed_checkpoint = close_checkpoint.checkpoint().clone();
+        closed_checkpoint.route_gates[route_index].gate = RouteGateState::Closed;
+        closed_checkpoint.updated_at_unix_ms = updated_at;
+        let replacement = AdmissionSnapshot::from_checkpoint(&closed_checkpoint)?;
+        let live = self.port.snapshot();
+        let mut port_error = None;
+        if live != replacement {
+            if !valid_close_gate_predecessor(
+                &live,
+                close_checkpoint.checkpoint(),
+                &replacement,
+                endpoint_id,
+            ) {
+                return Err(GateReconcileError::EndpointCellMismatch);
+            }
+            let result = self.port.close_gate(&live, &replacement, endpoint_id);
+            let after = self.port.snapshot();
+            match result {
+                Ok(()) if after != replacement => {
+                    return Err(GateReconcileError::EndpointCellMismatch)
+                }
+                Err(error) if after == replacement => port_error = Some(error),
+                Err(error) if after == live => return Err(error.into()),
+                Err(_) => return Err(GateReconcileError::EndpointCellMismatch),
+                Ok(()) => {}
+            }
+        }
+
+        let checkpoint = if close_checkpoint.checkpoint().route_gates[route_index].gate
+            == RouteGateState::Closed
+        {
+            close_checkpoint.clone()
+        } else {
+            self.store.replace(close_checkpoint, &closed_checkpoint)?
+        };
+        Ok(GateTransitionResult::EndpointClosed {
+            checkpoint,
+            port_error,
         })
     }
 
@@ -565,6 +876,496 @@ impl<'a, P: AdmissionGatePort> GateSequencer<'a, P> {
     }
 }
 
+#[derive(Debug, Clone)]
+enum EndpointAction {
+    Close {
+        endpoint_id: Id,
+    },
+    PrepareChanged {
+        endpoint_id: Id,
+        new_binding: RouteGateBinding,
+    },
+    Remove {
+        endpoint_id: Id,
+    },
+    Install {
+        endpoint_id: Id,
+        new_binding: RouteGateBinding,
+    },
+}
+
+impl EndpointAction {
+    fn endpoint_id(&self) -> &Id {
+        match self {
+            Self::Close { endpoint_id }
+            | Self::PrepareChanged { endpoint_id, .. }
+            | Self::Remove { endpoint_id }
+            | Self::Install { endpoint_id, .. } => endpoint_id,
+        }
+    }
+}
+
+fn validate_endpoint_desired(desired: &DesiredRuntimeSpec) -> Result<(), GateReconcileError> {
+    encode_desired_runtime_spec(desired).map_err(AppliedDesiredError::from)?;
+    if desired.target != RuntimeTarget::Running
+        || matches!(desired.transition, RuntimeTransition::RequireIdle { .. })
+    {
+        return Err(GateReconcileError::EndpointOnlyRequiresRunning);
+    }
+    Ok(())
+}
+
+fn first_endpoint_action(
+    checkpoint: &RuntimeCheckpoint,
+    desired: &DesiredRuntimeSpec,
+) -> Result<Option<EndpointAction>, GateReconcileError> {
+    validate_endpoint_desired(desired)?;
+    AdmissionSnapshot::from_checkpoint(checkpoint)?;
+    if checkpoint.cat_id != desired.cat_id {
+        return Err(GateReconcileError::WrongCat);
+    }
+    if desired.placement.node_id != checkpoint.node_id {
+        return Err(GateReconcileError::WrongNode);
+    }
+    if checkpoint
+        .route_gates
+        .iter()
+        .any(|route| route.binding.workspace_id != desired.workspace_id)
+    {
+        return Err(GateReconcileError::WrongWorkspace);
+    }
+    let incarnation = checkpoint
+        .runtime_incarnation
+        .as_ref()
+        .ok_or(GateReconcileError::RuntimeNotInstallable)?;
+    let mut current_index = 0;
+    let mut desired_index = 0;
+
+    while current_index < checkpoint.route_gates.len() || desired_index < desired.endpoints.len() {
+        let current = checkpoint.route_gates.get(current_index);
+        let endpoint = desired.endpoints.get(desired_index);
+        match (current, endpoint) {
+            (Some(current), Some(endpoint))
+                if current.binding.endpoint_id < endpoint.endpoint_id =>
+            {
+                let endpoint_id = current.binding.endpoint_id.clone();
+                return Ok(Some(if is_matching_close_step(checkpoint, current) {
+                    EndpointAction::Remove { endpoint_id }
+                } else {
+                    EndpointAction::Close { endpoint_id }
+                }));
+            }
+            (Some(current), Some(endpoint))
+                if current.binding.endpoint_id > endpoint.endpoint_id =>
+            {
+                let new_binding = route_binding(desired, endpoint, Some(incarnation))
+                    .ok_or(GateReconcileError::RuntimeNotInstallable)?;
+                return Ok(Some(EndpointAction::Install {
+                    endpoint_id: endpoint.endpoint_id.clone(),
+                    new_binding,
+                }));
+            }
+            (Some(current), Some(endpoint)) => {
+                let new_binding = route_binding(desired, endpoint, Some(incarnation))
+                    .ok_or(GateReconcileError::RuntimeNotInstallable)?;
+                if current.binding == new_binding {
+                    if current.gate == RouteGateState::Closed {
+                        return Ok(Some(EndpointAction::Install {
+                            endpoint_id: endpoint.endpoint_id.clone(),
+                            new_binding,
+                        }));
+                    }
+                    current_index += 1;
+                    desired_index += 1;
+                    continue;
+                }
+                if new_binding.route_epoch <= current.binding.route_epoch {
+                    return Err(GateReconcileError::RouteEpochNotAdvanced(
+                        endpoint.endpoint_id.clone(),
+                    ));
+                }
+                let endpoint_id = endpoint.endpoint_id.clone();
+                return Ok(Some(if current.gate == RouteGateState::Active {
+                    EndpointAction::Close { endpoint_id }
+                } else if is_matching_close_step(checkpoint, current) {
+                    EndpointAction::PrepareChanged {
+                        endpoint_id,
+                        new_binding,
+                    }
+                } else {
+                    EndpointAction::Install {
+                        endpoint_id,
+                        new_binding,
+                    }
+                }));
+            }
+            (Some(current), None) => {
+                let endpoint_id = current.binding.endpoint_id.clone();
+                return Ok(Some(if is_matching_close_step(checkpoint, current) {
+                    EndpointAction::Remove { endpoint_id }
+                } else {
+                    EndpointAction::Close { endpoint_id }
+                }));
+            }
+            (None, Some(endpoint)) => {
+                let new_binding = route_binding(desired, endpoint, Some(incarnation))
+                    .ok_or(GateReconcileError::RuntimeNotInstallable)?;
+                return Ok(Some(EndpointAction::Install {
+                    endpoint_id: endpoint.endpoint_id.clone(),
+                    new_binding,
+                }));
+            }
+            (None, None) => break,
+        }
+    }
+    Ok(None)
+}
+
+fn is_matching_close_step(checkpoint: &RuntimeCheckpoint, route: &CheckpointRouteGate) -> bool {
+    matches!(
+        &checkpoint.step,
+        ReconcileStep::CloseGate {
+            endpoint_id,
+            route_epoch,
+        } if endpoint_id == &route.binding.endpoint_id
+            && route_epoch == &route.binding.route_epoch
+    )
+}
+
+fn validate_close_gate_checkpoint(
+    checkpoint: &RuntimeCheckpoint,
+    desired: &DesiredRuntimeSpec,
+    endpoint_id: &Id,
+) -> Result<usize, GateReconcileError> {
+    validate_endpoint_desired(desired)?;
+    encode_runtime_checkpoint(checkpoint).map_err(|error| {
+        GateReconcileError::AppliedDesired(AppliedDesiredError::CheckpointContract { error })
+    })?;
+    if checkpoint.cat_id != desired.cat_id
+        || checkpoint.desired_revision != desired.desired_revision
+        || checkpoint.spec_digest != desired.spec_digest
+        || checkpoint.placement_epoch != desired.placement.placement_epoch
+        || checkpoint.node_id != desired.placement.node_id
+        || checkpoint.runtime_incarnation.is_none()
+        || checkpoint.lifecycle_admission != LifecycleAdmission::Open
+        || !matches!(
+            &checkpoint.step,
+            ReconcileStep::CloseGate {
+                endpoint_id: saved_endpoint,
+                route_epoch,
+            } if saved_endpoint == endpoint_id
+                && checkpoint.route_gates.iter().any(|route| {
+                    route.binding.endpoint_id == *endpoint_id
+                        && route.binding.route_epoch == *route_epoch
+                })
+        )
+    {
+        return Err(GateReconcileError::WrongCloseGateCheckpoint(
+            endpoint_id.clone(),
+        ));
+    }
+    let action = first_endpoint_action(checkpoint, desired)?
+        .ok_or_else(|| GateReconcileError::WrongEndpointAction(endpoint_id.clone()))?;
+    if action.endpoint_id() != endpoint_id {
+        return Err(GateReconcileError::EndpointOutOfOrder(endpoint_id.clone()));
+    }
+    if !matches!(
+        action,
+        EndpointAction::Close { .. }
+            | EndpointAction::PrepareChanged { .. }
+            | EndpointAction::Remove { .. }
+    ) {
+        return Err(GateReconcileError::WrongEndpointAction(endpoint_id.clone()));
+    }
+    checkpoint
+        .route_gates
+        .binary_search_by(|route| route.binding.endpoint_id.cmp(endpoint_id))
+        .map_err(|_| GateReconcileError::WrongCloseGateCheckpoint(endpoint_id.clone()))
+}
+
+fn prepared_install_matches(
+    checkpoint: &RuntimeCheckpoint,
+    desired: &DesiredRuntimeSpec,
+    endpoint_id: &Id,
+) -> Result<bool, GateReconcileError> {
+    if checkpoint.cat_id != desired.cat_id
+        || checkpoint.desired_revision != desired.desired_revision
+        || checkpoint.spec_digest != desired.spec_digest
+        || checkpoint.node_id != desired.placement.node_id
+        || checkpoint.placement_epoch != desired.placement.placement_epoch
+    {
+        return Ok(false);
+    }
+    let Some(incarnation) = checkpoint.runtime_incarnation.as_ref() else {
+        return Ok(false);
+    };
+    let Some(endpoint) = desired
+        .endpoints
+        .iter()
+        .find(|endpoint| &endpoint.endpoint_id == endpoint_id)
+    else {
+        return Ok(false);
+    };
+    let Some(expected) = route_binding(desired, endpoint, Some(incarnation)) else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        &checkpoint.step,
+        ReconcileStep::InstallGate {
+            endpoint_id: saved_endpoint,
+            route_epoch,
+        } if saved_endpoint == endpoint_id && route_epoch == &expected.route_epoch
+    ) && checkpoint
+        .route_gates
+        .iter()
+        .any(|route| route.binding == expected && route.gate == RouteGateState::Closed))
+}
+
+fn install_step_matches(
+    checkpoint: &RuntimeCheckpoint,
+    desired: &DesiredRuntimeSpec,
+    endpoint_id: &Id,
+) -> Result<bool, GateReconcileError> {
+    if checkpoint.cat_id != desired.cat_id
+        || checkpoint.desired_revision != desired.desired_revision
+        || checkpoint.spec_digest != desired.spec_digest
+        || checkpoint.node_id != desired.placement.node_id
+        || checkpoint.placement_epoch != desired.placement.placement_epoch
+    {
+        return Ok(false);
+    }
+    let Some(incarnation) = checkpoint.runtime_incarnation.as_ref() else {
+        return Ok(false);
+    };
+    let Some(endpoint) = desired
+        .endpoints
+        .iter()
+        .find(|endpoint| &endpoint.endpoint_id == endpoint_id)
+    else {
+        return Ok(false);
+    };
+    let Some(expected) = route_binding(desired, endpoint, Some(incarnation)) else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        &checkpoint.step,
+        ReconcileStep::InstallGate {
+            endpoint_id: saved_endpoint,
+            route_epoch,
+        } if saved_endpoint == endpoint_id && route_epoch == &expected.route_epoch
+    ) && checkpoint
+        .route_gates
+        .iter()
+        .any(|route| route.binding == expected))
+}
+
+fn prepare_install_entry(
+    checkpoint: &mut RuntimeCheckpoint,
+    binding: RouteGateBinding,
+) -> Result<(), GateReconcileError> {
+    let endpoint_id = binding.endpoint_id.clone();
+    match checkpoint
+        .route_gates
+        .binary_search_by(|route| route.binding.endpoint_id.cmp(&endpoint_id))
+    {
+        Ok(index) => {
+            let current = &checkpoint.route_gates[index];
+            if current.gate != RouteGateState::Closed {
+                return Err(GateReconcileError::GateMustBeClosed(endpoint_id));
+            }
+            if current.binding != binding && binding.route_epoch <= current.binding.route_epoch {
+                return Err(GateReconcileError::RouteEpochNotAdvanced(endpoint_id));
+            }
+            checkpoint.route_gates[index] = CheckpointRouteGate {
+                binding,
+                gate: RouteGateState::Closed,
+            };
+        }
+        Err(index) => checkpoint.route_gates.insert(
+            index,
+            CheckpointRouteGate {
+                binding,
+                gate: RouteGateState::Closed,
+            },
+        ),
+    }
+    Ok(())
+}
+
+fn activate_install_entry(
+    checkpoint: &mut RuntimeCheckpoint,
+    binding: &RouteGateBinding,
+) -> Result<(), GateReconcileError> {
+    let endpoint_id = binding.endpoint_id.clone();
+    let index = checkpoint
+        .route_gates
+        .binary_search_by(|route| route.binding.endpoint_id.cmp(&endpoint_id))
+        .map_err(|_| GateReconcileError::EndpointNotFound(endpoint_id.clone()))?;
+    if checkpoint.route_gates[index].binding != *binding {
+        return Err(GateReconcileError::RouteBindingConflict(endpoint_id));
+    }
+    checkpoint.route_gates[index].gate = RouteGateState::Active;
+    Ok(())
+}
+
+fn valid_close_gate_predecessor(
+    live: &AdmissionSnapshot,
+    checkpoint: &RuntimeCheckpoint,
+    replacement: &AdmissionSnapshot,
+    endpoint_id: &Id,
+) -> bool {
+    if live.applied_desired_revision() > replacement.applied_desired_revision()
+        || (live.applied_desired_revision() == replacement.applied_desired_revision()
+            && live.spec_digest() != replacement.spec_digest())
+        || live.placement() != replacement.placement()
+        || live.runtime_incarnation() != replacement.runtime_incarnation()
+        || live.lifecycle_admission() != replacement.lifecycle_admission()
+        || live.endpoints().len() != checkpoint.route_gates.len()
+    {
+        return false;
+    }
+    live.endpoints()
+        .iter()
+        .zip(&checkpoint.route_gates)
+        .all(|(live_route, durable_route)| {
+            if &durable_route.binding.endpoint_id == endpoint_id {
+                live_route.binding == durable_route.binding
+                    && live_route.gate == RouteGateState::Active
+            } else {
+                live_route == durable_route
+            }
+        })
+}
+
+fn valid_install_predecessor(
+    live: &AdmissionSnapshot,
+    active_checkpoint: &RuntimeCheckpoint,
+    replacement: &AdmissionSnapshot,
+    endpoint_id: &Id,
+) -> bool {
+    if live.applied_desired_revision() > replacement.applied_desired_revision()
+        || (live.applied_desired_revision() == replacement.applied_desired_revision()
+            && live.spec_digest() != replacement.spec_digest())
+        || live.placement() != replacement.placement()
+        || live.runtime_incarnation() != replacement.runtime_incarnation()
+    {
+        return false;
+    }
+
+    let Some(new_route) = active_checkpoint
+        .route_gates
+        .iter()
+        .find(|route| &route.binding.endpoint_id == endpoint_id)
+    else {
+        return false;
+    };
+    let mut live_index = 0;
+    for durable in &active_checkpoint.route_gates {
+        if &durable.binding.endpoint_id == endpoint_id {
+            if let Some(candidate) = live.endpoints().get(live_index) {
+                if &candidate.binding.endpoint_id == endpoint_id {
+                    let exact_active = candidate == new_route;
+                    let valid_closed_predecessor = candidate.gate == RouteGateState::Closed
+                        && candidate.binding.workspace_id == new_route.binding.workspace_id
+                        && candidate.binding.endpoint_id == new_route.binding.endpoint_id
+                        && candidate.binding.cat_id == new_route.binding.cat_id
+                        && candidate.binding.node_id == new_route.binding.node_id
+                        && candidate.binding.runtime_incarnation
+                            == new_route.binding.runtime_incarnation
+                        && (candidate.binding.route_epoch < new_route.binding.route_epoch
+                            || candidate.binding == new_route.binding);
+                    if !exact_active && !valid_closed_predecessor {
+                        return false;
+                    }
+                    live_index += 1;
+                }
+            }
+            continue;
+        }
+        let Some(candidate) = live.endpoints().get(live_index) else {
+            return false;
+        };
+        if candidate != durable {
+            return false;
+        }
+        live_index += 1;
+    }
+    live_index == live.endpoints().len()
+}
+
+fn advance_endpoint_checkpoint(
+    checkpoint: &mut RuntimeCheckpoint,
+    desired: &DesiredRuntimeSpec,
+) -> Result<(), GateReconcileError> {
+    match first_endpoint_action(checkpoint, desired)? {
+        Some(EndpointAction::Close { endpoint_id }) => {
+            let route_epoch = route_entry(checkpoint, &endpoint_id)?.binding.route_epoch;
+            checkpoint.stable_state = None;
+            checkpoint.step = ReconcileStep::CloseGate {
+                endpoint_id,
+                route_epoch,
+            };
+        }
+        Some(EndpointAction::PrepareChanged {
+            endpoint_id,
+            new_binding,
+        })
+        | Some(EndpointAction::Install {
+            endpoint_id,
+            new_binding,
+        }) => {
+            match checkpoint
+                .route_gates
+                .binary_search_by(|route| route.binding.endpoint_id.cmp(&endpoint_id))
+            {
+                Ok(index) => {
+                    if checkpoint.route_gates[index].gate != RouteGateState::Closed {
+                        return Err(GateReconcileError::GateMustBeClosed(endpoint_id));
+                    }
+                    checkpoint.route_gates[index] = CheckpointRouteGate {
+                        binding: new_binding.clone(),
+                        gate: RouteGateState::Closed,
+                    };
+                }
+                Err(index) => checkpoint.route_gates.insert(
+                    index,
+                    CheckpointRouteGate {
+                        binding: new_binding.clone(),
+                        gate: RouteGateState::Closed,
+                    },
+                ),
+            }
+            checkpoint.stable_state = None;
+            checkpoint.step = ReconcileStep::InstallGate {
+                endpoint_id,
+                route_epoch: new_binding.route_epoch,
+            };
+        }
+        Some(EndpointAction::Remove { endpoint_id }) => {
+            return Err(GateReconcileError::WrongEndpointAction(endpoint_id))
+        }
+        None => {
+            checkpoint.stable_state = Some(cats_api::runtime_reconciliation::StableState::Running);
+            checkpoint.step = ReconcileStep::Stable {
+                state: cats_api::runtime_reconciliation::StableState::Running,
+            };
+        }
+    }
+    Ok(())
+}
+
+fn route_entry<'a>(
+    checkpoint: &'a RuntimeCheckpoint,
+    endpoint_id: &Id,
+) -> Result<&'a CheckpointRouteGate, GateReconcileError> {
+    checkpoint
+        .route_gates
+        .binary_search_by(|route| route.binding.endpoint_id.cmp(endpoint_id))
+        .ok()
+        .and_then(|index| checkpoint.route_gates.get(index))
+        .ok_or_else(|| GateReconcileError::EndpointNotFound(endpoint_id.clone()))
+}
+
 fn stage_desired(
     checkpoint: &RuntimeCheckpoint,
     desired: &DesiredRuntimeSpec,
@@ -607,46 +1408,6 @@ fn stage_desired(
     }
     staged.updated_at_unix_ms = updated_at;
     Ok(staged)
-}
-
-fn install_route_in_checkpoint(
-    checkpoint: &mut RuntimeCheckpoint,
-    binding: RouteGateBinding,
-) -> Result<(), GateReconcileError> {
-    let endpoint_id = binding.endpoint_id.clone();
-    match checkpoint
-        .route_gates
-        .binary_search_by(|route| route.binding.endpoint_id.cmp(&endpoint_id))
-    {
-        Ok(index) => {
-            let current = &checkpoint.route_gates[index];
-            if binding.route_epoch < current.binding.route_epoch {
-                return Err(GateReconcileError::RouteEpochRegression(endpoint_id));
-            }
-            if binding.route_epoch == current.binding.route_epoch {
-                if binding != current.binding {
-                    return Err(GateReconcileError::RouteBindingConflict(endpoint_id));
-                }
-                if current.gate == RouteGateState::Closed {
-                    return Err(GateReconcileError::ClosedEpochReuse(endpoint_id));
-                }
-            } else if current.gate != RouteGateState::Closed {
-                return Err(GateReconcileError::GateMustBeClosed(endpoint_id));
-            }
-            checkpoint.route_gates[index] = CheckpointRouteGate {
-                binding,
-                gate: RouteGateState::Active,
-            };
-        }
-        Err(index) => checkpoint.route_gates.insert(
-            index,
-            CheckpointRouteGate {
-                binding,
-                gate: RouteGateState::Active,
-            },
-        ),
-    }
-    Ok(())
 }
 
 fn close_checkpoint_gates(checkpoint: &mut RuntimeCheckpoint) {

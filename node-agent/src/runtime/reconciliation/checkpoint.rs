@@ -5,6 +5,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cats_api::runtime_reconciliation::{
@@ -57,6 +58,8 @@ pub enum CheckpointStoreError {
     WrongCat { expected: Id, presented: Id },
     #[error("another checkpoint writer already owns {path}")]
     WriterAlreadyActive { path: PathBuf },
+    #[error("checkpoint writer serialization lock is poisoned: {path}")]
+    WriterSerializationPoisoned { path: PathBuf },
     #[cfg(test)]
     #[error("injected checkpoint publication crash")]
     InjectedCrash,
@@ -76,8 +79,9 @@ pub struct FileCheckpointStore {
     target_name: CString,
     target_path: PathBuf,
     cat_id: Id,
+    writer_serialization: Mutex<()>,
     #[cfg(test)]
-    faults: std::sync::Mutex<TestFaults>,
+    faults: Mutex<TestFaults>,
 }
 
 impl FileCheckpointStore {
@@ -146,8 +150,9 @@ impl FileCheckpointStore {
             target_name,
             target_path: directory.join(target_file_name),
             cat_id: cat_id.clone(),
+            writer_serialization: Mutex::new(()),
             #[cfg(test)]
-            faults: std::sync::Mutex::new(TestFaults::default()),
+            faults: Mutex::new(TestFaults::default()),
         })
     }
 
@@ -184,6 +189,11 @@ impl FileCheckpointStore {
         expected: ExpectedTarget<'_>,
         checkpoint: &RuntimeCheckpoint,
     ) -> Result<StoredCheckpoint, CheckpointStoreError> {
+        let _writer = self.writer_serialization.lock().map_err(|_| {
+            CheckpointStoreError::WriterSerializationPoisoned {
+                path: self.target_path.clone(),
+            }
+        })?;
         if checkpoint.cat_id != self.cat_id {
             return Err(CheckpointStoreError::WrongCat {
                 expected: self.cat_id.clone(),

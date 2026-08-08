@@ -5,6 +5,13 @@
 //! in-memory admission boundary to change, and persists the resulting state
 //! afterwards. Volume, VMM, device, network, mount, cleanup, inventory, and
 //! production server wiring remain outside this module.
+//!
+//! In particular, this spine does not manufacture an "Endpoint-only" proof:
+//! the complete reconciler must first compare the new Desired with its
+//! physical/runtime/volume/network inventory. Only a revision whose non-route
+//! facts are unchanged may enter `GateSequencer::close_gate`; every other
+//! revision uses the global close path. The checkpoint intentionally does not
+//! duplicate enough Desired fields to make that classification here.
 
 mod admission_port;
 mod checkpoint;
