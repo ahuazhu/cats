@@ -89,9 +89,12 @@ volumes(volume_id PK, size_bytes, generation, root_hash, root_object_id,
         last_transition_id, last_transition_kind, last_transition_request_fingerprint,
         last_transition_attachment,
         last_transition_result_epoch)
-snapshot_pins(snapshot_id PK, volume_id, size_bytes, generation,
-              root_hash, root_object_id, created_at)
+disk_snapshots(snapshot_id PK, disk_id, volume_id, size_bytes, generation,
+               root_hash, root_object_id, created_at)
 ```
+
+每条`disk_snapshots` row就是一条`DiskSnapshotRecord`，同时承担产品资源和GC live-root；没有第二份
+物化记录。
 
 - `generation` 单调递增；`generation=0` 表示空卷（全洞，无 Root 对象）。
 - Root CAS（提交唯一入口）必须在一条原子语句内完成：
@@ -361,9 +364,9 @@ socket，两者服务同一个 engine 与同一个 attachment lease。
 
 ## 9. GC（对象回收）
 
-存活判据是**从卷当前 Root和全部SnapshotPin Root可达**:root节点、它命名的leaf节点,以及每个
+存活判据是**从卷当前 Root和全部DiskSnapshotRecord Root可达**:root节点、它命名的leaf节点,以及每个
 `ChunkRef`命名的每个对象——delta pack之后这意味着**base加上它的全部delta**,而不是"每个
-chunk最新的那个对象"。删掉一个chunk的base只留最新delta,会直接损坏该chunk。任一pin无法
+chunk最新的那个对象"。删掉一个chunk的base只留最新delta,会直接损坏该chunk。任一record命名的Root无法
 读取或校验时，本轮GC fail closed，不删除任何对象。
 
 - **绝不碰 `images/`。**镜像对象属于镜像、被所有从它 provision 的卷共享,删一个卷不能删掉全队列

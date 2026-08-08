@@ -121,6 +121,7 @@ Running热路径不依赖Control Plane，撤销不必等待TTL；代价是Node�
 
 上线前至少证明：signer拒绝stale desired/observation revision，Node拒绝错误runtime incarnation/
 route epoch；close竞态后无新guard；A变更不取消B；
-RequireIdle Busy不关闭route且attempt不复用；active HTTP/WS正确drain；app port failure不刷新；当前
-request不重放；cache/DB慢路径有硬界；rotation全过程fail closed；Control Plane outage的warm/cold
-Gateway边界与Host fence oracle均成立。
+RequireIdle guard Busy且cell从未close时不关闭route；任何实际或不明close后旧epoch不得重开，且
+attempt始终不复用；active HTTP/WS正确drain；app port failure不刷新；当前request不重放；cache/DB
+慢路径有硬界；rotation全过程fail closed；Control Plane outage的warm/cold Gateway边界与Host
+fence oracle均成立。

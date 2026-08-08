@@ -21,9 +21,22 @@
 | Disk 是否存在、属于哪个 Workspace、是否可加入 Cat | Control Store |
 | 当前 DesiredRuntimeSpec 中的完整磁盘集合 | Control Store |
 | 当前 volume owner、fencing epoch、remote Root | MetadataStore |
+| DiskSnapshot产品资源与GC live-root | DiskSnapshotRecord |
+| API mutation的请求身份与不可变返回结果 | PostgreSQL `ApiIdempotencyResult` |
 | 本地 pending pack、cache、blockd 进程是否存在 | Node 物理 inventory |
 | ext4 UUID 和当前 mount 是否真实存在 | Guest Agent probe |
-| Host 是否已被外部隔离 | HostFenceEvent |
+| Host 是否已被外部隔离、逐卷授权是否已消费 | PostgreSQL HostFenceEvent/Authorization rows |
+
+Control Store 与 MetadataStore 是逻辑边界，不是两套提交authority。生产终态把`HostFenceEvent`、
+由它派生的authorization、不可变消费回执和`VolumeRecord`放在同一PostgreSQL事务域；SQLite contract
+adapter提供相同原子语义。首次消费授权与`Active -> Rejoined`都通过该事务域的固定锁序完成。
+
+全局锁DAG是`ApiIdempotencyResult key reservation -> HostFenceEvent -> AuthorizationRecord ->
+VolumeRecord -> Control Disk/Cat/Desired rows -> DiskSnapshotRecord`；事务跳过自己不涉及的节点，同类
+多行按稳定ID排序。API mutation先取得由认证Workspace、canonical route和`Idempotency-Key`导出的
+PostgreSQL transaction-scoped reservation，再读结果；它不能先锁资源，也不落持久Pending。这样同一
+key即使携带不同资源也不会分别先锁不同Volume。normal acquire只锁`VolumeRecord`，因此它与snapshot
+mutation或begin-delete仍只能有一方先提交。HostFenceEvent来源的内部恢复没有API前缀，从event开始。
 
 必须始终满足：
 
@@ -35,7 +48,11 @@
 6. Cold、磁盘集合变更、DiskSnapshot、detach、计划迁移和删除保留盘前必须 `R == L`；唯一例外是
    当前 Deleted Desired 明确放弃的 disposable Root，并且必须先消费 §11 的精确删除授权。
 7. Volume admin 操作和普通 attach 不能并发越过彼此。
-8. Snapshot pin 保护的 Root 必须进入 GC live set。
+8. 每条`DiskSnapshotRecord`命名的Root必须进入GC live set；不存在第二份物化记录。
+9. Snapshot API先验证调用者身份、当前Workspace membership和route permission，再reserve/read该
+   Workspace的幂等key；精确命中直接返回result。只有miss才在事务内重验Workspace拥有Disk及精确
+   disk/volume/snapshot tuple；跨Workspace miss返回不泄露存在性的`NotFound`/`Forbidden`并回滚
+   reservation，不写Operation、result或资源行。
 
 ## 2. 核心身份
 
@@ -47,9 +64,10 @@
 
 `transition_id` 解决响应丢失，epoch 解决 ABA。两者不能互相代替。
 
-## 3. MetadataStore 模型
+## 3. PostgreSQL authority 模型
 
-逻辑记录如下；具体 SQL 可以拆表，但条件必须在一个数据库事务中完成：
+逻辑Control Store/MetadataStore记录如下；具体 SQL 可以拆表，但标明原子的条件必须在一个数据库
+事务中完成：
 
 ```text
 VolumeRecord {
@@ -66,15 +84,23 @@ VolumeRecord {
   lease_expires_at?,
   last_transition: {
     transition_id,
-    kind: Acquire | Release | Takeover | Restore | BeginDelete | BeginDisposableDelete,
+    kind: Acquire | Release | Takeover | BeginDelete | BeginDisposableDelete,
     request_fingerprint,
     attachment_id?,
     resulting_epoch
   }?,
 }
 
-SnapshotPin {
+DiskRecord {
+  disk_id,
+  workspace_id,
+  volume_id,
+  state: Active | Deleting { delete_id }
+}
+
+DiskSnapshotRecord {
   snapshot_id,
+  disk_id,
   volume_id,
   size_bytes,
   generation,
@@ -82,7 +108,64 @@ SnapshotPin {
   root_object_id?,
   created_at
 }
+
+ApiIdempotencyResult {
+  authenticated_workspace_id,
+  canonical_route,
+  idempotency_key,
+  request_fingerprint,
+  outcome: Succeeded { http_status, response }
+         | Failed { http_status, typed_error },
+  created_at
+}
+
+AuthorizationRecord {
+  authorization_id,
+  host_fence_event_id?,
+  kind: Takeover | DisposableRootDelete,
+  payload,
+  request_fingerprint,
+  not_after,
+  state: Unconsumed | Consumed { receipt: AuthorizationConsumedReceipt }
+}
+
+AuthorizationConsumedReceipt {
+  authorization_id,
+  request_fingerprint,
+  volume_id,
+  transition_kind: Takeover | BeginDisposableDelete,
+  resulting_epoch,
+  resulting_admin_state,
+  resulting_disk_state?,
+  resulting_owner?,
+  resulting_attachment_id?,
+  consumed_at
+}
+
+DeleteCompletionReceipt {
+  disk_id,
+  volume_id,
+  delete_id,
+  deleting_epoch,
+  begin_transition_id,
+  begin_request_fingerprint,
+  completed_at
+}
 ```
+
+`ApiIdempotencyResult`的主键是`(authenticated_workspace_id, canonical_route, idempotency_key)`。
+`request_fingerprint`覆盖规范化route参数和请求body；同key同fingerprint只返回不可变`outcome`，同key
+不同fingerprint在读取任何资源锁前返回`IdempotencyConflict`。首次请求在reservation下执行一次资源
+事务，并在同一commit写最终result；业务成功或确定性业务失败可以结算，serialization、连接中断或
+无法提交事务不写result。V1的已提交result不因对应resource或Operation删除而GC，也不通过resource是否
+仍存在决定是否重放；它是API重试权威，不是Snapshot产品查询或GC authority。异步接口把
+`operation_id`放在不可变HTTP response中，但不复制Operation的phase或status；Snapshot create、delete
+和restore是同步事务，不创建Operation。
+
+`AuthorizationConsumedReceipt`一经写入不可修改，只记录授权首次消费的直接Volume/Disk结果，并保留到相关
+HostFenceEvent转为Rejoined。`DeleteCompletionReceipt`只在`VolumeRecord`被删除后证明同一卷、delete
+和epoch已经沿状态机完成；它保留到删除Operation结算，且只要仍有引用该卷的Active HostFenceEvent
+就必须继续保留。
 
 `request_fingerprint`是规范化完整请求的hash。同一ID但payload不同返回`StaleTransition`。只保留
 最近一次转换结果；Control Plane在一个转换结果被确认前不得启动下一转换。已经被后续转换取代的
@@ -93,7 +176,8 @@ SnapshotPin {
 `expected_epoch` 复活。
 
 MetadataStore 错误是闭集：`NotFound`、`OtherWriter`、`Fenced`、`StaleTransition`、
-`AdminBusy`、`HeadConflict`、`InvalidAuthorization`、`BackendUnknown`。调用方不得按文本分支。
+`AdminBusy`、`HeadConflict`、`SnapshotInUse`、`InvalidAuthorization`、`BackendUnknown`。调用方不得
+按文本分支。
 
 ### 3.1 Volume核心状态机
 
@@ -182,9 +266,14 @@ VolumeTakeoverAuthorization {
 }
 ```
 
-MetadataStore 在同一 CAS 中验证授权、旧 owner/epoch 和目标 identity，设置新 owner、增加 epoch，
-并以 `authorization_id` 作为 transition ID。相同授权重试返回同一 grant；它不能跨卷、跨
-placement、跨 attachment 或在过期后使用。
+首次消费使用固定锁序`HostFenceEvent -> AuthorizationRecord -> VolumeRecord`，在一个PostgreSQL
+事务中同时验证event仍为Active、authorization仍为Unconsumed、数据库当前时间未超过`not_after`、
+旧owner/epoch和目标identity精确匹配；随后设置新owner、增加epoch，并原子把authorization改为
+`Consumed(AuthorizationConsumedReceipt)`。`authorization_id`同时是transition ID。
+
+相同授权重试只读取不可变receipt并返回原grant，即使event已经Rejoined也不再次修改VolumeRecord。
+换卷、换placement、换attachment、payload不同、过期或event不再Active的首次消费全部返回
+`InvalidAuthorization`。
 
 ### 4.5 Host fence 与逐卷授权
 
@@ -212,12 +301,23 @@ event。
 
 旧 Host 恢复时先进入隔离rejoin流程：提高AgentSession epoch，枚举并停止全部旧VMM/blockd，按
 `VolumeLocalIdentity`把所有失效epoch目录移入quarantine，并证明旧route、socket和进程均不可用。
-授权派生与`Active -> Rejoined`使用同一个event行serialization point。Control Plane逐项核对该
-HostFenceEvent派生过的takeover/delete授权及当前MetadataStore owner/epoch：已消费授权必须精确
-匹配当前postcondition；未消费授权必须按PostgreSQL当前时间超过`not_after`。仍可首次生效的授权
-阻止rejoin。接受`HostRejoinProof`并把event持久改为Rejoined后，provider才可恢复workload网络。
-Rejoined event不能再派生授权；未消费授权不能首次生效，已消费授权仍可幂等读取原结果。旧epoch
-的`R < L`目录保留作人工恢复证据，永不参与新Root。
+
+授权派生、授权首次消费和`Active -> Rejoined`都先锁同一个event行。rejoin事务取得该锁后，按
+`authorization_id`稳定顺序锁定该event的全部授权，因此不存在已经开始但尚未被它观察的首次消费。
+它逐项验证：
+
+1. Unconsumed授权必须按PostgreSQL当前时间超过`not_after`；否则保持Active/Blocked。
+2. Consumed授权的不可变receipt必须与authorization payload精确匹配。若`VolumeRecord`仍存在，
+   相同epoch必须精确等于receipt的直接postcondition；更大epoch必须是§3.1状态机产生的合法单调
+   后继；receipt包含Disk postcondition时，Control Disk也必须仍为同一`Deleting(delete_id)`。所有
+   后续转换都锁同一VolumeRecord且epoch只增不减，因此当前状态足以证明后继。若Volume/Disk记录已
+   删除，必须存在同disk、同卷、同delete且`deleting_epoch >= resulting_epoch`的
+   `DeleteCompletionReceipt`。缺失、epoch倒退或identity冲突全部保持Blocked。
+
+同一事务接受`HostRejoinProof`并把event持久改为Rejoined后，provider才可恢复workload网络。
+Rejoined event不能再派生授权；Unconsumed授权因首次消费必须检查Active event而永久不能生效；
+Consumed授权仍可幂等读取receipt。相关authorization与`DeleteCompletionReceipt`至少保留到event
+Rejoined，之后才可按审计策略GC。旧epoch的`R < L`目录保留作人工恢复证据，永不参与新Root。
 
 ## 5. blockd 采用 grant，不改变 ownership
 
@@ -310,7 +410,7 @@ UUID，而远端盘仍是空白。
 
 ## 9. 容量不可变
 
-`size_bytes` 是创建卷时写入的不可变属性，并包含在每个 Root 和 SnapshotPin 中。所有读取都必须
+`size_bytes` 是创建卷时写入的不可变属性，并包含在每个 Root 和`DiskSnapshotRecord`中。所有读取都必须
 校验三者一致；不一致时 fail closed。
 
 第一版删除现有 resize API，不实现 offline/online resize、maintenance attachment、Map 扩边或
@@ -319,23 +419,49 @@ Guest 文件系统扩容。需要其他容量时创建新 Disk 并由 Guest 在�
 
 ## 10. DiskSnapshot、GC 与同盘恢复
 
-这里的 DiskSnapshot 是远端 Root pin，不是 WarmRuntimeSnapshot。
+这里的DiskSnapshot不是WarmRuntimeSnapshot。唯一的`DiskSnapshotRecord`既是产品资源，也是远端
+Root的GC live-root；`ApiIdempotencyResult`只保存API返回结果，不参与产品查询、restore或GC。
+
+Workspace ownership仍由`DiskRecord`权威持有；产品查询以record的`disk_id`连接Disk并按Workspace
+过滤，GC按`volume_id`读取同一row。Disk存在live record时不能删除，因此不需要在第二张表复制归属。
+
+create、delete和restore都要求非空`Idempotency-Key`。API先验证调用者身份、当前Workspace membership
+和route permission，但不以目标Disk或Snapshot是否仍存在决定重放；随后取得§3的key reservation。
+已有相同fingerprint的result时只返回其不可变outcome，绝不再读或修改Snapshot/Volume；不同
+fingerprint立即冲突。只有尚无result的首次请求才继续按`VolumeRecord -> DiskRecord(owner Workspace)/
+Cat/Desired -> DiskSnapshotRecord`锁序重验认证Workspace拥有Disk、Disk/volume绑定及各操作前置，并在
+同一commit写业务变化与最终result。跨Workspace miss回滚reservation且不写Operation、result或资源。
 
 ### 10.1 创建
 
-仅在 Disk Cold且 volume unowned时允许：
+仅在产品Disk row为Active、Disk Cold且 volume unowned时允许：
 
-1. 读取精确 unowned epoch、size和head。
-2. `pin_snapshot`在一个事务中锁定VolumeRecord，再次比较这些字段并插入SnapshotPin；normal
-   acquire更新同一行，因此只能发生在pin提交之前或之后，不能穿过中间窗口。
-3. 响应不明确时按 snapshot ID读取；内容完全相同才算成功。
+```text
+create_snapshot {
+  disk_id,
+  expected_unowned_epoch,
+  expected_size,
+  expected_generation,
+  expected_root
+}
+```
 
-没有 writer，因此 pin 与新 publish之间不存在空窗。
+首次事务重验产品Disk仍为Active、属于认证Workspace、所属Cat处于精确stable Cold，且
+`DiskRecord.volume_id`与Active + Unowned的`VolumeRecord`一致；epoch、size、generation和Root必须与
+请求完全相同。服务端随后分配一个全局唯一且永不复用的`snapshot_id`，插入包含精确disk/volume、
+size、generation、Root和`created_at`的`DiskSnapshotRecord`，并原子写入包含
+完整Snapshot返回值的成功result。客户端不能提供或复用`snapshot_id`。
+
+normal acquire与Disk begin-delete也先锁同一`VolumeRecord`，因此它们与create只能按提交顺序发生，
+响应丢失后只可能同时存在result与exact record，或二者都不存在。只有取得一个尚无result的key
+reservation的首次事务可以把record不存在解释为尚未创建；任意重放不得从record缺席推断可以重建。
+
+没有 writer，因此record命名的Root与新publish之间不存在空窗。
 
 ### 10.2 GC
 
-卷 GC 的 live roots 是 current Root 与该 volume 的全部 SnapshotPin。对每个 root遍历 Root、Leaf、
-Base和全部 Delta；任一 snapshot root无法读取或校验时，本轮 GC失败且不删除对象。
+卷GC的live roots是current Root与该volume的全部`DiskSnapshotRecord`。对每个root遍历Root、Leaf、
+Base和全部Delta；任一snapshot record命名的Root无法读取或校验时，本轮GC失败且不删除对象。
 
 Golden Image 继续是不可变、不可自动删除的系统工件。第一版不实现 image GC。
 
@@ -343,25 +469,63 @@ Golden Image 继续是不可变、不可自动删除的系统工件。第一版�
 
 第一版只支持恢复到原 Disk：
 
-1. Disk 必须 Cold、unowned、Active。
-2. 验证SnapshotPin及全部引用对象，SnapshotPin、VolumeRecord和Root中的`size_bytes`必须完全
-   相同。
-3. `restore_same_disk(transition_id, snapshot_id, expected head, expected unowned epoch)`在一个事务中
-   再次验证pin和前置状态，把当前head指向snapshot Root、generation增加1、epoch增加1并记录结果。
-4. 相同transition重试返回同一新head；晚到acquire因expected epoch失效而失败。
+1. Disk 必须属于认证Workspace并且Cold、unowned、Active。
+2. 在通用key reservation后按统一锁序验证`DiskSnapshotRecord`；record的disk/volume必须精确指向
+   当前Disk，且record、VolumeRecord和Root中的`size_bytes`必须完全相同。
+3. 首次`restore_same_disk(snapshot_id, expected head, expected unowned epoch)`把当前head指向snapshot
+   Root、generation和epoch各增加1，并在同一事务写含新head/generation/epoch的成功result。
+4. 相同key重放只读result，因此至多前进一次；晚到acquire因expected epoch失效而失败。
 
 restore 不倒退 generation；它发布一个引用旧不可变数据的新 generation。第一版不支持 clone，
 不建立跨 volume COW引用。
 
+### 10.4 删除 Snapshot
+
+Snapshot删除是独立操作，不由Disk删除隐式级联：
+
+```text
+delete_snapshot {
+  snapshot_id,
+  disk_id,
+  expected_generation,
+  expected_root
+}
+```
+
+首次事务按统一锁序重验认证Workspace拥有Disk，并验证Disk、Volume与`DiskSnapshotRecord`的
+disk/volume/generation/Root tuple完全一致。成功时删除这一行，并原子写包含`snapshot_id`和删除结果的
+通用成功result；相同key重放只读result。record缺失且没有既有result是新的`NotFound`结果，不能猜测
+某次旧删除或创建是否成功。
+
+`create_snapshot`、`delete_snapshot`和Disk `begin_delete`都锁同一`VolumeRecord`，因此创建record、
+删除record与关闭volume authority只能按一个确定顺序发生。删除record后，若该Root仍是current Root，它仍由
+current Root进入GC live set。
+
 ## 11. Delete
 
-删除使用一条当前状态和两种窄入口，不保留历史工作流。
+删除使用一条当前状态和两种窄入口；每个入口都用一次PostgreSQL事务同时关闭Control Disk与
+Volume authority。
+
+两种入口都必须在锁定`VolumeRecord`后检查不存在该Disk的live `DiskSnapshotRecord`。任一存在即
+返回`SnapshotInUse`，不改变Disk或Volume状态，也不删除对象。调用方必须先按§10.4显式删除Snapshot；
+Disk删除不做隐式cascade。
 
 ### 11.1 已安全释放的卷
 
 PersistentDisk、需要保留数据的 RootDisk，以及已经正常 drain 的卷必须先满足：没有新的 Desired
-引用、Cat稳定 Cold、`R == L`、blockd停止、精确 release完成且 owner为空。随后
-`begin_delete(delete_id, expected_head, expected_unowned_epoch)` 原子进入 Deleting并提高 epoch。
+引用、没有live `DiskSnapshotRecord`、Cat稳定 Cold、`R == L`、blockd停止、精确 release完成且 owner为空。
+
+`begin_delete(delete_id, disk_id, volume_id, expected_generation, expected_head,
+expected_unowned_epoch)`按`VolumeRecord -> Control Disk/Cat/Desired rows -> DiskSnapshotRecord rows`锁序，
+在同一事务重验全部前置、Control Disk仍为Active、VolumeRecord精确为Active + Unowned，然后原子执行：
+
+- `Control Disk Active -> Deleting(delete_id)`；
+- `VolumeRecord Active + Unowned -> Deleting(delete_id, epoch + 1)`并记录同一delete transition。
+
+相同delete ID的模糊响应只有在两边都处于精确postcondition，或两边均已删除且存在匹配
+`DeleteCompletionReceipt`时才返回原结果；单边状态或字段不一致返回`BackendUnknown`。normal acquire
+也先锁VolumeRecord：acquire先提交则begin-delete的Unowned检查失败；begin-delete先提交则acquire的
+Active检查失败，不存在重新取得owner的中间窗口。
 
 ### 11.2 放弃本地 tail 的 disposable Root
 
@@ -388,25 +552,37 @@ Control Plane 只为当前 `Deleted` Desired 中明确标为 disposable 的 Root
 HostFenceEvent。授权绑定当前revision/placement、delete ID、remote head和最后owner/epoch，不能
 跨Cat、卷、attachment或重试身份复用。
 
-MetadataStore消费授权时原子比较全部tuple，执行
-`Active + Owned(expected owner/epoch) -> Deleting(delete_id) + owner cleared + epoch + 1`。相同授权
-重试返回原结果；任何字段变化、过期或非Root/disposable请求都返回`InvalidAuthorization`。该CAS
-成功前不得删除pending data；成功后旧epoch永久不能publish，Node才可删除授权所指lineage的
-`R < L` tail。这里不经过会产生可抢占窗口的`Active + Unowned`，也不能扩展到PersistentDisk。
+HostFenceEvent来源的首次消费使用固定锁序
+`HostFenceEvent -> AuthorizationRecord -> VolumeRecord -> Control Disk/Desired/DiskSnapshotRecord rows`；
+RuntimeStopped来源使用相同后缀而没有event行。一个PostgreSQL事务重验event或stop observation、
+authorization完整tuple、Control Disk仍为Active、当前Deleted Desired仍把该Root标为disposable，
+并确认没有live `DiskSnapshotRecord`，然后原子执行：
+
+- `VolumeRecord Active + Owned(expected owner/epoch) -> Deleting(delete_id, owner cleared, epoch + 1)`；
+- `Control Disk Active -> Deleting(delete_id)`；
+- authorization `Unconsumed -> Consumed(AuthorizationConsumedReceipt)`，receipt记录两边postcondition。
+
+相同授权重试只读取receipt；snapshot record仍存活时返回`SnapshotInUse`且三边都不改变，其他字段变化、
+过期或非Root/disposable请求返回`InvalidAuthorization`。事务成功前不得删除pending data；成功后旧
+epoch永久不能publish，Node才可删除授权所指lineage的`R < L` tail。这里不经过会产生可抢占窗口的
+`Active + Unowned`，也不能扩展到PersistentDisk。
 
 HostFenceEvent路径上的本地lineage在旧Host rejoin时进入quarantine；删除授权记录至少保留到该
 event转为Rejoined，使rejoin仍能核对所有派生结果。
 
 ### 11.3 共同清理
 
-1. Control Store把Disk置为Deleting；此后不能进入任何新DesiredRuntimeSpec。
-2. 选择§11.1或§11.2之一把VolumeRecord原子置为Deleting；模糊响应按同一transition读取postcondition。
-3. Node完整inventory证明所有可达本地资源已按授权处理；失联Host residue由Active event跟踪。
-4. sweeper幂等删除`volumes/<volume-id>/`下的data/maps/commits和该卷SnapshotPins。
-5. 对象前缀确认为空后删除VolumeRecord，再删除Control Store Disk row。
+1. 只有§11.1或§11.2事务已经证明Control Disk与VolumeRecord都为同一`Deleting(delete_id)`后才进入
+   sweep；此后不能进入新DesiredRuntimeSpec或normal acquire。
+2. Node完整inventory证明所有可达本地资源已按授权处理；失联Host residue由Active event跟踪。
+3. sweeper断言`DiskSnapshotRecord`仍为空，再幂等删除`volumes/<volume-id>/`下的data/maps/commits；
+   它不负责删除Snapshot。
+4. 对象前缀确认为空后，一个PostgreSQL事务再次比较两边delete ID，写入精确
+   `DeleteCompletionReceipt`并同时删除VolumeRecord与Control Disk row。
 
 不存在根据控制面一列状态、lease TTL或目录缺失直接删除volume的路径。删除完成后无需保留兼容
-tombstone，但未Rejoined的HostFenceEvent及其派生授权仍按rejoin合同保留。
+tombstone；但只要某个Active HostFenceEvent的Consumed authorization引用该卷，精确
+`DeleteCompletionReceipt`、event和authorization都必须保留到Rejoined，供合法后继校验。
 
 ## 12. 两 revision Cold 迁移
 
@@ -427,12 +603,14 @@ tombstone，但未Rejoined的HostFenceEvent及其派生授权仍按rejoin合同�
 ## 13. 模块依赖和实施顺序
 
 1. 先建立旧实现必失败的 characterization tests：普通抢占、重复 acquire、silent release、旧 pack
-   新 epoch replay、expired-owner delete、snapshot GC和初始化 crash点。
-2. 一次替换 MetadataStore schema、trait和 PostgreSQL/SQLite adapter contract。
+   新 epoch replay、expired-owner delete、snapshot create/delete/GC和初始化 crash点。
+2. 一次替换 MetadataStore schema、trait和 PostgreSQL/SQLite adapter contract；HostFenceEvent、
+   `AuthorizationConsumedReceipt`、VolumeRecord与Rejoined使用同一事务域和固定锁序。
 3. 一次替换 pack header、data-dir identity、blockd启动参数和status；删除旧 pack parser。
 4. 接入 RuntimeCheckpoint、VolumeIntent/Observation和Node lease executor。
 5. 接入 Guest Agent probe/format/mount和Cold-only API前置条件。
-6. 实现 snapshot-aware GC、same-disk restore和delete sweeper。
+6. 实现通用`ApiIdempotencyResult`与单一`DiskSnapshotRecord`的原子create/delete、snapshot-aware GC、
+   same-disk restore、Control/Volume原子begin-delete和后置fail-closed sweeper。
 7. 接入 HostFenceEvent/takeover与两 revision Cold migration。
 8. 同一发布删除旧 acquire/revoke、hot disk mutation、resize API和无条件 delete路径。
 
@@ -445,16 +623,25 @@ tombstone，但未Rejoined的HostFenceEvent及其派生授权仍按rejoin合同�
 | release响应丢失 | 相同transition幂等；旧epoch永久不能publish |
 | stale acquire晚到release之后 | expected epoch不匹配，不能重新占有volume |
 | Host takeover | 只有精确逐卷授权成功；跨volume/placement/replay失败 |
+| 首次consume与Host rejoin并发 | 两者锁同一event；consume先提交则rejoin观察receipt，Rejoined先提交则consume失败且epoch不变 |
 | Host rejoin遇到未消费授权 | 未过`not_after`时保持Active/Blocked；过期后才可Rejoined，且不能首次消费 |
+| consumed授权的后继 | takeover→release→rejoin成功；delete→sweep以DeleteCompletionReceipt→rejoin成功；缺失/错receipt保持Blocked |
 | 旧pending目录遇到新attachment | quarantine，remote Root不改变 |
 | 相同lineage blockd crash | 从pack恢复L并按序publish |
 | resize请求 | API不存在；`size_bytes` 在Volume/Root/Snapshot中始终一致 |
-| delete各步骤crash | 重试同delete ID；不再attach；最终metadata和对象均消失 |
-| disposable Root `R < L` | 只有精确Owned->Deleting授权CAS后删除该lineage；PersistentDisk拒绝 |
+| normal acquire与begin-delete并发 | 两者锁同一VolumeRecord且只能一方提交；不存在Control Deleting但Volume仍可acquire的窗口 |
+| delete各步骤crash | begin-delete两边原子进入Deleting；sweep后置幂等；重试同delete ID并最终同时移除两边metadata |
+| disposable Root `R < L` | 固定event/auth/volume/control锁序；receipt与两边Deleting原子提交后才删lineage；PersistentDisk拒绝 |
 | mkfs各步骤crash | 只adopt期望UUID或quarantine；Initialized前R==L |
 | Running磁盘变更 | API拒绝，先Cold；不存在hotplug竞态 |
-| Snapshot与GC并发 | snapshot独占对象始终存活；坏pin使GC fail closed |
-| same-disk restore | generation前进，容量不变，字节等于snapshot |
+| Snapshot与GC并发 | record命名的对象始终存活；坏record使GC fail closed |
+| Snapshot create crash/响应丢失 | 同一commit同时产生exact record和不可变result，或二者都不存在；重放只读result |
+| create→delete→旧create重放 | create成功result跨Snapshot删除保留；返回原snapshot ID且不重新插row，该ID永不复用 |
+| Snapshot delete crash/响应丢失 | 同一commit同时删除record并写result，或二者都不发生；相同key只读原删除结果 |
+| Snapshot API同key异payload | key reservation先串行；返回`IdempotencyConflict`，不取得资源锁、不改变任何资源 |
+| Snapshot跨Workspace访问/重放 | 返回不泄露存在性的NotFound/Forbidden；不写Operation/result，不改变Volume、Disk或Snapshot |
+| Snapshot与Disk delete并发 | create与begin-delete锁同一VolumeRecord；live record返回SnapshotInUse；显式snapshot delete删除一行 |
+| same-disk restore/重放 | 首次事务原子写新head与result；generation/epoch只前进一次，容量不变，字节等于snapshot |
 | 两revision迁移 | 源Cold/release前目标无writer；目标只normal acquire |
 | Host loss `R < L` | 从R恢复并报告DataLossPossible；backlog只是最后样本 |
 

@@ -37,7 +37,7 @@ DesiredRuntimeSpec(revision, placement)
 
 ## 权威边界
 
-1. PostgreSQL 是 DesiredRuntimeSpec、placement、Operation 和 API idempotency 的权威。
+1. PostgreSQL 是 DesiredRuntimeSpec、placement、Operation 和`ApiIdempotencyResult`的权威。
 2. MetadataStore 的 owner/epoch/root CAS 是 RWO writer 与 remote durability 的权威。
 3. 带强身份的物理枚举和协议握手决定进程、socket、snapshot、journal 是否存在。
 4. Node checkpoint 只保存 crash recovery 所需的当前步骤和身份，不能推翻物理事实。
@@ -45,6 +45,11 @@ DesiredRuntimeSpec(revision, placement)
 
 Volume 的精确状态机由 [Volume Authority](../specs/volume-authority.md) 定义；Runtime 只编排
 它的窄acquire/publish/release/takeover/delete接口。
+
+API mutation的通用幂等主键是`(authenticated workspace, canonical route, Idempotency-Key)`，并绑定
+canonical request fingerprint和不可变成功/失败结果。同key异payload在资源锁前失败；同key同payload
+只读原result。首次事务先取得key reservation，再按各domain的固定锁序执行并在同一commit写result，
+不落持久Pending。V1已提交result不随resource或Operation删除而GC。
 
 heartbeat 只追加 observation，不写 Desired。Starting、Suspending、Warming、Stopping 是
 observation/checkpoint 的 step，不是控制面的稳定状态或新 authority。
@@ -70,7 +75,7 @@ Agent 必须先取得固定 Host state path 的 kernel 排他锁。它在注册 
 完整 VM shape、磁盘、Endpoint 和 transition policy。revision、placement epoch、runtime
 incarnation、attachment epoch 和 route epoch 各自防止对应 ABA。
 
-一次 mutation 在同一 PostgreSQL 事务写完整 spec 和精确绑定它的 Operation。提交前必须完成
+一次 mutation 在同一 PostgreSQL 事务写完整 spec、精确绑定它的 Operation和通用幂等result。提交前必须完成
 合法性、Cold-only 与 placement/capacity 检查；没有 placement 时不创建 revision。每次 placement
 改变也是一个新 revision 和 Operation，没有旁路调度权威。新 revision 原子 Supersede 旧的
 Pending Operation。已选 Node 若明确拒绝不可满足的容量/能力，当前 Operation Failed；重新调度
@@ -99,7 +104,9 @@ Deleted 是保留到物理 runtime、route 和 volume disposition 全部完成�
 - V1 的 VM shape 和磁盘集合只在 Cold 改变。非 Cold 变更请求直接返回
   `PreconditionFailed(MustBeCold)`；调用方先提交普通 Cold revision，成功后再以新请求提交完整
   配置。volume容量创建后不可变，不提供resize；DiskSnapshot只在stable Cold/unowned时创建，
-  只支持同盘restore。
+  单一`DiskSnapshotRecord`同时是产品资源和GC live-root，只支持同盘restore。Disk delete遇到live
+  record时返回`SnapshotInUse`。Snapshot create/delete/restore使用通用`ApiIdempotencyResult`与
+  Volume Authority变化同事务结算；重放只读result，Disk delete不隐式cascade。
 - 计划跨 Node 迁移同样只有两个普通 revision：源 placement 收敛到 Cold；成功后新 revision
   提高 placement epoch 并在目标 Node 恢复；整个过程始终只有当前 Desired 是 authority。
 
@@ -119,7 +126,7 @@ placement authority；晚到的本地结果绑定精确 incarnation，由下一�
 - process/scope/socket 使用 runtime incarnation、start time 和 handshake；
 - NBD/tap 使用完整 inventory 与 checkpoint ownership token；
 - WarmRuntimeSnapshot使用temp identity、文件metadata和VMM postcondition；DiskSnapshot走Volume
-  Authority的Root pin；
+  Authority的单一`DiskSnapshotRecord`；
 - route使用AdmissionCell中的runtime incarnation/per-Endpoint route epoch compare-and-guard；全局
   desired revision仍用于reconcile和signer snapshot，不进入Grant serving binding。
 
@@ -158,9 +165,11 @@ revision 和新 placement。MetadataStore 按 tuple CAS、提高 epoch；同一 
 
 旧Host仍保持workload网络隔离。新boot/session下完成全量inventory，把旧epoch的`R < L` lineage
 移入quarantine，并核对该event派生的全部takeover/delete authorization与每卷current owner/epoch。
-授权派生与Rejoined CAS串行；已消费授权必须匹配postcondition，未消费授权必须已过`not_after`。
-Control Plane接受HostRejoinProof并把event持久转为Rejoined后才恢复网络；此后未消费授权不能首次
-生效，已消费授权仍可幂等读取原结果。
+授权派生、首次consume和`Active -> Rejoined`都锁同一event行；首次consume在同一PostgreSQL事务
+完成Volume CAS并写不可变receipt。rejoin验证receipt以及当前卷是其直接结果或合法单调后继；
+VolumeRecord已删除时验证精确`DeleteCompletionReceipt`。未消费授权必须已过`not_after`；Control
+Plane接受HostRejoinProof并把event持久转为Rejoined后才恢复网络，此后未消费授权不能首次生效，
+已消费授权仍可幂等读取原receipt。
 
 disposable Root放弃`R < L`tail也不绕过volume authority。Control Plane只为当前Deleted Desired
 和精确stop observation或Active HostFenceEvent建立`DisposableRootDeleteAuthorization`；

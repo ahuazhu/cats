@@ -61,6 +61,15 @@ acquire deadline、connect/query/lock/transaction timeout、单批rows/bytes和c
 3. controller只分页扫描current state，按稳定key排序，每轮有work/time budget；notify只负责提前
    唤醒。没有无界in-memory backlog，也不靠历史command重建意图。
 
+API mutation先完成调用者认证、当前Workspace membership和route permission检查，再取得
+`(authenticated workspace, canonical route, Idempotency-Key)`的transaction-scoped reservation。
+全局锁DAG是`API key -> HostFenceEvent -> authorization -> VolumeRecord -> Disk/Desired ->
+DiskSnapshotRecord`，不涉及的节点直接跳过，同类多行按稳定ID排序。相同canonical request fingerprint
+只读不可变`ApiIdempotencyResult`，即使目标资源后来已删除也不先查询它；不同fingerprint在资源锁前
+失败。只有result miss才检查当前资源ownership并取得domain locks；跨Workspace miss回滚reservation，
+零持久副作用。首次业务变化与成功/确定性失败result同一commit且不落持久Pending。V1已提交result
+不随resource或Operation删除而GC。
+
 数据库慢或pool饱和时，readiness、队列拒绝和延迟指标必须先于全局超时告警；Running数据面不因
 controller retry而停止。
 
@@ -80,17 +89,25 @@ heartbeat缺失、AgentSession过期、EC2状态查询或Gateway不可达都只�
 3. Control Plane先把当前Pending Operation置为`Failed(HostLost)`，再在一个事务中创建新完整
    Desired/Operation、placement、全部新attachments与每卷`VolumeTakeoverAuthorization`；Desired
    逐卷引用授权。任何一项无法建立就保持Blocked，不留下旁路placement。
-4. replacement只从remote durable`R` Cold启动。每卷必须消费精确authorization并完成MetadataStore
-   epoch CAS，不存在另一种writer-proof fallback；全部volume、runtime和新route epochs Ready后才
-   serving。旧Grant/gate/writer全部fail closed。
+4. replacement只从remote durable`R` Cold启动。每卷首次消费必须按
+   `HostFenceEvent -> authorization -> VolumeRecord`锁序，在同一PostgreSQL事务确认event仍Active、
+   完成epoch CAS并写不可变`AuthorizationConsumedReceipt`；不存在另一种writer-proof fallback。
+   全部volume、runtime和新route epochs Ready后才serving。旧Grant/gate/writer全部fail closed。
+
+HostFenceEvent来源的disposable Root删除在上述锁序后继续锁Control rows；同一事务写Consumed receipt，
+把VolumeRecord和Control Disk改为同一Deleting。对象sweep只能在该提交后执行。普通begin-delete也在
+一个PostgreSQL事务同时改变两边；它与normal acquire锁同一VolumeRecord，只能一方提交。
 
 旧Host即使恢复供电也持续隔离。它只能以新boot/session进入cordoned rejoin：完成union inventory，
 停止旧VMM/blockd/tap/socket/gate/guard，把旧epoch的`R < L`lineage移入quarantine；随后核对该event
-派生的全部takeover/delete authorizations及每卷current owner/epoch。已消费授权必须匹配精确
-postcondition；未消费授权必须已过`not_after`。仍可首次生效的授权阻止rejoin；授权派生与
-`Active -> Rejoined`使用同一event serialization point。Control Plane接受`HostRejoinProof`并持久
-改为Rejoined后，provider才恢复workload网络。此后未消费授权不能首次生效，已消费授权仍可幂等
-读取原结果。没有可验证external fence的平台保持Blocked等待人工处置。
+派生的全部takeover/delete authorizations。授权派生、首次消费与`Active -> Rejoined`都先锁同一
+event行；rejoin取得该锁后再按稳定顺序锁全部授权，所以不会漏掉in-flight首次消费。Unconsumed授权
+必须已过`not_after`；Consumed授权必须有匹配payload的不可变receipt，当前VolumeRecord必须是直接
+结果或更大epoch的合法后继；receipt含Disk postcondition时Control Disk也必须匹配，两边记录已删除
+时必须有精确`DeleteCompletionReceipt`。任何缺失、倒退或
+冲突保持Blocked。Control Plane在同一事务接受`HostRejoinProof`并持久改为Rejoined后，provider才
+恢复workload网络。此后未消费授权不能首次生效，已消费授权只读取原receipt；相关authorization和
+`DeleteCompletionReceipt`至少保留到Rejoined。没有可验证external fence的平台保持Blocked等待人工处置。
 
 ## 5. 运行监控
 
@@ -121,8 +138,11 @@ runbook；禁止以“重启看看”跳过fence或durability proof。
    AdmissionCell/close race、RequireIdle one-shot、Gateway LRU/singleflight/backoff和PostgreSQL双session
    transaction tests。FakeVmm integration注入慢DB、响应丢失、restart/cancel和HTTP/WS transport歧义。
    [Volume Authority §14](specs/volume-authority.md#14-最小验收矩阵)是同一上线门，必须覆盖acquire/
-   release模糊响应、旧lineage、mkfs crash、SnapshotPin/GC、同盘restore、普通delete及disposable
-   Root Owned->Deleting的每个crash点。
+   release模糊响应、旧lineage、mkfs crash、snapshot create/result原子提交及lost response、
+   create→delete→旧create replay不复活、跨Workspace零副作用、`DiskSnapshotRecord`/GC、显式snapshot
+   delete与`SnapshotInUse`、同盘restore只前进一次、普通begin-delete与acquire
+   竞争，以及disposable Root两边Deleting的每个crash点；还要用PostgreSQL双session覆盖authorization
+   首次consume与Rejoined竞争以及合法后继receipt校验。
 2. **独立native x86_64 Linux build host**：使用现有
    [qualification build host](../deploy/aws/terraform/qualification/build-host/README.md)；controller发布
    exact 40-hex commit后，在Host运行：
@@ -143,7 +163,9 @@ runbook；禁止以“重启看看”跳过fence或durability proof。
    Hypervisor基线，再用下节同一个oracle分别设置`kernel-nbd`和`vhost-user`，覆盖真实HTTP/WS、
    Agent restart、gate rebuild、Endpoint rebind、RequireIdle active-stream race、key overlap、Control
    Plane/Gateway interruption和cleanup。provider adapter还必须跑两卷HostFenceEvent→逐卷CAS→旧
-   writer拒绝→quarantine→Rejoined矩阵，包含错tuple和未消费授权阻止rejoin。
+   writer拒绝→quarantine→Rejoined矩阵，包含错tuple、consume/Rejoined边界竞争、未消费授权阻止
+   rejoin、takeover后release、HostFence disposable event/auth/volume/control原子提交和delete完成
+   receipt两种合法后继。
 4. **生产拓扑smoke**：前三层全绿后，才运行已有
    [control-plane HA workflow](../.github/workflows/verify-control-plane-ha.yml)的diagnose/disrupt模式，
    保存public probe和Pod/EndpointSlice evidence。该workflow目前只证明Control Plane副本切换；它不
@@ -179,7 +201,7 @@ runbook；禁止以“重启看看”跳过fence或durability proof。
    隔离metal Host验证同一artifact；没有合格Host时该上线门保持Blocked。
 2. 进入维护窗口，关闭公网 ingress 和 mutation。drain 可达 runtime；对不可达 Host 执行外部
    fence，并正向证明旧 Gateway、Controller、Node Agent、VMM 和 blockd 已停止或被隔离。
-3. 按批准的 destructive runbook 删除 Cat、Disk、Snapshot、Operation、route/cache、Node runtime
+3. 按批准的 destructive runbook 删除 Cat、Disk、Snapshot、Operation、旧API幂等状态、route/cache、Node runtime
    state、产品 object prefixes 以及 Metadata/Control/Usage/Billing 数据。Terraform state、实验和
    审计 evidence 继续受限保留，但不导入新系统。
 4. 在任何终态组件启动前，核对待部署artifact与步骤1的receipt完全一致，并证明其schema/IaC不含

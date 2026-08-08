@@ -38,8 +38,11 @@ TTL只用于健康判断。普通acquire永远不能因为另一个owner过期�
 HostFenceEvent派生的逐卷授权；计划handoff使用release后normal acquire。删除无条件
 `revoke_lease`。
 
-HostFenceEvent的授权派生与Rejoined转换串行。Rejoined前，已消费授权必须匹配精确postcondition，
-所有未消费takeover/delete授权必须已过`not_after`；转换后它们不能首次生效。
+HostFenceEvent的授权派生、首次消费与Rejoined转换都先锁同一个PostgreSQL event行。首次消费还锁
+authorization和VolumeRecord，在同一事务完成卷CAS并写不可变`AuthorizationConsumedReceipt`；
+Rejoined先提交后，未消费授权不能首次生效。rejoin校验receipt以及当前卷是其直接结果或合法的
+单调后继；卷已删除时改验精确`DeleteCompletionReceipt`。这些安全回执保留到相关event Rejoined，
+随后按审计策略GC。
 
 ### 3. Node取得grant，blockd只采用grant
 
@@ -62,22 +65,40 @@ PersistentDisk UUID在Control Store预定。Guest Agent执行唯一一次mkfs并
 Control Store写Initialized前必须使blockd达到`R == L`。正确UUID可以幂等adopt；其他UUID、部分
 格式或模糊且无法证明未执行的状态进入quarantine。
 
-### 6. Snapshot是受GC保护的Root pin
+### 6. Snapshot产品row就是GC live-root
 
-DiskSnapshot只在Cold/unowned时以精确head创建。GC同时标记current Root和全部Snapshot Roots。
-第一版只支持原Disk restore；不支持clone，不建立跨volume COW。Golden Image第一版不回收。
+DiskSnapshot只在Cold/unowned时创建。create、delete和same-disk restore统一使用PostgreSQL
+`ApiIdempotencyResult`：主键是认证Workspace、canonical route和`Idempotency-Key`，绑定canonical请求
+fingerprint与不可变成功/失败结果；同key异payload fail closed。调用者身份、当前Workspace membership
+和route permission通过后，API先取得该key的transaction-scoped reservation；精确result命中直接返回，
+不依赖目标资源仍存在。只有miss才按`VolumeRecord -> Disk(owner Workspace)/Desired ->
+DiskSnapshotRecord`锁序重验精确disk/volume/snapshot tuple，并在同一事务写业务变化和result。
+跨Workspace miss回滚reservation，没有资源、Operation或result副作用。
+
+create的`snapshot_id`由服务端首次事务分配且永不复用；事务同时插入唯一`DiskSnapshotRecord`与成功
+result。该row同时是产品资源和GC live-root；delete原子删除该row并写通用result；restore原子前进
+head/generation/epoch并写通用result。重放只读result，不能因record缺失重新
+执行；已提交result不随Snapshot删除而GC。GC标记current Root和全部snapshot records。
+Snapshot mutation同步完成，不创建Operation；产品row只表示当前资源，通用result只保存旧HTTP回答。
+第一版只支持原Disk restore；不支持clone或跨volume COW。Disk删除遇到任一live record返回
+`SnapshotInUse`且不隐式cascade；Golden Image第一版不回收。
 
 ### 7. 删除先关闭authority，再删除对象
 
-普通删除只接受已经`R == L`并精确release的Unowned卷。Volume进入`Deleting(delete_id)`后永久
-拒绝新attach，sweeper再幂等删除volume对象和snapshot pins，最后删除metadata与Control Store row。
+普通删除只接受已经`R == L`并精确release且没有live `DiskSnapshotRecord`的Unowned卷。`begin_delete`
+锁VolumeRecord后在同一PostgreSQL事务重验全部前置，并同时把Control Disk和VolumeRecord从Active
+改为同一`Deleting(delete_id)`；normal acquire与它只能一方提交。sweeper在该提交之后断言没有live
+`DiskSnapshotRecord`，
+幂等删除volume对象，最后写`DeleteCompletionReceipt`并同时删除两边metadata。
 
 ADR-0025的disposable Root例外使用唯一的第二个入口：Control Plane根据当前Deleted Desired与
 精确stop observation或Active HostFenceEvent签发
 `DisposableRootDeleteAuthorization`，绑定delete ID、revision/placement、volume、attachment、
-owner/epoch和remote head。MetadataStore消费它时直接把精确Owned卷CAS到Deleting、清owner并提高
-epoch；CAS成功后才允许删除该lineage的`R < L`tail。它不经过Active+Unowned窗口，不能用于
-PersistentDisk。Deleting是当前动作状态，不是长期历史ledger。
+owner/epoch和remote head。HostFenceEvent来源按
+`event -> authorization -> VolumeRecord -> Control rows`固定锁序，在一个事务写Consumed receipt、
+把精确Owned卷CAS到Deleting、清owner并提高epoch，同时把Control Disk改为相同Deleting；CAS成功后
+才允许删除该lineage的`R < L`tail。它不经过Active+Unowned窗口，不能用于PersistentDisk。
+Deleting保留到对象sweep完成，随后由精确completion receipt证明结果。
 
 ### 8. 迁移只做两revision Cold迁移
 
@@ -100,6 +121,7 @@ Node本地状态，目标release只读取本ADR定义的attachment identity和pa
 - normal retry、planned handoff和Host takeover成为三个清楚、可测的合同；
 - 旧writer、晚到请求和旧pending pack不能跨epoch复活；
 - snapshot和delete不再绕过writer authority，resize入口被删除；
+- snapshot必须显式删除，Disk delete不会静默删除live record保护的数据；
 - disposable Root放弃tail只有一条精确、幂等且先fence writer的删除转换；
 - filesystem readiness有可恢复的远端durability边界；
 - 第一版不承担hotplug、clone和image GC的额外状态空间。

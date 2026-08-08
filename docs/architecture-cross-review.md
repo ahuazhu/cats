@@ -36,11 +36,17 @@ Operations/HA；依赖和实现顺序见[技术架构 §12](architecture.md#12-�
    终态增加唯一窄转换：精确`DisposableRootDeleteAuthorization`把当前Owned卷CAS为Deleting、清
    owner并提高epoch；CAS后才删除该lineage。PersistentDisk不能使用。
 6. **Host rejoin**：provider receipt只建立HostFenceEvent，不直接创建placement或writer。新完整
-   Desired/Operation和全部逐卷授权在Control Store事务中建立；rejoin quarantine旧lineage、核对
-   全部授权/current owner；已消费授权匹配postcondition且未消费授权过期后，才把event改为Rejoined
-   并恢复网络。转换后未消费授权不能首次生效。
+   Desired/Operation和全部逐卷授权在Control Store事务中建立。授权派生、首次consume和
+   `Active -> Rejoined`都锁同一event行；首次consume在同一PostgreSQL事务完成Volume CAS并写不可变
+   receipt。rejoin quarantine旧lineage，验证receipt及当前卷是其直接结果或合法单调后继；
+   VolumeRecord已删除时验证精确`DeleteCompletionReceipt`。未消费授权必须已过期，Rejoined后不能
+   首次生效。
 7. **磁盘产品边界**：volume size创建后不可变；无resize/hotplug。DiskSnapshot只在stable
-   Cold/unowned时pin Root，进入GC live set，只支持同盘restore；WarmRuntimeSnapshot保持独立。
+   Cold/unowned时创建一条`DiskSnapshotRecord`；该row同时是产品资源和GC live-root，只支持同盘
+   restore；WarmRuntimeSnapshot保持独立。Snapshot create/delete/restore先按认证Workspace/route/key
+   串行，再锁Volume/Disk/Snapshot，并把业务变化与通用不可变API result同事务提交；重放只读result。
+   snapshot ID由服务端分配且永不复用。Disk delete遇live record返回
+   `SnapshotInUse`，不隐式cascade。
 8. **首次部署**：顺序歧义已关闭；
    [Operations and HA §8](operations-ha.md#8-首次终态部署)是唯一cutover runbook，本记录不再复制步骤。
 
@@ -49,6 +55,7 @@ Operations/HA；依赖和实现顺序见[技术架构 §12](architecture.md#12-�
 | Producer | Consumer | 唯一合同 | 失败oracle |
 |---|---|---|---|
 | Control truth | Node convergence | complete Desired + revision/placement + Operation | N/N+1/N+2结果不能互相结算 |
+| API caller | Control truth | workspace/route/key + canonical fingerprint -> immutable result | 同key异payload、跨Workspace与旧create replay零资源副作用 |
 | Node inventory | Route signer | AgentSession + inventory attestation + per-Cat observation | partial/过期事实停止签发，不猜Ready |
 | Control/Node | MetadataStore | transition ID、exact epoch、逐卷或删除authorization | 响应丢失幂等；错tuple零副作用 |
 | Node runtime | Route admission | runtime incarnation + one Endpoint serving epoch | close后无guard；旧epoch不复活 |

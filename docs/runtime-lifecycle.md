@@ -30,11 +30,13 @@ Warm 的 snapshot 是 Host 本地 `WarmRuntimeSnapshot`。产品 `DiskSnapshot` 
 3. 所有离开 Running 的路径先关闭 work/route admission，再处理 Guest、VMM 和 volume。
 4. `R <= L`。Relaxed volume 的 `R < L` pending data 是唯一数据，不是 cache。
 5. Warm、Cold、detach和计划迁移前，所有保留卷必须`R == L`；DiskSnapshot还要求Cat稳定Cold且
-   volume unowned。
+   volume unowned，并在一个PostgreSQL事务创建一条exact `DiskSnapshotRecord`；该row就是GC live-root。
 6. Suspended/Warm 的 Host 快路径失败时，只有证明 durable data 安全后才能 Cold fallback。
 7. RootDisk 跟随 Cat；PersistentDisk 生命周期独立，Destroy 默认只 detach。
 8. Runtime shape 与磁盘集合只在精确 Cold 改变；V1 不做 hot attach/detach。
-9. volume容量创建后不可变；不提供resize。DiskSnapshot只pin远端Root，只支持同盘restore。
+9. volume容量创建后不可变；不提供resize。DiskSnapshot record命名远端Root，只支持同盘restore。
+10. Disk删除不隐式删除Snapshot；live `DiskSnapshotRecord`使`begin_delete`返回`SnapshotInUse`，
+    Snapshot create/delete/restore与通用PostgreSQL `ApiIdempotencyResult`同事务结算，重放只读result。
 
 ## 3. 转换合同
 
@@ -100,8 +102,17 @@ Running 先关闭 admission、quiesce Guest 并 drain。Suspended 若有 `R < L`
 Destroy先关闭admission并停止Guest/VMM。PersistentDisk必须完整drain/release，不能随Cat删除；
 只有当前Deleted Desired明确disposable的RootDisk可以按ADR-0025放弃local tail。它必须先消费
 绑定delete ID、revision/placement、attachment、owner/epoch、head和stop/fence证据的精确授权，
-原子从Owned进入Deleting并提高epoch；CAS成功后才删除该lineage。未知卷、冲突identity或未完成
-fence/rejoin都阻止Deleted Operation成功。
+HostFenceEvent来源按`event -> authorization -> VolumeRecord -> Control rows`锁序，在同一事务写
+Consumed receipt、把Volume从Owned转为Deleting并提高epoch、把Control Disk转为相同Deleting；提交后
+才删除该lineage。未知卷、冲突identity或未完成fence/rejoin都阻止Deleted Operation成功。
+
+待删除Disk必须没有live `DiskSnapshotRecord`，否则保持原状态并返回`SnapshotInUse`。Snapshot创建
+先取得认证Workspace/route/key reservation，再锁VolumeRecord并重验Disk owner、Active/Cold/unowned，
+与通用result同事务插入一条exact record；Snapshot删除同样原子删除该row并写result，Disk delete
+不负责cascade。普通begin-delete同样锁VolumeRecord，并在
+一个PostgreSQL事务原子把Control Disk与VolumeRecord从Active改为同一Deleting；normal acquire与它
+只能一方提交。Volume对象清空后写`DeleteCompletionReceipt`并同时删除两边row；若相关
+HostFenceEvent仍Active，该receipt保留到Rejoined。
 
 Deleted Desired 作为 tombstone 保留，直到无 runtime/route、卷 disposition 完成且 inventory
 无 residue。负责 Host 丢失时，仅 network isolation 不足以声称物理 residue 已清除；需要
@@ -166,7 +177,8 @@ heartbeat timeout 只产生 `NodeSuspected`。源可能仍运行且持有 Relaxe
 一个事务中把旧Pending Operation置为HostLost、创建新完整Desired/Operation/placement与全部逐卷
 授权。Host event只是Host级隔离事实；每个volume还必须取得独立
 `VolumeTakeoverAuthorization`，精确绑定旧 owner/epoch、新 attachment、Desired revision 和
-目标 placement。MetadataStore 在 CAS 中提高新 epoch。对应 schema/CAS 由
+目标 placement。首次消费先锁同一PostgreSQL event行，再锁authorization与VolumeRecord，在一个
+事务中提高epoch并写不可变`AuthorizationConsumedReceipt`。对应 schema/CAS 由
 [Volume Authority](specs/volume-authority.md) 定义。
 
 Strict 从 remote `R` 恢复。Relaxed 也只能从 `R` 恢复并标记
@@ -175,9 +187,11 @@ Strict 从 remote `R` 恢复。Relaxed 也只能从 `R` 恢复并标记
 
 失联Host返回后，旧epoch永久不能publish，旧`R < L` lineage移入quarantine而不删除。它必须在
 workload网络仍隔离时，以新boot/session完成完整inventory和清场；Control Plane还要核对该event
-派生的全部takeover/delete authorizations及每卷current owner/epoch。接受HostRejoinProof并把
-event持久转为Rejoined前，已消费授权必须匹配postcondition，未消费授权必须已过`not_after`；
-转换后它们不能首次生效。provider随后才恢复网络。
+派生的全部takeover/delete authorizations。授权派生、首次消费和`Active -> Rejoined`共用event行
+串行点：未消费授权必须已过`not_after`；已消费授权必须有匹配payload的不可变receipt，当前卷必须
+是直接结果或更大epoch的合法后继；receipt包含Disk postcondition时Control Disk也必须匹配，两边row
+已删除时必须有精确`DeleteCompletionReceipt`。
+接受HostRejoinProof并把event持久转为Rejoined后，未消费授权不能首次生效，provider才恢复网络。
 
 ## 6. Inventory、故障与 Operation
 
@@ -226,10 +240,18 @@ Condition 语义：
 - `R < L` 且 remote 故障时，Suspend 可完成，Warm/Cold/detach/migrate 必须阻塞且唯一数据保留。
 - 非 Cold shape/disk 变更先失败，Cold 成功后的新请求才改 spec；计划迁移严格使用两个普通
   revision。
-- volume size不可变；DiskSnapshot只在stable Cold/unowned时pin并进入GC live set，只同盘restore。
+- volume size不可变；DiskSnapshot只在stable Cold/unowned时创建一条exact `DiskSnapshotRecord`，
+  该row进入GC live set，只同盘restore。
+- Snapshot create/delete/restore的业务变化与通用API result同一commit；重放只读result，restore的
+  generation/epoch只前进一次。
+- create→delete后旧create key重放返回原snapshot ID但不复活record；跨Workspace请求零副作用。
+- live record使Disk delete返回SnapshotInUse；显式snapshot delete原子删除该row并写通用result。
 - Host 未 fence 时不迁移；fence 后逐卷 takeover 错 tuple 全部失败，旧 writer/route/session 永久
   失效。
-- disposable Root `R < L`只有精确Owned->Deleting授权CAS后可删；PersistentDisk同请求必须拒绝。
+- authorization首次consume与Rejoined并发时只有一方先提交；takeover后release、delete后sweep都可
+  用`AuthorizationConsumedReceipt`/`DeleteCompletionReceipt`证明合法后继，错或缺失receipt保持Blocked。
+- normal acquire与begin-delete只能一方提交；HostFence disposable Root只有event/auth/volume/control
+  同事务写receipt和两边Deleting后可删`R < L`，PersistentDisk同请求必须拒绝。
 - kernel-NBD 与 vhost-user-blk 运行同一生命周期和数据屏障矩阵。
 
 实验数据用于选择默认值和容量预算，不替代这些安全合同。

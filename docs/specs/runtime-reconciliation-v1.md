@@ -130,7 +130,8 @@ acquire: Normal {transition_id, expected_unowned_epoch}
 `Normal` 不能 revoke 其他 owner；同一 transition 的重试返回同一 LeaseGrant。`Takeover` 只
 引用第 9 节的逐卷授权。授权行、MetadataStore CAS 与卷状态机由
 [Volume Authority](volume-authority.md) 定义；它是 Runtime acquire/takeover 的硬依赖，Host
-事件本身不授予卷写权限。
+事件本身不授予卷写权限。HostFenceEvent来源的首次消费必须在同一PostgreSQL事务锁event、
+authorization和VolumeRecord，完成卷CAS并写不可变`AuthorizationConsumedReceipt`。
 
 Deleted Desired还为每卷显式声明`DetachRetained`或`DeleteDisposableRoot {delete_id}`。后一种只允许
 Control Store权威分类的RootDisk；Node停止runtime/blockd并报告精确observation后，Control Plane才
@@ -197,10 +198,29 @@ volume容量创建后不可变；Control Plane、MetadataStore、blockd与Guest�
 
 ### 3.3 提交、placement 与 Operation
 
+所有API mutation共用PostgreSQL：
+
+```text
+ApiIdempotencyResult {
+  authenticated_workspace_id, canonical_route, idempotency_key,
+  request_fingerprint,
+  outcome: Succeeded {http_status, response} | Failed {http_status, typed_error},
+  created_at
+}
+```
+
+主键是`(authenticated_workspace_id, canonical_route, idempotency_key)`。事务必须先取得该key的
+transaction-scoped reservation并读取result，再取得任何domain资源锁；此前只验证调用者身份、当前
+Workspace membership和route permission，不查询目标资源是否仍存在。同fingerprint重放只返回不可变
+outcome，同key异fingerprint返回`IdempotencyConflict`。只有result miss才检查resource ownership和
+tuple；跨Workspace miss回滚reservation且零持久副作用。首次执行的业务变化和最终result同一commit，
+不保留持久Pending；无法提交事务时二者都不存在。V1已提交result不因resource或Operation删除而GC。
+
 1. API 在创建 revision 前完成合法性、Cold-only 和 placement/capacity 检查。无法选择 Node
    时不创建 Desired 或 Operation；选中的 placement 与完整 spec/Operation 在同一事务提交。
-2. 完整 spec 与精确绑定它的 Operation 在同一 PostgreSQL 事务写入。同一 idempotency key
-   返回同一结果；已经完全满足相同 spec 时不创建空 revision。
+2. 完整 spec、精确绑定它的 Operation与API result在同一 PostgreSQL 事务写入。同key重放返回
+   同一不可变HTTP response；异步response包含原`operation_id`，但不复制Operation的可变phase或status。
+   已经完全满足相同 spec 时不创建空 revision。
 3. 新 revision 提交时，旧的 Pending Operation 原子变为 Superseded。
 4. 每次 placement 变化都是一个新的完整 revision、提高后的 `placement_epoch` 和新
    Operation；不存在只改调度表、不改 Desired 的旁路。
@@ -327,7 +347,7 @@ unit。Inspect、Verify 和 Quarantine 本身不产生外部 effect。
 | planner step | 副作用前必须持久化 | 可执行条件与晚到结果 |
 |---|---|---|
 | CloseAdmission | desired/cell revision、原gate集合、RequireIdle attempt state | cell内compare-and-close；Armed模糊结果按Busy且Closed结算，fresh Running只以更高route epochs重开 |
-| AcquireVolume | volume、attachment、transition id + expected unowned epoch，或 authorization id | MetadataStore 精确 CAS；只有同 transition/authorization 可 adopt，或在 `R == L` 后精确 release |
+| AcquireVolume | volume、attachment、transition id + expected unowned epoch，或 authorization id | MetadataStore 精确 CAS；authorization首次消费还要求Active event并原子写`AuthorizationConsumedReceipt`；只有同 transition/authorization 可 adopt，或在 `R == L` 后精确 release |
 | PrepareDevices | NBD/tap/socket slot、ownership token | 完整 inventory 后 create-if-absent；晚到资源只按 token adopt 或删除 |
 | FormatFilesystem | attachment、device、filesystem UUID、initialization token、blank predecessor | Guest Agent 只按精确 predecessor 格式化；晚到结果按 UUID probe/adopt，冲突立即 quarantine |
 | DrainInitialization | attachment epoch、local/remote root generation | device flush 后只向精确 owner/epoch publish，直到 `R == L` |
@@ -339,7 +359,7 @@ unit。Inspect、Verify 和 Quarantine 本身不产生外部 effect。
 | SnapshotWarmRuntime | runtime incarnation、snapshot temp id、source root/epoch | 验证VMM postcondition与durable rename；晚到文件不覆盖其他WarmRuntimeSnapshot |
 | StopRuntime | runtime incarnation、process start time、scope id | 只 stop 该 incarnation；晚到 stop 可发生，当前 revision 负责重建 |
 | CleanupRelease | 全部物理 identity、`R == L`/disposition、当前 desired 读取位置 | 只删匹配资源、只 release 精确 owner/epoch；stale cleanup 不得按可重算名称删除新资源 |
-| DeleteDisposableRoot | delete authorization、精确lineage、owner/epoch/head | 只在Guest/VMM/blockd已停后消费Owned->Deleting CAS；成功后才删该`R < L`lineage |
+| DeleteDisposableRoot | delete authorization、精确lineage、owner/epoch/head | 无live DiskSnapshotRecord且Guest/VMM/blockd已停后，按event/auth/volume/control锁序原子写Consumed receipt及两边Deleting；成功后才删该`R < L`lineage |
 | InstallGate | desired checkpoint、spec digest、placement、runtime incarnation、endpoint/route epoch | cell只接受一个serving epoch；任何已close gate必须由更大epoch重开 |
 
 每步都可被 kill。重启后只能确认 postcondition、重试同一 token、继续或 quarantine，不能先
@@ -354,13 +374,21 @@ teardown 再重做。不建立通用 effect workflow。
 - NBD slot、tap 等共享资源：完整 inventory 后分配，checkpoint 先写 ownership token。
 - WarmRuntimeSnapshot：先写temp identity；成功要求VMM postcondition、文件metadata和durable
   rename。产品DiskSnapshot不走Runtime planner，只能按Volume Authority在stable Cold/unowned时
-  pin Root；GC标记current Root与全部pins，只支持同盘restore，不支持clone或Golden Image GC。
+  使用通用API key reservation，再锁VolumeRecord、重验认证Workspace拥有Disk及精确tuple，并在一个
+  PostgreSQL事务写业务变化与result。create插入的单一`DiskSnapshotRecord`同时是产品资源和GC
+  live-root；delete删该row，restore前进Volume head。重放只读result。只支持同盘restore，不支持clone
+  或Golden Image GC。
 - Route：遵守 [Route Grant v2](route-grant-v2.md) 的本地 gate/guard 合同。
 
 任何cleanup只作用于精确物理identity。普通volume delete必须证明无Desired intent、无有效
-attachment、无inventory residue。当前Deleted Desired中的disposable Root可使用
+attachment、无inventory residue，并且不存在live `DiskSnapshotRecord`；任一仍存在即返回
+`SnapshotInUse`且不改变Disk/Volume。Snapshot必须按Volume Authority通过通用API result幂等删除该row，
+Disk delete不隐式cascade。normal `begin_delete`锁VolumeRecord并在同一PostgreSQL事务把Control Disk
+与VolumeRecord从Active改为相同Deleting；normal acquire与它只能一方提交。当前Deleted Desired中的
+disposable Root可使用
 [Volume Authority §11](volume-authority.md#11-delete)的精确Owned->Deleting授权；CAS成功前不能清
-tail，成功后只清授权lineage。RPC超时不回滚Desired。
+tail。HostFenceEvent来源按`event -> authorization -> VolumeRecord -> Control rows`锁序，在同一事务
+写Consumed receipt和两边Deleting；成功后只清授权lineage。RPC超时不回滚Desired。
 
 ## 9. HostFenceEvent 与逐卷 takeover
 
@@ -388,11 +416,12 @@ VolumeTakeoverAuthorization {
 }
 ```
 
-MetadataStore 只消费精确匹配的逐卷 tuple，原子提高 epoch；相同 authorization 返回同一
-LeaseGrant。换卷、换旧 owner、换 attachment、换 placement 或过期后都必须创建新授权。运行时
-Desired 的 `attachment_id`、revision、placement 必须与 authorization 一致，对应
-`VolumeIntent.acquire` 必须引用该 authorization。精确 schema/CAS 以
-[Volume Authority](volume-authority.md) 为准。
+首次消费按固定锁序`HostFenceEvent -> authorization -> VolumeRecord`，要求event仍为Active和数据库
+时间未超过`not_after`，在同一PostgreSQL事务完成精确逐卷CAS并写不可变
+`AuthorizationConsumedReceipt`。相同authorization只读取receipt并返回同一LeaseGrant，不再次改变
+volume；换卷、换旧owner、换attachment、换placement、过期或Rejoined后的首次消费都失败。运行时
+Desired的`attachment_id`、revision、placement必须与authorization一致，对应`VolumeIntent.acquire`
+必须引用该authorization。精确schema/CAS以[Volume Authority](volume-authority.md)为准。
 
 provider receipt只建立Active HostFenceEvent，不直接授予placement或writer。Control Plane先把旧
 Pending Operation置为`Failed(HostLost)`，再在一个事务中创建新完整Desired/Operation、placement、
@@ -401,11 +430,14 @@ MetadataStore CAS后才能Ready，不存在另一种writer-proof fallback。
 
 session失效或提高attachment epoch不是解除旧Host隔离的条件。旧Host重用前必须在隔离网络内以
 新boot/session完成完整inventory，保持gates Closed，停止旧runtime/transport/socket/tap/guards，
-并把旧epoch的`R < L` lineage移入quarantine而非删除。Control Plane核对该event派生的全部takeover/
-delete authorizations及每卷current owner/epoch。已消费授权必须匹配精确postcondition，未消费授权
-必须按PostgreSQL时间超过`not_after`；仍可首次生效的授权使rejoin保持Blocked。授权派生与event
-状态转换在同一serialization point完成。接受`HostRejoinProof`并把event持久转为Rejoined后provider
-才恢复workload网络；此后未消费授权不能首次生效，已消费授权仍可幂等读取原结果。
+并把旧epoch的`R < L` lineage移入quarantine而非删除。授权派生、首次消费和
+`Active -> Rejoined`都先锁同一event行；rejoin再按稳定顺序锁定该event的全部授权，所以不会漏掉
+in-flight首次消费。Control Plane核对每个Unconsumed授权都已过`not_after`，每个Consumed授权都有
+匹配payload的不可变receipt；当前VolumeRecord必须是receipt直接结果或更大epoch的合法状态机后继，
+receipt含Disk postcondition时Control Disk也必须匹配同一Deleting；两边记录已删除时必须有精确
+`DeleteCompletionReceipt`。缺失、倒退或冲突保持Blocked。接受
+`HostRejoinProof`并在同一事务把event持久转为Rejoined后provider才恢复workload网络；此后未消费
+授权不能首次生效，已消费授权只幂等读取receipt。相关authorization和`DeleteCompletionReceipt`保留到Rejoined。
 
 ## 10. Observation 与 Conditions
 
@@ -449,8 +481,9 @@ Condition type 是闭集：`Ready`、`Progressing`、`Blocked`、`PreconditionFa
 - **Cold**：gates Closed；VMM/blockd 不存在；保留卷 `R == L` 且 attachment 已释放；本地只剩
   可删除 cache/诊断证据。
 - **Deleted**：无可服务 route/runtime；Root 按 disposition 处理；PersistentDisk 只 detach，
-  不删除；普通卷已release，disposable Root已消费精确delete authorization；没有未知卷或
-  未跟踪的attachment residue。
+  不删除；待删除Disk没有live `DiskSnapshotRecord`；普通卷已release，disposable Root已消费精确delete
+  authorization；开始删除时Control Disk与VolumeRecord已原子进入同一Deleting，完成后有精确
+  DeleteCompletionReceipt；没有未知卷或未跟踪的attachment residue。
 
 未满足完整条件只能 Progressing、Blocked、Degraded 或 Quarantined，不能发布目标稳定态。
 
@@ -486,7 +519,8 @@ rejoin 后的空 inventory，才能证明物理 runtime 已不存在；仅网络
 Operation 结算、volume disposition 完成且不存在 fence/rejoin 待办后，才可 GC 当前 Desired、
 observation 和 checkpoint 索引。审计按独立产品策略保留。Node 删除 checkpoint 前还必须证明
 无runtime、无未跟踪volume residue和无route gate。授权丢弃的Root lineage必须已删除；Active
-HostFenceEvent上的隔离lineage由event/rejoin记录继续跟踪，不能因本地缺席猜测消失。
+HostFenceEvent上的隔离lineage由event/rejoin记录继续跟踪，关联的authorization与
+`DeleteCompletionReceipt`必须保留到Rejoined，不能因VolumeRecord或本地目录缺席猜测消失。
 
 ## 14. 最小验收矩阵
 
@@ -502,7 +536,15 @@ HostFenceEvent上的隔离lineage由event/rejoin记录继续跟踪，不能因�
 | RequireIdle Busy/crash | attempt 只评估一次，Suspended Operation Failed，系统创建新 Running revision |
 | identity conflict | gates Closed，Quarantined，当前 Pending Operation Failed |
 | Host fence 与多个卷 | 一个 HostFenceEvent 派生多个独立逐卷授权；错 tuple 全部拒绝 |
-| disposable Root `R < L` | 只有精确Owned->Deleting授权CAS后删lineage；PersistentDisk拒绝 |
+| authorization consume 与Rejoined并发 | 两者锁同一event；只能consume先提交并留下receipt，或Rejoined先提交且epoch不变 |
+| consumed授权后继 | takeover→release与delete→sweep后均可凭单调状态/精确DeleteCompletionReceipt完成rejoin；错receipt保持Blocked |
+| normal acquire与begin-delete并发 | 同一VolumeRecord串行且只能一方提交；Control Disk与Volume不会出现单边Deleting |
+| disposable Root `R < L` | event/auth/volume/control同事务写receipt和两边Deleting后才删lineage；PersistentDisk拒绝 |
+| Snapshot create crash/响应丢失 | exact record与成功result同时提交或都不存在；重放只读result，不从record缺席推断可重建 |
+| create→delete→旧create重放 | 返回原成功result和原snapshot ID，不重新插row；snapshot ID永不复用 |
+| Snapshot跨Workspace访问/重放 | NotFound/Forbidden；不写Operation/result，不改变Volume、Disk或Snapshot |
+| Snapshot API同key异payload | 在资源锁前返回IdempotencyConflict，保留原result且不改变资源 |
+| Snapshot与Disk delete并发 | create/begin-delete锁同一VolumeRecord；live record返回SnapshotInUse且两边状态不变 |
 | Deleted | tombstone 保留到物理/卷/route postcondition 和 Operation 闭环 |
 
 ## 15. Clean-slate 切换

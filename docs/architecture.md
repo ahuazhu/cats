@@ -117,7 +117,7 @@ PostgreSQL DesiredRuntimeSpec(revision)
 | 事实 | 唯一权威 | 其他副本的地位 |
 |---|---|---|
 | 用户意图、完整 runtime spec、目标状态、placement | PostgreSQL `DesiredRuntimeSpec` | Node 只缓存当前 revision |
-| API 幂等、Operation 与审计 | PostgreSQL | 日志不是恢复依据 |
+| API请求重放与不可变结果、Operation 与审计 | PostgreSQL `ApiIdempotencyResult` / Control rows | 日志不是恢复依据 |
 | VMM/blockd/Guest/snapshot 是否真实存在 | Node 新鲜物理枚举和协议握手 | PostgreSQL 只保存 observation |
 | 当前恢复步骤 | 每 Cat 一个原子替换的 `RuntimeCheckpoint` | 只是一条有界恢复线索，不覆盖物理事实 |
 | volume writer、attachment epoch、remote root | MetadataStore CAS | desired attachment 是请求，不是写权限 |
@@ -128,6 +128,15 @@ PostgreSQL DesiredRuntimeSpec(revision)
 
 本地 checkpoint 缺失、损坏或与物理事实冲突时，Node 必须报告
 `Blocked`/`Quarantined`；“没在文件里看到”不能推断 Cat 已 Cold。
+
+API mutation以`(authenticated workspace, canonical route, Idempotency-Key)`唯一标识并绑定canonical
+request fingerprint。调用者身份、当前Workspace membership和route permission先通过；事务随后取得
+该key reservation并优先读取result，再沿
+`HostFenceEvent -> authorization -> VolumeRecord -> Disk/Desired -> DiskSnapshotRecord`的全局DAG锁定
+自己涉及的行；首次业务变化与不可变成功/失败result同一commit，不落持久Pending。同key重放只读
+result，即使目标资源已删除也不先查资源；同key异payload在资源锁前失败。只有result miss才检查资源
+ownership并取得domain locks；跨Workspace miss回滚reservation且零持久副作用。V1已提交result不随
+resource或Operation删除而GC。
 
 ## 5. 产品资源
 
@@ -157,7 +166,9 @@ close后重开也必须由fresh Desired递增。未变Endpoint不因其他Endpoi
 lookup只定位current revision，不成为另一份Endpoint authority。Running请求
 只有先选定placement才能提交；无容量时API直接返回容量不足，不留下半个desired。
 
-相同 idempotency key 返回原 Operation。已经处于同一目标且 spec 未变时不制造新 revision。
+相同workspace/route/key和request fingerprint返回原不可变HTTP response；异步response只引用原
+`operation_id`，Operation的当前phase/status仍只由Operation row权威持有。异payload fail closed。
+已经处于同一目标且 spec 未变时不制造新 revision。
 一个 revision 是完整期望，不依赖读取旧命令才能解释。
 
 ### 6.2 Node reconcile
@@ -242,6 +253,8 @@ snapshot、detach、计划迁移和 PersistentDisk destroy 前必须 drain 到 `
 进入Deleting状态后幂等清对象，不能只相信控制面的一列状态。唯一disposable Root例外必须先消费
 绑定Deleted revision、delete ID、attachment、owner/epoch/head与stop/fence证据的精确授权，把
 Owned卷直接CAS到Deleting并提高epoch，随后才删除该`R < L`lineage；PersistentDisk不能使用。
+Disk delete遇到live `DiskSnapshotRecord`时返回`SnapshotInUse`且不改变状态；Snapshot由独立幂等
+API操作与通用`ApiIdempotencyResult`同事务删除该row，Disk delete不隐式cascade。
 
 block attach只证明virtio设备存在。声明了ext4 mount的PersistentDisk只有在Guest按稳定device
 identity找到设备、验证期望UUID并报告目标path已mount后才算Ready。新盘创建时在Control Store
@@ -249,8 +262,12 @@ identity找到设备、验证期望UUID并报告目标path已mount后才算Ready
 quarantine，不再格式化。初始化必须在device flush并把卷推进到`R == L`后才消费token并标记
 Initialized，随后mount和Mounted observation是独立的Ready条件。
 
-DiskSnapshot首版只允许Cold且unowned的卷：以精确generation/root原子pin，GC同时标记当前Root
-和全部retained snapshot roots；只支持恢复到同一Disk。clone与Golden Image自动GC不在本轮范围。
+DiskSnapshot首版只允许Cold且unowned的卷。create/delete/restore先验证当前Workspace membership和
+route permission，再读取通用result；精确命中直接返回。只有miss才验证认证Workspace拥有Disk及精确
+disk/volume/snapshot tuple，并在同一事务写资源变化与result。create由服务端分配永不复用的snapshot
+ID并插入一条精确`DiskSnapshotRecord`，该row同时是产品资源与GC live-root；只支持恢复到同一Disk。
+这三个Snapshot mutation同步完成，不创建Operation；产品row只表示资源现在是否存在，通用result只保存
+旧HTTP请求当时返回什么。clone与Golden Image自动GC不在本轮范围。
 详细状态机见[Volume Authority and Disk Lifecycle](specs/volume-authority.md)。
 
 ## 9. 路由
@@ -304,9 +321,10 @@ AWS自动Node failover使用一个窄、可审计的EC2/BMC Host-fence adapter�
 绑定不可变Host/boot、旧session和fence attempt的Active HostFenceEvent，不直接创建placement或
 writer。Control Plane以一个事务失败旧Operation并创建新完整Desired/Operation/placement及全部
 逐卷授权；每卷CAS后才恢复。旧Host网络持续隔离，rejoin把旧`R < L`lineage quarantine并核对全部
-派生授权/current owner；HostRejoinProof把event持久转为Rejoined后才恢复网络。Rejoined event
-不能再派生授权；转换前所有已消费授权必须匹配postcondition，未消费授权必须已过期，转换后
-不得首次生效。
+派生授权/current owner。授权派生、首次consume和`Active -> Rejoined`都锁同一event行；首次consume
+在同一PostgreSQL事务完成Volume CAS并写不可变receipt。rejoin验证receipt以及当前卷是其直接结果或
+合法单调后继，VolumeRecord已删除时验证精确`DeleteCompletionReceipt`；未消费授权必须已过期。
+HostRejoinProof把event持久转为Rejoined后才恢复网络，此后未消费授权不能首次生效。
 
 数据库调用在有界blocking executor/连接池中执行，不能让同步driver占住Tokio worker。
 拓扑、故障检测、告警和测试机资格合同见[Operations and HA](operations-ha.md)。
@@ -326,7 +344,7 @@ writer。Control Plane以一个事务失败旧Operation并创建新完整Desired
 
 | 模块 | 负责 | 核心模型或算法 | 依赖 |
 |---|---|---|---|
-| A. Control truth | DesiredSpec、Operation、Endpoint revision、NodeIdentity、AgentSession、observation | PostgreSQL事务、revision CAS、周期扫描 | 共享身份/错误闭集 |
+| A. Control truth | DesiredSpec、ApiIdempotencyResult、Operation、Endpoint revision、NodeIdentity、AgentSession、observation | PostgreSQL事务、revision CAS、周期扫描 | 共享身份/错误闭集 |
 | B. Node convergence | Host lock、per-Cat reconciler、checkpoint、scope、inventory、Host资源分配 | inspect -> plan one step -> persist -> act -> verify | A的revision/session |
 | C. Volume and disk | RWO lease、逐卷takeover、pack lineage、ext4、snapshot、delete | transition-id CAS、`R/L`屏障、Cold-only磁盘变化 | A的disk intent、B的checkpoint |
 | D. Route and work admission | Endpoint lookup、Grant、Gateway cache、Node gate/guard、RequireIdle | signer一致快照、pre-admission verify、AdmissionCell线性化 | A、B，且C mount Ready |
@@ -375,7 +393,9 @@ virtio/ext4 和四态，是因为它们是已验证且合适的终态设计，�
 - pending pack与attachment lineage绑定；新attachment不能发布旧epoch本地写；
 - crash后只能adopt、继续或quarantine，无孤儿删除、重复writer和lease抢占；
 - PersistentDisk格式化后必须先`R == L`再标记Initialized，正确UUID mount前不能Running/Ready；
-- snapshot pin保护GC mark set，Deleting状态阻止新attach并完成对象清理；
+- `DiskSnapshotRecord`直接进入GC mark set，Deleting状态阻止新attach并完成对象清理；
+- snapshot业务变化与通用API result原子提交；create→delete后的旧create重放不复活row，跨Workspace
+  mutation不写Operation/result或资源；
 - disposable Root `R < L`只有精确Owned->Deleting授权CAS后可删，且不能扩展到PersistentDisk；
 - `R < L` 时 Warm/Cold/detach/migrate 被阻止，远端恢复后能 drain；
 - Host 未 fence 时不跨 Node 启动；takeover后旧epoch永久fail closed，旧Host通过rejoin清场

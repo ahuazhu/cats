@@ -145,11 +145,12 @@ Golden Root 位于独立的 `images/<image-id>/` 命名空间。镜像 ID 来自
 ### GC
 
 每卷GC在持有writer lease且与stage/publish互斥时运行。live roots是当前Root与该卷全部
-SnapshotPins；每个root的Root/Leaf、Base和所有Delta都必须标记。任一pin无法读取或校验时，本轮
-fail closed，不删除对象。commit records按保留策略处理。
+`DiskSnapshotRecord`；每个root的Root/Leaf、Base和所有Delta都必须标记。任一record命名的Root无法
+读取或校验时，本轮fail closed，不删除对象。commit records按保留策略处理。
 
-DiskSnapshot只在Cold/unowned时原子pin精确size/generation/Root。第一版只支持恢复到原Disk：
-restore发布一个新的、单调递增generation；不支持clone或跨volume COW。
+DiskSnapshot只在Cold/unowned时创建一条精确包含disk/volume/size/generation/Root的
+`DiskSnapshotRecord`；该row同时是产品资源和GC live-root。第一版只支持恢复到原Disk：restore发布
+一个新的、单调递增generation；不支持clone或跨volume COW。
 
 Volume删除先进入`Deleting(delete_id)`并提高epoch，再清对象。普通卷要求Cold、`R == L`且owner
 为空；disposable Root可以消费精确删除授权从Owned直接进入Deleting。lease TTL、控制面缺行或
