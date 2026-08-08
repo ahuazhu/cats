@@ -487,7 +487,6 @@ RuntimeCheckpoint {
 }
 
 CheckpointRouteGate {
-  endpoint_id: Id,
   binding: RouteGateBinding,
   gate: "active" | "closed"
 }
@@ -517,7 +516,7 @@ RequireIdleCheckpoint =
   }
 ```
 
-数组使用§10的相同排序/唯一性规则；`route_gates`按`endpoint_id`排序。`step`本身携带当前窄effect
+数组使用§10的相同排序/唯一性规则；`route_gates`按`binding.endpoint_id`排序。`step`本身携带当前窄effect
 token，不存在另一个任意payload的`current_effect_token`。非`require_idle`Desired必须使用
 `not_applicable`；同一attempt只能从`armed`一次性进入`busy`或`closed`，不得回退或复用。
 直接观察到guard Busy写`busy {gate_closed:false}`；close后的watcher/quiesce失败和restart遇到结果不明
@@ -695,8 +694,8 @@ NodeObservation {
   inventory_epoch: Epoch,
   inventory_digest: Sha256Digest | null,
   inventory_read_position: Sequence | null,
-  key_ring_version: Epoch,
-  key_ring_digest: Sha256Digest,
+  key_ring_version: Epoch | null,
+  key_ring_digest: Sha256Digest | null,
   loaded_kids: [KeyId],
   runtimes: [ObservedRuntimeStatus],
   residue: [NodeResidue]
@@ -735,6 +734,10 @@ AppliedDesiredEvidence {
 
 Control Plane只接受当前session/instance的递增sequence；Node的`observed_at_unix_ms`不用于排序或
 freshness。`loaded_kids`按`KeyId`升序且无重复，`runtimes`按`cat_id`升序且无重复。
+`key_ring_version`与`key_ring_digest`必须同时为null或同时非null：null/null要求`loaded_kids=[]`并表示
+当前session尚无有效ring；非null时即使kids为空也表示已原子加载一个有效ring，且digest必须按§16.2
+以该version和精确kids重算匹配。禁止null/non-null混合或null/null携带kids。Route signer只接受两个字段
+都非null、digest匹配且active `kid`存在于`loaded_kids`的形态；unavailable和合法空ring都不能签发。
 `complete_inventory=false`时只upsert报告中列出的Cat，不能按缺项删除，并且不得覆盖当前
 AdmissionInventoryAttestation；此时`inventory_digest`和`inventory_read_position`必须都是`null`，
 `inventory_epoch`引用当前已接受attestation，且Node级`residue`必须为空。`complete_inventory=true`
@@ -1025,7 +1028,6 @@ WarmSnapshotEvidence =
   }
 
 ObservedRouteGate {
-  endpoint_id: Id,
   binding: RouteGateBinding,
   gate: "active" | "closed",
   active_guards: integer 0..=4294967295,
@@ -1061,6 +1063,23 @@ NodeResidue =
     role_hint: ProcessRole | null,
     ownership_token: OwnershipTokenEvidence,
     control_handshake: ControlHandshakeEvidence
+  }
+| {
+    kind: "systemd_scope",
+    scope_id: Id,
+    cgroup_path: HostPath,
+    ownership_token: OwnershipTokenEvidence
+  }
+| {
+    kind: "control_socket",
+    socket_path: HostPath,
+    role_hint: ProcessRole | null,
+    ownership_token: OwnershipTokenEvidence
+  }
+| {
+    kind: "checkpoint_file",
+    checkpoint_path: HostPath,
+    evidence: ResidueCheckpointFileEvidence
   }
 | {
     kind: "kernel_nbd",
@@ -1123,6 +1142,20 @@ ResidueLineageEvidence =
     pending_pack_count: U64,
     fenced: boolean
   }
+
+ResidueCheckpointFileEvidence =
+  { kind: "corrupt", raw_content_digest: Sha256Digest }
+| {
+    kind: "valid",
+    content_digest: Sha256Digest,
+    format_version: ContractVersion,
+    cat_id: Id,
+    node_id: Id,
+    placement_epoch: Epoch,
+    desired_revision: Revision,
+    spec_digest: Sha256Digest,
+    runtime_incarnation: RandomId128 | null
+  }
 ```
 
 `local_durable_generation >= remote_durable_generation`。`disk_kind="unknown"`时
@@ -1144,6 +1177,14 @@ separator；它们只关联不可解析证据，不能当作成功handshake或ow
 
 full scan发现的每个约定资源必须恰好进入某个`ObservedRuntimeStatus`，或在不能可靠归属Cat/Volume时
 进入顶层`NodeObservation.residue`。`*_hint`和`role_hint`只记录不可信线索，不能据此cleanup。
+没有live matching process的systemd scope/cgroup与control socket分别进入`systemd_scope`和
+`control_socket`；仍存在但不能关联assigned Cat的checkpoint进入`checkpoint_file`。scope/socket只有
+ownership token为valid且与持久化cleanup identity精确匹配时才可清理。valid checkpoint evidence的
+content digest按§16.2绑定完整文件，所列字段必须与文件逐字段相同；corrupt evidence只保留path和raw
+digest并禁止自动清理。不能因为进程已死就按可重算scope/socket/checkpoint名字删除。
+`systemd_scope`要求bounded scan确认该cgroup没有live PID且没有匹配`ProcessEvidence`；`control_socket`
+要求没有任何live `(process_start_time_ticks, process_id)`拥有该socket。否则必须同时报告对应process
+事实，不能伪装成可直接清理的standalone residue。
 非自描述资源的token文件缺席/损坏分别编码`missing`/`corrupt`；`corrupt.raw_content_digest`是原始文件
 bytes的普通SHA-256。不得因token无效而省略资源。readable residue lineage也必须满足
 `local_durable_generation >= remote_durable_generation`；attachment ID/epoch hints必须同时为null或
@@ -1352,16 +1393,18 @@ DataLossReason =
 
 所有Condition内array按§10.4的rank/tuple升序且无重复；`observed_attachments`长度必须`>= 2`且identity
 互不相同。
-`unavailable_sources`、`sources`、`volume_ids`、`duplicate_runtime.observed_incarnations`和
-`process_identity_conflict.process_ids`都非空，后两者至少两个元素。所有
+`unavailable_sources`、`sources`和`volume_ids`都非空。`runtime_identity_conflict.observed_incarnations`
+非空且至少一项不同于`expected_incarnation`；`duplicate_runtime.observed_incarnations`和
+`process_identity_conflict.process_ids`都要求`length >= 2`且各值不同。所有
 `remote_durability_lag`/`remote_tail_unavailable`必须满足`local_generation > remote_generation`；
 `active_guards`必须至少有一个非零platform或Endpoint guard。
 `duplicate_device.observed_device_count`、`duplicate_mount.observed_instance_count`、
 `duplicate_network.observed_tap_count`和
 `duplicate_route.observed_instance_count`都必须至少为2。device count精确等于该`ObservedVolume.devices`
 长度；mount count精确等于同一`(volume_id, mount_path)`各item的`instance_count`之和；tap count精确等于
-同一`network_id`的`ObservedNetwork` item数；route count精确等于同一`endpoint_id`各item的
-`instance_count`之和。所有和必须可表示为`U64`。`invalid_ownership_token.evidence`只允许`missing`或
+同一`network_id`的`ObservedNetwork` item数；route count精确等于所有
+`binding.endpoint_id == reason.endpoint_id`的`ObservedRouteGate.instance_count`之和。所有和必须可表示为`U64`。
+`invalid_ownership_token.evidence`只允许`missing`或
 `corrupt`，不能携带`valid`。
 Conditions可并存，但`kind="ready"`每个runtime至多一个，其他Condition按
 §10.4的rank/bytes tuple升序且不允许逐字节重复。V1不得增加string-only reason、
@@ -1397,24 +1440,27 @@ Conditions可并存，但`kind="ready"`每个runtime至多一个，其他Conditi
 | `networks` | 16 | `(network_id, tap_name, guest_mac, guest_ipv4, gateway_ipv4, CJ(item))`；`tap_name`唯一 |
 | `RequireIdleCheckpoint.endpoint_guards`、`BlockedReason.active_guards.endpoint_guards`、`PreconditionFailureReason.busy.endpoint_guards` | 256 | `(endpoint_id)`；`endpoint_id`唯一 |
 | `ReconcileStep.snapshot_warm_runtime.source_heads`、`WarmSnapshotEvidence.present.source_heads` | 64 | `(volume_id)`；`volume_id`唯一 |
-| `RuntimeCheckpoint.route_gates` | 256 | `(endpoint_id)`；`endpoint_id`唯一 |
-| `ObservedRuntimeStatus.routes` | 512 | `(endpoint_id, binding.route_epoch, binding.workspace_id, binding.cat_id, binding.node_id, binding.runtime_incarnation, gate rank, CJ(item))`；允许同Endpoint不同binding，完全相同实例累计`instance_count` |
+| `RuntimeCheckpoint.route_gates` | 256 | `(binding.endpoint_id)`；`binding.endpoint_id`唯一 |
+| `ObservedRuntimeStatus.routes` | 512 | `(binding.endpoint_id, binding.route_epoch, binding.workspace_id, binding.cat_id, binding.node_id, binding.runtime_incarnation, gate rank, CJ(item))`；允许同Endpoint不同binding，完全相同实例累计`instance_count` |
 | `ObservedRuntimeStatus.conditions` | 64 | `(Condition.kind rank, reason.kind rank, CJ(item))` |
 | `NodeObservation.loaded_kids` / `KeyRingDigestInput.loaded_kids` | 64 | `(KeyId)`；`KeyId`唯一 |
 | `NodeObservation.runtimes` / `InventoryDigestInput.runtimes` | 1024 | `(cat_id)`；`cat_id`唯一 |
-| `NodeObservation.residue` / `InventoryDigestInput.residue` | 4096 | `(NodeResidue.kind rank, residue primary identity, CJ(item))`；primary identity见下文 |
+| `NodeObservation.residue` / `InventoryDigestInput.residue` | 4096 | `(NodeResidue.kind rank, residue primary identity, CJ(item))`；全部variant合计，primary identity见下文 |
 | `IncompleteInventory.unavailable_sources` | 11 | `(InventorySource rank)`；非空且variant唯一 |
 | `DegradedReason.source_unavailable.sources` | 12 | `(DegradedSource rank)`；非空且variant唯一 |
 | `BlockedReason.volume_authority_unavailable.volume_ids` | 64 | `(Id)`；非空且ID唯一 |
-| `QuarantineReason.runtime_identity_conflict.observed_incarnations`、`duplicate_runtime.observed_incarnations` | 128 | `(RandomId128)`；至少2项且identity唯一 |
+| `QuarantineReason.runtime_identity_conflict.observed_incarnations` | 128 | `(RandomId128)`；非空、identity唯一，且至少一项不等于同reason的`expected_incarnation` |
+| `QuarantineReason.duplicate_runtime.observed_incarnations` | 128 | `(RandomId128)`；至少2项且identity唯一 |
 | `QuarantineReason.process_identity_conflict.process_ids` | 128 | `(integer)`；至少2项且PID唯一 |
 | `QuarantineReason.duplicate_writer.observed_attachments` | 64 | `(attachment_epoch, attachment_id)`；至少2项且identity唯一 |
 
 `NodeResidue`的primary identity按variant分别是：process的
-`(process_start_time_ticks, process_id, executable_path)`、kernel NBD的`device_path`、vhost-user的
+`(process_start_time_ticks, process_id, executable_path)`、systemd scope的`(scope_id, cgroup_path)`、
+control socket的`socket_path`、checkpoint file的`checkpoint_path`、kernel NBD的`device_path`、vhost-user的
 `socket_path`、network tap的`tap_name`、data directory的`data_directory`、mount的
 `(mount_path, source_path)`、warm snapshot的`path`、route gate的`CJ(binding)`。同一物理path/PID/tap
-不得在runtime evidence与`residue`重复出现。任何array超过表中上限都使整个顶层合同失败，不能把
+以及同一scope/control socket/checkpoint file不得在runtime evidence与`residue`重复出现。任何array超过
+表中上限都使整个顶层合同失败，不能把
 `complete_inventory`降为false后截断发送。
 
 ## 11. 稳定 postcondition
@@ -1543,6 +1589,7 @@ HostFenceEvent上的隔离lineage由event/rejoin记录继续跟踪，关联的au
 | N/N+1/N+2 ABA | 旧结果不能结算/授权 N+2；已线性化的本地 effect 可被下一轮安全修复 |
 | 双 Agent / register 响应丢失 | Host lock 排他；同 attempt 返回同 session；旧 session 永久拒绝 |
 | 各 planner step kill | restart 后确认、重试、继续或 quarantine；无重复 writer/误删 |
+| 进程已死但scope/socket/checkpoint仍存在 | full inventory分别报告standalone scope/cgroup、无live process socket和无法归属checkpoint；digest覆盖，token/content不可信时禁止按名字清理 |
 | normal acquire 遇到旧 owner | Blocked，不 revoke；只有精确逐卷 takeover authorization 可 CAS |
 | Running 改盘/shape | 请求先 PreconditionFailed(MustBeCold)；Cold 成功后的新请求才改完整 spec |
 | `R < L` + remote down | Suspend 可完成；Warm/Cold/detach/migrate 阻塞且唯一数据保留 |
@@ -1645,6 +1692,10 @@ canonical encode；它不hash文件外层长度、filesystem metadata或raw JSON
 诊断Condition或heartbeat重发不会伪造新的物理inventory，而session、epoch、read position或任一物理
 事实变化都会改变digest。
 
+`KeyRingDigestInput`只在NodeObservation的ring version/digest都非null时存在；null/null/empty的
+unavailable形态没有key-ring digest input。non-null/non-null/empty是合法空ring，必须对
+`{version:1,key_ring_version,loaded_kids:[]}`正常canonical encode并验证digest，不能与unavailable合并。
+
 ### 16.3 fixed vectors
 
 以下code block内每个canonical JSON都是一行ASCII bytes，末尾没有newline。
@@ -1681,14 +1732,25 @@ checkpoint_content_digest = sha256:2c934710769641606abfeababb6dd599670852e38f0c7
 
 **Non-empty full inventory vector**使用同一个inventory domain。它刻意包含两个frontend、两个tap、
 route multiplicity、VMM shape/Guest Ready、volume size/durability、missing/corrupt token及Node residue，
-并在无法归属的data directory中保留`R < L` lineage，所以不是Ready postcondition：
+包括dead-process遗留的scope/cgroup、control socket、corrupt checkpoint，并在无法归属的data directory
+中保留`R < L` lineage，所以不是Ready postcondition：
 
 ```json
-{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"inventory_epoch":4,"inventory_read_position":12,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","residue":[{"data_directory":"/var/lib/cats/orphan-vol","kind":"data_directory","lineage":{"attachment_epoch_hint":4,"attachment_id_hint":"att_orphan","fenced":false,"kind":"readable","local_durable_generation":6,"pending_pack_count":2,"remote_durable_generation":5},"ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"volume_id_hint":null}],"runtimes":[{"applied_desired":{"desired_revision":7,"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","target":"running"},"cat_id":"cat_01","checkpoint":{"cat_id":"cat_01","content_digest":"sha256:2c934710769641606abfeababb6dd599670852e38f0c774b6733e33d42b9bed5","desired_revision":7,"format_version":1,"kind":"valid","node_id":"node_a","placement_epoch":3,"require_idle":{"kind":"not_applicable"},"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"updated_at_unix_ms":1720000000000},"guest_transport":{"guest_agent_protocol_version":1,"guest_boot_id":"cccccccccccccccccccccccccccccccc","guest_cid":3,"guest_port":5000,"kind":"vsock_ready","runtime_incarnation":"55555555555555555555555555555555"},"lifecycle_admission":"closed","mounts":[{"access":"read_write","filesystem_uuid":"99999999999999999999999999999999","guest_device":{"serial":"cats-root","slot":0},"instance_count":1,"mount_path":"/","volume_id":"vol_root"}],"networks":[{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"valid","ownership_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"prefix_length":30,"tap_name":"tap0"},{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"prefix_length":30,"tap_name":"tap1"}],"platform_guards":0,"processes":[{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/vmm.sock","executable_path":"/usr/bin/cloud-hypervisor","observed_vm_shape":{"boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","guest_config_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","memory_bytes":2147483648,"vcpus":2},"ownership_token":{"kind":"valid","ownership_token":"66666666666666666666666666666666"},"process_id":1001,"process_start_time_ticks":9001,"role":{"kind":"vmm","runtime_incarnation":"55555555555555555555555555555555"},"scope_id":"cats-cat_01","state":"running"},{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/blockd-root.sock","executable_path":"/usr/bin/cats-blockd","observed_vm_shape":null,"ownership_token":{"kind":"valid","ownership_token":"77777777777777777777777777777777"},"process_id":1002,"process_start_time_ticks":9002,"role":{"attachment_epoch":8,"attachment_id":"att_01","kind":"blockd","volume_id":"vol_root"},"scope_id":"cats-cat_01","state":"running"}],"routes":[{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":9,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"endpoint_id":"ep_01","gate":"closed","instance_count":2},{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":10,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"endpoint_id":"ep_01","gate":"closed","instance_count":1}],"runtime_incarnation":"55555555555555555555555555555555","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"volumes":[{"authority":{"attachment_epoch":8,"attachment_id":"att_01","generation":4,"kind":"owned","remote_root":"sha256:2222222222222222222222222222222222222222222222222222222222222222"},"devices":[{"device_path":"/dev/nbd0","guest_device":{"serial":"cats-root","slot":0},"kind":"kernel_nbd","ownership_token":{"kind":"valid","ownership_token":"88888888888888888888888888888888"}},{"guest_device":{"serial":"cats-root","slot":0},"kind":"vhost_user_blk","ownership_token":{"kind":"missing"},"socket_path":"/run/cats/cat_01/root.sock"}],"disk_id":"disk_root","disk_kind":"root","durability":"strict","local_lineages":[{"acquire_transition_id":"tx_01","attachment_epoch":8,"attachment_id":"att_01","data_directory":"/var/lib/cats/vol_root","fenced":false,"local_durable_generation":5,"node_id":"node_a","pending_pack_count":1,"placement_epoch":3,"remote_durable_generation":4,"state":"active"}],"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"warm_snapshot":{"kind":"absent"}}],"version":1}
+{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"inventory_epoch":4,"inventory_read_position":12,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","residue":[{"cgroup_path":"/sys/fs/cgroup/system.slice/cats-orphan.scope","kind":"systemd_scope","ownership_token":{"kind":"valid","ownership_token":"dddddddddddddddddddddddddddddddd"},"scope_id":"cats-orphan.scope"},{"kind":"control_socket","ownership_token":{"kind":"missing"},"role_hint":null,"socket_path":"/run/cats/orphan/control.sock"},{"checkpoint_path":"/var/lib/cats/checkpoints/orphan.json","evidence":{"kind":"corrupt","raw_content_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"kind":"checkpoint_file"},{"data_directory":"/var/lib/cats/orphan-vol","kind":"data_directory","lineage":{"attachment_epoch_hint":4,"attachment_id_hint":"att_orphan","fenced":false,"kind":"readable","local_durable_generation":6,"pending_pack_count":2,"remote_durable_generation":5},"ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"volume_id_hint":null}],"runtimes":[{"applied_desired":{"desired_revision":7,"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","target":"running"},"cat_id":"cat_01","checkpoint":{"cat_id":"cat_01","content_digest":"sha256:2c934710769641606abfeababb6dd599670852e38f0c774b6733e33d42b9bed5","desired_revision":7,"format_version":1,"kind":"valid","node_id":"node_a","placement_epoch":3,"require_idle":{"kind":"not_applicable"},"runtime_incarnation":null,"spec_digest":"sha256:529c32e8600910283f99bf949af5c31fdadcf3757463eb6c4811c61673ed9409","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"updated_at_unix_ms":1720000000000},"guest_transport":{"guest_agent_protocol_version":1,"guest_boot_id":"cccccccccccccccccccccccccccccccc","guest_cid":3,"guest_port":5000,"kind":"vsock_ready","runtime_incarnation":"55555555555555555555555555555555"},"lifecycle_admission":"closed","mounts":[{"access":"read_write","filesystem_uuid":"99999999999999999999999999999999","guest_device":{"serial":"cats-root","slot":0},"instance_count":1,"mount_path":"/","volume_id":"vol_root"}],"networks":[{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"valid","ownership_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"prefix_length":30,"tap_name":"tap0"},{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"prefix_length":30,"tap_name":"tap1"}],"platform_guards":0,"processes":[{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/vmm.sock","executable_path":"/usr/bin/cloud-hypervisor","observed_vm_shape":{"boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","guest_config_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","memory_bytes":2147483648,"vcpus":2},"ownership_token":{"kind":"valid","ownership_token":"66666666666666666666666666666666"},"process_id":1001,"process_start_time_ticks":9001,"role":{"kind":"vmm","runtime_incarnation":"55555555555555555555555555555555"},"scope_id":"cats-cat_01","state":"running"},{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/blockd-root.sock","executable_path":"/usr/bin/cats-blockd","observed_vm_shape":null,"ownership_token":{"kind":"valid","ownership_token":"77777777777777777777777777777777"},"process_id":1002,"process_start_time_ticks":9002,"role":{"attachment_epoch":8,"attachment_id":"att_01","kind":"blockd","volume_id":"vol_root"},"scope_id":"cats-cat_01","state":"running"}],"routes":[{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":9,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"gate":"closed","instance_count":2},{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":10,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"gate":"closed","instance_count":1}],"runtime_incarnation":"55555555555555555555555555555555","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"volumes":[{"authority":{"attachment_epoch":8,"attachment_id":"att_01","generation":4,"kind":"owned","remote_root":"sha256:2222222222222222222222222222222222222222222222222222222222222222"},"devices":[{"device_path":"/dev/nbd0","guest_device":{"serial":"cats-root","slot":0},"kind":"kernel_nbd","ownership_token":{"kind":"valid","ownership_token":"88888888888888888888888888888888"}},{"guest_device":{"serial":"cats-root","slot":0},"kind":"vhost_user_blk","ownership_token":{"kind":"missing"},"socket_path":"/run/cats/cat_01/root.sock"}],"disk_id":"disk_root","disk_kind":"root","durability":"strict","local_lineages":[{"acquire_transition_id":"tx_01","attachment_epoch":8,"attachment_id":"att_01","data_directory":"/var/lib/cats/vol_root","fenced":false,"local_durable_generation":5,"node_id":"node_a","pending_pack_count":1,"placement_epoch":3,"remote_durable_generation":4,"state":"active"}],"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"warm_snapshot":{"kind":"absent"}}],"version":1}
 ```
 
 ```text
-inventory_digest = sha256:b7b9c12035e35e88bc5803e01b54d19234c7ebf3dab97aa90de5927bcb056b98
+inventory_digest = sha256:e0124bbd80a4ebf490a7e2b8d5db3c351df0937a1a0bb09cdb108d1f463c2792
+```
+
+**Valid empty key ring vector**的hash输入domain为`cats.runtime.key-ring.v1`：
+
+```json
+{"key_ring_version":1,"loaded_kids":[],"version":1}
+```
+
+```text
+key_ring_digest = sha256:966a44bd1b4337c7e7dae913607740e7c7359bab2b7d4127419d63f3f9903cbb
 ```
 
 **Two-key ring vector**的hash输入domain为`cats.runtime.key-ring.v1`：
@@ -1703,7 +1765,12 @@ key_ring_digest = sha256:7881e60fd2e5dfa2fda716f560d6f124a7defd6c06b9d23c1038c42
 
 实现测试必须逐字节断言全部canonical JSON和digest，另测object输入key顺序变化不改变结果、数组
 逆序/重复/超限被拒绝、`spec_digest`自身变化不进入其输入，以及checkpoint物理字段、inventory residue/
-multiplicity或任一其他被覆盖字段变化都会改变对应digest。
+multiplicity或任一其他被覆盖字段变化都会改变对应digest。NodeObservation serde/validation另测
+null/null/empty unavailable、non-null/non-null/empty valid ring及所有禁止的混合组合；unavailable没有
+key-ring digest，valid empty ring必须匹配上面的fixed vector。negative tests还必须覆盖route gate外层
+`endpoint_id`作为unknown field被拒绝、`runtime_identity_conflict`单个different identity合法、只有
+expected identity非法、`duplicate_runtime`少于两个different identity非法，以及invalid UTF-8、invalid
+JSON、duplicate field、invalid type/value按§16.4优先级返回且前两者pointer为空。
 
 ### 16.4 跨组件 typed errors
 
@@ -1784,7 +1851,8 @@ ContractErrorDetail =
     code: "malformed_payload",
     contract: ContractName,
     json_pointer: JsonPointer,
-    problem: "missing_field" | "unknown_field" | "duplicate_field" | "invalid_type"
+    problem: "invalid_utf8" | "invalid_json" | "missing_field" | "unknown_field"
+           | "duplicate_field" | "invalid_type"
            | "invalid_value" | "duplicate_identity" | "non_canonical_order"
   }
 | {
@@ -1812,9 +1880,12 @@ ContractName = "node_identity" | "agent_registration_attempt" | "agent_session"
 `message`只供人读，接收方只能按`error.code`及typed payload分支。`json_pointer`使用RFC 6901文本，根
 对象是空string。`limit_exceeded.observed_at_least`必须大于`maximum`；decoder在读到
 `maximum + 1`个byte/item时即可停止并报告该值，不需要继续接收攻击者控制的剩余payload。解析/验证
-优先级固定为：顶层wire byte上限 -> JSON语法/重复key -> object字段与primitive
-类型 -> `version` -> array item上限 -> 字段值和数组排序/唯一性 -> session -> revision -> digest ->
-placement。presented session
+优先级固定为：顶层wire byte上限 -> UTF-8 decode -> JSON grammar -> duplicate object key -> object字段与
+primitive类型 -> `version` -> array item上限 -> 字段值和数组排序/唯一性 -> session -> revision ->
+digest -> placement。UTF-8 decode失败返回`invalid_utf8`，UTF-8合法但JSON grammar不完整/非法返回
+`invalid_json`；二者的`json_pointer`固定为空string。只有完整JSON grammar成功后才检测
+`duplicate_field`，其pointer指向重复member；`invalid_type`/`invalid_value`再晚于object字段检查。
+presented session
 epoch小于current返回`stale_session`；epoch相同但boot/instance不匹配，或presented epoch更大，返回
 `wrong_session`。Desired delivery中revision小于current返回`stale_revision`；精确结算要求不相等时
 返回`wrong_revision`；revision相同而digest不同返回`revision_digest_conflict`。node ID或placement

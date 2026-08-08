@@ -46,13 +46,13 @@ claims 的逻辑形态：
 | `version` | 必须为 `2` |
 | `iss` | 精确为 `cats-control-plane` |
 | `aud` | 精确为 `cats-node-agent`，不接受额外 audience |
-| identities | 非空且长度有界；必须与本地期望逐字节相等 |
+| `workspace_id` / `endpoint_id` / `cat_id` / `node_id` | 分别使用Runtime Reconciliation v1 `Id`的精确wire与验证；必须与本地期望逐字节相等 |
 | `hostname` | Runtime Reconciliation v1 `Hostname`；小写ASCII DNS名，无端口、路径或尾点 |
 | `runtime_incarnation` | Runtime Reconciliation v1 `RandomId128`（32个小写十六进制字符），精确匹配当前 VMM |
 | `route_epoch` | Runtime Reconciliation v1 `Epoch`（`1..=9223372036854775807`），精确匹配Endpoint serving gate；close后重开必须更大 |
 | `protocol` | v2 只允许 `http`；WebSocket 是该 HTTP route 的 upgrade |
 | `target_port` | `1..=65535`，精确匹配 gate；请求不能覆盖 |
-| `iat`/`nbf`/`exp` | Unix seconds；`iat <= nbf < exp` |
+| `iat`/`nbf`/`exp` | JSON integer `0..=9223372036854775807` Unix seconds；`iat <= nbf < exp` |
 
 默认 TTL 为 120 秒，最大 TTL 为 300 秒，最大时钟偏差为 5 秒；必须满足
 `0 < exp - iat <= 300`。部署可以缩短 TTL，不能提高 wire 上限。TTL 只限制新的 admission，
@@ -60,6 +60,11 @@ claims 的逻辑形态：
 
 Node 以可信 wall clock `now` 计算 time verdict：`now + 5 < nbf` 是 `NotYetValid`，
 `now - 5 >= exp` 是 `Expired`，其余在时间窗口内。时钟不可信的 Node 保持 admission Closed。
+`now`必须先转换并验证为同样的`0..=9223372036854775807` Unix seconds范围。本规格的所有integer/time
+加减，包括`route_epoch + 1`、生成`nbf`/`exp`、`exp - iat`、`now + 5`、`now - 5`以及key retention
+deadline，都必须使用checked arithmetic；任何overflow/underflow都fail closed（mutation/signer不提交或
+不签发，verifier返回`InvalidClaims`），禁止wrapping或saturating替代。signer/verifier不得为上述
+identity或时间字段另定义更宽范围。
 
 ## 2. Endpoint authority 与 revision
 
@@ -110,8 +115,8 @@ revision，必须走全局close-and-drain；之后重开全部受影响Endpoint�
 6. observation 的 applied revision、placement、runtime incarnation、Running/Ready condition 与
    desired 完全一致；
 7. observation 报告同Endpoint gate Active、同route epoch/protocol/port；
-8. observation的ring version/digest已接受，且当前signer `kid`出现在该Node原子加载并ACK的
-   `loaded_kids`中。
+8. observation的ring version/digest均非null、按精确`loaded_kids`重算匹配，且当前signer `kid`出现
+   在该Node原子加载并ACK的`loaded_kids`中；Runtime合同的unavailable或empty-but-valid ring都不签发。
 
 Signer 以同一 snapshot 的数据库时间生成 `iat/nbf/exp`。任何条件不成立都返回
 Wake/Pending/Unavailable，不签发未来 revision，不从旧 token 复制 authority，也不建立 durable
@@ -265,7 +270,9 @@ Signer 每一时刻只使用一个 active private key；Node 使用有界、版�
 必须完整验证后原子 swap；加载失败的 Node 不 Ready并保持 admission Closed。heartbeat/
 observation 报告AgentSession、ring version、按
 [Runtime Reconciliation v1 §16](runtime-reconciliation-v1.md)计算的`key_ring_digest`和已排序
-`loaded_kids`。
+`loaded_kids`。Runtime合同的null/null/empty表示尚无有效ring；non-null/non-null/empty表示已经加载的
+合法空ring。两者都保持admission Closed，只有non-null version/digest、重算匹配且包含active `kid`才
+满足Route签发条件。
 
 普通 rotation 顺序固定：
 
@@ -306,6 +313,8 @@ observation revision，不能把desired revision塞回Grant vector。
 
 还必须证明：
 
+- 四个`Id` claims使用Runtime边界；time claims在0与`i64::MAX`边界解析一致，所有TTL/skew/retention
+  checked arithmetic的overflow/underflow都fail closed；
 - admission 与 close 并发时，close 线性化点后没有新 guard；panic/cancel/timeout 不泄漏 guard；
 - unbind A只取消A；B的active WebSocket与新admission不中断，serving gate/epoch不变；
 - `RequireIdle` guard Busy不改变cell/epoch；任何实际或不明close后旧epoch不能重开；
