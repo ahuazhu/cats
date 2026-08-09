@@ -29,10 +29,10 @@ use cats_storage::authority::{
     VolumeAuthorization, VolumeDurability, VolumeRecord, VolumeTakeoverAuthorization,
 };
 
-use super::product::{CatRecord, DiskAdminState, DiskRecord, DiskRole};
+use super::product::{CatRecord, DiskAdminState, DiskRecord, DiskRole, DiskSnapshotRecord};
 use super::product_rows::{
-    insert_cat, insert_desired, insert_disk, insert_operation, load_desired_for_update,
-    load_disk_by_id_for_update,
+    insert_cat, insert_desired, insert_disk, insert_disk_snapshot, insert_operation,
+    load_desired_for_update, load_disk_by_id_for_update,
 };
 use super::rows::{
     database_now, insert_authorization, insert_delete_completion, insert_event, insert_volume,
@@ -636,21 +636,6 @@ fn execute_transition(
     VolumeTransitionStoreOutcome<cats_api::runtime_reconciliation::RuntimeVolumeTransitionSuccess>,
 > {
     store.runtime_volume_transition(
-        &node.authenticated,
-        request,
-        &node.active_guest_config_digest,
-        &AuthorityRequestContext::new(Instant::now() + Duration::from_secs(5)),
-    )
-}
-
-fn execute_transition_with_empty_snapshot_authority(
-    store: &Store,
-    node: &TransitionNode,
-    request: &RuntimeVolumeTransitionRequest,
-) -> crate::store::Result<
-    VolumeTransitionStoreOutcome<cats_api::runtime_reconciliation::RuntimeVolumeTransitionSuccess>,
-> {
-    store.runtime_volume_transition_with_empty_snapshot_authority_for_test(
         &node.authenticated,
         request,
         &node.active_guest_config_digest,
@@ -1538,16 +1523,98 @@ fn a22_disposable_consume_updates_volume_disk_and_receipt_atomically() {
 
     let before_volume = stored_volume(&store, &owned.volume_id);
     let before_authorization = stored_authorization(&store, &id("delete-auth-1"));
-    let unavailable = execute_transition(&store, &node, &request).unwrap_err();
-    assert_eq!(unavailable.code, ErrorCode::Internal);
+    let before_disk = store
+        .authority_transaction(|transaction| {
+            Ok(load_disk_by_id_for_update(transaction, &id("disk-1"))?.unwrap())
+        })
+        .unwrap();
+    let snapshot = DiskSnapshotRecord {
+        snapshot_id: id("snapshot-1"),
+        disk_id: id("disk-1"),
+        volume_id: owned.volume_id.clone(),
+        size_bytes: owned.size_bytes,
+        head: owned.head.clone(),
+        created_at: unix_millis(1),
+    };
+    store
+        .authority_transaction(|transaction| insert_disk_snapshot(transaction, &snapshot))
+        .unwrap();
+    assert_eq!(
+        execute_transition(&store, &node, &request).unwrap(),
+        VolumeTransitionStoreOutcome::Rejected(
+            VolumeTransitionStoreRejection::VolumeAuthorizationRejected {
+                authorization_id: id("delete-auth-1"),
+                reason: RuntimeVolumeAuthorizationRejection::SnapshotInUse,
+            }
+        )
+    );
     assert_eq!(stored_volume(&store, &owned.volume_id), before_volume);
     assert_eq!(
         stored_authorization(&store, &id("delete-auth-1")),
         before_authorization
     );
+    assert_eq!(
+        store
+            .authority_transaction(|transaction| {
+                Ok(load_disk_by_id_for_update(transaction, &id("disk-1"))?.unwrap())
+            })
+            .unwrap(),
+        before_disk
+    );
 
-    let first = execute_transition_with_empty_snapshot_authority(&store, &node, &request).unwrap();
-    let second = execute_transition_with_empty_snapshot_authority(&store, &node, &request).unwrap();
+    store
+        .authority_transaction(|transaction| {
+            transaction.execute(
+                "UPDATE disk_snapshot_records
+                    SET record=jsonb_set(record, '{volume_id}', '\"other-volume\"'::jsonb)
+                  WHERE snapshot_id=$1",
+                &[&snapshot.snapshot_id.as_str()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let corrupt = execute_transition(&store, &node, &request).unwrap_err();
+    assert_eq!(corrupt.code, ErrorCode::Internal);
+    assert_eq!(stored_volume(&store, &owned.volume_id), before_volume);
+    assert_eq!(
+        stored_authorization(&store, &id("delete-auth-1")),
+        before_authorization
+    );
+    store
+        .authority_transaction(|transaction| {
+            transaction.execute(
+                "DELETE FROM disk_snapshot_records WHERE snapshot_id=$1",
+                &[&snapshot.snapshot_id.as_str()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let mut size_mismatch = snapshot.clone();
+    size_mismatch.snapshot_id = id("snapshot-size-mismatch");
+    size_mismatch.size_bytes = size_mismatch.size_bytes.checked_add(1).unwrap();
+    store
+        .authority_transaction(|transaction| insert_disk_snapshot(transaction, &size_mismatch))
+        .unwrap();
+    let corrupt = execute_transition(&store, &node, &request).unwrap_err();
+    assert_eq!(corrupt.code, ErrorCode::Internal);
+    assert_eq!(stored_volume(&store, &owned.volume_id), before_volume);
+    assert_eq!(
+        stored_authorization(&store, &id("delete-auth-1")),
+        before_authorization
+    );
+    store
+        .authority_transaction(|transaction| {
+            transaction.execute(
+                "DELETE FROM disk_snapshot_records WHERE snapshot_id=$1",
+                &[&size_mismatch.snapshot_id.as_str()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let first = execute_transition(&store, &node, &request).unwrap();
+    let second = execute_transition(&store, &node, &request).unwrap();
     assert_eq!(first, second);
     let VolumeTransitionStoreOutcome::Accepted(success) = first else {
         panic!("disposable delete was rejected")

@@ -30,8 +30,8 @@ use postgres::Transaction;
 
 use super::product::{DiskAdminState, DiskRecord, DiskRole};
 use super::product_rows::{
-    load_cat_by_id_for_update, load_desired_for_update, load_disk_by_id_for_update,
-    load_pending_operation_by_cat_for_update, update_disk,
+    load_any_disk_snapshot_for_update, load_cat_by_id_for_update, load_desired_for_update,
+    load_disk_by_id_for_update, load_pending_operation_by_cat_for_update, update_disk,
 };
 use super::rows::{
     database_now, load_authorization_for_update, load_event_for_update,
@@ -116,17 +116,6 @@ struct LockedMutationContext<'transaction, 'connection> {
     desired: DesiredRuntimeSpec,
 }
 
-/// A22 may not infer snapshot absence from a missing product table or writer.
-/// The production composition has no DiskSnapshotRecord authority yet, so its
-/// disposable branch must remain closed until a later slice supplies the
-/// required same-transaction absence proof.
-#[derive(Clone, Copy)]
-enum DiskSnapshotAbsenceAuthority {
-    Unavailable,
-    #[cfg(test)]
-    KnownEmptyForTest,
-}
-
 struct LockedTakeoverMutation<'transaction, 'connection> {
     transaction: &'transaction mut Transaction<'connection>,
     db_now: UnixMillis,
@@ -161,22 +150,20 @@ impl Store {
         active_guest_config_digest: &Sha256Digest,
         request_context: &AuthorityRequestContext,
     ) -> Result<VolumeTransitionStoreOutcome<RuntimeVolumeTransitionSuccess>> {
-        self.runtime_volume_transition_with_snapshot_authority(
+        self.runtime_volume_transition_checked(
             authenticated,
             request,
             active_guest_config_digest,
             request_context,
-            DiskSnapshotAbsenceAuthority::Unavailable,
         )
     }
 
-    fn runtime_volume_transition_with_snapshot_authority(
+    fn runtime_volume_transition_checked(
         &self,
         authenticated: &AuthenticatedNodeCredential,
         request: &RuntimeVolumeTransitionRequest,
         active_guest_config_digest: &Sha256Digest,
         request_context: &AuthorityRequestContext,
-        snapshot_authority: DiskSnapshotAbsenceAuthority,
     ) -> Result<VolumeTransitionStoreOutcome<RuntimeVolumeTransitionSuccess>> {
         if let Err(error) = encode_runtime_volume_transition_request(request) {
             return Ok(contract_rejected(error));
@@ -195,12 +182,8 @@ impl Store {
                     ));
                 }
             };
-            let outcome = runtime_volume_transition_in(
-                prefix,
-                request,
-                active_guest_config_digest,
-                snapshot_authority,
-            )?;
+            let outcome =
+                runtime_volume_transition_in(prefix, request, active_guest_config_digest)?;
             Ok(match outcome {
                 accepted @ VolumeTransitionStoreOutcome::Accepted(_) => {
                     AuthorityRequestDisposition::Commit(accepted)
@@ -210,23 +193,6 @@ impl Store {
                 }
             })
         })
-    }
-
-    #[cfg(test)]
-    pub(super) fn runtime_volume_transition_with_empty_snapshot_authority_for_test(
-        &self,
-        authenticated: &AuthenticatedNodeCredential,
-        request: &RuntimeVolumeTransitionRequest,
-        active_guest_config_digest: &Sha256Digest,
-        request_context: &AuthorityRequestContext,
-    ) -> Result<VolumeTransitionStoreOutcome<RuntimeVolumeTransitionSuccess>> {
-        self.runtime_volume_transition_with_snapshot_authority(
-            authenticated,
-            request,
-            active_guest_config_digest,
-            request_context,
-            DiskSnapshotAbsenceAuthority::KnownEmptyForTest,
-        )
     }
 
     /// Loads one exact authorization evidence bundle under the credential and
@@ -364,7 +330,6 @@ fn runtime_volume_transition_in(
     prefix: AuthenticatedMutationPrefix<'_, '_>,
     request: &RuntimeVolumeTransitionRequest,
     active_guest_config_digest: &Sha256Digest,
-    snapshot_authority: DiskSnapshotAbsenceAuthority,
 ) -> AuthorityTxResult<VolumeTransitionStoreOutcome<RuntimeVolumeTransitionSuccess>> {
     let context = match lock_common_mutation_context(prefix, request, active_guest_config_digest)? {
         VolumeTransitionStoreOutcome::Accepted(context) => context,
@@ -381,12 +346,6 @@ fn runtime_volume_transition_in(
         } => execute_takeover(context, authorization_id)?,
         RuntimeVolumeTransition::Release { cleanup } => execute_release(context, cleanup)?,
         RuntimeVolumeTransition::DeleteDisposableRoot { authorization_id } => {
-            if matches!(
-                snapshot_authority,
-                DiskSnapshotAbsenceAuthority::Unavailable
-            ) {
-                return Err(AuthorityError::BackendUnknown.into());
-            }
             execute_disposable_delete(context, authorization_id)?
         }
     };
@@ -821,6 +780,16 @@ fn execute_disposable_delete(
             authorization_id.clone(),
             RuntimeVolumeAuthorizationRejection::InvalidAuthorization,
         ));
+    }
+    if load_any_disk_snapshot_for_update(
+        context.transaction,
+        &payload.disk_id,
+        &payload.volume_id,
+        disk.size_bytes,
+    )?
+    .is_some()
+    {
+        return disposable_authority_error(authorization_id, AuthorityError::SnapshotInUse);
     }
     let (updated_volume, updated_authorization, receipt) = match consume_disposable_root_delete(
         &volume,

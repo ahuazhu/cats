@@ -12,7 +12,8 @@ use serde::{de::DeserializeOwned, Serialize};
 use super::pg_codec::{PgBigInt, SizeBytes};
 use super::product::{
     ApiIdempotencyRequest, ApiIdempotencyResult, CatRecord, DiskAdminState, DiskRecord, DiskRole,
-    EndpointRecord, ExactContentType, HostnameDesiredLookup, PersistentDiskInitialization,
+    DiskSnapshotRecord, EndpointRecord, ExactContentType, HostnameDesiredLookup,
+    PersistentDiskInitialization,
 };
 use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
 use crate::store::{internal, Result, Store};
@@ -28,6 +29,9 @@ const DISK_COLUMNS: &str = "
     expected_blank_generation, expected_blank_root_hash,
     expected_blank_root_object_id, initialized_generation,
     initialized_root_hash, initialized_root_object_id, initialized_at";
+const DISK_SNAPSHOT_COLUMNS: &str = "
+    snapshot_id, record::text AS record_json, disk_id, volume_id, size_bytes,
+    head_generation, head_root_hash, head_root_object_id, created_at";
 const DESIRED_COLUMNS: &str = "
     cat_id, record::text AS record_json, workspace_id, desired_revision,
     spec_digest, target, node_id, placement_epoch";
@@ -278,6 +282,47 @@ impl DiskProjection {
             initialized_root_hash: row.try_get("initialized_root_hash")?,
             initialized_root_object_id: row.try_get("initialized_root_object_id")?,
             initialized_at: optional_from_pg(row.try_get("initialized_at")?)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiskSnapshotProjection {
+    snapshot_id: String,
+    disk_id: String,
+    volume_id: String,
+    size_bytes: SizeBytes,
+    head_generation: Generation,
+    head_root_hash: Option<String>,
+    head_root_object_id: Option<String>,
+    created_at: UnixMillis,
+}
+
+impl DiskSnapshotProjection {
+    fn from_record(record: &DiskSnapshotRecord) -> AuthorityTxResult<Self> {
+        validate_disk_snapshot(record)?;
+        Ok(Self {
+            snapshot_id: record.snapshot_id.to_string(),
+            disk_id: record.disk_id.to_string(),
+            volume_id: record.volume_id.to_string(),
+            size_bytes: SizeBytes::new(record.size_bytes).map_err(corrupt)?,
+            head_generation: record.head.generation,
+            head_root_hash: record.head.root_hash.as_ref().map(ToString::to_string),
+            head_root_object_id: record.head.root_object_id.as_ref().map(ToString::to_string),
+            created_at: record.created_at,
+        })
+    }
+
+    fn from_row(row: &Row) -> AuthorityTxResult<Self> {
+        Ok(Self {
+            snapshot_id: row.try_get("snapshot_id")?,
+            disk_id: row.try_get("disk_id")?,
+            volume_id: row.try_get("volume_id")?,
+            size_bytes: from_pg(row.try_get("size_bytes")?)?,
+            head_generation: from_pg(row.try_get("head_generation")?)?,
+            head_root_hash: row.try_get("head_root_hash")?,
+            head_root_object_id: row.try_get("head_root_object_id")?,
+            created_at: from_pg(row.try_get("created_at")?)?,
         })
     }
 }
@@ -652,6 +697,77 @@ fn decode_disk(row: &Row) -> AuthorityTxResult<DiskRecord> {
     let stored = DiskProjection::from_row(row)?;
     let record: DiskRecord = decode_json(row.try_get("record_json")?)?;
     if stored != DiskProjection::from_record(&record)? {
+        return Err(corrupt(()));
+    }
+    Ok(record)
+}
+
+/// Lock and strictly decode a live snapshot that protects this exact
+/// Disk/Volume pair. The JSON selectors make projection drift visible instead
+/// of letting a corrupt scalar move a snapshot out of the absence query.
+pub(super) fn load_any_disk_snapshot_for_update(
+    transaction: &mut Transaction<'_>,
+    disk_id: &Id,
+    volume_id: &Id,
+    size_bytes: u64,
+) -> AuthorityTxResult<Option<DiskSnapshotRecord>> {
+    let sql = format!(
+        "SELECT {DISK_SNAPSHOT_COLUMNS}
+           FROM disk_snapshot_records
+          WHERE disk_id=$1 OR volume_id=$2
+             OR record->>'disk_id'=$1 OR record->>'volume_id'=$2
+          ORDER BY snapshot_id
+          LIMIT 2
+          FOR UPDATE"
+    );
+    let rows = transaction.query(&sql, &[&disk_id.as_str(), &volume_id.as_str()])?;
+    let mut first = None;
+    for row in rows {
+        let record = decode_disk_snapshot(&row)?;
+        if record.disk_id != *disk_id
+            || record.volume_id != *volume_id
+            || record.size_bytes != size_bytes
+        {
+            return Err(corrupt(()));
+        }
+        first.get_or_insert(record);
+    }
+    Ok(first)
+}
+
+#[cfg(test)]
+pub(super) fn insert_disk_snapshot(
+    transaction: &mut Transaction<'_>,
+    record: &DiskSnapshotRecord,
+) -> AuthorityTxResult<()> {
+    let projection = DiskSnapshotProjection::from_record(record)?;
+    let json = encode_json(record)?;
+    let size_bytes = projection.size_bytes.to_pg().map_err(corrupt)?;
+    let head_generation = projection.head_generation.to_pg().map_err(corrupt)?;
+    let created_at = projection.created_at.to_pg().map_err(corrupt)?;
+    exactly_one(transaction.execute(
+        "INSERT INTO disk_snapshot_records (
+            snapshot_id, record, disk_id, volume_id, size_bytes,
+            head_generation, head_root_hash, head_root_object_id, created_at
+         ) VALUES ($1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9)",
+        &[
+            &projection.snapshot_id,
+            &json,
+            &projection.disk_id,
+            &projection.volume_id,
+            &size_bytes,
+            &head_generation,
+            &projection.head_root_hash,
+            &projection.head_root_object_id,
+            &created_at,
+        ],
+    )?)
+}
+
+fn decode_disk_snapshot(row: &Row) -> AuthorityTxResult<DiskSnapshotRecord> {
+    let stored = DiskSnapshotProjection::from_row(row)?;
+    let record: DiskSnapshotRecord = decode_json(row.try_get("record_json")?)?;
+    if stored != DiskSnapshotProjection::from_record(&record)? {
         return Err(corrupt(()));
     }
     Ok(record)
@@ -1113,6 +1229,14 @@ fn validate_disk(record: &DiskRecord) -> AuthorityTxResult<()> {
                 }
             }
         },
+    }
+    Ok(())
+}
+
+fn validate_disk_snapshot(record: &DiskSnapshotRecord) -> AuthorityTxResult<()> {
+    SizeBytes::new(record.size_bytes).map_err(corrupt)?;
+    if !remote_head_is_valid(&record.head) {
+        return Err(corrupt(()));
     }
     Ok(())
 }

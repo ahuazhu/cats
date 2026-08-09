@@ -370,6 +370,7 @@ const CONTROL_TABLES: &[&str] = &[
     "cat_records",
     "endpoint_records",
     "disk_records",
+    "disk_snapshot_records",
     "desired_runtime_specs",
     "hostname_desired_lookups",
     "runtime_operations",
@@ -609,6 +610,9 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             initialized_generation, initialized_root_hash,
             initialized_root_object_id, initialized_at
        FROM disk_records WHERE FALSE",
+    "SELECT snapshot_id, record, disk_id, volume_id, size_bytes,
+            head_generation, head_root_hash, head_root_object_id, created_at
+       FROM disk_snapshot_records WHERE FALSE",
     "SELECT cat_id, record, workspace_id, desired_revision, spec_digest,
             target, node_id, placement_epoch
        FROM desired_runtime_specs WHERE FALSE",
@@ -1121,6 +1125,29 @@ CREATE TABLE IF NOT EXISTS disk_records (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS disk_records_one_root_per_cat
 ON disk_records(root_cat_id) WHERE role_kind = 'root';
+CREATE TABLE IF NOT EXISTS disk_snapshot_records (
+    snapshot_id TEXT PRIMARY KEY,
+    record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
+    disk_id TEXT NOT NULL REFERENCES disk_records(disk_id),
+    volume_id TEXT NOT NULL REFERENCES volume_records(volume_id),
+    size_bytes BIGINT NOT NULL CHECK (size_bytes > 0),
+    head_generation BIGINT NOT NULL CHECK (head_generation >= 0),
+    head_root_hash TEXT,
+    head_root_object_id TEXT,
+    created_at BIGINT NOT NULL CHECK (created_at >= 0),
+    CHECK (
+        (head_generation = 0 AND head_root_hash IS NULL AND head_root_object_id IS NULL) OR
+        (head_generation > 0 AND head_root_hash IS NOT NULL AND head_root_object_id IS NOT NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS disk_snapshot_records_disk
+ON disk_snapshot_records(disk_id, snapshot_id);
+CREATE INDEX IF NOT EXISTS disk_snapshot_records_volume
+ON disk_snapshot_records(volume_id, snapshot_id);
+CREATE INDEX IF NOT EXISTS disk_snapshot_records_record_disk
+ON disk_snapshot_records((record->>'disk_id'), snapshot_id);
+CREATE INDEX IF NOT EXISTS disk_snapshot_records_record_volume
+ON disk_snapshot_records((record->>'volume_id'), snapshot_id);
 CREATE TABLE IF NOT EXISTS desired_runtime_specs (
     cat_id TEXT PRIMARY KEY,
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),

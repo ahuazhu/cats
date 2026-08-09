@@ -100,6 +100,20 @@ pub(crate) struct DiskRecord {
     pub(crate) role: DiskRole,
 }
 
+/// The single product and GC-live-root authority for a durable disk snapshot.
+/// Runtime transitions only read this row; the public create/delete/restore
+/// API remains a separate future slice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DiskSnapshotRecord {
+    pub(crate) snapshot_id: Id,
+    pub(crate) disk_id: Id,
+    pub(crate) volume_id: Id,
+    pub(crate) size_bytes: u64,
+    pub(crate) head: RemoteHead,
+    pub(crate) created_at: UnixMillis,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum DiskAdminState {
