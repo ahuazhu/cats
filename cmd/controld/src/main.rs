@@ -118,9 +118,8 @@ struct Args {
     object_store_options: Vec<String>,
     #[arg(long, env = "CATS_AUTH_TOKEN", default_value = "dev-service-token")]
     auth_token: String,
-    /// Canonical installed Guest runtime profile receipt. CLI takes precedence
-    /// over the matching environment variable; either source must name the
-    /// one production path.
+    /// Exact qualified Guest runtime release receipt. Production has one
+    /// immutable install path shared with Node registration and Cat placement.
     #[arg(
         long,
         env = "CATS_GUEST_RUNTIME_PROFILE_RECEIPT_FILE",
@@ -575,7 +574,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(task) = usage_projector_task {
         task.abort();
     }
-    handle.shutdown().await;
+    handle.shutdown().await?;
     println!("SHUTDOWN");
     Ok(())
 }

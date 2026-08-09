@@ -1,6 +1,9 @@
 use super::*;
 
-pub(super) async fn create_cat(
+/// Retired Cat-create authority retained only for the explicit pre-cutover
+/// integration router. Production dispatches the same method/path to the
+/// strict A23 adapter and can never call this handler.
+pub(super) async fn create_cat_legacy_for_tests(
     State(state): State<AppState>,
     Path(workspace): Path<String>,
     headers: HeaderMap,
@@ -28,7 +31,7 @@ pub(super) async fn create_cat(
             let extra = req
                 .disk
                 .as_ref()
-                .map(|d| (d.name.as_str(), d.size_bytes, d.mount_at.as_str()));
+                .map(|disk| (disk.name.as_str(), disk.size_bytes, disk.mount_at.as_str()));
             match idempotency_key {
                 Some(key) => store.create_cat_idempotent(
                     &workspace,

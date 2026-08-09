@@ -15,9 +15,9 @@ use cats_api::runtime_reconciliation::{
 
 use super::cat_create_service::{
     parse_authorized_cat_create, CatCreateHttpFields, CatCreateIdentitySource,
-    CatCreateManifestResolver, CatCreatePlacementMutation, CatCreatePlacementPlanner,
-    CatCreatePlan, CatCreatePlanRequest, CatCreateService, ServiceFuture, ValidatedImageManifest,
-    CAT_CREATE_MAX_BODY_BYTES, CAT_CREATE_TOTAL_DEADLINE,
+    CatCreateManifestResolver, CatCreatePlacementMutation, CatCreatePlacementOutcome,
+    CatCreatePlacementPlanner, CatCreatePlan, CatCreatePlanRequest, CatCreateService,
+    ServiceFuture, ValidatedImageManifest, CAT_CREATE_MAX_BODY_BYTES, CAT_CREATE_TOTAL_DEADLINE,
 };
 use super::placement_planner::PlacementTargetSnapshot;
 use super::product::CatRecord;
@@ -291,7 +291,7 @@ struct FakePlanner {
     admission: Mutex<PlacementAdmissionSnapshot>,
 }
 
-fn placement_policy(admission: &PlacementAdmissionSnapshot) -> NodePlacementPolicy {
+pub(crate) fn placement_policy(admission: &PlacementAdmissionSnapshot) -> NodePlacementPolicy {
     NodePlacementPolicy {
         version: ContractVersion::V1,
         node_id: admission.node_identity.node_id.clone(),
@@ -320,7 +320,7 @@ impl CatCreatePlacementPlanner for FakePlanner {
         &'a self,
         request: &'a CatCreatePlanRequest,
         _absolute_deadline: Instant,
-    ) -> ServiceFuture<'a, CatCreatePlan> {
+    ) -> ServiceFuture<'a, CatCreatePlacementOutcome> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         *self.last_request.lock().unwrap() = Some(request.clone());
         let network_id = if self.replace_network_id {
@@ -339,7 +339,7 @@ impl CatCreatePlacementPlanner for FakePlanner {
         let network_config =
             super::placement_planner::allocate_network_for_test(&policy, &network_id);
         Box::pin(async move {
-            Ok(CatCreatePlan {
+            Ok(CatCreatePlacementOutcome::Planned(CatCreatePlan {
                 target: PlacementTargetSnapshot {
                     policy,
                     admission,
@@ -353,7 +353,7 @@ impl CatCreatePlacementPlanner for FakePlanner {
                     memory_bytes: request.memory_bytes,
                     network_config,
                 },
-            })
+            }))
         })
     }
 }
@@ -364,6 +364,25 @@ struct SequentialIdentities(AtomicU64);
 impl CatCreateIdentitySource for SequentialIdentities {
     fn random_id(&self) -> Result<RandomId128> {
         let value = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(RandomId128::new(format!("{value:032x}")).unwrap())
+    }
+}
+
+struct PausingIdentities {
+    next: AtomicU64,
+    batch_ready: Mutex<Option<mpsc::Sender<()>>>,
+    release_batch: Mutex<mpsc::Receiver<()>>,
+}
+
+impl CatCreateIdentitySource for PausingIdentities {
+    fn random_id(&self) -> Result<RandomId128> {
+        let value = self.next.fetch_add(1, Ordering::SeqCst) + 1;
+        if value == 9 {
+            if let Some(ready) = self.batch_ready.lock().unwrap().take() {
+                ready.send(()).unwrap();
+            }
+            self.release_batch.lock().unwrap().recv().unwrap();
+        }
         Ok(RandomId128::new(format!("{value:032x}")).unwrap())
     }
 }
@@ -662,7 +681,7 @@ fn candidate_collision_is_retryable_and_the_same_key_uses_a_fresh_whole_batch() 
     let first = runtime
         .block_on(service.create(ingress(&workspace, "app", "same-key")))
         .unwrap_err();
-    assert_eq!(first.code, cats_api::error::ErrorCode::Unavailable);
+    assert_eq!(first.error_code(), cats_api::error::ErrorCode::Unavailable);
     let result_rows: i64 = store
         .with(|client| {
             client
@@ -689,6 +708,9 @@ fn pre_commit_deadline_waits_for_rollback_and_leaves_no_cached_result() {
     let url = crate::testsupport::isolated_control_store_url();
     let (runtime, store, workspace, _manifests, _planner, service) =
         service_fixture_at(&url, "a23-precommit-deadline");
+    store
+        .with(|client| client.batch_execute("SET statement_timeout='8s'; SET lock_timeout='8s'"))
+        .unwrap();
     let mut blocker = postgres::Client::connect(&url, postgres::NoTls).unwrap();
     let mut blocker_tx = blocker.transaction().unwrap();
     blocker_tx
@@ -702,7 +724,10 @@ fn pre_commit_deadline_waits_for_rollback_and_leaves_no_cached_result() {
         .unwrap();
 
     let headers_received_at = Instant::now()
-        .checked_sub(CAT_CREATE_TOTAL_DEADLINE - Duration::from_millis(500))
+        // Leave enough time for the shared bounded Store executor under the
+        // full parallel suite. The test-only session timeouts above remain
+        // longer, so the service's PRE_COMMIT cancellation is the cause.
+        .checked_sub(CAT_CREATE_TOTAL_DEADLINE - Duration::from_secs(6))
         .unwrap();
     let error = runtime
         .block_on(service.create(ingress_with_size_at(
@@ -713,7 +738,7 @@ fn pre_commit_deadline_waits_for_rollback_and_leaves_no_cached_result() {
             headers_received_at,
         )))
         .unwrap_err();
-    assert_eq!(error.code, cats_api::error::ErrorCode::Unavailable);
+    assert_eq!(error.error_code(), cats_api::error::ErrorCode::Unavailable);
     drop(blocker_tx);
 
     let counts: (i64, i64) = store
@@ -804,7 +829,7 @@ fn definite_commit_retry_reenters_the_absolute_deadline() {
             headers_received_at,
         )))
         .unwrap_err();
-    assert_eq!(error.code, cats_api::error::ErrorCode::Unavailable);
+    assert_eq!(error.error_code(), cats_api::error::ErrorCode::Unavailable);
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "a definite commit retry ignored the original absolute deadline"
@@ -898,14 +923,108 @@ fn committed_owner_survives_handler_abort_and_shutdown_waits_for_resolution() {
             .unwrap()
             .unwrap();
 
-        let replay = service
+        let rejected = service
             .create(ingress(&workspace, "app", "owner-abort"))
             .await
-            .unwrap();
-        assert_eq!(replay.http_status, 202);
+            .unwrap_err();
+        assert!(matches!(
+            rejected,
+            super::cat_create_service::CatCreateServiceError::TemporarilyUnavailable
+        ));
     });
     assert_eq!(manifests.calls.load(Ordering::SeqCst), 1);
     assert_eq!(planner.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn queued_pre_commit_owner_is_cancelled_when_its_handler_is_aborted() {
+    let (runtime, store, workspace, manifests, planner, _service) =
+        service_fixture("a23-queued-pre-owner-abort");
+    let (batch_ready_tx, batch_ready_rx) = mpsc::channel();
+    let (release_batch_tx, release_batch_rx) = mpsc::channel();
+    let service = Arc::new(
+        CatCreateService::new(
+            store.clone(),
+            manifests,
+            planner,
+            Arc::new(PausingIdentities {
+                next: AtomicU64::new(0),
+                batch_ready: Mutex::new(Some(batch_ready_tx)),
+                release_batch: Mutex::new(release_batch_rx),
+            }),
+            &release_receipt(),
+        )
+        .unwrap(),
+    );
+    let handler = runtime.spawn({
+        let service = Arc::clone(&service);
+        let request = ingress(&workspace, "app", "queued-pre-abort");
+        async move { service.create(request).await }
+    });
+    batch_ready_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("the request must finish its fresh identity batch");
+
+    // Hold this exact Store's one-connection lane only after fast replay has
+    // missed. Releasing the ninth identity then lets this request plan and
+    // register its PRE_COMMIT owner behind that bounded lane without starving
+    // unrelated Store instances in concurrently running tests.
+    let (blocker_started_tx, blocker_started_rx) = mpsc::channel();
+    let (release_blocker_tx, release_blocker_rx) = mpsc::channel();
+    let blocker = runtime.spawn({
+        let store = Arc::clone(&store);
+        async move {
+            store
+                .execute(move |_| {
+                    blocker_started_tx.send(()).unwrap();
+                    release_blocker_rx.recv().unwrap();
+                    Ok(())
+                })
+                .await
+        }
+    });
+    blocker_started_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("the same-Store lane blocker must start");
+    release_batch_tx.send(()).unwrap();
+    let registered = Instant::now();
+    while service.active_commit_resolutions() != 1 {
+        assert!(registered.elapsed() < Duration::from_secs(3));
+        std::thread::yield_now();
+    }
+    assert!(!handler.is_finished());
+    handler.abort();
+    assert!(runtime.block_on(handler).unwrap_err().is_cancelled());
+
+    // The commit owner must observe the dropped request token and remove its
+    // still-queued Store operation. Shutdown therefore resolves while the
+    // connection lane remains blocked; releasing it is not part of the oracle.
+    runtime
+        .block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                service.shutdown_commit_resolutions(),
+            )
+            .await
+        })
+        .expect("queued PRE_COMMIT ownership must resolve without a Store worker")
+        .unwrap();
+
+    release_blocker_tx.send(()).unwrap();
+    runtime.block_on(blocker).unwrap().unwrap();
+    let counts: (i64, i64) = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT
+                        (SELECT count(*) FROM cat_records),
+                        (SELECT count(*) FROM api_idempotency_results)",
+                    &[],
+                )
+                .map(|row| (row.get(0), row.get(1)))
+        })
+        .unwrap();
+    assert_eq!(counts, (0, 0));
 }
 
 #[test]
@@ -923,7 +1042,7 @@ fn fast_replay_lookup_lock_timeout_is_unavailable_and_has_no_side_effect() {
     let error = runtime
         .block_on(service.create(ingress(&workspace, "app", "locked-fast-lookup")))
         .unwrap_err();
-    assert_eq!(error.code, cats_api::error::ErrorCode::Unavailable);
+    assert_eq!(error.error_code(), cats_api::error::ErrorCode::Unavailable);
     assert!(
         started.elapsed() < Duration::from_secs(4),
         "the configured PostgreSQL lock timeout did not bound fast replay lookup"

@@ -595,7 +595,7 @@ fn accepted<T>(outcome: RuntimeSpineOutcome<T>) -> T {
     }
 }
 
-pub(super) fn establish_empty_admission(
+pub(crate) fn establish_empty_admission(
     store: &Store,
     release: &GuestRuntimeProfileReceipt,
 ) -> super::runtime_spine::PlacementAdmissionSnapshot {
@@ -692,6 +692,9 @@ fn covered_error_code(error: super::product::CoveredCatCreateError) -> cats_api:
         super::product::CoveredCatCreateError::Store(error) => error.code,
         super::product::CoveredCatCreateError::CandidateCollision(_) => {
             cats_api::error::ErrorCode::Internal
+        }
+        super::product::CoveredCatCreateError::PlacementStale => {
+            cats_api::error::ErrorCode::Unavailable
         }
     }
 }

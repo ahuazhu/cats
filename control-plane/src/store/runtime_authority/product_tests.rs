@@ -636,6 +636,9 @@ fn error_code(error: CoveredCatCreateError) -> ErrorCode {
         CoveredCatCreateError::CandidateCollision(kind) => {
             panic!("expected Store error, observed candidate collision {kind:?}")
         }
+        CoveredCatCreateError::PlacementStale => {
+            panic!("expected Store error, observed placement stale")
+        }
     }
 }
 
@@ -645,6 +648,7 @@ fn into_api_error(error: CoveredCatCreateError) -> cats_api::error::ApiError {
         CoveredCatCreateError::CandidateCollision(kind) => {
             internal(format!("unexpected candidate collision in test: {kind:?}"))
         }
+        CoveredCatCreateError::PlacementStale => internal("unexpected placement stale in test"),
     }
 }
 

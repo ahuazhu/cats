@@ -34,7 +34,7 @@ pub(crate) mod volume_transition_auth;
 pub(crate) mod volume_transition_evidence;
 
 #[cfg(test)]
-mod cat_create_service_tests;
+pub(crate) mod cat_create_service_tests;
 
 #[cfg(test)]
 mod product_tests;
@@ -46,7 +46,7 @@ mod placement_policy_tests;
 mod placement_planner_tests;
 
 #[cfg(test)]
-mod runtime_spine_tests;
+pub(crate) mod runtime_spine_tests;
 
 #[cfg(test)]
 mod tests;

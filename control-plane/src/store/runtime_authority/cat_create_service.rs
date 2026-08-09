@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cats_api::error::ApiError;
+use cats_api::error::{ApiError, ErrorCode};
 use cats_api::runtime_reconciliation::{
     encode_admission_inventory_attestation, encode_agent_session, encode_desired_runtime_spec,
     encode_node_identity, encode_node_observation, encode_node_placement_policy,
@@ -277,6 +277,13 @@ pub(crate) struct CatCreatePlan {
     pub(crate) mutation: CatCreatePlacementMutation,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CatCreatePlacementOutcome {
+    Planned(CatCreatePlan),
+    Unavailable,
+    CandidateIdentityCollision,
+}
+
 /// The implementation must select only from current AgentSessions plus fresh
 /// full admission inventory. The plan is deliberately a complete typed
 /// binding, not `capacity_ok` or `network_ok` booleans.
@@ -285,7 +292,7 @@ pub(crate) trait CatCreatePlacementPlanner: Send + Sync {
         &'a self,
         request: &'a CatCreatePlanRequest,
         absolute_deadline: Instant,
-    ) -> ServiceFuture<'a, CatCreatePlan>;
+    ) -> ServiceFuture<'a, CatCreatePlacementOutcome>;
 }
 
 pub(crate) trait CatCreateIdentitySource: Send + Sync {
@@ -340,6 +347,45 @@ pub(crate) struct CatCreateHttpResult {
     pub(crate) response_body: Vec<u8>,
 }
 
+#[derive(Debug)]
+pub(crate) enum CatCreateServiceError {
+    Request(ApiError),
+    PlacementUnavailable,
+    TemporarilyUnavailable,
+    Fatal(ApiError),
+}
+
+impl CatCreateServiceError {
+    fn from_api(error: ApiError) -> Self {
+        match error.code {
+            ErrorCode::Unavailable | ErrorCode::DeadlineExceeded => Self::TemporarilyUnavailable,
+            ErrorCode::Internal => Self::Fatal(error),
+            _ => Self::Request(error),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn error_code(&self) -> ErrorCode {
+        match self {
+            Self::Request(error) | Self::Fatal(error) => error.code,
+            Self::PlacementUnavailable | Self::TemporarilyUnavailable => ErrorCode::Unavailable,
+        }
+    }
+}
+
+impl From<ApiError> for CatCreateServiceError {
+    fn from(error: ApiError) -> Self {
+        Self::from_api(error)
+    }
+}
+
+#[derive(Debug)]
+enum CatCreateCommitOutcome {
+    Committed(ApiIdempotencyResult),
+    CandidateIdentityCollision,
+    PlacementStale,
+}
+
 pub(crate) struct CatCreateService {
     store: Arc<Store>,
     manifests: Arc<dyn CatCreateManifestResolver>,
@@ -347,6 +393,7 @@ pub(crate) struct CatCreateService {
     identities: Arc<dyn CatCreateIdentitySource>,
     guest_config_digest: Sha256Digest,
     commit_resolutions: Arc<CommitResolutionRegistry>,
+    admission: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Default)]
@@ -394,6 +441,7 @@ impl CatCreateService {
     ) -> Result<Self> {
         let guest_config_digest = guest_config_digest(active_release_receipt)
             .map_err(|_| ApiError::invalid("active Guest runtime profile receipt is invalid"))?;
+        let (admission, _) = tokio::sync::watch::channel(true);
         Ok(Self {
             store,
             manifests,
@@ -401,15 +449,20 @@ impl CatCreateService {
             identities,
             guest_config_digest,
             commit_resolutions: Arc::new(CommitResolutionRegistry::default()),
+            admission,
         })
     }
 
     pub(crate) async fn create(
         &self,
         ingress: AuthorizedCatCreateIngress,
-    ) -> Result<CatCreateHttpResult> {
+    ) -> std::result::Result<CatCreateHttpResult, CatCreateServiceError> {
+        let shutdown = self.admission.subscribe();
+        if !*shutdown.borrow() {
+            return Err(CatCreateServiceError::TemporarilyUnavailable);
+        }
         let absolute_deadline = ingress.absolute_deadline;
-        self.create_before_deadline(ingress, absolute_deadline)
+        self.create_before_deadline(ingress, absolute_deadline, shutdown)
             .await
     }
 
@@ -417,14 +470,16 @@ impl CatCreateService {
         &self,
         ingress: AuthorizedCatCreateIngress,
         absolute_deadline: Instant,
-    ) -> Result<CatCreateHttpResult> {
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> std::result::Result<CatCreateHttpResult, CatCreateServiceError> {
         let fast_request = ingress.idempotency.clone();
         if let Some(result) = await_cat_create_before_deadline(
             absolute_deadline,
             self.store
                 .execute(move |store| store.cat_create_result_fast_lookup(&fast_request)),
         )
-        .await?
+        .await
+        .map_err(CatCreateServiceError::from_api)?
         {
             return Ok(http_result(result));
         }
@@ -433,22 +488,27 @@ impl CatCreateService {
             absolute_deadline,
             self.manifests.resolve(&ingress.request.boot_image_digest),
         )
-        .await?;
+        .await
+        .map_err(CatCreateServiceError::from_api)?;
         if manifest.boot_image_digest != ingress.request.boot_image_digest {
-            return Err(ApiError::internal(
+            return Err(CatCreateServiceError::Fatal(ApiError::internal(
                 "image manifest resolver returned a different digest",
-            ));
+            )));
         }
-        let root_size_bytes = rounded_root_size(ingress.request.root_size_bytes)?;
+        let root_size_bytes = rounded_root_size(ingress.request.root_size_bytes)
+            .map_err(CatCreateServiceError::from_api)?;
         if root_size_bytes < manifest.size_bytes {
-            return Err(ApiError::invalid(
+            return Err(CatCreateServiceError::Request(ApiError::invalid(
                 "root_size_bytes is smaller than the immutable image manifest",
-            ));
+            )));
         }
 
-        let identities = CatCreateIdentities::generate(self.identities.as_ref())?;
-        let cat_id = prefixed_id("cat_", &identities.cat)?;
-        let network_id = prefixed_id("net_", &identities.network)?;
+        let identities = CatCreateIdentities::generate(self.identities.as_ref())
+            .map_err(CatCreateServiceError::from_api)?;
+        let cat_id =
+            prefixed_id("cat_", &identities.cat).map_err(CatCreateServiceError::from_api)?;
+        let network_id =
+            prefixed_id("net_", &identities.network).map_err(CatCreateServiceError::from_api)?;
         let plan_request = CatCreatePlanRequest {
             cat_id,
             vcpus: ingress.request.vcpus,
@@ -459,12 +519,23 @@ impl CatCreateService {
             guest_config_digest: self.guest_config_digest.clone(),
             network_id: network_id.clone(),
         };
-        let plan = await_cat_create_before_deadline(
+        let plan = match await_cat_create_before_deadline(
             absolute_deadline,
             self.planner.plan(&plan_request, absolute_deadline),
         )
-        .await?;
-        validate_plan_evidence(&plan, &plan_request, &self.guest_config_digest)?;
+        .await
+        .map_err(CatCreateServiceError::from_api)?
+        {
+            CatCreatePlacementOutcome::Planned(plan) => plan,
+            CatCreatePlacementOutcome::Unavailable => {
+                return Err(CatCreateServiceError::PlacementUnavailable);
+            }
+            CatCreatePlacementOutcome::CandidateIdentityCollision => {
+                return Err(CatCreateServiceError::TemporarilyUnavailable);
+            }
+        };
+        validate_plan_evidence(&plan, &plan_request, &self.guest_config_digest)
+            .map_err(CatCreateServiceError::from_api)?;
         let planned_target = plan.target.clone();
         let planned_mutation = plan.mutation.clone();
         let guest_config_digest = self.guest_config_digest.clone();
@@ -474,7 +545,8 @@ impl CatCreateService {
             plan,
             guest_config_digest.clone(),
             root_size_bytes,
-        )?;
+        )
+        .map_err(CatCreateServiceError::from_api)?;
         let resolution_request = covered.idempotency.clone();
         let (commit_cancellation, commit_state) =
             CatCreateCommitCancellation::new(absolute_deadline);
@@ -491,21 +563,13 @@ impl CatCreateService {
         tokio::spawn(async move {
             let execution_store = Arc::clone(&store);
             let execution = execution_store.execute(move |store| {
-                match store.create_cat_covered_with_placement(
+                Ok(store.create_cat_covered_with_placement(
                     &covered,
                     &planned_target,
                     &planned_mutation,
                     &guest_config_digest,
                     &commit_state,
-                ) {
-                    Ok(result) => Ok(result),
-                    Err(CoveredCatCreateError::CandidateCollision(_)) => {
-                        Err(ApiError::unavailable(
-                            "Cat create candidate identity collided; retry with a fresh whole batch",
-                        ))
-                    }
-                    Err(CoveredCatCreateError::Store(error)) => Err(error),
-                }
+                ))
             });
             tokio::pin!(execution);
             let execution_outcome = tokio::select! {
@@ -520,10 +584,21 @@ impl CatCreateService {
                 }
             };
             let outcome = match execution_outcome {
-                Err(error) if commit_observer.commit_was_sent() => {
-                    resolve_cat_create_commit_loop(store, resolution_request, error).await
+                Ok(Ok(result)) => Ok(CatCreateCommitOutcome::Committed(result)),
+                Ok(Err(CoveredCatCreateError::CandidateCollision(_))) => {
+                    Ok(CatCreateCommitOutcome::CandidateIdentityCollision)
                 }
-                outcome => outcome,
+                Ok(Err(CoveredCatCreateError::PlacementStale)) => {
+                    Ok(CatCreateCommitOutcome::PlacementStale)
+                }
+                Ok(Err(CoveredCatCreateError::Store(error))) | Err(error)
+                    if commit_observer.commit_was_sent() =>
+                {
+                    resolve_cat_create_commit_loop(store, resolution_request, error)
+                        .await
+                        .map(CatCreateCommitOutcome::Committed)
+                }
+                Ok(Err(CoveredCatCreateError::Store(error))) | Err(error) => Err(error),
             };
             let _ = result_tx.send(outcome);
             drop(active);
@@ -539,7 +614,7 @@ impl CatCreateService {
                     // The atomic cancellation won against begin_commit. The
                     // worker may still be unwinding a bounded SQL call, but it
                     // can no longer publish any result or business row.
-                    return Err(ApiError::unavailable("Cat create deadline elapsed"));
+                    return Err(CatCreateServiceError::TemporarilyUnavailable);
                 }
                 // PostgreSQL commit has started. The result is no longer an
                 // ordinary timeout: await the registered owner, which retains
@@ -547,14 +622,33 @@ impl CatCreateService {
                 result_rx.await.map_err(|_| {
                     ApiError::internal("Cat create commit owner stopped without a result")
                 })?
+            },
+            () = wait_for_shutdown(&mut shutdown) => {
+                if commit_cancellation.cancel_before_commit() {
+                    return Err(CatCreateServiceError::TemporarilyUnavailable);
+                }
+                result_rx.await.map_err(|_| {
+                    ApiError::internal("Cat create commit owner stopped without a result")
+                })?
             }
         };
-        let result = outcome?;
-        Ok(http_result(result))
+        match outcome.map_err(CatCreateServiceError::from_api)? {
+            CatCreateCommitOutcome::Committed(result) => Ok(http_result(result)),
+            CatCreateCommitOutcome::CandidateIdentityCollision => {
+                Err(CatCreateServiceError::TemporarilyUnavailable)
+            }
+            CatCreateCommitOutcome::PlacementStale => {
+                Err(CatCreateServiceError::PlacementUnavailable)
+            }
+        }
     }
 
-    #[allow(dead_code, reason = "used by the Cat-create HTTP composition shutdown")]
+    pub(crate) fn begin_shutdown(&self) {
+        self.admission.send_replace(false);
+    }
+
     pub(crate) async fn shutdown_commit_resolutions(&self) -> Result<()> {
+        self.begin_shutdown();
         tokio::time::timeout(
             CAT_CREATE_RESOLUTION_SHUTDOWN_DEADLINE,
             self.commit_resolutions.wait_empty(),
@@ -568,6 +662,24 @@ impl CatCreateService {
                     .load(std::sync::atomic::Ordering::Acquire)
             ))
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn active_commit_resolutions(&self) -> usize {
+        self.commit_resolutions
+            .active
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+async fn wait_for_shutdown(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+    if !*shutdown.borrow() {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if !*shutdown.borrow() {
+            return;
+        }
     }
 }
 

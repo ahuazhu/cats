@@ -43,6 +43,7 @@ use crate::store::OciDeploymentClaim;
 mod accounts;
 mod agent_registration;
 mod billing;
+mod cat_create_v2;
 mod cats;
 mod disks;
 mod endpoints;
@@ -55,6 +56,7 @@ mod usage;
 
 use accounts::*;
 use billing::*;
+use cat_create_v2::*;
 use cats::*;
 use disks::*;
 use endpoints::*;
@@ -67,6 +69,7 @@ use usage::*;
 pub(crate) use billing::enforce_exhausted_billing_accounts;
 pub use cats::ensure_running;
 
+#[derive(Debug)]
 pub struct Failure(pub ApiError);
 
 impl IntoResponse for Failure {
@@ -106,6 +109,14 @@ fn require_legacy_node_runtime_for_tests(state: &AppState) -> ApiResult<()> {
             ApiError::unavailable("operation is unavailable during the signed runtime cutover")
                 .into(),
         )
+    }
+}
+
+async fn readiness(State(state): State<AppState>) -> Response {
+    if state.readiness.is_ready() {
+        (StatusCode::OK, "ok").into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "unready").into_response()
     }
 }
 
@@ -426,15 +437,17 @@ async fn reject_legacy_authority(
 }
 
 pub fn router(state: AppState) -> Router {
+    let cat_create_route = if state.legacy_node_runtime_for_tests {
+        post(create_cat_legacy_for_tests)
+    } else {
+        post(create_cat_v2)
+    };
     // These handlers read or mutate the retired Cat/Operation/Node authority.
     // Keep them reachable only from the explicit pre-cutover test composition.
     // The production middleware runs before authentication, body extraction,
     // PostgreSQL access, idempotency writes, and outbound Node calls.
     let legacy_authority = Router::new()
-        .route(
-            "/v1/workspaces/{workspace}/cats",
-            post(create_cat).get(list_cats),
-        )
+        .route("/v1/workspaces/{workspace}/cats", get(list_cats))
         .route(
             "/v1/workspaces/{workspace}/cats/{cat}",
             get(get_cat).delete(delete_cat),
@@ -560,7 +573,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/session", get(crate::auth::session))
         .route("/auth/workspace", post(crate::auth::switch_workspace))
         .route("/auth/logout", get(crate::auth::logout))
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(readiness))
         .route("/v1/me", get(cli_me))
         .route("/v1/workspaces", get(list_workspaces))
         .route(
@@ -585,6 +598,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/accounts/{account}/members/{membership}",
             axum::routing::patch(update_account_member).delete(deactivate_account_member),
         )
+        .route("/v1/workspaces/{workspace}/cats", cat_create_route)
         .route(
             "/v1/workspaces/{workspace}/tokens",
             post(create_workspace_token).get(list_workspace_tokens),
@@ -707,6 +721,11 @@ mod tests {
             }
             cursor = end;
         }
+        assert!(
+            router.contains(".route(\"/v1/workspaces/{workspace}/cats\", cat_create_route)"),
+            "conditional Cat-create route is missing",
+        );
+        routes.push("POST /v1/workspaces/{workspace}/cats".to_string());
         routes.sort();
 
         let expected = r#"DELETE /v1/accounts/{account}/members/{membership}

@@ -444,6 +444,50 @@ fn default_workspace_id(cp: &Handle) -> String {
         .id
 }
 
+/// Lifecycle/controller tests still exercise the pre-A23 product model. The
+/// public POST route now has the strict Desired-runtime contract, so those
+/// fixtures create their legacy resource directly instead of weakening the
+/// production ingress with a compatibility parser.
+fn create_legacy_cat(
+    cp: &Handle,
+    name: &str,
+    idempotency_key: Option<&str>,
+) -> Result<CatOperationResponse, cats_api::error::ApiError> {
+    let workspace_id = default_workspace_id(cp);
+    let workspace = cp.state.store.workspace_scope(&workspace_id)?.workspace;
+    let route = format!("test legacy create {workspace_id}/{name}");
+    let (cat, _disks, operation) = match idempotency_key {
+        Some(key) => cp.state.store.create_cat_idempotent(
+            &workspace,
+            name,
+            "ubuntu-24.04",
+            2,
+            1024,
+            8 << 20,
+            true,
+            None,
+            None,
+            Default::default(),
+            key,
+            &route,
+        ),
+        None => cp.state.store.create_cat(
+            &workspace,
+            name,
+            "ubuntu-24.04",
+            2,
+            1024,
+            8 << 20,
+            true,
+            None,
+            None,
+            Default::default(),
+        ),
+    }?;
+    cp.state.notify.notify_one();
+    Ok(CatOperationResponse { operation, cat })
+}
+
 struct Ctx {
     _dir: tempfile::TempDir,
     config: Config,
@@ -645,24 +689,7 @@ impl Ctx {
     }
 
     async fn create_cat(&self, name: &str, idem: Option<&str>) -> CatOperationResponse {
-        let mut req = self
-            .http
-            .post(self.ws_url("/cats"))
-            .bearer_auth("dev-admin-token")
-            .json(&serde_json::json!({
-                "name": name,
-                "image": "ubuntu-24.04",
-                "cpus": 2,
-                "memory_mib": 1024,
-                "root_size_bytes": 8 << 20,
-                "disk": null
-            }));
-        if let Some(k) = idem {
-            req = req.header("Idempotency-Key", k);
-        }
-        let resp = req.send().await.unwrap();
-        assert_eq!(resp.status(), 202);
-        resp.json().await.unwrap()
+        create_legacy_cat(&self.cp, name, idem).unwrap()
     }
 
     async fn action(&self, name: &str, verb: &str) -> CatOperationResponse {
@@ -936,26 +963,9 @@ async fn create_converges_and_idempotency_replays() {
     // Same idempotency key: same operation, no duplicate cat.
     let replay = ctx.create_cat("dev", Some("key-1")).await;
     assert_eq!(replay.operation.id, created.operation.id);
-    // A different key with the same name conflicts.
-    let resp = ctx
-        .http
-        .post(ctx.ws_url("/cats"))
-        .bearer_auth("dev-admin-token")
-        .json(&CreateCatRequest {
-            name: "dev".into(),
-            image: "x".into(),
-            cpus: 1,
-            memory_mib: 256,
-            root_size_bytes: 4 << 20,
-            auto_suspend: true,
-            disk: None,
-            expires_at_unix: None,
-            durability: Default::default(),
-        })
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 409);
+    // A different key with the same name conflicts in the legacy fixture too.
+    let error = create_legacy_cat(&ctx.cp, "dev", Some("different-key")).unwrap_err();
+    assert_eq!(error.code, cats_api::error::ErrorCode::AlreadyExists);
 
     // Unauthenticated requests are rejected.
     let resp = ctx.http.get(ctx.ws_url("/cats")).send().await.unwrap();
@@ -997,34 +1007,16 @@ async fn two_api_replicas_linearize_create_start_and_delete() {
     let workspace_id = default_workspace_id(&first);
     let http = reqwest::Client::new();
     let cats_path = format!("/v1/workspaces/{workspace_id}/cats");
-    let request = serde_json::json!({
-        "name": "replicated",
-        "image": "ubuntu-24.04",
-        "cpus": 2,
-        "memory_mib": 1024,
-        "root_size_bytes": 8 << 20,
-        "disk": null
+    let (created_first, created_second) = std::thread::scope(|scope| {
+        let first_create =
+            scope.spawn(|| create_legacy_cat(&first, "replicated", Some("replica-create")));
+        let second_create =
+            scope.spawn(|| create_legacy_cat(&second, "replicated", Some("replica-create")));
+        (
+            first_create.join().unwrap().unwrap(),
+            second_create.join().unwrap().unwrap(),
+        )
     });
-
-    let create_first = http
-        .post(format!("{}{cats_path}", first.base_url()))
-        .bearer_auth("dev-admin-token")
-        .header("Idempotency-Key", "replica-create")
-        .json(&request)
-        .send();
-    let create_second = http
-        .post(format!("{}{cats_path}", second.base_url()))
-        .bearer_auth("dev-admin-token")
-        .header("Idempotency-Key", "replica-create")
-        .json(&request)
-        .send();
-    let (created_first, created_second) = tokio::join!(create_first, create_second);
-    let created_first = created_first.unwrap();
-    let created_second = created_second.unwrap();
-    assert_eq!(created_first.status(), StatusCode::ACCEPTED);
-    assert_eq!(created_second.status(), StatusCode::ACCEPTED);
-    let created_first: CatOperationResponse = created_first.json().await.unwrap();
-    let created_second: CatOperationResponse = created_second.json().await.unwrap();
     assert_eq!(created_first.cat.id, created_second.cat.id);
     assert_eq!(created_first.operation.id, created_second.operation.id);
     assert_eq!(first.state.store.list_cats(&workspace_id).unwrap().len(), 1);
@@ -1149,25 +1141,7 @@ async fn reconciler_handoff_replays_persisted_suspending_with_the_same_job() {
     let workspace_id = default_workspace_id(&first);
     let http = reqwest::Client::new();
     let cats_path = format!("/v1/workspaces/{workspace_id}/cats");
-    let created: CatOperationResponse = http
-        .post(format!("{}{cats_path}", first.base_url()))
-        .bearer_auth("dev-admin-token")
-        .json(&serde_json::json!({
-            "name": "handoff-suspend",
-            "image": "ubuntu-24.04",
-            "cpus": 2,
-            "memory_mib": 1024,
-            "root_size_bytes": 8 << 20,
-            "disk": null
-        }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let created = create_legacy_cat(&first, "handoff-suspend", None).unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let cat = first
@@ -1229,7 +1203,7 @@ async fn reconciler_handoff_replays_persisted_suspending_with_the_same_job() {
     // aborted. The node has already journaled success, so replaying the same
     // deterministic job returns without applying SuspendCat twice.
     let second = spawn(config).await.unwrap();
-    first.shutdown().await;
+    first.shutdown().await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let cat = second
@@ -1359,7 +1333,7 @@ async fn reconciler_handoff_replays_persisted_warming_success_once() {
     );
 
     let second = spawn(ctx.config.clone()).await.unwrap();
-    ctx.cp.shutdown().await;
+    ctx.cp.shutdown().await.unwrap();
     let converged = wait_for_persisted_transition(
         &second,
         &created.cat.id,
@@ -1412,7 +1386,7 @@ async fn reconciler_handoff_replays_persisted_stopping_success_once() {
     );
 
     let second = spawn(ctx.config.clone()).await.unwrap();
-    ctx.cp.shutdown().await;
+    ctx.cp.shutdown().await.unwrap();
     let converged = wait_for_persisted_transition(
         &second,
         &created.cat.id,
@@ -1464,7 +1438,7 @@ async fn reconciler_handoff_failed_warm_replay_restores_suspended_source() {
     );
 
     let second = spawn(ctx.config.clone()).await.unwrap();
-    ctx.cp.shutdown().await;
+    ctx.cp.shutdown().await.unwrap();
     let retained = wait_for_persisted_transition(
         &second,
         &created.cat.id,
@@ -1524,7 +1498,7 @@ async fn reconciler_handoff_failed_stop_replay_restores_running_source() {
     );
 
     let second = spawn(ctx.config.clone()).await.unwrap();
-    ctx.cp.shutdown().await;
+    ctx.cp.shutdown().await.unwrap();
     let retained = wait_for_persisted_transition(
         &second,
         &created.cat.id,
@@ -1570,7 +1544,7 @@ async fn reconciler_handoff_finishes_a_converged_operation_without_replaying_nod
     // before the matching operation did. Also seed an older operation, a
     // future-generation operation, and an operation whose Cat row is gone so
     // the recovery scan's generation and deletion boundaries are explicit.
-    ctx.cp.shutdown().await;
+    ctx.cp.shutdown().await.unwrap();
     let dsn = match &ctx.config.control_store_dsn {
         DsnSource::Literal(dsn) => dsn.clone(),
         DsnSource::File(_) => panic!("the PostgreSQL test harness must use a literal DSN"),
@@ -3172,7 +3146,7 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
     legacy_billing.billing_enforcement_enabled = true;
     let billing_error = match spawn_production(legacy_billing).await {
         Ok(handle) => {
-            handle.shutdown().await;
+            handle.shutdown().await.unwrap();
             panic!("production started the legacy Cat billing enforcer")
         }
         Err(error) => error,
@@ -3272,12 +3246,6 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
 
     let workspace_base = format!("{}/v1/workspaces/{workspace_id}", production.base_url());
     let closed = vec![
-        (
-            reqwest::Method::POST,
-            format!("{workspace_base}/cats"),
-            Some(serde_json::json!({"name": "must-not-create"})),
-            "invalid-before-cutover-gate",
-        ),
         (
             reqwest::Method::GET,
             format!("{workspace_base}/cats"),
@@ -3648,7 +3616,7 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
     drop(lease);
     let operation_before =
         serde_json::to_value(production.state.store.get_operation(&operation_id).unwrap()).unwrap();
-    production.shutdown().await;
+    production.shutdown().await.unwrap();
 
     let successor = spawn_production(config).await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -3658,7 +3626,7 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
         "production startup converged a legacy OCI row",
     );
     assert_eq!(outbound_calls.load(Ordering::SeqCst), 0);
-    successor.shutdown().await;
+    successor.shutdown().await.unwrap();
 }
 
 #[tokio::test]

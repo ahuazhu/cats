@@ -94,12 +94,14 @@ pub(super) enum AuthorityTransactionError {
     Domain(AuthorityError),
     Application(ApiError),
     CandidateCollision,
+    PlacementStale,
     Postgres(postgres::Error),
 }
 
 pub(super) enum AuthorityExecutionError {
     Store(ApiError),
     CandidateCollision,
+    PlacementStale,
 }
 
 impl From<AuthorityError> for AuthorityTransactionError {
@@ -124,6 +126,7 @@ enum AttemptFailure {
     Domain(AuthorityError),
     Application(ApiError),
     CandidateCollision,
+    PlacementStale,
     Postgres(postgres::Error),
     Commit(postgres::Error),
     Rollback(postgres::Error),
@@ -189,6 +192,9 @@ impl Store {
             Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
                 "unexpected candidate-collision marker outside a covered create",
             )),
+            Err(AuthorityExecutionError::PlacementStale) => Err(internal(
+                "unexpected placement-stale marker outside a covered create",
+            )),
         }
     }
 
@@ -210,6 +216,9 @@ impl Store {
             Err(AuthorityExecutionError::Store(error)) => Err(error),
             Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
                 "unexpected candidate-collision marker in an authority request",
+            )),
+            Err(AuthorityExecutionError::PlacementStale) => Err(internal(
+                "unexpected placement-stale marker in an authority request",
             )),
         }
     }
@@ -233,6 +242,9 @@ impl Store {
             Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
                 "unexpected candidate-collision marker in an authority read snapshot",
             )),
+            Err(AuthorityExecutionError::PlacementStale) => Err(internal(
+                "unexpected placement-stale marker in an authority read snapshot",
+            )),
         }
     }
 
@@ -255,6 +267,9 @@ impl Store {
             Err(AuthorityExecutionError::Store(error)) => Err(error),
             Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
                 "unexpected candidate-collision marker in a locking authority snapshot",
+            )),
+            Err(AuthorityExecutionError::PlacementStale) => Err(internal(
+                "unexpected placement-stale marker in a locking authority snapshot",
             )),
         }
     }
@@ -417,6 +432,10 @@ impl Store {
                         transaction.rollback().map_err(AttemptFailure::Rollback)?;
                         Err(AttemptFailure::CandidateCollision)
                     }
+                    Err(AuthorityTransactionError::PlacementStale) => {
+                        transaction.rollback().map_err(AttemptFailure::Rollback)?;
+                        Err(AttemptFailure::PlacementStale)
+                    }
                     Err(AuthorityTransactionError::Postgres(error)) => {
                         if let Err(rollback_error) = transaction.rollback() {
                             // A closed PostgreSQL session has already lost its
@@ -457,6 +476,10 @@ impl Store {
                 Err(AttemptFailure::CandidateCollision) => {
                     metrics::record_authority_outcome(metrics::AuthorityOutcome::DomainRejected);
                     return Err(AuthorityExecutionError::CandidateCollision);
+                }
+                Err(AttemptFailure::PlacementStale) => {
+                    metrics::record_authority_outcome(metrics::AuthorityOutcome::DomainRejected);
+                    return Err(AuthorityExecutionError::PlacementStale);
                 }
                 Err(AttemptFailure::Infrastructure(error)) => {
                     metrics::record_authority_outcome(metrics::AuthorityOutcome::BackendFailed);

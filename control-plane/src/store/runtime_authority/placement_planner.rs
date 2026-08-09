@@ -25,8 +25,8 @@ use postgres::Transaction;
 use sha2::{Digest as _, Sha256};
 
 use super::cat_create_service::{
-    CatCreatePlacementMutation, CatCreatePlacementPlanner, CatCreatePlan, CatCreatePlanRequest,
-    ServiceFuture,
+    CatCreatePlacementMutation, CatCreatePlacementOutcome, CatCreatePlacementPlanner,
+    CatCreatePlan, CatCreatePlanRequest, ServiceFuture,
 };
 use super::placement_policy::load_policy_unlocked;
 use super::product_rows::{load_assigned_desired_unlocked, load_desired_by_network_id_unlocked};
@@ -136,7 +136,7 @@ impl CatCreatePlacementPlanner for PostgresCatCreatePlacementPlanner {
         &'a self,
         request: &'a CatCreatePlanRequest,
         deadline: Instant,
-    ) -> ServiceFuture<'a, CatCreatePlan> {
+    ) -> ServiceFuture<'a, CatCreatePlacementOutcome> {
         let store = Arc::clone(&self.store);
         let request = request.clone();
         Box::pin(async move {
@@ -151,13 +151,15 @@ impl CatCreatePlacementPlanner for PostgresCatCreatePlacementPlanner {
                     .await
                     .map_err(|_| ApiError::unavailable("placement planning deadline elapsed"))??;
             match outcome {
-                CatCreatePlacementLoad::Planned(plan) => Ok(*plan),
-                CatCreatePlacementLoad::Unavailable { .. } => Err(ApiError::unavailable(
-                    "no runtime node can currently accept this Cat",
-                )),
-                CatCreatePlacementLoad::CandidateIdentityCollision => Err(ApiError::unavailable(
-                    "Cat create candidate identity collided; retry with a fresh whole batch",
-                )),
+                CatCreatePlacementLoad::Planned(plan) => {
+                    Ok(CatCreatePlacementOutcome::Planned(*plan))
+                }
+                CatCreatePlacementLoad::Unavailable { .. } => {
+                    Ok(CatCreatePlacementOutcome::Unavailable)
+                }
+                CatCreatePlacementLoad::CandidateIdentityCollision => {
+                    Ok(CatCreatePlacementOutcome::CandidateIdentityCollision)
+                }
             }
         })
     }

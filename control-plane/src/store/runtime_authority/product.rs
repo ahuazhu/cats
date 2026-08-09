@@ -300,6 +300,7 @@ pub(crate) enum CandidateCollision {
 #[allow(dead_code, reason = "consumed by the later HTTP/service cutover")]
 pub(crate) enum CoveredCatCreateError {
     CandidateCollision(CandidateCollision),
+    PlacementStale,
     Store(ApiError),
 }
 
@@ -485,6 +486,7 @@ impl CatCreateCommitState {
 enum CreateCatTransactionError {
     Authority(AuthorityTransactionError),
     CandidateCollision(CandidateCollision),
+    PlacementStale,
 }
 
 impl From<AuthorityTransactionError> for CreateCatTransactionError {
@@ -700,6 +702,9 @@ impl Store {
                         collision = Some(kind);
                         Err(AuthorityTransactionError::CandidateCollision)
                     }
+                    Err(CreateCatTransactionError::PlacementStale) => {
+                        Err(AuthorityTransactionError::PlacementStale)
+                    }
                 }
             },
             || {
@@ -716,6 +721,9 @@ impl Store {
                     "candidate-collision transaction lost its typed reason",
                 ))),
             },
+            Err(AuthorityExecutionError::PlacementStale) => {
+                Err(CoveredCatCreateError::PlacementStale)
+            }
             Err(AuthorityExecutionError::Store(error)) => Err(CoveredCatCreateError::Store(error)),
         }
     }
@@ -789,10 +797,7 @@ fn create_cat_in(
             &mut checkpoint,
         )? != PlacementCommitLoad::Accepted
         {
-            return Err(AuthorityTransactionError::from(ApiError::unavailable(
-                "placement plan changed before Cat create commit",
-            ))
-            .into());
+            return Err(CreateCatTransactionError::PlacementStale);
         }
     } else if let Some((planned, active_guest_digest)) = admission {
         if request.candidate.desired.placement.node_id != planned.node_identity.node_id

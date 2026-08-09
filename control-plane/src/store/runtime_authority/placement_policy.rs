@@ -864,6 +864,27 @@ pub(super) fn insert_policy_for_test(
 }
 
 #[cfg(test)]
+pub(crate) fn insert_policy_on_store_for_test(
+    store: &Store,
+    policy: &NodePlacementPolicy,
+) -> Result<()> {
+    store.authority_transaction(|transaction| insert_policy(transaction, policy))
+}
+
+#[cfg(test)]
+pub(crate) fn corrupt_policy_on_store_for_test(store: &Store) -> Result<()> {
+    store.with(|client| {
+        client
+            .execute(
+                "UPDATE runtime_node_placement_policies
+                    SET record='{}'::jsonb, policy_revision=policy_revision + 1",
+                &[],
+            )
+            .map(|_| ())
+    })
+}
+
+#[cfg(test)]
 pub(super) fn update_policy_for_test(
     transaction: &mut Transaction<'_>,
     current: &NodePlacementPolicy,

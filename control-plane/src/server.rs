@@ -102,8 +102,9 @@ pub struct Config {
     pub image_blob: Arc<dyn BlobStore>,
     /// Service credential used by node agents, gateways and controller jobs.
     pub auth_token: String,
-    /// Exact, startup-validated release receipt used to bind every new Agent
-    /// session. Production loads this from the one canonical installed path.
+    /// Exact, startup-validated release receipt from the active qualified
+    /// Guest runtime. It binds both new Agent sessions and Cat placement.
+    /// Production loads it from the one canonical installed path.
     pub guest_runtime_profile_receipt: GuestRuntimeProfileReceipt,
     /// Private-key authority for short-lived V1 Endpoint Route Grants. It is
     /// intentionally absent from Gateway and Node configuration.
@@ -149,12 +150,9 @@ pub struct AppState {
     pub usage: Arc<dyn UsageStore>,
     pub credits: Arc<dyn CreditStore>,
     pub storage_meta: Arc<dyn MetadataStore>,
-    #[allow(
-        dead_code,
-        reason = "F2d consumes the staged A21 resolver when the Cat-create route switches"
-    )]
-    pub(crate) image_manifests:
-        Arc<dyn crate::store::runtime_authority::cat_create_service::CatCreateManifestResolver>,
+    pub(crate) cat_create:
+        Arc<crate::store::runtime_authority::cat_create_service::CatCreateService>,
+    pub(crate) readiness: Arc<ReadinessLatch>,
     pub notify: Arc<tokio::sync::Notify>,
     pub controller: Arc<Controller>,
     pub cfg: Arc<Config>,
@@ -177,6 +175,23 @@ pub struct Handle {
     image_manifest_resolver: Arc<
         crate::store::runtime_authority::image_manifest_resolver::ImmutableImageManifestResolver,
     >,
+    server_shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+pub(crate) struct ReadinessLatch(std::sync::atomic::AtomicBool);
+
+impl ReadinessLatch {
+    fn new() -> Self {
+        Self(std::sync::atomic::AtomicBool::new(true))
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn poison(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl Handle {
@@ -184,8 +199,17 @@ impl Handle {
         format!("http://{}", self.addr)
     }
     fn begin_shutdown(&self) {
-        self.server_task.abort();
+        self.state.cat_create.begin_shutdown();
+        self.image_manifest_resolver.begin_shutdown();
         self.state.observation_store.begin_shutdown();
+        if let Some(shutdown) = self
+            .server_shutdown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = shutdown.send(());
+        }
         if let Some(task) = &self.reconciler_task {
             task.abort();
         }
@@ -194,15 +218,23 @@ impl Handle {
         }
     }
 
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
         // Stop accepting product work before waiting for the dedicated
         // blocking manifest lane. The resolver itself closes its queue and
         // bounds this wait by the provider transport deadline.
         self.begin_shutdown();
-        self.state.observation_store.shutdown().await;
-        if !self.image_manifest_resolver.shutdown().await {
+        let observation_store = self.state.observation_store.shutdown();
+        let commit_resolutions = self.state.cat_create.shutdown_commit_resolutions();
+        let manifest_reads = self.image_manifest_resolver.shutdown();
+        let (_, commit_result, manifest_result) =
+            tokio::join!(observation_store, commit_resolutions, manifest_reads);
+        if !manifest_result {
             tracing::warn!("image manifest reads exceeded the shutdown deadline");
         }
+        // Graceful shutdown has already stopped admission. Abort any unrelated
+        // long-lived HTTP connection after Cat commit ownership is resolved.
+        self.server_task.abort();
+        commit_result.map_err(anyhow::Error::from)
     }
 }
 
@@ -210,8 +242,8 @@ impl Drop for Handle {
     fn drop(&mut self) {
         // Drop cannot await. It still prevents new work and cancels async
         // roles; production's signal path calls the async shutdown above.
-        self.image_manifest_resolver.begin_shutdown();
         self.begin_shutdown();
+        self.server_task.abort();
     }
 }
 
@@ -497,6 +529,22 @@ async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow
             cfg.image_blob.clone(),
         ),
     );
+    let cat_create = Arc::new(
+        crate::store::runtime_authority::cat_create_service::CatCreateService::new(
+            store.clone(),
+            image_manifests.clone(),
+            Arc::new(
+                crate::store::runtime_authority::placement_planner::PostgresCatCreatePlacementPlanner::new(
+                    store.clone(),
+                ),
+            ),
+            Arc::new(
+                crate::store::runtime_authority::cat_create_service::UuidCatCreateIdentitySource,
+            ),
+            &cfg.guest_runtime_profile_receipt,
+        )?,
+    );
+    let readiness = Arc::new(ReadinessLatch::new());
     let notify = Arc::new(tokio::sync::Notify::new());
     let controller = Controller::new_with_liveness_authority(
         store.clone(),
@@ -517,7 +565,8 @@ async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow
         usage,
         credits,
         storage_meta,
-        image_manifests: image_manifests.clone(),
+        cat_create,
+        readiness,
         notify,
         controller: controller.clone(),
         cfg: cfg.clone(),
@@ -535,8 +584,14 @@ async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow
     } else {
         crate::api::router(state.clone())
     };
+    let (server_shutdown, server_shutdown_rx) = tokio::sync::oneshot::channel();
     let server_task = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
+        if let Err(e) = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = server_shutdown_rx.await;
+            })
+            .await
+        {
             tracing::error!("control plane server exited: {e}");
         }
     });
@@ -580,5 +635,6 @@ async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow
         reconciler_task,
         billing_enforcer_task,
         image_manifest_resolver: image_manifests,
+        server_shutdown: std::sync::Mutex::new(Some(server_shutdown)),
     })
 }
