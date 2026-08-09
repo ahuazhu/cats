@@ -15,6 +15,7 @@
 
 mod admission_port;
 mod checkpoint;
+mod clean_slate_probes;
 mod gate_planner;
 mod inventory;
 mod root_provision;
@@ -29,11 +30,15 @@ pub use admission_port::{
 pub use checkpoint::{
     runtime_checkpoint_path, CheckpointStoreError, FileCheckpointStore, StoredCheckpoint,
 };
+#[cfg(test)]
+pub(crate) use clean_slate_probes::{clean_slate_scanner_for_test, TestCleanSlateProbeConfig};
+pub(crate) use clean_slate_probes::{
+    installed_clean_slate_scanner, InstalledCleanSlateProbeConfig,
+};
 pub use gate_planner::{
     applied_desired_evidence, AppliedDesiredError, GateReconcileError, GateSequencer,
     GateTransitionResult, PersistTimes,
 };
-pub(crate) use inventory::unavailable_clean_slate_scanner;
 pub use inventory::{
     CleanSlateInventoryScanner, InventoryAbsence, InventoryAbsenceProbe, InventoryProbeSetError,
 };

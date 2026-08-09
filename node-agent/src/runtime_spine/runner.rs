@@ -145,6 +145,11 @@ impl RuntimeInventoryScanContext {
         &mut self.coordinates
     }
 
+    #[cfg(test)]
+    pub(crate) fn cancel_for_test(&self) {
+        self.cancellation.cancel();
+    }
+
     pub fn coordinates(&self) -> &RuntimeSpineFullScan {
         &self.coordinates
     }
@@ -1485,6 +1490,11 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct CountingDelegatingScanner {
+        calls: AtomicUsize,
+        inner: Arc<dyn RuntimeInventoryScanner>,
+    }
+
     struct IncompleteScanner;
 
     impl crate::runtime_spine::inventory_scanner_sealed::Sealed for IncompleteScanner {}
@@ -1637,6 +1647,18 @@ mod tests {
                     Vec::new(),
                 ),
             ))
+        }
+    }
+
+    impl crate::runtime_spine::inventory_scanner_sealed::Sealed for CountingDelegatingScanner {}
+
+    impl RuntimeInventoryScanner for CountingDelegatingScanner {
+        fn scan_complete(
+            &self,
+            context: RuntimeInventoryScanContext,
+        ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.scan_complete(context)
         }
     }
 
@@ -2485,12 +2507,41 @@ mod tests {
                 }),
             );
         let (origin, server) = spawn(app).await;
-        let scanner = Arc::new(EmptyScanner {
-            calls: AtomicUsize::new(0),
-        });
-        let scanner_port: Arc<dyn RuntimeInventoryScanner> = scanner.clone();
         let root = tempfile::tempdir().unwrap();
         let state = StateDirectory::unanchored(root.path().to_path_buf());
+        let proc_root = root.path().join("test-proc");
+        let systemd_root = root.path().join("test-system.slice");
+        let block_root = root.path().join("test-block");
+        let network_root = root.path().join("test-net");
+        let socket_root = root.path().join("test-sockets");
+        for directory in [
+            &proc_root,
+            &systemd_root,
+            &block_root,
+            &network_root,
+            &socket_root,
+        ] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let concrete = crate::runtime::reconciliation::clean_slate_scanner_for_test(
+            crate::runtime::reconciliation::TestCleanSlateProbeConfig {
+                state_directory: state.clone(),
+                proc_root,
+                systemd_cgroup_root: systemd_root,
+                block_class_root: block_root,
+                network_class_root: network_root,
+                legacy_socket_root: socket_root,
+                cloud_hypervisor_binary: root.path().join("bin/cloud-hypervisor"),
+                blockd_binary: root.path().join("bin/cats-blockd"),
+                guest_agent_binary: root.path().join("bin/cats-guest-agent"),
+            },
+        )
+        .unwrap();
+        let scanner = Arc::new(CountingDelegatingScanner {
+            calls: AtomicUsize::new(0),
+            inner: concrete,
+        });
+        let scanner_port: Arc<dyn RuntimeInventoryScanner> = scanner.clone();
         let registered = decode_agent_session(SESSION).unwrap();
         let client = RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap();
         let mut runner = RuntimeSpineRunner::new(
