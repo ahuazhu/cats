@@ -92,6 +92,14 @@ enum ExecutionOutcome {
     Evidence(VolumeTransitionStoreOutcome<VolumeTransitionEvidenceLoad>),
 }
 
+enum OwnedExecutionResult {
+    Executed(std::result::Result<ExecutionOutcome, cats_api::error::ApiError>),
+    IdentityNotEligible,
+    NodeRequestInFlight,
+    TemporarilyUnavailable,
+    Internal,
+}
+
 struct CancelRequestOnDrop(AuthorityRequestContext);
 
 impl Drop for CancelRequestOnDrop {
@@ -109,7 +117,12 @@ pub(super) async fn evidence(State(state): State<AppState>, request: Request<Bod
 }
 
 async fn handle(state: AppState, request: Request<Body>, route: Route) -> Response {
-    let deadline = Instant::now() + route.deadline();
+    let route_deadline = route.deadline();
+    #[cfg(test)]
+    let route_deadline = state
+        .runtime_volume_transition_service
+        .deadline_for_test(route_deadline);
+    let deadline = Instant::now() + route_deadline;
     let request_context = AuthorityRequestContext::new(deadline);
     let _cancel_on_drop = CancelRequestOnDrop(request_context.clone());
 
@@ -194,6 +207,12 @@ async fn handle(state: AppState, request: Request<Body>, route: Route) -> Respon
         Ok(permit) => permit,
         Err(_) => return temporarily_unavailable(),
     };
+    let Some(request_guard) = state
+        .runtime_volume_transition_service
+        .begin(request_context.clone())
+    else {
+        return temporarily_unavailable();
+    };
     let body = match tokio::time::timeout_at(
         tokio::time::Instant::from_std(deadline),
         to_bytes(request.into_body(), route.body_limit()),
@@ -209,7 +228,7 @@ async fn handle(state: AppState, request: Request<Body>, route: Route) -> Respon
             return contract_error_response(StatusCode::PAYLOAD_TOO_LARGE, body_limit_error(route));
         }
         Ok(Err(_)) => return internal_response(),
-        Err(_) => return temporarily_unavailable(),
+        Err(_) => return closed_response(),
     };
 
     let authenticated = match (
@@ -242,33 +261,6 @@ async fn handle(state: AppState, request: Request<Body>, route: Route) -> Respon
         },
     };
 
-    let store = state.store.clone();
-    let lookup_credential = authenticated.clone();
-    let node_id = match tokio::time::timeout_at(
-        tokio::time::Instant::from_std(deadline),
-        store.execute(move |store| store.resolve_runtime_node(&lookup_credential)),
-    )
-    .await
-    {
-        Ok(Ok(Some(node_id))) => node_id,
-        Ok(Ok(None)) => return identity_not_eligible(),
-        Ok(Err(error)) if transient(&error) => return temporarily_unavailable(),
-        Ok(Err(_)) => return internal_response(),
-        Err(_) => return temporarily_unavailable(),
-    };
-    let node_permit = match state.runtime_volume_transition_admission.try_node(&node_id) {
-        Ok(permit) => permit,
-        Err(_) => return node_request_in_flight(),
-    };
-    let Some(request_guard) = state.runtime_volume_transition_service.begin() else {
-        return temporarily_unavailable();
-    };
-    #[cfg(test)]
-    state
-        .runtime_volume_transition_service
-        .pause_after_admission_for_test()
-        .await;
-
     let operation_context = request_context.clone();
     let response_context = request_context.clone();
     let active_guest_digest = state
@@ -276,55 +268,104 @@ async fn handle(state: AppState, request: Request<Body>, route: Route) -> Respon
         .approved_guest_config_digest()
         .clone();
     let store = state.store.clone();
+    let admission = state.runtime_volume_transition_admission.clone();
+    #[cfg(test)]
+    let test_service = state.runtime_volume_transition_service.clone();
     let (send, mut receive) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let _request_guard = request_guard;
-        let _permits = (global_permit, node_permit);
-        let result = store
-            .execute(move |store| match decoded {
-                DecodedRequest::Mutation(request) => store
-                    .runtime_volume_transition(
-                        &authenticated,
-                        &request,
-                        &active_guest_digest,
-                        &operation_context,
-                    )
-                    .map(|outcome| ExecutionOutcome::Mutation(Box::new(outcome))),
-                DecodedRequest::Evidence(request) => store
-                    .runtime_volume_transition_evidence_with_context(
-                        &authenticated,
-                        &request,
-                        &active_guest_digest,
-                        &operation_context,
-                    )
-                    .map(ExecutionOutcome::Evidence),
+        let _global_permit = global_permit;
+        let mut node_permit = None;
+        #[cfg(test)]
+        test_service.pause_before_node_resolution_for_test().await;
+        let lookup_credential = authenticated.clone();
+        let lookup_context = operation_context.clone();
+        let resolved = store
+            .execute(move |store| {
+                store.resolve_runtime_node_for_request(&lookup_credential, &lookup_context)
             })
             .await;
-        let _ = send.send(result);
-    });
+        let result = match resolved {
+            Ok(Some(node_id)) => match admission.try_node(&node_id) {
+                Ok(permit) => {
+                    node_permit = Some(permit);
+                    #[cfg(test)]
+                    test_service.pause_after_admission_for_test().await;
+                    let store_context = operation_context.clone();
+                    OwnedExecutionResult::Executed(
+                        store
+                            .execute(move |store| match decoded {
+                                DecodedRequest::Mutation(request) => store
+                                    .runtime_volume_transition(
+                                        &authenticated,
+                                        &request,
+                                        &active_guest_digest,
+                                        &store_context,
+                                    )
+                                    .map(|outcome| ExecutionOutcome::Mutation(Box::new(outcome))),
+                                DecodedRequest::Evidence(request) => store
+                                    .runtime_volume_transition_evidence_with_context(
+                                        &authenticated,
+                                        &request,
+                                        &active_guest_digest,
+                                        &store_context,
+                                    )
+                                    .map(ExecutionOutcome::Evidence),
+                            })
+                            .await,
+                    )
+                }
+                Err(_) => OwnedExecutionResult::NodeRequestInFlight,
+            },
+            Ok(None) => OwnedExecutionResult::IdentityNotEligible,
+            Err(error) if transient(&error) => OwnedExecutionResult::TemporarilyUnavailable,
+            Err(_) => OwnedExecutionResult::Internal,
+        };
 
-    let result =
-        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut receive).await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                request_context.cancel();
-                let joined = receive.await;
-                return if response_context.commit_was_attempted() {
-                    ambiguous_commit_response()
+        let response = if response_context.is_cancelled_or_expired() {
+            closed_response()
+        } else {
+            #[cfg(test)]
+            test_service.pause_response_encoding_for_test().await;
+            if response_context.is_cancelled_or_expired() {
+                closed_response()
+            } else {
+                let response = owned_execution_response(result, &response_context);
+                if response_context.is_cancelled_or_expired() {
+                    closed_response()
                 } else {
-                    match joined {
-                        Ok(_) | Err(_) => temporarily_unavailable(),
-                    }
-                };
+                    response
+                }
             }
         };
-    let result = match result {
-        Ok(result) => result,
-        Err(_) => return internal_response(),
-    };
-    let response = match result {
-        Ok(ExecutionOutcome::Mutation(outcome)) => match *outcome {
+        let _node_permit = node_permit;
+        let _ = send.send(response);
+    });
+
+    let response =
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut receive).await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => return closed_response(),
+            Err(_) => {
+                request_context.cancel();
+                let _ = receive.await;
+                return closed_response();
+            }
+        };
+    if request_context.is_cancelled_or_expired() {
+        closed_response()
+    } else {
+        response
+    }
+}
+
+fn owned_execution_response(
+    result: OwnedExecutionResult,
+    response_context: &AuthorityRequestContext,
+) -> Response {
+    match result {
+        OwnedExecutionResult::Executed(Ok(ExecutionOutcome::Mutation(outcome))) => match *outcome {
             VolumeTransitionStoreOutcome::Accepted(success) => {
                 match encode_runtime_volume_transition_success(&success) {
                     Ok(body) => success_response(body),
@@ -333,34 +374,38 @@ async fn handle(state: AppState, request: Request<Body>, route: Route) -> Respon
             }
             VolumeTransitionStoreOutcome::Rejected(rejection) => rejection_response(rejection),
         },
-        Ok(ExecutionOutcome::Evidence(VolumeTransitionStoreOutcome::Accepted(
-            VolumeTransitionEvidenceLoad::Available(success),
+        OwnedExecutionResult::Executed(Ok(ExecutionOutcome::Evidence(
+            VolumeTransitionStoreOutcome::Accepted(VolumeTransitionEvidenceLoad::Available(
+                success,
+            )),
         ))) => match encode_runtime_volume_transition_evidence_success(&success) {
             Ok(body) => success_response(body),
             Err(_) => internal_response(),
         },
-        Ok(ExecutionOutcome::Evidence(VolumeTransitionStoreOutcome::Accepted(
-            VolumeTransitionEvidenceLoad::Unavailable { authorization_id },
+        OwnedExecutionResult::Executed(Ok(ExecutionOutcome::Evidence(
+            VolumeTransitionStoreOutcome::Accepted(VolumeTransitionEvidenceLoad::Unavailable {
+                authorization_id,
+            }),
         ))) => encoded_error_response(
             StatusCode::NOT_FOUND,
             authorization_evidence_unavailable(authorization_id),
             &[],
         ),
-        Ok(ExecutionOutcome::Evidence(VolumeTransitionStoreOutcome::Rejected(rejection))) => {
-            rejection_response(rejection)
+        OwnedExecutionResult::Executed(Ok(ExecutionOutcome::Evidence(
+            VolumeTransitionStoreOutcome::Rejected(rejection),
+        ))) => rejection_response(rejection),
+        OwnedExecutionResult::Executed(Err(_)) if response_context.commit_was_attempted() => {
+            closed_response()
         }
-        Err(_error) if response_context.commit_was_attempted() => ambiguous_commit_response(),
-        Err(error) if transient(&error) => temporarily_unavailable(),
-        Err(_) => internal_response(),
-    };
-    if Instant::now() >= deadline {
-        if response_context.commit_was_attempted() {
-            ambiguous_commit_response()
-        } else {
+        OwnedExecutionResult::Executed(Err(error)) if transient(&error) => {
             temporarily_unavailable()
         }
-    } else {
-        response
+        OwnedExecutionResult::Executed(Err(_)) | OwnedExecutionResult::Internal => {
+            internal_response()
+        }
+        OwnedExecutionResult::IdentityNotEligible => identity_not_eligible(),
+        OwnedExecutionResult::NodeRequestInFlight => node_request_in_flight(),
+        OwnedExecutionResult::TemporarilyUnavailable => temporarily_unavailable(),
     }
 }
 
@@ -525,11 +570,11 @@ fn internal_response() -> Response {
     )
 }
 
-fn ambiguous_commit_response() -> Response {
+fn closed_response() -> Response {
     let stream = futures_util::stream::once(async {
         Err::<&'static [u8], io::Error>(io::Error::new(
             io::ErrorKind::ConnectionAborted,
-            "runtime volume transition commit outcome is unknown",
+            "runtime volume transition response is intentionally closed",
         ))
     });
     Response::builder()
@@ -775,6 +820,200 @@ mod tests {
         fn signed(&self, node: &TestNode, path: &str, body: Vec<u8>) -> reqwest::RequestBuilder {
             self.signed_with(&node.signer, path, body)
         }
+    }
+
+    fn evidence_body(node: &TestNode) -> Vec<u8> {
+        encode_runtime_volume_transition_evidence_request(&RuntimeVolumeTransitionEvidenceRequest {
+            version: ContractVersion::V1,
+            session: node.binding(),
+            authorization_id: Id::new("missing-a22-authorization").unwrap(),
+        })
+        .unwrap()
+    }
+
+    async fn assert_connection_closed(result: reqwest::Result<reqwest::Response>) {
+        if let Ok(response) = result {
+            assert!(
+                response.bytes().await.is_err(),
+                "a closed A22 response unexpectedly carried a typed body"
+            );
+        }
+    }
+
+    async fn wait_for_no_active_requests(service: &crate::server::RuntimeVolumeTransitionService) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while service.active_for_test() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("A22 service retained a completed request");
+    }
+
+    #[tokio::test]
+    async fn node_resolution_deadline_closes_and_joins_the_owned_request() {
+        let context = Context::new().await;
+        let node = context.register("resolve-deadline", '4').await;
+        let service = context
+            .server
+            .state
+            .runtime_volume_transition_service
+            .clone();
+        service.set_deadline_override_for_test(Duration::from_millis(150));
+        service.arm_pause_before_node_resolution_for_test();
+        let request = tokio::spawn(
+            context
+                .signed(
+                    &node,
+                    RUNTIME_VOLUME_TRANSITION_EVIDENCE_PATH,
+                    evidence_body(&node),
+                )
+                .send(),
+        );
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            service.wait_for_paused_node_resolution_for_test(),
+        )
+        .await
+        .expect("A22 resolver did not enter its owned pause");
+        assert_eq!(service.active_for_test(), 1);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        service.release_paused_node_resolution_for_test();
+        assert_connection_closed(
+            tokio::time::timeout(Duration::from_secs(3), request)
+                .await
+                .expect("deadline-bound A22 resolver did not join")
+                .unwrap(),
+        )
+        .await;
+        service.clear_deadline_override_for_test();
+        wait_for_no_active_requests(&service).await;
+    }
+
+    #[tokio::test]
+    async fn client_drop_and_shutdown_cancel_and_join_paused_node_resolution() {
+        let context = Context::new().await;
+        let node = context.register("resolve-shutdown", '5').await;
+        let service = context
+            .server
+            .state
+            .runtime_volume_transition_service
+            .clone();
+        service.arm_pause_before_node_resolution_for_test();
+        let request = tokio::spawn(
+            context
+                .signed(
+                    &node,
+                    RUNTIME_VOLUME_TRANSITION_EVIDENCE_PATH,
+                    evidence_body(&node),
+                )
+                .send(),
+        );
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            service.wait_for_paused_node_resolution_for_test(),
+        )
+        .await
+        .expect("A22 resolver did not enter its owned pause");
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert_eq!(service.active_for_test(), 1);
+
+        let shutdown = context.server.shutdown();
+        tokio::pin!(shutdown);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown returned before the owned resolver joined"
+        );
+        service.release_paused_node_resolution_for_test();
+        tokio::time::timeout(Duration::from_secs(5), &mut shutdown)
+            .await
+            .expect("shutdown did not join the released A22 resolver")
+            .unwrap();
+        assert_eq!(service.active_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn response_encoding_holds_service_and_permits_and_never_answers_after_deadline() {
+        let context = Context::new().await;
+        let node = context.register("encode-deadline", '6').await;
+        let authenticated = node.authenticated();
+        let session = node.binding();
+        let digest = context.active_guest_config_digest.clone();
+        let transition = context
+            .server
+            .state
+            .store
+            .execute(move |store| {
+                Ok(
+                    crate::store::runtime_authority::tests::prepare_a22_http_normal_fixture(
+                        store,
+                        authenticated,
+                        session,
+                        digest,
+                    ),
+                )
+            })
+            .await
+            .unwrap();
+        let body = encode_runtime_volume_transition_request(&transition).unwrap();
+        let service = context
+            .server
+            .state
+            .runtime_volume_transition_service
+            .clone();
+        let admission = context
+            .server
+            .state
+            .runtime_volume_transition_admission
+            .clone();
+        let global_before = admission.available_global_permits_for_test();
+        service.set_deadline_override_for_test(Duration::from_secs(1));
+        service.arm_pause_response_encoding_for_test();
+        let request = tokio::spawn(
+            context
+                .signed(&node, RUNTIME_VOLUME_TRANSITION_PATH, body.clone())
+                .send(),
+        );
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            service.wait_for_paused_response_encoding_for_test(),
+        )
+        .await
+        .expect("A22 response encoder did not enter its owned pause");
+        assert_eq!(service.active_for_test(), 1);
+        assert_eq!(
+            admission.available_global_permits_for_test(),
+            global_before - 1
+        );
+        assert!(
+            admission.try_node(&node.session.node_id).is_err(),
+            "per-Node admission was released before response encoding"
+        );
+
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        service.release_paused_response_encoding_for_test();
+        assert_connection_closed(
+            tokio::time::timeout(Duration::from_secs(3), request)
+                .await
+                .expect("deadline-bound A22 encoder did not join")
+                .unwrap(),
+        )
+        .await;
+        service.clear_deadline_override_for_test();
+        wait_for_no_active_requests(&service).await;
+        assert_eq!(admission.available_global_permits_for_test(), global_before);
+
+        let replay = context
+            .signed(&node, RUNTIME_VOLUME_TRANSITION_PATH, body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        decode_runtime_volume_transition_success(&replay.bytes().await.unwrap()).unwrap();
     }
 
     #[tokio::test]

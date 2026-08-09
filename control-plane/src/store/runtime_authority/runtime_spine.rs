@@ -197,6 +197,28 @@ struct AdmissionInventoryState {
 /// and, just as importantly, lets the transaction return without writing.
 type ContextValidation<T> = AuthorityTxResult<std::result::Result<T, ContractError>>;
 
+fn resolve_runtime_node_in(
+    transaction: &mut Transaction<'_>,
+    authenticated: &AuthenticatedNodeCredential,
+) -> AuthorityTxResult<Option<Id>> {
+    let Some(identity) =
+        load_identity_by_credential_unlocked(transaction, authenticated.credential_id())?
+    else {
+        return Ok(None);
+    };
+    if identity.state != NodeIdentityState::Provisioned
+        || identity.credential_id != *authenticated.credential_id()
+        || identity.credential_binding != *authenticated.binding()
+        || !matches!(
+            identity.credential_binding,
+            CredentialBinding::PublicKey { .. }
+        )
+    {
+        return Ok(None);
+    }
+    Ok(Some(identity.node_id))
+}
+
 impl Store {
     /// Resolves the authenticated proof to its one eligible Node before the
     /// HTTP adapter takes the per-Node in-flight permit.
@@ -210,22 +232,21 @@ impl Store {
         authenticated: &AuthenticatedNodeCredential,
     ) -> Result<Option<Id>> {
         self.authority_read_snapshot(|transaction| {
-            let Some(identity) =
-                load_identity_by_credential_unlocked(transaction, authenticated.credential_id())?
-            else {
-                return Ok(None);
-            };
-            if identity.state != NodeIdentityState::Provisioned
-                || identity.credential_id != *authenticated.credential_id()
-                || identity.credential_binding != *authenticated.binding()
-                || !matches!(
-                    identity.credential_binding,
-                    CredentialBinding::PublicKey { .. }
-                )
-            {
-                return Ok(None);
-            }
-            Ok(Some(identity.node_id))
+            resolve_runtime_node_in(transaction, authenticated)
+        })
+    }
+
+    /// A22-owned form of the pre-admission credential lookup. The request
+    /// context bounds queueing, PostgreSQL statement/lock time and rollback;
+    /// the HTTP service keeps the surrounding blocking task joined through
+    /// client drop, deadline and graceful shutdown.
+    pub(crate) fn resolve_runtime_node_for_request(
+        &self,
+        authenticated: &AuthenticatedNodeCredential,
+        request_context: &AuthorityRequestContext,
+    ) -> Result<Option<Id>> {
+        self.authority_request_locking_read_snapshot(request_context, |transaction| {
+            resolve_runtime_node_in(transaction, authenticated)
         })
     }
 

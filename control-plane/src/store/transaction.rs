@@ -44,6 +44,10 @@ impl AuthorityRequestContext {
         self.cancelled.store(true, Ordering::Release);
     }
 
+    pub(crate) fn is_cancelled_or_expired(&self) -> bool {
+        self.must_rollback()
+    }
+
     fn must_rollback(&self) -> bool {
         self.cancelled.load(Ordering::Acquire) || Instant::now() >= self.deadline
     }

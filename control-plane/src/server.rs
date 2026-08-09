@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -14,7 +14,9 @@ use cats_metering::{CreditStore, UsageStore};
 use cats_storage::{BlobStore, MetadataStore};
 
 use crate::controller::{AutoTierPolicy, Controller, NodeLivenessAuthority};
-use crate::store::{DsnSource, ObservationStoreLane, SingletonRole, Store};
+use crate::store::{
+    AuthorityRequestContext, DsnSource, ObservationStoreLane, SingletonRole, Store,
+};
 
 const SINGLETON_ELECTION_RETRY: Duration = Duration::from_millis(500);
 const SINGLETON_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
@@ -65,6 +67,11 @@ impl RuntimeSpineAdmission {
         };
         semaphore.try_acquire_owned()
     }
+
+    #[cfg(test)]
+    pub(crate) fn available_global_permits_for_test(&self) -> usize {
+        self.global.available_permits()
+    }
 }
 
 /// Owns every A22 Store closure independently of the client connection. A
@@ -74,6 +81,8 @@ impl RuntimeSpineAdmission {
 pub(crate) struct RuntimeVolumeTransitionService {
     accepting: AtomicBool,
     active: AtomicUsize,
+    next_request_id: AtomicU64,
+    active_requests: Mutex<BTreeMap<u64, AuthorityRequestContext>>,
     changed: tokio::sync::Notify,
     #[cfg(test)]
     pause_after_admission: AtomicBool,
@@ -81,6 +90,20 @@ pub(crate) struct RuntimeVolumeTransitionService {
     pause_entered: AtomicBool,
     #[cfg(test)]
     pause_changed: tokio::sync::Notify,
+    #[cfg(test)]
+    pause_before_node_resolution: AtomicBool,
+    #[cfg(test)]
+    node_resolution_entered: AtomicBool,
+    #[cfg(test)]
+    node_resolution_changed: tokio::sync::Notify,
+    #[cfg(test)]
+    pause_response_encoding: AtomicBool,
+    #[cfg(test)]
+    response_encoding_entered: AtomicBool,
+    #[cfg(test)]
+    response_encoding_changed: tokio::sync::Notify,
+    #[cfg(test)]
+    deadline_override_ms: AtomicU64,
 }
 
 impl RuntimeVolumeTransitionService {
@@ -88,6 +111,8 @@ impl RuntimeVolumeTransitionService {
         Self {
             accepting: AtomicBool::new(true),
             active: AtomicUsize::new(0),
+            next_request_id: AtomicU64::new(1),
+            active_requests: Mutex::new(BTreeMap::new()),
             changed: tokio::sync::Notify::new(),
             #[cfg(test)]
             pause_after_admission: AtomicBool::new(false),
@@ -95,22 +120,57 @@ impl RuntimeVolumeTransitionService {
             pause_entered: AtomicBool::new(false),
             #[cfg(test)]
             pause_changed: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            pause_before_node_resolution: AtomicBool::new(false),
+            #[cfg(test)]
+            node_resolution_entered: AtomicBool::new(false),
+            #[cfg(test)]
+            node_resolution_changed: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            pause_response_encoding: AtomicBool::new(false),
+            #[cfg(test)]
+            response_encoding_entered: AtomicBool::new(false),
+            #[cfg(test)]
+            response_encoding_changed: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            deadline_override_ms: AtomicU64::new(0),
         }
     }
 
-    pub(crate) fn begin(self: &Arc<Self>) -> Option<RuntimeVolumeTransitionRequestGuard> {
+    pub(crate) fn begin(
+        self: &Arc<Self>,
+        request_context: AuthorityRequestContext,
+    ) -> Option<RuntimeVolumeTransitionRequestGuard> {
         if !self.accepting.load(Ordering::Acquire) {
             return None;
         }
+        let request_id = self
+            .next_request_id
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .ok()?;
         self.active.fetch_add(1, Ordering::AcqRel);
+        self.active_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(request_id, request_context.clone());
         if !self.accepting.load(Ordering::Acquire) {
-            self.finish();
+            request_context.cancel();
+            self.finish(request_id);
             return None;
         }
-        Some(RuntimeVolumeTransitionRequestGuard(self.clone()))
+        Some(RuntimeVolumeTransitionRequestGuard {
+            service: self.clone(),
+            request_id,
+        })
     }
 
-    fn finish(&self) {
+    fn finish(&self, request_id: u64) {
+        self.active_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&request_id);
         if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.changed.notify_waiters();
         }
@@ -118,6 +178,14 @@ impl RuntimeVolumeTransitionService {
 
     fn begin_shutdown(&self) {
         self.accepting.store(false, Ordering::Release);
+        for context in self
+            .active_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+        {
+            context.cancel();
+        }
         self.changed.notify_waiters();
     }
 
@@ -178,13 +246,123 @@ impl RuntimeVolumeTransitionService {
         self.pause_after_admission.store(false, Ordering::Release);
         self.pause_changed.notify_waiters();
     }
+
+    #[cfg(test)]
+    pub(crate) fn arm_pause_before_node_resolution_for_test(&self) {
+        self.node_resolution_entered.store(false, Ordering::Release);
+        self.pause_before_node_resolution
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_before_node_resolution_for_test(&self) {
+        if !self.pause_before_node_resolution.load(Ordering::Acquire) {
+            return;
+        }
+        self.node_resolution_entered.store(true, Ordering::Release);
+        self.node_resolution_changed.notify_waiters();
+        loop {
+            let changed = self.node_resolution_changed.notified();
+            if !self.pause_before_node_resolution.load(Ordering::Acquire) {
+                break;
+            }
+            changed.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_paused_node_resolution_for_test(&self) {
+        loop {
+            let changed = self.node_resolution_changed.notified();
+            if self.node_resolution_entered.load(Ordering::Acquire) {
+                break;
+            }
+            changed.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_paused_node_resolution_for_test(&self) {
+        self.pause_before_node_resolution
+            .store(false, Ordering::Release);
+        self.node_resolution_changed.notify_waiters();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_pause_response_encoding_for_test(&self) {
+        self.response_encoding_entered
+            .store(false, Ordering::Release);
+        self.pause_response_encoding.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_response_encoding_for_test(&self) {
+        if !self.pause_response_encoding.load(Ordering::Acquire) {
+            return;
+        }
+        self.response_encoding_entered
+            .store(true, Ordering::Release);
+        self.response_encoding_changed.notify_waiters();
+        loop {
+            let changed = self.response_encoding_changed.notified();
+            if !self.pause_response_encoding.load(Ordering::Acquire) {
+                break;
+            }
+            changed.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_paused_response_encoding_for_test(&self) {
+        loop {
+            let changed = self.response_encoding_changed.notified();
+            if self.response_encoding_entered.load(Ordering::Acquire) {
+                break;
+            }
+            changed.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_paused_response_encoding_for_test(&self) {
+        self.pause_response_encoding.store(false, Ordering::Release);
+        self.response_encoding_changed.notify_waiters();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_deadline_override_for_test(&self, deadline: Duration) {
+        let millis = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
+        assert!(millis > 0, "the A22 test deadline must be non-zero");
+        self.deadline_override_ms.store(millis, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_deadline_override_for_test(&self) {
+        self.deadline_override_ms.store(0, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn deadline_for_test(&self, production: Duration) -> Duration {
+        match self.deadline_override_ms.load(Ordering::Acquire) {
+            0 => production,
+            millis => Duration::from_millis(millis),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_for_test(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
 }
 
-pub(crate) struct RuntimeVolumeTransitionRequestGuard(Arc<RuntimeVolumeTransitionService>);
+pub(crate) struct RuntimeVolumeTransitionRequestGuard {
+    service: Arc<RuntimeVolumeTransitionService>,
+    request_id: u64,
+}
 
 impl Drop for RuntimeVolumeTransitionRequestGuard {
     fn drop(&mut self) {
-        self.0.finish();
+        self.service.finish(self.request_id);
     }
 }
 
