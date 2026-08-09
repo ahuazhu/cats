@@ -6,12 +6,12 @@ use std::time::Duration;
 
 use cats_api::error::ErrorCode;
 use cats_api::runtime_reconciliation::{
-    encode_desired_runtime_spec, spec_digest, AsciiText, AssignedKind, AssignedPlacement,
-    ContractVersion, DesiredRuntimeSpec, DiskKind, Durability, EndpointIntent, Epoch, FenceEpoch,
-    Generation, GuestDeviceIdentity, Hostname, HttpProtocol, Id, Ipv4Address, IsolatedIpv4Kind,
-    MacAddress, NetworkConfig, RandomId128, Revision, RuntimeConfig, RuntimeTarget,
-    RuntimeTransition, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire, VolumeDisposition,
-    VolumeIntent,
+    encode_desired_runtime_spec, encode_operation, spec_digest, AsciiText, AssignedKind,
+    AssignedPlacement, ContractVersion, DesiredRuntimeSpec, DiskKind, Durability, EndpointIntent,
+    Epoch, FenceEpoch, Generation, GuestDeviceIdentity, Hostname, HttpProtocol, Id, Ipv4Address,
+    IsolatedIpv4Kind, MacAddress, NetworkConfig, Operation, OperationPhase, OperationTerminal,
+    RandomId128, Revision, RuntimeConfig, RuntimeTarget, RuntimeTransition, Sha256Digest,
+    UnixMillis, VolumeAccess, VolumeAcquire, VolumeDisposition, VolumeIntent,
 };
 use cats_storage::authority::{
     LastVolumeTransition, RemoteHead, VolumeAdminState, VolumeDurability, VolumeRecord,
@@ -23,12 +23,15 @@ use super::product::{
     api_request_fingerprint, encode_cat_create_accepted_response,
     encode_cat_name_conflict_response, ApiIdempotencyRequest, CandidateCollision,
     CatCreateCandidate, CatCreateEnvelopes, CoveredCatCreateError, CoveredCatCreateRequest,
-    DiskAdminState, DiskRecord, DiskRecordCandidate, DiskRole, EndpointRecordCandidate,
-    ExactContentType, ExactHttpResponse, HostnameDesiredLocation, HostnameDesiredLookup,
-    IfMatchFingerprint, PersistentDiskInitialization,
+    DiskAdminState, DiskRecord, DiskRecordCandidate, DiskRole, EndpointRecord,
+    EndpointRecordCandidate, ExactContentType, ExactHttpResponse, HostnameDesiredLocation,
+    HostnameDesiredLookup, IfMatchFingerprint, PersistentDiskInitialization,
 };
-use super::product_rows::{insert_disk, load_disk_by_id_for_update};
-use super::rows::insert_volume;
+use super::product_rows::{
+    insert_disk, insert_endpoint, insert_hostname_lookup, insert_operation,
+    load_disk_by_id_for_update, load_operation_by_cat_revision_unlocked,
+};
+use super::rows::{database_now, insert_volume};
 use crate::store::{internal, DsnSource, Store};
 
 const ROUTE: &str = "POST /v1/workspaces/{workspace}/cats";
@@ -340,6 +343,192 @@ fn refresh_candidate_contract(request: &mut CoveredCatCreateRequest) {
         conflict,
     )
     .unwrap();
+}
+
+fn advance_current_endpoints(
+    store: &Store,
+    original: &CoveredCatCreateRequest,
+    replacement: Option<(Id, Id, Hostname)>,
+    operation_id: Id,
+) -> DesiredRuntimeSpec {
+    let mut desired = original.candidate.desired.clone();
+    desired.desired_revision = revision(2);
+    desired.endpoints = replacement
+        .as_ref()
+        .map(|(endpoint_id, _name, hostname)| {
+            vec![EndpointIntent {
+                endpoint_id: endpoint_id.clone(),
+                hostname: hostname.clone(),
+                route_epoch: epoch(1),
+                protocol: HttpProtocol::Http,
+                target_port: 8080,
+            }]
+        })
+        .unwrap_or_default();
+    desired.spec_digest = Sha256Digest::from_bytes([0; 32]);
+    desired.spec_digest = spec_digest(&desired).unwrap();
+    let desired_json = String::from_utf8(encode_desired_runtime_spec(&desired).unwrap()).unwrap();
+
+    store
+        .authority_transaction(|transaction| {
+            let now = database_now(transaction)?;
+            let now_pg = i64::try_from(now.get()).unwrap();
+            let mut previous = load_operation_by_cat_revision_unlocked(
+                transaction,
+                &original.candidate.cat_id,
+                revision(1),
+            )?
+            .ok_or_else(|| internal("test setup lost the initial Operation"))?;
+            previous.phase = OperationPhase::Superseded;
+            previous.terminal = Some(OperationTerminal::Superseded {
+                superseded_by_revision: desired.desired_revision,
+                superseded_by_operation_id: operation_id.clone(),
+                completed_at_unix_ms: now,
+            });
+            previous.updated_at_unix_ms = now;
+            let previous_json = String::from_utf8(encode_operation(&previous).unwrap()).unwrap();
+            assert_eq!(
+                transaction.execute(
+                    "UPDATE runtime_operations
+                        SET record=$1::TEXT::jsonb,
+                            phase='superseded',
+                            terminal_kind='superseded',
+                            updated_at=$2
+                      WHERE operation_id=$3",
+                    &[&previous_json, &now_pg, &previous.operation_id.as_str(),],
+                )?,
+                1
+            );
+            assert_eq!(
+                transaction.execute(
+                    "DELETE FROM hostname_desired_lookups WHERE cat_id=$1",
+                    &[&original.candidate.cat_id.as_str()],
+                )?,
+                1
+            );
+            assert_eq!(
+                transaction.execute(
+                    "UPDATE desired_runtime_specs
+                        SET record=$1::TEXT::jsonb,
+                            desired_revision=$2,
+                            spec_digest=$3
+                      WHERE cat_id=$4",
+                    &[
+                        &desired_json,
+                        &2_i64,
+                        &desired.spec_digest.as_str(),
+                        &desired.cat_id.as_str(),
+                    ],
+                )?,
+                1
+            );
+
+            if let Some((endpoint_id, name, hostname)) = &replacement {
+                insert_endpoint(
+                    transaction,
+                    &EndpointRecord {
+                        endpoint_id: endpoint_id.clone(),
+                        workspace_id: desired.workspace_id.clone(),
+                        cat_id: desired.cat_id.clone(),
+                        name: name.clone(),
+                        created_at: now,
+                    },
+                )?;
+                insert_hostname_lookup(
+                    transaction,
+                    &HostnameDesiredLookup {
+                        hostname: hostname.clone(),
+                        workspace_id: desired.workspace_id.clone(),
+                        cat_id: desired.cat_id.clone(),
+                        endpoint_id: endpoint_id.clone(),
+                        desired_revision: desired.desired_revision,
+                    },
+                )?;
+            }
+
+            insert_operation(
+                transaction,
+                &Operation {
+                    version: ContractVersion::V1,
+                    operation_id: operation_id.clone(),
+                    workspace_id: desired.workspace_id.clone(),
+                    cat_id: desired.cat_id.clone(),
+                    desired_revision: desired.desired_revision,
+                    desired_spec_digest: desired.spec_digest.clone(),
+                    placement: desired.placement.clone(),
+                    target: desired.target,
+                    phase: OperationPhase::Pending,
+                    terminal: None,
+                    created_at_unix_ms: now,
+                    updated_at_unix_ms: now,
+                },
+            )
+        })
+        .unwrap();
+    desired
+}
+
+fn rewrite_current_desired_and_operation(
+    store: &Store,
+    desired: &DesiredRuntimeSpec,
+    lookup_rewrite: Option<(Hostname, HostnameDesiredLookup)>,
+) {
+    let desired_json = String::from_utf8(encode_desired_runtime_spec(desired).unwrap()).unwrap();
+    store
+        .authority_transaction(|transaction| {
+            let mut operation = load_operation_by_cat_revision_unlocked(
+                transaction,
+                &desired.cat_id,
+                desired.desired_revision,
+            )?
+            .ok_or_else(|| internal("test setup lost the current Operation"))?;
+            operation.desired_spec_digest = desired.spec_digest.clone();
+            let operation_json = String::from_utf8(encode_operation(&operation).unwrap()).unwrap();
+            assert_eq!(
+                transaction.execute(
+                    "UPDATE desired_runtime_specs
+                        SET record=$1::TEXT::jsonb, spec_digest=$2
+                      WHERE cat_id=$3",
+                    &[
+                        &desired_json,
+                        &desired.spec_digest.as_str(),
+                        &desired.cat_id.as_str(),
+                    ],
+                )?,
+                1
+            );
+            assert_eq!(
+                transaction.execute(
+                    "UPDATE runtime_operations
+                        SET record=$1::TEXT::jsonb, desired_spec_digest=$2
+                      WHERE operation_id=$3",
+                    &[
+                        &operation_json,
+                        &operation.desired_spec_digest.as_str(),
+                        &operation.operation_id.as_str(),
+                    ],
+                )?,
+                1
+            );
+            if let Some((old_hostname, lookup)) = &lookup_rewrite {
+                let lookup_json = serde_json::to_string(lookup).unwrap();
+                assert_eq!(
+                    transaction.execute(
+                        "UPDATE hostname_desired_lookups
+                            SET hostname=$1, record=$2::TEXT::jsonb
+                          WHERE hostname=$3",
+                        &[
+                            &lookup.hostname.as_str(),
+                            &lookup_json,
+                            &old_hostname.as_str(),
+                        ],
+                    )?,
+                    1
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
 }
 
 fn candidate_row_count(store: &Store, request: &CoveredCatCreateRequest) -> i64 {
@@ -846,21 +1035,24 @@ fn every_persisted_candidate_identity_collision_is_typed_and_rolls_back() {
         original.candidate.endpoint.endpoint_id.clone();
     endpoint_collision.candidate.desired.endpoints[0].endpoint_id =
         original.candidate.endpoint.endpoint_id.clone();
+    let endpoint_suffix = original
+        .candidate
+        .endpoint
+        .endpoint_id
+        .as_str()
+        .strip_prefix("ep_")
+        .unwrap();
+    let endpoint_collision_hostname =
+        Hostname::new(format!("new-endpoint-name-{endpoint_suffix}.cats.run")).unwrap();
+    endpoint_collision.candidate.hostname_lookup.hostname = endpoint_collision_hostname.clone();
+    endpoint_collision.candidate.desired.endpoints[0].hostname = endpoint_collision_hostname;
     refresh_candidate_contract(&mut endpoint_collision);
-
-    let mut hostname_collision = request(&workspace, "new-hostname-name", 7, "hostname-collision");
-    hostname_collision.candidate.hostname_lookup.hostname =
-        original.candidate.hostname_lookup.hostname.clone();
-    hostname_collision.candidate.desired.endpoints[0].hostname =
-        original.candidate.hostname_lookup.hostname.clone();
-    refresh_candidate_contract(&mut hostname_collision);
 
     for (request, expected) in [
         (&cat_collision, CandidateCollision::CatId),
         (&disk_collision, CandidateCollision::DiskIdOrName),
         (&volume_collision, CandidateCollision::VolumeId),
         (&endpoint_collision, CandidateCollision::EndpointIdOrName),
-        (&hostname_collision, CandidateCollision::Hostname),
         (&operation_collision, CandidateCollision::OperationId),
     ] {
         let error = store.create_cat_covered(request).unwrap_err();
@@ -880,24 +1072,24 @@ fn hostname_is_globally_unique_within_and_across_workspaces() {
     let original = request(&workspace, "original", 1, "original-key");
     store.create_cat_covered(&original).unwrap();
 
-    let mut same_workspace = request(&workspace, "same-workspace", 2, "same-workspace-key");
-    same_workspace.candidate.hostname_lookup.hostname =
-        original.candidate.hostname_lookup.hostname.clone();
-    same_workspace.candidate.desired.endpoints[0].hostname =
-        original.candidate.hostname_lookup.hostname.clone();
-    refresh_candidate_contract(&mut same_workspace);
-
-    let mut cross_workspace = request(
-        &other_workspace,
-        "cross-workspace",
-        3,
-        "cross-workspace-key",
+    let same_workspace = request(&workspace, "same-workspace", 2, "same-workspace-key");
+    let occupied_hostname = same_workspace.candidate.hostname_lookup.hostname.clone();
+    let mut occupied_desired = original.candidate.desired.clone();
+    occupied_desired.endpoints[0].hostname = occupied_hostname.clone();
+    occupied_desired.spec_digest = Sha256Digest::from_bytes([0; 32]);
+    occupied_desired.spec_digest = spec_digest(&occupied_desired).unwrap();
+    let mut occupied_lookup = original.candidate.hostname_lookup.clone();
+    occupied_lookup.hostname = occupied_hostname;
+    rewrite_current_desired_and_operation(
+        &store,
+        &occupied_desired,
+        Some((
+            original.candidate.hostname_lookup.hostname.clone(),
+            occupied_lookup,
+        )),
     );
-    cross_workspace.candidate.hostname_lookup.hostname =
-        original.candidate.hostname_lookup.hostname.clone();
-    cross_workspace.candidate.desired.endpoints[0].hostname =
-        original.candidate.hostname_lookup.hostname.clone();
-    refresh_candidate_contract(&mut cross_workspace);
+
+    let cross_workspace = request(&other_workspace, "same-workspace", 2, "cross-workspace-key");
 
     for candidate in [&same_workspace, &cross_workspace] {
         assert!(matches!(
@@ -1010,6 +1202,84 @@ fn two_keys_same_name_commit_one_bundle_and_one_durable_409() {
     delete_created_bundle(&observer, winner);
     assert_eq!(observer.create_cat_covered(loser).unwrap(), loser_result);
     assert_eq!(counts(&observer), [0, 0, 0, 0, 0, 0, 0, 2]);
+}
+
+#[test]
+fn removed_default_endpoint_with_no_lookup_remains_a_durable_name_conflict() {
+    let (_url, store, _second, workspace) = stores();
+    let original = request(&workspace, "demo", 1, "original");
+    store.create_cat_covered(&original).unwrap();
+    advance_current_endpoints(&store, &original, None, id("op_without_endpoints"));
+
+    assert!(store
+        .locate_hostname_desired(&original.candidate.hostname_lookup.hostname)
+        .unwrap()
+        .is_none());
+    let conflict = request(&workspace, "demo", 2, "after-endpoint-removal");
+    let first = store.create_cat_covered(&conflict).unwrap();
+    assert_eq!(first.http_status, 409);
+    assert_eq!(store.create_cat_covered(&conflict).unwrap(), first);
+    assert_eq!(counts(&store), [1, 1, 1, 1, 1, 0, 2, 2]);
+}
+
+#[test]
+fn non_default_current_binding_is_closed_and_corruption_is_not_cached_as_409() {
+    let (_url, store, _second, workspace) = stores();
+    let original = request(&workspace, "demo", 1, "original");
+    store.create_cat_covered(&original).unwrap();
+    let replacement_hostname =
+        Hostname::new("api-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.cats.run").unwrap();
+    let mut current = advance_current_endpoints(
+        &store,
+        &original,
+        Some((
+            id("ep_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            id("api"),
+            replacement_hostname.clone(),
+        )),
+        id("op_api_endpoint"),
+    );
+
+    let valid_conflict = request(&workspace, "demo", 2, "valid-non-default");
+    assert_eq!(
+        store
+            .create_cat_covered(&valid_conflict)
+            .unwrap()
+            .http_status,
+        409
+    );
+
+    current.endpoints[0].hostname =
+        Hostname::new("drift-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.cats.run").unwrap();
+    current.spec_digest = Sha256Digest::from_bytes([0; 32]);
+    current.spec_digest = spec_digest(&current).unwrap();
+    rewrite_current_desired_and_operation(&store, &current, None);
+    let lookup_error = store
+        .locate_hostname_desired(&replacement_hostname)
+        .unwrap_err();
+    assert_eq!(lookup_error.code, ErrorCode::Internal);
+
+    let corrupt_conflict = request(&workspace, "demo", 3, "corrupt-non-default");
+    let error = store.create_cat_covered(&corrupt_conflict).unwrap_err();
+    assert_eq!(error_code(error), ErrorCode::Internal);
+    assert_eq!(counts(&store), [1, 1, 1, 1, 2, 1, 2, 2]);
+}
+
+#[test]
+fn residual_lookup_outside_current_desired_fails_closed_without_a_409() {
+    let (_url, store, _second, workspace) = stores();
+    let original = request(&workspace, "demo", 1, "original");
+    store.create_cat_covered(&original).unwrap();
+    let mut corrupt = original.candidate.desired.clone();
+    corrupt.endpoints.clear();
+    corrupt.spec_digest = Sha256Digest::from_bytes([0; 32]);
+    corrupt.spec_digest = spec_digest(&corrupt).unwrap();
+    rewrite_current_desired_and_operation(&store, &corrupt, None);
+
+    let conflict = request(&workspace, "demo", 2, "residual-lookup");
+    let error = store.create_cat_covered(&conflict).unwrap_err();
+    assert_eq!(error_code(error), ErrorCode::Internal);
+    assert_eq!(counts(&store), [1, 1, 1, 1, 1, 1, 1, 1]);
 }
 
 #[test]
@@ -1180,6 +1450,78 @@ fn every_invalid_default_endpoint_binding_rolls_back_without_a_result() {
         ("lookup hostname", &wrong_hostname),
         ("initial route epoch", &wrong_epoch),
         ("initial target port", &wrong_port),
+    ] {
+        assert_invalid_bundle_writes_nothing(&store, candidate, label);
+    }
+    assert_eq!(counts(&store), [0, 0, 0, 0, 0, 0, 0, 0]);
+}
+
+#[test]
+fn every_self_consistent_wrong_initial_projection_rolls_back() {
+    let (_url, store, _second, workspace) = stores();
+
+    let mut wrong_revision = request(&workspace, "wrong-revision", 40, "projection-revision");
+    wrong_revision.candidate.desired.desired_revision = revision(2);
+    wrong_revision.candidate.hostname_lookup.desired_revision = revision(2);
+    refresh_candidate_contract(&mut wrong_revision);
+
+    let mut wrong_target = request(&workspace, "wrong-target", 41, "projection-target");
+    wrong_target.candidate.desired.target = RuntimeTarget::Cold;
+    refresh_candidate_contract(&mut wrong_target);
+
+    let mut wrong_placement = request(&workspace, "wrong-placement", 42, "projection-placement");
+    wrong_placement.candidate.desired.placement.placement_epoch = epoch(2);
+    refresh_candidate_contract(&mut wrong_placement);
+
+    let mut wrong_transition = request(&workspace, "wrong-transition", 43, "projection-transition");
+    wrong_transition.candidate.desired.desired_revision = revision(2);
+    wrong_transition.candidate.hostname_lookup.desired_revision = revision(2);
+    wrong_transition.candidate.desired.target = RuntimeTarget::Suspended;
+    wrong_transition.candidate.desired.transition = RuntimeTransition::RequireIdle {
+        attempt_id: random_id(43_001),
+        source_revision: revision(1),
+        source_runtime_incarnation: random_id(43_002),
+    };
+    refresh_candidate_contract(&mut wrong_transition);
+
+    let mut wrong_serial = request(&workspace, "wrong-serial", 44, "projection-serial");
+    wrong_serial.candidate.desired.volumes[0]
+        .guest_device
+        .serial = id("not-cats-root");
+    refresh_candidate_contract(&mut wrong_serial);
+
+    let mut wrong_slot = request(&workspace, "wrong-slot", 45, "projection-slot");
+    wrong_slot.candidate.desired.volumes[0].guest_device.slot = 1;
+    refresh_candidate_contract(&mut wrong_slot);
+
+    let mut wrong_hostname = request(&workspace, "wrong-hostname", 46, "projection-hostname");
+    let self_consistent_wrong_hostname =
+        Hostname::new("other-00000000000000000000000000000046.cats.run").unwrap();
+    wrong_hostname.candidate.desired.endpoints[0].hostname = self_consistent_wrong_hostname.clone();
+    wrong_hostname.candidate.hostname_lookup.hostname = self_consistent_wrong_hostname;
+    refresh_candidate_contract(&mut wrong_hostname);
+
+    let mut wrong_endpoint_id = request(
+        &workspace,
+        "wrong-endpoint-id",
+        47,
+        "projection-endpoint-id",
+    );
+    let uppercase_endpoint_id = id("ep_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    wrong_endpoint_id.candidate.endpoint.endpoint_id = uppercase_endpoint_id.clone();
+    wrong_endpoint_id.candidate.hostname_lookup.endpoint_id = uppercase_endpoint_id.clone();
+    wrong_endpoint_id.candidate.desired.endpoints[0].endpoint_id = uppercase_endpoint_id;
+    refresh_candidate_contract(&mut wrong_endpoint_id);
+
+    for (label, candidate) in [
+        ("revision", &wrong_revision),
+        ("target", &wrong_target),
+        ("placement epoch", &wrong_placement),
+        ("transition", &wrong_transition),
+        ("Root serial", &wrong_serial),
+        ("Root slot", &wrong_slot),
+        ("hostname projection", &wrong_hostname),
+        ("Endpoint suffix", &wrong_endpoint_id),
     ] {
         assert_invalid_bundle_writes_nothing(&store, candidate, label);
     }

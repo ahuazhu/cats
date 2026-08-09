@@ -9,7 +9,8 @@ use cats_api::error::ApiError;
 use cats_api::runtime_reconciliation::{
     encode_desired_runtime_spec, AsciiText, ContractVersion, DesiredRuntimeSpec, DiskKind,
     Durability, Generation, Hostname, HttpProtocol, Id, Operation, OperationPhase, Revision,
-    Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire, VolumeDisposition,
+    RuntimeTarget, RuntimeTransition, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire,
+    VolumeDisposition,
 };
 use cats_storage::authority::{RemoteHead, VolumeAdminState, VolumeDurability, VolumeRecord};
 use postgres::Transaction;
@@ -22,10 +23,9 @@ use super::product_rows::{
     load_cat_by_id_for_update, load_cat_by_name_unlocked, load_desired_for_update,
     load_desired_unlocked, load_disk_by_id_for_update, load_disk_by_name_for_update,
     load_endpoint_by_cat_name_unlocked, load_endpoint_by_id_for_update,
-    load_endpoint_by_id_unlocked, load_hostname_lookup_by_endpoint_unlocked,
-    load_hostname_lookup_for_update, load_hostname_lookup_unlocked,
-    load_operation_by_cat_revision_unlocked, load_operation_for_update,
-    load_root_disk_by_cat_unlocked,
+    load_endpoint_by_id_unlocked, load_hostname_lookup_for_update, load_hostname_lookup_unlocked,
+    load_hostname_lookups_by_cat_unlocked, load_operation_by_cat_revision_unlocked,
+    load_operation_for_update, load_root_disk_by_cat_unlocked,
 };
 use super::rows::{database_now, insert_volume, load_volume_for_update};
 use crate::store::transaction::{
@@ -642,32 +642,7 @@ fn validate_existing_cat_for_name_conflict(
         .ok_or_else(|| stored_corruption("existing Cat has no current Desired"))?;
     validate_existing_desired(&cat, &disk, &volume, &desired)?;
 
-    let peeked_endpoint = load_endpoint_by_cat_name_unlocked(transaction, &cat.cat_id, &id_web())?
-        .ok_or_else(|| stored_corruption("existing Cat has no default web Endpoint"))?;
-    lock_candidate_id(transaction, "endpoint", &peeked_endpoint.endpoint_id)?;
-    let endpoint = load_endpoint_by_id_for_update(transaction, &peeked_endpoint.endpoint_id)?
-        .ok_or_else(|| stored_corruption("existing Cat default Endpoint disappeared"))?;
-    if endpoint != peeked_endpoint
-        || endpoint.workspace_id != cat.workspace_id
-        || endpoint.cat_id != cat.cat_id
-        || endpoint.name.as_str() != "web"
-        || endpoint.created_at != cat.created_at
-    {
-        return Err(stored_corruption(
-            "existing Cat default Endpoint identity is invalid",
-        ));
-    }
-    let peeked_lookup =
-        load_hostname_lookup_by_endpoint_unlocked(transaction, &endpoint.endpoint_id)?.ok_or_else(
-            || stored_corruption("existing Cat default Endpoint has no hostname lookup"),
-        )?;
-    lock_candidate_hostname(transaction, &peeked_lookup.hostname)?;
-    let lookup = load_hostname_lookup_for_update(transaction, &peeked_lookup.hostname)?
-        .ok_or_else(|| stored_corruption("existing Cat hostname lookup disappeared"))?;
-    if lookup != peeked_lookup {
-        return Err(stored_corruption("existing Cat hostname lookup changed"));
-    }
-    validate_endpoint_lookup(&endpoint, &lookup, &desired)?;
+    validate_existing_endpoints(transaction, &cat, &desired)?;
 
     let peeked_operation = load_operation_by_cat_revision_unlocked(
         transaction,
@@ -730,6 +705,46 @@ fn validate_existing_desired(
     Ok(())
 }
 
+fn validate_existing_endpoints(
+    transaction: &mut Transaction<'_>,
+    cat: &CatRecord,
+    desired: &DesiredRuntimeSpec,
+) -> AuthorityTxResult<()> {
+    let lookups = load_hostname_lookups_by_cat_unlocked(transaction, &cat.cat_id)?;
+    if lookups.len() != desired.endpoints.len() {
+        return Err(stored_corruption(
+            "existing Cat hostname lookup set does not match current Desired",
+        ));
+    }
+
+    for (binding, peeked_lookup) in desired.endpoints.iter().zip(&lookups) {
+        if peeked_lookup.endpoint_id != binding.endpoint_id {
+            return Err(stored_corruption(
+                "existing Cat hostname lookup identities do not match current Desired",
+            ));
+        }
+        lock_candidate_id(transaction, "endpoint", &binding.endpoint_id)?;
+        let endpoint = load_endpoint_by_id_for_update(transaction, &binding.endpoint_id)?
+            .ok_or_else(|| stored_corruption("current Desired Endpoint has no product record"))?;
+        if endpoint.workspace_id != cat.workspace_id || endpoint.cat_id != cat.cat_id {
+            return Err(stored_corruption(
+                "current Desired Endpoint product identity is invalid",
+            ));
+        }
+
+        lock_candidate_hostname(transaction, &peeked_lookup.hostname)?;
+        let lookup = load_hostname_lookup_for_update(transaction, &peeked_lookup.hostname)?
+            .ok_or_else(|| stored_corruption("current Desired hostname lookup disappeared"))?;
+        if lookup != *peeked_lookup {
+            return Err(stored_corruption(
+                "current Desired hostname lookup changed while closing the graph",
+            ));
+        }
+        validate_endpoint_lookup(&endpoint, &lookup, desired)?;
+    }
+    Ok(())
+}
+
 fn validate_candidate(request: &CoveredCatCreateRequest) -> Result<()> {
     let candidate = &request.candidate;
     if candidate.workspace_id != request.idempotency.authenticated_workspace_id
@@ -773,6 +788,18 @@ fn validate_candidate(request: &CoveredCatCreateRequest) -> Result<()> {
             "initial Root Volume is not blank epoch-zero Unowned",
         ));
     }
+    if candidate.desired.desired_revision.get() != 1
+        || candidate.desired.target != RuntimeTarget::Running
+        || candidate.desired.placement.placement_epoch.get() != 1
+        || !matches!(
+            candidate.desired.transition,
+            RuntimeTransition::CancelAndDrain
+        )
+    {
+        return Err(invalid_bundle(
+            "initial Desired revision/target/placement/transition is invalid",
+        ));
+    }
     encode_desired_runtime_spec(&candidate.desired)
         .map_err(|error| invalid_bundle(format!("invalid DesiredRuntimeSpec: {error}")))?;
     let [root] = candidate.desired.volumes.as_slice() else {
@@ -790,6 +817,8 @@ fn validate_candidate(request: &CoveredCatCreateRequest) -> Result<()> {
         || root.size_bytes != candidate.volume.size_bytes
         || root.durability != expected_durability
         || root.access != VolumeAccess::ReadWriteOnce
+        || root.guest_device.serial.as_str() != "cats-root"
+        || root.guest_device.slot != 0
         || !matches!(root.disposition, VolumeDisposition::Retain)
         || root.mount.is_some()
         || !matches!(
@@ -807,10 +836,23 @@ fn validate_candidate(request: &CoveredCatCreateRequest) -> Result<()> {
             "initial Desired must contain exactly one default Endpoint",
         ));
     };
+    let endpoint_id = candidate.endpoint.endpoint_id.as_str();
+    let Some(endpoint_suffix) = endpoint_id.strip_prefix("ep_").filter(|suffix| {
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) else {
+        return Err(invalid_bundle(
+            "default Endpoint ID must be ep_ plus 32 lowercase hex digits",
+        ));
+    };
+    let expected_hostname = format!("{}-{endpoint_suffix}.cats.run", candidate.name);
     if candidate.endpoint.name.as_str() != "web"
         || candidate.endpoint.endpoint_id != endpoint_intent.endpoint_id
         || candidate.hostname_lookup.endpoint_id != endpoint_intent.endpoint_id
         || candidate.hostname_lookup.hostname != endpoint_intent.hostname
+        || candidate.hostname_lookup.hostname.as_str() != expected_hostname
         || candidate.hostname_lookup.desired_revision != candidate.desired.desired_revision
         || endpoint_intent.route_epoch.get() != 1
         || endpoint_intent.protocol != HttpProtocol::Http
@@ -941,10 +983,6 @@ fn lock_candidate_hostname(
         &[&hostname.as_str()],
     )?;
     Ok(())
-}
-
-fn id_web() -> Id {
-    Id::new("web").expect("web is a fixed valid Id")
 }
 
 fn result_from_envelope(

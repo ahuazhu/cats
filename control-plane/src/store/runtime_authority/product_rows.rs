@@ -716,17 +716,19 @@ pub(super) fn load_hostname_lookup_unlocked(
         .transpose()
 }
 
-pub(super) fn load_hostname_lookup_by_endpoint_unlocked(
+pub(super) fn load_hostname_lookups_by_cat_unlocked(
     transaction: &mut Transaction<'_>,
-    endpoint_id: &Id,
-) -> AuthorityTxResult<Option<HostnameDesiredLookup>> {
+    cat_id: &Id,
+) -> AuthorityTxResult<Vec<HostnameDesiredLookup>> {
     let sql = format!(
-        "SELECT {HOSTNAME_LOOKUP_COLUMNS} FROM hostname_desired_lookups WHERE endpoint_id=$1"
+        "SELECT {HOSTNAME_LOOKUP_COLUMNS} FROM hostname_desired_lookups
+          WHERE cat_id=$1 ORDER BY endpoint_id"
     );
     transaction
-        .query_opt(&sql, &[&endpoint_id.as_str()])?
-        .map(|row| decode_hostname_lookup(&row))
-        .transpose()
+        .query(&sql, &[&cat_id.as_str()])?
+        .iter()
+        .map(decode_hostname_lookup)
+        .collect()
 }
 
 fn decode_hostname_lookup(row: &Row) -> AuthorityTxResult<HostnameDesiredLookup> {
