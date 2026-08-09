@@ -5,6 +5,7 @@
 //! runtime contract value.
 
 use std::error::Error as _;
+use std::io;
 use std::time::{Duration, Instant};
 
 use axum::body::{to_bytes, Body};
@@ -253,6 +254,7 @@ async fn handle(state: AppState, request: Request<Body>, route: Route) -> Respon
 
     let store = state.store.clone();
     let operation_context = request_context.clone();
+    let response_context = request_context.clone();
     let operation = async move {
         match decoded {
             DecodedRequest::DesiredRead(request) => store
@@ -299,10 +301,12 @@ async fn handle(state: AppState, request: Request<Body>, route: Route) -> Respon
 
     match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), operation).await {
         Ok(Ok(Ok(EncodedOutcome::Accepted(body)))) => success_response(body),
+        Ok(_) if response_context.commit_was_attempted() => ambiguous_commit_response(),
         Ok(Ok(Ok(EncodedOutcome::Rejected(rejection)))) => rejection_response(rejection),
         Ok(Ok(Err(()))) => internal_response(),
         Ok(Err(error)) if transient(&error) => temporarily_unavailable(),
         Ok(Err(_)) => internal_response(),
+        Err(_) if response_context.commit_was_attempted() => ambiguous_commit_response(),
         Err(_) => temporarily_unavailable(),
     }
 }
@@ -452,6 +456,22 @@ fn internal_response() -> Response {
     )
 }
 
+/// Deliberately produces an incomplete HTTP response. Once COMMIT may have
+/// reached PostgreSQL, no status/envelope can truthfully assert success or
+/// failure; the Node must retry the exact durable domain request.
+fn ambiguous_commit_response() -> Response {
+    let stream = futures_util::stream::once(async {
+        Err::<&'static [u8], io::Error>(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "runtime authority commit outcome is unknown",
+        ))
+    });
+    Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .body(Body::from_stream(stream))
+        .expect("fixed ambiguous response is valid")
+}
+
 fn error_response(
     status: StatusCode,
     detail: RuntimeSpineErrorDetail,
@@ -488,4 +508,17 @@ fn success_response(body: Vec<u8>) -> Response {
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ambiguous_commit_response_cannot_be_mistaken_for_an_http_error_envelope() {
+        let response = ambiguous_commit_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(response.headers().get(header::CONTENT_TYPE).is_none());
+        assert!(to_bytes(response.into_body(), 1).await.is_err());
+    }
 }

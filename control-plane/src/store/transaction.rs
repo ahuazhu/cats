@@ -28,6 +28,7 @@ static RETRY_JITTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct AuthorityRequestContext {
     deadline: Instant,
     cancelled: Arc<AtomicBool>,
+    commit_attempted: Arc<AtomicBool>,
 }
 
 impl AuthorityRequestContext {
@@ -35,6 +36,7 @@ impl AuthorityRequestContext {
         Self {
             deadline,
             cancelled: Arc::new(AtomicBool::new(false)),
+            commit_attempted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -53,6 +55,18 @@ impl AuthorityRequestContext {
         let remaining = self.deadline.checked_duration_since(Instant::now())?;
         let millis = remaining.as_millis().min(i32::MAX as u128) as u64;
         (millis > 0).then_some(millis)
+    }
+
+    fn begin_commit(&self) {
+        self.commit_attempted.store(true, Ordering::Release);
+    }
+
+    /// True after COMMIT may have reached PostgreSQL. Even when the blocking
+    /// worker already knows it committed, a concurrent HTTP deadline can fire
+    /// before that result crosses the executor channel; such a response must
+    /// still close and let exact replay resolve what the client observed.
+    pub(crate) fn commit_was_attempted(&self) -> bool {
+        self.commit_attempted.load(Ordering::Acquire)
     }
 }
 
@@ -269,23 +283,31 @@ impl Store {
                             "runtime authority request was cancelled or exceeded its deadline",
                         )))
                     }
-                    Ok(value) => match transaction.commit() {
-                        Ok(()) => {
-                            #[cfg(test)]
-                            if self.commit_response_loss_once.swap(false, Ordering::AcqRel) {
-                                let delay_ms =
-                                    self.commit_response_loss_delay_ms.swap(0, Ordering::AcqRel);
-                                if delay_ms != 0 {
-                                    std::thread::sleep(Duration::from_millis(delay_ms));
-                                }
-                                return Err(AttemptFailure::Infrastructure(ApiError::unavailable(
-                                    "injected loss of a successful PostgreSQL commit response",
-                                )));
-                            }
-                            Ok(value)
+                    Ok(value) => {
+                        if let Some(request) = request {
+                            request.begin_commit();
                         }
-                        Err(error) => Err(AttemptFailure::Postgres(error)),
-                    },
+                        match transaction.commit() {
+                            Ok(()) => {
+                                #[cfg(test)]
+                                if self.commit_response_loss_once.swap(false, Ordering::AcqRel) {
+                                    let delay_ms = self
+                                        .commit_response_loss_delay_ms
+                                        .swap(0, Ordering::AcqRel);
+                                    if delay_ms != 0 {
+                                        std::thread::sleep(Duration::from_millis(delay_ms));
+                                    }
+                                    return Err(AttemptFailure::Infrastructure(
+                                        ApiError::unavailable(
+                                            "injected loss of a successful PostgreSQL commit response",
+                                        ),
+                                    ));
+                                }
+                                Ok(value)
+                            }
+                            Err(error) => Err(AttemptFailure::Postgres(error)),
+                        }
+                    }
                     Err(AuthorityTransactionError::Domain(error)) => {
                         // A domain rejection is never replayed. If its explicit
                         // rollback fails, the transaction outcome is unknown
@@ -485,4 +507,17 @@ fn retry_delay(attempt: usize) -> Duration {
 #[cfg(test)]
 pub(super) const fn authority_transaction_attempts() -> usize {
     AUTHORITY_TRANSACTION_ATTEMPTS
+}
+
+#[cfg(test)]
+mod request_context_tests {
+    use super::*;
+
+    #[test]
+    fn commit_attempt_stays_visible_to_a_racing_http_deadline() {
+        let context = AuthorityRequestContext::new(Instant::now() + Duration::from_secs(1));
+        assert!(!context.commit_was_attempted());
+        context.begin_commit();
+        assert!(context.commit_was_attempted());
+    }
 }
