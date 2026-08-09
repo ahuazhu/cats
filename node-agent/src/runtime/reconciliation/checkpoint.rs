@@ -116,7 +116,12 @@ impl FileCheckpointStore {
             });
         }
 
-        let target_file_name = format!("cat-{}.checkpoint.json", cat_id.as_str());
+        let target_path = runtime_checkpoint_path(directory, cat_id);
+        let target_file_name = target_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a runtime checkpoint basename is canonical ASCII")
+            .to_owned();
         let lock_file_name = format!("cat-{}.checkpoint.lock", cat_id.as_str());
         let temporary_file_name = format!(".cat-{}.checkpoint.tmp", cat_id.as_str());
         let target_name = c_string(&target_file_name, directory)?;
@@ -164,7 +169,7 @@ impl FileCheckpointStore {
             _writer_lock: writer_lock,
             directory_path: directory.to_path_buf(),
             target_name,
-            target_path: directory.join(target_file_name),
+            target_path,
             temporary_name,
             temporary_path,
             cat_id: cat_id.clone(),
@@ -616,6 +621,13 @@ impl FileCheckpointStore {
     pub(super) fn before_publish_once(&self, hook: impl FnOnce(&Path) + Send + 'static) {
         self.faults.lock().expect("test fault lock").before_publish = Some(Box::new(hook));
     }
+}
+
+/// The single deterministic path used by both the read-only inventory pass
+/// and the per-Cat checkpoint writer. The `cat-` prefix makes even the valid
+/// F0 `Id` values `.` and `..` ordinary basenames; `Id` rejects `/` and NUL.
+pub fn runtime_checkpoint_path(directory: &Path, cat_id: &Id) -> PathBuf {
+    directory.join(format!("cat-{}.checkpoint.json", cat_id.as_str()))
 }
 
 #[derive(Clone, Copy)]

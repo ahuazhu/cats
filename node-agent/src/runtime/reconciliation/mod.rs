@@ -16,15 +16,21 @@
 mod admission_port;
 mod checkpoint;
 mod gate_planner;
+mod inventory;
 mod root_provision;
 
 pub use admission_port::{
     AdmissionGatePort, AdmissionSnapshot, GatePortError, IdleCloseResult, SnapshotError,
 };
-pub use checkpoint::{CheckpointStoreError, FileCheckpointStore, StoredCheckpoint};
+pub use checkpoint::{
+    runtime_checkpoint_path, CheckpointStoreError, FileCheckpointStore, StoredCheckpoint,
+};
 pub use gate_planner::{
     applied_desired_evidence, AppliedDesiredError, GateReconcileError, GateSequencer,
     GateTransitionResult, PersistTimes,
+};
+pub use inventory::{
+    CleanSlateInventoryScanner, InventoryAbsence, InventoryAbsenceProbe, InventoryProbeSetError,
 };
 pub use root_provision::{
     AuthorityRereadRequired, RootProvisionClientError, RootProvisionControlPort,
