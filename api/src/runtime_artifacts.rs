@@ -169,7 +169,10 @@ pub fn load_installed_runtime_provisioner_trust_bundle(
 fn load_installed_runtime_provisioner_trust_bundle_platform(
     path: &Path,
 ) -> Result<InstalledRuntimeProvisionerTrustBundle, RuntimeArtifactError> {
-    let identity_directory = open_installed_directory(&["etc", "cats", "identity"], 0o755)?;
+    let identity_directory = open_installed_directory(
+        &["etc", "cats", "identity"],
+        InstalledDirectoryMode::ProvisionerIdentity,
+    )?;
     let exact_bytes = read_exact_installed_file_at(
         &identity_directory,
         "runtime-provisioner-trust.v1.json",
@@ -204,7 +207,10 @@ pub fn load_installed_guest_runtime_profile_receipt(
 fn load_installed_guest_runtime_profile_receipt_platform(
     receipt_path: &Path,
 ) -> Result<InstalledGuestRuntimeProfileReceipt, RuntimeArtifactError> {
-    let release_directory = open_installed_directory(&["opt", "cats", "release"], 0o755)?;
+    let release_directory = open_installed_directory(
+        &["opt", "cats", "release"],
+        InstalledDirectoryMode::Exact(0o755),
+    )?;
     let manifest_path = Path::new(GUEST_RUNTIME_RELEASE_MANIFEST_PATH);
     let exact_manifest_bytes = read_exact_installed_file_at(
         &release_directory,
@@ -255,7 +261,10 @@ fn load_installed_guest_runtime_profile_receipt_platform(
 pub fn validate_installed_node_guest_runtime(
     installed: &InstalledGuestRuntimeProfileReceipt,
 ) -> Result<(), RuntimeArtifactError> {
-    let guest_directory = open_installed_directory(&["opt", "cats", "guest"], 0o755)?;
+    let guest_directory = open_installed_directory(
+        &["opt", "cats", "guest"],
+        InstalledDirectoryMode::Exact(0o755),
+    )?;
     let kernel = read_exact_installed_file_at(
         &guest_directory,
         "vmlinuz",
@@ -307,7 +316,10 @@ pub fn open_verified_guest_runtime_launch(
     {
         return Err(RuntimeArtifactError::InvalidReceipt);
     }
-    let guest_directory = open_installed_directory(&["opt", "cats", "guest"], 0o755)?;
+    let guest_directory = open_installed_directory(
+        &["opt", "cats", "guest"],
+        InstalledDirectoryMode::Exact(0o755),
+    )?;
     let kernel = open_verified_installed_member_at(
         &guest_directory,
         "vmlinuz",
@@ -411,9 +423,31 @@ fn release_id(exact_manifest: &[u8]) -> Sha256Digest {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy)]
+enum InstalledDirectoryMode {
+    Exact(u32),
+    ProvisionerIdentity,
+}
+
+#[cfg(unix)]
+impl InstalledDirectoryMode {
+    fn accepts(self, mode: u32) -> bool {
+        let mode = mode & 0o777;
+        match self {
+            Self::Exact(expected) => mode == expected,
+            // Metal keeps identity material private (0700), while the
+            // container image exposes this non-secret public-key trust bundle
+            // from a traversal-only installed directory (0755). No other mode
+            // is part of the installed artifact contract.
+            Self::ProvisionerIdentity => matches!(mode, 0o700 | 0o755),
+        }
+    }
+}
+
+#[cfg(unix)]
 fn open_installed_directory(
     components: &[&str],
-    final_mode: u32,
+    final_mode: InstalledDirectoryMode,
 ) -> Result<File, RuntimeArtifactError> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -436,7 +470,7 @@ fn open_installed_directory(
             .metadata()
             .map_err(|_| filesystem_error(&display))?;
         let mode_is_valid = if index + 1 == components.len() {
-            metadata.mode() & 0o777 == final_mode
+            final_mode.accepts(metadata.mode())
         } else {
             metadata.mode() & 0o022 == 0
         };
@@ -690,6 +724,20 @@ mod tests {
             load_installed_runtime_provisioner_trust_bundle(Path::new("relative.json")),
             Err(RuntimeArtifactError::WrongProvisionerTrustPath)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provisioner_identity_directory_accepts_metal_and_container_modes_only() {
+        let contract = InstalledDirectoryMode::ProvisionerIdentity;
+        assert!(contract.accepts(0o700), "Metal identity directory");
+        assert!(contract.accepts(0o755), "container identity directory");
+        for unsafe_mode in [0o000, 0o500, 0o711, 0o750, 0o770, 0o775, 0o777] {
+            assert!(
+                !contract.accepts(unsafe_mode),
+                "mode {unsafe_mode:o} escaped the closed identity-directory contract"
+            );
+        }
     }
 
     #[test]
