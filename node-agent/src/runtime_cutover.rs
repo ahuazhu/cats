@@ -194,10 +194,23 @@ pub async fn spawn_signed_runtime_cutover(
         .register_until_session(&config.control_plane_url)
         .await
         .context("establish durable Agent session")?;
+    #[cfg(not(test))]
     let client = RuntimeSpineHttpClient::for_production(
         &config.control_plane_url,
         &config.agent_registration,
     )?;
+    #[cfg(test)]
+    let client = if config.agent_registration.uses_loopback_transport_for_test() {
+        RuntimeSpineHttpClient::for_loopback_test(
+            &config.control_plane_url,
+            config.agent_registration.runtime_request_signer(),
+        )?
+    } else {
+        RuntimeSpineHttpClient::for_production(
+            &config.control_plane_url,
+            &config.agent_registration,
+        )?
+    };
     let scanner = installed_clean_slate_scanner(InstalledCleanSlateProbeConfig {
         state_directory: config.agent_registration.runtime_state_directory(),
         cloud_hypervisor_binary: config.cloud_hypervisor_binary,
@@ -223,6 +236,12 @@ pub async fn spawn_signed_runtime_cutover(
     let readiness = Readiness::closed();
     let runner_readiness = readiness.clone();
     let (shutdown_runner, mut runner_shutdown) = tokio::sync::oneshot::channel();
+    // This value owns the Host-global open-file-description lock acquired
+    // before registration. Move the opaque authority into the runner task and
+    // release it only after effect/scan cancellation and journal/flock join.
+    // Keeping it merely in the Handle would release it early when Handle::drop
+    // can only request (not await) that shutdown sequence.
+    let registration_lease = config.agent_registration;
     let runner_task = tokio::spawn(async move {
         let mut runner = runner;
         let run_result = tokio::select! {
@@ -231,6 +250,7 @@ pub async fn spawn_signed_runtime_cutover(
         };
         runner_readiness.set(false);
         let shutdown_result = runner.shutdown().await;
+        drop(registration_lease);
         match (run_result, shutdown_result) {
             (Err(error), Ok(())) => Err(error),
             (Ok(()), Err(error)) => Err(error.into()),
@@ -319,6 +339,85 @@ fn apply_readiness_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::{Body, Bytes};
+    use axum::response::Response;
+    use axum::routing::post;
+    use cats_api::agent_registration::{
+        Ed25519RequestSigner, JSON_CONTENT_TYPE, REGISTRATION_PATH,
+    };
+    use cats_api::runtime_reconciliation::{
+        decode_agent_registration_attempt, encode_agent_session, AgentSession, AsciiText,
+        ContractVersion, CredentialBinding, Epoch, GuestRuntimeProfileReceipt, Id, NodeBootId,
+        NodeIdentity, NodeIdentityState, Sha256Digest, UnixMillis, DESIRED_READ_PATH,
+    };
+
+    #[derive(Clone)]
+    struct RegistrationStub {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    async fn accept_registration(State(stub): State<RegistrationStub>, body: Bytes) -> Response {
+        let attempt = decode_agent_registration_attempt(&body).unwrap();
+        stub.calls.fetch_add(1, Ordering::SeqCst);
+        let session = AgentSession {
+            version: ContractVersion::V1,
+            node_id: attempt.node_id,
+            immutable_host_id: attempt.immutable_host_id,
+            node_boot_id: attempt.node_boot_id,
+            agent_instance_id: attempt.agent_instance_id,
+            agent_session_epoch: Epoch::new(
+                attempt
+                    .expected_agent_session_epoch
+                    .map_or(1, |epoch| epoch.get() + 1),
+            )
+            .unwrap(),
+            registration_attempt_id: attempt.registration_attempt_id,
+            guest_config_digest: attempt.guest_config_digest,
+            lease_deadline_unix_ms: UnixMillis::new(1_900_000_060_000).unwrap(),
+        };
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", JSON_CONTENT_TYPE)
+            .body(Body::from(encode_agent_session(&session).unwrap()))
+            .unwrap()
+    }
+
+    async fn hold_desired_read() -> StatusCode {
+        std::future::pending().await
+    }
+
+    fn registration_config(
+        state_path: std::path::PathBuf,
+    ) -> anyhow::Result<AgentRegistrationConfig> {
+        let signer = Ed25519RequestSigner::from_pkcs8_pem(
+            Id::new("credential_cutover_a").unwrap(),
+            include_bytes!("../../tests/fixtures/route_grant_private_ed25519.pem"),
+        )
+        .unwrap();
+        AgentRegistrationConfig::for_loopback_test(
+            NodeIdentity {
+                version: ContractVersion::V1,
+                node_id: Id::new("node_cutover_a").unwrap(),
+                immutable_host_id: Id::new("host_cutover_a").unwrap(),
+                credential_id: signer.credential_id().clone(),
+                credential_binding: CredentialBinding::PublicKey {
+                    public_key_spki_sha256: signer.public_key_spki_sha256(),
+                },
+                state_path_id: Id::new("state_cutover_a").unwrap(),
+                state: NodeIdentityState::Provisioned,
+            },
+            signer,
+            state_path,
+            NodeBootId::new("11111111111111111111111111111111").unwrap(),
+            &GuestRuntimeProfileReceipt {
+                version: ContractVersion::V1,
+                kernel_digest: Sha256Digest::new(format!("sha256:{}", "1".repeat(64))).unwrap(),
+                initramfs_digest: None,
+                kernel_cmdline: AsciiText::new("console=hvc0 root=/dev/vda").unwrap(),
+                guest_agent_protocol_version: ContractVersion::V1,
+            },
+        )
+    }
 
     #[tokio::test]
     async fn health_stays_closed_without_an_accepted_full_observation() {
@@ -354,6 +453,72 @@ mod tests {
             assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
         }
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn runner_owns_host_lock_until_all_runtime_workers_are_joined() {
+        let state_root = tempfile::tempdir().unwrap();
+        let state_path = state_root.path().join("state");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_address = listener.local_addr().unwrap();
+        let stub = RegistrationStub {
+            calls: calls.clone(),
+        };
+        let control = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(REGISTRATION_PATH, post(accept_registration))
+                    .route(DESIRED_READ_PATH, post(hold_desired_read))
+                    .with_state(stub),
+            )
+            .await
+            .unwrap();
+        });
+        let origin = format!("http://{control_address}");
+        let registration = registration_config(state_path.clone()).unwrap();
+        let mut handle = spawn_signed_runtime_cutover(SignedRuntimeCutoverConfig {
+            listen: "127.0.0.1:0".into(),
+            control_plane_url: origin.clone(),
+            agent_registration: registration,
+            cloud_hypervisor_binary: "/opt/cats/bin/cloud-hypervisor".into(),
+            blockd_binary: "/opt/cats/bin/cats-blockd".into(),
+            guest_agent_binary: "/opt/cats/bin/cats-guest-agent".into(),
+            metering_cgroup_root: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let session_path = state_path.join(crate::agent_registration::SESSION_RELATIVE_PATH);
+        let first_session = std::fs::read(&session_path).unwrap();
+        let first_epoch = cats_api::runtime_reconciliation::decode_agent_session(&first_session)
+            .unwrap()
+            .agent_session_epoch;
+        assert_eq!(first_epoch.get(), 1);
+
+        // Acquiring the Host lease precedes pending-attempt creation and every
+        // network registration write. A competing process cannot replace the
+        // active Agent's session and then discover the journal flock too late.
+        assert!(registration_config(state_path.clone()).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(&session_path).unwrap(), first_session);
+
+        handle.request_runner_shutdown();
+        join_result(
+            (&mut handle.runner_task).await,
+            "join runner in Host lease regression",
+        )
+        .unwrap();
+
+        // The task drops its opaque registration lease only after
+        // RuntimeSpineRunner::shutdown has joined effect, scan and journal.
+        let successor = registration_config(state_path).unwrap();
+        let successor_session = successor.register_until_session(&origin).await.unwrap();
+        assert_eq!(successor_session.agent_session_epoch.get(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        drop(successor);
+        control.abort();
     }
 
     #[test]

@@ -217,6 +217,11 @@ impl AgentRegistrationConfig {
         self.signer.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn uses_loopback_transport_for_test(&self) -> bool {
+        matches!(self.transport, RegistrationTransport::LoopbackTest)
+    }
+
     /// Keeps one exact pending attempt durable across every ambiguous result.
     /// A returned session has already been validated, fsynced, and made the
     /// sole durable current session before the pending file was removed.
