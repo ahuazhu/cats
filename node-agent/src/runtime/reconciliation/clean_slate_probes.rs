@@ -65,7 +65,6 @@ trait MetadataAuthorityAbsenceReader:
 }
 
 enum MetadataAuthorityRead {
-    Empty,
     Complete { first_present: Id },
     Incomplete,
 }
@@ -117,9 +116,7 @@ impl VolumeDataAuthorityMetadataReader {
                             Err(_error) => incomplete = true,
                         }
                     }
-                    let result = if was_empty {
-                        MetadataAuthorityRead::Empty
-                    } else if incomplete {
+                    let result = if was_empty || incomplete {
                         MetadataAuthorityRead::Incomplete
                     } else if let Some(first_present) = first_present {
                         MetadataAuthorityRead::Complete { first_present }
@@ -154,10 +151,12 @@ impl MetadataAuthorityAbsenceReader for VolumeDataAuthorityMetadataReader {
         debug_assert_eq!(deadline, context.deadline());
         context.check_active()?;
         if candidate_volume_ids.is_empty() {
-            // The candidate set is the union of complete Desired and local
-            // namespaces. No unbounded global metadata listing is required to
-            // prove absence when that closed set is empty.
-            return Ok(InventoryAbsence::Empty);
+            // Point reads cannot prove that no authority-only orphan or owner
+            // exists outside Desired and local namespaces. Until a frozen,
+            // bounded authoritative absence/listing port exists, local
+            // emptiness must remain incomplete without issuing a meaningless
+            // synthetic point read.
+            return Ok(InventoryAbsence::Unavailable);
         }
 
         if self
@@ -195,7 +194,6 @@ impl MetadataAuthorityAbsenceReader for VolumeDataAuthorityMetadataReader {
         };
         context.check_active()?;
         match result {
-            MetadataAuthorityRead::Empty => Ok(InventoryAbsence::Empty),
             MetadataAuthorityRead::Incomplete => Ok(InventoryAbsence::Unavailable),
             MetadataAuthorityRead::Complete { first_present } => {
                 bail!("clean-slate metadata authority retains volume {first_present}")
@@ -797,9 +795,9 @@ impl InventoryAbsenceProbe for MetadataStoreProbe {
             local_candidates_complete = false;
         }
 
-        // The reader can prove an empty complete candidate set without a
-        // global authority listing. Every nonempty candidate is instead read
-        // through the strict authority port. The exact scan deadline is
+        // Every nonempty candidate is read through the strict authority port.
+        // An empty candidate set is still unavailable because point reads
+        // cannot prove global authority absence. The exact scan deadline is
         // passed through rather than recomputed per source.
         let authority_absence = self.authority.prove_absent(
             &context.coordinates().session.node_id,
@@ -1947,14 +1945,15 @@ mod tests {
     }
 
     #[test]
-    fn production_clean_host_is_complete_without_metadata_authority_io() {
+    fn production_clean_host_is_incomplete_without_global_authority_absence_port() {
         let environment = TestEnvironment::new();
         let (authority, calls) = TestVolumeDataAuthority::missing();
         let reader = Arc::new(VolumeDataAuthorityMetadataReader::start(authority).unwrap());
         let scanner = scanner_with_metadata_authority(environment.config(), reader).unwrap();
         assert!(matches!(
             scanner.scan_complete(context()).unwrap(),
-            RuntimeInventoryScanOutcome::Complete(_)
+            RuntimeInventoryScanOutcome::Incomplete { unavailable_sources }
+                if unavailable_sources == [InventorySource::MetadataStore]
         ));
         assert!(calls.lock().unwrap().is_empty());
         assert!(!environment.state.join(LEGACY_LEDGER).exists());
@@ -2034,22 +2033,29 @@ mod tests {
     }
 
     #[test]
-    fn typed_volume_authority_reader_proves_an_empty_candidate_set_without_io() {
-        let (authority, calls) = TestVolumeDataAuthority::missing();
-        let reader = VolumeDataAuthorityMetadataReader::start(authority).unwrap();
-        let scan_context = context();
-        assert_eq!(
-            reader
-                .prove_absent(
-                    &scan_context.coordinates().session.node_id,
-                    &BTreeSet::new(),
-                    scan_context.deadline(),
-                    &scan_context,
-                )
-                .unwrap(),
-            InventoryAbsence::Empty
-        );
-        assert!(calls.lock().unwrap().is_empty());
+    fn typed_point_reader_cannot_prove_an_empty_candidate_set() {
+        for (authority, calls) in [
+            TestVolumeDataAuthority::missing(),
+            TestVolumeDataAuthority::present(),
+        ] {
+            let reader = VolumeDataAuthorityMetadataReader::start(authority).unwrap();
+            let scan_context = context();
+            assert_eq!(
+                reader
+                    .prove_absent(
+                        &scan_context.coordinates().session.node_id,
+                        &BTreeSet::new(),
+                        scan_context.deadline(),
+                        &scan_context,
+                    )
+                    .unwrap(),
+                InventoryAbsence::Unavailable
+            );
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "a point lookup cannot manufacture a global absence read"
+            );
+        }
     }
 
     #[test]
