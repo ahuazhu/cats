@@ -3,6 +3,8 @@
 - 状态：Target operations contract；终态模块尚未全部实现
 - 架构：[Architecture](architecture.md)
 - Runtime：[Runtime Reconciliation v1](specs/runtime-reconciliation-v1.md)
+- Agent transport：[Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md)
+- Runtime internal spine：[Runtime Inventory and Observation Spine v1](specs/runtime-inventory-observation-v1.md)
 - Route：[Route Grant v2](specs/route-grant-v2.md)
 
 本文只定义终态运行边界和验收入口。它不引入新的 authority、工作流、共享 route cache或
@@ -161,7 +163,9 @@ event行；rejoin取得该锁后再按稳定顺序锁全部授权，所以不会
   signer active kid；
 - Gateway：每replica LRU size/bytes/eviction、hit/miss/expiry、negative/backoff、in-flight keys、
   singleflight waiters/reject、resolve latency/error、typed pre-admission reason、UpstreamUnavailable；
-- Node：Host lock/session、inventory attestation epoch/freshness、checkpoint rebuild、gate Active/Closed、active guards、
+- Node：Host lock/session、按
+  [Inventory Spine §7](specs/runtime-inventory-observation-v1.md#7-planner--signer-的同-snapshot读取)计算的
+  inventory attestation/per-Cat observation freshness、checkpoint rebuild、gate Active/Closed、active guards、
   close/drain time、Blocked reason、runtime incarnation、ring version/digest/loaded kids；
 - Storage/lifecycle：逐卷owner/epoch、`R/L` gap、Strict FLUSH、object-store error、Cold fallback、
   `DataLossPossible`、orphan/quarantine、Deleting row age、sweeper scan/delete/re-list-empty failure和completion

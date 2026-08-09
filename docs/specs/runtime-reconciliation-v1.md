@@ -3,13 +3,16 @@
 - 状态：Target contract；尚未实现
 - Authority：[ADR-0040](../decisions/0040-level-triggered-runtime-reconciliation.md)
 - 生命周期：[runtime-lifecycle.md](../runtime-lifecycle.md)
+- Internal delivery/acceptance：[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)
 
-本文定义 Control Plane 与 Node Agent 之间最小、可测试的收敛合同。传输可以是
-heartbeat、long-poll 或普通 GET；正确性不得依赖通知必达、连接不断或消息只到达一次。
-Agent注册、internal HTTP前缀、per-Node request proof、public error mapping、lease续期和
-Guest runtime receipt部署路径由
-[Agent Registration and Internal Transport v1](agent-registration-transport-v1.md)冻结；其他transport不得
-重新解释本文件的共享类型或建立第二个identity/session authority。
+本文只定义 Control Plane 与 Node Agent 之间最小、可测试的共享domain收敛合同，
+不另行定义transport。Agent注册、internal HTTP前缀、全部runtime internal请求共用的
+per-Node request proof、registration public error、session lease和Guest runtime receipt部署路径由
+[Agent Registration and Internal Transport v1](agent-registration-transport-v1.md)冻结。Desired read-position、
+observation acceptance的两条唯一HTTP route、endpoint-local error、原子事务和freshness由
+[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)冻结。其他transport不得重新
+解释本文件的共享类型、建立第二个identity/session authority，或把通知必达、连接不断、
+消息只到达一次当作正确性前提。
 
 文中的 MUST/MUST NOT 是上线条件。
 
@@ -100,7 +103,11 @@ V1的值只能是`1`；顶层不存在`format_version`或按合同名变化的ve
 | `DesiredRuntimeSpec` | 1048576 |
 | `RuntimeCheckpoint` | 4194304 |
 | `NodeCleanupCheckpoint` | 65536 |
+| `DesiredReadRequest` | 16384 |
+| `DesiredReadSnapshot` | 16777216 |
 | `NodeObservation` | 8388608 |
+| `ObservationAcceptance` | 16384 |
+| `RuntimeSpineError` | 20480 |
 | `Operation` | 65536 |
 | `ContractError` | 16384 |
 
@@ -232,11 +239,17 @@ AdmissionInventoryAttestation {
 }
 ```
 
-`inventory_epoch`在同一session内从1单调递增。`inventory_read_position`是该bounded scan开始时
-Control Plane完整assigned-spec读取返回的不可复用服务端位置；full scan必须再读同一位置仍覆盖完整
-集合后才能提交，不能用Node本地时间或目录游标代替。`accepted_at_unix_ms`由PostgreSQL写入。后续
-partial heartbeat只引用该epoch并upsert具体Cat，不能覆盖这条attestation。Route signer同时检查fresh
-attestation与fresh per-Cat observation；不要求每次heartbeat重新做全量scan。
+`inventory_epoch`在同一session内从1单调递增，first/next的精确边界见
+[Inventory Spine §5.1](runtime-inventory-observation-v1.md#51-inventory-epoch)。`inventory_read_position`是该
+bounded scan开始时Control Plane完整assigned-spec读取返回的不可复用服务端位置；签发scope、session
+replacement、expiry、replay和bounded GC以
+[Inventory Spine §3](runtime-inventory-observation-v1.md#3-desired-read-position)为准。full scan必须在
+接受事务中重读current assigned set并与该位置保存的完整snapshot逐字段相同后才能提交，不能用Node本地
+时间或目录游标代替。`accepted_at_unix_ms`由PostgreSQL写入。后续
+partial observation只引用该epoch并upsert具体Cat，不能覆盖这条attestation。Route signer同时检查fresh
+attestation与fresh per-Cat observation；精确不等式和窗口见
+[Inventory Spine §7](runtime-inventory-observation-v1.md#7-planner--signer-的同-snapshot读取)，不要求每次
+observation重新做全量scan。
 
 注册步骤如下：
 
@@ -247,12 +260,23 @@ attestation与fresh per-Cat observation；不要求每次heartbeat重新做全�
    `expected_agent_session_epoch` 和新 attempt 做 CAS replacement。Host lock 证明旧本地进程已退出。
 4. 不同 Host 不能 replacement 同一 `node_id`。它必须先经过显式 retire/fence 和 reprovision，
    取得新的 NodeIdentity/credential。
-5. heartbeat、desired 读取和 observation 都绑定当前 session。新 session 成功后，旧 session
+5. Desired读取和observation都按Inventory Spine绑定当前 session。新 session 成功后，旧 session
    的所有请求永久拒绝。
 
 这些步骤的唯一HTTP实现是
 `POST /v1/internal/runtime/agent-sessions`；request/success/error envelope、body cap、status和crash-safe
 Node落盘顺序见[Agent Registration Transport §2–§6](agent-registration-transport-v1.md#2-registration-http-wire)。
+注册后的Desired读取和observation提交只能分别使用
+`POST /v1/internal/runtime/desired-reads`和`POST /v1/internal/runtime/observations`；两者都先复用
+A19的同一proof adapter，再按Inventory Spine绑定current session。没有GET/long-poll、legacy
+heartbeat/inventory route或shared bearer兼容入口。
+
+registration attempt中的首次`AgentSession`结果不可变并保留初始deadline。只有Inventory Spine首次接受
+一个新heartbeat sequence时，current session row才允许在identity/session字段不变的前提下，以同一
+PostgreSQL `db_now`单调推进为`max(old_deadline, db_now + 60000)`；attempt replay仍返回
+最初结果，Desired read、exact observation replay和错误都不续期。expired current session不能签发或
+exact replay Desired，也不能首次接受新observation；deadline后唯一success例外是current session
+highest accepted sequence的exact observation replay，它只返回首次success，零写入且不续期。
 
 ## 3. DesiredRuntimeSpec
 
@@ -592,7 +616,9 @@ Endpoint/hostname lookup -> Operation`；name lock是transaction-scoped advisory
 ## 4. Desired delivery 与 AdmissionCell
 
 Control Plane 必须支持 Node 周期性拉取其全部 assigned specs。push/notify 只能提前触发拉取。
-列表带服务端读取位置和“完整集合”标志；一次缺项不能触发 orphan 删除。
+唯一wire是[Inventory Spine §1](runtime-inventory-observation-v1.md#1-常量与共享-wire)的
+`DesiredReadRequest -> DesiredReadSnapshot`；封闭snapshot类型本身表示完整集合，不另造boolean proof。
+一次缺项不能触发 orphan 删除。
 
 Node 处理规则：
 
@@ -1079,7 +1105,10 @@ AppliedDesiredEvidence {
 
 `applied_desired=null`只允许full inventory发现了无法关联到有效checkpoint/Desired的orphan；它不能
 携带`Ready`，也不能结算Operation。Running/Suspended必须有`runtime_incarnation`；Warm/Cold/Deleted
-必须为`null`。只有§11完整postcondition成立时`stable_state`才非null。
+必须为`null`。只有§11完整postcondition成立时`stable_state`才非null。full inventory中cursor assigned
+Cat的nonnull/exact applied binding由
+[Inventory Spine §5.2](runtime-inventory-observation-v1.md#52-full-cursor-与-complete-assigned-set)在接受
+attestation前强制执行，且不以该Cat存在Pending Operation为前提。
 
 Control Plane先按§16.4确认当前完整session/instance，再对该session的
 `heartbeat_sequence`执行唯一接收状态机。“相同payload”指两个已通过严格decoder的
@@ -1098,6 +1127,9 @@ Control Plane先按§16.4确认当前完整session/instance，再对该session�
    不同仍是conflict。
 4. presented sequence小于最高已接受值：返回`stale_observation_sequence`，零副作用；
    不再为该旧sequence查找或重放历史成功结果。
+
+exact route、deadline renewal、cursor/epoch检查、服务端`ObservationAcceptance`和同事务Operation settlement
+由[Inventory Spine §4-§6](runtime-inventory-observation-v1.md#4-observation-sessionsequence-gate)补全。
 
 Node的`observed_at_unix_ms`不用于sequence比较或freshness。`loaded_kids`按`KeyId`升序且无重复，
 `runtimes`按`cat_id`升序且无重复。
@@ -1968,6 +2000,7 @@ Conditions可并存，但`kind="ready"`每个runtime至多一个，其他Conditi
 |---|---:|---|
 | `DesiredRuntimeSpec.volumes` | 64 | `(volume_intent_id)`；§3.1列出的各identity分别唯一 |
 | `DesiredRuntimeSpec.endpoints` | 256 | `(endpoint_id)`；`endpoint_id`和`hostname`分别唯一 |
+| `DesiredReadSnapshot.desired_specs` | 1024 | `(cat_id)`；`cat_id`唯一，每项是完整`DesiredRuntimeSpec` |
 | `processes` | 128 | `(role.kind rank, role stable identity, process_start_time_ticks, process_id, CJ(item))`；`role stable identity`对VMM是`runtime_incarnation`，对blockd是`(volume_id, attachment_epoch, attachment_id)`；`(process_start_time_ticks, process_id)`唯一 |
 | `volumes` | 64 | `(volume_id)`；`volume_id`唯一 |
 | `ObservedVolume.local_lineages` | 8 | `(attachment_epoch, attachment_id, data_directory, CJ(item))`；`data_directory`唯一 |
@@ -2134,9 +2167,24 @@ stale/conflicting observation sequence、revision、stored digest或placement也
   `/runtimes/{runtime_index}/conditions/{condition_index}/reason/placement_epoch`；index是输入canonical array
   中的十进制数值位置。多个condition候选按§16.4逻辑path选择；同一reason两字段都不等时选择`node_id`。
   该拒绝作用于整份observation且零副作用，不能写入一个与Operation placement不一致的terminal reason。
+- 上述所有context-bound检查通过后，对每个current Pending Operation从该runtime已按
+  §10.4排好的`conditions`中按原wire顺序筛选
+  `kind in {"precondition_failed", "quarantined"}`。非空时唯一选择是第一项，也就是
+  `(Condition.kind rank, reason.kind rank, CJ(item))`的最小terminal Condition；不得按数据库行顺序、
+  枚举发现顺序、message、自定义severity或“quarantine更严重”重排。选中
+  `precondition_failed`时写`OperationFailure {kind:"precondition_failed", reason: exact selected reason}`；
+  选中`quarantined`时同理写`OperationFailure {kind:"quarantined", reason: exact selected reason}`。
+  后续terminal Condition仍保留在accepted observation/read model中，但不聚合、覆盖或改写
+  immutable Operation terminal。
+- 只要上述terminal candidate非空，该Pending Operation就先结算为Failed，即使同一
+  runtime还携带`ready`或物理事实恰好满足§11 postcondition，也不得改选Succeeded。
+  只有terminal candidate为空时才按既有§11规则在Succeeded与Pending之间选择；
+  `data_loss_possible`没有`OperationFailure`映射，不得伪造第四个failure variant。
 - 新 revision 在同一事务把旧 Pending Operation 变为 Superseded。
-- PreconditionFailed、HostLost 或 Quarantined 使当前 Pending Operation Failed。
-- Progressing、Blocked、Degraded 和暂时离线保持 Pending。
+- HostLost仍只由§9的trusted HostFence/controller事务构造，不是Node Condition，observation
+  settlement不得从timeout、`data_loss_possible`或任意reason猜测它。
+- 没有terminal candidate且未满足§11精确postcondition时，Progressing、Blocked、Degraded、
+  DataLossPossible和暂时离线保持 Pending。
 
 N+2 达到同名状态不能结算 N。observation 不写 Desired；所有用户和系统 placement 变更都走
 资源 API/Controller 的完整 revision 事务。
@@ -2274,8 +2322,9 @@ Rejoined；`host_destroyed`永不Rejoined，因此在没有tombstone、其他Hos
 ## 15. Clean-slate 切换
 
 首次部署按 [Operations and HA §8](../operations-ha.md#8-首次终态部署)执行。本规格的切换前置是：
-目标 schema 只包含本合同的 NodeIdentity、AgentSession、Desired、Operation、observation、
-attestation、per-Cat RuntimeCheckpoint与唯一NodeCleanupCheckpoint槽；exact release不含NodeJob、
+目标 schema 只包含本合同的 NodeIdentity、AgentSession、Desired、Operation、Inventory Spine的bounded
+read/receive/current attestation与per-Cat observation state、per-Cat RuntimeCheckpoint与唯一
+NodeCleanupCheckpoint槽；exact release不含NodeJob、
 heartbeat overwrite、per-dispatch数据库或旧ledger恢复入口；空fleet的
 Node 必须先完成 session 注册和 complete empty inventory，才允许任何 Running Desired。
 
@@ -2559,6 +2608,13 @@ PreconditionFailed PlacementRejected reason的`node_id`、`placement_epoch`和�
 必须接受。stale session与placement_rejected mismatch并存时必须先返回session error，且不读取或结算
 Operation。
 
+Multi-terminal settlement必须逐byte重建
+[Inventory Spine §9](runtime-inventory-observation-v1.md#9-fixed-vectors)的conditions/selected-failure向量。
+同一runtime同时有Ready、多个PreconditionFailed和Quarantined时仍只能选canonical第一个
+terminal Condition；反向SQL/迭代顺序不改变terminal bytes，非canonical condition顺序在F0拒绝，
+删除首个terminal才使选择前进。每个后续PlacementRejected仍必须先通过上述placement
+binding验证；无论它最终是否被选中，错binding都整份observation零副作用。
+
 Root provision Condition tests必须让standalone decoder接受两个新增closed reason的完整正例，并分别对
 missing/unknown字段、未知problem和wrong scalar type按§16.4固定pointer拒绝；把它们与其他Condition交换输入
 member/array顺序后，canonical `reason.kind` rank和CJ total order仍唯一。accepted observation中的
@@ -2640,6 +2696,10 @@ RegistrationAttemptBinding {
 
 ContractErrorDetail =
   {
+    code: "missing_agent_session",
+    node_id: Id
+  }
+| {
     code: "stale_session",
     node_id: Id,
     presented_agent_session_epoch: Epoch,
@@ -2677,6 +2737,125 @@ ContractErrorDetail =
     heartbeat_sequence: Sequence,
     accepted_observation_id: RandomId128,
     presented_observation_id: RandomId128
+  }
+| {
+    code: "session_expired",
+    node_id: Id,
+    agent_session_epoch: Epoch,
+    lease_deadline_unix_ms: UnixMillis,
+    server_time_unix_ms: UnixMillis
+  }
+| {
+    code: "stale_desired_read_sequence",
+    node_id: Id,
+    agent_session_epoch: Epoch,
+    presented_request_sequence: Sequence,
+    last_request_sequence: Sequence
+  }
+| {
+    code: "wrong_desired_read_sequence",
+    node_id: Id,
+    agent_session_epoch: Epoch,
+    expected_request_sequence: Sequence,
+    presented_request_sequence: Sequence
+  }
+| {
+    code: "desired_read_in_progress",
+    node_id: Id,
+    agent_session_epoch: Epoch,
+    request_sequence: Sequence,
+    read_position: Sequence,
+    expires_at_unix_ms: UnixMillis
+  }
+| {
+    code: "assigned_set_limit_exceeded",
+    node_id: Id,
+    limit: "desired_specs" | "wire_bytes",
+    maximum: U64,
+    observed_at_least: U64
+  }
+| {
+    code: "missing_inventory_read_position",
+    node_id: Id,
+    agent_session_epoch: Epoch
+  }
+| {
+    code: "stale_inventory_read_position",
+    node_id: Id,
+    agent_session_epoch: Epoch,
+    presented_read_position: Sequence,
+    current_read_position: Sequence
+  }
+| {
+    code: "wrong_inventory_read_position",
+    node_id: Id,
+    agent_session_epoch: Epoch,
+    current_read_position: Sequence,
+    presented_read_position: Sequence
+  }
+| {
+    code: "inventory_read_position_expired",
+    node_id: Id,
+    agent_session_epoch: Epoch,
+    read_position: Sequence,
+    expires_at_unix_ms: UnixMillis,
+    server_time_unix_ms: UnixMillis
+  }
+| {
+    code: "inventory_read_position_consumed",
+    node_id: Id,
+    agent_session_epoch: Epoch,
+    read_position: Sequence,
+    accepted_observation_id: RandomId128,
+    accepted_heartbeat_sequence: Sequence
+  }
+| {
+    code: "assigned_set_changed",
+    node_id: Id,
+    agent_session_epoch: Epoch,
+    read_position: Sequence
+  }
+| {
+    code: "incomplete_assigned_inventory",
+    node_id: Id,
+    agent_session_epoch: Epoch,
+    read_position: Sequence,
+    missing_cat_id: Id
+  }
+| {
+    code: "assigned_runtime_binding_mismatch",
+    node_id: Id,
+    agent_session_epoch: Epoch,
+    read_position: Sequence,
+    cat_id: Id,
+    expected: AppliedDesiredEvidence,
+    presented: AppliedDesiredEvidence | null
+  }
+| {
+    code: "missing_inventory_attestation",
+    node_id: Id,
+    agent_session_epoch: Epoch
+  }
+| {
+    code: "stale_inventory_epoch",
+    node_id: Id,
+    agent_session_epoch: Epoch,
+    presented_inventory_epoch: Epoch,
+    current_inventory_epoch: Epoch
+  }
+| {
+    code: "wrong_inventory_epoch",
+    node_id: Id,
+    agent_session_epoch: Epoch,
+    expected_inventory_epoch: Epoch,
+    presented_inventory_epoch: Epoch
+  }
+| {
+    code: "partial_cat_not_in_full_inventory",
+    node_id: Id,
+    agent_session_epoch: Epoch,
+    inventory_epoch: Epoch,
+    cat_id: Id
   }
 | {
     code: "stale_revision",
@@ -2737,9 +2916,14 @@ ContractErrorDetail =
 
 ContractName = "node_identity" | "agent_registration_attempt" | "agent_session"
              | "guest_runtime_profile_receipt" | "admission_inventory_attestation" | "desired_runtime_spec"
+             | "desired_read_request" | "desired_read_snapshot"
              | "runtime_checkpoint" | "node_cleanup_checkpoint" | "node_observation"
-             | "operation" | "contract_error"
+             | "observation_acceptance" | "runtime_spine_error" | "operation" | "contract_error"
 ```
+
+Inventory/Desired delivery variants的适用边界、字段不等式和固定选择以
+[Runtime Inventory and Observation Spine §8](runtime-inventory-observation-v1.md#8-closed-context-errors-与固定选择)
+为准；它们不是legacy heartbeat error或可扩展string map。
 
 `message`只供人读，接收方只能按`error.code`及typed payload分支。所有顶层合同共用下面唯一的
 validation pipeline；实现不得为某个合同类型另排优先级或在serde首次报错处提前返回。
@@ -2837,27 +3021,36 @@ context-free decoder通过后，需要外部状态的边界才进入context-boun
 适用的stage按下列固定顺序执行，不适用的stage直接跳过。前一stage失败时不得读取、执行或产生后一stage的
 任何副作用：
 
-1. **session**：presented epoch小于current返回`stale_session`；epoch相同但boot/instance不匹配，或
-   presented epoch更大，返回`wrong_session`。
+1. **session**：authenticated provisioned Node没有current row返回`missing_agent_session`；presented epoch
+   小于current返回`stale_session`；epoch相同但Node/boot/instance不匹配，或presented epoch更大，返回
+   `wrong_session`。authenticated Node来自credential，绝不按presented `node_id`改查另一Node。
 2. **observation sequence**：session通过后才执行§10唯一接收状态机。小于最高值返回
    `stale_observation_sequence`；等于但decoded payload不同返回`observation_sequence_conflict`；exact replay
    只读首次成功结果。
-3. **revision**：此时才读取current Desired/Operation的revision字段，按边界语义返回`stale_revision`或
+3. **session deadline 与 inventory delivery**：只对首次处理的新observation在sequence之后使用同一
+   PostgreSQL `db_now`检查deadline；current session highest exact observation replay在此前返回且
+   不续期，即使deadline已过。full/partial observation随后严格按
+   [Inventory Spine §5](runtime-inventory-observation-v1.md#5-full-与-partial-inventory-接受)检查cursor、assigned
+   set、inventory epoch、完整assigned Cat集合，以及每个assigned Cat独立于Operation phase的exact
+   `applied_desired` binding。Desired read endpoint不使用该例外；它在session后按
+   Inventory Spine §3先检查deadline和server-time causality，再执行独立request-sequence/cursor状态机，
+   expired session不得返回Desired exact replay。
+4. **revision**：此时才读取current Desired/Operation的revision字段，按边界语义返回`stale_revision`或
    `wrong_revision`，不能用后来revision结算旧Operation。
-4. **stored/context digest**：revision通过后才读取对应stored digest并比较。只有同Cat、同revision的
+5. **stored/context digest**：revision通过后才读取对应stored digest并比较。只有同Cat、同revision的
    current Desired/Operation spec digest不等才返回`revision_digest_conflict`；该code绝不表示§16.4.1
    self-digest重算失败，也不用于file content、inventory attestation或其他context digest。其他context
    digest mismatch按其既有domain语义拒绝，不构造虚假的revision字段。
-5. **placement**：digest通过后才读取对应stored/current Operation的placement字段；node ID或placement
+6. **placement**：digest通过后才读取对应stored/current Operation的placement字段；node ID或placement
    epoch不匹配返回`wrong_placement`。
-6. **Operation settlement / postcondition / external facts**：最后才结算Operation、验证目标完整postcondition
+7. **Operation settlement / postcondition / external facts**：最后才结算Operation、验证目标完整postcondition
    或读取/执行Node物理事实。stale session等前层错误不得读取Operation、filesystem或provider事实。
 
 外部checkpoint文件的content digest，Cleanup与accepted inventory/Desired的绑定，
 `AdmissionInventoryAttestation`与已接受inventory的绑定，Operation与current Desired的绑定，以及runtime、
 volume、route、provider等事实都不属于单对象decoder。Admission attestation与accepted inventory的digest
-在第4 stage验证；Operation/current Desired的revision、digest和placement绑定分别在第3/4/5 stage验证；
-external file、Cleanup binding、terminal settlement和物理postcondition只在第6 stage执行。任何非stored
+在第5 stage验证；Operation/current Desired的revision、digest和placement绑定分别在第4/5/6 stage验证；
+external file、Cleanup binding、terminal settlement和物理postcondition只在第7 stage执行。任何非stored
 revision/spec的digest mismatch都不能伪造`revision_digest_conflict`payload。
 特别地，`CheckpointEvidence.valid`只携带checkpoint projection，不携带完整`RuntimeCheckpoint`，所以其
 `content_digest`只能由Node读取完整文件后验证，不是self-digest规则。
@@ -2872,7 +3065,10 @@ Plane进入内部fatal/unready并停止签发新的Desired、placement和Grant�
 非Observation边界的`wrong_placement.expected/presented`就是该边界实际比较的两份完整
 `AssignedPlacement`，不能为填充错误payload构造虚假placement。
 
-NodeObservation settlement的revision、stored spec digest和placement三个stage共用同一外层选择：只遍历
+full inventory对全部cursor assigned Cat执行的`applied_desired`完整binding属于上述第3 stage；它先于且
+独立于下面的settlement selector，不能因Operation不是Pending而跳过。
+
+NodeObservation settlement的revision、stored spec digest和placement三个stage（上述第4/5/6）共用同一外层选择：只遍历
 `runtime.applied_desired != null`且该Cat有current Pending Operation的runtime；每个stage都独立从
 `runtimes.cat_id`最小项开始扫描，整个revision stage无冲突后才能重新从最小Cat进入digest，整个digest
 stage无冲突后才能进入placement。没有current Pending Operation的Cat不参与settlement选择；对于settlement

@@ -3,6 +3,7 @@
 - 状态：Target contract；尚未实现
 - Authority：[ADR-0041](../decisions/0041-node-verified-route-admission.md)
 - Runtime identity：[Runtime Reconciliation v1](runtime-reconciliation-v1.md)
+- Runtime accepted facts：[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)
 - Operations：[Operations and HA](../operations-ha.md)
 
 Route Grant 是 Control Plane 为一个当前 Running runtime 签发的短期 capability。Gateway
@@ -110,9 +111,13 @@ revision，必须走全局close-and-drain；之后重开全部受影响Endpoint�
    inventory_read_position,
    accepted_at_unix_ms}`；它来自accepted full scan，完整schema与digest算法以
    [Runtime Reconciliation v1](runtime-reconciliation-v1.md) §2/§16为准，
-   后续partial heartbeat不能覆盖；
+   后续partial observation不能覆盖；fresh精确使用
+   [Inventory Spine §7.2](runtime-inventory-observation-v1.md#72-route-signer-freshness)的同一DB-now与
+   `accepted_at <= db_now < accepted_at + 60000ms`，右边界相等已过期；
 5. 最新per-Cat accepted observation属于该session、引用同一inventory epoch，且其PostgreSQL
-   `accepted_at_unix_ms`足够新；freshness只使用数据库时间，不信Node上报时钟；
+   `accepted_at_unix_ms`满足同一DB-now的
+   `accepted_at <= db_now < accepted_at + 30000ms`，右边界相等已过期；freshness只使用数据库时间，
+   不信Node上报时钟；
 6. observation 的 applied revision、placement、runtime incarnation、Running/Ready condition 与
    desired 完全一致；
 7. observation 报告同Endpoint gate Active、同route epoch/protocol/port；

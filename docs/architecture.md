@@ -228,9 +228,9 @@ provisioner先把`node_id`、provider验证的不可变Host identity和每Node c
 PostgreSQL；注册不接受Agent自报identity或fleet共享credential。Agent在请求前持久化
 registration attempt，同一attempt重试返回同一session epoch；同Host新session使旧session永久
 失效。不同Host不得接管同一`node_id`；旧identity先显式fence/retire，随后以新的NodeIdentity和
-新`node_id` provision。heartbeat envelope包含
+新`node_id` provision。直接提交的`NodeObservation`包含
 session epoch、agent instance、该instance内单调sequence和本次inventory是否完整。full scan在
-current session下建立独立`AdmissionInventoryAttestation`；partial heartbeat引用其epoch而不覆盖。
+current session下建立独立`AdmissionInventoryAttestation`；partial observation引用其epoch而不覆盖。
 每个Cat status包含
 applied revision/spec digest、placement epoch、runtime incarnation、物理状态、结构化
 Condition、逐卷 owner/epoch 与 `R/L`、route gate 和 active guard 数。
@@ -244,12 +244,15 @@ storage永久销毁且该Cat保留的placement与immutable Host/state-path linea
 闭合后再GC；该检查不要求index最新boot/session等于event的fence session，普通隔离fence不够。N+2的同名
 状态不能完成N。
 
-详细合同见 [Runtime Reconciliation v1](specs/runtime-reconciliation-v1.md) 和
+共享domain合同见 [Runtime Reconciliation v1](specs/runtime-reconciliation-v1.md)，决策见
 [ADR-0040](decisions/0040-level-triggered-runtime-reconciliation.md)。注册的唯一终态入口是
 `POST /v1/internal/runtime/agent-sessions`；它和全部internal runtime请求共用的per-Node签名adapter、
-typed public error、lease与release receipt路径由
-[Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md)冻结。legacy
-`/v1/nodes/register`和shared service/admin bearer不属于目标架构。
+registration public error、session lease与release receipt路径由
+[Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md)冻结。Desired delivery只使用
+`POST /v1/internal/runtime/desired-reads`，inventory/observation接受只使用
+`POST /v1/internal/runtime/observations`；它们的事务、endpoint-local error和planner/signer freshness由
+[Runtime Inventory and Observation Spine v1](specs/runtime-inventory-observation-v1.md)冻结。legacy
+`/v1/nodes/register`、heartbeat/inventory route和shared service/admin bearer不属于目标架构。
 
 ## 7. 四态和数据屏障
 

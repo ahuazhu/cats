@@ -4,6 +4,7 @@
 - 日期：2026-08-08
 - 取代：ADR-0027、ADR-0028、ADR-0030、ADR-0035，以及 ADR-0002 中的旧协调合同
 - 规格：[Runtime Reconciliation v1](../specs/runtime-reconciliation-v1.md)
+- Internal delivery/acceptance：[Runtime Inventory and Observation Spine v1](../specs/runtime-inventory-observation-v1.md)
 
 ## 背景
 

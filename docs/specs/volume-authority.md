@@ -779,8 +779,12 @@ resource的fast lookup。exact hit逐byte重放且不得读取image、release re
    [GuestRuntimeProfileReceipt](runtime-reconciliation-v1.md#2-可信-node-与-agentsession) digest；请求、image
    manifest和builder都不能提供或重算另一个值。生产service构造器要求显式release receipt，不能使用测试
    fixture digest、编译期示例常量或空值fallback。
-3. placement planner只从当前provisioned/schedulable Node的current未失效`AgentSession`、fresh full
-   `AdmissionInventoryAttestation`及现有Node/placement事实中选择；session的`guest_config_digest`必须等于
+3. placement planner只从当前provisioned/schedulable Node的
+   [Inventory Spine §7.1](runtime-inventory-observation-v1.md#71-store-返回的完整-admission-facts)一次
+   same-snapshot loader返回的current未失效`AgentSession`、fresh full
+   `AdmissionInventoryAttestation`、产生它的完整full observation、逐字段相同的current assigned Desired
+   集合及现有Node/placement事实中选择；不能只返回三项摘录或`capacity_ok` boolean。session的
+   `guest_config_digest`必须等于
    上一步active release digest。调用时service把本批candidate `network_id`交给planner；planner为本次
    candidate返回一个`node_id`和完整合法`NetworkConfig`；service
    用该node构造`AssignedPlacement {kind:"assigned", node_id:planner node_id, placement_epoch:1}`，
@@ -1080,8 +1084,11 @@ release取得Volume锁后必须fresh读取同一delete ID/revision的authorizati
 current Deleted。release先commit时derive随后看到Unowned并整笔回滚；derive先commit时release看到auth并
 零副作用拒绝。不能在锁前缓存“无authorization”后越过这个重验。
 - Persistent不读取或保存“历史上属于哪个Cat”。它要求全部current完整Desired都不引用该Disk，且current
-  accepted complete inventory对相关物理identity证明不存在该volume的blockd、active lineage、device、mount
-  或其他residue；任一缺失/旧inventory都拒绝。
+  accepted complete inventory按
+  [Inventory Spine §5.4](runtime-inventory-observation-v1.md#54-服务端-attestation-与-current-read-model)在同一
+  snapshot重验live session、60秒freshness、内部binding和current assigned-set snapshot，随后对相关物理
+  identity证明不存在该volume的blockd、active lineage、device、mount或其他residue；任一缺失/旧inventory、
+  session/assigned set变化或partial-only事实都拒绝。
 
 attach/detach/move与begin-delete均锁同一VolumeRecord、DiskRecord和涉及的current Desired rows；attach先提交
 则delete看到绑定而拒绝，delete先提交则attach看到Deleting而拒绝，不存在已删除Disk被并发重新绑定的窗口。

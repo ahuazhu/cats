@@ -3,6 +3,7 @@
 - 状态：Frozen target contract；尚未实现
 - Authority：[ADR-0040](../decisions/0040-level-triggered-runtime-reconciliation.md)
 - 共享runtime类型：[Runtime Reconciliation v1](runtime-reconciliation-v1.md)
+- Session-bound delivery/acceptance：[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)
 
 本文冻结Node Agent注册的唯一HTTP接口、所有runtime internal请求共用的per-Node machine
 authentication adapter、注册错误映射、session lease policy，以及
@@ -36,6 +37,9 @@ provider-principal fallback。
 internal runtime handler、Store和Node不得读取`CATS_AUTH_TOKEN`、browser session、admin session、workspace
 token或另一个service bearer。生产请求使用server-authenticated HTTPS和§4的per-Node签名；HTTP只允许显式
 test adapter绑定loopback listener，不能由production配置降级。
+注册之外的两条session-bound route只由
+[Runtime Inventory and Observation Spine §2](runtime-inventory-observation-v1.md#2-http-与-authentication-envelope)冻结；
+本文的共用prefix/proof adapter不会自动创建GET、long-poll、legacy heartbeat或其他可路由入口。
 
 Node的`--control-plane-url`必须是`https://<authority>` origin：除根`/`外没有path，不含userinfo、query或
 fragment；client在它后拼接本规格的exact path。TLS使用部署Host的reviewed WebPKI trust roots并验证URL DNS
@@ -357,6 +361,11 @@ placement/admission或打开route gate；这些边界必须用同一PG-now重验
 accepted `heartbeat_sequence`及其exact observation的重放：deadline后仍返回首次success，零写入且不续期，只用于
 解析此前commit的response loss。expiry是Control liveness gate，不替代HostFence、attachment epoch或route
 epoch，不能仅凭expiry宣称旧Host/volume writer已经被fence。
+
+上述续期点、expired Desired拒绝和deadline后highest exact observation例外的唯一结果映射、
+事务顺序及response wire见
+[Runtime Inventory and Observation Spine §3–§6](runtime-inventory-observation-v1.md#3-desired-read-position)；
+本节不定义第二个observation接受或lease-renewal路径。
 
 ## 8. GuestRuntimeProfileReceipt release path
 
