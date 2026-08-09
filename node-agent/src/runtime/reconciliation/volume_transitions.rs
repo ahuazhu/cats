@@ -433,7 +433,26 @@ fn closed_takeover_successor(
                 &primary_receipt.resulting_head,
             )
         }
-        Some(LastVolumeTransition::NormalAcquire { .. }) | None => false,
+        Some(LastVolumeTransition::NormalAcquire { request, result }) => {
+            request.volume_id == primary_receipt.volume_id
+                // The primary takeover left the Volume owned at this epoch.
+                // A later normal acquire therefore needs at least one closed
+                // ownership transition before its Unowned predecessor. Equal
+                // epoch is a competing branch, while any larger predecessor
+                // remains a safe monotonic successor even if intervening
+                // release/acquire markers have already been overwritten.
+                && request.expected_unowned_epoch > primary_receipt.resulting_epoch
+                && is_epoch_offset(
+                    request.expected_unowned_epoch.get(),
+                    result.resulting_epoch.get(),
+                    1,
+                )
+                && remote_head_is_same_or_later(
+                    &result.resulting_head,
+                    &primary_receipt.resulting_head,
+                )
+        }
+        None => false,
     }
 }
 
@@ -474,7 +493,8 @@ mod tests {
 
     use cats_api::runtime_reconciliation::{
         decode_runtime_volume_transition_evidence_request,
-        encode_runtime_volume_transition_evidence_request,
+        encode_runtime_volume_transition_evidence_request, Epoch, FenceEpoch, NormalAcquireRequest,
+        ReleaseRequest, Revision,
     };
 
     use super::*;
@@ -642,6 +662,125 @@ mod tests {
             classify_evidence(&evidence).unwrap(),
             VolumeEvidenceRecoveryDecision::AdoptTakeover(primary_receipt)
         );
+    }
+
+    fn takeover_then_normal_reacquire_evidence() -> (
+        RuntimeVolumeTransitionEvidenceSuccess,
+        TakeoverConsumedReceipt,
+    ) {
+        let mut evidence =
+            decode_runtime_volume_transition_evidence_success(SUCCESS.as_bytes()).unwrap();
+        let AuthorizationState::Consumed(primary_receipt) = &evidence.authorization.state else {
+            unreachable!()
+        };
+        let AuthorizationConsumedReceipt::Takeover(primary_receipt) = primary_receipt.as_ref()
+        else {
+            unreachable!()
+        };
+        let primary_receipt = primary_receipt.clone();
+        let takeover_volume = evidence.current_volume.take().unwrap();
+        let (released, _) = cats_storage::authority::release(
+            &takeover_volume,
+            &ReleaseRequest {
+                volume_id: primary_receipt.volume_id.clone(),
+                transition_id: cats_api::runtime_reconciliation::RandomId128::new(
+                    "55555555555555555555555555555555",
+                )
+                .unwrap(),
+                attachment_id: primary_receipt.new_attachment_id.clone(),
+                expected_epoch: primary_receipt.resulting_epoch,
+            },
+        )
+        .unwrap();
+        let request = NormalAcquireRequest {
+            volume_id: primary_receipt.volume_id.clone(),
+            transition_id: cats_api::runtime_reconciliation::RandomId128::new(
+                "66666666666666666666666666666666",
+            )
+            .unwrap(),
+            attachment_id: Id::new("att_reacquired").unwrap(),
+            expected_unowned_epoch: released.lease_epoch,
+            desired_revision: Revision::new(9).unwrap(),
+            placement_epoch: Epoch::new(5).unwrap(),
+            lease_duration_ms: 60_000,
+        };
+        let (reacquired, _) = cats_storage::authority::normal_acquire(
+            &released,
+            &request,
+            cats_api::runtime_reconciliation::UnixMillis::new(1_720_000_010_000).unwrap(),
+        )
+        .unwrap();
+        evidence.current_volume = Some(reacquired);
+        (evidence, primary_receipt)
+    }
+
+    #[test]
+    fn takeover_release_then_normal_reacquire_closes_the_original_takeover() {
+        let (evidence, primary_receipt) = takeover_then_normal_reacquire_evidence();
+        assert_eq!(
+            classify_evidence(&evidence).unwrap(),
+            VolumeEvidenceRecoveryDecision::AdoptTakeover(primary_receipt)
+        );
+    }
+
+    #[test]
+    fn takeover_normal_reacquire_requires_a_closed_monotonic_successor_chain() {
+        let (mut split, _) = takeover_then_normal_reacquire_evidence();
+        let current = split.current_volume.as_mut().unwrap();
+        let Some(LastVolumeTransition::NormalAcquire { request, result }) =
+            current.last_transition.as_mut()
+        else {
+            unreachable!()
+        };
+        request.expected_unowned_epoch = FenceEpoch::new(4).unwrap();
+        result.resulting_epoch = FenceEpoch::new(5).unwrap();
+        current.lease_epoch = result.resulting_epoch;
+        assert_eq!(
+            classify_evidence(&split).unwrap(),
+            VolumeEvidenceRecoveryDecision::Blocked
+        );
+
+        let (mut nonmonotonic, _) = takeover_then_normal_reacquire_evidence();
+        let current = nonmonotonic.current_volume.as_mut().unwrap();
+        let Some(LastVolumeTransition::NormalAcquire { request, result }) =
+            current.last_transition.as_mut()
+        else {
+            unreachable!()
+        };
+        request.expected_unowned_epoch = FenceEpoch::new(3).unwrap();
+        result.resulting_epoch = FenceEpoch::new(4).unwrap();
+        current.lease_epoch = result.resulting_epoch;
+        assert_eq!(
+            classify_evidence(&nonmonotonic).unwrap(),
+            VolumeEvidenceRecoveryDecision::Blocked
+        );
+
+        let (mut later, primary_receipt) = takeover_then_normal_reacquire_evidence();
+        let current = later.current_volume.as_mut().unwrap();
+        let Some(LastVolumeTransition::NormalAcquire { request, result }) =
+            current.last_transition.as_mut()
+        else {
+            unreachable!()
+        };
+        request.expected_unowned_epoch = FenceEpoch::new(7).unwrap();
+        result.resulting_epoch = FenceEpoch::new(8).unwrap();
+        current.lease_epoch = result.resulting_epoch;
+        assert_eq!(
+            classify_evidence(&later).unwrap(),
+            VolumeEvidenceRecoveryDecision::AdoptTakeover(primary_receipt)
+        );
+
+        let (mut foreign, _) = takeover_then_normal_reacquire_evidence();
+        let current = foreign.current_volume.as_mut().unwrap();
+        current.volume_id = Id::new("vol_foreign").unwrap();
+        let Some(LastVolumeTransition::NormalAcquire { request, result }) =
+            current.last_transition.as_mut()
+        else {
+            unreachable!()
+        };
+        request.volume_id = current.volume_id.clone();
+        result.volume_id = current.volume_id.clone();
+        assert!(classify_evidence(&foreign).is_err());
     }
 
     #[tokio::test]

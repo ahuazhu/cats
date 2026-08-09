@@ -121,6 +121,17 @@ pub(crate) enum PlacementAdmissionLoad {
     Rejected(PlacementAdmissionRejection),
 }
 
+/// Closed A22 admission failures that remain distinguishable after the
+/// authenticated NodeIdentity/session prefix has been locked.  The ordinary
+/// placement loader intentionally collapses these to candidate rejections;
+/// a volume mutation instead has to preserve the Runtime/A22 error stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum VolumeMutationAdmissionRejection {
+    Contract(ContractError),
+    InventorySessionReplaced,
+    InventoryStale,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RouteRuntimeSnapshot {
     pub(crate) admission: PlacementAdmissionSnapshot,
@@ -433,6 +444,181 @@ where
         ));
     }
     Ok(PlacementAdmissionLoad::Accepted(Box::new(current)))
+}
+
+/// Locks and validates the complete admission receipt consumed by an A22
+/// volume mutation.
+///
+/// The caller already owns the authenticated NodeIdentity `FOR UPDATE`, the
+/// exact credential-lineage share lock and current AgentSession lock.  This
+/// helper continues the global DAG with the observation receive/cursor rows
+/// and `AdmissionInventoryState`, and returns the complete accepted full
+/// observation plus its exact assigned Desired snapshot.  It deliberately
+/// reuses the caller's one database timestamp.
+pub(super) fn lock_volume_mutation_admission_in(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+    active_guest_digest: &cats_api::runtime_reconciliation::Sha256Digest,
+    now: UnixMillis,
+) -> AuthorityTxResult<
+    std::result::Result<Box<PlacementAdmissionSnapshot>, VolumeMutationAdmissionRejection>,
+> {
+    let identity = load_identity_by_node_unlocked(transaction, node_id)?
+        .ok_or_else(|| corrupt("authenticated NodeIdentity disappeared while locked"))?;
+    if identity.state != NodeIdentityState::Provisioned || identity.node_id != *node_id {
+        return Err(corrupt(
+            "authenticated NodeIdentity changed while its coordination lock was held",
+        ));
+    }
+
+    let current_desired =
+        load_assigned_desired_unlocked(transaction, node_id, MAX_ASSIGNED_SPECS.saturating_add(1))?;
+    if current_desired.len() > MAX_ASSIGNED_SPECS {
+        return Err(corrupt("current assigned Desired set exceeds its hard cap"));
+    }
+
+    // Re-lock/re-read the current session at the canonical point. The A22
+    // authentication prefix has already proved it, so disagreement here is
+    // stored state or a lock-order bypass rather than an ordinary rejection.
+    let session = load_current_session_for_update(transaction, node_id)?
+        .ok_or_else(|| corrupt("authenticated current AgentSession disappeared while locked"))?;
+    if session.node_id != identity.node_id
+        || session.immutable_host_id != identity.immutable_host_id
+        || session.guest_config_digest != *active_guest_digest
+        || now >= session.lease_deadline_unix_ms
+    {
+        return Err(corrupt(
+            "authenticated AgentSession changed while NodeIdentity was locked",
+        ));
+    }
+    let expected_session = session_binding(&session);
+
+    // These rows are the A20 mutation serialization suffix. A later partial
+    // observation may be the highest receive-state while the last accepted
+    // full receipt remains current, so the two payloads are not required to
+    // be identical unless the highest observation itself is full.
+    let receive = load_observation_receive_state_for_update(transaction, node_id)?;
+    let desired_read = load_desired_read_state_for_update(transaction, node_id)?;
+    let inventory = load_admission_inventory_state_for_update(transaction, node_id)?;
+
+    let Some(inventory) = inventory else {
+        return Ok(Err(VolumeMutationAdmissionRejection::Contract(detail(
+            ContractErrorDetail::MissingInventoryAttestation {
+                node_id: node_id.clone(),
+                agent_session_epoch: session.agent_session_epoch,
+            },
+            "current AgentSession has no complete inventory attestation",
+        ))));
+    };
+    let inventory_session = observation_binding(&inventory.full_observation);
+    if inventory_session != expected_session {
+        return Ok(Err(
+            VolumeMutationAdmissionRejection::InventorySessionReplaced,
+        ));
+    }
+
+    let receive = receive.ok_or_else(|| {
+        corrupt("admission inventory exists without an observation receive-state")
+    })?;
+    if observation_binding(&receive.observation) != expected_session
+        || receive.acceptance.session != expected_session
+        || receive.acceptance.accepted_at_unix_ms < inventory.attestation.accepted_at_unix_ms
+    {
+        return Err(corrupt(
+            "current observation receive-state does not close the admission inventory",
+        ));
+    }
+    match &receive.acceptance.inventory {
+        ObservationInventoryAcceptance::Full { attestation } => {
+            if attestation != &inventory.attestation
+                || receive.observation != inventory.full_observation
+            {
+                return Err(corrupt(
+                    "highest full observation differs from admission inventory state",
+                ));
+            }
+        }
+        ObservationInventoryAcceptance::Partial { inventory_epoch }
+            if *inventory_epoch == inventory.attestation.inventory_epoch => {}
+        ObservationInventoryAcceptance::Partial { .. } => {
+            return Err(corrupt(
+                "highest partial observation references another inventory epoch",
+            ));
+        }
+    }
+
+    let desired_read = desired_read
+        .ok_or_else(|| corrupt("admission inventory exists without a Desired read-state"))?;
+    if desired_read.response.session != expected_session
+        || desired_read.response.read_position < inventory.assigned_snapshot.read_position
+    {
+        return Err(corrupt(
+            "current Desired read-state does not close the admission cursor",
+        ));
+    }
+    if desired_read.response.read_position == inventory.assigned_snapshot.read_position
+        && (desired_read.response != inventory.assigned_snapshot
+            || desired_read.consumed_by
+                != Some((
+                    inventory.full_observation.observation_id.clone(),
+                    inventory.full_observation.heartbeat_sequence,
+                )))
+    {
+        return Err(corrupt(
+            "retained Desired cursor is not the accepted full inventory cursor",
+        ));
+    }
+
+    let accepted_at = inventory.attestation.accepted_at_unix_ms;
+    if accepted_at > now {
+        return Err(corrupt(
+            "database time moved behind admission inventory acceptance",
+        ));
+    }
+    let stale_at = checked_add_time(
+        accepted_at,
+        PLACEMENT_INVENTORY_MAX_AGE_MS,
+        "admission inventory freshness overflow",
+    )?;
+    if now >= stale_at {
+        return Ok(Err(VolumeMutationAdmissionRejection::InventoryStale));
+    }
+    if current_desired != inventory.assigned_snapshot.desired_specs {
+        return Ok(Err(VolumeMutationAdmissionRejection::Contract(detail(
+            ContractErrorDetail::AssignedSetChanged {
+                node_id: node_id.clone(),
+                agent_session_epoch: session.agent_session_epoch,
+                read_position: inventory.attestation.inventory_read_position,
+            },
+            "assigned Desired set changed after the accepted full inventory",
+        ))));
+    }
+
+    let runtimes: BTreeMap<&Id, &ObservedRuntimeStatus> = inventory
+        .full_observation
+        .runtimes
+        .iter()
+        .map(|runtime| (&runtime.cat_id, runtime))
+        .collect();
+    for desired in &current_desired {
+        let runtime = runtimes
+            .get(&desired.cat_id)
+            .ok_or_else(|| corrupt("stored full inventory omitted an attested assigned Cat"))?;
+        if runtime.applied_desired.as_ref() != Some(&applied_projection(desired)) {
+            return Err(corrupt(
+                "stored full inventory assigned runtime binding is corrupt",
+            ));
+        }
+    }
+
+    Ok(Ok(Box::new(PlacementAdmissionSnapshot {
+        evaluated_at_unix_ms: now,
+        node_identity: identity,
+        agent_session: session,
+        inventory_attestation: inventory.attestation,
+        full_inventory_observation: inventory.full_observation,
+        assigned_desired_specs: current_desired,
+    })))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2864,6 +3050,41 @@ fn upsert_admission_inventory_state(
         ],
     )?;
     Ok(())
+}
+
+/// Rewrites one otherwise-closed admission receipt to a deterministic old
+/// timestamp.  This exists only so the real-PostgreSQL A22 tests can exercise
+/// the freshness rejection without sleeping for the production TTL.
+#[cfg(test)]
+pub(super) fn age_volume_mutation_admission_for_test(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+) -> AuthorityTxResult<()> {
+    let mut receive = load_observation_receive_state_for_update(transaction, node_id)?
+        .ok_or_else(|| corrupt("test admission lost its observation receive-state"))?;
+    let mut desired = load_desired_read_state_for_update(transaction, node_id)?
+        .ok_or_else(|| corrupt("test admission lost its Desired read-state"))?;
+    let mut inventory = load_admission_inventory_state_for_update(transaction, node_id)?
+        .ok_or_else(|| corrupt("test admission lost its inventory state"))?;
+
+    let issued_at = UnixMillis::new(1).expect("fixed test timestamp is valid");
+    let accepted_at = UnixMillis::new(2).expect("fixed test timestamp is valid");
+    let expires_at =
+        UnixMillis::new(DESIRED_READ_TTL_MS + 1).expect("fixed test cursor expiry is valid");
+    desired.response.issued_at_unix_ms = issued_at;
+    desired.response.expires_at_unix_ms = expires_at;
+    inventory.assigned_snapshot = desired.response.clone();
+    inventory.attestation.accepted_at_unix_ms = accepted_at;
+    receive.acceptance.accepted_at_unix_ms = accepted_at;
+    let ObservationInventoryAcceptance::Full { attestation } = &mut receive.acceptance.inventory
+    else {
+        return Err(corrupt("test admission receive-state is not complete"));
+    };
+    *attestation = inventory.attestation.clone();
+
+    upsert_desired_read_state(transaction, &desired)?;
+    upsert_admission_inventory_state(transaction, &inventory)?;
+    upsert_observation_receive_state(transaction, &receive)
 }
 
 fn replace_full_cat_observations(

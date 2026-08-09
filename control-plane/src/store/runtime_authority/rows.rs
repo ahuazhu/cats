@@ -532,25 +532,83 @@ impl AuthorizationProjection {
     }
 }
 
-pub(super) fn authorization_hint(
+/// Returns only the HostFence routing key for a takeover authorization that
+/// is already bounded to the authenticated Node and the current Desired
+/// intent.  A wrong Node, stale Desired revision/placement or unrelated
+/// volume is indistinguishable from an absent authorization and, critically,
+/// does not decode or lock the protected JSON row.
+pub(super) fn takeover_authorization_route_for_intent(
     transaction: &mut Transaction<'_>,
     authorization_id: &Id,
-) -> AuthorityTxResult<Option<(Option<Id>, Id)>> {
+    authorized_node_id: &Id,
+    volume_id: &Id,
+    desired_revision: Revision,
+    placement_epoch: Epoch,
+) -> AuthorityTxResult<Option<Id>> {
+    let desired_revision = desired_revision.to_pg().map_err(corrupt)?;
+    let placement_epoch = placement_epoch.to_pg().map_err(corrupt)?;
     let Some(row) = transaction.query_opt(
-        "SELECT host_fence_event_id, volume_id
+        "SELECT host_fence_event_id
            FROM volume_authorizations
-          WHERE authorization_id=$1",
-        &[&authorization_id.as_str()],
+          WHERE authorization_id=$1
+            AND authorized_node_id=$2
+            AND kind='takeover'
+            AND volume_id=$3
+            AND desired_revision=$4
+            AND placement_epoch=$5",
+        &[
+            &authorization_id.as_str(),
+            &authorized_node_id.as_str(),
+            &volume_id.as_str(),
+            &desired_revision,
+            &placement_epoch,
+        ],
     )?
     else {
         return Ok(None);
     };
-    let event_id = row
-        .try_get::<_, Option<String>>("host_fence_event_id")?
-        .map(|value| Id::new(value).ok_or_else(|| corrupt(())))
-        .transpose()?;
-    let volume_id = Id::new(row.try_get::<_, String>("volume_id")?).ok_or_else(|| corrupt(()))?;
-    Ok(Some((event_id, volume_id)))
+    let event_id: Option<String> = row.try_get("host_fence_event_id")?;
+    let event_id = event_id.ok_or_else(|| corrupt(()))?;
+    Ok(Some(Id::new(event_id).ok_or_else(|| corrupt(()))?))
+}
+
+/// Locks and decodes the same bounded takeover row after its HostFenceEvent
+/// serialization point has been acquired.  Repeating the access predicate at
+/// the authority read prevents a routing hint from becoming an authorization
+/// result if the row was changed or was never in the caller's current intent.
+pub(super) fn load_takeover_authorization_for_intent_update(
+    transaction: &mut Transaction<'_>,
+    authorization_id: &Id,
+    authorized_node_id: &Id,
+    volume_id: &Id,
+    desired_revision: Revision,
+    placement_epoch: Epoch,
+) -> AuthorityTxResult<Option<AuthorizationRecord>> {
+    let desired_revision = desired_revision.to_pg().map_err(corrupt)?;
+    let placement_epoch = placement_epoch.to_pg().map_err(corrupt)?;
+    let sql = format!(
+        "SELECT {AUTHORIZATION_COLUMNS} FROM volume_authorizations
+          WHERE authorization_id=$1
+            AND authorized_node_id=$2
+            AND kind='takeover'
+            AND volume_id=$3
+            AND desired_revision=$4
+            AND placement_epoch=$5
+          FOR UPDATE"
+    );
+    transaction
+        .query_opt(
+            &sql,
+            &[
+                &authorization_id.as_str(),
+                &authorized_node_id.as_str(),
+                &volume_id.as_str(),
+                &desired_revision,
+                &placement_epoch,
+            ],
+        )?
+        .map(|row| decode_authorization(&row))
+        .transpose()
 }
 
 pub(super) fn load_authorization_for_update(

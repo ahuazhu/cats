@@ -5,7 +5,6 @@
     reason = "F2c is the ready-to-wire service boundary consumed by the F2d HTTP cutover"
 )]
 pub(crate) mod cat_create_service;
-mod events;
 #[allow(
     dead_code,
     reason = "A21 production resolver is composed when the F2d Cat-create route is switched"

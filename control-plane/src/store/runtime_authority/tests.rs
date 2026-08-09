@@ -4,12 +4,19 @@ use std::time::Duration;
 
 use cats_api::error::ErrorCode;
 use cats_api::runtime_reconciliation::{
-    guest_config_digest, AgentRegistrationAttempt, AgentSession, AsciiText as RuntimeAsciiText,
-    ContractVersion, CredentialBinding, GuestRuntimeProfileReceipt, NodeBootId, NodeIdentity,
-    NodeIdentityState, RuntimeVolumeTransitionEvidenceRequest, SessionBinding,
+    encode_desired_runtime_spec, guest_config_digest, inventory_digest, spec_digest,
+    AgentRegistrationAttempt, AgentSession, AppliedDesiredEvidence, AsciiText as RuntimeAsciiText,
+    AssignedKind, AssignedPlacement, CheckpointEvidence, ContractErrorDetail, ContractVersion,
+    CredentialBinding, DesiredReadRequest, DesiredRuntimeSpec, DiskKind, GuestDeviceIdentity,
+    GuestRuntimeProfileReceipt, GuestTransportEvidence, Ipv4Address, IsolatedIpv4Kind,
+    LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId, NodeIdentity, NodeIdentityState,
+    NodeObservation, ObservedRuntimeStatus, ReconcileStep, RuntimeConfig, RuntimeTarget,
+    RuntimeTransition, RuntimeVolumeAuthorizationRejection, RuntimeVolumeTransitionEvidenceRequest,
+    RuntimeVolumeTransitionPreconditionProblem, Sequence, SessionBinding, VolumeAccess,
+    VolumeAcquire, VolumeDisposition, VolumeIntent, WarmSnapshotEvidence,
 };
 use cats_storage::authority::{
-    complete_disposable_root_delete, consume_disposable_root_delete, AsciiText,
+    complete_disposable_root_delete, consume_disposable_root_delete, AsciiText, AuthorityError,
     AuthorizationRecord, AuthorizationState, DeleteCompletionReceipt,
     DisposableDeleteIsolationBasis, DisposableRootDeleteAuthorization, Epoch, FenceEpoch,
     Generation, HostFenceEvent, HostFenceEventState, HostIsolationState, Id, NormalAcquireRequest,
@@ -17,14 +24,21 @@ use cats_storage::authority::{
     VolumeAuthorization, VolumeDurability, VolumeRecord, VolumeTakeoverAuthorization,
 };
 
+use super::product::{CatRecord, DiskAdminState, DiskRecord, DiskRole};
+use super::product_rows::{insert_cat, insert_desired, insert_disk, load_desired_for_update};
 use super::rows::{
     database_now, insert_authorization, insert_delete_completion, insert_event, insert_volume,
     load_active_event_by_node_unlocked, load_authorization_for_update,
     load_delete_completion_for_update, load_event_for_update, load_volume_for_update,
     update_authorization, update_event, update_volume,
 };
+use super::runtime_spine::{
+    age_volume_mutation_admission_for_test, PlacementAdmissionLoad, PlacementAdmissionRejection,
+    RuntimeSpineOutcome,
+};
 use super::volume_transition_auth::{
-    authenticate_evidence_context_in, VolumeTransitionStoreOutcome, VolumeTransitionStoreRejection,
+    authenticate_evidence_context_in, RuntimeTakeoverConsumeRequest, VolumeTransitionStoreOutcome,
+    VolumeTransitionStoreRejection,
 };
 use super::volume_transition_evidence::{
     load_volume_transition_evidence_in, VolumeTransitionEvidenceLoad,
@@ -139,6 +153,224 @@ fn session_binding(session: &AgentSession) -> SessionBinding {
         node_boot_id: session.node_boot_id.clone(),
         agent_instance_id: session.agent_instance_id.clone(),
         agent_session_epoch: session.agent_session_epoch,
+    }
+}
+
+fn takeover_desired(
+    workspace_id: &Id,
+    node: &TransitionNode,
+    authorization: &VolumeTakeoverAuthorization,
+    volume: &VolumeRecord,
+) -> DesiredRuntimeSpec {
+    let mut desired = DesiredRuntimeSpec {
+        version: ContractVersion::V1,
+        workspace_id: workspace_id.clone(),
+        cat_id: id("cat-1"),
+        desired_revision: authorization.desired_revision,
+        target: RuntimeTarget::Running,
+        placement: AssignedPlacement {
+            kind: AssignedKind::Assigned,
+            node_id: node.session.node_id.clone(),
+            placement_epoch: authorization.new_placement_epoch,
+        },
+        runtime: RuntimeConfig {
+            vcpus: 1,
+            memory_bytes: 512 * 1024 * 1024,
+            boot_image_digest: Sha256Digest::from_bytes([31; 32]),
+            guest_config_digest: node.active_guest_config_digest.clone(),
+            network_config: NetworkConfig {
+                kind: IsolatedIpv4Kind::IsolatedIpv4,
+                network_id: id("network-1"),
+                guest_mac: MacAddress::new("02:ca:0a:00:00:02").unwrap(),
+                guest_ipv4: Ipv4Address::new("10.0.0.2").unwrap(),
+                prefix_length: 30,
+                gateway_ipv4: Ipv4Address::new("10.0.0.1").unwrap(),
+            },
+        },
+        volumes: vec![VolumeIntent {
+            volume_intent_id: id("volume-intent-1"),
+            disk_id: id("disk-1"),
+            volume_id: volume.volume_id.clone(),
+            attachment_id: authorization.new_attachment_id.clone(),
+            size_bytes: volume.size_bytes,
+            disk_kind: DiskKind::Root,
+            access: VolumeAccess::ReadWriteOnce,
+            durability: volume.durability,
+            guest_device: GuestDeviceIdentity {
+                serial: id("root-device-1"),
+                slot: 0,
+            },
+            acquire: VolumeAcquire::Takeover {
+                authorization_id: authorization.authorization_id.clone(),
+            },
+            disposition: VolumeDisposition::Retain,
+            mount: None,
+        }],
+        endpoints: Vec::new(),
+        transition: RuntimeTransition::CancelAndDrain,
+        spec_digest: Sha256Digest::from_bytes([0; 32]),
+    };
+    desired.spec_digest = spec_digest(&desired).unwrap();
+    desired
+}
+
+fn takeover_runtime_status(desired: &DesiredRuntimeSpec) -> ObservedRuntimeStatus {
+    ObservedRuntimeStatus {
+        cat_id: desired.cat_id.clone(),
+        applied_desired: Some(AppliedDesiredEvidence {
+            desired_revision: desired.desired_revision,
+            spec_digest: desired.spec_digest.clone(),
+            placement: desired.placement.clone(),
+            target: desired.target,
+        }),
+        runtime_incarnation: None,
+        stable_state: None,
+        step: ReconcileStep::InspectInventory {
+            inventory_epoch: epoch(1),
+        },
+        checkpoint: CheckpointEvidence::Missing {
+            checkpoint_path: cats_api::runtime_reconciliation::HostPath::new(
+                "/var/lib/cats/runtime/cat-1.json",
+            )
+            .unwrap(),
+        },
+        processes: Vec::new(),
+        volumes: Vec::new(),
+        mounts: Vec::new(),
+        networks: Vec::new(),
+        guest_transport: GuestTransportEvidence::Unavailable,
+        warm_snapshot: WarmSnapshotEvidence::Absent,
+        lifecycle_admission: LifecycleAdmission::Closed,
+        routes: Vec::new(),
+        platform_guards: 0,
+        conditions: Vec::new(),
+    }
+}
+
+fn prepare_takeover_runtime(
+    store: &Store,
+    node: &TransitionNode,
+    authorization_id: &Id,
+) -> DesiredRuntimeSpec {
+    let authorization = stored_authorization(store, authorization_id);
+    let VolumeAuthorization::Takeover(payload) = authorization.authorization else {
+        panic!("takeover runtime fixture requires a takeover authorization")
+    };
+    let volume = stored_volume(store, &payload.volume_id);
+    let workspace = super::product_tests::bootstrap_workspace(store, "a22-takeover");
+    let desired = takeover_desired(&workspace, node, &payload, &volume);
+    store
+        .authority_transaction(|transaction| {
+            if let Some(current) = load_desired_for_update(transaction, &desired.cat_id)? {
+                if current != desired {
+                    return Err(AuthorityError::BackendUnknown.into());
+                }
+                return Ok(());
+            }
+            let now = database_now(transaction)?;
+            insert_cat(
+                transaction,
+                &CatRecord {
+                    cat_id: desired.cat_id.clone(),
+                    workspace_id: workspace.clone(),
+                    name: id("cat-1"),
+                    created_at: now,
+                },
+            )?;
+            insert_disk(
+                transaction,
+                &DiskRecord {
+                    disk_id: id("disk-1"),
+                    workspace_id: workspace.clone(),
+                    name: id("disk-1"),
+                    volume_id: volume.volume_id.clone(),
+                    size_bytes: volume.size_bytes,
+                    durability: volume.durability,
+                    created_at: now,
+                    admin_state: DiskAdminState::Active,
+                    role: DiskRole::Root {
+                        cat_id: desired.cat_id.clone(),
+                    },
+                },
+            )?;
+            insert_desired(transaction, &desired)
+        })
+        .unwrap();
+
+    match store
+        .load_placement_admission_snapshot(&node.session.node_id, &node.active_guest_config_digest)
+        .unwrap()
+    {
+        PlacementAdmissionLoad::Accepted(snapshot) => {
+            assert!(snapshot.assigned_desired_specs.contains(&desired));
+            return desired;
+        }
+        PlacementAdmissionLoad::Rejected(PlacementAdmissionRejection::InventoryMissing) => {}
+        PlacementAdmissionLoad::Rejected(rejection) => {
+            panic!("takeover admission unexpectedly rejected: {rejection:?}")
+        }
+    }
+
+    let desired_read = match store
+        .runtime_desired_read(
+            &node.authenticated,
+            &DesiredReadRequest {
+                version: ContractVersion::V1,
+                session: node.session.clone(),
+                request_sequence: Sequence::new(1).unwrap(),
+            },
+        )
+        .unwrap()
+    {
+        RuntimeSpineOutcome::Accepted(snapshot) => snapshot,
+        RuntimeSpineOutcome::Rejected(rejection) => {
+            panic!("takeover Desired read rejected: {rejection:?}")
+        }
+    };
+    let mut observation = NodeObservation {
+        version: ContractVersion::V1,
+        observation_id: random_id(91),
+        node_id: node.session.node_id.clone(),
+        node_boot_id: node.session.node_boot_id.clone(),
+        agent_instance_id: node.session.agent_instance_id.clone(),
+        agent_session_epoch: node.session.agent_session_epoch,
+        heartbeat_sequence: Sequence::new(1).unwrap(),
+        observed_at_unix_ms: unix_millis(1),
+        complete_inventory: true,
+        inventory_epoch: epoch(1),
+        inventory_digest: Some(Sha256Digest::from_bytes([0; 32])),
+        inventory_read_position: Some(desired_read.read_position),
+        key_ring_version: None,
+        key_ring_digest: None,
+        loaded_kids: Vec::new(),
+        runtimes: vec![takeover_runtime_status(&desired)],
+        residue: Vec::new(),
+    };
+    observation.inventory_digest = Some(inventory_digest(&observation).unwrap());
+    match store
+        .runtime_accept_observation(&node.authenticated, &observation)
+        .unwrap()
+    {
+        RuntimeSpineOutcome::Accepted(_) => {}
+        RuntimeSpineOutcome::Rejected(rejection) => {
+            panic!("takeover full observation rejected: {rejection:?}")
+        }
+    }
+    desired
+}
+
+fn takeover_consume_request(
+    node: &TransitionNode,
+    desired: &DesiredRuntimeSpec,
+    authorization_id: &Id,
+) -> RuntimeTakeoverConsumeRequest {
+    RuntimeTakeoverConsumeRequest {
+        session: node.session.clone(),
+        cat_id: desired.cat_id.clone(),
+        desired_revision: desired.desired_revision,
+        spec_digest: desired.spec_digest.clone(),
+        placement: desired.placement.clone(),
+        authorization_id: authorization_id.clone(),
     }
 }
 
@@ -348,6 +580,90 @@ fn stored_authorization_row(store: &Store, authorization_id: &Id) -> String {
         .unwrap()
 }
 
+fn stored_volume_row(store: &Store, volume_id: &Id) -> String {
+    store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT to_jsonb(volume_records)::text
+                       FROM volume_records
+                      WHERE volume_id=$1",
+                    &[&volume_id.as_str()],
+                )
+                .map(|row| row.get(0))
+        })
+        .unwrap()
+}
+
+fn rewrite_desired_in(
+    transaction: &mut postgres::Transaction<'_>,
+    desired: &DesiredRuntimeSpec,
+) -> Result<(), AuthorityTransactionError> {
+    let encoded = String::from_utf8(encode_desired_runtime_spec(desired).unwrap()).unwrap();
+    let revision = i64::try_from(desired.desired_revision.get()).unwrap();
+    let placement_epoch = i64::try_from(desired.placement.placement_epoch.get()).unwrap();
+    let target = match desired.target {
+        RuntimeTarget::Running => "running",
+        RuntimeTarget::Suspended => "suspended",
+        RuntimeTarget::Warm => "warm",
+        RuntimeTarget::Cold => "cold",
+        RuntimeTarget::Deleted => "deleted",
+    };
+    assert_eq!(
+        transaction.execute(
+            "UPDATE desired_runtime_specs
+                SET record=$1::TEXT::jsonb,
+                    desired_revision=$2,
+                    spec_digest=$3,
+                    target=$4,
+                    node_id=$5,
+                    placement_epoch=$6
+              WHERE cat_id=$7",
+            &[
+                &encoded,
+                &revision,
+                &desired.spec_digest.as_str(),
+                &target,
+                &desired.placement.node_id.as_str(),
+                &placement_epoch,
+                &desired.cat_id.as_str(),
+            ],
+        )?,
+        1
+    );
+    Ok(())
+}
+
+fn moved_takeover_desired(
+    current: &DesiredRuntimeSpec,
+    destination_node_id: &Id,
+) -> DesiredRuntimeSpec {
+    let mut moved = current.clone();
+    moved.desired_revision = revision(current.desired_revision.get() + 1);
+    moved.placement.node_id = destination_node_id.clone();
+    moved.placement.placement_epoch = epoch(current.placement.placement_epoch.get() + 1);
+    moved.volumes[0].attachment_id = id("attachment-after-move");
+    moved.volumes[0].acquire = VolumeAcquire::Takeover {
+        authorization_id: id("takeover-auth-after-move"),
+    };
+    moved.spec_digest = Sha256Digest::from_bytes([0; 32]);
+    moved.spec_digest = spec_digest(&moved).unwrap();
+    moved
+}
+
+fn lock_node_identities_in_order(
+    transaction: &mut postgres::Transaction<'_>,
+    node_ids: &[Id],
+) -> Result<(), AuthorityTransactionError> {
+    let mut sorted = node_ids.to_vec();
+    sorted.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    sorted.dedup();
+    for node_id in sorted {
+        assert!(load_identity_by_node_for_update(transaction, &node_id)?.is_some());
+    }
+    Ok(())
+}
+
 fn acquire_owned_volume(store: &Store) -> VolumeRecord {
     seed_volume(store, &unowned_volume());
     store
@@ -365,17 +681,25 @@ fn consume_takeover_as(
     consume_takeover_with_node(store, authorization_id, &node)
 }
 
+fn consume_takeover_outcome_with_node(
+    store: &Store,
+    authorization_id: &Id,
+    node: &TransitionNode,
+) -> crate::store::Result<VolumeTransitionStoreOutcome<cats_storage::authority::TakeoverResult>> {
+    let desired = prepare_takeover_runtime(store, node, authorization_id);
+    store.runtime_consume_volume_takeover(
+        &node.authenticated,
+        &takeover_consume_request(node, &desired, authorization_id),
+        &node.active_guest_config_digest,
+    )
+}
+
 fn consume_takeover_with_node(
     store: &Store,
     authorization_id: &Id,
     node: &TransitionNode,
 ) -> crate::store::Result<cats_storage::authority::TakeoverResult> {
-    match store.runtime_consume_volume_takeover(
-        &node.authenticated,
-        &node.session,
-        authorization_id,
-        &node.active_guest_config_digest,
-    )? {
+    match consume_takeover_outcome_with_node(store, authorization_id, node)? {
         VolumeTransitionStoreOutcome::Accepted(result) => Ok(result),
         VolumeTransitionStoreOutcome::Rejected(rejection) => {
             panic!("authenticated takeover was rejected before authority: {rejection:?}")
@@ -568,8 +892,8 @@ fn two_store_sessions_cannot_both_acquire_one_volume() {
 }
 
 #[test]
-fn takeover_wrong_tuple_has_zero_side_effect_and_consumed_row_replays() {
-    let (url, store, observer) = store_pair();
+fn takeover_wrong_tuple_has_zero_side_effect_and_exact_request_replays() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
     let owned = acquire_owned_volume(&store);
     let event = host_fence_event(HostFenceEventState::Active);
     let mut wrong = takeover_authorization(&owned);
@@ -578,18 +902,34 @@ fn takeover_wrong_tuple_has_zero_side_effect_and_consumed_row_replays() {
     };
     payload.expected_attachment_id = id("wrong-attachment");
     seed_takeover(&store, &event, &wrong);
+    let node = transition_node(&store, "node-new");
+    let desired = prepare_takeover_runtime(&store, &node, &id("takeover-auth-1"));
+    let request = takeover_consume_request(&node, &desired, &id("takeover-auth-1"));
     let before_volume = stored_volume(&store, &owned.volume_id);
     let before_authorization = stored_authorization(&store, &id("takeover-auth-1"));
-    let error = consume_takeover_as(&store, &id("takeover-auth-1"), &id("node-new")).unwrap_err();
-    assert_eq!(error.code, ErrorCode::FailedPrecondition);
+    assert_eq!(
+        store
+            .runtime_consume_volume_takeover(
+                &node.authenticated,
+                &request,
+                &node.active_guest_config_digest,
+            )
+            .unwrap(),
+        VolumeTransitionStoreOutcome::Rejected(
+            VolumeTransitionStoreRejection::VolumeAuthorizationRejected {
+                authorization_id: id("takeover-auth-1"),
+                reason: RuntimeVolumeAuthorizationRejection::InvalidAuthorization,
+            }
+        )
+    );
     assert_eq!(stored_volume(&store, &owned.volume_id), before_volume);
     assert_eq!(
         stored_authorization(&store, &id("takeover-auth-1")),
         before_authorization
     );
 
-    // Replace only the rejected fixture, then prove that a committed receipt
-    // is the replay authority even if the Volume row no longer exists.
+    // Replace only the rejected fixture, then prove exact replay while the
+    // complete current mutation context still exists.
     store
         .with(|client| {
             client
@@ -604,20 +944,22 @@ fn takeover_wrong_tuple_has_zero_side_effect_and_consumed_row_replays() {
     store
         .authority_transaction(|transaction| insert_authorization(transaction, &valid))
         .unwrap();
-    let first = consume_takeover_as(&store, &id("takeover-auth-1"), &id("node-new")).unwrap();
-    observer
-        .with(|client| {
-            client
-                .execute(
-                    "DELETE FROM volume_records WHERE volume_id=$1",
-                    &[&"volume-1"],
-                )
-                .map(|_| ())
-        })
+    let first = store
+        .runtime_consume_volume_takeover(
+            &node.authenticated,
+            &request,
+            &node.active_guest_config_digest,
+        )
         .unwrap();
-    drop(Store::connect(&url, None).unwrap());
+    assert!(matches!(first, VolumeTransitionStoreOutcome::Accepted(_)));
     assert_eq!(
-        consume_takeover_as(&store, &id("takeover-auth-1"), &id("node-new")).unwrap(),
+        store
+            .runtime_consume_volume_takeover(
+                &node.authenticated,
+                &request,
+                &node.active_guest_config_digest,
+            )
+            .unwrap(),
         first
     );
 }
@@ -908,13 +1250,14 @@ fn authenticated_takeover_response_loss_replays_the_committed_receipt() {
     let authorization = takeover_authorization(&owned);
     seed_takeover(&store, &event, &authorization);
     let node = transition_node(&store, "node-new");
+    let desired = prepare_takeover_runtime(&store, &node, &id("takeover-auth-1"));
+    let request = takeover_consume_request(&node, &desired, &id("takeover-auth-1"));
 
     store.inject_committed_response_loss_once();
     let error = store
         .runtime_consume_volume_takeover(
             &node.authenticated,
-            &node.session,
-            &id("takeover-auth-1"),
+            &request,
             &node.active_guest_config_digest,
         )
         .unwrap_err();
@@ -929,8 +1272,7 @@ fn authenticated_takeover_response_loss_replays_the_committed_receipt() {
     let replay = store
         .runtime_consume_volume_takeover(
             &node.authenticated,
-            &node.session,
-            &id("takeover-auth-1"),
+            &request,
             &node.active_guest_config_digest,
         )
         .unwrap();
@@ -940,6 +1282,354 @@ fn authenticated_takeover_response_loss_replays_the_committed_receipt() {
     assert_eq!(replay.resulting_epoch, committed_volume.lease_epoch);
     assert_eq!(replay.resulting_head, committed_volume.head);
     assert_eq!(replay.attachment_id, id("attachment-new"));
+}
+
+#[test]
+fn stale_preplanned_takeover_is_closed_before_any_authority_write() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let owned = acquire_owned_volume(&store);
+    let event = host_fence_event(HostFenceEventState::Active);
+    let authorization = takeover_authorization(&owned);
+    seed_takeover(&store, &event, &authorization);
+    let node = transition_node(&store, "node-new");
+    let desired = prepare_takeover_runtime(&store, &node, &id("takeover-auth-1"));
+    let mut request = takeover_consume_request(&node, &desired, &id("takeover-auth-1"));
+    request.desired_revision = revision(desired.desired_revision.get() - 1);
+    let before_volume = stored_volume_row(&store, &owned.volume_id);
+    let before_authorization = stored_authorization_row(&store, &id("takeover-auth-1"));
+
+    let outcome = store
+        .runtime_consume_volume_takeover(
+            &node.authenticated,
+            &request,
+            &node.active_guest_config_digest,
+        )
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        VolumeTransitionStoreOutcome::Rejected(VolumeTransitionStoreRejection::Contract(
+            cats_api::runtime_reconciliation::ContractError { error, .. }
+        )) if matches!(
+            *error,
+            ContractErrorDetail::StaleRevision {
+                presented_revision,
+                current_revision,
+                ..
+            } if presented_revision == request.desired_revision
+                && current_revision == desired.desired_revision
+        )
+    ));
+    assert_eq!(stored_volume_row(&store, &owned.volume_id), before_volume);
+    assert_eq!(
+        stored_authorization_row(&store, &id("takeover-auth-1")),
+        before_authorization
+    );
+}
+
+#[test]
+fn stale_takeover_inventory_is_a_closed_zero_write_precondition() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let owned = acquire_owned_volume(&store);
+    let event = host_fence_event(HostFenceEventState::Active);
+    let authorization = takeover_authorization(&owned);
+    seed_takeover(&store, &event, &authorization);
+    let node = transition_node(&store, "node-new");
+    let desired = prepare_takeover_runtime(&store, &node, &id("takeover-auth-1"));
+    let request = takeover_consume_request(&node, &desired, &id("takeover-auth-1"));
+    store
+        .authority_transaction(|transaction| {
+            age_volume_mutation_admission_for_test(transaction, &node.session.node_id)
+        })
+        .unwrap();
+    let before_volume = stored_volume_row(&store, &owned.volume_id);
+    let before_authorization = stored_authorization_row(&store, &id("takeover-auth-1"));
+
+    assert_eq!(
+        store
+            .runtime_consume_volume_takeover(
+                &node.authenticated,
+                &request,
+                &node.active_guest_config_digest,
+            )
+            .unwrap(),
+        VolumeTransitionStoreOutcome::Rejected(
+            VolumeTransitionStoreRejection::TransitionPreconditionFailed {
+                cat_id: desired.cat_id,
+                problem: RuntimeVolumeTransitionPreconditionProblem::InventoryStale,
+            }
+        )
+    );
+    assert_eq!(stored_volume_row(&store, &owned.volume_id), before_volume);
+    assert_eq!(
+        stored_authorization_row(&store, &id("takeover-auth-1")),
+        before_authorization
+    );
+}
+
+#[test]
+fn mismatched_disk_and_intent_each_reject_before_authority_writes() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let owned = acquire_owned_volume(&store);
+    let event = host_fence_event(HostFenceEventState::Active);
+    let authorization = takeover_authorization(&owned);
+    seed_takeover(&store, &event, &authorization);
+    let node = transition_node(&store, "node-new");
+    let desired = prepare_takeover_runtime(&store, &node, &id("takeover-auth-1"));
+    let request = takeover_consume_request(&node, &desired, &id("takeover-auth-1"));
+    let before_volume = stored_volume_row(&store, &owned.volume_id);
+    let before_authorization = stored_authorization_row(&store, &id("takeover-auth-1"));
+
+    let mut wrong_intent = request.clone();
+    wrong_intent.authorization_id = id("takeover-auth-not-current");
+    assert_eq!(
+        store
+            .runtime_consume_volume_takeover(
+                &node.authenticated,
+                &wrong_intent,
+                &node.active_guest_config_digest,
+            )
+            .unwrap(),
+        VolumeTransitionStoreOutcome::Rejected(
+            VolumeTransitionStoreRejection::TransitionPreconditionFailed {
+                cat_id: desired.cat_id.clone(),
+                problem: RuntimeVolumeTransitionPreconditionProblem::VolumeIntentMismatch,
+            }
+        )
+    );
+    assert_eq!(stored_volume_row(&store, &owned.volume_id), before_volume);
+    assert_eq!(
+        stored_authorization_row(&store, &id("takeover-auth-1")),
+        before_authorization
+    );
+
+    store
+        .with(|client| {
+            client
+                .execute(
+                    "UPDATE disk_records
+                        SET record=jsonb_set(record, '{size_bytes}', to_jsonb(size_bytes + 1)),
+                            size_bytes=size_bytes + 1
+                      WHERE disk_id=$1",
+                    &[&"disk-1"],
+                )
+                .map(|_| ())
+        })
+        .unwrap();
+    assert_eq!(
+        store
+            .runtime_consume_volume_takeover(
+                &node.authenticated,
+                &request,
+                &node.active_guest_config_digest,
+            )
+            .unwrap(),
+        VolumeTransitionStoreOutcome::Rejected(
+            VolumeTransitionStoreRejection::TransitionPreconditionFailed {
+                cat_id: desired.cat_id,
+                problem: RuntimeVolumeTransitionPreconditionProblem::VolumeIntentMismatch,
+            }
+        )
+    );
+    assert_eq!(stored_volume_row(&store, &owned.volume_id), before_volume);
+    assert_eq!(
+        stored_authorization_row(&store, &id("takeover-auth-1")),
+        before_authorization
+    );
+}
+
+#[test]
+fn expired_takeover_is_a_closed_zero_write_authorization_rejection() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let owned = acquire_owned_volume(&store);
+    let event = host_fence_event(HostFenceEventState::Active);
+    let mut authorization = takeover_authorization(&owned);
+    let VolumeAuthorization::Takeover(payload) = &mut authorization.authorization else {
+        unreachable!()
+    };
+    payload.not_after = unix_millis(1);
+    seed_takeover(&store, &event, &authorization);
+    let node = transition_node(&store, "node-new");
+    let desired = prepare_takeover_runtime(&store, &node, &id("takeover-auth-1"));
+    let request = takeover_consume_request(&node, &desired, &id("takeover-auth-1"));
+    let before_volume = stored_volume_row(&store, &owned.volume_id);
+    let before_authorization = stored_authorization_row(&store, &id("takeover-auth-1"));
+
+    assert_eq!(
+        store
+            .runtime_consume_volume_takeover(
+                &node.authenticated,
+                &request,
+                &node.active_guest_config_digest,
+            )
+            .unwrap(),
+        VolumeTransitionStoreOutcome::Rejected(
+            VolumeTransitionStoreRejection::VolumeAuthorizationRejected {
+                authorization_id: id("takeover-auth-1"),
+                reason: RuntimeVolumeAuthorizationRejection::InvalidAuthorization,
+            }
+        )
+    );
+    assert_eq!(stored_volume_row(&store, &owned.volume_id), before_volume);
+    assert_eq!(
+        stored_authorization_row(&store, &id("takeover-auth-1")),
+        before_authorization
+    );
+}
+
+#[test]
+fn desired_move_winning_the_pg_barrier_rejects_takeover_with_zero_writes() {
+    let (url, seed, consumer) = store_pair();
+    let owned = acquire_owned_volume(&seed);
+    let event = host_fence_event(HostFenceEventState::Active);
+    let authorization = takeover_authorization(&owned);
+    seed_takeover(&seed, &event, &authorization);
+    let node = transition_node(&seed, "node-new");
+    let desired = prepare_takeover_runtime(&seed, &node, &id("takeover-auth-1"));
+    let destination = transition_node(&seed, "node-other");
+    let moved = moved_takeover_desired(&desired, &destination.session.node_id);
+    let request = takeover_consume_request(&node, &desired, &id("takeover-auth-1"));
+    let before_volume = stored_volume_row(&seed, &owned.volume_id);
+    let before_authorization = stored_authorization_row(&seed, &id("takeover-auth-1"));
+
+    let mover = Store::connect(&url, None).unwrap();
+    let move_nodes = vec![node.session.node_id.clone(), destination.session.node_id];
+    let moved_for_worker = moved.clone();
+    let (move_locked_tx, move_locked_rx) = mpsc::channel();
+    let (finish_move_tx, finish_move_rx) = mpsc::channel();
+    let mover_worker = std::thread::spawn(move || {
+        mover.authority_transaction(move |transaction| {
+            lock_node_identities_in_order(transaction, &move_nodes)?;
+            move_locked_tx.send(()).unwrap();
+            finish_move_rx.recv().unwrap();
+            rewrite_desired_in(transaction, &moved_for_worker)
+        })
+    });
+    move_locked_rx.recv().unwrap();
+
+    let (consume_done_tx, consume_done_rx) = mpsc::channel();
+    let consumer_worker = std::thread::spawn(move || {
+        consume_done_tx
+            .send(consumer.runtime_consume_volume_takeover(
+                &node.authenticated,
+                &request,
+                &node.active_guest_config_digest,
+            ))
+            .unwrap();
+    });
+    assert!(
+        consume_done_rx
+            .recv_timeout(Duration::from_millis(150))
+            .is_err(),
+        "takeover did not wait behind the Desired mover's NodeIdentity lock"
+    );
+    finish_move_tx.send(()).unwrap();
+    mover_worker.join().unwrap().unwrap();
+
+    let outcome = consume_done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("takeover did not resume after the Desired move")
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        VolumeTransitionStoreOutcome::Rejected(VolumeTransitionStoreRejection::Contract(
+            cats_api::runtime_reconciliation::ContractError { error, .. }
+        )) if matches!(*error, ContractErrorDetail::AssignedSetChanged { .. })
+    ));
+    consumer_worker.join().unwrap();
+    assert_eq!(stored_volume_row(&seed, &owned.volume_id), before_volume);
+    assert_eq!(
+        stored_authorization_row(&seed, &id("takeover-auth-1")),
+        before_authorization
+    );
+    assert_eq!(
+        seed.authority_transaction(|transaction| {
+            Ok(load_desired_for_update(transaction, &moved.cat_id)?.unwrap())
+        })
+        .unwrap(),
+        moved
+    );
+}
+
+#[test]
+fn takeover_winning_the_pg_barrier_serializes_before_desired_move() {
+    let (url, seed, consumer) = store_pair();
+    let owned = acquire_owned_volume(&seed);
+    let event = host_fence_event(HostFenceEventState::Active);
+    let authorization = takeover_authorization(&owned);
+    seed_takeover(&seed, &event, &authorization);
+    let node = transition_node(&seed, "node-new");
+    let desired = prepare_takeover_runtime(&seed, &node, &id("takeover-auth-1"));
+    let destination = transition_node(&seed, "node-other");
+    let moved = moved_takeover_desired(&desired, &destination.session.node_id);
+    let request = takeover_consume_request(&node, &desired, &id("takeover-auth-1"));
+
+    // Pause the real Store transaction only after its authenticated prefix
+    // owns NodeIdentity. The one competing PG session must then block on that
+    // same row before it can supersede/move Desired.
+    let (prefix_locked_tx, prefix_locked_rx) = mpsc::channel();
+    let (finish_consume_tx, finish_consume_rx) = mpsc::channel();
+    let (consume_done_tx, consume_done_rx) = mpsc::channel();
+    let consumer_worker = std::thread::spawn(move || {
+        consume_done_tx
+            .send(consumer.runtime_consume_volume_takeover_with_checkpoint(
+                &node.authenticated,
+                &request,
+                &node.active_guest_config_digest,
+                move || {
+                    prefix_locked_tx.send(()).unwrap();
+                    finish_consume_rx.recv().unwrap();
+                    Ok(())
+                },
+            ))
+            .unwrap();
+    });
+    prefix_locked_rx.recv().unwrap();
+
+    let mover = Store::connect(&url, None).unwrap();
+    let move_nodes = vec![id("node-new"), destination.session.node_id.clone()];
+    let moved_for_worker = moved.clone();
+    let (move_done_tx, move_done_rx) = mpsc::channel();
+    let mover_worker = std::thread::spawn(move || {
+        move_done_tx
+            .send(mover.authority_transaction(move |transaction| {
+                lock_node_identities_in_order(transaction, &move_nodes)?;
+                rewrite_desired_in(transaction, &moved_for_worker)
+            }))
+            .unwrap();
+    });
+    assert!(
+        move_done_rx
+            .recv_timeout(Duration::from_millis(150))
+            .is_err(),
+        "Desired mover passed the takeover transaction's NodeIdentity lock"
+    );
+
+    finish_consume_tx.send(()).unwrap();
+    let outcome = consume_done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("takeover did not resume after the HostFence barrier")
+        .unwrap();
+    assert!(matches!(outcome, VolumeTransitionStoreOutcome::Accepted(_)));
+    move_done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Desired move did not resume after takeover commit")
+        .unwrap();
+    consumer_worker.join().unwrap();
+    mover_worker.join().unwrap();
+
+    let committed = stored_volume(&seed, &owned.volume_id);
+    assert_eq!(committed.lease_owner, Some(id("attachment-new")));
+    assert!(matches!(
+        stored_authorization(&seed, &id("takeover-auth-1")).state,
+        AuthorizationState::Consumed(_)
+    ));
+    assert_eq!(
+        seed.authority_transaction(|transaction| {
+            Ok(load_desired_for_update(transaction, &moved.cat_id)?.unwrap())
+        })
+        .unwrap(),
+        moved
+    );
 }
 
 #[test]
@@ -1015,16 +1705,115 @@ fn takeover_authorized_node_is_immutable_and_wrong_caller_has_zero_writes() {
     let event = host_fence_event(HostFenceEventState::Active);
     let authorization = takeover_authorization(&owned);
     seed_takeover(&store, &event, &authorization);
+    let wrong_node = transition_node(&store, "node-other");
+    let desired = prepare_takeover_runtime(&store, &wrong_node, &id("takeover-auth-1"));
+    let request = takeover_consume_request(&wrong_node, &desired, &id("takeover-auth-1"));
     let before_volume = stored_volume(&store, &owned.volume_id);
     let before_authorization = stored_authorization(&store, &id("takeover-auth-1"));
 
-    let error = consume_takeover_as(&store, &id("takeover-auth-1"), &id("node-other")).unwrap_err();
-    assert_eq!(error.code, ErrorCode::FailedPrecondition);
+    assert_eq!(
+        store
+            .runtime_consume_volume_takeover(
+                &wrong_node.authenticated,
+                &request,
+                &wrong_node.active_guest_config_digest,
+            )
+            .unwrap(),
+        VolumeTransitionStoreOutcome::Rejected(
+            VolumeTransitionStoreRejection::VolumeAuthorizationRejected {
+                authorization_id: id("takeover-auth-1"),
+                reason: RuntimeVolumeAuthorizationRejection::InvalidAuthorization,
+            }
+        )
+    );
     assert_eq!(stored_volume(&store, &owned.volume_id), before_volume);
     assert_eq!(
         stored_authorization(&store, &id("takeover-auth-1")),
         before_authorization
     );
+}
+
+#[test]
+fn wrong_node_rejects_before_corrupt_foreign_authority_locks_or_decode() {
+    let (url, seed, consumer) = store_pair();
+    let owned = acquire_owned_volume(&seed);
+    let event = host_fence_event(HostFenceEventState::Active);
+    let authorization = takeover_authorization(&owned);
+    seed_takeover(&seed, &event, &authorization);
+    let wrong_node = transition_node(&seed, "node-other");
+    let desired = prepare_takeover_runtime(&seed, &wrong_node, &id("takeover-auth-1"));
+    let request = takeover_consume_request(&wrong_node, &desired, &id("takeover-auth-1"));
+
+    // Keep every bounded scalar route projection intact while making the
+    // protected payload undecodable. A wrong Node must never reach it.
+    seed.with(|client| {
+        client
+            .execute(
+                "UPDATE volume_authorizations
+                    SET record=record || '{\"unexpected\":true}'::jsonb
+                  WHERE authorization_id=$1",
+                &[&"takeover-auth-1"],
+            )
+            .map(|_| ())
+    })
+    .unwrap();
+    let before_volume = stored_volume_row(&seed, &owned.volume_id);
+    let before_authorization = stored_authorization_row(&seed, &id("takeover-auth-1"));
+
+    let blocker = Store::connect(&url, None).unwrap();
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let blocker_worker = std::thread::spawn(move || {
+        blocker.with(move |client| {
+            let mut transaction = client.transaction()?;
+            transaction.query_one(
+                "SELECT event_id FROM host_fence_events WHERE event_id=$1 FOR UPDATE",
+                &[&"fence-event-1"],
+            )?;
+            transaction.query_one(
+                "SELECT authorization_id
+                   FROM volume_authorizations
+                  WHERE authorization_id=$1 FOR UPDATE",
+                &[&"takeover-auth-1"],
+            )?;
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            transaction.rollback()
+        })
+    });
+    locked_rx.recv().unwrap();
+
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let consumer_worker = std::thread::spawn(move || {
+        let result = consumer.runtime_consume_volume_takeover(
+            &wrong_node.authenticated,
+            &request,
+            &wrong_node.active_guest_config_digest,
+        );
+        finished_tx.send(result).unwrap();
+    });
+    let outcome = finished_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("wrong-Node routing touched the locked foreign authority graph")
+        .unwrap();
+    assert_eq!(
+        outcome,
+        VolumeTransitionStoreOutcome::Rejected(
+            VolumeTransitionStoreRejection::VolumeAuthorizationRejected {
+                authorization_id: id("takeover-auth-1"),
+                reason: RuntimeVolumeAuthorizationRejection::InvalidAuthorization,
+            }
+        )
+    );
+    assert_eq!(stored_volume_row(&seed, &owned.volume_id), before_volume);
+    assert_eq!(
+        stored_authorization_row(&seed, &id("takeover-auth-1")),
+        before_authorization
+    );
+
+    release_tx.send(()).unwrap();
+    blocker_worker.join().unwrap().unwrap();
+    consumer_worker.join().unwrap();
 }
 
 #[test]
@@ -1095,12 +1884,18 @@ fn evidence_snapshot_detects_duplicate_completion_rows_even_without_schema_guard
         .unwrap();
     store
         .with(|client| {
-            client
+            let mut transaction = client.transaction()?;
+            transaction.execute(
+                "DELETE FROM disk_records WHERE volume_id=$1",
+                &[&owned.volume_id.as_str()],
+            )?;
+            transaction
                 .execute(
                     "DELETE FROM volume_records WHERE volume_id=$1",
                     &[&owned.volume_id.as_str()],
                 )
-                .map(|_| ())
+                .map(|_| ())?;
+            transaction.commit()
         })
         .unwrap();
     for (delete_id, disk_id, completed_at) in [
@@ -1225,6 +2020,9 @@ fn corrupted_authorization_payload_fails_closed_without_writes() {
     let authorization = takeover_authorization(&owned);
     let authorization_id = id("takeover-auth-1");
     seed_takeover(&store, &event, &authorization);
+    let node = transition_node(&store, "node-new");
+    let desired = prepare_takeover_runtime(&store, &node, &authorization_id);
+    let request = takeover_consume_request(&node, &desired, &authorization_id);
 
     // Attachment identities are intentionally not duplicated as projections.
     // Make the closed JSONB payload internally invalid while every projection
@@ -1250,7 +2048,13 @@ fn corrupted_authorization_payload_fails_closed_without_writes() {
     let before_event = stored_event(&store, &event.event_id);
     let before_authorization = stored_authorization_row(&store, &authorization_id);
 
-    let error = consume_takeover_as(&store, &authorization_id, &id("node-new")).unwrap_err();
+    let error = store
+        .runtime_consume_volume_takeover(
+            &node.authenticated,
+            &request,
+            &node.active_guest_config_digest,
+        )
+        .unwrap_err();
     assert_eq!(error.code, ErrorCode::Internal);
     assert_eq!(stored_volume(&store, &owned.volume_id), before_volume);
     assert_eq!(stored_event(&store, &event.event_id), before_event);
@@ -1267,6 +2071,9 @@ fn rejoin_event_lock_serializes_before_unconsumed_takeover() {
     let event = host_fence_event(HostFenceEventState::Active);
     let authorization = takeover_authorization(&owned);
     seed_takeover(&seed, &event, &authorization);
+    let node = transition_node(&seed, "node-new");
+    let desired = prepare_takeover_runtime(&seed, &node, &id("takeover-auth-1"));
+    let request = takeover_consume_request(&node, &desired, &id("takeover-auth-1"));
 
     let rejoin = Store::connect_from(&seed.dsn, None).unwrap();
     let (locked_tx, locked_rx) = mpsc::channel();
@@ -1282,12 +2089,23 @@ fn rejoin_event_lock_serializes_before_unconsumed_takeover() {
     });
     locked_rx.recv().unwrap();
     let consume_worker = std::thread::spawn(move || {
-        consume_takeover_as(&consumer, &id("takeover-auth-1"), &id("node-new"))
+        consumer.runtime_consume_volume_takeover(
+            &node.authenticated,
+            &request,
+            &node.active_guest_config_digest,
+        )
     });
     release_tx.send(()).unwrap();
     rejoin_worker.join().unwrap().unwrap();
-    let error = consume_worker.join().unwrap().unwrap_err();
-    assert_eq!(error.code, ErrorCode::FailedPrecondition);
+    assert_eq!(
+        consume_worker.join().unwrap().unwrap(),
+        VolumeTransitionStoreOutcome::Rejected(
+            VolumeTransitionStoreRejection::VolumeAuthorizationRejected {
+                authorization_id: id("takeover-auth-1"),
+                reason: RuntimeVolumeAuthorizationRejection::InvalidAuthorization,
+            }
+        )
+    );
     assert_eq!(stored_volume(&seed, &owned.volume_id), owned);
     assert!(matches!(
         stored_authorization(&seed, &id("takeover-auth-1")).state,
