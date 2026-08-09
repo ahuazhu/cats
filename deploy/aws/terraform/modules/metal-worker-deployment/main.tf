@@ -71,7 +71,7 @@ locals {
     # jq was already being used below without ever being checked for. It is
     # also what render-postgres-url uses to read the managed secret.
     # curl talks to IMDS when a fresh host derives its advertise address.
-    for required in aws jq zstd tar sha256sum findmnt curl base64 openssl flock stat; do
+    for required in aws jq zstd tar sha256sum findmnt curl base64 openssl flock stat systemd-run; do
       command -v "$required" >/dev/null 2>&1 || {
         echo "worker deployment needs $required on the host" >&2
         exit 1
@@ -93,6 +93,7 @@ locals {
       status=$?
       trap - EXIT INT TERM
       if [ "$release_transaction_active" -eq 1 ]; then
+        systemctl mask --runtime cats-worker >/dev/null 2>&1 || true
         cats_stop_node_service cats-worker >/dev/null 2>&1 || true
         "$release_installer" rollback >/dev/null 2>&1 || true
       fi
@@ -174,9 +175,31 @@ locals {
     # One Host-global open-file-description lock spans the entire mutation,
     # candidate start/readiness proof, and commit/rollback boundary.
     cats_acquire_worker_deployment_lock
-    release_installer="$stage_path/install-guest-runtime-release.sh"
+    test "${var.install_root}" = /opt/cats
+    release_installer="${var.install_root}/bin/install-guest-runtime-release"
+
+    # Before publishing an activation journal, close both ways the cached old
+    # unit could start: a runtime mask covers this boot, while the fsynced new
+    # unit/recovery helper covers a reboot. Only then may prepare expose a
+    # candidate release identity.
+    cats_gate_node_service cats-worker
+    cats_worker_deployment_crash_probe after-mask-worker
+    install -D -m 0755 "$stage_path/install-guest-runtime-release.sh" "$release_installer"
+    cats_worker_deployment_crash_probe after-install-release-installer
+    install -D -m 0755 "$stage_path/worker-deployment-transaction.sh" "${var.install_root}/bin/worker-deployment-transaction"
+    cats_worker_deployment_crash_probe after-install-deployment-transaction
+    install -m 0644 "$stage_path/cats-worker.service" /etc/systemd/system/cats-worker.service
+    cats_worker_deployment_crash_probe after-install-worker-unit
+    sync -f "$release_installer"
+    sync -f "${var.install_root}/bin/worker-deployment-transaction"
+    sync -f "${var.install_root}/bin"
+    sync -f /etc/systemd/system/cats-worker.service
+    sync -f /etc/systemd/system
+    cats_worker_deployment_crash_probe after-fsync-worker-recovery-gate
+    systemctl daemon-reload
+    cats_worker_deployment_crash_probe after-recovery-gate-daemon-reload
+
     release_transaction_active=1
-    cats_stop_node_service cats-worker
     "$release_installer" prepare "$stage_path/guest-runtime-release.v1"
     cats_worker_deployment_crash_probe after-installer-return
 
@@ -195,12 +218,6 @@ locals {
     cats_worker_deployment_crash_probe after-install-idle-guard
     install -D -m 0755 "$stage_path/render-postgres-url.sh" "${var.install_root}/bin/render-postgres-url"
     cats_worker_deployment_crash_probe after-install-postgres-renderer
-    install -D -m 0755 "$stage_path/install-guest-runtime-release.sh" "${var.install_root}/bin/install-guest-runtime-release"
-    cats_worker_deployment_crash_probe after-install-release-installer
-    install -D -m 0755 "$stage_path/worker-deployment-transaction.sh" "${var.install_root}/bin/worker-deployment-transaction"
-    cats_worker_deployment_crash_probe after-install-deployment-transaction
-    install -m 0644 "$stage_path/cats-worker.service" /etc/systemd/system/cats-worker.service
-    cats_worker_deployment_crash_probe after-install-worker-unit
     install -m 0644 "$stage_path/cats-postgres-url.service" /etc/systemd/system/cats-postgres-url.service
     cats_worker_deployment_crash_probe after-install-postgres-unit
     install -m 0644 "$stage_path/cats-postgres-url.timer" /etc/systemd/system/cats-postgres-url.timer
@@ -317,13 +334,17 @@ CATS_BASE_ENVIRONMENT
     systemctl start cats-postgres-url.service
     cats_worker_deployment_crash_probe after-start-postgres-renderer
 
-    "$release_installer" authorize-start
+    cats_begin_candidate_lifetime cats-worker "$release_installer"
     cats_worker_deployment_crash_probe after-authorize-worker-start
+    cats_ungate_node_service cats-worker
+    cats_worker_deployment_crash_probe after-unmask-worker
     systemctl start cats-worker
     cats_worker_deployment_crash_probe after-start-worker
+    cats_bind_candidate_main cats-worker "$release_installer"
+    cats_worker_deployment_crash_probe after-bind-worker-main
     cats_wait_for_registered_node cats-worker
     cats_worker_deployment_crash_probe after-registration-readiness
-    "$release_installer" commit
+    cats_commit_candidate "$release_installer"
     release_transaction_active=0
     cats_worker_deployment_crash_probe after-release-commit
     echo "Route Grant verifier key: $installed_route_grant_key_fingerprint"

@@ -3,8 +3,11 @@
 set -euo pipefail
 
 mode=${1:-}
-source_root=${2:-}
+argument_1=${2:-}
+argument_2=${3:-}
+argument_3=${4:-}
 node_service=${CATS_NODE_SERVICE_NAME:-cats-worker}
+deployment_watchdog_service=cats-worker-deployment-watchdog.service
 cats_root=/opt/cats
 required_uid=0
 required_gid=0
@@ -15,9 +18,10 @@ deployment_lock_path=/run/lock/cats/worker-deployment.lock
 # at each labeled durability boundary.
 crash_probe() { :; }
 [[ $mode == verify || $mode == prepare || $mode == commit \
-    || $mode == authorize-start || $mode == rollback || $mode == recover \
+    || $mode == authorize-start || $mode == bind-start \
+    || $mode == watchdog-check || $mode == rollback || $mode == recover \
     || $mode == startup-recover ]] || {
-  echo "usage: $0 verify|prepare <guest-runtime-release.v1> | authorize-start|commit|rollback|recover|startup-recover" >&2
+  echo "usage: $0 verify|prepare <guest-runtime-release.v1> | authorize-start <token> <owner-pid> <owner-start> | bind-start|commit <token> <main-pid> <main-start> | watchdog-check <token> <owner-pid> <owner-start> | rollback|recover|startup-recover" >&2
   exit 2
 }
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
@@ -58,10 +62,50 @@ require_service_stopped() {
   load_state=$(systemd_property LoadState) || return 1
   active_state=$(systemd_property ActiveState) || return 1
   case "$load_state:$active_state" in
-    loaded:inactive|loaded:failed|not-found:inactive) return 0 ;;
+    loaded:inactive|loaded:failed|not-found:inactive|masked:inactive|masked:failed) return 0 ;;
   esac
   echo "$node_service is not provably stopped ($load_state/$active_state)" >&2
   return 1
+}
+
+valid_decimal() {
+  [[ $1 =~ ^[1-9][0-9]*$ ]]
+}
+
+valid_candidate_token() {
+  [[ $1 =~ ^[0-9a-f]{64}$ ]]
+}
+
+process_start_ticks() {
+  local pid=$1 stat_line suffix
+  valid_decimal "$pid" || return 1
+  [[ -r /proc/$pid/stat ]] || return 1
+  IFS= read -r stat_line < "/proc/$pid/stat" || return 1
+  suffix=${stat_line##*) }
+  set -- $suffix
+  [[ $# -ge 20 ]] || return 1
+  valid_decimal "${20}" || return 1
+  printf '%s\n' "${20}"
+}
+
+require_process_identity() {
+  local pid=$1 expected_start=$2 actual_start
+  actual_start=$(process_start_ticks "$pid") || return 1
+  [[ $actual_start == "$expected_start" ]] || {
+    echo "process $pid no longer has expected start identity" >&2
+    return 1
+  }
+}
+
+current_main_identity() {
+  local main_pid main_start
+  main_pid=$(systemd_property MainPID) || return 1
+  valid_decimal "$main_pid" || {
+    echo "$node_service returned an invalid MainPID" >&2
+    return 1
+  }
+  main_start=$(process_start_ticks "$main_pid") || return 1
+  printf '%s:%s\n' "$main_pid" "$main_start"
 }
 
 require_service_active() {
@@ -183,16 +227,17 @@ PY
 
 release_id=""
 if [[ $mode == verify || $mode == prepare ]]; then
+  source_root=$argument_1
   [[ -n $source_root ]] || { echo "$mode requires a release source" >&2; exit 2; }
   release_id=$(verify_release "$source_root")
 fi
 [[ $mode == verify ]] && { printf '%s\n' "$release_id"; exit 0; }
-if [[ $mode != startup-recover ]]; then
+if [[ $mode != startup-recover && $mode != watchdog-check ]]; then
   require_deployment_lock
 fi
 case "$mode" in
   prepare|authorize-start|rollback|recover) require_service_stopped ;;
-  commit) require_service_active ;;
+  bind-start|commit) require_service_active ;;
 esac
 
 releases_root="$cats_root/releases"
@@ -384,10 +429,23 @@ load_activation() {
 }
 
 write_start_authorization() {
-  local incoming_id=$1 temp="$start_authorization_path.incoming"
+  local incoming_id=$1 token=$2 owner_pid=$3 owner_start=$4 gate=$5 main_pid=$6 main_start=$7
+  local temp="$start_authorization_path.incoming"
   valid_release_id "$incoming_id" || return 1
+  valid_candidate_token "$token" || return 1
+  valid_decimal "$owner_pid" || return 1
+  valid_decimal "$owner_start" || return 1
+  [[ $gate == armed || $gate == consumed ]] || return 1
+  if [[ $main_pid == none || $main_start == none ]]; then
+    [[ $main_pid == none && $main_start == none ]] || return 1
+  else
+    valid_decimal "$main_pid" || return 1
+    valid_decimal "$main_start" || return 1
+  fi
   rm -f -- "$temp" || return 1
-  (umask 077; printf 'version=1\nincoming=%s\n' "$incoming_id" > "$temp") || return 1
+  (umask 077; printf 'version=2\nincoming=%s\ntoken=%s\nowner_pid=%s\nowner_start=%s\ngate=%s\nmain_pid=%s\nmain_start=%s\n' \
+    "$incoming_id" "$token" "$owner_pid" "$owner_start" "$gate" \
+    "$main_pid" "$main_start" > "$temp") || return 1
   chown "$required_uid:$required_gid" "$temp" || return 1
   chmod 0600 "$temp" || return 1
   sync -f "$temp" || return 1
@@ -404,9 +462,32 @@ load_start_authorization() {
   metadata=$(stat -c '%u:%g:%a:%h:%F' "$start_authorization_path") || return 1
   test "$metadata" = "$required_uid:$required_gid:600:1:regular file" || return 1
   mapfile -t start_authorization_lines < "$start_authorization_path" || return 1
-  [[ ${#start_authorization_lines[@]} -eq 2 \
-      && ${start_authorization_lines[0]} == version=1 \
+  [[ ${#start_authorization_lines[@]} -eq 8 \
+      && ${start_authorization_lines[0]} == version=2 \
       && ${start_authorization_lines[1]} == "incoming=$expected_id" ]] || return 1
+  start_authorization_token=${start_authorization_lines[2]#token=}
+  start_authorization_owner_pid=${start_authorization_lines[3]#owner_pid=}
+  start_authorization_owner_start=${start_authorization_lines[4]#owner_start=}
+  start_authorization_gate=${start_authorization_lines[5]#gate=}
+  start_authorization_main_pid=${start_authorization_lines[6]#main_pid=}
+  start_authorization_main_start=${start_authorization_lines[7]#main_start=}
+  [[ ${start_authorization_lines[2]} == "token=$start_authorization_token" \
+      && ${start_authorization_lines[3]} == "owner_pid=$start_authorization_owner_pid" \
+      && ${start_authorization_lines[4]} == "owner_start=$start_authorization_owner_start" \
+      && ${start_authorization_lines[5]} == "gate=$start_authorization_gate" \
+      && ${start_authorization_lines[6]} == "main_pid=$start_authorization_main_pid" \
+      && ${start_authorization_lines[7]} == "main_start=$start_authorization_main_start" ]] || return 1
+  valid_candidate_token "$start_authorization_token" || return 1
+  valid_decimal "$start_authorization_owner_pid" || return 1
+  valid_decimal "$start_authorization_owner_start" || return 1
+  [[ $start_authorization_gate == armed || $start_authorization_gate == consumed ]] || return 1
+  if [[ $start_authorization_main_pid == none || $start_authorization_main_start == none ]]; then
+    [[ $start_authorization_main_pid == none \
+        && $start_authorization_main_start == none ]] || return 1
+  else
+    valid_decimal "$start_authorization_main_pid" || return 1
+    valid_decimal "$start_authorization_main_start" || return 1
+  fi
 }
 
 clear_start_authorization() {
@@ -481,18 +562,29 @@ startup_recover() {
     [[ ! -e $activation_path && ! -L $activation_path ]]
   else
     # A live outer deployment owns the lock and is intentionally starting the
-    # candidate for its registration/readiness proof. Only exact incoming bytes
-    # with the durable post-mutation authorization may cross this gate; the
-    # outer owner remains responsible for readiness and commit.
+    # candidate for its registration/readiness proof. The authorization is
+    # bound to both that process lifetime and an independently supervised
+    # watchdog. Consume the one-shot start gate before returning so Restart=
+    # always cannot start a second MainPID under the same authorization.
     load_activation || return 1
     load_start_authorization "$activation_incoming" || return 1
-    verify_active "$activation_incoming"
+    require_process_identity "$start_authorization_owner_pid" \
+      "$start_authorization_owner_start" || return 1
+    systemctl is-active --quiet "$deployment_watchdog_service" || return 1
+    [[ $start_authorization_gate == armed \
+        && $start_authorization_main_pid == none \
+        && $start_authorization_main_start == none ]] || return 1
+    verify_active "$activation_incoming" || return 1
+    write_start_authorization "$activation_incoming" \
+      "$start_authorization_token" "$start_authorization_owner_pid" \
+      "$start_authorization_owner_start" consumed none none
   fi
 }
 
 case "$mode" in
   prepare)
     recover_activation
+    recovered_previous_id=""
     if [[ -e $activation_path || -L $activation_path ]]; then
       load_activation
       if [[ $activation_previous == none ]]; then
@@ -505,20 +597,26 @@ case "$mode" in
         exit 0
       fi
       # A previous failed deployment has now restored its exact prior release.
-      # Clear only while this new outer transaction holds the Host lock, then
-      # immediately build its fresh journal before any candidate start.
-      clear_activation
+      # Keep that durable journal as the recovery authority while copying and
+      # fsyncing the next candidate. Replacing it is the new transaction's
+      # linearization point; there is never an unjournaled retry window.
+      recovered_previous_id=$activation_previous
     fi
     target_set=$(persist_source_set "$source_root" "$release_id" incoming)
-    previous_id=none
-    active_manifest="$active_release_root/guest-runtime-release-manifest.v1.json"
-    if [[ -e $active_manifest || -L $active_manifest ]]; then
-      previous_id=$(persist_active_set)
-    elif [[ -e $active_release_root/guest-runtime-profile.v1.json \
-        || -e $active_guest_root/vmlinuz \
-        || -e $active_guest_root/initramfs.img ]]; then
-      echo "partial active Guest release exists without its manifest" >&2
-      exit 1
+    if [[ -n $recovered_previous_id ]]; then
+      previous_id=$recovered_previous_id
+      verify_active "$previous_id"
+    else
+      previous_id=none
+      active_manifest="$active_release_root/guest-runtime-release-manifest.v1.json"
+      if [[ -e $active_manifest || -L $active_manifest ]]; then
+        previous_id=$(persist_active_set)
+      elif [[ -e $active_release_root/guest-runtime-profile.v1.json \
+          || -e $active_guest_root/vmlinuz \
+          || -e $active_guest_root/initramfs.img ]]; then
+        echo "partial active Guest release exists without its manifest" >&2
+        exit 1
+      fi
     fi
     write_activation "$release_id" "$previous_id"
     prepare_rollback() {
@@ -534,17 +632,63 @@ case "$mode" in
     printf '%s\n' "$release_id"
     ;;
   authorize-start)
+    valid_candidate_token "$argument_1" || exit 2
+    valid_decimal "$argument_2" || exit 2
+    valid_decimal "$argument_3" || exit 2
+    require_process_identity "$argument_2" "$argument_3"
     load_activation
     verify_active "$activation_incoming"
-    write_start_authorization "$activation_incoming"
+    systemctl is-active --quiet "$deployment_watchdog_service"
+    write_start_authorization "$activation_incoming" \
+      "$argument_1" "$argument_2" "$argument_3" armed none none
     ;;
-  commit)
+  bind-start)
+    valid_candidate_token "$argument_1" || exit 2
+    valid_decimal "$argument_2" || exit 2
+    valid_decimal "$argument_3" || exit 2
     load_activation
     load_start_authorization "$activation_incoming"
+    [[ $start_authorization_token == "$argument_1" \
+        && $start_authorization_gate == consumed \
+        && $start_authorization_main_pid == none \
+        && $start_authorization_main_start == none ]] || exit 1
+    require_process_identity "$start_authorization_owner_pid" \
+      "$start_authorization_owner_start"
+    [[ $(current_main_identity) == "$argument_2:$argument_3" ]] || exit 1
+    write_start_authorization "$activation_incoming" \
+      "$start_authorization_token" "$start_authorization_owner_pid" \
+      "$start_authorization_owner_start" consumed "$argument_2" "$argument_3"
+    ;;
+  commit)
+    valid_candidate_token "$argument_1" || exit 2
+    valid_decimal "$argument_2" || exit 2
+    valid_decimal "$argument_3" || exit 2
+    load_activation
+    load_start_authorization "$activation_incoming"
+    [[ $start_authorization_token == "$argument_1" \
+        && $start_authorization_gate == consumed \
+        && $start_authorization_main_pid == "$argument_2" \
+        && $start_authorization_main_start == "$argument_3" ]] || exit 1
+    require_process_identity "$start_authorization_owner_pid" \
+      "$start_authorization_owner_start"
+    [[ $(current_main_identity) == "$argument_2:$argument_3" ]] || exit 1
     verify_active "$activation_incoming"
     crash_probe "commit-verified-readiness"
     clear_activation
     clear_start_authorization
+    ;;
+  watchdog-check)
+    valid_candidate_token "$argument_1" || exit 2
+    valid_decimal "$argument_2" || exit 2
+    valid_decimal "$argument_3" || exit 2
+    if [[ ! -e $activation_path && ! -L $activation_path ]]; then
+      exit 10
+    fi
+    load_activation
+    load_start_authorization "$activation_incoming"
+    [[ $start_authorization_token == "$argument_1" \
+        && $start_authorization_owner_pid == "$argument_2" \
+        && $start_authorization_owner_start == "$argument_3" ]] || exit 1
     ;;
   rollback)
     rollback_activation

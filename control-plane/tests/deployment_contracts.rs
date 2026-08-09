@@ -1828,10 +1828,10 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
             .find("cats_wait_for_registered_node")
             .expect("registration-backed readiness");
         let authorize = source
-            .find("\"$release_installer\" authorize-start")
-            .expect("post-mutation start authorization");
+            .find("cats_begin_candidate_lifetime")
+            .expect("post-mutation start authorization and watchdog");
         let commit = source
-            .find("\"$release_installer\" commit")
+            .find("cats_commit_candidate \"$release_installer\"")
             .expect("release commit");
         assert!(
             required < verify
@@ -1895,9 +1895,9 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
         .find("cats_acquire_worker_deployment_lock")
         .expect("Host deployment lock");
     let stop = terraform[deployment_lock..]
-        .find("cats_stop_node_service cats-worker")
+        .find("cats_gate_node_service cats-worker")
         .map(|offset| deployment_lock + offset)
-        .expect("worker stop");
+        .expect("masked worker stop");
     let prepare = terraform[stop..]
         .find("\"$release_installer\" prepare")
         .map(|offset| stop + offset)
@@ -1912,8 +1912,8 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
         "nothing from the empty stage may execute before verified extraction"
     );
     let authorize = terraform
-        .find("\"$release_installer\" authorize-start")
-        .expect("durable post-mutation start authorization");
+        .find("cats_begin_candidate_lifetime cats-worker \"$release_installer\"")
+        .expect("durable post-mutation start authorization and watchdog");
     let start = terraform
         .find("systemctl start cats-worker")
         .expect("candidate worker start");
@@ -1921,7 +1921,7 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
         .find("cats_wait_for_registered_node cats-worker")
         .expect("registration-backed readiness");
     let commit = terraform
-        .find("\"$release_installer\" commit")
+        .find("cats_commit_candidate \"$release_installer\"")
         .expect("release commit");
     assert!(
         first_install < authorize && authorize < start && start < readiness && readiness < commit

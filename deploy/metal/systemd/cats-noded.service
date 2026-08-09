@@ -9,6 +9,7 @@ Wants=cats-controld.service
 # Controlled stop/restart is permitted only at state=cordoned cats=0/orphans=0.
 Environment=CATS_GUEST_NETWORK_CIDR=10.240.0.0/16
 Environment=CATS_NODE_LISTEN=127.0.0.1:7301
+Environment=CATS_NODE_SERVICE_NAME=cats-noded
 EnvironmentFile=/etc/cats/cats.env
 # Root is required for /dev/kvm, kernel NBD attach and tap devices (Phase A;
 # privilege separation is a hardening milestone). The nbd module is loaded

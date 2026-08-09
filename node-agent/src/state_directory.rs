@@ -129,14 +129,19 @@ impl StateDirectory {
         let Some(directory) = &self.inherited_directory else {
             return Ok(());
         };
-        // SAFETY: `directory` owns a live descriptor and `F_GETFD` has no
-        // pointer argument or retained memory.
-        let flags = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_GETFD) };
-        anyhow::ensure!(flags >= 0, "inspect inherited Node state descriptor");
-        anyhow::ensure!(
-            flags & libc::FD_CLOEXEC == 0,
-            "Node state descriptor must remain open across child exec"
-        );
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: `directory` owns a live descriptor and `F_GETFD` has no
+            // pointer argument or retained memory.
+            let flags = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_GETFD) };
+            anyhow::ensure!(flags >= 0, "inspect inherited Node state descriptor");
+            anyhow::ensure!(
+                flags & libc::FD_CLOEXEC == 0,
+                "Node state descriptor must remain open across child exec"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = directory;
         Ok(())
     }
 

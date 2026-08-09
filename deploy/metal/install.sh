@@ -28,6 +28,12 @@ apt-get update -q
 apt-get install -qy build-essential curl git nbd-client busybox-static \
   musl-tools e2fsprogs cpio zstd pkg-config libssl-dev debootstrap iptables \
   util-linux openssl
+for required in flock stat curl openssl findmnt systemd-run; do
+  command -v "$required" >/dev/null 2>&1 || {
+    echo "worker deployment needs $required" >&2
+    exit 1
+  }
+done
 
 echo "==> rust toolchain"
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -53,14 +59,17 @@ fi
 export CATS_NODE_SERVICE_NAME=cats-noded
 release_installer="$REPO/deploy/aws/metal/install-guest-runtime-release.sh"
 "$release_installer" verify "$GUEST_RUNTIME_RELEASE_SOURCE"
+metering_root=$(cats_worker_metering_root cats-noded)
+"$REPO/deploy/aws/metal/require-idle-worker.sh" "$metering_root" "$PREFIX/bin"
 cats_acquire_worker_deployment_lock
-release_transaction_active=1
+release_transaction_active=0
 route_key_temp=""
 route_public_temp=""
 deployment_cleanup() {
   status=$?
   trap - EXIT INT TERM
   if [[ $release_transaction_active -eq 1 ]]; then
+    systemctl mask --runtime cats-noded >/dev/null 2>&1 || true
     cats_stop_node_service cats-noded >/dev/null 2>&1 || true
     "$release_installer" rollback >/dev/null 2>&1 || true
   fi
@@ -71,7 +80,28 @@ deployment_cleanup() {
 trap deployment_cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-cats_stop_node_service cats-noded
+cats_gate_node_service cats-noded
+cats_worker_deployment_crash_probe after-mask-worker
+
+install -D -m 0755 "$REPO/deploy/aws/metal/install-guest-runtime-release.sh" \
+  "$PREFIX/bin/install-guest-runtime-release"
+cats_worker_deployment_crash_probe after-install-release-installer
+install -D -m 0755 "$REPO/deploy/aws/metal/worker-deployment-transaction.sh" \
+  "$PREFIX/bin/worker-deployment-transaction"
+cats_worker_deployment_crash_probe after-install-deployment-transaction
+install -m 0644 "$REPO/deploy/metal/systemd/cats-noded.service" \
+  /etc/systemd/system/cats-noded.service
+cats_worker_deployment_crash_probe after-install-worker-unit
+sync -f "$PREFIX/bin/install-guest-runtime-release"
+sync -f "$PREFIX/bin/worker-deployment-transaction"
+sync -f "$PREFIX/bin"
+sync -f /etc/systemd/system/cats-noded.service
+sync -f /etc/systemd/system
+cats_worker_deployment_crash_probe after-fsync-worker-recovery-gate
+systemctl daemon-reload
+cats_worker_deployment_crash_probe after-recovery-gate-daemon-reload
+release_installer="$PREFIX/bin/install-guest-runtime-release"
+release_transaction_active=1
 "$release_installer" prepare "$GUEST_RUNTIME_RELEASE_SOURCE"
 cats_worker_deployment_crash_probe after-installer-return
 
@@ -103,11 +133,6 @@ cats_worker_deployment_crash_probe after-install-nbd-configuration
 echo "==> guest outbound network"
 install -m 0755 "$REPO/deploy/metal/setup-guest-network.sh" \
   "$PREFIX/bin/setup-guest-network"
-install -m 0755 "$REPO/deploy/aws/metal/install-guest-runtime-release.sh" \
-  "$PREFIX/bin/install-guest-runtime-release"
-install -m 0755 "$REPO/deploy/aws/metal/worker-deployment-transaction.sh" \
-  "$PREFIX/bin/worker-deployment-transaction"
-cats_worker_deployment_crash_probe after-install-deployment-transaction
 printf 'net.ipv4.ip_forward=1\nnet.ipv4.conf.all.rp_filter=1\nnet.ipv4.conf.default.rp_filter=1\n' \
   > /etc/sysctl.d/90-cats-guest-network.conf
 cats_worker_deployment_crash_probe after-install-network-configuration
@@ -211,19 +236,26 @@ rm -f -- "$route_public_temp"
 route_public_temp=""
 
 echo "==> systemd units"
-install -m 0644 "$REPO"/deploy/metal/systemd/*.service /etc/systemd/system/
+for unit in "$REPO"/deploy/metal/systemd/*.service; do
+  [[ ${unit##*/} == cats-noded.service ]] && continue
+  install -m 0644 "$unit" /etc/systemd/system/
+done
 cats_worker_deployment_crash_probe after-install-systemd-units
 systemctl daemon-reload
 cats_worker_deployment_crash_probe after-daemon-reload
 systemctl enable --now cats-controld cats-gatewayd
 cats_worker_deployment_crash_probe after-start-control-services
-"$release_installer" authorize-start
+cats_begin_candidate_lifetime cats-noded "$release_installer"
 cats_worker_deployment_crash_probe after-authorize-worker-start
+cats_ungate_node_service cats-noded
+cats_worker_deployment_crash_probe after-unmask-worker
 systemctl enable --now cats-noded
 cats_worker_deployment_crash_probe after-start-worker
+cats_bind_candidate_main cats-noded "$release_installer"
+cats_worker_deployment_crash_probe after-bind-worker-main
 cats_wait_for_registered_node cats-noded
 cats_worker_deployment_crash_probe after-registration-readiness
-"$release_installer" commit
+cats_commit_candidate "$release_installer"
 release_transaction_active=0
 cats_worker_deployment_crash_probe after-release-commit
 

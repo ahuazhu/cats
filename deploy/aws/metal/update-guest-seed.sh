@@ -50,7 +50,7 @@ done
 # an independent mutation authority. A manual or overlapping invocation must
 # prove both the inherited Host deployment lock and a stopped worker before it
 # creates staging bytes beside the live seed.
-transaction_helper=/opt/cats/bin/worker-deployment-transaction.sh
+transaction_helper=/opt/cats/bin/worker-deployment-transaction
 [[ -f $transaction_helper && ! -L $transaction_helper ]] || {
   echo "installed worker deployment transaction helper is missing" >&2
   exit 1

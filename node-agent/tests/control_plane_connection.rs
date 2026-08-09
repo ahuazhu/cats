@@ -198,9 +198,10 @@ fn registration(root: &Path) -> AgentRegistrationConfig {
 
 fn config(root: &Path, control_plane_url: String) -> ServerConfig {
     let registration = registration(root);
-    let node: NodeConfig = fake_node_config!(
+    let mut node: NodeConfig = fake_node_config!(
         NodeConfigBuilder::new(root, "node_a").with_state_dir(registration.state_path())
     );
+    node.state_dir = registration.runtime_state_directory();
     let storage_meta: Arc<dyn MetadataStore> =
         Arc::new(SqliteMetadataStore::open(&root.join("meta.db")).unwrap());
     ServerConfig {

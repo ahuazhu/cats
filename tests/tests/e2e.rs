@@ -178,6 +178,11 @@ impl Cluster {
             )
             .unwrap(),
         );
+        let mut node_config = fake_node_config!(NodeConfigBuilder::new(dir.path(), id.to_string())
+            .with_state_dir(state_dir)
+            .with_metadata_store(metadata_store)
+            .with_object_store(object_store));
+        node_config.state_dir = registration.runtime_state_directory();
         let node = spawn_node(ServerConfig {
             listen: "127.0.0.1:0".into(),
             control_plane_url: cp.base_url(),
@@ -186,10 +191,7 @@ impl Cluster {
             route_grant_verifier: route_grant_verifier.clone(),
             heartbeat_ms: 300,
             storage_meta,
-            node: fake_node_config!(NodeConfigBuilder::new(dir.path(), id.to_string())
-                .with_state_dir(state_dir)
-                .with_metadata_store(metadata_store)
-                .with_object_store(object_store)),
+            node: node_config,
         })
         .await
         .unwrap();

@@ -194,6 +194,11 @@ async fn start_agent(
         &receipt,
     )
     .unwrap();
+    let mut node_config =
+        fake_node_config!(
+            NodeConfigBuilder::new(dir.path(), "node_a".to_string()).with_state_dir(state_dir)
+        );
+    node_config.state_dir = registration.runtime_state_directory();
     spawn(ServerConfig {
         listen: "127.0.0.1:0".into(),
         control_plane_url,
@@ -207,9 +212,7 @@ async fn start_agent(
         ),
         heartbeat_ms: HEARTBEAT_MS,
         storage_meta,
-        node: fake_node_config!(
-            NodeConfigBuilder::new(dir.path(), "node_a".to_string()).with_state_dir(state_dir)
-        ),
+        node: node_config,
     })
     .await
     .unwrap()

@@ -39,7 +39,7 @@ install -m 0600 "$ROUTE_GRANT_PUBLIC_KEY_SOURCE" "$ROUTE_GRANT_PUBLIC_KEY_STAGE"
 
 "$CATS_REPO/deploy/aws/metal/validate-node-identity-installation.sh"
 . "$CATS_REPO/deploy/aws/metal/worker-deployment-transaction.sh"
-for required in flock stat curl; do
+for required in flock stat curl openssl findmnt systemd-run; do
   command -v "$required" >/dev/null 2>&1 || {
     echo "worker deployment needs $required" >&2
     exit 1
@@ -68,12 +68,16 @@ fi
 
 release_installer="$CATS_REPO/deploy/aws/metal/install-guest-runtime-release.sh"
 "$release_installer" verify "$GUEST_RUNTIME_RELEASE_SOURCE"
+metering_root=$(cats_worker_metering_root cats-worker)
+"$CATS_REPO/deploy/aws/metal/require-idle-worker.sh" \
+  "$metering_root" "$CATS_PREFIX/bin"
 cats_acquire_worker_deployment_lock
-release_transaction_active=1
+release_transaction_active=0
 deployment_cleanup() {
   status=$?
   trap - EXIT INT TERM
   if [[ $release_transaction_active -eq 1 ]]; then
+    systemctl mask --runtime cats-worker >/dev/null 2>&1 || true
     cats_stop_node_service cats-worker >/dev/null 2>&1 || true
     "$release_installer" rollback >/dev/null 2>&1 || true
   fi
@@ -83,7 +87,30 @@ deployment_cleanup() {
 trap deployment_cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-cats_stop_node_service cats-worker
+cats_gate_node_service cats-worker
+cats_worker_deployment_crash_probe after-mask-worker
+
+# Establish the reboot recovery gate before the release journal or any state
+# filesystem mutation. The runtime mask covers this boot; fsynced installed
+# bytes plus daemon-reload cover direct start after reboot.
+install -D -m 0755 "$CATS_REPO/deploy/aws/metal/install-guest-runtime-release.sh" \
+  "$CATS_PREFIX/bin/install-guest-runtime-release"
+cats_worker_deployment_crash_probe after-install-release-installer
+install -D -m 0755 "$CATS_REPO/deploy/aws/metal/worker-deployment-transaction.sh" \
+  "$CATS_PREFIX/bin/worker-deployment-transaction"
+cats_worker_deployment_crash_probe after-install-deployment-transaction
+install -m 0644 "$CATS_REPO/deploy/aws/metal/cats-worker.service" \
+  /etc/systemd/system/cats-worker.service
+cats_worker_deployment_crash_probe after-install-worker-unit
+sync -f "$CATS_PREFIX/bin/install-guest-runtime-release"
+sync -f "$CATS_PREFIX/bin/worker-deployment-transaction"
+sync -f "$CATS_PREFIX/bin"
+sync -f /etc/systemd/system/cats-worker.service
+sync -f /etc/systemd/system
+cats_worker_deployment_crash_probe after-fsync-worker-recovery-gate
+systemctl daemon-reload
+cats_worker_deployment_crash_probe after-recovery-gate-daemon-reload
+release_installer="$CATS_PREFIX/bin/install-guest-runtime-release"
 
 # Local NVMe discovery and mkfs/mount both happen inside the same Host
 # deployment transaction as every other installed-state mutation. In
@@ -130,6 +157,7 @@ else
   echo "    (fine for functional testing, NOT comparable for storage benchmarks)"
 fi
 
+release_transaction_active=1
 "$release_installer" prepare "$GUEST_RUNTIME_RELEASE_SOURCE"
 cats_worker_deployment_crash_probe after-installer-return
 
@@ -144,12 +172,6 @@ install -m 0755 "$CATS_REPO/target/release/cats-blockd" "$CATS_PREFIX/bin/cats-b
 cats_worker_deployment_crash_probe after-install-cats-blockd
 install -m 0755 "$CATS_REPO/target/release/cats-guest-agent" "$CATS_PREFIX/bin/cats-guest-agent"
 cats_worker_deployment_crash_probe after-install-cats-guest-agent
-install -m 0755 "$CATS_REPO/deploy/aws/metal/install-guest-runtime-release.sh" \
-  "$CATS_PREFIX/bin/install-guest-runtime-release"
-install -m 0755 "$CATS_REPO/deploy/aws/metal/worker-deployment-transaction.sh" \
-  "$CATS_PREFIX/bin/worker-deployment-transaction"
-cats_worker_deployment_crash_probe after-install-deployment-transaction
-
 if [[ ! -x "$CATS_PREFIX/bin/cloud-hypervisor" ]]; then
   curl -fsSL -o "$CATS_PREFIX/bin/cloud-hypervisor" \
     "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/$CATS_CH_VERSION/cloud-hypervisor-static"
@@ -178,8 +200,6 @@ cats_worker_deployment_crash_probe after-install-rds-ca
 
 install -m 0755 "$CATS_REPO/deploy/aws/metal/render-postgres-url.sh" \
   "$CATS_PREFIX/bin/render-postgres-url"
-install -m 0644 "$CATS_REPO/deploy/aws/metal/cats-worker.service" \
-  /etc/systemd/system/cats-worker.service
 install -m 0644 "$CATS_REPO/deploy/aws/metal/cats-postgres-url.service" \
   /etc/systemd/system/cats-postgres-url.service
 install -m 0644 "$CATS_REPO/deploy/aws/metal/cats-postgres-url.timer" \
@@ -195,13 +215,17 @@ if [[ -f /etc/cats/worker.env ]]; then
   chmod 0600 /etc/cats/worker.env
   systemctl enable --now cats-postgres-url.timer
   cats_worker_deployment_crash_probe after-enable-postgres-timer
-  "$release_installer" authorize-start
+  cats_begin_candidate_lifetime cats-worker "$release_installer"
   cats_worker_deployment_crash_probe after-authorize-worker-start
+  cats_ungate_node_service cats-worker
+  cats_worker_deployment_crash_probe after-unmask-worker
   systemctl enable --now cats-worker
   cats_worker_deployment_crash_probe after-start-worker
+  cats_bind_candidate_main cats-worker "$release_installer"
+  cats_worker_deployment_crash_probe after-bind-worker-main
   cats_wait_for_registered_node cats-worker
   cats_worker_deployment_crash_probe after-registration-readiness
-  "$release_installer" commit
+  cats_commit_candidate "$release_installer"
   release_transaction_active=0
   cats_worker_deployment_crash_probe after-release-commit
 else
