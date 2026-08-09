@@ -45,6 +45,15 @@ impl AuthorityRequestContext {
     fn must_rollback(&self) -> bool {
         self.cancelled.load(Ordering::Acquire) || Instant::now() >= self.deadline
     }
+
+    fn remaining_timeout_millis(&self) -> Option<u64> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return None;
+        }
+        let remaining = self.deadline.checked_duration_since(Instant::now())?;
+        let millis = remaining.as_millis().min(i32::MAX as u128) as u64;
+        (millis > 0).then_some(millis)
+    }
 }
 
 pub(super) type AuthorityTxResult<T> = std::result::Result<T, AuthorityTransactionError>;
@@ -232,6 +241,27 @@ impl Store {
                         .start(),
                 }
                 .map_err(AttemptFailure::Postgres)?;
+                if let Some(request) = request {
+                    let Some(timeout_ms) = request.remaining_timeout_millis() else {
+                        transaction.rollback().map_err(AttemptFailure::Rollback)?;
+                        return Err(AttemptFailure::Application(ApiError::unavailable(
+                            "runtime authority request was cancelled or exceeded its deadline",
+                        )));
+                    };
+                    let lock_timeout_ms = timeout_ms.min(2_000);
+                    if let Err(error) = transaction.batch_execute(&format!(
+                        "SET LOCAL statement_timeout = '{timeout_ms}ms'; \
+                         SET LOCAL lock_timeout = '{lock_timeout_ms}ms'"
+                    )) {
+                        if let Err(rollback_error) = transaction.rollback() {
+                            if client.is_closed() && authority_retry_reason(&error).is_some() {
+                                return Err(AttemptFailure::Postgres(error));
+                            }
+                            return Err(AttemptFailure::Rollback(rollback_error));
+                        }
+                        return Err(AttemptFailure::Postgres(error));
+                    }
+                }
                 match operation(&mut transaction) {
                     Ok(_value) if request.is_some_and(AuthorityRequestContext::must_rollback) => {
                         transaction.rollback().map_err(AttemptFailure::Rollback)?;
@@ -322,6 +352,12 @@ impl Store {
                 }
                 Err(AttemptFailure::Postgres(error)) => {
                     metrics::record_postgres_error(&error);
+                    if request.is_some() && request_timeout(&error) {
+                        metrics::record_authority_outcome(metrics::AuthorityOutcome::BackendFailed);
+                        return Err(AuthorityExecutionError::Store(ApiError::unavailable(
+                            "runtime authority request exceeded its PostgreSQL deadline",
+                        )));
+                    }
                     let retry_reason = authority_retry_reason(&error);
                     if attempt + 1 < AUTHORITY_TRANSACTION_ATTEMPTS {
                         if let Some(reason) = retry_reason {
@@ -418,6 +454,13 @@ fn authority_retry_reason(error: &postgres::Error) -> Option<metrics::AuthorityR
         source = current.source();
     }
     None
+}
+
+fn request_timeout(error: &postgres::Error) -> bool {
+    matches!(
+        error.code(),
+        Some(&SqlState::QUERY_CANCELED) | Some(&SqlState::LOCK_NOT_AVAILABLE)
+    )
 }
 
 fn is_transient_connection_kind(kind: ErrorKind) -> bool {

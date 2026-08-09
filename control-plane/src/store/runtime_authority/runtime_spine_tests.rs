@@ -181,6 +181,51 @@ fn cancelling_a_started_http_authority_request_rolls_back_before_commit() {
     );
 }
 
+#[test]
+fn authority_request_uses_its_remaining_deadline_as_the_postgres_timeout() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let (store, _identity, authenticated, _policy, session) = fixture_at(&url);
+    store
+        .with(|client| {
+            client.batch_execute(
+                "CREATE OR REPLACE FUNCTION pause_runtime_desired_until_deadline()
+                 RETURNS trigger AS $$
+                 BEGIN
+                   PERFORM pg_sleep(1);
+                   RETURN NEW;
+                 END;
+                 $$ LANGUAGE plpgsql;
+                 CREATE TRIGGER pause_runtime_desired_until_deadline
+                   BEFORE INSERT ON runtime_desired_read_states
+                   FOR EACH ROW EXECUTE FUNCTION pause_runtime_desired_until_deadline();",
+            )
+        })
+        .unwrap();
+    let request = cats_api::runtime_reconciliation::DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: binding(&session),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let context = AuthorityRequestContext::new(Instant::now() + Duration::from_millis(100));
+    let started = Instant::now();
+    let error = store
+        .runtime_desired_read_for_request(&authenticated, &request, &context)
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Unavailable);
+    assert!(
+        started.elapsed() < Duration::from_millis(750),
+        "the request must not inherit the ordinary five-second statement timeout"
+    );
+    let row_count: i64 = store
+        .with(|client| {
+            Ok(client
+                .query_one("SELECT count(*) FROM runtime_desired_read_states", &[])?
+                .get(0))
+        })
+        .unwrap();
+    assert_eq!(row_count, 0);
+}
+
 fn numbered_identity(index: usize) -> NodeIdentity {
     NodeIdentity {
         version: ContractVersion::V1,
