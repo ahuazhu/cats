@@ -19,6 +19,7 @@ mod checkpoint;
 mod clean_slate_probes;
 mod gate_planner;
 mod inventory;
+mod normal_acquire;
 mod root_provision;
 mod volume_transitions;
 
@@ -47,6 +48,12 @@ pub use gate_planner::{
 };
 pub use inventory::{
     CleanSlateInventoryScanner, InventoryAbsence, InventoryAbsenceProbe, InventoryProbeSetError,
+};
+pub use normal_acquire::{
+    recover_normal_acquire_from_authority, A19SignedVolumeTransitionTransport,
+    ControlSignedNormalAcquireClient, NormalAcquireAttempt, NormalAcquireAuthorityRecovery,
+    NormalAcquireClientError, RuntimeVolumeTransitionHttpClient, SignedVolumeTransitionResponse,
+    VolumeTransitionTransportFailure,
 };
 pub use root_provision::{
     AuthorityRereadRequired, RootProvisionClientError, RootProvisionControlPort,
