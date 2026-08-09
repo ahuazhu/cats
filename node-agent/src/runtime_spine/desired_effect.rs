@@ -183,7 +183,11 @@ impl RuntimeDesiredEffect for ProductionRuntimeDesiredEffect {
         self.launch
             .launch(desired, &network)
             .context("launch exact checkpointed Desired runtime")?;
-        Ok(RuntimeDesiredEffectOutcome::Applied)
+        // This adapter wrote a checkpoint and prepared Host networking before
+        // launch. Even a successful exact launch must return through a fresh
+        // complete physical scan; it may not advance another Cat from the
+        // predecessor admission batch.
+        Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
     }
 }
 
@@ -749,9 +753,10 @@ mod tests {
             assert_eq!(encode_checkpoint(&stored).unwrap(), bytes);
         }));
         let (launch, launch_calls) = RecordingLaunch::new(false);
-        adapter(network, launch)
+        let outcome = adapter(network, launch)
             .apply(effect_context(root.path()), &desired)
             .unwrap();
+        assert_eq!(outcome, RuntimeDesiredEffectOutcome::RefreshInventory);
 
         let network_calls = network_calls.lock().unwrap();
         assert_eq!(network_calls.plans, 1);
@@ -1028,13 +1033,14 @@ mod tests {
         let (launch, launch_calls) = RecordingLaunch::new(false);
         let tap_create = Arc::new(FakeTapCreatePort::default());
         let tap_calls = Arc::clone(&tap_create.calls);
-        ProductionRuntimeDesiredEffect::with_tap_create_port(
+        let outcome = ProductionRuntimeDesiredEffect::with_tap_create_port(
             ch_config(fake_ip),
             tap_create,
             Arc::new(launch),
         )
         .apply(effect_context(root.path()), &desired)
         .unwrap();
+        assert_eq!(outcome, RuntimeDesiredEffectOutcome::RefreshInventory);
 
         let launch_calls = launch_calls.lock().unwrap();
         assert_eq!(launch_calls.len(), 1);

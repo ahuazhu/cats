@@ -63,7 +63,11 @@ pub trait RuntimeInventoryScanner:
 /// A Cloud Hypervisor network adapter must pass
 /// `&desired.runtime.network_config` unchanged to its typed network/VMM
 /// primitive; legacy NodeJob fields or Cat-ID-derived networking are not an
-/// admissible substitute.
+/// admissible substitute. An implementation may return `Applied` only when
+/// the current accepted full inventory already proves this Desired item needs
+/// no persistent or physical change. Any checkpoint write, authority
+/// mutation, process/device/network action, or postcondition confirmation
+/// returns `RefreshInventory` so a new full scan is the sole bridge onward.
 pub trait RuntimeDesiredEffect: Send + Sync + 'static {
     fn apply(
         &self,
@@ -77,6 +81,8 @@ pub trait RuntimeDesiredEffect: Send + Sync + 'static {
 /// every other non-applied decision leaves that batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeDesiredEffectOutcome {
+    /// The accepted full inventory already proved this item converged; this
+    /// invocation performed no persistent or physical change.
     Applied,
     RetryExact,
     RefreshInventory,
