@@ -7,10 +7,12 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cats_api::blockd::{BlockdControlResponse, DurabilityStatus};
 use cats_api::chunk::{CHUNKS_PER_LEAF, CHUNK_SIZE};
 use cats_api::runtime_reconciliation::{
-    decode_provision_root_image_result, encode_provision_root_image_request, AsciiText, FenceEpoch,
-    Generation, Id, ProvisionRootImageRequest, RandomId128, RemoteHead, Sha256Digest,
+    decode_provision_root_image_result, encode_provision_root_image_request, AcquireOrigin,
+    AsciiText, Epoch, FenceEpoch, Generation, Id, NormalAcquireRequest, NormalAcquireResult,
+    ProvisionRootImageRequest, RandomId128, RemoteHead, Revision, Sha256Digest,
     PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES,
 };
 use cats_blockd::format::{self, LeafRef};
@@ -18,8 +20,9 @@ use cats_control_plane::store::Store;
 use cats_metadata_store_postgres::PostgresVolumeDataAuthority;
 use cats_object_store_file::FileBlobStore;
 use cats_storage::authority::{
-    project_volume_record, LastVolumeTransition, UnixMillis, VolumeAdminState, VolumeDataAuthority,
-    VolumeDurability, VolumeOwnerBinding, VolumeRecord,
+    project_volume_record, AttachmentLineageIdentity, AuthorizedServingAttachment,
+    LastVolumeTransition, UnixMillis, VolumeAdminState, VolumeDataAuthority, VolumeDurability,
+    VolumeOwnerBinding, VolumeRecord,
 };
 use cats_storage::BlobStore;
 use postgres::{Client, NoTls};
@@ -29,6 +32,9 @@ const ATTACHMENT_ID: &str = "att_root_provision";
 const NODE_ID: &str = "node-root-provision";
 const VOLUME_SIZE: u64 = 2 * CHUNK_SIZE as u64;
 const TRANSITION: &str = "13579bdf2468ace013579bdf2468ace0";
+const ACQUIRE_TRANSITION: &str = "2468ace013579bdf2468ace013579bdf";
+const PROCESS_TOKEN: &str = "3579bdf2468ace013579bdf2468ace01";
+const SCOPE_ID: &str = "cats-root-provision.scope";
 
 struct Env {
     dir: tempfile::TempDir,
@@ -57,6 +63,19 @@ impl Env {
             .unwrap()
             .manifest;
         let request = request_from_manifest(&manifest, epoch);
+        let attachment = authorized_attachment(epoch);
+        let data_dir = dir.path().join("control-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            data_dir.join("identity.json"),
+            serde_json::to_vec(&attachment.identity).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            data_dir.join("authorized-control.json"),
+            serde_json::to_vec(&attachment).unwrap(),
+        )
+        .unwrap();
         Self {
             dir,
             postgres_url,
@@ -75,6 +94,10 @@ impl Env {
 
     fn control_socket(&self) -> PathBuf {
         self.dir.path().join("provision.sock")
+    }
+
+    fn authorized_control_spec(&self) -> PathBuf {
+        self.data_dir().join("authorized-control.json")
     }
 
     fn authority(&self) -> PostgresVolumeDataAuthority {
@@ -96,6 +119,12 @@ impl Env {
             .arg("--attachment-epoch")
             .arg(self.epoch.to_string())
             .arg("--control-only")
+            .arg("--authorized-control-spec")
+            .arg(self.authorized_control_spec())
+            .arg("--runtime-scope-id")
+            .arg(SCOPE_ID)
+            .arg("--process-identity-token")
+            .arg(PROCESS_TOKEN)
             .arg("--data-dir")
             .arg(self.data_dir())
             .arg("--metadata-store-adapter")
@@ -131,6 +160,7 @@ impl Env {
 }
 
 fn owned_volume(epoch: i64) -> VolumeRecord {
+    let (request, result) = acquire_receipt(epoch);
     VolumeRecord {
         volume_id: Id::new(VOLUME_ID).unwrap(),
         size_bytes: VOLUME_SIZE,
@@ -144,9 +174,58 @@ fn owned_volume(epoch: i64) -> VolumeRecord {
         lease_owner: Some(Id::new(ATTACHMENT_ID).unwrap()),
         lease_epoch: FenceEpoch::new(u64::try_from(epoch).unwrap()).unwrap(),
         lease_expires_at: Some(UnixMillis::new(1).unwrap()),
-        last_transition: Some(LastVolumeTransition::Takeover {
-            authorization_id: Id::new("takeover-root-provision").unwrap(),
-        }),
+        last_transition: Some(LastVolumeTransition::NormalAcquire { request, result }),
+    }
+}
+
+fn acquire_receipt(epoch: i64) -> (NormalAcquireRequest, NormalAcquireResult) {
+    let request = NormalAcquireRequest {
+        volume_id: Id::new(VOLUME_ID).unwrap(),
+        transition_id: RandomId128::new(ACQUIRE_TRANSITION).unwrap(),
+        attachment_id: Id::new(ATTACHMENT_ID).unwrap(),
+        expected_unowned_epoch: FenceEpoch::new(u64::try_from(epoch - 1).unwrap()).unwrap(),
+        desired_revision: Revision::new(5).unwrap(),
+        placement_epoch: Epoch::new(3).unwrap(),
+        lease_duration_ms: 60_000,
+    };
+    let result = NormalAcquireResult {
+        volume_id: request.volume_id.clone(),
+        transition_id: request.transition_id.clone(),
+        attachment_id: request.attachment_id.clone(),
+        resulting_epoch: FenceEpoch::new(u64::try_from(epoch).unwrap()).unwrap(),
+        resulting_head: blank_head(),
+        lease_expires_at: UnixMillis::new(1_900_000_060_000).unwrap(),
+    };
+    (request, result)
+}
+
+fn authorized_attachment(epoch: i64) -> AuthorizedServingAttachment {
+    let (acquire_request, acquire_result) = acquire_receipt(epoch);
+    AuthorizedServingAttachment {
+        identity: AttachmentLineageIdentity {
+            volume_id: acquire_request.volume_id.clone(),
+            attachment_id: acquire_request.attachment_id.clone(),
+            attachment_epoch: acquire_result.resulting_epoch,
+            acquire_origin: AcquireOrigin::Normal {
+                transition_id: acquire_request.transition_id.clone(),
+            },
+            node_id: Id::new("node_a").unwrap(),
+            placement_epoch: acquire_request.placement_epoch,
+        },
+        size_bytes: VOLUME_SIZE,
+        durability: VolumeDurability::Strict,
+        head: blank_head(),
+        lease_expires_at: acquire_result.lease_expires_at,
+        acquire_request,
+        acquire_result,
+    }
+}
+
+fn blank_head() -> RemoteHead {
+    RemoteHead {
+        generation: Generation::new(0).unwrap(),
+        root_hash: None,
+        root_object_id: None,
     }
 }
 
@@ -348,6 +427,12 @@ fn control_only_rejects_frontends_and_serves_only_the_typed_effect() {
         .arg("--control-only")
         .arg("--attachment-epoch")
         .arg(env.epoch.to_string())
+        .arg("--authorized-control-spec")
+        .arg(env.authorized_control_spec())
+        .arg("--runtime-scope-id")
+        .arg(SCOPE_ID)
+        .arg("--process-identity-token")
+        .arg(PROCESS_TOKEN)
         .arg("--listen-control")
         .arg(env.control_socket())
         .arg("--listen-unix")
@@ -365,6 +450,12 @@ fn control_only_rejects_frontends_and_serves_only_the_typed_effect() {
         .arg("--control-only")
         .arg("--attachment-epoch")
         .arg(env.epoch.to_string())
+        .arg("--authorized-control-spec")
+        .arg(env.authorized_control_spec())
+        .arg("--runtime-scope-id")
+        .arg(SCOPE_ID)
+        .arg("--process-identity-token")
+        .arg(PROCESS_TOKEN)
         .arg("--listen-control")
         .arg(env.control_socket())
         .arg("--metadata-store-adapter")
@@ -380,6 +471,29 @@ fn control_only_rejects_frontends_and_serves_only_the_typed_effect() {
     let _server = env.spawn(None);
     assert!(env.control_socket().exists());
     assert!(!env.dir.path().join("forbidden-nbd.sock").exists());
+    let status = exchange(&env.control_socket(), b"status\n");
+    let status = BlockdControlResponse::parse_wire(std::str::from_utf8(&status).unwrap()).unwrap();
+    let BlockdControlResponse::Ok(status) = status else {
+        panic!("control-only status returned an error")
+    };
+    let status: DurabilityStatus = serde_json::from_str(&status).unwrap();
+    assert_eq!(status.volume_id, VOLUME_ID);
+    assert_eq!(status.attachment_id, ATTACHMENT_ID);
+    assert_eq!(status.attachment_epoch, Some(FenceEpoch::new(7).unwrap()));
+    assert_eq!(
+        status.acquire_origin,
+        Some(AcquireOrigin::Normal {
+            transition_id: RandomId128::new(ACQUIRE_TRANSITION).unwrap()
+        })
+    );
+    assert_eq!(status.size_bytes, Some(VOLUME_SIZE));
+    assert_eq!(status.scope_id, Some(Id::new(SCOPE_ID).unwrap()));
+    assert_eq!(
+        status.process_identity_token,
+        Some(RandomId128::new(PROCESS_TOKEN).unwrap())
+    );
+    assert_eq!(status.control_only, Some(true));
+    assert_eq!(status.guest_io_enabled, Some(false));
     let response = exchange(&env.control_socket(), &wire_request(&env.request));
     assert_ok(&response, &env.request);
     let head = env
@@ -511,7 +625,7 @@ fn stalled_connection_times_out_without_starving_the_next_request() {
 }
 
 #[test]
-fn every_provision_publication_crash_window_replays_the_same_transition() {
+fn every_provision_publication_crash_window_recovers_by_authority_or_exact_replay() {
     for point in [
         "after_provision_leaf_put",
         "after_provision_root_put",
@@ -529,9 +643,23 @@ fn every_provision_publication_crash_window_replays_the_same_transition() {
             crashing.wait_exit();
         }
         env.reset_stale_socket_after_verified_exit();
-        let _restarted = env.spawn(None);
-        let response = exchange(&env.control_socket(), &wire_request(&env.request));
-        assert_ok(&response, &env.request);
+        let after_crash = env
+            .authority()
+            .load_volume(&Id::new(VOLUME_ID).unwrap())
+            .unwrap();
+        let _restarted = if after_crash.head == env.request.expected_blank_head {
+            let server = env.spawn(None);
+            let response = exchange(&env.control_socket(), &wire_request(&env.request));
+            assert_ok(&response, &env.request);
+            Some(server)
+        } else {
+            // `after_cas` lost only the response. The signed Runtime closes
+            // this ambiguity through the strict authority reread and does not
+            // need to start another control process with a stale blank-head
+            // launch grant.
+            assert_eq!(after_crash.head, env.request.expected_provisioned_head);
+            None
+        };
         let head = env
             .authority()
             .load_volume(&Id::new(VOLUME_ID).unwrap())

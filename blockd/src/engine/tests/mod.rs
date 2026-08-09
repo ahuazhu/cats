@@ -382,6 +382,36 @@ fn authorized_serving_requires_identity_before_authority_or_local_state() {
 }
 
 #[test]
+fn authorized_control_only_renews_exact_grant_and_keeps_guest_io_closed() {
+    let fixture = serving_fixture(VolumeDurability::Strict);
+    write_serving_identity(&fixture);
+    let authority: Arc<dyn VolumeDataAuthority> = fixture.authority.clone();
+    let engine = ChunkEngine::attach_authorized_control_only(
+        fixture.config.clone(),
+        fixture.attachment.clone(),
+        fixture.blob.clone(),
+        authority,
+    )
+    .unwrap();
+    assert_eq!(fixture.authority.load_calls.load(Ordering::SeqCst), 4);
+    assert_eq!(fixture.authority.renew_calls.load(Ordering::SeqCst), 1);
+    let status = engine.durability_status();
+    assert_eq!(
+        status.attachment_epoch,
+        Some(fixture.attachment.identity.attachment_epoch)
+    );
+    assert_eq!(
+        status.acquire_origin.as_ref(),
+        Some(&fixture.attachment.identity.acquire_origin)
+    );
+    assert_eq!(status.guest_io_enabled, Some(false));
+    assert!(matches!(
+        engine.write(0, b"must stay closed"),
+        Err(EngineError::GuestIoDisabled)
+    ));
+}
+
+#[test]
 fn authorized_serving_renews_before_guest_io_and_writes_target_v2_lineage() {
     let fixture = serving_fixture(VolumeDurability::Relaxed);
     write_serving_identity(&fixture);

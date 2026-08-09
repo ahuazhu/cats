@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use cats_api::blockd::{BlockdControlCommand, BlockdControlResponse};
+use cats_api::runtime_reconciliation::{Id, RandomId128};
 use cats_blockd::engine::{ChunkEngine, EngineConfig, ProvisionRootImageEffectError};
 use cats_blockd::nbd;
 use cats_metadata_store_postgres::{PostgresMetadataStoreFactory, PostgresVolumeDataAuthority};
@@ -44,6 +45,20 @@ struct Args {
     /// increments, releases, or otherwise changes attachment ownership.
     #[arg(long, value_name = "PATH")]
     authorized_serving_spec: Option<PathBuf>,
+
+    /// Complete exact grant for the signed root-provision control process.
+    /// This shares the frozen grant shape with serving but never opens a Guest
+    /// frontend.
+    #[arg(long, value_name = "PATH", requires = "control_only")]
+    authorized_control_spec: Option<PathBuf>,
+
+    /// Exact transient-unit identity already fsynced by Runtime.
+    #[arg(long, value_name = "ID")]
+    runtime_scope_id: Option<String>,
+
+    /// Fresh process-attempt token already fsynced by Runtime.
+    #[arg(long, value_name = "RANDOM_ID_128")]
+    process_identity_token: Option<String>,
 
     /// Exact grant epoch to adopt in `--control-only` mode.
     #[arg(long, requires = "control_only")]
@@ -272,6 +287,7 @@ fn main() -> Result<()> {
         .init();
     let args = Args::parse();
     validate_process_mode(&args)?;
+    let runtime_process_identity = runtime_process_identity(&args)?;
     // Copied out before the adapter option vectors are consumed below.
     let vhost_user_args = VhostUserArgs {
         socket: args.listen_vhost_user.clone(),
@@ -365,17 +381,30 @@ fn main() -> Result<()> {
         .as_deref()
         .map(read_authorized_serving_attachment)
         .transpose()?;
+    let authorized_control = args
+        .authorized_control_spec
+        .as_deref()
+        .map(read_authorized_serving_attachment)
+        .transpose()?;
     let engine = if args.control_only {
         let authority = PostgresVolumeDataAuthority::open(&metadata_config)
             .context("open target volume authority")?;
-        ChunkEngine::attach_control_only(
+        let attachment = authorized_control
+            .as_ref()
+            .context("process-mode validation requires an authorized control grant")?;
+        let presented_epoch = args
+            .attachment_epoch
+            .context("process-mode validation requires an attachment epoch")?;
+        if u64::try_from(presented_epoch).ok() != Some(attachment.identity.attachment_epoch.get()) {
+            bail!("--attachment-epoch does not match --authorized-control-spec");
+        }
+        ChunkEngine::attach_authorized_control_only(
             config,
-            args.attachment_epoch
-                .expect("process-mode validation requires an attachment epoch"),
+            attachment.clone(),
             blob.clone(),
             authority,
         )
-        .context("adopt control-only chunk engine")?
+        .context("adopt exact authorized control-only chunk engine")?
     } else if let Some(attachment) = authorized_serving.as_ref() {
         let authority = PostgresVolumeDataAuthority::open(&metadata_config)
             .context("open target volume authority")?;
@@ -437,7 +466,13 @@ fn main() -> Result<()> {
         // Deliberately no detach/release: this process adopted, rather than
         // created, the grant. The runtime owns release and the later serving
         // process must be able to restart under the same exact owner/epoch.
-        serve_root_provision_control(listener, engine);
+        serve_root_provision_control(
+            listener,
+            engine,
+            runtime_process_identity
+                .clone()
+                .context("process-mode validation requires Runtime process identity")?,
+        );
         return Ok(());
     }
 
@@ -506,7 +541,8 @@ fn main() -> Result<()> {
         let listener = UnixListener::bind(path)
             .with_context(|| format!("bind control socket {}", path.display()))?;
         let engine = engine.clone();
-        std::thread::spawn(move || serve_legacy_control(listener, engine));
+        let process_identity = runtime_process_identity.clone();
+        std::thread::spawn(move || serve_legacy_control(listener, engine, process_identity));
     }
 
     let ready = args
@@ -558,11 +594,13 @@ fn main() -> Result<()> {
 fn serve_legacy_control(
     listener: UnixListener,
     engine: std::sync::Arc<cats_blockd::engine::ChunkEngine>,
+    process_identity: Option<RuntimeProcessIdentity>,
 ) {
     use std::io::{BufRead, BufReader, Write};
     for connection in listener.incoming() {
         let Ok(connection) = connection else { return };
         let engine = engine.clone();
+        let process_identity = process_identity.clone();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(&connection);
             let mut line = String::new();
@@ -575,7 +613,7 @@ fn serve_legacy_control(
                     Err(error) => BlockdControlResponse::error(error.to_string()),
                 },
                 Ok(BlockdControlCommand::Status) => {
-                    match serde_json::to_string(&engine.durability_status()) {
+                    match runtime_status_json(&engine, process_identity.as_ref()) {
                         Ok(status) => BlockdControlResponse::ok(status),
                         Err(error) => {
                             BlockdControlResponse::error(format!("serialize status: {error}"))
@@ -594,12 +632,34 @@ fn serve_legacy_control(
 const PROVISION_COMMAND_PREFIX: &[u8] = b"provision_root_image ";
 const PROVISION_CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[derive(Debug, Clone)]
+struct RuntimeProcessIdentity {
+    scope_id: Id,
+    process_identity_token: RandomId128,
+    control_only: bool,
+}
+
+fn runtime_status_json(
+    engine: &cats_blockd::engine::ChunkEngine,
+    process_identity: Option<&RuntimeProcessIdentity>,
+) -> serde_json::Result<String> {
+    let mut status = engine.durability_status();
+    if let Some(identity) = process_identity {
+        status.size_bytes = Some(engine.size());
+        status.scope_id = Some(identity.scope_id.clone());
+        status.process_identity_token = Some(identity.process_identity_token.clone());
+        status.control_only = Some(identity.control_only);
+    }
+    serde_json::to_string(&status)
+}
+
 /// Serve only the A14 provision effect. Connections are handled serially: a
 /// single transition is the only useful work and this keeps admission memory
 /// bounded without adding a second concurrency policy to the daemon.
 fn serve_root_provision_control(
     listener: UnixListener,
     engine: std::sync::Arc<cats_blockd::engine::ChunkEngine>,
+    process_identity: RuntimeProcessIdentity,
 ) {
     for connection in listener.incoming() {
         let Ok(mut connection) = connection else {
@@ -608,16 +668,29 @@ fn serve_root_provision_control(
         if connection.set_nonblocking(true).is_err() {
             continue;
         }
-        let Some(payload) = read_first_lf_payload(
+        let Some(frame) = read_first_lf_frame(
             &mut connection,
-            PROVISION_COMMAND_PREFIX,
             cats_api::runtime_reconciliation::PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES,
             PROVISION_CONTROL_IO_TIMEOUT,
         ) else {
             continue;
         };
+        if frame == BlockdControlCommand::Status.as_wire().as_bytes() {
+            if let Ok(status) = runtime_status_json(&engine, Some(&process_identity)) {
+                let response = BlockdControlResponse::ok(status).to_wire();
+                let _ = write_all_before(
+                    &mut connection,
+                    response.as_bytes(),
+                    PROVISION_CONTROL_IO_TIMEOUT,
+                );
+            }
+            continue;
+        }
+        let Some(payload) = frame.strip_prefix(PROVISION_COMMAND_PREFIX) else {
+            continue;
+        };
         let Ok(request) =
-            cats_api::runtime_reconciliation::decode_provision_root_image_request(&payload)
+            cats_api::runtime_reconciliation::decode_provision_root_image_request(payload)
         else {
             continue;
         };
@@ -647,15 +720,14 @@ fn serve_root_provision_control(
 /// Read one first-LF frame without ever retaining byte `maximum + 1` of the
 /// JSON payload. Bytes after the first LF belong to neither this request nor a
 /// second command; the caller responds and closes the connection immediately.
-fn read_first_lf_payload(
+fn read_first_lf_frame(
     stream: &mut UnixStream,
-    prefix: &[u8],
     maximum: usize,
     timeout: Duration,
 ) -> Option<Vec<u8>> {
     let deadline = Instant::now().checked_add(timeout)?;
-    let mut matched = 0usize;
-    let mut payload = Vec::with_capacity(maximum.min(4096));
+    let maximum = maximum.checked_add(PROVISION_COMMAND_PREFIX.len())?;
+    let mut frame = Vec::with_capacity(maximum.min(4096));
     let mut buffer = [0_u8; 512];
     loop {
         ensure_before(deadline)?;
@@ -672,23 +744,16 @@ fn read_first_lf_payload(
             return None;
         }
         for &byte in &buffer[..read] {
-            if matched < prefix.len() {
-                if byte != prefix[matched] {
-                    return None;
-                }
-                matched += 1;
-                continue;
-            }
             if byte == b'\n' {
-                if payload.last() == Some(&b'\r') {
+                if frame.last() == Some(&b'\r') {
                     return None;
                 }
-                return Some(payload);
+                return Some(frame);
             }
-            if payload.len() == maximum {
+            if frame.len() == maximum {
                 return None;
             }
-            payload.push(byte);
+            frame.push(byte);
         }
     }
 }
@@ -731,6 +796,9 @@ fn validate_process_mode(args: &Args) -> Result<()> {
         if args.authorized_serving_spec.is_some() {
             bail!("--control-only conflicts with --authorized-serving-spec");
         }
+        if args.authorized_control_spec.is_none() {
+            bail!("--control-only requires --authorized-control-spec");
+        }
         if args.attachment_epoch.is_none() {
             bail!("--control-only requires --attachment-epoch");
         }
@@ -757,6 +825,9 @@ fn validate_process_mode(args: &Args) -> Result<()> {
             bail!("--control-only requires --metadata-store-adapter postgres");
         }
     } else if args.authorized_serving_spec.is_some() {
+        if args.authorized_control_spec.is_some() {
+            bail!("--authorized-serving-spec conflicts with --authorized-control-spec");
+        }
         if args.attachment_epoch.is_some() {
             bail!("--authorized-serving-spec carries its own exact attachment epoch");
         }
@@ -791,8 +862,34 @@ fn validate_process_mode(args: &Args) -> Result<()> {
         }
     } else if args.attachment_epoch.is_some() {
         bail!("--attachment-epoch is only valid with --control-only");
+    } else if args.authorized_control_spec.is_some() {
+        bail!("--authorized-control-spec is only valid with --control-only");
     }
+    let _ = runtime_process_identity(args)?;
     Ok(())
+}
+
+fn runtime_process_identity(args: &Args) -> Result<Option<RuntimeProcessIdentity>> {
+    let target_mode = args.control_only || args.authorized_serving_spec.is_some();
+    match (
+        target_mode,
+        args.runtime_scope_id.as_deref(),
+        args.process_identity_token.as_deref(),
+    ) {
+        (false, None, None) => Ok(None),
+        (false, _, _) => bail!(
+            "--runtime-scope-id and --process-identity-token are only valid for signed target modes"
+        ),
+        (true, Some(scope), Some(token)) => Ok(Some(RuntimeProcessIdentity {
+            scope_id: Id::new(scope.to_owned()).context("--runtime-scope-id is not a valid Id")?,
+            process_identity_token: RandomId128::new(token.to_owned())
+                .context("--process-identity-token is not a valid RandomId128")?,
+            control_only: args.control_only,
+        })),
+        (true, _, _) => bail!(
+            "signed target modes require --runtime-scope-id and --process-identity-token together"
+        ),
+    }
 }
 
 /// NBD-only mode: the listener threads own the work, so the process lives as
@@ -901,6 +998,10 @@ mod tests {
             "/runtime/attachment.json",
             "--listen-control",
             "/runtime/control.sock",
+            "--runtime-scope-id",
+            "cats-cat_01-root.scope",
+            "--process-identity-token",
+            "13579bdf2468ace013579bdf2468ace0",
         ];
         arguments.extend_from_slice(extra);
         Args::try_parse_from(arguments).unwrap()

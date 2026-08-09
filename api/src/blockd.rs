@@ -17,7 +17,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::runtime_reconciliation::{AcquireOrigin, Epoch, FenceEpoch, Id};
+use crate::runtime_reconciliation::{AcquireOrigin, Epoch, FenceEpoch, Id, RandomId128};
 
 /// Directory under a blockd `--data-dir` holding locally durable, remotely
 /// unpublished packs.
@@ -183,6 +183,23 @@ pub struct DurabilityStatus {
     /// therefore not proof that a frontend is either open or closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_io_enabled: Option<bool>,
+    /// Immutable physical volume size reported by the running engine. Missing
+    /// is legacy and cannot satisfy a Runtime process handshake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    /// Checkpointed transient-unit identity supplied by the signed Runtime.
+    /// The Node must also prove actual cgroup membership; this echo alone is
+    /// never systemd authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_id: Option<Id>,
+    /// Fresh process-attempt token fsynced before spawn. Missing/corrupt values
+    /// are not adoptable and must never be reconstructed from a unit name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_identity_token: Option<RandomId128>,
+    /// Exact process mode. Missing means legacy; `guest_io_enabled=false`
+    /// alone is not proof that the process exposes only Host control I/O.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_only: Option<bool>,
     pub mode: String,
     pub local_durable_generation: i64,
     pub remote_durable_generation: i64,
@@ -240,6 +257,10 @@ mod tests {
             node_id: None,
             placement_epoch: None,
             guest_io_enabled: None,
+            size_bytes: None,
+            scope_id: None,
+            process_identity_token: None,
+            control_only: None,
             mode: "relaxed".to_string(),
             local_durable_generation: 7,
             remote_durable_generation: 5,

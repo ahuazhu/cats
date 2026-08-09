@@ -17,8 +17,8 @@ use std::process::Command;
 use anyhow::{Context as _, Result};
 use cats_api::runtime_reconciliation::DesiredRuntimeSpec;
 use cats_api::runtime_reconciliation::{
-    encode_desired_runtime_spec, ContractVersion, DiskKind, Durability, RuntimeTarget,
-    VolumeAccess, VolumeAcquire, VolumeDisposition, VolumeIntent,
+    encode_desired_runtime_spec, ContractVersion, DiskKind, Durability, Id, RandomId128,
+    RuntimeTarget, VolumeAccess, VolumeAcquire, VolumeDisposition, VolumeIntent,
 };
 use cats_storage::authority::{
     validate_authorized_serving_attachment, AuthorizedServingAttachment,
@@ -222,6 +222,8 @@ pub enum AuthorizedBlockFrontend {
 pub fn authorized_blockd_command(
     config: &AuthorizedBlockdLaunchConfig,
     prepared: &PreparedAuthorizedBlockd,
+    scope_id: &Id,
+    process_identity_token: &RandomId128,
     control_socket: &Path,
     frontend: &AuthorizedBlockFrontend,
 ) -> Result<Command> {
@@ -274,6 +276,10 @@ pub fn authorized_blockd_command(
         .arg(attachment.identity.attachment_id.as_str())
         .arg("--authorized-serving-spec")
         .arg(prepared.authorized_serving_path())
+        .arg("--runtime-scope-id")
+        .arg(scope_id.as_str())
+        .arg("--process-identity-token")
+        .arg(process_identity_token.as_str())
         .arg("--metadata-store-adapter")
         .arg(&config.metadata_store.name)
         .arg("--object-store-adapter")
@@ -996,6 +1002,8 @@ mod tests {
         let command = authorized_blockd_command(
             &launch_config(),
             &prepared,
+            &id("cats-cat-1-root.scope"),
+            &random(2),
             &control,
             &AuthorizedBlockFrontend::VhostUser {
                 socket: frontend.clone(),
@@ -1011,6 +1019,10 @@ mod tests {
             prepared.authorized_serving_path().as_os_str().to_owned(),
             OsString::from("--listen-control"),
             control.into_os_string(),
+            OsString::from("--runtime-scope-id"),
+            OsString::from("cats-cat-1-root.scope"),
+            OsString::from("--process-identity-token"),
+            OsString::from("00000000000000000000000000000002"),
             OsString::from("--listen-vhost-user"),
             frontend.into_os_string(),
             OsString::from("--lease-ttl-ms"),
@@ -1159,6 +1171,8 @@ mod tests {
         let result = authorized_blockd_command(
             &launch_config(),
             &prepared,
+            &id("cats-cat-1-root.scope"),
+            &random(2),
             Path::new("/tmp/not-state-derived-control.sock"),
             &AuthorizedBlockFrontend::NbdUnix {
                 socket: temp.path().join("frontends/root.sock"),

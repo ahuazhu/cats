@@ -53,6 +53,13 @@ impl ChunkEngine {
             node_id: lineage.map(|identity| identity.node_id.clone()),
             placement_epoch: lineage.map(|identity| identity.placement_epoch),
             guest_io_enabled: lineage.map(|_| self.guest_io_enabled),
+            // Process-attempt identity belongs to the composition root, not
+            // the storage engine. The target control server fills these only
+            // when exact signed CLI inputs are present.
+            size_bytes: None,
+            scope_id: None,
+            process_identity_token: None,
+            control_only: None,
             mode: match self.cfg.durability {
                 DurabilityMode::Strict => "strict",
                 DurabilityMode::Relaxed { .. } => "relaxed",

@@ -291,6 +291,7 @@ pub struct ChunkEngine {
 enum AttachmentMode {
     Acquire,
     AdoptControlOnly { expected_epoch: i64 },
+    AdoptAuthorizedControlOnly { expected_epoch: i64 },
     AdoptAuthorizedServing { expected_epoch: i64 },
 }
 
@@ -747,6 +748,32 @@ impl ChunkEngine {
         )
     }
 
+    /// Adopt the complete Node-authorized grant for the root-provision effect.
+    ///
+    /// This is the signed Runtime form of [`Self::attach_control_only`]. It
+    /// performs the same strict read/renew/reread grant proof as authorized
+    /// serving, retains the complete lineage for status handshakes, and still
+    /// exposes no Guest data frontend or publisher.
+    pub fn attach_authorized_control_only(
+        cfg: EngineConfig,
+        attachment: AuthorizedServingAttachment,
+        blob: Arc<dyn BlobStore>,
+        authority: Arc<dyn VolumeDataAuthority>,
+    ) -> Result<Arc<Self>> {
+        validate_authorized_serving_config(&cfg, &attachment)?;
+        let expected_epoch =
+            i64::try_from(attachment.identity.attachment_epoch.get()).map_err(|_| {
+                EngineError::InvalidConfig("attachment epoch exceeds the engine range".into())
+            })?;
+        Self::open(
+            cfg,
+            blob,
+            AuthorityBackend::Target(authority),
+            AttachmentMode::AdoptAuthorizedControlOnly { expected_epoch },
+            Some(attachment),
+        )
+    }
+
     /// Adopt an exact target-authority grant as a serving block data plane.
     ///
     /// This path has no acquire capability and never increments an epoch. It
@@ -803,18 +830,24 @@ impl ChunkEngine {
         }
         match (&mode, &authority, &authorized_attachment) {
             (
-                AttachmentMode::AdoptAuthorizedServing { .. },
+                AttachmentMode::AdoptAuthorizedServing { .. }
+                | AttachmentMode::AdoptAuthorizedControlOnly { .. },
                 AuthorityBackend::Target(target),
                 Some(attachment),
             ) => preflight_authorized_serving(&cfg, attachment, target.as_ref())?,
-            (AttachmentMode::AdoptAuthorizedServing { .. }, _, _) => {
+            (
+                AttachmentMode::AdoptAuthorizedServing { .. }
+                | AttachmentMode::AdoptAuthorizedControlOnly { .. },
+                _,
+                _,
+            ) => {
                 return Err(EngineError::InvalidConfig(
-                    "authorized serving requires one target-authority attachment".into(),
+                    "authorized target attach requires one complete authority grant".into(),
                 ));
             }
             (_, _, Some(_)) => {
                 return Err(EngineError::InvalidConfig(
-                    "an authorized serving attachment was supplied to another mode".into(),
+                    "an authorized attachment was supplied to another mode".into(),
                 ));
             }
             _ => {}
@@ -851,7 +884,8 @@ impl ChunkEngine {
                 expected_epoch
             }
             (
-                AttachmentMode::AdoptAuthorizedServing { expected_epoch },
+                AttachmentMode::AdoptAuthorizedServing { expected_epoch }
+                | AttachmentMode::AdoptAuthorizedControlOnly { expected_epoch },
                 AuthorityBackend::Target(_),
             ) => {
                 let attachment = authorized_attachment.as_ref().ok_or_else(|| {
@@ -870,13 +904,18 @@ impl ChunkEngine {
             }
             (AttachmentMode::Acquire, AuthorityBackend::Target(_))
             | (AttachmentMode::AdoptControlOnly { .. }, AuthorityBackend::Legacy(_))
+            | (AttachmentMode::AdoptAuthorizedControlOnly { .. }, AuthorityBackend::Legacy(_))
             | (AttachmentMode::AdoptAuthorizedServing { .. }, AuthorityBackend::Legacy(_)) => {
                 return Err(EngineError::InvalidConfig(
                     "attachment mode and authority backend do not match".into(),
                 ));
             }
         };
-        let control_only = matches!(mode, AttachmentMode::AdoptControlOnly { .. });
+        let control_only = matches!(
+            mode,
+            AttachmentMode::AdoptControlOnly { .. }
+                | AttachmentMode::AdoptAuthorizedControlOnly { .. }
+        );
 
         fs::create_dir_all(cfg.data_dir.join(PENDING_PACK_DIR))?;
         let cache_path = cfg.data_dir.join("cache.data");
