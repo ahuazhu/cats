@@ -1,4 +1,6 @@
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use cats_api::agent_registration::{
     Ed25519RequestSigner, JSON_CONTENT_TYPE, NODE_CREDENTIAL_ID_HEADER,
@@ -303,4 +305,81 @@ async fn admission_order_and_signature_path_binding_fail_closed() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn observation_renews_while_the_ordinary_store_connection_is_saturated() {
+    let context = Context::new().await;
+    let desired = DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: context.binding(),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let desired_body = encode_desired_read_request(&desired).unwrap();
+    let desired_response = context
+        .signed(DESIRED_PATH, desired_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(desired_response.status(), StatusCode::OK);
+    let snapshot = decode_desired_read_snapshot(&desired_response.bytes().await.unwrap()).unwrap();
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let ordinary_store = Arc::clone(&context.server.state.store);
+    let ordinary = tokio::spawn(async move {
+        ordinary_store
+            .execute(move |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+    });
+    tokio::task::spawn_blocking(move || {
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ordinary Store closure must own its connection lane")
+    })
+    .await
+    .unwrap();
+
+    let mut observation = NodeObservation {
+        version: ContractVersion::V1,
+        observation_id: RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+        node_id: context.session.node_id.clone(),
+        node_boot_id: context.session.node_boot_id.clone(),
+        agent_instance_id: context.session.agent_instance_id.clone(),
+        agent_session_epoch: context.session.agent_session_epoch,
+        heartbeat_sequence: Sequence::new(1).unwrap(),
+        observed_at_unix_ms: UnixMillis::new(1).unwrap(),
+        complete_inventory: true,
+        inventory_epoch: Epoch::new(1).unwrap(),
+        inventory_digest: None,
+        inventory_read_position: Some(snapshot.read_position),
+        key_ring_version: None,
+        key_ring_digest: None,
+        loaded_kids: Vec::new(),
+        runtimes: Vec::new(),
+        residue: Vec::new(),
+    };
+    observation.inventory_digest = Some(inventory_digest(&observation).unwrap());
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        context
+            .signed(
+                OBSERVATION_PATH,
+                encode_node_observation(&observation).unwrap(),
+            )
+            .send(),
+    )
+    .await
+    .expect("the reserved observation lane must not wait for ordinary Store work")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted = decode_observation_acceptance(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(accepted.observation_id, observation.observation_id);
+
+    release_tx.send(()).unwrap();
+    ordinary.await.unwrap().unwrap();
 }

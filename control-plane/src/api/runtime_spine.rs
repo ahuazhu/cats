@@ -219,17 +219,31 @@ async fn handle(state: AppState, request: Request<Body>, route: Route) -> Respon
     };
 
     let lookup_credential = authenticated.clone();
-    let lookup = state
-        .store
-        .execute(move |store| store.resolve_runtime_node(&lookup_credential));
-    let node_id =
-        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), lookup).await {
-            Ok(Ok(Some(node_id))) => node_id,
-            Ok(Ok(None)) => return identity_not_eligible(),
-            Ok(Err(error)) if transient(&error) => return temporarily_unavailable(),
-            Ok(Err(_)) => return internal_response(),
-            Err(_) => return temporarily_unavailable(),
-        };
+    let lookup = match route {
+        Route::DesiredRead => {
+            let store = state.store.clone();
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                store.execute(move |store| store.resolve_runtime_node(&lookup_credential)),
+            )
+            .await
+        }
+        Route::Observation => {
+            let store = state.observation_store.clone();
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                store.execute(move |store| store.resolve_runtime_node(&lookup_credential)),
+            )
+            .await
+        }
+    };
+    let node_id = match lookup {
+        Ok(Ok(Some(node_id))) => node_id,
+        Ok(Ok(None)) => return identity_not_eligible(),
+        Ok(Err(error)) if transient(&error) => return temporarily_unavailable(),
+        Ok(Err(_)) => return internal_response(),
+        Err(_) => return temporarily_unavailable(),
+    };
 
     let _node_permit = match state.runtime_spine_admission.try_node(&node_id) {
         Ok(permit) => permit,
@@ -259,7 +273,8 @@ async fn handle(state: AppState, request: Request<Body>, route: Route) -> Respon
                         Ok(EncodedOutcome::Rejected(rejection))
                     }
                 }),
-            DecodedRequest::Observation(observation) => store
+            DecodedRequest::Observation(observation) => state
+                .observation_store
                 .execute(move |store| {
                     store.runtime_accept_observation_for_request(
                         &authenticated,

@@ -475,6 +475,10 @@ pub(super) async fn prometheus_metrics(
     let store_metrics = crate::store::metrics_snapshot(&state.store);
     let mut body = String::new();
     store_metrics.append_prometheus(&mut body);
+    state
+        .observation_store
+        .snapshot()
+        .append_prometheus(&mut body);
     macro_rules! metric {
         ($name:expr, $value:expr) => {
             body.push_str(&format!("{} {}\n", $name, $value));

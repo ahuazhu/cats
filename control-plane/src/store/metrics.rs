@@ -25,6 +25,8 @@ pub(super) enum RejectionKind {
     LeadershipCleanup,
     SingletonConnection,
     OciConnection,
+    ObservationAdmission,
+    ObservationQueue,
 }
 
 static ADMISSION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
@@ -34,6 +36,8 @@ static NORMAL_CLEANUP_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 static LEADERSHIP_CLEANUP_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 static SINGLETON_CONNECTION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 static OCI_CONNECTION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+static OBSERVATION_ADMISSION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+static OBSERVATION_QUEUE_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 static LANE_ACQUIRE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static POSTGRES_STATEMENT_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static POSTGRES_IO_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
@@ -83,6 +87,8 @@ pub(super) fn record_rejection(kind: RejectionKind) {
         RejectionKind::LeadershipCleanup => &LEADERSHIP_CLEANUP_REJECTIONS,
         RejectionKind::SingletonConnection => &SINGLETON_CONNECTION_REJECTIONS,
         RejectionKind::OciConnection => &OCI_CONNECTION_REJECTIONS,
+        RejectionKind::ObservationAdmission => &OBSERVATION_ADMISSION_REJECTIONS,
+        RejectionKind::ObservationQueue => &OBSERVATION_QUEUE_REJECTIONS,
     };
     counter.fetch_add(1, Ordering::Relaxed);
 }
@@ -97,6 +103,8 @@ pub(super) fn rejection_count(kind: RejectionKind) -> u64 {
         RejectionKind::LeadershipCleanup => &LEADERSHIP_CLEANUP_REJECTIONS,
         RejectionKind::SingletonConnection => &SINGLETON_CONNECTION_REJECTIONS,
         RejectionKind::OciConnection => &OCI_CONNECTION_REJECTIONS,
+        RejectionKind::ObservationAdmission => &OBSERVATION_ADMISSION_REJECTIONS,
+        RejectionKind::ObservationQueue => &OBSERVATION_QUEUE_REJECTIONS,
     };
     counter.load(Ordering::Relaxed)
 }
@@ -184,6 +192,8 @@ pub(crate) struct StoreMetricsSnapshot {
     pub leadership_cleanup_rejections: u64,
     pub singleton_connection_rejections: u64,
     pub oci_connection_rejections: u64,
+    pub observation_admission_rejections: u64,
+    pub observation_queue_rejections: u64,
     pub lane_acquire_timeouts: u64,
     pub postgres_statement_timeouts: u64,
     pub postgres_io_timeouts: u64,
@@ -240,6 +250,8 @@ pub(crate) fn snapshot(store: &Store) -> StoreMetricsSnapshot {
         leadership_cleanup_rejections: LEADERSHIP_CLEANUP_REJECTIONS.load(Ordering::Relaxed),
         singleton_connection_rejections: SINGLETON_CONNECTION_REJECTIONS.load(Ordering::Relaxed),
         oci_connection_rejections: OCI_CONNECTION_REJECTIONS.load(Ordering::Relaxed),
+        observation_admission_rejections: OBSERVATION_ADMISSION_REJECTIONS.load(Ordering::Relaxed),
+        observation_queue_rejections: OBSERVATION_QUEUE_REJECTIONS.load(Ordering::Relaxed),
         lane_acquire_timeouts: LANE_ACQUIRE_TIMEOUTS.load(Ordering::Relaxed),
         postgres_statement_timeouts: POSTGRES_STATEMENT_TIMEOUTS.load(Ordering::Relaxed),
         postgres_io_timeouts: POSTGRES_IO_TIMEOUTS.load(Ordering::Relaxed),
@@ -319,6 +331,11 @@ impl StoreMetricsSnapshot {
             ("leadership_cleanup", self.leadership_cleanup_rejections),
             ("singleton_connection", self.singleton_connection_rejections),
             ("oci_connection", self.oci_connection_rejections),
+            (
+                "observation_admission",
+                self.observation_admission_rejections,
+            ),
+            ("observation_queue", self.observation_queue_rejections),
         ] {
             let _ = writeln!(
                 body,

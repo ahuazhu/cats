@@ -13,7 +13,7 @@ use cats_metering::{CreditStore, UsageStore};
 use cats_storage::{BlobStore, MetadataStore};
 
 use crate::controller::{AutoTierPolicy, Controller};
-use crate::store::{DsnSource, SingletonRole, Store};
+use crate::store::{DsnSource, ObservationStoreLane, SingletonRole, Store};
 
 const SINGLETON_ELECTION_RETRY: Duration = Duration::from_millis(500);
 const SINGLETON_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
@@ -144,6 +144,7 @@ pub const DEFAULT_OCI_DEPLOY_SYNC_WAIT_MS: u64 = 240_000;
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
+    pub(crate) observation_store: Arc<ObservationStoreLane>,
     pub usage: Arc<dyn UsageStore>,
     pub credits: Arc<dyn CreditStore>,
     pub storage_meta: Arc<dyn MetadataStore>,
@@ -178,6 +179,7 @@ impl Handle {
     }
     fn begin_shutdown(&self) {
         self.server_task.abort();
+        self.state.observation_store.begin_shutdown();
         self.reconciler_task.abort();
         if let Some(task) = &self.billing_enforcer_task {
             task.abort();
@@ -189,6 +191,7 @@ impl Handle {
         // blocking manifest lane. The resolver itself closes its queue and
         // bounds this wait by the provider transport deadline.
         self.begin_shutdown();
+        self.state.observation_store.shutdown().await;
         if !self.image_manifest_resolver.shutdown().await {
             tracing::warn!("image manifest reads exceeded the shutdown deadline");
         }
@@ -420,6 +423,14 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         .and_then(|path| path.to_str())
         .map(str::to_string);
     let store = Arc::new(Store::connect_from_async(cfg.control_store_dsn.clone(), ca_file).await?);
+    let observation_store = ObservationStoreLane::connect_from_async(
+        cfg.control_store_dsn.clone(),
+        cfg.control_store_ca_file
+            .as_deref()
+            .and_then(|path| path.to_str())
+            .map(str::to_string),
+    )
+    .await?;
     if let Some(workos) = &cfg.workos {
         let organizations = workos.account_organizations().clone();
         store
@@ -474,6 +485,7 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
     );
     let state = AppState {
         store,
+        observation_store,
         usage,
         credits,
         storage_meta,

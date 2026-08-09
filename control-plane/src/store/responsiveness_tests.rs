@@ -347,6 +347,121 @@ async fn full_queue_backpressures_and_cancelled_mutation_never_runs() {
     assert_eq!(mutations.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observation_lane_has_one_worker_one_waiter_and_queued_cancel_is_removable() {
+    let lane = ObservationStoreLane::connect_from_async(
+        DsnSource::Literal(crate::testsupport::isolated_control_store_url()),
+        None,
+    )
+    .await
+    .unwrap();
+    let (release_active, wait_for_release) = mpsc::channel();
+    let active_lane = Arc::clone(&lane);
+    let active = tokio::spawn(async move {
+        active_lane
+            .execute(move |_| {
+                wait_for_release.recv().unwrap();
+                Ok(())
+            })
+            .await
+    });
+    while lane.snapshot().active != 1 {
+        tokio::task::yield_now().await;
+    }
+
+    let mutations = Arc::new(AtomicUsize::new(0));
+    let queued_mutations = Arc::clone(&mutations);
+    let queued_lane = Arc::clone(&lane);
+    let queued = tokio::spawn(async move {
+        queued_lane
+            .execute(move |_| {
+                queued_mutations.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+    });
+    while lane.snapshot().queued != 1 {
+        tokio::task::yield_now().await;
+    }
+    let rejection = lane
+        .execute(|_| Ok(()))
+        .await
+        .expect_err("active + one waiter is the exact lane capacity");
+    assert_eq!(rejection.code, cats_api::error::ErrorCode::Unavailable);
+
+    queued.abort();
+    assert!(queued.await.unwrap_err().is_cancelled());
+    while lane.snapshot().queued != 0 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(mutations.load(Ordering::SeqCst), 0);
+
+    release_active.send(()).unwrap();
+    active.await.unwrap().unwrap();
+    lane.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observation_lane_shutdown_discards_waiter_and_joins_active_work() {
+    let lane = ObservationStoreLane::connect_from_async(
+        DsnSource::Literal(crate::testsupport::isolated_control_store_url()),
+        None,
+    )
+    .await
+    .unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let active_lane = Arc::clone(&lane);
+    let active = tokio::spawn(async move {
+        active_lane
+            .execute(move |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+    });
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(2)).unwrap())
+        .await
+        .unwrap();
+
+    let mutations = Arc::new(AtomicUsize::new(0));
+    let queued_mutations = Arc::clone(&mutations);
+    let queued_lane = Arc::clone(&lane);
+    let queued = tokio::spawn(async move {
+        queued_lane
+            .execute(move |_| {
+                queued_mutations.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+    });
+    while lane.snapshot().queued != 1 {
+        tokio::task::yield_now().await;
+    }
+
+    let shutdown_lane = Arc::clone(&lane);
+    let mut shutdown = tokio::spawn(async move { shutdown_lane.shutdown().await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
+            .await
+            .is_err(),
+        "shutdown must join a claimed operation instead of detaching it"
+    );
+    assert_eq!(mutations.load(Ordering::SeqCst), 0);
+
+    release_tx.send(()).unwrap();
+    shutdown.await.unwrap();
+    active.await.unwrap().unwrap();
+    let queued_error = queued
+        .await
+        .unwrap()
+        .expect_err("shutdown must discard the queued waiter");
+    assert_eq!(queued_error.code, cats_api::error::ErrorCode::Unavailable);
+    assert_eq!(mutations.load(Ordering::SeqCst), 0);
+    assert_eq!(lane.snapshot().connected, 0);
+}
+
 struct BlockingDrop {
     entered: Option<mpsc::Sender<()>>,
     release: mpsc::Receiver<()>,
