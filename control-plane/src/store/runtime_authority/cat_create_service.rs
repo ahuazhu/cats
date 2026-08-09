@@ -402,6 +402,8 @@ pub(crate) struct CatCreateService {
     guest_config_digest: Sha256Digest,
     commit_resolutions: Arc<CommitResolutionRegistry>,
     admission: tokio::sync::watch::Sender<bool>,
+    #[cfg(test)]
+    planner_calls: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Default)]
@@ -458,6 +460,8 @@ impl CatCreateService {
             guest_config_digest,
             commit_resolutions: Arc::new(CommitResolutionRegistry::default()),
             admission,
+            #[cfg(test)]
+            planner_calls: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -527,6 +531,9 @@ impl CatCreateService {
             guest_config_digest: self.guest_config_digest.clone(),
             network_id: network_id.clone(),
         };
+        #[cfg(test)]
+        self.planner_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let plan = match await_cat_create_before_deadline(
             absolute_deadline,
             self.planner.plan(&plan_request, absolute_deadline),
@@ -677,6 +684,11 @@ impl CatCreateService {
         self.commit_resolutions
             .active
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn planner_calls_for_test(&self) -> usize {
+        self.planner_calls.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     #[cfg(test)]

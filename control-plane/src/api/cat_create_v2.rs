@@ -1,6 +1,5 @@
 //! Strict public Cat-create HTTP adapter.
 
-use std::future::Future;
 use std::time::Instant;
 
 use axum::body::{to_bytes, Body, Bytes};
@@ -42,11 +41,21 @@ async fn create_cat_v2_from_headers_at(
     headers_received_at: Instant,
 ) -> ApiResult<Response> {
     let absolute_deadline = cat_create_absolute_deadline(headers_received_at)?;
-    let ingress = await_ingress_before_deadline(
-        absolute_deadline,
+    let ingress = match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(absolute_deadline),
         authorized_cat_create_ingress(&state, &workspace, headers_received_at, request),
     )
-    .await?;
+    .await
+    {
+        Ok(ingress) => ingress?,
+        Err(_) => {
+            return Ok(closed_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                TEMPORARILY_UNAVAILABLE_BODY,
+                true,
+            ));
+        }
+    };
     // CatCreateService owns the same absolute deadline. Do not wrap this call
     // in a handler timeout: before COMMIT_SENT it cancels safely, while after
     // COMMIT_SENT its registered non-cancellable owner must resolve the exact
@@ -74,15 +83,6 @@ async fn create_cat_v2_from_headers_at(
             ))
         }
     }
-}
-
-async fn await_ingress_before_deadline<T>(
-    absolute_deadline: Instant,
-    operation: impl Future<Output = ApiResult<T>>,
-) -> ApiResult<T> {
-    tokio::time::timeout_at(tokio::time::Instant::from_std(absolute_deadline), operation)
-        .await
-        .map_err(|_| Failure(ApiError::unavailable("Cat create deadline elapsed")))?
 }
 
 /// Authenticate and fund the public request before parsing any byte of its
@@ -447,21 +447,26 @@ mod tests {
             headers_received_at,
         )
         .await
-        .unwrap_err();
-        assert_eq!(timeout.0.code, ErrorCode::Unavailable);
-        assert_eq!(timeout.0.message, "Cat create deadline elapsed");
+        .unwrap();
         assert!(started.elapsed() < Duration::from_secs(4));
+        assert_eq!(timeout.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(timeout.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(timeout.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(timeout.headers()[header::RETRY_AFTER], "1");
+        assert_eq!(
+            to_bytes(timeout.into_body(), 4096).await.unwrap().as_ref(),
+            TEMPORARILY_UNAVAILABLE_BODY
+        );
         assert_eq!(body_reads.load(Ordering::SeqCst), 1);
-        // The immutable manifest read necessarily precedes the planner, so no
-        // manifest read plus no durable rows proves the stalled body reached
-        // neither planner nor Store create/result ownership.
         assert_eq!(image_blob.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(handle.state.cat_create.planner_calls_for_test(), 0);
         assert_eq!(handle.state.cat_create.active_commit_resolutions(), 0);
-        let timeout_rows = tokio::task::block_in_place(|| {
+        let (store_rows, result_rows) = tokio::task::block_in_place(|| {
             handle.state.cat_create.durable_create_row_counts_for_test()
         })
         .unwrap();
-        assert_eq!(timeout_rows, (0, 0));
+        assert_eq!(store_rows, 0, "trickled ingress reached the Cat Store");
+        assert_eq!(result_rows, 0, "trickled ingress stored an API result");
 
         let unavailable = send().await.unwrap();
         assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
