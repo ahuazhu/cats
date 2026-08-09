@@ -368,27 +368,13 @@ that contract can change. A controlled release must first reach
 ### When the drain cannot converge
 
 An orphan whose Cold stop is refused by storage fencing
-(`root CAS conflict: expected generation N`) can never stop cleanly: its root
-was superseded elsewhere, its local journal is stale and must not be
-published. The drain deliberately does not escalate — whether to discard a
-journal is an operator decision, not the control plane's. After confirming
-the refusal is a CAS conflict (not a transient metadata-store error) in the
-controller logs, discard that Cat explicitly through the node agent's job
-API, which kills its processes and deletes its runtime directory **without
-publishing**:
-
-```sh
-# CATS_AUTH_TOKEN as installed in the worker's runtime secret (worker.env).
-curl -sS -X POST "http://<node-agent>/v1/jobs" \
-  -H "Authorization: Bearer $CATS_AUTH_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"job_id":"manual-cleanup-<cat-id>","cat_generation":<reported-generation>,
-       "action":"cleanup_cat","cat_id":"<cat-id>"}'
-```
-
-Use this only for Cats whose stop was refused by fencing. For any other
-failure (usage spool, transient storage errors) let the drain retry: those
-stops publish once the dependency recovers.
+(`root CAS conflict: expected generation N`) cannot be discarded through a
+Node HTTP fallback. Signed workers receive no `CATS_AUTH_TOKEN`, production
+does not expose `/v1/jobs`, and the deployment must remain fail closed with the
+Host untouched. Escalate the Host for the typed fenced-cleanup workflow once
+that authority is composed; do not recreate the retired shared-bearer request
+by hand. For transient metadata-store or usage-spool failures, leave the Host
+drained and let the durable transition retry after the dependency recovers.
 
 ## PostgreSQL split runbook
 

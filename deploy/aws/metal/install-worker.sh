@@ -219,7 +219,16 @@ cats_worker_deployment_crash_probe after-daemon-reload
 # leaves the mid-run rotation window unbounded until the next boot fires
 # OnBootSec. It can only start once worker.env exists, since the unit reads it.
 if [[ -f /etc/cats/worker.env ]]; then
-  chmod 0600 /etc/cats/worker.env
+  # Signed Agent registration replaced the Host-wide shared Control bearer.
+  # Remove a value retained by an older install before the candidate can run.
+  worker_env_temp=$(mktemp /etc/cats/.worker.env.XXXXXX)
+  awk -F= '$1 != "CATS_AUTH_TOKEN"' /etc/cats/worker.env > "$worker_env_temp"
+  chown root:root "$worker_env_temp"
+  chmod 0600 "$worker_env_temp"
+  mv -f -- "$worker_env_temp" /etc/cats/worker.env
+  sync -f /etc/cats/worker.env
+  sync -f /etc/cats
+  cats_worker_deployment_crash_probe after-remove-worker-shared-bearer
   systemctl enable --now cats-postgres-url.timer
   cats_worker_deployment_crash_probe after-enable-postgres-timer
   cats_begin_candidate_lifetime cats-worker "$release_installer"

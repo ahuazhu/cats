@@ -132,7 +132,7 @@ variable "worker_managed_environment" {
 }
 
 variable "worker_runtime_secret_data" {
-  description = "Worker CATS_AUTH_TOKEN delivered through Secrets Manager. A legacy CATS_POSTGRES_URL is still accepted but no longer read."
+  description = "Optional legacy CATS_POSTGRES_URL compatibility map. Signed workers must not receive CATS_AUTH_TOKEN."
   type        = map(string)
   sensitive   = true
   default     = {}

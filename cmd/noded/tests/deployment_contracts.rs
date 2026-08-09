@@ -185,6 +185,10 @@ fn manual_worker_bootstrap_refuses_the_example_identity() {
         !example.contains("CATS_NODE_ID=") && !example.contains("CATS_NODE_ADVERTISE_URL="),
         "the worker environment must not be a second Node identity authority"
     );
+    assert!(
+        !example.contains("CATS_AUTH_TOKEN="),
+        "signed workers must not receive the retired shared Control bearer"
+    );
 
     let installer = read_workspace_file("deploy/aws/metal/install-worker.sh");
     assert!(installer.contains("validate-node-identity-installation.sh"));
@@ -207,6 +211,28 @@ fn manual_worker_bootstrap_refuses_the_example_identity() {
             < installer.find("apt-get update -q"),
         "identity presence validation must happen before the expensive bootstrap starts"
     );
+}
+
+#[test]
+fn production_worker_release_rejects_and_removes_the_shared_control_bearer() {
+    let variables =
+        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/variables.tf");
+    assert!(!variables.contains("var.worker_runtime_secret_data[\"CATS_AUTH_TOKEN\"]"));
+    assert!(variables.contains("signed workers must not receive CATS_AUTH_TOKEN"));
+
+    let deployment =
+        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
+    assert!(deployment.contains("if (keys - [\"CATS_POSTGRES_URL\"]) != []"));
+    assert!(deployment.contains("[to_entries[] | \"\\(.key)=\\(.value)\"] | join(\"\\n\")"));
+    assert!(deployment.contains("if (key == \"CATS_AUTH_TOKEN\")"));
+
+    let installer = read_workspace_file("deploy/aws/metal/install-worker.sh");
+    assert!(installer.contains("$1 != \"CATS_AUTH_TOKEN\""));
+    assert!(installer.contains("after-remove-worker-shared-bearer"));
+
+    let stack =
+        read_workspace_file("deploy/aws/terraform/stacks/production-infrastructure/main.tf");
+    assert!(!stack.contains("length(var.worker_runtime_secret_data) > 0"));
 }
 
 #[test]

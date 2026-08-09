@@ -247,12 +247,10 @@ locals {
     # A host still carrying the old key in worker.env is harmless once
     # cats-worker passes url-file.
     jq -er '
-      if (keys - ["CATS_AUTH_TOKEN", "CATS_POSTGRES_URL"]) != [] then
+      if (keys - ["CATS_POSTGRES_URL"]) != [] then
         error("unexpected worker runtime secret keys")
-      elif (has("CATS_AUTH_TOKEN") | not) then
-        error("worker runtime secret is missing CATS_AUTH_TOKEN")
       else
-        to_entries[] | "\(.key)=\(.value)"
+        [to_entries[] | "\(.key)=\(.value)"] | join("\n")
       end
     ' "$runtime_secret" > "$runtime_overlay"
 
@@ -293,7 +291,11 @@ CATS_BASE_ENVIRONMENT
       {
         key = $0
         sub(/=.*/, "", key)
-        if (key == "CATS_METERING_CGROUP_ROOT") {
+        if (key == "CATS_AUTH_TOKEN") {
+          # Signed Agent registration is the only production Node credential.
+          # A rolling cutover must remove a bearer left by an older release.
+          next
+        } else if (key == "CATS_METERING_CGROUP_ROOT") {
           print "CATS_METERING_CGROUP_ROOT=" metering_root
           metering_found = 1
         } else if (key in replacement) {
@@ -454,7 +456,7 @@ resource "aws_s3_object" "worker_bundle" {
 
 resource "aws_secretsmanager_secret" "worker_runtime" {
   name                    = "${local.resource_name}-runtime"
-  description             = "Root-only runtime credentials fetched by the Cats metal worker during Terraform-managed deployment."
+  description             = "Root-only transitional worker compatibility values; signed workers receive no shared Control bearer."
   recovery_window_in_days = 30
 
   tags = local.tags
