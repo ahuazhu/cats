@@ -2158,6 +2158,77 @@ fn a22_root_release_fails_closed_on_nested_current_authorization_corruption() {
 }
 
 #[test]
+fn a22_root_release_fails_closed_when_current_authorization_projection_drifts() {
+    #[derive(Clone, Copy, Debug)]
+    enum ProjectionDrift {
+        DesiredRevision,
+        PlacementEpoch,
+        VolumeId,
+    }
+
+    for drift in [
+        ProjectionDrift::DesiredRevision,
+        ProjectionDrift::PlacementEpoch,
+        ProjectionDrift::VolumeId,
+    ] {
+        let store =
+            Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+        let owned = acquire_owned_volume(&store);
+        let (node, _desired, _admission, request) =
+            prepare_root_delete_release_fixture(&store, &owned);
+        let authorization = disposable_authorization(&owned);
+        store
+            .authority_transaction(|transaction| insert_authorization(transaction, &authorization))
+            .unwrap();
+        store
+            .authority_transaction(|transaction| {
+                let changed = match drift {
+                    ProjectionDrift::DesiredRevision => transaction.execute(
+                        "UPDATE volume_authorizations
+                            SET desired_revision=11
+                          WHERE authorization_id=$1",
+                        &[&"delete-auth-1"],
+                    )?,
+                    ProjectionDrift::PlacementEpoch => transaction.execute(
+                        "UPDATE volume_authorizations
+                            SET placement_epoch=3
+                          WHERE authorization_id=$1",
+                        &[&"delete-auth-1"],
+                    )?,
+                    ProjectionDrift::VolumeId => transaction.execute(
+                        "UPDATE volume_authorizations
+                            SET volume_id='projection-drift-volume'
+                          WHERE authorization_id=$1",
+                        &[&"delete-auth-1"],
+                    )?,
+                };
+                assert_eq!(changed, 1, "failed to install {drift:?}");
+                Ok(())
+            })
+            .unwrap();
+        let before_volume = stored_volume_row(&store, &owned.volume_id);
+        let before_authorization = stored_authorization_row(&store, &id("delete-auth-1"));
+
+        let error = execute_transition(&store, &node, &request).unwrap_err();
+        assert_eq!(
+            error.code,
+            ErrorCode::Internal,
+            "wrong result for {drift:?}"
+        );
+        assert_eq!(
+            stored_volume_row(&store, &owned.volume_id),
+            before_volume,
+            "Volume changed for {drift:?}"
+        );
+        assert_eq!(
+            stored_authorization_row(&store, &id("delete-auth-1")),
+            before_authorization,
+            "authorization changed for {drift:?}"
+        );
+    }
+}
+
+#[test]
 fn a22_release_accepts_a_persisted_cleanup_cursor_behind_the_latest_desired_read() {
     let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
     let owned = acquire_owned_volume(&store);

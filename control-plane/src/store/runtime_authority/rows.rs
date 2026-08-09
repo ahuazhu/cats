@@ -671,16 +671,31 @@ pub(super) fn volume_has_disposable_root_authorization_for_delete(
     let sql = format!(
         "SELECT {AUTHORIZATION_COLUMNS}
            FROM volume_authorizations
-          WHERE volume_id=$1
+          WHERE (
+                volume_id=$1
             AND kind='disposable_root_delete'
             AND desired_revision=$2
             AND placement_epoch=$3
+          ) OR (
+                record->'authorization' @> jsonb_build_object(
+                    'kind', 'disposable_root_delete'::text,
+                    'volume_id', $1::text,
+                    'desired_revision', $2::bigint,
+                    'placement_epoch', $3::bigint,
+                    'delete_id', $4::text
+                )
+          )
           ORDER BY authorization_id COLLATE \"C\"
           LIMIT 2"
     );
     let rows = transaction.query(
         &sql,
-        &[&volume_id.as_str(), &desired_revision, &placement_epoch],
+        &[
+            &volume_id.as_str(),
+            &desired_revision,
+            &placement_epoch,
+            &delete_id.as_str(),
+        ],
     )?;
     if rows.len() > 1 {
         return Err(corrupt(
