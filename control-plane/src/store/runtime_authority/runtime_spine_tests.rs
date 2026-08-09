@@ -1322,6 +1322,146 @@ fn cross_document_receipt_corruption_fails_closed() {
 }
 
 #[test]
+fn corrupt_admission_cursor_causality_blocks_partial_and_replacement_full() {
+    let (store, identity, authenticated, _policy, session) = fixture();
+    let workspace = bootstrap_workspace(&store, "f3c-corrupt-causality");
+    let desired = current_desired(&workspace, &identity.node_id);
+    insert_pending_operation(&store, &desired);
+    let request1 = cats_api::runtime_reconciliation::DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: binding(&session),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let snapshot1 = accepted(
+        store
+            .runtime_desired_read(&authenticated, &request1)
+            .unwrap(),
+    );
+    let mut runtime = settlement_runtime(&desired, &identity.node_id);
+    runtime.conditions = vec![Condition::Blocked {
+        reason: BlockedReason::IncompleteInventory {
+            unavailable_sources: vec![InventorySource::Process],
+        },
+    }];
+    let full1 = observation(
+        &store,
+        &session,
+        1,
+        1,
+        true,
+        Some(snapshot1.read_position),
+        vec![runtime.clone()],
+    );
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &full1)
+            .unwrap(),
+    );
+    let request2 = cats_api::runtime_reconciliation::DesiredReadRequest {
+        request_sequence: Sequence::new(2).unwrap(),
+        ..request1
+    };
+    let snapshot2 = accepted(
+        store
+            .runtime_desired_read(&authenticated, &request2)
+            .unwrap(),
+    );
+    let before: (i64, i64, i64, String, String) = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT
+                        (SELECT count(*) FROM runtime_observation_receive_states WHERE node_id=$1),
+                        (SELECT count(*) FROM runtime_current_cat_observations WHERE node_id=$1),
+                        (SELECT lease_deadline_unix_ms FROM current_agent_sessions WHERE node_id=$1),
+                        (SELECT phase FROM runtime_operations WHERE cat_id=$2),
+                        (SELECT record::text FROM runtime_operations WHERE cat_id=$2)",
+                    &[&identity.node_id.as_str(), &desired.cat_id.as_str()],
+                )
+                .map(|row| {
+                    (
+                        row.get(0),
+                        row.get(1),
+                        row.get(2),
+                        row.get(3),
+                        row.get(4),
+                    )
+                })
+        })
+        .unwrap();
+    assert_eq!(before.0, 1);
+    assert_eq!(before.1, 1);
+    assert_eq!(before.3, "pending");
+
+    // Keep the JSON/scalar projection equal while moving accepted_at exactly
+    // to cursor expiry. The shared row decoder must reject the broken strict
+    // `issued <= accepted < expires` receipt before either request can write.
+    let corrupt_accepted_at = i64::try_from(snapshot1.expires_at_unix_ms.get()).unwrap();
+    store
+        .with(|client| {
+            client.execute(
+                "UPDATE runtime_admission_inventory_states
+                    SET attestation=jsonb_set(
+                            attestation, '{accepted_at_unix_ms}', to_jsonb($2::BIGINT), FALSE),
+                        accepted_at_unix_ms=$2
+                  WHERE node_id=$1",
+                &[&identity.node_id.as_str(), &corrupt_accepted_at],
+            )
+        })
+        .unwrap();
+
+    let partial = observation(&store, &session, 2, 1, false, None, Vec::new());
+    assert_eq!(
+        store
+            .runtime_accept_observation(&authenticated, &partial)
+            .unwrap_err()
+            .code,
+        cats_api::error::ErrorCode::Internal
+    );
+    let full2 = observation(
+        &store,
+        &session,
+        2,
+        2,
+        true,
+        Some(snapshot2.read_position),
+        vec![runtime],
+    );
+    assert_eq!(
+        store
+            .runtime_accept_observation(&authenticated, &full2)
+            .unwrap_err()
+            .code,
+        cats_api::error::ErrorCode::Internal
+    );
+
+    let after: (i64, i64, i64, String, String) = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT
+                        (SELECT count(*) FROM runtime_observation_receive_states WHERE node_id=$1),
+                        (SELECT count(*) FROM runtime_current_cat_observations WHERE node_id=$1),
+                        (SELECT lease_deadline_unix_ms FROM current_agent_sessions WHERE node_id=$1),
+                        (SELECT phase FROM runtime_operations WHERE cat_id=$2),
+                        (SELECT record::text FROM runtime_operations WHERE cat_id=$2)",
+                    &[&identity.node_id.as_str(), &desired.cat_id.as_str()],
+                )
+                .map(|row| {
+                    (
+                        row.get(0),
+                        row.get(1),
+                        row.get(2),
+                        row.get(3),
+                        row.get(4),
+                    )
+                })
+        })
+        .unwrap();
+    assert_eq!(after, before);
+}
+
+#[test]
 fn desired_mutation_coordination_helper_revalidates_exact_admission_facts() {
     let (store, identity, authenticated, policy, session) = fixture();
     let request = cats_api::runtime_reconciliation::DesiredReadRequest {

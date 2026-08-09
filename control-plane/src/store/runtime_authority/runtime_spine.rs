@@ -448,11 +448,6 @@ fn load_placement_admission_in(
     }
     let cursor = &inventory.assigned_snapshot;
     let accepted_at = inventory.attestation.accepted_at_unix_ms;
-    if cursor.issued_at_unix_ms > accepted_at || accepted_at >= cursor.expires_at_unix_ms {
-        return Err(corrupt(
-            "admission inventory cursor/acceptance causality mismatch",
-        ));
-    }
     if accepted_at > now {
         return Err(corrupt(
             "database time moved behind admission inventory acceptance",
@@ -2583,6 +2578,13 @@ fn decode_admission_inventory_state(row: &Row) -> AuthorityTxResult<AdmissionInv
     {
         return Err(corrupt(
             "admission inventory state binding/projection mismatch",
+        ));
+    }
+    if assigned_snapshot.issued_at_unix_ms > accepted_at
+        || accepted_at >= assigned_snapshot.expires_at_unix_ms
+    {
+        return Err(corrupt(
+            "admission inventory cursor/acceptance causality mismatch",
         ));
     }
     Ok(AdmissionInventoryState {
