@@ -2,8 +2,9 @@
 
 use std::error::Error as _;
 use std::io::ErrorKind;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use cats_api::error::{ApiError, ErrorCode};
 use cats_storage::authority::AuthorityError;
@@ -14,6 +15,37 @@ use super::*;
 
 const AUTHORITY_TRANSACTION_ATTEMPTS: usize = 3;
 static RETRY_JITTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Cancellation/deadline state shared by an HTTP request and the blocking
+/// authority worker that may outlive its async caller.
+///
+/// A queued worker observes it before opening a transaction. A started worker
+/// checks it immediately before commit, so dropping or timing out the handler
+/// cannot cause a delayed mutation. Cancellation racing an already-started
+/// PostgreSQL COMMIT remains an intentionally ambiguous result recovered by
+/// the domain's exact replay key.
+#[derive(Clone)]
+pub(crate) struct AuthorityRequestContext {
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl AuthorityRequestContext {
+    pub(crate) fn new(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn must_rollback(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire) || Instant::now() >= self.deadline
+    }
+}
 
 pub(super) type AuthorityTxResult<T> = std::result::Result<T, AuthorityTransactionError>;
 
@@ -98,6 +130,24 @@ impl Store {
         }
     }
 
+    pub(super) fn authority_request_transaction<T: Send>(
+        &self,
+        request: &AuthorityRequestContext,
+        operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
+    ) -> Result<T> {
+        match self.authority_transaction_outcome_with(
+            operation,
+            AuthorityTransactionMode::ReadWrite,
+            Some(request),
+        ) {
+            Ok(value) => Ok(value),
+            Err(AuthorityExecutionError::Store(error)) => Err(error),
+            Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
+                "unexpected candidate-collision marker in an authority request",
+            )),
+        }
+    }
+
     /// Runs a complete authority facts loader in one PostgreSQL snapshot.
     /// Consumers must receive either the complete mutually-consistent fact set
     /// or no fact set at all, so this deliberately shares the retry and
@@ -110,6 +160,7 @@ impl Store {
         match self.authority_transaction_outcome_with(
             operation,
             AuthorityTransactionMode::RepeatableReadOnly,
+            None,
         ) {
             Ok(value) => Ok(value),
             Err(AuthorityExecutionError::Store(error)) => Err(error),
@@ -123,7 +174,11 @@ impl Store {
         &self,
         operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
     ) -> std::result::Result<T, AuthorityExecutionError> {
-        self.authority_transaction_outcome_with(operation, AuthorityTransactionMode::ReadWrite)
+        self.authority_transaction_outcome_with(
+            operation,
+            AuthorityTransactionMode::ReadWrite,
+            None,
+        )
     }
 
     /// Cat-create exposes its commit-send phase to an async cancellation
@@ -139,6 +194,7 @@ impl Store {
         self.authority_transaction_outcome_with_hook(
             operation,
             AuthorityTransactionMode::ReadWrite,
+            None,
             on_definite_retry,
         )
     }
@@ -147,17 +203,24 @@ impl Store {
         &self,
         operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
         mode: AuthorityTransactionMode,
+        request: Option<&AuthorityRequestContext>,
     ) -> std::result::Result<T, AuthorityExecutionError> {
-        self.authority_transaction_outcome_with_hook(operation, mode, || {})
+        self.authority_transaction_outcome_with_hook(operation, mode, request, || {})
     }
 
     fn authority_transaction_outcome_with_hook<T: Send>(
         &self,
         mut operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
         mode: AuthorityTransactionMode,
+        request: Option<&AuthorityRequestContext>,
         mut on_definite_retry: impl FnMut() + Send,
     ) -> std::result::Result<T, AuthorityExecutionError> {
         for attempt in 0..AUTHORITY_TRANSACTION_ATTEMPTS {
+            if request.is_some_and(AuthorityRequestContext::must_rollback) {
+                return Err(AuthorityExecutionError::Store(ApiError::unavailable(
+                    "runtime authority request was cancelled or exceeded its deadline",
+                )));
+            }
             let outcome = self.enter(|client| {
                 let client = client.map_err(AttemptFailure::Infrastructure)?;
                 let mut transaction = match mode {
@@ -170,6 +233,12 @@ impl Store {
                 }
                 .map_err(AttemptFailure::Postgres)?;
                 match operation(&mut transaction) {
+                    Ok(_value) if request.is_some_and(AuthorityRequestContext::must_rollback) => {
+                        transaction.rollback().map_err(AttemptFailure::Rollback)?;
+                        Err(AttemptFailure::Application(ApiError::unavailable(
+                            "runtime authority request was cancelled or exceeded its deadline",
+                        )))
+                    }
                     Ok(value) => match transaction.commit() {
                         Ok(()) => {
                             #[cfg(test)]

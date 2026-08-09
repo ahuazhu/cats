@@ -30,6 +30,7 @@ mod work;
 pub(crate) use agent_sessions::{
     AgentRegistrationOutcome, AgentRegistrationRejection, AgentSessionRegistrationPolicy,
 };
+pub(crate) use transaction::AuthorityRequestContext;
 
 #[cfg(test)]
 mod tests;

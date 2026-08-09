@@ -685,6 +685,17 @@ pub(super) fn lock_exact_credential_lineage(
     Ok(Some(state))
 }
 
+pub(super) fn load_identity_by_credential_unlocked(
+    transaction: &mut Transaction<'_>,
+    credential_id: &Id,
+) -> AuthorityTxResult<Option<NodeIdentity>> {
+    let sql = format!("SELECT {NODE_IDENTITY_COLUMNS} FROM node_identities WHERE credential_id=$1");
+    transaction
+        .query_opt(&sql, &[&credential_id.as_str()])?
+        .map(|row| decode_identity(&row))
+        .transpose()
+}
+
 pub(super) fn load_identity_by_node_for_update(
     transaction: &mut Transaction<'_>,
     node_id: &Id,

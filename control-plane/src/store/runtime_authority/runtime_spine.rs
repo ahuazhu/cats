@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use cats_api::agent_registration::AuthenticatedNodeCredential;
 use cats_api::runtime_reconciliation::{
     decode_admission_inventory_attestation, decode_desired_read_snapshot, decode_node_observation,
     decode_observation_acceptance, encode_admission_inventory_attestation,
@@ -35,13 +36,13 @@ use super::product_rows::{
 use super::rows::{database_now, load_delete_completion_for_update, load_volume_for_update};
 use crate::store::agent_sessions::{
     load_current_session_for_update, load_current_session_unlocked,
-    load_identity_by_credential_for_update, load_identity_by_node_for_update,
-    load_identity_by_node_unlocked, load_provisioned_identities_after,
-    lock_exact_credential_lineage, renew_current_session_deadline, AuthenticatedNodeCredential,
-    CredentialLineageState, PROVISIONED_NODE_ID_PAGE_SIZE,
+    load_identity_by_credential_for_update, load_identity_by_credential_unlocked,
+    load_identity_by_node_for_update, load_identity_by_node_unlocked,
+    load_provisioned_identities_after, lock_exact_credential_lineage,
+    renew_current_session_deadline, CredentialLineageState, PROVISIONED_NODE_ID_PAGE_SIZE,
 };
 use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
-use crate::store::{Result, Store};
+use crate::store::{AuthorityRequestContext, Result, Store};
 
 pub(crate) const AGENT_SESSION_LEASE_MS: u64 = 60_000;
 pub(crate) const DESIRED_READ_TTL_MS: u64 = 30_000;
@@ -148,6 +149,37 @@ struct AdmissionInventoryState {
 type ContextValidation<T> = AuthorityTxResult<std::result::Result<T, ContractError>>;
 
 impl Store {
+    /// Resolves the authenticated proof to its one eligible Node before the
+    /// HTTP adapter takes the per-Node in-flight permit.
+    ///
+    /// This read is deliberately not authorization authority for the later
+    /// operation: both mutation entry points lock and revalidate the same
+    /// identity in their domain transaction. It only prevents an invalid
+    /// credential from selecting or allocating a per-Node admission key.
+    pub(crate) fn resolve_runtime_node(
+        &self,
+        authenticated: &AuthenticatedNodeCredential,
+    ) -> Result<Option<Id>> {
+        self.authority_read_snapshot(|transaction| {
+            let Some(identity) =
+                load_identity_by_credential_unlocked(transaction, authenticated.credential_id())?
+            else {
+                return Ok(None);
+            };
+            if identity.state != NodeIdentityState::Provisioned
+                || identity.credential_id != *authenticated.credential_id()
+                || identity.credential_binding != *authenticated.binding()
+                || !matches!(
+                    identity.credential_binding,
+                    CredentialBinding::PublicKey { .. }
+                )
+            {
+                return Ok(None);
+            }
+            Ok(Some(identity.node_id))
+        })
+    }
+
     /// Lists one bounded, stable keyset page from NodeIdentity authority.
     ///
     /// This is only a candidate seed: callers must load and evaluate the full
@@ -187,6 +219,20 @@ impl Store {
         })
     }
 
+    pub(crate) fn runtime_desired_read_for_request(
+        &self,
+        authenticated: &AuthenticatedNodeCredential,
+        request: &DesiredReadRequest,
+        request_context: &AuthorityRequestContext,
+    ) -> Result<RuntimeSpineOutcome<DesiredReadSnapshot>> {
+        if let Err(error) = encode_desired_read_request(request) {
+            return Ok(rejected(error));
+        }
+        self.authority_request_transaction(request_context, |transaction| {
+            desired_read_in(transaction, authenticated, request)
+        })
+    }
+
     pub(crate) fn runtime_accept_observation(
         &self,
         authenticated: &AuthenticatedNodeCredential,
@@ -196,6 +242,20 @@ impl Store {
             return Ok(rejected(error));
         }
         self.authority_transaction(|transaction| {
+            accept_observation_in(transaction, authenticated, observation)
+        })
+    }
+
+    pub(crate) fn runtime_accept_observation_for_request(
+        &self,
+        authenticated: &AuthenticatedNodeCredential,
+        observation: &NodeObservation,
+        request_context: &AuthorityRequestContext,
+    ) -> Result<RuntimeSpineOutcome<ObservationAcceptance>> {
+        if let Err(error) = encode_node_observation(observation) {
+            return Ok(rejected(error));
+        }
+        self.authority_request_transaction(request_context, |transaction| {
             accept_observation_in(transaction, authenticated, observation)
         })
     }

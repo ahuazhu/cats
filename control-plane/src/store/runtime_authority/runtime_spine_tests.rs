@@ -2,8 +2,10 @@
 
 use std::collections::BTreeMap;
 use std::sync::{mpsc, Arc, Barrier};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use cats_api::agent_registration::AuthenticatedNodeCredential;
+use cats_api::error::ErrorCode;
 use cats_api::runtime_reconciliation::{
     decode_operation, encode_admission_inventory_attestation, encode_agent_session,
     encode_desired_read_snapshot, encode_node_observation, guest_config_digest, inventory_digest,
@@ -27,9 +29,8 @@ use super::runtime_spine::{
     PlacementAdmissionRejection, RouteRuntimeLoad, RouteRuntimeRejection, RuntimeSpineOutcome,
     RuntimeSpineRejection,
 };
-use crate::store::agent_sessions::{
-    AgentRegistrationOutcome, AgentSessionRegistrationPolicy, AuthenticatedNodeCredential,
-};
+use crate::store::agent_sessions::{AgentRegistrationOutcome, AgentSessionRegistrationPolicy};
+use crate::store::AuthorityRequestContext;
 use crate::store::Store;
 
 fn id(value: impl Into<String>) -> Id {
@@ -94,9 +95,7 @@ fn fixture_at(
         identity.credential_id.clone(),
         identity.credential_binding.clone(),
     );
-    let policy =
-        AgentSessionRegistrationPolicy::from_release_receipt(&release(), Duration::from_secs(120))
-            .unwrap();
+    let policy = AgentSessionRegistrationPolicy::from_release_receipt(&release()).unwrap();
     store.provision_node_identity(&identity).unwrap();
     let attempt = registration_attempt(&identity, 1, None, policy.approved_guest_config_digest());
     let session = registered(
@@ -105,6 +104,81 @@ fn fixture_at(
             .unwrap(),
     );
     (store, identity, authenticated, policy, session)
+}
+
+#[test]
+fn cancelling_a_started_http_authority_request_rolls_back_before_commit() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let (store, _identity, authenticated, _policy, session) = fixture_at(&url);
+    store
+        .with(|client| {
+            client.batch_execute(
+                "CREATE OR REPLACE FUNCTION pause_runtime_desired_insert()
+                 RETURNS trigger AS $$
+                 BEGIN
+                   PERFORM pg_sleep(0.5);
+                   RETURN NEW;
+                 END;
+                 $$ LANGUAGE plpgsql;
+                 CREATE TRIGGER pause_runtime_desired_insert
+                   BEFORE INSERT ON runtime_desired_read_states
+                   FOR EACH ROW EXECUTE FUNCTION pause_runtime_desired_insert();",
+            )
+        })
+        .unwrap();
+    let backend_pid: i32 = store
+        .with(|client| Ok(client.query_one("SELECT pg_backend_pid()", &[])?.get(0)))
+        .unwrap();
+    let observer = Store::connect(&url, None).unwrap();
+    let request = cats_api::runtime_reconciliation::DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: binding(&session),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let context = AuthorityRequestContext::new(Instant::now() + Duration::from_secs(5));
+    let worker_context = context.clone();
+    let worker = std::thread::spawn(move || {
+        store.runtime_desired_read_for_request(&authenticated, &request, &worker_context)
+    });
+
+    let wait_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let sleeping = observer
+            .with(|client| {
+                Ok(client
+                    .query_opt(
+                        "SELECT 1 FROM pg_stat_activity
+                           WHERE pid=$1 AND wait_event='PgSleep'
+                             AND query LIKE '%runtime_desired_read_states%'",
+                        &[&backend_pid],
+                    )?
+                    .is_some())
+            })
+            .unwrap();
+        if sleeping {
+            break;
+        }
+        assert!(
+            Instant::now() < wait_deadline,
+            "request never reached the pre-commit trigger"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    context.cancel();
+
+    let error = worker.join().unwrap().unwrap_err();
+    assert_eq!(error.code, ErrorCode::Unavailable);
+    let row_count: i64 = observer
+        .with(|client| {
+            Ok(client
+                .query_one("SELECT count(*) FROM runtime_desired_read_states", &[])?
+                .get(0))
+        })
+        .unwrap();
+    assert_eq!(
+        row_count, 0,
+        "cancelled request committed after its caller left"
+    );
 }
 
 fn numbered_identity(index: usize) -> NodeIdentity {
@@ -475,9 +549,7 @@ pub(super) fn establish_empty_admission_for(
         identity.credential_id.clone(),
         identity.credential_binding.clone(),
     );
-    let policy =
-        AgentSessionRegistrationPolicy::from_release_receipt(release, Duration::from_secs(120))
-            .unwrap();
+    let policy = AgentSessionRegistrationPolicy::from_release_receipt(release).unwrap();
     store.provision_node_identity(&identity).unwrap();
     let attempt = registration_attempt(
         &identity,

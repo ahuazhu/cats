@@ -49,6 +49,7 @@ mod endpoints;
 mod nodes;
 mod operations;
 mod routes;
+mod runtime_spine;
 mod sessions;
 mod usage;
 
@@ -536,6 +537,14 @@ pub fn router(state: AppState) -> Router {
             post(agent_registration::register_agent_session)
                 .fallback(agent_registration::register_agent_session),
         )
+        .route(
+            "/v1/internal/runtime/desired-reads",
+            post(runtime_spine::desired_read).fallback(runtime_spine::desired_read),
+        )
+        .route(
+            "/v1/internal/runtime/observations",
+            post(runtime_spine::observation).fallback(runtime_spine::observation),
+        )
         .route("/v1/nodes/heartbeat", post(heartbeat))
         .route("/v1/nodes/work-status", post(node_work_status))
         .route("/v1/internal/work/acquire", post(acquire_work))
@@ -728,6 +737,8 @@ POST /v1/admin/nodes/{id}/actions/{verb}
 POST /v1/auth/logout
 POST /v1/billing/stripe/webhook
 POST /v1/internal/runtime/agent-sessions
+POST /v1/internal/runtime/desired-reads
+POST /v1/internal/runtime/observations
 POST /v1/internal/usage/checkpoints
 POST /v1/internal/work/acquire
 POST /v1/internal/work/release

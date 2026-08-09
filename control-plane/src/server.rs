@@ -1,9 +1,10 @@
 //! Control-plane assembly: config, shared state, reconciler task and HTTP
 //! server. `spawn` is used by the binary and by every integration/E2E test.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -16,6 +17,52 @@ use crate::store::{DsnSource, SingletonRole, Store};
 
 const SINGLETON_ELECTION_RETRY: Duration = Duration::from_millis(500);
 const SINGLETON_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
+const RUNTIME_SPINE_GLOBAL_IN_FLIGHT: usize = 64;
+
+/// Non-authoritative, per-replica admission for the two A20 Node routes.
+/// PostgreSQL remains the concurrency authority; these permits only bound
+/// memory and handler work before a request reaches it.
+pub(crate) struct RuntimeSpineAdmission {
+    global: Arc<tokio::sync::Semaphore>,
+    per_node: Mutex<BTreeMap<String, Weak<tokio::sync::Semaphore>>>,
+}
+
+impl RuntimeSpineAdmission {
+    fn new() -> Self {
+        Self {
+            global: Arc::new(tokio::sync::Semaphore::new(RUNTIME_SPINE_GLOBAL_IN_FLIGHT)),
+            per_node: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    pub(crate) fn try_global(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+        self.global.clone().try_acquire_owned()
+    }
+
+    pub(crate) fn try_node(
+        &self,
+        node_id: &cats_api::runtime_reconciliation::Id,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+        let semaphore = {
+            let mut nodes = self
+                .per_node
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            nodes.retain(|_, weak| weak.strong_count() != 0);
+            match nodes.get(node_id.as_str()).and_then(Weak::upgrade) {
+                Some(semaphore) => semaphore,
+                None => {
+                    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+                    nodes.insert(node_id.as_str().to_owned(), Arc::downgrade(&semaphore));
+                    semaphore
+                }
+            }
+        };
+        semaphore.try_acquire_owned()
+    }
+}
 
 /// Ask an elected-role supervisor to stop if its election task is cancelled.
 /// The supervisor owns the PostgreSQL session, so dropping this guard cannot
@@ -110,6 +157,7 @@ pub struct AppState {
     pub controller: Arc<Controller>,
     pub cfg: Arc<Config>,
     pub(crate) agent_session_registration_policy: Arc<crate::store::AgentSessionRegistrationPolicy>,
+    pub(crate) runtime_spine_admission: Arc<RuntimeSpineAdmission>,
 }
 
 pub struct Handle {
@@ -434,6 +482,7 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         controller: controller.clone(),
         cfg: cfg.clone(),
         agent_session_registration_policy,
+        runtime_spine_admission: Arc::new(RuntimeSpineAdmission::new()),
     };
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen)
