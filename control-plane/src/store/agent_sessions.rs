@@ -24,7 +24,7 @@ use super::{internal, Result, Store};
 const NODE_IDENTITY_COLUMNS: &str = "
     node_id, record::text AS record_json, immutable_host_id, credential_id,
     credential_kind, credential_public_key_spki_sha256, credential_provider,
-    credential_principal, state_path_id, state";
+    credential_principal, credential_lineage_state, state_path_id, state";
 const REGISTRATION_ATTEMPT_COLUMNS: &str = "
     node_id, registration_attempt_id, attempt_record::text AS attempt_record_json,
     immutable_host_id, node_boot_id, agent_instance_id, guest_config_digest,
@@ -138,31 +138,38 @@ struct NodeIdentityProjection {
     credential_public_key_spki_sha256: Option<String>,
     credential_provider: Option<String>,
     credential_principal: Option<String>,
+    credential_lineage_state: Option<String>,
     state_path_id: String,
     state: String,
 }
 
 impl NodeIdentityProjection {
     fn from_record(record: &NodeIdentity) -> Self {
-        let (credential_kind, public_key, provider, principal) = match &record.credential_binding {
-            CredentialBinding::PublicKey {
-                public_key_spki_sha256,
-            } => (
-                "public_key",
-                Some(public_key_spki_sha256.to_string()),
-                None,
-                None,
-            ),
-            CredentialBinding::ProviderPrincipal {
-                provider,
-                principal,
-            } => (
-                "provider_principal",
-                None,
-                Some(provider.to_string()),
-                Some(principal.to_string()),
-            ),
-        };
+        let (credential_kind, public_key, provider, principal, lineage_state) =
+            match &record.credential_binding {
+                CredentialBinding::PublicKey {
+                    public_key_spki_sha256,
+                } => (
+                    "public_key",
+                    Some(public_key_spki_sha256.to_string()),
+                    None,
+                    None,
+                    Some(match record.state {
+                        NodeIdentityState::Provisioned => "active",
+                        NodeIdentityState::Retired => "retired",
+                    }),
+                ),
+                CredentialBinding::ProviderPrincipal {
+                    provider,
+                    principal,
+                } => (
+                    "provider_principal",
+                    None,
+                    Some(provider.to_string()),
+                    Some(principal.to_string()),
+                    None,
+                ),
+            };
         Self {
             node_id: record.node_id.to_string(),
             immutable_host_id: record.immutable_host_id.to_string(),
@@ -171,6 +178,7 @@ impl NodeIdentityProjection {
             credential_public_key_spki_sha256: public_key,
             credential_provider: provider,
             credential_principal: principal,
+            credential_lineage_state: lineage_state.map(str::to_owned),
             state_path_id: record.state_path_id.to_string(),
             state: match record.state {
                 NodeIdentityState::Provisioned => "provisioned",
@@ -192,6 +200,7 @@ impl NodeIdentityProjection {
             credential_public_key_spki_sha256: row.try_get("credential_public_key_spki_sha256")?,
             credential_provider: row.try_get("credential_provider")?,
             credential_principal: row.try_get("credential_principal")?,
+            credential_lineage_state: row.try_get("credential_lineage_state")?,
             state_path_id: row.try_get("state_path_id")?,
             state: closed_text(row.try_get("state")?, &["provisioned", "retired"])?,
         })
@@ -321,29 +330,9 @@ impl Store {
                 "a newly provisioned NodeIdentity must be provisioned",
             ));
         }
-        let record_json = encode_identity(identity).map_err(store_corruption)?;
-        let projection = NodeIdentityProjection::from_record(identity);
         self.authority_transaction(|transaction| {
-            let inserted = transaction.execute(
-                "INSERT INTO node_identities (
-                    node_id, record, immutable_host_id, credential_id,
-                    credential_kind, credential_public_key_spki_sha256,
-                    credential_provider, credential_principal, state_path_id, state
-                 ) VALUES ($1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9, $10)
-                 ON CONFLICT DO NOTHING",
-                &[
-                    &projection.node_id,
-                    &record_json,
-                    &projection.immutable_host_id,
-                    &projection.credential_id,
-                    &projection.credential_kind,
-                    &projection.credential_public_key_spki_sha256,
-                    &projection.credential_provider,
-                    &projection.credential_principal,
-                    &projection.state_path_id,
-                    &projection.state,
-                ],
-            )?;
+            let committed_at = database_now(transaction)?;
+            let inserted = insert_node_identity_in(transaction, identity, committed_at)?;
             if inserted == 1 {
                 return Ok(());
             }
@@ -362,7 +351,7 @@ impl Store {
     #[allow(dead_code, reason = "consumed by the Node provisioning service slice")]
     pub(crate) fn retire_node_identity(&self, node_id: &Id) -> Result<()> {
         self.authority_transaction(|transaction| {
-            let Some(mut identity) = load_identity_by_node_for_update(transaction, node_id)? else {
+            let Some(identity) = load_identity_by_node_for_update(transaction, node_id)? else {
                 return Err(AuthorityTransactionError::Application(
                     super::ApiError::not_found("NodeIdentity"),
                 ));
@@ -370,14 +359,8 @@ impl Store {
             if identity.state == NodeIdentityState::Retired {
                 return Ok(());
             }
-            identity.state = NodeIdentityState::Retired;
-            let record_json = encode_identity(&identity)?;
-            let changed = transaction.execute(
-                "UPDATE node_identities SET record=$2::TEXT::jsonb, state='retired'
-                  WHERE node_id=$1 AND state='provisioned'",
-                &[&identity.node_id.as_str(), &record_json],
-            )?;
-            exactly_one(changed)
+            let retired_at = database_now(transaction)?;
+            retire_node_identity_in(transaction, &identity, retired_at).map(|_| ())
         })
     }
 
@@ -402,6 +385,164 @@ impl Store {
             register_agent_session_in(transaction, authenticated, attempt, policy)
         })
     }
+}
+
+/// Inserts both sides of the deferred current-credential lineage invariant.
+/// Callers own the node-scoped/advisory lock that makes an absent identity a
+/// stable fact for their larger transaction.
+pub(super) fn insert_node_identity_in(
+    transaction: &mut Transaction<'_>,
+    identity: &NodeIdentity,
+    committed_at: UnixMillis,
+) -> AuthorityTxResult<u64> {
+    let record_json = encode_identity(identity)?;
+    let projection = NodeIdentityProjection::from_record(identity);
+    let inserted = transaction.execute(
+        "INSERT INTO node_identities (
+            node_id, record, immutable_host_id, credential_id,
+            credential_kind, credential_public_key_spki_sha256,
+            credential_provider, credential_principal,
+            credential_lineage_state, state_path_id, state
+         ) VALUES ($1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT DO NOTHING",
+        &[
+            &projection.node_id,
+            &record_json,
+            &projection.immutable_host_id,
+            &projection.credential_id,
+            &projection.credential_kind,
+            &projection.credential_public_key_spki_sha256,
+            &projection.credential_provider,
+            &projection.credential_principal,
+            &projection.credential_lineage_state,
+            &projection.state_path_id,
+            &projection.state,
+        ],
+    )?;
+    if inserted == 1 {
+        if let Some(public_key) = &projection.credential_public_key_spki_sha256 {
+            let committed_at = committed_at.to_pg().map_err(corrupt)?;
+            exactly_one(transaction.execute(
+                "INSERT INTO runtime_node_credential_lineage (
+                    credential_id, node_id, public_key_spki_sha256,
+                    state, first_committed_at_unix_ms, retired_at_unix_ms
+                 ) VALUES ($1, $2, $3, 'active', $4, NULL)",
+                &[
+                    &projection.credential_id,
+                    &projection.node_id,
+                    public_key,
+                    &committed_at,
+                ],
+            )?)?;
+        }
+    }
+    Ok(inserted)
+}
+
+/// Rotates both the current NodeIdentity binding and its all-history lineage
+/// in one transaction. The deferred composite foreign key rejects any partial
+/// update at commit.
+pub(super) fn rotate_public_key_identity_in(
+    transaction: &mut Transaction<'_>,
+    current: &NodeIdentity,
+    new_credential_id: &Id,
+    new_public_key_spki_sha256: &Sha256Digest,
+    committed_at: UnixMillis,
+) -> AuthorityTxResult<NodeIdentity> {
+    if current.state != NodeIdentityState::Provisioned
+        || !matches!(
+            current.credential_binding,
+            CredentialBinding::PublicKey { .. }
+        )
+    {
+        return Err(corrupt("only an active public-key NodeIdentity can rotate"));
+    }
+    let mut next = current.clone();
+    next.credential_id = new_credential_id.clone();
+    next.credential_binding = CredentialBinding::PublicKey {
+        public_key_spki_sha256: new_public_key_spki_sha256.clone(),
+    };
+    let projection = NodeIdentityProjection::from_record(&next);
+    let record_json = encode_identity(&next)?;
+    let committed_at = committed_at.to_pg().map_err(corrupt)?;
+    exactly_one(transaction.execute(
+        "UPDATE runtime_node_credential_lineage
+            SET state='retired', retired_at_unix_ms=$3
+          WHERE credential_id=$1 AND node_id=$2 AND state='active'",
+        &[
+            &current.credential_id.as_str(),
+            &current.node_id.as_str(),
+            &committed_at,
+        ],
+    )?)?;
+    exactly_one(transaction.execute(
+        "INSERT INTO runtime_node_credential_lineage (
+            credential_id, node_id, public_key_spki_sha256,
+            state, first_committed_at_unix_ms, retired_at_unix_ms
+         ) VALUES ($1, $2, $3, 'active', $4, NULL)",
+        &[
+            &projection.credential_id,
+            &projection.node_id,
+            &projection.credential_public_key_spki_sha256,
+            &committed_at,
+        ],
+    )?)?;
+    exactly_one(transaction.execute(
+        "UPDATE node_identities
+            SET record=$2::TEXT::jsonb,
+                credential_id=$3,
+                credential_public_key_spki_sha256=$4,
+                credential_lineage_state='active'
+          WHERE node_id=$1 AND state='provisioned'",
+        &[
+            &projection.node_id,
+            &record_json,
+            &projection.credential_id,
+            &projection.credential_public_key_spki_sha256,
+        ],
+    )?)?;
+    Ok(next)
+}
+
+/// Permanently retires one current identity and its exact credential lineage.
+pub(super) fn retire_node_identity_in(
+    transaction: &mut Transaction<'_>,
+    current: &NodeIdentity,
+    retired_at: UnixMillis,
+) -> AuthorityTxResult<NodeIdentity> {
+    if current.state != NodeIdentityState::Provisioned {
+        return Err(corrupt("only a provisioned NodeIdentity can retire"));
+    }
+    let mut retired = current.clone();
+    retired.state = NodeIdentityState::Retired;
+    let record_json = encode_identity(&retired)?;
+    let retired_at = retired_at.to_pg().map_err(corrupt)?;
+    if matches!(
+        current.credential_binding,
+        CredentialBinding::PublicKey { .. }
+    ) {
+        exactly_one(transaction.execute(
+            "UPDATE runtime_node_credential_lineage
+                SET state='retired', retired_at_unix_ms=$3
+              WHERE credential_id=$1 AND node_id=$2 AND state='active'",
+            &[
+                &current.credential_id.as_str(),
+                &current.node_id.as_str(),
+                &retired_at,
+            ],
+        )?)?;
+    }
+    exactly_one(transaction.execute(
+        "UPDATE node_identities
+            SET record=$2::TEXT::jsonb, state='retired',
+                credential_lineage_state = CASE
+                    WHEN credential_kind='public_key' THEN 'retired'
+                    ELSE NULL
+                END
+          WHERE node_id=$1 AND state='provisioned'",
+        &[&current.node_id.as_str(), &record_json],
+    )?)?;
+    Ok(retired)
 }
 
 fn register_agent_session_in(
@@ -937,8 +1078,4 @@ fn corrupt(_error: impl std::fmt::Debug) -> AuthorityTransactionError {
     AuthorityTransactionError::Application(internal(
         "Agent session Store persisted contract or generated value is invalid",
     ))
-}
-
-fn store_corruption(_error: AuthorityTransactionError) -> super::ApiError {
-    internal("Agent session Store received an invalid NodeIdentity contract value")
 }

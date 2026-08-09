@@ -3,9 +3,9 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use super::types::{
-    ContractError, ContractErrorDetail, ContractName, ContractVersion, DesiredRuntimeSpec, Epoch,
-    GuestRuntimeProfileReceipt, JsonPointer, KeyId, MalformedProblem, NodeObservation,
-    RuntimeCheckpoint, RuntimeProvisionerActiveSet, Sha256Digest,
+    Base64UrlNoPad, ContractError, ContractErrorDetail, ContractName, ContractVersion,
+    DesiredRuntimeSpec, Epoch, GuestRuntimeProfileReceipt, JsonPointer, KeyId, MalformedProblem,
+    NodeObservation, RuntimeCheckpoint, RuntimeProvisionerActiveSet, Sha256Digest,
 };
 
 const SPEC_DOMAIN: &[u8] = b"cats.runtime.desired-spec.v1";
@@ -145,6 +145,14 @@ pub fn runtime_provisioner_active_set_digest(
 ) -> Result<Sha256Digest, ContractError> {
     let canonical = super::wire::encode_runtime_provisioner_active_set(active_set)?;
     Ok(Sha256Digest::from_bytes(Sha256::digest(canonical).into()))
+}
+
+/// Computes the ordinary SHA-256 of one exact canonical Ed25519 SPKI DER
+/// value. The narrow `Option` keeps provider code from accepting a merely
+/// base64url-shaped string as an Ed25519 key.
+pub fn canonical_ed25519_spki_sha256(public_key_spki: &Base64UrlNoPad) -> Option<Sha256Digest> {
+    let der = super::wire::canonical_ed25519_spki_bytes(public_key_spki)?;
+    Some(Sha256Digest::from_bytes(Sha256::digest(der).into()))
 }
 
 pub(crate) fn unchecked_spec_digest(spec: &DesiredRuntimeSpec) -> Sha256Digest {

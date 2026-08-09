@@ -20,8 +20,8 @@ mod types;
 mod wire;
 
 pub use canonical::{
-    checkpoint_content_digest, guest_config_digest, inventory_digest, key_ring_digest,
-    runtime_provisioner_active_set_digest, spec_digest,
+    canonical_ed25519_spki_sha256, checkpoint_content_digest, guest_config_digest,
+    inventory_digest, key_ring_digest, runtime_provisioner_active_set_digest, spec_digest,
 };
 pub use types::*;
 pub use wire::{

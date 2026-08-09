@@ -245,6 +245,12 @@ const CONTROL_TABLES: &[&str] = &[
     "runtime_observation_receive_states",
     "runtime_admission_inventory_states",
     "runtime_current_cat_observations",
+    "runtime_node_placement_policies",
+    "runtime_node_authority_apply_records",
+    "runtime_node_credential_lineage",
+    "runtime_provisioner_deployment_identity",
+    "runtime_provisioner_trust_revisions",
+    "runtime_provisioner_credential_lineage",
 ];
 
 const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
@@ -295,7 +301,8 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
        FROM api_idempotency_results WHERE FALSE",
     "SELECT node_id, record, immutable_host_id, credential_id,
             credential_kind, credential_public_key_spki_sha256,
-            credential_provider, credential_principal, state_path_id, state
+            credential_provider, credential_principal,
+            credential_lineage_state, state_path_id, state
        FROM node_identities WHERE FALSE",
     "SELECT node_id, registration_attempt_id, attempt_record,
             immutable_host_id, node_boot_id, agent_instance_id,
@@ -326,6 +333,27 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             source_observation_id, heartbeat_sequence, accepted_at_unix_ms,
             source_kind
        FROM runtime_current_cat_observations WHERE FALSE",
+    "SELECT node_id, record, policy_revision, scheduling_state,
+            allocatable_vcpus, allocatable_memory_bytes,
+            guest_config_digest, block_frontend, guest_ipv4_network_address
+       FROM runtime_node_placement_policies WHERE FALSE",
+    "SELECT apply_id, request, request_sha256, principal, principal_kind,
+            node_id, outcome, outcome_kind, committed_at_unix_ms
+       FROM runtime_node_authority_apply_records WHERE FALSE",
+    "SELECT credential_id, node_id, public_key_spki_sha256, state,
+            first_committed_at_unix_ms, retired_at_unix_ms
+       FROM runtime_node_credential_lineage WHERE FALSE",
+    "SELECT singleton, deployment_id, current_trust_revision,
+            current_active_set_sha256, first_committed_at_unix_ms
+       FROM runtime_provisioner_deployment_identity WHERE FALSE",
+    "SELECT deployment_id, trust_revision, active_set_sha256,
+            expected_previous_trust_revision,
+            expected_previous_active_set_sha256, committed_at_unix_ms
+       FROM runtime_provisioner_trust_revisions WHERE FALSE",
+    "SELECT credential_id, deployment_id, public_key_spki,
+            public_key_spki_sha256, state, first_committed_at_unix_ms,
+            retired_at_unix_ms
+       FROM runtime_provisioner_credential_lineage WHERE FALSE",
 ];
 
 const SCHEMA: &str = "
@@ -845,6 +873,8 @@ CREATE TABLE IF NOT EXISTS node_identities (
     credential_public_key_spki_sha256 TEXT,
     credential_provider TEXT,
     credential_principal TEXT,
+    credential_lineage_state TEXT
+        CHECK (credential_lineage_state IN ('active', 'retired')),
     state_path_id TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('provisioned', 'retired')),
     UNIQUE (immutable_host_id, state_path_id),
@@ -853,12 +883,121 @@ CREATE TABLE IF NOT EXISTS node_identities (
             AND credential_public_key_spki_sha256 IS NOT NULL
             AND credential_public_key_spki_sha256 ~ '^sha256:[0-9a-f]{64}$'
             AND credential_provider IS NULL
-            AND credential_principal IS NULL) OR
+            AND credential_principal IS NULL
+            AND credential_lineage_state IS NOT NULL
+            AND ((state = 'provisioned' AND credential_lineage_state = 'active') OR
+                 (state = 'retired' AND credential_lineage_state = 'retired'))) OR
         (credential_kind = 'provider_principal'
             AND credential_public_key_spki_sha256 IS NULL
             AND credential_provider IS NOT NULL
-            AND credential_principal IS NOT NULL)
+            AND credential_principal IS NOT NULL
+            AND credential_lineage_state IS NULL)
     ) IS TRUE)
+);
+CREATE TABLE IF NOT EXISTS runtime_node_credential_lineage (
+    credential_id TEXT PRIMARY KEY,
+    node_id TEXT NOT NULL REFERENCES node_identities(node_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+    public_key_spki_sha256 TEXT NOT NULL UNIQUE
+        CHECK (public_key_spki_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    state TEXT NOT NULL CHECK (state IN ('active', 'retired')),
+    first_committed_at_unix_ms BIGINT NOT NULL CHECK (first_committed_at_unix_ms >= 0),
+    retired_at_unix_ms BIGINT NULL CHECK (
+        retired_at_unix_ms IS NULL OR
+        retired_at_unix_ms >= first_committed_at_unix_ms),
+    CHECK ((state = 'active' AND retired_at_unix_ms IS NULL) OR
+           (state = 'retired' AND retired_at_unix_ms IS NOT NULL)),
+    UNIQUE (node_id, credential_id),
+    UNIQUE (node_id, credential_id, public_key_spki_sha256, state)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS runtime_node_one_active_credential
+    ON runtime_node_credential_lineage(node_id) WHERE state = 'active';
+ALTER TABLE node_identities
+    ADD CONSTRAINT node_identity_current_public_key_lineage
+    FOREIGN KEY (
+        node_id, credential_id, credential_public_key_spki_sha256,
+        credential_lineage_state)
+    REFERENCES runtime_node_credential_lineage(
+        node_id, credential_id, public_key_spki_sha256, state)
+    ON UPDATE NO ACTION ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED;
+CREATE TABLE IF NOT EXISTS runtime_node_placement_policies (
+    node_id TEXT PRIMARY KEY REFERENCES node_identities(node_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
+    policy_revision BIGINT NOT NULL CHECK (policy_revision > 0),
+    scheduling_state TEXT NOT NULL CHECK (scheduling_state IN ('cordoned', 'schedulable')),
+    allocatable_vcpus BIGINT NOT NULL
+        CHECK (allocatable_vcpus BETWEEN 1 AND 4294967295),
+    allocatable_memory_bytes BIGINT NOT NULL CHECK (allocatable_memory_bytes > 0),
+    guest_config_digest TEXT NOT NULL
+        CHECK (guest_config_digest ~ '^sha256:[0-9a-f]{64}$'),
+    block_frontend TEXT NOT NULL CHECK (block_frontend IN ('kernel_nbd', 'vhost_user_blk')),
+    guest_ipv4_network_address TEXT NOT NULL
+        CHECK (guest_ipv4_network_address ~ '^[0-9]{1,3}([.][0-9]{1,3}){3}$')
+);
+CREATE TABLE IF NOT EXISTS runtime_node_authority_apply_records (
+    apply_id TEXT PRIMARY KEY,
+    request JSONB NOT NULL CHECK (jsonb_typeof(request) = 'object'),
+    request_sha256 TEXT NOT NULL CHECK (request_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    principal JSONB NOT NULL CHECK (jsonb_typeof(principal) = 'object'),
+    principal_kind TEXT NOT NULL
+        CHECK (principal_kind IN ('deployment_provisioner', 'workos_fleet_administrator')),
+    node_id TEXT NOT NULL,
+    outcome JSONB NOT NULL CHECK (jsonb_typeof(outcome) = 'object'),
+    outcome_kind TEXT NOT NULL CHECK (outcome_kind IN ('applied', 'authority_precondition_failed')),
+    committed_at_unix_ms BIGINT NOT NULL CHECK (committed_at_unix_ms >= 0)
+);
+CREATE TABLE IF NOT EXISTS runtime_provisioner_deployment_identity (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    deployment_id TEXT NOT NULL UNIQUE,
+    current_trust_revision BIGINT NOT NULL CHECK (current_trust_revision > 0),
+    current_active_set_sha256 TEXT NOT NULL
+        CHECK (current_active_set_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    first_committed_at_unix_ms BIGINT NOT NULL CHECK (first_committed_at_unix_ms >= 0)
+);
+CREATE TABLE IF NOT EXISTS runtime_provisioner_trust_revisions (
+    deployment_id TEXT NOT NULL
+        REFERENCES runtime_provisioner_deployment_identity(deployment_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+    trust_revision BIGINT NOT NULL CHECK (trust_revision > 0),
+    active_set_sha256 TEXT NOT NULL
+        CHECK (active_set_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    expected_previous_trust_revision BIGINT NULL
+        CHECK (expected_previous_trust_revision > 0),
+    expected_previous_active_set_sha256 TEXT NULL
+        CHECK (expected_previous_active_set_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    committed_at_unix_ms BIGINT NOT NULL CHECK (committed_at_unix_ms >= 0),
+    PRIMARY KEY (deployment_id, trust_revision),
+    UNIQUE (deployment_id, trust_revision, active_set_sha256),
+    CHECK (
+        (trust_revision = 1 AND expected_previous_trust_revision IS NULL
+            AND expected_previous_active_set_sha256 IS NULL) OR
+        (trust_revision > 1
+            AND expected_previous_trust_revision = trust_revision - 1
+            AND expected_previous_active_set_sha256 IS NOT NULL)
+    )
+);
+ALTER TABLE runtime_provisioner_deployment_identity
+    ADD CONSTRAINT runtime_provisioner_current_trust_revision
+    FOREIGN KEY (deployment_id, current_trust_revision, current_active_set_sha256)
+    REFERENCES runtime_provisioner_trust_revisions(
+        deployment_id, trust_revision, active_set_sha256)
+    ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED;
+CREATE TABLE IF NOT EXISTS runtime_provisioner_credential_lineage (
+    credential_id TEXT PRIMARY KEY,
+    deployment_id TEXT NOT NULL
+        REFERENCES runtime_provisioner_deployment_identity(deployment_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    public_key_spki TEXT NOT NULL UNIQUE,
+    public_key_spki_sha256 TEXT NOT NULL UNIQUE
+        CHECK (public_key_spki_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    state TEXT NOT NULL CHECK (state IN ('active', 'retired')),
+    first_committed_at_unix_ms BIGINT NOT NULL CHECK (first_committed_at_unix_ms >= 0),
+    retired_at_unix_ms BIGINT NULL CHECK (
+        retired_at_unix_ms IS NULL OR
+        retired_at_unix_ms >= first_committed_at_unix_ms),
+    CHECK ((state = 'active' AND retired_at_unix_ms IS NULL) OR
+           (state = 'retired' AND retired_at_unix_ms IS NOT NULL))
 );
 CREATE TABLE IF NOT EXISTS agent_registration_attempts (
     node_id TEXT NOT NULL REFERENCES node_identities(node_id),
@@ -945,6 +1084,130 @@ CREATE TABLE IF NOT EXISTS runtime_current_cat_observations (
     source_kind TEXT NOT NULL CHECK (source_kind IN ('full', 'partial')),
     PRIMARY KEY (node_id, cat_id)
 );
+CREATE OR REPLACE FUNCTION control_runtime_node_credential_lineage_update()
+RETURNS trigger AS $$
+BEGIN
+    IF NEW.credential_id IS DISTINCT FROM OLD.credential_id
+       OR NEW.node_id IS DISTINCT FROM OLD.node_id
+       OR NEW.public_key_spki_sha256 IS DISTINCT FROM OLD.public_key_spki_sha256
+       OR NEW.first_committed_at_unix_ms IS DISTINCT FROM OLD.first_committed_at_unix_ms
+       OR OLD.state = 'retired'
+       OR OLD.state <> 'active'
+       OR NEW.state <> 'retired'
+       OR OLD.retired_at_unix_ms IS NOT NULL
+       OR NEW.retired_at_unix_ms IS NULL THEN
+        RAISE EXCEPTION 'runtime Node credential lineage is immutable';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION control_runtime_node_credential_lineage_cannot_delete()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'runtime Node credential lineage cannot be deleted';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER runtime_node_credential_lineage_update
+    BEFORE UPDATE ON runtime_node_credential_lineage
+    FOR EACH ROW EXECUTE FUNCTION control_runtime_node_credential_lineage_update();
+CREATE TRIGGER runtime_node_credential_lineage_cannot_delete
+    BEFORE DELETE ON runtime_node_credential_lineage
+    FOR EACH ROW EXECUTE FUNCTION control_runtime_node_credential_lineage_cannot_delete();
+CREATE OR REPLACE FUNCTION control_runtime_node_policy_update()
+RETURNS trigger AS $$
+BEGIN
+    IF NEW.node_id IS DISTINCT FROM OLD.node_id
+       OR NEW.policy_revision <> OLD.policy_revision + 1 THEN
+        RAISE EXCEPTION 'runtime Node placement policy revision is not a successor';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION control_runtime_node_policy_cannot_delete()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'runtime Node placement policy cannot be deleted';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER runtime_node_policy_update
+    BEFORE UPDATE ON runtime_node_placement_policies
+    FOR EACH ROW EXECUTE FUNCTION control_runtime_node_policy_update();
+CREATE TRIGGER runtime_node_policy_cannot_delete
+    BEFORE DELETE ON runtime_node_placement_policies
+    FOR EACH ROW EXECUTE FUNCTION control_runtime_node_policy_cannot_delete();
+CREATE OR REPLACE FUNCTION control_runtime_node_apply_is_immutable()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'runtime Node authority apply result is immutable';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER runtime_node_apply_is_immutable
+    BEFORE UPDATE OR DELETE ON runtime_node_authority_apply_records
+    FOR EACH ROW EXECUTE FUNCTION control_runtime_node_apply_is_immutable();
+CREATE OR REPLACE FUNCTION control_runtime_provisioner_revision_is_immutable()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'runtime provisioner trust revision is immutable';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER runtime_provisioner_revision_is_immutable
+    BEFORE UPDATE OR DELETE ON runtime_provisioner_trust_revisions
+    FOR EACH ROW EXECUTE FUNCTION control_runtime_provisioner_revision_is_immutable();
+CREATE OR REPLACE FUNCTION control_runtime_provisioner_credential_update()
+RETURNS trigger AS $$
+BEGIN
+    IF NEW.credential_id IS DISTINCT FROM OLD.credential_id
+       OR NEW.deployment_id IS DISTINCT FROM OLD.deployment_id
+       OR NEW.public_key_spki IS DISTINCT FROM OLD.public_key_spki
+       OR NEW.public_key_spki_sha256 IS DISTINCT FROM OLD.public_key_spki_sha256
+       OR NEW.first_committed_at_unix_ms IS DISTINCT FROM OLD.first_committed_at_unix_ms
+       OR OLD.state = 'retired'
+       OR OLD.state <> 'active'
+       OR NEW.state <> 'retired'
+       OR OLD.retired_at_unix_ms IS NOT NULL
+       OR NEW.retired_at_unix_ms IS NULL THEN
+        RAISE EXCEPTION 'runtime provisioner credential lineage is immutable';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION control_runtime_provisioner_credential_cannot_delete()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'runtime provisioner credential lineage cannot be deleted';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER runtime_provisioner_credential_update
+    BEFORE UPDATE ON runtime_provisioner_credential_lineage
+    FOR EACH ROW EXECUTE FUNCTION control_runtime_provisioner_credential_update();
+CREATE TRIGGER runtime_provisioner_credential_cannot_delete
+    BEFORE DELETE ON runtime_provisioner_credential_lineage
+    FOR EACH ROW EXECUTE FUNCTION control_runtime_provisioner_credential_cannot_delete();
+CREATE OR REPLACE FUNCTION control_runtime_provisioner_pointer_update()
+RETURNS trigger AS $$
+BEGIN
+    IF NEW.singleton IS DISTINCT FROM OLD.singleton
+       OR NEW.deployment_id IS DISTINCT FROM OLD.deployment_id
+       OR NEW.first_committed_at_unix_ms IS DISTINCT FROM OLD.first_committed_at_unix_ms
+       OR NEW.current_trust_revision <> OLD.current_trust_revision + 1
+       OR NEW.current_active_set_sha256 = OLD.current_active_set_sha256 THEN
+        RAISE EXCEPTION 'runtime provisioner trust pointer is not a successor';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION control_runtime_provisioner_pointer_cannot_delete()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'runtime provisioner deployment identity cannot be deleted';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER runtime_provisioner_pointer_update
+    BEFORE UPDATE ON runtime_provisioner_deployment_identity
+    FOR EACH ROW EXECUTE FUNCTION control_runtime_provisioner_pointer_update();
+CREATE TRIGGER runtime_provisioner_pointer_cannot_delete
+    BEFORE DELETE ON runtime_provisioner_deployment_identity
+    FOR EACH ROW EXECUTE FUNCTION control_runtime_provisioner_pointer_cannot_delete();
 CREATE OR REPLACE FUNCTION control_node_identity_lineage_is_immutable()
 RETURNS trigger AS $$
 BEGIN

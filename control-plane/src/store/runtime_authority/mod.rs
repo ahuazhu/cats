@@ -12,6 +12,7 @@ mod events;
 )]
 pub(crate) mod image_manifest_resolver;
 pub(super) mod pg_codec;
+pub(crate) mod placement_policy;
 mod product;
 mod product_rows;
 pub(super) mod rows;
@@ -27,6 +28,9 @@ mod cat_create_service_tests;
 
 #[cfg(test)]
 mod product_tests;
+
+#[cfg(test)]
+mod placement_policy_tests;
 
 #[cfg(test)]
 mod runtime_spine_tests;

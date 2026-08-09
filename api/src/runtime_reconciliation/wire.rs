@@ -4744,12 +4744,17 @@ fn provisioner_credential_candidates(
 }
 
 fn canonical_ed25519_spki(value: &Base64UrlNoPad) -> bool {
+    canonical_ed25519_spki_bytes(value).is_some()
+}
+
+pub(crate) fn canonical_ed25519_spki_bytes(value: &Base64UrlNoPad) -> Option<Vec<u8>> {
     const PREFIX: [u8; 12] = [
         0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
     ];
     URL_SAFE_NO_PAD
         .decode(value.as_str())
-        .is_ok_and(|decoded| decoded.len() == PREFIX.len() + 32 && decoded.starts_with(&PREFIX))
+        .ok()
+        .filter(|decoded| decoded.len() == PREFIX.len() + 32 && decoded.starts_with(&PREFIX))
 }
 
 fn private_aligned_ipv4_16(address: &Ipv4Address) -> bool {

@@ -20,7 +20,7 @@ const MAX_INTEGER: u64 = i64::MAX as u64;
 /// Sharing this release number lets the adapter reject an unstamped or
 /// incompatible authority shape without importing the product store or
 /// duplicating its schema.
-pub const AUTHORITY_RELEASE_SCHEMA_VERSION: i64 = 5;
+pub const AUTHORITY_RELEASE_SCHEMA_VERSION: i64 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
