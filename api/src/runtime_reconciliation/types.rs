@@ -374,6 +374,88 @@ pub struct AdmissionInventoryAttestation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct DesiredReadRequest {
+    pub version: ContractVersion,
+    pub session: SessionBinding,
+    pub request_sequence: Sequence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesiredReadSnapshot {
+    pub version: ContractVersion,
+    pub session: SessionBinding,
+    pub request_sequence: Sequence,
+    pub read_position: Sequence,
+    pub issued_at_unix_ms: UnixMillis,
+    pub expires_at_unix_ms: UnixMillis,
+    pub desired_specs: Vec<DesiredRuntimeSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationAcceptance {
+    pub version: ContractVersion,
+    pub session: SessionBinding,
+    pub observation_id: RandomId128,
+    pub heartbeat_sequence: Sequence,
+    pub accepted_at_unix_ms: UnixMillis,
+    pub lease_deadline_unix_ms: UnixMillis,
+    pub inventory: ObservationInventoryAcceptance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ObservationInventoryAcceptance {
+    Full {
+        attestation: AdmissionInventoryAttestation,
+    },
+    Partial {
+        inventory_epoch: Epoch,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSpineError {
+    pub version: ContractVersion,
+    pub error: Box<RuntimeSpineErrorDetail>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "code", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RuntimeSpineErrorDetail {
+    AuthenticationFailed,
+    IdentityNotEligible,
+    HttpRequestRejected { problem: RuntimeSpineHttpProblem },
+    ContractError { contract_error: ContractError },
+    NodeRequestInFlight,
+    TemporarilyUnavailable,
+    Internal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeSpineHttpProblem {
+    MethodNotAllowed,
+    QueryNotAllowed,
+    ContentTypeNotAllowed,
+    ContentEncodingNotAllowed,
+    AuthorizationNotAllowed,
+    AcceptNotAllowed,
+    SemanticHeaderNotAllowed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignedSetLimit {
+    DesiredSpecs,
+    WireBytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DesiredRuntimeSpec {
     pub version: ContractVersion,
     pub workspace_id: Id,
@@ -1724,6 +1806,9 @@ impl std::error::Error for ContractError {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "code", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContractErrorDetail {
+    MissingAgentSession {
+        node_id: Id,
+    },
     StaleSession {
         node_id: Id,
         presented_agent_session_epoch: Epoch,
@@ -1756,6 +1841,108 @@ pub enum ContractErrorDetail {
         heartbeat_sequence: Sequence,
         accepted_observation_id: RandomId128,
         presented_observation_id: RandomId128,
+    },
+    SessionExpired {
+        node_id: Id,
+        agent_session_epoch: Epoch,
+        lease_deadline_unix_ms: UnixMillis,
+        server_time_unix_ms: UnixMillis,
+    },
+    StaleDesiredReadSequence {
+        node_id: Id,
+        agent_session_epoch: Epoch,
+        presented_request_sequence: Sequence,
+        last_request_sequence: Sequence,
+    },
+    WrongDesiredReadSequence {
+        node_id: Id,
+        agent_session_epoch: Epoch,
+        expected_request_sequence: Sequence,
+        presented_request_sequence: Sequence,
+    },
+    DesiredReadInProgress {
+        node_id: Id,
+        agent_session_epoch: Epoch,
+        request_sequence: Sequence,
+        read_position: Sequence,
+        expires_at_unix_ms: UnixMillis,
+    },
+    AssignedSetLimitExceeded {
+        node_id: Id,
+        limit: AssignedSetLimit,
+        maximum: WireU64,
+        observed_at_least: WireU64,
+    },
+    MissingInventoryReadPosition {
+        node_id: Id,
+        agent_session_epoch: Epoch,
+    },
+    StaleInventoryReadPosition {
+        node_id: Id,
+        agent_session_epoch: Epoch,
+        presented_read_position: Sequence,
+        current_read_position: Sequence,
+    },
+    WrongInventoryReadPosition {
+        node_id: Id,
+        agent_session_epoch: Epoch,
+        current_read_position: Sequence,
+        presented_read_position: Sequence,
+    },
+    InventoryReadPositionExpired {
+        node_id: Id,
+        agent_session_epoch: Epoch,
+        read_position: Sequence,
+        expires_at_unix_ms: UnixMillis,
+        server_time_unix_ms: UnixMillis,
+    },
+    InventoryReadPositionConsumed {
+        node_id: Id,
+        agent_session_epoch: Epoch,
+        read_position: Sequence,
+        accepted_observation_id: RandomId128,
+        accepted_heartbeat_sequence: Sequence,
+    },
+    AssignedSetChanged {
+        node_id: Id,
+        agent_session_epoch: Epoch,
+        read_position: Sequence,
+    },
+    IncompleteAssignedInventory {
+        node_id: Id,
+        agent_session_epoch: Epoch,
+        read_position: Sequence,
+        missing_cat_id: Id,
+    },
+    AssignedRuntimeBindingMismatch {
+        node_id: Id,
+        agent_session_epoch: Epoch,
+        read_position: Sequence,
+        cat_id: Id,
+        expected: AppliedDesiredEvidence,
+        presented: Option<AppliedDesiredEvidence>,
+    },
+    MissingInventoryAttestation {
+        node_id: Id,
+        agent_session_epoch: Epoch,
+    },
+    StaleInventoryEpoch {
+        node_id: Id,
+        agent_session_epoch: Epoch,
+        presented_inventory_epoch: Epoch,
+        current_inventory_epoch: Epoch,
+    },
+    WrongInventoryEpoch {
+        node_id: Id,
+        agent_session_epoch: Epoch,
+        expected_inventory_epoch: Epoch,
+        presented_inventory_epoch: Epoch,
+    },
+    PartialCatNotInFullInventory {
+        node_id: Id,
+        agent_session_epoch: Epoch,
+        inventory_epoch: Epoch,
+        cat_id: Id,
     },
     StaleRevision {
         cat_id: Id,
@@ -1823,10 +2010,14 @@ pub enum ContractName {
     AgentSession,
     GuestRuntimeProfileReceipt,
     AdmissionInventoryAttestation,
+    DesiredReadRequest,
+    DesiredReadSnapshot,
     DesiredRuntimeSpec,
     RuntimeCheckpoint,
     NodeCleanupCheckpoint,
     NodeObservation,
+    ObservationAcceptance,
+    RuntimeSpineError,
     Operation,
     ContractError,
 }

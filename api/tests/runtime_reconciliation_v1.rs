@@ -27,6 +27,12 @@ const NODE_CLEANUP_WIRE: &str = r#"{"cleanup":{"desired_read_position":15,"inven
 const VOLUME_CLEANUP_WIRE: &str = r#"{"desired_read_position":15,"inventory_epoch":5,"inventory_read_position":13,"inventory_session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"target":{"attachment_epoch":8,"attachment_id":"att_01","kind":"volume","volume_id":"vol_root"},"volume_release":{"disposition":{"kind":"detach_retained"},"generation":5,"release_transition_id":"acacacacacacacacacacacacacacacac"}}"#;
 
 const CONTRACT_ERROR_WIRE: &str = r#"{"error":{"accepted_observation_id":"10101010101010101010101010101010","agent_session_epoch":2,"code":"observation_sequence_conflict","heartbeat_sequence":19,"node_id":"node_a","presented_observation_id":"20202020202020202020202020202020"},"message":"same sequence carried a different observation","version":1}"#;
+const DESIRED_READ_REQUEST_WIRE: &str = r#"{"request_sequence":1,"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
+const EMPTY_DESIRED_READ_SNAPSHOT_WIRE: &str = r#"{"desired_specs":[],"expires_at_unix_ms":1720000030000,"issued_at_unix_ms":1720000000000,"read_position":12,"request_sequence":1,"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
+const OBSERVATION_ACCEPTANCE_WIRE: &str = r#"{"accepted_at_unix_ms":1720000005000,"heartbeat_sequence":9,"inventory":{"attestation":{"accepted_at_unix_ms":1720000005000,"agent_session_epoch":2,"inventory_digest":"sha256:12c19ac927b853c8f66f6dac52d448d6f2e797925527a0c606c7692b6f714e05","inventory_epoch":4,"inventory_read_position":12,"node_id":"node_a","version":1},"kind":"full"},"lease_deadline_unix_ms":1720000065000,"observation_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
+const MULTI_TERMINAL_CONDITIONS_WIRE: &str = r#"[{"kind":"ready","reason":{"kind":"postcondition_satisfied","target":"running"}},{"kind":"precondition_failed","reason":{"kind":"must_be_cold","observed_state":"running"}},{"kind":"precondition_failed","reason":{"kind":"placement_rejected","node_id":"node_a","placement_epoch":3,"reason":"insufficient_memory"}},{"kind":"quarantined","reason":{"kind":"checkpoint_corrupt","raw_content_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]"#;
+const SELECTED_TERMINAL_FAILURE_WIRE: &str =
+    r#"{"kind":"precondition_failed","reason":{"kind":"must_be_cold","observed_state":"running"}}"#;
 
 fn desired_wire(claim: &str) -> Vec<u8> {
     let mut value: serde_json::Value = serde_json::from_str(DESIRED_DIGEST_INPUT).unwrap();
@@ -849,6 +855,109 @@ fn fixed_non_digest_vectors_decode_exactly() {
         "same sequence carried a different observation"
     );
     assert_eq!(canonical_json(&error), CONTRACT_ERROR_WIRE.as_bytes());
+}
+
+#[test]
+fn a20_fixed_wire_vectors_round_trip_exactly() {
+    use sha2::{Digest, Sha256};
+
+    let request = decode_desired_read_request(DESIRED_READ_REQUEST_WIRE.as_bytes()).unwrap();
+    assert_eq!(
+        encode_desired_read_request(&request).unwrap(),
+        DESIRED_READ_REQUEST_WIRE.as_bytes()
+    );
+    assert_eq!(
+        hex::encode(Sha256::digest(DESIRED_READ_REQUEST_WIRE.as_bytes())),
+        "4e231231b83a31f2731a0a95724d883020084d0239f58ba1e615083072f36245"
+    );
+
+    let snapshot =
+        decode_desired_read_snapshot(EMPTY_DESIRED_READ_SNAPSHOT_WIRE.as_bytes()).unwrap();
+    assert_eq!(
+        encode_desired_read_snapshot(&snapshot).unwrap(),
+        EMPTY_DESIRED_READ_SNAPSHOT_WIRE.as_bytes()
+    );
+    assert_eq!(
+        hex::encode(Sha256::digest(EMPTY_DESIRED_READ_SNAPSHOT_WIRE.as_bytes())),
+        "5e71eabff38019ccb7ff142593f07261de677547da3b2882163886578c21c00d"
+    );
+
+    let acceptance = decode_observation_acceptance(OBSERVATION_ACCEPTANCE_WIRE.as_bytes()).unwrap();
+    assert_eq!(
+        encode_observation_acceptance(&acceptance).unwrap(),
+        OBSERVATION_ACCEPTANCE_WIRE.as_bytes()
+    );
+    assert_eq!(
+        hex::encode(Sha256::digest(OBSERVATION_ACCEPTANCE_WIRE.as_bytes())),
+        "a67ae8fbd6adf6f1ba57d6c5027c75b7d412dd5d04ad27756aa6522e27eba086"
+    );
+
+    let conditions: Vec<Condition> = serde_json::from_str(MULTI_TERMINAL_CONDITIONS_WIRE).unwrap();
+    assert_eq!(
+        canonical_json(&conditions),
+        MULTI_TERMINAL_CONDITIONS_WIRE.as_bytes()
+    );
+    assert_eq!(MULTI_TERMINAL_CONDITIONS_WIRE.len(), 469);
+    assert_eq!(
+        hex::encode(Sha256::digest(MULTI_TERMINAL_CONDITIONS_WIRE.as_bytes())),
+        "5c3ee698b8e2c2f113edac24c1213b765eec474f740ad233fd9f81f77851c7dd"
+    );
+    let selected = conditions.iter().find_map(|condition| match condition {
+        Condition::PreconditionFailed { reason } => Some(OperationFailure::PreconditionFailed {
+            reason: reason.clone(),
+        }),
+        Condition::Quarantined { reason } => Some(OperationFailure::Quarantined {
+            reason: Box::new(reason.clone()),
+        }),
+        _ => None,
+    });
+    assert_eq!(
+        canonical_json(&selected.unwrap()),
+        SELECTED_TERMINAL_FAILURE_WIRE.as_bytes()
+    );
+    assert_eq!(SELECTED_TERMINAL_FAILURE_WIRE.len(), 90);
+    assert_eq!(
+        hex::encode(Sha256::digest(SELECTED_TERMINAL_FAILURE_WIRE.as_bytes())),
+        "02f0c1a22771e9f653526233f827a978f55f258a8bf7528101b9d03c96fd595d"
+    );
+}
+
+#[test]
+fn a20_nested_contract_failures_keep_their_exact_rebased_pointer() {
+    let request = decode_desired_read_request(DESIRED_READ_REQUEST_WIRE.as_bytes()).unwrap();
+    let mut desired = decode_desired_runtime_spec(&desired_wire(SPEC_DIGEST)).unwrap();
+    desired.spec_digest = Sha256Digest::new(ZERO_DIGEST).unwrap();
+    let snapshot = DesiredReadSnapshot {
+        version: ContractVersion::V1,
+        session: request.session,
+        request_sequence: Sequence::new(1).unwrap(),
+        read_position: Sequence::new(1).unwrap(),
+        issued_at_unix_ms: UnixMillis::new(1).unwrap(),
+        expires_at_unix_ms: UnixMillis::new(2).unwrap(),
+        desired_specs: vec![desired],
+    };
+    let error = encode_desired_read_snapshot(&snapshot).unwrap_err();
+    assert_eq!(malformed(&error).0.as_str(), "/desired_specs/0/spec_digest");
+
+    let invalid_nested = ContractError {
+        version: ContractVersion::V1,
+        error: Box::new(ContractErrorDetail::WrongDesiredReadSequence {
+            node_id: Id::new("node_a").unwrap(),
+            agent_session_epoch: Epoch::new(1).unwrap(),
+            expected_request_sequence: Sequence::new(2).unwrap(),
+            presented_request_sequence: Sequence::new(1).unwrap(),
+        }),
+        message: "not a wrong next sequence".to_owned(),
+    };
+    let envelope = RuntimeSpineError {
+        version: ContractVersion::V1,
+        error: Box::new(RuntimeSpineErrorDetail::ContractError {
+            contract_error: invalid_nested,
+        }),
+        message: "invalid nested error".to_owned(),
+    };
+    let error = encode_runtime_spine_error(&envelope).unwrap_err();
+    assert_eq!(malformed(&error).0.as_str(), "/error/contract_error/error");
 }
 
 #[test]

@@ -14,10 +14,14 @@ pub const AGENT_REGISTRATION_ATTEMPT_MAX_WIRE_BYTES: usize = 16_384;
 pub const AGENT_SESSION_MAX_WIRE_BYTES: usize = 16_384;
 pub const GUEST_RUNTIME_PROFILE_RECEIPT_MAX_WIRE_BYTES: usize = 4_096;
 pub const ADMISSION_INVENTORY_ATTESTATION_MAX_WIRE_BYTES: usize = 16_384;
+pub const DESIRED_READ_REQUEST_MAX_WIRE_BYTES: usize = 16_384;
+pub const DESIRED_READ_SNAPSHOT_MAX_WIRE_BYTES: usize = 16_777_216;
 pub const DESIRED_RUNTIME_SPEC_MAX_WIRE_BYTES: usize = 1_048_576;
 pub const RUNTIME_CHECKPOINT_MAX_WIRE_BYTES: usize = 4_194_304;
 pub const NODE_CLEANUP_CHECKPOINT_MAX_WIRE_BYTES: usize = 65_536;
 pub const NODE_OBSERVATION_MAX_WIRE_BYTES: usize = 8_388_608;
+pub const OBSERVATION_ACCEPTANCE_MAX_WIRE_BYTES: usize = 16_384;
+pub const RUNTIME_SPINE_ERROR_MAX_WIRE_BYTES: usize = 20_480;
 pub const OPERATION_MAX_WIRE_BYTES: usize = 65_536;
 pub const CONTRACT_ERROR_MAX_WIRE_BYTES: usize = 16_384;
 pub const PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES: usize = 4_096;
@@ -3282,10 +3286,14 @@ fn contract_name_schema() -> Schema {
         "agent_session",
         "guest_runtime_profile_receipt",
         "admission_inventory_attestation",
+        "desired_read_request",
+        "desired_read_snapshot",
         "desired_runtime_spec",
         "runtime_checkpoint",
         "node_cleanup_checkpoint",
         "node_observation",
+        "observation_acceptance",
+        "runtime_spine_error",
         "operation",
         "contract_error",
     ])
@@ -3305,6 +3313,7 @@ fn contract_error_detail_schema() -> Schema {
     union(
         "code",
         vec![
+            variant("missing_agent_session", vec![field("node_id", id())]),
             variant(
                 "stale_session",
                 vec![
@@ -3354,6 +3363,159 @@ fn contract_error_detail_schema() -> Schema {
                     field("heartbeat_sequence", sequence()),
                     field("accepted_observation_id", random_id()),
                     field("presented_observation_id", random_id()),
+                ],
+            ),
+            variant(
+                "session_expired",
+                vec![
+                    field("node_id", id()),
+                    field("agent_session_epoch", epoch()),
+                    field("lease_deadline_unix_ms", wire_u64()),
+                    field("server_time_unix_ms", wire_u64()),
+                ],
+            ),
+            variant(
+                "stale_desired_read_sequence",
+                vec![
+                    field("node_id", id()),
+                    field("agent_session_epoch", epoch()),
+                    field("presented_request_sequence", sequence()),
+                    field("last_request_sequence", sequence()),
+                ],
+            ),
+            variant(
+                "wrong_desired_read_sequence",
+                vec![
+                    field("node_id", id()),
+                    field("agent_session_epoch", epoch()),
+                    field("expected_request_sequence", sequence()),
+                    field("presented_request_sequence", sequence()),
+                ],
+            ),
+            variant(
+                "desired_read_in_progress",
+                vec![
+                    field("node_id", id()),
+                    field("agent_session_epoch", epoch()),
+                    field("request_sequence", sequence()),
+                    field("read_position", sequence()),
+                    field("expires_at_unix_ms", wire_u64()),
+                ],
+            ),
+            variant(
+                "assigned_set_limit_exceeded",
+                vec![
+                    field("node_id", id()),
+                    field("limit", closed(&["desired_specs", "wire_bytes"])),
+                    field("maximum", wire_u64()),
+                    field("observed_at_least", wire_u64()),
+                ],
+            ),
+            variant(
+                "missing_inventory_read_position",
+                vec![
+                    field("node_id", id()),
+                    field("agent_session_epoch", epoch()),
+                ],
+            ),
+            variant(
+                "stale_inventory_read_position",
+                vec![
+                    field("node_id", id()),
+                    field("agent_session_epoch", epoch()),
+                    field("presented_read_position", sequence()),
+                    field("current_read_position", sequence()),
+                ],
+            ),
+            variant(
+                "wrong_inventory_read_position",
+                vec![
+                    field("node_id", id()),
+                    field("agent_session_epoch", epoch()),
+                    field("current_read_position", sequence()),
+                    field("presented_read_position", sequence()),
+                ],
+            ),
+            variant(
+                "inventory_read_position_expired",
+                vec![
+                    field("node_id", id()),
+                    field("agent_session_epoch", epoch()),
+                    field("read_position", sequence()),
+                    field("expires_at_unix_ms", wire_u64()),
+                    field("server_time_unix_ms", wire_u64()),
+                ],
+            ),
+            variant(
+                "inventory_read_position_consumed",
+                vec![
+                    field("node_id", id()),
+                    field("agent_session_epoch", epoch()),
+                    field("read_position", sequence()),
+                    field("accepted_observation_id", random_id()),
+                    field("accepted_heartbeat_sequence", sequence()),
+                ],
+            ),
+            variant(
+                "assigned_set_changed",
+                vec![
+                    field("node_id", id()),
+                    field("agent_session_epoch", epoch()),
+                    field("read_position", sequence()),
+                ],
+            ),
+            variant(
+                "incomplete_assigned_inventory",
+                vec![
+                    field("node_id", id()),
+                    field("agent_session_epoch", epoch()),
+                    field("read_position", sequence()),
+                    field("missing_cat_id", id()),
+                ],
+            ),
+            variant(
+                "assigned_runtime_binding_mismatch",
+                vec![
+                    field("node_id", id()),
+                    field("agent_session_epoch", epoch()),
+                    field("read_position", sequence()),
+                    field("cat_id", id()),
+                    field("expected", applied_desired_schema()),
+                    field("presented", nullable(applied_desired_schema())),
+                ],
+            ),
+            variant(
+                "missing_inventory_attestation",
+                vec![
+                    field("node_id", id()),
+                    field("agent_session_epoch", epoch()),
+                ],
+            ),
+            variant(
+                "stale_inventory_epoch",
+                vec![
+                    field("node_id", id()),
+                    field("agent_session_epoch", epoch()),
+                    field("presented_inventory_epoch", epoch()),
+                    field("current_inventory_epoch", epoch()),
+                ],
+            ),
+            variant(
+                "wrong_inventory_epoch",
+                vec![
+                    field("node_id", id()),
+                    field("agent_session_epoch", epoch()),
+                    field("expected_inventory_epoch", epoch()),
+                    field("presented_inventory_epoch", epoch()),
+                ],
+            ),
+            variant(
+                "partial_cat_not_in_full_inventory",
+                vec![
+                    field("node_id", id()),
+                    field("agent_session_epoch", epoch()),
+                    field("inventory_epoch", epoch()),
+                    field("cat_id", id()),
                 ],
             ),
             variant(
@@ -3512,6 +3674,91 @@ fn admission_attestation_schema() -> Schema {
     ])
 }
 
+fn desired_read_request_schema() -> Schema {
+    object(vec![
+        field("version", version()),
+        field("session", session_binding_schema()),
+        field("request_sequence", sequence()),
+    ])
+}
+
+fn desired_read_snapshot_schema() -> Schema {
+    object(vec![
+        field("version", version()),
+        field("session", session_binding_schema()),
+        field("request_sequence", sequence()),
+        field("read_position", sequence()),
+        field("issued_at_unix_ms", wire_u64()),
+        field("expires_at_unix_ms", wire_u64()),
+        field("desired_specs", array(desired_runtime_spec_schema(), 1024)),
+    ])
+}
+
+fn observation_inventory_acceptance_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant(
+                "full",
+                vec![field("attestation", admission_attestation_schema())],
+            ),
+            variant("partial", vec![field("inventory_epoch", epoch())]),
+        ],
+    )
+}
+
+fn observation_acceptance_schema() -> Schema {
+    object(vec![
+        field("version", version()),
+        field("session", session_binding_schema()),
+        field("observation_id", random_id()),
+        field("heartbeat_sequence", sequence()),
+        field("accepted_at_unix_ms", wire_u64()),
+        field("lease_deadline_unix_ms", wire_u64()),
+        field("inventory", observation_inventory_acceptance_schema()),
+    ])
+}
+
+fn runtime_spine_error_detail_schema() -> Schema {
+    union(
+        "code",
+        vec![
+            variant("authentication_failed", vec![]),
+            variant("identity_not_eligible", vec![]),
+            variant(
+                "http_request_rejected",
+                vec![field(
+                    "problem",
+                    closed(&[
+                        "method_not_allowed",
+                        "query_not_allowed",
+                        "content_type_not_allowed",
+                        "content_encoding_not_allowed",
+                        "authorization_not_allowed",
+                        "accept_not_allowed",
+                        "semantic_header_not_allowed",
+                    ]),
+                )],
+            ),
+            variant(
+                "contract_error",
+                vec![field("contract_error", contract_error_schema())],
+            ),
+            variant("node_request_in_flight", vec![]),
+            variant("temporarily_unavailable", vec![]),
+            variant("internal", vec![]),
+        ],
+    )
+}
+
+fn runtime_spine_error_schema() -> Schema {
+    object(vec![
+        field("version", version()),
+        field("error", runtime_spine_error_detail_schema()),
+        field("message", string(StringRule::Message)),
+    ])
+}
+
 fn node_cleanup_checkpoint_schema() -> Schema {
     object(vec![
         field("version", version()),
@@ -3530,11 +3777,16 @@ static AGENT_SESSION_SCHEMA: LazyLock<Schema> = LazyLock::new(agent_session_sche
 static GUEST_RUNTIME_PROFILE_RECEIPT_SCHEMA: LazyLock<Schema> =
     LazyLock::new(guest_runtime_profile_receipt_schema);
 static ADMISSION_ATTESTATION_SCHEMA: LazyLock<Schema> = LazyLock::new(admission_attestation_schema);
+static DESIRED_READ_REQUEST_SCHEMA: LazyLock<Schema> = LazyLock::new(desired_read_request_schema);
+static DESIRED_READ_SNAPSHOT_SCHEMA: LazyLock<Schema> = LazyLock::new(desired_read_snapshot_schema);
 static DESIRED_RUNTIME_SPEC_SCHEMA: LazyLock<Schema> = LazyLock::new(desired_runtime_spec_schema);
 static RUNTIME_CHECKPOINT_SCHEMA: LazyLock<Schema> = LazyLock::new(runtime_checkpoint_schema);
 static NODE_CLEANUP_CHECKPOINT_SCHEMA: LazyLock<Schema> =
     LazyLock::new(node_cleanup_checkpoint_schema);
 static NODE_OBSERVATION_SCHEMA: LazyLock<Schema> = LazyLock::new(node_observation_schema);
+static OBSERVATION_ACCEPTANCE_SCHEMA: LazyLock<Schema> =
+    LazyLock::new(observation_acceptance_schema);
+static RUNTIME_SPINE_ERROR_SCHEMA: LazyLock<Schema> = LazyLock::new(runtime_spine_error_schema);
 static OPERATION_SCHEMA: LazyLock<Schema> = LazyLock::new(operation_schema);
 static CONTRACT_ERROR_SCHEMA: LazyLock<Schema> = LazyLock::new(contract_error_schema);
 static PROVISION_ROOT_IMAGE_REQUEST_SCHEMA: LazyLock<Schema> =
@@ -3758,6 +4010,26 @@ pub fn decode_admission_inventory_attestation(
     )
 }
 
+pub fn decode_desired_read_request(bytes: &[u8]) -> Result<DesiredReadRequest, ContractError> {
+    decode(
+        bytes,
+        ContractName::DesiredReadRequest,
+        DESIRED_READ_REQUEST_MAX_WIRE_BYTES,
+        &DESIRED_READ_REQUEST_SCHEMA,
+        |_| Ok(()),
+    )
+}
+
+pub fn decode_desired_read_snapshot(bytes: &[u8]) -> Result<DesiredReadSnapshot, ContractError> {
+    decode(
+        bytes,
+        ContractName::DesiredReadSnapshot,
+        DESIRED_READ_SNAPSHOT_MAX_WIRE_BYTES,
+        &DESIRED_READ_SNAPSHOT_SCHEMA,
+        validate_desired_read_snapshot,
+    )
+}
+
 pub fn decode_desired_runtime_spec(bytes: &[u8]) -> Result<DesiredRuntimeSpec, ContractError> {
     decode(
         bytes,
@@ -3797,6 +4069,26 @@ pub fn decode_node_observation(bytes: &[u8]) -> Result<NodeObservation, Contract
         NODE_OBSERVATION_MAX_WIRE_BYTES,
         &NODE_OBSERVATION_SCHEMA,
         |value| validate_node_observation(value, true),
+    )
+}
+
+pub fn decode_observation_acceptance(bytes: &[u8]) -> Result<ObservationAcceptance, ContractError> {
+    decode(
+        bytes,
+        ContractName::ObservationAcceptance,
+        OBSERVATION_ACCEPTANCE_MAX_WIRE_BYTES,
+        &OBSERVATION_ACCEPTANCE_SCHEMA,
+        validate_observation_acceptance,
+    )
+}
+
+pub fn decode_runtime_spine_error(bytes: &[u8]) -> Result<RuntimeSpineError, ContractError> {
+    decode(
+        bytes,
+        ContractName::RuntimeSpineError,
+        RUNTIME_SPINE_ERROR_MAX_WIRE_BYTES,
+        &RUNTIME_SPINE_ERROR_SCHEMA,
+        validate_runtime_spine_error,
     )
 }
 
@@ -3858,6 +4150,22 @@ pub fn encode_admission_inventory_attestation(
     )
 }
 
+pub fn encode_desired_read_request(value: &DesiredReadRequest) -> Result<Vec<u8>, ContractError> {
+    encode(
+        value,
+        ContractName::DesiredReadRequest,
+        decode_desired_read_request,
+    )
+}
+
+pub fn encode_desired_read_snapshot(value: &DesiredReadSnapshot) -> Result<Vec<u8>, ContractError> {
+    encode(
+        value,
+        ContractName::DesiredReadSnapshot,
+        decode_desired_read_snapshot,
+    )
+}
+
 pub fn encode_desired_runtime_spec(value: &DesiredRuntimeSpec) -> Result<Vec<u8>, ContractError> {
     encode(
         value,
@@ -3892,6 +4200,24 @@ pub fn encode_node_observation(value: &NodeObservation) -> Result<Vec<u8>, Contr
     )
 }
 
+pub fn encode_observation_acceptance(
+    value: &ObservationAcceptance,
+) -> Result<Vec<u8>, ContractError> {
+    encode(
+        value,
+        ContractName::ObservationAcceptance,
+        decode_observation_acceptance,
+    )
+}
+
+pub fn encode_runtime_spine_error(value: &RuntimeSpineError) -> Result<Vec<u8>, ContractError> {
+    encode(
+        value,
+        ContractName::RuntimeSpineError,
+        decode_runtime_spine_error,
+    )
+}
+
 pub fn encode_operation(value: &Operation) -> Result<Vec<u8>, ContractError> {
     encode(value, ContractName::Operation, decode_operation)
 }
@@ -3914,6 +4240,119 @@ pub(crate) fn validate_key_ring(loaded_kids: &[KeyId]) -> Result<(), ContractErr
         ContractName::NodeObservation,
         &[PathSegment::Key("loaded_kids".to_owned())],
     )
+}
+
+fn validate_desired_read_snapshot(snapshot: &DesiredReadSnapshot) -> Result<(), ContractError> {
+    let contract = ContractName::DesiredReadSnapshot;
+    let specs_path = path(&["desired_specs"]);
+    let mut candidates = Vec::new();
+    collect_unique_order(
+        &snapshot.desired_specs,
+        &specs_path,
+        |spec| spec.cat_id.as_str().as_bytes().to_vec(),
+        &mut candidates,
+    );
+    for (index, spec) in snapshot.desired_specs.iter().enumerate() {
+        if let Err(error) = validate_desired_runtime_spec(spec, true) {
+            candidates.push(rebase_contract_candidate(
+                &indexed(&specs_path, index),
+                &error,
+            ));
+        }
+    }
+    if snapshot.issued_at_unix_ms.get() >= snapshot.expires_at_unix_ms.get() {
+        candidates.push(Candidate::at(&[], MalformedProblem::InvalidValue));
+    }
+    if let Some(candidate) = choose(candidates) {
+        return Err(malformed(contract, candidate));
+    }
+    Ok(())
+}
+
+fn validate_observation_acceptance(
+    acceptance: &ObservationAcceptance,
+) -> Result<(), ContractError> {
+    let contract = ContractName::ObservationAcceptance;
+    let mut candidates = Vec::new();
+    if acceptance.accepted_at_unix_ms.get() >= acceptance.lease_deadline_unix_ms.get() {
+        candidates.push(Candidate::at(&[], MalformedProblem::InvalidValue));
+    }
+    if let ObservationInventoryAcceptance::Full { attestation } = &acceptance.inventory {
+        if attestation.node_id != acceptance.session.node_id
+            || attestation.agent_session_epoch != acceptance.session.agent_session_epoch
+            || attestation.accepted_at_unix_ms != acceptance.accepted_at_unix_ms
+        {
+            candidates.push(Candidate::at(
+                &path(&["inventory"]),
+                MalformedProblem::InvalidValue,
+            ));
+        }
+    }
+    if let Some(candidate) = choose(candidates) {
+        return Err(malformed(contract, candidate));
+    }
+    Ok(())
+}
+
+fn validate_runtime_spine_error(error: &RuntimeSpineError) -> Result<(), ContractError> {
+    if let RuntimeSpineErrorDetail::ContractError { contract_error } = error.error.as_ref() {
+        validate_contract_error(contract_error).map_err(|nested| {
+            malformed(
+                ContractName::RuntimeSpineError,
+                rebase_contract_candidate(&path(&["error", "contract_error"]), &nested),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn rebase_contract_candidate(prefix: &[PathSegment], error: &ContractError) -> Candidate {
+    let (pointer, problem) = match error.error.as_ref() {
+        ContractErrorDetail::MalformedPayload {
+            json_pointer,
+            problem,
+            ..
+        } => (json_pointer.as_str(), *problem),
+        _ => return Candidate::at(prefix, MalformedProblem::InvalidValue),
+    };
+    let Some(suffix) = parse_rendered_pointer(pointer) else {
+        return Candidate::at(prefix, MalformedProblem::InvalidValue);
+    };
+    let mut path = prefix.to_vec();
+    path.extend(suffix);
+    Candidate::at(&path, problem)
+}
+
+fn parse_rendered_pointer(pointer: &str) -> Option<Vec<PathSegment>> {
+    if pointer.is_empty() {
+        return Some(Vec::new());
+    }
+    if !pointer.starts_with('/') {
+        return None;
+    }
+    pointer[1..]
+        .split('/')
+        .map(|component| {
+            let mut decoded = String::new();
+            let mut characters = component.chars();
+            while let Some(character) = characters.next() {
+                if character != '~' {
+                    decoded.push(character);
+                    continue;
+                }
+                match characters.next()? {
+                    '0' => decoded.push('~'),
+                    '1' => decoded.push('/'),
+                    _ => return None,
+                }
+            }
+            if !decoded.is_empty() && decoded.bytes().all(|byte| byte.is_ascii_digit()) {
+                decoded.parse::<usize>().ok().map(PathSegment::Index)
+            } else {
+                Some(PathSegment::Key(decoded))
+            }
+        })
+        .collect()
 }
 
 fn validate_desired_runtime_spec(
@@ -4443,6 +4882,64 @@ fn validate_contract_error(error: &ContractError) -> Result<(), ContractError> {
             last_accepted_heartbeat_sequence,
             ..
         } => presented_heartbeat_sequence < last_accepted_heartbeat_sequence,
+        ContractErrorDetail::SessionExpired {
+            lease_deadline_unix_ms,
+            server_time_unix_ms,
+            ..
+        } => server_time_unix_ms >= lease_deadline_unix_ms,
+        ContractErrorDetail::StaleDesiredReadSequence {
+            presented_request_sequence,
+            last_request_sequence,
+            ..
+        } => presented_request_sequence < last_request_sequence,
+        ContractErrorDetail::WrongDesiredReadSequence {
+            expected_request_sequence,
+            presented_request_sequence,
+            ..
+        } => presented_request_sequence > expected_request_sequence,
+        ContractErrorDetail::AssignedSetLimitExceeded {
+            limit,
+            maximum,
+            observed_at_least,
+            ..
+        } => match limit {
+            AssignedSetLimit::DesiredSpecs => {
+                maximum.get() == 1024 && observed_at_least.get() == 1025
+            }
+            AssignedSetLimit::WireBytes => {
+                maximum.get() == 16_777_216 && observed_at_least.get() == 16_777_217
+            }
+        },
+        ContractErrorDetail::StaleInventoryReadPosition {
+            presented_read_position,
+            current_read_position,
+            ..
+        } => presented_read_position < current_read_position,
+        ContractErrorDetail::WrongInventoryReadPosition {
+            current_read_position,
+            presented_read_position,
+            ..
+        } => presented_read_position > current_read_position,
+        ContractErrorDetail::InventoryReadPositionExpired {
+            expires_at_unix_ms,
+            server_time_unix_ms,
+            ..
+        } => server_time_unix_ms >= expires_at_unix_ms,
+        ContractErrorDetail::AssignedRuntimeBindingMismatch {
+            expected,
+            presented,
+            ..
+        } => presented.as_ref() != Some(expected),
+        ContractErrorDetail::StaleInventoryEpoch {
+            presented_inventory_epoch,
+            current_inventory_epoch,
+            ..
+        } => presented_inventory_epoch <= current_inventory_epoch,
+        ContractErrorDetail::WrongInventoryEpoch {
+            expected_inventory_epoch,
+            presented_inventory_epoch,
+            ..
+        } => presented_inventory_epoch > expected_inventory_epoch,
         ContractErrorDetail::StaleRevision {
             presented_revision,
             current_revision,
