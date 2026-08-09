@@ -34,6 +34,8 @@ const CURRENT_SESSION_COLUMNS: &str = "
     node_id, record::text AS record_json, immutable_host_id, node_boot_id,
     agent_instance_id, agent_session_epoch, registration_attempt_id,
     guest_config_digest, lease_deadline_unix_ms";
+pub(super) const PROVISIONED_NODE_ID_PAGE_SIZE: usize = 64;
+const PROVISIONED_NODE_ID_QUERY_LIMIT: i64 = PROVISIONED_NODE_ID_PAGE_SIZE as i64 + 1;
 
 /// The exact identity produced by a successful per-Node authentication check.
 ///
@@ -533,6 +535,38 @@ pub(super) fn load_identity_by_node_unlocked(
         .query_opt(&sql, &[&node_id.as_str()])?
         .map(|row| decode_identity(&row))
         .transpose()
+}
+
+/// Returns at most one bounded keyset page plus one look-ahead row from the
+/// NodeIdentity authority. `state` is used only to bound the candidate scan;
+/// every returned row is still decoded and cross-checked against its complete
+/// JSON record before it can become a planner candidate.
+pub(super) fn load_provisioned_identities_after(
+    transaction: &mut Transaction<'_>,
+    after: Option<&Id>,
+) -> AuthorityTxResult<Vec<NodeIdentity>> {
+    let sql = format!(
+        "SELECT {NODE_IDENTITY_COLUMNS} FROM node_identities
+          WHERE state='provisioned'
+            AND ($1::TEXT IS NULL OR node_id > $1)
+          ORDER BY node_id
+          LIMIT $2"
+    );
+    let after = after.map(Id::as_str);
+    transaction
+        .query(&sql, &[&after, &PROVISIONED_NODE_ID_QUERY_LIMIT])?
+        .iter()
+        .map(decode_identity)
+        .map(|result| {
+            let identity = result?;
+            if identity.state != NodeIdentityState::Provisioned {
+                return Err(corrupt(
+                    "provisioned NodeIdentity page returned a non-provisioned record",
+                ));
+            }
+            Ok(identity)
+        })
+        .collect()
 }
 
 fn decode_identity(row: &Row) -> AuthorityTxResult<NodeIdentity> {

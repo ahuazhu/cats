@@ -36,7 +36,8 @@ use super::rows::{database_now, load_delete_completion_for_update, load_volume_f
 use crate::store::agent_sessions::{
     load_current_session_for_update, load_current_session_unlocked,
     load_identity_by_credential_for_update, load_identity_by_node_for_update,
-    load_identity_by_node_unlocked, renew_current_session_deadline, AuthenticatedNodeCredential,
+    load_identity_by_node_unlocked, load_provisioned_identities_after,
+    renew_current_session_deadline, AuthenticatedNodeCredential, PROVISIONED_NODE_ID_PAGE_SIZE,
 };
 use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
 use crate::store::{Result, Store};
@@ -46,6 +47,14 @@ pub(crate) const DESIRED_READ_TTL_MS: u64 = 30_000;
 pub(crate) const PLACEMENT_INVENTORY_MAX_AGE_MS: u64 = 60_000;
 pub(crate) const ROUTE_CAT_OBSERVATION_MAX_AGE_MS: u64 = 30_000;
 pub(crate) const MAX_ASSIGNED_SPECS: usize = 1024;
+
+/// One process-local planner page. The page size bounds each authority read;
+/// it is not a fleet-size, persisted, or wire-protocol limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProvisionedNodeIdPage {
+    pub(crate) node_ids: Vec<Id>,
+    pub(crate) next_after: Option<Id>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeSpineOutcome<T> {
@@ -138,6 +147,35 @@ struct AdmissionInventoryState {
 type ContextValidation<T> = AuthorityTxResult<std::result::Result<T, ContractError>>;
 
 impl Store {
+    /// Lists one bounded, stable keyset page from NodeIdentity authority.
+    ///
+    /// This is only a candidate seed: callers must load and evaluate the full
+    /// placement admission snapshot for every returned id. A change between
+    /// pages merely invalidates that plan; the selected NodeIdentity remains
+    /// the unique assigned-set coordination lock at Desired commit time.
+    pub(crate) fn list_provisioned_node_ids_after(
+        &self,
+        after: Option<&Id>,
+    ) -> Result<ProvisionedNodeIdPage> {
+        self.authority_read_snapshot(|transaction| {
+            let mut identities = load_provisioned_identities_after(transaction, after)?;
+            let has_more = identities.len() > PROVISIONED_NODE_ID_PAGE_SIZE;
+            if has_more {
+                identities.truncate(PROVISIONED_NODE_ID_PAGE_SIZE);
+            }
+            let next_after = has_more
+                .then(|| identities.last().map(|identity| identity.node_id.clone()))
+                .flatten();
+            Ok(ProvisionedNodeIdPage {
+                node_ids: identities
+                    .into_iter()
+                    .map(|identity| identity.node_id)
+                    .collect(),
+                next_after,
+            })
+        })
+    }
+
     pub(crate) fn runtime_desired_read(
         &self,
         authenticated: &AuthenticatedNodeCredential,

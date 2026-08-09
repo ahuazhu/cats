@@ -106,6 +106,20 @@ fn fixture_at(
     (store, identity, authenticated, policy, session)
 }
 
+fn numbered_identity(index: usize) -> NodeIdentity {
+    NodeIdentity {
+        version: ContractVersion::V1,
+        node_id: id(format!("node_{index:03}")),
+        immutable_host_id: id(format!("host_{index:03}")),
+        credential_id: id(format!("credential_{index:03}")),
+        credential_binding: CredentialBinding::PublicKey {
+            public_key_spki_sha256: digest(u8::try_from(index).unwrap()),
+        },
+        state_path_id: id(format!("state_path_{index:03}")),
+        state: NodeIdentityState::Provisioned,
+    }
+}
+
 fn registration_attempt(
     identity: &NodeIdentity,
     number: u128,
@@ -402,6 +416,58 @@ fn accepted<T>(outcome: RuntimeSpineOutcome<T>) -> T {
         RuntimeSpineOutcome::Accepted(value) => value,
         RuntimeSpineOutcome::Rejected(rejection) => panic!("runtime spine rejected: {rejection:?}"),
     }
+}
+
+#[test]
+fn provisioned_node_id_pages_are_bounded_and_tolerate_a_concurrent_retire() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let (first_store, existing, _, _, _) = fixture_at(&url);
+    for index in 0..65 {
+        first_store
+            .provision_node_identity(&numbered_identity(index))
+            .unwrap();
+    }
+
+    let first = first_store.list_provisioned_node_ids_after(None).unwrap();
+    assert_eq!(first.node_ids.len(), 64);
+    assert_eq!(first.node_ids.first(), Some(&id("node_000")));
+    assert_eq!(first.node_ids.last(), Some(&id("node_063")));
+    assert_eq!(first.next_after, Some(id("node_063")));
+    let exact = first_store
+        .list_provisioned_node_ids_after(Some(&id("node_001")))
+        .unwrap();
+    assert_eq!(exact.node_ids.len(), 64);
+    assert_eq!(exact.node_ids.first(), Some(&id("node_002")));
+    assert_eq!(exact.node_ids.last(), Some(&existing.node_id));
+    assert_eq!(exact.next_after, None);
+
+    // Each page is an intentionally invalidatable read plan. A second Store
+    // retiring the look-ahead identity between snapshots removes it from the
+    // next page without duplicating or reordering the remaining candidate.
+    let second_store = Store::connect(&url, None).unwrap();
+    second_store.retire_node_identity(&id("node_064")).unwrap();
+    let second = first_store
+        .list_provisioned_node_ids_after(first.next_after.as_ref())
+        .unwrap();
+    assert_eq!(second.node_ids, vec![existing.node_id]);
+    assert_eq!(second.next_after, None);
+}
+
+#[test]
+fn provisioned_node_id_page_strictly_decodes_every_returned_projection() {
+    let (store, identity, _, _, _) = fixture();
+    store
+        .with(|client| {
+            client.execute(
+                "UPDATE node_identities
+                    SET record=jsonb_set(record, '{immutable_host_id}', '\"corrupt_host\"')
+                  WHERE node_id=$1",
+                &[&identity.node_id.as_str()],
+            )
+        })
+        .unwrap();
+
+    assert!(store.list_provisioned_node_ids_after(None).is_err());
 }
 
 #[test]
