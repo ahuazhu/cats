@@ -45,8 +45,8 @@ DiskSnapshotRecord`；事务跳过自己不涉及的节点，同类
 PostgreSQL transaction-scoped reservation，再读结果；它不能先锁资源，也不落持久Pending。这样同一
 key即使携带不同资源也不会分别先锁不同Volume。normal acquire只锁`VolumeRecord`，因此它与snapshot
 mutation或begin-delete仍只能有一方先提交。production Runtime HTTP owner不能直接暴露该primitive；它必须先按
-[Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)取得NodeIdentity、current AgentSession和accepted
-inventory锁前缀，然后才进入本文的event/authorization/Volume后缀。HostFenceEvent来源的内部恢复没有API前缀；
+[Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)取得NodeIdentity、exact active credential lineage、
+current AgentSession和accepted inventory锁前缀，然后才进入本文的event/authorization/Volume后缀。HostFenceEvent来源的内部恢复没有API前缀；
 改变event eligibility或创建placement时从NodeIdentity开始，只消费已有authorization且不再读Node时从event开始。
 `CatNameLock`不是row或authority；只有会插入新Cat identity的create事务使用它。Cat create固定在API key之后
 取得它并先闭合名称分支：合法existing Cat按既有Volume→Cat→Disk→Desired→Endpoint/lookup→Operation锁序
@@ -713,14 +713,17 @@ PostgreSQL credential或表级`SELECT`。唯一边界是
 `DeleteCompletionReceipt | null`，以及由current marker/completion直接派生的最多一个
 `direct_successor_authorization`。
 
-Control先把proof绑定唯一provisioned `NodeIdentity`和其current、未过期`AgentSession`，再读取primary
+Control先把proof绑定唯一provisioned `NodeIdentity`，锁后重验并持有exact active credential lineage share lock，
+再验证其current、未过期`AgentSession`并读取primary
 authorization；只有`authorization.authorized_node_id`等于该authenticated Node才可返回任何evidence。
 authorization不存在和存在但属于其他Node必须给出同一non-enumerating unavailable结果。retired identity在
 authorization lookup前按transport普通403拒绝。授权创建后的Desired revision、placement和session变化不会
 改写`authorized_node_id`，因此同一Node在session replacement后可用新的current `SessionBinding`恢复；Control
 不得为此读取或信任可能已supersede/GC的current Desired。Host-fence内部worker不借用或伪造这条Node route。
 
-一个`REPEATABLE READ READ ONLY` PostgreSQL transaction只读一次`db_now`并返回一份不可拆分的snapshot。
+一个逻辑read-only、无domain write的PostgreSQL `REPEATABLE READ` transaction只读一次`db_now`，按
+`NodeIdentity FOR SHARE -> exact active credential lineage FOR SHARE -> current AgentSession`锁/读后返回一份
+不可拆分的snapshot；为取得前两把row lock，它不声明SQL `READ ONLY`。
 metadata adapter先strict decode并以共享projection validator验证primary，再只从其closed payload派生volume
 ID；caller不能提交volume ID、delete ID、receipt ID、successor authorization ID或预判bool。snapshot固定为：
 
@@ -1394,7 +1397,7 @@ tombstone；但只要某个Active HostFenceEvent的Consumed authorization引用�
 | release响应丢失/异payload | 相同RandomId128且完整request相同返回原result；同ID异payload Stale，旧epoch永久不能publish |
 | stale acquire晚到release之后 | expected epoch不匹配，不能重新占有volume |
 | authorization单一authority | Node只传authorization ID；两类payload都含派生时immutable `authorized_node_id`且consume caller必须匹配；锁定row中的payload/receipt是唯一权威，receipt不重复Node ID，Volume last_transition仅ID marker；不存在客户端payload、第二签名或重复receipt副本 |
-| Control-signed authorization evidence read | A19 proof绑定current provisioned NodeIdentity/AgentSession，唯一业务key为authorization ID；只有immutable `authorized_node_id`匹配可读，同一read-only snapshot只返回exact primary、derived current Volume/null、derived completion/null和current marker/completion直接引用的最多一个direct authorization；不读current Desired，不接受volume/delete/successor key，不枚举全volume历史，不返回bool或chain ledger；blockd object graph无此client |
+| Control-signed authorization evidence read | A19 proof绑定current provisioned NodeIdentity/exact active credential lineage/AgentSession，唯一业务key为authorization ID；只有immutable `authorized_node_id`匹配可读，同一RR snapshot在NodeIdentity/credential share lock下只返回exact primary、derived current Volume/null、derived completion/null和current marker/completion直接引用的最多一个direct authorization；transaction为取得row lock不声明SQL READ ONLY但零domain write；不读current Desired，不接受volume/delete/successor key，不枚举全volume历史，不返回bool或chain ledger；blockd object graph无此client |
 | authorization response-loss/current successor | takeover consume commit丢response后，分别以direct current state、合法renew/head-CAS/release、以及指向第二authorization的更大epoch current marker做正例；只有厚receipt、current marker/最多一direct successor row、epoch/head单调和closed successor全部通过才adopt；Consumed + null marker但缺same-disk restore result保持Blocked |
 | authorization response-loss/delete completion | disposable consume commit后断response，sweeper随即写exact completion并删除Volume/Disk；按原authorization ID的snapshot必须返回`current_volume=null`+唯一matching receipt并闭合；row absent但receipt缺失/错variant/错volume/delete/prior attachment/epoch/head均Blocked |
 | authorization evidence corruption/isolation | 破坏primary/current/receipt/direct任一JSON/projection、制造current+completion并存、同volume重复completion或缺少/跨volume引用都fail closed；先用已知授权正例校准查询探针，再证明wrong/retired Node、无关authorization和任何额外key不能读到其volume/receipt/auth；absent/wrong Node同类404；Node无authorization/completion raw SQL credential，Control read零write |

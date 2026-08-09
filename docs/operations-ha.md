@@ -212,11 +212,11 @@ runbook；禁止以“重启看看”跳过fence或durability proof。
    以及disposable Root两边Deleting的每个crash点；
    还要用PostgreSQL双session覆盖authorization
    首次consume与Rejoined竞争以及合法后继receipt校验；用真实PG pause双向覆盖
-   Desired INSERT/full observation的`NodeIdentity -> AgentSession -> receive/cursor`锁序；饱和A22/
+   Desired INSERT/full observation的`NodeIdentity -> credential lineage -> AgentSession -> receive/cursor`锁序；饱和A22/
    ordinary Store时保留observation lane仍续期，并在queue/running/commit三个取消点证明无
    detached late mutation。Control-signed authorization evidence read还必须覆盖consume commit丢response后的
    direct/合法current successor、sweep删row后的exact completion，以及错projection/重复receipt/跨volume
-   direct authorization的fail-closed；验证A19 proof、current provisioned identity/session、immutable
+   direct authorization的fail-closed；验证A19 proof、current provisioned identity/exact active credential lineage/session、immutable
    `authorized_node_id` isolation、combined cap/deadline/cancel，并以negative probe证明Node没有相关表的raw
    SQL credential或权限。
 2. **独立native x86_64 Linux build host**：使用现有

@@ -261,7 +261,8 @@ registration public error、session lease与release receipt路径由
 `POST /v1/internal/runtime/desired-reads`，inventory/observation接受只使用
 `POST /v1/internal/runtime/observations`；它们的事务、endpoint-local error和planner/signer freshness由
 [Runtime Inventory and Observation Spine v1](specs/runtime-inventory-observation-v1.md)冻结。两条session-bound mutation
-在`READ COMMITTED`下统一从`NodeIdentity FOR UPDATE -> current AgentSession -> receive/cursor state`
+在`READ COMMITTED`下统一从`NodeIdentity FOR UPDATE -> exact active credential lineage FOR SHARE ->
+current AgentSession -> receive/cursor state`
 开始，planner/signer仍是单一`REPEATABLE READ READ ONLY` snapshot。observation的唯一session续期点
 还使用每replica独占的有界Store worker/queue/PostgreSQL connection，不与volume/product/controller
 work共享。legacy

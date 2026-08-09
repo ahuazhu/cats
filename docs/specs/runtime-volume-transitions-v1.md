@@ -78,7 +78,9 @@ address、hostname、IMDS或shared token构造身份。
 
 固定处理顺序是：path -> method -> query -> media/semantic headers -> 合计global admission -> route-specific
 bounded body -> A19 proof -> F0 decoder -> 唯一provisioned exact-binding NodeIdentity -> 合计per-Node
-admission -> mutation的§4 transaction或evidence的§3.1 read transaction。更早失败不得读取后续事实。
+admission -> mutation的§4 transaction或evidence的§3.1 read transaction。两种transaction都必须在
+NodeIdentity lock后再次join并重验exact active credential lineage，并持有lineage `FOR SHARE`到transaction结束；
+更早失败不得读取后续事实。
 handler deadline从完整headers到达开始；mutation在commit前到期必须rollback，commit结果不明就关闭response；
 evidence到期必须取消并join read closure且不发送late response。deadline内mutation最多3次完整
 serialization/deadlock retry，evidence最多3次serialization retry；每次都从immutable decoded request重新读取
@@ -250,8 +252,11 @@ current Desired read，才可以在current context下重试mutation；同一Node
 exact route是`POST /v1/internal/runtime/volume-transition-evidence`。它使用§1的A19 proof、combined
 admission、4096-byte request cap、32768-byte success cap和5000 ms absolute deadline。proof不是授权查询
 能力：F0成功后，Control仍必须把credential绑定唯一provisioned `NodeIdentity`和body中的current
-`AgentSession`。read transaction使用一个`REPEATABLE READ READ ONLY` snapshot且只读一次`db_now`；它在
-同一snapshot中重新验证authenticated credential对应的唯一provisioned exact-binding NodeIdentity，再按§4.1/
+`AgentSession`。read transaction使用一个PostgreSQL `REPEATABLE READ` snapshot且只读一次`db_now`；为满足
+A23 credential retire/rotation barrier，它不能声明SQL `READ ONLY`，而要按`current NodeIdentity FOR SHARE ->
+exact active credential lineage FOR SHARE -> current AgentSession`锁/读并把两把share lock持有到transaction结束。
+它没有domain write、session续期或authority mutation，仍是逻辑read-only边界。transaction在同一snapshot中
+重新验证authenticated credential对应的唯一provisioned exact-binding NodeIdentity和active lineage，再按§4.1/
 Runtime §16.4.3的既有顺序验证current exact session、active-release guest digest和
 `db_now < lease_deadline`，但不要求A20 attestation，也不读取current Desired、Operation或inventory。
 
@@ -322,7 +327,8 @@ Content-Type、任何Content-Encoding、超cap、malformed/unknown body或无法
 每个request使用一个Control PostgreSQL `READ COMMITTED` mutation transaction。固定锁DAG是：
 
 ```text
-authenticated NodeIdentity
+authenticated current NodeIdentity FOR UPDATE
+-> exact active credential lineage FOR SHARE
 -> current AgentSession
 -> observation receive-state / AdmissionInventoryState
 -> HostFenceEvent（authorization需要时）
@@ -332,7 +338,7 @@ authenticated NodeIdentity
 -> DiskSnapshotRecord / immutable accepted observation
 ```
 
-同类多row按稳定ID排序。取得NodeIdentity协调锁后，transaction可以无行锁读取它保护的current
+同类多row按稳定ID排序。取得NodeIdentity协调锁并重验active credential lineage后，transaction可以无行锁读取它保护的current
 Desired以及authorization/cleanup routing hint，先证明request携带的Cat、volume、authorization和当前intent
 属于同一context；任何authenticated Node都不能用不受信的ID让Control取得另一Cat/volume/event/
 authorization的锁。这个routing read不是authority result，不用于提交；取得上述固定顺序的row锁后
@@ -346,7 +352,7 @@ full/transition必须观察新assigned set并拒绝；full先提交时，INSERT�
 attestation立即因assigned-set changed不可消费。本文transaction取得它后，current assigned
 完整Desired集合必须仍逐字段等于fresh AdmissionInventoryState cursor snapshot。
 
-共同context validation按Runtime §16.4.3执行：authenticated identity -> current exact session ->
+共同context validation按Runtime §16.4.3执行：authenticated identity -> exact active credential lineage -> current exact session ->
 current session的`guest_config_digest`逐字段等于Control启动时从A19 exact receipt批准的active release digest ->
 `db_now < lease_deadline` -> current session的complete admission attestation存在，并满足
 `accepted_at <= db_now < checked_add(accepted_at,60000)`（等于上界即stale）-> assigned
@@ -508,7 +514,7 @@ precondition/domain错误。相同stage多个action-specific候选固定按：in
 -> volume intent -> cleanup evidence -> authorization branch -> pure domain。前一个失败零写且不得读取/渲染
 后一个事实。
 
-evidence route在共同HTTP/proof/F0/identity顺序后固定为：current exact session -> active release digest ->
+evidence route在共同HTTP/proof/F0/identity顺序后固定为：exact active credential lineage -> current exact session -> active release digest ->
 session deadline -> authorization access-control predicate -> full stored-row validation -> canonical encode/cap。
 因此wrong/expired session不能探测authorization存在性，absent与wrong authorized Node不可区分；只有已经通过
 access-control的caller才可能观察stored corruption。typed evidence 404只适用于exact evidence path，未匹配path
@@ -601,7 +607,7 @@ cross-binding。
 |---|---|
 | route/admission | 两个exact POST；wrong method/query/path/media/semantic headers；mutation 16384/16385、evidence 4096/4097；proof失败不decode/查DB；两route合计global/per-Node caps、无等待queue且不占A20 observation permit；饱和A22 ordinary Store worker/queue/connection时A20保留renewal-critical lane仍可提交新sequence续期；两个deadline及queue/running/encode cancel均join、无late commit/response |
 | codecs | mutation request三variant及acquire两variant、success三variant、evidence request/success和error全部closed；missing/unknown/duplicate/noncanonical integer、wrong union field、各route cap；全部fixed vectors及两个path的proof mutation |
-| auth/session | body Node不能选credential；retired/wrong binding拒绝；missing/stale/wrong/expired session；replacement必须先fresh full才能mutation，但同authorized Node可用new current session读原authorization evidence；expired没有mutation replay或evidence例外 |
+| auth/session | body Node不能选credential；NodeIdentity锁后重验exact active lineage并持有credential share lock到transaction结束；retire/rotation先提交则旧proof零domain read/write，request先持锁则retire等其结束；retired/wrong binding拒绝；missing/stale/wrong/expired session；replacement必须先fresh full才能mutation，但同authorized Node可用new current session读原authorization evidence；expired没有mutation replay或evidence例外 |
 | routing isolation | mutation中合法Node填另一Cat/volume/authorization ID只得到current-intent mismatch，不锁、不读取后者authority payload；evidence用authorization ID+authorized Node单一predicate，absent/wrong Node逐byte同类404且不读派生row，不能提交volume/delete/successor key；NodeIdentity锁后的mutation routing hint与后row-lock reread不一致必须零写入 |
 | release binding | current session guest digest必须等于Control active exact receipt；旧release session即使其他字段匹配也零卷副作用 |
 | assigned-set lock | 真实PG双connection双向pause：Desired INSERT先锁/提交则旧cursor full/transition拒绝且零写；full先锁/提交则INSERT只能在后，旧attestation随即以assigned-set changed不可消费；所有Desired mutation、A20 mutation和transition先锁同一NodeIdentity；两Control replicas双session覆盖 |
@@ -612,7 +618,7 @@ cross-binding。
 | release/auth race | 两session按Volume锁后fresh重验；release先则derive全rollback，derive先则release exact 409零写；无auth+Unowned |
 | disposable | runtime-stopped与host-fence两basis；immutable `authorized_node_id`与HTTP caller绑定，internal fence worker不借Node route；current Deleted Root/delete ID、Disk、snapshot、stop/event、old owner/epoch/head全绑定；receipt/Volume/Disk同commit且receipt不重复Node ID；成功前不删tail |
 | corruption | 每张JSONB/projection、receipt/direct state、missing referenced row和future time逐项破坏均500/零写；evidence snapshot还覆盖错primary ID/authorized-node/variant/volume、current Volume与completion并存、同volume重复completion、marker引用缺失或direct row错volume/variant；只有access-control已命中caller可观察500，绝不返回partial或接受半postcondition |
-| authorization evidence read | 唯一业务input是authorization ID；A19 proof + current provisioned identity/session；同一RR/RO snapshot返回exact primary、derived Volume/null、derived completion/null和current marker/completion直接引用的最多一个direct authorization；无Desired lookup、volume/delete/successor key输入、全volume枚举/分页、bool或chain ledger；新session同Node成功、wrong/retired Node fail closed；已知无关authorization正例校准后证明不能读/返回其他volume/receipt/auth；Node无raw SQL credential，Control read无write且blockd composition不能取得client |
+| authorization evidence read | 唯一业务input是authorization ID；A19 proof + current provisioned identity/session；同一RR snapshot在NodeIdentity/credential share lock下返回exact primary、derived Volume/null、derived completion/null和current marker/completion直接引用的最多一个direct authorization；transaction为取得row lock不声明SQL READ ONLY，但无domain write/续期；无Desired lookup、volume/delete/successor key输入、全volume枚举/分页、bool或chain ledger；新session同Node成功、wrong/retired Node fail closed；已知无关authorization正例校准后证明不能读/返回其他volume/receipt/auth；Node无raw SQL credential，Control read无write且blockd composition不能取得client |
 | ambiguity | commit前/后断连接；同domain ID重放；current context变化后fresh rebind；normal用direct `load_volume`，authorization只用signed evidence；takeover commit丢response后允许current Volume已合法renew/head-CAS/release/更大epoch后继，仍必须由原authorization receipt + current marker/最多一direct authorization + epoch/head单调闭合；Unconsumed + exact predecessor只重放原ID，Consumed + null marker缺same-disk restore API result时必须Blocked；disposable commit丢response后sweeper已删Volume/Disk row时只凭exact completion receipt闭合；evidence EOF/invalid/oversize重读fresh snapshot，typed unavailable保持Blocked且不猜mutation未发生；plain unmatched-route 404停止自动重试；redirect、HTML、status/detail/header不匹配和malformed body全部保留checkpoint；不建HTTP result row或second grant ledger |
 | legacy negative | production route表没有legacy acquire/revoke或authorization list/GET；blockd port没有ownership mutation；Node不直接调用pure Control single-row method且没有authorization/completion table SELECT；internal handler不读shared bearer |
 
