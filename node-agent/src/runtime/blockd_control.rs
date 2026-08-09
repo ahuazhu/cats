@@ -214,29 +214,6 @@ impl NodeRuntime {
             _ => None,
         };
         let data_dir = volume_data_dir(cat_dir, &grant.disk_id);
-        let mut cmd = Command::new(&self.cfg.blockd_bin);
-        cmd.arg("--volume-id")
-            .arg(&grant.volume_id)
-            .arg("--data-dir")
-            .arg(&data_dir)
-            .arg("--attachment-id")
-            .arg(&grant.attachment_id)
-            .arg("--metadata-store-adapter")
-            .arg(&self.cfg.metadata_store.name)
-            .arg("--object-store-adapter")
-            .arg(&self.cfg.object_store.name)
-            .arg("--listen-unix")
-            .arg(&socket)
-            .arg("--create-volume-size")
-            .arg(grant.size_bytes.to_string())
-            .arg("--lease-ttl-ms")
-            .arg(self.cfg.blockd_lease_ttl_ms.to_string())
-            .arg("--max-staged-bytes")
-            .arg(self.cfg.blockd_max_staged_bytes.to_string())
-            .arg("--max-staged-packs")
-            .arg(self.cfg.blockd_max_staged_packs.to_string())
-            .arg("--max-local-bytes")
-            .arg(self.cfg.blockd_max_local_bytes.to_string());
         let control_socket = short_socket_path(
             &self.cfg.state_dir,
             cat_id,
@@ -246,36 +223,21 @@ impl NodeRuntime {
             &cat_dir.join(format!("ctl-{}.sock", grant.disk_id)),
             &control_socket,
         );
-        cmd.arg("--listen-control").arg(&control_socket);
-        if grant.durability == cats_api::resources::DiskDurability::Relaxed {
-            cmd.arg("--durability").arg("relaxed");
-        }
-        if let Some(image_id) = seed_image_id {
-            // Provision from the already-published image: one manifest GET plus a
-            // map write, no data bytes (ADR-0017). Safe unconditionally, because a
-            // volume that already has a generation is left alone.
-            cmd.arg("--seed-image-id").arg(image_id);
-        }
-        if let (Some(socket), VmmMode::CloudHypervisor(chc)) = (&vhost_user_socket, &self.cfg.vmm) {
-            cmd.arg("--listen-vhost-user")
-                .arg(socket)
-                .arg("--vhost-user-queues")
-                .arg(vhost_user_queues.to_string())
-                .arg("--vhost-user-queue-size")
-                .arg(chc.vhost_user_queue_size.to_string());
-        }
+        let mut cmd = legacy_blockd_command(LegacyBlockdCommand {
+            config: &self.cfg,
+            grant,
+            data_dir: &data_dir,
+            nbd_socket: &socket,
+            control_socket: &control_socket,
+            vhost_user_socket: vhost_user_socket.as_deref(),
+            vhost_user_queues,
+            seed_image_id,
+        });
         let log_path = blockd_log_path(cat_dir, &grant.disk_id);
         let log = std::fs::File::create(&log_path).context("create blockd log")?;
-        for option in self.cfg.metadata_store.config.to_cli() {
-            cmd.arg("--metadata-store-option").arg(option);
-        }
-        for option in self.cfg.object_store.config.to_cli() {
-            cmd.arg("--object-store-option").arg(option);
-        }
         let child = cmd
             .stdout(Stdio::null())
             .stderr(log)
-            .env_remove("CATS_CRASH_POINT")
             .spawn()
             .context("spawn cats-blockd")?;
         let mut proc = BlockdProc {
@@ -286,7 +248,7 @@ impl NodeRuntime {
             control_socket,
             grant: grant.clone(),
         };
-        self.wait_blockd_ready(&mut proc)
+        wait_blockd_ready(&mut proc)
             .with_context(|| format!("blockd for {} never became ready", grant.disk_id))?;
         #[cfg(test)]
         if let Some(probe) = &self.launch_overlap_probe {
@@ -300,32 +262,99 @@ impl NodeRuntime {
         }
         Ok(proc)
     }
+}
 
-    fn wait_blockd_ready(&self, proc: &mut BlockdProc) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            if let Ok(client) = NbdClient::connect_unix(&proc.socket) {
-                let _ = client.disconnect();
-                return Ok(());
-            }
-            if proc.child.exited()? {
-                // Quote what blockd actually said. Guessing here ("lease held or
-                // bad config?") sent an operator looking for a stale lease while
-                // the log held `connect PostgreSQL: FATAL password
-                // authentication failed`, and the wrong hypothesis was acted on.
-                let reason = blockd_failure_reason(&proc.log_path);
-                match proc.child.owned_exit_status() {
-                    Some(status) => {
-                        bail!("cats-blockd exited during startup: {status}: {reason}")
-                    }
-                    None => bail!("cats-blockd exited during startup: {reason}"),
-                }
-            }
-            if Instant::now() > deadline {
-                bail!("timed out waiting for blockd socket");
-            }
-            std::thread::sleep(Duration::from_millis(10));
+struct LegacyBlockdCommand<'a> {
+    config: &'a NodeConfig,
+    grant: &'a VolumeGrant,
+    data_dir: &'a Path,
+    nbd_socket: &'a Path,
+    control_socket: &'a Path,
+    vhost_user_socket: Option<&'a Path>,
+    vhost_user_queues: usize,
+    seed_image_id: Option<&'a str>,
+}
+
+/// Build the legacy blockd argv without starting a process. Keeping command
+/// construction at this narrow seam makes its existing behavior directly
+/// characterizable before the signed Runtime gets a separate typed launcher.
+fn legacy_blockd_command(spec: LegacyBlockdCommand<'_>) -> Command {
+    let mut cmd = Command::new(&spec.config.blockd_bin);
+    cmd.arg("--volume-id")
+        .arg(&spec.grant.volume_id)
+        .arg("--data-dir")
+        .arg(spec.data_dir)
+        .arg("--attachment-id")
+        .arg(&spec.grant.attachment_id)
+        .arg("--metadata-store-adapter")
+        .arg(&spec.config.metadata_store.name)
+        .arg("--object-store-adapter")
+        .arg(&spec.config.object_store.name)
+        .arg("--listen-unix")
+        .arg(spec.nbd_socket)
+        .arg("--create-volume-size")
+        .arg(spec.grant.size_bytes.to_string())
+        .arg("--lease-ttl-ms")
+        .arg(spec.config.blockd_lease_ttl_ms.to_string())
+        .arg("--max-staged-bytes")
+        .arg(spec.config.blockd_max_staged_bytes.to_string())
+        .arg("--max-staged-packs")
+        .arg(spec.config.blockd_max_staged_packs.to_string())
+        .arg("--max-local-bytes")
+        .arg(spec.config.blockd_max_local_bytes.to_string())
+        .arg("--listen-control")
+        .arg(spec.control_socket);
+    if spec.grant.durability == cats_api::resources::DiskDurability::Relaxed {
+        cmd.arg("--durability").arg("relaxed");
+    }
+    if let Some(image_id) = spec.seed_image_id {
+        // Provision from the already-published image: one manifest GET plus a
+        // map write, no data bytes (ADR-0017). Safe unconditionally, because a
+        // volume that already has a generation is left alone.
+        cmd.arg("--seed-image-id").arg(image_id);
+    }
+    if let (Some(socket), VmmMode::CloudHypervisor(chc)) =
+        (spec.vhost_user_socket, &spec.config.vmm)
+    {
+        cmd.arg("--listen-vhost-user")
+            .arg(socket)
+            .arg("--vhost-user-queues")
+            .arg(spec.vhost_user_queues.to_string())
+            .arg("--vhost-user-queue-size")
+            .arg(chc.vhost_user_queue_size.to_string());
+    }
+    for option in spec.config.metadata_store.config.to_cli() {
+        cmd.arg("--metadata-store-option").arg(option);
+    }
+    for option in spec.config.object_store.config.to_cli() {
+        cmd.arg("--object-store-option").arg(option);
+    }
+    cmd.env_remove("CATS_CRASH_POINT");
+    cmd
+}
+
+fn wait_blockd_ready(proc: &mut BlockdProc) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(client) = NbdClient::connect_unix(&proc.socket) {
+            let _ = client.disconnect();
+            return Ok(());
         }
+        if proc.child.exited()? {
+            // Quote what blockd actually said. Guessing here ("lease held or
+            // bad config?") sent an operator looking for a stale lease while
+            // the log held `connect PostgreSQL: FATAL password
+            // authentication failed`, and the wrong hypothesis was acted on.
+            let reason = blockd_failure_reason(&proc.log_path);
+            match proc.child.owned_exit_status() {
+                Some(status) => bail!("cats-blockd exited during startup: {status}: {reason}"),
+                None => bail!("cats-blockd exited during startup: {reason}"),
+            }
+        }
+        if Instant::now() > deadline {
+            bail!("timed out waiting for blockd socket");
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -366,7 +395,91 @@ fn blockd_failure_reason(log_path: &Path) -> String {
 
 #[cfg(test)]
 mod failure_reason_tests {
-    use super::blockd_failure_reason;
+    use super::*;
+
+    #[test]
+    fn legacy_spawn_argv_and_crash_env_are_characterized() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = stub_node_config(root.path(), VmmMode::Fake);
+        config.blockd_bin = "/opt/cats/bin/cats-blockd".into();
+        config.metadata_store = cats_storage::AdapterSelection::new(
+            "postgres",
+            cats_storage::AdapterConfig::from_pairs([("url-env", "CATS_TEST_POSTGRES_URL")])
+                .unwrap(),
+        );
+        config.object_store = cats_storage::AdapterSelection::new(
+            "file",
+            cats_storage::AdapterConfig::from_pairs([("root", "/var/lib/cats/objects")]).unwrap(),
+        );
+        config.blockd_lease_ttl_ms = 1_500;
+        config.blockd_max_staged_bytes = 101;
+        config.blockd_max_staged_packs = 102;
+        config.blockd_max_local_bytes = 103;
+        let grant = VolumeGrant {
+            disk_id: "disk_root".into(),
+            volume_id: "vol_root".into(),
+            attachment_id: "att_root".into(),
+            epoch: 7,
+            size_bytes: 4_294_967_296,
+            mount_path: "/".into(),
+            durability: cats_api::resources::DiskDurability::Relaxed,
+        };
+        let command = legacy_blockd_command(LegacyBlockdCommand {
+            config: &config,
+            grant: &grant,
+            data_dir: Path::new("/var/lib/cats/cat_a/vol-disk_root"),
+            nbd_socket: Path::new("/run/cats/nbd.sock"),
+            control_socket: Path::new("/run/cats/control.sock"),
+            vhost_user_socket: None,
+            vhost_user_queues: 1,
+            seed_image_id: Some("image-root"),
+        });
+
+        assert_eq!(command.get_program(), "/opt/cats/bin/cats-blockd");
+        assert_eq!(
+            command
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            [
+                "--volume-id",
+                "vol_root",
+                "--data-dir",
+                "/var/lib/cats/cat_a/vol-disk_root",
+                "--attachment-id",
+                "att_root",
+                "--metadata-store-adapter",
+                "postgres",
+                "--object-store-adapter",
+                "file",
+                "--listen-unix",
+                "/run/cats/nbd.sock",
+                "--create-volume-size",
+                "4294967296",
+                "--lease-ttl-ms",
+                "1500",
+                "--max-staged-bytes",
+                "101",
+                "--max-staged-packs",
+                "102",
+                "--max-local-bytes",
+                "103",
+                "--listen-control",
+                "/run/cats/control.sock",
+                "--durability",
+                "relaxed",
+                "--seed-image-id",
+                "image-root",
+                "--metadata-store-option",
+                "url-env=CATS_TEST_POSTGRES_URL",
+                "--object-store-option",
+                "root=/var/lib/cats/objects",
+            ]
+        );
+        assert!(command
+            .get_envs()
+            .any(|(name, value)| name == "CATS_CRASH_POINT" && value.is_none()));
+    }
 
     /// A startup failure must quote what blockd wrote, not a guess.
     ///
