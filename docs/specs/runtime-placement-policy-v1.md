@@ -214,6 +214,15 @@ cats admin runtime-node credential rotate --request <file>
 cats admin runtime-node retire --request <file>
 ```
 
+每个上述命令只选择一种认证来源。deployment provisioner同时提供
+`--deployment-id <id> --provisioner-credential-id <id>
+--provisioner-private-key-file <path>`；key file必须是current user拥有、single-link、无symlink、exact
+`0600`的strict PKCS#8 PEM，只有路径进入argv，private-key octets不进入argv、log、pending或resolution
+receipt。每次重试都从该file读取current signer，因此同一pending可在trust rotation后由new current key重签。
+human先用`cats admin login`取得独立的admin-Organization WorkOS session（也可显式提供一个短期WorkOS
+access JWT），再运行上述命令；这个login/session不读取Cats Account/Workspace login，`--workspace`与
+`CATS_WORKSPACE`在`admin login/logout`和`admin runtime-node`均固定拒绝。
+
 CLI调用上述HTTP route，不打开数据库连接、不执行SQL；A19a §2.3/§2.4的crash recovery source继续保存
 old/new Node private halves和identity descriptors，central IaC/provisioning state则必须在发送前durable保存exact
 `apply_id`与canonical request。A19a closed Host recovery directory不增加policy/request/provisioner-key文件；
@@ -1195,7 +1204,7 @@ body_sha256 = sha256:a4636d17031808e21932b2f54dc3b0d104243a1e9e56e33962f678cd4d8
 | route/trust bounds | query、encoded/trailing path、wrong method/media mapping；chunked/Content-Length实际65536进decoder、65537为413；success/error cap叉rotate/admin-error fixed vectors；trust bundle 16384边界、metadata/path/read-change fail startup；active-set/initial/overlap/principal fixed vectors；persisted deployment current-pointer/revision-receipt/lineage DDL check/unique/FK/projection corruption fail closed |
 | trust revision/history | revision1 null-previous；old -> overlap old+new -> new-only使用连续revision/exact previous-set CAS；两个replica同revision exact replay零写；same revision不同set、old-only stale restart、gap、wrong previous和两个不同next-set竞态输家均fail startup且不能retire current key；已移除ID、已retire SPKI、same ID/different SPKI、different ID/same SPKI和deployment改名均fail；tombstone/revision receipt不GC/不重激活 |
 | apply replay | response loss exact replay原200或persisted precondition 409；same apply ID异payload 409；new trust key可重放old-key apply；revision/credential CAS conflict零domain写入且保存rejected outcome |
-| official CLI | pending在首send前fsync；canonical bound 200和带exact单一apply-ID header的persisted precondition 409才先durably写resolution再清pending；409 header缺失/重复/错值、EOF/reset/timeout/redirect/401/403/429/5xx/apply conflict/超限或mismatched 200都保留same body/apply ID；apply conflict报警不换ID；crash每个fsync窗口都不重新结算 |
+| official CLI | machine fixed-vector headers且key octets不落argv/log/state、same pending可换current key重签；human admin-only与同时拥有ordinary Workspace两种identity都只取独立admin-org session，runtime/admin login拒绝Workspace selector；pending在首send前逐级ancestor/record fsync；canonical bound 200和带exact单一apply-ID header的persisted precondition 409才先durably写resolution/index再清pending；A→B→A、不同exact apply ID、不同normalized origin和root/ancestor ABA均零错误重发；409 header缺失/重复/错值、EOF/reset/timeout/redirect/401/403/429/5xx/apply conflict/超限或mismatched 200都保留same body/apply ID；apply conflict报警不换ID；crash每个fsync窗口都不重新结算 |
 | admission/shutdown | global 32、每principal 4恰好边界；无等待，global满503/per-principal满429且Retry-After 1、零apply；cancel在commit-send前回滚，之后permit留到resolution；shutdown拒绝新请求、join可能commit的job，30000 ms未解析只能非零退出 |
 | Node credential lineage | exact现有`node_identities`表名；deferred circular/composite FK令current public-key ID/digest/state只指向同Node exact active/retired lineage；A19锁后join且只给retired exact-attempt replay例外；provision/rotation只接受PublicKey，ProviderPrincipal持久409；same/different Node历史ID/SPKI重用均持久409；partial/错state constraint注入整笔abort且不伪造result |
 | A19a lifecycle | atomic identity+cordoned policy；cordoned/drained/expired-session rotation；pre-commit可保留old，commit后只能forward-complete new；old永久retired无reverse CAS；new half丢失只能retire/new lineage；crash windows只重放same apply/private half |

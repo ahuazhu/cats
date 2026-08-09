@@ -12,6 +12,7 @@ use cats_api::auth::{UserProfile, Workspace};
 pub(crate) const DEFAULT_API_URL: &str = "https://cats.run";
 const CONFIG_VERSION: u32 = 2;
 const KEYRING_SERVICE: &str = "cats.run CLI";
+const ADMIN_KEYRING_PREFIX: &str = "fleet-admin:";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct StoredConfig {
@@ -135,6 +136,48 @@ pub(crate) struct Credentials {
     pub active_organization_id: Option<String>,
 }
 
+/// Fleet-administrator credentials are deliberately disjoint from the
+/// Workspace login. In particular, an administrator does not need a Cats
+/// Account or Workspace mapping to acquire or refresh this session.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FleetAdminCredentials {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub organization_id: String,
+    pub subject: String,
+    pub email: String,
+}
+
+impl FleetAdminCredentials {
+    fn account(api_url: &str) -> String {
+        format!("{ADMIN_KEYRING_PREFIX}{api_url}")
+    }
+
+    pub(crate) fn load(api_url: &str) -> Result<Option<Self>> {
+        let encoded = match crate::credential_store::get(KEYRING_SERVICE, &Self::account(api_url))?
+        {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        Ok(Some(serde_json::from_str(&encoded).context(
+            "parse Cats fleet-administrator login from credential store",
+        )?))
+    }
+
+    pub(crate) fn save(&self, api_url: &str) -> Result<()> {
+        crate::credential_store::set(
+            KEYRING_SERVICE,
+            &Self::account(api_url),
+            &serde_json::to_string(self)?,
+        )
+    }
+
+    pub(crate) fn delete(api_url: &str) -> Result<()> {
+        crate::credential_store::delete(KEYRING_SERVICE, &Self::account(api_url))
+    }
+}
+
 impl Credentials {
     pub(crate) fn load(api_url: &str) -> Result<Option<Self>> {
         let encoded = match crate::credential_store::get(KEYRING_SERVICE, api_url)? {
@@ -179,6 +222,39 @@ impl CliStateLock {
             .with_context(|| format!("open {}", path.display()))?;
         FileExt::lock_exclusive(&file).with_context(|| format!("lock {}", path.display()))?;
         Ok(Self { file })
+    }
+}
+
+pub(crate) struct FleetAdminStateLock {
+    file: std::fs::File,
+}
+
+impl FleetAdminStateLock {
+    pub(crate) fn acquire() -> Result<Self> {
+        let path = config_path().with_file_name("fleet-admin-credentials.lock");
+        let parent = path
+            .parent()
+            .context("Cats fleet-administrator credential lock has no parent")?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create config directory {}", parent.display()))?;
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        FileExt::lock_exclusive(&file).with_context(|| format!("lock {}", path.display()))?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for FleetAdminStateLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
     }
 }
 

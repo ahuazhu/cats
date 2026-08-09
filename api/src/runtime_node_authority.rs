@@ -9,6 +9,7 @@ use base64::Engine as _;
 use ring::signature::{UnparsedPublicKey, ED25519};
 use sha2::{Digest as _, Sha256};
 
+use crate::agent_registration::Ed25519RequestSigner;
 use crate::runtime_reconciliation::{
     canonical_ed25519_spki_sha256, FleetPolicyPrincipal, RuntimeProvisionerCredential,
 };
@@ -31,6 +32,34 @@ const ED25519_SPKI_LEN: usize = ED25519_SPKI_PREFIX.len() + 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("runtime Node authority request authentication failed")]
 pub struct RuntimeNodeAuthorityProofError;
+
+/// The two exact headers emitted by a deployment provisioner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeNodeAuthorityProvisionerProof {
+    pub credential_id: String,
+    pub signature: String,
+}
+
+/// Sign the one frozen A23 deployment-provisioner request frame.
+///
+/// PKCS#8 parsing and Ed25519 key handling remain owned by
+/// [`Ed25519RequestSigner`]; this wrapper prevents clients from copying or
+/// subtly drifting the A23 frame.
+pub fn sign_runtime_node_authority_request(
+    deployment_id: &crate::runtime_reconciliation::Id,
+    signer: &Ed25519RequestSigner,
+    exact_body: &[u8],
+) -> RuntimeNodeAuthorityProvisionerProof {
+    let signed = runtime_node_authority_signed_request(
+        deployment_id.as_str(),
+        signer.credential_id().as_str(),
+        exact_body,
+    );
+    RuntimeNodeAuthorityProvisionerProof {
+        credential_id: signer.credential_id().to_string(),
+        signature: URL_SAFE_NO_PAD.encode(signer.sign_framed(&signed)),
+    }
+}
 
 /// Verify a machine apply against one credential from the fixed startup
 /// bundle and return the only typed principal accepted by the Store.
@@ -156,6 +185,27 @@ mod tests {
                 APPLY,
             ))),
             "3441dcc9b166491330f9b2579919c04779c2842180929cbc3cbef5db23bd05f0"
+        );
+    }
+
+    #[test]
+    fn provisioner_signer_emits_the_frozen_signature_vector() {
+        let mut der = hex::decode("302e020100300506032b657004220420").unwrap();
+        der.extend_from_slice(
+            &hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+                .unwrap(),
+        );
+        let signer = Ed25519RequestSigner::from_pkcs8_der(
+            Id::new("provisioner_a".to_owned()).unwrap(),
+            &der,
+        )
+        .unwrap();
+        let deployment_id = Id::new("deployment_a".to_owned()).unwrap();
+        let proof = sign_runtime_node_authority_request(&deployment_id, &signer, APPLY);
+        assert_eq!(proof.credential_id, "provisioner_a");
+        assert_eq!(
+            proof.signature,
+            "ZqMEaH3fIxcNWG5CExvV4nHOSk7OEQORKctt-z9R_naZm2s0OM64IGOAHr_5hhNdl2SZ1CeUBCKNX1t-O-wyAg"
         );
     }
 

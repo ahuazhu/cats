@@ -1047,6 +1047,7 @@ async fn workos_user_and_admin_sessions_enforce_their_scopes() {
         .as_str()
         .unwrap()
         .starts_with("http://127.0.0.1:"));
+    assert_eq!(public_config["workos_admin_organization_id"], "org_admin");
     assert!(public_config.get("token_login_enabled").is_none());
     assert!(public_config.get("workspaces").is_none());
     assert!(!public_config.to_string().contains("sk_test_secret"));

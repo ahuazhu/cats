@@ -171,6 +171,19 @@ impl Ed25519RequestSigner {
             signature: URL_SAFE_NO_PAD.encode(self.key_pair.sign(&signed).as_ref()),
         }
     }
+
+    /// Sign bytes already framed by another closed Cats protocol.
+    ///
+    /// This remains crate-private so callers cannot accidentally invent a
+    /// second public signing dialect. Protocol modules expose typed wrappers
+    /// around their one frozen frame instead.
+    pub(crate) fn sign_framed(&self, framed: &[u8]) -> [u8; 64] {
+        self.key_pair
+            .sign(framed)
+            .as_ref()
+            .try_into()
+            .expect("ring Ed25519 signatures are exactly 64 octets")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

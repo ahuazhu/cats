@@ -298,6 +298,10 @@ pub enum OperationCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum AdminCommand {
+    /// Sign in to the deployment's independent fleet-administrator scope.
+    Login,
+    /// Remove the independent fleet-administrator session.
+    Logout,
     /// Show fleet health, lifecycle and capacity counters.
     Monitoring,
     /// List worker nodes with assignments and last telemetry.
@@ -309,9 +313,25 @@ pub enum AdminCommand {
     },
     /// Apply the signed Runtime Node identity and placement authority.
     RuntimeNode {
+        /// Deployment identity whose current provisioner trust set owns this request.
+        #[arg(long, global = true, conflicts_with = "token", requires_all = ["provisioner_credential_id", "provisioner_private_key_file"])]
+        deployment_id: Option<String>,
+        /// Current deployment-provisioner credential ID.
+        #[arg(long, global = true, conflicts_with = "token", requires_all = ["deployment_id", "provisioner_private_key_file"])]
+        provisioner_credential_id: Option<String>,
+        /// Strict 0600, single-link PKCS#8 PEM private-key file.
+        #[arg(long, global = true, conflicts_with = "token", requires_all = ["deployment_id", "provisioner_credential_id"])]
+        provisioner_private_key_file: Option<std::path::PathBuf>,
         #[command(subcommand)]
         cmd: RuntimeNodeCommand,
     },
+}
+
+#[derive(Debug)]
+pub(crate) struct RuntimeNodeAuthorityAuth<'a> {
+    pub(crate) deployment_id: Option<&'a str>,
+    pub(crate) provisioner_credential_id: Option<&'a str>,
+    pub(crate) provisioner_private_key_file: Option<&'a std::path::Path>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -720,8 +740,51 @@ pub fn run(cli: Cli) -> Result<()> {
             return Ok(());
         }
         Command::Admin {
-            cmd: AdminCommand::RuntimeNode { cmd },
-        } => return runtime_node_admin::run(&cli, cmd),
+            cmd: AdminCommand::Login,
+        } => {
+            anyhow::ensure!(
+                cli.token.is_none(),
+                "fleet administrator login acquires its own WorkOS session; remove --token"
+            );
+            anyhow::ensure!(
+                cli.workspace.is_none(),
+                "fleet administrator login is not Workspace-scoped; remove --workspace/CATS_WORKSPACE"
+            );
+            let identity = auth::fleet_admin_login(cli.api_url.as_deref())?;
+            println!("Fleet administrator signed in as {}", identity.email);
+            return Ok(());
+        }
+        Command::Admin {
+            cmd: AdminCommand::Logout,
+        } => {
+            anyhow::ensure!(
+                cli.token.is_none(),
+                "fleet administrator logout uses its own WorkOS session; remove --token"
+            );
+            anyhow::ensure!(
+                cli.workspace.is_none(),
+                "fleet administrator logout is not Workspace-scoped; remove --workspace/CATS_WORKSPACE"
+            );
+            auth::fleet_admin_logout(cli.api_url.as_deref())?;
+            println!("Fleet administrator logged out");
+            return Ok(());
+        }
+        Command::Admin {
+            cmd:
+                AdminCommand::RuntimeNode {
+                    deployment_id,
+                    provisioner_credential_id,
+                    provisioner_private_key_file,
+                    cmd,
+                },
+        } => {
+            let authority = RuntimeNodeAuthorityAuth {
+                deployment_id: deployment_id.as_deref(),
+                provisioner_credential_id: provisioner_credential_id.as_deref(),
+                provisioner_private_key_file: provisioner_private_key_file.as_deref(),
+            };
+            return runtime_node_admin::run(&cli, &authority, cmd);
+        }
         _ => {}
     }
     let client = Client::new(&cli)?;
@@ -1363,6 +1426,9 @@ fn run_admin(client: &Client, cli: &Cli, cmd: &AdminCommand) -> Result<()> {
         AdminCommand::RuntimeNode { .. } => {
             unreachable!("Runtime Node authority commands bypass workspace API construction")
         }
+        AdminCommand::Login | AdminCommand::Logout => {
+            unreachable!("fleet administrator login commands bypass workspace API construction")
+        }
     }
 }
 
@@ -1658,7 +1724,8 @@ mod tests {
             cli.command,
             Command::Admin {
                 cmd: AdminCommand::RuntimeNode {
-                    cmd: RuntimeNodeCommand::Provision { .. }
+                    cmd: RuntimeNodeCommand::Provision { .. },
+                    ..
                 }
             }
         ));
@@ -1681,9 +1748,96 @@ mod tests {
                 cmd: AdminCommand::RuntimeNode {
                     cmd: RuntimeNodeCommand::Policy {
                         cmd: RuntimeNodePolicyCommand::Apply { .. }
-                    }
+                    },
+                    ..
                 }
             }
         ));
+        assert!(matches!(
+            Cli::parse_from(["cats", "admin", "login"]).command,
+            Command::Admin {
+                cmd: AdminCommand::Login
+            }
+        ));
+        assert!(matches!(
+            Cli::parse_from(["cats", "admin", "logout"]).command,
+            Command::Admin {
+                cmd: AdminCommand::Logout
+            }
+        ));
+        let machine = Cli::parse_from([
+            "cats",
+            "admin",
+            "runtime-node",
+            "provision",
+            "--identity",
+            "identity.json",
+            "--policy",
+            "policy.json",
+            "--deployment-id",
+            "deployment_a",
+            "--provisioner-credential-id",
+            "provisioner_a",
+            "--provisioner-private-key-file",
+            "provisioner.pem",
+        ]);
+        assert!(matches!(
+            machine.command,
+            Command::Admin {
+                cmd: AdminCommand::RuntimeNode {
+                    deployment_id: Some(_),
+                    provisioner_credential_id: Some(_),
+                    provisioner_private_key_file: Some(_),
+                    ..
+                }
+            }
+        ));
+        assert!(Cli::try_parse_from([
+            "cats",
+            "admin",
+            "runtime-node",
+            "--deployment-id",
+            "deployment_a",
+            "provision",
+            "--identity",
+            "identity.json",
+            "--policy",
+            "policy.json",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn fleet_admin_commands_reject_workspace_scope_before_authentication() {
+        for arguments in [
+            vec!["cats", "--workspace", "ordinary", "admin", "login"],
+            vec!["cats", "--workspace", "ordinary", "admin", "logout"],
+            vec![
+                "cats",
+                "--workspace",
+                "ordinary",
+                "admin",
+                "runtime-node",
+                "provision",
+                "--identity",
+                "missing-identity.json",
+                "--policy",
+                "missing-policy.json",
+            ],
+        ] {
+            let error = run(Cli::parse_from(arguments)).unwrap_err().to_string();
+            assert!(error.contains("not Workspace-scoped"), "{error}");
+        }
+
+        let error = run(Cli::parse_from([
+            "cats",
+            "--token",
+            "must-not-be-ignored",
+            "admin",
+            "login",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("remove --token"), "{error}");
     }
 }

@@ -98,6 +98,11 @@ pub async fn config(State(state): State<AppState>) -> Response {
             .workos
             .as_ref()
             .map(|config| config.api_base_url().to_string()),
+        workos_admin_organization_id: state
+            .cfg
+            .workos
+            .as_ref()
+            .map(|config| config.admin_organization_id.clone()),
     })
     .into_response();
     set_no_store(&mut response);
