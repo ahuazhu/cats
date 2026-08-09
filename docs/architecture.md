@@ -245,7 +245,11 @@ storage永久销毁且该Cat保留的placement与immutable Host/state-path linea
 状态不能完成N。
 
 详细合同见 [Runtime Reconciliation v1](specs/runtime-reconciliation-v1.md) 和
-[ADR-0040](decisions/0040-level-triggered-runtime-reconciliation.md)。
+[ADR-0040](decisions/0040-level-triggered-runtime-reconciliation.md)。注册的唯一终态入口是
+`POST /v1/internal/runtime/agent-sessions`；它和全部internal runtime请求共用的per-Node签名adapter、
+typed public error、lease与release receipt路径由
+[Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md)冻结。legacy
+`/v1/nodes/register`和shared service/admin bearer不属于目标架构。
 
 ## 7. 四态和数据屏障
 

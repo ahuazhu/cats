@@ -98,6 +98,15 @@ host-wide binary used by another workload. The S3 adapter uses the EC2
 instance role and refreshes its temporary credentials; no long-lived AWS key is
 stored in `worker.env`.
 
+This current Host-derived boot shape is not eligible for the frozen target
+[Agent Registration and Internal Transport v1](../../docs/specs/agent-registration-transport-v1.md).
+Before the runtime-reconciliation cutover, one release build must put the same exact
+`guest-runtime-profile.v1.json` bytes in the Control artifact and worker bundle, install them at
+`/opt/cats/release/guest-runtime-profile.v1.json`, and ship the pinned Guest kernel and optional initramfs named by
+that receipt. Target worker systemd `ExecStart` and Control Kubernetes container args both pass
+`--guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json`; missing or mismatched
+receipt/boot files fail closed. Rebuilding from the Host kernel is not a target fallback.
+
 The worker builds an optimized Ubuntu 24.04 Guest: direct kernel, a minimal
 BusyBox initramfs used only for `switch_root`, and an Ubuntu minbase golden root
 with systemd as PID 1. Root growth, deterministic tap setup and the Guest Agent

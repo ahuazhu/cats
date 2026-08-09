@@ -46,6 +46,14 @@ installs the pinned Cloud Hypervisor, constructs the Guest kernel/initramfs/root
 image, and installs the systemd units. It configures the kernel NBD pool for the
 default path; vhost-user does not consume `/dev/nbdN`.
 
+For the target runtime-reconciliation release, the builder must instead carry the same exact
+`guest-runtime-profile.v1.json` bytes in the Control and Node artifacts and install them at
+`/opt/cats/release/guest-runtime-profile.v1.json` together with the pinned Guest kernel and optional initramfs.
+Production Control and Node systemd `ExecStart` both pass
+`--guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json`; there is no Host rebuild,
+missing-file or fixture fallback. The full fail-closed contract is
+[Agent Registration and Internal Transport v1](../../docs/specs/agent-registration-transport-v1.md).
+
 仅限首次安装、尚未创建任何 Cat 的空节点，配置后可以直接启动或重启服务。
 
 ```bash

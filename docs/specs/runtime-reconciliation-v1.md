@@ -6,6 +6,10 @@
 
 本文定义 Control Plane 与 Node Agent 之间最小、可测试的收敛合同。传输可以是
 heartbeat、long-poll 或普通 GET；正确性不得依赖通知必达、连接不断或消息只到达一次。
+Agent注册、internal HTTP前缀、per-Node request proof、public error mapping、lease续期和
+Guest runtime receipt部署路径由
+[Agent Registration and Internal Transport v1](agent-registration-transport-v1.md)冻结；其他transport不得
+重新解释本文件的共享类型或建立第二个identity/session authority。
 
 文中的 MUST/MUST NOT 是上线条件。
 
@@ -136,6 +140,8 @@ SubjectPublicKeyInfo DER，而不是PEM文本。`provider`是adapter的稳定名
 每个 Node 使用独立 credential。注册端同时验证 credential、`node_id` 和
 `immutable_host_id` 的预置绑定；共享 fleet token、调用方任意指定 `node_id`、仅凭
 hostname/IP 注册都不允许。credential 轮换是对同一 `NodeIdentity` 的显式管理操作。
+V1唯一machine authentication adapter和exact proof-to-credential映射见
+[Agent Registration Transport §4](agent-registration-transport-v1.md#4-per-node-request-proof-adapter)。
 
 Agent 在读取任何 runtime state 前，必须在由 `state_path_id` 决定的固定、受保护路径取得
 Host 级 kernel 排他锁，并核对本地 root-owned identity。命令行更换 state directory 不能绕过
@@ -173,8 +179,10 @@ AgentSession {
 `AgentRegistrationAttempt`重放返回原session；`immutable_host_id`、`node_boot_id`、
 `agent_instance_id`、`guest_config_digest`或`expected_agent_session_epoch`任一不同都返回§16.4
 `registration_attempt_conflict`，不能把它当作新attempt，也不能复用`wrong_session`。
-`agent_session_epoch`和`lease_deadline_unix_ms`由Control
-Plane按PostgreSQL时间分配；Agent请求不能提供或延长deadline。
+`agent_session_epoch`和initial `lease_deadline_unix_ms`由Control
+Plane按PostgreSQL时间分配；Agent请求不能提供deadline。固定60000 ms lease、exact registration replay保留
+initial deadline，以及仅由新sequence accepted observation续期current deadline的唯一规则见
+[Agent Registration Transport §7](agent-registration-transport-v1.md#7-agentsession-lease-policy)。
 
 `guest_config_digest`不是调用方选择的任意capability string。每个部署release只携带一个由release build
 一次生成的不可变artifact：
@@ -207,6 +215,8 @@ receipt；Control Plane与Node都读取部署系统分发的同一份bytes，不
 只有携带该exact digest才可创建session，成功的`AgentSession.guest_config_digest`逐字段复制attempt值。
 生产builder不得回退到测试fixture digest、环境缺省常量、image alias或catalog；测试必须显式注入自己的
 receipt。receipt是部署artifact，不是DB row、catalog、协商列表或第二authority。
+唯一release member、installed path、systemd config与fail-closed启动规则见
+[Agent Registration Transport §8](agent-registration-transport-v1.md#8-guestruntimeprofilereceipt-release-path)。
 
 一次成功的全量inventory还为当前session建立独立的签发证明：
 
@@ -239,6 +249,10 @@ attestation与fresh per-Cat observation；不要求每次heartbeat重新做全�
    取得新的 NodeIdentity/credential。
 5. heartbeat、desired 读取和 observation 都绑定当前 session。新 session 成功后，旧 session
    的所有请求永久拒绝。
+
+这些步骤的唯一HTTP实现是
+`POST /v1/internal/runtime/agent-sessions`；request/success/error envelope、body cap、status和crash-safe
+Node落盘顺序见[Agent Registration Transport §2–§6](agent-registration-transport-v1.md#2-registration-http-wire)。
 
 ## 3. DesiredRuntimeSpec
 
