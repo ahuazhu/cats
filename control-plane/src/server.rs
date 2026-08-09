@@ -159,6 +159,11 @@ pub struct AppState {
     pub cfg: Arc<Config>,
     pub(crate) agent_session_registration_policy: Arc<crate::store::AgentSessionRegistrationPolicy>,
     pub(crate) runtime_spine_admission: Arc<RuntimeSpineAdmission>,
+    /// The old Controller/NodeJob runtime exists only to keep the explicit
+    /// pre-cutover integration harness exercising its historical contract.
+    /// Production handlers consult this before touching any legacy work row
+    /// or Node HTTP surface.
+    pub(crate) legacy_node_runtime_for_tests: bool,
 }
 
 pub struct Handle {
@@ -166,7 +171,7 @@ pub struct Handle {
     pub addr: std::net::SocketAddr,
     pub state: AppState,
     server_task: tokio::task::JoinHandle<()>,
-    reconciler_task: tokio::task::JoinHandle<()>,
+    reconciler_task: Option<tokio::task::JoinHandle<()>>,
     billing_enforcer_task: Option<tokio::task::JoinHandle<()>>,
     image_manifest_resolver: Arc<
         crate::store::runtime_authority::image_manifest_resolver::ImmutableImageManifestResolver,
@@ -180,7 +185,9 @@ impl Handle {
     fn begin_shutdown(&self) {
         self.server_task.abort();
         self.state.observation_store.begin_shutdown();
-        self.reconciler_task.abort();
+        if let Some(task) = &self.reconciler_task {
+            task.abort();
+        }
         if let Some(task) = &self.billing_enforcer_task {
             task.abort();
         }
@@ -460,21 +467,21 @@ async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow
             })
             .await?;
     }
-    // An OCI deploy is driven by an in-memory task holding one-pull registry
-    // credentials that are never persisted, so a deploy in flight when this
-    // process died cannot be resumed. Report it as failed instead of leaving
-    // its operation unresolved and its (cat, app, digest) identity blocked --
-    // a caller polling that operation would otherwise wait forever.
-    match store
-        .execute(|store| store.fail_interrupted_oci_deployments())
-        .await
-    {
-        Ok(0) => {}
-        Ok(count) => {
-            tracing::warn!("failed {count} OCI deployment(s) interrupted by a restart")
-        }
-        Err(error) => {
-            tracing::error!("converging interrupted OCI deployments failed: {error}")
+    if legacy_node_runtime_for_tests {
+        // Legacy OCI deploys are driven by an in-memory Node HTTP task. Only
+        // the explicit legacy harness is allowed to converge those rows; the
+        // signed production process must not claim ownership of that runtime.
+        match store
+            .execute(|store| store.fail_interrupted_oci_deployments())
+            .await
+        {
+            Ok(0) => {}
+            Ok(count) => {
+                tracing::warn!("failed {count} OCI deployment(s) interrupted by a restart")
+            }
+            Err(error) => {
+                tracing::error!("converging interrupted OCI deployments failed: {error}")
+            }
         }
     }
     let usage = cfg.usage_store.clone();
@@ -511,6 +518,7 @@ async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow
         cfg: cfg.clone(),
         agent_session_registration_policy,
         runtime_spine_admission: Arc::new(RuntimeSpineAdmission::new()),
+        legacy_node_runtime_for_tests,
     };
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen)
@@ -528,12 +536,13 @@ async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow
         }
     });
     let interval = Duration::from_millis(cfg.reconcile_interval_ms);
-    let reconciler = controller.clone();
-    let reconciler_store = state.store.clone();
-    let reconciler_task =
+    let reconciler_task = legacy_node_runtime_for_tests.then(|| {
+        let reconciler = controller.clone();
+        let reconciler_store = state.store.clone();
         spawn_singleton_task(state.store.clone(), SingletonRole::Reconciler, move || {
             run_reconciler_role(reconciler.clone(), reconciler_store.clone(), interval)
-        });
+        })
+    });
     let billing_enforcer_task = cfg.billing_enforcement_enabled.then(|| {
         let enforcement_state = state.clone();
         spawn_singleton_task(

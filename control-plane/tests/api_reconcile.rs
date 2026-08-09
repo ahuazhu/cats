@@ -22,9 +22,9 @@ use cats_api::requests::*;
 use cats_api::resources::*;
 use cats_control_plane::controller::AutoTierPolicy;
 use cats_control_plane::server::{
-    spawn_with_legacy_node_runtime_for_tests as spawn, Config, Handle,
+    spawn as spawn_production, spawn_with_legacy_node_runtime_for_tests as spawn, Config, Handle,
 };
-use cats_control_plane::store::{DsnSource, Store};
+use cats_control_plane::store::{DsnSource, OciDeploymentClaim, Store};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::{
     deterministic_event_id, AttributedCheckpoint, IngestOutcome, SqliteUsageStore, UsageAttribution,
@@ -32,6 +32,13 @@ use cats_metering::{
 use cats_storage::MetadataStore;
 
 const SERVICE_TOKEN: &str = "dev-service-token";
+
+async fn reject_unexpected_production_node_call(
+    State(calls): State<Arc<AtomicUsize>>,
+) -> StatusCode {
+    calls.fetch_add(1, Ordering::SeqCst);
+    StatusCode::INTERNAL_SERVER_ERROR
+}
 
 // ---------------------------------------------------------------------------
 // Stub node agent: accepts every job, tracks "running" cats, heartbeats.
@@ -3129,6 +3136,312 @@ async fn legacy_node_registration_route_is_absent_while_test_fixture_admission_r
     .await;
     let admitted: NodeSummary = ctx.get_json(ctx.url("/v1/admin/nodes/fixture-node")).await;
     assert_eq!(admitted.node.state, NodeState::Ready);
+}
+
+#[tokio::test]
+async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let usage: Arc<SqliteUsageStore> =
+        Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap());
+    let storage_meta: Arc<dyn MetadataStore> =
+        Arc::new(SqliteMetadataStore::open(&dir.path().join("storage-meta.db")).unwrap());
+    let config = Config {
+        listen: "127.0.0.1:0".into(),
+        control_store_dsn: DsnSource::Literal(
+            cats_control_plane::testsupport::isolated_control_store_url(),
+        ),
+        control_store_ca_file: None,
+        usage_store: usage.clone(),
+        credit_store: usage,
+        storage_meta,
+        image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
+        auth_token: SERVICE_TOKEN.into(),
+        guest_runtime_profile_receipt:
+            cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
+        route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
+        admin_token: "dev-admin-token".into(),
+        workos: None,
+        stripe: None,
+        billing_enforcement_enabled: false,
+        node_lease_timeout_ms: 30_000,
+        reconcile_interval_ms: 10,
+        oci_deploy_sync_wait_ms: 5_000,
+        auto_tier_policy: AutoTierPolicy::default(),
+    };
+    let production = spawn_production(config.clone()).await.unwrap();
+    let workspace_id = default_workspace_id(&production);
+
+    let outbound_calls = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_addr = listener.local_addr().unwrap();
+    let counter = outbound_calls.clone();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(reject_unexpected_production_node_call)
+                .with_state(counter),
+        )
+        .await
+        .ok();
+    });
+    cats_control_plane::testsupport::register_legacy_test_node(
+        &production.state.store,
+        "node_cutover_old".into(),
+        format!("http://{node_addr}"),
+        format!("http://{node_addr}"),
+        4,
+        4096,
+        production
+            .state
+            .cfg
+            .route_grant_signer
+            .public_key_sha256()
+            .to_string(),
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!(
+            "{}/v1/workspaces/{workspace_id}/cats",
+            production.base_url()
+        ))
+        .bearer_auth("dev-admin-token")
+        .json(&serde_json::json!({
+            "name": "signed-cutover",
+            "image": "ubuntu-24.04",
+            "cpus": 1,
+            "memory_mib": 512,
+            "root_size_bytes": 8 << 20,
+            "disk": null
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+    let created: CatOperationResponse = created.json().await.unwrap();
+
+    // A 10 ms legacy reconcile interval would place and dispatch this row
+    // almost immediately. Production owns no such background role.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(outbound_calls.load(Ordering::SeqCst), 0);
+    let cat_before = production
+        .state
+        .store
+        .must_get_cat_by_id(&created.cat.id)
+        .unwrap();
+    assert_eq!(cat_before.node_id, None);
+    assert_eq!(cat_before.observed_state, ObservedState::Creating);
+    let cat_before_json = serde_json::to_value(&cat_before).unwrap();
+    let operations_before = serde_json::to_value(
+        production
+            .state
+            .store
+            .list_operations(&workspace_id)
+            .unwrap(),
+    )
+    .unwrap();
+    let work_before = production
+        .state
+        .store
+        .work_status(&cat_before.id, 30_000)
+        .unwrap();
+    let nodes_before = serde_json::to_value(production.state.store.list_nodes().unwrap()).unwrap();
+
+    let workspace_base = format!("{}/v1/workspaces/{workspace_id}", production.base_url());
+    let closed = vec![
+        (
+            reqwest::Method::POST,
+            format!("{workspace_base}/cats/signed-cutover/exec"),
+            Some(serde_json::json!({"command": ["true"]})),
+            "dev-admin-token",
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{workspace_base}/cats/signed-cutover/oci-deployments"),
+            Some(serde_json::json!({
+                "app": "server",
+                "image": format!("registry.test/app@sha256:{}", "a".repeat(64))
+            })),
+            "dev-admin-token",
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{workspace_base}/cats/signed-cutover/actions/sync"),
+            None,
+            "dev-admin-token",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/cats/signed-cutover/auto-suspend"),
+            None,
+            "dev-admin-token",
+        ),
+        (
+            reqwest::Method::PUT,
+            format!("{workspace_base}/cats/signed-cutover/auto-suspend"),
+            Some(serde_json::json!({"enabled": true})),
+            "dev-admin-token",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/cats/signed-cutover/work"),
+            None,
+            "dev-admin-token",
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{workspace_base}/disks/old/actions/mount"),
+            Some(serde_json::json!({
+                "cat_id": "signed-cutover",
+                "mount_at": "/data"
+            })),
+            "dev-admin-token",
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{workspace_base}/disks/old/actions/unmount"),
+            Some(serde_json::json!({})),
+            "dev-admin-token",
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{workspace_base}/disks/old/snapshots"),
+            None,
+            "dev-admin-token",
+        ),
+        (
+            reqwest::Method::POST,
+            format!(
+                "{}/v1/routes/wake?hostname=cutover.test",
+                production.base_url()
+            ),
+            None,
+            SERVICE_TOKEN,
+        ),
+    ];
+    for (method, url, body, token) in closed {
+        let mut request = client.request(method, &url).bearer_auth(token);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "legacy runtime entry point stayed reachable: {url}",
+        );
+    }
+
+    // Exercise the WebSocket extractor so this proves the handler itself is
+    // closed, rather than merely observing a missing Upgrade header.
+    let shell = client
+        .get(format!(
+            "{workspace_base}/cats/signed-cutover/shell?rows=24&cols=80"
+        ))
+        .bearer_auth("dev-admin-token")
+        .header("connection", "upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(shell.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // The retired shared-bearer routes are absent rather than authenticated
+    // fallbacks. Try both credentials and prove the same old rows stayed exact.
+    for path in [
+        "/v1/nodes/register",
+        "/v1/nodes/heartbeat",
+        "/v1/nodes/work-status",
+        "/v1/internal/work/acquire",
+        "/v1/internal/work/release",
+    ] {
+        for token in [SERVICE_TOKEN, "dev-admin-token"] {
+            let response = client
+                .post(format!("{}{path}", production.base_url()))
+                .bearer_auth(token)
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(outbound_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        serde_json::to_value(
+            production
+                .state
+                .store
+                .must_get_cat_by_id(&created.cat.id)
+                .unwrap()
+        )
+        .unwrap(),
+        cat_before_json
+    );
+    assert_eq!(
+        serde_json::to_value(
+            production
+                .state
+                .store
+                .list_operations(&workspace_id)
+                .unwrap()
+        )
+        .unwrap(),
+        operations_before
+    );
+    let work_after = production
+        .state
+        .store
+        .work_status(&created.cat.id, 30_000)
+        .unwrap();
+    assert_eq!(work_after.work_version, work_before.work_version);
+    assert_eq!(work_after.active_work_count, work_before.active_work_count);
+    assert_eq!(
+        serde_json::to_value(production.state.store.list_nodes().unwrap()).unwrap(),
+        nodes_before
+    );
+
+    // A stranded legacy OCI row is another old runtime owner. Restarting a
+    // production replica must leave it untouched rather than running the old
+    // in-memory-task reaper.
+    let claim_cat = cat_before.clone();
+    let (operation_id, lease) = production
+        .state
+        .store
+        .execute(move |store| {
+            match store.claim_oci_deployment(
+                &claim_cat,
+                "legacy-app",
+                &format!("sha256:{}", "b".repeat(64)),
+            )? {
+                OciDeploymentClaim::Claimed {
+                    operation, lease, ..
+                } => Ok((operation.id, lease)),
+                _ => unreachable!("fresh legacy deployment identity"),
+            }
+        })
+        .await
+        .unwrap();
+    drop(lease);
+    let operation_before =
+        serde_json::to_value(production.state.store.get_operation(&operation_id).unwrap()).unwrap();
+    production.shutdown().await;
+
+    let successor = spawn_production(config).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        serde_json::to_value(successor.state.store.get_operation(&operation_id).unwrap()).unwrap(),
+        operation_before,
+        "production startup converged a legacy OCI row",
+    );
+    assert_eq!(outbound_calls.load(Ordering::SeqCst), 0);
+    successor.shutdown().await;
 }
 
 #[tokio::test]

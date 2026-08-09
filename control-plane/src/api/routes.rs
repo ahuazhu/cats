@@ -138,6 +138,7 @@ pub(super) async fn wake_route_handler(
     Query(q): Query<ResolveQuery>,
     headers: HeaderMap,
 ) -> ApiResult<StatusCode> {
+    require_legacy_node_runtime_for_tests(&state)?;
     check_service_auth(&state, &headers).await?;
     wake_route(&state, &q.hostname).await?;
     Ok(StatusCode::NO_CONTENT)

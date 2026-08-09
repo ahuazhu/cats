@@ -94,6 +94,21 @@ impl From<ApiError> for Failure {
 
 type ApiResult<T> = std::result::Result<T, Failure>;
 
+/// Reject an entry point whose implementation still owns legacy work leases
+/// or calls the retired Node HTTP runtime. This check must be the first handler
+/// action so production cannot authenticate, write an idempotency/work row, or
+/// emit an outbound call before failing closed.
+fn require_legacy_node_runtime_for_tests(state: &AppState) -> ApiResult<()> {
+    if state.legacy_node_runtime_for_tests {
+        Ok(())
+    } else {
+        Err(
+            ApiError::unavailable("operation is unavailable during the signed runtime cutover")
+                .into(),
+        )
+    }
+}
+
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("authorization")
