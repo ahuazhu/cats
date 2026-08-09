@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cats_api::runtime_reconciliation::{
-    AdmissionInventoryAttestation, AgentSession, AsciiText, ContractVersion, CredentialBinding,
-    Epoch, GuestRuntimeProfileReceipt, Id, Ipv4Address, MacAddress, NetworkConfig, NodeBootId,
-    NodeIdentity, NodeIdentityState, RandomId128, Sequence, Sha256Digest, UnixMillis,
+    decode_desired_runtime_spec, guest_config_digest, AdmissionInventoryAttestation, AgentSession,
+    AsciiText, AssignedKind, ContractVersion, CredentialBinding, DiskKind, Durability, Epoch,
+    GuestRuntimeProfileReceipt, Id, Ipv4Address, MacAddress, NetworkConfig, NodeBootId,
+    NodeIdentity, NodeIdentityState, RandomId128, RuntimeTarget, RuntimeTransition, Sequence,
+    Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire, VolumeDisposition,
 };
 
 use super::cat_create_service::{
@@ -87,6 +89,9 @@ fn ingress_rejects_envelope_path_and_closed_dto_drift() {
     let mut wrong_type = fields("key");
     wrong_type.content_type = vec![b"application/json; charset=utf-8".to_vec()];
     cases.push((path.as_slice(), wrong_type, valid_body.clone()));
+    let mut missing_type = fields("key");
+    missing_type.content_type.clear();
+    cases.push((path.as_slice(), missing_type, valid_body.clone()));
     let mut duplicate_type = fields("key");
     duplicate_type
         .content_type
@@ -95,18 +100,34 @@ fn ingress_rejects_envelope_path_and_closed_dto_drift() {
     let mut encoded = fields("key");
     encoded.content_encoding = vec![b"gzip".to_vec()];
     cases.push((path.as_slice(), encoded, valid_body.clone()));
+    let mut duplicate_identity = fields("key");
+    duplicate_identity.content_encoding = vec![b"identity".to_vec(), b"identity".to_vec()];
+    cases.push((path.as_slice(), duplicate_identity, valid_body.clone()));
     let mut if_match = fields("key");
     if_match.if_match = vec![b"1".to_vec()];
     cases.push((path.as_slice(), if_match, valid_body.clone()));
     let mut duplicate_key = fields("key");
     duplicate_key.idempotency_key.push(b"other".to_vec());
     cases.push((path.as_slice(), duplicate_key, valid_body.clone()));
+    let mut missing_key = fields("key");
+    missing_key.idempotency_key.clear();
+    cases.push((path.as_slice(), missing_key, valid_body.clone()));
+    let mut empty_key = fields("key");
+    empty_key.idempotency_key = vec![b" \t ".to_vec()];
+    cases.push((path.as_slice(), empty_key, valid_body.clone()));
+    let mut oversized_key = fields("key");
+    oversized_key.idempotency_key = vec![vec![b'a'; 513]];
+    cases.push((path.as_slice(), oversized_key, valid_body.clone()));
+    let mut non_printable_key = fields("key");
+    non_printable_key.idempotency_key = vec![vec![b'a', 0x1f]];
+    cases.push((path.as_slice(), non_printable_key, valid_body.clone()));
 
     for (raw_path, headers, raw_body) in cases {
         assert!(parse_authorized_cat_create(&workspace, raw_path, &headers, &raw_body).is_err());
     }
     for raw_path in [
         b"/v1/workspaces/ws_01/cats?x=1".as_slice(),
+        b"/v1/workspaces/ws_01/cats?".as_slice(),
         b"/v1/workspaces/%77s_01/cats".as_slice(),
         b"/v1/workspaces/ws_other/cats".as_slice(),
     ] {
@@ -115,6 +136,7 @@ fn ingress_rejects_envelope_path_and_closed_dto_drift() {
         );
     }
 
+    let valid_text = String::from_utf8(valid_body.clone()).unwrap();
     let duplicate = valid_body
         .iter()
         .position(|byte| *byte == b'}')
@@ -124,20 +146,59 @@ fn ingress_rejects_envelope_path_and_closed_dto_drift() {
             value
         })
         .unwrap();
-    let unknown = String::from_utf8(valid_body.clone())
-        .unwrap()
+    let unknown = valid_text
+        .clone()
         .replace("}", ",\"image\":\"ubuntu\"}")
         .into_bytes();
-    let null = String::from_utf8(valid_body.clone())
-        .unwrap()
+    let null = valid_text
+        .clone()
         .replace("\"vcpus\":2", "\"vcpus\":null")
         .into_bytes();
-    let float = String::from_utf8(valid_body.clone())
-        .unwrap()
+    let float = valid_text
+        .clone()
         .replace("\"vcpus\":2", "\"vcpus\":2.0")
         .into_bytes();
+    let negative_zero = valid_text
+        .clone()
+        .replace("\"vcpus\":2", "\"vcpus\":-0")
+        .into_bytes();
+    let exponent = valid_text
+        .clone()
+        .replace("\"vcpus\":2", "\"vcpus\":1e0")
+        .into_bytes();
+    let mut bom = b"\xef\xbb\xbf".to_vec();
+    bom.extend_from_slice(&valid_body);
     let legacy = br#"{"name":"app","image":"ubuntu-24.04"}"#.to_vec();
-    for invalid in [duplicate, unknown, null, float, legacy] {
+    let mut invalid_bodies = vec![
+        duplicate,
+        unknown,
+        null,
+        float,
+        negative_zero,
+        exponent,
+        bom,
+        legacy,
+    ];
+    let mut value: serde_json::Value = serde_json::from_slice(&valid_body).unwrap();
+    for field in [
+        "boot_image_digest",
+        "durability",
+        "memory_bytes",
+        "name",
+        "root_size_bytes",
+        "vcpus",
+    ] {
+        let removed = value.as_object_mut().unwrap().remove(field).unwrap();
+        invalid_bodies.push(serde_json::to_vec(&value).unwrap());
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert(field.to_owned(), removed);
+    }
+    for invalid_name in ["", "App", "-app", "app-", &"a".repeat(31)] {
+        invalid_bodies.push(body(invalid_name, 4_194_304));
+    }
+    for invalid in invalid_bodies {
         assert!(parse_authorized_cat_create(&workspace, path, &fields("key"), &invalid).is_err());
     }
 }
@@ -146,6 +207,11 @@ fn ingress_rejects_envelope_path_and_closed_dto_drift() {
 fn ingress_enforces_the_body_cap_before_decode() {
     let workspace = id("ws_01");
     let path = b"/v1/workspaces/ws_01/cats";
+    let mut below = body("app", 4_194_304);
+    below.resize(CAT_CREATE_MAX_BODY_BYTES - 1, b' ');
+    assert_eq!(below.len(), CAT_CREATE_MAX_BODY_BYTES - 1);
+    parse_authorized_cat_create(&workspace, path, &fields("key"), &below).unwrap();
+
     let mut exact = body("app", 4_194_304);
     exact.resize(CAT_CREATE_MAX_BODY_BYTES, b' ');
     assert_eq!(exact.len(), CAT_CREATE_MAX_BODY_BYTES);
@@ -176,6 +242,7 @@ impl CatCreateManifestResolver for FakeManifestResolver {
 
 struct FakePlanner {
     calls: AtomicUsize,
+    last_request: Mutex<Option<CatCreatePlanRequest>>,
     replace_network_id: bool,
     retire_node: bool,
 }
@@ -183,6 +250,7 @@ struct FakePlanner {
 impl CatCreatePlacementPlanner for FakePlanner {
     fn plan<'a>(&'a self, request: &'a CatCreatePlanRequest) -> ServiceFuture<'a, CatCreatePlan> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.last_request.lock().unwrap() = Some(request.clone());
         let network_id = if self.replace_network_id {
             id("net_ffffffffffffffffffffffffffffffff")
         } else {
@@ -299,6 +367,7 @@ fn service_fixture(
     });
     let planner = Arc::new(FakePlanner {
         calls: AtomicUsize::new(0),
+        last_request: Mutex::new(None),
         replace_network_id: false,
         retire_node: false,
     });
@@ -331,6 +400,20 @@ fn service_builds_the_complete_candidate_and_replays_before_external_reads() {
     );
     assert_eq!(manifests.calls.load(Ordering::SeqCst), 1);
     assert_eq!(planner.calls.load(Ordering::SeqCst), 1);
+    let plan_request = planner.last_request.lock().unwrap().clone().unwrap();
+    assert_eq!(plan_request.vcpus, 2);
+    assert_eq!(plan_request.memory_bytes, 2_147_483_648);
+    assert_eq!(plan_request.root_size_bytes, 4_194_304);
+    assert_eq!(plan_request.durability, Durability::Strict);
+    assert_eq!(plan_request.boot_image_digest.as_str(), BOOT_DIGEST);
+    assert_eq!(
+        plan_request.guest_config_digest,
+        guest_config_digest(&release_receipt()).unwrap()
+    );
+    assert_eq!(
+        plan_request.network_id.as_str(),
+        "net_00000000000000000000000000000008"
+    );
 
     let replay = runtime
         .block_on(service.create(ingress(&workspace, "app", "same-key")))
@@ -364,6 +447,98 @@ fn service_builds_the_complete_candidate_and_replays_before_external_reads() {
         })
         .unwrap();
     assert_eq!(counts, vec![1; 8]);
+
+    let desired_json: String = store
+        .with(|client| {
+            client
+                .query_one("SELECT record::text FROM desired_runtime_specs", &[])
+                .map(|row| row.get(0))
+        })
+        .unwrap();
+    let desired = decode_desired_runtime_spec(desired_json.as_bytes()).unwrap();
+    assert_eq!(
+        desired.cat_id.as_str(),
+        "cat_00000000000000000000000000000001"
+    );
+    assert_eq!(desired.workspace_id, workspace);
+    assert_eq!(desired.desired_revision.get(), 1);
+    assert_eq!(desired.target, RuntimeTarget::Running);
+    assert_eq!(desired.placement.kind, AssignedKind::Assigned);
+    assert_eq!(desired.placement.node_id.as_str(), "node_a");
+    assert_eq!(desired.placement.placement_epoch.get(), 1);
+    assert_eq!(desired.transition, RuntimeTransition::CancelAndDrain);
+    assert_eq!(desired.runtime.vcpus, 2);
+    assert_eq!(desired.runtime.memory_bytes, 2_147_483_648);
+    assert_eq!(desired.runtime.boot_image_digest.as_str(), BOOT_DIGEST);
+    assert_eq!(
+        desired.runtime.guest_config_digest,
+        plan_request.guest_config_digest
+    );
+    assert_eq!(
+        desired.runtime.network_config.network_id,
+        plan_request.network_id
+    );
+    assert_eq!(
+        desired.runtime.network_config.guest_mac.as_str(),
+        "02:00:00:00:00:01"
+    );
+    assert_eq!(
+        desired.runtime.network_config.guest_ipv4.as_str(),
+        "10.0.0.1"
+    );
+    assert_eq!(desired.runtime.network_config.prefix_length, 30);
+    assert_eq!(
+        desired.runtime.network_config.gateway_ipv4.as_str(),
+        "10.0.0.2"
+    );
+    let [root] = desired.volumes.as_slice() else {
+        panic!("initial Desired must contain exactly one Root volume")
+    };
+    assert_eq!(
+        root.volume_intent_id.as_str(),
+        "vint_00000000000000000000000000000005"
+    );
+    assert_eq!(
+        root.disk_id.as_str(),
+        "disk_00000000000000000000000000000002"
+    );
+    assert_eq!(
+        root.volume_id.as_str(),
+        "vol_00000000000000000000000000000003"
+    );
+    assert_eq!(
+        root.attachment_id.as_str(),
+        "att_00000000000000000000000000000004"
+    );
+    assert_eq!(root.disk_kind, DiskKind::Root);
+    assert_eq!(root.access, VolumeAccess::ReadWriteOnce);
+    assert_eq!(root.durability, Durability::Strict);
+    assert_eq!(root.size_bytes, 4_194_304);
+    assert_eq!(root.guest_device.serial.as_str(), "cats-root");
+    assert_eq!(root.guest_device.slot, 0);
+    assert!(matches!(
+        &root.acquire,
+        VolumeAcquire::Normal {
+            transition_id,
+            expected_unowned_epoch
+        } if transition_id.as_str() == "00000000000000000000000000000009"
+            && expected_unowned_epoch.get() == 0
+    ));
+    assert_eq!(root.disposition, VolumeDisposition::Retain);
+    assert!(root.mount.is_none());
+    let [endpoint] = desired.endpoints.as_slice() else {
+        panic!("initial Desired must contain exactly one Endpoint")
+    };
+    assert_eq!(
+        endpoint.endpoint_id.as_str(),
+        "ep_00000000000000000000000000000007"
+    );
+    assert_eq!(
+        endpoint.hostname.as_str(),
+        "app-00000000000000000000000000000007.cats.run"
+    );
+    assert_eq!(endpoint.route_epoch.get(), 1);
+    assert_eq!(endpoint.target_port, 8080);
 }
 
 #[test]
@@ -414,6 +589,7 @@ fn invalid_manifest_or_planner_binding_has_no_store_side_effect() {
     });
     let planner = Arc::new(FakePlanner {
         calls: AtomicUsize::new(0),
+        last_request: Mutex::new(None),
         replace_network_id: false,
         retire_node: false,
     });
@@ -432,6 +608,7 @@ fn invalid_manifest_or_planner_binding_has_no_store_side_effect() {
 
     let wrong_planner = Arc::new(FakePlanner {
         calls: AtomicUsize::new(0),
+        last_request: Mutex::new(None),
         replace_network_id: true,
         retire_node: false,
     });
@@ -452,6 +629,7 @@ fn invalid_manifest_or_planner_binding_has_no_store_side_effect() {
 
     let retired_planner = Arc::new(FakePlanner {
         calls: AtomicUsize::new(0),
+        last_request: Mutex::new(None),
         replace_network_id: false,
         retire_node: true,
     });
