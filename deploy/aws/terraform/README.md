@@ -204,6 +204,7 @@ example:
 export TF_VAR_runtime_secret_data='{"CATS_AUTH_TOKEN":"...","CATS_ADMIN_TOKEN":"..."}'
 export TF_VAR_route_grant_private_key_pem="$(cat /approved/secret/path/route-grant-private.pem)"
 export TF_VAR_route_grant_public_key_pem="$(openssl pkey -in /approved/secret/path/route-grant-private.pem -pubout)"
+export TF_VAR_runtime_provisioner_trust_bundle_json="$(cat /approved/provisioning/runtime-provisioner-trust.v1.json)"
 export TF_VAR_storage_postgres_url='postgresql://...'
 export TF_VAR_usage_postgres_url='postgresql://...'
 export TF_VAR_rds_ca_pem='-----BEGIN CERTIFICATE-----...'

@@ -685,6 +685,14 @@ mod tests {
     }
 
     #[test]
+    fn provisioner_trust_path_rejects_every_alternate_before_filesystem_access() {
+        assert!(matches!(
+            load_installed_runtime_provisioner_trust_bundle(Path::new("relative.json")),
+            Err(RuntimeArtifactError::WrongProvisionerTrustPath)
+        ));
+    }
+
+    #[test]
     fn launch_revalidation_rejects_noncanonical_paths_before_filesystem_access() {
         let manifest = decode_release_manifest(MANIFEST).unwrap();
         let contract = GuestRuntimeBootContract {

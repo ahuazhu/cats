@@ -1206,8 +1206,8 @@ fn production_control_plane_survives_one_pod_or_node_disruption() {
     }
     for expected in [
         "public_target_pre_stop_delay_seconds           = 15",
-        "public_target_termination_grace_period_seconds = 30",
-        "condition     = local.public_target_pre_stop_delay_seconds < local.public_target_termination_grace_period_seconds",
+        "public_target_termination_grace_period_seconds = 60",
+        "condition     = local.public_target_pre_stop_delay_seconds + 30 <= local.public_target_termination_grace_period_seconds",
     ] {
         assert!(
             terraform.contains(expected),
@@ -1273,8 +1273,8 @@ fn production_gateway_survives_one_pod_or_node_disruption() {
     }
     for expected in [
         "public_target_pre_stop_delay_seconds           = 15",
-        "public_target_termination_grace_period_seconds = 30",
-        "condition     = local.public_target_pre_stop_delay_seconds < local.public_target_termination_grace_period_seconds",
+        "public_target_termination_grace_period_seconds = 60",
+        "condition     = local.public_target_pre_stop_delay_seconds + 30 <= local.public_target_termination_grace_period_seconds",
     ] {
         assert!(
             terraform.contains(expected),
@@ -1773,6 +1773,45 @@ fn agent_registration_deployments_share_one_canonical_release_receipt() {
                 "runtime cutover guide lost composition blocker {composition_gate:?}"
             );
         }
+    }
+}
+
+#[test]
+fn runtime_node_authority_deployments_pin_exact_trust_artifact_and_shutdown_window() {
+    let argument =
+        "--runtime-provisioner-trust-file /etc/cats/identity/runtime-provisioner-trust.v1.json";
+    let metal = read_workspace_file("deploy/metal/systemd/cats-controld.service");
+    assert!(metal.contains(argument));
+    assert!(metal.contains("TimeoutStopSec=35s"));
+
+    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    for expected in [
+        "\"--runtime-provisioner-trust-file\",",
+        "\"/etc/cats/identity/runtime-provisioner-trust.v1.json\",",
+        "resource \"kubernetes_config_map_v1\" \"runtime_provisioner_trust\"",
+        "mount_path = \"/etc/cats/identity/runtime-provisioner-trust.v1.json\"",
+        "sub_path   = \"runtime-provisioner-trust.v1.json\"",
+        "public_target_termination_grace_period_seconds = 60",
+        "public_target_pre_stop_delay_seconds + 30 <= local.public_target_termination_grace_period_seconds",
+    ] {
+        assert!(
+            kubernetes.contains(expected),
+            "production A23 composition lost {expected:?}"
+        );
+    }
+    let variables =
+        read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/variables.tf");
+    assert!(variables.contains("variable \"runtime_provisioner_trust_bundle_json\""));
+    assert!(variables.contains("<= 16384"));
+    let image = read_workspace_file("deploy/aws/Dockerfile.control-plane");
+    assert!(image.contains("install -d -o 0 -g 0 -m 0755 /etc/cats/identity"));
+    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
+    for expected in [
+        "RUNTIME_PROVISIONER_TRUST_BUNDLE_B64",
+        "$RUNNER_TEMP/runtime-provisioner-trust.v1.json",
+        "runtime_provisioner_trust_bundle_json: $runtime_provisioner_trust_bundle_json",
+    ] {
+        assert!(workflow.contains(expected));
     }
 }
 

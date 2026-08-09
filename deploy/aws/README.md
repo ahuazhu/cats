@@ -104,6 +104,14 @@ that receipt. Target worker systemd `ExecStart` and Control Kubernetes container
 `--guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json`; missing or mismatched
 receipt/boot files fail closed. Rebuilding from the Host kernel is not a fallback.
 
+The application rollout also mounts the central provisioner's canonical public
+trust bundle as the root-owned regular file
+`/etc/cats/identity/runtime-provisioner-trust.v1.json` and passes exactly
+`--runtime-provisioner-trust-file /etc/cats/identity/runtime-provisioner-trust.v1.json`.
+The bundle checksum forces a Pod rollout; each replica pins it at startup and
+persists or exact-replays its monotonic trust revision before opening the
+administrator listener.
+
 The same cutover provisioner installs the canonical root-only local identity at
 `/etc/cats/identity/node-identity.v1.json`, with its matching per-Node key and credential ID. `cats-noded`
 derives `node_id`, immutable Host identity and `/var/lib/cats/node/<state_path_id>` only from that artifact; the

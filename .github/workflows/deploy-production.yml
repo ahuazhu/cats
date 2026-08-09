@@ -57,6 +57,9 @@ jobs:
       # without line-ending changes. Only cats-controld receives the decoded
       # file; workers get its public half through the infrastructure stack.
       ROUTE_GRANT_PRIVATE_KEY_PEM_B64: ${{ secrets.ROUTE_GRANT_PRIVATE_KEY_PEM_B64 }}
+      # Canonical A23 public trust bundle emitted by the central provisioner.
+      # Base64 preserves its exact JSON bytes through GitHub configuration.
+      RUNTIME_PROVISIONER_TRUST_BUNDLE_B64: ${{ secrets.RUNTIME_PROVISIONER_TRUST_BUNDLE_B64 }}
 
     steps:
       - uses: actions/checkout@v4
@@ -150,7 +153,8 @@ jobs:
             ROUTE_CACHE_TABLE_NAME \
             PRODUCTION_TFVARS_B64 \
             RDS_MASTER_USER_SECRET_ARN \
-            ROUTE_GRANT_PRIVATE_KEY_PEM_B64
+            ROUTE_GRANT_PRIVATE_KEY_PEM_B64 \
+            RUNTIME_PROVISIONER_TRUST_BUNDLE_B64
           do
             if [[ -z "${!name:-}" ]]; then
               echo "::error::Missing required repository configuration $name"
@@ -162,6 +166,11 @@ jobs:
             | base64 --decode > "$RUNNER_TEMP/production.tfvars"
           printf '%s' "$ROUTE_GRANT_PRIVATE_KEY_PEM_B64" \
             | base64 --decode > "$RUNNER_TEMP/route-grant-private.pem"
+          printf '%s' "$RUNTIME_PROVISIONER_TRUST_BUNDLE_B64" \
+            | base64 --decode > "$RUNNER_TEMP/runtime-provisioner-trust.v1.json"
+          test "$(wc -c < "$RUNNER_TEMP/runtime-provisioner-trust.v1.json")" -le 16384
+          jq -e 'type == "object"' \
+            "$RUNNER_TEMP/runtime-provisioner-trust.v1.json" >/dev/null
           openssl pkey \
             -in "$RUNNER_TEMP/route-grant-private.pem" \
             -text -noout \
@@ -300,10 +309,12 @@ jobs:
             --arg storage_postgres_session_setup "$storage_postgres_session_setup" \
             --rawfile route_grant_private_key_pem "$RUNNER_TEMP/route-grant-private.pem" \
             --rawfile route_grant_public_key_pem "$RUNNER_TEMP/route-grant-public.pem" \
+            --rawfile runtime_provisioner_trust_bundle_json "$RUNNER_TEMP/runtime-provisioner-trust.v1.json" \
             '{
               runtime_secret_data: $runtime_secret_data[0],
               route_grant_private_key_pem: $route_grant_private_key_pem,
               route_grant_public_key_pem: $route_grant_public_key_pem,
+              runtime_provisioner_trust_bundle_json: $runtime_provisioner_trust_bundle_json,
               storage_postgres_url: $rotated[0].CATS_POSTGRES_URL,
               storage_postgres_session_setup: $storage_postgres_session_setup,
               usage_postgres_url: $rotated[0].CATS_USAGE_POSTGRES_URL,
@@ -319,6 +330,7 @@ jobs:
             "$RUNNER_TEMP/route-grant-private.pem" \
             "$RUNNER_TEMP/route-grant-public.pem" \
             "$RUNNER_TEMP/route-grant-public.sha256" \
+            "$RUNNER_TEMP/runtime-provisioner-trust.v1.json" \
             "$RUNNER_TEMP/production-secrets.tfvars.json"
 
       - name: Check control database compatibility

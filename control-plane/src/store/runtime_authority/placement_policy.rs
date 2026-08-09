@@ -242,6 +242,12 @@ impl Store {
         encode_runtime_node_authority_apply(apply)
             .map_err(|_| ApiError::invalid("runtime Node authority apply is invalid"))?;
         self.authority_transaction(|transaction| {
+            // A connection-class COMMIT error can return to the original
+            // backend before PostgreSQL has made that transaction's outcome
+            // observable to a fresh connection. Serialize the resolver behind
+            // the exact reservation held by the original transaction. Only a
+            // post-lock miss proves that transaction rolled back.
+            lock_runtime_node_authority_apply(transaction, apply.apply_id.as_str())?;
             let stored = load_apply_record(transaction, apply.apply_id.as_str())?;
             Ok(stored.map(|stored| {
                 if *stored.request == *apply {
@@ -250,6 +256,24 @@ impl Store {
                     RuntimeNodeAuthorityApplyStoreOutcome::ApplyIdConflict
                 }
             }))
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rollback_runtime_node_authority_reservation_for_test(
+        &self,
+        apply_id: &str,
+        entered: &std::sync::Barrier,
+        release: &std::sync::Barrier,
+    ) -> Result<()> {
+        let request = AuthorityRequestContext::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
+        self.authority_request_transaction(&request, |transaction| {
+            lock_runtime_node_authority_apply(transaction, apply_id)?;
+            entered.wait();
+            release.wait();
+            Ok(AuthorityRequestDisposition::Reject(()))
         })
     }
 }
@@ -573,16 +597,24 @@ fn load_active_provisioner_credentials(
         .collect()
 }
 
+fn lock_runtime_node_authority_apply(
+    transaction: &mut Transaction<'_>,
+    apply_id: &str,
+) -> AuthorityTxResult<()> {
+    transaction.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
+            current_schema() || ':runtime-node-authority-apply:' || $1, 0::BIGINT))",
+        &[&apply_id],
+    )?;
+    Ok(())
+}
+
 fn apply_runtime_node_authority_in(
     transaction: &mut Transaction<'_>,
     principal: &FleetPolicyPrincipal,
     apply: &RuntimeNodeAuthorityApply,
 ) -> AuthorityTxResult<RuntimeNodeAuthorityApplyStoreOutcome> {
-    transaction.query_one(
-        "SELECT pg_advisory_xact_lock(hashtextextended(
-            current_schema() || ':runtime-node-authority-apply:' || $1, 0::BIGINT))",
-        &[&apply.apply_id.as_str()],
-    )?;
+    lock_runtime_node_authority_apply(transaction, apply.apply_id.as_str())?;
     if !revalidate_machine_principal(transaction, principal)? {
         return Ok(RuntimeNodeAuthorityApplyStoreOutcome::AuthenticationFailed);
     }

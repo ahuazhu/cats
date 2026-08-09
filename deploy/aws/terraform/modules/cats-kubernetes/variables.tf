@@ -110,6 +110,24 @@ variable "route_grant_public_key_pem" {
   }
 }
 
+variable "runtime_provisioner_trust_bundle_json" {
+  description = "Canonical A23 deployment-provisioner trust bundle mounted read-only into cats-controld. Contains public keys only."
+  type        = string
+
+  validation {
+    condition = (
+      length(var.runtime_provisioner_trust_bundle_json) > 0 &&
+      (
+        length(base64encode(var.runtime_provisioner_trust_bundle_json)) * 3 / 4 -
+        (endswith(base64encode(var.runtime_provisioner_trust_bundle_json), "==") ? 2 :
+        endswith(base64encode(var.runtime_provisioner_trust_bundle_json), "=") ? 1 : 0)
+      ) <= 16384 &&
+      can(jsondecode(var.runtime_provisioner_trust_bundle_json))
+    )
+    error_message = "runtime_provisioner_trust_bundle_json must be nonempty JSON no larger than the 16384-octet A23 cap; cats-controld enforces its canonical closed schema."
+  }
+}
+
 variable "storage_postgres_url" {
   description = "PostgreSQL URL used for ChunkStore roots, leases, and fencing."
   type        = string

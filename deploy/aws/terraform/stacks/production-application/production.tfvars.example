@@ -29,6 +29,7 @@ public_subnet_ids = [
 ]
 
 # Do not put runtime_secret_data, route_grant_private_key_pem or its CI-derived
-# route_grant_public_key_pem, storage_postgres_url, usage_postgres_url, stripe_secret_key,
+# route_grant_public_key_pem, runtime_provisioner_trust_bundle_json,
+# storage_postgres_url, usage_postgres_url, stripe_secret_key,
 # stripe_webhook_secret, or rds_ca_pem in this file. Supply them through
-# TF_VAR_* or the CI secret store.
+# TF_VAR_* or the central provisioning/CI store.

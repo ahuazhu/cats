@@ -1,6 +1,7 @@
 //! Real PostgreSQL acceptance tests for the A23 authority core.
 
-use std::sync::{Arc, Barrier};
+use std::sync::{mpsc, Arc, Barrier};
+use std::time::Duration;
 
 use cats_api::runtime_reconciliation::{
     canonical_ed25519_spki_sha256, runtime_provisioner_active_set_digest, AllocatableMemoryBytes,
@@ -15,7 +16,7 @@ use cats_api::runtime_reconciliation::{
 };
 
 use super::placement_policy::RuntimeNodeAuthorityApplyStoreOutcome;
-use crate::store::Store;
+use crate::store::{AuthorityRequestContext, Store};
 
 const SPKI_A: &str = "MCowBQYDK2VwAyEA11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
 const SPKI_B: &str = "MCowBQYDK2VwAyEAPUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw";
@@ -158,6 +159,83 @@ fn assert_applied(
         RuntimeNodeAuthorityStoredOutcome::AuthorityPreconditionFailed => {
             panic!("expected applied outcome")
         }
+    }
+}
+
+fn pause_apply_commit(store: &Store, url: &str, barrier_key: i64) -> postgres::Client {
+    store
+        .with(|client| {
+            client.batch_execute(&format!(
+                "CREATE FUNCTION runtime_node_authority_pause_commit_for_test()
+                   RETURNS trigger LANGUAGE plpgsql AS $$
+                   BEGIN
+                     PERFORM pg_advisory_lock({barrier_key});
+                     PERFORM pg_advisory_unlock({barrier_key});
+                     RETURN NEW;
+                   END
+                   $$;
+                 CREATE CONSTRAINT TRIGGER runtime_node_authority_pause_commit_for_test
+                   AFTER INSERT ON runtime_node_authority_apply_records
+                   DEFERRABLE INITIALLY DEFERRED
+                   FOR EACH ROW EXECUTE FUNCTION runtime_node_authority_pause_commit_for_test()"
+            ))
+        })
+        .unwrap();
+    let mut barrier = postgres::Client::connect(url, postgres::NoTls).unwrap();
+    barrier
+        .query_one("SELECT pg_advisory_lock($1)", &[&barrier_key])
+        .unwrap();
+    barrier
+}
+
+fn release_apply_commit(barrier: &mut postgres::Client, barrier_key: i64) {
+    assert!(barrier
+        .query_one("SELECT pg_advisory_unlock($1)", &[&barrier_key])
+        .unwrap()
+        .get::<_, bool>(0));
+}
+
+fn wait_for_commit_attempt(request: &AuthorityRequestContext) {
+    let started = std::time::Instant::now();
+    while !request.commit_was_attempted() {
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "writer did not enter PostgreSQL COMMIT"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn backend_pid(store: &Store) -> i32 {
+    store
+        .with(|client| Ok(client.query_one("SELECT pg_backend_pid()", &[])?.get(0)))
+        .unwrap()
+}
+
+fn wait_for_advisory_lock_wait(store: &Store, backend_pid: i32) {
+    let started = std::time::Instant::now();
+    loop {
+        let waiting = store
+            .with(|client| {
+                Ok(client
+                    .query_one(
+                        "SELECT EXISTS (
+                           SELECT 1 FROM pg_locks
+                            WHERE pid=$1 AND locktype='advisory' AND NOT granted
+                         )",
+                        &[&backend_pid],
+                    )?
+                    .get::<_, bool>(0))
+            })
+            .unwrap();
+        if waiting {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "resolver backend did not wait on the apply-ID advisory lock"
+        );
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -417,6 +495,210 @@ fn retired_provisioner_is_rejected_before_replay_or_new_apply() {
             Ok(())
         })
         .unwrap();
+}
+
+#[test]
+fn provisioner_retirement_and_apply_share_locks_define_both_race_orders() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let seed = Store::connect(&url, None).unwrap();
+    let a = credential("provisioner_a", SPKI_A);
+    let b = credential("provisioner_b", SPKI_B);
+    let active_one = active_set(vec![a.clone()]);
+    seed.install_runtime_provisioner_trust_bundle(&trust(1, vec![a.clone()], None))
+        .unwrap();
+    const COMMIT_BARRIER: i64 = 8_023_004_023_772;
+    let mut commit_barrier = pause_apply_commit(&seed, &url, COMMIT_BARRIER);
+    let request = provision(19);
+    let writer_request = request.clone();
+    let actor = principal(&a);
+    let writer = Store::connect(&url, None).unwrap();
+    let request_context = AuthorityRequestContext::new(
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    );
+    let writer_observer = request_context.clone();
+    let writer = std::thread::spawn(move || {
+        writer
+            .apply_runtime_node_authority_request(&actor, &writer_request, &request_context)
+            .unwrap()
+    });
+    wait_for_commit_attempt(&writer_observer);
+
+    let retirement = Store::connect(&url, None).unwrap();
+    let next = trust(2, vec![b.clone()], Some(&active_one));
+    let (started_tx, started_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
+    let retirement = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        result_tx
+            .send(retirement.install_runtime_provisioner_trust_bundle(&next))
+            .unwrap();
+    });
+    started_rx.recv().unwrap();
+    assert!(
+        matches!(
+            result_rx.recv_timeout(Duration::from_millis(150)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "retirement passed the apply's trust share locks before its result commit"
+    );
+    release_apply_commit(&mut commit_barrier, COMMIT_BARRIER);
+    let committed = writer.join().unwrap();
+    assert_applied(committed.clone(), RuntimeNodeAuthorityOutcome::Provisioned);
+    result_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    retirement.join().unwrap();
+    let verifier = Store::connect(&url, None).unwrap();
+    assert_eq!(
+        verifier
+            .apply_runtime_node_authority(&principal(&a), &request)
+            .unwrap(),
+        RuntimeNodeAuthorityApplyStoreOutcome::AuthenticationFailed
+    );
+    assert_eq!(
+        verifier
+            .apply_runtime_node_authority(&principal(&b), &request)
+            .unwrap(),
+        committed
+    );
+
+    let retire_first_url = crate::testsupport::isolated_control_store_url();
+    let retire_first = Store::connect(&retire_first_url, None).unwrap();
+    retire_first
+        .install_runtime_provisioner_trust_bundle(&trust(1, vec![a.clone()], None))
+        .unwrap();
+    retire_first
+        .install_runtime_provisioner_trust_bundle(&trust(2, vec![b], Some(&active_one)))
+        .unwrap();
+    assert_eq!(
+        retire_first
+            .apply_runtime_node_authority(&principal(&a), &provision(18))
+            .unwrap(),
+        RuntimeNodeAuthorityApplyStoreOutcome::AuthenticationFailed
+    );
+    retire_first
+        .with(|client| {
+            assert_eq!(
+                client
+                    .query_one(
+                        "SELECT count(*) FROM runtime_node_authority_apply_records",
+                        &[],
+                    )?
+                    .get::<_, i64>(0),
+                0
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn ambiguous_resolver_waits_for_apply_reservation_then_distinguishes_commit_and_rollback() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let seed = Store::connect(&url, None).unwrap();
+    let a = credential("provisioner_a", SPKI_A);
+    seed.install_runtime_provisioner_trust_bundle(&trust(1, vec![a.clone()], None))
+        .unwrap();
+    // Hold a database-wide test lock that an INITIALLY DEFERRED trigger takes
+    // only while PostgreSQL is executing COMMIT. This puts the writer beyond
+    // AuthorityRequestContext::begin_commit while its transaction (and A23
+    // apply-ID reservation) is deliberately still unsettled.
+    const COMMIT_BARRIER: i64 = 8_023_004_023_771;
+    let mut commit_barrier = pause_apply_commit(&seed, &url, COMMIT_BARRIER);
+    let request = provision(20);
+    let actor = principal(&a);
+    let writer = Store::connect(&url, None).unwrap();
+    let resolver = Store::connect(&url, None).unwrap();
+    let resolver_pid = backend_pid(&resolver);
+    let resolver_monitor = Store::connect(&url, None).unwrap();
+    let request_context = AuthorityRequestContext::new(
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    );
+    let writer_observer = request_context.clone();
+    let writer_request = request.clone();
+    let writer = std::thread::spawn(move || {
+        writer
+            .apply_runtime_node_authority_request(&actor, &writer_request, &request_context)
+            .unwrap()
+    });
+    wait_for_commit_attempt(&writer_observer);
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
+    let resolver_request = request.clone();
+    let resolver_thread = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        result_tx
+            .send(
+                resolver
+                    .resolve_runtime_node_authority_apply(&resolver_request)
+                    .unwrap(),
+            )
+            .unwrap();
+    });
+    started_rx.recv().unwrap();
+    wait_for_advisory_lock_wait(&resolver_monitor, resolver_pid);
+    assert_eq!(
+        result_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty),
+        "resolver returned before the original apply reservation settled"
+    );
+    release_apply_commit(&mut commit_barrier, COMMIT_BARRIER);
+    let committed = writer.join().unwrap();
+    assert_eq!(
+        result_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        Some(committed)
+    );
+    resolver_thread.join().unwrap();
+
+    let rollback_url = crate::testsupport::isolated_control_store_url();
+    let rollback_writer = Store::connect(&rollback_url, None).unwrap();
+    let rollback_resolver = Store::connect(&rollback_url, None).unwrap();
+    let rollback_resolver_pid = backend_pid(&rollback_resolver);
+    let rollback_monitor = Store::connect(&rollback_url, None).unwrap();
+    let rollback_request = provision(21);
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let writer_entered = Arc::clone(&entered);
+    let writer_release = Arc::clone(&release);
+    let apply_id = rollback_request.apply_id.to_string();
+    let writer = std::thread::spawn(move || {
+        rollback_writer
+            .rollback_runtime_node_authority_reservation_for_test(
+                &apply_id,
+                &writer_entered,
+                &writer_release,
+            )
+            .unwrap();
+    });
+    entered.wait();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
+    let resolver_thread = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        result_tx
+            .send(
+                rollback_resolver
+                    .resolve_runtime_node_authority_apply(&rollback_request)
+                    .unwrap(),
+            )
+            .unwrap();
+    });
+    started_rx.recv().unwrap();
+    wait_for_advisory_lock_wait(&rollback_monitor, rollback_resolver_pid);
+    assert_eq!(
+        result_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty),
+        "resolver returned None before the original reservation rolled back"
+    );
+    release.wait();
+    writer.join().unwrap();
+    assert_eq!(
+        result_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        None
+    );
+    resolver_thread.join().unwrap();
 }
 
 #[test]

@@ -4,7 +4,7 @@ locals {
   # Auto Mode ALB remove that target; otherwise the ALB can route to a process
   # that has already exited during the propagation window.
   public_target_pre_stop_delay_seconds           = 15
-  public_target_termination_grace_period_seconds = 30
+  public_target_termination_grace_period_seconds = 60
 
   labels = {
     "app.kubernetes.io/part-of"    = "cats"
@@ -62,8 +62,8 @@ locals {
 
 check "public_target_drain_fits_termination_grace" {
   assert {
-    condition     = local.public_target_pre_stop_delay_seconds < local.public_target_termination_grace_period_seconds
-    error_message = "public target termination grace must outlast its preStop target-drain delay."
+    condition     = local.public_target_pre_stop_delay_seconds + 30 <= local.public_target_termination_grace_period_seconds
+    error_message = "public target termination grace must leave at least 30 seconds after preStop for commit-resolution shutdown."
   }
 }
 
@@ -179,6 +179,22 @@ resource "kubernetes_secret_v1" "route_grant_signing" {
   }
 }
 
+# Public deployment-provisioner trust is a rollout-pinned artifact, not a
+# credential. A subPath bind mount gives the process one root-owned regular
+# 0644 file instead of Kubernetes' symlink-based projected-volume entry; the
+# A23 descriptor reader deliberately rejects symlinks and hot reload.
+resource "kubernetes_config_map_v1" "runtime_provisioner_trust" {
+  metadata {
+    name      = "cats-runtime-provisioner-trust"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels    = local.labels
+  }
+
+  data = {
+    "runtime-provisioner-trust.v1.json" = var.runtime_provisioner_trust_bundle_json
+  }
+}
+
 resource "kubernetes_config_map_v1" "rds_ca" {
   metadata {
     name      = "cats-rds-ca"
@@ -224,9 +240,10 @@ resource "kubernetes_deployment_v1" "control_plane" {
           "app.kubernetes.io/name" = "cats-controld"
         })
         annotations = {
-          "cats.run/runtime-secret-sha256"  = sha256(jsonencode(local.runtime_secret_data))
-          "cats.run/route-grant-key-sha256" = sha256("${var.route_grant_private_key_pem}\n${var.route_grant_public_key_pem}")
-          "cats.run/rds-ca-sha256"          = sha256(local.rds_ca_pem)
+          "cats.run/runtime-secret-sha256"            = sha256(jsonencode(local.runtime_secret_data))
+          "cats.run/route-grant-key-sha256"           = sha256("${var.route_grant_private_key_pem}\n${var.route_grant_public_key_pem}")
+          "cats.run/runtime-provisioner-trust-sha256" = sha256(var.runtime_provisioner_trust_bundle_json)
+          "cats.run/rds-ca-sha256"                    = sha256(local.rds_ca_pem)
         }
       }
 
@@ -283,6 +300,8 @@ resource "kubernetes_deployment_v1" "control_plane" {
             "/etc/cats/runtime/CATS_POSTGRES_URL",
             "--guest-runtime-profile-receipt-file",
             "/opt/cats/release/guest-runtime-profile.v1.json",
+            "--runtime-provisioner-trust-file",
+            "/etc/cats/identity/runtime-provisioner-trust.v1.json",
             "--metadata-store-adapter",
             "postgres",
             "--metadata-store-option",
@@ -419,6 +438,13 @@ resource "kubernetes_deployment_v1" "control_plane" {
             mount_path = "/etc/cats/route-grant"
             read_only  = true
           }
+
+          volume_mount {
+            name       = "runtime-provisioner-trust"
+            mount_path = "/etc/cats/identity/runtime-provisioner-trust.v1.json"
+            sub_path   = "runtime-provisioner-trust.v1.json"
+            read_only  = true
+          }
         }
 
         volume {
@@ -442,6 +468,15 @@ resource "kubernetes_deployment_v1" "control_plane" {
 
           secret {
             secret_name = kubernetes_secret_v1.route_grant_signing.metadata[0].name
+          }
+        }
+
+        volume {
+          name = "runtime-provisioner-trust"
+
+          config_map {
+            name         = kubernetes_config_map_v1.runtime_provisioner_trust.metadata[0].name
+            default_mode = "0644"
           }
         }
       }

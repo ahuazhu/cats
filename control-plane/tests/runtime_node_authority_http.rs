@@ -32,7 +32,7 @@ use cats_metering::SqliteUsageStore;
 use cats_storage::MetadataStore;
 use reqwest::{Method, RequestBuilder, StatusCode};
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
 const DEPLOYMENT_ID: &str = "deployment_a";
@@ -67,6 +67,39 @@ async fn pending_machine_body(addr: std::net::SocketAddr) -> TcpStream {
     );
     stream.write_all(request.as_bytes()).await.unwrap();
     stream
+}
+
+async fn read_raw_response(mut stream: TcpStream) -> Vec<u8> {
+    let mut response = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        stream.read_to_end(&mut response),
+    )
+    .await
+    .expect("A23 raw request exceeded its absolute deadline")
+    .unwrap();
+    response
+}
+
+async fn chunked_machine_request(context: &Context, body: &[u8]) -> Vec<u8> {
+    let signed =
+        runtime_node_authority_signed_request(DEPLOYMENT_ID, &context.provisioner_id, body);
+    let signature = URL_SAFE_NO_PAD.encode(context.signer.sign(&signed).as_ref());
+    let mut stream = TcpStream::connect(context.server.addr).await.unwrap();
+    let headers = format!(
+        "POST {RUNTIME_NODE_AUTHORITY_PATH} HTTP/1.1\r\nHost: {}\r\n\
+         Content-Type: {JSON_CONTENT_TYPE}\r\n\
+         Cats-Provisioner-Credential-Id: {}\r\n\
+         Cats-Provisioner-Signature: {signature}\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+        context.server.addr,
+        context.provisioner_id,
+        body.len(),
+    );
+    stream.write_all(headers.as_bytes()).await.unwrap();
+    stream.write_all(body).await.unwrap();
+    stream.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+    read_raw_response(stream).await
 }
 
 impl Context {
@@ -343,7 +376,11 @@ async fn machine_apply_replay_conflict_and_persisted_precondition_are_exact() {
 #[tokio::test]
 async fn machine_envelope_rejects_legacy_and_node_credentials_before_decode() {
     let context = Context::new().await;
-    for token in [ADMIN_TOKEN, SERVICE_TOKEN] {
+    for token in [
+        ADMIN_TOKEN,
+        SERVICE_TOKEN,
+        "cats_wst_0123456789abcdef0123456789abcdef",
+    ] {
         let response = context
             .http
             .post(context.url(RUNTIME_NODE_AUTHORITY_PATH))
@@ -457,6 +494,20 @@ async fn route_media_and_wire_caps_are_closed_before_domain_decode() {
         exact_body(over_limit).await,
         br#"{"code":"request_too_large","message":"runtime node authority request is too large"}"#
     );
+
+    let mut chunked_at_limit = vec![b' '; 65_536];
+    chunked_at_limit[0] = b'{';
+    chunked_at_limit[1] = b'}';
+    let response = chunked_machine_request(&context, &chunked_at_limit).await;
+    assert!(std::str::from_utf8(&response)
+        .unwrap()
+        .starts_with("HTTP/1.1 400 Bad Request\r\n"));
+    let response = chunked_machine_request(&context, &vec![b' '; 65_537]).await;
+    let response = std::str::from_utf8(&response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 413 Payload Too Large\r\n"));
+    assert!(response.ends_with(
+        r#"{"code":"request_too_large","message":"runtime node authority request is too large"}"#
+    ));
 }
 
 #[tokio::test]
@@ -576,4 +627,22 @@ async fn global_admission_is_exactly_32_nonblocking_requests_and_releases_on_can
         .await
         .unwrap();
     assert_eq!(released.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn absolute_deadline_closes_an_incomplete_body_with_the_one_retryable_error() {
+    let context = Context::new().await;
+    let stream = pending_machine_body(context.server.addr).await;
+    let started = std::time::Instant::now();
+    let response = read_raw_response(stream).await;
+    assert!(started.elapsed() >= std::time::Duration::from_secs(9));
+    let response = std::str::from_utf8(&response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+    assert!(response.to_ascii_lowercase().contains("retry-after: 1\r\n"));
+    assert!(response
+        .to_ascii_lowercase()
+        .contains("cache-control: no-store\r\n"));
+    assert!(response.ends_with(
+        r#"{"code":"temporarily_unavailable","message":"runtime node authority is temporarily unavailable"}"#
+    ));
 }

@@ -56,6 +56,11 @@ variable "route_grant_public_key_pem" {
   type        = string
 }
 
+variable "runtime_provisioner_trust_bundle_json" {
+  description = "Canonical A23 deployment-provisioner public trust bundle. Supply from the central provisioning release."
+  type        = string
+}
+
 variable "storage_postgres_url" {
   description = "ChunkStore metadata PostgreSQL URL."
   type        = string

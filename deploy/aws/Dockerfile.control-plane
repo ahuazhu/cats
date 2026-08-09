@@ -32,7 +32,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 cats \
-    && useradd --uid 10001 --gid cats --home-dir /var/lib/cats --create-home cats
+    && useradd --uid 10001 --gid cats --home-dir /var/lib/cats --create-home cats \
+    && install -d -o 0 -g 0 -m 0755 /etc/cats/identity
 
 COPY --from=builder /out/cats-controld /usr/local/bin/cats-controld
 COPY --from=builder /out/cats-gatewayd /usr/local/bin/cats-gatewayd

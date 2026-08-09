@@ -263,9 +263,7 @@ impl RuntimeNodeAuthorityService {
         let timeout = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
         tokio::pin!(timeout);
         tokio::select! {
-            result = &mut result_rx => result.map_err(|_| {
-                ApiError::internal("runtime Node authority commit owner stopped without a result")
-            })?,
+            biased;
             () = &mut timeout => {
                 request.cancel();
                 Err(ApiError::unavailable(
@@ -278,6 +276,9 @@ impl RuntimeNodeAuthorityService {
                     "runtime Node authority service is shutting down",
                 ))
             }
+            result = &mut result_rx => result.map_err(|_| {
+                ApiError::internal("runtime Node authority commit owner stopped without a result")
+            })?,
         }
     }
 }
@@ -599,7 +600,10 @@ async fn authenticate(
             // principal. Reject them before consulting WorkOS so an
             // unconfigured or unavailable WorkOS dependency cannot turn a
             // deterministic authentication failure into a retryable 503.
-            if token == state.cfg.admin_token || token == state.cfg.auth_token {
+            if token == state.cfg.admin_token
+                || token == state.cfg.auth_token
+                || token.starts_with("cats_wst_")
+            {
                 return Err(authentication_failed());
             }
             let workos = state
@@ -685,9 +689,10 @@ async fn await_before_deadline_or_shutdown<T>(
     tokio::pin!(timeout);
     tokio::pin!(future);
     tokio::select! {
-        result = &mut future => AwaitOutcome::Completed(result),
+        biased;
         () = &mut timeout => AwaitOutcome::Deadline,
         () = wait_for_shutdown(shutdown) => AwaitOutcome::Shutdown,
+        result = &mut future => AwaitOutcome::Completed(result),
     }
 }
 
@@ -902,6 +907,20 @@ mod tests {
         assert!(admission.try_principal(&principal).is_err());
         drop(principals);
         assert!(admission.try_principal(&principal).is_ok());
+    }
+
+    #[tokio::test]
+    async fn expired_absolute_deadline_wins_over_an_already_ready_result() {
+        let (_, mut shutdown) = tokio::sync::watch::channel(true);
+        assert!(matches!(
+            await_before_deadline_or_shutdown(
+                Instant::now() - Duration::from_millis(1),
+                &mut shutdown,
+                std::future::ready(42_u8),
+            )
+            .await,
+            AwaitOutcome::Deadline
+        ));
     }
 
     #[tokio::test]

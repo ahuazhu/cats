@@ -58,6 +58,10 @@ missing-file or fixture fallback. The full fail-closed contract is
 single-build payload/manifest plus root-provisioned local Node identity are frozen by
 [Runtime Composition Artifacts v1](../../docs/specs/runtime-composition-artifacts-v1.md). `cats-noded` does
 not derive registration identity from the development `CATS_NODE_ID`, hostname, address or Host kernel.
+Control additionally requires the provisioner-owned root:root 0644 regular file
+`/etc/cats/identity/runtime-provisioner-trust.v1.json` through the exact
+`--runtime-provisioner-trust-file` argument. The unit's 35-second stop timeout
+leaves the fixed 30-second A23 commit-resolution join window intact.
 
 The installer holds one `/run/lock/cats/worker-deployment.lock` descriptor from Node stop through every installed
 mutation, candidate registration-backed readiness and Guest release commit. An interrupted transaction restores

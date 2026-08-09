@@ -866,7 +866,7 @@ async fn assert_membership_unavailable(response: reqwest::Response) {
 }
 
 #[tokio::test]
-async fn node_authority_jwt_uses_current_admin_org_permission_not_stale_claims_or_role_slug() {
+async fn node_authority_workos_contract_uses_only_current_admin_org_permission() {
     let ctx = Ctx::new().await;
     let token_without_permission = ctx.cli_token_with_permissions("org_admin", &[]);
     let before = ctx.membership_request_count();
@@ -935,11 +935,7 @@ async fn node_authority_jwt_uses_current_admin_org_permission_not_stale_claims_o
         r#"{"code":"permission_denied","message":"runtime node authority permission denied"}"#,
     )
     .await;
-}
 
-#[tokio::test]
-async fn node_authority_admin_cookie_is_online_authorized_and_envelopes_fail_closed() {
-    let ctx = Ctx::new().await;
     ctx.set_fleet_authority("member", &["cats:fleet:admin"]);
     let admin_cookie = ctx.login("admin", "admin-code").await;
     let (body, apply_id) = node_authority_update('c');
@@ -991,11 +987,7 @@ async fn node_authority_admin_cookie_is_online_authorized_and_envelopes_fail_clo
         r#"{"code":"authentication_failed","message":"runtime node authority authentication failed"}"#,
     )
     .await;
-}
 
-#[tokio::test]
-async fn node_authority_workos_current_deny_and_outage_are_exact_and_retryable_only_on_outage() {
-    let ctx = Ctx::new().await;
     let (body, _) = node_authority_update('d');
     let wrong_org = ctx
         .http
