@@ -20,6 +20,9 @@
 |---|---|
 | Disk 是否存在、属于哪个 Workspace、是否可加入 Cat | Control Store |
 | 当前 DesiredRuntimeSpec 中的完整磁盘集合 | Control Store |
+| Endpoint产品identity、所属Cat与管理名 | `EndpointRecord` |
+| Endpoint当前hostname/protocol/port/route epoch binding | current完整`DesiredRuntimeSpec` |
+| hostname到current Desired的定位 | `HostnameDesiredLookup`投影；不是binding authority |
 | 当前 volume owner、fencing epoch、remote Root | MetadataStore |
 | DiskSnapshot产品资源与GC live-root | DiskSnapshotRecord |
 | 本规格覆盖的Workspace product mutation请求身份与不可变返回结果 | PostgreSQL `ApiIdempotencyResult` |
@@ -33,7 +36,7 @@ pure-domain/data-row fixture，不提供Control cross-row authority。首次消�
 都通过唯一PG事务域的固定锁序完成。
 
 全局锁DAG是`ApiIdempotencyResult key reservation -> CatNameLock -> HostFenceEvent -> AuthorizationRecord ->
-VolumeRecord -> Control Disk/Cat/Desired rows -> DiskSnapshotRecord`；事务跳过自己不涉及的节点，同类
+VolumeRecord -> Control Cat/Disk/Desired/Endpoint rows -> DiskSnapshotRecord`；事务跳过自己不涉及的节点，同类
 多行按稳定ID排序。§3.3覆盖的Workspace product mutation先取得由认证Workspace、canonical route和`Idempotency-Key`导出的
 PostgreSQL transaction-scoped reservation，再读结果；它不能先锁资源，也不落持久Pending。这样同一
 key即使携带不同资源也不会分别先锁不同Volume。normal acquire只锁`VolumeRecord`，因此它与snapshot
@@ -81,7 +84,7 @@ normal begin都在持锁的current rows上完成。
 
 本文复用[Runtime Reconciliation §1.1](runtime-reconciliation-v1.md#11-v1-wire-基础类型)的`Id`、
 `AsciiText`、`RandomId128`、`Revision`、`Epoch`、`FenceEpoch`、`Generation`、`UnixMillis`和
-`Sha256Digest`定义。normal transition、authorization和delete保留各自类型，不引入可混用的统一ID。
+`Sha256Digest`、`Hostname`定义。normal transition、authorization和delete保留各自类型，不引入可混用的统一ID。
 操作ID解决响应丢失，epoch解决ABA；两者不能互相代替。
 
 ## 3. PostgreSQL authority 模型
@@ -124,6 +127,31 @@ CatRecord {
   workspace_id: Id,
   name: Id,
   created_at: UnixMillis
+}
+
+EndpointRecord {
+  endpoint_id: Id,
+  workspace_id: Id,
+  cat_id: Id,
+  name: Id,
+  created_at: UnixMillis
+}
+
+HostnameDesiredLookup {
+  hostname: Hostname,
+  workspace_id: Id,
+  cat_id: Id,
+  endpoint_id: Id,
+  desired_revision: Revision
+}
+
+CatCreateRequest {
+  name: Id,
+  boot_image_digest: Sha256Digest,
+  vcpus: integer 1..=4294967295,
+  memory_bytes: integer 1..=9223372036854775807,
+  root_size_bytes: integer 1..=1099511627776,
+  durability: "strict" | "relaxed"
 }
 
 CatCreateAcceptedResponse {
@@ -259,6 +287,15 @@ DeleteCompletionReceipt =
 只由`DiskRecord.role.root {cat_id}`、current完整`DesiredRuntimeSpec`、accepted observation和`Operation`
 回答。每个Cat恰好一个Root的交叉约束仍按下段锁定Disk/current Desired验证，不能向Cat row增加缓存字段作为
 第二个关系权威。Cat create的初始target也只由同事务的Desired/Operation携带，`CatRecord`不另存或选择target。
+
+`EndpointRecord`的五个字段创建后都不可修改，`endpoint_id`全局唯一、`(cat_id, name)`唯一；workspace/cat
+必须逐字段指向同一合法Cat。它只保存产品identity和管理名，不复制hostname、protocol、port、route epoch、
+placement或wake状态。`HostnameDesiredLookup.hostname`全局唯一，并且只定位
+`workspace_id/cat_id/endpoint_id/desired_revision`；signer必须在同一snapshot重读该revision的current完整
+Desired并逐字段闭合Endpoint binding，不能单独把lookup当作签发authority。创建或改变Endpoint的事务必须
+原子写完整Desired与对应lookup；任何提交仍包含该Endpoint的新current完整Desired revision的事务也必须把
+lookup推进到同一revision，移除Endpoint则在同一事务删除旧lookup。任一不等是store invariant failure并
+fail closed。
 
 `DiskRecord`的disk/workspace/name/volume identity、size、durability和created_at创建后不可修改，且
 size/durability必须与同一`VolumeRecord`逐字段相同。`DiskRecord.volume_id`全局唯一：产品Disk与Volume
@@ -414,6 +451,7 @@ path/query percent spelling、顺序不同，即使业务解析后等价，也�
 |---|---|---|---|---|---|---|
 | absent If-Match | `ws_01` | `POST /v1/workspaces/{workspace}/disks` | `/v1/workspaces/ws_01/disks` | `00` | `{"durability":"strict","name":"data","size_bytes":1073741824}` | `sha256:5069be7db8918e6a363d4d842224d9437a9eba202965ccc372838579b3b4ecbe` |
 | generation 7 | `ws_01` | `POST /v1/workspaces/{workspace}/disks/{disk}/actions/{verb}` | `/v1/workspaces/ws_01/disks/disk_01/actions/mount?note=a%2Fb` | `010000000000000007` | hex `7b0a2020226361745f6964223a20226361745f3031222c0a2020226d6f756e745f6174223a20222f64617461220a7d` | `sha256:d07a08a0b37fbf5b6ee2022a6561f9441a186d516fd4316c5cce9068401bd6b7` |
+| Cat create | `ws_01` | `POST /v1/workspaces/{workspace}/cats` | `/v1/workspaces/ws_01/cats` | `00` | `{"boot_image_digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","durability":"strict","memory_bytes":2147483648,"name":"app","root_size_bytes":4294967296,"vcpus":2}` | `sha256:8745422e60778a889e8a85f9a45a7cadbbd57d71ba412417bf02daaedcb0f76c` |
 
 ## 4. Lease 接口和状态机
 
@@ -706,25 +744,116 @@ clean-slate cutover 不解析缺少这些字段的旧 pack，也不接受旧裸`
 mutation path中的Disk引用遵守§3的immutable `disk_id`规则；create response可以展示name，但后续资源path
 不以name代替ID。
 
+**Public Cat create request到完整candidate。** 唯一route是
+`POST /v1/workspaces/{workspace}/cats`，canonical route template逐byte同该string。它的HTTP envelope固定为：
+
+- transfer framing移除后的完整raw body最多4096 bytes；恰好4096合法，读到第4097 byte即可停止并拒绝，
+  不得先分配或解析无界body；
+- 恰好一个`Content-Type` field，field-value逐byte等于`application/json`；`Content-Encoding`只能缺席或
+  恰好一个逐byte等于`identity`的field；
+- `If-Match`必须完全缺席，任一occurrence都在fingerprint/fast lookup前拒绝；因此§3.3 fingerprint的
+  `if_match_payload`恒为单byte `0x00`；
+- raw path bytes必须精确等于`/v1/workspaces/<path中canonical workspace_id>/cats`，不接受percent-encoded
+  等价写法；query component必须缺席，`?x=1`和结尾裸`?`都在fingerprint/fast lookup前拒绝；
+- 必须携带§3.3的exact `Idempotency-Key`。fingerprint保留server收到的raw path/query和raw body bytes，
+  不把JSON重编码后再hash。
+
+body必须是无BOM的UTF-8 JSON object，并按上面的`CatCreateRequest`闭合：六个字段全部必填，unknown字段、
+duplicate key、null、错误JSON kind和尾随非空白bytes都拒绝；integer沿用Runtime §1.1的canonical raw number
+token和范围。`name`进一步收窄为1..=30 ASCII bytes，只允许`[a-z0-9-]`且首尾必须是`[a-z0-9]`；不trim、
+不lowercase、不做Unicode或DNS归一化。六个字段都没有隐式default。旧create-time `image` alias、额外`disk`、
+`auto_suspend`、`expires_at`及其optional/null形态都不是本route字段；磁盘成员、自动休眠和过期策略是后续
+独立mutation/policy，不能偷偷进入首个Desired。
+
+envelope/DTO、身份、当前Workspace membership和route permission通过后，按§3.3计算fingerprint并执行不查
+resource的fast lookup。exact hit逐byte重放且不得读取image、release receipt、placement或capacity；conflict
+也在这些读取前返回。只有fast miss才按以下唯一来源构造candidate：
+
+1. `boot_image_digest`直接寻址ADR-0017的
+   `images/<boot_image_digest去掉sha256:后的64位hex>/manifest.json`。service按
+   [blockd §6.3.1](blockd-protocol.md#631-root-provision-control-effect)完整验证immutable manifest；不解析image
+   alias/tag，也不查询catalog。Root实际`size_bytes = ceil(root_size_bytes / CHUNK_SIZE) * CHUNK_SIZE`，其中
+   `CHUNK_SIZE=4194304`；结果必须不小于manifest `size_bytes`且不大于`MAX_VOLUME_BYTES=1099511627776`。
+   manifest缺失/暂不可读、非法或size不满足时不生成可提交candidate，不以fixture manifest继续。
+2. `guest_config_digest`只取Control Plane启动时已验证的唯一
+   [GuestRuntimeProfileReceipt](runtime-reconciliation-v1.md#2-可信-node-与-agentsession) digest；请求、image
+   manifest和builder都不能提供或重算另一个值。生产service构造器要求显式release receipt，不能使用测试
+   fixture digest、编译期示例常量或空值fallback。
+3. placement planner只从当前provisioned/schedulable Node的current未失效`AgentSession`、fresh full
+   `AdmissionInventoryAttestation`及现有Node/placement事实中选择；session的`guest_config_digest`必须等于
+   上一步active release digest。调用时service把本批candidate `network_id`交给planner；planner为本次
+   candidate返回一个`node_id`和完整合法`NetworkConfig`；service
+   用该node构造`AssignedPlacement {kind:"assigned", node_id:planner node_id, placement_epoch:1}`，
+   NetworkConfig的`network_id`逐字段
+   等于本批candidate network ID，地址/MAC满足Runtime §3。
+   具体Node排序、capacity估算和地址选择算法不属于共享合同；planner结果只是可失效的pre-transaction plan，
+   不创建capacity reservation、network lease、scheduler row或第二authority。无可选Node/config时不创建
+   Desired/Operation。commit后Node/capacity/address事实变化由既有
+   `PlacementRejected(insufficient_vcpus|insufficient_memory|unsupported_block_path|unsupported_network|
+   unsupported_guest_capability)`
+   终结revision 1；任何重新选择都创建placement epoch更大的新系统revision，不能原地改candidate。
+
+public API/service在调用Store前一次生成整批独立、非全零`RandomId128`，并固定编码为
+`cat_<random>`、`disk_<random>`、`vol_<random>`、`att_<random>`、`vint_<random>`、`op_<random>`、
+`ep_<random>`和`net_<random>`；normal acquire的`transition_id`使用另一裸`RandomId128`。这些分别是
+Cat、Root Disk、Volume、attachment、volume intent、Operation、default Endpoint和network identity。
+同一candidate或任何重试不得重抽其中单个ID；任一identity/hostname碰撞或candidate事务回滚都丢弃整批，
+下一次只使用全新整批。planner一旦返回NetworkConfig，该network ID/MAC/IPv4/prefix/gateway也作为一个
+不可拆分binding固定；要改变任一字段就丢弃整批并以新network ID重plan，不能在同ID下换地址。
+Endpoint opaque suffix精确取`endpoint_id`去掉`ep_`后的32位lowercase hex，default
+hostname固定为`<request.name>-<suffix>.cats.run`；name上限保证该DNS label最长恰好63 bytes。
+
+fast miss后的唯一构造顺序固定为：先完成上面的immutable manifest与active release receipt验证；再一次生成
+上述整批ID；随后以请求shape和本批`network_id`调用planner；只在exact NetworkConfig返回后构造并验证完整
+Desired、计算`spec_digest`及全部cross-row binding；然后用同批`cat_id/operation_id`编码exact 202并准备固定
+409 envelope；最后才调用Store。planner拒绝、candidate/encoder验证失败或已知事务回滚都丢弃整批，不能保留
+某个ID、NetworkConfig或已编码202供下一批复用；commit/result不明只按§3.3重放权威查询，不能盲目重建。
+
+由上述事实构造的唯一初始`DesiredRuntimeSpec`是：
+
+- `version=1`、请求path中的`workspace_id`、candidate `cat_id`、`desired_revision=1`、`target="running"`、
+  planner node上的`placement_epoch=1`、`transition={kind:"cancel_and_drain"}`；
+- runtime的`vcpus/memory_bytes/boot_image_digest`逐字段来自request，`guest_config_digest`来自active release
+  receipt，`network_config`逐字段来自planner；
+- `volumes`恰好一个Root intent：使用candidate intent/disk/volume/attachment ID和上面的rounded size，
+  `disk_kind="root"`、`access="read_write_once"`、request durability、
+  `guest_device={serial:"cats-root",slot:0}`、
+  `acquire={kind:"normal",transition_id:candidate transition_id,expected_unowned_epoch:0}`、
+  `disposition={kind:"retain"}`、`mount=null`；
+- `endpoints`恰好一个default binding：candidate `endpoint_id`、上述hostname、`route_epoch=1`、
+  `protocol="http"`、`target_port=8080`；产品管理名`web`不复制进Runtime `EndpointIntent`，
+  `wake_on_request`是ADR-0010固定行为而不是第二份可变binding；
+- 最后按Runtime §16对除`spec_digest`外的完整字段计算唯一`spec_digest`。builder不能从测试Desired、Store
+  default或旧Cat row复制任何缺失字段。
+
+同一candidate还包含`CatRecord`、Root `DiskRecord/VolumeRecord`、
+`EndpointRecord {endpoint_id, workspace_id, cat_id, name:"web", created_at:待注入}`、与上述hostname/Desired
+revision逐字段相同的`HostnameDesiredLookup`、绑定该Desired的Pending Operation及exact 202 envelope。
+Store接收的是这份完整candidate；它只验证closed schema、全部交叉绑定和digest，不接受public request、image
+alias、planner callback或任意default参数来补全它。
+
 **RootDisk随Cat create。** auth/membership/route permission通过后，API先做一次不查resource的只读result
 fast lookup；hit直接重放，miss只是一条可失效的优化提示，不创建reservation或Pending。只有fast miss才完成
 placement/capacity等当前状态准备，并由public API/service边界在进入Store前一次性生成全部candidate identity、形成包含
 完整Desired及所有非时间业务字段的已验证bundle，并用同一批candidate通过canonical response encoder编码成功response；candidate尚未提交时不对外
 可见且永不复用。result miss后的唯一PG事务首次持久化这些identity，并原子写入Cat、current完整
-Desired、绑定该revision的runtime Operation、`root {cat_id}` Disk、generation-zero且Unowned的Root
-Volume，以及包含原operation ID的exact `ApiIdempotencyResult`。Cat、Disk和Desired的Workspace逐字段相同，
+Desired、default `EndpointRecord`及hostname lookup、绑定该revision的runtime Operation、
+`root {cat_id}` Disk、generation-zero且Unowned的Root Volume，以及包含原operation ID的exact
+`ApiIdempotencyResult`。Cat、Endpoint、Disk和Desired的Workspace/Cat identity逐字段相同，
 Desired恰好引用这一个Root Disk/Volume。全部rows/result同一commit或全部不存在；commit/response不明后
-同key只重放原status/body/operation ID，不生成第二个Cat、Disk、Volume、Desired或Operation。
+同key只重放原status/body/operation ID，不生成第二个Cat、Endpoint、network、Disk、Volume、Desired或Operation。
 初始Volume精确为`admin_state=Active`、`lease_epoch=0`、owner/expiry/last_transition均为null、head精确为
 `{generation:0, root_hash:null, root_object_id:null}`。Desired中唯一Root intent使用normal acquire且
 `expected_unowned_epoch=0`；任何非零epoch、非blank head、已有owner/transition或takeover acquire都拒绝整个bundle。
 candidate集合一次性包含`cat_id`、Root `disk_id/volume_id`、`attachment_id`、`volume_intent_id`、normal-acquire
-`transition_id`、`operation_id`以及完整Desired中出现的全部`Id/RandomId128`；Cat/Root/Volume全部非时间字段
-也在同一bundle内。Store逐字段验证Workspace、Root role、size/durability、Desired volume/operation binding与
-spec digest，不接收`placement_ok`、`capacity_ok`或其他验证bool。placement/capacity结果允许在commit后变旧，
+`transition_id`、`operation_id`、`endpoint_id`、`network_id`以及完整Desired中出现的全部`Id/RandomId128`；
+Cat/Endpoint/Root/Volume全部非时间字段也在同一bundle内。Store逐字段验证Workspace、Root role、
+size/durability、Endpoint/hostname lookup、Desired volume/operation binding与spec digest，不接收
+`placement_ok`、`capacity_ok`或其他验证bool。placement/capacity结果允许在commit后变旧，
 按Runtime §3.3既有`PlacementRejected -> new revision`闭环处理，不新增capacity reservation authority。
 Root不携带Persistent initialization状态，也不创建第二个Disk Operation。事务只读取一次PostgreSQL DB now，
-并把同一毫秒值写入`CatRecord.created_at`、`DiskRecord.created_at`、Operation的created/updated time和
+并把同一毫秒值写入`CatRecord.created_at`、`EndpointRecord.created_at`、`DiskRecord.created_at`、
+Operation的created/updated time和
 `ApiIdempotencyResult.created_at`；重放不刷新任何时间。
 
 Cat create调用边界同时携带两个非持久、由public API层预先编码的exact HTTP envelope：成功response和
@@ -741,7 +870,8 @@ candidate资源锁前，Store直接丢弃本次bundle/envelope并逐字节返回
 `pg_advisory_xact_lock(hashtextextended(current_schema() || ':cat-name:' || $1 || ':' || $2,
 0::BIGINT))`，其中`$1=workspace_id`、`$2=name`。
 `Id`中的冒号或64-bit hash碰撞最多让不同名称额外串行，不会让相同tuple得到不同lock。持锁后读取并验证
-`CatRecord`：合法existing row选择409；absent才继续Volume→Cat→Disk→Desired→Operation锁/插入；corrupt row
+`CatRecord`：合法existing row选择409；absent才继续
+Volume→Cat→Disk→Desired→EndpointRecord/hostname lookup→Operation锁/插入；corrupt row
 返回BackendUnknown。唯一约束只作invariant backstop，意外constraint error整体回滚，不能事后翻译成409。
 首次持久化的Operation固定为`phase=Pending, terminal=null`，其workspace/cat/revision/spec digest/placement/
 target从同一完整Desired和candidate operation ID构造；`created_at_unix_ms=updated_at_unix_ms`都由上述单次
@@ -749,11 +879,14 @@ DB now注入。调用边界不携带一个带伪时间的“完整Operation row�
 Root `DiskRecord.name`固定逐字节等于candidate `disk_id`，不从用户Cat name派生，也不增加第二种用户可观察
 name-conflict。若该server-generated disk ID/name意外碰撞既有Disk，则与其他candidate identity碰撞相同，
 整体回滚并用从未使用的新candidate bundle重试。
-server生成的cat/disk/volume/operation ID/name碰撞、stored row损坏和数据库/serialization失败不是name conflict，
+`EndpointRecord.endpoint_id`、`(cat_id,"web")`和lookup hostname使用数据库unique约束作并发/invariant
+backstop；候选endpoint/hostname与不属于同一candidate的现有row碰撞时整体回滚并换全新bundle，不能改suffix、
+采用existing Endpoint或写Cat name 409。
+server生成的cat/endpoint/network/disk/volume/operation ID/name碰撞、stored row损坏和数据库/serialization失败不是name conflict，
 不得写409 result；事务回滚后按其既有infrastructure/invariant规则处理。
 
 两个route response使用UTF-8、无BOM/空白/newline且按下列字段序编码；这是public API encoder fixed vector，
-不属于Runtime §16的10种wire或digest：
+不属于Runtime §16的wire或digest：
 
 | outcome | status/content-type | exact body bytes | bytes | SHA-256 |
 |---|---|---|---:|---|
@@ -1152,14 +1285,17 @@ tombstone；但只要某个Active HostFenceEvent的Consumed authorization引用�
 |---|---|
 | RemoteHead边界 | 只接受`0/null/null`或`>0/non-null/non-null`；hash、object ID、generation任一改变都会使exact compare失败；result/receipt逐字段复制tuple |
 | mutation分类gate | 枚举全部HTTP mutation；Workspace product route恰好使用本节PG result，Account/WorkOS、Billing/Stripe、fleet/admin、Node/internal、webhook及external-first route只使用既有domain协议；未分类或双归属均fail gate且不伪造system workspace |
-| API fingerprint fixed vectors | 独立实现按五个u64-BE frame重算§3.3两个hash；body key order/whitespace、raw percent spelling/query order或If-Match Generation任一改变都会冲突，Idempotency-Key/auth/cookie/request ID/User-Agent变化不改hash |
+| API fingerprint fixed vectors | 独立实现按五个u64-BE frame重算§3.3三个hash；body key order/whitespace、raw percent spelling/query order或If-Match Generation任一改变都会冲突，Idempotency-Key/auth/cookie/request ID/User-Agent变化不改hash |
 | API envelope/result exact replay | Idempotency-Key缺失、重复、空、非printable或超过512 bytes，以及wrong media type/non-identity encoding均在reservation前拒绝；hit不读resource并逐字节重放status/content-type/body，且route不依赖未保存的ETag/Location；response body超过1MiB则业务/result都不能commit；transport/commit unknown本身不结算失败row，最终只可能业务+result全有或全无 |
+| Cat create closed request | 4095/4096/4097-byte边界、非canonical/percent-encoded path、`?x=1`/结尾裸`?`、wrong/duplicate media与encoding、任一If-Match、unknown/duplicate/missing/null字段、非canonical integer、name首尾/大小写/长度、旧image alias/disk/auto-suspend/expiry都在fast lookup前按合同拒绝；合法raw bytes匹配§3.3 Cat vector |
 | DiskRecord identity/closed role | `volume_id`全局一对一；Root与Cat同Workspace且每Cat恰好一个，Persistent同时最多一个current Desired；Root只含不可变cat ID，Persistent只含两态initialization且仅允许同lineage的一次Uninitialized→Initialized；`{disk}`只解析disk_id，name只能显式lookup；完成删除后row缺席 |
-| Root create crash/重放 | Cat + current完整Desired + runtime Operation + generation-zero/unowned Root Disk/Volume + API result同一PG commit或全无；相同key只返回原operation ID且不生成第二identity；Root无Persistent initialization或第二Disk Operation |
+| Root create crash/重放 | Cat + default Endpoint/hostname lookup + current完整Desired + runtime Operation + generation-zero/unowned Root Disk/Volume + API result同一PG commit或全无；相同key只返回原operation ID且不生成第二identity；Root无Persistent initialization或第二Disk Operation |
 | Root create fast lookup/竞态 | exact fast hit不执行placement/capacity；异fingerprint在resource前冲突；fast miss后另一session以同key先commit时，业务事务reservation+reread命中、丢弃整组candidate且零candidate row |
+| Root create manifest/release/planner来源 | boot digest只读同digest immutable manifest，size按4MiB向上取整且覆盖manifest/不超1TiB；guest digest只来自验证过的release receipt；planner只选匹配digest的current session/fresh full inventory并返回exact network，任何缺失都不以fixture/default补齐 |
 | Root create name并发 | 两个不同key同Workspace/name经CatNameLock只能一方提交202全套rows，另一方零业务row并提交fixed 409；原Cat后来删除后，409 key仍逐byte重放；unique violation不能充当409路径 |
-| Root create candidate/corruption | 每类candidate ID/name碰撞、existing Cat cross-row corruption、serialization/connection failure均不写409/result或半rows；collision只用全新未使用bundle和重新编码的202重试 |
-| Root create exact初态/时间 | Volume仅接受Active+Unowned、epoch0、blank head、null owner/expiry/transition，Desired Root normal acquire expected epoch0；Cat/Disk/Operation/result四处使用同一DB-now，Operation为Pending/null；202/409 fixed vector由独立encoder逐byte重算 |
+| Root create candidate/corruption | 每类candidate ID/Endpoint/hostname/name碰撞、existing Cat cross-row corruption、serialization/connection failure均不写409/result或半rows；collision只用全新未使用bundle和重新编码的202重试 |
+| Root create exact初态/时间 | Desired固定revision1/Running/placement epoch1/cancel-and-drain、一个Root、一个web HTTP:8080 route epoch1；Volume仅接受Active+Unowned、epoch0、blank head、null owner/expiry/transition，Root normal acquire expected epoch0；Cat/Endpoint/Disk/Operation/result五处使用同一DB-now，Operation为Pending/null；202/409 fixed vector由独立encoder逐byte重算 |
+| Endpoint单一authority | EndpointRecord只保留immutable product identity/name；hostname lookup只定位current Desired；三者同txn且signer必须重读完整binding。改record/lookup/Desired任一identity/revision或制造hostname并发碰撞都fail closed，不采用旧binding |
 | Persistent create crash/重放 | Disk + empty exact Volume + 201 result同一PG commit或全无；相同key只返回原201且无Operation，异fingerprint不读resource |
 | initialization CAS/重放 | 锁current AgentSession与highest accepted head后才锁Volume/Disk/Desired/observation；observation ID、revision/placement、valid checkpoint `commit_initialized`、Owned attachment/epoch/head和active lineage逐字段匹配，new head非空且generation>0、R==L；session replacement或新observation先提交则旧evidence零副作用，initialize先提交则replacement随后正常前进；exact tuple保留首次time且无ledger |
 | normal acquire响应丢失/异payload | 相同RandomId128且完整request相同返回原result/absolute expiry；同ID异任一字段Stale，不使用domain request hash、不产生第二次fence |

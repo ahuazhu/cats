@@ -91,6 +91,7 @@ V1的值只能是`1`；顶层不存在`format_version`或按合同名变化的ve
 | `NodeIdentity` | 16384 |
 | `AgentRegistrationAttempt` | 16384 |
 | `AgentSession` | 16384 |
+| `GuestRuntimeProfileReceipt` | 4096 |
 | `AdmissionInventoryAttestation` | 16384 |
 | `DesiredRuntimeSpec` | 1048576 |
 | `RuntimeCheckpoint` | 4194304 |
@@ -150,6 +151,7 @@ AgentRegistrationAttempt {
   node_boot_id: NodeBootId,
   agent_instance_id: RandomId128,
   registration_attempt_id: RandomId128,
+  guest_config_digest: Sha256Digest,
   expected_agent_session_epoch: Epoch | null
 }
 
@@ -161,6 +163,7 @@ AgentSession {
   agent_instance_id: RandomId128,
   agent_session_epoch: Epoch,
   registration_attempt_id: RandomId128,
+  guest_config_digest: Sha256Digest,
   lease_deadline_unix_ms: UnixMillis
 }
 ```
@@ -168,10 +171,42 @@ AgentSession {
 首次注册的`expected_agent_session_epoch`必须为`null`；replacement必须是当前精确epoch。同一
 `(node_id, registration_attempt_id)`只能对应一个完整`AgentSession`。相同完整
 `AgentRegistrationAttempt`重放返回原session；`immutable_host_id`、`node_boot_id`、
-`agent_instance_id`或`expected_agent_session_epoch`任一不同都返回§16.4
+`agent_instance_id`、`guest_config_digest`或`expected_agent_session_epoch`任一不同都返回§16.4
 `registration_attempt_conflict`，不能把它当作新attempt，也不能复用`wrong_session`。
 `agent_session_epoch`和`lease_deadline_unix_ms`由Control
 Plane按PostgreSQL时间分配；Agent请求不能提供或延长deadline。
+
+`guest_config_digest`不是调用方选择的任意capability string。每个部署release只携带一个由release build
+一次生成的不可变artifact：
+
+```text
+GuestRuntimeProfileReceipt {
+  version: 1,
+  kernel_digest: Sha256Digest,
+  initramfs_digest: Sha256Digest | null,
+  kernel_cmdline: AsciiText,
+  guest_agent_protocol_version: 1
+}
+```
+
+`kernel_digest`和非null的`initramfs_digest`分别是对应完整文件bytes的普通SHA-256；null精确表示VMM不配置
+initramfs，不能表示文件缺失或校验失败。`kernel_cmdline`是传给VMM的exact printable-ASCII bytes，长度
+1..=512，不裁剪、不按空格重分词且不包含结尾NUL/newline。receipt必须是§16.1的canonical JSON bytes，
+不含BOM、前后空白或结尾newline，总长最多4096 bytes。其唯一digest为：
+
+```text
+guest_config_digest = SHA-256(
+  ASCII("cats.runtime.guest-runtime-profile.v1") || 0x00 || exact_receipt_bytes
+)
+```
+
+release build从已经验证的kernel、可选initramfs、唯一launch cmdline和Guest Agent协议literal生成这一个
+receipt；Control Plane与Node都读取部署系统分发的同一份bytes，不能各自从默认值重建。Node启动时先重算
+本机kernel/initramfs文件digest，逐byte比较实际launch cmdline并比较编译进binary的Guest Agent协议版本；
+任一不等都拒绝注册和启动runtime。Control Plane启动时重算同一receipt得到唯一批准digest；新注册attempt
+只有携带该exact digest才可创建session，成功的`AgentSession.guest_config_digest`逐字段复制attempt值。
+生产builder不得回退到测试fixture digest、环境缺省常量、image alias或catalog；测试必须显式注入自己的
+receipt。receipt是部署artifact，不是DB row、catalog、协商列表或第二authority。
 
 一次成功的全量inventory还为当前session建立独立的签发证明：
 
@@ -505,14 +540,18 @@ Cat create是第2条的完整原子实例：auth/membership/permission后先做�
 hit立即重放，fast miss不保留reservation/Pending。只有fast miss才做placement/capacity准备，并由public API/service生成
 一次性、未提交时不可见且永不复用的candidate
 identity、完整Desired及所有非时间业务字段，并以同一批identity编码成功response；同一PG commit首次持久化Cat、current完整Desired、runtime Operation、
-generation-zero且Unowned的Root Disk/Volume和包含原operation ID的result，或全部不写。Root没有
+default Endpoint产品记录/hostname lookup、generation-zero且Unowned的Root Disk/Volume和包含原operation ID的result，或全部不写。Root没有
 Persistent initialization状态或第二个Disk Operation。同key
 响应/commit不明只重放原response与operation ID，不能持久化第二组identity；业务事务仍须重新reservation/read，
 竞态result hit在资源锁前丢弃本次candidate。fast lookup不是重放authority。
 初始Volume只能是Active+Unowned、epoch 0、blank head且owner/expiry/last-transition全null；唯一Root
 `VolumeIntent.acquire`只能是normal且`expected_unowned_epoch=0`。任何其他初始形态是bundle invariant failure。
+Cat public request、release/image/planner来源、完整初始Desired和default Endpoint的唯一投影算法由
+[Volume Authority §8.1](volume-authority.md#81-disk-create)冻结。初始Desired固定为revision 1、target Running、
+placement epoch 1、`cancel_and_drain`，并携带一个Root和一个default HTTP Endpoint；Store仍只接收并验证完整
+candidate，不从public DTO补字段或选择default。
 Cat row的精确最小schema由[Volume Authority §3](volume-authority.md#3-postgresql-authority-模型)冻结，只保存
-不可变identity/name/created time；Root、target、placement和runtime状态不得复制进Cat row。Cat/Disk、
+不可变identity/name/created time；Root、target、placement和runtime状态不得复制进Cat row。Cat/Endpoint/Disk、
 Operation created/updated和API result的首次时间使用同一次PostgreSQL DB now，初始target只由本节完整
 Desired及其Operation携带。该Cat row不是Control Plane -> Node共享wire，也不属于F0 codegen集合。
 public API在调用Control Store前同时编码exact成功response和`(workspace_id, name)`冲突时的exact
@@ -524,15 +563,16 @@ conflict使用固定`already_exists` body。
 Store把candidate operation ID与Desired的workspace/cat/revision/digest/placement/target组合为初始
 `Pending + terminal=null` Operation，并以单次DB now同时填充created/updated time；它不接收伪时间、选择
 placement或重算spec。
-candidate一次构造并包含Cat/Root/Volume/attachment/intent/acquire/Operation identity以及完整Desired中全部
-`Id/RandomId128`；Store逐字段验证bundle内部绑定，不接受`placement_ok/capacity_ok` bool。提交后capacity
+candidate一次构造并包含Cat/Root/Volume/attachment/intent/acquire/Operation、Endpoint和network identity以及
+完整Desired中全部`Id/RandomId128`；Store逐字段验证bundle内部绑定，不接受
+`placement_ok/capacity_ok` bool。提交后capacity
 变旧仍使用本节既有`PlacementRejected -> new revision`，不新增capacity reservation authority。
 Root Disk的name固定等于candidate `disk_id`；它不从用户Cat name派生，意外碰撞只回滚并换一组未使用的
 candidate，不能产生第二种持久409。
-名称冲突事务不写Cat/Desired/Operation/Disk/Volume，只写该409 result；随机identity碰撞、持久row损坏或
+名称冲突事务不写Cat/Endpoint/hostname lookup/Desired/Operation/Disk/Volume，只写该409 result；随机identity碰撞、持久row损坏或
 数据库失败不得伪装成名称冲突result。
 业务事务的锁序固定为`API key -> CatNameLock(workspace_id,name) -> Volume -> Cat -> Disk -> Desired ->
-Operation`；name lock是transaction-scoped advisory coordination，不是持久row。锁后existing合法Cat才可选择
+Endpoint/hostname lookup -> Operation`；name lock是transaction-scoped advisory coordination，不是持久row。锁后existing合法Cat才可选择
 固定409，absent才继续；不能依赖unique-violation后的已回滚事务补写result。
 
 ## 4. Desired delivery 与 AdmissionCell
@@ -2163,6 +2203,8 @@ Rejoined；`host_destroyed`永不Rejoined，因此在没有tombstone、其他Hos
 |---|---|
 | N/N+1/N+2 ABA | 旧结果不能结算/授权 N+2；已线性化的本地 effect 可被下一轮安全修复 |
 | 双 Agent / register 响应丢失 | Host lock 排他；同 attempt 返回同 session；旧 session 永久拒绝 |
+| Guest runtime profile receipt | 独立重算fixed vector；kernel/initramfs任一byte、nullability、cmdline任一byte或Guest Agent协议变化都改变digest；非canonical artifact、文件/launch配置不等或fixture fallback使Node/Control启动失败 |
+| register Guest配置绑定 | attempt/session digest逐字段等于active release；同attempt改digest返回包含五字段binding的`registration_attempt_conflict`，新attempt错digest返回`guest_config_mismatch`且不分配epoch/写row；exact replay返回原session |
 | 各 planner step kill | restart 后确认、重试、继续或 quarantine；无重复 writer/误删 |
 | 进程崩溃，scope/socket/checkpoint仍存在 | full inventory报告scope/socket standalone residue及attributed checkpoint evidence；scope/socket强归属后产生Cat CleanupRelease，Deleted checkpoint只从`CheckpointEvidence.valid`产生Node单槽target；rescan后才可Ready/GC |
 | standalone residue归属冲突 | 只有scope/socket唯一Cat/tombstone强匹配才写该Cat RuntimeCheckpoint；unexpected/unassigned checkpoint及无/多匹配都保留证据并Quarantine，不自动删除 |
@@ -2227,7 +2269,7 @@ Node 必须先完成 session 注册和 complete empty inventory，才允许任�
 
 ### 16.1 Cats Canonical JSON v1
 
-本节四个V1 deterministic digest都使用同一确定性编码，不依赖Rust struct声明顺序或
+本节五个V1 deterministic digest都使用同一确定性编码，不依赖Rust struct声明顺序或
 `serde_json::Map`实现：
 
 1. 先按本规格完成全部类型、范围、one-of、排序和唯一性验证；无效对象没有digest。
@@ -2253,11 +2295,13 @@ canonical writer不能替decoder“修正”非canonical number；任何`1.0`、
 | `CheckpointEvidence.valid.content_digest` | `cats.runtime.checkpoint-content.v1` | 完整`RuntimeCheckpoint`，不删除任何字段 |
 | `inventory_digest` | `cats.runtime.inventory.v1` | 下述`InventoryDigestInput` |
 | `key_ring_digest` | `cats.runtime.key-ring.v1` | 下述`KeyRingDigestInput` |
+| `guest_config_digest` | `cats.runtime.guest-runtime-profile.v1` | §2完整`GuestRuntimeProfileReceipt`；release artifact bytes必须已经逐byte等于其canonical JSON |
 
-这四种digest中，同一顶层payload同时携带完整projection和claim的self-digest只有第1/3/4行，即
+这五种digest中，同一顶层payload同时携带完整projection和claim的self-digest只有第1/3/4行，即
 `DesiredRuntimeSpec.spec_digest`、complete `NodeObservation.inventory_digest`和non-null
 `NodeObservation.key_ring_digest`；它们在context-free decoder内重算。`RuntimeCheckpoint`本身只产生
-checkpoint content digest而不携带claim；`CheckpointEvidence.valid.content_digest`、
+checkpoint content digest而不携带claim；release receipt也不在自身复制digest。
+`CheckpointEvidence.valid.content_digest`、
 `AdmissionInventoryAttestation.inventory_digest`、`RuntimeCheckpoint.spec_digest`、
 `AppliedDesiredEvidence.spec_digest`和`Operation.desired_spec_digest`都缺少同payload完整projection，必须在
 §16.4.3与文件或stored context验证。
@@ -2317,6 +2361,17 @@ unavailable形态没有key-ring digest input。non-null/non-null/empty是合法�
 ### 16.3 fixed vectors
 
 以下code block内每个canonical JSON都是一行ASCII bytes，末尾没有newline。
+
+**Guest runtime profile receipt vector**的hash输入domain为
+`cats.runtime.guest-runtime-profile.v1`；artifact bytes必须与下行逐byte相同：
+
+```json
+{"guest_agent_protocol_version":1,"initramfs_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","kernel_cmdline":"console=ttyS0 root=/dev/vda rw clocksource=kvm-clock","kernel_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","version":1}
+```
+
+```text
+guest_config_digest = sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2
+```
 
 **Desired spec vector**的hash输入domain为`cats.runtime.desired-spec.v1`：
 
@@ -2393,7 +2448,19 @@ key_ring_digest = sha256:966a44bd1b4337c7e7dae913607740e7c7359bab2b7d4127419d63f
 key_ring_digest = sha256:7881e60fd2e5dfa2fda716f560d6f124a7defd6c06b9d23c1038c42471cc8000
 ```
 
-以下三个是严格serde/canonical wire fixed vectors，不增加新的digest domain。
+以下五个是严格serde/canonical wire fixed vectors，不增加新的digest domain。
+
+**AgentRegistrationAttempt wire vector**（digest绑定本节receipt vector）：
+
+```json
+{"agent_instance_id":"44444444444444444444444444444444","expected_agent_session_epoch":null,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","immutable_host_id":"host_a","node_boot_id":"33333333333333333333333333333333","node_id":"node_a","registration_attempt_id":"55555555555555555555555555555555","version":1}
+```
+
+**AgentSession wire vector**（`guest_config_digest`逐字段复制attempt）：
+
+```json
+{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","immutable_host_id":"host_a","lease_deadline_unix_ms":1720000060000,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","registration_attempt_id":"55555555555555555555555555555555","version":1}
+```
 
 **Volume CleanupRelease wire vector**：
 
@@ -2414,11 +2481,13 @@ valid checkpoint交叉校验；这里只固定wire，不表示该Running observa
 {"error":{"accepted_observation_id":"10101010101010101010101010101010","agent_session_epoch":2,"code":"observation_sequence_conflict","heartbeat_sequence":19,"node_id":"node_a","presented_observation_id":"20202020202020202020202020202020"},"message":"same sequence carried a different observation","version":1}
 ```
 
-实现测试必须逐字节断言全部canonical JSON、七个digest结果和三个non-digest wire vectors，另测object
+实现测试必须逐字节断言全部canonical JSON、八个digest结果和五个non-digest wire vectors，另测object
 输入key顺序变化不改变digest、数组逆序/重复/超限被拒绝、`spec_digest`自身变化不进入其输入，以及checkpoint
 物理字段、inventory residue/multiplicity或任一其他被覆盖字段变化都会改变对应digest。全部§1.2顶层合同
-必须共用version tests：missing/错误类型/越界、范围内非1，以及`format_version` unknown field；
-`ContractError`自身也必须携带`version:1`。
+必须共用version tests：missing/错误类型/越界、范围内非1，以及`format_version` unknown field；receipt的
+wire超限、leading/trailing whitespace、key reorder、等价非canonical escape、其他malformed payload和
+version错误必须逐字段断言
+`contract:"guest_runtime_profile_receipt"`；`ContractError`自身也必须携带`version:1`。
 
 NodeObservation serde/validation另测null/null/empty unavailable、non-null/non-null/empty valid ring及所有禁止
 的混合组合；unavailable没有key-ring digest，valid empty ring必须匹配上面的fixed vector。接收状态机必须测：
@@ -2551,6 +2620,7 @@ RegistrationAttemptBinding {
   immutable_host_id: Id,
   node_boot_id: NodeBootId,
   agent_instance_id: RandomId128,
+  guest_config_digest: Sha256Digest,
   expected_agent_session_epoch: Epoch | null
 }
 
@@ -2572,6 +2642,12 @@ ContractErrorDetail =
     registration_attempt_id: RandomId128,
     expected: RegistrationAttemptBinding,
     presented: RegistrationAttemptBinding
+  }
+| {
+    code: "guest_config_mismatch",
+    node_id: Id,
+    expected_guest_config_digest: Sha256Digest,
+    presented_guest_config_digest: Sha256Digest
   }
 | {
     code: "stale_observation_sequence",
@@ -2646,7 +2722,7 @@ ContractErrorDetail =
   }
 
 ContractName = "node_identity" | "agent_registration_attempt" | "agent_session"
-             | "admission_inventory_attestation" | "desired_runtime_spec"
+             | "guest_runtime_profile_receipt" | "admission_inventory_attestation" | "desired_runtime_spec"
              | "runtime_checkpoint" | "node_cleanup_checkpoint" | "node_observation"
              | "operation" | "contract_error"
 ```
@@ -2700,7 +2776,12 @@ F0只实现不读取Control Store、filesystem、provider或其他合同对象�
       integer。随后验证Id、HostPath、其他string格式及所有非discriminator closed scalar literal。
    2. 所有array的strict order和identity约束。
    3. 只引用同一payload字段的wire cross-field invariant。
-   4. payload同时携带完整digest projection与claimed digest时，按§16.1/§16.2重算并比较。V1具体是
+   4. 只对`GuestRuntimeProfileReceipt`，用§16.1重新编码已通过前三个substage的对象，并要求结果逐byte
+      等于收到的完整artifact bytes。前后空白、object key换序或任何非canonical但等价的JSON escape都固定
+      返回
+      `malformed_payload {contract:"guest_runtime_profile_receipt", json_pointer:"", problem:"invalid_value"}`；
+      BOM或非法JSON仍由Transport优先返回。其他顶层合同不要求raw wire本身是canonical JSON。
+   5. payload同时携带完整digest projection与claimed digest时，按§16.1/§16.2重算并比较。V1具体是
       `DesiredRuntimeSpec.spec_digest`、complete `NodeObservation.inventory_digest`及non-null
       `NodeObservation.key_ring_digest`；不完整projection不能冒充self-digest input。重算不等返回
       `malformed_payload {problem:"invalid_value"}`并精确指向claimed digest字段。
@@ -2808,9 +2889,12 @@ session与该reason mismatch并存时先返回session error且不读取Operation
 
 `AgentRegistrationAttempt`没有可先验证的current session，因此保留§2的端点specific replay顺序：先按
 `(node_id, registration_attempt_id)`查找已提交attempt；命中且binding不同返回
-`registration_attempt_conflict`。`expected`是首次提交的四字段binding，`presented`是本次请求，不包含
+`registration_attempt_conflict`。`expected`是首次提交的五字段binding，`presented`是本次请求，不包含
 服务端分配的session epoch/deadline，也不构造两个虚假的`SessionBinding`。这不是F0 decoder规则，也不改变
-其他session-bound边界的stage顺序。通用API idempotency仍按§4在domain mutation前处理，不属于单对象decoder。
+其他session-bound边界的stage顺序。未命中attempt时才把presented `guest_config_digest`与Control Plane
+本进程启动时验证的release digest比较；不等返回`guest_config_mismatch`且不分配session epoch、不写attempt/
+session。exact已提交attempt仍按原session重放；部署切换不得在进程内热换批准digest，新的Control/Node进程
+使用新attempt建立新session。通用API idempotency仍按§4在domain mutation前处理，不属于单对象decoder。
 
 `stale_observation_sequence`必须满足`presented_heartbeat_sequence <
 last_accepted_heartbeat_sequence`。`observation_sequence_conflict.heartbeat_sequence`必须等于已接受和
