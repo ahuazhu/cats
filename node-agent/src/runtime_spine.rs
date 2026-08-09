@@ -13,9 +13,9 @@ pub(crate) mod inventory_scanner_sealed {
 }
 
 pub use runner::{
-    CompleteRuntimeInventory, RuntimeInventoryScanContext, RuntimeInventoryScanOutcome,
-    RuntimeInventoryScanner, RuntimeSpineRunError, RuntimeSpineRunRetry, RuntimeSpineRunStep,
-    RuntimeSpineRunner,
+    CompleteRuntimeInventory, RuntimeDesiredEffect, RuntimeDesiredEffectContext,
+    RuntimeInventoryScanContext, RuntimeInventoryScanOutcome, RuntimeInventoryScanner,
+    RuntimeSpineRunError, RuntimeSpineRunRetry, RuntimeSpineRunStep, RuntimeSpineRunner,
 };
 pub(crate) use runner::{InventoryCoverageAggregator, RuntimeInventoryKeyRing};
 pub(crate) use state::RuntimeSpineJournal;

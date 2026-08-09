@@ -1,6 +1,6 @@
 //! One-step orchestration for the durable signed Node spine.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use cats_api::runtime_reconciliation::{
     inventory_digest, AgentSession, ContractError, ContractErrorDetail, ContractVersion,
-    DesiredReadRequest, DesiredReadSnapshot, Epoch, InventorySource, KeyId, NodeObservation,
-    NodeResidue, ObservationAcceptance, ObservedRuntimeStatus, RandomId128, RuntimeSpineError,
-    RuntimeSpineErrorDetail, Sha256Digest, UnixMillis,
+    DesiredReadRequest, DesiredReadSnapshot, DesiredRuntimeSpec, Epoch, Id, InventorySource, KeyId,
+    NodeObservation, NodeResidue, ObservationAcceptance, ObservedRuntimeStatus, RandomId128,
+    RuntimeSpineError, RuntimeSpineErrorDetail, Sha256Digest, UnixMillis,
 };
 use thiserror::Error;
 
@@ -49,6 +49,66 @@ pub trait RuntimeInventoryScanner:
         &self,
         context: RuntimeInventoryScanContext,
     ) -> anyhow::Result<RuntimeInventoryScanOutcome>;
+}
+
+/// Executes one bounded, typed reconciliation unit for an exact fresh Desired
+/// spec after restart admission has been re-established.
+///
+/// The runner invokes this seam only after a physical full inventory produced
+/// in the current process has been accepted by Control, then a newer Desired
+/// snapshot has been read and durably stored. Implementations must re-read the
+/// Cat checkpoint from `context.state_directory()` before planning an effect.
+/// A Cloud Hypervisor network adapter must pass
+/// `&desired.runtime.network_config` unchanged to its typed network/VMM
+/// primitive; legacy NodeJob fields or Cat-ID-derived networking are not an
+/// admissible substitute.
+pub trait RuntimeDesiredEffect: Send + Sync + 'static {
+    fn apply(
+        &self,
+        context: RuntimeDesiredEffectContext,
+        desired: &DesiredRuntimeSpec,
+    ) -> anyhow::Result<()>;
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeDesiredEffectContext {
+    state_directory: StateDirectory,
+    deadline: Instant,
+    cancellation: RuntimeInventoryScanCancellation,
+}
+
+impl RuntimeDesiredEffectContext {
+    fn new(
+        state_directory: StateDirectory,
+        deadline: Instant,
+        cancellation: RuntimeInventoryScanCancellation,
+    ) -> Self {
+        Self {
+            state_directory,
+            deadline,
+            cancellation,
+        }
+    }
+
+    pub fn state_directory(&self) -> &StateDirectory {
+        &self.state_directory
+    }
+
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    pub fn check_active(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.cancellation.is_cancelled(),
+            "runtime Desired effect was cancelled"
+        );
+        anyhow::ensure!(
+            Instant::now() < self.deadline,
+            "runtime Desired effect deadline expired"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -265,6 +325,10 @@ pub enum RuntimeSpineRunRetry {
 pub enum RuntimeSpineRunStep {
     DesiredAccepted,
     ObservationAccepted,
+    EffectApplied {
+        cat_id: Id,
+    },
+    EffectsApplied,
     RetryExact(RuntimeSpineRunRetry),
     /// A definite server result made the retained Desired cursor unusable.
     DesiredInvalidated {
@@ -287,6 +351,13 @@ pub enum RuntimeSpineRunStep {
         unavailable_sources: Vec<InventorySource>,
     },
     ScanDeadlineExceeded,
+    EffectUnavailable {
+        cat_id: Id,
+        error: anyhow::Error,
+    },
+    EffectDeadlineExceeded {
+        cat_id: Id,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -307,6 +378,10 @@ pub enum RuntimeSpineRunError {
     ScanLanePoisoned,
     #[error("runtime-spine inventory scan queue is full")]
     ScanQueueFull,
+    #[error("runtime-spine Desired effect lane is poisoned after cancellation or timeout")]
+    EffectLanePoisoned,
+    #[error("runtime-spine Desired effect queue is full")]
+    EffectQueueFull,
     #[error("runtime-spine journal queue is full")]
     JournalQueueFull,
     #[error("runtime-spine worker shutdown failed: {0}")]
@@ -674,6 +749,194 @@ impl Drop for ScanLane {
     }
 }
 
+enum EffectCommand {
+    Apply {
+        context: RuntimeDesiredEffectContext,
+        desired: DesiredRuntimeSpec,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+    },
+}
+
+#[derive(Default)]
+struct EffectLaneState {
+    poisoned: AtomicBool,
+    active: Mutex<Option<RuntimeInventoryScanCancellation>>,
+}
+
+struct EffectLane {
+    sender: Option<mpsc::SyncSender<EffectCommand>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    state: Arc<EffectLaneState>,
+}
+
+impl EffectLane {
+    fn start(effect: Arc<dyn RuntimeDesiredEffect>) -> Result<Self, RuntimeSpineRunError> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let state = Arc::new(EffectLaneState::default());
+        let worker_state = Arc::clone(&state);
+        let thread = std::thread::Builder::new()
+            .name("cats-runtime-spine-effect".to_owned())
+            .spawn(move || {
+                while let Ok(EffectCommand::Apply {
+                    context,
+                    desired,
+                    reply,
+                }) = receiver.recv()
+                {
+                    let result = if context.check_active().is_ok() {
+                        effect.apply(context, &desired)
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "runtime Desired effect was cancelled before execution"
+                        ))
+                    };
+                    active_effect(&worker_state.active).take();
+                    let _ = reply.send(result);
+                }
+            })
+            .map_err(|source| RuntimeSpineRunError::WorkerStart {
+                worker: "Desired effect",
+                source,
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            thread: Some(thread),
+            state,
+        })
+    }
+
+    async fn apply(
+        &self,
+        state_directory: StateDirectory,
+        desired: DesiredRuntimeSpec,
+        deadline: Instant,
+    ) -> Result<EffectWait, RuntimeSpineRunError> {
+        if self.state.poisoned.load(Ordering::Acquire) {
+            return Err(RuntimeSpineRunError::EffectLanePoisoned);
+        }
+        if Instant::now() >= deadline {
+            return Ok(EffectWait::DeadlineExceeded);
+        }
+        let cancellation = RuntimeInventoryScanCancellation::new();
+        let context =
+            RuntimeDesiredEffectContext::new(state_directory, deadline, cancellation.clone());
+        {
+            let mut active = active_effect(&self.state.active);
+            if active.is_some() {
+                return Err(RuntimeSpineRunError::EffectQueueFull);
+            }
+            *active = Some(cancellation.clone());
+        }
+        let (reply, received) = tokio::sync::oneshot::channel();
+        let command = EffectCommand::Apply {
+            context,
+            desired,
+            reply,
+        };
+        let send_result = self
+            .sender
+            .as_ref()
+            .ok_or_else(|| RuntimeSpineRunError::WorkerStopped("Desired effect".to_owned()))?
+            .try_send(command);
+        if let Err(error) = send_result {
+            active_effect(&self.state.active).take();
+            return match error {
+                mpsc::TrySendError::Full(_) => Err(RuntimeSpineRunError::EffectQueueFull),
+                mpsc::TrySendError::Disconnected(_) => Err(RuntimeSpineRunError::WorkerStopped(
+                    "Desired effect".to_owned(),
+                )),
+            };
+        }
+
+        let mut guard = ActiveEffectGuard {
+            cancellation,
+            state: Arc::clone(&self.state),
+            armed: true,
+        };
+        let timed =
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), received).await;
+        match timed {
+            Ok(Ok(result)) => {
+                guard.disarm();
+                if Instant::now() >= deadline {
+                    Ok(EffectWait::DeadlineExceeded)
+                } else {
+                    Ok(EffectWait::Finished(result))
+                }
+            }
+            Ok(Err(_)) => {
+                guard.poison();
+                Err(RuntimeSpineRunError::WorkerStopped(
+                    "Desired effect".to_owned(),
+                ))
+            }
+            Err(_) => {
+                guard.poison();
+                Ok(EffectWait::DeadlineExceeded)
+            }
+        }
+    }
+
+    fn cancel_and_poison(&self) {
+        self.state.poisoned.store(true, Ordering::Release);
+        if let Some(cancellation) = active_effect(&self.state.active).as_ref() {
+            cancellation.cancel();
+        }
+    }
+
+    fn shutdown_blocking(&mut self) -> Result<(), RuntimeSpineRunError> {
+        self.cancel_and_poison();
+        self.sender.take();
+        join_worker_blocking("Desired effect", self.thread.take())
+    }
+}
+
+impl Drop for EffectLane {
+    fn drop(&mut self) {
+        let _ = self.shutdown_blocking();
+    }
+}
+
+fn active_effect(
+    mutex: &Mutex<Option<RuntimeInventoryScanCancellation>>,
+) -> MutexGuard<'_, Option<RuntimeInventoryScanCancellation>> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+enum EffectWait {
+    Finished(anyhow::Result<()>),
+    DeadlineExceeded,
+}
+
+struct ActiveEffectGuard {
+    cancellation: RuntimeInventoryScanCancellation,
+    state: Arc<EffectLaneState>,
+    armed: bool,
+}
+
+impl ActiveEffectGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn poison(&mut self) {
+        if self.armed {
+            self.cancellation.cancel();
+            self.state.poisoned.store(true, Ordering::Release);
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for ActiveEffectGuard {
+    fn drop(&mut self) {
+        self.poison();
+    }
+}
+
 fn active_scan(
     mutex: &Mutex<Option<RuntimeInventoryScanCancellation>>,
 ) -> MutexGuard<'_, Option<RuntimeInventoryScanCancellation>> {
@@ -747,6 +1010,10 @@ pub struct RuntimeSpineRunner {
     client: RuntimeSpineHttpClient,
     journal_lane: Option<JournalLane>,
     scan_lane: Option<ScanLane>,
+    effect_lane: Option<EffectLane>,
+    current_process_scan_observation_id: Option<RandomId128>,
+    effect_admission_open: bool,
+    pending_effects: VecDeque<DesiredRuntimeSpec>,
 }
 
 impl std::fmt::Debug for RuntimeSpineRunner {
@@ -767,10 +1034,40 @@ impl RuntimeSpineRunner {
         client: RuntimeSpineHttpClient,
         scanner: Arc<dyn RuntimeInventoryScanner>,
     ) -> Result<Self, RuntimeSpineRunError> {
+        Self::new_inner(state_directory, registered_session, client, scanner, None)
+    }
+
+    /// Production composition with the only typed Desired-to-effect seam.
+    /// The executor remains unreachable until a current-process full physical
+    /// inventory has been accepted and a fresh Desired snapshot is persisted.
+    pub fn new_with_desired_effects(
+        state_directory: StateDirectory,
+        registered_session: AgentSession,
+        client: RuntimeSpineHttpClient,
+        scanner: Arc<dyn RuntimeInventoryScanner>,
+        effect: Arc<dyn RuntimeDesiredEffect>,
+    ) -> Result<Self, RuntimeSpineRunError> {
+        Self::new_inner(
+            state_directory,
+            registered_session,
+            client,
+            scanner,
+            Some(effect),
+        )
+    }
+
+    fn new_inner(
+        state_directory: StateDirectory,
+        registered_session: AgentSession,
+        client: RuntimeSpineHttpClient,
+        scanner: Arc<dyn RuntimeInventoryScanner>,
+        effect: Option<Arc<dyn RuntimeDesiredEffect>>,
+    ) -> Result<Self, RuntimeSpineRunError> {
         // Start the non-authoritative scanner first. If acquiring the journal
-        // flock then fails, ScanLane's Drop closes and joins the already
-        // started thread before this constructor returns.
+        // flock then fails, the effect and ScanLane Drops join the already
+        // started threads before this constructor returns.
         let scan_lane = ScanLane::start(scanner)?;
+        let effect_lane = effect.map(EffectLane::start).transpose()?;
         let journal_lane = JournalLane::start(state_directory.clone(), registered_session.clone())?;
         Ok(Self {
             state_directory,
@@ -778,6 +1075,10 @@ impl RuntimeSpineRunner {
             client,
             journal_lane: Some(journal_lane),
             scan_lane: Some(scan_lane),
+            effect_lane,
+            current_process_scan_observation_id: None,
+            effect_admission_open: false,
+            pending_effects: VecDeque::new(),
         })
     }
 
@@ -785,6 +1086,9 @@ impl RuntimeSpineRunner {
         &mut self,
         scan_deadline: Instant,
     ) -> Result<RuntimeSpineRunStep, RuntimeSpineRunError> {
+        if !self.pending_effects.is_empty() {
+            return self.run_next_effect(scan_deadline).await;
+        }
         let work = self.journal_lane()?.next().await?;
 
         match work {
@@ -821,6 +1125,8 @@ impl RuntimeSpineRunner {
                 };
                 let candidate = build_full_observation(coordinates, inventory)?;
                 let request = self.journal_lane()?.prepare_observation(candidate).await?;
+                self.current_process_scan_observation_id =
+                    Some(request.value().observation_id.clone());
                 self.send_observation(request).await
             }
         }
@@ -853,23 +1159,73 @@ impl RuntimeSpineRunner {
             .ok_or_else(|| RuntimeSpineRunError::WorkerStopped("inventory scan".to_owned()))
     }
 
+    fn effect_lane(&self) -> Result<&EffectLane, RuntimeSpineRunError> {
+        self.effect_lane
+            .as_ref()
+            .ok_or_else(|| RuntimeSpineRunError::WorkerStopped("Desired effect".to_owned()))
+    }
+
     fn take_workers(&mut self) -> RunnerWorkers {
         RunnerWorkers {
+            effect_lane: self.effect_lane.take(),
             scan_lane: self.scan_lane.take(),
             journal_lane: self.journal_lane.take(),
         }
     }
 
+    async fn run_next_effect(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<RuntimeSpineRunStep, RuntimeSpineRunError> {
+        let desired = self
+            .pending_effects
+            .front()
+            .cloned()
+            .ok_or_else(|| RuntimeSpineRunError::WorkerStopped("Desired effect".to_owned()))?;
+        let cat_id = desired.cat_id.clone();
+        match self
+            .effect_lane()?
+            .apply(self.state_directory.clone(), desired, deadline)
+            .await?
+        {
+            EffectWait::Finished(Ok(())) => {
+                self.pending_effects.pop_front();
+                if self.pending_effects.is_empty() {
+                    Ok(RuntimeSpineRunStep::EffectsApplied)
+                } else {
+                    Ok(RuntimeSpineRunStep::EffectApplied { cat_id })
+                }
+            }
+            EffectWait::Finished(Err(error)) => {
+                Ok(RuntimeSpineRunStep::EffectUnavailable { cat_id, error })
+            }
+            EffectWait::DeadlineExceeded => {
+                Ok(RuntimeSpineRunStep::EffectDeadlineExceeded { cat_id })
+            }
+        }
+    }
+
     async fn send_desired(
-        &self,
+        &mut self,
         request: DurableRuntimeSpineRequest<DesiredReadRequest>,
     ) -> Result<RuntimeSpineRunStep, RuntimeSpineRunError> {
         match self.client.desired_read(request.bytes()).await? {
             RuntimeSpineAttempt::Accepted(accepted) => {
+                let desired_specs = accepted.value.desired_specs.clone();
                 self.journal_lane()?
                     .accept_desired(accepted.value, accepted.bytes)
                     .await?;
-                Ok(RuntimeSpineRunStep::DesiredAccepted)
+                if self.effect_lane.is_some() && self.effect_admission_open {
+                    self.effect_admission_open = false;
+                    self.pending_effects = desired_specs.into();
+                    if self.pending_effects.is_empty() {
+                        Ok(RuntimeSpineRunStep::EffectsApplied)
+                    } else {
+                        Ok(RuntimeSpineRunStep::DesiredAccepted)
+                    }
+                } else {
+                    Ok(RuntimeSpineRunStep::DesiredAccepted)
+                }
             }
             RuntimeSpineAttempt::RetryExact(reason) => Ok(RuntimeSpineRunStep::RetryExact(
                 RuntimeSpineRunRetry::Transport(reason),
@@ -890,14 +1246,21 @@ impl RuntimeSpineRunner {
     }
 
     async fn send_observation(
-        &self,
+        &mut self,
         request: DurableRuntimeSpineRequest<NodeObservation>,
     ) -> Result<RuntimeSpineRunStep, RuntimeSpineRunError> {
         match self.client.observation(request.bytes()).await? {
             RuntimeSpineAttempt::Accepted(accepted) => {
+                let establishes_effect_admission = request.value().complete_inventory
+                    && self.current_process_scan_observation_id.as_ref()
+                        == Some(&request.value().observation_id);
                 self.journal_lane()?
                     .accept_observation(accepted.value, accepted.bytes)
                     .await?;
+                self.current_process_scan_observation_id = None;
+                if establishes_effect_admission {
+                    self.effect_admission_open = true;
+                }
                 Ok(RuntimeSpineRunStep::ObservationAccepted)
             }
             RuntimeSpineAttempt::RetryExact(reason) => Ok(RuntimeSpineRunStep::RetryExact(
@@ -908,6 +1271,7 @@ impl RuntimeSpineRunner {
                 match desired_invalidation_binding(&error, request.value()) {
                     DesiredInvalidationBinding::Exact => {
                         self.journal_lane()?.invalidate_desired().await?;
+                        self.current_process_scan_observation_id = None;
                         Ok(RuntimeSpineRunStep::DesiredInvalidated { status, error })
                     }
                     DesiredInvalidationBinding::Mismatch => Ok(RuntimeSpineRunStep::RetryExact(
@@ -935,12 +1299,17 @@ impl Drop for RuntimeSpineRunner {
 }
 
 struct RunnerWorkers {
+    effect_lane: Option<EffectLane>,
     scan_lane: Option<ScanLane>,
     journal_lane: Option<JournalLane>,
 }
 
 impl RunnerWorkers {
     fn shutdown_blocking(mut self) -> Result<(), RuntimeSpineRunError> {
+        let effect_result = self
+            .effect_lane
+            .as_mut()
+            .map_or(Ok(()), EffectLane::shutdown_blocking);
         let scan_result = self
             .scan_lane
             .as_mut()
@@ -952,10 +1321,13 @@ impl RunnerWorkers {
             .journal_lane
             .as_mut()
             .map_or(Ok(()), JournalLane::shutdown_blocking);
-        match (scan_result, journal_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (scan, journal) => {
+        match (effect_result, scan_result, journal_result) {
+            (Ok(()), Ok(()), Ok(())) => Ok(()),
+            (effect, scan, journal) => {
                 let mut failures = Vec::new();
+                if let Err(error) = effect {
+                    failures.push(format!("Desired effect: {error}"));
+                }
                 if let Err(error) = scan {
                     failures.push(format!("inventory scan: {error}"));
                 }
@@ -1079,10 +1451,15 @@ mod tests {
     use axum::Router;
     use cats_api::agent_registration::{Ed25519RequestSigner, JSON_CONTENT_TYPE};
     use cats_api::runtime_reconciliation::{
-        decode_agent_session, decode_node_observation, encode_observation_acceptance,
-        encode_runtime_spine_error, AdmissionInventoryAttestation, ContractVersion, Id,
-        ObservationAcceptance, ObservationInventoryAcceptance, RuntimeSpineErrorDetail,
-        SessionBinding, UnixMillis, NODE_OBSERVATION_MAX_WIRE_BYTES,
+        decode_agent_session, decode_desired_read_request, decode_desired_read_snapshot,
+        decode_node_observation, encode_desired_read_snapshot, encode_observation_acceptance,
+        encode_runtime_spine_error, spec_digest, AdmissionInventoryAttestation,
+        AppliedDesiredEvidence, AssignedKind, AssignedPlacement, CheckpointEvidence,
+        ContractVersion, GuestTransportEvidence, HostPath, Id, Ipv4Address, IsolatedIpv4Kind,
+        LifecycleAdmission, MacAddress, NetworkConfig, ObservationAcceptance,
+        ObservationInventoryAcceptance, ReconcileStep, Revision, RuntimeConfig,
+        RuntimeSpineErrorDetail, RuntimeTarget, RuntimeTransition, SessionBinding, UnixMillis,
+        WarmSnapshotEvidence, DESIRED_READ_REQUEST_MAX_WIRE_BYTES, NODE_OBSERVATION_MAX_WIRE_BYTES,
     };
 
     use super::*;
@@ -1092,6 +1469,141 @@ mod tests {
 
     struct EmptyScanner {
         calls: AtomicUsize,
+    }
+
+    struct IncompleteScanner;
+
+    impl crate::runtime_spine::inventory_scanner_sealed::Sealed for IncompleteScanner {}
+
+    impl RuntimeInventoryScanner for IncompleteScanner {
+        fn scan_complete(
+            &self,
+            context: RuntimeInventoryScanContext,
+        ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
+            context.check_active()?;
+            Ok(RuntimeInventoryScanOutcome::Incomplete {
+                unavailable_sources: vec![InventorySource::Process],
+            })
+        }
+    }
+
+    struct AssignedScanner;
+
+    impl crate::runtime_spine::inventory_scanner_sealed::Sealed for AssignedScanner {}
+
+    impl RuntimeInventoryScanner for AssignedScanner {
+        fn scan_complete(
+            &self,
+            context: RuntimeInventoryScanContext,
+        ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
+            context.check_active()?;
+            let runtimes = context
+                .coordinates()
+                .desired
+                .desired_specs
+                .iter()
+                .map(|desired| ObservedRuntimeStatus {
+                    cat_id: desired.cat_id.clone(),
+                    applied_desired: Some(AppliedDesiredEvidence {
+                        desired_revision: desired.desired_revision,
+                        spec_digest: desired.spec_digest.clone(),
+                        placement: desired.placement.clone(),
+                        target: desired.target,
+                    }),
+                    runtime_incarnation: None,
+                    stable_state: None,
+                    step: ReconcileStep::InspectInventory {
+                        inventory_epoch: Epoch::new(1).unwrap(),
+                    },
+                    checkpoint: CheckpointEvidence::Missing {
+                        checkpoint_path: HostPath::new(format!(
+                            "/var/lib/cats/{}.json",
+                            desired.cat_id.as_str()
+                        ))
+                        .unwrap(),
+                    },
+                    processes: Vec::new(),
+                    volumes: Vec::new(),
+                    mounts: Vec::new(),
+                    networks: Vec::new(),
+                    guest_transport: GuestTransportEvidence::Unavailable,
+                    warm_snapshot: WarmSnapshotEvidence::Absent,
+                    lifecycle_admission: LifecycleAdmission::Closed,
+                    routes: Vec::new(),
+                    platform_guards: 0,
+                    conditions: Vec::new(),
+                })
+                .collect();
+            Ok(RuntimeInventoryScanOutcome::Complete(
+                CompleteRuntimeInventory::for_test(
+                    UnixMillis::new(1_720_000_004_000).unwrap(),
+                    RuntimeInventoryKeyRing::Unavailable,
+                    runtimes,
+                    Vec::new(),
+                ),
+            ))
+        }
+    }
+
+    struct CountingEffect {
+        calls: AtomicUsize,
+    }
+
+    impl RuntimeDesiredEffect for CountingEffect {
+        fn apply(
+            &self,
+            context: RuntimeDesiredEffectContext,
+            desired: &DesiredRuntimeSpec,
+        ) -> anyhow::Result<()> {
+            context.check_active()?;
+            assert_eq!(
+                desired.runtime.network_config,
+                desired_with_network().runtime.network_config
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn desired_with_network() -> DesiredRuntimeSpec {
+        let mut desired = DesiredRuntimeSpec {
+            version: ContractVersion::V1,
+            workspace_id: Id::new("ws_01").unwrap(),
+            cat_id: Id::new("cat_01").unwrap(),
+            desired_revision: Revision::new(1).unwrap(),
+            target: RuntimeTarget::Running,
+            placement: AssignedPlacement {
+                kind: AssignedKind::Assigned,
+                node_id: Id::new("node_a").unwrap(),
+                placement_epoch: Epoch::new(1).unwrap(),
+            },
+            runtime: RuntimeConfig {
+                vcpus: 2,
+                memory_bytes: 2_147_483_648,
+                boot_image_digest: Sha256Digest::from_bytes([1; 32]),
+                guest_config_digest: Sha256Digest::from_bytes([2; 32]),
+                network_config: NetworkConfig {
+                    kind: IsolatedIpv4Kind::IsolatedIpv4,
+                    network_id: Id::new("net_01").unwrap(),
+                    guest_mac: MacAddress::new("02:ca:0a:f0:00:06").unwrap(),
+                    guest_ipv4: Ipv4Address::new("10.240.0.6").unwrap(),
+                    prefix_length: 30,
+                    gateway_ipv4: Ipv4Address::new("10.240.0.5").unwrap(),
+                },
+            },
+            volumes: Vec::new(),
+            endpoints: Vec::new(),
+            transition: RuntimeTransition::CancelAndDrain,
+            spec_digest: Sha256Digest::from_bytes([0; 32]),
+        };
+        desired.spec_digest = spec_digest(&desired).unwrap();
+        desired
+    }
+
+    fn snapshot_with_network() -> Vec<u8> {
+        let mut snapshot = decode_desired_read_snapshot(SNAPSHOT).unwrap();
+        snapshot.desired_specs = vec![desired_with_network()];
+        encode_desired_read_snapshot(&snapshot).unwrap()
     }
 
     impl crate::runtime_spine::inventory_scanner_sealed::Sealed for EmptyScanner {}
@@ -1228,6 +1740,164 @@ mod tests {
             RuntimeSpineRunStep::ScanDeadlineExceeded
         ));
         assert_eq!(scanner.calls.load(Ordering::SeqCst), 0);
+
+        runner.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unavailable_full_inventory_never_reaches_the_typed_effect_seam() {
+        let snapshot = snapshot_with_network();
+        let app = Router::new().route(
+            cats_api::runtime_reconciliation::DESIRED_READ_PATH,
+            post(move || {
+                let snapshot = snapshot.clone();
+                async move { wire_response(StatusCode::OK, snapshot) }
+            }),
+        );
+        let (origin, server) = spawn(app).await;
+        let effect = Arc::new(CountingEffect {
+            calls: AtomicUsize::new(0),
+        });
+        let root = tempfile::tempdir().unwrap();
+        let mut runner = RuntimeSpineRunner::new_with_desired_effects(
+            StateDirectory::unanchored(root.path().to_path_buf()),
+            decode_agent_session(SESSION).unwrap(),
+            RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap(),
+            Arc::new(IncompleteScanner),
+            effect.clone(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::DesiredAccepted
+        ));
+        for _ in 0..2 {
+            assert!(matches!(
+                runner
+                    .run_once_until(Instant::now() + Duration::from_secs(5))
+                    .await
+                    .unwrap(),
+                RuntimeSpineRunStep::ScanIncomplete { .. }
+            ));
+        }
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
+
+        runner.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn effect_waits_for_current_process_full_acceptance_and_fresh_desired() {
+        let app = Router::new()
+            .route(
+                cats_api::runtime_reconciliation::DESIRED_READ_PATH,
+                post(|request: Request<Body>| async move {
+                    let body = to_bytes(request.into_body(), DESIRED_READ_REQUEST_MAX_WIRE_BYTES)
+                        .await
+                        .unwrap();
+                    let request = decode_desired_read_request(&body).unwrap();
+                    let mut snapshot = decode_desired_read_snapshot(SNAPSHOT).unwrap();
+                    snapshot.session = request.session;
+                    snapshot.request_sequence = request.request_sequence;
+                    snapshot.read_position = request.request_sequence;
+                    snapshot.desired_specs = vec![desired_with_network()];
+                    wire_response(
+                        StatusCode::OK,
+                        encode_desired_read_snapshot(&snapshot).unwrap(),
+                    )
+                }),
+            )
+            .route(
+                cats_api::runtime_reconciliation::OBSERVATION_PATH,
+                post(|request: Request<Body>| async move {
+                    let body = to_bytes(request.into_body(), NODE_OBSERVATION_MAX_WIRE_BYTES)
+                        .await
+                        .unwrap();
+                    let observation = decode_node_observation(&body).unwrap();
+                    let accepted_at = UnixMillis::new(1_720_000_005_000).unwrap();
+                    let acceptance = ObservationAcceptance {
+                        version: ContractVersion::V1,
+                        session: SessionBinding {
+                            node_id: observation.node_id.clone(),
+                            node_boot_id: observation.node_boot_id.clone(),
+                            agent_instance_id: observation.agent_instance_id.clone(),
+                            agent_session_epoch: observation.agent_session_epoch,
+                        },
+                        observation_id: observation.observation_id.clone(),
+                        heartbeat_sequence: observation.heartbeat_sequence,
+                        accepted_at_unix_ms: accepted_at,
+                        lease_deadline_unix_ms: UnixMillis::new(1_720_000_065_000).unwrap(),
+                        inventory: ObservationInventoryAcceptance::Full {
+                            attestation: AdmissionInventoryAttestation {
+                                version: ContractVersion::V1,
+                                node_id: observation.node_id.clone(),
+                                agent_session_epoch: observation.agent_session_epoch,
+                                inventory_epoch: observation.inventory_epoch,
+                                inventory_digest: observation.inventory_digest.clone().unwrap(),
+                                inventory_read_position: observation
+                                    .inventory_read_position
+                                    .unwrap(),
+                                accepted_at_unix_ms: accepted_at,
+                            },
+                        },
+                    };
+                    wire_response(
+                        StatusCode::OK,
+                        encode_observation_acceptance(&acceptance).unwrap(),
+                    )
+                }),
+            );
+        let (origin, server) = spawn(app).await;
+        let effect = Arc::new(CountingEffect {
+            calls: AtomicUsize::new(0),
+        });
+        let root = tempfile::tempdir().unwrap();
+        let mut runner = RuntimeSpineRunner::new_with_desired_effects(
+            StateDirectory::unanchored(root.path().to_path_buf()),
+            decode_agent_session(SESSION).unwrap(),
+            RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap(),
+            Arc::new(AssignedScanner),
+            effect.clone(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::DesiredAccepted
+        ));
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::ObservationAccepted
+        ));
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::DesiredAccepted
+        ));
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::EffectsApplied
+        ));
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
 
         runner.shutdown().await.unwrap();
         server.abort();
