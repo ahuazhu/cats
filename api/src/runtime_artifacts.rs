@@ -453,6 +453,7 @@ fn open_verified_installed_member(
 struct StableFileMetadata {
     dev: u64,
     ino: u64,
+    is_file: bool,
     mode: u32,
     uid: u32,
     gid: u32,
@@ -470,6 +471,7 @@ impl StableFileMetadata {
         Self {
             dev: metadata.dev(),
             ino: metadata.ino(),
+            is_file: metadata.file_type().is_file(),
             mode: metadata.mode(),
             uid: metadata.uid(),
             gid: metadata.gid(),
@@ -481,7 +483,7 @@ impl StableFileMetadata {
     }
 
     fn is_exact_installed_file(self) -> bool {
-        self.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
+        self.is_file
             && self.mode & 0o777 == 0o644
             && self.uid == 0
             && self.gid == 0

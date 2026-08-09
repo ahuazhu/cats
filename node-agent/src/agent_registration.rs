@@ -741,6 +741,7 @@ fn lock_exclusive_nonblocking(file: &File) -> anyhow::Result<()> {
 struct StableMetadata {
     dev: u64,
     ino: u64,
+    is_file: bool,
     mode: u32,
     uid: u32,
     gid: u32,
@@ -755,6 +756,7 @@ impl StableMetadata {
         Self {
             dev: metadata.dev(),
             ino: metadata.ino(),
+            is_file: metadata.file_type().is_file(),
             mode: metadata.mode(),
             uid: metadata.uid(),
             gid: metadata.gid(),
@@ -766,7 +768,7 @@ impl StableMetadata {
     }
 
     fn is_exact_file(self, mode: u32) -> bool {
-        self.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
+        self.is_file
             && self.mode & 0o777 == mode
             && self.uid == 0
             && self.gid == 0
@@ -841,7 +843,7 @@ fn read_optional_bounded(
     let before = StableMetadata::new(&metadata);
     let (uid, gid) = expected_state_owner(transport);
     anyhow::ensure!(
-        before.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
+        before.is_file
             && before.mode & 0o777 == 0o600
             && before.uid == uid
             && before.gid == gid

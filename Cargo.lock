@@ -1274,7 +1274,6 @@ dependencies = [
  "clap",
  "tempfile",
  "tokio",
- "tracing",
  "tracing-subscriber",
 ]
 
