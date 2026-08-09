@@ -33,6 +33,7 @@ pub use gate_planner::{
     applied_desired_evidence, AppliedDesiredError, GateReconcileError, GateSequencer,
     GateTransitionResult, PersistTimes,
 };
+pub(crate) use inventory::unavailable_clean_slate_scanner;
 pub use inventory::{
     CleanSlateInventoryScanner, InventoryAbsence, InventoryAbsenceProbe, InventoryProbeSetError,
 };

@@ -324,7 +324,12 @@ pub enum RuntimeSpineRunRetry {
 #[derive(Debug)]
 pub enum RuntimeSpineRunStep {
     DesiredAccepted,
+    /// A full observation physically scanned by this runner was accepted.
     ObservationAccepted,
+    /// A durable observation prepared by a predecessor process was resolved.
+    /// It repairs an ambiguous result but cannot establish restart admission
+    /// or local readiness without a new physical scan.
+    ObservationReplayed,
     EffectApplied {
         cat_id: Id,
     },
@@ -1132,14 +1137,15 @@ impl RuntimeSpineRunner {
         }
     }
 
-    /// Stops both ordered workers and waits until no late filesystem or scan
-    /// action can outlive this runner. Production session replacement and
-    /// process shutdown must use this boundary before constructing a successor.
+    /// Stops the ordered effect, scan and journal workers and waits until no
+    /// late filesystem or physical action can outlive this runner. Production
+    /// session replacement and process shutdown must use this boundary before
+    /// constructing a successor.
     pub async fn shutdown(mut self) -> Result<(), RuntimeSpineRunError> {
         let workers = self.take_workers();
         // `spawn_blocking` keeps running when this future is cancelled. It owns
-        // both lanes, so cancellation cannot detach either Rust thread or drop
-        // the journal flock before the scanner has actually exited.
+        // all lanes, so cancellation cannot detach a Rust thread or drop the
+        // journal flock before effects and the scanner have actually exited.
         tokio::task::spawn_blocking(move || workers.shutdown_blocking())
             .await
             .map_err(|error| {
@@ -1260,8 +1266,10 @@ impl RuntimeSpineRunner {
                 self.current_process_scan_observation_id = None;
                 if establishes_effect_admission {
                     self.effect_admission_open = true;
+                    Ok(RuntimeSpineRunStep::ObservationAccepted)
+                } else {
+                    Ok(RuntimeSpineRunStep::ObservationReplayed)
                 }
-                Ok(RuntimeSpineRunStep::ObservationAccepted)
             }
             RuntimeSpineAttempt::RetryExact(reason) => Ok(RuntimeSpineRunStep::RetryExact(
                 RuntimeSpineRunRetry::Transport(reason),
@@ -1292,7 +1300,7 @@ impl RuntimeSpineRunner {
 impl Drop for RuntimeSpineRunner {
     fn drop(&mut self) {
         // This fallback is intentionally synchronous: dropping a runner may
-        // not detach either owned thread. Production callers use `shutdown`,
+        // not detach any owned thread. Production callers use `shutdown`,
         // which moves the same ordered join onto Tokio's blocking pool.
         let _ = self.take_workers().shutdown_blocking();
     }
@@ -1306,6 +1314,12 @@ struct RunnerWorkers {
 
 impl RunnerWorkers {
     fn shutdown_blocking(mut self) -> Result<(), RuntimeSpineRunError> {
+        if let Some(effect) = self.effect_lane.as_ref() {
+            effect.cancel_and_poison();
+        }
+        if let Some(scan) = self.scan_lane.as_ref() {
+            scan.cancel_and_poison();
+        }
         let effect_result = self
             .effect_lane
             .as_mut()
@@ -1315,8 +1329,8 @@ impl RunnerWorkers {
             .as_mut()
             .map_or(Ok(()), ScanLane::shutdown_blocking);
         // The journal lane, and therefore its flock, remains alive until the
-        // scan has been cancelled and joined. Always attempt this second join
-        // even if the scanner panicked.
+        // effect and scan lanes have been cancelled and joined. Always attempt
+        // every join even if an earlier worker panicked.
         let journal_result = self
             .journal_lane
             .as_mut()
@@ -1898,6 +1912,96 @@ mod tests {
             RuntimeSpineRunStep::EffectsApplied
         ));
         assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
+
+        runner.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn predecessor_observation_replay_never_establishes_restart_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let state = StateDirectory::unanchored(root.path().to_path_buf());
+        let registered = decode_agent_session(SESSION).unwrap();
+        let mut predecessor =
+            RuntimeSpineJournal::open_for_test(&state, registered.clone()).unwrap();
+        assert!(matches!(
+            predecessor.desired_work().unwrap(),
+            RuntimeSpineDesiredWork::Request(_)
+        ));
+        let snapshot = decode_desired_read_snapshot(SNAPSHOT).unwrap();
+        predecessor.accept_desired(snapshot, SNAPSHOT).unwrap();
+        let candidate = build_full_observation(
+            predecessor.full_scan().unwrap(),
+            CompleteRuntimeInventory::for_test(
+                UnixMillis::new(1_720_000_004_000).unwrap(),
+                RuntimeInventoryKeyRing::Unavailable,
+                Vec::new(),
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        predecessor.prepare_observation(candidate).unwrap();
+        drop(predecessor);
+
+        let app = Router::new().route(
+            cats_api::runtime_reconciliation::OBSERVATION_PATH,
+            post(|request: Request<Body>| async move {
+                let body = to_bytes(request.into_body(), NODE_OBSERVATION_MAX_WIRE_BYTES)
+                    .await
+                    .unwrap();
+                let observation = decode_node_observation(&body).unwrap();
+                let accepted_at = UnixMillis::new(1_720_000_005_000).unwrap();
+                let acceptance = ObservationAcceptance {
+                    version: ContractVersion::V1,
+                    session: SessionBinding {
+                        node_id: observation.node_id.clone(),
+                        node_boot_id: observation.node_boot_id.clone(),
+                        agent_instance_id: observation.agent_instance_id.clone(),
+                        agent_session_epoch: observation.agent_session_epoch,
+                    },
+                    observation_id: observation.observation_id.clone(),
+                    heartbeat_sequence: observation.heartbeat_sequence,
+                    accepted_at_unix_ms: accepted_at,
+                    lease_deadline_unix_ms: UnixMillis::new(1_720_000_065_000).unwrap(),
+                    inventory: ObservationInventoryAcceptance::Full {
+                        attestation: AdmissionInventoryAttestation {
+                            version: ContractVersion::V1,
+                            node_id: observation.node_id.clone(),
+                            agent_session_epoch: observation.agent_session_epoch,
+                            inventory_epoch: observation.inventory_epoch,
+                            inventory_digest: observation.inventory_digest.clone().unwrap(),
+                            inventory_read_position: observation.inventory_read_position.unwrap(),
+                            accepted_at_unix_ms: accepted_at,
+                        },
+                    },
+                };
+                wire_response(
+                    StatusCode::OK,
+                    encode_observation_acceptance(&acceptance).unwrap(),
+                )
+            }),
+        );
+        let (origin, server) = spawn(app).await;
+        let effect = Arc::new(CountingEffect {
+            calls: AtomicUsize::new(0),
+        });
+        let mut runner = RuntimeSpineRunner::new_with_desired_effects(
+            state,
+            registered,
+            RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap(),
+            Arc::new(IncompleteScanner),
+            effect.clone(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::ObservationReplayed
+        ));
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
 
         runner.shutdown().await.unwrap();
         server.abort();

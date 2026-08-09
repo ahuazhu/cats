@@ -1,11 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
-use cats_metadata_store_postgres::PostgresMetadataStoreFactory;
-use cats_metadata_store_sqlite::SqliteMetadataStoreFactory;
-use cats_node_agent::runtime::NodeConfig;
-use cats_node_agent::server::{spawn, ServerConfig};
-use cats_storage::{open_metadata_store, AdapterConfig, AdapterSelection, MetadataStoreFactory};
+use cats_node_agent::runtime_cutover::{spawn_signed_runtime_cutover, SignedRuntimeCutoverConfig};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -15,8 +11,6 @@ struct Args {
     listen: String,
     #[arg(long)]
     control_plane_url: String,
-    #[arg(long, env = "CATS_AUTH_TOKEN", default_value = "dev-service-token")]
-    auth_token: String,
     /// Ed25519 public key used to verify control-plane signed Route Grants.
     #[arg(long, env = "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE")]
     route_grant_public_key_file: PathBuf,
@@ -38,8 +32,6 @@ struct Args {
     object_store_adapter: String,
     #[arg(long = "object-store-option", value_name = "KEY=VALUE")]
     object_store_options: Vec<String>,
-    #[arg(long, default_value_t = 1000)]
-    heartbeat_ms: u64,
     #[arg(long, default_value_t = 1500)]
     blockd_lease_ttl_ms: i64,
     /// Per-volume remotely unpublished local journal limit.
@@ -131,89 +123,17 @@ async fn main() -> anyhow::Result<()> {
         cats_node_agent::agent_registration::AgentRegistrationConfig::load_installed(
             installed_receipt.receipt(),
         )?;
-    let metadata_store = AdapterSelection::new(
-        args.metadata_store_adapter,
-        AdapterConfig::from_cli(args.metadata_store_options)?,
-    );
-    let object_store = AdapterSelection::new(
-        args.object_store_adapter,
-        AdapterConfig::from_cli(args.object_store_options)?,
-    );
-    let metadata_factories: [&dyn MetadataStoreFactory; 2] =
-        [&SqliteMetadataStoreFactory, &PostgresMetadataStoreFactory];
-    let storage_meta = open_metadata_store(
-        &metadata_store.name,
-        &metadata_store.config,
-        &metadata_factories,
-    )?;
-    let vmm = match args.vmm.as_str() {
-        "fake" => cats_node_agent::runtime::VmmMode::Fake,
-        "ch" => cats_node_agent::runtime::VmmMode::CloudHypervisor(cats_node_agent::ch::ChConfig {
-            ch_bin: args.ch_bin.clone(),
-            kernel: PathBuf::from("/opt/cats/guest/vmlinuz"),
-            initramfs: installed_receipt
-                .receipt()
-                .initramfs_digest
-                .as_ref()
-                .map(|_| PathBuf::from("/opt/cats/guest/initramfs.img")),
-            boot_contract: Some(installed_receipt.boot_contract()),
-            cmdline: installed_receipt.receipt().kernel_cmdline.to_string(),
-            seed_image: args.ch_seed_image.clone(),
-            block_path: cats_node_agent::ch::BlockPath::parse(&args.ch_block_path)?,
-            block_direct: args.ch_block_direct,
-            vhost_user_queues: args.ch_vhost_user_queues,
-            vhost_user_queue_size: args.ch_vhost_user_queue_size,
-            nbd_client_bin: args.ch_nbd_client.clone(),
-            nbd_devices: args.ch_nbd_devices,
-            network_cidr: args.ch_network_cidr.clone(),
-            ip_bin: args.ch_ip_bin.clone(),
-        }),
-        other => anyhow::bail!("unknown --vmm {other} (expected fake|ch)"),
-    };
-    let route_grant_public_key =
-        std::fs::read(&args.route_grant_public_key_file).with_context(|| {
-            format!(
-                "read route grant public key {}",
-                args.route_grant_public_key_file.display()
-            )
-        })?;
-    let route_grant_verifier = std::sync::Arc::new(
-        cats_node_agent::route_grant::RouteGrantVerifier::from_ed25519_pem(
-            &route_grant_public_key,
-        )?,
-    );
-    let handle = spawn(ServerConfig {
+    let handle = spawn_signed_runtime_cutover(SignedRuntimeCutoverConfig {
         listen: args.listen,
         control_plane_url: args.control_plane_url,
-        auth_token: args.auth_token,
-        agent_registration: agent_registration.clone(),
-        route_grant_verifier,
-        heartbeat_ms: args.heartbeat_ms,
-        node: NodeConfig {
-            node_id: agent_registration.identity().node_id.to_string(),
-            state_dir: agent_registration.runtime_state_directory(),
-            blockd_bin: args.blockd_bin,
-            guest_agent_bin: args.guest_agent_bin,
-            metadata_store,
-            object_store,
-            blockd_lease_ttl_ms: args.blockd_lease_ttl_ms,
-            blockd_max_staged_bytes: args.blockd_max_staged_bytes,
-            blockd_max_staged_packs: args.blockd_max_staged_packs,
-            blockd_max_local_bytes: args.blockd_max_local_bytes,
-            metering_cgroup_root: args.metering_cgroup_root,
-            wake_budget: cats_node_agent::admission::WakeBudget {
-                commitment_bytes: args.wake_commitment_budget_bytes,
-                max_wakes: args.max_concurrent_wakes,
-                queue_timeout: std::time::Duration::from_secs(args.wake_queue_timeout_secs),
-            },
-            vmm,
-        },
-        storage_meta,
+        agent_registration,
     })
     .await?;
-    println!("READY {}", handle.addr);
-    std::future::pending::<()>().await;
-    Ok(())
+    eprintln!(
+        "signed Runtime listener {} is bound; readiness stays closed until complete inventory is attested",
+        handle.addr
+    );
+    handle.run_until_signal().await
 }
 
 #[cfg(test)]
@@ -240,5 +160,16 @@ mod tests {
             );
         }
         assert!(ids.contains(&"guest_runtime_profile_receipt_file"));
+        assert!(!ids.contains(&"auth_token"));
+    }
+
+    #[test]
+    fn production_entrypoint_cannot_start_the_legacy_node_runtime() {
+        let source = include_str!("main.rs");
+        assert!(source.contains("spawn_signed_runtime_cutover"));
+        let legacy_spawn = ["server", "::{", "spawn"].concat();
+        let legacy_runtime = ["Node", "Runtime", "::", "new"].concat();
+        assert!(!source.contains(&legacy_spawn));
+        assert!(!source.contains(&legacy_runtime));
     }
 }

@@ -120,16 +120,20 @@ journal retained until the complete worker transaction is replayed. Direct `syst
 
 ### Runtime-cutover composition gate
 
-The Agent-registration slice is not a standalone deployable release. It may be
-cherry-picked into production only together with the A20 signed Desired and
-observation routes: a newly accepted observation must renew the exact current
-`AgentSession`, the Node-loss detector must derive liveness from that signed
-session/observation state, and `/v1/nodes/heartbeat` must be absent (a service
-or admin bearer request receives plain 404 and writes nothing). Until all three
-conditions are present in one tested commit, deploying this worker/Control
-pair would expire every new 60-second session while the legacy loss detector
-independently marks the Node lost. Restoring the shared-bearer heartbeat is not
-a rollout or compatibility option.
+The signed cutover contains the A19 registration and A20 signed Desired and
+observation routes. Only an accepted new-sequence observation renews the exact
+current `AgentSession`; exact replay does not. Node-loss liveness reads that
+signed session/observation state, and `/v1/nodes/heartbeat` is absent from the
+production route map (a service or admin bearer request receives plain 404 and
+writes nothing).
+
+This is still not a standalone deployable release. The production Node is
+deliberately composed with an unavailable clean-slate scanner until all eleven
+physical inventory probes and the Runtime §7 typed planner/effect adapter are
+wired. Its local readiness stays closed with HTTP 503 and it executes zero runtime effects; the
+deployment transaction must roll back instead of committing an empty inventory
+as complete. Restoring the shared-bearer heartbeat or the legacy NodeJob
+listener is not a rollout or compatibility option.
 
 The worker builds an optimized Ubuntu 24.04 Guest: direct kernel, a minimal
 BusyBox initramfs used only for `switch_root`, and an Ubuntu minbase golden root

@@ -1732,7 +1732,9 @@ fn agent_registration_deployments_share_one_canonical_release_receipt() {
     let worker_image = read_workspace_file("deploy/aws/Dockerfile.worker-artifact");
     assert!(worker_image.contains("COPY guest-runtime-release.v1 /guest-runtime-release.v1"));
     let noded = read_workspace_file("cmd/noded/src/main.rs");
-    assert!(noded.contains("boot_contract: Some(installed_receipt.boot_contract())"));
+    assert!(noded.contains("load_installed_guest_runtime_profile_receipt"));
+    assert!(noded.contains("validate_installed_node_guest_runtime"));
+    assert!(noded.contains("spawn_signed_runtime_cutover"));
 
     let workflow = read_workspace_file(".github/workflows/release.yml");
     assert_eq!(
@@ -1762,6 +1764,9 @@ fn agent_registration_deployments_share_one_canonical_release_receipt() {
             "A20 signed Desired",
             "/v1/nodes/heartbeat",
             "shared-bearer heartbeat",
+            "eleven",
+            "readiness stays closed",
+            "zero runtime effect",
         ] {
             assert!(
                 guide.contains(composition_gate),

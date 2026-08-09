@@ -65,13 +65,17 @@ the exact previous Guest set but deliberately leaves the Node stopped and its jo
 installer to replace every outer artifact and commit. The systemd startup gate does not treat a merely busy lock as
 authorization.
 
-This Agent-registration slice is not a standalone deployable release. The exact release
-commit must also contain the A20 signed Desired/observation HTTP routes, renew
-the current `AgentSession` only when a new observation is accepted, drive
-Node-loss liveness from that signed state, and remove `/v1/nodes/heartbeat`
-such that service/admin bearer calls get 404 with zero writes. Without that
-single-commit composition, every 60-second session expires and the old loss
-detector still marks the Node lost. Do not restore the shared-bearer heartbeat
+The signed cutover contains the A19 registration and A20 signed Desired/observation HTTP routes.
+It renews the exact current `AgentSession` only when a new-sequence observation
+is accepted; exact replay does not renew. Node-loss liveness reads that signed
+state, and `/v1/nodes/heartbeat` is absent from the production route map, so
+service/admin bearer calls get 404 with zero writes.
+
+This is still not a standalone deployable release. Until all eleven physical
+inventory probes and the Runtime §7 typed planner/effect adapter are composed,
+the production clean-slate scanner is explicitly unavailable: readiness stays closed
+with HTTP 503; it runs zero runtime effects and the installer must roll back.
+Do not restore either the shared-bearer heartbeat or the legacy NodeJob listener
 as a transition mechanism.
 
 仅限首次安装、尚未创建任何 Cat 的空节点，配置后可以直接启动或重启服务。

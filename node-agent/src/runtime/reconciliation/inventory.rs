@@ -39,6 +39,29 @@ const REQUIRED_SOURCES: [InventorySource; 11] = [
     InventorySource::GuestMount,
 ];
 
+/// Explicit cutover placeholder used until the production composition root
+/// supplies all eleven concrete absence probes. It can never manufacture a
+/// complete scan or let local readiness open.
+pub(crate) struct UnavailableCleanSlateScanner;
+
+impl crate::runtime_spine::inventory_scanner_sealed::Sealed for UnavailableCleanSlateScanner {}
+
+impl RuntimeInventoryScanner for UnavailableCleanSlateScanner {
+    fn scan_complete(
+        &self,
+        context: RuntimeInventoryScanContext,
+    ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
+        context.check_active()?;
+        Ok(RuntimeInventoryScanOutcome::Incomplete {
+            unavailable_sources: REQUIRED_SOURCES.to_vec(),
+        })
+    }
+}
+
+pub(crate) fn unavailable_clean_slate_scanner() -> Arc<dyn RuntimeInventoryScanner> {
+    Arc::new(UnavailableCleanSlateScanner)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InventoryAbsence {
     Empty,
