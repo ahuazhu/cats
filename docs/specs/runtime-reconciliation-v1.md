@@ -720,6 +720,7 @@ unit。Inspect、Verify 和 Quarantine 本身不产生外部 effect。
 | CloseAdmission | desired/cell revision、原gate集合、RequireIdle attempt state | 只用于全局lifecycle/placement/runtime/volume/mount/network/platform变化或RequireIdle；cell内compare-and-close全部gate，Armed模糊结果按Busy且Closed结算，fresh Running只以更高route epochs重开；Endpoint-only禁止使用 |
 | CloseGate | `close_gate {endpoint_id, old route_epoch}`及checkpoint top-level、所选old `route_gates`完整entry | 只compare-and-close该Endpoint；revision或完整binding不匹配零副作用，exact same binding Closed是close postcondition；成功/结果不明后确认Closed才fsync且旧epoch不重开。changed以更高epoch另走InstallGate；removed drain后以old Closed binding compare-remove cell entry，确认absent才删除checkpoint entry/推进step，不install |
 | AcquireVolume | normal时完整`VolumeAcquireRequest`（含positive lease duration），takeover时只有authorization id | MetadataStore 精确 CAS；authorization首次消费还要求Active event并原子写`AuthorizationConsumedReceipt`；只有完整typed request或同authorization可adopt，或在 `R == L` 后精确release |
+| ProvisionRootImage | 完整`provision_root_image` step（包含不与provision transition混用的control-only blockd物理身份）、checkpoint top-level revision/spec/placement和该attachment的现有process/volume evidence | 只允许current non-Deleted Desired的唯一Root；step必须先fsync再spawn/adopt精确blockd实例，并以已持久transition ID发送显式typed request，把exact blank head CAS为纯确定计算的generation-1 target。响应不明只读权威head；closed retryable/conflict按§7.1处理。成功前不得创建Guest device或VMM |
 | PrepareDevices | NBD/tap/socket slot、ownership token | 完整 inventory 后 create-if-absent；晚到资源只按 token adopt 或删除 |
 | FormatFilesystem | attachment、device、filesystem UUID、initialization token、blank predecessor | Guest Agent 只按精确 predecessor 格式化；晚到结果按 UUID probe/adopt，冲突立即 quarantine |
 | DrainInitialization | attachment epoch、local/remote root generation | device flush 后只向精确 owner/epoch publish，直到 `R == L` |
@@ -736,6 +737,75 @@ unit。Inspect、Verify 和 Quarantine 本身不产生外部 effect。
 
 每步都可被 kill。重启后只能确认 postcondition、重试同一 token、继续或 quarantine，不能先
 teardown 再重做。不建立通用 effect workflow。
+
+### 7.1 Root image provision
+
+`provision_root_image`只用于current Desired中`disk_kind="root"`的唯一VolumeIntent；该intent必须
+`mount=null`，Desired target不得为Deleted，且step的volume、attachment、size与
+`RuntimeConfig.boot_image_digest`必须逐字段等于current Desired和当前exact LeaseGrant。PersistentDisk
+初始化、`format_filesystem`和`commit_initialized`不使用该step，也不能把ext4格式化结果当作Root image
+provision postcondition。
+
+planner对新Root固定执行`acquire_volume -> provision_root_image -> prepare_device`。`provision_root_image`
+本身携带control-only blockd的`scope_id`、`control_socket_path`、`data_directory`和
+`process_identity_token`；这四项连同完整step必须在spawn前fsync。Node随后才可启动或adopt只开放Host
+control socket、Guest I/O gate保持关闭的blockd；在provision exact postcondition确认前，
+不得创建或暴露NBD/vhost-user device、不得把任何frontend交给Guest，也不得启动VMM。目标为Cold的新Cat
+同样必须先完成provision，再按普通release收敛Cold；blank Root不能结算任何non-Deleted稳定态。
+
+adopt必须由current full inventory逐字段匹配一个且仅一个实例：`ProcessEvidence.role`的
+volume/attachment/epoch、scope、control socket、valid ownership token，以及同一`ObservedVolume`的
+data-directory lineage都等于step；verified handshake还必须确认它以该exact grant和immutable size运行、
+处于control-only且Guest I/O gate关闭。path/scope已有missing、corrupt或不同token的实例，错误role、data-dir
+或handshake，以及同一identity出现多个实例，都是`root_provision_conflict {problem:
+"control_process_identity"}`，不得按名称adopt、覆盖或删除。spawn/handshake结果不明时保留同一step和token，
+先以full inventory确认；确认旧attempt的PID/cgroup/control socket已经精确不存在后，才可在一次checkpoint
+replace中只更换`process_identity_token`并fsync后重启。`scope_id`、`control_socket_path`、
+`data_directory`、`provision_transition_id`、image、blank和target都不变；进程attempt token不得代替或改写
+generation-1 transition identity。
+
+planner从`images/<image-id>/manifest.json`读取ADR-0017的immutable manifest，其中`image-id`必须等于
+`boot_image_digest`的64位小写hex payload；按[blockd protocol §6.3](blockd-protocol.md)验证manifest并用
+manifest、step `size_bytes`和§3 Map编码纯确定计算base Map、root hash及root object ID。
+`expected_blank_head`必须精确为`{generation:0, root_hash:null, root_object_id:null}`；
+`expected_provisioned_head`必须精确为该计算结果，generation为1且hash/object ID均非null。manifest、size或
+计算结果任一不匹配时没有effect，不能由调用方提交任意target或opaque proof。
+
+第一个provision副作用前必须把完整step连同checkpoint top-level revision/spec/placement原子fsync，并重验：
+
+1. current Desired仍是同一revision/spec/placement，仍含上述唯一Root及相同image/size；
+2. Volume仍为Active + Owned，owner/epoch精确等于step attachment，head精确等于blank；
+3. blockd process/inventory逐字段满足上述step物理身份，current grant、data-directory identity和verified
+   handshake绑定同一volume/attachment/epoch，且没有pending pack、staged commit、dirty/unflushed write；
+   Guest data frontend仍不可达。
+
+通过后，Node只发送[blockd protocol §6.3](blockd-protocol.md)的显式`ProvisionRootImageRequest`。
+`provision_transition_id`同时固定generation-1 commit record的txn/object identity；同step重试不得生成新ID。
+blockd幂等PUT同一image-backed Map、root和commit record，再以exact owner/epoch及blank->target执行单行head
+CAS。对象PUT前后或CAS前crash都保留同一step；未被Root引用的immutable对象只是orphan，不能据此猜CAS成功。
+
+`OK`、closed error或结果不明都必须重新读取权威Volume head和owner/epoch。EOF、timeout、malformed或response
+identity不匹配都只算结果不明；closed error只有blockd protocol §6.3.1的两个variant。authority判定固定为：
+
+- owner/epoch仍精确且head等于target：effect成功，原子推进checkpoint；
+- owner/epoch仍精确且head仍等于blank：结果不明时保留step并重放同一request/transition；closed
+  `retryable`也保留同一step，其中image/object暂不可用报告
+  `Blocked(root_image_unavailable)`，其他retryable可保持Progressing并有界重试；closed
+  `definite_conflict`立即报告相同problem的`Quarantined(root_provision_conflict)`，不得在blank上无限重放；
+- owner/epoch改变：本attachment已Fenced，保留证据并停止；
+- 同owner/epoch下出现任何其他generation、root hash或object ID：Quarantined，绝不覆盖或把任意
+  `generation > 0`当成功，reason固定为`root_provision_conflict {problem:"head_conflict"}`。
+
+暂时无法读取authority时只Blocked并保留step。Agent restart先完成当前session的full inventory，再只凭
+持久step、current Desired、exact grant和重新计算的target执行上述同一判定；不读取进程内bool，也不写第二份
+provision receipt。Volume head仍是唯一数据authority，checkpoint只是一条current effect journal。若旧effect
+在新Desired提交后才成功，它不能结算新revision，必须重plan：current non-Deleted仍引用同一Root volume、
+image和size且权威head就是同一target时可把initial provision视为已满足；仅attachment/placement变化仍由
+Volume Authority收敛。current Deleted或已不再引用该volume时保留durable head并走其明确disposition。
+current non-Deleted仍要求同一volume却改了image/size时才Quarantined；所有分支都绝不重新provision已有generation。
+authority target确认只完成数据effect；进入`prepare_device`前，control-only blockd还必须从该authoritative
+root重新加载并握手确认同一owner/epoch/target。本地实例无法证明已加载时就停止并以同grant重启加载，不能把
+stale generation-zero cache接到Guest。
 
 新建任一携scope/socket/device/tap等ownership token的物理实例前，必须先生成新的
 `RandomId128`并写入该Cat checkpoint；已用于另一物理实例或已完成cleanup的token
@@ -993,6 +1063,21 @@ ReconcileStep =
 | { kind: "close_admission", require_idle_attempt_id: RandomId128 | null }
 | { kind: "close_gate", endpoint_id: Id, route_epoch: Epoch }
 | { kind: "acquire_volume", request: VolumeAcquireRequest }
+| {
+    kind: "provision_root_image",
+    provision_transition_id: RandomId128,
+    volume_id: Id,
+    attachment_id: Id,
+    attachment_epoch: FenceEpoch,
+    scope_id: Id,
+    control_socket_path: HostPath,
+    data_directory: HostPath,
+    process_identity_token: RandomId128,
+    size_bytes: integer 1..=9223372036854775807,
+    boot_image_digest: Sha256Digest,
+    expected_blank_head: RemoteHead,
+    expected_provisioned_head: RemoteHead
+  }
 | {
     kind: "prepare_device",
     volume_id: Id,
@@ -1603,6 +1688,7 @@ BlockedReason =
     loaded_version: Epoch | null,
     loaded_digest: Sha256Digest | null
   }
+| { kind: "root_image_unavailable", boot_image_digest: Sha256Digest }
 
 EndpointGuardCount { endpoint_id: Id, active_guards: integer 1..=4294967295 }
 
@@ -1721,6 +1807,13 @@ QuarantineReason =
     expected_binding: RouteGateBinding,
     observed_binding: RouteGateBinding
   }
+| {
+    kind: "root_provision_conflict",
+    volume_id: Id,
+    provision_transition_id: RandomId128,
+    problem: "control_process_identity" | "request_binding" | "image_manifest"
+           | "target_mismatch" | "local_state" | "immutable_object" | "head_conflict"
+  }
 
 AttachmentIdentity {
   attachment_id: Id,
@@ -1761,6 +1854,11 @@ DataLossReason =
 `binding.endpoint_id == reason.endpoint_id`的`ObservedRouteGate.instance_count`之和。所有和必须可表示为`U64`。
 `invalid_ownership_token.evidence`只允许`missing`或
 `corrupt`，不能携带`valid`。
+`root_image_unavailable`只表示当前step绑定的bootstrap image或完成该step所需的object-store读写暂时不可用；它不允许更换
+image/transition且Operation保持Pending。`root_provision_conflict`的`volume_id`和
+`provision_transition_id`必须逐字段等于当前持久step；problem是上面顺序固定的closed enum，不能携带string
+message或opaque evidence。blockd closed conflict的problem原样映射；进程物理身份与authority head冲突只由
+Node分别产生`control_process_identity`和`head_conflict`。
 Conditions可并存，但`kind="ready"`每个runtime至多一个，其他Condition按
 §10.4的rank/bytes tuple升序且不允许逐字节重复。V1不得增加string-only reason、
 任意JSON evidence或按message文本分支；新物理故障语义需要先修改本闭集。
@@ -1830,6 +1928,8 @@ control socket的`socket_path`、checkpoint file的`checkpoint_path`、kernel NB
   `observed_vm_shape`逐字段匹配vCPU、memory、boot image和guest config；`guest_transport`为绑定同一
   incarnation的`vsock_ready`。每个Desired volume的size/durability、authority owner/epoch、唯一frontend
   device、Guest serial/slot及要求的UUID/read-write mount逐字段匹配，且无额外volume/device/mount。
+  Root不得仍为blank；若本attachment曾执行`provision_root_image`，其generation-1边界必须由exact target
+  确认后才允许出现任何device/VMM，后续head只能由同owner/epoch的合法commit单调前进。
   恰好一个匹配Desired network的tap；每个Endpoint恰好一个`instance_count=1`的Active route，binding
   全匹配且无额外route；ownership token全部valid、Node级`residue`为空；observation与
   revision/placement/incarnation匹配。
@@ -2052,6 +2152,13 @@ Rejoined；`host_destroyed`永不Rejoined，因此在没有tombstone、其他Hos
 | pending pack lineage adoption | data-dir identity、全部pending pack、runtime evidence和当前grant的服务器端acquire marker逐字段绑定同一完整`AcquireOrigin`才adopt；任一variant/字段冲突保留目录并Quarantine |
 | volume release提交后响应丢失 | 同一`release_transition_id`及完整typed request重放返回原UnownedGrant，或精确`last_transition.release` request/result postcondition被adopt；epoch只增加1 |
 | release N / reacquire N+1 / 旧release N重放 | attachment/expected epoch/transition不匹配，旧N不能释放N+1 writer，不能以当前Unowned猜测成功 |
+| Root provision step fsync后crash | checkpoint保留完整request；full inventory/current Desired/exact grant重验后只重试同一transition，Guest device与VMM仍不存在 |
+| Root provision control process crash | spawn前kill只留下含完整scope/socket/data-dir/token的step；spawn后任一点kill都以full inventory精确adopt同token实例。wrong/missing/corrupt token或错误role/path/handshake进入typed conflict；只有旧PID/cgroup/socket精确absence后才只轮换process token，provision transition/target不变 |
+| Root provision PUT/CAS crash矩阵 | manifest读取、leaf/root/commit PUT前后及CAS前crash都保持blank或最终exact target；同一step只写相同immutable keys，不产生第二target，orphan不被当作成功 |
+| Root provision control response | OK、retryable、definite-conflict、EOF/timeout/malformed都先读authority；exact target才adopt。blank+ambiguous重试，blank+retryable保留step并Blocked/Progressing，blank+definite-conflict写exact typed quarantine；任一其他head或target hash/object ID错配都Fenced/Quarantined，绝不覆盖generation>0 |
+| Root provision后checkpoint未推进或Agent restart | 新session full inventory后从持久step重算同一target；exact target推进，blank重试，其他结果fail closed，不依赖进程内bool或第二receipt |
+| Root provision与Desired变化 | effect前revision/spec/placement或Root image/size/attachment改变则零副作用replan；in-flight旧effect不能结算新revision。同volume/image/size且exact target可由新planner采用，attachment/placement另走Volume Authority；Deleted/移除走disposition，仍用同volume却改image/size才Quarantine |
+| Root provision顺序 | acquire后可有control-only blockd，但exact target确认前NBD/vhost-user device与VMM均不得出现；Persistent initialization不得产生或消费该step |
 | 新物理实例遇到旧token | 每个新create attempt使用新token；名称/path已有不同token时Quarantine，不覆写/adopt/删除 |
 | Running 改盘/shape | 请求先 PreconditionFailed(MustBeCold)；Cold 成功后的新请求才改完整 spec |
 | `R < L` + remote down | Suspend 可完成；Warm/Cold/detach/migrate 阻塞且唯一数据保留 |
@@ -2339,6 +2446,13 @@ PreconditionFailed PlacementRejected reason的`node_id`、`placement_epoch`和�
 和两者不匹配，pointer指向该condition的精确reason字段且整份observation零副作用；匹配placement的正例
 必须接受。stale session与placement_rejected mismatch并存时必须先返回session error，且不读取或结算
 Operation。
+
+Root provision Condition tests必须让standalone decoder接受两个新增closed reason的完整正例，并分别对
+missing/unknown字段、未知problem和wrong scalar type按§16.4固定pointer拒绝；把它们与其他Condition交换输入
+member/array顺序后，canonical `reason.kind` rank和CJ total order仍唯一。accepted observation中的
+`root_image_unavailable`保持current Operation Pending；单一`root_provision_conflict`结算Quarantined时，
+`OperationFailure.quarantined.reason`必须逐字段复制同一decoded reason。wrong volume/transition的reason不能
+结算另一step，且整份observation零副作用。
 
 Context-bound conflict selector tests必须覆盖：两个Cat同时revision或digest冲突时，即使Store反向返回rows，
 也固定选择较小`cat_id`；同一Cat的Operation和applied revision同时冲突、digest同时冲突时都固定选择

@@ -275,6 +275,151 @@ admission 必须把“当前 dirty set 的未来 pack”作为 accounted reserva
 - **GC**：镜像对象属于镜像而不属于卷，存活判据**不是**「某个卷的 Root 引用它」。第一版既不
   自动删除，也不提供人工删除入口；Golden Image GC不在本协议范围内。
 
+#### 6.3.1 Root provision control effect
+
+Cat runtime不得在blockd进程启动参数中携带`--seed-image-id`，也不得把“进程已启动”当作provision
+完成。clean-slate vertical cutover删除这个隐式路径，不提供兼容解析。`--publish-image`只可保留为
+operator发布immutable系统镜像的离线入口；per-Cat reconciler只读取已经发布且manifest-last的镜像。
+
+Node先按[Runtime Reconciliation §7.1](runtime-reconciliation-v1.md#71-root-image-provision)持久化step，
+再通过现有Host control socket发送唯一新增的typed命令；语义payload固定为：
+
+```text
+ProvisionRootImageRequest {
+  provision_transition_id: RandomId128,
+  volume_id: Id,
+  attachment_id: Id,
+  attachment_epoch: FenceEpoch,
+  size_bytes: integer 1..=9223372036854775807,
+  boot_image_digest: Sha256Digest,
+  expected_blank_head: RemoteHead,
+  expected_provisioned_head: RemoteHead
+}
+
+ProvisionRootImageResult {
+  provision_transition_id: RandomId128,
+  volume_id: Id,
+  attachment_id: Id,
+  attachment_epoch: FenceEpoch,
+  resulting_head: RemoteHead
+}
+
+ProvisionRootImageError =
+  {
+    kind: "retryable",
+    provision_transition_id: RandomId128,
+    volume_id: Id,
+    attachment_id: Id,
+    attachment_epoch: FenceEpoch,
+    problem: "image_unavailable" | "object_store_unavailable"
+           | "authority_unavailable" | "local_io_unavailable"
+  }
+| {
+    kind: "definite_conflict",
+    provision_transition_id: RandomId128,
+    volume_id: Id,
+    attachment_id: Id,
+    attachment_epoch: FenceEpoch,
+    problem: "request_binding" | "image_manifest" | "target_mismatch"
+           | "local_state" | "immutable_object"
+  }
+```
+
+line-oriented control wire使用`provision_root_image `后接一个strict JSON request和newline；成功响应沿用
+`OK `后接strict JSON result；可分类失败唯一使用`ERR `后接上述strict JSON closed error。字段沿用Runtime的
+closed scalar、canonical unsigned integer和RemoteHead nullability；duplicate、缺失、unknown、错类型、额外
+尾随内容都拒绝。该本地wire不参与digest或authority。OK/ERR中的transition/volume/attachment/epoch都必须
+逐字段等于request；不匹配、EOF、timeout、非closed ERR或无法解析的响应只算结果不明。Node对全部OK、ERR和
+结果不明都必须按Runtime §7.1读取权威head；响应本身不是receipt。
+
+`retryable.image_unavailable/object_store_unavailable`表示当前image manifest或其immutable objects暂时不可
+读取/写入，映射到step image的`Blocked(root_image_unavailable)`；`authority_unavailable`复用既有
+`Blocked(volume_authority_unavailable)`，`local_io_unavailable`保留step并按同一token有界重试。`definite_conflict`
+只表示blockd已确定的无重试安全冲突：配置/request binding不等、manifest非法、纯计算target不等、
+dirty/pending/staged本地状态，或immutable key已有不同bytes；problem literal原样成为Runtime
+`root_provision_conflict.problem`。fenced/owner/epoch变化不伪装成这些problem，仍由Node读取Volume authority后
+走existing superseded/fail-closed分支。若authority已是exact target则不论control response都成功；若仍blank，
+retryable可重试而definite conflict必须Quarantine，不能无限重放。
+请求只能发给以相同volume/attachment/epoch/immutable size启动、当前owner grant仍有效且Guest I/O gate
+关闭的blockd；任一字段不同零副作用拒绝。
+
+target由请求以外的既有immutable事实纯确定计算，步骤固定如下：
+
+1. 从`boot_image_digest`去掉`sha256:`得到64位小写`image-id`，读取
+   `images/<image-id>/manifest.json`。manifest必须`version=1`、`manifest.image_id=image-id`，
+   `size_bytes`为正CHUNK_SIZE整数倍且不大于request size；non-hole chunks按`chunk_idx`严格升序且唯一，
+   index在manifest范围内，每项`len=CHUNK_SIZE`、`object_id`为该chunk的64位小写SHA-256。manifest-last
+   语义保证这些immutable image objects在manifest可见前已durable。
+2. 建立`request.size_bytes / CHUNK_SIZE`项的Map，默认Hole；每个manifest chunk变为§3的image Base：
+   `object_id`和decoded SHA-256取该chunk object ID，`len=CHUNK_SIZE`，`image_id`取上述image-id。
+3. 每256个ChunkRef按§3.1编码Leaf；全Hole leaf使用EmptyLeaf，其余只在内存中编码、hash并派生本卷
+   `maps/<lowerhex(leaf_hash)>.node` key。按§3.2用exact request size和这些LeafRef编码Root，计算
+   `root_hash=SHA-256(root_bytes)`、`root_object_id=<lowerhex(root_hash)>.node`。
+4. 计算结果必须逐字段等于request的
+   `expected_provisioned_head={generation:1, root_hash, root_object_id}`，且
+   `expected_blank_head`精确为`0/null/null`；不匹配时在任何PUT/CAS前拒绝。
+
+`provision_transition_id`的32位小写hex wire同时是既有commit txn，故commit record key固定为
+`volumes/<volume-id>/commits/1-<provision_transition_id>.json`；同step重试必须产生相同Map/root/commit
+bytes和相同immutable keys，不能生成新txn。provision commit record bytes专门冻结为下面五个字段的UTF-8
+JSON：key顺序必须精确为`chunks,generation,lease_epoch,root_hash,txn`，不含空白、BOM或结尾newline；
+`chunks`是manifest non-hole `chunk_idx`的同一严格升序array，`generation`固定为canonical number `1`，
+`lease_epoch`是request attachment epoch的canonical unsigned decimal，`root_hash`是target hash不含
+`sha256:`的64位小写hex，`txn`是`provision_transition_id`的32位小写hex。不得增加、缺失、重排字段或用
+等价JSON重写已有key。blockd在flush/publish/I/O write gate内再次确认无dirty bitmap、
+pending pack或staged commit，然后按leaf -> root -> commit record顺序PUT，最后执行§4的单行CAS；CAS predicate
+除Active、immutable size和exact owner/epoch外，还必须匹配完整blank RemoteHead，update写入上述exact target。
+
+相同request重放只允许两种非冲突状态：blank时重做相同PUT/CAS，或同owner/epoch下已经是exact target时返回
+同一result。任何其他generation/root、owner/epoch或immutable request冲突都fail closed，绝不覆盖已有head。
+blockd本地cache在target确认后按该Map重新加载，`L=R=1`且没有pending pack；这个本地状态不是成功authority。
+无法证明当前进程已经加载该target时必须保持Guest I/O gate关闭并以同grant重启/重载，不能把stale
+generation-zero cache交给frontend。Volume head是唯一数据authority，RuntimeCheckpoint是唯一current
+effect journal，不增加provision receipt。
+
+#### 6.3.2 Root provision fixed vector
+
+实现不得用生产planner与blockd共享的同一个helper互相证明。下面的literal manifest跨越
+`CHUNKS_PER_LEAF=256`边界；测试从这些bytes独立构造Map v3并逐字节编码两个Leaf和一个Root。固定input为：
+
+```json
+{"chunks":[{"chunk_idx":0,"len":4194304,"object_id":"1111111111111111111111111111111111111111111111111111111111111111"},{"chunk_idx":256,"len":4194304,"object_id":"2222222222222222222222222222222222222222222222222222222222222222"}],"image_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","size_bytes":1077936128,"version":1}
+```
+
+```text
+volume_id = vol_golden
+volume_size = 1077936128
+boot_image_digest = sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+provision_transition_id = 13579bdf2468ace013579bdf2468ace0
+attachment_epoch = 7
+
+leaf first_chunk=0 entry_count=256 encoded_bytes=446
+leaf_hash = 21853df0366ecb382ed81d8ec0162d84531567a835b9b16438ffddad46f2ff33
+leaf_object_id = 21853df0366ecb382ed81d8ec0162d84531567a835b9b16438ffddad46f2ff33.node
+
+leaf first_chunk=256 entry_count=1 encoded_bytes=191
+leaf_hash = a353861b0cb2e42e281738da932e357017545c3fe4e8c6718239a5de82f07be4
+leaf_object_id = a353861b0cb2e42e281738da932e357017545c3fe4e8c6718239a5de82f07be4.node
+
+root encoded_bytes=230
+root_hash = a3a4782016a5ec8ef71c9efd06c5e899beeab070982397c294b578fc4e341753
+root_object_id = a3a4782016a5ec8ef71c9efd06c5e899beeab070982397c294b578fc4e341753.node
+commit_key = volumes/vol_golden/commits/1-13579bdf2468ace013579bdf2468ace0.json
+commit_record_bytes = {"chunks":[0,256],"generation":1,"lease_epoch":7,"root_hash":"a3a4782016a5ec8ef71c9efd06c5e899beeab070982397c294b578fc4e341753","txn":"13579bdf2468ace013579bdf2468ace0"}
+commit_record_bytes_len = 169
+commit_record_sha256 = b15b76d3cad36765db54f421200124ff27e4ffea8bf7dbd8016743069a593720
+```
+
+对应`expected_blank_head`为`0/null/null`，`expected_provisioned_head`为generation 1、
+`sha256:a3a4782016a5ec8ef71c9efd06c5e899beeab070982397c294b578fc4e341753`和上面的root object ID。
+第二套独立实现必须从literal input得到全部相同值和逐字节相同的commit record；只比较两个实现彼此的动态
+输出不算oracle。crash test还必须让encoder A PUT该record后在CAS前退出，再由独立encoder B以同key/bytes
+重放并完成blank->target CAS；字段重排或空白变化必须由literal bytes/hash oracle捕获，而不是等immutable PUT
+冲突后才发现。
+manifest corpus还必须逐项拒绝：version不是1、相同`chunk_idx`重复、chunk逆序、`chunk_idx=257`越界、
+`len != 4194304`，以及object ID长度错误、非小写hex或与实际immutable chunk SHA-256不等。每个失败都必须在
+任何Map/object PUT或head CAS前得到closed `definite_conflict.image_manifest`。
+
 ## 7. NBD 前端（开发/测试/恢复通道）
 
 - 协议：NBD newstyle fixed（`NBD_OPT_GO`），仅导出单卷；支持 `READ / WRITE / FLUSH / TRIM / WRITE_ZEROES / DISC`。
@@ -347,9 +492,15 @@ socket，两者服务同一个 engine 与同一个 attachment lease。
 8. blockd restart只有在data-dir identity、全部pending pack、Runtime inventory evidence和Node从服务器端
    acquisition marker投影并随精确grant传入的完整`AcquireOrigin`逐字段相同时才adopt；同文本不同variant、
    missing/unknown origin或旧裸字段都quarantine且不发布Root。
+9. Root provision逐个覆盖manifest/leaf/root/commit PUT前后、CAS前后、CAS成功响应丢失和blockd/Agent
+   restart；同一持久step只产生同一generation-1 target与commit key。wrong image/size/grant/head、
+   非blank predecessor、pending/dirty/staged write均在CAS前拒绝；exact target可重放，exact blank
+   可重试，任何其他generation绝不覆盖。测试还必须断言provision确认前Guest frontend没有listen且VMM未启动。
 
 ### 8.1 控制命令与可观测性
 
+- `provision_root_image`只实现§6.3.1的blank->generation-1 exact effect；它只在Guest I/O gate关闭时可用，
+  不格式化PersistentDisk、不接受任意target，也不替代normal FLUSH。
 - `status` 返回 durability mode、local/remote generation、unpublished
   generations/bytes/oldest age、max staged/local bytes、allocated/accounted
   bytes、eviction、backpressure、fenced、last publish error以及精确attachment lineage。

@@ -50,15 +50,20 @@ Node 必须先验证当前 AgentSession、placement 和完整 inventory。普通
 1. 持久化当前 revision、placement 和新的 runtime incarnation。
 2. 为完整磁盘集合做 normal acquire；若 Desired 带逐卷 takeover authorization，则按该精确
    tuple CAS。
-3. 准备 blockd、virtio block frontend、per-Cat systemd scope、tap/vsock 和 VMM。
-4. Guest Ready 后按稳定 device identity 验证所有磁盘。只有持久 initialization token、blank
+3. 新Root仍是exact blank时，先fsync `provision_root_image` step，以control-only且Guest I/O关闭的
+   blockd把Desired image纯确定CAS到exact generation-1 head；响应不明只接受exact target或重试exact
+   blank，任何其他head/owner/epoch都fail closed。
+4. provision确认后才准备virtio block frontend、per-Cat systemd scope、tap/vsock 和 VMM。
+5. Guest Ready 后按稳定 device identity 验证所有磁盘。只有持久 initialization token、blank
    Root 和 generation 都匹配时，Guest Agent 才可格式化；异 UUID 或部分格式痕迹 quarantine。
    初始化写先 device flush 并 drain 到 `R == L`，Control Store CAS Initialized/消费 token 后才
    mount。
-5. 验证VM shape、boot identity、volume size/epochs、UUID/mount集合和Endpoint target。
-6. 在AdmissionCell内安装精确incarnation/route-epoch gates，发布Ready observation。
+6. 验证VM shape、boot identity、volume size/epochs、UUID/mount集合和Endpoint target。
+7. 在AdmissionCell内安装精确incarnation/route-epoch gates，发布Ready observation。
 
 RPC 响应丢失时用 checkpoint、握手和物理 postcondition确认或重试同一 token，不能先 teardown。
+新Cat若直接以Cold为目标，也必须先acquire并完成相同Root provision，再release；它不创建device/VMM，
+generation-zero blank Root不能结算stable Cold。PersistentDisk initialization不使用这个step。
 
 ### 3.2 Running -> Suspended
 
@@ -240,6 +245,9 @@ Condition 语义：
 
 - 在 acquire、start、pause、drain、snapshot、stop、release、gate install 每个边界 kill Agent；
   重启后只能确认、重试、继续或 quarantine。
+- Root provision在step fsync、manifest/Map PUT、commit PUT、CAS及CAS响应丢失各边界kill；restart只能以
+  同一transition确认exact generation-1 target或在exact blank上重试，任意其他head不得覆盖，device/VMM
+  不得提前出现。
 - 活跃 HTTP/WebSocket 下 RequireIdle 必须 terminal Busy 且 cell 不变；同 attempt 不得重试。
 - `R < L` 且 remote 故障时，Suspend 可完成，Warm/Cold/detach/migrate 必须阻塞且唯一数据保留。
 - 非 Cold shape/disk 变更先失败，Cold 成功后的新请求才改 spec；计划迁移严格使用两个普通

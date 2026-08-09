@@ -208,6 +208,11 @@ admission以及Endpoint/Platform guards；reconcile的枚举、数据库、VMM�
    每步后更新同一checkpoint。
 6. 达到稳定目标后发布完整 observation；checkpoint 收敛为稳定快照，而非追加历史。
 
+新Root的唯一数据初始化步骤是`acquire_volume -> provision_root_image -> prepare_device`：checkpoint绑定
+Desired image、immutable size、attachment/epoch、blank和由manifest/Map编码纯确定计算的generation-1 head。
+blockd只可先开放Host control socket；exact target确认前没有Guest device或VMM。RPC不明时只读Volume head，
+exact target成功、exact blank重试同transition，其他head/owner/epoch fail closed；没有第二个receipt。
+
 tap/subnet、kernel-NBD slot和vhost-user socket按Host inventory在Host resource lock下分配，
 exact identity先写checkpoint。容量耗尽是明确placement failure；cleanup只删除ownership token与
 物理identity同时匹配的资源，不按Cat hash重算名字后先删。
@@ -306,7 +311,8 @@ observation是独立的Ready条件。
 
 Cat create同一PG commit写Cat、current完整Desired、runtime Operation、唯一Root Disk、generation-zero/
 Unowned Volume和exact result；Root没有Persistent初始化状态或第二个Disk Operation，响应不明的同key
-重放不能产生第二组identity。
+重放不能产生第二组identity。Node随后以RuntimeCheckpoint中的显式typed provision step引用operator已发布
+的immutable golden manifest；`--seed-image-id`启动时隐式provision不属于终态合同，也没有兼容路径。
 
 DiskSnapshot首版只允许Cold且unowned的卷。create/delete/restore先验证当前Workspace membership和
 route permission，再读取covered result；精确命中直接返回。只有miss才验证认证Workspace拥有Disk及精确
@@ -446,6 +452,9 @@ virtio/ext4 和四态，是因为它们是已验证且合适的终态设计，�
   来自current complete Desired；Disk/Volume一对一、Root/Cat一对一且path只用disk ID；
 - Cat create连同Root/Volume/Desired/Operation/result全有或全无；PersistentDisk格式化后必须锁current
   session/accepted head并绑定exact UUID/checkpoint/owner/head和`R == L`再标记Initialized；
+- Root provision target由manifest+size+Map编码独立重算；step fsync、各PUT、CAS、响应丢失和Agent restart
+  只能得到exact generation-1 target或保留exact blank重试，同transition不换object identity，任何其他
+  generation绝不覆盖且device/VMM不提前出现；
 - `DiskSnapshotRecord`直接进入GC mark set，Deleting状态阻止新attach并完成对象清理；
 - snapshot业务变化与covered API result原子提交；create→delete后的旧create重放不复活row，跨Workspace
   mutation不写Operation/result或资源；

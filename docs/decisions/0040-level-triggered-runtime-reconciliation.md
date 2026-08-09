@@ -87,7 +87,9 @@ Pending Operation。已选 Node 若明确拒绝不可满足的容量/能力，�
 
 Cat create把Cat、current完整Desired、runtime Operation、generation-zero且Unowned的唯一Root
 Disk/Volume和exact API result放在同一PG commit；不留下半套identity。Root没有Persistent
-initialization状态或第二个Disk Operation。
+initialization状态或第二个Disk Operation。generation-zero只表示Control identity已原子创建，不是可启动
+postcondition；Node acquire后必须以RuntimeCheckpoint中的单一`provision_root_image` step把Desired指定的
+immutable image确定性CAS为generation 1，确认前不暴露device或启动VMM。
 
 Operation 只有在 current desired、observation revision、placement 和完整 postcondition 全部
 匹配时才成功；顶层observation Node、Operation placement、applied desired placement和current
@@ -143,6 +145,9 @@ placement authority；晚到的本地结果绑定精确 incarnation，由下一�
 - volume acquire/publish/release 使用 owner/epoch/root CAS；release在RuntimeCheckpoint先持久
   唯一transition ID、generation、disposition与full-inventory/Desired读取绑定，响应丢失只重放
   同request或核对精确transition postcondition；
+- 新Root image provision同样只用现有checkpoint和head CAS：`acquire_volume -> provision_root_image ->
+  prepare_device`，step绑定image、size、attachment、blank和纯确定target；模糊结果只认exact target或exact
+  blank，不把任意非零generation当成功，也不增加receipt；
 - process/scope/socket 使用 runtime incarnation、start time 和 handshake；
 - NBD/tap 使用完整 inventory 与 checkpoint ownership token；
 - WarmRuntimeSnapshot使用temp identity、文件metadata和VMM postcondition；DiskSnapshot走Volume
@@ -247,8 +252,8 @@ Root都可授权，包括最后`R == L`或L未知，不能等待已不可达Node
 2. Node 基础：Host lock、强进程身份、per-Cat checkpoint、checkpoint自删的唯一Node单槽、
    完整 inventory。
 3. Volume Authority：normal acquire 与 HostFenceEvent 派生的逐卷 takeover CAS。
-4. Runtime planner：有界 steps、四态 postconditions、AdmissionCell；Route 实现同时按 ADR-0041
-   切换。
+4. Runtime planner：有界 steps、四态 postconditions、AdmissionCell；Root provision同时从隐式
+   `--seed-image-id`切换为显式typed blockd control request，Route 实现同时按 ADR-0041 切换。
 5. crash/ABA/double-Agent/Host-loss/Deleted 验收矩阵全部通过后，才允许部署。
 
 当前开发数据可删除，因此不做 V1 row 或 runtime 迁移。首次部署按
