@@ -91,6 +91,10 @@ initialization状态或第二个Disk Operation。generation-zero只表示Control
 postcondition；Node acquire后必须以RuntimeCheckpoint中的单一`provision_root_image` step把Desired指定的
 immutable image确定性CAS为generation 1，确认前不暴露device或启动VMM。
 
+其中Cat row只保存不可变`cat_id/workspace_id/name/created_at`，不复制Root、Desired、observation、placement或
+Operation事实；Root关系只由`DiskRecord.role.root {cat_id}`和current完整Desired回答。Cat/Disk/Operation/API
+result的创建时间取同一次PostgreSQL DB now，Cat的初始target只存在于Desired/Operation。
+
 Operation 只有在 current desired、observation revision、placement 和完整 postcondition 全部
 匹配时才成功；顶层observation Node、Operation placement、applied desired placement和current
 desired placement必须绑定同一Node，applied/Operation/current desired与实际结算target也必须

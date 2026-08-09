@@ -505,6 +505,10 @@ Cat create是第2条的完整原子实例：同一PG commit写Cat、current完�
 generation-zero且Unowned的Root Disk/Volume和包含原operation ID的result，或全部不写。Root没有
 Persistent initialization状态或第二个Disk Operation。同key
 响应/commit不明只重放原response与operation ID，不能分配第二组identity。
+Cat row的精确最小schema由[Volume Authority §3](volume-authority.md#3-postgresql-authority-模型)冻结，只保存
+不可变identity/name/created time；Root、target、placement和runtime状态不得复制进Cat row。Cat/Disk、
+Operation created/updated和API result的首次时间使用同一次PostgreSQL DB now，初始target只由本节完整
+Desired及其Operation携带。该Cat row不是Control Plane -> Node共享wire，也不属于F0 codegen集合。
 
 ## 4. Desired delivery 与 AdmissionCell
 

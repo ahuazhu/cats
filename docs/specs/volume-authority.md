@@ -116,6 +116,13 @@ LastVolumeTransition =
 | { kind: "begin_delete", request: BeginDeleteRequest, result: BeginDeleteResult }
 | { kind: "begin_disposable_delete", authorization_id: Id }
 
+CatRecord {
+  cat_id: Id,
+  workspace_id: Id,
+  name: Id,
+  created_at: UnixMillis
+}
+
 DiskRecord {
   disk_id: Id,
   workspace_id: Id,
@@ -232,6 +239,12 @@ DeleteCompletionReceipt =
 比较、保存和复制；任何result或receipt写“exact head”都复用这三个字段，不能只比较其中一部分。
 本文的“head generation非倒退”固定表示：更小generation拒绝；相同generation时hash和object ID也必须
 逐字段相同；只有更大generation才进入对应的数据面CAS或closed successor验证。
+
+`CatRecord`只保存产品identity：四个字段创建后都不可修改，`(workspace_id, name)`唯一。它不复制
+`root_disk_id`、Desired/Observed state、generation、Node/placement、runtime shape或transition；这些事实分别
+只由`DiskRecord.role.root {cat_id}`、current完整`DesiredRuntimeSpec`、accepted observation和`Operation`
+回答。每个Cat恰好一个Root的交叉约束仍按下段锁定Disk/current Desired验证，不能向Cat row增加缓存字段作为
+第二个关系权威。Cat create的初始target也只由同事务的Desired/Operation携带，`CatRecord`不另存或选择target。
 
 `DiskRecord`的disk/workspace/name/volume identity、size、durability和created_at创建后不可修改，且
 size/durability必须与同一`VolumeRecord`逐字段相同。`DiskRecord.volume_id`全局唯一：产品Disk与Volume
@@ -684,7 +697,9 @@ Desired、绑定该revision的runtime Operation、`root {cat_id}` Disk、generat
 Volume，以及包含原operation ID的exact `ApiIdempotencyResult`。Cat、Disk和Desired的Workspace逐字段相同，
 Desired恰好引用这一个Root Disk/Volume。全部rows/result同一commit或全部不存在；commit/response不明后
 同key只重放原status/body/operation ID，不生成第二个Cat、Disk、Volume、Desired或Operation。
-Root不携带Persistent initialization状态，也不创建第二个Disk Operation。
+Root不携带Persistent initialization状态，也不创建第二个Disk Operation。事务只读取一次PostgreSQL DB now，
+并把同一毫秒值写入`CatRecord.created_at`、`DiskRecord.created_at`、Operation的created/updated time和
+`ApiIdempotencyResult.created_at`；重放不刷新任何时间。
 
 **PersistentDisk独立create。** 它是同步资源事务，不走Runtime Operation。认证、当前membership/route permission和§3.3
 key reservation通过后，result miss的唯一PostgreSQL事务由server分配永不复用的`disk_id`、`volume_id`、
