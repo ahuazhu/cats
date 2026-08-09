@@ -257,6 +257,10 @@ runbook；禁止以“重启看看”跳过fence或durability proof。
 3. 按批准的 destructive runbook 删除 Cat、Disk、Snapshot、Operation、旧API幂等状态、route/cache、Node runtime
    state、产品 object prefixes 以及 Metadata/Control/Usage/Billing 数据。Terraform state、实验和
    审计 evidence 继续受限保留，但不导入新系统。
+   产品object prefixes明确包括configured ChunkStore prefix下的`images/`；maintenance actor用独立权限删除，
+   不能借用Control Plane只读manifest IAM。步骤3必须生成记录exact bucket/prefix与删除边界的reset receipt，并在
+   credential rotation或任何target组件启动前对该prefix做authoritative empty verification。receipt缺失/不完整、
+   prefix不可读、仍非空或范围unknown都停止cutover；不得把旧schema缺表或步骤5的新空schema当成零引用proof。
 4. 在任何终态组件启动前，核对待部署artifact与步骤1的receipt完全一致，并证明其schema/IaC不含
    NodeJob、heartbeat overwrite、旧Route parser/mirror、旧IAM/Terraform inputs或transitional
    writes；随后轮换service、per-Node、database、object-store与route-signing credentials。此步不

@@ -130,9 +130,23 @@ bucket、endpoint 或 parser debug dump。Blob `NotFound`只映射 `NotFound`；
 冲突；`NotFound/BackendUnavailable`可以在同一 digest/key下有界重试。
 
 reader 无持久 replay row。相同 digest 每次机械读取相同 immutable key；成功必须返回逐字段相同 DTO。
-若同一 key 后来返回不同 bytes，adapter 已违反 immutable object contract，reader按当次 bytes fail closed并
-进入 fatal operational alert，不能接受“后来修正”的第二 manifest。Cat-create 的 HTTP response-loss replay
-仍由 `ApiIdempotencyResult`优先命中，命中时完全不读取 manifest；只有 result miss 才调用本 reader。
+reader 只能验证当次读取的 object，不能在进程重启后探测同一 key 的历史 bytes 是否变化；V1也没有另一个
+manifest artifact digest或持久 anchor可供这种比较。因此，不可替换性是`BlobStore::put_immutable`和 production
+backend 的硬前置条件：conditional create/WORM/IAM必须让同一 key 的第二次不同 bytes写入在跨adapter进程重启后
+仍失败。该能力未通过qualification时不能把该backend用于production，也不能靠reader“记住”先前内容补救。
+Cat-create 的 HTTP response-loss replay仍由`ApiIdempotencyResult`优先命中，命中时完全不读取 manifest；只有
+result miss才调用本 reader。
+
+Control Plane 不能在 Tokio worker 上直接执行同步`BlobStore`读取。composition root为manifest resolver创建专用
+有界blocking lane，V1固定为最多2个active read、最多32个queued read，单次从enqueue开始的absolute deadline为
+10秒；这些值不能通过请求、workspace或adapter option扩大。超过queue上限、等待permit超时、transport/retry耗尽
+deadline或shutdown都映射`BackendUnavailable`。adapter的connect/read timeout和全部retry预算必须服从同一deadline，
+不能让一次attempt使用更长的独立60秒预算。请求取消、deadline或shutdown后到达的late result必须丢弃；active
+permit只有在底层blocking read真正返回后才释放，queued permit在取消/超时/shutdown时立即释放。shutdown先拒绝新
+enqueue并清空queued work，再在该10秒transport上界内等待active work退出。queued item只持有已验证digest/key、
+deadline和completion handle，取得active permit前不得读取或保留manifest body；每个active read至多持有一份cap内
+raw bytes、一份上界为262144项的decoded DTO和一份cap内canonical bytes。Cat-create fast replay在进入resolver前
+返回，因此既不读取object，也不取得active/queued permit。
 
 ## 6. Production composition 与最小权限
 
@@ -159,20 +173,25 @@ Kubernetes/runtime Secret只保存非公开的配置引用；AWS workload identi
 `version,image_id,size_bytes,chunks`，旧 reader也接受 whitespace/member-order变化；这些旧 bytes不是本合同
 的 canonical artifact，不能被新 reader接受，也不能在同一个 immutable key下覆盖。
 
-上线前必须在旧协调组件完全退出、目标组件尚未启动的维护窗口执行：
+本节不定义第二条cutover runbook；唯一顺序是[Operations HA §8](../operations-ha.md#8-首次终态部署)的首次终态
+destructive reset。旧schema没有足以证明target image引用集合的authority，因此不得把缺表、空表或对旧Control
+PostgreSQL的扫描解释成零引用proof，也不得在Operations步骤3之后用新建的空schema补做这种证明。
 
-1. 在一个 Control PostgreSQL transaction snapshot 扫描全部 current Desired、Disk/Root、snapshot retained
-   root 和任何 image reference projection，证明目标 image namespace没有 live 或 retained reference；扫描
-   incomplete、schema不可信、数据库不可用或出现任一 live/unknown reference都停止 cutover；
-2. 只有上述零引用 proof成功，才可按reviewed manifest精确删除 qualification/development旧 image namespace；
-   生产namespace若无法证明零引用，不删除、不覆盖、不启用双reader；
-3. 使用新 canonical publisher重新发布 operator image，验证manifest fixed vector/cap/identity与全部 data
-   objects，再启动 Control Plane/Node；
-4. qualification分别从 Control Plane reader与 blockd provision path读取同一个 exact object，重算 bytes
-   checksum并验证相同 DTO。
+A21只给该唯一runbook增加以下前置凭据和qualification：
 
-该 proof 是一次 cutover admission，不成为新的运行时数据库 authority或永久 image catalog。V1 不保留旧
-noncanonical parser、legacy key、alias或版本协商。
+1. Operations步骤2完成旧组件quiesce/fence后，步骤3的approved destructive reset必须把configured product
+   object prefix内的`images/`完整纳入删除范围；operator使用独立maintenance权限执行，不能借用只读Control IAM；
+2. 步骤3生成的reset receipt必须记录exact bucket/prefix、删除边界、完成结果，并在凭据发布前对该prefix做
+   authoritative empty verification。receipt缺失/不完整、prefix不可读、仍非空或范围unknown一律停止，且不得
+   启动target Control/blockd、覆盖旧key或启用兼容reader；
+3. Operations步骤4完成artifact核对和credential rotation、步骤5创建空target schema后，使用新canonical
+   publisher发布operator image；publisher先durable写data objects，最后以qualified immutable create写manifest，
+   并验证fixed vector/cap/identity和全部data objects；
+4. Operations步骤7的qualification分别从Control Plane reader与blockd provision path读取同一个exact
+   manifest object，重算artifact bytes checksum并验证相同DTO，全部通过后才可开放ingress。
+
+V1不支持保留live/unknown image reference的non-destructive upgrade；该场景必须另立migration合同，本合同不提供
+scan/migration/dual reader。V1也不保留旧noncanonical parser、legacy key、alias或版本协商。
 
 ## 8. 最小验收
 
@@ -184,7 +203,10 @@ noncanonical parser、legacy key、alias或版本协商。
 - 262144项上界、重复/倒序/越界index、wrong len/object digest；
 - `NotFound/TooLarge/Corrupt/BackendUnavailable`映射不混淆且error不泄漏provider secret；
 - reader不GET data objects；blockd仍逐唯一object验证length+digest；Cat fast replay零manifest GET；
+- 同key不同bytes的第二次`put_immutable`在adapter重启前后都拒绝；不具备conditional create/WORM的backend不Ready；
+- Control resolver用2 active/32 queued/10秒absolute deadline做slow/trickle和32 MiB并发测试：active、queued和
+  retained memory有界，queue overflow/timeout映射正确，health仍响应，cancel/shutdown释放queue且late result丢弃；
 - file/AWS adapters复用同一个 core contract suite；Control Plane没有blockd依赖、catalog/DB fallback；
 - IAM只允许exact manifest namespace GET，data/volume/LIST/PUT/DELETE全部显式拒绝；
-- cutover有live/unknown ref时零删除且不Ready；零引用后旧noncanonical artifact清理、新canonical publish和两消费方
-  exact read全部通过。
+- cutover只有Operations §8 exact顺序；缺reset receipt、empty verification失败或prefix非空时不Ready且不发布，
+  receipt成功后新canonical publish和两消费方exact read全部通过。
