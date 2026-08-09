@@ -18,7 +18,14 @@ pub(super) type AuthorityTxResult<T> = std::result::Result<T, AuthorityTransacti
 
 pub(super) enum AuthorityTransactionError {
     Domain(AuthorityError),
+    Application(ApiError),
+    CandidateCollision,
     Postgres(postgres::Error),
+}
+
+pub(super) enum AuthorityExecutionError {
+    Store(ApiError),
+    CandidateCollision,
 }
 
 impl From<AuthorityError> for AuthorityTransactionError {
@@ -33,8 +40,16 @@ impl From<postgres::Error> for AuthorityTransactionError {
     }
 }
 
+impl From<ApiError> for AuthorityTransactionError {
+    fn from(error: ApiError) -> Self {
+        Self::Application(error)
+    }
+}
+
 enum AttemptFailure {
     Domain(AuthorityError),
+    Application(ApiError),
+    CandidateCollision,
     Postgres(postgres::Error),
     Rollback(postgres::Error),
     Infrastructure(ApiError),
@@ -46,8 +61,21 @@ impl Store {
     /// domain conflicts are rolled back and returned exactly once.
     pub(super) fn authority_transaction<T: Send>(
         &self,
-        mut operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
+        operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
     ) -> Result<T> {
+        match self.authority_transaction_outcome(operation) {
+            Ok(value) => Ok(value),
+            Err(AuthorityExecutionError::Store(error)) => Err(error),
+            Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
+                "unexpected candidate-collision marker outside a covered create",
+            )),
+        }
+    }
+
+    pub(super) fn authority_transaction_outcome<T: Send>(
+        &self,
+        mut operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
+    ) -> std::result::Result<T, AuthorityExecutionError> {
         for attempt in 0..AUTHORITY_TRANSACTION_ATTEMPTS {
             let outcome = self.enter(|client| {
                 let client = client.map_err(AttemptFailure::Infrastructure)?;
@@ -64,6 +92,14 @@ impl Store {
                         // a retriable serialization/connection error.
                         transaction.rollback().map_err(AttemptFailure::Rollback)?;
                         Err(AttemptFailure::Domain(error))
+                    }
+                    Err(AuthorityTransactionError::Application(error)) => {
+                        transaction.rollback().map_err(AttemptFailure::Rollback)?;
+                        Err(AttemptFailure::Application(error))
+                    }
+                    Err(AuthorityTransactionError::CandidateCollision) => {
+                        transaction.rollback().map_err(AttemptFailure::Rollback)?;
+                        Err(AttemptFailure::CandidateCollision)
                     }
                     Err(AuthorityTransactionError::Postgres(error)) => {
                         if let Err(rollback_error) = transaction.rollback() {
@@ -88,18 +124,30 @@ impl Store {
                 }
                 Err(AttemptFailure::Domain(error)) => {
                     metrics::record_authority_outcome(metrics::AuthorityOutcome::DomainRejected);
-                    return Err(authority_rejection(error));
+                    return Err(AuthorityExecutionError::Store(authority_rejection(error)));
+                }
+                Err(AttemptFailure::Application(error)) => {
+                    metrics::record_authority_outcome(if error.code == ErrorCode::Internal {
+                        metrics::AuthorityOutcome::BackendFailed
+                    } else {
+                        metrics::AuthorityOutcome::DomainRejected
+                    });
+                    return Err(AuthorityExecutionError::Store(error));
+                }
+                Err(AttemptFailure::CandidateCollision) => {
+                    metrics::record_authority_outcome(metrics::AuthorityOutcome::DomainRejected);
+                    return Err(AuthorityExecutionError::CandidateCollision);
                 }
                 Err(AttemptFailure::Infrastructure(error)) => {
                     metrics::record_authority_outcome(metrics::AuthorityOutcome::BackendFailed);
-                    return Err(error);
+                    return Err(AuthorityExecutionError::Store(error));
                 }
                 Err(AttemptFailure::Rollback(error)) => {
                     metrics::record_postgres_error(&error);
                     metrics::record_authority_outcome(metrics::AuthorityOutcome::BackendFailed);
-                    return Err(internal(format!(
+                    return Err(AuthorityExecutionError::Store(internal(format!(
                         "volume authority PostgreSQL rollback failed: {error}"
-                    )));
+                    ))));
                 }
                 Err(AttemptFailure::Postgres(error)) => {
                     metrics::record_postgres_error(&error);
@@ -113,14 +161,14 @@ impl Store {
                     }
 
                     metrics::record_authority_outcome(metrics::AuthorityOutcome::BackendFailed);
-                    return Err(match retry_reason {
+                    return Err(AuthorityExecutionError::Store(match retry_reason {
                         Some(_) => ApiError::unavailable(format!(
                             "volume authority transaction did not commit after {AUTHORITY_TRANSACTION_ATTEMPTS} attempts"
                         )),
                         None => internal(format!(
                             "volume authority PostgreSQL transaction failed: {error}"
                         )),
-                    });
+                    }));
                 }
             }
         }

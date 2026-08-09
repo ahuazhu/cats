@@ -201,7 +201,7 @@ fn verify_current_schema(transaction: &mut postgres::Transaction<'_>) -> Result<
 }
 
 /// This is the first clean-slate runtime-cutover schema. Version 1 is not
-/// migrated or repaired; F1 must ship only as part of the complete vertical
+/// migrated or repaired; it must ship only as part of the complete vertical
 /// cutover release.
 pub(super) const SCHEMA_VERSION: i64 = 2;
 
@@ -231,6 +231,11 @@ const CONTROL_TABLES: &[&str] = &[
     "host_fence_events",
     "volume_authorizations",
     "delete_completion_receipts",
+    "cat_records",
+    "disk_records",
+    "desired_runtime_specs",
+    "runtime_operations",
+    "api_idempotency_results",
 ];
 
 const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
@@ -253,6 +258,27 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             prior_attachment_id, deleting_epoch, head_generation,
             head_root_hash, head_root_object_id, completed_at
        FROM delete_completion_receipts WHERE FALSE",
+    "SELECT cat_id, record, workspace_id, name, created_at
+       FROM cat_records WHERE FALSE",
+    "SELECT disk_id, record, workspace_id, name, volume_id, size_bytes,
+            durability, created_at, admin_state, delete_id, role_kind,
+            root_cat_id, initialization_kind, initialization_token,
+            filesystem_uuid, expected_blank_generation,
+            expected_blank_root_hash, expected_blank_root_object_id,
+            initialized_generation, initialized_root_hash,
+            initialized_root_object_id, initialized_at
+       FROM disk_records WHERE FALSE",
+    "SELECT cat_id, record, workspace_id, desired_revision, spec_digest,
+            target, node_id, placement_epoch
+       FROM desired_runtime_specs WHERE FALSE",
+    "SELECT operation_id, record, workspace_id, cat_id, desired_revision,
+            desired_spec_digest, node_id, placement_epoch, target, phase,
+            terminal_kind, created_at, updated_at
+       FROM runtime_operations WHERE FALSE",
+    "SELECT authenticated_workspace_id, canonical_route, idempotency_key,
+            request_fingerprint, http_status, content_type, response_body,
+            created_at
+       FROM api_idempotency_results WHERE FALSE",
 ];
 
 const SCHEMA: &str = "
@@ -599,6 +625,140 @@ CREATE TABLE IF NOT EXISTS delete_completion_receipts (
         (head_generation = 0 AND head_root_hash IS NULL AND head_root_object_id IS NULL) OR
         (head_generation > 0 AND head_root_hash IS NOT NULL AND head_root_object_id IS NOT NULL)
     )
+);
+CREATE TABLE IF NOT EXISTS cat_records (
+    cat_id TEXT PRIMARY KEY,
+    record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+    name TEXT NOT NULL,
+    created_at BIGINT NOT NULL CHECK (created_at >= 0),
+    UNIQUE (workspace_id, name),
+    UNIQUE (workspace_id, cat_id)
+);
+CREATE TABLE IF NOT EXISTS disk_records (
+    disk_id TEXT PRIMARY KEY,
+    record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+    name TEXT NOT NULL,
+    volume_id TEXT NOT NULL UNIQUE REFERENCES volume_records(volume_id),
+    size_bytes BIGINT NOT NULL CHECK (size_bytes > 0),
+    durability TEXT NOT NULL CHECK (durability IN ('strict', 'relaxed')),
+    created_at BIGINT NOT NULL CHECK (created_at >= 0),
+    admin_state TEXT NOT NULL CHECK (admin_state IN ('active', 'deleting')),
+    delete_id TEXT,
+    role_kind TEXT NOT NULL CHECK (role_kind IN ('root', 'persistent')),
+    root_cat_id TEXT,
+    initialization_kind TEXT CHECK (initialization_kind IN ('uninitialized', 'initialized')),
+    initialization_token TEXT,
+    filesystem_uuid TEXT,
+    expected_blank_generation BIGINT,
+    expected_blank_root_hash TEXT,
+    expected_blank_root_object_id TEXT,
+    initialized_generation BIGINT,
+    initialized_root_hash TEXT,
+    initialized_root_object_id TEXT,
+    initialized_at BIGINT,
+    UNIQUE (workspace_id, name),
+    FOREIGN KEY (workspace_id, root_cat_id)
+        REFERENCES cat_records(workspace_id, cat_id),
+    CHECK (
+        (admin_state = 'active' AND delete_id IS NULL) OR
+        (admin_state = 'deleting' AND delete_id IS NOT NULL)
+    ),
+    CHECK (
+        (role_kind = 'root'
+            AND root_cat_id IS NOT NULL
+            AND initialization_kind IS NULL
+            AND initialization_token IS NULL
+            AND filesystem_uuid IS NULL
+            AND expected_blank_generation IS NULL
+            AND expected_blank_root_hash IS NULL
+            AND expected_blank_root_object_id IS NULL
+            AND initialized_generation IS NULL
+            AND initialized_root_hash IS NULL
+            AND initialized_root_object_id IS NULL
+            AND initialized_at IS NULL) OR
+        (role_kind = 'persistent'
+            AND root_cat_id IS NULL
+            AND initialization_kind = 'uninitialized'
+            AND initialization_token IS NOT NULL
+            AND filesystem_uuid IS NOT NULL
+            AND expected_blank_generation = 0
+            AND expected_blank_root_hash IS NULL
+            AND expected_blank_root_object_id IS NULL
+            AND initialized_generation IS NULL
+            AND initialized_root_hash IS NULL
+            AND initialized_root_object_id IS NULL
+            AND initialized_at IS NULL) OR
+        (role_kind = 'persistent'
+            AND root_cat_id IS NULL
+            AND initialization_kind = 'initialized'
+            AND initialization_token IS NOT NULL
+            AND filesystem_uuid IS NOT NULL
+            AND expected_blank_generation = 0
+            AND expected_blank_root_hash IS NULL
+            AND expected_blank_root_object_id IS NULL
+            AND initialized_generation > 0
+            AND initialized_root_hash IS NOT NULL
+            AND initialized_root_object_id IS NOT NULL
+            AND initialized_at >= 0)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS disk_records_one_root_per_cat
+ON disk_records(root_cat_id) WHERE role_kind = 'root';
+CREATE TABLE IF NOT EXISTS desired_runtime_specs (
+    cat_id TEXT PRIMARY KEY,
+    record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
+    workspace_id TEXT NOT NULL,
+    desired_revision BIGINT NOT NULL CHECK (desired_revision > 0),
+    spec_digest TEXT NOT NULL CHECK (spec_digest ~ '^sha256:[0-9a-f]{64}$'),
+    target TEXT NOT NULL CHECK (target IN ('running', 'suspended', 'warm', 'cold', 'deleted')),
+    node_id TEXT NOT NULL,
+    placement_epoch BIGINT NOT NULL CHECK (placement_epoch > 0),
+    FOREIGN KEY (workspace_id, cat_id)
+        REFERENCES cat_records(workspace_id, cat_id)
+);
+CREATE TABLE IF NOT EXISTS runtime_operations (
+    operation_id TEXT PRIMARY KEY,
+    record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
+    workspace_id TEXT NOT NULL,
+    cat_id TEXT NOT NULL,
+    desired_revision BIGINT NOT NULL CHECK (desired_revision > 0),
+    desired_spec_digest TEXT NOT NULL CHECK (desired_spec_digest ~ '^sha256:[0-9a-f]{64}$'),
+    node_id TEXT NOT NULL,
+    placement_epoch BIGINT NOT NULL CHECK (placement_epoch > 0),
+    target TEXT NOT NULL CHECK (target IN ('running', 'suspended', 'warm', 'cold', 'deleted')),
+    phase TEXT NOT NULL CHECK (phase IN ('pending', 'succeeded', 'failed', 'superseded')),
+    terminal_kind TEXT CHECK (terminal_kind IN ('succeeded', 'failed', 'superseded')),
+    created_at BIGINT NOT NULL CHECK (created_at >= 0),
+    updated_at BIGINT NOT NULL CHECK (updated_at >= created_at),
+    UNIQUE (cat_id, desired_revision),
+    FOREIGN KEY (workspace_id, cat_id)
+        REFERENCES cat_records(workspace_id, cat_id),
+    CHECK (
+        (phase = 'pending' AND terminal_kind IS NULL) OR
+        (phase <> 'pending' AND terminal_kind = phase)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS runtime_operations_one_pending_per_cat
+ON runtime_operations(cat_id) WHERE phase = 'pending';
+CREATE TABLE IF NOT EXISTS api_idempotency_results (
+    authenticated_workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+    canonical_route TEXT NOT NULL CHECK (
+        octet_length(canonical_route) BETWEEN 1 AND 512
+        AND canonical_route ~ '^[ -~]+$'
+    ),
+    idempotency_key TEXT NOT NULL CHECK (
+        octet_length(idempotency_key) BETWEEN 1 AND 512
+        AND idempotency_key ~ '^[ -~]+$'
+    ),
+    request_fingerprint TEXT NOT NULL
+        CHECK (request_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
+    http_status SMALLINT NOT NULL CHECK (http_status BETWEEN 200 AND 599),
+    content_type TEXT CHECK (content_type = 'application/json'),
+    response_body BYTEA NOT NULL CHECK (octet_length(response_body) <= 1048576),
+    created_at BIGINT NOT NULL CHECK (created_at >= 0),
+    PRIMARY KEY (authenticated_workspace_id, canonical_route, idempotency_key)
 );
 -- Workspace ownership is immutable, enforced in the database exactly as the
 -- SQLite triggers did. Raised as an ordinary exception; the store maps it to
