@@ -4778,7 +4778,7 @@ pub fn decode_runtime_volume_transition_error(
         ContractName::RuntimeVolumeTransitionError,
         RUNTIME_VOLUME_TRANSITION_ERROR_MAX_WIRE_BYTES,
         &RUNTIME_VOLUME_TRANSITION_ERROR_SCHEMA,
-        |_| Ok(()),
+        validate_runtime_volume_transition_error,
     )
 }
 
@@ -5268,6 +5268,15 @@ fn authorization_volume_id(record: &AuthorizationRecord) -> &Id {
     }
 }
 
+fn authorization_node_id(record: &AuthorizationRecord) -> &Id {
+    match &record.authorization {
+        VolumeAuthorization::Takeover(authorization) => &authorization.authorized_node_id,
+        VolumeAuthorization::DisposableRootDelete(authorization) => {
+            &authorization.authorized_node_id
+        }
+    }
+}
+
 fn valid_next_epoch(previous: FenceEpoch, next: FenceEpoch) -> bool {
     previous
         .get()
@@ -5442,12 +5451,290 @@ fn delete_completion_valid(receipt: &DeleteCompletionReceipt) -> bool {
     }
 }
 
+/// Returns whether the four stored rows form the one closed authorization
+/// evidence bundle allowed by the runtime-volume-transition contract.
+///
+/// This is the shared, context-free closure used by both the public success
+/// codec and the Volume Authority adapter. The caller still owns transport
+/// context such as binding the primary authorization to the authenticated
+/// session's Node.
+pub fn volume_transition_evidence_bundle_is_closed(
+    primary: &AuthorizationRecord,
+    current_volume: Option<&VolumeRecord>,
+    delete_completion: Option<&DeleteCompletionReceipt>,
+    direct_successor: Option<&AuthorizationRecord>,
+) -> bool {
+    if !authorization_record_valid(primary)
+        || current_volume.is_some_and(|record| !volume_record_valid(record))
+        || delete_completion.is_some_and(|receipt| !delete_completion_valid(receipt))
+        || direct_successor.is_some_and(|record| !authorization_record_valid(record))
+        || (current_volume.is_some() && delete_completion.is_some())
+    {
+        return false;
+    }
+
+    let primary_id = authorization_id(primary);
+    let volume_id = authorization_volume_id(primary);
+    if current_volume.is_some_and(|record| &record.volume_id != volume_id)
+        || delete_completion.is_some_and(|receipt| completion_volume_id(receipt) != volume_id)
+    {
+        return false;
+    }
+    if let VolumeAuthorization::DisposableRootDelete(authorization) = &primary.authorization {
+        if delete_completion
+            .is_some_and(|completion| completion_delete_id(completion) != &authorization.delete_id)
+        {
+            return false;
+        }
+    }
+
+    let marker = current_volume
+        .and_then(volume_authorization_marker)
+        .or_else(|| delete_completion.and_then(completion_authorization_marker));
+    match marker.filter(|marker| *marker != primary_id) {
+        None if direct_successor.is_none() => {}
+        Some(marker)
+            if direct_successor.is_some_and(|record| authorization_id(record) == marker) => {}
+        _ => return false,
+    }
+
+    if let Some(record) = direct_successor {
+        if authorization_id(record) == primary_id
+            || authorization_volume_id(record) != volume_id
+            || !direct_successor_postcondition_is_closed(record, current_volume, delete_completion)
+            || !direct_successor_is_monotonic(primary, record)
+        {
+            return false;
+        }
+    } else if marker == Some(primary_id)
+        && !direct_successor_postcondition_is_closed(primary, current_volume, delete_completion)
+    {
+        return false;
+    }
+
+    primary_postcondition_is_monotonic(primary, current_volume, delete_completion)
+}
+
+fn completion_volume_id(receipt: &DeleteCompletionReceipt) -> &Id {
+    match receipt {
+        DeleteCompletionReceipt::Normal { request, .. } => &request.volume_id,
+        DeleteCompletionReceipt::DisposableRoot { volume_id, .. } => volume_id,
+    }
+}
+
+fn completion_delete_id(receipt: &DeleteCompletionReceipt) -> &Id {
+    match receipt {
+        DeleteCompletionReceipt::Normal { request, .. } => &request.delete_id,
+        DeleteCompletionReceipt::DisposableRoot { delete_id, .. } => delete_id,
+    }
+}
+
+fn volume_authorization_marker(record: &VolumeRecord) -> Option<&Id> {
+    match &record.last_transition {
+        Some(LastVolumeTransition::Takeover { authorization_id })
+        | Some(LastVolumeTransition::BeginDisposableDelete { authorization_id }) => {
+            Some(authorization_id)
+        }
+        _ => None,
+    }
+}
+
+fn completion_authorization_marker(receipt: &DeleteCompletionReceipt) -> Option<&Id> {
+    match receipt {
+        DeleteCompletionReceipt::Normal { .. } => None,
+        DeleteCompletionReceipt::DisposableRoot {
+            authorization_id, ..
+        } => Some(authorization_id),
+    }
+}
+
+fn direct_successor_postcondition_is_closed(
+    record: &AuthorizationRecord,
+    current_volume: Option<&VolumeRecord>,
+    delete_completion: Option<&DeleteCompletionReceipt>,
+) -> bool {
+    let AuthorizationState::Consumed(receipt) = &record.state else {
+        return false;
+    };
+    match (&record.authorization, receipt.as_ref()) {
+        (
+            VolumeAuthorization::Takeover(authorization),
+            AuthorizationConsumedReceipt::Takeover(receipt),
+        ) => {
+            let Some(current) = current_volume else {
+                return false;
+            };
+            matches!(
+                &current.last_transition,
+                Some(LastVolumeTransition::Takeover { authorization_id })
+                    if authorization_id == &authorization.authorization_id
+            ) && matches!(current.admin_state, VolumeAdminState::Active)
+                && current.lease_owner.as_ref() == Some(&receipt.new_attachment_id)
+                && current.lease_epoch == receipt.resulting_epoch
+                && remote_head_same_or_later(&current.head, &receipt.resulting_head)
+        }
+        (
+            VolumeAuthorization::DisposableRootDelete(authorization),
+            AuthorizationConsumedReceipt::BeginDisposableDelete(receipt),
+        ) => match (current_volume, delete_completion) {
+            (Some(current), None) => {
+                disposable_direct_postcondition_is_closed(current, authorization, receipt)
+            }
+            (None, Some(completion)) => {
+                disposable_completion_is_closed(completion, authorization, receipt)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn disposable_direct_postcondition_is_closed(
+    record: &VolumeRecord,
+    authorization: &DisposableRootDeleteAuthorization,
+    receipt: &BeginDisposableDeleteConsumedReceipt,
+) -> bool {
+    matches!(
+        &record.admin_state,
+        VolumeAdminState::Deleting { delete_id } if delete_id == &authorization.delete_id
+    ) && record.lease_owner.is_none()
+        && record.lease_expires_at.is_none()
+        && record.lease_epoch == receipt.resulting_epoch
+        && record.head == receipt.resulting_head
+        && matches!(
+            &record.last_transition,
+            Some(LastVolumeTransition::BeginDisposableDelete { authorization_id })
+                if authorization_id == &authorization.authorization_id
+        )
+}
+
+fn disposable_completion_is_closed(
+    completion: &DeleteCompletionReceipt,
+    authorization: &DisposableRootDeleteAuthorization,
+    receipt: &BeginDisposableDeleteConsumedReceipt,
+) -> bool {
+    matches!(
+        completion,
+        DeleteCompletionReceipt::DisposableRoot {
+            disk_id,
+            volume_id,
+            delete_id,
+            authorization_id,
+            prior_attachment_id,
+            deleting_epoch,
+            deleting_head,
+            completed_at,
+            ..
+        } if disk_id == &authorization.disk_id
+            && volume_id == &authorization.volume_id
+            && delete_id == &authorization.delete_id
+            && authorization_id == &authorization.authorization_id
+            && prior_attachment_id == &authorization.expected_attachment_id
+            && deleting_epoch == &receipt.resulting_epoch
+            && deleting_head == &receipt.resulting_head
+            && completed_at >= &receipt.consumed_at
+    )
+}
+
+fn direct_successor_is_monotonic(
+    primary: &AuthorizationRecord,
+    direct: &AuthorizationRecord,
+) -> bool {
+    let (VolumeAuthorization::Takeover(_), AuthorizationState::Consumed(primary_receipt)) =
+        (&primary.authorization, &primary.state)
+    else {
+        return true;
+    };
+    let AuthorizationConsumedReceipt::Takeover(primary_receipt) = primary_receipt.as_ref() else {
+        return false;
+    };
+    match (&direct.authorization, &direct.state) {
+        (VolumeAuthorization::Takeover(authorization), AuthorizationState::Consumed(receipt)) => {
+            let AuthorizationConsumedReceipt::Takeover(receipt) = receipt.as_ref() else {
+                return false;
+            };
+            authorization.expected_attachment_id == primary_receipt.new_attachment_id
+                && authorization.expected_epoch == primary_receipt.resulting_epoch
+                && remote_head_same_or_later(
+                    &receipt.resulting_head,
+                    &primary_receipt.resulting_head,
+                )
+        }
+        (
+            VolumeAuthorization::DisposableRootDelete(authorization),
+            AuthorizationState::Consumed(_),
+        ) => {
+            authorization.expected_attachment_id == primary_receipt.new_attachment_id
+                && authorization.expected_epoch == primary_receipt.resulting_epoch
+                && remote_head_same_or_later(
+                    &authorization.expected_head,
+                    &primary_receipt.resulting_head,
+                )
+        }
+        _ => false,
+    }
+}
+
+fn primary_postcondition_is_monotonic(
+    primary: &AuthorizationRecord,
+    current_volume: Option<&VolumeRecord>,
+    delete_completion: Option<&DeleteCompletionReceipt>,
+) -> bool {
+    let AuthorizationState::Consumed(receipt) = &primary.state else {
+        return true;
+    };
+    match (&primary.authorization, receipt.as_ref()) {
+        (VolumeAuthorization::Takeover(_), AuthorizationConsumedReceipt::Takeover(receipt)) => {
+            let (epoch, head) = match (current_volume, delete_completion) {
+                (Some(current), None) => (current.lease_epoch, &current.head),
+                (
+                    None,
+                    Some(DeleteCompletionReceipt::Normal {
+                        deleting_epoch,
+                        deleting_head,
+                        ..
+                    }),
+                )
+                | (
+                    None,
+                    Some(DeleteCompletionReceipt::DisposableRoot {
+                        deleting_epoch,
+                        deleting_head,
+                        ..
+                    }),
+                ) => (*deleting_epoch, deleting_head),
+                (None, None) => return true,
+                _ => return false,
+            };
+            epoch >= receipt.resulting_epoch
+                && remote_head_same_or_later(head, &receipt.resulting_head)
+        }
+        (
+            VolumeAuthorization::DisposableRootDelete(authorization),
+            AuthorizationConsumedReceipt::BeginDisposableDelete(receipt),
+        ) => match (current_volume, delete_completion) {
+            (Some(current), None) => {
+                disposable_direct_postcondition_is_closed(current, authorization, receipt)
+            }
+            (None, Some(completion)) => {
+                disposable_completion_is_closed(completion, authorization, receipt)
+            }
+            // A sweeper crash between row deletion and completion insertion is
+            // incomplete recovery evidence, not permission to infer success.
+            (None, None) => true,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn validate_runtime_volume_transition_evidence_success(
     success: &RuntimeVolumeTransitionEvidenceSuccess,
 ) -> Result<(), ContractError> {
     let contract = ContractName::RuntimeVolumeTransitionEvidenceSuccess;
     let mut candidates = Vec::new();
     if authorization_id(&success.authorization) != &success.authorization_id
+        || authorization_node_id(&success.authorization) != &success.session.node_id
         || !authorization_record_valid(&success.authorization)
     {
         candidates.push(Candidate::at(
@@ -5475,9 +5762,6 @@ fn validate_runtime_volume_transition_evidence_success(
             MalformedProblem::InvalidValue,
         ));
     }
-    if success.current_volume.is_some() && success.delete_completion.is_some() {
-        candidates.push(Candidate::at(&[], MalformedProblem::InvalidValue));
-    }
     if success
         .direct_successor_authorization
         .as_ref()
@@ -5489,54 +5773,18 @@ fn validate_runtime_volume_transition_evidence_success(
         ));
     }
 
-    let volume_id = authorization_volume_id(&success.authorization);
-    if success
-        .current_volume
-        .as_ref()
-        .is_some_and(|record| &record.volume_id != volume_id)
-        || success.delete_completion.as_ref().is_some_and(|receipt| {
-            let receipt_volume_id = match receipt {
-                DeleteCompletionReceipt::Normal { request, .. } => &request.volume_id,
-                DeleteCompletionReceipt::DisposableRoot { volume_id, .. } => volume_id,
-            };
-            receipt_volume_id != volume_id
-        })
-    {
-        candidates.push(Candidate::at(&[], MalformedProblem::InvalidValue));
-    }
-
-    let direct_marker = success
-        .current_volume
-        .as_ref()
-        .and_then(|record| match &record.last_transition {
-            Some(LastVolumeTransition::Takeover { authorization_id })
-            | Some(LastVolumeTransition::BeginDisposableDelete { authorization_id }) => {
-                Some(authorization_id)
-            }
-            _ => None,
-        })
-        .or_else(|| {
-            success
-                .delete_completion
-                .as_ref()
-                .and_then(|receipt| match receipt {
-                    DeleteCompletionReceipt::DisposableRoot {
-                        authorization_id, ..
-                    } => Some(authorization_id),
-                    DeleteCompletionReceipt::Normal { .. } => None,
-                })
-        })
-        .filter(|id| *id != &success.authorization_id);
-    match (
-        direct_marker,
+    if !volume_transition_evidence_bundle_is_closed(
+        &success.authorization,
+        success.current_volume.as_ref(),
+        success.delete_completion.as_ref(),
         success.direct_successor_authorization.as_ref(),
     ) {
-        (None, None) => {}
-        (Some(expected), Some(record)) if authorization_id(record) == expected => {}
-        _ => candidates.push(Candidate::at(
-            &path(&["direct_successor_authorization"]),
-            MalformedProblem::InvalidValue,
-        )),
+        let path = if success.direct_successor_authorization.is_some() {
+            path(&["direct_successor_authorization"])
+        } else {
+            Vec::new()
+        };
+        candidates.push(Candidate::at(&path, MalformedProblem::InvalidValue));
     }
 
     if let Some(candidate) = choose(candidates) {
@@ -5602,6 +5850,22 @@ fn validate_runtime_spine_error(error: &RuntimeSpineError) -> Result<(), Contrac
         validate_contract_error(contract_error).map_err(|nested| {
             malformed(
                 ContractName::RuntimeSpineError,
+                rebase_contract_candidate(&path(&["error", "contract_error"]), &nested),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_runtime_volume_transition_error(
+    error: &RuntimeVolumeTransitionError,
+) -> Result<(), ContractError> {
+    if let RuntimeVolumeTransitionErrorDetail::ContractError { contract_error } =
+        error.error.as_ref()
+    {
+        validate_contract_error(contract_error).map_err(|nested| {
+            malformed(
+                ContractName::RuntimeVolumeTransitionError,
                 rebase_contract_candidate(&path(&["error", "contract_error"]), &nested),
             )
         })?;

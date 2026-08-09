@@ -142,9 +142,6 @@ where
                     {
                         return Ok(VolumeEvidenceRecovery::Ambiguous);
                     }
-                    if authorization_node_id(&evidence.authorization) != &request.session.node_id {
-                        return Ok(VolumeEvidenceRecovery::Ambiguous);
-                    }
                     let Ok(decision) = classify_evidence(&evidence) else {
                         return Ok(VolumeEvidenceRecovery::Ambiguous);
                     };
@@ -165,15 +162,6 @@ where
                 SignedVolumeEvidenceResponse::Ambiguous => Ok(VolumeEvidenceRecovery::Ambiguous),
             }
         })
-    }
-}
-
-fn authorization_node_id(record: &AuthorizationRecord) -> &Id {
-    match &record.authorization {
-        VolumeAuthorization::Takeover(authorization) => &authorization.authorized_node_id,
-        VolumeAuthorization::DisposableRootDelete(authorization) => {
-            &authorization.authorized_node_id
-        }
     }
 }
 
@@ -683,6 +671,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn self_contradictory_nested_contract_error_is_ambiguous() {
+        let invalid = serde_json::json!({
+            "version": 1,
+            "error": {
+                "code": "contract_error",
+                "contract_error": {
+                    "version": 1,
+                    "error": {
+                        "code": "stale_observation_sequence",
+                        "node_id": "node_a",
+                        "agent_session_epoch": 2,
+                        "presented_heartbeat_sequence": 20,
+                        "last_accepted_heartbeat_sequence": 19,
+                    },
+                    "message": "not stale",
+                },
+            },
+            "message": "invalid nested error",
+        });
+        let client = ControlSignedVolumeEvidenceClient::new(FakeSignedTransport::new(
+            SignedVolumeEvidenceResponse::ClosedError {
+                status: 409,
+                body: serde_json::to_vec(&invalid).unwrap(),
+            },
+        ));
+
+        assert_eq!(
+            client.recover_authorization(&request()).await.unwrap(),
+            VolumeEvidenceRecovery::Ambiguous
+        );
+    }
+
     #[test]
     fn session_error_must_bind_the_presented_node_and_epoch() {
         let request = request();
@@ -748,18 +769,9 @@ mod tests {
             VolumeEvidenceRecovery::Ambiguous
         ));
 
-        let mut success =
-            decode_runtime_volume_transition_evidence_success(SUCCESS.as_bytes()).unwrap();
-        let VolumeAuthorization::Takeover(authorization) = &mut success.authorization.authorization
-        else {
-            unreachable!()
-        };
-        authorization.authorized_node_id = Id::new("node_other").unwrap();
-        let body =
-            cats_api::runtime_reconciliation::encode_runtime_volume_transition_evidence_success(
-                &success,
-            )
-            .unwrap();
+        let mut success: serde_json::Value = serde_json::from_str(SUCCESS).unwrap();
+        success["authorization"]["authorization"]["authorized_node_id"] = "node_other".into();
+        let body = serde_json::to_vec(&success).unwrap();
         let client = ControlSignedVolumeEvidenceClient::new(FakeSignedTransport::new(
             SignedVolumeEvidenceResponse::Success(body),
         ));

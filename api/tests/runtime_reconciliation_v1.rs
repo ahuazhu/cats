@@ -58,6 +58,45 @@ fn zero_remote_head() -> serde_json::Value {
     })
 }
 
+fn takeover_evidence_with_direct_successor() -> serde_json::Value {
+    let mut success: serde_json::Value =
+        serde_json::from_str(CONSUMED_TAKEOVER_EVIDENCE_SUCCESS_WIRE).unwrap();
+    success["current_volume"]["lease_owner"] = "att_next".into();
+    success["current_volume"]["lease_epoch"] = 5.into();
+    success["current_volume"]["lease_expires_at"] = 1_720_000_061_000_u64.into();
+    success["current_volume"]["last_transition"]["authorization_id"] = "auth_02".into();
+    success["direct_successor_authorization"] = serde_json::json!({
+        "authorization": {
+            "kind": "takeover",
+            "authorization_id": "auth_02",
+            "authorized_node_id": "node_b",
+            "host_fence_event_id": "fence_02",
+            "volume_id": "vol_root",
+            "expected_attachment_id": "att_new",
+            "expected_epoch": 4,
+            "new_attachment_id": "att_next",
+            "desired_revision": 9,
+            "new_placement_epoch": 5,
+            "lease_duration_ms": 60_000,
+            "not_after": 1_720_000_040_000_u64,
+        },
+        "state": {
+            "kind": "consumed",
+            "receipt": {
+                "kind": "takeover",
+                "authorization_id": "auth_02",
+                "host_fence_event_id": "fence_02",
+                "volume_id": "vol_root",
+                "new_attachment_id": "att_next",
+                "resulting_epoch": 5,
+                "resulting_head": zero_remote_head(),
+                "consumed_at": 1_720_000_001_000_u64,
+            },
+        },
+    });
+    success
+}
+
 fn nonzero_remote_head() -> serde_json::Value {
     serde_json::json!({
         "generation": 1,
@@ -952,6 +991,86 @@ fn a22_authorization_evidence_codecs_reject_open_or_cross_mismatched_payloads() 
         malformed(&error).0.as_str(),
         "/direct_successor_authorization"
     );
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+}
+
+#[test]
+fn a22_evidence_success_codec_requires_the_complete_authority_closure() {
+    let mut wrong_primary_node: serde_json::Value =
+        serde_json::from_str(CONSUMED_TAKEOVER_EVIDENCE_SUCCESS_WIRE).unwrap();
+    wrong_primary_node["authorization"]["authorization"]["authorized_node_id"] =
+        "node_other".into();
+    let error = decode_runtime_volume_transition_evidence_success(
+        &serde_json::to_vec(&wrong_primary_node).unwrap(),
+    )
+    .unwrap_err();
+    assert_eq!(malformed(&error).0.as_str(), "/authorization");
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+
+    // A direct successor is returned because the current marker names it. Its
+    // own authorized Node can differ from the primary authorization's Node.
+    let valid_other_node = takeover_evidence_with_direct_successor();
+    decode_runtime_volume_transition_evidence_success(
+        &serde_json::to_vec(&valid_other_node).unwrap(),
+    )
+    .unwrap();
+
+    let mut wrong_volume = takeover_evidence_with_direct_successor();
+    wrong_volume["direct_successor_authorization"]["authorization"]["volume_id"] =
+        "vol_other".into();
+    wrong_volume["direct_successor_authorization"]["state"]["receipt"]["volume_id"] =
+        "vol_other".into();
+    assert_direct_successor_invalid(wrong_volume);
+
+    let mut unconsumed = takeover_evidence_with_direct_successor();
+    unconsumed["direct_successor_authorization"]["state"] =
+        serde_json::json!({"kind": "unconsumed"});
+    assert_direct_successor_invalid(unconsumed);
+
+    let mut bad_receipt_postcondition = takeover_evidence_with_direct_successor();
+    bad_receipt_postcondition["current_volume"]["lease_epoch"] = 6.into();
+    assert_direct_successor_invalid(bad_receipt_postcondition);
+
+    let mut non_monotonic = takeover_evidence_with_direct_successor();
+    non_monotonic["direct_successor_authorization"]["authorization"]["expected_attachment_id"] =
+        "att_unrelated".into();
+    assert_direct_successor_invalid(non_monotonic);
+}
+
+fn assert_direct_successor_invalid(value: serde_json::Value) {
+    let error =
+        decode_runtime_volume_transition_evidence_success(&serde_json::to_vec(&value).unwrap())
+            .unwrap_err();
+    assert_eq!(
+        malformed(&error).0.as_str(),
+        "/direct_successor_authorization"
+    );
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+}
+
+#[test]
+fn a22_nested_contract_failures_keep_their_exact_rebased_pointer() {
+    let invalid = serde_json::json!({
+        "version": 1,
+        "error": {
+            "code": "contract_error",
+            "contract_error": {
+                "version": 1,
+                "error": {
+                    "code": "stale_observation_sequence",
+                    "node_id": "node_a",
+                    "agent_session_epoch": 2,
+                    "presented_heartbeat_sequence": 20,
+                    "last_accepted_heartbeat_sequence": 19,
+                },
+                "message": "not stale",
+            },
+        },
+        "message": "invalid nested error",
+    });
+    let error =
+        decode_runtime_volume_transition_error(&serde_json::to_vec(&invalid).unwrap()).unwrap_err();
+    assert_eq!(malformed(&error).0.as_str(), "/error/contract_error/error");
     assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
 }
 

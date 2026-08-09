@@ -60,7 +60,7 @@ pub use wire::{
     encode_runtime_provisioner_active_set, encode_runtime_provisioner_trust_bundle,
     encode_runtime_spine_error, encode_runtime_volume_transition_error,
     encode_runtime_volume_transition_evidence_request,
-    encode_runtime_volume_transition_evidence_success,
+    encode_runtime_volume_transition_evidence_success, volume_transition_evidence_bundle_is_closed,
     ADMISSION_INVENTORY_ATTESTATION_MAX_WIRE_BYTES,
     AGENT_REGISTRATION_ATTEMPT_MAX_WIRE_BYTES, AGENT_SESSION_MAX_WIRE_BYTES,
     CONTRACT_ERROR_MAX_WIRE_BYTES, DESIRED_READ_REQUEST_MAX_WIRE_BYTES,
