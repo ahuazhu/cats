@@ -657,7 +657,8 @@ pub(super) fn runtime_authorization_route_for_context(
 /// exact disposable-delete lineage, so release and derive cannot both commit.
 /// Historical takeover records and authorizations for an older delete
 /// lineage are immutable evidence, not a branch conflict for the current
-/// normal Root delete.
+/// normal Root delete. Current scalar-scope candidates are bounded and fully
+/// decoded so projection-preserving corruption cannot masquerade as absence.
 pub(super) fn volume_has_disposable_root_authorization_for_delete(
     transaction: &mut Transaction<'_>,
     volume_id: &Id,
@@ -667,26 +668,40 @@ pub(super) fn volume_has_disposable_root_authorization_for_delete(
 ) -> AuthorityTxResult<bool> {
     let desired_revision = desired_revision.to_pg().map_err(corrupt)?;
     let placement_epoch = placement_epoch.to_pg().map_err(corrupt)?;
-    transaction
-        .query_one(
-            "SELECT EXISTS(
-                 SELECT 1
-                   FROM volume_authorizations
-                  WHERE volume_id=$1
-                    AND kind='disposable_root_delete'
-                    AND desired_revision=$3
-                    AND placement_epoch=$4
-                    AND record->'authorization'->>'delete_id'=$2
-             )",
-            &[
-                &volume_id.as_str(),
-                &delete_id.as_str(),
-                &desired_revision,
-                &placement_epoch,
-            ],
-        )?
-        .try_get(0)
-        .map_err(Into::into)
+    let sql = format!(
+        "SELECT {AUTHORIZATION_COLUMNS}
+           FROM volume_authorizations
+          WHERE volume_id=$1
+            AND kind='disposable_root_delete'
+            AND desired_revision=$2
+            AND placement_epoch=$3
+          ORDER BY authorization_id COLLATE \"C\"
+          LIMIT 2"
+    );
+    let rows = transaction.query(
+        &sql,
+        &[&volume_id.as_str(), &desired_revision, &placement_epoch],
+    )?;
+    if rows.len() > 1 {
+        return Err(corrupt(
+            "multiple disposable authorizations share one current delete scope",
+        ));
+    }
+    let Some(row) = rows.first() else {
+        return Ok(false);
+    };
+    let authorization = decode_authorization(row)?;
+    let VolumeAuthorization::DisposableRootDelete(payload) = authorization.authorization else {
+        return Err(corrupt(
+            "current disposable authorization scope decoded another kind",
+        ));
+    };
+    if payload.delete_id != *delete_id {
+        return Err(corrupt(
+            "current disposable authorization names another delete lineage",
+        ));
+    }
+    Ok(true)
 }
 
 /// Locks and decodes the same bounded takeover row after its HostFenceEvent

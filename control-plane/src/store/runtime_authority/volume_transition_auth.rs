@@ -23,8 +23,8 @@ use cats_api::runtime_reconciliation::{
 use cats_storage::authority::{
     consume_disposable_root_delete, consume_takeover, normal_acquire, release,
     replay_consumed_takeover, AuthorityError, AuthorizationRecord, AuthorizationState,
-    HostFenceEvent, NormalAcquireRequest, ReleaseRequest, TakeoverResult, VolumeAuthorization,
-    VolumeRecord,
+    HostFenceEvent, LastVolumeTransition, NormalAcquireRequest, ReleaseRequest, TakeoverResult,
+    VolumeAuthorization, VolumeRecord,
 };
 use postgres::Transaction;
 
@@ -916,10 +916,14 @@ fn normal_physical_evidence_is_safe(
             else {
                 return false;
             };
-            attachment_id == &request.attachment_id
-                && *attachment_epoch == resulting_epoch
-                && head == &volume.head
-                && observed.local_lineages.len() == 1
+            let exact_known_empty_replay = observed.local_lineages.is_empty()
+                && observed.devices.is_empty()
+                && runtime.processes.is_empty()
+                && runtime.mounts.is_empty()
+                && physical.blockd_processes.is_empty()
+                && physical.mounts.is_empty()
+                && volume_has_exact_normal_acquire_marker(volume, request);
+            let exact_started_lineage = observed.local_lineages.len() == 1
                 && observed.local_lineages.first().is_some_and(|lineage| {
                     lineage.attachment_id == request.attachment_id
                         && lineage.attachment_epoch == resulting_epoch
@@ -949,12 +953,35 @@ fn normal_physical_evidence_is_safe(
                 && physical
                     .mounts
                     .iter()
-                    .all(|(runtime, _)| std::ptr::eq(*runtime, expected_runtime))
+                    .all(|(runtime, _)| std::ptr::eq(*runtime, expected_runtime));
+            attachment_id == &request.attachment_id
+                && *attachment_epoch == resulting_epoch
+                && head == &volume.head
+                && (exact_known_empty_replay || exact_started_lineage)
         }
         VolumeAuthorityEvidence::Unavailable
         | VolumeAuthorityEvidence::Absent
         | VolumeAuthorityEvidence::Deleting { .. } => false,
     }
+}
+
+fn volume_has_exact_normal_acquire_marker(
+    volume: &VolumeRecord,
+    request: &NormalAcquireRequest,
+) -> bool {
+    matches!(
+        &volume.last_transition,
+        Some(LastVolumeTransition::NormalAcquire {
+            request: original,
+            result,
+        }) if original == request
+            && result.volume_id == volume.volume_id
+            && result.attachment_id == request.attachment_id
+            && result.resulting_epoch == volume.lease_epoch
+            && result.resulting_head == volume.head
+            && volume.lease_owner.as_ref() == Some(&request.attachment_id)
+            && volume.lease_expires_at == Some(result.lease_expires_at)
+    )
 }
 
 fn release_evidence_matches(

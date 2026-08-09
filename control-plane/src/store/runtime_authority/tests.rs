@@ -1581,6 +1581,66 @@ fn a22_normal_acquire_commits_once_and_replays_after_response_loss() {
     assert_eq!(committed.lease_owner, Some(id("attachment-normal")));
     assert_eq!(committed.lease_epoch, fence_epoch(8));
 
+    let desired_read = match store
+        .runtime_desired_read(
+            &node.authenticated,
+            &DesiredReadRequest {
+                version: ContractVersion::V1,
+                session: node.session.clone(),
+                request_sequence: Sequence::new(2).unwrap(),
+            },
+        )
+        .unwrap()
+    {
+        RuntimeSpineOutcome::Accepted(snapshot) => snapshot,
+        RuntimeSpineOutcome::Rejected(rejection) => {
+            panic!("fresh replay Desired read rejected: {rejection:?}")
+        }
+    };
+    let mut observed = observed_owned_volume(
+        &desired,
+        &committed,
+        cats_api::runtime_reconciliation::AcquireOrigin::Normal {
+            transition_id: random_id(2),
+        },
+        committed.head.generation,
+        committed.head.generation,
+    );
+    observed.local_lineages.clear();
+    let mut fresh = NodeObservation {
+        version: ContractVersion::V1,
+        observation_id: random_id(92),
+        node_id: node.session.node_id.clone(),
+        node_boot_id: node.session.node_boot_id.clone(),
+        agent_instance_id: node.session.agent_instance_id.clone(),
+        agent_session_epoch: node.session.agent_session_epoch,
+        heartbeat_sequence: Sequence::new(2).unwrap(),
+        observed_at_unix_ms: unix_millis(2),
+        complete_inventory: true,
+        inventory_epoch: epoch(2),
+        inventory_digest: Some(Sha256Digest::from_bytes([0; 32])),
+        inventory_read_position: Some(desired_read.read_position),
+        key_ring_version: None,
+        key_ring_digest: None,
+        loaded_kids: Vec::new(),
+        runtimes: vec![observed_runtime_with_volumes(
+            &desired,
+            None,
+            vec![observed],
+        )],
+        residue: Vec::new(),
+    };
+    fresh.inventory_digest = Some(inventory_digest(&fresh).unwrap());
+    assert!(matches!(
+        store
+            .runtime_accept_observation(&node.authenticated, &fresh)
+            .unwrap(),
+        RuntimeSpineOutcome::Accepted(_)
+    ));
+
+    let before_replay = stored_volume_row(&store, &volume.volume_id);
+    let original_expiry = committed.lease_expires_at.unwrap();
+
     let first = execute_transition(&store, &node, &request).unwrap();
     let second = execute_transition(&store, &node, &request).unwrap();
     assert_eq!(first, second);
@@ -1592,7 +1652,9 @@ fn a22_normal_acquire_commits_once_and_replays_after_response_loss() {
     };
     assert_eq!(grant.attachment_id, id("attachment-normal"));
     assert_eq!(grant.attachment_epoch, fence_epoch(8));
+    assert_eq!(grant.lease_expires_at, original_expiry);
     assert_eq!(stored_volume(&store, &volume.volume_id), committed);
+    assert_eq!(stored_volume_row(&store, &volume.volume_id), before_replay);
 }
 
 #[test]
@@ -2056,6 +2118,43 @@ fn a22_root_release_validates_product_and_cleanup_before_fresh_branch_conflict()
             authorization
         );
     }
+}
+
+#[test]
+fn a22_root_release_fails_closed_on_nested_current_authorization_corruption() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let owned = acquire_owned_volume(&store);
+    let (node, _desired, _admission, request) = prepare_root_delete_release_fixture(&store, &owned);
+    let authorization = disposable_authorization(&owned);
+    store
+        .authority_transaction(|transaction| insert_authorization(transaction, &authorization))
+        .unwrap();
+    store
+        .authority_transaction(|transaction| {
+            let changed = transaction.execute(
+                "UPDATE volume_authorizations
+                    SET record=jsonb_set(
+                        record,
+                        '{authorization,delete_id}',
+                        to_jsonb($2::text)
+                    )
+                  WHERE authorization_id=$1",
+                &[&"delete-auth-1", &"corrupt-delete-lineage"],
+            )?;
+            assert_eq!(changed, 1);
+            Ok(())
+        })
+        .unwrap();
+    let before_volume = stored_volume_row(&store, &owned.volume_id);
+    let before_authorization = stored_authorization_row(&store, &id("delete-auth-1"));
+
+    let error = execute_transition(&store, &node, &request).unwrap_err();
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert_eq!(stored_volume_row(&store, &owned.volume_id), before_volume);
+    assert_eq!(
+        stored_authorization_row(&store, &id("delete-auth-1")),
+        before_authorization
+    );
 }
 
 #[test]
