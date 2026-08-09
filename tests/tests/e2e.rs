@@ -33,6 +33,21 @@ const ROUTE_GRANT_PRIVATE_KEY: &[u8] =
     include_bytes!("../fixtures/route_grant_private_ed25519.pem");
 const ROUTE_GRANT_PUBLIC_KEY: &[u8] = include_bytes!("../fixtures/route_grant_public_ed25519.pem");
 
+fn node_request_signer(id: &str) -> Ed25519RequestSigner {
+    // Each simulated Host needs a distinct credential lineage. Derive a
+    // deterministic, test-only Ed25519 seed from the short fixture Node ID;
+    // production keys are installed by the release workflow instead.
+    let id_bytes = id.as_bytes();
+    assert!(id_bytes.len() <= 31, "E2E fixture Node ID is too long");
+    let mut seed = [0_u8; 32];
+    seed[0] = u8::try_from(id_bytes.len()).unwrap();
+    seed[1..1 + id_bytes.len()].copy_from_slice(id_bytes);
+    let mut der = hex::decode("302e020100300506032b657004220420").unwrap();
+    der.extend_from_slice(&seed);
+    Ed25519RequestSigner::from_pkcs8_der(Id::new(format!("credential_{id}")).unwrap(), &der)
+        .unwrap()
+}
+
 struct Cluster {
     dir: tempfile::TempDir,
     cp: cats_control_plane::server::Handle,
@@ -144,11 +159,7 @@ impl Cluster {
         };
         let storage_meta: Arc<dyn MetadataStore> =
             Arc::new(SqliteMetadataStore::open(&meta_path).unwrap());
-        let signer = Ed25519RequestSigner::from_pkcs8_pem(
-            Id::new(format!("credential_{id}")).unwrap(),
-            ROUTE_GRANT_PRIVATE_KEY,
-        )
-        .unwrap();
+        let signer = node_request_signer(id);
         let identity = NodeIdentity {
             version: ContractVersion::V1,
             node_id: Id::new(id.to_string()).unwrap(),
