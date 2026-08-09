@@ -327,17 +327,8 @@ jobs:
               's/^(pub\(super\)[[:space:]]+)?const[[:space:]]+SCHEMA_VERSION:[[:space:]]+i64[[:space:]]+=[[:space:]]+([0-9]+);$/\2/p' \
               control-plane/src/store/schema.rs
           )"
-          oldest_migratable="$(
-            sed -nE \
-              's/^(pub\(super\)[[:space:]]+)?const[[:space:]]+OLDEST_MIGRATABLE_SCHEMA_VERSION:[[:space:]]+i64[[:space:]]+=[[:space:]]+([0-9]+);$/\2/p' \
-              control-plane/src/store/schema.rs
-          )"
           if [[ ! "$required_schema" =~ ^[0-9]+$ ]]; then
             echo "::error::Could not read control-plane SCHEMA_VERSION"
-            exit 1
-          fi
-          if [[ ! "$oldest_migratable" =~ ^[0-9]+$ ]]; then
-            echo "::error::Could not read control-plane OLDEST_MIGRATABLE_SCHEMA_VERSION"
             exit 1
           fi
 
@@ -361,8 +352,8 @@ jobs:
 
           if (( query_status == 0 )) && [[ "$query_output" =~ ^[0-9]+$ ]]; then
             actual_schema="$query_output"
-            if (( actual_schema < oldest_migratable || actual_schema > required_schema )); then
-              echo "::error::Control database schema $actual_schema is incompatible with build schema $required_schema (migratable from $oldest_migratable). cats-controld only migrates stamped versions inside that range; recreate the database with the reviewed runbook before retrying. The deployment will not replace the live Pod or delete production data automatically."
+            if (( actual_schema != required_schema )); then
+              echo "::error::Control database schema $actual_schema does not exactly match build schema $required_schema. Recreate the database with the reviewed clean-slate cutover runbook before retrying. The deployment will not replace the live Pod or delete production data automatically."
               exit 1
             fi
           elif (( query_status != 0 )) && [[ "$query_output" == *'relation "control_schema_version" does not exist'* ]]; then

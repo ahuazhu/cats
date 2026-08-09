@@ -223,7 +223,7 @@ Nothing is dropped automatically: history being disposable is not a licence for
 this code to destroy a credit ledger at startup, so the wipe stays an explicit
 operator action.
 
-Check both before the first deploy of a build whose `SCHEMA_VERSION` moved.
+Check the exact version before the first deploy of a build whose `SCHEMA_VERSION` moved.
 Bumping that constant is what declares a control-plane schema incompatible; a
 schema change that forgets to bump it lets an old database open as if it were
 current.

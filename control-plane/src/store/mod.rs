@@ -21,7 +21,9 @@ mod nodes;
 mod oci;
 mod operations;
 mod rows;
+mod runtime_authority;
 mod schema;
+mod transaction;
 mod work;
 
 #[cfg(test)]

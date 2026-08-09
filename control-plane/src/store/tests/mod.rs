@@ -811,7 +811,7 @@ fn refuses_a_database_stamped_with_another_schema_version() {
     assert!(
         error
             .to_string()
-            .contains(&format!("requires {SCHEMA_VERSION}")),
+            .contains(&format!("version {SCHEMA_VERSION}")),
         "the operator needs to see the required schema version, got: {error}"
     );
     // A schema this build wrote itself keeps opening.
@@ -833,7 +833,7 @@ fn refuses_a_database_stamped_with_another_schema_version() {
 }
 
 #[test]
-fn expands_v1_route_grant_metadata_without_breaking_the_rollback_stamp() {
+fn refuses_an_old_stamp_without_repairing_its_shape() {
     let url = crate::testsupport::isolated_control_store_url();
     drop(Store::connect(&url, None).unwrap());
     {
@@ -847,25 +847,106 @@ fn expands_v1_route_grant_metadata_without_breaking_the_rollback_stamp() {
             .unwrap();
     }
 
-    let store = Store::connect(&url, None).expect("upgrade the stamped v1 schema");
-    store
-        .register_node_with_admission(
-            "node-keyed",
-            "http://node",
-            "http://gateway",
-            4,
-            8192,
-            NodeAdmission::for_route_grant(false, Some("abc123"), "abc123"),
+    let Err(error) = Store::connect(&url, None) else {
+        panic!("an old stamp must fail closed");
+    };
+    assert_eq!(error.code, ErrorCode::FailedPrecondition);
+
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let stamped: i64 = admin
+        .query_one(
+            "SELECT version FROM control_schema_version WHERE singleton",
+            &[],
         )
+        .unwrap()
+        .get(0);
+    let route_table: Option<String> = admin
+        .query_one("SELECT to_regclass('route_grant_rollout_state')::TEXT", &[])
+        .unwrap()
+        .get(0);
+    let route_column: bool = admin
+        .query_one(
+            "SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                 WHERE table_schema=current_schema()
+                   AND table_name='nodes'
+                   AND column_name='route_grant_public_key_sha256'
+             )",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(stamped, 1);
+    assert!(route_table.is_none());
+    assert!(!route_column);
+}
+
+#[test]
+fn refuses_unstamped_partial_control_schema_without_adding_tables() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    admin
+        .batch_execute("CREATE TABLE volume_records (volume_id TEXT PRIMARY KEY)")
         .unwrap();
-    assert_eq!(
-        store
-            .get_node("node-keyed")
-            .unwrap()
-            .route_grant_public_key_sha256
-            .as_deref(),
-        Some("abc123")
-    );
+
+    let Err(error) = Store::connect(&url, None) else {
+        panic!("partial schema must fail closed");
+    };
+    assert_eq!(error.code, ErrorCode::FailedPrecondition);
+    let stamp: Option<String> = admin
+        .query_one("SELECT to_regclass('control_schema_version')::TEXT", &[])
+        .unwrap()
+        .get(0);
+    let accounts: Option<String> = admin
+        .query_one("SELECT to_regclass('accounts')::TEXT", &[])
+        .unwrap()
+        .get(0);
+    assert!(stamp.is_none());
+    assert!(accounts.is_none());
+}
+
+#[test]
+fn refuses_current_stamp_with_a_partial_shape_without_repairing_it() {
+    let url = crate::testsupport::isolated_control_store_url();
+    drop(Store::connect(&url, None).unwrap());
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    admin
+        .batch_execute("DROP TABLE delete_completion_receipts")
+        .unwrap();
+
+    let Err(error) = Store::connect(&url, None) else {
+        panic!("partial schema must fail closed");
+    };
+    assert_eq!(error.code, ErrorCode::FailedPrecondition);
+    let table: Option<String> = admin
+        .query_one(
+            "SELECT to_regclass('delete_completion_receipts')::TEXT",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(table.is_none(), "startup must not repair a stamped schema");
+}
+
+#[test]
+fn concurrent_first_connections_create_one_exact_schema() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let url = url.clone();
+        let barrier = Arc::clone(&barrier);
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            Store::connect(&url, None)
+        }));
+    }
+    barrier.wait();
+    for worker in workers {
+        drop(worker.join().unwrap().unwrap());
+    }
+
+    let store = Store::connect(&url, None).unwrap();
     let stamped = store
         .with(|client| {
             client
@@ -877,10 +958,6 @@ fn expands_v1_route_grant_metadata_without_breaking_the_rollback_stamp() {
         })
         .unwrap();
     assert_eq!(stamped, SCHEMA_VERSION);
-    assert_eq!(
-        stamped, 1,
-        "the expand-only Route Grant metadata must remain startable by the v1 application"
-    );
 }
 
 #[test]

@@ -8,22 +8,26 @@ pub use cats_api::runtime_reconciliation::{
     AsciiText, Epoch, FenceEpoch, Generation, Id, NodeBootId, RandomId128, RemoteHead, Revision,
     Sha256Digest, UnixMillis,
 };
+use serde::{Deserialize, Serialize};
 
 const MAX_INTEGER: u64 = i64::MAX as u64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VolumeDurability {
     Strict,
     Relaxed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum VolumeAdminState {
     Active,
     Deleting { delete_id: Id },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VolumeRecord {
     pub volume_id: Id,
     pub size_bytes: u64,
@@ -36,7 +40,8 @@ pub struct VolumeRecord {
     pub last_transition: Option<LastVolumeTransition>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LastVolumeTransition {
     NormalAcquire {
         request: NormalAcquireRequest,
@@ -58,7 +63,8 @@ pub enum LastVolumeTransition {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NormalAcquireRequest {
     pub volume_id: Id,
     pub transition_id: RandomId128,
@@ -69,7 +75,8 @@ pub struct NormalAcquireRequest {
     pub lease_duration_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NormalAcquireResult {
     pub volume_id: Id,
     pub transition_id: RandomId128,
@@ -95,7 +102,8 @@ pub struct RenewLeaseResult {
     pub lease_expires_at: UnixMillis,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReleaseRequest {
     pub volume_id: Id,
     pub transition_id: RandomId128,
@@ -103,7 +111,8 @@ pub struct ReleaseRequest {
     pub expected_epoch: FenceEpoch,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReleaseResult {
     pub volume_id: Id,
     pub transition_id: RandomId128,
@@ -112,7 +121,8 @@ pub struct ReleaseResult {
     pub resulting_head: RemoteHead,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VolumeTakeoverAuthorization {
     pub authorization_id: Id,
     pub host_fence_event_id: Id,
@@ -126,7 +136,8 @@ pub struct VolumeTakeoverAuthorization {
     pub not_after: UnixMillis,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TakeoverConsumedReceipt {
     pub authorization_id: Id,
     pub host_fence_event_id: Id,
@@ -147,7 +158,8 @@ pub struct TakeoverResult {
     pub lease_expires_at: UnixMillis,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BeginDeleteRequest {
     pub delete_id: Id,
     pub disk_id: Id,
@@ -156,7 +168,8 @@ pub struct BeginDeleteRequest {
     pub expected_head: RemoteHead,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BeginDeleteResult {
     pub delete_id: Id,
     pub disk_id: Id,
@@ -165,7 +178,8 @@ pub struct BeginDeleteResult {
     pub resulting_head: RemoteHead,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DisposableRootDeleteAuthorization {
     pub authorization_id: Id,
     pub delete_id: Id,
@@ -181,7 +195,8 @@ pub struct DisposableRootDeleteAuthorization {
     pub not_after: UnixMillis,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DisposableDeleteIsolationBasis {
     RuntimeStopped {
         node_id: Id,
@@ -194,7 +209,8 @@ pub enum DisposableDeleteIsolationBasis {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BeginDisposableDeleteConsumedReceipt {
     pub authorization_id: Id,
     pub volume_id: Id,
@@ -207,31 +223,41 @@ pub struct BeginDisposableDeleteConsumedReceipt {
     pub consumed_at: UnixMillis,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum VolumeAuthorization {
     Takeover(VolumeTakeoverAuthorization),
     DisposableRootDelete(DisposableRootDeleteAuthorization),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuthorizationConsumedReceipt {
     Takeover(TakeoverConsumedReceipt),
     BeginDisposableDelete(BeginDisposableDeleteConsumedReceipt),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "receipt",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum AuthorizationState {
     Unconsumed,
     Consumed(Box<AuthorizationConsumedReceipt>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorizationRecord {
     pub authorization: VolumeAuthorization,
     pub state: AuthorizationState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostFenceEvent {
     pub event_id: Id,
     pub provider: Id,
@@ -245,19 +271,22 @@ pub struct HostFenceEvent {
     pub state: HostFenceEventState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HostIsolationState {
     Isolated,
     HostDestroyed { receipt: HostDestroyedReceipt },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HostFenceEventState {
     Active,
     Rejoined,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostDestroyedReceipt {
     pub provider: Id,
     pub immutable_host_id: Id,
@@ -269,12 +298,14 @@ pub struct HostDestroyedReceipt {
     pub destroyed_at_unix_ms: UnixMillis,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StateStorageDisposition {
     PermanentlyDestroyed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DeleteCompletionReceipt {
     Normal {
         request: BeginDeleteRequest,
@@ -482,20 +513,8 @@ pub fn normal_acquire(
     request: &NormalAcquireRequest,
     db_now: UnixMillis,
 ) -> Result<(VolumeRecord, NormalAcquireResult)> {
-    validate_volume_record(record)?;
-    if let Some(last_id) = normal_transition_id(record.last_transition.as_ref()) {
-        if last_id == &request.transition_id {
-            return match record.last_transition.as_ref() {
-                Some(LastVolumeTransition::NormalAcquire {
-                    request: original,
-                    result,
-                }) if original == request => Ok((record.clone(), result.clone())),
-                _ => Err(AuthorityError::StaleTransition),
-            };
-        }
-    }
-    if record.volume_id != request.volume_id {
-        return Err(AuthorityError::NotFound);
+    if let Some(result) = replay_normal_acquire(record, request)? {
+        return Ok((record.clone(), result));
     }
     let lease_expires_at = checked_expiry(db_now, request.lease_duration_ms)?;
     if !matches!(record.admin_state, VolumeAdminState::Active) {
@@ -525,6 +544,30 @@ pub fn normal_acquire(
         result: result.clone(),
     });
     Ok((updated, result))
+}
+
+/// Returns an exact acquire replay without requiring the caller to read a
+/// clock. Reusing the transition ID with another payload is stale.
+pub fn replay_normal_acquire(
+    record: &VolumeRecord,
+    request: &NormalAcquireRequest,
+) -> Result<Option<NormalAcquireResult>> {
+    validate_volume_record(record)?;
+    if let Some(last_id) = normal_transition_id(record.last_transition.as_ref()) {
+        if last_id == &request.transition_id {
+            return match record.last_transition.as_ref() {
+                Some(LastVolumeTransition::NormalAcquire {
+                    request: original,
+                    result,
+                }) if original == request => Ok(Some(result.clone())),
+                _ => Err(AuthorityError::StaleTransition),
+            };
+        }
+    }
+    if record.volume_id != request.volume_id {
+        return Err(AuthorityError::NotFound);
+    }
+    Ok(None)
 }
 
 pub fn renew_lease(
@@ -675,6 +718,33 @@ pub fn consume_takeover(
         ))),
     };
     Ok((updated, updated_authorization, result))
+}
+
+/// Reconstructs the immutable result of an already-consumed takeover.
+///
+/// A replay is owned by the authorization row, not by the volume's current
+/// state: the volume may since have been released, reacquired, or removed.
+/// The PostgreSQL transaction owner still locks the event and authorization
+/// rows before calling this helper so an unconsumed authorization cannot race
+/// an `Active -> Rejoined` transition.
+pub fn replay_consumed_takeover(
+    authorization_record: &AuthorizationRecord,
+    authorization_id: &Id,
+) -> Result<Option<TakeoverResult>> {
+    validate_authorization_record(authorization_record)?;
+    let VolumeAuthorization::Takeover(authorization) = &authorization_record.authorization else {
+        return Err(AuthorityError::InvalidAuthorization);
+    };
+    if &authorization.authorization_id != authorization_id {
+        return Err(AuthorityError::InvalidAuthorization);
+    }
+    let AuthorizationState::Consumed(receipt) = &authorization_record.state else {
+        return Ok(None);
+    };
+    let AuthorizationConsumedReceipt::Takeover(receipt) = receipt.as_ref() else {
+        return Err(AuthorityError::BackendUnknown);
+    };
+    takeover_result(authorization, receipt).map(Some)
 }
 
 pub fn begin_delete(

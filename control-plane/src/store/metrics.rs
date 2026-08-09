@@ -37,6 +37,12 @@ static OCI_CONNECTION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 static LANE_ACQUIRE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static POSTGRES_STATEMENT_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static POSTGRES_IO_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+static AUTHORITY_COMMITTED: AtomicU64 = AtomicU64::new(0);
+static AUTHORITY_DOMAIN_REJECTED: AtomicU64 = AtomicU64::new(0);
+static AUTHORITY_BACKEND_FAILED: AtomicU64 = AtomicU64::new(0);
+static AUTHORITY_SERIALIZATION_RETRIES: AtomicU64 = AtomicU64::new(0);
+static AUTHORITY_DEADLOCK_RETRIES: AtomicU64 = AtomicU64::new(0);
+static AUTHORITY_CONNECTION_RETRIES: AtomicU64 = AtomicU64::new(0);
 static NORMAL_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static NORMAL_REQUEST_MICROS: AtomicU64 = AtomicU64::new(0);
 static LEADERSHIP_REQUESTS: AtomicU64 = AtomicU64::new(0);
@@ -99,6 +105,38 @@ pub(super) fn record_lane_acquire_timeout() {
     LANE_ACQUIRE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum AuthorityOutcome {
+    Committed,
+    DomainRejected,
+    BackendFailed,
+}
+
+pub(super) fn record_authority_outcome(outcome: AuthorityOutcome) {
+    let counter = match outcome {
+        AuthorityOutcome::Committed => &AUTHORITY_COMMITTED,
+        AuthorityOutcome::DomainRejected => &AUTHORITY_DOMAIN_REJECTED,
+        AuthorityOutcome::BackendFailed => &AUTHORITY_BACKEND_FAILED,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum AuthorityRetryReason {
+    Serialization,
+    Deadlock,
+    Connection,
+}
+
+pub(super) fn record_authority_retry(reason: AuthorityRetryReason) {
+    let counter = match reason {
+        AuthorityRetryReason::Serialization => &AUTHORITY_SERIALIZATION_RETRIES,
+        AuthorityRetryReason::Deadlock => &AUTHORITY_DEADLOCK_RETRIES,
+        AuthorityRetryReason::Connection => &AUTHORITY_CONNECTION_RETRIES,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Count server-enforced statement/lock deadlines and established-session I/O
 /// deadlines without attaching SQL text, resource ids, or error messages.
 pub(super) fn record_postgres_error(error: &postgres::Error) {
@@ -149,6 +187,12 @@ pub(crate) struct StoreMetricsSnapshot {
     pub lane_acquire_timeouts: u64,
     pub postgres_statement_timeouts: u64,
     pub postgres_io_timeouts: u64,
+    pub authority_committed: u64,
+    pub authority_domain_rejected: u64,
+    pub authority_backend_failed: u64,
+    pub authority_serialization_retries: u64,
+    pub authority_deadlock_retries: u64,
+    pub authority_connection_retries: u64,
     pub normal_requests: u64,
     pub normal_request_micros: u64,
     pub leadership_requests: u64,
@@ -199,6 +243,12 @@ pub(crate) fn snapshot(store: &Store) -> StoreMetricsSnapshot {
         lane_acquire_timeouts: LANE_ACQUIRE_TIMEOUTS.load(Ordering::Relaxed),
         postgres_statement_timeouts: POSTGRES_STATEMENT_TIMEOUTS.load(Ordering::Relaxed),
         postgres_io_timeouts: POSTGRES_IO_TIMEOUTS.load(Ordering::Relaxed),
+        authority_committed: AUTHORITY_COMMITTED.load(Ordering::Relaxed),
+        authority_domain_rejected: AUTHORITY_DOMAIN_REJECTED.load(Ordering::Relaxed),
+        authority_backend_failed: AUTHORITY_BACKEND_FAILED.load(Ordering::Relaxed),
+        authority_serialization_retries: AUTHORITY_SERIALIZATION_RETRIES.load(Ordering::Relaxed),
+        authority_deadlock_retries: AUTHORITY_DEADLOCK_RETRIES.load(Ordering::Relaxed),
+        authority_connection_retries: AUTHORITY_CONNECTION_RETRIES.load(Ordering::Relaxed),
         normal_requests: NORMAL_REQUESTS.load(Ordering::Relaxed),
         normal_request_micros: NORMAL_REQUEST_MICROS.load(Ordering::Relaxed),
         leadership_requests: LEADERSHIP_REQUESTS.load(Ordering::Relaxed),
@@ -301,6 +351,26 @@ impl StoreMetricsSnapshot {
                 body,
                 "cats_control_store_request_latency_seconds_sum{{executor=\"{executor}\"}} {:.6}",
                 micros as f64 / 1_000_000.0
+            );
+        }
+        for (outcome, value) in [
+            ("committed", self.authority_committed),
+            ("domain_rejected", self.authority_domain_rejected),
+            ("backend_failed", self.authority_backend_failed),
+        ] {
+            let _ = writeln!(
+                body,
+                "cats_control_store_authority_transactions_total{{outcome=\"{outcome}\"}} {value}"
+            );
+        }
+        for (reason, value) in [
+            ("serialization", self.authority_serialization_retries),
+            ("deadlock", self.authority_deadlock_retries),
+            ("connection", self.authority_connection_retries),
+        ] {
+            let _ = writeln!(
+                body,
+                "cats_control_store_authority_transaction_retries_total{{reason=\"{reason}\"}} {value}"
             );
         }
         for (kind, count, limit) in [
