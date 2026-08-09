@@ -25,6 +25,11 @@ pub(crate) mod runtime_spine;
 mod volume;
 #[allow(
     dead_code,
+    reason = "A22 authenticated Store entrypoints are consumed when the internal HTTP routes are composed"
+)]
+pub(crate) mod volume_transition_auth;
+#[allow(
+    dead_code,
     reason = "A22 transaction-local evidence loader is composed by the authenticated A23 route"
 )]
 pub(crate) mod volume_transition_evidence;

@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use cats_api::error::ErrorCode;
 use cats_api::runtime_reconciliation::{
-    ContractVersion, RuntimeVolumeTransitionEvidenceRequest, SessionBinding,
+    guest_config_digest, AgentRegistrationAttempt, AgentSession, AsciiText as RuntimeAsciiText,
+    ContractVersion, CredentialBinding, GuestRuntimeProfileReceipt, NodeBootId, NodeIdentity,
+    NodeIdentityState, RuntimeVolumeTransitionEvidenceRequest, SessionBinding,
 };
 use cats_storage::authority::{
     complete_disposable_root_delete, consume_disposable_root_delete, AsciiText,
@@ -15,15 +17,21 @@ use cats_storage::authority::{
     VolumeAuthorization, VolumeDurability, VolumeRecord, VolumeTakeoverAuthorization,
 };
 
-use super::events::consume_volume_takeover_in;
 use super::rows::{
     database_now, insert_authorization, insert_delete_completion, insert_event, insert_volume,
     load_active_event_by_node_unlocked, load_authorization_for_update,
-    load_delete_completion_for_update, load_event_for_update, load_volume_for_update, update_event,
-    update_authorization, update_volume,
+    load_delete_completion_for_update, load_event_for_update, load_volume_for_update,
+    update_authorization, update_event, update_volume,
+};
+use super::volume_transition_auth::{
+    authenticate_evidence_context_in, VolumeTransitionStoreOutcome, VolumeTransitionStoreRejection,
 };
 use super::volume_transition_evidence::{
     load_volume_transition_evidence_in, VolumeTransitionEvidenceLoad,
+};
+use crate::store::agent_sessions::{
+    load_identity_by_node_for_update, rotate_public_key_identity_in, AgentRegistrationOutcome,
+    AgentSessionRegistrationPolicy, AuthenticatedNodeCredential,
 };
 use crate::store::transaction::{authority_transaction_attempts, AuthorityTransactionError};
 use crate::store::{metrics_snapshot, Store};
@@ -56,6 +64,84 @@ fn unix_millis(value: u64) -> UnixMillis {
     UnixMillis::new(value).unwrap()
 }
 
+fn boot_id(value: u128) -> NodeBootId {
+    NodeBootId::new(format!("{value:032x}")).unwrap()
+}
+
+fn runtime_release() -> GuestRuntimeProfileReceipt {
+    GuestRuntimeProfileReceipt {
+        version: ContractVersion::V1,
+        kernel_digest: Sha256Digest::from_bytes([1; 32]),
+        initramfs_digest: Some(Sha256Digest::from_bytes([2; 32])),
+        kernel_cmdline: RuntimeAsciiText::new("console=hvc0 root=/dev/vda").unwrap(),
+        guest_agent_protocol_version: ContractVersion::V1,
+    }
+}
+
+#[derive(Clone)]
+struct TransitionNode {
+    authenticated: AuthenticatedNodeCredential,
+    session: SessionBinding,
+    active_guest_config_digest: Sha256Digest,
+}
+
+fn transition_node(store: &Store, node_id: &str) -> TransitionNode {
+    let suffix = if node_id == "node-new" { 9 } else { 10 };
+    let identity = NodeIdentity {
+        version: ContractVersion::V1,
+        node_id: id(node_id),
+        immutable_host_id: id(&format!("host-{suffix}")),
+        credential_id: id(&format!("credential-{suffix}")),
+        credential_binding: CredentialBinding::PublicKey {
+            public_key_spki_sha256: Sha256Digest::from_bytes([suffix; 32]),
+        },
+        state_path_id: id(&format!("state-path-{suffix}")),
+        state: NodeIdentityState::Provisioned,
+    };
+    let authenticated = AuthenticatedNodeCredential::new(
+        identity.credential_id.clone(),
+        identity.credential_binding.clone(),
+    );
+    let release = runtime_release();
+    let policy =
+        AgentSessionRegistrationPolicy::from_release_receipt(&release, Duration::from_secs(120))
+            .unwrap();
+    store.provision_node_identity(&identity).unwrap();
+    let attempt = AgentRegistrationAttempt {
+        version: ContractVersion::V1,
+        node_id: identity.node_id,
+        immutable_host_id: identity.immutable_host_id,
+        node_boot_id: boot_id(41),
+        agent_instance_id: random_id(42),
+        registration_attempt_id: random_id(43),
+        guest_config_digest: policy.approved_guest_config_digest().clone(),
+        expected_agent_session_epoch: None,
+    };
+    let session = match store
+        .register_agent_session(&authenticated, &attempt, &policy)
+        .unwrap()
+    {
+        AgentRegistrationOutcome::Registered(session) => session,
+        AgentRegistrationOutcome::Rejected(rejection) => {
+            panic!("transition AgentSession was rejected: {rejection:?}")
+        }
+    };
+    TransitionNode {
+        authenticated,
+        session: session_binding(&session),
+        active_guest_config_digest: guest_config_digest(&release).unwrap(),
+    }
+}
+
+fn session_binding(session: &AgentSession) -> SessionBinding {
+    SessionBinding {
+        node_id: session.node_id.clone(),
+        node_boot_id: session.node_boot_id.clone(),
+        agent_instance_id: session.agent_instance_id.clone(),
+        agent_session_epoch: session.agent_session_epoch,
+    }
+}
+
 fn evidence_request(node_id: &str) -> RuntimeVolumeTransitionEvidenceRequest {
     evidence_request_for(node_id, "takeover-auth-1")
 }
@@ -68,9 +154,9 @@ fn evidence_request_for(
         version: ContractVersion::V1,
         session: SessionBinding {
             node_id: id(node_id),
-            node_boot_id: cats_storage::authority::NodeBootId::new(format!("{:032x}", 41)).unwrap(),
+            node_boot_id: boot_id(41),
             agent_instance_id: random_id(42),
-            agent_session_epoch: epoch(3),
+            agent_session_epoch: epoch(1),
         },
         authorization_id: id(authorization_id),
     }
@@ -275,18 +361,62 @@ fn consume_takeover_as(
     authorization_id: &Id,
     authorized_node_id: &Id,
 ) -> crate::store::Result<cats_storage::authority::TakeoverResult> {
-    store.authority_transaction(|transaction| {
-        consume_volume_takeover_in(transaction, authorization_id, authorized_node_id)
-    })
+    let node = transition_node(store, authorized_node_id.as_str());
+    consume_takeover_with_node(store, authorization_id, &node)
+}
+
+fn consume_takeover_with_node(
+    store: &Store,
+    authorization_id: &Id,
+    node: &TransitionNode,
+) -> crate::store::Result<cats_storage::authority::TakeoverResult> {
+    match store.runtime_consume_volume_takeover(
+        &node.authenticated,
+        &node.session,
+        authorization_id,
+        &node.active_guest_config_digest,
+    )? {
+        VolumeTransitionStoreOutcome::Accepted(result) => Ok(result),
+        VolumeTransitionStoreOutcome::Rejected(rejection) => {
+            panic!("authenticated takeover was rejected before authority: {rejection:?}")
+        }
+    }
 }
 
 fn load_evidence(
     transaction: &mut postgres::Transaction<'_>,
-    authenticated_node_id: &Id,
+    node: &TransitionNode,
     request: &RuntimeVolumeTransitionEvidenceRequest,
 ) -> Result<VolumeTransitionEvidenceLoad, AuthorityTransactionError> {
-    let db_now = database_now(transaction)?;
-    load_volume_transition_evidence_in(transaction, authenticated_node_id, request, db_now)
+    let context = match authenticate_evidence_context_in(
+        transaction,
+        &node.authenticated,
+        &request.session,
+        &node.active_guest_config_digest,
+    )? {
+        VolumeTransitionStoreOutcome::Accepted(context) => context,
+        VolumeTransitionStoreOutcome::Rejected(rejection) => {
+            panic!("evidence authentication prefix was rejected: {rejection:?}")
+        }
+    };
+    load_volume_transition_evidence_in(context, request)
+}
+
+fn load_evidence_public(
+    store: &Store,
+    node: &TransitionNode,
+    request: &RuntimeVolumeTransitionEvidenceRequest,
+) -> crate::store::Result<VolumeTransitionEvidenceLoad> {
+    match store.runtime_volume_transition_evidence(
+        &node.authenticated,
+        request,
+        &node.active_guest_config_digest,
+    )? {
+        VolumeTransitionStoreOutcome::Accepted(load) => Ok(load),
+        VolumeTransitionStoreOutcome::Rejected(rejection) => {
+            panic!("evidence Store entrypoint was rejected: {rejection:?}")
+        }
+    }
 }
 
 #[test]
@@ -501,6 +631,7 @@ fn evidence_snapshot_returns_the_exact_consumed_takeover_bundle() {
     seed_takeover(&store, &event, &authorization);
     consume_takeover_as(&store, &id("takeover-auth-1"), &id("node-new")).unwrap();
 
+    let node = transition_node(&store, "node-new");
     let request = evidence_request("node-new");
     let loaded = store
         .authority_locking_read_snapshot(|transaction| {
@@ -512,7 +643,7 @@ fn evidence_snapshot_returns_the_exact_consumed_takeover_bundle() {
                 .get(0);
             assert_eq!(isolation, "repeatable read");
             assert_eq!(read_only, "off");
-            load_evidence(transaction, &id("node-new"), &request)
+            load_evidence(transaction, &node, &request)
         })
         .unwrap();
     let VolumeTransitionEvidenceLoad::Available(success) = loaded else {
@@ -540,6 +671,7 @@ fn evidence_snapshot_rejects_a_future_consumption_timestamp() {
     let authorization = takeover_authorization(&owned);
     seed_takeover(&store, &event, &authorization);
     consume_takeover_as(&store, &id("takeover-auth-1"), &id("node-new")).unwrap();
+    let node = transition_node(&store, "node-new");
 
     let db_now = store.authority_locking_read_snapshot(database_now).unwrap();
     let future = unix_millis(db_now.get() + 60_000);
@@ -575,9 +707,7 @@ fn evidence_snapshot_rejects_a_future_consumption_timestamp() {
 
     let request = evidence_request("node-new");
     let error = store
-        .authority_locking_read_snapshot(|transaction| {
-            load_evidence(transaction, &id("node-new"), &request)
-        })
+        .authority_locking_read_snapshot(|transaction| load_evidence(transaction, &node, &request))
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Internal);
 }
@@ -589,17 +719,15 @@ fn evidence_access_predicate_hides_wrong_node_before_protected_decode() {
     let event = host_fence_event(HostFenceEventState::Active);
     let authorization = takeover_authorization(&owned);
     seed_takeover(&store, &event, &authorization);
+    let node = transition_node(&store, "node-new");
+    let wrong_node = transition_node(&store, "node-other");
 
     // Calibrate the query with the known authorized Node before corrupting the
     // protected payload. This makes the negative isolation assertion prove
     // the access predicate rather than a typo in the fixture.
     let request = evidence_request("node-new");
     assert!(matches!(
-        store
-            .authority_locking_read_snapshot(|transaction| {
-                load_evidence(transaction, &id("node-new"), &request)
-            })
-            .unwrap(),
+        load_evidence_public(&store, &node, &request).unwrap(),
         VolumeTransitionEvidenceLoad::Available(_)
     ));
     store
@@ -616,23 +744,202 @@ fn evidence_access_predicate_hides_wrong_node_before_protected_decode() {
         .unwrap();
 
     let wrong_request = evidence_request("node-other");
-    let wrong = store
-        .authority_locking_read_snapshot(|transaction| {
-            load_evidence(transaction, &id("node-other"), &wrong_request)
-        })
-        .unwrap();
+    let wrong = load_evidence_public(&store, &wrong_node, &wrong_request).unwrap();
     assert_eq!(
         wrong,
         VolumeTransitionEvidenceLoad::Unavailable {
             authorization_id: id("takeover-auth-1")
         }
     );
-    let error = store
-        .authority_locking_read_snapshot(|transaction| {
-            load_evidence(transaction, &id("node-new"), &request)
-        })
-        .unwrap_err();
+    let error = load_evidence_public(&store, &node, &request).unwrap_err();
     assert_eq!(error.code, ErrorCode::Internal);
+}
+
+#[test]
+fn evidence_rejects_wrong_credential_lineage_before_protected_rows() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let owned = acquire_owned_volume(&store);
+    let event = host_fence_event(HostFenceEventState::Active);
+    let authorization = takeover_authorization(&owned);
+    seed_takeover(&store, &event, &authorization);
+    let node = transition_node(&store, "node-new");
+    let request = evidence_request("node-new");
+
+    // First calibrate the public Store entrypoint with the exact active
+    // lineage. Then corrupt the protected row: a wrong proof binding must
+    // still stop at identity admission and never expose that corruption.
+    assert!(matches!(
+        load_evidence_public(&store, &node, &request).unwrap(),
+        VolumeTransitionEvidenceLoad::Available(_)
+    ));
+    store
+        .with(|client| {
+            client
+                .execute(
+                    "UPDATE volume_authorizations
+                        SET record=record || '{\"unexpected\":true}'::jsonb
+                      WHERE authorization_id=$1",
+                    &[&"takeover-auth-1"],
+                )
+                .map(|_| ())
+        })
+        .unwrap();
+    let wrong = AuthenticatedNodeCredential::new(
+        node.authenticated.credential_id().clone(),
+        CredentialBinding::PublicKey {
+            public_key_spki_sha256: Sha256Digest::from_bytes([77; 32]),
+        },
+    );
+    let outcome = store
+        .runtime_volume_transition_evidence(&wrong, &request, &node.active_guest_config_digest)
+        .unwrap();
+    assert_eq!(
+        outcome,
+        VolumeTransitionStoreOutcome::Rejected(VolumeTransitionStoreRejection::IdentityNotEligible)
+    );
+}
+
+#[test]
+fn evidence_share_locks_hold_credential_rotation_until_snapshot_commit() {
+    let (_url, seed, reader) = store_pair();
+    let owned = acquire_owned_volume(&seed);
+    let event = host_fence_event(HostFenceEventState::Active);
+    let authorization = takeover_authorization(&owned);
+    seed_takeover(&seed, &event, &authorization);
+    let node = transition_node(&seed, "node-new");
+    let request = evidence_request("node-new");
+
+    let reader_node = node.clone();
+    let reader_request = request.clone();
+    let (prefix_tx, prefix_rx) = mpsc::channel();
+    let (finish_read_tx, finish_read_rx) = mpsc::channel();
+    let reader_worker = std::thread::spawn(move || {
+        reader.authority_locking_read_snapshot(move |transaction| {
+            let context = match authenticate_evidence_context_in(
+                transaction,
+                &reader_node.authenticated,
+                &reader_request.session,
+                &reader_node.active_guest_config_digest,
+            )? {
+                VolumeTransitionStoreOutcome::Accepted(context) => context,
+                VolumeTransitionStoreOutcome::Rejected(rejection) => {
+                    panic!("evidence prefix rejected: {rejection:?}")
+                }
+            };
+            prefix_tx.send(()).unwrap();
+            finish_read_rx.recv().unwrap();
+            load_volume_transition_evidence_in(context, &reader_request)
+        })
+    });
+    prefix_rx.recv().unwrap();
+
+    let rotator = Store::connect_from(&seed.dsn, None).unwrap();
+    let (rotation_started_tx, rotation_started_rx) = mpsc::channel();
+    let (rotation_finished_tx, rotation_finished_rx) = mpsc::channel();
+    let rotation_worker = std::thread::spawn(move || {
+        let outcome = rotator.authority_transaction(|transaction| {
+            rotation_started_tx.send(()).unwrap();
+            let current = load_identity_by_node_for_update(transaction, &id("node-new"))?
+                .expect("transition NodeIdentity exists");
+            let committed_at = database_now(transaction)?;
+            rotate_public_key_identity_in(
+                transaction,
+                &current,
+                &id("credential-rotated"),
+                &Sha256Digest::from_bytes([88; 32]),
+                committed_at,
+            )?;
+            Ok(())
+        });
+        rotation_finished_tx.send(outcome).unwrap();
+    });
+    rotation_started_rx.recv().unwrap();
+    assert!(
+        rotation_finished_rx
+            .recv_timeout(Duration::from_millis(150))
+            .is_err(),
+        "credential rotation passed the evidence transaction's share locks"
+    );
+
+    finish_read_tx.send(()).unwrap();
+    assert!(matches!(
+        reader_worker.join().unwrap().unwrap(),
+        VolumeTransitionEvidenceLoad::Available(_)
+    ));
+    rotation_finished_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("rotation finishes after evidence commit")
+        .unwrap();
+    rotation_worker.join().unwrap();
+
+    let old = seed
+        .runtime_volume_transition_evidence(
+            &node.authenticated,
+            &request,
+            &node.active_guest_config_digest,
+        )
+        .unwrap();
+    assert_eq!(
+        old,
+        VolumeTransitionStoreOutcome::Rejected(VolumeTransitionStoreRejection::IdentityNotEligible)
+    );
+    let rotated = AuthenticatedNodeCredential::new(
+        id("credential-rotated"),
+        CredentialBinding::PublicKey {
+            public_key_spki_sha256: Sha256Digest::from_bytes([88; 32]),
+        },
+    );
+    assert!(matches!(
+        seed.runtime_volume_transition_evidence(
+            &rotated,
+            &request,
+            &node.active_guest_config_digest,
+        )
+        .unwrap(),
+        VolumeTransitionStoreOutcome::Accepted(VolumeTransitionEvidenceLoad::Available(_))
+    ));
+}
+
+#[test]
+fn authenticated_takeover_response_loss_replays_the_committed_receipt() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let owned = acquire_owned_volume(&store);
+    let event = host_fence_event(HostFenceEventState::Active);
+    let authorization = takeover_authorization(&owned);
+    seed_takeover(&store, &event, &authorization);
+    let node = transition_node(&store, "node-new");
+
+    store.inject_committed_response_loss_once();
+    let error = store
+        .runtime_consume_volume_takeover(
+            &node.authenticated,
+            &node.session,
+            &id("takeover-auth-1"),
+            &node.active_guest_config_digest,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Unavailable);
+    let committed_volume = stored_volume(&store, &owned.volume_id);
+    assert_eq!(committed_volume.lease_owner, Some(id("attachment-new")));
+    assert!(matches!(
+        stored_authorization(&store, &id("takeover-auth-1")).state,
+        AuthorizationState::Consumed(_)
+    ));
+
+    let replay = store
+        .runtime_consume_volume_takeover(
+            &node.authenticated,
+            &node.session,
+            &id("takeover-auth-1"),
+            &node.active_guest_config_digest,
+        )
+        .unwrap();
+    let VolumeTransitionStoreOutcome::Accepted(replay) = replay else {
+        panic!("committed takeover replay was rejected")
+    };
+    assert_eq!(replay.resulting_epoch, committed_volume.lease_epoch);
+    assert_eq!(replay.resulting_head, committed_volume.head);
+    assert_eq!(replay.attachment_id, id("attachment-new"));
 }
 
 #[test]
@@ -643,6 +950,7 @@ fn evidence_snapshot_rejects_missing_direct_successor_and_split_completion() {
     let authorization = takeover_authorization(&owned);
     seed_takeover(&store, &event, &authorization);
     consume_takeover_as(&store, &id("takeover-auth-1"), &id("node-new")).unwrap();
+    let node = transition_node(&store, "node-new");
     let request = evidence_request("node-new");
 
     store
@@ -660,9 +968,7 @@ fn evidence_snapshot_rejects_missing_direct_successor_and_split_completion() {
         })
         .unwrap();
     let error = store
-        .authority_locking_read_snapshot(|transaction| {
-            load_evidence(transaction, &id("node-new"), &request)
-        })
+        .authority_locking_read_snapshot(|transaction| load_evidence(transaction, &node, &request))
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Internal);
 
@@ -697,9 +1003,7 @@ fn evidence_snapshot_rejects_missing_direct_successor_and_split_completion() {
         .authority_transaction(|transaction| insert_delete_completion(transaction, &completion))
         .unwrap();
     let error = store
-        .authority_locking_read_snapshot(|transaction| {
-            load_evidence(transaction, &id("node-new"), &request)
-        })
+        .authority_locking_read_snapshot(|transaction| load_evidence(transaction, &node, &request))
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Internal);
 }
@@ -758,11 +1062,10 @@ fn evidence_snapshot_returns_disposable_completion_after_rows_are_gone() {
         })
         .unwrap();
 
+    let node = transition_node(&store, "node-new");
     let request = evidence_request_for("node-new", "delete-auth-1");
     let loaded = store
-        .authority_locking_read_snapshot(|transaction| {
-            load_evidence(transaction, &id("node-new"), &request)
-        })
+        .authority_locking_read_snapshot(|transaction| load_evidence(transaction, &node, &request))
         .unwrap();
     let VolumeTransitionEvidenceLoad::Available(success) = loaded else {
         panic!("disposable evidence unexpectedly unavailable")
@@ -781,6 +1084,7 @@ fn evidence_snapshot_detects_duplicate_completion_rows_even_without_schema_guard
     let authorization = takeover_authorization(&owned);
     seed_takeover(&store, &event, &authorization);
     let result = consume_takeover_as(&store, &id("takeover-auth-1"), &id("node-new")).unwrap();
+    let node = transition_node(&store, "node-new");
     store
         .with(|client| {
             client.batch_execute(
@@ -823,9 +1127,7 @@ fn evidence_snapshot_detects_duplicate_completion_rows_even_without_schema_guard
 
     let request = evidence_request("node-new");
     let error = store
-        .authority_locking_read_snapshot(|transaction| {
-            load_evidence(transaction, &id("node-new"), &request)
-        })
+        .authority_locking_read_snapshot(|transaction| load_evidence(transaction, &node, &request))
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Internal);
 }
@@ -837,27 +1139,53 @@ fn evidence_repeatable_read_never_mixes_takeover_before_and_after_images() {
     let event = host_fence_event(HostFenceEventState::Active);
     let authorization = takeover_authorization(&owned);
     seed_takeover(&seed, &event, &authorization);
+    let node = transition_node(&seed, "node-new");
 
     let request = evidence_request("node-new");
     let reader_request = request.clone();
+    let reader_node = node.clone();
     let (snapshot_tx, snapshot_rx) = mpsc::channel();
     let (continue_tx, continue_rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
         reader.authority_locking_read_snapshot(move |transaction| {
-            // Establish the RR snapshot before allowing the writer to commit.
-            let db_now = database_now(transaction)?;
+            // Authenticate and establish the RR snapshot before allowing the
+            // writer to commit. The unforgeable context carries that one DB
+            // time into the evidence loader.
+            let context = match authenticate_evidence_context_in(
+                transaction,
+                &reader_node.authenticated,
+                &reader_request.session,
+                &reader_node.active_guest_config_digest,
+            )? {
+                VolumeTransitionStoreOutcome::Accepted(context) => context,
+                VolumeTransitionStoreOutcome::Rejected(rejection) => {
+                    panic!("evidence prefix rejected: {rejection:?}")
+                }
+            };
             snapshot_tx.send(()).unwrap();
             continue_rx.recv().unwrap();
-            load_volume_transition_evidence_in(
-                transaction,
-                &id("node-new"),
-                &reader_request,
-                db_now,
-            )
+            load_volume_transition_evidence_in(context, &reader_request)
         })
     });
     snapshot_rx.recv().unwrap();
-    consume_takeover_as(&seed, &id("takeover-auth-1"), &id("node-new")).unwrap();
+    let writer = Store::connect_from(&seed.dsn, None).unwrap();
+    let writer_node = node.clone();
+    let (consume_finished_tx, consume_finished_rx) = mpsc::channel();
+    let consume_worker = std::thread::spawn(move || {
+        consume_finished_tx
+            .send(consume_takeover_with_node(
+                &writer,
+                &id("takeover-auth-1"),
+                &writer_node,
+            ))
+            .unwrap();
+    });
+    assert!(
+        consume_finished_rx
+            .recv_timeout(Duration::from_millis(150))
+            .is_err(),
+        "takeover mutation passed the evidence transaction's identity share lock"
+    );
     continue_tx.send(()).unwrap();
 
     let VolumeTransitionEvidenceLoad::Available(before) = worker.join().unwrap().unwrap() else {
@@ -868,12 +1196,14 @@ fn evidence_repeatable_read_never_mixes_takeover_before_and_after_images() {
         AuthorizationState::Unconsumed
     ));
     assert_eq!(before.current_volume, Some(owned));
+    consume_finished_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("takeover finishes after evidence snapshot commits")
+        .unwrap();
+    consume_worker.join().unwrap();
 
-    let VolumeTransitionEvidenceLoad::Available(after) = seed
-        .authority_locking_read_snapshot(|transaction| {
-            load_evidence(transaction, &id("node-new"), &request)
-        })
-        .unwrap()
+    let VolumeTransitionEvidenceLoad::Available(after) =
+        load_evidence_public(&seed, &node, &request).unwrap()
     else {
         panic!("post-commit snapshot unexpectedly unavailable")
     };

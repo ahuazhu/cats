@@ -15,12 +15,12 @@ use cats_api::runtime_reconciliation::{
 use cats_storage::authority::{
     validate_volume_transition_evidence_bundle, DeleteCompletionReceipt, VolumeRecord,
 };
-use postgres::Transaction;
 
 use super::rows::{
     load_authorization_for_evidence, load_authorization_unlocked,
     load_delete_completions_by_volume, load_volume_unlocked,
 };
+use super::volume_transition_auth::EvidenceTransactionContext;
 use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,21 +52,20 @@ pub(crate) fn authorization_evidence_unavailable(
 /// composing independently read rows or accidentally opening a second
 /// authority.
 pub(super) fn load_volume_transition_evidence_in(
-    transaction: &mut Transaction<'_>,
-    authenticated_node_id: &Id,
+    context: EvidenceTransactionContext<'_, '_>,
     request: &RuntimeVolumeTransitionEvidenceRequest,
-    db_now: UnixMillis,
 ) -> AuthorityTxResult<VolumeTransitionEvidenceLoad> {
-    if &request.session.node_id != authenticated_node_id {
-        // The authenticated composition must have proved this binding before
-        // handing control to the authority loader. Fail before the primary
-        // access predicate if a future caller violates that seam.
+    let (transaction, authenticated_node_id, db_now) = context.into_parts();
+    if request.session.node_id != authenticated_node_id {
+        // The unforgeable context already bound the exact current session.
+        // Treat any impossible mismatch at this seam as stored/programming
+        // corruption before touching the protected authorization predicate.
         return Err(corrupt());
     }
     let Some(primary) = load_authorization_for_evidence(
         transaction,
         &request.authorization_id,
-        authenticated_node_id,
+        &authenticated_node_id,
     )?
     else {
         return Ok(VolumeTransitionEvidenceLoad::Unavailable {
@@ -74,7 +73,7 @@ pub(super) fn load_volume_transition_evidence_in(
         });
     };
     if authorization_id(&primary) != &request.authorization_id
-        || authorized_node_id(&primary) != authenticated_node_id
+        || authorized_node_id(&primary) != &authenticated_node_id
     {
         return Err(corrupt());
     }

@@ -9,12 +9,12 @@ use cats_storage::authority::{
     consume_takeover, replay_consumed_takeover, AuthorityError, Id, TakeoverResult,
     VolumeAuthorization,
 };
-use postgres::Transaction;
 
 use super::rows::{
-    authorization_hint, database_now, load_authorization_for_update, load_event_for_update,
+    authorization_hint, load_authorization_for_update, load_event_for_update,
     load_volume_for_update, update_authorization, update_volume,
 };
+use super::volume_transition_auth::MutationTransactionContext;
 use crate::store::transaction::AuthorityTxResult;
 
 /// Consumes one server-side takeover authorization after the caller has
@@ -26,10 +26,10 @@ use crate::store::transaction::AuthorityTxResult;
 /// without requiring the Volume to remain in the direct takeover state.
 #[allow(dead_code, reason = "consumed by the authenticated A22 mutation route")]
 pub(super) fn consume_volume_takeover_in(
-    transaction: &mut Transaction<'_>,
+    context: MutationTransactionContext<'_, '_>,
     authorization_id: &Id,
-    authorized_node_id: &Id,
 ) -> AuthorityTxResult<TakeoverResult> {
+    let (transaction, authorized_node_id, db_now) = context.into_parts();
     // This is a non-locking routing hint read only after the authenticated
     // NodeIdentity coordination lock. The closed row is decoded and rechecked
     // after the event lock and before any mutation.
@@ -47,7 +47,7 @@ pub(super) fn consume_volume_takeover_in(
     if payload.host_fence_event_id != event.event_id || payload.volume_id != volume_hint {
         return Err(AuthorityError::BackendUnknown.into());
     }
-    if &payload.authorized_node_id != authorized_node_id {
+    if payload.authorized_node_id != authorized_node_id {
         return Err(AuthorityError::InvalidAuthorization.into());
     }
 
@@ -57,7 +57,6 @@ pub(super) fn consume_volume_takeover_in(
 
     let volume = load_volume_for_update(transaction, &payload.volume_id)?
         .ok_or(AuthorityError::InvalidAuthorization)?;
-    let db_now = database_now(transaction)?;
     let (updated_volume, updated_authorization, result) =
         consume_takeover(&volume, &event, &authorization, authorization_id, db_now)?;
     update_volume(transaction, &updated_volume)?;

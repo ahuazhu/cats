@@ -620,6 +620,25 @@ pub(super) fn load_identity_by_credential_for_update(
         .transpose()
 }
 
+/// Locks the current identity selected by one authenticated credential for a
+/// logically read-only runtime transaction. Rotation, retirement and session
+/// replacement all take the same row for update, so this share lock keeps the
+/// selected identity stable until the caller commits its complete snapshot.
+#[allow(dead_code, reason = "consumed by the A22 authenticated evidence route")]
+pub(super) fn load_identity_by_credential_for_share(
+    transaction: &mut Transaction<'_>,
+    credential_id: &Id,
+) -> AuthorityTxResult<Option<NodeIdentity>> {
+    let sql = format!(
+        "SELECT {NODE_IDENTITY_COLUMNS} FROM node_identities
+          WHERE credential_id=$1 FOR SHARE"
+    );
+    transaction
+        .query_opt(&sql, &[&credential_id.as_str()])?
+        .map(|row| decode_identity(&row))
+        .transpose()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CredentialLineageState {
     Active,
@@ -825,9 +844,29 @@ pub(super) fn load_current_session_for_update(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
 ) -> AuthorityTxResult<Option<AgentSession>> {
+    load_current_session_locked(transaction, node_id, "FOR UPDATE")
+}
+
+/// Locks the current session for a logically read-only runtime transaction.
+/// The NodeIdentity share lock already serializes session replacement; this
+/// additional row lock makes the exact current-session dependency explicit
+/// and keeps its renewal projection stable through the evidence snapshot.
+#[allow(dead_code, reason = "consumed by the A22 authenticated evidence route")]
+pub(super) fn load_current_session_for_share(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+) -> AuthorityTxResult<Option<AgentSession>> {
+    load_current_session_locked(transaction, node_id, "FOR SHARE")
+}
+
+fn load_current_session_locked(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+    lock: &'static str,
+) -> AuthorityTxResult<Option<AgentSession>> {
     let sql = format!(
         "SELECT {CURRENT_SESSION_COLUMNS} FROM current_agent_sessions
-          WHERE node_id=$1 FOR UPDATE"
+          WHERE node_id=$1 {lock}"
     );
     let Some(row) = transaction.query_opt(&sql, &[&node_id.as_str()])? else {
         return Ok(None);
