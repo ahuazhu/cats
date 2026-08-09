@@ -311,8 +311,8 @@ fn apply_readiness_policy(
             readiness.set(false);
             Ok(false)
         }
-        RuntimeSpineRunStep::ObservationAccepted => {
-            readiness.set(true);
+        RuntimeSpineRunStep::ObservationAccepted { service_ready } => {
+            readiness.set(service_ready);
             Ok(false)
         }
         RuntimeSpineRunStep::ObservationReplayed
@@ -611,5 +611,27 @@ mod tests {
         )
         .unwrap());
         assert!(!readiness.is_ready());
+    }
+
+    #[test]
+    fn only_a_nonempty_full_acceptance_opens_readiness() {
+        let readiness = Readiness::closed();
+        assert!(!apply_readiness_policy(
+            RuntimeSpineRunStep::ObservationAccepted {
+                service_ready: false,
+            },
+            &readiness,
+        )
+        .unwrap());
+        assert!(!readiness.is_ready());
+
+        assert!(!apply_readiness_policy(
+            RuntimeSpineRunStep::ObservationAccepted {
+                service_ready: true,
+            },
+            &readiness,
+        )
+        .unwrap());
+        assert!(readiness.is_ready());
     }
 }

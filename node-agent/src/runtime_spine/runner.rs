@@ -344,7 +344,13 @@ pub enum RuntimeSpineRunRetry {
 pub enum RuntimeSpineRunStep {
     DesiredAccepted,
     /// A full observation physically scanned by this runner was accepted.
-    ObservationAccepted,
+    /// Local service readiness additionally requires a nonempty full inventory.
+    /// Runtime convergence is deliberately not a readiness prerequisite: the
+    /// accepted inventory may be the Missing/Inspect baseline that admits the
+    /// first effect for a newly assigned Cat.
+    ObservationAccepted {
+        service_ready: bool,
+    },
     /// A durable observation prepared by a predecessor process was resolved.
     /// It repairs an ambiguous result but cannot establish restart admission
     /// or local readiness without a new physical scan.
@@ -1279,13 +1285,15 @@ impl RuntimeSpineRunner {
                 let establishes_effect_admission = request.value().complete_inventory
                     && self.current_process_scan_observation_id.as_ref()
                         == Some(&request.value().observation_id);
+                let service_ready = establishes_effect_admission
+                    && observation_opens_service_readiness(request.value());
                 self.journal_lane()?
                     .accept_observation(accepted.value, accepted.bytes)
                     .await?;
                 self.current_process_scan_observation_id = None;
                 if establishes_effect_admission {
                     self.effect_admission_open = true;
-                    Ok(RuntimeSpineRunStep::ObservationAccepted)
+                    Ok(RuntimeSpineRunStep::ObservationAccepted { service_ready })
                 } else {
                     Ok(RuntimeSpineRunStep::ObservationReplayed)
                 }
@@ -1314,6 +1322,12 @@ impl RuntimeSpineRunner {
             }
         }
     }
+}
+
+fn observation_opens_service_readiness(observation: &NodeObservation) -> bool {
+    observation.complete_inventory
+        && observation.inventory_digest.is_some()
+        && !observation.runtimes.is_empty()
 }
 
 impl Drop for RuntimeSpineRunner {
@@ -1968,7 +1982,9 @@ mod tests {
                 .run_once_until(Instant::now() + Duration::from_secs(5))
                 .await
                 .unwrap(),
-            RuntimeSpineRunStep::ObservationAccepted
+            RuntimeSpineRunStep::ObservationAccepted {
+                service_ready: true
+            }
         ));
         assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
         assert!(matches!(
@@ -2722,7 +2738,9 @@ mod tests {
                 .run_once_until(Instant::now() + std::time::Duration::from_secs(5))
                 .await
                 .unwrap(),
-            RuntimeSpineRunStep::ObservationAccepted
+            RuntimeSpineRunStep::ObservationAccepted {
+                service_ready: false
+            }
         ));
 
         assert_eq!(scanner.calls.load(Ordering::SeqCst), 1);
