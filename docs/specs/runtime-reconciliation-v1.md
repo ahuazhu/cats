@@ -501,14 +501,39 @@ tuple；跨Workspace miss回滚reservation且零持久副作用。首次执行�
 6. placement 提交后若 Node 明确拒绝不可满足的容量/能力，当前 Operation Failed；Controller
    重新选择 Node 时必须创建新的系统 revision，不能原地替换 placement。
 
-Cat create是第2条的完整原子实例：同一PG commit写Cat、current完整Desired、runtime Operation、
+Cat create是第2条的完整原子实例：auth/membership/permission后先做不查resource的只读result fast lookup；
+hit立即重放，fast miss不保留reservation/Pending。只有fast miss才做placement/capacity准备，并由public API/service生成
+一次性、未提交时不可见且永不复用的candidate
+identity、完整Desired及所有非时间业务字段，并以同一批identity编码成功response；同一PG commit首次持久化Cat、current完整Desired、runtime Operation、
 generation-zero且Unowned的Root Disk/Volume和包含原operation ID的result，或全部不写。Root没有
 Persistent initialization状态或第二个Disk Operation。同key
-响应/commit不明只重放原response与operation ID，不能分配第二组identity。
+响应/commit不明只重放原response与operation ID，不能持久化第二组identity；业务事务仍须重新reservation/read，
+竞态result hit在资源锁前丢弃本次candidate。fast lookup不是重放authority。
+初始Volume只能是Active+Unowned、epoch 0、blank head且owner/expiry/last-transition全null；唯一Root
+`VolumeIntent.acquire`只能是normal且`expected_unowned_epoch=0`。任何其他初始形态是bundle invariant failure。
 Cat row的精确最小schema由[Volume Authority §3](volume-authority.md#3-postgresql-authority-模型)冻结，只保存
 不可变identity/name/created time；Root、target、placement和runtime状态不得复制进Cat row。Cat/Disk、
 Operation created/updated和API result的首次时间使用同一次PostgreSQL DB now，初始target只由本节完整
 Desired及其Operation携带。该Cat row不是Control Plane -> Node共享wire，也不属于F0 codegen集合。
+public API在调用Control Store前同时编码exact成功response和`(workspace_id, name)`冲突时的exact
+`409 application/json` response；Store只按锁定后的名称唯一性选择并原子保存，不自行生成HTTP bytes。
+两者的closed DTO、`202/409` status/content type和exact-byte fixed vectors以
+[Volume Authority §8.1](volume-authority.md#81-disk-create)为唯一权威；success只含candidate `cat_id + operation_id`，
+conflict使用固定`already_exists` body。
+成功response的operation ID来自同一candidate Operation且不得包含DB-now派生字段；
+Store把candidate operation ID与Desired的workspace/cat/revision/digest/placement/target组合为初始
+`Pending + terminal=null` Operation，并以单次DB now同时填充created/updated time；它不接收伪时间、选择
+placement或重算spec。
+candidate一次构造并包含Cat/Root/Volume/attachment/intent/acquire/Operation identity以及完整Desired中全部
+`Id/RandomId128`；Store逐字段验证bundle内部绑定，不接受`placement_ok/capacity_ok` bool。提交后capacity
+变旧仍使用本节既有`PlacementRejected -> new revision`，不新增capacity reservation authority。
+Root Disk的name固定等于candidate `disk_id`；它不从用户Cat name派生，意外碰撞只回滚并换一组未使用的
+candidate，不能产生第二种持久409。
+名称冲突事务不写Cat/Desired/Operation/Disk/Volume，只写该409 result；随机identity碰撞、持久row损坏或
+数据库失败不得伪装成名称冲突result。
+业务事务的锁序固定为`API key -> CatNameLock(workspace_id,name) -> Volume -> Cat -> Disk -> Desired ->
+Operation`；name lock是transaction-scoped advisory coordination，不是持久row。锁后existing合法Cat才可选择
+固定409，absent才继续；不能依赖unique-violation后的已回滚事务补写result。
 
 ## 4. Desired delivery 与 AdmissionCell
 

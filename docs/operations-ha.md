@@ -64,7 +64,7 @@ acquire deadline、connect/query/lock/transaction timeout、单批rows/bytes和c
 只有能与业务rows在唯一Control PostgreSQL事务原子提交的Workspace product mutation使用以下result；
 它先完成调用者认证、当前Workspace membership和route permission检查，再取得
 `(authenticated workspace, canonical route, Idempotency-Key)`的transaction-scoped reservation。
-全局锁DAG是`API key -> HostFenceEvent -> authorization -> VolumeRecord -> Disk/Desired ->
+全局锁DAG是`API key -> CatNameLock -> HostFenceEvent -> authorization -> VolumeRecord -> Disk/Desired ->
 DiskSnapshotRecord`，不涉及的节点直接跳过，同类多行按稳定ID排序。fingerprint唯一使用
 [Volume Authority §3.3](specs/volume-authority.md#33-workspace-product-api-idempotency)的domain-separated、
 u64-BE length-framed workspace/route/raw path-query/If-Match/raw body bytes；不允许route-local JSON或参数
@@ -75,6 +75,21 @@ u64-BE length-framed workspace/route/raw path-query/If-Match/raw body bytes；�
 不随resource或Operation删除而GC。request超过route body cap、非identity Content-Encoding和非法
 If-Match在reservation前拒绝；transport/commit结果不明本身不写失败result，最终事务只允许业务+result
 全有或全无，重试按key判定。
+
+每条covered route必须在自己的canonical合同中枚举result-miss后可持久化的确定性业务失败，并由public
+API层在进入Control Store前提供对应的exact status/content-type/body。Store只选择已冻结的envelope，不能把
+PostgreSQL constraint name、provider error或内部validator error临时映射成HTTP bytes。未枚举的identity碰撞、
+stored-state corruption、serialization/连接错误全部回滚且不写失败result。Cat create当前唯一这种失败是
+`(workspace_id, name)`已存在：零业务row变化并原子保存调用方提供的`409 application/json` response。
+
+需要在result miss后准备placement或其他当前状态bundle的route可以先做一次不查resource的只读result fast
+lookup：hit直接重放；miss不保留reservation/Pending，准备完成后的业务事务必须再次按相同key取得reservation并
+重读result。两次读取之间的竞态以事务内结果为准，届时丢弃candidate bundle。该优化不新增authority，也不能
+把resource/capacity检查放到fast hit之前。
+
+`CatNameLock(workspace_id,name)`只是不落row的PostgreSQL transaction advisory coordination：只有Cat create
+在API key之后、任何Volume/Cat/Disk锁之前取得它；持锁查询existing Cat后才选择fixed 202或409 envelope。
+数据库unique constraint仍保留，但不能依赖一个已abort的unique violation事务再补写409 result。
 
 router build/startup gate枚举全部mutation：每条恰好归入上述PG result或已有domain协议；Account/WorkOS、
 Billing/Stripe、fleet/admin、Node/internal、webhook与external-first route不使用本row，不伪造system

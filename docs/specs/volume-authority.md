@@ -32,12 +32,15 @@ Control Store 与 MetadataStore 是逻辑边界，不是两套提交authority。
 pure-domain/data-row fixture，不提供Control cross-row authority。首次消费授权与`Active -> Rejoined`
 都通过唯一PG事务域的固定锁序完成。
 
-全局锁DAG是`ApiIdempotencyResult key reservation -> HostFenceEvent -> AuthorizationRecord ->
+全局锁DAG是`ApiIdempotencyResult key reservation -> CatNameLock -> HostFenceEvent -> AuthorizationRecord ->
 VolumeRecord -> Control Disk/Cat/Desired rows -> DiskSnapshotRecord`；事务跳过自己不涉及的节点，同类
 多行按稳定ID排序。§3.3覆盖的Workspace product mutation先取得由认证Workspace、canonical route和`Idempotency-Key`导出的
 PostgreSQL transaction-scoped reservation，再读结果；它不能先锁资源，也不落持久Pending。这样同一
 key即使携带不同资源也不会分别先锁不同Volume。normal acquire只锁`VolumeRecord`，因此它与snapshot
 mutation或begin-delete仍只能有一方先提交。HostFenceEvent来源的内部恢复没有API前缀，从event开始。
+`CatNameLock`不是row或authority；只有会插入新Cat identity的create事务使用它，并固定在API key之后、
+任何Volume/Cat/Disk row或candidate-ID lock之前取得。删除已有Cat由被锁定的existing Cat row与唯一索引
+线性化，不取得name lock，因此§1的Cat Destroy锁序没有反向边。
 
 Persistent initialization CAS没有API/event前缀，固定锁序是`current AgentSession row -> 该session的
 highest accepted-observation receive-state -> VolumeRecord -> DiskRecord -> current Desired -> immutable
@@ -121,6 +124,17 @@ CatRecord {
   workspace_id: Id,
   name: Id,
   created_at: UnixMillis
+}
+
+CatCreateAcceptedResponse {
+  cat_id: Id,
+  operation_id: Id
+}
+
+CatNameAlreadyExistsResponse = ErrorBody {
+  code: "already_exists",
+  message: "cat name already exists",
+  request_id: omitted
 }
 
 DiskRecord {
@@ -692,14 +706,61 @@ clean-slate cutover 不解析缺少这些字段的旧 pack，也不接受旧裸`
 mutation path中的Disk引用遵守§3的immutable `disk_id`规则；create response可以展示name，但后续资源path
 不以name代替ID。
 
-**RootDisk随Cat create。** result miss后的唯一PG事务分配所有新identity，并原子写入Cat、current完整
+**RootDisk随Cat create。** auth/membership/route permission通过后，API先做一次不查resource的只读result
+fast lookup；hit直接重放，miss只是一条可失效的优化提示，不创建reservation或Pending。只有fast miss才完成
+placement/capacity等当前状态准备，并由public API/service边界在进入Store前一次性生成全部candidate identity、形成包含
+完整Desired及所有非时间业务字段的已验证bundle，并用同一批candidate通过canonical response encoder编码成功response；candidate尚未提交时不对外
+可见且永不复用。result miss后的唯一PG事务首次持久化这些identity，并原子写入Cat、current完整
 Desired、绑定该revision的runtime Operation、`root {cat_id}` Disk、generation-zero且Unowned的Root
 Volume，以及包含原operation ID的exact `ApiIdempotencyResult`。Cat、Disk和Desired的Workspace逐字段相同，
 Desired恰好引用这一个Root Disk/Volume。全部rows/result同一commit或全部不存在；commit/response不明后
 同key只重放原status/body/operation ID，不生成第二个Cat、Disk、Volume、Desired或Operation。
+初始Volume精确为`admin_state=Active`、`lease_epoch=0`、owner/expiry/last_transition均为null、head精确为
+`{generation:0, root_hash:null, root_object_id:null}`。Desired中唯一Root intent使用normal acquire且
+`expected_unowned_epoch=0`；任何非零epoch、非blank head、已有owner/transition或takeover acquire都拒绝整个bundle。
+candidate集合一次性包含`cat_id`、Root `disk_id/volume_id`、`attachment_id`、`volume_intent_id`、normal-acquire
+`transition_id`、`operation_id`以及完整Desired中出现的全部`Id/RandomId128`；Cat/Root/Volume全部非时间字段
+也在同一bundle内。Store逐字段验证Workspace、Root role、size/durability、Desired volume/operation binding与
+spec digest，不接收`placement_ok`、`capacity_ok`或其他验证bool。placement/capacity结果允许在commit后变旧，
+按Runtime §3.3既有`PlacementRejected -> new revision`闭环处理，不新增capacity reservation authority。
 Root不携带Persistent initialization状态，也不创建第二个Disk Operation。事务只读取一次PostgreSQL DB now，
 并把同一毫秒值写入`CatRecord.created_at`、`DiskRecord.created_at`、Operation的created/updated time和
 `ApiIdempotencyResult.created_at`；重放不刷新任何时间。
+
+Cat create调用边界同时携带两个非持久、由public API层预先编码的exact HTTP envelope：成功response和
+`(workspace_id, name)`已存在时的`409 application/json` name-conflict response。Control Store只验证status、
+content type和body cap并在锁定事实后选择其一，不拼装、解析或重新序列化HTTP body。result miss下名称可用时，
+上述业务rows与成功result同一commit；名称已被另一个合法Cat占用时，零业务row变化并只把调用方提供的409
+response与同一次DB now原子写入`ApiIdempotencyResult`。因此该key以后始终重放原409，即使原Cat随后删除。
+成功response只使用同一bundle中的candidate identity和请求内已有字段，不包含`created_at`或其他必须等事务
+DB now/数据库生成值才能编码的字段；其operation ID必须逐字段等于待持久化Operation。result hit发生在任何
+candidate资源锁前，Store直接丢弃本次bundle/envelope并逐字节返回旧result。
+该事务必须重新取得key reservation并重新读取result；fast lookup与业务事务之间若另一请求先提交，仍以事务
+内hit为准。fast lookup不是第二authority，也不能让调用方跳过事务内重检。
+事务内result miss后立即取得`CatNameLock(workspace_id, name)`；V1 PostgreSQL实现固定执行
+`pg_advisory_xact_lock(hashtextextended(current_schema() || ':cat-name:' || $1 || ':' || $2,
+0::BIGINT))`，其中`$1=workspace_id`、`$2=name`。
+`Id`中的冒号或64-bit hash碰撞最多让不同名称额外串行，不会让相同tuple得到不同lock。持锁后读取并验证
+`CatRecord`：合法existing row选择409；absent才继续Volume→Cat→Disk→Desired→Operation锁/插入；corrupt row
+返回BackendUnknown。唯一约束只作invariant backstop，意外constraint error整体回滚，不能事后翻译成409。
+首次持久化的Operation固定为`phase=Pending, terminal=null`，其workspace/cat/revision/spec digest/placement/
+target从同一完整Desired和candidate operation ID构造；`created_at_unix_ms=updated_at_unix_ms`都由上述单次
+DB now注入。调用边界不携带一个带伪时间的“完整Operation row”，Store也不选择placement或重算spec。
+Root `DiskRecord.name`固定逐字节等于candidate `disk_id`，不从用户Cat name派生，也不增加第二种用户可观察
+name-conflict。若该server-generated disk ID/name意外碰撞既有Disk，则与其他candidate identity碰撞相同，
+整体回滚并用从未使用的新candidate bundle重试。
+server生成的cat/disk/volume/operation ID/name碰撞、stored row损坏和数据库/serialization失败不是name conflict，
+不得写409 result；事务回滚后按其既有infrastructure/invariant规则处理。
+
+两个route response使用UTF-8、无BOM/空白/newline且按下列字段序编码；这是public API encoder fixed vector，
+不属于Runtime §16的10种wire或digest：
+
+| outcome | status/content-type | exact body bytes | bytes | SHA-256 |
+|---|---|---|---:|---|
+| accepted | `202 application/json` | `{"cat_id":"cat_01","operation_id":"op_01"}` | 42 | `9ff23d30170e1a81a16e5cdc847c79af292a48b2da3ce2764749320b8826bfda` |
+| name exists | `409 application/json` | `{"code":"already_exists","message":"cat name already exists"}` | 61 | `38f397c0f602012a22d578aec019b53c40b42e5e01611e1264be45fac3eb421e` |
+
+实际accepted body逐字节替换示例中的两个`Id`；name-conflict body恒定，不带动态name、request ID或时间。
 
 **PersistentDisk独立create。** 它是同步资源事务，不走Runtime Operation。认证、当前membership/route permission和§3.3
 key reservation通过后，result miss的唯一PostgreSQL事务由server分配永不复用的`disk_id`、`volume_id`、
@@ -1095,6 +1156,10 @@ tombstone；但只要某个Active HostFenceEvent的Consumed authorization引用�
 | API envelope/result exact replay | Idempotency-Key缺失、重复、空、非printable或超过512 bytes，以及wrong media type/non-identity encoding均在reservation前拒绝；hit不读resource并逐字节重放status/content-type/body，且route不依赖未保存的ETag/Location；response body超过1MiB则业务/result都不能commit；transport/commit unknown本身不结算失败row，最终只可能业务+result全有或全无 |
 | DiskRecord identity/closed role | `volume_id`全局一对一；Root与Cat同Workspace且每Cat恰好一个，Persistent同时最多一个current Desired；Root只含不可变cat ID，Persistent只含两态initialization且仅允许同lineage的一次Uninitialized→Initialized；`{disk}`只解析disk_id，name只能显式lookup；完成删除后row缺席 |
 | Root create crash/重放 | Cat + current完整Desired + runtime Operation + generation-zero/unowned Root Disk/Volume + API result同一PG commit或全无；相同key只返回原operation ID且不生成第二identity；Root无Persistent initialization或第二Disk Operation |
+| Root create fast lookup/竞态 | exact fast hit不执行placement/capacity；异fingerprint在resource前冲突；fast miss后另一session以同key先commit时，业务事务reservation+reread命中、丢弃整组candidate且零candidate row |
+| Root create name并发 | 两个不同key同Workspace/name经CatNameLock只能一方提交202全套rows，另一方零业务row并提交fixed 409；原Cat后来删除后，409 key仍逐byte重放；unique violation不能充当409路径 |
+| Root create candidate/corruption | 每类candidate ID/name碰撞、existing Cat cross-row corruption、serialization/connection failure均不写409/result或半rows；collision只用全新未使用bundle和重新编码的202重试 |
+| Root create exact初态/时间 | Volume仅接受Active+Unowned、epoch0、blank head、null owner/expiry/transition，Desired Root normal acquire expected epoch0；Cat/Disk/Operation/result四处使用同一DB-now，Operation为Pending/null；202/409 fixed vector由独立encoder逐byte重算 |
 | Persistent create crash/重放 | Disk + empty exact Volume + 201 result同一PG commit或全无；相同key只返回原201且无Operation，异fingerprint不读resource |
 | initialization CAS/重放 | 锁current AgentSession与highest accepted head后才锁Volume/Disk/Desired/observation；observation ID、revision/placement、valid checkpoint `commit_initialized`、Owned attachment/epoch/head和active lineage逐字段匹配，new head非空且generation>0、R==L；session replacement或新observation先提交则旧evidence零副作用，initialize先提交则replacement随后正常前进；exact tuple保留首次time且无ledger |
 | normal acquire响应丢失/异payload | 相同RandomId128且完整request相同返回原result/absolute expiry；同ID异任一字段Stale，不使用domain request hash、不产生第二次fence |
