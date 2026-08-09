@@ -73,7 +73,7 @@ pub(super) fn plan_commit(
     // occupies no payload and its pack entry publishes no object. It still has to
     // be in the plan, because the commit is what turns its map entry into a Hole
     // and a pending pack has to be able to replay that.
-    discarded
+    let mut plans: Vec<ChunkPlan> = discarded
         .iter()
         .map(|&chunk_idx| ChunkPlan {
             chunk_idx,
@@ -92,7 +92,9 @@ pub(super) fn plan_commit(
                 page_mask,
             }
         }))
-        .collect()
+        .collect();
+    plans.sort_unstable_by_key(|plan| plan.chunk_idx);
+    plans
 }
 
 /// How many threads to use for one commit's copy/hash work.

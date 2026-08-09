@@ -289,11 +289,15 @@ impl ChunkEngine {
         Ok(())
     }
 
-    pub(super) fn wait_for_staging_space_for(&self, required_bytes: u64) -> Result<()> {
+    pub(super) fn wait_for_staging_space_for(
+        &self,
+        required_bytes: u64,
+        required_packs: usize,
+    ) -> Result<()> {
         let mut staged = self.staged.lock().unwrap();
-        while staged.packs.len() >= self.cfg.max_staged_packs
-            || (!staged.packs.is_empty()
-                && staged.bytes.saturating_add(required_bytes) > self.cfg.max_staged_bytes)
+        while !staged.packs.is_empty()
+            && (staged.packs.len().saturating_add(required_packs) > self.cfg.max_staged_packs
+                || staged.bytes.saturating_add(required_bytes) > self.cfg.max_staged_bytes)
         {
             if self.is_fenced() {
                 return Err(EngineError::Fenced);

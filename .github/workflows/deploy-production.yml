@@ -324,11 +324,11 @@ jobs:
           set -euo pipefail
           required_schema="$(
             sed -nE \
-              's/^(pub\(super\)[[:space:]]+)?const[[:space:]]+SCHEMA_VERSION:[[:space:]]+i64[[:space:]]+=[[:space:]]+([0-9]+);$/\2/p' \
-              control-plane/src/store/schema.rs
+              's/^pub[[:space:]]+const[[:space:]]+AUTHORITY_RELEASE_SCHEMA_VERSION:[[:space:]]+i64[[:space:]]+=[[:space:]]+([0-9]+);$/\1/p' \
+              storage/src/authority.rs
           )"
           if [[ ! "$required_schema" =~ ^[0-9]+$ ]]; then
-            echo "::error::Could not read control-plane SCHEMA_VERSION"
+            echo "::error::Could not read AUTHORITY_RELEASE_SCHEMA_VERSION"
             exit 1
           fi
 

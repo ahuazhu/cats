@@ -100,6 +100,7 @@ impl ChunkEngine {
 
         let cas = self.authority.compare_and_swap_head(
             volume_id,
+            self.size,
             &request.expected_blank_head,
             &request.expected_provisioned_head,
             request.attachment_id.as_str(),

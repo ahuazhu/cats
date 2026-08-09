@@ -1,5 +1,6 @@
 use super::*;
 
+use cats_storage::authority::AUTHORITY_RELEASE_SCHEMA_VERSION;
 use native_tls::{Certificate, TlsConnector};
 use postgres_native_tls::MakeTlsConnector;
 use std::time::Duration;
@@ -200,9 +201,9 @@ fn verify_current_schema(transaction: &mut postgres::Transaction<'_>) -> Result<
     Ok(())
 }
 
-/// This clean-slate runtime-cutover schema is not migrated or repaired; it
-/// must ship only as part of the complete vertical cutover release.
-pub(super) const SCHEMA_VERSION: i64 = 4;
+/// The Control Store owns the full release stamp. Its authority tables share
+/// the one compatibility number consumed by the target data-plane adapter.
+pub(super) const SCHEMA_VERSION: i64 = AUTHORITY_RELEASE_SCHEMA_VERSION;
 
 const CONTROL_TABLES: &[&str] = &[
     "control_schema_version",

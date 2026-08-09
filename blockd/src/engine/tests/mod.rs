@@ -304,6 +304,311 @@ fn relaxed_flush_acks_locally_and_the_drain_publishes() {
 }
 
 #[test]
+fn one_large_barrier_is_split_into_bounded_contiguous_packs() {
+    const TEST_LIMIT: usize = 18 << 20;
+    const DENSE_BYTES: usize = 3 << 20;
+
+    let _limit = PublisherWorkingSetLimitGuard::set(TEST_LIMIT);
+    let dir = tempfile::tempdir().unwrap();
+    let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let meta = Arc::new(CountingMeta {
+        inner: Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap()),
+        cas_calls: AtomicU64::new(0),
+        forced_head_epoch: None,
+    });
+    meta.create_volume(VOL, SIZE).unwrap();
+    let mut cfg = EngineConfig::new(VOL, dir.path().join("data"), "attA");
+    cfg.durability = DurabilityMode::Relaxed {
+        drain_interval_ms: NO_TIMER,
+    };
+    let e = ChunkEngine::attach(cfg, blob.clone(), meta.clone()).unwrap();
+    let first = pattern(DENSE_BYTES, 61);
+    let second = pattern(DENSE_BYTES, 62);
+    e.write(0, &first).unwrap();
+    e.write(CHUNK_SIZE as u64, &second).unwrap();
+
+    assert_eq!(
+        e.flush().unwrap(),
+        2,
+        "one logical barrier must advance once per bounded pack"
+    );
+    let paths: Vec<PathBuf> = e
+        .staged
+        .lock()
+        .unwrap()
+        .packs
+        .iter()
+        .map(|pack| pack.path.clone())
+        .collect();
+    assert_eq!(paths.len(), 2);
+    for (index, path) in paths.iter().enumerate() {
+        let encoded = fs::read(path).unwrap();
+        let (header, _) = format::decode_pack(&encoded).unwrap();
+        assert_eq!(header.base_generation, index as i64);
+        let materialized = materialized_pack_bytes(&header).unwrap();
+        assert!(
+            pack_working_set_bytes(encoded.len(), materialized).unwrap() <= TEST_LIMIT,
+            "pack {index} exceeded its exact publisher budget"
+        );
+    }
+
+    assert_eq!(e.drain_staged().unwrap(), 2);
+    assert_eq!(
+        meta.cas_calls.load(Ordering::SeqCst),
+        2,
+        "the same budget also bounds each publisher CAS prefix"
+    );
+    e.detach().unwrap();
+
+    let restored = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data-b"), "attB"),
+        blob,
+        meta,
+    )
+    .unwrap();
+    let mut back = vec![0u8; DENSE_BYTES];
+    restored.read(0, &mut back).unwrap();
+    assert_eq!(back, first);
+    restored.read(CHUNK_SIZE as u64, &mut back).unwrap();
+    assert_eq!(back, second);
+    restored.detach().unwrap();
+}
+
+#[test]
+fn strict_flush_waits_for_every_bounded_pack_in_one_barrier() {
+    const TEST_LIMIT: usize = 18 << 20;
+    const DENSE_BYTES: usize = 3 << 20;
+
+    let _limit = PublisherWorkingSetLimitGuard::set(TEST_LIMIT);
+    let dir = tempfile::tempdir().unwrap();
+    let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let meta = Arc::new(CountingMeta {
+        inner: Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap()),
+        cas_calls: AtomicU64::new(0),
+        forced_head_epoch: None,
+    });
+    meta.create_volume(VOL, SIZE).unwrap();
+    let e = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        blob,
+        meta.clone(),
+    )
+    .unwrap();
+    e.write(0, &pattern(DENSE_BYTES, 63)).unwrap();
+    e.write(CHUNK_SIZE as u64, &pattern(DENSE_BYTES, 64))
+        .unwrap();
+
+    assert_eq!(e.flush().unwrap(), 2);
+    assert!(e.staged.lock().unwrap().packs.is_empty());
+    assert_eq!(
+        meta.cas_calls.load(Ordering::SeqCst),
+        2,
+        "Strict must publish every bounded pack before acknowledging the barrier"
+    );
+    e.detach().unwrap();
+}
+
+#[test]
+fn failed_multi_pack_stage_queues_its_durable_prefix_and_restores_the_tail() {
+    const TEST_LIMIT: usize = 18 << 20;
+    const DENSE_BYTES: usize = 3 << 20;
+
+    let _limit = PublisherWorkingSetLimitGuard::set(TEST_LIMIT);
+    let dir = tempfile::tempdir().unwrap();
+    let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+    meta.create_volume(VOL, SIZE).unwrap();
+    let data_dir = dir.path().join("data");
+    let mut cfg = EngineConfig::new(VOL, &data_dir, "attA");
+    cfg.durability = DurabilityMode::Relaxed {
+        drain_interval_ms: NO_TIMER,
+    };
+    let e = ChunkEngine::attach(cfg, blob.clone(), meta.clone()).unwrap();
+    let first = pattern(DENSE_BYTES, 71);
+    let second = pattern(DENSE_BYTES, 72);
+    let third = pattern(DENSE_BYTES, 73);
+    e.write(0, &first).unwrap();
+    e.write(CHUNK_SIZE as u64, &second).unwrap();
+
+    let error = {
+        let _failure = StageWriteFailureGuard::set(1);
+        e.flush().unwrap_err()
+    };
+    assert!(matches!(error, EngineError::Io(_)));
+    let status = e.durability_status();
+    assert_eq!(status.local_durable_generation, 1);
+    assert_eq!(status.remote_durable_generation, 0);
+    assert_eq!(status.unpublished_generations, 1);
+    assert_eq!(e.staged.lock().unwrap().packs.len(), 1);
+
+    // The failed barrier was not ACKed, but its durable first pack remains a
+    // live prefix. The restored tail can join later writes in a new barrier
+    // without a restart or a generation gap.
+    e.write(2 * CHUNK_SIZE as u64, &third).unwrap();
+    assert_eq!(e.flush().unwrap(), 3);
+    assert_eq!(e.staged.lock().unwrap().packs.len(), 3);
+    assert_eq!(e.drain_staged().unwrap(), 3);
+    e.detach().unwrap();
+
+    let restored = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data-b"), "attB"),
+        blob,
+        meta,
+    )
+    .unwrap();
+    for (chunk_index, expected) in [first, second, third].iter().enumerate() {
+        let mut back = vec![0u8; DENSE_BYTES];
+        restored
+            .read(chunk_index as u64 * CHUNK_SIZE as u64, &mut back)
+            .unwrap();
+        assert_eq!(&back, expected, "chunk {chunk_index} lost staged bytes");
+    }
+    restored.detach().unwrap();
+}
+
+#[test]
+fn restart_scans_a_durable_split_prefix_without_breaking_the_watermark() {
+    const TEST_LIMIT: usize = 18 << 20;
+    const DENSE_BYTES: usize = 3 << 20;
+
+    let _limit = PublisherWorkingSetLimitGuard::set(TEST_LIMIT);
+    let dir = tempfile::tempdir().unwrap();
+    let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+    meta.create_volume(VOL, SIZE).unwrap();
+    let data_dir = dir.path().join("data");
+    let mut cfg = EngineConfig::new(VOL, &data_dir, "attA");
+    cfg.durability = DurabilityMode::Relaxed {
+        drain_interval_ms: NO_TIMER,
+    };
+    let first = pattern(DENSE_BYTES, 74);
+    let second = pattern(DENSE_BYTES, 75);
+    {
+        let e = ChunkEngine::attach(cfg, blob.clone(), meta.clone()).unwrap();
+        e.write(0, &first).unwrap();
+        e.write(CHUNK_SIZE as u64, &second).unwrap();
+        let error = {
+            let _failure = StageWriteFailureGuard::set(1);
+            e.flush().unwrap_err()
+        };
+        assert!(matches!(error, EngineError::Io(_)));
+        assert_eq!(e.staged.lock().unwrap().packs.len(), 1);
+        // Drop models a crash: the in-memory queue disappears, leaving only
+        // the renamed pack prefix and persistent dirty bitmap/cache.
+    }
+    meta.revoke_lease(VOL).unwrap();
+
+    let recovered =
+        ChunkEngine::attach(EngineConfig::new(VOL, &data_dir, "attB"), blob, meta).unwrap();
+    assert_eq!(
+        recovered.generation(),
+        1,
+        "startup must replay the durable contiguous prefix"
+    );
+    let mut back = vec![0u8; DENSE_BYTES];
+    recovered.read(0, &mut back).unwrap();
+    assert_eq!(back, first);
+    // The tail was never ACKed, so a crash may discard it. The recovered
+    // prefix must nevertheless leave an appendable watermark.
+    let replacement = pattern(4096, 76);
+    recovered
+        .write(2 * CHUNK_SIZE as u64, &replacement)
+        .unwrap();
+    assert_eq!(recovered.flush().unwrap(), 2);
+    let mut replacement_back = vec![0u8; replacement.len()];
+    recovered
+        .read(2 * CHUNK_SIZE as u64, &mut replacement_back)
+        .unwrap();
+    assert_eq!(replacement_back, replacement);
+    recovered.detach().unwrap();
+}
+
+#[test]
+fn split_overlay_fragments_promote_to_bases_and_preserve_the_exact_bytes() {
+    const RANGE_STORM_LIMIT: usize = (8 << 20) + (16 << 10);
+
+    let dir = tempfile::tempdir().unwrap();
+    let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+    meta.create_volume(VOL, SIZE).unwrap();
+    let data_dir = dir.path().join("data");
+    let mut cfg = EngineConfig::new(VOL, &data_dir, "attA");
+    cfg.durability = DurabilityMode::Relaxed {
+        drain_interval_ms: NO_TIMER,
+    };
+    let e = ChunkEngine::attach(cfg, blob.clone(), meta.clone()).unwrap();
+    let mut expected = vec![0u8; CHUNK_SIZE as usize];
+
+    for generation in 0..3usize {
+        let offset = generation * cats_api::chunk::DIRTY_PAGE_SIZE as usize;
+        let bytes = pattern(4096, 81 + generation as u8);
+        e.write(offset as u64, &bytes).unwrap();
+        expected[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        e.flush().unwrap();
+        e.drain_staged().unwrap();
+    }
+    assert_eq!(e.state.lock().unwrap().map[0].layer_count(), 3);
+
+    let _limit = PublisherWorkingSetLimitGuard::set(RANGE_STORM_LIMIT);
+    let mut range_count = 0usize;
+    for page in 0..33usize {
+        let page_start = page * cats_api::chunk::DIRTY_PAGE_SIZE as usize;
+        for range in 0..16usize {
+            let offset = page_start + range * 2;
+            let byte = [(page as u8).wrapping_add(range as u8).wrapping_add(1)];
+            e.write(offset as u64, &byte).unwrap();
+            expected[offset] = byte[0];
+            range_count += 1;
+        }
+    }
+    let local_generation = e.flush().unwrap();
+    let paths: Vec<PathBuf> = e
+        .staged
+        .lock()
+        .unwrap()
+        .packs
+        .iter()
+        .map(|pack| pack.path.clone())
+        .collect();
+    assert!(paths.len() > 1, "the range storm did not cross the budget");
+    let mut persisted_ranges = 0usize;
+    for path in &paths {
+        let encoded = fs::read(path).unwrap();
+        let (header, _) = format::decode_pack(&encoded).unwrap();
+        assert_eq!(header.entries.len(), 1);
+        assert_eq!(header.entries[0].page_mask, format::full_page_mask());
+        persisted_ranges += header.entries[0].byte_ranges.len();
+        assert!(
+            pack_working_set_bytes(encoded.len(), materialized_pack_bytes(&header).unwrap())
+                .unwrap()
+                <= RANGE_STORM_LIMIT
+        );
+    }
+    assert_eq!(persisted_ranges, range_count);
+    assert_eq!(local_generation, 3 + paths.len() as i64);
+
+    e.drain_staged().unwrap();
+    assert_eq!(
+        e.state.lock().unwrap().map[0].layer_count(),
+        0,
+        "budget-split overlays must end at a fresh base"
+    );
+    e.detach().unwrap();
+
+    let restored = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data-b"), "attB"),
+        blob,
+        meta,
+    )
+    .unwrap();
+    let mut back = vec![0u8; CHUNK_SIZE as usize];
+    restored.read(0, &mut back).unwrap();
+    assert_eq!(format::sha256(&back), format::sha256(&expected));
+    assert_eq!(back, expected);
+    restored.detach().unwrap();
+}
+
+#[test]
 fn relaxed_restart_rebuilds_the_local_watermark_without_remote_writes() {
     use cats_storage::blob::FaultyBlobStore;
 
@@ -721,10 +1026,12 @@ struct CountingMeta {
 /// timeout after PostgreSQL made the new root authoritative.
 #[derive(Clone, Copy)]
 enum CasFault {
+    BackendBeforeCas,
     ResponseLost,
     ResponseLostAndFirstReconciliationFails,
     ResponseLostThenLeaseRevoked,
     ResponseLostThenGenerationAdvanced,
+    ResponseLostThenSizeChanged,
     UnrelatedRootPublished,
     ExplicitFenced,
 }
@@ -733,6 +1040,8 @@ struct LostCasResponseMeta {
     inner: Arc<dyn MetadataStore>,
     fault: Mutex<Option<CasFault>>,
     fail_next_load: AtomicBool,
+    forced_head_size: AtomicU64,
+    cas_calls: AtomicU64,
 }
 
 impl MetadataStore for LostCasResponseMeta {
@@ -748,7 +1057,12 @@ impl MetadataStore for LostCasResponseMeta {
                 "injected authoritative-head read failure".into(),
             ));
         }
-        self.inner.load_head(v)
+        let mut head = self.inner.load_head(v)?;
+        let forced_size = self.forced_head_size.load(Ordering::SeqCst);
+        if forced_size != 0 {
+            head.size_bytes = forced_size;
+        }
+        Ok(head)
     }
     fn delete_volume(&self, v: &str) -> cats_storage::metadata::Result<()> {
         self.inner.delete_volume(v)
@@ -785,8 +1099,14 @@ impl MetadataStore for LostCasResponseMeta {
         a: &str,
         epoch: i64,
     ) -> cats_storage::metadata::Result<i64> {
+        self.cas_calls.fetch_add(1, Ordering::SeqCst);
         let fault = self.fault.lock().unwrap().take();
         match fault {
+            Some(CasFault::BackendBeforeCas) => {
+                return Err(MetaError::Backend(
+                    "injected failure before root CAS".into(),
+                ));
+            }
             Some(CasFault::ExplicitFenced) => return Err(MetaError::Fenced),
             Some(CasFault::UnrelatedRootPublished) => {
                 self.inner.cas_head(
@@ -825,7 +1145,18 @@ impl MetadataStore for LostCasResponseMeta {
                         epoch,
                     )?;
                 }
-                CasFault::UnrelatedRootPublished | CasFault::ExplicitFenced => unreachable!(),
+                CasFault::ResponseLostThenSizeChanged => {
+                    let changed_size = self
+                        .inner
+                        .load_head(v)?
+                        .size_bytes
+                        .checked_add(1)
+                        .expect("test volume size has room to grow");
+                    self.forced_head_size.store(changed_size, Ordering::SeqCst);
+                }
+                CasFault::BackendBeforeCas
+                | CasFault::UnrelatedRootPublished
+                | CasFault::ExplicitFenced => unreachable!(),
             }
             return Err(MetaError::Backend(
                 "injected timeout after root CAS committed".into(),
@@ -962,6 +1293,291 @@ fn batched_drain_publishes_the_whole_queue_in_one_cas() {
 }
 
 #[test]
+fn final_batch_record_is_byte_stable_when_recovery_uses_smaller_prefixes() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let meta = fault_meta(&dir, CasFault::BackendBeforeCas);
+    let data_dir = dir.path().join("data");
+    let mut cfg = EngineConfig::new(VOL, &data_dir, "attA");
+    cfg.durability = DurabilityMode::Relaxed {
+        drain_interval_ms: NO_TIMER,
+    };
+    let e = ChunkEngine::attach(cfg, blob.clone(), meta.clone()).unwrap();
+    e.write(0, &pattern(4096, 31)).unwrap();
+    assert_eq!(e.flush().unwrap(), 1);
+    e.write(CHUNK_SIZE as u64, &pattern(4096, 32)).unwrap();
+    assert_eq!(e.flush().unwrap(), 2);
+    let final_txn = e.staged.lock().unwrap().packs.back().unwrap().txn.clone();
+    let final_record_key = chunk::keys::commit_record(VOL, 2, &final_txn);
+
+    assert!(matches!(
+        e.drain_staged(),
+        Err(EngineError::Meta(MetaError::Backend(_)))
+    ));
+    assert_eq!(meta.load_head(VOL).unwrap().generation, 0);
+    let record_before_restart = blob.get(&final_record_key).unwrap();
+    assert!(
+        !blob
+            .exists(&chunk::keys::commit_record(
+                VOL,
+                1,
+                &e.staged.lock().unwrap().packs.front().unwrap().txn,
+            ))
+            .unwrap(),
+        "the failed batch writes only its final commit record"
+    );
+
+    // This is the durable state of a crash after the final record PUT and
+    // before CAS. A Strict restart replays A and B separately, changing the
+    // batch prefix but not the identity or bytes of B's final record.
+    drop(e);
+    meta.revoke_lease(VOL).unwrap();
+    let recovered = ChunkEngine::attach(
+        EngineConfig::new(VOL, &data_dir, "attB"),
+        blob.clone(),
+        meta.clone(),
+    )
+    .unwrap();
+    assert_eq!(recovered.generation(), 2);
+    assert_eq!(blob.get(&final_record_key).unwrap(), record_before_restart);
+    assert!(fs::read_dir(data_dir.join("pending"))
+        .unwrap()
+        .next()
+        .is_none());
+    assert_eq!(
+        meta.cas_calls.load(Ordering::SeqCst),
+        3,
+        "one failed batch CAS plus two single-pack recovery CAS operations"
+    );
+    recovered.detach().unwrap();
+}
+
+#[test]
+fn strict_recovery_cleans_every_pack_covered_by_a_final_record_only_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let meta = Arc::new(CountingMeta {
+        inner: Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap()),
+        cas_calls: AtomicU64::new(0),
+        forced_head_epoch: None,
+    });
+    meta.create_volume(VOL, SIZE).unwrap();
+    let data_dir = dir.path().join("data");
+    let mut cfg = EngineConfig::new(VOL, &data_dir, "attA");
+    cfg.durability = DurabilityMode::Relaxed {
+        drain_interval_ms: NO_TIMER,
+    };
+    let e = ChunkEngine::attach(cfg, blob.clone(), meta.clone()).unwrap();
+    e.write(0, &pattern(4096, 41)).unwrap();
+    e.flush().unwrap();
+    e.write(CHUNK_SIZE as u64, &pattern(4096, 42)).unwrap();
+    e.flush().unwrap();
+
+    let paths: Vec<PathBuf> = e
+        .staged
+        .lock()
+        .unwrap()
+        .packs
+        .iter()
+        .map(|pack| pack.path.clone())
+        .collect();
+    let decoded: Vec<(PackHeader, Vec<u8>)> = paths
+        .iter()
+        .map(|path| format::decode_pack(&fs::read(path).unwrap()).unwrap())
+        .collect();
+    let packs: Vec<(&PackHeader, &[u8])> = decoded
+        .iter()
+        .map(|(header, payload)| (header, payload.as_slice()))
+        .collect();
+    let (base_map, base_leaves) = {
+        let state = e.state.lock().unwrap();
+        (state.map.clone(), state.leaf_refs.clone())
+    };
+    assert_eq!(
+        e.commit_pack_batch(&packs, base_map, base_leaves).unwrap(),
+        2
+    );
+    assert_eq!(meta.cas_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        !blob
+            .exists(&chunk::keys::commit_record(VOL, 1, &decoded[0].0.txn))
+            .unwrap(),
+        "a successful batch intentionally has no intermediate record"
+    );
+
+    // Simulate a crash after CAS and before local queue cleanup. Recovery must
+    // use the exact authoritative generation as the oracle, not require an
+    // intermediate record that the batching model never writes.
+    drop(e);
+    meta.revoke_lease(VOL).unwrap();
+    let recovered = ChunkEngine::attach(
+        EngineConfig::new(VOL, &data_dir, "attB"),
+        blob,
+        meta.clone(),
+    )
+    .unwrap();
+    assert_eq!(recovered.generation(), 2);
+    assert!(fs::read_dir(data_dir.join("pending"))
+        .unwrap()
+        .next()
+        .is_none());
+    assert_eq!(
+        meta.cas_calls.load(Ordering::SeqCst),
+        1,
+        "cleanup of a covered prefix must not issue another CAS"
+    );
+    recovered.detach().unwrap();
+}
+
+#[test]
+fn generation_exhaustion_rejects_a_batch_before_any_remote_write() {
+    use cats_storage::blob::FaultyBlobStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let healthy: Arc<dyn BlobStore> =
+        Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let blob = Arc::new(FaultyBlobStore::new(healthy));
+    let meta = Arc::new(CountingMeta {
+        inner: Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap()),
+        cas_calls: AtomicU64::new(0),
+        forced_head_epoch: None,
+    });
+    meta.create_volume(VOL, SIZE).unwrap();
+    let e = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        blob.clone(),
+        meta.clone(),
+    )
+    .unwrap();
+
+    let first = PackHeader {
+        txn: "generation-exhaustion-a".into(),
+        volume_id: VOL.into(),
+        base_generation: i64::MAX - 1,
+        lease_epoch: e.epoch,
+        entries: Vec::new(),
+    };
+    let second = PackHeader {
+        txn: "generation-exhaustion-b".into(),
+        volume_id: VOL.into(),
+        base_generation: i64::MAX,
+        lease_epoch: e.epoch,
+        entries: Vec::new(),
+    };
+    let (base_map, base_leaves) = {
+        let state = e.state.lock().unwrap();
+        (state.map.clone(), state.leaf_refs.clone())
+    };
+
+    // Any object-store PUT would consume this fault. The unchanged counter and
+    // CAS count jointly prove the overflow is rejected before remote mutation.
+    blob.fail_puts.store(1, Ordering::SeqCst);
+    let cas_before = meta.cas_calls.load(Ordering::SeqCst);
+    let error = e
+        .commit_pack_batch(&[(&first, &[]), (&second, &[])], base_map, base_leaves)
+        .unwrap_err();
+
+    assert!(
+        matches!(error, EngineError::Corrupt(ref message) if message == "commit generation overflow"),
+        "unexpected generation exhaustion error: {error}"
+    );
+    assert_eq!(
+        blob.fail_puts.load(Ordering::SeqCst),
+        1,
+        "generation exhaustion must precede every immutable PUT"
+    );
+    assert_eq!(
+        meta.cas_calls.load(Ordering::SeqCst),
+        cas_before,
+        "generation exhaustion must precede the authority CAS"
+    );
+
+    blob.fail_puts.store(0, Ordering::SeqCst);
+    e.detach().unwrap();
+}
+
+#[test]
+fn malformed_batch_lineage_is_rejected_before_any_remote_write() {
+    use cats_storage::blob::FaultyBlobStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let healthy: Arc<dyn BlobStore> =
+        Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let blob = Arc::new(FaultyBlobStore::new(healthy));
+    let meta = Arc::new(CountingMeta {
+        inner: Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap()),
+        cas_calls: AtomicU64::new(0),
+        forced_head_epoch: None,
+    });
+    meta.create_volume(VOL, SIZE).unwrap();
+    let e = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        blob.clone(),
+        meta.clone(),
+    )
+    .unwrap();
+    let first = PackHeader {
+        txn: "lineage-a".into(),
+        volume_id: VOL.into(),
+        base_generation: 0,
+        lease_epoch: e.epoch,
+        entries: Vec::new(),
+    };
+    let second = PackHeader {
+        txn: "lineage-b".into(),
+        volume_id: VOL.into(),
+        base_generation: 1,
+        lease_epoch: e.epoch,
+        entries: Vec::new(),
+    };
+    let (base_map, base_leaves) = {
+        let state = e.state.lock().unwrap();
+        (state.map.clone(), state.leaf_refs.clone())
+    };
+    let malformed = [
+        {
+            let mut value = second.clone();
+            value.base_generation = 2;
+            (first.clone(), value)
+        },
+        (second.clone(), first.clone()),
+        {
+            let mut value = second.clone();
+            value.volume_id = "other-volume".into();
+            (first.clone(), value)
+        },
+        {
+            let mut value = second.clone();
+            value.lease_epoch += 1;
+            (first.clone(), value)
+        },
+        {
+            let mut value = second.clone();
+            value.txn = first.txn.clone();
+            (first.clone(), value)
+        },
+    ];
+
+    for (first, second) in malformed {
+        blob.fail_puts.store(1, Ordering::SeqCst);
+        let cas_before = meta.cas_calls.load(Ordering::SeqCst);
+        assert!(matches!(
+            e.commit_pack_batch(
+                &[(&first, &[]), (&second, &[])],
+                base_map.clone(),
+                base_leaves.clone(),
+            ),
+            Err(EngineError::Corrupt(_))
+        ));
+        assert_eq!(blob.fail_puts.load(Ordering::SeqCst), 1);
+        assert_eq!(meta.cas_calls.load(Ordering::SeqCst), cas_before);
+    }
+
+    blob.fail_puts.store(0, Ordering::SeqCst);
+    e.detach().unwrap();
+}
+
+#[test]
 fn committed_cas_with_a_lost_response_is_reconciled_without_fencing() {
     let dir = tempfile::tempdir().unwrap();
     let blob: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
@@ -972,6 +1588,8 @@ fn committed_cas_with_a_lost_response_is_reconciled_without_fencing() {
         inner,
         fault: Mutex::new(Some(CasFault::ResponseLost)),
         fail_next_load: AtomicBool::new(false),
+        forced_head_size: AtomicU64::new(0),
+        cas_calls: AtomicU64::new(0),
     });
     let data_dir = dir.path().join("data-a");
     let e = ChunkEngine::attach(
@@ -1031,6 +1649,8 @@ fn fault_meta(dir: &tempfile::TempDir, fault: CasFault) -> Arc<LostCasResponseMe
         inner,
         fault: Mutex::new(Some(fault)),
         fail_next_load: AtomicBool::new(false),
+        forced_head_size: AtomicU64::new(0),
+        cas_calls: AtomicU64::new(0),
     })
 }
 
@@ -1075,6 +1695,38 @@ fn an_authoritative_generation_beyond_the_target_fences() {
         Err(EngineError::Meta(MetaError::CasConflict { expected: 0 }))
     ));
     assert!(e.is_fenced());
+}
+
+#[test]
+fn a_target_head_with_a_different_size_cannot_reconcile_a_lost_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let meta = fault_meta(&dir, CasFault::ResponseLostThenSizeChanged);
+    let e = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        blob,
+        meta.clone(),
+    )
+    .unwrap();
+    e.write(0, &pattern(4096, 77)).unwrap();
+
+    assert!(matches!(
+        e.flush(),
+        Err(EngineError::Meta(MetaError::CasConflict { expected: 0 }))
+    ));
+    assert!(
+        e.is_fenced(),
+        "a changed authority binding must fail closed"
+    );
+    assert_eq!(e.generation(), 0, "the target head must not be adopted");
+    assert_eq!(
+        meta.cas_calls.load(Ordering::SeqCst),
+        1,
+        "ambiguous reconciliation must read, never guess with a second CAS"
+    );
+    let observed = meta.load_head(VOL).unwrap();
+    assert_eq!(observed.generation, 1, "the injected CAS did commit");
+    assert_ne!(observed.size_bytes, SIZE, "the authority size drifted");
 }
 
 #[test]
@@ -3001,6 +3653,8 @@ fn a_lost_generation_one_cas_response_is_adopted_from_exact_authority() {
         inner,
         fault: Mutex::new(Some(CasFault::ResponseLost)),
         fail_next_load: AtomicBool::new(false),
+        forced_head_size: AtomicU64::new(0),
+        cas_calls: AtomicU64::new(0),
     });
     let engine = ChunkEngine::attach_control_only(
         EngineConfig::new(VOL, dir.path().join("data"), "attA"),

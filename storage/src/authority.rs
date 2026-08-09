@@ -12,6 +12,16 @@ use serde::{Deserialize, Serialize};
 
 const MAX_INTEGER: u64 = i64::MAX as u64;
 
+/// Exact clean-slate authority schema release understood by the Volume
+/// Authority writer and its data-plane adapter. Earlier versions are neither
+/// migrated nor repaired by this release.
+///
+/// The Control Store remains the sole owner of its full schema stamp and DDL.
+/// Sharing this release number lets the adapter reject an unstamped or
+/// incompatible authority shape without importing the product store or
+/// duplicating its schema.
+pub const AUTHORITY_RELEASE_SCHEMA_VERSION: i64 = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VolumeDurability {
@@ -112,6 +122,7 @@ pub struct VolumeHeadCasRequest {
     pub volume_id: Id,
     pub attachment_id: Id,
     pub expected_epoch: FenceEpoch,
+    pub expected_size_bytes: u64,
     pub expected_head: RemoteHead,
     pub new_head: RemoteHead,
 }
@@ -758,6 +769,9 @@ pub fn compare_and_swap_head(
         return Err(AuthorityError::Fenced);
     }
     if record.head != request.expected_head {
+        return Err(AuthorityError::HeadConflict);
+    }
+    if record.size_bytes != request.expected_size_bytes {
         return Err(AuthorityError::HeadConflict);
     }
 

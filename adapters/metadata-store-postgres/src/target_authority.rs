@@ -10,6 +10,7 @@ use cats_storage::authority::{
     compare_and_swap_head, project_volume_record, renew_lease, AuthorityError, Epoch, FenceEpoch,
     Generation, Id, RenewLeaseRequest, RenewLeaseResult, Revision, UnixMillis, VolumeDataAuthority,
     VolumeHeadCasRequest, VolumeHeadCasResult, VolumeRecord, VolumeRecordProjection,
+    AUTHORITY_RELEASE_SCHEMA_VERSION,
 };
 use cats_storage::{AdapterConfig, AdapterError, MetaError};
 use postgres::{Client, Row, Transaction};
@@ -163,6 +164,31 @@ impl VolumeDataAuthority for PostgresVolumeDataAuthority {
 }
 
 pub(super) fn verify_schema(client: &mut Client) -> cats_storage::metadata::Result<()> {
+    let stamp = client
+        .query_opt(
+            "SELECT version FROM control_schema_version WHERE singleton",
+            &[],
+        )
+        .map_err(|error| {
+            MetaError::Backend(format!(
+                "target volume authority schema stamp is unavailable or incompatible: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            MetaError::Backend(
+                "target volume authority schema stamp is missing its singleton row".into(),
+            )
+        })?;
+    let stamped: i64 = stamp.try_get(0).map_err(|error| {
+        MetaError::Backend(format!(
+            "target volume authority schema stamp has an incompatible type: {error}"
+        ))
+    })?;
+    if stamped != AUTHORITY_RELEASE_SCHEMA_VERSION {
+        return Err(MetaError::Backend(format!(
+            "target volume authority database is at schema version {stamped}, this build requires exact authority release version {AUTHORITY_RELEASE_SCHEMA_VERSION}"
+        )));
+    }
     let sql = format!("SELECT {VOLUME_COLUMNS} FROM volume_records WHERE FALSE");
     client.query(&sql, &[]).map(|_| ()).map_err(|error| {
         MetaError::Backend(format!(
@@ -418,6 +444,7 @@ mod tests {
 
     const VOLUME_ID: &str = "volume-target-authority";
     const ATTACHMENT_ID: &str = "attachment-target-authority";
+    const VOLUME_SIZE: u64 = 8 * 1024 * 1024;
 
     struct Fixture {
         url: String,
@@ -482,7 +509,7 @@ mod tests {
     fn owned_volume() -> VolumeRecord {
         VolumeRecord {
             volume_id: id(VOLUME_ID),
-            size_bytes: 8 * 1024 * 1024,
+            size_bytes: VOLUME_SIZE,
             durability: VolumeDurability::Strict,
             admin_state: VolumeAdminState::Active,
             head: head(4, 4),
@@ -567,6 +594,7 @@ mod tests {
             volume_id: id(VOLUME_ID),
             attachment_id: id(ATTACHMENT_ID),
             expected_epoch: fence_epoch(7),
+            expected_size_bytes: VOLUME_SIZE,
             expected_head: expected,
             new_head: target,
         }
@@ -584,6 +612,71 @@ mod tests {
             .query_one(&format!("SELECT {DB_NOW_MS}"), &[])
             .unwrap()
             .get(0)
+    }
+
+    fn raw_volume_row_json(client: &mut Client) -> String {
+        client
+            .query_one(
+                "SELECT row_to_json(volume_records)::text
+                   FROM volume_records WHERE volume_id=$1",
+                &[&VOLUME_ID],
+            )
+            .unwrap()
+            .get(0)
+    }
+
+    fn assert_target_startup_rejected_without_volume_write(mutate_stamp: impl FnOnce(&mut Client)) {
+        let url = cats_control_plane::testsupport::isolated_control_store_url();
+        drop(Store::connect(&url, None).expect("initialize final control-store schema"));
+        let mut client = Client::connect(&url, NoTls).expect("connect test PostgreSQL");
+        insert_volume(&mut client, &owned_volume());
+        mutate_stamp(&mut client);
+        let before = raw_volume_row_json(&mut client);
+
+        let error = PostgresVolumeDataAuthority::connect(&url, None)
+            .err()
+            .expect("an incompatible schema stamp must reject target startup");
+        assert!(
+            error.to_string().contains("schema"),
+            "unexpected startup error: {error}"
+        );
+        assert_eq!(raw_volume_row_json(&mut client), before);
+        assert_eq!(legacy_table(&mut client), None);
+    }
+
+    #[test]
+    fn target_requires_the_exact_existing_control_schema_stamp() {
+        assert_target_startup_rejected_without_volume_write(|client| {
+            client
+                .batch_execute("DROP TABLE control_schema_version")
+                .unwrap();
+        });
+        assert_target_startup_rejected_without_volume_write(|client| {
+            client
+                .execute("DELETE FROM control_schema_version", &[])
+                .unwrap();
+        });
+        assert_target_startup_rejected_without_volume_write(|client| {
+            client
+                .execute(
+                    "UPDATE control_schema_version SET version=$1 WHERE singleton",
+                    &[&(AUTHORITY_RELEASE_SCHEMA_VERSION - 1)],
+                )
+                .unwrap();
+        });
+        assert_target_startup_rejected_without_volume_write(|client| {
+            client
+                .execute(
+                    "UPDATE control_schema_version SET version=$1 WHERE singleton",
+                    &[&(AUTHORITY_RELEASE_SCHEMA_VERSION + 1)],
+                )
+                .unwrap();
+        });
+        assert_target_startup_rejected_without_volume_write(|client| {
+            client
+                .batch_execute("ALTER TABLE volume_records DROP COLUMN head_root_object_id")
+                .unwrap();
+        });
     }
 
     #[test]
@@ -621,8 +714,8 @@ mod tests {
     }
 
     #[test]
-    fn wrong_owner_epoch_and_exact_predecessor_have_zero_side_effects() {
-        let fixture = Fixture::new();
+    fn wrong_owner_epoch_size_and_exact_predecessor_have_zero_side_effects() {
+        let mut fixture = Fixture::new();
         let before = fixture.stored();
 
         assert_eq!(
@@ -648,6 +741,21 @@ mod tests {
             Err(AuthorityError::HeadConflict)
         );
         assert_eq!(fixture.stored(), before);
+
+        let mut resized = fixture.stored();
+        resized.size_bytes += 1024 * 1024;
+        let mut transaction = fixture.client.transaction().unwrap();
+        update_volume(&mut transaction, &resized).unwrap();
+        transaction.commit().unwrap();
+        let before_size_conflict = fixture.stored();
+        assert_eq!(before_size_conflict.size_bytes, VOLUME_SIZE + 1024 * 1024);
+        assert_eq!(
+            fixture
+                .authority
+                .compare_and_swap_head(&cas_request(head(4, 4), head(5, 5))),
+            Err(AuthorityError::HeadConflict)
+        );
+        assert_eq!(fixture.stored(), before_size_conflict);
     }
 
     #[test]

@@ -1026,6 +1026,7 @@ fn data_plane_head_cas_compares_owner_epoch_and_complete_head() {
         volume_id: owned.volume_id.clone(),
         attachment_id: owned.lease_owner.clone().unwrap(),
         expected_epoch: owned.lease_epoch,
+        expected_size_bytes: owned.size_bytes,
         expected_head: owned.head.clone(),
         new_head: head(5),
     };
@@ -1061,6 +1062,15 @@ fn data_plane_head_cas_compares_owner_epoch_and_complete_head() {
         compare_and_swap_head(&owned, &same_generation_different_root),
         Err(AuthorityError::HeadConflict)
     );
+
+    let mut wrong_size = same_generation_different_root;
+    wrong_size.expected_head = owned.head.clone();
+    wrong_size.expected_size_bytes = owned.size_bytes + 1;
+    assert_eq!(
+        compare_and_swap_head(&owned, &wrong_size),
+        Err(AuthorityError::HeadConflict)
+    );
+    assert_eq!(owned, acquired_volume());
 }
 
 #[test]

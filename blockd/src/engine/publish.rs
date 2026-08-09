@@ -43,11 +43,6 @@ pub(super) fn is_background_publisher_context() -> bool {
 /// long before the configured backpressure cap is in sight.
 pub(super) const EAGER_DRAIN_WATERMARK: usize = 2;
 
-/// Payload bytes one drain batch may hold in memory at once. A batch of
-/// sparse packs is far below this; a run of dense 4 MiB-base commits gets
-/// split into successive batches instead of pulling gigabytes into RAM.
-const MAX_BATCH_BYTES: usize = 256 << 20;
-
 /// Roots on both sides of one attempted CAS. Keeping the evidence together
 /// makes it harder for reconciliation to compare a generation without its
 /// corresponding root identity.
@@ -151,16 +146,105 @@ impl ChunkEngine {
             return Ok(true);
         }
         let mut decoded: Vec<(PackHeader, Vec<u8>)> = Vec::new();
-        let mut batched_bytes = 0usize;
+        let mut encoded_bytes = 0usize;
+        let mut materialized_bytes = 0usize;
+        let mut batch_epoch = None;
         for (txn, path) in &snapshot {
-            let bytes = fs::read(path)?;
-            batched_bytes += bytes.len();
-            let (header, payload) = format::decode_pack(&bytes)
-                .map_err(|e| EngineError::Corrupt(format!("staged pack {txn}: {e}")))?;
-            decoded.push((header, payload));
-            if batched_bytes >= MAX_BATCH_BYTES {
+            let mut file = File::open(path)?;
+            let file_bytes = usize::try_from(file.metadata()?.len())
+                .map_err(|_| EngineError::Corrupt(format!("staged pack {txn} is too large")))?;
+            let candidate_encoded = encoded_bytes
+                .checked_add(file_bytes)
+                .ok_or_else(|| EngineError::Corrupt("publisher encoded length overflow".into()))?;
+            let minimum_working_set = pack_working_set_bytes(candidate_encoded, 0)
+                .ok_or_else(|| EngineError::Corrupt("publisher working-set overflow".into()))?;
+            if minimum_working_set > publisher_working_set_limit() {
+                if decoded.is_empty() {
+                    return Err(EngineError::Corrupt(format!(
+                        "staged pack {txn} exceeds the publisher working-set limit"
+                    )));
+                }
                 break;
             }
+
+            // Read only the fixed prefix and bounded JSON header first. M is
+            // derivable from the header, so a candidate that would cross the
+            // exact batch budget is rejected before any of its payload enters
+            // memory.
+            let mut prefix = [0u8; format::ENCODED_PACK_PREFIX_LEN];
+            file.read_exact(&mut prefix).map_err(|error| {
+                if error.kind() == ErrorKind::UnexpectedEof {
+                    EngineError::Corrupt(format!("staged pack {txn} is truncated"))
+                } else {
+                    EngineError::Io(error)
+                }
+            })?;
+            let encoded_header_bytes = format::encoded_pack_header_len(&prefix)
+                .map_err(|error| EngineError::Corrupt(format!("staged pack {txn}: {error}")))?;
+            if encoded_header_bytes > file_bytes {
+                return Err(EngineError::Corrupt(format!(
+                    "staged pack {txn} header exceeds its file length"
+                )));
+            }
+            let mut header_bytes = vec![0u8; encoded_header_bytes];
+            header_bytes[..prefix.len()].copy_from_slice(&prefix);
+            file.read_exact(&mut header_bytes[prefix.len()..])
+                .map_err(|error| {
+                    if error.kind() == ErrorKind::UnexpectedEof {
+                        EngineError::Corrupt(format!("staged pack {txn} header is truncated"))
+                    } else {
+                        EngineError::Io(error)
+                    }
+                })?;
+            let (header, payload_offset) = format::decode_pack_header(&header_bytes)
+                .map_err(|error| EngineError::Corrupt(format!("staged pack {txn}: {error}")))?;
+            if payload_offset != encoded_header_bytes {
+                return Err(EngineError::Corrupt(format!(
+                    "staged pack {txn} header length is inconsistent"
+                )));
+            }
+            drop(header_bytes);
+            match batch_epoch {
+                Some(epoch) if header.lease_epoch != epoch => break,
+                None => batch_epoch = Some(header.lease_epoch),
+                Some(_) => {}
+            }
+            let candidate_materialized = materialized_bytes
+                .checked_add(materialized_pack_bytes(&header).ok_or_else(|| {
+                    EngineError::Corrupt("materialized pack length overflow".into())
+                })?)
+                .ok_or_else(|| {
+                    EngineError::Corrupt("publisher materialized length overflow".into())
+                })?;
+            let working_set = pack_working_set_bytes(candidate_encoded, candidate_materialized)
+                .ok_or_else(|| EngineError::Corrupt("publisher working-set overflow".into()))?;
+            if working_set > publisher_working_set_limit() {
+                if decoded.is_empty() {
+                    return Err(EngineError::Corrupt(format!(
+                        "staged pack {txn} exceeds the publisher working-set limit"
+                    )));
+                }
+                break;
+            }
+
+            let payload_bytes = file_bytes - payload_offset;
+            let mut payload = vec![0u8; payload_bytes];
+            file.read_exact(&mut payload).map_err(|error| {
+                if error.kind() == ErrorKind::UnexpectedEof {
+                    EngineError::Corrupt(format!("staged pack {txn} payload is truncated"))
+                } else {
+                    EngineError::Io(error)
+                }
+            })?;
+            let mut trailing = [0u8; 1];
+            if file.read(&mut trailing)? != 0 {
+                return Err(EngineError::Corrupt(format!(
+                    "staged pack {txn} changed length while reading"
+                )));
+            }
+            encoded_bytes = candidate_encoded;
+            materialized_bytes = candidate_materialized;
+            decoded.push((header, payload));
         }
         let (base_map, base_leaves) = {
             let st = self.state.lock().unwrap();
@@ -245,10 +329,11 @@ impl ChunkEngine {
         lease_epoch: i64,
         new_map: &[ChunkRef],
         leaves: &mut [LeafRef],
-        chunks: &[u64],
+        map_chunks: &[u64],
+        record_chunks: &[u64],
     ) -> Result<i64> {
         let vol = &self.cfg.volume_id;
-        let prepared = self.prepare_map_publication(base_generation, new_map, leaves, chunks);
+        let prepared = self.prepare_map_publication(base_generation, new_map, leaves, map_chunks);
         for (hash, encoded) in &prepared.leaf_nodes {
             self.blob
                 .put_immutable(&chunk::keys::map_node(vol, &hex::encode(hash)), encoded)?;
@@ -256,7 +341,8 @@ impl ChunkEngine {
         let root_hex = hex::encode(prepared.root_hash);
         self.blob
             .put_immutable(&chunk::keys::map_node(vol, &root_hex), &prepared.root_bytes)?;
-        let record = encode_commit_record(txn, new_generation, lease_epoch, &root_hex, chunks);
+        let record =
+            encode_commit_record(txn, new_generation, lease_epoch, &root_hex, record_chunks);
         self.blob.put_immutable(
             &chunk::keys::commit_record(vol, new_generation, txn),
             &record,
@@ -275,6 +361,7 @@ impl ChunkEngine {
         )?;
         let requested = self.authority.compare_and_swap_head(
             vol,
+            self.size,
             &expected_head,
             &target_head,
             &self.cfg.attachment_id,
@@ -372,7 +459,8 @@ impl ChunkEngine {
         {
             return Err(EngineError::Meta(MetaError::Fenced));
         }
-        if head.generation == evidence.target_generation
+        if head.size_bytes == self.size
+            && head.generation == evidence.target_generation
             && head.root_hash == Some(evidence.target_root_hash)
             && head.root_object_id.as_deref() == Some(evidence.target_root_object_id)
         {
@@ -388,6 +476,7 @@ impl ChunkEngine {
         // the pack remains the local durability oracle. A reported conflict,
         // or any generation movement, means another lineage won.
         if matches!(&error, MetaError::Backend(_))
+            && head.size_bytes == self.size
             && head.generation == evidence.base_generation
             && head.root_hash == evidence.base_root_hash
             && head.root_object_id.as_deref() == evidence.base_root_object_id
@@ -492,19 +581,63 @@ impl ChunkEngine {
     /// With one pack this is exactly the old per-pack commit.
     ///
     /// Only the final generation gets a commit record. On a crash after the
-    /// CAS the batch's earlier pack files replay as "superseded lineage" and
-    /// are discarded — correct, because their content is already in the
-    /// committed map. On a crash before it, recovery replays them one by one
-    /// through this same path, and writes their records then. Records are NOT
-    /// pre-uploaded for intermediate packs on purpose: a pre-CAS crash would
-    /// replay per pack with a real root hash, and the differing bytes would
-    /// trip `put_immutable`'s immutability check on the same record key.
+    /// CAS the batch's earlier pack files are covered by the authoritative
+    /// generation and are discarded — correct, because their content is
+    /// already in the committed map. On a crash before it, recovery may replay
+    /// a smaller prefix through this same path and write intermediate records.
+    /// The final record therefore binds the last pack's own txn/chunks while
+    /// its Root binds the whole applied prefix: regrouping produces identical
+    /// bytes for the same final key without persisting a batch identity.
     pub(super) fn commit_pack_batch(
         &self,
         packs: &[(&PackHeader, &[u8])],
         base_map: Vec<ChunkRef>,
         base_leaves: Vec<LeafRef>,
     ) -> Result<i64> {
+        let first = packs
+            .first()
+            .ok_or_else(|| EngineError::Corrupt("commit batch must not be empty".into()))?
+            .0;
+        let base_generation = first.base_generation;
+        let pack_count = i64::try_from(packs.len())
+            .map_err(|_| EngineError::Corrupt("commit batch length exceeds i64".into()))?;
+        let new_generation = base_generation
+            .checked_add(pack_count)
+            .ok_or_else(|| EngineError::Corrupt("commit generation overflow".into()))?;
+
+        let batch_epoch = first.lease_epoch;
+        let mut expected_generation = base_generation;
+        let mut txns = HashSet::with_capacity(packs.len());
+        for (header, _) in packs {
+            if header.volume_id != self.cfg.volume_id {
+                return Err(EngineError::Corrupt("commit batch volume mismatch".into()));
+            }
+            if header.base_generation != expected_generation {
+                return Err(EngineError::Corrupt(format!(
+                    "commit batch generation gap: expected {expected_generation}, found {}",
+                    header.base_generation
+                )));
+            }
+            if header.lease_epoch != batch_epoch {
+                return Err(EngineError::Corrupt(
+                    "commit batch crosses lease epochs".into(),
+                ));
+            }
+            if !txns.insert(header.txn.as_str()) {
+                return Err(EngineError::Corrupt(
+                    "commit batch reuses a transaction id".into(),
+                ));
+            }
+            expected_generation = expected_generation
+                .checked_add(1)
+                .ok_or_else(|| EngineError::Corrupt("commit generation overflow".into()))?;
+        }
+        debug_assert_eq!(expected_generation, new_generation);
+
+        // Establish the complete generation range before materialization can
+        // read remote bases and, critically, before this batch can issue any
+        // immutable PUT or authority CAS. Exhaustion therefore leaves no
+        // orphaned remote objects behind.
         let materialized = if packs
             .iter()
             .any(|(header, _)| header.entries.iter().any(PackEntry::is_byte_overlay))
@@ -521,9 +654,10 @@ impl ChunkEngine {
             None => packs.to_vec(),
         };
         let packs = effective.as_slice();
-        let first = packs.first().expect("commit batch must not be empty").0;
-        let last = packs.last().expect("checked").0;
-        let base_generation = first.base_generation;
+        let last = packs
+            .last()
+            .expect("non-empty batch was checked before materialization")
+            .0;
 
         // 1. Data objects for the whole batch (idempotent keys from the txns).
         self.upload_batch(packs)?;
@@ -531,24 +665,29 @@ impl ChunkEngine {
 
         // 2. Apply the packs to the map in chain order.
         let mut new_map = base_map;
-        let mut chunks: Vec<u64> = Vec::new();
+        let mut map_chunks: Vec<u64> = Vec::new();
         for (header, _) in packs {
             Self::apply_pack_entries(&mut new_map, header)?;
-            chunks.extend(header.entries.iter().map(|e| e.chunk_idx));
+            map_chunks.extend(header.entries.iter().map(|e| e.chunk_idx));
         }
-        chunks.sort_unstable();
-        chunks.dedup();
+        map_chunks.sort_unstable();
+        map_chunks.dedup();
+        let mut record_chunks: Vec<u64> =
+            last.entries.iter().map(|entry| entry.chunk_idx).collect();
+        record_chunks.sort_unstable();
+        record_chunks.dedup();
 
         // 3-5. Map, root, commit record, CAS jumping one step per pack.
         let mut new_leaves = base_leaves;
         let new_gen = self.publish_map(
             &last.txn,
             base_generation,
-            base_generation + packs.len() as i64,
+            new_generation,
             last.lease_epoch,
             &new_map,
             &mut new_leaves,
-            &chunks,
+            &map_chunks,
+            &record_chunks,
         )?;
 
         // 6. Swap in the committed map.
@@ -576,69 +715,108 @@ impl ChunkEngine {
         base_map: &[ChunkRef],
     ) -> Result<Vec<(PackHeader, Vec<u8>)>> {
         let page_bytes = cats_api::chunk::DIRTY_PAGE_SIZE as usize;
-        let mut working_map = base_map.to_vec();
-        let mut images: HashMap<u64, Vec<u8>> = HashMap::new();
-        let mut materialized = Vec::with_capacity(packs.len());
+        let mut outputs: Vec<Vec<u8>> = packs
+            .iter()
+            .map(|(header, _)| {
+                materialized_pack_bytes(header)
+                    .map(Vec::with_capacity)
+                    .ok_or_else(|| EngineError::Corrupt("materialized pack length overflow".into()))
+            })
+            .collect::<Result<_>>()?;
+        let mut materialized_entries: Vec<Vec<Option<PackEntry>>> = packs
+            .iter()
+            .map(|(header, _)| vec![None; header.entries.len()])
+            .collect();
+        let mut chunks: Vec<u64> = packs
+            .iter()
+            .flat_map(|(header, _)| header.entries.iter().map(|entry| entry.chunk_idx))
+            .collect();
+        chunks.sort_unstable();
+        chunks.dedup();
 
-        for (header, payload) in packs {
-            let mut output = Vec::new();
-            let mut entries = Vec::with_capacity(header.entries.len());
-            for entry in &header.entries {
-                if entry.is_discard() {
-                    images.insert(entry.chunk_idx, vec![0u8; CHUNK_SIZE as usize]);
-                    entries.push(PackEntry {
-                        chunk_idx: entry.chunk_idx,
-                        payload_offset: output.len() as u64,
-                        len: 0,
-                        sha256_hex: hex::encode(format::sha256(&[])),
-                        page_mask: 0,
+        // Process one chunk through every pack before moving to the next. This
+        // preserves cross-pack overlay order while holding exactly one 4 MiB
+        // image scratch instead of a HashMap of every touched chunk image.
+        for chunk_idx in chunks {
+            let base_ref = base_map
+                .get(chunk_idx as usize)
+                .ok_or_else(|| EngineError::Corrupt("pack chunk is out of bounds".into()))?;
+            let mut image: Option<Vec<u8>> = None;
+            for (pack_index, (header, payload)) in packs.iter().enumerate() {
+                for (entry_index, entry) in header.entries.iter().enumerate() {
+                    if entry.chunk_idx != chunk_idx {
+                        continue;
+                    }
+                    let output = &mut outputs[pack_index];
+                    if entry.is_discard() {
+                        match &mut image {
+                            Some(image) => image.fill(0),
+                            None => image = Some(vec![0u8; CHUNK_SIZE as usize]),
+                        }
+                        materialized_entries[pack_index][entry_index] = Some(PackEntry {
+                            chunk_idx,
+                            payload_offset: output.len() as u64,
+                            len: 0,
+                            sha256_hex: hex::encode(format::sha256(&[])),
+                            page_mask: 0,
+                            byte_ranges: Vec::new(),
+                        });
+                        continue;
+                    }
+                    if image.is_none() {
+                        image = Some(self.fetch_chunk_image(base_ref)?);
+                    }
+                    let image = image.as_mut().expect("initialized");
+                    apply_local_entry(image, entry, payload)?;
+
+                    let start = output.len();
+                    if entry.is_base() {
+                        output.extend_from_slice(image);
+                    } else {
+                        for page in 0..cats_api::chunk::PAGES_PER_CHUNK {
+                            if entry.page_mask & (1u64 << page) == 0 {
+                                continue;
+                            }
+                            let at = page as usize * page_bytes;
+                            output.extend_from_slice(&image[at..at + page_bytes]);
+                        }
+                    }
+                    let bytes = &output[start..];
+                    materialized_entries[pack_index][entry_index] = Some(PackEntry {
+                        chunk_idx,
+                        payload_offset: start as u64,
+                        len: bytes.len() as u32,
+                        sha256_hex: hex::encode(format::sha256(bytes)),
+                        page_mask: entry.page_mask,
                         byte_ranges: Vec::new(),
                     });
-                    continue;
                 }
-
-                if let std::collections::hash_map::Entry::Vacant(slot) =
-                    images.entry(entry.chunk_idx)
-                {
-                    let image = self.fetch_chunk_image(&working_map[entry.chunk_idx as usize])?;
-                    slot.insert(image);
-                }
-                let image = images.get_mut(&entry.chunk_idx).expect("inserted");
-                apply_local_entry(image, entry, payload)?;
-
-                let start = output.len();
-                if entry.is_base() {
-                    output.extend_from_slice(image);
-                } else {
-                    for page in 0..cats_api::chunk::PAGES_PER_CHUNK {
-                        if entry.page_mask & (1u64 << page) == 0 {
-                            continue;
-                        }
-                        let at = page as usize * page_bytes;
-                        output.extend_from_slice(&image[at..at + page_bytes]);
-                    }
-                }
-                let bytes = &output[start..];
-                entries.push(PackEntry {
-                    chunk_idx: entry.chunk_idx,
-                    payload_offset: start as u64,
-                    len: bytes.len() as u32,
-                    sha256_hex: hex::encode(format::sha256(bytes)),
-                    page_mask: entry.page_mask,
-                    byte_ranges: Vec::new(),
-                });
             }
-            let materialized_header = PackHeader {
-                txn: header.txn.clone(),
-                volume_id: header.volume_id.clone(),
-                base_generation: header.base_generation,
-                lease_epoch: header.lease_epoch,
-                entries,
-            };
-            Self::apply_pack_entries(&mut working_map, &materialized_header)?;
-            materialized.push((materialized_header, output));
         }
-        Ok(materialized)
+
+        packs
+            .iter()
+            .zip(outputs)
+            .zip(materialized_entries)
+            .map(|(((header, _), output), entries)| {
+                let entries = entries
+                    .into_iter()
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| {
+                        EngineError::Corrupt("pack materialization omitted an entry".into())
+                    })?;
+                Ok((
+                    PackHeader {
+                        txn: header.txn.clone(),
+                        volume_id: header.volume_id.clone(),
+                        base_generation: header.base_generation,
+                        lease_epoch: header.lease_epoch,
+                        entries,
+                    },
+                    output,
+                ))
+            })
+            .collect()
     }
 
     /// Apply one pack's entries onto a map: a base entry replaces the chunk's

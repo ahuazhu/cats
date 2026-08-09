@@ -10,6 +10,7 @@ use cats_api::chunk::{CHUNK_SIZE, PAGES_PER_CHUNK};
 pub const LEAF_MAGIC: &[u8; 8] = b"CATSLEAF";
 pub const ROOT_MAGIC: &[u8; 8] = b"CATSROOT";
 pub const PACK_MAGIC: &[u8; 8] = b"CATSPACK";
+pub(crate) const ENCODED_PACK_PREFIX_LEN: usize = 8 + 2 + 4;
 pub const BITMAP_MAGIC: &[u8; 8] = b"CATSDRTY";
 pub const FORMAT_VERSION: u16 = 1;
 /// Leaf encoding version that can carry layered (base + delta) chunk refs.
@@ -477,20 +478,59 @@ pub fn encode_pack(header: &PackHeader, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-pub fn decode_pack(mut buf: &[u8]) -> Result<(PackHeader, Vec<u8>), FormatError> {
-    let b = &mut buf;
-    if take(b, 8, "pack")? != PACK_MAGIC {
+pub fn encoded_pack_len(header: &PackHeader, payload_len: usize) -> Option<usize> {
+    let header_len = serde_json::to_vec(header)
+        .expect("pack header serializes")
+        .len();
+    8usize
+        .checked_add(2)?
+        .checked_add(4)?
+        .checked_add(header_len)?
+        .checked_add(payload_len)
+}
+
+pub(crate) fn encoded_pack_header_len(prefix: &[u8]) -> Result<usize, FormatError> {
+    let mut remaining = prefix;
+    if take(&mut remaining, 8, "pack")? != PACK_MAGIC {
         return Err(FormatError::Malformed("pack"));
     }
-    let ver = take_u16(b, "pack")?;
+    let ver = take_u16(&mut remaining, "pack")?;
     if ver != FORMAT_VERSION {
         return Err(FormatError::Version("pack", ver));
     }
-    let hdr_len = take_u32(b, "pack")? as usize;
-    let hdr = take(b, hdr_len, "pack")?;
+    let header_len = take_u32(&mut remaining, "pack")? as usize;
+    ENCODED_PACK_PREFIX_LEN
+        .checked_add(header_len)
+        .ok_or(FormatError::Malformed("pack"))
+}
+
+pub(crate) fn decode_pack_header(buf: &[u8]) -> Result<(PackHeader, usize), FormatError> {
+    let mut remaining = buf;
+    let encoded_header_len = encoded_pack_header_len(buf)?;
+    let _prefix = take(&mut remaining, ENCODED_PACK_PREFIX_LEN, "pack")?;
+    let hdr_len = encoded_header_len - ENCODED_PACK_PREFIX_LEN;
+    let hdr = take(&mut remaining, hdr_len, "pack")?;
     let header: PackHeader =
         serde_json::from_slice(hdr).map_err(|_| FormatError::Malformed("pack"))?;
-    Ok((header, b.to_vec()))
+    let payload_offset = buf
+        .len()
+        .checked_sub(remaining.len())
+        .ok_or(FormatError::Malformed("pack"))?;
+    Ok((header, payload_offset))
+}
+
+pub fn decode_pack(buf: &[u8]) -> Result<(PackHeader, Vec<u8>), FormatError> {
+    let (header, payload_offset) = decode_pack_header(buf)?;
+    Ok((header, buf[payload_offset..].to_vec()))
+}
+
+/// Decode an owned pack without cloning its payload. The prefix is removed
+/// in-place, so publisher memory stays bounded by the encoded buffer it
+/// admitted before reading the file.
+pub fn decode_pack_owned(mut buf: Vec<u8>) -> Result<(PackHeader, Vec<u8>), FormatError> {
+    let (header, payload_offset) = decode_pack_header(&buf)?;
+    buf.drain(..payload_offset);
+    Ok((header, buf))
 }
 
 // ---------------------------------------------------------------------------
@@ -661,9 +701,18 @@ mod tests {
             }],
         };
         let enc = encode_pack(&header, b"data");
+        assert_eq!(encoded_pack_len(&header, 4), Some(enc.len()));
+        let encoded_header_len = encoded_pack_header_len(&enc[..ENCODED_PACK_PREFIX_LEN]).unwrap();
+        let (prefix_header, payload_offset) =
+            decode_pack_header(&enc[..encoded_header_len]).unwrap();
+        assert_eq!(prefix_header.txn, "t1");
+        assert_eq!(payload_offset, encoded_header_len);
         let (h, payload) = decode_pack(&enc).unwrap();
         assert_eq!(h.txn, "t1");
         assert_eq!(payload, b"data");
+        let (owned_header, owned_payload) = decode_pack_owned(enc).unwrap();
+        assert_eq!(owned_header.txn, "t1");
+        assert_eq!(owned_payload, b"data");
     }
 
     #[test]

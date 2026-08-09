@@ -7,8 +7,8 @@ use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-const SCHEMA_PATH: &str = "control-plane/src/store/schema.rs";
-const SCHEMA_VERSION_PATTERN: &str = r"s/^(pub\(super\)[[:space:]]+)?const[[:space:]]+SCHEMA_VERSION:[[:space:]]+i64[[:space:]]+=[[:space:]]+([0-9]+);$/\2/p";
+const SCHEMA_PATH: &str = "storage/src/authority.rs";
+const SCHEMA_VERSION_PATTERN: &str = r"s/^pub[[:space:]]+const[[:space:]]+AUTHORITY_RELEASE_SCHEMA_VERSION:[[:space:]]+i64[[:space:]]+=[[:space:]]+([0-9]+);$/\1/p";
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -398,7 +398,7 @@ fn production_deploy_extracts_versions_from_the_current_store_schema() {
     let value = String::from_utf8(output.stdout).expect("schema version is UTF-8");
     assert!(
         value.trim().parse::<i64>().is_ok(),
-        "SCHEMA_VERSION did not yield one numeric value: {value:?}"
+        "AUTHORITY_RELEASE_SCHEMA_VERSION did not yield one numeric value: {value:?}"
     );
 }
 

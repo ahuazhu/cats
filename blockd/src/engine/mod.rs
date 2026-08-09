@@ -7,9 +7,9 @@
 //! state authoritative until the background publisher advances the remote
 //! watermark.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -44,14 +44,83 @@ mod recovery;
 mod status;
 
 pub use gc::GcStats;
+#[cfg(test)]
+use pack::StageWriteFailureGuard;
 use pack::{apply_local_entry, merge_dirty_range, DirtyByteRange, StagedPack, StagedQueue};
-use plan::{commit_workers, copy_planned_pages, plan_commit, ChunkPlan};
+use plan::{copy_planned_pages, plan_commit, ChunkPlan};
 pub use provision::ProvisionRootImageEffectError;
 #[cfg(test)]
 use publish::is_background_publisher_context;
 use publish::{CommitterSignal, EAGER_DRAIN_WATERMARK, MAX_UPLOAD_CONCURRENCY};
 use quota::{pack_reservation_upper, punch_hole};
 pub use status::DurabilityMode;
+
+/// Maximum transient encoded/decoded/materialized publisher working set for
+/// one CAS prefix. Pack boundaries use the provider-neutral formula documented
+/// beside `pack_working_set_bytes`; this is not an allocator-size estimate.
+const MAX_PUBLISHER_WORKING_SET_BYTES: usize = 256 << 20;
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_PUBLISHER_WORKING_SET_BYTES: std::cell::Cell<Option<usize>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+fn publisher_working_set_limit() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = TEST_PUBLISHER_WORKING_SET_BYTES.get() {
+        return limit;
+    }
+    MAX_PUBLISHER_WORKING_SET_BYTES
+}
+
+fn materialized_entry_bytes(entry: &PackEntry) -> Option<usize> {
+    if entry.is_discard() {
+        return Some(0);
+    }
+    materialized_page_mask_bytes(entry.page_mask)
+}
+
+fn materialized_page_mask_bytes(page_mask: u64) -> Option<usize> {
+    (page_mask.count_ones() as usize).checked_mul(cats_api::chunk::DIRTY_PAGE_SIZE as usize)
+}
+
+fn materialized_pack_bytes(header: &PackHeader) -> Option<usize> {
+    header.entries.iter().try_fold(0usize, |total, entry| {
+        total.checked_add(materialized_entry_bytes(entry)?)
+    })
+}
+
+/// Cross-implementation publisher budget: twice the exact encoded pack bytes,
+/// plus its worst-case materialized output, plus one full-chunk scratch image.
+/// Every operation is checked before comparing with the fixed cap.
+fn pack_working_set_bytes(encoded_bytes: usize, materialized_bytes: usize) -> Option<usize> {
+    encoded_bytes
+        .checked_mul(2)?
+        .checked_add(materialized_bytes)?
+        .checked_add(CHUNK_SIZE as usize)
+}
+
+#[cfg(test)]
+struct PublisherWorkingSetLimitGuard {
+    previous: Option<usize>,
+}
+
+#[cfg(test)]
+impl PublisherWorkingSetLimitGuard {
+    fn set(limit: usize) -> Self {
+        let previous = TEST_PUBLISHER_WORKING_SET_BYTES.replace(Some(limit));
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for PublisherWorkingSetLimitGuard {
+    fn drop(&mut self) {
+        TEST_PUBLISHER_WORKING_SET_BYTES.set(self.previous);
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -304,6 +373,7 @@ impl AuthorityBackend {
     fn compare_and_swap_head(
         &self,
         volume_id: &str,
+        expected_size_bytes: u64,
         expected_head: &RemoteHead,
         new_head: &RemoteHead,
         attachment_id: &str,
@@ -341,6 +411,7 @@ impl AuthorityBackend {
                         volume_id: volume_id.clone(),
                         attachment_id: attachment_id.clone(),
                         expected_epoch,
+                        expected_size_bytes,
                         expected_head: expected_head.clone(),
                         new_head: new_head.clone(),
                     })
@@ -913,8 +984,16 @@ impl ChunkEngine {
         let chunks: Vec<u64> = manifest.chunks.iter().map(|c| c.chunk_idx).collect();
         let txn = format!("img-{}", &manifest.image_id[..16]);
         let mut new_leaves = vec![LeafRef::Empty; chunk::leaf_count(self.size) as usize];
-        let new_gen =
-            self.publish_map(&txn, 0, 1, self.epoch, &new_map, &mut new_leaves, &chunks)?;
+        let new_gen = self.publish_map(
+            &txn,
+            0,
+            1,
+            self.epoch,
+            &new_map,
+            &mut new_leaves,
+            &chunks,
+            &chunks,
+        )?;
 
         let mut st = self.state.lock().unwrap();
         st.map = new_map;
