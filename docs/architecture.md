@@ -138,7 +138,7 @@ fingerprint：domain separator后依次length-frame workspace、matched method/r
 If-Match presence/Generation和raw body，不做JSON/path/query语义归一化。调用者身份、当前Workspace
 membership和route permission先通过；事务随后取得
 该key reservation并优先读取result，再沿
-`NodeIdentity -> AgentSession -> observation receive/cursor -> HostFenceEvent -> authorization ->
+`NodeIdentity -> current credential lineage（A19 auth适用时）-> AgentSession -> observation receive/cursor -> HostFenceEvent -> authorization ->
 VolumeRecord -> Disk/Desired -> DiskSnapshotRecord`的全局DAG锁定
 自己涉及的行；首次业务变化与保存status/content-type/exact response bytes的result同一commit，不落持久
 Pending。同key重放只读

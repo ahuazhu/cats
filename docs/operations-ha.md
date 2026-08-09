@@ -76,8 +76,8 @@ retry共享HTTP的10秒absolute deadline，取消和shutdown必须rollback/close
 只有能与业务rows在唯一Control PostgreSQL事务原子提交的Workspace product mutation使用以下result；
 它先完成调用者认证、当前Workspace membership和route permission检查，再取得
 `(authenticated workspace, canonical route, Idempotency-Key)`的transaction-scoped reservation。
-全局锁DAG是`API key -> CatNameLock -> NodeIdentity（会改变assigned Desired或消费current Node
-evidence时）-> AgentSession -> observation receive/cursor（适用时）-> HostFenceEvent ->
+全局锁DAG是`API key -> CatNameLock -> NodeIdentity（写old/new assigned current Desired任一字段或消费current Node
+evidence时）-> current credential lineage（A19 auth适用时）-> AgentSession -> observation receive/cursor（适用时）-> HostFenceEvent ->
 authorization -> VolumeRecord -> Disk/Desired -> DiskSnapshotRecord`，不涉及的节点直接跳过，同类多行按稳定ID排序。fingerprint唯一使用
 [Volume Authority §3.3](specs/volume-authority.md#33-workspace-product-api-idempotency)的domain-separated、
 u64-BE length-framed workspace/route/raw path-query/If-Match/raw body bytes；不允许route-local JSON或参数
@@ -289,7 +289,8 @@ runbook；禁止以“重启看看”跳过fence或durability proof。
    writes；随后轮换service、per-Node、database、object-store与route-signing credentials。此步不
    重建或修改artifact。
 5. 创建空目标 schema（含A23 Node/provisioner credential all-history lineage DDL），安装并验证
-   A23 deployment provisioner Ed25519 trust bundle，在打开admin listener前同步持久active/retired tombstone，
+   A23 deployment provisioner Ed25519 revision-1/null-previous trust bundle，在打开admin listener前CAS持久
+   revision receipt与active/retired tombstone，
    再启动同一个exact release
    的Control Plane；central IaC通过single signed node-authority route原子provision
    `NodeIdentity`/per-Node credential binding与revision-1 cordoned `NodePlacementPolicy`。不得direct SQL或
@@ -303,8 +304,9 @@ runbook；禁止以“重启看看”跳过fence或durability proof。
 是启动前置事实，运行期只有这一套authority。
 
 后续同一终态协议内的普通 release 可以逐副本/逐空 Node 部署，但必须保持 schema 兼容范围、
-key overlap、Node drain 和不可变 artifact digest；provisioner key rotation必须先所有replica overlap、
-再切signer、最后移除old，已retire ID/SPKI跨release不得重用。该路径不能用于首次 cutover。
+key overlap、Node drain 和不可变 artifact digest；provisioner key rotation必须以单调revision和exact previous-set
+CAS先所有replica overlap、再切signer、最后用下一revision移除old，已retire ID/SPKI跨release不得重用；
+stale/same-revision不同set的replica必须fail startup，不能按本地缺席隐式retire。该路径不能用于首次 cutover。
 
 步骤4–6还必须遵守
 [Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md)和

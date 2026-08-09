@@ -191,7 +191,8 @@ header。任何error都不得持久化成observation/Condition或domain success/
 
 固定处理顺序是：path dispatch -> method -> query -> Content-Type -> Content-Encoding -> Authorization ->
 Accept -> forbidden semantic headers -> non-blocking global admission -> bounded body -> A19 proof -> F0 decoder ->
-credential的唯一provisioned NodeIdentity -> non-blocking per-Node admission -> session/domain transaction。前一
+credential的唯一provisioned NodeIdentity + exact active credential lineage -> non-blocking per-Node admission ->
+session/domain transaction（NodeIdentity锁后再次join并持有lineage share lock到commit）。前一
 stage失败不得读取或暴露后一stage事实；特别是proof失败不解析JSON、不查credential，F0失败不查
 NodeIdentity，identity失败不查session。A19 authentication 得到eligible Node后才按`node_id`取得per-Node
 admission。没有 handler admission等待队列；跨replica并发不靠内存cap证明唯一性，仍由§3/§6相同的
@@ -437,6 +438,7 @@ transaction，禁止在 commit 前后分拆 attestation、read model、session l
 
 ```text
 authenticated current NodeIdentity FOR UPDATE
+-> exact active credential lineage FOR SHARE（A19 auth适用时）
 -> current AgentSession
 -> Node observation receive-state
 -> DesiredReadState / AdmissionInventoryState（适用时）
@@ -463,10 +465,12 @@ error stage：为遵守DAG可先仅按主键取得Volume/Disk锁，但在revisio
 比较、按row存在性分支或渲染任何volume/postcondition error；完整authority facts只在最后postcondition
 stage读取使用。
 
-`NodeIdentity` lock是A23后每Node assigned-set/placement的唯一serialization前缀，不是新的
+`NodeIdentity` lock是A23后每Node current assigned full Desired的唯一serialization前缀，不是新的
 observation authority。Desired read、full/partial observation、AgentSession registration/replacement、policy apply和
-placement commit都必须先锁定并重验authenticated Node的current `NodeIdentity`，再按上述顺序
-取AgentSession/receive/cursor rows；任何事务都不得先锁AgentSession、receive-state、cursor或Desired后
+任何会写old/new assigned current Desired任一字段的commit都必须先锁定并重验authenticated/affected Node的
+current `NodeIdentity`，再按上述顺序
+取exact active credential lineage（仅A19-auth path；其他路径跳过）、AgentSession/receive/cursor rows；任何事务都不得先锁credential lineage、
+AgentSession、receive-state、cursor或Desired后
 反向取NodeIdentity。identity在auth与transaction之间retire/rotate时，锁后重验拒绝旧事实，
 不得用auth时的cached row。
 
@@ -474,7 +478,13 @@ placement commit都必须先锁定并重验authenticated Node的current `NodeIde
 observation先提交时create/apply在锁后看到new receive/admission facts；create/apply先提交时
 observation在锁后看到new assigned set/policy并按同一个current contract重新判定。后一方可返回
 stale/changed并fresh retry，但不存在`AgentSession -> NodeIdentity`与`NodeIdentity -> AgentSession`
-同时等待的环。
+或`credential lineage -> NodeIdentity`与正序同时等待的环。
+
+这里的“任一字段”包括placement/shape以外的target、route、volume intent、disk/disposition、require-idle和
+任何仍使`DesiredReadSnapshot` canonical bytes/spec digest变化的字段。writer从无锁snapshot得到old/new
+assigned node并按node ID锁全后，必须重读current Desired；affected set变化就rollback/fresh retry。
+因此non-shape revision与Cat-create也覆盖两种barrier顺序：revision先提交时create只能读取new full spec；
+create先提交时revision在同一NodeIdentity后看到new assigned set，二者都不得死锁或让observation接受混合集合。
 
 事务只做同一Control PostgreSQL中的Control Store/Volume Authority I/O，不访问filesystem、Node、object
 store、provider或Gateway。
@@ -807,6 +817,9 @@ inventory还必须覆盖没有Pending Operation（包括已有Succeeded/Failed O
 - observation与Cat-create、observation与policy apply各以两种先取得NodeIdentity的顺序做并发barrier
   test；后一方只能在锁后看到前一方新facts并commit或closed retry，不允许
   AgentSession/receive-state -> NodeIdentity逆序、deadlock或用锁前cache判定；
+- 对shape/placement不变但target、route、volume intent、disk/disposition或require-idle变化的revision，分别与
+  Cat-create及full observation做两个先提交方向；读取方只能看到完整old或new full Desired，writer发现
+  pre-read affected node变化只能整笔fresh retry，不能先锁Desired再反取NodeIdentity；
 - full接受事务的每一个write point做crash injection，恢复后只能看到全旧或全新；
 - 一个合法credential用连续partial轮换新cat ID全部按最小ID closed error拒绝，row数始终不超过最近full
   的runtime集合；下一次full才可改变membership；

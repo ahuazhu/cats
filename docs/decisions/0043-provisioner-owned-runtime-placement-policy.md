@@ -24,8 +24,10 @@ Node自报或本地配置，无法阻止Node给自己扩容/uncordon，多Contro
 2. 自动化provisioner使用deployment-scoped Ed25519签名，private key只在central IaC；人类变更另可使用
    ADR-0006 admin Organization中current active membership且含exact `cats:fleet:admin` permission的WorkOS身份；
    每次apply都online验证，不信任sealed stale session。两者进入同一个typed principal和apply
-   transaction；static bearer、Workspace token及A19 Node proof拒绝。provisioner trust ID/SPKI在Control
-   Store保留all-history active/retired tombstone，跨release不可重用。
+   transaction；static bearer、Workspace token及A19 Node proof拒绝。provisioner trust使用单调revision与
+   expected previous active-set CAS；ID/SPKI在Control Store保留all-history active/retired tombstone，跨release
+   不可重用，单个replica的bundle缺项不能隐式retire全局key。machine apply commit还会锁住并重验exact active
+   trust row，关闭认证后并发retire窗口。
 3. NodeIdentity初始provision与revision-1 cordoned policy同一transaction。policy update用expected revision；
    capacity/capability/CIDR只在cordoned且current assigned set为空时改变。credential rotation和retire复用A19a
    lineage并与policy/Create在NodeIdentity row串行。V1 Node provision/rotation只接受public key，
@@ -41,8 +43,8 @@ Node自报或本地配置，无法阻止Node给自己扩容/uncordon，多Contro
    slot释放还要求new full inventory证明旧tap/residue消失。
 6. Cat-create commit继续遵守ADR-0032/0042：先锁NodeIdentity，再按AgentSession/observation
    receive-cursor/HostFenceEvent顺序重验policy、A20 facts、post-set、capacity和exact slot，最后进入
-   Volume。所有session/observation和会改assigned set/shape的Desired mutation使用同一NodeIdentity-first
-   DAG；不增加scheduler table/lease/boolean。
+   Volume。所有session/observation和任何写old/new assigned current Desired任一字段的mutation使用同一
+   NodeIdentity-first DAG；即使placement/shape不变也不能先锁Desired。不增加scheduler table/lease/boolean。
 7. Node只消费Desired中的exact NetworkConfig。旧FNV/cat-ID推导和`--ch-network-cidr`在A23上线前删除；mixed
    authority部署保持cordoned。
 

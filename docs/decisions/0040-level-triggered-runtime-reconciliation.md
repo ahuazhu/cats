@@ -102,6 +102,8 @@ Node ID分页选择，Active HostFenceEvent的Node不能成为target，并在Nod
 AgentSession/observation receive-cursor/event统一顺序重验。每Node post-mutation assigned set最多
 1024，same-node shape change、migration/takeover/retry都以exact current Desired CAS和server-derived source
 exclusion重算。heartbeat、legacy Node row、Node自报数字、本地CIDR推导和scheduler reservation都不是authority。
+任何会写old/new assigned current Desired的mutation都先按Node ID锁NodeIdentity，即使只改变target、route、
+volume intent、disk/disposition、require-idle或其他non-shape字段；锁后affected set变化则fresh retry。
 
 Cat create把Cat、current完整Desired、runtime Operation、generation-zero且Unowned的唯一Root
 Disk/Volume和exact API result放在同一PG commit；不留下半套identity。Root没有Persistent

@@ -156,6 +156,13 @@ hostname/IP 注册都不允许。credential 轮换是对同一 `NodeIdentity` �
 V1唯一machine authentication adapter和exact proof-to-credential映射见
 [Agent Registration Transport §4](agent-registration-transport-v1.md#4-per-node-request-proof-adapter)。
 
+A23之后，任何mutation只要会写old或new placement为assigned的current完整
+`DesiredRuntimeSpec`任一字段，就必须在任何Desired/Volume业务锁前，先按node ID锁定old/new affected
+`NodeIdentity`并在锁后重读full Desired；这包括placement/shape不变的target、route、volume intent、
+disk/disposition、require-idle和其他revision。pre-read affected set变化必须rollback并fresh retry，不能
+`Desired -> NodeIdentity`反向补锁。完整DAG与unassigned例外由
+[Runtime Placement Policy §6](runtime-placement-policy-v1.md#6-cat-create-commit与所有desired-mutation)冻结。
+
 Agent 在读取任何 runtime state 前，必须在由 `state_path_id` 决定的固定、受保护路径取得
 Host 级 kernel 排他锁，并核对本地 root-owned identity。命令行更换 state directory 不能绕过
 排他锁。同一 Host 的第二个 Agent 必须启动失败。

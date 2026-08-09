@@ -113,8 +113,10 @@ fsync session。完成前不得发送session-bound请求、启动VMM或打开任
 6. 把Store outcome按§5映射为唯一HTTP response。
 
 proof未通过时不得解析body内容、查询NodeIdentity或暴露credential是否存在。通过proof不代表identity
-eligible。Store的唯一顺序是：(a) 按credential ID锁定identity并exact比较credential binding与
-`attempt.node_id`，失败为identity not eligible；(b) 查`(node_id, registration_attempt_id)`，exact attempt返回
+eligible。Store只用credential ID定位candidate node ID，随后固定顺序是：(a) 先锁该`node_identities`
+current row，再锁并join A23 `runtime_node_credential_lineage` exact ID/node/SPKI digest row；provisioned identity
+要求它是唯一active row，retired identity只接受current binding对应的exact retired row，任一不等为identity
+not eligible；(b) 查`(node_id, registration_attempt_id)`，exact attempt返回
 immutable result，binding不同返回registration attempt conflict；(c) 对未命中attempt检查provisioned state与
 `immutable_host_id`；(d) 检查approved guest config digest；(e) 锁current session并检查expected epoch，最后才
 分配epoch/deadline和写入。adapter不得使用body中的`node_id`、`immutable_host_id`、hostname、IP或TLS client
@@ -326,6 +328,12 @@ Store all-history唯一、active/retired lineage DDL与不可reverse-CAS规则�
 proof adapter不会为`ProviderPrincipal`或已rotation移出current NodeIdentity的历史key建立fallback。
 最终retire仍保留exact current binding时，只保留本规格已冻结的retired identity exact-attempt replay；
 这不是new attempt、eligibility、rotation回滚或credential重用。
+
+所有A19-authenticated internal route把proof得到的exact credential ID/SPKI digest传入业务transaction；该
+transaction在`NodeIdentity` lock后必须按上述join重验current active lineage并持有lineage share lock到commit。
+只有retired identity的步骤(b) exact immutable registration-attempt replay使用exact retired lineage；其他
+retired/history row一律不能认证。`node_identities` current credential与lineage的deferred composite FK、
+all-history唯一和rotation/retire原子边界由A23 §3.4冻结。
 
 Node不得从`--node-id`、hostname/IP或provider metadata补出该NodeIdentity。production local artifact、
 filesystem校验、initial no-replace provision、credential rotation和retire/Host replacement规则以

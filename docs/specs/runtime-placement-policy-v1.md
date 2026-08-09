@@ -260,6 +260,7 @@ FleetPolicyPrincipal =
     kind: "deployment_provisioner",
     deployment_id: Id,
     credential_id: Id,
+    public_key_spki: Base64UrlNoPad,
     public_key_spki_sha256: Sha256Digest
   }
 | {
@@ -279,12 +280,23 @@ file，使用Runtime canonical JSON，closed schema如下：
 RuntimeProvisionerTrustBundle {
   version: 1,
   deployment_id: Id,
+  trust_revision: Epoch,
+  expected_previous: null | {
+    trust_revision: Epoch,
+    active_set_sha256: Sha256Digest
+  },
   credentials: [RuntimeProvisionerCredential]
 }
 
 RuntimeProvisionerCredential {
   credential_id: Id,
   public_key_spki: Base64UrlNoPad
+}
+
+RuntimeProvisionerActiveSet {
+  version: 1,
+  deployment_id: Id,
+  credentials: [RuntimeProvisionerCredential]
 }
 ```
 
@@ -294,9 +306,14 @@ RuntimeProvisionerCredential {
 startup fail closed。private half只在central IaC/provisioning environment，绝不进入Control config、Node、Guest、
 日志或request body。
 
+`active_set_sha256 = SHA-256(CatsCanonicalJson(RuntimeProvisionerActiveSet))`，projection只删除
+`trust_revision/expected_previous`，不能重排或过滤credentials。revision 1必须
+`expected_previous=null`；revision大于1必须有non-null previous，其`trust_revision`恰好是
+checked `bundle.trust_revision - 1`。这两个revision字段都使用`Epoch`，不得wrap或跳号。
+
 同一Control schema/cell的`deployment_id`不可变。不能只把candidate bundle与“上一个release”比较；
 每次production startup必须在打开admin listener前把完整bundle下述持久all-history lineage
-进行同步。一个schema只允许一个deployment identity，credential ID和SPKI digest各自在该
+进行CAS。一个schema只允许一个deployment identity，credential ID、exact SPKI和SPKI digest各自在该
 schema全历史唯一；它们在移除、retire、多个release和多次rotation后也永不可重用。
 
 最小PostgreSQL DDL固定为（`Id`、digest和time的closed decoder/check仍必须在Store边界执行）：
@@ -305,8 +322,40 @@ schema全历史唯一；它们在移除、retire、多个release和多次rotatio
 CREATE TABLE runtime_provisioner_deployment_identity (
   singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
   deployment_id TEXT NOT NULL UNIQUE,
+  current_trust_revision BIGINT NOT NULL CHECK (current_trust_revision > 0),
+  current_active_set_sha256 TEXT NOT NULL
+    CHECK (current_active_set_sha256 ~ '^sha256:[0-9a-f]{64}$'),
   first_committed_at_unix_ms BIGINT NOT NULL CHECK (first_committed_at_unix_ms >= 0)
 );
+
+CREATE TABLE runtime_provisioner_trust_revisions (
+  deployment_id TEXT NOT NULL REFERENCES runtime_provisioner_deployment_identity(deployment_id)
+    ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+  trust_revision BIGINT NOT NULL CHECK (trust_revision > 0),
+  active_set_sha256 TEXT NOT NULL
+    CHECK (active_set_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+  expected_previous_trust_revision BIGINT NULL
+    CHECK (expected_previous_trust_revision > 0),
+  expected_previous_active_set_sha256 TEXT NULL
+    CHECK (expected_previous_active_set_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+  committed_at_unix_ms BIGINT NOT NULL CHECK (committed_at_unix_ms >= 0),
+  PRIMARY KEY (deployment_id, trust_revision),
+  UNIQUE (deployment_id, trust_revision, active_set_sha256),
+  CHECK (
+    (trust_revision = 1 AND expected_previous_trust_revision IS NULL
+      AND expected_previous_active_set_sha256 IS NULL) OR
+    (trust_revision > 1
+      AND expected_previous_trust_revision = trust_revision - 1
+      AND expected_previous_active_set_sha256 IS NOT NULL)
+  )
+);
+
+ALTER TABLE runtime_provisioner_deployment_identity
+  ADD CONSTRAINT runtime_provisioner_current_trust_revision
+  FOREIGN KEY (deployment_id, current_trust_revision, current_active_set_sha256)
+  REFERENCES runtime_provisioner_trust_revisions(
+    deployment_id, trust_revision, active_set_sha256)
+  ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED;
 
 CREATE TABLE runtime_provisioner_credential_lineage (
   credential_id TEXT PRIMARY KEY,
@@ -323,12 +372,28 @@ CREATE TABLE runtime_provisioner_credential_lineage (
 );
 ```
 
-首次启动在一个transaction内插入immutable deployment row和bundle的全部active key。后续
-启动同样锁singleton row并逐字段同步：实现从canonical SPKI DER独立重算digest；已见ID只能匹配
-原exact SPKI与digest；已见SPKI或digest只能匹配原ID；新ID+SPKI+digest插入active；本次bundle中缺席的active row单调转retired并写该次
-DB now。retired row、ID或SPKI永不返回active，lineage/tombstone永不GC；对ID、SPKI、
-deployment或时间的任何不等都fail startup。除`active -> retired`与retired time外，表内所有
-字段不可更改或删除。这不是Node heartbeat或policy写入口。
+startup CAS使用一个transaction和一次DB now，先取得
+`pg_advisory_xact_lock(hashtextextended(current_schema() || ':runtime-provisioner-trust', 0::BIGINT))`，
+再读取/锁singleton row `FOR UPDATE`，最后按credential ID锁
+全部current/candidate lineage。实现从canonical SPKI DER独立重算digest，并从全部`state=active` row按
+credential ID重建current active-set canonical bytes；row里的current digest、revision receipt和重建值
+任一不等都是stored corruption并fail startup。closed outcome只有：
+
+- empty schema只接受revision 1 + null previous；同一commit插入deployment row、revision receipt和全部
+  active lineage；
+- candidate revision等于current revision时，只允许bundle expected-previous、active-set digest和每个
+  ID/exact SPKI/digest逐字段等于该revision receipt/current active set的exact replay，零row mutation；
+- candidate revision恰好是checked current+1时，`expected_previous`必须逐字段等于current
+  revision+active-set digest，且candidate active set必须与current不同。已见ID只能匹配原exact
+  SPKI/digest；已见SPKI或digest只能匹配原ID；retired值不能重新出现。transaction插入fresh key、把
+  candidate缺席的current active row单调转retired、插入immutable revision receipt，最后以exact
+  old revision+digest CAS推进singleton current pointer；
+- older revision、gap、same revision不同set、previous mismatch或并发输掉CAS都fail startup且零mutation。
+
+因此一个replica仅因自己的bundle缺少另一把active key，不能把它全局retire；只有central IaC发布的next
+revision和exact previous-set CAS能改变active set。revision receipt、retired row、ID或SPKI永不删除/
+重激活；除lineage `active -> retired`与retired time、singleton exact forward CAS外，字段不可更改。
+这不是Node heartbeat或policy写入口。
 
 machine request必须恰有一个`Cats-Provisioner-Credential-Id`和一个
 `Cats-Provisioner-Signature` header；不得有`Authorization`、Cookie或A19的三个
@@ -352,13 +417,15 @@ signed_request =
 
 没有timestamp是有意的：TLS防窃取，method/path/deployment/key/body binding防搬用，Store的`apply_id`提供exact
 replay/conflict。proof格式/签名失败统一401，不查询NodeIdentity或apply row。签名通过后，
-每次request（包括exact apply replay）还必须读取§3.2持久trust lineage，要求该
-`deployment_id`、credential ID和SPKI digest逐字段等于current `active` row。数据库不可用返回503；
+每次request（包括exact apply replay）还必须先读取§3.2持久trust lineage，要求该
+`deployment_id`、credential ID、exact SPKI和SPKI digest逐字段等于current `active` row，并把这四项放进
+typed `FleetPolicyPrincipal`交给Store。数据库不可用返回503；
 retired/mismatch返回401，不得因为本地旧bundle还有key而接受。
 
-trust key rotation使用overlap：先让每个replica部署含old+new的bundle并把new row同步为active，
+trust key rotation使用显式revision：先让每个replica部署含old+new的next-revision bundle；第一台以
+expected previous-set CAS加入new，其他replica只能exact replay该revision，
 再切换IaC signer并用new key完成或重放同一apply，确认没有old-key pending后才部署移除old
-的bundle；首个新replica将old持久retire后，仍在运行的旧replica也因per-request lineage检查立即
+的下一revision bundle；首个新replica CAS后old才持久retire，仍在运行的旧replica也因per-request lineage检查立即
 拒绝old。retired tombstone跨后续release永不重用。apply identity不包含credential ID，所以合法
 new key可重放old key response-loss；审计仍保留首次principal。
 
@@ -449,13 +516,13 @@ RuntimeNodeAuthorityApplyRecord {
 ```
 
 Node credential不只保存在current `NodeIdentity`中。下列all-history lineage是clean-slate schema的
-必需表；`runtime_node_identities`是实现`NodeIdentity`的主表，不得用无外键的日志代替：
+必需表；现有`node_identities`是实现`NodeIdentity`的主表，不得另造同义表或用无外键日志代替：
 
 ```sql
 CREATE TABLE runtime_node_credential_lineage (
   credential_id TEXT PRIMARY KEY,
-  node_id TEXT NOT NULL REFERENCES runtime_node_identities(node_id)
-    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  node_id TEXT NOT NULL REFERENCES node_identities(node_id)
+    ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
   public_key_spki_sha256 TEXT NOT NULL UNIQUE,
   state TEXT NOT NULL CHECK (state IN ('active', 'retired')),
   first_committed_at_unix_ms BIGINT NOT NULL CHECK (first_committed_at_unix_ms >= 0),
@@ -463,16 +530,40 @@ CREATE TABLE runtime_node_credential_lineage (
     retired_at_unix_ms IS NULL OR retired_at_unix_ms >= first_committed_at_unix_ms),
   CHECK ((state = 'active' AND retired_at_unix_ms IS NULL) OR
          (state = 'retired' AND retired_at_unix_ms IS NOT NULL)),
-  UNIQUE (node_id, credential_id)
+  UNIQUE (node_id, credential_id),
+  UNIQUE (node_id, credential_id, public_key_spki_sha256, state)
 );
 
 CREATE UNIQUE INDEX runtime_node_one_active_credential
   ON runtime_node_credential_lineage(node_id) WHERE state = 'active';
+
+ALTER TABLE node_identities
+  ADD COLUMN credential_lineage_state TEXT NULL,
+  ADD CONSTRAINT node_identity_credential_lineage_state_matches_identity CHECK (
+    (credential_kind = 'public_key' AND credential_lineage_state IS NOT NULL AND
+      ((state = 'provisioned' AND credential_lineage_state = 'active') OR
+       (state = 'retired' AND credential_lineage_state = 'retired'))) OR
+    (credential_kind = 'provider_principal' AND credential_lineage_state IS NULL)
+  );
+
+ALTER TABLE node_identities
+  ADD CONSTRAINT node_identity_current_public_key_lineage
+  FOREIGN KEY (
+    node_id, credential_id, credential_public_key_spki_sha256, credential_lineage_state)
+  REFERENCES runtime_node_credential_lineage(
+    node_id, credential_id, public_key_spki_sha256, state)
+  ON UPDATE NO ACTION ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED;
 ```
 
 `credential_id`和`public_key_spki_sha256`各自在整个Control schema的全历史中唯一，不仅在
 一个Node或active set中唯一。只有`active -> retired`和首次retired timestamp可变；ID、Node、SPKI、
 first time都immutable，row永不删除/重激活，NodeIdentity也因外键不能在lineage仍存在时GC。
+两个deferred FK使同一transaction可以创建/轮换/retire两侧，但commit时每个PublicKey
+`node_identities` current credential必须逐字段指向exact lineage：provisioned只能指向唯一active row，
+retired只能指向其exact retired row；partial update、错Node/digest/state或active row不等于current binding
+都由constraint abort，不能靠应用层best effort检查。composite FK的`NO ACTION`是有意的：rotation事务内
+old lineage state和current binding可先后更新，到deferred commit一起检查；不能改成会在中间态立即拒绝的
+`RESTRICT`。
 `provision`在identity/policy同一commit插入active row；rotation在同一commit把exact old row转为
 retired、插入fresh active row并替换NodeIdentity current binding；retire在同一commit把exact active
 row转retired并retire identity。任何历史ID或SPKI命中，即使来自另一Node或已retire row，也是
@@ -482,9 +573,17 @@ row转retired并retire identity。任何历史ID或SPKI命中，即使来自另�
 完整typed request，不能只信digest。row不更新、不因retire或trust-key rotation删除。
 它是fleet/admin domain identity，不是ADR-0040的Workspace `ApiIdempotencyResult`，不伪造system workspace。
 
-每次请求在一个PG transaction中先对`apply_id`取得transaction reservation并读取record：exact typed request
-命中立即返回原stored 200或409，即使Node已retire或policy后来提高revision；同ID不同request立即409，二者都不读current
-Node/policy。miss且mutation带new credential时，先对new credential ID和SPKI digest取得下述全局
+每次请求在一个PG transaction中先对`apply_id`取得transaction reservation。若typed principal是
+deployment provisioner，事务随后按固定顺序锁
+`runtime_provisioner_deployment_identity FOR SHARE -> exact runtime_provisioner_credential_lineage FOR SHARE`，
+从principal的canonical SPKI独立重算digest，并重验deployment、credential ID、exact SPKI、digest和
+`state=active`全部逐字段相同；这两把row lock持有到apply/domain/result commit。锁后不等属于
+`401 authentication_failed`并整笔rollback，零apply/domain/audit row，不能持久为authority precondition。
+WorkOS principal不走trust rows。
+
+完成上述current-auth revalidation后才读取apply record：exact typed request命中立即返回原stored 200或409，
+即使Node已retire或policy后来提高revision；同ID不同request立即409，二者都不读current Node/policy。
+miss且mutation带new credential时，先对new credential ID和SPKI digest取得下述全局
 lineage locks；随后才按`node_id`锁NodeIdentity coordination row（initial absent使用node-scoped advisory lock），
 再按mutation读取exact最小facts：provision只读identity/policy absence；policy update读current policy和按cat ID
 排序的current assigned Desired；rotation/retire在§6统一顺序下另读current AgentSession deadline。cordon不因session/
@@ -499,8 +598,15 @@ NodeIdentity，所以锁后facts不会被另一个合法Control replica越过。
 
 apply reservation固定为
 `pg_advisory_xact_lock(hashtextextended(current_schema() || ':runtime-node-authority-apply:' || $1, 0::BIGINT))`，
-其中`$1`是32 lowercase hex `apply_id`；随后读取record。primary key只作invariant backstop，不能在unique
+其中`$1`是32 lowercase hex `apply_id`；随后先完成上述current-auth transaction revalidation，再读取record。
+primary key只作invariant backstop，不能在unique
 violation abort后补写result。
+
+trust revision CAS从不取得apply-ID lock；initial/rotation都先取上述schema-scoped trust advisory lock，再锁
+deployment singleton `FOR UPDATE`（存在时）和credential rows。
+因此与machine apply没有lock cycle。apply先取得singleton/credential share lock时，retirement必须等其
+domain+result commit后才能前进；retirement先提交时，即使adapter早先已验证signature，apply事务锁后也只能
+看到retired并401 rollback。不得在Store transaction外缓存`active=true`越过这个barrier。
 
 new-credential lineage locks固定对`("credential_id", new_credential_id)`和
 `("public_key_spki_sha256", new_spki_digest)`按整个tuple的ASCII octet order排序后逐个执行：
@@ -863,14 +969,24 @@ safety，也不允许为“更优”placement中止一个仍完全有效的plan�
 合法same-name 409分支不改变Desired，按Volume Authority现有graph锁序持久exact 409 result，并且不读取或
 消费已失效placement plan。事务内idempotency hit也直接丢弃candidate。
 
-policy apply、Agent registration/session replacement、Desired read cursor、observation acceptance和每个会增加/
-删除/换Node/改shape的Desired mutation都以NodeIdentity作为唯一per-Node serialization row，并共用
-`NodeIdentity -> AgentSession -> observation receive/cursor -> HostFenceEvent -> Volume`前缀。不能
-`AgentSession|receive-state|Desired|HostFenceEvent -> NodeIdentity`逆序。一个HostFenceEvent的新建、
+policy apply、Agent registration/session replacement、Desired read cursor、observation acceptance和
+**任何写current full Desired任一字段**的mutation，只要old或new placement是assigned，都以
+NodeIdentity作为唯一per-Node serialization row，并共用
+`NodeIdentity -> current credential lineage（A19-auth path）-> AgentSession -> observation receive/cursor ->
+HostFenceEvent -> Volume`前缀；不涉及的row跳过。不能
+`credential-lineage|AgentSession|receive-state|Desired|HostFenceEvent -> NodeIdentity`逆序。一个HostFenceEvent的新建、
 `Active -> Rejoined`或任何会改变placement eligibility的state/lineage mutation也必须先锁该
 NodeIdentity，再锁event；这使target NodeIdentity锁下的“无Active event”重验不会被并发插入或
 rejoin越过。只消费已有event且不改event eligibility state的Volume authorization继续可按
 `HostFenceEvent -> Authorization -> Volume`走，因为它不会再反向取NodeIdentity。
+
+Desired writer的affected set是old assigned node与new assigned node的并集：insert只取new，remove只取old，
+same-node lifecycle/route/volume-intent/disk/disposition/require-idle/target或其他non-shape revision也必须取该
+same Node，move取source+target并按node ID排序。writer可以在无锁snapshot定位candidate set，但必须在取得
+全部NodeIdentity后重读current full Desired；若old placement或应锁集合不同，整笔rollback并从fresh
+snapshot重试，不能先锁Desired再补NodeIdentity。只有old/new都unassigned且不消费Node evidence的mutation可
+跳过该前缀。non-shape mutation不需要伪造placement plan，但仍以exact current full Desired CAS写完整new
+revision；这样A20 full snapshot、policy/create capacity read与每个字段变化都在线性化点两侧看到全旧或全新。
 
 迁移/Host takeover/placement retry向target增加assignment时使用本planner和fresh NetworkConfig；
 从source移除assignment在同一事务锁source并完成exact old Desired CAS。
@@ -937,15 +1053,55 @@ policy_octets = 497
 policy_sha256 = sha256:e6f9c7b26334e4728119a96a40579f8f6ba3862c557160eb078cbc97428ab620
 ```
 
-**Provisioner trust bundle：**
+**Provisioner active set 与revisioned trust bundle：**
 
 ```json
 {"credentials":[{"credential_id":"provisioner_a","public_key_spki":"MCowBQYDK2VwAyEA11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}],"deployment_id":"deployment_a","version":1}
 ```
 
 ```text
-trust_bundle_octets = 174
-trust_bundle_sha256 = sha256:e348b9d89a43efd190cfc8443abdd2dcb4e14bf21537f5bfef0ec82a1d70a144
+active_set_octets = 174
+active_set_sha256 = sha256:e348b9d89a43efd190cfc8443abdd2dcb4e14bf21537f5bfef0ec82a1d70a144
+```
+
+```json
+{"credentials":[{"credential_id":"provisioner_a","public_key_spki":"MCowBQYDK2VwAyEA11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}],"deployment_id":"deployment_a","expected_previous":null,"trust_revision":1,"version":1}
+```
+
+```text
+initial_trust_bundle_octets = 218
+initial_trust_bundle_sha256 = sha256:f054993251d9e78ea0cc9169ec5156e36465b874257f946d970a624d0b92b49a
+```
+
+revision-2 overlap的active set canonical bytes为：
+
+```json
+{"credentials":[{"credential_id":"provisioner_a","public_key_spki":"MCowBQYDK2VwAyEA11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"},{"credential_id":"provisioner_b","public_key_spki":"MCowBQYDK2VwAyEAPUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw"}],"deployment_id":"deployment_a","version":1}
+```
+
+```text
+overlap_active_set_octets = 288
+overlap_active_set_sha256 = sha256:707f709222d120452e07a4e999ea540ad214d43fc0243b30a9c65043ec6c96fd
+```
+
+```json
+{"credentials":[{"credential_id":"provisioner_a","public_key_spki":"MCowBQYDK2VwAyEA11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"},{"credential_id":"provisioner_b","public_key_spki":"MCowBQYDK2VwAyEAPUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw"}],"deployment_id":"deployment_a","expected_previous":{"active_set_sha256":"sha256:e348b9d89a43efd190cfc8443abdd2dcb4e14bf21537f5bfef0ec82a1d70a144","trust_revision":1},"trust_revision":2,"version":1}
+```
+
+```text
+overlap_trust_bundle_octets = 442
+overlap_trust_bundle_sha256 = sha256:931a8758e7b0c82208bb23b8a831b4e97532747b7e7c3df61e26f973ca6eeca0
+```
+
+Store transaction收到并持久审计的deployment-provisioner principal为：
+
+```json
+{"credential_id":"provisioner_a","deployment_id":"deployment_a","kind":"deployment_provisioner","public_key_spki":"MCowBQYDK2VwAyEA11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo","public_key_spki_sha256":"sha256:06e3fd8fda29bb60ab59557de61edb0aecdb231134be30e75b455f8e1b792fa9"}
+```
+
+```text
+provisioner_principal_octets = 275
+provisioner_principal_sha256 = sha256:407a741259f6155606c029218830fce0319cd6884ec8500490ccda36f555490d
 ```
 
 **Update-policy apply/result：**
@@ -1034,17 +1190,17 @@ body_sha256 = sha256:a4636d17031808e21932b2f54dc3b0d104243a1e9e56e33962f678cd4d8
 
 | boundary | required oracle |
 |---|---|
-| machine authority | provisioner signature fixed vector；wrong deployment/key/path/body拒绝；local bundle key在persisted lineage已retire时每个replica立即拒绝；DB outage下503且不读apply；static admin/service bearer、workspace token和A19 Node proof均拒绝 |
+| machine authority | provisioner signature fixed vector；wrong deployment/key/path/body拒绝；typed principal携带deployment/ID/exact SPKI/digest；Store apply锁住并重验exact active lineage到domain/result commit；apply-first后retire、retire-first后401零写两个barrier顺序；local bundle key已retire时每个replica立即拒绝；DB outage下503且不读apply；static admin/service bearer、workspace token和A19 Node proof均拒绝 |
 | WorkOS authority | Cookie/JWT/provisioner三形态互斥，duplicate/mixed统一401；每次apply/replay都online验current active admin-org membership + exact `cats:fleet:admin`；role slug、token/session stale permission不算；current deny为403，JWKS/WorkOS/API outage/timeout/rate-limit为503且零Store写 |
-| route/trust bounds | query、encoded/trailing path、wrong method/media mapping；chunked/Content-Length实际65536进decoder、65537为413；success/error cap叉rotate/admin-error fixed vectors；trust bundle 16384边界、metadata/path/read-change fail startup；persisted deployment singleton与DDL check/unique/FK/projection corruption fail closed |
-| trust all-history | 跨三个release做old -> overlap old+new -> new-only；两replica不同版本仍以持久active/retired为准；已移除ID、已retire SPKI、same ID/different SPKI、different ID/same SPKI和deployment改名均fail startup；tombstone不GC/不重激活 |
+| route/trust bounds | query、encoded/trailing path、wrong method/media mapping；chunked/Content-Length实际65536进decoder、65537为413；success/error cap叉rotate/admin-error fixed vectors；trust bundle 16384边界、metadata/path/read-change fail startup；active-set/initial/overlap/principal fixed vectors；persisted deployment current-pointer/revision-receipt/lineage DDL check/unique/FK/projection corruption fail closed |
+| trust revision/history | revision1 null-previous；old -> overlap old+new -> new-only使用连续revision/exact previous-set CAS；两个replica同revision exact replay零写；same revision不同set、old-only stale restart、gap、wrong previous和两个不同next-set竞态输家均fail startup且不能retire current key；已移除ID、已retire SPKI、same ID/different SPKI、different ID/same SPKI和deployment改名均fail；tombstone/revision receipt不GC/不重激活 |
 | apply replay | response loss exact replay原200或persisted precondition 409；same apply ID异payload 409；new trust key可重放old-key apply；revision/credential CAS conflict零domain写入且保存rejected outcome |
 | official CLI | pending在首send前fsync；canonical bound 200和带exact单一apply-ID header的persisted precondition 409才先durably写resolution再清pending；409 header缺失/重复/错值、EOF/reset/timeout/redirect/401/403/429/5xx/apply conflict/超限或mismatched 200都保留same body/apply ID；apply conflict报警不换ID；crash每个fsync窗口都不重新结算 |
 | admission/shutdown | global 32、每principal 4恰好边界；无等待，global满503/per-principal满429且Retry-After 1、零apply；cancel在commit-send前回滚，之后permit留到resolution；shutdown拒绝新请求、join可能commit的job，30000 ms未解析只能非零退出 |
-| Node credential lineage | clean DDL/unique/FK；provision/rotation只接受PublicKey，ProviderPrincipal持久409；same/different Node下的历史ID复用、same SPKI换ID、old rotation/retire ID或SPKI重用都持久409且零identity/policy写；constraint直接注入使transaction fail而不伪造result |
+| Node credential lineage | exact现有`node_identities`表名；deferred circular/composite FK令current public-key ID/digest/state只指向同Node exact active/retired lineage；A19锁后join且只给retired exact-attempt replay例外；provision/rotation只接受PublicKey，ProviderPrincipal持久409；same/different Node历史ID/SPKI重用均持久409；partial/错state constraint注入整笔abort且不伪造result |
 | A19a lifecycle | atomic identity+cordoned policy；cordoned/drained/expired-session rotation；pre-commit可保留old，commit后只能forward-complete new；old永久retired无reverse CAS；new half丢失只能retire/new lineage；crash windows只重放same apply/private half |
 | policy mutation | cordon与create两种lock先后各自线性；有assigned set时不能改capacity/capability/CIDR；uncordon不能夹带静态变化 |
-| lock DAG | registration/Desired read/observation/policy/create都是NodeIdentity -> AgentSession -> receive/cursor；observation与create、observation与policy各跑两种先提交顺序，后者只看new facts/retry且无deadlock；连续serialization retry都从fresh DB now开始 |
+| lock DAG | registration/Desired read/observation/policy/create都是NodeIdentity -> credential lineage -> AgentSession -> receive/cursor（不涉及lineage的路径跳过）；observation与create、observation与policy各跑两种先提交顺序；placement/shape不变的target/route/volume-intent/disk/disposition/require-idle revision与create也跑双向barrier，只能看到完整old/new或fresh retry；无Desired -> NodeIdentity反序/deadlock，连续serialization retry都从fresh DB now开始 |
 | pages/replicas | 0、1、64、65和超过1024 Node；keyset无漏重；一个snapshot/DB now；两个Control replica稳定选同一最小eligible node；无fleet cap |
 | capacity/count | lifecycle各态都计完整shape；equality fit、超1拒绝；vCPU/memory分别边界；checked sum/add/sub/count overflow fatal；count 1023->1024成功、1024->1025在plan和commit均零business/result；stored 1025使replica unready；不读heartbeat/legacy node capacity |
 | post-mutation plan | same-node resize只评估current node、精确`total-old+new`且保留network；planned migration/takeover/retry从source删、target加并fresh network/revision/epoch；current revision/digest/placement/old shape/network任一变化就stale；两replica resize/move只一个CAS胜出；纯remove也锁source NodeIdentity |

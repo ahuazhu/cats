@@ -36,8 +36,9 @@ Control Store 与 MetadataStore 是逻辑边界，不是两套提交authority。
 pure-domain/data-row fixture，不提供Control cross-row authority。首次消费授权与`Active -> Rejoined`
 都通过唯一PG事务域的固定锁序完成。
 
-全局锁DAG是`ApiIdempotencyResult key reservation -> CatNameLock -> NodeIdentity（会改变assigned Desired或
-消费current Node evidence时）-> AgentSession -> observation receive/cursor rows（适用时）
+全局锁DAG是`ApiIdempotencyResult key reservation -> CatNameLock -> NodeIdentity（写old/new assigned
+current Desired任一字段或消费current Node evidence时）-> current credential lineage（A19 auth适用时）
+-> AgentSession -> observation receive/cursor rows（适用时）
 -> HostFenceEvent -> AuthorizationRecord -> VolumeRecord -> Control Cat/Disk/Desired/Endpoint rows ->
 DiskSnapshotRecord`；事务跳过自己不涉及的节点，同类
 多行按稳定ID排序。§3.3覆盖的Workspace product mutation先取得由认证Workspace、canonical route和`Idempotency-Key`导出的
