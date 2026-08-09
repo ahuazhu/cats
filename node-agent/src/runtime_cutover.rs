@@ -26,11 +26,10 @@ use crate::runtime::reconciliation::{
     installed_clean_slate_scanner, InstalledCleanSlateProbeConfig,
 };
 use crate::runtime_spine::{
-    ProductionRuntimeDesiredEffect, RuntimeLaunchPort, RuntimeSpineHttpClient, RuntimeSpineRunStep,
-    RuntimeSpineRunner,
+    ProductionRuntimeDesiredEffect, RuntimeLaunchPort, RuntimeSpineDeadlinePolicy,
+    RuntimeSpineHttpClient, RuntimeSpineRunStep, RuntimeSpineRunner,
 };
 
-const SCAN_DEADLINE: Duration = Duration::from_secs(5);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Fail-closed endpoint for the next signed reconciliation slice. The
@@ -60,6 +59,7 @@ pub struct SignedRuntimeCutoverConfig {
     pub guest_agent_binary: std::path::PathBuf,
     pub metering_cgroup_root: Option<std::path::PathBuf>,
     pub volume_data_authority: Arc<dyn VolumeDataAuthority>,
+    pub deadline_policy: RuntimeSpineDeadlinePolicy,
 }
 
 pub struct SignedRuntimeCutoverHandle {
@@ -196,6 +196,12 @@ fn health_router(readiness: Readiness) -> Router {
 pub async fn spawn_signed_runtime_cutover(
     config: SignedRuntimeCutoverConfig,
 ) -> anyhow::Result<SignedRuntimeCutoverHandle> {
+    // Reject an unrepresentable operator budget before registration, worker
+    // construction, or listener binding can mutate external/local state.
+    config
+        .deadline_policy
+        .deadlines_from(Instant::now())
+        .context("validate signed Runtime startup deadlines")?;
     let session = config
         .agent_registration
         .register_until_session(&config.control_plane_url)
@@ -252,10 +258,11 @@ pub async fn spawn_signed_runtime_cutover(
     // Keeping it merely in the Handle would release it early when Handle::drop
     // can only request (not await) that shutdown sequence.
     let registration_lease = config.agent_registration;
+    let deadline_policy = config.deadline_policy;
     let runner_task = tokio::spawn(async move {
         let mut runner = runner;
         let run_result = tokio::select! {
-            result = run_signed_spine(&mut runner, &runner_readiness) => result,
+            result = run_signed_spine(&mut runner, &runner_readiness, deadline_policy) => result,
             _ = &mut runner_shutdown => Ok(()),
         };
         runner_readiness.set(false);
@@ -288,48 +295,67 @@ pub async fn spawn_signed_runtime_cutover(
 async fn run_signed_spine(
     runner: &mut RuntimeSpineRunner,
     readiness: &Readiness,
+    deadline_policy: RuntimeSpineDeadlinePolicy,
 ) -> anyhow::Result<()> {
     loop {
-        let step = runner
-            .run_once_until(Instant::now() + SCAN_DEADLINE)
-            .await?;
-        if apply_readiness_policy(step, readiness)? {
-            tokio::time::sleep(RETRY_DELAY).await;
+        // Both absolute deadlines start before dispatch into the runner. Time
+        // spent waiting on its ordered journal/effect lanes is not refunded at
+        // a later blocking boundary.
+        let deadlines = deadline_policy.deadlines_from(Instant::now())?;
+        let step = runner.run_once_with_deadlines(deadlines).await?;
+        match apply_readiness_policy(step, readiness)? {
+            RuntimeLoopAction::Continue => {}
+            RuntimeLoopAction::RetryAfterDelay => tokio::time::sleep(RETRY_DELAY).await,
+            RuntimeLoopAction::WaitForIdentityRepair => {
+                // Credential/identity repair is external to the Agent session
+                // state machine. Keep the process cordoned and alive so a
+                // supervisor restart cannot silently replace the session.
+                std::future::pending::<()>().await;
+            }
         }
     }
 }
 
-/// Returns true when the caller should apply the bounded retry delay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeLoopAction {
+    Continue,
+    RetryAfterDelay,
+    WaitForIdentityRepair,
+}
+
 fn apply_readiness_policy(
     step: RuntimeSpineRunStep,
     readiness: &Readiness,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<RuntimeLoopAction> {
     match step {
         RuntimeSpineRunStep::DesiredAccepted => {
             // A fresh Desired must be reconciled and attested before the
             // process can advertise local readiness again.
             readiness.set(false);
-            Ok(false)
+            Ok(RuntimeLoopAction::Continue)
         }
         RuntimeSpineRunStep::ObservationAccepted { service_ready } => {
             readiness.set(service_ready);
-            Ok(false)
+            Ok(RuntimeLoopAction::Continue)
         }
         RuntimeSpineRunStep::ObservationReplayed
         | RuntimeSpineRunStep::EffectApplied { .. }
         | RuntimeSpineRunStep::EffectsApplied
+        | RuntimeSpineRunStep::EffectRefreshInventory { .. }
+        | RuntimeSpineRunStep::EffectReplanDesired { .. }
         | RuntimeSpineRunStep::DesiredInvalidated { .. } => {
             readiness.set(false);
-            Ok(false)
+            Ok(RuntimeLoopAction::Continue)
         }
         RuntimeSpineRunStep::RetryExact(_)
         | RuntimeSpineRunStep::ScanUnavailable(_)
         | RuntimeSpineRunStep::ScanIncomplete { .. }
         | RuntimeSpineRunStep::ScanDeadlineExceeded
+        | RuntimeSpineRunStep::EffectRetryExact { .. }
         | RuntimeSpineRunStep::EffectUnavailable { .. }
         | RuntimeSpineRunStep::EffectDeadlineExceeded { .. } => {
             readiness.set(false);
-            Ok(true)
+            Ok(RuntimeLoopAction::RetryAfterDelay)
         }
         RuntimeSpineRunStep::SessionInvalid { status, error } => {
             readiness.set(false);
@@ -342,6 +368,19 @@ fn apply_readiness_policy(
         RuntimeSpineRunStep::RouteUnavailable => {
             readiness.set(false);
             anyhow::bail!("signed Runtime routes are not deployed");
+        }
+        RuntimeSpineRunStep::EffectIdentityRepairRequired { cat_id } => {
+            readiness.set(false);
+            tracing::error!(%cat_id, "signed Runtime identity repair is required; Agent is cordoned");
+            Ok(RuntimeLoopAction::WaitForIdentityRepair)
+        }
+        RuntimeSpineRunStep::EffectSessionReplacementRequired { cat_id } => {
+            readiness.set(false);
+            anyhow::bail!("signed Runtime session replacement is required for {cat_id}");
+        }
+        RuntimeSpineRunStep::EffectStopped { cat_id, reason } => {
+            readiness.set(false);
+            anyhow::bail!("signed Runtime effect stopped for {cat_id}: {reason:?}");
         }
     }
 }
@@ -555,6 +594,11 @@ mod tests {
             guest_agent_binary: "/opt/cats/bin/cats-guest-agent".into(),
             metering_cgroup_root: None,
             volume_data_authority: Arc::new(TestUnavailableVolumeDataAuthority),
+            deadline_policy: RuntimeSpineDeadlinePolicy::new(
+                Duration::from_secs(5),
+                Duration::from_secs(30),
+            )
+            .unwrap(),
         })
         .await
         .unwrap();
@@ -590,48 +634,119 @@ mod tests {
         control.abort();
     }
 
+    #[tokio::test]
+    async fn deadline_overflow_fails_before_registration_or_listener_binding() {
+        let state_root = tempfile::tempdir().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_address = listener.local_addr().unwrap();
+        let stub = RegistrationStub {
+            calls: calls.clone(),
+        };
+        let control = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(REGISTRATION_PATH, post(accept_registration))
+                    .with_state(stub),
+            )
+            .await
+            .unwrap();
+        });
+        let result = spawn_signed_runtime_cutover(SignedRuntimeCutoverConfig {
+            listen: "not-a-socket-address".into(),
+            control_plane_url: format!("http://{control_address}"),
+            agent_registration: registration_config(state_root.path().join("state")).unwrap(),
+            ch_config: test_ch_config(),
+            blockd_binary: "/opt/cats/bin/cats-blockd".into(),
+            guest_agent_binary: "/opt/cats/bin/cats-guest-agent".into(),
+            metering_cgroup_root: None,
+            volume_data_authority: Arc::new(TestUnavailableVolumeDataAuthority),
+            deadline_policy: RuntimeSpineDeadlinePolicy::new(Duration::MAX, Duration::from_secs(1))
+                .unwrap(),
+        })
+        .await;
+        let Err(error) = result else {
+            panic!("overflowing policy must fail before startup")
+        };
+
+        assert!(error
+            .to_string()
+            .contains("validate signed Runtime startup deadlines"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        control.abort();
+    }
+
     #[test]
     fn unavailable_or_residue_scan_can_never_open_readiness() {
         let readiness = Readiness::closed();
-        assert!(apply_readiness_policy(
-            RuntimeSpineRunStep::ScanIncomplete {
-                unavailable_sources: vec![
-                    cats_api::runtime_reconciliation::InventorySource::MetadataStore,
-                ],
-            },
-            &readiness,
-        )
-        .unwrap());
+        assert_eq!(
+            apply_readiness_policy(
+                RuntimeSpineRunStep::ScanIncomplete {
+                    unavailable_sources: vec![
+                        cats_api::runtime_reconciliation::InventorySource::MetadataStore,
+                    ],
+                },
+                &readiness,
+            )
+            .unwrap(),
+            RuntimeLoopAction::RetryAfterDelay
+        );
         assert!(!readiness.is_ready());
 
         readiness.set(true);
-        assert!(apply_readiness_policy(
-            RuntimeSpineRunStep::ScanUnavailable(anyhow::anyhow!("physical residue")),
-            &readiness,
-        )
-        .unwrap());
+        assert_eq!(
+            apply_readiness_policy(
+                RuntimeSpineRunStep::ScanUnavailable(anyhow::anyhow!("physical residue")),
+                &readiness,
+            )
+            .unwrap(),
+            RuntimeLoopAction::RetryAfterDelay
+        );
         assert!(!readiness.is_ready());
     }
 
     #[test]
     fn only_a_nonempty_full_acceptance_opens_readiness() {
         let readiness = Readiness::closed();
-        assert!(!apply_readiness_policy(
-            RuntimeSpineRunStep::ObservationAccepted {
-                service_ready: false,
-            },
-            &readiness,
-        )
-        .unwrap());
+        assert_eq!(
+            apply_readiness_policy(
+                RuntimeSpineRunStep::ObservationAccepted {
+                    service_ready: false,
+                },
+                &readiness,
+            )
+            .unwrap(),
+            RuntimeLoopAction::Continue
+        );
         assert!(!readiness.is_ready());
 
-        assert!(!apply_readiness_policy(
-            RuntimeSpineRunStep::ObservationAccepted {
-                service_ready: true,
-            },
-            &readiness,
-        )
-        .unwrap());
+        assert_eq!(
+            apply_readiness_policy(
+                RuntimeSpineRunStep::ObservationAccepted {
+                    service_ready: true,
+                },
+                &readiness,
+            )
+            .unwrap(),
+            RuntimeLoopAction::Continue
+        );
         assert!(readiness.is_ready());
+    }
+
+    #[test]
+    fn identity_repair_cordons_without_requesting_session_replacement() {
+        let readiness = Readiness::closed();
+        assert_eq!(
+            apply_readiness_policy(
+                RuntimeSpineRunStep::EffectIdentityRepairRequired {
+                    cat_id: Id::new("cat_a").unwrap(),
+                },
+                &readiness,
+            )
+            .unwrap(),
+            RuntimeLoopAction::WaitForIdentityRepair
+        );
+        assert!(!readiness.is_ready());
     }
 }

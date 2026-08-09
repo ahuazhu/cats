@@ -7,10 +7,12 @@ use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use cats_api::runtime_reconciliation::{
-    inventory_digest, AgentSession, ContractError, ContractErrorDetail, ContractVersion,
-    DesiredReadRequest, DesiredReadSnapshot, DesiredRuntimeSpec, Epoch, Id, InventorySource, KeyId,
-    NodeObservation, NodeResidue, ObservationAcceptance, ObservedRuntimeStatus, RandomId128,
-    RuntimeSpineError, RuntimeSpineErrorDetail, Sha256Digest, UnixMillis,
+    inventory_digest, AdmissionInventoryAttestation, AgentSession, ContractError,
+    ContractErrorDetail, ContractVersion, DesiredReadRequest, DesiredReadSnapshot,
+    DesiredRuntimeSpec, Epoch, Id, InventorySource, KeyId, NodeObservation, NodeResidue,
+    ObservationAcceptance, ObservationInventoryAcceptance, ObservedRuntimeStatus, RandomId128,
+    RuntimeSpineError, RuntimeSpineErrorDetail, RuntimeVolumeAuthorityRejection, Sha256Digest,
+    UnixMillis,
 };
 use thiserror::Error;
 
@@ -67,7 +69,87 @@ pub trait RuntimeDesiredEffect: Send + Sync + 'static {
         &self,
         context: RuntimeDesiredEffectContext,
         desired: &DesiredRuntimeSpec,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<RuntimeDesiredEffectOutcome>;
+}
+
+/// Closed control decision returned by a typed Desired effect. Only
+/// `RetryExact` retains the same in-memory admission and exact Desired unit;
+/// every other non-applied decision leaves that batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeDesiredEffectOutcome {
+    Applied,
+    RetryExact,
+    RefreshInventory,
+    ReplanDesired,
+    IdentityRepairRequired,
+    SessionReplacementRequired,
+    Stop(RuntimeDesiredEffectStopReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeDesiredEffectStopReason {
+    LocalContract,
+    DeploymentMismatch,
+    AuthorityRejected(RuntimeVolumeAuthorityRejection),
+}
+
+/// Operator-selected budgets for one bounded inventory scan and one bounded
+/// physical reconciler step. These are local execution limits, not protocol
+/// SLAs; deriving both absolute deadlines from one `now` ensures queue time is
+/// never refunded at a later blocking boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeSpineDeadlinePolicy {
+    scan_timeout: Duration,
+    effect_step_timeout: Duration,
+}
+
+impl RuntimeSpineDeadlinePolicy {
+    pub fn new(
+        scan_timeout: Duration,
+        effect_step_timeout: Duration,
+    ) -> Result<Self, RuntimeSpineDeadlinePolicyError> {
+        if scan_timeout.is_zero() {
+            return Err(RuntimeSpineDeadlinePolicyError::ZeroScanTimeout);
+        }
+        if effect_step_timeout.is_zero() {
+            return Err(RuntimeSpineDeadlinePolicyError::ZeroEffectStepTimeout);
+        }
+        Ok(Self {
+            scan_timeout,
+            effect_step_timeout,
+        })
+    }
+
+    pub fn deadlines_from(
+        self,
+        now: Instant,
+    ) -> Result<RuntimeSpineRunDeadlines, RuntimeSpineDeadlinePolicyError> {
+        let scan = now
+            .checked_add(self.scan_timeout)
+            .ok_or(RuntimeSpineDeadlinePolicyError::ScanDeadlineOverflow)?;
+        let effect_step = now
+            .checked_add(self.effect_step_timeout)
+            .ok_or(RuntimeSpineDeadlinePolicyError::EffectStepDeadlineOverflow)?;
+        Ok(RuntimeSpineRunDeadlines { scan, effect_step })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeSpineRunDeadlines {
+    scan: Instant,
+    effect_step: Instant,
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeSpineDeadlinePolicyError {
+    #[error("runtime inventory scan timeout must be positive")]
+    ZeroScanTimeout,
+    #[error("runtime effect-step timeout must be positive")]
+    ZeroEffectStepTimeout,
+    #[error("runtime inventory scan deadline overflowed Instant")]
+    ScanDeadlineOverflow,
+    #[error("runtime effect-step deadline overflowed Instant")]
+    EffectStepDeadlineOverflow,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +157,57 @@ pub struct RuntimeDesiredEffectContext {
     state_directory: StateDirectory,
     deadline: Instant,
     cancellation: RuntimeInventoryScanCancellation,
+    accepted_full: Option<RuntimeDesiredEffectAdmission>,
+}
+
+/// The exact current-process full inventory acceptance that opened the one
+/// subsequent Desired effect batch. It is never reconstructed from an old
+/// checkpoint or a previous process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeDesiredEffectAdmission {
+    session: AgentSession,
+    observation: NodeObservation,
+    attestation: AdmissionInventoryAttestation,
+}
+
+impl RuntimeDesiredEffectAdmission {
+    fn from_acceptance(
+        mut session: AgentSession,
+        observation: NodeObservation,
+        acceptance: &ObservationAcceptance,
+    ) -> Option<Self> {
+        let ObservationInventoryAcceptance::Full { attestation } = &acceptance.inventory else {
+            return None;
+        };
+        if !super::acceptance_matches_observation(acceptance, &observation)
+            || session.node_id != observation.node_id
+            || session.node_boot_id != observation.node_boot_id
+            || session.agent_instance_id != observation.agent_instance_id
+            || session.agent_session_epoch != observation.agent_session_epoch
+            || acceptance.lease_deadline_unix_ms < session.lease_deadline_unix_ms
+            || attestation.accepted_at_unix_ms != acceptance.accepted_at_unix_ms
+        {
+            return None;
+        }
+        session.lease_deadline_unix_ms = acceptance.lease_deadline_unix_ms;
+        Some(Self {
+            session,
+            observation,
+            attestation: attestation.clone(),
+        })
+    }
+
+    pub fn session(&self) -> &AgentSession {
+        &self.session
+    }
+
+    pub fn observation(&self) -> &NodeObservation {
+        &self.observation
+    }
+
+    pub fn attestation(&self) -> &AdmissionInventoryAttestation {
+        &self.attestation
+    }
 }
 
 impl RuntimeDesiredEffectContext {
@@ -82,11 +215,13 @@ impl RuntimeDesiredEffectContext {
         state_directory: StateDirectory,
         deadline: Instant,
         cancellation: RuntimeInventoryScanCancellation,
+        accepted_full: Option<RuntimeDesiredEffectAdmission>,
     ) -> Self {
         Self {
             state_directory,
             deadline,
             cancellation,
+            accepted_full,
         }
     }
 
@@ -110,12 +245,19 @@ impl RuntimeDesiredEffectContext {
         Ok(())
     }
 
+    pub fn accepted_full(&self) -> anyhow::Result<&RuntimeDesiredEffectAdmission> {
+        self.accepted_full.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("runtime Desired effect lacks current-process full admission")
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(state_directory: StateDirectory, deadline: Instant) -> Self {
         Self::new(
             state_directory,
             deadline,
             RuntimeInventoryScanCancellation::new(),
+            None,
         )
     }
 
@@ -359,6 +501,25 @@ pub enum RuntimeSpineRunStep {
         cat_id: Id,
     },
     EffectsApplied,
+    EffectRetryExact {
+        cat_id: Id,
+    },
+    EffectRefreshInventory {
+        cat_id: Id,
+    },
+    EffectReplanDesired {
+        cat_id: Id,
+    },
+    EffectIdentityRepairRequired {
+        cat_id: Id,
+    },
+    EffectSessionReplacementRequired {
+        cat_id: Id,
+    },
+    EffectStopped {
+        cat_id: Id,
+        reason: RuntimeDesiredEffectStopReason,
+    },
     RetryExact(RuntimeSpineRunRetry),
     /// A definite server result made the retained Desired cursor unusable.
     DesiredInvalidated {
@@ -445,6 +606,9 @@ enum JournalCommand {
         reply: tokio::sync::oneshot::Sender<Result<(), RuntimeSpineJournalError>>,
     },
     InvalidateDesired(tokio::sync::oneshot::Sender<Result<(), RuntimeSpineJournalError>>),
+    InvalidateDesiredAfterEffect(
+        tokio::sync::oneshot::Sender<Result<(), RuntimeSpineJournalError>>,
+    ),
 }
 
 struct JournalLane {
@@ -526,6 +690,13 @@ impl JournalLane {
                                 });
                             let _ = reply.send(result);
                         }
+                        JournalCommand::InvalidateDesiredAfterEffect(reply) => {
+                            let result = open_journal(&state_directory, &registered_session)
+                                .and_then(|mut journal| {
+                                    journal.invalidate_desired_after_effect_replan()
+                                });
+                            let _ = reply.send(result);
+                        }
                     }
                 }
             })
@@ -600,6 +771,12 @@ impl JournalLane {
     async fn invalidate_desired(&self) -> Result<(), RuntimeSpineRunError> {
         let (reply, received) = tokio::sync::oneshot::channel();
         self.send(JournalCommand::InvalidateDesired(reply))?;
+        receive("journal", received).await
+    }
+
+    async fn invalidate_desired_after_effect_replan(&self) -> Result<(), RuntimeSpineRunError> {
+        let (reply, received) = tokio::sync::oneshot::channel();
+        self.send(JournalCommand::InvalidateDesiredAfterEffect(reply))?;
         receive("journal", received).await
     }
 
@@ -783,7 +960,7 @@ enum EffectCommand {
     Apply {
         context: RuntimeDesiredEffectContext,
         desired: DesiredRuntimeSpec,
-        reply: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<RuntimeDesiredEffectOutcome>>,
     },
 }
 
@@ -839,6 +1016,7 @@ impl EffectLane {
         &self,
         state_directory: StateDirectory,
         desired: DesiredRuntimeSpec,
+        accepted_full: Option<RuntimeDesiredEffectAdmission>,
         deadline: Instant,
     ) -> Result<EffectWait, RuntimeSpineRunError> {
         if self.state.poisoned.load(Ordering::Acquire) {
@@ -848,8 +1026,12 @@ impl EffectLane {
             return Ok(EffectWait::DeadlineExceeded);
         }
         let cancellation = RuntimeInventoryScanCancellation::new();
-        let context =
-            RuntimeDesiredEffectContext::new(state_directory, deadline, cancellation.clone());
+        let context = RuntimeDesiredEffectContext::new(
+            state_directory,
+            deadline,
+            cancellation.clone(),
+            accepted_full,
+        );
         {
             let mut active = active_effect(&self.state.active);
             if active.is_some() {
@@ -937,7 +1119,7 @@ fn active_effect(
 }
 
 enum EffectWait {
-    Finished(anyhow::Result<()>),
+    Finished(anyhow::Result<RuntimeDesiredEffectOutcome>),
     DeadlineExceeded,
 }
 
@@ -1032,8 +1214,8 @@ async fn receive<T>(
 }
 
 /// Drives the signed spine without doing filesystem or inventory work on the
-/// async executor. Calling `run_once_until` concurrently is intentionally
-/// prevented by its `&mut self` receiver.
+/// async executor. Calling `run_once_with_deadlines` concurrently is
+/// intentionally prevented by its `&mut self` receiver.
 pub struct RuntimeSpineRunner {
     state_directory: StateDirectory,
     registered_session: AgentSession,
@@ -1043,6 +1225,7 @@ pub struct RuntimeSpineRunner {
     effect_lane: Option<EffectLane>,
     current_process_scan_observation_id: Option<RandomId128>,
     effect_admission_open: bool,
+    effect_admission: Option<RuntimeDesiredEffectAdmission>,
     pending_effects: VecDeque<DesiredRuntimeSpec>,
 }
 
@@ -1108,16 +1291,17 @@ impl RuntimeSpineRunner {
             effect_lane,
             current_process_scan_observation_id: None,
             effect_admission_open: false,
+            effect_admission: None,
             pending_effects: VecDeque::new(),
         })
     }
 
-    pub async fn run_once_until(
+    pub async fn run_once_with_deadlines(
         &mut self,
-        scan_deadline: Instant,
+        deadlines: RuntimeSpineRunDeadlines,
     ) -> Result<RuntimeSpineRunStep, RuntimeSpineRunError> {
         if !self.pending_effects.is_empty() {
-            return self.run_next_effect(scan_deadline).await;
+            return self.run_next_effect(deadlines.effect_step).await;
         }
         let work = self.journal_lane()?.next().await?;
 
@@ -1126,7 +1310,11 @@ impl RuntimeSpineRunner {
             PendingWork::Observation(request) => self.send_observation(request).await,
             PendingWork::Scan(scan) => {
                 let coordinates = scan.clone();
-                let outcome = match self.scan_lane()?.scan_complete(scan, scan_deadline).await? {
+                let outcome = match self
+                    .scan_lane()?
+                    .scan_complete(scan, deadlines.scan)
+                    .await?
+                {
                     ScanWait::Finished(Ok(outcome)) => outcome,
                     ScanWait::Finished(Err(error)) => {
                         return Ok(RuntimeSpineRunStep::ScanUnavailable(error));
@@ -1135,7 +1323,7 @@ impl RuntimeSpineRunner {
                         return Ok(RuntimeSpineRunStep::ScanDeadlineExceeded);
                     }
                 };
-                if Instant::now() >= scan_deadline {
+                if Instant::now() >= deadlines.scan {
                     return Ok(RuntimeSpineRunStep::ScanDeadlineExceeded);
                 }
                 let inventory = match outcome {
@@ -1160,6 +1348,18 @@ impl RuntimeSpineRunner {
                 self.send_observation(request).await
             }
         }
+    }
+
+    #[cfg(test)]
+    async fn run_once_until(
+        &mut self,
+        shared_deadline: Instant,
+    ) -> Result<RuntimeSpineRunStep, RuntimeSpineRunError> {
+        self.run_once_with_deadlines(RuntimeSpineRunDeadlines {
+            scan: shared_deadline,
+            effect_step: shared_deadline,
+        })
+        .await
     }
 
     /// Stops the ordered effect, scan and journal workers and waits until no
@@ -1216,16 +1416,48 @@ impl RuntimeSpineRunner {
         let cat_id = desired.cat_id.clone();
         match self
             .effect_lane()?
-            .apply(self.state_directory.clone(), desired, deadline)
+            .apply(
+                self.state_directory.clone(),
+                desired,
+                self.effect_admission.clone(),
+                deadline,
+            )
             .await?
         {
-            EffectWait::Finished(Ok(())) => {
+            EffectWait::Finished(Ok(RuntimeDesiredEffectOutcome::Applied)) => {
                 self.pending_effects.pop_front();
                 if self.pending_effects.is_empty() {
+                    self.effect_admission = None;
                     Ok(RuntimeSpineRunStep::EffectsApplied)
                 } else {
                     Ok(RuntimeSpineRunStep::EffectApplied { cat_id })
                 }
+            }
+            EffectWait::Finished(Ok(RuntimeDesiredEffectOutcome::RetryExact)) => {
+                Ok(RuntimeSpineRunStep::EffectRetryExact { cat_id })
+            }
+            EffectWait::Finished(Ok(RuntimeDesiredEffectOutcome::RefreshInventory)) => {
+                self.clear_effect_batch();
+                Ok(RuntimeSpineRunStep::EffectRefreshInventory { cat_id })
+            }
+            EffectWait::Finished(Ok(RuntimeDesiredEffectOutcome::ReplanDesired)) => {
+                self.journal_lane()?
+                    .invalidate_desired_after_effect_replan()
+                    .await?;
+                self.clear_effect_batch();
+                Ok(RuntimeSpineRunStep::EffectReplanDesired { cat_id })
+            }
+            EffectWait::Finished(Ok(RuntimeDesiredEffectOutcome::IdentityRepairRequired)) => {
+                self.clear_effect_batch();
+                Ok(RuntimeSpineRunStep::EffectIdentityRepairRequired { cat_id })
+            }
+            EffectWait::Finished(Ok(RuntimeDesiredEffectOutcome::SessionReplacementRequired)) => {
+                self.clear_effect_batch();
+                Ok(RuntimeSpineRunStep::EffectSessionReplacementRequired { cat_id })
+            }
+            EffectWait::Finished(Ok(RuntimeDesiredEffectOutcome::Stop(reason))) => {
+                self.clear_effect_batch();
+                Ok(RuntimeSpineRunStep::EffectStopped { cat_id, reason })
             }
             EffectWait::Finished(Err(error)) => {
                 Ok(RuntimeSpineRunStep::EffectUnavailable { cat_id, error })
@@ -1234,6 +1466,12 @@ impl RuntimeSpineRunner {
                 Ok(RuntimeSpineRunStep::EffectDeadlineExceeded { cat_id })
             }
         }
+    }
+
+    fn clear_effect_batch(&mut self) {
+        self.pending_effects.clear();
+        self.effect_admission = None;
+        self.effect_admission_open = false;
     }
 
     async fn send_desired(
@@ -1250,6 +1488,7 @@ impl RuntimeSpineRunner {
                     self.effect_admission_open = false;
                     self.pending_effects = desired_specs.into();
                     if self.pending_effects.is_empty() {
+                        self.effect_admission = None;
                         Ok(RuntimeSpineRunStep::EffectsApplied)
                     } else {
                         Ok(RuntimeSpineRunStep::DesiredAccepted)
@@ -1287,11 +1526,26 @@ impl RuntimeSpineRunner {
                         == Some(&request.value().observation_id);
                 let service_ready = establishes_effect_admission
                     && observation_opens_service_readiness(request.value());
+                let admission = if establishes_effect_admission {
+                    Some(
+                        RuntimeDesiredEffectAdmission::from_acceptance(
+                            self.registered_session.clone(),
+                            request.value().clone(),
+                            &accepted.value,
+                        )
+                        .ok_or(RuntimeSpineRunError::InvalidScan(
+                            "accepted full observation does not form one effect admission",
+                        ))?,
+                    )
+                } else {
+                    None
+                };
                 self.journal_lane()?
                     .accept_observation(accepted.value, accepted.bytes)
                     .await?;
                 self.current_process_scan_observation_id = None;
                 if establishes_effect_admission {
+                    self.effect_admission = admission;
                     self.effect_admission_open = true;
                     Ok(RuntimeSpineRunStep::ObservationAccepted { service_ready })
                 } else {
@@ -1605,6 +1859,11 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct DecisionEffect {
+        outcome: RuntimeDesiredEffectOutcome,
+        calls: AtomicUsize,
+    }
+
     struct NeverLaunch {
         calls: AtomicUsize,
     }
@@ -1645,14 +1904,33 @@ mod tests {
             &self,
             context: RuntimeDesiredEffectContext,
             desired: &DesiredRuntimeSpec,
-        ) -> anyhow::Result<()> {
+        ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
             context.check_active()?;
+            let accepted = context.accepted_full()?;
+            assert_eq!(accepted.session().node_id, desired.placement.node_id);
+            assert!(accepted.observation().complete_inventory);
+            assert_eq!(
+                accepted.observation().inventory_digest.as_ref(),
+                Some(&accepted.attestation().inventory_digest)
+            );
             assert_eq!(
                 desired.runtime.network_config,
                 desired_with_network().runtime.network_config
             );
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(RuntimeDesiredEffectOutcome::Applied)
+        }
+    }
+
+    impl RuntimeDesiredEffect for DecisionEffect {
+        fn apply(
+            &self,
+            context: RuntimeDesiredEffectContext,
+            _desired: &DesiredRuntimeSpec,
+        ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
+            context.check_active()?;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.outcome.clone())
         }
     }
 
@@ -1695,6 +1973,73 @@ mod tests {
         let mut snapshot = decode_desired_read_snapshot(SNAPSHOT).unwrap();
         snapshot.desired_specs = vec![desired_with_network()];
         encode_desired_read_snapshot(&snapshot).unwrap()
+    }
+
+    fn prepare_unconsumed_effect_desired(
+        state: &StateDirectory,
+        registered: &AgentSession,
+    ) -> DesiredRuntimeSpec {
+        let mut journal = RuntimeSpineJournal::open_for_test(state, registered.clone()).unwrap();
+        assert!(matches!(
+            journal.desired_work().unwrap(),
+            RuntimeSpineDesiredWork::Request(_)
+        ));
+        let first = decode_desired_read_snapshot(SNAPSHOT).unwrap();
+        journal.accept_desired(first.clone(), SNAPSHOT).unwrap();
+        let observation = build_full_observation(
+            journal.full_scan().unwrap(),
+            CompleteRuntimeInventory::for_test(
+                UnixMillis::new(1_720_000_004_000).unwrap(),
+                RuntimeInventoryKeyRing::Unavailable,
+                Vec::new(),
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        journal.prepare_observation(observation.clone()).unwrap();
+        let accepted_at = UnixMillis::new(1_720_000_005_000).unwrap();
+        let acceptance = ObservationAcceptance {
+            version: ContractVersion::V1,
+            session: SessionBinding {
+                node_id: observation.node_id.clone(),
+                node_boot_id: observation.node_boot_id.clone(),
+                agent_instance_id: observation.agent_instance_id.clone(),
+                agent_session_epoch: observation.agent_session_epoch,
+            },
+            observation_id: observation.observation_id.clone(),
+            heartbeat_sequence: observation.heartbeat_sequence,
+            accepted_at_unix_ms: accepted_at,
+            lease_deadline_unix_ms: UnixMillis::new(1_720_000_065_000).unwrap(),
+            inventory: ObservationInventoryAcceptance::Full {
+                attestation: AdmissionInventoryAttestation {
+                    version: ContractVersion::V1,
+                    node_id: observation.node_id,
+                    agent_session_epoch: observation.agent_session_epoch,
+                    inventory_epoch: observation.inventory_epoch,
+                    inventory_digest: observation.inventory_digest.unwrap(),
+                    inventory_read_position: observation.inventory_read_position.unwrap(),
+                    accepted_at_unix_ms: accepted_at,
+                },
+            },
+        };
+        let acceptance_bytes = encode_observation_acceptance(&acceptance).unwrap();
+        journal
+            .accept_observation(acceptance, &acceptance_bytes)
+            .unwrap();
+        let RuntimeSpineDesiredWork::Request(request) = journal.desired_work().unwrap() else {
+            panic!("accepted full inventory must advance the Desired request")
+        };
+        let desired = desired_with_network();
+        let mut second = first;
+        second.session = request.value().session.clone();
+        second.request_sequence = request.value().request_sequence;
+        second.read_position = cats_api::runtime_reconciliation::Sequence::new(13).unwrap();
+        second.issued_at_unix_ms = UnixMillis::new(1_720_000_010_000).unwrap();
+        second.expires_at_unix_ms = UnixMillis::new(1_720_000_040_000).unwrap();
+        second.desired_specs = vec![desired.clone()];
+        let bytes = encode_desired_read_snapshot(&second).unwrap();
+        journal.accept_desired(second, &bytes).unwrap();
+        desired
     }
 
     impl crate::runtime_spine::inventory_scanner_sealed::Sealed for EmptyScanner {}
@@ -1846,6 +2191,83 @@ mod tests {
 
         runner.shutdown().await.unwrap();
         server.abort();
+    }
+
+    #[test]
+    fn deadline_policy_rejects_zero_and_overflow() {
+        assert_eq!(
+            RuntimeSpineDeadlinePolicy::new(Duration::ZERO, Duration::from_secs(1)),
+            Err(RuntimeSpineDeadlinePolicyError::ZeroScanTimeout)
+        );
+        assert_eq!(
+            RuntimeSpineDeadlinePolicy::new(Duration::from_secs(1), Duration::ZERO),
+            Err(RuntimeSpineDeadlinePolicyError::ZeroEffectStepTimeout)
+        );
+
+        let scan_overflow = RuntimeSpineDeadlinePolicy::new(Duration::MAX, Duration::from_secs(1))
+            .unwrap()
+            .deadlines_from(Instant::now());
+        assert_eq!(
+            scan_overflow,
+            Err(RuntimeSpineDeadlinePolicyError::ScanDeadlineOverflow)
+        );
+
+        let effect_overflow =
+            RuntimeSpineDeadlinePolicy::new(Duration::from_secs(1), Duration::MAX)
+                .unwrap()
+                .deadlines_from(Instant::now());
+        assert_eq!(
+            effect_overflow,
+            Err(RuntimeSpineDeadlinePolicyError::EffectStepDeadlineOverflow)
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_effect_uses_only_its_precomputed_absolute_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let state = StateDirectory::unanchored(root.path().to_path_buf());
+        let effect = Arc::new(DecisionEffect {
+            outcome: RuntimeDesiredEffectOutcome::Applied,
+            calls: AtomicUsize::new(0),
+        });
+        let mut runner = RuntimeSpineRunner::new_with_desired_effects(
+            state,
+            decode_agent_session(SESSION).unwrap(),
+            RuntimeSpineHttpClient::for_loopback_test("http://127.0.0.1:1/", signer()).unwrap(),
+            Arc::new(EmptyScanner {
+                calls: AtomicUsize::new(0),
+            }),
+            effect.clone(),
+        )
+        .unwrap();
+        runner.pending_effects.push_back(desired_with_network());
+
+        assert!(matches!(
+            runner
+                .run_once_with_deadlines(RuntimeSpineRunDeadlines {
+                    scan: Instant::now(),
+                    effect_step: Instant::now() + Duration::from_secs(5),
+                })
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::EffectsApplied
+        ));
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
+
+        runner.pending_effects.push_back(desired_with_network());
+        assert!(matches!(
+            runner
+                .run_once_with_deadlines(RuntimeSpineRunDeadlines {
+                    scan: Instant::now() + Duration::from_secs(5),
+                    effect_step: Instant::now(),
+                })
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::EffectDeadlineExceeded { .. }
+        ));
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
+
+        runner.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -2006,6 +2428,126 @@ mod tests {
 
         runner.shutdown().await.unwrap();
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn effect_replan_durably_supersedes_the_unconsumed_desired() {
+        let root = tempfile::tempdir().unwrap();
+        let state = StateDirectory::unanchored(root.path().to_path_buf());
+        let registered = decode_agent_session(SESSION).unwrap();
+        let desired = prepare_unconsumed_effect_desired(&state, &registered);
+        let effect = Arc::new(DecisionEffect {
+            outcome: RuntimeDesiredEffectOutcome::ReplanDesired,
+            calls: AtomicUsize::new(0),
+        });
+        let mut runner = RuntimeSpineRunner::new_with_desired_effects(
+            state.clone(),
+            registered.clone(),
+            RuntimeSpineHttpClient::for_loopback_test("http://127.0.0.1:1/", signer()).unwrap(),
+            Arc::new(EmptyScanner {
+                calls: AtomicUsize::new(0),
+            }),
+            effect.clone(),
+        )
+        .unwrap();
+        runner.pending_effects.push_back(desired);
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::EffectReplanDesired { .. }
+        ));
+        assert!(runner.pending_effects.is_empty());
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
+        runner.shutdown().await.unwrap();
+
+        let mut recovered = RuntimeSpineJournal::open_for_test(&state, registered).unwrap();
+        let RuntimeSpineDesiredWork::Request(next) = recovered.desired_work().unwrap() else {
+            panic!("replan must durably advance to a fresh Desired read")
+        };
+        assert_eq!(next.value().request_sequence.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn effect_inventory_refresh_drops_the_batch_and_returns_to_the_same_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let state = StateDirectory::unanchored(root.path().to_path_buf());
+        let registered = decode_agent_session(SESSION).unwrap();
+        let desired = prepare_unconsumed_effect_desired(&state, &registered);
+        let effect = Arc::new(DecisionEffect {
+            outcome: RuntimeDesiredEffectOutcome::RefreshInventory,
+            calls: AtomicUsize::new(0),
+        });
+        let mut runner = RuntimeSpineRunner::new_with_desired_effects(
+            state.clone(),
+            registered.clone(),
+            RuntimeSpineHttpClient::for_loopback_test("http://127.0.0.1:1/", signer()).unwrap(),
+            Arc::new(EmptyScanner {
+                calls: AtomicUsize::new(0),
+            }),
+            effect.clone(),
+        )
+        .unwrap();
+        runner.pending_effects.push_back(desired.clone());
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::EffectRefreshInventory { .. }
+        ));
+        assert!(runner.pending_effects.is_empty());
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
+        runner.shutdown().await.unwrap();
+
+        let mut recovered = RuntimeSpineJournal::open_for_test(&state, registered).unwrap();
+        let RuntimeSpineDesiredWork::Scan(snapshot) = recovered.desired_work().unwrap() else {
+            panic!("inventory refresh must return to the same accepted Desired scan")
+        };
+        assert_eq!(snapshot.desired_specs, vec![desired]);
+    }
+
+    #[tokio::test]
+    async fn effect_identity_repair_never_retries_or_replaces_the_session_locally() {
+        let root = tempfile::tempdir().unwrap();
+        let state = StateDirectory::unanchored(root.path().to_path_buf());
+        let registered = decode_agent_session(SESSION).unwrap();
+        let desired = prepare_unconsumed_effect_desired(&state, &registered);
+        let effect = Arc::new(DecisionEffect {
+            outcome: RuntimeDesiredEffectOutcome::IdentityRepairRequired,
+            calls: AtomicUsize::new(0),
+        });
+        let mut runner = RuntimeSpineRunner::new_with_desired_effects(
+            state.clone(),
+            registered.clone(),
+            RuntimeSpineHttpClient::for_loopback_test("http://127.0.0.1:1/", signer()).unwrap(),
+            Arc::new(EmptyScanner {
+                calls: AtomicUsize::new(0),
+            }),
+            effect.clone(),
+        )
+        .unwrap();
+        runner.pending_effects.push_back(desired.clone());
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::EffectIdentityRepairRequired { .. }
+        ));
+        assert!(runner.pending_effects.is_empty());
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 1);
+        runner.shutdown().await.unwrap();
+
+        let mut recovered = RuntimeSpineJournal::open_for_test(&state, registered).unwrap();
+        let RuntimeSpineDesiredWork::Scan(snapshot) = recovered.desired_work().unwrap() else {
+            panic!("identity repair must not invent a replacement session or Desired request")
+        };
+        assert_eq!(snapshot.desired_specs, vec![desired]);
     }
 
     #[tokio::test]

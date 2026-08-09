@@ -28,7 +28,7 @@ use crate::ch::{
 };
 use crate::state_directory::StateDirectory;
 
-use super::{RuntimeDesiredEffect, RuntimeDesiredEffectContext};
+use super::{RuntimeDesiredEffect, RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome};
 
 const DIRECTORY_NAME: &str = "runtime-effects";
 const CHECKPOINT_MAX_BYTES: usize = 4_096;
@@ -130,7 +130,7 @@ impl RuntimeDesiredEffect for ProductionRuntimeDesiredEffect {
         &self,
         context: RuntimeDesiredEffectContext,
         desired: &DesiredRuntimeSpec,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
         // This is intentionally the first operation. A queued unit whose
         // current-process admission has already expired must touch nothing.
         context.check_active()?;
@@ -182,7 +182,8 @@ impl RuntimeDesiredEffect for ProductionRuntimeDesiredEffect {
         context.check_active()?;
         self.launch
             .launch(desired, &network)
-            .context("launch exact checkpointed Desired runtime")
+            .context("launch exact checkpointed Desired runtime")?;
+        Ok(RuntimeDesiredEffectOutcome::Applied)
     }
 }
 

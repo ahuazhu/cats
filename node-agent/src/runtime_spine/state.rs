@@ -369,6 +369,45 @@ impl RuntimeSpineJournal {
         Ok(())
     }
 
+    /// Durably retires the exact accepted, unconsumed Desired after a typed
+    /// effect proved that Control must replan it. Unlike observation rejection
+    /// there is no pending observation to remove: the current-process effect
+    /// batch is downstream of an already accepted full inventory.
+    pub(crate) fn invalidate_desired_after_effect_replan(
+        &mut self,
+    ) -> Result<(), RuntimeSpineJournalError> {
+        if self.pending_observation.is_some() {
+            return Err(RuntimeSpineJournalError::Transition(
+                "effect replan cannot replace a pending observation",
+            ));
+        }
+        let snapshot =
+            self.desired_snapshot
+                .as_ref()
+                .ok_or(RuntimeSpineJournalError::Transition(
+                    "effect replan has no accepted Desired snapshot",
+                ))?;
+        if self.desired_is_consumed(snapshot) || self.desired_is_invalidated(snapshot) {
+            return Err(RuntimeSpineJournalError::Transition(
+                "effect replan cannot retire a consumed or invalidated Desired snapshot",
+            ));
+        }
+        let bytes = encode_desired_read_snapshot(snapshot).map_err(|source| {
+            RuntimeSpineJournalError::Contract {
+                record: "DesiredReadSnapshot effect invalidation marker",
+                source,
+            }
+        })?;
+        replace_file(
+            &self.directory,
+            &self.path,
+            DESIRED_INVALIDATED_FILE,
+            &bytes,
+        )?;
+        self.invalidated_desired = Some(snapshot.clone());
+        Ok(())
+    }
+
     /// Durably stores a complete, already-physically-scanned candidate before
     /// any network send. A retained pending request always wins over a newly
     /// supplied candidate.

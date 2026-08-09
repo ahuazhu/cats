@@ -20,8 +20,10 @@ pub(crate) mod runtime_launch_port_sealed {
 pub(crate) use desired_effect::{ProductionRuntimeDesiredEffect, RuntimeLaunchPort};
 
 pub use runner::{
-    CompleteRuntimeInventory, RuntimeDesiredEffect, RuntimeDesiredEffectContext,
+    CompleteRuntimeInventory, RuntimeDesiredEffect, RuntimeDesiredEffectAdmission,
+    RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome, RuntimeDesiredEffectStopReason,
     RuntimeInventoryScanContext, RuntimeInventoryScanOutcome, RuntimeInventoryScanner,
+    RuntimeSpineDeadlinePolicy, RuntimeSpineDeadlinePolicyError, RuntimeSpineRunDeadlines,
     RuntimeSpineRunError, RuntimeSpineRunRetry, RuntimeSpineRunStep, RuntimeSpineRunner,
 };
 pub(crate) use runner::{InventoryCoverageAggregator, RuntimeInventoryKeyRing};

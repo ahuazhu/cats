@@ -1,8 +1,10 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Context;
 use cats_node_agent::ch::{BlockPath, ChConfig};
 use cats_node_agent::runtime_cutover::{spawn_signed_runtime_cutover, SignedRuntimeCutoverConfig};
+use cats_node_agent::runtime_spine::RuntimeSpineDeadlinePolicy;
 use cats_storage::AdapterConfig;
 use clap::Parser;
 
@@ -51,6 +53,23 @@ struct Args {
     /// Delegated cgroup v2 subtree for authoritative billing counters.
     #[arg(long, env = "CATS_METERING_CGROUP_ROOT")]
     metering_cgroup_root: Option<PathBuf>,
+
+    /// Local budget for one complete signed Runtime inventory scan. This is an
+    /// operator safety limit, not a protocol or product latency SLA.
+    #[arg(
+        long,
+        env = "CATS_RUNTIME_INVENTORY_SCAN_TIMEOUT_MS",
+        default_value_t = 5_000
+    )]
+    runtime_inventory_scan_timeout_ms: u64,
+    /// Local budget for one durable signed Runtime physical step. It is
+    /// intentionally independent from the inventory scan budget.
+    #[arg(
+        long,
+        env = "CATS_RUNTIME_EFFECT_STEP_TIMEOUT_MS",
+        default_value_t = 30_000
+    )]
+    runtime_effect_step_timeout_ms: u64,
 
     /// Concurrent-wake commitment budget in bytes (ADR-0002 §8). Accounted in
     /// bytes because the 2026-07-21 run showed Guest memory page read-back is
@@ -133,6 +152,11 @@ async fn main() -> anyhow::Result<()> {
         cats_node_agent::agent_registration::AgentRegistrationConfig::load_installed(
             installed_receipt.receipt(),
         )?;
+    let deadline_policy = RuntimeSpineDeadlinePolicy::new(
+        Duration::from_millis(args.runtime_inventory_scan_timeout_ms),
+        Duration::from_millis(args.runtime_effect_step_timeout_ms),
+    )
+    .context("validate signed Runtime scan/effect deadline policy")?;
     let handle = spawn_signed_runtime_cutover(SignedRuntimeCutoverConfig {
         listen: args.listen,
         control_plane_url: args.control_plane_url,
@@ -142,6 +166,7 @@ async fn main() -> anyhow::Result<()> {
         guest_agent_binary: args.guest_agent_bin,
         metering_cgroup_root: args.metering_cgroup_root,
         volume_data_authority,
+        deadline_policy,
     })
     .await?;
     eprintln!(
