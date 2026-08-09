@@ -4,6 +4,7 @@
 - Authority：[ADR-0040](../decisions/0040-level-triggered-runtime-reconciliation.md)
 - 生命周期：[runtime-lifecycle.md](../runtime-lifecycle.md)
 - Internal delivery/acceptance：[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)
+- Volume transition transport：[Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)
 
 本文只定义 Control Plane 与 Node Agent 之间最小、可测试的共享domain收敛合同，
 不另行定义transport。Agent注册、internal HTTP前缀、全部runtime internal请求共用的
@@ -13,6 +14,10 @@ observation acceptance的两条唯一HTTP route、endpoint-local error、原子�
 [Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)冻结。其他transport不得重新
 解释本文件的共享类型、建立第二个identity/session authority，或把通知必达、连接不断、
 消息只到达一次当作正确性前提。
+
+Node把已经fsync进checkpoint的normal/takeover acquire、exact release与disposable Root authorization
+consume交给Control时，只使用[Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)；该route不
+扩展本文件的共享类型，不建立effect job/receipt，也不把blockd提升为ownership mutation owner。
 
 文中的 MUST/MUST NOT 是上线条件。
 
@@ -398,6 +403,8 @@ FilesystemInitialization =
 [Volume Authority](volume-authority.md) 定义；它是 Runtime acquire/takeover 的硬依赖，Host
 事件本身不授予卷写权限。HostFenceEvent来源的首次消费必须在同一PostgreSQL事务锁event、
 authorization和VolumeRecord，完成卷CAS并写不可变`AuthorizationConsumedReceipt`。
+Node到Control的exact request、current session/inventory/Desired binding、HTTP ambiguity和该事务的完整锁序
+由[Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)冻结。
 
 `target != "deleted"`时所有volume的disposition必须是`retain`。Deleted Desired为每卷显式声明
 `detach_retained`或`delete_disposable_root`。后一种只允许
@@ -832,7 +839,7 @@ unit。Inspect、Verify 和 Quarantine 本身不产生外部 effect。
 |---|---|---|
 | CloseAdmission | desired/cell revision、原gate集合、RequireIdle attempt state | 只用于全局lifecycle/placement/runtime/volume/mount/network/platform变化或RequireIdle；cell内compare-and-close全部gate，Armed模糊结果按Busy且Closed结算，fresh Running只以更高route epochs重开；Endpoint-only禁止使用 |
 | CloseGate | `close_gate {endpoint_id, old route_epoch}`及checkpoint top-level、所选old `route_gates`完整entry | 只compare-and-close该Endpoint；revision或完整binding不匹配零副作用，exact same binding Closed是close postcondition；成功/结果不明后确认Closed才fsync且旧epoch不重开。changed以更高epoch另走InstallGate；removed drain后以old Closed binding compare-remove cell entry，确认absent才删除checkpoint entry/推进step，不install |
-| AcquireVolume | normal时完整`VolumeAcquireRequest`（含positive lease duration），takeover时只有authorization id | MetadataStore 精确 CAS；authorization首次消费还要求Active event并原子写`AuthorizationConsumedReceipt`；只有完整typed request或同authorization可adopt，或在 `R == L` 后精确release |
+| AcquireVolume | normal时完整`VolumeAcquireRequest`（含positive lease duration），takeover时只有authorization id | 只通过Runtime Volume Transitions签名route交给Control的单一PostgreSQL事务；authorization首次消费还要求Active event并原子写`AuthorizationConsumedReceipt`；只有完整typed request或同authorization可adopt，或在 `R == L` 后精确release |
 | ProvisionRootImage | 完整`provision_root_image` step（包含不与provision transition混用的control-only blockd物理身份）、checkpoint top-level revision/spec/placement和该attachment的现有process/volume evidence | 只允许current non-Deleted Desired的唯一Root；step必须先fsync再spawn/adopt精确blockd实例，并以已持久transition ID发送显式typed request，把exact blank head CAS为纯确定计算的generation-1 target。响应不明只读权威head；closed retryable/conflict按§7.1处理。成功前不得创建Guest device或VMM |
 | PrepareDevices | NBD/tap/socket slot、ownership token | 完整 inventory 后 create-if-absent；晚到资源只按 token adopt 或删除 |
 | FormatFilesystem | attachment、device、filesystem UUID、initialization token、blank predecessor | Guest Agent 只按精确 predecessor 格式化；晚到结果按 UUID probe/adopt，冲突立即 quarantine |
@@ -930,7 +937,8 @@ adopt或按名删除。
 volume `CleanupRelease`必须先持久化，再以`target.volume_id`、`target.attachment_id`、
 `target.attachment_epoch`和`volume_release.release_transition_id`构造Volume Authority的exact
 release request；`generation`和`disposition`是Runtime的决策/前置绑定，不增加第二个
-MetadataStore authority。若release已提交但响应丢失，重启只能：
+MetadataStore authority。Node只通过Runtime Volume Transitions签名route提交该request；若release已提交
+但响应丢失，重启只能：
 
 1. 逐字段重放同一request/同一`release_transition_id`，并接受原`UnownedGrant`；或
 2. 读取VolumeRecord，仅当`last_transition.kind="release"`中的完整typed request/result逐字段匹配、
@@ -2922,7 +2930,9 @@ ContractName = "node_identity" | "agent_registration_attempt" | "agent_session"
              | "guest_runtime_profile_receipt" | "admission_inventory_attestation" | "desired_runtime_spec"
              | "desired_read_request" | "desired_read_snapshot"
              | "runtime_checkpoint" | "node_cleanup_checkpoint" | "node_observation"
-             | "observation_acceptance" | "runtime_spine_error" | "operation" | "contract_error"
+             | "observation_acceptance" | "runtime_spine_error"
+             | "runtime_volume_transition_request" | "runtime_volume_transition_success"
+             | "runtime_volume_transition_error" | "operation" | "contract_error"
 ```
 
 Inventory/Desired delivery variants的适用边界、字段不等式和固定选择以

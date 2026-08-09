@@ -42,9 +42,11 @@ provider-principal fallback。
 internal runtime handler、Store和Node不得读取`CATS_AUTH_TOKEN`、browser session、admin session、workspace
 token或另一个service bearer。生产请求使用server-authenticated HTTPS和§4的per-Node签名；HTTP只允许显式
 test adapter绑定loopback listener，不能由production配置降级。
-注册之外的两条session-bound route只由
+注册之外，Desired/observation两条session-bound delivery route只由
 [Runtime Inventory and Observation Spine §2](runtime-inventory-observation-v1.md#2-http-与-authentication-envelope)冻结；
-本文的共用prefix/proof adapter不会自动创建GET、long-poll、legacy heartbeat或其他可路由入口。
+卷状态转换的一条session-bound mutation route只由
+[Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)冻结。本文的共用prefix/proof adapter不会自动
+创建GET、long-poll、legacy heartbeat或任何未被这两个下位合同逐条冻结的可路由入口。
 
 Node的`--control-plane-url`必须是`https://<authority>` origin：除根`/`外没有path，不含userinfo、query或
 fragment；client在它后拼接本规格的exact path。TLS使用部署Host的reviewed WebPKI trust roots并验证URL DNS

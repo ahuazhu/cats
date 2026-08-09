@@ -3,6 +3,7 @@
 - 状态：目标合同；尚未实现
 - 决策：[ADR-0042](../decisions/0042-volume-authority-and-disk-lifecycle.md)
 - 协调协议：[Runtime Reconciliation v1](runtime-reconciliation-v1.md)
+- Runtime mutation transport：[Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)
 - 数据协议：[cats-blockd 协议](blockd-protocol.md)
 
 本文定义卷从创建、附着、格式化、快照、迁移到删除的完整合同。目标是让每个危险动作都由
@@ -40,12 +41,17 @@ pure-domain/data-row fixture，不提供Control cross-row authority。首次消�
 DiskSnapshotRecord`；事务跳过自己不涉及的节点，同类
 多行按稳定ID排序。§3.3覆盖的Workspace product mutation先取得由认证Workspace、canonical route和`Idempotency-Key`导出的
 PostgreSQL transaction-scoped reservation，再读结果；它不能先锁资源，也不落持久Pending。这样同一
-key即使携带不同资源也不会分别先锁不同Volume。normal acquire只锁`VolumeRecord`，因此它与snapshot
-mutation或begin-delete仍只能有一方先提交。HostFenceEvent来源的内部恢复没有API前缀，从event开始。
-`CatNameLock`不是row或authority；Cat create固定在API key之后取得它并先闭合名称分支：合法existing Cat
-按既有Volume→Cat→Disk→Desired→Endpoint/lookup→Operation锁序闭合existing graph后只写exact 409 result，
-不读取或锁定candidate plan/NodeIdentity；name free且将插入新Desired时，才在任何candidate Volume/Cat/Disk
-row或candidate-ID lock之前锁定并重验candidate `NodeIdentity`。删除已有Cat由被锁定的existing Cat row与唯一索引
+ key即使携带不同资源也不会分别先锁不同Volume。纯Volume Authority的
+ `normal_acquire`单行primitive只锁`VolumeRecord`，因此它与snapshot mutation或begin-delete仍只能
+ 有一方先提交。production Runtime HTTP owner不能直接暴露该primitive；它必须先按
+ [Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)取得NodeIdentity、current AgentSession和accepted
+ inventory锁前缀，然后才进入本文的event/authorization/Volume后缀。HostFenceEvent来源的内部恢复没有API前缀，
+ 从event开始。
+ `CatNameLock`不是row或authority；只有会插入新Cat identity的create事务使用它。Cat create固定在API key之后
+ 取得它并先闭合名称分支：合法existing Cat按既有Volume→Cat→Disk→Desired→Endpoint/lookup→Operation锁序
+ 闭合existing graph后只写exact 409 result，不读取或锁定candidate plan/NodeIdentity；name free且将插入新Desired时，
+ 才在任何candidate Volume/Cat/Disk row或candidate-ID lock之前锁定并重验candidate `NodeIdentity`。删除已有Cat由
+ 被锁定的existing Cat row与唯一索引
 线性化，不取得name lock，因此§1的Cat Destroy锁序没有反向边。
 
 Persistent initialization CAS没有API/event前缀，固定锁序是`current AgentSession row -> 该session的
@@ -675,7 +681,8 @@ HostFenceEvent/HostDestroyed receipt继续按现有Operation/审计引用保留�
 Node 是 lease transition 的执行者。顺序固定：
 
 1. 在 checkpoint 写 acquire/takeover request。
-2. 调用 MetadataStore，并对模糊结果读取精确 transition postcondition。
+2. 调用[Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)的唯一签名route，并对模糊结果以同一
+   `volume_records`的只读`VolumeDataAuthority`/authorization receipt读取精确transition postcondition。
 3. 把 `LeaseGrant` 原子写回 checkpoint。
 4. 创建 attachment 专属 data-dir identity。
 5. 启动 blockd，传入 volume、attachment、epoch 和既有的closed acquire origin。

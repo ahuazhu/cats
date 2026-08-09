@@ -258,6 +258,10 @@ registration public error、session lease与release receipt路径由
 `POST /v1/internal/runtime/observations`；它们的事务、endpoint-local error和planner/signer freshness由
 [Runtime Inventory and Observation Spine v1](specs/runtime-inventory-observation-v1.md)冻结。legacy
 `/v1/nodes/register`、heartbeat/inventory route和shared service/admin bearer不属于目标架构。
+Node把checkpoint中的normal/takeover acquire、exact release和disposable Root authorization consume提交给
+Control的唯一窄mutation route；wire、同一current session/inventory/Desired校验、锁序与模糊响应恢复由
+[Runtime Volume Transitions v1](specs/runtime-volume-transitions-v1.md)冻结。blockd继续只读/renew/head-CAS，
+不得取得ownership transition能力。
 
 ## 7. 四态和数据屏障
 
@@ -494,6 +498,7 @@ virtio/ext4 和四态，是因为它们是已验证且合适的终态设计，�
 - [runtime-lifecycle.md](runtime-lifecycle.md)：四态、资源屏障和降级。
 - [storage.md](storage.md)：当前 ChunkStore 数据正确性。
 - [Volume Authority and Disk Lifecycle](specs/volume-authority.md)：卷所有权、磁盘状态机和GC。
+- [Runtime Volume Transitions v1](specs/runtime-volume-transitions-v1.md)：Node到Control的卷状态转换transport与事务边界。
 - [Operations and HA](operations-ha.md)：运行拓扑、故障恢复和分层验证。
 - `docs/specs/`：可实现、可测试的 wire/state 合同。
 - `docs/decisions/`：为什么选择这些边界。

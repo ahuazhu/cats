@@ -3,6 +3,7 @@
 - 状态：Accepted
 - 日期：2026-08-08
 - 规格：[Volume Authority 与磁盘生命周期](../specs/volume-authority.md)
+- Runtime mutation transport：[Runtime Volume Transitions v1](../specs/runtime-volume-transitions-v1.md)
 
 ## 背景
 

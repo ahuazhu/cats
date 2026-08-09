@@ -5,6 +5,7 @@
 - 取代：ADR-0027、ADR-0028、ADR-0030、ADR-0035，以及 ADR-0002 中的旧协调合同
 - 规格：[Runtime Reconciliation v1](../specs/runtime-reconciliation-v1.md)
 - Internal delivery/acceptance：[Runtime Inventory and Observation Spine v1](../specs/runtime-inventory-observation-v1.md)
+- Volume transition transport：[Runtime Volume Transitions v1](../specs/runtime-volume-transitions-v1.md)
 - composition：[Runtime Composition Artifacts v1](../specs/runtime-composition-artifacts-v1.md)
 
 ## 背景
@@ -48,7 +49,9 @@ DesiredRuntimeSpec(revision, placement)
 5. Route admission 使用 [ADR-0041](0041-node-verified-route-admission.md) 的本地 gate/guard。
 
 Volume 的精确状态机由 [Volume Authority](../specs/volume-authority.md) 定义；Runtime 只编排
-它的窄acquire/publish/release/takeover/delete接口。
+它的窄acquire/publish/release/takeover/delete接口。Node到Control的acquire/release/disposable consume
+只使用[Runtime Volume Transitions v1](../specs/runtime-volume-transitions-v1.md)冻结的签名HTTP边界和单一
+PostgreSQL transaction；blockd不获得ownership mutation能力。
 
 只有能把业务rows与结果在唯一Control PostgreSQL事务中原子提交的Workspace product mutation使用
 `ApiIdempotencyResult`；精确scope、request envelope、fingerprint和重放合同以
