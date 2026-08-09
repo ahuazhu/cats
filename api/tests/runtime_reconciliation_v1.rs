@@ -68,6 +68,58 @@ fn normal_acquire_step(lease_duration_ms: u64) -> serde_json::Value {
     })
 }
 
+fn provision_root_image_step(size_bytes: u64) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "provision_root_image",
+        "provision_transition_id": "1234567890abcdef1234567890abcdef",
+        "volume_id": "vol_root",
+        "attachment_id": "att_01",
+        "attachment_epoch": 8,
+        "scope_id": "cats-cat_01-root-provision",
+        "control_socket_path": "/run/cats/cat_01/blockd-root.sock",
+        "data_directory": "/var/lib/cats/vol_root",
+        "process_identity_token": "fedcba0987654321fedcba0987654321",
+        "size_bytes": size_bytes,
+        "boot_image_digest": ZERO_DIGEST,
+        "expected_blank_head": zero_remote_head(),
+        "expected_provisioned_head": nonzero_remote_head(),
+    })
+}
+
+fn provision_root_image_request_value() -> serde_json::Value {
+    serde_json::json!({
+        "provision_transition_id": "1234567890abcdef1234567890abcdef",
+        "volume_id": "vol_root",
+        "attachment_id": "att_01",
+        "attachment_epoch": 8,
+        "size_bytes": 4_294_967_296_u64,
+        "boot_image_digest": ZERO_DIGEST,
+        "expected_blank_head": zero_remote_head(),
+        "expected_provisioned_head": nonzero_remote_head(),
+    })
+}
+
+fn provision_root_image_result_value() -> serde_json::Value {
+    serde_json::json!({
+        "provision_transition_id": "1234567890abcdef1234567890abcdef",
+        "volume_id": "vol_root",
+        "attachment_id": "att_01",
+        "attachment_epoch": 8,
+        "resulting_head": nonzero_remote_head(),
+    })
+}
+
+fn provision_root_image_error_value(kind: &str, problem: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kind": kind,
+        "provision_transition_id": "1234567890abcdef1234567890abcdef",
+        "volume_id": "vol_root",
+        "attachment_id": "att_01",
+        "attachment_epoch": 8,
+        "problem": problem,
+    })
+}
+
 fn checkpoint_route_gate(endpoint_id: &str, route_epoch: u64, gate: &str) -> serde_json::Value {
     serde_json::json!({
         "binding": {
@@ -185,6 +237,30 @@ fn reject_contract_error(bytes: &[u8]) -> ContractError {
     decode_contract_error(bytes).unwrap_err()
 }
 
+fn reject_provision_request(bytes: &[u8]) -> ProvisionRootImageWireDecodeError {
+    decode_provision_root_image_request(bytes).unwrap_err()
+}
+
+fn reject_provision_result(bytes: &[u8]) -> ProvisionRootImageWireDecodeError {
+    decode_provision_root_image_result(bytes).unwrap_err()
+}
+
+fn reject_provision_error(bytes: &[u8]) -> ProvisionRootImageWireDecodeError {
+    decode_provision_root_image_error(bytes).unwrap_err()
+}
+
+fn accept_provision_request(bytes: &[u8]) -> Result<(), ProvisionRootImageWireDecodeError> {
+    decode_provision_root_image_request(bytes).map(|_| ())
+}
+
+fn accept_provision_result(bytes: &[u8]) -> Result<(), ProvisionRootImageWireDecodeError> {
+    decode_provision_root_image_result(bytes).map(|_| ())
+}
+
+fn accept_provision_error(bytes: &[u8]) -> Result<(), ProvisionRootImageWireDecodeError> {
+    decode_provision_root_image_error(bytes).map(|_| ())
+}
+
 fn complete_observation_wire(projection: &str, claim: &str) -> Vec<u8> {
     let mut value: serde_json::Value = serde_json::from_str(projection).unwrap();
     let object = value.as_object_mut().unwrap();
@@ -253,6 +329,20 @@ fn malformed(error: &ContractError) -> (&JsonPointer, MalformedProblem) {
             ..
         } => (json_pointer, *problem),
         detail => panic!("expected malformed_payload, got {detail:?}"),
+    }
+}
+
+fn provision_wire_malformed(
+    error: &ProvisionRootImageWireDecodeError,
+) -> (&JsonPointer, MalformedProblem) {
+    match error {
+        ProvisionRootImageWireDecodeError::Malformed {
+            json_pointer,
+            problem,
+        } => (json_pointer, *problem),
+        ProvisionRootImageWireDecodeError::WireBytesLimitExceeded { .. } => {
+            panic!("expected malformed provision payload, got {error:?}")
+        }
     }
 }
 
@@ -1354,6 +1444,10 @@ fn volume_and_gate_reconcile_steps_round_trip_without_copied_authority_payloads(
         ),
         ("normal_acquire", normal_acquire_step(1)),
         (
+            "provision_root_image",
+            provision_root_image_step(4_294_967_296),
+        ),
+        (
             "takeover_acquire",
             serde_json::json!({
                 "kind": "acquire_volume",
@@ -1424,6 +1518,425 @@ fn volume_and_gate_reconcile_steps_round_trip_without_copied_authority_payloads(
             decoded,
             "{name}",
         );
+    }
+}
+
+#[test]
+fn provision_root_image_step_is_shared_by_every_wire_host() {
+    let step = provision_root_image_step(4_294_967_296);
+
+    let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+    checkpoint["step"] = step.clone();
+    let decoded = decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+    assert!(matches!(
+        decoded.step,
+        ReconcileStep::ProvisionRootImage {
+            size_bytes: 4_294_967_296,
+            ..
+        }
+    ));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&encode_runtime_checkpoint(&decoded).unwrap())
+            .unwrap(),
+        checkpoint,
+    );
+
+    let mut observation = nonempty_observation_value();
+    observation["runtimes"][0]["step"] = step.clone();
+    observation["runtimes"][0]["checkpoint"]["step"] = step.clone();
+    refresh_inventory_digest(&mut observation);
+    let decoded = decode_node_observation(&serde_json::to_vec(&observation).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&encode_node_observation(&decoded).unwrap())
+            .unwrap(),
+        observation,
+    );
+
+    let mut condition_host = nonempty_observation_value();
+    condition_host["runtimes"][0]["conditions"] = serde_json::json!([{
+        "kind": "progressing",
+        "reason": {"kind": "reconcile_step", "step": step},
+    }]);
+    decode_node_observation(&serde_json::to_vec(&condition_host).unwrap()).unwrap();
+
+    // Standalone F0 checks each RemoteHead's intrinsic nullability, but the
+    // Desired/grant/manifest bindings and exact blank/generation-one roles are
+    // deliberately context-bound.
+    let mut context_bound = checkpoint;
+    context_bound["step"]["expected_blank_head"] = serde_json::json!({
+        "generation": 2,
+        "root_hash": ZERO_DIGEST,
+        "root_object_id": "volumes/vol_root/roots/2",
+    });
+    context_bound["step"]["expected_provisioned_head"] = zero_remote_head();
+    decode_runtime_checkpoint(&serde_json::to_vec(&context_bound).unwrap()).unwrap();
+}
+
+#[test]
+fn provision_root_image_reuses_remote_head_validation_in_every_wire_host() {
+    type Reject = fn(&[u8]) -> ContractError;
+
+    let mut invalid_step = provision_root_image_step(4_294_967_296);
+    invalid_step["expected_provisioned_head"] = serde_json::json!({
+        "generation": 1,
+        "root_hash": null,
+        "root_object_id": null,
+    });
+
+    let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+    checkpoint["step"] = invalid_step.clone();
+
+    let mut observation = nonempty_observation_value();
+    observation["runtimes"][0]["step"] = invalid_step.clone();
+    observation["runtimes"][0]["checkpoint"]["step"] = invalid_step.clone();
+
+    let mut condition_host = nonempty_observation_value();
+    condition_host["runtimes"][0]["conditions"] = serde_json::json!([{
+        "kind": "progressing",
+        "reason": {"kind": "reconcile_step", "step": invalid_step},
+    }]);
+
+    let cases: Vec<(&str, serde_json::Value, Reject, &str)> = vec![
+        (
+            "runtime_checkpoint",
+            checkpoint,
+            reject_checkpoint,
+            "/step/expected_provisioned_head",
+        ),
+        (
+            "observation_runtime_and_checkpoint",
+            observation,
+            reject_observation,
+            "/runtimes/0/checkpoint/step/expected_provisioned_head",
+        ),
+        (
+            "progressing_condition",
+            condition_host,
+            reject_observation,
+            "/runtimes/0/conditions/0/reason/step/expected_provisioned_head",
+        ),
+    ];
+
+    for (host, value, reject, pointer) in cases {
+        let error = reject(&serde_json::to_vec(&value).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), pointer, "{host}");
+        assert_eq!(
+            malformed(&error).1,
+            MalformedProblem::InvalidValue,
+            "{host}"
+        );
+    }
+}
+
+#[test]
+fn provision_root_image_size_and_shape_are_strict() {
+    for size_bytes in [1, i64::MAX as u64] {
+        let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+        checkpoint["step"] = provision_root_image_step(size_bytes);
+        decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+    }
+
+    for size_bytes in [0, i64::MAX as u64 + 1] {
+        let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+        checkpoint["step"] = provision_root_image_step(size_bytes);
+        let error = reject_checkpoint(&serde_json::to_vec(&checkpoint).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), "/step/size_bytes");
+        assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+    }
+
+    let mut missing = provision_root_image_step(1);
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("provision_transition_id");
+    let mut expanded = provision_root_image_step(1);
+    expanded
+        .as_object_mut()
+        .unwrap()
+        .insert("manifest".to_owned(), serde_json::json!({"copied": true}));
+    let mut old_heads = provision_root_image_step(1);
+    old_heads
+        .as_object_mut()
+        .unwrap()
+        .remove("expected_blank_head");
+    old_heads
+        .as_object_mut()
+        .unwrap()
+        .insert("expected_blank_generation".to_owned(), 0.into());
+    let alias = serde_json::json!({
+        "kind": "seed_root_image",
+        "provision_transition_id": "1234567890abcdef1234567890abcdef",
+    });
+    let cases = [
+        (
+            "missing_transition",
+            missing,
+            "/step/provision_transition_id",
+            MalformedProblem::MissingField,
+        ),
+        (
+            "expanded_manifest",
+            expanded,
+            "/step/manifest",
+            MalformedProblem::UnknownField,
+        ),
+        (
+            "old_split_head",
+            old_heads,
+            "/step/expected_blank_generation",
+            MalformedProblem::UnknownField,
+        ),
+        (
+            "implicit_seed_alias",
+            alias,
+            "/step/kind",
+            MalformedProblem::InvalidValue,
+        ),
+    ];
+    for (name, step, pointer, problem) in cases {
+        let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
+        checkpoint["step"] = step;
+        let error = reject_checkpoint(&serde_json::to_vec(&checkpoint).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), pointer, "{name}");
+        assert_eq!(malformed(&error).1, problem, "{name}");
+    }
+}
+
+#[test]
+fn root_provision_conditions_and_operation_failure_are_closed_and_typed() {
+    let blocked = serde_json::json!({
+        "kind": "blocked",
+        "reason": {
+            "kind": "root_image_unavailable",
+            "boot_image_digest": ZERO_DIGEST,
+        },
+    });
+    let quarantined_reason = serde_json::json!({
+        "kind": "root_provision_conflict",
+        "volume_id": "vol_root",
+        "provision_transition_id": "1234567890abcdef1234567890abcdef",
+        "problem": "immutable_object",
+    });
+    let quarantined = serde_json::json!({
+        "kind": "quarantined",
+        "reason": quarantined_reason.clone(),
+    });
+
+    for condition in [blocked.clone(), quarantined] {
+        let mut observation = nonempty_observation_value();
+        observation["runtimes"][0]["conditions"] = serde_json::json!([condition]);
+        let decoded = decode_node_observation(&serde_json::to_vec(&observation).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &encode_node_observation(&decoded).unwrap()
+            )
+            .unwrap(),
+            observation,
+        );
+    }
+
+    let mut operation = operation_value();
+    operation["phase"] = "failed".into();
+    operation["terminal"] = serde_json::json!({
+        "kind": "failed",
+        "error": {"kind": "quarantined", "reason": quarantined_reason},
+        "completed_at_unix_ms": 1,
+    });
+    let decoded = decode_operation(&serde_json::to_vec(&operation).unwrap()).unwrap();
+    assert!(matches!(
+        &decoded.terminal,
+        Some(OperationTerminal::Failed { error, .. })
+            if matches!(
+                error.as_ref(),
+                OperationFailure::Quarantined { reason }
+                    if matches!(
+                        reason.as_ref(),
+                        QuarantineReason::RootProvisionConflict {
+                            problem: RootProvisionConflictProblem::ImmutableObject,
+                            ..
+                        }
+                    )
+            )
+    ));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&encode_operation(&decoded).unwrap()).unwrap(),
+        operation,
+    );
+    operation["terminal"]["error"]["reason"]["problem"] = "opaque_message".into();
+    let error = reject_operation(&serde_json::to_vec(&operation).unwrap());
+    assert_eq!(
+        malformed(&error).0.as_str(),
+        "/terminal/error/reason/problem"
+    );
+    assert_eq!(malformed(&error).1, MalformedProblem::InvalidValue);
+
+    let mut cases = Vec::new();
+    let mut missing = blocked.clone();
+    missing["reason"]
+        .as_object_mut()
+        .unwrap()
+        .remove("boot_image_digest");
+    cases.push((
+        "blocked_missing_digest",
+        missing,
+        "/runtimes/0/conditions/0/reason/boot_image_digest",
+        MalformedProblem::MissingField,
+    ));
+    let mut expanded = blocked;
+    expanded["reason"]
+        .as_object_mut()
+        .unwrap()
+        .insert("message".to_owned(), "try another image".into());
+    cases.push((
+        "blocked_expanded_message",
+        expanded,
+        "/runtimes/0/conditions/0/reason/message",
+        MalformedProblem::UnknownField,
+    ));
+    let mut wrong_blocked_scalar = serde_json::json!({
+        "kind": "blocked",
+        "reason": {
+            "kind": "root_image_unavailable",
+            "boot_image_digest": ZERO_DIGEST,
+        },
+    });
+    wrong_blocked_scalar["reason"]["boot_image_digest"] = 1.into();
+    cases.push((
+        "blocked_wrong_scalar_type",
+        wrong_blocked_scalar,
+        "/runtimes/0/conditions/0/reason/boot_image_digest",
+        MalformedProblem::InvalidType,
+    ));
+    let mut missing_conflict_field = serde_json::json!({
+        "kind": "quarantined",
+        "reason": {
+            "kind": "root_provision_conflict",
+            "volume_id": "vol_root",
+            "provision_transition_id": "1234567890abcdef1234567890abcdef",
+            "problem": "local_state",
+        },
+    });
+    missing_conflict_field["reason"]
+        .as_object_mut()
+        .unwrap()
+        .remove("provision_transition_id");
+    cases.push((
+        "conflict_missing_transition",
+        missing_conflict_field,
+        "/runtimes/0/conditions/0/reason/provision_transition_id",
+        MalformedProblem::MissingField,
+    ));
+    let mut wrong_conflict_scalar = serde_json::json!({
+        "kind": "quarantined",
+        "reason": {
+            "kind": "root_provision_conflict",
+            "volume_id": "vol_root",
+            "provision_transition_id": "1234567890abcdef1234567890abcdef",
+            "problem": "local_state",
+        },
+    });
+    wrong_conflict_scalar["reason"]["volume_id"] = 1.into();
+    cases.push((
+        "conflict_wrong_scalar_type",
+        wrong_conflict_scalar,
+        "/runtimes/0/conditions/0/reason/volume_id",
+        MalformedProblem::InvalidType,
+    ));
+    let mut unknown_problem = serde_json::json!({
+        "kind": "quarantined",
+        "reason": {
+            "kind": "root_provision_conflict",
+            "volume_id": "vol_root",
+            "provision_transition_id": "1234567890abcdef1234567890abcdef",
+            "problem": "opaque_message",
+        },
+    });
+    cases.push((
+        "unknown_conflict_problem",
+        unknown_problem.clone(),
+        "/runtimes/0/conditions/0/reason/problem",
+        MalformedProblem::InvalidValue,
+    ));
+    unknown_problem["reason"]
+        .as_object_mut()
+        .unwrap()
+        .insert("evidence".to_owned(), serde_json::json!({}));
+    cases.push((
+        "expanded_conflict_evidence",
+        unknown_problem,
+        "/runtimes/0/conditions/0/reason/evidence",
+        MalformedProblem::UnknownField,
+    ));
+
+    for (name, condition, pointer, problem) in cases {
+        let mut observation = nonempty_observation_value();
+        observation["runtimes"][0]["conditions"] = serde_json::json!([condition]);
+        let error = reject_observation(&serde_json::to_vec(&observation).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), pointer, "{name}");
+        assert_eq!(malformed(&error).1, problem, "{name}");
+    }
+}
+
+#[test]
+fn new_condition_reasons_extend_the_existing_total_order() {
+    let key_ring = serde_json::json!({
+        "kind": "blocked",
+        "reason": {
+            "kind": "key_ring_unavailable",
+            "expected_version": 1,
+            "expected_digest": ZERO_DIGEST,
+            "loaded_version": null,
+            "loaded_digest": null,
+        },
+    });
+    let image = serde_json::json!({
+        "kind": "blocked",
+        "reason": {"kind": "root_image_unavailable", "boot_image_digest": ZERO_DIGEST},
+    });
+    let route_binding = checkpoint_route_gate("ep_01", 9, "closed")["binding"].clone();
+    let mut observed_binding = route_binding.clone();
+    observed_binding["route_epoch"] = 10.into();
+    let route = serde_json::json!({
+        "kind": "quarantined",
+        "reason": {
+            "kind": "route_gate_conflict",
+            "endpoint_id": "ep_01",
+            "expected_binding": route_binding,
+            "observed_binding": observed_binding,
+        },
+    });
+    let provision = serde_json::json!({
+        "kind": "quarantined",
+        "reason": {
+            "kind": "root_provision_conflict",
+            "volume_id": "vol_root",
+            "provision_transition_id": "1234567890abcdef1234567890abcdef",
+            "problem": "head_conflict",
+        },
+    });
+
+    for (name, ordered, reversed) in [
+        (
+            "blocked_reason_rank",
+            vec![key_ring.clone(), image.clone()],
+            vec![image, key_ring],
+        ),
+        (
+            "quarantine_reason_rank",
+            vec![route.clone(), provision.clone()],
+            vec![provision, route],
+        ),
+    ] {
+        let mut valid = nonempty_observation_value();
+        valid["runtimes"][0]["conditions"] = ordered.into();
+        decode_node_observation(&serde_json::to_vec(&valid).unwrap())
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+
+        let mut invalid = nonempty_observation_value();
+        invalid["runtimes"][0]["conditions"] = reversed.into();
+        let error = reject_observation(&serde_json::to_vec(&invalid).unwrap());
+        assert_eq!(malformed(&error).0.as_str(), "/runtimes/0/conditions");
+        assert_eq!(malformed(&error).1, MalformedProblem::NonCanonicalOrder);
     }
 }
 
@@ -2887,6 +3400,699 @@ fn quarantine_identity_reasons_preserve_conflict_evidence() {
     operation["terminal"]["error"]["reason"]["observed_incarnations"] =
         serde_json::json!([expected, different]);
     decode_operation(&serde_json::to_vec(&operation).unwrap()).unwrap();
+}
+
+#[test]
+fn provision_root_image_payloads_round_trip_canonical_wire() {
+    let request_value = provision_root_image_request_value();
+    let request =
+        decode_provision_root_image_request(&serde_json::to_vec(&request_value).unwrap()).unwrap();
+    let request_bytes = encode_provision_root_image_request(&request).unwrap();
+    assert_eq!(
+        request_bytes,
+        format!(
+            "{{\"attachment_epoch\":8,\"attachment_id\":\"att_01\",\"boot_image_digest\":\"{ZERO_DIGEST}\",\"expected_blank_head\":{{\"generation\":0,\"root_hash\":null,\"root_object_id\":null}},\"expected_provisioned_head\":{{\"generation\":1,\"root_hash\":\"{ZERO_DIGEST}\",\"root_object_id\":\"volumes/vol_root/roots/1\"}},\"provision_transition_id\":\"1234567890abcdef1234567890abcdef\",\"size_bytes\":4294967296,\"volume_id\":\"vol_root\"}}"
+        )
+        .into_bytes(),
+    );
+    assert_eq!(
+        decode_provision_root_image_request(&request_bytes).unwrap(),
+        request
+    );
+
+    let result_value = provision_root_image_result_value();
+    let result =
+        decode_provision_root_image_result(&serde_json::to_vec(&result_value).unwrap()).unwrap();
+    let result_bytes = encode_provision_root_image_result(&result).unwrap();
+    assert_eq!(
+        result_bytes,
+        format!(
+            "{{\"attachment_epoch\":8,\"attachment_id\":\"att_01\",\"provision_transition_id\":\"1234567890abcdef1234567890abcdef\",\"resulting_head\":{{\"generation\":1,\"root_hash\":\"{ZERO_DIGEST}\",\"root_object_id\":\"volumes/vol_root/roots/1\"}},\"volume_id\":\"vol_root\"}}"
+        )
+        .into_bytes(),
+    );
+    assert_eq!(
+        decode_provision_root_image_result(&result_bytes).unwrap(),
+        result
+    );
+
+    let variants: [(&str, &[&str]); 2] = [
+        (
+            "retryable",
+            &[
+                "image_unavailable",
+                "object_store_unavailable",
+                "authority_unavailable",
+                "local_io_unavailable",
+            ],
+        ),
+        (
+            "definite_conflict",
+            &[
+                "request_binding",
+                "image_manifest",
+                "target_mismatch",
+                "local_state",
+                "immutable_object",
+            ],
+        ),
+    ];
+    for (kind, problems) in variants {
+        for problem in problems {
+            let value = provision_root_image_error_value(kind, problem);
+            let decoded =
+                decode_provision_root_image_error(&serde_json::to_vec(&value).unwrap()).unwrap();
+            let encoded = encode_provision_root_image_error(&decoded).unwrap();
+            if kind == "retryable" && *problem == "image_unavailable" {
+                assert_eq!(
+                    encoded,
+                    b"{\"attachment_epoch\":8,\"attachment_id\":\"att_01\",\"kind\":\"retryable\",\"problem\":\"image_unavailable\",\"provision_transition_id\":\"1234567890abcdef1234567890abcdef\",\"volume_id\":\"vol_root\"}"
+                );
+            }
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&encoded).unwrap(),
+                value,
+                "{kind}.{problem}",
+            );
+            assert_eq!(
+                decode_provision_root_image_error(&encoded).unwrap(),
+                decoded,
+                "{kind}.{problem}",
+            );
+        }
+    }
+
+    let retryable = decode_provision_root_image_error(
+        &serde_json::to_vec(&provision_root_image_error_value(
+            "retryable",
+            "authority_unavailable",
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        retryable,
+        ProvisionRootImageError::Retryable {
+            problem: ProvisionRootImageRetryableProblem::AuthorityUnavailable,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn provision_root_image_payload_schema_is_strict_and_deterministic() {
+    let request_value = provision_root_image_request_value();
+    let valid_request = serde_json::to_string(&request_value).unwrap();
+
+    let duplicate = replace_once(
+        &valid_request,
+        r#""volume_id":"vol_root""#,
+        r#""volume_id":"vol_root","volume_id":"vol_other""#,
+    );
+    let error = reject_provision_request(&duplicate);
+    assert_eq!(provision_wire_malformed(&error).0.as_str(), "/volume_id");
+    assert_eq!(
+        provision_wire_malformed(&error).1,
+        MalformedProblem::DuplicateField
+    );
+
+    let mut request_cases = Vec::new();
+    let mut missing = request_value.clone();
+    missing.as_object_mut().unwrap().remove("volume_id");
+    request_cases.push((
+        "missing",
+        missing,
+        "/volume_id",
+        MalformedProblem::MissingField,
+    ));
+    let mut unknown = request_value.clone();
+    unknown
+        .as_object_mut()
+        .unwrap()
+        .insert("image_id".to_owned(), "old-seed-alias".into());
+    request_cases.push((
+        "unknown",
+        unknown,
+        "/image_id",
+        MalformedProblem::UnknownField,
+    ));
+    let mut versioned = request_value.clone();
+    versioned
+        .as_object_mut()
+        .unwrap()
+        .insert("version".to_owned(), 1.into());
+    request_cases.push((
+        "no_runtime_version_space",
+        versioned,
+        "/version",
+        MalformedProblem::UnknownField,
+    ));
+    let mut wrong_type = request_value.clone();
+    wrong_type["attachment_epoch"] = "8".into();
+    request_cases.push((
+        "wrong_type",
+        wrong_type,
+        "/attachment_epoch",
+        MalformedProblem::InvalidType,
+    ));
+    let mut invalid_value = request_value;
+    invalid_value["size_bytes"] = 0.into();
+    request_cases.push((
+        "invalid_value",
+        invalid_value,
+        "/size_bytes",
+        MalformedProblem::InvalidValue,
+    ));
+    for (name, value, pointer, problem) in request_cases {
+        let error = reject_provision_request(&serde_json::to_vec(&value).unwrap());
+        assert_eq!(
+            provision_wire_malformed(&error).0.as_str(),
+            pointer,
+            "{name}"
+        );
+        assert_eq!(provision_wire_malformed(&error).1, problem, "{name}");
+    }
+
+    let mut result = provision_root_image_result_value();
+    result.as_object_mut().unwrap().remove("resulting_head");
+    let error = reject_provision_result(&serde_json::to_vec(&result).unwrap());
+    assert_eq!(
+        provision_wire_malformed(&error).0.as_str(),
+        "/resulting_head"
+    );
+    assert_eq!(
+        provision_wire_malformed(&error).1,
+        MalformedProblem::MissingField
+    );
+
+    let mut result = provision_root_image_result_value();
+    result
+        .as_object_mut()
+        .unwrap()
+        .insert("root_hash".to_owned(), ZERO_DIGEST.into());
+    let error = reject_provision_result(&serde_json::to_vec(&result).unwrap());
+    assert_eq!(provision_wire_malformed(&error).0.as_str(), "/root_hash");
+    assert_eq!(
+        provision_wire_malformed(&error).1,
+        MalformedProblem::UnknownField
+    );
+
+    let mut local_error = provision_root_image_error_value("retryable", "image_unavailable");
+    local_error.as_object_mut().unwrap().remove("kind");
+    let error = reject_provision_error(&serde_json::to_vec(&local_error).unwrap());
+    assert_eq!(provision_wire_malformed(&error).0.as_str(), "/kind");
+    assert_eq!(
+        provision_wire_malformed(&error).1,
+        MalformedProblem::MissingField
+    );
+
+    let mut local_error = provision_root_image_error_value("retryable", "image_unavailable");
+    local_error
+        .as_object_mut()
+        .unwrap()
+        .insert("message".to_owned(), "opaque".into());
+    let error = reject_provision_error(&serde_json::to_vec(&local_error).unwrap());
+    assert_eq!(provision_wire_malformed(&error).0.as_str(), "/message");
+    assert_eq!(
+        provision_wire_malformed(&error).1,
+        MalformedProblem::UnknownField
+    );
+
+    for (name, value, pointer, problem) in [
+        (
+            "unknown_kind",
+            provision_root_image_error_value("conflict", "request_binding"),
+            "/kind",
+            MalformedProblem::InvalidValue,
+        ),
+        (
+            "retryable_problem_cannot_expand",
+            provision_root_image_error_value("retryable", "head_conflict"),
+            "/problem",
+            MalformedProblem::InvalidValue,
+        ),
+        (
+            "definite_problem_cannot_expand",
+            provision_root_image_error_value("definite_conflict", "authority_unavailable"),
+            "/problem",
+            MalformedProblem::InvalidValue,
+        ),
+    ] {
+        let error = reject_provision_error(&serde_json::to_vec(&value).unwrap());
+        assert_eq!(
+            provision_wire_malformed(&error).0.as_str(),
+            pointer,
+            "{name}"
+        );
+        assert_eq!(provision_wire_malformed(&error).1, problem, "{name}");
+    }
+
+    let prefix = valid_request.strip_suffix('}').unwrap();
+    for members in [r#""zzz":0,"aaa":0"#, r#""aaa":0,"zzz":0"#] {
+        let input = format!("{prefix},{members}}}");
+        let error = reject_provision_request(input.as_bytes());
+        assert_eq!(provision_wire_malformed(&error).0.as_str(), "/aaa");
+        assert_eq!(
+            provision_wire_malformed(&error).1,
+            MalformedProblem::UnknownField
+        );
+    }
+}
+
+#[test]
+fn provision_root_image_payload_transport_numeric_and_depth_boundaries_are_closed() {
+    let valid_request = serde_json::to_string(&provision_root_image_request_value()).unwrap();
+    for (name, input, problem) in [
+        ("invalid_utf8", vec![0xff], MalformedProblem::InvalidUtf8),
+        ("invalid_json", b"{".to_vec(), MalformedProblem::InvalidJson),
+        (
+            "trailing_value",
+            format!("{valid_request}[]").into_bytes(),
+            MalformedProblem::InvalidJson,
+        ),
+    ] {
+        let error = reject_provision_request(&input);
+        assert_eq!(provision_wire_malformed(&error).0.as_str(), "", "{name}");
+        assert_eq!(provision_wire_malformed(&error).1, problem, "{name}");
+    }
+
+    let duplicate_then_bad_tail = replace_once(
+        &format!("{valid_request}[]"),
+        r#""volume_id":"vol_root""#,
+        r#""volume_id":"vol_root","volume_id":"vol_other""#,
+    );
+    let error = reject_provision_request(&duplicate_then_bad_tail);
+    assert_eq!(provision_wire_malformed(&error).0.as_str(), "");
+    assert_eq!(
+        provision_wire_malformed(&error).1,
+        MalformedProblem::InvalidJson
+    );
+
+    for (field, original, replacement) in [
+        ("attachment_epoch", "8", "-0"),
+        ("attachment_epoch", "8", "8e0"),
+        ("size_bytes", "4294967296", "1.0"),
+        ("size_bytes", "4294967296", "9223372036854775808"),
+    ] {
+        let needle = format!(r#""{field}":{original}"#);
+        let replacement = format!(r#""{field}":{replacement}"#);
+        let input = replace_once(&valid_request, &needle, &replacement);
+        let error = reject_provision_request(&input);
+        assert_eq!(
+            provision_wire_malformed(&error).0.as_str(),
+            format!("/{field}")
+        );
+        assert_eq!(
+            provision_wire_malformed(&error).1,
+            MalformedProblem::InvalidValue
+        );
+    }
+
+    let base = valid_request.strip_suffix('}').unwrap();
+    let depth = 1_500;
+    let unknown = format!(
+        "{base},\"unknown\":{}0{}}}",
+        "[".repeat(depth),
+        "]".repeat(depth)
+    );
+    assert!(unknown.len() < PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES);
+    let error = reject_provision_request(unknown.as_bytes());
+    assert_eq!(provision_wire_malformed(&error).0.as_str(), "/unknown");
+    assert_eq!(
+        provision_wire_malformed(&error).1,
+        MalformedProblem::UnknownField
+    );
+
+    let depth = 600;
+    let duplicate = format!(
+        "{base},\"unknown\":{}{{\"same\":1,\"same\":2}}{}}}",
+        "[".repeat(depth),
+        "]".repeat(depth)
+    );
+    assert!(duplicate.len() < PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES);
+    let error = reject_provision_request(duplicate.as_bytes());
+    assert_eq!(provision_wire_malformed(&error).0.as_str(), "");
+    assert_eq!(
+        provision_wire_malformed(&error).1,
+        MalformedProblem::DuplicateField
+    );
+}
+
+#[test]
+fn each_provision_payload_decoder_reuses_transport_and_scalar_stages() {
+    type Reject = fn(&[u8]) -> ProvisionRootImageWireDecodeError;
+    let cases: Vec<(&str, String, Reject)> = vec![
+        (
+            "request",
+            serde_json::to_string(&provision_root_image_request_value()).unwrap(),
+            reject_provision_request,
+        ),
+        (
+            "result",
+            serde_json::to_string(&provision_root_image_result_value()).unwrap(),
+            reject_provision_result,
+        ),
+        (
+            "error",
+            serde_json::to_string(&provision_root_image_error_value(
+                "retryable",
+                "image_unavailable",
+            ))
+            .unwrap(),
+            reject_provision_error,
+        ),
+    ];
+
+    for (name, valid, reject) in cases {
+        for (transport, input, problem) in [
+            ("utf8", vec![0xff], MalformedProblem::InvalidUtf8),
+            ("json", b"{".to_vec(), MalformedProblem::InvalidJson),
+            (
+                "bom",
+                [b"\xef\xbb\xbf".as_slice(), valid.as_bytes()].concat(),
+                MalformedProblem::InvalidJson,
+            ),
+            (
+                "tail",
+                format!("{valid}[]").into_bytes(),
+                MalformedProblem::InvalidJson,
+            ),
+        ] {
+            let error = reject(&input);
+            assert_eq!(
+                provision_wire_malformed(&error).0.as_str(),
+                "",
+                "{name}.{transport}"
+            );
+            assert_eq!(
+                provision_wire_malformed(&error).1,
+                problem,
+                "{name}.{transport}"
+            );
+        }
+
+        let duplicate = replace_once(
+            &valid,
+            r#""volume_id":"vol_root""#,
+            r#""volume_id":"vol_root","volume_id":"vol_other""#,
+        );
+        let error = reject(&duplicate);
+        assert_eq!(
+            provision_wire_malformed(&error).0.as_str(),
+            "/volume_id",
+            "{name}.duplicate"
+        );
+        assert_eq!(
+            provision_wire_malformed(&error).1,
+            MalformedProblem::DuplicateField,
+            "{name}.duplicate"
+        );
+
+        let wrong_type = replace_once(
+            &valid,
+            r#""attachment_epoch":8"#,
+            r#""attachment_epoch":"8""#,
+        );
+        let error = reject(&wrong_type);
+        assert_eq!(
+            provision_wire_malformed(&error).0.as_str(),
+            "/attachment_epoch",
+            "{name}.type"
+        );
+        assert_eq!(
+            provision_wire_malformed(&error).1,
+            MalformedProblem::InvalidType,
+            "{name}.type"
+        );
+
+        let invalid_value = replace_once(
+            &valid,
+            r#""attachment_epoch":8"#,
+            r#""attachment_epoch":-0"#,
+        );
+        let error = reject(&invalid_value);
+        assert_eq!(
+            provision_wire_malformed(&error).0.as_str(),
+            "/attachment_epoch",
+            "{name}.value"
+        );
+        assert_eq!(
+            provision_wire_malformed(&error).1,
+            MalformedProblem::InvalidValue,
+            "{name}.value"
+        );
+    }
+}
+
+#[test]
+fn all_provision_payload_caps_are_public_exact_and_shared_by_decoders() {
+    type Accept = fn(&[u8]) -> Result<(), ProvisionRootImageWireDecodeError>;
+    let cases: Vec<(&str, Vec<u8>, usize, Accept)> = vec![
+        (
+            "request",
+            serde_json::to_vec(&provision_root_image_request_value()).unwrap(),
+            PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES,
+            accept_provision_request,
+        ),
+        (
+            "result",
+            serde_json::to_vec(&provision_root_image_result_value()).unwrap(),
+            PROVISION_ROOT_IMAGE_RESULT_MAX_WIRE_BYTES,
+            accept_provision_result,
+        ),
+        (
+            "error",
+            serde_json::to_vec(&provision_root_image_error_value(
+                "retryable",
+                "image_unavailable",
+            ))
+            .unwrap(),
+            PROVISION_ROOT_IMAGE_ERROR_MAX_WIRE_BYTES,
+            accept_provision_error,
+        ),
+    ];
+    for (name, mut payload, maximum, accept) in cases {
+        assert_eq!(maximum, 4_096, "{name}");
+        payload.resize(maximum, b' ');
+        accept(&payload).unwrap_or_else(|error| panic!("{name} exact cap: {error:?}"));
+
+        payload.push(b' ');
+        let error = accept(&payload).unwrap_err();
+        assert_eq!(
+            error,
+            ProvisionRootImageWireDecodeError::WireBytesLimitExceeded {
+                maximum: WireU64::new(maximum as u64).unwrap(),
+                observed_at_least: WireU64::new(maximum as u64 + 1).unwrap(),
+            },
+            "{name}",
+        );
+    }
+}
+
+#[test]
+fn provision_payload_remote_heads_are_intrinsic_but_roles_stay_context_bound() {
+    let combinations = [
+        (0, None, None, true),
+        (0, Some(ZERO_DIGEST), None, false),
+        (0, None, Some("volumes/vol_root/roots/0"), false),
+        (
+            0,
+            Some(ZERO_DIGEST),
+            Some("volumes/vol_root/roots/0"),
+            false,
+        ),
+        (1, None, None, false),
+        (1, Some(ZERO_DIGEST), None, false),
+        (1, None, Some("volumes/vol_root/roots/1"), false),
+        (1, Some(ZERO_DIGEST), Some("volumes/vol_root/roots/1"), true),
+    ];
+    for field in ["expected_blank_head", "expected_provisioned_head"] {
+        for (generation, root_hash, root_object_id, valid) in combinations {
+            let mut request = provision_root_image_request_value();
+            request[field] = serde_json::json!({
+                "generation": generation,
+                "root_hash": root_hash,
+                "root_object_id": root_object_id,
+            });
+            let decoded =
+                decode_provision_root_image_request(&serde_json::to_vec(&request).unwrap());
+            if valid {
+                decoded.unwrap();
+            } else {
+                let error = decoded.unwrap_err();
+                assert_eq!(
+                    provision_wire_malformed(&error).0.as_str(),
+                    format!("/{field}")
+                );
+                assert_eq!(
+                    provision_wire_malformed(&error).1,
+                    MalformedProblem::InvalidValue
+                );
+            }
+        }
+    }
+
+    for (generation, root_hash, root_object_id, valid) in combinations {
+        let mut result = provision_root_image_result_value();
+        result["resulting_head"] = serde_json::json!({
+            "generation": generation,
+            "root_hash": root_hash,
+            "root_object_id": root_object_id,
+        });
+        let decoded = decode_provision_root_image_result(&serde_json::to_vec(&result).unwrap());
+        if valid {
+            decoded.unwrap();
+        } else {
+            let error = decoded.unwrap_err();
+            assert_eq!(
+                provision_wire_malformed(&error).0.as_str(),
+                "/resulting_head"
+            );
+            assert_eq!(
+                provision_wire_malformed(&error).1,
+                MalformedProblem::InvalidValue
+            );
+        }
+    }
+
+    let mut context_bound = provision_root_image_request_value();
+    context_bound["expected_blank_head"] = nonzero_remote_head();
+    context_bound["expected_provisioned_head"] = zero_remote_head();
+    decode_provision_root_image_request(&serde_json::to_vec(&context_bound).unwrap()).unwrap();
+
+    let mut scalar_precedes_cross = provision_root_image_request_value();
+    scalar_precedes_cross["volume_id"] = "bad id".into();
+    scalar_precedes_cross["expected_blank_head"] = serde_json::json!({
+        "generation": 1,
+        "root_hash": null,
+        "root_object_id": null,
+    });
+    let error = reject_provision_request(&serde_json::to_vec(&scalar_precedes_cross).unwrap());
+    assert_eq!(provision_wire_malformed(&error).0.as_str(), "/volume_id");
+    assert_eq!(
+        provision_wire_malformed(&error).1,
+        MalformedProblem::InvalidValue
+    );
+}
+
+#[test]
+fn provision_control_frame_contract_is_bounded_and_one_command_per_connection() {
+    fn first_frame_payload<'a>(
+        frame: &'a [u8],
+        prefix: &[u8],
+        maximum: usize,
+    ) -> Result<&'a [u8], &'static str> {
+        let remaining = frame.strip_prefix(prefix).ok_or("wrong prefix")?;
+        let bounded = &remaining[..remaining.len().min(maximum + 1)];
+        let line_end = bounded.iter().position(|byte| *byte == b'\n');
+        let Some(line_end) = line_end else {
+            return if remaining.len() > maximum {
+                Err("wire bytes")
+            } else {
+                Err("missing LF")
+            };
+        };
+        let payload = &remaining[..line_end];
+        if payload.ends_with(b"\r") {
+            return Err("CRLF");
+        }
+        Ok(payload)
+    }
+
+    type Accept = fn(&[u8]) -> Result<(), ProvisionRootImageWireDecodeError>;
+    let cases: Vec<(&[u8], Vec<u8>, usize, Accept)> = vec![
+        (
+            b"provision_root_image ",
+            serde_json::to_vec(&provision_root_image_request_value()).unwrap(),
+            PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES,
+            accept_provision_request,
+        ),
+        (
+            b"OK ",
+            serde_json::to_vec(&provision_root_image_result_value()).unwrap(),
+            PROVISION_ROOT_IMAGE_RESULT_MAX_WIRE_BYTES,
+            accept_provision_result,
+        ),
+        (
+            b"ERR ",
+            serde_json::to_vec(&provision_root_image_error_value(
+                "retryable",
+                "image_unavailable",
+            ))
+            .unwrap(),
+            PROVISION_ROOT_IMAGE_ERROR_MAX_WIRE_BYTES,
+            accept_provision_error,
+        ),
+    ];
+    for (prefix, mut payload, maximum, accept) in cases {
+        let canonical_payload = payload.clone();
+        payload.resize(maximum, b' ');
+        let mut frame = prefix.to_vec();
+        frame.extend_from_slice(&payload);
+        frame.push(b'\n');
+        let decoded_payload = first_frame_payload(&frame, prefix, maximum).unwrap();
+        assert_eq!(decoded_payload.len(), maximum);
+        accept(decoded_payload).unwrap();
+
+        let mut over = prefix.to_vec();
+        over.extend_from_slice(&vec![b' '; maximum + 1]);
+        over.push(b'\n');
+        assert_eq!(
+            first_frame_payload(&over, prefix, maximum),
+            Err("wire bytes")
+        );
+
+        let mut crlf = prefix.to_vec();
+        crlf.extend_from_slice(&canonical_payload);
+        crlf.extend_from_slice(b"\r\n");
+        assert_eq!(first_frame_payload(&crlf, prefix, maximum), Err("CRLF"));
+    }
+
+    let request = serde_json::to_vec(&provision_root_image_request_value()).unwrap();
+    let mut wrong_prefix = b"seed_image ".to_vec();
+    wrong_prefix.extend_from_slice(&request);
+    wrong_prefix.push(b'\n');
+    assert_eq!(
+        first_frame_payload(
+            &wrong_prefix,
+            b"provision_root_image ",
+            PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES,
+        ),
+        Err("wrong prefix")
+    );
+
+    let split = request.len() / 2;
+    let mut embedded_lf = b"provision_root_image ".to_vec();
+    embedded_lf.extend_from_slice(&request[..split]);
+    embedded_lf.push(b'\n');
+    embedded_lf.extend_from_slice(&request[split..]);
+    embedded_lf.push(b'\n');
+    let truncated = first_frame_payload(
+        &embedded_lf,
+        b"provision_root_image ",
+        PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES,
+    )
+    .unwrap();
+    let error = reject_provision_request(truncated);
+    assert_eq!(provision_wire_malformed(&error).0.as_str(), "");
+    assert_eq!(
+        provision_wire_malformed(&error).1,
+        MalformedProblem::InvalidJson
+    );
+
+    let mut followed_by_second = b"provision_root_image ".to_vec();
+    followed_by_second.extend_from_slice(&request);
+    followed_by_second.extend_from_slice(b"\nprovision_root_image ");
+    followed_by_second.extend_from_slice(&request);
+    followed_by_second.push(b'\n');
+    let first = first_frame_payload(
+        &followed_by_second,
+        b"provision_root_image ",
+        PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES,
+    )
+    .unwrap();
+    assert_eq!(first, request);
+    accept_provision_request(first).unwrap();
 }
 
 #[test]

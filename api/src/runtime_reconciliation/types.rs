@@ -649,6 +649,20 @@ pub enum ReconcileStep {
     AcquireVolume {
         request: VolumeAcquireRequest,
     },
+    ProvisionRootImage {
+        provision_transition_id: RandomId128,
+        volume_id: Id,
+        attachment_id: Id,
+        attachment_epoch: FenceEpoch,
+        scope_id: Id,
+        control_socket_path: HostPath,
+        data_directory: HostPath,
+        process_identity_token: RandomId128,
+        size_bytes: u64,
+        boot_image_digest: Sha256Digest,
+        expected_blank_head: RemoteHead,
+        expected_provisioned_head: RemoteHead,
+    },
     PrepareDevice {
         volume_id: Id,
         guest_device: GuestDeviceIdentity,
@@ -810,6 +824,67 @@ pub struct RemoteHead {
     pub generation: Generation,
     pub root_hash: Option<Sha256Digest>,
     pub root_object_id: Option<AsciiText>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisionRootImageRequest {
+    pub provision_transition_id: RandomId128,
+    pub volume_id: Id,
+    pub attachment_id: Id,
+    pub attachment_epoch: FenceEpoch,
+    pub size_bytes: u64,
+    pub boot_image_digest: Sha256Digest,
+    pub expected_blank_head: RemoteHead,
+    pub expected_provisioned_head: RemoteHead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisionRootImageResult {
+    pub provision_transition_id: RandomId128,
+    pub volume_id: Id,
+    pub attachment_id: Id,
+    pub attachment_epoch: FenceEpoch,
+    pub resulting_head: RemoteHead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProvisionRootImageError {
+    Retryable {
+        provision_transition_id: RandomId128,
+        volume_id: Id,
+        attachment_id: Id,
+        attachment_epoch: FenceEpoch,
+        problem: ProvisionRootImageRetryableProblem,
+    },
+    DefiniteConflict {
+        provision_transition_id: RandomId128,
+        volume_id: Id,
+        attachment_id: Id,
+        attachment_epoch: FenceEpoch,
+        problem: ProvisionRootImageDefiniteConflictProblem,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvisionRootImageRetryableProblem {
+    ImageUnavailable,
+    ObjectStoreUnavailable,
+    AuthorityUnavailable,
+    LocalIoUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvisionRootImageDefiniteConflictProblem {
+    RequestBinding,
+    ImageManifest,
+    TargetMismatch,
+    LocalState,
+    ImmutableObject,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1328,6 +1403,9 @@ pub enum BlockedReason {
         loaded_version: Option<Epoch>,
         loaded_digest: Option<Sha256Digest>,
     },
+    RootImageUnavailable {
+        boot_image_digest: Sha256Digest,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1476,6 +1554,23 @@ pub enum QuarantineReason {
         expected_binding: RouteGateBinding,
         observed_binding: RouteGateBinding,
     },
+    RootProvisionConflict {
+        volume_id: Id,
+        provision_transition_id: RandomId128,
+        problem: RootProvisionConflictProblem,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootProvisionConflictProblem {
+    ControlProcessIdentity,
+    RequestBinding,
+    ImageManifest,
+    TargetMismatch,
+    LocalState,
+    ImmutableObject,
+    HeadConflict,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1730,6 +1825,26 @@ pub enum MalformedProblem {
     DuplicateIdentity,
     NonCanonicalOrder,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvisionRootImageWireDecodeError {
+    Malformed {
+        json_pointer: JsonPointer,
+        problem: MalformedProblem,
+    },
+    WireBytesLimitExceeded {
+        maximum: WireU64,
+        observed_at_least: WireU64,
+    },
+}
+
+impl fmt::Display for ProvisionRootImageWireDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("root image provision payload validation failed")
+    }
+}
+
+impl std::error::Error for ProvisionRootImageWireDecodeError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

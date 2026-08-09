@@ -19,6 +19,9 @@ pub const NODE_CLEANUP_CHECKPOINT_MAX_WIRE_BYTES: usize = 65_536;
 pub const NODE_OBSERVATION_MAX_WIRE_BYTES: usize = 8_388_608;
 pub const OPERATION_MAX_WIRE_BYTES: usize = 65_536;
 pub const CONTRACT_ERROR_MAX_WIRE_BYTES: usize = 16_384;
+pub const PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES: usize = 4_096;
+pub const PROVISION_ROOT_IMAGE_RESULT_MAX_WIRE_BYTES: usize = 4_096;
+pub const PROVISION_ROOT_IMAGE_ERROR_MAX_WIRE_BYTES: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PathSegment {
@@ -1438,6 +1441,48 @@ fn render_raw_pointer(document: &RawDocument<'_>, path: &[RawPathSegment]) -> Js
         .unwrap_or_else(|| JsonPointer::new("").expect("root pointer is valid"))
 }
 
+enum PayloadValidationError {
+    Malformed {
+        json_pointer: JsonPointer,
+        problem: MalformedProblem,
+    },
+    LimitExceeded {
+        json_pointer: JsonPointer,
+        limit: LimitKind,
+        maximum: usize,
+    },
+    UnsupportedVersion(u64),
+}
+
+fn payload_malformed(candidate: Candidate) -> PayloadValidationError {
+    PayloadValidationError::Malformed {
+        json_pointer: render_pointer(&candidate.path),
+        problem: candidate.problem,
+    }
+}
+
+fn payload_malformed_duplicate(
+    document: &RawDocument<'_>,
+    candidate: RawCandidate,
+) -> PayloadValidationError {
+    PayloadValidationError::Malformed {
+        json_pointer: render_raw_pointer(document, &candidate.path),
+        problem: MalformedProblem::DuplicateField,
+    }
+}
+
+fn payload_malformed_root(problem: MalformedProblem) -> PayloadValidationError {
+    payload_malformed(Candidate::at(&[], problem))
+}
+
+fn payload_limit(path: &[PathSegment], limit: LimitKind, maximum: usize) -> PayloadValidationError {
+    PayloadValidationError::LimitExceeded {
+        json_pointer: render_pointer(path),
+        limit,
+        maximum,
+    }
+}
+
 fn malformed(contract: ContractName, candidate: Candidate) -> ContractError {
     ContractError {
         version: ContractVersion::V1,
@@ -1445,22 +1490,6 @@ fn malformed(contract: ContractName, candidate: Candidate) -> ContractError {
             contract,
             json_pointer: render_pointer(&candidate.path),
             problem: candidate.problem,
-        }),
-        message: "runtime reconciliation contract validation failed".to_owned(),
-    }
-}
-
-fn malformed_duplicate(
-    contract: ContractName,
-    document: &RawDocument<'_>,
-    candidate: RawCandidate,
-) -> ContractError {
-    ContractError {
-        version: ContractVersion::V1,
-        error: Box::new(ContractErrorDetail::MalformedPayload {
-            contract,
-            json_pointer: render_raw_pointer(document, &candidate.path),
-            problem: MalformedProblem::DuplicateField,
         }),
         message: "runtime reconciliation contract validation failed".to_owned(),
     }
@@ -1503,6 +1532,111 @@ fn unsupported_version(contract: ContractName, presented: u64) -> ContractError 
     }
 }
 
+fn contract_payload_error(contract: ContractName, error: PayloadValidationError) -> ContractError {
+    match error {
+        PayloadValidationError::Malformed {
+            json_pointer,
+            problem,
+        } => ContractError {
+            version: ContractVersion::V1,
+            error: Box::new(ContractErrorDetail::MalformedPayload {
+                contract,
+                json_pointer,
+                problem,
+            }),
+            message: "runtime reconciliation contract validation failed".to_owned(),
+        },
+        PayloadValidationError::LimitExceeded {
+            json_pointer,
+            limit,
+            maximum,
+        } => ContractError {
+            version: ContractVersion::V1,
+            error: Box::new(ContractErrorDetail::LimitExceeded {
+                contract,
+                json_pointer,
+                limit,
+                maximum: WireU64::new(maximum as u64).expect("contract limits fit the wire range"),
+                observed_at_least: WireU64::new(maximum as u64 + 1)
+                    .expect("contract limits plus one fit the wire range"),
+            }),
+            message: "runtime reconciliation contract limit exceeded".to_owned(),
+        },
+        PayloadValidationError::UnsupportedVersion(presented) => {
+            unsupported_version(contract, presented)
+        }
+    }
+}
+
+fn validate_payload<'a>(
+    bytes: &'a [u8],
+    maximum_bytes: usize,
+    schema: &Schema,
+    validate_v1_version: bool,
+) -> Result<&'a str, PayloadValidationError> {
+    if bytes.len() > maximum_bytes {
+        return Err(payload_limit(&[], LimitKind::WireBytes, maximum_bytes));
+    }
+    let input = std::str::from_utf8(bytes)
+        .map_err(|_| payload_malformed_root(MalformedProblem::InvalidUtf8))?;
+    let raw = Parser::new(input)
+        .parse()
+        .map_err(|_| payload_malformed_root(MalformedProblem::InvalidJson))?;
+    let root = raw.root();
+
+    if let Some(candidate) = collect_duplicates(&raw, root) {
+        return Err(payload_malformed_duplicate(&raw, candidate));
+    }
+
+    let mut schema_candidates = SchemaCandidates::default();
+    collect_schema(schema, &raw, root, &mut Vec::new(), &mut schema_candidates);
+    if let Some(candidate) = schema_candidates
+        .shape
+        .or(schema_candidates.discriminator)
+        .or(schema_candidates.variant)
+    {
+        return Err(payload_malformed(candidate));
+    }
+
+    if validate_v1_version {
+        let version_value = raw
+            .object_member(root, "version")
+            .and_then(|value| {
+                (raw.kind(value) == PrimitiveKind::Number)
+                    .then(|| parse_wire_integer(raw.text(value)))
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                payload_malformed(Candidate::field(
+                    &[],
+                    "version",
+                    MalformedProblem::InvalidValue,
+                ))
+            })?;
+        if version_value != 1 {
+            return Err(PayloadValidationError::UnsupportedVersion(version_value));
+        }
+    }
+
+    let mut limit = None;
+    collect_limits(schema, &raw, root, &mut Vec::new(), &mut limit);
+    if let Some((candidate, maximum)) = limit {
+        return Err(payload_limit(
+            &candidate.path,
+            LimitKind::ArrayItems,
+            maximum,
+        ));
+    }
+
+    let mut scalar = None;
+    collect_scalars(schema, &raw, root, &mut Vec::new(), &mut scalar);
+    if let Some(candidate) = scalar {
+        return Err(payload_malformed(candidate));
+    }
+
+    Ok(input)
+}
+
 fn decode<T>(
     bytes: &[u8],
     contract: ContractName,
@@ -1513,68 +1647,8 @@ fn decode<T>(
 where
     T: DeserializeOwned,
 {
-    if bytes.len() > maximum_bytes {
-        return Err(limit_error(
-            contract,
-            &[],
-            LimitKind::WireBytes,
-            maximum_bytes,
-        ));
-    }
-    let input = std::str::from_utf8(bytes)
-        .map_err(|_| malformed_root(contract, MalformedProblem::InvalidUtf8))?;
-    let raw = Parser::new(input)
-        .parse()
-        .map_err(|_| malformed_root(contract, MalformedProblem::InvalidJson))?;
-    let root = raw.root();
-
-    if let Some(candidate) = collect_duplicates(&raw, root) {
-        return Err(malformed_duplicate(contract, &raw, candidate));
-    }
-
-    let mut schema_candidates = SchemaCandidates::default();
-    collect_schema(schema, &raw, root, &mut Vec::new(), &mut schema_candidates);
-    if let Some(candidate) = schema_candidates
-        .shape
-        .or(schema_candidates.discriminator)
-        .or(schema_candidates.variant)
-    {
-        return Err(malformed(contract, candidate));
-    }
-
-    let version_value = raw
-        .object_member(root, "version")
-        .and_then(|value| {
-            (raw.kind(value) == PrimitiveKind::Number)
-                .then(|| parse_wire_integer(raw.text(value)))
-                .flatten()
-        })
-        .ok_or_else(|| {
-            malformed(
-                contract,
-                Candidate::field(&[], "version", MalformedProblem::InvalidValue),
-            )
-        })?;
-    if version_value != 1 {
-        return Err(unsupported_version(contract, version_value));
-    }
-
-    let mut limit = None;
-    collect_limits(schema, &raw, root, &mut Vec::new(), &mut limit);
-    if let Some((candidate, maximum)) = limit {
-        return Err(limit_error(
-            contract,
-            &candidate.path,
-            LimitKind::ArrayItems,
-            maximum,
-        ));
-    }
-
-    let mut scalar = None;
-    collect_scalars(schema, &raw, root, &mut Vec::new(), &mut scalar);
-    if let Some(candidate) = scalar {
-        return Err(malformed(contract, candidate));
-    }
+    let input = validate_payload(bytes, maximum_bytes, schema, true)
+        .map_err(|error| contract_payload_error(contract, error))?;
 
     let decoded = serde_json::from_str(input)
         .map_err(|_| malformed_root(contract, MalformedProblem::InvalidValue))?;
@@ -1940,6 +2014,74 @@ fn remote_head_schema() -> Schema {
     ])
 }
 
+fn provision_root_image_request_schema() -> Schema {
+    object(vec![
+        field("provision_transition_id", random_id()),
+        field("volume_id", id()),
+        field("attachment_id", id()),
+        field("attachment_epoch", wire_u64()),
+        field("size_bytes", number(1, MAX_WIRE_INTEGER)),
+        field("boot_image_digest", digest()),
+        field("expected_blank_head", remote_head_schema()),
+        field("expected_provisioned_head", remote_head_schema()),
+    ])
+}
+
+fn provision_root_image_result_schema() -> Schema {
+    object(vec![
+        field("provision_transition_id", random_id()),
+        field("volume_id", id()),
+        field("attachment_id", id()),
+        field("attachment_epoch", wire_u64()),
+        field("resulting_head", remote_head_schema()),
+    ])
+}
+
+fn provision_root_image_error_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant(
+                "retryable",
+                vec![
+                    field("provision_transition_id", random_id()),
+                    field("volume_id", id()),
+                    field("attachment_id", id()),
+                    field("attachment_epoch", wire_u64()),
+                    field(
+                        "problem",
+                        closed(&[
+                            "image_unavailable",
+                            "object_store_unavailable",
+                            "authority_unavailable",
+                            "local_io_unavailable",
+                        ]),
+                    ),
+                ],
+            ),
+            variant(
+                "definite_conflict",
+                vec![
+                    field("provision_transition_id", random_id()),
+                    field("volume_id", id()),
+                    field("attachment_id", id()),
+                    field("attachment_epoch", wire_u64()),
+                    field(
+                        "problem",
+                        closed(&[
+                            "request_binding",
+                            "image_manifest",
+                            "target_mismatch",
+                            "local_state",
+                            "immutable_object",
+                        ]),
+                    ),
+                ],
+            ),
+        ],
+    )
+}
+
 fn reconcile_step_schema() -> Schema {
     union(
         "kind",
@@ -1957,6 +2099,23 @@ fn reconcile_step_schema() -> Schema {
             variant(
                 "acquire_volume",
                 vec![field("request", volume_acquire_request_schema())],
+            ),
+            variant(
+                "provision_root_image",
+                vec![
+                    field("provision_transition_id", random_id()),
+                    field("volume_id", id()),
+                    field("attachment_id", id()),
+                    field("attachment_epoch", wire_u64()),
+                    field("scope_id", id()),
+                    field("control_socket_path", string(StringRule::HostPath)),
+                    field("data_directory", string(StringRule::HostPath)),
+                    field("process_identity_token", random_id()),
+                    field("size_bytes", number(1, MAX_WIRE_INTEGER)),
+                    field("boot_image_digest", digest()),
+                    field("expected_blank_head", remote_head_schema()),
+                    field("expected_provisioned_head", remote_head_schema()),
+                ],
             ),
             variant(
                 "prepare_device",
@@ -2625,6 +2784,10 @@ fn blocked_reason_schema() -> Schema {
                     field("loaded_digest", nullable(digest())),
                 ],
             ),
+            variant(
+                "root_image_unavailable",
+                vec![field("boot_image_digest", digest())],
+            ),
         ],
     )
 }
@@ -2811,6 +2974,25 @@ fn quarantine_reason_schema() -> Schema {
                     field("endpoint_id", id()),
                     field("expected_binding", route_binding_schema()),
                     field("observed_binding", route_binding_schema()),
+                ],
+            ),
+            variant(
+                "root_provision_conflict",
+                vec![
+                    field("volume_id", id()),
+                    field("provision_transition_id", random_id()),
+                    field(
+                        "problem",
+                        closed(&[
+                            "control_process_identity",
+                            "request_binding",
+                            "image_manifest",
+                            "target_mismatch",
+                            "local_state",
+                            "immutable_object",
+                            "head_conflict",
+                        ]),
+                    ),
                 ],
             ),
         ],
@@ -3330,6 +3512,161 @@ static NODE_CLEANUP_CHECKPOINT_SCHEMA: LazyLock<Schema> =
 static NODE_OBSERVATION_SCHEMA: LazyLock<Schema> = LazyLock::new(node_observation_schema);
 static OPERATION_SCHEMA: LazyLock<Schema> = LazyLock::new(operation_schema);
 static CONTRACT_ERROR_SCHEMA: LazyLock<Schema> = LazyLock::new(contract_error_schema);
+static PROVISION_ROOT_IMAGE_REQUEST_SCHEMA: LazyLock<Schema> =
+    LazyLock::new(provision_root_image_request_schema);
+static PROVISION_ROOT_IMAGE_RESULT_SCHEMA: LazyLock<Schema> =
+    LazyLock::new(provision_root_image_result_schema);
+static PROVISION_ROOT_IMAGE_ERROR_SCHEMA: LazyLock<Schema> =
+    LazyLock::new(provision_root_image_error_schema);
+
+fn provision_payload_error(error: PayloadValidationError) -> ProvisionRootImageWireDecodeError {
+    match error {
+        PayloadValidationError::Malformed {
+            json_pointer,
+            problem,
+        } => ProvisionRootImageWireDecodeError::Malformed {
+            json_pointer,
+            problem,
+        },
+        PayloadValidationError::LimitExceeded {
+            limit: LimitKind::WireBytes,
+            maximum,
+            ..
+        } => ProvisionRootImageWireDecodeError::WireBytesLimitExceeded {
+            maximum: WireU64::new(maximum as u64).expect("local wire limit fits the wire range"),
+            observed_at_least: WireU64::new(maximum as u64 + 1)
+                .expect("local wire limit plus one fits the wire range"),
+        },
+        // Local provision schemas contain no arrays or version field. Keep a
+        // closed fail-safe mapping here so a future private schema edit cannot
+        // leak a runtime ContractError or panic at an untrusted-input boundary.
+        PayloadValidationError::LimitExceeded { json_pointer, .. } => {
+            ProvisionRootImageWireDecodeError::Malformed {
+                json_pointer,
+                problem: MalformedProblem::InvalidValue,
+            }
+        }
+        PayloadValidationError::UnsupportedVersion(_) => {
+            ProvisionRootImageWireDecodeError::Malformed {
+                json_pointer: JsonPointer::new("").expect("root pointer is valid"),
+                problem: MalformedProblem::InvalidValue,
+            }
+        }
+    }
+}
+
+fn decode_provision_payload<T>(
+    bytes: &[u8],
+    maximum_bytes: usize,
+    schema: &Schema,
+) -> Result<T, ProvisionRootImageWireDecodeError>
+where
+    T: DeserializeOwned,
+{
+    let input =
+        validate_payload(bytes, maximum_bytes, schema, false).map_err(provision_payload_error)?;
+    serde_json::from_str(input).map_err(|_| ProvisionRootImageWireDecodeError::Malformed {
+        json_pointer: JsonPointer::new("").expect("root pointer is valid"),
+        problem: MalformedProblem::InvalidValue,
+    })
+}
+
+fn provision_cross_error(candidate: Candidate) -> ProvisionRootImageWireDecodeError {
+    ProvisionRootImageWireDecodeError::Malformed {
+        json_pointer: render_pointer(&candidate.path),
+        problem: candidate.problem,
+    }
+}
+
+fn encode_provision_payload<T>(
+    value: &T,
+    decode: fn(&[u8]) -> Result<T, ProvisionRootImageWireDecodeError>,
+) -> Result<Vec<u8>, ProvisionRootImageWireDecodeError>
+where
+    T: Serialize,
+{
+    let value =
+        serde_json::to_value(value).map_err(|_| ProvisionRootImageWireDecodeError::Malformed {
+            json_pointer: JsonPointer::new("").expect("root pointer is valid"),
+            problem: MalformedProblem::InvalidValue,
+        })?;
+    let bytes = value_bytes(&value);
+    decode(&bytes)?;
+    Ok(bytes)
+}
+
+pub fn decode_provision_root_image_request(
+    bytes: &[u8],
+) -> Result<ProvisionRootImageRequest, ProvisionRootImageWireDecodeError> {
+    let request: ProvisionRootImageRequest = decode_provision_payload(
+        bytes,
+        PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES,
+        &PROVISION_ROOT_IMAGE_REQUEST_SCHEMA,
+    )?;
+    let mut cross = Vec::new();
+    collect_remote_head_cross(
+        &request.expected_blank_head,
+        &path(&["expected_blank_head"]),
+        &mut cross,
+    );
+    collect_remote_head_cross(
+        &request.expected_provisioned_head,
+        &path(&["expected_provisioned_head"]),
+        &mut cross,
+    );
+    if let Some(candidate) = choose(cross) {
+        return Err(provision_cross_error(candidate));
+    }
+    Ok(request)
+}
+
+pub fn decode_provision_root_image_result(
+    bytes: &[u8],
+) -> Result<ProvisionRootImageResult, ProvisionRootImageWireDecodeError> {
+    let result: ProvisionRootImageResult = decode_provision_payload(
+        bytes,
+        PROVISION_ROOT_IMAGE_RESULT_MAX_WIRE_BYTES,
+        &PROVISION_ROOT_IMAGE_RESULT_SCHEMA,
+    )?;
+    let mut cross = Vec::new();
+    collect_remote_head_cross(
+        &result.resulting_head,
+        &path(&["resulting_head"]),
+        &mut cross,
+    );
+    if let Some(candidate) = choose(cross) {
+        return Err(provision_cross_error(candidate));
+    }
+    Ok(result)
+}
+
+pub fn decode_provision_root_image_error(
+    bytes: &[u8],
+) -> Result<ProvisionRootImageError, ProvisionRootImageWireDecodeError> {
+    decode_provision_payload(
+        bytes,
+        PROVISION_ROOT_IMAGE_ERROR_MAX_WIRE_BYTES,
+        &PROVISION_ROOT_IMAGE_ERROR_SCHEMA,
+    )
+}
+
+pub fn encode_provision_root_image_request(
+    value: &ProvisionRootImageRequest,
+) -> Result<Vec<u8>, ProvisionRootImageWireDecodeError> {
+    encode_provision_payload(value, decode_provision_root_image_request)
+}
+
+pub fn encode_provision_root_image_result(
+    value: &ProvisionRootImageResult,
+) -> Result<Vec<u8>, ProvisionRootImageWireDecodeError> {
+    encode_provision_payload(value, decode_provision_root_image_result)
+}
+
+pub fn encode_provision_root_image_error(
+    value: &ProvisionRootImageError,
+) -> Result<Vec<u8>, ProvisionRootImageWireDecodeError> {
+    encode_provision_payload(value, decode_provision_root_image_error)
+}
 
 pub fn decode_node_identity(bytes: &[u8]) -> Result<NodeIdentity, ContractError> {
     decode(
@@ -4268,6 +4605,7 @@ fn condition_ranks(condition: &Condition) -> (u64, u64) {
                 BlockedReason::HostRejoinPending { .. } => 6,
                 BlockedReason::ControlPlaneUnavailable { .. } => 7,
                 BlockedReason::KeyRingUnavailable { .. } => 8,
+                BlockedReason::RootImageUnavailable { .. } => 9,
             },
         ),
         Condition::PreconditionFailed { reason } => (
@@ -4311,6 +4649,7 @@ fn quarantine_rank(reason: &QuarantineReason) -> u64 {
         QuarantineReason::UnknownPersistentDisk { .. } => 16,
         QuarantineReason::WarmSnapshotConflict { .. } => 17,
         QuarantineReason::RouteGateConflict { .. } => 18,
+        QuarantineReason::RootProvisionConflict { .. } => 19,
     }
 }
 
@@ -4873,6 +5212,22 @@ fn collect_reconcile_step_cross(
                 output,
             );
             collect_remote_head_cross(new_remote_head, &child(path, "new_remote_head"), output);
+        }
+        ReconcileStep::ProvisionRootImage {
+            expected_blank_head,
+            expected_provisioned_head,
+            ..
+        } => {
+            collect_remote_head_cross(
+                expected_blank_head,
+                &child(path, "expected_blank_head"),
+                output,
+            );
+            collect_remote_head_cross(
+                expected_provisioned_head,
+                &child(path, "expected_provisioned_head"),
+                output,
+            );
         }
         ReconcileStep::SnapshotWarmRuntime { source_heads, .. } => {
             collect_volume_heads_cross(source_heads, &child(path, "source_heads"), output);
