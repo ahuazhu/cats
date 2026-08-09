@@ -23,9 +23,10 @@ receipt。
 
 ## 1. 常量与共享 wire
 
-本合同固定使用以下常量；in-flight cap都是每个Control Plane replica的进程内non-blocking admission，
-只保护本replica资源，non-durable、non-authoritative且不进入schema，
-部署可以用更小的 per-replica global cap 或更短的 HTTP deadline，但不能
+本合同固定使用以下常量。in-flight cap是每个Control Plane replica的进程内non-blocking
+HTTP admission；renewal-critical worker/queue/connection是另一层不可借用的Store保留容量。两者都只
+保护本replica资源，non-durable、non-authoritative且不进入schema。部署可以用更小的
+per-replica global cap 或更短的 HTTP deadline，但不能
 改变 wire/body 上限、lease、read-position 或 freshness 的语义值：
 
 | 名称 | v1 值 |
@@ -37,6 +38,9 @@ receipt。
 | 每 replica 两个 A20 route 合计 global in-flight cap | `64` |
 | 每 replica、每个 authenticated Node 合计 in-flight cap | `1` |
 | handler deadline | `10000` ms |
+| observation renewal-critical Store worker | 每 replica `1`，不与其他Store work共享 |
+| observation renewal-critical Store queue | 每 replica `1`（不含正在执行的一项） |
+| observation renewal-critical PostgreSQL connection | 每 replica `1`，不得借给其他lane |
 | Desired read request wire cap | `16384` bytes |
 | Desired read response wire cap | `16777216` bytes |
 | Observation request wire cap | `8388608` bytes |
@@ -196,6 +200,25 @@ PostgreSQL current-row lock和exact replay状态机串行化。handler deadline 
 内对 serialization/deadlock做最多 3 次完整事务重试；每次必须从 authentication 后的 immutable decoded
 request 重新读取全部 Control Store facts，不能复用前一次 snapshot。
 
+HTTP global/per-Node permit本身不能保护唯一session续期点：它们之后仍可能共享同一个
+blocking worker、queue或PostgreSQL connection。因此`POST .../observations`的全部Store调用（包括先判定
+sequence的exact replay）必须进入本规格表中的renewal-critical lane：它有独立的一个blocking
+worker、最多一个waiter的FIFO queue和一个独立Control Store PostgreSQL connection。这是使用同一DSN、
+schema和transaction函数的第二个有界Store执行实例，不是新authority或新数据库。Desired read、
+registration、planner/signer、product/controller mutation和
+[Runtime Volume Transitions](runtime-volume-transitions-v1.md)均不得提交、借用或在空闲时抢占该worker、queue或
+connection。这一个保留connection必须计入replica/RDS Proxy的硬上限。
+部署在计算ordinary pool上限前先从该replica和database/proxy的connection budget中扣除这一席；
+replica启动/readiness必须打开该connection，断线重连仍消耗同一保留席。ordinary Store不得
+因保留connection尚未发送SQL就把该席计入自己的可用上限。
+
+renewal-critical Store调用携带从HTTP headers到达时刻派生的同一absolute deadline，排队时间、
+connection acquire、全部transaction retry和commit都消耗这一额度。queue满立即503；在queue中
+取消必须删除closure。已开始的调用必须使用不超过剩余额度的connection/statement/lock timeout，
+取消或shutdown时必须cancel query、rollback或关闭连接并join worker；不得在handler返回后让detached
+closure稍后提交续期或observation。commit outcome已不明时只关闭response并由exact replay解析，
+不得用503猜测事务未发生。
+
 ## 3. Desired read-position
 
 ### 3.1 scope、顺序与签发
@@ -217,8 +240,10 @@ DesiredReadState {
 `read_position_high_water`跨 session 保留并且永不回退、重置或复用。第一次成功签发为 1，之后每次新
 snapshot 都以 checked add 得到 `high_water + 1`；耗尽是 store invariant/unready，不wrap、不归零。
 
-`request_sequence`只在一个 exact `SessionBinding`内有序。endpoint先锁定并重验current
-`AgentSession`与`DesiredReadState`，取一次PostgreSQL `db_now`，并严格按“current session binding
+`request_sequence`只在一个 exact `SessionBinding`内有序。这是会覆盖bounded read state的
+`READ COMMITTED` mutation transaction；它先按authenticated identity取得并重验
+`NodeIdentity FOR UPDATE`，再锁current `AgentSession -> DesiredReadState`，取一次PostgreSQL
+`db_now`，并严格按“Node identity → current session binding
 → `db_now < lease_deadline_unix_ms` → server-time causality → request sequence”判定。只要state仍保留任一
 session最后一份response，就必须先满足`db_now >= last_response.issued_at_unix_ms`；倒退是fatal/
 unready且零写入，不得返回exact replay或签发新snapshot。然后才按下列顺序处理：
@@ -264,8 +289,9 @@ request-ID ledger、按 Desired revision累积快照或定时全表历史清理�
 `POST .../observations`的 request body 直接是 Runtime §10 `NodeObservation`，不套 heartbeat envelope。
 adapter/F0通过后，context-bound固定顺序为：
 
-1. credential -> provisioned `NodeIdentity` -> body `SessionBinding` -> current `AgentSession`；
-2. current session 的 highest accepted heartbeat sequence；
+1. credential -> provisioned `NodeIdentity FOR UPDATE` -> body `SessionBinding` -> current
+   `AgentSession FOR UPDATE`；
+2. current session 的 observation receive-state/highest accepted heartbeat sequence；
 3. 对新 sequence 才检查 session deadline；
 4. full/partial inventory cursor、epoch与assigned set；
 5. Runtime §16.4.3 revision、stored digest、placement；
@@ -402,11 +428,13 @@ freshness。任一消费者只读attestation digest/epoch、忽略assigned snaps
 
 ## 6. 单一原子事务与 Operation settlement
 
-每个首次接受的新 observation只有一个 PostgreSQL事务，禁止在 commit 前后分拆 attestation、read model、
-session lease或Operation。跨副本的 logical lock/read顺序固定为：
+每个首次接受的新 observation只有一个 PostgreSQL `READ COMMITTED` mutation
+transaction，禁止在 commit 前后分拆 attestation、read model、session lease或Operation。
+跨副本的 logical lock/read顺序固定为：
 
 ```text
-current AgentSession
+authenticated NodeIdentity FOR UPDATE
+-> current AgentSession
 -> Node observation receive-state
 -> DesiredReadState / AdmissionInventoryState（适用时）
 -> VolumeRecord，按 volume_id
@@ -417,6 +445,12 @@ current AgentSession
 -> per-Cat observation rows，按 cat_id
 -> attestation/cursor/receive-state/current session deadline writes
 ```
+
+`NodeIdentity`是assigned-set的coordination row，不是只在HTTP proof后做一次不加锁的
+eligibility lookup。所有会为current Node插入、supersede、移动或删除current Desired的mutation
+transaction都必须先锁同一`NodeIdentity FOR UPDATE`，再按本规格/全局DAG取得后续row。
+这使full assigned-set重读与新Desired INSERT没有phantom窗口，也与
+[Runtime Volume Transitions §4.1](runtime-volume-transitions-v1.md#41-共同前缀与锁序)使用同一可证锁前缀。
 
 实现可在锁前bounded发现request涉及的Cat/volume/disk identity，但不能据此判定或写入；取得上述authority锁后
 必须重新读取current rows并从头验证。这个顺序保持Volume Authority的
@@ -459,6 +493,10 @@ fatal abort。多Cat settlement不能各取一次时间。
 
 任一 terminal postcondition需要 transaction外物理读取，说明该证据没有完整进入
 `NodeObservation`合同，V1必须保持 Pending/拒绝，不能在本事务内做外部I/O或事后补一个 bool proof。
+
+上述`READ COMMITTED`只适用于session-bound Desired/observation mutation。本规格§7的planner与
+signer仍必须使用各自单一`REPEATABLE READ READ ONLY` snapshot；它们不取代这个
+NodeIdentity coordination lock，也不得将多个普通read拼成伪snapshot。
 
 ## 7. Planner / signer 的同 snapshot读取
 
@@ -743,6 +781,11 @@ inventory还必须覆盖没有Pending Operation（包括已有Succeeded/Failed O
 - 一个合法credential用连续partial轮换新cat ID全部按最小ID closed error拒绝，row数始终不超过最近full
   的runtime集合；下一次full才可改变membership；
 - Desired在scan期间变化时旧cursor full拒绝，next request sequence可签发新position；
+- 使用真实PostgreSQL双connection保留Desired INSERT/full observation的双向竞态oracle：Desired
+  mutation先取得`NodeIdentity FOR UPDATE`并提交时，携旧cursor的full随后返回
+  `assigned_set_changed`且零写；full先取得该锁时，它在锁内对一个完整assigned set提交，
+  INSERT只能在其后提交，之后任何planner/transition消费都以`assigned_set_changed`使旧
+  attestation失效；两个方向都必须证明暂停点已命中，不得用未执行的race当通过；
 - session replacement不重置read high-water，新session full epoch从1开始，旧session所有endpoint永久拒绝；
 - planner和signer在同snapshot证明全部返回facts；attestation恰好60秒、per-Cat恰好30秒、session恰好deadline
   均视为过期；
@@ -751,3 +794,8 @@ inventory还必须覆盖没有Pending Operation（包括已有Succeeded/Failed O
   不能写倒退server timestamp；
 - legacy heartbeat/inventory row存在或更新时，A20结果完全不变；生产代码不得import legacy Node
   heartbeat/capacity DTO或查询其动态列。
+- renewal-critical lane的正例先证明新sequence observation能更新deadline；随后饱和
+  Runtime Volume Transition/ordinary Store worker与queue，新observation仍只使用保留worker/queue/
+  connection并在10000 ms absolute deadline内提交或明确503。分别在保留queue等待、SQL已开始和
+  commit边界取消/关机，必须证明后两者已rollback/connection-close并join，或commit不明后只由
+  exact replay返回首次结果；handler结束后不得观察到detached续期/observation写入。

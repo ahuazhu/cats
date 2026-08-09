@@ -681,8 +681,10 @@ HostFenceEvent/HostDestroyed receipt继续按现有Operation/审计引用保留�
 Node 是 lease transition 的执行者。顺序固定：
 
 1. 在 checkpoint 写 acquire/takeover request。
-2. 调用[Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)的唯一签名route，并对模糊结果以同一
-   `volume_records`的只读`VolumeDataAuthority`/authorization receipt读取精确transition postcondition。
+2. 调用[Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)的唯一签名route。normal acquire/release
+   的模糊结果可由`VolumeDataAuthority.load_volume(volume_id)`读取精确transition marker；
+   takeover/disposable authorization的模糊结果只使用§5.1的Node-only
+   `RuntimeTransitionRecoveryReader`读取一份闭合snapshot。
 3. 把 `LeaseGrant` 原子写回 checkpoint。
 4. 创建 attachment 专属 data-dir identity。
 5. 启动 blockd，传入 volume、attachment、epoch 和既有的closed acquire origin。
@@ -690,6 +692,69 @@ Node 是 lease transition 的执行者。顺序固定：
 
 blockd 启动不得调用 acquire、takeover或增加 epoch。它只可以 renew、以精确 owner/epoch发布 Root，
 以及报告 status。Cold detach 时 Node 先 drain、停止 blockd，再执行 release。
+
+### 5.1 Node-only transition recovery read port
+
+authorization的response-loss恢复不得扩展blockd的`VolumeDataAuthority`。provider-neutral storage
+boundary只额外暴露一个由Node per-Cat reconciler组合并使用的只读port：
+
+```text
+RuntimeTransitionRecoverySnapshot {
+  authorization: AuthorizationRecord,
+  current_volume: VolumeRecord | null,
+  delete_completion: DeleteCompletionReceipt | null,
+  associated_authorizations: [AuthorizationRecord]
+}
+
+RuntimeTransitionRecoveryReader {
+  load_authorization_recovery(
+    authorization_id: Id
+  ) -> RuntimeTransitionRecoverySnapshot
+}
+```
+
+`authorization_id`是唯一外部key。caller不得提交volume ID、delete ID、receipt ID、successor
+authorization ID或任何预判bool。adapter先strict decode并以共享projection validator验证该
+exact `AuthorizationRecord`，只从它的closed payload派生volume ID；再在一个
+`REPEATABLE READ READ ONLY` PostgreSQL snapshot中返回：
+
+1. 该volume的current strict/projection-validated `VolumeRecord`，或row已被合法sweep删除时`null`；
+2. 只按已派生volume ID查找的唯一strict/projection-validated
+   `DeleteCompletionReceipt`，不存在时`null`；disposable authorization还必须精确绑定其
+   delete ID，takeover则以receipt内的closed normal/disposable variant建立后继；
+3. 仅由current Volume `last_transition` authorization marker或
+   `DeleteCompletionReceipt.disposable_root.authorization_id`直接引用、且与首个ID不同的
+   `AuthorizationRecord`，按authorization ID严格升序无重复。V1的一个direct current/terminal
+   state最多需要一个这样的associated row；adapter不得按volume枚举全部历史授权。
+
+这四项是同一database snapshot，不是可分开缓存或拼接的rows。每个JSON/projection、
+authorization自身ID/variant、派生volume、current marker、receipt volume/delete/prior attachment/
+epoch/head和associated authorization引用必须逐字段闭合。同一volume同时有current row和
+completion receipt、多个completion receipts、缺少被引用authorization、引用错volume/variant或任何
+projection不等都是stored corruption，整份读取fail closed。端口不返回`consumed`、
+`transition_succeeded`、`rows_deleted`或其他bool；Node必须用本规格的closed direct/successor
+validator和checkpoint的完整step自行决定adopt、retry或Blocked。主authorization不存在、
+snapshot暂时不可读或closed validator不通过都不能猜测首次mutation失败或成功。
+`current_volume.last_transition=null`仍只能由§10.3的same-disk restore immutable API result闭合；本port
+既不返回也不镜像该product result，因此null marker不能证明首次consume已成功。若原row仍
+Unconsumed且current Volume是完整matching predecessor，Node可重放厚authorization；若原row已Consumed
+却缺same-disk restore result，则必须Blocked。不得为了避免false negative而把epoch/head单调降级为
+success bool。
+
+当前production adapter是PostgreSQL metadata adapter，使用与blockd、Control writer都不同的Node
+recovery credential和connection。该database role只有目标database的`CONNECT`、目标schema的
+`USAGE`，以及`volume_authorizations`、`volume_records`、`delete_completion_receipts`三张表的
+`SELECT`；它没有其他Control表的`SELECT`，没有任何table/sequence的
+`INSERT/UPDATE/DELETE/TRUNCATE/REFERENCES/TRIGGER`，没有schema create/DDL或超级角色，且connection固定
+`default_transaction_read_only=on`。部署必须先revoke inherited/`PUBLIC`/broad read role再精确grant上述权限并
+以negative probe验证三张表都不能写、第四张Control表不能读。credential只注入Node Agent
+reconciler composition，不传给blockd、VMM或Guest；blockd的trait/object graph也不得引用这个port。
+
+未来移除Node PostgreSQL credential前，必须先用新ADR/规格冻结并上线等价的签名read boundary：
+它以current per-Node强身份认证，仍只接受authorization ID，在一个server PostgreSQL snapshot中返回
+上述同一closed typed bundle和等价not-found/corruption/unavailable语义，并具有有界wire、deadline和
+proof vectors。它不得退化为bool、HTTP mutation result、审计查询或让请求方提供volume/delete/
+successor key。新边界通过同一recovery/corruption oracle并原子替换adapter后，才可撤销读角色。
 
 ## 6. 本地 attachment lineage
 
@@ -1325,6 +1390,10 @@ tombstone；但只要某个Active HostFenceEvent的Consumed authorization引用�
 | release响应丢失/异payload | 相同RandomId128且完整request相同返回原result；同ID异payload Stale，旧epoch永久不能publish |
 | stale acquire晚到release之后 | expected epoch不匹配，不能重新占有volume |
 | authorization单一authority | Node只传authorization ID；锁定row中的immutable payload/receipt是唯一权威，Volume last_transition仅ID marker；不存在客户端payload、第二签名或重复receipt副本 |
+| Node-only authorization recovery read | provider-neutral port只接受authorization ID，同一read-only snapshot只返回exact primary、derived current Volume/null、derived completion/null和current marker/completion直接引用的最多一个associated authorization；不接受volume/delete/successor key，不枚举全volume历史，不返回bool或chain ledger；blockd object graph无此port |
+| authorization response-loss/current successor | takeover consume commit丢response后，分别以direct current state、合法renew/head-CAS/release、以及指向第二authorization的更大epoch current marker做正例；只有厚receipt、current marker/最多一associated row、epoch/head单调和closed successor全部通过才adopt；Consumed + null marker但缺same-disk restore result保持Blocked |
+| authorization response-loss/delete completion | disposable consume commit后断response，sweeper随即写exact completion并删除Volume/Disk；按原authorization ID的snapshot必须返回`current_volume=null`+唯一matching receipt并闭合；row absent但receipt缺失/错variant/错volume/delete/prior attachment/epoch/head均Blocked |
+| authorization recovery corruption/isolation | 破坏primary/current/receipt/associated任一JSON/projection、制造current+completion并存、同volume重复completion或缺少/跨volume引用都fail closed；先用已知无关authorization正例校准查询探针，再证明caller无法用任何额外key读到其volume/receipt/auth；Node DB role三表只读、第四表不可读 |
 | Host takeover | 只有精确逐卷授权成功；跨volume/placement/replay失败；receipt精确记录event/volume/new attachment/resulting epoch/head |
 | 首次consume与Host rejoin并发 | 两者锁同一event；consume先提交则rejoin观察receipt，Rejoined先提交则consume失败且epoch不变 |
 | Host rejoin遇到未消费授权 | 未过`not_after`时保持Active/Blocked；过期后才可Rejoined，且不能首次消费 |

@@ -256,12 +256,18 @@ registration public error、session lease与release receipt路径由
 [Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md)冻结。Desired delivery只使用
 `POST /v1/internal/runtime/desired-reads`，inventory/observation接受只使用
 `POST /v1/internal/runtime/observations`；它们的事务、endpoint-local error和planner/signer freshness由
-[Runtime Inventory and Observation Spine v1](specs/runtime-inventory-observation-v1.md)冻结。legacy
+[Runtime Inventory and Observation Spine v1](specs/runtime-inventory-observation-v1.md)冻结。两条session-bound mutation
+在`READ COMMITTED`下统一从`NodeIdentity FOR UPDATE -> current AgentSession -> receive/cursor state`
+开始，planner/signer仍是单一`REPEATABLE READ READ ONLY` snapshot。observation的唯一session续期点
+还使用每replica独占的有界Store worker/queue/PostgreSQL connection，不与volume/product/controller
+work共享。legacy
 `/v1/nodes/register`、heartbeat/inventory route和shared service/admin bearer不属于目标架构。
 Node把checkpoint中的normal/takeover acquire、exact release和disposable Root authorization consume提交给
 Control的唯一窄mutation route；wire、同一current session/inventory/Desired校验、锁序与模糊响应恢复由
-[Runtime Volume Transitions v1](specs/runtime-volume-transitions-v1.md)冻结。blockd继续只读/renew/head-CAS，
-不得取得ownership transition能力。
+[Runtime Volume Transitions v1](specs/runtime-volume-transitions-v1.md)冻结。authorization类结果不明由只供Node
+reconciler的provider-neutral recovery reader按authorization ID读一份一致snapshot，与blockd的
+`VolumeDataAuthority`分离；它不枚举授权历史或返回success bool。blockd继续只读/renew/head-CAS，
+不得取得ownership transition或authorization/completion read能力。
 
 ## 7. 四态和数据屏障
 

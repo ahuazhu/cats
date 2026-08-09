@@ -41,9 +41,13 @@ V1常量：
 | 每replica、每个authenticated Node独立in-flight cap | 1 |
 | handler absolute deadline | 10000 ms |
 
-这条mutation lane与A20 Desired/observation lane分别计数，不能占用或等待A20的per-Node permit；否则连续
-volume I/O会饿死唯一session续期点。两个lane都不是authority，不进入schema，也不能代替PostgreSQL锁。
-部署可把global cap调小或deadline调短，但不能扩大cap、增加等待队列或改变wire/domain replay语义。
+这条mutation lane与A20 Desired/observation lane分别计数，不能占用或等待A20的per-Node permit；但
+独立HTTP semaphore仍不足以保护唯一session续期点。A22的handler、Store closure、blocking worker、
+queue和PostgreSQL connection都不得进入、借用或占用
+[A20的renewal-critical Store lane](runtime-inventory-observation-v1.md#2-http-与-authentication-envelope)。A22只使用
+ordinary bounded Store execution capacity；其饱和必须返回503，不得等待保留lane或把volume工作
+伪装成observation。这些lane都不是authority，不进入schema，也不能代替PostgreSQL锁。
+部署可把A22 global cap调小或deadline调短，但不能扩大cap、增加等待队列或改变wire/domain replay语义。
 
 route逐byte遵守A19/A20 internal HTTP合同：
 
@@ -182,13 +186,24 @@ authorization ID。proof signature可以每次重新计算，但body在同一con
   stale/replan，不能把旧effect移植给新revision；release则按Runtime §10允许在新session/full scan后重新持久化
   完整`CleanupRelease`，只替换inventory session/epoch/read positions与tombstone read position，必须保留
   target、`release_transition_id`、generation和disposition，因此导出的`ReleaseRequest`逐字段不变；
-- Node也必须使用已经部署到Host、与blockd共用的只读`VolumeDataAuthority.load_volume`解析模糊结果。
-  normal acquire只接受完整matching `last_transition.normal_acquire`和current owner/epoch；release只接受完整
-  matching `last_transition.release`、Unowned、exact head/epoch；takeover与disposable只接受服务器端closed
-  authorization receipt及Volume direct/successor closure。暂时读不到时Blocked，不猜成功；
-- 本文不增加HTTP read route。只读adapter与blockd操作同一`volume_records`并运行同一closed validator；它
-  不允许ownership transition。最终privilege separation若移除Node的PG reader，必须先冻结等价的
-  authenticated exact-record read boundary，不能把当前error或bool当postcondition；
+- normal acquire/release的模糊结果可使用已部署的
+  `VolumeDataAuthority.load_volume(volume_id)`解析：normal acquire只接受完整matching
+  `last_transition.normal_acquire`和current owner/epoch，release只接受完整matching
+  `last_transition.release`、Unowned、exact head/epoch。这不为blockd增加方法；
+- takeover/disposable的模糊结果只使用
+  [Volume Authority §5.1](volume-authority.md#51-node-only-transition-recovery-read-port)的provider-neutral、
+  Node-reconciler-only `RuntimeTransitionRecoveryReader`。它外部只接受authorization ID，并在
+  一个consistent read-only snapshot返回原exact AuthorizationRecord、由其volume派生的current
+  Volume/null、DeleteCompletionReceipt/null，以及只由current marker或disposable completion直接引用的
+  最多一个associated AuthorizationRecord。Node只按原authorization receipt和current direct marker，或现在
+  epoch/head单调且closed marker/receipt完整的合法后继确认首次commit；不枚举授权历史、
+  不复制transition chain或接受opaque success bool。暂时读不到或原authorization缺失时Blocked；
+  exact Unconsumed + matching predecessor只允许重放厚authorization，Consumed却无法闭合则Blocked/
+  Quarantined，两者都不猜成功；
+- 本文不增加HTTP read route。`RuntimeTransitionRecoveryReader`与blockd的
+  `VolumeDataAuthority`是两个独立port/object graph，只有前者可见authorization/completion、且两者都没有
+  ownership transition。PostgreSQL adapter当前使用的精确Node只读权限和未来签名read替换规则
+  以Volume Authority §5.1为唯一权威；
 - current Desired已supersede/GC时，transition HTTP可以拒绝旧context，即使domain conversion已经commit。
   Node仍按上面的authoritative row/receipt和Runtime stale cleanup规则adopt；HTTP response不是唯一恢复证据。
 
@@ -211,7 +226,7 @@ Content-Type、任何Content-Encoding、超cap、malformed/unknown body或无法
 
 ### 4.1 共同前缀与锁序
 
-每个request使用一个Control PostgreSQL transaction。固定锁DAG是：
+每个request使用一个Control PostgreSQL `READ COMMITTED` mutation transaction。固定锁DAG是：
 
 ```text
 authenticated NodeIdentity
@@ -233,8 +248,10 @@ Volume行、按其存在性分支或渲染后stage error。
 
 NodeIdentity行同时是A20 assigned-set mutation coordination lock。所有会插入、supersede、移动或删除该Node
 current Desired的transaction，都必须先取得同一NodeIdentity锁并在锁内重验candidate/current session；因此
-full attestation和新的Desired INSERT不存在phantom窗口。本文transaction取得它后，current assigned完整
-Desired集合必须仍逐字段等于fresh AdmissionInventoryState cursor snapshot。
+full attestation和新的Desired INSERT不存在phantom窗口。Desired mutation先提交时，携旧cursor的
+full/transition必须观察新assigned set并拒绝；full先提交时，INSERT只能随后提交，此后该
+attestation立即因assigned-set changed不可消费。本文transaction取得它后，current assigned
+完整Desired集合必须仍逐字段等于fresh AdmissionInventoryState cursor snapshot。
 
 共同context validation按Runtime §16.4.3执行：authenticated identity -> current exact session ->
 current session的`guest_config_digest`逐字段等于Control启动时从A19 exact receipt批准的active release digest ->
@@ -444,20 +461,21 @@ content-type、credential ID、SPKI、body length或body任一byte变化都必�
 
 | boundary | required oracle |
 |---|---|
-| route/admission | exact POST；wrong method/query/path/media/semantic headers；16384/16385；proof失败不decode/查DB；独立global/per-Node caps且不占A20 observation permit；absolute deadline/cancel/late commit |
+| route/admission | exact POST；wrong method/query/path/media/semantic headers；16384/16385；proof失败不decode/查DB；独立global/per-Node caps且不占A20 observation permit；饱和A22 ordinary Store worker/queue/connection时A20保留renewal-critical lane仍可提交新sequence续期；absolute deadline/cancel/late commit |
 | codecs | request三variant及acquire两variant、success三variant、error全部closed；missing/unknown/duplicate/noncanonical integer、wrong union field和16KiB边界；fixed vectors及proof mutation |
 | auth/session | body Node不能选credential；retired/wrong binding拒绝；missing/stale/wrong/expired session；replacement必须先fresh full；expired没有transition replay例外 |
 | routing isolation | 合法Node在body中填另一Cat/volume/authorization ID只得到current-intent mismatch，不锁、不读取后者的authority payload也不泄露其是否存在；NodeIdentity锁后的routing hint与后row-lock reread不一致必须零写入 |
 | release binding | current session guest digest必须等于Control active exact receipt；旧release session即使其他字段匹配也零卷副作用 |
-| assigned-set lock | full empty/old cursor与并发新Desired INSERT只能一方commit；所有Desired mutation和transition先锁同一NodeIdentity；两Control replicas双session覆盖 |
+| assigned-set lock | 真实PG双connection双向pause：Desired INSERT先锁/提交则旧cursor full/transition拒绝且零写；full先锁/提交则INSERT只能在后，旧attestation随即以assigned-set changed不可消费；所有Desired mutation、A20 mutation和transition先锁同一NodeIdentity；两Control replicas双session覆盖 |
 | normal acquire | current Desired/intent/Disk/Volume逐字段；fresh complete inventory；same transition exact replay不刷新expiry；异payload、other writer、epoch mismatch、Deleting和epoch max零副作用 |
 | takeover | caller只传ID；event/auth/volume固定锁序；current intent/new attachment/revision/placement绑定；首次consume、Rejoined并发、not-after过期、`db_now + duration`溢出的exact typed错误、exact receipt replay |
 | grant | size/durability/head/owner/epoch/expiry/origin来自同一updated VolumeRecord；Node落checkpoint后才spawn/adopt；success字段替换或late old-session response不能开Guest I/O |
 | release | CleanupRelease唯一导出ReleaseRequest；current full evidence、origin、stop、R==L==generation、Desired/tombstone和disposition；same ID replay、异payload、response loss、epoch max |
 | release/auth race | 两session按Volume锁后fresh重验；release先则derive全rollback，derive先则release exact 409零写；无auth+Unowned |
 | disposable | runtime-stopped与host-fence两basis；current Deleted Root/delete ID、Disk、snapshot、stop/event、old owner/epoch/head全绑定；receipt/Volume/Disk同commit；成功前不删tail |
-| corruption | 每张JSONB/projection、receipt/direct state、missing referenced row和future time逐项破坏均500/零写；绝不降级4xx或接受半postcondition |
-| ambiguity | commit前/后断连接；同domain ID重放；current context变化后fresh rebind；direct `load_volume`/receipt oracle；plain 404停止自动重试；redirect、HTML、status/detail/header不匹配、超cap和malformed success/error全部保留checkpoint且只重试原request；不建HTTP result row或second grant ledger |
+| corruption | 每张JSONB/projection、receipt/direct state、missing referenced row和future time逐项破坏均500/零写；recovery snapshot还覆盖错primary ID/variant/volume、current Volume与completion并存、同volume重复completion、marker引用缺失或associated row错volume/variant；绝不降级4xx或接受半postcondition |
+| authorization recovery read | 唯一input是authorization ID；在同snapshot返回exact primary、derived Volume/null、derived completion/null和只被current marker/completion直接引用的最多一个associated authorization；无volume/delete/successor key输入、无全volume授权枚举/分页、无bool或chain ledger；使用无关ID的正例校准后，证明它不读/返回其他volume/receipt/authorization；PostgreSQL role只读三表，三表write与第四张Control表read均拒绝；blockd composition不能取得该port |
+| ambiguity | commit前/后断连接；同domain ID重放；current context变化后fresh rebind；normal用direct `load_volume`，authorization用recovery snapshot；takeover commit丢response后允许current Volume已经合法renew/head-CAS/release/更大epoch后继，仍必须由原authorization receipt + current marker/最多一associated authorization + epoch/head单调闭合；Unconsumed + null marker + exact predecessor只重放原ID，Consumed + null marker缺same-disk restore API result时必须Blocked；disposable commit丢response后sweeper已删Volume/Disk row时只凭exact completion receipt闭合，缺receipt保持Blocked；plain 404停止自动重试；redirect、HTML、status/detail/header不匹配、超cap和malformed success/error全部保留checkpoint且只重试原request；不建HTTP result row或second grant ledger |
 | legacy negative | production route表没有legacy acquire/revoke；blockd port没有ownership mutation；Node不直接调用pure Control single-row method；internal handler不读shared bearer |
 
 这些测试使用真实PostgreSQL双session与两个Control Plane实例。failure probe必须先证明注入命中；空日志或未执行

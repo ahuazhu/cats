@@ -53,6 +53,16 @@ qualification 基础设施。
 acquire deadline、connect/query/lock/transaction timeout、单批rows/bytes和controller scan page。
 同步driver不得占用Tokio worker；blocking queue满时立即backpressure。
 
+其中A20新sequence observation是AgentSession的唯一续期点，不能只靠HTTP semaphore与其他
+mutation分流。每个Control Plane replica必须按
+[Inventory Spine §2](specs/runtime-inventory-observation-v1.md#2-http-与-authentication-envelope)为完整observation
+Store调用保留一个独立blocking worker、一个等待位和一个PostgreSQL connection；这些资源计入
+replica/database/proxy硬上限，并在计算ordinary pool容量前先扣除一席；启动/readiness必须
+实际打开它，断线重连仍只用该保留席。它不借给volume transition、Desired read、product mutation或
+controller。排队、SQL和
+retry共享HTTP的10秒absolute deadline，取消和shutdown必须rollback/close并join，不允许请求已返回
+后再detached commit。ordinary Store饱和可以使A22返回Unavailable，但不得阻塞这个保留lane。
+
 事务规则只有三条：
 
 1. mutation、Endpoint revision、signer snapshot、AgentSession和result settlement各使用文档规定的
@@ -160,7 +170,8 @@ event行；rejoin取得该锁后再按稳定顺序锁全部授权，所以不会
 
 必须覆盖：
 
-- Control Plane：PG pool/queue saturation、acquire/query/lock timeout、transaction retry、scan lag、
+- Control Plane：PG pool/queue saturation、acquire/query/lock timeout、transaction retry、observation renewal-critical
+  lane的active/queued/reject/deadline/cancel/join、ordinary-lane saturation时的renewal progress、scan lag、
   desired-to-observation lag、stale observation拒签、AgentSession conflict、API fingerprint conflict/result replay、
   signer active kid；
 - Gateway：每replica LRU size/bytes/eviction、hit/miss/expiry、negative/backoff、in-flight keys、
@@ -197,7 +208,12 @@ runbook；禁止以“重启看看”跳过fence或durability proof。
    strong prefix-empty/provider fence paused accepted PUT barrier/completion CAS、receipt后再次empty，
    以及disposable Root两边Deleting的每个crash点；
    还要用PostgreSQL双session覆盖authorization
-   首次consume与Rejoined竞争以及合法后继receipt校验。
+   首次consume与Rejoined竞争以及合法后继receipt校验；用真实PG pause双向覆盖
+   Desired INSERT/full observation的`NodeIdentity -> AgentSession -> receive/cursor`锁序；饱和A22/
+   ordinary Store时保留observation lane仍续期，并在queue/running/commit三个取消点证明无
+   detached late mutation。Node-only authorization recovery read还必须覆盖consume commit丢response后的
+   direct/合法current successor、sweep删row后的exact completion，以及错projection/重复receipt/跨volume
+   associated authorization的fail-closed和三表read-only SQL权限。
 2. **独立native x86_64 Linux build host**：使用现有
    [qualification build host](../deploy/aws/terraform/qualification/build-host/README.md)；controller发布
    exact 40-hex commit后，在Host运行：
