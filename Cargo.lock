@@ -1059,13 +1059,16 @@ dependencies = [
  "fs2",
  "futures-util",
  "keyring",
+ "libc",
  "open",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "uuid",
  "workos",
 ]
 

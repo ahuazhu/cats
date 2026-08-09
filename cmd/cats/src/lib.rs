@@ -6,6 +6,7 @@
 mod auth;
 mod config;
 mod credential_store;
+mod runtime_node_admin;
 mod shell;
 
 use std::time::{Duration, Instant};
@@ -305,6 +306,57 @@ pub enum AdminCommand {
     Node {
         #[command(subcommand)]
         cmd: AdminNodeCommand,
+    },
+    /// Apply the signed Runtime Node identity and placement authority.
+    RuntimeNode {
+        #[command(subcommand)]
+        cmd: RuntimeNodeCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RuntimeNodeCommand {
+    /// Atomically provision one Node identity and its initial cordoned policy.
+    Provision {
+        #[arg(long)]
+        identity: std::path::PathBuf,
+        #[arg(long)]
+        policy: std::path::PathBuf,
+    },
+    /// Apply a placement-policy mutation.
+    Policy {
+        #[command(subcommand)]
+        cmd: RuntimeNodePolicyCommand,
+    },
+    /// Rotate the Node's A19 public-key credential.
+    Credential {
+        #[command(subcommand)]
+        cmd: RuntimeNodeCredentialCommand,
+    },
+    /// Retire a cordoned, empty Node identity.
+    Retire {
+        #[arg(long)]
+        request: std::path::PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RuntimeNodePolicyCommand {
+    Apply {
+        #[arg(long)]
+        node: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RuntimeNodeCredentialCommand {
+    Rotate {
+        #[arg(long)]
+        request: std::path::PathBuf,
     },
 }
 
@@ -667,6 +719,9 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             return Ok(());
         }
+        Command::Admin {
+            cmd: AdminCommand::RuntimeNode { cmd },
+        } => return runtime_node_admin::run(&cli, cmd),
         _ => {}
     }
     let client = Client::new(&cli)?;
@@ -1305,6 +1360,9 @@ fn run_admin(client: &Client, cli: &Cli, cmd: &AdminCommand) -> Result<()> {
             }
             Ok(())
         }
+        AdminCommand::RuntimeNode { .. } => {
+            unreachable!("Runtime Node authority commands bypass workspace API construction")
+        }
     }
 }
 
@@ -1582,6 +1640,47 @@ mod tests {
                     cmd: AdminNodeCommand::Fence {
                         confirm_host_stopped_or_isolated: true,
                         ..
+                    }
+                }
+            }
+        ));
+        let cli = Cli::parse_from([
+            "cats",
+            "admin",
+            "runtime-node",
+            "provision",
+            "--identity",
+            "identity.json",
+            "--policy",
+            "policy.json",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::Admin {
+                cmd: AdminCommand::RuntimeNode {
+                    cmd: RuntimeNodeCommand::Provision { .. }
+                }
+            }
+        ));
+        let cli = Cli::parse_from([
+            "cats",
+            "admin",
+            "runtime-node",
+            "policy",
+            "apply",
+            "--node",
+            "node_a",
+            "--expected-revision",
+            "1",
+            "--file",
+            "policy.json",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::Admin {
+                cmd: AdminCommand::RuntimeNode {
+                    cmd: RuntimeNodeCommand::Policy {
+                        cmd: RuntimeNodePolicyCommand::Apply { .. }
                     }
                 }
             }
