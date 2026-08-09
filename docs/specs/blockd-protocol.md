@@ -89,24 +89,60 @@ blockd adapter只读取当前`volume_id`、不可变`size_bytes`、`admin_state`
 `lease_owner`、`lease_epoch`和absolute `lease_expires_at` projection，以精确owner/epoch renew，并执行下面的
 head CAS。它不建权威表，不执行acquire、release、takeover、revoke、resize、delete或snapshot mutation。
 
-`RemoteHead`的generation/hash/object ID nullability和exact compare沿用Volume Authority；generation只通过
-下述数据面CAS或该规格允许的Control transition前进。Root CAS（blockd提交唯一入口）必须在一条原子语句
-内完成：
+本clean-slate release的Volume Authority持久契约只有一个provider-neutral版本常量
+`AUTHORITY_RELEASE_SCHEMA_VERSION = 2`。Control Store是`control_schema_version`与全部DDL的唯一
+owner；它的私有`SCHEMA_VERSION`直接引用该常量，不保留第二个literal。target data-plane
+adapter在任何volume read/renew/CAS前只读校验：`control_schema_version`必须存在singleton
+row且version精确等于该常量，然后再验证本节所需的列projection。未打stamp、row缺失、
+旧版、future version或列不匹配都拒绝启动；adapter不建表、不迁移、不修复stamp，也不回退读写
+旧MetadataStore表。将来需要改变authority持久shape时必须在同一release中提高这一常量并同步
+Control writer、target adapter和部署gate，不接受版本区间或列探测推测兼容。
+
+Root CAS request的唯一shape是：
+
+```text
+VolumeHeadCasRequest {
+  volume_id: Id,
+  attachment_id: Id,
+  expected_epoch: FenceEpoch,
+  expected_size_bytes: integer 1..=9223372036854775807,
+  expected_head: RemoteHead,
+  new_head: RemoteHead
+}
+```
+
+`expected_size_bytes`来自启动该blockd的immutable volume size；`expected_head`和`new_head`都是不可拆的
+exact tuple。`RemoteHead`的generation/hash/object ID nullability和exact compare沿用Volume Authority；
+generation只通过下述数据面CAS或该规格允许的Control transition前进。Root CAS（blockd提交唯一入口）
+必须在同一个原子事务的一个线性化点完成exact compare/update：可用一条条件`UPDATE`，也可在同一
+事务中`SELECT ... FOR UPDATE`锁行、调用唯一的pure exact-compare transition，再`UPDATE`并commit。
+两种实现的对外结果、回滚和响应丢失语义必须相同；不允许在锁定事务外比较、再无条件写。
+下面SQL只是该原子predicate/update的逻辑形状，不是第二份DDL：
 
 ```sql
 UPDATE volumes
-   SET root_hash = :new_root, root_object_id = :new_obj, generation = generation + 1
+   SET root_hash = :new_root, root_object_id = :new_obj, generation = :new_generation
  WHERE volume_id = :vol
    AND admin_state = 'Active'
-   AND size_bytes = :expected_size
+   AND size_bytes = :expected_size_bytes
    AND generation = :expected_generation
+   AND root_hash IS NOT DISTINCT FROM :expected_root
+   AND root_object_id IS NOT DISTINCT FROM :expected_root_object_id
    AND lease_owner = :attachment_id
    AND lease_epoch = :epoch;
 -- 受影响行数必须恰好为 1，否则本次远端发布失败
 ```
 
-`size_bytes`创建后不可变；blockd还必须验证新Root编码的`volume_size`与grant对应的VolumeRecord
-一致。协议不提供resize入口。
+`new_generation`必须是对`expected_generation`做checked的严格正向前进，不得wrap或饱和。
+单个pack的delta为1；[ADR-0022](../decisions/0022-relaxed-local-first-dual-watermark.md)允许把`k >= 1`
+个连续pack按generation顺序合并为一次object wave和一次CAS，此时唯一合法delta是`k`。
+blockd在持有本地连续pack chain时验证这一等式；data authority只从old/new exact head得到正delta，
+不在request中再存一份`advance_count`。超过`Generation`上界时必须在本批任何remote PUT或CAS前以有界错误停止。
+
+`size_bytes`创建后不可变；CAS必须比较request中的exact expected size，blockd还必须验证新Root编码的
+`volume_size`与该值一致。size、predecessor head、owner或epoch任一不等都零更新拒绝；协议不提供
+resize入口。CAS响应不明时，只有在同owner/epoch/size下读到request的exact `new_head`才算成功；
+其他任何状态都不能从对象存在或generation更大猜测成功。
 
 ### 4.1 Lease / Fencing
 
@@ -200,13 +236,49 @@ pack不转换、不回放，clean-slate切换前直接删除。缺失/unknown `a
 必须存在完整、已同步的pending pack；它不表示Guest已经收到ACK。
 
 1. 捕获屏障：冻结当前 dirty set（清 volatile 位图对应位，新写进入下一集合）。
-2. 生成并落盘 Pending Pack（§5.2）；完成 fsync/rename/directory fsync 后 `L`
-   前进。Relaxed 此时向 Guest ACK；Strict 继续等待。
-3. 后台 publisher 按 generation 读取 pack。验证pack、data-dir identity及Node随精确LeaseGrant传入的
-   closed `acquire_origin`整个variant逐字段相同；再按`byte_ranges`读取远端 base
-   并按序叠加，构造完整 page/base；PUT `data/<txn>-c<idx>`（幂等，重试同键）。
-4. 构造新 Leaf/Root，PUT `maps/…`；PUT `commits/<gen+1>-<txn>.json`。
-5. Root CAS（§4）。恰好 1 行 → `R` 前进；Strict 此时向 Guest ACK。
+2. 生成并落盘 Pending Pack（§5.2）。选批和stage分组共用唯一、可以从wire计算的
+   `pack_decode_materialize_budget(E, M) = checked(2 * E + M + 4194304)`，上限是
+   268435456 bytes：
+   - `E`是候选pack或batch中全部pack的exact当前CATSPACK编码长度之和：8-byte magic、
+     little-endian `u16` version、little-endian `u32` header length、compact UTF-8 `PackHeader`
+     JSON和input payload；`2 * E`同时预算raw input与owned/in-place decode所需的有界结构。
+   - `M`是全部entry的worst-case materialized output之和：discard为0，其他entry为
+     `65536 * popcount(page_mask)` bytes；最后4194304 bytes是唯一chunk image scratch。
+   这是pack解码/物化的增量缓冲合同，不声称为整个blockd进程RSS；按volume大小常驻的Map/leaf
+   state由已有engine/volume上限约束，不参与pack分组。hash与PUT必须借用`E`/`M`内已有
+   bytes或使用另一个固定有界传输buffer，不得按batch大小再做无界整体拷贝。
+   全部乘加都必须checked；overflow或超限不能进入publisher。若一个barrier超限，stage按已有
+   canonical chunk/entry顺序贪心取满足公式的最大非空prefix，分成若干独立txn、generation连续
+   的pack。若单个Relaxed byte-overlay entry仍超限，只可按该entry已有canonical `byte_ranges`
+   顺序贪心切分；每个子entry只携该组range及对应payload，重算payload offsets/hash，并将
+   `page_mask`固定为u64 full mask。publisher因此按working Map依次物化每个4 MiB base，后一个自然
+   包含前一fragment的结果，中间与最终delta chain都为0。同chunk可跨连续generation重复，
+   单range最大4 MiB因而必然有进展；不在stage读远程base、不改range内容，不增batch ID/count。
+   因full mask会增加`M`，分组算法必须做单调fixed point：先用range实际覆盖页贪心分组，标记所有
+   跨fragment的overlay plan；将已标记plan的每个候选fragment按full mask/4 MiB `M`从头重算。
+   新一轮只能增加标记，直到一轮无新标记才是唯一有效分组；不得取消标记或使用allocator大小选边界。
+   每个pack完成fsync/rename/
+   directory fsync后`L`按连续
+   generation前进；Relaxed只在该barrier的全部pack本地durable后向Guest ACK，Strict继续等待全部远程
+   durable。同一进程内publisher不得在整个barrier的全部pack完成directory fsync并一次性加入有序
+   队列前消费其prefix。若stage中途失败，必须先恢复尚未被durable pack覆盖的frozen dirty facts，
+   再在返回错误前把已durable的连续prefix作为未ACK pack一次性加入有序队列；prefix为空才不改队列。
+   崩溃时已rename的连续prefix由启动扫描做同一恢复；两者都不得留generation缺口或要求重启才能drain。
+3. 后台 publisher 从队首选一个非空连续pack prefix；单pack是必须始终可用的最小批。每个pack都要验证
+   generation chain、data-dir identity及Node随精确LeaseGrant传入的closed `acquire_origin`
+   整个variant逐字段相同；再按pack与`byte_ranges`顺序读取远端 base并叠加，构造完整
+   page/base。publisher必须在读取payload前用文件长度和有界header计算第2步的exact budget，
+   只选取使本批pack decode/materialize budget硬性`<= 268435456`的最长连续prefix；不得先完整读入超限
+   pack再停止，单pack也没有超限豁免。materialize只保留单一chunk image scratch，已验证
+   pack用owned/in-place decode；批内对象可做有界并发PUT，每个键仍由原pack txn派生且幂等。
+4. 按pack顺序得到唯一final Map，构造并PUT新Leaf/Root；只为final generation写一个包含最后pack txn的
+   commit record。该record的`chunks`只是最后一个pack自身的chunk index升序去重集合，不是本批union；
+   Root仍包含所有pack按序叠加的final Map。因此同一连续chain在CAS前崩溃后即使以不同prefix重分批，
+   到达相同final generation时仍以同last txn、last-pack chunks和exact final root生成逐字节相同的
+   immutable record；不持久batch identity。对`k`个pack，在第3步任何remote PUT前先用checked-add得到
+   `new_generation = base_generation + k`并拒绝溢出；这个先后要求不改变后续的Map/commit/CAS顺序。
+5. 以§4的old/new exact head执行一次Root CAS。恰好1行且new-old generation delta等于本批连续pack数
+   → `R` 直接前进到final generation；Strict中所有被该批覆盖的barrier此时才可ACK。
 6. 清持久 bitmap 中该集合的位；删除 pack。
 
 dirty set 为空时 FLUSH 直接成功（generation 不变）。
@@ -229,11 +301,18 @@ admission 必须把“当前 dirty set 的未来 pack”作为 accounted reserva
   并验证三者的volume、attachment、epoch一致且MetadataStore仍认可该owner/epoch。normal/takeover即使
   ID文本相同也不相等；缺失、unknown variant、损坏、已fence或不匹配时整个目录
   quarantine；不能删除pack，也不能交给新attachment发布。
-- 再读MetadataStore当前generation：
-  - `generation > base_generation` 且 `commits/<base+1>-<txn>` 存在 → **CAS 已发生**：只清位图/删 pack，不得重复提交；
-  - 否则 → 从 pack 幂等重放步骤 3–6（对象 PUT 键不变）。
-- 每卷publisher在同一grant内严格按generation串行，前一pack结果未判定前不能提交后一pack；因此
-  在grant仍精确有效时，上述generation前进只能包含队首txn。该不变量必须由并发测试覆盖。
+- 再读MetadataStore的exact current head。target-v2中Strict与Relaxed共用同一条持久队列和恢复规则，
+  durability mode只决定Guest ACK的时点，不改变batch已提交事实的判定：
+  - `base_generation < head.generation`的连续队首pack已被先前单次batch CAS包含，只清理本地
+    pack/bitmap；中间pack没有独立commit record是正常形状，不得为了重放另造一份。
+  - `base_generation == head.generation`时从该pack开始保留连续队列并幂等重放。
+  - `base_generation > head.generation`、队列generation缺口、非当前exact grant/lineage下的head前进都是
+    corruption或authority conflict，必须quarantine/fail closed，不能仅凭更大generation清理。
+  上述结论依赖本节的唯一串行publisher和完整连续lineage；commit record是最终Root的审计/
+  重放证据，不是每个中间pack的必需成功凭证。
+- 每卷publisher在同一grant内严格按generation串行，队首批结果未判定前不能提交后续pack；因此
+  在grant仍精确有效时，一次generation前进只能包含当时选中的队首连续prefix。该不变量必须由
+  并发和crash测试覆盖。
 - CAS 前崩溃产生的无 Root 引用对象成为 Orphan，由 GC 按 grace period 清理；恢复流程不负责删除。
 
 ### 6.2 发布粒度：Delta Pack（[ADR-0016](../decisions/0016-delta-pack-page-granular-commits.md)）
@@ -249,7 +328,8 @@ admission 必须把“当前 dirty set 的未来 pack”作为 accounted reserva
 - 对象键：base 为 `data/<txn>-c<idx>`，delta 为 `data/<txn>-c<idx>-d`。一次提交对一个 chunk
   最多产生一个对象。
 - **自压缩**：满足任一条件时本次提交对该 chunk 发布新的整块 base 并清空链——链长达到
-  `MAX_DELTA_LAYERS`（当前 4），或本次脏页超过半块（> 32 页）。因此冷读放大有硬上限
+  `MAX_DELTA_LAYERS`（当前 4），本次脏页超过半块（> 32 页），或Relaxed overlay entry因
+  §6的decode/materialize budget被切成多个fragment。最后一种形状的每个fragment都是base，因此冷读放大仍有硬上限
   （≤ 5 个对象/chunk），正确性不依赖后台 Compactor。
 - 读路径在 hydration 处解析层：base（或全零）+ 按序应用 delta，一次性整块写入本地 cache；
   每个对象按其引用中的 `len` 与 `sha256` 校验。
@@ -541,6 +621,29 @@ socket，两者服务同一个 engine 与同一个 attachment lease。
     bounded read内拒绝；LF后即使peer继续发送也不得执行第二个command。每个`RemoteHead` nullability错误还要断言
     object pointer，而exact blank/target/response identity只在context tests验证。Node把所有response framing/decode
     失败只作为结果不明后读取权威head。
+11. 数据面CAS分别覆盖单pack delta 1与多pack delta `k`；后者必须先证明本地pack generation连续并
+    按序构造final Root，只发生一次CAS。空批、缺口、顺序错、delta不等于pack数、checked-add溢出都在
+    authority不变时拒绝；响应丢失只有精确final head可以结算成功。另在两个有不同chunk集合的连续pack
+    写完合批final commit record后、CAS前崩溃；重启后改用逐pack或另一个合法prefix边界。最后pack的
+    commit key与bytes必须与崩溃前逐字节相同，immutable PUT幂等且队列最终drain成功。
+    Strict另覆盖两个pack的final-record-only batch已CAS、本地清理前崩溃；新进程必须在
+    exact grant/lineage/head下清理两个pack且不重放中间generation，其判定与Relaxed相同。
+12. publisher内存边界覆盖budget恰好256 MiB、加入下一entry/pack会超限、以及单个barrier
+    需要拆成多个generation的形状。再用单chunk的非相邻`byte_ranges`风暴构造超限单entry；
+    必须在range边界按公式确定性切成多个同chunk子entry/pack，每个fragment都物化为base，
+    最终chain仍`<= 4`、fresh-host digest与原barrier完全一致，且不得发起前台remote GET。
+    选批必须在读入超限payload或发出PUT前切prefix，每个stage分组与publisher batch
+    按exact budget计算的pack decode/materialize增量缓冲始终不得超限。跨组Relaxed只在全部本地durable后ACK，
+    Strict只在全部远程durable后ACK；注入第k个pack stage失败和每个fsync/rename崩溃窗口，必须保持
+    dirty facts或一个generation连续的durable prefix。特别覆盖A已durable、B stage失败后不重启进程：
+    A必须进入publisher队列，新barrier可追加并最终drain。测试用pack decode/materialize
+    buffer高水位证明该上界，不得只断言最终batch的encoded-byte求和，也不把进程常驻Map
+    误算为本次batch分组的可变缓冲。
+13. 在CAS前把Volume row的size改成另一个合法正数，即使owner/epoch/head都未变也必须返回head conflict且
+    row零变化；Root编码size与request expected size不等同样不得发布。
+14. target adapter启动测试先验证空或旧表的探针确实可命中正控，再覆盖未打stamp、缺singleton row、
+    旧/future version和列不匹配均在任何volume read/write前拒绝；精确当前stamp可重复打开，且target adapter
+    不建表、不改stamp、不访问旧metadata volume表。
 
 ### 8.1 控制命令与可观测性
 
