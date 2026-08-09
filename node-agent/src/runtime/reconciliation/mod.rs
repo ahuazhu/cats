@@ -21,6 +21,14 @@ mod gate_planner;
 mod inventory;
 mod normal_acquire;
 mod root_provision;
+// This focused foundation intentionally lands before the production systemd
+// adapter and signed launch orchestrator that consume it. Keep the exception
+// on this one private module; the follow-up composition removes it.
+#[expect(
+    dead_code,
+    reason = "sealed root-provision process port is staged before production composition"
+)]
+mod root_provision_process;
 mod volume_transitions;
 
 pub(crate) mod inventory_probe_sealed {
@@ -58,6 +66,16 @@ pub use normal_acquire::{
 pub use root_provision::{
     AuthorityRereadRequired, RootProvisionClientError, RootProvisionControlPort,
     RootProvisionResponseHint, RootProvisionUnknownReason, UnixRootProvisionClient,
+};
+// This crate-private seam is landed before the systemd composition that
+// consumes it; keeping the re-export here prevents feature code from reaching
+// through the module path while preserving the sealed boundary.
+#[allow(unused_imports)]
+pub(crate) use root_provision_process::{
+    ensure_root_provision_process_after_checkpoint, RootProvisionBlockdHandshake,
+    RootProvisionProcessConflict, RootProvisionProcessEnsureResult, RootProvisionProcessEvidence,
+    RootProvisionProcessExpectation, RootProvisionProcessInspection, RootProvisionProcessOutcome,
+    RootProvisionProcessPort, RootProvisionProcessStart,
 };
 pub use volume_transitions::{
     A19SignedVolumeEvidenceTransport, ControlSignedVolumeEvidenceClient,
