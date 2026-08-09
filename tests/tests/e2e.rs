@@ -65,7 +65,7 @@ impl Cluster {
         let storage_meta_path = dir.path().join("storage-meta.db");
         let storage_meta: Arc<dyn MetadataStore> =
             Arc::new(SqliteMetadataStore::open(&storage_meta_path).unwrap());
-        let cp = cats_control_plane::server::spawn_with_legacy_heartbeat_for_tests(
+        let cp = cats_control_plane::server::spawn_with_legacy_node_runtime_for_tests(
             cats_control_plane::server::Config {
                 listen: "127.0.0.1:0".into(),
                 control_store_dsn: cats_control_plane::store::DsnSource::Literal(

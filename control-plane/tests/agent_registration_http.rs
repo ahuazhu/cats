@@ -375,24 +375,26 @@ async fn admission_order_and_proof_mutations_are_closed() {
             .status(),
         StatusCode::NOT_FOUND
     );
-    assert_eq!(
-        context
-            .client
-            .post(context.url("/v1/nodes/register"))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        context
-            .client
-            .post(context.url("/v1/nodes/heartbeat"))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::NOT_FOUND
-    );
+    for path in [
+        "/v1/nodes/register",
+        "/v1/nodes/heartbeat",
+        "/v1/nodes/work-status",
+        "/v1/internal/work/acquire",
+        "/v1/internal/work/release",
+    ] {
+        for token in [SERVICE_TOKEN, ADMIN_TOKEN] {
+            assert_eq!(
+                context
+                    .client
+                    .post(context.url(path))
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::NOT_FOUND,
+                "legacy shared-bearer mutation route {path} is reachable",
+            );
+        }
+    }
 }

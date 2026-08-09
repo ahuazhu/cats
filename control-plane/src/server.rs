@@ -394,13 +394,13 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
 }
 
 /// Pre-cutover integration harness. The shipped daemon calls [`spawn`], whose
-/// production route map has no legacy heartbeat.
+/// production route map has no legacy heartbeat or Node work mutation routes.
 #[doc(hidden)]
-pub async fn spawn_with_legacy_heartbeat_for_tests(cfg: Config) -> anyhow::Result<Handle> {
+pub async fn spawn_with_legacy_node_runtime_for_tests(cfg: Config) -> anyhow::Result<Handle> {
     spawn_inner(cfg, true).await
 }
 
-async fn spawn_inner(cfg: Config, legacy_heartbeat_for_tests: bool) -> anyhow::Result<Handle> {
+async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow::Result<Handle> {
     anyhow::ensure!(
         !cfg.auth_token.is_empty(),
         "service token must not be empty"
@@ -493,7 +493,7 @@ async fn spawn_inner(cfg: Config, legacy_heartbeat_for_tests: bool) -> anyhow::R
         cfg.node_lease_timeout_ms,
         cfg.auth_token.clone(),
         cfg.auto_tier_policy,
-        if legacy_heartbeat_for_tests {
+        if legacy_node_runtime_for_tests {
             NodeLivenessAuthority::LegacyHeartbeatForTests
         } else {
             NodeLivenessAuthority::SignedSession
@@ -517,8 +517,8 @@ async fn spawn_inner(cfg: Config, legacy_heartbeat_for_tests: bool) -> anyhow::R
         .await
         .with_context(|| format!("bind {}", cfg.listen))?;
     let addr = listener.local_addr()?;
-    let app = if legacy_heartbeat_for_tests {
-        crate::api::router_with_legacy_heartbeat_for_tests(state.clone())
+    let app = if legacy_node_runtime_for_tests {
+        crate::api::router_with_legacy_node_runtime_for_tests(state.clone())
     } else {
         crate::api::router(state.clone())
     };
