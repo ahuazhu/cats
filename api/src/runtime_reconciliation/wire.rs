@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{de::DeserializeOwned, Serialize};
 
 use super::canonical::{
@@ -27,6 +28,11 @@ pub const CONTRACT_ERROR_MAX_WIRE_BYTES: usize = 16_384;
 pub const PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES: usize = 4_096;
 pub const PROVISION_ROOT_IMAGE_RESULT_MAX_WIRE_BYTES: usize = 4_096;
 pub const PROVISION_ROOT_IMAGE_ERROR_MAX_WIRE_BYTES: usize = 4_096;
+pub const NODE_PLACEMENT_POLICY_MAX_WIRE_BYTES: usize = 65_536;
+pub const RUNTIME_NODE_AUTHORITY_APPLY_MAX_WIRE_BYTES: usize = 65_536;
+pub const RUNTIME_NODE_AUTHORITY_APPLY_RESULT_MAX_WIRE_BYTES: usize = 16_384;
+pub const RUNTIME_PROVISIONER_TRUST_BUNDLE_MAX_WIRE_BYTES: usize = 16_384;
+pub const RUNTIME_PROVISIONER_ACTIVE_SET_MAX_WIRE_BYTES: usize = 16_384;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PathSegment {
@@ -704,6 +710,7 @@ enum StringRule {
     Hostname,
     Ipv4,
     Mac,
+    Base64UrlNoPad,
     Message,
     Closed(&'static [&'static str]),
 }
@@ -770,6 +777,10 @@ fn random_id() -> Schema {
 
 fn digest() -> Schema {
     string(StringRule::Digest)
+}
+
+fn base64url_no_pad() -> Schema {
+    string(StringRule::Base64UrlNoPad)
 }
 
 fn epoch() -> Schema {
@@ -1351,6 +1362,7 @@ fn valid_string(rule: StringRule, value: &str) -> bool {
         StringRule::Hostname => valid_hostname(value),
         StringRule::Ipv4 => valid_ipv4(value),
         StringRule::Mac => valid_mac(value),
+        StringRule::Base64UrlNoPad => valid_base64url_no_pad(value),
         StringRule::Message => {
             value.len() <= 1024 && !value.chars().any(|character| character.is_control())
         }
@@ -3282,6 +3294,12 @@ fn operation_schema() -> Schema {
 fn contract_name_schema() -> Schema {
     closed(&[
         "node_identity",
+        "node_placement_policy",
+        "runtime_node_authority_apply",
+        "runtime_node_authority_apply_result",
+        "runtime_provisioner_trust_bundle",
+        "runtime_provisioner_active_set",
+        "runtime_node_authority_apply_record",
         "agent_registration_attempt",
         "agent_session",
         "guest_runtime_profile_receipt",
@@ -3625,6 +3643,166 @@ fn node_identity_schema() -> Schema {
     ])
 }
 
+fn runtime_placement_capabilities_schema() -> Schema {
+    object(vec![
+        field("vmm", closed(&["cloud_hypervisor"])),
+        field("block_frontend", closed(&["kernel_nbd", "vhost_user_blk"])),
+        field("guest_network", closed(&["isolated_ipv4"])),
+        field("guest_transport", closed(&["vsock"])),
+        field("guest_agent_protocol_version", literal_number(1)),
+        field("guest_config_digest", digest()),
+    ])
+}
+
+fn guest_ipv4_pool_schema() -> Schema {
+    object(vec![
+        field("kind", closed(&["private_ipv4_16"])),
+        field("network_address", string(StringRule::Ipv4)),
+        field("prefix_length", literal_number(16)),
+    ])
+}
+
+fn node_placement_policy_schema() -> Schema {
+    object(vec![
+        field("version", version()),
+        field("node_id", id()),
+        field("policy_revision", epoch()),
+        field("scheduling_state", closed(&["cordoned", "schedulable"])),
+        field("allocatable_vcpus", number(1, u64::from(u32::MAX))),
+        field("allocatable_memory_bytes", number(1, MAX_WIRE_INTEGER)),
+        field("capabilities", runtime_placement_capabilities_schema()),
+        field("guest_ipv4_pool", guest_ipv4_pool_schema()),
+    ])
+}
+
+fn public_key_credential_binding_schema() -> Schema {
+    union(
+        "kind",
+        vec![variant(
+            "public_key",
+            vec![field("public_key_spki_sha256", digest())],
+        )],
+    )
+}
+
+fn runtime_node_authority_mutation_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant(
+                "provision",
+                vec![
+                    field("node_identity", node_identity_schema()),
+                    field("placement_policy", node_placement_policy_schema()),
+                ],
+            ),
+            variant(
+                "update_policy",
+                vec![
+                    field("expected_policy_revision", epoch()),
+                    field("placement_policy", node_placement_policy_schema()),
+                ],
+            ),
+            variant(
+                "rotate_credential",
+                vec![
+                    field("expected_policy_revision", epoch()),
+                    field("expected_credential_id", id()),
+                    field(
+                        "expected_credential_binding",
+                        public_key_credential_binding_schema(),
+                    ),
+                    field("new_credential_id", id()),
+                    field(
+                        "new_credential_binding",
+                        public_key_credential_binding_schema(),
+                    ),
+                ],
+            ),
+            variant(
+                "retire",
+                vec![
+                    field("expected_policy_revision", epoch()),
+                    field("expected_credential_id", id()),
+                    field(
+                        "expected_credential_binding",
+                        public_key_credential_binding_schema(),
+                    ),
+                ],
+            ),
+        ],
+    )
+}
+
+fn runtime_node_authority_apply_schema() -> Schema {
+    object(vec![
+        field("version", version()),
+        field("apply_id", random_id()),
+        field("node_id", id()),
+        field("mutation", runtime_node_authority_mutation_schema()),
+    ])
+}
+
+fn runtime_node_authority_apply_result_schema() -> Schema {
+    object(vec![
+        field("version", version()),
+        field("apply_id", random_id()),
+        field("node_id", id()),
+        field(
+            "outcome",
+            closed(&[
+                "provisioned",
+                "policy_updated",
+                "credential_rotated",
+                "retired",
+            ]),
+        ),
+        field("identity_state", closed(&["provisioned", "retired"])),
+        field("policy_revision", epoch()),
+    ])
+}
+
+fn runtime_provisioner_credential_schema() -> Schema {
+    object(vec![
+        field("credential_id", id()),
+        field("public_key_spki", base64url_no_pad()),
+    ])
+}
+
+fn runtime_provisioner_expected_previous_schema() -> Schema {
+    object(vec![
+        field("trust_revision", epoch()),
+        field("active_set_sha256", digest()),
+    ])
+}
+
+fn runtime_provisioner_trust_bundle_schema() -> Schema {
+    object(vec![
+        field("version", version()),
+        field("deployment_id", id()),
+        field("trust_revision", epoch()),
+        field(
+            "expected_previous",
+            nullable(runtime_provisioner_expected_previous_schema()),
+        ),
+        field(
+            "credentials",
+            array(runtime_provisioner_credential_schema(), 4),
+        ),
+    ])
+}
+
+fn runtime_provisioner_active_set_schema() -> Schema {
+    object(vec![
+        field("version", version()),
+        field("deployment_id", id()),
+        field(
+            "credentials",
+            array(runtime_provisioner_credential_schema(), 4),
+        ),
+    ])
+}
+
 fn agent_registration_attempt_schema() -> Schema {
     object(vec![
         field("version", version()),
@@ -3771,6 +3949,15 @@ fn node_cleanup_checkpoint_schema() -> Schema {
 // NodeObservation tree on every heartbeat would put avoidable allocation on the
 // hot path, so each explicit decoder shares one lazily initialized tree.
 static NODE_IDENTITY_SCHEMA: LazyLock<Schema> = LazyLock::new(node_identity_schema);
+static NODE_PLACEMENT_POLICY_SCHEMA: LazyLock<Schema> = LazyLock::new(node_placement_policy_schema);
+static RUNTIME_NODE_AUTHORITY_APPLY_SCHEMA: LazyLock<Schema> =
+    LazyLock::new(runtime_node_authority_apply_schema);
+static RUNTIME_NODE_AUTHORITY_APPLY_RESULT_SCHEMA: LazyLock<Schema> =
+    LazyLock::new(runtime_node_authority_apply_result_schema);
+static RUNTIME_PROVISIONER_TRUST_BUNDLE_SCHEMA: LazyLock<Schema> =
+    LazyLock::new(runtime_provisioner_trust_bundle_schema);
+static RUNTIME_PROVISIONER_ACTIVE_SET_SCHEMA: LazyLock<Schema> =
+    LazyLock::new(runtime_provisioner_active_set_schema);
 static AGENT_REGISTRATION_ATTEMPT_SCHEMA: LazyLock<Schema> =
     LazyLock::new(agent_registration_attempt_schema);
 static AGENT_SESSION_SCHEMA: LazyLock<Schema> = LazyLock::new(agent_session_schema);
@@ -3955,6 +4142,64 @@ pub fn decode_node_identity(bytes: &[u8]) -> Result<NodeIdentity, ContractError>
     )
 }
 
+pub fn decode_node_placement_policy(bytes: &[u8]) -> Result<NodePlacementPolicy, ContractError> {
+    decode(
+        bytes,
+        ContractName::NodePlacementPolicy,
+        NODE_PLACEMENT_POLICY_MAX_WIRE_BYTES,
+        &NODE_PLACEMENT_POLICY_SCHEMA,
+        validate_node_placement_policy,
+    )
+}
+
+pub fn decode_runtime_node_authority_apply(
+    bytes: &[u8],
+) -> Result<RuntimeNodeAuthorityApply, ContractError> {
+    decode(
+        bytes,
+        ContractName::RuntimeNodeAuthorityApply,
+        RUNTIME_NODE_AUTHORITY_APPLY_MAX_WIRE_BYTES,
+        &RUNTIME_NODE_AUTHORITY_APPLY_SCHEMA,
+        validate_runtime_node_authority_apply,
+    )
+}
+
+pub fn decode_runtime_node_authority_apply_result(
+    bytes: &[u8],
+) -> Result<RuntimeNodeAuthorityApplyResult, ContractError> {
+    decode(
+        bytes,
+        ContractName::RuntimeNodeAuthorityApplyResult,
+        RUNTIME_NODE_AUTHORITY_APPLY_RESULT_MAX_WIRE_BYTES,
+        &RUNTIME_NODE_AUTHORITY_APPLY_RESULT_SCHEMA,
+        validate_runtime_node_authority_apply_result,
+    )
+}
+
+pub fn decode_runtime_provisioner_trust_bundle(
+    bytes: &[u8],
+) -> Result<RuntimeProvisionerTrustBundle, ContractError> {
+    decode(
+        bytes,
+        ContractName::RuntimeProvisionerTrustBundle,
+        RUNTIME_PROVISIONER_TRUST_BUNDLE_MAX_WIRE_BYTES,
+        &RUNTIME_PROVISIONER_TRUST_BUNDLE_SCHEMA,
+        validate_runtime_provisioner_trust_bundle,
+    )
+}
+
+pub fn decode_runtime_provisioner_active_set(
+    bytes: &[u8],
+) -> Result<RuntimeProvisionerActiveSet, ContractError> {
+    decode(
+        bytes,
+        ContractName::RuntimeProvisionerActiveSet,
+        RUNTIME_PROVISIONER_ACTIVE_SET_MAX_WIRE_BYTES,
+        &RUNTIME_PROVISIONER_ACTIVE_SET_SCHEMA,
+        validate_runtime_provisioner_active_set,
+    )
+}
+
 pub fn decode_agent_registration_attempt(
     bytes: &[u8],
 ) -> Result<AgentRegistrationAttempt, ContractError> {
@@ -4116,6 +4361,54 @@ pub fn encode_node_identity(value: &NodeIdentity) -> Result<Vec<u8>, ContractErr
     encode(value, ContractName::NodeIdentity, decode_node_identity)
 }
 
+pub fn encode_node_placement_policy(value: &NodePlacementPolicy) -> Result<Vec<u8>, ContractError> {
+    encode(
+        value,
+        ContractName::NodePlacementPolicy,
+        decode_node_placement_policy,
+    )
+}
+
+pub fn encode_runtime_node_authority_apply(
+    value: &RuntimeNodeAuthorityApply,
+) -> Result<Vec<u8>, ContractError> {
+    encode(
+        value,
+        ContractName::RuntimeNodeAuthorityApply,
+        decode_runtime_node_authority_apply,
+    )
+}
+
+pub fn encode_runtime_node_authority_apply_result(
+    value: &RuntimeNodeAuthorityApplyResult,
+) -> Result<Vec<u8>, ContractError> {
+    encode(
+        value,
+        ContractName::RuntimeNodeAuthorityApplyResult,
+        decode_runtime_node_authority_apply_result,
+    )
+}
+
+pub fn encode_runtime_provisioner_trust_bundle(
+    value: &RuntimeProvisionerTrustBundle,
+) -> Result<Vec<u8>, ContractError> {
+    encode(
+        value,
+        ContractName::RuntimeProvisionerTrustBundle,
+        decode_runtime_provisioner_trust_bundle,
+    )
+}
+
+pub fn encode_runtime_provisioner_active_set(
+    value: &RuntimeProvisionerActiveSet,
+) -> Result<Vec<u8>, ContractError> {
+    encode(
+        value,
+        ContractName::RuntimeProvisionerActiveSet,
+        decode_runtime_provisioner_active_set,
+    )
+}
+
 pub fn encode_agent_registration_attempt(
     value: &AgentRegistrationAttempt,
 ) -> Result<Vec<u8>, ContractError> {
@@ -4224,6 +4517,249 @@ pub fn encode_operation(value: &Operation) -> Result<Vec<u8>, ContractError> {
 
 pub fn encode_contract_error(value: &ContractError) -> Result<Vec<u8>, ContractError> {
     encode(value, ContractName::ContractError, decode_contract_error)
+}
+
+fn validate_node_placement_policy(policy: &NodePlacementPolicy) -> Result<(), ContractError> {
+    let mut candidates = Vec::new();
+    if policy.version != ContractVersion::V1 {
+        candidates.push(Candidate::at(
+            &path(&["version"]),
+            MalformedProblem::InvalidValue,
+        ));
+    }
+    if policy.capabilities.guest_agent_protocol_version != ContractVersion::V1 {
+        candidates.push(Candidate::at(
+            &path(&["capabilities", "guest_agent_protocol_version"]),
+            MalformedProblem::InvalidValue,
+        ));
+    }
+    if policy.guest_ipv4_pool.prefix_length != 16
+        || !private_aligned_ipv4_16(&policy.guest_ipv4_pool.network_address)
+    {
+        candidates.push(Candidate::at(
+            &path(&["guest_ipv4_pool"]),
+            MalformedProblem::InvalidValue,
+        ));
+    }
+    if let Some(candidate) = choose(candidates) {
+        return Err(malformed(ContractName::NodePlacementPolicy, candidate));
+    }
+    Ok(())
+}
+
+fn validate_runtime_node_authority_apply(
+    apply: &RuntimeNodeAuthorityApply,
+) -> Result<(), ContractError> {
+    let contract = ContractName::RuntimeNodeAuthorityApply;
+    let mutation_path = path(&["mutation"]);
+    let mut candidates = Vec::new();
+    match &apply.mutation {
+        RuntimeNodeAuthorityMutation::Provision {
+            node_identity,
+            placement_policy,
+        } => {
+            if node_identity.version != ContractVersion::V1
+                || node_identity.node_id != apply.node_id
+                || node_identity.state != NodeIdentityState::Provisioned
+                || !matches!(
+                    node_identity.credential_binding,
+                    CredentialBinding::PublicKey { .. }
+                )
+            {
+                candidates.push(Candidate::at(
+                    &child(&mutation_path, "node_identity"),
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+            collect_nested_policy_candidate(
+                placement_policy,
+                &child(&mutation_path, "placement_policy"),
+                &mut candidates,
+            );
+            if placement_policy.node_id != apply.node_id
+                || placement_policy.policy_revision.get() != 1
+                || placement_policy.scheduling_state != RuntimeSchedulingState::Cordoned
+            {
+                candidates.push(Candidate::at(
+                    &child(&mutation_path, "placement_policy"),
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+        }
+        RuntimeNodeAuthorityMutation::UpdatePolicy {
+            expected_policy_revision,
+            placement_policy,
+        } => {
+            collect_nested_policy_candidate(
+                placement_policy,
+                &child(&mutation_path, "placement_policy"),
+                &mut candidates,
+            );
+            if placement_policy.node_id != apply.node_id
+                || expected_policy_revision
+                    .get()
+                    .checked_add(1)
+                    .is_none_or(|next| next != placement_policy.policy_revision.get())
+            {
+                candidates.push(Candidate::at(
+                    &child(&mutation_path, "placement_policy"),
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+        }
+        RuntimeNodeAuthorityMutation::RotateCredential {
+            expected_credential_id,
+            expected_credential_binding,
+            new_credential_id,
+            new_credential_binding,
+            ..
+        } => {
+            if expected_credential_id == new_credential_id
+                || expected_credential_binding == new_credential_binding
+            {
+                candidates.push(Candidate::at(
+                    &mutation_path,
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+        }
+        RuntimeNodeAuthorityMutation::Retire { .. } => {}
+    }
+    if let Some(candidate) = choose(candidates) {
+        return Err(malformed(contract, candidate));
+    }
+    Ok(())
+}
+
+fn collect_nested_policy_candidate(
+    policy: &NodePlacementPolicy,
+    prefix: &[PathSegment],
+    candidates: &mut Vec<Candidate>,
+) {
+    if let Err(error) = validate_node_placement_policy(policy) {
+        candidates.push(rebase_contract_candidate(prefix, &error));
+    }
+}
+
+fn validate_runtime_node_authority_apply_result(
+    result: &RuntimeNodeAuthorityApplyResult,
+) -> Result<(), ContractError> {
+    let valid = match result.outcome {
+        RuntimeNodeAuthorityOutcome::Provisioned => {
+            result.identity_state == NodeIdentityState::Provisioned
+                && result.policy_revision.get() == 1
+        }
+        RuntimeNodeAuthorityOutcome::PolicyUpdated
+        | RuntimeNodeAuthorityOutcome::CredentialRotated => {
+            result.identity_state == NodeIdentityState::Provisioned
+        }
+        RuntimeNodeAuthorityOutcome::Retired => result.identity_state == NodeIdentityState::Retired,
+    };
+    if !valid {
+        return Err(malformed(
+            ContractName::RuntimeNodeAuthorityApplyResult,
+            Candidate::at(&[], MalformedProblem::InvalidValue),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_runtime_provisioner_trust_bundle(
+    bundle: &RuntimeProvisionerTrustBundle,
+) -> Result<(), ContractError> {
+    let contract = ContractName::RuntimeProvisionerTrustBundle;
+    let mut candidates = provisioner_credential_candidates(&bundle.credentials);
+    let expected_valid = if bundle.trust_revision.get() == 1 {
+        bundle.expected_previous.is_none()
+    } else {
+        bundle.expected_previous.as_ref().is_some_and(|previous| {
+            previous
+                .trust_revision
+                .get()
+                .checked_add(1)
+                .is_some_and(|next| next == bundle.trust_revision.get())
+        })
+    };
+    if !expected_valid {
+        candidates.push(Candidate::at(
+            &path(&["expected_previous"]),
+            MalformedProblem::InvalidValue,
+        ));
+    }
+    if let Some(candidate) = choose(candidates) {
+        return Err(malformed(contract, candidate));
+    }
+    Ok(())
+}
+
+fn validate_runtime_provisioner_active_set(
+    active_set: &RuntimeProvisionerActiveSet,
+) -> Result<(), ContractError> {
+    if let Some(candidate) = choose(provisioner_credential_candidates(&active_set.credentials)) {
+        return Err(malformed(
+            ContractName::RuntimeProvisionerActiveSet,
+            candidate,
+        ));
+    }
+    Ok(())
+}
+
+fn provisioner_credential_candidates(
+    credentials: &[RuntimeProvisionerCredential],
+) -> Vec<Candidate> {
+    let credentials_path = path(&["credentials"]);
+    let mut candidates = Vec::new();
+    if credentials.is_empty() {
+        candidates.push(Candidate::at(
+            &credentials_path,
+            MalformedProblem::InvalidValue,
+        ));
+        return candidates;
+    }
+    collect_unique_order(
+        credentials,
+        &credentials_path,
+        |credential| credential.credential_id.as_str().as_bytes().to_vec(),
+        &mut candidates,
+    );
+    if has_duplicate(
+        credentials
+            .iter()
+            .map(|credential| credential.public_key_spki.as_str()),
+    ) {
+        candidates.push(Candidate::at(
+            &credentials_path,
+            MalformedProblem::DuplicateIdentity,
+        ));
+    }
+    for (index, credential) in credentials.iter().enumerate() {
+        if !canonical_ed25519_spki(&credential.public_key_spki) {
+            candidates.push(Candidate::at(
+                &child(&indexed(&credentials_path, index), "public_key_spki"),
+                MalformedProblem::InvalidValue,
+            ));
+        }
+    }
+    candidates
+}
+
+fn canonical_ed25519_spki(value: &Base64UrlNoPad) -> bool {
+    const PREFIX: [u8; 12] = [
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+    URL_SAFE_NO_PAD
+        .decode(value.as_str())
+        .is_ok_and(|decoded| decoded.len() == PREFIX.len() + 32 && decoded.starts_with(&PREFIX))
+}
+
+fn private_aligned_ipv4_16(address: &Ipv4Address) -> bool {
+    let address = ipv4_integer(address);
+    if address & 0xffff != 0 {
+        return false;
+    }
+    let first = address >> 24;
+    let second = (address >> 16) & 0xff;
+    first == 10 || (first == 172 && (16..=31).contains(&second)) || (first == 192 && second == 168)
 }
 
 pub(crate) fn validate_key_ring(loaded_kids: &[KeyId]) -> Result<(), ContractError> {

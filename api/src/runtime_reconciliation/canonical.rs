@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use super::types::{
     ContractError, ContractErrorDetail, ContractName, ContractVersion, DesiredRuntimeSpec, Epoch,
     GuestRuntimeProfileReceipt, JsonPointer, KeyId, MalformedProblem, NodeObservation,
-    RuntimeCheckpoint, Sha256Digest,
+    RuntimeCheckpoint, RuntimeProvisionerActiveSet, Sha256Digest,
 };
 
 const SPEC_DOMAIN: &[u8] = b"cats.runtime.desired-spec.v1";
@@ -134,6 +134,17 @@ pub fn key_ring_digest(
         "loaded_kids": loaded_kids,
     });
     Ok(digest_value(KEY_RING_DOMAIN, &projection))
+}
+
+/// Computes the ordinary SHA-256 of one validated canonical provisioner
+/// active-set artifact. Unlike runtime content digests this authority pointer
+/// deliberately has no domain prefix; the closed active-set schema is its
+/// complete preimage contract.
+pub fn runtime_provisioner_active_set_digest(
+    active_set: &RuntimeProvisionerActiveSet,
+) -> Result<Sha256Digest, ContractError> {
+    let canonical = super::wire::encode_runtime_provisioner_active_set(active_set)?;
+    Ok(Sha256Digest::from_bytes(Sha256::digest(canonical).into()))
 }
 
 pub(crate) fn unchecked_spec_digest(spec: &DesiredRuntimeSpec) -> Sha256Digest {

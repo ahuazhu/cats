@@ -2,6 +2,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub(crate) const MAX_WIRE_INTEGER: u64 = i64::MAX as u64;
@@ -43,6 +44,32 @@ integer_newtype!(WireU64, 0);
 integer_newtype!(Generation, 0);
 integer_newtype!(FenceEpoch, 0);
 integer_newtype!(UnixMillis, 0);
+integer_newtype!(AllocatableMemoryBytes, 1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct AllocatableVcpus(u32);
+
+impl AllocatableVcpus {
+    pub fn new(value: u32) -> Option<Self> {
+        (value > 0).then_some(Self(value))
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for AllocatableVcpus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u32::deserialize(deserializer)?;
+        Self::new(value)
+            .ok_or_else(|| serde::de::Error::custom("allocatable vCPU count must be positive"))
+    }
+}
 
 impl ContractVersion {
     pub const V1: Self = Self(1);
@@ -183,6 +210,15 @@ pub(crate) fn valid_mac(value: &str) -> bool {
     }) && parts.next().is_none()
 }
 
+pub(crate) fn valid_base64url_no_pad(value: &str) -> bool {
+    if value.is_empty() || value.len() > 512 || value.contains('=') {
+        return false;
+    }
+    URL_SAFE_NO_PAD
+        .decode(value)
+        .is_ok_and(|decoded| URL_SAFE_NO_PAD.encode(decoded) == value)
+}
+
 pub(crate) fn printable_ascii(value: &str) -> bool {
     value.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
 }
@@ -204,6 +240,7 @@ string_newtype!(HostPath, valid_host_path);
 string_newtype!(Hostname, valid_hostname);
 string_newtype!(Ipv4Address, valid_ipv4);
 string_newtype!(MacAddress, valid_mac);
+string_newtype!(Base64UrlNoPad, valid_base64url_no_pad);
 
 #[derive(Clone)]
 pub struct Sha256Digest {
@@ -321,6 +358,205 @@ pub enum CredentialBinding {
 pub enum NodeIdentityState {
     Provisioned,
     Retired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeSchedulingState {
+    Cordoned,
+    Schedulable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimePlacementVmm {
+    CloudHypervisor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimePlacementBlockFrontend {
+    KernelNbd,
+    VhostUserBlk,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimePlacementGuestNetwork {
+    IsolatedIpv4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimePlacementGuestTransport {
+    Vsock,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimePlacementCapabilities {
+    pub vmm: RuntimePlacementVmm,
+    pub block_frontend: RuntimePlacementBlockFrontend,
+    pub guest_network: RuntimePlacementGuestNetwork,
+    pub guest_transport: RuntimePlacementGuestTransport,
+    pub guest_agent_protocol_version: ContractVersion,
+    pub guest_config_digest: Sha256Digest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuestIpv4PoolKind {
+    PrivateIpv4_16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuestIpv4Pool {
+    pub kind: GuestIpv4PoolKind,
+    pub network_address: Ipv4Address,
+    pub prefix_length: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodePlacementPolicy {
+    pub version: ContractVersion,
+    pub node_id: Id,
+    pub policy_revision: Epoch,
+    pub scheduling_state: RuntimeSchedulingState,
+    pub allocatable_vcpus: AllocatableVcpus,
+    pub allocatable_memory_bytes: AllocatableMemoryBytes,
+    pub capabilities: RuntimePlacementCapabilities,
+    pub guest_ipv4_pool: GuestIpv4Pool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PublicKeyCredentialBinding {
+    PublicKey {
+        public_key_spki_sha256: Sha256Digest,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeNodeAuthorityApply {
+    pub version: ContractVersion,
+    pub apply_id: RandomId128,
+    pub node_id: Id,
+    pub mutation: RuntimeNodeAuthorityMutation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RuntimeNodeAuthorityMutation {
+    Provision {
+        node_identity: Box<NodeIdentity>,
+        placement_policy: Box<NodePlacementPolicy>,
+    },
+    UpdatePolicy {
+        expected_policy_revision: Epoch,
+        placement_policy: Box<NodePlacementPolicy>,
+    },
+    RotateCredential {
+        expected_policy_revision: Epoch,
+        expected_credential_id: Id,
+        expected_credential_binding: PublicKeyCredentialBinding,
+        new_credential_id: Id,
+        new_credential_binding: PublicKeyCredentialBinding,
+    },
+    Retire {
+        expected_policy_revision: Epoch,
+        expected_credential_id: Id,
+        expected_credential_binding: PublicKeyCredentialBinding,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeNodeAuthorityOutcome {
+    Provisioned,
+    PolicyUpdated,
+    CredentialRotated,
+    Retired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeNodeAuthorityApplyResult {
+    pub version: ContractVersion,
+    pub apply_id: RandomId128,
+    pub node_id: Id,
+    pub outcome: RuntimeNodeAuthorityOutcome,
+    pub identity_state: NodeIdentityState,
+    pub policy_revision: Epoch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RuntimeNodeAuthorityStoredOutcome {
+    Applied {
+        response: RuntimeNodeAuthorityApplyResult,
+    },
+    AuthorityPreconditionFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeProvisionerExpectedPrevious {
+    pub trust_revision: Epoch,
+    pub active_set_sha256: Sha256Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeProvisionerCredential {
+    pub credential_id: Id,
+    pub public_key_spki: Base64UrlNoPad,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeProvisionerTrustBundle {
+    pub version: ContractVersion,
+    pub deployment_id: Id,
+    pub trust_revision: Epoch,
+    pub expected_previous: Option<RuntimeProvisionerExpectedPrevious>,
+    pub credentials: Vec<RuntimeProvisionerCredential>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeProvisionerActiveSet {
+    pub version: ContractVersion,
+    pub deployment_id: Id,
+    pub credentials: Vec<RuntimeProvisionerCredential>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FleetPolicyPrincipal {
+    DeploymentProvisioner {
+        deployment_id: Id,
+        credential_id: Id,
+        public_key_spki: Base64UrlNoPad,
+        public_key_spki_sha256: Sha256Digest,
+    },
+    WorkosFleetAdministrator {
+        subject: Id,
+        organization_id: Id,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeNodeAuthorityApplyRecord {
+    pub apply_id: RandomId128,
+    pub request: Box<RuntimeNodeAuthorityApply>,
+    pub request_sha256: Sha256Digest,
+    pub principal: FleetPolicyPrincipal,
+    pub outcome: RuntimeNodeAuthorityStoredOutcome,
+    pub committed_at_unix_ms: UnixMillis,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2006,6 +2242,12 @@ pub struct RegistrationAttemptBinding {
 #[serde(rename_all = "snake_case")]
 pub enum ContractName {
     NodeIdentity,
+    NodePlacementPolicy,
+    RuntimeNodeAuthorityApply,
+    RuntimeNodeAuthorityApplyResult,
+    RuntimeProvisionerTrustBundle,
+    RuntimeProvisionerActiveSet,
+    RuntimeNodeAuthorityApplyRecord,
     AgentRegistrationAttempt,
     AgentSession,
     GuestRuntimeProfileReceipt,
