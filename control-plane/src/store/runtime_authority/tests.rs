@@ -1,20 +1,24 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Barrier};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cats_api::agent_registration::AuthenticatedNodeCredential;
 use cats_api::error::ErrorCode;
 use cats_api::runtime_reconciliation::{
     encode_desired_runtime_spec, guest_config_digest, inventory_digest, spec_digest,
     AgentRegistrationAttempt, AgentSession, AppliedDesiredEvidence, AsciiText as RuntimeAsciiText,
-    AssignedKind, AssignedPlacement, CheckpointEvidence, ContractErrorDetail, ContractVersion,
-    CredentialBinding, DesiredReadRequest, DesiredRuntimeSpec, DiskKind, GuestDeviceIdentity,
-    GuestRuntimeProfileReceipt, GuestTransportEvidence, Ipv4Address, IsolatedIpv4Kind,
-    LifecycleAdmission, MacAddress, NetworkConfig, NodeBootId, NodeIdentity, NodeIdentityState,
-    NodeObservation, ObservedRuntimeStatus, ReconcileStep, RuntimeConfig, RuntimeTarget,
-    RuntimeTransition, RuntimeVolumeAuthorizationRejection, RuntimeVolumeTransitionEvidenceRequest,
-    RuntimeVolumeTransitionPreconditionProblem, Sequence, SessionBinding, VolumeAccess,
-    VolumeAcquire, VolumeDisposition, VolumeIntent, WarmSnapshotEvidence,
+    AssignedKind, AssignedPlacement, CheckpointEvidence, CleanupRelease, CleanupTarget,
+    ContractErrorDetail, ContractVersion, CredentialBinding, DesiredReadRequest,
+    DesiredRuntimeSpec, DiskKind, GuestDeviceIdentity, GuestRuntimeProfileReceipt,
+    GuestTransportEvidence, Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, LocalLineageState,
+    LocalVolumeLineage, MacAddress, NetworkConfig, NodeBootId, NodeIdentity, NodeIdentityState,
+    NodeObservation, ObservedDiskKind, ObservedRuntimeStatus, ObservedVolume, Operation,
+    OperationPhase, ReconcileStep, RuntimeConfig, RuntimeTarget, RuntimeTransition,
+    RuntimeVolumeAuthorizationRejection, RuntimeVolumeTransition,
+    RuntimeVolumeTransitionEvidenceRequest, RuntimeVolumeTransitionOutcome,
+    RuntimeVolumeTransitionPreconditionProblem, RuntimeVolumeTransitionRequest, Sequence,
+    SessionBinding, VolumeAccess, VolumeAcquire, VolumeAcquireRequest, VolumeAuthorityEvidence,
+    VolumeDisposition, VolumeIntent, VolumeReleaseReplay, WarmSnapshotEvidence, WireU64,
 };
 use cats_storage::authority::{
     complete_disposable_root_delete, consume_disposable_root_delete, AsciiText, AuthorityError,
@@ -26,7 +30,10 @@ use cats_storage::authority::{
 };
 
 use super::product::{CatRecord, DiskAdminState, DiskRecord, DiskRole};
-use super::product_rows::{insert_cat, insert_desired, insert_disk, load_desired_for_update};
+use super::product_rows::{
+    insert_cat, insert_desired, insert_disk, insert_operation, load_desired_for_update,
+    load_disk_by_id_for_update,
+};
 use super::rows::{
     database_now, insert_authorization, insert_delete_completion, insert_event, insert_volume,
     load_active_event_by_node_unlocked, load_authorization_for_update,
@@ -49,7 +56,7 @@ use crate::store::agent_sessions::{
     AgentSessionRegistrationPolicy,
 };
 use crate::store::transaction::{authority_transaction_attempts, AuthorityTransactionError};
-use crate::store::{metrics_snapshot, Store};
+use crate::store::{metrics_snapshot, AuthorityRequestContext, Store};
 
 fn id(value: &str) -> Id {
     Id::new(value).unwrap()
@@ -246,6 +253,238 @@ fn takeover_runtime_status(desired: &DesiredRuntimeSpec) -> ObservedRuntimeStatu
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the test fixture spells every current Desired transition binding explicitly"
+)]
+fn transition_desired(
+    workspace_id: &Id,
+    node: &TransitionNode,
+    volume: &VolumeRecord,
+    target: RuntimeTarget,
+    desired_revision: Revision,
+    placement_epoch: Epoch,
+    attachment_id: Id,
+    acquire: VolumeAcquire,
+    disposition: VolumeDisposition,
+) -> DesiredRuntimeSpec {
+    let mut desired = DesiredRuntimeSpec {
+        version: ContractVersion::V1,
+        workspace_id: workspace_id.clone(),
+        cat_id: id("cat-1"),
+        desired_revision,
+        target,
+        placement: AssignedPlacement {
+            kind: AssignedKind::Assigned,
+            node_id: node.session.node_id.clone(),
+            placement_epoch,
+        },
+        runtime: RuntimeConfig {
+            vcpus: 1,
+            memory_bytes: 512 * 1024 * 1024,
+            boot_image_digest: Sha256Digest::from_bytes([31; 32]),
+            guest_config_digest: node.active_guest_config_digest.clone(),
+            network_config: NetworkConfig {
+                kind: IsolatedIpv4Kind::IsolatedIpv4,
+                network_id: id("network-1"),
+                guest_mac: MacAddress::new("02:ca:0a:00:00:02").unwrap(),
+                guest_ipv4: Ipv4Address::new("10.0.0.2").unwrap(),
+                prefix_length: 30,
+                gateway_ipv4: Ipv4Address::new("10.0.0.1").unwrap(),
+            },
+        },
+        volumes: vec![VolumeIntent {
+            volume_intent_id: id("volume-intent-1"),
+            disk_id: id("disk-1"),
+            volume_id: volume.volume_id.clone(),
+            attachment_id,
+            size_bytes: volume.size_bytes,
+            disk_kind: DiskKind::Root,
+            access: VolumeAccess::ReadWriteOnce,
+            durability: volume.durability,
+            guest_device: GuestDeviceIdentity {
+                serial: id("root-device-1"),
+                slot: 0,
+            },
+            acquire,
+            disposition,
+            mount: None,
+        }],
+        endpoints: Vec::new(),
+        transition: RuntimeTransition::CancelAndDrain,
+        spec_digest: Sha256Digest::from_bytes([0; 32]),
+    };
+    desired.spec_digest = spec_digest(&desired).unwrap();
+    desired
+}
+
+fn observed_runtime_with_volumes(
+    desired: &DesiredRuntimeSpec,
+    runtime_incarnation: Option<RandomId128>,
+    volumes: Vec<ObservedVolume>,
+) -> ObservedRuntimeStatus {
+    let mut runtime = takeover_runtime_status(desired);
+    runtime.runtime_incarnation = runtime_incarnation;
+    runtime.volumes = volumes;
+    runtime
+}
+
+fn observed_owned_volume(
+    desired: &DesiredRuntimeSpec,
+    volume: &VolumeRecord,
+    origin: cats_api::runtime_reconciliation::AcquireOrigin,
+    local_generation: Generation,
+    remote_generation: Generation,
+) -> ObservedVolume {
+    let intent = desired.volumes.first().unwrap();
+    ObservedVolume {
+        volume_intent_id: Some(intent.volume_intent_id.clone()),
+        disk_id: Some(intent.disk_id.clone()),
+        volume_id: intent.volume_id.clone(),
+        disk_kind: ObservedDiskKind::Root,
+        size_bytes: Some(intent.size_bytes),
+        durability: Some(intent.durability),
+        authority: VolumeAuthorityEvidence::Owned {
+            attachment_id: intent.attachment_id.clone(),
+            attachment_epoch: volume.lease_epoch,
+            head: volume.head.clone(),
+        },
+        local_lineages: vec![LocalVolumeLineage {
+            attachment_id: intent.attachment_id.clone(),
+            attachment_epoch: volume.lease_epoch,
+            acquire_origin: origin,
+            node_id: desired.placement.node_id.clone(),
+            placement_epoch: desired.placement.placement_epoch,
+            local_durable_generation: local_generation,
+            remote_durable_generation: remote_generation,
+            data_directory: cats_api::runtime_reconciliation::HostPath::new(
+                "/var/lib/cats/volumes/volume-1",
+            )
+            .unwrap(),
+            pending_pack_count: WireU64::new(0).unwrap(),
+            fenced: false,
+            state: LocalLineageState::Active,
+        }],
+        devices: Vec::new(),
+    }
+}
+
+fn prepare_a22_runtime(
+    store: &Store,
+    node: &TransitionNode,
+    desired: &DesiredRuntimeSpec,
+    volume: &VolumeRecord,
+    runtime: ObservedRuntimeStatus,
+    operation_required: bool,
+) -> super::runtime_spine::PlacementAdmissionSnapshot {
+    store
+        .authority_transaction(|transaction| {
+            let now = database_now(transaction)?;
+            insert_cat(
+                transaction,
+                &CatRecord {
+                    cat_id: desired.cat_id.clone(),
+                    workspace_id: desired.workspace_id.clone(),
+                    name: id("cat-1"),
+                    created_at: now,
+                },
+            )?;
+            insert_disk(
+                transaction,
+                &DiskRecord {
+                    disk_id: id("disk-1"),
+                    workspace_id: desired.workspace_id.clone(),
+                    name: id("disk-1"),
+                    volume_id: volume.volume_id.clone(),
+                    size_bytes: volume.size_bytes,
+                    durability: volume.durability,
+                    created_at: now,
+                    admin_state: DiskAdminState::Active,
+                    role: DiskRole::Root {
+                        cat_id: desired.cat_id.clone(),
+                    },
+                },
+            )?;
+            insert_desired(transaction, desired)?;
+            if operation_required {
+                insert_operation(
+                    transaction,
+                    &Operation {
+                        version: ContractVersion::V1,
+                        operation_id: id("operation-1"),
+                        workspace_id: desired.workspace_id.clone(),
+                        cat_id: desired.cat_id.clone(),
+                        desired_revision: desired.desired_revision,
+                        desired_spec_digest: desired.spec_digest.clone(),
+                        placement: desired.placement.clone(),
+                        target: desired.target,
+                        phase: OperationPhase::Pending,
+                        terminal: None,
+                        created_at_unix_ms: now,
+                        updated_at_unix_ms: now,
+                    },
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    let desired_read = match store
+        .runtime_desired_read(
+            &node.authenticated,
+            &DesiredReadRequest {
+                version: ContractVersion::V1,
+                session: node.session.clone(),
+                request_sequence: Sequence::new(1).unwrap(),
+            },
+        )
+        .unwrap()
+    {
+        RuntimeSpineOutcome::Accepted(snapshot) => snapshot,
+        RuntimeSpineOutcome::Rejected(rejection) => {
+            panic!("A22 Desired read rejected: {rejection:?}")
+        }
+    };
+    let mut observation = NodeObservation {
+        version: ContractVersion::V1,
+        observation_id: random_id(91),
+        node_id: node.session.node_id.clone(),
+        node_boot_id: node.session.node_boot_id.clone(),
+        agent_instance_id: node.session.agent_instance_id.clone(),
+        agent_session_epoch: node.session.agent_session_epoch,
+        heartbeat_sequence: Sequence::new(1).unwrap(),
+        observed_at_unix_ms: unix_millis(1),
+        complete_inventory: true,
+        inventory_epoch: epoch(1),
+        inventory_digest: Some(Sha256Digest::from_bytes([0; 32])),
+        inventory_read_position: Some(desired_read.read_position),
+        key_ring_version: None,
+        key_ring_digest: None,
+        loaded_kids: Vec::new(),
+        runtimes: vec![runtime],
+        residue: Vec::new(),
+    };
+    observation.inventory_digest = Some(inventory_digest(&observation).unwrap());
+    match store
+        .runtime_accept_observation(&node.authenticated, &observation)
+        .unwrap()
+    {
+        RuntimeSpineOutcome::Accepted(_) => {}
+        RuntimeSpineOutcome::Rejected(rejection) => {
+            panic!("A22 full observation rejected: {rejection:?}")
+        }
+    }
+    match store
+        .load_placement_admission_snapshot(&node.session.node_id, &node.active_guest_config_digest)
+        .unwrap()
+    {
+        PlacementAdmissionLoad::Accepted(snapshot) => *snapshot,
+        PlacementAdmissionLoad::Rejected(rejection) => {
+            panic!("A22 admission unexpectedly rejected: {rejection:?}")
+        }
+    }
+}
+
 fn prepare_takeover_runtime(
     store: &Store,
     node: &TransitionNode,
@@ -371,6 +610,136 @@ fn takeover_consume_request(
         placement: desired.placement.clone(),
         authorization_id: authorization_id.clone(),
     }
+}
+
+fn transition_request(
+    node: &TransitionNode,
+    desired: &DesiredRuntimeSpec,
+    transition: RuntimeVolumeTransition,
+) -> RuntimeVolumeTransitionRequest {
+    RuntimeVolumeTransitionRequest {
+        version: ContractVersion::V1,
+        session: node.session.clone(),
+        cat_id: desired.cat_id.clone(),
+        desired_revision: desired.desired_revision,
+        spec_digest: desired.spec_digest.clone(),
+        placement: desired.placement.clone(),
+        transition,
+    }
+}
+
+fn execute_transition(
+    store: &Store,
+    node: &TransitionNode,
+    request: &RuntimeVolumeTransitionRequest,
+) -> crate::store::Result<
+    VolumeTransitionStoreOutcome<cats_api::runtime_reconciliation::RuntimeVolumeTransitionSuccess>,
+> {
+    store.runtime_volume_transition(
+        &node.authenticated,
+        request,
+        &node.active_guest_config_digest,
+        &AuthorityRequestContext::new(Instant::now() + Duration::from_secs(5)),
+    )
+}
+
+fn execute_transition_with_empty_snapshot_authority(
+    store: &Store,
+    node: &TransitionNode,
+    request: &RuntimeVolumeTransitionRequest,
+) -> crate::store::Result<
+    VolumeTransitionStoreOutcome<cats_api::runtime_reconciliation::RuntimeVolumeTransitionSuccess>,
+> {
+    store.runtime_volume_transition_with_empty_snapshot_authority_for_test(
+        &node.authenticated,
+        request,
+        &node.active_guest_config_digest,
+        &AuthorityRequestContext::new(Instant::now() + Duration::from_secs(5)),
+    )
+}
+
+pub(crate) fn prepare_a22_http_normal_fixture(
+    store: &Store,
+    authenticated: AuthenticatedNodeCredential,
+    session: SessionBinding,
+    active_guest_config_digest: Sha256Digest,
+) -> RuntimeVolumeTransitionRequest {
+    let node = TransitionNode {
+        authenticated,
+        session,
+        active_guest_config_digest,
+    };
+    let volume = unowned_volume();
+    seed_volume(store, &volume);
+    let workspace = super::product_tests::bootstrap_workspace(store, "a22-http-normal");
+    let desired = transition_desired(
+        &workspace,
+        &node,
+        &volume,
+        RuntimeTarget::Running,
+        revision(11),
+        epoch(3),
+        id("attachment-normal"),
+        VolumeAcquire::Normal {
+            transition_id: random_id(2),
+            expected_unowned_epoch: fence_epoch(7),
+        },
+        VolumeDisposition::Retain,
+    );
+    prepare_a22_runtime(
+        store,
+        &node,
+        &desired,
+        &volume,
+        takeover_runtime_status(&desired),
+        false,
+    );
+    transition_request(
+        &node,
+        &desired,
+        RuntimeVolumeTransition::Acquire {
+            request: VolumeAcquireRequest::Normal {
+                volume_id: volume.volume_id,
+                transition_id: random_id(2),
+                attachment_id: id("attachment-normal"),
+                expected_unowned_epoch: fence_epoch(7),
+                desired_revision: desired.desired_revision,
+                placement_epoch: desired.placement.placement_epoch,
+                lease_duration_ms: 30_000,
+            },
+        },
+    )
+}
+
+pub(crate) fn prepare_a22_http_takeover_fixture(
+    store: &Store,
+    authenticated: AuthenticatedNodeCredential,
+    session: SessionBinding,
+    active_guest_config_digest: Sha256Digest,
+) -> RuntimeVolumeTransitionRequest {
+    let node = TransitionNode {
+        authenticated,
+        session,
+        active_guest_config_digest,
+    };
+    let owned = acquire_owned_volume(store);
+    let event = host_fence_event(HostFenceEventState::Active);
+    let mut authorization = takeover_authorization(&owned);
+    let VolumeAuthorization::Takeover(payload) = &mut authorization.authorization else {
+        unreachable!()
+    };
+    payload.authorized_node_id = node.session.node_id.clone();
+    seed_takeover(store, &event, &authorization);
+    let desired = prepare_takeover_runtime(store, &node, &id("takeover-auth-1"));
+    transition_request(
+        &node,
+        &desired,
+        RuntimeVolumeTransition::Acquire {
+            request: VolumeAcquireRequest::Takeover {
+                authorization_id: id("takeover-auth-1"),
+            },
+        },
+    )
 }
 
 fn evidence_request(node_id: &str) -> RuntimeVolumeTransitionEvidenceRequest {
@@ -912,6 +1281,301 @@ fn two_store_sessions_cannot_both_acquire_one_volume() {
             .count(),
         1
     );
+}
+
+#[test]
+fn a22_normal_acquire_commits_once_and_replays_after_response_loss() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let volume = unowned_volume();
+    seed_volume(&store, &volume);
+    let node = transition_node(&store, "node-new");
+    let workspace = super::product_tests::bootstrap_workspace(&store, "a22-normal");
+    let desired = transition_desired(
+        &workspace,
+        &node,
+        &volume,
+        RuntimeTarget::Running,
+        revision(11),
+        epoch(3),
+        id("attachment-normal"),
+        VolumeAcquire::Normal {
+            transition_id: random_id(2),
+            expected_unowned_epoch: fence_epoch(7),
+        },
+        VolumeDisposition::Retain,
+    );
+    prepare_a22_runtime(
+        &store,
+        &node,
+        &desired,
+        &volume,
+        takeover_runtime_status(&desired),
+        false,
+    );
+    let request = transition_request(
+        &node,
+        &desired,
+        RuntimeVolumeTransition::Acquire {
+            request: VolumeAcquireRequest::Normal {
+                volume_id: volume.volume_id.clone(),
+                transition_id: random_id(2),
+                attachment_id: id("attachment-normal"),
+                expected_unowned_epoch: fence_epoch(7),
+                desired_revision: desired.desired_revision,
+                placement_epoch: desired.placement.placement_epoch,
+                lease_duration_ms: 30_000,
+            },
+        },
+    );
+
+    store.inject_request_committed_response_loss_once_after(Duration::ZERO);
+    let lost = execute_transition(&store, &node, &request).unwrap_err();
+    assert_eq!(lost.code, ErrorCode::Unavailable);
+    let committed = stored_volume(&store, &volume.volume_id);
+    assert_eq!(committed.lease_owner, Some(id("attachment-normal")));
+    assert_eq!(committed.lease_epoch, fence_epoch(8));
+
+    let first = execute_transition(&store, &node, &request).unwrap();
+    let second = execute_transition(&store, &node, &request).unwrap();
+    assert_eq!(first, second);
+    let VolumeTransitionStoreOutcome::Accepted(success) = first else {
+        panic!("normal acquire replay was rejected")
+    };
+    let RuntimeVolumeTransitionOutcome::LeaseGranted { grant } = success.outcome else {
+        panic!("normal acquire returned the wrong outcome")
+    };
+    assert_eq!(grant.attachment_id, id("attachment-normal"));
+    assert_eq!(grant.attachment_epoch, fence_epoch(8));
+    assert_eq!(stored_volume(&store, &volume.volume_id), committed);
+}
+
+#[test]
+fn a22_takeover_union_consumes_and_replays_the_exact_authorization() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let owned = acquire_owned_volume(&store);
+    let event = host_fence_event(HostFenceEventState::Active);
+    let authorization = takeover_authorization(&owned);
+    seed_takeover(&store, &event, &authorization);
+    let node = transition_node(&store, "node-new");
+    let desired = prepare_takeover_runtime(&store, &node, &id("takeover-auth-1"));
+    let request = transition_request(
+        &node,
+        &desired,
+        RuntimeVolumeTransition::Acquire {
+            request: VolumeAcquireRequest::Takeover {
+                authorization_id: id("takeover-auth-1"),
+            },
+        },
+    );
+
+    let first = execute_transition(&store, &node, &request).unwrap();
+    let second = execute_transition(&store, &node, &request).unwrap();
+    assert_eq!(first, second);
+    let VolumeTransitionStoreOutcome::Accepted(success) = first else {
+        panic!("takeover union was rejected")
+    };
+    let RuntimeVolumeTransitionOutcome::LeaseGranted { grant } = success.outcome else {
+        panic!("takeover returned the wrong outcome")
+    };
+    assert_eq!(grant.attachment_id, id("attachment-new"));
+    assert_eq!(grant.attachment_epoch, fence_epoch(9));
+    assert!(matches!(
+        stored_authorization(&store, &id("takeover-auth-1")).state,
+        AuthorizationState::Consumed(_)
+    ));
+}
+
+#[test]
+fn a22_release_uses_full_physical_evidence_and_exactly_replays() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let owned = acquire_owned_volume(&store);
+    let node = transition_node(&store, "node-new");
+    let workspace = super::product_tests::bootstrap_workspace(&store, "a22-release");
+    let desired = transition_desired(
+        &workspace,
+        &node,
+        &owned,
+        RuntimeTarget::Cold,
+        revision(11),
+        epoch(3),
+        id("attachment-old"),
+        VolumeAcquire::Normal {
+            transition_id: random_id(1),
+            expected_unowned_epoch: fence_epoch(7),
+        },
+        VolumeDisposition::Retain,
+    );
+    let observed = observed_owned_volume(
+        &desired,
+        &owned,
+        cats_api::runtime_reconciliation::AcquireOrigin::Normal {
+            transition_id: random_id(1),
+        },
+        owned.head.generation,
+        owned.head.generation,
+    );
+    let admission = prepare_a22_runtime(
+        &store,
+        &node,
+        &desired,
+        &owned,
+        observed_runtime_with_volumes(&desired, None, vec![observed]),
+        false,
+    );
+    let request = transition_request(
+        &node,
+        &desired,
+        RuntimeVolumeTransition::Release {
+            cleanup: CleanupRelease {
+                target: CleanupTarget::Volume {
+                    volume_id: owned.volume_id.clone(),
+                    attachment_id: id("attachment-old"),
+                    attachment_epoch: fence_epoch(8),
+                },
+                inventory_session: node.session.clone(),
+                inventory_epoch: admission.inventory_attestation.inventory_epoch,
+                inventory_read_position: admission.inventory_attestation.inventory_read_position,
+                desired_read_position: admission.desired_read_position,
+                volume_release: Some(VolumeReleaseReplay {
+                    release_transition_id: random_id(2),
+                    generation: owned.head.generation,
+                    disposition: VolumeDisposition::Retain,
+                }),
+            },
+        },
+    );
+
+    let first = execute_transition(&store, &node, &request).unwrap();
+    let second = execute_transition(&store, &node, &request).unwrap();
+    assert_eq!(first, second);
+    let VolumeTransitionStoreOutcome::Accepted(success) = first else {
+        panic!("release was rejected")
+    };
+    let RuntimeVolumeTransitionOutcome::Released { release } = success.outcome else {
+        panic!("release returned the wrong outcome")
+    };
+    assert_eq!(release.released_attachment_id, id("attachment-old"));
+    assert_eq!(release.resulting_epoch, fence_epoch(9));
+    let released = stored_volume(&store, &owned.volume_id);
+    assert_eq!(released.lease_owner, None);
+    assert_eq!(released.lease_epoch, fence_epoch(9));
+}
+
+#[test]
+fn a22_disposable_consume_updates_volume_disk_and_receipt_atomically() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let owned = acquire_owned_volume(&store);
+    let node = transition_node(&store, "node-new");
+    let workspace = super::product_tests::bootstrap_workspace(&store, "a22-disposable");
+    let desired = transition_desired(
+        &workspace,
+        &node,
+        &owned,
+        RuntimeTarget::Deleted,
+        revision(12),
+        epoch(4),
+        id("attachment-old"),
+        VolumeAcquire::Normal {
+            transition_id: random_id(1),
+            expected_unowned_epoch: fence_epoch(7),
+        },
+        VolumeDisposition::DeleteDisposableRoot {
+            delete_id: id("delete-1"),
+        },
+    );
+    let observed = observed_owned_volume(
+        &desired,
+        &owned,
+        cats_api::runtime_reconciliation::AcquireOrigin::Normal {
+            transition_id: random_id(1),
+        },
+        generation(5),
+        owned.head.generation,
+    );
+    prepare_a22_runtime(
+        &store,
+        &node,
+        &desired,
+        &owned,
+        observed_runtime_with_volumes(&desired, Some(random_id(51)), vec![observed]),
+        true,
+    );
+    let authorization = AuthorizationRecord {
+        authorization: VolumeAuthorization::DisposableRootDelete(
+            DisposableRootDeleteAuthorization {
+                authorization_id: id("delete-auth-1"),
+                authorized_node_id: node.session.node_id.clone(),
+                delete_id: id("delete-1"),
+                disk_id: id("disk-1"),
+                volume_id: owned.volume_id.clone(),
+                cat_id: desired.cat_id.clone(),
+                desired_revision: desired.desired_revision,
+                placement_epoch: desired.placement.placement_epoch,
+                expected_attachment_id: id("attachment-old"),
+                expected_epoch: fence_epoch(8),
+                expected_head: owned.head.clone(),
+                isolation_basis: DisposableDeleteIsolationBasis::RuntimeStopped {
+                    node_id: node.session.node_id.clone(),
+                    agent_session_epoch: node.session.agent_session_epoch,
+                    runtime_incarnation: random_id(51),
+                    observation_id: random_id(91),
+                },
+                not_after: unix_millis(i64::MAX.unsigned_abs()),
+            },
+        ),
+        state: AuthorizationState::Unconsumed,
+    };
+    store
+        .authority_transaction(|transaction| insert_authorization(transaction, &authorization))
+        .unwrap();
+    let request = transition_request(
+        &node,
+        &desired,
+        RuntimeVolumeTransition::DeleteDisposableRoot {
+            authorization_id: id("delete-auth-1"),
+        },
+    );
+
+    let before_volume = stored_volume(&store, &owned.volume_id);
+    let before_authorization = stored_authorization(&store, &id("delete-auth-1"));
+    let unavailable = execute_transition(&store, &node, &request).unwrap_err();
+    assert_eq!(unavailable.code, ErrorCode::Internal);
+    assert_eq!(stored_volume(&store, &owned.volume_id), before_volume);
+    assert_eq!(
+        stored_authorization(&store, &id("delete-auth-1")),
+        before_authorization
+    );
+
+    let first = execute_transition_with_empty_snapshot_authority(&store, &node, &request).unwrap();
+    let second = execute_transition_with_empty_snapshot_authority(&store, &node, &request).unwrap();
+    assert_eq!(first, second);
+    let VolumeTransitionStoreOutcome::Accepted(success) = first else {
+        panic!("disposable delete was rejected")
+    };
+    let RuntimeVolumeTransitionOutcome::DisposableRootDeleting { receipt } = success.outcome else {
+        panic!("disposable delete returned the wrong outcome")
+    };
+    assert_eq!(receipt.authorization_id, id("delete-auth-1"));
+    assert_eq!(receipt.resulting_epoch, fence_epoch(9));
+    assert!(matches!(
+        stored_volume(&store, &owned.volume_id).admin_state,
+        VolumeAdminState::Deleting { ref delete_id } if delete_id == &id("delete-1")
+    ));
+    let disk = store
+        .authority_transaction(|transaction| {
+            Ok(load_disk_by_id_for_update(transaction, &id("disk-1"))?.unwrap())
+        })
+        .unwrap();
+    assert_eq!(
+        disk.admin_state,
+        DiskAdminState::Deleting {
+            delete_id: id("delete-1")
+        }
+    );
+    assert!(matches!(
+        stored_authorization(&store, &id("delete-auth-1")).state,
+        AuthorizationState::Consumed(_)
+    ));
 }
 
 #[test]

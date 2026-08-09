@@ -113,6 +113,7 @@ pub(crate) struct PlacementAdmissionSnapshot {
     pub(crate) node_identity: NodeIdentity,
     pub(crate) agent_session: AgentSession,
     pub(crate) inventory_attestation: AdmissionInventoryAttestation,
+    pub(crate) desired_read_position: Sequence,
     pub(crate) full_inventory_observation: NodeObservation,
     pub(crate) assigned_desired_specs: Vec<DesiredRuntimeSpec>,
 }
@@ -631,6 +632,7 @@ pub(super) fn lock_volume_mutation_admission_in(
         node_identity: identity,
         agent_session: session,
         inventory_attestation: inventory.attestation,
+        desired_read_position: desired_read.response.read_position,
         full_inventory_observation: inventory.full_observation,
         assigned_desired_specs: current_desired,
     })))
@@ -875,6 +877,7 @@ where
             node_identity: identity,
             agent_session: session,
             inventory_attestation: inventory.attestation,
+            desired_read_position: cursor.read_position,
             full_inventory_observation: inventory.full_observation,
             assigned_desired_specs: current_desired,
         },

@@ -49,4 +49,4 @@ mod placement_planner_tests;
 pub(crate) mod runtime_spine_tests;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

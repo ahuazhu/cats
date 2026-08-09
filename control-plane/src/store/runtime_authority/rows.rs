@@ -595,6 +595,80 @@ pub(super) fn takeover_authorization_is_owned_by_other_node(
         .map_err(Into::into)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RuntimeAuthorizationRoute {
+    pub(super) kind: &'static str,
+    pub(super) volume_id: Id,
+    pub(super) host_fence_event_id: Option<Id>,
+}
+
+/// Reads only immutable scalar projections needed to prove that an A22
+/// authorization id belongs to the authenticated Node and current wrapper.
+/// The protected JSON payload is decoded only after its optional event has
+/// been locked in the canonical DAG.
+pub(super) fn runtime_authorization_route_for_context(
+    transaction: &mut Transaction<'_>,
+    authorization_id: &Id,
+    authorized_node_id: &Id,
+    desired_revision: Revision,
+    placement_epoch: Epoch,
+) -> AuthorityTxResult<Option<RuntimeAuthorizationRoute>> {
+    let desired_revision = desired_revision.to_pg().map_err(corrupt)?;
+    let placement_epoch = placement_epoch.to_pg().map_err(corrupt)?;
+    let Some(row) = transaction.query_opt(
+        "SELECT kind, volume_id, host_fence_event_id
+           FROM volume_authorizations
+          WHERE authorization_id=$1
+            AND authorized_node_id=$2
+            AND desired_revision=$3
+            AND placement_epoch=$4",
+        &[
+            &authorization_id.as_str(),
+            &authorized_node_id.as_str(),
+            &desired_revision,
+            &placement_epoch,
+        ],
+    )?
+    else {
+        return Ok(None);
+    };
+    let kind = static_value(
+        row.try_get("kind")?,
+        &["takeover", "disposable_root_delete"],
+    )?;
+    let volume_id = Id::new(row.try_get::<_, String>("volume_id")?)
+        .ok_or_else(|| corrupt("invalid projected authorization volume id"))?;
+    let host_fence_event_id = match row.try_get::<_, Option<String>>("host_fence_event_id")? {
+        Some(value) => Some(
+            Id::new(value).ok_or_else(|| corrupt("invalid projected authorization event id"))?,
+        ),
+        None => None,
+    };
+    Ok(Some(RuntimeAuthorizationRoute {
+        kind,
+        volume_id,
+        host_fence_event_id,
+    }))
+}
+
+/// Fresh branch check performed only after the matching Volume row is locked.
+/// Authorization derivation is required to take that same Volume lock before
+/// insert, so release and derive cannot both commit.
+pub(super) fn volume_has_authorization(
+    transaction: &mut Transaction<'_>,
+    volume_id: &Id,
+) -> AuthorityTxResult<bool> {
+    transaction
+        .query_one(
+            "SELECT EXISTS(
+                 SELECT 1 FROM volume_authorizations WHERE volume_id=$1
+             )",
+            &[&volume_id.as_str()],
+        )?
+        .try_get(0)
+        .map_err(Into::into)
+}
+
 /// Locks and decodes the same bounded takeover row after its HostFenceEvent
 /// serialization point has been acquired.  Repeating the access predicate at
 /// the authority read prevents a routing hint from becoming an authorization

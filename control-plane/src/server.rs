@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -18,6 +19,7 @@ use crate::store::{DsnSource, ObservationStoreLane, SingletonRole, Store};
 const SINGLETON_ELECTION_RETRY: Duration = Duration::from_millis(500);
 const SINGLETON_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
 const RUNTIME_SPINE_GLOBAL_IN_FLIGHT: usize = 64;
+const RUNTIME_VOLUME_TRANSITION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Non-authoritative, per-replica admission for signed A19/A20 Node ingress.
 /// PostgreSQL remains the concurrency authority; these permits only bound
@@ -62,6 +64,127 @@ impl RuntimeSpineAdmission {
             }
         };
         semaphore.try_acquire_owned()
+    }
+}
+
+/// Owns every A22 Store closure independently of the client connection. A
+/// dropped handler cancels its request context, while this registry keeps the
+/// closure joined and lets graceful shutdown prove that no late mutation or
+/// read is still running.
+pub(crate) struct RuntimeVolumeTransitionService {
+    accepting: AtomicBool,
+    active: AtomicUsize,
+    changed: tokio::sync::Notify,
+    #[cfg(test)]
+    pause_after_admission: AtomicBool,
+    #[cfg(test)]
+    pause_entered: AtomicBool,
+    #[cfg(test)]
+    pause_changed: tokio::sync::Notify,
+}
+
+impl RuntimeVolumeTransitionService {
+    fn new() -> Self {
+        Self {
+            accepting: AtomicBool::new(true),
+            active: AtomicUsize::new(0),
+            changed: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            pause_after_admission: AtomicBool::new(false),
+            #[cfg(test)]
+            pause_entered: AtomicBool::new(false),
+            #[cfg(test)]
+            pause_changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub(crate) fn begin(self: &Arc<Self>) -> Option<RuntimeVolumeTransitionRequestGuard> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return None;
+        }
+        self.active.fetch_add(1, Ordering::AcqRel);
+        if !self.accepting.load(Ordering::Acquire) {
+            self.finish();
+            return None;
+        }
+        Some(RuntimeVolumeTransitionRequestGuard(self.clone()))
+    }
+
+    fn finish(&self) {
+        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.changed.notify_waiters();
+        }
+    }
+
+    fn begin_shutdown(&self) {
+        self.accepting.store(false, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    async fn shutdown(&self) -> anyhow::Result<()> {
+        self.begin_shutdown();
+        let joined = tokio::time::timeout(RUNTIME_VOLUME_TRANSITION_SHUTDOWN_TIMEOUT, async {
+            loop {
+                let changed = self.changed.notified();
+                if self.active.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await;
+        anyhow::ensure!(
+            joined.is_ok(),
+            "runtime volume-transition requests exceeded the shutdown deadline"
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_pause_after_admission_for_test(&self) {
+        self.pause_entered.store(false, Ordering::Release);
+        self.pause_after_admission.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_after_admission_for_test(&self) {
+        if !self.pause_after_admission.load(Ordering::Acquire) {
+            return;
+        }
+        self.pause_entered.store(true, Ordering::Release);
+        self.pause_changed.notify_waiters();
+        loop {
+            let changed = self.pause_changed.notified();
+            if !self.pause_after_admission.load(Ordering::Acquire) {
+                break;
+            }
+            changed.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_paused_admission_for_test(&self) {
+        loop {
+            let changed = self.pause_changed.notified();
+            if self.pause_entered.load(Ordering::Acquire) {
+                break;
+            }
+            changed.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_paused_admission_for_test(&self) {
+        self.pause_after_admission.store(false, Ordering::Release);
+        self.pause_changed.notify_waiters();
+    }
+}
+
+pub(crate) struct RuntimeVolumeTransitionRequestGuard(Arc<RuntimeVolumeTransitionService>);
+
+impl Drop for RuntimeVolumeTransitionRequestGuard {
+    fn drop(&mut self) {
+        self.0.finish();
     }
 }
 
@@ -158,6 +281,8 @@ pub struct AppState {
     pub cfg: Arc<Config>,
     pub(crate) agent_session_registration_policy: Arc<crate::store::AgentSessionRegistrationPolicy>,
     pub(crate) runtime_spine_admission: Arc<RuntimeSpineAdmission>,
+    pub(crate) runtime_volume_transition_admission: Arc<RuntimeSpineAdmission>,
+    pub(crate) runtime_volume_transition_service: Arc<RuntimeVolumeTransitionService>,
     /// The old Controller/NodeJob runtime exists only to keep the explicit
     /// pre-cutover integration harness exercising its historical contract.
     /// Production handlers consult this before touching any legacy work row
@@ -200,6 +325,9 @@ impl Handle {
     }
     fn begin_shutdown(&self) {
         self.state.cat_create.begin_shutdown();
+        self.state
+            .runtime_volume_transition_service
+            .begin_shutdown();
         self.image_manifest_resolver.begin_shutdown();
         self.state.observation_store.begin_shutdown();
         if let Some(shutdown) = self
@@ -224,16 +352,22 @@ impl Handle {
         // bounds this wait by the provider transport deadline.
         self.begin_shutdown();
         let observation_store = self.state.observation_store.shutdown();
+        let volume_transitions = self.state.runtime_volume_transition_service.shutdown();
         let commit_resolutions = self.state.cat_create.shutdown_commit_resolutions();
         let manifest_reads = self.image_manifest_resolver.shutdown();
-        let (_, commit_result, manifest_result) =
-            tokio::join!(observation_store, commit_resolutions, manifest_reads);
+        let (_, transition_result, commit_result, manifest_result) = tokio::join!(
+            observation_store,
+            volume_transitions,
+            commit_resolutions,
+            manifest_reads
+        );
         if !manifest_result {
             tracing::warn!("image manifest reads exceeded the shutdown deadline");
         }
         // Graceful shutdown has already stopped admission. Abort any unrelated
         // long-lived HTTP connection after Cat commit ownership is resolved.
         self.server_task.abort();
+        transition_result?;
         commit_result.map_err(anyhow::Error::from)
     }
 }
@@ -572,6 +706,8 @@ async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow
         cfg: cfg.clone(),
         agent_session_registration_policy,
         runtime_spine_admission: Arc::new(RuntimeSpineAdmission::new()),
+        runtime_volume_transition_admission: Arc::new(RuntimeSpineAdmission::new()),
+        runtime_volume_transition_service: Arc::new(RuntimeVolumeTransitionService::new()),
         legacy_node_runtime_for_tests,
     };
 

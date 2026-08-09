@@ -274,6 +274,32 @@ impl Store {
         }
     }
 
+    /// Deadline-bound A22 logical read. The value is returned through the
+    /// explicit rollback disposition so the transaction never enters the
+    /// mutation commit/ambiguity phase, while PostgreSQL statement and lock
+    /// timeouts still follow the request's one absolute deadline.
+    pub(super) fn authority_request_locking_read_snapshot<T: Send>(
+        &self,
+        request: &AuthorityRequestContext,
+        mut operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
+    ) -> Result<T> {
+        match self.authority_transaction_outcome_with_hook(
+            move |transaction| operation(transaction).map(AuthorityRequestDisposition::Reject),
+            AuthorityTransactionMode::RepeatableRead,
+            Some(request),
+            || {},
+        ) {
+            Ok(value) => Ok(value),
+            Err(AuthorityExecutionError::Store(error)) => Err(error),
+            Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
+                "unexpected candidate-collision marker in an authority request read",
+            )),
+            Err(AuthorityExecutionError::PlacementStale) => Err(internal(
+                "unexpected placement-stale marker in an authority request read",
+            )),
+        }
+    }
+
     pub(super) fn authority_transaction_outcome<T: Send>(
         &self,
         operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,

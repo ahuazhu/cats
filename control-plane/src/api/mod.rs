@@ -51,6 +51,7 @@ mod nodes;
 mod operations;
 mod routes;
 mod runtime_spine;
+mod runtime_volume_transitions;
 mod sessions;
 mod usage;
 
@@ -531,6 +532,21 @@ pub fn router(state: AppState) -> Router {
     } else {
         legacy_authority.route_layer(axum::middleware::from_fn(reject_legacy_authority))
     };
+    let runtime_volume_authority = if state.legacy_node_runtime_for_tests {
+        Router::new()
+    } else {
+        Router::new()
+            .route(
+                "/v1/internal/runtime/volume-transitions",
+                post(runtime_volume_transitions::mutation)
+                    .fallback(runtime_volume_transitions::mutation),
+            )
+            .route(
+                "/v1/internal/runtime/volume-transition-evidence",
+                post(runtime_volume_transitions::evidence)
+                    .fallback(runtime_volume_transitions::evidence),
+            )
+    };
 
     Router::new()
         .route("/", get(crate::ui::portal))
@@ -630,6 +646,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/billing/stripe/webhook", post(stripe_webhook))
         .route("/v1/admin/workspaces", get(admin_list_workspaces))
+        .merge(runtime_volume_authority)
         .merge(legacy_authority)
         .fallback(crate::ui::not_found)
         .with_state(state)
@@ -809,6 +826,8 @@ POST /v1/billing/stripe/webhook
 POST /v1/internal/runtime/agent-sessions
 POST /v1/internal/runtime/desired-reads
 POST /v1/internal/runtime/observations
+POST /v1/internal/runtime/volume-transition-evidence
+POST /v1/internal/runtime/volume-transitions
 POST /v1/internal/usage/checkpoints
 POST /v1/nodes/{id}/actions/cordon
 POST /v1/routes/wake

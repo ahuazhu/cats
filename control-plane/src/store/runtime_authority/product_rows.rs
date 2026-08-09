@@ -584,6 +584,56 @@ pub(super) fn load_disk_by_id_for_update(
         .transpose()
 }
 
+pub(super) fn update_disk(
+    transaction: &mut Transaction<'_>,
+    record: &DiskRecord,
+) -> AuthorityTxResult<()> {
+    let projection = DiskProjection::from_record(record)?;
+    let json = encode_json(record)?;
+    let size_bytes = projection.size_bytes.to_pg().map_err(corrupt)?;
+    let created_at = projection.created_at.to_pg().map_err(corrupt)?;
+    let expected_blank_generation = optional_to_pg(projection.expected_blank_generation)?;
+    let initialized_generation = optional_to_pg(projection.initialized_generation)?;
+    let initialized_at = optional_to_pg(projection.initialized_at)?;
+    let changed = transaction.execute(
+        "UPDATE disk_records SET
+            record=$2::TEXT::jsonb, workspace_id=$3, name=$4, volume_id=$5,
+            size_bytes=$6, durability=$7, created_at=$8, admin_state=$9,
+            delete_id=$10, role_kind=$11, root_cat_id=$12,
+            initialization_kind=$13, initialization_token=$14,
+            filesystem_uuid=$15, expected_blank_generation=$16,
+            expected_blank_root_hash=$17, expected_blank_root_object_id=$18,
+            initialized_generation=$19, initialized_root_hash=$20,
+            initialized_root_object_id=$21, initialized_at=$22
+          WHERE disk_id=$1",
+        &[
+            &projection.disk_id,
+            &json,
+            &projection.workspace_id,
+            &projection.name,
+            &projection.volume_id,
+            &size_bytes,
+            &projection.durability,
+            &created_at,
+            &projection.admin_state,
+            &projection.delete_id,
+            &projection.role_kind,
+            &projection.root_cat_id,
+            &projection.initialization_kind,
+            &projection.initialization_token,
+            &projection.filesystem_uuid,
+            &expected_blank_generation,
+            &projection.expected_blank_root_hash,
+            &projection.expected_blank_root_object_id,
+            &initialized_generation,
+            &projection.initialized_root_hash,
+            &projection.initialized_root_object_id,
+            &initialized_at,
+        ],
+    )?;
+    exactly_one(changed)
+}
+
 pub(super) fn load_disk_by_name_for_update(
     transaction: &mut Transaction<'_>,
     workspace_id: &Id,
