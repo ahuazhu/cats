@@ -127,6 +127,10 @@ async fn main() -> anyhow::Result<()> {
         listen: args.listen,
         control_plane_url: args.control_plane_url,
         agent_registration,
+        cloud_hypervisor_binary: args.ch_bin,
+        blockd_binary: args.blockd_bin,
+        guest_agent_binary: args.guest_agent_bin,
+        metering_cgroup_root: args.metering_cgroup_root,
     })
     .await?;
     eprintln!(

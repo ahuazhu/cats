@@ -1,10 +1,10 @@
 //! Production entry point for the signed Runtime spine cutover.
 //!
 //! The legacy [`crate::server`] remains available to the pre-cutover test
-//! suite, but the shipped Node binary starts here. Until all eleven physical
-//! inventory probes are composed, the scanner reports every source as
-//! unavailable and local readiness stays closed. In particular this path does
-//! not construct `NodeRuntime`, adopt a legacy ledger, or run a destructive
+//! suite, but the shipped Node binary starts here. The first production
+//! scanner can attest only a physically empty Host; any non-empty fact remains
+//! fail-closed for the later identity-aware scanner. This path does not
+//! construct `NodeRuntime`, adopt a legacy ledger, or run a destructive
 //! residue/device sweep.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +18,9 @@ use axum::routing::get;
 use axum::Router;
 
 use crate::agent_registration::AgentRegistrationConfig;
-use crate::runtime::reconciliation::unavailable_clean_slate_scanner;
+use crate::runtime::reconciliation::{
+    installed_clean_slate_scanner, InstalledCleanSlateProbeConfig,
+};
 use crate::runtime_spine::{
     RuntimeDesiredEffect, RuntimeDesiredEffectContext, RuntimeSpineHttpClient, RuntimeSpineRunStep,
     RuntimeSpineRunner,
@@ -28,9 +30,9 @@ const SCAN_DEADLINE: Duration = Duration::from_secs(5);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Fail-closed placeholder until the typed Runtime §7 planner/effect adapter
-/// is composed. The unavailable physical scanner must make this unreachable;
-/// retaining the error is defense in depth against accidentally bypassing the
-/// required accepted full-inventory gate.
+/// is composed. The clean-slate scanner can attest physical absence, but it
+/// cannot authorize a later assigned-spec mutation; retaining this error keeps
+/// that post-attestation seam non-mutating.
 struct UnavailableDesiredEffect;
 
 impl RuntimeDesiredEffect for UnavailableDesiredEffect {
@@ -47,6 +49,10 @@ pub struct SignedRuntimeCutoverConfig {
     pub listen: String,
     pub control_plane_url: String,
     pub agent_registration: AgentRegistrationConfig,
+    pub cloud_hypervisor_binary: std::path::PathBuf,
+    pub blockd_binary: std::path::PathBuf,
+    pub guest_agent_binary: std::path::PathBuf,
+    pub metering_cgroup_root: Option<std::path::PathBuf>,
 }
 
 pub struct SignedRuntimeCutoverHandle {
@@ -192,7 +198,14 @@ pub async fn spawn_signed_runtime_cutover(
         &config.control_plane_url,
         &config.agent_registration,
     )?;
-    let scanner = unavailable_clean_slate_scanner();
+    let scanner = installed_clean_slate_scanner(InstalledCleanSlateProbeConfig {
+        state_directory: config.agent_registration.runtime_state_directory(),
+        cloud_hypervisor_binary: config.cloud_hypervisor_binary,
+        blockd_binary: config.blockd_binary,
+        guest_agent_binary: config.guest_agent_binary,
+        metering_cgroup_root: config.metering_cgroup_root,
+    })
+    .context("compose installed clean-slate inventory probes")?;
     let runner = RuntimeSpineRunner::new_with_desired_effects(
         config.agent_registration.runtime_state_directory(),
         session,
@@ -250,39 +263,55 @@ async fn run_signed_spine(
         let step = runner
             .run_once_until(Instant::now() + SCAN_DEADLINE)
             .await?;
-        match step {
-            RuntimeSpineRunStep::DesiredAccepted => {
-                // A fresh Desired must be reconciled and attested before the
-                // process can advertise local readiness again.
-                readiness.set(false);
-            }
-            RuntimeSpineRunStep::ObservationAccepted => readiness.set(true),
-            RuntimeSpineRunStep::ObservationReplayed => readiness.set(false),
-            RuntimeSpineRunStep::EffectApplied { .. } | RuntimeSpineRunStep::EffectsApplied => {
-                readiness.set(false)
-            }
-            RuntimeSpineRunStep::DesiredInvalidated { .. } => readiness.set(false),
-            RuntimeSpineRunStep::RetryExact(_)
-            | RuntimeSpineRunStep::ScanUnavailable(_)
-            | RuntimeSpineRunStep::ScanIncomplete { .. }
-            | RuntimeSpineRunStep::ScanDeadlineExceeded
-            | RuntimeSpineRunStep::EffectUnavailable { .. }
-            | RuntimeSpineRunStep::EffectDeadlineExceeded { .. } => {
-                readiness.set(false);
-                tokio::time::sleep(RETRY_DELAY).await;
-            }
-            RuntimeSpineRunStep::SessionInvalid { status, error } => {
-                readiness.set(false);
-                anyhow::bail!("signed Runtime session was rejected with {status}: {error:?}");
-            }
-            RuntimeSpineRunStep::Rejected { status, error } => {
-                readiness.set(false);
-                anyhow::bail!("signed Runtime request was rejected with {status}: {error:?}");
-            }
-            RuntimeSpineRunStep::RouteUnavailable => {
-                readiness.set(false);
-                anyhow::bail!("signed Runtime routes are not deployed");
-            }
+        if apply_readiness_policy(step, readiness)? {
+            tokio::time::sleep(RETRY_DELAY).await;
+        }
+    }
+}
+
+/// Returns true when the caller should apply the bounded retry delay.
+fn apply_readiness_policy(
+    step: RuntimeSpineRunStep,
+    readiness: &Readiness,
+) -> anyhow::Result<bool> {
+    match step {
+        RuntimeSpineRunStep::DesiredAccepted => {
+            // A fresh Desired must be reconciled and attested before the
+            // process can advertise local readiness again.
+            readiness.set(false);
+            Ok(false)
+        }
+        RuntimeSpineRunStep::ObservationAccepted => {
+            readiness.set(true);
+            Ok(false)
+        }
+        RuntimeSpineRunStep::ObservationReplayed
+        | RuntimeSpineRunStep::EffectApplied { .. }
+        | RuntimeSpineRunStep::EffectsApplied
+        | RuntimeSpineRunStep::DesiredInvalidated { .. } => {
+            readiness.set(false);
+            Ok(false)
+        }
+        RuntimeSpineRunStep::RetryExact(_)
+        | RuntimeSpineRunStep::ScanUnavailable(_)
+        | RuntimeSpineRunStep::ScanIncomplete { .. }
+        | RuntimeSpineRunStep::ScanDeadlineExceeded
+        | RuntimeSpineRunStep::EffectUnavailable { .. }
+        | RuntimeSpineRunStep::EffectDeadlineExceeded { .. } => {
+            readiness.set(false);
+            Ok(true)
+        }
+        RuntimeSpineRunStep::SessionInvalid { status, error } => {
+            readiness.set(false);
+            anyhow::bail!("signed Runtime session was rejected with {status}: {error:?}");
+        }
+        RuntimeSpineRunStep::Rejected { status, error } => {
+            readiness.set(false);
+            anyhow::bail!("signed Runtime request was rejected with {status}: {error:?}");
+        }
+        RuntimeSpineRunStep::RouteUnavailable => {
+            readiness.set(false);
+            anyhow::bail!("signed Runtime routes are not deployed");
         }
     }
 }
@@ -311,12 +340,42 @@ mod tests {
                 .await
                 .unwrap();
         });
-        for path in ["/v1/jobs", "/v1/nodes/heartbeat", "/v1/nodes/register"] {
+        for path in [
+            "/v1/jobs",
+            "/v1/nodes/heartbeat",
+            "/v1/nodes/register",
+            "/v1/nodes/work-status",
+            "/v1/internal/work/acquire",
+            "/v1/internal/work/release",
+        ] {
             let response = reqwest::get(format!("http://{address}{path}"))
                 .await
                 .unwrap();
             assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
         }
         server.abort();
+    }
+
+    #[test]
+    fn unavailable_or_residue_scan_can_never_open_readiness() {
+        let readiness = Readiness::closed();
+        assert!(apply_readiness_policy(
+            RuntimeSpineRunStep::ScanIncomplete {
+                unavailable_sources: vec![
+                    cats_api::runtime_reconciliation::InventorySource::MetadataStore,
+                ],
+            },
+            &readiness,
+        )
+        .unwrap());
+        assert!(!readiness.is_ready());
+
+        readiness.set(true);
+        assert!(apply_readiness_policy(
+            RuntimeSpineRunStep::ScanUnavailable(anyhow::anyhow!("physical residue")),
+            &readiness,
+        )
+        .unwrap());
+        assert!(!readiness.is_ready());
     }
 }
