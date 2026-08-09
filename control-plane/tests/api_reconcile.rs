@@ -333,31 +333,22 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
         axum::serve(listener, app).await.ok();
     });
 
-    let client = reqwest::Client::new();
     let base = cp.base_url();
-    client
-        .post(format!("{base}/v1/nodes/register"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&RegisterNodeRequest {
-            node_id: id.to_string(),
-            agent_url: format!("http://{addr}"),
-            gateway_url: format!("http://{addr}"),
-            cpus: 16,
-            memory_mib: 32_768,
-            route_grant_public_key_sha256: Some(
-                cp.state
-                    .cfg
-                    .route_grant_signer
-                    .public_key_sha256()
-                    .to_string(),
-            ),
-            initially_cordoned: false,
-        })
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
+    cats_control_plane::testsupport::register_legacy_test_node(
+        &cp.state.store,
+        id.to_string(),
+        format!("http://{addr}"),
+        format!("http://{addr}"),
+        16,
+        32_768,
+        cp.state
+            .cfg
+            .route_grant_signer
+            .public_key_sha256()
+            .to_string(),
+    )
+    .await;
+    let client = reqwest::Client::new();
 
     // Heartbeat loop.
     let hb = node.clone();
@@ -490,6 +481,8 @@ impl Ctx {
             storage_meta,
             image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
             auth_token: SERVICE_TOKEN.into(),
+            guest_runtime_profile_receipt:
+                cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
             route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
             admin_token: "dev-admin-token".into(),
             workos: None,
@@ -977,6 +970,8 @@ async fn two_api_replicas_linearize_create_start_and_delete() {
         storage_meta,
         image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
         auth_token: SERVICE_TOKEN.into(),
+        guest_runtime_profile_receipt:
+            cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
         route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "dev-admin-token".into(),
         workos: None,
@@ -1128,6 +1123,8 @@ async fn reconciler_handoff_replays_persisted_suspending_with_the_same_job() {
         storage_meta,
         image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
         auth_token: SERVICE_TOKEN.into(),
+        guest_runtime_profile_receipt:
+            cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
         route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "dev-admin-token".into(),
         workos: None,
@@ -2136,17 +2133,14 @@ async fn node_loss_preserves_claim_until_fencing_is_explicitly_confirmed() {
     // explicitly fence the Host; silently making it Ready would strand these
     // Unknown Cats outside both recovery paths.
     let registered = ctx.cp.state.store.get_node("node_a").unwrap();
-    ctx.post_service(
-        ctx.url("/v1/nodes/register"),
-        &RegisterNodeRequest {
-            node_id: registered.id.clone(),
-            agent_url: registered.agent_url.clone(),
-            gateway_url: registered.gateway_url.clone(),
-            cpus: registered.capacity.cpus,
-            memory_mib: registered.capacity.memory_mib,
-            route_grant_public_key_sha256: registered.route_grant_public_key_sha256.clone(),
-            initially_cordoned: false,
-        },
+    cats_control_plane::testsupport::register_legacy_test_node(
+        &ctx.cp.state.store,
+        registered.id.clone(),
+        registered.agent_url.clone(),
+        registered.gateway_url.clone(),
+        registered.capacity.cpus,
+        registered.capacity.memory_mib,
+        registered.route_grant_public_key_sha256.clone().unwrap(),
     )
     .await;
     ctx.post_service(
@@ -2368,6 +2362,8 @@ async fn control_plane_startup_grace_preserves_a_reconnecting_host_bound_cat() {
         storage_meta,
         image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
         auth_token: SERVICE_TOKEN.into(),
+        guest_runtime_profile_receipt:
+            cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
         route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "dev-admin-token".into(),
         workos: None,
@@ -2696,6 +2692,8 @@ async fn static_user_tokens_are_not_accepted() {
         storage_meta,
         image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
         auth_token: SERVICE_TOKEN.into(),
+        guest_runtime_profile_receipt:
+            cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
         route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "token-admin".into(),
         workos: None,
@@ -3100,140 +3098,35 @@ async fn exhausted_prepaid_balance_blocks_new_or_waking_compute() {
 }
 
 #[tokio::test]
-async fn route_grant_verifier_admission_is_rollout_compatible_and_fails_closed() {
+async fn legacy_node_registration_route_is_absent_while_test_fixture_admission_remains_explicit() {
     let ctx = Ctx::new().await;
-    let register = |fingerprint: String| RegisterNodeRequest {
-        node_id: "node-key-mismatch".into(),
-        agent_url: "http://127.0.0.1:7301".into(),
-        gateway_url: "http://127.0.0.1:7301".into(),
-        cpus: 4,
-        memory_mib: 4096,
-        route_grant_public_key_sha256: Some(fingerprint),
-        initially_cordoned: false,
-    };
-
-    let legacy = RegisterNodeRequest {
-        node_id: "node-legacy-new".into(),
-        agent_url: "http://127.0.0.1:7302".into(),
-        gateway_url: "http://127.0.0.1:7302".into(),
-        cpus: 4,
-        memory_mib: 4096,
-        route_grant_public_key_sha256: None,
-        initially_cordoned: false,
-    };
-    ctx.cp
-        .state
-        .store
-        .register_node(
-            "node-legacy-existing",
-            "http://127.0.0.1:7303",
-            "http://127.0.0.1:7303",
-            4,
-            4096,
-            false,
-        )
-        .unwrap();
-    let existing_legacy = RegisterNodeRequest {
-        node_id: "node-legacy-existing".into(),
-        agent_url: "http://127.0.0.1:7303".into(),
-        gateway_url: "http://127.0.0.1:7303".into(),
-        ..legacy.clone()
-    };
     let response = ctx
         .http
         .post(ctx.url("/v1/nodes/register"))
         .bearer_auth(SERVICE_TOKEN)
-        .json(&existing_legacy)
+        .json(&serde_json::json!({"node_id": "legacy"}))
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    let summary: NodeSummary = ctx
-        .get_json(ctx.url("/v1/admin/nodes/node-legacy-existing"))
-        .await;
-    assert_eq!(summary.node.state, NodeState::Ready);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-    let response = ctx
-        .http
-        .post(ctx.url("/v1/nodes/register"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&legacy)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    let summary: NodeSummary = ctx
-        .get_json(ctx.url("/v1/admin/nodes/node-legacy-new"))
-        .await;
-    assert_eq!(summary.node.state, NodeState::Cordoned);
-    let refused = ctx
-        .http
-        .post(ctx.url("/v1/admin/nodes/node-legacy-new/actions/uncordon"))
-        .bearer_auth("dev-admin-token")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(refused.status(), StatusCode::PRECONDITION_FAILED);
-
-    let mismatch = "0".repeat(64);
-    let response = ctx
-        .http
-        .post(ctx.url("/v1/nodes/register"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&register(mismatch.clone()))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-    let summary: NodeSummary = ctx
-        .get_json(ctx.url("/v1/admin/nodes/node-key-mismatch"))
-        .await;
-    assert_eq!(summary.node.state, NodeState::Cordoned);
-    assert_eq!(
-        summary.node.route_grant_public_key_sha256.as_deref(),
-        Some(mismatch.as_str())
-    );
-
-    let refused = ctx
-        .http
-        .post(ctx.url("/v1/admin/nodes/node-key-mismatch/actions/uncordon"))
-        .bearer_auth("dev-admin-token")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(refused.status(), StatusCode::PRECONDITION_FAILED);
-    let body: cats_api::error::ErrorBody = refused.json().await.unwrap();
-    assert_eq!(body.code, cats_api::error::ErrorCode::FailedPrecondition);
-
-    let expected = ctx
-        .cp
-        .state
-        .cfg
-        .route_grant_signer
-        .public_key_sha256()
-        .to_string();
-    let response = ctx
-        .http
-        .post(ctx.url("/v1/nodes/register"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&register(expected))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    let admitted = ctx
-        .http
-        .post(ctx.url("/v1/admin/nodes/node-key-mismatch/actions/uncordon"))
-        .bearer_auth("dev-admin-token")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(admitted.status(), StatusCode::OK);
-    assert_eq!(
-        admitted.json::<NodeSummary>().await.unwrap().node.state,
-        NodeState::Ready
-    );
+    cats_control_plane::testsupport::register_legacy_test_node(
+        &ctx.cp.state.store,
+        "fixture-node".into(),
+        "http://127.0.0.1:7301".into(),
+        "http://127.0.0.1:7301".into(),
+        4,
+        4096,
+        ctx.cp
+            .state
+            .cfg
+            .route_grant_signer
+            .public_key_sha256()
+            .to_string(),
+    )
+    .await;
+    let admitted: NodeSummary = ctx.get_json(ctx.url("/v1/admin/nodes/fixture-node")).await;
+    assert_eq!(admitted.node.state, NodeState::Ready);
 }
 
 #[tokio::test]
@@ -3405,30 +3298,21 @@ async fn admin_can_monitor_and_drain_nodes() {
         cordon.json::<NodeSummary>().await.unwrap().node.state,
         NodeState::Lost
     );
-    let register = ctx
-        .http
-        .post(ctx.url("/v1/nodes/register"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&RegisterNodeRequest {
-            node_id: "node_a".into(),
-            agent_url: "http://127.0.0.1:1".into(),
-            gateway_url: "http://gateway.invalid".into(),
-            cpus: 8,
-            memory_mib: 16_384,
-            route_grant_public_key_sha256: Some(
-                ctx.cp
-                    .state
-                    .cfg
-                    .route_grant_signer
-                    .public_key_sha256()
-                    .to_string(),
-            ),
-            initially_cordoned: false,
-        })
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(register.status(), StatusCode::NO_CONTENT);
+    cats_control_plane::testsupport::register_legacy_test_node(
+        &ctx.cp.state.store,
+        "node_a".into(),
+        "http://127.0.0.1:1".into(),
+        "http://gateway.invalid".into(),
+        8,
+        16_384,
+        ctx.cp
+            .state
+            .cfg
+            .route_grant_signer
+            .public_key_sha256()
+            .to_string(),
+    )
+    .await;
     let heartbeat = ctx
         .http
         .post(ctx.url("/v1/nodes/heartbeat"))

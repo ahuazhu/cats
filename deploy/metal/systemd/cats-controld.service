@@ -10,6 +10,7 @@ ExecStart=/opt/cats/bin/cats-controld \
   --listen ${CATS_CONTROLD_LISTEN} \
   --route-grant-private-key-file /etc/cats/route-grant-private.pem \
   --route-grant-public-key-file /etc/cats/route-grant-public.pem \
+  --guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json \
   --db-path /var/lib/cats/control.db \
   $CATS_METADATA_STORE_ARGS
 Restart=always

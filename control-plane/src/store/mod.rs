@@ -27,6 +27,10 @@ mod schema;
 mod transaction;
 mod work;
 
+pub(crate) use agent_sessions::{
+    AgentRegistrationOutcome, AgentRegistrationRejection, AgentSessionRegistrationPolicy,
+};
+
 #[cfg(test)]
 mod tests;
 
@@ -91,15 +95,27 @@ impl<'a> NodeAdmission<'a> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn for_route_grant(
         initially_cordoned: bool,
-        actual: Option<&'a str>,
-        expected: &'a str,
+        route_grant_public_key_sha256: Option<&'a str>,
+        expected_route_grant_public_key_sha256: &'a str,
     ) -> Self {
         Self {
             initially_cordoned,
-            route_grant_public_key_sha256: actual,
-            expected_route_grant_public_key_sha256: Some(expected),
+            route_grant_public_key_sha256,
+            expected_route_grant_public_key_sha256: Some(expected_route_grant_public_key_sha256),
+        }
+    }
+
+    pub(crate) fn for_route_grant_for_test(
+        initially_cordoned: bool,
+        route_grant_public_key_sha256: &'a str,
+    ) -> Self {
+        Self {
+            initially_cordoned,
+            route_grant_public_key_sha256: Some(route_grant_public_key_sha256),
+            expected_route_grant_public_key_sha256: Some(route_grant_public_key_sha256),
         }
     }
 }

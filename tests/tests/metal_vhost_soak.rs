@@ -392,6 +392,7 @@ impl Soak {
                 ch_bin: cfg.ch_bin.clone(),
                 kernel: cfg.kernel.clone(),
                 initramfs: Some(cfg.initramfs.clone()),
+                boot_contract: None,
                 cmdline: "console=ttyS0 root=/dev/vda rw clocksource=kvm-clock".into(),
                 seed_image: Some(cfg.seed_image.clone()),
                 block_path: cfg.block_path,

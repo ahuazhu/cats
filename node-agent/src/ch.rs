@@ -26,6 +26,7 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -79,6 +80,11 @@ pub struct ChConfig {
     pub ch_bin: PathBuf,
     pub kernel: PathBuf,
     pub initramfs: Option<PathBuf>,
+    /// Production carries the release manifest projection and reopens/hashes
+    /// the exact boot bytes for every fresh launch. `None` exists only for
+    /// test and historical experiment constructors that do not use the
+    /// production installed release paths.
+    pub boot_contract: Option<cats_api::runtime_artifacts::GuestRuntimeBootContract>,
     /// Kernel command line; `root=/dev/vda` etc.
     pub cmdline: String,
     /// Golden root: the raw image a generation-0 root volume is provisioned from.
@@ -786,15 +792,45 @@ pub fn spawn_vmm(s: &ChSpawn<'_>) -> Result<Child> {
     let _ = std::fs::remove_file(s.vsock_sock);
     let mut cmd = Command::new(&s.cfg.ch_bin);
     cmd.arg("--api-socket").arg(s.api_sock);
+    let verified_boot = if s.restore_from.is_none() {
+        s.cfg
+            .boot_contract
+            .as_ref()
+            .map(|contract| {
+                cats_api::runtime_artifacts::open_verified_guest_runtime_launch(
+                    contract,
+                    &s.cfg.kernel,
+                    s.cfg.initramfs.as_deref(),
+                )
+                .context("revalidate installed Guest boot bytes for VMM launch")
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    if let Some(verified) = &verified_boot {
+        make_inheritable(verified.kernel())?;
+        if let Some(initramfs) = verified.initramfs() {
+            make_inheritable(initramfs)?;
+        }
+    }
     match s.restore_from {
         Some(dir) => {
             cmd.arg("--restore")
                 .arg(format!("source_url=file://{}", dir.display()));
         }
         None => {
-            cmd.arg("--kernel").arg(&s.cfg.kernel);
-            if let Some(initrd) = &s.cfg.initramfs {
-                cmd.arg("--initramfs").arg(initrd);
+            if let Some(verified) = &verified_boot {
+                cmd.arg("--kernel")
+                    .arg(inherited_fd_path(verified.kernel()));
+                if let Some(initramfs) = verified.initramfs() {
+                    cmd.arg("--initramfs").arg(inherited_fd_path(initramfs));
+                }
+            } else {
+                cmd.arg("--kernel").arg(&s.cfg.kernel);
+                if let Some(initrd) = &s.cfg.initramfs {
+                    cmd.arg("--initramfs").arg(initrd);
+                }
             }
             cmd.arg("--cmdline").arg(&s.cfg.cmdline);
             cmd.arg("--cpus").arg(format!("boot={}", s.cpus.max(1)));
@@ -831,6 +867,23 @@ pub fn spawn_vmm(s: &ChSpawn<'_>) -> Result<Child> {
         std::fs::File::create(s.serial_log.with_file_name("vmm.log")).context("create vmm log")?;
     cmd.stdout(Stdio::null()).stderr(log);
     cmd.spawn().context("spawn cloud-hypervisor")
+}
+
+fn inherited_fd_path(file: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+fn make_inheritable(file: &File) -> Result<()> {
+    // SAFETY: `file` owns a live descriptor. F_GETFD/F_SETFD operate only on
+    // that descriptor and do not access Rust memory. Clearing CLOEXEC is
+    // deliberate: Cloud Hypervisor opens `/proc/self/fd/<n>` after exec.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+    anyhow::ensure!(flags >= 0, "read Guest boot descriptor flags");
+    // SAFETY: the same live descriptor invariant applies to this F_SETFD
+    // operation; no pointer or Rust memory is passed to libc.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+    anyhow::ensure!(result == 0, "make Guest boot descriptor inheritable");
+    Ok(())
 }
 
 /// Create a zero-filled sparse RAM backing. Sparse allocation avoids charging
@@ -1141,6 +1194,7 @@ mod tests {
             ch_bin: PathBuf::from("ch"),
             kernel: PathBuf::from("vmlinuz"),
             initramfs: None,
+            boot_contract: None,
             cmdline: String::new(),
             seed_image: None,
             block_path: BlockPath::KernelNbd,
@@ -1312,6 +1366,7 @@ mod tests {
             ch_bin: PathBuf::from("ch"),
             kernel: PathBuf::from("vmlinuz"),
             initramfs: None,
+            boot_contract: None,
             cmdline: String::new(),
             seed_image: None,
             block_path: BlockPath::VhostUser,
@@ -1421,6 +1476,7 @@ mod tests {
             ch_bin: fake_ch,
             kernel,
             initramfs: None,
+            boot_contract: None,
             cmdline: "console=ttyS0".into(),
             seed_image: None,
             block_path: BlockPath::KernelNbd,

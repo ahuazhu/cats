@@ -98,18 +98,18 @@ host-wide binary used by another workload. The S3 adapter uses the EC2
 instance role and refreshes its temporary credentials; no long-lived AWS key is
 stored in `worker.env`.
 
-This current Host-derived boot shape and `CATS_NODE_ID` worker environment are not eligible for the frozen target
+The release pipeline implements the frozen target
 [Agent Registration and Internal Transport v1](../../docs/specs/agent-registration-transport-v1.md) plus
 [Runtime Composition Artifacts v1](../../docs/specs/runtime-composition-artifacts-v1.md).
-Before the runtime-reconciliation cutover, one release build must put the same exact
+One release build puts the same exact
 `guest-runtime-profile.v1.json` bytes in the Control artifact and worker bundle, install them at
 `/opt/cats/release/guest-runtime-profile.v1.json`, and ship the pinned Guest kernel and optional initramfs named by
 that receipt. Target worker systemd `ExecStart` and Control Kubernetes container args both pass
 `--guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json`; missing or mismatched
-receipt/boot files fail closed. Rebuilding from the Host kernel is not a target fallback.
+receipt/boot files fail closed. Rebuilding from the Host kernel is not a fallback.
 
 The same cutover provisioner installs the canonical root-only local identity at
-`/etc/cats/identity/node-identity.v1.json`, with its matching per-Node key and credential ID. Target `cats-noded`
+`/etc/cats/identity/node-identity.v1.json`, with its matching per-Node key and credential ID. `cats-noded`
 derives `node_id`, immutable Host identity and `/var/lib/cats/node/<state_path_id>` only from that artifact; the
 worker name, advertise address and IMDS are not registration identity. The shared Guest payload has the exact
 closed layout and manifest defined by the composition contract; Control and worker artifacts must report one

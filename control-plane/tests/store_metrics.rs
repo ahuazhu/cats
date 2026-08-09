@@ -43,6 +43,8 @@ impl MetricsContext {
             storage_meta,
             image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
             auth_token: SERVICE_TOKEN.to_string(),
+            guest_runtime_profile_receipt:
+                cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
             route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
             admin_token: ADMIN_TOKEN.to_string(),
             workos: None,

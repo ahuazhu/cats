@@ -3,6 +3,7 @@
 //! `runtime.rs` for the FakeVmm / Cloud Hypervisor seam.
 
 pub mod admission;
+pub mod agent_registration;
 pub mod ch;
 pub mod guest_client;
 pub(crate) mod proc;

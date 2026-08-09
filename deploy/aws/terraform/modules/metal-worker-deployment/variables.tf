@@ -227,9 +227,8 @@ variable "worker_base_environment" {
     worker.env yet -- control plane and gateway URLs, region, ChunkStore
     bucket, guest network CIDR. An existing file is never rewritten, so
     operator edits survive. Secrets belong in worker_runtime_secret_data;
-    CATS_METERING_CGROUP_ROOT is discovered on the host; node identity
-    (CATS_NODE_ID, CATS_NODE_ADVERTISE_URL) is derived per worker at seed time
-    and must not be set here.
+    CATS_METERING_CGROUP_ROOT is discovered on the host; Node identity is a
+    provisioner-owned artifact and must not be set here.
   EOT
   type        = map(string)
   default     = {}
@@ -254,6 +253,6 @@ variable "worker_base_environment" {
       toset(keys(var.worker_base_environment)),
       toset(["CATS_NODE_ID", "CATS_NODE_ADVERTISE_URL"]),
     )) == 0
-    error_message = "Node identity is per worker: CATS_NODE_ID comes from the instances key and CATS_NODE_ADVERTISE_URL from the host's IMDS at seed time."
+    error_message = "Node identity is provisioner-owned artifact data; environment and IMDS values are forbidden."
   }
 }

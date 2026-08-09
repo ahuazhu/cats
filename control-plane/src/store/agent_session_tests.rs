@@ -9,9 +9,10 @@ use cats_api::runtime_reconciliation::{
     NodeBootId, NodeIdentity, NodeIdentityState, RandomId128, Sha256Digest, UnixMillis,
 };
 
+use cats_api::agent_registration::{AuthenticatedNodeCredential, AGENT_SESSION_LEASE_MS};
+
 use super::agent_sessions::{
     AgentRegistrationOutcome, AgentRegistrationRejection, AgentSessionRegistrationPolicy,
-    AuthenticatedNodeCredential,
 };
 use super::Store;
 
@@ -41,19 +42,15 @@ fn release_receipt() -> GuestRuntimeProfileReceipt {
     }
 }
 
-fn policy(duration_ms: u64) -> AgentSessionRegistrationPolicy {
-    AgentSessionRegistrationPolicy::from_release_receipt(
-        &release_receipt(),
-        Duration::from_millis(duration_ms),
-    )
-    .unwrap()
+fn policy() -> AgentSessionRegistrationPolicy {
+    AgentSessionRegistrationPolicy::from_release_receipt(&release_receipt()).unwrap()
 }
 
 fn approved_digest() -> Sha256Digest {
     guest_config_digest(&release_receipt()).unwrap()
 }
 
-fn credential_binding(principal: &str) -> CredentialBinding {
+fn provider_credential_binding(principal: &str) -> CredentialBinding {
     CredentialBinding::ProviderPrincipal {
         provider: id("test_provider"),
         principal: AsciiText::new(principal).unwrap(),
@@ -142,6 +139,39 @@ fn current_session(store: &Store, node_id: &Id) -> AgentSession {
     decode_agent_session(json.as_bytes()).unwrap()
 }
 
+fn overwrite_current_session(store: &Store, session: &AgentSession) {
+    let record = String::from_utf8(encode_agent_session(session).unwrap()).unwrap();
+    store
+        .with(|client| {
+            client
+                .execute(
+                    "UPDATE current_agent_sessions SET
+                        record=$2::TEXT::jsonb,
+                        immutable_host_id=$3,
+                        node_boot_id=$4,
+                        agent_instance_id=$5,
+                        agent_session_epoch=$6,
+                        registration_attempt_id=$7,
+                        guest_config_digest=$8,
+                        lease_deadline_unix_ms=$9
+                      WHERE node_id=$1",
+                    &[
+                        &session.node_id.as_str(),
+                        &record,
+                        &session.immutable_host_id.as_str(),
+                        &session.node_boot_id.as_str(),
+                        &session.agent_instance_id.as_str(),
+                        &(session.agent_session_epoch.get() as i64),
+                        &session.registration_attempt_id.as_str(),
+                        &session.guest_config_digest.as_str(),
+                        &(session.lease_deadline_unix_ms.get() as i64),
+                    ],
+                )
+                .map(|changed| assert_eq!(changed, 1))
+        })
+        .unwrap();
+}
+
 fn database_now_ms(store: &Store) -> u64 {
     store
         .with(|client| {
@@ -165,35 +195,13 @@ fn assert_identity_rejected(outcome: AgentRegistrationOutcome) {
 }
 
 #[test]
-fn registration_policy_requires_a_positive_bigint_millisecond_duration() {
-    for duration in [Duration::ZERO, Duration::from_nanos(1)] {
-        let error =
-            AgentSessionRegistrationPolicy::from_release_receipt(&release_receipt(), duration)
-                .unwrap_err();
-        assert_eq!(error.code, ErrorCode::FailedPrecondition);
-    }
-
-    let above_bigint = Duration::from_millis(i64::MAX.unsigned_abs() + 1);
-    let error =
-        AgentSessionRegistrationPolicy::from_release_receipt(&release_receipt(), above_bigint)
-            .unwrap_err();
-    assert_eq!(error.code, ErrorCode::FailedPrecondition);
-
-    AgentSessionRegistrationPolicy::from_release_receipt(
-        &release_receipt(),
-        Duration::from_millis(1),
-    )
-    .unwrap();
-}
-
-#[test]
 fn first_registration_replay_and_replacement_keep_one_current_session() {
     let url = crate::testsupport::isolated_control_store_url();
     let store = Store::connect(&url, None).unwrap();
     let identity = identity(1);
     store.provision_node_identity(&identity).unwrap();
     let authenticated = authenticated(&identity);
-    let policy = policy(60_000);
+    let policy = policy();
 
     store
         .with(|client| {
@@ -220,9 +228,9 @@ fn first_registration_replay_and_replacement_keep_one_current_session() {
     let after_registration = database_now_ms(&store);
     assert_eq!(first.agent_session_epoch.get(), 1);
     assert!(
-        first.lease_deadline_unix_ms.get() >= before_registration + 60_000
-            && first.lease_deadline_unix_ms.get() <= after_registration + 60_000,
-        "lease deadline must be derived from PostgreSQL time and the configured duration"
+        first.lease_deadline_unix_ms.get() >= before_registration + AGENT_SESSION_LEASE_MS
+            && first.lease_deadline_unix_ms.get() <= after_registration + AGENT_SESSION_LEASE_MS,
+        "lease deadline must be derived from PostgreSQL time and the fixed V1 duration"
     );
     let replay = registered(
         store
@@ -248,11 +256,8 @@ fn first_registration_replay_and_replacement_keep_one_current_session() {
         .unwrap_err();
     let mut next_release = release_receipt();
     next_release.kernel_digest = digest('3');
-    let next_release_policy = AgentSessionRegistrationPolicy::from_release_receipt(
-        &next_release,
-        Duration::from_millis(60_000),
-    )
-    .unwrap();
+    let next_release_policy =
+        AgentSessionRegistrationPolicy::from_release_receipt(&next_release).unwrap();
     let replay_after_release_change = registered(
         store
             .register_agent_session(&authenticated, &first_attempt, &next_release_policy)
@@ -262,6 +267,11 @@ fn first_registration_replay_and_replacement_keep_one_current_session() {
         replay_after_release_change, first,
         "an exact committed attempt replays before active-release validation"
     );
+
+    let mut renewed_current = first.clone();
+    renewed_current.lease_deadline_unix_ms =
+        UnixMillis::new(first.lease_deadline_unix_ms.get() + 1_000).unwrap();
+    overwrite_current_session(&store, &renewed_current);
 
     let replacement_attempt = attempt(&identity, 1, 12, 112, Some(1));
     let replacement = registered(
@@ -293,6 +303,46 @@ fn first_registration_replay_and_replacement_keep_one_current_session() {
         })
         .unwrap();
     assert_eq!(sentinel, ("ready".to_owned(), 77, "sentinel".to_owned()));
+}
+
+#[test]
+fn a_current_deadline_may_advance_but_must_not_regress_below_the_attempt_result() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let store = Store::connect(&url, None).unwrap();
+    let identity = identity(1);
+    store.provision_node_identity(&identity).unwrap();
+    let authenticated = authenticated(&identity);
+    let original_attempt = attempt(&identity, 1, 11, 111, None);
+    let initial = registered(
+        store
+            .register_agent_session(&authenticated, &original_attempt, &policy())
+            .unwrap(),
+    );
+
+    let mut regressed = initial.clone();
+    regressed.lease_deadline_unix_ms =
+        UnixMillis::new(initial.lease_deadline_unix_ms.get() - 1).unwrap();
+    overwrite_current_session(&store, &regressed);
+
+    let error = store
+        .register_agent_session(
+            &authenticated,
+            &attempt(&identity, 1, 12, 112, Some(1)),
+            &policy(),
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert_eq!(counts(&store, &identity.node_id), (1, 1));
+    assert_eq!(current_session(&store, &identity.node_id), regressed);
+    assert_eq!(
+        registered(
+            store
+                .register_agent_session(&authenticated, &original_attempt, &policy())
+                .unwrap()
+        ),
+        initial,
+        "exact attempt replay remains the immutable result and does not read or repair current"
+    );
 }
 
 #[test]
@@ -342,7 +392,7 @@ fn node_lineage_is_idempotent_then_permanently_retired_and_non_reusable() {
     let original_attempt = attempt(&original, 1, 11, 111, None);
     let original_session = registered(
         store
-            .register_agent_session(&original_authenticated, &original_attempt, &policy(60_000))
+            .register_agent_session(&original_authenticated, &original_attempt, &policy())
             .unwrap(),
     );
 
@@ -351,11 +401,7 @@ fn node_lineage_is_idempotent_then_permanently_retired_and_non_reusable() {
     assert_eq!(
         registered(
             store
-                .register_agent_session(
-                    &original_authenticated,
-                    &original_attempt,
-                    &policy(60_000),
-                )
+                .register_agent_session(&original_authenticated, &original_attempt, &policy(),)
                 .unwrap(),
         ),
         original_session,
@@ -366,7 +412,7 @@ fn node_lineage_is_idempotent_then_permanently_retired_and_non_reusable() {
             .register_agent_session(
                 &original_authenticated,
                 &attempt(&original, 1, 12, 112, Some(1)),
-                &policy(60_000),
+                &policy(),
             )
             .unwrap(),
     );
@@ -387,7 +433,7 @@ fn node_lineage_is_idempotent_then_permanently_retired_and_non_reusable() {
             .register_agent_session(
                 &authenticated(&replacement),
                 &attempt(&replacement, 5, 51, 551, None),
-                &policy(60_000),
+                &policy(),
             )
             .unwrap(),
     );
@@ -405,18 +451,32 @@ fn node_lineage_is_idempotent_then_permanently_retired_and_non_reusable() {
 }
 
 #[test]
-fn public_key_credentials_round_trip_and_the_projection_is_strictly_one_of() {
+fn provision_rejects_navigation_state_path_components_without_writes() {
     let url = crate::testsupport::isolated_control_store_url();
     let store = Store::connect(&url, None).unwrap();
-    let identity = public_key_identity(1);
-    store.provision_node_identity(&identity).unwrap();
+
+    for component in [".", ".."] {
+        let mut invalid = identity(if component == "." { 91 } else { 92 });
+        invalid.state_path_id = id(component);
+        let error = store.provision_node_identity(&invalid).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert_eq!(counts(&store, &invalid.node_id), (0, 0));
+    }
+}
+
+#[test]
+fn public_key_credentials_round_trip_and_provider_credentials_are_ineligible() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let store = Store::connect(&url, None).unwrap();
+    let public_identity = identity(1);
+    store.provision_node_identity(&public_identity).unwrap();
 
     registered(
         store
             .register_agent_session(
-                &authenticated(&identity),
-                &attempt(&identity, 1, 11, 111, None),
-                &policy(60_000),
+                &authenticated(&public_identity),
+                &attempt(&public_identity, 1, 11, 111, None),
+                &policy(),
             )
             .unwrap(),
     );
@@ -429,12 +489,26 @@ fn public_key_credentials_round_trip_and_the_projection_is_strictly_one_of() {
                         SET credential_provider='forbidden_second_variant',
                             credential_principal='forbidden-principal'
                       WHERE node_id=$1",
-                    &[&identity.node_id.as_str()],
+                    &[&public_identity.node_id.as_str()],
                 )
                 .map(|_| ())
         })
         .unwrap_err();
-    assert_eq!(counts(&store, &identity.node_id), (1, 1));
+    assert_eq!(counts(&store, &public_identity.node_id), (1, 1));
+
+    let mut provider_identity = identity(2);
+    provider_identity.credential_binding = provider_credential_binding("provider-principal");
+    store.provision_node_identity(&provider_identity).unwrap();
+    assert_identity_rejected(
+        store
+            .register_agent_session(
+                &authenticated(&provider_identity),
+                &attempt(&provider_identity, 2, 21, 221, None),
+                &policy(),
+            )
+            .unwrap(),
+    );
+    assert_eq!(counts(&store, &provider_identity.node_id), (0, 0));
 }
 
 #[test]
@@ -444,7 +518,7 @@ fn every_changed_attempt_binding_conflicts_before_active_release_validation() {
     let identity = identity(1);
     store.provision_node_identity(&identity).unwrap();
     let authenticated = authenticated(&identity);
-    let policy = policy(60_000);
+    let policy = policy();
     let original = attempt(&identity, 1, 11, 111, None);
     registered(
         store
@@ -516,7 +590,7 @@ fn identity_digest_retirement_and_epoch_rejections_have_zero_side_effects() {
     let identity = identity(1);
     store.provision_node_identity(&identity).unwrap();
     let authenticated = authenticated(&identity);
-    let policy = policy(60_000);
+    let policy = policy();
 
     let wrong_credential = AuthenticatedNodeCredential::new(
         id("missing_credential"),
@@ -533,7 +607,9 @@ fn identity_digest_retirement_and_epoch_rejections_have_zero_side_effects() {
     );
     let wrong_binding = AuthenticatedNodeCredential::new(
         identity.credential_id.clone(),
-        credential_binding("another-principal"),
+        CredentialBinding::PublicKey {
+            public_key_spki_sha256: digest('8'),
+        },
     );
     assert_identity_rejected(
         store
@@ -635,25 +711,14 @@ fn identity_digest_retirement_and_epoch_rejections_have_zero_side_effects() {
 }
 
 #[test]
-fn epoch_and_db_deadline_overflow_fail_closed() {
+fn epoch_overflow_fails_closed() {
     let url = crate::testsupport::isolated_control_store_url();
     let store = Store::connect(&url, None).unwrap();
     let identity = identity(1);
     store.provision_node_identity(&identity).unwrap();
     let authenticated = authenticated(&identity);
 
-    let deadline_overflow_policy = policy(i64::MAX.unsigned_abs());
-    let error = store
-        .register_agent_session(
-            &authenticated,
-            &attempt(&identity, 1, 11, 111, None),
-            &deadline_overflow_policy,
-        )
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::Internal);
-    assert_eq!(counts(&store, &identity.node_id), (0, 0));
-
-    let normal_policy = policy(60_000);
+    let normal_policy = policy();
     let first_attempt = attempt(&identity, 1, 11, 112, None);
     let maximum = AgentSession {
         version: ContractVersion::V1,
@@ -740,7 +805,7 @@ fn two_first_sessions_for_one_node_have_one_winner() {
     let identity = identity(1);
     first_store.provision_node_identity(&identity).unwrap();
     let authenticated = authenticated(&identity);
-    let policy = policy(60_000);
+    let policy = policy();
     let barrier = Arc::new(Barrier::new(2));
 
     let (first, second) = std::thread::scope(|scope| {
@@ -822,7 +887,7 @@ fn a_locked_node_identity_does_not_serialize_another_node() {
     let worker_store = Store::connect(&url, None).unwrap();
     let second_auth = authenticated(&second_identity);
     let second_attempt = attempt(&second_identity, 2, 21, 221, None);
-    let second_policy = policy(60_000);
+    let second_policy = policy();
     let (result_tx, result_rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
         result_tx
@@ -868,7 +933,7 @@ fn stored_identity_attempt_and_current_projection_corruption_fail_backend_unknow
         .register_agent_session(
             &authenticated(&corrupt_identity),
             &attempt(&corrupt_identity, 1, 11, 111, None),
-            &policy(60_000),
+            &policy(),
         )
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Internal);
@@ -923,7 +988,7 @@ fn stored_identity_attempt_and_current_projection_corruption_fail_backend_unknow
         .register_agent_session(
             &authenticated(&corrupt_attempt_identity),
             &original_attempt,
-            &policy(60_000),
+            &policy(),
         )
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Internal);
@@ -939,7 +1004,7 @@ fn stored_identity_attempt_and_current_projection_corruption_fail_backend_unknow
             .register_agent_session(
                 &authenticated(&corrupt_current_identity),
                 &attempt(&corrupt_current_identity, 3, 31, 331, None),
-                &policy(60_000),
+                &policy(),
             )
             .unwrap(),
     );
@@ -981,7 +1046,7 @@ fn stored_identity_attempt_and_current_projection_corruption_fail_backend_unknow
         .register_agent_session(
             &authenticated(&corrupt_current_identity),
             &attempt(&corrupt_current_identity, 3, 32, 332, Some(1)),
-            &policy(60_000),
+            &policy(),
         )
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Internal);
@@ -1026,7 +1091,7 @@ async fn cancelled_active_registration_commits_once_and_exact_retry_recovers_res
     let task_store = Arc::clone(&store);
     let task_authenticated = authenticated(&identity);
     let task_attempt = attempt(&identity, 1, 11, 111, None);
-    let task_policy = policy(60_000);
+    let task_policy = policy();
     let task = tokio::spawn(async move {
         task_store
             .execute(move |store| {
@@ -1081,7 +1146,7 @@ async fn cancelled_active_registration_commits_once_and_exact_retry_recovers_res
 
     let replay_authenticated = authenticated(&identity);
     let replay_attempt = attempt(&identity, 1, 11, 111, None);
-    let replay_policy = policy(60_000);
+    let replay_policy = policy();
     let replay = store
         .execute(move |store| {
             store.register_agent_session(&replay_authenticated, &replay_attempt, &replay_policy)

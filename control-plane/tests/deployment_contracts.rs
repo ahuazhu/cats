@@ -146,8 +146,10 @@ fn route_grant_private_key_reaches_only_control_plane_and_nodes_get_public_key()
     assert!(workflow.contains("route_grant_public_key_pem: $route_grant_public_key_pem"));
 
     let dev = read_workspace_file("scripts/dev.sh");
-    assert!(dev.contains("--route-grant-private-key-file"));
-    assert!(dev.contains("--route-grant-public-key-file"));
+    assert!(dev.contains("signed Agent-registration cutover"));
+    assert!(dev.contains("provisioner-owned /etc/cats/identity"));
+    assert!(!dev.contains("--node-id"));
+    assert!(!dev.contains("--state-dir"));
 }
 
 #[test]
@@ -1689,5 +1691,183 @@ fn worker_bootstrap_validates_and_installs_its_route_grant_key_before_mutation()
             .output()
             .unwrap_or_else(|error| panic!("validate {invalid}: {error}"));
         assert!(!output.status.success(), "accepted invalid key {invalid}");
+    }
+}
+
+#[test]
+fn agent_registration_deployments_share_one_canonical_release_receipt() {
+    let receipt_argument =
+        "--guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json";
+    for unit in [
+        "deploy/metal/systemd/cats-controld.service",
+        "deploy/metal/systemd/cats-noded.service",
+        "deploy/aws/metal/cats-worker.service",
+    ] {
+        let source = read_workspace_file(unit);
+        assert!(
+            source.contains(receipt_argument),
+            "{unit} lost the exact installed release receipt"
+        );
+        if unit.contains("noded") || unit.contains("worker") {
+            for forbidden in ["--node-id", "--state-dir", "--ch-kernel", "--ch-initramfs"] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{unit} regained forbidden identity or Guest-byte override {forbidden}"
+                );
+            }
+        }
+    }
+
+    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    assert!(kubernetes.contains("\"--guest-runtime-profile-receipt-file\","));
+    assert!(kubernetes.contains("\"/opt/cats/release/guest-runtime-profile.v1.json\","));
+
+    let control_image = read_workspace_file("deploy/aws/Dockerfile.control-plane");
+    for copy in [
+        "guest-runtime-release.v1/guest-runtime-profile.v1.json /opt/cats/release/guest-runtime-profile.v1.json",
+        "guest-runtime-release.v1/manifest.v1.json /opt/cats/release/guest-runtime-release-manifest.v1.json",
+    ] {
+        assert!(control_image.contains(copy), "Control image lost {copy:?}");
+    }
+    let worker_image = read_workspace_file("deploy/aws/Dockerfile.worker-artifact");
+    assert!(worker_image.contains("COPY guest-runtime-release.v1 /guest-runtime-release.v1"));
+    let noded = read_workspace_file("cmd/noded/src/main.rs");
+    assert!(noded.contains("boot_contract: Some(installed_receipt.boot_contract())"));
+
+    let workflow = read_workspace_file(".github/workflows/release.yml");
+    assert_eq!(
+        workflow.matches("guest-runtime-release:\n").count(),
+        1,
+        "the workflow must have one Guest release producer"
+    );
+    assert!(workflow.contains("RELEASE_OUT=\"$PWD/guest-runtime-release.v1\""));
+    assert_eq!(
+        workflow.matches("needs: guest-runtime-release").count(),
+        2,
+        "Control and Node artifacts must consume the same build job"
+    );
+    assert_eq!(
+        workflow.matches("name: guest-runtime-release-v1").count(),
+        3,
+        "one upload and exactly two consumers must name the same artifact"
+    );
+    assert!(
+        workflow.contains("tar --owner=0 --group=0 --numeric-owner -C worker-out"),
+        "the worker archive must preserve the root-owned release member contract"
+    );
+}
+
+#[test]
+fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
+    let installer = read_workspace_file("deploy/aws/metal/install-guest-runtime-release.sh");
+    for invariant in [
+        "actual != expected",
+        "actual_directories != {\"guest\"}",
+        "metadata.st_nlink != 1",
+        "metadata.st_uid != 0",
+        "stat.S_IMODE(metadata.st_mode) != 0o644",
+        "find \"$incomplete\" -type f -exec sync -f {} +",
+        "mv -T -- \"$incomplete\" \"$target_set\"",
+        "materialize_active \"$previous_incomplete\"",
+        "find \"$previous_incomplete\" -type f -exec sync -f {} +",
+        "trap rollback ERR",
+        "guest-runtime-release-manifest.v1.json.incoming",
+    ] {
+        assert!(
+            installer.contains(invariant),
+            "release installer lost {invariant:?}"
+        );
+    }
+    let kernel_activation = installer
+        .find("guest/vmlinuz|/opt/cats/guest/vmlinuz")
+        .expect("kernel activation");
+    let manifest_activation = installer
+        .find("mv -fT -- \"$temp\" /opt/cats/release/guest-runtime-release-manifest.v1.json")
+        .expect("manifest activation");
+    assert!(
+        kernel_activation < manifest_activation,
+        "the manifest is the active-set commit marker and must be renamed last"
+    );
+
+    for bootstrap in [
+        "deploy/aws/metal/install-worker.sh",
+        "deploy/metal/install.sh",
+    ] {
+        let source = read_workspace_file(bootstrap);
+        let required = source
+            .find("CATS_GUEST_RUNTIME_RELEASE_DIR must name the qualified guest-runtime-release.v1 payload")
+            .expect("required shared release input");
+        let verify = source
+            .find("install-guest-runtime-release\" verify")
+            .expect("release verification");
+        let install = source
+            .find("install-guest-runtime-release\" install")
+            .expect("release activation");
+        assert!(required < verify && verify < install);
+        assert!(source.contains("validate-node-identity-installation.sh"));
+        for forbidden in ["169.254.169.254", "CATS_NODE_ID=", "build-guest-image.sh"] {
+            assert!(
+                !source.contains(forbidden),
+                "{bootstrap} regained Host-local identity/release synthesis {forbidden:?}"
+            );
+        }
+    }
+
+    let identity_validator =
+        read_workspace_file("deploy/aws/metal/validate-node-identity-installation.sh");
+    for exact in [
+        "identity_dir=/etc/cats/identity",
+        "node-identity.v1.json",
+        "node-registration-key.pem",
+        "node-registration-credential-id",
+        "0:0:700",
+        "0:0:600:1",
+    ] {
+        assert!(identity_validator.contains(exact));
+    }
+
+    let terraform =
+        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
+    let archive_listing = terraform.find("tar --zstd -tf").expect("archive preflight");
+    let archive_extract = terraform.find("tar --zstd -xf").expect("archive extract");
+    let release_verify = terraform
+        .find("install-guest-runtime-release.sh\" verify")
+        .expect("staged release verification");
+    let stop = terraform
+        .find("systemctl stop cats-worker")
+        .expect("worker stop");
+    let first_install = terraform
+        .find("install -D -m 0755 \"$stage_path/cats-noded\"")
+        .expect("first installed byte");
+    assert!(archive_listing < archive_extract && archive_extract < release_verify);
+    assert!(release_verify < stop && stop < first_install);
+    for forbidden in ["169.254.169.254", "CATS_NODE_ID=", "--node-id"] {
+        assert!(
+            !terraform.contains(forbidden),
+            "Terraform regained derived Node identity {forbidden:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn guest_release_shell_entrypoints_parse() {
+    for script in [
+        "deploy/aws/metal/install-guest-runtime-release.sh",
+        "deploy/aws/metal/install-worker.sh",
+        "deploy/aws/metal/validate-node-identity-installation.sh",
+        "deploy/metal/build-guest-image.sh",
+        "deploy/metal/install.sh",
+    ] {
+        let output = Command::new("bash")
+            .args(["-n", script])
+            .current_dir(workspace_root())
+            .output()
+            .unwrap_or_else(|error| panic!("parse {script}: {error}"));
+        assert!(
+            output.status.success(),
+            "{script} is not valid Bash: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

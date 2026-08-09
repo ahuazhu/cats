@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use cats_api::runtime_reconciliation::GuestRuntimeProfileReceipt;
 use cats_metering::{CreditStore, UsageStore};
 use cats_storage::{BlobStore, MetadataStore};
 
@@ -53,6 +54,9 @@ pub struct Config {
     pub image_blob: Arc<dyn BlobStore>,
     /// Service credential used by node agents, gateways and controller jobs.
     pub auth_token: String,
+    /// Exact, startup-validated release receipt used to bind every new Agent
+    /// session. Production loads this from the one canonical installed path.
+    pub guest_runtime_profile_receipt: GuestRuntimeProfileReceipt,
     /// Private-key authority for short-lived V1 Endpoint Route Grants. It is
     /// intentionally absent from Gateway and Node configuration.
     pub route_grant_signer: Arc<crate::route_grant::RouteGrantSigner>,
@@ -105,6 +109,7 @@ pub struct AppState {
     pub notify: Arc<tokio::sync::Notify>,
     pub controller: Arc<Controller>,
     pub cfg: Arc<Config>,
+    pub(crate) agent_session_registration_policy: Arc<crate::store::AgentSessionRegistrationPolicy>,
 }
 
 pub struct Handle {
@@ -356,6 +361,11 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         "automatic Cold threshold must be positive"
     );
     let cfg = Arc::new(cfg);
+    let agent_session_registration_policy = Arc::new(
+        crate::store::AgentSessionRegistrationPolicy::from_release_receipt(
+            &cfg.guest_runtime_profile_receipt,
+        )?,
+    );
     let ca_file = cfg
         .control_store_ca_file
         .as_deref()
@@ -423,6 +433,7 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         notify,
         controller: controller.clone(),
         cfg: cfg.clone(),
+        agent_session_registration_policy,
     };
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen)

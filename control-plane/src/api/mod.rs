@@ -41,6 +41,7 @@ use crate::server::AppState;
 use crate::store::OciDeploymentClaim;
 
 mod accounts;
+mod agent_registration;
 mod billing;
 mod cats;
 mod disks;
@@ -530,7 +531,11 @@ pub fn router(state: AppState) -> Router {
             "/v1/workspaces/{workspace}/operations",
             get(list_operations),
         )
-        .route("/v1/nodes/register", post(register_node))
+        .route(
+            "/v1/internal/runtime/agent-sessions",
+            post(agent_registration::register_agent_session)
+                .fallback(agent_registration::register_agent_session),
+        )
         .route("/v1/nodes/heartbeat", post(heartbeat))
         .route("/v1/nodes/work-status", post(node_work_status))
         .route("/v1/internal/work/acquire", post(acquire_work))
@@ -583,7 +588,7 @@ mod tests {
             .split_once("pub fn router")
             .expect("router declaration")
             .1
-            .split_once(".fallback")
+            .split_once(".fallback(crate::ui::not_found)")
             .expect("router fallback")
             .0;
         let mut routes = Vec::new();
@@ -722,11 +727,11 @@ POST /v1/accounts/{account}/workspaces
 POST /v1/admin/nodes/{id}/actions/{verb}
 POST /v1/auth/logout
 POST /v1/billing/stripe/webhook
+POST /v1/internal/runtime/agent-sessions
 POST /v1/internal/usage/checkpoints
 POST /v1/internal/work/acquire
 POST /v1/internal/work/release
 POST /v1/nodes/heartbeat
-POST /v1/nodes/register
 POST /v1/nodes/work-status
 POST /v1/nodes/{id}/actions/cordon
 POST /v1/routes/wake

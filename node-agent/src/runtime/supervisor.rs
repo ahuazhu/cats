@@ -886,6 +886,7 @@ mod teardown_tests {
                 ch_bin: PathBuf::from("unused-ch"),
                 kernel: PathBuf::from("unused-kernel"),
                 initramfs: None,
+                boot_contract: None,
                 cmdline: String::new(),
                 seed_image: None,
                 block_path: BlockPath::KernelNbd,

@@ -10,9 +10,15 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 CH_VERSION=${CH_VERSION:-v53.0}
 PREFIX=/opt/cats
+GUEST_RUNTIME_RELEASE_SOURCE=${CATS_GUEST_RUNTIME_RELEASE_DIR:-}
 
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 [[ -e /dev/kvm ]] || { echo "/dev/kvm missing: use a *.metal instance" >&2; exit 1; }
+[[ -d $GUEST_RUNTIME_RELEASE_SOURCE ]] || {
+  echo "CATS_GUEST_RUNTIME_RELEASE_DIR must name the qualified guest-runtime-release.v1 payload" >&2
+  exit 1
+}
+"$REPO/deploy/aws/metal/validate-node-identity-installation.sh"
 
 echo "==> apt dependencies"
 export DEBIAN_FRONTEND=noninteractive
@@ -66,13 +72,19 @@ echo "options nbd nbds_max=64" > /etc/modprobe.d/cats-nbd.conf
 echo "==> guest outbound network"
 install -m 0755 "$REPO/deploy/metal/setup-guest-network.sh" \
   "$PREFIX/bin/setup-guest-network"
+install -m 0755 "$REPO/deploy/aws/metal/install-guest-runtime-release.sh" \
+  "$PREFIX/bin/install-guest-runtime-release"
 printf 'net.ipv4.ip_forward=1\nnet.ipv4.conf.all.rp_filter=1\nnet.ipv4.conf.default.rp_filter=1\n' \
   > /etc/sysctl.d/90-cats-guest-network.conf
 CATS_GUEST_NETWORK_CIDR=${CATS_GUEST_NETWORK_CIDR:-10.240.0.0/16} \
   "$PREFIX/bin/setup-guest-network"
 
-echo "==> guest image"
-OUT="$PREFIX/guest" "$REPO/deploy/metal/build-guest-image.sh"
+echo "==> shared Guest runtime release"
+CATS_NODE_SERVICE_NAME=cats-noded \
+  "$PREFIX/bin/install-guest-runtime-release" verify "$GUEST_RUNTIME_RELEASE_SOURCE"
+systemctl stop cats-noded 2>/dev/null || true
+CATS_NODE_SERVICE_NAME=cats-noded \
+  "$PREFIX/bin/install-guest-runtime-release" install "$GUEST_RUNTIME_RELEASE_SOURCE"
 
 # --------------------------------------------------------------------------
 # Local NVMe for the ChunkStore cache and the file object store.

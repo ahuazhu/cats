@@ -16,12 +16,24 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
+use cats_api::agent_registration::{
+    verify_request_proof, Ed25519RequestSigner, JSON_CONTENT_TYPE, NODE_CREDENTIAL_ID_HEADER,
+    NODE_PUBLIC_KEY_SPKI_HEADER, NODE_SIGNATURE_HEADER, REGISTRATION_PATH,
+};
 use cats_api::metering::{CatUsageCheckpoint, UsageMetric};
+use cats_api::runtime_reconciliation::{
+    decode_agent_registration_attempt, encode_agent_session, AgentSession, AsciiText,
+    ContractVersion, CredentialBinding, Epoch, GuestRuntimeProfileReceipt, Id, NodeBootId,
+    NodeIdentity, NodeIdentityState, Sha256Digest, UnixMillis,
+};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
+use cats_node_agent::agent_registration::AgentRegistrationConfig;
 use cats_node_agent::server::{spawn, ServerConfig};
 use cats_node_agent::usage_spool::UsageSpool;
 use cats_storage::MetadataStore;
@@ -57,6 +69,47 @@ async fn mock_usage_ok(State(cp): State<MockControlPlane>) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+async fn mock_registration(headers: HeaderMap, body: Bytes) -> Response {
+    verify_request_proof(
+        "POST",
+        REGISTRATION_PATH,
+        &body,
+        headers
+            .get(NODE_CREDENTIAL_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        headers
+            .get(NODE_PUBLIC_KEY_SPKI_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        headers
+            .get(NODE_SIGNATURE_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let attempt = decode_agent_registration_attempt(&body).unwrap();
+    (
+        [("content-type", JSON_CONTENT_TYPE)],
+        encode_agent_session(&AgentSession {
+            version: ContractVersion::V1,
+            node_id: attempt.node_id,
+            immutable_host_id: attempt.immutable_host_id,
+            node_boot_id: attempt.node_boot_id,
+            agent_instance_id: attempt.agent_instance_id,
+            agent_session_epoch: Epoch::new(1).unwrap(),
+            registration_attempt_id: attempt.registration_attempt_id,
+            guest_config_digest: attempt.guest_config_digest,
+            lease_deadline_unix_ms: UnixMillis::new(1_900_000_060_000).unwrap(),
+        })
+        .unwrap(),
+    )
+        .into_response()
+}
+
 async fn start_mock(hang_usage: bool) -> (MockControlPlane, String) {
     let cp = MockControlPlane::default();
     let usage = if hang_usage {
@@ -67,10 +120,7 @@ async fn start_mock(hang_usage: bool) -> (MockControlPlane, String) {
     let app = Router::new()
         .route("/v1/nodes/heartbeat", post(mock_heartbeat))
         .route("/v1/internal/usage/checkpoints", usage)
-        .route(
-            "/v1/nodes/register",
-            post(|| async { StatusCode::NO_CONTENT }),
-        )
+        .route(REGISTRATION_PATH, post(mock_registration))
         .route(
             "/v1/nodes/work-status",
             post(|| async { StatusCode::NO_CONTENT }),
@@ -114,21 +164,47 @@ async fn start_agent(
     seed_spool(&state_dir);
     let storage_meta: Arc<dyn MetadataStore> =
         Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+    let signer = Ed25519RequestSigner::from_pkcs8_pem(
+        Id::new("credential_node_a").unwrap(),
+        include_bytes!("../../tests/fixtures/route_grant_private_ed25519.pem"),
+    )
+    .unwrap();
+    let receipt = GuestRuntimeProfileReceipt {
+        version: ContractVersion::V1,
+        kernel_digest: Sha256Digest::new(format!("sha256:{}", "1".repeat(64))).unwrap(),
+        initramfs_digest: None,
+        kernel_cmdline: AsciiText::new("console=hvc0 root=/dev/vda").unwrap(),
+        guest_agent_protocol_version: ContractVersion::V1,
+    };
+    let registration = AgentRegistrationConfig::for_loopback_test(
+        NodeIdentity {
+            version: ContractVersion::V1,
+            node_id: Id::new("node_a").unwrap(),
+            immutable_host_id: Id::new("host_a").unwrap(),
+            credential_id: signer.credential_id().clone(),
+            credential_binding: CredentialBinding::PublicKey {
+                public_key_spki_sha256: signer.public_key_spki_sha256(),
+            },
+            state_path_id: Id::new("state_a").unwrap(),
+            state: NodeIdentityState::Provisioned,
+        },
+        signer,
+        state_dir.clone(),
+        NodeBootId::new("11111111111111111111111111111111").unwrap(),
+        &receipt,
+    )
+    .unwrap();
     spawn(ServerConfig {
-        advertise_url: None,
         listen: "127.0.0.1:0".into(),
         control_plane_url,
         auth_token: "dev-service-token".into(),
+        agent_registration: registration,
         route_grant_verifier: Arc::new(
             cats_node_agent::route_grant::RouteGrantVerifier::from_ed25519_pem(include_bytes!(
                 "../../tests/fixtures/route_grant_public_ed25519.pem"
             ))
             .unwrap(),
         ),
-        gateway_url: "http://127.0.0.1:1".into(),
-        cpus: 4,
-        memory_mib: 4096,
-        initially_cordoned: false,
         heartbeat_ms: HEARTBEAT_MS,
         storage_meta,
         node: fake_node_config!(
@@ -139,7 +215,7 @@ async fn start_agent(
     .unwrap()
 }
 
-/// The heartbeat keeps its cadence while usage upload is wedged.
+/// A wedged legacy upload does not resurrect the removed legacy heartbeat.
 #[tokio::test]
 async fn a_hanging_usage_upload_does_not_delay_the_heartbeat() {
     let dir = TempDirFixture::new();
@@ -150,22 +226,7 @@ async fn a_hanging_usage_upload_does_not_delay_the_heartbeat() {
     // inline call the second heartbeat would not arrive for 10 s.
     tokio::time::sleep(Duration::from_millis(HEARTBEAT_MS * 12)).await;
 
-    let beats = cp.heartbeats.lock().unwrap().clone();
-    assert!(
-        beats.len() >= 8,
-        "expected a steady heartbeat while upload hangs, got {} in {} ms",
-        beats.len(),
-        HEARTBEAT_MS * 12
-    );
-    let worst_gap = beats
-        .windows(2)
-        .map(|pair| pair[1].duration_since(pair[0]))
-        .max()
-        .expect("at least two heartbeats");
-    assert!(
-        worst_gap < Duration::from_millis(HEARTBEAT_MS * 5),
-        "heartbeat stalled for {worst_gap:?}; liveness is still coupled to usage upload"
-    );
+    assert!(cp.heartbeats.lock().unwrap().is_empty());
     assert!(
         cp.usage_attempts.load(Ordering::SeqCst) >= 1,
         "the uploader must still be trying on its own channel"
@@ -185,7 +246,7 @@ async fn usage_upload_runs_on_its_own_channel() {
         "decoupling must not mean the upload stops happening"
     );
     assert!(
-        !cp.heartbeats.lock().unwrap().is_empty(),
-        "the heartbeat must still be running too"
+        cp.heartbeats.lock().unwrap().is_empty(),
+        "the runtime session cutover must not double-write legacy heartbeats"
     );
 }

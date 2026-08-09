@@ -64,6 +64,7 @@ tokio = { version = "1", features = [
     "io-std",
 ] }
 axum = { version = "0.8", features = ["ws"] }
+http-body-util = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 postgres = "0.19.14"
@@ -78,6 +79,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
 base64 = "0.22"
+ring = "0.17"
 rand = "0.9"
 libc = "0.2"
 tempfile = "3"

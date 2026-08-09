@@ -281,6 +281,8 @@ resource "kubernetes_deployment_v1" "control_plane" {
             "0.0.0.0:7300",
             "--control-store-url-file",
             "/etc/cats/runtime/CATS_POSTGRES_URL",
+            "--guest-runtime-profile-receipt-file",
+            "/opt/cats/release/guest-runtime-profile.v1.json",
             "--metadata-store-adapter",
             "postgres",
             "--metadata-store-option",

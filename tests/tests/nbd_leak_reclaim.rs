@@ -51,6 +51,7 @@ fn config() -> Result<ChConfig> {
         ch_bin: PathBuf::from("/nonexistent"),
         kernel: PathBuf::from("/nonexistent"),
         initramfs: None,
+        boot_contract: None,
         cmdline: String::new(),
         seed_image: None,
         block_path: BlockPath::KernelNbd,

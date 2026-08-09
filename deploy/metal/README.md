@@ -37,16 +37,18 @@ Use an exact reviewed repository revision:
 ```bash
 git clone <this-repo> cats
 cd cats
-sudo deploy/metal/install.sh
+sudo CATS_GUEST_RUNTIME_RELEASE_DIR=/path/to/guest-runtime-release.v1 \
+  deploy/metal/install.sh
 sudoedit /etc/cats/cats.env
 ```
 
-`install.sh` installs build/runtime dependencies, builds release binaries,
-installs the pinned Cloud Hypervisor, constructs the Guest kernel/initramfs/root
-image, and installs the systemd units. It configures the kernel NBD pool for the
+`install.sh` requires the provisioner-owned `/etc/cats/identity` set and
+`CATS_GUEST_RUNTIME_RELEASE_DIR=.../guest-runtime-release.v1`, installs build/runtime dependencies,
+builds release binaries, installs the pinned Cloud Hypervisor and the shared Guest release,
+and installs the systemd units. It configures the kernel NBD pool for the
 default path; vhost-user does not consume `/dev/nbdN`.
 
-For the target runtime-reconciliation release, the builder must instead carry the same exact
+The runtime-reconciliation release carries the same exact
 `guest-runtime-profile.v1.json` bytes in the Control and Node artifacts and install them at
 `/opt/cats/release/guest-runtime-profile.v1.json` together with the pinned Guest kernel and optional initramfs.
 Production Control and Node systemd `ExecStart` both pass
@@ -54,7 +56,7 @@ Production Control and Node systemd `ExecStart` both pass
 missing-file or fixture fallback. The full fail-closed contract is
 [Agent Registration and Internal Transport v1](../../docs/specs/agent-registration-transport-v1.md), and the
 single-build payload/manifest plus root-provisioned local Node identity are frozen by
-[Runtime Composition Artifacts v1](../../docs/specs/runtime-composition-artifacts-v1.md). Target `cats-noded` does
+[Runtime Composition Artifacts v1](../../docs/specs/runtime-composition-artifacts-v1.md). `cats-noded` does
 not derive registration identity from the development `CATS_NODE_ID`, hostname, address or Host kernel.
 
 仅限首次安装、尚未创建任何 Cat 的空节点，配置后可以直接启动或重启服务。
@@ -77,8 +79,8 @@ ADR-0040 Host-lock/checkpoint/inventory cutover.
 
 ## Cluster configuration
 
-Every Host needs a unique `CATS_NODE_ID`, listen address, and advertised URL.
-All Hosts in one fleet point to the same control plane, PostgreSQL metadata
+Every Host needs one unique provisioner-owned Node identity/key set; hostname, IP and
+environment values are not Node identity. All Hosts in one fleet point to the same control plane, PostgreSQL metadata
 store, and durable object store. File and SQLite adapters are local development
 adapters and cannot provide cross-Host restore.
 

@@ -118,6 +118,15 @@ struct Args {
     object_store_options: Vec<String>,
     #[arg(long, env = "CATS_AUTH_TOKEN", default_value = "dev-service-token")]
     auth_token: String,
+    /// Canonical installed Guest runtime profile receipt. CLI takes precedence
+    /// over the matching environment variable; either source must name the
+    /// one production path.
+    #[arg(
+        long,
+        env = "CATS_GUEST_RUNTIME_PROFILE_RECEIPT_FILE",
+        value_name = "PATH"
+    )]
+    guest_runtime_profile_receipt_file: Option<std::path::PathBuf>,
     /// PKCS#8 Ed25519 private key used only by the control plane to issue
     /// short-lived V1 Endpoint Route Grants.
     #[arg(long, env = "CATS_ROUTE_GRANT_PRIVATE_KEY_FILE")]
@@ -519,6 +528,14 @@ async fn main() -> anyhow::Result<()> {
             args.route_grant_ttl_seconds,
         )?,
     );
+    let guest_runtime_profile_receipt_path = args
+        .guest_runtime_profile_receipt_file
+        .as_deref()
+        .context("--guest-runtime-profile-receipt-file or CATS_GUEST_RUNTIME_PROFILE_RECEIPT_FILE is required")?;
+    let guest_runtime_profile_receipt =
+        cats_api::runtime_artifacts::load_installed_guest_runtime_profile_receipt(
+            guest_runtime_profile_receipt_path,
+        )?;
     let handle = cats_control_plane::server::spawn(cats_control_plane::server::Config {
         listen: args.listen,
         control_store_dsn,
@@ -528,6 +545,7 @@ async fn main() -> anyhow::Result<()> {
         storage_meta,
         image_blob,
         auth_token: args.auth_token,
+        guest_runtime_profile_receipt: guest_runtime_profile_receipt.receipt().clone(),
         route_grant_signer,
         admin_token: args.admin_token,
         workos,

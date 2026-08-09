@@ -24,6 +24,7 @@ set -euo pipefail
 umask 022
 
 OUT=${OUT:-/opt/cats/guest}
+RELEASE_OUT=${RELEASE_OUT:-/opt/cats/guest-runtime-release.v1}
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 KVER=${KVER:-$(uname -r)}
 ROOTFS_MB=${ROOTFS_MB:-512}
@@ -416,5 +417,47 @@ mkfs.ext4 -q -F -d "$RF" "$OUT/rootfs.ext4"
 
 (cd "$OUT" && sha256sum vmlinuz initramfs.img rootfs.ext4 > SHA256SUMS)
 
+# --------------------------------------------------------------------------
+# 4. One immutable Guest runtime payload, consumed by Control and Node.
+# --------------------------------------------------------------------------
+release_incomplete="${RELEASE_OUT}.incomplete"
+rm -rf -- "$release_incomplete"
+install -d -m 0755 "$release_incomplete/guest"
+install -o root -g root -m 0644 "$OUT/vmlinuz" "$release_incomplete/guest/vmlinuz"
+install -o root -g root -m 0644 "$OUT/initramfs.img" "$release_incomplete/guest/initramfs.img"
+kernel_sha=$(sha256sum "$release_incomplete/guest/vmlinuz" | awk '{print $1}')
+initramfs_sha=$(sha256sum "$release_incomplete/guest/initramfs.img" | awk '{print $1}')
+kernel_size=$(stat -c %s "$release_incomplete/guest/vmlinuz")
+initramfs_size=$(stat -c %s "$release_incomplete/guest/initramfs.img")
+printf '%s' \
+  "{\"guest_agent_protocol_version\":1,\"initramfs_digest\":\"sha256:$initramfs_sha\",\"kernel_cmdline\":\"console=ttyS0 root=/dev/vda rw clocksource=kvm-clock\",\"kernel_digest\":\"sha256:$kernel_sha\",\"version\":1}" \
+  > "$release_incomplete/guest-runtime-profile.v1.json"
+receipt_sha=$(sha256sum "$release_incomplete/guest-runtime-profile.v1.json" | awk '{print $1}')
+receipt_size=$(stat -c %s "$release_incomplete/guest-runtime-profile.v1.json")
+printf '%s' \
+  "{\"guest_runtime_profile\":{\"path\":\"guest-runtime-profile.v1.json\",\"sha256\":\"sha256:$receipt_sha\",\"size_bytes\":$receipt_size},\"initramfs\":{\"path\":\"guest/initramfs.img\",\"sha256\":\"sha256:$initramfs_sha\",\"size_bytes\":$initramfs_size},\"kernel\":{\"path\":\"guest/vmlinuz\",\"sha256\":\"sha256:$kernel_sha\",\"size_bytes\":$kernel_size},\"version\":1}" \
+  > "$release_incomplete/manifest.v1.json"
+release_id=$(
+  { printf '%s\0' 'cats.release.guest-runtime-manifest.v1'; cat "$release_incomplete/manifest.v1.json"; } \
+    | sha256sum | awk '{print $1}'
+)
+chmod 0644 \
+  "$release_incomplete/guest-runtime-profile.v1.json" \
+  "$release_incomplete/manifest.v1.json" \
+  "$release_incomplete/guest/vmlinuz" \
+  "$release_incomplete/guest/initramfs.img"
+for release_file in \
+  "$release_incomplete/guest-runtime-profile.v1.json" \
+  "$release_incomplete/manifest.v1.json" \
+  "$release_incomplete/guest/vmlinuz" \
+  "$release_incomplete/guest/initramfs.img"; do
+  sync -f "$release_file"
+done
+sync -f "$release_incomplete/guest" "$release_incomplete"
+rm -rf -- "$RELEASE_OUT"
+mv "$release_incomplete" "$RELEASE_OUT"
+sync -f "$(dirname "$RELEASE_OUT")"
+
 echo "guest artifacts ready in $OUT:"
 ls -la "$OUT"
+echo "Guest runtime release sha256:$release_id ready in $RELEASE_OUT"

@@ -10,6 +10,7 @@ name = "cats-controld"
 path = "src/main.rs"
 
 [dependencies]
+cats-api = { workspace = true }
 cats-control-plane = { workspace = true }
 cats-metering = { workspace = true }
 cats-storage = { workspace = true }

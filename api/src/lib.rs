@@ -13,6 +13,7 @@
 //! It must stay dependency-light. Encoding and hashing live here only when
 //! they are themselves part of a shared wire contract.
 
+pub mod agent_registration;
 pub mod auth;
 pub mod billing;
 pub mod blockd;
@@ -26,4 +27,5 @@ pub mod oci;
 pub mod requests;
 pub mod resources;
 pub mod route_grant;
+pub mod runtime_artifacts;
 pub mod runtime_reconciliation;

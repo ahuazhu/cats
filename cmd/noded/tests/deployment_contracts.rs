@@ -43,23 +43,21 @@ fn production_deployment_selects_each_control_plane_image_target() {
     );
 }
 
-/// The units pass `--ch-cmdline` explicitly, so they override the binary
-/// default rather than inheriting it.
 #[test]
-fn deployment_units_pin_kvm_clock_too() {
+fn deployment_units_take_the_pinned_guest_cmdline_only_from_the_shared_receipt() {
+    let builder = read_workspace_file("deploy/metal/build-guest-image.sh");
+    assert!(builder.contains(
+        r#"\"kernel_cmdline\":\"console=ttyS0 root=/dev/vda rw clocksource=kvm-clock\""#
+    ));
     for unit in [
         "deploy/metal/systemd/cats-noded.service",
         "deploy/aws/metal/cats-worker.service",
     ] {
         let text = read_workspace_file(unit);
-        let line = text
-            .lines()
-            .find(|line| line.contains("--ch-cmdline"))
-            .unwrap_or_else(|| panic!("{unit} no longer passes --ch-cmdline"));
-        assert!(
-            line.contains("clocksource=kvm-clock"),
-            "{unit} overrides the guest cmdline without pinning kvm-clock: {line}"
-        );
+        assert!(text.contains(
+            "--guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json"
+        ));
+        assert!(!text.contains("--ch-cmdline"));
     }
 }
 
@@ -102,13 +100,13 @@ fn node_agent_restart_requires_a_drained_idle_node() {
 }
 
 #[test]
-fn production_aws_worker_joins_initially_cordoned() {
+fn production_aws_worker_does_not_write_legacy_schedulability_state() {
     let unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
     assert!(
-        unit.lines()
-            .any(|line| line.trim() == "--initially-cordoned \\"),
-        "a fresh production worker must be unschedulable until an administrator validates and uncordons it"
+        !unit.contains("--initially-cordoned") && !unit.contains("--node-id"),
+        "Agent registration must not manufacture or double-write legacy Node schedulability state"
     );
+    assert!(unit.contains("/etc/cats/identity/node-identity.v1.json"));
 }
 
 #[test]
@@ -174,29 +172,30 @@ fn production_platform_example_keeps_two_workers_in_distinct_subnets() {
 fn manual_worker_bootstrap_refuses_the_example_identity() {
     let example = read_workspace_file("deploy/aws/metal/worker.env.example");
     assert!(
-        example.contains("CATS_NODE_ID=REPLACE_WITH_UNIQUE_NODE_ID"),
-        "the manual bootstrap example must never claim a real fleet identity"
-    );
-    assert!(
-        !example.lines().any(|line| line == "CATS_NODE_ID=metal-1"),
-        "a second manual worker must not register as metal-1 by default"
+        !example.contains("CATS_NODE_ID=") && !example.contains("CATS_NODE_ADVERTISE_URL="),
+        "the worker environment must not be a second Node identity authority"
     );
 
     let installer = read_workspace_file("deploy/aws/metal/install-worker.sh");
+    assert!(installer.contains("validate-node-identity-installation.sh"));
+    let validator = read_workspace_file("deploy/aws/metal/validate-node-identity-installation.sh");
     for expected in [
-        "worker_node_id=$(awk",
-        "$worker_node_id == REPLACE_WITH_UNIQUE_NODE_ID",
-        "$worker_advertise_url == *PRIVATE_IPV4*",
+        "identity_dir=/etc/cats/identity",
+        "node-identity.v1.json",
+        "node-registration-key.pem",
+        "node-registration-credential-id",
+        "0:0:700",
+        "0:0:600:1",
     ] {
         assert!(
-            installer.contains(expected),
-            "the installer must reject an unresolved identity before starting systemd: {expected:?}"
+            validator.contains(expected),
+            "the validator must enforce provisioner-owned identity before startup: {expected:?}"
         );
     }
     assert!(
-        installer.find("$worker_node_id == REPLACE_WITH_UNIQUE_NODE_ID")
+        installer.find("validate-node-identity-installation.sh")
             < installer.find("apt-get update -q"),
-        "identity validation must happen before the expensive bootstrap starts"
+        "identity presence validation must happen before the expensive bootstrap starts"
     );
 }
 
@@ -449,8 +448,11 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
     let first_install = deployment
         .find("install -D -m 0755 \"$stage_path/cats-noded\"")
         .expect("worker deployment installs cats-noded");
+    let release_verify = deployment
+        .find("install-guest-runtime-release.sh\" verify")
+        .expect("worker deployment verifies the shared Guest release");
     let update = deployment
-        .find("# Replace the golden RootDisk immediately before stopping the idle node.")
+        .find("# Replace the golden RootDisk while the worker remains stopped.")
         .expect("worker deployment has the guest-seed update phase");
     let stop = deployment
         .find("systemctl stop cats-worker")
@@ -459,11 +461,12 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
         .find("systemctl start cats-worker")
         .expect("worker deployment starts the replacement worker");
     assert!(
-        idle_guard < first_install
+        release_verify < idle_guard
+            && idle_guard < stop
+            && stop < first_install
             && first_install < update
-            && update < stop
-            && deployment[update..stop].contains("\"${var.install_root}/bin/update-guest-seed\""),
-        "worker must guard the drain before install and update the seed immediately before stop"
+            && deployment[update..start].contains("\"${var.install_root}/bin/update-guest-seed\""),
+        "worker must verify and guard the drain, stop, then replace release bytes before start"
     );
     assert!(stop < start, "worker must stop cleanly before starting");
     assert!(

@@ -11,12 +11,8 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(name = "cats-noded", about = "Cats node agent")]
 struct Args {
-    #[arg(long)]
-    node_id: String,
     #[arg(long, default_value = "127.0.0.1:0")]
     listen: String,
-    #[arg(long, env = "CATS_NODE_ADVERTISE_URL")]
-    advertise_url: Option<String>,
     #[arg(long)]
     control_plane_url: String,
     #[arg(long, env = "CATS_AUTH_TOKEN", default_value = "dev-service-token")]
@@ -24,10 +20,12 @@ struct Args {
     /// Ed25519 public key used to verify control-plane signed Route Grants.
     #[arg(long, env = "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE")]
     route_grant_public_key_file: PathBuf,
-    #[arg(long, default_value = "")]
-    gateway_url: String,
-    #[arg(long)]
-    state_dir: PathBuf,
+    #[arg(
+        long,
+        env = "CATS_GUEST_RUNTIME_PROFILE_RECEIPT_FILE",
+        value_name = "PATH"
+    )]
+    guest_runtime_profile_receipt_file: Option<PathBuf>,
     #[arg(long)]
     blockd_bin: PathBuf,
     #[arg(long)]
@@ -40,16 +38,6 @@ struct Args {
     object_store_adapter: String,
     #[arg(long = "object-store-option", value_name = "KEY=VALUE")]
     object_store_options: Vec<String>,
-    /// Schedulable logical CPUs. Defaults to the detected host total.
-    #[arg(long, env = "CATS_NODE_CPUS")]
-    cpus: Option<u32>,
-    /// Schedulable memory in MiB. Defaults to the detected host total.
-    #[arg(long, env = "CATS_NODE_MEMORY_MIB")]
-    memory_mib: Option<u64>,
-    /// Keep a newly registered node out of placement until an administrator
-    /// explicitly uncordons it. Re-registration never overrides admin state.
-    #[arg(long, default_value_t = false)]
-    initially_cordoned: bool,
     #[arg(long, default_value_t = 1000)]
     heartbeat_ms: u64,
     #[arg(long, default_value_t = 1500)]
@@ -94,25 +82,6 @@ struct Args {
     vmm: String,
     #[arg(long, default_value = "/usr/local/bin/cloud-hypervisor")]
     ch_bin: PathBuf,
-    #[arg(long, default_value = "/opt/cats/guest/vmlinux")]
-    ch_kernel: PathBuf,
-    #[arg(long)]
-    ch_initramfs: Option<PathBuf>,
-    /// `clocksource=kvm-clock` is load-bearing, not cosmetic. On a host with an
-    /// invariant TSC the guest kernel demotes kvm-clock to rating 299 and picks
-    /// raw `tsc` instead (`arch/x86/kernel/kvmclock.c`), because reading `rdtsc`
-    /// is cheaper. But a Warm restore re-establishes the guest clock through
-    /// `KVM_SET_CLOCK`, which moves kvmclock -- a clock a `tsc` guest never
-    /// reads. Its TSC is restored to the snapshot value instead, so all three
-    /// guest clocks resume frozen at the moment of the snapshot and the lag
-    /// accumulates across every Warm cycle
-    /// (`experiments/suspend-clock-semantics-20260727`). Pinning kvm-clock puts
-    /// the guest back on the clock the restore path actually adjusts.
-    #[arg(
-        long,
-        default_value = "console=ttyS0 root=/dev/vda rw quiet clocksource=kvm-clock"
-    )]
-    ch_cmdline: String,
     /// Raw golden-root image written into fresh root volumes.
     #[arg(long)]
     ch_seed_image: Option<PathBuf>,
@@ -151,21 +120,17 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
-    let detected_cpus = std::thread::available_parallelism()
-        .map(|count| u32::try_from(count.get()))
-        .map_err(anyhow::Error::from)??;
-    let detected_memory_mib = detect_host_memory_mib()?;
-    let cpus = args.cpus.unwrap_or(detected_cpus);
-    let memory_mib = args.memory_mib.unwrap_or(detected_memory_mib);
-    anyhow::ensure!(cpus > 0, "--cpus must be greater than zero");
-    anyhow::ensure!(memory_mib > 0, "--memory-mib must be greater than zero");
-    tracing::info!(
-        schedulable_cpus = cpus,
-        schedulable_memory_mib = memory_mib,
-        detected_cpus,
-        detected_memory_mib,
-        "resolved node capacity"
-    );
+    let receipt_path = args
+        .guest_runtime_profile_receipt_file
+        .as_deref()
+        .context("--guest-runtime-profile-receipt-file or CATS_GUEST_RUNTIME_PROFILE_RECEIPT_FILE is required")?;
+    let installed_receipt =
+        cats_api::runtime_artifacts::load_installed_guest_runtime_profile_receipt(receipt_path)?;
+    cats_api::runtime_artifacts::validate_installed_node_guest_runtime(&installed_receipt)?;
+    let agent_registration =
+        cats_node_agent::agent_registration::AgentRegistrationConfig::load_installed(
+            installed_receipt.receipt(),
+        )?;
     let metadata_store = AdapterSelection::new(
         args.metadata_store_adapter,
         AdapterConfig::from_cli(args.metadata_store_options)?,
@@ -185,9 +150,14 @@ async fn main() -> anyhow::Result<()> {
         "fake" => cats_node_agent::runtime::VmmMode::Fake,
         "ch" => cats_node_agent::runtime::VmmMode::CloudHypervisor(cats_node_agent::ch::ChConfig {
             ch_bin: args.ch_bin.clone(),
-            kernel: args.ch_kernel.clone(),
-            initramfs: args.ch_initramfs.clone(),
-            cmdline: args.ch_cmdline.clone(),
+            kernel: PathBuf::from("/opt/cats/guest/vmlinuz"),
+            initramfs: installed_receipt
+                .receipt()
+                .initramfs_digest
+                .as_ref()
+                .map(|_| PathBuf::from("/opt/cats/guest/initramfs.img")),
+            boot_contract: Some(installed_receipt.boot_contract()),
+            cmdline: installed_receipt.receipt().kernel_cmdline.to_string(),
             seed_image: args.ch_seed_image.clone(),
             block_path: cats_node_agent::ch::BlockPath::parse(&args.ch_block_path)?,
             block_direct: args.ch_block_direct,
@@ -214,18 +184,14 @@ async fn main() -> anyhow::Result<()> {
     );
     let handle = spawn(ServerConfig {
         listen: args.listen,
-        advertise_url: args.advertise_url,
         control_plane_url: args.control_plane_url,
         auth_token: args.auth_token,
+        agent_registration: agent_registration.clone(),
         route_grant_verifier,
-        gateway_url: args.gateway_url,
-        cpus,
-        memory_mib,
-        initially_cordoned: args.initially_cordoned,
         heartbeat_ms: args.heartbeat_ms,
         node: NodeConfig {
-            node_id: args.node_id,
-            state_dir: args.state_dir,
+            node_id: agent_registration.identity().node_id.to_string(),
+            state_dir: agent_registration.state_path().to_path_buf(),
             blockd_bin: args.blockd_bin,
             guest_agent_bin: args.guest_agent_bin,
             metadata_store,
@@ -250,66 +216,29 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn detect_host_memory_mib() -> anyhow::Result<u64> {
-    if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
-        if let Some(memory_mib) = parse_linux_memory_mib(&contents) {
-            return Ok(memory_mib);
-        }
-    }
-    // SAFETY: sysconf reads process-wide host configuration and does not
-    // dereference pointers. Negative results are checked before conversion.
-    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
-    // SAFETY: same as above for the page-size selector.
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    anyhow::ensure!(
-        pages > 0 && page_size > 0,
-        "could not detect host memory; pass --memory-mib explicitly"
-    );
-    u64::try_from(pages)
-        .and_then(|pages| u64::try_from(page_size).map(|size| pages.saturating_mul(size)))
-        .map(|bytes| bytes / 1024 / 1024)
-        .context("detected host memory does not fit in u64")
-}
-
-fn parse_linux_memory_mib(contents: &str) -> Option<u64> {
-    contents.lines().find_map(|line| {
-        let mut fields = line.split_whitespace();
-        if fields.next()? != "MemTotal:" {
-            return None;
-        }
-        fields.next()?.parse::<u64>().ok().map(|kib| kib / 1024)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
 
     #[test]
-    fn parses_linux_host_memory() {
-        assert_eq!(
-            super::parse_linux_memory_mib("MemTotal:       197659444 kB\nMemFree: 1 kB\n"),
-            Some(193_026)
-        );
-    }
-
-    #[test]
-    fn default_guest_cmdline_pins_kvm_clock() {
+    fn production_cli_has_no_identity_or_guest_byte_overrides() {
         let command = super::Args::command();
-        let arg = command
+        let ids = command
             .get_arguments()
-            .find(|a| a.get_id() == "ch_cmdline")
-            .expect("--ch-cmdline argument");
-        let default = arg
-            .get_default_values()
-            .first()
-            .expect("--ch-cmdline has a default")
-            .to_string_lossy()
-            .into_owned();
-        assert!(
-            default.contains("clocksource=kvm-clock"),
-            "a guest left on the `tsc` clocksource resumes from a Warm restore with \
-             all three clocks frozen at the snapshot instant; got {default:?}"
-        );
+            .map(|argument| argument.get_id().as_str())
+            .collect::<Vec<_>>();
+        for forbidden in [
+            "node_id",
+            "state_dir",
+            "ch_kernel",
+            "ch_initramfs",
+            "ch_cmdline",
+        ] {
+            assert!(
+                !ids.contains(&forbidden),
+                "forbidden production override {forbidden}"
+            );
+        }
+        assert!(ids.contains(&"guest_runtime_profile_receipt_file"));
     }
 }

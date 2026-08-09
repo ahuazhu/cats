@@ -9,10 +9,16 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cats_api::agent_registration::Ed25519RequestSigner;
 use cats_api::guest::{GuestRequestBody, GuestResponseBody};
+use cats_api::requests::{HeartbeatCat, HeartbeatRequest};
 use cats_api::resources::NodeState;
+use cats_api::runtime_reconciliation::{
+    ContractVersion, CredentialBinding, Id, NodeBootId, NodeIdentity, NodeIdentityState,
+};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::SqliteUsageStore;
+use cats_node_agent::agent_registration::AgentRegistrationConfig;
 use cats_node_agent::guest_client::GuestClient;
 use cats_node_agent::server::{spawn as spawn_node, Handle as NodeHandle, ServerConfig};
 use cats_object_store_file::FileBlobStore;
@@ -55,6 +61,8 @@ impl Cluster {
             storage_meta,
             image_blob: Arc::new(FileBlobStore::open(dir.path().join("image-blob")).unwrap()),
             auth_token: SERVICE_TOKEN.into(),
+            guest_runtime_profile_receipt:
+                cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
             route_grant_signer: Arc::new(
                 cats_control_plane::route_grant::RouteGrantSigner::from_ed25519_pem(
                     ROUTE_GRANT_PRIVATE_KEY,
@@ -130,30 +138,101 @@ impl Cluster {
         };
         let storage_meta: Arc<dyn MetadataStore> =
             Arc::new(SqliteMetadataStore::open(&meta_path).unwrap());
-        spawn_node(ServerConfig {
-            advertise_url: None,
+        let signer = Ed25519RequestSigner::from_pkcs8_pem(
+            Id::new(format!("credential_{id}")).unwrap(),
+            ROUTE_GRANT_PRIVATE_KEY,
+        )
+        .unwrap();
+        let identity = NodeIdentity {
+            version: ContractVersion::V1,
+            node_id: Id::new(id.to_string()).unwrap(),
+            immutable_host_id: Id::new(format!("host_{id}")).unwrap(),
+            credential_id: signer.credential_id().clone(),
+            credential_binding: CredentialBinding::PublicKey {
+                public_key_spki_sha256: signer.public_key_spki_sha256(),
+            },
+            state_path_id: Id::new(format!("state_{id}")).unwrap(),
+            state: NodeIdentityState::Provisioned,
+        };
+        cats_control_plane::testsupport::provision_node_identity(&cp.state.store, identity.clone())
+            .await;
+        let state_dir = dir.path().join(format!("node-{id}"));
+        let registration = AgentRegistrationConfig::for_loopback_test(
+            identity,
+            signer,
+            state_dir.clone(),
+            NodeBootId::new(format!(
+                "{:032x}",
+                id.bytes().map(u128::from).sum::<u128>() + 1
+            ))
+            .unwrap(),
+            &cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
+        )
+        .unwrap();
+        let route_grant_verifier = Arc::new(
+            cats_node_agent::route_grant::RouteGrantVerifier::from_ed25519_pem(
+                ROUTE_GRANT_PUBLIC_KEY,
+            )
+            .unwrap(),
+        );
+        let node = spawn_node(ServerConfig {
             listen: "127.0.0.1:0".into(),
             control_plane_url: cp.base_url(),
             auth_token: SERVICE_TOKEN.into(),
-            route_grant_verifier: Arc::new(
-                cats_node_agent::route_grant::RouteGrantVerifier::from_ed25519_pem(
-                    ROUTE_GRANT_PUBLIC_KEY,
-                )
-                .unwrap(),
-            ),
-            gateway_url: gateway.base_url(),
-            cpus: 16,
-            memory_mib: 32_768,
-            initially_cordoned: false,
+            agent_registration: registration,
+            route_grant_verifier: route_grant_verifier.clone(),
             heartbeat_ms: 300,
             storage_meta,
             node: fake_node_config!(NodeConfigBuilder::new(dir.path(), id.to_string())
-                .with_state_dir(dir.path().join(format!("node-{id}")))
+                .with_state_dir(state_dir)
                 .with_metadata_store(metadata_store)
                 .with_object_store(object_store)),
         })
         .await
-        .unwrap()
+        .unwrap();
+        cats_control_plane::testsupport::register_legacy_test_node(
+            &cp.state.store,
+            id.to_string(),
+            node.base_url(),
+            gateway.base_url(),
+            16,
+            32_768,
+            route_grant_verifier.public_key_sha256().to_string(),
+        )
+        .await;
+        let runtime = node.state.runtime.clone();
+        let node_health = format!("{}/healthz", node.base_url());
+        let cp_heartbeat = format!("{}/v1/nodes/heartbeat", cp.base_url());
+        let node_id = id.to_string();
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            loop {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                if client.get(&node_health).send().await.is_err() {
+                    break;
+                }
+                let cats = runtime
+                    .snapshot()
+                    .into_iter()
+                    .map(|(cat_id, generation, state)| HeartbeatCat {
+                        cat_id,
+                        generation,
+                        state,
+                    })
+                    .collect();
+                let _ = client
+                    .post(&cp_heartbeat)
+                    .bearer_auth(SERVICE_TOKEN)
+                    .json(&HeartbeatRequest {
+                        node_id: node_id.clone(),
+                        cats,
+                        telemetry: None,
+                    })
+                    .send()
+                    .await;
+            }
+        });
+        node
     }
 
     /// Run the real `cats` binary; returns (exit_ok, stdout, stderr).

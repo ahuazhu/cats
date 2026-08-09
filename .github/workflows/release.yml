@@ -35,8 +35,37 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  guest-runtime-release:
+    name: Shared Guest runtime release
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the one Guest payload
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -qy busybox-static cpio zstd gzip e2fsprogs debootstrap musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --locked --release -p cats-guest-agent --target x86_64-unknown-linux-musl
+          sudo env \
+            HOME=/root \
+            GUEST_AGENT_BIN="$PWD/target/x86_64-unknown-linux-musl/release/cats-guest-agent" \
+            OUT="$RUNNER_TEMP/guest-build" \
+            RELEASE_OUT="$PWD/guest-runtime-release.v1" \
+            deploy/metal/build-guest-image.sh
+          sudo chown -R "$USER:$USER" guest-runtime-release.v1
+          find guest-runtime-release.v1 -type f -exec sha256sum {} + | LC_ALL=C sort
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guest-runtime-release-v1
+          path: guest-runtime-release.v1
+          if-no-files-found: error
+          retention-days: 1
+
   control-plane-image:
     name: Control-plane image
+    needs: guest-runtime-release
     runs-on: ubuntu-latest
     timeout-minutes: 60
     outputs:
@@ -44,6 +73,11 @@ jobs:
       tag: ${{ steps.meta.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: guest-runtime-release-v1
+          path: guest-runtime-release.v1
 
       - name: Derive image tag
         id: meta
@@ -97,10 +131,16 @@ jobs:
 
   worker-bundle:
     name: Metal worker bundle
+    needs: guest-runtime-release
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: guest-runtime-release-v1
+          path: guest-runtime-release.v1
 
       - uses: docker/setup-buildx-action@v3
 
@@ -123,7 +163,8 @@ jobs:
         run: |
           set -euo pipefail
           ls -l worker-out
-          tar -C worker-out -cf - . | zstd -19 -T0 -o cats-worker.tar.zst
+          tar --owner=0 --group=0 --numeric-owner -C worker-out -cf - . \
+            | zstd -19 -T0 -o cats-worker.tar.zst
           sha256=$(sha256sum cats-worker.tar.zst | cut -d' ' -f1)
           echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
           {

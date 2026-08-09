@@ -28,9 +28,8 @@ use cats_api::metering::{
 use cats_api::nodejob::{JobPhase, NodeJob};
 use cats_api::oci::{DeployOciRequest, OciDeployment};
 use cats_api::requests::{
-    ExecRequest, ExecResponse, HeartbeatCat, HeartbeatRequest, NodeWorkStatusRequest,
-    ProxyHttpRequest, RegisterNodeRequest, ShellClientControl, ShellServerControl,
-    MAX_SHELL_MESSAGE_BYTES,
+    ExecRequest, ExecResponse, NodeWorkStatusRequest, ProxyHttpRequest, ShellClientControl,
+    ShellServerControl, MAX_SHELL_MESSAGE_BYTES,
 };
 use cats_api::resources::{CatResourceTelemetry, NodeTelemetry};
 use cats_api::route_grant::{ROUTE_GRANT_REJECTION_EXPIRED, ROUTE_GRANT_REJECTION_HEADER};
@@ -92,19 +91,14 @@ async fn watch_guest_work(
 #[derive(Clone)]
 pub struct ServerConfig {
     pub listen: String,
-    /// URL other components use to reach this node. Required when `listen`
-    /// uses a wildcard address such as `0.0.0.0:7301`.
-    pub advertise_url: Option<String>,
     pub control_plane_url: String,
     pub auth_token: String,
+    /// Closed local Node identity, durable registration state, and signer.
+    pub agent_registration: crate::agent_registration::AgentRegistrationConfig,
     /// Public-key verifier for control-plane signed Endpoint Route Grants.
     pub route_grant_verifier: Arc<crate::route_grant::RouteGrantVerifier>,
-    pub gateway_url: String,
-    pub cpus: u32,
-    pub memory_mib: u64,
-    /// Ask the control plane to keep only a never-before-seen node out of
-    /// placement until an administrator validates and uncordons it.
-    pub initially_cordoned: bool,
+    /// Local telemetry sampling cadence. It no longer drives the removed
+    /// `/v1/nodes/heartbeat` transport.
     pub heartbeat_ms: u64,
     pub node: NodeConfig,
     pub storage_meta: Arc<dyn MetadataStore>,
@@ -116,6 +110,8 @@ pub struct NodeState {
     pub cfg: Arc<ServerConfig>,
     client: reqwest::Client,
     usage_pipeline: Arc<UsageMeteringPipeline>,
+    /// Already durable before any runtime gate or listener is opened.
+    pub agent_session: Arc<cats_api::runtime_reconciliation::AgentSession>,
 }
 
 pub struct Handle {
@@ -1850,72 +1846,6 @@ fn compact_pending_checkpoints(checkpoints: Vec<CatUsageCheckpoint>) -> Vec<CatU
     compacted
 }
 
-/// Retry cadence for control-plane exchanges.
-///
-/// The V1 agent keeps serving its local runtime through a control-plane outage,
-/// so the retry has to be patient rather than fast: an outage lasting hours
-/// must not become a 200 ms spin. The ceiling only bounds
-/// how long a recovered control plane waits to hear from this node again.
-const CONTROL_PLANE_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
-const CONTROL_PLANE_MAX_BACKOFF: Duration = Duration::from_secs(30);
-
-/// Reachability of the control plane, as this agent last observed it.
-///
-/// The target reconciliation model calls the unreachable side the
-/// `ControlPlaneDisconnected` condition. V1 has no Conditions API, so this stays
-/// internal state driving one log line per transition — it is deliberately not
-/// exposed over HTTP, and in particular not through `/healthz`, which means
-/// process liveness and nothing else.
-struct ControlPlaneLink {
-    node_id: String,
-    control_plane_url: String,
-    /// Starts optimistic so the first failed exchange logs the transition.
-    connected: bool,
-    backoff: Duration,
-}
-
-impl ControlPlaneLink {
-    fn new(node_id: String, control_plane_url: String) -> Self {
-        Self {
-            node_id,
-            control_plane_url,
-            connected: true,
-            backoff: CONTROL_PLANE_INITIAL_BACKOFF,
-        }
-    }
-
-    /// Record one failed exchange and return how long to wait before retrying.
-    fn record_failure(&mut self, reason: &str) -> Duration {
-        if self.connected {
-            self.connected = false;
-            tracing::warn!(
-                node = %self.node_id,
-                control_plane = %self.control_plane_url,
-                reason,
-                "control plane disconnected; the node agent keeps serving its local runtime and keeps retrying"
-            );
-        }
-        let delay = self.backoff;
-        self.backoff = self
-            .backoff
-            .saturating_mul(2)
-            .min(CONTROL_PLANE_MAX_BACKOFF);
-        delay
-    }
-
-    fn record_success(&mut self) {
-        if !self.connected {
-            self.connected = true;
-            tracing::info!(
-                node = %self.node_id,
-                control_plane = %self.control_plane_url,
-                "control plane reconnected"
-            );
-        }
-        self.backoff = CONTROL_PLANE_INITIAL_BACKOFF;
-    }
-}
-
 /// One operator-readable line naming every Cat adoption refused, and why.
 fn residue_summary(residue: &[(String, String)]) -> String {
     if residue.is_empty() {
@@ -1928,90 +1858,10 @@ fn residue_summary(residue: &[(String, String)]) -> String {
         .join("; ")
 }
 
-/// One registration attempt. `None` means the control plane accepted it; `Some`
-/// carries how long the caller should wait before trying again.
-///
-/// Used directly at startup so that `spawn` still means "registered" whenever
-/// the control plane is reachable, without ever blocking on one that is not.
-async fn try_register_once(
-    client: &reqwest::Client,
-    control_plane_url: &str,
-    auth_token: &str,
-    request: &RegisterNodeRequest,
-    link: &mut ControlPlaneLink,
-) -> Option<Duration> {
-    match client
-        .post(format!("{control_plane_url}/v1/nodes/register"))
-        .bearer_auth(auth_token)
-        .json(request)
-        .send()
-        .await
-    {
-        Ok(response) if response.status().is_success() => {
-            link.record_success();
-            tracing::info!(
-                node = %request.node_id,
-                agent_url = %request.agent_url,
-                "node agent registered"
-            );
-            None
-        }
-        Ok(response) => {
-            Some(link.record_failure(&format!("registration returned {}", response.status())))
-        }
-        Err(error) => Some(link.record_failure(&format!("registration request failed: {error}"))),
-    }
-}
-
-/// Register until the control plane accepts, retrying indefinitely.
-///
-/// A control-plane outage must not end the V1 node-agent process. This also
-/// runs before every heartbeat run, not only at startup, because the control
-/// plane's heartbeat handler looks the node up and rejects an unknown one — a
-/// control plane that lost this node re-learns it here instead of needing an
-/// agent restart.
-async fn register_until_accepted(
-    client: &reqwest::Client,
-    control_plane_url: &str,
-    auth_token: &str,
-    request: &RegisterNodeRequest,
-    link: &mut ControlPlaneLink,
-) {
-    while let Some(backoff) =
-        try_register_once(client, control_plane_url, auth_token, request, link).await
-    {
-        tokio::time::sleep(backoff).await;
-    }
-}
-
-/// Heartbeat on the configured interval until one fails, then return so the
-/// caller can register again.
-///
-/// The reported inventory is exactly [`NodeRuntime::snapshot`]: a Cat whose V1
-/// adoption proof was refused is absent from it and must stay absent. Reporting
-/// it as `Cold` would tell the control plane the disk was released while an old
-/// blockd may still hold its lease; omitting it only keeps the node Lost.
-async fn heartbeat_until_failure(
-    state: &NodeState,
-    client: &reqwest::Client,
-    control_plane_url: &str,
-    auth_token: &str,
-    interval: Duration,
-    link: &mut ControlPlaneLink,
-) {
+async fn sample_usage(state: &NodeState, interval: Duration) {
     loop {
         tokio::time::sleep(interval).await;
-        let cats: Vec<HeartbeatCat> = state
-            .runtime
-            .snapshot()
-            .into_iter()
-            .map(|(cat_id, generation, state)| HeartbeatCat {
-                cat_id,
-                generation,
-                state,
-            })
-            .collect();
-        let (telemetry, persisted) = state
+        let (_, persisted) = state
             .usage_pipeline
             .sample(state.runtime.telemetry(), state.runtime.telemetry_targets());
         if let Err(error) = persisted {
@@ -2020,52 +1870,32 @@ async fn heartbeat_until_failure(
                 "usage checkpoints are not durable; billing remains failed closed"
             );
         }
-        // Liveness owns this channel alone. Sampling above is local work
-        // against the durable spool; nothing else in this loop may await a
-        // remote call, because the interval between heartbeats is what the
-        // control plane reads as "this Host is alive". Usage upload used to run
-        // here and its 10 s client timeout was enough, on its own, to push the
-        // gap past the node lease and have the Host declared Lost. The
-        // registration retry this loop returns to is not an exception: it only
-        // runs once the control plane is already unreachable, so there is no
-        // liveness left to protect.
-        let sent = client
-            .post(format!("{control_plane_url}/v1/nodes/heartbeat"))
-            .bearer_auth(auth_token)
-            .json(&HeartbeatRequest {
-                node_id: state.cfg.node.node_id.clone(),
-                cats,
-                telemetry: Some(telemetry),
-            })
-            .send()
-            .await;
-        let reason = match sent {
-            Ok(response) if response.status().is_success() => {
-                link.record_success();
-                continue;
-            }
-            Ok(response) => format!("heartbeat returned {}", response.status()),
-            Err(error) => format!("heartbeat request failed: {error}"),
-        };
-        tokio::time::sleep(link.record_failure(&reason)).await;
-        return;
     }
 }
 
-/// Start the node agent: local inventory adoption, HTTP server, then a
-/// background registration + heartbeat loop.
-///
-/// Returns once the agent is serving. Reaching the control plane is not a
-/// precondition: a control plane that is down at startup leaves this node
-/// disconnected but running, not dead.
+/// Start the Node only after its exact pending registration has produced a
+/// validated and durable AgentSession. No runtime gate or listener opens first.
 pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
     anyhow::ensure!(cfg.heartbeat_ms > 0, "heartbeat interval must be positive");
     anyhow::ensure!(
         cfg.node.metering_cgroup_root.is_none() || cfg.heartbeat_ms <= 1_000,
         "authoritative billing requires a heartbeat/sample interval of at most 1000ms"
     );
+    anyhow::ensure!(
+        cfg.node.node_id == cfg.agent_registration.identity().node_id.as_str(),
+        "Node runtime identity does not match the installed NodeIdentity"
+    );
+    anyhow::ensure!(
+        cfg.node.state_dir == cfg.agent_registration.state_path(),
+        "Node runtime state path does not match the installed NodeIdentity"
+    );
+    let agent_session = Arc::new(
+        cfg.agent_registration
+            .register_until_session(&cfg.control_plane_url)
+            .await
+            .context("establish durable Agent session")?,
+    );
     crate::runtime::initialize_metering_cgroup(&cfg.node)?;
-    std::fs::create_dir_all(&cfg.node.state_dir)?;
     let usage_pipeline = Arc::new(UsageMeteringPipeline::open(
         cfg.node.node_id.clone(),
         cfg.node.state_dir.clone(),
@@ -2123,6 +1953,7 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
         cfg: cfg.clone(),
         client: client.clone(),
         usage_pipeline: usage_pipeline.clone(),
+        agent_session,
     };
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen)
@@ -2136,77 +1967,13 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
         }
     });
 
-    let agent_url = cfg
-        .advertise_url
-        .clone()
-        .unwrap_or_else(|| format!("http://{addr}"));
-    anyhow::ensure!(
-        reqwest::Url::parse(&agent_url).is_ok_and(|url| matches!(url.scheme(), "http" | "https")
-            && url.has_host()
-            && !url.cannot_be_a_base()),
-        "node advertise URL must be an absolute HTTP(S) URL"
-    );
-    let register = RegisterNodeRequest {
-        node_id: cfg.node.node_id.clone(),
-        agent_url,
-        gateway_url: cfg.gateway_url.clone(),
-        cpus: cfg.cpus,
-        memory_mib: cfg.memory_mib,
-        route_grant_public_key_sha256: Some(
-            cfg.route_grant_verifier.public_key_sha256().to_string(),
-        ),
-        initially_cordoned: cfg.initially_cordoned,
-    };
     let cp = cfg.control_plane_url.trim_end_matches('/').to_string();
     let token = cfg.auth_token.clone();
 
-    // One synchronous registration attempt before returning. Dropping the old
-    // blocking registration entirely would have quietly changed a contract
-    // callers depend on: `spawn` returning used to mean "the control plane
-    // knows this node", so anything that starts an agent and immediately
-    // addresses it by id -- the e2e cluster harness cordoning a node it just
-    // started, an operator scripting against `READY` -- would now race.
-    //
-    // An unreachable control plane must not end the process, but that does not
-    // mean startup should skip its synchronous best-effort announcement. Try
-    // once, keep the guarantee whenever the control plane is up, and hand an
-    // unreachable one to the retry loop instead of dying on it.
-    let mut link = ControlPlaneLink::new(cfg.node.node_id.clone(), cp.clone());
-    let registered = try_register_once(&client, &cp, &token, &register, &mut link)
-        .await
-        .is_none();
-    if !registered {
-        tracing::warn!(
-            node = %cfg.node.node_id,
-            "starting without a control-plane registration; serving the local runtime and retrying in the background"
-        );
-    }
-
-    // Connection loop: ensure registered, heartbeat until one fails, register
-    // again. Registration has to precede heartbeats — the control plane's
-    // heartbeat handler rejects a node it does not know — and it is retried
-    // rather than fatal, so a control plane that is down at startup or that
-    // forgot this node needs no agent restart.
-    let hb_state = state.clone();
-    let hb_client = client.clone();
-    let hb_cp = cp.clone();
-    let hb_token = token.clone();
-    let interval = Duration::from_millis(cfg.heartbeat_ms);
-    let connection = tokio::spawn(async move {
-        let mut registered = registered;
-        loop {
-            // `take` consumes the startup registration exactly once: the first
-            // pass skips re-registering if it already succeeded, and every
-            // later pass follows a failed heartbeat and must register again.
-            if !std::mem::take(&mut registered) {
-                register_until_accepted(&hb_client, &hb_cp, &hb_token, &register, &mut link).await;
-            }
-            heartbeat_until_failure(
-                &hb_state, &hb_client, &hb_cp, &hb_token, interval, &mut link,
-            )
-            .await;
-        }
-    });
+    let sampling_state = state.clone();
+    let sampling_interval = Duration::from_millis(cfg.heartbeat_ms);
+    let telemetry_sampler =
+        tokio::spawn(async move { sample_usage(&sampling_state, sampling_interval).await });
 
     // Usage upload: its own channel, best effort. It may be slow, it may fail,
     // it may back off for a minute -- none of that is allowed to reach liveness
@@ -2302,7 +2069,7 @@ pub async fn spawn(cfg: ServerConfig) -> anyhow::Result<Handle> {
         state,
         tasks: vec![
             server,
-            connection,
+            telemetry_sampler,
             usage_uploader,
             residue_sweeper,
             activity_watchers,

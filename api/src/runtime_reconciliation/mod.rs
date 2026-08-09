@@ -19,6 +19,8 @@ mod canonical;
 mod types;
 mod wire;
 
+pub(crate) use canonical::value_bytes as canonical_json_value_bytes;
+
 pub use canonical::{
     canonical_ed25519_spki_sha256, checkpoint_content_digest, guest_config_digest,
     inventory_digest, key_ring_digest, runtime_provisioner_active_set_digest, spec_digest,

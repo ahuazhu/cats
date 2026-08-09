@@ -86,10 +86,11 @@ locals {
     seed_temp=""
     route_grant_key_temp=""
     route_grant_key_fingerprint=""
+    archive_entries=""
     cleanup() {
       rm -rf -- "$stage_path"
       rm -f -- "$artifact_path"
-      for temporary_path in "$runtime_secret" "$runtime_overlay" "$environment_temp" "$seed_temp" "$route_grant_key_temp"; do
+      for temporary_path in "$runtime_secret" "$runtime_overlay" "$environment_temp" "$seed_temp" "$route_grant_key_temp" "$archive_entries"; do
         if [ -n "$temporary_path" ]; then
           rm -f -- "$temporary_path"
         fi
@@ -97,9 +98,20 @@ locals {
     }
     trap cleanup EXIT
 
+    "$stage_path/validate-node-identity-installation.sh"
+
     aws s3 cp --no-progress "s3://${aws_s3_bucket.artifacts.id}/${aws_s3_object.worker_bundle.key}" "$artifact_path"
     echo "${var.worker_bundle_sha256}  $artifact_path" | sha256sum --check --strict -
+    archive_entries="$(mktemp /var/tmp/cats-worker-entries.XXXXXX)"
+    tar --zstd -tf "$artifact_path" > "$archive_entries"
+    awk '
+      /^\// || /(^|\/)\.\.($|\/)/ { exit 1 }
+      seen[$0]++ { exit 1 }
+    ' "$archive_entries"
+    tar --zstd -tvf "$artifact_path" | awk 'substr($1,1,1) !~ /^[-d]$/ { exit 1 }'
     tar --zstd -xf "$artifact_path" -C "$stage_path"
+    "$stage_path/install-guest-runtime-release.sh" verify \
+      "$stage_path/guest-runtime-release.v1"
 
     cgroup_mount="$(findmnt --noheadings --first-only --types cgroup2 --output TARGET)"
 
@@ -144,6 +156,10 @@ locals {
     )"
     printf '%s' "$route_grant_key_fingerprint" | grep -Eq '^[0-9a-f]{64}$'
 
+    # Stop only after every staged artifact and verification input has passed
+    # its read-only checks, immediately before the first installed byte changes.
+    systemctl stop cats-worker
+
     # -D creates the parent directory. Without it a host that has never been
     # touched by install.sh fails here: /opt/cats/bin does not exist yet, and
     # the association only ever ran against hosts that had been set up by hand.
@@ -153,6 +169,7 @@ locals {
     install -D -m 0755 "$stage_path/update-guest-seed.sh" "${var.install_root}/bin/update-guest-seed"
     install -D -m 0755 "$stage_path/require-idle-worker.sh" "${var.install_root}/bin/require-idle-worker"
     install -D -m 0755 "$stage_path/render-postgres-url.sh" "${var.install_root}/bin/render-postgres-url"
+    install -D -m 0755 "$stage_path/install-guest-runtime-release.sh" "${var.install_root}/bin/install-guest-runtime-release"
     install -m 0644 "$stage_path/cats-worker.service" /etc/systemd/system/cats-worker.service
     install -m 0644 "$stage_path/cats-postgres-url.service" /etc/systemd/system/cats-postgres-url.service
     install -m 0644 "$stage_path/cats-postgres-url.timer" /etc/systemd/system/cats-postgres-url.timer
@@ -164,6 +181,8 @@ locals {
         | awk '{print $1}'
     )"
     test "$installed_route_grant_key_fingerprint" = "$route_grant_key_fingerprint"
+    "${var.install_root}/bin/install-guest-runtime-release" install \
+      "$stage_path/guest-runtime-release.v1"
 
     runtime_secret="$(mktemp /var/tmp/cats-worker-runtime.XXXXXX)"
     runtime_overlay="$(mktemp /var/tmp/cats-worker-overlay.XXXXXX)"
@@ -199,28 +218,12 @@ CATS_MANAGED_ENVIRONMENT
     # production path ever created the non-secret half of the configuration.
     # Seed it once; an existing file is left alone so operator edits survive.
     if [ ! -f "${var.worker_environment_file}" ]; then
-      # Node identity is per worker, never fleet-shared configuration: a
-      # second host seeded from a shared map would register as a duplicate of
-      # the first. The name is this association's worker key; the advertise
-      # address is the host's own primary private IP from IMDSv2.
-      #
-      # The seed is assembled in a temporary file and only installed at the
-      # final path once every fallible step has succeeded. Writing the final
-      # path first would let an IMDS failure strand a worker.env without
-      # identity that no later run repairs, because seeding only happens when
-      # the file is absent.
-      imds_token="$(curl -fsS -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')"
-      private_ipv4="$(curl -fsS -H "X-aws-ec2-metadata-token: $imds_token" http://169.254.169.254/latest/meta-data/local-ipv4)"
-      test -n "$private_ipv4"
-
+      # Identity is never environment or IMDS data. The provisioner must have
+      # installed the closed /etc/cats/identity artifact before this release.
       seed_temp="$(mktemp /var/tmp/cats-worker-seed.XXXXXX)"
       cat > "$seed_temp" <<'CATS_BASE_ENVIRONMENT'
 ${local.worker_base_environment}
 CATS_BASE_ENVIRONMENT
-      {
-        echo "CATS_NODE_ID=__CATS_WORKER_NAME__"
-        echo "CATS_NODE_ADVERTISE_URL=http://$private_ipv4:7301"
-      } >> "$seed_temp"
 
       mkdir -p "$(dirname "${var.worker_environment_file}")"
       install -o root -g root -m 0600 "$seed_temp" "${var.worker_environment_file}"
@@ -262,9 +265,8 @@ CATS_BASE_ENVIRONMENT
     ' "$runtime_overlay" "${var.worker_environment_file}" > "$environment_temp"
     install -o root -g root -m 0600 "$environment_temp" "${var.worker_environment_file}"
 
-    # Replace the golden RootDisk immediately before stopping the idle node. This
-    # minimizes the window in which a create request could reuse the old
-    # in-memory golden-root ID after the on-disk seed has changed.
+    # Replace the golden RootDisk while the worker remains stopped. No create
+    # can observe a new seed under an in-memory ID computed from the old bytes.
     "${var.install_root}/bin/update-guest-seed" \
       "${var.install_root}/guest/rootfs.ext4" \
       "$stage_path/cats-guest-agent" \
@@ -279,7 +281,6 @@ CATS_BASE_ENVIRONMENT
     systemctl enable --now cats-postgres-url.timer
     systemctl start cats-postgres-url.service
 
-    systemctl stop cats-worker
     systemctl start cats-worker
     systemctl is-active --quiet cats-worker
     echo "Route Grant verifier key: $installed_route_grant_key_fingerprint"
@@ -480,7 +481,7 @@ resource "aws_ssm_association" "worker_deploy" {
   parameters = {
     # The script is shared across the fleet except for the one line where a
     # fresh host learns who it is.
-    commands = replace(local.deployment_script, "__CATS_WORKER_NAME__", each.key)
+    commands = local.deployment_script
   }
 
   targets {

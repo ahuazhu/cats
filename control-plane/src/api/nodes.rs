@@ -1,35 +1,6 @@
 use super::*;
 use std::sync::Arc;
 
-pub(super) async fn register_node(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(req): Json<RegisterNodeRequest>,
-) -> ApiResult<StatusCode> {
-    check_service_auth(&state, &headers).await?;
-    let expected_fingerprint = state.cfg.route_grant_signer.public_key_sha256().to_string();
-    state
-        .store
-        .execute(move |store| {
-            let admission = crate::store::NodeAdmission::for_route_grant(
-                req.initially_cordoned,
-                req.route_grant_public_key_sha256.as_deref(),
-                &expected_fingerprint,
-            );
-            store.register_node_with_admission(
-                &req.node_id,
-                &req.agent_url,
-                &req.gateway_url,
-                req.cpus,
-                req.memory_mib,
-                admission,
-            )
-        })
-        .await?;
-    state.notify.notify_one();
-    Ok(StatusCode::NO_CONTENT)
-}
-
 pub(super) async fn heartbeat(
     State(state): State<AppState>,
     headers: HeaderMap,

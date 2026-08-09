@@ -5,8 +5,9 @@
 //! that credential to select and lock the provisioned `NodeIdentity` before it
 //! considers any identity claimed by the registration attempt.
 
-use std::time::Duration;
-
+use cats_api::agent_registration::{
+    validate_state_path_component, AuthenticatedNodeCredential, AGENT_SESSION_LEASE_MS,
+};
 use cats_api::runtime_reconciliation::{
     decode_agent_registration_attempt, decode_agent_session, decode_node_identity,
     encode_agent_registration_attempt, encode_agent_session, encode_node_identity,
@@ -37,68 +38,24 @@ const CURRENT_SESSION_COLUMNS: &str = "
 pub(super) const PROVISIONED_NODE_ID_PAGE_SIZE: usize = 64;
 const PROVISIONED_NODE_ID_QUERY_LIMIT: i64 = PROVISIONED_NODE_ID_PAGE_SIZE as i64;
 
-/// The exact identity produced by a successful per-Node authentication check.
-///
-/// It deliberately contains neither `node_id` nor Host identity. Those values
-/// only come from the provisioned `NodeIdentity` selected by `credential_id`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code, reason = "consumed by the Node registration service slice")]
-pub(crate) struct AuthenticatedNodeCredential {
-    credential_id: Id,
-    binding: CredentialBinding,
-}
-
-#[allow(dead_code, reason = "consumed by the Node registration service slice")]
-impl AuthenticatedNodeCredential {
-    pub(crate) fn new(credential_id: Id, binding: CredentialBinding) -> Self {
-        Self {
-            credential_id,
-            binding,
-        }
-    }
-
-    pub(super) fn credential_id(&self) -> &Id {
-        &self.credential_id
-    }
-
-    pub(super) fn binding(&self) -> &CredentialBinding {
-        &self.binding
-    }
-}
-
 /// Process-lifetime registration policy derived from one validated release
-/// artifact and one positive configured lease duration.
+/// artifact. The lease is the fixed V1 protocol constant, not configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code, reason = "consumed by the Node registration service slice")]
 pub(crate) struct AgentSessionRegistrationPolicy {
     approved_guest_config_digest: Sha256Digest,
-    lease_duration_ms: u64,
 }
 
 #[allow(dead_code, reason = "consumed by the Node registration service slice")]
 impl AgentSessionRegistrationPolicy {
-    pub(crate) fn from_release_receipt(
-        receipt: &GuestRuntimeProfileReceipt,
-        lease_duration: Duration,
-    ) -> Result<Self> {
+    pub(crate) fn from_release_receipt(receipt: &GuestRuntimeProfileReceipt) -> Result<Self> {
         let approved_guest_config_digest = guest_config_digest(receipt).map_err(|error| {
             super::ApiError::failed_precondition(format!(
                 "invalid active Guest runtime profile receipt: {error}"
             ))
         })?;
-        let lease_duration_ms = u64::try_from(lease_duration.as_millis()).map_err(|_| {
-            super::ApiError::failed_precondition(
-                "Agent session lease duration exceeds the runtime wire range",
-            )
-        })?;
-        if lease_duration_ms == 0 || lease_duration_ms > i64::MAX.unsigned_abs() {
-            return Err(super::ApiError::failed_precondition(
-                "Agent session lease duration must be a positive PostgreSQL BIGINT millisecond value",
-            ));
-        }
         Ok(Self {
             approved_guest_config_digest,
-            lease_duration_ms,
         })
     }
 
@@ -330,6 +287,9 @@ impl Store {
                 "a newly provisioned NodeIdentity must be provisioned",
             ));
         }
+        validate_state_path_component(&identity.state_path_id).map_err(|_| {
+            super::ApiError::invalid("NodeIdentity state_path_id is not a safe path component")
+        })?;
         self.authority_transaction(|transaction| {
             let committed_at = database_now(transaction)?;
             let inserted = insert_node_identity_in(transaction, identity, committed_at)?;
@@ -552,12 +512,15 @@ fn register_agent_session_in(
     policy: &AgentSessionRegistrationPolicy,
 ) -> AuthorityTxResult<AgentRegistrationOutcome> {
     let Some(identity) =
-        load_identity_by_credential_for_update(transaction, &authenticated.credential_id)?
+        load_identity_by_credential_for_update(transaction, authenticated.credential_id())?
     else {
         return Ok(identity_rejected());
     };
-    if identity.credential_id != authenticated.credential_id
-        || identity.credential_binding != authenticated.binding
+    if !matches!(
+        &identity.credential_binding,
+        CredentialBinding::PublicKey { .. }
+    ) || identity.credential_id != *authenticated.credential_id()
+        || identity.credential_binding != *authenticated.binding()
         || identity.node_id != attempt.node_id
     {
         return Ok(identity_rejected());
@@ -622,7 +585,7 @@ fn register_agent_session_in(
     let now = database_now(transaction)?;
     let lease_deadline_unix_ms = now
         .get()
-        .checked_add(policy.lease_duration_ms)
+        .checked_add(AGENT_SESSION_LEASE_MS)
         .and_then(UnixMillis::new)
         .ok_or_else(|| corrupt("Agent session lease deadline overflow"))?;
     let session = AgentSession {

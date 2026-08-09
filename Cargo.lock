@@ -978,6 +978,8 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "hex",
+ "libc",
+ "ring",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1080,6 +1082,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac 0.12.1",
+ "http-body-util",
  "jsonwebtoken",
  "native-tls",
  "postgres",
@@ -1101,6 +1104,7 @@ name = "cats-control-plane-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cats-api",
  "cats-control-plane",
  "cats-metadata-store-postgres",
  "cats-metadata-store-sqlite",
@@ -1268,7 +1272,6 @@ dependencies = [
  "cats-node-agent",
  "cats-storage",
  "clap",
- "libc",
  "tempfile",
  "tokio",
  "tracing",

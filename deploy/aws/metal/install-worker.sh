@@ -6,10 +6,15 @@ set -euo pipefail
 CATS_REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
 CATS_PREFIX=/opt/cats
 CATS_CH_VERSION=${CATS_CH_VERSION:-v53.0}
+GUEST_RUNTIME_RELEASE_SOURCE=${CATS_GUEST_RUNTIME_RELEASE_DIR:-}
 
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 [[ $(uname -m) == x86_64 ]] || { echo "x86_64 is required" >&2; exit 1; }
 [[ -e /dev/kvm ]] || { echo "/dev/kvm missing: use a bare-metal instance" >&2; exit 1; }
+[[ -d $GUEST_RUNTIME_RELEASE_SOURCE ]] || {
+  echo "CATS_GUEST_RUNTIME_RELEASE_DIR must name the qualified guest-runtime-release.v1 payload" >&2
+  exit 1
+}
 
 # Validate every required operator input before apt, build, installed-file or
 # systemd mutation. Staging closes the validate/use race if the supplied path
@@ -32,26 +37,7 @@ install -m 0600 "$ROUTE_GRANT_PUBLIC_KEY_SOURCE" "$ROUTE_GRANT_PUBLIC_KEY_STAGE"
 "$CATS_REPO/deploy/aws/metal/validate-route-grant-public-key.sh" \
   "$ROUTE_GRANT_PUBLIC_KEY_STAGE"
 
-validate_worker_identity() {
-  local worker_node_id worker_advertise_url
-
-  # Read the last assignment, matching systemd EnvironmentFile semantics,
-  # without sourcing operator-controlled shell text.
-  worker_node_id=$(awk -F= '$1 == "CATS_NODE_ID" { value = substr($0, index($0, "=") + 1) } END { print value }' /etc/cats/worker.env)
-  worker_advertise_url=$(awk -F= '$1 == "CATS_NODE_ADVERTISE_URL" { value = substr($0, index($0, "=") + 1) } END { print value }' /etc/cats/worker.env)
-  if [[ -z $worker_node_id || $worker_node_id == REPLACE_WITH_UNIQUE_NODE_ID ]]; then
-    echo "/etc/cats/worker.env needs a unique CATS_NODE_ID before the worker can start" >&2
-    exit 1
-  fi
-  if [[ -z $worker_advertise_url || $worker_advertise_url == *PRIVATE_IPV4* ]]; then
-    echo "/etc/cats/worker.env needs this host's CATS_NODE_ADVERTISE_URL before the worker can start" >&2
-    exit 1
-  fi
-}
-
-# Refuse a copied example before downloading packages or building binaries: a
-# duplicate node identity sends this host's jobs to a different worker.
-[[ ! -f /etc/cats/worker.env ]] || validate_worker_identity
+"$CATS_REPO/deploy/aws/metal/validate-node-identity-installation.sh"
 
 # SSM RunShellScript and cloud-init use non-login root shells where HOME may
 # be absent. rustup and cargo still need a stable home before the guest-image
@@ -133,6 +119,8 @@ install -o root -g root -m 0644 "$ROUTE_GRANT_PUBLIC_KEY_STAGE" \
 install -m 0755 "$CATS_REPO/target/release/cats-noded" "$CATS_PREFIX/bin/cats-noded"
 install -m 0755 "$CATS_REPO/target/release/cats-blockd" "$CATS_PREFIX/bin/cats-blockd"
 install -m 0755 "$CATS_REPO/target/release/cats-guest-agent" "$CATS_PREFIX/bin/cats-guest-agent"
+install -m 0755 "$CATS_REPO/deploy/aws/metal/install-guest-runtime-release.sh" \
+  "$CATS_PREFIX/bin/install-guest-runtime-release"
 
 if [[ ! -x "$CATS_PREFIX/bin/cloud-hypervisor" ]]; then
   curl -fsSL -o "$CATS_PREFIX/bin/cloud-hypervisor" \
@@ -151,7 +139,9 @@ printf 'net.ipv4.ip_forward=1\nnet.ipv4.conf.all.rp_filter=1\nnet.ipv4.conf.defa
 CATS_GUEST_NETWORK_CIDR=${CATS_GUEST_NETWORK_CIDR:-10.240.0.0/16} \
   "$CATS_PREFIX/bin/setup-guest-network"
 
-OUT="$CATS_PREFIX/guest" "$CATS_REPO/deploy/metal/build-guest-image.sh"
+"$CATS_PREFIX/bin/install-guest-runtime-release" verify "$GUEST_RUNTIME_RELEASE_SOURCE"
+systemctl stop cats-worker 2>/dev/null || true
+"$CATS_PREFIX/bin/install-guest-runtime-release" install "$GUEST_RUNTIME_RELEASE_SOURCE"
 curl -fsSL https://truststore.pki.rds.amazonaws.com/us-east-1/us-east-1-bundle.pem \
   -o /etc/cats/rds-ca.pem
 chmod 0644 /etc/cats/rds-ca.pem
