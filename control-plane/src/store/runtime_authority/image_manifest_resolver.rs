@@ -1,5 +1,6 @@
 //! Bounded Control Plane adapter for immutable golden-image manifests.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,7 +18,42 @@ pub(crate) struct ImmutableImageManifestResolver {
     blob: Arc<dyn BlobStore>,
     active: Arc<tokio::sync::Semaphore>,
     queued: Arc<tokio::sync::Semaphore>,
+    inflight: Arc<InflightReads>,
     read_deadline: Duration,
+}
+
+#[derive(Default)]
+struct InflightReads {
+    count: AtomicUsize,
+    completed: tokio::sync::Notify,
+}
+
+impl InflightReads {
+    fn start(self: &Arc<Self>) -> InflightReadGuard {
+        self.count.fetch_add(1, Ordering::AcqRel);
+        InflightReadGuard(self.clone())
+    }
+
+    async fn wait_until_idle(&self) {
+        loop {
+            // Register before observing the counter so a completion between
+            // the two operations cannot become a lost wakeup.
+            let completed = self.completed.notified();
+            if self.count.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            completed.await;
+        }
+    }
+}
+
+struct InflightReadGuard(Arc<InflightReads>);
+
+impl Drop for InflightReadGuard {
+    fn drop(&mut self) {
+        self.0.count.fetch_sub(1, Ordering::AcqRel);
+        self.0.completed.notify_waiters();
+    }
 }
 
 impl ImmutableImageManifestResolver {
@@ -26,17 +62,29 @@ impl ImmutableImageManifestResolver {
             blob,
             active: Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_READS)),
             queued: Arc::new(tokio::sync::Semaphore::new(MAX_QUEUED_READS)),
+            inflight: Arc::new(InflightReads::default()),
             read_deadline: READ_DEADLINE,
         }
     }
 
-    pub(crate) fn shutdown(&self) {
+    pub(crate) fn begin_shutdown(&self) {
         // Closing the queue rejects new work. Closing the active semaphore
         // wakes every queued waiter without revoking permits already owned by
         // synchronous reads; those permits remain held until provider I/O
         // returns within its absolute transport deadline.
         self.queued.close();
         self.active.close();
+    }
+
+    /// Reject new reads, clear queued reads, and wait no longer than the same
+    /// absolute provider-I/O bound for already-active blocking reads to exit.
+    /// A false result means a provider violated its deadline; callers may
+    /// continue process shutdown and any eventual late result is discarded.
+    pub(crate) async fn shutdown(&self) -> bool {
+        self.begin_shutdown();
+        tokio::time::timeout(self.read_deadline, self.inflight.wait_until_idle())
+            .await
+            .is_ok()
     }
 
     #[cfg(test)]
@@ -80,12 +128,14 @@ impl CatCreateManifestResolver for ImmutableImageManifestResolver {
 
             let blob = self.blob.clone();
             let digest = boot_image_digest.clone();
+            let inflight = self.inflight.start();
             let task = tokio::task::spawn_blocking(move || {
                 // The active permit lives until synchronous provider I/O
                 // actually returns. Timing out the HTTP future therefore
                 // discards a late result without admitting replacement work
                 // above the fixed two-read bound.
                 let _active = active;
+                let _inflight = inflight;
                 read_image_manifest_until(blob.as_ref(), &digest, deadline)
             });
             let manifest = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), task)
@@ -447,7 +497,8 @@ mod tests {
         let queued = spawn_read(resolver.clone());
         wait_until(|| resolver.queued.available_permits() == MAX_QUEUED_READS - 1).await;
 
-        resolver.shutdown();
+        let shutdown_resolver = resolver.clone();
+        let shutdown = tokio::spawn(async move { shutdown_resolver.shutdown().await });
         let queued_error = queued.await.unwrap().unwrap_err();
         assert_eq!(queued_error.code, cats_api::error::ErrorCode::Unavailable);
         let digest = Sha256Digest::new(DIGEST).unwrap();
@@ -461,6 +512,37 @@ mod tests {
         for task in active {
             task.await.unwrap().unwrap();
         }
+        assert!(shutdown.await.unwrap());
         assert_eq!(blob.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_wait_is_bounded_and_late_provider_results_are_discarded() {
+        let resolver = Arc::new(ImmutableImageManifestResolver::with_deadline(
+            Arc::new(SlowBlob),
+            Duration::from_millis(20),
+        ));
+        let read_resolver = resolver.clone();
+        let read = tokio::spawn(async move {
+            let digest = Sha256Digest::new(DIGEST).unwrap();
+            read_resolver.resolve(&digest).await
+        });
+        wait_until(|| resolver.inflight.count.load(Ordering::SeqCst) == 1).await;
+
+        let started = Instant::now();
+        assert!(!resolver.shutdown().await);
+        assert!(started.elapsed() < Duration::from_millis(80));
+        assert_eq!(
+            read.await.unwrap().unwrap_err().code,
+            cats_api::error::ErrorCode::Unavailable
+        );
+        assert_eq!(resolver.inflight.count.load(Ordering::SeqCst), 1);
+
+        wait_until(|| resolver.inflight.count.load(Ordering::SeqCst) == 0).await;
+        let digest = Sha256Digest::new(DIGEST).unwrap();
+        assert_eq!(
+            resolver.resolve(&digest).await.unwrap_err().code,
+            cats_api::error::ErrorCode::Unavailable
+        );
     }
 }

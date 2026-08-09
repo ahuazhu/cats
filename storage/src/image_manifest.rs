@@ -5,12 +5,14 @@ use std::time::Instant;
 
 use cats_api::chunk::{CHUNK_SIZE, MAX_VOLUME_BYTES};
 use cats_api::runtime_reconciliation::Sha256Digest;
-use serde::{Deserialize, Serialize};
+use serde::de::{SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{BlobError, BlobStore};
 
 pub const IMAGE_MANIFEST_MAX_BYTES: usize = 32 * 1024 * 1024;
 pub const IMAGE_MANIFEST_VERSION: u16 = 1;
+const IMAGE_MANIFEST_MAX_CHUNKS: usize = (MAX_VOLUME_BYTES / CHUNK_SIZE as u64) as usize;
 
 /// A SHA-256 digest without the wire-level `sha256:` prefix.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -119,6 +121,7 @@ pub enum ImageManifestReadError {
 #[serde(deny_unknown_fields)]
 struct WireManifest {
     // Declaration order is the canonical JSON object member order.
+    #[serde(deserialize_with = "deserialize_bounded_chunks")]
     chunks: Vec<WireChunk>,
     image_id: String,
     size_bytes: u64,
@@ -132,6 +135,53 @@ struct WireChunk {
     chunk_idx: u64,
     len: u32,
     object_id: String,
+}
+
+fn deserialize_bounded_chunks<'de, D>(deserializer: D) -> Result<Vec<WireChunk>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedChunksVisitor;
+
+    impl<'de> Visitor<'de> for BoundedChunksVisitor {
+        type Value = Vec<WireChunk>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "at most {IMAGE_MANIFEST_MAX_CHUNKS} image manifest chunks"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            // Never trust an input-provided size hint as an allocation size.
+            // A maximum-size valid image has exactly this many chunks, so any
+            // 262145th entry is invalid independent of size_bytes and must be
+            // rejected while streaming the sequence rather than after a large
+            // untrusted Vec has already been built.
+            let mut chunks = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or(0)
+                    .min(IMAGE_MANIFEST_MAX_CHUNKS),
+            );
+            while let Some(chunk) = sequence.next_element()? {
+                if chunks.len() == IMAGE_MANIFEST_MAX_CHUNKS {
+                    return Err(serde::de::Error::invalid_length(
+                        IMAGE_MANIFEST_MAX_CHUNKS + 1,
+                        &self,
+                    ));
+                }
+                chunks.push(chunk);
+            }
+            Ok(chunks)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedChunksVisitor)
 }
 
 pub fn image_manifest_key(boot_image_digest: &Sha256Digest) -> String {
@@ -511,6 +561,28 @@ mod tests {
         assert!(encoded.len() < IMAGE_MANIFEST_MAX_BYTES);
         let decoded = decode_image_manifest(&encoded, &digest()).unwrap();
         assert_eq!(decoded.chunks.len(), 262_144);
+    }
+
+    #[test]
+    fn chunk_sequence_is_rejected_at_the_first_entry_above_the_volume_limit() {
+        let entry = "{\"chunk_idx\":0,\"len\":0,\"object_id\":\"\"}";
+        let mut bytes = String::with_capacity(entry.len() * (IMAGE_MANIFEST_MAX_CHUNKS + 1));
+        bytes.push_str("{\"chunks\":[");
+        for index in 0..=IMAGE_MANIFEST_MAX_CHUNKS {
+            if index != 0 {
+                bytes.push(',');
+            }
+            bytes.push_str(entry);
+        }
+        bytes.push_str(
+            "],\"image_id\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"size_bytes\":1099511627776,\"version\":1}",
+        );
+
+        assert!(bytes.len() < IMAGE_MANIFEST_MAX_BYTES);
+        assert_eq!(
+            decode_image_manifest(bytes.as_bytes(), &digest()),
+            Err(ImageManifestProblem::InvalidUtf8OrJson)
+        );
     }
 
     struct RecordingBlob {

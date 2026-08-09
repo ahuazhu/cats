@@ -1223,7 +1223,7 @@ async fn reconciler_handoff_replays_persisted_suspending_with_the_same_job() {
     // aborted. The node has already journaled success, so replaying the same
     // deterministic job returns without applying SuspendCat twice.
     let second = spawn(config).await.unwrap();
-    first.shutdown();
+    first.shutdown().await;
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let cat = second
@@ -1353,7 +1353,7 @@ async fn reconciler_handoff_replays_persisted_warming_success_once() {
     );
 
     let second = spawn(ctx.config.clone()).await.unwrap();
-    ctx.cp.shutdown();
+    ctx.cp.shutdown().await;
     let converged = wait_for_persisted_transition(
         &second,
         &created.cat.id,
@@ -1406,7 +1406,7 @@ async fn reconciler_handoff_replays_persisted_stopping_success_once() {
     );
 
     let second = spawn(ctx.config.clone()).await.unwrap();
-    ctx.cp.shutdown();
+    ctx.cp.shutdown().await;
     let converged = wait_for_persisted_transition(
         &second,
         &created.cat.id,
@@ -1458,7 +1458,7 @@ async fn reconciler_handoff_failed_warm_replay_restores_suspended_source() {
     );
 
     let second = spawn(ctx.config.clone()).await.unwrap();
-    ctx.cp.shutdown();
+    ctx.cp.shutdown().await;
     let retained = wait_for_persisted_transition(
         &second,
         &created.cat.id,
@@ -1518,7 +1518,7 @@ async fn reconciler_handoff_failed_stop_replay_restores_running_source() {
     );
 
     let second = spawn(ctx.config.clone()).await.unwrap();
-    ctx.cp.shutdown();
+    ctx.cp.shutdown().await;
     let retained = wait_for_persisted_transition(
         &second,
         &created.cat.id,
@@ -1564,7 +1564,7 @@ async fn reconciler_handoff_finishes_a_converged_operation_without_replaying_nod
     // before the matching operation did. Also seed an older operation, a
     // future-generation operation, and an operation whose Cat row is gone so
     // the recovery scan's generation and deletion boundaries are explicit.
-    ctx.cp.shutdown();
+    ctx.cp.shutdown().await;
     let dsn = match &ctx.config.control_store_dsn {
         DsnSource::Literal(dsn) => dsn.clone(),
         DsnSource::File(_) => panic!("the PostgreSQL test harness must use a literal DSN"),

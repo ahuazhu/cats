@@ -557,7 +557,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(task) = usage_projector_task {
         task.abort();
     }
-    handle.shutdown();
+    handle.shutdown().await;
     println!("SHUTDOWN");
     Ok(())
 }

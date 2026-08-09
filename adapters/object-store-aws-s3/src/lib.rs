@@ -24,6 +24,7 @@ const RETRY_ATTEMPTS: u32 = 5;
 const RETRY_INITIAL_DELAY_MS: u64 = 100;
 const RETRY_MAX_DELAY_MS: u64 = 3_000;
 const ERROR_RESPONSE_MAX_BYTES: usize = 8 * 1024;
+const CREDENTIAL_RESPONSE_MAX_BYTES: usize = 16 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -121,6 +122,10 @@ impl AwsS3BlobStore {
         }
         cfg.endpoint = endpoint.origin().ascii_serialization();
         let client = reqwest::blocking::Client::builder()
+            // Signed requests and link-local credential requests must never
+            // be replayed to a Location that was not part of the signature or
+            // exact credential-endpoint validation.
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(60))
             .build()
             .map_err(|e| BlobError::Backend {
@@ -536,39 +541,33 @@ fn load_imds_credentials(
     }
     const IMDS: &str = "http://169.254.169.254/latest";
     let initial_timeout = credential_timeout(deadline)?;
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(2).min(initial_timeout))
-        .timeout(initial_timeout)
-        .build()
-        .map_err(|error| BlobError::Backend {
-            key: "<credentials>".into(),
-            message: format!("build EC2 metadata client: {error}"),
-        })?;
-    let token = client
+    let client = credential_client(initial_timeout)?;
+    let token_response = client
         .put(format!("{IMDS}/api/token"))
         .timeout(credential_timeout(deadline)?)
         .header("x-aws-ec2-metadata-token-ttl-seconds", "21600")
         .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
-        .and_then(reqwest::blocking::Response::text)
         .map_err(|error| BlobError::Backend {
             key: "<credentials>".into(),
             message: format!("obtain EC2 metadata token: {error}"),
         })?;
+    let token = read_credential_text(token_response, "obtain EC2 metadata token")?;
     let role_name = match role_name {
         Some(role_name) => role_name.to_string(),
-        None => client
-            .get(format!("{IMDS}/meta-data/iam/security-credentials/"))
-            .timeout(credential_timeout(deadline)?)
-            .header("x-aws-ec2-metadata-token", &token)
-            .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
-            .and_then(reqwest::blocking::Response::text)
-            .map(|value| value.trim().to_string())
-            .map_err(|error| BlobError::Backend {
-                key: "<credentials>".into(),
-                message: format!("discover EC2 instance role: {error}"),
-            })?,
+        None => {
+            let response = client
+                .get(format!("{IMDS}/meta-data/iam/security-credentials/"))
+                .timeout(credential_timeout(deadline)?)
+                .header("x-aws-ec2-metadata-token", &token)
+                .send()
+                .map_err(|error| BlobError::Backend {
+                    key: "<credentials>".into(),
+                    message: format!("discover EC2 instance role: {error}"),
+                })?;
+            read_credential_text(response, "discover EC2 instance role")?
+                .trim()
+                .to_string()
+        }
     };
     if role_name.is_empty() || role_name.contains(['/', '\n', '\r']) {
         return Err(BlobError::Backend {
@@ -576,25 +575,19 @@ fn load_imds_credentials(
             message: "EC2 metadata returned an invalid role name".into(),
         });
     }
-    let document: ImdsCredentialDocument = client
+    let response = client
         .get(format!(
             "{IMDS}/meta-data/iam/security-credentials/{role_name}"
         ))
         .timeout(credential_timeout(deadline)?)
         .header("x-aws-ec2-metadata-token", token)
         .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
-        .and_then(reqwest::blocking::Response::text)
         .map_err(|error| BlobError::Backend {
             key: "<credentials>".into(),
             message: format!("read EC2 instance-role credentials: {error}"),
-        })
-        .and_then(|body| {
-            serde_json::from_str(&body).map_err(|error| BlobError::Backend {
-                key: "<credentials>".into(),
-                message: format!("decode EC2 instance-role credentials: {error}"),
-            })
         })?;
+    let document: ImdsCredentialDocument =
+        read_credential_json(response, "read EC2 instance-role credentials")?;
     if document.access_key_id.is_empty()
         || document.secret_access_key.is_empty()
         || document.token.is_empty()
@@ -681,25 +674,18 @@ fn load_container_credentials(
         });
     }
     let timeout = credential_timeout(deadline)?;
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(2).min(timeout))
-        .timeout(timeout)
-        .build()
-        .map_err(|error| BlobError::Backend {
-            key: "<credentials>".into(),
-            message: format!("build EKS Pod Identity credential client: {error}"),
-        })?;
-    let document: ImdsCredentialDocument = client
+    let client = credential_client(timeout)?;
+    let response = client
         .get(endpoint)
         .timeout(credential_timeout(deadline)?)
         .header("authorization", token)
         .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
-        .and_then(reqwest::blocking::Response::json)
         .map_err(|error| BlobError::Backend {
             key: "<credentials>".into(),
             message: format!("read EKS Pod Identity credentials: {error}"),
         })?;
+    let document: ImdsCredentialDocument =
+        read_credential_json(response, "read EKS Pod Identity credentials")?;
     if document.access_key_id.is_empty()
         || document.secret_access_key.is_empty()
         || document.token.is_empty()
@@ -714,6 +700,73 @@ fn load_container_credentials(
         secret_key: document.secret_access_key,
         session_token: Some(document.token),
     })
+}
+
+fn read_credential_text(response: reqwest::blocking::Response, operation: &str) -> Result<String> {
+    let bytes = read_credential_body(response, operation)?;
+    String::from_utf8(bytes).map_err(|error| BlobError::Backend {
+        key: "<credentials>".into(),
+        message: format!("{operation}: response is not UTF-8: {error}"),
+    })
+}
+
+fn credential_client(timeout: Duration) -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(2).min(timeout))
+        .timeout(timeout)
+        .build()
+        .map_err(|error| BlobError::Backend {
+            key: "<credentials>".into(),
+            message: format!("build AWS credential client: {error}"),
+        })
+}
+
+fn read_credential_json<T>(response: reqwest::blocking::Response, operation: &str) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let bytes = read_credential_body(response, operation)?;
+    serde_json::from_slice(&bytes).map_err(|error| BlobError::Backend {
+        key: "<credentials>".into(),
+        message: format!("{operation}: invalid JSON: {error}"),
+    })
+}
+
+fn read_credential_body(
+    mut response: reqwest::blocking::Response,
+    operation: &str,
+) -> Result<Vec<u8>> {
+    response = response
+        .error_for_status()
+        .map_err(|error| BlobError::Backend {
+            key: "<credentials>".into(),
+            message: format!("{operation}: {error}"),
+        })?;
+    if response.content_length().is_some_and(|length| {
+        length > u64::try_from(CREDENTIAL_RESPONSE_MAX_BYTES).unwrap_or(u64::MAX)
+    }) {
+        return Err(BlobError::Backend {
+            key: "<credentials>".into(),
+            message: format!("{operation}: response exceeds {CREDENTIAL_RESPONSE_MAX_BYTES} bytes"),
+        });
+    }
+    let mut bytes = Vec::with_capacity(CREDENTIAL_RESPONSE_MAX_BYTES.min(4 * 1024));
+    response
+        .by_ref()
+        .take(u64::try_from(CREDENTIAL_RESPONSE_MAX_BYTES + 1).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)
+        .map_err(|error| BlobError::Backend {
+            key: "<credentials>".into(),
+            message: format!("{operation}: {error}"),
+        })?;
+    if bytes.len() > CREDENTIAL_RESPONSE_MAX_BYTES {
+        return Err(BlobError::Backend {
+            key: "<credentials>".into(),
+            message: format!("{operation}: response exceeds {CREDENTIAL_RESPONSE_MAX_BYTES} bytes"),
+        });
+    }
+    Ok(bytes)
 }
 
 fn credential_timeout(deadline: Option<Instant>) -> Result<Duration> {
@@ -1073,8 +1126,19 @@ fn xml_unescape(s: &str) -> String {
 mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
 
     use super::*;
+
+    fn read_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        request
+    }
 
     fn local_store(
         respond: impl FnOnce(TcpStream) + Send + 'static,
@@ -1083,12 +1147,7 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut byte = [0_u8; 1];
-            while !request.ends_with(b"\r\n\r\n") {
-                stream.read_exact(&mut byte).unwrap();
-                request.push(byte[0]);
-            }
+            let _ = read_request(&mut stream);
             respond(stream);
         });
         let store = AwsS3BlobStore::new(AwsS3Config {
@@ -1102,6 +1161,23 @@ mod tests {
         })
         .unwrap();
         (store, server)
+    }
+
+    fn assert_no_connection(listener: TcpListener, waited: Duration) {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + waited;
+        loop {
+            match listener.accept() {
+                Ok(_) => panic!("redirect target received a credential-bearing request"),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("redirect target accept failed: {error}"),
+            }
+        }
     }
 
     #[test]
@@ -1194,6 +1270,115 @@ mod tests {
         ] {
             assert!(validate_container_credential_endpoint(endpoint).is_err());
         }
+    }
+
+    #[test]
+    fn signed_s3_request_never_follows_a_cross_origin_redirect() {
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let location = format!("http://{}/stolen", target.local_addr().unwrap());
+        let (store, redirect) = local_store(move |mut stream| {
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        *store.credentials.lock().unwrap() = CredentialState::Static(SigningCredentials {
+            access_key: "test-access".into(),
+            secret_key: "test-secret".into(),
+            session_token: Some("session-secret".into()),
+        });
+
+        assert!(matches!(
+            store.get("images/test/manifest.json"),
+            Err(BlobError::Backend { .. })
+        ));
+        redirect.join().unwrap();
+        assert_no_connection(target, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn signed_s3_request_treats_same_origin_redirect_as_a_terminal_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let location = format!("{endpoint}/redirected");
+        let (request_tx, request_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            request_tx.send(read_request(&mut stream)).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            assert_no_connection(listener, Duration::from_millis(100));
+        });
+        let store = AwsS3BlobStore::new(AwsS3Config {
+            endpoint,
+            bucket: "test".into(),
+            region: "us-east-1".into(),
+            access_key: "test-access".into(),
+            secret_key: "test-secret".into(),
+            session_token: Some("session-secret".into()),
+            prefix: String::new(),
+        })
+        .unwrap();
+
+        assert!(matches!(
+            store.get("images/test/manifest.json"),
+            Err(BlobError::Backend { .. })
+        ));
+        let request = String::from_utf8(request_rx.recv().unwrap()).unwrap();
+        assert!(request.to_ascii_lowercase().contains("authorization:"));
+        assert!(request.contains("x-amz-security-token: session-secret"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn credential_client_rejects_redirects_and_caps_response_bodies() {
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_url = format!("http://{}/stolen", target.local_addr().unwrap());
+        let redirect = TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirect_url = format!("http://{}", redirect.local_addr().unwrap());
+        let redirect_server = std::thread::spawn(move || {
+            let (mut stream, _) = redirect.accept().unwrap();
+            let _ = read_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: {target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let client = credential_client(Duration::from_secs(1)).unwrap();
+        let response = client
+            .get(redirect_url)
+            .header("authorization", "credential-secret")
+            .send()
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 302);
+        redirect_server.join().unwrap();
+        assert_no_connection(target, Duration::from_millis(100));
+
+        let oversized = TcpListener::bind("127.0.0.1:0").unwrap();
+        let oversized_url = format!("http://{}", oversized.local_addr().unwrap());
+        let oversized_server = std::thread::spawn(move || {
+            let (mut stream, _) = oversized.accept().unwrap();
+            let _ = read_request(&mut stream);
+            let body = vec![b'x'; CREDENTIAL_RESPONSE_MAX_BYTES + 1];
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        let response = client.get(oversized_url).send().unwrap();
+        assert!(matches!(
+            read_credential_text(response, "test credential response"),
+            Err(BlobError::Backend { .. })
+        ));
+        oversized_server.join().unwrap();
     }
 
     #[test]

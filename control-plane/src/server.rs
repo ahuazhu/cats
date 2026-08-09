@@ -123,19 +123,31 @@ impl Handle {
     pub fn base_url(&self) -> String {
         format!("http://{}", self.addr)
     }
-    pub fn shutdown(&self) {
-        self.image_manifest_resolver.shutdown();
+    fn begin_shutdown(&self) {
         self.server_task.abort();
         self.reconciler_task.abort();
         if let Some(task) = &self.billing_enforcer_task {
             task.abort();
         }
     }
+
+    pub async fn shutdown(&self) {
+        // Stop accepting product work before waiting for the dedicated
+        // blocking manifest lane. The resolver itself closes its queue and
+        // bounds this wait by the provider transport deadline.
+        self.begin_shutdown();
+        if !self.image_manifest_resolver.shutdown().await {
+            tracing::warn!("image manifest reads exceeded the shutdown deadline");
+        }
+    }
 }
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        self.shutdown();
+        // Drop cannot await. It still prevents new work and cancels async
+        // roles; production's signal path calls the async shutdown above.
+        self.image_manifest_resolver.begin_shutdown();
+        self.begin_shutdown();
     }
 }
 
