@@ -202,6 +202,8 @@ pub struct Store {
     #[cfg(test)]
     commit_response_loss_once: std::sync::atomic::AtomicBool,
     #[cfg(test)]
+    request_commit_response_loss_once: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
     commit_response_loss_delay_ms: std::sync::atomic::AtomicU64,
 }
 

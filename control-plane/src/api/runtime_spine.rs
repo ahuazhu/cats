@@ -518,7 +518,221 @@ fn success_response(body: Vec<u8>) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use cats_api::agent_registration::{Ed25519RequestSigner, REGISTRATION_PATH};
+    use cats_api::runtime_reconciliation::{
+        decode_agent_session, decode_desired_read_snapshot, decode_runtime_spine_error,
+        encode_agent_registration_attempt, encode_desired_read_request, encode_node_observation,
+        guest_config_digest, inventory_digest, AgentRegistrationAttempt, ContractErrorDetail,
+        ContractVersion, CredentialBinding, DesiredReadRequest, Epoch, Id, NodeBootId,
+        NodeIdentity, NodeIdentityState, NodeObservation, RandomId128, Sequence, SessionBinding,
+        UnixMillis,
+    };
+    use cats_metadata_store_sqlite::SqliteMetadataStore;
+    use cats_metering::SqliteUsageStore;
+    use cats_storage::MetadataStore;
+
     use super::*;
+    use crate::controller::AutoTierPolicy;
+    use crate::server::{spawn, Config, Handle};
+    use crate::store::DsnSource;
+
+    const SERVICE_TOKEN: &str = "runtime-spine-phase-service-token";
+    const ADMIN_TOKEN: &str = "runtime-spine-phase-admin-token";
+
+    struct Context {
+        _dir: tempfile::TempDir,
+        server: Handle,
+        client: reqwest::Client,
+        signer: Ed25519RequestSigner,
+        session: cats_api::runtime_reconciliation::AgentSession,
+    }
+
+    impl Context {
+        async fn new(suffix: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let usage = Arc::new(SqliteUsageStore::open(&dir.path().join("usage.db")).unwrap());
+            let storage_meta: Arc<dyn MetadataStore> =
+                Arc::new(SqliteMetadataStore::open(&dir.path().join("storage.db")).unwrap());
+            let receipt = crate::testsupport::test_guest_runtime_profile_receipt();
+            let server = spawn(Config {
+                listen: "127.0.0.1:0".into(),
+                control_store_dsn: DsnSource::Literal(
+                    crate::testsupport::isolated_control_store_url(),
+                ),
+                control_store_ca_file: None,
+                usage_store: usage.clone(),
+                credit_store: usage,
+                storage_meta,
+                image_blob: crate::testsupport::unavailable_image_blob(),
+                auth_token: SERVICE_TOKEN.into(),
+                guest_runtime_profile_receipt: receipt.clone(),
+                route_grant_signer: crate::testsupport::route_grant_signer(),
+                admin_token: ADMIN_TOKEN.into(),
+                workos: None,
+                stripe: None,
+                billing_enforcement_enabled: false,
+                node_lease_timeout_ms: 30_000,
+                reconcile_interval_ms: 60_000,
+                auto_tier_policy: AutoTierPolicy::default(),
+                oci_deploy_sync_wait_ms: 5_000,
+            })
+            .await
+            .unwrap();
+            let signer = Ed25519RequestSigner::from_pkcs8_pem(
+                Id::new(format!("credential_phase_{suffix}")).unwrap(),
+                include_bytes!("../../../tests/fixtures/route_grant_private_ed25519.pem"),
+            )
+            .unwrap();
+            let identity = NodeIdentity {
+                version: ContractVersion::V1,
+                node_id: Id::new(format!("node_phase_{suffix}")).unwrap(),
+                immutable_host_id: Id::new(format!("host_phase_{suffix}")).unwrap(),
+                credential_id: signer.credential_id().clone(),
+                credential_binding: CredentialBinding::PublicKey {
+                    public_key_spki_sha256: signer.public_key_spki_sha256(),
+                },
+                state_path_id: Id::new(format!("state_phase_{suffix}")).unwrap(),
+                state: NodeIdentityState::Provisioned,
+            };
+            crate::testsupport::provision_node_identity(&server.state.store, identity.clone())
+                .await;
+            let attempt = AgentRegistrationAttempt {
+                version: ContractVersion::V1,
+                node_id: identity.node_id,
+                immutable_host_id: identity.immutable_host_id,
+                node_boot_id: NodeBootId::new("11111111111111111111111111111111").unwrap(),
+                agent_instance_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+                registration_attempt_id: RandomId128::new("33333333333333333333333333333333")
+                    .unwrap(),
+                guest_config_digest: guest_config_digest(&receipt).unwrap(),
+                expected_agent_session_epoch: None,
+            };
+            let body = encode_agent_registration_attempt(&attempt).unwrap();
+            let response = Self::signed_with(
+                &reqwest::Client::new(),
+                &signer,
+                &server,
+                REGISTRATION_PATH,
+                body,
+            )
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let session = decode_agent_session(&response.bytes().await.unwrap()).unwrap();
+            Self {
+                _dir: dir,
+                server,
+                client: reqwest::Client::new(),
+                signer,
+                session,
+            }
+        }
+
+        fn signed_with(
+            client: &reqwest::Client,
+            signer: &Ed25519RequestSigner,
+            server: &Handle,
+            path: &str,
+            body: Vec<u8>,
+        ) -> reqwest::RequestBuilder {
+            let proof = signer.sign("POST", path, &body);
+            client
+                .post(format!("{}{path}", server.base_url()))
+                .header(reqwest::header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                .header(reqwest::header::ACCEPT, JSON_CONTENT_TYPE)
+                .header(NODE_CREDENTIAL_ID_HEADER, proof.credential_id)
+                .header(NODE_PUBLIC_KEY_SPKI_HEADER, proof.public_key_spki)
+                .header(NODE_SIGNATURE_HEADER, proof.signature)
+                .body(body)
+        }
+
+        fn signed(&self, path: &str, body: Vec<u8>) -> reqwest::RequestBuilder {
+            Self::signed_with(&self.client, &self.signer, &self.server, path, body)
+        }
+
+        fn binding(&self) -> SessionBinding {
+            SessionBinding {
+                node_id: self.session.node_id.clone(),
+                node_boot_id: self.session.node_boot_id.clone(),
+                agent_instance_id: self.session.agent_instance_id.clone(),
+                agent_session_epoch: self.session.agent_session_epoch,
+            }
+        }
+
+        fn full_observation(&self, read_position: Sequence) -> NodeObservation {
+            let mut observation = NodeObservation {
+                version: ContractVersion::V1,
+                observation_id: RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+                node_id: self.session.node_id.clone(),
+                node_boot_id: self.session.node_boot_id.clone(),
+                agent_instance_id: self.session.agent_instance_id.clone(),
+                agent_session_epoch: self.session.agent_session_epoch,
+                heartbeat_sequence: Sequence::new(1).unwrap(),
+                observed_at_unix_ms: UnixMillis::new(1).unwrap(),
+                complete_inventory: true,
+                inventory_epoch: Epoch::new(1).unwrap(),
+                inventory_digest: None,
+                inventory_read_position: Some(read_position),
+                key_ring_version: None,
+                key_ring_digest: None,
+                loaded_kids: Vec::new(),
+                runtimes: Vec::new(),
+                residue: Vec::new(),
+            };
+            observation.inventory_digest = Some(inventory_digest(&observation).unwrap());
+            observation
+        }
+
+        async fn fingerprint(&self) -> String {
+            crate::testsupport::runtime_spine_state_fingerprint(
+                &self.server.state.store,
+                self.session.node_id.clone(),
+            )
+            .await
+        }
+
+        fn arm_commit_response_loss_after(&self, delay: Duration) {
+            self.server
+                .state
+                .store
+                .inject_request_committed_response_loss_once_after(delay);
+        }
+
+        fn arm_delayed_commit_response_loss(&self) {
+            self.arm_commit_response_loss_after(Duration::from_secs(11));
+        }
+
+        fn assert_commit_response_loss_remains_armed(&self) {
+            assert!(
+                self.server
+                    .state
+                    .store
+                    .request_committed_response_loss_is_armed(),
+                "a definite rejection must not enter COMMIT or consume response-loss injection"
+            );
+        }
+    }
+
+    async fn promptly(request: reqwest::RequestBuilder) -> reqwest::Response {
+        tokio::time::timeout(Duration::from_secs(2), request.send())
+            .await
+            .expect("a definite rejection entered the commit/deadline path")
+            .unwrap()
+    }
+
+    async fn decoded_error(response: reqwest::Response) -> RuntimeSpineError {
+        assert_eq!(
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .unwrap(),
+            JSON_CONTENT_TYPE
+        );
+        decode_runtime_spine_error(&response.bytes().await.unwrap()).unwrap()
+    }
 
     #[tokio::test]
     async fn ambiguous_commit_response_cannot_be_mistaken_for_an_http_error_envelope() {
@@ -526,5 +740,168 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(response.headers().get(header::CONTENT_TYPE).is_none());
         assert!(to_bytes(response.into_body(), 1).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn definite_runtime_rejections_rollback_before_commit_and_keep_exact_http_errors() {
+        let wrong = Context::new("wrong").await;
+        let mut wrong_binding = wrong.binding();
+        wrong_binding.agent_instance_id =
+            RandomId128::new("99999999999999999999999999999999").unwrap();
+        let request = DesiredReadRequest {
+            version: ContractVersion::V1,
+            session: wrong_binding,
+            request_sequence: Sequence::new(1).unwrap(),
+        };
+        let before = wrong.fingerprint().await;
+        wrong.arm_delayed_commit_response_loss();
+        let response = promptly(wrong.signed(
+            DESIRED_READ_PATH,
+            encode_desired_read_request(&request).unwrap(),
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(matches!(
+            decoded_error(response).await.error.as_ref(),
+            RuntimeSpineErrorDetail::ContractError { contract_error }
+                if matches!(contract_error.error.as_ref(), ContractErrorDetail::WrongSession { .. })
+        ));
+        assert_eq!(wrong.fingerprint().await, before);
+        wrong.assert_commit_response_loss_remains_armed();
+
+        let expired = Context::new("expired").await;
+        crate::testsupport::expire_agent_session_for_test(
+            &expired.server.state.store,
+            expired.session.node_id.clone(),
+        )
+        .await;
+        let request = DesiredReadRequest {
+            version: ContractVersion::V1,
+            session: expired.binding(),
+            request_sequence: Sequence::new(1).unwrap(),
+        };
+        let before = expired.fingerprint().await;
+        expired.arm_delayed_commit_response_loss();
+        let response = promptly(expired.signed(
+            DESIRED_READ_PATH,
+            encode_desired_read_request(&request).unwrap(),
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(matches!(
+            decoded_error(response).await.error.as_ref(),
+            RuntimeSpineErrorDetail::ContractError { contract_error }
+                if matches!(contract_error.error.as_ref(), ContractErrorDetail::SessionExpired { .. })
+        ));
+        assert_eq!(expired.fingerprint().await, before);
+        expired.assert_commit_response_loss_remains_armed();
+
+        let changed = Context::new("changed").await;
+        let desired = DesiredReadRequest {
+            version: ContractVersion::V1,
+            session: changed.binding(),
+            request_sequence: Sequence::new(1).unwrap(),
+        };
+        let response = changed
+            .signed(
+                DESIRED_READ_PATH,
+                encode_desired_read_request(&desired).unwrap(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot = decode_desired_read_snapshot(&response.bytes().await.unwrap()).unwrap();
+        crate::testsupport::insert_assigned_desired_after_cursor_for_test(
+            &changed.server.state.store,
+            changed.session.node_id.clone(),
+        )
+        .await;
+        let observation = changed.full_observation(snapshot.read_position);
+        let before = changed.fingerprint().await;
+        changed.arm_delayed_commit_response_loss();
+        let response = promptly(changed.signed(
+            OBSERVATION_PATH,
+            encode_node_observation(&observation).unwrap(),
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(matches!(
+            decoded_error(response).await.error.as_ref(),
+            RuntimeSpineErrorDetail::ContractError { contract_error }
+                if matches!(contract_error.error.as_ref(), ContractErrorDetail::AssignedSetChanged { .. })
+        ));
+        assert_eq!(changed.fingerprint().await, before);
+        changed.assert_commit_response_loss_remains_armed();
+
+        let ineligible = Context::new("ineligible").await;
+        let request = DesiredReadRequest {
+            version: ContractVersion::V1,
+            session: ineligible.binding(),
+            request_sequence: Sequence::new(1).unwrap(),
+        };
+        let body = encode_desired_read_request(&request).unwrap();
+        let unprovisioned_signer = Ed25519RequestSigner::from_pkcs8_pem(
+            Id::new("credential_phase_unprovisioned").unwrap(),
+            include_bytes!("../../../tests/fixtures/route_grant_private_ed25519.pem"),
+        )
+        .unwrap();
+        let before = ineligible.fingerprint().await;
+        ineligible.arm_delayed_commit_response_loss();
+        let response = promptly(Context::signed_with(
+            &ineligible.client,
+            &unprovisioned_signer,
+            &ineligible.server,
+            DESIRED_READ_PATH,
+            body,
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(matches!(
+            decoded_error(response).await.error.as_ref(),
+            RuntimeSpineErrorDetail::IdentityNotEligible
+        ));
+        assert_eq!(ineligible.fingerprint().await, before);
+        ineligible.assert_commit_response_loss_remains_armed();
+    }
+
+    #[tokio::test]
+    async fn committed_runtime_mutation_closes_response_and_exact_retry_recovers() {
+        let context = Context::new("committed_loss").await;
+        let request = DesiredReadRequest {
+            version: ContractVersion::V1,
+            session: context.binding(),
+            request_sequence: Sequence::new(1).unwrap(),
+        };
+        let body = encode_desired_read_request(&request).unwrap();
+        let before = context.fingerprint().await;
+        context.arm_commit_response_loss_after(Duration::ZERO);
+
+        let incomplete = context
+            .signed(DESIRED_READ_PATH, body.clone())
+            .send()
+            .await
+            .expect_err("an ambiguous commit must close without an HTTP error envelope");
+        assert!(incomplete.status().is_none());
+        assert!(!context
+            .server
+            .state
+            .store
+            .request_committed_response_loss_is_armed());
+        let committed = context.fingerprint().await;
+        assert_ne!(
+            committed, before,
+            "the accepted mutation must have committed"
+        );
+
+        let replay = context
+            .signed(DESIRED_READ_PATH, body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let snapshot = decode_desired_read_snapshot(&replay.bytes().await.unwrap()).unwrap();
+        assert_eq!(snapshot.request_sequence, request.request_sequence);
+        assert_eq!(context.fingerprint().await, committed);
     }
 }

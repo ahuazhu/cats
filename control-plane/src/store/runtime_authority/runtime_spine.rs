@@ -41,7 +41,9 @@ use crate::store::agent_sessions::{
     load_provisioned_identities_after, lock_exact_credential_lineage,
     renew_current_session_deadline, CredentialLineageState, PROVISIONED_NODE_ID_PAGE_SIZE,
 };
-use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
+use crate::store::transaction::{
+    AuthorityRequestDisposition, AuthorityTransactionError, AuthorityTxResult,
+};
 use crate::store::{AuthorityRequestContext, Result, Store};
 
 pub(crate) const AGENT_SESSION_LEASE_MS: u64 = 60_000;
@@ -90,6 +92,19 @@ pub(crate) enum RuntimeSpineOutcome<T> {
 pub(crate) enum RuntimeSpineRejection {
     IdentityNotEligible,
     Contract(ContractError),
+}
+
+fn request_disposition<T>(
+    outcome: RuntimeSpineOutcome<T>,
+) -> AuthorityRequestDisposition<RuntimeSpineOutcome<T>> {
+    match outcome {
+        accepted @ RuntimeSpineOutcome::Accepted(_) => {
+            AuthorityRequestDisposition::Commit(accepted)
+        }
+        rejected @ RuntimeSpineOutcome::Rejected(_) => {
+            AuthorityRequestDisposition::Reject(rejected)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,7 +322,7 @@ impl Store {
             return Ok(rejected(error));
         }
         self.authority_request_transaction(request_context, |transaction| {
-            desired_read_in(transaction, authenticated, request)
+            desired_read_in(transaction, authenticated, request).map(request_disposition)
         })
     }
 
@@ -334,7 +349,7 @@ impl Store {
             return Ok(rejected(error));
         }
         self.authority_request_transaction(request_context, |transaction| {
-            accept_observation_in(transaction, authenticated, observation)
+            accept_observation_in(transaction, authenticated, observation).map(request_disposition)
         })
     }
 

@@ -80,6 +80,16 @@ impl AuthorityRequestContext {
 
 pub(super) type AuthorityTxResult<T> = std::result::Result<T, AuthorityTransactionError>;
 
+/// The closed result of an authenticated runtime request transaction.
+///
+/// A wire-visible rejection is a read-only decision: it must explicitly roll
+/// back and can never enter PostgreSQL COMMIT or the ambiguous-response path.
+/// Only an accepted mutation is allowed to cross the commit-send boundary.
+pub(super) enum AuthorityRequestDisposition<T> {
+    Commit(T),
+    Reject(T),
+}
+
 pub(super) enum AuthorityTransactionError {
     Domain(AuthorityError),
     Application(ApiError),
@@ -147,6 +157,25 @@ impl Store {
         self.inject_committed_response_loss_once();
     }
 
+    /// Arm only the commit belonging to an HTTP authority request. Read-only
+    /// credential lookup happens earlier in the same handler and must not
+    /// consume this deterministic response-loss fixture.
+    #[cfg(test)]
+    pub(crate) fn inject_request_committed_response_loss_once_after(&self, delay: Duration) {
+        self.commit_response_loss_delay_ms.store(
+            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
+        self.request_commit_response_loss_once
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_committed_response_loss_is_armed(&self) -> bool {
+        self.request_commit_response_loss_once
+            .load(Ordering::Acquire)
+    }
+
     /// Runs one complete authority closure in one fresh PostgreSQL
     /// transaction. Retriable database failures replay the whole closure;
     /// domain conflicts are rolled back and returned exactly once.
@@ -166,12 +195,16 @@ impl Store {
     pub(super) fn authority_request_transaction<T: Send>(
         &self,
         request: &AuthorityRequestContext,
-        operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
+        operation: impl FnMut(
+                &mut postgres::Transaction<'_>,
+            ) -> AuthorityTxResult<AuthorityRequestDisposition<T>>
+            + Send,
     ) -> Result<T> {
-        match self.authority_transaction_outcome_with(
+        match self.authority_transaction_outcome_with_hook(
             operation,
             AuthorityTransactionMode::ReadWrite,
             Some(request),
+            || {},
         ) {
             Ok(value) => Ok(value),
             Err(AuthorityExecutionError::Store(error)) => Err(error),
@@ -244,11 +277,11 @@ impl Store {
     /// deliberately do not invoke this hook.
     pub(super) fn authority_transaction_outcome_with_definite_retry<T: Send>(
         &self,
-        operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
+        mut operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
         on_definite_retry: impl FnMut() + Send,
     ) -> std::result::Result<T, AuthorityExecutionError> {
         self.authority_transaction_outcome_with_hook(
-            operation,
+            move |transaction| operation(transaction).map(AuthorityRequestDisposition::Commit),
             AuthorityTransactionMode::ReadWrite,
             None,
             on_definite_retry,
@@ -257,16 +290,24 @@ impl Store {
 
     fn authority_transaction_outcome_with<T: Send>(
         &self,
-        operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
+        mut operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
         mode: AuthorityTransactionMode,
         request: Option<&AuthorityRequestContext>,
     ) -> std::result::Result<T, AuthorityExecutionError> {
-        self.authority_transaction_outcome_with_hook(operation, mode, request, || {})
+        self.authority_transaction_outcome_with_hook(
+            move |transaction| operation(transaction).map(AuthorityRequestDisposition::Commit),
+            mode,
+            request,
+            || {},
+        )
     }
 
     fn authority_transaction_outcome_with_hook<T: Send>(
         &self,
-        mut operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
+        mut operation: impl FnMut(
+                &mut postgres::Transaction<'_>,
+            ) -> AuthorityTxResult<AuthorityRequestDisposition<T>>
+            + Send,
         mode: AuthorityTransactionMode,
         request: Option<&AuthorityRequestContext>,
         mut on_definite_retry: impl FnMut() + Send,
@@ -314,33 +355,48 @@ impl Store {
                     }
                 }
                 match operation(&mut transaction) {
-                    Ok(_value) if request.is_some_and(AuthorityRequestContext::must_rollback) => {
+                    Ok(AuthorityRequestDisposition::Reject(value)) => {
+                        transaction.rollback().map_err(AttemptFailure::Rollback)?;
+                        Ok(AuthorityRequestDisposition::Reject(value))
+                    }
+                    Ok(AuthorityRequestDisposition::Commit(_value))
+                        if request.is_some_and(AuthorityRequestContext::must_rollback) =>
+                    {
                         transaction.rollback().map_err(AttemptFailure::Rollback)?;
                         Err(AttemptFailure::Application(ApiError::unavailable(
                             "runtime authority request was cancelled or exceeded its deadline",
                         )))
                     }
-                    Ok(value) => {
+                    Ok(AuthorityRequestDisposition::Commit(value)) => {
                         if let Some(request) = request {
                             request.begin_commit();
                         }
                         match transaction.commit() {
                             Ok(()) => {
                                 #[cfg(test)]
-                                if self.commit_response_loss_once.swap(false, Ordering::AcqRel) {
-                                    let delay_ms = self
-                                        .commit_response_loss_delay_ms
-                                        .swap(0, Ordering::AcqRel);
-                                    if delay_ms != 0 {
-                                        std::thread::sleep(Duration::from_millis(delay_ms));
+                                {
+                                    let inject_response_loss = self
+                                        .commit_response_loss_once
+                                        .swap(false, Ordering::AcqRel)
+                                        || (request.is_some()
+                                            && self
+                                                .request_commit_response_loss_once
+                                                .swap(false, Ordering::AcqRel));
+                                    if inject_response_loss {
+                                        let delay_ms = self
+                                            .commit_response_loss_delay_ms
+                                            .swap(0, Ordering::AcqRel);
+                                        if delay_ms != 0 {
+                                            std::thread::sleep(Duration::from_millis(delay_ms));
+                                        }
+                                        return Err(AttemptFailure::Infrastructure(
+                                            ApiError::unavailable(
+                                                "injected loss of a successful PostgreSQL commit response",
+                                            ),
+                                        ));
                                     }
-                                    return Err(AttemptFailure::Infrastructure(
-                                        ApiError::unavailable(
-                                            "injected loss of a successful PostgreSQL commit response",
-                                        ),
-                                    ));
                                 }
-                                Ok(value)
+                                Ok(AuthorityRequestDisposition::Commit(value))
                             }
                             Err(error) => Err(AttemptFailure::Commit(error)),
                         }
@@ -378,8 +434,12 @@ impl Store {
             });
 
             match outcome {
-                Ok(value) => {
+                Ok(AuthorityRequestDisposition::Commit(value)) => {
                     metrics::record_authority_outcome(metrics::AuthorityOutcome::Committed);
+                    return Ok(value);
+                }
+                Ok(AuthorityRequestDisposition::Reject(value)) => {
+                    metrics::record_authority_outcome(metrics::AuthorityOutcome::DomainRejected);
                     return Ok(value);
                 }
                 Err(AttemptFailure::Domain(error)) => {

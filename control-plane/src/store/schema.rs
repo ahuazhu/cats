@@ -29,6 +29,8 @@ impl Store {
             #[cfg(test)]
             commit_response_loss_once: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
+            request_commit_response_loss_once: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
             commit_response_loss_delay_ms: std::sync::atomic::AtomicU64::new(0),
         })
     }
