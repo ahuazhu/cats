@@ -29,6 +29,11 @@ mod root_provision;
     reason = "sealed root-provision process port is staged before production composition"
 )]
 mod root_provision_process;
+#[expect(
+    dead_code,
+    reason = "systemd root-provision adapter is staged before signed launch composition"
+)]
+mod systemd_root_provision;
 mod volume_transitions;
 
 pub(crate) mod inventory_probe_sealed {
@@ -76,6 +81,10 @@ pub(crate) use root_provision_process::{
     RootProvisionProcessConflict, RootProvisionProcessEnsureResult, RootProvisionProcessEvidence,
     RootProvisionProcessExpectation, RootProvisionProcessInspection, RootProvisionProcessOutcome,
     RootProvisionProcessPort, RootProvisionProcessStart,
+};
+#[allow(unused_imports)]
+pub(crate) use systemd_root_provision::{
+    PlatformSystemdRootProvisionProcessPort, RootProvisionSystemdConfig,
 };
 pub use volume_transitions::{
     A19SignedVolumeEvidenceTransport, ControlSignedVolumeEvidenceClient,

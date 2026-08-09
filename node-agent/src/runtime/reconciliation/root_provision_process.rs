@@ -186,6 +186,7 @@ pub(crate) enum RootProvisionProcessInspection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RootProvisionProcessStart {
     Started(Box<RootProvisionProcessEvidence>),
+    Conflict(RootProvisionProcessConflict),
     /// The create request may have reached the process owner. The caller must
     /// inspect once and must not issue a second create in this unit.
     Ambiguous,
@@ -220,6 +221,11 @@ pub(crate) struct CheckpointedRootProvisionProcess<'a> {
 impl<'a> CheckpointedRootProvisionProcess<'a> {
     pub(crate) fn expected(&self) -> &'a RootProvisionProcessExpectation {
         self.expected
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(expected: &'a RootProvisionProcessExpectation) -> Self {
+        Self { expected }
     }
 }
 
@@ -285,6 +291,9 @@ where
             {
                 RootProvisionProcessStart::Started(evidence) => {
                     match_exact(&expected, evidence, RootProvisionProcessOutcome::Started)
+                }
+                RootProvisionProcessStart::Conflict(problem) => {
+                    RootProvisionProcessOutcome::Conflict(problem)
                 }
                 RootProvisionProcessStart::CancelledClean => {
                     RootProvisionProcessOutcome::CancelledClean
