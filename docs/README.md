@@ -11,6 +11,11 @@ HTML companion。公开产品文档仍由 `control-plane/ui/` 独立维护双语
 4. 与任务相关的 accepted ADR 和 `docs/specs/` 合同。
 5. 需要引用数字时再读[实验总报告](experiments-2026-07-21-storage-lifecycle.md)及其原始证据。
 
+Agent注册的HTTP/proof/lease见
+[Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md)；Node本地identity
+artifact与单一Guest release payload见
+[Runtime Composition Artifacts v1](specs/runtime-composition-artifacts-v1.md)。
+
 ## 当前实现与目标
 
 决策状态和实现状态是两回事。2026-08-08 的准确边界：
@@ -55,6 +60,7 @@ AdmissionCell。它们由同一个vertical cutover合同和故障矩阵收敛。
 | [Runtime Reconciliation v1](specs/runtime-reconciliation-v1.md) | Target，未实现 | ADR-0040切换合同 |
 | [Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md) | Frozen target，未实现 | per-Node签名、注册wire、lease与Guest receipt部署路径 |
 | [Runtime Inventory and Observation Spine v1](specs/runtime-inventory-observation-v1.md) | Frozen target，未实现 | Desired read-position、inventory/observation接受与freshness |
+| [Runtime Composition Artifacts v1](specs/runtime-composition-artifacts-v1.md) | Frozen target，未实现 | local NodeIdentity artifact与单一Guest release payload |
 | [Route Grant v2](specs/route-grant-v2.md) | Target，未实现 | ADR-0041切换合同；固定向量待实现时重建 |
 | [Volume Authority](specs/volume-authority.md) | Target，未实现 | ADR-0042卷、attachment、ext4、snapshot和delete合同 |
 

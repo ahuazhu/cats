@@ -52,7 +52,10 @@ For the target runtime-reconciliation release, the builder must instead carry th
 Production Control and Node systemd `ExecStart` both pass
 `--guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json`; there is no Host rebuild,
 missing-file or fixture fallback. The full fail-closed contract is
-[Agent Registration and Internal Transport v1](../../docs/specs/agent-registration-transport-v1.md).
+[Agent Registration and Internal Transport v1](../../docs/specs/agent-registration-transport-v1.md), and the
+single-build payload/manifest plus root-provisioned local Node identity are frozen by
+[Runtime Composition Artifacts v1](../../docs/specs/runtime-composition-artifacts-v1.md). Target `cats-noded` does
+not derive registration identity from the development `CATS_NODE_ID`, hostname, address or Host kernel.
 
 仅限首次安装、尚未创建任何 Cat 的空节点，配置后可以直接启动或重启服务。
 

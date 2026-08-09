@@ -275,8 +275,9 @@ runbook；禁止以“重启看看”跳过fence或durability proof。
 key overlap、Node drain 和不可变 artifact digest；该路径不能用于首次 cutover。
 
 步骤4–6还必须遵守
-[Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md)：Control/Node artifact
-extract出的`guest-runtime-profile.v1.json`逐byte一致，Node/Metal Control systemd及AWS Control Kubernetes
-container都显式传入installed exact path，每Node Ed25519
-key只在该Host以root-only文件存在。缺失receipt、Host临时重建Guest kernel或回退shared bearer都必须在启动/
-注册前fail closed。
+[Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md)和
+[Runtime Composition Artifacts v1](specs/runtime-composition-artifacts-v1.md)：provisioner安装并封闭验证唯一的
+local `NodeIdentity` artifact；Control/Node artifact extract出的manifest和
+`guest-runtime-profile.v1.json`逐byte一致；Node/Metal Control systemd及AWS Control Kubernetes container都
+显式传入installed exact receipt path；每Node Ed25519 key只在该Host以root-only文件存在。缺失identity、
+manifest或receipt，Host临时重建Guest kernel，或回退shared bearer都必须在启动/注册前fail closed。

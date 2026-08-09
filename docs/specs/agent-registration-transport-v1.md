@@ -11,6 +11,11 @@ authentication adapter、注册错误映射、session lease policy，以及
 authority：adapter只把请求证明转换成`AuthenticatedNodeCredential`，NodeIdentity和当前
 AgentSession仍只由Control Store裁决。
 
+Node本地`NodeIdentity` artifact、identity-selected state path，以及Control/Node共同消费的一次构建
+Guest release payload由
+[Runtime Composition Artifacts v1](runtime-composition-artifacts-v1.md)冻结；本文件的固定credential/
+receipt paths和该composition合同必须同时满足。
+
 本文中的MUST/MUST NOT是F3b及后续internal transport实现的上线条件。V1没有legacy
 `/v1/nodes/register`兼容路由、shared service/admin bearer fallback、双写、协商、动态receipt catalog或
 provider-principal fallback。
@@ -314,6 +319,10 @@ Terraform state/output、environment、argv或日志。credential ID文件owner 
 合法`Id` ASCII后恰好一个LF；parser只移除这一个LF，拒绝其他前后空白、多行或额外bytes。provisioner把
 credential ID和canonical SPKI DER digest预先写入唯一NodeIdentity。
 
+Node不得从`--node-id`、hostname/IP或provider metadata补出该NodeIdentity。production local artifact、
+filesystem校验、initial no-replace provision、credential rotation和retire/Host replacement规则以
+[Composition §2](runtime-composition-artifacts-v1.md#2-local-nodeidentity-artifact)为唯一权威。
+
 key轮换前必须证明没有pending attempt并保持Node cordoned；随后先staged安装新private key，再以显式管理事务
 替换同一NodeIdentity的credential ID/binding，最后atomic激活对应key。切换窗口不会同时接受两把key；失败必须
 保持Node cordoned，不能用fleet credential解锁或丢弃pending attempt。
@@ -375,6 +384,10 @@ release build从最终要部署的pinned Guest kernel完整bytes、可选initram
 compiled Guest Agent protocol literal生成一次
 `guest-runtime-profile.v1.json`。生成器必须使用Runtime Reconciliation v1 §16.1 canonical encoder，无BOM、前后
 空白或结尾LF，最大4096 octets；随后用该规格§2的domain计算`guest_config_digest`。
+
+“生成一次”的process composition、closed manifest/layout、immutable release identity、Control/worker
+artifact exact-copy qualification和Node crash-safe install/rollback由
+[Composition §3](runtime-composition-artifacts-v1.md#3-one-shared-guest-runtime-release-payload)冻结。
 
 同一个exact receipt member必须逐byte进入Control release artifact、Node/worker release bundle和release
 manifest。manifest记录receipt本身的普通SHA-256和guest kernel/initramfs artifact digest；构建资格检查要extract

@@ -231,6 +231,11 @@ registration attempt，同一attempt重试返回同一session epoch；同Host新
 新`node_id` provision。直接提交的`NodeObservation`包含
 session epoch、agent instance、该instance内单调sequence和本次inventory是否完整。full scan在
 current session下建立独立`AdmissionInventoryAttestation`；partial observation引用其epoch而不覆盖。
+
+Node只从root/provisioner安装的canonical local `NodeIdentity` artifact取得Node/Host/state-path lineage，
+并逐byte绑定per-Node key；CLI、hostname/IP和IMDS不补身份。Control与Node只消费同一次release build冻结的
+closed Guest payload/manifest，见
+[Runtime Composition Artifacts v1](specs/runtime-composition-artifacts-v1.md)。
 每个Cat status包含
 applied revision/spec digest、placement epoch、runtime incarnation、物理状态、结构化
 Condition、逐卷 owner/epoch 与 `R/L`、route gate 和 active guard 数。

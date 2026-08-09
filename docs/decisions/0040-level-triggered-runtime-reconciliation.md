@@ -5,6 +5,7 @@
 - 取代：ADR-0027、ADR-0028、ADR-0030、ADR-0035，以及 ADR-0002 中的旧协调合同
 - 规格：[Runtime Reconciliation v1](../specs/runtime-reconciliation-v1.md)
 - Internal delivery/acceptance：[Runtime Inventory and Observation Spine v1](../specs/runtime-inventory-observation-v1.md)
+- composition：[Runtime Composition Artifacts v1](../specs/runtime-composition-artifacts-v1.md)
 
 ## 背景
 
@@ -73,6 +74,10 @@ Agent 必须先取得固定 Host state path 的 kernel 排他锁。它在注册 
 
 这两个边界分工明确：Host lock 排除同机双进程，AgentSession 排除延迟包和跨 boot/session
 复用，provisioned credential 排除另一台机器自称同一 Node。
+
+Node本地identity artifact、identity-selected固定state path与Host lock，以及Control/Node共同消费的单一
+Guest release payload属于composition，不增加数据库authority；exact path、provision/rotation和部署规则由
+Runtime Composition Artifacts v1冻结。
 
 ## Desired、placement 与 Operation
 
