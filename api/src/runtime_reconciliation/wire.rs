@@ -23,6 +23,8 @@ pub const NODE_CLEANUP_CHECKPOINT_MAX_WIRE_BYTES: usize = 65_536;
 pub const NODE_OBSERVATION_MAX_WIRE_BYTES: usize = 8_388_608;
 pub const OBSERVATION_ACCEPTANCE_MAX_WIRE_BYTES: usize = 16_384;
 pub const RUNTIME_SPINE_ERROR_MAX_WIRE_BYTES: usize = 20_480;
+pub const RUNTIME_VOLUME_TRANSITION_REQUEST_MAX_WIRE_BYTES: usize = 16_384;
+pub const RUNTIME_VOLUME_TRANSITION_SUCCESS_MAX_WIRE_BYTES: usize = 16_384;
 pub const RUNTIME_VOLUME_TRANSITION_EVIDENCE_REQUEST_MAX_WIRE_BYTES: usize = 4_096;
 pub const RUNTIME_VOLUME_TRANSITION_EVIDENCE_SUCCESS_MAX_WIRE_BYTES: usize = 32_768;
 pub const RUNTIME_VOLUME_TRANSITION_ERROR_MAX_WIRE_BYTES: usize = 20_480;
@@ -2319,6 +2321,80 @@ fn runtime_volume_transition_evidence_request_schema() -> Schema {
     ])
 }
 
+fn runtime_volume_transition_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant(
+                "acquire",
+                vec![field("request", volume_acquire_request_schema())],
+            ),
+            variant("release", vec![field("cleanup", cleanup_release_schema())]),
+            variant(
+                "delete_disposable_root",
+                vec![field("authorization_id", id())],
+            ),
+        ],
+    )
+}
+
+fn runtime_volume_transition_request_schema() -> Schema {
+    object(vec![
+        field("version", version()),
+        field("session", session_binding_schema()),
+        field("cat_id", id()),
+        field("desired_revision", revision()),
+        field("spec_digest", digest()),
+        field("placement", assigned_placement_schema()),
+        field("transition", runtime_volume_transition_schema()),
+    ])
+}
+
+fn volume_lease_grant_schema() -> Schema {
+    object(vec![
+        field("volume_id", id()),
+        field("attachment_id", id()),
+        field("attachment_epoch", wire_u64()),
+        field("size_bytes", number(1, MAX_WIRE_INTEGER)),
+        field("durability", closed(&["strict", "relaxed"])),
+        field("head", remote_head_schema()),
+        field("lease_expires_at", wire_u64()),
+        field("acquire_origin", acquire_origin_schema()),
+    ])
+}
+
+fn runtime_volume_transition_outcome_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant(
+                "lease_granted",
+                vec![field("grant", volume_lease_grant_schema())],
+            ),
+            variant("released", vec![field("release", release_result_schema())]),
+            variant(
+                "disposable_root_deleting",
+                vec![field(
+                    "receipt",
+                    object(disposable_delete_consumed_receipt_fields()),
+                )],
+            ),
+        ],
+    )
+}
+
+fn runtime_volume_transition_success_schema() -> Schema {
+    object(vec![
+        field("version", version()),
+        field("session", session_binding_schema()),
+        field("cat_id", id()),
+        field("desired_revision", revision()),
+        field("spec_digest", digest()),
+        field("placement", assigned_placement_schema()),
+        field("outcome", runtime_volume_transition_outcome_schema()),
+    ])
+}
+
 fn runtime_volume_transition_evidence_success_schema() -> Schema {
     object(vec![
         field("version", version()),
@@ -4377,6 +4453,10 @@ static NODE_OBSERVATION_SCHEMA: LazyLock<Schema> = LazyLock::new(node_observatio
 static OBSERVATION_ACCEPTANCE_SCHEMA: LazyLock<Schema> =
     LazyLock::new(observation_acceptance_schema);
 static RUNTIME_SPINE_ERROR_SCHEMA: LazyLock<Schema> = LazyLock::new(runtime_spine_error_schema);
+static RUNTIME_VOLUME_TRANSITION_REQUEST_SCHEMA: LazyLock<Schema> =
+    LazyLock::new(runtime_volume_transition_request_schema);
+static RUNTIME_VOLUME_TRANSITION_SUCCESS_SCHEMA: LazyLock<Schema> =
+    LazyLock::new(runtime_volume_transition_success_schema);
 static RUNTIME_VOLUME_TRANSITION_EVIDENCE_REQUEST_SCHEMA: LazyLock<Schema> =
     LazyLock::new(runtime_volume_transition_evidence_request_schema);
 static RUNTIME_VOLUME_TRANSITION_EVIDENCE_SUCCESS_SCHEMA: LazyLock<Schema> =
@@ -4758,6 +4838,30 @@ pub fn decode_runtime_volume_transition_evidence_request(
     )
 }
 
+pub fn decode_runtime_volume_transition_request(
+    bytes: &[u8],
+) -> Result<RuntimeVolumeTransitionRequest, ContractError> {
+    decode(
+        bytes,
+        ContractName::RuntimeVolumeTransitionRequest,
+        RUNTIME_VOLUME_TRANSITION_REQUEST_MAX_WIRE_BYTES,
+        &RUNTIME_VOLUME_TRANSITION_REQUEST_SCHEMA,
+        validate_runtime_volume_transition_request,
+    )
+}
+
+pub fn decode_runtime_volume_transition_success(
+    bytes: &[u8],
+) -> Result<RuntimeVolumeTransitionSuccess, ContractError> {
+    decode(
+        bytes,
+        ContractName::RuntimeVolumeTransitionSuccess,
+        RUNTIME_VOLUME_TRANSITION_SUCCESS_MAX_WIRE_BYTES,
+        &RUNTIME_VOLUME_TRANSITION_SUCCESS_SCHEMA,
+        validate_runtime_volume_transition_success,
+    )
+}
+
 pub fn decode_runtime_volume_transition_evidence_success(
     bytes: &[u8],
 ) -> Result<RuntimeVolumeTransitionEvidenceSuccess, ContractError> {
@@ -4963,6 +5067,26 @@ pub fn encode_runtime_volume_transition_evidence_request(
         value,
         ContractName::RuntimeVolumeTransitionEvidenceRequest,
         decode_runtime_volume_transition_evidence_request,
+    )
+}
+
+pub fn encode_runtime_volume_transition_request(
+    value: &RuntimeVolumeTransitionRequest,
+) -> Result<Vec<u8>, ContractError> {
+    encode(
+        value,
+        ContractName::RuntimeVolumeTransitionRequest,
+        decode_runtime_volume_transition_request,
+    )
+}
+
+pub fn encode_runtime_volume_transition_success(
+    value: &RuntimeVolumeTransitionSuccess,
+) -> Result<Vec<u8>, ContractError> {
+    encode(
+        value,
+        ContractName::RuntimeVolumeTransitionSuccess,
+        decode_runtime_volume_transition_success,
     )
 }
 
@@ -5787,6 +5911,98 @@ fn validate_runtime_volume_transition_evidence_success(
         candidates.push(Candidate::at(&path, MalformedProblem::InvalidValue));
     }
 
+    if let Some(candidate) = choose(candidates) {
+        return Err(malformed(contract, candidate));
+    }
+    Ok(())
+}
+
+fn validate_runtime_volume_transition_request(
+    request: &RuntimeVolumeTransitionRequest,
+) -> Result<(), ContractError> {
+    let contract = ContractName::RuntimeVolumeTransitionRequest;
+    let mut candidates = Vec::new();
+    if request.session.node_id != request.placement.node_id {
+        candidates.push(Candidate::at(
+            &path(&["session", "node_id"]),
+            MalformedProblem::InvalidValue,
+        ));
+    }
+    match &request.transition {
+        RuntimeVolumeTransition::Acquire {
+            request:
+                VolumeAcquireRequest::Normal {
+                    desired_revision,
+                    placement_epoch,
+                    ..
+                },
+        } => {
+            if *desired_revision != request.desired_revision {
+                candidates.push(Candidate::at(
+                    &path(&["transition", "desired_revision"]),
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+            if *placement_epoch != request.placement.placement_epoch {
+                candidates.push(Candidate::at(
+                    &path(&["transition", "placement_epoch"]),
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+        }
+        RuntimeVolumeTransition::Release { cleanup } => {
+            if cleanup.inventory_session != request.session {
+                candidates.push(Candidate::at(
+                    &path(&["transition", "cleanup", "inventory_session"]),
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+            if !matches!(cleanup.target, CleanupTarget::Volume { .. })
+                || cleanup.volume_release.is_none()
+                || cleanup.desired_read_position < cleanup.inventory_read_position
+            {
+                candidates.push(Candidate::at(
+                    &path(&["transition", "cleanup"]),
+                    MalformedProblem::InvalidValue,
+                ));
+            }
+        }
+        RuntimeVolumeTransition::Acquire {
+            request: VolumeAcquireRequest::Takeover { .. },
+        }
+        | RuntimeVolumeTransition::DeleteDisposableRoot { .. } => {}
+    }
+    if let Some(candidate) = choose(candidates) {
+        return Err(malformed(contract, candidate));
+    }
+    Ok(())
+}
+
+fn validate_runtime_volume_transition_success(
+    success: &RuntimeVolumeTransitionSuccess,
+) -> Result<(), ContractError> {
+    let contract = ContractName::RuntimeVolumeTransitionSuccess;
+    let mut candidates = Vec::new();
+    if success.session.node_id != success.placement.node_id {
+        candidates.push(Candidate::at(
+            &path(&["session", "node_id"]),
+            MalformedProblem::InvalidValue,
+        ));
+    }
+    let (head, head_path) = match &success.outcome {
+        RuntimeVolumeTransitionOutcome::LeaseGranted { grant } => {
+            (&grant.head, path(&["outcome", "grant", "head"]))
+        }
+        RuntimeVolumeTransitionOutcome::Released { release } => (
+            &release.resulting_head,
+            path(&["outcome", "release", "resulting_head"]),
+        ),
+        RuntimeVolumeTransitionOutcome::DisposableRootDeleting { receipt } => (
+            &receipt.resulting_head,
+            path(&["outcome", "receipt", "resulting_head"]),
+        ),
+    };
+    collect_remote_head_cross(head, &head_path, &mut candidates);
     if let Some(candidate) = choose(candidates) {
         return Err(malformed(contract, candidate));
     }

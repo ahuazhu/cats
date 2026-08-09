@@ -1397,6 +1397,65 @@ pub enum DeleteCompletionReceipt {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RuntimeVolumeTransitionRequest {
+    pub version: ContractVersion,
+    pub session: SessionBinding,
+    pub cat_id: Id,
+    pub desired_revision: Revision,
+    pub spec_digest: Sha256Digest,
+    pub placement: AssignedPlacement,
+    pub transition: RuntimeVolumeTransition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RuntimeVolumeTransition {
+    Acquire { request: VolumeAcquireRequest },
+    Release { cleanup: CleanupRelease },
+    DeleteDisposableRoot { authorization_id: Id },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeVolumeTransitionSuccess {
+    pub version: ContractVersion,
+    pub session: SessionBinding,
+    pub cat_id: Id,
+    pub desired_revision: Revision,
+    pub spec_digest: Sha256Digest,
+    pub placement: AssignedPlacement,
+    pub outcome: RuntimeVolumeTransitionOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RuntimeVolumeTransitionOutcome {
+    LeaseGranted {
+        grant: VolumeLeaseGrant,
+    },
+    Released {
+        release: ReleaseResult,
+    },
+    DisposableRootDeleting {
+        receipt: BeginDisposableDeleteConsumedReceipt,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeLeaseGrant {
+    pub volume_id: Id,
+    pub attachment_id: Id,
+    pub attachment_epoch: FenceEpoch,
+    pub size_bytes: u64,
+    pub durability: VolumeDurability,
+    pub head: RemoteHead,
+    pub lease_expires_at: UnixMillis,
+    pub acquire_origin: AcquireOrigin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeVolumeTransitionEvidenceRequest {
     pub version: ContractVersion,
     pub session: SessionBinding,
