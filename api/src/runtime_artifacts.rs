@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::runtime_reconciliation::{
-    decode_guest_runtime_profile_receipt, ContractVersion, GuestRuntimeProfileReceipt,
-    Sha256Digest, WireU64, GUEST_RUNTIME_PROFILE_RECEIPT_MAX_WIRE_BYTES,
+    decode_guest_runtime_profile_receipt, decode_runtime_provisioner_trust_bundle, ContractVersion,
+    GuestRuntimeProfileReceipt, RuntimeProvisionerTrustBundle, Sha256Digest, WireU64,
+    GUEST_RUNTIME_PROFILE_RECEIPT_MAX_WIRE_BYTES, RUNTIME_PROVISIONER_TRUST_BUNDLE_MAX_WIRE_BYTES,
 };
 
 pub const GUEST_RUNTIME_PROFILE_RECEIPT_PATH: &str =
@@ -21,6 +22,8 @@ pub const GUEST_RUNTIME_RELEASE_MANIFEST_PATH: &str =
 pub const GUEST_KERNEL_PATH: &str = "/opt/cats/guest/vmlinuz";
 pub const GUEST_INITRAMFS_PATH: &str = "/opt/cats/guest/initramfs.img";
 pub const GUEST_RUNTIME_PROFILE_RECEIPT_ENV: &str = "CATS_GUEST_RUNTIME_PROFILE_RECEIPT_FILE";
+pub const RUNTIME_PROVISIONER_TRUST_PATH: &str =
+    "/etc/cats/identity/runtime-provisioner-trust.v1.json";
 pub const GUEST_RUNTIME_RELEASE_MANIFEST_MAX_BYTES: usize = 4_096;
 pub const GUEST_BOOT_MEMBER_MAX_BYTES: usize = 536_870_912;
 
@@ -50,6 +53,22 @@ pub struct InstalledGuestRuntimeProfileReceipt {
     manifest: GuestRuntimeReleaseManifest,
     exact_manifest_bytes: Vec<u8>,
     release_id: Sha256Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledRuntimeProvisionerTrustBundle {
+    bundle: RuntimeProvisionerTrustBundle,
+    exact_bytes: Vec<u8>,
+}
+
+impl InstalledRuntimeProvisionerTrustBundle {
+    pub fn bundle(&self) -> &RuntimeProvisionerTrustBundle {
+        &self.bundle
+    }
+
+    pub fn exact_bytes(&self) -> &[u8] {
+        &self.exact_bytes
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +139,8 @@ impl InstalledGuestRuntimeProfileReceipt {
 pub enum RuntimeArtifactError {
     #[error("Guest runtime profile receipt path must be the canonical installed path")]
     WrongReceiptPath,
+    #[error("Runtime provisioner trust path must be the canonical installed path")]
+    WrongProvisionerTrustPath,
     #[error("Guest runtime release is not supported on this platform")]
     UnsupportedPlatform,
     #[error("Guest runtime release filesystem contract failed at {path}")]
@@ -128,6 +149,46 @@ pub enum RuntimeArtifactError {
     LimitExceeded,
     #[error("Guest runtime release contract is invalid")]
     InvalidReceipt,
+    #[error("Runtime provisioner trust bundle is invalid")]
+    InvalidProvisionerTrust,
+}
+
+/// Read and pin the one deployment-provisioner trust bundle before the admin
+/// listener opens. The descriptor-based reader rejects path replacement,
+/// symlinks, hard links, ownership/mode drift, and bytes changed during read.
+pub fn load_installed_runtime_provisioner_trust_bundle(
+    selected_path: &Path,
+) -> Result<InstalledRuntimeProvisionerTrustBundle, RuntimeArtifactError> {
+    if selected_path != Path::new(RUNTIME_PROVISIONER_TRUST_PATH) {
+        return Err(RuntimeArtifactError::WrongProvisionerTrustPath);
+    }
+    load_installed_runtime_provisioner_trust_bundle_platform(selected_path)
+}
+
+#[cfg(unix)]
+fn load_installed_runtime_provisioner_trust_bundle_platform(
+    path: &Path,
+) -> Result<InstalledRuntimeProvisionerTrustBundle, RuntimeArtifactError> {
+    let identity_directory = open_installed_directory(&["etc", "cats", "identity"], 0o755)?;
+    let exact_bytes = read_exact_installed_file_at(
+        &identity_directory,
+        "runtime-provisioner-trust.v1.json",
+        path,
+        RUNTIME_PROVISIONER_TRUST_BUNDLE_MAX_WIRE_BYTES,
+    )?;
+    let bundle = decode_runtime_provisioner_trust_bundle(&exact_bytes)
+        .map_err(|_| RuntimeArtifactError::InvalidProvisionerTrust)?;
+    Ok(InstalledRuntimeProvisionerTrustBundle {
+        bundle,
+        exact_bytes,
+    })
+}
+
+#[cfg(not(unix))]
+fn load_installed_runtime_provisioner_trust_bundle_platform(
+    _path: &Path,
+) -> Result<InstalledRuntimeProvisionerTrustBundle, RuntimeArtifactError> {
+    Err(RuntimeArtifactError::UnsupportedPlatform)
 }
 
 pub fn load_installed_guest_runtime_profile_receipt(

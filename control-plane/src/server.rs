@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use anyhow::Context;
-use cats_api::runtime_reconciliation::GuestRuntimeProfileReceipt;
+use cats_api::runtime_reconciliation::{GuestRuntimeProfileReceipt, RuntimeProvisionerTrustBundle};
 use cats_metering::{CreditStore, UsageStore};
 use cats_storage::{BlobStore, MetadataStore};
 
@@ -229,6 +229,10 @@ pub struct Config {
     /// Guest runtime. It binds both new Agent sessions and Cat placement.
     /// Production loads it from the one canonical installed path.
     pub guest_runtime_profile_receipt: GuestRuntimeProfileReceipt,
+    /// Exact deployment-provisioner trust bundle loaded from the one A23
+    /// installed path. Startup persists/exact-replays its monotonic lineage
+    /// before opening the administrator listener.
+    pub runtime_provisioner_trust_bundle: RuntimeProvisionerTrustBundle,
     /// Private-key authority for short-lived V1 Endpoint Route Grants. It is
     /// intentionally absent from Gateway and Node configuration.
     pub route_grant_signer: Arc<crate::route_grant::RouteGrantSigner>,
@@ -283,6 +287,8 @@ pub struct AppState {
     pub(crate) runtime_spine_admission: Arc<RuntimeSpineAdmission>,
     pub(crate) runtime_volume_transition_admission: Arc<RuntimeSpineAdmission>,
     pub(crate) runtime_volume_transition_service: Arc<RuntimeVolumeTransitionService>,
+    pub(crate) runtime_node_authority:
+        Arc<crate::api::runtime_node_authority::RuntimeNodeAuthorityService>,
     /// The old Controller/NodeJob runtime exists only to keep the explicit
     /// pre-cutover integration harness exercising its historical contract.
     /// Production handlers consult this before touching any legacy work row
@@ -328,6 +334,7 @@ impl Handle {
         self.state
             .runtime_volume_transition_service
             .begin_shutdown();
+        self.state.runtime_node_authority.begin_shutdown();
         self.image_manifest_resolver.begin_shutdown();
         self.state.observation_store.begin_shutdown();
         if let Some(shutdown) = self
@@ -354,11 +361,16 @@ impl Handle {
         let observation_store = self.state.observation_store.shutdown();
         let volume_transitions = self.state.runtime_volume_transition_service.shutdown();
         let commit_resolutions = self.state.cat_create.shutdown_commit_resolutions();
+        let node_authority_resolutions = self
+            .state
+            .runtime_node_authority
+            .shutdown_commit_resolutions();
         let manifest_reads = self.image_manifest_resolver.shutdown();
-        let (_, transition_result, commit_result, manifest_result) = tokio::join!(
+        let (_, transition_result, commit_result, node_authority_result, manifest_result) = tokio::join!(
             observation_store,
             volume_transitions,
             commit_resolutions,
+            node_authority_resolutions,
             manifest_reads
         );
         if !manifest_result {
@@ -368,7 +380,8 @@ impl Handle {
         // long-lived HTTP connection after Cat commit ownership is resolved.
         self.server_task.abort();
         transition_result?;
-        commit_result.map_err(anyhow::Error::from)
+        commit_result.map_err(anyhow::Error::from)?;
+        node_authority_result.map_err(anyhow::Error::from)
     }
 }
 
@@ -612,6 +625,11 @@ async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow
         .and_then(|path| path.to_str())
         .map(str::to_string);
     let store = Arc::new(Store::connect_from_async(cfg.control_store_dsn.clone(), ca_file).await?);
+    let trust_bundle = cfg.runtime_provisioner_trust_bundle.clone();
+    store
+        .execute(move |store| store.install_runtime_provisioner_trust_bundle(&trust_bundle))
+        .await
+        .context("install runtime provisioner trust bundle")?;
     let observation_store = ObservationStoreLane::connect_from_async(
         cfg.control_store_dsn.clone(),
         cfg.control_store_ca_file
@@ -694,6 +712,12 @@ async fn spawn_inner(cfg: Config, legacy_node_runtime_for_tests: bool) -> anyhow
         },
     );
     let state = AppState {
+        runtime_node_authority: Arc::new(
+            crate::api::runtime_node_authority::RuntimeNodeAuthorityService::new(
+                store.clone(),
+                cfg.runtime_provisioner_trust_bundle.clone(),
+            ),
+        ),
         store,
         observation_store,
         usage,

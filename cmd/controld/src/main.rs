@@ -126,6 +126,11 @@ struct Args {
         value_name = "PATH"
     )]
     guest_runtime_profile_receipt_file: Option<std::path::PathBuf>,
+    /// Deployment-scoped A23 provisioner trust. Production accepts only the
+    /// frozen installed path; there is intentionally no environment or inline
+    /// alternate.
+    #[arg(long, value_name = "PATH")]
+    runtime_provisioner_trust_file: std::path::PathBuf,
     /// PKCS#8 Ed25519 private key used only by the control plane to issue
     /// short-lived V1 Endpoint Route Grants.
     #[arg(long, env = "CATS_ROUTE_GRANT_PRIVATE_KEY_FILE")]
@@ -535,6 +540,10 @@ async fn main() -> anyhow::Result<()> {
         cats_api::runtime_artifacts::load_installed_guest_runtime_profile_receipt(
             guest_runtime_profile_receipt_path,
         )?;
+    let runtime_provisioner_trust =
+        cats_api::runtime_artifacts::load_installed_runtime_provisioner_trust_bundle(
+            &args.runtime_provisioner_trust_file,
+        )?;
     let handle = cats_control_plane::server::spawn(cats_control_plane::server::Config {
         listen: args.listen,
         control_store_dsn,
@@ -545,6 +554,7 @@ async fn main() -> anyhow::Result<()> {
         image_blob,
         auth_token: args.auth_token,
         guest_runtime_profile_receipt: guest_runtime_profile_receipt.receipt().clone(),
+        runtime_provisioner_trust_bundle: runtime_provisioner_trust.bundle().clone(),
         route_grant_signer,
         admin_token: args.admin_token,
         workos,

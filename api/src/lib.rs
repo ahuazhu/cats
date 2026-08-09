@@ -28,4 +28,5 @@ pub mod requests;
 pub mod resources;
 pub mod route_grant;
 pub mod runtime_artifacts;
+pub mod runtime_node_authority;
 pub mod runtime_reconciliation;

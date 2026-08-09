@@ -65,6 +65,60 @@ pub fn test_guest_runtime_profile_receipt(
         guest_agent_protocol_version: ContractVersion::V1,
     }
 }
+
+/// Revision-one deployment provisioner trust for HTTP/server tests. Tests
+/// inject the typed value and therefore do not weaken the production fixed-
+/// path filesystem reader.
+pub fn test_runtime_provisioner_trust_bundle(
+) -> cats_api::runtime_reconciliation::RuntimeProvisionerTrustBundle {
+    use cats_api::runtime_reconciliation::{
+        Base64UrlNoPad, ContractVersion, Epoch, Id, RuntimeProvisionerCredential,
+        RuntimeProvisionerTrustBundle,
+    };
+
+    RuntimeProvisionerTrustBundle {
+        version: ContractVersion::V1,
+        deployment_id: Id::new("deployment_a".to_owned()).expect("valid test deployment ID"),
+        trust_revision: Epoch::new(1).expect("positive test trust revision"),
+        expected_previous: None,
+        credentials: vec![RuntimeProvisionerCredential {
+            credential_id: Id::new("provisioner_a".to_owned()).expect("valid test credential ID"),
+            public_key_spki: Base64UrlNoPad::new(
+                "MCowBQYDK2VwAyEA11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo".to_owned(),
+            )
+            .expect("canonical test Ed25519 SPKI"),
+        }],
+    }
+}
+
+/// Seed a disposable schema with a typed provisioner-trust revision before a
+/// server using the next revision is started.
+pub fn seed_runtime_provisioner_trust_bundle(
+    dsn: &str,
+    bundle: &cats_api::runtime_reconciliation::RuntimeProvisionerTrustBundle,
+) {
+    let dsn = dsn.to_owned();
+    let bundle = bundle.clone();
+    crate::store::off_runtime(move || {
+        let store = crate::store::Store::connect(&dsn, None).expect("connect test control Store");
+        store
+            .install_runtime_provisioner_trust_bundle(&bundle)
+            .expect("install test runtime provisioner trust bundle");
+    });
+}
+
+/// Advance provisioner trust through the production typed Store while an
+/// isolated HTTP server remains live.
+pub async fn install_runtime_provisioner_trust_bundle(
+    store: &Arc<crate::store::Store>,
+    bundle: cats_api::runtime_reconciliation::RuntimeProvisionerTrustBundle,
+) {
+    store
+        .execute(move |store| store.install_runtime_provisioner_trust_bundle(&bundle))
+        .await
+        .expect("install test runtime provisioner trust bundle");
+}
+
 pub fn route_grant_signer() -> Arc<crate::route_grant::RouteGrantSigner> {
     Arc::new(
         crate::route_grant::RouteGrantSigner::from_ed25519_pem(

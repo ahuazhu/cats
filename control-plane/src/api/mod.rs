@@ -50,6 +50,7 @@ mod endpoints;
 mod nodes;
 mod operations;
 mod routes;
+pub(crate) mod runtime_node_authority;
 mod runtime_spine;
 mod runtime_volume_transitions;
 mod sessions;
@@ -637,6 +638,11 @@ pub fn router(state: AppState) -> Router {
             post(runtime_spine::observation).fallback(runtime_spine::observation),
         )
         .route(
+            "/v1/admin/runtime/node-authority-applies",
+            post(runtime_node_authority::apply_runtime_node_authority)
+                .fallback(runtime_node_authority::apply_runtime_node_authority),
+        )
+        .route(
             "/v1/workspaces/{workspace}/billing/balance",
             get(workspace_billing_balance),
         )
@@ -821,6 +827,7 @@ POST /v1/accounts/{account}/invitations
 POST /v1/accounts/{account}/invitations/{invitation}/actions/revoke
 POST /v1/accounts/{account}/workspaces
 POST /v1/admin/nodes/{id}/actions/{verb}
+POST /v1/admin/runtime/node-authority-applies
 POST /v1/auth/logout
 POST /v1/billing/stripe/webhook
 POST /v1/internal/runtime/agent-sessions

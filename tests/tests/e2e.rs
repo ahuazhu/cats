@@ -83,6 +83,8 @@ impl Cluster {
                 auth_token: SERVICE_TOKEN.into(),
                 guest_runtime_profile_receipt:
                     cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
+                runtime_provisioner_trust_bundle:
+                    cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
                 route_grant_signer: Arc::new(
                     cats_control_plane::route_grant::RouteGrantSigner::from_ed25519_pem(
                         ROUTE_GRANT_PRIVATE_KEY,

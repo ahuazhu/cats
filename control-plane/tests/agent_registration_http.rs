@@ -86,6 +86,8 @@ impl Context {
             image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
             auth_token: SERVICE_TOKEN.into(),
             guest_runtime_profile_receipt: receipt.clone(),
+            runtime_provisioner_trust_bundle:
+                cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
             route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
             admin_token: ADMIN_TOKEN.into(),
             workos: None,

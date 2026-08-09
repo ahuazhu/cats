@@ -28,8 +28,10 @@ use crate::store::agent_sessions::{
     insert_node_identity_in, load_current_session_for_update, load_identity_by_node_for_update,
     retire_node_identity_in, rotate_public_key_identity_in,
 };
-use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
-use crate::store::{ApiError, Result, Store};
+use crate::store::transaction::{
+    AuthorityRequestDisposition, AuthorityTransactionError, AuthorityTxResult,
+};
+use crate::store::{ApiError, AuthorityRequestContext, Result, Store};
 
 const POLICY_COLUMNS: &str = "
     node_id, record::text AS record_json, policy_revision, scheduling_state,
@@ -180,6 +182,74 @@ impl Store {
             .map_err(|_| ApiError::invalid("runtime Node authority principal is invalid"))?;
         self.authority_transaction(|transaction| {
             apply_runtime_node_authority_in(transaction, principal, apply)
+        })
+    }
+
+    /// Prove that the locally verified deployment key is still the exact
+    /// active persisted key before the transport adapter decodes or inspects
+    /// any Node/apply facts.
+    pub(crate) fn authenticate_runtime_provisioner_principal(
+        &self,
+        principal: &FleetPolicyPrincipal,
+    ) -> Result<bool> {
+        validate_principal(principal)
+            .map_err(|_| ApiError::invalid("runtime Node authority principal is invalid"))?;
+        if !matches!(
+            principal,
+            FleetPolicyPrincipal::DeploymentProvisioner { .. }
+        ) {
+            return Ok(false);
+        }
+        self.authority_transaction(|transaction| {
+            revalidate_machine_principal(transaction, principal)
+        })
+    }
+
+    /// Deadline/cancellation-aware HTTP apply boundary. Deterministic stored
+    /// success and precondition outcomes cross COMMIT; authentication and
+    /// apply-ID conflicts explicitly roll back without an audit/domain write.
+    pub(crate) fn apply_runtime_node_authority_request(
+        &self,
+        principal: &FleetPolicyPrincipal,
+        apply: &RuntimeNodeAuthorityApply,
+        request: &AuthorityRequestContext,
+    ) -> Result<RuntimeNodeAuthorityApplyStoreOutcome> {
+        encode_runtime_node_authority_apply(apply)
+            .map_err(|_| ApiError::invalid("runtime Node authority apply is invalid"))?;
+        validate_principal(principal)
+            .map_err(|_| ApiError::invalid("runtime Node authority principal is invalid"))?;
+        self.authority_request_transaction(request, |transaction| {
+            let outcome = apply_runtime_node_authority_in(transaction, principal, apply)?;
+            Ok(match outcome {
+                RuntimeNodeAuthorityApplyStoreOutcome::Stored(_) => {
+                    AuthorityRequestDisposition::Commit(outcome)
+                }
+                RuntimeNodeAuthorityApplyStoreOutcome::ApplyIdConflict
+                | RuntimeNodeAuthorityApplyStoreOutcome::AuthenticationFailed => {
+                    AuthorityRequestDisposition::Reject(outcome)
+                }
+            })
+        })
+    }
+
+    /// Resolve an already-sent COMMIT without re-running domain mutation or
+    /// requiring the possibly-rotated request credential. This read is only
+    /// reachable from the registered commit owner after `commit_was_attempted`.
+    pub(crate) fn resolve_runtime_node_authority_apply(
+        &self,
+        apply: &RuntimeNodeAuthorityApply,
+    ) -> Result<Option<RuntimeNodeAuthorityApplyStoreOutcome>> {
+        encode_runtime_node_authority_apply(apply)
+            .map_err(|_| ApiError::invalid("runtime Node authority apply is invalid"))?;
+        self.authority_transaction(|transaction| {
+            let stored = load_apply_record(transaction, apply.apply_id.as_str())?;
+            Ok(stored.map(|stored| {
+                if *stored.request == *apply {
+                    RuntimeNodeAuthorityApplyStoreOutcome::Stored(stored.outcome)
+                } else {
+                    RuntimeNodeAuthorityApplyStoreOutcome::ApplyIdConflict
+                }
+            }))
         })
     }
 }

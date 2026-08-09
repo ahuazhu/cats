@@ -41,9 +41,9 @@ use cats_api::error::{ApiError, ErrorCode};
 use crate::api::Failure;
 use crate::server::AppState;
 
-const USER_SESSION_COOKIE: &str = "cats_user_session";
+pub(crate) const USER_SESSION_COOKIE: &str = "cats_user_session";
 const USER_CONTEXT_COOKIE: &str = "cats_user_context";
-const ADMIN_SESSION_COOKIE: &str = "cats_admin_session";
+pub(crate) const ADMIN_SESSION_COOKIE: &str = "cats_admin_session";
 const USER_FLOW_COOKIE: &str = "cats_user_auth_flow";
 const ADMIN_FLOW_COOKIE: &str = "cats_admin_auth_flow";
 const SESSION_MAX_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
@@ -65,6 +65,7 @@ pub use session::{
     web_session_is_admin, web_session_is_admin_without_store, web_user_identity, SiteQuery,
     SwitchWorkspaceRequest, WebIdentity,
 };
+pub(crate) use session::{sealed_admin_session_candidate, FleetAdministratorIdentityCandidate};
 pub use token::AccessIdentity;
 pub use web_flow::{callback, config, login, CallbackQuery, LoginQuery};
 pub use workos_client::{WorkOsConfig, WorkOsConfigParams};

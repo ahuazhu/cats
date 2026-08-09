@@ -142,6 +142,129 @@ impl WorkOsConfig {
         &self.account_organizations
     }
 
+    /// Re-read the candidate's current admin-organization membership and the
+    /// permissions of every currently assigned role. Role slugs are lookup
+    /// keys only; authorization is the exact permission in the current WorkOS
+    /// role objects, never a comparison against a privileged slug.
+    pub(crate) async fn current_fleet_administrator_principal(
+        &self,
+        candidate: &super::FleetAdministratorIdentityCandidate,
+    ) -> Result<Option<cats_api::runtime_reconciliation::FleetPolicyPrincipal>, ApiError> {
+        const FLEET_ADMIN_PERMISSION: &str = "cats:fleet:admin";
+
+        let page = self
+            .client
+            .organization_membership()
+            .list_organization_memberships(ListOrganizationMembershipsParams {
+                organization_id: Some(self.admin_organization_id.clone()),
+                user_id: Some(candidate.subject.clone()),
+                statuses: Some(vec![
+                    workos::enums::UserManagementOrganizationMembershipStatuses::Active,
+                ]),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    error = %error,
+                    subject = candidate.subject,
+                    organization_id = self.admin_organization_id,
+                    "WorkOS fleet administrator membership lookup failed"
+                );
+                ApiError::unavailable("WorkOS fleet authorization is temporarily unavailable")
+            })?;
+        if page.list_metadata.after.is_some() {
+            tracing::warn!(
+                subject = candidate.subject,
+                organization_id = self.admin_organization_id,
+                "WorkOS returned more than one page for one subject/organization membership"
+            );
+            return Err(ApiError::unavailable(
+                "WorkOS fleet authorization is temporarily unavailable",
+            ));
+        }
+        let mut matching = page
+            .data
+            .into_iter()
+            .filter(|membership| {
+                membership.user_id == candidate.subject
+                    && membership.organization_id == self.admin_organization_id
+                    && membership.status == UserOrganizationMembershipStatus::Active
+            })
+            .collect::<Vec<_>>();
+        if candidate.organization_id != self.admin_organization_id || matching.len() != 1 {
+            return Ok(None);
+        }
+        let membership = matching.pop().expect("length was checked");
+        let mut role_slugs = membership
+            .roles
+            .into_iter()
+            .map(|role| role.slug)
+            .collect::<std::collections::BTreeSet<_>>();
+        role_slugs.insert(membership.role.slug);
+        if role_slugs.is_empty() {
+            return Ok(None);
+        }
+        for role_slug in role_slugs {
+            let role = match self
+                .client
+                .authorization()
+                .get_organization_role(&self.admin_organization_id, &role_slug)
+                .await
+            {
+                Ok(role) => role,
+                Err(error) if error.is_not_found() => return Ok(None),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        subject = candidate.subject,
+                        organization_id = self.admin_organization_id,
+                        "WorkOS fleet administrator role lookup failed"
+                    );
+                    return Err(ApiError::unavailable(
+                        "WorkOS fleet authorization is temporarily unavailable",
+                    ));
+                }
+            };
+            if role.slug != role_slug {
+                tracing::warn!(
+                    requested_role = role_slug,
+                    returned_role = role.slug,
+                    "WorkOS fleet administrator role response was not self-consistent"
+                );
+                return Err(ApiError::unavailable(
+                    "WorkOS fleet authorization is temporarily unavailable",
+                ));
+            }
+            if role
+                .permissions
+                .iter()
+                .any(|permission| permission == FLEET_ADMIN_PERMISSION)
+            {
+                return Ok(Some(
+                    cats_api::runtime_reconciliation::FleetPolicyPrincipal::WorkosFleetAdministrator {
+                        subject: cats_api::runtime_reconciliation::Id::new(
+                            candidate.subject.clone(),
+                        )
+                        .ok_or_else(|| {
+                            ApiError::unauthenticated("WorkOS administrator subject is invalid")
+                        })?,
+                        organization_id: cats_api::runtime_reconciliation::Id::new(
+                            self.admin_organization_id.clone(),
+                        )
+                        .ok_or_else(|| {
+                            ApiError::unavailable(
+                                "WorkOS fleet authorization is temporarily unavailable",
+                            )
+                        })?,
+                    },
+                ));
+            }
+        }
+        Ok(None)
+    }
+
     pub(super) async fn ensure_personal_organization(
         &self,
         user_id: &str,

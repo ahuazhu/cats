@@ -523,6 +523,44 @@ fn session_is_admin(config: &WorkOsConfig, session: &SessionState) -> bool {
             .any(|permission| permission == &config.admin_permission)
 }
 
+/// Cryptographically validate the dedicated sealed admin cookie and expose
+/// only its identity candidate. Stale permission claims are deliberately not
+/// consulted; A23 performs an online current-membership/role verification on
+/// every apply and replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FleetAdministratorIdentityCandidate {
+    pub(crate) subject: String,
+    pub(crate) organization_id: String,
+}
+
+pub(crate) fn sealed_admin_session_candidate(
+    config: &WorkOsConfig,
+    sealed: &str,
+) -> Result<FleetAdministratorIdentityCandidate, ApiError> {
+    let session =
+        SessionManager::new(None, sealed.to_owned(), &config.cookie_password).authenticate();
+    if !session.authenticated {
+        return Err(ApiError::unauthenticated(
+            "invalid or expired WorkOS administrator session",
+        ));
+    }
+    let subject = session
+        .user
+        .as_ref()
+        .map(|user| user.id.clone())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::unauthenticated("WorkOS administrator session has no subject"))?;
+    if session.organization_id.is_empty() {
+        return Err(ApiError::unauthenticated(
+            "WorkOS administrator session has no organization scope",
+        ));
+    }
+    Ok(FleetAdministratorIdentityCandidate {
+        subject,
+        organization_id: session.organization_id,
+    })
+}
+
 /// Validate the sealed administrator cookie without entering the control
 /// store. The normal admin identity path has the same predicate; its Store
 /// closure is only needed to share machinery with workspace-scoped sessions.
