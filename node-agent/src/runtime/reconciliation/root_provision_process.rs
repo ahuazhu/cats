@@ -35,6 +35,7 @@ pub(crate) struct RootProvisionProcessExpectation {
     pub attachment_id: Id,
     pub attachment_epoch: FenceEpoch,
     pub scope_id: Id,
+    pub cgroup_path: HostPath,
     pub control_socket_path: HostPath,
     pub data_directory: HostPath,
     pub process_identity_token: RandomId128,
@@ -82,6 +83,17 @@ impl RootProvisionProcessExpectation {
             executable_path.as_str().starts_with('/'),
             "root-provision executable path must be absolute"
         );
+        anyhow::ensure!(
+            scope_id.as_str().ends_with(".service")
+                && scope_id
+                    .as_str()
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte)),
+            "root-provision process owner requires one canonical transient service unit"
+        );
+        let cgroup_path =
+            HostPath::new(format!("/sys/fs/cgroup/system.slice/{}", scope_id.as_str()))
+                .context("root-provision service does not form a canonical cgroup path")?;
         Ok(Self {
             cat_id: checkpoint.cat_id.clone(),
             node_id: checkpoint.node_id.clone(),
@@ -93,6 +105,7 @@ impl RootProvisionProcessExpectation {
             attachment_id: attachment_id.clone(),
             attachment_epoch: *attachment_epoch,
             scope_id: scope_id.clone(),
+            cgroup_path,
             control_socket_path: control_socket_path.clone(),
             data_directory: data_directory.clone(),
             process_identity_token: process_identity_token.clone(),
@@ -107,6 +120,8 @@ impl RootProvisionProcessExpectation {
 /// Exact self-description required from the blockd control handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RootProvisionBlockdHandshake {
+    /// Linux `SO_PEERCRED` PID from the exact connected control socket.
+    pub peer_process_id: u32,
     pub identity: AttachmentLineageIdentity,
     pub size_bytes: u64,
     pub durability: Durability,
@@ -119,10 +134,13 @@ pub(crate) struct RootProvisionBlockdHandshake {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RootProvisionProcessEvidence {
     pub process_id: u32,
+    pub unit_main_process_id: u32,
     pub process_start_time_ticks: WireU64,
     pub executable_path: HostPath,
     pub scope_id: Id,
     pub cgroup_path: HostPath,
+    /// Exact bounded `cgroup.procs` membership for the transient service.
+    pub cgroup_process_ids: Vec<u32>,
     pub control_socket_path: HostPath,
     pub data_directory: HostPath,
     pub ownership_token: RandomId128,
@@ -131,8 +149,14 @@ pub(crate) struct RootProvisionProcessEvidence {
 
 impl RootProvisionProcessEvidence {
     fn exactly_matches(&self, expected: &RootProvisionProcessExpectation) -> bool {
-        self.executable_path == expected.executable_path
+        self.process_id > 0
+            && self.unit_main_process_id == self.process_id
+            && self.process_start_time_ticks.get() > 0
+            && self.cgroup_process_ids == [self.process_id]
+            && self.handshake.peer_process_id == self.process_id
+            && self.executable_path == expected.executable_path
             && self.scope_id == expected.scope_id
+            && self.cgroup_path == expected.cgroup_path
             && self.control_socket_path == expected.control_socket_path
             && self.data_directory == expected.data_directory
             && self.ownership_token == expected.process_identity_token
@@ -357,7 +381,7 @@ mod tests {
             checkpointed: CheckpointedRootProvisionProcess<'_>,
             _context: &RuntimeDesiredEffectContext,
         ) -> anyhow::Result<RootProvisionProcessStart> {
-            assert_eq!(checkpointed.expected().scope_id, id("cats-root.scope"));
+            assert_eq!(checkpointed.expected().scope_id, id("cats-root.service"));
             let mut state = self.state.lock().unwrap();
             state.start_calls += 1;
             Ok(state
@@ -392,7 +416,7 @@ mod tests {
             volume_id: id("vol_root"),
             attachment_id: id("att_root"),
             attachment_epoch: fence(7),
-            scope_id: id("cats-root.scope"),
+            scope_id: id("cats-root.service"),
             control_socket_path: host("/run/cats/cat_01/root-provision.sock"),
             data_directory: host("/var/lib/cats/cat_01/root"),
             process_identity_token: random('4'),
@@ -595,6 +619,59 @@ mod tests {
     }
 
     #[test]
+    fn pid_start_cgroup_and_socket_peer_are_all_part_of_exact_identity() {
+        let variants = [
+            "zero_pid",
+            "zero_start",
+            "wrong_main_pid",
+            "wrong_cgroup",
+            "duplicate_cgroup_member",
+            "foreign_socket_peer",
+        ];
+        for variant in variants {
+            let (_root, state, store, predecessor, staged, attachment, mut evidence) = fixture();
+            match variant {
+                "zero_pid" => evidence.process_id = 0,
+                "zero_start" => {
+                    evidence.process_start_time_ticks = WireU64::new(0).unwrap();
+                }
+                "wrong_main_pid" => evidence.unit_main_process_id += 1,
+                "wrong_cgroup" => {
+                    evidence.cgroup_path = host("/sys/fs/cgroup/system.slice/foreign.service");
+                }
+                "duplicate_cgroup_member" => evidence.cgroup_process_ids.push(5252),
+                "foreign_socket_peer" => evidence.handshake.peer_process_id += 1,
+                _ => unreachable!(),
+            }
+            let port = FakePort::default();
+            {
+                let mut fake = port.state.lock().unwrap();
+                fake.inspections
+                    .push_back(RootProvisionProcessInspection::Absent);
+                fake.starts
+                    .push_back(RootProvisionProcessStart::Started(Box::new(evidence)));
+            }
+            let result = ensure_root_provision_process_after_checkpoint(
+                &store,
+                &predecessor,
+                &staged,
+                attachment,
+                host("/usr/bin/cats-blockd"),
+                &port,
+                &context(state),
+            )
+            .unwrap();
+            assert_eq!(
+                result.outcome,
+                RootProvisionProcessOutcome::Conflict(
+                    RootProvisionProcessConflict::IdentityMismatch
+                ),
+                "{variant}"
+            );
+        }
+    }
+
+    #[test]
     fn cancelled_start_is_closed_only_after_the_port_reports_cleanup() {
         let (_root, state, store, predecessor, staged, attachment, _evidence) = fixture();
         let port = FakePort::default();
@@ -687,14 +764,17 @@ mod tests {
     fn evidence(attachment: &AuthorizedServingAttachment) -> RootProvisionProcessEvidence {
         RootProvisionProcessEvidence {
             process_id: 4242,
+            unit_main_process_id: 4242,
             process_start_time_ticks: WireU64::new(700).unwrap(),
             executable_path: host("/usr/bin/cats-blockd"),
-            scope_id: id("cats-root.scope"),
-            cgroup_path: host("/sys/fs/cgroup/system.slice/cats-root.scope"),
+            scope_id: id("cats-root.service"),
+            cgroup_path: host("/sys/fs/cgroup/system.slice/cats-root.service"),
+            cgroup_process_ids: vec![4242],
             control_socket_path: host("/run/cats/cat_01/root-provision.sock"),
             data_directory: host("/var/lib/cats/cat_01/root"),
             ownership_token: random('4'),
             handshake: RootProvisionBlockdHandshake {
+                peer_process_id: 4242,
                 identity: attachment.identity.clone(),
                 size_bytes: attachment.size_bytes,
                 durability: attachment.durability,
